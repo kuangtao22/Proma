@@ -64,7 +64,7 @@ export function createVoiceDictationWindow(): void {
 
   const isDev = !app.isPackaged
   if (isDev) {
-    voiceDictationWindow.loadURL('http://localhost:5173?window=voice-dictation')
+    voiceDictationWindow.loadURL('http://localhost:5174?window=voice-dictation')
   } else {
     voiceDictationWindow.loadFile(join(__dirname, 'renderer', 'index.html'), {
       query: { window: 'voice-dictation' },
@@ -160,7 +160,7 @@ function isTrustedVoiceDictationUrl(rawUrl: string | undefined): boolean {
 
   try {
     const parsed = new URL(rawUrl)
-    if (!app.isPackaged && parsed.origin === 'http://localhost:5173') {
+    if (!app.isPackaged && parsed.origin === 'http://localhost:5174') {
       return true
     }
     return parsed.protocol === 'file:'

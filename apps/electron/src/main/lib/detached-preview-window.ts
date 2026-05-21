@@ -110,7 +110,7 @@ export function openDetachedPreviewWindow(
 
   const isDev = !app.isPackaged
   if (isDev) {
-    win.loadURL(`http://localhost:5173?window=detached-preview&previewId=${encodeURIComponent(id)}`)
+    win.loadURL(`http://localhost:5174?window=detached-preview&previewId=${encodeURIComponent(id)}`)
   } else {
     win.loadFile(join(__dirname, 'renderer', 'index.html'), {
       query: { window: 'detached-preview', previewId: id },
