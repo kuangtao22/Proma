@@ -9,7 +9,7 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, cpSync, rmSync, mkdirSync, statSync, renameSync, openSync, readSync, closeSync } from 'node:fs'
 import { writeJsonFileAtomic, readJsonFileSafe } from './safe-file'
 import { randomUUID } from 'node:crypto'
-import { join, resolve, relative, isAbsolute, dirname } from 'node:path'
+import { join, resolve, relative, isAbsolute, dirname, basename } from 'node:path'
 import {
   getAgentWorkspacesIndexPath,
   getAgentWorkspacePath,
@@ -283,7 +283,13 @@ export function ensureDefaultWorkspace(): AgentWorkspace {
 
 // ===== 默认 Skills 自动升级 =====
 
-/** 将所有工作区中版本过旧的默认 Skill 升级到 ~/.proma/default-skills/ 的最新版本 */
+/**
+ * 同步默认 Skills 到所有工作区。规则：
+ * - 缺失：注入到 skills/（active），让升级后新增的内置 Skill 对老用户立即可用
+ * - 已存在（active 或 inactive）：比较 SKILL.md 的 version，bundled 更新时才覆盖
+ *   （保留用户停用决定 — 在 inactive 的依然在 inactive；同时避免每次启动
+ *    全量 cpSync 4MB+ 文件阻塞主进程）
+ */
 export function upgradeDefaultSkillsInWorkspaces(): void {
   const defaultDir = getDefaultSkillsDir()
 
@@ -298,8 +304,10 @@ export function upgradeDefaultSkillsInWorkspaces(): void {
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
       const sourcePath = join(defaultDir, entry.name)
-      const version = parseSkillVersion(sourcePath)
-      defaultSkills.set(entry.name, { version, sourcePath })
+      defaultSkills.set(entry.name, {
+        version: parseSkillVersion(sourcePath),
+        sourcePath,
+      })
     }
   } catch {
     return
@@ -310,26 +318,92 @@ export function upgradeDefaultSkillsInWorkspaces(): void {
   const index = readIndex()
 
   for (const workspace of index.workspaces) {
-    const dirs = [
-      getWorkspaceSkillsDir(workspace.slug),
-      getInactiveSkillsDir(workspace.slug),
-    ]
+    const activeDir = getWorkspaceSkillsDir(workspace.slug)
+    const inactiveDir = getInactiveSkillsDir(workspace.slug)
 
-    for (const dir of dirs) {
-      if (!existsSync(dir)) continue
+    for (const [slug, info] of defaultSkills) {
+      const activePath = join(activeDir, slug)
+      const inactivePath = join(inactiveDir, slug)
 
-      for (const [slug, info] of defaultSkills) {
-        const targetPath = join(dir, slug)
-        if (!existsSync(targetPath)) continue
-
-        const currentVer = parseSkillVersion(targetPath)
+      if (existsSync(activePath)) {
+        const currentVer = parseSkillVersion(activePath)
         if (compareSemver(info.version, currentVer) > 0) {
-          cpSync(info.sourcePath, targetPath, { recursive: true, force: true })
-          console.log(`[Agent 工作区] 已升级 Skill: ${workspace.slug}/${slug} (${currentVer} → ${info.version})`)
+          if (safeReplaceSkillDir(info.sourcePath, activePath)) {
+            console.log(
+              `[Agent 工作区] 已升级默认 Skill: ${workspace.slug}/${slug} (active, ${currentVer} → ${info.version})`,
+            )
+          } else {
+            console.warn(
+              `[Agent 工作区] 升级默认 Skill 失败 (${workspace.slug}/${slug}, active)，跳过`,
+            )
+          }
         }
+        continue
+      }
+
+      if (existsSync(inactivePath)) {
+        const currentVer = parseSkillVersion(inactivePath)
+        if (compareSemver(info.version, currentVer) > 0) {
+          if (safeReplaceSkillDir(info.sourcePath, inactivePath)) {
+            console.log(
+              `[Agent 工作区] 已升级默认 Skill: ${workspace.slug}/${slug} (inactive, ${currentVer} → ${info.version})`,
+            )
+          } else {
+            console.warn(
+              `[Agent 工作区] 升级默认 Skill 失败 (${workspace.slug}/${slug}, inactive)，跳过`,
+            )
+          }
+        }
+        continue
+      }
+
+      try {
+        if (!existsSync(activeDir)) mkdirSync(activeDir, { recursive: true })
+        cpSync(info.sourcePath, activePath, { recursive: true, filter: skillCopyFilter })
+        console.log(`[Agent 工作区] 已注入新默认 Skill: ${workspace.slug}/${slug} → active`)
+      } catch (err) {
+        console.warn(`[Agent 工作区] 注入默认 Skill 失败 (${workspace.slug}/${slug}):`, err)
       }
     }
   }
+}
+
+/**
+ * 安全替换一个 skill 目录：先 rmSync 再 cpSync，每步独立 try/catch。
+ *
+ * 直接 cpSync({ force: true }) 在目标存在只读文件（如 .git/objects/ 下的 0444
+ * 文件）时会因 EACCES 失败；rmSync({ force: true }) 不依赖目标文件的写权限，
+ * 仅需父目录可写即可 unlink。这种"先删后拷"也修正了 cpSync 的合并语义——
+ * bundle 已删除的文件能从用户目录中真正消失。
+ *
+ * @returns 成功返回 true；任何步骤失败返回 false（已记录日志，不抛出）
+ */
+function safeReplaceSkillDir(sourcePath: string, targetPath: string): boolean {
+  try {
+    rmSync(targetPath, { recursive: true, force: true })
+    cpSync(sourcePath, targetPath, { recursive: true, filter: skillCopyFilter })
+    return true
+  } catch (err) {
+    console.warn(`[Agent 工作区] safeReplaceSkillDir 失败 (${targetPath}):`, err)
+    return false
+  }
+}
+
+/** 防御性目录基名集合：复制 skill 时永远跳过这些目录，避免 .git 0444 文件、
+ *  node_modules 文件爆炸等场景把启动期同步链路炸掉。 */
+const SKILL_COPY_BLOCKLIST = new Set([
+  '.git',
+  '.DS_Store',
+  'node_modules',
+  'dist',
+  '.next',
+  '.cache',
+  '.turbo',
+  '__pycache__',
+])
+
+export function skillCopyFilter(src: string): boolean {
+  return !SKILL_COPY_BLOCKLIST.has(basename(src))
 }
 
 /** 比较两个 semver 版本字符串，返回值 >0 表示 a 更新 */

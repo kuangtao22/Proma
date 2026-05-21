@@ -5,8 +5,8 @@
  * 所有用户配置存储在 ~/.proma/ 目录下。
  */
 
-import { join } from 'node:path'
-import { mkdirSync, existsSync, cpSync, readdirSync, readFileSync } from 'node:fs'
+import { join, basename } from 'node:path'
+import { mkdirSync, existsSync, cpSync, rmSync, readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 
 /**
@@ -396,8 +396,7 @@ export function parseSkillVersion(skillDir: string): string {
   return '0.0.0'
 }
 
-/**
- * 比较两个 semver 版本字符串
+/** 比较两个 semver 版本字符串
  *
  * @returns 正数表示 a > b，0 表示相等，负数表示 a < b
  */
@@ -411,6 +410,23 @@ function compareSemver(a: string, b: string): number {
   return 0
 }
 
+/** 防御性目录基名集合：复制 default skills 时永远跳过这些目录，避免
+ *  .git 0444 文件、node_modules 文件爆炸等场景把启动期同步链路炸掉。 */
+const DEFAULT_SKILL_COPY_BLOCKLIST = new Set([
+  '.git',
+  '.DS_Store',
+  'node_modules',
+  'dist',
+  '.next',
+  '.cache',
+  '.turbo',
+  '__pycache__',
+])
+
+function defaultSkillCopyFilter(src: string): boolean {
+  return !DEFAULT_SKILL_COPY_BLOCKLIST.has(basename(src))
+}
+
 /**
  * 从 app bundle 同步默认 Skills 到 ~/.proma/default-skills/
  *
@@ -418,7 +434,8 @@ function compareSemver(a: string, b: string): number {
  * 开发模式下从源码 default-skills/ 目录复制。
  *
  * - 缺失的 Skill：直接复制
- * - 已存在的 Skill：比较 version，bundled 版本更新时覆盖
+ * - 已存在的 Skill：比较 SKILL.md 中的 version，bundled 更新时才覆盖
+ *   （避免每次启动同步 4MB+ 文件阻塞主进程）
  */
 export function seedDefaultSkills(): void {
   const { app } = require('electron')
@@ -442,19 +459,28 @@ export function seedDefaultSkills(): void {
       const source = join(bundledDir, entry.name)
       const target = join(userDir, entry.name)
 
-      if (!existsSync(target)) {
-        // 缺失的 Skill：直接复制
-        cpSync(source, target, { recursive: true })
-        console.log(`[配置] 已同步默认 Skill: ${entry.name}`)
-      } else {
-        // 已存在：比较版本，bundled 更新时覆盖
+      try {
+        if (!existsSync(target)) {
+          cpSync(source, target, { recursive: true, filter: defaultSkillCopyFilter })
+          console.log(`[配置] 已同步默认 Skill: ${entry.name}`)
+          continue
+        }
+
         const bundledVer = parseSkillVersion(source)
         const existingVer = parseSkillVersion(target)
 
         if (compareSemver(bundledVer, existingVer) > 0) {
-          cpSync(source, target, { recursive: true, force: true })
+          // rm-then-cp：rmSync 不依赖目标文件写权限（只读 .git/objects/ 等
+          // 0444 文件用 cpSync({ force: true }) 无法覆盖会 EACCES，但
+          // rmSync({ force: true }) 只需父目录可写就能 unlink）。
+          rmSync(target, { recursive: true, force: true })
+          cpSync(source, target, { recursive: true, filter: defaultSkillCopyFilter })
           console.log(`[配置] 已升级默认 Skill: ${entry.name} (${existingVer} → ${bundledVer})`)
         }
+      } catch (err) {
+        // 单 skill 失败不影响其他 skill 同步。这里吞错是为了防止启动期 bootstrap
+        // 链路被任意一个 skill 的同步异常掀翻——窗口和托盘必须先出来。
+        console.warn(`[配置] 同步默认 Skill 失败 (${entry.name})，跳过:`, err)
       }
     }
   } catch (err) {
