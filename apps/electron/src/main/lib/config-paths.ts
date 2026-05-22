@@ -3,6 +3,7 @@
  *
  * 管理 Proma 应用的本地配置文件路径。
  * 所有用户配置存储在 ~/.proma/ 目录下。
+ *
  */
 
 import { join, basename } from 'node:path'
@@ -13,11 +14,13 @@ import { homedir } from 'node:os'
  * 获取配置目录名称
  *
  * 开发模式下返回 '.proma-dev'，正式版本返回 '.proma'。
+ * Proma Dev 打包版（productName=Proma Dev）也使用 '.proma-dev'，与官方 Proma 完全隔离。
  *
  * 检测优先级：
  * 1. PROMA_DEV=1 环境变量（显式覆盖）
- * 2. Electron app.isPackaged（未打包 = 开发模式）
- * 3. 兜底 '.proma'
+ * 2. Electron app.isPackaged + productName（Proma Dev 打包版用 .proma-dev）
+ * 3. Electron app.isPackaged（未打包 = 开发模式）
+ * 4. 兜底 '.proma'
  */
 let _configDirName: string | undefined
 
@@ -28,7 +31,11 @@ export function getConfigDirName(): string {
     } else {
       try {
         const { app } = require('electron')
-        _configDirName = app.isPackaged ? '.proma' : '.proma-dev'
+        if (app.isPackaged && app.getName() === 'Proma Dev') {
+          _configDirName = '.proma-dev'
+        } else {
+          _configDirName = app.isPackaged ? '.proma' : '.proma-dev'
+        }
       } catch {
         _configDirName = '.proma'
       }
