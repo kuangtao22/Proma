@@ -9,6 +9,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http'
 import { readFileSync, existsSync } from 'node:fs'
 import { join, extname, normalize } from 'node:path'
 import { networkInterfaces } from 'node:os'
+import { app } from 'electron'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { getLanBridgeConfig, updateLanBridgeConfig } from './lan-bridge-config'
 import { initAuth, refreshPin, getCurrentPin } from './lan-bridge-auth'
@@ -46,8 +47,12 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
 
     sessionManager = new LanBridgeSessionManager(config.maxConnections)
 
-    // 静态文件根目录: apps/mobile/dist/
-    const mobileDistDir = join(__dirname, '..', '..', 'mobile', 'dist')
+    // 静态文件根目录:
+    // 开发环境: apps/mobile/dist/（相对于 dist/main.cjs 上两级）
+    // 打包环境: Resources/mobile-dist/（extraResources，通过 process.resourcesPath 定位）
+    const mobileDistDir = app.isPackaged
+      ? join(process.resourcesPath, 'mobile-dist')
+      : join(__dirname, '..', '..', 'mobile', 'dist')
     const mimeTypes: Record<string, string> = {
       '.html': 'text/html; charset=utf-8', '.js': 'application/javascript',
       '.css': 'text/css', '.svg': 'image/svg+xml', '.json': 'application/json',

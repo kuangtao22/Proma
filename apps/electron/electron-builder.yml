@@ -61,6 +61,11 @@ extraResources:
     to: proma-logos
     filter:
       - "**/*"
+  # LAN Bridge 移动端前端（由 CI 在 electron:build 前构建）
+  - from: ../../apps/mobile/dist
+    to: mobile-dist
+    filter:
+      - "**/*"
 
 # ============================================
 # macOS 配置

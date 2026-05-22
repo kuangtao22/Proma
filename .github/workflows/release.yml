@@ -64,6 +64,9 @@ jobs:
 
           rm $RUNNER_TEMP/cert.p12
 
+      - name: 构建 LAN Bridge 移动端
+        run: bun run --filter='@proma/mobile' build
+
       - name: 构建 Electron 应用
         run: bun run electron:build
 
@@ -121,6 +124,9 @@ jobs:
 
           rm $RUNNER_TEMP/cert.p12
 
+      - name: 构建 LAN Bridge 移动端
+        run: bun run --filter='@proma/mobile' build
+
       - name: 构建 Electron 应用
         run: bun run electron:build
 
@@ -157,6 +163,9 @@ jobs:
 
       - name: 安装依赖
         run: bun install
+
+      - name: 构建 LAN Bridge 移动端
+        run: bun run --filter='@proma/mobile' build
 
       - name: 构建 Electron 应用
         run: bun run electron:build
