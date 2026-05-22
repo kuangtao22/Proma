@@ -2,13 +2,10 @@ import { app, BrowserWindow, dialog, Menu, nativeTheme, protocol, screen, shell 
 import { join } from 'path'
 import { existsSync } from 'fs'
 
-// Dev 与正式版使用独立的 userData 目录，避免共享 Chromium SingletonLock 导致 dev 启动被静默退出
+// Dev 开发模式使用独立的 userData 目录，避免与打包版共享 Chromium SingletonLock
 // 必须在任何会读取 userData 路径的模块加载之前执行
 if (!app.isPackaged) {
   app.setPath('userData', join(app.getPath('appData'), '@proma/electron-dev'))
-} else if (app.getName() === 'Proma Dev') {
-  // Proma Dev 打包版使用独立 userData，与官方 Proma 共存
-  app.setPath('userData', join(app.getPath('appData'), '@proma/electron-dev-release'))
 }
 
 // 单实例锁：防止重复启动同一个版本（dev/prod 因 userData 已隔离，互不影响）
