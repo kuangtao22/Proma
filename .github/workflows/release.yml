@@ -41,10 +41,11 @@ jobs:
           node-version: 20
 
       - name: 安装依赖
-        run: bun install --frozen-lockfile
+        run: bun install
 
-      # macOS 代码签名准备
+      # macOS 代码签名准备（需要配置 MAC_CERTS / MAC_CERTS_PASSWORD secrets，未配置则跳过签名）
       - name: 导入 macOS 签名证书
+        if: ${{ env.MAC_CERTS != '' }}
         env:
           MAC_CERTS: ${{ secrets.MAC_CERTS }}
           MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
@@ -104,10 +105,11 @@ jobs:
           node-version: 20
 
       - name: 安装依赖
-        run: bun install --frozen-lockfile
+        run: bun install
 
-      # macOS 代码签名准备
+      # macOS 代码签名准备（需要配置 MAC_CERTS / MAC_CERTS_PASSWORD secrets，未配置则跳过签名）
       - name: 导入 macOS 签名证书
+        if: ${{ env.MAC_CERTS != '' }}
         env:
           MAC_CERTS: ${{ secrets.MAC_CERTS }}
           MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
@@ -303,7 +305,7 @@ jobs:
           node-version: 20
 
       - name: 安装依赖
-        run: bun install --frozen-lockfile
+        run: bun install
 
       # 构建应用
       - name: 构建 Electron 应用
