@@ -56,7 +56,9 @@ import { agentDiffUnseenChangesAtom, agentDiffUnseenFilesAtom, agentDiffPanelTab
 import { autoPreviewEnabledAtom, previewPanelOpenMapAtom, previewFileMapAtom } from '@/atoms/preview-atoms'
 import type { NotificationSoundType } from '@/types/settings'
 import { toast } from 'sonner'
-import type { AgentStreamEvent, AgentStreamCompletePayload, AgentEvent, AgentStreamPayload, SDKAssistantMessage, SDKUserMessage, SDKSystemMessage, SDKContentBlock, SDKUserContentBlock } from '@proma/shared'
+import type { AgentStreamEvent, AgentStreamCompletePayload, AgentEvent, AgentStreamPayload, SDKAssistantMessage, SDKUserMessage, SDKSystemMessage, SDKContentBlock, SDKUserContentBlock, PromaEvent, AgentSessionMeta } from '@proma/shared'
+import { buildExternalAgentRunActivation } from '@/lib/external-agent-run'
+import { getAgentCompletionMarkers } from '@/lib/agent-completion-presence'
 
 /** 触发右侧文件浏览器自动定位的写入类工具集合 */
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Update'])
@@ -108,9 +110,18 @@ function inferContextWindow(model?: string): number | undefined {
   const m = model.toLowerCase()
   // Claude Haiku 为 200k
   if (m.includes('claude-haiku')) return 200_000
-  // Claude Sonnet 4+、Opus 4.6+、DeepSeek V4 系列均为 1M 上下文
-  if (m.includes('claude-sonnet-4-6') || m.includes('claude-opus-4-6') || m.includes('claude-opus-4-7')) return 1_000_000
+  // Claude Sonnet 4.6、Opus 4.6 / 4.7 / 4.8、DeepSeek V4 系列均为 1M 上下文
+  if (
+    m.includes('claude-sonnet-4-6') ||
+    m.includes('claude-opus-4-6') ||
+    m.includes('claude-opus-4-7') ||
+    m.includes('claude-opus-4-8')
+  ) return 1_000_000
   if (m.includes('deepseek-v4')) return 1_000_000
+  // MiniMax M3 为 1M 上下文
+  if (m.includes('minimax-m3')) return 1_000_000
+  // 小米 MiMo：v2.5 / v2.5-pro / v2-pro 为 1M（omni / flash 仍走默认 200k）
+  if (m.includes('mimo-v2.5') || m.includes('mimo-v2-pro')) return 1_000_000
   return 200_000
 }
 
@@ -283,6 +294,13 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
           } : undefined,
         }]
       }
+      if (sMsg.subtype === 'thinking_tokens' && typeof sMsg.estimated_tokens === 'number') {
+        return [{
+          type: 'thinking_tokens',
+          estimatedTokens: sMsg.estimated_tokens,
+          estimatedTokensDelta: typeof sMsg.estimated_tokens_delta === 'number' ? sMsg.estimated_tokens_delta : 0,
+        }]
+      }
       return []
     }
 
@@ -341,6 +359,59 @@ export function useGlobalAgentListeners(): void {
     const getSessionTitle = (sessionId: string): string => {
       const sessions = store.get(agentSessionsAtom)
       return sessions.find((s) => s.id === sessionId)?.title ?? '未命名会话'
+    }
+
+    const activateExternalAgentRun = (event: Extract<PromaEvent, { type: 'external_run_started' }>): void => {
+      const applyActivation = (sessions: AgentSessionMeta[]): void => {
+        const activation = buildExternalAgentRunActivation({
+          tabs: store.get(tabsAtom),
+          sessions,
+          sessionId: event.sessionId,
+          title: event.title,
+          workspaceId: event.workspaceId,
+          modelId: event.modelId,
+          startedAt: event.startedAt,
+          currentStreamState: store.get(agentStreamingStatesAtom).get(event.sessionId),
+        })
+
+        // 外部来源（飞书/钉钉/微信/bridge）唤起的 run 不抢占前台：
+        // 不打开新 Tab、不切换激活 Tab、不切换 appMode/当前会话/当前工作区。
+        // 只更新驱动左侧边栏列表与状态指示条所需的状态，让用户自行决定是否切过去。
+        // 若该会话恰好是用户当前正在查看的会话，这里不动 Tab/激活，流式内容会通过
+        // agentStreamingStatesAtom 自然刷新，用户视角无任何跳动。
+        store.set(agentSessionsAtom, sessions)
+        const activationModelId = activation.modelId
+        if (activationModelId) {
+          store.set(agentSessionModelMapAtom, (prev) => {
+            const map = new Map(prev)
+            map.set(event.sessionId, activationModelId)
+            return map
+          })
+        }
+        store.set(unviewedCompletedSessionIdsAtom, (prev) => {
+          if (!prev.has(event.sessionId)) return prev
+          const next = new Set(prev)
+          next.delete(event.sessionId)
+          return next
+        })
+        store.set(agentStreamingStatesAtom, (prev) => {
+          const map = new Map(prev)
+          map.set(event.sessionId, activation.streamState)
+          return map
+        })
+      }
+
+      const knownSessions = store.get(agentSessionsAtom)
+      if (knownSessions.some((session) => session.id === event.sessionId)) {
+        applyActivation(knownSessions)
+        return
+      }
+
+      window.electronAPI.listAgentSessions()
+        .then((sessions) => {
+          unstable_batchedUpdates(() => applyActivation(sessions))
+        })
+        .catch(console.error)
     }
 
     /** 发送阻塞通知（带提示音 + 会话导航） */
@@ -425,10 +496,31 @@ export function useGlobalAgentListeners(): void {
         }
       }
 
+      // 检查文件是否落在当前会话的 diff scope 内（与 getUnstagedChanges 的 candidates 对齐）
+      // 注：未纳入 dirPath，因为 DiffChangesList 调用时 dirPath 始终等于 sessionPath
+      // 路径分隔符统一为正斜杠，避免 Windows 下 client 与服务端（path.sep='\\'）方向不一致导致反向错配
+      const toForwardSlash = (p: string) => p.replace(/\\/g, '/')
+      const sessionScopePaths = uniqueTruthyPaths([
+        sessionPath,
+        workspaceFilesPath,
+        ...sessionAttachedDirs,
+        ...workspaceAttachedDirs,
+      ]).map(toForwardSlash)
+      const absTarget = toForwardSlash(
+        isAbsolutePath(targetPath)
+          ? targetPath
+          : (sessionPath ? `${sessionPath.replace(/[/\\]+$/, '')}/${targetPath}` : targetPath)
+      )
+      const inDiffScope = sessionScopePaths.some((root) => {
+        const r = root.replace(/\/+$/, '') + '/'
+        return absTarget === root || absTarget.startsWith(r)
+      })
+
       return {
         filePath: targetPath,
         dirPath: dirPath || undefined,
         previewOnly,
+        inDiffScope,
         basePaths: basePaths.length > 0 ? basePaths : undefined,
       }
     }
@@ -483,6 +575,10 @@ export function useGlobalAgentListeners(): void {
         unstable_batchedUpdates(() => {
         const { sessionId, payload } = streamEvent
 
+        if (payload.kind === 'proma_event' && payload.event.type === 'external_run_started') {
+          activateExternalAgentRun(payload.event)
+        }
+
         // 如果收到未知会话的事件（跨工作区场景），立即刷新会话列表
         const knownSessions = store.get(agentSessionsAtom)
         if (!knownSessions.some((s) => s.id === sessionId)) {
@@ -498,6 +594,8 @@ export function useGlobalAgentListeners(): void {
           // 它通过下方 legacyEvents 分支写入 agentPromptSuggestionsAtom，显示在输入框上方
           if (msgRecord.type === 'prompt_suggestion') {
             // 跳过写入 liveMessages
+          } else if (msgRecord.type === 'system' && msgRecord.subtype === 'thinking_tokens') {
+            // thinking_tokens 是高频进度估算，只更新流式状态，不进入消息转录。
           } else if (!msgRecord.isReplay) {
             // 为实时消息补充 _createdAt 时间戳（与持久化时的逻辑一致），
             // 避免 AssistantTurnRenderer 因缺少时间戳导致 header 时间消失
@@ -654,7 +752,7 @@ export function useGlobalAgentListeners(): void {
                   : buildAutoPreviewFile(sessionId, writtenPath)
 
                 previewPromise.then((previewFile) => {
-                  if (!previewFile || previewFile.previewOnly) return
+                  if (!previewFile || previewFile.previewOnly || !previewFile.inDiffScope) return
 
                   store.set(agentDiffUnseenChangesAtom, (prev) => {
                     const m = new Map(prev); m.set(sessionId, true); return m
@@ -836,10 +934,17 @@ export function useGlobalAgentListeners(): void {
           return map
         })
 
-        // 如果用户当前不在查看该会话，标记为"未查看的已完成"
+        // 当前激活会话完成后仍保留在 Working Done，等待用户用对勾明确确认。
+        // 只有未激活会话才进入"未查看完成"，避免当前页面完成时出现额外未读提醒。
         const currentSessionId = store.get(currentAgentSessionIdAtom)
-        const isViewingCompletedSession = data.sessionId === currentSessionId && document.hasFocus()
-        if (!isViewingCompletedSession) {
+        const completionMarkers = getAgentCompletionMarkers({
+          tabs: store.get(tabsAtom),
+          activeTabId: store.get(activeTabIdAtom),
+          currentAgentSessionId: currentSessionId,
+          sessionId: data.sessionId,
+          documentHasFocus: document.hasFocus(),
+        })
+        if (completionMarkers.markUnviewedCompleted) {
           store.set(unviewedCompletedSessionIdsAtom, (prev: Set<string>) => {
             const next = new Set(prev)
             next.add(data.sessionId)
@@ -847,12 +952,13 @@ export function useGlobalAgentListeners(): void {
           })
         }
 
-        // 添加到 Working Done 集合（保持到 Tab 关闭）
-        store.set(workingDoneSessionIdsAtom, (prev: Set<string>) => {
-          const next = new Set(prev)
-          next.add(data.sessionId)
-          return next
-        })
+        if (completionMarkers.keepInWorkingDone) {
+          store.set(workingDoneSessionIdsAtom, (prev: Set<string>) => {
+            const next = new Set(prev)
+            next.add(data.sessionId)
+            return next
+          })
+        }
 
         // 标记用户主动打断状态
         if (data.stoppedByUser) {

@@ -44,6 +44,12 @@ interface BotPlatformDef {
 
 const PLATFORMS: readonly BotPlatformDef[] = [
   {
+    id: 'feishu',
+    name: '飞书',
+    iconSrc: feishuLogo,
+    iconBgClass: 'bg-blue-500/15',
+  },
+  {
     id: 'wechat',
     name: '微信',
     iconSrc: wechatLogo,
@@ -54,12 +60,6 @@ const PLATFORMS: readonly BotPlatformDef[] = [
     name: '局域网',
     iconSrc: lanIcon,
     iconBgClass: 'bg-muted',
-  },
-  {
-    id: 'feishu',
-    name: '飞书',
-    iconSrc: feishuLogo,
-    iconBgClass: 'bg-blue-500/15',
   },
   {
     id: 'dingtalk',
@@ -194,7 +194,7 @@ function renderPlatformPanel(id: BotPlatformId): React.ReactElement {
 // ===== 主组件 =====
 
 export function BotHubSettings(): React.ReactElement {
-  const [selectedPlatform, setSelectedPlatform] = React.useState<BotPlatformId>('wechat')
+  const [selectedPlatform, setSelectedPlatform] = React.useState<BotPlatformId>('feishu')
 
   return (
     <div className="flex -mx-6 -my-4 h-full">

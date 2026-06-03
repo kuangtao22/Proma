@@ -18,7 +18,10 @@ import { cn } from '@/lib/utils'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
 import { ContentBlock } from './ContentBlock'
 import { TaskProgressCard } from './TaskProgressCard'
+import { TurnFileChangesSummary } from './TurnFileChangesSummary'
+import { ProcessBlockGroup, buildAssistantTurnRenderItems, buildCompletedToolResultIds } from './ProcessBlockGroup'
 import { extractToolResultText, parseTaskCreateResult, TASK_TOOL_NAMES } from './task-progress'
+import { normalizeThinkTagsInContentBlocks } from './thinking-tag-parser'
 import { DurationBadge } from './AgentMessages'
 import {
   Message,
@@ -37,6 +40,7 @@ import { formatMessageTime } from '@/components/chat/ChatMessageItem'
 import { getModelLogo, resolveModelDisplayName } from '@/lib/model-logo'
 import { userProfileAtom } from '@/atoms/user-profile'
 import { channelsAtom } from '@/atoms/chat-atoms'
+import { agentProcessGroupsKeepExpandedAtom } from '@/atoms/agent-atoms'
 import { environmentCheckDialogOpenAtom } from '@/atoms/environment'
 import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
 import type {
@@ -516,6 +520,7 @@ export interface AssistantTurnRendererProps {
 
 export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubjects, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, isStreaming, stoppedByUser, sessionModelId }: AssistantTurnRendererProps): React.ReactElement | null {
   const channels = useAtomValue(channelsAtom)
+  const processGroupsKeepExpanded = useAtomValue(agentProcessGroupsKeepExpandedAtom)
   // 收集所有 assistant 消息的内容块，保留 parent_tool_use_id 关联
   interface EnrichedBlock {
     block: SDKContentBlock
@@ -535,7 +540,9 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
     const blocks = aMsg.message?.content
     if (Array.isArray(blocks)) {
       for (const block of blocks) {
-        enrichedBlocks.push({ block, parentToolUseId: aMsg.parent_tool_use_id })
+        for (const normalizedBlock of normalizeThinkTagsInContentBlocks([block])) {
+          enrichedBlocks.push({ block: normalizedBlock, parentToolUseId: aMsg.parent_tool_use_id })
+        }
       }
     }
   }
@@ -543,14 +550,9 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
   // 从 turnMessages 中提取 result 消息的耗时和用量
   const { durationMs, usage } = extractTurnUsage(turn.turnMessages)
 
-  // 该 turn 是否被软中断（aborted_streaming / aborted_tools）
-  // 用于在消息底部显示“已被用户中断”徽章，独立于会话级 stoppedByUser 标记
-  const isInterruptedTurn = turn.turnMessages.some((m) => {
-    if (m.type !== 'result') return false
-    const reason = (m as { terminal_reason?: string }).terminal_reason
-    return reason === 'aborted_streaming' || reason === 'aborted_tools'
-  })
-  const showStoppedBadge = stoppedByUser || isInterruptedTurn
+  // 只在用户点击停止时显示中断徽章。
+  // aborted_streaming / aborted_tools 是流式追加消息时的软中断，语义是继续补充信息。
+  const showStoppedBadge = !!stoppedByUser
 
   // 构建 Agent/Task tool_use → 子代理内容块映射
   const agentToolIds = new Set<string>()
@@ -585,6 +587,15 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
   const { taskActivities, firstTaskIndex } = React.useMemo(() => {
     return buildTaskProgressData(topLevelBlocks, turn.turnMessages)
   }, [topLevelBlocks, turn.turnMessages])
+  const completedToolResultIds = React.useMemo(() => {
+    return buildCompletedToolResultIds(turn.turnMessages)
+  }, [turn.turnMessages])
+  const renderItems = React.useMemo(() => {
+    return buildAssistantTurnRenderItems(topLevelBlocks, {
+      isStreaming,
+      completedToolResultIds,
+    })
+  }, [topLevelBlocks, isStreaming, completedToolResultIds])
 
   // 如果只有错误消息
   if (enrichedBlocks.length === 0 && hasError && errorContent) {
@@ -601,6 +612,58 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
   // 如果没有任何内容
   if (enrichedBlocks.length === 0 && !hasError) return null
 
+  const renderTopLevelBlock = (block: SDKContentBlock, i: number): React.ReactNode => {
+    // Task 工具块：聚合为卡片，此处用索引定位首个任务工具
+    if (block.type === 'tool_use' && TASK_TOOL_NAMES.has((block as SDKToolUseBlock).name)) {
+      if (i === firstTaskIndex) {
+        return (
+          <TaskProgressCard
+            key="task-progress-card"
+            activities={taskActivities}
+            streamEnded={!isStreaming}
+            historicalTaskSubjects={historicalTaskSubjects}
+          />
+        )
+      }
+      return null
+    }
+
+    const isAgentTool = block.type === 'tool_use'
+      && ((block as { name: string }).name === 'Agent' || (block as { name: string }).name === 'Task')
+    const childBlocks = isAgentTool
+      ? childBlocksMap.get((block as { id: string }).id)
+      : undefined
+
+    return (
+      <ContentBlock
+        key={i}
+        block={block}
+        allMessages={allMessages}
+        basePath={basePath}
+        animate={!!isStreaming}
+        index={i}
+        dimmed={hasTextContent && block.type !== 'text'}
+        childBlocks={childBlocks}
+        isStreaming={isStreaming}
+      />
+    )
+  }
+
+  const renderProcessGroupBlock = (block: SDKContentBlock, i: number): React.ReactNode => {
+    const content = renderTopLevelBlock(block, i)
+    if (!content) return content
+    if (!isStreaming || block.type !== 'text') return content
+
+    return (
+      <div
+        key={`process-text-${i}`}
+        className="animate-in fade-in slide-in-from-top-1 duration-300"
+      >
+        {content}
+      </div>
+    )
+  }
+
   return (
     <Message from="assistant">
       <MessageHeader
@@ -610,35 +673,24 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
       />
       <MessageContent>
         <div className={cn('space-y-2')}>
-          {topLevelBlocks.map((block, i) => {
-              // Task 工具块：聚合为卡片，此处用索引定位首个任务工具
-              if (block.type === 'tool_use' && TASK_TOOL_NAMES.has((block as SDKToolUseBlock).name)) {
-                if (i === firstTaskIndex) {
-                  return <TaskProgressCard key="task-progress-card" activities={taskActivities} streamEnded={!isStreaming} historicalTaskSubjects={historicalTaskSubjects} />
-                }
-                return null
-              }
+          {renderItems.map((item) => {
+            if (item.type === 'block') {
+              return renderTopLevelBlock(item.item.block, item.item.index)
+            }
 
-              const isAgentTool = block.type === 'tool_use'
-                && ((block as { name: string }).name === 'Agent' || (block as { name: string }).name === 'Task')
-              const childBlocks = isAgentTool
-                ? childBlocksMap.get((block as { id: string }).id)
-                : undefined
-
-              return (
-                <ContentBlock
-                  key={i}
-                  block={block}
-                  allMessages={allMessages}
-                  basePath={basePath}
-                  animate={!!isStreaming}
-                  index={i}
-                  dimmed={hasTextContent && block.type !== 'text'}
-                  childBlocks={childBlocks}
-                  isStreaming={isStreaming}
-                />
-              )
-            })}
+            const groupBlocks = item.items.map((groupItem) => groupItem.block)
+            const firstIndex = item.items[0]?.index ?? 0
+            return (
+              <ProcessBlockGroup
+                key={`process-${firstIndex}`}
+                blocks={groupBlocks}
+                isStreaming={isStreaming}
+                keepExpandedAfterComplete={processGroupsKeepExpanded}
+              >
+                {item.items.map((groupItem) => renderProcessGroupBlock(groupItem.block, groupItem.index))}
+              </ProcessBlockGroup>
+            )
+          })}
         </div>
         {/* 如果有错误但也有内容块，在末尾显示错误 */}
         {hasError && errorContent && topLevelBlocks.length > 0 && (
@@ -649,6 +701,10 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
           </div>
         )}
       </MessageContent>
+      {/* 文件改动汇总：流式结束后展示本轮所有 Edit/Write/MultiEdit/NotebookEdit 文件 */}
+      {!isStreaming && (
+        <TurnFileChangesSummary turnMessages={turn.turnMessages} basePath={basePath} />
+      )}
       {/* 操作栏：流式输出完成后显示操作按钮 */}
       {!isStreaming && (() => {
         const textContent = topLevelBlocks
@@ -715,8 +771,10 @@ export function SDKMessageRenderer({
       return <ErrorMessage message={aMsg} />
     }
 
-    const blocks = aMsg.message?.content
-    if (!Array.isArray(blocks) || blocks.length === 0) return null
+    const rawBlocks = aMsg.message?.content
+    if (!Array.isArray(rawBlocks) || rawBlocks.length === 0) return null
+    const blocks = normalizeThinkTagsInContentBlocks(rawBlocks)
+    if (blocks.length === 0) return null
 
     const model = aMsg._channelModelId || aMsg.message?.model || sessionModelId
     const meta = extractMeta(message)
@@ -1259,9 +1317,9 @@ export function getGroupPreview(group: MessageGroup): string {
   // assistant-turn：收集所有 text 块
   const texts: string[] = []
   for (const aMsg of group.assistantMessages) {
-    const blocks = aMsg.message?.content
-    if (!Array.isArray(blocks)) continue
-    for (const block of blocks) {
+    const rawBlocks = aMsg.message?.content
+    if (!Array.isArray(rawBlocks)) continue
+    for (const block of normalizeThinkTagsInContentBlocks(rawBlocks)) {
       if (block.type === 'text' && 'text' in block) {
         texts.push((block as { text: string }).text)
       }

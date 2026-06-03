@@ -82,7 +82,7 @@ for (const key of Object.keys(process.env)) {
 
 import { createApplicationMenu } from './menu'
 import { registerIpcHandlers } from './ipc'
-import { createTray, destroyTray } from './tray'
+import { createTray, destroyTray, getTray } from './tray'
 import { initializeRuntime } from './lib/runtime-init'
 import { seedDefaultSkills } from './lib/config-paths'
 import { upgradeDefaultSkillsInWorkspaces } from './lib/agent-workspace-manager'
@@ -95,6 +95,7 @@ import { getIsQuitting, setQuitting } from './lib/app-lifecycle'
 import { registerBridge, startAllBridges, stopAllBridges } from './lib/bridge-registry'
 import { feishuBridgeManager } from './lib/feishu-bridge-manager'
 import { getFeishuMultiBotConfig } from './lib/feishu-config'
+import { stopFeishuSyncSleepBlocker, syncFeishuSyncSleepBlocker } from './lib/feishu-sleep-blocker'
 import { dingtalkBridgeManager } from './lib/dingtalk-bridge-manager'
 import { getDingTalkMultiBotConfig } from './lib/dingtalk-config'
 import { wechatBridge } from './lib/wechat-bridge'
@@ -107,6 +108,7 @@ import {
   shouldSuppressVoiceDictationActivate,
 } from './lib/voice-dictation-window'
 import { registerGlobalShortcut, unregisterAllGlobalShortcuts } from './lib/global-shortcut-service'
+import { setPromaVersion } from '@proma/core'
 import { TRAY_IPC_CHANNELS } from '../types'
 
 const MIGRATION_IPC_OPEN = 'migration:open-import-file'
@@ -208,6 +210,7 @@ function ensureWindowOnScreen(win: BrowserWindow): void {
 /** 显示并聚焦主窗口，确保窗口在可见区域；若窗口已销毁则重新创建 */
 function showAndFocusMainWindow(): void {
   if (process.platform === 'darwin') {
+    if (app.dock) app.dock.show()
     app.show()
   }
 
@@ -311,6 +314,9 @@ function createWindow(): void {
     if (savedState?.isMaximized ?? true) {
       mainWindow?.maximize()
     }
+    if (process.platform === 'darwin' && app.dock) {
+      app.dock.show()
+    }
     mainWindow?.show()
   })
 
@@ -362,6 +368,22 @@ function createWindow(): void {
     })
   }
 
+  // Windows: 点击关闭按钮时隐藏窗口到托盘，而不是退出
+  if (process.platform === 'win32') {
+    mainWindow.on('close', (event) => {
+      if (!getIsQuitting() && getTray()) {
+        // 隐藏前先刷新挂起的窗口状态保存
+        if (windowStateSaveTimer) {
+          clearTimeout(windowStateSaveTimer)
+          windowStateSaveTimer = null
+        }
+        saveMainWindowState()
+        event.preventDefault()
+        mainWindow?.hide()
+      }
+    })
+  }
+
   mainWindow.on('closed', () => {
     mainWindow = null
   })
@@ -393,6 +415,9 @@ app.whenReady().then(bootstrap).catch(handleBootstrapFailure)
  * 单点失败不应阻止窗口和托盘的创建（用户至少要能看到界面）。
  */
 async function bootstrap(): Promise<void> {
+  // 初始化 Proma 版本号（供 User-Agent 等全局标识使用）
+  setPromaVersion(app.getVersion())
+
   // 注册自定义协议 proma-file:// 用于内联预览本地文件。
   // 协议只接受主进程签发的 opaque token，不解析 renderer 提供的绝对路径。
   protocol.handle('proma-file', handlePromaFileRequest)
@@ -414,15 +439,15 @@ async function bootstrap(): Promise<void> {
   // Register IPC handlers
   registerIpcHandlers()
 
-  // Set dock icon on macOS (required for dev mode, bundled apps use Info.plist)
+  // Set dock icon on macOS
+  // 确保 Dock 图标可见（dev 模式下通过 spawn 启动时可能不会自动显示）
   // 如果用户有保存的图标偏好则使用，否则用默认图标
   if (process.platform === 'darwin' && app.dock) {
+    await app.dock.show()
     const { resolveAppIconPath } = require('./ipc')
     const settings = getSettings()
     const variantId = settings.appIconVariant
-    const dockIconPath = variantId
-      ? resolveAppIconPath(variantId)
-      : join(__dirname, 'resources/icon.png')
+    const dockIconPath = resolveAppIconPath(variantId ?? 'default')
     if (dockIconPath && existsSync(dockIconPath)) {
       app.dock.setIcon(dockIconPath)
     }
@@ -463,6 +488,9 @@ async function bootstrap(): Promise<void> {
   if (getSettings().voiceDictation?.enabled === true) {
     safeRun('createVoiceDictationWindow', createVoiceDictationWindow)
   }
+
+  // 飞书实时同步开启时，默认阻止系统自动休眠，保证远程群内继续可用。
+  safeRun('syncFeishuSyncSleepBlocker', () => syncFeishuSyncSleepBlocker(getSettings()))
 
   // 注册全局快捷键
   safeRun('registerGlobalShortcut:quick-task', () =>
@@ -571,6 +599,8 @@ app.on('before-quit', () => {
   stopChatToolsWatcher()
   // 停止所有 Bridge
   stopAllBridges()
+  // 释放飞书同步防休眠
+  stopFeishuSyncSleepBlocker()
   // 注销全局快捷键
   unregisterAllGlobalShortcuts()
   // 销毁快速任务窗口

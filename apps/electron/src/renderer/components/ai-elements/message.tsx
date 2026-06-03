@@ -24,6 +24,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import { ChevronDown, ChevronUp, Paperclip, FileText, Sparkles, Server, Download, MessageSquareText } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { shouldInspectMermaidCodeBlock, shouldRenderMermaidCodeBlock } from '@/lib/mermaid-detection'
 import { Button } from '@/components/ui/button'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
 import {
@@ -34,6 +35,7 @@ import {
 } from '@/components/ui/tooltip'
 import { LoadingIndicator } from '@/components/ui/loading-indicator'
 import { CodeBlock, MermaidBlock } from '@proma/ui'
+import { detectLanguage } from '@proma/core'
 import { FilePathChip, isAbsoluteFilePath, isRelativeFilePath } from './file-path-chip'
 import type { HTMLAttributes, ComponentProps, ReactNode } from 'react'
 import type { FileAttachment } from '@proma/shared'
@@ -443,16 +445,42 @@ function extractText(node: React.ReactNode): string {
 const MarkdownPre = React.memo(function MarkdownPre({
   children: preChildren,
 }: { children?: React.ReactNode }): React.ReactElement {
+  // react-markdown v10 把 <code> 替换成自定义组件后，type 不再是字符串 'code'，
+  // 但 pre 的 code child 要么是原生 'code'（v9 及之前），要么是自定义函数/对象组件（v10+）。
+  // 通过 type 形态过滤掉意外混入的其他原生 HTML 元素（如 span/div），降低未来 react-markdown
+  // 行为变化导致静默误识别的风险
   const codeChild = React.Children.toArray(preChildren).find(
-    (child): child is React.ReactElement =>
-      React.isValidElement(child) && (child as React.ReactElement).type === 'code'
+    (child): child is React.ReactElement => {
+      if (!React.isValidElement(child)) return false
+      const t = (child as React.ReactElement).type
+      return t === 'code' || typeof t === 'function' || typeof t === 'object'
+    }
   ) as React.ReactElement | undefined
 
   if (codeChild) {
     const codeProps = codeChild.props as { className?: string; children?: React.ReactNode }
-    if (codeProps.className?.includes('language-mermaid')) {
-      const mermaidCode = extractText(codeProps.children).replace(/\n$/, '')
-      return <MermaidBlock code={mermaidCode} />
+    const className = codeProps.className ?? ''
+    const hasExplicitLang = /\blanguage-\S+/.test(className)
+
+    // 先用共享 mermaid 识别（覆盖 language-mermaid/mmd 以及未标语言但内容像 Mermaid 的情况）
+    if (shouldInspectMermaidCodeBlock(className)) {
+      // normalize Windows/legacy-Mac line endings before feeding to Mermaid parser
+      const mermaidCode = extractText(codeProps.children).replace(/\r\n?/g, '\n').replace(/\n$/, '')
+      if (shouldRenderMermaidCodeBlock(className, mermaidCode)) {
+        return <MermaidBlock code={mermaidCode} />
+      }
+    }
+
+    // 未标注语言且非 Mermaid 时：highlight.js 自动检测，命中后注入 language-xxx 喂给 CodeBlock 高亮
+    if (!hasExplicitLang) {
+      const rawCode = extractText(codeProps.children).replace(/\n$/, '')
+      const detected = detectLanguage(rawCode)
+      if (detected !== 'text') {
+        const patchedCode = React.cloneElement(codeChild, {
+          className: `${className} language-${detected}`.trim(),
+        } as Partial<React.HTMLAttributes<HTMLElement>>)
+        return <CodeBlock>{patchedCode}</CodeBlock>
+      }
     }
   }
 
@@ -495,7 +523,7 @@ const MarkdownInlineCode = React.memo(function MarkdownInlineCode({
 
   return (
     <code
-      className="rounded bg-foreground/10 px-[0.35em] py-[0.15em] text-[0.875em] font-medium"
+      className="rounded bg-foreground/10 px-[0.35em] py-[0.15em] text-[0.875em] font-mono font-medium"
       {...codeProps}
     >
       {codeChildren}
@@ -524,8 +552,8 @@ export const MessageResponse = React.memo(
     return (
       <div
         className={cn(
-          'prose dark:prose-invert max-w-none text-[15px]',
-          'prose-p:my-1.5 prose-p:leading-[1.6] prose-li:leading-[1.6] prose-pre:my-0 prose-headings:my-2',
+          'prose dark:prose-invert max-w-none text-[length:var(--md-preview-font-size,15px)]',
+          'prose-p:my-1.5 prose-p:leading-[1.6] prose-li:leading-[1.6] prose-pre:my-0 prose-headings:my-2 prose-hr:my-3',
           '[&_.code-block-wrapper+.code-block-wrapper]:mt-4',
           '[&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
           className

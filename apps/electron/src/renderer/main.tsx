@@ -44,16 +44,20 @@ import {
   stickyUserMessageEnabledAtom,
   initializeUiPreferences,
 } from './atoms/ui-preferences'
+import {
+  markdownFontSizeAtom,
+  initializeMarkdownFontSize,
+} from './atoms/markdown-font-size'
 import { useGlobalAgentListeners } from './hooks/useGlobalAgentListeners'
 import { useGlobalChatListeners } from './hooks/useGlobalChatListeners'
-import { tabsAtom, activeTabIdAtom, ensureScratchPadTab, scratchPadContentAtom, scratchPadLoadedAtom, SCRATCH_PAD_ID } from './atoms/tab-atoms'
+import { tabsAtom, activeTabIdAtom, ensureScratchPadTab, getPersistableTabState, scratchPadContentAtom, scratchPadLoadedAtom, SCRATCH_PAD_ID } from './atoms/tab-atoms'
 import type { TabItem } from './atoms/tab-atoms'
 import { chatToolsAtom } from './atoms/chat-tool-atoms'
 import { feishuBotStatesAtom } from './atoms/feishu-atoms'
 import { dingtalkBotStatesAtom } from './atoms/dingtalk-atoms'
 import { currentConversationIdAtom, channelsAtom, channelsLoadedAtom, selectedModelAtom } from './atoms/chat-atoms'
 import { appModeAtom } from './atoms/app-mode'
-import type { FeishuBotBridgeState, FeishuBridgeState, FeishuNotificationSentPayload, DingTalkBotBridgeState, DingTalkBridgeState } from '@proma/shared'
+import type { FeishuBotBridgeState, FeishuBridgeState, DingTalkBotBridgeState, DingTalkBridgeState } from '@proma/shared'
 import { Toaster } from './components/ui/sonner'
 import { toast } from 'sonner'
 import { diffCapabilities } from '@proma/shared'
@@ -393,6 +397,21 @@ function UiPreferencesInitializer(): null {
 }
 
 /**
+ * Markdown 字号初始化组件
+ *
+ * 从主进程加载字号档位，写入 :root CSS 变量驱动 Markdown 预览。
+ */
+function MarkdownFontSizeInitializer(): null {
+  const setMarkdownFontSize = useSetAtom(markdownFontSizeAtom)
+
+  useEffect(() => {
+    initializeMarkdownFontSize(setMarkdownFontSize)
+  }, [setMarkdownFontSize])
+
+  return null
+}
+
+/**
  * Chat IPC 监听器初始化组件
  *
  * 全局挂载，永不销毁。确保 Chat 流式事件
@@ -482,20 +501,6 @@ function FeishuInitializer(): null {
       }))
     })
 
-    // 订阅通知已发送事件 → Sonner + 桌面通知
-    const cleanupNotif = window.electronAPI.onFeishuNotificationSent((payload: FeishuNotificationSentPayload) => {
-      toast('已发送到飞书', {
-        description: `${payload.sessionTitle}: ${payload.preview.slice(0, 60)}`,
-        duration: 3000,
-      })
-      // 桌面通知
-      if (Notification.permission === 'granted') {
-        new Notification('Proma → 飞书', {
-          body: `${payload.sessionTitle} 的回复已发送到飞书`,
-        })
-      }
-    })
-
     // 定期上报在场状态（5 秒间隔 + 焦点变化时即时上报）
     const reportPresence = (): void => {
       const activeSessionId = store.get(currentAgentSessionIdAtom) ?? store.get(currentConversationIdAtom)
@@ -510,7 +515,6 @@ function FeishuInitializer(): null {
 
     return () => {
       cleanupStatus()
-      cleanupNotif()
       clearInterval(interval)
       window.removeEventListener('focus', reportPresence)
       window.removeEventListener('blur', reportPresence)
@@ -624,6 +628,7 @@ function TabStatePersistenceInitializer(): null {
           'sessionId' in t &&
           'type' in t &&
           'title' in t &&
+          (t.type === 'chat' || t.type === 'agent') &&
           validSessionIds.has(t.sessionId),
       )
       if (validTabs.length === 0) {
@@ -647,21 +652,22 @@ function TabStatePersistenceInitializer(): null {
         }
       }
 
-      store.set(tabsAtom, ensureScratchPadTab(validTabs))
+      const activeTab = validTabs.find((t) => t.id === restoredActiveTabId) ?? validTabs[0] ?? null
+      store.set(tabsAtom, ensureScratchPadTab(activeTab ? [activeTab] : []))
       store.set(activeTabIdAtom, restoredActiveTabId)
 
       // 同步 appMode 和 currentSessionId
-      const activeTab = validTabs.find((t) => t.id === restoredActiveTabId)
       if (activeTab) {
-        store.set(appModeAtom, activeTab.type)
         if (activeTab.type === 'chat') {
+          store.set(appModeAtom, 'chat')
           store.set(currentConversationIdAtom, activeTab.sessionId)
         } else {
+          store.set(appModeAtom, 'agent')
           store.set(currentAgentSessionIdAtom, activeTab.sessionId)
         }
       }
 
-      console.log(`[TabRestore] 已恢复 ${validTabs.length} 个标签页`)
+      console.log(`[TabRestore] 已恢复当前会话入口，历史标签 ${validTabs.length} 个已收敛到左侧列表`)
     }).catch((err) => console.error('[TabRestore] 恢复标签页失败:', err))
       .finally(() => { restoredRef.current = true })
   }, [store])
@@ -673,10 +679,9 @@ function TabStatePersistenceInitializer(): null {
     const save = (): void => {
       const tabs = store.get(tabsAtom)
       const activeTabId = store.get(activeTabIdAtom)
-      // 过滤掉 scratch tab，它由代码注入，不参与 tabState 持久化
-      const persistTabs = tabs.filter((t) => t.id !== SCRATCH_PAD_ID)
+      const persistableTabState = getPersistableTabState(tabs, activeTabId)
       window.electronAPI.updateSettings({
-        tabState: { tabs: persistTabs, activeTabId },
+        tabState: persistableTabState,
       }).catch(console.error)
     }
 
@@ -695,9 +700,9 @@ function TabStatePersistenceInitializer(): null {
       // 使用同步 IPC 确保关闭前数据写入磁盘
       const tabs = store.get(tabsAtom)
       const activeTabId = store.get(activeTabIdAtom)
-      const persistTabs = tabs.filter((t) => t.id !== SCRATCH_PAD_ID)
+      const persistableTabState = getPersistableTabState(tabs, activeTabId)
       if (tabs.length > 0 && window.electronAPI.updateSettingsSync) {
-        const ok = window.electronAPI.updateSettingsSync({ tabState: { tabs: persistTabs, activeTabId } })
+        const ok = window.electronAPI.updateSettingsSync({ tabState: persistableTabState })
         if (!ok) {
           console.warn('[TabPersist] sync IPC failed, falling back to async save')
           save()
@@ -848,6 +853,7 @@ if (isQuickTaskWindow) {
     ReactDOM.createRoot(document.getElementById('root')!).render(
       <React.StrictMode>
         <ThemeInitializer />
+        <MarkdownFontSizeInitializer />
         <DetachedPreviewApp />
         <Toaster position="top-right" />
       </React.StrictMode>
@@ -862,6 +868,7 @@ if (isQuickTaskWindow) {
       <NotificationsInitializer />
       <DockBadgeInitializer />
       <UiPreferencesInitializer />
+      <MarkdownFontSizeInitializer />
       <ChatListenersInitializer />
       <AgentListenersInitializer />
       <ChatToolInitializer />

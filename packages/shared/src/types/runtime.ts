@@ -138,6 +138,20 @@ export interface UnstagedChangesResult {
   gitRootNames: string[]
 }
 
+/** Git Worktree 信息 */
+export interface WorktreeInfo {
+  /** worktree 绝对路径 */
+  path: string
+  /** 分支名 */
+  branch: string
+  /** HEAD commit hash (short) */
+  head: string
+  /** 是否为主 worktree */
+  isMain: boolean
+  /** 显示名（路径最后一段） */
+  name: string
+}
+
 /** 获取文件 Diff 的输入 */
 export interface GetFileDiffInput {
   dirPath: string
@@ -146,6 +160,8 @@ export interface GetFileDiffInput {
   gitRoot?: string
   /** 当前 Agent 会话 ID，用于主进程校验可访问路径 */
   sessionId?: string
+  /** 基准 ref（如 "origin/main"），用于 worktree vs main 模式 */
+  baseRef?: string
 }
 
 /** 独立预览窗口输入 */
@@ -229,6 +245,16 @@ export interface EditorApp {
   name: string
   /** .app 路径，如 "/Applications/Visual Studio Code.app" */
   path: string
+}
+
+/** 某个文件路径在本机系统中的默认打开应用信息 */
+export interface DefaultAppInfo {
+  /** 显示名称，如 "Visual Studio Code"、"Typora"、"Preview" */
+  name: string
+  /** 应用绝对路径（macOS 为 .app bundle，Windows 为 .exe），用于点击打开/调试 */
+  appPath: string
+  /** App 图标的 PNG dataURL；通过 Electron app.getFileIcon 抓取 */
+  iconDataUrl: string
 }
 
 /**
@@ -324,12 +350,18 @@ export const IPC_CHANNELS = {
   /** 还原文件变更 */
   REVERT_FILE: 'git:revert-file',
   GET_DIFF_CONTENTS: 'git:get-diff-contents',
+  /** 列出 Git Worktree */
+  LIST_WORKTREES: 'git:list-worktrees',
+  /** 获取 Worktree 相对于基准分支的全量变更 */
+  GET_WORKTREE_CHANGES: 'git:get-worktree-changes',
   /** 在系统默认浏览器中打开外部链接 */
   OPEN_EXTERNAL: 'shell:open-external',
   /** 用系统默认应用打开任意文件 */
   SYSTEM_OPEN_FILE: 'shell:system-open-file',
   /** 扫描系统中可用的编辑器应用 */
   SCAN_EDITORS: 'shell:scan-editors',
+  /** 查询某个文件在本机系统中的默认打开应用信息（带图标） */
+  GET_DEFAULT_APP_FOR_FILE: 'shell:get-default-app-for-file',
   /** 打开独立预览窗口 */
   OPEN_DETACHED_PREVIEW: 'preview:open-detached',
   /** 获取独立预览窗口数据 */

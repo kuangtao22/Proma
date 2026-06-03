@@ -100,7 +100,7 @@ export function ScratchPadView(): React.ReactElement {
 
   const activeSessionId = React.useMemo(() => {
     const activeTab = tabs.find((t) => t.id === activeTabId)
-    if (activeTab?.type === 'agent') return activeTab.sessionId
+    if (activeTab?.type === 'agent' || activeTab?.type === 'preview') return activeTab.sessionId
     const agentTab = [...tabs].reverse().find((t) => t.type === 'agent')
     return agentTab?.sessionId ?? null
   }, [tabs, activeTabId])
@@ -254,6 +254,19 @@ export function ScratchPadView(): React.ReactElement {
     <div ref={containerRef} className="relative flex flex-col h-full">
       <div className="flex-1 overflow-auto scrollbar-thin px-8 pt-6 pb-20">
         <div className="max-w-3xl mx-auto h-full">
+          <div className="mb-5 flex flex-col gap-2">
+            <div>
+              <h1 className="text-xl font-semibold tracking-normal text-foreground">草稿页</h1>
+              <p className="mt-1 text-[13px] leading-5 text-muted-foreground">
+                临时记录内容、整理 Todo、暂存剪贴板文本，稍后再导出到会话或工作区。
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-1.5 text-[11px] text-muted-foreground/80">
+              <span className="rounded-md bg-muted px-2 py-1">临时笔记</span>
+              <span className="rounded-md bg-muted px-2 py-1">Todo 草稿</span>
+              <span className="rounded-md bg-muted px-2 py-1">剪贴板暂存</span>
+            </div>
+          </div>
           {loaded ? (
             <EditorContent
               editor={editor}

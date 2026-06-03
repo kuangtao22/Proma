@@ -1035,6 +1035,7 @@ function isNewerVersion(a: string, b: string): boolean {
 interface WorkspaceConfig {
   attachedDirectories?: string[]
   attachedFiles?: string[]
+  worktreeRepos?: import('@proma/shared').WorkspaceWorktreeRepo[]
 }
 
 function getWorkspaceConfigPath(workspaceSlug: string): string {
@@ -1057,6 +1058,9 @@ function readWorkspaceConfig(workspaceSlug: string): WorkspaceConfig {
         : undefined,
       attachedFiles: Array.isArray(data.attachedFiles)
         ? data.attachedFiles.filter((file): file is string => typeof file === 'string')
+        : undefined,
+      worktreeRepos: Array.isArray(data.worktreeRepos)
+        ? data.worktreeRepos.filter((r) => r && typeof r.name === 'string' && typeof r.repoPath === 'string' && typeof r.worktreesPath === 'string')
         : undefined,
     }
   } catch {
@@ -1127,4 +1131,77 @@ export function detachWorkspaceFile(workspaceSlug: string, filePath: string): st
   writeWorkspaceConfig(workspaceSlug, { ...config, attachedFiles: updated })
   console.log(`[Agent 工作区] 已移除工作区文件: ${filePath} ← ${workspaceSlug}`)
   return updated
+}
+
+// ===== 工作区级 Worktree 仓库管理 =====
+
+export function getWorktreeRepos(workspaceSlug: string): import('@proma/shared').WorkspaceWorktreeRepo[] {
+  const config = readWorkspaceConfig(workspaceSlug)
+  const repos = config.worktreeRepos ?? []
+  return repos.sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99))
+}
+
+export function addWorktreeRepo(workspaceSlug: string, repo: import('@proma/shared').WorkspaceWorktreeRepo): import('@proma/shared').WorkspaceWorktreeRepo[] {
+  const config = readWorkspaceConfig(workspaceSlug)
+  const existing = config.worktreeRepos ?? []
+
+  if (existing.some((r) => r.repoPath === repo.repoPath)) {
+    return existing
+  }
+
+  const updated = [...existing, repo]
+  writeWorkspaceConfig(workspaceSlug, { ...config, worktreeRepos: updated })
+  console.log(`[Agent 工作区] 已添加 worktree 仓库: ${repo.name} (${repo.repoPath}) → ${workspaceSlug}`)
+  return updated
+}
+
+export function removeWorktreeRepo(workspaceSlug: string, repoPath: string): import('@proma/shared').WorkspaceWorktreeRepo[] {
+  const config = readWorkspaceConfig(workspaceSlug)
+  const existing = config.worktreeRepos ?? []
+  const updated = existing.filter((r) => r.repoPath !== repoPath)
+  writeWorkspaceConfig(workspaceSlug, { ...config, worktreeRepos: updated })
+  console.log(`[Agent 工作区] 已移除 worktree 仓库: ${repoPath} ← ${workspaceSlug}`)
+  return updated
+}
+
+/**
+ * 清理所有工作区中不存在的附加目录和附加文件
+ * @returns 清理的条目总数
+ */
+export function cleanupStaleWorkspaceAttachedPaths(): number {
+  const workspaces = listAgentWorkspaces()
+  let count = 0
+
+  for (const ws of workspaces) {
+    const config = readWorkspaceConfig(ws.slug)
+    let changed = false
+
+    if (config.attachedDirectories?.length) {
+      const valid = config.attachedDirectories.filter((d) => existsSync(d))
+      if (valid.length < config.attachedDirectories.length) {
+        count += config.attachedDirectories.length - valid.length
+        config.attachedDirectories = valid.length > 0 ? valid : undefined
+        changed = true
+      }
+    }
+
+    if (config.attachedFiles?.length) {
+      const valid = config.attachedFiles.filter((f) => existsSync(f))
+      if (valid.length < config.attachedFiles.length) {
+        count += config.attachedFiles.length - valid.length
+        config.attachedFiles = valid.length > 0 ? valid : undefined
+        changed = true
+      }
+    }
+
+    if (changed) {
+      writeWorkspaceConfig(ws.slug, config)
+    }
+  }
+
+  if (count > 0) {
+    console.log(`[Agent 工作区] 清理了 ${count} 个不存在的附加路径`)
+  }
+
+  return count
 }

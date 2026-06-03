@@ -92,8 +92,6 @@ import type {
   FeishuTestResult,
   FeishuChatBinding,
   FeishuPresenceReport,
-  FeishuNotifyMode,
-  FeishuNotificationSentPayload,
   FeishuUpdateBindingInput,
   DingTalkConfig,
   DingTalkConfigInput,
@@ -161,6 +159,10 @@ export interface ElectronAPI {
   revertFile: (input: import('@proma/shared').RevertFileInput) => Promise<void>
   /** 获取文件新旧版本内容 */
   getDiffContents: (input: import('@proma/shared').GetFileDiffInput) => Promise<{ oldContent: string; newContent: string } | null>
+  /** 列出 Git Worktree */
+  listWorktrees: (repoPath: string, sessionId: string) => Promise<import('@proma/shared').WorktreeInfo[]>
+  /** 获取 Worktree 相对于基准分支的全量变更 */
+  getWorktreeChanges: (worktreePath: string, baseBranch: string, sessionId: string) => Promise<import('@proma/shared').UnstagedChangesResult>
   /** 在独立窗口打开当前文件预览 */
   openDetachedPreview: (input: DetachedPreviewWindowInput) => Promise<string | null>
   /** 获取独立预览窗口数据 */
@@ -428,6 +430,9 @@ export interface ElectronAPI {
   /** 切换 Agent 会话手动工作中状态 */
   toggleManualWorkingAgentSession: (id: string) => Promise<AgentSessionMeta>
 
+  /** 确认 Agent 会话已完成（清除 completedButUnconfirmed 和 manualWorking） */
+  confirmWorkingDoneAgentSession: (id: string) => Promise<AgentSessionMeta>
+
   /** 切换 Agent 会话归档状态 */
   toggleArchiveAgentSession: (id: string) => Promise<AgentSessionMeta>
 
@@ -655,6 +660,12 @@ export interface ElectronAPI {
 
   /** 获取工作区附加文件列表 */
   getWorkspaceAttachedFiles: (workspaceSlug: string) => Promise<string[]>
+  /** 获取工作区 worktree 仓库配置列表 */
+  getWorktreeRepos: (workspaceSlug: string) => Promise<import('@proma/shared').WorkspaceWorktreeRepo[]>
+  /** 添加 worktree 仓库到工作区配置 */
+  addWorktreeRepo: (workspaceSlug: string, repo: import('@proma/shared').WorkspaceWorktreeRepo) => Promise<import('@proma/shared').WorkspaceWorktreeRepo[]>
+  /** 从工作区配置移除 worktree 仓库 */
+  removeWorktreeRepo: (workspaceSlug: string, repoPath: string) => Promise<import('@proma/shared').WorkspaceWorktreeRepo[]>
 
   // ===== Agent 文件系统操作 =====
 
@@ -678,6 +689,9 @@ export interface ElectronAPI {
 
   /** 扫描系统中可用的编辑器应用（仅 macOS） */
   scanEditors: () => Promise<import('@proma/shared').EditorApp[]>
+
+  /** 查询本机为该文件类型注册的默认打开应用（含图标 dataURL） */
+  getDefaultAppForFile: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<import('@proma/shared').DefaultAppInfo | null>
 
   /** 在系统文件管理器中显示文件 */
   showInFolder: (filePath: string) => Promise<void>
@@ -811,12 +825,8 @@ export interface ElectronAPI {
   removeFeishuBinding: (chatId: string) => Promise<boolean>
   /** 上报用户在场状态 */
   reportFeishuPresence: (report: FeishuPresenceReport) => Promise<void>
-  /** 设置会话通知模式 */
-  setFeishuSessionNotify: (sessionId: string, mode: FeishuNotifyMode) => Promise<void>
   /** 订阅飞书 Bridge 状态变化 */
   onFeishuStatusChanged: (callback: (state: FeishuBridgeState) => void) => () => void
-  /** 订阅飞书通知已发送事件 */
-  onFeishuNotificationSent: (callback: (payload: FeishuNotificationSentPayload) => void) => () => void
 
   // --- 多 Bot v2 API ---
 
@@ -834,6 +844,17 @@ export interface ElectronAPI {
   stopFeishuBot: (botId: string) => Promise<void>
   /** 获取多 Bot 状态 */
   getFeishuMultiStatus: () => Promise<import('@proma/shared').FeishuMultiBridgeState>
+
+  // --- 扫码注册 ---
+
+  /** 启动扫码注册流程，等待用户扫码 + 飞书确认后返回 App ID/Secret */
+  registerFeishuApp: () => Promise<import('@proma/shared').FeishuRegisterAppResult>
+  /** 取消正在进行的扫码注册流程 */
+  cancelFeishuRegistration: () => Promise<void>
+  /** 监听二维码 URL 生成 */
+  onFeishuRegisterQrcode: (callback: (payload: import('@proma/shared').FeishuRegisterAppQRCode) => void) => () => void
+  /** 监听注册流程状态变化 */
+  onFeishuRegisterStatus: (callback: (payload: import('@proma/shared').FeishuRegisterAppStatus) => void) => () => void
 
   // ===== 钉钉集成 =====
 
@@ -1036,6 +1057,14 @@ const electronAPI: ElectronAPI = {
 
   getDiffContents: (input: import('@proma/shared').GetFileDiffInput) => {
     return ipcRenderer.invoke(IPC_CHANNELS.GET_DIFF_CONTENTS, input)
+  },
+
+  listWorktrees: (repoPath: string, sessionId: string) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.LIST_WORKTREES, repoPath, sessionId)
+  },
+
+  getWorktreeChanges: (worktreePath: string, baseBranch: string, sessionId: string) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.GET_WORKTREE_CHANGES, worktreePath, baseBranch, sessionId)
   },
 
   openDetachedPreview: (input: DetachedPreviewWindowInput) => {
@@ -1390,6 +1419,10 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.TOGGLE_MANUAL_WORKING, id)
   },
 
+  confirmWorkingDoneAgentSession: (id: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.CONFIRM_WORKING_DONE, id)
+  },
+
   toggleArchiveAgentSession: (id: string) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.TOGGLE_ARCHIVE, id)
   },
@@ -1722,6 +1755,18 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_WORKSPACE_ATTACHED_FILES, workspaceSlug)
   },
 
+  getWorktreeRepos: (workspaceSlug: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_WORKTREE_REPOS, workspaceSlug)
+  },
+
+  addWorktreeRepo: (workspaceSlug: string, repo: import('@proma/shared').WorkspaceWorktreeRepo) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.ADD_WORKTREE_REPO, workspaceSlug, repo)
+  },
+
+  removeWorktreeRepo: (workspaceSlug: string, repoPath: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.REMOVE_WORKTREE_REPO, workspaceSlug, repoPath)
+  },
+
   // Agent 文件系统操作
   getAgentSessionPath: (workspaceId: string, sessionId: string) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_SESSION_PATH, workspaceId, sessionId)
@@ -1749,6 +1794,10 @@ const electronAPI: ElectronAPI = {
 
   scanEditors: () => {
     return ipcRenderer.invoke(IPC_CHANNELS.SCAN_EDITORS)
+  },
+
+  getDefaultAppForFile: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.GET_DEFAULT_APP_FOR_FILE, filePath, access) as Promise<import('@proma/shared').DefaultAppInfo | null>
   },
 
   showInFolder: (filePath: string) => {
@@ -1923,20 +1972,10 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.REPORT_PRESENCE, report)
   },
 
-  setFeishuSessionNotify: (sessionId: string, mode: FeishuNotifyMode) => {
-    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.SET_SESSION_NOTIFY, sessionId, mode)
-  },
-
   onFeishuStatusChanged: (callback: (state: FeishuBridgeState) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, state: FeishuBridgeState): void => callback(state)
     ipcRenderer.on(FEISHU_IPC_CHANNELS.STATUS_CHANGED, listener)
     return () => { ipcRenderer.removeListener(FEISHU_IPC_CHANNELS.STATUS_CHANGED, listener) }
-  },
-
-  onFeishuNotificationSent: (callback: (payload: FeishuNotificationSentPayload) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, payload: FeishuNotificationSentPayload): void => callback(payload)
-    ipcRenderer.on(FEISHU_IPC_CHANNELS.NOTIFICATION_SENT, listener)
-    return () => { ipcRenderer.removeListener(FEISHU_IPC_CHANNELS.NOTIFICATION_SENT, listener) }
   },
 
   // --- 多 Bot v2 API ---
@@ -1967,6 +2006,28 @@ const electronAPI: ElectronAPI = {
 
   getFeishuMultiStatus: () => {
     return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.GET_MULTI_STATUS)
+  },
+
+  // --- 扫码注册 ---
+
+  registerFeishuApp: () => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.REGISTER_APP_START)
+  },
+
+  cancelFeishuRegistration: () => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.REGISTER_APP_CANCEL)
+  },
+
+  onFeishuRegisterQrcode: (callback: (payload: import('@proma/shared').FeishuRegisterAppQRCode) => void) => {
+    const listener = (_: unknown, payload: import('@proma/shared').FeishuRegisterAppQRCode) => callback(payload)
+    ipcRenderer.on(FEISHU_IPC_CHANNELS.REGISTER_APP_QRCODE, listener)
+    return () => { ipcRenderer.removeListener(FEISHU_IPC_CHANNELS.REGISTER_APP_QRCODE, listener) }
+  },
+
+  onFeishuRegisterStatus: (callback: (payload: import('@proma/shared').FeishuRegisterAppStatus) => void) => {
+    const listener = (_: unknown, payload: import('@proma/shared').FeishuRegisterAppStatus) => callback(payload)
+    ipcRenderer.on(FEISHU_IPC_CHANNELS.REGISTER_APP_STATUS, listener)
+    return () => { ipcRenderer.removeListener(FEISHU_IPC_CHANNELS.REGISTER_APP_STATUS, listener) }
   },
 
   // ===== 微信集成 =====

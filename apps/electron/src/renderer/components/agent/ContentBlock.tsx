@@ -199,6 +199,8 @@ export interface ContentBlockProps {
   allMessages: SDKMessage[]
   /** 相对路径解析基准（文件链接用） */
   basePath?: string
+  /** 多个可解析相对路径的基准目录 */
+  basePaths?: string[]
   /** 是否启用入场动画 */
   animate?: boolean
   /** 在父级中的索引（用于动画延迟） */
@@ -258,22 +260,6 @@ function PromptRow({ prompt, dimmed = false }: { prompt: string; dimmed?: boolea
 }
 
 // ===== 工具短语 diff 着色 =====
-
-/** 将 displayLabel 中的 +N 染绿、-N 染红（仅对 Edit/Write 工具生效，避免 `head -5` 等命令参数被误染） */
-function renderLabelWithDiffColors(label: string, toolName: string): React.ReactNode {
-  if (toolName !== 'Edit' && toolName !== 'Write') return label
-  const parts = label.split(/((?:^|(?<=\s))[+-]\d+)/g)
-  if (parts.length === 1) return label
-  return parts.map((part, i) => {
-    if (/^\+\d+$/.test(part)) {
-      return <span key={i} className="text-green-500">{part}</span>
-    }
-    if (/^-\d+$/.test(part)) {
-      return <span key={i} className="text-red-500">{part}</span>
-    }
-    return part
-  })
-}
 
 function TaskGetCollapsedSummary({ task }: { task: ParsedTaskGetResult }): React.ReactElement {
   const blockPreview = task.blocks.length > 0
@@ -494,7 +480,7 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
       <button
         type="button"
         className={cn(
-          'flex w-full max-w-full items-center gap-2 py-0.5 text-left transition-opacity group',
+          'inline-flex max-w-full items-center gap-2 py-0.5 text-left transition-opacity group',
           'hover:opacity-70',
         )}
         onClick={() => setExpanded(!expanded)}
@@ -508,32 +494,44 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
         <ToolIcon className={cn('size-3.5 shrink-0', dimmed ? 'text-muted-foreground/70' : 'text-muted-foreground')} />
 
         <span className={cn(
-          'truncate text-[14px]',
-          taskGetSummary || taskListSummary ? 'shrink-0' : 'min-w-0 flex-1',
+          'min-w-0 truncate text-[14px]',
+          taskGetSummary || taskListSummary ? 'shrink-0' : '',
           dimmed ? 'text-muted-foreground/70' : 'text-muted-foreground',
-        )}>{renderLabelWithDiffColors(displayLabel, block.name)}</span>
+        )}>{displayLabel}</span>
+
+        {phrase.diffStats && (isCompleted || !isStreaming) && (
+          <span className="shrink-0 text-[14px] tabular-nums">
+            {phrase.diffStats.additions > 0 && (
+              <span className="text-green-500">+{phrase.diffStats.additions}</span>
+            )}
+            {phrase.diffStats.additions > 0 && phrase.diffStats.deletions > 0 && ' '}
+            {phrase.diffStats.deletions > 0 && (
+              <span className="text-red-500">-{phrase.diffStats.deletions}</span>
+            )}
+          </span>
+        )}
 
         {taskGetSummary && (
-          <span className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span className="flex min-w-0 items-center gap-1.5">
             <TaskGetCollapsedSummary task={taskGetSummary} />
           </span>
         )}
 
         {taskListSummary && (
-          <span className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span className="flex min-w-0 items-center gap-1.5">
             <TaskListCollapsedSummary tasks={taskListSummary} />
           </span>
         )}
 
         <ChevronRight
           className={cn(
-            'ml-auto shrink-0 size-3 text-muted-foreground/40 opacity-0 group-hover:opacity-100 transition-all duration-150',
-            expanded && 'rotate-90 opacity-100',
+            'shrink-0 size-3 text-muted-foreground/45 transition-transform duration-150',
+            expanded && 'rotate-90',
           )}
         />
 
         {isPreviewable && (
-          <PreviewOpenButton filePath={filePath} expanded={expanded} />
+          <PreviewOpenButton filePath={filePath} />
         )}
       </button>
 
@@ -648,13 +646,13 @@ function ThinkingBlock({ block, dimmed = false }: ThinkingBlockProps): React.Rea
 
 // ===== ContentBlock 主组件 =====
 
-export function ContentBlock({ block, allMessages, basePath, animate = false, index = 0, dimmed = false, childBlocks, isStreaming }: ContentBlockProps): React.ReactElement | null {
+export function ContentBlock({ block, allMessages, basePath, basePaths, animate = false, index = 0, dimmed = false, childBlocks, isStreaming }: ContentBlockProps): React.ReactElement | null {
   // text 块 — 主要内容，不受 dimmed 影响
   if (block.type === 'text') {
     const textBlock = block as SDKTextBlock
     if (!textBlock.text) return null
     return (
-      <MessageResponse basePath={basePath}>{textBlock.text}</MessageResponse>
+      <MessageResponse basePath={basePath} basePaths={basePaths}>{textBlock.text}</MessageResponse>
     )
   }
 

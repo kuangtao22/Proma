@@ -76,6 +76,19 @@ export interface FeishuBotConfigInput {
   defaultModelId?: string
 }
 
+// ===== Session 镜像 =====
+
+/** 飞书 Session 同步模式 */
+export type FeishuSessionSyncMode = 'off' | 'stream'
+
+/** 飞书 Session 镜像设置：多个 Bot 中只能选择一个作为同步 Bot */
+export interface FeishuSessionMirrorSettings {
+  /** 同步模式：关闭 / 实时同步 */
+  mode: FeishuSessionSyncMode
+  /** 负责创建 Session 镜像群与更新卡片的 Bot ID */
+  botId?: string
+}
+
 // ===== Bridge 连接状态 =====
 
 /** 飞书 Bridge 连接状态 */
@@ -134,8 +147,8 @@ export interface FeishuChatBinding {
   channelId: string
   /** 模型 ID */
   modelId?: string
-  /** 会话模式 */
-  mode: 'agent' | 'chat'
+  /** 绑定来源：飞书主动绑定或 Proma 桌面 Session 镜像 */
+  source?: 'feishu' | 'session-mirror'
   /** 聊天类型（单聊或群聊） */
   chatType?: 'p2p' | 'group'
   /** 群名称（群聊时） */
@@ -143,11 +156,6 @@ export interface FeishuChatBinding {
   /** 创建时间 */
   createdAt: number
 }
-
-// ===== 通知模式 =====
-
-/** 飞书通知模式（per-session） */
-export type FeishuNotifyMode = 'auto' | 'always' | 'off'
 
 // ===== 连接测试 =====
 
@@ -167,13 +175,6 @@ export interface FeishuPresenceReport {
   activeSessionId: string | null
   /** 最后交互时间戳 */
   lastInteractionAt: number
-}
-
-/** 飞书通知已发送的事件载荷 */
-export interface FeishuNotificationSentPayload {
-  sessionId: string
-  sessionTitle: string
-  preview: string
 }
 
 // ===== 群聊相关类型 =====
@@ -200,6 +201,8 @@ export interface FeishuGroupInfo {
   description?: string
   /** 群成员列表 */
   members?: FeishuGroupMember[]
+  /** 群内真人数量（来自 chat.get 的 user_count，不含机器人）。免 @ 续聊判定的权威依据。 */
+  userCount?: number
   /** 缓存时间戳 */
   cachedAt: number
 }
@@ -275,10 +278,6 @@ export const FEISHU_IPC_CHANNELS = {
   REMOVE_BINDING: 'feishu:remove-binding',
   /** 渲染进程 → 主进程：上报用户在场状态 */
   REPORT_PRESENCE: 'feishu:report-presence',
-  /** 渲染进程 → 主进程：设置某会话的通知模式 */
-  SET_SESSION_NOTIFY: 'feishu:set-session-notify',
-  /** 主进程 → 渲染进程：飞书通知已发送 */
-  NOTIFICATION_SENT: 'feishu:notification-sent',
 
   // ===== 多 Bot（v2）=====
 
@@ -298,4 +297,42 @@ export const FEISHU_IPC_CHANNELS = {
   GET_MULTI_STATUS: 'feishu:get-multi-status',
   /** 多 Bot 状态变化推送 */
   MULTI_STATUS_CHANGED: 'feishu:multi-status-changed',
+
+  // ===== 扫码注册（v3）=====
+
+  /** 启动扫码注册流程，返回最终的 App ID/Secret */
+  REGISTER_APP_START: 'feishu:register-app-start',
+  /** 主进程 → 渲染进程：二维码 URL 已生成 */
+  REGISTER_APP_QRCODE: 'feishu:register-app-qrcode',
+  /** 主进程 → 渲染进程：注册流程状态变化（polling/slow_down/domain_switched） */
+  REGISTER_APP_STATUS: 'feishu:register-app-status',
+  /** 取消正在进行的扫码注册流程 */
+  REGISTER_APP_CANCEL: 'feishu:register-app-cancel',
 } as const
+
+// ===== 扫码注册类型 =====
+
+export interface FeishuRegisterAppQRCode {
+  /** 扫码 URL */
+  url: string
+  /** PNG dataURL（主进程预生成，渲染层直接用 <img src> 渲染） */
+  dataUrl: string
+  /** 有效期秒数 */
+  expireIn: number
+}
+
+export interface FeishuRegisterAppStatus {
+  status: 'polling' | 'slow_down' | 'domain_switched'
+  interval?: number
+}
+
+export interface FeishuRegisterAppResult {
+  /** 创建出的飞书应用 App ID */
+  appId: string
+  /** 应用 App Secret（明文，仅一次性返回）*/
+  appSecret: string
+  /** 租户品牌（feishu / lark）*/
+  tenantBrand?: 'feishu' | 'lark'
+  /** 扫码用户的 open_id */
+  operatorOpenId?: string
+}

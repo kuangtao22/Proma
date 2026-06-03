@@ -1,108 +1,107 @@
 /**
- * useCloseTab — 统一的标签页关闭逻辑
+ * useCloseTab — 统一的当前会话入口关闭逻辑
  *
  * 被 TabBar（×按钮/中键）和 GlobalShortcuts（Cmd+W）共用，
- * 解决原实现"关闭 Agent Tab 时不调 stopAgent 导致 claude 子进程残留"的问题。
  *
  * 关键行为：
- * - Agent Tab 关闭前先调 window.electronAPI.stopAgent(sessionId) 终止子进程
- * - 若 Agent 正在流式中，先弹 AlertDialog 让用户确认（通过 pendingCloseTabIdAtom 驱动）
- * - Chat Tab 走原有 UI 清理链路
+ * - 关闭当前会话入口只回到 Scratch Pad，不停止后台 Agent
+ * - 运行中或阻塞中的会话继续通过左侧 Working 区恢复
+ * - idle 状态的 Agent 会话在用户主动关闭 Tab 时自动从 Working 移除
+ * - 真正删除/归档时由侧边栏路径负责清理 per-session 状态
  */
 
 import * as React from 'react'
-import { atom, useAtom, useAtomValue, useSetAtom } from 'jotai'
+import { useAtom, useSetAtom } from 'jotai'
+import { useStore } from 'jotai'
 import {
   tabsAtom,
   activeTabIdAtom,
   closeTab,
+  isPreviewTab,
+  sessionViewStateMapAtom,
 } from '@/atoms/tab-atoms'
 import {
-  agentRunningSessionIdsAtom,
+  agentSessionsAtom,
+  agentSessionIndicatorMapAtom,
+  unviewedCompletedSessionIdsAtom,
   workingDoneSessionIdsAtom,
-  agentDiffPanelTabAtom,
-  agentDiffRefreshVersionAtom,
-  agentDiffUnseenChangesAtom,
-  agentDiffUnseenFilesAtom,
 } from '@/atoms/agent-atoms'
-import { previewPanelOpenMapAtom, previewFileMapAtom } from '@/atoms/preview-atoms'
-import { clearPreviewCacheForSession } from '@/components/diff/DiffTabContent'
-import {
-  conversationModelsAtom,
-  conversationContextLengthAtom,
-  conversationThinkingEnabledAtom,
-  conversationParallelModeAtom,
-} from '@/atoms/chat-atoms'
-import { conversationPromptIdAtom } from '@/atoms/system-prompt-atoms'
 import { useSyncActiveTabSideEffects } from '@/hooks/useSyncActiveTabSideEffects'
 
-/** 触发"关闭确认对话框"的状态：存放待关闭的 tabId，null 表示无对话框 */
-export const pendingCloseTabIdAtom = atom<string | null>(null)
-
 interface UseCloseTabReturn {
-  /** 请求关闭：若 Agent 流式中则弹确认，否则直接关 */
+  /** 请求关闭当前会话入口 */
   requestClose: (tabId: string) => void
-  /** 直接执行关闭（跳过确认，供 Dialog 的"确认"按钮使用） */
+  /** 直接执行关闭 */
   executeClose: (tabId: string) => void
 }
 
 export function useCloseTab(): UseCloseTabReturn {
   const [tabs, setTabs] = useAtom(tabsAtom)
   const [activeTabId, setActiveTabId] = useAtom(activeTabIdAtom)
-  const runningSessionIds = useAtomValue(agentRunningSessionIdsAtom)
-  const setPending = useSetAtom(pendingCloseTabIdAtom)
-  const setWorkingDone = useSetAtom(workingDoneSessionIdsAtom)
   const syncActiveTabSideEffects = useSyncActiveTabSideEffects()
+  const store = useStore()
+  const setUnviewedCompleted = useSetAtom(unviewedCompletedSessionIdsAtom)
+  const setWorkingDone = useSetAtom(workingDoneSessionIdsAtom)
+  const setAgentSessions = useSetAtom(agentSessionsAtom)
+  const setViewStateMap = useSetAtom(sessionViewStateMapAtom)
 
-  // per-conversation / per-session Map atoms（关闭 Tab 时需要清理对应条目）
-  const setConvModels = useSetAtom(conversationModelsAtom)
-  const setConvContextLength = useSetAtom(conversationContextLengthAtom)
-  const setConvThinking = useSetAtom(conversationThinkingEnabledAtom)
-  const setConvParallel = useSetAtom(conversationParallelModeAtom)
-  const setConvPromptId = useSetAtom(conversationPromptIdAtom)
-  const setPreviewPanelOpen = useSetAtom(previewPanelOpenMapAtom)
-  const setPreviewFile = useSetAtom(previewFileMapAtom)
-  const setDiffPanelTab = useSetAtom(agentDiffPanelTabAtom)
-  const setDiffRefreshVersion = useSetAtom(agentDiffRefreshVersionAtom)
-  const setDiffUnseen = useSetAtom(agentDiffUnseenChangesAtom)
-  const setDiffUnseenFiles = useSetAtom(agentDiffUnseenFilesAtom)
+  const removeIdleSessionFromWorking = React.useCallback((sessionId: string) => {
+    const indicatorMap = store.get(agentSessionIndicatorMapAtom)
+    const status = indicatorMap.get(sessionId)
+    // running 或 blocked 的会话不移除
+    if (status === 'running' || status === 'blocked') return
 
-  const cleanupMapAtoms = React.useCallback((tabId: string) => {
-    const deleteKey = <T,>(prev: Map<string, T>): Map<string, T> => {
-      if (!prev.has(tabId)) return prev
-      const map = new Map(prev)
-      map.delete(tabId)
-      return map
-    }
-    setConvModels(deleteKey)
-    setConvContextLength(deleteKey)
-    setConvThinking(deleteKey)
-    setConvParallel(deleteKey)
-    setConvPromptId(deleteKey)
-    setPreviewPanelOpen(deleteKey)
-    setPreviewFile(deleteKey)
-    setDiffPanelTab(deleteKey)
-    setDiffRefreshVersion(deleteKey)
-    setDiffUnseen(deleteKey)
-    setDiffUnseenFiles(deleteKey)
-    clearPreviewCacheForSession(tabId)
-  }, [setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles])
+    // 通过 IPC 清除持久化的 completedButUnconfirmed 和 manualWorking 状态
+    window.electronAPI.confirmWorkingDoneAgentSession(sessionId)
+      .then((updated) => {
+        setAgentSessions((prev) =>
+          prev.map((s) => (s.id === updated.id ? updated : s))
+        )
+      })
+      .catch(console.error)
+
+    setWorkingDone((prev) => {
+      if (!prev.has(sessionId)) return prev
+      const next = new Set(prev)
+      next.delete(sessionId)
+      return next
+    })
+    setUnviewedCompleted((prev) => {
+      if (!prev.has(sessionId)) return prev
+      const next = new Set(prev)
+      next.delete(sessionId)
+      return next
+    })
+  }, [store, setAgentSessions, setWorkingDone, setUnviewedCompleted])
 
   const executeClose = React.useCallback((tabId: string) => {
-    const tab = tabs.find((t) => t.id === tabId)
-
-    // Agent 类型：先通知主进程中止 SDK 子进程，再做 UI 清理
-    // 这是 Issue #357 的核心修复：断开"UI 关闭 → IPC stop → claude subprocess 退出"断链
-    if (tab?.type === 'agent') {
-      window.electronAPI.stopAgent(tab.sessionId).catch((err) => {
-        console.error('[useCloseTab] stopAgent 失败:', err)
-      })
-    }
-
+    const closingTab = tabs.find((t) => t.id === tabId)
     const wasActive = activeTabId === tabId
     const result = closeTab(tabs, activeTabId, tabId)
     setTabs(result.tabs)
     setActiveTabId(result.activeTabId)
+
+    // 同步该会话的视图状态：
+    // - 关闭预览 Tab → 预览不再打开（保留 lastView，切回不再重建预览）
+    // - 关闭会话 Tab（连带其预览）→ 删除整条记录
+    if (closingTab) {
+      if (isPreviewTab(closingTab)) {
+        setViewStateMap((prev) => {
+          const current = prev.get(closingTab.sessionId)
+          if (!current) return prev
+          const next = new Map(prev)
+          next.set(closingTab.sessionId, { previewTabOpen: false, lastView: current.lastView })
+          return next
+        })
+      } else if (closingTab.type === 'agent') {
+        setViewStateMap((prev) => {
+          if (!prev.has(closingTab.sessionId)) return prev
+          const next = new Map(prev)
+          next.delete(closingTab.sessionId)
+          return next
+        })
+      }
+    }
 
     if (wasActive) {
       const newActiveTab = result.activeTabId
@@ -111,24 +110,15 @@ export function useCloseTab(): UseCloseTabReturn {
       syncActiveTabSideEffects(newActiveTab)
     }
 
-    cleanupMapAtoms(tabId)
-    setWorkingDone((prev) => {
-      if (!prev.has(tabId)) return prev
-      const next = new Set(prev)
-      next.delete(tabId)
-      return next
-    })
-  }, [tabs, activeTabId, setTabs, setActiveTabId, cleanupMapAtoms, setWorkingDone, syncActiveTabSideEffects])
+    // 用户主动关闭 idle 的 Agent Tab 时，从 Working 状态移除
+    if (closingTab && closingTab.type === 'agent') {
+      removeIdleSessionFromWorking(closingTab.sessionId)
+    }
+  }, [tabs, activeTabId, setTabs, setActiveTabId, setViewStateMap, syncActiveTabSideEffects, removeIdleSessionFromWorking])
 
   const requestClose = React.useCallback((tabId: string) => {
-    const tab = tabs.find((t) => t.id === tabId)
-    // 流式中弹确认，避免误关丢失进度
-    if (tab?.type === 'agent' && runningSessionIds.has(tab.sessionId)) {
-      setPending(tabId)
-      return
-    }
     executeClose(tabId)
-  }, [tabs, runningSessionIds, setPending, executeClose])
+  }, [executeClose])
 
   return { requestClose, executeClose }
 }

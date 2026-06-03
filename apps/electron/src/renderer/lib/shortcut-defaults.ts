@@ -30,13 +30,12 @@ export interface ShortcutDefinition {
   readonly?: boolean
 }
 
-/** 用户自定义快捷键覆盖（持久化到 settings.json） */
-export interface ShortcutOverrides {
-  [shortcutId: string]: {
-    mac?: string
-    win?: string
-  }
-}
+/**
+ * 用户自定义快捷键覆盖（持久化到 settings.json）
+ *
+ * 类型在 `types/settings.ts` 中定义，此处转发以便渲染层就近使用。
+ */
+export type { ShortcutOverrides } from '../../types/settings'
 
 // ===== 分类标签 =====
 
@@ -87,6 +86,14 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
     id: 'global-search',
     name: '全局搜索',
     description: '搜索对话和会话',
+    defaultMac: 'Cmd+Shift+F',
+    defaultWin: 'Ctrl+Shift+F',
+    category: 'navigation',
+  },
+  {
+    id: 'file-find',
+    name: '文件内查找',
+    description: '在文件预览或 Diff 面板中查找当前文件内容',
     defaultMac: 'Cmd+F',
     defaultWin: 'Ctrl+F',
     category: 'navigation',

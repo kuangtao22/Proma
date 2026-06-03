@@ -130,7 +130,7 @@ export function GlobalShortcuts(): null {
     useCallback(() => setSettingsOpen(true), [setSettingsOpen]),
   )
 
-  // Cmd+F → 全局搜索
+  // Cmd+Shift+F / Ctrl+Shift+F → 全局搜索
   useShortcut(
     'global-search',
     useCallback(() => setSearchOpen(true), [setSearchOpen]),
@@ -366,7 +366,7 @@ export function GlobalShortcuts(): null {
 
       store.set(activeViewAtom, 'conversations')
 
-      if (target.type === 'agent') {
+      if (target.type === 'agent' || target.type === 'preview') {
         const sessionId = target.sessionId
         store.set(appModeAtom, 'agent')
         store.set(currentAgentSessionIdAtom, sessionId)

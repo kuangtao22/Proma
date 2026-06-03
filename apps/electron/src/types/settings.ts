@@ -4,7 +4,7 @@
  * 主题模式、IPC 通道等设置相关定义。
  */
 
-import type { EnvironmentCheckResult, ThinkingConfig, AgentEffort } from '@proma/shared'
+import type { EnvironmentCheckResult, ThinkingConfig, AgentEffort, FeishuSessionMirrorSettings } from '@proma/shared'
 
 /** 通知音场景类型 */
 export type NotificationSoundType = 'taskComplete' | 'permissionRequest' | 'exitPlanMode'
@@ -35,6 +35,10 @@ export type VoiceDictationOutputMode = 'auto' | 'clipboard' | 'proma-input'
 export interface VoiceDictationWindowPosition {
   x: number
   y: number
+  /** 窗口相对于所在屏幕 workArea 的归一化水平偏移 (0~1) */
+  relativeX?: number
+  /** 窗口相对于所在屏幕 workArea 的归一化垂直偏移 (0~1) */
+  relativeY?: number
 }
 
 /** 语音输入设置（渲染进程读取到的是解密后的值） */
@@ -131,11 +135,18 @@ export interface MicPermissionResult {
   platform: NodeJS.Platform
 }
 
-/** 用户自定义快捷键覆盖（持久化到 settings.json） */
+/**
+ * 用户自定义快捷键覆盖（持久化到 settings.json）
+ *
+ * 字段三态语义：
+ * - `undefined`（字段缺失）→ 使用默认快捷键
+ * - 非空字符串 → 使用该自定义 accelerator
+ * - `null` → 用户已主动禁用此平台的快捷键，不注册任何监听
+ */
 export interface ShortcutOverrides {
   [shortcutId: string]: {
-    mac?: string
-    win?: string
+    mac?: string | null
+    win?: string | null
   }
 }
 
@@ -150,6 +161,12 @@ export const DEFAULT_THEME_MODE: ThemeMode = 'dark'
 
 /** 默认特殊风格 */
 export const DEFAULT_THEME_STYLE: ThemeStyle = 'default'
+
+/** Markdown 预览字号档位 */
+export type MarkdownFontSize = 'small' | 'medium' | 'large'
+
+/** 默认 Markdown 字号档位 */
+export const DEFAULT_MARKDOWN_FONT_SIZE: MarkdownFontSize = 'medium'
 
 /** 应用设置 */
 export interface AppSettings {
@@ -197,12 +214,16 @@ export interface AppSettings {
   shortcutOverrides?: ShortcutOverrides
   /** 是否显示用户消息悬浮置顶条（默认 true） */
   stickyUserMessageEnabled?: boolean
+  /** Markdown 预览字号档位（默认 'medium'，对应 15px） */
+  markdownFontSize?: MarkdownFontSize
   /** 上次是否在 Scratch Pad 页（用于重启恢复） */
   scratchPadActive?: boolean
   /** 应用图标变体 ID（dock + window icon），'default' 或 logo 变体 id */
   appIconVariant?: string
   /** 语音输入设置（Access Token 以加密态存储，由专用服务解密后返回渲染进程） */
   voiceDictation?: VoiceDictationPersistedSettings
+  /** 飞书 Session 镜像设置：每个 Proma Session 可创建一个仅包含用户与指定 Bot 的飞书群 */
+  feishuSessionMirror?: FeishuSessionMirrorSettings
   /** 启动时自动清理临时文件（proma-preview、proma-installers），默认 true */
   autoCleanupTempOnStart?: boolean
   /** 自动清理 N 天前已归档会话的 SDK 数据（0 = 禁用，默认 0） */

@@ -110,10 +110,10 @@ export function MarkdownRichEditor({
       attributes: {
         class: cn(
           'prose prose-sm dark:prose-invert max-w-none min-h-full cursor-text focus:outline-none',
-          'px-4 py-3 text-[13px] leading-relaxed',
+          'px-4 py-3 text-[length:var(--md-preview-font-size,15px)] leading-relaxed',
           '[&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
           '[&_pre]:rounded-md [&_pre]:p-3',
-          '[&_code]:bg-muted [&_code]:rounded [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-[12px]',
+          '[&_code]:bg-muted [&_code]:rounded [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-[0.875em]',
           '[&_pre_code]:bg-transparent [&_pre_code]:p-0',
           '[&_table_p]:my-0',
           '[&_input[type=checkbox]]:accent-primary',
@@ -184,7 +184,23 @@ export function MarkdownRichEditor({
   return (
     <div className="flex min-h-full flex-col">
       {editing && editor && <MarkdownEditorToolbar editor={editor} />}
-      <EditorContent editor={editor} className="min-h-full flex-1" />
+      <EditorContent
+        editor={editor}
+        className={cn(
+          'min-h-full flex-1',
+          isEditable
+            ? '[&_.proma-mermaid-preview]:hidden [&_.proma-code-source-body]:block'
+            : [
+                '[&_.proma-code-block--mermaid]:overflow-visible',
+                '[&_.proma-code-block--mermaid]:rounded-none',
+                '[&_.proma-code-block--mermaid]:border-0',
+                '[&_.proma-code-block--mermaid]:bg-transparent',
+                '[&_.proma-code-block--mermaid_.proma-code-header]:hidden',
+                '[&_.proma-code-block--mermaid_.proma-mermaid-preview]:block',
+                '[&_.proma-code-block--mermaid_.proma-code-source-body]:hidden',
+              ],
+        )}
+      />
       {editing && editor && <TableBubbleMenu editor={editor} />}
     </div>
   )
