@@ -53,3 +53,6 @@ export * from './wechat'
 
 // LAN Bridge 局域网远程连接相关类型
 export * from './lan-bridge'
+
+// 定时任务（Automation）相关类型
+export * from './automation'

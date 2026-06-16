@@ -59,6 +59,11 @@ export function finalizeStreamingActivities(
 /** Agent 会话的流式状态 */
 export interface AgentStreamState {
   running: boolean
+  /**
+   * 后台任务等待态（软空闲）：本轮主体已结束、UI 可输入，但 SDK 通道仍开着等后台任务唤醒。
+   * 此状态下 running 为 false，但服务端 activeSessions 仍保留，新消息必须走注入通道而非新建 run。
+   */
+  backgroundWaiting?: boolean
   content: string
   toolActivities: ToolActivity[]
   model?: string
@@ -76,6 +81,8 @@ export interface AgentStreamState {
   contextWindow?: number
   /** 当前 thinking block 的 token 估算值（SDK 实时估算，非计费值） */
   thinkingEstimatedTokens?: number
+  /** usage 数据最后更新时间戳（毫秒），用于 UI 提示数据时效 */
+  usageUpdatedAt?: number
   /** 是否正在压缩上下文 */
   isCompacting?: boolean
   /**
@@ -682,11 +689,29 @@ export function applyAgentEvent(
       // 等待 STREAM_COMPLETE IPC 回调通过删除流式状态来控制 UI 就绪状态
       // 这避免了用户在后端尚未完成清理时就能发送新消息的竞态条件
       // 同时将未完成的工具活动标记为 done（兜底）
+      //
+      // token 计数（inputTokens / 缓存 / outputTokens）只信任流式中每条 assistant
+      // 消息的 usage_update：单条模型调用的 input+缓存 ≈ 当轮完整 prompt = 当前真实上下文。
+      // 这里【不再】从 result.usage 写入这些字段——SDK 的 result.usage 是整个 query 内所有
+      // 模型调用的累计求和（cache_read 会被累加 N 次），当成当前上下文会让进度环虚高、冲破 100%。
+      //
+      // 仅从 result 取两个货真价实的值：
+      // - contextWindow：进度环分母（窗口大小，非用量）
+      // - costUsd：本就该是整轮累计成本
       return {
         ...prev,
+        ...(event.usage ? {
+          ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
+          ...(event.usage.contextWindow != null && { contextWindow: event.usage.contextWindow }),
+          ...(event.usage.contextWindow != null && { usageUpdatedAt: Date.now() }),
+        } : {}),
         retrying: undefined,
         ...finalizeStreamingActivities(prev.toolActivities),
       }
+
+    case 'run_resumed':
+      // 后台任务完成自动唤醒：从"空闲可输入"恢复到运行态（防御性，监听器已显式处理）。
+      return { ...prev, running: true, backgroundWaiting: false }
 
     case 'typed_error':
       // 处理类型化错误（TypedError）
@@ -701,12 +726,15 @@ export function applyAgentEvent(
     case 'usage_update':
       return {
         ...prev,
-        inputTokens: event.usage.inputTokens,
+        ...(event.usage.inputTokens != null && { inputTokens: event.usage.inputTokens }),
         ...(event.usage.outputTokens != null && { outputTokens: event.usage.outputTokens }),
         ...(event.usage.cacheReadTokens != null && { cacheReadTokens: event.usage.cacheReadTokens }),
         ...(event.usage.cacheCreationTokens != null && { cacheCreationTokens: event.usage.cacheCreationTokens }),
         ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
-        ...(event.usage.contextWindow && { contextWindow: event.usage.contextWindow }),
+        // 流式中 assistant 消息的 usage_update 可能携带推断的 contextWindow，
+        // 若已有 result 消息提供的真实值，则不再覆盖
+        ...(event.usage.contextWindow && !prev.contextWindow && { contextWindow: event.usage.contextWindow }),
+        usageUpdatedAt: Date.now(),
       }
 
     case 'compacting':
@@ -799,6 +827,8 @@ export interface AgentContextStatus {
   cacheCreationTokens?: number
   costUsd?: number
   contextWindow?: number
+  /** usage 数据最后更新时间戳（毫秒） */
+  usageUpdatedAt?: number
 }
 
 /** 当前会话的上下文使用量派生 atom */
@@ -814,6 +844,7 @@ export const agentContextStatusAtom = atom<AgentContextStatus>((get) => {
     cacheCreationTokens: state?.cacheCreationTokens,
     costUsd: state?.costUsd,
     contextWindow: state?.contextWindow,
+    usageUpdatedAt: state?.usageUpdatedAt,
   }
 })
 

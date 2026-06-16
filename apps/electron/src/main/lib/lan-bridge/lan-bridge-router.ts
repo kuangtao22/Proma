@@ -5,7 +5,7 @@
  */
 
 import type { ClientConnection, RouteHandler } from './lan-bridge-types'
-import type { LanBridgeResponse } from '@proma/shared'
+import type { LanBridgeResponse, LanBridgeErrorCode } from '@proma/shared'
 
 const routes = new Map<string, RouteHandler>()
 
@@ -42,7 +42,7 @@ export async function dispatch(
     }
   } catch (err: any) {
     const message = err instanceof Error ? err.message : 'Internal error'
-    const errorCode = (err as any)?.errorCode ?? 'INTERNAL_ERROR'
+    const errorCode = ((err as any)?.errorCode ?? 'INTERNAL_ERROR') as LanBridgeErrorCode
     console.error(`[LAN Bridge] dispatch error: type=${type} id=${id}`, message, errorCode)
     sendError(client, type, id, message, errorCode)
   }
@@ -54,7 +54,7 @@ export function sendError(
   type: string,
   id: string | undefined,
   error: string,
-  errorCode: string,
+  errorCode: LanBridgeErrorCode,
 ): void {
   const response: LanBridgeResponse = { type, id, ok: false, error, errorCode }
   try {

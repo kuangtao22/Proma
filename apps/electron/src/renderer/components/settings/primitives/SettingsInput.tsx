@@ -11,8 +11,8 @@ import { LABEL_CLASS, DESCRIPTION_CLASS } from './SettingsUIConstants'
 import { cn } from '@/lib/utils'
 
 interface SettingsInputProps {
-  /** 标签文本 */
-  label: string
+  /** 标签文本（在 SettingsRow 内使用时可省略，由 SettingsRow 提供标签） */
+  label?: string
   /** 描述文本（可选） */
   description?: string
   /** 输入值 */
@@ -31,6 +31,8 @@ interface SettingsInputProps {
   error?: string
   /** 输入类型 */
   type?: string
+  /** 透传给底层 Input 的额外样式 */
+  className?: string
 }
 
 export function SettingsInput({
@@ -44,15 +46,18 @@ export function SettingsInput({
   disabled,
   error,
   type = 'text',
+  className,
 }: SettingsInputProps): React.ReactElement {
   return (
     <div className="px-4 py-3 space-y-2">
-      <div>
-        <div className={LABEL_CLASS}>{label}</div>
-        {description && (
-          <div className={cn(DESCRIPTION_CLASS, 'mt-0.5')}>{description}</div>
-        )}
-      </div>
+      {(label || description) && (
+        <div>
+          {label && <div className={LABEL_CLASS}>{label}</div>}
+          {description && (
+            <div className={cn(DESCRIPTION_CLASS, 'mt-0.5')}>{description}</div>
+          )}
+        </div>
+      )}
       <Input
         type={type}
         value={value}
@@ -61,7 +66,7 @@ export function SettingsInput({
         placeholder={placeholder}
         required={required}
         disabled={disabled}
-        className={cn(error && 'border-destructive focus-visible:ring-destructive')}
+        className={cn(error && 'border-destructive focus-visible:ring-destructive', className)}
       />
       {error && (
         <p className="text-xs text-destructive">{error}</p>

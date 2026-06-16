@@ -4,6 +4,11 @@
  * 挂载 React 应用，初始化主题系统。
  */
 
+// 引入 Inter Variable 自托管字体（含 400/500/600/700 等所有字重）
+// index.css 声明了全部语言子集（latin/latin-ext/cyrillic/greek/vietnamese 等），
+// 但每个 @font-face 都带 unicode-range，浏览器仅按需下载实际用到的子集（本应用主要是 latin）。
+import '@fontsource-variable/inter/index.css'
+
 import React, { useEffect, useMemo, useRef } from 'react'
 import ReactDOM from 'react-dom/client'
 import { useSetAtom, useAtomValue, useStore } from 'jotai'
@@ -34,6 +39,7 @@ import {
   unviewedCompletedSessionIdsAtom,
 } from './atoms/agent-atoms'
 import { updateStatusAtom, initializeUpdater } from './atoms/updater'
+import { automationsAtom } from './atoms/automation-atoms'
 import {
   notificationsEnabledAtom,
   notificationSoundEnabledAtom,
@@ -319,6 +325,26 @@ function UpdaterInitializer(): null {
     const cleanup = initializeUpdater(setUpdateStatus)
     return cleanup
   }, [setUpdateStatus])
+
+  return null
+}
+
+/**
+ * 定时任务初始化组件
+ *
+ * 加载全部定时任务，并订阅主进程的变更事件（运行完成/状态变化）刷新列表。
+ */
+function AutomationInitializer(): null {
+  const setAutomations = useSetAtom(automationsAtom)
+
+  useEffect(() => {
+    const load = (): void => {
+      window.electronAPI.listAutomations().then(setAutomations).catch(console.error)
+    }
+    load()
+    const unsub = window.electronAPI.onAutomationChanged(load)
+    return unsub
+  }, [setAutomations])
 
   return null
 }
@@ -873,6 +899,7 @@ if (isQuickTaskWindow) {
       <AgentListenersInitializer />
       <ChatToolInitializer />
       <UpdaterInitializer />
+      <AutomationInitializer />
       <FeishuInitializer />
       <DingTalkInitializer />
       <TabStatePersistenceInitializer />

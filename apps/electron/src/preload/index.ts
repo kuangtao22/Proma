@@ -6,7 +6,7 @@
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, MEMORY_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, LAN_BRIDGE_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, MEMORY_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, LAN_BRIDGE_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS } from '../types'
 import type {
   RuntimeStatus,
@@ -101,6 +101,9 @@ import type {
   WeChatBridgeState,
   AgentQueueMessageInput,
   PendingRequestsSnapshot,
+  Automation,
+  CreateAutomationInput,
+  UpdateAutomationInput,
 } from '@proma/shared'
 import type {
   UserProfile,
@@ -516,6 +519,9 @@ export interface ElectronAPI {
   /** 获取其他工作区的 Skill 列表 */
   getOtherWorkspaceSkills: (currentSlug: string) => Promise<OtherWorkspaceSkillsGroup[]>
 
+  /** 获取默认 Skills 的 slug 列表（来自 ~/.proma/default-skills/） */
+  getDefaultSkillSlugs: () => Promise<string[]>
+
   /** 从其他工作区导入 Skill */
   importSkillFromWorkspace: (targetSlug: string, sourceSlug: string, skillSlug: string) => Promise<SkillMeta>
 
@@ -692,6 +698,9 @@ export interface ElectronAPI {
 
   /** 在系统文件管理器中显示文件 */
   showInFolder: (filePath: string) => Promise<void>
+
+  /** 在系统文件管理器中显示文件（无工作区限制，支持候选基础目录） */
+  showItemInFolder: (filePath: string, candidateBasePaths?: string[]) => Promise<void>
 
   /** 解析文件路径并读取内容（供内联预览使用） */
   resolveAndReadFile: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<{ resolvedPath: string; content: string } | null>
@@ -1011,6 +1020,22 @@ export interface ElectronAPI {
   cleanupTempStorage: () => Promise<unknown>
   /** 取消迁移导入（清理临时解压目录） */
   migrationCancelImport: (tempDir: string) => Promise<void>
+
+  // ===== 定时任务（Automation）=====
+  /** 获取全部定时任务 */
+  listAutomations: () => Promise<Automation[]>
+  /** 创建定时任务 */
+  createAutomation: (input: CreateAutomationInput) => Promise<Automation>
+  /** 更新定时任务 */
+  updateAutomation: (input: UpdateAutomationInput) => Promise<Automation | undefined>
+  /** 删除定时任务 */
+  deleteAutomation: (id: string) => Promise<boolean>
+  /** 切换启用/暂停 */
+  toggleAutomation: (id: string, active: boolean) => Promise<Automation | undefined>
+  /** 立即运行一次 */
+  runAutomationNow: (id: string) => Promise<void>
+  /** 订阅任务列表变更事件 */
+  onAutomationChanged: (callback: () => void) => () => void
 }
 
 interface MigrationExportResult {
@@ -1524,6 +1549,10 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_OTHER_WORKSPACE_SKILLS, currentSlug)
   },
 
+  getDefaultSkillSlugs: () => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_DEFAULT_SKILL_SLUGS)
+  },
+
   importSkillFromWorkspace: (targetSlug: string, sourceSlug: string, skillSlug: string) => {
     return ipcRenderer.invoke(
       AGENT_IPC_CHANNELS.IMPORT_SKILL_FROM_WORKSPACE,
@@ -1795,6 +1824,11 @@ const electronAPI: ElectronAPI = {
 
   showInFolder: (filePath: string) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SHOW_IN_FOLDER, filePath)
+  },
+
+  /** 在系统文件管理器中显示文件（无工作区限制，支持候选基础目录） */
+  showItemInFolder: (filePath: string, candidateBasePaths?: string[]) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.SHOW_ITEM_IN_FOLDER, filePath, candidateBasePaths)
   },
 
   resolveAndReadFile: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => {
@@ -2339,6 +2373,24 @@ const electronAPI: ElectronAPI = {
 
   migrationCancelImport: (tempDir: string) => {
     return ipcRenderer.invoke('migration:cancelImport', tempDir)
+  },
+
+  // ===== 定时任务（Automation）=====
+  listAutomations: () => ipcRenderer.invoke(AUTOMATION_IPC_CHANNELS.LIST),
+  createAutomation: (input: CreateAutomationInput) =>
+    ipcRenderer.invoke(AUTOMATION_IPC_CHANNELS.CREATE, input),
+  updateAutomation: (input: UpdateAutomationInput) =>
+    ipcRenderer.invoke(AUTOMATION_IPC_CHANNELS.UPDATE, input),
+  deleteAutomation: (id: string) =>
+    ipcRenderer.invoke(AUTOMATION_IPC_CHANNELS.DELETE, id),
+  toggleAutomation: (id: string, active: boolean) =>
+    ipcRenderer.invoke(AUTOMATION_IPC_CHANNELS.TOGGLE, id, active),
+  runAutomationNow: (id: string) =>
+    ipcRenderer.invoke(AUTOMATION_IPC_CHANNELS.RUN_NOW, id),
+  onAutomationChanged: (callback: () => void) => {
+    const listener = (): void => callback()
+    ipcRenderer.on(AUTOMATION_IPC_CHANNELS.CHANGED, listener)
+    return () => { ipcRenderer.removeListener(AUTOMATION_IPC_CHANNELS.CHANGED, listener) }
   },
 }
 

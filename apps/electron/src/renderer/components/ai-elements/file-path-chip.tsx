@@ -3,16 +3,22 @@
  *
  * 在 Agent 消息中检测到文件路径时，渲染为可点击的芯片。
  * 支持绝对路径和相对路径（相对于 basePath 解析）。
- * 点击后在当前会话的临时预览标签页中打开文件。
+ * 点击后按用户偏好（标签页 / 侧边分屏）打开文件预览。
  */
 
 import * as React from 'react'
 import { useStore } from 'jotai'
 import { cn } from '@/lib/utils'
 import { FileTypeIcon } from '@/components/file-browser/FileTypeIcon'
-import { previewFileMapAtom, previewPanelOpenMapAtom } from '@/atoms/preview-atoms'
+import { useOpenPreview } from '@/components/diff/preview-opener'
 import { currentAgentSessionIdAtom } from '@/atoms/agent-atoms'
-import { activeTabIdAtom, getPreviewTabTitle, openTab, tabsAtom } from '@/atoms/tab-atoms'
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+} from '@/components/ui/context-menu'
 
 /** 文件存在性缓存（模块级共享，避免重复 IPC）。key = filePath + basePaths */
 const fileExistsCache = new Map<string, boolean>()
@@ -96,6 +102,7 @@ export function FilePathChip({ filePath, basePath, basePaths, className }: FileP
   const chipRef = React.useRef<HTMLButtonElement>(null)
   const [fileStatus, setFileStatus] = React.useState<'idle' | 'resolved' | 'broken'>('idle')
   const store = useStore()
+  const openPreview = useOpenPreview()
 
   // 候选基础目录列表：优先使用 basePaths；否则退化到 basePath 单值
   const candidateBases = React.useMemo<string[]>(() => {
@@ -161,48 +168,50 @@ export function FilePathChip({ filePath, basePath, basePaths, className }: FileP
     const sessionId = store.get(currentAgentSessionIdAtom)
     if (!sessionId) return
 
-    store.set(previewFileMapAtom, (prev) => {
-      const m = new Map(prev)
-      m.set(sessionId, {
-        filePath: cleanPath,
-        previewOnly: true,
-        basePaths: candidateBases.length > 0 ? candidateBases : undefined,
-      })
-      return m
+    openPreview(sessionId, {
+      filePath: cleanPath,
+      previewOnly: true,
+      basePaths: candidateBases.length > 0 ? candidateBases : undefined,
     })
-    store.set(previewPanelOpenMapAtom, (prev) => {
-      const m = new Map(prev)
-      m.set(sessionId, false)
-      return m
-    })
-    const result = openTab(store.get(tabsAtom), {
-      type: 'preview',
-      sessionId,
-      title: getPreviewTabTitle(cleanPath),
-    })
-    store.set(tabsAtom, result.tabs)
-    store.set(activeTabIdAtom, result.activeTabId)
-  }, [store, cleanPath, candidateBases])
+  }, [store, openPreview, cleanPath, candidateBases])
+
+  const handleShowInFolder = React.useCallback(() => {
+    const bases = candidateBases.length > 0 ? candidateBases : undefined
+    window.electronAPI.showItemInFolder(cleanPath, bases).catch(console.error)
+  }, [cleanPath, candidateBases])
 
   return (
-    <button
-      ref={chipRef}
-      type="button"
-      onClick={handleClick}
-      title={fileStatus === 'broken' ? `文件不存在: ${displayPath}` : displayPath}
-      className={cn(
-        'inline-flex items-center gap-1 rounded px-1.5 py-[2px] text-[12px] font-medium leading-[1.6]',
-        'cursor-pointer transition-colors duration-150',
-        'align-baseline not-prose',
-        fileStatus === 'broken'
-          ? 'opacity-50 border border-dashed border-muted-foreground/30 text-muted-foreground hover:opacity-70 hover:bg-muted/20'
-          : 'bg-primary/10 text-primary hover:bg-primary/20',
-        className
-      )}
-    >
-      <FileTypeIcon name={filename} isDirectory={false} size={14} />
-      <span className="truncate max-w-[240px]">{filename}{lineColSuffix}</span>
-    </button>
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <button
+          ref={chipRef}
+          type="button"
+          onClick={handleClick}
+          title={fileStatus === 'broken' ? `文件不存在: ${displayPath}` : displayPath}
+          className={cn(
+            'inline-flex items-center gap-1 rounded px-1.5 py-[2px] text-[12px] font-medium leading-[1.6]',
+            'cursor-pointer transition-colors duration-150',
+            'align-baseline not-prose',
+            fileStatus === 'broken'
+              ? 'opacity-50 border border-dashed border-muted-foreground/30 text-muted-foreground hover:opacity-70 hover:bg-muted/20'
+              : 'bg-primary/10 text-primary hover:bg-primary/20',
+            className
+          )}
+        >
+          <FileTypeIcon name={filename} isDirectory={false} size={14} />
+          <span className="truncate max-w-[240px]">{filename}{lineColSuffix}</span>
+        </button>
+      </ContextMenuTrigger>
+      <ContextMenuContent className="w-48">
+        <ContextMenuItem onClick={handleClick}>
+          打开预览
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem onClick={handleShowInFolder}>
+          在文件管理器中显示
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   )
 }
 

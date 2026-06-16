@@ -1,6 +1,6 @@
 {
   "name": "@proma/electron",
-  "version": "0.11.0",
+  "version": "0.12.23",
   "description": "Proma next gen ai software with general agents - Electron App",
   "main": "dist/main.cjs",
   "author": {
@@ -10,7 +10,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k -n vite,electron -c blue,green \"bun run dev:vite\" \"bun run dev:electron\"",
+    "dev": "bun run scripts/dev-kill.ts --vite && concurrently -k -n vite,electron -c blue,green \"bun run dev:vite\" \"bun run dev:electron\"",
     "dev:split": "bash scripts/dev-split.sh",
     "dev:vite": "vite dev",
     "dev:kill": "bun run scripts/dev-kill.ts",
@@ -37,6 +37,7 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.153",
     "@anthropic-ai/sdk": "^0.93.0",
+    "@fontsource-variable/inter": "5.2.8",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@pierre/diffs": "^1.1.20",
     "@xmldom/xmldom": "^0.8.11",

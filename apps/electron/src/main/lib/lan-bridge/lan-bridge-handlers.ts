@@ -95,7 +95,7 @@ function handleConversationMessages(client: ClientConnection, data: Record<strin
   return { messages, total: allMessages.length }
 }
 
-function handleSearch(client: ClientConnection, data: Record<string, unknown>) {
+async function handleSearch(client: ClientConnection, data: Record<string, unknown>) {
   requireAuth(client, data)
   const query = data.query as string
   if (!query) {
@@ -105,13 +105,13 @@ function handleSearch(client: ClientConnection, data: Record<string, unknown>) {
   const now = Date.now()
   const results: Array<{ id: string; title: string; snippet: string; type: 'chat' | 'agent'; matchedAt: number }> = []
   if (!sessionType || sessionType === 'chat') {
-    for (const r of searchConversationMessages(query)) {
-      results.push({ id: r.conversationId, title: r.title ?? '', snippet: r.snippet, type: 'chat', matchedAt: now })
+    for (const r of await searchConversationMessages(query)) {
+      results.push({ id: r.conversationId, title: r.conversationTitle ?? '', snippet: r.snippet, type: 'chat', matchedAt: now })
     }
   }
   if (!sessionType || sessionType === 'agent') {
-    for (const r of searchAgentSessionMessages(query)) {
-      results.push({ id: r.sessionId, title: r.title ?? '', snippet: r.snippet, type: 'agent', matchedAt: now })
+    for (const r of await searchAgentSessionMessages(query)) {
+      results.push({ id: r.sessionId, title: r.sessionTitle ?? '', snippet: r.snippet, type: 'agent', matchedAt: now })
     }
   }
   return { results }

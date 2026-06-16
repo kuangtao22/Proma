@@ -15,9 +15,5 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src"],
-  "references": [
-    { "path": "../../packages/shared" },
-    { "path": "../../packages/ui" }
-  ]
+  "include": ["src"]
 }

@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto'
 import { join, resolve, relative, isAbsolute, dirname, basename } from 'node:path'
 import {
   getAgentWorkspacesIndexPath,
+  getAgentWorkspacesDir,
   getAgentWorkspacePath,
   getWorkspaceMcpPath,
   getWorkspaceSkillsDir,
@@ -19,6 +20,7 @@ import {
   getDefaultSkillsDir,
   parseSkillVersion,
 } from './config-paths'
+import { findAllGitRoots, normalizeGitRoot } from './git-diff-service'
 import type { AgentWorkspace, WorkspaceMcpConfig, SkillMeta, SkillImportSource, OtherWorkspaceSkillsGroup, WorkspaceCapabilities, SkillFileNode, SkillFileContent } from '@proma/shared'
 
 interface AgentWorkspacesIndex {
@@ -235,7 +237,7 @@ export function updateAgentWorkspace(
   return updated
 }
 
-/** 删除工作区索引条目，保留目录避免误删用户文件 */
+/** 删除工作区索引条目及其本地目录 */
 export function deleteAgentWorkspace(id: string): void {
   const index = readIndex()
   const idx = index.workspaces.findIndex((w) => w.id === id)
@@ -244,10 +246,37 @@ export function deleteAgentWorkspace(id: string): void {
     throw new Error(`Agent 工作区不存在: ${id}`)
   }
 
+  const target = index.workspaces[idx]!
+  if (target.slug === 'default') {
+    throw new Error('默认项目不能删除')
+  }
+  if (index.workspaces.length <= 1) {
+    throw new Error('至少需要保留一个项目')
+  }
+
+  const workspacesRoot = resolve(getAgentWorkspacesDir())
+  const workspaceDir = resolve(join(workspacesRoot, target.slug))
+  const relativePath = relative(workspacesRoot, workspaceDir)
+  if (!relativePath || relativePath.startsWith('..') || isAbsolute(relativePath)) {
+    throw new Error(`工作区目录路径异常，已跳过删除: ${workspaceDir}`)
+  }
+
+  // 先移除索引条目并落盘，再删目录：
+  // 即使随后 rmSync 失败，也只会残留一个无引用目录（无害，可被同 slug 重建覆盖），
+  // 而不会留下指向已删目录的孤儿索引条目导致 UI 状态不一致
   const removed = index.workspaces.splice(idx, 1)[0]!
   writeIndex(index)
 
-  console.log(`[Agent 工作区] 已删除工作区索引: ${removed.name} (slug: ${removed.slug}，目录已保留)`)
+  if (existsSync(workspaceDir)) {
+    try {
+      rmSync(workspaceDir, { recursive: true, force: true })
+      console.log(`[Agent 工作区] 已删除工作区目录: ${workspaceDir}`)
+    } catch (error) {
+      console.warn(`[Agent 工作区] 删除工作区目录失败，已残留无引用目录 (${target.slug}):`, error)
+    }
+  }
+
+  console.log(`[Agent 工作区] 已删除工作区: ${removed.name} (slug: ${removed.slug})`)
 }
 
 /** 确保默认工作区存在，首次启动时自动创建（slug: default） */
@@ -452,7 +481,14 @@ export function getWorkspaceMcpConfig(workspaceSlug: string): WorkspaceMcpConfig
   try {
     const raw = readFileSync(mcpPath, 'utf-8')
     const parsed = JSON.parse(raw) as Partial<WorkspaceMcpConfig>
-    return { servers: parsed.servers ?? {} }
+    const servers = parsed.servers ?? {}
+    for (const [name, entry] of Object.entries(servers)) {
+      if (!entry.type) {
+        entry.type = entry.command ? 'stdio' : entry.url ? 'http' : 'stdio'
+        console.log(`[Agent 工作区] MCP 服务器 "${name}" 缺少 type 字段，已自动推断为 "${entry.type}"`)
+      }
+    }
+    return { servers }
   } catch (error) {
     console.error('[Agent 工作区] 读取 MCP 配置失败:', error)
     return { servers: {} }
@@ -482,13 +518,16 @@ export function getWorkspaceSkills(workspaceSlug: string): SkillMeta[] {
 function parseSkillFrontmatter(content: string, slug: string, enabled: boolean): SkillMeta {
   const meta: SkillMeta = { slug, name: slug, enabled }
 
+  // 移除 UTF-8 BOM（﻿），确保 YAML frontmatter 匹配不受 BOM 干扰
+  if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1)
+
   const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/)
   if (!fmMatch) return meta
 
   const yaml = fmMatch[1]
   if (!yaml) return meta
 
-  const validKeys = new Set(['name', 'description', 'icon', 'version'])
+  const validKeys = new Set(['name', 'description', 'group', 'icon', 'version'])
   const entries: Record<string, string> = {}
   let currentKey = ''
   let isFolded = false
@@ -525,6 +564,7 @@ function parseSkillFrontmatter(content: string, slug: string, enabled: boolean):
 
   if (entries.name) meta.name = entries.name.trim()
   if (entries.description) meta.description = entries.description.trim()
+  if (entries.group) meta.group = entries.group.trim()
   if (entries.icon) meta.icon = entries.icon.trim()
   if (entries.version) meta.version = entries.version.trim()
 
@@ -597,6 +637,20 @@ function scanSkillsInDir(dir: string, enabled: boolean): SkillMeta[] {
   }
 
   return skills
+}
+
+/** 获取默认 Skills 的 slug 列表（来自 ~/.proma/default-skills/） */
+export function getDefaultSkillSlugs(): string[] {
+  const dir = getDefaultSkillsDir()
+  if (!existsSync(dir)) return []
+
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+  } catch {
+    return []
+  }
 }
 
 /** 获取工作区所有 Skills（含活跃和不活跃），用于设置页 UI */
@@ -1135,10 +1189,50 @@ export function detachWorkspaceFile(workspaceSlug: string, filePath: string): st
 
 // ===== 工作区级 Worktree 仓库管理 =====
 
-export function getWorktreeRepos(workspaceSlug: string): import('@proma/shared').WorkspaceWorktreeRepo[] {
+/**
+ * 获取工作区的 Worktree 仓库列表。
+ *
+ * 优先从工作区的「附加目录」中自动探测 git 仓库根，避免依赖手动维护的
+ * worktreeRepos 配置（其 repoPath 容易因仓库移动而失效，导致 WorktreeSelector
+ * 静默找不到 worktree）。同时保留 config 中仍然存在的手动配置项（如不在附加
+ * 目录内的额外仓库），并自动过滤掉路径已不存在的陈旧条目。
+ */
+export async function getWorktreeRepos(workspaceSlug: string): Promise<import('@proma/shared').WorkspaceWorktreeRepo[]> {
   const config = readWorkspaceConfig(workspaceSlug)
-  const repos = config.worktreeRepos ?? []
-  return repos.sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99))
+
+  // repoPath 归一化后去重
+  const byPath = new Map<string, import('@proma/shared').WorkspaceWorktreeRepo>()
+
+  // 1. 从附加目录自动探测 git 仓库根
+  const attachedDirs = config.attachedDirectories ?? []
+  for (const dir of attachedDirs) {
+    let roots: string[]
+    try {
+      roots = await findAllGitRoots(dir)
+    } catch {
+      continue
+    }
+    for (const root of roots) {
+      if (!byPath.has(root)) {
+        byPath.set(root, {
+          name: basename(root),
+          repoPath: root,
+          worktreesPath: '',
+          priority: 1,
+        })
+      }
+    }
+  }
+
+  // 2. 合并手动配置中仍然存在的仓库（自动过滤失效路径）
+  for (const repo of config.worktreeRepos ?? []) {
+    const normalized = normalizeGitRoot(repo.repoPath)
+    if (!byPath.has(normalized) && existsSync(repo.repoPath)) {
+      byPath.set(normalized, repo)
+    }
+  }
+
+  return Array.from(byPath.values()).sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99))
 }
 
 export function addWorktreeRepo(workspaceSlug: string, repo: import('@proma/shared').WorkspaceWorktreeRepo): import('@proma/shared').WorkspaceWorktreeRepo[] {

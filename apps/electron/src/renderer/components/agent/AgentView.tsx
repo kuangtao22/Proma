@@ -49,7 +49,7 @@ import {
 import { cn } from '@/lib/utils'
 import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
 import { registerShortcut } from '@/lib/shortcut-registry'
-import { previewPanelOpenMapAtom, previewFileMapAtom, autoPreviewEnabledAtom, quotedSelectionMapAtom, currentQuotedSelectionAtom } from '@/atoms/preview-atoms'
+import { previewPanelOpenMapAtom, autoPreviewEnabledAtom, quotedSelectionMapAtom, currentQuotedSelectionAtom } from '@/atoms/preview-atoms'
 import {
   agentStreamingStatesAtom,
   agentSessionStreamingStateAtomFamily,
@@ -97,7 +97,7 @@ import { useOpenSession } from '@/hooks/useOpenSession'
 import { AgentSessionProvider } from '@/contexts/session-context'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
-import { activeTabIdAtom, getPreviewTabTitle, openTab, tabsAtom } from '@/atoms/tab-atoms'
+import { useOpenPreview } from '@/components/diff/preview-opener'
 import type { AgentSendInput, AgentPendingFile, FileDialogLargeFile, ModelOption, SDKMessage } from '@proma/shared'
 import { MAX_ATTACHMENT_SIZE } from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
@@ -310,6 +310,9 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   // atom 输出引用未变，订阅者跳过通知。
   const streamState = useAtomValue(agentSessionStreamingStateAtomFamily(sessionId))
   const streaming = streamState?.running ?? false
+  // 软空闲态：本轮主体已结束、UI 可输入，但 SDK 通道仍开着等后台任务唤醒。
+  // 此时服务端 activeSessions 仍保留，新消息须走注入通道而非新建 run。
+  const backgroundWaiting = streamState?.backgroundWaiting ?? false
   const stoppedByUserSessions = useAtomValue(stoppedByUserSessionsAtom)
   const sendWithCmdEnter = useAtomValue(sendWithCmdEnterAtom)
   const stoppedByUser = stoppedByUserSessions.has(sessionId)
@@ -350,30 +353,40 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   // 已有会话首次打开时，从全局默认值初始化 per-session map。
   // setter 内的 `prev.has(sessionId)` 守卫保证幂等，外层不再订阅 Map atom，
   // 避免 setter 写入 → atom 引用变化 → effect 重跑的自循环（React #185）。
+  // 优先使用会话元数据上的 channelId/modelId（如自动任务子会话），回退到全局默认。
+  const sessionMeta = React.useMemo(
+    () => sessions.find((s) => s.id === sessionId),
+    [sessions, sessionId],
+  )
+  const sessionMetaChannelId = sessionMeta?.channelId
+  const sessionMetaModelId = sessionMeta?.modelId
   React.useEffect(() => {
     if (!sessionId) return
-    if (defaultChannelId) {
+    const initialChannelId = sessionMetaChannelId ?? defaultChannelId
+    const initialModelId = sessionMetaModelId ?? defaultModelId
+    if (initialChannelId) {
       setSessionChannelMap((prev) => {
         if (prev.has(sessionId)) return prev
         const map = new Map(prev)
-        map.set(sessionId, defaultChannelId)
+        map.set(sessionId, initialChannelId)
         return map
       })
     }
-    if (defaultModelId) {
+    if (initialModelId) {
       setSessionModelMap((prev) => {
         if (prev.has(sessionId)) return prev
         const map = new Map(prev)
-        map.set(sessionId, defaultModelId)
+        map.set(sessionId, initialModelId)
         return map
       })
     }
-  }, [sessionId, defaultChannelId, defaultModelId, setSessionChannelMap, setSessionModelMap])
+  }, [sessionId, sessionMetaChannelId, sessionMetaModelId, defaultChannelId, defaultModelId, setSessionChannelMap, setSessionModelMap])
 
   const contextStatus: AgentContextStatus = {
     isCompacting: streamState?.isCompacting ?? false,
     inputTokens: streamState?.inputTokens,
     contextWindow: streamState?.contextWindow,
+    usageUpdatedAt: streamState?.usageUpdatedAt,
   }
   const setAgentStreamErrors = useSetAtom(agentStreamErrorsAtom)
   const streamErrors = useAtomValue(agentStreamErrorsAtom)
@@ -388,6 +401,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const store = useStore()
   const currentQuotedSelection = useAtomValue(currentQuotedSelectionAtom)
   const setQuotedSelectionMap = useSetAtom(quotedSelectionMapAtom)
+  const openPreview = useOpenPreview()
 
   /** 移除当前引用选中文本 */
   const handleRemoveQuotedSelection = React.useCallback(() => {
@@ -398,7 +412,6 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     })
   }, [sessionId, setQuotedSelectionMap])
 
-  const setPreviewFileMap = useSetAtom(previewFileMapAtom)
   const suggestionsMap = useAtomValue(agentPromptSuggestionsAtom)
   const suggestion = suggestionsMap.get(sessionId) ?? null
   const setPromptSuggestions = useSetAtom(agentPromptSuggestionsAtom)
@@ -667,12 +680,16 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           // 注意：保留 inputTokens/contextWindow 以维持上下文用量圆环显示
           setStreamingStates((prev) => {
             const state = prev.get(sessionId)
-            if (!state || state.running) return prev  // 仍在运行中，不清除
+            // 仍在运行中：不清除
+            if (!state || state.running) return prev
             const map = new Map(prev)
+            // 软空闲态（后台任务等待）：必须保留 backgroundWaiting 标志（否则 handleSend 误走新建 run），
+            // 但展示字段 content/toolActivities 仍要清空——否则上一轮流式文本残留会被兜底气泡渲染成重复消息。
             if (state.inputTokens !== undefined) {
               // 保留 usage 数据，仅清除流式展示字段
               map.set(sessionId, {
                 running: false,
+                backgroundWaiting: state.backgroundWaiting,
                 content: '',
                 toolActivities: [],
                 inputTokens: state.inputTokens,
@@ -681,6 +698,14 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
                 cacheCreationTokens: state.cacheCreationTokens,
                 contextWindow: state.contextWindow,
                 model: state.model,
+              })
+            } else if (state.backgroundWaiting) {
+              // 无 usage 数据但处于软空闲：保留标志，清空展示字段
+              map.set(sessionId, {
+                running: false,
+                backgroundWaiting: true,
+                content: '',
+                toolActivities: [],
               })
             } else {
               map.delete(sessionId)
@@ -1014,29 +1039,13 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
   const openClipboardPreviewFile = React.useCallback((filePath: string): void => {
     const parentPath = getFileParentPath(filePath)
-    setPreviewFileMap((prev) => {
-      const m = new Map(prev)
-      m.set(sessionId, {
-        filePath,
-        previewOnly: true,
-        readOnly: false,
-        basePaths: parentPath ? [parentPath] : undefined,
-      })
-      return m
+    openPreview(sessionId, {
+      filePath,
+      previewOnly: true,
+      readOnly: false,
+      basePaths: parentPath ? [parentPath] : undefined,
     })
-    store.set(previewPanelOpenMapAtom, (prev) => {
-      const m = new Map(prev)
-      m.set(sessionId, false)
-      return m
-    })
-    const result = openTab(store.get(tabsAtom), {
-      type: 'preview',
-      sessionId,
-      title: getPreviewTabTitle(filePath),
-    })
-    store.set(tabsAtom, result.tabs)
-    store.set(activeTabIdAtom, result.activeTabId)
-  }, [sessionId, setPreviewFileMap, store])
+  }, [sessionId, openPreview])
 
   /** 点击 clipboard 附件时，在当前会话的临时预览标签页中显示内容 */
   const handleClipboardPreview = React.useCallback(async (file: AgentPendingFile) => {
@@ -1190,6 +1199,15 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       return map
     })
 
+    // 模型切换时：清除旧的 contextWindow，让 result 重新提供真实值
+    setStreamingStates((prev) => {
+      const state = prev.get(sessionId)
+      if (!state) return prev
+      const map = new Map(prev)
+      map.set(sessionId, { ...state, contextWindow: undefined })
+      return map
+    })
+
     // 自动将选中的渠道加入 Agent 可用渠道白名单
     const updatedChannelIds = agentChannelIds.includes(option.channelId)
       ? agentChannelIds
@@ -1211,10 +1229,15 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   }, [sessionId, setSessionChannelMap, setSessionModelMap, setDefaultChannelId, setDefaultModelId, agentChannelIds, setAgentChannelIds])
 
   /** 构建 externalSelectedModel 给 ModelSelector */
-  const externalSelectedModel = React.useMemo(() => {
+  const computedSelectedModel = React.useMemo(() => {
     if (!agentChannelId || !agentModelId) return null
     return { channelId: agentChannelId, modelId: agentModelId }
   }, [agentChannelId, agentModelId])
+
+  // 防止瞬态 null 传递给 ModelSelector（防御 overflow remount 时 stableModelInfoRef 丢失）
+  const stableSelectedModelRef = React.useRef(computedSelectedModel)
+  if (computedSelectedModel) stableSelectedModelRef.current = computedSelectedModel
+  const externalSelectedModel = computedSelectedModel ?? stableSelectedModelRef.current
 
   /** 发送消息 */
   const handleSend = React.useCallback(async (): Promise<void> => {
@@ -1228,8 +1251,11 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       additionalDirectoriesForRun.add(dir)
     }
 
-    // 上一条消息仍在处理中，直接追加发送
-    if (streaming) {
+    // 上一条消息仍在处理中（streaming），或后台任务等待态（backgroundWaiting，通道仍开着）：
+    // 都走注入通道而非新建 run，避免被服务端并发守卫拒绝。
+    // - streaming：本轮真正进行中，注入时需先软中断当前 turn
+    // - backgroundWaiting：软空闲、无活跃 turn，直接注入即可，无需中断
+    if (streaming || backgroundWaiting) {
       // 流式追加时不处理附件（仅支持纯文本）
       if (pendingFilesSnapshot.length > 0) {
         toast.info('Agent 运行中暂不支持追加发送附件', {
@@ -1268,12 +1294,14 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return map
       })
 
-      // 3. 异步发送到后端（立即软中断当前 turn，再注入消息作为新一轮输入）
+      // 3. 异步发送到后端，注入消息作为新一轮输入。
+      //    - streaming（本轮真正进行中）：先软中断当前 turn 再注入
+      //    - backgroundWaiting（软空闲，无活跃 turn）：直接注入，无需中断
       window.electronAPI.queueAgentMessage({
         sessionId,
         userMessage: effectiveText,
         uuid: localUuid,
-        interrupt: true,
+        interrupt: streaming,
       }).catch((error) => {
         console.error('[AgentView] 追加消息失败:', error)
         toast.error('追加消息失败', { description: String(error) })
@@ -1518,7 +1546,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return map
       })
     })
-  }, [inputContent, attachedDirs, attachedFileDirectories, sessionId, agentChannelId, agentModelId, currentWorkspaceId, workspaces, streaming, suggestion, hasAvailableModel, store, setStreamingStates, setPendingFiles, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode, messagesLoaded])
+  }, [inputContent, attachedDirs, attachedFileDirectories, sessionId, agentChannelId, agentModelId, currentWorkspaceId, workspaces, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, setStreamingStates, setPendingFiles, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode, messagesLoaded])
 
   /** 停止生成 */
   const handleStop = React.useCallback((): void => {
@@ -1914,8 +1942,10 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           cacheReadTokens={contextStatus.cacheReadTokens}
           cacheCreationTokens={contextStatus.cacheCreationTokens}
           contextWindow={contextStatus.contextWindow}
+          usageUpdatedAt={contextStatus.usageUpdatedAt}
           isCompacting={contextStatus.isCompacting}
           isProcessing={streaming}
+          sessionId={sessionId}
           onCompact={handleCompact}
         />
       ),
@@ -1933,7 +1963,8 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     },
   ], [
     agentChannelIds,
-    externalSelectedModel,
+    agentChannelId,
+    agentModelId,
     handleModelSelect,
     sessionId,
     agentThinking,
@@ -2020,6 +2051,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
 
         {/* AskUserQuestion 交互式问答横幅 */}
         <AskUserBanner sessionId={sessionId} />
+
 
         {/* ExitPlanMode 计划审批横幅 */}
         <ExitPlanModeBanner sessionId={sessionId} />

@@ -29,9 +29,16 @@ interface ContextUsageBadgeProps {
   cacheCreationTokens?: number
   costUsd?: number
   contextWindow?: number
+  /** usage 数据最后更新时间戳（毫秒），用于显示数据时效 */
+  usageUpdatedAt?: number
   isCompacting: boolean
   isProcessing: boolean
   onCompact: () => void
+  /**
+   * 当前会话 ID，用于在切换会话时清空 stableRef，
+   * 避免新会话尚未发消息时仍显示上一个会话的 token 数。
+   */
+  sessionId?: string
 }
 
 /** 格式化 token 数为可读字符串（如 1234 → "1.2k"） */
@@ -116,9 +123,11 @@ export function ContextUsageBadge({
   cacheReadTokens,
   cacheCreationTokens,
   contextWindow,
+  usageUpdatedAt,
   isCompacting,
   isProcessing,
   onCompact,
+  sessionId,
 }: ContextUsageBadgeProps): React.ReactElement | null {
   // 保留最近一次有效的 token 值，避免切换会话时闪烁消失
   const stableRef = React.useRef<{
@@ -128,6 +137,14 @@ export function ContextUsageBadge({
     cacheCreationTokens?: number
     contextWindow?: number
   } | null>(null)
+  // 会话切换时清空陈旧值，避免新会话尚未上报 usage 时显示上个会话的数字
+  const lastSessionRef = React.useRef<string | undefined>(sessionId)
+  React.useEffect(() => {
+    if (lastSessionRef.current !== sessionId) {
+      stableRef.current = null
+      lastSessionRef.current = sessionId
+    }
+  }, [sessionId])
   if (inputTokens && inputTokens > 0) {
     stableRef.current = { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, contextWindow }
   }
@@ -193,6 +210,17 @@ export function ContextUsageBadge({
     ? Math.round((displayTokens / displayWindow) * 100)
     : undefined
 
+  /** 计算数据时效提示（普通变量，非 useMemo — 避免在 isCompacting early return 后 hook 数不一致） */
+  let ageText: string | undefined
+  if (usageUpdatedAt) {
+    const ageMs = Date.now() - usageUpdatedAt
+    if (ageMs >= 5_000 && ageMs < 60_000) {
+      ageText = `${Math.round(ageMs / 1000)}秒前更新`
+    } else if (ageMs >= 60_000) {
+      ageText = `${Math.round(ageMs / 60_000)}分钟前更新`
+    }
+  }
+
   const handleCompactClick = (): void => {
     if (isProcessing) return
     onCompact()
@@ -250,6 +278,12 @@ export function ContextUsageBadge({
                 />
               )}
             </>
+          ) : null}
+
+          {ageText ? (
+            <div className="text-[11px] text-center text-foreground/50 pt-0.5">
+              数据{ageText}
+            </div>
           ) : null}
 
           <div className="h-px bg-border my-0.5" />

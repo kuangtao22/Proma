@@ -298,7 +298,7 @@ function isPrivateIp(ip: string): boolean {
   if (ip.startsWith('10.')) return true
   // 172.16.0.0/12
   if (ip.startsWith('172.')) {
-    const second = parseInt(ip.split('.')[1], 10)
+    const second = parseInt(ip.split('.')[1] ?? '0', 10)
     if (second >= 16 && second <= 31) return true
   }
   // 192.168.0.0/16

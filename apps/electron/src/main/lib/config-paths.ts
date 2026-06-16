@@ -412,7 +412,8 @@ export function parseSkillVersion(skillDir: string): string {
   if (!existsSync(skillMdPath)) return '0.0.0'
 
   try {
-    const content = readFileSync(skillMdPath, 'utf-8')
+    let content = readFileSync(skillMdPath, 'utf-8')
+    if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1)
     const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/)
     if (!fmMatch?.[1]) return '0.0.0'
 
@@ -636,4 +637,13 @@ export function getSdkConfigDir(): string {
  */
 export function getScratchPadPath(): string {
   return join(getConfigDir(), 'scratch-pad.md')
+}
+
+/**
+ * 获取定时任务（Automation）配置文件路径
+ *
+ * @returns ~/.proma/automations.json
+ */
+export function getAutomationsPath(): string {
+  return join(getConfigDir(), 'automations.json')
 }

@@ -56,6 +56,7 @@ import { autoPreviewEnabledAtom, previewPanelOpenMapAtom, previewFileMapAtom } f
 import type { NotificationSoundType } from '@/types/settings'
 import { toast } from 'sonner'
 import type { AgentStreamEvent, AgentStreamCompletePayload, AgentEvent, AgentStreamPayload, SDKAssistantMessage, SDKUserMessage, SDKSystemMessage, SDKContentBlock, SDKUserContentBlock, PromaEvent, AgentSessionMeta } from '@proma/shared'
+import { inferContextWindow } from '@proma/shared'
 import { buildExternalAgentRunActivation } from '@/lib/external-agent-run'
 import { getAgentCompletionMarkers } from '@/lib/agent-completion-presence'
 import { getPlanModeChangeFromToolName, updatePlanModeSessionSet } from '@/lib/agent-plan-mode'
@@ -100,31 +101,6 @@ function uniqueTruthyPaths(paths: Array<string | null | undefined>): string[] {
 // Phase 2 将移除此转换，直接使用 SDKMessage 渲染
 // ============================================================================
 
-/**
- * 按模型名推断 contextWindow。SDK 流式过程中不返回此字段，
- * 只有 result 消息的 modelUsage 才带（且部分渠道不返回）。
- * 这里提供一个按模型家族的 fallback，保证进度环永远有分母可用。
- */
-function inferContextWindow(model?: string): number | undefined {
-  if (!model) return undefined
-  const m = model.toLowerCase()
-  // Claude Haiku 为 200k
-  if (m.includes('claude-haiku')) return 200_000
-  // Claude Sonnet 4.6、Opus 4.6 / 4.7 / 4.8、DeepSeek V4 系列均为 1M 上下文
-  if (
-    m.includes('claude-sonnet-4-6') ||
-    m.includes('claude-opus-4-6') ||
-    m.includes('claude-opus-4-7') ||
-    m.includes('claude-opus-4-8')
-  ) return 1_000_000
-  if (m.includes('deepseek-v4')) return 1_000_000
-  // MiniMax M3 为 1M 上下文
-  if (m.includes('minimax-m3')) return 1_000_000
-  // 小米 MiMo：v2.5 / v2.5-pro / v2-pro 为 1M（omni / flash 仍走默认 200k）
-  if (m.includes('mimo-v2.5') || m.includes('mimo-v2-pro')) return 1_000_000
-  return 200_000
-}
-
 function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
   if (payload.kind === 'proma_event') {
     const evt = payload.event
@@ -147,8 +123,13 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
         return [{ type: 'plan_mode_changed', active: evt.active, source: evt.source }]
       case 'model_resolved':
         return [{ type: 'model_resolved', model: evt.model }]
+      case 'context_window':
+        // main 进程从 SDK result 拿到的真实 contextWindow，转成 usage_update 让 atom 合并到 streamState
+        return [{ type: 'usage_update', usage: { contextWindow: evt.contextWindow } }]
       case 'permission_mode_changed':
         return [{ type: 'permission_mode_changed', mode: evt.mode }]
+      case 'run_resumed':
+        return [{ type: 'run_resumed' }]
       case 'retry': {
         const events: AgentEvent[] = []
         if (evt.status === 'starting' && evt.attempt != null && evt.maxAttempts != null) {
@@ -212,8 +193,11 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
       if (!aMsg.parent_tool_use_id && aMsg.message.usage) {
         const u = aMsg.message.usage
         const inputTokens = u.input_tokens + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)
-        // 流式过程中 SDK 不返回 contextWindow，按模型名推断一个默认值作为 fallback
-        const modelName = aMsg.message.model ?? aMsg._channelModelId
+        // 流式过程中 SDK 不返回 contextWindow，按模型名推断一个默认值作为 fallback。
+        // 注意：必须优先用 _channelModelId（用户在 UI 上选择的原始模型 ID），
+        // 因为部分端点（如智谱）会在 message.model 里剥掉 [1m] 等规格后缀，
+        // 导致 glm-x-preview[1m] 被识别成 glm-x-preview（200K）。
+        const modelName = aMsg._channelModelId ?? aMsg.message.model
         const fallbackWindow = inferContextWindow(modelName)
         events.push({
           type: 'usage_update',
@@ -251,17 +235,15 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
     }
 
     case 'result': {
-      const rMsg = msg as { subtype: string; usage?: { input_tokens: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }; total_cost_usd?: number; modelUsage?: Record<string, { contextWindow?: number }> }
-      const usage = rMsg.usage
+      const rMsg = msg as { subtype: string; total_cost_usd?: number; modelUsage?: Record<string, { contextWindow?: number }> }
       const contextWindow = rMsg.modelUsage ? Object.values(rMsg.modelUsage)[0]?.contextWindow : undefined
+      // 注意：result.usage 是整个 query 内所有模型调用的累计求和，不能当成当前上下文占用，
+      // 否则进度环会虚高（见 agent-atoms complete 分支）。token 计数只信任流式 usage_update，
+      // 这里仅透传两个货真价实的值：成本（本就累计）与窗口大小（进度环分母）。
       return [{
         type: 'complete',
         stopReason: rMsg.subtype === 'success' ? 'end_turn' : 'error',
-        usage: usage ? {
-          inputTokens: usage.input_tokens + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0),
-          outputTokens: usage.output_tokens,
-          cacheReadTokens: usage.cache_read_input_tokens,
-          cacheCreationTokens: usage.cache_creation_input_tokens,
+        usage: (rMsg.total_cost_usd != null || contextWindow != null) ? {
           costUsd: rMsg.total_cost_usd,
           contextWindow,
         } : undefined,
@@ -894,6 +876,15 @@ export function useGlobalAgentListeners(): void {
             store.set(agentPlanModeSessionsAtom, (prev: Set<string>) =>
               updatePlanModeSessionSet(prev, sessionId, event.mode === 'plan')
             )
+          } else if (event.type === 'run_resumed') {
+            // 后台任务完成自动唤醒：从"空闲可输入"恢复到"运行中"。
+            store.set(agentStreamingStatesAtom, (prev) => {
+              const current = prev.get(sessionId)
+              if (!current || current.running) return prev
+              const map = new Map(prev)
+              map.set(sessionId, { ...current, running: true })
+              return map
+            })
           }
         }
         }) // unstable_batchedUpdates
@@ -905,22 +896,28 @@ export function useGlobalAgentListeners(): void {
       (data: AgentStreamCompletePayload) => {
         console.log(`[FLASH-DEBUG] STREAM_COMPLETE for session=${data.sessionId.slice(0, 8)}, stoppedByUser=${data.stoppedByUser}, resultSubtype=${data.resultSubtype}`)
         unstable_batchedUpdates(() => {
+        // 后台任务等待态：turn 主体结束但仍有后台任务在飞行，UI 进入"空闲可输入"。
+        // 不发"任务已完成"通知（任务并未真正完成）、不清后台任务列表、不重载消息——
+        // 等后台任务完成时 Agent 会自动唤醒续轮。
+        const backgroundTasksPending = data.backgroundTasksPending === true
         // 发送桌面通知（任务完成，始终播放提示音）
         const enabled = store.get(notificationsEnabledAtom)
         const soundEnabled = store.get(notificationSoundEnabledAtom)
         const sounds = store.get(notificationSoundsAtom)
         const sessionTitle = getSessionTitle(data.sessionId)
-        sendDesktopNotification(
-          'Agent 任务完成',
-          `[${sessionTitle}] 任务已完成`,
-          enabled,
-          {
-            playSound: enabled && soundEnabled,
-            soundType: 'taskComplete',
-            sounds,
-            onNavigate: makeNavigateToSession(data.sessionId, sessionTitle),
-          }
-        )
+        if (!backgroundTasksPending) {
+          sendDesktopNotification(
+            'Agent 任务完成',
+            `[${sessionTitle}] 任务已完成`,
+            enabled,
+            {
+              playSound: enabled && soundEnabled,
+              soundType: 'taskComplete',
+              sounds,
+              onNavigate: makeNavigateToSession(data.sessionId, sessionTitle),
+            }
+          )
+        }
 
         // STREAM_COMPLETE 表示后端已完全结束 — 立即标记 running: false
         // 同时将所有未完成的工具活动标记为已完成，防止 subagent spinner 继续转动
@@ -928,7 +925,10 @@ export function useGlobalAgentListeners(): void {
         // 竞态保护：通过 startedAt 区分新旧流，防止旧流的 complete 事件重置新流的 running 状态
         store.set(agentStreamingStatesAtom, (prev) => {
           const current = prev.get(data.sessionId)
-          if (!current || !current.running) {
+          // 既非运行中、也非软空闲态 → 已彻底结束，忽略重复/陈旧的完成事件。
+          // 软空闲态（running=false 但 backgroundWaiting=true）也要处理：空闲超时/用户停止
+          // 触发的真正完成会带 backgroundTasksPending=false，需借此清除 backgroundWaiting。
+          if (!current || (!current.running && !current.backgroundWaiting)) {
             return prev
           }
           if (current.startedAt != null && (data.startedAt == null || current.startedAt > data.startedAt)) {
@@ -938,6 +938,9 @@ export function useGlobalAgentListeners(): void {
           map.set(data.sessionId, {
             ...current,
             running: false,
+            // backgroundTasksPending=true → 进入/保持软空闲态（通道仍开着，handleSend 走注入路径）；
+            // false → 真正结束，清除软空闲态，新消息回到新建 run 路径。
+            backgroundWaiting: backgroundTasksPending,
             ...finalizeStreamingActivities(current.toolActivities),
           })
           return map
@@ -952,7 +955,7 @@ export function useGlobalAgentListeners(): void {
           sessionId: data.sessionId,
           documentHasFocus: document.hasFocus(),
         })
-        if (completionMarkers.markUnviewedCompleted) {
+        if (completionMarkers.markUnviewedCompleted && !backgroundTasksPending) {
           store.set(unviewedCompletedSessionIdsAtom, (prev: Set<string>) => {
             const next = new Set(prev)
             next.add(data.sessionId)
@@ -1006,6 +1009,10 @@ export function useGlobalAgentListeners(): void {
         const finalize = (): void => {
           // 竞态保护：新流已启动时不要清理状态
           if (isNewStreamRunning()) return
+
+          // 后台任务等待态：保留后台任务列表（面板继续显示在跑任务），不做收尾清理，
+          // 等任务完成 Agent 自动唤醒续轮后再走真正的完成路径。
+          if (backgroundTasksPending) return
 
           // 清理后台任务
           store.set(backgroundTasksAtomFamily(data.sessionId), [])
