@@ -104,6 +104,7 @@ const PATHS = {
   mobilePackage: 'apps/mobile/package.json',
   electronBuilder: 'apps/electron/electron-builder.yml',
   workflow: '.github/workflows/upstream-compat.yml',
+  mergeHelper: 'apps/electron/scripts/verify-upstream-merge.ts',
 } as const
 
 /** AST 中发现的运行时模块依赖。 */
@@ -462,6 +463,8 @@ function returnedObjectStartUsesInjectedBus(
 
 /** 解析仅允许顶层 `&&` 串联的命令链，并按 shell 规则移除普通引号。 */
 function parseConjunctiveShellCommands(script: string): ShellCommand[] | undefined {
+  /** shell 在解析操作符前会移除反斜杠换行。 */
+  const normalizedScript = normalizeShellContinuations(script)
   /** 已完成解析的命令。 */
   const commands: ShellCommand[] = []
   /** 当前命令的参数列表。 */
@@ -489,9 +492,9 @@ function parseConjunctiveShellCommands(script: string): ShellCommand[] | undefin
     return true
   }
 
-  for (let index = 0; index < script.length; index += 1) {
+  for (let index = 0; index < normalizedScript.length; index += 1) {
     /** 当前 shell 字符。 */
-    const character = script[index]!
+    const character = normalizedScript[index]!
     if (quote) {
       if (character === quote) quote = undefined
       else {
@@ -507,7 +510,7 @@ function parseConjunctiveShellCommands(script: string): ShellCommand[] | undefin
       tokenStarted = true
     } else if (/\s/.test(character)) {
       pushToken()
-    } else if (character === '&' && script[index + 1] === '&') {
+    } else if (character === '&' && normalizedScript[index + 1] === '&') {
       if (!pushCommand()) return undefined
       index += 1
     } else if (';&|`#$()<>\\'.includes(character)) {
@@ -520,6 +523,33 @@ function parseConjunctiveShellCommands(script: string): ShellCommand[] | undefin
 
   if (quote || !pushCommand()) return undefined
   return commands
+}
+
+/** 按 shell 词法规则折叠 LF/CRLF 反斜杠续行，防止物理行绕过控制流判断。 */
+function normalizeShellContinuations(script: string): string {
+  return script.replace(/\\(?:\r\n|\n)[\t ]*/g, ' ')
+}
+
+/** 返回去除空行和整行注释后的逻辑 shell 行。 */
+function getLogicalShellLines(step: Record<string, unknown> | undefined): string[] {
+  /** 当前 step 的 shell 脚本文本。 */
+  const run = getStepRun(step)
+  if (!run) return []
+  return normalizeShellContinuations(run)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'))
+}
+
+/** 判断逻辑 shell 行与完整有序合同逐项一致，不允许插入额外命令。 */
+function stepMatchesLinearContract(
+  step: Record<string, unknown> | undefined,
+  contract: readonly RegExp[],
+): boolean {
+  /** 当前 step 归一化后的全部有效逻辑行。 */
+  const lines = getLogicalShellLines(step)
+  return lines.length === contract.length
+    && lines.every((line, index) => contract[index]!.test(line))
 }
 
 /** 判断解析后的命令参数与期望完全一致。 */
@@ -569,9 +599,7 @@ function stepRunsExactCommand(step: Record<string, unknown> | undefined, expecte
 
 /** 判断复杂 shell step 中存在行首真实命令，echo/引号文本不会命中。 */
 function stepHasDirectCommand(step: Record<string, unknown> | undefined, pattern: RegExp): boolean {
-  /** 当前 step 的 shell 脚本文本。 */
-  const run = getStepRun(step)
-  return Boolean(run && run.split(/\r?\n/).some((line) => pattern.test(line.trim())))
+  return getLogicalShellLines(step).some((line) => pattern.test(line))
 }
 
 /** 递归收集结构化 workflow 中全部 run 脚本，不局限于约定 job 或 step 名称。 */
@@ -608,7 +636,7 @@ function hasShellControlStructure(step: Record<string, unknown> | undefined): bo
   /** 命令起点或连接符后的控制关键字，以及 POSIX 函数声明。 */
   const controlKeyword = /(?:^|[;&|]\s*)(?:if|then|elif|else|fi|for|while|until|select|do|done|case|esac|function|exit|return|break|continue)\b/
   const functionDeclaration = /^[A-Za-z_][A-Za-z0-9_]*\s*\(\)\s*\{/
-  return run.split(/\r?\n/).some((line) => {
+  return normalizeShellContinuations(run).split(/\r?\n/).some((line) => {
     /** 注释行不参与 shell 结构判断。 */
     const trimmed = line.trim()
     return trimmed.length > 0
@@ -621,7 +649,7 @@ function hasShellControlStructure(step: Record<string, unknown> | undefined): bo
 function hasForbiddenWorkflowCommand(run: string): boolean {
   /** 仅匹配行首或 shell 连接符后的真实命令位置，避免把 echo 文本误判为执行。 */
   const forbiddenCommand = /(?:^|(?:&&|\|\||;)\s*)(?:if\s+)?(?:git\s+push\b|gh\s+(?:pr|release)\b|(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?(?:release|publish)\b|cargo\s+publish\b|twine\s+upload\b|docker\s+push\b|electron-builder\b[^\n]*\s--publish\b)/
-  return run.split(/\r?\n/).some((line) => forbiddenCommand.test(line.trim()))
+  return normalizeShellContinuations(run).split(/\r?\n/).some((line) => forbiddenCommand.test(line.trim()))
 }
 
 /** 检查主进程 Bridge 注册与统一启动组合点。 */
@@ -988,6 +1016,8 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
   const details: string[] = []
   /** workflow YAML 文本。 */
   const workflow = readRequired(reader, PATHS.workflow, details)
+  /** merge 状态 helper 必须随兼容检查保留。 */
+  readRequired(reader, PATHS.mergeHelper, details)
   /** 结构化 workflow YAML 根映射。 */
   const document = parseYamlRecord(workflow, 'upstream workflow', details)
   if (document) {
@@ -1047,44 +1077,38 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
       details.push('workflow uses 包含未批准 action')
     }
 
-    /** 上游 tag 选择与合并必须符合当前可证明的顶层命令模板。 */
+    /** 上游 tag 选择必须符合完整线性合同，顺序与命令集合都不可扩张。 */
     const selectTag = findStep('Select latest official release tag')
-    /** tag ref 可直接输出，也可先由正式 tag 构造受控变量后输出。 */
-    const hasTagRefOutput = stepHasDirectCommand(
-      selectTag,
-      /^echo\s+["']tag_ref=refs\/tags\/upstream\/\$LATEST_TAG["']\s*>>\s*["']\$GITHUB_OUTPUT["']$/,
-    ) || (
-      stepHasDirectCommand(selectTag, /^readonly\s+UPSTREAM_TAG_REF=["']refs\/tags\/upstream\/\$LATEST_TAG["']$/)
-      && stepHasDirectCommand(selectTag, /^echo\s+["']tag_ref=\$UPSTREAM_TAG_REF["']\s*>>\s*["']\$GITHUB_OUTPUT["']$/)
-    )
-    /** 线性筛选链必须先保留 namespaced 正式 semver，再移除 namespace。 */
-    const hasStrictCandidateFilter = (
-      stepHasDirectCommand(
-        selectTag,
-        /^grep\s+-E\s+['"]\^upstream\/v\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$['"]\s+["']\$RAW_TAGS_FILE["']\s+>\s+["']\$NAMESPACED_RELEASE_TAGS_FILE["']$/,
-      )
-      && stepHasDirectCommand(
-        selectTag,
-        /^sed\s+['"]s#\^upstream\/#\#['"]\s+["']\$NAMESPACED_RELEASE_TAGS_FILE["']\s+>\s+["']\$RELEASE_TAGS_FILE["']$/,
-      )
-    )
-    /** 最大 tag 必须来自 sort -V 输出文件的最后一行。 */
-    const selectsMaximumTag = (
-      stepHasDirectCommand(selectTag, /^sort\s+-V\s+["']\$RELEASE_TAGS_FILE["']\s+>\s+["']\$SORTED_TAGS_FILE["']$/)
-      && stepHasDirectCommand(selectTag, /^readonly\s+LATEST_TAG=.*\btail\s+-n\s+1\s+["']\$SORTED_TAGS_FILE["'].*$/)
-    )
+    /** 变量只能在定义后引用，remote 也只能执行一次精确 add。 */
+    const selectTagContract = [
+      /^set -euo pipefail$/,
+      /^git remote add upstream https:\/\/github\.com\/ErlichLiu\/Proma\.git$/,
+      /^git fetch --force upstream ['"]\+refs\/tags\/\*:refs\/tags\/upstream\/\*['"]$/,
+      /^readonly TEMP_BRANCH=["']compat\/upstream-\$\{?GITHUB_RUN_ID\}?-\$\{?GITHUB_RUN_ATTEMPT\}?["']$/,
+      /^readonly BASE_SHA=["']\$\(git rev-parse HEAD\)["']$/,
+      /^readonly RAW_TAGS_FILE=["']\$RUNNER_TEMP\/upstream-tags\.txt["']$/,
+      /^readonly NAMESPACED_RELEASE_TAGS_FILE=["']\$RUNNER_TEMP\/upstream-namespaced-release-tags\.txt["']$/,
+      /^readonly RELEASE_TAGS_FILE=["']\$RUNNER_TEMP\/upstream-release-tags\.txt["']$/,
+      /^readonly SORTED_TAGS_FILE=["']\$RUNNER_TEMP\/upstream-release-tags\.sorted\.txt["']$/,
+      /^git tag --list ['"]upstream\/v\*['"] > ["']\$RAW_TAGS_FILE["']$/,
+      /^grep -E ['"]\^upstream\/v\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$['"] ["']\$RAW_TAGS_FILE["'] > ["']\$NAMESPACED_RELEASE_TAGS_FILE["']$/,
+      /^sed ['"]s#\^upstream\/##["'] ["']\$NAMESPACED_RELEASE_TAGS_FILE["'] > ["']\$RELEASE_TAGS_FILE["']$/,
+      /^sort -V ["']\$RELEASE_TAGS_FILE["'] > ["']\$SORTED_TAGS_FILE["']$/,
+      /^readonly LATEST_TAG=["']\$\(tail -n 1 ["']\$SORTED_TAGS_FILE["']\)["']$/,
+      /^test -n ["']\$LATEST_TAG["']$/,
+      /^readonly UPSTREAM_TAG_REF=["']refs\/tags\/upstream\/\$LATEST_TAG["']$/,
+      /^readonly UPSTREAM_SHA=["']\$\(git rev-parse ["']\$\{UPSTREAM_TAG_REF\}\^\{commit\}["']\)["']$/,
+      /^echo ["']base_sha=\$BASE_SHA["'] >> ["']\$GITHUB_OUTPUT["']$/,
+      /^echo ["']tag=\$LATEST_TAG["'] >> ["']\$GITHUB_OUTPUT["']$/,
+      /^echo ["']tag_ref=\$UPSTREAM_TAG_REF["'] >> ["']\$GITHUB_OUTPUT["']$/,
+      /^echo ["']upstream_sha=\$UPSTREAM_SHA["'] >> ["']\$GITHUB_OUTPUT["']$/,
+      /^echo ["']temp_branch=\$TEMP_BRANCH["'] >> ["']\$GITHUB_OUTPUT["']$/,
+    ] as const
     if (
       selectTag?.id !== 'upstream'
       || hasShellControlStructure(selectTag)
-      || !stepHasDirectCommand(selectTag, /^set\s+-euo\s+pipefail$/)
-      || !stepHasDirectCommand(selectTag, /^readonly\s+UPSTREAM_URL=["']https:\/\/github\.com\/ErlichLiu\/Proma\.git["']$/)
-      || !stepHasDirectCommand(selectTag, /^git\s+remote\s+add\s+upstream\s+["']\$UPSTREAM_URL["']$/)
-      || !stepHasDirectCommand(selectTag, /^git\s+fetch\s+--force\s+upstream\s+["']\+refs\/tags\/\*:refs\/tags\/upstream\/\*["']$/)
-      || !stepHasDirectCommand(selectTag, /^git\s+tag\s+--list\s+["']upstream\/v\*["']\s+>\s+["']\$RAW_TAGS_FILE["']$/)
-      || !hasStrictCandidateFilter
-      || !selectsMaximumTag
-      || !hasTagRefOutput
-    ) details.push('上游 tag 步骤必须使用官方 URL，在顶层 fetch/tag/sort/tail 最大正式 tag 并输出 tag_ref')
+      || !stepMatchesLinearContract(selectTag, selectTagContract)
+    ) details.push('上游 tag 步骤必须严格按官方 remote、fetch、候选筛选、最大 tag 验证、只读 ref 与 outputs 的线性合同执行')
     const merge = findStep('Merge upstream tag without committing')
     /** merge 的 tag ref 只能来自已验证 select step 的精确 output。 */
     const mergeEnv = merge && isRecord(merge.env) ? merge.env : undefined
@@ -1095,8 +1119,16 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
       || mergeEnv?.UPSTREAM_TAG_REF !== '${{ steps.upstream.outputs.tag_ref }}'
       || !stepHasDirectCommand(merge, /^git\s+switch\s+--create\s+["']\$TEMP_BRANCH["']\s+["']\$BASE_SHA["']$/)
       || !stepHasDirectCommand(merge, /^git\s+merge\s+--no-commit\s+--no-ff\s+["']\$UPSTREAM_TAG_REF["']$/)
-      || !stepHasDirectCommand(merge, /^git\s+merge-base\s+--is-ancestor\s+["']\$UPSTREAM_TAG_REF["']\s+HEAD$/)
-    ) details.push('merge 步骤必须线性使用 select step 输出的 namespaced tag ref 完成合并与 ancestor 校验')
+      || stepHasDirectCommand(merge, /^git\s+merge-base\s+--is-ancestor\b/)
+    ) details.push('merge 步骤必须线性使用 select step 输出的 namespaced tag ref，状态验证交由只读 helper 处理')
+
+    /** helper 必须紧随 merge，并使用同一个受信 tag_ref output。 */
+    const verifyMerge = findStep('Verify upstream merge state')
+    const verifyMergeEnv = verifyMerge && isRecord(verifyMerge.env) ? verifyMerge.env : undefined
+    if (
+      verifyMergeEnv?.UPSTREAM_TAG_REF !== '${{ steps.upstream.outputs.tag_ref }}'
+      || !stepRunsExactCommand(verifyMerge, ['bun', 'run', 'apps/electron/scripts/verify-upstream-merge.ts'])
+    ) details.push('merge 状态 helper 必须使用 select step 的 tag_ref 执行只读双态验证')
 
     /** 简单验证步骤必须是唯一真实命令。 */
     const requiredCommands: Array<[string, readonly string[]]> = [
@@ -1117,6 +1149,7 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
       'Install Bun',
       'Select latest official release tag',
       'Merge upstream tag without committing',
+      'Verify upstream merge state',
       'Install dependencies from merged tree',
       'Check fork compatibility seams',
       'Run LAN and mobile targeted tests',
@@ -1141,7 +1174,7 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     ) details.push('cleanup 必须 always() 执行 abort、switch、delete 并返回聚合失败')
 
     /** 任何关键 run 都不能使用 || true 静默吞错。 */
-    if (steps.some((step) => /\|\|\s*true\b/.test(getStepRun(step) ?? ''))) {
+    if (steps.some((step) => /\|\|\s*true\b/.test(normalizeShellContinuations(getStepRun(step) ?? '')))) {
       details.push('workflow 使用 || true 吞掉命令或 pipeline 错误')
     }
     /** 任意 job 的 run 都不能写远端、创建 PR/release 或发布制品。 */
@@ -1153,7 +1186,7 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
   return createResult(
     'workflow-definition',
     '上游兼容 workflow 失败传播',
-    [PATHS.workflow],
+    [PATHS.workflow, PATHS.mergeHelper],
     '保留 manual+weekly 触发、最小权限、完整 checkout、固定验证命令顺序与 always cleanup；关键 run 不得用 echo 伪装。',
     details,
   )

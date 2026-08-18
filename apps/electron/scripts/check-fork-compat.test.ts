@@ -39,23 +39,26 @@ jobs:
         id: upstream
         run: |
           set -euo pipefail
-          readonly UPSTREAM_URL='https://github.com/ErlichLiu/Proma.git'
+          git remote add upstream https://github.com/ErlichLiu/Proma.git
+          git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'
           readonly TEMP_BRANCH="compat/upstream-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           readonly BASE_SHA="$(git rev-parse HEAD)"
           readonly RAW_TAGS_FILE="$RUNNER_TEMP/upstream-tags.txt"
-          readonly NAMESPACED_RELEASE_TAGS_FILE="$RUNNER_TEMP/namespaced-release-tags.txt"
-          readonly RELEASE_TAGS_FILE="$RUNNER_TEMP/release-tags.txt"
-          readonly SORTED_TAGS_FILE="$RUNNER_TEMP/release-tags.sorted.txt"
-          git remote add upstream "$UPSTREAM_URL"
-          git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'
+          readonly NAMESPACED_RELEASE_TAGS_FILE="$RUNNER_TEMP/upstream-namespaced-release-tags.txt"
+          readonly RELEASE_TAGS_FILE="$RUNNER_TEMP/upstream-release-tags.txt"
+          readonly SORTED_TAGS_FILE="$RUNNER_TEMP/upstream-release-tags.sorted.txt"
           git tag --list 'upstream/v*' > "$RAW_TAGS_FILE"
           grep -E '^upstream/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$' "$RAW_TAGS_FILE" > "$NAMESPACED_RELEASE_TAGS_FILE"
           sed 's#^upstream/##' "$NAMESPACED_RELEASE_TAGS_FILE" > "$RELEASE_TAGS_FILE"
           sort -V "$RELEASE_TAGS_FILE" > "$SORTED_TAGS_FILE"
           readonly LATEST_TAG="$(tail -n 1 "$SORTED_TAGS_FILE")"
+          test -n "$LATEST_TAG"
           readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"
+          readonly UPSTREAM_SHA="$(git rev-parse "\${UPSTREAM_TAG_REF}^{commit}")"
           echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
           echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "temp_branch=$TEMP_BRANCH" >> "$GITHUB_OUTPUT"
       - name: Merge upstream tag without committing
         env:
@@ -63,9 +66,13 @@ jobs:
           TEMP_BRANCH: \${{ steps.upstream.outputs.temp_branch }}
           UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}
         run: |
+          set -euo pipefail
           git switch --create "$TEMP_BRANCH" "$BASE_SHA"
           git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"
-          git merge-base --is-ancestor "$UPSTREAM_TAG_REF" HEAD
+      - name: Verify upstream merge state
+        env:
+          UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}
+        run: bun run apps/electron/scripts/verify-upstream-merge.ts
       - name: Install dependencies from merged tree
         run: bun install --frozen-lockfile
       - name: Check fork compatibility seams
@@ -240,6 +247,7 @@ extraResources:
       - "**/*"
   `,
   '.github/workflows/upstream-compat.yml': validWorkflow,
+  'apps/electron/scripts/verify-upstream-merge.ts': 'export function verifyUpstreamMerge() {}',
 }
 
 /** 执行内存 fixture 并返回全部兼容检查结果。 */
@@ -1304,6 +1312,123 @@ broken: [
     })
   }
 
+  /** 反斜杠续行必须先折叠，否则短路操作符可把下一物理行的关键命令变成不可达。 */
+  const continuedShortCircuitCases = [
+    { name: 'false && LF', prefix: 'false && \\', newline: '\n' },
+    { name: 'true || LF', prefix: 'true || \\', newline: '\n' },
+    { name: 'false && CRLF', prefix: 'false && \\', newline: '\r\n' },
+  ]
+
+  for (const shortCircuitCase of continuedShortCircuitCases) {
+    test(`Given ${shortCircuitCase.name} 通过续行包裹 fetch When 检查 workflow Then 明确失败`, () => {
+      /** 把关键命令拼接到短路表达式的同一逻辑行。 */
+      const workflow = validWorkflow.replace(
+        "git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'",
+        `${shortCircuitCase.prefix}${shortCircuitCase.newline}          git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'`,
+      )
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  test('Given tag_ref 输出移动到变量赋值前 When 检查线性合同 Then 明确失败', () => {
+    /** 文本仍全部存在，但输出发生在可信 tag ref 定义之前。 */
+    const workflow = validWorkflow
+      .replace('          echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"\n', '')
+      .replace(
+        '          readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"\n',
+        '          echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"\n          readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"\n',
+      )
+    const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+    expect(workflow).not.toBe(validWorkflow)
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
+
+  /** upstream remote 只能按合同添加一次，禁止后续改写或追加其他来源。 */
+  const invalidRemoteCases = [
+    'git remote set-url upstream https://attacker.invalid/Proma.git',
+    'git remote add upstream https://attacker.invalid/Proma.git',
+    'git remote add mirror https://attacker.invalid/Proma.git',
+  ]
+
+  for (const remoteCommand of invalidRemoteCases) {
+    test(`Given select step 追加 ${remoteCommand} When 检查 remote 闭集 Then 明确失败`, () => {
+      /** 在合法 add 之后注入额外远端写操作。 */
+      const workflow = validWorkflow.replace(
+        '          git remote add upstream https://github.com/ErlichLiu/Proma.git',
+        `          git remote add upstream https://github.com/ErlichLiu/Proma.git\n          ${remoteCommand}`,
+      )
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  test('Given merge helper 步骤缺失 When 检查 workflow Then 明确失败', () => {
+    /** 删除 merge 状态验证步骤但保留其它验证命令。 */
+    const workflow = validWorkflow.replace(
+      `      - name: Verify upstream merge state
+        env:
+          UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}
+        run: bun run apps/electron/scripts/verify-upstream-merge.ts
+`,
+      '',
+    )
+    const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+    expect(workflow).not.toBe(validWorkflow)
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
+
+  test('Given merge helper 位于 merge 前 When 检查步骤顺序 Then 明确失败', () => {
+    /** 把 helper step 移到 merge 操作之前。 */
+    const helperStep = `      - name: Verify upstream merge state
+        env:
+          UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}
+        run: bun run apps/electron/scripts/verify-upstream-merge.ts
+`
+    const workflow = validWorkflow
+      .replace(helperStep, '')
+      .replace('      - name: Merge upstream tag without committing', `${helperStep}      - name: Merge upstream tag without committing`)
+    const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+    expect(workflow).not.toBe(validWorkflow)
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
+
+  test('Given merge helper 位于兼容检查后 When 检查步骤顺序 Then 明确失败', () => {
+    /** 把 helper step 移到 fork checker 之后，破坏先验证 merge 状态的顺序。 */
+    const helperStep = `      - name: Verify upstream merge state
+        env:
+          UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}
+        run: bun run apps/electron/scripts/verify-upstream-merge.ts
+`
+    const workflow = validWorkflow
+      .replace(helperStep, '')
+      .replace(
+        "      - name: Run LAN and mobile targeted tests",
+        `${helperStep}      - name: Run LAN and mobile targeted tests`,
+      )
+    const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+    expect(workflow).not.toBe(validWorkflow)
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
+
+  test('Given merge helper 源文件缺失 When 检查 workflow Then 明确报告路径', () => {
+    /** 删除 helper 文件，checker 必须把它纳入必需文件清单。 */
+    const files = { ...validFiles }
+    delete files['apps/electron/scripts/verify-upstream-merge.ts']
+    const result = getCheck(files, 'workflow-definition')
+
+    expect(result.passed).toBe(false)
+    expect(result.details.join('\n')).toContain('apps/electron/scripts/verify-upstream-merge.ts')
+  })
+
   /** tag_ref 与 merge 必须沿已验证 LATEST_TAG 的固定 namespaced 数据流。 */
   const invalidTagFlowCases = [
     {
@@ -1322,9 +1447,9 @@ broken: [
       replacement: 'git merge --no-commit --no-ff "$UNTRUSTED_TAG"',
     },
     {
-      name: 'ancestor 使用硬编码错误 tag',
-      target: 'git merge-base --is-ancestor "$UPSTREAM_TAG_REF" HEAD',
-      replacement: 'git merge-base --is-ancestor refs/tags/upstream/v0.0.1 HEAD',
+      name: 'helper 使用硬编码错误 tag',
+      target: 'UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}',
+      replacement: 'UPSTREAM_TAG_REF: refs/tags/upstream/v0.0.1',
     },
     {
       name: 'fetch 未写入 upstream namespace',
@@ -1386,8 +1511,8 @@ broken: [
     })
   }
 
-  test('Given tag ref 直接来自 LATEST_TAG When 检查 workflow Then 接受真实输出命令', () => {
-    /** 模拟直接从 LATEST_TAG 输出 namespaced tag ref。 */
+  test('Given tag ref 跳过只读 ref 变量 When 检查线性合同 Then 明确失败', () => {
+    /** 直接输出虽可运行，但破坏严格有序的单一数据流合同。 */
     const workflow = validWorkflow
       .replace('          readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"\n', '')
       .replace(
@@ -1401,7 +1526,7 @@ broken: [
     }
 
     expect(workflow).not.toBe(validWorkflow)
-    expect(getCheck(files, 'workflow-definition').passed).toBe(true)
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
   })
 
   /** 每个关键 run 被 echo 替换时都不能被文本内容伪装。 */

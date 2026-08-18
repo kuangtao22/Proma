@@ -36,7 +36,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          readonly UPSTREAM_URL='https://github.com/ErlichLiu/Proma.git'
+          git remote add upstream https://github.com/ErlichLiu/Proma.git
+          git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'
+
           readonly TEMP_BRANCH="compat/upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           readonly BASE_SHA="$(git rev-parse HEAD)"
           readonly RAW_TAGS_FILE="$RUNNER_TEMP/upstream-tags.txt"
@@ -44,25 +46,20 @@ jobs:
           readonly RELEASE_TAGS_FILE="$RUNNER_TEMP/upstream-release-tags.txt"
           readonly SORTED_TAGS_FILE="$RUNNER_TEMP/upstream-release-tags.sorted.txt"
 
-          git remote add upstream "$UPSTREAM_URL"
-          git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'
-
           git tag --list 'upstream/v*' > "$RAW_TAGS_FILE"
           grep -E '^upstream/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' "$RAW_TAGS_FILE" > "$NAMESPACED_RELEASE_TAGS_FILE"
           sed 's#^upstream/##' "$NAMESPACED_RELEASE_TAGS_FILE" > "$RELEASE_TAGS_FILE"
 
           sort -V "$RELEASE_TAGS_FILE" > "$SORTED_TAGS_FILE"
           readonly LATEST_TAG="$(tail -n 1 "$SORTED_TAGS_FILE")"
+          test -n "$LATEST_TAG"
           readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"
           readonly UPSTREAM_SHA="$(git rev-parse "${UPSTREAM_TAG_REF}^{commit}")"
-          echo "base=$BASE_SHA"
-          echo "head=$(git rev-parse HEAD)"
-          echo "upstream_tag=$LATEST_TAG"
-          echo "upstream_sha=$UPSTREAM_SHA"
 
           echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
           echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
           echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "temp_branch=$TEMP_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Merge upstream tag without committing
@@ -81,9 +78,13 @@ jobs:
           echo "base=$BASE_SHA"
           echo "head=$(git rev-parse HEAD)"
           echo "upstream_tag=$UPSTREAM_TAG"
-          git merge-base --is-ancestor "$UPSTREAM_TAG_REF" HEAD
           git status --short
           git diff --cached --stat
+
+      - name: Verify upstream merge state
+        env:
+          UPSTREAM_TAG_REF: ${{ steps.upstream.outputs.tag_ref }}
+        run: bun run apps/electron/scripts/verify-upstream-merge.ts
 
       - name: Install dependencies from merged tree
         run: bun install --frozen-lockfile
