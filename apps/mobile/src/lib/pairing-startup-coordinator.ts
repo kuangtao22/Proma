@@ -7,6 +7,14 @@ export interface PairingConnectionTarget {
   port: string
 }
 
+/** 地址切换时由 App 执行的连接与 UI 状态动作。 */
+export interface PairingConnectionActions {
+  /** 使用当前 atoms 中的地址建立连接。 */
+  connect: (host: string, port: string) => void
+  /** 自动配对被地址切换取消后解除 PIN 禁用态。 */
+  onPairingCancelled: () => void
+}
+
 /** 自动票据配对的外部动作。 */
 export interface PairingStartupCallbacks {
   /** 提交只可消费一次的配对票据并返回认证 Token。 */
@@ -27,8 +35,26 @@ export interface PairingStartupCoordinator {
   takeInitialTarget: () => PairingConnectionTarget | null
   /** 根据服务端能力完成自动配对或触发 PIN 回退。 */
   handleConnected: (payload: unknown, callbacks: PairingStartupCallbacks) => Promise<void>
-  /** 清除尚未消费的启动配对材料。 */
-  cancel: () => void
+  /** 清除启动配对材料与进行中请求；返回是否取消了自动配对。 */
+  cancel: () => boolean
+}
+
+/** 启动当前地址连接并返回供下一轮比较的目标。 */
+export function startPairingConnection(
+  coordinator: PairingStartupCoordinator,
+  previousTarget: PairingConnectionTarget | null,
+  target: PairingConnectionTarget,
+  actions: PairingConnectionActions,
+): PairingConnectionTarget {
+  /** 只有地址实际改变才取消，兼容 StrictMode 对同一 effect 的重复挂载。 */
+  const targetChanged = previousTarget !== null && (
+    previousTarget.host !== target.host || previousTarget.port !== target.port
+  )
+  if (targetChanged && coordinator.cancel()) {
+    actions.onPairingCancelled()
+  }
+  actions.connect(target.host, target.port)
+  return target
 }
 
 /** 创建只持有一次性 ticket/target 的启动协调器。 */
@@ -37,6 +63,10 @@ export function createPairingStartupCoordinator(link: PairingLink | null): Pairi
   let pendingTicket = link?.ticket ?? null
   /** 尚未同步进连接 atoms 的启动目标；只允许读取一次。 */
   let initialTarget = link ? parseConnectionTarget(link.cleanUrl) : null
+  /** 当前请求编号；取消后置空以忽略迟到成功或失败。 */
+  let activeRequestId: number | null = null
+  /** 为每次真实票据请求分配单调递增编号。 */
+  let nextRequestId = 0
 
   return {
     hasPendingTicket: () => pendingTicket !== null,
@@ -58,21 +88,34 @@ export function createPairingStartupCoordinator(link: PairingLink | null): Pairi
       /** 先取走再请求，成功、失败、断线和重连都不能二次消费。 */
       const ticket = pendingTicket
       pendingTicket = null
+      /** 标记当前唯一进行中的自动配对请求。 */
+      const requestId = ++nextRequestId
+      activeRequestId = requestId
+      /** 服务端签发的认证结果。 */
+      let result: { token: string }
       try {
-        /** 服务端签发的认证结果。 */
-        const result = await callbacks.requestPairTicket(ticket)
-        if (!result.token) {
-          callbacks.onFallback('扫码配对响应无效，请使用 PIN 码连接')
-          return
-        }
-        callbacks.onAuthenticated(result.token)
+        result = await callbacks.requestPairTicket(ticket)
       } catch (error) {
+        if (activeRequestId !== requestId) return
+        activeRequestId = null
         callbacks.onFallback(getPairingFailureMessage(error))
+        return
       }
+      if (activeRequestId !== requestId) return
+      activeRequestId = null
+      if (!result.token) {
+        callbacks.onFallback('扫码配对响应无效，请使用 PIN 码连接')
+        return
+      }
+      callbacks.onAuthenticated(result.token)
     },
     cancel: () => {
+      /** pending ticket 或 in-flight 请求都代表 UI 仍处于自动配对态。 */
+      const pairingWasActive = pendingTicket !== null || activeRequestId !== null
       pendingTicket = null
       initialTarget = null
+      activeRequestId = null
+      return pairingWasActive
     },
   }
 }

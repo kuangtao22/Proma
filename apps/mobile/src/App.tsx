@@ -19,7 +19,11 @@ import { AppShell } from './components/layout/AppShell'
 import {
   consumePairingLink,
 } from './lib/pairing-link'
-import { createPairingStartupCoordinator } from './lib/pairing-startup-coordinator'
+import {
+  createPairingStartupCoordinator,
+  startPairingConnection,
+} from './lib/pairing-startup-coordinator'
+import type { PairingConnectionTarget } from './lib/pairing-startup-coordinator'
 
 interface ConvListResponse { conversations: ConvItem[] }
 interface SessionListResponse { sessions: ConvItem[] }
@@ -73,6 +77,8 @@ export function App() {
   )
   /** 每次连接 open 使用独立 generation，旧异步认证无法回写。 */
   const connectionGenerations = useRef(createGenerationTracker())
+  /** 记录上一轮实际连接目标，用于识别来自任意 atom 更新源的地址切换。 */
+  const previousConnectionTarget = useRef<PairingConnectionTarget | null>(null)
 
   /** 将扫码 origin 一次性同步进现有地址 atoms，之后完全由表单/atoms 驱动连接。 */
   useLayoutEffect(() => {
@@ -236,8 +242,16 @@ export function App() {
       })
     })
 
-    /** 连接目标始终来自 atoms；手工修改地址会触发 effect 重建连接。 */
-    connect(host, port)
+    /** 地址切换取消旧自动配对并解除 PIN 禁用，同地址 StrictMode 重建不会误取消。 */
+    previousConnectionTarget.current = startPairingConnection(
+      startupPairingCoordinator,
+      previousConnectionTarget.current,
+      { host, port },
+      {
+        connect,
+        onPairingCancelled: () => setPairingPending(false),
+      },
+    )
     return () => {
       cancelled = true
       clearPairingCapabilityTimer()
