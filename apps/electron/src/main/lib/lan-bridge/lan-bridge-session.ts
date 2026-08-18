@@ -11,16 +11,37 @@ import { verifyToken } from './lan-bridge-auth'
 
 const RATE_LIMIT_WINDOW_MS = 60_000 // 1 minute
 const RATE_LIMIT_MAX_MESSAGES = 60
-const HEARTBEAT_INTERVAL_MS = 30_000
-const HEARTBEAT_TIMEOUT_MS = 20_000
+const HEARTBEAT_INTERVAL_MS = 15_000
+const HEARTBEAT_TIMEOUT_MS = 45_000
+
+/** 会话管理器的时间、调度与 ID 依赖，便于确定性测试。 */
+export interface LanBridgeSessionManagerDependencies {
+  /** 返回当前毫秒时间戳。 */
+  now: () => number
+  /** 注册固定间隔任务，返回可清理的调度句柄。 */
+  scheduleInterval: (callback: () => void, intervalMs: number) => ReturnType<typeof setInterval>
+  /** 清理固定间隔任务。 */
+  clearScheduledInterval: (handle: ReturnType<typeof setInterval>) => void
+  /** 生成客户端唯一 ID。 */
+  uuid: () => string
+}
+
+const DEFAULT_DEPENDENCIES: LanBridgeSessionManagerDependencies = {
+  now: Date.now,
+  scheduleInterval: setInterval,
+  clearScheduledInterval: clearInterval,
+  uuid: randomUUID,
+}
 
 export class LanBridgeSessionManager {
   private clients = new Map<string, ClientConnection>()
   private maxConnections: number
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  private readonly dependencies: LanBridgeSessionManagerDependencies
 
-  constructor(maxConnections: number) {
+  constructor(maxConnections: number, dependencies: Partial<LanBridgeSessionManagerDependencies> = {}) {
     this.maxConnections = maxConnections
+    this.dependencies = { ...DEFAULT_DEPENDENCIES, ...dependencies }
   }
 
   /** 添加新连接 */
@@ -30,15 +51,16 @@ export class LanBridgeSessionManager {
       return null
     }
 
+    const now = this.dependencies.now()
     const client: ClientConnection = {
-      id: randomUUID(),
+      id: this.dependencies.uuid(),
       ws,
       ip,
       authenticated: false,
       subscriptions: new Set(),
-      lastActivity: Date.now(),
-      alive: true,
-      windowStart: Date.now(),
+      lastActivity: now,
+      lastPongAt: now,
+      windowStart: now,
       messageCount: 0,
     }
 
@@ -60,9 +82,15 @@ export class LanBridgeSessionManager {
     return this.clients.get(id)
   }
 
+  /** 记录目标连接的 pong；已移除或被同 ID 新连接替换的对象不会被更新。 */
+  markPong(client: ClientConnection, receivedAt = this.dependencies.now()): void {
+    if (this.clients.get(client.id) !== client) return
+    client.lastPongAt = receivedAt
+  }
+
   /** 检查速率限制，返回 true 表示允许 */
   checkRateLimit(client: ClientConnection): boolean {
-    const now = Date.now()
+    const now = this.dependencies.now()
     if (now - client.windowStart > RATE_LIMIT_WINDOW_MS) {
       client.windowStart = now
       client.messageCount = 0
@@ -118,18 +146,26 @@ export class LanBridgeSessionManager {
   /** 启动心跳检测 */
   startHeartbeat(): void {
     this.stopHeartbeat()
-    this.heartbeatTimer = setInterval(() => {
-      const now = Date.now()
+    this.heartbeatTimer = this.dependencies.scheduleInterval(() => {
+      const now = this.dependencies.now()
       for (const [id, client] of this.clients) {
-        // 检查心跳超时
-        if (!client.alive || now - client.lastActivity > HEARTBEAT_TIMEOUT_MS) {
+        // 先清理达到完整超时窗口的连接，避免超时后继续发送心跳。
+        if (now - client.lastPongAt >= HEARTBEAT_TIMEOUT_MS) {
           console.log(`[LAN Bridge] 心跳超时，断开: ${client.ip} (${id})`)
-          client.ws.terminate()
           this.clients.delete(id)
+          try {
+            client.ws.terminate()
+          } catch {
+            console.warn(`[LAN Bridge] 心跳终止失败，尝试关闭: ${client.ip} (${id})`)
+            try {
+              client.ws.close(1011, 'Heartbeat timeout cleanup')
+            } catch {
+              console.warn(`[LAN Bridge] 心跳关闭失败，连接已移除: ${client.ip} (${id})`)
+            }
+          }
           continue
         }
-        // 发送心跳 ping
-        client.alive = false
+        // 仅向可写连接发送应用层心跳，发送结果不改变 pong 时间。
         if (client.ws.readyState === 1) {
           try { client.ws.send(JSON.stringify({ type: '_heartbeat' })) } catch { /* ignore */ }
         }
@@ -140,7 +176,7 @@ export class LanBridgeSessionManager {
   /** 停止心跳检测 */
   stopHeartbeat(): void {
     if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer)
+      this.dependencies.clearScheduledInterval(this.heartbeatTimer)
       this.heartbeatTimer = null
     }
   }

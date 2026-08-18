@@ -16,13 +16,14 @@ import { initAuth, refreshPin, getCurrentPin, removeLegacyPinFile } from './lan-
 import { getConfigDir } from '../config-paths'
 import { LanBridgeSessionManager } from './lan-bridge-session'
 import { dispatch } from './lan-bridge-router'
-import type { ClientConnection } from './lan-bridge-types'
-import type { LanBridgeConfig, LanBridgeRequest, LanBridgeRuntimeState } from '@proma/shared'
+import type { LanBridgeConfig, LanBridgeRuntimeState } from '@proma/shared'
 import { LAN_BRIDGE_IPC_CHANNELS } from '@proma/shared'
 
 import './lan-bridge-handlers'
 import { startSubscription, stopSubscription } from './lan-bridge-subscription'
 import type { AgentEventBus } from '../agent-event-bus'
+import { createLanBridgeRecoveryController } from './lan-bridge-recovery'
+import { createLanBridgeMessageHandler } from './lan-bridge-message-handler'
 
 // ===== 单例状态 =====
 
@@ -33,10 +34,19 @@ let sessionManager: LanBridgeSessionManager | null = null
 let status: LanBridgeRuntimeState['status'] = 'stopped'
 let errorMessage: string | undefined
 
+const recoveryController = createLanBridgeRecoveryController({
+  isEnabled: () => getLanBridgeConfig().enabled,
+  getStatus: () => status,
+  getActiveEventBus: () => eventBus,
+  stop: stopLanBridge,
+  start: startLanBridge,
+})
+
 // ===== 公开 API =====
 
 /** 启动 LAN Bridge WS Server */
 export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
+  recoveryController.rememberEventBus(bus)
   const config = getLanBridgeConfig()
   if (status === 'running') return
 
@@ -48,6 +58,11 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
     removeLegacyPinFile(getConfigDir())
 
     sessionManager = new LanBridgeSessionManager(config.maxConnections)
+    const handleMessage = createLanBridgeMessageHandler({
+      sessionManager,
+      now: Date.now,
+      dispatch,
+    })
 
     // 静态文件根目录:
     // 开发环境: apps/mobile/dist/（相对于 dist/main.cjs 上两级）
@@ -211,51 +226,14 @@ export function updateConfig(updates: Partial<LanBridgeConfig>): LanBridgeConfig
 export const lanBridgeRegistration = {
   name: 'LAN Bridge',
   shouldAutoStart: () => getLanBridgeConfig().enabled,
+  needsRecovery: recoveryController.needsRecovery,
   start: () => {
     // 动态导入避免循环依赖
     const { agentEventBus } = require('../agent-service') as { agentEventBus: import('../agent-event-bus').AgentEventBus }
     return startLanBridge(agentEventBus)
   },
   stop: stopLanBridge,
-}
-
-// ===== 内部工具 =====
-
-function handleMessage(client: ClientConnection, raw: Buffer): void {
-  client.lastActivity = Date.now()
-  client.alive = true
-
-  if (!sessionManager!.checkRateLimit(client)) {
-    sessionManager!.send(client, {
-      type: 'error',
-      ok: false,
-      error: 'Rate limited',
-      errorCode: 'RATE_LIMITED',
-    })
-    return
-  }
-
-  let parsed: LanBridgeRequest
-  try {
-    parsed = JSON.parse(raw.toString('utf-8'))
-  } catch {
-    sessionManager!.send(client, {
-      type: 'error',
-      ok: false,
-      error: 'Invalid JSON',
-      errorCode: 'VALIDATION_ERROR',
-    })
-    return
-  }
-
-  if (!parsed.type) return
-
-  // 心跳 pong 响应
-  if (parsed.type === 'pong') {
-    return
-  }
-
-  dispatch(client, parsed.type, parsed.data ?? {}, parsed.id)
+  recover: recoveryController.recover,
 }
 
 /** 从 HTTP 请求中提取真实客户端 IP。仅当连接来自本地回环时才信任代理头。 */

@@ -18,8 +18,8 @@ export interface ClientConnection {
   subscriptions: Set<string>
   /** 最后活跃时间 */
   lastActivity: number
-  /** 心跳标记 */
-  alive: boolean
+  /** 最后收到应用层 pong 的时间 */
+  lastPongAt: number
   /** 消息计数（速率限制用，滑动窗口起始时间戳） */
   windowStart: number
   /** 消息计数 */
