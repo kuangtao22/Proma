@@ -7,7 +7,8 @@
 import { randomUUID } from 'node:crypto'
 import type { WebSocket } from 'ws'
 import type { ClientConnection } from './lan-bridge-types'
-import { verifyToken } from './lan-bridge-auth'
+import { verifyTokenDetails } from './lan-bridge-auth'
+import type { TokenVerificationResult } from './lan-bridge-auth'
 
 const RATE_LIMIT_WINDOW_MS = 60_000 // 1 minute
 const RATE_LIMIT_MAX_MESSAGES = 60
@@ -24,6 +25,8 @@ export interface LanBridgeSessionManagerDependencies {
   clearScheduledInterval: (handle: ReturnType<typeof setInterval>) => void
   /** 生成客户端唯一 ID。 */
   uuid: () => string
+  /** 验证 Token 并返回对应设备。 */
+  verifyToken: (token: string, ip: string) => TokenVerificationResult
 }
 
 const DEFAULT_DEPENDENCIES: LanBridgeSessionManagerDependencies = {
@@ -31,6 +34,7 @@ const DEFAULT_DEPENDENCIES: LanBridgeSessionManagerDependencies = {
   scheduleInterval: setInterval,
   clearScheduledInterval: clearInterval,
   uuid: randomUUID,
+  verifyToken: verifyTokenDetails,
 }
 
 export class LanBridgeSessionManager {
@@ -103,11 +107,31 @@ export class LanBridgeSessionManager {
   authenticateFromData(client: ClientConnection, data: Record<string, unknown>): boolean {
     const token = data.token as string | undefined
     if (!token) return false
-    if (verifyToken(token, client.ip)) {
+    /** 包含设备标识的 Token 验证结果。 */
+    const verification = this.dependencies.verifyToken(token, client.ip)
+    if (verification.valid) {
       client.authenticated = true
+      client.deviceId = verification.deviceId
       return true
     }
     return false
+  }
+
+  /**
+   * 断开指定设备的所有现有连接。
+   *
+   * @param deviceId 被撤销设备唯一标识
+   */
+  disconnectDevice(deviceId: string): void {
+    for (const [clientId, client] of this.clients) {
+      if (client.deviceId !== deviceId) continue
+      this.clients.delete(clientId)
+      try {
+        client.ws.close(1008, 'Device revoked')
+      } catch {
+        console.warn(`[LAN Bridge] 撤销设备连接关闭失败: ${client.ip} (${clientId})`)
+      }
+    }
   }
 
   /** 获取订阅了指定 sessionId 的所有客户端 */

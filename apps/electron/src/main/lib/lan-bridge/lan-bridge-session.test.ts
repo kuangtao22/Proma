@@ -73,6 +73,56 @@ function createHarness(initialNow = 0): {
   }
 }
 
+describe('LanBridgeSessionManager 设备认证与撤销', () => {
+  test('设备 Token 认证成功后记录 deviceId', () => {
+    /** 当前用例的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      verifyToken: () => ({ valid: true, deviceId: 'device-1' }),
+      uuid: () => 'client-1',
+    })
+    /** 当前用例的测试连接。 */
+    const socket = new FakeWebSocket()
+    /** 等待认证的客户端。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+
+    expect(manager.authenticateFromData(client, { token: 'valid-token' })).toBe(true)
+    expect(client.authenticated).toBe(true)
+    expect(client.deviceId).toBe('device-1')
+  })
+
+  test('撤销设备时使用合法策略违规关闭码断开其全部连接', () => {
+    /** 用于生成不同连接 ID 的序号。 */
+    let nextId = 0
+    /** 当前用例的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      verifyToken: token => ({ valid: true, deviceId: token }),
+      uuid: () => `client-${++nextId}`,
+    })
+    /** 属于被撤销设备的首个连接。 */
+    const firstSocket = new FakeWebSocket()
+    /** 属于被撤销设备的第二个连接。 */
+    const secondSocket = new FakeWebSocket()
+    /** 属于其他设备的连接。 */
+    const otherSocket = new FakeWebSocket()
+    /** 三个已建立的客户端。 */
+    const clients = [firstSocket, secondSocket, otherSocket].map((socket, index) => (
+      manager.addClient(socket as unknown as WebSocket, `192.168.1.${index + 2}`)!
+    ))
+    manager.authenticateFromData(clients[0]!, { token: 'device-1' })
+    manager.authenticateFromData(clients[1]!, { token: 'device-1' })
+    manager.authenticateFromData(clients[2]!, { token: 'device-2' })
+
+    manager.disconnectDevice('device-1')
+
+    expect(firstSocket.closeCalls).toEqual([{ code: 1008, reason: 'Device revoked' }])
+    expect(secondSocket.closeCalls).toEqual([{ code: 1008, reason: 'Device revoked' }])
+    expect(otherSocket.closeCalls).toEqual([])
+    expect(manager.getClient(clients[0]!.id)).toBeUndefined()
+    expect(manager.getClient(clients[1]!.id)).toBeUndefined()
+    expect(manager.getClient(clients[2]!.id)).toBe(clients[2])
+  })
+})
+
 describe('LanBridgeSessionManager 应用层心跳', () => {
   test('新连接在 15 秒收到心跳且不会先断开', () => {
     const harness = createHarness()

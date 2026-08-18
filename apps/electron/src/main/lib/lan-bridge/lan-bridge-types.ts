@@ -14,6 +14,8 @@ export interface ClientConnection {
   ip: string
   /** 是否已认证 */
   authenticated: boolean
+  /** 已认证设备唯一标识；未认证或旧连接为空。 */
+  deviceId?: string
   /** 已订阅的 sessionId 集合 */
   subscriptions: Set<string>
   /** 最后活跃时间 */
