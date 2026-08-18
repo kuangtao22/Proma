@@ -267,12 +267,14 @@ function functionDirectlyStartsLanBridge(
   injectedName: string,
 ): boolean {
   if (!ts.isBlock(functionLike.body)) return isInjectedStartCall(functionLike.body, injectedName)
-  return functionLike.body.statements.some((statement) => {
+  for (const statement of functionLike.body.statements) {
     if (ts.isReturnStatement(statement) && statement.expression) {
       return isInjectedStartCall(statement.expression, injectedName)
     }
-    return ts.isExpressionStatement(statement) && isInjectedStartCall(statement.expression, injectedName)
-  })
+    if (ts.isReturnStatement(statement) || ts.isThrowStatement(statement)) return false
+    if (ts.isExpressionStatement(statement) && isInjectedStartCall(statement.expression, injectedName)) return true
+  }
+  return false
 }
 
 /** 解析 factory 直接返回对象上的 start 函数，支持属性、方法和局部 shorthand。 */

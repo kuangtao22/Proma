@@ -359,6 +359,22 @@ describe('fork 上游兼容检查器', () => {
         }
       `,
     },
+    {
+      name: 'block direct call',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          return { start: () => { startLanBridge(agentEventBus) } }
+        }
+      `,
+    },
+    {
+      name: 'block return call',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          return { start: () => { return startLanBridge(agentEventBus) } }
+        }
+      `,
+    },
   ]
 
   for (const bridgeCase of validBridgeStartCases) {
@@ -400,6 +416,40 @@ describe('fork 上游兼容检查器', () => {
       source: `
         export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
           return { start: () => startLanBridge(otherEventBus) }
+        }
+      `,
+    },
+    {
+      name: '调用位于 return 后',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          return {
+            start: () => {
+              return Promise.resolve()
+              startLanBridge(agentEventBus)
+            },
+          }
+        }
+      `,
+    },
+    {
+      name: '调用位于 throw 后',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          return {
+            start: () => {
+              throw new Error('stop')
+              startLanBridge(agentEventBus)
+            },
+          }
+        }
+      `,
+    },
+    {
+      name: '调用仅存在于永不执行条件分支',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          return { start: () => { if (false) startLanBridge(agentEventBus) } }
         }
       `,
     },
