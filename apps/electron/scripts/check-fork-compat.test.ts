@@ -38,12 +38,21 @@ jobs:
       - name: Select latest official release tag
         id: upstream
         run: |
+          readonly UPSTREAM_URL='https://github.com/ErlichLiu/Proma.git'
+          readonly RAW_TAGS_FILE="$RUNNER_TEMP/upstream-tags.txt"
+          readonly RELEASE_TAGS_FILE="$RUNNER_TEMP/release-tags.txt"
+          readonly SORTED_TAGS_FILE="$RUNNER_TEMP/release-tags.sorted.txt"
+          git remote add upstream "$UPSTREAM_URL"
           git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'
-          git tag --list 'upstream/v*'
-          if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then
-            sort -V "$RUNNER_TEMP/tags.txt"
-          fi
-          echo "tag_ref=refs/tags/upstream/$tag" >> "$GITHUB_OUTPUT"
+          git tag --list 'upstream/v*' > "$RAW_TAGS_FILE"
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then
+              printf '%s\\n' "$tag" >> "$RELEASE_TAGS_FILE"
+            fi
+          done < "$RAW_TAGS_FILE"
+          sort -V "$RELEASE_TAGS_FILE" > "$SORTED_TAGS_FILE"
+          readonly LATEST_TAG="$(tail -n 1 "$SORTED_TAGS_FILE")"
+          echo "tag_ref=refs/tags/upstream/$LATEST_TAG" >> "$GITHUB_OUTPUT"
       - name: Merge upstream tag without committing
         run: |
           git switch --create "$TEMP_BRANCH" "$BASE_SHA"
@@ -304,7 +313,10 @@ describe('fork 上游兼容检查器', () => {
       name: '十个 LAN IPC 命令和设备管理方法',
       id: 'lan-ipc-contract',
       path: 'apps/electron/src/preload/lan-bridge-preload.ts',
-      mutate: (content) => content.replace('revokeLanBridgeDevice: Function', 'removedDeviceMethod: Function'),
+      mutate: (content) => content.replace(
+        'revokeLanBridgeDevice: () => ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.REVOKE_DEVICE),',
+        'removedDeviceMethod: () => ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.REVOKE_DEVICE),',
+      ),
     },
     {
       name: '上游兼容 workflow 结构',
@@ -442,6 +454,54 @@ describe('fork 上游兼容检查器', () => {
 
     expect(getCheck(files, 'bridge-composition').passed).toBe(false)
   })
+
+  /** LAN registration 必须是 Program 顶层可执行表达式。 */
+  const unreachableRegistrationCases: Array<{ name: string; registration: string }> = [
+    {
+      name: '唯一注册位于未调用函数',
+      registration: 'function registerLater() { registerBridge(createLanBridgeRegistration(agentEventBus)) }',
+    },
+    {
+      name: '唯一注册位于 false 条件',
+      registration: 'if (false) { registerBridge(createLanBridgeRegistration(agentEventBus)) }',
+    },
+    {
+      name: '唯一注册位于 return 后',
+      registration: 'function registerLater() { return; registerBridge(createLanBridgeRegistration(agentEventBus)) }',
+    },
+  ]
+
+  for (const registrationCase of unreachableRegistrationCases) {
+    test(`Given ${registrationCase.name} When 检查 Bridge 注册 Then 明确失败`, () => {
+      /** 用不可达注册替换唯一顶层注册。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/index.ts': validFiles['apps/electron/src/main/index.ts']!
+          .replace('registerBridge(createLanBridgeRegistration(agentEventBus))', registrationCase.registration),
+      }
+
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    })
+  }
+
+  /** bootstrap 必须精确挂在 Electron app.whenReady() 上。 */
+  const invalidBootstrapReceivers: Array<{ name: string; source: string }> = [
+    { name: 'Promise.reject.then', source: 'Promise.reject().then(bootstrap).catch(handleBootstrapFailure)' },
+    { name: '其他对象 whenReady', source: 'otherApp.whenReady().then(bootstrap).catch(handleBootstrapFailure)' },
+  ]
+
+  for (const bootstrapCase of invalidBootstrapReceivers) {
+    test(`Given ${bootstrapCase.name} When 检查 bootstrap 挂接 Then 明确失败`, () => {
+      /** 替换当前 app.whenReady() 调用链的接收者。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/index.ts': validFiles['apps/electron/src/main/index.ts']!
+          .replace('app.whenReady().then(bootstrap).catch(handleBootstrapFailure)', bootstrapCase.source),
+      }
+
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    })
+  }
 
   /** startAllBridges 只有在可达 bootstrap 顶层路径中才有效。 */
   const unreachableBootstrapCases: Array<{ name: string; source: string }> = [
@@ -730,6 +790,95 @@ describe('fork 上游兼容检查器', () => {
     expect(getCheck(duplicateSpreadFiles, 'preload-composition').passed).toBe(false)
   })
 
+  /** registrar 的十个 handler 必须是导出函数体中的直接调用。 */
+  const disguisedHandlerCases: Array<{ name: string; replacement: string }> = [
+    {
+      name: 'START handler 只剩注释',
+      replacement: '// ipc.handle(LAN_BRIDGE_IPC_CHANNELS.START, async () => start())',
+    },
+    {
+      name: 'START handler 只在死函数',
+      replacement: 'function deadStart() { ipc.handle(LAN_BRIDGE_IPC_CHANNELS.START, async () => start()) }',
+    },
+  ]
+
+  for (const handlerCase of disguisedHandlerCases) {
+    test(`Given ${handlerCase.name} When 检查 LAN IPC 合同 Then 明确失败`, () => {
+      /** 替换 registrar 内唯一真实 START handler。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/lib/lan-bridge/lan-bridge-ipc.ts': validFiles['apps/electron/src/main/lib/lan-bridge/lan-bridge-ipc.ts']!
+          .replace(
+            'ipc.handle(LAN_BRIDGE_IPC_CHANNELS.START, async () => start())',
+            handlerCase.replacement,
+          ),
+      }
+
+      expect(getCheck(files, 'lan-ipc-contract').passed).toBe(false)
+    })
+  }
+
+  test('Given registrar handler 使用错误通道或重复注册 When 检查合同 Then 均失败', () => {
+    /** START 方法错误绑定 STOP 通道。 */
+    const wrongChannelFiles = {
+      ...validFiles,
+      'apps/electron/src/main/lib/lan-bridge/lan-bridge-ipc.ts': validFiles['apps/electron/src/main/lib/lan-bridge/lan-bridge-ipc.ts']!
+        .replace('LAN_BRIDGE_IPC_CHANNELS.START, async () => start()', 'LAN_BRIDGE_IPC_CHANNELS.STOP, async () => start()'),
+    }
+    /** START 通道在 registrar 中注册两次。 */
+    const duplicateHandlerFiles = {
+      ...validFiles,
+      'apps/electron/src/main/lib/lan-bridge/lan-bridge-ipc.ts': validFiles['apps/electron/src/main/lib/lan-bridge/lan-bridge-ipc.ts']!
+        .replace(
+          'ipc.handle(LAN_BRIDGE_IPC_CHANNELS.START, async () => start())',
+          `ipc.handle(LAN_BRIDGE_IPC_CHANNELS.START, async () => start())
+      ipc.handle(LAN_BRIDGE_IPC_CHANNELS.START, async () => start())`,
+        ),
+    }
+
+    expect(getCheck(wrongChannelFiles, 'lan-ipc-contract').passed).toBe(false)
+    expect(getCheck(duplicateHandlerFiles, 'lan-ipc-contract').passed).toBe(false)
+  })
+
+  /** preload 方法必须来自 factory 返回对象并真实 invoke 对应通道。 */
+  const disguisedPreloadCases: Array<{ name: string; replacement: string }> = [
+    {
+      name: 'start 方法只剩注释',
+      replacement: '// startLanBridge: () => ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.START),',
+    },
+    {
+      name: 'start 方法只在死对象',
+      replacement: 'dead: { startLanBridge: () => ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.START) },',
+    },
+  ]
+
+  for (const preloadCase of disguisedPreloadCases) {
+    test(`Given preload ${preloadCase.name} When 检查 LAN IPC 合同 Then 明确失败`, () => {
+      /** 替换 factory 返回对象内唯一真实 start 方法。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/preload/lan-bridge-preload.ts': validFiles['apps/electron/src/preload/lan-bridge-preload.ts']!
+          .replace(
+            'startLanBridge: () => ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.START),',
+            preloadCase.replacement,
+          ),
+      }
+
+      expect(getCheck(files, 'lan-ipc-contract').passed).toBe(false)
+    })
+  }
+
+  test('Given preload start 方法调用错误通道 When 检查 LAN IPC 合同 Then 明确失败', () => {
+    /** start 方法错误调用 STOP 通道。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/preload/lan-bridge-preload.ts': validFiles['apps/electron/src/preload/lan-bridge-preload.ts']!
+        .replace('LAN_BRIDGE_IPC_CHANNELS.START),', 'LAN_BRIDGE_IPC_CHANNELS.STOP),'),
+    }
+
+    expect(getCheck(files, 'lan-ipc-contract').passed).toBe(false)
+  })
+
   test('Given package prepare 用 echo 伪装命令 When 检查移动构建 Then 明确失败', () => {
     /** shell 只打印命令文本，不实际构建。 */
     const files = {
@@ -977,11 +1126,120 @@ broken: [
     })
   }
 
+  test('Given upstream URL 指向错误仓库 When 检查 workflow Then 明确失败', () => {
+    /** 只替换官方上游 URL，保留其余 tag 流程。 */
+    const files = {
+      ...validFiles,
+      '.github/workflows/upstream-compat.yml': validWorkflow.replace(
+        'https://github.com/ErlichLiu/Proma.git',
+        'https://github.com/example/Proma.git',
+      ),
+    }
+
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
+
+  test('Given tag 排序后使用 head 选择最小版本 When 检查 workflow Then 明确失败', () => {
+    /** 把最大 tag 选择改为排序结果首行。 */
+    const files = {
+      ...validFiles,
+      '.github/workflows/upstream-compat.yml': validWorkflow.replace(
+        'tail -n 1 "$SORTED_TAGS_FILE"',
+        'head -n 1 "$SORTED_TAGS_FILE"',
+      ),
+    }
+
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
+
+  test('Given strict candidate 正则只存在于注释 When 检查 workflow Then 明确失败', () => {
+    /** 注释掉严格 semver 分支，保留相同文本。 */
+    const files = {
+      ...validFiles,
+      '.github/workflows/upstream-compat.yml': validWorkflow.replace(
+        'if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
+        '# if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
+      ),
+    }
+
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
+
+  test('Given tag_ref 输出只存在于注释 When 检查 workflow Then 明确失败', () => {
+    /** 注释掉 GitHub output 写入，保留相同文本。 */
+    const files = {
+      ...validFiles,
+      '.github/workflows/upstream-compat.yml': validWorkflow.replace(
+        'echo "tag_ref=refs/tags/upstream/$LATEST_TAG" >> "$GITHUB_OUTPUT"',
+        '# echo "tag_ref=refs/tags/upstream/$LATEST_TAG" >> "$GITHUB_OUTPUT"',
+      ),
+    }
+
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
+
+  /** 关键命令不能藏在不可证明执行的 false 控制流中。 */
+  const unreachableWorkflowCommandCases: Array<{ name: string; target: string; replacement: string }> = [
+    {
+      name: 'fetch',
+      target: "git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'",
+      replacement: "if false; then\n            git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'\n          fi",
+    },
+    {
+      name: 'tag list',
+      target: "git tag --list 'upstream/v*' > \"$RAW_TAGS_FILE\"",
+      replacement: "if false; then\n            git tag --list 'upstream/v*' > \"$RAW_TAGS_FILE\"\n          fi",
+    },
+    {
+      name: 'merge',
+      target: 'git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+      replacement: 'if false; then\n            git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"\n          fi',
+    },
+    {
+      name: 'checker',
+      target: "run: bun run --filter='@proma/electron' check:fork-compat",
+      replacement: "run: |\n          if false; then\n            bun run --filter='@proma/electron' check:fork-compat\n          fi",
+    },
+  ]
+
+  for (const commandCase of unreachableWorkflowCommandCases) {
+    test(`Given ${commandCase.name} 命令位于 if false When 检查 workflow Then 明确失败`, () => {
+      /** 将当前关键命令包进不可达控制流。 */
+      const workflow = validWorkflow.replace(commandCase.target, commandCase.replacement)
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  /** 任意额外 step 都不得执行发布、PR 或 push 副作用。 */
+  const forbiddenWorkflowCommands = [
+    'git push origin HEAD',
+    'gh pr create --fill',
+    'gh release create v9.9.9',
+    'bun run publish',
+  ]
+
+  for (const command of forbiddenWorkflowCommands) {
+    test(`Given workflow 额外执行 ${command} When 检查定义 Then 明确失败`, () => {
+      /** 在清理前插入不属于兼容检查职责的副作用 step。 */
+      const unsafeStep = `      - name: Unsafe side effect\n        run: ${command}\n`
+      const workflow = validWorkflow.replace(
+        '      - name: Abort merge and remove temporary branch',
+        `${unsafeStep}      - name: Abort merge and remove temporary branch`,
+      )
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
   test('Given tag ref 先写入受控变量 When 检查 workflow Then 接受真实输出命令', () => {
     /** 模拟真实 workflow 先构造 namespaced tag ref 再写入输出。 */
     const workflow = validWorkflow.replace(
-      'echo "tag_ref=refs/tags/upstream/$tag" >> "$GITHUB_OUTPUT"',
-      'readonly UPSTREAM_TAG_REF="refs/tags/upstream/$tag"\n          echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"',
+      'echo "tag_ref=refs/tags/upstream/$LATEST_TAG" >> "$GITHUB_OUTPUT"',
+      'readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"\n          echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"',
     )
     /** 使用变量输出 tag ref 的仓库 fixture。 */
     const files = {
@@ -989,6 +1247,7 @@ broken: [
       '.github/workflows/upstream-compat.yml': workflow,
     }
 
+    expect(workflow).not.toBe(validWorkflow)
     expect(getCheck(files, 'workflow-definition').passed).toBe(true)
   })
 

@@ -55,18 +55,18 @@ const LAN_IPC_COMMAND_KEYS = [
   'REVOKE_DEVICE',
 ] as const
 
-/** Task 7 以后 renderer 必须继续可用的十个 LAN Bridge 命令方法。 */
-const LAN_PRELOAD_METHODS = [
-  'getLanBridgeConfig',
-  'updateLanBridgeConfig',
-  'getLanBridgeStatus',
-  'startLanBridge',
-  'stopLanBridge',
-  'getLanBridgePin',
-  'refreshLanBridgePin',
-  'getLanBridgePairingQr',
-  'listLanBridgeDevices',
-  'revokeLanBridgeDevice',
+/** 十个 preload 方法与请求/响应 IPC 通道的精确映射。 */
+const LAN_PRELOAD_METHOD_CHANNELS = [
+  ['getLanBridgeConfig', 'GET_CONFIG'],
+  ['updateLanBridgeConfig', 'UPDATE_CONFIG'],
+  ['getLanBridgeStatus', 'GET_STATUS'],
+  ['startLanBridge', 'START'],
+  ['stopLanBridge', 'STOP'],
+  ['getLanBridgePin', 'GET_PIN'],
+  ['refreshLanBridgePin', 'REFRESH_PIN'],
+  ['getLanBridgePairingQr', 'GET_PAIRING_QR'],
+  ['listLanBridgeDevices', 'LIST_DEVICES'],
+  ['revokeLanBridgeDevice', 'REVOKE_DEVICE'],
 ] as const
 
 /** Adapter 组合根负责隔离的官方运行时模块。 */
@@ -254,17 +254,26 @@ function findNamedFunction(sourceFile: ts.SourceFile, name: string): ts.Function
 function hasReachableBootstrapRegistration(sourceFile: ts.SourceFile): boolean {
   return sourceFile.statements.some((statement) => {
     if (!ts.isExpressionStatement(statement)) return false
-    /** 递归检查调用链中的 then(bootstrap)。 */
+    /** 精确判断 Electron app.whenReady() 调用。 */
+    const isAppWhenReadyCall = (node: ts.Expression): boolean => (
+      ts.isCallExpression(node)
+      && node.arguments.length === 0
+      && ts.isPropertyAccessExpression(node.expression)
+      && node.expression.name.text === 'whenReady'
+      && ts.isIdentifier(node.expression.expression)
+      && node.expression.expression.text === 'app'
+    )
+    /** 沿当前顶层 Promise 链查找精确的 app.whenReady().then(bootstrap)。 */
     const containsBootstrapThen = (node: ts.Expression): boolean => {
-      if (!ts.isCallExpression(node)) return false
+      if (!ts.isCallExpression(node) || !ts.isPropertyAccessExpression(node.expression)) return false
       if (
-        ts.isPropertyAccessExpression(node.expression)
-        && node.expression.name.text === 'then'
-        && node.arguments.some((argument) => ts.isIdentifier(argument) && argument.text === 'bootstrap')
+        node.expression.name.text === 'then'
+        && node.arguments.length === 1
+        && ts.isIdentifier(node.arguments[0])
+        && node.arguments[0].text === 'bootstrap'
+        && isAppWhenReadyCall(node.expression.expression)
       ) return true
-      return ts.isPropertyAccessExpression(node.expression)
-        ? containsBootstrapThen(node.expression.expression)
-        : false
+      return containsBootstrapThen(node.expression.expression)
     }
     return containsBootstrapThen(statement.expression)
   })
@@ -325,29 +334,45 @@ function collectImportedLocalNames(
   return names
 }
 
-/** 统计所有 registerBridge(factory(...)) 语法调用。 */
+/** 判断调用是否为 LAN registration factory 的 registerBridge 组合。 */
+function isLanBridgeRegistrationCall(
+  node: ts.Node,
+  factoryNames: ReadonlySet<string>,
+  requireAgentEventBus: boolean,
+): node is ts.CallExpression {
+  if (!ts.isCallExpression(node) || !ts.isIdentifier(node.expression) || node.expression.text !== 'registerBridge') {
+    return false
+  }
+  /** registerBridge 的首个实参必须是 LAN registration factory 调用。 */
+  const registration = node.arguments[0]
+  if (
+    !ts.isCallExpression(registration)
+    || !ts.isIdentifier(registration.expression)
+    || !factoryNames.has(registration.expression.text)
+  ) return false
+  if (!requireAgentEventBus) return true
+  return ts.isIdentifier(registration.arguments[0]) && registration.arguments[0].text === 'agentEventBus'
+}
+
+/** 统计全部 LAN registerBridge 语法调用，包括不可达位置，用于拒绝隐藏重复注册。 */
 function countLanBridgeRegistrations(sourceFile: ts.SourceFile, factoryNames: ReadonlySet<string>): number {
   /** 当前累计注册次数。 */
   let count = 0
   /** 递归扫描全部真实调用节点，注释和字符串不会进入 AST。 */
   const visit = (node: ts.Node): void => {
-    if (
-      ts.isCallExpression(node)
-      && ts.isIdentifier(node.expression)
-      && node.expression.text === 'registerBridge'
-    ) {
-      /** registerBridge 的首个实参必须是 LAN registration factory 调用。 */
-      const registration = node.arguments[0]
-      if (
-        ts.isCallExpression(registration)
-        && ts.isIdentifier(registration.expression)
-        && factoryNames.has(registration.expression.text)
-      ) count += 1
-    }
+    if (isLanBridgeRegistrationCall(node, factoryNames, false)) count += 1
     ts.forEachChild(node, visit)
   }
   visit(sourceFile)
   return count
+}
+
+/** 统计 Program 顶层直接执行且注入 agentEventBus 的 LAN 注册。 */
+function countTopLevelLanBridgeRegistrations(sourceFile: ts.SourceFile, factoryNames: ReadonlySet<string>): number {
+  return sourceFile.statements.filter((statement) => (
+    ts.isExpressionStatement(statement)
+    && isLanBridgeRegistrationCall(statement.expression, factoryNames, true)
+  )).length
 }
 
 /** 判断表达式是否直接调用 startLanBridge，并传入 factory 注入参数。 */
@@ -542,6 +567,35 @@ function stepHasDirectCommand(step: Record<string, unknown> | undefined, pattern
   return Boolean(run && run.split(/\r?\n/).some((line) => pattern.test(line.trim())))
 }
 
+/** 判断复杂 shell step 的 Program 顶层存在批准命令，缩进控制流内命令不计入。 */
+function stepHasTopLevelCommand(step: Record<string, unknown> | undefined, pattern: RegExp): boolean {
+  /** 当前 step 的 shell 脚本文本。 */
+  const run = getStepRun(step)
+  return Boolean(run && run.split(/\r?\n/).some((line) => (
+    line.length > 0 && line === line.trimStart() && pattern.test(line.trimEnd())
+  )))
+}
+
+/** 递归收集结构化 workflow 中全部 run 脚本，不局限于约定 job 或 step 名称。 */
+function collectWorkflowRunScripts(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(collectWorkflowRunScripts)
+  if (!isRecord(value)) return []
+  /** 当前 YAML map 及其后代中的全部 run 文本。 */
+  const scripts: string[] = []
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'run' && typeof child === 'string') scripts.push(child)
+    else scripts.push(...collectWorkflowRunScripts(child))
+  }
+  return scripts
+}
+
+/** 判断 shell 脚本是否包含兼容检查职责之外的发布或远端写副作用。 */
+function hasForbiddenWorkflowCommand(run: string): boolean {
+  /** 仅匹配行首或 shell 连接符后的真实命令位置，避免把 echo 文本误判为执行。 */
+  const forbiddenCommand = /(?:^|(?:&&|\|\||;)\s*)(?:if\s+)?(?:git\s+push\b|gh\s+(?:pr|release)\b|(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?(?:release|publish)\b|cargo\s+publish\b|twine\s+upload\b|docker\s+push\b|electron-builder\b[^\n]*\s--publish\b)/
+  return run.split(/\r?\n/).some((line) => forbiddenCommand.test(line.trim()))
+}
+
 /** 检查主进程 Bridge 注册与统一启动组合点。 */
 function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult {
   /** 当前检查的失败原因。 */
@@ -556,6 +610,8 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
   /** LAN registration factory 的本地名称及全部注册次数。 */
   const factoryNames = collectImportedLocalNames(mainSource, './lib/lan-bridge/lan-bridge', 'createLanBridgeRegistration')
   const registrationCount = countLanBridgeRegistrations(mainSource, factoryNames)
+  /** Program 顶层实际执行且绑定 agentEventBus 的注册次数。 */
+  const topLevelRegistrationCount = countTopLevelLanBridgeRegistrations(mainSource, factoryNames)
   /** 顶层挂接且顺序可达的 bootstrap。 */
   const bootstrap = findNamedFunction(mainSource, 'bootstrap')
   const hasReachableStart = hasReachableBootstrapRegistration(mainSource) && bootstrapStartsAllBridges(bootstrap)
@@ -571,7 +627,9 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     && returnedObjectStartUsesInjectedBus(registrationFactory, injectedName),
   )
 
-  if (registrationCount !== 1) details.push('主进程必须且只能注册一次 createLanBridgeRegistration(...)')
+  if (registrationCount !== 1 || topLevelRegistrationCount !== 1) {
+    details.push('主进程必须且只能在 Program 顶层注册一次 createLanBridgeRegistration(agentEventBus)')
+  }
   if (!hasReachableStart) details.push('主进程 bootstrap 可达顶层路径未启动统一 Bridge 生命周期')
   if (!registrationFactory) details.push('LAN Bridge 未导出 createLanBridgeRegistration')
   if (!startUsesInjectedBus) details.push('LAN registration 返回对象的 start 未直接把注入 EventBus 交给 startLanBridge')
@@ -951,25 +1009,45 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
       details.push('Bun 安装步骤必须使用 setup-bun@v2 latest')
     }
 
-    /** 上游 tag 选择与合并必须包含真实行首命令。 */
+    /** 上游 tag 选择与合并必须符合当前可证明的顶层命令模板。 */
     const selectTag = findStep('Select latest official release tag')
     /** tag ref 可直接输出，也可先由正式 tag 构造受控变量后输出。 */
-    const hasTagRefOutput = /tag_ref=refs\/tags\/upstream/.test(getStepRun(selectTag) ?? '') || (
+    const hasTagRefOutput = stepHasDirectCommand(
+      selectTag,
+      /^echo\s+["']tag_ref=refs\/tags\/upstream\/\$[A-Za-z_][A-Za-z0-9_]*["']\s*>>\s*["']\$GITHUB_OUTPUT["']$/,
+    ) || (
       stepHasDirectCommand(selectTag, /^(?:readonly\s+)?UPSTREAM_TAG_REF=["']refs\/tags\/upstream\/\$[A-Za-z_][A-Za-z0-9_]*["']$/)
       && stepHasDirectCommand(selectTag, /^echo\s+["']tag_ref=\$UPSTREAM_TAG_REF["']\s*>>\s*["']\$GITHUB_OUTPUT["']$/)
     )
+    /** strict candidate 循环必须把正式 semver 写入独立候选文件。 */
+    const hasStrictCandidateLoop = (
+      stepHasTopLevelCommand(selectTag, /^while\s+IFS=\s+read\s+-r\s+[A-Za-z_][A-Za-z0-9_]*;\s+do$/)
+      && stepHasDirectCommand(
+        selectTag,
+        /^if\s+\[\[\s+["']\$[A-Za-z_][A-Za-z0-9_]*["']\s+=~\s+\^v\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$\s+\]\];\s+then$/,
+      )
+      && stepHasDirectCommand(selectTag, /^printf\s+['"]%s\\n['"]\s+["']\$[A-Za-z_][A-Za-z0-9_]*["']\s+>>\s+["']\$RELEASE_TAGS_FILE["']$/)
+      && stepHasTopLevelCommand(selectTag, /^done\s+<\s+["']\$RAW_TAGS_FILE["']$/)
+    )
+    /** 最大 tag 必须来自 sort -V 输出文件的最后一行。 */
+    const selectsMaximumTag = (
+      stepHasTopLevelCommand(selectTag, /^sort\s+-V\s+["']\$RELEASE_TAGS_FILE["']\s+>\s+["']\$SORTED_TAGS_FILE["']$/)
+      && stepHasTopLevelCommand(selectTag, /^readonly\s+LATEST_TAG=.*\btail\s+-n\s+1\s+["']\$SORTED_TAGS_FILE["'].*$/)
+    )
     if (
       selectTag?.id !== 'upstream'
-      || !stepHasDirectCommand(selectTag, /^git\s+fetch\s+--force\s+upstream(?:\s|$)/)
-      || !stepHasDirectCommand(selectTag, /^git\s+tag\s+--list(?:\s|$)/)
-      || !stepHasDirectCommand(selectTag, /^sort\s+-V(?:\s|$)/)
-      || !/\^v\(0\|\[1-9\]\[0-9\]\*\)/.test(getStepRun(selectTag) ?? '')
+      || !stepHasTopLevelCommand(selectTag, /^readonly\s+UPSTREAM_URL=["']https:\/\/github\.com\/ErlichLiu\/Proma\.git["']$/)
+      || !stepHasTopLevelCommand(selectTag, /^git\s+remote\s+add\s+upstream\s+["']\$UPSTREAM_URL["']$/)
+      || !stepHasTopLevelCommand(selectTag, /^git\s+fetch\s+--force\s+upstream(?:\s|$)/)
+      || !stepHasTopLevelCommand(selectTag, /^git\s+tag\s+--list\s+["']upstream\/v\*["']\s+>\s+["']\$RAW_TAGS_FILE["']$/)
+      || !hasStrictCandidateLoop
+      || !selectsMaximumTag
       || !hasTagRefOutput
-    ) details.push('上游 tag 步骤必须真实 fetch、本地筛选正式 tag、sort -V 并输出 tag_ref')
+    ) details.push('上游 tag 步骤必须使用官方 URL，在顶层 fetch/tag/sort/tail 最大正式 tag 并输出 tag_ref')
     const merge = findStep('Merge upstream tag without committing')
     if (
-      !stepHasDirectCommand(merge, /^git\s+switch\s+--create(?:\s|$)/)
-      || !stepHasDirectCommand(merge, /^git\s+merge\s+--no-commit\s+--no-ff(?:\s|$)/)
+      !stepHasTopLevelCommand(merge, /^git\s+switch\s+--create(?:\s|$)/)
+      || !stepHasTopLevelCommand(merge, /^git\s+merge\s+--no-commit\s+--no-ff(?:\s|$)/)
     ) details.push('merge 步骤必须真实创建临时分支并合并上游 tag')
 
     /** 简单验证步骤必须是唯一真实命令。 */
@@ -1018,6 +1096,10 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     if (steps.some((step) => /\|\|\s*true\b/.test(getStepRun(step) ?? ''))) {
       details.push('workflow 使用 || true 吞掉命令或 pipeline 错误')
     }
+    /** 任意 job 的 run 都不能写远端、创建 PR/release 或发布制品。 */
+    if (collectWorkflowRunScripts(document).some(hasForbiddenWorkflowCommand)) {
+      details.push('workflow 不得执行 git push、PR、release 或 publish 副作用命令')
+    }
   }
 
   return createResult(
@@ -1027,6 +1109,119 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     '保留 manual+weekly 触发、最小权限、完整 checkout、固定验证命令顺序与 always cleanup；关键 run 不得用 echo 伪装。',
     details,
   )
+}
+
+/** 去除不改变运行时调用形状的 TypeScript 表达式包装。 */
+function unwrapTypeScriptExpression(expression: ts.Expression): ts.Expression {
+  if (ts.isParenthesizedExpression(expression)) return unwrapTypeScriptExpression(expression.expression)
+  if (ts.isAsExpression(expression)) return unwrapTypeScriptExpression(expression.expression)
+  if (ts.isTypeAssertionExpression(expression)) return unwrapTypeScriptExpression(expression.expression)
+  if (ts.isSatisfiesExpression(expression)) return unwrapTypeScriptExpression(expression.expression)
+  if (ts.isNonNullExpression(expression)) return unwrapTypeScriptExpression(expression.expression)
+  return expression
+}
+
+/** 返回对象属性的静态名称。 */
+function getStaticPropertyName(name: ts.PropertyName): string | undefined {
+  if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) return name.text
+  return undefined
+}
+
+/** 查找顶层命名变量声明。 */
+function findTopLevelVariable(sourceFile: ts.SourceFile, name: string): ts.VariableDeclaration | undefined {
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) continue
+    /** 当前变量语句中的目标声明。 */
+    const declaration = statement.declarationList.declarations.find((candidate) => (
+      ts.isIdentifier(candidate.name) && candidate.name.text === name
+    ))
+    if (declaration) return declaration
+  }
+  return undefined
+}
+
+/** 读取函数体直接 return 的对象字面量。 */
+function findDirectReturnedObject(functionDeclaration: ts.FunctionDeclaration): ts.ObjectLiteralExpression | undefined {
+  if (!functionDeclaration.body) return undefined
+  for (const statement of functionDeclaration.body.statements) {
+    if (ts.isReturnStatement(statement) && statement.expression) {
+      /** 去除 as/括号后的直接返回值。 */
+      const returned = unwrapTypeScriptExpression(statement.expression)
+      return ts.isObjectLiteralExpression(returned) ? returned : undefined
+    }
+    if (ts.isReturnStatement(statement) || ts.isThrowStatement(statement)) return undefined
+  }
+  return undefined
+}
+
+/** 读取属性函数直接返回的表达式，不进入嵌套控制流。 */
+function getDirectFunctionResult(initializer: ts.Expression): ts.Expression | undefined {
+  /** 去除属性值外围类型包装。 */
+  const functionExpression = unwrapTypeScriptExpression(initializer)
+  if (!ts.isArrowFunction(functionExpression) && !ts.isFunctionExpression(functionExpression)) return undefined
+  if (!ts.isBlock(functionExpression.body)) return unwrapTypeScriptExpression(functionExpression.body)
+  for (const statement of functionExpression.body.statements) {
+    if (ts.isReturnStatement(statement) && statement.expression) {
+      return unwrapTypeScriptExpression(statement.expression)
+    }
+    if (ts.isReturnStatement(statement) || ts.isThrowStatement(statement)) return undefined
+  }
+  return undefined
+}
+
+/** 判断表达式是否直接调用指定 ipc 方法与 LAN 通道。 */
+function isDirectLanIpcCall(
+  expression: ts.Expression,
+  ipcParameterName: string,
+  methodName: 'handle' | 'invoke',
+  channelKey: string,
+): boolean {
+  /** 去除返回表达式外围类型包装后的调用。 */
+  const call = unwrapTypeScriptExpression(expression)
+  if (!ts.isCallExpression(call) || !ts.isPropertyAccessExpression(call.expression)) return false
+  if (
+    call.expression.name.text !== methodName
+    || !ts.isIdentifier(call.expression.expression)
+    || call.expression.expression.text !== ipcParameterName
+  ) return false
+  /** 首个参数必须是 LAN 通道对象的静态属性。 */
+  const channel = call.arguments[0]
+  return Boolean(
+    channel
+    && ts.isPropertyAccessExpression(channel)
+    && ts.isIdentifier(channel.expression)
+    && channel.expression.text === 'LAN_BRIDGE_IPC_CHANNELS'
+    && channel.name.text === channelKey,
+  )
+}
+
+/** 统计 registrar 函数体中直接执行的指定通道 handler。 */
+function countDirectLanIpcHandlers(functionDeclaration: ts.FunctionDeclaration, channelKey: string): number {
+  /** registrar 的 IPC 参数名。 */
+  const ipcParameter = functionDeclaration.parameters[0]?.name
+  if (!ipcParameter || !ts.isIdentifier(ipcParameter) || !functionDeclaration.body) return 0
+  return functionDeclaration.body.statements.filter((statement) => (
+    ts.isExpressionStatement(statement)
+    && isDirectLanIpcCall(statement.expression, ipcParameter.text, 'handle', channelKey)
+  )).length
+}
+
+/** 判断 preload factory 返回对象的方法是否直接 invoke 对应通道。 */
+function hasMappedPreloadMethod(
+  returnedObject: ts.ObjectLiteralExpression | undefined,
+  ipcParameterName: string | undefined,
+  methodName: string,
+  channelKey: string,
+): boolean {
+  if (!returnedObject || !ipcParameterName) return false
+  /** 返回对象中同名的直接属性。 */
+  const properties = returnedObject.properties.filter((property): property is ts.PropertyAssignment => (
+    ts.isPropertyAssignment(property) && getStaticPropertyName(property.name) === methodName
+  ))
+  if (properties.length !== 1) return false
+  /** 方法函数必须直接返回对应 ipc.invoke 调用。 */
+  const result = getDirectFunctionResult(properties[0]!.initializer)
+  return Boolean(result && isDirectLanIpcCall(result, ipcParameterName, 'invoke', channelKey))
 }
 
 /** 检查十个 LAN IPC 命令及对应 preload 方法没有回退。 */
@@ -1039,14 +1234,38 @@ function checkLanIpcContract(reader: RepositoryReader): ForkCompatCheckResult {
   const lanIpc = readRequired(reader, PATHS.lanIpc, details)
   /** 独立 LAN preload 源码。 */
   const lanPreload = readRequired(reader, PATHS.lanPreload, details)
+  /** 三层合同源码的 AST。 */
+  const sharedSource = parseTypeScript(PATHS.sharedProtocol, shared)
+  const lanIpcSource = parseTypeScript(PATHS.lanIpc, lanIpc)
+  const lanPreloadSource = parseTypeScript(PATHS.lanPreload, lanPreload)
+  /** 共享通道对象、registrar 与 preload factory。 */
+  const sharedChannels = findTopLevelVariable(sharedSource, 'LAN_BRIDGE_IPC_CHANNELS')
+  const sharedChannelObject = sharedChannels?.initializer
+    ? unwrapTypeScriptExpression(sharedChannels.initializer)
+    : undefined
+  const registrar = findExportedFunction(lanIpcSource, 'registerLanBridgeIpcHandlers')
+  const preloadFactory = findExportedFunction(lanPreloadSource, 'createLanBridgePreloadApi')
+  /** preload factory 的 IPC 参数名与直接返回对象。 */
+  const preloadIpcParameter = preloadFactory?.parameters[0]?.name
+  const preloadIpcParameterName = preloadIpcParameter && ts.isIdentifier(preloadIpcParameter)
+    ? preloadIpcParameter.text
+    : undefined
+  const preloadApi = preloadFactory ? findDirectReturnedObject(preloadFactory) : undefined
 
   for (const key of LAN_IPC_COMMAND_KEYS) {
-    if (countMatches(shared, new RegExp(`\\b${key}\\s*:`)) !== 1) details.push(`共享通道常量缺少或重复：${key}`)
-    if (countMatches(lanIpc, new RegExp(`ipc\\.handle\\s*\\(\\s*LAN_BRIDGE_IPC_CHANNELS\\.${key}\\b`)) !== 1) details.push(`LAN IPC registrar 缺少或重复 handler：${key}`)
-    if (countMatches(lanPreload, new RegExp(`LAN_BRIDGE_IPC_CHANNELS\\.${key}\\b`)) !== 1) details.push(`LAN preload 缺少或重复通道调用：${key}`)
+    /** 共享对象中当前通道键的真实属性数量。 */
+    const sharedKeyCount = ts.isObjectLiteralExpression(sharedChannelObject)
+      ? sharedChannelObject.properties.filter((property) => getStaticPropertyName(property.name) === key).length
+      : 0
+    if (sharedKeyCount !== 1) details.push(`共享通道常量缺少或重复：${key}`)
+    if (!registrar || countDirectLanIpcHandlers(registrar, key) !== 1) {
+      details.push(`LAN IPC registrar 缺少或重复直接 handler：${key}`)
+    }
   }
-  for (const method of LAN_PRELOAD_METHODS) {
-    if (countMatches(lanPreload, new RegExp(`\\b${method}\\s*:`)) < 2) details.push(`LAN preload 接口或实现缺少方法：${method}`)
+  for (const [method, channelKey] of LAN_PRELOAD_METHOD_CHANNELS) {
+    if (!hasMappedPreloadMethod(preloadApi, preloadIpcParameterName, method, channelKey)) {
+      details.push(`LAN preload 方法未直接调用对应通道：${method} -> ${channelKey}`)
+    }
   }
 
   return createResult(
