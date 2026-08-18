@@ -14,6 +14,13 @@ describe('移动端一次性配对链接', () => {
     })
   })
 
+  test('Given 链接包含 path 和普通 query When 解析配对票据 Then cleanUrl 只保留 origin 根地址', () => {
+    expect(parsePairingLink('https://example.test/mobile?campaign=secret#/pair?ticket=abc')).toEqual({
+      ticket: 'abc',
+      cleanUrl: 'https://example.test/',
+    })
+  })
+
   test('Given 票据只出现在普通 query When 解析链接 Then 不读取该票据', () => {
     expect(parsePairingLink('http://192.168.1.2:29888/?ticket=leaked#/pair')).toBeNull()
   })
@@ -25,7 +32,20 @@ describe('移动端一次性配对链接', () => {
 
   test('Given fragment 票据编码损坏 When 解析链接 Then 拒绝不可逆的异常编码', () => {
     expect(parsePairingLink('http://192.168.1.2:29888/#/pair?ticket=%E0%A4%A')).toBeNull()
+    expect(parsePairingLink('https://example.test/mobile?campaign=secret#/pair?ticket=%ZZ')).toBeNull()
     expect(parsePairingLink('not-a-url#/pair?ticket=abc')).toBeNull()
+  })
+
+  test('Given path query 和 fragment 都存在 When 消费配对链接 Then history 仅写入 clean origin', () => {
+    /** 记录浏览器历史唯一替换目标。 */
+    const replacements: string[] = []
+    const result = consumePairingLink({
+      getHref: () => 'https://example.test/mobile?campaign=secret#/pair?ticket=abc%2B123',
+      replaceUrl: cleanUrl => replacements.push(cleanUrl),
+    })
+
+    expect(result).toEqual({ ticket: 'abc+123', cleanUrl: 'https://example.test/' })
+    expect(replacements).toEqual(['https://example.test/'])
   })
 
   test('Given 首次启动读取票据 When 消费链接 Then 立即替换历史且第二次无法再读', () => {

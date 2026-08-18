@@ -31,8 +31,8 @@ export function parsePairingLink(href: string): PairingLink | null {
     /** 严格解码票据；坏百分号编码会抛错并被当作无效链接。 */
     const ticket = decodeURIComponent(rawTicket)
     if (!ticket) return null
-    url.hash = ''
-    return { ticket, cleanUrl: url.toString() }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+    return { ticket, cleanUrl: `${url.origin}/` }
   } catch {
     return null
   }
@@ -48,8 +48,7 @@ export function consumePairingLink(browser: PairingLinkBrowser): PairingLink | n
     /** 清理任何 fragment，避免刷新、后退或能力降级时重复读取票据。 */
     const url = new URL(href)
     if (url.hash) {
-      url.hash = ''
-      browser.replaceUrl(url.toString())
+      browser.replaceUrl(`${url.origin}/`)
     }
   } catch {
     // 无法解析的地址不执行历史写入。
