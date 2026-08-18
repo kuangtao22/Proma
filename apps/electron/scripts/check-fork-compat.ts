@@ -663,15 +663,174 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** 判断 YAML map 的顶层键与执行合同完全一致，既不缺失也不扩张。 */
-function hasExactKeys(
-  value: Record<string, unknown> | undefined,
-  expectedKeys: ReadonlySet<string>,
-): boolean {
-  if (!value) return false
-  /** 当前 map 的全部顶层字段。 */
+/** workflow schema 允许的不可递归字面量。 */
+type WorkflowLiteralValue = string | number | boolean | null
+
+/** 精确字面量节点。 */
+interface WorkflowLiteralSchema {
+  kind: 'literal'
+  value: WorkflowLiteralValue
+}
+
+/** 任意字符串节点，具体 run 内容由后续命令合同校验。 */
+interface WorkflowStringSchema {
+  kind: 'string'
+}
+
+/** 精确键集合的 YAML map 节点。 */
+interface WorkflowRecordSchema {
+  kind: 'record'
+  fields: Readonly<Record<string, WorkflowNodeSchema>>
+}
+
+/** 精确长度与顺序的 YAML sequence 节点。 */
+interface WorkflowArraySchema {
+  kind: 'array'
+  items: readonly WorkflowNodeSchema[]
+}
+
+/** workflow 递归白名单节点。 */
+type WorkflowNodeSchema =
+  | WorkflowLiteralSchema
+  | WorkflowStringSchema
+  | WorkflowRecordSchema
+  | WorkflowArraySchema
+
+/** 创建精确字面量 schema。 */
+function workflowLiteral(value: WorkflowLiteralValue): WorkflowLiteralSchema {
+  return { kind: 'literal', value }
+}
+
+/** 创建精确 YAML map schema。 */
+function workflowRecord(fields: Readonly<Record<string, WorkflowNodeSchema>>): WorkflowRecordSchema {
+  return { kind: 'record', fields }
+}
+
+/** 创建精确 YAML sequence schema。 */
+function workflowArray(items: readonly WorkflowNodeSchema[]): WorkflowArraySchema {
+  return { kind: 'array', items }
+}
+
+/** 普通 run step 的递归 schema。 */
+function simpleRunStepSchema(name: string): WorkflowRecordSchema {
+  return workflowRecord({ name: workflowLiteral(name), run: WORKFLOW_STRING_SCHEMA })
+}
+
+/** run 字段只在结构层要求字符串，执行内容继续由现有 shell 合同锁定。 */
+const WORKFLOW_STRING_SCHEMA: WorkflowStringSchema = { kind: 'string' }
+
+/** 当前批准的 workflow 完整递归白名单。 */
+const APPROVED_UPSTREAM_WORKFLOW_SCHEMA = workflowRecord({
+  name: workflowLiteral('Upstream Compatibility'),
+  on: workflowRecord({
+    workflow_dispatch: workflowRecord({}),
+    schedule: workflowArray([
+      workflowRecord({ cron: workflowLiteral('17 3 * * 1') }),
+    ]),
+  }),
+  permissions: workflowRecord({ contents: workflowLiteral('read') }),
+  concurrency: workflowRecord({
+    group: workflowLiteral('upstream-compat-${{ github.ref }}'),
+    'cancel-in-progress': workflowLiteral(true),
+  }),
+  jobs: workflowRecord({
+    'upstream-compat': workflowRecord({
+      name: workflowLiteral('Verify latest upstream release'),
+      'runs-on': workflowLiteral('ubuntu-latest'),
+      'timeout-minutes': workflowLiteral(60),
+      steps: workflowArray([
+        workflowRecord({
+          name: workflowLiteral('Checkout fork with full history'),
+          uses: workflowLiteral('actions/checkout@v4'),
+          with: workflowRecord({
+            'fetch-depth': workflowLiteral(0),
+            'fetch-tags': workflowLiteral(true),
+          }),
+        }),
+        workflowRecord({
+          name: workflowLiteral('Install Bun'),
+          uses: workflowLiteral('oven-sh/setup-bun@v2'),
+          with: workflowRecord({ 'bun-version': workflowLiteral('latest') }),
+        }),
+        workflowRecord({
+          name: workflowLiteral('Select latest official release tag'),
+          id: workflowLiteral('upstream'),
+          shell: workflowLiteral('bash'),
+          run: WORKFLOW_STRING_SCHEMA,
+        }),
+        workflowRecord({
+          name: workflowLiteral('Merge upstream tag without committing'),
+          shell: workflowLiteral('bash'),
+          env: workflowRecord({
+            BASE_SHA: workflowLiteral('${{ steps.upstream.outputs.base_sha }}'),
+            TEMP_BRANCH: workflowLiteral('${{ steps.upstream.outputs.temp_branch }}'),
+            UPSTREAM_TAG: workflowLiteral('${{ steps.upstream.outputs.tag }}'),
+            UPSTREAM_TAG_REF: workflowLiteral('${{ steps.upstream.outputs.tag_ref }}'),
+          }),
+          run: WORKFLOW_STRING_SCHEMA,
+        }),
+        workflowRecord({
+          name: workflowLiteral('Verify upstream merge state'),
+          env: workflowRecord({
+            UPSTREAM_TAG_REF: workflowLiteral('${{ steps.upstream.outputs.tag_ref }}'),
+          }),
+          run: WORKFLOW_STRING_SCHEMA,
+        }),
+        simpleRunStepSchema('Install dependencies from merged tree'),
+        simpleRunStepSchema('Check fork compatibility seams'),
+        simpleRunStepSchema('Run LAN and mobile targeted tests'),
+        simpleRunStepSchema('Build mobile app'),
+        simpleRunStepSchema('Typecheck all workspaces'),
+        simpleRunStepSchema('Build Electron app'),
+        workflowRecord({
+          name: workflowLiteral('Abort merge and remove temporary branch'),
+          if: workflowLiteral('always()'),
+          shell: workflowLiteral('bash'),
+          env: workflowRecord({
+            BASE_SHA: workflowLiteral('${{ steps.upstream.outputs.base_sha }}'),
+            TEMP_BRANCH: workflowLiteral('${{ steps.upstream.outputs.temp_branch }}'),
+          }),
+          run: WORKFLOW_STRING_SCHEMA,
+        }),
+      ]),
+    }),
+  }),
+})
+
+/** 返回首个递归 schema 不匹配路径；完全匹配时返回 undefined。 */
+function findWorkflowSchemaMismatch(
+  value: unknown,
+  schema: WorkflowNodeSchema,
+  path = 'workflow',
+): string | undefined {
+  if (schema.kind === 'literal') {
+    return Object.is(value, schema.value) ? undefined : `${path} 必须等于 ${JSON.stringify(schema.value)}`
+  }
+  if (schema.kind === 'string') return typeof value === 'string' ? undefined : `${path} 必须是字符串`
+  if (schema.kind === 'array') {
+    if (!Array.isArray(value)) return `${path} 必须是数组`
+    if (value.length !== schema.items.length) return `${path} 数量必须为 ${schema.items.length}`
+    for (const [index, itemSchema] of schema.items.entries()) {
+      /** 当前数组元素的递归不匹配。 */
+      const mismatch = findWorkflowSchemaMismatch(value[index], itemSchema, `${path}[${index}]`)
+      if (mismatch) return mismatch
+    }
+    return undefined
+  }
+  if (!isRecord(value)) return `${path} 必须是对象`
+  /** 当前对象与 schema 声明的键集合。 */
   const actualKeys = Object.keys(value)
-  return actualKeys.length === expectedKeys.size && actualKeys.every((key) => expectedKeys.has(key))
+  const expectedKeys = Object.keys(schema.fields)
+  if (
+    actualKeys.length !== expectedKeys.length
+    || actualKeys.some((key) => !Object.hasOwn(schema.fields, key))
+  ) return `${path} keys 必须精确为 ${expectedKeys.join(', ')}`
+  for (const [key, childSchema] of Object.entries(schema.fields)) {
+    /** 当前属性的递归不匹配。 */
+    const mismatch = findWorkflowSchemaMismatch(value[key], childSchema, `${path}.${key}`)
+    if (mismatch) return mismatch
+  }
+  return undefined
 }
 
 /** 使用 Bun 内置解析器读取 YAML 映射，并把语法/根类型错误写入诊断。 */
@@ -721,19 +880,6 @@ function collectWorkflowRunScripts(value: unknown): string[] {
     else scripts.push(...collectWorkflowRunScripts(child))
   }
   return scripts
-}
-
-/** 递归收集结构化 workflow 中全部 uses 引用。 */
-function collectWorkflowUses(value: unknown): string[] {
-  if (Array.isArray(value)) return value.flatMap(collectWorkflowUses)
-  if (!isRecord(value)) return []
-  /** 当前 YAML map 及其后代中的全部 uses 字符串。 */
-  const uses: string[] = []
-  for (const [key, child] of Object.entries(value)) {
-    if (key === 'uses' && typeof child === 'string') uses.push(child)
-    else uses.push(...collectWorkflowUses(child))
-  }
-  return uses
 }
 
 /** 判断关键 shell step 是否含无法静态证明可达性的控制结构。 */
@@ -1198,82 +1344,15 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
   /** 结构化 workflow YAML 根映射。 */
   const document = parseYamlRecord(workflow, 'upstream workflow', details)
   if (document) {
-    /** workflow 触发器映射。 */
-    const triggers = isRecord(document.on) ? document.on : undefined
-    if (!triggers || !Object.hasOwn(triggers, 'workflow_dispatch')) details.push('workflow 缺少 workflow_dispatch 手动触发')
-    /** 每周 schedule 的 cron 条目。 */
-    const schedules = triggers?.schedule
-    const hasWeeklySchedule = Array.isArray(schedules) && schedules.some((schedule) => (
-      isRecord(schedule)
-      && typeof schedule.cron === 'string'
-      && /^\S+\s+\S+\s+\*\s+\*\s+(?:1|MON)$/i.test(schedule.cron.trim())
-    ))
-    if (!hasWeeklySchedule) details.push('workflow 缺少每周 schedule 触发')
-
-    /** 最小只读权限与并发去重配置。 */
-    const permissions = isRecord(document.permissions) ? document.permissions : undefined
-    if (!permissions || permissions.contents !== 'read' || Object.keys(permissions).length !== 1) {
-      details.push('workflow permissions 必须且只能包含 contents: read')
-    }
-    const concurrency = isRecord(document.concurrency) ? document.concurrency : undefined
-    if (
-      typeof concurrency?.group !== 'string'
-      || !concurrency.group.includes('github.ref')
-      || concurrency['cancel-in-progress'] !== true
-    ) details.push('workflow concurrency 必须按 github.ref 分组并取消旧任务')
-
-    /** 唯一上游验证 job。 */
+    /** 根到 step 嵌套对象的首个 schema 偏差。 */
+    const schemaMismatch = findWorkflowSchemaMismatch(document, APPROVED_UPSTREAM_WORKFLOW_SCHEMA)
+    if (schemaMismatch) details.push(`workflow 递归 schema 不匹配：${schemaMismatch}`)
+    /** schema 锁定后的唯一上游验证 job。 */
     const jobs = isRecord(document.jobs) ? document.jobs : undefined
-    const job = jobs && isRecord(jobs['verify-upstream-merge']) ? jobs['verify-upstream-merge'] : undefined
-    /** 验证 job 只能保留当前工作流实际使用的四个字段。 */
-    const jobAllowedKeys = new Set(['name', 'runs-on', 'timeout-minutes', 'steps'])
-    if (!jobs || Object.keys(jobs).length !== 1 || !job) details.push('workflow 必须且只能包含 verify-upstream-merge job')
-    if (job && !hasExactKeys(job, jobAllowedKeys)) details.push('verify-upstream-merge job 顶层字段必须符合固定闭集')
-    if (typeof job?.['timeout-minutes'] !== 'number' || job['timeout-minutes'] <= 0) {
-      details.push('上游验证 job 缺少正数 timeout-minutes')
-    }
+    const job = jobs && isRecord(jobs['upstream-compat']) ? jobs['upstream-compat'] : undefined
     /** 结构化 step 列表。 */
     const steps = Array.isArray(job?.steps) ? job.steps.filter(isRecord) : []
     const findStep = (name: string): Record<string, unknown> | undefined => steps.find((step) => step.name === name)
-    const stepIndex = (name: string): number => steps.findIndex((step) => step.name === name)
-    /** action step 的固定顶层字段。 */
-    const actionStepAllowedKeys = new Set(['name', 'uses', 'with'])
-    /** tag 选择 step 的固定顶层字段。 */
-    const selectTagStepAllowedKeys = new Set(['name', 'id', 'shell', 'run'])
-    /** merge step 的固定顶层字段。 */
-    const mergeStepAllowedKeys = new Set(['name', 'shell', 'env', 'run'])
-    /** merge 状态 helper step 的固定顶层字段。 */
-    const verifyMergeStepAllowedKeys = new Set(['name', 'env', 'run'])
-    /** 无额外执行配置的普通 run step 固定顶层字段。 */
-    const simpleRunStepAllowedKeys = new Set(['name', 'run'])
-    /** cleanup 是唯一允许 always 条件的 run step。 */
-    const cleanupStepAllowedKeys = new Set(['name', 'if', 'shell', 'env', 'run'])
-
-    /** checkout 与 Bun 安装 action 配置。 */
-    const checkout = findStep('Checkout fork with full history')
-    const checkoutWith = checkout && isRecord(checkout.with) ? checkout.with : undefined
-    if (
-      !hasExactKeys(checkout, actionStepAllowedKeys)
-      || checkout?.uses !== 'actions/checkout@v4'
-      || checkoutWith?.['fetch-depth'] !== 0
-      || checkoutWith?.['fetch-tags'] !== true
-    ) {
-      details.push('checkout 必须使用 v4、fetch-depth 0 并拉取 tags')
-    }
-    const setupBun = findStep('Install Bun')
-    const setupBunWith = setupBun && isRecord(setupBun.with) ? setupBun.with : undefined
-    if (
-      !hasExactKeys(setupBun, actionStepAllowedKeys)
-      || setupBun?.uses !== 'oven-sh/setup-bun@v2'
-      || setupBunWith?.['bun-version'] !== 'latest'
-    ) {
-      details.push('Bun 安装步骤必须使用 setup-bun@v2 latest')
-    }
-    /** 所有 action 引用必须来自当前验证任务的精确 allowlist。 */
-    const allowedActions = new Set(['actions/checkout@v4', 'oven-sh/setup-bun@v2'])
-    if (collectWorkflowUses(document).some((action) => !allowedActions.has(action))) {
-      details.push('workflow uses 包含未批准 action')
-    }
 
     /** 上游 tag 选择必须符合完整线性合同，顺序与命令集合都不可扩张。 */
     const selectTag = findStep('Select latest official release tag')
@@ -1303,8 +1382,7 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
       /^echo ["']temp_branch=\$TEMP_BRANCH["'] >> ["']\$GITHUB_OUTPUT["']$/,
     ] as const
     if (
-      !hasExactKeys(selectTag, selectTagStepAllowedKeys)
-      || selectTag?.id !== 'upstream'
+      selectTag?.id !== 'upstream'
       || hasShellControlStructure(selectTag)
       || !stepMatchesLinearContract(selectTag, selectTagContract)
     ) details.push('上游 tag 步骤必须严格按官方 remote、fetch、候选筛选、最大 tag 验证、只读 ref 与 outputs 的线性合同执行')
@@ -1323,8 +1401,7 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
       /^git diff --cached --stat$/,
     ] as const
     if (
-      !hasExactKeys(merge, mergeStepAllowedKeys)
-      || merge?.shell !== 'bash'
+      merge?.shell !== 'bash'
       || hasShellControlStructure(merge)
       || mergeEnv?.BASE_SHA !== '${{ steps.upstream.outputs.base_sha }}'
       || mergeEnv?.TEMP_BRANCH !== '${{ steps.upstream.outputs.temp_branch }}'
@@ -1337,8 +1414,7 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     const verifyMerge = findStep('Verify upstream merge state')
     const verifyMergeEnv = verifyMerge && isRecord(verifyMerge.env) ? verifyMerge.env : undefined
     if (
-      !hasExactKeys(verifyMerge, verifyMergeStepAllowedKeys)
-      || verifyMergeEnv?.UPSTREAM_TAG_REF !== '${{ steps.upstream.outputs.tag_ref }}'
+      verifyMergeEnv?.UPSTREAM_TAG_REF !== '${{ steps.upstream.outputs.tag_ref }}'
       || !stepRunsExactCommand(verifyMerge, ['bun', 'run', 'apps/electron/scripts/verify-upstream-merge.ts'])
     ) details.push('merge 状态 helper 必须使用 select step 的 tag_ref 执行只读双态验证')
 
@@ -1362,29 +1438,7 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     for (const [name, expectedArgv] of requiredCommands) {
       /** 当前约定名称对应的普通 run step。 */
       const step = findStep(name)
-      if (!hasExactKeys(step, simpleRunStepAllowedKeys) || !stepRunsExactCommand(step, expectedArgv)) {
-        details.push(`${name} 必须执行约定的真实命令且不得包含额外执行字段`)
-      }
-    }
-
-    /** 关键步骤必须保持从合并到验证再清理的顺序。 */
-    const orderedStepNames = [
-      'Checkout fork with full history',
-      'Install Bun',
-      'Select latest official release tag',
-      'Merge upstream tag without committing',
-      'Verify upstream merge state',
-      'Install dependencies from merged tree',
-      'Check fork compatibility seams',
-      'Run LAN and mobile targeted tests',
-      'Build mobile app',
-      'Typecheck all workspaces',
-      'Build Electron app',
-      'Abort merge and remove temporary branch',
-    ]
-    const orderedIndexes = orderedStepNames.map(stepIndex)
-    if (orderedIndexes.some((index) => index < 0) || orderedIndexes.some((index, position) => position > 0 && index <= orderedIndexes[position - 1]!)) {
-      details.push('workflow 关键步骤缺失或顺序错误')
+      if (!stepRunsExactCommand(step, expectedArgv)) details.push(`${name} 必须执行约定的真实命令`)
     }
 
     /** cleanup 必须始终运行，并按生产脚本的固定控制流逐项聚合清理失败。 */
@@ -1425,11 +1479,9 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     ] as const
     if (
       cleanup?.if !== 'always()'
-      || !hasExactKeys(cleanup, cleanupStepAllowedKeys)
       || cleanup?.shell !== 'bash'
       || cleanupEnv?.BASE_SHA !== '${{ steps.upstream.outputs.base_sha }}'
       || cleanupEnv?.TEMP_BRANCH !== '${{ steps.upstream.outputs.temp_branch }}'
-      || Object.keys(cleanupEnv ?? {}).length !== 2
       || !stepMatchesExactContract(cleanup, cleanupContract)
     ) details.push('cleanup 必须按固定有序闭集尝试 abort、switch、delete，并返回聚合失败')
 

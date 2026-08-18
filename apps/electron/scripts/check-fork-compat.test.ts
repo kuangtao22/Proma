@@ -14,7 +14,7 @@ import {
 const validWorkflow = `
 name: Upstream Compatibility
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
     - cron: '17 3 * * 1'
 permissions:
@@ -23,7 +23,7 @@ concurrency:
   group: upstream-compat-\${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  verify-upstream-merge:
+  upstream-compat:
     name: Verify latest upstream release
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -1394,6 +1394,91 @@ broken: [
     })
   }
 
+  /** workflow 递归 schema 必须拒绝每一层未批准的 key、元素与嵌套值。 */
+  const invalidWorkflowSchemaCases: Array<{ name: string; mutate: (source: string) => string }> = [
+    {
+      name: '根 defaults 注入吞错 shell',
+      mutate: (source) => source.replace(
+        'jobs:',
+        'defaults:\n  run:\n    shell: bash {0} || true\njobs:',
+      ),
+    },
+    {
+      name: '额外 push step',
+      mutate: (source) => source.replace(
+        '      - name: Abort merge and remove temporary branch',
+        '      - name: Push merged result\n        run: git push origin HEAD\n      - name: Abort merge and remove temporary branch',
+      ),
+    },
+    {
+      name: 'checkout with 增加 ref',
+      mutate: (source) => source.replace(
+        '          fetch-tags: true',
+        '          fetch-tags: true\n          ref: refs/heads/main',
+      ),
+    },
+    {
+      name: 'merge env 增加额外变量',
+      mutate: (source) => source.replace(
+        '          UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}',
+        '          UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}\n          EXTRA_INPUT: untrusted',
+      ),
+    },
+    {
+      name: '重复 Build mobile step',
+      mutate: (source) => source.replace(
+        '      - name: Typecheck all workspaces',
+        '      - name: Build mobile app\n        run: bun run --filter=\'@proma/mobile\' build\n      - name: Typecheck all workspaces',
+      ),
+    },
+    {
+      name: '根节点增加未知 key',
+      mutate: (source) => source.replace(
+        'permissions:',
+        'unexpected-root: true\npermissions:',
+      ),
+    },
+    {
+      name: 'on 增加 push 触发器',
+      mutate: (source) => source.replace(
+        '  schedule:',
+        '  push:\n  schedule:',
+      ),
+    },
+    {
+      name: 'workflow_dispatch 用字符串伪装空 map',
+      mutate: (source) => source.replace(
+        '  workflow_dispatch: {}\n',
+        '  workflow_dispatch: disabled\n',
+      ),
+    },
+    {
+      name: 'permissions 增加 actions read',
+      mutate: (source) => source.replace(
+        '  contents: read',
+        '  contents: read\n  actions: read',
+      ),
+    },
+    {
+      name: 'concurrency 增加未知 key',
+      mutate: (source) => source.replace(
+        '  cancel-in-progress: true',
+        '  cancel-in-progress: true\n  unexpected: true',
+      ),
+    },
+  ]
+
+  for (const schemaCase of invalidWorkflowSchemaCases) {
+    test(`Given ${schemaCase.name} When 递归校验 workflow schema Then 明确失败`, () => {
+      /** 仅扩张一个 schema 节点，保留其余批准结构。 */
+      const workflow = schemaCase.mutate(validWorkflow)
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
   test('Given upstream URL 指向错误仓库 When 检查 workflow Then 明确失败', () => {
     /** 只替换官方上游 URL，保留其余 tag 流程。 */
     const files = {
@@ -1626,8 +1711,8 @@ broken: [
   test('Given workflow 增加第二个 job When 检查唯一 job 合同 Then 明确失败', () => {
     /** 附加无副作用 job，证明唯一性检查不依赖禁用命令或 action allowlist。 */
     const workflow = validWorkflow.replace(
-      'jobs:\n  verify-upstream-merge:',
-      'jobs:\n  passive-extra-job:\n    runs-on: ubuntu-latest\n    steps: []\n  verify-upstream-merge:',
+      'jobs:\n  upstream-compat:',
+      'jobs:\n  passive-extra-job:\n    runs-on: ubuntu-latest\n    steps: []\n  upstream-compat:',
     )
     const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
 
