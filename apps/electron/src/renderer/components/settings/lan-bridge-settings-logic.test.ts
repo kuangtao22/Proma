@@ -99,10 +99,10 @@ describe('LAN Bridge 设置页纯逻辑', () => {
       onError: () => undefined,
       onSettled: () => undefined,
     }
-    const oldRun = coordinator.run('devices', () => stoppedRequest.promise, callbacks)
+    const oldRun = coordinator.run('devicesList', () => stoppedRequest.promise, callbacks)
     coordinator.setRunning(false)
     coordinator.setRunning(true)
-    const newRun = coordinator.run('devices', () => restartedRequest.promise, callbacks)
+    const newRun = coordinator.run('devicesList', () => restartedRequest.promise, callbacks)
 
     stoppedRequest.resolve(['old-device'])
     await oldRun
@@ -132,4 +132,94 @@ describe('LAN Bridge 设置页纯逻辑', () => {
 
     expect(events).toEqual(['start'])
   })
+
+  test('Given 首次设备列表请求 When 结果返回 Then 未初始化的共享结果世代允许正常提交', async () => {
+    /** 首次加载返回的设备列表。 */
+    const initialList = createDeferred<string[]>()
+    /** 模拟组件当前设备数据。 */
+    let devices: string[] = []
+    const coordinator = createLanBridgeSettingsRequestCoordinator()
+    coordinator.setRunning(true)
+    const run = coordinator.run('devicesList', () => initialList.promise, {
+      onStart: () => undefined,
+      onSuccess: value => { devices = value },
+      onError: () => undefined,
+      onSettled: () => undefined,
+    }, { resultScope: 'devices' })
+
+    initialList.resolve(['device-a'])
+    await run
+
+    expect(devices).toEqual(['device-a'])
+  })
+
+  test.each([
+    ['列表先发且先返回', 'list', 'list'],
+    ['列表先发且撤销先返回', 'list', 'revoke'],
+    ['撤销先发且列表先返回', 'revoke', 'list'],
+    ['撤销先发且先返回', 'revoke', 'revoke'],
+  ] as const)(
+    'Given %s When 撤销后重载设备 Then 旧列表不回写且所有 pending 最终清零',
+    async (_caseName, firstStarted, firstResolved) => {
+      /** 撤销前列表、撤销请求和撤销后的权威列表。 */
+      const staleList = createDeferred<string[]>()
+      const revoke = createDeferred<void>()
+      const freshList = createDeferred<string[]>()
+      /** 模拟组件设备数据与两个独立 pending 状态。 */
+      let devices = ['device-a', 'device-b']
+      let listPending = false
+      let revokePending = false
+      const coordinator = createLanBridgeSettingsRequestCoordinator()
+      coordinator.setRunning(true)
+
+      /** 发起受共享设备数据世代保护的列表请求。 */
+      const runList = (request: Deferred<string[]>): Promise<void> => coordinator.run(
+        'devicesList',
+        () => request.promise,
+        {
+          onStart: () => { listPending = true },
+          onSuccess: value => { devices = value },
+          onError: () => undefined,
+          onSettled: () => { listPending = false },
+        },
+        { resultScope: 'devices' },
+      )
+      /** 撤销成功时使旧列表失效、即时移除设备并触发权威重载。 */
+      const runRevoke = (): Promise<void> => coordinator.run('deviceRevoke', () => revoke.promise, {
+        onStart: () => { revokePending = true },
+        onSuccess: () => {
+          coordinator.invalidateResults('devices')
+          devices = devices.filter(device => device !== 'device-a')
+          void runList(freshList)
+        },
+        onError: () => undefined,
+        onSettled: () => { revokePending = false },
+      })
+
+      /** 按用例指定顺序启动两个交叉操作。 */
+      const staleListRun = firstStarted === 'list' ? runList(staleList) : null
+      const revokeRun = runRevoke()
+      const ensuredStaleListRun = staleListRun ?? runList(staleList)
+
+      if (firstResolved === 'list') {
+        staleList.resolve(['device-a', 'device-b', 'stale-device'])
+        await ensuredStaleListRun
+        revoke.resolve()
+        await revokeRun
+      } else {
+        revoke.resolve()
+        await revokeRun
+        staleList.resolve(['device-a', 'device-b', 'stale-device'])
+        await ensuredStaleListRun
+      }
+      freshList.resolve(['device-b', 'fresh-device'])
+      /** 撤销成功回调内启动的 Promise 在下一微任务结算。 */
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(devices).toEqual(['device-b', 'fresh-device'])
+      expect(listPending).toBe(false)
+      expect(revokePending).toBe(false)
+    },
+  )
 })

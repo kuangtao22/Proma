@@ -88,7 +88,7 @@ export function LanBridgeSettings(): React.ReactElement {
 
   /** 加载当前仍有访问权的设备列表。 */
   const loadDevices = React.useCallback(async () => {
-    await requestCoordinator.run('devices', () => window.electronAPI.listLanBridgeDevices(), {
+    await requestCoordinator.run('devicesList', () => window.electronAPI.listLanBridgeDevices(), {
       onStart: () => {
         setDevicesLoading(true)
         setDevicesError('')
@@ -99,7 +99,7 @@ export function LanBridgeSettings(): React.ReactElement {
         error instanceof Error ? error.message : '无法加载授权设备',
       ),
       onSettled: () => setDevicesLoading(false),
-    })
+    }, { resultScope: 'devices' })
   }, [requestCoordinator])
 
   /** 卸载后永久废弃所有迟到 IPC 回调。 */
@@ -208,20 +208,24 @@ export function LanBridgeSettings(): React.ReactElement {
   /** 撤销指定设备；IPC 成功后立即同步本地列表，避免等待下一次刷新。 */
   const handleRevokeDevice = React.useCallback(async (deviceId: string) => {
     if (revokingDeviceId) return
-    await requestCoordinator.run('devices', () => (
+    await requestCoordinator.run('deviceRevoke', () => (
       window.electronAPI.revokeLanBridgeDevice({ deviceId })
     ), {
       onStart: () => setRevokingDeviceId(deviceId),
       onSuccess: () => {
+        /** 撤销完成后废弃所有更早的设备列表结果。 */
+        requestCoordinator.invalidateResults('devices')
         setDevices(current => removeRevokedDevice(current, deviceId))
         toast.success('设备访问权已撤销')
+        /** 重新读取主进程权威列表，覆盖撤销期间可能出现的其他设备变化。 */
+        void loadDevices()
       },
       onError: error => toast.error(
         `撤销失败: ${error instanceof Error ? error.message : String(error)}`,
       ),
       onSettled: () => setRevokingDeviceId(null),
     })
-  }, [revokingDeviceId, requestCoordinator])
+  }, [loadDevices, revokingDeviceId, requestCoordinator])
 
   // 保存配置
   const handleSaveConfig = React.useCallback(async () => {

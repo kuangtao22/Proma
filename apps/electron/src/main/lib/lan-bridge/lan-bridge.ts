@@ -25,7 +25,12 @@ import { getConfigDir } from '../config-paths'
 import { LanBridgeSessionManager } from './lan-bridge-session'
 import { dispatch } from './lan-bridge-router'
 import type { LanBridgeConfig, LanBridgeRuntimeState } from '@proma/shared'
-import { isRfc1918Ipv4, LAN_BRIDGE_IPC_CHANNELS, selectRfc1918Ipv4 } from '@proma/shared'
+import {
+  isLanBridgeWebSocketClientIp,
+  isRfc1918Ipv4,
+  LAN_BRIDGE_IPC_CHANNELS,
+  selectRfc1918Ipv4,
+} from '@proma/shared'
 
 import {
   createLanBridgeConnectedPayload,
@@ -134,7 +139,7 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
     httpServer.on('upgrade', (req: IncomingMessage, socket: any, head: Buffer) => {
       if (req.url === '/ws') {
         const ip = extractIp(req)
-        if (!isRfc1918Ipv4(ip)) {
+        if (!isLanBridgeWebSocketClientIp(ip)) {
           socket.destroy()
           return
         }

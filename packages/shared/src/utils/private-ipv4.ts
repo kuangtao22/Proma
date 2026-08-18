@@ -18,6 +18,17 @@ export function isRfc1918Ipv4(address: string): boolean {
     || (first === 192 && second === 168)
 }
 
+/** 判断 WebSocket 客户端是否来自 RFC1918 局域网或明确的本机回环。 */
+export function isLanBridgeWebSocketClientIp(address: string): boolean {
+  /** Node 可能把 IPv4 socket 地址表示为 IPv4-mapped IPv6。 */
+  const normalizedAddress = address.startsWith('::ffff:')
+    ? address.slice('::ffff:'.length)
+    : address
+  return normalizedAddress === '127.0.0.1'
+    || normalizedAddress === '::1'
+    || isRfc1918Ipv4(normalizedAddress)
+}
+
 /** 从候选地址中选择第一个严格 RFC1918 IPv4。 */
 export function selectRfc1918Ipv4(addresses: readonly string[]): string | undefined {
   return addresses.find(isRfc1918Ipv4)

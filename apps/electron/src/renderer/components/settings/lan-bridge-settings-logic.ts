@@ -39,7 +39,16 @@ export function removeRevokedDevice(
 }
 
 /** 设置页受运行状态约束的异步资源类别。 */
-export type LanBridgeSettingsRequestScope = 'pairingQr' | 'devices' | 'pin'
+export type LanBridgeSettingsRequestScope = 'pairingQr' | 'devicesList' | 'deviceRevoke' | 'pin'
+
+/** 跨操作共享的数据结果类别。 */
+export type LanBridgeSettingsResultScope = 'devices'
+
+/** 单次请求可选的结果新旧约束。 */
+export interface LanBridgeSettingsRequestOptions {
+  /** 仅当共享结果世代未变化时才允许提交成功或错误。 */
+  resultScope?: LanBridgeSettingsResultScope
+}
 
 /** 单次设置页异步请求的状态提交动作。 */
 export interface LanBridgeSettingsRequestCallbacks<T> {
@@ -62,7 +71,10 @@ export interface LanBridgeSettingsRequestCoordinator {
     scope: LanBridgeSettingsRequestScope,
     request: () => Promise<T>,
     callbacks: LanBridgeSettingsRequestCallbacks<T>,
+    options?: LanBridgeSettingsRequestOptions,
   ) => Promise<void>
+  /** 使指定数据类别的在途旧结果失效。 */
+  invalidateResults: (scope: LanBridgeSettingsResultScope) => void
   /** 标记组件卸载。 */
   unmount: () => void
 }
@@ -77,33 +89,46 @@ export function createLanBridgeSettingsRequestCoordinator(): LanBridgeSettingsRe
   let lifecycleEpoch = 0
   /** 各资源独立分代，允许 QR、设备与 PIN 并行。 */
   const scopeGenerations = new Map<LanBridgeSettingsRequestScope, number>()
+  /** 跨操作共享的数据世代，仅限制结果回写而不跳过各自 onSettled。 */
+  const resultGenerations = new Map<LanBridgeSettingsResultScope, number>()
   return {
     setRunning: value => {
       if (running === value) return
       running = value
       lifecycleEpoch += 1
     },
-    run: async (scope, request, callbacks) => {
+    run: async (scope, request, callbacks, options = {}) => {
       if (!mounted || !running) return
       /** 当前资源的新 generation 会立即淘汰上一同类请求。 */
       const generation = (scopeGenerations.get(scope) ?? 0) + 1
       scopeGenerations.set(scope, generation)
       /** 捕获请求启动时的全局生命周期。 */
       const requestEpoch = lifecycleEpoch
+      /** 捕获设备等共享数据在请求启动时的结果世代。 */
+      const resultGeneration = options.resultScope === undefined
+        ? undefined
+        : resultGenerations.get(options.resultScope) ?? 0
       /** 同时校验 mounted、running、epoch 与 scope generation。 */
-      const isCurrent = (): boolean => mounted
+      const isOperationCurrent = (): boolean => mounted
         && running
         && lifecycleEpoch === requestEpoch
         && scopeGenerations.get(scope) === generation
+      /** 结果还需保证跨操作共享的数据世代未失效。 */
+      const isResultCurrent = (): boolean => isOperationCurrent()
+        && (options.resultScope === undefined
+          || (resultGenerations.get(options.resultScope) ?? 0) === resultGeneration)
       callbacks.onStart()
       try {
         const value = await request()
-        if (isCurrent()) callbacks.onSuccess(value)
+        if (isResultCurrent()) callbacks.onSuccess(value)
       } catch (error) {
-        if (isCurrent()) callbacks.onError(error)
+        if (isResultCurrent()) callbacks.onError(error)
       } finally {
-        if (isCurrent()) callbacks.onSettled()
+        if (isOperationCurrent()) callbacks.onSettled()
       }
+    },
+    invalidateResults: scope => {
+      resultGenerations.set(scope, (resultGenerations.get(scope) ?? 0) + 1)
     },
     unmount: () => {
       mounted = false
