@@ -28,6 +28,7 @@
     "build:native-helpers": "bun run build:agent-island-native && bun run build:eventkit-native",
     "build:cli": "bun run scripts/build-cli.ts",
     "build:mobile": "bun run --filter='@proma/mobile' build",
+    "check:fork-compat": "bun run scripts/check-fork-compat.ts",
     "sync:runtime-deps": "bun run scripts/sync-runtime-deps.ts",
     "sync:runtime-deps:dev": "bun run scripts/sync-runtime-deps.ts --no-clean",
     "build": "bun run build:main && bun run build:agent-runtime && bun run build:preload && bun run build:renderer && bun run build:cli && bun run build:native-helpers && bun run build:resources",

@@ -1,0 +1,148 @@
+name: Upstream Compatibility
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-upstream-merge:
+    name: Verify latest upstream release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout fork with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Select latest official release tag
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          readonly UPSTREAM_URL='https://github.com/ErlichLiu/Proma.git'
+          readonly TEMP_BRANCH="compat/upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          readonly BASE_SHA="$(git rev-parse HEAD)"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --force upstream --tags
+
+          mapfile -t RELEASE_TAGS < <(
+            git ls-remote --tags --refs upstream 'v*' \
+              | awk '{ sub("refs/tags/", "", $2); print $2 }' \
+              | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              | sort -V \
+              || true
+          )
+
+          if (( ${#RELEASE_TAGS[@]} == 0 )); then
+            echo '未找到官方正式 vMAJOR.MINOR.PATCH tag。' >&2
+            exit 1
+          fi
+
+          if ! printf '%s\n' "${RELEASE_TAGS[@]}" | sort -V -C; then
+            echo '正式 tag 的 semver 排序结果异常。' >&2
+            exit 1
+          fi
+
+          readonly LATEST_TAG="${RELEASE_TAGS[-1]}"
+          if [[ ! "$LATEST_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "最新 tag 不是正式 semver：$LATEST_TAG" >&2
+            exit 1
+          fi
+
+          readonly UPSTREAM_SHA="$(git rev-parse "${LATEST_TAG}^{commit}")"
+          echo "base=$BASE_SHA"
+          echo "head=$(git rev-parse HEAD)"
+          echo "upstream_tag=$LATEST_TAG"
+          echo "upstream_sha=$UPSTREAM_SHA"
+
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "temp_branch=$TEMP_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream tag without committing
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.upstream.outputs.base_sha }}
+          TEMP_BRANCH: ${{ steps.upstream.outputs.temp_branch }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git switch --create "$TEMP_BRANCH" "$BASE_SHA"
+          git merge --no-commit --no-ff "$UPSTREAM_TAG"
+
+          echo "base=$BASE_SHA"
+          echo "head=$(git rev-parse HEAD)"
+          echo "upstream_tag=$UPSTREAM_TAG"
+          if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
+            echo "merge_head=$(git rev-parse MERGE_HEAD)"
+          elif git merge-base --is-ancestor "$UPSTREAM_TAG" HEAD; then
+            echo 'merge_state=upstream-tag-already-contained'
+          else
+            echo '合并命令结束后既没有 MERGE_HEAD，也无法证明上游 tag 已包含在 HEAD 中。' >&2
+            exit 1
+          fi
+          git status --short
+          git diff --cached --stat
+
+      - name: Install dependencies from merged tree
+        run: bun install --frozen-lockfile
+
+      - name: Check fork compatibility seams
+        run: bun run --filter='@proma/electron' check:fork-compat
+
+      - name: Run LAN and mobile targeted tests
+        run: >-
+          bun test
+          apps/electron/src/main/lib/lan-bridge
+          apps/electron/src/preload/lan-bridge-preload.test.ts
+          apps/mobile/src/lib
+
+      - name: Build mobile app
+        run: bun run --filter='@proma/mobile' build
+
+      - name: Typecheck all workspaces
+        run: bun run typecheck
+
+      - name: Build Electron app
+        run: bun run electron:build
+
+      - name: Abort merge and remove temporary branch
+        if: always()
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.upstream.outputs.base_sha }}
+          TEMP_BRANCH: ${{ steps.upstream.outputs.temp_branch }}
+        run: |
+          set +e
+
+          if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
+            git merge --abort
+          fi
+
+          if [[ -n "${BASE_SHA:-}" ]]; then
+            git switch --detach "$BASE_SHA"
+          fi
+
+          if [[ -n "${TEMP_BRANCH:-}" ]] && git show-ref --verify --quiet "refs/heads/$TEMP_BRANCH"; then
+            git branch --delete --force "$TEMP_BRANCH"
+          fi
