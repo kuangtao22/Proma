@@ -42,6 +42,8 @@ import type { AgentEventBus } from '../agent-event-bus'
 import { createLanBridgeRecoveryController } from './lan-bridge-recovery'
 import { createLanBridgeMessageHandler } from './lan-bridge-message-handler'
 import { executeLanBridgeDeviceRevocation } from './lan-bridge-device-revocation'
+import { createLanBridgeStartCoordinator } from './lan-bridge-lifecycle'
+import { LAN_BRIDGE_WEBSOCKET_SERVER_OPTIONS } from './lan-bridge-server-options'
 
 // ===== 单例状态 =====
 
@@ -51,6 +53,8 @@ let wss: WebSocketServer | null = null
 let sessionManager: LanBridgeSessionManager | null = null
 let status: LanBridgeRuntimeState['status'] = 'stopped'
 let errorMessage: string | undefined
+/** 进程内唯一的启动协调器。 */
+const startCoordinator = createLanBridgeStartCoordinator()
 
 /** 组合根首次加载时固定的生产认证服务，Bridge restart 继续复用。 */
 const lanBridgeAuthService = getLanBridgeAuthService()
@@ -72,8 +76,16 @@ const recoveryController = createLanBridgeRecoveryController({
 // ===== 公开 API =====
 
 /** 启动 LAN Bridge WS Server */
-export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
+export function startLanBridge(bus?: AgentEventBus): Promise<void> {
   recoveryController.rememberEventBus(bus)
+  return startCoordinator.run(isCancelled => performStartLanBridge(bus, isCancelled))
+}
+
+/** 执行单个生命周期代次的实际启动。 */
+async function performStartLanBridge(
+  bus: AgentEventBus | undefined,
+  isCancelled: () => boolean,
+): Promise<void> {
   const config = getLanBridgeConfig()
   if (status === 'running') return
 
@@ -88,7 +100,12 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
     const handleMessage = createLanBridgeMessageHandler({
       sessionManager,
       now: Date.now,
-      dispatch,
+      dispatch: async (client, type, data, id) => {
+        // timer 回调延迟时也先执行绝对期限检查，Handler 认证后立即释放 deadline。
+        if (!sessionManager?.synchronizeAuthenticationState(client)) return
+        await dispatch(client, type, data, id)
+        sessionManager?.synchronizeAuthenticationState(client)
+      },
     })
 
     // 静态文件根目录:
@@ -134,7 +151,7 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
       }
     })
 
-    wss = new WebSocketServer({ noServer: true })
+    wss = new WebSocketServer(LAN_BRIDGE_WEBSOCKET_SERVER_OPTIONS)
 
     httpServer.on('upgrade', (req: IncomingMessage, socket: any, head: Buffer) => {
       if (req.url === '/ws') {
@@ -183,6 +200,11 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
       httpServer!.on('error', reject)
     })
 
+    if (isCancelled()) {
+      cleanup()
+      return
+    }
+
     sessionManager.startHeartbeat()
 
     // 启动 EventBus 订阅
@@ -194,6 +216,10 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
     status = 'running'
     notifyStatusChanged()
   } catch (err) {
+    if (isCancelled()) {
+      cleanup()
+      return
+    }
     status = 'error'
     errorMessage = err instanceof Error ? err.message : String(err)
     console.error('[LAN Bridge] 启动失败:', errorMessage)
@@ -204,6 +230,7 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
 
 /** 停止 LAN Bridge */
 export function stopLanBridge(): void {
+  startCoordinator.cancelPending()
   if (status === 'stopped') return
   cleanup()
   status = 'stopped'

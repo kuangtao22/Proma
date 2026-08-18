@@ -67,6 +67,96 @@ afterEach(() => {
 })
 
 describe('LAN Bridge 真实认证 handler 链路', () => {
+  test('protocol.hello 对不重叠主版本返回稳定 PROTOCOL_UNSUPPORTED', async () => {
+    const authService = createAuthService()
+    const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-protocol' })
+    registerLanBridgeHandlers({
+      authService,
+      promaAdapter: { hasAgentSession: () => true } as unknown as LanBridgePromaAdapter,
+      getSessionManager: () => manager,
+    })
+    const socket = new FakeWebSocket()
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.8')!
+
+    const response = await request(client, socket, 'protocol.hello', {
+      minProtocolVersion: 3,
+      maxProtocolVersion: 3,
+    })
+
+    expect(response).toMatchObject({ ok: false, errorCode: 'PROTOCOL_UNSUPPORTED' })
+    expect(client.protocolVersion).toBeUndefined()
+  })
+
+  test('protocol.hello 协商共同主版本后提交到连接状态', async () => {
+    const authService = createAuthService()
+    const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-protocol' })
+    registerLanBridgeHandlers({
+      authService,
+      promaAdapter: { hasAgentSession: () => true } as unknown as LanBridgePromaAdapter,
+      getSessionManager: () => manager,
+    })
+    const socket = new FakeWebSocket()
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.8')!
+
+    const response = await request(client, socket, 'protocol.hello', {
+      minProtocolVersion: 2,
+      maxProtocolVersion: 2,
+    })
+
+    expect(response).toMatchObject({ ok: true, data: { protocolVersion: 2 } })
+    expect(client.protocolVersion).toBe(2)
+  })
+
+  test('Agent 消息 Handler 在调用 Adapter 前拒绝 traversal sessionId', async () => {
+    const authService = createAuthService()
+    const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-traversal' })
+    let readCount = 0
+    const promaAdapter = {
+      hasAgentSession: () => true,
+      getAgentMessages: () => {
+        readCount += 1
+        return []
+      },
+    } as unknown as LanBridgePromaAdapter
+    registerLanBridgeHandlers({ authService, promaAdapter, getSessionManager: () => manager })
+    const socket = new FakeWebSocket()
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.8')!
+    const issued = authService.generateToken(client.ip, 'iPhone')
+
+    const response = await request(client, socket, 'agent.sessions.messages', {
+      token: issued.token,
+      sessionId: '../outside',
+    })
+
+    expect(response).toMatchObject({ ok: false, errorCode: 'VALIDATION_ERROR' })
+    expect(readCount).toBe(0)
+  })
+
+  test('Agent 发送 Handler 在运行时调用前拒绝不存在的 sessionId', async () => {
+    const authService = createAuthService()
+    const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-missing' })
+    let sendCount = 0
+    const promaAdapter = {
+      hasAgentSession: () => false,
+      isAgentSessionActive: () => false,
+      getSettings: () => ({}),
+      sendAgent: async () => { sendCount += 1 },
+    } as unknown as LanBridgePromaAdapter
+    registerLanBridgeHandlers({ authService, promaAdapter, getSessionManager: () => manager })
+    const socket = new FakeWebSocket()
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.8')!
+    const issued = authService.generateToken(client.ip, 'iPhone')
+
+    const response = await request(client, socket, 'agent.send', {
+      token: issued.token,
+      sessionId: 'missing-session',
+      userMessage: '不应发送',
+    })
+
+    expect(response).toMatchObject({ ok: false, errorCode: 'NOT_FOUND' })
+    expect(sendCount).toBe(0)
+  })
+
   test('一次性票据 handler 签发设备 Token 并记录实际 deviceId', async () => {
     /** 当前用例的隔离认证服务。 */
     const authService = createAuthService()
@@ -74,7 +164,7 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-ticket' })
     registerLanBridgeHandlers({
       authService,
-      promaAdapter: {} as unknown as LanBridgePromaAdapter,
+      promaAdapter: { hasAgentSession: () => true } as unknown as LanBridgePromaAdapter,
       getSessionManager: () => manager,
     })
     /** 当前用例签发的一次性票据。 */
@@ -104,7 +194,7 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     const manager = new LanBridgeSessionManager(10, { uuid: () => `client-${++nextClientId}` })
     registerLanBridgeHandlers({
       authService,
-      promaAdapter: {} as unknown as LanBridgePromaAdapter,
+      promaAdapter: { hasAgentSession: () => true } as unknown as LanBridgePromaAdapter,
       getSessionManager: () => manager,
     })
     /** PIN 配对连接。 */
@@ -142,14 +232,14 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     expect(protectedResponse).toMatchObject({ ok: true, data: { subscribed: 'session-1' } })
   })
 
-  test('refresh 为连接提交新 Token 和延后的认证期限', async () => {
+  test('refresh 为连接提交新 Token 并保留首次配对的绝对期限', async () => {
     /** 当前用例的隔离认证服务。 */
     const authService = createAuthService()
     /** 当前用例的真实会话管理器。 */
     const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-refresh' })
     registerLanBridgeHandlers({
       authService,
-      promaAdapter: {} as unknown as LanBridgePromaAdapter,
+      promaAdapter: { hasAgentSession: () => true } as unknown as LanBridgePromaAdapter,
       getSessionManager: () => manager,
     })
     /** 刷新 Token 的连接。 */
@@ -166,7 +256,7 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     /** 刷新后签发的认证数据。 */
     const refreshed = refreshResponse.data as { token: string; expiresAt: number }
 
-    expect(refreshed.expiresAt).toBeGreaterThan(oldToken.expiresAt)
+    expect(refreshed.expiresAt).toBe(oldToken.expiresAt)
     expect(client.authToken).toBe(refreshed.token)
     expect(client.authExpiresAt).toBe(refreshed.expiresAt)
   })
@@ -178,7 +268,7 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-1' })
     registerLanBridgeHandlers({
       authService,
-      promaAdapter: {} as unknown as LanBridgePromaAdapter,
+      promaAdapter: { hasAgentSession: () => true } as unknown as LanBridgePromaAdapter,
       getSessionManager: () => manager,
     })
     /** 被撤销设备的连接。 */
@@ -212,7 +302,7 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-errors' })
     registerLanBridgeHandlers({
       authService,
-      promaAdapter: {} as unknown as LanBridgePromaAdapter,
+      promaAdapter: { hasAgentSession: () => true } as unknown as LanBridgePromaAdapter,
       getSessionManager: () => manager,
     })
     /** 错误语义验证连接。 */

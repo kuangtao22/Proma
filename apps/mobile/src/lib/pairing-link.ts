@@ -56,9 +56,12 @@ export function consumePairingLink(browser: PairingLinkBrowser): PairingLink | n
   return pairingLink
 }
 
-/** 判断服务端是否明确支持一次性票据配对。 */
+/** 根据 hello 已协商能力判断是否支持一次性票据配对。 */
 export function supportsPairingTicket(payload: unknown): boolean {
   if (!isRecord(payload) || !Array.isArray(payload.capabilities)) return false
+  if (!Number.isSafeInteger(payload.protocolVersion)
+    || (payload.protocolVersion as number) < LAN_BRIDGE_MIN_PROTOCOL_VERSION
+    || (payload.protocolVersion as number) > LAN_BRIDGE_MAX_PROTOCOL_VERSION) return false
   return payload.capabilities.some(capability => capability === 'pairing-ticket')
 }
 
@@ -88,3 +91,7 @@ export function getPairingFailureMessage(error: unknown): string {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
+import {
+  LAN_BRIDGE_MAX_PROTOCOL_VERSION,
+  LAN_BRIDGE_MIN_PROTOCOL_VERSION,
+} from '@proma/shared'

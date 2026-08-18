@@ -1,7 +1,7 @@
 /**
  * LAN Bridge 进程级认证服务。
  *
- * 单个服务固定持有一个设备仓库；Bridge 重启只轮换 PIN/HMAC 并清理内存票据。
+ * 单个服务固定持有一个设备仓库；Bridge 重启只轮换 PIN 并清理内存票据。
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
@@ -102,7 +102,8 @@ const DEFAULT_LOGGER: LanBridgeAuthLogger = {
 /** 固定持有设备仓库的进程级认证服务。 */
 export class LanBridgeAuthService {
   private currentPin = ''
-  private hmacKey = ''
+  /** 服务实例生命周期内固定的 Token 签名密钥。 */
+  private readonly hmacKey = randomBytes(32).toString('hex')
   private readonly pairingAttempts = new Map<string, PairingAttemptState>()
   private readonly pairingTickets = new Map<string, PairingTicketState>()
 
@@ -119,10 +120,13 @@ export class LanBridgeAuthService {
     this.initialize()
   }
 
-  /** 轮换 PIN/HMAC 并清理进程内临时状态，保留设备仓库。 */
+  /** 轮换 PIN 并清理进程内临时状态，保留 HMAC 和设备仓库。 */
   initialize(): string {
-    this.currentPin = generatePin()
-    this.hmacKey = randomBytes(32).toString('hex')
+    /** 轮换前的 PIN，用于保证旧 PIN 在重启后失效。 */
+    const previousPin = this.currentPin
+    do {
+      this.currentPin = generatePin()
+    } while (this.currentPin === previousPin)
     this.pairingAttempts.clear()
     this.pairingTickets.clear()
     return this.currentPin
@@ -135,7 +139,11 @@ export class LanBridgeAuthService {
 
   /** 只刷新 PIN 和失败窗口，不影响 HMAC 或已配对设备。 */
   refreshPin(): string {
-    this.currentPin = generatePin()
+    /** 刷新前的 PIN，用于保证旧 PIN 立即失效。 */
+    const previousPin = this.currentPin
+    do {
+      this.currentPin = generatePin()
+    } while (this.currentPin === previousPin)
     this.pairingAttempts.clear()
     console.log('[LAN Bridge] PIN 码已刷新')
     return this.currentPin
@@ -241,11 +249,11 @@ export class LanBridgeAuthService {
       /** 通过运行时字段验证的 payload。 */
       const payload = parsed
 
-      /** Token 的绝对失效时间。 */
-      const expiresAt = payload.iat + TOKEN_EXPIRY_MS
-      if (!Number.isFinite(expiresAt)) return invalidToken('TOKEN_INVALID')
+      /** 当前 Token 按自身签发时间计算的失效时间。 */
+      const tokenExpiresAt = payload.iat + TOKEN_EXPIRY_MS
+      if (!Number.isFinite(tokenExpiresAt)) return invalidToken('TOKEN_INVALID')
       if (payload.iat - now > TOKEN_FUTURE_IAT_TOLERANCE_MS) return invalidToken('TOKEN_INVALID')
-      if (now >= expiresAt) return invalidToken('TOKEN_EXPIRED')
+      if (now >= tokenExpiresAt) return invalidToken('TOKEN_EXPIRED')
       if (payload.ip !== ip) return invalidToken('TOKEN_INVALID')
 
       /** Token payload 对应的当前设备记录。 */
@@ -253,6 +261,13 @@ export class LanBridgeAuthService {
       if (!device || device.revokedAt !== undefined || device.tokenVersion !== payload.tokenVersion) {
         return invalidToken('DEVICE_REVOKED')
       }
+
+      /** 首次配对后不可通过刷新延长的设备绝对失效时间。 */
+      const deviceExpiresAt = device.createdAt + TOKEN_EXPIRY_MS
+      if (!Number.isFinite(deviceExpiresAt)) return invalidToken('TOKEN_INVALID')
+      /** 同时受单 Token 和首次配对绝对期限约束的最终失效时间。 */
+      const expiresAt = Math.min(tokenExpiresAt, deviceExpiresAt)
+      if (now >= expiresAt) return invalidToken('TOKEN_EXPIRED')
 
       try {
         this.deviceStore.updateLastSeen(device.id, now)
@@ -314,10 +329,12 @@ export class LanBridgeAuthService {
     }
     /** 编码后的 payload。 */
     const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url')
+    /** 首次配对后不可通过刷新延长的绝对失效时间。 */
+    const expiresAt = Math.min(now + TOKEN_EXPIRY_MS, device.createdAt + TOKEN_EXPIRY_MS)
     return {
       token: `${payloadB64}.${this.sign(payloadB64)}`,
-      expiresIn: TOKEN_EXPIRY_MS,
-      expiresAt: now + TOKEN_EXPIRY_MS,
+      expiresIn: Math.max(0, expiresAt - now),
+      expiresAt,
       deviceId: device.id,
     }
   }

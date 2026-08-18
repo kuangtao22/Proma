@@ -198,9 +198,11 @@ export interface LanBridgePromaDependencies {
 /** LAN Bridge handlers 使用的 Proma 稳定能力集合。 */
 export interface LanBridgePromaAdapter {
   listConversations: () => LanBridgeConversationDto[]
+  hasConversation: (conversationId: string) => boolean
   getConversationMessages: (conversationId: string) => ChatSendInput['messageHistory']
   searchConversations: (query: string, matchedAt?: number) => Promise<LanBridgeSearchResultDto[]>
   listAgentSessions: () => LanBridgeAgentSessionDto[]
+  hasAgentSession: (sessionId: string) => boolean
   getAgentMessages: (sessionId: string) => unknown[]
   searchAgentSessions: (query: string, matchedAt?: number) => Promise<LanBridgeSearchResultDto[]>
   listWorkspaces: () => LanBridgeWorkspaceDto[]
@@ -214,6 +216,38 @@ export interface LanBridgePromaAdapter {
   listChannels: () => LanBridgeChannelDto[]
   getChannelBaseUrl: (channelId: string) => string | null
   listEnabledChannelOptions: () => LanBridgeChannelOptionDto[]
+}
+
+/** 判断外部会话 ID 是否为不改变路径层级的单段标识。 */
+export function isValidLanBridgeSessionId(sessionId: unknown): sessionId is string {
+  return typeof sessionId === 'string'
+    && sessionId.length > 0
+    && sessionId.length <= 256
+    && sessionId !== '.'
+    && sessionId !== '..'
+    && !sessionId.includes('/')
+    && !sessionId.includes('\\')
+    && !sessionId.includes('\0')
+}
+
+/** 在进入官方文件或运行时能力前验证 ID 格式与实体存在性。 */
+function assertExistingAgentSession(dependencies: LanBridgePromaDependencies, sessionId: string): void {
+  if (!isValidLanBridgeSessionId(sessionId)) {
+    throw Object.assign(new Error('无效的会话 ID'), { errorCode: 'VALIDATION_ERROR' })
+  }
+  if (!dependencies.listAgentSessions().some(session => session.id === sessionId)) {
+    throw Object.assign(new Error('会话不存在'), { errorCode: 'NOT_FOUND' })
+  }
+}
+
+/** 在进入官方对话文件或发送能力前验证 ID 格式与实体存在性。 */
+function assertExistingConversation(dependencies: LanBridgePromaDependencies, conversationId: string): void {
+  if (!isValidLanBridgeSessionId(conversationId)) {
+    throw Object.assign(new Error('无效的会话 ID'), { errorCode: 'VALIDATION_ERROR' })
+  }
+  if (!dependencies.listConversations().some(conversation => conversation.id === conversationId)) {
+    throw Object.assign(new Error('会话不存在'), { errorCode: 'NOT_FOUND' })
+  }
 }
 
 /** 将官方对话对象映射为 shared 定义的 LAN 稳定字段。 */
@@ -248,7 +282,12 @@ export function createLanBridgePromaAdapter(
 ): LanBridgePromaAdapter {
   return {
     listConversations: () => dependencies.listConversations().map(mapConversation),
-    getConversationMessages: (conversationId) => dependencies.getConversationMessages(conversationId),
+    hasConversation: (conversationId) => isValidLanBridgeSessionId(conversationId)
+      && dependencies.listConversations().some(conversation => conversation.id === conversationId),
+    getConversationMessages: (conversationId) => {
+      assertExistingConversation(dependencies, conversationId)
+      return dependencies.getConversationMessages(conversationId)
+    },
     searchConversations: async (query, matchedAt = Date.now()) => {
       /** 官方 Chat 搜索结果只在此处转换为 LAN 字段。 */
       const results = await dependencies.searchConversationMessages(query)
@@ -261,7 +300,12 @@ export function createLanBridgePromaAdapter(
       }))
     },
     listAgentSessions: () => dependencies.listAgentSessions().map(mapAgentSession),
-    getAgentMessages: (sessionId) => dependencies.getAgentSessionMessages(sessionId),
+    hasAgentSession: (sessionId) => isValidLanBridgeSessionId(sessionId)
+      && dependencies.listAgentSessions().some(session => session.id === sessionId),
+    getAgentMessages: (sessionId) => {
+      assertExistingAgentSession(dependencies, sessionId)
+      return dependencies.getAgentSessionMessages(sessionId)
+    },
     searchAgentSessions: async (query, matchedAt = Date.now()) => {
       /** 官方 Agent 搜索结果只在此处转换为 LAN 字段。 */
       const results = await dependencies.searchAgentSessionMessages(query)
@@ -285,8 +329,12 @@ export function createLanBridgePromaAdapter(
       dependencies.notifyAgentTitleUpdated(session)
       return session
     },
-    isAgentSessionActive: (sessionId) => dependencies.isAgentSessionActive(sessionId),
+    isAgentSessionActive: (sessionId) => {
+      assertExistingAgentSession(dependencies, sessionId)
+      return dependencies.isAgentSessionActive(sessionId)
+    },
     sendAgent: async (command, callbacks) => {
+      assertExistingAgentSession(dependencies, command.sessionId)
       /** 默认设置仅从 Adapter 白名单读取，避免 handlers 接触官方设置对象。 */
       const settings = dependencies.getSettings()
       /** LAN 的 auto 表示交给运行时默认权限，其余值显式覆盖。 */
@@ -318,8 +366,12 @@ export function createLanBridgePromaAdapter(
         onTitleUpdated: (title) => callbacks.onTitleUpdated?.({ title }),
       })
     },
-    stopAgent: (sessionId) => dependencies.stopAgent(sessionId),
+    stopAgent: (sessionId) => {
+      assertExistingAgentSession(dependencies, sessionId)
+      dependencies.stopAgent(sessionId)
+    },
     sendConversation: async (command, callbacks) => {
+      assertExistingConversation(dependencies, command.conversationId)
       /** 发送前读取消息历史，保持官方 Chat 上下文语义。 */
       const messageHistory = dependencies.getConversationMessages(command.conversationId)
       /** 可选渠道和模型在 Adapter 内独立兑现默认设置语义。 */
@@ -357,7 +409,10 @@ export function createLanBridgePromaAdapter(
         onEvent,
       )
     },
-    stopConversation: (conversationId) => dependencies.stopConversation(conversationId),
+    stopConversation: (conversationId) => {
+      assertExistingConversation(dependencies, conversationId)
+      dependencies.stopConversation(conversationId)
+    },
     getSettings: () => {
       /** 设置对象按字段重建，禁止凭据或供应商配置越过 Adapter。 */
       const settings = dependencies.getSettings()

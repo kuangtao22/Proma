@@ -162,6 +162,49 @@ describe('LAN Bridge 设备 Token', () => {
     expect(service.verifyToken(result.token, '192.168.1.8', 86_401_001)).toBe(false)
   })
 
+  test('连续刷新不能越过首次配对后的 24 小时绝对期限', () => {
+    /** 当前用例的隔离认证服务。 */
+    const { service } = initTestAuth()
+    /** 首次配对时刻。 */
+    const pairedAt = 1_000
+    /** 首次配对后不可延长的绝对失效时间。 */
+    const absoluteExpiresAt = pairedAt + 24 * 60 * 60 * 1_000
+    /** 首次配对签发的设备 Token。 */
+    const initialToken = service.generateToken('192.168.1.8', 'iPhone', pairedAt)
+
+    /** 配对 12 小时后的首次刷新结果。 */
+    const firstRefresh = service.refreshTokenDetails(
+      initialToken.token,
+      '192.168.1.8',
+      pairedAt + 12 * 60 * 60 * 1_000,
+    )
+    expect(firstRefresh.valid).toBe(true)
+    if (!firstRefresh.valid) throw new Error('首次刷新失败')
+    expect(firstRefresh.expiresAt).toBe(absoluteExpiresAt)
+    expect(firstRefresh.expiresIn).toBe(12 * 60 * 60 * 1_000)
+
+    /** 绝对期限前一秒的连续刷新结果。 */
+    const secondRefresh = service.refreshTokenDetails(
+      firstRefresh.token,
+      '192.168.1.8',
+      absoluteExpiresAt - 1_000,
+    )
+    expect(secondRefresh.valid).toBe(true)
+    if (!secondRefresh.valid) throw new Error('连续刷新失败')
+    expect(secondRefresh.expiresAt).toBe(absoluteExpiresAt)
+    expect(secondRefresh.expiresIn).toBe(1_000)
+    expect(service.verifyTokenDetails(
+      secondRefresh.token,
+      '192.168.1.8',
+      absoluteExpiresAt,
+    )).toEqual({ valid: false, errorCode: 'TOKEN_EXPIRED' })
+    expect(service.refreshTokenDetails(
+      secondRefresh.token,
+      '192.168.1.8',
+      absoluteExpiresAt,
+    )).toEqual({ valid: false, errorCode: 'TOKEN_EXPIRED' })
+  })
+
   test('PIN 认证签发的真实设备 Token 可让 SessionManager 记录 deviceId', () => {
     /** 当前用例的真实设备仓库。 */
     const { store, service } = initTestAuth()
@@ -336,7 +379,7 @@ describe('LanBridgeAuthService 生命周期与协议安全', () => {
     expect(storeFactoryCalls).toBe(1)
   })
 
-  test('重复初始化只轮换凭据并保留同一设备集合', () => {
+  test('Bridge 重启只轮换临时配对状态并保留已配对设备 Token', () => {
     /** 当前用例的隔离设备仓库。 */
     const { store } = initTestAuth()
     /** 当前用例的认证服务。 */
@@ -344,16 +387,24 @@ describe('LanBridgeAuthService 生命周期与协议安全', () => {
     expect(service).toBeDefined()
 
     service!.initialize()
+    /** 重启前的 PIN。 */
+    const oldPin = service!.getCurrentPin()
     /** 首轮凭据签发的 Token。 */
     const oldToken = service!.generateToken('192.168.1.8', 'iPhone', 1_000).token
+    /** 重启前签发的一次性配对票据。 */
+    const oldTicket = service!.createPairingTicket(1_000)
     /** 首轮注册的设备 ID。 */
     const deviceId = service!.listDevices()[0]?.id
     service!.initialize()
 
     expect(service!.listDevices()[0]?.id).toBe(deviceId)
+    expect(service!.verifyPin(oldPin)).toBe(false)
+    expect(captureErrorCode(() => (
+      service!.consumePairingTicket(oldTicket.value, '192.168.1.8', 'iPad', 1_001)
+    ))).toBe('PAIRING_TICKET_INVALID')
     expect(service!.verifyTokenDetails(oldToken, '192.168.1.8', 1_001)).toMatchObject({
-      valid: false,
-      errorCode: 'TOKEN_INVALID',
+      valid: true,
+      deviceId,
     })
   })
 

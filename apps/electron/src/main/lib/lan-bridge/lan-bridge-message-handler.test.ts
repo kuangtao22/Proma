@@ -48,6 +48,89 @@ function countRateLimitedErrors(socket: FakeWebSocket): number {
 }
 
 describe('LAN Bridge 消息处理器', () => {
+  test('未认证连接发送 pong 并更新活动时间后仍按固定 15 秒截止淘汰', () => {
+    /** 当前可控时间。 */
+    let now = 0
+    /** 当前用例的手动心跳调度器。 */
+    const scheduler = new ManualHeartbeatScheduler()
+    /** 当前用例的测试连接。 */
+    const socket = new FakeWebSocket()
+    /** 当前用例的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      now: () => now,
+      scheduleInterval: scheduler.schedule,
+      clearScheduledInterval: scheduler.clear,
+      uuid: () => 'client-auth-deadline',
+    })
+    /** 尚未认证的客户端。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+    /** 使用生产消息解析路径的处理器。 */
+    const handleMessage = createLanBridgeMessageHandler({
+      sessionManager: manager,
+      now: () => now,
+      dispatch: () => undefined,
+    })
+    manager.startHeartbeat()
+
+    now = 14_999
+    handleMessage(client, Buffer.from(JSON.stringify({ type: 'pong' })))
+    now = 15_000
+    scheduler.tick()
+
+    expect(client.lastActivity).toBe(14_999)
+    expect(client.lastPongAt).toBe(14_999)
+    expect(manager.getClient(client.id)).toBeUndefined()
+    expect(socket.terminateCount).toBe(0)
+  })
+
+  test('未完成协议 hello 的连接不能提交认证材料', () => {
+    const socket = new FakeWebSocket()
+    const manager = new LanBridgeSessionManager(20, { uuid: () => 'client-1' })
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+    let dispatchCount = 0
+    const handleMessage = createLanBridgeMessageHandler({
+      sessionManager: manager,
+      now: () => 1,
+      dispatch: () => { dispatchCount += 1 },
+    })
+
+    handleMessage(client, Buffer.from(JSON.stringify({
+      type: 'auth.verify',
+      id: 'auth-1',
+      data: { token: 'secret-token' },
+    })))
+
+    expect(dispatchCount).toBe(0)
+    expect(JSON.parse(socket.sentMessages.at(-1) ?? '{}')).toMatchObject({
+      type: 'auth.verify',
+      id: 'auth-1',
+      ok: false,
+      errorCode: 'PROTOCOL_UNSUPPORTED',
+    })
+  })
+
+  test('未完成协议 hello 的连接不能通过业务请求携带 Token 绕过协商', () => {
+    const socket = new FakeWebSocket()
+    const manager = new LanBridgeSessionManager(20, { uuid: () => 'client-business' })
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+    let dispatchCount = 0
+    const handleMessage = createLanBridgeMessageHandler({
+      sessionManager: manager,
+      now: () => 1,
+      dispatch: () => { dispatchCount += 1 },
+    })
+
+    handleMessage(client, Buffer.from(JSON.stringify({
+      type: 'conversations.list', id: 'business-1', data: { token: 'secret-token' },
+    })))
+
+    expect(dispatchCount).toBe(0)
+    expect(JSON.parse(socket.sentMessages.at(-1) ?? '{}')).toMatchObject({
+      type: 'conversations.list', id: 'business-1', ok: false,
+      errorCode: 'PROTOCOL_UNSUPPORTED',
+    })
+  })
+
   test('业务配额耗尽后有效 pong 仍更新时间并维持 45 秒心跳窗口', () => {
     let now = 0
     const scheduler = new ManualHeartbeatScheduler()
@@ -59,6 +142,11 @@ describe('LAN Bridge 消息处理器', () => {
       uuid: () => 'client-1',
     })
     const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+    client.authenticated = true
+    client.authExpiresAt = 100_000
+    client.protocolVersion = 2
+    /** 业务消息测试前置条件：连接已完成协议 hello。 */
+    client.protocolVersion = 1
     let dispatchCount = 0
     const handleMessage = createLanBridgeMessageHandler({
       sessionManager: manager,

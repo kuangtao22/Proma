@@ -14,6 +14,8 @@ export interface ClientConnection {
   ip: string
   /** 是否已认证 */
   authenticated: boolean
+  /** hello 成功后协商出的协议主版本；认证前必须存在。 */
+  protocolVersion?: number
   /** 已认证设备唯一标识；未认证或旧连接为空。 */
   deviceId?: string
   /** 当前连接最近一次通过结构化验证的设备 Token。 */
@@ -22,6 +24,8 @@ export interface ClientConnection {
   authExpiresAt?: number
   /** 已订阅的 sessionId 集合 */
   subscriptions: Set<string>
+  /** WebSocket 建立时间；认证截止固定以此计算，不受消息或 pong 影响。 */
+  connectedAt: number
   /** 最后活跃时间 */
   lastActivity: number
   /** 最后收到应用层 pong 的时间 */

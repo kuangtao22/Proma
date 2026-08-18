@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import type { WebSocket } from 'ws'
-import { LanBridgeSessionManager } from './lan-bridge-session'
+import {
+  MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP,
+  UNAUTHENTICATED_CONNECTION_TIMEOUT_MS,
+  LanBridgeSessionManager,
+} from './lan-bridge-session'
 
 /** 测试用 WebSocket，仅记录心跳发送与关闭行为。 */
 class FakeWebSocket {
@@ -48,6 +52,34 @@ class ManualIntervalScheduler {
   }
 }
 
+/** 可手动触发的单次任务调度器，用于验证未认证连接的绝对截止时间。 */
+class ManualTimeoutScheduler {
+  private readonly callbacks = new Map<ReturnType<typeof setTimeout>, () => void>()
+  readonly delays: number[] = []
+  readonly clearedHandles: Array<ReturnType<typeof setTimeout>> = []
+
+  schedule = (callback: () => void, delayMs: number): ReturnType<typeof setTimeout> => {
+    /** 当前单次任务的测试句柄。 */
+    const handle = Symbol('authentication-deadline') as unknown as ReturnType<typeof setTimeout>
+    this.callbacks.set(handle, callback)
+    this.delays.push(delayMs)
+    return handle
+  }
+
+  clear = (handle: ReturnType<typeof setTimeout>): void => {
+    this.clearedHandles.push(handle)
+    this.callbacks.delete(handle)
+  }
+
+  /** 触发仍未被清理的全部单次任务。 */
+  fireAll(): void {
+    for (const [handle, callback] of [...this.callbacks]) {
+      this.callbacks.delete(handle)
+      callback()
+    }
+  }
+}
+
 /** 创建使用可控时间与调度器的会话管理器。 */
 function createHarness(initialNow = 0): {
   manager: LanBridgeSessionManager
@@ -71,6 +103,12 @@ function createHarness(initialNow = 0): {
     socket,
     setNow: value => { now = value },
   }
+}
+
+/** 将测试客户端标记为长时间有效的已认证连接，隔离应用层心跳语义。 */
+function authenticateHeartbeatClient(client: NonNullable<ReturnType<LanBridgeSessionManager['addClient']>>): void {
+  client.authenticated = true
+  client.authExpiresAt = 120_000
 }
 
 describe('LanBridgeSessionManager 设备认证与撤销', () => {
@@ -233,10 +271,180 @@ describe('LanBridgeSessionManager 设备认证与撤销', () => {
 })
 
 describe('LanBridgeSessionManager 应用层心跳', () => {
-  test('新连接在 15 秒收到心跳且不会先断开', () => {
+  test('同一 IP 最多保留 3 个未认证连接，认证后立即释放待认证名额', () => {
+    /** 用于生成不同连接 ID 的序号。 */
+    let nextId = 0
+    /** 当前用例的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      verifyToken: () => ({ valid: true, deviceId: 'device-1', expiresAt: 60_000 }),
+      uuid: () => `client-${++nextId}`,
+    })
+    /** 同一来源 IP 的测试连接。 */
+    const sockets = Array.from(
+      { length: MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP + 2 },
+      () => new FakeWebSocket(),
+    )
+    /** 达到单 IP 上限的待认证客户端。 */
+    const pendingClients = sockets
+      .slice(0, MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP)
+      .map(socket => manager.addClient(socket as unknown as WebSocket, '192.168.1.2'))
+
+    expect(MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP).toBe(3)
+    expect(pendingClients.every(Boolean)).toBeTrue()
+    expect(manager.addClient(
+      sockets[MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP]! as unknown as WebSocket,
+      '192.168.1.2',
+    )).toBeNull()
+    expect(sockets[MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP]!.terminateCount).toBe(1)
+    expect(sockets[MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP]!.closeCalls).toEqual([])
+
+    manager.authenticateFromData(pendingClients[0]!, { token: 'valid-token' })
+
+    expect(manager.addClient(
+      sockets[MAX_UNAUTHENTICATED_CONNECTIONS_PER_IP + 1]! as unknown as WebSocket,
+      '192.168.1.2',
+    )).not.toBeNull()
+  })
+
+  test('达到总连接上限时立即终止未纳管的已升级 WebSocket', () => {
+    /** 总连接上限为一的会话管理器。 */
+    const manager = new LanBridgeSessionManager(1, { uuid: () => 'client-1' })
+    /** 已占用总连接名额的 socket。 */
+    const acceptedSocket = new FakeWebSocket()
+    /** 因总连接数超限而被拒绝的 socket。 */
+    const rejectedSocket = new FakeWebSocket()
+
+    expect(manager.addClient(acceptedSocket as unknown as WebSocket, '192.168.1.2')).not.toBeNull()
+    expect(manager.addClient(rejectedSocket as unknown as WebSocket, '192.168.1.3')).toBeNull()
+
+    expect(rejectedSocket.terminateCount).toBe(1)
+    expect(rejectedSocket.closeCalls).toEqual([])
+    expect(manager.connectionCount).toBe(1)
+  })
+
+  test('心跳 tick 后建立的未认证连接仍在 connectedAt 起 15 秒准时终止', () => {
+    /** 当前可控时间，模拟连接恰好建立在心跳 tick 之后。 */
+    let now = 15_001
+    /** 当前用例的单次 deadline 调度器。 */
+    const timeoutScheduler = new ManualTimeoutScheduler()
+    /** 使用独立 deadline 的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      now: () => now,
+      scheduleTimeout: timeoutScheduler.schedule,
+      clearScheduledTimeout: timeoutScheduler.clear,
+      uuid: () => 'phase-offset-client',
+    })
+    /** 心跳相位偏移下建立的待认证 socket。 */
+    const socket = new FakeWebSocket()
+    /** 心跳相位偏移下建立的待认证客户端。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+
+    expect(timeoutScheduler.delays).toEqual([UNAUTHENTICATED_CONNECTION_TIMEOUT_MS])
+
+    now = client.connectedAt + UNAUTHENTICATED_CONNECTION_TIMEOUT_MS
+    timeoutScheduler.fireAll()
+
+    expect(manager.getClient(client.id)).toBeUndefined()
+    expect(socket.closeCalls).toEqual([{
+      code: 1008,
+      reason: 'Authentication timeout',
+    }])
+  })
+
+  test('deadline 回调延迟时也不允许在 15 秒截止点抢先认证', () => {
+    /** 当前可控时间，用于模拟事件循环阻塞导致 timer 尚未回调。 */
+    let now = 0
+    /** 当前用例的单次 deadline 调度器。 */
+    const timeoutScheduler = new ManualTimeoutScheduler()
+    /** 能验证 Token 但必须执行绝对期限检查的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      now: () => now,
+      scheduleTimeout: timeoutScheduler.schedule,
+      clearScheduledTimeout: timeoutScheduler.clear,
+      verifyToken: () => ({ valid: true, deviceId: 'device-1', expiresAt: 60_000 }),
+      uuid: () => 'delayed-deadline-client',
+    })
+    /** 尚未执行 deadline 回调的待认证 socket。 */
+    const socket = new FakeWebSocket()
+    /** 尚未执行 deadline 回调的待认证客户端。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+
+    now = client.connectedAt + UNAUTHENTICATED_CONNECTION_TIMEOUT_MS
+
+    expect(manager.authenticateFromData(client, { token: 'valid-token' })).toBeFalse()
+    expect(manager.getClient(client.id)).toBeUndefined()
+    expect(socket.closeCalls).toEqual([{
+      code: 1008,
+      reason: 'Authentication timeout',
+    }])
+  })
+
+  test('认证、显式移除与整体关闭都会清理未认证 deadline timer', () => {
+    /** 用于生成不同连接 ID 的序号。 */
+    let nextId = 0
+    /** 当前用例的单次 deadline 调度器。 */
+    const timeoutScheduler = new ManualTimeoutScheduler()
+    /** 可认证且使用受控 deadline 的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      scheduleTimeout: timeoutScheduler.schedule,
+      clearScheduledTimeout: timeoutScheduler.clear,
+      verifyToken: () => ({ valid: true, deviceId: 'device-1', expiresAt: 60_000 }),
+      uuid: () => `client-${++nextId}`,
+    })
+    /** 将通过认证释放 timer 的客户端。 */
+    const authenticatedClient = manager.addClient(
+      new FakeWebSocket() as unknown as WebSocket,
+      '192.168.1.2',
+    )!
+    /** 将通过显式移除释放 timer 的客户端。 */
+    const removedClient = manager.addClient(
+      new FakeWebSocket() as unknown as WebSocket,
+      '192.168.1.3',
+    )!
+    /** 将由 closeAll 释放 timer 的客户端。 */
+    manager.addClient(new FakeWebSocket() as unknown as WebSocket, '192.168.1.4')
+
+    authenticatedClient.authenticated = true
+    expect(manager.synchronizeAuthenticationState(authenticatedClient)).toBeTrue()
+    manager.removeClient(removedClient.id)
+    manager.closeAll()
+
+    expect(timeoutScheduler.clearedHandles).toHaveLength(3)
+    timeoutScheduler.fireAll()
+    expect(manager.connectionCount).toBe(0)
+  })
+
+  test('未认证连接到达 15 秒截止时间后关闭，pong 不能延长占槽时间', () => {
+    /** 使用可控时间的会话测试环境。 */
+    const harness = createHarness()
+    /** 尚未认证的客户端。 */
+    const client = harness.manager.addClient(
+      harness.socket as unknown as WebSocket,
+      '192.168.1.2',
+    )!
+    harness.manager.startHeartbeat()
+
+    harness.setNow(UNAUTHENTICATED_CONNECTION_TIMEOUT_MS - 1)
+    harness.manager.markPong(client)
+    harness.setNow(UNAUTHENTICATED_CONNECTION_TIMEOUT_MS)
+    harness.scheduler.tick()
+
+    expect(UNAUTHENTICATED_CONNECTION_TIMEOUT_MS).toBe(15_000)
+    expect(client.lastPongAt).toBe(UNAUTHENTICATED_CONNECTION_TIMEOUT_MS - 1)
+    expect(harness.manager.getClient(client.id)).toBeUndefined()
+    expect(harness.socket.closeCalls).toEqual([{
+      code: 1008,
+      reason: 'Authentication timeout',
+    }])
+    expect(harness.socket.terminateCount).toBe(0)
+    expect(harness.socket.sentMessages).toEqual([])
+  })
+
+  test('已认证新连接在 15 秒收到心跳且不会先断开', () => {
     const harness = createHarness()
     const client = harness.manager.addClient(harness.socket as unknown as WebSocket, '192.168.1.2')
     expect(client).not.toBeNull()
+    authenticateHeartbeatClient(client!)
 
     harness.manager.startHeartbeat()
     harness.setNow(15_000)
@@ -250,6 +458,7 @@ describe('LanBridgeSessionManager 应用层心跳', () => {
   test('15,001 毫秒收到 pong 后，到 60,000 毫秒仍保留连接', () => {
     const harness = createHarness()
     const client = harness.manager.addClient(harness.socket as unknown as WebSocket, '192.168.1.2')!
+    authenticateHeartbeatClient(client)
     harness.manager.startHeartbeat()
 
     harness.setNow(15_001)
@@ -264,6 +473,7 @@ describe('LanBridgeSessionManager 应用层心跳', () => {
   test('从最后 pong 起达到 45 秒时终止并删除连接', () => {
     const harness = createHarness()
     const client = harness.manager.addClient(harness.socket as unknown as WebSocket, '192.168.1.2')!
+    authenticateHeartbeatClient(client)
     harness.manager.startHeartbeat()
 
     harness.manager.markPong(client, 15_000)
@@ -275,9 +485,10 @@ describe('LanBridgeSessionManager 应用层心跳', () => {
     expect(harness.socket.sentMessages).toEqual([])
   })
 
-  test('未回复的新连接拥有完整 45 秒窗口', () => {
+  test('已认证且未回复的新连接拥有完整 45 秒窗口', () => {
     const harness = createHarness()
     const client = harness.manager.addClient(harness.socket as unknown as WebSocket, '192.168.1.2')!
+    authenticateHeartbeatClient(client)
     harness.manager.startHeartbeat()
 
     for (const now of [15_000, 30_000]) {
@@ -321,7 +532,8 @@ describe('LanBridgeSessionManager 应用层心跳', () => {
 
   test('连续启动心跳时清理首个 timer 并仅保留第二个有效', () => {
     const harness = createHarness()
-    harness.manager.addClient(harness.socket as unknown as WebSocket, '192.168.1.2')
+    const client = harness.manager.addClient(harness.socket as unknown as WebSocket, '192.168.1.2')!
+    authenticateHeartbeatClient(client)
 
     harness.manager.startHeartbeat()
     const firstHandle = harness.scheduler.scheduledHandles[0]
@@ -360,6 +572,8 @@ describe('LanBridgeSessionManager 应用层心跳', () => {
     const healthySocket = new FakeWebSocket()
     const throwingClient = manager.addClient(throwingSocket as unknown as WebSocket, '192.168.1.2')!
     const healthyClient = manager.addClient(healthySocket as unknown as WebSocket, '192.168.1.3')!
+    authenticateHeartbeatClient(throwingClient)
+    authenticateHeartbeatClient(healthyClient)
     manager.markPong(healthyClient, 15_000)
     manager.startHeartbeat()
 

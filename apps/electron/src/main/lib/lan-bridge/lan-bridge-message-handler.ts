@@ -81,6 +81,16 @@ export function createLanBridgeMessageHandler(
     const request = parsed as ParsedRequest
     const data = isRecord(request.data) ? request.data : {}
     const id = typeof request.id === 'string' ? request.id : undefined
+    if (parsed.type !== 'protocol.hello' && client.protocolVersion === undefined) {
+      dependencies.sessionManager.send(client, {
+        type: parsed.type,
+        id,
+        ok: false,
+        error: 'Protocol negotiation required',
+        errorCode: 'PROTOCOL_UNSUPPORTED',
+      })
+      return
+    }
     dependencies.dispatch(client, parsed.type, data, id)
   }
 }

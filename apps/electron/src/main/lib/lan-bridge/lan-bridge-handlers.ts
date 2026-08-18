@@ -8,8 +8,11 @@ import { registerRoute } from './lan-bridge-router'
 import type { LanBridgeAuthService, TokenVerificationResult } from './lan-bridge-auth'
 import type { ClientConnection, RouteHandler } from './lan-bridge-types'
 import type { LanBridgeSessionManager } from './lan-bridge-session'
+import { isValidLanBridgeSessionId } from './lan-bridge-proma-adapter-core'
 import type { LanBridgePromaAdapter } from './lan-bridge-proma-adapter-core'
 import {
+  LAN_BRIDGE_MAX_PROTOCOL_VERSION,
+  LAN_BRIDGE_MIN_PROTOCOL_VERSION,
   LAN_BRIDGE_PROTOCOL_VERSION,
   LAN_BRIDGE_WS_CAPABILITIES,
 } from '@proma/shared'
@@ -20,6 +23,8 @@ export function createLanBridgeConnectedPayload(serverVersion: string): LanBridg
   return {
     message: 'Proma LAN Bridge',
     protocolVersion: LAN_BRIDGE_PROTOCOL_VERSION,
+    minProtocolVersion: LAN_BRIDGE_MIN_PROTOCOL_VERSION,
+    maxProtocolVersion: LAN_BRIDGE_MAX_PROTOCOL_VERSION,
     serverVersion,
     capabilities: [...LAN_BRIDGE_WS_CAPABILITIES],
   }
@@ -47,6 +52,7 @@ export function registerLanBridgeHandlers(dependencies: LanBridgeHandlerDependen
   ): RouteHandler => (client, data) => handler(dependencies, client, data)
 
   registerRoute('auth.pair', bind(handlePair))
+  registerRoute('protocol.hello', bind(handleProtocolHello))
   registerRoute('auth.pairTicket', bind(handlePairTicket))
   registerRoute('auth.verify', bind(handleVerify))
   registerRoute('auth.refresh', bind(handleRefresh))
@@ -67,6 +73,28 @@ export function registerLanBridgeHandlers(dependencies: LanBridgeHandlerDependen
   registerRoute('conversations.stop', bind(handleConversationStop))
   registerRoute('settings.get', bind(handleSettingsGet))
   registerRoute('settings.channels', bind(handleSettingsChannels))
+}
+
+/** 在任何认证材料提交前协商双方共同支持的协议主版本。 */
+function handleProtocolHello(
+  _context: LanBridgeHandlerDependencies,
+  client: ClientConnection,
+  data: Record<string, unknown>,
+) {
+  /** 客户端声明的最低主版本。 */
+  const minimum = data.minProtocolVersion
+  /** 客户端声明的最高主版本。 */
+  const maximum = data.maxProtocolVersion
+  if (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum)
+    || (minimum as number) > (maximum as number)
+    || (maximum as number) < LAN_BRIDGE_MIN_PROTOCOL_VERSION
+    || (minimum as number) > LAN_BRIDGE_MAX_PROTOCOL_VERSION) {
+    throw Object.assign(new Error('Protocol version unsupported'), { errorCode: 'PROTOCOL_UNSUPPORTED' })
+  }
+  /** 当前范围只有一个稳定主版本；显式记录到连接状态供认证门禁使用。 */
+  const protocolVersion = Math.min(maximum as number, LAN_BRIDGE_MAX_PROTOCOL_VERSION)
+  client.protocolVersion = protocolVersion
+  return { protocolVersion, capabilities: [...LAN_BRIDGE_WS_CAPABILITIES] }
 }
 
 // ===== 认证 =====
@@ -166,6 +194,7 @@ function handleConversationMessages(context: LanBridgeHandlerDependencies, clien
   if (!conversationId) {
     throw Object.assign(new Error('conversationId required'), { errorCode: 'VALIDATION_ERROR' })
   }
+  requireExistingConversation(context.promaAdapter, conversationId)
   const allMessages = context.promaAdapter.getConversationMessages(conversationId)
   const limit = typeof data.limit === 'number' ? data.limit : 100
   const messages = limit > 0 ? allMessages.slice(-limit) : allMessages
@@ -202,6 +231,7 @@ function handleAgentSessionMessages(context: LanBridgeHandlerDependencies, clien
   if (!sessionId) {
     throw Object.assign(new Error('sessionId required'), { errorCode: 'VALIDATION_ERROR' })
   }
+  requireExistingAgentSession(context.promaAdapter, sessionId)
   const allMessages = context.promaAdapter.getAgentMessages(sessionId)
   const limit = typeof data.limit === 'number' ? data.limit : 100
   const messages = limit > 0 ? allMessages.slice(-limit) : allMessages
@@ -231,6 +261,8 @@ function handleSubscribe(context: LanBridgeHandlerDependencies, client: ClientCo
   if (!id) {
     throw Object.assign(new Error('sessionId or conversationId required'), { errorCode: 'VALIDATION_ERROR' })
   }
+  if (data.sessionId !== undefined) requireExistingAgentSession(context.promaAdapter, id)
+  if (data.conversationId !== undefined) requireExistingConversation(context.promaAdapter, id)
   client.subscriptions.add(id)
   return { subscribed: id }
 }
@@ -239,6 +271,8 @@ function handleUnsubscribe(context: LanBridgeHandlerDependencies, client: Client
   requireAuth(context.authService, client, data)
   const id = (data.sessionId ?? data.conversationId) as string | undefined
   if (id) {
+    if (data.sessionId !== undefined) requireExistingAgentSession(context.promaAdapter, id)
+    if (data.conversationId !== undefined) requireExistingConversation(context.promaAdapter, id)
     client.subscriptions.delete(id)
   }
   return { unsubscribed: id }
@@ -263,6 +297,7 @@ function handleAgentSend(context: LanBridgeHandlerDependencies, client: ClientCo
   if (!sessionId || !userMessage) {
     throw Object.assign(new Error('sessionId and userMessage required'), { errorCode: 'VALIDATION_ERROR' })
   }
+  requireExistingAgentSession(context.promaAdapter, sessionId)
 
   if (context.promaAdapter.isAgentSessionActive(sessionId)) {
     throw Object.assign(new Error('Agent session is already running'), { errorCode: 'SESSION_ACTIVE' })
@@ -322,6 +357,7 @@ function handleAgentStop(context: LanBridgeHandlerDependencies, client: ClientCo
   if (!sessionId) {
     throw Object.assign(new Error('sessionId required'), { errorCode: 'VALIDATION_ERROR' })
   }
+  requireExistingAgentSession(context.promaAdapter, sessionId)
   context.promaAdapter.stopAgent(sessionId)
   return { stopped: true, sessionId }
 }
@@ -335,6 +371,7 @@ function handleConversationSend(context: LanBridgeHandlerDependencies, client: C
   if (!conversationId || !userMessage) {
     throw Object.assign(new Error('conversationId and userMessage required'), { errorCode: 'VALIDATION_ERROR' })
   }
+  requireExistingConversation(context.promaAdapter, conversationId)
 
   /** 默认渠道和模型通过稳定设置 DTO 解析。 */
   const settings = context.promaAdapter.getSettings()
@@ -379,6 +416,7 @@ function handleConversationStop(context: LanBridgeHandlerDependencies, client: C
   if (!conversationId) {
     throw Object.assign(new Error('conversationId required'), { errorCode: 'VALIDATION_ERROR' })
   }
+  requireExistingConversation(context.promaAdapter, conversationId)
   context.promaAdapter.stopConversation(conversationId)
   return { stopped: true, conversationId }
 }
@@ -420,6 +458,26 @@ function requireAuth(
   const verification = authService.verifyTokenDetails(token, client.ip)
   if (!verification.valid) throwAuthError(verification.errorCode)
   markAuthenticated(client, token, verification.deviceId, verification.expiresAt)
+}
+
+/** 在 Handler 边界拒绝路径型 ID，并确认目标 Agent 会话真实存在。 */
+function requireExistingAgentSession(adapter: LanBridgePromaAdapter, sessionId: unknown): asserts sessionId is string {
+  if (!isValidLanBridgeSessionId(sessionId)) {
+    throw Object.assign(new Error('无效的会话 ID'), { errorCode: 'VALIDATION_ERROR' })
+  }
+  if (!adapter.hasAgentSession(sessionId)) {
+    throw Object.assign(new Error('会话不存在'), { errorCode: 'NOT_FOUND' })
+  }
+}
+
+/** 在 Handler 边界拒绝路径型 ID，并确认目标普通对话真实存在。 */
+function requireExistingConversation(adapter: LanBridgePromaAdapter, conversationId: unknown): asserts conversationId is string {
+  if (!isValidLanBridgeSessionId(conversationId)) {
+    throw Object.assign(new Error('无效的会话 ID'), { errorCode: 'VALIDATION_ERROR' })
+  }
+  if (!adapter.hasConversation(conversationId)) {
+    throw Object.assign(new Error('会话不存在'), { errorCode: 'NOT_FOUND' })
+  }
 }
 
 /** 同时提交连接认证布尔、设备 ID 和已验证 Token。 */

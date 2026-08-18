@@ -6,7 +6,7 @@
  *
  */
 
-import { join, basename } from 'node:path'
+import { join, basename, relative, resolve } from 'node:path'
 import { mkdirSync, existsSync, cpSync, rmSync, readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { rmSyncWithRetry } from './fs-retry'
@@ -81,7 +81,8 @@ export function getConversationsDir(): string {
  * @returns ~/.proma/conversations/{id}.jsonl
  */
 export function getConversationMessagesPath(id: string): string {
-  return join(getConversationsDir(), `${id}.jsonl`)
+  assertSafeSessionPathSegment(id)
+  return resolveContainedDataFile(getConversationsDir(), id)
 }
 
 /**
@@ -218,7 +219,8 @@ export function getAgentSessionsDir(): string {
  * @returns ~/.proma/agent-sessions/{id}.jsonl
  */
 export function getAgentSessionMessagesPath(id: string): string {
-  return join(getAgentSessionsDir(), `${id}.jsonl`)
+  assertSafeSessionPathSegment(id)
+  return resolveContainedDataFile(getAgentSessionsDir(), id)
 }
 
 /**
@@ -338,7 +340,8 @@ export function resolveWorkspaceFilesDir(slug: string): string {
  * @returns ~/.proma/agent-workspaces/{slug}/{sessionId}/
  */
 export function resolveAgentSessionWorkspacePath(slug: string, sessionId: string): string {
-  return join(getConfigDir(), 'agent-workspaces', slug, sessionId)
+  assertSafeSessionPathSegment(sessionId)
+  return resolveContainedSessionPath(join(getConfigDir(), 'agent-workspaces', slug), sessionId)
 }
 
 /**
@@ -641,7 +644,8 @@ export function getFeishuBotMetadataPath(botId: string): string {
  * @returns ~/.proma/agent-workspaces/{slug}/{sessionId}/
  */
 export function getAgentSessionWorkspacePath(workspaceSlug: string, sessionId: string): string {
-  const dir = join(getAgentWorkspacePath(workspaceSlug), sessionId)
+  assertSafeSessionPathSegment(sessionId)
+  const dir = resolveContainedSessionPath(getAgentWorkspacePath(workspaceSlug), sessionId)
 
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true })
@@ -649,6 +653,39 @@ export function getAgentSessionWorkspacePath(workspaceSlug: string, sessionId: s
   }
 
   return dir
+}
+
+/** 拒绝可改变目录层级或平台路径语义的会话 ID。 */
+function assertSafeSessionPathSegment(sessionId: string): void {
+  if (!sessionId || sessionId === '.' || sessionId === '..'
+    || sessionId.includes('/') || sessionId.includes('\\') || sessionId.includes('\0')) {
+    throw new Error('无效的会话 ID')
+  }
+}
+
+/** 解析会话目录并再次确认结果仍严格位于工作区根目录内。 */
+function resolveContainedSessionPath(workspacePath: string, sessionId: string): string {
+  /** 绝对化根目录，避免相对路径影响包含关系判断。 */
+  const root = resolve(workspacePath)
+  /** 使用 resolve 后再做 relative 判断，阻止其他调用者绕过入口校验。 */
+  const candidate = resolve(root, sessionId)
+  const relativePath = relative(root, candidate)
+  if (!relativePath || relativePath.startsWith('..') || relativePath.includes('/') || relativePath.includes('\\')) {
+    throw new Error('无效的会话 ID')
+  }
+  return candidate
+}
+
+/** 解析单实体 JSONL 文件并确认结果仍位于指定数据目录内。 */
+function resolveContainedDataFile(dataDirectory: string, entityId: string): string {
+  /** 文件扩展名由应用固定追加，调用方只能控制已验证的单段 ID。 */
+  const root = resolve(dataDirectory)
+  const candidate = resolve(root, `${entityId}.jsonl`)
+  const relativePath = relative(root, candidate)
+  if (!relativePath || relativePath.startsWith('..') || relativePath.includes('/') || relativePath.includes('\\')) {
+    throw new Error('无效的会话 ID')
+  }
+  return candidate
 }
 
 /**

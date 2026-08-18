@@ -117,6 +117,110 @@ async function captureWsClientError(request: Promise<unknown>): Promise<WsClient
 }
 
 describe('移动端 WebSocket 请求生命周期', () => {
+  test('Given 服务端当前主版本为 3 且范围包含 v2 When hello 协商到 v2 Then 配对能力仅在协商后推送', async () => {
+    const { client, sockets } = createHarness()
+    /** 记录交给业务层的可信协商结果。 */
+    const connectedPayloads: unknown[] = []
+    client.onPush((message) => {
+      if (message.type !== 'connected') return
+      connectedPayloads.push(message.data)
+      /** 模拟配对协调器在收到能力后提交一次性凭据。 */
+      void client.wsReq('auth.pairTicket', { ticket: 'ticket-secret' })
+    })
+    client.connect('127.0.0.1', '7788')
+    sockets[0].open()
+
+    sockets[0].receive({
+      type: 'connected',
+      data: {
+        message: 'Proma LAN Bridge',
+        protocolVersion: 3,
+        minProtocolVersion: 2,
+        maxProtocolVersion: 3,
+        serverVersion: 'future',
+        capabilities: ['pairing-ticket'],
+      },
+    })
+    const hello = JSON.parse(sockets[0].sent[0] ?? '{}') as { id: string; type: string }
+    expect(hello.type).toBe('protocol.hello')
+    expect(connectedPayloads).toEqual([])
+    expect(sockets[0].sent.some(frame => frame.includes('ticket-secret'))).toBe(false)
+
+    sockets[0].receive({
+      type: 'protocol.hello', id: hello.id, ok: true,
+      data: { protocolVersion: 2, capabilities: ['pairing-ticket'] },
+    })
+    await Promise.resolve()
+
+    expect(connectedPayloads).toEqual([
+      { protocolVersion: 2, capabilities: ['pairing-ticket'] },
+    ])
+    expect(sockets[0].sent.some(frame => frame.includes('ticket-secret'))).toBe(true)
+    /** 结算测试中的票据请求，确保不遗留 pending 或 timeout。 */
+    const pairingRequest = JSON.parse(sockets[0].sent[1] ?? '{}') as { id: string; type: string }
+    sockets[0].receive({
+      type: 'auth.pairTicket', id: pairingRequest.id, ok: true,
+      data: { token: 'issued-token' },
+    })
+    expect(client.pendingCount()).toBe(0)
+  })
+
+  test('Given 已保存 Token When 收到兼容 connected Then hello 成功后才发送认证请求', async () => {
+    const { client, sockets } = createHarness()
+    client.connect('127.0.0.1', '7788')
+    sockets[0].open()
+
+    const verification = client.wsReq('auth.verify', { token: 'saved-secret' })
+    expect(sockets[0].sent).toEqual([])
+
+    sockets[0].receive({
+      type: 'connected',
+      data: {
+        message: 'Proma LAN Bridge',
+        protocolVersion: 2,
+        minProtocolVersion: 2,
+        maxProtocolVersion: 2,
+        serverVersion: '0.17.42',
+        capabilities: ['pairing-ticket'],
+      },
+    })
+    const hello = JSON.parse(sockets[0].sent[0] ?? '{}') as { id: string; type: string; data: object }
+    expect(hello).toMatchObject({
+      type: 'protocol.hello',
+      data: { minProtocolVersion: 2, maxProtocolVersion: 2 },
+    })
+    expect(sockets[0].sent.some(frame => frame.includes('saved-secret'))).toBe(false)
+
+    sockets[0].receive({
+      type: 'protocol.hello', id: hello.id, ok: true,
+      data: { protocolVersion: 2, capabilities: ['pairing-ticket'] },
+    })
+    await Promise.resolve()
+    const auth = JSON.parse(sockets[0].sent[1] ?? '{}') as { id: string; type: string }
+    expect(auth.type).toBe('auth.verify')
+    sockets[0].receive({ type: 'auth.verify', id: auth.id, ok: true, data: { valid: true } })
+    expect(await verification).toEqual({ valid: true })
+  })
+
+  test('Given connected 主版本不兼容 When 已排队认证 Then 不发送 hello 或 Token 并稳定拒绝', async () => {
+    const { client, sockets } = createHarness()
+    client.connect('127.0.0.1', '7788')
+    sockets[0].open()
+    const verification = client.wsReq('auth.verify', { token: 'saved-secret' })
+
+    sockets[0].receive({
+      type: 'connected',
+      data: {
+        message: 'Proma LAN Bridge', protocolVersion: 3,
+        minProtocolVersion: 3, maxProtocolVersion: 3,
+        serverVersion: 'future', capabilities: ['pairing-ticket'],
+      },
+    })
+
+    await expect(verification).rejects.toMatchObject({ code: 'PROTOCOL_UNSUPPORTED' })
+    expect(sockets[0].sent).toEqual([])
+  })
+
   test('Given 请求挂起 When 网络断开 Then 立即以 CONNECTION_LOST 拒绝并清理 timeout', async () => {
     const { client, scheduler, sockets } = createHarness()
     client.connect('127.0.0.1', '7788')

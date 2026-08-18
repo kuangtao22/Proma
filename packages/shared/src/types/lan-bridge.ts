@@ -8,6 +8,12 @@
 /** 当前 LAN Bridge 协议主版本。 */
 export const LAN_BRIDGE_PROTOCOL_VERSION = 2
 
+/** 客户端与服务端当前可协商的最低协议主版本。 */
+export const LAN_BRIDGE_MIN_PROTOCOL_VERSION = 2
+
+/** 客户端与服务端当前可协商的最高协议主版本。 */
+export const LAN_BRIDGE_MAX_PROTOCOL_VERSION = LAN_BRIDGE_PROTOCOL_VERSION
+
 /** 当前服务端稳定支持的 LAN Bridge 能力集合。 */
 export const LAN_BRIDGE_CAPABILITIES = [
   'pin-pairing',
@@ -32,7 +38,21 @@ export const LAN_BRIDGE_WS_CAPABILITIES = [
 export interface LanBridgeConnectedPayload {
   message: string
   protocolVersion: number
+  minProtocolVersion: number
+  maxProtocolVersion: number
   serverVersion: string
+  capabilities: LanBridgeCapability[]
+}
+
+/** 客户端在提交认证材料前声明的协议支持范围。 */
+export interface LanBridgeProtocolHelloInput {
+  minProtocolVersion: number
+  maxProtocolVersion: number
+}
+
+/** 服务端确认的协议主版本和本连接可用能力。 */
+export interface LanBridgeProtocolHelloResult {
+  protocolVersion: number
   capabilities: LanBridgeCapability[]
 }
 

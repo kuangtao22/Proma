@@ -49,8 +49,8 @@ describe('移动端启动配对协调器', () => {
     }
 
     await Promise.all([
-      coordinator.handleConnected({ capabilities: ['pairing-ticket'] }, callbacks),
-      coordinator.handleConnected({ capabilities: ['pairing-ticket'] }, callbacks),
+      coordinator.handleConnected({ protocolVersion: 2, capabilities: ['pairing-ticket'] }, callbacks),
+      coordinator.handleConnected({ protocolVersion: 2, capabilities: ['pairing-ticket'] }, callbacks),
     ])
 
     expect(submittedTickets).toEqual(['ticket-1'])
@@ -100,8 +100,8 @@ describe('移动端启动配对协调器', () => {
       onFallback: (message: string) => fallbacks.push(message),
     }
 
-    await coordinator.handleConnected({ capabilities: ['pairing-ticket'] }, callbacks)
-    await coordinator.handleConnected({ capabilities: ['pairing-ticket'] }, callbacks)
+    await coordinator.handleConnected({ protocolVersion: 2, capabilities: ['pairing-ticket'] }, callbacks)
+    await coordinator.handleConnected({ protocolVersion: 2, capabilities: ['pairing-ticket'] }, callbacks)
 
     expect(requestCount).toBe(1)
     expect(fallbacks).toEqual(['连接中断，请检查网络后使用 PIN 码重试'])
@@ -146,7 +146,7 @@ describe('移动端启动配对协调器', () => {
       onPairingCancelled: () => { pairingPending = false },
     })
     /** 保持请求 pending，模拟用户在响应前修改地址。 */
-    const pairingRequest = coordinator.handleConnected({ capabilities: ['pairing-ticket'] }, {
+    const pairingRequest = coordinator.handleConnected({ protocolVersion: 2, capabilities: ['pairing-ticket'] }, {
       requestPairTicket: () => deferred.promise,
       onAuthenticated: token => savedTokens.push(token),
       onFallback: () => undefined,
@@ -179,7 +179,7 @@ describe('移动端启动配对协调器', () => {
       cleanUrl: 'http://192.168.1.2:29888/',
     })
     /** 启动后保持 pending 的自动配对请求。 */
-    const pairingRequest = coordinator.handleConnected({ capabilities: ['pairing-ticket'] }, {
+    const pairingRequest = coordinator.handleConnected({ protocolVersion: 2, capabilities: ['pairing-ticket'] }, {
       requestPairTicket: () => deferred.promise,
       onAuthenticated: () => undefined,
       onFallback: message => fallbacks.push(message),

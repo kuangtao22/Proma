@@ -88,7 +88,7 @@ jobs:
       - name: Check fork compatibility seams
         run: bun run --filter='@proma/electron' check:fork-compat
       - name: Run LAN and mobile targeted tests
-        run: bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib
+        run: bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/config-paths.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib
       - name: Build mobile app
         run: bun run --filter='@proma/mobile' build
       - name: Typecheck all workspaces
@@ -1776,6 +1776,15 @@ broken: [
   })
 
   /** targeted tests 必须真实执行 checker 与 helper 测试文件。 */
+  test('Given targeted tests 包含配置路径防线 When 检查 workflow Then 允许执行', () => {
+    /** 基准工作流必须直接携带底层 JSONL 路径边界测试。 */
+    const workflow = validWorkflow
+    const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+    expect(workflow).toContain('apps/electron/src/main/lib/config-paths.test.ts')
+    expect(getCheck(files, 'workflow-definition').passed).toBe(true)
+  })
+
   const invalidTargetedTestCases = [
     {
       name: '缺少 helper test',
@@ -1795,6 +1804,11 @@ broken: [
     {
       name: '缺少 checker test',
       target: 'apps/electron/scripts/check-fork-compat.test.ts ',
+      replacement: '',
+    },
+    {
+      name: '缺少配置路径防线 test',
+      target: ' apps/electron/src/main/lib/config-paths.test.ts',
       replacement: '',
     },
   ]
@@ -2056,8 +2070,8 @@ broken: [
     },
     {
       name: 'targeted tests',
-      target: 'run: bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib',
-      replacement: 'run: echo "bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib"',
+      target: 'run: bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/config-paths.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib',
+      replacement: 'run: echo "bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/config-paths.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib"',
     },
     {
       name: 'mobile build',

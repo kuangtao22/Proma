@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import {
   LAN_BRIDGE_CAPABILITIES,
+  LAN_BRIDGE_MAX_PROTOCOL_VERSION,
+  LAN_BRIDGE_MIN_PROTOCOL_VERSION,
   LAN_BRIDGE_PROTOCOL_VERSION,
   LAN_BRIDGE_WS_CAPABILITIES,
   type LanBridgeConnectedPayload,
@@ -14,6 +16,8 @@ describe('LAN Bridge 协议协商', () => {
     const payload: LanBridgeConnectedPayload = {
       message: 'Proma LAN Bridge',
       protocolVersion: LAN_BRIDGE_PROTOCOL_VERSION,
+      minProtocolVersion: LAN_BRIDGE_MIN_PROTOCOL_VERSION,
+      maxProtocolVersion: LAN_BRIDGE_MAX_PROTOCOL_VERSION,
       serverVersion: '0.17.42',
       capabilities: [...LAN_BRIDGE_WS_CAPABILITIES],
     }
@@ -48,6 +52,8 @@ describe('LAN Bridge 协议协商', () => {
     expect(createLanBridgeConnectedPayload(electronPackage.version)).toEqual({
       message: 'Proma LAN Bridge',
       protocolVersion: LAN_BRIDGE_PROTOCOL_VERSION,
+      minProtocolVersion: LAN_BRIDGE_MIN_PROTOCOL_VERSION,
+      maxProtocolVersion: LAN_BRIDGE_MAX_PROTOCOL_VERSION,
       serverVersion: electronPackage.version,
       capabilities: [...LAN_BRIDGE_WS_CAPABILITIES],
     })

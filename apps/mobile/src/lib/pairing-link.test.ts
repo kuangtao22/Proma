@@ -71,8 +71,10 @@ describe('移动端一次性配对链接', () => {
     expect(replacements).toHaveLength(1)
   })
 
-  test('Given 服务端 connected 能力 When 判断票据兼容性 Then 仅明确声明能力时启用', () => {
-    expect(supportsPairingTicket({ capabilities: ['pin-pairing', 'pairing-ticket'] })).toBe(true)
+  test('Given hello 已协商且声明票据能力 When 判断配对能力 Then 只接受客户端支持范围内的协商版本', () => {
+    expect(supportsPairingTicket({ protocolVersion: 2, capabilities: ['pin-pairing', 'pairing-ticket'] })).toBe(true)
+    expect(supportsPairingTicket({ protocolVersion: 3, capabilities: ['pairing-ticket'] })).toBe(false)
+    expect(supportsPairingTicket({ capabilities: ['pairing-ticket'] })).toBe(false)
     expect(supportsPairingTicket({ capabilities: ['pin-pairing'] })).toBe(false)
     expect(supportsPairingTicket({ capabilities: 'pairing-ticket' })).toBe(false)
     expect(supportsPairingTicket(null)).toBe(false)

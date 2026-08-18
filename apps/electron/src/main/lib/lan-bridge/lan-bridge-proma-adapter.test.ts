@@ -121,6 +121,61 @@ function createDependencies(): LanBridgePromaDependencies {
 }
 
 describe('LAN Bridge Proma Adapter', () => {
+  test('外部 sessionId 为 traversal 或不存在实体时拒绝读取消息', () => {
+    let readCount = 0
+    const dependencies: LanBridgePromaDependencies = {
+      ...createDependencies(),
+      getAgentSessionMessages: () => {
+        readCount += 1
+        return []
+      },
+    }
+    const adapter = createLanBridgePromaAdapter(dependencies)
+
+    expect(() => adapter.getAgentMessages('../agent-1')).toThrow('无效的会话 ID')
+    expect(() => adapter.getAgentMessages('missing-agent')).toThrow('会话不存在')
+    expect(readCount).toBe(0)
+  })
+
+  test('外部 sessionId 为 traversal 或不存在实体时拒绝发送 Agent 消息', async () => {
+    let sendCount = 0
+    const dependencies: LanBridgePromaDependencies = {
+      ...createDependencies(),
+      runAgentHeadless: async () => { sendCount += 1 },
+    }
+    const adapter = createLanBridgePromaAdapter(dependencies)
+
+    await expect(adapter.sendAgent({ sessionId: '../agent-1', userMessage: '越界' }, {}))
+      .rejects.toThrow('无效的会话 ID')
+    await expect(adapter.sendAgent({ sessionId: 'missing-agent', userMessage: '不存在' }, {}))
+      .rejects.toThrow('会话不存在')
+    expect(sendCount).toBe(0)
+  })
+
+  test('外部 conversationId 为 traversal 或不存在实体时拒绝读取与发送', async () => {
+    let readCount = 0
+    let sendCount = 0
+    const dependencies: LanBridgePromaDependencies = {
+      ...createDependencies(),
+      getConversationMessages: () => {
+        readCount += 1
+        return []
+      },
+      sendConversationMessage: async () => { sendCount += 1 },
+    }
+    const adapter = createLanBridgePromaAdapter(dependencies)
+
+    expect(() => adapter.getConversationMessages('../conversation-1')).toThrow('无效的会话 ID')
+    expect(() => adapter.getConversationMessages('missing-conversation')).toThrow('会话不存在')
+    await expect(adapter.sendConversation({
+      conversationId: '../conversation-1', userMessage: '越界',
+    }, {})).rejects.toThrow('无效的会话 ID')
+    await expect(adapter.sendConversation({
+      conversationId: 'missing-conversation', userMessage: '不存在',
+    }, {})).rejects.toThrow('会话不存在')
+    expect({ readCount, sendCount }).toEqual({ readCount: 0, sendCount: 0 })
+  })
+
   test('会话和工作区列表只返回 LAN 稳定字段，并保留缺失的可选工作区', () => {
     /** 被测适配器使用纯依赖注入，避免读取真实用户配置。 */
     const adapter = createLanBridgePromaAdapter(createDependencies())

@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { AgentEventBus } from '../agent-event-bus'
+import { createLanBridgeAuthService } from './lan-bridge-auth'
+import { LanBridgeDeviceStore } from './lan-bridge-device-store'
 import { createLanBridgeRecoveryController } from './lan-bridge-recovery'
 
 /** 创建仅用于身份比较的 EventBus 测试对象。 */
@@ -8,6 +10,41 @@ function createEventBus(): AgentEventBus {
 }
 
 describe('LAN Bridge 自愈控制器', () => {
+  test('recover 轮换临时配对状态后，已签发 Token 保持有效且撤销仍立即生效', async () => {
+    /** 当前用例使用的内存设备仓库。 */
+    const deviceStore = new LanBridgeDeviceStore('/tmp/lan-bridge-recovery-auth-test', {
+      readJson: () => undefined,
+      writeJson: () => undefined,
+      uuid: () => 'device-1',
+    })
+    /** 模拟进程级复用的认证服务。 */
+    const authService = createLanBridgeAuthService({ deviceStore })
+    /** recover 前签发的设备 Token。 */
+    const issuedToken = authService.generateToken('192.168.1.2', '测试设备', 1_000)
+    /** 通过真实 Bridge 初始化 facade 模拟的恢复控制器。 */
+    const controller = createLanBridgeRecoveryController({
+      isEnabled: () => true,
+      getStatus: () => 'error',
+      getActiveEventBus: () => null,
+      stop: () => undefined,
+      start: async () => { authService.initialize() },
+    })
+
+    await controller.recover()
+
+    expect(authService.verifyTokenDetails(issuedToken.token, '192.168.1.2', 2_000)).toEqual({
+      valid: true,
+      deviceId: 'device-1',
+      expiresAt: 86_401_000,
+    })
+
+    authService.revokeDevice(issuedToken.deviceId, 3_000)
+    expect(authService.verifyTokenDetails(issuedToken.token, '192.168.1.2', 3_001)).toEqual({
+      valid: false,
+      errorCode: 'DEVICE_REVOKED',
+    })
+  })
+
   test('仅在配置启用且状态为 error 时需要恢复', () => {
     let enabled = false
     let status: 'running' | 'error' = 'error'

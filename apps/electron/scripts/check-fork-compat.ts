@@ -1427,6 +1427,7 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
         'test',
         'apps/electron/scripts/check-fork-compat.test.ts',
         'apps/electron/scripts/verify-upstream-merge.test.ts',
+        'apps/electron/src/main/lib/config-paths.test.ts',
         'apps/electron/src/main/lib/lan-bridge',
         'apps/electron/src/preload/lan-bridge-preload.test.ts',
         'apps/mobile/src/lib',

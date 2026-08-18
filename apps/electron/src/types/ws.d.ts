@@ -18,6 +18,7 @@ declare module 'ws' {
       server?: unknown
       port?: number
       host?: string
+      maxPayload?: number
     })
     handleUpgrade(
       req: IncomingMessage,

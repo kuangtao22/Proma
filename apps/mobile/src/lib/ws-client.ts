@@ -1,4 +1,8 @@
-import type { LanBridgeErrorCode } from '@proma/shared'
+import {
+  LAN_BRIDGE_MAX_PROTOCOL_VERSION,
+  LAN_BRIDGE_MIN_PROTOCOL_VERSION,
+} from '@proma/shared'
+import type { LanBridgeConnectedPayload, LanBridgeErrorCode } from '@proma/shared'
 
 export interface WSRequest {
   type: string
@@ -51,6 +55,21 @@ interface PendingRequest {
   timeoutId: unknown
 }
 
+/** 协议协商前暂存的认证请求，避免 Token 或票据提前出站。 */
+interface QueuedAuthRequest {
+  type: string
+  data?: Record<string, unknown>
+  timeout: number
+  resolve(value: unknown): void
+  reject(error: Error): void
+}
+
+/** hello 完成后可交给业务层的可信协商结果。 */
+interface NegotiatedProtocolResult {
+  protocolVersion: number
+  capabilities: string[]
+}
+
 type PushHandler = (msg: WSResponse) => void
 type OpenHandler = (ws: WebSocketLike, isReconnect: boolean) => void
 
@@ -82,8 +101,10 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
   let sourceProtocol: WebSocketSourceProtocol = 'http:'
   let reconnectTimer: unknown = null
   let reconnectBaseDelay = 1000
+  let protocolState: 'waiting' | 'negotiating' | 'ready' | 'unsupported' = 'waiting'
   let openHandler: OpenHandler | null = null
   const pendingRequests = new Map<string, PendingRequest>()
+  const queuedAuthRequests: QueuedAuthRequest[] = []
   const pushHandlers = new Set<PushHandler>()
 
   /** 先释放 timer 和映射，再执行 Promise 回调，保证所有结算路径一致。 */
@@ -99,6 +120,20 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
   function rejectPendingRequests(code: WsClientErrorCode, message: string): void {
     for (const id of [...pendingRequests.keys()]) {
       takePending(id)?.reject(createWsClientError(code, message))
+    }
+  }
+
+  /** 拒绝尚未出站的认证请求，确保断线或不兼容时不遗留凭据任务。 */
+  function rejectQueuedAuthRequests(code: WsClientErrorCode, message: string): void {
+    for (const request of queuedAuthRequests.splice(0)) {
+      request.reject(createWsClientError(code, message))
+    }
+  }
+
+  /** hello 成功后按原顺序发送认证请求。 */
+  function flushQueuedAuthRequests(): void {
+    for (const request of queuedAuthRequests.splice(0)) {
+      sendRequest(request.type, request.data, request.timeout).then(request.resolve, request.reject)
     }
   }
 
@@ -127,6 +162,7 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
     const socketProtocol = sourceProtocol === 'https:' ? 'wss' : 'ws'
     const currentSocket = dependencies.createWebSocket(`${socketProtocol}://${host}:${port}/ws`)
     socket = currentSocket
+    protocolState = 'waiting'
 
     currentSocket.onopen = () => {
       if (socket !== currentSocket) return
@@ -140,6 +176,10 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
         const message = JSON.parse(event.data) as WSResponse
         if (message.type === '_heartbeat') {
           currentSocket.send(JSON.stringify({ type: 'pong' }))
+          return
+        }
+        if (message.type === 'connected' && !message.id) {
+          handleConnected(currentSocket, message)
           return
         }
         if (message.id) {
@@ -169,6 +209,7 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
       if (socket !== currentSocket) return
       socket = null
       rejectPendingRequests('CONNECTION_LOST', 'WebSocket connection lost')
+      rejectQueuedAuthRequests('CONNECTION_LOST', 'WebSocket connection lost')
       scheduleReconnect()
     }
 
@@ -186,6 +227,7 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
     const previousSocket = socket
     socket = null
     rejectPendingRequests('CONNECTION_LOST', 'WebSocket connection lost')
+    rejectQueuedAuthRequests('CONNECTION_LOST', 'WebSocket connection lost')
     if (previousSocket) {
       try { previousSocket.close() } catch { /* 已关闭 socket 无需额外处理 */ }
     }
@@ -193,6 +235,7 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
     port = nextPort
     sourceProtocol = nextProtocol
     reconnectBaseDelay = 1000
+    protocolState = 'waiting'
     return openConnection(false)
   }
 
@@ -202,6 +245,7 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
     const currentSocket = socket
     socket = null
     rejectPendingRequests('CONNECTION_LOST', 'WebSocket connection lost')
+    rejectQueuedAuthRequests('CONNECTION_LOST', 'WebSocket connection lost')
     if (currentSocket) {
       try { currentSocket.close() } catch { /* 已关闭 socket 无需额外处理 */ }
     }
@@ -222,7 +266,7 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
   }
 
   /** 发送带超时控制的请求，所有响应路径都会释放 timeout。 */
-  function wsReq(type: string, data?: Record<string, unknown>, timeout = 15000): Promise<unknown> {
+  function sendRequest(type: string, data?: Record<string, unknown>, timeout = 15000): Promise<unknown> {
     const currentSocket = socket
     if (!currentSocket || currentSocket.readyState !== 1) {
       return Promise.reject(createWsClientError('NOT_CONNECTED', 'WebSocket is not connected'))
@@ -245,12 +289,90 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
     })
   }
 
+  /** 认证请求在 hello 完成前只驻留内存，不向网络写入凭据。 */
+  function wsReq(type: string, data?: Record<string, unknown>, timeout = 15000): Promise<unknown> {
+    if (type.startsWith('auth.') && protocolState !== 'ready') {
+      if (protocolState === 'unsupported') {
+        return Promise.reject(createWsClientError('PROTOCOL_UNSUPPORTED', 'Protocol version unsupported'))
+      }
+      return new Promise((resolve, reject) => {
+        queuedAuthRequests.push({ type, data, timeout, resolve, reject })
+      })
+    }
+    return sendRequest(type, data, timeout)
+  }
+
+  /** 校验 connected 主版本并执行一次显式客户端 hello。 */
+  function handleConnected(
+    currentSocket: WebSocketLike,
+    message: WSResponse,
+  ): void {
+    if (protocolState !== 'waiting') return
+    if (!isCompatibleConnectedPayload(message.data)) {
+      protocolState = 'unsupported'
+      rejectQueuedAuthRequests('PROTOCOL_UNSUPPORTED', 'Protocol version unsupported')
+      return
+    }
+    protocolState = 'negotiating'
+    void sendRequest('protocol.hello', {
+      minProtocolVersion: LAN_BRIDGE_MIN_PROTOCOL_VERSION,
+      maxProtocolVersion: LAN_BRIDGE_MAX_PROTOCOL_VERSION,
+    }).then((result) => {
+      if (socket !== currentSocket) return
+      if (!isNegotiatedProtocolResult(result)) {
+        throw createWsClientError('PROTOCOL_UNSUPPORTED', 'Protocol version unsupported')
+      }
+      protocolState = 'ready'
+      flushQueuedAuthRequests()
+      /** 仅把 hello 确认的版本与能力暴露给配对等业务层。 */
+      const negotiatedMessage: WSResponse = { ...message, data: result }
+      for (const handler of pushHandlers) {
+        try { handler(negotiatedMessage) } catch { /* 单个处理器异常不影响其他订阅者 */ }
+      }
+    }).catch(() => {
+      if (socket !== currentSocket) return
+      protocolState = 'unsupported'
+      rejectQueuedAuthRequests('PROTOCOL_UNSUPPORTED', 'Protocol version unsupported')
+    })
+  }
+
   /** 暴露挂起数量用于诊断和无泄漏回归测试。 */
   function pendingCount(): number {
-    return pendingRequests.size
+    return pendingRequests.size + queuedAuthRequests.length
   }
 
   return { connect, close, onOpen, onPush, wsReq, pendingCount }
+}
+
+/** connected 必须声明与客户端重叠的主版本范围。 */
+function isCompatibleConnectedPayload(payload: unknown): payload is LanBridgeConnectedPayload {
+  if (!isRecord(payload)) return false
+  /** 旧字段 protocolVersion 仍作为缺少范围字段时的兼容范围。 */
+  const minimum = Number.isSafeInteger(payload.minProtocolVersion)
+    ? payload.minProtocolVersion as number
+    : payload.protocolVersion
+  const maximum = Number.isSafeInteger(payload.maxProtocolVersion)
+    ? payload.maxProtocolVersion as number
+    : payload.protocolVersion
+  return Number.isSafeInteger(minimum)
+    && Number.isSafeInteger(maximum)
+    && (minimum as number) <= LAN_BRIDGE_MAX_PROTOCOL_VERSION
+    && (maximum as number) >= LAN_BRIDGE_MIN_PROTOCOL_VERSION
+}
+
+/** hello 响应必须确认客户端当前支持的主版本与能力列表。 */
+function isNegotiatedProtocolResult(result: unknown): result is NegotiatedProtocolResult {
+  return isRecord(result)
+    && Number.isSafeInteger(result.protocolVersion)
+    && (result.protocolVersion as number) >= LAN_BRIDGE_MIN_PROTOCOL_VERSION
+    && (result.protocolVersion as number) <= LAN_BRIDGE_MAX_PROTOCOL_VERSION
+    && Array.isArray(result.capabilities)
+    && result.capabilities.every(capability => typeof capability === 'string')
+}
+
+/** 判断未知输入是否为普通对象。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 /** 浏览器默认依赖只负责环境接线，业务逻辑由实例实现。 */
