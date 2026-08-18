@@ -112,6 +112,7 @@ export class LanBridgeSessionManager {
     if (verification.valid) {
       client.authenticated = true
       client.deviceId = verification.deviceId
+      client.authToken = token
       return true
     }
     return false

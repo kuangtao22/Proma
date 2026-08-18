@@ -11,6 +11,9 @@ import { readJsonFileSafe, writeJsonFileAtomic } from '../safe-file'
 
 const DEVICES_FILENAME = 'lan-bridge-devices.json'
 const LAST_SEEN_WRITE_INTERVAL_MS = 60_000
+const MAX_DEVICE_ID_LENGTH = 128
+const MAX_DEVICE_NAME_LENGTH = 100
+const DEFAULT_DEVICE_NAME = 'LAN 设备'
 
 /** LAN Bridge 已配对设备的安全元数据。 */
 export interface LanBridgeDevice {
@@ -81,18 +84,26 @@ export class LanBridgeDeviceStore {
    * @returns 新注册的设备记录
    */
   registerDevice(name: string, now = Date.now()): LanBridgeDevice {
+    /** 新设备的唯一标识。 */
+    const id = this.dependencies.uuid()
+    if (!isValidDeviceId(id) || this.devices.has(id)) {
+      throw new Error('设备 ID 无效或重复')
+    }
+    if (!isValidTimestamp(now)) throw new Error('设备注册时间无效')
     /** 新设备只包含允许持久化的安全字段。 */
     const device: LanBridgeDevice = {
-      id: this.dependencies.uuid(),
-      name,
+      id,
+      name: normalizeDeviceName(name),
       createdAt: now,
       lastSeenAt: now,
       tokenVersion: 1,
       revokedAt: undefined,
     }
+    /** 原子写入前构造的下一设备快照。 */
+    const nextDevices = [...this.devices.values(), device]
+    this.persist(nextDevices)
     this.devices.set(device.id, device)
     this.persistedLastSeenAt.set(device.id, now)
-    this.persist()
     return { ...device }
   }
 
@@ -131,6 +142,7 @@ export class LanBridgeDeviceStore {
     /** 待更新的设备记录。 */
     const device = this.devices.get(deviceId)
     if (!device) return undefined
+    if (!isValidTimestamp(now)) throw new Error('设备最近访问时间无效')
 
     device.lastSeenAt = now
     /** 最近一次已持久化的访问时间。 */
@@ -153,10 +165,24 @@ export class LanBridgeDeviceStore {
     /** 待撤销的设备记录。 */
     const device = this.devices.get(deviceId)
     if (!device) return undefined
+    if (!isValidTimestamp(now)) throw new Error('设备撤销时间无效')
     if (device.revokedAt === undefined) {
-      device.tokenVersion++
-      device.revokedAt = now
-      this.persist()
+      if (device.tokenVersion === Number.MAX_SAFE_INTEGER) {
+        throw new Error('Token 版本已达上限')
+      }
+      /** 尚未提交到内存的撤销后设备。 */
+      const revokedDevice: LanBridgeDevice = {
+        ...device,
+        tokenVersion: device.tokenVersion + 1,
+        revokedAt: now,
+      }
+      /** 原子写入前构造的下一设备快照。 */
+      const nextDevices = [...this.devices.values()].map(candidate => (
+        candidate.id === deviceId ? revokedDevice : candidate
+      ))
+      this.persist(nextDevices)
+      this.devices.set(deviceId, revokedDevice)
+      return { ...revokedDevice }
     }
     return { ...device }
   }
@@ -184,8 +210,8 @@ export class LanBridgeDeviceStore {
   }
 
   /** 使用原子 JSON API 持久化当前设备列表。 */
-  private persist(): void {
-    this.dependencies.writeJson(this.filePath, [...this.devices.values()])
+  private persist(devices: LanBridgeDevice[] = [...this.devices.values()]): void {
+    this.dependencies.writeJson(this.filePath, devices)
   }
 }
 
@@ -194,10 +220,36 @@ function isLanBridgeDevice(value: unknown): value is LanBridgeDevice {
   if (!value || typeof value !== 'object') return false
   /** 需要逐字段验证的候选记录。 */
   const candidate = value as Record<string, unknown>
-  return typeof candidate.id === 'string'
-    && typeof candidate.name === 'string'
-    && typeof candidate.createdAt === 'number'
-    && typeof candidate.lastSeenAt === 'number'
-    && typeof candidate.tokenVersion === 'number'
-    && (candidate.revokedAt === undefined || typeof candidate.revokedAt === 'number')
+  return isValidDeviceId(candidate.id)
+    && isValidStoredDeviceName(candidate.name)
+    && isValidTimestamp(candidate.createdAt)
+    && isValidTimestamp(candidate.lastSeenAt)
+    && Number.isSafeInteger(candidate.tokenVersion)
+    && (candidate.tokenVersion as number) > 0
+    && (candidate.revokedAt === undefined || isValidTimestamp(candidate.revokedAt))
+}
+
+/** 判断设备 ID 是否为非空且长度受限的字符串。 */
+function isValidDeviceId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_DEVICE_ID_LENGTH
+}
+
+/** 判断持久化设备名是否已经规范化且长度受限。 */
+function isValidStoredDeviceName(value: unknown): value is string {
+  return typeof value === 'string'
+    && value === value.trim()
+    && value.length > 0
+    && value.length <= MAX_DEVICE_NAME_LENGTH
+}
+
+/** 将用户输入名称规范化为稳定安全的显示名。 */
+function normalizeDeviceName(value: string): string {
+  /** 去除首尾空白后的设备名。 */
+  const trimmed = value.trim()
+  return (trimmed || DEFAULT_DEVICE_NAME).slice(0, MAX_DEVICE_NAME_LENGTH)
+}
+
+/** 判断时间戳是否为有限非负数。 */
+function isValidTimestamp(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }

@@ -4,95 +4,159 @@
  * 调用已有服务实现各个 WS 命令。
  */
 
-import { registerRoute, sendError } from './lan-bridge-router'
-import { verifyPairingPin, generateToken, verifyToken, refreshToken } from './lan-bridge-auth'
-import type { ClientConnection } from './lan-bridge-types'
-import { getSessionManager } from './lan-bridge'
-import { lanBridgePromaAdapter } from './lan-bridge-proma-adapter'
+import { registerRoute } from './lan-bridge-router'
+import type { LanBridgeAuthService, TokenVerificationResult } from './lan-bridge-auth'
+import type { ClientConnection, RouteHandler } from './lan-bridge-types'
+import type { LanBridgeSessionManager } from './lan-bridge-session'
+import type { LanBridgePromaAdapter } from './lan-bridge-proma-adapter-core'
 
-// ===== 注册所有路由 =====
+/** handlers 的进程级组合依赖。 */
+export interface LanBridgeHandlerDependencies {
+  /** 生产唯一或测试隔离的认证服务。 */
+  authService: LanBridgeAuthService
+  /** 稳定的 Proma 业务适配器。 */
+  promaAdapter: LanBridgePromaAdapter
+  /** 获取当前 Bridge 会话管理器。 */
+  getSessionManager: () => LanBridgeSessionManager | null
+}
 
-registerRoute('auth.pair', handlePair)
-registerRoute('auth.verify', handleVerify)
-registerRoute('auth.refresh', handleRefresh)
-registerRoute('ping', handlePing)
-registerRoute('conversations.list', handleListConversations)
-registerRoute('conversations.messages', handleConversationMessages)
-registerRoute('conversations.search', handleSearch)
-registerRoute('agent.sessions', handleAgentSessions)
-registerRoute('agent.sessions.messages', handleAgentSessionMessages)
-registerRoute('agent.sessions.search', handleAgentSearch)
-registerRoute('workspaces.list', handleWorkspaces)
-registerRoute('subscribe', handleSubscribe)
-registerRoute('unsubscribe', handleUnsubscribe)
-registerRoute('agent.send', handleAgentSend)
-registerRoute('agent.stop', handleAgentStop)
-registerRoute('conversations.send', handleConversationSend)
-registerRoute('conversations.stop', handleConversationStop)
-registerRoute('settings.get', handleSettingsGet)
-registerRoute('settings.channels', handleSettingsChannels)
+/** 注册全部 LAN Bridge 路由；重复注册会按 type 原子替换 handler。 */
+export function registerLanBridgeHandlers(dependencies: LanBridgeHandlerDependencies): void {
+  /** 将依赖上下文绑定到现有 RouteHandler 签名。 */
+  const bind = (
+    handler: (
+      context: LanBridgeHandlerDependencies,
+      client: ClientConnection,
+      data: Record<string, unknown>,
+    ) => unknown,
+  ): RouteHandler => (client, data) => handler(dependencies, client, data)
+
+  registerRoute('auth.pair', bind(handlePair))
+  registerRoute('auth.pairTicket', bind(handlePairTicket))
+  registerRoute('auth.verify', bind(handleVerify))
+  registerRoute('auth.refresh', bind(handleRefresh))
+  registerRoute('ping', bind(handlePing))
+  registerRoute('conversations.list', bind(handleListConversations))
+  registerRoute('conversations.messages', bind(handleConversationMessages))
+  registerRoute('conversations.search', bind(handleSearch))
+  registerRoute('agent.sessions', bind(handleAgentSessions))
+  registerRoute('agent.sessions.messages', bind(handleAgentSessionMessages))
+  registerRoute('agent.sessions.search', bind(handleAgentSearch))
+  registerRoute('workspaces.list', bind(handleWorkspaces))
+  registerRoute('subscribe', bind(handleSubscribe))
+  registerRoute('unsubscribe', bind(handleUnsubscribe))
+  registerRoute('agent.session.create', bind(handleAgentSessionCreate))
+  registerRoute('agent.send', bind(handleAgentSend))
+  registerRoute('agent.stop', bind(handleAgentStop))
+  registerRoute('conversations.send', bind(handleConversationSend))
+  registerRoute('conversations.stop', bind(handleConversationStop))
+  registerRoute('settings.get', bind(handleSettingsGet))
+  registerRoute('settings.channels', bind(handleSettingsChannels))
+}
 
 // ===== 认证 =====
 
-function handlePair(client: ClientConnection, data: Record<string, unknown>) {
+function handlePair(
+  context: LanBridgeHandlerDependencies,
+  client: ClientConnection,
+  data: Record<string, unknown>,
+) {
   const pin = data.pin as string | undefined
-  const result = pin ? verifyPairingPin(pin, client.ip) : 'invalid'
+  const result = pin ? context.authService.verifyPairingPin(pin, client.ip) : 'invalid'
   if (result === 'rate_limited') {
     throw Object.assign(new Error('Too many pairing attempts'), { errorCode: 'RATE_LIMITED' })
   }
   if (result !== 'valid') {
     throw Object.assign(new Error('Invalid PIN'), { errorCode: 'AUTH_FAILED' })
   }
-  client.authenticated = true
-  return generateToken(client.ip)
+  /** PIN 配对注册并签发的真实设备 Token。 */
+  const issuedToken = context.authService.generateToken(
+    client.ip,
+    typeof data.deviceName === 'string' ? data.deviceName : undefined,
+  )
+  markAuthenticated(client, issuedToken.token, issuedToken.deviceId)
+  return issuedToken
 }
 
-function handleVerify(client: ClientConnection, data: Record<string, unknown>) {
+function handlePairTicket(
+  context: LanBridgeHandlerDependencies,
+  client: ClientConnection,
+  data: Record<string, unknown>,
+) {
+  /** 客户端提交的一次性票据。 */
+  const ticket = typeof data.ticket === 'string' ? data.ticket : ''
+  /** 票据配对签发的真实设备 Token。 */
+  const issuedToken = context.authService.consumePairingTicket(
+    ticket,
+    client.ip,
+    typeof data.deviceName === 'string' ? data.deviceName : 'LAN 设备',
+  )
+  markAuthenticated(client, issuedToken.token, issuedToken.deviceId)
+  return issuedToken
+}
+
+function handleVerify(
+  context: LanBridgeHandlerDependencies,
+  client: ClientConnection,
+  data: Record<string, unknown>,
+) {
   const token = data.token as string | undefined
-  if (!token) return { valid: false }
-  return { valid: verifyToken(token, client.ip) }
+  if (!token) return { valid: false, errorCode: 'TOKEN_INVALID' }
+  /** 保留具体失败语义的结构化验证结果。 */
+  const verification = context.authService.verifyTokenDetails(token, client.ip)
+  if (verification.valid) markAuthenticated(client, token, verification.deviceId)
+  return verification
 }
 
-function handleRefresh(client: ClientConnection, data: Record<string, unknown>) {
+function handleRefresh(
+  context: LanBridgeHandlerDependencies,
+  client: ClientConnection,
+  data: Record<string, unknown>,
+) {
   const token = data.token as string | undefined
   if (!token) {
     throw Object.assign(new Error('Token required'), { errorCode: 'AUTH_REQUIRED' })
   }
-  const result = refreshToken(token, client.ip)
-  if (!result) {
-    throw Object.assign(new Error('Token invalid or expired'), { errorCode: 'TOKEN_EXPIRED' })
-  }
-  client.authenticated = true
-  return result
+  /** 保留具体失败语义的结构化刷新结果。 */
+  const result = context.authService.refreshTokenDetails(token, client.ip)
+  if (!result.valid) throwAuthError(result.errorCode)
+  markAuthenticated(client, result.token, result.deviceId)
+  /** 旧客户端继续读取 token/expiresIn，新增 deviceId 不破坏兼容。 */
+  const { valid: _valid, ...issuedToken } = result
+  return issuedToken
 }
 
 // ===== 心跳 =====
 
-function handlePing(_client: ClientConnection, _data: Record<string, unknown>) {
+function handlePing(
+  _context: LanBridgeHandlerDependencies,
+  _client: ClientConnection,
+  _data: Record<string, unknown>,
+) {
   return { pong: true }
 }
 
 // ===== 数据查询 =====
 
-function handleListConversations(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
-  return { conversations: lanBridgePromaAdapter.listConversations() }
+function handleListConversations(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
+  return { conversations: context.promaAdapter.listConversations() }
 }
 
-function handleConversationMessages(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+function handleConversationMessages(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const conversationId = data.conversationId as string
   if (!conversationId) {
     throw Object.assign(new Error('conversationId required'), { errorCode: 'VALIDATION_ERROR' })
   }
-  const allMessages = lanBridgePromaAdapter.getConversationMessages(conversationId)
+  const allMessages = context.promaAdapter.getConversationMessages(conversationId)
   const limit = typeof data.limit === 'number' ? data.limit : 100
   const messages = limit > 0 ? allMessages.slice(-limit) : allMessages
   return { messages, total: allMessages.length }
 }
 
-async function handleSearch(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+async function handleSearch(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const query = data.query as string
   if (!query) {
     throw Object.assign(new Error('Query required'), { errorCode: 'VALIDATION_ERROR' })
@@ -101,51 +165,51 @@ async function handleSearch(client: ClientConnection, data: Record<string, unkno
   const now = Date.now()
   const results: Array<{ id: string; title: string; snippet: string; type: 'chat' | 'agent'; matchedAt: number }> = []
   if (!sessionType || sessionType === 'chat') {
-    results.push(...await lanBridgePromaAdapter.searchConversations(query, now))
+    results.push(...await context.promaAdapter.searchConversations(query, now))
   }
   if (!sessionType || sessionType === 'agent') {
-    results.push(...await lanBridgePromaAdapter.searchAgentSessions(query, now))
+    results.push(...await context.promaAdapter.searchAgentSessions(query, now))
   }
   return { results }
 }
 
-function handleAgentSessions(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
-  const sessions = lanBridgePromaAdapter.listAgentSessions()
+function handleAgentSessions(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
+  const sessions = context.promaAdapter.listAgentSessions()
   return { sessions }
 }
 
-function handleAgentSessionMessages(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+function handleAgentSessionMessages(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const sessionId = data.sessionId as string
   if (!sessionId) {
     throw Object.assign(new Error('sessionId required'), { errorCode: 'VALIDATION_ERROR' })
   }
-  const allMessages = lanBridgePromaAdapter.getAgentMessages(sessionId)
+  const allMessages = context.promaAdapter.getAgentMessages(sessionId)
   const limit = typeof data.limit === 'number' ? data.limit : 100
   const messages = limit > 0 ? allMessages.slice(-limit) : allMessages
   return { messages, total: allMessages.length }
 }
 
-async function handleAgentSearch(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+async function handleAgentSearch(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const query = data.query as string
   if (!query) {
     throw Object.assign(new Error('Query required'), { errorCode: 'VALIDATION_ERROR' })
   }
-  const results = await lanBridgePromaAdapter.searchAgentSessions(query)
+  const results = await context.promaAdapter.searchAgentSessions(query)
   return { results }
 }
 
-function handleWorkspaces(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
-  return { workspaces: lanBridgePromaAdapter.listWorkspaces() }
+function handleWorkspaces(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
+  return { workspaces: context.promaAdapter.listWorkspaces() }
 }
 
 // ===== 订阅 =====
 
-function handleSubscribe(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+function handleSubscribe(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const id = (data.sessionId ?? data.conversationId) as string | undefined
   if (!id) {
     throw Object.assign(new Error('sessionId or conversationId required'), { errorCode: 'VALIDATION_ERROR' })
@@ -154,8 +218,8 @@ function handleSubscribe(client: ClientConnection, data: Record<string, unknown>
   return { subscribed: id }
 }
 
-function handleUnsubscribe(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+function handleUnsubscribe(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const id = (data.sessionId ?? data.conversationId) as string | undefined
   if (id) {
     client.subscriptions.delete(id)
@@ -165,32 +229,30 @@ function handleUnsubscribe(client: ClientConnection, data: Record<string, unknow
 
 // ===== Agent 交互 =====
 
-function handleAgentSessionCreate(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+function handleAgentSessionCreate(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const title = data.title as string | undefined
   /** 新会话默认工作区保持与桌面设置一致。 */
-  const workspaceId = (data.workspaceId as string | undefined) || lanBridgePromaAdapter.getSettings().agentWorkspaceId
+  const workspaceId = (data.workspaceId as string | undefined) || context.promaAdapter.getSettings().agentWorkspaceId
   /** Adapter 同时负责稳定字段映射和桌面标题通知。 */
-  const session = lanBridgePromaAdapter.createAgentSession(title, workspaceId)
+  const session = context.promaAdapter.createAgentSession(title, workspaceId)
 
   return { session }
 }
-registerRoute('agent.session.create', handleAgentSessionCreate)
-
-function handleAgentSend(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+function handleAgentSend(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const sessionId = data.sessionId as string | undefined
   const userMessage = data.userMessage as string | undefined
   if (!sessionId || !userMessage) {
     throw Object.assign(new Error('sessionId and userMessage required'), { errorCode: 'VALIDATION_ERROR' })
   }
 
-  if (lanBridgePromaAdapter.isAgentSessionActive(sessionId)) {
+  if (context.promaAdapter.isAgentSessionActive(sessionId)) {
     throw Object.assign(new Error('Agent session is already running'), { errorCode: 'SESSION_ACTIVE' })
   }
 
   /** 设置快照只用于日志；官方设置对象不会越过 Adapter。 */
-  const settings = lanBridgePromaAdapter.getSettings()
+  const settings = context.promaAdapter.getSettings()
   /** 仅接受协议支持的权限值，未知值保持旧行为并回退 bypassPermissions。 */
   const requestedPermissionMode = data.permissionMode
   /** 识别后的 LAN 权限模式由 Adapter 转换为官方运行时字段。 */
@@ -201,13 +263,13 @@ function handleAgentSend(client: ClientConnection, data: Record<string, unknown>
     : undefined
   console.log(`[LAN Bridge] agent.send 开始: sessionId=${sessionId.slice(0, 12)} channelId=${settings.agentChannelId || '(空)'}`)
   const pushToSubs = (msg: object) => {
-    const mgr = getSessionManager()
+    const mgr = context.getSessionManager()
     if (!mgr) return
     for (const c of mgr.getSubscribers(sessionId)) {
       mgr.send(c, msg)
     }
   }
-  lanBridgePromaAdapter.sendAgent({
+  context.promaAdapter.sendAgent({
     sessionId,
     userMessage,
     modelId: data.modelId as string | undefined,
@@ -237,20 +299,20 @@ function handleAgentSend(client: ClientConnection, data: Record<string, unknown>
   return { sent: true, sessionId }
 }
 
-function handleAgentStop(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+function handleAgentStop(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const sessionId = data.sessionId as string | undefined
   if (!sessionId) {
     throw Object.assign(new Error('sessionId required'), { errorCode: 'VALIDATION_ERROR' })
   }
-  lanBridgePromaAdapter.stopAgent(sessionId)
+  context.promaAdapter.stopAgent(sessionId)
   return { stopped: true, sessionId }
 }
 
 // ===== Chat 对话发送 =====
 
-function handleConversationSend(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+function handleConversationSend(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const conversationId = data.conversationId as string | undefined
   const userMessage = data.userMessage as string | undefined
   if (!conversationId || !userMessage) {
@@ -258,7 +320,7 @@ function handleConversationSend(client: ClientConnection, data: Record<string, u
   }
 
   /** 默认渠道和模型通过稳定设置 DTO 解析。 */
-  const settings = lanBridgePromaAdapter.getSettings()
+  const settings = context.promaAdapter.getSettings()
   const channelId = data.channelId as string | undefined || settings.agentChannelId
   const modelId = data.modelId as string | undefined || settings.agentModelId
   if (!channelId || !modelId) {
@@ -267,14 +329,14 @@ function handleConversationSend(client: ClientConnection, data: Record<string, u
 
   /** 将 Adapter 的 LAN 自有回调转换为既有 WebSocket 推送。 */
   const pushToSubs = (type: string, payload: Record<string, unknown>) => {
-    const mgr = getSessionManager()
+    const mgr = context.getSessionManager()
     if (!mgr) return
     for (const c of mgr.getSubscribers(conversationId)) {
       mgr.send(c, { type, data: { conversationId, ...payload } })
     }
   }
 
-  lanBridgePromaAdapter.sendConversation({
+  context.promaAdapter.sendConversation({
     conversationId,
     userMessage,
     channelId,
@@ -294,24 +356,24 @@ function handleConversationSend(client: ClientConnection, data: Record<string, u
   return { sent: true, conversationId }
 }
 
-function handleConversationStop(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
+function handleConversationStop(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
   const conversationId = data.conversationId as string | undefined
   if (!conversationId) {
     throw Object.assign(new Error('conversationId required'), { errorCode: 'VALIDATION_ERROR' })
   }
-  lanBridgePromaAdapter.stopConversation(conversationId)
+  context.promaAdapter.stopConversation(conversationId)
   return { stopped: true, conversationId }
 }
 
 // ===== 设置 =====
 
-function handleSettingsGet(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
-  const settings = lanBridgePromaAdapter.getSettings()
+function handleSettingsGet(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
+  const settings = context.promaAdapter.getSettings()
   let channelBaseUrl: string | null = null
   if (settings.agentChannelId) {
-    channelBaseUrl = lanBridgePromaAdapter.getChannelBaseUrl(settings.agentChannelId)
+    channelBaseUrl = context.promaAdapter.getChannelBaseUrl(settings.agentChannelId)
   }
   return {
     agentWorkspaceId: settings.agentWorkspaceId || null,
@@ -321,20 +383,36 @@ function handleSettingsGet(client: ClientConnection, data: Record<string, unknow
   }
 }
 
-function handleSettingsChannels(client: ClientConnection, data: Record<string, unknown>) {
-  requireAuth(client, data)
-  const channels = lanBridgePromaAdapter.listEnabledChannelOptions()
+function handleSettingsChannels(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
+  requireAuth(context.authService, client, data)
+  const channels = context.promaAdapter.listEnabledChannelOptions()
   return { channels }
 }
 
 // ===== 工具 =====
 
-function requireAuth(client: ClientConnection, data: Record<string, unknown>): void {
-  if (client.authenticated) return
-  const token = data.token as string | undefined
-  if (token && verifyToken(token, client.ip)) {
-    client.authenticated = true
-    return
-  }
-  throw Object.assign(new Error('Authentication required'), { errorCode: 'AUTH_REQUIRED' })
+function requireAuth(
+  authService: LanBridgeAuthService,
+  client: ClientConnection,
+  data: Record<string, unknown>,
+): void {
+  /** 请求显式 Token 优先，否则复验连接最近一次通过的 Token。 */
+  const token = typeof data.token === 'string' ? data.token : client.authToken
+  if (!token) throw Object.assign(new Error('Authentication required'), { errorCode: 'AUTH_REQUIRED' })
+  /** 每个受保护请求都复验设备状态，禁止 authenticated 布尔旁路撤销。 */
+  const verification = authService.verifyTokenDetails(token, client.ip)
+  if (!verification.valid) throwAuthError(verification.errorCode)
+  markAuthenticated(client, token, verification.deviceId)
+}
+
+/** 同时提交连接认证布尔、设备 ID 和已验证 Token。 */
+function markAuthenticated(client: ClientConnection, token: string, deviceId: string): void {
+  client.authenticated = true
+  client.deviceId = deviceId
+  client.authToken = token
+}
+
+/** 将结构化认证失败转换为保留稳定错误码的路由异常。 */
+function throwAuthError(errorCode: Extract<TokenVerificationResult, { valid: false }>['errorCode']): never {
+  throw Object.assign(new Error(errorCode), { errorCode })
 }

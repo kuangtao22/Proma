@@ -12,14 +12,23 @@ import { networkInterfaces } from 'node:os'
 import { app } from 'electron'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { getLanBridgeConfig, updateLanBridgeConfig } from './lan-bridge-config'
-import { initAuth, refreshPin, getCurrentPin, removeLegacyPinFile } from './lan-bridge-auth'
+import {
+  getCurrentPin,
+  initAuth,
+  lanBridgeAuthService,
+  refreshPin,
+  removeLegacyPinFile,
+} from './lan-bridge-auth'
+import type { PairingTicket } from './lan-bridge-auth'
+import type { LanBridgeDevice } from './lan-bridge-device-store'
 import { getConfigDir } from '../config-paths'
 import { LanBridgeSessionManager } from './lan-bridge-session'
 import { dispatch } from './lan-bridge-router'
 import type { LanBridgeConfig, LanBridgeRuntimeState } from '@proma/shared'
 import { LAN_BRIDGE_IPC_CHANNELS } from '@proma/shared'
 
-import './lan-bridge-handlers'
+import { registerLanBridgeHandlers } from './lan-bridge-handlers'
+import { lanBridgePromaAdapter } from './lan-bridge-proma-adapter'
 import { startSubscription, stopSubscription } from './lan-bridge-subscription'
 import type { AgentEventBus } from '../agent-event-bus'
 import { createLanBridgeRecoveryController } from './lan-bridge-recovery'
@@ -33,6 +42,12 @@ let wss: WebSocketServer | null = null
 let sessionManager: LanBridgeSessionManager | null = null
 let status: LanBridgeRuntimeState['status'] = 'stopped'
 let errorMessage: string | undefined
+
+registerLanBridgeHandlers({
+  authService: lanBridgeAuthService,
+  promaAdapter: lanBridgePromaAdapter,
+  getSessionManager: () => sessionManager,
+})
 
 const recoveryController = createLanBridgeRecoveryController({
   isEnabled: () => getLanBridgeConfig().enabled,
@@ -198,6 +213,31 @@ export function getLanBridgeStatus(): LanBridgeRuntimeState {
 /** 刷新 PIN 码 */
 export function refreshLanBridgePin(): string {
   return refreshPin()
+}
+
+/** 为 Task 7 二维码入口创建生产认证服务的一次性票据。 */
+export function createLanBridgePairingTicket(now = Date.now()): PairingTicket {
+  return lanBridgeAuthService.createPairingTicket(now)
+}
+
+/** 列出生产认证服务固定仓库中的设备。 */
+export function listLanBridgeDevices(includeRevoked = false): LanBridgeDevice[] {
+  return lanBridgeAuthService.listDevices(includeRevoked)
+}
+
+/**
+ * 原子撤销设备，持久化成功后才断开该设备现有连接。
+ *
+ * @param deviceId 待撤销设备唯一标识
+ * @param now 当前时间戳
+ * @returns 撤销后的设备；不存在时返回 undefined
+ */
+export function revokeLanBridgeDevice(deviceId: string, now = Date.now()): LanBridgeDevice | undefined {
+  /** 原子持久化成功后的撤销设备。 */
+  const revokedDevice = lanBridgeAuthService.revokeDevice(deviceId, now)
+  if (!revokedDevice) return undefined
+  sessionManager?.disconnectDevice(deviceId)
+  return revokedDevice
 }
 
 /** 获取配置 */

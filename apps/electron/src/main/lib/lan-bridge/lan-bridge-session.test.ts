@@ -88,6 +88,7 @@ describe('LanBridgeSessionManager 设备认证与撤销', () => {
     expect(manager.authenticateFromData(client, { token: 'valid-token' })).toBe(true)
     expect(client.authenticated).toBe(true)
     expect(client.deviceId).toBe('device-1')
+    expect(client.authToken).toBe('valid-token')
   })
 
   test('撤销设备时使用合法策略违规关闭码断开其全部连接', () => {

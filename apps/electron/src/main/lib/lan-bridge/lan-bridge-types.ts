@@ -16,6 +16,8 @@ export interface ClientConnection {
   authenticated: boolean
   /** 已认证设备唯一标识；未认证或旧连接为空。 */
   deviceId?: string
+  /** 当前连接最近一次通过结构化验证的设备 Token。 */
+  authToken?: string
   /** 已订阅的 sessionId 集合 */
   subscriptions: Set<string>
   /** 最后活跃时间 */
