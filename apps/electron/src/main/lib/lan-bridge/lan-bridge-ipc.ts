@@ -47,8 +47,27 @@ export interface LanBridgeIpcDependencies {
   revokeDevice: (deviceId: string) => LanBridgeDeviceDto | undefined
 }
 
-/** 在真实注册发生时惰性加载 LAN Bridge 业务模块，避免纯注入测试触发 Electron 依赖。 */
-function createDefaultDependencies(): LanBridgeIpcDependencies {
+/** 根组合点创建 LAN IPC 依赖时绑定的本地运行时能力。 */
+export interface LanBridgeIpcRuntimeDependencies extends Omit<LanBridgeIpcDependencies, 'start'> {
+  /** 使用根组合点注入的 EventBus 启动 LAN Bridge。 */
+  startLanBridge: (agentEventBus: AgentEventBus) => Promise<void>
+}
+
+/** 将根组合点提供的 EventBus 绑定为 IPC start 依赖。 */
+export function createLanBridgeIpcDependencies(
+  agentEventBus: AgentEventBus,
+  runtime: LanBridgeIpcRuntimeDependencies = loadLanBridgeIpcRuntimeDependencies(),
+): LanBridgeIpcDependencies {
+  /** 本地运行时启动函数由根组合点的 EventBus 绑定。 */
+  const { startLanBridge, ...dependencies } = runtime
+  return {
+    ...dependencies,
+    start: () => startLanBridge(agentEventBus),
+  }
+}
+
+/** 惰性加载纯 LAN 业务模块，不在自有层获取任何官方 runtime。 */
+function loadLanBridgeIpcRuntimeDependencies(): LanBridgeIpcRuntimeDependencies {
   /** LAN Bridge 服务模块，仅在应用注册 IPC 时加载。 */
   const lanBridge = require('./lan-bridge') as Pick<
     typeof import('./lan-bridge'),
@@ -71,11 +90,7 @@ function createDefaultDependencies(): LanBridgeIpcDependencies {
     getConfig: lanBridge.getConfig,
     updateConfig: lanBridge.updateConfig,
     getStatus: lanBridge.getLanBridgeStatus,
-    start: async () => {
-      /** 当前 Agent 事件总线，保持原实现只在启动 LAN Bridge 时加载。 */
-      const { agentEventBus } = require('../agent-service') as { agentEventBus: AgentEventBus }
-      await lanBridge.startLanBridge(agentEventBus)
-    },
+    startLanBridge: lanBridge.startLanBridge,
     stop: lanBridge.stopLanBridge,
     getPin: lanBridgeAuth.getCurrentPin,
     refreshPin: lanBridgeAuth.refreshPin,
@@ -93,41 +108,38 @@ function createDefaultDependencies(): LanBridgeIpcDependencies {
 /** 注册当前十个 LAN Bridge IPC 命令。 */
 export function registerLanBridgeIpcHandlers(
   ipc: LanBridgeIpcRegistrar,
-  dependencies?: LanBridgeIpcDependencies,
+  dependencies: LanBridgeIpcDependencies,
 ): void {
-  /** 实际 handler 依赖；测试注入时不会加载 Electron 或 Agent 服务。 */
-  const resolvedDependencies = dependencies ?? createDefaultDependencies()
-
-  ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_CONFIG, async () => resolvedDependencies.getConfig())
+  ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_CONFIG, async () => dependencies.getConfig())
   ipc.handle(LAN_BRIDGE_IPC_CHANNELS.UPDATE_CONFIG, async (_event, updates) => (
-    resolvedDependencies.updateConfig(updates as Partial<LanBridgeConfig>)
+    dependencies.updateConfig(updates as Partial<LanBridgeConfig>)
   ))
-  ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_STATUS, async () => resolvedDependencies.getStatus())
+  ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_STATUS, async () => dependencies.getStatus())
   ipc.handle(LAN_BRIDGE_IPC_CHANNELS.START, async () => {
-    await resolvedDependencies.start()
+    await dependencies.start()
   })
-  ipc.handle(LAN_BRIDGE_IPC_CHANNELS.STOP, async () => resolvedDependencies.stop())
-  ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_PIN, async () => resolvedDependencies.getPin())
-  ipc.handle(LAN_BRIDGE_IPC_CHANNELS.REFRESH_PIN, async () => resolvedDependencies.refreshPin())
+  ipc.handle(LAN_BRIDGE_IPC_CHANNELS.STOP, async () => dependencies.stop())
+  ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_PIN, async () => dependencies.getPin())
+  ipc.handle(LAN_BRIDGE_IPC_CHANNELS.REFRESH_PIN, async () => dependencies.refreshPin())
   ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_PAIRING_QR, async (): Promise<LanBridgeGetPairingQrResponse> => {
     /** 当前运行状态提供实际监听端口和已筛选的局域网地址。 */
-    const state = resolvedDependencies.getStatus()
+    const state = dependencies.getStatus()
     if (state.status !== 'running') throw new Error('LAN Bridge 尚未运行')
     if (!isRfc1918Ipv4(state.localIp)) throw new Error('没有可用的局域网 IPv4 地址')
 
     /** 只在地址可用后签发票据，避免生成无法消费的临时凭据。 */
-    const pairingTicket = resolvedDependencies.createPairingTicket()
+    const pairingTicket = dependencies.createPairingTicket()
     /** 票据仅存在 fragment 中，不会进入 HTTP 请求、服务日志或浏览器 query。 */
     const pairingUrl = `http://${state.localIp}:${state.port}/#/pair?ticket=${encodeURIComponent(pairingTicket.value)}`
     return {
-      qrCodeData: await resolvedDependencies.createQrCodeData(pairingUrl),
+      qrCodeData: await dependencies.createQrCodeData(pairingUrl),
       expiresAt: pairingTicket.expiresAt,
     }
   })
   ipc.handle(LAN_BRIDGE_IPC_CHANNELS.LIST_DEVICES, async (_event, request): Promise<LanBridgeListDevicesResponse> => {
     /** renderer 可省略请求对象，默认只返回仍有效的设备。 */
     const input = (request ?? {}) as LanBridgeListDevicesRequest
-    return { devices: resolvedDependencies.listDevices(input.includeRevoked === true) }
+    return { devices: dependencies.listDevices(input.includeRevoked === true) }
   })
   ipc.handle(LAN_BRIDGE_IPC_CHANNELS.REVOKE_DEVICE, async (_event, request): Promise<LanBridgeRevokeDeviceResponse> => {
     /** 撤销请求必须包含非空设备 ID。 */
@@ -136,7 +148,7 @@ export function registerLanBridgeIpcHandlers(
       throw new Error('设备 ID 无效')
     }
     /** facade 内先原子持久化再断开；异常必须原样使 IPC 失败。 */
-    const device = resolvedDependencies.revokeDevice(input.deviceId)
+    const device = dependencies.revokeDevice(input.deviceId)
     if (!device) throw new Error('设备不存在')
     return { revoked: true, device }
   })

@@ -1279,6 +1279,9 @@ export interface ElectronAPI extends LanBridgePreloadApi {
 /**
  * 实现 ElectronAPI 接口
  */
+/** 根 preload 唯一创建的 LAN API 组合对象。 */
+const lanBridgePreloadApi = createLanBridgePreloadApi(ipcRenderer)
+
 const electronAPI: ElectronAPI = {
   // 运行时
   getRuntimeStatus: () => {
@@ -2542,7 +2545,7 @@ const electronAPI: ElectronAPI = {
   },
 
   // LAN Bridge API 由独立 preload 模块统一组合，减少根文件冲突面。
-  ...createLanBridgePreloadApi(ipcRenderer),
+  ...lanBridgePreloadApi,
 
   // ===== 钉钉集成 =====
 

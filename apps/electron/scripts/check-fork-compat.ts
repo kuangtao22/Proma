@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { join, relative, resolve } from 'node:path'
+import { join, posix, relative, resolve } from 'node:path'
+import * as ts from 'typescript'
 
 /** fork 兼容检查使用的稳定检查项顺序。 */
 export const FORK_COMPAT_CHECK_IDS = [
@@ -11,6 +12,7 @@ export const FORK_COMPAT_CHECK_IDS = [
   'mobile-build',
   'mobile-resource',
   'lan-ipc-contract',
+  'workflow-definition',
 ] as const
 
 /** 仓库源码读取边界，生产环境和内存测试共用。 */
@@ -101,7 +103,23 @@ const PATHS = {
   electronPackage: 'apps/electron/package.json',
   mobilePackage: 'apps/mobile/package.json',
   electronBuilder: 'apps/electron/electron-builder.yml',
+  workflow: '.github/workflows/upstream-compat.yml',
 } as const
+
+/** AST 中发现的运行时模块依赖。 */
+interface RuntimeModuleDependency {
+  /** 模块说明符原文。 */
+  specifier: string
+  /** 依赖语法类别，用于失败提示。 */
+  syntax: string
+}
+
+/** electron-builder 顶层 extraResources 的最小结构。 */
+interface ExtraResourceEntry {
+  from?: string
+  to?: string
+  filter: string[]
+}
 
 /** 创建一个成功或失败格式一致的检查结果。 */
 function createResult(
@@ -144,6 +162,147 @@ function extractStringArray(content: string, name: string): string[] | undefined
   return values
 }
 
+/** 使用仓库 TypeScript compiler API 解析 TS/TSX，注释和字符串不会成为语法节点。 */
+function parseTypeScript(path: string, content: string): ts.SourceFile {
+  /** 根据扩展名选择正确的 JSX 解析模式。 */
+  const scriptKind = path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
+  return ts.createSourceFile(path, content, ts.ScriptTarget.Latest, true, scriptKind)
+}
+
+/** 判断 import clause 是否会生成运行时代码。 */
+function hasRuntimeImport(importClause: ts.ImportClause | undefined): boolean {
+  if (!importClause) return true
+  if (importClause.isTypeOnly) return false
+  if (importClause.name) return true
+  if (!importClause.namedBindings) return false
+  if (ts.isNamespaceImport(importClause.namedBindings)) return true
+  return importClause.namedBindings.elements.some((element) => !element.isTypeOnly)
+}
+
+/** 判断 export clause 是否会生成运行时代码。 */
+function hasRuntimeExport(node: ts.ExportDeclaration): boolean {
+  if (node.isTypeOnly) return false
+  if (!node.exportClause) return true
+  if (ts.isNamespaceExport(node.exportClause)) return true
+  return node.exportClause.elements.some((element) => !element.isTypeOnly)
+}
+
+/** 提取源码中真实存在的运行时模块依赖，覆盖静态、动态、require 与 re-export。 */
+function collectRuntimeDependencies(path: string, content: string): RuntimeModuleDependency[] {
+  /** 当前文件 AST。 */
+  const sourceFile = parseTypeScript(path, content)
+  /** 当前文件全部运行时依赖。 */
+  const dependencies: RuntimeModuleDependency[] = []
+  /** 记录字符串模块说明符。 */
+  const addDependency = (specifier: ts.Expression | undefined, syntax: string): void => {
+    if (specifier && ts.isStringLiteralLike(specifier)) {
+      dependencies.push({ specifier: specifier.text, syntax })
+    }
+  }
+  /** 递归访问语法树。 */
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && hasRuntimeImport(node.importClause)) {
+      addDependency(node.moduleSpecifier, 'import')
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && hasRuntimeExport(node)) {
+      addDependency(node.moduleSpecifier, 'export')
+    } else if (ts.isImportEqualsDeclaration(node) && !node.isTypeOnly && ts.isExternalModuleReference(node.moduleReference)) {
+      addDependency(node.moduleReference.expression, 'import=')
+    } else if (ts.isCallExpression(node)) {
+      /** 动态 import() 或 CommonJS require() 的模块参数。 */
+      const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword
+      const isRequire = ts.isIdentifier(node.expression) && node.expression.text === 'require'
+      if (isDynamicImport || isRequire) addDependency(node.arguments[0], isDynamicImport ? 'import()' : 'require()')
+    }
+    ts.forEachChild(node, visit)
+  }
+
+  visit(sourceFile)
+  return dependencies
+}
+
+/** 返回函数体中直接执行的指定调用，嵌套死函数不计入组合点。 */
+function countDirectCalls(functionDeclaration: ts.FunctionDeclaration, functionName: string): number {
+  if (!functionDeclaration.body) return 0
+  return functionDeclaration.body.statements.filter((statement) => {
+    if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return false
+    return ts.isIdentifier(statement.expression.expression) && statement.expression.expression.text === functionName
+  }).length
+}
+
+/** 查找带 export 修饰符的命名函数。 */
+function findExportedFunction(sourceFile: ts.SourceFile, name: string): ts.FunctionDeclaration | undefined {
+  return sourceFile.statements.find((statement): statement is ts.FunctionDeclaration => (
+    ts.isFunctionDeclaration(statement)
+    && statement.name?.text === name
+    && statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) === true
+  ))
+}
+
+/** 解析只允许 `&&` 串联的保守 shell command segments。 */
+function parseShellCommandSegments(script: string): string[] | undefined {
+  if (/[;|`\n\r#]/.test(script) || /\$[({A-Za-z_]/.test(script) || /(^|[^&])&([^&]|$)/.test(script)) return undefined
+  /** 去除首尾空白后的实际命令段。 */
+  const segments = script.split(/\s*&&\s*/).map((segment) => segment.trim())
+  return segments.length > 0 && segments.every(Boolean) ? segments : undefined
+}
+
+/** 去除 YAML 标量外围引号。 */
+function unquoteYamlScalar(value: string): string {
+  /** 当前标量去除首尾空白后的文本。 */
+  const trimmed = value.trim()
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1)
+  }
+  return trimmed
+}
+
+/** 最小解析顶层 extraResources list，拒绝 ignoredResources 等相似嵌套。 */
+function parseTopLevelExtraResources(content: string): ExtraResourceEntry[] | undefined {
+  /** YAML 原始行。 */
+  const lines = content.split(/\r?\n/)
+  /** 顶层 extraResources 键所在行。 */
+  const startIndex = lines.findIndex((line) => /^extraResources:\s*(?:#.*)?$/.test(line))
+  if (startIndex < 0) return undefined
+
+  /** 顶层 extraResources 下解析出的列表项。 */
+  const entries: ExtraResourceEntry[] = []
+  /** 当前正在解析的列表项。 */
+  let current: ExtraResourceEntry | undefined
+  /** 当前是否位于 filter 子列表。 */
+  let readingFilter = false
+
+  for (const line of lines.slice(startIndex + 1)) {
+    if (!line.trim() || /^\s*#/.test(line)) continue
+    if (/^\S/.test(line)) break
+
+    /** 新 extraResources 列表项。 */
+    const fromMatch = line.match(/^  -\s+from:\s*(.+?)\s*$/)
+    if (fromMatch) {
+      current = { from: unquoteYamlScalar(fromMatch[1]!), filter: [] }
+      entries.push(current)
+      readingFilter = false
+      continue
+    }
+    if (!current) continue
+
+    /** 当前资源目标路径。 */
+    const toMatch = line.match(/^    to:\s*(.+?)\s*$/)
+    if (toMatch) {
+      current.to = unquoteYamlScalar(toMatch[1]!)
+      readingFilter = false
+      continue
+    }
+    if (/^    filter:\s*$/.test(line)) {
+      readingFilter = true
+      continue
+    }
+    /** filter 列表值。 */
+    const filterMatch = readingFilter ? line.match(/^      -\s+(.+?)\s*$/) : undefined
+    if (filterMatch) current.filter.push(unquoteYamlScalar(filterMatch[1]!))
+  }
+  return entries
+}
+
 /** 检查主进程 Bridge 注册与统一启动组合点。 */
 function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult {
   /** 当前检查的失败原因。 */
@@ -152,18 +311,55 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
   const main = readRequired(reader, PATHS.main, details)
   /** LAN Bridge 生命周期注册源码。 */
   const bridge = readRequired(reader, PATHS.bridge, details)
+  /** 主进程和 LAN Bridge AST。 */
+  const mainSource = parseTypeScript(PATHS.main, main)
+  const bridgeSource = parseTypeScript(PATHS.bridge, bridge)
+  /** 顶层真实 registerBridge 调用。 */
+  const registrationCalls = mainSource.statements.filter((statement): statement is ts.ExpressionStatement => {
+    if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return false
+    if (!ts.isIdentifier(statement.expression.expression) || statement.expression.expression.text !== 'registerBridge') return false
+    /** registerBridge 的首个参数必须是显式 EventBus 注入 factory。 */
+    const registration = statement.expression.arguments[0]
+    return Boolean(
+      registration
+      && ts.isCallExpression(registration)
+      && ts.isIdentifier(registration.expression)
+      && registration.expression.text === 'createLanBridgeRegistration'
+      && ts.isIdentifier(registration.arguments[0])
+      && registration.arguments[0].text === 'agentEventBus',
+    )
+  })
+  /** 统一 Bridge 启动调用数量。 */
+  let startAllBridgesCalls = 0
+  /** LAN registration factory 内 startLanBridge(agentEventBus) 调用数量。 */
+  let injectedStartCalls = 0
+  /** 统计真实调用表达式。 */
+  const countCalls = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+      if (node.expression.text === 'startAllBridges') startAllBridgesCalls += 1
+      if (
+        node.expression.text === 'startLanBridge'
+        && ts.isIdentifier(node.arguments[0])
+        && node.arguments[0].text === 'agentEventBus'
+      ) injectedStartCalls += 1
+    }
+    ts.forEachChild(node, countCalls)
+  }
+  countCalls(mainSource)
+  /** 导出的显式注入 factory。 */
+  const registrationFactory = findExportedFunction(bridgeSource, 'createLanBridgeRegistration')
+  if (registrationFactory) countCalls(registrationFactory)
 
-  if (!/from\s+['"]\.\/lib\/lan-bridge\/lan-bridge['"]/.test(main)) details.push('主进程未导入 lanBridgeRegistration')
-  if (countMatches(main, /registerBridge\s*\(\s*lanBridgeRegistration\s*\)/) !== 1) details.push('主进程必须且只能注册一次 lanBridgeRegistration')
-  if (!/startAllBridges\s*\(/.test(main)) details.push('主进程未通过 startAllBridges 启动统一 Bridge 生命周期')
-  if (!/export\s+const\s+lanBridgeRegistration\s*=/.test(bridge)) details.push('LAN Bridge 未导出 lanBridgeRegistration')
-  if (!/start\s*:\s*\([^)]*\)\s*=>[\s\S]*?startLanBridge\s*\(\s*agentEventBus\s*\)/.test(bridge)) details.push('lanBridgeRegistration.start 未把 agentEventBus 交给 startLanBridge')
+  if (registrationCalls.length !== 1) details.push('主进程必须且只能顶层注册一次 createLanBridgeRegistration(agentEventBus)')
+  if (startAllBridgesCalls < 1) details.push('主进程未通过 startAllBridges 启动统一 Bridge 生命周期')
+  if (!registrationFactory) details.push('LAN Bridge 未导出 createLanBridgeRegistration')
+  if (injectedStartCalls !== 1) details.push('LAN registration factory 未把注入的 agentEventBus 交给 startLanBridge')
 
   return createResult(
     'bridge-composition',
     'Bridge 生命周期组合点',
     [PATHS.main, PATHS.bridge],
-    '在主进程组合根保留唯一 registerBridge(lanBridgeRegistration)，并由 registration.start 调用 startLanBridge(agentEventBus)。',
+    '在主进程组合根唯一调用 registerBridge(createLanBridgeRegistration(agentEventBus))，LAN 模块只消费注入的 EventBus。',
     details,
   )
 }
@@ -176,11 +372,34 @@ function checkIpcComposition(reader: RepositoryReader): ForkCompatCheckResult {
   const rootIpc = readRequired(reader, PATHS.rootIpc, details)
   /** 独立 LAN IPC registrar 源码。 */
   const lanIpc = readRequired(reader, PATHS.lanIpc, details)
+  /** 根 IPC AST 与导出的注册函数。 */
+  const rootSource = parseTypeScript(PATHS.rootIpc, rootIpc)
+  const registerFunction = findExportedFunction(rootSource, 'registerIpcHandlers')
+  /** registerIpcHandlers 函数体中的直接 LAN registrar 调用。 */
+  const directCalls = registerFunction ? countDirectCalls(registerFunction, 'registerLanBridgeIpcHandlers') : 0
+  /** 根 IPC 中满足显式 EventBus 注入形状的调用数量。 */
+  let injectedCalls = 0
+  if (registerFunction?.body) {
+    for (const statement of registerFunction.body.statements) {
+      if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) continue
+      if (!ts.isIdentifier(statement.expression.expression) || statement.expression.expression.text !== 'registerLanBridgeIpcHandlers') continue
+      /** registrar 第二参数必须由根组合点绑定 agentEventBus。 */
+      const dependencies = statement.expression.arguments[1]
+      if (
+        ts.isCallExpression(dependencies)
+        && ts.isIdentifier(dependencies.expression)
+        && dependencies.expression.text === 'createLanBridgeIpcDependencies'
+        && ts.isIdentifier(dependencies.arguments[0])
+        && dependencies.arguments[0].text === 'agentEventBus'
+      ) injectedCalls += 1
+    }
+  }
 
-  if (!/from\s+['"]\.\/lib\/lan-bridge\/lan-bridge-ipc['"]/.test(rootIpc)) details.push('根 IPC 未从独立模块导入 registerLanBridgeIpcHandlers')
-  if (countMatches(rootIpc, /registerLanBridgeIpcHandlers\s*\(\s*ipcMain\s*\)/) !== 1) details.push('根 IPC 必须且只能组合一次 registerLanBridgeIpcHandlers(ipcMain)')
+  if (!collectRuntimeDependencies(PATHS.rootIpc, rootIpc).some((dependency) => dependency.specifier === './lib/lan-bridge/lan-bridge-ipc')) details.push('根 IPC 未从独立模块导入 LAN registrar')
+  if (directCalls !== 1 || injectedCalls !== 1) details.push('registerIpcHandlers 必须直接且唯一调用 registrar，并显式注入 agentEventBus')
   if (!/export\s+interface\s+LanBridgeIpcRegistrar\b/.test(lanIpc)) details.push('独立 LAN IPC 模块缺少可注入 LanBridgeIpcRegistrar')
   if (!/export\s+function\s+registerLanBridgeIpcHandlers\b/.test(lanIpc)) details.push('独立 LAN IPC 模块缺少 registerLanBridgeIpcHandlers 导出')
+  if (!/export\s+function\s+createLanBridgeIpcDependencies\b/.test(lanIpc)) details.push('独立 LAN IPC 模块缺少显式 EventBus 依赖 factory')
 
   return createResult(
     'ipc-composition',
@@ -199,10 +418,45 @@ function checkPreloadComposition(reader: RepositoryReader): ForkCompatCheckResul
   const rootPreload = readRequired(reader, PATHS.rootPreload, details)
   /** 独立 LAN preload 源码。 */
   const lanPreload = readRequired(reader, PATHS.lanPreload, details)
+  /** 根 preload AST。 */
+  const sourceFile = parseTypeScript(PATHS.rootPreload, rootPreload)
+  /** 查找命名变量声明。 */
+  const findVariable = (name: string): ts.VariableDeclaration | undefined => {
+    for (const statement of sourceFile.statements) {
+      if (!ts.isVariableStatement(statement)) continue
+      /** 当前变量语句中匹配名称的声明。 */
+      const declaration = statement.declarationList.declarations.find((candidate) => (
+        ts.isIdentifier(candidate.name) && candidate.name.text === name
+      ))
+      if (declaration) return declaration
+    }
+    return undefined
+  }
+  /** factory 结果变量与最终 API 对象变量。 */
+  const lanApi = findVariable('lanBridgePreloadApi')
+  const electronApi = findVariable('electronAPI')
+  /** 最终 electronAPI 对象中的 LAN spread 数量。 */
+  const spreadCount = electronApi?.initializer && ts.isObjectLiteralExpression(electronApi.initializer)
+    ? electronApi.initializer.properties.filter((property) => (
+      ts.isSpreadAssignment(property)
+      && ts.isIdentifier(property.expression)
+      && property.expression.text === 'lanBridgePreloadApi'
+    )).length
+    : 0
+  /** 独立 factory 的真实调用形状。 */
+  const hasFactoryInitializer = Boolean(
+    lanApi?.initializer
+    && ts.isCallExpression(lanApi.initializer)
+    && ts.isIdentifier(lanApi.initializer.expression)
+    && lanApi.initializer.expression.text === 'createLanBridgePreloadApi'
+    && ts.isIdentifier(lanApi.initializer.arguments[0])
+    && lanApi.initializer.arguments[0].text === 'ipcRenderer',
+  )
 
-  if (!/from\s+['"]\.\/lan-bridge-preload['"]/.test(rootPreload)) details.push('根 preload 未导入独立 LAN preload factory')
+  if (!collectRuntimeDependencies(PATHS.rootPreload, rootPreload).some((dependency) => dependency.specifier === './lan-bridge-preload')) details.push('根 preload 未导入独立 LAN preload factory')
   if (!/interface\s+ElectronAPI\s+extends\s+LanBridgePreloadApi\b/.test(rootPreload)) details.push('ElectronAPI 未继承 LanBridgePreloadApi')
-  if (countMatches(rootPreload, /\.\.\.\s*createLanBridgePreloadApi\s*\(\s*ipcRenderer\s*\)/) !== 1) details.push('根 preload 必须且只能 spread 一次 createLanBridgePreloadApi(ipcRenderer)')
+  if (!hasFactoryInitializer) details.push('根 preload 必须唯一创建 lanBridgePreloadApi factory 结果')
+  if (spreadCount !== 1) details.push('electronAPI 对象必须且只能 spread 一次 lanBridgePreloadApi')
   if (/LAN_BRIDGE_IPC_CHANNELS\s*\./.test(rootPreload)) details.push('根 preload 出现 LAN 通道直连，必须留在独立 factory 内')
   if (!/export\s+function\s+createLanBridgePreloadApi\b/.test(lanPreload)) details.push('独立 LAN preload 缺少 createLanBridgePreloadApi 导出')
 
@@ -260,23 +514,64 @@ function checkAdapterBoundary(reader: RepositoryReader): ForkCompatCheckResult {
   const adapterRoot = readRequired(reader, PATHS.adapterRoot, details)
   /** 不依赖官方服务的纯 Adapter 核心源码。 */
   const adapterCore = readRequired(reader, PATHS.adapterCore, details)
-  /** LAN Bridge 生产源码路径。 */
-  const productionFiles = reader.list('apps/electron/src/main/lib/lan-bridge')
-    .filter((path) => path.endsWith('.ts') && !path.endsWith('.test.ts') && path !== PATHS.adapterRoot)
-
+  /** 判断说明符是否指向被 Adapter 隔离的官方运行时模块。 */
+  const getOfficialModule = (specifier: string): string | undefined => OFFICIAL_RUNTIME_MODULES.find((moduleName) => (
+    specifier === `../${moduleName}`
+    || specifier === `./${moduleName}`
+    || specifier.endsWith(`/${moduleName}`)
+  ))
+  /** 解析相对依赖对应的仓库 TS/TSX 文件。 */
+  const resolveLocalDependency = (ownerPath: string, specifier: string): string | undefined => {
+    if (!specifier.startsWith('.')) return undefined
+    /** 去除显式 JS/TS 扩展后的相对基础路径。 */
+    const basePath = posix.normalize(posix.join(posix.dirname(ownerPath), specifier.replace(/\.(?:[cm]?[jt]sx?)$/, '')))
+    /** TypeScript 本地模块可能使用的候选路径。 */
+    const candidates = [`${basePath}.ts`, `${basePath}.tsx`, posix.join(basePath, 'index.ts'), posix.join(basePath, 'index.tsx')]
+    return candidates.find((candidate) => reader.read(candidate) !== undefined)
+  }
+  /** Adapter 组合根直接绑定的官方运行时模块。 */
+  const adapterRuntimeModules = new Set(
+    collectRuntimeDependencies(PATHS.adapterRoot, adapterRoot)
+      .map((dependency) => getOfficialModule(dependency.specifier))
+      .filter((moduleName): moduleName is string => moduleName !== undefined),
+  )
   for (const moduleName of OFFICIAL_RUNTIME_MODULES) {
-    if (!new RegExp(`from\\s+['"]\\.\\.\\/${moduleName}['"]`).test(adapterRoot)) details.push(`Adapter 组合根缺少官方模块导入：${moduleName}`)
+    if (!adapterRuntimeModules.has(moduleName)) details.push(`Adapter 组合根缺少官方运行时绑定：${moduleName}`)
   }
   if (!/createLanBridgePromaAdapter\s*\(/.test(adapterRoot)) details.push('Adapter 组合根未创建 lanBridgePromaAdapter')
 
-  /** 禁止越过 Adapter 边界的官方模块静态导入。 */
-  const forbiddenImport = new RegExp(`from\\s+['"]\\.\\.\\/(?:${OFFICIAL_RUNTIME_MODULES.join('|')})['"]`)
-  for (const path of productionFiles) {
-    /** 当前 LAN Bridge 生产文件源码。 */
+  /** 从全部 LAN 生产模块开始，递归扫描传递本地运行时依赖。 */
+  const queue = reader.list('apps/electron/src/main/lib/lan-bridge')
+    .filter((path) => /\.tsx?$/.test(path) && !path.endsWith('.test.ts') && !path.endsWith('.test.tsx'))
+  /** 已扫描文件，防止循环依赖无限遍历。 */
+  const visited = new Set<string>()
+  while (queue.length > 0) {
+    /** 当前待扫描文件。 */
+    const path = queue.shift()!
+    if (visited.has(path)) continue
+    visited.add(path)
+    /** 当前生产文件源码。 */
     const content = readRequired(reader, path, details)
-    if (forbiddenImport.test(content)) details.push(`官方运行时静态导入越过 Adapter 边界：${path}`)
+
+    for (const dependency of collectRuntimeDependencies(path, content)) {
+      /** 当前依赖命中的官方模块。 */
+      const officialModule = getOfficialModule(dependency.specifier)
+      if (officialModule) {
+        if (path !== PATHS.adapterRoot) {
+          details.push(`官方运行时依赖越过 Adapter 边界：${path} 通过 ${dependency.syntax} 引用 ${dependency.specifier}`)
+        }
+        continue
+      }
+      /** 继续追踪目录外本地 helper，官方服务边界不会被展开。 */
+      const resolvedPath = resolveLocalDependency(path, dependency.specifier)
+      if (resolvedPath && !visited.has(resolvedPath)) queue.push(resolvedPath)
+    }
   }
-  if (forbiddenImport.test(adapterCore)) details.push('纯 Adapter core 直接导入了官方运行时服务')
+
+  /** 纯 Adapter core 必须保持无官方运行时依赖。 */
+  if (collectRuntimeDependencies(PATHS.adapterCore, adapterCore).some((dependency) => getOfficialModule(dependency.specifier))) {
+    details.push('纯 Adapter core 直接依赖了官方运行时服务')
+  }
 
   return createResult(
     'adapter-boundary',
@@ -305,10 +600,20 @@ function checkMobileBuild(reader: RepositoryReader): ForkCompatCheckResult {
     const buildMobile = electronPackage.scripts?.['build:mobile'] ?? ''
     /** Electron 的打包准备命令。 */
     const packagePrepare = electronPackage.scripts?.['package:prepare'] ?? ''
+    /** package:prepare 中可确认会实际执行的命令段。 */
+    const commandSegments = parseShellCommandSegments(packagePrepare)
 
     if (!/bun\s+run\s+--filter=['"]@proma\/mobile['"]\s+build/.test(buildMobile)) details.push('build:mobile 未调用 @proma/mobile workspace build')
-    if (!/bun\s+run\s+build:mobile\b/.test(packagePrepare)) details.push('package:prepare 未包含移动端构建')
-    if (!/bun\s+run\s+build\b/.test(packagePrepare) || !/bun\s+run\s+sync:runtime-deps\b/.test(packagePrepare)) details.push('package:prepare 未保留 Electron build 或 runtime 依赖同步')
+    if (!commandSegments) {
+      details.push('package:prepare 包含无法安全确认的 shell 语法')
+    } else {
+      /** 三个必需命令在真实 shell segments 中的位置。 */
+      const buildIndex = commandSegments.indexOf('bun run build')
+      const mobileIndex = commandSegments.indexOf('bun run build:mobile')
+      const syncIndex = commandSegments.indexOf('bun run sync:runtime-deps')
+      if (buildIndex < 0 || mobileIndex < 0 || syncIndex < 0) details.push('package:prepare 缺少 Electron build、mobile build 或 runtime 同步命令')
+      else if (!(buildIndex < mobileIndex && mobileIndex < syncIndex)) details.push('package:prepare 必须按 Electron build、mobile build、runtime 同步顺序执行')
+    }
     if (mobilePackage.name !== '@proma/mobile' || !mobilePackage.scripts?.build) details.push('apps/mobile 未保留可执行 build script')
   } catch (error) {
     details.push(`package.json 解析失败：${error instanceof Error ? error.message : String(error)}`)
@@ -329,17 +634,55 @@ function checkMobileResource(reader: RepositoryReader): ForkCompatCheckResult {
   const details: string[] = []
   /** electron-builder 配置源码。 */
   const builder = readRequired(reader, PATHS.electronBuilder, details)
-  /** mobile dist extraResource 条目。 */
-  const resourceBlock = builder.match(/-\s*from\s*:\s*['"]?\.\.\/\.\.\/apps\/mobile\/dist['"]?([\s\S]*?)(?=\n\s*-\s*from\s*:|\n\S|$)/)?.[0]
+  /** 顶层 extraResources 结构化列表。 */
+  const resources = parseTopLevelExtraResources(builder)
+  /** from/to 精确匹配的移动端资源项。 */
+  const mobileResource = resources?.find((entry) => (
+    entry.from === '../../apps/mobile/dist' && entry.to === 'mobile-dist'
+  ))
 
-  if (!resourceBlock) details.push('extraResources 缺少 ../../apps/mobile/dist 来源')
-  else if (!/\bto\s*:\s*['"]?mobile-dist['"]?/.test(resourceBlock)) details.push('移动端资源未映射到 mobile-dist')
+  if (!resources) details.push('electron-builder 顶层缺少可解析的 extraResources list')
+  else if (!mobileResource) details.push('顶层 extraResources 缺少 mobile dist 到 mobile-dist 的精确映射')
+  else if (!mobileResource.filter.includes('**/*')) details.push('mobile-dist 资源项缺少 **/* filter')
 
   return createResult(
     'mobile-resource',
     'Electron 包内 mobile-dist 资源',
     [PATHS.electronBuilder],
     '在 electron-builder.yml 的 extraResources 中把 ../../apps/mobile/dist 映射到 mobile-dist。',
+    details,
+  )
+}
+
+/** 检查上游兼容 workflow 的关键执行与失败传播结构。 */
+function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResult {
+  /** 当前检查的失败原因。 */
+  const details: string[] = []
+  /** workflow YAML 文本。 */
+  const workflow = readRequired(reader, PATHS.workflow, details)
+  /** merge 和 checker 步骤的位置。 */
+  const mergeIndex = workflow.indexOf('Merge upstream tag without committing')
+  const checkerIndex = workflow.indexOf('Check fork compatibility seams')
+  /** cleanup 步骤及其剩余文本。 */
+  const cleanupIndex = workflow.indexOf('Abort merge and remove temporary branch')
+  const cleanup = cleanupIndex >= 0 ? workflow.slice(cleanupIndex) : ''
+
+  if (!/bun-version:\s*latest\b/.test(workflow)) details.push('Bun 版本未复用现有 workflow 的 latest 模式')
+  if (/\|\|\s*true\b/.test(workflow)) details.push('workflow 使用 || true 吞掉命令或 pipeline 错误')
+  if (!/git\s+tag\s+--list\b/.test(workflow)) details.push('tag 选择未使用 fetch 后的本地 tag 列表')
+  if (!/sort\s+-V\b/.test(workflow)) details.push('tag 选择缺少 semver sort -V')
+  if (!/\^v\(0\|\[1-9\]\[0-9\]\*\)/.test(workflow)) details.push('tag 选择缺少严格正式 vMAJOR.MINOR.PATCH 校验')
+  if (mergeIndex < 0 || checkerIndex < 0 || mergeIndex >= checkerIndex) details.push('merge 步骤必须位于 checker 和全部验证步骤之前')
+  if (!/if:\s*always\(\)/.test(cleanup)) details.push('cleanup 步骤缺少 always()')
+  if (!/cleanup_failed=0/.test(cleanup) || !/git\s+merge\s+--abort/.test(cleanup) || !/git\s+switch\s+--detach/.test(cleanup) || !/git\s+branch\s+--delete\s+--force/.test(cleanup) || !/exit\s+"\$cleanup_failed"/.test(cleanup)) {
+    details.push('cleanup 未聚合 abort、switch、delete 的失败并返回非零退出码')
+  }
+
+  return createResult(
+    'workflow-definition',
+    '上游兼容 workflow 失败传播',
+    [PATHS.workflow],
+    '使用 latest Bun、本地正式 tags 和 sort -V；merge 必须先于 checks，cleanup 必须逐项记录并聚合失败退出。',
     details,
   )
 }
@@ -419,6 +762,7 @@ export function checkForkCompatibility(reader: RepositoryReader): ForkCompatChec
     checkMobileBuild(reader),
     checkMobileResource(reader),
     checkLanIpcContract(reader),
+    checkWorkflowDefinition(reader),
   ]
 }
 

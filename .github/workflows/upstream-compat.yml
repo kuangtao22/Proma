@@ -28,7 +28,7 @@ jobs:
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.14
+          bun-version: latest
 
       - name: Select latest official release tag
         id: upstream
@@ -39,36 +39,46 @@ jobs:
           readonly UPSTREAM_URL='https://github.com/ErlichLiu/Proma.git'
           readonly TEMP_BRANCH="compat/upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           readonly BASE_SHA="$(git rev-parse HEAD)"
+          readonly RAW_TAGS_FILE="$RUNNER_TEMP/upstream-tags.txt"
+          readonly RELEASE_TAGS_FILE="$RUNNER_TEMP/upstream-release-tags.txt"
+          readonly SORTED_TAGS_FILE="$RUNNER_TEMP/upstream-release-tags.sorted.txt"
 
-          git remote remove upstream 2>/dev/null || true
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote remove upstream
+          fi
           git remote add upstream "$UPSTREAM_URL"
-          git fetch --force upstream --tags
+          git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'
 
-          mapfile -t RELEASE_TAGS < <(
-            git ls-remote --tags --refs upstream 'v*' \
-              | awk '{ sub("refs/tags/", "", $2); print $2 }' \
-              | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
-              | sort -V \
-              || true
-          )
+          git tag --list 'upstream/v*' > "$RAW_TAGS_FILE"
+          : > "$RELEASE_TAGS_FILE"
+          while IFS= read -r namespaced_tag; do
+            tag="${namespaced_tag#upstream/}"
+            if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              printf '%s\n' "$tag" >> "$RELEASE_TAGS_FILE"
+            fi
+          done < "$RAW_TAGS_FILE"
 
-          if (( ${#RELEASE_TAGS[@]} == 0 )); then
+          if [[ ! -s "$RELEASE_TAGS_FILE" ]]; then
             echo '未找到官方正式 vMAJOR.MINOR.PATCH tag。' >&2
             exit 1
           fi
 
-          if ! printf '%s\n' "${RELEASE_TAGS[@]}" | sort -V -C; then
-            echo '正式 tag 的 semver 排序结果异常。' >&2
-            exit 1
-          fi
+          sort -V "$RELEASE_TAGS_FILE" > "$SORTED_TAGS_FILE"
+          readonly LATEST_TAG="$(tail -n 1 "$SORTED_TAGS_FILE")"
 
-          readonly LATEST_TAG="${RELEASE_TAGS[-1]}"
           if [[ ! "$LATEST_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "最新 tag 不是正式 semver：$LATEST_TAG" >&2
             exit 1
           fi
 
-          readonly UPSTREAM_SHA="$(git rev-parse "${LATEST_TAG}^{commit}")"
+          readonly CONFIRMED_MAX="$(sort -V "$RELEASE_TAGS_FILE" | tail -n 1)"
+          if [[ "$LATEST_TAG" != "$CONFIRMED_MAX" ]]; then
+            echo "最新 tag 不是全部正式候选的最大值：$LATEST_TAG != $CONFIRMED_MAX" >&2
+            exit 1
+          fi
+
+          readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"
+          readonly UPSTREAM_SHA="$(git rev-parse "${UPSTREAM_TAG_REF}^{commit}")"
           echo "base=$BASE_SHA"
           echo "head=$(git rev-parse HEAD)"
           echo "upstream_tag=$LATEST_TAG"
@@ -76,6 +86,7 @@ jobs:
 
           echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
           echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"
           echo "temp_branch=$TEMP_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Merge upstream tag without committing
@@ -84,18 +95,19 @@ jobs:
           BASE_SHA: ${{ steps.upstream.outputs.base_sha }}
           TEMP_BRANCH: ${{ steps.upstream.outputs.temp_branch }}
           UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_TAG_REF: ${{ steps.upstream.outputs.tag_ref }}
         run: |
           set -euo pipefail
 
           git switch --create "$TEMP_BRANCH" "$BASE_SHA"
-          git merge --no-commit --no-ff "$UPSTREAM_TAG"
+          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"
 
           echo "base=$BASE_SHA"
           echo "head=$(git rev-parse HEAD)"
           echo "upstream_tag=$UPSTREAM_TAG"
           if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
             echo "merge_head=$(git rev-parse MERGE_HEAD)"
-          elif git merge-base --is-ancestor "$UPSTREAM_TAG" HEAD; then
+          elif git merge-base --is-ancestor "$UPSTREAM_TAG_REF" HEAD; then
             echo 'merge_state=upstream-tag-already-contained'
           else
             echo '合并命令结束后既没有 MERGE_HEAD，也无法证明上游 tag 已包含在 HEAD 中。' >&2
@@ -133,16 +145,37 @@ jobs:
           BASE_SHA: ${{ steps.upstream.outputs.base_sha }}
           TEMP_BRANCH: ${{ steps.upstream.outputs.temp_branch }}
         run: |
-          set +e
+          set -u
+          cleanup_failed=0
+
+          run_cleanup() {
+            local label="$1"
+            shift
+            echo "cleanup: $label"
+            if "$@"; then
+              echo "cleanup passed: $label"
+            else
+              echo "cleanup failed: $label" >&2
+              cleanup_failed=1
+            fi
+          }
 
           if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
-            git merge --abort
+            run_cleanup 'abort merge' git merge --abort
+          else
+            echo 'cleanup skipped: no merge in progress'
           fi
 
           if [[ -n "${BASE_SHA:-}" ]]; then
-            git switch --detach "$BASE_SHA"
+            run_cleanup 'switch to base' git switch --detach "$BASE_SHA"
+          else
+            echo 'cleanup skipped: base SHA unavailable'
           fi
 
           if [[ -n "${TEMP_BRANCH:-}" ]] && git show-ref --verify --quiet "refs/heads/$TEMP_BRANCH"; then
-            git branch --delete --force "$TEMP_BRANCH"
+            run_cleanup 'delete temporary branch' git branch --delete --force "$TEMP_BRANCH"
+          else
+            echo 'cleanup skipped: temporary branch unavailable'
           fi
+
+          exit "$cleanup_failed"

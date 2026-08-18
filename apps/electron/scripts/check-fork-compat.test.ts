@@ -10,31 +10,37 @@ import {
 const validFiles: Record<string, string> = {
   'apps/electron/src/main/index.ts': `
     import { registerBridge, startAllBridges } from './lib/bridge-registry'
-    import { lanBridgeRegistration } from './lib/lan-bridge/lan-bridge'
-    registerBridge(lanBridgeRegistration)
+    import { agentEventBus } from './lib/agent-service'
+    import { createLanBridgeRegistration } from './lib/lan-bridge/lan-bridge'
+    registerBridge(createLanBridgeRegistration(agentEventBus))
     await startAllBridges()
   `,
   'apps/electron/src/main/lib/lan-bridge/lan-bridge.ts': `
-    export const lanBridgeRegistration = {
-      name: 'LAN Bridge',
-      shouldAutoStart: () => getConfig().enabled,
-      start: () => {
-        const { agentEventBus } = require('../agent-service')
-        return startLanBridge(agentEventBus)
-      },
-      stop: stopLanBridge,
+    import type { AgentEventBus } from '../agent-event-bus'
+    export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+      return {
+        name: 'LAN Bridge',
+        shouldAutoStart: () => getConfig().enabled,
+        start: () => startLanBridge(agentEventBus),
+        stop: stopLanBridge,
+      }
     }
   `,
   'apps/electron/src/main/ipc.ts': `
-    import { registerLanBridgeIpcHandlers } from './lib/lan-bridge/lan-bridge-ipc'
+    import { agentEventBus } from './lib/agent-service'
+    import { createLanBridgeIpcDependencies, registerLanBridgeIpcHandlers } from './lib/lan-bridge/lan-bridge-ipc'
     export function registerIpcHandlers(): void {
-      registerLanBridgeIpcHandlers(ipcMain)
+      registerLanBridgeIpcHandlers(ipcMain, createLanBridgeIpcDependencies(agentEventBus))
     }
   `,
   'apps/electron/src/main/lib/lan-bridge/lan-bridge-ipc.ts': `
     import { LAN_BRIDGE_IPC_CHANNELS } from '@proma/shared'
+    import type { AgentEventBus } from '../agent-event-bus'
     export interface LanBridgeIpcRegistrar { handle: (channel: string, handler: Function) => void }
-    export function registerLanBridgeIpcHandlers(ipc: LanBridgeIpcRegistrar): void {
+    export function createLanBridgeIpcDependencies(agentEventBus: AgentEventBus) {
+      return { start: () => startLanBridge(agentEventBus) }
+    }
+    export function registerLanBridgeIpcHandlers(ipc: LanBridgeIpcRegistrar, dependencies: object): void {
       ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_CONFIG, async () => getConfig())
       ipc.handle(LAN_BRIDGE_IPC_CHANNELS.UPDATE_CONFIG, async () => updateConfig())
       ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_STATUS, async () => getStatus())
@@ -51,7 +57,8 @@ const validFiles: Record<string, string> = {
     import { createLanBridgePreloadApi } from './lan-bridge-preload'
     import type { LanBridgePreloadApi } from './lan-bridge-preload'
     export interface ElectronAPI extends LanBridgePreloadApi {}
-    const electronAPI: ElectronAPI = { ...createLanBridgePreloadApi(ipcRenderer) }
+    const lanBridgePreloadApi = createLanBridgePreloadApi(ipcRenderer)
+    const electronAPI: ElectronAPI = { ...lanBridgePreloadApi }
     contextBridge.exposeInMainWorld('electronAPI', electronAPI)
   `,
   'apps/electron/src/preload/lan-bridge-preload.ts': `
@@ -141,11 +148,38 @@ const validFiles: Record<string, string> = {
   }),
   'apps/mobile/package.json': JSON.stringify({ name: '@proma/mobile', scripts: { build: 'vite build' } }),
   'apps/electron/electron-builder.yml': `
-    extraResources:
-      - from: ../../apps/mobile/dist
-        to: mobile-dist
-        filter:
-          - "**/*"
+extraResources:
+  - from: ../../apps/mobile/dist
+    to: mobile-dist
+    filter:
+      - "**/*"
+  `,
+  '.github/workflows/upstream-compat.yml': `
+name: Upstream Compatibility
+on: [workflow_dispatch]
+jobs:
+  verify:
+    steps:
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Select latest official release tag
+        run: |
+          git tag --list 'upstream/v*' > "$RUNNER_TEMP/tags.txt"
+          grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' "$RUNNER_TEMP/tags.txt"
+          sort -V "$RUNNER_TEMP/tags.txt"
+      - name: Merge upstream tag without committing
+        run: git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"
+      - name: Check fork compatibility seams
+        run: bun run --filter='@proma/electron' check:fork-compat
+      - name: Abort merge and remove temporary branch
+        if: always()
+        run: |
+          cleanup_failed=0
+          git merge --abort || cleanup_failed=1
+          git switch --detach "$BASE_SHA" || cleanup_failed=1
+          git branch --delete --force "$TEMP_BRANCH" || cleanup_failed=1
+          exit "$cleanup_failed"
   `,
 }
 
@@ -181,19 +215,22 @@ describe('fork 上游兼容检查器', () => {
       name: 'Bridge 注册与启动组合点',
       id: 'bridge-composition',
       path: 'apps/electron/src/main/index.ts',
-      mutate: (content) => content.replace('registerBridge(lanBridgeRegistration)', ''),
+      mutate: (content) => content.replace('registerBridge(createLanBridgeRegistration(agentEventBus))', ''),
     },
     {
       name: '独立 LAN IPC registrar',
       id: 'ipc-composition',
       path: 'apps/electron/src/main/ipc.ts',
-      mutate: (content) => content.replace('registerLanBridgeIpcHandlers(ipcMain)', ''),
+      mutate: (content) => content.replace(
+        'registerLanBridgeIpcHandlers(ipcMain, createLanBridgeIpcDependencies(agentEventBus))',
+        '',
+      ),
     },
     {
       name: '根 preload 唯一组合点',
       id: 'preload-composition',
       path: 'apps/electron/src/preload/index.ts',
-      mutate: (content) => content.replace('...createLanBridgePreloadApi(ipcRenderer)', ''),
+      mutate: (content) => content.replace('...lanBridgePreloadApi', ''),
     },
     {
       name: '协议版本和 WS capabilities',
@@ -228,6 +265,12 @@ describe('fork 上游兼容检查器', () => {
       path: 'apps/electron/src/preload/lan-bridge-preload.ts',
       mutate: (content) => content.replace('revokeLanBridgeDevice: Function', 'removedDeviceMethod: Function'),
     },
+    {
+      name: '上游兼容 workflow 结构',
+      id: 'workflow-definition',
+      path: '.github/workflows/upstream-compat.yml',
+      mutate: (content) => content.replace('bun-version: latest', 'bun-version: 1.3.14'),
+    },
   ]
 
   for (const seam of missingSeamCases) {
@@ -260,7 +303,7 @@ describe('fork 上游兼容检查器', () => {
     const files = {
       ...validFiles,
       'apps/electron/src/main/index.ts': validFiles['apps/electron/src/main/index.ts']!
-        .replace('registerBridge(lanBridgeRegistration)', ''),
+        .replace('registerBridge(createLanBridgeRegistration(agentEventBus))', ''),
     }
     /** 捕获 CLI 标准输出和错误输出。 */
     const lines: string[] = []
@@ -274,5 +317,182 @@ describe('fork 上游兼容检查器', () => {
     expect(lines.join('\n')).toContain('[FAIL] Bridge 生命周期组合点')
     expect(lines.join('\n')).toContain('apps/electron/src/main/index.ts')
     expect(lines.join('\n')).toContain('修复：')
+  })
+
+  test('Given 官方服务仅作为 type-only import When 检查 Adapter 边界 Then 不判定运行时越界', () => {
+    /** type-only import 不会生成运行时依赖。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/lib/lan-bridge/type-only.ts': `
+        import type { AgentEventBus } from '../agent-service'
+        export type { AgentSession } from '../agent-session-manager'
+      `,
+    }
+
+    expect(getCheck(files, 'adapter-boundary').passed).toBe(true)
+  })
+
+  /** 所有形式都应被 TypeScript AST 识别为官方服务运行时依赖。 */
+  const runtimeBoundaryCases: Array<{ name: string; source: string }> = [
+    { name: 'require', source: `const service = require('../agent-service')` },
+    { name: 'dynamic import', source: `const service = import('../settings-service')` },
+    { name: 'runtime re-export', source: `export { getSettings } from '../settings-service'` },
+    { name: 'export star', source: `export * from '../chat-service'` },
+  ]
+
+  for (const boundaryCase of runtimeBoundaryCases) {
+    test(`Given LAN 模块通过 ${boundaryCase.name} 访问官方服务 When 检查边界 Then 明确失败`, () => {
+      /** 将当前运行时依赖形式放入 LAN 生产模块。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/lib/lan-bridge/runtime-leak.ts': boundaryCase.source,
+      }
+
+      /** Adapter 边界检查结果。 */
+      const result = getCheck(files, 'adapter-boundary')
+      expect(result.passed).toBe(false)
+      expect(result.details.join('\n')).toContain('runtime-leak.ts')
+    })
+  }
+
+  test('Given LAN 模块经本地 helper 传递依赖官方服务 When 检查边界 Then 报告 helper', () => {
+    /** LAN 入口及其目录外本地 helper。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/lib/lan-bridge/transitive.ts': `import '../lan-runtime-helper'`,
+      'apps/electron/src/main/lib/lan-runtime-helper.ts': `export * from './agent-service'`,
+    }
+
+    /** 传递依赖检查结果。 */
+    const result = getCheck(files, 'adapter-boundary')
+    expect(result.passed).toBe(false)
+    expect(result.details.join('\n')).toContain('lan-runtime-helper.ts')
+  })
+
+  test('Given IPC 注册调用只存在于注释和死函数 When 检查组合点 Then 明确失败', () => {
+    /** 不会执行的伪注册源码。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/ipc.ts': `
+        import { registerLanBridgeIpcHandlers } from './lib/lan-bridge/lan-bridge-ipc'
+        // registerLanBridgeIpcHandlers(ipcMain, dependencies)
+        function deadRegistration() { registerLanBridgeIpcHandlers(ipcMain, dependencies) }
+        export function registerIpcHandlers(): void {}
+      `,
+    }
+
+    expect(getCheck(files, 'ipc-composition').passed).toBe(false)
+  })
+
+  test('Given registerIpcHandlers 真实重复注册 LAN registrar When 检查组合点 Then 明确失败', () => {
+    /** 根注册函数重复执行相同 registrar。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/ipc.ts': validFiles['apps/electron/src/main/ipc.ts']!
+        .replace(
+          'registerLanBridgeIpcHandlers(ipcMain, createLanBridgeIpcDependencies(agentEventBus))',
+          `registerLanBridgeIpcHandlers(ipcMain, createLanBridgeIpcDependencies(agentEventBus))
+           registerLanBridgeIpcHandlers(ipcMain, createLanBridgeIpcDependencies(agentEventBus))`,
+        ),
+    }
+
+    expect(getCheck(files, 'ipc-composition').passed).toBe(false)
+  })
+
+  test('Given 根 preload 仅在注释中出现 spread When 检查组合点 Then 明确失败', () => {
+    /** 没有真实对象 spread 的 preload 源码。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/preload/index.ts': `
+        import { createLanBridgePreloadApi } from './lan-bridge-preload'
+        import type { LanBridgePreloadApi } from './lan-bridge-preload'
+        export interface ElectronAPI extends LanBridgePreloadApi {}
+        const lanBridgePreloadApi = createLanBridgePreloadApi(ipcRenderer)
+        // const electronAPI = { ...lanBridgePreloadApi }
+        const electronAPI: ElectronAPI = {}
+        contextBridge.exposeInMainWorld('electronAPI', electronAPI)
+      `,
+    }
+
+    expect(getCheck(files, 'preload-composition').passed).toBe(false)
+  })
+
+  test('Given LAN spread 只在死对象或在 electronAPI 重复 When 检查组合点 Then 均失败', () => {
+    /** LAN spread 不在实际暴露对象上的源码。 */
+    const deadSpreadFiles = {
+      ...validFiles,
+      'apps/electron/src/preload/index.ts': validFiles['apps/electron/src/preload/index.ts']!
+        .replace(
+          'const electronAPI: ElectronAPI = { ...lanBridgePreloadApi }',
+          'const deadApi = { ...lanBridgePreloadApi }\nconst electronAPI: ElectronAPI = {}',
+        ),
+    }
+    /** 实际暴露对象重复 spread 的源码。 */
+    const duplicateSpreadFiles = {
+      ...validFiles,
+      'apps/electron/src/preload/index.ts': validFiles['apps/electron/src/preload/index.ts']!
+        .replace('...lanBridgePreloadApi', '...lanBridgePreloadApi, ...lanBridgePreloadApi'),
+    }
+
+    expect(getCheck(deadSpreadFiles, 'preload-composition').passed).toBe(false)
+    expect(getCheck(duplicateSpreadFiles, 'preload-composition').passed).toBe(false)
+  })
+
+  test('Given package prepare 用 echo 伪装命令 When 检查移动构建 Then 明确失败', () => {
+    /** shell 只打印命令文本，不实际构建。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/package.json': JSON.stringify({
+        scripts: {
+          'build:mobile': "bun run --filter='@proma/mobile' build",
+          'package:prepare': 'echo "bun run build && bun run build:mobile && bun run sync:runtime-deps"',
+        },
+      }),
+    }
+
+    expect(getCheck(files, 'mobile-build').passed).toBe(false)
+  })
+
+  test('Given package prepare 顺序错误 When 检查移动构建 Then 明确失败', () => {
+    /** 三个真实命令存在但顺序违反打包契约。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/package.json': JSON.stringify({
+        scripts: {
+          'build:mobile': "bun run --filter='@proma/mobile' build",
+          'package:prepare': 'bun run build:mobile && bun run build && bun run sync:runtime-deps',
+        },
+      }),
+    }
+
+    expect(getCheck(files, 'mobile-build').passed).toBe(false)
+  })
+
+  test('Given mobile resource 位于 ignoredResources When 检查 builder 配置 Then 明确失败', () => {
+    /** 结构相似但不属于顶层 extraResources 的 YAML。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/electron-builder.yml': `
+ignoredResources:
+  - from: ../../apps/mobile/dist
+    to: mobile-dist
+    filter:
+      - "**/*"
+      `,
+    }
+
+    expect(getCheck(files, 'mobile-resource').passed).toBe(false)
+  })
+
+  test('Given workflow 吞错或清理静默成功 When 检查定义 Then 明确失败', () => {
+    /** 同时破坏 tag pipeline 与 cleanup 聚合。 */
+    const files = {
+      ...validFiles,
+      '.github/workflows/upstream-compat.yml': validFiles['.github/workflows/upstream-compat.yml']!
+        .replace('git tag --list', 'git tag --list || true #')
+        .replace('exit "$cleanup_failed"', 'exit 0'),
+    }
+
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
   })
 })

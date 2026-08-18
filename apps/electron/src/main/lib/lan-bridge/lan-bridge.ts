@@ -278,17 +278,16 @@ export function updateConfig(updates: Partial<LanBridgeConfig>): LanBridgeConfig
 
 // ===== BridgeRegistration 接口 =====
 
-export const lanBridgeRegistration = {
-  name: 'LAN Bridge',
-  shouldAutoStart: () => getLanBridgeConfig().enabled,
-  needsRecovery: recoveryController.needsRecovery,
-  start: () => {
-    // 动态导入避免循环依赖
-    const { agentEventBus } = require('../agent-service') as { agentEventBus: import('../agent-event-bus').AgentEventBus }
-    return startLanBridge(agentEventBus)
-  },
-  stop: stopLanBridge,
-  recover: recoveryController.recover,
+/** 使用根组合点注入的 EventBus 创建 LAN Bridge 生命周期注册。 */
+export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+  return {
+    name: 'LAN Bridge',
+    shouldAutoStart: () => getLanBridgeConfig().enabled,
+    needsRecovery: recoveryController.needsRecovery,
+    start: () => startLanBridge(agentEventBus),
+    stop: stopLanBridge,
+    recover: recoveryController.recover,
+  }
 }
 
 /** 从 HTTP 请求中提取真实客户端 IP。仅当连接来自本地回环时才信任代理头。 */

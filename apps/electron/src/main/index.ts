@@ -84,7 +84,7 @@ import { createTray, destroyTray, getTray, setTrayFlash } from './tray'
 import { initializeRuntime } from './lib/runtime-init'
 import { seedDefaultSkills } from './lib/config-paths'
 import { upgradeDefaultSkillsInWorkspaces } from './lib/agent-workspace-manager'
-import { hasActiveAgentSessions, stopAllAgents } from './lib/agent-service'
+import { agentEventBus, hasActiveAgentSessions, stopAllAgents } from './lib/agent-service'
 import { disposePiMcpConnections } from './lib/adapters/pi-mcp-tools'
 import { browserController } from './lib/browser-controller'
 import { markRunningDelegationsAsInterrupted } from './lib/agent-session-manager'
@@ -209,9 +209,9 @@ registerBridge({
   stop: () => wechatBridge.stop(),
 })
 
-// LAN Bridge 在注册时内部动态导入 agentEventBus，避免循环依赖
-import { lanBridgeRegistration } from './lib/lan-bridge/lan-bridge'
-registerBridge(lanBridgeRegistration)
+// LAN Bridge 只接收根组合点显式注入的 EventBus，不在自有模块获取官方 runtime。
+import { createLanBridgeRegistration } from './lib/lan-bridge/lan-bridge'
+registerBridge(createLanBridgeRegistration(agentEventBus))
 
 async function recoverEnabledFeishuBots(): Promise<void> {
   const config = getFeishuMultiBotConfig()

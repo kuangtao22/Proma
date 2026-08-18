@@ -7,10 +7,13 @@ import type {
 } from '@proma/shared'
 import type { IpcMainInvokeEvent } from 'electron'
 import {
+  createLanBridgeIpcDependencies,
   registerLanBridgeIpcHandlers,
   type LanBridgeIpcDependencies,
   type LanBridgeIpcRegistrar,
+  type LanBridgeIpcRuntimeDependencies,
 } from './lan-bridge-ipc'
+import type { AgentEventBus } from '../agent-event-bus'
 
 /** 测试用 IPC handler 类型，用于直接验证注册后的转发行为。 */
 type RecordedHandler = (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown
@@ -74,6 +77,41 @@ function createDependencies(overrides: Partial<LanBridgeIpcDependencies> = {}): 
 }
 
 describe('LAN Bridge IPC 注册', () => {
+  test('Given 根组合点注入 AgentEventBus When 创建生产 IPC 依赖 Then start 使用同一实例', async () => {
+    /** 用作对象身份断言的 EventBus。 */
+    const agentEventBus = {} as AgentEventBus
+    /** 记录 startLanBridge 实际收到的 EventBus。 */
+    let receivedEventBus: AgentEventBus | undefined
+    /** 不触碰 Electron 和真实持久化的运行时依赖。 */
+    const runtime: LanBridgeIpcRuntimeDependencies = {
+      getConfig: () => ({ enabled: false, port: 29888, maxConnections: 20 }),
+      updateConfig: () => ({ enabled: false, port: 29888, maxConnections: 20 }),
+      getStatus: () => ({
+        status: 'stopped',
+        pin: '123456',
+        port: 29888,
+        localIp: '127.0.0.1',
+        connectedClients: [],
+      }),
+      startLanBridge: async (received) => {
+        receivedEventBus = received
+      },
+      stop: () => undefined,
+      getPin: () => '123456',
+      refreshPin: () => '654321',
+      createPairingTicket: () => ({ value: 'ticket', expiresAt: 120_000 }),
+      createQrCodeData: async () => 'data:image/png;base64,qr',
+      listDevices: () => [],
+      revokeDevice: () => undefined,
+    }
+
+    /** 由根组合点创建的 IPC 业务依赖。 */
+    const dependencies = createLanBridgeIpcDependencies(agentEventBus, runtime)
+    await dependencies.start()
+
+    expect(receivedEventBus).toBe(agentEventBus)
+  })
+
   test('Given 当前十个命令 When 注册并逐一调用 handlers Then 各注册一次并原样转发', async () => {
     /** 各业务依赖的实际调用次数。 */
     const calls = {
