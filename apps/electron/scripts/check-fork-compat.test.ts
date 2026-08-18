@@ -332,6 +332,91 @@ describe('fork 上游兼容检查器', () => {
     expect(getCheck(files, 'adapter-boundary').passed).toBe(true)
   })
 
+  /** Bridge registration 的 start 仅允许真实绑定注入 EventBus 的函数形式。 */
+  const validBridgeStartCases: Array<{ name: string; source: string }> = [
+    {
+      name: 'arrow property',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          return { start: () => startLanBridge(agentEventBus) }
+        }
+      `,
+    },
+    {
+      name: 'object method',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          return { start() { return startLanBridge(agentEventBus) } }
+        }
+      `,
+    },
+    {
+      name: 'shorthand property',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          const start = () => startLanBridge(agentEventBus)
+          return { start }
+        }
+      `,
+    },
+  ]
+
+  for (const bridgeCase of validBridgeStartCases) {
+    test(`Given ${bridgeCase.name} start 绑定注入 EventBus When 检查 Bridge Then 通过`, () => {
+      /** 使用当前合法 start 表达形式替换 LAN Bridge factory。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/lib/lan-bridge/lan-bridge.ts': bridgeCase.source,
+      }
+
+      expect(getCheck(files, 'bridge-composition').passed).toBe(true)
+    })
+  }
+
+  /** 无关位置或错误参数中的同名调用不能证明 start 行为正确。 */
+  const invalidBridgeStartCases: Array<{ name: string; source: string }> = [
+    {
+      name: '调用藏在无关属性',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          return {
+            start: () => undefined,
+            inspect: () => startLanBridge(agentEventBus),
+          }
+        }
+      `,
+    },
+    {
+      name: '调用藏在不可达函数',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          function deadStart() { return startLanBridge(agentEventBus) }
+          return { start: () => undefined }
+        }
+      `,
+    },
+    {
+      name: 'start 使用错误参数',
+      source: `
+        export function createLanBridgeRegistration(agentEventBus: AgentEventBus) {
+          return { start: () => startLanBridge(otherEventBus) }
+        }
+      `,
+    },
+  ]
+
+  for (const bridgeCase of invalidBridgeStartCases) {
+    test(`Given ${bridgeCase.name} When 检查 Bridge Then 明确失败`, () => {
+      /** 使用不能证明 start 正确绑定的 factory 源码。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/lib/lan-bridge/lan-bridge.ts': bridgeCase.source,
+      }
+
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    })
+  }
+
   /** 所有形式都应被 TypeScript AST 识别为官方服务运行时依赖。 */
   const runtimeBoundaryCases: Array<{ name: string; source: string }> = [
     { name: 'require', source: `const service = require('../agent-service')` },
@@ -467,6 +552,77 @@ describe('fork 上游兼容检查器', () => {
 
     expect(getCheck(files, 'mobile-build').passed).toBe(false)
   })
+
+  test('Given build:mobile filter 未加引号 When 检查移动构建 Then 与引号形式等价通过', () => {
+    /** 使用 shell 合法的无引号 workspace filter。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/package.json': JSON.stringify({
+        scripts: {
+          'build:mobile': 'bun run --filter=@proma/mobile build',
+          'package:prepare': 'bun run build && bun run build:mobile && bun run sync:runtime-deps',
+        },
+      }),
+    }
+
+    expect(getCheck(files, 'mobile-build').passed).toBe(true)
+  })
+
+  /** 两个打包脚本都必须拒绝无法保证执行目标命令的 shell 结构。 */
+  const unsafeShellCases: Array<{ name: string; buildMobile: string; packagePrepare: string }> = [
+    {
+      name: 'build:mobile 用 echo 伪装',
+      buildMobile: `echo "bun run --filter='@proma/mobile' build"`,
+      packagePrepare: 'bun run build && bun run build:mobile && bun run sync:runtime-deps',
+    },
+    {
+      name: 'build:mobile 前置 false',
+      buildMobile: `false && bun run --filter='@proma/mobile' build`,
+      packagePrepare: 'bun run build && bun run build:mobile && bun run sync:runtime-deps',
+    },
+    {
+      name: 'build:mobile 使用变量伪装',
+      buildMobile: 'bun run --filter=$MOBILE_WORKSPACE build',
+      packagePrepare: 'bun run build && bun run build:mobile && bun run sync:runtime-deps',
+    },
+    {
+      name: 'package:prepare 前置 false',
+      buildMobile: 'bun run --filter=@proma/mobile build',
+      packagePrepare: 'false && bun run build && bun run build:mobile && bun run sync:runtime-deps',
+    },
+    {
+      name: 'package:prepare 使用 true 或短路',
+      buildMobile: 'bun run --filter=@proma/mobile build',
+      packagePrepare: 'true || bun run build && bun run build:mobile && bun run sync:runtime-deps',
+    },
+    {
+      name: 'package:prepare 使用子 shell',
+      buildMobile: 'bun run --filter=@proma/mobile build',
+      packagePrepare: '(bun run build && bun run build:mobile) && bun run sync:runtime-deps',
+    },
+    {
+      name: 'package:prepare 仅在引号文本出现命令',
+      buildMobile: 'bun run --filter=@proma/mobile build',
+      packagePrepare: 'echo "bun run build && bun run build:mobile && bun run sync:runtime-deps"',
+    },
+  ]
+
+  for (const shellCase of unsafeShellCases) {
+    test(`Given ${shellCase.name} When 检查移动构建 Then 明确失败`, () => {
+      /** 注入当前不安全 shell 脚本组合。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/package.json': JSON.stringify({
+          scripts: {
+            'build:mobile': shellCase.buildMobile,
+            'package:prepare': shellCase.packagePrepare,
+          },
+        }),
+      }
+
+      expect(getCheck(files, 'mobile-build').passed).toBe(false)
+    })
+  }
 
   test('Given mobile resource 位于 ignoredResources When 检查 builder 配置 Then 明确失败', () => {
     /** 结构相似但不属于顶层 extraResources 的 YAML。 */

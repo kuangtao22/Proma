@@ -121,6 +121,12 @@ interface ExtraResourceEntry {
   filter: string[]
 }
 
+/** 保守 shell 解析器确认可顺序执行的单条命令。 */
+interface ShellCommand {
+  /** 去除 shell 引号后的命令及参数。 */
+  argv: string[]
+}
+
 /** 创建一个成功或失败格式一致的检查结果。 */
 function createResult(
   id: string,
@@ -238,12 +244,151 @@ function findExportedFunction(sourceFile: ts.SourceFile, name: string): ts.Funct
   ))
 }
 
-/** 解析只允许 `&&` 串联的保守 shell command segments。 */
-function parseShellCommandSegments(script: string): string[] | undefined {
-  if (/[;|`\n\r#]/.test(script) || /\$[({A-Za-z_]/.test(script) || /(^|[^&])&([^&]|$)/.test(script)) return undefined
-  /** 去除首尾空白后的实际命令段。 */
-  const segments = script.split(/\s*&&\s*/).map((segment) => segment.trim())
-  return segments.length > 0 && segments.every(Boolean) ? segments : undefined
+/** 判断表达式是否直接调用 startLanBridge，并传入 factory 注入参数。 */
+function isInjectedStartCall(expression: ts.Expression, injectedName: string): boolean {
+  /** await 和括号不改变被调用表达式的语义。 */
+  const unwrapped = ts.isAwaitExpression(expression)
+    ? expression.expression
+    : ts.isParenthesizedExpression(expression)
+      ? expression.expression
+      : expression
+  return Boolean(
+    ts.isCallExpression(unwrapped)
+    && ts.isIdentifier(unwrapped.expression)
+    && unwrapped.expression.text === 'startLanBridge'
+    && ts.isIdentifier(unwrapped.arguments[0])
+    && unwrapped.arguments[0].text === injectedName,
+  )
+}
+
+/** 判断 start 函数自身是否在直接表达式或直接语句中启动 LAN Bridge。 */
+function functionDirectlyStartsLanBridge(
+  functionLike: ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration | ts.FunctionDeclaration,
+  injectedName: string,
+): boolean {
+  if (!ts.isBlock(functionLike.body)) return isInjectedStartCall(functionLike.body, injectedName)
+  return functionLike.body.statements.some((statement) => {
+    if (ts.isReturnStatement(statement) && statement.expression) {
+      return isInjectedStartCall(statement.expression, injectedName)
+    }
+    return ts.isExpressionStatement(statement) && isInjectedStartCall(statement.expression, injectedName)
+  })
+}
+
+/** 解析 factory 直接返回对象上的 start 函数，支持属性、方法和局部 shorthand。 */
+function returnedObjectStartUsesInjectedBus(
+  factory: ts.FunctionDeclaration,
+  injectedName: string,
+): boolean {
+  if (!factory.body) return false
+  /** factory 顶层直接返回的 registration 对象。 */
+  const returnedObject = factory.body.statements
+    .filter((statement): statement is ts.ReturnStatement => ts.isReturnStatement(statement))
+    .map((statement) => statement.expression)
+    .find((expression): expression is ts.ObjectLiteralExpression => Boolean(expression && ts.isObjectLiteralExpression(expression)))
+  if (!returnedObject) return false
+
+  /** registration 对象上的 start 属性或方法。 */
+  const startMember = returnedObject.properties.find((property) => property.name?.getText() === 'start')
+  if (!startMember) return false
+  if (ts.isMethodDeclaration(startMember)) {
+    return functionDirectlyStartsLanBridge(startMember, injectedName)
+  }
+
+  /** 属性 initializer 或 shorthand 名称引用的局部函数。 */
+  let startValue: ts.Expression | ts.FunctionDeclaration | undefined
+  if (ts.isPropertyAssignment(startMember)) {
+    startValue = startMember.initializer
+  } else if (ts.isShorthandPropertyAssignment(startMember)) {
+    /** 与 shorthand 同名的 factory 顶层变量或函数声明。 */
+    const localName = startMember.name.text
+    for (const statement of factory.body.statements) {
+      if (ts.isVariableStatement(statement)) {
+        const declaration = statement.declarationList.declarations.find((candidate) => (
+          ts.isIdentifier(candidate.name) && candidate.name.text === localName
+        ))
+        if (declaration?.initializer) startValue = declaration.initializer
+      } else if (ts.isFunctionDeclaration(statement) && statement.name?.text === localName) {
+        startValue = statement
+      }
+    }
+  }
+
+  if (startValue && (ts.isArrowFunction(startValue) || ts.isFunctionExpression(startValue) || ts.isFunctionDeclaration(startValue))) {
+    return functionDirectlyStartsLanBridge(startValue, injectedName)
+  }
+  return false
+}
+
+/** 解析仅允许顶层 `&&` 串联的命令链，并按 shell 规则移除普通引号。 */
+function parseConjunctiveShellCommands(script: string): ShellCommand[] | undefined {
+  /** 已完成解析的命令。 */
+  const commands: ShellCommand[] = []
+  /** 当前命令的参数列表。 */
+  let argv: string[] = []
+  /** 当前正在构造的参数。 */
+  let token = ''
+  /** 空引号也应产生一个参数。 */
+  let tokenStarted = false
+  /** 当前单引号或双引号状态。 */
+  let quote: "'" | '"' | undefined
+
+  /** 将当前参数提交到 argv。 */
+  const pushToken = (): void => {
+    if (!tokenStarted) return
+    argv.push(token)
+    token = ''
+    tokenStarted = false
+  }
+  /** 将当前 argv 提交为命令。 */
+  const pushCommand = (): boolean => {
+    pushToken()
+    if (argv.length === 0) return false
+    commands.push({ argv })
+    argv = []
+    return true
+  }
+
+  for (let index = 0; index < script.length; index += 1) {
+    /** 当前 shell 字符。 */
+    const character = script[index]!
+    if (quote) {
+      if (character === quote) quote = undefined
+      else {
+        if (character === '$' || character === '`' || character === '\\') return undefined
+        token += character
+      }
+      tokenStarted = true
+      continue
+    }
+
+    if (character === "'" || character === '"') {
+      quote = character
+      tokenStarted = true
+    } else if (/\s/.test(character)) {
+      pushToken()
+    } else if (character === '&' && script[index + 1] === '&') {
+      if (!pushCommand()) return undefined
+      index += 1
+    } else if (';&|`#$()<>\\'.includes(character)) {
+      return undefined
+    } else {
+      token += character
+      tokenStarted = true
+    }
+  }
+
+  if (quote || !pushCommand()) return undefined
+  return commands
+}
+
+/** 判断解析后的命令参数与期望完全一致。 */
+function commandEquals(command: ShellCommand | undefined, expectedArgv: readonly string[]): boolean {
+  return Boolean(
+    command
+    && command.argv.length === expectedArgv.length
+    && command.argv.every((argument, index) => argument === expectedArgv[index]),
+  )
 }
 
 /** 去除 YAML 标量外围引号。 */
@@ -331,29 +476,30 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
   })
   /** 统一 Bridge 启动调用数量。 */
   let startAllBridgesCalls = 0
-  /** LAN registration factory 内 startLanBridge(agentEventBus) 调用数量。 */
-  let injectedStartCalls = 0
   /** 统计真实调用表达式。 */
   const countCalls = (node: ts.Node): void => {
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
       if (node.expression.text === 'startAllBridges') startAllBridgesCalls += 1
-      if (
-        node.expression.text === 'startLanBridge'
-        && ts.isIdentifier(node.arguments[0])
-        && node.arguments[0].text === 'agentEventBus'
-      ) injectedStartCalls += 1
     }
     ts.forEachChild(node, countCalls)
   }
   countCalls(mainSource)
   /** 导出的显式注入 factory。 */
   const registrationFactory = findExportedFunction(bridgeSource, 'createLanBridgeRegistration')
-  if (registrationFactory) countCalls(registrationFactory)
+  /** factory 首个参数是必须由 start 消费的注入 EventBus。 */
+  const injectedParameter = registrationFactory?.parameters[0]?.name
+  const injectedName = injectedParameter && ts.isIdentifier(injectedParameter) ? injectedParameter.text : undefined
+  /** 返回对象的 start 函数是否直接消费注入参数。 */
+  const startUsesInjectedBus = Boolean(
+    registrationFactory
+    && injectedName
+    && returnedObjectStartUsesInjectedBus(registrationFactory, injectedName),
+  )
 
   if (registrationCalls.length !== 1) details.push('主进程必须且只能顶层注册一次 createLanBridgeRegistration(agentEventBus)')
   if (startAllBridgesCalls < 1) details.push('主进程未通过 startAllBridges 启动统一 Bridge 生命周期')
   if (!registrationFactory) details.push('LAN Bridge 未导出 createLanBridgeRegistration')
-  if (injectedStartCalls !== 1) details.push('LAN registration factory 未把注入的 agentEventBus 交给 startLanBridge')
+  if (!startUsesInjectedBus) details.push('LAN registration 返回对象的 start 未直接把注入 EventBus 交给 startLanBridge')
 
   return createResult(
     'bridge-composition',
@@ -600,20 +746,20 @@ function checkMobileBuild(reader: RepositoryReader): ForkCompatCheckResult {
     const buildMobile = electronPackage.scripts?.['build:mobile'] ?? ''
     /** Electron 的打包准备命令。 */
     const packagePrepare = electronPackage.scripts?.['package:prepare'] ?? ''
-    /** package:prepare 中可确认会实际执行的命令段。 */
-    const commandSegments = parseShellCommandSegments(packagePrepare)
+    /** 两个脚本都通过同一个保守 shell 解析器得到顶层命令链。 */
+    const buildMobileCommands = parseConjunctiveShellCommands(buildMobile)
+    const packagePrepareCommands = parseConjunctiveShellCommands(packagePrepare)
+    /** build:mobile 唯一允许的真实 workspace 构建命令。 */
+    const hasValidMobileBuild = buildMobileCommands?.length === 1
+      && commandEquals(buildMobileCommands[0], ['bun', 'run', '--filter=@proma/mobile', 'build'])
+    /** package:prepare 必须无额外前置命令地执行固定三步。 */
+    const hasValidPackagePrepare = packagePrepareCommands?.length === 3
+      && commandEquals(packagePrepareCommands[0], ['bun', 'run', 'build'])
+      && commandEquals(packagePrepareCommands[1], ['bun', 'run', 'build:mobile'])
+      && commandEquals(packagePrepareCommands[2], ['bun', 'run', 'sync:runtime-deps'])
 
-    if (!/bun\s+run\s+--filter=['"]@proma\/mobile['"]\s+build/.test(buildMobile)) details.push('build:mobile 未调用 @proma/mobile workspace build')
-    if (!commandSegments) {
-      details.push('package:prepare 包含无法安全确认的 shell 语法')
-    } else {
-      /** 三个必需命令在真实 shell segments 中的位置。 */
-      const buildIndex = commandSegments.indexOf('bun run build')
-      const mobileIndex = commandSegments.indexOf('bun run build:mobile')
-      const syncIndex = commandSegments.indexOf('bun run sync:runtime-deps')
-      if (buildIndex < 0 || mobileIndex < 0 || syncIndex < 0) details.push('package:prepare 缺少 Electron build、mobile build 或 runtime 同步命令')
-      else if (!(buildIndex < mobileIndex && mobileIndex < syncIndex)) details.push('package:prepare 必须按 Electron build、mobile build、runtime 同步顺序执行')
-    }
+    if (!hasValidMobileBuild) details.push('build:mobile 必须直接执行 @proma/mobile workspace build')
+    if (!hasValidPackagePrepare) details.push('package:prepare 必须按 Electron build、mobile build、runtime 同步顺序直接执行')
     if (mobilePackage.name !== '@proma/mobile' || !mobilePackage.scripts?.build) details.push('apps/mobile 未保留可执行 build script')
   } catch (error) {
     details.push(`package.json 解析失败：${error instanceof Error ? error.message : String(error)}`)
