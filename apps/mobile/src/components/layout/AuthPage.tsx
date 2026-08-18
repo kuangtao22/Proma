@@ -60,24 +60,27 @@ export function AuthPage({
         )}
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label className="block text-sm text-muted-foreground mb-1">地址</label>
+            <label htmlFor="auth-host" className="block text-sm text-muted-foreground mb-1">地址</label>
             <input
+              id="auth-host"
               type="text" value={host} onChange={e => setHost(e.target.value)}
               className="w-full rounded-lg border border-border bg-muted px-3 py-2.5 text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-ring"
               placeholder="192.168.x.x"
             />
           </div>
           <div>
-            <label className="block text-sm text-muted-foreground mb-1">端口</label>
+            <label htmlFor="auth-port" className="block text-sm text-muted-foreground mb-1">端口</label>
             <input
+              id="auth-port"
               type="text" value={port} onChange={e => setPort(e.target.value)}
               className="w-full rounded-lg border border-border bg-muted px-3 py-2.5 text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-ring"
               placeholder="29888"
             />
           </div>
           <div>
-            <label className="block text-sm text-muted-foreground mb-1">PIN 码</label>
+            <label htmlFor="auth-pin" className="block text-sm text-muted-foreground mb-1">PIN 码</label>
             <input
+              id="auth-pin"
               type="text" inputMode="numeric" maxLength={6} autoFocus
               value={pin} onChange={e => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
               className="w-full rounded-lg border border-border bg-muted px-3 py-2.5 text-foreground text-lg tracking-[0.3em] text-center font-mono focus:outline-none focus:ring-2 focus:ring-ring"
