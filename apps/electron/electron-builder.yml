@@ -1,7 +1,7 @@
 # electron-builder 配置
 # 文档: https://www.electron.build/configuration/configuration
 
-appId: com.proma.app
+appId: com.bone.proma.app
 productName: Proma
 copyright: Copyright © 2024-2026 Erlich Liu
 

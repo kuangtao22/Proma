@@ -14,43 +14,17 @@ import { rmSyncWithRetry } from './fs-retry'
 /**
  * 获取配置目录名称
  *
- * 开发模式下返回 '.proma-dev'，正式版本返回 '.proma'。
- * Proma Dev 打包版（productName=Proma Dev）也使用 '.proma-dev'，与官方 Proma 完全隔离。
- *
- * 检测优先级：
- * 1. PROMA_DEV=1 环境变量（显式覆盖）
- * 2. Electron app.isPackaged + productName（Proma Dev 打包版用 .proma-dev）
- * 3. Electron app.isPackaged（未打包 = 开发模式）
- * 4. 兜底 '.proma'
+ * 开发版与打包版统一返回 '.proma'，共享 Skills、模型、渠道和会话等业务配置。
+ * Electron 的 userData 目录仍由主进程独立管理，不受这里影响。
  */
-let _configDirName: string | undefined
-
 export function getConfigDirName(): string {
-  if (_configDirName === undefined) {
-    if (process.env.PROMA_DEV === '1') {
-      _configDirName = '.proma-dev'
-    } else {
-      try {
-        const { app } = require('electron')
-        if (app.isPackaged && app.getName() === 'Proma Dev') {
-          _configDirName = '.proma-dev'
-        } else {
-          _configDirName = app.isPackaged ? '.proma' : '.proma-dev'
-        }
-      } catch {
-        _configDirName = '.proma'
-      }
-    }
-    const mode = _configDirName === '.proma-dev' ? '开发模式' : '正式版本'
-    console.log(`[配置] 配置目录: ~/${_configDirName}/（${mode}）`)
-  }
-  return _configDirName
+  return '.proma'
 }
 
 /**
  * 获取配置目录路径
  *
- * 开发模式返回 ~/.proma-dev/，正式版本返回 ~/.proma/。
+ * 开发版与打包版均返回 ~/.proma/。
  * 如果目录不存在则自动创建。
  */
 export function getConfigDir(): string {

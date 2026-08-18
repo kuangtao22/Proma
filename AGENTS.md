@@ -10,6 +10,7 @@ Proma 是一个本地优先的 Electron AI 桌面 Agent。仓库是 Bun monorepo
 - 状态管理统一使用 Jotai。保持组件化、可读、最小设计；避免过度抽象。
 - 先调研再新增依赖，明确版本与维护状态；不要凭习惯加入依赖。
 - 本地优先：持久化优先采用可移植的 JSON/JSONL 配置文件，不引入本地数据库。
+- 开发版与打包版共享 `~/.proma` 业务配置目录，确保 Skills、模型、渠道和会话设置一致；Electron 内部 `userData` 仍按开发实例隔离。
 - 修改 JSON 配置或会话元数据时，使用 `apps/electron/src/main/lib/safe-file.ts` 的原子写封装；不要直接 `writeFileSync`。
 - 功能改动应有 BDD 风格的可执行测试，至少覆盖正常路径和主要边界。
 - 改动 UI 时复用既有 Radix/shadcn primitives 与主题变量；重视空状态、键盘操作、加载态和深浅主题。
@@ -73,7 +74,7 @@ release-notes/                    版本发布日志
 
 ## 版本、提交与文档
 
-- **每次改动都必须递增版本号**：代码、UI、默认 Skills、文档或工程配置的任何提交，至少将对应交付物的 patch 版本 +1；跨多个可发布包时逐个递增受影响包。
-- `apps/electron/package.json` 是桌面应用版本；`packages/*/package.json` 是各共享包版本；默认 Skill 改动还必须递增其 `SKILL.md` frontmatter 的 `version`。
+- `apps/electron/package.json` 的桌面应用版本必须与当前已合入的最新官方 `v*` 标签一致；fork 自有代码、UI、文档或工程配置改动不单独递增桌面版本。
+- 更新官方版本时，同步将桌面版本改为对应官方标签去掉 `v` 后的版本号。`packages/*/package.json` 跟随合入的官方包版本；默认 Skill 改动仍必须递增其 `SKILL.md` frontmatter 的 `version`。
 - 仅在功能行为、安装方式或用户流程发生变化时更新 README / tutorial / release notes；改文档前先取得用户授权。
 - 提交前检查 `git diff`，不要覆盖用户已有改动或提交无关文件。

@@ -5,7 +5,7 @@
  */
 
 import { join } from 'node:path'
-import { getConfigDir, getConfigDirName } from '../config-paths'
+import { getConfigDir } from '../config-paths'
 import { writeJsonFileAtomic, readJsonFileSafe } from '../safe-file'
 import { DEFAULT_LAN_BRIDGE_CONFIG } from '@proma/shared'
 import type { LanBridgeConfig } from '@proma/shared'
@@ -19,12 +19,7 @@ function getConfigPath(): string {
 /** 获取 LAN Bridge 配置 */
 export function getLanBridgeConfig(): LanBridgeConfig {
   const config = readJsonFileSafe<Partial<LanBridgeConfig>>(getConfigPath())
-  const result = config ? { ...DEFAULT_LAN_BRIDGE_CONFIG, ...config } : { ...DEFAULT_LAN_BRIDGE_CONFIG }
-  // Dev 版本使用 29889 端口，避免与正式版 Proma 的 29888 冲突
-  if (getConfigDirName() === '.proma-dev' && !config?.port) {
-    result.port = 29889
-  }
-  return result
+  return config ? { ...DEFAULT_LAN_BRIDGE_CONFIG, ...config } : { ...DEFAULT_LAN_BRIDGE_CONFIG }
 }
 
 /** 更新 LAN Bridge 配置（合并） */
