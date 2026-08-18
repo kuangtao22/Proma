@@ -77,7 +77,7 @@ describe('LanBridgeSessionManager 设备认证与撤销', () => {
   test('设备 Token 认证成功后记录 deviceId', () => {
     /** 当前用例的会话管理器。 */
     const manager = new LanBridgeSessionManager(20, {
-      verifyToken: () => ({ valid: true, deviceId: 'device-1' }),
+      verifyToken: () => ({ valid: true, deviceId: 'device-1', expiresAt: 10_000 }),
       uuid: () => 'client-1',
     })
     /** 当前用例的测试连接。 */
@@ -89,6 +89,7 @@ describe('LanBridgeSessionManager 设备认证与撤销', () => {
     expect(client.authenticated).toBe(true)
     expect(client.deviceId).toBe('device-1')
     expect(client.authToken).toBe('valid-token')
+    expect(client.authExpiresAt).toBe(10_000)
   })
 
   test('撤销设备时使用合法策略违规关闭码断开其全部连接', () => {
@@ -96,7 +97,7 @@ describe('LanBridgeSessionManager 设备认证与撤销', () => {
     let nextId = 0
     /** 当前用例的会话管理器。 */
     const manager = new LanBridgeSessionManager(20, {
-      verifyToken: token => ({ valid: true, deviceId: token }),
+      verifyToken: token => ({ valid: true, deviceId: token, expiresAt: 10_000 }),
       uuid: () => `client-${++nextId}`,
     })
     /** 属于被撤销设备的首个连接。 */
@@ -121,6 +122,113 @@ describe('LanBridgeSessionManager 设备认证与撤销', () => {
     expect(manager.getClient(clients[0]!.id)).toBeUndefined()
     expect(manager.getClient(clients[1]!.id)).toBeUndefined()
     expect(manager.getClient(clients[2]!.id)).toBe(clients[2])
+  })
+
+  test('有效期前订阅可收消息，恰好到期时先淘汰且不接收当前推送', () => {
+    /** 当前可控时间。 */
+    let now = 99
+    /** 当前用例的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      now: () => now,
+      verifyToken: () => ({ valid: true, deviceId: 'device-1', expiresAt: 100 }),
+      uuid: () => 'client-1',
+    })
+    /** 当前用例的测试连接。 */
+    const socket = new FakeWebSocket()
+    /** 已认证且已订阅的客户端。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+    manager.authenticateFromData(client, { token: 'valid-token' })
+    client.subscriptions.add('session-1')
+
+    for (const subscriber of manager.getSubscribers('session-1')) subscriber.ws.send('before-expiry')
+    now = 100
+    for (const subscriber of manager.getSubscribers('session-1')) subscriber.ws.send('at-expiry')
+
+    expect(socket.sentMessages).toEqual(['before-expiry'])
+    expect(socket.closeCalls).toEqual([{ code: 1008, reason: 'Authentication expired' }])
+    expect(client.subscriptions.size).toBe(0)
+    expect(manager.getClient(client.id)).toBeUndefined()
+    expect(manager.getSubscribers('session-1')).toEqual([])
+    expect(socket.closeCalls).toHaveLength(1)
+  })
+
+  test('broadcast 和认证客户端列表不会返回或推送给到期连接', () => {
+    /** 当前可控时间。 */
+    let now = 99
+    /** 当前用例的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      now: () => now,
+      verifyToken: () => ({ valid: true, deviceId: 'device-1', expiresAt: 100 }),
+      uuid: () => 'client-1',
+    })
+    /** 当前用例的测试连接。 */
+    const socket = new FakeWebSocket()
+    /** 已认证客户端。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+    manager.authenticateFromData(client, { token: 'valid-token' })
+
+    expect(manager.getAuthenticatedClients()).toEqual([client])
+    manager.broadcast({ phase: 'before' })
+    now = 100
+    manager.broadcast({ phase: 'expired' })
+
+    expect(socket.sentMessages).toEqual([JSON.stringify({ phase: 'before' })])
+    expect(manager.getAuthenticatedClients()).toEqual([])
+    expect(socket.closeCalls).toEqual([{ code: 1008, reason: 'Authentication expired' }])
+  })
+
+  test('认证客户端列表入口会直接淘汰到期连接', () => {
+    /** 当前可控时间。 */
+    let now = 99
+    /** 当前用例的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      now: () => now,
+      verifyToken: () => ({ valid: true, deviceId: 'device-1', expiresAt: 100 }),
+      uuid: () => 'client-1',
+    })
+    /** 当前用例的测试连接。 */
+    const socket = new FakeWebSocket()
+    /** 已认证客户端。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+    manager.authenticateFromData(client, { token: 'valid-token' })
+
+    now = 100
+
+    expect(manager.getAuthenticatedClients()).toEqual([])
+    expect(manager.getClient(client.id)).toBeUndefined()
+    expect(socket.closeCalls).toEqual([{ code: 1008, reason: 'Authentication expired' }])
+  })
+
+  test('只回复 pong 不能延长认证期限，心跳在到期时按 1008 淘汰', () => {
+    /** 当前可控时间。 */
+    let now = 0
+    /** 当前用例的手动调度器。 */
+    const scheduler = new ManualIntervalScheduler()
+    /** 当前用例的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, {
+      now: () => now,
+      scheduleInterval: scheduler.schedule,
+      clearScheduledInterval: scheduler.clear,
+      verifyToken: () => ({ valid: true, deviceId: 'device-1', expiresAt: 100 }),
+      uuid: () => 'client-1',
+    })
+    /** 当前用例的测试连接。 */
+    const socket = new FakeWebSocket()
+    /** 已认证客户端。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.2')!
+    manager.authenticateFromData(client, { token: 'valid-token' })
+    manager.startHeartbeat()
+
+    now = 99
+    manager.markPong(client)
+    now = 100
+    scheduler.tick()
+
+    expect(client.lastPongAt).toBe(99)
+    expect(manager.getClient(client.id)).toBeUndefined()
+    expect(socket.closeCalls).toEqual([{ code: 1008, reason: 'Authentication expired' }])
+    expect(socket.terminateCount).toBe(0)
+    expect(socket.sentMessages).toEqual([])
   })
 })
 

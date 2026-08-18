@@ -18,6 +18,8 @@ export interface ClientConnection {
   deviceId?: string
   /** 当前连接最近一次通过结构化验证的设备 Token。 */
   authToken?: string
+  /** 当前连接认证 Token 的绝对失效时间。 */
+  authExpiresAt?: number
   /** 已订阅的 sessionId 集合 */
   subscriptions: Set<string>
   /** 最后活跃时间 */

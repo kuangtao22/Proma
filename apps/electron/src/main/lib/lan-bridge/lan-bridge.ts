@@ -14,8 +14,8 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import { getLanBridgeConfig, updateLanBridgeConfig } from './lan-bridge-config'
 import {
   getCurrentPin,
+  getLanBridgeAuthService,
   initAuth,
-  lanBridgeAuthService,
   refreshPin,
   removeLegacyPinFile,
 } from './lan-bridge-auth'
@@ -42,6 +42,9 @@ let wss: WebSocketServer | null = null
 let sessionManager: LanBridgeSessionManager | null = null
 let status: LanBridgeRuntimeState['status'] = 'stopped'
 let errorMessage: string | undefined
+
+/** 组合根首次加载时固定的生产认证服务，Bridge restart 继续复用。 */
+const lanBridgeAuthService = getLanBridgeAuthService()
 
 registerLanBridgeHandlers({
   authService: lanBridgeAuthService,

@@ -113,6 +113,7 @@ export class LanBridgeSessionManager {
       client.authenticated = true
       client.deviceId = verification.deviceId
       client.authToken = token
+      client.authExpiresAt = verification.expiresAt
       return true
     }
     return false
@@ -137,6 +138,7 @@ export class LanBridgeSessionManager {
 
   /** 获取订阅了指定 sessionId 的所有客户端 */
   getSubscribers(sessionId: string): ClientConnection[] {
+    this.evictExpiredAuthenticatedClients(this.dependencies.now())
     const subscribers: ClientConnection[] = []
     for (const client of this.clients.values()) {
       if (client.authenticated && client.subscriptions.has(sessionId)) {
@@ -148,11 +150,13 @@ export class LanBridgeSessionManager {
 
   /** 获取所有已认证客户端 */
   getAuthenticatedClients(): ClientConnection[] {
+    this.evictExpiredAuthenticatedClients(this.dependencies.now())
     return [...this.clients.values()].filter(c => c.authenticated)
   }
 
   /** 向所有已认证客户端广播 */
   broadcast(message: object): void {
+    this.evictExpiredAuthenticatedClients(this.dependencies.now())
     const data = JSON.stringify(message)
     for (const client of this.clients.values()) {
       if (client.authenticated && client.ws.readyState === 1) {
@@ -173,6 +177,7 @@ export class LanBridgeSessionManager {
     this.stopHeartbeat()
     this.heartbeatTimer = this.dependencies.scheduleInterval(() => {
       const now = this.dependencies.now()
+      this.evictExpiredAuthenticatedClients(now)
       for (const [id, client] of this.clients) {
         // 先清理达到完整超时窗口的连接，避免超时后继续发送心跳。
         if (now - client.lastPongAt >= HEARTBEAT_TIMEOUT_MS) {
@@ -203,6 +208,27 @@ export class LanBridgeSessionManager {
     if (this.heartbeatTimer) {
       this.dependencies.clearScheduledInterval(this.heartbeatTimer)
       this.heartbeatTimer = null
+    }
+  }
+
+  /** 淘汰认证已到期的连接，并确保同一连接最多关闭一次。 */
+  private evictExpiredAuthenticatedClients(now: number): void {
+    for (const [clientId, client] of this.clients) {
+      if (!client.authenticated) continue
+      if (client.authExpiresAt !== undefined && now < client.authExpiresAt) continue
+
+      // 先移出所有可推送集合，再执行可能失败的网络关闭。
+      this.clients.delete(clientId)
+      client.subscriptions.clear()
+      client.authenticated = false
+      client.deviceId = undefined
+      client.authToken = undefined
+      client.authExpiresAt = undefined
+      try {
+        client.ws.close(1008, 'Authentication expired')
+      } catch {
+        console.warn(`[LAN Bridge] 到期认证连接关闭失败: ${client.ip} (${clientId})`)
+      }
     }
   }
 

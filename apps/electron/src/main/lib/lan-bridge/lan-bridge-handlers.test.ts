@@ -142,6 +142,35 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     expect(protectedResponse).toMatchObject({ ok: true, data: { subscribed: 'session-1' } })
   })
 
+  test('refresh 为连接提交新 Token 和延后的认证期限', async () => {
+    /** 当前用例的隔离认证服务。 */
+    const authService = createAuthService()
+    /** 当前用例的真实会话管理器。 */
+    const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-refresh' })
+    registerLanBridgeHandlers({
+      authService,
+      promaAdapter: {} as unknown as LanBridgePromaAdapter,
+      getSessionManager: () => manager,
+    })
+    /** 刷新 Token 的连接。 */
+    const socket = new FakeWebSocket()
+    /** 刷新 Token 的客户端。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.8')!
+    /** 比当前时间早一分钟签发的旧 Token。 */
+    const oldToken = authService.generateToken(client.ip, 'iPhone', Date.now() - 60_000)
+
+    await request(client, socket, 'auth.verify', { token: oldToken.token })
+    expect(client.authExpiresAt).toBe(oldToken.expiresAt)
+    /** 刷新后的协议响应。 */
+    const refreshResponse = await request(client, socket, 'auth.refresh', { token: oldToken.token })
+    /** 刷新后签发的认证数据。 */
+    const refreshed = refreshResponse.data as { token: string; expiresAt: number }
+
+    expect(refreshed.expiresAt).toBeGreaterThan(oldToken.expiresAt)
+    expect(client.authToken).toBe(refreshed.token)
+    expect(client.authExpiresAt).toBe(refreshed.expiresAt)
+  })
+
   test('撤销后断开设备连接并保留 DEVICE_REVOKED 失败语义', async () => {
     /** 当前用例的隔离认证服务。 */
     const authService = createAuthService()

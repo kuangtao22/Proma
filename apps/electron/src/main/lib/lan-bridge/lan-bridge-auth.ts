@@ -47,6 +47,14 @@ export interface LanBridgeAuthServiceOptions {
   logger?: LanBridgeAuthLogger
 }
 
+/** 惰性认证服务 getter 的可测试依赖。 */
+export interface LanBridgeAuthServiceGetterOptions {
+  /** 首次使用时才创建固定设备仓库。 */
+  deviceStoreFactory?: () => LanBridgeDeviceStore
+  /** 认证服务使用的安全 logger。 */
+  logger?: LanBridgeAuthLogger
+}
+
 /** 认证模块用于记录非致命持久化故障的安全 logger。 */
 export interface LanBridgeAuthLogger {
   /** 记录不含凭据的中文警告。 */
@@ -63,6 +71,7 @@ export interface PairingTicket {
 export interface IssuedDeviceToken {
   token: string
   expiresIn: number
+  expiresAt: number
   deviceId: string
 }
 
@@ -73,7 +82,11 @@ export interface TokenFailure {
 }
 
 /** Token 的结构化验证结果。 */
-export type TokenVerificationResult = { valid: true; deviceId: string } | TokenFailure
+export type TokenVerificationResult = {
+  valid: true
+  deviceId: string
+  expiresAt: number
+} | TokenFailure
 
 /** Token 刷新的结构化结果。 */
 export type TokenRefreshResult =
@@ -228,8 +241,11 @@ export class LanBridgeAuthService {
       /** 通过运行时字段验证的 payload。 */
       const payload = parsed
 
+      /** Token 的绝对失效时间。 */
+      const expiresAt = payload.iat + TOKEN_EXPIRY_MS
+      if (!Number.isFinite(expiresAt)) return invalidToken('TOKEN_INVALID')
       if (payload.iat - now > TOKEN_FUTURE_IAT_TOLERANCE_MS) return invalidToken('TOKEN_INVALID')
-      if (now - payload.iat >= TOKEN_EXPIRY_MS) return invalidToken('TOKEN_EXPIRED')
+      if (now >= expiresAt) return invalidToken('TOKEN_EXPIRED')
       if (payload.ip !== ip) return invalidToken('TOKEN_INVALID')
 
       /** Token payload 对应的当前设备记录。 */
@@ -245,7 +261,7 @@ export class LanBridgeAuthService {
         const errorName = error instanceof Error ? error.name : 'UnknownError'
         this.warnSafely(`[LAN Bridge] 设备 ${device.id} 最近访问时间持久化失败（${errorName}）`)
       }
-      return { valid: true, deviceId: device.id }
+      return { valid: true, deviceId: device.id, expiresAt }
     } catch {
       return invalidToken('TOKEN_INVALID')
     }
@@ -301,6 +317,7 @@ export class LanBridgeAuthService {
     return {
       token: `${payloadB64}.${this.sign(payloadB64)}`,
       expiresIn: TOKEN_EXPIRY_MS,
+      expiresAt: now + TOKEN_EXPIRY_MS,
       deviceId: device.id,
     }
   }
@@ -359,37 +376,58 @@ export function createLanBridgeAuthService(options: LanBridgeAuthServiceOptions 
   )
 }
 
-/** 生产进程唯一认证服务；Bridge stop/start 不替换该实例或仓库。 */
-export const lanBridgeAuthService = createLanBridgeAuthService()
+/** 创建首次调用才构造仓库和服务的进程级 getter。 */
+export function createLanBridgeAuthServiceGetter(
+  options: LanBridgeAuthServiceGetterOptions = {},
+): () => LanBridgeAuthService {
+  /** 当前 getter 固定复用的认证服务。 */
+  let service: LanBridgeAuthService | undefined
+  return () => {
+    if (!service) {
+      /** 首次调用时才创建的固定设备仓库。 */
+      const deviceStore = (options.deviceStoreFactory ?? (() => new LanBridgeDeviceStore()))()
+      service = createLanBridgeAuthService({ deviceStore, logger: options.logger })
+    }
+    return service
+  }
+}
+
+/** 生产进程唯一认证服务的惰性 getter。 */
+const getProductionLanBridgeAuthService = createLanBridgeAuthServiceGetter()
+
+/** 获取生产认证服务；Bridge stop/start 始终复用同一实例和仓库。 */
+export function getLanBridgeAuthService(): LanBridgeAuthService {
+  return getProductionLanBridgeAuthService()
+}
 
 /** 轮换生产认证凭据；保留旧模块 facade。 */
 export function initAuth(): string {
-  return lanBridgeAuthService.initialize()
+  return getLanBridgeAuthService().initialize()
 }
 
 /** 获取生产服务当前 PIN。 */
 export function getCurrentPin(): string {
-  return lanBridgeAuthService.getCurrentPin()
+  return getLanBridgeAuthService().getCurrentPin()
 }
 
 /** 刷新生产服务 PIN。 */
 export function refreshPin(): string {
-  return lanBridgeAuthService.refreshPin()
+  return getLanBridgeAuthService().refreshPin()
 }
 
 /** 验证生产服务 PIN。 */
 export function verifyPin(pin: string): boolean {
-  return lanBridgeAuthService.verifyPin(pin)
+  return getLanBridgeAuthService().verifyPin(pin)
 }
 
 /** 按 IP 验证生产服务 PIN。 */
 export function verifyPairingPin(pin: string, ip: string, now = Date.now()): PairingVerificationResult {
-  return lanBridgeAuthService.verifyPairingPin(pin, ip, now)
+  return getLanBridgeAuthService().verifyPairingPin(pin, ip, now)
 }
 
 /** 创建生产服务的一次性票据。 */
 export function createPairingTicket(now = Date.now()): PairingTicket {
-  return lanBridgeAuthService.createPairingTicket(now)
+  return getLanBridgeAuthService().createPairingTicket(now)
 }
 
 /** 消费生产服务的一次性票据。 */
@@ -399,27 +437,27 @@ export function consumePairingTicket(
   deviceName: string,
   now = Date.now(),
 ): IssuedDeviceToken {
-  return lanBridgeAuthService.consumePairingTicket(value, ip, deviceName, now)
+  return getLanBridgeAuthService().consumePairingTicket(value, ip, deviceName, now)
 }
 
 /** 使用生产服务注册设备并签发 Token。 */
 export function generateToken(ip: string, deviceName = 'LAN 设备', now = Date.now()): IssuedDeviceToken {
-  return lanBridgeAuthService.generateToken(ip, deviceName, now)
+  return getLanBridgeAuthService().generateToken(ip, deviceName, now)
 }
 
 /** 使用生产服务验证 Token。 */
 export function verifyTokenDetails(token: string, ip: string, now = Date.now()): TokenVerificationResult {
-  return lanBridgeAuthService.verifyTokenDetails(token, ip, now)
+  return getLanBridgeAuthService().verifyTokenDetails(token, ip, now)
 }
 
 /** 保留旧布尔 Token 验证 facade。 */
 export function verifyToken(token: string, ip: string, now = Date.now()): boolean {
-  return lanBridgeAuthService.verifyToken(token, ip, now)
+  return getLanBridgeAuthService().verifyToken(token, ip, now)
 }
 
 /** 保留旧 nullable Token 刷新 facade。 */
 export function refreshToken(token: string, ip: string, now = Date.now()): IssuedDeviceToken | null {
-  return lanBridgeAuthService.refreshToken(token, ip, now)
+  return getLanBridgeAuthService().refreshToken(token, ip, now)
 }
 
 /** 删除旧版本落盘的明文 PIN 文件。 */

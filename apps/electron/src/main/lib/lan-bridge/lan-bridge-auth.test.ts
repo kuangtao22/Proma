@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import type { WebSocket } from 'ws'
-import { createLanBridgeAuthService } from './lan-bridge-auth'
+import {
+  createLanBridgeAuthService,
+  createLanBridgeAuthServiceGetter,
+} from './lan-bridge-auth'
 import type { LanBridgeAuthService } from './lan-bridge-auth'
 import { LanBridgeDeviceStore } from './lan-bridge-device-store'
 import { LanBridgeSessionManager } from './lan-bridge-session'
@@ -132,10 +136,12 @@ describe('LAN Bridge 设备 Token', () => {
     const result = service.generateToken('192.168.1.8', 'iPhone', 1_000)
 
     expect(result.expiresIn).toBe(24 * 60 * 60 * 1_000)
+    expect(result.expiresAt).toBe(86_401_000)
     expect(store.listDevices()).toHaveLength(1)
     expect(service.verifyTokenDetails(result.token, '192.168.1.8', 86_400_999)).toMatchObject({
       valid: true,
       deviceId: store.listDevices()[0]?.id,
+      expiresAt: 86_401_000,
     })
     expect(service.verifyToken(result.token, '192.168.1.9', 1_001)).toBe(false)
     expect(service.verifyToken(result.token, '192.168.1.8', 86_401_000)).toBe(false)
@@ -194,6 +200,7 @@ describe('LAN Bridge 设备 Token', () => {
     expect(service.verifyTokenDetails(result.token, '192.168.1.8', 61_000)).toEqual({
       valid: true,
       deviceId: 'device-1',
+      expiresAt: 86_401_000,
     })
     expect(warnings).toEqual(['[LAN Bridge] 设备 device-1 最近访问时间持久化失败（Error）'])
     expect(warnings[0]).not.toContain('secret-credential')
@@ -201,6 +208,7 @@ describe('LAN Bridge 设备 Token', () => {
     expect(service.verifyTokenDetails(result.token, '192.168.1.8', 61_001)).toEqual({
       valid: true,
       deviceId: 'device-1',
+      expiresAt: 86_401_000,
     })
     expect(writeCount).toBe(3)
     expect(warnings).toHaveLength(1)
@@ -230,6 +238,7 @@ describe('LAN Bridge 设备 Token', () => {
     expect(service.verifyTokenDetails(issued.token, '192.168.1.8', 61_000)).toEqual({
       valid: true,
       deviceId: 'device-1',
+      expiresAt: 86_401_000,
     })
   })
 
@@ -251,6 +260,68 @@ describe('LAN Bridge 设备 Token', () => {
 })
 
 describe('LanBridgeAuthService 生命周期与协议安全', () => {
+  test('真实模块 import 不触碰用户目录且生产 getter 全进程只返回一个实例', () => {
+    /** 当前子进程使用的隔离 HOME。 */
+    const isolatedHome = mkdtempSync(join(tmpdir(), 'proma-auth-import-'))
+    temporaryDirectories.push(isolatedHome)
+    /** 认证核心模块的绝对 URL。 */
+    const authModuleUrl = pathToFileURL(join(import.meta.dir, 'lan-bridge-auth.ts')).href
+    /** 子进程内验证 import 前后目录状态和生产实例身份的脚本。 */
+    const script = `
+      import { existsSync } from 'node:fs'
+      import { homedir } from 'node:os'
+      import { join } from 'node:path'
+      import { getLanBridgeAuthService } from ${JSON.stringify(authModuleUrl)}
+      const configDir = join(homedir(), '.proma')
+      const existsBeforeGetter = existsSync(configDir)
+      const firstService = getLanBridgeAuthService()
+      const secondService = getLanBridgeAuthService()
+      console.log(JSON.stringify({
+        existsBeforeGetter,
+        existsAfterGetter: existsSync(configDir),
+        sameService: firstService === secondService,
+      }))
+    `
+    /** 隔离 HOME 中执行认证模块导入的子进程结果。 */
+    const result = Bun.spawnSync({
+      cmd: [process.execPath, '-e', script],
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: isolatedHome },
+      stderr: 'pipe',
+      stdout: 'pipe',
+    })
+    /** 子进程最后一行的结构化验证结果。 */
+    const output = new TextDecoder().decode(result.stdout).trim().split('\n').at(-1)
+
+    expect(result.exitCode).toBe(0)
+    expect(output ? JSON.parse(output) : undefined).toEqual({
+      existsBeforeGetter: false,
+      existsAfterGetter: true,
+      sameService: true,
+    })
+  })
+
+  test('生产 getter 未使用前不创建默认仓库且首次使用只创建一次', () => {
+    /** 当前用例累计的设备仓库工厂调用次数。 */
+    let storeFactoryCalls = 0
+    /** 使用生产同款惰性策略的认证服务 getter。 */
+    const getService = createLanBridgeAuthServiceGetter({
+      deviceStoreFactory: () => {
+        storeFactoryCalls++
+        return createIsolatedDeviceStore('proma-lazy-auth-')
+      },
+    })
+
+    expect(storeFactoryCalls).toBe(0)
+    expect(temporaryDirectories).toEqual([])
+    /** 首次获取的认证服务。 */
+    const firstService = getService()
+    expect(storeFactoryCalls).toBe(1)
+    expect(temporaryDirectories).toHaveLength(1)
+    expect(getService()).toBe(firstService)
+    expect(storeFactoryCalls).toBe(1)
+  })
+
   test('重复初始化只轮换凭据并保留同一设备集合', () => {
     /** 当前用例的隔离设备仓库。 */
     const { store } = initTestAuth()

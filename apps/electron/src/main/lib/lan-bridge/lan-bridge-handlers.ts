@@ -74,7 +74,7 @@ function handlePair(
     client.ip,
     typeof data.deviceName === 'string' ? data.deviceName : undefined,
   )
-  markAuthenticated(client, issuedToken.token, issuedToken.deviceId)
+  markAuthenticated(client, issuedToken.token, issuedToken.deviceId, issuedToken.expiresAt)
   return issuedToken
 }
 
@@ -91,7 +91,7 @@ function handlePairTicket(
     client.ip,
     typeof data.deviceName === 'string' ? data.deviceName : 'LAN 设备',
   )
-  markAuthenticated(client, issuedToken.token, issuedToken.deviceId)
+  markAuthenticated(client, issuedToken.token, issuedToken.deviceId, issuedToken.expiresAt)
   return issuedToken
 }
 
@@ -104,7 +104,9 @@ function handleVerify(
   if (!token) return { valid: false, errorCode: 'TOKEN_INVALID' }
   /** 保留具体失败语义的结构化验证结果。 */
   const verification = context.authService.verifyTokenDetails(token, client.ip)
-  if (verification.valid) markAuthenticated(client, token, verification.deviceId)
+  if (verification.valid) {
+    markAuthenticated(client, token, verification.deviceId, verification.expiresAt)
+  }
   return verification
 }
 
@@ -120,7 +122,7 @@ function handleRefresh(
   /** 保留具体失败语义的结构化刷新结果。 */
   const result = context.authService.refreshTokenDetails(token, client.ip)
   if (!result.valid) throwAuthError(result.errorCode)
-  markAuthenticated(client, result.token, result.deviceId)
+  markAuthenticated(client, result.token, result.deviceId, result.expiresAt)
   /** 旧客户端继续读取 token/expiresIn，新增 deviceId 不破坏兼容。 */
   const { valid: _valid, ...issuedToken } = result
   return issuedToken
@@ -402,14 +404,20 @@ function requireAuth(
   /** 每个受保护请求都复验设备状态，禁止 authenticated 布尔旁路撤销。 */
   const verification = authService.verifyTokenDetails(token, client.ip)
   if (!verification.valid) throwAuthError(verification.errorCode)
-  markAuthenticated(client, token, verification.deviceId)
+  markAuthenticated(client, token, verification.deviceId, verification.expiresAt)
 }
 
 /** 同时提交连接认证布尔、设备 ID 和已验证 Token。 */
-function markAuthenticated(client: ClientConnection, token: string, deviceId: string): void {
+function markAuthenticated(
+  client: ClientConnection,
+  token: string,
+  deviceId: string,
+  expiresAt: number,
+): void {
   client.authenticated = true
   client.deviceId = deviceId
   client.authToken = token
+  client.authExpiresAt = expiresAt
 }
 
 /** 将结构化认证失败转换为保留稳定错误码的路由异常。 */
