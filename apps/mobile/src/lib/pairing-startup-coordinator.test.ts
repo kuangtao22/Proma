@@ -114,7 +114,11 @@ describe('移动端启动配对协调器', () => {
     })
 
     expect(coordinator.hasInitialTarget()).toBe(true)
-    expect(coordinator.takeInitialTarget()).toEqual({ host: '192.168.1.2', port: '29888' })
+    expect(coordinator.takeInitialTarget()).toEqual({
+      host: '192.168.1.2',
+      port: '29888',
+      protocol: 'http:',
+    })
     expect(coordinator.hasInitialTarget()).toBe(false)
     expect(coordinator.takeInitialTarget()).toBeNull()
   })
@@ -136,6 +140,7 @@ describe('移动端启动配对协调器', () => {
     let previousTarget = startPairingConnection(coordinator, null, {
       host: '192.168.1.2',
       port: '29888',
+      protocol: 'http:',
     }, {
       connect: (host, port) => connections.push(`${host}:${port}`),
       onPairingCancelled: () => { pairingPending = false },
@@ -150,6 +155,7 @@ describe('移动端启动配对协调器', () => {
     previousTarget = startPairingConnection(coordinator, previousTarget, {
       host: '192.168.1.9',
       port: '31000',
+      protocol: 'http:',
     }, {
       connect: (host, port) => connections.push(`${host}:${port}`),
       onPairingCancelled: () => { pairingPending = false },
@@ -157,7 +163,7 @@ describe('移动端启动配对协调器', () => {
 
     expect(pairingPending).toBe(false)
     expect(connections).toEqual(['192.168.1.2:29888', '192.168.1.9:31000'])
-    expect(previousTarget).toEqual({ host: '192.168.1.9', port: '31000' })
+    expect(previousTarget).toEqual({ host: '192.168.1.9', port: '31000', protocol: 'http:' })
     deferred.resolve({ token: 'late-token' })
     await pairingRequest
     expect(savedTokens).toEqual([])
@@ -185,5 +191,36 @@ describe('移动端启动配对协调器', () => {
 
     expect(fallbacks).toEqual([])
     expect(coordinator.hasPendingTicket()).toBe(false)
+  })
+
+  test('Given HTTPS 非典型端口与默认端口 When 解析扫码目标 Then 保留 scheme 与正确端口', () => {
+    /** HTTPS 非典型端口配对目标。 */
+    const secure = createPairingStartupCoordinator({
+      ticket: 'ticket-secure',
+      cleanUrl: 'https://192.168.1.2:8443/',
+    })
+    /** HTTP 默认端口配对目标。 */
+    const defaultHttp = createPairingStartupCoordinator({
+      ticket: 'ticket-http',
+      cleanUrl: 'http://10.0.0.8/',
+    })
+
+    expect(secure.takeInitialTarget()).toEqual({
+      host: '192.168.1.2', port: '8443', protocol: 'https:',
+    })
+    expect(defaultHttp.takeInitialTarget()).toEqual({
+      host: '10.0.0.8', port: '80', protocol: 'http:',
+    })
+  })
+
+  test('Given IPv6 扫码地址 When 创建启动协调器 Then 不自动连接且直接保留 PIN 回退', () => {
+    const coordinator = createPairingStartupCoordinator({
+      ticket: 'ticket-ipv6',
+      cleanUrl: 'http://[fd00::1]:29888/',
+    })
+
+    expect(coordinator.hasPendingTicket()).toBe(false)
+    expect(coordinator.hasInitialTarget()).toBe(false)
+    expect(coordinator.takeInitialTarget()).toBeNull()
   })
 })

@@ -24,6 +24,7 @@ import {
   startPairingConnection,
 } from './lib/pairing-startup-coordinator'
 import type { PairingConnectionTarget } from './lib/pairing-startup-coordinator'
+import type { WebSocketSourceProtocol } from './lib/ws-client'
 
 interface ConvListResponse { conversations: ConvItem[] }
 interface SessionListResponse { sessions: ConvItem[] }
@@ -75,6 +76,10 @@ export function App() {
   const [startupTargetPending, setStartupTargetPending] = useState(
     startupPairingCoordinator.hasInitialTarget(),
   )
+  /** 连接协议跟随扫码页面 scheme；普通手工连接沿用当前页面协议。 */
+  const [connectionProtocol, setConnectionProtocol] = useState<WebSocketSourceProtocol>(
+    window.location.protocol === 'https:' ? 'https:' : 'http:',
+  )
   /** 每次连接 open 使用独立 generation，旧异步认证无法回写。 */
   const connectionGenerations = useRef(createGenerationTracker())
   /** 记录上一轮实际连接目标，用于识别来自任意 atom 更新源的地址切换。 */
@@ -87,6 +92,7 @@ export function App() {
     if (!target) return
     setHost(target.host)
     setPort(target.port)
+    setConnectionProtocol(target.protocol)
     setStartupTargetPending(false)
   }, [setHost, setPort])
 
@@ -246,7 +252,7 @@ export function App() {
     previousConnectionTarget.current = startPairingConnection(
       startupPairingCoordinator,
       previousConnectionTarget.current,
-      { host, port },
+      { host, port, protocol: connectionProtocol },
       {
         connect,
         onPairingCancelled: () => setPairingPending(false),
@@ -261,7 +267,7 @@ export function App() {
       close()
     }
   }, [
-    host, port, setActive, setChannelBaseUrl, setChannelId, setConnected,
+    host, port, connectionProtocol, setActive, setChannelBaseUrl, setChannelId, setConnected,
     handleAuthSuccess, setConvs, setCurrentWsId, setModelId, setToken, setView, setWorkspaces,
     startupTargetPending,
   ])

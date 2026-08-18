@@ -82,9 +82,12 @@ class FakeWebSocket implements WebSocketLike {
 function createHarness(random = 0) {
   const scheduler = new FakeScheduler()
   const sockets: FakeWebSocket[] = []
+  /** 记录 WebSocket 构造时收到的完整 URL。 */
+  const createdUrls: string[] = []
   const authExpiredCodes: string[] = []
   const client = createWsClient({
-    createWebSocket: () => {
+    createWebSocket: (url) => {
+      createdUrls.push(url)
       const socket = new FakeWebSocket()
       sockets.push(socket)
       return socket
@@ -94,7 +97,7 @@ function createHarness(random = 0) {
     random: () => random,
     authExpired: code => authExpiredCodes.push(code),
   })
-  return { client, scheduler, sockets, authExpiredCodes }
+  return { client, scheduler, sockets, createdUrls, authExpiredCodes }
 }
 
 /** 读取最后一个请求帧，供响应测试复用请求 id。 */
@@ -243,6 +246,18 @@ describe('移动端 WebSocket 请求生命周期', () => {
 })
 
 describe('移动端 WebSocket 重连状态机', () => {
+  test('Given HTTP 与 HTTPS 使用非典型端口 When 建立连接 Then scheme 决定 ws 或 wss 而非端口', () => {
+    /** 分别记录 HTTP 443 与 HTTPS 8443 的连接 URL。 */
+    const httpHarness = createHarness()
+    const httpsHarness = createHarness()
+
+    httpHarness.client.connect('192.168.1.2', '443', 'http:')
+    httpsHarness.client.connect('192.168.1.2', '8443', 'https:')
+
+    expect(httpHarness.createdUrls).toEqual(['ws://192.168.1.2:443/ws'])
+    expect(httpsHarness.createdUrls).toEqual(['wss://192.168.1.2:8443/ws'])
+  })
+
   test('Given 请求挂起 When 手动关闭 Then 拒绝 pending 但不安排重连', async () => {
     const { client, scheduler, sockets } = createHarness()
     client.connect('127.0.0.1', '7788')

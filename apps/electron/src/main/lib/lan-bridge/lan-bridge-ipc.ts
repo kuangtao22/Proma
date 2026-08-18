@@ -1,5 +1,4 @@
-import { LAN_BRIDGE_IPC_CHANNELS } from '@proma/shared'
-import { isIPv4 } from 'node:net'
+import { isRfc1918Ipv4, LAN_BRIDGE_IPC_CHANNELS } from '@proma/shared'
 import type {
   LanBridgeConfig,
   LanBridgeDeviceDto,
@@ -114,7 +113,7 @@ export function registerLanBridgeIpcHandlers(
     /** 当前运行状态提供实际监听端口和已筛选的局域网地址。 */
     const state = resolvedDependencies.getStatus()
     if (state.status !== 'running') throw new Error('LAN Bridge 尚未运行')
-    if (!isReachableIpv4(state.localIp)) throw new Error('没有可用的局域网 IPv4 地址')
+    if (!isRfc1918Ipv4(state.localIp)) throw new Error('没有可用的局域网 IPv4 地址')
 
     /** 只在地址可用后签发票据，避免生成无法消费的临时凭据。 */
     const pairingTicket = resolvedDependencies.createPairingTicket()
@@ -141,11 +140,4 @@ export function registerLanBridgeIpcHandlers(
     if (!device) throw new Error('设备不存在')
     return { revoked: true, device }
   })
-}
-
-/** 判断状态地址是否为可供其他局域网设备访问的非 loopback IPv4。 */
-function isReachableIpv4(address: string): boolean {
-  if (!isIPv4(address)) return false
-  if (address === '0.0.0.0') return false
-  return !address.startsWith('127.')
 }

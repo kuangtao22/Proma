@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   LAN_BRIDGE_CAPABILITIES,
   LAN_BRIDGE_PROTOCOL_VERSION,
+  LAN_BRIDGE_WS_CAPABILITIES,
   type LanBridgeConnectedPayload,
 } from '@proma/shared'
 import { createLanBridgeConnectedPayload } from './lan-bridge-handlers'
@@ -14,12 +15,12 @@ describe('LAN Bridge 协议协商', () => {
       message: 'Proma LAN Bridge',
       protocolVersion: LAN_BRIDGE_PROTOCOL_VERSION,
       serverVersion: '0.17.42',
-      capabilities: [...LAN_BRIDGE_CAPABILITIES],
+      capabilities: [...LAN_BRIDGE_WS_CAPABILITIES],
     }
 
     expect(payload.protocolVersion).toBe(2)
     expect(payload.capabilities).toContain('pairing-ticket')
-    expect(payload.capabilities).toContain('device-revocation')
+    expect(payload.capabilities).not.toContain('device-revocation')
   })
 
   test('能力声明保持为无重复的稳定只读集合', () => {
@@ -34,6 +35,13 @@ describe('LAN Bridge 协议协商', () => {
       'connection-recovery',
     ])
     expect(new Set(capabilities).size).toBe(capabilities.length)
+    expect(LAN_BRIDGE_WS_CAPABILITIES).toEqual([
+      'pin-pairing',
+      'pairing-ticket',
+      'streaming',
+      'connection-recovery',
+    ])
+    expect(new Set(LAN_BRIDGE_WS_CAPABILITIES).size).toBe(LAN_BRIDGE_WS_CAPABILITIES.length)
   })
 
   test('Given WebSocket 建连 When 构造 connected push Then 保留旧消息并声明当前应用版本和能力', () => {
@@ -41,7 +49,7 @@ describe('LAN Bridge 协议协商', () => {
       message: 'Proma LAN Bridge',
       protocolVersion: LAN_BRIDGE_PROTOCOL_VERSION,
       serverVersion: electronPackage.version,
-      capabilities: [...LAN_BRIDGE_CAPABILITIES],
+      capabilities: [...LAN_BRIDGE_WS_CAPABILITIES],
     })
   })
 })

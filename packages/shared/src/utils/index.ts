@@ -73,3 +73,4 @@ export {
   collectSuccessfulSkillReadActivations,
   collectSkillActivations,
 } from './skill-usage'
+export { isRfc1918Ipv4, selectRfc1918Ipv4 } from './private-ipv4'

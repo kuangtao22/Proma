@@ -27,7 +27,12 @@ import { SettingsCard } from './primitives/SettingsCard'
 import { SettingsRow } from './primitives/SettingsRow'
 import { SettingsInput } from './primitives/SettingsInput'
 import { lanBridgeStateAtom, lanBridgeConfigAtom } from '@/atoms/lan-bridge-atoms'
-import { getPairingCountdown, removeRevokedDevice } from './lan-bridge-settings-logic'
+import {
+  createLanBridgeSettingsRequestCoordinator,
+  getPairingCountdown,
+  removeRevokedDevice,
+  shouldRunPairingCountdown,
+} from './lan-bridge-settings-logic'
 import type {
   LanBridgeConfig,
   LanBridgeDeviceDto,
@@ -58,38 +63,47 @@ export function LanBridgeSettings(): React.ReactElement {
   const [devicesError, setDevicesError] = React.useState('')
   const [revokingDeviceId, setRevokingDeviceId] = React.useState<string | null>(null)
   const [now, setNow] = React.useState(Date.now())
+  /** 按资源 generation 隔离乱序 IPC，并统一处理 stop/restart/unmount。 */
+  const requestCoordinator = React.useMemo(createLanBridgeSettingsRequestCoordinator, [])
 
   /** 获取新的短期二维码；旧票据按 AuthService 语义自然保留至短 TTL。 */
   const loadPairingQr = React.useCallback(async () => {
-    setPairingLoading(true)
-    setPairingError('')
-    try {
-      /** 主进程只返回二维码图像和失效时间，不向 renderer 暴露票据。 */
-      const response = await window.electronAPI.getLanBridgePairingQr()
-      setPairingQr(response)
-      setNow(Date.now())
-    } catch (error) {
-      setPairingQr(null)
-      setPairingError(error instanceof Error ? error.message : '无法生成配对二维码')
-    } finally {
-      setPairingLoading(false)
-    }
-  }, [])
+    await requestCoordinator.run('pairingQr', () => window.electronAPI.getLanBridgePairingQr(), {
+      onStart: () => {
+        setPairingLoading(true)
+        setPairingError('')
+      },
+      onSuccess: (response) => {
+        /** 主进程只返回二维码图像和失效时间，不向 renderer 暴露票据。 */
+        setPairingQr(response)
+        setNow(Date.now())
+      },
+      onError: (error) => {
+        setPairingQr(null)
+        setPairingError(error instanceof Error ? error.message : '无法生成配对二维码')
+      },
+      onSettled: () => setPairingLoading(false),
+    })
+  }, [requestCoordinator])
 
   /** 加载当前仍有访问权的设备列表。 */
   const loadDevices = React.useCallback(async () => {
-    setDevicesLoading(true)
-    setDevicesError('')
-    try {
+    await requestCoordinator.run('devices', () => window.electronAPI.listLanBridgeDevices(), {
+      onStart: () => {
+        setDevicesLoading(true)
+        setDevicesError('')
+      },
       /** 默认不包含已撤销设备，保持界面与有效权限一致。 */
-      const response = await window.electronAPI.listLanBridgeDevices()
-      setDevices(response.devices)
-    } catch (error) {
-      setDevicesError(error instanceof Error ? error.message : '无法加载授权设备')
-    } finally {
-      setDevicesLoading(false)
-    }
-  }, [])
+      onSuccess: response => setDevices(response.devices),
+      onError: error => setDevicesError(
+        error instanceof Error ? error.message : '无法加载授权设备',
+      ),
+      onSettled: () => setDevicesLoading(false),
+    })
+  }, [requestCoordinator])
+
+  /** 卸载后永久废弃所有迟到 IPC 回调。 */
+  React.useEffect(() => () => requestCoordinator.unmount(), [requestCoordinator])
 
   // 加载配置和状态
   React.useEffect(() => {
@@ -116,8 +130,16 @@ export function LanBridgeSettings(): React.ReactElement {
 
   // 获取 PIN
   React.useEffect(() => {
-    if (runtimeState.status === 'running') {
-      void window.electronAPI.getLanBridgePin().then(setPin)
+    /** running 变化提升 lifecycle epoch，旧 stop/restart 请求无法回写。 */
+    const isRunningNow = runtimeState.status === 'running'
+    requestCoordinator.setRunning(isRunningNow)
+    if (isRunningNow) {
+      void requestCoordinator.run('pin', () => window.electronAPI.getLanBridgePin(), {
+        onStart: () => undefined,
+        onSuccess: setPin,
+        onError: () => setPin(''),
+        onSettled: () => undefined,
+      })
       void loadPairingQr()
       void loadDevices()
       return
@@ -125,14 +147,25 @@ export function LanBridgeSettings(): React.ReactElement {
     setPin('')
     setPairingQr(null)
     setPairingError('')
+    setPairingLoading(false)
     setDevices([])
     setDevicesError('')
-  }, [runtimeState.status, loadPairingQr, loadDevices])
+    setDevicesLoading(false)
+    setRevokingDeviceId(null)
+  }, [runtimeState.status, loadPairingQr, loadDevices, requestCoordinator])
 
   /** 二维码存在时每秒刷新一次剩余时间，不触发网络请求。 */
   React.useEffect(() => {
-    if (!pairingQr) return
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    if (!pairingQr || !shouldRunPairingCountdown(pairingQr.expiresAt, Date.now())) return
+    /** 到期 tick 内立即停止 interval；新二维码会通过依赖变化重新启动。 */
+    const timer = window.setInterval(() => {
+      /** 当前 tick 时间同时用于展示与是否继续调度的判定。 */
+      const currentNow = Date.now()
+      setNow(currentNow)
+      if (!shouldRunPairingCountdown(pairingQr.expiresAt, currentNow)) {
+        window.clearInterval(timer)
+      }
+    }, 1_000)
     return () => window.clearInterval(timer)
   }, [pairingQr])
 
@@ -159,29 +192,36 @@ export function LanBridgeSettings(): React.ReactElement {
 
   // 刷新 PIN
   const handleRefreshPin = React.useCallback(async () => {
-    try {
-      const newPin = await window.electronAPI.refreshLanBridgePin()
-      setPin(newPin)
-      toast.success('PIN 码已刷新')
-    } catch (error) {
-      toast.error(`刷新失败: ${error instanceof Error ? error.message : String(error)}`)
-    }
-  }, [])
+    await requestCoordinator.run('pin', () => window.electronAPI.refreshLanBridgePin(), {
+      onStart: () => undefined,
+      onSuccess: (newPin) => {
+        setPin(newPin)
+        toast.success('PIN 码已刷新')
+      },
+      onError: error => toast.error(
+        `刷新失败: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+      onSettled: () => undefined,
+    })
+  }, [requestCoordinator])
 
   /** 撤销指定设备；IPC 成功后立即同步本地列表，避免等待下一次刷新。 */
   const handleRevokeDevice = React.useCallback(async (deviceId: string) => {
     if (revokingDeviceId) return
-    setRevokingDeviceId(deviceId)
-    try {
-      await window.electronAPI.revokeLanBridgeDevice({ deviceId })
-      setDevices(current => removeRevokedDevice(current, deviceId))
-      toast.success('设备访问权已撤销')
-    } catch (error) {
-      toast.error(`撤销失败: ${error instanceof Error ? error.message : String(error)}`)
-    } finally {
-      setRevokingDeviceId(null)
-    }
-  }, [revokingDeviceId])
+    await requestCoordinator.run('devices', () => (
+      window.electronAPI.revokeLanBridgeDevice({ deviceId })
+    ), {
+      onStart: () => setRevokingDeviceId(deviceId),
+      onSuccess: () => {
+        setDevices(current => removeRevokedDevice(current, deviceId))
+        toast.success('设备访问权已撤销')
+      },
+      onError: error => toast.error(
+        `撤销失败: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+      onSettled: () => setRevokingDeviceId(null),
+    })
+  }, [revokingDeviceId, requestCoordinator])
 
   // 保存配置
   const handleSaveConfig = React.useCallback(async () => {
@@ -284,8 +324,8 @@ export function LanBridgeSettings(): React.ReactElement {
           )}
         >
           <SettingsCard divided={false}>
-            <div className="flex min-h-[244px] items-center gap-6 px-4 py-4">
-              <div className="flex h-[212px] w-[212px] shrink-0 items-center justify-center rounded-lg border border-border/60 bg-white p-2">
+            <div className="flex min-h-[244px] flex-wrap items-center justify-center gap-4 px-4 py-4 sm:justify-start sm:gap-6">
+              <div className="flex aspect-square w-full max-w-[212px] shrink-0 items-center justify-center rounded-lg border border-border/60 bg-white p-2">
                 {pairingLoading && !pairingQr ? (
                   <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" aria-label="正在生成二维码" />
                 ) : pairingQr ? (
@@ -298,7 +338,7 @@ export function LanBridgeSettings(): React.ReactElement {
                   <QrCode className="h-10 w-10 text-muted-foreground/40" aria-hidden="true" />
                 )}
               </div>
-              <div className="min-w-0 space-y-2">
+              <div className="w-full min-w-0 flex-1 space-y-2 sm:w-auto">
                 <div className="flex items-center gap-2 text-sm font-medium text-foreground">
                   <Smartphone size={16} />
                   手机扫码连接
@@ -398,11 +438,16 @@ export function LanBridgeSettings(): React.ReactElement {
           ) : (
             <SettingsCard>
               {devices.map(device => (
-                <SettingsRow
-                  key={device.id}
-                  label={device.name}
-                  description={`最近访问 ${formatDeviceTime(device.lastSeenAt)}`}
-                >
+                <div key={device.id} className="flex min-w-0 items-center justify-between gap-3 px-4 py-3">
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-foreground" title={device.name}>
+                      {device.name}
+                    </p>
+                    <p className="mt-0.5 truncate text-sm text-muted-foreground">
+                      最近访问 {formatDeviceTime(device.lastSeenAt)}
+                    </p>
+                  </div>
+                  <div className="shrink-0">
                   <AlertDialog>
                     <Tooltip>
                       <TooltipTrigger asChild>
@@ -441,7 +486,8 @@ export function LanBridgeSettings(): React.ReactElement {
                       </AlertDialogFooter>
                     </AlertDialogContent>
                   </AlertDialog>
-                </SettingsRow>
+                  </div>
+                </div>
               ))}
             </SettingsCard>
           )}

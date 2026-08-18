@@ -10,8 +10,8 @@ import type { ClientConnection, RouteHandler } from './lan-bridge-types'
 import type { LanBridgeSessionManager } from './lan-bridge-session'
 import type { LanBridgePromaAdapter } from './lan-bridge-proma-adapter-core'
 import {
-  LAN_BRIDGE_CAPABILITIES,
   LAN_BRIDGE_PROTOCOL_VERSION,
+  LAN_BRIDGE_WS_CAPABILITIES,
 } from '@proma/shared'
 import type { LanBridgeConnectedPayload } from '@proma/shared'
 
@@ -21,7 +21,7 @@ export function createLanBridgeConnectedPayload(serverVersion: string): LanBridg
     message: 'Proma LAN Bridge',
     protocolVersion: LAN_BRIDGE_PROTOCOL_VERSION,
     serverVersion,
-    capabilities: [...LAN_BRIDGE_CAPABILITIES],
+    capabilities: [...LAN_BRIDGE_WS_CAPABILITIES],
   }
 }
 

@@ -25,10 +25,89 @@ export function getPairingCountdown(expiresAt: number, now: number): PairingCoun
   }
 }
 
+/** 判断二维码倒计时是否仍需继续调度。 */
+export function shouldRunPairingCountdown(expiresAt: number, now: number): boolean {
+  return expiresAt > now
+}
+
 /** 从当前授权列表即时移除已撤销设备。 */
 export function removeRevokedDevice(
   devices: LanBridgeDeviceDto[],
   deviceId: string,
 ): LanBridgeDeviceDto[] {
   return devices.filter(device => device.id !== deviceId)
+}
+
+/** 设置页受运行状态约束的异步资源类别。 */
+export type LanBridgeSettingsRequestScope = 'pairingQr' | 'devices' | 'pin'
+
+/** 单次设置页异步请求的状态提交动作。 */
+export interface LanBridgeSettingsRequestCallbacks<T> {
+  /** 请求开始时设置 loading。 */
+  onStart: () => void
+  /** 当前请求成功时提交结果。 */
+  onSuccess: (value: T) => void
+  /** 当前请求失败时提交错误。 */
+  onError: (error: unknown) => void
+  /** 当前请求结束时清理 loading。 */
+  onSettled: () => void
+}
+
+/** 设置页异步请求协调器。 */
+export interface LanBridgeSettingsRequestCoordinator {
+  /** 更新 Bridge 运行态。 */
+  setRunning: (running: boolean) => void
+  /** 执行一次受生命周期保护的请求。 */
+  run: <T>(
+    scope: LanBridgeSettingsRequestScope,
+    request: () => Promise<T>,
+    callbacks: LanBridgeSettingsRequestCallbacks<T>,
+  ) => Promise<void>
+  /** 标记组件卸载。 */
+  unmount: () => void
+}
+
+/** 创建按资源分代、受运行态和卸载态约束的设置页请求协调器。 */
+export function createLanBridgeSettingsRequestCoordinator(): LanBridgeSettingsRequestCoordinator {
+  /** 当前 Bridge 是否运行。 */
+  let running = false
+  /** 组件卸载后永久拒绝状态提交。 */
+  let mounted = true
+  /** stop/restart 或卸载时提升，统一淘汰所有旧请求。 */
+  let lifecycleEpoch = 0
+  /** 各资源独立分代，允许 QR、设备与 PIN 并行。 */
+  const scopeGenerations = new Map<LanBridgeSettingsRequestScope, number>()
+  return {
+    setRunning: value => {
+      if (running === value) return
+      running = value
+      lifecycleEpoch += 1
+    },
+    run: async (scope, request, callbacks) => {
+      if (!mounted || !running) return
+      /** 当前资源的新 generation 会立即淘汰上一同类请求。 */
+      const generation = (scopeGenerations.get(scope) ?? 0) + 1
+      scopeGenerations.set(scope, generation)
+      /** 捕获请求启动时的全局生命周期。 */
+      const requestEpoch = lifecycleEpoch
+      /** 同时校验 mounted、running、epoch 与 scope generation。 */
+      const isCurrent = (): boolean => mounted
+        && running
+        && lifecycleEpoch === requestEpoch
+        && scopeGenerations.get(scope) === generation
+      callbacks.onStart()
+      try {
+        const value = await request()
+        if (isCurrent()) callbacks.onSuccess(value)
+      } catch (error) {
+        if (isCurrent()) callbacks.onError(error)
+      } finally {
+        if (isCurrent()) callbacks.onSettled()
+      }
+    },
+    unmount: () => {
+      mounted = false
+      lifecycleEpoch += 1
+    },
+  }
 }

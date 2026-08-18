@@ -1,16 +1,19 @@
+import { isRfc1918Ipv4 } from '@proma/shared'
 import { getPairingFailureMessage, supportsPairingTicket } from './pairing-link'
 import type { PairingLink } from './pairing-link'
+import type { WebSocketSourceProtocol } from './ws-client'
 
 /** 启动配对地址目标。 */
 export interface PairingConnectionTarget {
   host: string
   port: string
+  protocol: WebSocketSourceProtocol
 }
 
 /** 地址切换时由 App 执行的连接与 UI 状态动作。 */
 export interface PairingConnectionActions {
   /** 使用当前 atoms 中的地址建立连接。 */
-  connect: (host: string, port: string) => void
+  connect: (host: string, port: string, protocol: WebSocketSourceProtocol) => void
   /** 自动配对被地址切换取消后解除 PIN 禁用态。 */
   onPairingCancelled: () => void
 }
@@ -48,21 +51,23 @@ export function startPairingConnection(
 ): PairingConnectionTarget {
   /** 只有地址实际改变才取消，兼容 StrictMode 对同一 effect 的重复挂载。 */
   const targetChanged = previousTarget !== null && (
-    previousTarget.host !== target.host || previousTarget.port !== target.port
+    previousTarget.host !== target.host
+    || previousTarget.port !== target.port
+    || previousTarget.protocol !== target.protocol
   )
   if (targetChanged && coordinator.cancel()) {
     actions.onPairingCancelled()
   }
-  actions.connect(target.host, target.port)
+  actions.connect(target.host, target.port, target.protocol)
   return target
 }
 
 /** 创建只持有一次性 ticket/target 的启动协调器。 */
 export function createPairingStartupCoordinator(link: PairingLink | null): PairingStartupCoordinator {
-  /** 尚未提交的一次性票据；发请求前即清空，禁止重连重放。 */
-  let pendingTicket = link?.ticket ?? null
   /** 尚未同步进连接 atoms 的启动目标；只允许读取一次。 */
   let initialTarget = link ? parseConnectionTarget(link.cleanUrl) : null
+  /** 只有目标属于受支持的私有 IPv4 时才保留一次性票据。 */
+  let pendingTicket = initialTarget ? link?.ticket ?? null : null
   /** 当前请求编号；取消后置空以忽略迟到成功或失败。 */
   let activeRequestId: number | null = null
   /** 为每次真实票据请求分配单调递增编号。 */
@@ -125,9 +130,12 @@ function parseConnectionTarget(cleanUrl: string): PairingConnectionTarget | null
   try {
     /** cleanUrl 已无凭据，只用于 host/port 同步。 */
     const url = new URL(cleanUrl)
+    if (!isRfc1918Ipv4(url.hostname)) return null
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
     return {
       host: url.hostname,
       port: url.port || (url.protocol === 'https:' ? '443' : '80'),
+      protocol: url.protocol,
     }
   } catch {
     return null

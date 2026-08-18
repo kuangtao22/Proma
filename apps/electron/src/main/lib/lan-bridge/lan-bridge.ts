@@ -25,7 +25,7 @@ import { getConfigDir } from '../config-paths'
 import { LanBridgeSessionManager } from './lan-bridge-session'
 import { dispatch } from './lan-bridge-router'
 import type { LanBridgeConfig, LanBridgeRuntimeState } from '@proma/shared'
-import { LAN_BRIDGE_IPC_CHANNELS } from '@proma/shared'
+import { isRfc1918Ipv4, LAN_BRIDGE_IPC_CHANNELS, selectRfc1918Ipv4 } from '@proma/shared'
 
 import {
   createLanBridgeConnectedPayload,
@@ -36,6 +36,7 @@ import { startSubscription, stopSubscription } from './lan-bridge-subscription'
 import type { AgentEventBus } from '../agent-event-bus'
 import { createLanBridgeRecoveryController } from './lan-bridge-recovery'
 import { createLanBridgeMessageHandler } from './lan-bridge-message-handler'
+import { executeLanBridgeDeviceRevocation } from './lan-bridge-device-revocation'
 
 // ===== 单例状态 =====
 
@@ -133,7 +134,7 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
     httpServer.on('upgrade', (req: IncomingMessage, socket: any, head: Buffer) => {
       if (req.url === '/ws') {
         const ip = extractIp(req)
-        if (!isPrivateIp(ip)) {
+        if (!isRfc1918Ipv4(ip)) {
           socket.destroy()
           return
         }
@@ -242,11 +243,11 @@ export function listLanBridgeDevices(includeRevoked = false): LanBridgeDevice[] 
  * @returns 撤销后的设备；不存在时返回 undefined
  */
 export function revokeLanBridgeDevice(deviceId: string, now = Date.now()): LanBridgeDevice | undefined {
-  /** 原子持久化成功后的撤销设备。 */
-  const revokedDevice = lanBridgeAuthService.revokeDevice(deviceId, now)
-  if (!revokedDevice) return undefined
-  sessionManager?.disconnectDevice(deviceId)
-  return revokedDevice
+  return executeLanBridgeDeviceRevocation({
+    revokeDevice: () => lanBridgeAuthService.revokeDevice(deviceId, now),
+    disconnectDevice: () => sessionManager?.disconnectDevice(deviceId),
+    notifyStatusChanged,
+  })
 }
 
 /** 获取配置 */
@@ -310,26 +311,11 @@ function getLocalIp(): string {
     }
   }
   // 优先返回 192.168.x.x（家庭/办公 WiFi），其次 10.x / 172.16-31.x
-  const wifi = candidates.find(ip => ip.startsWith('192.168.'))
+  const wifi = candidates.find(ip => ip.startsWith('192.168.') && isRfc1918Ipv4(ip))
   if (wifi) return wifi
-  const rfc1918 = candidates.find(ip => isPrivateIp(ip))
+  const rfc1918 = selectRfc1918Ipv4(candidates)
   if (rfc1918) return rfc1918
-  return candidates[0] ?? '127.0.0.1'
-}
-
-/** 检查 IP 是否为 RFC 1918 私有地址或 localhost */
-function isPrivateIp(ip: string): boolean {
-  if (ip === '::1' || ip === '127.0.0.1' || ip === 'localhost') return true
-  // 10.0.0.0/8
-  if (ip.startsWith('10.')) return true
-  // 172.16.0.0/12
-  if (ip.startsWith('172.')) {
-    const second = parseInt(ip.split('.')[1] ?? '0', 10)
-    if (second >= 16 && second <= 31) return true
-  }
-  // 192.168.0.0/16
-  if (ip.startsWith('192.168.')) return true
-  return false
+  return '127.0.0.1'
 }
 
 function cleanup(): void {

@@ -34,13 +34,16 @@ export interface WsClientDependencies {
 }
 
 export interface WsClient {
-  connect(host: string, port: string): WebSocketLike
+  connect(host: string, port: string, protocol?: WebSocketSourceProtocol): WebSocketLike
   close(): void
   onOpen(handler: OpenHandler): () => void
   onPush(handler: PushHandler): () => void
   wsReq(type: string, data?: Record<string, unknown>, timeout?: number): Promise<unknown>
   pendingCount(): number
 }
+
+/** 决定 WebSocket 安全性的原始页面协议。 */
+export type WebSocketSourceProtocol = 'http:' | 'https:'
 
 interface PendingRequest {
   resolve(value: unknown): void
@@ -76,6 +79,7 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
   let socket: WebSocketLike | null = null
   let host = ''
   let port = ''
+  let sourceProtocol: WebSocketSourceProtocol = 'http:'
   let reconnectTimer: unknown = null
   let reconnectBaseDelay = 1000
   let openHandler: OpenHandler | null = null
@@ -119,8 +123,9 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
 
   /** 建立一次连接；事件只允许当前 socket 修改客户端状态。 */
   function openConnection(isReconnect: boolean): WebSocketLike {
-    const protocol = port === '443' ? 'wss' : 'ws'
-    const currentSocket = dependencies.createWebSocket(`${protocol}://${host}:${port}/ws`)
+    /** WebSocket scheme 必须跟随配对页面协议，不能从端口猜测。 */
+    const socketProtocol = sourceProtocol === 'https:' ? 'wss' : 'ws'
+    const currentSocket = dependencies.createWebSocket(`${socketProtocol}://${host}:${port}/ws`)
     socket = currentSocket
 
     currentSocket.onopen = () => {
@@ -172,7 +177,11 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
   }
 
   /** 显式连接会替换旧 socket，并从首次连接状态开始。 */
-  function connect(nextHost: string, nextPort: string): WebSocketLike {
+  function connect(
+    nextHost: string,
+    nextPort: string,
+    nextProtocol: WebSocketSourceProtocol = 'http:',
+  ): WebSocketLike {
     clearReconnectTimer()
     const previousSocket = socket
     socket = null
@@ -182,6 +191,7 @@ export function createWsClient(dependencies: WsClientDependencies): WsClient {
     }
     host = nextHost
     port = nextPort
+    sourceProtocol = nextProtocol
     reconnectBaseDelay = 1000
     return openConnection(false)
   }
@@ -256,8 +266,12 @@ const defaultClient = createWsClient({
 })
 
 /** 使用浏览器默认实例建立连接。 */
-export function connect(host: string, port: string): WebSocketLike {
-  return defaultClient.connect(host, port)
+export function connect(
+  host: string,
+  port: string,
+  protocol: WebSocketSourceProtocol = 'http:',
+): WebSocketLike {
+  return defaultClient.connect(host, port, protocol)
 }
 
 /** 使用浏览器默认实例手动关闭连接。 */

@@ -20,6 +20,14 @@ export const LAN_BRIDGE_CAPABILITIES = [
 /** LAN Bridge 可协商能力。 */
 export type LanBridgeCapability = typeof LAN_BRIDGE_CAPABILITIES[number]
 
+/** WebSocket 远端客户端可实际调用或依赖的能力集合。 */
+export const LAN_BRIDGE_WS_CAPABILITIES = [
+  'pin-pairing',
+  'pairing-ticket',
+  'streaming',
+  'connection-recovery',
+] as const satisfies readonly LanBridgeCapability[]
+
 /** WebSocket 连接建立后的协议协商信息。 */
 export interface LanBridgeConnectedPayload {
   message: string
