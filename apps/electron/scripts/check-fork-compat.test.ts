@@ -94,11 +94,44 @@ jobs:
         run: bun run electron:build
       - name: Abort merge and remove temporary branch
         if: always()
+        shell: bash
+        env:
+          BASE_SHA: \${{ steps.upstream.outputs.base_sha }}
+          TEMP_BRANCH: \${{ steps.upstream.outputs.temp_branch }}
         run: |
+          set -u
           cleanup_failed=0
-          run_cleanup 'abort merge' git merge --abort
-          run_cleanup 'switch to base' git switch --detach "$BASE_SHA"
-          run_cleanup 'delete temporary branch' git branch --delete --force "$TEMP_BRANCH"
+
+          run_cleanup() {
+            local label="$1"
+            shift
+            echo "cleanup: $label"
+            if "$@"; then
+              echo "cleanup passed: $label"
+            else
+              echo "cleanup failed: $label" >&2
+              cleanup_failed=1
+            fi
+          }
+
+          if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
+            run_cleanup 'abort merge' git merge --abort
+          else
+            echo 'cleanup skipped: no merge in progress'
+          fi
+
+          if [[ -n "\${BASE_SHA:-}" ]]; then
+            run_cleanup 'switch to base' git switch --detach "$BASE_SHA"
+          else
+            echo 'cleanup skipped: base SHA unavailable'
+          fi
+
+          if [[ -n "\${TEMP_BRANCH:-}" ]] && git show-ref --verify --quiet "refs/heads/$TEMP_BRANCH"; then
+            run_cleanup 'delete temporary branch' git branch --delete --force "$TEMP_BRANCH"
+          else
+            echo 'cleanup skipped: temporary branch unavailable'
+          fi
+
           exit "$cleanup_failed"
 `
 
@@ -394,6 +427,95 @@ describe('fork 上游兼容检查器', () => {
     expect(lines.join('\n')).toContain('[FAIL] Bridge 生命周期组合点')
     expect(lines.join('\n')).toContain('apps/electron/src/main/index.ts')
     expect(lines.join('\n')).toContain('修复：')
+  })
+
+  /** 三个组合根都必须从目标模块的真实 named import 获取运行时 binding。 */
+  const forgedImportCases = [
+    {
+      name: 'Bridge factory',
+      id: 'bridge-composition',
+      path: 'apps/electron/src/main/index.ts',
+      importLine: "import { createLanBridgeRegistration } from './lib/lan-bridge/lan-bridge'",
+      replacement: `import './lib/lan-bridge/lan-bridge'
+        const createLanBridgeRegistration = (eventBus: object) => ({ eventBus })`,
+    },
+    {
+      name: 'IPC registrar 与 dependencies factory',
+      id: 'ipc-composition',
+      path: 'apps/electron/src/main/ipc.ts',
+      importLine: "import { createLanBridgeIpcDependencies, registerLanBridgeIpcHandlers } from './lib/lan-bridge/lan-bridge-ipc'",
+      replacement: `import './lib/lan-bridge/lan-bridge-ipc'
+        const createLanBridgeIpcDependencies = (eventBus: object) => ({ eventBus })
+        const registerLanBridgeIpcHandlers = (_ipc: object, _dependencies: object): void => {}`,
+    },
+    {
+      name: 'preload factory',
+      id: 'preload-composition',
+      path: 'apps/electron/src/preload/index.ts',
+      importLine: "import { createLanBridgePreloadApi } from './lan-bridge-preload'",
+      replacement: `import './lan-bridge-preload'
+        const createLanBridgePreloadApi = (_ipc: object) => ({})`,
+    },
+  ]
+
+  for (const importCase of forgedImportCases) {
+    test(`Given ${importCase.name} 仅 side-effect import 且本地伪造同名函数 When 检查组合点 Then 明确失败`, () => {
+      /** 删除真实 named import，并保留模块副作用导入与同名本地伪造。 */
+      const files = {
+        ...validFiles,
+        [importCase.path]: validFiles[importCase.path]!.replace(importCase.importLine, importCase.replacement),
+      }
+
+      expect(getCheck(files, importCase.id).passed).toBe(false)
+    })
+  }
+
+  test('Given 三个组合根使用 named import alias When 检查组合点 Then 全部通过', () => {
+    /** 使用合法 alias，并同步把组合调用改为对应 local binding。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/index.ts': validFiles['apps/electron/src/main/index.ts']!
+        .replace(
+          'import { createLanBridgeRegistration }',
+          'import { createLanBridgeRegistration as createLanRegistration }',
+        )
+        .replace('createLanBridgeRegistration(agentEventBus)', 'createLanRegistration(agentEventBus)'),
+      'apps/electron/src/main/ipc.ts': validFiles['apps/electron/src/main/ipc.ts']!
+        .replace(
+          'import { createLanBridgeIpcDependencies, registerLanBridgeIpcHandlers }',
+          'import { createLanBridgeIpcDependencies as createLanDependencies, registerLanBridgeIpcHandlers as registerLanHandlers }',
+        )
+        .replace(
+          'registerLanBridgeIpcHandlers(ipcMain, createLanBridgeIpcDependencies(agentEventBus))',
+          'registerLanHandlers(ipcMain, createLanDependencies(agentEventBus))',
+        ),
+      'apps/electron/src/preload/index.ts': validFiles['apps/electron/src/preload/index.ts']!
+        .replace(
+          'import { createLanBridgePreloadApi }',
+          'import { createLanBridgePreloadApi as createLanApi }',
+        )
+        .replace('createLanBridgePreloadApi(ipcRenderer)', 'createLanApi(ipcRenderer)'),
+    }
+
+    expect(getCheck(files, 'bridge-composition').passed).toBe(true)
+    expect(getCheck(files, 'ipc-composition').passed).toBe(true)
+    expect(getCheck(files, 'preload-composition').passed).toBe(true)
+  })
+
+  test('Given IPC 函数内本地同名 shadow 覆盖真实 imports When 检查组合点 Then 明确失败', () => {
+    /** shadow 仍保留真实 import 文本，但实际调用绑定到函数内局部声明。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/ipc.ts': validFiles['apps/electron/src/main/ipc.ts']!
+        .replace(
+          'export function registerIpcHandlers(): void {',
+          `export function registerIpcHandlers(): void {
+            const registerLanBridgeIpcHandlers = (_ipc: object, _dependencies: object): void => {}
+            const createLanBridgeIpcDependencies = (eventBus: object) => ({ eventBus })`,
+        ),
+    }
+
+    expect(getCheck(files, 'ipc-composition').passed).toBe(false)
   })
 
   test('Given 官方服务仅作为 type-only import When 检查 Adapter 边界 Then 不判定运行时越界', () => {
@@ -1355,6 +1477,31 @@ broken: [
     test(`Given ${mergeCase.name} When 检查 merge 闭集合同 Then 明确失败`, () => {
       /** 仅破坏 merge step 的命令集合或顺序。 */
       const workflow = mergeCase.mutate(validWorkflow)
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  /** cleanup 是完整有序闭集，wrapper、别名和普通额外命令都不能扩张执行面。 */
+  const invalidCleanupContractCases = [
+    { name: 'bash -c wrapper', command: `bash -c 'git push origin HEAD'` },
+    { name: 'sh -c wrapper', command: `sh -c 'git push origin HEAD'` },
+    { name: 'command wrapper', command: 'command git push origin HEAD' },
+    { name: 'env wrapper', command: 'env UNSAFE=1 git push origin HEAD' },
+    { name: 'alias wrapper', command: `alias publish_now='git push origin HEAD'` },
+    { name: 'function wrapper', command: 'publish_now() { command git push origin HEAD; }' },
+    { name: '普通 extra echo', command: `echo 'unexpected cleanup command'` },
+  ]
+
+  for (const cleanupCase of invalidCleanupContractCases) {
+    test(`Given cleanup 注入 ${cleanupCase.name} When 检查有序闭集 Then 明确失败`, () => {
+      /** 在状态聚合初始化后插入一条未批准执行语句。 */
+      const workflow = validWorkflow.replace(
+        '          cleanup_failed=0',
+        `          cleanup_failed=0\n          ${cleanupCase.command}`,
+      )
       const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
 
       expect(workflow).not.toBe(validWorkflow)

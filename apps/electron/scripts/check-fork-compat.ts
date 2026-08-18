@@ -121,6 +121,14 @@ interface ShellCommand {
   argv: string[]
 }
 
+/** 单文件 TypeScript 绑定上下文，用于区分真实 import 与同名局部 shadow。 */
+interface TypeScriptBindingContext {
+  /** 已完成 binder 处理的源码 AST。 */
+  sourceFile: ts.SourceFile
+  /** 查询标识符实际声明来源的类型检查器。 */
+  checker: ts.TypeChecker
+}
+
 /** 创建一个成功或失败格式一致的检查结果。 */
 function createResult(
   id: string,
@@ -167,6 +175,27 @@ function parseTypeScript(path: string, content: string): ts.SourceFile {
   /** 根据扩展名选择正确的 JSX 解析模式。 */
   const scriptKind = path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
   return ts.createSourceFile(path, content, ts.ScriptTarget.Latest, true, scriptKind)
+}
+
+/** 创建只绑定当前源码的 TypeScript Program，不解析外部模块或标准库。 */
+function createTypeScriptBindingContext(path: string, content: string): TypeScriptBindingContext {
+  /** 单文件绑定只需要语法与符号表，不需要类型库或模块解析。 */
+  const options: ts.CompilerOptions = {
+    module: ts.ModuleKind.ESNext,
+    noLib: true,
+    noResolve: true,
+    target: ts.ScriptTarget.Latest,
+  }
+  /** 当前源码 AST 由 Program binder 复用。 */
+  const sourceFile = parseTypeScript(path, content)
+  /** 限制 compiler host 只能读取当前虚拟文件。 */
+  const host = ts.createCompilerHost(options)
+  host.fileExists = (fileName) => fileName === path
+  host.getSourceFile = (fileName) => fileName === path ? sourceFile : undefined
+  host.readFile = (fileName) => fileName === path ? content : undefined
+  /** Program 负责为 import、局部声明和使用位置建立统一 symbol identity。 */
+  const program = ts.createProgram([path], options, host)
+  return { sourceFile, checker: program.getTypeChecker() }
 }
 
 /** 判断 import clause 是否会生成运行时代码。 */
@@ -224,15 +253,6 @@ function collectRuntimeDependencies(path: string, content: string): RuntimeModul
 
   visit(sourceFile)
   return dependencies
-}
-
-/** 返回函数体中直接执行的指定调用，嵌套死函数不计入组合点。 */
-function countDirectCalls(functionDeclaration: ts.FunctionDeclaration, functionName: string): number {
-  if (!functionDeclaration.body) return 0
-  return functionDeclaration.body.statements.filter((statement) => {
-    if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return false
-    return ts.isIdentifier(statement.expression.expression) && statement.expression.expression.text === functionName
-  }).length
 }
 
 /** 查找带 export 修饰符的命名函数。 */
@@ -316,29 +336,48 @@ function bootstrapStartsAllBridges(bootstrap: ts.FunctionDeclaration | undefined
   return false
 }
 
-/** 收集指定 import 导出的本地标识符，支持 import alias。 */
-function collectImportedLocalNames(
-  sourceFile: ts.SourceFile,
+/** 收集目标模块真实运行时 named import 的 local binding，支持 import alias。 */
+function collectImportedLocalBindings(
+  context: TypeScriptBindingContext,
   modulePath: string,
   exportedName: string,
-): Set<string> {
-  /** 默认名称兼容同文件内最小测试源码。 */
-  const names = new Set<string>([exportedName])
-  for (const statement of sourceFile.statements) {
+): Map<string, ts.Symbol> {
+  /** local 名称到 import specifier symbol 的精确映射。 */
+  const bindings = new Map<string, ts.Symbol>()
+  for (const statement of context.sourceFile.statements) {
     if (!ts.isImportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) continue
-    if (statement.moduleSpecifier.text !== modulePath || !statement.importClause?.namedBindings) continue
+    if (
+      statement.moduleSpecifier.text !== modulePath
+      || statement.importClause?.isTypeOnly
+      || !statement.importClause?.namedBindings
+    ) continue
     if (!ts.isNamedImports(statement.importClause.namedBindings)) continue
     for (const element of statement.importClause.namedBindings.elements) {
-      if ((element.propertyName?.text ?? element.name.text) === exportedName) names.add(element.name.text)
+      if (element.isTypeOnly || (element.propertyName?.text ?? element.name.text) !== exportedName) continue
+      /** binder 为 import specifier local 名建立的唯一 symbol。 */
+      const symbol = context.checker.getSymbolAtLocation(element.name)
+      if (symbol) bindings.set(element.name.text, symbol)
     }
   }
-  return names
+  return bindings
+}
+
+/** 判断使用位置是否实际绑定到目标 named import，而不是同名局部声明。 */
+function identifierUsesImportedBinding(
+  identifier: ts.Identifier,
+  bindings: ReadonlyMap<string, ts.Symbol>,
+  checker: ts.TypeChecker,
+): boolean {
+  /** local 名只用于快速定位，最终以 symbol identity 判定 provenance。 */
+  const importedSymbol = bindings.get(identifier.text)
+  return Boolean(importedSymbol && checker.getSymbolAtLocation(identifier) === importedSymbol)
 }
 
 /** 判断调用是否为 LAN registration factory 的 registerBridge 组合。 */
 function isLanBridgeRegistrationCall(
   node: ts.Node,
-  factoryNames: ReadonlySet<string>,
+  factoryBindings: ReadonlyMap<string, ts.Symbol>,
+  checker: ts.TypeChecker,
   requireAgentEventBus: boolean,
 ): node is ts.CallExpression {
   if (!ts.isCallExpression(node) || !ts.isIdentifier(node.expression) || node.expression.text !== 'registerBridge') {
@@ -349,19 +388,23 @@ function isLanBridgeRegistrationCall(
   if (
     !ts.isCallExpression(registration)
     || !ts.isIdentifier(registration.expression)
-    || !factoryNames.has(registration.expression.text)
+    || !identifierUsesImportedBinding(registration.expression, factoryBindings, checker)
   ) return false
   if (!requireAgentEventBus) return true
   return ts.isIdentifier(registration.arguments[0]) && registration.arguments[0].text === 'agentEventBus'
 }
 
 /** 统计全部 LAN registerBridge 语法调用，包括不可达位置，用于拒绝隐藏重复注册。 */
-function countLanBridgeRegistrations(sourceFile: ts.SourceFile, factoryNames: ReadonlySet<string>): number {
+function countLanBridgeRegistrations(
+  sourceFile: ts.SourceFile,
+  factoryBindings: ReadonlyMap<string, ts.Symbol>,
+  checker: ts.TypeChecker,
+): number {
   /** 当前累计注册次数。 */
   let count = 0
   /** 递归扫描全部真实调用节点，注释和字符串不会进入 AST。 */
   const visit = (node: ts.Node): void => {
-    if (isLanBridgeRegistrationCall(node, factoryNames, false)) count += 1
+    if (isLanBridgeRegistrationCall(node, factoryBindings, checker, false)) count += 1
     ts.forEachChild(node, visit)
   }
   visit(sourceFile)
@@ -369,10 +412,14 @@ function countLanBridgeRegistrations(sourceFile: ts.SourceFile, factoryNames: Re
 }
 
 /** 统计 Program 顶层直接执行且注入 agentEventBus 的 LAN 注册。 */
-function countTopLevelLanBridgeRegistrations(sourceFile: ts.SourceFile, factoryNames: ReadonlySet<string>): number {
+function countTopLevelLanBridgeRegistrations(
+  sourceFile: ts.SourceFile,
+  factoryBindings: ReadonlyMap<string, ts.Symbol>,
+  checker: ts.TypeChecker,
+): number {
   return sourceFile.statements.filter((statement) => (
     ts.isExpressionStatement(statement)
-    && isLanBridgeRegistrationCall(statement.expression, factoryNames, true)
+    && isLanBridgeRegistrationCall(statement.expression, factoryBindings, checker, true)
   )).length
 }
 
@@ -552,6 +599,17 @@ function stepMatchesLinearContract(
     && lines.every((line, index) => contract[index]!.test(line))
 }
 
+/** 判断逻辑 shell 行与精确文本合同逐项一致，适用于固定控制流脚本。 */
+function stepMatchesExactContract(
+  step: Record<string, unknown> | undefined,
+  contract: readonly string[],
+): boolean {
+  /** 当前 step 去除空行和纯注释后的全部可执行逻辑行。 */
+  const lines = getLogicalShellLines(step)
+  return lines.length === contract.length
+    && lines.every((line, index) => line === contract[index])
+}
+
 /** 判断解析后的命令参数与期望完全一致。 */
 function commandEquals(command: ShellCommand | undefined, expectedArgv: readonly string[]): boolean {
   return Boolean(
@@ -660,14 +718,23 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
   const main = readRequired(reader, PATHS.main, details)
   /** LAN Bridge 生命周期注册源码。 */
   const bridge = readRequired(reader, PATHS.bridge, details)
-  /** 主进程和 LAN Bridge AST。 */
-  const mainSource = parseTypeScript(PATHS.main, main)
+  /** 主进程绑定上下文和 LAN Bridge AST。 */
+  const mainContext = createTypeScriptBindingContext(PATHS.main, main)
+  const mainSource = mainContext.sourceFile
   const bridgeSource = parseTypeScript(PATHS.bridge, bridge)
-  /** LAN registration factory 的本地名称及全部注册次数。 */
-  const factoryNames = collectImportedLocalNames(mainSource, './lib/lan-bridge/lan-bridge', 'createLanBridgeRegistration')
-  const registrationCount = countLanBridgeRegistrations(mainSource, factoryNames)
+  /** LAN registration factory 的真实 import bindings 及全部注册次数。 */
+  const factoryBindings = collectImportedLocalBindings(
+    mainContext,
+    './lib/lan-bridge/lan-bridge',
+    'createLanBridgeRegistration',
+  )
+  const registrationCount = countLanBridgeRegistrations(mainSource, factoryBindings, mainContext.checker)
   /** Program 顶层实际执行且绑定 agentEventBus 的注册次数。 */
-  const topLevelRegistrationCount = countTopLevelLanBridgeRegistrations(mainSource, factoryNames)
+  const topLevelRegistrationCount = countTopLevelLanBridgeRegistrations(
+    mainSource,
+    factoryBindings,
+    mainContext.checker,
+  )
   /** 顶层挂接且顺序可达的 bootstrap。 */
   const bootstrap = findNamedFunction(mainSource, 'bootstrap')
   const hasReachableStart = hasReachableBootstrapRegistration(mainSource) && bootstrapStartsAllBridges(bootstrap)
@@ -707,23 +774,47 @@ function checkIpcComposition(reader: RepositoryReader): ForkCompatCheckResult {
   const rootIpc = readRequired(reader, PATHS.rootIpc, details)
   /** 独立 LAN IPC registrar 源码。 */
   const lanIpc = readRequired(reader, PATHS.lanIpc, details)
-  /** 根 IPC AST 与导出的注册函数。 */
-  const rootSource = parseTypeScript(PATHS.rootIpc, rootIpc)
+  /** 根 IPC binding context 与导出的注册函数。 */
+  const rootContext = createTypeScriptBindingContext(PATHS.rootIpc, rootIpc)
+  const rootSource = rootContext.sourceFile
   const registerFunction = findExportedFunction(rootSource, 'registerIpcHandlers')
-  /** registerIpcHandlers 函数体中的直接 LAN registrar 调用。 */
-  const directCalls = registerFunction ? countDirectCalls(registerFunction, 'registerLanBridgeIpcHandlers') : 0
+  /** registrar 与 dependencies factory 必须来自目标模块的真实 named import。 */
+  const registrarBindings = collectImportedLocalBindings(
+    rootContext,
+    './lib/lan-bridge/lan-bridge-ipc',
+    'registerLanBridgeIpcHandlers',
+  )
+  const dependencyFactoryBindings = collectImportedLocalBindings(
+    rootContext,
+    './lib/lan-bridge/lan-bridge-ipc',
+    'createLanBridgeIpcDependencies',
+  )
+  /** registerIpcHandlers 函数体中的直接且来源可信的 LAN registrar 调用。 */
+  let directCalls = 0
   /** 根 IPC 中满足显式 EventBus 注入形状的调用数量。 */
   let injectedCalls = 0
   if (registerFunction?.body) {
     for (const statement of registerFunction.body.statements) {
       if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) continue
-      if (!ts.isIdentifier(statement.expression.expression) || statement.expression.expression.text !== 'registerLanBridgeIpcHandlers') continue
+      if (
+        !ts.isIdentifier(statement.expression.expression)
+        || !identifierUsesImportedBinding(
+          statement.expression.expression,
+          registrarBindings,
+          rootContext.checker,
+        )
+      ) continue
+      directCalls += 1
       /** registrar 第二参数必须由根组合点绑定 agentEventBus。 */
       const dependencies = statement.expression.arguments[1]
       if (
         ts.isCallExpression(dependencies)
         && ts.isIdentifier(dependencies.expression)
-        && dependencies.expression.text === 'createLanBridgeIpcDependencies'
+        && identifierUsesImportedBinding(
+          dependencies.expression,
+          dependencyFactoryBindings,
+          rootContext.checker,
+        )
         && ts.isIdentifier(dependencies.arguments[0])
         && dependencies.arguments[0].text === 'agentEventBus'
       ) injectedCalls += 1
@@ -753,8 +844,15 @@ function checkPreloadComposition(reader: RepositoryReader): ForkCompatCheckResul
   const rootPreload = readRequired(reader, PATHS.rootPreload, details)
   /** 独立 LAN preload 源码。 */
   const lanPreload = readRequired(reader, PATHS.lanPreload, details)
-  /** 根 preload AST。 */
-  const sourceFile = parseTypeScript(PATHS.rootPreload, rootPreload)
+  /** 根 preload binding context。 */
+  const context = createTypeScriptBindingContext(PATHS.rootPreload, rootPreload)
+  const sourceFile = context.sourceFile
+  /** preload factory 必须来自目标模块的真实 named import。 */
+  const factoryBindings = collectImportedLocalBindings(
+    context,
+    './lan-bridge-preload',
+    'createLanBridgePreloadApi',
+  )
   /** 查找命名变量声明。 */
   const findVariable = (name: string): ts.VariableDeclaration | undefined => {
     for (const statement of sourceFile.statements) {
@@ -770,12 +868,16 @@ function checkPreloadComposition(reader: RepositoryReader): ForkCompatCheckResul
   /** factory 结果变量与最终 API 对象变量。 */
   const lanApi = findVariable('lanBridgePreloadApi')
   const electronApi = findVariable('electronAPI')
+  /** factory 结果变量自身的 symbol，spread 必须绑定同一声明。 */
+  const lanApiSymbol = lanApi && ts.isIdentifier(lanApi.name)
+    ? context.checker.getSymbolAtLocation(lanApi.name)
+    : undefined
   /** 最终 electronAPI 对象中的 LAN spread 数量。 */
   const spreadCount = electronApi?.initializer && ts.isObjectLiteralExpression(electronApi.initializer)
     ? electronApi.initializer.properties.filter((property) => (
       ts.isSpreadAssignment(property)
       && ts.isIdentifier(property.expression)
-      && property.expression.text === 'lanBridgePreloadApi'
+      && Boolean(lanApiSymbol && context.checker.getSymbolAtLocation(property.expression) === lanApiSymbol)
     )).length
     : 0
   /** 独立 factory 的真实调用形状。 */
@@ -783,7 +885,7 @@ function checkPreloadComposition(reader: RepositoryReader): ForkCompatCheckResul
     lanApi?.initializer
     && ts.isCallExpression(lanApi.initializer)
     && ts.isIdentifier(lanApi.initializer.expression)
-    && lanApi.initializer.expression.text === 'createLanBridgePreloadApi'
+    && identifierUsesImportedBinding(lanApi.initializer.expression, factoryBindings, context.checker)
     && ts.isIdentifier(lanApi.initializer.arguments[0])
     && lanApi.initializer.arguments[0].text === 'ipcRenderer',
   )
@@ -1182,15 +1284,50 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
       details.push('workflow 关键步骤缺失或顺序错误')
     }
 
-    /** cleanup 必须始终运行并逐项聚合清理失败。 */
+    /** cleanup 必须始终运行，并按生产脚本的固定控制流逐项聚合清理失败。 */
     const cleanup = findStep('Abort merge and remove temporary branch')
+    /** cleanup 只能读取 select step 产生的 base 和临时分支 outputs。 */
+    const cleanupEnv = cleanup && isRecord(cleanup.env) ? cleanup.env : undefined
+    /** 完整闭集锁定函数、三个尝试分支、状态聚合与最终退出顺序。 */
+    const cleanupContract = [
+      'set -u',
+      'cleanup_failed=0',
+      'run_cleanup() {',
+      'local label="$1"',
+      'shift',
+      'echo "cleanup: $label"',
+      'if "$@"; then',
+      'echo "cleanup passed: $label"',
+      'else',
+      'echo "cleanup failed: $label" >&2',
+      'cleanup_failed=1',
+      'fi',
+      '}',
+      'if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then',
+      "run_cleanup 'abort merge' git merge --abort",
+      'else',
+      "echo 'cleanup skipped: no merge in progress'",
+      'fi',
+      'if [[ -n "${BASE_SHA:-}" ]]; then',
+      "run_cleanup 'switch to base' git switch --detach \"$BASE_SHA\"",
+      'else',
+      "echo 'cleanup skipped: base SHA unavailable'",
+      'fi',
+      'if [[ -n "${TEMP_BRANCH:-}" ]] && git show-ref --verify --quiet "refs/heads/$TEMP_BRANCH"; then',
+      "run_cleanup 'delete temporary branch' git branch --delete --force \"$TEMP_BRANCH\"",
+      'else',
+      "echo 'cleanup skipped: temporary branch unavailable'",
+      'fi',
+      'exit "$cleanup_failed"',
+    ] as const
     if (
       cleanup?.if !== 'always()'
-      || !stepHasDirectCommand(cleanup, /^run_cleanup\s+['"]abort merge['"]\s+git\s+merge\s+--abort$/)
-      || !stepHasDirectCommand(cleanup, /^run_cleanup\s+['"]switch to base['"]\s+git\s+switch\s+--detach(?:\s|$)/)
-      || !stepHasDirectCommand(cleanup, /^run_cleanup\s+['"]delete temporary branch['"]\s+git\s+branch\s+--delete\s+--force(?:\s|$)/)
-      || !stepHasDirectCommand(cleanup, /^exit\s+"\$cleanup_failed"$/)
-    ) details.push('cleanup 必须 always() 执行 abort、switch、delete 并返回聚合失败')
+      || cleanup?.shell !== 'bash'
+      || cleanupEnv?.BASE_SHA !== '${{ steps.upstream.outputs.base_sha }}'
+      || cleanupEnv?.TEMP_BRANCH !== '${{ steps.upstream.outputs.temp_branch }}'
+      || Object.keys(cleanupEnv ?? {}).length !== 2
+      || !stepMatchesExactContract(cleanup, cleanupContract)
+    ) details.push('cleanup 必须按固定有序闭集尝试 abort、switch、delete，并返回聚合失败')
 
     /** 任何关键 run 都不能使用 || true 静默吞错。 */
     if (steps.some((step) => /\|\|\s*true\b/.test(normalizeShellContinuations(getStepRun(step) ?? '')))) {
