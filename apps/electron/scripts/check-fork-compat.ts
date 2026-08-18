@@ -414,11 +414,18 @@ function returnedObjectStartUsesInjectedBus(
   injectedName: string,
 ): boolean {
   if (!factory.body) return false
-  /** factory 顶层直接返回的 registration 对象。 */
-  const returnedObject = factory.body.statements
-    .filter((statement): statement is ts.ReturnStatement => ts.isReturnStatement(statement))
-    .map((statement) => statement.expression)
-    .find((expression): expression is ts.ObjectLiteralExpression => Boolean(expression && ts.isObjectLiteralExpression(expression)))
+  /** factory 首个可达顶层 return 必须直接返回 registration 对象。 */
+  let returnedObject: ts.ObjectLiteralExpression | undefined
+  for (const statement of factory.body.statements) {
+    if (ts.isThrowStatement(statement)) return false
+    if (!ts.isReturnStatement(statement)) continue
+    if (!statement.expression) return false
+    /** 去除不改变返回值语义的 TypeScript 包装。 */
+    const returned = unwrapTypeScriptExpression(statement.expression)
+    if (!ts.isObjectLiteralExpression(returned)) return false
+    returnedObject = returned
+    break
+  }
   if (!returnedObject) return false
 
   /** registration 对象上的 start 属性或方法。 */
@@ -567,15 +574,6 @@ function stepHasDirectCommand(step: Record<string, unknown> | undefined, pattern
   return Boolean(run && run.split(/\r?\n/).some((line) => pattern.test(line.trim())))
 }
 
-/** 判断复杂 shell step 的 Program 顶层存在批准命令，缩进控制流内命令不计入。 */
-function stepHasTopLevelCommand(step: Record<string, unknown> | undefined, pattern: RegExp): boolean {
-  /** 当前 step 的 shell 脚本文本。 */
-  const run = getStepRun(step)
-  return Boolean(run && run.split(/\r?\n/).some((line) => (
-    line.length > 0 && line === line.trimStart() && pattern.test(line.trimEnd())
-  )))
-}
-
 /** 递归收集结构化 workflow 中全部 run 脚本，不局限于约定 job 或 step 名称。 */
 function collectWorkflowRunScripts(value: unknown): string[] {
   if (Array.isArray(value)) return value.flatMap(collectWorkflowRunScripts)
@@ -587,6 +585,36 @@ function collectWorkflowRunScripts(value: unknown): string[] {
     else scripts.push(...collectWorkflowRunScripts(child))
   }
   return scripts
+}
+
+/** 递归收集结构化 workflow 中全部 uses 引用。 */
+function collectWorkflowUses(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(collectWorkflowUses)
+  if (!isRecord(value)) return []
+  /** 当前 YAML map 及其后代中的全部 uses 字符串。 */
+  const uses: string[] = []
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'uses' && typeof child === 'string') uses.push(child)
+    else uses.push(...collectWorkflowUses(child))
+  }
+  return uses
+}
+
+/** 判断关键 shell step 是否含无法静态证明可达性的控制结构。 */
+function hasShellControlStructure(step: Record<string, unknown> | undefined): boolean {
+  /** 当前 step 的 shell 脚本文本。 */
+  const run = getStepRun(step)
+  if (!run) return false
+  /** 命令起点或连接符后的控制关键字，以及 POSIX 函数声明。 */
+  const controlKeyword = /(?:^|[;&|]\s*)(?:if|then|elif|else|fi|for|while|until|select|do|done|case|esac|function|exit|return|break|continue)\b/
+  const functionDeclaration = /^[A-Za-z_][A-Za-z0-9_]*\s*\(\)\s*\{/
+  return run.split(/\r?\n/).some((line) => {
+    /** 注释行不参与 shell 结构判断。 */
+    const trimmed = line.trim()
+    return trimmed.length > 0
+      && !trimmed.startsWith('#')
+      && (controlKeyword.test(trimmed) || functionDeclaration.test(trimmed))
+  })
 }
 
 /** 判断 shell 脚本是否包含兼容检查职责之外的发布或远端写副作用。 */
@@ -977,7 +1005,9 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
 
     /** 最小只读权限与并发去重配置。 */
     const permissions = isRecord(document.permissions) ? document.permissions : undefined
-    if (permissions?.contents !== 'read') details.push('workflow permissions.contents 必须为 read')
+    if (!permissions || permissions.contents !== 'read' || Object.keys(permissions).length !== 1) {
+      details.push('workflow permissions 必须且只能包含 contents: read')
+    }
     const concurrency = isRecord(document.concurrency) ? document.concurrency : undefined
     if (
       typeof concurrency?.group !== 'string'
@@ -989,6 +1019,9 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     const jobs = isRecord(document.jobs) ? document.jobs : undefined
     const job = jobs && isRecord(jobs['verify-upstream-merge']) ? jobs['verify-upstream-merge'] : undefined
     if (!job) details.push('workflow 缺少 verify-upstream-merge job')
+    if (jobs && Object.values(jobs).some((candidate) => isRecord(candidate) && Object.hasOwn(candidate, 'permissions'))) {
+      details.push('workflow job 不得覆盖顶层只读 permissions')
+    }
     if (typeof job?.['timeout-minutes'] !== 'number' || job['timeout-minutes'] <= 0) {
       details.push('上游验证 job 缺少正数 timeout-minutes')
     }
@@ -1008,47 +1041,62 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     if (setupBun?.uses !== 'oven-sh/setup-bun@v2' || setupBunWith?.['bun-version'] !== 'latest') {
       details.push('Bun 安装步骤必须使用 setup-bun@v2 latest')
     }
+    /** 所有 action 引用必须来自当前验证任务的精确 allowlist。 */
+    const allowedActions = new Set(['actions/checkout@v4', 'oven-sh/setup-bun@v2'])
+    if (collectWorkflowUses(document).some((action) => !allowedActions.has(action))) {
+      details.push('workflow uses 包含未批准 action')
+    }
 
     /** 上游 tag 选择与合并必须符合当前可证明的顶层命令模板。 */
     const selectTag = findStep('Select latest official release tag')
     /** tag ref 可直接输出，也可先由正式 tag 构造受控变量后输出。 */
     const hasTagRefOutput = stepHasDirectCommand(
       selectTag,
-      /^echo\s+["']tag_ref=refs\/tags\/upstream\/\$[A-Za-z_][A-Za-z0-9_]*["']\s*>>\s*["']\$GITHUB_OUTPUT["']$/,
+      /^echo\s+["']tag_ref=refs\/tags\/upstream\/\$LATEST_TAG["']\s*>>\s*["']\$GITHUB_OUTPUT["']$/,
     ) || (
-      stepHasDirectCommand(selectTag, /^(?:readonly\s+)?UPSTREAM_TAG_REF=["']refs\/tags\/upstream\/\$[A-Za-z_][A-Za-z0-9_]*["']$/)
+      stepHasDirectCommand(selectTag, /^readonly\s+UPSTREAM_TAG_REF=["']refs\/tags\/upstream\/\$LATEST_TAG["']$/)
       && stepHasDirectCommand(selectTag, /^echo\s+["']tag_ref=\$UPSTREAM_TAG_REF["']\s*>>\s*["']\$GITHUB_OUTPUT["']$/)
     )
-    /** strict candidate 循环必须把正式 semver 写入独立候选文件。 */
-    const hasStrictCandidateLoop = (
-      stepHasTopLevelCommand(selectTag, /^while\s+IFS=\s+read\s+-r\s+[A-Za-z_][A-Za-z0-9_]*;\s+do$/)
+    /** 线性筛选链必须先保留 namespaced 正式 semver，再移除 namespace。 */
+    const hasStrictCandidateFilter = (
+      stepHasDirectCommand(
+        selectTag,
+        /^grep\s+-E\s+['"]\^upstream\/v\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$['"]\s+["']\$RAW_TAGS_FILE["']\s+>\s+["']\$NAMESPACED_RELEASE_TAGS_FILE["']$/,
+      )
       && stepHasDirectCommand(
         selectTag,
-        /^if\s+\[\[\s+["']\$[A-Za-z_][A-Za-z0-9_]*["']\s+=~\s+\^v\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$\s+\]\];\s+then$/,
+        /^sed\s+['"]s#\^upstream\/#\#['"]\s+["']\$NAMESPACED_RELEASE_TAGS_FILE["']\s+>\s+["']\$RELEASE_TAGS_FILE["']$/,
       )
-      && stepHasDirectCommand(selectTag, /^printf\s+['"]%s\\n['"]\s+["']\$[A-Za-z_][A-Za-z0-9_]*["']\s+>>\s+["']\$RELEASE_TAGS_FILE["']$/)
-      && stepHasTopLevelCommand(selectTag, /^done\s+<\s+["']\$RAW_TAGS_FILE["']$/)
     )
     /** 最大 tag 必须来自 sort -V 输出文件的最后一行。 */
     const selectsMaximumTag = (
-      stepHasTopLevelCommand(selectTag, /^sort\s+-V\s+["']\$RELEASE_TAGS_FILE["']\s+>\s+["']\$SORTED_TAGS_FILE["']$/)
-      && stepHasTopLevelCommand(selectTag, /^readonly\s+LATEST_TAG=.*\btail\s+-n\s+1\s+["']\$SORTED_TAGS_FILE["'].*$/)
+      stepHasDirectCommand(selectTag, /^sort\s+-V\s+["']\$RELEASE_TAGS_FILE["']\s+>\s+["']\$SORTED_TAGS_FILE["']$/)
+      && stepHasDirectCommand(selectTag, /^readonly\s+LATEST_TAG=.*\btail\s+-n\s+1\s+["']\$SORTED_TAGS_FILE["'].*$/)
     )
     if (
       selectTag?.id !== 'upstream'
-      || !stepHasTopLevelCommand(selectTag, /^readonly\s+UPSTREAM_URL=["']https:\/\/github\.com\/ErlichLiu\/Proma\.git["']$/)
-      || !stepHasTopLevelCommand(selectTag, /^git\s+remote\s+add\s+upstream\s+["']\$UPSTREAM_URL["']$/)
-      || !stepHasTopLevelCommand(selectTag, /^git\s+fetch\s+--force\s+upstream(?:\s|$)/)
-      || !stepHasTopLevelCommand(selectTag, /^git\s+tag\s+--list\s+["']upstream\/v\*["']\s+>\s+["']\$RAW_TAGS_FILE["']$/)
-      || !hasStrictCandidateLoop
+      || hasShellControlStructure(selectTag)
+      || !stepHasDirectCommand(selectTag, /^set\s+-euo\s+pipefail$/)
+      || !stepHasDirectCommand(selectTag, /^readonly\s+UPSTREAM_URL=["']https:\/\/github\.com\/ErlichLiu\/Proma\.git["']$/)
+      || !stepHasDirectCommand(selectTag, /^git\s+remote\s+add\s+upstream\s+["']\$UPSTREAM_URL["']$/)
+      || !stepHasDirectCommand(selectTag, /^git\s+fetch\s+--force\s+upstream\s+["']\+refs\/tags\/\*:refs\/tags\/upstream\/\*["']$/)
+      || !stepHasDirectCommand(selectTag, /^git\s+tag\s+--list\s+["']upstream\/v\*["']\s+>\s+["']\$RAW_TAGS_FILE["']$/)
+      || !hasStrictCandidateFilter
       || !selectsMaximumTag
       || !hasTagRefOutput
     ) details.push('上游 tag 步骤必须使用官方 URL，在顶层 fetch/tag/sort/tail 最大正式 tag 并输出 tag_ref')
     const merge = findStep('Merge upstream tag without committing')
+    /** merge 的 tag ref 只能来自已验证 select step 的精确 output。 */
+    const mergeEnv = merge && isRecord(merge.env) ? merge.env : undefined
     if (
-      !stepHasTopLevelCommand(merge, /^git\s+switch\s+--create(?:\s|$)/)
-      || !stepHasTopLevelCommand(merge, /^git\s+merge\s+--no-commit\s+--no-ff(?:\s|$)/)
-    ) details.push('merge 步骤必须真实创建临时分支并合并上游 tag')
+      hasShellControlStructure(merge)
+      || mergeEnv?.BASE_SHA !== '${{ steps.upstream.outputs.base_sha }}'
+      || mergeEnv?.TEMP_BRANCH !== '${{ steps.upstream.outputs.temp_branch }}'
+      || mergeEnv?.UPSTREAM_TAG_REF !== '${{ steps.upstream.outputs.tag_ref }}'
+      || !stepHasDirectCommand(merge, /^git\s+switch\s+--create\s+["']\$TEMP_BRANCH["']\s+["']\$BASE_SHA["']$/)
+      || !stepHasDirectCommand(merge, /^git\s+merge\s+--no-commit\s+--no-ff\s+["']\$UPSTREAM_TAG_REF["']$/)
+      || !stepHasDirectCommand(merge, /^git\s+merge-base\s+--is-ancestor\s+["']\$UPSTREAM_TAG_REF["']\s+HEAD$/)
+    ) details.push('merge 步骤必须线性使用 select step 输出的 namespaced tag ref 完成合并与 ancestor 校验')
 
     /** 简单验证步骤必须是唯一真实命令。 */
     const requiredCommands: Array<[string, readonly string[]]> = [
@@ -1200,10 +1248,16 @@ function countDirectLanIpcHandlers(functionDeclaration: ts.FunctionDeclaration, 
   /** registrar 的 IPC 参数名。 */
   const ipcParameter = functionDeclaration.parameters[0]?.name
   if (!ipcParameter || !ts.isIdentifier(ipcParameter) || !functionDeclaration.body) return 0
-  return functionDeclaration.body.statements.filter((statement) => (
-    ts.isExpressionStatement(statement)
-    && isDirectLanIpcCall(statement.expression, ipcParameter.text, 'handle', channelKey)
-  )).length
+  /** 只统计首个无条件终止语句之前的顶层 handler。 */
+  let count = 0
+  for (const statement of functionDeclaration.body.statements) {
+    if (ts.isReturnStatement(statement) || ts.isThrowStatement(statement)) break
+    if (
+      ts.isExpressionStatement(statement)
+      && isDirectLanIpcCall(statement.expression, ipcParameter.text, 'handle', channelKey)
+    ) count += 1
+  }
+  return count
 }
 
 /** 判断 preload factory 返回对象的方法是否直接 invoke 对应通道。 */

@@ -38,25 +38,34 @@ jobs:
       - name: Select latest official release tag
         id: upstream
         run: |
+          set -euo pipefail
           readonly UPSTREAM_URL='https://github.com/ErlichLiu/Proma.git'
+          readonly TEMP_BRANCH="compat/upstream-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          readonly BASE_SHA="$(git rev-parse HEAD)"
           readonly RAW_TAGS_FILE="$RUNNER_TEMP/upstream-tags.txt"
+          readonly NAMESPACED_RELEASE_TAGS_FILE="$RUNNER_TEMP/namespaced-release-tags.txt"
           readonly RELEASE_TAGS_FILE="$RUNNER_TEMP/release-tags.txt"
           readonly SORTED_TAGS_FILE="$RUNNER_TEMP/release-tags.sorted.txt"
           git remote add upstream "$UPSTREAM_URL"
           git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'
           git tag --list 'upstream/v*' > "$RAW_TAGS_FILE"
-          while IFS= read -r tag; do
-            if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then
-              printf '%s\\n' "$tag" >> "$RELEASE_TAGS_FILE"
-            fi
-          done < "$RAW_TAGS_FILE"
+          grep -E '^upstream/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$' "$RAW_TAGS_FILE" > "$NAMESPACED_RELEASE_TAGS_FILE"
+          sed 's#^upstream/##' "$NAMESPACED_RELEASE_TAGS_FILE" > "$RELEASE_TAGS_FILE"
           sort -V "$RELEASE_TAGS_FILE" > "$SORTED_TAGS_FILE"
           readonly LATEST_TAG="$(tail -n 1 "$SORTED_TAGS_FILE")"
-          echo "tag_ref=refs/tags/upstream/$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"
+          echo "temp_branch=$TEMP_BRANCH" >> "$GITHUB_OUTPUT"
       - name: Merge upstream tag without committing
+        env:
+          BASE_SHA: \${{ steps.upstream.outputs.base_sha }}
+          TEMP_BRANCH: \${{ steps.upstream.outputs.temp_branch }}
+          UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}
         run: |
           git switch --create "$TEMP_BRANCH" "$BASE_SHA"
           git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"
+          git merge-base --is-ancestor "$UPSTREAM_TAG_REF" HEAD
       - name: Install dependencies from merged tree
         run: bun install --frozen-lockfile
       - name: Check fork compatibility seams
@@ -503,6 +512,25 @@ describe('fork 上游兼容检查器', () => {
     })
   }
 
+  /** factory 首个顶层终止语句之后的 registration object 不可达。 */
+  const terminatedFactoryCases = [
+    { name: 'return undefined 前置', statement: 'return undefined' },
+    { name: 'throw 前置', statement: "throw new Error('stopped')" },
+  ]
+
+  for (const factoryCase of terminatedFactoryCases) {
+    test(`Given factory ${factoryCase.name} When 检查 Bridge registration Then 明确失败`, () => {
+      /** 在合法对象 return 前插入无条件终止。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/lib/lan-bridge/lan-bridge.ts': validFiles['apps/electron/src/main/lib/lan-bridge/lan-bridge.ts']!
+          .replace('      return {', `      ${factoryCase.statement}\n      return {`),
+      }
+
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    })
+  }
+
   /** startAllBridges 只有在可达 bootstrap 顶层路径中才有效。 */
   const unreachableBootstrapCases: Array<{ name: string; source: string }> = [
     {
@@ -818,6 +846,28 @@ describe('fork 上游兼容检查器', () => {
     })
   }
 
+  /** registrar 终止后出现的 handler 不得计为可达合同。 */
+  const terminatedRegistrarCases = [
+    { name: 'return 前置', statement: 'return' },
+    { name: 'throw 前置', statement: "throw new Error('stopped')" },
+  ]
+
+  for (const registrarCase of terminatedRegistrarCases) {
+    test(`Given registrar ${registrarCase.name} When 检查 LAN IPC 合同 Then 明确失败`, () => {
+      /** 在第一个 handler 前插入无条件终止语句。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/lib/lan-bridge/lan-bridge-ipc.ts': validFiles['apps/electron/src/main/lib/lan-bridge/lan-bridge-ipc.ts']!
+          .replace(
+            '      ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_CONFIG',
+            `      ${registrarCase.statement}\n      ipc.handle(LAN_BRIDGE_IPC_CHANNELS.GET_CONFIG`,
+          ),
+      }
+
+      expect(getCheck(files, 'lan-ipc-contract').passed).toBe(false)
+    })
+  }
+
   test('Given registrar handler 使用错误通道或重复注册 When 检查合同 Then 均失败', () => {
     /** START 方法错误绑定 STOP 通道。 */
     const wrongChannelFiles = {
@@ -1086,6 +1136,17 @@ broken: [
       mutate: (source) => source.replace('permissions:\n  contents: read\n', ''),
     },
     {
+      name: '顶层权限包含额外 write',
+      mutate: (source) => source.replace('  contents: read\n', '  contents: read\n  pull-requests: write\n'),
+    },
+    {
+      name: 'job 覆盖为 write 权限',
+      mutate: (source) => source.replace(
+        '    timeout-minutes: 60\n',
+        '    timeout-minutes: 60\n    permissions:\n      contents: write\n',
+      ),
+    },
+    {
       name: '缺少并发取消',
       mutate: (source) => source.replace('  cancel-in-progress: true', '  cancel-in-progress: false'),
     },
@@ -1152,13 +1213,13 @@ broken: [
     expect(getCheck(files, 'workflow-definition').passed).toBe(false)
   })
 
-  test('Given strict candidate 正则只存在于注释 When 检查 workflow Then 明确失败', () => {
+  test('Given strict candidate 命令只存在于注释 When 检查 workflow Then 明确失败', () => {
     /** 注释掉严格 semver 分支，保留相同文本。 */
     const files = {
       ...validFiles,
       '.github/workflows/upstream-compat.yml': validWorkflow.replace(
-        'if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
-        '# if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
+        "grep -E '^upstream/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$'",
+        "# grep -E '^upstream/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$'",
       ),
     }
 
@@ -1170,8 +1231,8 @@ broken: [
     const files = {
       ...validFiles,
       '.github/workflows/upstream-compat.yml': validWorkflow.replace(
-        'echo "tag_ref=refs/tags/upstream/$LATEST_TAG" >> "$GITHUB_OUTPUT"',
-        '# echo "tag_ref=refs/tags/upstream/$LATEST_TAG" >> "$GITHUB_OUTPUT"',
+        'echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"',
+        '# echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"',
       ),
     }
 
@@ -1213,6 +1274,96 @@ broken: [
     })
   }
 
+  /** 关键 step 出现 shell 控制结构时一律保守拒绝，不依赖缩进。 */
+  const workflowControlStructureCases = [
+    {
+      name: '无缩进 if false',
+      target: "git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'",
+      replacement: "if false; then\n          echo hidden\n          fi\n          git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'",
+    },
+    {
+      name: '单行 if false',
+      target: 'git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+      replacement: 'if false; then echo hidden; fi\n          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+    },
+    {
+      name: '提前 exit 0',
+      target: 'git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+      replacement: 'exit 0\n          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+    },
+  ]
+
+  for (const controlCase of workflowControlStructureCases) {
+    test(`Given ${controlCase.name} When 检查关键 workflow step Then 明确失败`, () => {
+      /** 注入不依赖缩进的控制结构。 */
+      const workflow = validWorkflow.replace(controlCase.target, controlCase.replacement)
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  /** tag_ref 与 merge 必须沿已验证 LATEST_TAG 的固定 namespaced 数据流。 */
+  const invalidTagFlowCases = [
+    {
+      name: 'tag_ref 使用未验证变量',
+      target: 'refs/tags/upstream/$LATEST_TAG',
+      replacement: 'refs/tags/upstream/$UNTRUSTED_TAG',
+    },
+    {
+      name: 'tag_ref 使用硬编码错误 tag',
+      target: 'refs/tags/upstream/$LATEST_TAG',
+      replacement: 'refs/tags/upstream/v0.0.1',
+    },
+    {
+      name: 'merge 使用未验证变量',
+      target: 'git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+      replacement: 'git merge --no-commit --no-ff "$UNTRUSTED_TAG"',
+    },
+    {
+      name: 'ancestor 使用硬编码错误 tag',
+      target: 'git merge-base --is-ancestor "$UPSTREAM_TAG_REF" HEAD',
+      replacement: 'git merge-base --is-ancestor refs/tags/upstream/v0.0.1 HEAD',
+    },
+    {
+      name: 'fetch 未写入 upstream namespace',
+      target: '+refs/tags/*:refs/tags/upstream/*',
+      replacement: '+refs/tags/*:refs/tags/*',
+    },
+  ]
+
+  for (const tagCase of invalidTagFlowCases) {
+    test(`Given ${tagCase.name} When 检查 tag 数据流 Then 明确失败`, () => {
+      /** 破坏 namespaced tag 的单一可信来源。 */
+      const workflow = validWorkflow.replace(tagCase.target, tagCase.replacement)
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  /** uses 只能来自当前验证任务所需的精确 allowlist。 */
+  const forbiddenWorkflowActions = [
+    'softprops/action-gh-release@v2',
+    'peter-evans/create-pull-request@v7',
+  ]
+
+  for (const action of forbiddenWorkflowActions) {
+    test(`Given workflow 使用 ${action} When 检查 action allowlist Then 明确失败`, () => {
+      /** 在 cleanup 前加入未批准 action。 */
+      const unsafeStep = `      - name: Unsafe action\n        uses: ${action}\n`
+      const workflow = validWorkflow.replace(
+        '      - name: Abort merge and remove temporary branch',
+        `${unsafeStep}      - name: Abort merge and remove temporary branch`,
+      )
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
   /** 任意额外 step 都不得执行发布、PR 或 push 副作用。 */
   const forbiddenWorkflowCommands = [
     'git push origin HEAD',
@@ -1235,13 +1386,15 @@ broken: [
     })
   }
 
-  test('Given tag ref 先写入受控变量 When 检查 workflow Then 接受真实输出命令', () => {
-    /** 模拟真实 workflow 先构造 namespaced tag ref 再写入输出。 */
-    const workflow = validWorkflow.replace(
-      'echo "tag_ref=refs/tags/upstream/$LATEST_TAG" >> "$GITHUB_OUTPUT"',
-      'readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"\n          echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"',
-    )
-    /** 使用变量输出 tag ref 的仓库 fixture。 */
+  test('Given tag ref 直接来自 LATEST_TAG When 检查 workflow Then 接受真实输出命令', () => {
+    /** 模拟直接从 LATEST_TAG 输出 namespaced tag ref。 */
+    const workflow = validWorkflow
+      .replace('          readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"\n', '')
+      .replace(
+        'echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"',
+        'echo "tag_ref=refs/tags/upstream/$LATEST_TAG" >> "$GITHUB_OUTPUT"',
+      )
+    /** 直接输出 tag ref 的仓库 fixture。 */
     const files = {
       ...validFiles,
       '.github/workflows/upstream-compat.yml': workflow,

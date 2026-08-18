@@ -40,43 +40,19 @@ jobs:
           readonly TEMP_BRANCH="compat/upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           readonly BASE_SHA="$(git rev-parse HEAD)"
           readonly RAW_TAGS_FILE="$RUNNER_TEMP/upstream-tags.txt"
+          readonly NAMESPACED_RELEASE_TAGS_FILE="$RUNNER_TEMP/upstream-namespaced-release-tags.txt"
           readonly RELEASE_TAGS_FILE="$RUNNER_TEMP/upstream-release-tags.txt"
           readonly SORTED_TAGS_FILE="$RUNNER_TEMP/upstream-release-tags.sorted.txt"
 
-          if git remote get-url upstream >/dev/null 2>&1; then
-            git remote remove upstream
-          fi
           git remote add upstream "$UPSTREAM_URL"
           git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'
 
           git tag --list 'upstream/v*' > "$RAW_TAGS_FILE"
-          : > "$RELEASE_TAGS_FILE"
-          while IFS= read -r namespaced_tag; do
-            tag="${namespaced_tag#upstream/}"
-            if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              printf '%s\n' "$tag" >> "$RELEASE_TAGS_FILE"
-            fi
-          done < "$RAW_TAGS_FILE"
-
-          if [[ ! -s "$RELEASE_TAGS_FILE" ]]; then
-            echo '未找到官方正式 vMAJOR.MINOR.PATCH tag。' >&2
-            exit 1
-          fi
+          grep -E '^upstream/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' "$RAW_TAGS_FILE" > "$NAMESPACED_RELEASE_TAGS_FILE"
+          sed 's#^upstream/##' "$NAMESPACED_RELEASE_TAGS_FILE" > "$RELEASE_TAGS_FILE"
 
           sort -V "$RELEASE_TAGS_FILE" > "$SORTED_TAGS_FILE"
           readonly LATEST_TAG="$(tail -n 1 "$SORTED_TAGS_FILE")"
-
-          if [[ ! "$LATEST_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "最新 tag 不是正式 semver：$LATEST_TAG" >&2
-            exit 1
-          fi
-
-          readonly CONFIRMED_MAX="$(sort -V "$RELEASE_TAGS_FILE" | tail -n 1)"
-          if [[ "$LATEST_TAG" != "$CONFIRMED_MAX" ]]; then
-            echo "最新 tag 不是全部正式候选的最大值：$LATEST_TAG != $CONFIRMED_MAX" >&2
-            exit 1
-          fi
-
           readonly UPSTREAM_TAG_REF="refs/tags/upstream/$LATEST_TAG"
           readonly UPSTREAM_SHA="$(git rev-parse "${UPSTREAM_TAG_REF}^{commit}")"
           echo "base=$BASE_SHA"
@@ -105,14 +81,7 @@ jobs:
           echo "base=$BASE_SHA"
           echo "head=$(git rev-parse HEAD)"
           echo "upstream_tag=$UPSTREAM_TAG"
-          if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
-            echo "merge_head=$(git rev-parse MERGE_HEAD)"
-          elif git merge-base --is-ancestor "$UPSTREAM_TAG_REF" HEAD; then
-            echo 'merge_state=upstream-tag-already-contained'
-          else
-            echo '合并命令结束后既没有 MERGE_HEAD，也无法证明上游 tag 已包含在 HEAD 中。' >&2
-            exit 1
-          fi
+          git merge-base --is-ancestor "$UPSTREAM_TAG_REF" HEAD
           git status --short
           git diff --cached --stat
 
