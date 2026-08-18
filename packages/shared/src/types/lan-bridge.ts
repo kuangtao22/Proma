@@ -5,6 +5,29 @@
  * 配置持久化到 ~/.proma/lan-bridge.json。
  */
 
+/** 当前 LAN Bridge 协议主版本。 */
+export const LAN_BRIDGE_PROTOCOL_VERSION = 2
+
+/** 当前服务端稳定支持的 LAN Bridge 能力集合。 */
+export const LAN_BRIDGE_CAPABILITIES = [
+  'pin-pairing',
+  'pairing-ticket',
+  'device-revocation',
+  'streaming',
+  'connection-recovery',
+] as const
+
+/** LAN Bridge 可协商能力。 */
+export type LanBridgeCapability = typeof LAN_BRIDGE_CAPABILITIES[number]
+
+/** WebSocket 连接建立后的协议协商信息。 */
+export interface LanBridgeConnectedPayload {
+  message: string
+  protocolVersion: number
+  serverVersion: string
+  capabilities: LanBridgeCapability[]
+}
+
 // ===== WS 消息格式 =====
 
 /** WS 请求消息（客户端 → Proma） */
@@ -47,6 +70,11 @@ export type LanBridgeErrorCode =
   | 'AUTH_FAILED'
   | 'TOKEN_EXPIRED'
   | 'TOKEN_INVALID'
+  | 'DEVICE_REVOKED'
+  | 'PAIRING_TICKET_INVALID'
+  | 'PAIRING_TICKET_EXPIRED'
+  | 'PROTOCOL_UNSUPPORTED'
+  | 'CONNECTION_LOST'
   | 'RATE_LIMITED'
   | 'PERMISSION_DENIED'
   | 'NOT_FOUND'
@@ -88,11 +116,41 @@ export interface LanBridgeAuthRefreshResult {
   expiresIn: number
 }
 
+/** 一次性配对票据认证请求。 */
+export interface LanBridgeAuthPairTicketInput {
+  ticket: string
+  deviceName: string
+}
+
+/** 一次性配对票据认证响应。 */
+export interface LanBridgeAuthPairTicketResult {
+  token: string
+  expiresIn: number
+  deviceId: string
+}
+
 // ===== 数据查询 =====
+
+/** LAN Bridge 对外暴露的稳定对话摘要。 */
+export interface LanBridgeConversationDto {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+}
+
+/** LAN Bridge 对外暴露的稳定 Agent 会话摘要。 */
+export interface LanBridgeAgentSessionDto {
+  id: string
+  title: string
+  workspaceId?: string
+  createdAt: number
+  updatedAt: number
+}
 
 /** 对话列表查询结果 */
 export interface LanBridgeConversationsResult {
-  conversations: import('./chat').ConversationMeta[]
+  conversations: LanBridgeConversationDto[]
 }
 
 /** 对话消息查询 */
@@ -129,7 +187,7 @@ export interface LanBridgeSearchResult {
 
 /** Agent 会话列表结果 */
 export interface LanBridgeAgentSessionsResult {
-  sessions: import('./agent').AgentSessionMeta[]
+  sessions: LanBridgeAgentSessionDto[]
   workspaces: Array<{ id: string; name: string; slug: string }>
 }
 
@@ -268,6 +326,49 @@ export interface LanBridgeRuntimeState {
   errorMessage?: string
 }
 
+// ===== 配对与设备管理 IPC =====
+
+/** 已配对设备的安全元数据，不包含 Token、票据或签名凭据。 */
+export interface LanBridgeDeviceDto {
+  id: string
+  name: string
+  createdAt: number
+  lastSeenAt: number
+  tokenVersion: number
+  revokedAt?: number
+}
+
+/** 获取配对二维码请求；当前无需传入参数。 */
+export type LanBridgeGetPairingQrRequest = Record<string, never>
+
+/** 获取配对二维码响应。 */
+export interface LanBridgeGetPairingQrResponse {
+  qrCodeData: string
+  expiresAt: number
+}
+
+/** 查询已配对设备请求。 */
+export interface LanBridgeListDevicesRequest {
+  /** 是否包含已撤销设备，默认不包含。 */
+  includeRevoked?: boolean
+}
+
+/** 查询已配对设备响应。 */
+export interface LanBridgeListDevicesResponse {
+  devices: LanBridgeDeviceDto[]
+}
+
+/** 撤销设备请求。 */
+export interface LanBridgeRevokeDeviceRequest {
+  deviceId: string
+}
+
+/** 撤销设备响应。 */
+export interface LanBridgeRevokeDeviceResponse {
+  revoked: boolean
+  device: LanBridgeDeviceDto
+}
+
 // ===== IPC 通道 =====
 
 /** LAN Bridge IPC 通道 */
@@ -286,6 +387,12 @@ export const LAN_BRIDGE_IPC_CHANNELS = {
   GET_PIN: 'lan-bridge:get-pin',
   /** 刷新 PIN 码 */
   REFRESH_PIN: 'lan-bridge:refresh-pin',
+  /** 获取一次性配对二维码 */
+  GET_PAIRING_QR: 'lan-bridge:get-pairing-qr',
+  /** 查询已配对设备 */
+  LIST_DEVICES: 'lan-bridge:list-devices',
+  /** 撤销已配对设备 */
+  REVOKE_DEVICE: 'lan-bridge:revoke-device',
   /** 状态变更推送 */
   STATUS_CHANGED: 'lan-bridge:status-changed',
   /** 连接列表变更推送 */
