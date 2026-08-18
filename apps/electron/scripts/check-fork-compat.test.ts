@@ -518,6 +518,73 @@ describe('fork 上游兼容检查器', () => {
     expect(getCheck(files, 'ipc-composition').passed).toBe(false)
   })
 
+  /** Bridge registry 与 EventBus 组合依赖也必须来自各自目标模块的真实 named import。 */
+  const forgedBridgeDependencyCases = [
+    {
+      name: 'registerBridge',
+      importLine: "import { registerBridge, startAllBridges } from './lib/bridge-registry'",
+      replacement: `import { startAllBridges } from './lib/bridge-registry'
+        const registerBridge = (_registration: object): void => {}`,
+    },
+    {
+      name: 'startAllBridges',
+      importLine: "import { registerBridge, startAllBridges } from './lib/bridge-registry'",
+      replacement: `import { registerBridge } from './lib/bridge-registry'
+        const startAllBridges = (): void => {}`,
+    },
+    {
+      name: 'agentEventBus',
+      importLine: "import { agentEventBus } from './lib/agent-service'",
+      replacement: `import './lib/agent-service'
+        const agentEventBus = { emit: (): void => {} }`,
+    },
+  ]
+
+  for (const dependencyCase of forgedBridgeDependencyCases) {
+    test(`Given Bridge 组合点用本地 ${dependencyCase.name} 替换真实 import When 检查来源 Then 明确失败`, () => {
+      /** 删除当前关键依赖的 named import，并保留能通过文本检查的本地伪造。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/index.ts': validFiles['apps/electron/src/main/index.ts']!
+          .replace(dependencyCase.importLine, dependencyCase.replacement),
+      }
+
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    })
+  }
+
+  test('Given Bridge 三个关键依赖均使用 named import alias When 检查来源 Then 通过', () => {
+    /** alias 后的调用都应绑定对应 import specifier local symbol。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/index.ts': validFiles['apps/electron/src/main/index.ts']!
+        .replace(
+          'import { registerBridge, startAllBridges }',
+          'import { registerBridge as registerLifecycleBridge, startAllBridges as startLifecycleBridges }',
+        )
+        .replace('import { agentEventBus }', 'import { agentEventBus as mainAgentEventBus }')
+        .replace('registerBridge(createLanBridgeRegistration(agentEventBus))', 'registerLifecycleBridge(createLanBridgeRegistration(mainAgentEventBus))')
+        .replace('startAllBridges()', 'startLifecycleBridges()'),
+    }
+
+    expect(getCheck(files, 'bridge-composition').passed).toBe(true)
+  })
+
+  test('Given bootstrap 内局部 startAllBridges shadow 覆盖真实 import When 检查来源 Then 明确失败', () => {
+    /** import 仍存在，但 bootstrap 实际调用绑定到函数内局部声明。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/index.ts': validFiles['apps/electron/src/main/index.ts']!
+        .replace(
+          'async function bootstrap(): Promise<void> {',
+          `async function bootstrap(): Promise<void> {
+            const startAllBridges = (): void => {}`,
+        ),
+    }
+
+    expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+  })
+
   test('Given 官方服务仅作为 type-only import When 检查 Adapter 边界 Then 不判定运行时越界', () => {
     /** type-only import 不会生成运行时依赖。 */
     const files = {
@@ -1501,6 +1568,28 @@ broken: [
       const workflow = validWorkflow.replace(
         '          cleanup_failed=0',
         `          cleanup_failed=0\n          ${cleanupCase.command}`,
+      )
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  /** cleanup step 只能包含当前执行合同需要的键，禁止覆写失败与工作目录语义。 */
+  const invalidCleanupStepKeyCases = [
+    { name: 'continue-on-error true', line: '        continue-on-error: true' },
+    { name: 'continue-on-error false', line: '        continue-on-error: false' },
+    { name: 'timeout override', line: '        timeout-minutes: 5' },
+    { name: 'working-directory', line: '        working-directory: apps/electron' },
+  ]
+
+  for (const keyCase of invalidCleanupStepKeyCases) {
+    test(`Given cleanup step 增加 ${keyCase.name} When 检查允许键闭集 Then 明确失败`, () => {
+      /** 在 always 条件后注入不属于 cleanup 合同的 step 字段。 */
+      const workflow = validWorkflow.replace(
+        '        if: always()',
+        `        if: always()\n${keyCase.line}`,
       )
       const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
 

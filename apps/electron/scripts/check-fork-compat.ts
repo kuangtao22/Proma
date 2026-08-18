@@ -300,8 +300,12 @@ function hasReachableBootstrapRegistration(sourceFile: ts.SourceFile): boolean {
   })
 }
 
-/** 判断 bootstrap 顶层表达式是否直接启动 Bridge。 */
-function expressionStartsAllBridges(expression: ts.Expression): boolean {
+/** 判断 bootstrap 顶层表达式是否调用真实 import 的统一 Bridge 启动函数。 */
+function expressionStartsAllBridges(
+  expression: ts.Expression,
+  startBindings: ReadonlyMap<string, ts.Symbol>,
+  checker: ts.TypeChecker,
+): boolean {
   /** await 和括号不改变当前表达式的执行路径。 */
   const unwrapped = ts.isAwaitExpression(expression)
     ? expression.expression
@@ -309,7 +313,10 @@ function expressionStartsAllBridges(expression: ts.Expression): boolean {
       ? expression.expression
       : expression
   if (!ts.isCallExpression(unwrapped)) return false
-  if (ts.isIdentifier(unwrapped.expression) && unwrapped.expression.text === 'startAllBridges') return true
+  if (
+    ts.isIdentifier(unwrapped.expression)
+    && identifierUsesImportedBinding(unwrapped.expression, startBindings, checker)
+  ) return true
   if (!ts.isIdentifier(unwrapped.expression) || unwrapped.expression.text !== 'safeAwait') return false
   /** safeAwait 的函数参数由该 helper 在当前 bootstrap 步骤直接执行。 */
   return unwrapped.arguments.some((argument) => (
@@ -317,21 +324,28 @@ function expressionStartsAllBridges(expression: ts.Expression): boolean {
     && (ts.isBlock(argument.body)
       ? argument.body.statements.some((statement) => (
         ts.isReturnStatement(statement)
-        && Boolean(statement.expression && expressionStartsAllBridges(statement.expression))
+        && Boolean(statement.expression && expressionStartsAllBridges(statement.expression, startBindings, checker))
       ))
-      : expressionStartsAllBridges(argument.body))
+      : expressionStartsAllBridges(argument.body, startBindings, checker))
   ))
 }
 
 /** 按顺序确认 bootstrap 在无条件终止前直接启动 Bridge。 */
-function bootstrapStartsAllBridges(bootstrap: ts.FunctionDeclaration | undefined): boolean {
+function bootstrapStartsAllBridges(
+  bootstrap: ts.FunctionDeclaration | undefined,
+  startBindings: ReadonlyMap<string, ts.Symbol>,
+  checker: ts.TypeChecker,
+): boolean {
   if (!bootstrap?.body) return false
   for (const statement of bootstrap.body.statements) {
     if (ts.isReturnStatement(statement)) {
-      return Boolean(statement.expression && expressionStartsAllBridges(statement.expression))
+      return Boolean(statement.expression && expressionStartsAllBridges(statement.expression, startBindings, checker))
     }
     if (ts.isThrowStatement(statement)) return false
-    if (ts.isExpressionStatement(statement) && expressionStartsAllBridges(statement.expression)) return true
+    if (
+      ts.isExpressionStatement(statement)
+      && expressionStartsAllBridges(statement.expression, startBindings, checker)
+    ) return true
   }
   return false
 }
@@ -376,11 +390,17 @@ function identifierUsesImportedBinding(
 /** 判断调用是否为 LAN registration factory 的 registerBridge 组合。 */
 function isLanBridgeRegistrationCall(
   node: ts.Node,
+  registerBridgeBindings: ReadonlyMap<string, ts.Symbol>,
   factoryBindings: ReadonlyMap<string, ts.Symbol>,
+  eventBusBindings: ReadonlyMap<string, ts.Symbol>,
   checker: ts.TypeChecker,
   requireAgentEventBus: boolean,
 ): node is ts.CallExpression {
-  if (!ts.isCallExpression(node) || !ts.isIdentifier(node.expression) || node.expression.text !== 'registerBridge') {
+  if (
+    !ts.isCallExpression(node)
+    || !ts.isIdentifier(node.expression)
+    || !identifierUsesImportedBinding(node.expression, registerBridgeBindings, checker)
+  ) {
     return false
   }
   /** registerBridge 的首个实参必须是 LAN registration factory 调用。 */
@@ -391,20 +411,30 @@ function isLanBridgeRegistrationCall(
     || !identifierUsesImportedBinding(registration.expression, factoryBindings, checker)
   ) return false
   if (!requireAgentEventBus) return true
-  return ts.isIdentifier(registration.arguments[0]) && registration.arguments[0].text === 'agentEventBus'
+  return ts.isIdentifier(registration.arguments[0])
+    && identifierUsesImportedBinding(registration.arguments[0], eventBusBindings, checker)
 }
 
 /** 统计全部 LAN registerBridge 语法调用，包括不可达位置，用于拒绝隐藏重复注册。 */
 function countLanBridgeRegistrations(
   sourceFile: ts.SourceFile,
+  registerBridgeBindings: ReadonlyMap<string, ts.Symbol>,
   factoryBindings: ReadonlyMap<string, ts.Symbol>,
+  eventBusBindings: ReadonlyMap<string, ts.Symbol>,
   checker: ts.TypeChecker,
 ): number {
   /** 当前累计注册次数。 */
   let count = 0
   /** 递归扫描全部真实调用节点，注释和字符串不会进入 AST。 */
   const visit = (node: ts.Node): void => {
-    if (isLanBridgeRegistrationCall(node, factoryBindings, checker, false)) count += 1
+    if (isLanBridgeRegistrationCall(
+      node,
+      registerBridgeBindings,
+      factoryBindings,
+      eventBusBindings,
+      checker,
+      false,
+    )) count += 1
     ts.forEachChild(node, visit)
   }
   visit(sourceFile)
@@ -414,12 +444,21 @@ function countLanBridgeRegistrations(
 /** 统计 Program 顶层直接执行且注入 agentEventBus 的 LAN 注册。 */
 function countTopLevelLanBridgeRegistrations(
   sourceFile: ts.SourceFile,
+  registerBridgeBindings: ReadonlyMap<string, ts.Symbol>,
   factoryBindings: ReadonlyMap<string, ts.Symbol>,
+  eventBusBindings: ReadonlyMap<string, ts.Symbol>,
   checker: ts.TypeChecker,
 ): number {
   return sourceFile.statements.filter((statement) => (
     ts.isExpressionStatement(statement)
-    && isLanBridgeRegistrationCall(statement.expression, factoryBindings, checker, true)
+    && isLanBridgeRegistrationCall(
+      statement.expression,
+      registerBridgeBindings,
+      factoryBindings,
+      eventBusBindings,
+      checker,
+      true,
+    )
   )).length
 }
 
@@ -722,22 +761,47 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
   const mainContext = createTypeScriptBindingContext(PATHS.main, main)
   const mainSource = mainContext.sourceFile
   const bridgeSource = parseTypeScript(PATHS.bridge, bridge)
-  /** LAN registration factory 的真实 import bindings 及全部注册次数。 */
+  /** Bridge registry、LAN factory 与官方 EventBus 的真实 import bindings。 */
+  const registerBridgeBindings = collectImportedLocalBindings(
+    mainContext,
+    './lib/bridge-registry',
+    'registerBridge',
+  )
+  const startAllBridgesBindings = collectImportedLocalBindings(
+    mainContext,
+    './lib/bridge-registry',
+    'startAllBridges',
+  )
   const factoryBindings = collectImportedLocalBindings(
     mainContext,
     './lib/lan-bridge/lan-bridge',
     'createLanBridgeRegistration',
   )
-  const registrationCount = countLanBridgeRegistrations(mainSource, factoryBindings, mainContext.checker)
+  const eventBusBindings = collectImportedLocalBindings(
+    mainContext,
+    './lib/agent-service',
+    'agentEventBus',
+  )
+  /** 只统计真实 registry 与 LAN factory 组合的注册调用。 */
+  const registrationCount = countLanBridgeRegistrations(
+    mainSource,
+    registerBridgeBindings,
+    factoryBindings,
+    eventBusBindings,
+    mainContext.checker,
+  )
   /** Program 顶层实际执行且绑定 agentEventBus 的注册次数。 */
   const topLevelRegistrationCount = countTopLevelLanBridgeRegistrations(
     mainSource,
+    registerBridgeBindings,
     factoryBindings,
+    eventBusBindings,
     mainContext.checker,
   )
   /** 顶层挂接且顺序可达的 bootstrap。 */
   const bootstrap = findNamedFunction(mainSource, 'bootstrap')
-  const hasReachableStart = hasReachableBootstrapRegistration(mainSource) && bootstrapStartsAllBridges(bootstrap)
+  const hasReachableStart = hasReachableBootstrapRegistration(mainSource)
+    && bootstrapStartsAllBridges(bootstrap, startAllBridgesBindings, mainContext.checker)
   /** 导出的显式注入 factory。 */
   const registrationFactory = findExportedFunction(bridgeSource, 'createLanBridgeRegistration')
   /** factory 首个参数是必须由 start 消费的注入 EventBus。 */
@@ -1286,6 +1350,8 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
 
     /** cleanup 必须始终运行，并按生产脚本的固定控制流逐项聚合清理失败。 */
     const cleanup = findStep('Abort merge and remove temporary branch')
+    /** cleanup step 顶层只允许当前执行合同需要的五个字段。 */
+    const cleanupAllowedKeys = new Set(['name', 'if', 'shell', 'env', 'run'])
     /** cleanup 只能读取 select step 产生的 base 和临时分支 outputs。 */
     const cleanupEnv = cleanup && isRecord(cleanup.env) ? cleanup.env : undefined
     /** 完整闭集锁定函数、三个尝试分支、状态聚合与最终退出顺序。 */
@@ -1322,6 +1388,7 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     ] as const
     if (
       cleanup?.if !== 'always()'
+      || Object.keys(cleanup ?? {}).some((key) => !cleanupAllowedKeys.has(key))
       || cleanup?.shell !== 'bash'
       || cleanupEnv?.BASE_SHA !== '${{ steps.upstream.outputs.base_sha }}'
       || cleanupEnv?.TEMP_BRANCH !== '${{ steps.upstream.outputs.temp_branch }}'
