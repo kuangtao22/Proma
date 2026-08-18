@@ -64,6 +64,8 @@ export interface LanBridgeSettingsRequestCallbacks<T> {
 
 /** 设置页异步请求协调器。 */
 export interface LanBridgeSettingsRequestCoordinator {
+  /** 标记组件挂载；已挂载时保持当前生命周期。 */
+  mount: () => void
   /** 更新 Bridge 运行态。 */
   setRunning: (running: boolean) => void
   /** 执行一次受生命周期保护的请求。 */
@@ -83,15 +85,20 @@ export interface LanBridgeSettingsRequestCoordinator {
 export function createLanBridgeSettingsRequestCoordinator(): LanBridgeSettingsRequestCoordinator {
   /** 当前 Bridge 是否运行。 */
   let running = false
-  /** 组件卸载后永久拒绝状态提交。 */
-  let mounted = true
-  /** stop/restart 或卸载时提升，统一淘汰所有旧请求。 */
+  /** 组件仅在 effect setup 与 cleanup 之间允许状态提交。 */
+  let mounted = false
+  /** stop/restart 或挂载状态转换时提升，统一淘汰所有旧请求。 */
   let lifecycleEpoch = 0
   /** 各资源独立分代，允许 QR、设备与 PIN 并行。 */
   const scopeGenerations = new Map<LanBridgeSettingsRequestScope, number>()
   /** 跨操作共享的数据世代，仅限制结果回写而不跳过各自 onSettled。 */
   const resultGenerations = new Map<LanBridgeSettingsResultScope, number>()
   return {
+    mount: () => {
+      if (mounted) return
+      mounted = true
+      lifecycleEpoch += 1
+    },
     setRunning: value => {
       if (running === value) return
       running = value
@@ -131,6 +138,7 @@ export function createLanBridgeSettingsRequestCoordinator(): LanBridgeSettingsRe
       resultGenerations.set(scope, (resultGenerations.get(scope) ?? 0) + 1)
     },
     unmount: () => {
+      if (!mounted) return
       mounted = false
       lifecycleEpoch += 1
     },

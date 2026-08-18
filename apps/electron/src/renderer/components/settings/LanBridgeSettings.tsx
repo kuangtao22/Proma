@@ -102,9 +102,6 @@ export function LanBridgeSettings(): React.ReactElement {
     }, { resultScope: 'devices' })
   }, [requestCoordinator])
 
-  /** 卸载后永久废弃所有迟到 IPC 回调。 */
-  React.useEffect(() => () => requestCoordinator.unmount(), [requestCoordinator])
-
   // 加载配置和状态
   React.useEffect(() => {
     Promise.all([
@@ -130,7 +127,8 @@ export function LanBridgeSettings(): React.ReactElement {
 
   // 获取 PIN
   React.useEffect(() => {
-    /** running 变化提升 lifecycle epoch，旧 stop/restart 请求无法回写。 */
+    /** effect setup 建立可逆生命周期，兼容 StrictMode 的 setup-cleanup-setup。 */
+    requestCoordinator.mount()
     const isRunningNow = runtimeState.status === 'running'
     requestCoordinator.setRunning(isRunningNow)
     if (isRunningNow) {
@@ -142,16 +140,21 @@ export function LanBridgeSettings(): React.ReactElement {
       })
       void loadPairingQr()
       void loadDevices()
-      return
+    } else {
+      setPin('')
+      setPairingQr(null)
+      setPairingError('')
+      setPairingLoading(false)
+      setDevices([])
+      setDevicesError('')
+      setDevicesLoading(false)
+      setRevokingDeviceId(null)
     }
-    setPin('')
-    setPairingQr(null)
-    setPairingError('')
-    setPairingLoading(false)
-    setDevices([])
-    setDevicesError('')
-    setDevicesLoading(false)
-    setRevokingDeviceId(null)
+    return () => {
+      /** cleanup 先停用运行态再卸载，使所有当前请求立即失效。 */
+      requestCoordinator.setRunning(false)
+      requestCoordinator.unmount()
+    }
   }, [runtimeState.status, loadPairingQr, loadDevices, requestCoordinator])
 
   /** 二维码存在时每秒刷新一次剩余时间，不触发网络请求。 */

@@ -11,15 +11,25 @@ import {
 interface Deferred<T> {
   promise: Promise<T>
   resolve: (value: T) => void
+  reject: (error: unknown) => void
 }
 
 /** 创建 deferred Promise，模拟 IPC 乱序响应。 */
 function createDeferred<T>(): Deferred<T> {
   /** Promise 的成功结算函数。 */
   let resolvePromise: ((value: T) => void) | undefined
+  /** Promise 的失败结算函数。 */
+  let rejectPromise: ((error: unknown) => void) | undefined
   /** 由测试稍后结算的 Promise。 */
-  const promise = new Promise<T>((resolve) => { resolvePromise = resolve })
-  return { promise, resolve: value => resolvePromise?.(value) }
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve
+    rejectPromise = reject
+  })
+  return {
+    promise,
+    resolve: value => resolvePromise?.(value),
+    reject: error => rejectPromise?.(error),
+  }
 }
 
 describe('LAN Bridge 设置页纯逻辑', () => {
@@ -62,6 +72,7 @@ describe('LAN Bridge 设置页纯逻辑', () => {
     let displayed = ''
     let loading = false
     const coordinator = createLanBridgeSettingsRequestCoordinator()
+    coordinator.mount()
     coordinator.setRunning(true)
     /** 复用组件真实提交语义。 */
     const callbacks = {
@@ -91,6 +102,7 @@ describe('LAN Bridge 设置页纯逻辑', () => {
     /** 模拟组件设备列表。 */
     let devices: string[] = []
     const coordinator = createLanBridgeSettingsRequestCoordinator()
+    coordinator.mount()
     coordinator.setRunning(true)
     /** 设备请求共用的提交动作。 */
     const callbacks = {
@@ -118,6 +130,7 @@ describe('LAN Bridge 设置页纯逻辑', () => {
     /** 记录卸载后是否仍触发回调。 */
     const events: string[] = []
     const coordinator = createLanBridgeSettingsRequestCoordinator()
+    coordinator.mount()
     coordinator.setRunning(true)
     const run = coordinator.run('pin', () => deferred.promise, {
       onStart: () => events.push('start'),
@@ -133,12 +146,65 @@ describe('LAN Bridge 设置页纯逻辑', () => {
     expect(events).toEqual(['start'])
   })
 
+  test('Given StrictMode 卸载重挂 When 旧请求迟到且新请求完成 Then 仅新生命周期可提交', async () => {
+    /** 卸载前分别成功和失败的两个迟到请求。 */
+    const oldSuccess = createDeferred<string>()
+    const oldError = createDeferred<string>()
+    /** 重挂后正常完成的新请求。 */
+    const freshRequest = createDeferred<string>()
+    /** 记录各生命周期实际提交的回调。 */
+    const events: string[] = []
+    const coordinator = createLanBridgeSettingsRequestCoordinator()
+    coordinator.mount()
+    coordinator.setRunning(true)
+    const oldSuccessRun = coordinator.run('pairingQr', () => oldSuccess.promise, {
+      onStart: () => events.push('old-success:start'),
+      onSuccess: () => events.push('old-success:success'),
+      onError: () => events.push('old-success:error'),
+      onSettled: () => events.push('old-success:settled'),
+    })
+    const oldErrorRun = coordinator.run('pin', () => oldError.promise, {
+      onStart: () => events.push('old-error:start'),
+      onSuccess: () => events.push('old-error:success'),
+      onError: () => events.push('old-error:error'),
+      onSettled: () => events.push('old-error:settled'),
+    })
+
+    /** 模拟 StrictMode cleanup 后重新 setup。 */
+    coordinator.setRunning(false)
+    coordinator.unmount()
+    coordinator.mount()
+    coordinator.setRunning(true)
+    const freshRun = coordinator.run('devicesList', () => freshRequest.promise, {
+      onStart: () => events.push('fresh:start'),
+      onSuccess: value => events.push(`fresh:success:${value}`),
+      onError: () => events.push('fresh:error'),
+      onSettled: () => events.push('fresh:settled'),
+    })
+    /** 已挂载时重复 setup 不得使当前请求失效。 */
+    coordinator.mount()
+
+    oldSuccess.resolve('stale-success')
+    oldError.reject(new Error('stale-error'))
+    freshRequest.resolve('fresh-value')
+    await Promise.all([oldSuccessRun, oldErrorRun, freshRun])
+
+    expect(events).toEqual([
+      'old-success:start',
+      'old-error:start',
+      'fresh:start',
+      'fresh:success:fresh-value',
+      'fresh:settled',
+    ])
+  })
+
   test('Given 首次设备列表请求 When 结果返回 Then 未初始化的共享结果世代允许正常提交', async () => {
     /** 首次加载返回的设备列表。 */
     const initialList = createDeferred<string[]>()
     /** 模拟组件当前设备数据。 */
     let devices: string[] = []
     const coordinator = createLanBridgeSettingsRequestCoordinator()
+    coordinator.mount()
     coordinator.setRunning(true)
     const run = coordinator.run('devicesList', () => initialList.promise, {
       onStart: () => undefined,
@@ -170,6 +236,7 @@ describe('LAN Bridge 设置页纯逻辑', () => {
       let listPending = false
       let revokePending = false
       const coordinator = createLanBridgeSettingsRequestCoordinator()
+      coordinator.mount()
       coordinator.setRunning(true)
 
       /** 发起受共享设备数据世代保护的列表请求。 */
