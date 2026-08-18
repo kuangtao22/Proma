@@ -1,10 +1,74 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   FORK_COMPAT_CHECK_IDS,
   checkForkCompatibility,
+  createFileSystemRepositoryReader,
   createMemoryRepositoryReader,
   runForkCompatCli,
 } from './check-fork-compat'
+
+/** 结构完整的最小上游兼容 workflow fixture。 */
+const validWorkflow = `
+name: Upstream Compatibility
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: upstream-compat-\${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify-upstream-merge:
+    timeout-minutes: 60
+    steps:
+      - name: Checkout fork with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Select latest official release tag
+        id: upstream
+        run: |
+          git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'
+          git tag --list 'upstream/v*'
+          if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then
+            sort -V "$RUNNER_TEMP/tags.txt"
+          fi
+          echo "tag_ref=refs/tags/upstream/$tag" >> "$GITHUB_OUTPUT"
+      - name: Merge upstream tag without committing
+        run: |
+          git switch --create "$TEMP_BRANCH" "$BASE_SHA"
+          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"
+      - name: Install dependencies from merged tree
+        run: bun install --frozen-lockfile
+      - name: Check fork compatibility seams
+        run: bun run --filter='@proma/electron' check:fork-compat
+      - name: Run LAN and mobile targeted tests
+        run: bun test apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib
+      - name: Build mobile app
+        run: bun run --filter='@proma/mobile' build
+      - name: Typecheck all workspaces
+        run: bun run typecheck
+      - name: Build Electron app
+        run: bun run electron:build
+      - name: Abort merge and remove temporary branch
+        if: always()
+        run: |
+          cleanup_failed=0
+          run_cleanup 'abort merge' git merge --abort
+          run_cleanup 'switch to base' git switch --detach "$BASE_SHA"
+          run_cleanup 'delete temporary branch' git branch --delete --force "$TEMP_BRANCH"
+          exit "$cleanup_failed"
+`
 
 /** checker 测试使用的最小完整仓库文件集合。 */
 const validFiles: Record<string, string> = {
@@ -13,7 +77,10 @@ const validFiles: Record<string, string> = {
     import { agentEventBus } from './lib/agent-service'
     import { createLanBridgeRegistration } from './lib/lan-bridge/lan-bridge'
     registerBridge(createLanBridgeRegistration(agentEventBus))
-    await startAllBridges()
+    app.whenReady().then(bootstrap).catch(handleBootstrapFailure)
+    async function bootstrap(): Promise<void> {
+      await safeAwait('startAllBridges', () => startAllBridges())
+    }
   `,
   'apps/electron/src/main/lib/lan-bridge/lan-bridge.ts': `
     import type { AgentEventBus } from '../agent-event-bus'
@@ -154,33 +221,7 @@ extraResources:
     filter:
       - "**/*"
   `,
-  '.github/workflows/upstream-compat.yml': `
-name: Upstream Compatibility
-on: [workflow_dispatch]
-jobs:
-  verify:
-    steps:
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-      - name: Select latest official release tag
-        run: |
-          git tag --list 'upstream/v*' > "$RUNNER_TEMP/tags.txt"
-          grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' "$RUNNER_TEMP/tags.txt"
-          sort -V "$RUNNER_TEMP/tags.txt"
-      - name: Merge upstream tag without committing
-        run: git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"
-      - name: Check fork compatibility seams
-        run: bun run --filter='@proma/electron' check:fork-compat
-      - name: Abort merge and remove temporary branch
-        if: always()
-        run: |
-          cleanup_failed=0
-          git merge --abort || cleanup_failed=1
-          git switch --detach "$BASE_SHA" || cleanup_failed=1
-          git branch --delete --force "$TEMP_BRANCH" || cleanup_failed=1
-          exit "$cleanup_failed"
-  `,
+  '.github/workflows/upstream-compat.yml': validWorkflow,
 }
 
 /** 执行内存 fixture 并返回全部兼容检查结果。 */
@@ -331,6 +372,122 @@ describe('fork 上游兼容检查器', () => {
 
     expect(getCheck(files, 'adapter-boundary').passed).toBe(true)
   })
+
+  test('Given type-only import/export 带模块后缀 When 检查 Adapter 边界 Then 仍允许', () => {
+    /** 带扩展名的纯类型依赖不会生成运行时加载。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/lib/lan-bridge/type-only-extension.ts': `
+        import type { AgentEventBus } from '../agent-service.js'
+        export type { AgentSession } from '../agent-session-manager.ts'
+      `,
+    }
+
+    expect(getCheck(files, 'adapter-boundary').passed).toBe(true)
+  })
+
+  /** 官方运行时模块的常见扩展名和加载语法必须统一命中。 */
+  const suffixedRuntimeBoundaryCases: Array<{ name: string; source: string }> = [
+    { name: 'static import .js', source: `import { runAgent } from '../agent-service.js'` },
+    { name: 'runtime export .ts', source: `export { getSettings } from '../settings-service.ts'` },
+    { name: 'dynamic import .mjs', source: `const channel = import('../channel-manager.mjs')` },
+    { name: 'require .cjs', source: `const chat = require('../chat-service.cjs')` },
+    { name: 'empty named import', source: `import {} from '../agent-service.js'` },
+  ]
+
+  for (const boundaryCase of suffixedRuntimeBoundaryCases) {
+    test(`Given ${boundaryCase.name} 引用官方服务 When 检查 Adapter 边界 Then 明确失败`, () => {
+      /** 将当前运行时加载形式放入 LAN 生产模块。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/lib/lan-bridge/suffixed-runtime-leak.ts': boundaryCase.source,
+      }
+
+      expect(getCheck(files, 'adapter-boundary').passed).toBe(false)
+    })
+  }
+
+  /** 非字面量加载无法静态证明目标，LAN 生产代码必须保守拒绝。 */
+  const nonLiteralRuntimeCases: Array<{ name: string; source: string }> = [
+    { name: 'require identifier', source: `const target = '../agent-service'; require(target)` },
+    { name: 'require concatenation', source: `require('../' + 'agent-service')` },
+    { name: 'dynamic import identifier', source: `const target = '../chat-service'; import(target)` },
+    { name: 'dynamic import concatenation', source: `import('../' + 'chat-service')` },
+  ]
+
+  for (const boundaryCase of nonLiteralRuntimeCases) {
+    test(`Given ${boundaryCase.name} When 检查 Adapter 边界 Then 保守失败并提示改用字面量`, () => {
+      /** 将无法静态解析的加载形式放入 LAN 生产模块。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/lib/lan-bridge/non-literal-runtime.ts': boundaryCase.source,
+      }
+      /** Adapter 边界检查结果。 */
+      const result = getCheck(files, 'adapter-boundary')
+
+      expect(result.passed).toBe(false)
+      expect(result.details.join('\n')).toContain('非字面量')
+      expect(result.details.join('\n')).toContain('静态字符串')
+    })
+  }
+
+  test('Given 正确 LAN 注册之外追加 duplicateBus 注册 When 检查 Bridge Then 明确失败', () => {
+    /** 第二次注册使用不同变量名，仍必须计入总数。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/index.ts': `${validFiles['apps/electron/src/main/index.ts']!}
+        registerBridge(createLanBridgeRegistration(duplicateBus))
+      `,
+    }
+
+    expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+  })
+
+  /** startAllBridges 只有在可达 bootstrap 顶层路径中才有效。 */
+  const unreachableBootstrapCases: Array<{ name: string; source: string }> = [
+    {
+      name: '调用只在死函数',
+      source: `
+        registerBridge(createLanBridgeRegistration(agentEventBus))
+        app.whenReady().then(bootstrap)
+        async function bootstrap(): Promise<void> {}
+        function deadStart() { startAllBridges() }
+      `,
+    },
+    {
+      name: '调用位于 return 后',
+      source: `
+        registerBridge(createLanBridgeRegistration(agentEventBus))
+        app.whenReady().then(bootstrap)
+        async function bootstrap(): Promise<void> {
+          return
+          await startAllBridges()
+        }
+      `,
+    },
+    {
+      name: '调用只在 false 条件分支',
+      source: `
+        registerBridge(createLanBridgeRegistration(agentEventBus))
+        app.whenReady().then(bootstrap)
+        async function bootstrap(): Promise<void> {
+          if (false) await startAllBridges()
+        }
+      `,
+    },
+  ]
+
+  for (const bootstrapCase of unreachableBootstrapCases) {
+    test(`Given ${bootstrapCase.name} When 检查 Bridge 启动 Then 明确失败`, () => {
+      /** 使用当前不可达启动源码替换主进程组合根。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/index.ts': bootstrapCase.source,
+      }
+
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    })
+  }
 
   /** Bridge registration 的 start 仅允许真实绑定注入 EventBus 的函数形式。 */
   const validBridgeStartCases: Array<{ name: string; source: string }> = [
@@ -690,6 +847,216 @@ ignoredResources:
     expect(getCheck(files, 'mobile-resource').passed).toBe(false)
   })
 
+  /** electron-builder 目标资源必须来自顶层数组中的完整 map。 */
+  const invalidBuilderYamlCases: Array<{ name: string; source: string }> = [
+    {
+      name: 'extraResources 是 map',
+      source: `
+extraResources:
+  from: ../../apps/mobile/dist
+  to: mobile-dist
+  filter: ["**/*"]
+      `,
+    },
+    {
+      name: '目标 entry 是 scalar',
+      source: `
+extraResources:
+  - ../../apps/mobile/dist
+      `,
+    },
+    {
+      name: 'filter 为 null 且 ignoredResources 有伪列表',
+      source: `
+extraResources:
+  - from: ../../apps/mobile/dist
+    to: mobile-dist
+    filter: null
+ignoredResources:
+  - from: ../../apps/mobile/dist
+    to: mobile-dist
+    filter: ["**/*"]
+      `,
+    },
+    {
+      name: '资源只存在于 mac 错层',
+      source: `
+mac:
+  extraResources:
+    - from: ../../apps/mobile/dist
+      to: mobile-dist
+      filter: ["**/*"]
+      `,
+    },
+    {
+      name: '使用相似键 extraResource',
+      source: `
+extraResource:
+  - from: ../../apps/mobile/dist
+    to: mobile-dist
+    filter: ["**/*"]
+      `,
+    },
+    {
+      name: '目标 entry 后包含损坏 YAML',
+      source: `
+extraResources:
+  - from: ../../apps/mobile/dist
+    to: mobile-dist
+    filter:
+      - "**/*"
+broken: [
+      `,
+    },
+  ]
+
+  for (const builderCase of invalidBuilderYamlCases) {
+    test(`Given ${builderCase.name} When 检查 Builder YAML Then 明确失败`, () => {
+      /** 使用当前结构无效或类型错误的 builder YAML。 */
+      const files = {
+        ...validFiles,
+        'apps/electron/electron-builder.yml': builderCase.source,
+      }
+
+      expect(getCheck(files, 'mobile-resource').passed).toBe(false)
+    })
+  }
+
+  /** workflow 的触发、安全与执行资源约束必须结构化存在。 */
+  const invalidWorkflowStructureCases: Array<{ name: string; mutate: (source: string) => string }> = [
+    {
+      name: '缺少手动触发',
+      mutate: (source) => source.replace('workflow_dispatch:', 'repository_dispatch:'),
+    },
+    {
+      name: '缺少每周触发',
+      mutate: (source) => source.replace("  schedule:\n    - cron: '17 3 * * 1'\n", ''),
+    },
+    {
+      name: '缺少只读权限',
+      mutate: (source) => source.replace('permissions:\n  contents: read\n', ''),
+    },
+    {
+      name: '缺少并发取消',
+      mutate: (source) => source.replace('  cancel-in-progress: true', '  cancel-in-progress: false'),
+    },
+    {
+      name: '缺少超时',
+      mutate: (source) => source.replace('    timeout-minutes: 60\n', ''),
+    },
+    {
+      name: 'checkout 非完整历史',
+      mutate: (source) => source.replace('          fetch-depth: 0', '          fetch-depth: 1'),
+    },
+    {
+      name: 'checkout 不拉取 tags',
+      mutate: (source) => source.replace('          fetch-tags: true', '          fetch-tags: false'),
+    },
+    {
+      name: 'install 未冻结 lockfile',
+      mutate: (source) => source.replace('bun install --frozen-lockfile', 'bun install'),
+    },
+    {
+      name: '验证步骤顺序错误',
+      mutate: (source) => source
+        .replace('      - name: Build mobile app', '      - name: TEMP mobile')
+        .replace('      - name: Typecheck all workspaces', '      - name: Build mobile app')
+        .replace('      - name: TEMP mobile', '      - name: Typecheck all workspaces'),
+    },
+  ]
+
+  for (const workflowCase of invalidWorkflowStructureCases) {
+    test(`Given ${workflowCase.name} When 检查 workflow Then 明确失败`, () => {
+      /** 破坏单项 workflow 结构契约。 */
+      const files = {
+        ...validFiles,
+        '.github/workflows/upstream-compat.yml': workflowCase.mutate(validWorkflow),
+      }
+
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  test('Given tag ref 先写入受控变量 When 检查 workflow Then 接受真实输出命令', () => {
+    /** 模拟真实 workflow 先构造 namespaced tag ref 再写入输出。 */
+    const workflow = validWorkflow.replace(
+      'echo "tag_ref=refs/tags/upstream/$tag" >> "$GITHUB_OUTPUT"',
+      'readonly UPSTREAM_TAG_REF="refs/tags/upstream/$tag"\n          echo "tag_ref=$UPSTREAM_TAG_REF" >> "$GITHUB_OUTPUT"',
+    )
+    /** 使用变量输出 tag ref 的仓库 fixture。 */
+    const files = {
+      ...validFiles,
+      '.github/workflows/upstream-compat.yml': workflow,
+    }
+
+    expect(getCheck(files, 'workflow-definition').passed).toBe(true)
+  })
+
+  /** 每个关键 run 被 echo 替换时都不能被文本内容伪装。 */
+  const echoedWorkflowRunCases: Array<{ name: string; target: string; replacement: string }> = [
+    {
+      name: 'upstream fetch',
+      target: "git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'",
+      replacement: `echo "git fetch --force upstream '+refs/tags/*:refs/tags/upstream/*'"`,
+    },
+    {
+      name: 'tag list',
+      target: "git tag --list 'upstream/v*'",
+      replacement: `echo "git tag --list 'upstream/v*'"`,
+    },
+    {
+      name: 'merge',
+      target: 'git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+      replacement: 'echo \'git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"\'',
+    },
+    {
+      name: 'frozen install',
+      target: 'run: bun install --frozen-lockfile',
+      replacement: 'run: echo "bun install --frozen-lockfile"',
+    },
+    {
+      name: 'checker',
+      target: "run: bun run --filter='@proma/electron' check:fork-compat",
+      replacement: `run: echo "bun run --filter='@proma/electron' check:fork-compat"`,
+    },
+    {
+      name: 'targeted tests',
+      target: 'run: bun test apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib',
+      replacement: 'run: echo "bun test apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib"',
+    },
+    {
+      name: 'mobile build',
+      target: "run: bun run --filter='@proma/mobile' build",
+      replacement: `run: echo "bun run --filter='@proma/mobile' build"`,
+    },
+    {
+      name: 'root typecheck',
+      target: 'run: bun run typecheck',
+      replacement: 'run: echo "bun run typecheck"',
+    },
+    {
+      name: 'electron build',
+      target: 'run: bun run electron:build',
+      replacement: 'run: echo "bun run electron:build"',
+    },
+    {
+      name: 'cleanup abort',
+      target: "run_cleanup 'abort merge' git merge --abort",
+      replacement: `echo "run_cleanup 'abort merge' git merge --abort"`,
+    },
+  ]
+
+  for (const workflowCase of echoedWorkflowRunCases) {
+    test(`Given ${workflowCase.name} run 被 echo 替换 When 检查 workflow Then 明确失败`, () => {
+      /** 只替换当前关键命令，保留相同文本作为 echo 参数。 */
+      const workflow = validWorkflow.replace(workflowCase.target, workflowCase.replacement)
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
   test('Given workflow 吞错或清理静默成功 When 检查定义 Then 明确失败', () => {
     /** 同时破坏 tag pipeline 与 cleanup 聚合。 */
     const files = {
@@ -700,5 +1067,33 @@ ignoredResources:
     }
 
     expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
+
+  test('Given filesystem reader 收到绝对路径、父目录或 symlink When 读取 Then 不越出仓库根', () => {
+    /** 隔离的临时父目录、仓库根与外部目录。 */
+    const temporaryRoot = mkdtempSync(join(tmpdir(), 'proma-fork-reader-'))
+    const repositoryRoot = join(temporaryRoot, 'repository')
+    const outsideDirectory = join(temporaryRoot, 'outside')
+    mkdirSync(repositoryRoot)
+    mkdirSync(outsideDirectory)
+    writeFileSync(join(repositoryRoot, 'inside.txt'), 'inside', 'utf8')
+    writeFileSync(join(temporaryRoot, 'outside.txt'), 'outside-parent', 'utf8')
+    writeFileSync(join(outsideDirectory, 'secret.txt'), 'outside-directory', 'utf8')
+    symlinkSync('/etc/hosts', join(repositoryRoot, 'hosts-link'))
+    symlinkSync(outsideDirectory, join(repositoryRoot, 'outside-link'))
+
+    try {
+      /** 受测的真实文件系统 reader。 */
+      const reader = createFileSystemRepositoryReader(repositoryRoot)
+
+      expect(reader.read('inside.txt')).toBe('inside')
+      expect(reader.read('/etc/hosts') === undefined).toBe(true)
+      expect(reader.read('../outside.txt') === undefined).toBe(true)
+      expect(reader.read('hosts-link') === undefined).toBe(true)
+      expect(reader.list('../outside')).toEqual([])
+      expect(reader.list('outside-link')).toEqual([])
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true })
+    }
   })
 })

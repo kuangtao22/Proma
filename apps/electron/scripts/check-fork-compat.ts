@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { join, posix, relative, resolve } from 'node:path'
+import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 import * as ts from 'typescript'
 
 /** fork 兼容检查使用的稳定检查项顺序。 */
@@ -108,17 +108,10 @@ const PATHS = {
 
 /** AST 中发现的运行时模块依赖。 */
 interface RuntimeModuleDependency {
-  /** 模块说明符原文。 */
-  specifier: string
+  /** 模块说明符原文；非字面量加载时不存在。 */
+  specifier?: string
   /** 依赖语法类别，用于失败提示。 */
   syntax: string
-}
-
-/** electron-builder 顶层 extraResources 的最小结构。 */
-interface ExtraResourceEntry {
-  from?: string
-  to?: string
-  filter: string[]
 }
 
 /** 保守 shell 解析器确认可顺序执行的单条命令。 */
@@ -182,6 +175,7 @@ function hasRuntimeImport(importClause: ts.ImportClause | undefined): boolean {
   if (importClause.name) return true
   if (!importClause.namedBindings) return false
   if (ts.isNamespaceImport(importClause.namedBindings)) return true
+  if (importClause.namedBindings.elements.length === 0) return true
   return importClause.namedBindings.elements.some((element) => !element.isTypeOnly)
 }
 
@@ -190,6 +184,7 @@ function hasRuntimeExport(node: ts.ExportDeclaration): boolean {
   if (node.isTypeOnly) return false
   if (!node.exportClause) return true
   if (ts.isNamespaceExport(node.exportClause)) return true
+  if (node.exportClause.elements.length === 0) return true
   return node.exportClause.elements.some((element) => !element.isTypeOnly)
 }
 
@@ -200,9 +195,11 @@ function collectRuntimeDependencies(path: string, content: string): RuntimeModul
   /** 当前文件全部运行时依赖。 */
   const dependencies: RuntimeModuleDependency[] = []
   /** 记录字符串模块说明符。 */
-  const addDependency = (specifier: ts.Expression | undefined, syntax: string): void => {
+  const addDependency = (specifier: ts.Expression | undefined, syntax: string, requireLiteral = false): void => {
     if (specifier && ts.isStringLiteralLike(specifier)) {
       dependencies.push({ specifier: specifier.text, syntax })
+    } else if (requireLiteral) {
+      dependencies.push({ syntax })
     }
   }
   /** 递归访问语法树。 */
@@ -217,7 +214,9 @@ function collectRuntimeDependencies(path: string, content: string): RuntimeModul
       /** 动态 import() 或 CommonJS require() 的模块参数。 */
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword
       const isRequire = ts.isIdentifier(node.expression) && node.expression.text === 'require'
-      if (isDynamicImport || isRequire) addDependency(node.arguments[0], isDynamicImport ? 'import()' : 'require()')
+      if (isDynamicImport || isRequire) {
+        addDependency(node.arguments[0], isDynamicImport ? 'import()' : 'require()', true)
+      }
     }
     ts.forEachChild(node, visit)
   }
@@ -242,6 +241,113 @@ function findExportedFunction(sourceFile: ts.SourceFile, name: string): ts.Funct
     && statement.name?.text === name
     && statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) === true
   ))
+}
+
+/** 查找源码中的命名函数声明。 */
+function findNamedFunction(sourceFile: ts.SourceFile, name: string): ts.FunctionDeclaration | undefined {
+  return sourceFile.statements.find((statement): statement is ts.FunctionDeclaration => (
+    ts.isFunctionDeclaration(statement) && statement.name?.text === name
+  ))
+}
+
+/** 判断顶层 bootstrap 是否由 app.whenReady().then(bootstrap) 挂接。 */
+function hasReachableBootstrapRegistration(sourceFile: ts.SourceFile): boolean {
+  return sourceFile.statements.some((statement) => {
+    if (!ts.isExpressionStatement(statement)) return false
+    /** 递归检查调用链中的 then(bootstrap)。 */
+    const containsBootstrapThen = (node: ts.Expression): boolean => {
+      if (!ts.isCallExpression(node)) return false
+      if (
+        ts.isPropertyAccessExpression(node.expression)
+        && node.expression.name.text === 'then'
+        && node.arguments.some((argument) => ts.isIdentifier(argument) && argument.text === 'bootstrap')
+      ) return true
+      return ts.isPropertyAccessExpression(node.expression)
+        ? containsBootstrapThen(node.expression.expression)
+        : false
+    }
+    return containsBootstrapThen(statement.expression)
+  })
+}
+
+/** 判断 bootstrap 顶层表达式是否直接启动 Bridge。 */
+function expressionStartsAllBridges(expression: ts.Expression): boolean {
+  /** await 和括号不改变当前表达式的执行路径。 */
+  const unwrapped = ts.isAwaitExpression(expression)
+    ? expression.expression
+    : ts.isParenthesizedExpression(expression)
+      ? expression.expression
+      : expression
+  if (!ts.isCallExpression(unwrapped)) return false
+  if (ts.isIdentifier(unwrapped.expression) && unwrapped.expression.text === 'startAllBridges') return true
+  if (!ts.isIdentifier(unwrapped.expression) || unwrapped.expression.text !== 'safeAwait') return false
+  /** safeAwait 的函数参数由该 helper 在当前 bootstrap 步骤直接执行。 */
+  return unwrapped.arguments.some((argument) => (
+    (ts.isArrowFunction(argument) || ts.isFunctionExpression(argument))
+    && (ts.isBlock(argument.body)
+      ? argument.body.statements.some((statement) => (
+        ts.isReturnStatement(statement)
+        && Boolean(statement.expression && expressionStartsAllBridges(statement.expression))
+      ))
+      : expressionStartsAllBridges(argument.body))
+  ))
+}
+
+/** 按顺序确认 bootstrap 在无条件终止前直接启动 Bridge。 */
+function bootstrapStartsAllBridges(bootstrap: ts.FunctionDeclaration | undefined): boolean {
+  if (!bootstrap?.body) return false
+  for (const statement of bootstrap.body.statements) {
+    if (ts.isReturnStatement(statement)) {
+      return Boolean(statement.expression && expressionStartsAllBridges(statement.expression))
+    }
+    if (ts.isThrowStatement(statement)) return false
+    if (ts.isExpressionStatement(statement) && expressionStartsAllBridges(statement.expression)) return true
+  }
+  return false
+}
+
+/** 收集指定 import 导出的本地标识符，支持 import alias。 */
+function collectImportedLocalNames(
+  sourceFile: ts.SourceFile,
+  modulePath: string,
+  exportedName: string,
+): Set<string> {
+  /** 默认名称兼容同文件内最小测试源码。 */
+  const names = new Set<string>([exportedName])
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) continue
+    if (statement.moduleSpecifier.text !== modulePath || !statement.importClause?.namedBindings) continue
+    if (!ts.isNamedImports(statement.importClause.namedBindings)) continue
+    for (const element of statement.importClause.namedBindings.elements) {
+      if ((element.propertyName?.text ?? element.name.text) === exportedName) names.add(element.name.text)
+    }
+  }
+  return names
+}
+
+/** 统计所有 registerBridge(factory(...)) 语法调用。 */
+function countLanBridgeRegistrations(sourceFile: ts.SourceFile, factoryNames: ReadonlySet<string>): number {
+  /** 当前累计注册次数。 */
+  let count = 0
+  /** 递归扫描全部真实调用节点，注释和字符串不会进入 AST。 */
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isCallExpression(node)
+      && ts.isIdentifier(node.expression)
+      && node.expression.text === 'registerBridge'
+    ) {
+      /** registerBridge 的首个实参必须是 LAN registration factory 调用。 */
+      const registration = node.arguments[0]
+      if (
+        ts.isCallExpression(registration)
+        && ts.isIdentifier(registration.expression)
+        && factoryNames.has(registration.expression.text)
+      ) count += 1
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return count
 }
 
 /** 判断表达式是否直接调用 startLanBridge，并传入 factory 注入参数。 */
@@ -393,61 +499,47 @@ function commandEquals(command: ShellCommand | undefined, expectedArgv: readonly
   )
 }
 
-/** 去除 YAML 标量外围引号。 */
-function unquoteYamlScalar(value: string): string {
-  /** 当前标量去除首尾空白后的文本。 */
-  const trimmed = value.trim()
-  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
-    return trimmed.slice(1, -1)
-  }
-  return trimmed
+/** 判断未知 YAML 节点是否为普通对象映射。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** 最小解析顶层 extraResources list，拒绝 ignoredResources 等相似嵌套。 */
-function parseTopLevelExtraResources(content: string): ExtraResourceEntry[] | undefined {
-  /** YAML 原始行。 */
-  const lines = content.split(/\r?\n/)
-  /** 顶层 extraResources 键所在行。 */
-  const startIndex = lines.findIndex((line) => /^extraResources:\s*(?:#.*)?$/.test(line))
-  if (startIndex < 0) return undefined
-
-  /** 顶层 extraResources 下解析出的列表项。 */
-  const entries: ExtraResourceEntry[] = []
-  /** 当前正在解析的列表项。 */
-  let current: ExtraResourceEntry | undefined
-  /** 当前是否位于 filter 子列表。 */
-  let readingFilter = false
-
-  for (const line of lines.slice(startIndex + 1)) {
-    if (!line.trim() || /^\s*#/.test(line)) continue
-    if (/^\S/.test(line)) break
-
-    /** 新 extraResources 列表项。 */
-    const fromMatch = line.match(/^  -\s+from:\s*(.+?)\s*$/)
-    if (fromMatch) {
-      current = { from: unquoteYamlScalar(fromMatch[1]!), filter: [] }
-      entries.push(current)
-      readingFilter = false
-      continue
+/** 使用 Bun 内置解析器读取 YAML 映射，并把语法/根类型错误写入诊断。 */
+function parseYamlRecord(content: string, label: string, details: string[]): Record<string, unknown> | undefined {
+  try {
+    /** Bun YAML 解析后的未知根节点。 */
+    const parsed: unknown = Bun.YAML.parse(content)
+    if (!isRecord(parsed)) {
+      details.push(`${label} 根节点必须是 YAML map`)
+      return undefined
     }
-    if (!current) continue
-
-    /** 当前资源目标路径。 */
-    const toMatch = line.match(/^    to:\s*(.+?)\s*$/)
-    if (toMatch) {
-      current.to = unquoteYamlScalar(toMatch[1]!)
-      readingFilter = false
-      continue
-    }
-    if (/^    filter:\s*$/.test(line)) {
-      readingFilter = true
-      continue
-    }
-    /** filter 列表值。 */
-    const filterMatch = readingFilter ? line.match(/^      -\s+(.+?)\s*$/) : undefined
-    if (filterMatch) current.filter.push(unquoteYamlScalar(filterMatch[1]!))
+    return parsed
+  } catch (error) {
+    details.push(`${label} YAML 解析失败：${error instanceof Error ? error.message : String(error)}`)
+    return undefined
   }
-  return entries
+}
+
+/** 返回 workflow step 的字符串 run 内容。 */
+function getStepRun(step: Record<string, unknown> | undefined): string | undefined {
+  return step && typeof step.run === 'string' ? step.run : undefined
+}
+
+/** 判断 step 只执行一条给定 argv 的安全命令。 */
+function stepRunsExactCommand(step: Record<string, unknown> | undefined, expectedArgv: readonly string[]): boolean {
+  /** 当前 step 的 shell 脚本文本。 */
+  const run = getStepRun(step)
+  if (!run) return false
+  /** 只接受无短路、变量或子 shell 的单命令脚本。 */
+  const commands = parseConjunctiveShellCommands(run)
+  return commands?.length === 1 && commandEquals(commands[0], expectedArgv)
+}
+
+/** 判断复杂 shell step 中存在行首真实命令，echo/引号文本不会命中。 */
+function stepHasDirectCommand(step: Record<string, unknown> | undefined, pattern: RegExp): boolean {
+  /** 当前 step 的 shell 脚本文本。 */
+  const run = getStepRun(step)
+  return Boolean(run && run.split(/\r?\n/).some((line) => pattern.test(line.trim())))
 }
 
 /** 检查主进程 Bridge 注册与统一启动组合点。 */
@@ -461,31 +553,12 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
   /** 主进程和 LAN Bridge AST。 */
   const mainSource = parseTypeScript(PATHS.main, main)
   const bridgeSource = parseTypeScript(PATHS.bridge, bridge)
-  /** 顶层真实 registerBridge 调用。 */
-  const registrationCalls = mainSource.statements.filter((statement): statement is ts.ExpressionStatement => {
-    if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return false
-    if (!ts.isIdentifier(statement.expression.expression) || statement.expression.expression.text !== 'registerBridge') return false
-    /** registerBridge 的首个参数必须是显式 EventBus 注入 factory。 */
-    const registration = statement.expression.arguments[0]
-    return Boolean(
-      registration
-      && ts.isCallExpression(registration)
-      && ts.isIdentifier(registration.expression)
-      && registration.expression.text === 'createLanBridgeRegistration'
-      && ts.isIdentifier(registration.arguments[0])
-      && registration.arguments[0].text === 'agentEventBus',
-    )
-  })
-  /** 统一 Bridge 启动调用数量。 */
-  let startAllBridgesCalls = 0
-  /** 统计真实调用表达式。 */
-  const countCalls = (node: ts.Node): void => {
-    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
-      if (node.expression.text === 'startAllBridges') startAllBridgesCalls += 1
-    }
-    ts.forEachChild(node, countCalls)
-  }
-  countCalls(mainSource)
+  /** LAN registration factory 的本地名称及全部注册次数。 */
+  const factoryNames = collectImportedLocalNames(mainSource, './lib/lan-bridge/lan-bridge', 'createLanBridgeRegistration')
+  const registrationCount = countLanBridgeRegistrations(mainSource, factoryNames)
+  /** 顶层挂接且顺序可达的 bootstrap。 */
+  const bootstrap = findNamedFunction(mainSource, 'bootstrap')
+  const hasReachableStart = hasReachableBootstrapRegistration(mainSource) && bootstrapStartsAllBridges(bootstrap)
   /** 导出的显式注入 factory。 */
   const registrationFactory = findExportedFunction(bridgeSource, 'createLanBridgeRegistration')
   /** factory 首个参数是必须由 start 消费的注入 EventBus。 */
@@ -498,8 +571,8 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     && returnedObjectStartUsesInjectedBus(registrationFactory, injectedName),
   )
 
-  if (registrationCalls.length !== 1) details.push('主进程必须且只能顶层注册一次 createLanBridgeRegistration(agentEventBus)')
-  if (startAllBridgesCalls < 1) details.push('主进程未通过 startAllBridges 启动统一 Bridge 生命周期')
+  if (registrationCount !== 1) details.push('主进程必须且只能注册一次 createLanBridgeRegistration(...)')
+  if (!hasReachableStart) details.push('主进程 bootstrap 可达顶层路径未启动统一 Bridge 生命周期')
   if (!registrationFactory) details.push('LAN Bridge 未导出 createLanBridgeRegistration')
   if (!startUsesInjectedBus) details.push('LAN registration 返回对象的 start 未直接把注入 EventBus 交给 startLanBridge')
 
@@ -663,11 +736,15 @@ function checkAdapterBoundary(reader: RepositoryReader): ForkCompatCheckResult {
   /** 不依赖官方服务的纯 Adapter 核心源码。 */
   const adapterCore = readRequired(reader, PATHS.adapterCore, details)
   /** 判断说明符是否指向被 Adapter 隔离的官方运行时模块。 */
-  const getOfficialModule = (specifier: string): string | undefined => OFFICIAL_RUNTIME_MODULES.find((moduleName) => (
-    specifier === `../${moduleName}`
-    || specifier === `./${moduleName}`
-    || specifier.endsWith(`/${moduleName}`)
-  ))
+  const getOfficialModule = (specifier: string): string | undefined => {
+    /** 去除运行时模块常见 JS/TS 扩展名后的规范说明符。 */
+    const normalizedSpecifier = specifier.replace(/\.(?:[cm]?[jt]sx?)$/, '')
+    return OFFICIAL_RUNTIME_MODULES.find((moduleName) => (
+      normalizedSpecifier === `../${moduleName}`
+      || normalizedSpecifier === `./${moduleName}`
+      || normalizedSpecifier.endsWith(`/${moduleName}`)
+    ))
+  }
   /** 解析相对依赖对应的仓库 TS/TSX 文件。 */
   const resolveLocalDependency = (ownerPath: string, specifier: string): string | undefined => {
     if (!specifier.startsWith('.')) return undefined
@@ -680,7 +757,7 @@ function checkAdapterBoundary(reader: RepositoryReader): ForkCompatCheckResult {
   /** Adapter 组合根直接绑定的官方运行时模块。 */
   const adapterRuntimeModules = new Set(
     collectRuntimeDependencies(PATHS.adapterRoot, adapterRoot)
-      .map((dependency) => getOfficialModule(dependency.specifier))
+      .map((dependency) => dependency.specifier ? getOfficialModule(dependency.specifier) : undefined)
       .filter((moduleName): moduleName is string => moduleName !== undefined),
   )
   for (const moduleName of OFFICIAL_RUNTIME_MODULES) {
@@ -702,6 +779,10 @@ function checkAdapterBoundary(reader: RepositoryReader): ForkCompatCheckResult {
     const content = readRequired(reader, path, details)
 
     for (const dependency of collectRuntimeDependencies(path, content)) {
+      if (dependency.specifier === undefined) {
+        details.push(`LAN 生产模块使用非字面量 ${dependency.syntax}：${path}；请改用可静态检查的静态字符串`)
+        continue
+      }
       /** 当前依赖命中的官方模块。 */
       const officialModule = getOfficialModule(dependency.specifier)
       if (officialModule) {
@@ -717,7 +798,9 @@ function checkAdapterBoundary(reader: RepositoryReader): ForkCompatCheckResult {
   }
 
   /** 纯 Adapter core 必须保持无官方运行时依赖。 */
-  if (collectRuntimeDependencies(PATHS.adapterCore, adapterCore).some((dependency) => getOfficialModule(dependency.specifier))) {
+  if (collectRuntimeDependencies(PATHS.adapterCore, adapterCore).some((dependency) => (
+    dependency.specifier !== undefined && getOfficialModule(dependency.specifier) !== undefined
+  ))) {
     details.push('纯 Adapter core 直接依赖了官方运行时服务')
   }
 
@@ -782,16 +865,27 @@ function checkMobileResource(reader: RepositoryReader): ForkCompatCheckResult {
   const details: string[] = []
   /** electron-builder 配置源码。 */
   const builder = readRequired(reader, PATHS.electronBuilder, details)
-  /** 顶层 extraResources 结构化列表。 */
-  const resources = parseTopLevelExtraResources(builder)
-  /** from/to 精确匹配的移动端资源项。 */
-  const mobileResource = resources?.find((entry) => (
-    entry.from === '../../apps/mobile/dist' && entry.to === 'mobile-dist'
-  ))
-
-  if (!resources) details.push('electron-builder 顶层缺少可解析的 extraResources list')
-  else if (!mobileResource) details.push('顶层 extraResources 缺少 mobile dist 到 mobile-dist 的精确映射')
-  else if (!mobileResource.filter.includes('**/*')) details.push('mobile-dist 资源项缺少 **/* filter')
+  /** 结构化 builder YAML 根映射。 */
+  const document = parseYamlRecord(builder, 'electron-builder', details)
+  /** 顶层 extraResources 原始节点。 */
+  const resources = document?.extraResources
+  if (!Array.isArray(resources)) {
+    details.push('electron-builder 顶层 extraResources 必须是数组')
+  } else {
+    /** from/to 精确匹配且自身为 map 的移动端资源项。 */
+    const mobileResource = resources.find((entry) => (
+      isRecord(entry)
+      && entry.from === '../../apps/mobile/dist'
+      && entry.to === 'mobile-dist'
+    ))
+    if (!isRecord(mobileResource)) {
+      details.push('顶层 extraResources 缺少 mobile dist 到 mobile-dist 的精确 map')
+    } else if (!Array.isArray(mobileResource.filter) || !mobileResource.filter.every((item) => typeof item === 'string')) {
+      details.push('mobile-dist 资源项 filter 必须是字符串数组')
+    } else if (!mobileResource.filter.includes('**/*')) {
+      details.push('mobile-dist 资源项缺少 **/* filter')
+    }
+  }
 
   return createResult(
     'mobile-resource',
@@ -808,29 +902,129 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
   const details: string[] = []
   /** workflow YAML 文本。 */
   const workflow = readRequired(reader, PATHS.workflow, details)
-  /** merge 和 checker 步骤的位置。 */
-  const mergeIndex = workflow.indexOf('Merge upstream tag without committing')
-  const checkerIndex = workflow.indexOf('Check fork compatibility seams')
-  /** cleanup 步骤及其剩余文本。 */
-  const cleanupIndex = workflow.indexOf('Abort merge and remove temporary branch')
-  const cleanup = cleanupIndex >= 0 ? workflow.slice(cleanupIndex) : ''
+  /** 结构化 workflow YAML 根映射。 */
+  const document = parseYamlRecord(workflow, 'upstream workflow', details)
+  if (document) {
+    /** workflow 触发器映射。 */
+    const triggers = isRecord(document.on) ? document.on : undefined
+    if (!triggers || !Object.hasOwn(triggers, 'workflow_dispatch')) details.push('workflow 缺少 workflow_dispatch 手动触发')
+    /** 每周 schedule 的 cron 条目。 */
+    const schedules = triggers?.schedule
+    const hasWeeklySchedule = Array.isArray(schedules) && schedules.some((schedule) => (
+      isRecord(schedule)
+      && typeof schedule.cron === 'string'
+      && /^\S+\s+\S+\s+\*\s+\*\s+(?:1|MON)$/i.test(schedule.cron.trim())
+    ))
+    if (!hasWeeklySchedule) details.push('workflow 缺少每周 schedule 触发')
 
-  if (!/bun-version:\s*latest\b/.test(workflow)) details.push('Bun 版本未复用现有 workflow 的 latest 模式')
-  if (/\|\|\s*true\b/.test(workflow)) details.push('workflow 使用 || true 吞掉命令或 pipeline 错误')
-  if (!/git\s+tag\s+--list\b/.test(workflow)) details.push('tag 选择未使用 fetch 后的本地 tag 列表')
-  if (!/sort\s+-V\b/.test(workflow)) details.push('tag 选择缺少 semver sort -V')
-  if (!/\^v\(0\|\[1-9\]\[0-9\]\*\)/.test(workflow)) details.push('tag 选择缺少严格正式 vMAJOR.MINOR.PATCH 校验')
-  if (mergeIndex < 0 || checkerIndex < 0 || mergeIndex >= checkerIndex) details.push('merge 步骤必须位于 checker 和全部验证步骤之前')
-  if (!/if:\s*always\(\)/.test(cleanup)) details.push('cleanup 步骤缺少 always()')
-  if (!/cleanup_failed=0/.test(cleanup) || !/git\s+merge\s+--abort/.test(cleanup) || !/git\s+switch\s+--detach/.test(cleanup) || !/git\s+branch\s+--delete\s+--force/.test(cleanup) || !/exit\s+"\$cleanup_failed"/.test(cleanup)) {
-    details.push('cleanup 未聚合 abort、switch、delete 的失败并返回非零退出码')
+    /** 最小只读权限与并发去重配置。 */
+    const permissions = isRecord(document.permissions) ? document.permissions : undefined
+    if (permissions?.contents !== 'read') details.push('workflow permissions.contents 必须为 read')
+    const concurrency = isRecord(document.concurrency) ? document.concurrency : undefined
+    if (
+      typeof concurrency?.group !== 'string'
+      || !concurrency.group.includes('github.ref')
+      || concurrency['cancel-in-progress'] !== true
+    ) details.push('workflow concurrency 必须按 github.ref 分组并取消旧任务')
+
+    /** 唯一上游验证 job。 */
+    const jobs = isRecord(document.jobs) ? document.jobs : undefined
+    const job = jobs && isRecord(jobs['verify-upstream-merge']) ? jobs['verify-upstream-merge'] : undefined
+    if (!job) details.push('workflow 缺少 verify-upstream-merge job')
+    if (typeof job?.['timeout-minutes'] !== 'number' || job['timeout-minutes'] <= 0) {
+      details.push('上游验证 job 缺少正数 timeout-minutes')
+    }
+    /** 结构化 step 列表。 */
+    const steps = Array.isArray(job?.steps) ? job.steps.filter(isRecord) : []
+    const findStep = (name: string): Record<string, unknown> | undefined => steps.find((step) => step.name === name)
+    const stepIndex = (name: string): number => steps.findIndex((step) => step.name === name)
+
+    /** checkout 与 Bun 安装 action 配置。 */
+    const checkout = findStep('Checkout fork with full history')
+    const checkoutWith = checkout && isRecord(checkout.with) ? checkout.with : undefined
+    if (checkout?.uses !== 'actions/checkout@v4' || checkoutWith?.['fetch-depth'] !== 0 || checkoutWith?.['fetch-tags'] !== true) {
+      details.push('checkout 必须使用 v4、fetch-depth 0 并拉取 tags')
+    }
+    const setupBun = findStep('Install Bun')
+    const setupBunWith = setupBun && isRecord(setupBun.with) ? setupBun.with : undefined
+    if (setupBun?.uses !== 'oven-sh/setup-bun@v2' || setupBunWith?.['bun-version'] !== 'latest') {
+      details.push('Bun 安装步骤必须使用 setup-bun@v2 latest')
+    }
+
+    /** 上游 tag 选择与合并必须包含真实行首命令。 */
+    const selectTag = findStep('Select latest official release tag')
+    /** tag ref 可直接输出，也可先由正式 tag 构造受控变量后输出。 */
+    const hasTagRefOutput = /tag_ref=refs\/tags\/upstream/.test(getStepRun(selectTag) ?? '') || (
+      stepHasDirectCommand(selectTag, /^(?:readonly\s+)?UPSTREAM_TAG_REF=["']refs\/tags\/upstream\/\$[A-Za-z_][A-Za-z0-9_]*["']$/)
+      && stepHasDirectCommand(selectTag, /^echo\s+["']tag_ref=\$UPSTREAM_TAG_REF["']\s*>>\s*["']\$GITHUB_OUTPUT["']$/)
+    )
+    if (
+      selectTag?.id !== 'upstream'
+      || !stepHasDirectCommand(selectTag, /^git\s+fetch\s+--force\s+upstream(?:\s|$)/)
+      || !stepHasDirectCommand(selectTag, /^git\s+tag\s+--list(?:\s|$)/)
+      || !stepHasDirectCommand(selectTag, /^sort\s+-V(?:\s|$)/)
+      || !/\^v\(0\|\[1-9\]\[0-9\]\*\)/.test(getStepRun(selectTag) ?? '')
+      || !hasTagRefOutput
+    ) details.push('上游 tag 步骤必须真实 fetch、本地筛选正式 tag、sort -V 并输出 tag_ref')
+    const merge = findStep('Merge upstream tag without committing')
+    if (
+      !stepHasDirectCommand(merge, /^git\s+switch\s+--create(?:\s|$)/)
+      || !stepHasDirectCommand(merge, /^git\s+merge\s+--no-commit\s+--no-ff(?:\s|$)/)
+    ) details.push('merge 步骤必须真实创建临时分支并合并上游 tag')
+
+    /** 简单验证步骤必须是唯一真实命令。 */
+    const requiredCommands: Array<[string, readonly string[]]> = [
+      ['Install dependencies from merged tree', ['bun', 'install', '--frozen-lockfile']],
+      ['Check fork compatibility seams', ['bun', 'run', '--filter=@proma/electron', 'check:fork-compat']],
+      ['Run LAN and mobile targeted tests', ['bun', 'test', 'apps/electron/src/main/lib/lan-bridge', 'apps/electron/src/preload/lan-bridge-preload.test.ts', 'apps/mobile/src/lib']],
+      ['Build mobile app', ['bun', 'run', '--filter=@proma/mobile', 'build']],
+      ['Typecheck all workspaces', ['bun', 'run', 'typecheck']],
+      ['Build Electron app', ['bun', 'run', 'electron:build']],
+    ]
+    for (const [name, expectedArgv] of requiredCommands) {
+      if (!stepRunsExactCommand(findStep(name), expectedArgv)) details.push(`${name} 必须执行约定的真实命令`)
+    }
+
+    /** 关键步骤必须保持从合并到验证再清理的顺序。 */
+    const orderedStepNames = [
+      'Checkout fork with full history',
+      'Install Bun',
+      'Select latest official release tag',
+      'Merge upstream tag without committing',
+      'Install dependencies from merged tree',
+      'Check fork compatibility seams',
+      'Run LAN and mobile targeted tests',
+      'Build mobile app',
+      'Typecheck all workspaces',
+      'Build Electron app',
+      'Abort merge and remove temporary branch',
+    ]
+    const orderedIndexes = orderedStepNames.map(stepIndex)
+    if (orderedIndexes.some((index) => index < 0) || orderedIndexes.some((index, position) => position > 0 && index <= orderedIndexes[position - 1]!)) {
+      details.push('workflow 关键步骤缺失或顺序错误')
+    }
+
+    /** cleanup 必须始终运行并逐项聚合清理失败。 */
+    const cleanup = findStep('Abort merge and remove temporary branch')
+    if (
+      cleanup?.if !== 'always()'
+      || !stepHasDirectCommand(cleanup, /^run_cleanup\s+['"]abort merge['"]\s+git\s+merge\s+--abort$/)
+      || !stepHasDirectCommand(cleanup, /^run_cleanup\s+['"]switch to base['"]\s+git\s+switch\s+--detach(?:\s|$)/)
+      || !stepHasDirectCommand(cleanup, /^run_cleanup\s+['"]delete temporary branch['"]\s+git\s+branch\s+--delete\s+--force(?:\s|$)/)
+      || !stepHasDirectCommand(cleanup, /^exit\s+"\$cleanup_failed"$/)
+    ) details.push('cleanup 必须 always() 执行 abort、switch、delete 并返回聚合失败')
+
+    /** 任何关键 run 都不能使用 || true 静默吞错。 */
+    if (steps.some((step) => /\|\|\s*true\b/.test(getStepRun(step) ?? ''))) {
+      details.push('workflow 使用 || true 吞掉命令或 pipeline 错误')
+    }
   }
 
   return createResult(
     'workflow-definition',
     '上游兼容 workflow 失败传播',
     [PATHS.workflow],
-    '使用 latest Bun、本地正式 tags 和 sort -V；merge 必须先于 checks，cleanup 必须逐项记录并聚合失败退出。',
+    '保留 manual+weekly 触发、最小权限、完整 checkout、固定验证命令顺序与 always cleanup；关键 run 不得用 echo 伪装。',
     details,
   )
 }
@@ -874,6 +1068,33 @@ export function createMemoryRepositoryReader(files: Readonly<Record<string, stri
 
 /** 创建只读本地文件系统 reader，不会写入或修改仓库。 */
 export function createFileSystemRepositoryReader(repositoryRoot: string): RepositoryReader {
+  /** 仓库根真实路径，用于抵御根内 symlink 越界。 */
+  const realRepositoryRoot = realpathSync(resolve(repositoryRoot))
+  /** 判断绝对路径是否仍位于仓库真实根内。 */
+  const isInsideRepository = (absolutePath: string): boolean => {
+    /** 从仓库根到目标的相对路径。 */
+    const relativePath = relative(realRepositoryRoot, absolutePath)
+    return relativePath === '' || (
+      relativePath !== '..'
+      && !relativePath.startsWith(`..${sep}`)
+      && !isAbsolute(relativePath)
+    )
+  }
+  /** 把仓库相对路径解析为受约束的真实路径。 */
+  const resolveRepositoryPath = (path: string): string | undefined => {
+    if (isAbsolute(path)) return undefined
+    /** 未解析 symlink 前的词法绝对路径。 */
+    const lexicalPath = resolve(realRepositoryRoot, path)
+    if (!isInsideRepository(lexicalPath)) return undefined
+    if (!existsSync(lexicalPath)) return lexicalPath
+    try {
+      /** 已存在目标的真实路径。 */
+      const realPath = realpathSync(lexicalPath)
+      return isInsideRepository(realPath) ? realPath : undefined
+    } catch {
+      return undefined
+    }
+  }
   /** 递归列出指定目录下的文件。 */
   const listFiles = (absoluteDirectory: string): string[] => {
     if (!existsSync(absoluteDirectory)) return []
@@ -890,12 +1111,22 @@ export function createFileSystemRepositoryReader(repositoryRoot: string): Reposi
 
   return {
     read: (path) => {
-      /** 当前仓库相对路径对应的绝对路径。 */
-      const absolutePath = resolve(repositoryRoot, path)
-      return existsSync(absolutePath) ? readFileSync(absolutePath, 'utf8') : undefined
+      /** 经过词法与 realpath 双重约束的仓库内路径。 */
+      const absolutePath = resolveRepositoryPath(path)
+      if (!absolutePath || !existsSync(absolutePath)) return undefined
+      try {
+        return readFileSync(absolutePath, 'utf8')
+      } catch {
+        return undefined
+      }
     },
-    list: (directory) => listFiles(resolve(repositoryRoot, directory))
-      .map((path) => relative(repositoryRoot, path).replaceAll('\\', '/')),
+    list: (directory) => {
+      /** 经过词法与 realpath 双重约束的仓库内目录。 */
+      const absoluteDirectory = resolveRepositoryPath(directory)
+      if (!absoluteDirectory) return []
+      return listFiles(absoluteDirectory)
+        .map((path) => relative(realRepositoryRoot, path).replaceAll('\\', '/'))
+    },
   }
 }
 
