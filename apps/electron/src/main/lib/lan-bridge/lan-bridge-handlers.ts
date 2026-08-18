@@ -4,20 +4,11 @@
  * 调用已有服务实现各个 WS 命令。
  */
 
-import { BrowserWindow } from 'electron'
-import { AGENT_IPC_CHANNELS } from '@proma/shared'
-import type { AgentSendInput } from '@proma/shared'
 import { registerRoute, sendError } from './lan-bridge-router'
 import { verifyPairingPin, generateToken, verifyToken, refreshToken } from './lan-bridge-auth'
 import type { ClientConnection } from './lan-bridge-types'
-import { listConversations, searchConversationMessages, getConversationMessages } from '../conversation-manager'
-import { listAgentSessions, searchAgentSessionMessages, getAgentSessionMessages, createAgentSession } from '../agent-session-manager'
-import { listAgentWorkspaces } from '../agent-workspace-manager'
-import { isAgentSessionActive, runAgentHeadless, stopAgent } from '../agent-service'
-import { getSettings } from '../settings-service'
-import { listChannels } from '../channel-manager'
-import { sendMessage as chatSendMessage, stopGeneration as chatStopGeneration, type ChatStreamEvent } from '../chat-service'
 import { getSessionManager } from './lan-bridge'
+import { lanBridgePromaAdapter } from './lan-bridge-proma-adapter'
 
 // ===== 注册所有路由 =====
 
@@ -85,7 +76,7 @@ function handlePing(_client: ClientConnection, _data: Record<string, unknown>) {
 
 function handleListConversations(client: ClientConnection, data: Record<string, unknown>) {
   requireAuth(client, data)
-  return { conversations: listConversations() }
+  return { conversations: lanBridgePromaAdapter.listConversations() }
 }
 
 function handleConversationMessages(client: ClientConnection, data: Record<string, unknown>) {
@@ -94,7 +85,7 @@ function handleConversationMessages(client: ClientConnection, data: Record<strin
   if (!conversationId) {
     throw Object.assign(new Error('conversationId required'), { errorCode: 'VALIDATION_ERROR' })
   }
-  const allMessages = getConversationMessages(conversationId)
+  const allMessages = lanBridgePromaAdapter.getConversationMessages(conversationId)
   const limit = typeof data.limit === 'number' ? data.limit : 100
   const messages = limit > 0 ? allMessages.slice(-limit) : allMessages
   return { messages, total: allMessages.length }
@@ -110,21 +101,17 @@ async function handleSearch(client: ClientConnection, data: Record<string, unkno
   const now = Date.now()
   const results: Array<{ id: string; title: string; snippet: string; type: 'chat' | 'agent'; matchedAt: number }> = []
   if (!sessionType || sessionType === 'chat') {
-    for (const r of await searchConversationMessages(query)) {
-      results.push({ id: r.conversationId, title: r.conversationTitle ?? '', snippet: r.snippet, type: 'chat', matchedAt: now })
-    }
+    results.push(...await lanBridgePromaAdapter.searchConversations(query, now))
   }
   if (!sessionType || sessionType === 'agent') {
-    for (const r of await searchAgentSessionMessages(query)) {
-      results.push({ id: r.sessionId, title: r.sessionTitle ?? '', snippet: r.snippet, type: 'agent', matchedAt: now })
-    }
+    results.push(...await lanBridgePromaAdapter.searchAgentSessions(query, now))
   }
   return { results }
 }
 
 function handleAgentSessions(client: ClientConnection, data: Record<string, unknown>) {
   requireAuth(client, data)
-  const sessions = listAgentSessions()
+  const sessions = lanBridgePromaAdapter.listAgentSessions()
   return { sessions }
 }
 
@@ -134,25 +121,25 @@ function handleAgentSessionMessages(client: ClientConnection, data: Record<strin
   if (!sessionId) {
     throw Object.assign(new Error('sessionId required'), { errorCode: 'VALIDATION_ERROR' })
   }
-  const allMessages = getAgentSessionMessages(sessionId)
+  const allMessages = lanBridgePromaAdapter.getAgentMessages(sessionId)
   const limit = typeof data.limit === 'number' ? data.limit : 100
   const messages = limit > 0 ? allMessages.slice(-limit) : allMessages
   return { messages, total: allMessages.length }
 }
 
-function handleAgentSearch(client: ClientConnection, data: Record<string, unknown>) {
+async function handleAgentSearch(client: ClientConnection, data: Record<string, unknown>) {
   requireAuth(client, data)
   const query = data.query as string
   if (!query) {
     throw Object.assign(new Error('Query required'), { errorCode: 'VALIDATION_ERROR' })
   }
-  const results = searchAgentSessionMessages(query)
+  const results = await lanBridgePromaAdapter.searchAgentSessions(query)
   return { results }
 }
 
 function handleWorkspaces(client: ClientConnection, data: Record<string, unknown>) {
   requireAuth(client, data)
-  return { workspaces: listAgentWorkspaces() }
+  return { workspaces: lanBridgePromaAdapter.listWorkspaces() }
 }
 
 // ===== 订阅 =====
@@ -181,17 +168,10 @@ function handleUnsubscribe(client: ClientConnection, data: Record<string, unknow
 function handleAgentSessionCreate(client: ClientConnection, data: Record<string, unknown>) {
   requireAuth(client, data)
   const title = data.title as string | undefined
-  const workspaceId = (data.workspaceId as string | undefined) || getSettings().agentWorkspaceId
-  const session = createAgentSession(title, undefined, workspaceId)
-
-  // 通知桌面端刷新会话列表（复用 TITLE_UPDATED 通道，与飞书 Bridge 保持一致）
-  const win = BrowserWindow.getAllWindows()[0]
-  if (win && !win.isDestroyed()) {
-    win.webContents.send(AGENT_IPC_CHANNELS.TITLE_UPDATED, {
-      sessionId: session.id,
-      title: session.title,
-    })
-  }
+  /** 新会话默认工作区保持与桌面设置一致。 */
+  const workspaceId = (data.workspaceId as string | undefined) || lanBridgePromaAdapter.getSettings().agentWorkspaceId
+  /** Adapter 同时负责稳定字段映射和桌面标题通知。 */
+  const session = lanBridgePromaAdapter.createAgentSession(title, workspaceId)
 
   return { session }
 }
@@ -205,28 +185,20 @@ function handleAgentSend(client: ClientConnection, data: Record<string, unknown>
     throw Object.assign(new Error('sessionId and userMessage required'), { errorCode: 'VALIDATION_ERROR' })
   }
 
-  if (isAgentSessionActive(sessionId)) {
+  if (lanBridgePromaAdapter.isAgentSessionActive(sessionId)) {
     throw Object.assign(new Error('Agent session is already running'), { errorCode: 'SESSION_ACTIVE' })
   }
 
-  const settings = getSettings()
-
-  const permissionMode = data.permissionMode as string | undefined
-  let permissionModeOverride: AgentSendInput['permissionModeOverride'] = 'bypassPermissions'
-  if (permissionMode === 'auto') {
-    permissionModeOverride = undefined
-  } else if (permissionMode === 'bypassPermissions' || permissionMode === 'plan') {
-    permissionModeOverride = permissionMode
-  }
-
-  const input: AgentSendInput = {
-    sessionId,
-    userMessage,
-    channelId: settings.agentChannelId || '',
-    modelId: data.modelId as string | undefined || settings.agentModelId,
-    workspaceId: (data.workspaceId as string | undefined) || settings.agentWorkspaceId,
-    permissionModeOverride,
-  }
+  /** 设置快照只用于日志；官方设置对象不会越过 Adapter。 */
+  const settings = lanBridgePromaAdapter.getSettings()
+  /** 仅接受协议支持的权限值，未知值保持旧行为并回退 bypassPermissions。 */
+  const requestedPermissionMode = data.permissionMode
+  /** 识别后的 LAN 权限模式由 Adapter 转换为官方运行时字段。 */
+  const permissionMode = requestedPermissionMode === 'auto'
+    || requestedPermissionMode === 'bypassPermissions'
+    || requestedPermissionMode === 'plan'
+    ? requestedPermissionMode
+    : undefined
   console.log(`[LAN Bridge] agent.send 开始: sessionId=${sessionId.slice(0, 12)} channelId=${settings.agentChannelId || '(空)'}`)
   const pushToSubs = (msg: object) => {
     const mgr = getSessionManager()
@@ -235,17 +207,23 @@ function handleAgentSend(client: ClientConnection, data: Record<string, unknown>
       mgr.send(c, msg)
     }
   }
-  runAgentHeadless(input, {
-    onError: (err) => {
-      console.error(`[LAN Bridge] agent.send error:`, err)
-      pushToSubs({ type: 'stream.error', data: { sessionId, error: err } })
+  lanBridgePromaAdapter.sendAgent({
+    sessionId,
+    userMessage,
+    modelId: data.modelId as string | undefined,
+    workspaceId: data.workspaceId as string | undefined,
+    permissionMode,
+  }, {
+    onError: ({ error }) => {
+      console.error(`[LAN Bridge] agent.send error:`, error)
+      pushToSubs({ type: 'stream.error', data: { sessionId, error } })
       pushToSubs({ type: 'stream.complete', data: { sessionId } })
     },
     onComplete: () => {
       console.log(`[LAN Bridge] agent.send complete`)
       pushToSubs({ type: 'stream.complete', data: { sessionId } })
     },
-    onTitleUpdated: (title) => {
+    onTitleUpdated: ({ title }) => {
       console.log(`[LAN Bridge] agent.send title:`, title)
       pushToSubs({ type: 'session.updated', data: { sessionId, title } })
     },
@@ -265,7 +243,7 @@ function handleAgentStop(client: ClientConnection, data: Record<string, unknown>
   if (!sessionId) {
     throw Object.assign(new Error('sessionId required'), { errorCode: 'VALIDATION_ERROR' })
   }
-  stopAgent(sessionId)
+  lanBridgePromaAdapter.stopAgent(sessionId)
   return { stopped: true, sessionId }
 }
 
@@ -279,61 +257,38 @@ function handleConversationSend(client: ClientConnection, data: Record<string, u
     throw Object.assign(new Error('conversationId and userMessage required'), { errorCode: 'VALIDATION_ERROR' })
   }
 
-  const settings = getSettings()
+  /** 默认渠道和模型通过稳定设置 DTO 解析。 */
+  const settings = lanBridgePromaAdapter.getSettings()
   const channelId = data.channelId as string | undefined || settings.agentChannelId
   const modelId = data.modelId as string | undefined || settings.agentModelId
   if (!channelId || !modelId) {
     throw Object.assign(new Error('channelId and modelId required'), { errorCode: 'VALIDATION_ERROR' })
   }
 
-  const pushToSubs = (event: ChatStreamEvent) => {
+  /** 将 Adapter 的 LAN 自有回调转换为既有 WebSocket 推送。 */
+  const pushToSubs = (type: string, payload: Record<string, unknown>) => {
     const mgr = getSessionManager()
     if (!mgr) return
-    let wsType = ''
-    let wsData: Record<string, unknown> = { conversationId }
-    switch (event.type) {
-      case 'chunk':
-        wsType = 'stream.chunk'
-        wsData = { conversationId, text: event.delta ?? '' }
-        break
-      case 'reasoning':
-        wsType = 'stream.reasoning'
-        wsData = { conversationId, text: event.delta ?? '' }
-        break
-      case 'complete':
-        wsType = 'stream.complete'
-        break
-      case 'error':
-        wsType = 'stream.error'
-        wsData = { conversationId, error: event.error }
-        break
-      default:
-        return
-    }
     for (const c of mgr.getSubscribers(conversationId)) {
-      mgr.send(c, { type: wsType, data: wsData })
+      mgr.send(c, { type, data: { conversationId, ...payload } })
     }
   }
 
-  const history = getConversationMessages(conversationId)
-
-  // 获取 webContents 用于 sendMessage 签名（实际走 onEvent 回调，不使用 webContents）
-  const win = BrowserWindow.getAllWindows()[0]
-
-  chatSendMessage(
-    {
-      conversationId,
-      userMessage,
-      messageHistory: history,
-      channelId,
-      modelId,
-    },
-    win?.webContents ?? null,
-    pushToSubs,
-  ).catch((err: unknown) => {
+  lanBridgePromaAdapter.sendConversation({
+    conversationId,
+    userMessage,
+    channelId,
+    modelId,
+  }, {
+    onText: ({ text }) => pushToSubs('stream.chunk', { text }),
+    onReasoning: ({ text }) => pushToSubs('stream.reasoning', { text }),
+    onError: ({ error }) => pushToSubs('stream.error', { error }),
+    onComplete: () => pushToSubs('stream.complete', {}),
+  }).catch((err: unknown) => {
+    /** Promise 级异常保持旧行为：先错误，再完成。 */
     const errMsg = err instanceof Error ? err.message : String(err)
-    pushToSubs({ type: 'error', conversationId, error: errMsg })
-    pushToSubs({ type: 'complete', conversationId, model: modelId })
+    pushToSubs('stream.error', { error: errMsg })
+    pushToSubs('stream.complete', {})
   })
 
   return { sent: true, conversationId }
@@ -345,7 +300,7 @@ function handleConversationStop(client: ClientConnection, data: Record<string, u
   if (!conversationId) {
     throw Object.assign(new Error('conversationId required'), { errorCode: 'VALIDATION_ERROR' })
   }
-  chatStopGeneration(conversationId)
+  lanBridgePromaAdapter.stopConversation(conversationId)
   return { stopped: true, conversationId }
 }
 
@@ -353,11 +308,10 @@ function handleConversationStop(client: ClientConnection, data: Record<string, u
 
 function handleSettingsGet(client: ClientConnection, data: Record<string, unknown>) {
   requireAuth(client, data)
-  const settings = getSettings()
+  const settings = lanBridgePromaAdapter.getSettings()
   let channelBaseUrl: string | null = null
   if (settings.agentChannelId) {
-    const ch = listChannels().find(c => c.id === settings.agentChannelId)
-    if (ch) channelBaseUrl = ch.baseUrl || null
+    channelBaseUrl = lanBridgePromaAdapter.getChannelBaseUrl(settings.agentChannelId)
   }
   return {
     agentWorkspaceId: settings.agentWorkspaceId || null,
@@ -369,15 +323,7 @@ function handleSettingsGet(client: ClientConnection, data: Record<string, unknow
 
 function handleSettingsChannels(client: ClientConnection, data: Record<string, unknown>) {
   requireAuth(client, data)
-  const channels = listChannels()
-    .filter(c => c.enabled)
-    .map(c => ({
-      id: c.id,
-      name: c.name,
-      provider: c.provider,
-      baseUrl: c.baseUrl,
-      models: c.models.filter(m => m.enabled),
-    }))
+  const channels = lanBridgePromaAdapter.listEnabledChannelOptions()
   return { channels }
 }
 

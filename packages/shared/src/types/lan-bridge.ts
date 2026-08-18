@@ -135,6 +135,10 @@ export interface LanBridgeAuthPairTicketResult {
 export interface LanBridgeConversationDto {
   id: string
   title: string
+  /** 是否置顶。 */
+  pinned?: boolean
+  /** 是否归档。 */
+  archived?: boolean
   createdAt: number
   updatedAt: number
 }
@@ -144,6 +148,12 @@ export interface LanBridgeAgentSessionDto {
   id: string
   title: string
   workspaceId?: string
+  /** 是否置顶。 */
+  pinned?: boolean
+  /** 是否归档。 */
+  archived?: boolean
+  /** 是否标记为手动工作中。 */
+  manualWorking?: boolean
   createdAt: number
   updatedAt: number
 }
