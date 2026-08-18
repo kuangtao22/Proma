@@ -61,14 +61,21 @@ jobs:
           echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "temp_branch=$TEMP_BRANCH" >> "$GITHUB_OUTPUT"
       - name: Merge upstream tag without committing
+        shell: bash
         env:
           BASE_SHA: \${{ steps.upstream.outputs.base_sha }}
           TEMP_BRANCH: \${{ steps.upstream.outputs.temp_branch }}
+          UPSTREAM_TAG: \${{ steps.upstream.outputs.tag }}
           UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}
         run: |
           set -euo pipefail
           git switch --create "$TEMP_BRANCH" "$BASE_SHA"
           git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"
+          echo "base=$BASE_SHA"
+          echo "head=$(git rev-parse HEAD)"
+          echo "upstream_tag=$UPSTREAM_TAG"
+          git status --short
+          git diff --cached --stat
       - name: Verify upstream merge state
         env:
           UPSTREAM_TAG_REF: \${{ steps.upstream.outputs.tag_ref }}
@@ -78,7 +85,7 @@ jobs:
       - name: Check fork compatibility seams
         run: bun run --filter='@proma/electron' check:fork-compat
       - name: Run LAN and mobile targeted tests
-        run: bun test apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib
+        run: bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib
       - name: Build mobile app
         run: bun run --filter='@proma/mobile' build
       - name: Typecheck all workspaces
@@ -1312,6 +1319,84 @@ broken: [
     })
   }
 
+  /** merge step 必须是完整有序闭集，任何换序、破坏状态或重复合并都必须拒绝。 */
+  const invalidMergeContractCases = [
+    {
+      name: 'switch 与 merge 交换顺序',
+      mutate: (workflow: string) => workflow.replace(
+        '          git switch --create "$TEMP_BRANCH" "$BASE_SHA"\n          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+        '          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"\n          git switch --create "$TEMP_BRANCH" "$BASE_SHA"',
+      ),
+    },
+    {
+      name: 'merge 后追加 abort',
+      mutate: (workflow: string) => workflow.replace(
+        '          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+        '          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"\n          git merge --abort',
+      ),
+    },
+    {
+      name: 'merge 后追加 reset',
+      mutate: (workflow: string) => workflow.replace(
+        '          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+        '          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"\n          git reset --hard HEAD',
+      ),
+    },
+    {
+      name: '重复执行 merge',
+      mutate: (workflow: string) => workflow.replace(
+        '          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+        '          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"\n          git merge --no-commit --no-ff "$UPSTREAM_TAG_REF"',
+      ),
+    },
+  ]
+
+  for (const mergeCase of invalidMergeContractCases) {
+    test(`Given ${mergeCase.name} When 检查 merge 闭集合同 Then 明确失败`, () => {
+      /** 仅破坏 merge step 的命令集合或顺序。 */
+      const workflow = mergeCase.mutate(validWorkflow)
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  /** targeted tests 必须真实执行 checker 与 helper 测试文件。 */
+  const invalidTargetedTestCases = [
+    {
+      name: '缺少 helper test',
+      target: ' apps/electron/scripts/verify-upstream-merge.test.ts',
+      replacement: '',
+    },
+    {
+      name: 'echo helper test',
+      target: 'apps/electron/scripts/verify-upstream-merge.test.ts',
+      replacement: 'apps/electron/src/main/lib/lan-bridge && echo apps/electron/scripts/verify-upstream-merge.test.ts',
+    },
+    {
+      name: 'helper test 路径错误',
+      target: 'apps/electron/scripts/verify-upstream-merge.test.ts',
+      replacement: 'apps/electron/scripts/verify-upstream-merge.spec.ts',
+    },
+    {
+      name: '缺少 checker test',
+      target: 'apps/electron/scripts/check-fork-compat.test.ts ',
+      replacement: '',
+    },
+  ]
+
+  for (const targetedCase of invalidTargetedTestCases) {
+    test(`Given targeted tests ${targetedCase.name} When 检查 workflow Then 明确失败`, () => {
+      /** 破坏自测文件参数或用 echo 文本伪装。 */
+      const workflow = validWorkflow.replace(targetedCase.target, targetedCase.replacement)
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
   /** 反斜杠续行必须先折叠，否则短路操作符可把下一物理行的关键命令变成不可达。 */
   const continuedShortCircuitCases = [
     { name: 'false && LF', prefix: 'false && \\', newline: '\n' },
@@ -1558,8 +1643,8 @@ broken: [
     },
     {
       name: 'targeted tests',
-      target: 'run: bun test apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib',
-      replacement: 'run: echo "bun test apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib"',
+      target: 'run: bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib',
+      replacement: 'run: echo "bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib"',
     },
     {
       name: 'mobile build',

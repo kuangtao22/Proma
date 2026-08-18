@@ -1112,15 +1112,26 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     const merge = findStep('Merge upstream tag without committing')
     /** merge 的 tag ref 只能来自已验证 select step 的精确 output。 */
     const mergeEnv = merge && isRecord(merge.env) ? merge.env : undefined
+    /** merge 后保留待验证状态，只允许现行诊断输出，不允许插入破坏命令。 */
+    const mergeContract = [
+      /^set -euo pipefail$/,
+      /^git switch --create ["']\$TEMP_BRANCH["'] ["']\$BASE_SHA["']$/,
+      /^git merge --no-commit --no-ff ["']\$UPSTREAM_TAG_REF["']$/,
+      /^echo ["']base=\$BASE_SHA["']$/,
+      /^echo ["']head=\$\(git rev-parse HEAD\)["']$/,
+      /^echo ["']upstream_tag=\$UPSTREAM_TAG["']$/,
+      /^git status --short$/,
+      /^git diff --cached --stat$/,
+    ] as const
     if (
-      hasShellControlStructure(merge)
+      merge?.shell !== 'bash'
+      || hasShellControlStructure(merge)
       || mergeEnv?.BASE_SHA !== '${{ steps.upstream.outputs.base_sha }}'
       || mergeEnv?.TEMP_BRANCH !== '${{ steps.upstream.outputs.temp_branch }}'
+      || mergeEnv?.UPSTREAM_TAG !== '${{ steps.upstream.outputs.tag }}'
       || mergeEnv?.UPSTREAM_TAG_REF !== '${{ steps.upstream.outputs.tag_ref }}'
-      || !stepHasDirectCommand(merge, /^git\s+switch\s+--create\s+["']\$TEMP_BRANCH["']\s+["']\$BASE_SHA["']$/)
-      || !stepHasDirectCommand(merge, /^git\s+merge\s+--no-commit\s+--no-ff\s+["']\$UPSTREAM_TAG_REF["']$/)
-      || stepHasDirectCommand(merge, /^git\s+merge-base\s+--is-ancestor\b/)
-    ) details.push('merge 步骤必须线性使用 select step 输出的 namespaced tag ref，状态验证交由只读 helper 处理')
+      || !stepMatchesLinearContract(merge, mergeContract)
+    ) details.push('merge 步骤必须按 switch、merge、诊断输出的有序闭集合同执行，并保留 merge 状态供 helper 验证')
 
     /** helper 必须紧随 merge，并使用同一个受信 tag_ref output。 */
     const verifyMerge = findStep('Verify upstream merge state')
@@ -1134,7 +1145,15 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     const requiredCommands: Array<[string, readonly string[]]> = [
       ['Install dependencies from merged tree', ['bun', 'install', '--frozen-lockfile']],
       ['Check fork compatibility seams', ['bun', 'run', '--filter=@proma/electron', 'check:fork-compat']],
-      ['Run LAN and mobile targeted tests', ['bun', 'test', 'apps/electron/src/main/lib/lan-bridge', 'apps/electron/src/preload/lan-bridge-preload.test.ts', 'apps/mobile/src/lib']],
+      ['Run LAN and mobile targeted tests', [
+        'bun',
+        'test',
+        'apps/electron/scripts/check-fork-compat.test.ts',
+        'apps/electron/scripts/verify-upstream-merge.test.ts',
+        'apps/electron/src/main/lib/lan-bridge',
+        'apps/electron/src/preload/lan-bridge-preload.test.ts',
+        'apps/mobile/src/lib',
+      ]],
       ['Build mobile app', ['bun', 'run', '--filter=@proma/mobile', 'build']],
       ['Typecheck all workspaces', ['bun', 'run', 'typecheck']],
       ['Build Electron app', ['bun', 'run', 'electron:build']],
