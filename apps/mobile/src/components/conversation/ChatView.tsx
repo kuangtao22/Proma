@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { useAtom, useAtomValue } from 'jotai'
 import {
   activeConvAtom, messagesAtom, tokenAtom,
@@ -6,6 +6,11 @@ import {
   type Message,
 } from '../../atoms'
 import { wsReq, onPush } from '../../lib/ws-client'
+import {
+  createGenerationTracker,
+  shouldClearMessagesBeforeLoad,
+  type MessageLoadReason,
+} from '../../lib/recovery-guards'
 import { InputBar } from './InputBar'
 import { MessageList } from './MessageBubble'
 import { renderMd } from '../../utils/markdown'
@@ -28,25 +33,63 @@ export function ChatView() {
   const [streamContent, setStreamContent] = useAtom(streamContentAtom)
   const listRef = useRef<HTMLDivElement>(null)
   const streamTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /** 历史加载与订阅各自使用 generation，避免互相误伤。 */
+  const historyGenerations = useRef(createGenerationTracker())
+  const subscriptionGenerations = useRef(createGenerationTracker())
+  /** 使用原始字段作为依赖，避免同一会话对象刷新导致重复订阅。 */
+  const activeId = active?.id
+  const activeType = active?.type
 
-  const loadMessages = () => {
-    if (!active || !token) return
-    setMessages([])
-    fetchMessages(active.type, token, active.id)
-      .then(d => setMessages(d.messages ?? []))
-      .catch(() => setMessages([]))
-    const subKey = active.type === 'agent' ? 'sessionId' : 'conversationId'
-    wsReq('subscribe', { token, [subKey]: active.id }).catch(() => {})
-  }
+  /** 按触发原因加载当前历史，后台刷新不提前清空现有消息。 */
+  const loadMessages = useCallback((reason: MessageLoadReason) => {
+    const generation = historyGenerations.current.begin()
+    if (!activeId || !activeType || !token) return
+    if (shouldClearMessagesBeforeLoad(reason)) setMessages([])
+    fetchMessages(activeType, token, activeId)
+      .then(d => {
+        if (historyGenerations.current.isCurrent(generation)) setMessages(d.messages ?? [])
+      })
+      .catch(() => {
+        if (historyGenerations.current.isCurrent(generation) && shouldClearMessagesBeforeLoad(reason)) {
+          setMessages([])
+        }
+      })
+  }, [activeId, activeType, setMessages, token])
 
-  useEffect(() => { loadMessages() }, [active?.id, active?.type, token])
+  useEffect(() => {
+    if (!activeId || !activeType || !token) {
+      historyGenerations.current.invalidate()
+      subscriptionGenerations.current.invalidate()
+      return
+    }
+    loadMessages('active-change')
+    const subKey = activeType === 'agent' ? 'sessionId' : 'conversationId'
+    subscriptionGenerations.current.begin()
+    void wsReq('subscribe', { token, [subKey]: activeId }).catch(() => {})
+    return () => {
+      historyGenerations.current.invalidate()
+      subscriptionGenerations.current.invalidate()
+      void wsReq('unsubscribe', { token, [subKey]: activeId }).catch(() => {})
+    }
+  }, [activeId, activeType, loadMessages, token])
 
   // WS 重连后重新加载
   useEffect(() => {
-    const handler = () => { loadMessages() }
+    const handler = () => {
+      if (!activeId || !activeType || !token) return
+      loadMessages('reconnect')
+      const subKey = activeType === 'agent' ? 'sessionId' : 'conversationId'
+      const generation = subscriptionGenerations.current.begin()
+      void wsReq('unsubscribe', { token, [subKey]: activeId })
+        .catch(() => {})
+        .then(() => {
+          if (!subscriptionGenerations.current.isCurrent(generation)) return
+          return wsReq('subscribe', { token, [subKey]: activeId }).catch(() => {})
+        })
+    }
     window.addEventListener('proma:ws-reconnected', handler)
     return () => window.removeEventListener('proma:ws-reconnected', handler)
-  }, [active?.id, active?.type, token, setMessages])
+  }, [activeId, activeType, loadMessages, token])
 
   // 流式推送
   useEffect(() => {
@@ -66,11 +109,7 @@ export function ChatView() {
         case 'stream.complete':
           if (streamTimeoutRef.current) { clearTimeout(streamTimeoutRef.current); streamTimeoutRef.current = null }
           setStreaming(false)
-          if (token) {
-            fetchMessages(active.type, token, active.id)
-              .then(r => setMessages(r.messages ?? []))
-              .catch(() => {})
-          }
+          loadMessages('stream-complete')
           break
         case 'stream.error':
           if (streamTimeoutRef.current) { clearTimeout(streamTimeoutRef.current); streamTimeoutRef.current = null }
@@ -79,7 +118,7 @@ export function ChatView() {
       }
     })
     return unsub
-  }, [active?.id, streaming, token])
+  }, [active, loadMessages, setStreamContent, setStreaming, streaming])
 
   useEffect(() => {
     if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight

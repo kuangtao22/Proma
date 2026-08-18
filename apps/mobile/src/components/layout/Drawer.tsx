@@ -44,6 +44,8 @@ export function Drawer({ onClose }: Props) {
   }
 
   const handleDisconnect = () => {
+    /** 先通知 App 失效所有恢复 generation，再执行幂等本地清理。 */
+    window.dispatchEvent(new CustomEvent('proma:auth-invalidated'))
     removeStorage(STORAGE_KEYS.token)
     setToken(null); setConnected(false); setView('auth')
     closeWS()

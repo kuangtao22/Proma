@@ -1,7 +1,8 @@
-import { useState, useCallback, FormEvent } from 'react'
+import { useState, useCallback } from 'react'
+import type { FormEvent } from 'react'
 import { useAtom } from 'jotai'
 import { pinAtom, bridgeHostAtom, bridgePortAtom } from '../../atoms'
-import { wsReq } from '../../lib/ws-client'
+import { wsReq, WsClientError } from '../../lib/ws-client'
 
 interface Props {
   onSuccess: (token: string) => void
@@ -24,7 +25,7 @@ export function AuthPage({ onSuccess }: Props) {
       localStorage.setItem('proma_mobile_port', port)
       onSuccess(r.token)
     } catch (err: unknown) {
-      setError(err instanceof Error && err.message === 'timeout' ? '连接超时，请检查地址和 PIN 码' : 'PIN 码错误或服务不可用')
+      setError(err instanceof WsClientError && err.code === 'TIMEOUT' ? '连接超时，请检查地址和 PIN 码' : 'PIN 码错误或服务不可用')
     } finally {
       setLoading(false)
     }
