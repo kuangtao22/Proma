@@ -23,9 +23,12 @@ export * from './chat'
 
 // Agent 相关类型
 export * from './agent'
+export * from './browser'
+export * from './reasoning-profile'
 
 // Agent Provider 适配器接口
 export * from './agent-provider'
+export * from './agent-runtime'
 
 // 环境检测相关类型
 export * from './environment'
@@ -56,3 +59,8 @@ export * from './lan-bridge'
 
 // 定时任务（Automation）相关类型
 export * from './automation'
+// 本地任务与日程（Planning）相关类型
+export * from './planning'
+
+// Agent 灵动岛相关类型
+export * from './agent-island'

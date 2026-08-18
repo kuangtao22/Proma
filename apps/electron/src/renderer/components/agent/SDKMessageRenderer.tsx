@@ -12,16 +12,30 @@
  */
 
 import * as React from 'react'
-import { Bot, Loader2, AlertTriangle, FileText, FileImage, Download, Split, Undo2, RotateCw, Plus, Minimize2, Wrench, Settings, ExternalLink, Quote, Clock } from 'lucide-react'
+import { Bot, Loader2, AlertTriangle, FileText, FileImage, Download, Split, Undo2, RotateCw, Plus, Minimize2, Wrench, Settings, Cpu, ExternalLink, Quote, Clock, FolderInput, FolderPlus, ListTodo } from 'lucide-react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { cn } from '@/lib/utils'
-import { ImageLightbox } from '@/components/ui/image-lightbox'
+import { ImageLightbox, type LightboxImage } from '@/components/ui/image-lightbox'
 import { ContentBlock } from './ContentBlock'
-import { TaskProgressCard } from './TaskProgressCard'
-import { TurnFileChangesSummary } from './TurnFileChangesSummary'
+import { TurnFileChangesSummary, buildTurnFileNameMap } from './TurnFileChangesSummary'
+import { TurnSkillUsageSummary } from './TurnSkillUsageSummary'
 import { ProcessBlockGroup, buildAssistantTurnRenderItems, buildCompletedToolResultIds } from './ProcessBlockGroup'
-import { extractToolResultText, parseTaskCreateResult, TASK_TOOL_NAMES } from './task-progress'
+import { extractToolResultText, TASK_TOOL_NAMES } from './task-progress'
 import { normalizeThinkTagsInContentBlocks } from './thinking-tag-parser'
+// 会话转录的纯逻辑(Turn 分组 / 快照去重 / 预览)已下沉到 @proma/session-core 作为唯一真源。
+// 这里 import 供本文件内部使用，并 re-export 以保持既有 `from './SDKMessageRenderer'` 导入方零改动。
+import {
+  groupIntoTurns,
+  getGroupPreview,
+  extractUserText,
+  extractMeta,
+  isUserInputMessage,
+  stripScheduledRunMarker,
+  type MessageGroup,
+  type AssistantTurn,
+} from '@proma/session-core'
+export { groupIntoTurns, getGroupPreview, extractUserText } from '@proma/session-core'
+export type { MessageGroup, AssistantTurn } from '@proma/session-core'
 import { DurationBadge } from './AgentMessages'
 import {
   Message,
@@ -31,22 +45,28 @@ import {
   MessageAction,
   MessageResponse,
   UserMessageContent,
+  TurnFileMapProvider,
 } from '@/components/ai-elements/message'
 import { UserAvatar } from '@/components/chat/UserAvatar'
 import { CopyButton } from '@/components/chat/CopyButton'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { formatMessageTime } from '@/components/chat/ChatMessageItem'
-import { getModelLogo, resolveModelDisplayName } from '@/lib/model-logo'
+import { getModelLogo, resolveModelDisplayName, resolveModelProvider } from '@/lib/model-logo'
 import { userProfileAtom } from '@/atoms/user-profile'
-import { channelsAtom } from '@/atoms/chat-atoms'
-import { agentProcessGroupsKeepExpandedAtom } from '@/atoms/agent-atoms'
-import { agentSessionsAtom } from '@/atoms/agent-atoms'
+import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
+import { agentSessionPendingFilesAtom, agentSessionsAtom, agentWorkspacesAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
 import { automationsAtom, automationFormAtom, automationToDraft } from '@/atoms/automation-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
+import { planningTabAtom } from '@/atoms/planning-atoms'
 import { environmentCheckDialogOpenAtom } from '@/atoms/environment'
 import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
+import { useOpenPreview } from '@/components/diff/preview-opener'
+import { getFileParentPath } from '@/lib/file-utils'
+import { parseQuotedSelectionRefs, replaceAgentHistoryQuoteMentionsWithLabels } from '@/lib/quoted-selection'
+import type { QuotedSelection } from '@/atoms/preview-atoms'
+import type { ParsedQuotedSelectionRef } from '@/lib/quoted-selection'
 import type {
   SDKMessage,
   SDKAssistantMessage,
@@ -59,7 +79,10 @@ import type {
   SDKToolResultBlock,
   RecoveryAction,
 } from '@proma/shared'
+import type { AgentPendingFile } from '@proma/shared'
 import {
+  getSDKCompactStatus,
+  inferContextWindow,
   THINKING_SIGNATURE_ERROR_CODE,
   THINKING_SIGNATURE_ERROR_TITLE,
   THINKING_SIGNATURE_ERROR_MESSAGE,
@@ -115,7 +138,7 @@ function PermissionDeniedNotice({ message }: { message: SDKSystemMessage }): Rea
         <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
         <div className="min-w-0 space-y-1">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="font-medium text-foreground">自动审批已拒绝操作</span>
+            <span className="font-medium text-foreground">权限检查已拒绝操作</span>
             {toolName && (
               <span className="rounded bg-background/60 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
                 {toolName}
@@ -134,33 +157,51 @@ function PermissionDeniedNotice({ message }: { message: SDKSystemMessage }): Rea
   )
 }
 
-// ===== system 消息：正在压缩指示器（与 CompactBoundaryDivider 同款横线样式，pill 内带 spinner） =====
+// ===== system 消息：压缩历史状态 =====
 
-export function CompactingIndicator(): React.ReactElement {
-  return (
-    <div className="flex items-center gap-3 my-4 px-1">
-      <div className="flex-1 h-px bg-border/40" />
-      <span className="shrink-0 inline-flex items-center gap-1.5 text-[11px] text-muted-foreground/70 px-2 py-0.5 rounded-full border border-border/30 bg-muted/20">
-        <Loader2 className="size-3 animate-spin" />
-        正在压缩...
-      </span>
-      <div className="flex-1 h-px bg-border/40" />
-    </div>
-  )
-}
-
-// ===== 辅助：从 SDKMessage 提取元数据 =====
-
-interface MessageMeta {
-  createdAt?: number
-}
-
-function extractMeta(message: SDKMessage): MessageMeta {
-  const msg = message as Record<string, unknown>
-  return {
-    createdAt: typeof msg._createdAt === 'number' ? msg._createdAt : undefined,
+function CompactStatusNotice({ message }: { message: SDKSystemMessage }): React.ReactElement | null {
+  const compactStatus = getSDKCompactStatus(message)
+  if (compactStatus === 'success') return <CompactBoundaryDivider />
+  if (compactStatus === 'compacting') {
+    return (
+      <div className="flex items-center gap-3 my-4 px-1">
+        <div className="flex-1 h-px bg-border/40" />
+        <span className="shrink-0 text-[11px] text-muted-foreground/60 px-2 py-0.5 rounded-full border border-border/30 bg-muted/20">
+          开始压缩上下文
+        </span>
+        <div className="flex-1 h-px bg-border/40" />
+      </div>
+    )
   }
+  if (compactStatus === 'noop') {
+    return (
+      <div className="flex items-center gap-3 my-4 px-1">
+        <div className="flex-1 h-px bg-border/40" />
+        <span className="shrink-0 text-[11px] text-muted-foreground/60 px-2 py-0.5 rounded-full border border-border/30 bg-muted/20">
+          {message.message ?? '当前上下文无需压缩'}
+        </span>
+        <div className="flex-1 h-px bg-border/40" />
+      </div>
+    )
+  }
+  if (compactStatus === 'failed') {
+    const error = typeof message.compact_error === 'string' ? message.compact_error : undefined
+    return (
+      <div className="my-3 pl-[46px] pr-1">
+        <div className="flex items-start gap-2.5 rounded-md border border-destructive/25 bg-destructive/5 px-3 py-2.5 text-xs text-foreground/80">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
+          <div className="min-w-0 space-y-1">
+            <div className="font-medium text-foreground">上下文压缩失败</div>
+            {error && <p className="break-words text-muted-foreground">{error}</p>}
+          </div>
+        </div>
+      </div>
+    )
+  }
+  return null
 }
+
+// extractMeta / MessageMeta 已迁移至 @proma/session-core
 
 /** 从 turn 消息列表中提取 result 消息的耗时和用量数据 */
 function extractTurnUsage(turnMessages: SDKMessage[]): { durationMs?: number; usage?: AgentEventUsage } {
@@ -171,9 +212,20 @@ function extractTurnUsage(turnMessages: SDKMessage[]): { durationMs?: number; us
     const durationMs = typeof raw._durationMs === 'number' ? raw._durationMs : undefined
     const u = resultMsg.usage
     if (!u) return { durationMs }
-    const contextWindow = resultMsg.modelUsage
-      ? Object.values(resultMsg.modelUsage)[0]?.contextWindow
-      : undefined
+    // 多 entry 场景（Task 子 Agent 等）：取最大 contextWindow
+    let contextWindow: number | undefined
+    if (resultMsg.modelUsage) {
+      for (const [modelId, info] of Object.entries(resultMsg.modelUsage)) {
+        const fallbackModelId = resultMsg._channelModelId ?? modelId
+        const fallbackWindow = inferContextWindow(fallbackModelId)
+        const candidate = Math.max(info?.contextWindow ?? 0, fallbackWindow ?? 0) || undefined
+        if (candidate && (contextWindow === undefined || candidate > contextWindow)) {
+          contextWindow = candidate
+        }
+      }
+    } else {
+      contextWindow = inferContextWindow(resultMsg._channelModelId)
+    }
     return {
       durationMs,
       usage: {
@@ -189,21 +241,7 @@ function extractTurnUsage(turnMessages: SDKMessage[]): { durationMs?: number; us
   return {}
 }
 
-// ===== 辅助：从 user 消息中提取纯文本内容 =====
-
-export function extractUserText(message: SDKUserMessage): string | null {
-  const content = message.message?.content
-  if (!Array.isArray(content)) return null
-
-  const texts: string[] = []
-  for (const block of content) {
-    if (block.type === 'text' && 'text' in block) {
-      texts.push((block as { text: string }).text)
-    }
-  }
-
-  return texts.length > 0 ? texts.join('\n') : null
-}
+// extractUserText 已迁移至 @proma/session-core
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -224,25 +262,16 @@ function extractToolResultForTask(message: SDKUserMessage, resultBlock: SDKToolR
   return extractStructuredToolResultText(message) ?? extractToolResultText(resultBlock.content)
 }
 
-// ===== 辅助：判断 user 消息是否为真正的人类用户输入（非工具结果/子代理提示） =====
-
-function isUserInputMessage(message: SDKUserMessage): boolean {
-  if (message.parent_tool_use_id) return false
-  // SDK 合成消息（如 Skill 展开 prompt）不是用户输入
-  if (message.isSynthetic) return false
-  // 包含 tool_result 块的消息是工具结果，不是用户输入
-  const content = message.message?.content
-  if (Array.isArray(content) && content.some((b) => b.type === 'tool_result')) return false
-  return extractUserText(message) !== null
-}
+// isUserInputMessage 已迁移至 @proma/session-core
 
 // ===== 助手头像 =====
 
-function AssistantLogo({ model }: { model?: string }): React.ReactElement {
+export function AssistantLogo({ model }: { model?: string }): React.ReactElement {
+  const channels = useAtomValue(channelsAtom)
   if (model) {
     return (
       <img
-        src={getModelLogo(model)}
+        src={getModelLogo(model, resolveModelProvider(model, channels))}
         alt={model}
         className="size-[35px] rounded-[25%] object-cover"
       />
@@ -255,178 +284,11 @@ function AssistantLogo({ model }: { model?: string }): React.ReactElement {
   )
 }
 
-// ===== Turn 分组类型 =====
+// AssistantTurn / MessageGroup 类型已迁移至 @proma/session-core
 
-export interface AssistantTurn {
-  type: 'assistant-turn'
-  /** 当前 turn 内所有 assistant 消息 */
-  assistantMessages: SDKAssistantMessage[]
-  /** 当前 turn 内所有消息（含 tool_result user 消息，供工具结果查找） */
-  turnMessages: SDKMessage[]
-  /** 模型名称（取首条 assistant 消息的 model） */
-  model?: string
-  /** 创建时间（取首条 assistant 消息的时间） */
-  createdAt?: number
-  /**
-   * 该 turn 由后台任务完成通知（task_notification）唤醒后开始。
-   * 用于阻断与前一 turn 的合并，让自动唤醒的新输出独立成块，而不是被追加进上一轮的消息块。
-   */
-  startsAfterWake?: boolean
-}
+// groupIntoTurns / mergeAdjacentSameModelTurns 已迁移至 @proma/session-core
 
-export type MessageGroup =
-  | { type: 'user'; message: SDKUserMessage }
-  | { type: 'system'; message: SDKSystemMessage }
-  | AssistantTurn
-
-/**
- * 将 SDKMessage 列表分组为可渲染的 Turn
- *
- * 规则：
- * 1. user（真正用户输入）→ 单独的 user group
- * 2. assistant + user(tool_result) + assistant... → 合并为一个 assistant-turn
- * 3. system（compact_boundary / compacting / permission_denied）→ 独立渲染，其他归入当前 turn
- * 4. 其他类型（result, tool_progress 等）→ 归入当前 assistant-turn
- * 5. 后处理：合并相邻同模型的 assistant-turn（处理子代理切换模型导致的碎片化）
- */
-export function groupIntoTurns(messages: SDKMessage[], sessionModelId?: string): MessageGroup[] {
-  const groups: MessageGroup[] = []
-  let currentTurn: AssistantTurn | null = null
-  // 收到后台任务完成通知（task_notification）后，若没有用户输入就直接出现新的 assistant 输出，
-  // 说明这是自动唤醒的新一轮，应另起独立消息块，而不是续接上一轮。
-  // 注意：不能用 result 做信号——正常对话每轮也以 result 结束，会误伤普通回复。
-  let pendingWakeBoundary = false
-
-  const flushTurn = (): void => {
-    if (currentTurn && currentTurn.assistantMessages.length > 0) {
-      groups.push(currentTurn)
-    }
-    currentTurn = null
-  }
-
-  for (const msg of messages) {
-    if (msg.type === 'user') {
-      const userMsg = msg as SDKUserMessage
-      if (isUserInputMessage(userMsg)) {
-        // 真正的用户输入 → 结束当前 turn，开始新段落
-        flushTurn()
-        groups.push({ type: 'user', message: userMsg })
-        pendingWakeBoundary = false
-      } else {
-        // tool_result 消息 → 归入当前 turn
-        if (currentTurn) {
-          currentTurn.turnMessages.push(msg)
-        }
-      }
-    } else if (msg.type === 'assistant') {
-      const aMsg = msg as SDKAssistantMessage
-      // 跳过重放消息
-      if (aMsg.isReplay) continue
-
-      if (!currentTurn) {
-        // 开始新 turn
-        const meta = extractMeta(msg)
-        currentTurn = {
-          type: 'assistant-turn',
-          assistantMessages: [aMsg],
-          turnMessages: [msg],
-          model: aMsg._channelModelId || aMsg.message?.model || sessionModelId,
-          createdAt: meta.createdAt,
-          // 紧跟在后台任务唤醒之后的新 turn：阻断与上一轮的合并
-          startsAfterWake: pendingWakeBoundary || undefined,
-        }
-        pendingWakeBoundary = false
-      } else {
-        // 继续当前 turn
-        currentTurn.assistantMessages.push(aMsg)
-        currentTurn.turnMessages.push(msg)
-      }
-    } else if (msg.type === 'system') {
-      const sysMsg = msg as SDKSystemMessage
-      // 仅需要独立渲染的 system 消息才中断 turn（compact_boundary / compacting / permission_denied）
-      // 其他 system 消息（如 init、task_started、task_progress）归入当前 turn，不中断分组
-      if (sysMsg.subtype === 'compact_boundary' || sysMsg.subtype === 'compacting' || sysMsg.subtype === 'permission_denied') {
-        flushTurn()
-        groups.push({ type: 'system', message: sysMsg })
-      } else if (sysMsg.subtype === 'task_notification') {
-        // 后台任务完成通知：仅在没有进行中的 turn 时标记唤醒边界（真正的唤醒场景）。
-        // 若当前有 turn 正在进行，归入当前 turn 不截断。
-        if (currentTurn) {
-          currentTurn.turnMessages.push(msg)
-        } else {
-          pendingWakeBoundary = true
-        }
-      } else if (currentTurn) {
-        currentTurn.turnMessages.push(msg)
-      }
-    } else {
-      // result, tool_progress 等 → 归入当前 turn
-      // prompt_suggestion 不属于对话转录，不入 turn，避免被当作文本附加到助手消息末尾
-      if ((msg as { type: string }).type === 'prompt_suggestion') {
-        continue
-      }
-      if (currentTurn) {
-        currentTurn.turnMessages.push(msg)
-      }
-    }
-  }
-
-  flushTurn()
-  return mergeAdjacentSameModelTurns(groups)
-}
-
-/**
- * 后处理：合并相邻同模型的 assistant-turn
- *
- * 当子代理（如 haiku）执行多个工具调用时，中间的 user(tool_result) 消息
- * 可能导致 turn 被拆分为多个碎片。此函数将同模型的相邻 assistant-turn 合并，
- * 同时吸收它们之间的非用户输入 group（如被误判为用户输入的子代理内部消息）。
- */
-function mergeAdjacentSameModelTurns(groups: MessageGroup[]): MessageGroup[] {
-  if (groups.length <= 1) return groups
-
-  const result: MessageGroup[] = []
-
-  for (const group of groups) {
-    if (group.type !== 'assistant-turn') {
-      result.push(group)
-      continue
-    }
-
-    // 后台任务唤醒后开始的 turn：独立成块，不向前合并。
-    if (group.startsAfterWake) {
-      result.push(group)
-      continue
-    }
-
-    // 向前查找可合并的同模型 assistant-turn（跳过非 user-input 的中间 group）
-    let mergeTargetIdx = -1
-    for (let i = result.length - 1; i >= 0; i--) {
-      const prev = result[i]!
-      if (prev.type === 'user') break // 真正的用户输入阻断合并
-      if (prev.type === 'system' && ['compact_boundary', 'permission_denied'].includes((prev.message as SDKSystemMessage).subtype ?? '')) break
-      if (prev.type === 'assistant-turn') {
-        if (prev.model === group.model) {
-          mergeTargetIdx = i
-        }
-        break // 遇到第一个 assistant-turn 就停止（不跨越不同模型的 turn）
-      }
-      // system 或其他 group：继续向前查找
-    }
-
-    if (mergeTargetIdx >= 0) {
-      const target = result[mergeTargetIdx] as AssistantTurn
-      target.assistantMessages.push(...group.assistantMessages)
-      target.turnMessages.push(...group.turnMessages)
-    } else {
-      result.push(group)
-    }
-  }
-
-  return result
-}
-
-function buildTaskProgressData(
+export function buildTaskProgressData(
   topLevelBlocks: SDKContentBlock[],
   turnMessages: SDKMessage[],
 ): {
@@ -471,76 +333,58 @@ function buildTaskProgressData(
 }
 
 /**
- * 扫描全部消息，构建跨 turn 的「历史 TaskCreate id → subject」映射。
+ * 提取一个 turn 中直接属于当前 Agent 的任务工具活动。
  *
- * 早期把这部分逻辑放在 buildTaskProgressData 里，每个 AssistantTurnRenderer 渲染都要
- * 跑一次 → O(T × M)；流式期间 allMessages 引用每帧变化，useMemo 缓存失效，长会话
- * 雪崩。提升到 AgentMessages 顶层后只算一次，O(M)。
+ * Task/Agent 容器内的子 Agent 工具不会进入父会话的浮动进度，避免跨执行单元串扰。
  */
-export function buildHistoricalTaskSubjects(allMessages: SDKMessage[]): Map<string, string> {
-  const historicalTaskSubjects = new Map<string, string>()
-  const globalResultMap = new Map<string, string>()
-  const pendingTaskCreates: SDKToolUseBlock[] = []
+export function buildTaskProgressDataForTurn(turn: AssistantTurn): { taskActivities: ToolActivity[] } {
+  const enrichedBlocks: Array<{ block: SDKContentBlock; parentToolUseId?: string | null }> = []
 
-  for (const msg of allMessages) {
-    if (msg.type === 'user') {
-      const userMsg = msg as SDKUserMessage
-      const blocks = userMsg.message?.content
-      if (!Array.isArray(blocks)) continue
-      for (const b of blocks) {
-        if (b.type === 'tool_result') {
-          const rb = b as SDKToolResultBlock
-          const text = extractToolResultForTask(userMsg, rb)
-          if (text) globalResultMap.set(rb.tool_use_id, text)
-        }
-      }
-    } else if (msg.type === 'assistant') {
-      const aMsg = msg as SDKAssistantMessage
-      const blocks = aMsg.message?.content
-      if (!Array.isArray(blocks)) continue
-      for (const b of blocks) {
-        if (b.type === 'tool_use' && (b as SDKToolUseBlock).name === 'TaskCreate') {
-          pendingTaskCreates.push(b as SDKToolUseBlock)
-        }
+  for (const message of turn.assistantMessages) {
+    const blocks = message.message?.content
+    if (!Array.isArray(blocks)) continue
+    for (const block of blocks) {
+      for (const normalizedBlock of normalizeThinkTagsInContentBlocks([block])) {
+        enrichedBlocks.push({ block: normalizedBlock, parentToolUseId: message.parent_tool_use_id })
       }
     }
   }
 
-  for (const tb of pendingTaskCreates) {
-    const input = tb.input as Record<string, unknown>
-    const subject = typeof input.subject === 'string'
-      ? input.subject
-      : typeof input.description === 'string'
-        ? input.description
-        : undefined
-    if (!subject) continue
-    const resultText = globalResultMap.get(tb.id)
-    const parsedResult = parseTaskCreateResult(resultText)
-    if (parsedResult?.id) historicalTaskSubjects.set(parsedResult.id, parsedResult.subject ?? subject)
+  const agentToolIds = new Set<string>()
+  for (const { block } of enrichedBlocks) {
+    if (block.type !== 'tool_use') continue
+    const tool = block as { name: string; id: string }
+    if (tool.name === 'Agent' || tool.name === 'Task') agentToolIds.add(tool.id)
   }
 
-  return historicalTaskSubjects
+  const topLevelBlocks = enrichedBlocks
+    .filter(({ parentToolUseId }) => !parentToolUseId || !agentToolIds.has(parentToolUseId))
+    .map(({ block }) => block)
+
+  const { taskActivities } = buildTaskProgressData(topLevelBlocks, turn.turnMessages)
+  return { taskActivities }
 }
 
-// ===== AssistantTurnRenderer — 渲染一个完整的 assistant turn =====
 
 export interface AssistantTurnRendererProps {
   turn: AssistantTurn
   /** 所有消息（全局，供工具结果查找跨 turn 的结果） */
   allMessages: SDKMessage[]
-  /** 跨 turn 历史 TaskCreate id → subject 映射（由父组件 useMemo 算一次后传入） */
-  historicalTaskSubjects: Map<string, string>
   basePath?: string
   /** 分叉回调（传入最后一条 assistant 消息的 uuid） */
   onFork?: (upToMessageUuid: string) => void
   /** 回退回调（传入 assistant message uuid） */
   onRewind?: (assistantMessageUuid: string) => void
-  /** 错误重试回调（仅当 turn 含错误消息时使用） */
-  onRetry?: () => void
+  /** 将本轮回复标记为 Todo */
+  onCreateTodo?: (text: string) => void
+  /** 错误重试回调（传入本轮开始前应删除的错误 UUID） */
+  onRetry?: (errorUuid?: string) => void
   /** 在新会话中重试回调（仅当 turn 含错误消息时使用） */
   onRetryInNewSession?: () => void
   /** 压缩上下文回调（仅 prompt_too_long 错误使用） */
   onCompact?: () => void
+  onRelinkProjectRoot?: () => void
+  onRestoreProjectRoot?: () => void
   /** 是否正在流式输出中（隐藏操作栏） */
   isStreaming?: boolean
   /** 是否被用户中断 */
@@ -549,9 +393,8 @@ export interface AssistantTurnRendererProps {
   sessionModelId?: string
 }
 
-export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubjects, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, isStreaming, stoppedByUser, sessionModelId }: AssistantTurnRendererProps): React.ReactElement | null {
+export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onRewind, onCreateTodo, onRetry, onRetryInNewSession, onCompact, onRelinkProjectRoot, onRestoreProjectRoot, isStreaming, stoppedByUser, sessionModelId }: AssistantTurnRendererProps): React.ReactElement | null {
   const channels = useAtomValue(channelsAtom)
-  const processGroupsKeepExpanded = useAtomValue(agentProcessGroupsKeepExpandedAtom)
   // 收集所有 assistant 消息的内容块，保留 parent_tool_use_id 关联
   interface EnrichedBlock {
     block: SDKContentBlock
@@ -563,10 +406,17 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
   let errorContent: SDKAssistantMessage | null = null
 
   for (const aMsg of turn.assistantMessages) {
+    const msgAny = aMsg as unknown as Record<string, unknown>
+    // 区分两种错误消息：
+    // 1. Orchestrator 造的纯错误消息（带 _errorCode）：content 里的 text 就是错误摘要，不当正文渲染
+    // 2. Pi 混合消息（只带 error、无 _errorCode）：provider 已吐完正文后收尾报错，content 是真正的 assistant 正文
+    const isPureErrorSummary = typeof msgAny._errorCode === 'string'
     if (aMsg.error) {
       hasError = true
       errorContent = aMsg
-      continue
+      // 纯错误消息的 content 不当正文渲染（避免错误摘要重复出现两次）
+      if (isPureErrorSummary) continue
+      // Pi 混合消息：继续向下把 content 收集进 enrichedBlocks，保留真正的助手正文
     }
     const blocks = aMsg.message?.content
     if (Array.isArray(blocks)) {
@@ -614,10 +464,6 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
     (b) => b.type === 'text' && 'text' in b && !!(b as { text: string }).text
   )
 
-  // Task 聚合数据（useMemo 防止每次渲染重算）
-  const { taskActivities, firstTaskIndex } = React.useMemo(() => {
-    return buildTaskProgressData(topLevelBlocks, turn.turnMessages)
-  }, [topLevelBlocks, turn.turnMessages])
   const completedToolResultIds = React.useMemo(() => {
     return buildCompletedToolResultIds(turn.turnMessages)
   }, [turn.turnMessages])
@@ -628,6 +474,12 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
     })
   }, [topLevelBlocks, isStreaming, completedToolResultIds])
 
+  // 本轮「文件名 → 绝对路径」映射：与 footer chips 同源，供正文内联文件引用补全裸文件名
+  const turnFileMap = React.useMemo(
+    () => buildTurnFileNameMap(turn.turnMessages),
+    [turn.turnMessages]
+  )
+
   // 如果只有错误消息
   if (enrichedBlocks.length === 0 && hasError && errorContent) {
     return (
@@ -636,6 +488,8 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
         onRetry={onRetry}
         onRetryInNewSession={onRetryInNewSession}
         onCompact={onCompact}
+        onRelinkProjectRoot={onRelinkProjectRoot}
+        onRestoreProjectRoot={onRestoreProjectRoot}
       />
     )
   }
@@ -644,18 +498,8 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
   if (enrichedBlocks.length === 0 && !hasError) return null
 
   const renderTopLevelBlock = (block: SDKContentBlock, i: number): React.ReactNode => {
-    // Task 工具块：聚合为卡片，此处用索引定位首个任务工具
+    // 任务进度由底部浮层统一呈现，输出记录不再重复显示任务卡。
     if (block.type === 'tool_use' && TASK_TOOL_NAMES.has((block as SDKToolUseBlock).name)) {
-      if (i === firstTaskIndex) {
-        return (
-          <TaskProgressCard
-            key="task-progress-card"
-            activities={taskActivities}
-            streamEnded={!isStreaming}
-            historicalTaskSubjects={historicalTaskSubjects}
-          />
-        )
-      }
       return null
     }
 
@@ -692,6 +536,7 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
         logo={<AssistantLogo model={turn.model} />}
       />
       <MessageContent>
+        <TurnFileMapProvider map={turnFileMap}>
         <div className={cn('space-y-2')}>
           {renderItems.map((item, itemIndex) => {
             if (item.type === 'block') {
@@ -700,31 +545,44 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
 
             const groupBlocks = item.items.map((groupItem) => groupItem.block)
             const firstIndex = item.items[0]?.index ?? 0
+            const groupKey = `process-${firstIndex}`
             return (
               <ProcessBlockGroup
-                key={`process-${firstIndex}`}
+                key={groupKey}
                 blocks={groupBlocks}
                 isStreaming={isStreaming}
-                keepExpandedAfterComplete={processGroupsKeepExpanded}
+                renderChildren={() => item.items.map((groupItem) => (
+                  <React.Fragment key={groupItem.index}>
+                    {renderProcessGroupBlock(groupItem.block, groupItem.index)}
+                  </React.Fragment>
+                ))}
                 isMessageTail={itemIndex === renderItems.length - 1}
-              >
-                {item.items.map((groupItem) => renderProcessGroupBlock(groupItem.block, groupItem.index))}
-              </ProcessBlockGroup>
+              />
             )
           })}
         </div>
-        {/* 如果有错误但也有内容块，在末尾显示错误 */}
+        {/* 如果有错误但也有内容块，在末尾以 tail 形式挂错误横幅附错误提示 + 重试按钮，保留正文本身的 markdown 排版 */}
         {hasError && errorContent && topLevelBlocks.length > 0 && (
-          <div className="mt-3 text-sm text-destructive">
-            {isThinkingSignatureError(errorContent.error?.message)
-              ? `${THINKING_SIGNATURE_ERROR_TITLE}：${THINKING_SIGNATURE_ERROR_MESSAGE}`
-              : (errorContent.error?.message ?? '未知错误')}
-          </div>
+          <AssistantErrorTail
+            message={errorContent}
+            onRetry={onRetry}
+            onRetryInNewSession={onRetryInNewSession}
+            onCompact={onCompact}
+            onRelinkProjectRoot={onRelinkProjectRoot}
+            onRestoreProjectRoot={onRestoreProjectRoot}
+          />
         )}
+        </TurnFileMapProvider>
       </MessageContent>
-      {/* 文件改动汇总：流式结束后展示本轮所有 Edit/Write/MultiEdit/NotebookEdit 文件 */}
+      {/* 完成态汇总：Skill 使用记录与文件改动 chip */}
       {!isStreaming && (
-        <TurnFileChangesSummary turnMessages={turn.turnMessages} basePath={basePath} />
+        <>
+          <TurnSkillUsageSummary
+            inputMessage={turn.inputMessage}
+            turnMessages={turn.turnMessages}
+          />
+          <TurnFileChangesSummary turnMessages={turn.turnMessages} basePath={basePath} />
+        </>
       )}
       {/* 操作栏：流式输出完成后显示操作按钮 */}
       {!isStreaming && (() => {
@@ -746,8 +604,13 @@ export function AssistantTurnRenderer({ turn, allMessages, historicalTaskSubject
           <MessageActions className="pl-[46px] mt-0.5 min-h-[28px] justify-start">
             {hasDuration && <DurationBadge durationMs={durationMs!} usage={usage} />}
             {textContent && <CopyButton content={textContent} />}
+            {textContent && onCreateTodo && (
+              <MessageAction tooltip="标记为 Todo" onClick={() => onCreateTodo(textContent)}>
+                <ListTodo className="size-3.5" />
+              </MessageAction>
+            )}
             {onFork && lastUuid && (
-              <MessageAction tooltip="从此处分叉" onClick={() => onFork(lastUuid)}>
+              <MessageAction tooltip="按当前模型从此处分叉" onClick={() => onFork(lastUuid)}>
                 <Split className="size-3.5" />
               </MessageAction>
             )}
@@ -787,15 +650,30 @@ export function SDKMessageRenderer({
     // 跳过重放消息
     if (aMsg.isReplay) return null
 
-    // 错误消息
+    // 错误消息分发：
+    // - Orchestrator 造的纯错误消息（带 _errorCode）：直接走 ErrorMessage 组件
+    // - Pi 混合消息（只带 error、无 _errorCode）：走下方正常渲染 + 末尾挂 tail
+    //   与 AssistantTurnRenderer 对齐：不检查 hasRenderableContent，有 blocks 就正常渲染正文，
+    //   没有 blocks 才回退到 ErrorMessage
     if (aMsg.error) {
-      return <ErrorMessage message={aMsg} />
+      const msgAny = aMsg as unknown as Record<string, unknown>
+      const isPureErrorSummary = typeof msgAny._errorCode === 'string'
+      if (isPureErrorSummary) {
+        return <ErrorMessage message={aMsg} />
+      }
+      // Pi 混合消息：下面按正常路径收集 content blocks，末尾挂 AssistantErrorTail
     }
 
     const rawBlocks = aMsg.message?.content
-    if (!Array.isArray(rawBlocks) || rawBlocks.length === 0) return null
+    if (!Array.isArray(rawBlocks) || rawBlocks.length === 0) {
+      if (aMsg.error) return <ErrorMessage message={aMsg} />
+      return null
+    }
     const blocks = normalizeThinkTagsInContentBlocks(rawBlocks)
-    if (blocks.length === 0) return null
+    if (blocks.length === 0) {
+      if (aMsg.error) return <ErrorMessage message={aMsg} />
+      return null
+    }
 
     const model = aMsg._channelModelId || aMsg.message?.model || sessionModelId
     const meta = extractMeta(message)
@@ -827,6 +705,10 @@ export function SDKMessageRenderer({
               />
             ))}
           </div>
+          {/* Pi runtime 下「provider 已吐正文 + 收尾报错」的混合消息：末尾挂错误横幅 */}
+          {aMsg.error && (
+            <AssistantErrorTail message={aMsg} />
+          )}
         </MessageContent>
       </Message>
     )
@@ -845,15 +727,12 @@ export function SDKMessageRenderer({
   if (msgType === 'system') {
     const sysMsg = message as SDKSystemMessage
     const subtype = sysMsg.subtype
+    const compactStatus = getSDKCompactStatus(sysMsg)
 
-    if (subtype === 'compact_boundary') {
-      return <CompactBoundaryDivider />
-    }
+    if (compactStatus) return <CompactStatusNotice message={sysMsg} />
     if (subtype === 'permission_denied') {
       return <PermissionDeniedNotice message={sysMsg} />
     }
-
-    // compacting 事件已由 isCompacting flag 驱动的尾部指示器接管（见 AgentMessages），此处不再渲染持久条目
 
     return null
   }
@@ -870,36 +749,20 @@ export interface AttachedFileRef {
 }
 
 /** 解析的引用文件 */
-export interface QuotedFileRef {
-  /** 源文件路径 */
-  path: string
-  /** 源文件名 */
-  filename: string
-}
+export type QuotedFileRef = ParsedQuotedSelectionRef
 
-/** 解析消息中的 <attached_files> 块和 <quoted_file> 块，返回文件列表、引用列表和剩余文本 */
-export function parseAttachedFiles(content: string): { files: AttachedFileRef[]; quotes: QuotedFileRef[]; text: string } {
-  const quoteRegex = /<quoted_file[^>]*>[\s\S]*?<\/quoted_file>\n*/g
-  const quotes: QuotedFileRef[] = []
-  let quoteMatch: RegExpExecArray | null
-  while ((quoteMatch = quoteRegex.exec(content)) !== null) {
-    const pathMatch = quoteMatch[0].match(/path="([^"]*)"/)
-    if (pathMatch) {
-      // 反解 XML 实体：&amp; 必须最后做，否则会被先一步解出的 & 误伤
-      const filePath = pathMatch[1]!
-        .replace(/&quot;/g, '"')
-        .replace(/&gt;/g, '>')
-        .replace(/&lt;/g, '<')
-        .replace(/&amp;/g, '&')
-      quotes.push({ path: filePath, filename: filePath.split('/').pop() ?? filePath })
-    }
-  }
+/** 解析消息中的 <attached_files>、<quoted_file> 和 <quoted_context> 块，返回文件列表、引用列表和剩余文本 */
+export function parseAttachedFiles(
+  content: string,
+  options: { inlineAgentHistoryQuotes?: boolean } = {},
+): { files: AttachedFileRef[]; quotes: QuotedFileRef[]; text: string } {
+  const parsedQuotes = parseQuotedSelectionRefs(content, options)
+  const quotes: QuotedFileRef[] = parsedQuotes.quotes
 
   const regex = /<attached_files>\n?([\s\S]*?)\n?<\/attached_files>\n*/
   const match = content.match(regex)
   if (!match) {
-    const cleanText = content.replace(/<quoted_file[^>]*>[\s\S]*?<\/quoted_file>\n*/g, '').trim()
-    return { files: [], quotes, text: cleanText }
+    return { files: [], quotes, text: parsedQuotes.text }
   }
 
   const files: AttachedFileRef[] = []
@@ -911,9 +774,7 @@ export function parseAttachedFiles(content: string): { files: AttachedFileRef[];
     }
   }
 
-  let text = content.replace(regex, '')
-  text = text.replace(/<quoted_file[^>]*>[\s\S]*?<\/quoted_file>\n*/g, '')
-  text = text.trim()
+  const text = parsedQuotes.text.replace(regex, '').trim()
   return { files, quotes, text }
 }
 
@@ -923,9 +784,16 @@ export function isImageFile(filename: string): boolean {
 }
 
 /** 图片附件缩略图，点击可预览大图 */
-function AttachedImageThumb({ file }: { file: AttachedFileRef }): React.ReactElement {
+function AttachedImageThumb({ file, index, onOpen, onLoaded }: {
+  file: AttachedFileRef
+  /** 该图在同批图片中的索引 */
+  index: number
+  /** 点击缩略图打开大图预览（第 index 张） */
+  onOpen: (index: number) => void
+  /** 图片 src 加载完成上报父组件（供共享 lightbox 翻页使用） */
+  onLoaded: (path: string, src: string) => void
+}): React.ReactElement {
   const [imageSrc, setImageSrc] = React.useState<string | null>(null)
-  const [lightboxOpen, setLightboxOpen] = React.useState(false)
 
   React.useEffect(() => {
     const ext = file.filename.split('.').pop()?.toLowerCase() ?? 'png'
@@ -937,9 +805,13 @@ function AttachedImageThumb({ file }: { file: AttachedFileRef }): React.ReactEle
 
     window.electronAPI
       .readAttachment(file.path)
-      .then((base64) => setImageSrc(`data:${mediaType};base64,${base64}`))
+      .then((base64) => {
+        const src = `data:${mediaType};base64,${base64}`
+        setImageSrc(src)
+        onLoaded(file.path, src)
+      })
       .catch((err) => console.error('[AttachedImageThumb] 读取附件失败:', err))
-  }, [file.path, file.filename])
+  }, [file.path, file.filename, onLoaded])
 
   const handleSave = React.useCallback((): void => {
     window.electronAPI.saveImageAs(file.path, file.filename)
@@ -955,7 +827,7 @@ function AttachedImageThumb({ file }: { file: AttachedFileRef }): React.ReactEle
         src={imageSrc}
         alt={file.filename}
         className="max-w-[300px] max-h-[200px] rounded-lg object-contain cursor-pointer"
-        onClick={() => setLightboxOpen(true)}
+        onClick={() => onOpen(index)}
       />
       <button
         type="button"
@@ -965,13 +837,6 @@ function AttachedImageThumb({ file }: { file: AttachedFileRef }): React.ReactEle
       >
         <Download className="size-4" />
       </button>
-      <ImageLightbox
-        src={imageSrc}
-        alt={file.filename}
-        open={lightboxOpen}
-        onOpenChange={setLightboxOpen}
-        onSave={handleSave}
-      />
     </div>
   )
 }
@@ -980,21 +845,45 @@ function AttachedImageThumb({ file }: { file: AttachedFileRef }): React.ReactEle
 function AttachedFileChip({ file }: { file: AttachedFileRef }): React.ReactElement {
   const isImg = isImageFile(file.filename)
   const Icon = isImg ? FileImage : FileText
+  const activeSessionId = useAtomValue(activeSessionIdAtom)
+  const openPreview = useOpenPreview()
+
+  const handleOpenPreview = React.useCallback((): void => {
+    if (!activeSessionId) return
+    const parentPath = getFileParentPath(file.path)
+    openPreview(activeSessionId, {
+      filePath: file.path,
+      previewOnly: true,
+      readOnly: true,
+      basePaths: parentPath ? [parentPath] : undefined,
+    })
+  }, [activeSessionId, file.path, openPreview])
 
   return (
-    <div className="inline-flex items-center gap-1.5 rounded-md bg-muted/60 px-2.5 py-1 text-[12px] text-muted-foreground">
+    <button
+      type="button"
+      onClick={handleOpenPreview}
+      disabled={!activeSessionId}
+      className={cn(
+        'inline-flex items-center gap-1.5 rounded-md bg-muted/60 px-2.5 py-1 text-[12px] text-muted-foreground',
+        'transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:hover:bg-muted/60 disabled:hover:text-muted-foreground'
+      )}
+      title={file.path}
+    >
       <Icon className="size-3.5 shrink-0" />
       <span className="truncate max-w-[200px]">{file.filename}</span>
-    </div>
+    </button>
   )
 }
 
+
 /** 引用文件 Chip（显示在用户消息中，表示该消息引用了某个文件的选中内容） */
 function QuoteChip({ quote }: { quote: QuotedFileRef }): React.ReactElement {
+  const label = quote.label ?? quote.filename
   return (
     <div className="inline-flex items-center gap-1.5 rounded-md bg-primary/8 border border-primary/20 px-2.5 py-1 text-[12px] text-muted-foreground">
       <Quote className="size-3.5 shrink-0 text-primary/60" />
-      <span className="truncate max-w-[200px]">{quote.filename}</span>
+      <span className="truncate max-w-[200px]">{label}</span>
     </div>
   )
 }
@@ -1004,9 +893,7 @@ function QuoteChip({ quote }: { quote: QuotedFileRef }): React.ReactElement {
 
 const SCHEDULED_RUN_MARKER = '<!--PROMA_SCHEDULED_RUN-->'
 
-function stripScheduledRunMarker(text: string): string {
-  return text.replaceAll(SCHEDULED_RUN_MARKER, '').trim()
-}
+// stripScheduledRunMarker 已迁移至 @proma/session-core（本文件从该包 import 使用）
 
 function ScheduledRunBadge(): React.ReactElement {
   const activeSessionId = useAtomValue(activeSessionIdAtom)
@@ -1014,15 +901,17 @@ function ScheduledRunBadge(): React.ReactElement {
   const automations = useAtomValue(automationsAtom)
   const setForm = useSetAtom(automationFormAtom)
   const setActiveView = useSetAtom(activeViewAtom)
+  const setPlanningTab = useSetAtom(planningTabAtom)
 
   const session = sessions.find((s) => s.id === activeSessionId)
-  const automation = session?.sourceAutomationId
+  const automation = session?.sourceAutomationId && !session.sourceDelegationId
     ? automations.find((a) => a.id === session.sourceAutomationId)
     : undefined
 
   const handleClick = (): void => {
     if (!automation) return
-    setActiveView('automations')
+    setActiveView('planning')
+    setPlanningTab('automations')
     setForm({
       open: true,
       draft: automationToDraft(automation),
@@ -1042,14 +931,74 @@ function ScheduledRunBadge(): React.ReactElement {
   )
 }
 
-function UserInputMessage({ message }: { message: SDKUserMessage }): React.ReactElement {
+function UserInputMessage({ message, onAgentHistoryQuoteClick }: {
+  message: SDKUserMessage
+  onAgentHistoryQuoteClick?: (quote: QuotedSelection) => void
+}): React.ReactElement {
   const userProfile = useAtomValue(userProfileAtom)
   const rawText = extractUserText(message) ?? ''
   const isScheduledRun = rawText.includes(SCHEDULED_RUN_MARKER)
-  const { files: attachedFiles, quotes, text } = parseAttachedFiles(stripScheduledRunMarker(rawText))
+  const { files: attachedFiles, quotes, text } = parseAttachedFiles(
+    stripScheduledRunMarker(rawText),
+    { inlineAgentHistoryQuotes: true },
+  )
   const imageFiles = attachedFiles.filter((f) => isImageFile(f.filename))
+  const activeSessionId = useAtomValue(activeSessionIdAtom)
+  const setSessionPendingFiles = useSetAtom(agentSessionPendingFilesAtom)
   const nonImageFiles = attachedFiles.filter((f) => !isImageFile(f.filename))
   const meta = extractMeta(message as unknown as SDKMessage)
+
+  const handleImageEditComplete = React.useCallback((editedDataUrl: string): void => {
+    const base64 = editedDataUrl.split(',')[1]
+    if (!base64 || !activeSessionId) return
+
+    const id = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const pending: AgentPendingFile = {
+      id,
+      filename: `edited_image_${Date.now()}.png`,
+      mediaType: 'image/png',
+      size: Math.round(base64.length * 0.75),
+      previewUrl: editedDataUrl,
+    }
+
+    if (!window.__pendingAgentFileData) {
+      window.__pendingAgentFileData = new Map()
+    }
+    window.__pendingAgentFileData.set(id, base64)
+
+    setSessionPendingFiles((prev) => {
+      const sessionFiles = prev.get(activeSessionId) ?? []
+      const map = new Map(prev)
+      map.set(activeSessionId, [...sessionFiles, pending])
+      return map
+    })
+  }, [activeSessionId, setSessionPendingFiles])
+
+  // 共享大图预览状态（多图可左右翻页）
+  const [lightboxOpen, setLightboxOpen] = React.useState(false)
+  const [lightboxIndex, setLightboxIndex] = React.useState(0)
+  // 各图加载好的 src（key = file.path）——缩略图渲染时已加载，翻页复用不再触发 IO
+  const [loadedSrcs, setLoadedSrcs] = React.useState<Record<string, string>>({})
+
+  const handleImageLoaded = React.useCallback((path: string, src: string): void => {
+    setLoadedSrcs((prev) => (prev[path] ? prev : { ...prev, [path]: src }))
+  }, [])
+
+  const openLightbox = React.useCallback((index: number): void => {
+    setLightboxIndex(index)
+    setLightboxOpen(true)
+  }, [])
+
+  // lightbox 图片列表（索引与 imageFiles 对齐，每张带自己的保存回调）
+  const lightboxImages = React.useMemo<LightboxImage[]>(
+    () => imageFiles.map((file) => ({
+      src: loadedSrcs[file.path] ?? '',
+      alt: file.filename,
+      onSave: () => window.electronAPI.saveImageAs(file.path, file.filename),
+      onEditComplete: handleImageEditComplete,
+    })),
+    [imageFiles, loadedSrcs, handleImageEditComplete]
+  )
 
   return (
     <Message from="user">
@@ -1060,7 +1009,7 @@ function UserInputMessage({ message }: { message: SDKUserMessage }): React.React
           {(meta.createdAt || isScheduledRun) && (
             <span className="flex items-center gap-2 leading-none">
               {meta.createdAt && (
-                <span className="text-[10px] text-foreground/[0.38]">{formatMessageTime(meta.createdAt)}</span>
+                <span className="message-time text-[10px] text-foreground/[0.38]">{formatMessageTime(meta.createdAt)}</span>
               )}
               {isScheduledRun && (
                 <ScheduledRunBadge />
@@ -1071,18 +1020,26 @@ function UserInputMessage({ message }: { message: SDKUserMessage }): React.React
       </div>
       <MessageContent>
         {/* 引用文件 Chip */}
-        {quotes.length > 0 && (
+        {quotes.filter((quote) => quote.sourceType !== 'agent-history').length > 0 && (
           <div className="flex flex-wrap gap-1.5 mb-2">
-            {quotes.map((q, i) => (
-              <QuoteChip key={`${q.path}:${i}`} quote={q} />
-            ))}
+            {quotes
+              .filter((quote) => quote.sourceType !== 'agent-history')
+              .map((q, i) => (
+                <QuoteChip key={`${q.path}:${i}`} quote={q} />
+              ))}
           </div>
         )}
         {/* 图片缩略图 */}
         {imageFiles.length > 0 && (
           <div className="flex flex-wrap gap-2.5 mb-2">
-            {imageFiles.map((file) => (
-              <AttachedImageThumb key={file.path} file={file} />
+            {imageFiles.map((file, index) => (
+              <AttachedImageThumb
+                key={file.path}
+                file={file}
+                index={index}
+                onOpen={openLightbox}
+                onLoaded={handleImageLoaded}
+              />
             ))}
           </div>
         )}
@@ -1094,11 +1051,25 @@ function UserInputMessage({ message }: { message: SDKUserMessage }): React.React
             ))}
           </div>
         )}
-        {text && <UserMessageContent>{text}</UserMessageContent>}
+        {text && (
+          <UserMessageContent onAgentHistoryQuoteClick={onAgentHistoryQuoteClick}>
+            {text}
+          </UserMessageContent>
+        )}
       </MessageContent>
+      {/* 共享大图预览 — 单图时无翻页，行为同以前 */}
+      {imageFiles.length > 0 && (
+        <ImageLightbox
+          open={lightboxOpen}
+          onOpenChange={setLightboxOpen}
+          images={lightboxImages}
+          index={lightboxIndex}
+          onIndexChange={setLightboxIndex}
+        />
+      )}
       {text && (
         <MessageActions className="pl-[46px] mt-0.5">
-          <CopyButton content={text} />
+          <CopyButton content={replaceAgentHistoryQuoteMentionsWithLabels(text)} />
         </MessageActions>
       )}
     </Message>
@@ -1107,18 +1078,59 @@ function UserInputMessage({ message }: { message: SDKUserMessage }): React.React
 
 // ===== 错误消息渲染 =====
 
+function shouldOfferProjectRootRestore(projectRootStatus: string | undefined): boolean {
+  return projectRootStatus === 'missing'
+}
+
 interface ErrorMessageProps {
   message: SDKAssistantMessage
   /** 重试回调（在当前会话内重试） */
-  onRetry?: () => void
+  onRetry?: (errorUuid?: string) => void
   /** 在新会话中重试回调（创建新会话并引用当前会话继续） */
   onRetryInNewSession?: () => void
   /** 压缩上下文回调（仅 prompt_too_long 错误使用） */
   onCompact?: () => void
+  onRelinkProjectRoot?: () => void
+  onRestoreProjectRoot?: () => void
 }
 
-function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: ErrorMessageProps): React.ReactElement {
-  const meta = extractMeta(message as unknown as SDKMessage)
+interface AssistantErrorTailProps {
+  message: SDKAssistantMessage
+  /** 重试回调（在当前会话内重试） */
+  onRetry?: (errorUuid?: string) => void
+  /** 在新会话中重试回调（创建新会话并引用当前会话继续） */
+  onRetryInNewSession?: () => void
+  /** 压缩上下文回调（仅 prompt_too_long 错误使用） */
+  onCompact?: () => void
+  onRelinkProjectRoot?: () => void
+  onRestoreProjectRoot?: () => void
+  /**
+   * 以「独立错误消息」形式渲染：正文用红色 MessageResponse 展示（用于 ErrorMessage 主体）。
+   *
+   * 以 tail 形式（默认 false）渲染时：正文本身已在上层用普通 MessageResponse 展示，这里只输出
+   * 错误标题 + 简短描述 + 诊断详情 + recovery 按钮，附一条分隔线。
+   */
+  standalone?: boolean
+}
+
+/**
+ * 助手消息的错误尾部（诊断详情 + recovery 按钮 + 简短错误描述）。
+ *
+ * 抽出这个组件是为了让「Pi runtime 已经吐了正文，但收尾时上游报错」这种混合消息
+ * 也能保留正文的 markdown 排版，同时把错误提示以尾部 banner 形式挂在最下面。
+ *
+ * standalone=true 时兼容旧 ErrorMessage 的行为：把 error.message / content 里的所有 text
+ * 一并作为红色 MessageResponse 渲染出来，用于「没有正文，只有错误」的场景。
+ */
+export function AssistantErrorTail({
+  message,
+  onRetry,
+  onRetryInNewSession,
+  onCompact,
+  onRelinkProjectRoot,
+  onRestoreProjectRoot,
+  standalone = false,
+}: AssistantErrorTailProps): React.ReactElement | null {
   const errorText = message.error?.message ?? '未知错误'
 
   const msgAny = message as unknown as Record<string, unknown>
@@ -1131,20 +1143,27 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
     ? (msgAny._errorActions as RecoveryAction[])
     : undefined
   const isPromptTooLong = errorCode === 'prompt_too_long'
+  const isLocalProjectRootUnavailable = errorCode === 'local_project_root_unavailable'
+  const activeSessionId = useAtomValue(activeSessionIdAtom)
+  const sessions = useAtomValue(agentSessionsAtom)
+  const workspaces = useAtomValue(agentWorkspacesAtom)
+  const activeWorkspaceId = sessions.find((session) => session.id === activeSessionId)?.workspaceId
+  const projectRootStatus = workspaces.find((workspace) => workspace.id === activeWorkspaceId)?.projectRootStatus
+  const canRestoreProjectRoot = shouldOfferProjectRootRestore(projectRootStatus)
 
   const setEnvDialogOpen = useSetAtom(environmentCheckDialogOpenAtom)
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const setSettingsTab = useSetAtom(settingsTabAtom)
+  const setModelSelectorOpen = useSetAtom(modelSelectorOpenAtom)
   const [detailsOpen, setDetailsOpen] = React.useState(false)
 
-  const contentText = message.message?.content
-    ?.filter((b) => b.type === 'text' && 'text' in b)
-    .map((b) => (b as { text: string }).text)
-    .join('\n') ?? errorText
+  // Error presentation always uses error.message. Assistant content is not error detail:
+  // Pi may have generated it before a stream failure.
+  const bodyText = errorText
   const isThinkingSignature = errorCode === THINKING_SIGNATURE_ERROR_CODE ||
-    isThinkingSignatureError(contentText, errorText)
+    isThinkingSignatureError(bodyText, errorText)
   const displayTitle = errorTitle ?? (isThinkingSignature ? THINKING_SIGNATURE_ERROR_TITLE : undefined)
-  const displayContentText = isThinkingSignature ? THINKING_SIGNATURE_ERROR_MESSAGE : contentText
+  const displayContentText = isThinkingSignature ? THINKING_SIGNATURE_ERROR_MESSAGE : bodyText
   const displayedErrorActions = (errorActions ?? []).filter((action) => {
     if (action.action === 'retry' && !onRetry) return false
     if (action.action === 'compact' && !onCompact) return false
@@ -1164,13 +1183,16 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
       case 'settings':
         setSettingsOpen(true)
         break
+      case 'select_model':
+        setModelSelectorOpen(true)
+        break
       case 'open_external':
         if (action.payload) {
           window.electronAPI.openExternal(action.payload)
         }
         break
       case 'retry':
-        onRetry?.()
+        onRetry?.(typeof message.uuid === 'string' ? message.uuid : undefined)
         break
       case 'compact':
         onCompact?.()
@@ -1190,6 +1212,8 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
       case 'open_channel_settings':
       case 'settings':
         return <Settings className="size-3.5 mr-1.5" />
+      case 'select_model':
+        return <Cpu className="size-3.5 mr-1.5" />
       case 'open_external':
         return <ExternalLink className="size-3.5 mr-1.5" />
       case 'retry':
@@ -1205,7 +1229,127 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
 
   const hasStructuredActions = displayedErrorActions.length > 0
   const hasLegacyActions = !!(onRetry || onRetryInNewSession || (isPromptTooLong && onCompact))
-  const hasActions = hasStructuredActions || hasLegacyActions
+  const hasProjectRootActions = isLocalProjectRootUnavailable && !!(
+    onRelinkProjectRoot || (canRestoreProjectRoot && onRestoreProjectRoot)
+  )
+  const hasActions = hasStructuredActions || hasLegacyActions || hasProjectRootActions
+
+  // tail 模式：给出上边距 + 顶部细边分隔线，让它视觉上是「正文之后的一段警告」而不是「消息本身」
+  const rootClass = standalone
+    ? undefined
+    : 'mt-3 pt-3 border-t border-destructive/20'
+
+  return (
+    <div className={rootClass}>
+      {displayTitle && (
+        <div className="text-sm font-medium text-destructive mb-1 flex items-center gap-1.5">
+          {!standalone && <AlertTriangle size={14} className="shrink-0" />}
+          {displayTitle}
+        </div>
+      )}
+      {standalone ? (
+        <div className="text-destructive">
+          <MessageResponse>{displayContentText}</MessageResponse>
+        </div>
+      ) : (
+        displayContentText && (
+          <div className="text-sm text-destructive/90 whitespace-pre-wrap break-words">
+            {displayContentText}
+          </div>
+        )
+      )}
+      {errorDetails && errorDetails.length > 0 && (
+        <div className="mt-2 text-[11px] text-muted-foreground">
+          <button
+            type="button"
+            onClick={() => setDetailsOpen((v) => !v)}
+            className="underline-offset-2 hover:underline"
+          >
+            {detailsOpen ? '收起诊断详情' : '查看诊断详情'}
+          </button>
+          {detailsOpen && (
+            <ul className="mt-1.5 space-y-0.5 list-disc list-inside">
+              {errorDetails.map((d, i) => (
+                <li key={i}>{d}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+      {hasActions && (
+        <div className="flex items-center flex-wrap gap-2 mt-3">
+          {hasProjectRootActions && (
+            <>
+              {onRelinkProjectRoot && (
+                <Button size="sm" onClick={onRelinkProjectRoot}>
+                  <FolderInput className="size-3.5 mr-1.5" />
+                  重新选择文件夹
+                </Button>
+              )}
+              {canRestoreProjectRoot && onRestoreProjectRoot && (
+                <Button size="sm" variant="outline" onClick={onRestoreProjectRoot}>
+                  <FolderPlus className="size-3.5 mr-1.5" />
+                  在原路径新建空文件夹
+                </Button>
+              )}
+            </>
+          )}
+          {hasStructuredActions &&
+            displayedErrorActions.map((a, i) => (
+              <Button
+                key={`${a.action}-${i}`}
+                size="sm"
+                variant={i === 0 ? 'default' : 'outline'}
+                onClick={() => handleRecoveryAction(a)}
+              >
+                {iconForAction(a.action)}
+                {a.label}
+              </Button>
+            ))}
+          {!hasStructuredActions && isPromptTooLong && onCompact && (
+            <Button size="sm" onClick={onCompact}>
+              <Minimize2 className="size-3.5 mr-1.5" />
+              压缩上下文
+            </Button>
+          )}
+          {!hasStructuredActions && isThinkingSignature && onRetryInNewSession && (
+            <Button
+              size="sm"
+              onClick={onRetryInNewSession}
+              title="新建对话并引用当前会话继续"
+            >
+              <Plus className="size-3.5 mr-1.5" />
+              在新对话继续
+            </Button>
+          )}
+          {!hasStructuredActions && onRetry && (
+            <Button size="sm" variant={isPromptTooLong || isThinkingSignature ? 'outline' : 'default'} onClick={() => onRetry(typeof message.uuid === 'string' ? message.uuid : undefined)}>
+              <RotateCw className="size-3.5 mr-1.5" />
+              重试
+            </Button>
+          )}
+          {!hasStructuredActions && !isThinkingSignature && onRetryInNewSession && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onRetryInNewSession}
+              title="如遇到未知错误，可点此按钮在新会话中尝试解决"
+            >
+              <Plus className="size-3.5 mr-1.5" />
+              在新会话中重试
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact, onRelinkProjectRoot, onRestoreProjectRoot }: ErrorMessageProps): React.ReactElement {
+  const meta = extractMeta(message as unknown as SDKMessage)
+
+  // Do not copy assistant content carried by an error record.
+  const copyText = message.error?.message ?? 'Unknown error'
 
   return (
     <Message from="assistant">
@@ -1219,82 +1363,18 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
         }
       />
       <MessageContent>
-        {displayTitle && (
-          <div className="text-sm font-medium text-destructive mb-1">{displayTitle}</div>
-        )}
-        <div className="text-destructive">
-          <MessageResponse>{displayContentText}</MessageResponse>
-        </div>
-        {errorDetails && errorDetails.length > 0 && (
-          <div className="mt-2 text-[11px] text-muted-foreground">
-            <button
-              type="button"
-              onClick={() => setDetailsOpen((v) => !v)}
-              className="underline-offset-2 hover:underline"
-            >
-              {detailsOpen ? '收起诊断详情' : '查看诊断详情'}
-            </button>
-            {detailsOpen && (
-              <ul className="mt-1.5 space-y-0.5 list-disc list-inside">
-                {errorDetails.map((d, i) => (
-                  <li key={i}>{d}</li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
-        {hasActions && (
-          <div className="flex items-center flex-wrap gap-2 mt-3">
-            {hasStructuredActions &&
-              displayedErrorActions.map((a, i) => (
-                <Button
-                  key={`${a.action}-${i}`}
-                  size="sm"
-                  variant={i === 0 ? 'default' : 'outline'}
-                  onClick={() => handleRecoveryAction(a)}
-                >
-                  {iconForAction(a.action)}
-                  {a.label}
-                </Button>
-              ))}
-            {!hasStructuredActions && isPromptTooLong && onCompact && (
-              <Button size="sm" onClick={onCompact}>
-                <Minimize2 className="size-3.5 mr-1.5" />
-                压缩上下文
-              </Button>
-            )}
-            {!hasStructuredActions && isThinkingSignature && onRetryInNewSession && (
-              <Button
-                size="sm"
-                onClick={onRetryInNewSession}
-                title="新建对话并引用当前会话继续"
-              >
-                <Plus className="size-3.5 mr-1.5" />
-                在新对话继续
-              </Button>
-            )}
-            {!hasStructuredActions && onRetry && (
-              <Button size="sm" variant={isPromptTooLong || isThinkingSignature ? 'outline' : 'default'} onClick={onRetry}>
-                <RotateCw className="size-3.5 mr-1.5" />
-                重试
-              </Button>
-            )}
-            {!hasStructuredActions && !isThinkingSignature && onRetryInNewSession && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={onRetryInNewSession}
-                title="如遇到未知错误，可点此按钮在新会话中尝试解决"
-              >
-                <Plus className="size-3.5 mr-1.5" />
-                在新会话中重试
-              </Button>
-            )}
-          </div>
-        )}
+        <AssistantErrorTail
+          message={message}
+          onRetry={onRetry}
+          onRetryInNewSession={onRetryInNewSession}
+          onCompact={onCompact}
+          onRelinkProjectRoot={onRelinkProjectRoot}
+          onRestoreProjectRoot={onRestoreProjectRoot}
+          standalone
+        />
       </MessageContent>
       <MessageActions className="pl-[46px] mt-0.5">
-        <CopyButton content={displayContentText} />
+        <CopyButton content={copyText} />
       </MessageActions>
     </Message>
   )
@@ -1305,17 +1385,25 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
 export interface MessageGroupRendererProps {
   group: MessageGroup
   allMessages: SDKMessage[]
-  /** 跨 turn 历史 TaskCreate id → subject 映射（由父组件 useMemo 算一次后传入） */
-  historicalTaskSubjects: Map<string, string>
+  /** 仅跨 turn 工具元数据变化时更新历史 assistant；普通 live 数组新引用不触发重渲染。 */
+  externalMetadataSignature?: string
   basePath?: string
   onFork?: (upToMessageUuid: string) => void
   onRewind?: (assistantMessageUuid: string) => void
-  /** 错误重试回调（仅当 turn 含错误消息时使用） */
-  onRetry?: () => void
+  /** 已发送的 Agent 历史引用 chip 请求定位时的精确范围。 */
+  onAgentHistoryQuoteClick?: (quote: QuotedSelection) => void
+  /** 将 assistant 回复标记为 Todo */
+  onCreateTodo?: (text: string) => void
+  /** 错误重试回调（传入本轮开始前应删除的错误 UUID） */
+  onRetry?: (errorUuid?: string) => void
   /** 在新会话中重试回调（仅当 turn 含错误消息时使用） */
   onRetryInNewSession?: () => void
   /** 压缩上下文回调（仅 prompt_too_long 错误使用） */
   onCompact?: () => void
+  onRelinkProjectRoot?: () => void
+  onRestoreProjectRoot?: () => void
+  /** 当前历史轮次；直接写入消息 DOM，避免划选时回扫整段历史。 */
+  historyTurn?: number
   /** 是否正在流式输出中（隐藏操作栏） */
   isStreaming?: boolean
   /** 是否被用户中断 */
@@ -1347,10 +1435,10 @@ export function getGroupId(group: MessageGroup): string {
     return messageIdCache.get(group.message)!
   }
   if (group.type === 'system') {
-    if (!messageIdCache.has(group.message)) {
-      messageIdCache.set(group.message, `system-${group.message.subtype ?? 'unknown'}-${++fallbackIdCounter}`)
+    if (!messageIdCache.has(group.identityMessage)) {
+      messageIdCache.set(group.identityMessage, `system-${group.identityMessage.subtype ?? 'unknown'}-${++fallbackIdCounter}`)
     }
-    return messageIdCache.get(group.message)!
+    return messageIdCache.get(group.identityMessage)!
   }
   // assistant-turn：取首条 assistant 消息的 uuid
   const first = group.assistantMessages[0]
@@ -1368,72 +1456,73 @@ export function getGroupId(group: MessageGroup): string {
   return `turn-empty-${++fallbackIdCounter}`
 }
 
-/**
- * 从 MessageGroup 中提取纯文本预览，供迷你地图使用
- */
-export function getGroupPreview(group: MessageGroup): string {
-  if (group.type === 'user') {
-    return stripScheduledRunMarker(extractUserText(group.message) ?? '')
-      .replace(/<attached_files>[\s\S]*?<\/attached_files>\n*/, '')
-      .replace(/<quoted_file[^>]*>[\s\S]*?<\/quoted_file>\n*/g, '')
-      .slice(0, 200)
-  }
-  if (group.type === 'system') {
-    if (group.message.subtype === 'compact_boundary') return '上下文已压缩'
-    if (group.message.subtype === 'compacting') return '正在压缩上下文...'
-    if (group.message.subtype === 'permission_denied') return '自动审批已拒绝操作'
-    return ''
-  }
-  // assistant-turn：收集所有 text 块
-  const texts: string[] = []
-  for (const aMsg of group.assistantMessages) {
-    const rawBlocks = aMsg.message?.content
-    if (!Array.isArray(rawBlocks)) continue
-    for (const block of normalizeThinkTagsInContentBlocks(rawBlocks)) {
-      if (block.type === 'text' && 'text' in block) {
-        texts.push((block as { text: string }).text)
-      }
-    }
-  }
-  return texts.join(' ').slice(0, 200)
-}
+// getGroupPreview 已迁移至 @proma/session-core（本文件从该包 import 并 re-export）
 
-export function MessageGroupRenderer({ group, allMessages, historicalTaskSubjects, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
+export const MessageGroupRenderer = React.memo(function MessageGroupRenderer({ group, allMessages, basePath, onFork, onRewind, onAgentHistoryQuoteClick, onCreateTodo, onRetry, onRetryInNewSession, onCompact, onRelinkProjectRoot, onRestoreProjectRoot, historyTurn, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
   const groupId = getGroupId(group)
 
   if (group.type === 'user') {
     return (
-      <div data-message-id={groupId} data-message-role="user">
-        <UserInputMessage message={group.message} />
+      <div data-message-id={groupId} data-message-role="user" data-message-turn={historyTurn}>
+        <UserInputMessage message={group.message} onAgentHistoryQuoteClick={onAgentHistoryQuoteClick} />
       </div>
     )
   }
 
   if (group.type === 'system') {
     const subtype = group.message.subtype
-    if (subtype === 'compact_boundary') return <div data-message-id={groupId}><CompactBoundaryDivider /></div>
-    if (subtype === 'compacting') return <div data-message-id={groupId}><CompactingIndicator /></div>
-    if (subtype === 'permission_denied') return <div data-message-id={groupId}><PermissionDeniedNotice message={group.message} /></div>
+    // system 消息同样需要稳定 DOM 锚点，保留既有历史引用与精确回跳能力。
+    const historySelectionAttributes = {
+      'data-message-id': groupId,
+      'data-message-role': 'system',
+      'data-message-turn': historyTurn,
+    }
+    if (getSDKCompactStatus(group.message)) return <div {...historySelectionAttributes}><CompactStatusNotice message={group.message} /></div>
+    if (subtype === 'permission_denied') return <div {...historySelectionAttributes}><PermissionDeniedNotice message={group.message} /></div>
     return null
   }
 
   // assistant-turn
   return (
-    <div data-message-id={groupId} data-message-role="assistant">
+    <div
+      data-message-id={groupId}
+      data-message-role="assistant"
+      data-message-turn={historyTurn}
+      data-agent-live={isStreaming ? 'true' : undefined}
+    >
       <AssistantTurnRenderer
         turn={group}
         allMessages={allMessages}
-        historicalTaskSubjects={historicalTaskSubjects}
         basePath={basePath}
         onFork={onFork}
         onRewind={onRewind}
+        onCreateTodo={onCreateTodo}
         onRetry={onRetry}
         onRetryInNewSession={onRetryInNewSession}
         onCompact={onCompact}
+        onRelinkProjectRoot={onRelinkProjectRoot}
+        onRestoreProjectRoot={onRestoreProjectRoot}
         isStreaming={isStreaming}
         stoppedByUser={stoppedByUser}
         sessionModelId={sessionModelId}
       />
     </div>
   )
-}
+}, (previous, next) => (
+  previous.group === next.group
+  && previous.basePath === next.basePath
+  && previous.onFork === next.onFork
+  && previous.onRewind === next.onRewind
+  && previous.onAgentHistoryQuoteClick === next.onAgentHistoryQuoteClick
+  && previous.onCreateTodo === next.onCreateTodo
+  && previous.onRetry === next.onRetry
+  && previous.onRetryInNewSession === next.onRetryInNewSession
+  && previous.onCompact === next.onCompact
+  && previous.onRelinkProjectRoot === next.onRelinkProjectRoot
+  && previous.onRestoreProjectRoot === next.onRestoreProjectRoot
+  && previous.historyTurn === next.historyTurn
+  && previous.isStreaming === next.isStreaming
+  && previous.stoppedByUser === next.stoppedByUser
+  && previous.sessionModelId === next.sessionModelId
+  && previous.externalMetadataSignature === next.externalMetadataSignature
+))

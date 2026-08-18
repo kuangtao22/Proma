@@ -188,12 +188,25 @@ export interface LanBridgeStreamChunk {
   text: string
 }
 
+/** 流式思考片段 */
+export interface LanBridgeStreamReasoning extends LanBridgeStreamChunk {}
+
 /** 工具调用开始 */
 export interface LanBridgeStreamToolStart {
   sessionId: string
+  toolUseId?: string
   toolName: string
   toolInput?: string
 }
+
+/** 工具调用参数增量 */
+export interface LanBridgeStreamToolDelta {
+  sessionId: string
+  toolInputDelta: string
+}
+
+/** 工具调用结束 */
+export interface LanBridgeStreamToolEnd extends LanBridgeStreamToolStart {}
 
 /** 流式完成 */
 export interface LanBridgeStreamComplete {

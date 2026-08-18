@@ -29,8 +29,10 @@ import {
   agentPendingPromptAtom,
 } from '@/atoms/agent-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
+import { appModeAtom } from '@/atoms/app-mode'
 import { useOpenSession } from '@/hooks/useOpenSession'
 import { useCreateSession } from '@/hooks/useCreateSession'
+import { sessionHoverPreviewEnabledAtom } from '@/atoms/ui-preferences'
 import {
   SessionMiniMapPopover,
   useSessionMiniMapHover,
@@ -39,6 +41,7 @@ import type {
   MessageSearchResult,
   AgentMessageSearchResult,
 } from '@proma/shared'
+import { findBestSearchMatch } from '@proma/shared'
 
 /** 标题搜索结果项 */
 interface TitleResult {
@@ -69,32 +72,20 @@ function isContentResult(result: SearchResult): result is ContentResult {
 
 /** 高亮文本中的匹配部分 */
 function HighlightText({ text, query }: { text: string; query: string }): React.ReactElement {
-  if (!query) return <>{text}</>
+  const match = findBestSearchMatch(text, query)
+  if (!match) return <>{text}</>
 
-  const lowerText = text.toLowerCase()
-  const lowerQuery = query.toLowerCase()
-  const parts: React.ReactNode[] = []
-  let lastIndex = 0
+  const before = text.slice(0, match.matchStart)
+  const matchedText = text.slice(match.matchStart, match.matchStart + match.matchLength)
+  const after = text.slice(match.matchStart + match.matchLength)
 
-  let idx = lowerText.indexOf(lowerQuery)
-  while (idx !== -1) {
-    if (idx > lastIndex) {
-      parts.push(text.slice(lastIndex, idx))
-    }
-    parts.push(
-      <mark key={idx} className="bg-primary/20 text-foreground rounded-sm px-0.5">
-        {text.slice(idx, idx + query.length)}
-      </mark>
-    )
-    lastIndex = idx + query.length
-    idx = lowerText.indexOf(lowerQuery, lastIndex)
-  }
-
-  if (lastIndex < text.length) {
-    parts.push(text.slice(lastIndex))
-  }
-
-  return <>{parts}</>
+  return (
+    <>
+      {before}
+      <mark className="bg-primary/20 text-foreground rounded-sm px-0.5">{matchedText}</mark>
+      {after}
+    </>
+  )
 }
 
 /** 高亮 snippet 中的匹配部分（使用预计算位置） */
@@ -131,6 +122,7 @@ interface SearchResultRowProps {
   index: number
   isSelected: boolean
   committedQuery: string
+  miniMapDisabled?: boolean
   getAgentWorkspaceName: (sessionId: string) => string | undefined
   onSelect: (result: SearchResult) => void
   onHover: (index: number) => void
@@ -141,11 +133,12 @@ function SearchResultRow({
   index,
   isSelected,
   committedQuery,
+  miniMapDisabled,
   getAgentWorkspaceName,
   onSelect,
   onHover,
 }: SearchResultRowProps): React.ReactElement {
-  const preview = useSessionMiniMapHover(400)
+  const preview = useSessionMiniMapHover(400, miniMapDisabled)
   const isContent = isContentResult(result)
   const wsName = result.type === 'agent' ? getAgentWorkspaceName(result.id) : undefined
 
@@ -214,8 +207,10 @@ export function SearchDialog(): React.ReactElement {
   const [open, setOpen] = useAtom(searchDialogOpenAtom)
   const conversations = useAtomValue(conversationsAtom)
   const agentSessions = useAtomValue(agentSessionsAtom)
+  const sessionHoverPreviewEnabled = useAtomValue(sessionHoverPreviewEnabledAtom)
   const agentWorkspaces = useAtomValue(agentWorkspacesAtom)
   const channels = useAtomValue(channelsAtom)
+  const appMode = useAtomValue(appModeAtom)
   const currentAgentChannelId = useAtomValue(agentChannelIdAtom)
   const setAgentPendingPrompt = useSetAtom(agentPendingPromptAtom)
   const setActiveView = useSetAtom(activeViewAtom)
@@ -294,15 +289,18 @@ export function SearchDialog(): React.ReactElement {
     setLoading(true)
     setSelectedIndex(0)
 
-    const qLower = q.toLowerCase()
-    const titles: TitleResult[] = [
-      ...conversations
-        .filter((c) => c.title.toLowerCase().includes(qLower))
-        .map((c) => ({ id: c.id, title: c.title, type: 'chat' as const, archived: c.archived, updatedAt: c.updatedAt })),
-      ...agentSessions
-        .filter((s) => s.title.toLowerCase().includes(qLower))
-        .map((s) => ({ id: s.id, title: s.title, type: 'agent' as const, archived: s.archived, updatedAt: s.updatedAt })),
-    ]
+    const isChatMode = appMode === 'chat'
+    const isAgentMode = appMode === 'agent'
+    const matchesTitle = (title: string): boolean => findBestSearchMatch(title, q) !== null
+    const titles: TitleResult[] = (isChatMode
+      ? conversations
+        .filter((c) => matchesTitle(c.title))
+        .map((c) => ({ id: c.id, title: c.title, type: 'chat' as const, archived: c.archived, updatedAt: c.updatedAt }))
+      : isAgentMode
+        ? agentSessions
+          .filter((s) => matchesTitle(s.title))
+          .map((s) => ({ id: s.id, title: s.title, type: 'agent' as const, archived: s.archived, updatedAt: s.updatedAt }))
+        : [])
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .slice(0, 20)
 
@@ -310,8 +308,8 @@ export function SearchDialog(): React.ReactElement {
 
     try {
       const [chatResults, agentResults] = await Promise.all([
-        window.electronAPI.searchConversationMessages(q),
-        window.electronAPI.searchAgentSessionMessages(q),
+        isChatMode ? window.electronAPI.searchConversationMessages(q) : Promise.resolve([]),
+        isAgentMode ? window.electronAPI.searchAgentSessionMessages(q) : Promise.resolve([]),
       ])
       if (token !== searchTokenRef.current) return
 
@@ -348,7 +346,7 @@ export function SearchDialog(): React.ReactElement {
     } finally {
       if (token === searchTokenRef.current) setLoading(false)
     }
-  }, [query, conversations, agentSessions])
+  }, [query, conversations, agentSessions, appMode])
 
   const handleAgentSearch = React.useCallback(async () => {
     const q = query.trim()
@@ -470,13 +468,13 @@ export function SearchDialog(): React.ReactElement {
         <DialogPortal>
           <div
             aria-hidden
-            className="fixed inset-0 z-[99] bg-black/40 backdrop-blur-sm pointer-events-none animate-in fade-in-0 duration-150"
+            className="fixed inset-0 z-[99] bg-black/40 pointer-events-none animate-in fade-in-0 duration-150"
           />
         </DialogPortal>
       )}
       <DialogContent
         hideClose
-        className="sm:max-w-[520px] p-0 gap-0 overflow-hidden"
+        className="w-[min(720px,calc(100vw_-_32px))] sm:max-w-[720px] p-0 gap-0 overflow-hidden"
         aria-describedby={undefined}
       >
         <DialogTitle className="sr-only">搜索对话</DialogTitle>
@@ -491,7 +489,7 @@ export function SearchDialog(): React.ReactElement {
             onCompositionEnd={handleCompositionEnd}
             onKeyDown={handleKeyDown}
             placeholder="输入关键词，按 Enter 或点击搜索"
-            className="flex-1 bg-transparent text-[14px] text-foreground placeholder:text-foreground/40 outline-none"
+            className="min-w-0 flex-1 bg-transparent text-[14px] text-foreground placeholder:text-foreground/40 outline-none"
           />
           {query && (
             <button
@@ -506,7 +504,7 @@ export function SearchDialog(): React.ReactElement {
             onClick={() => void runSearch()}
             disabled={!canSearch}
             className={cn(
-              'flex items-center gap-1 px-2 py-1 rounded text-[12px] font-medium transition-colors',
+              'flex shrink-0 items-center gap-1 px-2 py-1 rounded text-[12px] font-medium transition-colors',
               canSearch
                 ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                 : 'bg-foreground/[0.06] text-foreground/30 cursor-not-allowed'
@@ -520,7 +518,7 @@ export function SearchDialog(): React.ReactElement {
             disabled={trimmedQuery.length < 2}
             title="适合在精准搜索找不到的情况下使用，Agent 会帮助你搜索整个 Proma 会话空间"
             className={cn(
-              'flex items-center gap-1 px-2 py-1 rounded text-[12px] font-medium transition-colors',
+              'flex shrink-0 items-center gap-1 px-2 py-1 rounded text-[12px] font-medium transition-colors',
               trimmedQuery.length >= 2
                 ? 'bg-blue-500/10 text-blue-500 hover:bg-blue-500/20'
                 : 'bg-foreground/[0.06] text-foreground/30 cursor-not-allowed'
@@ -577,6 +575,7 @@ export function SearchDialog(): React.ReactElement {
                   index={idx}
                   isSelected={selectedIndex === idx}
                   committedQuery={committedQuery}
+                  miniMapDisabled={!sessionHoverPreviewEnabled}
                   getAgentWorkspaceName={getAgentWorkspaceName}
                   onSelect={navigateToResult}
                   onHover={setSelectedIndex}
@@ -599,6 +598,7 @@ export function SearchDialog(): React.ReactElement {
                   index={titleResults.length + i}
                   isSelected={selectedIndex === titleResults.length + i}
                   committedQuery={committedQuery}
+                  miniMapDisabled={!sessionHoverPreviewEnabled}
                   getAgentWorkspaceName={getAgentWorkspaceName}
                   onSelect={navigateToResult}
                   onHover={setSelectedIndex}

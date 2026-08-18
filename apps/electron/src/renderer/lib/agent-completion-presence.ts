@@ -1,3 +1,4 @@
+import type { AgentSessionMeta, AgentStreamCompletePayload } from '@proma/shared'
 import type { TabItem } from '@/atoms/tab-atoms'
 
 export interface AgentCompletionPresenceInput {
@@ -5,12 +6,50 @@ export interface AgentCompletionPresenceInput {
   activeTabId: string | null
   currentAgentSessionId: string | null
   sessionId: string
+  /** 委派子会话由父会话汇总，不计入用户级未读完成。 */
+  session?: Pick<AgentSessionMeta, 'sourceDelegationId'>
   /** 完成发生时应用窗口是否处于前台。窗口失焦时即使是当前 Tab 也不算"正在查看"。 */
   documentHasFocus: boolean
 }
 
 export interface AgentCompletionMarkers {
   markUnviewedCompleted: boolean
+}
+
+export interface AgentCompletionNotificationInput {
+  completion: AgentStreamCompletePayload
+  session?: Pick<AgentSessionMeta, 'sourceDelegationId'>
+}
+
+export interface NotifyAgentCompletionInput extends AgentCompletionNotificationInput {
+  hasStreamError: boolean
+  notify: () => void
+}
+
+/** 仅顶层 Agent 会话完成属于用户级任务完成提醒边界 */
+export function shouldNotifyAgentCompletion({
+  completion,
+  session,
+}: AgentCompletionNotificationInput): boolean {
+  return completion.triggeredBy !== 'delegation' && !session?.sourceDelegationId
+}
+
+/** 仅在真正成功且无需等待后台任务时调用完成通知 callback */
+export function notifyAgentCompletion({
+  completion,
+  session,
+  hasStreamError,
+  notify,
+}: NotifyAgentCompletionInput): void {
+  const isSuccessfulCompletion = !completion.stoppedByUser &&
+    !hasStreamError &&
+    (!completion.resultSubtype || completion.resultSubtype === 'success')
+
+  if (!completion.backgroundTasksPending &&
+    isSuccessfulCompletion &&
+    shouldNotifyAgentCompletion({ completion, session })) {
+    notify()
+  }
 }
 
 /** 判断 Agent 完成时用户是否仍停留在该会话入口 */
@@ -37,6 +76,6 @@ export function isAgentSessionActiveForCompletion({
 export function getAgentCompletionMarkers(input: AgentCompletionPresenceInput): AgentCompletionMarkers {
   const isActiveSession = isAgentSessionActiveForCompletion(input)
   return {
-    markUnviewedCompleted: !isActiveSession,
+    markUnviewedCompleted: !input.session?.sourceDelegationId && !isActiveSession,
   }
 }

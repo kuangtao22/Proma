@@ -63,7 +63,24 @@ function isSameLocalDay(a: number, b: number): boolean {
   )
 }
 
+function formatWeekdays(days?: number[]): string {
+  const normalized = [...new Set(days ?? [])].sort((a, b) => a - b)
+  if (normalized.length === 0) return '每天'
+  if (normalized.join(',') === '1,2,3,4,5') return '工作日'
+  if (normalized.join(',') === '0,6') return '周末'
+  const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+  return normalized.map((day) => names[day] ?? '').join('、')
+}
+
 function formatScheduleLabel(a: Automation): string {
+  if (a.scheduleType === 'once') {
+    const when = a.scheduledAt
+      ? new Date(a.scheduledAt).toLocaleString('zh-CN', {
+          month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+        })
+      : '指定时间'
+    return `仅运行一次（${when}）`
+  }
   if (a.scheduleType === 'daily') return `每天 ${a.timeOfDay ?? '09:00'}`
   if (a.scheduleType === 'weekly') {
     const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
@@ -71,9 +88,10 @@ function formatScheduleLabel(a: Automation): string {
   }
   if (a.scheduleType === 'monthly') return `每月 ${a.dayOfMonth ?? 1} 号 ${a.timeOfDay ?? '09:00'}`
   const min = a.intervalMinutes
-  if (min < 60) return `每 ${min} 分钟`
-  if (min < 1440) return `每 ${min / 60} 小时`
-  return `每 ${min / 1440} 天`
+  const intervalLabel = min < 60 ? `每 ${min} 分钟` : min < 1440 ? `每 ${min / 60} 小时` : `每 ${min / 1440} 天`
+  const weekdayLabel = a.activeWeekdays && a.activeWeekdays.length > 0 ? `，${formatWeekdays(a.activeWeekdays)}` : ''
+  const windowLabel = a.activeWindowStart && a.activeWindowEnd ? `，${a.activeWindowStart}–${a.activeWindowEnd}` : ''
+  return `${intervalLabel}${weekdayLabel}${windowLabel}`
 }
 
 let tickTimer: NodeJS.Timeout | undefined
@@ -119,7 +137,12 @@ export async function runAutomation(automation: Automation, manual = false): Pro
     const sessionMode = automation.sessionMode ?? AUTOMATION_DEFAULT_SESSION_MODE
 
     let reuseSessionId: string | undefined
-    if (automation.lastSessionId && getAgentSessionMeta(automation.lastSessionId)) {
+    const lastSessionMeta = automation.lastSessionId ? getAgentSessionMeta(automation.lastSessionId) : undefined
+    // 已被用户手动接管（毕业）的会话不再复用，强制新建，避免把定时任务消息注入用户的私人会话
+    if (lastSessionMeta?.automationGraduated) {
+      console.log(`[定时任务] ${automation.name} 上次会话已被用户接管，本次自动开新会话`)
+    }
+    if (automation.lastSessionId && lastSessionMeta && !lastSessionMeta.automationGraduated) {
       if (sessionMode === 'reuse') {
         reuseSessionId = automation.lastSessionId
       } else if (
@@ -147,6 +170,7 @@ export async function runAutomation(automation: Automation, manual = false): Pro
       targetSessionId = created.id
       setLastSessionId(automation.id, created.id)
     }
+
 
     await new Promise<void>((resolveRun) => {
       let settled = false
@@ -233,7 +257,7 @@ export async function runAutomationNow(id: string): Promise<void> {
   if (!automation) throw new Error(`定时任务不存在: ${id}`)
   // 草稿态（缺 channelId / workspaceId）拒绝运行，兜底前端 disabled 防止 IPC 绕过
   if (!automation.channelId || !automation.workspaceId) {
-    throw new Error('请先为该任务配置模型与工作区')
+    throw new Error('请先为该任务配置模型与项目')
   }
   await runAutomation(automation, true)
 }

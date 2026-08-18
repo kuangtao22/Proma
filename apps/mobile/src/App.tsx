@@ -9,8 +9,6 @@ import { connect, onPush, onOpen, wsReq, close } from './lib/ws-client'
 import { AuthPage } from './components/layout/AuthPage'
 import { AppShell } from './components/layout/AppShell'
 
-declare global { interface Window { __PROMO_PIN__?: string } }
-
 interface ConvListResponse { conversations: ConvItem[] }
 interface SessionListResponse { sessions: ConvItem[] }
 interface WorkspaceListResponse { workspaces: Array<{ id: string; name: string; slug: string }> }
@@ -35,7 +33,7 @@ export function App() {
     return () => window.removeEventListener('proma:auth-expired', handler)
   }, [setToken, setConnected, setView])
 
-  // 页面加载时自动连接 + 智能认证（含重连后重新认证）
+  // 页面加载时自动连接，并优先恢复已保存的认证 Token。
   useEffect(() => {
     const storedToken = localStorage.getItem('proma_mobile_token')
     const storedView = localStorage.getItem('proma_mobile_view') as View | null
@@ -53,19 +51,6 @@ export function App() {
             return
           }
         } catch { /* fall through */ }
-      }
-
-      // 内置页面：用注入的 PIN 自动配对
-      const injectedPin = window.__PROMO_PIN__
-      if (injectedPin && injectedPin.length === 6 && /^\d{6}$/.test(injectedPin)) {
-        try {
-          const pair = await wsReq('auth.pair', { pin: injectedPin }) as { token: string }
-          localStorage.setItem('proma_mobile_token', pair.token)
-          setToken(pair.token); setConnected(true)
-          setView('chat')
-          restoreActiveConv()
-          return
-        } catch { /* fall through to manual auth */ }
       }
 
       setToken(null); setConnected(false); setView('auth')

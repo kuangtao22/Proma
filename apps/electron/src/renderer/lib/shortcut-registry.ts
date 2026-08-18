@@ -141,8 +141,9 @@ let parsedCache = new Map<string, ParsedAccelerator>()
 function rebuildCache(): void {
   parsedCache = new Map()
   for (const def of DEFAULT_SHORTCUTS) {
-    // 全局快捷键由主进程 globalShortcut 处理，不在渲染进程注册
-    if (def.global) continue
+    // 全局快捷键通常由主进程处理；声明本地回退的组合仍注册 keydown，
+    // 以便系统拒绝全局注册时保留应用内行为。
+    if (def.global && !def.localFallback) continue
     const accel = getActiveAccelerator(def.id)
     // 用户已禁用的快捷键不进入分发缓存
     if (accel === null) continue
@@ -265,21 +266,21 @@ export function getActiveAccelerator(id: string): string | null {
  */
 export function getAcceleratorDisplay(accelerator: string | null): string {
   if (!accelerator) return ''
-  if (isMac) {
-    return accelerator
-      .split('+')
-      .map((part) => {
-        const normalized = part.trim().toLowerCase()
-        if (['cmd', 'command', 'meta', 'super'].includes(normalized)) return '⌘'
-        if (['ctrl', 'control'].includes(normalized)) return '⌃'
-        if (normalized === 'shift') return '⇧'
-        if (['alt', 'option'].includes(normalized)) return '⌥'
-        if (normalized === 'backspace') return '⌫'
-        return part
-      })
-      .join('')
-  }
   return accelerator
+    .split('+')
+    .map((part) => {
+      const normalized = part.trim().toLowerCase()
+      if (normalized === 'plus') return '+'
+      if (normalized === 'minus') return '−'
+      if (!isMac) return part
+      if (['cmd', 'command', 'meta', 'super'].includes(normalized)) return '⌘'
+      if (['ctrl', 'control'].includes(normalized)) return '⌃'
+      if (normalized === 'shift') return '⇧'
+      if (['alt', 'option'].includes(normalized)) return '⌥'
+      if (normalized === 'backspace') return '⌫'
+      return part
+    })
+    .join(isMac ? '' : '+')
 }
 
 /**

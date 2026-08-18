@@ -7,6 +7,7 @@
 
 import * as React from 'react'
 import { ArrowLeft, Loader2, CheckCircle2, XCircle, AlertCircle } from 'lucide-react'
+import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import type { McpServerEntry, McpTransportType, WorkspaceMcpConfig } from '@proma/shared'
@@ -30,6 +31,7 @@ interface McpServerFormProps {
   /** 当前工作区 slug */
   workspaceSlug: string
   onSaved: () => void
+  onChanged?: () => void
   onCancel: () => void
 }
 
@@ -71,7 +73,54 @@ function serializeKeyValueText(record: Record<string, string> | undefined, separ
     .join('\n')
 }
 
-export function McpServerForm({ server, workspaceSlug, onSaved, onCancel }: McpServerFormProps): React.ReactElement {
+interface McpFormValues {
+  transportType: McpTransportType
+  enabled: boolean
+  testResult: { success: boolean; message: string; timestamp?: number } | null
+  isBuiltin: boolean
+  command: string
+  argsText: string
+  envText: string
+  timeoutStr: string
+  url: string
+  headersText: string
+}
+
+/** 根据当前表单值构建 McpServerEntry */
+function buildEntryFromValues(values: McpFormValues, includeTestResult = false): McpServerEntry {
+  const base: McpServerEntry = {
+    type: values.transportType,
+    enabled: values.enabled,
+    ...(values.isBuiltin && { isBuiltin: true }),
+    ...(includeTestResult && values.testResult && {
+      lastTestResult: {
+        ...values.testResult,
+        timestamp: values.testResult.timestamp ?? Date.now(),
+      },
+    }),
+  }
+
+  if (values.transportType === 'stdio') {
+    base.command = values.command.trim()
+    const args = values.argsText
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (args.length > 0) base.args = args
+    const env = parseKeyValueText(values.envText, '=')
+    if (Object.keys(env).length > 0) base.env = env
+    const timeout = parseInt(values.timeoutStr, 10)
+    if (!isNaN(timeout) && timeout > 0) base.timeout = timeout
+  } else {
+    base.url = values.url.trim()
+    const headers = parseKeyValueText(values.headersText, ':')
+    if (Object.keys(headers).length > 0) base.headers = headers
+  }
+
+  return base
+}
+
+export function McpServerForm({ server, workspaceSlug, onSaved, onChanged, onCancel }: McpServerFormProps): React.ReactElement {
   const isEdit = server !== null
   const isBuiltin = server?.entry.isBuiltin === true
 
@@ -95,67 +144,156 @@ export function McpServerForm({ server, workspaceSlug, onSaved, onCancel }: McpS
   // UI 状态
   const [saving, setSaving] = React.useState(false)
   const [testing, setTesting] = React.useState(false)
-  const [testResult, setTestResult] = React.useState<{ success: boolean; message: string } | null>(
+  const [testResult, setTestResult] = React.useState<{ success: boolean; message: string; timestamp?: number } | null>(
     server?.entry.lastTestResult ?? null
   )
 
-  // 监听配置改变，清空测试结果（避免使用过期的测试结果）
+  // 自动保存状态（仅编辑模式）
+  const AUTO_SAVE_DELAY = 600
+  const autoSaveTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const isFirstRenderRef = React.useRef(true)
+  const mountedRef = React.useRef(true)
+  const [saveStatus, setSaveStatus] = React.useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const lastSavedEnabledRef = React.useRef(server?.entry.enabled ?? false)
+
+  // 保留最新表单值，供 unmount 时 flush 待保存变更
+  const latestValuesRef = React.useRef({
+    name, transportType, command, url, argsText, envText, headersText, timeoutStr, enabled, testResult, isBuiltin,
+  })
+  React.useEffect(() => {
+    latestValuesRef.current = {
+      name, transportType, command, url, argsText, envText, headersText, timeoutStr, enabled, testResult, isBuiltin,
+    }
+  }, [name, transportType, command, url, argsText, envText, headersText, timeoutStr, enabled, testResult, isBuiltin])
+
+  // 监听配置改变，清空测试结果（避免展示过期的测试结果）
   React.useEffect(() => {
     if (!server) return // 新建时不需要清空
 
     // 检查关键配置是否改变（包括连接相关的所有字段）
+    // 注意：server.entry.command/url 可能为 undefined，需要与空字符串统一比较
     const configChanged =
       transportType !== server.entry.type ||
-      (transportType === 'stdio' && command !== server.entry.command) ||
-      (transportType !== 'stdio' && url !== server.entry.url) ||
+      (transportType === 'stdio' && command !== (server.entry.command ?? '')) ||
+      (transportType !== 'stdio' && url !== (server.entry.url ?? '')) ||
       argsText !== (server.entry.args?.join(', ') ?? '') ||
       envText !== serializeKeyValueText(server.entry.env, '=') ||
       headersText !== serializeKeyValueText(server.entry.headers, ':')
 
     if (configChanged) {
       setTestResult(null)
-      setEnabled(false) // 配置改变时自动关闭开关
     }
   }, [transportType, command, url, argsText, envText, headersText, server])
 
   /** 构建 McpServerEntry */
   const buildEntry = (includeTestResult = false): McpServerEntry => {
-    const base: McpServerEntry = {
-      type: transportType,
-      // 关键保护：只有测试成功才能启用
-      enabled: enabled && testResult?.success === true,
-      // 保留内置标记
-      ...(isBuiltin && { isBuiltin: true }),
-      // 保存测试结果
-      ...(includeTestResult && testResult && {
-        lastTestResult: {
-          ...testResult,
-          timestamp: Date.now(),
-        },
-      }),
-    }
-
-    if (transportType === 'stdio') {
-      base.command = command.trim()
-      const args = argsText
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean)
-      if (args.length > 0) base.args = args
-      const env = parseKeyValueText(envText, '=')
-      if (Object.keys(env).length > 0) base.env = env
-      const timeout = parseInt(timeoutStr, 10)
-      if (!isNaN(timeout) && timeout > 0) base.timeout = timeout
-    } else {
-      base.url = url.trim()
-      const headers = parseKeyValueText(headersText, ':')
-      if (Object.keys(headers).length > 0) base.headers = headers
-    }
-
-    return base
+    return buildEntryFromValues(
+      {
+        transportType,
+        enabled,
+        testResult,
+        isBuiltin,
+        command,
+        argsText,
+        envText,
+        timeoutStr,
+        url,
+        headersText,
+      },
+      includeTestResult,
+    )
   }
 
-  /** 测试连接 */
+  const saveGenerationRef = React.useRef(0)
+
+  /** 执行自动保存 */
+  const doSaveEntry = React.useCallback(async (serverName: string, entry: McpServerEntry) => {
+    const generation = ++saveGenerationRef.current
+    try {
+      const config = await window.electronAPI.getWorkspaceMcpConfig(workspaceSlug)
+      const newConfig: WorkspaceMcpConfig = {
+        servers: { ...config.servers, [serverName]: entry },
+      }
+      await window.electronAPI.saveWorkspaceMcpConfig(workspaceSlug, newConfig)
+      if (generation === saveGenerationRef.current && mountedRef.current) {
+        if (entry.enabled !== lastSavedEnabledRef.current) {
+          lastSavedEnabledRef.current = entry.enabled
+          onChanged?.()
+        }
+        setSaveStatus('saved')
+        setTimeout(() => {
+          if (generation === saveGenerationRef.current && mountedRef.current) {
+            setSaveStatus('idle')
+          }
+        }, 3000)
+      }
+    } catch (error) {
+      console.error('[MCP 表单] 自动保存失败:', error)
+      if (generation === saveGenerationRef.current && mountedRef.current) {
+        toast.error('自动保存失败')
+        setSaveStatus('error')
+      }
+    }
+  }, [workspaceSlug, onChanged])
+
+  const doSaveEntryRef = React.useRef(doSaveEntry)
+  React.useEffect(() => { doSaveEntryRef.current = doSaveEntry }, [doSaveEntry])
+
+  // 编辑模式下监听字段变化，防抖自动保存
+  React.useEffect(() => {
+    if (!isEdit) return
+    // 首次渲染跳过，避免加载时触发 auto-save
+    if (isFirstRenderRef.current) {
+      isFirstRenderRef.current = false
+      return
+    }
+    const serverName = name.trim()
+    if (!serverName) return
+    if (transportType === 'stdio' && !command.trim()) return
+    if (transportType !== 'stdio' && !url.trim()) return
+    setSaveStatus('idle')
+    autoSaveTimerRef.current = setTimeout(() => {
+      const vals = latestValuesRef.current
+      const entry = buildEntryFromValues(vals, true)
+      void doSaveEntryRef.current(vals.name.trim(), entry)
+    }, AUTO_SAVE_DELAY)
+    return () => {
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current)
+        autoSaveTimerRef.current = null
+      }
+    }
+  }, [
+    isEdit,
+    name,
+    transportType,
+    command,
+    url,
+    argsText,
+    envText,
+    headersText,
+    timeoutStr,
+    enabled,
+    testResult,
+  ])
+
+  // 组件卸载时 flush 待保存的变更，并标记 unmounted
+  React.useEffect(() => {
+    return () => {
+      mountedRef.current = false
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current)
+        autoSaveTimerRef.current = null
+        const vals = latestValuesRef.current
+        const serverName = vals.name.trim()
+        if (!serverName) return
+        if (vals.transportType === 'stdio' && !vals.command.trim()) return
+        if (vals.transportType !== 'stdio' && !vals.url.trim()) return
+        const entry = buildEntryFromValues(vals, true)
+        void doSaveEntryRef.current(serverName, entry)
+      }
+    }
+  }, [])
   const handleTest = async (): Promise<void> => {
     const serverName = name.trim()
     if (!serverName) return
@@ -173,20 +311,23 @@ export function McpServerForm({ server, workspaceSlug, onSaved, onCancel }: McpS
       setTestResult({
         success: result.success,
         message: result.message,
+        timestamp: Date.now(),
       })
     } catch (error) {
       setTestResult({
         success: false,
         message: error instanceof Error ? error.message : '测试失败',
+        timestamp: Date.now(),
       })
     } finally {
       setTesting(false)
     }
   }
 
-  /** 提交表单 */
+  /** 提交表单（仅创建模式） */
   const handleSubmit = async (e: React.FormEvent): Promise<void> => {
     e.preventDefault()
+    if (isEdit) return
 
     const serverName = name.trim()
     if (!serverName) return
@@ -195,19 +336,13 @@ export function McpServerForm({ server, workspaceSlug, onSaved, onCancel }: McpS
     if (transportType === 'stdio' && !command.trim()) return
     if (transportType !== 'stdio' && !url.trim()) return
 
-    // 警告：如果用户试图启用但测试未成功
-    if (enabled && !testResult?.success) {
-      console.warn('[MCP 表单] 用户试图启用未测试成功的 MCP，将强制禁用')
-    }
-
     setSaving(true)
     try {
       // 读取现有配置
       const config = await window.electronAPI.getWorkspaceMcpConfig(workspaceSlug)
       const entry = buildEntry(true) // 保存时包含测试结果
 
-      // 日志记录实际保存的状态
-      console.log(`[MCP 表单] 保存 MCP: ${serverName}, enabled: ${entry.enabled}, testResult: ${testResult?.success}`)
+      console.log(`[MCP 表单] 保存 MCP: ${serverName}, enabled: ${entry.enabled}, testResult: ${testResult?.success ?? '未测试'}`)
 
       const newConfig: WorkspaceMcpConfig = {
         servers: {
@@ -237,43 +372,60 @@ export function McpServerForm({ server, workspaceSlug, onSaved, onCancel }: McpS
     return canSubmit()
   }
 
+  /** 返回/关闭：编辑模式下先 flush 待保存变更 */
+  const handleCancel = async (): Promise<void> => {
+    if (isEdit && autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current)
+      autoSaveTimerRef.current = null
+      const vals = latestValuesRef.current
+      const serverName = vals.name.trim()
+      if (serverName) {
+        const isValid =
+          (vals.transportType === 'stdio' && vals.command.trim()) ||
+          (vals.transportType !== 'stdio' && vals.url.trim())
+        if (isValid) {
+          const entry = buildEntryFromValues(vals, true)
+          await doSaveEntryRef.current(serverName, entry)
+        }
+      }
+    }
+    onCancel()
+  }
+
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
       {/* 标题栏 + 操作按钮 */}
       <div className="flex items-center gap-3">
-        <Button variant="ghost" size="icon" className="h-8 w-8" type="button" onClick={onCancel}>
+        <Button variant="ghost" size="icon" className="h-8 w-8" type="button" onClick={() => void handleCancel()}>
           <ArrowLeft size={18} />
         </Button>
         <h3 className="text-lg font-medium text-foreground flex-1">
           {isEdit ? '编辑 MCP 服务器' : '添加 MCP 服务器'}
         </h3>
-        <div className="flex items-center gap-2">
-          <Button variant="ghost" size="sm" type="button" onClick={onCancel}>
-            取消
-          </Button>
+        {isEdit && (saveStatus === 'saved' || saveStatus === 'error') && (
+          <div className={cn(
+            'flex items-center gap-1.5 text-xs',
+            saveStatus === 'error' ? 'text-destructive' : 'text-muted-foreground',
+          )}>
+            {saveStatus === 'saved' && <CheckCircle2 size={12} className="text-emerald-600" />}
+            {saveStatus === 'error' && <XCircle size={12} />}
+            <span>
+              {saveStatus === 'saved' && '已保存'}
+              {saveStatus === 'error' && '保存失败'}
+            </span>
+          </div>
+        )}
+        {!isEdit && (
           <Button size="sm" type="submit" disabled={saving || !canSubmit()}>
             {saving && <Loader2 size={14} className="animate-spin" />}
-            <span>{isEdit ? '保存修改' : '创建服务器'}</span>
+            <span>创建服务器</span>
           </Button>
-        </div>
+        )}
       </div>
 
       {/* 基本信息 */}
       <SettingsSection title="基本信息">
         <SettingsCard>
-          {/* 内置 MCP 引导提示 */}
-          {isBuiltin && (
-            <div className="px-4 py-3 text-sm bg-blue-500/10 text-blue-700 dark:text-blue-400 rounded-md mx-4 mt-3">
-              <div className="font-medium">内置记忆服务 (MemOS Cloud)</div>
-              <div className="text-xs mt-1 opacity-90">
-                前往 <a href="https://memos-dashboard.openmem.net/apikeys/" target="_blank" rel="noopener noreferrer" className="underline">memos-dashboard.openmem.net</a> 注册并获取 API Key 和 User ID，填入下方环境变量后启用。
-              </div>
-              <div className="text-xs mt-2 opacity-80 space-y-0.5">
-                <div><code className="font-mono">MEMOS_API_KEY</code> — 你的 API 密钥，在控制台 API Keys 页面生成</div>
-                <div><code className="font-mono">MEMOS_USER_ID</code> — 你的用户 ID，在控制台个人设置中查看</div>
-              </div>
-            </div>
-          )}
           <SettingsInput
             label="服务器名称"
             value={name}
@@ -368,7 +520,7 @@ export function McpServerForm({ server, workspaceSlug, onSaved, onCancel }: McpS
               <div>
                 <div className="text-sm font-medium text-foreground">连接测试</div>
                 <div className="text-xs text-muted-foreground mt-0.5">
-                  必须测试成功后才能启用
+                  可选的诊断工具；测试结果不会影响 MCP 是否启用
                 </div>
               </div>
               <Button
@@ -412,7 +564,7 @@ export function McpServerForm({ server, workspaceSlug, onSaved, onCancel }: McpS
               <div className="flex items-start gap-2 px-3 py-2 rounded-md text-sm bg-amber-500/10 text-amber-700 dark:text-amber-400">
                 <AlertCircle size={16} className="mt-0.5 shrink-0" />
                 <div className="text-xs">
-                  尚未测试连接。请先点击"测试连接"按钮验证配置是否正确。
+                  尚未测试连接。如需排查配置，可以点击"测试连接"。
                 </div>
               </div>
             )}
@@ -424,11 +576,10 @@ export function McpServerForm({ server, workspaceSlug, onSaved, onCancel }: McpS
             description={
               testResult?.success
                 ? '开启后该 MCP 服务器将在 Agent 会话中加载'
-                : '只有测试成功后才能启用'
+                : '开启后该 MCP 服务器将在 Agent 会话中加载；如配置有误，Agent 会按运行时错误提示处理'
             }
             checked={enabled}
             onCheckedChange={setEnabled}
-            disabled={!testResult?.success}
           />
         </SettingsCard>
       </SettingsSection>

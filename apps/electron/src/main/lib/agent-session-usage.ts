@@ -81,7 +81,8 @@ export function getSessionContextUsageRatio(sessionId: string): number | undefin
       const usage = asst.message?.usage
       if (!usage) continue
       const usedTokens = sumUsedTokens(usage)
-      const contextWindow = inferContextWindow(asst.message?.model)
+      const modelId = asst._channelModelId ?? asst.message?.model
+      const contextWindow = inferContextWindow(modelId)
       return calculateContextUsageRatio(usedTokens, contextWindow)
     }
   }
@@ -98,13 +99,15 @@ export function getSessionContextUsageRatio(sessionId: string): number | undefin
  *   - 单 entry（常态）：行为与从前一致
  *   - 多 entry：避免被子 agent 的小窗口拉低、过早误触发 daily 切换阈值
  *
- * 每个 entry 优先用 SDK 实测的 contextWindow，缺失时按 modelId 推断。
+ * 每个 entry 优先用 SDK 实测的 contextWindow，缺失时按本次 Agent provider 的运行窗口推断。
  */
 function pickResultContextWindow(result: SDKResultMessage): number | undefined {
   if (!result.modelUsage) return undefined
   let best: number | undefined
   for (const [modelId, info] of Object.entries(result.modelUsage)) {
-    const win = info?.contextWindow ?? inferContextWindow(modelId)
+    const fallbackModelId = result._channelModelId ?? modelId
+    const fallbackWindow = inferContextWindow(fallbackModelId)
+    const win = Math.max(info?.contextWindow ?? 0, fallbackWindow ?? 0) || undefined
     if (win === undefined) continue
     if (best === undefined || win > best) best = win
   }

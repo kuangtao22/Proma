@@ -12,7 +12,8 @@ import { networkInterfaces } from 'node:os'
 import { app } from 'electron'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { getLanBridgeConfig, updateLanBridgeConfig } from './lan-bridge-config'
-import { initAuth, refreshPin, getCurrentPin } from './lan-bridge-auth'
+import { initAuth, refreshPin, getCurrentPin, removeLegacyPinFile } from './lan-bridge-auth'
+import { getConfigDir } from '../config-paths'
 import { LanBridgeSessionManager } from './lan-bridge-session'
 import { dispatch } from './lan-bridge-router'
 import type { ClientConnection } from './lan-bridge-types'
@@ -44,6 +45,7 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
 
   try {
     initAuth()
+    removeLegacyPinFile(getConfigDir())
 
     sessionManager = new LanBridgeSessionManager(config.maxConnections)
 
@@ -73,18 +75,14 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
 
       if (existsSync(safePath)) {
         const ext = extname(safePath)
-        let content = readFileSync(safePath)
-        // 注入当前 PIN 码到 HTML 页面，手机端免手动输入
-        if (ext === '.html') {
-          content = Buffer.from(content.toString('utf-8').replace('"__PROMO_PIN__"', JSON.stringify(getCurrentPin())))
-        }
+        const content = readFileSync(safePath)
         res.writeHead(200, { 'Content-Type': mimeTypes[ext] ?? 'application/octet-stream' })
         res.end(content)
       } else {
         // SPA fallback: 所有未知路径返回 index.html
         const indexHtml = join(mobileDistDir, 'index.html')
         if (existsSync(indexHtml)) {
-          const html = readFileSync(indexHtml).toString('utf-8').replace('"__PROMO_PIN__"', JSON.stringify(getCurrentPin()))
+          const html = readFileSync(indexHtml)
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
           res.end(html)
         } else {
@@ -200,8 +198,9 @@ export function updateConfig(updates: Partial<LanBridgeConfig>): LanBridgeConfig
   const updated = updateLanBridgeConfig(updates)
 
   if (needsRestart) {
+    const restartEventBus = eventBus
     stopLanBridge()
-    startLanBridge().catch(console.error)
+    startLanBridge(restartEventBus ?? undefined).catch(console.error)
   }
 
   return updated

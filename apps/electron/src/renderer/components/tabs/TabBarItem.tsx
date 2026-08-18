@@ -9,11 +9,13 @@
 import * as React from 'react'
 import { createPortal } from 'react-dom'
 import { useAtomValue } from 'jotai'
-import { FileText, StickyNote, X, Clock } from 'lucide-react'
+import { FileText, StickyNote, X, Clock, GitBranch } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TabType, TabMinimapItem } from '@/atoms/tab-atoms'
 import type { SessionIndicatorStatus } from '@/atoms/agent-atoms'
 import { tabMinimapCacheAtom } from '@/atoms/tab-atoms'
+import { interfaceVariantAtom } from '@/atoms/theme'
+import { Spinner } from '@/components/ui/spinner'
 import { TabPreviewPanel } from './TabPreviewPanel'
 
 export interface TabBarItemProps {
@@ -35,6 +37,8 @@ export interface TabBarItemProps {
   onDragStart: (e: React.PointerEvent) => void
   /** 该 Tab 对应的会话是否由定时任务创建 */
   isAutomation?: boolean
+  /** 该 Tab 对应的会话是否由父 Agent 协作委派创建 */
+  isDelegation?: boolean
   /** hover 进入 Tab */
   onHoverEnter: () => void
   /** hover 离开 Tab */
@@ -60,6 +64,7 @@ export function TabBarItem({
   onMiddleClick,
   onDragStart,
   isAutomation,
+  isDelegation,
   onHoverEnter,
   onHoverLeave,
   onPanelHoverEnter,
@@ -68,6 +73,8 @@ export function TabBarItem({
   const buttonRef = React.useRef<HTMLButtonElement>(null)
   const [isNarrow, setIsNarrow] = React.useState(false)
   const minimapCache = useAtomValue(tabMinimapCacheAtom)
+  const interfaceVariant = useAtomValue(interfaceVariantAtom)
+  const isClassic = interfaceVariant === 'classic'
 
   React.useEffect(() => {
     const el = buttonRef.current
@@ -95,15 +102,7 @@ export function TabBarItem({
   }
 
   const isScratch = type === 'scratch'
-  const indicatorColor = isScratch
-    ? undefined
-    : isStreaming !== 'idle'
-    ? isStreaming === 'completed'
-      ? 'border-green-500'
-      : isStreaming === 'blocked'
-        ? 'border-orange-500'
-        : 'border-blue-500'
-    : undefined
+  const showAgentSpinner = type === 'agent' && isStreaming === 'running'
   const previewItems = minimapCache.get(id) ?? []
   // 当前 active Tab 不显示预览面板
   const showPreview = isHovered && !isActive
@@ -121,11 +120,16 @@ export function TabBarItem({
           type="button"
           className={cn(
             'group relative flex items-center justify-center gap-1.5 min-w-[82px] px-3 h-[34px]',
-            'rounded-t-lg text-xs transition-colors select-none cursor-pointer',
+            isClassic ? 'rounded-t-lg' : 'rounded-none',
+            'text-xs transition-colors select-none cursor-pointer',
             'border-t border-l border-r border-transparent',
             isActive
-              ? 'bg-content-area text-foreground border-border/50'
-              : 'text-muted-foreground hover:text-foreground hover:bg-muted/50',
+              ? isClassic
+                ? 'bg-content-area text-foreground border-border/50'
+                : 'app-tab-active text-foreground border-border/80'
+              : isClassic
+                ? 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                : 'app-tab-inactive text-muted-foreground hover:text-foreground',
           )}
           onClick={onActivate}
           onMouseDown={handleMouseDown}
@@ -140,7 +144,7 @@ export function TabBarItem({
 
   return (
     <div
-      className="relative min-w-[120px] max-w-[200px] flex-[1_0_120px] titlebar-no-drag"
+      className="relative min-w-[132px] max-w-[240px] flex-[1_0_132px] titlebar-no-drag"
       onMouseEnter={onHoverEnter}
       onMouseLeave={onHoverLeave}
     >
@@ -149,11 +153,16 @@ export function TabBarItem({
         type="button"
         className={cn(
           'group relative flex items-center gap-1.5 px-3 h-[34px] w-full',
-          'rounded-t-lg text-xs transition-colors select-none cursor-pointer',
+          isClassic ? 'rounded-t-lg' : 'rounded-none',
+          'text-xs transition-colors select-none cursor-pointer',
           'border-t border-l border-r border-transparent',
           isActive
-            ? 'bg-content-area text-foreground border-border/50'
-            : 'text-muted-foreground hover:text-foreground hover:bg-muted/50',
+            ? isClassic
+              ? 'bg-content-area text-foreground border-border/50'
+              : 'app-tab-active text-foreground border-border/80'
+            : isClassic
+              ? 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+              : 'app-tab-inactive text-muted-foreground hover:text-foreground',
           isTearingOff && 'ring-2 ring-primary/70 ring-offset-0 bg-primary/10',
         )}
         onClick={onActivate}
@@ -169,8 +178,10 @@ export function TabBarItem({
           <span className="flex-1" />
         ) : (
           <span className="flex-1 min-w-0 truncate text-left flex items-center gap-1">
+            {showAgentSpinner && <Spinner size="sm" className="mr-2 shrink-0 text-primary/70" />}
             {isAutomation && <Clock className="size-3 shrink-0 text-foreground/40" />}
-            {title}
+            {isDelegation && !isAutomation && <GitBranch className="size-3 shrink-0 text-foreground/40" />}
+            <span className="min-w-0 truncate">{title}</span>
           </span>
         )}
 
@@ -199,16 +210,6 @@ export function TabBarItem({
         </span>
         )}
 
-        {/* 状态包边 */}
-        {indicatorColor && (
-          <span
-            className={cn(
-              'absolute inset-0 rounded-t-lg border-t-2 border-l-2 border-r-2 border-b-0 pointer-events-none',
-              indicatorColor,
-            )}
-            aria-hidden="true"
-          />
-        )}
       </button>
 
       {/* 悬浮预览面板（Portal 渲染到 body） */}

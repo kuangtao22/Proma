@@ -6,10 +6,13 @@
  */
 
 import { atom } from 'jotai'
-import { atomFamily, atomWithStorage } from 'jotai/utils'
+import type { Getter } from 'jotai'
+import { atomFamily, atomWithStorage, selectAtom } from 'jotai/utils'
 import type { AgentSessionMeta, AgentEvent, AgentWorkspace, AgentPendingFile, RetryAttempt, PromaPermissionMode, PermissionRequest, AskUserRequest, ExitPlanModeRequest, ThinkingConfig, AgentEffort, SDKMessage, UnstagedChangesResult } from '@proma/shared'
 import { PROMA_DEFAULT_PERMISSION_MODE } from '@proma/shared'
 import { calculateDockBadgeCount, countPendingRequests } from '@/lib/dock-badge-count'
+import type { AgentQueuedMessage } from '@/lib/agent-message-queue'
+import type { SessionFileChange } from '@/lib/session-file-changes'
 
 /** 活动状态 */
 export type ActivityStatus = 'pending' | 'running' | 'completed' | 'error' | 'backgrounded'
@@ -39,21 +42,37 @@ export interface ActivityGroup {
   children: ToolActivity[]
 }
 
-/**
- * 将流式状态中未完成的 toolActivities 标记为终态。
- * 用于 complete、handleStop、STREAM_COMPLETE 等多个终态入口的兜底清理。
- * 当所有项已处于终态时返回原引用，避免不必要的 React 重渲染。
- */
-export function finalizeStreamingActivities(
-  toolActivities: ToolActivity[],
-): { toolActivities: ToolActivity[] } {
-  const hasUnfinishedTools = toolActivities.some((ta) => !ta.done)
+export interface ContextCompactionState {
+  status: 'running' | 'success' | 'noop' | 'failed'
+  summary?: string
+  message?: string
+}
 
-  return {
-    toolActivities: hasUnfinishedTools
-      ? toolActivities.map((ta) => (ta.done ? ta : { ...ta, done: true }))
-      : toolActivities,
-  }
+/** 用户可见的 retry 生命周期。 */
+export type RetryPhase = 'scheduled' | 'running' | 'succeeded' | 'exhausted' | 'cancelled'
+
+/** 单个流式 run 的 retry 状态。 */
+export interface AgentRetryState {
+  /** 用渲染进程创建的 startedAt 隔离迟到事件。 */
+  runStartedAt?: number
+  /** 当前 retry 所处阶段。 */
+  phase: RetryPhase
+  /** 当前第几次 retry（不含初始请求）。 */
+  currentAttempt: number
+  /** 当前连续失败段的 retry 上限。 */
+  maxAttempts: number
+  /** 当前顶层 run 已调度的 retry 数。 */
+  totalAttempt?: number
+  /** 当前顶层 run 的 retry 总预算。 */
+  maxTotalAttempts?: number
+  /** 已实际开始的 retry 历史，按 attempt upsert，不记录“仅安排”的次数。 */
+  history: RetryAttempt[]
+  /** retry 被安排的时间，用于 backoff 倒计时。 */
+  scheduledAt?: number
+  /** 当前安排的 backoff 时长。 */
+  delaySeconds?: number
+  /** 当前或最后一次失败原因。 */
+  reason?: string
 }
 
 /** Agent 会话的流式状态 */
@@ -64,8 +83,6 @@ export interface AgentStreamState {
    * 此状态下 running 为 false，但服务端 activeSessions 仍保留，新消息必须走注入通道而非新建 run。
    */
   backgroundWaiting?: boolean
-  content: string
-  toolActivities: ToolActivity[]
   model?: string
   /** 当前输入 token 数（上下文使用量） */
   inputTokens?: number
@@ -79,31 +96,43 @@ export interface AgentStreamState {
   costUsd?: number
   /** 模型上下文窗口大小 */
   contextWindow?: number
+  /** 当前上下文 token 是 Pi 手动压缩后的预估值 */
+  contextUsageIsEstimated?: boolean
   /** 当前 thinking block 的 token 估算值（SDK 实时估算，非计费值） */
   thinkingEstimatedTokens?: number
-  /** usage 数据最后更新时间戳（毫秒），用于 UI 提示数据时效 */
-  usageUpdatedAt?: number
   /** 是否正在压缩上下文 */
   isCompacting?: boolean
+  /** 当前或最近一次压缩状态，保留到实时消息清理或同一流恢复正常工作后供底部进度区展示。 */
+  contextCompaction?: ContextCompactionState
   /**
    * 压缩流程是否进行中（含收尾窗口）。
-   * 从用户点击压缩 / SDK compacting 事件开始 → 到整个 stream 结束（state 被删除）前一直为 true。
-   * 用于抑制压缩分隔符切换期间 AgentRunningIndicator 的短暂闪烁。
+   * 从用户点击压缩 / SDK compacting 事件开始；若同一流在压缩后恢复正常工作则立即清除，
+   * 否则保留到整个 stream 结束（state 被删除）。用于抑制压缩分隔符切换期间 AgentRunningIndicator 的短暂闪烁。
    */
   compactInFlight?: boolean
   /** 流式开始时间戳（用于思考计时持久化） */
   startedAt?: number
-  /** 重试状态（扩展版） */
-  retrying?: {
-    /** 当前第几次尝试 */
-    currentAttempt: number
-    /** 最大尝试次数 */
-    maxAttempts: number
-    /** 重试历史记录（按时间顺序） */
-    history: RetryAttempt[]
-    /** 是否已失败 */
-    failed: boolean
+  /** 重试状态 */
+  retrying?: AgentRetryState
+}
+
+/**
+ * 成功或无需压缩后，Pi 可能在同一个 stream 内自动续跑原任务。
+ * 一旦收到新的正常 Agent 活动，终态压缩提示不应继续抢占底部进度区。
+ */
+function clearFinishedCompactionForResumedWork(prev: AgentStreamState): AgentStreamState {
+  const status = prev.contextCompaction?.status
+  if (status !== 'success' && status !== 'noop') return prev
+  return {
+    ...prev,
+    compactInFlight: false,
+    contextCompaction: undefined,
   }
+}
+
+export function resumeAgentStreamState(prev: AgentStreamState): AgentStreamState {
+  const resumed = clearFinishedCompactionForResumedWork(prev)
+  return resumed.retrying === undefined ? resumed : { ...resumed, retrying: undefined }
 }
 
 /** 从 ToolActivity 派生状态 */
@@ -112,6 +141,32 @@ export function getActivityStatus(activity: ToolActivity): ActivityStatus {
   if (!activity.done) return 'running'
   if (activity.isError) return 'error'
   return 'completed'
+}
+
+interface RetryEventRunScope {
+  runStartedAt?: number
+}
+
+/**
+ * 仅接受属于当前流式 run 的 retry 事件；旧版无 run 标识的事件保留兼容。
+ * 带 run 标识的事件必须精确匹配，避免旧 IPC 事件在 state 缺失时复活已结束的流。
+ */
+export function isRetryEventForCurrentStream(
+  state: Pick<AgentStreamState, 'startedAt'>,
+  event: RetryEventRunScope,
+): boolean {
+  return event.runStartedAt == null || event.runStartedAt === state.startedAt
+}
+
+function upsertRetryAttempt(history: RetryAttempt[], attempt: RetryAttempt): RetryAttempt[] {
+  const index = history.findIndex((item) => item.attempt === attempt.attempt)
+  if (index === -1) return [...history, attempt]
+  return history.map((item, itemIndex) => (
+    itemIndex === index
+      // 终态会带着最终错误更新同一 retry；保留真正开始请求时的时间和 backoff。
+      ? { ...item, ...attempt, timestamp: item.timestamp, delaySeconds: item.delaySeconds }
+      : item
+  ))
 }
 
 /**
@@ -198,6 +253,8 @@ export interface AgentPendingPrompt {
   sessionId: string
   message: string
   additionalDirectories?: string[]
+  /** 自动发送时注入的 Todo 引用，确保 Agent 读取最新记录而非仅依赖提示文本。 */
+  mentionedTodoIds?: string[]
 }
 
 // ===== Atoms =====
@@ -205,36 +262,147 @@ export interface AgentPendingPrompt {
 export const agentSessionsAtom = atom<AgentSessionMeta[]>([])
 export const agentWorkspacesAtom = atom<AgentWorkspace[]>([])
 export const currentAgentWorkspaceIdAtom = atom<string | null>(null)
+/** 侧栏「自动任务」合成项目组在项目列表中的位置索引（默认 0 = 最靠前；从 settings.json 加载） */
+export const automationGroupOrderAtom = atom<number>(0)
 /** 全局默认渠道 ID（新会话继承用，从 settings.json 加载） */
 export const agentChannelIdAtom = atom<string | null>(null)
 /** 全局默认模型 ID（新会话继承用，从 settings.json 加载） */
 export const agentModelIdAtom = atom<string | null>(null)
-/** Agent 启用的渠道 ID 列表（多选，设置页 Switch 开关控制） */
-export const agentChannelIdsAtom = atom<string[]>([])
-
 /** Per-session 渠道 ID Map — sessionId → channelId */
 export const agentSessionChannelMapAtom = atom<Map<string, string>>(new Map())
 /** Per-session 模型 ID Map — sessionId → modelId */
 export const agentSessionModelMapAtom = atom<Map<string, string>>(new Map())
 export const currentAgentSessionIdAtom = atom<string | null>(null)
-export const agentStreamingStatesAtom = atom<Map<string, AgentStreamState>>(new Map())
 
-/** Agent 流式结束后是否保持过程组展开，默认收起以降低结果阅读干扰 */
-export const agentProcessGroupsKeepExpandedAtom = atomWithStorage<boolean>(
-  'proma-agent-process-groups-keep-expanded',
-  false,
+/**
+ * Agent 流式状态的 session 索引与实际存储。
+ *
+ * 高频事件直接写入 family，避免每次 token/tool 状态更新都复制完整的 session Map。
+ * 聚合 atom 仅作为低频汇总和旧调用方兼容入口保留。
+ */
+const agentStreamingStateIdsAtom = atom<Set<string>>(new Set<string>())
+const agentStreamingStateStorageAtomFamily = atomFamily((sessionId: string) =>
+  atom<AgentStreamState | undefined>(undefined),
+)
+
+export const agentSessionStreamingStateAtomFamily = atomFamily((sessionId: string) =>
+  atom(
+    (get) => get(agentStreamingStateStorageAtomFamily(sessionId)),
+    (
+      get,
+      set,
+      update: AgentStreamState | undefined | ((prev: AgentStreamState | undefined) => AgentStreamState | undefined),
+    ) => {
+      const previous = get(agentStreamingStateStorageAtomFamily(sessionId))
+      const next = typeof update === 'function' ? update(previous) : update
+      if (Object.is(previous, next)) return
+
+      set(agentStreamingStateStorageAtomFamily(sessionId), next)
+      set(agentStreamingStateIdsAtom, (prev: Set<string>) => {
+        if (next !== undefined) {
+          if (prev.has(sessionId)) return prev
+          const ids = new Set(prev)
+          ids.add(sessionId)
+          return ids
+        }
+        if (!prev.has(sessionId)) return prev
+        const ids = new Set(prev)
+        ids.delete(sessionId)
+        return ids
+      })
+    },
+  ),
+)
+
+function readAgentStreamingStates(get: Getter): Map<string, AgentStreamState> {
+  const states = new Map<string, AgentStreamState>()
+  for (const sessionId of get(agentStreamingStateIdsAtom)) {
+    const state = get(agentSessionStreamingStateAtomFamily(sessionId))
+    if (state) states.set(sessionId, state)
+  }
+  return states
+}
+
+/**
+ * 兼容旧调用方的聚合视图。高频路径不要写入此 atom，请使用
+ * agentSessionStreamingStateAtomFamily(sessionId)。
+ */
+export const agentStreamingStatesAtom = atom<Map<string, AgentStreamState>, [Map<string, AgentStreamState> | ((prev: Map<string, AgentStreamState>) => Map<string, AgentStreamState>)], void>(
+  (get) => readAgentStreamingStates(get),
+  (get, set, update) => {
+    const previous = readAgentStreamingStates(get)
+    const next = typeof update === 'function' ? update(previous) : update
+    const sessionIds = new Set([...previous.keys(), ...next.keys()])
+    for (const sessionId of sessionIds) {
+      const previousState = previous.get(sessionId)
+      const nextState = next.get(sessionId)
+      if (Object.is(previousState, nextState)) continue
+      set(agentSessionStreamingStateAtomFamily(sessionId), nextState)
+    }
+  },
+)
+
+/** AgentView 输入区/工具栏需要的低频流状态。 */
+export type AgentViewStreamState = Pick<
+  AgentStreamState,
+  | 'running'
+  | 'backgroundWaiting'
+  | 'inputTokens'
+  | 'outputTokens'
+  | 'cacheReadTokens'
+  | 'cacheCreationTokens'
+  | 'contextWindow'
+  | 'contextUsageIsEstimated'
+  | 'isCompacting'
+>
+
+const EMPTY_AGENT_VIEW_STREAM_STATE: AgentViewStreamState = { running: false }
+
+export function areAgentViewStreamStatesEqual(
+  previous: AgentViewStreamState,
+  next: AgentViewStreamState,
+): boolean {
+  return previous.running === next.running
+    && previous.backgroundWaiting === next.backgroundWaiting
+    && previous.inputTokens === next.inputTokens
+    && previous.outputTokens === next.outputTokens
+    && previous.cacheReadTokens === next.cacheReadTokens
+    && previous.cacheCreationTokens === next.cacheCreationTokens
+    && previous.contextWindow === next.contextWindow
+    && previous.contextUsageIsEstimated === next.contextUsageIsEstimated
+    && previous.isCompacting === next.isCompacting
+}
+
+export const agentSessionViewStreamStateAtomFamily = atomFamily((sessionId: string) =>
+  selectAtom(
+    agentSessionStreamingStateAtomFamily(sessionId),
+    (state): AgentViewStreamState => state ?? EMPTY_AGENT_VIEW_STREAM_STATE,
+    areAgentViewStreamStatesEqual,
+  ),
 )
 
 /**
- * 单个 session 的 streaming state 派生 atomFamily — 按 sessionId 切片订阅。
- *
- * 直接订阅 agentStreamingStatesAtom 会让任意 session 的流式更新都触发 AgentView
- * 整树重渲染（10–30fps）。本 family 让订阅者只在本 session 的 state 引用变化时
- * 重渲染——其他 session 的更新虽然让 base atom 变化，但派生 atom 输出引用未变，
- * jotai 自动跳过通知。
+ * AgentView 输入区/工具栏只订阅运行生命周期，usage 数据由 ContextUsageBadge 独立消费。
  */
-export const agentSessionStreamingStateAtomFamily = atomFamily((sessionId: string) =>
-  atom((get) => get(agentStreamingStatesAtom).get(sessionId)),
+export type AgentInputStreamState = Pick<AgentStreamState, 'running' | 'backgroundWaiting'>
+
+const EMPTY_AGENT_INPUT_STREAM_STATE: AgentInputStreamState = { running: false }
+
+export function areAgentInputStreamStatesEqual(
+  previous: AgentInputStreamState,
+  next: AgentInputStreamState,
+): boolean {
+  return previous.running === next.running
+    && previous.backgroundWaiting === next.backgroundWaiting
+}
+
+/** 输入区只订阅发送/排队需要的生命周期状态，避免 usage_update 触发整页重渲染。 */
+export const agentSessionInputStreamStateAtomFamily = atomFamily((sessionId: string) =>
+  selectAtom(
+    agentSessionStreamingStateAtomFamily(sessionId),
+    (state): AgentInputStreamState => state ?? EMPTY_AGENT_INPUT_STREAM_STATE,
+    areAgentInputStreamStatesEqual,
+  ),
 )
 
 /**
@@ -244,6 +412,13 @@ export const agentSessionStreamingStateAtomFamily = atomFamily((sessionId: strin
  * 流式完成后清空（持久化消息从 JSONL 加载）。
  */
 export const liveMessagesMapAtom = atom<Map<string, SDKMessage[]>>(new Map())
+
+const EMPTY_LIVE_SDK_MESSAGES: SDKMessage[] = []
+
+/** 单个 session 的实时消息切片；其他 session 流式更新不唤醒当前历史区。 */
+export const agentLiveMessagesAtomFamily = atomFamily((sessionId: string) =>
+  atom((get) => get(liveMessagesMapAtom).get(sessionId) ?? EMPTY_LIVE_SDK_MESSAGES),
+)
 
 export const agentPendingPromptAtom = atom<AgentPendingPrompt | null>(null)
 
@@ -277,28 +452,93 @@ export const agentPendingFilesAtomFamily = atomFamily((sessionId: string) =>
   ),
 )
 
+/**
+ * Agent 运行中待发送消息队列 Map — 以 sessionId 为 key。
+ * 队列只保存在渲染进程内存中，避免跨重启恢复时误把过期上下文继续发送。
+ */
+export const agentSessionMessageQueueAtom = atom<Map<string, AgentQueuedMessage[]>>(new Map())
+
+/**
+ * 单个 session 的队列派生 atom（读写）。
+ * 空队列写回时删除 Map entry，避免长时间使用后残留空数组。
+ */
+export const agentMessageQueueAtomFamily = atomFamily((sessionId: string) =>
+  atom(
+    (get) => get(agentSessionMessageQueueAtom).get(sessionId) ?? [],
+    (_get, set, update: AgentQueuedMessage[] | ((prev: AgentQueuedMessage[]) => AgentQueuedMessage[])) => {
+      set(agentSessionMessageQueueAtom, (prev) => {
+        const current = prev.get(sessionId) ?? []
+        const next = typeof update === 'function' ? update(current) : update
+        const map = new Map(prev)
+        if (next.length === 0) {
+          map.delete(sessionId)
+        } else {
+          map.set(sessionId, next)
+        }
+        return map
+      })
+    },
+  ),
+)
+
 /** 工作区能力版本号 — 每次修改 MCP/Skills 后自增，触发侧边栏重新获取 */
 export const workspaceCapabilitiesVersionAtom = atom(0)
 
 /** 工作区文件版本号 — 文件变化时自增，触发文件浏览器重新加载 */
 export const workspaceFilesVersionAtom = atom(0)
 
+/** Git watcher 触发的全局 Diff 刷新版本，避免按历史会话批量更新 Map。 */
+export const workspaceGitDiffRefreshVersionAtom = atom(0)
+
 // ===== 侧面板 Atoms =====
 
-/** 侧面板是否打开（全局共享，所有会话共用一个状态） */
-export const agentSidePanelOpenAtom = atomWithStorage<boolean>('proma-agent-sidepanel-open', true)
+/** 侧面板是否打开：按 Agent 会话持久化，未存储的会话默认打开。 */
+export const agentSidePanelOpenMapAtom = atomWithStorage<Record<string, boolean>>(
+  'proma-agent-sidepanel-open-by-session',
+  {},
+  undefined,
+  { getOnInit: true },
+)
+
+/** 指定 Agent 会话的侧面板开关。 */
+export const agentSidePanelOpenAtomFamily = atomFamily((sessionId: string) => atom(
+  (get) => get(agentSidePanelOpenMapAtom)[sessionId] ?? true,
+  (_get, set, isOpen: boolean) => {
+    set(agentSidePanelOpenMapAtom, (previous) => ({ ...previous, [sessionId]: isOpen }))
+  },
+))
 
 /** 侧面板宽度（全局共享，用户拖拽后持久化） */
 export const agentSidePanelWidthAtom = atomWithStorage<number>('proma-agent-sidepanel-width', 280)
 
-/** @deprecated 保留以兼容旧代码，但实际所有 session 都读全局 atom */
-export const agentSidePanelOpenMapAtom = atom<Map<string, boolean>>(new Map())
+/** 文件来源选择：按会话持久化，未存储的会话默认显示会话文件。 */
+export type AgentFileSourceFilter = 'session' | 'project'
+export const agentFileSourceFilterMapAtom = atomWithStorage<Record<string, AgentFileSourceFilter>>(
+  'proma-agent-file-source-filter-map',
+  {},
+  undefined,
+  { getOnInit: true },
+)
 
-/** 侧面板当前 Tab：'session' | 'workspace' | 'changes'（per-session Map） */
-export const agentDiffPanelTabAtom = atom<Map<string, 'session' | 'workspace' | 'changes'>>(new Map())
+export type AgentSidePanelTab = 'files' | 'changes' | 'chat'
 
-/** Diff 视图模式：'split' | 'unified' */
-export const agentDiffViewModeAtom = atom<'split' | 'unified'>('split')
+/** 当前会话的侧面板是否打开，并将写入定向到当前会话。 */
+export const currentSessionSidePanelOpenAtom = atom(
+  (get) => {
+    const currentId = get(currentAgentSessionIdAtom)
+    return currentId ? get(agentSidePanelOpenAtomFamily(currentId)) : false
+  },
+  (get, set, isOpen: boolean) => {
+    const currentId = get(currentAgentSessionIdAtom)
+    if (currentId) set(agentSidePanelOpenAtomFamily(currentId), isOpen)
+  },
+)
+
+/** 侧面板当前 Tab：Files / 文件改动 / Chat（per-session Map） */
+export const agentDiffPanelTabAtom = atom<Map<string, AgentSidePanelTab>>(new Map())
+
+/** Diff 视图模式：'split' | 'unified'，默认使用统一预览 */
+export const agentDiffViewModeAtom = atom<'split' | 'unified'>('unified')
 
 /** Diff 刷新版本号 — 按 session 隔离，Agent 写工具完成时递增 */
 export const agentDiffRefreshVersionAtom = atom(new Map<string, number>())
@@ -313,6 +553,15 @@ export const agentDiffUnseenChangesAtom = atom(new Map<string, boolean>())
 export const agentDiffUnseenFilesAtom = atom(new Map<string, Set<string>>())
 
 /**
+ * 非 Git 目录中由 Agent 成功写入的文件变更，按会话保存。
+ * 这些文件不能生成 Git diff，但应和 Git 改动共享“文件改动”入口。
+ */
+export const agentNonGitFileChangesAtom = atom<Map<string, SessionFileChange[]>>(new Map())
+
+/** 当前 session 的 Agent run ID（即渲染进程生成并传给主进程的 startedAt）。 */
+export const agentFileChangesCurrentRunAtom = atom<Map<string, string>>(new Map())
+
+/**
  * Diff 数据缓存 — 按 session 隔离，存放上一次 IPC 拉取到的未暂存改动结果。
  *
  * 让 DiffChangesList 切走再切回时能立即拿到旧数据渲染（SWR 模式），
@@ -321,20 +570,13 @@ export const agentDiffUnseenFilesAtom = atom(new Map<string, Set<string>>())
  */
 export const agentDiffDataAtom = atom(new Map<string, UnstagedChangesResult>())
 
-/** 当前会话的侧面板是否打开（派生只读：全局共享，但仅在有当前会话且为 Agent 模式时显示） */
-export const currentSessionSidePanelOpenAtom = atom<boolean>((get) => {
-  const currentId = get(currentAgentSessionIdAtom)
-  if (!currentId) return false
-  return get(agentSidePanelOpenAtom)
-})
-
 /** 当前会话的工作路径 Map — sessionId → path */
 export const agentSessionPathMapAtom = atom<Map<string, string>>(new Map())
 
 /**
- * 文件浏览器自动定位信号：当 Agent 调用写入类工具（Write/Edit/MultiEdit/NotebookEdit）时，
- * 设置该 atom；FileBrowser 实例订阅后，若路径落在自身 rootPath 下则展开祖先 + 滚动 + 高亮。
- * `ts` 用于触发同路径的二次脉冲（atom 比对引用）。
+ * 文件浏览器自动定位信号：当用户通过文件搜索点击结果时设置该 atom；
+ * FileBrowser 实例订阅后，若路径落在自身 rootPath 下则展开祖先 + 滚动定位。
+ * `ts` 用于触发同路径的二次定位（atom 比对引用）。
  */
 export interface FileBrowserAutoReveal {
   sessionId: string
@@ -383,8 +625,8 @@ export const sessionExistsAtom = atomFamily((sessionId: string) =>
   }),
 )
 
-/** Agent 思考模式 */
-export const agentThinkingAtom = atom<ThinkingConfig | undefined>(undefined)
+/** Agent 思考模式：未加载持久化设置前也默认开启，避免输入栏按钮短暂显示为关闭。 */
+export const agentThinkingAtom = atom<ThinkingConfig | undefined>({ type: 'adaptive' })
 
 /** Agent 推理深度 */
 export const agentEffortAtom = atom<AgentEffort | undefined>(undefined)
@@ -423,6 +665,23 @@ export const pendingPermissionRequestsAtom = atom(
 
 /** 待处理的 AskUser 请求 Map — 以 sessionId 为 key，切换会话时保留状态 */
 export const allPendingAskUserRequestsAtom = atom<Map<string, readonly AskUserRequest[]>>(new Map())
+
+/** AskUser 单题答案草稿 */
+export interface AskUserQuestionDraft {
+  selected: string[]
+  customText: string
+  showCustom: boolean
+}
+
+/** AskUser 请求级草稿 — 以 requestId 为 key，组件卸载后仍保留 */
+export interface AskUserRequestDraft {
+  activeTab: number
+  focusedOptIdx: number
+  answers: Map<number, AskUserQuestionDraft>
+}
+
+/** 待提交 AskUser 草稿 Map — 以 requestId 为 key，切换预览/会话时保留填写进度 */
+export const askUserDraftsAtom = atom<Map<string, AskUserRequestDraft>>(new Map())
 
 type AskUserRequestsUpdate = readonly AskUserRequest[] | ((prev: readonly AskUserRequest[]) => readonly AskUserRequest[])
 
@@ -463,45 +722,39 @@ export const currentAgentSessionAtom = atom<AgentSessionMeta | null>((get) => {
 export const agentStreamingAtom = atom<boolean>((get) => {
   const currentId = get(currentAgentSessionIdAtom)
   if (!currentId) return false
-  return get(agentStreamingStatesAtom).get(currentId)?.running ?? false
-})
-
-export const agentStreamingContentAtom = atom<string>((get) => {
-  const currentId = get(currentAgentSessionIdAtom)
-  if (!currentId) return ''
-  return get(agentStreamingStatesAtom).get(currentId)?.content ?? ''
-})
-
-export const agentToolActivitiesAtom = atom<ToolActivity[]>((get) => {
-  const currentId = get(currentAgentSessionIdAtom)
-  if (!currentId) return []
-  return get(agentStreamingStatesAtom).get(currentId)?.toolActivities ?? []
+  return get(agentSessionStreamingStateAtomFamily(currentId))?.running ?? false
 })
 
 export const agentStreamingModelAtom = atom<string | undefined>((get) => {
   const currentId = get(currentAgentSessionIdAtom)
   if (!currentId) return undefined
-  return get(agentStreamingStatesAtom).get(currentId)?.model
+  return get(agentSessionStreamingStateAtomFamily(currentId))?.model
 })
 
 export const agentRetryingAtom = atom<AgentStreamState['retrying'] | undefined>((get) => {
   const currentId = get(currentAgentSessionIdAtom)
   if (!currentId) return undefined
-  return get(agentStreamingStatesAtom).get(currentId)?.retrying
+  return get(agentSessionStreamingStateAtomFamily(currentId))?.retrying
 })
 
 export const agentStartedAtAtom = atom<number | undefined>((get) => {
   const currentId = get(currentAgentSessionIdAtom)
   if (!currentId) return undefined
-  return get(agentStreamingStatesAtom).get(currentId)?.startedAt
+  return get(agentSessionStreamingStateAtomFamily(currentId))?.startedAt
 })
 
+let lastRunningSessionSignature = ''
+let lastRunningSessionIds = new Set<string>()
+
 export const agentRunningSessionIdsAtom = atom<Set<string>>((get) => {
-  const states = get(agentStreamingStatesAtom)
   const ids = new Set<string>()
-  for (const [id, state] of states) {
-    if (state.running) ids.add(id)
+  for (const sessionId of get(agentStreamingStateIdsAtom)) {
+    if (get(agentSessionStreamingStateAtomFamily(sessionId))?.running) ids.add(sessionId)
   }
+  const signature = [...ids].sort().join('|')
+  if (signature === lastRunningSessionSignature) return lastRunningSessionIds
+  lastRunningSessionSignature = signature
+  lastRunningSessionIds = ids
   return ids
 })
 
@@ -571,224 +824,251 @@ export function applyAgentEvent(
   event: AgentEvent,
 ): AgentStreamState {
   switch (event.type) {
-    case 'text_delta':
-      // 开始接收文本 - 清除重试状态（重试成功）
-      return { ...prev, content: prev.content + event.text, retrying: undefined }
-
-    case 'text_complete':
-      // 用完整文本替换增量累积的文本（用于回放场景：只需 text_complete 即可重建文本状态）
-      return { ...prev, content: event.text }
-
-    case 'tool_start': {
-      const existing = prev.toolActivities.find((t) => t.toolUseId === event.toolUseId)
-      if (existing) {
-        return {
-          ...prev,
-          toolActivities: prev.toolActivities.map((t) =>
-            t.toolUseId === event.toolUseId
-              ? { ...t, input: event.input, intent: event.intent || t.intent, displayName: event.displayName || t.displayName }
-              : t
-          ),
-          // 开始工具调用 - 清除重试状态（重试成功）
-          retrying: undefined,
-        }
-      }
-      return {
-        ...prev,
-        toolActivities: [...prev.toolActivities, {
-          toolUseId: event.toolUseId,
-          toolName: event.toolName,
-          input: event.input,
-          intent: event.intent,
-          displayName: event.displayName,
-          done: false,
-          parentToolUseId: event.parentToolUseId,
-        }],
-        // 开始工具调用 - 清除重试状态（重试成功）
-        retrying: undefined,
-      }
-    }
+    case 'tool_start':
+      // 工具开始只负责收束 retry/compaction 控制状态；工具展示由 live SDK message 驱动。
+      return { ...clearFinishedCompactionForResumedWork(prev), retrying: undefined }
 
     case 'tool_result':
-      return {
-        ...prev,
-        toolActivities: prev.toolActivities.map((t) =>
-          t.toolUseId === event.toolUseId
-            ? { ...t, result: event.result, isError: event.isError, done: true, imageAttachments: event.imageAttachments }
-            : t
-        ),
-      }
-
     case 'task_backgrounded':
-      return {
-        ...prev,
-        toolActivities: prev.toolActivities.map((t) =>
-          t.toolUseId === event.toolUseId
-            ? { ...t, isBackground: true, taskId: event.taskId, done: true }
-            : t
-        ),
-      }
-
     case 'task_progress':
-      // 普通 tool 计时语义（仅当有真实 elapsedSeconds 时更新）
-      if (event.elapsedSeconds != null) {
-        return {
-          ...prev,
-          toolActivities: prev.toolActivities.map((t) =>
-            t.toolUseId === event.toolUseId
-              ? { ...t, elapsedSeconds: event.elapsedSeconds! }
-              : t
-          ),
-        }
-      }
-      return prev
-
-    case 'task_started': {
-      // 查找匹配 toolUseId 的 ToolActivity，更新 intent 和 taskId
-      let nextActivities = prev.toolActivities
-      if (event.toolUseId) {
-        if (prev.toolActivities.some((t) => t.toolUseId === event.toolUseId)) {
-          nextActivities = prev.toolActivities.map((t) =>
-            t.toolUseId === event.toolUseId
-              ? { ...t, intent: event.description, taskId: event.taskId }
-              : t
-          )
-        }
-      }
-      return { ...prev, toolActivities: nextActivities }
-    }
-
+    case 'task_started':
     case 'shell_backgrounded':
-      return {
-        ...prev,
-        toolActivities: prev.toolActivities.map((t) =>
-          t.toolUseId === event.toolUseId
-            ? { ...t, isBackground: true, shellId: event.shellId, done: true }
-            : t
-        ),
-      }
-
     case 'shell_killed':
-      return prev
-
     case 'task_notification':
-      return prev
+      return clearFinishedCompactionForResumedWork(prev)
 
-    case 'thinking_tokens':
+    case 'thinking_tokens': {
+      const resumed = clearFinishedCompactionForResumedWork(prev)
       return {
-        ...prev,
+        ...resumed,
         thinkingEstimatedTokens: event.estimatedTokens,
       }
+    }
 
     case 'tool_use_summary':
       // 工具使用摘要 — 目前不影响流式状态，仅用于 UI 展示
       return prev
 
-    case 'complete':
+    case 'complete': {
       // 成功完成 — 清除 retrying，但保持 running: true
       // 等待 STREAM_COMPLETE IPC 回调通过删除流式状态来控制 UI 就绪状态
       // 这避免了用户在后端尚未完成清理时就能发送新消息的竞态条件
       // 同时将未完成的工具活动标记为 done（兜底）
       //
-      // token 计数（inputTokens / 缓存 / outputTokens）只信任流式中每条 assistant
+      // token 计数（inputTokens / 缓存 / outputTokens）默认只信任流式中每条 assistant
       // 消息的 usage_update：单条模型调用的 input+缓存 ≈ 当轮完整 prompt = 当前真实上下文。
-      // 这里【不再】从 result.usage 写入这些字段——SDK 的 result.usage 是整个 query 内所有
-      // 模型调用的累计求和（cache_read 会被累加 N 次），当成当前上下文会让进度环虚高、冲破 100%。
+      // SDK 的 result.usage 是整个 query 内所有模型调用的累计求和（cache_read 会被累加 N 次），
+      // 直接覆盖会让进度环虚高、冲破 100%（PR #821 修的正是这个问题）。
       //
-      // 仅从 result 取两个货真价实的值：
-      // - contextWindow：进度环分母（窗口大小，非用量）
-      // - costUsd：本就该是整轮累计成本
+      // 但 GLM-5.2 等走 Anthropic 兼容端点的渠道，流式 assistant 消息不携带 usage 字段，
+      // 真实值只在 result 中返回。若完全不用 result.usage，这些渠道的 ContextUsageBadge
+      // 永远停留在 inputTokens=0 不显示。
+      //
+      // 折中：仅当「整个 query 期间从未收到流式 usage_update」（prev.inputTokens 为空/0）
+      // 才从 result.usage 兜底写入 token 字段；已有流式真实值时不动。
+      // - contextWindow：取流式与 result 的较大值（result 未必更权威——多 entry 时
+      //   子 Agent 的小窗口可能拉低值，Fix 1/2 已从源头取 max，此处作为安全网）。
+      // - costUsd：始终覆盖（本就该是整轮累计成本）
+      const needResultFallback = !prev.inputTokens || prev.inputTokens <= 0 || prev.contextUsageIsEstimated === true
+      const shouldUseResultUsage = needResultFallback
+        && event.usage?.inputTokens != null
+        && (event.usage.inputTokens > 0 || prev.contextUsageIsEstimated !== true)
       return {
         ...prev,
         ...(event.usage ? {
           ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
-          ...(event.usage.contextWindow != null && { contextWindow: event.usage.contextWindow }),
-          ...(event.usage.contextWindow != null && { usageUpdatedAt: Date.now() }),
+          ...(event.usage.contextWindow != null && {
+            contextWindow: prev.contextWindow != null
+              ? Math.max(prev.contextWindow, event.usage.contextWindow)
+              : event.usage.contextWindow,
+          }),
+          ...(shouldUseResultUsage && {
+            inputTokens: event.usage.inputTokens,
+            outputTokens: event.usage.outputTokens,
+            cacheReadTokens: event.usage.cacheReadTokens,
+            cacheCreationTokens: event.usage.cacheCreationTokens,
+            contextUsageIsEstimated: false,
+          }),
         } : {}),
         retrying: undefined,
-        ...finalizeStreamingActivities(prev.toolActivities),
       }
+    }
 
-    case 'run_resumed':
+    case 'run_resumed': {
       // 后台任务完成自动唤醒：从"空闲可输入"恢复到运行态（防御性，监听器已显式处理）。
-      return { ...prev, running: true, backgroundWaiting: false }
+      const resumed = clearFinishedCompactionForResumedWork(prev)
+      return { ...resumed, running: true, backgroundWaiting: false }
+    }
 
     case 'typed_error':
-      // 处理类型化错误（TypedError）
-      // 停止运行，清除重试状态
-      return { ...prev, running: false, retrying: undefined }
+      // 终态 IPC 仍可能在后端清理前到达；统一由 STREAM_COMPLETE 释放运行锁，
+      // 避免用户在 active session 尚未销毁时抢先启动新 run。
+      return { ...prev, retrying: undefined }
 
     case 'error':
-      // 改进：error 事件不再清除 retrying 状态
-      // retrying 状态由专用事件控制
-      return { ...prev, running: false }
+      // 同上：保留运行锁和 retry 状态，等待专用 retry 终态或 STREAM_COMPLETE 收束。
+      return prev
 
-    case 'usage_update':
+    case 'usage_update': {
+      const resumed = clearFinishedCompactionForResumedWork(prev)
       return {
-        ...prev,
-        ...(event.usage.inputTokens != null && { inputTokens: event.usage.inputTokens }),
+        ...resumed,
+        ...(event.usage.inputTokens != null && {
+          inputTokens: event.usage.inputTokens,
+          contextUsageIsEstimated: false,
+        }),
         ...(event.usage.outputTokens != null && { outputTokens: event.usage.outputTokens }),
         ...(event.usage.cacheReadTokens != null && { cacheReadTokens: event.usage.cacheReadTokens }),
         ...(event.usage.cacheCreationTokens != null && { cacheCreationTokens: event.usage.cacheCreationTokens }),
         ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
-        // 流式中 assistant 消息的 usage_update 可能携带推断的 contextWindow，
-        // 若已有 result 消息提供的真实值，则不再覆盖
-        ...(event.usage.contextWindow && !prev.contextWindow && { contextWindow: event.usage.contextWindow }),
-        usageUpdatedAt: Date.now(),
+        // contextWindow 取 max：本分支同时承载「流式 assistant 消息按模型名推断的窗口」
+        // 与「后端从 SDK result 透传的真实窗口（context_window 事件）」两个来源。
+        // 模型窗口在同一会话内不会缩小，取更大值可兼顾两类端点——既不会让推断偏小的
+        // 端点（如 GLM 剥掉 [1m] 后缀）挡住真实的 1M，也不会让回报偏小的端点覆盖正确的 1M。
+        ...(event.usage.contextWindow && {
+          contextWindow: Math.max(resumed.contextWindow ?? 0, event.usage.contextWindow),
+        }),
       }
+    }
 
     case 'compacting':
-      return { ...prev, isCompacting: true, compactInFlight: true }
+      return {
+        ...prev,
+        isCompacting: true,
+        compactInFlight: true,
+        contextCompaction: { status: 'running' },
+      }
 
-    case 'compact_complete':
-      return { ...prev, isCompacting: false }
+    case 'compact_complete': {
+      const contextCompaction = {
+        status: event.status,
+        summary: event.summary,
+        message: event.message,
+      }
+      if (event.estimatedTokensAfter == null) {
+        return { ...prev, isCompacting: false, contextCompaction }
+      }
+      return {
+        ...prev,
+        isCompacting: false,
+        contextCompaction,
+        inputTokens: event.estimatedTokensAfter,
+        outputTokens: undefined,
+        cacheReadTokens: undefined,
+        cacheCreationTokens: undefined,
+        contextUsageIsEstimated: true,
+      }
+    }
 
     case 'model_resolved':
       // 不用 SDK 返回的实际模型名覆盖，保持用户选择的 modelId
       // 以确保 resolveModelDisplayName 能匹配到渠道配置的显示名
       return prev
 
-    case 'retrying':
-      // 向后兼容：保留原有的简单 retrying 事件
-      return {
-        ...prev,
-        retrying: prev.retrying ?? {
-          currentAttempt: event.attempt,
-          maxAttempts: event.maxAttempts,
-          history: [],
-          failed: false,
-        },
-      }
-
-    case 'retry_attempt': {
-      // 新增：记录详细的重试尝试
-      const currentHistory = prev.retrying?.history ?? []
+    case 'retrying': {
+      if (!isRetryEventForCurrentStream(prev, event)) return prev
+      const previousRetry = prev.retrying
+      // 同一顶层 run 的下一段连续错误从 1 开始时，开始新的历史；同一段的 1 → 2
+      // 则保留已实际执行的记录。
+      const isNewCycle = event.attempt === 1
+        && previousRetry != null
+        && previousRetry.phase !== 'scheduled'
+        && previousRetry.phase !== 'running'
       return {
         ...prev,
         retrying: {
-          currentAttempt: event.attemptData.attempt,
-          maxAttempts: prev.retrying?.maxAttempts ?? 3,
-          history: [...currentHistory, event.attemptData],
-          failed: false,
+          runStartedAt: event.runStartedAt ?? previousRetry?.runStartedAt,
+          phase: 'scheduled',
+          currentAttempt: event.attempt,
+          maxAttempts: event.maxAttempts,
+          totalAttempt: event.totalAttempt ?? previousRetry?.totalAttempt,
+          maxTotalAttempts: event.maxTotalAttempts ?? previousRetry?.maxTotalAttempts,
+          history: isNewCycle ? [] : (previousRetry?.history ?? []),
+          scheduledAt: event.scheduledAt ?? Date.now(),
+          delaySeconds: event.delaySeconds,
+          reason: event.reason,
         },
       }
     }
 
-    case 'retry_cleared':
-      // 新增：重试成功，清除状态
-      return { ...prev, retrying: undefined }
-
-    case 'retry_failed': {
-      // 新增：重试失败，标记为 failed 但保留历史
-      const finalHistory = prev.retrying?.history ?? []
+    case 'retry_attempt': {
+      if (!isRetryEventForCurrentStream(prev, event)) return prev
+      const previousRetry = prev.retrying
+      const isNewCycle = event.attemptData.attempt === 1
+        && previousRetry != null
+        && previousRetry.phase !== 'scheduled'
+        && previousRetry.phase !== 'running'
+      const history = upsertRetryAttempt(
+        isNewCycle ? [] : (previousRetry?.history ?? []),
+        event.attemptData,
+      )
       return {
         ...prev,
-        running: false,
         retrying: {
+          runStartedAt: event.runStartedAt ?? previousRetry?.runStartedAt,
+          phase: 'running',
+          currentAttempt: event.attemptData.attempt,
+          maxAttempts: event.maxAttempts ?? previousRetry?.maxAttempts ?? 3,
+          totalAttempt: event.totalAttempt ?? event.attemptData.totalAttempt ?? previousRetry?.totalAttempt,
+          maxTotalAttempts: event.maxTotalAttempts ?? event.attemptData.maxTotalAttempts ?? previousRetry?.maxTotalAttempts,
+          history,
+          reason: event.attemptData.reason,
+        },
+      }
+    }
+
+    case 'retry_cleared': {
+      if (!isRetryEventForCurrentStream(prev, event) || !prev.retrying) return prev
+      return {
+        ...prev,
+        retrying: {
+          ...prev.retrying,
+          phase: 'succeeded',
+          scheduledAt: undefined,
+          delaySeconds: undefined,
+          currentAttempt: event.attempt ?? prev.retrying.currentAttempt,
+          maxAttempts: event.maxAttempts ?? prev.retrying.maxAttempts,
+          totalAttempt: event.totalAttempt ?? prev.retrying.totalAttempt,
+          maxTotalAttempts: event.maxTotalAttempts ?? prev.retrying.maxTotalAttempts,
+          reason: undefined,
+        },
+      }
+    }
+
+    case 'retry_failed': {
+      if (!isRetryEventForCurrentStream(prev, event)) return prev
+      const previousRetry = prev.retrying
+      return {
+        ...prev,
+        // session.prompt() 与 adapter 资源清理尚未完成；由 STREAM_COMPLETE 释放运行锁。
+        retrying: {
+          runStartedAt: event.runStartedAt ?? previousRetry?.runStartedAt,
+          phase: 'exhausted',
           currentAttempt: event.finalAttempt.attempt,
-          maxAttempts: prev.retrying?.maxAttempts ?? 3,
-          history: [...finalHistory, event.finalAttempt],
-          failed: true,
+          maxAttempts: event.maxAttempts ?? previousRetry?.maxAttempts ?? 3,
+          totalAttempt: event.totalAttempt ?? event.finalAttempt.totalAttempt ?? previousRetry?.totalAttempt,
+          maxTotalAttempts: event.maxTotalAttempts ?? event.finalAttempt.maxTotalAttempts ?? previousRetry?.maxTotalAttempts,
+          history: upsertRetryAttempt(previousRetry?.history ?? [], event.finalAttempt),
+          reason: event.finalAttempt.reason,
+        },
+      }
+    }
+
+    case 'retry_cancelled': {
+      if (!isRetryEventForCurrentStream(prev, event)) return prev
+      const previousRetry = prev.retrying
+      return {
+        ...prev,
+        // 取消 retry 不代表外围 prompt chain 已结束；由 STREAM_COMPLETE 释放运行锁。
+        retrying: {
+          runStartedAt: event.runStartedAt ?? previousRetry?.runStartedAt,
+          phase: 'cancelled',
+          currentAttempt: event.attempt,
+          maxAttempts: event.maxAttempts,
+          totalAttempt: event.totalAttempt ?? previousRetry?.totalAttempt,
+          maxTotalAttempts: event.maxTotalAttempts ?? previousRetry?.maxTotalAttempts,
+          history: previousRetry?.history ?? [],
+          reason: event.reason ?? previousRetry?.reason,
         },
       }
     }
@@ -827,15 +1107,15 @@ export interface AgentContextStatus {
   cacheCreationTokens?: number
   costUsd?: number
   contextWindow?: number
-  /** usage 数据最后更新时间戳（毫秒） */
-  usageUpdatedAt?: number
+  /** 当前上下文 token 是否为 Pi 手动压缩后的预估值 */
+  contextUsageIsEstimated?: boolean
 }
 
 /** 当前会话的上下文使用量派生 atom */
 export const agentContextStatusAtom = atom<AgentContextStatus>((get) => {
   const currentId = get(currentAgentSessionIdAtom)
   if (!currentId) return { isCompacting: false }
-  const state = get(agentStreamingStatesAtom).get(currentId)
+  const state = get(agentSessionStreamingStateAtomFamily(currentId))
   return {
     isCompacting: state?.isCompacting ?? false,
     inputTokens: state?.inputTokens,
@@ -844,7 +1124,7 @@ export const agentContextStatusAtom = atom<AgentContextStatus>((get) => {
     cacheCreationTokens: state?.cacheCreationTokens,
     costUsd: state?.costUsd,
     contextWindow: state?.contextWindow,
-    usageUpdatedAt: state?.usageUpdatedAt,
+    contextUsageIsEstimated: state?.contextUsageIsEstimated,
   }
 })
 
@@ -853,6 +1133,17 @@ export const agentContextStatusAtom = atom<AgentContextStatus>((get) => {
  * 错误发生时写入，下次发送或手动关闭时清除
  */
 export const agentStreamErrorsAtom = atom<Map<string, string>>(new Map())
+
+/** 在同一会话确认恢复运行后移除过期的流式错误记录。 */
+export function clearAgentStreamError(
+  errors: Map<string, string>,
+  sessionId: string,
+): Map<string, string> {
+  if (!errors.has(sessionId)) return errors
+  const next = new Map(errors)
+  next.delete(sessionId)
+  return next
+}
 
 /**
  * Agent 消息刷新版本 Map — 以 sessionId 为 key
@@ -906,6 +1197,14 @@ export const currentAgentErrorAtom = atom<string | null>((get) => {
  * 用于在切换会话时保留输入框内容
  */
 export const agentSessionDraftsAtom = atom<Map<string, string>>(new Map())
+
+/** 明确外部草稿写入的版本号；RichTextInput 用它区分本地回写与强制覆盖。 */
+export const agentSessionDraftSyncVersionsAtom = atom<Map<string, number>>(new Map())
+
+/** 单个 session 的外部草稿同步版本派生 atom。 */
+export const agentSessionDraftSyncVersionAtomFamily = atomFamily((sessionId: string) =>
+  atom((get) => get(agentSessionDraftSyncVersionsAtom).get(sessionId) ?? 0),
+)
 
 /** 单个 session 的 markdown 草稿派生 atom — 按 sessionId 切片订阅 */
 export const agentSessionDraftAtomFamily = atomFamily((sessionId: string) =>

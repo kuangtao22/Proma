@@ -6,15 +6,16 @@
  * - 角色：user / assistant（不支持 system 角色，system 通过 body.system 传递）
  * - 图片格式：{ type: 'image', source: { type: 'base64', media_type, data } }
  * - SSE 解析：content_block_delta → text，thinking_delta → reasoning，tool_use 支持
- * - 认证：x-api-key + Authorization: Bearer（Kimi Coding Plan 只用 Bearer）
+ * - 认证：按供应商差异发送 api-key / x-api-key / Authorization
  * - 同时适配 Anthropic 原生 API、DeepSeek、Kimi API、Kimi Coding Plan、MiniMax
  *
  * 思考模式按模型能力分支（见 thinking-capability.ts）：
  * - Opus 4.7 / Mythos Preview：adaptive 唯一模式（发 `{type: 'adaptive'}`）
- * - Opus 4.6 / Sonnet 4.6：推荐 adaptive
+ * - Opus 4.6 / Sonnet 5：推荐 adaptive
  * - DeepSeek v4 系列：`{type: 'enabled'}` + `output_config.effort = 'max'`
  * - 更老的 Claude 系列及 DeepSeek v3：manual（旧版 `{type: 'enabled', budget_tokens}`）
- * - Kimi（kimi-api / kimi-coding）：不发 thinking 字段（K2 系列非 reasoning 模型）
+ * - K3 / GLM-5.2：由 shared reasoning profile 编译为 adaptive + effort
+ * - Kimi（K2 系列）：不发 thinking 字段
  * - MiniMax：不发 thinking 字段，接收服务端返回的 thinking 块
  *
  * Kimi Coding Plan 特殊要求：
@@ -23,7 +24,7 @@
  * - UA 格式：`Proma/<version> (+https://github.com/ErlichLiu/Proma)`
  */
 
-import type { ProviderType } from '@proma/shared'
+import { extractZhipuCodingTeamApiToken, type ProviderType } from '@proma/shared'
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -34,7 +35,7 @@ import type {
   ToolDefinition,
   ContinuationMessage,
 } from './types.ts'
-import { normalizeAnthropicProviderUrl } from './url-utils.ts'
+import { resolveAnthropicMessagesUrl } from './url-utils.ts'
 import { detectThinkingCapability } from './thinking-capability.ts'
 import { getPromaUserAgent } from './user-agent.ts'
 
@@ -261,9 +262,9 @@ export class AnthropicAdapter implements ProviderAdapter {
     this.providerType = providerType
   }
 
-  /** 根据 provider 类型选择 URL 规范化方式 */
-  private normalizeUrl(baseUrl: string): string {
-    return normalizeAnthropicProviderUrl(baseUrl, this.providerType)
+  /** 根据 provider 类型解析 Messages 请求地址 */
+  private resolveMessagesUrl(baseUrl: string): string {
+    return resolveAnthropicMessagesUrl(baseUrl, this.providerType)
   }
 
   /**
@@ -278,18 +279,22 @@ export class AnthropicAdapter implements ProviderAdapter {
       'anthropic-version': '2023-06-01',
       'content-type': 'application/json',
     }
-    if (this.providerType === 'kimi-coding' || this.providerType === 'zhipu-coding') {
+    if (this.providerType === 'kimi-coding' || this.providerType === 'zhipu-coding' || this.providerType === 'zhipu-coding-team') {
+      base['Authorization'] = `Bearer ${this.providerType === 'zhipu-coding-team' ? extractZhipuCodingTeamApiToken(apiKey) : apiKey}`
+      base['User-Agent'] = getPromaUserAgent()
+      return base
+    }
+    if (this.providerType === 'xiaomi-token-plan' || this.providerType === 'qwen-token-plan') {
       base['Authorization'] = `Bearer ${apiKey}`
       base['User-Agent'] = getPromaUserAgent()
       return base
     }
-    if (this.providerType === 'xiaomi-token-plan') {
+    if (this.providerType === 'minimax' || this.providerType === 'qwen-anthropic') {
       base['Authorization'] = `Bearer ${apiKey}`
-      base['User-Agent'] = getPromaUserAgent()
       return base
     }
-    if (this.providerType === 'minimax') {
-      base['Authorization'] = `Bearer ${apiKey}`
+    if (this.providerType === 'xiaomi') {
+      base['api-key'] = apiKey
       return base
     }
     // 其它渠道：保持双认证头（Anthropic 原生 + Bearer 兼容）
@@ -299,7 +304,7 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   buildStreamRequest(input: StreamRequestInput): ProviderRequest {
-    const url = this.normalizeUrl(input.baseUrl)
+    const url = this.resolveMessagesUrl(input.baseUrl)
     const messages = toAnthropicMessages(input)
     const capability = detectThinkingCapability(this.providerType, input.modelId)
 
@@ -343,6 +348,9 @@ export class AnthropicAdapter implements ProviderAdapter {
           type: 'adaptive',
           display: 'summarized',
         }
+        if (capability.effort) {
+          body.output_config = { effort: capability.effort }
+        }
       } else if (capability.mode === 'manual-only') {
         body.thinking = {
           type: 'enabled',
@@ -374,7 +382,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     }
 
     return {
-      url: `${url}/messages`,
+      url,
       headers: this.buildHeaders(input.apiKey),
       body: requestBody,
     }
@@ -441,7 +449,7 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   buildTitleRequest(input: TitleRequestInput): ProviderRequest {
-    const url = this.normalizeUrl(input.baseUrl)
+    const url = this.resolveMessagesUrl(input.baseUrl)
     const capability = detectThinkingCapability(this.providerType, input.modelId)
 
     const body: Record<string, unknown> = {
@@ -458,7 +466,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     }
 
     return {
-      url: `${url}/messages`,
+      url,
       headers: this.buildHeaders(input.apiKey),
       body: JSON.stringify(body),
     }

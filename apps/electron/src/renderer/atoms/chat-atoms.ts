@@ -6,7 +6,7 @@
  */
 
 import { atom } from 'jotai'
-import { atomWithStorage } from 'jotai/utils'
+import { atomFamily, atomWithStorage } from 'jotai/utils'
 import type { ConversationMeta, ChatMessage, FileAttachment, ChatToolActivity, Channel } from '@proma/shared'
 
 /** 全局渠道列表缓存（启动时加载一次，设置变更时刷新） */
@@ -14,6 +14,9 @@ export const channelsAtom = atom<Channel[]>([])
 
 /** 渠道列表是否已完成首次加载 */
 export const channelsLoadedAtom = atom(false)
+
+/** 主输入框「模型选择器」是否打开（错误卡片的「重新选择模型」按钮会置 true） */
+export const modelSelectorOpenAtom = atom(false)
 
 /** 选中的模型信息 */
 export interface SelectedModel {
@@ -32,6 +35,9 @@ export const conversationsAtom = atom<ConversationMeta[]>([])
 
 /** 当前对话 ID */
 export const currentConversationIdAtom = atom<string | null>(null)
+
+/** Agent 会话右侧 Chat 面板，key 为 Agent sessionId，value 为 Chat conversationId */
+export const agentSideChatMapAtom = atom<Map<string, string>>(new Map())
 
 /** 当前对话的消息列表 */
 export const currentMessagesAtom = atom<ChatMessage[]>([])
@@ -57,15 +63,29 @@ export const streamingStatesAtom = atom<Map<string, ConversationStreamState>>(ne
 
 /**
  * 当前正在流式输出的对话 ID 集合（派生只读原子）
- * 用于侧边栏绿色呼吸点指示器
+ * 用于侧边栏绿色呼吸点指示器。
+ *
+ * 流式文本 chunk 会频繁替换 streamingStatesAtom，但通常不会改变正在运行的
+ * conversation ID。复用相同 Set 引用可避免订阅该 atom 的侧边栏按 token 重渲染。
  */
+let previousStreamingConversationIds = new Set<string>()
+let previousStreamingConversationIdsSignature = ''
+
 export const streamingConversationIdsAtom = atom<Set<string>>((get) => {
   const states = get(streamingStatesAtom)
-  const ids = new Set<string>()
+  const ids: string[] = []
   for (const [id, state] of states) {
-    if (state.streaming) ids.add(id)
+    if (state.streaming) ids.push(id)
   }
-  return ids
+  ids.sort()
+  const signature = ids.join('\u0000')
+  if (signature === previousStreamingConversationIdsSignature) {
+    return previousStreamingConversationIds
+  }
+
+  previousStreamingConversationIdsSignature = signature
+  previousStreamingConversationIds = new Set(ids)
+  return previousStreamingConversationIds
 })
 
 /**
@@ -190,6 +210,14 @@ export const currentChatErrorAtom = atom<string | null>((get) => {
  */
 export const conversationDraftsAtom = atom<Map<string, string>>(new Map())
 
+/** 明确外部草稿写入的版本号；RichTextInput 用它区分本地回写与强制覆盖。 */
+export const conversationDraftSyncVersionsAtom = atom<Map<string, number>>(new Map())
+
+/** 单个对话的外部草稿同步版本派生 atom。 */
+export const conversationDraftSyncVersionAtomFamily = atomFamily((conversationId: string) =>
+  atom((get) => get(conversationDraftSyncVersionsAtom).get(conversationId) ?? 0),
+)
+
 /** 当前对话的草稿内容（派生读写原子） */
 export const currentConversationDraftAtom = atom(
   (get) => {
@@ -261,9 +289,3 @@ export const conversationThinkingEnabledAtom = atom<Map<string, boolean>>(new Ma
 
 /** 每个对话的并排模式 */
 export const conversationParallelModeAtom = atom<Map<string, boolean>>(new Map())
-
-/** 思考块默认展开偏好（持久化到 localStorage） */
-export const thinkingExpandedAtom = atomWithStorage<boolean>(
-  'proma-thinking-expanded',
-  false,
-)

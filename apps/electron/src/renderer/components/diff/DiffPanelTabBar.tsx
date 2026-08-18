@@ -1,33 +1,46 @@
 /**
  * DiffPanelTabBar — 右侧面板顶部 Tab 栏
  *
- * 切换「会话文件」「工作区文件」和「代码改动」三个视图。最右侧有关闭按钮。
+ * 切换「文件」和「代码改动」视图。文件内同时展示会话文件与项目文件。
  */
 
 import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { PanelRightClose } from 'lucide-react'
+import { PanelRightClose, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { WINDOW_CONTROLS_INSET_RIGHT } from '@/lib/platform'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { agentDiffUnseenChangesAtom, currentAgentSessionIdAtom } from '@/atoms/agent-atoms'
-
-type DiffPanelTab = 'session' | 'workspace' | 'changes'
+import type { AgentSidePanelTab } from '@/atoms/agent-atoms'
+import { interfaceVariantAtom } from '@/atoms/theme'
 
 interface DiffPanelTabBarProps {
-  activeTab: DiffPanelTab
-  onTabChange: (tab: DiffPanelTab) => void
+  activeTab: AgentSidePanelTab
+  onTabChange: (tab: AgentSidePanelTab) => void
   onClose?: () => void
+  onCloseChat?: () => void
+  showChatTab?: boolean
+  isWindows?: boolean
 }
 
 interface PreviousTabState {
   sessionId: string | null
-  activeTab: DiffPanelTab
+  activeTab: AgentSidePanelTab
 }
 
-export function DiffPanelTabBar({ activeTab, onTabChange, onClose }: DiffPanelTabBarProps): React.ReactElement {
+export function DiffPanelTabBar({
+  activeTab,
+  onTabChange,
+  onClose,
+  onCloseChat,
+  showChatTab = false,
+  isWindows = false,
+}: DiffPanelTabBarProps): React.ReactElement {
   const unseenMap = useAtomValue(agentDiffUnseenChangesAtom)
   const setUnseenMap = useSetAtom(agentDiffUnseenChangesAtom)
   const currentSessionId = useAtomValue(currentAgentSessionIdAtom)
+  const interfaceVariant = useAtomValue(interfaceVariantAtom)
+  const isClassic = interfaceVariant === 'classic'
   const unseenChanges = unseenMap.get(currentSessionId ?? '') ?? false
   const prevTabStateRef = React.useRef<PreviousTabState>({ sessionId: currentSessionId, activeTab })
 
@@ -59,43 +72,40 @@ export function DiffPanelTabBar({ activeTab, onTabChange, onClose }: DiffPanelTa
 
   return (
     <div className="flex items-end h-[34px] tabbar-bg relative flex-shrink-0">
-      <div className="absolute inset-0 titlebar-drag-region" />
+      <div className={cn("absolute inset-0 titlebar-drag-region", isWindows && WINDOW_CONTROLS_INSET_RIGHT)} />
       <div className="relative flex items-end flex-1 titlebar-no-drag">
         <button
           type="button"
-          onClick={() => onTabChange('session')}
+          onClick={() => onTabChange('files')}
           className={cn(
-            'flex-1 px-3 h-[34px] rounded-t-lg text-xs transition-colors select-none cursor-pointer',
+            'flex-1 px-3 h-[34px] text-xs transition-colors select-none cursor-pointer whitespace-nowrap overflow-hidden',
+            isClassic ? 'rounded-t-lg' : 'rounded-none',
             'border-t border-l border-r',
-            activeTab === 'session'
-              ? 'bg-content-area text-foreground border-border/50'
-              : 'text-muted-foreground border-transparent hover:text-foreground hover:bg-muted/50',
+            activeTab === 'files'
+              ? isClassic
+                ? 'bg-content-area text-foreground border-border/50'
+                : 'app-tab-active text-foreground border-border/80'
+              : isClassic
+                ? 'text-muted-foreground border-transparent hover:text-foreground hover:bg-muted/50'
+                : 'app-tab-inactive text-muted-foreground border-transparent hover:text-foreground',
           )}
         >
-          会话文件
-        </button>
-        <button
-          type="button"
-          onClick={() => onTabChange('workspace')}
-          className={cn(
-            'flex-1 px-3 h-[34px] rounded-t-lg text-xs transition-colors select-none cursor-pointer',
-            'border-t border-l border-r',
-            activeTab === 'workspace'
-              ? 'bg-content-area text-foreground border-border/50'
-              : 'text-muted-foreground border-transparent hover:text-foreground hover:bg-muted/50',
-          )}
-        >
-          工作区文件
+          文件
         </button>
         <button
           type="button"
           onClick={handleChangesClick}
           className={cn(
-            'flex-1 px-3 h-[34px] rounded-t-lg text-xs transition-colors select-none cursor-pointer relative',
+            'flex-1 px-3 h-[34px] text-xs transition-colors select-none cursor-pointer relative whitespace-nowrap overflow-hidden',
+            isClassic ? 'rounded-t-lg' : 'rounded-none',
             'border-t border-l border-r',
             activeTab === 'changes'
-              ? 'bg-content-area text-foreground border-border/50'
-              : 'text-muted-foreground border-transparent hover:text-foreground hover:bg-muted/50',
+              ? isClassic
+                ? 'bg-content-area text-foreground border-border/50'
+                : 'app-tab-active text-foreground border-border/80'
+              : isClassic
+                ? 'text-muted-foreground border-transparent hover:text-foreground hover:bg-muted/50'
+                : 'app-tab-inactive text-muted-foreground border-transparent hover:text-foreground',
           )}
         >
           <span className="inline-flex items-center gap-1">
@@ -105,6 +115,42 @@ export function DiffPanelTabBar({ activeTab, onTabChange, onClose }: DiffPanelTa
             文件改动
           </span>
         </button>
+        {showChatTab && (
+          <div
+            className={cn(
+              'flex-1 h-[34px] text-xs transition-colors select-none relative whitespace-nowrap overflow-hidden',
+              isClassic ? 'rounded-t-lg' : 'rounded-none',
+              'border-t border-l border-r',
+              activeTab === 'chat'
+                ? isClassic
+                  ? 'bg-content-area text-foreground border-border/50'
+                  : 'app-tab-active text-foreground border-border/80'
+                : isClassic
+                  ? 'text-muted-foreground border-transparent hover:text-foreground hover:bg-muted/50'
+                  : 'app-tab-inactive text-muted-foreground border-transparent hover:text-foreground',
+            )}
+          >
+            <div className="flex h-full items-center">
+              <button
+                type="button"
+                onClick={() => onTabChange('chat')}
+                className="min-w-0 flex-1 self-stretch px-2 text-left"
+              >
+                <span className="block truncate text-center">问答</span>
+              </button>
+              {onCloseChat && (
+                <button
+                  type="button"
+                  className="mr-1 inline-flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted/70 hover:text-foreground"
+                  aria-label="关闭问答 Tab"
+                  onClick={onCloseChat}
+                >
+                  <X className="size-3" />
+                </button>
+              )}
+            </div>
+          </div>
+        )}
         {/* 右侧关闭按钮（常驻，三个 tab 下都可见） */}
         {onClose && (
           <Tooltip>

@@ -26,20 +26,59 @@ interface AutomationsIndex {
   automations: Automation[]
 }
 
-const INDEX_VERSION = 2
+const INDEX_VERSION = 4
 
 /**
- * 兼容历史 sessionMode 字面量：v1 用过的 'new' 值统一改为 'daily'。
+ * 兼容历史字段：
+ * - sessionMode：v1 用过的 'new' 值统一改为 'daily'。
+ * - permissionMode：已移除的 'auto' 统一改为默认完全自动模式。
  * - v1 默认值 'new' 的语义是「每次新建会话」；v2 的 'daily' 默认行为是「同日复用、跨日新建」，
  *   高频任务可少占左侧栏 tab，低频任务（间隔 ≥ 24h）的实际行为等价于「每次新建」，对用户无负面影响。
  * - 同时把 index.version bump 到当前值，避免下次启动反复迁移。
  * 返回是否发生改动，由调用方决定是否写回磁盘。
  */
-function migrateLegacySessionMode(data: AutomationsIndex): boolean {
+function migrateLegacyFields(data: AutomationsIndex): boolean {
   let changed = false
   for (const a of data.automations) {
     if ((a.sessionMode as string | undefined) === 'new') {
       a.sessionMode = 'daily'
+      changed = true
+    }
+    const permissionMode = a.permissionMode as string | undefined
+    if (permissionMode && permissionMode !== AUTOMATION_DEFAULT_PERMISSION_MODE) {
+      a.permissionMode = AUTOMATION_DEFAULT_PERMISSION_MODE
+      changed = true
+    }
+    const beforeScheduleFields = JSON.stringify({
+      scheduleType: a.scheduleType,
+      activeWindowStart: a.activeWindowStart,
+      activeWindowEnd: a.activeWindowEnd,
+      activeWeekdays: a.activeWeekdays,
+      timeOfDay: a.timeOfDay,
+      dayOfWeek: a.dayOfWeek,
+      dayOfMonth: a.dayOfMonth,
+      scheduledAt: a.scheduledAt,
+    })
+    normalizeAutomationScheduleFields(a)
+    if (beforeScheduleFields !== JSON.stringify({
+      scheduleType: a.scheduleType,
+      activeWindowStart: a.activeWindowStart,
+      activeWindowEnd: a.activeWindowEnd,
+      activeWeekdays: a.activeWeekdays,
+      timeOfDay: a.timeOfDay,
+      dayOfWeek: a.dayOfWeek,
+      dayOfMonth: a.dayOfMonth,
+      scheduledAt: a.scheduledAt,
+    })) changed = true
+    // 因此清空 lastSessionId，下一次运行必定创建新的 Pi 会话。
+    const raw = a as Automation & { agentRuntime?: unknown }
+    const wasLegacyRuntime = raw.agentRuntime !== 'pi'
+    if ('agentRuntime' in raw) {
+      delete raw.agentRuntime
+      changed = true
+    }
+    if (wasLegacyRuntime && a.lastSessionId) {
+      a.lastSessionId = undefined
       changed = true
     }
   }
@@ -89,11 +128,11 @@ function readIndex(): AutomationsIndex {
     cachedIndex = { version: INDEX_VERSION, automations: [] }
     return cachedIndex
   }
-  const migrated = migrateLegacySessionMode(data)
+  const migrated = migrateLegacyFields(data)
   cachedIndex = data
   if (migrated) {
     writeIndex(data)
-    console.log('[定时任务] 索引已迁移至最新版本（sessionMode: new → daily）')
+    console.log('[定时任务] 索引已迁移至最新版本（sessionMode: new → daily，permissionMode: auto → bypassPermissions）')
   }
   return cachedIndex
 }
@@ -114,12 +153,14 @@ function writeIndex(index: AutomationsIndex): void {
  * - interval：from + 间隔分钟
  * - daily：今天/明天的 timeOfDay
  * - weekly：本周/下周 dayOfWeek 的 timeOfDay
+ * - once：直接返回固定的 scheduledAt（不做任何前进推算），跑完后由 appendRun 自动停用
+ * - interval 叠加 activeWindowStart/activeWindowEnd 时，仅在每日窗口内运行；窗口外自动跳至下一天窗口开始
  *
  * 返回值保证为有限正整数。输入非法时回退到 from + 10min 并打印警告。
  */
 export function computeNextRunAt(
   a: { scheduleType: Automation['scheduleType'] } & Partial<
-    Pick<Automation, 'intervalMinutes' | 'timeOfDay' | 'dayOfWeek' | 'dayOfMonth'>
+    Pick<Automation, 'intervalMinutes' | 'activeWindowStart' | 'activeWindowEnd' | 'activeWeekdays' | 'timeOfDay' | 'dayOfWeek' | 'dayOfMonth' | 'scheduledAt'>
   >,
   from: number = Date.now(),
 ): number {
@@ -127,13 +168,85 @@ export function computeNextRunAt(
 
   let result: number
 
-  if (a.scheduleType === 'interval') {
+  if (a.scheduleType === 'once') {
+    // 一次性任务：永远返回固定的绝对时间戳，不随 from 前进。
+    // 即使该时刻已过去（如应用重启后恢复），也保持过去值——让调度器在下个 tick 补跑一次，
+    // 这正是「该跑没跑就补上」的期望行为；跑完后 appendRun 会把任务自动停用，不会重复触发。
+    result = Number.isFinite(a.scheduledAt) && a.scheduledAt! > 0
+      ? a.scheduledAt!
+      : from + FALLBACK_INTERVAL_MS
+    if (!Number.isFinite(a.scheduledAt) || a.scheduledAt! <= 0) {
+      console.warn(`[定时任务] computeNextRunAt: once 缺少有效 scheduledAt (${a.scheduledAt})，回退到 10 分钟后`)
+    }
+  } else if (a.scheduleType === 'interval') {
     const minutes = Number(a.intervalMinutes)
     if (!Number.isFinite(minutes) || minutes < 1) {
       console.warn(`[定时任务] computeNextRunAt: intervalMinutes 非法 (${a.intervalMinutes})，回退到 10 分钟`)
       result = from + FALLBACK_INTERVAL_MS
     } else {
-      result = from + Math.max(1, minutes) * 60_000
+      const step = Math.max(1, minutes) * 60_000
+      const parseWindowTime = (value: string | undefined): [number, number] | undefined => {
+        if (!value || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)) return undefined
+        const [hours, minutes] = value.split(':').map(Number)
+        return [hours!, minutes!]
+      }
+      const start = parseWindowTime(a.activeWindowStart)
+      const end = parseWindowTime(a.activeWindowEnd)
+      const hasWindow = !!start && !!end && start[0] * 60 + start[1] < end[0] * 60 + end[1]
+      const weekdays = [...new Set((a.activeWeekdays ?? []).filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))]
+      const isAllowedDay = (date: Date): boolean => weekdays.length === 0 || weekdays.includes(date.getDay())
+      const nextAllowedDay = (date: Date): Date => {
+        const next = new Date(date)
+        for (let i = 0; i < 7; i++) {
+          if (i > 0) next.setDate(next.getDate() + 1)
+          if (isAllowedDay(next)) return next
+        }
+        return next
+      }
+
+      if (hasWindow) {
+        const windowStart = new Date(from)
+        windowStart.setHours(start![0], start![1], 0, 0)
+        const windowEnd = new Date(from)
+        windowEnd.setHours(end![0], end![1], 0, 0)
+        if (!isAllowedDay(windowStart) || from >= windowEnd.getTime()) {
+          windowStart.setDate(windowStart.getDate() + (from >= windowEnd.getTime() ? 1 : 0))
+          const next = nextAllowedDay(windowStart)
+          next.setHours(start![0], start![1], 0, 0)
+          result = next.getTime()
+        } else if (from < windowStart.getTime()) {
+          result = windowStart.getTime()
+        } else {
+          // 窗口起点是 interval 锚点，避免执行耗时造成 10:00、10:20… 的漂移。
+          const elapsed = from - windowStart.getTime()
+          const candidate = windowStart.getTime() + (Math.floor(elapsed / step) + 1) * step
+          if (candidate < windowEnd.getTime()) {
+            result = candidate
+          } else {
+            const next = new Date(windowStart)
+            next.setDate(next.getDate() + 1)
+            const allowed = nextAllowedDay(next)
+            allowed.setHours(start![0], start![1], 0, 0)
+            result = allowed.getTime()
+          }
+        }
+      } else {
+        const current = new Date(from)
+        if (isAllowedDay(current)) {
+          const candidate = from + step
+          if (isAllowedDay(new Date(candidate))) {
+            result = candidate
+          } else {
+            const next = nextAllowedDay(new Date(candidate))
+            next.setHours(current.getHours(), current.getMinutes(), current.getSeconds(), current.getMilliseconds())
+            result = next.getTime()
+          }
+        } else {
+          const next = nextAllowedDay(current)
+          next.setHours(current.getHours(), current.getMinutes(), current.getSeconds(), current.getMilliseconds())
+          result = next.getTime()
+        }
+      }
     }
   } else {
     const timeOfDay = a.timeOfDay ?? '09:00'
@@ -196,7 +309,135 @@ function isAutomationRunnable(a: Pick<Automation, 'channelId' | 'workspaceId'>):
   return !!a.channelId && !!a.workspaceId
 }
 
-/** 创建定时任务 */
+/**
+ * 规范化 maxRuns：只接受 ≥1 的有限整数，其余（0、负数、非法值、undefined）一律按「不限次」处理返回 undefined。
+ * 让 0/负数等价于"取消上限"，避免出现"上限为 0 永远跑不了"的死配置。
+ */
+function normalizeMaxRuns(v: number | null | undefined): number | undefined {
+  if (v === null || v === undefined) return undefined
+  if (!Number.isFinite(v) || !Number.isInteger(v) || v < 1) return undefined
+  return v
+}
+
+/**
+ * 应用 maxRuns 变更。只要运行配额发生变化，就把已执行计数/完成标记重置到新配额的起点。
+ */
+export function applyMaxRunsUpdate(
+  target: Pick<Automation, 'maxRuns' | 'runCount' | 'completedAt'>,
+  nextMaxRuns: number | null | undefined,
+): void {
+  const normalizedMaxRuns = normalizeMaxRuns(nextMaxRuns)
+  if (normalizedMaxRuns !== target.maxRuns) {
+    target.runCount = 0
+    target.completedAt = undefined
+  }
+  target.maxRuns = normalizedMaxRuns
+}
+
+/**
+ * 判断任务是否已达成「自动完成」条件（跑完后应停用，区别于手动暂停 / 失败暂停）：
+ * - once：只要实际执行过一次（runCount ≥ 1）即完成
+ * - 任意模式叠加 maxRuns：实际执行次数达到上限即完成
+ * 仅依据 runCount（成功 + 失败，不含 skipped），调用方需保证传入的是已自增后的最新值。
+ */
+function shouldAutoComplete(a: Pick<Automation, 'scheduleType' | 'maxRuns' | 'runCount'>): boolean {
+  const count = a.runCount ?? 0
+  if (a.scheduleType === 'once') return count >= 1
+  const max = normalizeMaxRuns(a.maxRuns)
+  return max !== undefined && count >= max
+}
+
+/**
+ * 按调度模式清理不适用字段。
+ * 更新接口只需声明目标 scheduleType，避免调用方必须手动清空旧模式字段。
+ */
+type AutomationScheduleFields = Omit<
+  Pick<
+    Automation,
+    'scheduleType' | 'intervalMinutes' | 'activeWindowStart' | 'activeWindowEnd' | 'activeWeekdays' | 'timeOfDay' | 'dayOfWeek' | 'dayOfMonth' | 'scheduledAt'
+  >,
+  'intervalMinutes'
+> & { intervalMinutes?: number }
+
+export function normalizeAutomationScheduleFields(
+  target: Pick<Automation, 'scheduleType' | 'activeWindowStart' | 'activeWindowEnd' | 'activeWeekdays' | 'timeOfDay' | 'dayOfWeek' | 'dayOfMonth' | 'scheduledAt'>,
+): void {
+  if (target.scheduleType !== 'interval') {
+    target.activeWindowStart = undefined
+    target.activeWindowEnd = undefined
+    target.activeWeekdays = undefined
+  }
+  if (target.scheduleType !== 'daily' && target.scheduleType !== 'weekly' && target.scheduleType !== 'monthly') {
+    target.timeOfDay = undefined
+  }
+  if (target.scheduleType !== 'weekly') target.dayOfWeek = undefined
+  if (target.scheduleType !== 'monthly') target.dayOfMonth = undefined
+  if (target.scheduleType !== 'once') target.scheduledAt = undefined
+}
+
+/**
+ * 拒绝调用方显式提交的、与目标 scheduleType 不兼容的字段。
+ *
+ * 此检查必须发生在 getEffectiveAutomationScheduleFields() 归一化之前：后者只用于
+ * 忽略已有任务继承的旧模式字段，不能将本次请求明确提供的非法字段静默丢弃。
+ */
+export function validateExplicitAutomationScheduleFields(
+  input: Partial<CreateAutomationInput | UpdateAutomationInput>,
+  scheduleType: Automation['scheduleType'],
+): void {
+  const hasValue = (value: unknown): boolean => value !== undefined && value !== null
+
+  // intervalMinutes 是所有 Automation 持久化记录及 CreateAutomationInput 的必填兼容字段；
+  // 非 interval 模式会保留它作为闲置值，不能在此按模式拒绝。
+  if (scheduleType !== 'interval') {
+    if (input.activeWeekdays !== undefined && input.activeWeekdays !== null) {
+      throw new Error('周内运行日限制仅支持 scheduleType=interval')
+    }
+    if (hasValue(input.activeWindowStart) || hasValue(input.activeWindowEnd)) {
+      throw new Error('每日执行窗口仅支持 scheduleType=interval')
+    }
+  }
+  if (scheduleType !== 'daily' && scheduleType !== 'weekly' && scheduleType !== 'monthly' && input.timeOfDay !== undefined) {
+    throw new Error('timeOfDay 仅支持 scheduleType=daily/weekly/monthly')
+  }
+  if (scheduleType !== 'weekly' && input.dayOfWeek !== undefined) {
+    throw new Error('dayOfWeek 仅支持 scheduleType=weekly')
+  }
+  if (scheduleType !== 'monthly' && input.dayOfMonth !== undefined) {
+    throw new Error('dayOfMonth 仅支持 scheduleType=monthly')
+  }
+  if (scheduleType !== 'once' && input.scheduledAt !== undefined) {
+    throw new Error('scheduledAt 仅支持 scheduleType=once')
+  }
+}
+
+/**
+ * 合并更新输入与已有任务，并按目标 scheduleType 清理旧模式字段后供边界层校验。
+ * 切换模式时，旧模式的字段不能参与新模式的完整性校验；否则归一化尚未执行就会被拒绝。
+ */
+export function getEffectiveAutomationScheduleFields(
+  input: Partial<CreateAutomationInput | UpdateAutomationInput>,
+  existing?: Automation,
+): AutomationScheduleFields {
+  const scheduleType = input.scheduleType ?? existing?.scheduleType ?? 'interval'
+  const useExisting = <K extends keyof AutomationScheduleFields>(field: K): AutomationScheduleFields[K] | undefined =>
+    input[field] !== undefined ? input[field] as AutomationScheduleFields[K] : existing?.[field]
+
+  const effective: AutomationScheduleFields = {
+    scheduleType,
+    intervalMinutes: useExisting('intervalMinutes'),
+    activeWindowStart: useExisting('activeWindowStart') ?? undefined,
+    activeWindowEnd: useExisting('activeWindowEnd') ?? undefined,
+    activeWeekdays: useExisting('activeWeekdays') ?? undefined,
+    timeOfDay: useExisting('timeOfDay') ?? undefined,
+    dayOfWeek: useExisting('dayOfWeek'),
+    dayOfMonth: useExisting('dayOfMonth'),
+    scheduledAt: useExisting('scheduledAt'),
+  }
+  normalizeAutomationScheduleFields(effective)
+  return effective
+}
+
 export function createAutomation(input: CreateAutomationInput): Automation {
   const index = readIndex()
   const now = Date.now()
@@ -211,9 +452,14 @@ export function createAutomation(input: CreateAutomationInput): Automation {
     active,
     scheduleType: input.scheduleType,
     intervalMinutes: input.intervalMinutes,
+    activeWindowStart: input.activeWindowStart,
+    activeWindowEnd: input.activeWindowEnd,
+    activeWeekdays: input.activeWeekdays,
     timeOfDay: input.timeOfDay,
     dayOfWeek: input.dayOfWeek,
     dayOfMonth: input.dayOfMonth,
+    scheduledAt: input.scheduledAt,
+    maxRuns: normalizeMaxRuns(input.maxRuns),
     channelId: input.channelId,
     modelId: input.modelId,
     workspaceId: input.workspaceId,
@@ -224,8 +470,10 @@ export function createAutomation(input: CreateAutomationInput): Automation {
     createdAt: now,
     updatedAt: now,
     nextRunAt: computeNextRunAt(input, now),
+    runCount: 0,
     runHistory: [],
   }
+  normalizeAutomationScheduleFields(automation)
 
   index.automations.push(automation)
   writeIndex(index)
@@ -251,19 +499,30 @@ export function updateAutomation(input: UpdateAutomationInput): Automation | und
   if (input.permissionMode !== undefined) target.permissionMode = input.permissionMode
   if (input.sessionMode !== undefined) target.sessionMode = input.sessionMode
   if (input.notificationTargets !== undefined) target.notificationTargets = input.notificationTargets
+  const nextMaxRuns = input.maxRuns !== undefined ? input.maxRuns : target.maxRuns
+  if (input.maxRuns !== undefined) applyMaxRunsUpdate(target, nextMaxRuns)
 
   // 调度参数变化：重算下次运行时间（从现在起算，避免旧时间戳立即触发）
   const scheduleChanged =
     (input.scheduleType !== undefined && input.scheduleType !== target.scheduleType) ||
     (input.intervalMinutes !== undefined && input.intervalMinutes !== target.intervalMinutes) ||
+    (input.activeWindowStart !== undefined && input.activeWindowStart !== target.activeWindowStart) ||
+    (input.activeWindowEnd !== undefined && input.activeWindowEnd !== target.activeWindowEnd) ||
+    (input.activeWeekdays !== undefined && JSON.stringify(input.activeWeekdays ?? []) !== JSON.stringify(target.activeWeekdays ?? [])) ||
     (input.timeOfDay !== undefined && input.timeOfDay !== target.timeOfDay) ||
     (input.dayOfWeek !== undefined && input.dayOfWeek !== target.dayOfWeek) ||
-    (input.dayOfMonth !== undefined && input.dayOfMonth !== target.dayOfMonth)
+    (input.dayOfMonth !== undefined && input.dayOfMonth !== target.dayOfMonth) ||
+    (input.scheduledAt !== undefined && input.scheduledAt !== target.scheduledAt)
   if (input.scheduleType !== undefined) target.scheduleType = input.scheduleType
   if (input.intervalMinutes !== undefined) target.intervalMinutes = input.intervalMinutes
+  if (input.activeWindowStart !== undefined) target.activeWindowStart = input.activeWindowStart ?? undefined
+  if (input.activeWindowEnd !== undefined) target.activeWindowEnd = input.activeWindowEnd ?? undefined
+  if (input.activeWeekdays !== undefined) target.activeWeekdays = input.activeWeekdays ?? undefined
   if (input.timeOfDay !== undefined) target.timeOfDay = input.timeOfDay
   if (input.dayOfWeek !== undefined) target.dayOfWeek = input.dayOfWeek
   if (input.dayOfMonth !== undefined) target.dayOfMonth = input.dayOfMonth
+  if (input.scheduledAt !== undefined) target.scheduledAt = input.scheduledAt
+  normalizeAutomationScheduleFields(target)
   if (scheduleChanged) {
     target.nextRunAt = computeNextRunAt(target, now)
   }
@@ -272,13 +531,17 @@ export function updateAutomation(input: UpdateAutomationInput): Automation | und
   if (input.active !== undefined && input.active !== target.active) {
     // 启用要求 channelId + workspaceId 齐全，否则拒绝（兜底前端校验，避免空配置任务进入调度）
     if (input.active && !isAutomationRunnable(target)) {
-      throw new Error('启用定时任务前必须配置模型与工作区')
+      throw new Error('启用定时任务前必须配置模型与项目')
     }
     target.active = input.active
     if (input.active) {
-      // 重新启用：从现在起算下一次触发，清空连续失败计数
+      // 重新启用：从现在起算下一次触发，清空连续失败计数，并重置运行配额
+      //（runCount 清零 + 清空 completedAt），语义是「重新跑一轮配额」。
+      // 这样跑满 maxRuns / once 完成后被自动停用的任务，用户手动启用即可再跑一轮。
       target.nextRunAt = computeNextRunAt(target, now)
       target.consecutiveFailures = 0
+      target.runCount = 0
+      target.completedAt = undefined
     }
   }
 
@@ -307,10 +570,11 @@ export function deleteAutomation(id: string): boolean {
  * 记录一次运行结果并推进下次触发时间
  *
  * 由调度器在运行完成/失败/跳过后调用。
- * - 成功/失败：从「现在」起算下次触发时间
- * - 跳过：不动 nextRunAt——否则任务因重入持续跳过时，每次跳过都会把下次触发再推一个完整间隔，
+ * - 成功/失败：从「现在」起算下次触发时间，并累加 runCount
+ * - 跳过：不动 nextRunAt、不计入 runCount——否则任务因重入持续跳过时，每次跳过都会把下次触发再推一个完整间隔，
  *   实际周期会被拉成 N×interval。保留原 nextRunAt 让下一个 tick 立刻有机会再次尝试。
  * - 成功/跳过：清零连续失败计数；失败：累加（调度器据此判断是否自动暂停）
+ * - once 跑完一次 / 达到 maxRuns 上限：自动停用并标记 completedAt，区别于手动暂停
  */
 export function appendRun(id: string, run: AutomationRun): Automation | undefined {
   const index = readIndex()
@@ -325,6 +589,7 @@ export function appendRun(id: string, run: AutomationRun): Automation | undefine
 
   if (run.status !== 'skipped') {
     target.lastRunAt = run.runAt
+    target.runCount = (target.runCount ?? 0) + 1
     target.nextRunAt = computeNextRunAt(target, now)
   }
 
@@ -332,6 +597,14 @@ export function appendRun(id: string, run: AutomationRun): Automation | undefine
     target.consecutiveFailures = (target.consecutiveFailures ?? 0) + 1
   } else {
     target.consecutiveFailures = 0
+  }
+
+  // 自动完成：once 跑完一次，或循环任务达到 maxRuns 上限 → 停用并标记完成时间。
+  // 只在非 skipped（runCount 已自增）时判断，避免重入跳过被误判为完成。
+  if (run.status !== 'skipped' && shouldAutoComplete(target)) {
+    target.active = false
+    target.completedAt = now
+    console.log(`[定时任务] ${target.name} 已达成运行上限（${target.runCount} 次），自动完成停用`)
   }
 
   target.updatedAt = now

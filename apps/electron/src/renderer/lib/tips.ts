@@ -43,7 +43,7 @@ export const TIPS: Tip[] = [
   { id: 'win-shortcut-search', text: '按 Ctrl+Shift+F 搜索历史对话', platform: 'windows' },
   { id: 'win-shortcut-file-find', text: '按 Ctrl+F 可在对话中搜索消息，预览面板中则查找文件内容', platform: 'windows' },
   { id: 'win-shortcut-settings', text: '按 Ctrl+, 打开设置', platform: 'windows' },
-  { id: 'win-shortcut-sidebar', text: '按 Ctrl+B 切换侧边栏显示', platform: 'windows' },
+  { id: 'win-shortcut-sidebar', text: '按 Ctrl+Shift+E 切换侧边栏显示', platform: 'windows' },
   { id: 'win-shortcut-mode', text: '按 Ctrl+Shift+M 快速切换 Chat / Agent 模式', platform: 'windows' },
   { id: 'win-shortcut-focus', text: '按 Ctrl+L 快速跳转到输入框', platform: 'windows' },
   { id: 'win-shortcut-clear', text: '按 Ctrl+K 清除当前对话上下文', platform: 'windows' },
@@ -53,7 +53,7 @@ export const TIPS: Tip[] = [
   { id: 'win-shortcut-tab-switch', text: '按 Ctrl+Tab 快速切换标签，长按 Ctrl 反复按 Tab 可在标签间循环选择', platform: 'windows' },
 
   // 通用
-  { id: 'tip-agent-file', text: 'Agent 模式下输入 @ 可以引用工作区文件', platform: 'all' },
+  { id: 'tip-agent-file', text: 'Agent 模式下输入 @ 可以引用会话文件、项目文件和已附加目录', platform: 'all' },
   { id: 'tip-agent-mcp', text: 'Agent 模式下输入 # 可以调用 MCP 工具', platform: 'all' },
   { id: 'tip-agent-skill', text: 'Agent 模式下输入 / 可以使用 Skill', platform: 'all' },
   { id: 'tip-attachment', text: '支持拖拽文件到输入框直接上传附件', platform: 'all' },

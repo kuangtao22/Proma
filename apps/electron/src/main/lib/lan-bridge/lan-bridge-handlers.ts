@@ -6,8 +6,9 @@
 
 import { BrowserWindow } from 'electron'
 import { AGENT_IPC_CHANNELS } from '@proma/shared'
+import type { AgentSendInput } from '@proma/shared'
 import { registerRoute, sendError } from './lan-bridge-router'
-import { verifyPin, generateToken, verifyToken, refreshToken } from './lan-bridge-auth'
+import { verifyPairingPin, generateToken, verifyToken, refreshToken } from './lan-bridge-auth'
 import type { ClientConnection } from './lan-bridge-types'
 import { listConversations, searchConversationMessages, getConversationMessages } from '../conversation-manager'
 import { listAgentSessions, searchAgentSessionMessages, getAgentSessionMessages, createAgentSession } from '../agent-session-manager'
@@ -44,7 +45,11 @@ registerRoute('settings.channels', handleSettingsChannels)
 
 function handlePair(client: ClientConnection, data: Record<string, unknown>) {
   const pin = data.pin as string | undefined
-  if (!pin || !verifyPin(pin)) {
+  const result = pin ? verifyPairingPin(pin, client.ip) : 'invalid'
+  if (result === 'rate_limited') {
+    throw Object.assign(new Error('Too many pairing attempts'), { errorCode: 'RATE_LIMITED' })
+  }
+  if (result !== 'valid') {
     throw Object.assign(new Error('Invalid PIN'), { errorCode: 'AUTH_FAILED' })
   }
   client.authenticated = true
@@ -207,27 +212,29 @@ function handleAgentSend(client: ClientConnection, data: Record<string, unknown>
   const settings = getSettings()
 
   const permissionMode = data.permissionMode as string | undefined
-  const validModes = ['auto', 'bypassPermissions', 'plan']
-  const permissionModeOverride = (permissionMode && validModes.includes(permissionMode))
-    ? permissionMode as 'auto' | 'bypassPermissions' | 'plan'
-    : 'bypassPermissions' as const
+  let permissionModeOverride: AgentSendInput['permissionModeOverride'] = 'bypassPermissions'
+  if (permissionMode === 'auto') {
+    permissionModeOverride = undefined
+  } else if (permissionMode === 'bypassPermissions' || permissionMode === 'plan') {
+    permissionModeOverride = permissionMode
+  }
 
-  const input = {
+  const input: AgentSendInput = {
     sessionId,
     userMessage,
     channelId: settings.agentChannelId || '',
     modelId: data.modelId as string | undefined || settings.agentModelId,
     workspaceId: (data.workspaceId as string | undefined) || settings.agentWorkspaceId,
     permissionModeOverride,
-  };
-  console.log(`[LAN Bridge] agent.send 开始: sessionId=${sessionId.slice(0, 12)} channelId=${settings.agentChannelId || '(空)'}`);
+  }
+  console.log(`[LAN Bridge] agent.send 开始: sessionId=${sessionId.slice(0, 12)} channelId=${settings.agentChannelId || '(空)'}`)
   const pushToSubs = (msg: object) => {
     const mgr = getSessionManager()
     if (!mgr) return
     for (const c of mgr.getSubscribers(sessionId)) {
       mgr.send(c, msg)
     }
-  };
+  }
   runAgentHeadless(input, {
     onError: (err) => {
       console.error(`[LAN Bridge] agent.send error:`, err)
@@ -247,7 +254,7 @@ function handleAgentSend(client: ClientConnection, data: Record<string, unknown>
     const errMsg = err instanceof Error ? err.message : String(err)
     pushToSubs({ type: 'stream.error', data: { sessionId, error: errMsg } })
     pushToSubs({ type: 'stream.complete', data: { sessionId } })
-  });
+  })
 
   return { sent: true, sessionId }
 }
@@ -385,4 +392,3 @@ function requireAuth(client: ClientConnection, data: Record<string, unknown>): v
   }
   throw Object.assign(new Error('Authentication required'), { errorCode: 'AUTH_REQUIRED' })
 }
-

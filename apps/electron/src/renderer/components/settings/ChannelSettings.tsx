@@ -1,21 +1,18 @@
 /**
  * ChannelSettings - 渠道配置页
  *
- * 分为两个区块：
- * 1. 渠道管理 — 所有渠道列表 + 添加/编辑/删除（渠道同时用于 Chat 和 Agent）
- * 2. Agent 供应商 — 从已启用的 Anthropic 兼容渠道（Anthropic / DeepSeek / Kimi / MiniMax）中
- *    通过 Switch 开关启用多个 Agent 供应商
+ * 管理所有渠道的添加、编辑、删除与启用状态。
  */
 
 import * as React from 'react'
 import { useAtom, useSetAtom } from 'jotai'
-import { Plus, Pencil, Trash2, ExternalLink } from 'lucide-react'
+import { ExternalLink, Pencil, Plus, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
-import { PROVIDER_LABELS, isAgentCompatibleProvider } from '@proma/shared'
+import { PROVIDER_LABELS } from '@proma/shared'
 import type { Channel } from '@proma/shared'
 import { getChannelLogo, PromaLogo } from '@/lib/model-logo'
-import { agentChannelIdAtom, agentModelIdAtom, agentChannelIdsAtom } from '@/atoms/agent-atoms'
+import { agentChannelIdAtom, agentModelIdAtom } from '@/atoms/agent-atoms'
 import { channelsAtom } from '@/atoms/chat-atoms'
 import { SettingsSection, SettingsCard, SettingsRow } from './primitives'
 import {
@@ -40,15 +37,9 @@ export function ChannelSettings(): React.ReactElement {
   const [loading, setLoading] = React.useState(true)
   const [agentChannelId, setAgentChannelId] = useAtom(agentChannelIdAtom)
   const [, setAgentModelId] = useAtom(agentModelIdAtom)
-  const [agentChannelIds, setAgentChannelIds] = useAtom(agentChannelIdsAtom)
   const setGlobalChannels = useSetAtom(channelsAtom)
   const [deleteTarget, setDeleteTarget] = React.useState<Channel | null>(null)
-  const agentChannelIdsRef = React.useRef(agentChannelIds)
   const agentChannelIdRef = React.useRef(agentChannelId)
-
-  React.useEffect(() => {
-    agentChannelIdsRef.current = agentChannelIds
-  }, [agentChannelIds])
 
   React.useEffect(() => {
     agentChannelIdRef.current = agentChannelId
@@ -73,40 +64,6 @@ export function ChannelSettings(): React.ReactElement {
     loadChannels()
   }, [loadChannels])
 
-  const syncAgentChannelEligibility = React.useCallback(async (
-    channel: Channel,
-    eligible: boolean,
-  ): Promise<void> => {
-    const currentIds = agentChannelIdsRef.current
-
-    if (eligible) {
-      if (currentIds.includes(channel.id)) return
-      const newIds = [...currentIds, channel.id]
-      agentChannelIdsRef.current = newIds
-      setAgentChannelIds(newIds)
-      await window.electronAPI.updateSettings({ agentChannelIds: newIds }).catch(console.error)
-      return
-    }
-
-    if (!currentIds.includes(channel.id)) return
-    const newIds = currentIds.filter((id) => id !== channel.id)
-    agentChannelIdsRef.current = newIds
-    setAgentChannelIds(newIds)
-
-    const updates: Parameters<typeof window.electronAPI.updateSettings>[0] = {
-      agentChannelIds: newIds,
-    }
-    if (agentChannelIdRef.current === channel.id) {
-      agentChannelIdRef.current = null
-      setAgentChannelId(null)
-      setAgentModelId(null)
-      updates.agentChannelId = undefined
-      updates.agentModelId = undefined
-    }
-
-    await window.electronAPI.updateSettings(updates).catch(console.error)
-  }, [setAgentChannelIds, setAgentChannelId, setAgentModelId])
-
   /** 删除渠道（通过弹窗确认） */
   const handleDeleteRequest = (channel: Channel): void => {
     setDeleteTarget(channel)
@@ -119,10 +76,6 @@ export function ChannelSettings(): React.ReactElement {
     try {
       await window.electronAPI.deleteChannel(target.id)
 
-      // 从 Agent 渠道列表中移除
-      const newIds = agentChannelIds.filter((id) => id !== target.id)
-      setAgentChannelIds(newIds)
-
       // 如果删除的是当前选中的 Agent 渠道，清空选择
       if (agentChannelId === target.id) {
         setAgentChannelId(null)
@@ -130,7 +83,6 @@ export function ChannelSettings(): React.ReactElement {
       }
 
       await window.electronAPI.updateSettings({
-        agentChannelIds: newIds,
         ...(agentChannelId === target.id && { agentChannelId: undefined, agentModelId: undefined }),
       })
 
@@ -145,38 +97,10 @@ export function ChannelSettings(): React.ReactElement {
   const handleToggle = async (channel: Channel): Promise<void> => {
     try {
       const savedChannel = await window.electronAPI.updateChannel(channel.id, { enabled: !channel.enabled })
-      await syncAgentChannelEligibility(
-        savedChannel,
-        savedChannel.enabled && isAgentCompatibleProvider(savedChannel.provider),
-      )
-
       await loadChannels()
     } catch (error) {
       console.error('[渠道设置] 切换渠道状态失败:', error)
     }
-  }
-
-  /** 切换 Agent 供应商开关 */
-  const handleToggleAgentProvider = async (channelId: string, enabled: boolean): Promise<void> => {
-    const newIds = enabled
-      ? [...agentChannelIds, channelId]
-      : agentChannelIds.filter((id) => id !== channelId)
-
-    setAgentChannelIds(newIds)
-
-    // 如果关闭的是当前选中的渠道，清空选择
-    if (!enabled && agentChannelId === channelId) {
-      setAgentChannelId(null)
-      setAgentModelId(null)
-      await window.electronAPI.updateSettings({
-        agentChannelIds: newIds,
-        agentChannelId: undefined,
-        agentModelId: undefined,
-      }).catch(console.error)
-      return
-    }
-
-    await window.electronAPI.updateSettings({ agentChannelIds: newIds }).catch(console.error)
   }
 
   /** 表单保存回调 */
@@ -198,16 +122,10 @@ export function ChannelSettings(): React.ReactElement {
       <ChannelForm
         channel={editingChannel}
         onSaved={handleFormSaved}
-        onAgentEligibilityChange={syncAgentChannelEligibility}
         onCancel={handleFormCancel}
       />
     )
   }
-
-  // Agent 兼容渠道（已启用）：Anthropic / DeepSeek / Kimi API / Kimi Coding Plan / MiniMax
-  const agentCapableChannels = channels.filter(
-    (c) => isAgentCompatibleProvider(c.provider) && c.enabled
-  )
 
   // 列表视图
   return (
@@ -215,7 +133,7 @@ export function ChannelSettings(): React.ReactElement {
       {/* 区块一：模型配置 */}
       <SettingsSection
         title="模型配置"
-        description="管理 AI 供应商连接，配置 API Key 和可用模型。Anthropic 渠道同时可用于 Agent 模式"
+        description="管理 AI 供应商连接，配置 API Key 和可用模型。"
         action={
           <Button size="sm" onClick={() => setViewMode('create')}>
             <Plus size={16} />
@@ -252,36 +170,6 @@ export function ChannelSettings(): React.ReactElement {
         )}
       </SettingsSection>
 
-      {/* 区块二：Agent 供应商 */}
-      <SettingsSection
-        title="Agent 供应商"
-        description="启用 Agent 模式可用的供应商，支持同时开启多个渠道，在 Agent 模式下可直接切换"
-      >
-        <SettingsCard>
-          <PromaProviderCard />
-        </SettingsCard>
-        {loading ? (
-          <div className="text-sm text-muted-foreground py-8 text-center">加载中...</div>
-        ) : agentCapableChannels.length === 0 ? (
-          <SettingsCard divided={false}>
-            <div className="text-sm text-muted-foreground py-8 text-center">
-              暂无可用的 Anthropic 兼容渠道，请先在上方添加 Anthropic / DeepSeek / Kimi / MiniMax 渠道并启用
-            </div>
-          </SettingsCard>
-        ) : (
-          <SettingsCard>
-            {agentCapableChannels.map((channel) => (
-              <AgentProviderRow
-                key={channel.id}
-                channel={channel}
-                enabled={agentChannelIds.includes(channel.id)}
-                onToggle={(enabled) => handleToggleAgentProvider(channel.id, enabled)}
-              />
-            ))}
-          </SettingsCard>
-        )}
-      </SettingsSection>
-
       {/* 删除确认弹窗 */}
       <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }}>
         <AlertDialogContent>
@@ -301,6 +189,10 @@ export function ChannelSettings(): React.ReactElement {
   )
 }
 
+function openPromaDownload(): void {
+  window.open('https://proma.cool/download', '_blank')
+}
+
 // ===== 渠道行子组件 =====
 
 interface ChannelRowProps {
@@ -315,7 +207,6 @@ function ChannelRow({ channel, onEdit, onDelete, onToggle }: ChannelRowProps): R
   const description = [
     PROVIDER_LABELS[channel.provider],
     enabledCount > 0 ? `${enabledCount} 个模型已启用` : undefined,
-    isAgentCompatibleProvider(channel.provider) ? '可用于 Agent' : undefined,
   ]
     .filter(Boolean)
     .join(' · ')
@@ -324,7 +215,9 @@ function ChannelRow({ channel, onEdit, onDelete, onToggle }: ChannelRowProps): R
     <SettingsRow
       label={channel.name}
       icon={<img src={getChannelLogo(channel)} alt="" className="w-8 h-8 rounded" />}
-      description={description}
+      description={
+        <span>{description}</span>
+      }
       className="group"
     >
       <div className="flex items-center gap-2">
@@ -354,53 +247,18 @@ function ChannelRow({ channel, onEdit, onDelete, onToggle }: ChannelRowProps): R
   )
 }
 
-// ===== Agent 供应商行子组件 =====
-
-interface AgentProviderRowProps {
-  channel: Channel
-  enabled: boolean
-  onToggle: (enabled: boolean) => void
-}
-
-function AgentProviderRow({ channel, enabled, onToggle }: AgentProviderRowProps): React.ReactElement {
-  const enabledCount = channel.models.filter((m) => m.enabled).length
-  const description = [
-    PROVIDER_LABELS[channel.provider],
-    enabledCount > 0 ? `${enabledCount} 个模型可用` : undefined,
-  ]
-    .filter(Boolean)
-    .join(' · ')
-
-  return (
-    <SettingsRow
-      label={channel.name}
-      icon={<img src={getChannelLogo(channel)} alt="" className="w-8 h-8 rounded" />}
-      description={description}
-    >
-      <Switch
-        checked={enabled}
-        onCheckedChange={onToggle}
-      />
-    </SettingsRow>
-  )
-}
-
 // ===== Proma 官方供应商推广卡片 =====
 
 function PromaProviderCard(): React.ReactElement {
-  const handleDownload = (): void => {
-    window.open('http://proma.cool/download', '_blank')
-  }
-
   return (
     <SettingsRow
       label="Proma"
       icon={<img src={PromaLogo} alt="Proma" className="w-8 h-8 rounded" />}
-      description="Proma 官方供应｜稳定｜靠谱｜丝滑｜简单｜可用于 Agent"
+      description="Proma 商业版｜安全、稳定、优惠的内置模型｜适用于 Chat 与 Agent"
     >
-      <Button size="sm" variant="outline" className="gap-1.5" onClick={handleDownload}>
+      <Button size="sm" variant="outline" className="gap-1.5" onClick={openPromaDownload}>
         <ExternalLink size={13} />
-        <span>下载后启动</span>
+        <span>下载商业版</span>
       </Button>
     </SettingsRow>
   )

@@ -10,6 +10,7 @@
  * - 认证：Authorization: Bearer
  */
 
+import type { ProviderType } from '@proma/shared'
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -20,7 +21,7 @@ import type {
   ToolDefinition,
   ContinuationMessage,
 } from './types.ts'
-import { normalizeBaseUrl } from './url-utils.ts'
+import { resolveOpenAIChatCompletionsUrl } from './url-utils.ts'
 
 // ===== OpenAI 特有类型 =====
 
@@ -185,10 +186,14 @@ function appendContinuationMessages(
 // ===== 适配器实现 =====
 
 export class OpenAIAdapter implements ProviderAdapter {
-  readonly providerType = 'openai' as const
+  readonly providerType: ProviderType
+
+  constructor(providerType: ProviderType = 'openai') {
+    this.providerType = providerType
+  }
 
   buildStreamRequest(input: StreamRequestInput): ProviderRequest {
-    const url = normalizeBaseUrl(input.baseUrl)
+    const url = resolveOpenAIChatCompletionsUrl(input.baseUrl, this.providerType)
     const messages = toOpenAIMessages(input)
 
     const bodyObj: Record<string, unknown> = {
@@ -208,7 +213,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     }
 
     return {
-      url: `${url}/chat/completions`,
+      url,
       headers: {
         'Authorization': `Bearer ${input.apiKey}`,
         'content-type': 'application/json',
@@ -267,10 +272,15 @@ export class OpenAIAdapter implements ProviderAdapter {
   }
 
   buildTitleRequest(input: TitleRequestInput): ProviderRequest {
-    const url = normalizeBaseUrl(input.baseUrl)
+    const url = resolveOpenAIChatCompletionsUrl(input.baseUrl, this.providerType)
+    // OpenCode Go 的编程模型会将一部分输出预算用于推理；通用标题请求的
+    // 50 tokens 不足以稳定产出可见正文，导致自动重命名收到空标题。
+    // const maxTokens = this.providerType === 'opencode-go-openai' ? 512 : 50
+    // 统一设置 512 tokens 解决兼容open ai 供应商 自动重命名收到空标题问题。
+    const maxTokens = 512
 
     return {
-      url: `${url}/chat/completions`,
+      url,
       headers: {
         'Authorization': `Bearer ${input.apiKey}`,
         'content-type': 'application/json',
@@ -278,7 +288,7 @@ export class OpenAIAdapter implements ProviderAdapter {
       body: JSON.stringify({
         model: input.modelId,
         messages: [{ role: 'user', content: input.prompt }],
-        max_tokens: 50,
+        max_tokens: maxTokens,
       }),
     }
   }

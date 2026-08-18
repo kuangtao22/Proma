@@ -10,10 +10,11 @@
  * 所有业务逻辑已委托给 AgentOrchestrator。
  */
 
-import { join, dirname } from 'node:path'
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path'
+import { accessSync, constants, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { BrowserWindow } from 'electron'
 import type { WebContents } from 'electron'
+import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { AGENT_IPC_CHANNELS, MAX_ATTACHMENT_SIZE } from '@proma/shared'
 import type {
   AgentSendInput,
@@ -24,23 +25,41 @@ import type {
   AgentStreamEvent,
   AgentStreamPayload,
   AgentQueueMessageInput,
+  AgentDeferredQueueMessageInput,
+  AgentQueuedMessageControlInput,
+  AgentMoveQueuedMessageInput,
   PromaPermissionMode,
   AgentExternalRunSource,
+  AgentMessage,
 } from '@proma/shared'
-import { ClaudeAgentAdapter, scanAndKillOrphanedClaudeSubprocesses } from './adapters/claude-agent-adapter'
+import { PiAgentAdapter } from './adapters/pi-agent-adapter'
+import { PiUtilityAdapter } from './adapters/pi-utility-adapter'
 import { AgentEventBus } from './agent-event-bus'
 import { AgentOrchestrator } from './agent-orchestrator'
-import { getAgentSessionWorkspacePath, getWorkspaceFilesDir } from './config-paths'
+import { getAgentSessionWorkspacePath } from './config-paths'
+import { getAgentWorkspaceBySlug, getLocalProjectRootStatus, getProjectFilesPath } from './agent-workspace-manager'
 import { getAgentSessionMeta, updateAgentSessionMeta } from './agent-session-manager'
+import { setAgentStopper, setHeadlessAgentRunner } from './agent-headless-runner-registry'
+import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
+import { sendAgentStreamComplete } from './agent-completion-payload'
+import { AgentStreamForwarder } from './agent-stream-forwarder'
+import { AgentQueueCoordinator } from './agent-queue-coordinator'
 
 // ===== 实例创建 =====
 
 const eventBus = new AgentEventBus()
-const adapter = new ClaudeAgentAdapter()
+const useUtilityAgentRuntime = process.env.PROMA_AGENT_RUNTIME !== 'in-process'
+  && process.env.PROMA_AGENT_RUNTIME !== 'off'
+const adapter = useUtilityAgentRuntime ? new PiUtilityAdapter() : new PiAgentAdapter()
 const orchestrator = new AgentOrchestrator(adapter, eventBus)
 
 /** 导出 EventBus 供飞书 Bridge 等外部服务订阅事件 */
 export { eventBus as agentEventBus }
+
+// 注册协作子会话 EventBus 阻塞事件监听
+import('./agent-collaboration-tools').then(({ registerCollaborationEventBus }) => {
+  registerCollaborationEventBus(eventBus)
+}).catch(() => { /* collaboration 模块可能未加载 */ })
 
 /**
  * 会话 → webContents 映射
@@ -49,6 +68,9 @@ export { eventBus as agentEventBus }
  * runAgent 开始时注册，结束时清理。
  */
 const sessionWebContents = new Map<string, WebContents>()
+/** 每个 renderer 当前可见的 Agent 会话；仅该会话维持 20fps partial。 */
+const visibleAgentSessionByWebContents = new WeakMap<WebContents, string | null>()
+const streamForwarder = new AgentStreamForwarder()
 
 /**
  * 已挂载 destroyed 回收钩子的 webContents 集合。
@@ -65,16 +87,22 @@ const wcWithCleanupHook = new WeakSet<WebContents>()
  * webContents 提前销毁的场景——destroyed 事件兜底。
  */
 function registerWebContents(sessionId: string, wc: WebContents): void {
-  // 同一 sessionId 切换 webContents 时直接覆盖；旧 wc 的 destroyed 钩子仍由 WeakSet 持有，
-  // 触发时会扫描 sessionWebContents 清理所有指向旧 wc 的条目（见下方实现）。
+  // 同一 sessionId 切换 renderer 时，先丢弃捕获旧 wc.send 的等待 partial，避免投递到旧窗口。
+  const previousWebContents = sessionWebContents.get(sessionId)
+  if (previousWebContents && previousWebContents !== wc) streamForwarder.clear(sessionId)
+  // 旧 wc 的 destroyed 钩子仍由 WeakSet 持有，触发时会扫描 sessionWebContents 清理所有指向它的条目。
   sessionWebContents.set(sessionId, wc)
   if (wcWithCleanupHook.has(wc)) return
   wcWithCleanupHook.add(wc)
   wc.once('destroyed', () => {
     // 单个 wc 可能映射到多个 sessionId（同窗口多 tab），需要清理所有指向它的条目
     for (const [sid, mappedWc] of sessionWebContents) {
-      if (mappedWc === wc) sessionWebContents.delete(sid)
+      if (mappedWc === wc) {
+        sessionWebContents.delete(sid)
+        streamForwarder.clear(sid)
+      }
     }
+    visibleAgentSessionByWebContents.delete(wc)
   })
 }
 
@@ -93,21 +121,79 @@ function getMainRendererWebContents(): WebContents | null {
   return win && !win.webContents.isDestroyed() ? win.webContents : null
 }
 
+const agentQueueCoordinator = new AgentQueueCoordinator({
+  isActive: (sessionId) => orchestrator.isActive(sessionId),
+  getWebContents: (sessionId) => sessionWebContents.get(sessionId) ?? getMainRendererWebContents(),
+  startRun: (input, webContents) => runAgent(input, webContents),
+  sendStarted: (webContents, status) => {
+    if (!webContents.isDestroyed()) webContents.send(AGENT_IPC_CHANNELS.QUEUED_MESSAGE_STATUS, status)
+  },
+})
+
+function publishRunStopped(
+  sessionId: string,
+  stoppedByUser: boolean | undefined,
+  startedAt: number | undefined,
+): void {
+  if (!stoppedByUser) return
+  eventBus.emit(sessionId, {
+    kind: 'proma_event',
+    event: {
+      type: 'run_stopped',
+      ...(startedAt != null ? { startedAt } : {}),
+    },
+  })
+}
+
 // ===== EventBus IPC 转发中间件 =====
+
+/**
+ * 完成事件只需要侧栏/导航使用的轻量 meta。Pi 的 entry bindings 仅用于主进程
+ * session fork/rewind，传到 renderer 会在长会话完成时徒增 IPC 序列化成本。
+ */
+function getSessionMetaForRenderer(sessionId: string) {
+  const session = getAgentSessionMeta(sessionId)
+  if (!session) return undefined
+  const { piEntryBindings: _piEntryBindings, ...meta } = session
+  return meta
+}
 
 eventBus.use((sessionId, payload, next) => {
   const wc = sessionWebContents.get(sessionId)
   if (wc && !wc.isDestroyed()) {
     try {
-      wc.send(AGENT_IPC_CHANNELS.STREAM_EVENT, { sessionId, payload } as AgentStreamEvent)
+      streamForwarder.forward(
+        { sessionId, payload } as AgentStreamEvent,
+        (event) => wc.send(AGENT_IPC_CHANNELS.STREAM_EVENT, event),
+        visibleAgentSessionByWebContents.get(wc) === sessionId,
+      )
     } catch (err) {
       console.error(`[EventBus] wc.send 失败: sessionId=${sessionId}, payload.kind=${(payload as Record<string, unknown>)?.kind}`, err)
     }
   }
+  if (payload.kind === 'sdk_message' && payload.message.type === 'system' && payload.message.subtype === 'task_notification') {
+    agentQueueCoordinator.onBackgroundTaskComplete(sessionId)
+  }
   next()
 })
 
+/** renderer 切换标签时更新流式优先级；切入会话立即 flush 等待中的后台快照。 */
+export function setVisibleAgentSession(webContents: WebContents, sessionId: string | null): void {
+  const previousSessionId = visibleAgentSessionByWebContents.get(webContents)
+  if (previousSessionId && previousSessionId !== sessionId) {
+    // 切出后将已排队的前台帧按后台频率重排，避免继续以 20fps 发送。
+    streamForwarder.reprioritize(previousSessionId, false)
+  }
+  visibleAgentSessionByWebContents.set(webContents, sessionId)
+  if (sessionId) streamForwarder.promote(sessionId)
+}
+
 // ===== IPC 薄包装函数 =====
+
+/** 仅主进程内部使用的单次运行扩展，绝不经 IPC 序列化。 */
+export interface AgentRunExtensions {
+  piCustomTools?: ToolDefinition[]
+}
 
 /**
  * 运行 Agent 并流式推送事件到渲染进程
@@ -120,10 +206,27 @@ export async function runAgent(
 ): Promise<void> {
   // 更新 webContents 映射（允许覆盖 — 由 orchestrator.activeSessions 处理真正的并发保护）
   registerWebContents(input.sessionId, webContents)
+  // deferred queue runs carry their queue id as an internal extension.
+  const queueMessageId = (input as Partial<AgentDeferredQueueMessageInput>).queueMessageId
   // 开始新一轮执行时清除"完成未确认"标记
   try {
     updateAgentSessionMeta(input.sessionId, { completedButUnconfirmed: false })
   } catch { /* 新会话可能尚未写入索引 */ }
+  // 自动任务会话"毕业"：用户手动发消息（非定时触发）即视为接管，标记后该会话回到普通项目列表，
+  // 调度器也不再复用它注入新的定时运行。
+  if (input.triggeredBy !== 'automation') {
+    try {
+      const meta = getAgentSessionMeta(input.sessionId)
+      if (meta?.sourceAutomationId && !meta.automationGraduated) {
+        updateAgentSessionMeta(input.sessionId, { automationGraduated: true })
+        // 向渲染进程发送毕业事件，触发 toast 提示
+        eventBus.emit(input.sessionId, {
+          kind: 'proma_event',
+          event: { type: 'automation_graduated' },
+        })
+      }
+    } catch { /* 新会话可能尚未写入索引 */ }
+  }
   try {
     await orchestrator.sendMessage(input, {
       onError: (error) => {
@@ -135,16 +238,31 @@ export async function runAgent(
         }
       },
       onComplete: (messages, opts) => {
+        publishRunStopped(input.sessionId, opts?.stoppedByUser, opts?.startedAt)
         if (!webContents.isDestroyed()) {
-          webContents.send(AGENT_IPC_CHANNELS.STREAM_COMPLETE, {
-            sessionId: input.sessionId,
+          sendAgentStreamComplete(webContents, input, {
             messages,
             stoppedByUser: opts?.stoppedByUser ?? false,
             startedAt: opts?.startedAt,
             resultSubtype: opts?.resultSubtype,
+            resultErrors: opts?.resultErrors,
             backgroundTasksPending: opts?.backgroundTasksPending,
+            // 只读取刚完成的轻量 meta，renderer 可据此增量更新列表，避免再取 5,000+ 条全量会话。
+            session: getSessionMetaForRenderer(input.sessionId),
           })
         }
+        agentQueueCoordinator.onRunComplete(
+          input.sessionId,
+          queueMessageId,
+          opts?.backgroundTasksPending === true,
+          opts?.stoppedByUser === true,
+        )
+      },
+      onRunStarted: ({ startedAt }) => {
+        eventBus.emit(input.sessionId, {
+          kind: 'proma_event',
+          event: { type: 'run_started', startedAt },
+        })
       },
       onTitleUpdated: (title) => {
         eventBus.emit(input.sessionId, {
@@ -167,17 +285,18 @@ export async function runAgent(
         sessionId: input.sessionId,
         error: errorMessage,
       })
-      webContents.send(AGENT_IPC_CHANNELS.STREAM_COMPLETE, {
-        sessionId: input.sessionId,
+      sendAgentStreamComplete(webContents, input, {
         messages: [],
         stoppedByUser: false,
       })
     }
+    agentQueueCoordinator.onRunComplete(input.sessionId, queueMessageId, false, false)
   } finally {
     // 仅在 orchestrator 已完成此会话时清理映射
     // 避免被拒绝的请求误删仍在运行的会话映射
     if (!orchestrator.isActive(input.sessionId)) {
       sessionWebContents.delete(input.sessionId)
+      streamForwarder.clear(input.sessionId)
     }
   }
 }
@@ -192,13 +311,19 @@ export async function runAgentHeadless(
   input: AgentSendInput,
   callbacks: {
     onError: (error: string) => void
-    onComplete: () => void
+    onComplete: (messages?: AgentMessage[]) => void
     onTitleUpdated: (title: string) => void
     source?: AgentExternalRunSource
+    originSessionId?: string
   },
+  extensions?: AgentRunExtensions,
 ): Promise<void> {
-  // 尝试注册主窗口 webContents，让流式事件同步推送到桌面端
-  const wc = getMainRendererWebContents()
+  // 委派子会话优先回到父会话所在 renderer，外部无界面运行才回退任意主窗口。
+  const wc = getHeadlessAgentRunTarget(
+    sessionWebContents,
+    callbacks.originSessionId,
+    getMainRendererWebContents,
+  )
   const runInput: AgentSendInput = input.startedAt != null ? input : { ...input, startedAt: Date.now() }
   const startedAt = runInput.startedAt!
   if (wc) {
@@ -218,18 +343,27 @@ export async function runAgentHeadless(
         }
       },
       onComplete: (messages, opts) => {
-        callbacks.onComplete()
+        callbacks.onComplete(messages)
+        publishRunStopped(runInput.sessionId, opts?.stoppedByUser, opts?.startedAt)
         // 同步到渲染进程
         if (wc && !wc.isDestroyed()) {
-          wc.send(AGENT_IPC_CHANNELS.STREAM_COMPLETE, {
-            sessionId: runInput.sessionId,
+          sendAgentStreamComplete(wc, runInput, {
             messages,
             stoppedByUser: opts?.stoppedByUser ?? false,
             startedAt: opts?.startedAt,
             resultSubtype: opts?.resultSubtype,
+            resultErrors: opts?.resultErrors,
             backgroundTasksPending: opts?.backgroundTasksPending,
+            // 只读取刚完成的轻量 meta，renderer 可据此增量更新列表，避免再取 5,000+ 条全量会话。
+            session: getSessionMetaForRenderer(runInput.sessionId),
           })
         }
+        agentQueueCoordinator.onRunComplete(
+          runInput.sessionId,
+          undefined,
+          opts?.backgroundTasksPending === true,
+          opts?.stoppedByUser === true,
+        )
       },
       onTitleUpdated: (title) => {
         callbacks.onTitleUpdated(title)
@@ -257,10 +391,11 @@ export async function runAgentHeadless(
             workspaceId: runInput.workspaceId ?? session?.workspaceId,
             modelId: runInput.modelId,
             startedAt: persistedStartedAt,
+            ...(session ? { session } : {}),
           },
         })
       },
-    })
+    }, extensions)
   } catch (err) {
     console.error('[Agent 服务] runAgentHeadless 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'
@@ -268,11 +403,17 @@ export async function runAgentHeadless(
     callbacks.onComplete()
     if (wc && !wc.isDestroyed()) {
       wc.send(AGENT_IPC_CHANNELS.STREAM_ERROR, { sessionId: runInput.sessionId, error: errorMessage })
-      wc.send(AGENT_IPC_CHANNELS.STREAM_COMPLETE, { sessionId: runInput.sessionId, messages: [], stoppedByUser: false, startedAt })
+      sendAgentStreamComplete(wc, runInput, {
+        messages: [],
+        stoppedByUser: false,
+        startedAt,
+      })
     }
+    agentQueueCoordinator.onRunComplete(runInput.sessionId, undefined, false, false)
   } finally {
     if (!orchestrator.isActive(runInput.sessionId)) {
       sessionWebContents.delete(runInput.sessionId)
+      streamForwarder.clear(runInput.sessionId)
     }
   }
 }
@@ -288,8 +429,11 @@ export async function generateAgentTitle(input: AgentGenerateTitleInput): Promis
  * 中止指定会话的 Agent 执行
  */
 export function stopAgent(sessionId: string): void {
-  orchestrator.stop(sessionId)
+  orchestrator.stop(sessionId, agentQueueCoordinator.isDispatching(sessionId))
 }
+
+setHeadlessAgentRunner(runAgentHeadless)
+setAgentStopper(stopAgent)
 
 /**
  * 快照回退：回退到指定消息点，恢复文件 + 截断对话
@@ -308,20 +452,16 @@ export function isAgentSessionActive(sessionId: string): boolean {
   return orchestrator.isActive(sessionId)
 }
 
+/** 是否存在任意运行中 Agent，供更新器等全局生命周期服务安全判断。 */
+export function hasActiveAgentSessions(): boolean {
+  return orchestrator.hasActiveSessions()
+}
+
 /** 中止所有活跃的 Agent 会话（应用退出时调用） */
 export function stopAllAgents(): void {
   orchestrator.stopAll()
 }
 
-/**
- * 退出前最后兜底：扫描并强杀所有孤儿 claude-agent-sdk 子进程
- *
- * 必须在 stopAllAgents() 之后调用。针对 pidMap 未覆盖、dispose 漏杀等极端场景。
- * 同步执行，不 await，确保 before-quit 能在 Electron 超时前完成。
- */
-export function killOrphanedClaudeSubprocesses(): void {
-  scanAndKillOrphanedClaudeSubprocesses()
-}
 
 /**
  * 运行中动态切换会话的权限模式
@@ -346,10 +486,33 @@ export async function queueAgentMessage(
   return orchestrator.queueMessage(
     input.sessionId,
     input.userMessage,
+    input.rawUserMessage,
     undefined,
     input.uuid,
     { interrupt: input.interrupt },
+    input.mentionedSkills,
+    input.mentionedMcpServers,
+    input.mentionedSessionIds,
+    input.mentionedTodoIds,
+    input.mentionedCalendarEventIds,
   )
+}
+
+export function enqueueAgentQueuedMessage(input: AgentDeferredQueueMessageInput, webContents: WebContents): void {
+  registerWebContents(input.sessionId, webContents)
+  agentQueueCoordinator.enqueue(input)
+}
+
+export function cancelAgentQueuedMessage(input: AgentQueuedMessageControlInput): boolean {
+  return agentQueueCoordinator.cancel(input)
+}
+
+export function moveAgentQueuedMessage(input: AgentMoveQueuedMessageInput): boolean {
+  return agentQueueCoordinator.move(input)
+}
+
+export function clearAgentQueuedMessages(sessionId: string): void {
+  agentQueueCoordinator.clear(sessionId)
 }
 
 // ===== 文件操作 =====
@@ -357,15 +520,24 @@ export async function queueAgentMessage(
 /**
  * 保存文件到 Agent session 工作目录
  *
- * 将 base64 编码的文件写入 session 的 cwd，供 Agent 通过 Read 工具读取。
+ * 将 base64 编码的文件写入当前会话的私有工作目录，供 Agent 通过授权的附加目录读取。
  */
 export function saveFilesToAgentSession(input: AgentSaveFilesInput): AgentSavedFile[] {
   const sessionDir = getAgentSessionWorkspacePath(input.workspaceSlug, input.sessionId)
+  const attachmentsDir = join(sessionDir, 'attachments')
   const results: AgentSavedFile[] = []
   const usedPaths = new Set<string>()
 
-  for (const file of input.files) {
-    let targetPath = join(sessionDir, file.filename)
+  const decodedFiles = input.files.map((file) => {
+    const buffer = Buffer.from(file.data, 'base64')
+    if (buffer.length > MAX_ATTACHMENT_SIZE) {
+      throw new Error(`文件超过 100MB 限制: ${file.filename}`)
+    }
+    return { file, buffer }
+  })
+
+  for (const { file, buffer } of decodedFiles) {
+    let targetPath = resolveSafeWorkspaceFilePath(attachmentsDir, file.filename)
 
     // 防止同名文件覆盖
     if (usedPaths.has(targetPath) || existsSync(targetPath)) {
@@ -373,25 +545,16 @@ export function saveFilesToAgentSession(input: AgentSaveFilesInput): AgentSavedF
       const baseName = dotIdx > 0 ? file.filename.slice(0, dotIdx) : file.filename
       const ext = dotIdx > 0 ? file.filename.slice(dotIdx) : ''
       let counter = 1
-      let candidate = join(sessionDir, `${baseName}-${counter}${ext}`)
+      let candidate = join(attachmentsDir, `${baseName}-${counter}${ext}`)
       while (usedPaths.has(candidate) || existsSync(candidate)) {
         counter++
-        candidate = join(sessionDir, `${baseName}-${counter}${ext}`)
+        candidate = join(attachmentsDir, `${baseName}-${counter}${ext}`)
       }
       targetPath = candidate
     }
     usedPaths.add(targetPath)
 
     mkdirSync(dirname(targetPath), { recursive: true })
-
-    // 防御性检查：base64 字符串长度估算是否超 100MB 限制
-    // base64 编码膨胀率约 4/3，data.length * 0.75 ≈ 原始字节数
-    if (file.data.length * 0.75 > MAX_ATTACHMENT_SIZE) {
-      console.warn(`[Agent 服务] 文件超过 100MB 限制，跳过: ${file.filename} (预估 ${(file.data.length * 0.75 / 1024 / 1024).toFixed(1)}MB)`)
-      continue
-    }
-
-    const buffer = Buffer.from(file.data, 'base64')
     writeFileSync(targetPath, buffer)
 
     const actualFilename = targetPath.slice(sessionDir.length + 1)
@@ -402,45 +565,98 @@ export function saveFilesToAgentSession(input: AgentSaveFilesInput): AgentSavedF
   return results
 }
 
+const LOCAL_PROJECT_ROOT_UNAVAILABLE_CODE = 'local_project_root_unavailable'
+
+function createLocalProjectRootUnavailableError(projectRootPath: string, status?: string): Error {
+  const error = new Error(
+    `本地项目根目录不可用: 本地项目根目录不存在或无法访问：${projectRootPath}。请在 Proma 中重新选择项目文件夹。`,
+  ) as Error & { code?: string; details?: string[] }
+  error.code = LOCAL_PROJECT_ROOT_UNAVAILABLE_CODE
+  error.details = status ? [`目录状态: ${status}`] : undefined
+  return error
+}
+
+function resolveSafeWorkspaceFilePath(workspaceRoot: string, filename: string): string {
+  const hasParentTraversal = filename.split(/[\\/]+/).some((segment) => segment === '..')
+  if (!filename || isAbsolute(filename) || win32.isAbsolute(filename) || hasParentTraversal) {
+    throw new Error(`项目文件名不安全，拒绝保存: ${filename}`)
+  }
+
+  const resolvedRoot = resolve(workspaceRoot)
+  const targetPath = resolve(resolvedRoot, filename)
+  const pathWithinRoot = relative(resolvedRoot, targetPath)
+  const escapesRoot = pathWithinRoot === '..'
+    || pathWithinRoot.startsWith(`..${sep}`)
+    || isAbsolute(pathWithinRoot)
+
+  if (!pathWithinRoot || escapesRoot) {
+    throw new Error(`项目文件名不安全，拒绝保存: ${filename}`)
+  }
+
+  return targetPath
+}
+
 /**
- * 保存文件到工作区文件目录
+ * 保存文件到项目文件根目录
  *
- * 将 base64 编码的文件写入工作区 workspace-files/ 目录，所有会话均可访问。
+ * 空白项目写入 Proma 托管的 workspace-files/；本地目录项目直接写入用户选择的原始目录。
  */
 export function saveFilesToWorkspaceFiles(input: AgentSaveWorkspaceFilesInput): AgentSavedFile[] {
-  const wsFilesDir = getWorkspaceFilesDir(input.workspaceSlug)
+  const workspace = getAgentWorkspaceBySlug(input.workspaceSlug)
+  if (!workspace) {
+    throw new Error(`指定的 Agent 项目不存在或已删除: ${input.workspaceSlug}`)
+  }
+
+  if (workspace.projectRootPath) {
+    const status = getLocalProjectRootStatus(workspace.projectRootPath)
+    if (status !== 'available') {
+      throw createLocalProjectRootUnavailableError(workspace.projectRootPath, status)
+    }
+    try {
+      accessSync(workspace.projectRootPath, constants.R_OK | constants.W_OK | constants.X_OK)
+    } catch {
+      throw createLocalProjectRootUnavailableError(workspace.projectRootPath, 'unavailable')
+    }
+  }
+
+  const wsFilesDir = workspace.projectRootPath ?? getProjectFilesPath(input.workspaceSlug)
+  const files = input.files.map((file) => ({
+    file,
+    initialTargetPath: resolveSafeWorkspaceFilePath(wsFilesDir, file.filename),
+  }))
+  const decodedFiles = files.map(({ file, initialTargetPath }) => {
+    const buffer = Buffer.from(file.data, 'base64')
+    if (buffer.length > MAX_ATTACHMENT_SIZE) {
+      throw new Error(`文件超过 100MB 限制: ${file.filename}`)
+    }
+    return { file, initialTargetPath, buffer }
+  })
   const results: AgentSavedFile[] = []
   const usedPaths = new Set<string>()
 
-  for (const file of input.files) {
-    let targetPath = join(wsFilesDir, file.filename)
+  for (const { file, initialTargetPath, buffer } of decodedFiles) {
+    let targetPath = initialTargetPath
 
     // 防止同名文件覆盖
     if (usedPaths.has(targetPath) || existsSync(targetPath)) {
-      const dotIdx = file.filename.lastIndexOf('.')
-      const baseName = dotIdx > 0 ? file.filename.slice(0, dotIdx) : file.filename
-      const ext = dotIdx > 0 ? file.filename.slice(dotIdx) : ''
+      const relativeFilename = relative(wsFilesDir, targetPath)
+      const dotIdx = relativeFilename.lastIndexOf('.')
+      const baseName = dotIdx > 0 ? relativeFilename.slice(0, dotIdx) : relativeFilename
+      const ext = dotIdx > 0 ? relativeFilename.slice(dotIdx) : ''
       let counter = 1
-      let candidate = join(wsFilesDir, `${baseName}-${counter}${ext}`)
+      let candidate = resolveSafeWorkspaceFilePath(wsFilesDir, `${baseName}-${counter}${ext}`)
       while (usedPaths.has(candidate) || existsSync(candidate)) {
         counter++
-        candidate = join(wsFilesDir, `${baseName}-${counter}${ext}`)
+        candidate = resolveSafeWorkspaceFilePath(wsFilesDir, `${baseName}-${counter}${ext}`)
       }
       targetPath = candidate
     }
     usedPaths.add(targetPath)
 
     mkdirSync(dirname(targetPath), { recursive: true })
-
-    if (file.data.length * 0.75 > MAX_ATTACHMENT_SIZE) {
-      console.warn(`[Agent 服务] 工作区文件超过 100MB 限制，跳过: ${file.filename} (预估 ${(file.data.length * 0.75 / 1024 / 1024).toFixed(1)}MB)`)
-      continue
-    }
-
-    const buffer = Buffer.from(file.data, 'base64')
     writeFileSync(targetPath, buffer)
 
-    const actualFilename = targetPath.slice(wsFilesDir.length + 1)
+    const actualFilename = relative(wsFilesDir, targetPath)
     results.push({ filename: actualFilename, targetPath })
     console.log(`[Agent 服务] 工作区文件已保存: ${targetPath} (${buffer.length} bytes)`)
   }

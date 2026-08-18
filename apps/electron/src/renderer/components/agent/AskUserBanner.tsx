@@ -11,16 +11,25 @@ import { Send, X } from 'lucide-react'
 import Markdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Button } from '@/components/ui/button'
-import { allPendingAskUserRequestsAtom, agentStreamingStatesAtom, finalizeStreamingActivities } from '@/atoms/agent-atoms'
+import { SpeechButton } from '@/components/ai-elements/speech-button'
+import {
+  VOICE_DICTATION_CLEAR_PREVIEW_EVENT,
+  VOICE_DICTATION_INSERT_EVENT,
+  VOICE_DICTATION_PREVIEW_EVENT,
+  getLastFocusedVoiceInputId,
+  isVoiceDictationTargetInput,
+  setLastFocusedVoiceInputId,
+} from '@/lib/voice-input-focus'
+import {
+  allPendingAskUserRequestsAtom,
+  agentStreamingStatesAtom,
+  askUserDraftsAtom,
+  type AskUserQuestionDraft,
+  type AskUserRequestDraft,
+} from '@/atoms/agent-atoms'
 import type { AskUserQuestion } from '@proma/shared'
 
-interface QuestionAnswer {
-  selected: string[]
-  customText: string
-  showCustom: boolean
-}
-
-const EMPTY_ANSWER: QuestionAnswer = { selected: [], customText: '', showCustom: false }
+const EMPTY_ANSWER: AskUserQuestionDraft = { selected: [], customText: '', showCustom: false }
 
 const PREVIEW_REMARK_PLUGINS = [remarkGfm]
 
@@ -36,15 +45,19 @@ interface AskUserBannerProps {
 
 export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactElement | null {
   const [allRequests, setAllRequests] = useAtom(allPendingAskUserRequestsAtom)
+  const [drafts, setDrafts] = useAtom(askUserDraftsAtom)
   const setStreamingStates = useSetAtom(agentStreamingStatesAtom)
   const requests = allRequests.get(sessionId) ?? []
-  const [answers, setAnswers] = React.useState<Map<number, QuestionAnswer>>(new Map())
   const [submitting, setSubmitting] = React.useState(false)
-  const [activeTab, setActiveTab] = React.useState(0)
-  const [focusedOptIdx, setFocusedOptIdx] = React.useState(-1)
 
   const request = requests[0] ?? null
   const questions = request?.questions ?? []
+  const requestDraft = request ? drafts.get(request.requestId) : undefined
+  const activeTab = questions.length > 0
+    ? Math.min(Math.max(requestDraft?.activeTab ?? 0, 0), questions.length - 1)
+    : 0
+  const focusedOptIdx = requestDraft?.focusedOptIdx ?? -1
+  const answers = requestDraft?.answers ?? createInitialDraft(questions).answers
   const isLastTab = activeTab >= questions.length - 1
 
   // ===== Refs：确保 keydown handler 始终读取最新值，消除闭包过期问题 =====
@@ -69,26 +82,15 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
 
   React.useEffect(() => {
     clearAutoAdvanceTimer()
-    setActiveTab(0)
-    setFocusedOptIdx(-1)
-    const firstOpt = questions[0]?.options[0]
-    setAnswers(firstOpt
-      ? new Map([[0, { ...EMPTY_ANSWER, selected: [firstOpt.label] }]])
-      : new Map())
-  }, [request?.requestId])
-
-  // 切换 Tab 时重置焦点并默认选中第一个选项
-  React.useEffect(() => {
-    setFocusedOptIdx(-1)
-    setAnswers((prev) => {
-      if (prev.has(activeTab)) return prev
-      const firstOpt = questions[activeTab]?.options[0]
-      if (!firstOpt) return prev
+    if (!request || questions.length === 0) return
+    setDrafts((prev) => {
+      const current = prev.get(request.requestId)
+      if (current && current.activeTab >= 0 && current.activeTab < questions.length) return prev
       const map = new Map(prev)
-      map.set(activeTab, { ...EMPTY_ANSWER, selected: [firstOpt.label] })
+      map.set(request.requestId, createInitialDraft(questions))
       return map
     })
-  }, [activeTab])
+  }, [request?.requestId, questions, clearAutoAdvanceTimer, setDrafts])
 
   // 键盘导航：只在 requestId 变化时重建 handler，内部通过 ref 读取最新值
   React.useEffect(() => {
@@ -108,7 +110,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
         if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
           e.preventDefault()
           if (lastTab) submitRef.current?.()
-          else setActiveTab((prev) => prev + 1)
+          else setActiveTabByState((prev) => prev + 1)
         }
         return
       }
@@ -120,7 +122,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
           : e.key === 'ArrowDown'
             ? (curFocusIdx + 1) % itemCount
             : (curFocusIdx - 1 + itemCount) % itemCount
-        setFocusedOptIdx(nextIdx)
+        setFocusedOptIdxByState(nextIdx)
         // 移动焦点同时选中
         if (nextIdx < q.options.length) {
           const opt = q.options[nextIdx]
@@ -131,7 +133,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
       } else if (e.key === 'Enter' && !e.isComposing) {
         e.preventDefault()
         if (lastTab) submitRef.current?.()
-        else setActiveTab((prev) => prev + 1)
+        else setActiveTabByState((prev) => prev + 1)
       }
     }
 
@@ -149,7 +151,6 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
       map.set(sessionId, {
         ...current,
         running: false,
-        ...finalizeStreamingActivities(current.toolActivities),
       })
       return map
     })
@@ -159,16 +160,57 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
       map.delete(sessionId)
       return map
     })
+    clearDrafts(requests.map((r) => r.requestId))
     // 终止 Agent
     window.electronAPI.stopAgent(sessionId).catch(console.error)
   }
 
   if (!request) return null
 
-  const getAnswer = (idx: number): QuestionAnswer => answers.get(idx) ?? EMPTY_ANSWER
+  const getAnswer = (idx: number): AskUserQuestionDraft => answers.get(idx) ?? EMPTY_ANSWER
+
+  function updateCurrentDraft(updater: (draft: AskUserRequestDraft) => AskUserRequestDraft): void {
+    if (!request) return
+    setDrafts((prev) => {
+      const current = prev.get(request.requestId) ?? createInitialDraft(questions)
+      const map = new Map(prev)
+      map.set(request.requestId, updater(current))
+      return map
+    })
+  }
+
+  function updateAnswers(updater: (prev: Map<number, AskUserQuestionDraft>) => Map<number, AskUserQuestionDraft>): void {
+    updateCurrentDraft((draft) => ({ ...draft, answers: updater(draft.answers) }))
+  }
+
+  function setActiveTabByState(update: number | ((prev: number) => number)): void {
+    updateCurrentDraft((draft) => {
+      const rawNext = typeof update === 'function' ? update(draft.activeTab) : update
+      const maxTab = Math.max(questions.length - 1, 0)
+      const nextTab = Math.min(Math.max(rawNext, 0), maxTab)
+      return {
+        ...draft,
+        activeTab: nextTab,
+        focusedOptIdx: -1,
+        answers: ensureAnswerForTab(draft.answers, questions, nextTab),
+      }
+    })
+  }
+
+  function setFocusedOptIdxByState(nextIdx: number): void {
+    updateCurrentDraft((draft) => ({ ...draft, focusedOptIdx: nextIdx }))
+  }
+
+  function clearDrafts(requestIds: string[]): void {
+    setDrafts((prev) => {
+      const map = new Map(prev)
+      requestIds.forEach((requestId) => map.delete(requestId))
+      return map
+    })
+  }
 
   function toggleOptionByState(qIdx: number, q: AskUserQuestion, label: string): void {
-    setAnswers((prev) => {
+    updateAnswers((prev) => {
       const map = new Map(prev)
       const cur = map.get(qIdx) ?? EMPTY_ANSWER
       const selected = q.multiSelect
@@ -180,7 +222,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
   }
 
   function toggleCustomByState(qIdx: number): void {
-    setAnswers((prev) => {
+    updateAnswers((prev) => {
       const map = new Map(prev)
       const cur = map.get(qIdx) ?? EMPTY_ANSWER
       map.set(qIdx, { ...cur, showCustom: !cur.showCustom, selected: cur.showCustom ? cur.selected : [] })
@@ -213,6 +255,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
         else map.set(sessionId, newValue)
         return map
       })
+      clearDrafts([request.requestId])
     } catch (error) {
       console.error('[AskUserBanner] 响应失败:', error)
     } finally {
@@ -231,11 +274,11 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
   if (!currentQuestion) return null
 
   const goNextTab = (): void => {
-    if (!isLastTab) setActiveTab((prev) => prev + 1)
+    if (!isLastTab) setActiveTabByState((prev) => prev + 1)
   }
 
   return (
-    <div className="mx-4 mb-3 rounded-xl bg-card shadow-lg overflow-hidden animate-in slide-in-from-bottom-2 duration-200">
+    <div className="ask-user-banner mx-4 mb-3 rounded-xl bg-card shadow-lg overflow-hidden animate-in slide-in-from-bottom-2 duration-200">
       {/* 头部 + Tab 栏 */}
       <div className="px-4 pt-3 pb-2">
         <div className="flex items-center justify-between mb-2">
@@ -275,7 +318,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
                         : 'bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground'
                     }
                   `}
-                  onClick={() => setActiveTab(idx)}
+                  onClick={() => setActiveTabByState(idx)}
                 >
                   {`${idx + 1}-${q.multiSelect ? '多选' : '单选'}：${q.header || `问题 ${idx + 1}`}`}
                 </button>
@@ -299,12 +342,12 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
               clearAutoAdvanceTimer()
               autoAdvanceTimerRef.current = setTimeout(() => {
                 autoAdvanceTimerRef.current = null
-                setActiveTab((prev) => prev + 1)
+                setActiveTabByState((prev) => prev + 1)
               }, 150)
             }
           }}
           onToggleCustom={() => toggleCustomByState(activeTab)}
-          onCustomTextChange={(text) => setAnswers((prev) => {
+          onCustomTextChange={(text) => updateAnswers((prev) => {
             const map = new Map(prev)
             const cur = map.get(activeTab) ?? EMPTY_ANSWER
             map.set(activeTab, { ...cur, customText: text })
@@ -336,6 +379,27 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
   )
 }
 
+function createInitialDraft(questions: readonly AskUserQuestion[]): AskUserRequestDraft {
+  return {
+    activeTab: 0,
+    focusedOptIdx: -1,
+    answers: ensureAnswerForTab(new Map(), questions, 0),
+  }
+}
+
+function ensureAnswerForTab(
+  answers: Map<number, AskUserQuestionDraft>,
+  questions: readonly AskUserQuestion[],
+  tabIndex: number,
+): Map<number, AskUserQuestionDraft> {
+  if (answers.has(tabIndex)) return answers
+  const firstOpt = questions[tabIndex]?.options[0]
+  if (!firstOpt) return answers
+  const map = new Map(answers)
+  map.set(tabIndex, { ...EMPTY_ANSWER, selected: [firstOpt.label] })
+  return map
+}
+
 /** 单个问题卡片（竖向选项） */
 function QuestionCard({
   question,
@@ -350,7 +414,7 @@ function QuestionCard({
 }: {
   question: AskUserQuestion
   questionIndex: number
-  answer: QuestionAnswer
+  answer: AskUserQuestionDraft
   focusedIndex: number
   showBadge: boolean
   onToggleOption: (label: string) => void
@@ -358,11 +422,111 @@ function QuestionCard({
   onCustomTextChange: (text: string) => void
   onSubmit: () => void
 }): React.ReactElement {
+  const customInputRef = React.useRef<HTMLInputElement | null>(null)
+  const voiceInputIdRef = React.useRef(`ask-user-custom-${Math.random().toString(36).slice(2)}`)
+  const customTextRef = React.useRef(answer.customText)
+  const previewRef = React.useRef<{ sessionId: string; start: number; text: string } | null>(null)
+  const onCustomTextChangeRef = React.useRef(onCustomTextChange)
   const optionCount = question.options.length
   const previewOption = focusedIndex >= 0 && focusedIndex < optionCount
     ? question.options[focusedIndex]
     : question.options.find((o) => answer.selected.includes(o.label))
   const previewContent = previewOption?.preview
+
+  customTextRef.current = answer.customText
+  onCustomTextChangeRef.current = onCustomTextChange
+
+  React.useEffect(() => {
+    if (!answer.showCustom) {
+      previewRef.current = null
+      return
+    }
+
+    const restoreSelection = (input: HTMLInputElement | null, cursor: number): void => {
+      requestAnimationFrame(() => {
+        input?.focus()
+        input?.setSelectionRange(cursor, cursor)
+      })
+    }
+
+    const discardPreview = (): void => {
+      const preview = previewRef.current
+      if (!preview) return
+      const currentText = customTextRef.current
+      if (currentText.slice(preview.start, preview.start + preview.text.length) === preview.text) {
+        onCustomTextChangeRef.current(`${currentText.slice(0, preview.start)}${currentText.slice(preview.start + preview.text.length)}`)
+      }
+      previewRef.current = null
+    }
+
+    const replacePreview = (sessionId: string, text: string, targetInputId: string | null | undefined): boolean => {
+      if (!isVoiceDictationTargetInput(voiceInputIdRef.current, targetInputId)) return false
+      const input = customInputRef.current
+      const currentText = customTextRef.current
+      const previous = previewRef.current
+      const canReplacePrevious = previous?.sessionId === sessionId &&
+        currentText.slice(previous.start, previous.start + previous.text.length) === previous.text
+      const start = canReplacePrevious ? previous.start : (input?.selectionStart ?? currentText.length)
+      const end = canReplacePrevious ? start + (previous?.text.length ?? 0) : (input?.selectionEnd ?? start)
+      const nextText = `${currentText.slice(0, start)}${text}${currentText.slice(end)}`
+
+      previewRef.current = { sessionId, start, text }
+      onCustomTextChangeRef.current(nextText)
+      restoreSelection(input, start + text.length)
+      return true
+    }
+
+    const previewHandler = (event: Event): void => {
+      const detail = (event as CustomEvent<{ sessionId?: string; text?: string; targetInputId?: string | null }>).detail
+      if (!detail?.sessionId) return
+      if (replacePreview(detail.sessionId, detail.text ?? '', detail.targetInputId)) {
+        event.preventDefault()
+      }
+    }
+
+    const clearPreviewHandler = (event: Event): void => {
+      const detail = (event as CustomEvent<{ sessionId?: string; targetInputId?: string | null }>).detail
+      const sessionId = detail?.sessionId
+      const preview = previewRef.current
+      if (!sessionId || preview?.sessionId !== sessionId) return
+      if (replacePreview(sessionId, '', detail?.targetInputId)) {
+        previewRef.current = null
+        event.preventDefault()
+      }
+    }
+
+    const insertHandler = (event: Event): void => {
+      const detail = (event as CustomEvent<{ sessionId?: string; text?: string; targetInputId?: string | null }>).detail
+      const text = detail?.text?.trim()
+      if (!text) return
+
+      const input = customInputRef.current
+      const currentText = customTextRef.current
+      const preview = previewRef.current
+      const canReplacePreview = !!detail?.sessionId && preview?.sessionId === detail.sessionId &&
+        currentText.slice(preview.start, preview.start + preview.text.length) === preview.text
+      if (!canReplacePreview && !isVoiceDictationTargetInput(voiceInputIdRef.current, detail?.targetInputId)) return
+      const start = canReplacePreview ? preview.start : (input?.selectionStart ?? currentText.length)
+      const end = canReplacePreview ? start + (preview?.text.length ?? 0) : (input?.selectionEnd ?? start)
+      const nextText = `${currentText.slice(0, start)}${text}${currentText.slice(end)}`
+      const nextCursor = start + text.length
+
+      previewRef.current = null
+      onCustomTextChangeRef.current(nextText)
+      event.preventDefault()
+      restoreSelection(input, nextCursor)
+    }
+
+    window.addEventListener(VOICE_DICTATION_PREVIEW_EVENT, previewHandler)
+    window.addEventListener(VOICE_DICTATION_CLEAR_PREVIEW_EVENT, clearPreviewHandler)
+    window.addEventListener(VOICE_DICTATION_INSERT_EVENT, insertHandler)
+    return () => {
+      discardPreview()
+      window.removeEventListener(VOICE_DICTATION_PREVIEW_EVENT, previewHandler)
+      window.removeEventListener(VOICE_DICTATION_CLEAR_PREVIEW_EVENT, clearPreviewHandler)
+      window.removeEventListener(VOICE_DICTATION_INSERT_EVENT, insertHandler)
+    }
+  }, [answer.showCustom])
 
   return (
     <div className="space-y-2">
@@ -430,21 +594,26 @@ function QuestionCard({
 
       {/* 自由文本输入 */}
       {answer.showCustom && (
-        <input
-          type="text"
-          className="w-full px-3 py-2 rounded-lg text-xs bg-muted/40 focus:bg-muted/60 focus:outline-none focus:ring-2 focus:ring-primary/30 placeholder:text-muted-foreground/40 transition-colors"
-          placeholder="输入自定义答案..."
-          value={answer.customText}
-          onChange={(e) => onCustomTextChange(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-              e.preventDefault()
-              e.stopPropagation() // 阻止冒泡到 document handler，避免重复触发 setActiveTab
-              onSubmit()
-            }
-          }}
-          autoFocus
-        />
+        <div className="relative">
+          <input
+            ref={customInputRef}
+            type="text"
+            className="w-full px-3 py-2 pr-9 rounded-lg text-xs bg-muted/40 focus:bg-muted/60 focus:outline-none focus:ring-2 focus:ring-primary/30 placeholder:text-muted-foreground/40 transition-colors"
+            placeholder="输入自定义答案..."
+            value={answer.customText}
+            onChange={(e) => onCustomTextChange(e.target.value)}
+            onFocus={() => setLastFocusedVoiceInputId(voiceInputIdRef.current)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault()
+                e.stopPropagation() // 阻止冒泡到 document handler，避免重复触发 setActiveTab
+                onSubmit()
+              }
+            }}
+            autoFocus
+          />
+          <SpeechButton className="absolute right-1 top-1/2 -translate-y-1/2 size-6 rounded-full" voiceInputId={voiceInputIdRef.current} />
+        </div>
       )}
 
       {/* 选项 Preview（聚焦或选中时展示） */}

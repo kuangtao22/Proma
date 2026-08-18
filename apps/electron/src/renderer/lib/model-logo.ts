@@ -238,17 +238,25 @@ const PROVIDER_LOGO_MAP: Record<ProviderType, string> = {
   anthropic: ClaudeLogo,
   'anthropic-compatible': DefaultLogo,
   openai: OpenAILogo,
+  'openai-responses': OpenAILogo,
   deepseek: DeepSeekLogo,
   google: GeminiLogo,
   'kimi-api': KimiLogo,
   'kimi-coding': KimiLogo,
+  'opencode-go-openai': DefaultLogo,
   zhipu: ZhipuLogo,
   'zhipu-coding': ZhipuLogo,
+  'zhipu-coding-team': ZhipuLogo,
+  'ark-coding-plan': DoubaoLogo,
   minimax: MiniMaxLogo,
   doubao: DoubaoLogo,
   qwen: QwenLogo,
+  'qwen-anthropic': QwenLogo,
+  'qwen-token-plan': QwenLogo,
   xiaomi: XiaomiLogo,
   'xiaomi-token-plan': XiaomiLogo,
+  'openai-codex': OpenAILogo,
+  xai: GrokLogo,
   custom: DefaultLogo,
 }
 
@@ -373,6 +381,20 @@ export function resolveModelDisplayName(modelId: string, channels: import('@prom
     }
   }
   return modelId
+}
+
+/**
+ * 根据模型 ID 在渠道列表中查找供应商类型
+ */
+export function resolveModelProvider(modelId: string, channels: import('@proma/shared').Channel[]): ProviderType | undefined {
+  for (const channel of channels) {
+    for (const model of channel.models) {
+      if (model.id === modelId) {
+        return channel.provider
+      }
+    }
+  }
+  return undefined
 }
 
 /** 默认模型图标 */

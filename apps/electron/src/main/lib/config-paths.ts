@@ -9,6 +9,7 @@
 import { join, basename } from 'node:path'
 import { mkdirSync, existsSync, cpSync, rmSync, readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { rmSyncWithRetry } from './fs-retry'
 
 /**
  * 获取配置目录名称
@@ -165,6 +166,15 @@ export function getSettingsPath(): string {
 }
 
 /**
+ * 获取系统默认 App 探测缓存路径
+ *
+ * @returns ~/.proma/default-apps.json
+ */
+export function getDefaultAppsCachePath(): string {
+  return join(getConfigDir(), 'default-apps.json')
+}
+
+/**
  * 获取用户档案文件路径
  *
  * @returns ~/.proma/user-profile.json
@@ -189,15 +199,6 @@ export function getProxySettingsPath(): string {
  */
 export function getSystemPromptsPath(): string {
   return join(getConfigDir(), 'system-prompts.json')
-}
-
-/**
- * 获取记忆配置文件路径
- *
- * @returns ~/.proma/memory.json
- */
-export function getMemoryConfigPath(): string {
-  return join(getConfigDir(), 'memory.json')
 }
 
 /**
@@ -403,6 +404,23 @@ export function getDefaultSkillsDir(): string {
 }
 
 /**
+ * 获取打包进 App 的 proma CLI 二进制路径。
+ *
+ * 打包模式下从 process.resourcesPath/bin 取（electron-builder extraResources 注入）。
+ * 开发模式下没有编译二进制——返回 undefined，由调用方回退到源码运行
+ * （bun apps/cli/src/index.ts）。
+ *
+ * @returns 二进制绝对路径；不存在时返回 undefined
+ */
+export function getBundledCliPath(): string | undefined {
+  const { app } = require('electron')
+  if (!app.isPackaged) return undefined
+  const binName = process.platform === 'win32' ? 'proma.exe' : 'proma'
+  const cliPath = join(process.resourcesPath, 'bin', binName)
+  return existsSync(cliPath) ? cliPath : undefined
+}
+
+/**
  * 从 SKILL.md 的 YAML frontmatter 中解析 version 字段
  *
  * 无 version 字段时返回 '0.0.0'（确保旧 Skill 会被更新）。
@@ -445,6 +463,37 @@ function compareSemver(a: string, b: string): number {
   return 0
 }
 
+/**
+ * 已从 App bundle 移除、但仍需在既有用户目录中清理的默认 Skills。
+ *
+ * 不根据 bundle 中缺失的目录自动删除，避免误删用户自行安装的 Skills；
+ * 后续退役某个内置 Skill 时，显式把它的 slug 加到这里。
+ */
+export const RETIRED_DEFAULT_SKILL_SLUGS: readonly string[] = [
+  'brainstorming',
+]
+
+const RETIRED_DEFAULT_SKILL_SLUG_SET = new Set(RETIRED_DEFAULT_SKILL_SLUGS)
+
+export function isRetiredDefaultSkill(slug: string): boolean {
+  return RETIRED_DEFAULT_SKILL_SLUG_SET.has(slug)
+}
+
+/** 清理 ~/.proma/default-skills/ 中已退役的内置 Skill 缓存。 */
+export function removeRetiredDefaultSkills(dir = getDefaultSkillsDir()): void {
+  for (const slug of RETIRED_DEFAULT_SKILL_SLUGS) {
+    const target = join(dir, slug)
+    if (!existsSync(target)) continue
+
+    try {
+      rmSyncWithRetry(target, { recursive: true, force: true })
+      console.log(`[配置] 已移除退役默认 Skill: ${slug}`)
+    } catch (err) {
+      console.warn(`[配置] 移除退役默认 Skill 失败 (${slug}):`, err)
+    }
+  }
+}
+
 /** 防御性目录基名集合：复制 default skills 时永远跳过这些目录，避免
  *  .git 0444 文件、node_modules 文件爆炸等场景把启动期同步链路炸掉。 */
 const DEFAULT_SKILL_COPY_BLOCKLIST = new Set([
@@ -477,13 +526,14 @@ export function seedDefaultSkills(): void {
   const bundledDir = app.isPackaged
     ? join(process.resourcesPath, 'default-skills')
     : join(__dirname, '../default-skills')
+  const userDir = getDefaultSkillsDir()
+
+  removeRetiredDefaultSkills(userDir)
 
   if (!existsSync(bundledDir)) {
     console.log('[配置] 未找到内置 default-skills 目录，跳过')
     return
   }
-
-  const userDir = getDefaultSkillsDir()
 
   try {
     const entries = readdirSync(bundledDir, { withFileTypes: true })
@@ -542,12 +592,30 @@ export function getWeChatSyncPath(): string {
 }
 
 /**
+ * 获取微信聊天绑定持久化路径
+ *
+ * @returns ~/.proma/wechat-bindings.json
+ */
+export function getWeChatBindingsPath(): string {
+  return join(getConfigDir(), 'wechat-bindings.json')
+}
+
+/**
  * 获取钉钉配置文件路径
  *
  * @returns ~/.proma/dingtalk.json
  */
 export function getDingTalkConfigPath(): string {
   return join(getConfigDir(), 'dingtalk.json')
+}
+
+/**
+ * 获取某个钉钉 Bot 的聊天绑定持久化路径
+ *
+ * @returns ~/.proma/dingtalk-bindings-{botId}.json
+ */
+export function getDingTalkBotBindingsPath(botId: string): string {
+  return join(getConfigDir(), `dingtalk-bindings-${botId}.json`)
 }
 
 /**
@@ -612,7 +680,7 @@ export function getAgentSessionWorkspacePath(workspaceSlug: string, sessionId: s
 /**
  * 获取 SDK 隔离配置目录路径
  *
- * 用于设置 CLAUDE_CONFIG_DIR 环境变量，让 SDK 读取独立的配置文件，
+ * 用于保存 Pi session artifact 等运行时数据，
  * 而不是用户的 ~/.claude.json，实现 Proma 与 Claude Code CLI 的配置隔离。
  *
  * 如果目录不存在则自动创建。
@@ -646,4 +714,9 @@ export function getScratchPadPath(): string {
  */
 export function getAutomationsPath(): string {
   return join(getConfigDir(), 'automations.json')
+}
+
+/** 获取任务/日程 SQLite 数据库路径。 */
+export function getPlanningDatabasePath(): string {
+  return join(getConfigDir(), 'planning.db')
 }

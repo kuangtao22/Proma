@@ -22,6 +22,9 @@ import { BridgeCommandHandler, type BridgeAttachment } from './bridge-command-ha
 import { inferImageMediaType, saveImageToSession, inferExtension, MAX_IMAGE_SIZE } from './bridge-attachment-utils'
 import { getAgentWorkspace } from './agent-workspace-manager'
 import { getSettings } from './settings-service'
+import { getDingTalkBotBindingsPath } from './config-paths'
+import { createJsonBridgeChatBindingStore } from './bridge-binding-store'
+import { redactSensitiveLogText, redactSensitiveLogValue } from './bridge-log-redaction'
 
 // ===== 类型声明 =====
 
@@ -144,11 +147,15 @@ class DingTalkBridge {
               console.warn(`[钉钉 Bridge/${this.botConfig.name}] 发送消息失败: HTTP ${resp.status}`)
             }
           } catch (error) {
-            console.error(`[钉钉 Bridge/${this.botConfig.name}] 发送消息异常:`, error)
+            console.error(`[钉钉 Bridge/${this.botConfig.name}] 发送消息异常:`, redactSensitiveLogValue(error))
           }
         },
       },
       getDefaultWorkspaceId: () => this.botConfig.defaultWorkspaceId,
+      bindingStore: createJsonBridgeChatBindingStore(
+        getDingTalkBotBindingsPath(botConfig.id),
+        `钉钉 Bridge/${botConfig.name}`,
+      ),
       onWorkspaceSwitched: async (workspaceId) => {
         const { saveDingTalkBotConfig } = await import('./dingtalk-config')
         saveDingTalkBotConfig({
@@ -172,6 +179,11 @@ class DingTalkBridge {
   /** 获取当前状态 */
   getStatus(): DingTalkBridgeState {
     return { ...this.state }
+  }
+
+  /** 在删除项目时清理指向其会话的聊天绑定。 */
+  removeBindingsForDeletedWorkspace(workspaceId: string, sessionIds: Iterable<string>): number {
+    return this.commandHandler.removeBindingsForDeletedWorkspace(workspaceId, sessionIds)
   }
 
   /** 启动 Stream 连接 */
@@ -216,7 +228,7 @@ class DingTalkBridge {
       this.updateStatus({ status: 'connected', connectedAt: Date.now() })
       console.log(`[钉钉 Bridge/${this.botConfig.name}] Stream 连接已建立`)
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error)
+      const errorMessage = redactSensitiveLogText(error instanceof Error ? error.message : String(error))
       this.updateStatus({ status: 'error', errorMessage })
       console.error(`[钉钉 Bridge/${this.botConfig.name}] 连接失败:`, errorMessage)
       this.client = null
@@ -271,7 +283,7 @@ class DingTalkBridge {
       if (testClient) {
         try { testClient.disconnect() } catch {}
       }
-      const errorMessage = error instanceof Error ? error.message : String(error)
+      const errorMessage = redactSensitiveLogText(error instanceof Error ? error.message : String(error))
       return {
         success: false,
         message: `连接失败: ${errorMessage}`,
@@ -284,7 +296,7 @@ class DingTalkBridge {
     this.messageQueue = this.messageQueue
       .then(() => this.processRobotMessage(msg))
       .catch((error) => {
-        console.error(`[钉钉 Bridge/${this.botConfig.name}] 处理消息失败:`, error)
+        console.error(`[钉钉 Bridge/${this.botConfig.name}] 处理消息失败:`, redactSensitiveLogValue(error))
       })
   }
 
@@ -303,7 +315,7 @@ class DingTalkBridge {
     try {
       data = JSON.parse(msg.data) as DingTalkRobotMessage
     } catch (error) {
-      console.error(`[钉钉 Bridge/${this.botConfig.name}] 解析消息失败:`, error, msg.data)
+      console.error(`[钉钉 Bridge/${this.botConfig.name}] 解析消息失败 (messageId=${msg.headers.messageId}):`, redactSensitiveLogValue(error))
       return
     }
 
@@ -332,13 +344,13 @@ class DingTalkBridge {
       return
     }
 
-    console.log(`[钉钉 Bridge/${this.botConfig.name}] 收到消息:`, {
+    console.log(`[钉钉 Bridge/${this.botConfig.name}] 收到消息:`, redactSensitiveLogValue({
       msgId: msg.headers.messageId,
       senderNick: data.senderNick,
       text: text.length > 100 ? text.slice(0, 100) + '...' : text,
       imageCount: downloadCodes.length,
       conversationType: data.conversationType,
-    })
+    }))
 
     // 下载图片（使用消息中的 robotCode，而非 clientId）
     const robotCode = data.robotCode || this.botConfig.clientId
@@ -352,7 +364,7 @@ class DingTalkBridge {
         }
         downloads.push({ id: `${msg.headers.messageId}-${idx}`, data: buf, mediaType })
       } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error)
+        const errMsg = redactSensitiveLogText(error instanceof Error ? error.message : String(error))
         console.error(`[钉钉 Bridge/${this.botConfig.name}] 图片下载失败:`, errMsg)
         await this.replyTextViaWebhook(data.sessionWebhook, '⚠️ 一张图片下载失败，已跳过')
       }
@@ -404,7 +416,7 @@ class DingTalkBridge {
     // 先验证 workspace 是否有效，避免 ensureBinding 创建孤儿 binding
     const preCheckWorkspaceId = this.botConfig.defaultWorkspaceId ?? getSettings().agentWorkspaceId ?? ''
     if (!preCheckWorkspaceId || !getAgentWorkspace(preCheckWorkspaceId)) {
-      await this.replyTextViaWebhook(data.sessionWebhook, '⚠️ 当前未设置工作区，无法保存图片')
+      await this.replyTextViaWebhook(data.sessionWebhook, '⚠️ 当前未设置项目，无法保存图片')
       return
     }
 
@@ -415,7 +427,7 @@ class DingTalkBridge {
     }
     const workspace = getAgentWorkspace(binding.workspaceId)
     if (!workspace) {
-      await this.replyTextViaWebhook(data.sessionWebhook, '⚠️ 当前未设置工作区，无法保存图片')
+      await this.replyTextViaWebhook(data.sessionWebhook, '⚠️ 当前未设置项目，无法保存图片')
       return
     }
 
@@ -447,7 +459,7 @@ class DingTalkBridge {
         console.warn(`[钉钉 Bridge/${this.botConfig.name}] webhook 回复失败: HTTP ${resp.status}`)
       }
     } catch (error) {
-      console.error(`[钉钉 Bridge/${this.botConfig.name}] webhook 发送失败:`, error)
+      console.error(`[钉钉 Bridge/${this.botConfig.name}] webhook 发送失败:`, redactSensitiveLogValue(error))
     }
   }
 

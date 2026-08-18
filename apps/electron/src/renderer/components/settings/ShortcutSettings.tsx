@@ -13,6 +13,7 @@ import { useAtom } from 'jotai'
 import { RotateCcw } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
+import { ShortcutKeycaps } from '@/components/shortcuts/ShortcutKeycaps'
 import { Switch } from '@/components/ui/switch'
 import {
   Tooltip,
@@ -257,11 +258,11 @@ function ShortcutRecorder({
   return (
     <button
       type="button"
-      className="text-xs px-2.5 py-1 rounded-md bg-muted hover:bg-muted/80 text-foreground/80 font-mono transition-colors"
+      className="rounded-md p-1 transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
       onClick={handleStartRecording}
       title="点击自定义快捷键"
     >
-      {getAcceleratorDisplay(currentAccelerator)}
+      <ShortcutKeycaps accelerator={currentAccelerator} />
     </button>
   )
 }
@@ -592,9 +593,7 @@ export function ShortcutSettings(): React.ReactElement {
                     </div>
                     <div className="flex items-center gap-2 ml-4">
                       {def.readonly ? (
-                        <span className="text-xs px-2.5 py-1 rounded-md bg-muted text-foreground/60 font-mono">
-                          {getAcceleratorDisplay(isMac ? def.defaultMac : def.defaultWin)}
-                        </span>
+                        <ShortcutKeycaps accelerator={isMac ? def.defaultMac : def.defaultWin} />
                       ) : (
                         <>
                           <ShortcutRecorder

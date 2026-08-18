@@ -1,4 +1,4 @@
-import { Node, mergeAttributes, nodeInputRule } from '@tiptap/core'
+import { Node, mergeAttributes, nodeInputRule, ResizableNodeView } from '@tiptap/core'
 import type { Node as ProseMirrorNode } from '@tiptap/pm/model'
 import { Fragment } from '@tiptap/pm/model'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
@@ -18,8 +18,10 @@ import { highlightCode, highlightToTokens, getDisplayName } from '@proma/core'
 import { MermaidBlock } from '@proma/ui'
 import type { HighlightTokensResult } from '@proma/core'
 import type { FileAccessOptions } from '@proma/shared'
-import { extractCodeText } from '../../lib/markdown-rich-text'
+import { copyImageSourceToClipboard } from '../../lib/image-clipboard'
+import { extractCodeText, parseImageWidth } from '../../lib/markdown-rich-text'
 import { shouldRenderMermaidCodeBlock } from '../../lib/mermaid-detection'
+import { copyTextToClipboard } from '../../lib/clipboard'
 
 type FileAccessRef = { current: FileAccessOptions | undefined }
 /** 传 null 表示当前编辑器无会话/文件上下文（如 ScratchPad），跳过路径解析。 */
@@ -76,7 +78,17 @@ function serializeMarkdownImage(state: MarkdownSerializerLike, node: ProseMirror
   const src = escapeMarkdownLinkTarget(stringAttr(node, 'src'))
   const alt = state.esc(stringAttr(node, 'alt'))
   const title = stringAttr(node, 'title').replace(/"/g, '\\"')
-  state.write(`![${alt}](${src}${title ? ` "${title}"` : ''})`)
+  const width = parseImageWidth(node.attrs.width)
+  if (width) {
+    const escapedSrc = escapeHtmlAttr(stringAttr(node, 'src'))
+    const escapedAlt = escapeHtmlAttr(stringAttr(node, 'alt'))
+    const escapedTitle = escapeHtmlAttr(stringAttr(node, 'title'))
+    state.write(`<img src="${escapedSrc}" alt="${escapedAlt}" width="${width}"${escapedTitle ? ` title="${escapedTitle}"` : ''}>`)
+  } else {
+    state.write(`![${alt}](${src}${title ? ` "${title}"` : ''})`)
+  }
+  state.ensureNewLine()
+  state.closeBlock(node)
 }
 
 function serializeMarkdownVideo(state: MarkdownSerializerLike, node: ProseMirrorNode): void {
@@ -460,10 +472,10 @@ function createStaticHtmlView(
   }
 }
 
-function createMarkdownImageView(initialNode: ProseMirrorNode, fileAccessRef: FileAccessRefOrNull) {
+function createMarkdownImageView(initialNode: ProseMirrorNode, fileAccessRef: FileAccessRefOrNull, editor: any, getPos: (() => number | undefined) | boolean) {
   const figure = document.createElement('figure')
   figure.contentEditable = 'false'
-  setClass(figure, 'not-prose my-3')
+  setClass(figure, 'not-prose my-3 group relative w-fit')
 
   const img = document.createElement('img')
   img.draggable = false
@@ -472,6 +484,64 @@ function createMarkdownImageView(initialNode: ProseMirrorNode, fileAccessRef: Fi
 
   const caption = document.createElement('figcaption')
   setClass(caption, 'mt-1 text-center text-xs text-muted-foreground')
+  const isScratchPad = fileAccessRef === null
+
+  // Toolbar (copy / edit / delete)
+  const toolbar = document.createElement('div')
+  setClass(toolbar, 'absolute top-2 right-2 hidden group-hover:flex items-center gap-1 bg-background/90 backdrop-blur-sm border border-border rounded-md p-1 shadow-sm z-10')
+
+  const createBtn = (title: string, svgPath: string, onClick: () => void) => {
+    const btn = document.createElement('button')
+    setClass(btn, 'p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors')
+    btn.title = title
+    btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${svgPath}</svg>`
+    btn.addEventListener('click', (e) => { e.stopPropagation(); onClick() })
+    return btn
+  }
+
+  const copyBtn = createBtn('复制图片', '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>', async () => {
+    const result = await copyImageSourceToClipboard(img.src, window.electronAPI.copyImageToClipboard)
+    const { toast } = await import('sonner')
+    if (result.success) {
+      toast.success('已复制到剪贴板')
+    } else {
+      toast.error(result.message ?? '复制失败')
+    }
+  })
+
+  const editBtn = createBtn('编辑图片', '<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>', () => {
+    figure.dispatchEvent(new CustomEvent('scratch-pad-edit-image', {
+      bubbles: true,
+      detail: { src: img.src, getPos, nodeType: initialNode.type, mode: 'editing' },
+    }))
+  })
+
+  // 单击图片打开预览（仅 Scratch Pad 监听该事件）
+  if (isScratchPad) {
+    img.style.cursor = 'pointer'
+    img.addEventListener('click', (e) => {
+      e.stopPropagation()
+      figure.dispatchEvent(new CustomEvent('scratch-pad-edit-image', {
+        bubbles: true,
+        detail: { src: img.src, getPos, nodeType: initialNode.type, mode: 'preview' },
+      }))
+    })
+  }
+
+  const deleteBtn = createBtn('删除图片', '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>', () => {
+    if (typeof getPos === 'function') {
+      const pos = getPos()
+      if (pos == null) return
+      editor.chain().focus().deleteRange({ from: pos, to: pos + initialNode.nodeSize }).run()
+    }
+  })
+
+  if (isScratchPad) {
+    toolbar.appendChild(copyBtn)
+    toolbar.appendChild(editBtn)
+    toolbar.appendChild(deleteBtn)
+    figure.appendChild(toolbar)
+  }
 
   let cleanup = () => {}
 
@@ -480,8 +550,15 @@ function createMarkdownImageView(initialNode: ProseMirrorNode, fileAccessRef: Fi
     const src = String(node.attrs.src ?? '')
     const alt = String(node.attrs.alt ?? '')
     const title = String(node.attrs.title ?? '')
+    const width = parseImageWidth(node.attrs.width)
     img.alt = alt
     img.title = title
+    if (width) {
+      img.style.width = `${width}px`
+      img.style.maxWidth = '100%'
+    } else {
+      img.style.width = ''
+    }
     cleanup = resolveMediaSrc(src, fileAccessRef, (resolvedSrc) => { img.src = resolvedSrc })
 
     if (title) {
@@ -494,10 +571,53 @@ function createMarkdownImageView(initialNode: ProseMirrorNode, fileAccessRef: Fi
 
   render(initialNode)
 
+  // Use ResizableNodeView for resize capability (only in editable mode)
+  if (editor.isEditable) {
+    const resizable = new ResizableNodeView({
+      node: initialNode,
+      editor,
+      element: figure,
+      getPos: getPos as () => number | undefined,
+      onResize: (w: number, _h: number) => {
+        img.style.width = `${w}px`
+        img.style.maxWidth = '100%'
+      },
+      onCommit: (w: number, _h: number) => {
+        if (typeof getPos === 'function') {
+          editor.chain().focus()
+            .command(({ tr }: { tr: any }) => {
+              tr.setNodeMarkup(getPos(), undefined, { ...initialNode.attrs, width: w })
+              return true
+            })
+            .run()
+        }
+      },
+      onUpdate: (node: ProseMirrorNode) => {
+        if (node.type !== initialNode.type) return false
+        initialNode = node
+        render(node)
+        return true
+      },
+      options: {
+        directions: ['bottom-right'],
+        preserveAspectRatio: true,
+        min: { width: 50, height: 50 },
+        className: {
+          container: 'scratch-pad-image-resize-container',
+          wrapper: 'scratch-pad-image-resize-wrapper',
+          handle: 'scratch-pad-image-resize-handle',
+          resizing: 'scratch-pad-image-resizing',
+        },
+      },
+    })
+    return resizable
+  }
+
   return {
     dom: figure,
     update(nextNode: ProseMirrorNode) {
       if (nextNode.type !== initialNode.type) return false
+      initialNode = nextNode
       render(nextNode)
       return true
     },
@@ -583,7 +703,7 @@ function createMathView(initialNode: ProseMirrorNode, displayMode: boolean) {
   })
 }
 
-function createShikiCodeBlockView(initialNode: ProseMirrorNode, view: EditorView) {
+function createShikiCodeBlockView(initialNode: ProseMirrorNode) {
   const dom = document.createElement('div')
   setClass(dom, 'not-prose my-3 overflow-hidden rounded-md border border-border/40 bg-muted/30')
   dom.dataset.promaCodeBlock = 'true'
@@ -603,7 +723,7 @@ function createShikiCodeBlockView(initialNode: ProseMirrorNode, view: EditorView
   let copyTimeout: ReturnType<typeof setTimeout> | null = null
   let currentCode = initialNode.textContent
   copyBtn.addEventListener('click', () => {
-    navigator.clipboard.writeText(currentCode).then(() => {
+    copyTextToClipboard(currentCode).then(() => {
       copyBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>已复制</span>'
       if (copyTimeout) clearTimeout(copyTimeout)
       copyTimeout = setTimeout(() => {
@@ -642,7 +762,7 @@ function createShikiCodeBlockView(initialNode: ProseMirrorNode, view: EditorView
     mermaidRenderTimer = setTimeout(() => {
       mermaidRenderTimer = null
       if (destroyed) return
-      mermaidRoot.render(nextCode === null ? null : <MermaidBlock code={nextCode} />)
+      mermaidRoot.render(nextCode === null ? null : <MermaidBlock code={nextCode} onCopy={copyTextToClipboard} />)
     }, 0)
   }
 
@@ -651,7 +771,7 @@ function createShikiCodeBlockView(initialNode: ProseMirrorNode, view: EditorView
     currentCode = node.textContent
     label.textContent = language === 'text' ? 'Code' : getDisplayName(language)
     const className = language === 'text' ? undefined : `language-${language}`
-    const shouldRenderMermaid = !view.editable && shouldRenderMermaidCodeBlock(className, currentCode)
+    const shouldRenderMermaid = shouldRenderMermaidCodeBlock(className, currentCode)
     dom.classList.toggle('proma-code-block--mermaid', shouldRenderMermaid)
     scheduleMermaidRender(shouldRenderMermaid ? currentCode : null)
   }
@@ -690,6 +810,14 @@ export function createMarkdownImage(fileAccessRef: FileAccessRefOrNull): Node {
         src: { default: '' },
         alt: { default: '' },
         title: { default: '' },
+        width: {
+          default: null,
+          parseHTML: (el) => parseImageWidth(el.getAttribute('width')),
+          renderHTML: (attrs) => {
+            const width = parseImageWidth(attrs.width)
+            return width ? { width } : {}
+          },
+        },
       }
     },
 
@@ -702,6 +830,7 @@ export function createMarkdownImage(fileAccessRef: FileAccessRefOrNull): Node {
             src: node.getAttribute('src') || '',
             alt: node.getAttribute('alt') || '',
             title: node.getAttribute('title') || '',
+            width: parseImageWidth(node.getAttribute('width')),
           }
         },
       }]
@@ -720,7 +849,7 @@ export function createMarkdownImage(fileAccessRef: FileAccessRefOrNull): Node {
     },
 
     addNodeView() {
-      return ({ node }) => createMarkdownImageView(node, fileAccessRef)
+      return ({ node, editor, getPos }) => createMarkdownImageView(node, fileAccessRef, editor, getPos)
     },
   })
 }
@@ -1017,7 +1146,7 @@ export function createShikiCodeBlock(themeRef: ThemeRef): Node {
     },
 
     addNodeView() {
-      return ({ node, view }) => createShikiCodeBlockView(node, view)
+      return ({ node }) => createShikiCodeBlockView(node)
     },
 
     addProseMirrorPlugins() {

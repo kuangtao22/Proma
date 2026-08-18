@@ -12,7 +12,7 @@ import * as React from 'react'
 import { useAtom, useSetAtom } from 'jotai'
 import { Shield, ShieldAlert, Check, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { allPendingPermissionRequestsAtom, agentStreamingStatesAtom, finalizeStreamingActivities } from '@/atoms/agent-atoms'
+import { allPendingPermissionRequestsAtom, agentStreamingStatesAtom } from '@/atoms/agent-atoms'
 import type { DangerLevel } from '@proma/shared'
 
 /** 危险等级对应的图标颜色 */
@@ -72,7 +72,6 @@ export function PermissionBanner({ sessionId }: PermissionBannerProps): React.Re
       map.set(sessionId, {
         ...current,
         running: false,
-        ...finalizeStreamingActivities(current.toolActivities),
       })
       return map
     })
@@ -193,7 +192,7 @@ export function PermissionBanner({ sessionId }: PermissionBannerProps): React.Re
           拒绝
         </Button>
 
-        <Button
+        {request.allowAlways !== false && <Button
           variant="outline"
           size="sm"
           onClick={() => respond('allow', true)}
@@ -201,7 +200,7 @@ export function PermissionBanner({ sessionId }: PermissionBannerProps): React.Re
           className="h-7 px-3 text-xs"
         >
           本次会话总是允许
-        </Button>
+        </Button>}
 
         <Button
           variant="default"

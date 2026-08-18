@@ -18,6 +18,7 @@ import { toast } from 'sonner'
 import { Clock, Pause, Play, Power, Plus, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
 import {
   automationsAtom,
   automationFormAtom,
@@ -28,6 +29,12 @@ import type { Automation } from '@proma/shared'
 
 /** 把调度配置格式化为可读文案 */
 function formatSchedule(a: Automation): string {
+  if (a.scheduleType === 'once') {
+    const when = a.scheduledAt
+      ? new Date(a.scheduledAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : '指定时间'
+    return `仅一次 ${when}`
+  }
   if (a.scheduleType === 'daily') return `每天 ${a.timeOfDay ?? '09:00'}`
   if (a.scheduleType === 'weekly') {
     const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
@@ -40,13 +47,35 @@ function formatSchedule(a: Automation): string {
     return `每月 ${dom} 号 ${a.timeOfDay ?? '09:00'}${suffix}`
   }
   const min = a.intervalMinutes
-  if (min < 60) return `每 ${min} 分钟`
-  if (min < 1440) return `每 ${min / 60} 小时`
-  return `每 ${min / 1440} 天`
+  let label: string
+  if (min < 60) label = `每 ${min} 分钟`
+  else if (min < 1440) label = `每 ${min / 60} 小时`
+  else label = `每 ${min / 1440} 天`
+  const weekdayLabel = a.activeWeekdays && a.activeWeekdays.length > 0 ? ` · ${formatWeekdays(a.activeWeekdays)}` : ''
+  const windowLabel = a.activeWindowStart && a.activeWindowEnd ? ` · ${a.activeWindowStart}–${a.activeWindowEnd}` : ''
+  if (weekdayLabel || windowLabel) label += `${weekdayLabel}${windowLabel}`
+  // 叠加了运行次数上限时在末尾标注，让列表能看出"跑 N 次就停"
+  return a.maxRuns !== undefined ? `${label}·限 ${a.maxRuns} 次` : label
 }
 
+function formatWeekdays(days?: number[]): string {
+  const normalized = [...new Set(days ?? [])].sort((a, b) => a - b)
+  if (normalized.length === 0) return '每天'
+  if (normalized.join(',') === '1,2,3,4,5') return '工作日'
+  if (normalized.join(',') === '0,6') return '周末'
+  const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+  return normalized.map((day) => names[day] ?? '').join('、')
+}
+
+function formatNextRun(a: Automation): string {
+  if (!a.active) return a.completedAt ? '已完成' : '已暂停'
+  return `下次 ${new Date(a.nextRunAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}`
+}
+
+/** 定时任务列表嵌入统一的任务/日程页，页头由父级提供。 */
 export function AutomationsListView(): React.ReactElement {
   const automations = useAtomValue(automationsAtom)
+  const [pendingDeletion, setPendingDeletion] = React.useState<Automation | null>(null)
   const setAutomations = useSetAtom(automationsAtom)
   const setForm = useSetAtom(automationFormAtom)
 
@@ -56,7 +85,9 @@ export function AutomationsListView(): React.ReactElement {
   }, [setAutomations])
 
   const current = automations.filter((a) => a.active)
-  const paused = automations.filter((a) => !a.active)
+  // 已完成（once 跑完 / 跑满 maxRuns 自动停用，带 completedAt）单独成组，区别于用户手动暂停 / 草稿
+  const completed = automations.filter((a) => !a.active && a.completedAt)
+  const paused = automations.filter((a) => !a.active && !a.completedAt)
 
   const handleCreate = (): void => {
     // 自动命名「定时任务 N」：取现有最大 X + 1
@@ -73,40 +104,46 @@ export function AutomationsListView(): React.ReactElement {
   const handleEdit = (a: Automation): void => {
     setForm({ open: true, draft: automationToDraft(a) })
   }
+  const confirmDelete = async (): Promise<void> => {
+    const automation = pendingDeletion
+    if (!automation) return
+    try {
+      await window.electronAPI.deleteAutomation(automation.id)
+      await refreshList()
+      setPendingDeletion(null)
+      toast.success('已删除')
+    } catch (error) {
+      console.error('[定时任务] 删除失败:', error)
+      toast.error('删除失败')
+    }
+  }
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      {/* 标题栏 */}
-      {/* 空列表时隐藏右上角「新建」按钮，避免与空状态中心按钮重复 */}
-      <div className="titlebar-drag-region flex items-center justify-between max-w-5xl w-full mx-auto px-8 pt-8 pb-6 flex-shrink-0">
-        <h1 className="text-2xl font-semibold text-foreground">定时任务</h1>
-        {automations.length > 0 && (
-          <button
-            type="button"
-            onClick={handleCreate}
-            className="titlebar-no-drag flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors duration-100 shadow-sm"
-          >
-            <Plus size={14} />
-            <span>新建定时任务</span>
-          </button>
-        )}
-      </div>
-
       {/* 列表内容 */}
       <div className="flex-1 min-h-0 overflow-y-auto">
         {automations.length === 0 ? (
           <EmptyState onCreate={handleCreate} />
         ) : (
-          <div className="flex flex-col gap-8 max-w-5xl w-full mx-auto px-8 pb-8">
+          <div className="flex w-full flex-col gap-8 pb-8">
             {current.length > 0 && (
-              <Section title="启用中" automations={current} onEdit={handleEdit} onRefresh={refreshList} variant="active" />
+              <Section title="启用中" automations={current} onEdit={handleEdit} onRefresh={refreshList} onDelete={setPendingDeletion} />
             )}
             {paused.length > 0 && (
-              <Section title="已暂停" automations={paused} onEdit={handleEdit} onRefresh={refreshList} variant="paused" />
+              <Section title="已暂停" automations={paused} onEdit={handleEdit} onRefresh={refreshList} onDelete={setPendingDeletion} />
+            )}
+            {completed.length > 0 && (
+              <Section title="已完成" automations={completed} onEdit={handleEdit} onRefresh={refreshList} onDelete={setPendingDeletion} />
             )}
           </div>
         )}
       </div>
+      <AlertDialog open={pendingDeletion !== null} onOpenChange={(open) => { if (!open) setPendingDeletion(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader><AlertDialogTitle>确认删除定时任务</AlertDialogTitle><AlertDialogDescription>删除「{pendingDeletion?.name}」后无法恢复。</AlertDialogDescription></AlertDialogHeader>
+          <AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction onClick={() => void confirmDelete()} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">删除</AlertDialogAction></AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
@@ -116,17 +153,17 @@ interface SectionProps {
   automations: Automation[]
   onEdit: (a: Automation) => void
   onRefresh: () => Promise<void>
-  variant: 'active' | 'paused'
+  onDelete: (a: Automation) => void
 }
 
-function Section({ title, automations, onEdit, onRefresh, variant }: SectionProps): React.ReactElement {
+function Section({ title, automations, onEdit, onRefresh, onDelete }: SectionProps): React.ReactElement {
   /** 列表上的任务是否具备运行 / 启用所需的最小完整度 */
   const isRunnable = (a: Automation): boolean => !!a.channelId && !!a.workspaceId
 
   const handleRunNow = async (e: React.MouseEvent, a: Automation): Promise<void> => {
     e.stopPropagation()
     if (!isRunnable(a)) {
-      toast.error('请先为该任务配置模型与工作区')
+      toast.error('请先为该任务配置模型与项目')
       onEdit(a)
       return
     }
@@ -143,9 +180,9 @@ function Section({ title, automations, onEdit, onRefresh, variant }: SectionProp
 
   const handleToggle = async (e: React.MouseEvent, a: Automation): Promise<void> => {
     e.stopPropagation()
-    // 启用前必须配齐模型与工作区，否则打开编辑面板让用户补全
+    // 启用前必须配齐模型与项目，否则打开编辑面板让用户补全
     if (!a.active && !isRunnable(a)) {
-      toast.error('请先为该任务配置模型与工作区')
+      toast.error('请先为该任务配置模型与项目')
       onEdit(a)
       return
     }
@@ -159,23 +196,15 @@ function Section({ title, automations, onEdit, onRefresh, variant }: SectionProp
     }
   }
 
-  const handleDelete = async (e: React.MouseEvent, a: Automation): Promise<void> => {
-    e.stopPropagation()
-    if (!window.confirm(`确定要删除定时任务「${a.name}」吗？`)) return
-    try {
-      await window.electronAPI.deleteAutomation(a.id)
-      await onRefresh()
-      toast.success('已删除')
-    } catch (err) {
-      toast.error('删除失败')
-      console.error('[定时任务] 删除失败:', err)
-    }
+  const handleDelete = (event: React.MouseEvent, automation: Automation): void => {
+    event.stopPropagation()
+    onDelete(automation)
   }
 
   return (
     <div className="flex flex-col gap-2">
       <div className="text-[13px] font-medium text-foreground/55 px-1">{title}</div>
-      <div className="rounded-xl border border-border/50 overflow-hidden bg-content-area">
+      <div className="overflow-hidden rounded-none border border-border/60 bg-card">
         {automations.map((a, i) => (
           // 行容器：用 div + role=button，避免与内部 button（立即运行/删除/暂停）
           // 形成嵌套 button 的非法 HTML，同时通过 keyDown 维持键盘可达。
@@ -191,8 +220,8 @@ function Section({ title, automations, onEdit, onRefresh, variant }: SectionProp
               }
             }}
             className={cn(
-              'group w-full flex items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-foreground/[0.15] cursor-pointer focus:outline-none focus-visible:bg-foreground/[0.18]',
-              i > 0 && 'border-t border-border/40',
+              'group w-full flex items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/50 cursor-pointer focus:outline-none focus-visible:bg-muted/50',
+              i > 0 && 'border-t border-border/60',
             )}
           >
             <div className="flex-1 min-w-0">
@@ -202,15 +231,13 @@ function Section({ title, automations, onEdit, onRefresh, variant }: SectionProp
                   {a.prompt.slice(0, 60)}{a.prompt.length > 60 ? '…' : ''}
                 </span>
               </div>
+              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[12px] text-muted-foreground">
+                <span className="inline-flex items-center gap-1"><Clock className="size-3" />{formatSchedule(a)}</span>
+                <span className="tabular-nums">{formatNextRun(a)}</span>
+              </div>
             </div>
-            {/* 右侧槽位固定宽度，只切透明度，避免 hover 时列表行横向跳动。 */}
-            <div className="relative h-7 w-24 shrink-0">
-              <span className={cn(
-                'absolute right-0 top-1/2 -translate-y-1/2 text-[12px] tabular-nums whitespace-nowrap transition-opacity group-hover:opacity-0',
-                variant === 'active' ? 'text-foreground/55' : 'text-foreground/35',
-              )}>
-                {variant === 'paused' ? '已暂停' : formatSchedule(a)}
-              </span>
+            {/* 右侧槽位固定宽度，只在悬浮时显示行操作，避免改变列表布局。 */}
+            <div className="relative h-7 w-16 shrink-0">
               <div className="pointer-events-none absolute right-0 top-1/2 flex -translate-y-1/2 items-center gap-1 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -230,7 +257,7 @@ function Section({ title, automations, onEdit, onRefresh, variant }: SectionProp
                     <button
                       type="button"
                       aria-label={`删除 ${a.name}`}
-                      onClick={(e) => { void handleDelete(e, a) }}
+                      onClick={(e) => handleDelete(e, a)}
                       className="p-1.5 rounded-md text-foreground/50 hover:text-destructive hover:bg-destructive/10 transition-colors"
                     >
                       <Trash2 className="size-3.5" />

@@ -14,7 +14,7 @@
  */
 
 import * as React from 'react'
-import { useAtomValue, useSetAtom } from 'jotai'
+import { useAtomValue, useSetAtom, useStore } from 'jotai'
 import { AlertCircle, X } from 'lucide-react'
 import { ChatHeader } from './ChatHeader'
 import { ChatMessages } from './ChatMessages'
@@ -33,6 +33,7 @@ import {
   INITIAL_MESSAGE_LIMIT,
 } from '@/atoms/chat-atoms'
 import type { PendingAttachment, ChatPendingMessage } from '@/atoms/chat-atoms'
+import { quotedSelectionMapAtom } from '@/atoms/preview-atoms'
 import { promptConfigAtom, promptSidebarOpenAtom, conversationPromptIdAtom, resolveSystemMessage, selectedPromptIdAtom } from '@/atoms/system-prompt-atoms'
 import { activeToolIdsAtom } from '@/atoms/chat-tool-atoms'
 import { userProfileAtom } from '@/atoms/user-profile'
@@ -46,6 +47,7 @@ import {
 import { registerPendingTitle } from '@/hooks/useGlobalChatListeners'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { cn } from '@/lib/utils'
+import { buildQuotedSelectionBlock } from '@/lib/quoted-selection'
 import type {
   ChatMessage,
   ChatSendInput,
@@ -55,6 +57,15 @@ import type {
 
 interface ChatViewProps {
   conversationId: string
+}
+
+function cleanupPendingAttachments(attachments: PendingAttachment[]): void {
+  for (const att of attachments) {
+    if (att.previewUrl?.startsWith('blob:')) {
+      URL.revokeObjectURL(att.previewUrl)
+    }
+    window.__pendingAttachmentData?.delete(att.id)
+  }
 }
 
 export function ChatView({ conversationId }: ChatViewProps): React.ReactElement {
@@ -70,9 +81,11 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
   const [messages, setMessages] = React.useState<ChatMessage[]>([])
   const [contextDividers, setContextDividers] = React.useState<string[]>([])
   const [pendingAttachments, setPendingAttachments] = React.useState<PendingAttachment[]>([])
+  const pendingAttachmentsRef = React.useRef<PendingAttachment[]>([])
   const [hasMoreMessages, setHasMoreMessages] = React.useState(false)
   const [messagesLoaded, setMessagesLoaded] = React.useState(false)
   const [inlineEditingMessageId, setInlineEditingMessageId] = React.useState<string | null>(null)
+  const store = useStore()
 
   // ===== Per-conversation hooks（分屏独立） =====
   const [selectedModel, setSelectedModel] = useConversationModel()
@@ -101,6 +114,17 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
   const globalChatPending = useAtomValue(chatPendingMessageAtom)
   const setGlobalChatPending = useSetAtom(chatPendingMessageAtom)
 
+  React.useEffect(() => {
+    pendingAttachmentsRef.current = pendingAttachments
+  }, [pendingAttachments])
+
+  React.useEffect(() => {
+    return () => {
+      cleanupPendingAttachments(pendingAttachmentsRef.current)
+      pendingAttachmentsRef.current = []
+    }
+  }, [])
+
   // 检测到当前对话的待发送消息时，捕获到本地状态
   React.useEffect(() => {
     if (!globalChatPending) return
@@ -127,19 +151,10 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
 
     // 清空附件列表和缓存
     setPendingAttachments((prev) => {
-      // 释放 blob URLs
-      prev.forEach((att) => {
-        if (att.previewUrl?.startsWith('blob:')) {
-          URL.revokeObjectURL(att.previewUrl)
-        }
-      })
+      cleanupPendingAttachments(prev)
+      pendingAttachmentsRef.current = []
       return []
     })
-
-    // 清空附件数据缓存（如果存在）
-    if (window.__pendingAttachmentData) {
-      window.__pendingAttachmentData.clear()
-    }
   }, [conversationId, setPendingRecommendation])
 
   // ===== 加载消息 + 上下文分隔线 =====
@@ -273,13 +288,25 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
       }
 
       // 清理 pending 附件和临时缓存
-      for (const att of currentAttachments) {
-        if (att.previewUrl?.startsWith('blob:')) {
-          URL.revokeObjectURL(att.previewUrl)
-        }
-        window.__pendingAttachmentData?.delete(att.id)
-      }
+      cleanupPendingAttachments(currentAttachments)
+      pendingAttachmentsRef.current = []
       setPendingAttachments([])
+    }
+
+    const quotedSelection = store.get(quotedSelectionMapAtom).get(conversationId)
+    const finalContent = quotedSelection
+      ? buildQuotedSelectionBlock(quotedSelection) + content
+      : content
+
+    if (quotedSelection) {
+      const capturedAt = quotedSelection.capturedAt
+      store.set(quotedSelectionMapAtom, (prev) => {
+        const current = prev.get(conversationId)
+        if (!current || current.capturedAt !== capturedAt) return prev
+        const next = new Map(prev)
+        next.delete(conversationId)
+        return next
+      })
     }
 
     // 初始化当前对话的流式状态
@@ -311,7 +338,7 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
 
     const input: ChatSendInput = {
       conversationId,
-      userMessage: content,
+      userMessage: finalContent,
       messageHistory: [], // 后端已改为从磁盘读取完整历史，无需前端传入
       channelId: selectedModel.channelId,
       modelId: selectedModel.modelId,
@@ -329,7 +356,7 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
       {
         id: `temp-${Date.now()}`,
         role: 'user',
-        content,
+        content: finalContent,
         createdAt: Date.now(),
         attachments: savedAttachments.length > 0 ? savedAttachments : undefined,
       },
@@ -341,6 +368,12 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
         if (!prev.has(conversationId)) return prev
         const map = new Map(prev)
         map.delete(conversationId)
+        return map
+      })
+      // 显示错误横幅，确保用户看到发送失败的反馈
+      setChatStreamErrors((prev) => {
+        const map = new Map(prev)
+        map.set(conversationId, '发送失败，请重试')
         return map
       })
     })
@@ -359,6 +392,7 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
     setChatStreamErrors,
     setStreamingStates,
     setConversations,
+    store,
   ])
 
   // ===== 自动发送快速任务消息 =====
@@ -569,6 +603,28 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
     setHasMoreMessages(false)
   }, [conversationId])
 
+  /** 消息历史中的图片编辑完成 → 作为新附件加入输入框 */
+  const handleImageEditComplete = React.useCallback((editedDataUrl: string): void => {
+    const base64 = editedDataUrl.split(',')[1]
+    if (!base64) return
+
+    const id = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const pending: PendingAttachment = {
+      id,
+      filename: `edited_image_${Date.now()}.png`,
+      mediaType: 'image/png',
+      localPath: '',
+      size: Math.round(base64.length * 0.75),
+      previewUrl: editedDataUrl,
+    }
+
+    if (!window.__pendingAttachmentData) {
+      window.__pendingAttachmentData = new Map()
+    }
+    window.__pendingAttachmentData.set(id, base64)
+    setPendingAttachments((prev) => [...prev, pending])
+  }, [setPendingAttachments])
+
   return (
     <div className="flex h-full overflow-hidden">
       {/* 主内容区域 */}
@@ -597,6 +653,7 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
             inlineEditingMessageId={inlineEditingMessageId}
             onDeleteDivider={handleDeleteDivider}
             onLoadMore={handleLoadMore}
+            onImageEditComplete={handleImageEditComplete}
           />
 
           {/* 错误提示 */}

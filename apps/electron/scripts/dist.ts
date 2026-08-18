@@ -167,45 +167,19 @@ function main(): void {
   console.log(`  ${color.bold}详细日志${color.reset}: ${opts.verbose ? '开启' : '关闭'}`)
   printSeparator()
 
-  const totalSteps = 5
+  const totalSteps = 2
   let step = 0
 
-  // ── 步骤 1: 构建主进程 ──
+  // ── 步骤 1: 统一准备所有应用、资源与 external 依赖 ──
   step++
-  printStepStart(step, totalSteps, '构建主进程 (esbuild)')
+  printStepStart(step, totalSteps, '准备完整打包资源')
   results.push(
-    runStep('构建主进程', 'bun', ['run', 'build:main'], { verbose: opts.verbose })
+    runStep('准备完整打包资源', 'bun', ['run', 'package:prepare'], { verbose: opts.verbose })
   )
   printStepResult(results[results.length - 1])
   if (!results[results.length - 1].success) return printSummary(results)
 
-  // ── 步骤 2: 构建 Preload ──
-  step++
-  printStepStart(step, totalSteps, '构建 Preload (esbuild)')
-  results.push(
-    runStep('构建 Preload', 'bun', ['run', 'build:preload'], { verbose: opts.verbose })
-  )
-  printStepResult(results[results.length - 1])
-  if (!results[results.length - 1].success) return printSummary(results)
-
-  // ── 步骤 3: 构建渲染进程 ──
-  step++
-  printStepStart(step, totalSteps, '构建渲染进程 (Vite)')
-  results.push(
-    runStep('构建渲染进程', 'bun', ['run', 'build:renderer'], { verbose: opts.verbose })
-  )
-  printStepResult(results[results.length - 1])
-  if (!results[results.length - 1].success) return printSummary(results)
-
-  // ── 步骤 4: 复制资源文件 ──
-  step++
-  printStepStart(step, totalSteps, '复制资源文件')
-  results.push(
-    runStep('复制资源文件', 'bun', ['run', 'build:resources'], { verbose: opts.verbose })
-  )
-  printStepResult(results[results.length - 1])
-
-  // ── 步骤 5: electron-builder 打包 ──
+  // ── 步骤 2: electron-builder 打包 ──
   step++
   printStepStart(step, totalSteps, 'Electron Builder 打包')
 

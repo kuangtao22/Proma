@@ -18,13 +18,16 @@ import type {
 } from '@proma/shared'
 import { WECHAT_IPC_CHANNELS, WECHAT_ITEM_TYPE, WECHAT_MESSAGE_TYPE, WECHAT_MESSAGE_STATE } from '@proma/shared'
 import { getDecryptedCredentials, saveWeChatCredentials, clearWeChatCredentials, getWeChatConfig, updateWeChatDefaultWorkspace } from './wechat-config'
-import { getWeChatSyncPath } from './config-paths'
+import { getWeChatBindingsPath, getWeChatSyncPath } from './config-paths'
 import { BridgeCommandHandler, type BridgeAttachment } from './bridge-command-handler'
+import { createJsonBridgeChatBindingStore } from './bridge-binding-store'
 import { inferImageMediaType, saveImageToSession, saveFileToSession, inferExtension, MAX_IMAGE_SIZE } from './bridge-attachment-utils'
 import { getAgentWorkspace } from './agent-workspace-manager'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import * as crypto from 'node:crypto'
 import QRCode from 'qrcode'
+
+import { redactSensitiveLogText, redactSensitiveLogValue } from './bridge-log-redaction'
 
 // ===== iLink API 常量 =====
 
@@ -408,12 +411,18 @@ class WeChatBridge {
       },
     },
     getDefaultWorkspaceId: () => getWeChatConfig().defaultWorkspaceId,
+    bindingStore: createJsonBridgeChatBindingStore(getWeChatBindingsPath(), '微信 Bridge'),
     onWorkspaceSwitched: (workspaceId) => updateWeChatDefaultWorkspace(workspaceId),
   })
 
   /** 获取当前状态 */
   getStatus(): WeChatBridgeState {
     return { ...this.state }
+  }
+
+  /** 在删除项目时清理指向其会话的聊天绑定。 */
+  removeBindingsForDeletedWorkspace(workspaceId: string, sessionIds: Iterable<string>): number {
+    return this.commandHandler.removeBindingsForDeletedWorkspace(workspaceId, sessionIds)
   }
 
   /** 开始扫码登录流程 */
@@ -451,7 +460,7 @@ class WeChatBridge {
       await this.startPolling(creds)
     } catch (error) {
       if (this.loginAbortController?.signal.aborted) return
-      const msg = error instanceof Error ? error.message : String(error)
+      const msg = redactSensitiveLogText(error instanceof Error ? error.message : String(error))
       this.updateStatus({ status: 'error', errorMessage: msg, qrCodeData: undefined })
       console.error('[微信 Bridge] 登录失败:', msg)
       throw error
@@ -584,7 +593,7 @@ class WeChatBridge {
     // 后台运行长轮询循环
     this.pollLoop().catch((error) => {
       if (!this.pollAbortController?.signal.aborted) {
-        const msg = error instanceof Error ? error.message : String(error)
+        const msg = redactSensitiveLogText(error instanceof Error ? error.message : String(error))
         this.updateStatus({ status: 'error', errorMessage: msg })
         console.error('[微信 Bridge] 长轮询异常退出:', msg)
       }
@@ -617,7 +626,7 @@ class WeChatBridge {
 
         // 其他服务端错误
         if (resp.ret !== 0 && resp.errcode) {
-          console.warn('[微信 Bridge] 服务端错误:', resp.ret, resp.errcode, resp.errmsg)
+          console.warn('[微信 Bridge] 服务端错误:', resp.ret, resp.errcode, redactSensitiveLogText(resp.errmsg ?? ''))
           continue
         }
 
@@ -638,7 +647,7 @@ class WeChatBridge {
               }),
             ])
           } catch (error) {
-            console.error('[微信 Bridge] 处理消息失败:', error)
+            console.error('[微信 Bridge] 处理消息失败:', redactSensitiveLogValue(error))
           } finally {
             if (timeoutId) clearTimeout(timeoutId)
           }
@@ -648,7 +657,7 @@ class WeChatBridge {
 
         failures++
         const backoff = Math.min(INITIAL_BACKOFF_MS * Math.pow(2, failures - 1), MAX_BACKOFF_MS)
-        console.warn(`[微信 Bridge] 轮询失败 (${failures}/${MAX_CONSECUTIVE_FAILURES}, backoff=${backoff}ms):`, error)
+        console.warn(`[微信 Bridge] 轮询失败 (${failures}/${MAX_CONSECUTIVE_FAILURES}, backoff=${backoff}ms):`, redactSensitiveLogValue(error))
 
         if (failures >= MAX_CONSECUTIVE_FAILURES) {
           console.warn('[微信 Bridge] 连续失败过多，可能需要重新登录')
@@ -701,13 +710,13 @@ class WeChatBridge {
     // 纯粹的空消息
     if (!text.trim() && imageItems.length === 0 && fileItems.length === 0) return
 
-    console.log('[微信 Bridge] 收到消息:', {
+    console.log('[微信 Bridge] 收到消息:', redactSensitiveLogValue({
       from: chatId,
       messageId: msg.message_id,
       text: text.length > 100 ? text.slice(0, 100) + '...' : text,
       imageCount: imageItems.length,
       fileCount: fileItems.length,
-    })
+    }))
 
     // 下载图片
     const imageDownloads: WeChatImageAttachment[] = []
@@ -723,7 +732,7 @@ class WeChatBridge {
         }
         imageDownloads.push({ id: `${msgId}-img-${idx}`, data: buf, mediaType })
       } catch (error) {
-        console.error('[微信 Bridge] 图片下载失败:', error)
+        console.error('[微信 Bridge] 图片下载失败:', redactSensitiveLogValue(error))
         await this.client.sendText(chatId, '⚠️ 一张图片下载失败，已跳过', contextToken)
       }
     }
@@ -749,7 +758,7 @@ class WeChatBridge {
         }
         fileDownloads.push({ id: `${msgId}-file-${idx}`, data: buf, fileName })
       } catch (error) {
-        console.error(`[微信 Bridge] 文件下载失败 (${fileName}):`, error)
+        console.error(`[微信 Bridge] 文件下载失败 (${fileName}):`, redactSensitiveLogValue(error))
         await this.client.sendText(chatId, `⚠️ 文件「${fileName}」下载失败，已跳过`, contextToken)
       }
     }
@@ -841,7 +850,7 @@ class WeChatBridge {
     }
     const workspace = binding.workspaceId ? getAgentWorkspace(binding.workspaceId) : undefined
     if (!workspace) {
-      await this.client.sendText(chatId, '⚠️ 当前未设置工作区，无法保存附件', contextToken)
+      await this.client.sendText(chatId, '⚠️ 当前未设置项目，无法保存附件', contextToken)
       return
     }
 
@@ -896,7 +905,7 @@ class WeChatBridge {
     try {
       writeFileSync(syncPath, JSON.stringify({ get_updates_buf: this.getUpdatesBuf }), 'utf-8')
     } catch (error) {
-      console.warn('[微信 Bridge] 保存同步游标失败:', error)
+      console.warn('[微信 Bridge] 保存同步游标失败:', redactSensitiveLogValue(error))
     }
   }
 

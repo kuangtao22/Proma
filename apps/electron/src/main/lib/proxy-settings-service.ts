@@ -19,6 +19,48 @@ const DEFAULT_PROXY_CONFIG: ProxyConfig = {
   manualUrl: '',
 }
 
+const SYSTEM_PROXY_CACHE_TTL_MS = 30_000
+let systemProxyCache: { expiresAt: number; result: Awaited<ReturnType<typeof detectSystemProxy>> } | undefined
+let pendingSystemProxyDetection: Promise<Awaited<ReturnType<typeof detectSystemProxy>>> | undefined
+
+/**
+ * 系统代理检测可能需要调用 OS 命令。合并并短暂缓存检测，避免网络请求热路径重复触发它。
+ */
+async function getCachedSystemProxy(): Promise<Awaited<ReturnType<typeof detectSystemProxy>>> {
+  const now = Date.now()
+  if (systemProxyCache && systemProxyCache.expiresAt > now) return systemProxyCache.result
+
+  if (!pendingSystemProxyDetection) {
+    pendingSystemProxyDetection = detectSystemProxy()
+      .then((result) => {
+        systemProxyCache = { result, expiresAt: Date.now() + SYSTEM_PROXY_CACHE_TTL_MS }
+        return result
+      })
+      .finally(() => {
+        pendingSystemProxyDetection = undefined
+      })
+  }
+
+  return await pendingSystemProxyDetection
+}
+
+/** 代理 URL 可能携带认证信息；日志中绝不能输出其用户名或密码。 */
+export function redactProxyUrl(proxyUrl: string): string {
+  try {
+    const url = new URL(proxyUrl)
+    if (!['http:', 'https:', 'socks:', 'socks4:', 'socks5:'].includes(url.protocol)) {
+      return '[invalid proxy URL]'
+    }
+    if (url.username || url.password) {
+      url.username = '***'
+      url.password = '***'
+    }
+    return url.toString()
+  } catch {
+    return '[invalid proxy URL]'
+  }
+}
+
 /**
  * 读取代理配置
  *
@@ -51,7 +93,11 @@ export async function saveProxySettings(config: ProxyConfig): Promise<void> {
 
   try {
     writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8')
-    console.log('[代理配置] 配置已保存:', config)
+    systemProxyCache = undefined
+    console.log('[代理配置] 配置已保存:', {
+      ...config,
+      manualUrl: config.manualUrl ? redactProxyUrl(config.manualUrl) : '',
+    })
   } catch (error) {
     console.error('[代理配置] 保存配置失败:', error)
     throw new Error('保存代理配置失败')
@@ -76,9 +122,9 @@ export async function getEffectiveProxyUrl(): Promise<string | undefined> {
   }
 
   if (config.mode === 'system') {
-    const result = await detectSystemProxy()
+    const result = await getCachedSystemProxy()
     if (result.success && result.proxyUrl) {
-      console.log('[代理配置] 使用系统代理:', result.proxyUrl)
+      console.log('[代理配置] 使用系统代理:', redactProxyUrl(result.proxyUrl))
       return result.proxyUrl
     }
     console.log('[代理配置] 系统代理检测失败:', result.message)
@@ -87,7 +133,7 @@ export async function getEffectiveProxyUrl(): Promise<string | undefined> {
 
   // 手动模式
   if (config.manualUrl.trim()) {
-    console.log('[代理配置] 使用手动配置代理:', config.manualUrl)
+    console.log('[代理配置] 使用手动配置代理:', redactProxyUrl(config.manualUrl))
     return config.manualUrl.trim()
   }
 

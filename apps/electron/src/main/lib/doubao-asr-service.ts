@@ -357,15 +357,25 @@ export async function startDoubaoAsrSession(
 
     const active: ActiveSession = { sessionId, ws, win, closed: false }
     activeSessions.set(sessionId, active)
+    let connected = false
+    let settled = false
+    const fail = (error: Error): void => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
 
     const timer = setTimeout(() => {
       ws.terminate()
       activeSessions.delete(sessionId)
-      reject(new Error('连接豆包 ASR 超时'))
+      fail(new Error('连接豆包 ASR 超时'))
     }, 10000)
 
     ws.once('open', () => {
+      if (settled) return
       clearTimeout(timer)
+      connected = true
+      settled = true
       ws.send(buildClientRequest(settings))
       sendState(win, { sessionId, status: 'recording', message: '正在听写' })
       resolve()
@@ -397,16 +407,18 @@ export async function startDoubaoAsrSession(
     })
 
     ws.on('close', () => {
+      clearTimeout(timer)
       active.closed = true
       activeSessions.delete(sessionId)
       sendState(win, { sessionId, status: 'idle', message: 'asr_session_ended' })
+      if (!connected) fail(new Error('连接豆包 ASR 在建立前已关闭'))
     })
 
     ws.once('error', (error: Error) => {
       clearTimeout(timer)
       activeSessions.delete(sessionId)
       sendState(win, { sessionId, status: 'error', message: error.message })
-      reject(error)
+      fail(error)
     })
   })
 }

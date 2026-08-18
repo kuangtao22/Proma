@@ -25,7 +25,7 @@ export type ConversationProps = ComponentProps<typeof StickToBottom>
 export function Conversation({ className, ...props }: ConversationProps): React.ReactElement {
   return (
     <StickToBottom
-      className={cn('relative flex-1 overflow-y-hidden scrollbar-none', className)}
+      className={cn('relative min-h-0 flex-1 overflow-y-hidden scrollbar-none', className)}
       initial="instant"
       resize="smooth"
       role="log"
@@ -106,12 +106,12 @@ export function ConversationScrollButton({
     <Button
       className={cn(
         'absolute bottom-[26px] left-1/2 -translate-x-1/2 rounded-[17px] size-9',
-        'border-[0.5px] border-border',
+        'bg-card shadow-sm hover:bg-accent/80',
         className
       )}
       onClick={handleScrollToBottom}
       type="button"
-      variant="outline"
+      variant="ghost"
       {...props}
     >
       <ArrowDownIcon className="size-4" />

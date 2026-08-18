@@ -1,34 +1,45 @@
 /**
  * SettingsPanel - 设置面板
  *
- * 顶部 Header（标题 + 关闭按钮）+ 下方（左侧导航 + 右侧 ScrollArea 内容区域）。
- * 使用 Jotai atom 管理当前标签页状态。
+ * 在应用主工作区中展示左侧导航和右侧 ScrollArea 内容区域。
+ * 使用 Jotai atom 管理当前标签页状态，保持已有设置项与分组顺序。
  */
 
 import * as React from "react";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { cn } from "@/lib/utils";
+import { detectIsWindows, WINDOW_CONTROLS_INSET_RIGHT } from "@/lib/platform";
 import {
   Settings,
   Radio,
+  Eye,
   Palette,
   Info,
-  Plug,
   Globe,
   BookOpen,
   Wrench,
   Bot,
   GraduationCap,
-  X,
+  ArrowLeft,
   Keyboard,
   Mic,
   HardDriveDownload,
   HardDrive,
 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { settingsTabAtom, channelFormDirtyAtom, settingsCloseRequestedAtom, settingsOpenAtom } from "@/atoms/settings-tab";
+import { ShortcutKeycaps } from "@/components/shortcuts/ShortcutKeycaps";
+import {
+  settingsTabAtom,
+  channelFormDirtyAtom,
+  settingsCloseRequestedAtom,
+  settingsOpenAtom,
+  settingsPendingSessionNavigationAtom,
+  type SettingsSessionNavigation,
+} from "@/atoms/settings-tab";
 import type { SettingsTab } from "@/atoms/settings-tab";
 import { appModeAtom } from "@/atoms/app-mode";
+import { activeViewAtom } from "@/atoms/active-view";
+import { automationFormAtom } from "@/atoms/automation-atoms";
 import { hasUpdateAtom } from "@/atoms/updater";
 import { tabsAtom, activeTabIdAtom, openTab, TUTORIAL_TAB_ID } from "@/atoms/tab-atoms";
 import { hasEnvironmentIssuesAtom } from "@/atoms/environment";
@@ -43,11 +54,11 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { ChannelSettings } from "./ChannelSettings";
+import { VisionRelaySettings } from "./VisionRelaySettings";
 import { GeneralSettings } from "./GeneralSettings";
 import { ProxySettings } from "./ProxySettings";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { AboutSettings } from "./AboutSettings";
-import { AgentSettings } from "./AgentSettings";
 import { PromptSettings } from "./PromptSettings";
 import { ToolSettings } from "./ToolSettings";
 import { BotHubSettings } from "./BotHubSettings";
@@ -55,6 +66,8 @@ import { ShortcutSettings } from "./ShortcutSettings";
 import { VoiceInputSettings } from "./VoiceInputSettings";
 import { MigrationSettings } from "./MigrationSettings";
 import { StorageSettings } from "./StorageSettings";
+import { OnboardingSettings } from "./OnboardingSettings";
+import { useOpenSession } from '@/hooks/useOpenSession'
 
 /** 设置 Tab 定义 */
 interface TabItem {
@@ -67,16 +80,11 @@ interface TabItem {
 const BASE_TABS: TabItem[] = [
   { id: "general", label: "通用设置", icon: <Settings size={16} /> },
   { id: "channels", label: "模型配置", icon: <Radio size={16} /> },
+  { id: "vision-relay", label: "视觉助手", icon: <Eye size={16} /> },
   { id: "prompts", label: "提示词管理", icon: <BookOpen size={16} /> },
   { id: "proxy", label: "代理设置", icon: <Globe size={16} /> },
 ];
 
-/** Agent 模式专属 Tab */
-const AGENT_TAB: TabItem = {
-  id: "agent",
-  label: "Agent 配置",
-  icon: <Plug size={16} />,
-};
 const TOOLS_TAB: TabItem = {
   id: "tools",
   label: "Chat 工具",
@@ -97,17 +105,22 @@ const SHORTCUTS_TAB: TabItem = {
   label: "快捷键管理",
   icon: <Keyboard size={16} />,
 };
+const ONBOARDING_TAB: TabItem = {
+  id: "onboarding",
+  label: "Proma 新手引导",
+  icon: <GraduationCap size={16} />,
+};
 const VOICE_INPUT_TAB: TabItem = {
   id: "voice-input",
   label: "语音输入",
   icon: <Mic size={16} />,
 };
-
 /** 尾部 Tabs */
 const TAIL_TABS: TabItem[] = [
   { id: "migration", label: "数据迁移", icon: <HardDriveDownload size={16} /> },
   { id: "storage", label: "磁盘管理", icon: <HardDrive size={16} /> },
   { id: "appearance", label: "外观设置", icon: <Palette size={16} /> },
+  ONBOARDING_TAB,
   { id: "about", label: "关于/更新", icon: <Info size={16} /> },
 ];
 
@@ -118,12 +131,12 @@ function renderTabContent(tab: SettingsTab): React.ReactElement {
       return <GeneralSettings />;
     case "channels":
       return <ChannelSettings />;
+    case "vision-relay":
+      return <VisionRelaySettings />;
     case "prompts":
       return <PromptSettings />;
     case "proxy":
       return <ProxySettings />;
-    case "agent":
-      return <AgentSettings />;
     case "tools":
       return <ToolSettings />;
     case "appearance":
@@ -140,6 +153,8 @@ function renderTabContent(tab: SettingsTab): React.ReactElement {
       return <MigrationSettings />;
     case "storage":
       return <StorageSettings />;
+    case "onboarding":
+      return <OnboardingSettings />;
     default:
       // tutorial 等特殊 tab 由 handleTabChange 拦截打开主区 Tab，不会在此渲染
       return <GeneralSettings />;
@@ -156,15 +171,24 @@ export function SettingsPanel({
   const [activeTab, setActiveTab] = useAtom(settingsTabAtom);
   const channelFormDirty = useAtomValue(channelFormDirtyAtom);
   const [closeRequested, setCloseRequested] = useAtom(settingsCloseRequestedAtom);
+  const [pendingSessionNavigation, setPendingSessionNavigation] = useAtom(settingsPendingSessionNavigationAtom);
   const setSettingsOpen = useSetAtom(settingsOpenAtom);
+  const setActiveView = useSetAtom(activeViewAtom);
+  const setAutomationForm = useSetAtom(automationFormAtom);
   const appMode = useAtomValue(appModeAtom);
   const hasUpdate = useAtomValue(hasUpdateAtom);
   const hasEnvironmentIssues = useAtomValue(hasEnvironmentIssuesAtom);
   const [mainTabs, setMainTabs] = useAtom(tabsAtom);
   const setMainActiveTabId = useSetAtom(activeTabIdAtom);
+  const openSession = useOpenSession()
+  const isWindows = React.useMemo(() => detectIsWindows(), [])
 
   /** 统一的退出拦截对话框状态 */
-  type PendingAction = { type: 'tab'; tabId: SettingsTab } | { type: 'close' } | null
+  type PendingAction =
+    | { type: 'tab'; tabId: SettingsTab }
+    | { type: 'close' }
+    | { type: 'session'; navigation: SettingsSessionNavigation }
+    | null
   const [pendingAction, setPendingAction] = React.useState<PendingAction>(null)
   const showNavDialog = pendingAction !== null
 
@@ -173,6 +197,13 @@ export function SettingsPanel({
     if (!pendingAction) return
     if (pendingAction.type === 'tab') {
       setActiveTab(pendingAction.tabId)
+    } else if (pendingAction.type === 'session') {
+      openSession(
+        pendingAction.navigation.type,
+        pendingAction.navigation.sessionId,
+        pendingAction.navigation.title,
+        { bypassSettingsGuard: true },
+      )
     } else {
       onClose?.()
     }
@@ -190,6 +221,9 @@ export function SettingsPanel({
       const result = openTab(mainTabs, { type: 'tutorial', sessionId: TUTORIAL_TAB_ID, title: 'Proma 使用教程' })
       setMainTabs(result.tabs)
       setMainActiveTabId(result.activeTabId)
+      // Skills/Automations 会全屏覆盖 TabContent；打开教程时先清理表单并回到会话视图。
+      setAutomationForm({ open: false, draft: null })
+      setActiveView('conversations')
       setSettingsOpen(false)
       return
     }
@@ -202,13 +236,33 @@ export function SettingsPanel({
   }
 
   /** 关闭设置面板时检测是否有未保存内容 */
-  const handleClose = (): void => {
+  const handleClose = React.useCallback((): void => {
     if (activeTab === 'channels' && channelFormDirty) {
       setPendingAction({ type: 'close' })
       return
     }
     onClose?.()
-  }
+  }, [activeTab, channelFormDirty, onClose])
+
+  /** 按 ESC 退出设置面板：window 级监听确保焦点在设置面板内任何位置（含 body）都生效；
+   *  Radix 弹层（Select 下拉/AlertDialog/Popover 等）处理 ESC 时会 preventDefault，
+   *  此时交给弹层自行关闭，不退出设置。 */
+  React.useEffect(() => {
+    const handleWindowKeyDown = (e: KeyboardEvent): void => {
+      if (e.key !== 'Escape') return
+      if (e.defaultPrevented) return
+      handleClose()
+    }
+    window.addEventListener('keydown', handleWindowKeyDown)
+    return () => window.removeEventListener('keydown', handleWindowKeyDown)
+  }, [handleClose])
+
+  // 左侧会话点击在渠道表单有未保存内容时，由 useOpenSession 暂存目标并交给此处确认。
+  React.useEffect(() => {
+    if (!pendingSessionNavigation) return
+    setPendingAction({ type: 'session', navigation: pendingSessionNavigation })
+    setPendingSessionNavigation(null)
+  }, [pendingSessionNavigation, setPendingSessionNavigation])
 
   // Cmd+W 等外部关闭请求：弹出确认对话框
   React.useEffect(() => {
@@ -218,12 +272,11 @@ export function SettingsPanel({
     }
   }, [closeRequested, activeTab, setCloseRequested])
 
-  // Agent 模式时在渠道后插入 Agent Tab，工具 tab 两种模式都显示
+  // 工具 tab 两种模式都显示，Agent Skills / MCP 独立在侧边栏能力中心管理。
   const tabs = React.useMemo(() => {
     if (appMode === "agent") {
       return [
         ...BASE_TABS,
-        AGENT_TAB,
         TOOLS_TAB,
         VOICE_INPUT_TAB,
         BOTS_TAB,
@@ -243,37 +296,32 @@ export function SettingsPanel({
     ];
   }, [appMode]);
 
-  // 当前 tab 标题
-  const activeTabLabel = tabs.find((t) => t.id === activeTab)?.label ?? "设置";
-
   return (
-    <div className="flex flex-col h-full">
-      {/* 顶部 Header 栏 */}
-      <div className="h-12 flex items-center justify-between px-5 border-b border-border/50 flex-shrink-0">
-        <h2 className="text-sm font-medium text-foreground">
-          {activeTabLabel}
-        </h2>
-        {onClose && (
-          <button
-            onClick={handleClose}
-            className="rounded-md p-1.5 text-muted-foreground/60 hover:text-foreground hover:bg-muted transition-colors"
-          >
-            <X size={16} />
-          </button>
-        )}
+    <div className="flex h-full min-h-0 flex-col bg-content-area text-foreground">
+      {/* 顶部可拖动标题栏区域。背景层保持全宽；drag 层在 Windows 上必须避开右上角的
+          WindowControls 按钮区域（WINDOW_CONTROLS_INSET_RIGHT），否则 OS hitmask 会把
+          按钮点击误判为标题栏点击，导致最小化/最大化/关闭按钮无响应（与 AppShell/TabBar 一致）。 */}
+      <div className="relative h-[35px] flex-shrink-0 bg-[hsl(var(--sidebar-surface))]">
+        <div
+          aria-hidden="true"
+          className={cn(
+            'titlebar-drag-region pointer-events-none absolute left-0 top-0 h-full',
+            isWindows ? WINDOW_CONTROLS_INSET_RIGHT : 'right-0',
+          )}
+        />
       </div>
 
-      {/* 下方主体：左导航 + 右内容 */}
+      {/* 主体：左导航 + 右内容 */}
       <div className="flex flex-1 min-h-0">
         {/* 左侧 Tab 导航 */}
-        <div className="w-[160px] border-r border-border/50 pt-3 px-2 flex-shrink-0 overflow-y-auto scrollbar-thin">
-          <nav className="flex flex-col gap-0.5">
+        <div className="flex h-full min-h-0 w-[277px] flex-shrink-0 flex-col border-r border-border/80 bg-[hsl(var(--sidebar-surface))] dark:border-border/70">
+          <nav className="flex flex-1 flex-col gap-0.5 overflow-y-auto px-3 pt-5 scrollbar-thin">
             {tabs.map((tab) => (
               <button
                 key={tab.id}
                 onClick={() => handleTabChange(tab.id)}
                 className={cn(
-                  "flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors",
+                  "flex items-center gap-2 rounded-md px-3 py-2.5 text-sm transition-colors",
                   activeTab === tab.id
                     ? "bg-muted text-foreground font-medium"
                     : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
@@ -287,11 +335,25 @@ export function SettingsPanel({
               </button>
             ))}
           </nav>
+          <div className="flex-shrink-0 p-3">
+            <button
+              onClick={handleClose}
+              className="group flex w-full items-center gap-2 rounded-md px-3 py-2.5 text-sm text-muted-foreground transition-colors hover:bg-background/60 hover:text-foreground"
+            >
+              <ArrowLeft size={16} />
+              <span>返回</span>
+              <span className="ml-auto hidden group-hover:inline-flex">
+                <ShortcutKeycaps accelerator="Esc" />
+              </span>
+            </button>
+          </div>
         </div>
 
         {/* 右侧内容区域 */}
-        <ScrollArea className="flex-1">
-          <div className="px-6 py-4">{renderTabContent(activeTab)}</div>
+        <ScrollArea className="min-w-0 flex-1 bg-content-area">
+          <div className="mx-auto w-full max-w-[1080px] px-5 py-8 pb-12 sm:px-8">
+            {renderTabContent(activeTab)}
+          </div>
         </ScrollArea>
       </div>
 

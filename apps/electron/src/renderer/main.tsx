@@ -16,30 +16,35 @@ import App from './App'
 import {
   themeModeAtom,
   themeStyleAtom,
+  interfaceVariantAtom,
   systemIsDarkAtom,
   resolvedThemeAtom,
   applyThemeToDOM,
+  applyInterfaceVariantToDOM,
   initializeTheme,
 } from './atoms/theme'
 import {
   agentChannelIdAtom,
   agentModelIdAtom,
-  agentChannelIdsAtom,
   agentWorkspacesAtom,
+  agentSessionsAtom,
   currentAgentWorkspaceIdAtom,
   currentAgentSessionIdAtom,
   workspaceCapabilitiesVersionAtom,
   workspaceFilesVersionAtom,
+  workspaceGitDiffRefreshVersionAtom,
   agentThinkingAtom,
   agentEffortAtom,
   agentMaxBudgetUsdAtom,
   agentMaxTurnsAtom,
   agentSettingsReadyAtom,
+  automationGroupOrderAtom,
   dockBadgeCountAtom,
   unviewedCompletedSessionIdsAtom,
 } from './atoms/agent-atoms'
 import { updateStatusAtom, initializeUpdater } from './atoms/updater'
 import { automationsAtom } from './atoms/automation-atoms'
+import { calendarEventsAtom, calendarPlanningGroupsAtom, planningTagsAtom, todoPlanningGroupsAtom, todosAtom } from './atoms/planning-atoms'
 import {
   notificationsEnabledAtom,
   notificationSoundEnabledAtom,
@@ -48,6 +53,9 @@ import {
 } from './atoms/notifications'
 import {
   stickyUserMessageEnabledAtom,
+  longTextPasteAsAttachmentEnabledAtom,
+  richTextRenderingEnabledAtom,
+  sessionHoverPreviewEnabledAtom,
   initializeUiPreferences,
 } from './atoms/ui-preferences'
 import {
@@ -66,20 +74,35 @@ import { appModeAtom } from './atoms/app-mode'
 import type { FeishuBotBridgeState, FeishuBridgeState, DingTalkBotBridgeState, DingTalkBridgeState } from '@proma/shared'
 import { Toaster } from './components/ui/sonner'
 import { toast } from 'sonner'
+import { ArrowUpRight } from 'lucide-react'
 import { diffCapabilities } from '@proma/shared'
 import type { WorkspaceCapabilities } from '@proma/shared'
 import { showCapabilityChangeToasts } from './lib/capabilities-toast'
-import { UpdateDialog } from './components/settings/UpdateDialog'
 import { GlobalShortcuts } from './components/shortcuts/GlobalShortcuts'
+import { VoiceDictationApp } from './components/voice-dictation/VoiceDictationApp'
 import { TabSwitcher } from './components/tabs/TabSwitcher'
 import { htmlToMarkdown, markdownToHtml } from './lib/markdown-rich-text'
+import { PromaLogo } from './lib/model-logo'
+import { initShortcutRegistry, updateShortcutOverrides } from './lib/shortcut-registry'
+import { initializePerformanceMonitor } from './lib/performance-monitor'
 import './styles/globals.css'
 import 'katex/dist/katex.min.css'
 
 // ===== 窗口类型检测 =====
 const isQuickTaskWindow = new URLSearchParams(window.location.search).get('window') === 'quick-task'
-const isVoiceDictationWindow = new URLSearchParams(window.location.search).get('window') === 'voice-dictation'
+const isVoiceDictationIndicatorWindow = new URLSearchParams(window.location.search).get('window') === 'voice-dictation-indicator'
 const isDetachedPreviewWindow = new URLSearchParams(window.location.search).get('window') === 'detached-preview'
+const isPlanningWindow = new URLSearchParams(window.location.search).get('window') === 'planning'
+const isWorkspaceMemoryWindow = new URLSearchParams(window.location.search).get('window') === 'workspace-memory'
+const isAgentStatusHoverWindow = new URLSearchParams(window.location.search).get('window') === 'agent-status-hover'
+const isMainWindow = !isQuickTaskWindow && !isVoiceDictationIndicatorWindow && !isDetachedPreviewWindow && !isPlanningWindow && !isWorkspaceMemoryWindow && !isAgentStatusHoverWindow
+
+initializePerformanceMonitor()
+
+// 主窗口和独立规划窗口均由内部面板管理滚动，避免页面本身出现第二层滚动。
+if (isMainWindow || isPlanningWindow || isWorkspaceMemoryWindow) {
+  document.documentElement.classList.add('proma-main-window')
+}
 
 /**
  * 主题初始化组件
@@ -90,9 +113,11 @@ const isDetachedPreviewWindow = new URLSearchParams(window.location.search).get(
 function ThemeInitializer(): null {
   const setThemeMode = useSetAtom(themeModeAtom)
   const setThemeStyle = useSetAtom(themeStyleAtom)
+  const setInterfaceVariant = useSetAtom(interfaceVariantAtom)
   const setSystemIsDark = useSetAtom(systemIsDarkAtom)
   const themeMode = useAtomValue(themeModeAtom)
   const themeStyle = useAtomValue(themeStyleAtom)
+  const interfaceVariant = useAtomValue(interfaceVariantAtom)
   const systemIsDark = useAtomValue(systemIsDarkAtom)
 
   // 初始化：从主进程加载设置 + 订阅系统主题变化
@@ -100,7 +125,7 @@ function ThemeInitializer(): null {
     let isMounted = true
     let cleanup: (() => void) | undefined
 
-    initializeTheme(setThemeMode, setSystemIsDark, setThemeStyle).then((fn) => {
+    initializeTheme(setThemeMode, setSystemIsDark, setThemeStyle, setInterfaceVariant).then((fn) => {
       if (isMounted) {
         cleanup = fn
       } else {
@@ -113,7 +138,7 @@ function ThemeInitializer(): null {
       isMounted = false
       cleanup?.()
     }
-  }, [setThemeMode, setSystemIsDark, setThemeStyle])
+  }, [setThemeMode, setSystemIsDark, setThemeStyle, setInterfaceVariant])
 
   // 响应式应用主题到 DOM
   // 用 useMemo 计算"实际会影响 DOM 的状态签名"作为唯一依赖：
@@ -134,6 +159,10 @@ function ThemeInitializer(): null {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [themeSignature])
 
+  useEffect(() => {
+    applyInterfaceVariantToDOM(interfaceVariant)
+  }, [interfaceVariant])
+
   return null
 }
 
@@ -145,15 +174,16 @@ function ThemeInitializer(): null {
 function AgentSettingsInitializer(): null {
   const setAgentChannelId = useSetAtom(agentChannelIdAtom)
   const setAgentModelId = useSetAtom(agentModelIdAtom)
-  const setAgentChannelIds = useSetAtom(agentChannelIdsAtom)
   const setAgentWorkspaces = useSetAtom(agentWorkspacesAtom)
   const setCurrentWorkspaceId = useSetAtom(currentAgentWorkspaceIdAtom)
   const bumpCapabilities = useSetAtom(workspaceCapabilitiesVersionAtom)
   const bumpFiles = useSetAtom(workspaceFilesVersionAtom)
+  const bumpGitDiffRefresh = useSetAtom(workspaceGitDiffRefreshVersionAtom)
   const setThinking = useSetAtom(agentThinkingAtom)
   const setEffort = useSetAtom(agentEffortAtom)
   const setMaxBudget = useSetAtom(agentMaxBudgetUsdAtom)
   const setMaxTurns = useSetAtom(agentMaxTurnsAtom)
+  const setAutomationGroupOrder = useSetAtom(automationGroupOrderAtom)
 
   const setAgentSettingsReady = useSetAtom(agentSettingsReadyAtom)
   const setChannels = useSetAtom(channelsAtom)
@@ -188,42 +218,27 @@ function AgentSettingsInitializer(): null {
         store.set(selectedModelAtom, null)
       }
 
-      // 验证并加载 Agent 渠道/模型
-      if (settings.agentChannelId && channelIds.has(settings.agentChannelId)) {
+      const selectedChannel = settings.agentChannelId
+        ? channels.find((channel) => channel.id === settings.agentChannelId)
+        : undefined
+      const selectedChannelIsUsable = selectedChannel?.enabled
+
+      const updates: Parameters<typeof window.electronAPI.updateSettings>[0] = {}
+
+      // 验证并加载 Agent 默认渠道/模型。Pi 可使用任意启用渠道。
+      if (settings.agentChannelId && selectedChannelIsUsable) {
         setAgentChannelId(settings.agentChannelId)
-      } else if (settings.agentChannelId && !channelIds.has(settings.agentChannelId)) {
-        // 渠道已删除，清除无效设置
-        console.warn('[AgentSettings] agentChannelId 指向已删除的渠道，清除')
-        window.electronAPI.updateSettings({ agentChannelId: undefined, agentModelId: undefined }).catch(console.error)
-      }
-      if (settings.agentModelId && (!settings.agentChannelId || channelIds.has(settings.agentChannelId))) {
-        setAgentModelId(settings.agentModelId)
-      }
-
-      // 加载 Agent 启用渠道列表，过滤已删除的渠道
-      if (settings.agentChannelIds && settings.agentChannelIds.length > 0) {
-        const validIds = settings.agentChannelIds.filter((id) => channelIds.has(id))
-        setAgentChannelIds(validIds)
-        // 如果有渠道被清理，持久化更新后的列表
-        if (validIds.length !== settings.agentChannelIds.length) {
-          console.warn('[AgentSettings] 清理了已删除的 agentChannelIds')
-          window.electronAPI.updateSettings({ agentChannelIds: validIds }).catch(console.error)
-        }
-      } else if (settings.agentChannelId && channelIds.has(settings.agentChannelId)) {
-        // 迁移：旧版本只有 agentChannelId，自动转为数组
-        const migrated = [settings.agentChannelId]
-        setAgentChannelIds(migrated)
-        window.electronAPI.updateSettings({ agentChannelIds: migrated }).catch(console.error)
+        if (settings.agentModelId) setAgentModelId(settings.agentModelId)
+      } else if (settings.agentChannelId) {
+        console.warn('[AgentSettings] agentChannelId 指向当前 Core 不可用的渠道，清除')
+        setAgentChannelId(null)
+        setAgentModelId(null)
+        updates.agentChannelId = undefined
+        updates.agentModelId = undefined
       }
 
-      // 兜底：agentChannelId 存在但不在 agentChannelIds 白名单中，自动修复不一致
-      if (settings.agentChannelId && channelIds.has(settings.agentChannelId)) {
-        const currentIds = settings.agentChannelIds?.filter((id) => channelIds.has(id)) ?? []
-        if (!currentIds.includes(settings.agentChannelId)) {
-          const fixedIds = [...currentIds, settings.agentChannelId]
-          setAgentChannelIds(fixedIds)
-          window.electronAPI.updateSettings({ agentChannelIds: fixedIds }).catch(console.error)
-        }
+      if (Object.keys(updates).length > 0) {
+        window.electronAPI.updateSettings(updates).catch(console.error)
       }
 
       if (settings.agentThinking) {
@@ -237,6 +252,9 @@ function AgentSettingsInitializer(): null {
       }
       if (settings.agentMaxTurns != null) {
         setMaxTurns(settings.agentMaxTurns)
+      }
+      if (typeof settings.agentAutomationGroupOrder === 'number') {
+        setAutomationGroupOrder(settings.agentAutomationGroupOrder)
       }
 
       // 加载工作区列表并恢复上次选中的工作区
@@ -258,7 +276,7 @@ function AgentSettingsInitializer(): null {
       console.error(err)
       setAgentSettingsReady(true) // 即使出错也标记就绪，避免永远阻塞
     })
-  }, [setAgentChannelId, setAgentModelId, setAgentChannelIds, setAgentWorkspaces, setCurrentWorkspaceId, setThinking, setEffort, setMaxBudget, setMaxTurns, setChannels, setChannelsLoaded, setAgentSettingsReady])
+  }, [setAgentChannelId, setAgentModelId, setAgentWorkspaces, setCurrentWorkspaceId, setThinking, setEffort, setMaxBudget, setMaxTurns, setAutomationGroupOrder, setChannels, setChannelsLoaded, setAgentSettingsReady])
 
   // 工作区切换时重置能力缓存，预加载基线
   useEffect(() => {
@@ -302,13 +320,18 @@ function AgentSettingsInitializer(): null {
     })
     const unsubFiles = window.electronAPI.onWorkspaceFilesChanged(() => {
       bumpFiles((v) => v + 1)
+      // watcher 已在主进程失效命中的 repo cache；所有已挂载 Changes 面板由此重新拉取。
+      bumpGitDiffRefresh((v) => v + 1)
+      // 外部本地项目目录变动时，主进程在 LIST_WORKSPACES 中重新计算根目录状态。
+      // 这里仅响应 watcher 事件刷新一次，避免在侧栏每次渲染时同步访问文件系统。
+      window.electronAPI.listAgentWorkspaces().then(setAgentWorkspaces).catch(console.error)
     })
 
     return () => {
       unsubCapabilities()
       unsubFiles()
     }
-  }, [bumpCapabilities, bumpFiles, currentWorkspaceId, workspaces])
+  }, [bumpCapabilities, bumpFiles, bumpGitDiffRefresh, currentWorkspaceId, setAgentWorkspaces, workspaces])
 
   return null
 }
@@ -320,11 +343,107 @@ function AgentSettingsInitializer(): null {
  */
 function UpdaterInitializer(): null {
   const setUpdateStatus = useSetAtom(updateStatusAtom)
+  const updateStatus = useAtomValue(updateStatusAtom)
+  const notifiedDownloadVersionRef = useRef<string | null>(null)
 
   useEffect(() => {
     const cleanup = initializeUpdater(setUpdateStatus)
     return cleanup
   }, [setUpdateStatus])
+
+  useEffect(() => {
+    if (updateStatus.status !== 'downloaded') return
+
+    const version = updateStatus.version || '新版本'
+    if (notifiedDownloadVersionRef.current === version) return
+    notifiedDownloadVersionRef.current = version
+    const versionLabel = version.startsWith('v') ? version : `v${version}`
+
+    toast.custom((toastId) => (
+      <div className="w-[344px] max-w-[calc(100vw-32px)] rounded-xl bg-background/95 p-3 text-foreground shadow-[0_12px_32px_rgba(0,0,0,0.14)] ring-1 ring-black/5 backdrop-blur-xl dark:ring-white/10">
+        <div className="flex items-center gap-2.5">
+          <img src={PromaLogo} alt="Proma" className="size-8 rounded-lg" />
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 text-sm leading-5">
+              <span className="font-semibold tracking-tight">Proma 更新已下载</span>
+              <span className="text-xs text-primary">{versionLabel}</span>
+            </div>
+            <p className="text-xs leading-4 text-muted-foreground">所有 Agent 完成后即可自动安装。</p>
+          </div>
+        </div>
+        <div className="mt-2.5 flex items-center justify-between">
+          <button
+            type="button"
+            className="h-7 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-[0.96]"
+            onClick={() => toast.dismiss(toastId)}
+          >
+            取消
+          </button>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-[0.96]"
+              onClick={() => { void window.electronAPI.openExternal('https://proma.cool/changelog') }}
+            >
+              查看更新
+              <ArrowUpRight size={13} />
+            </button>
+            <button
+              type="button"
+              className="h-7 rounded-md bg-primary px-2.5 text-xs font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 active:scale-[0.96]"
+              onClick={() => {
+                toast.dismiss(toastId)
+                void window.electronAPI.updater?.installWhenIdle()
+                  .then((scheduled) => {
+                    if (!scheduled) {
+                      toast.error('更新尚未准备好，请稍后重试')
+                      return
+                    }
+
+                    toast.custom((scheduledToastId) => (
+                      <div className="w-[312px] max-w-[calc(100vw-32px)] rounded-xl bg-background/95 p-3 text-foreground shadow-[0_12px_32px_rgba(0,0,0,0.14)] ring-1 ring-black/5 backdrop-blur-xl dark:ring-white/10">
+                        <div className="flex items-center gap-2.5">
+                          <img src={PromaLogo} alt="Proma" className="size-7 rounded-md" />
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-semibold tracking-tight">已安排空闲时更新</p>
+                            <p className="text-xs leading-4 text-muted-foreground">当前任务结束后会自动重启安装。</p>
+                          </div>
+                        </div>
+                        <div className="mt-2 flex justify-end">
+                          <button
+                            type="button"
+                            className="h-7 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-[0.96]"
+                            onClick={() => {
+                              void window.electronAPI.updater?.cancelIdleInstall()
+                              toast.dismiss(scheduledToastId)
+                            }}
+                          >
+                            取消安排
+                          </button>
+                        </div>
+                      </div>
+                    ), {
+                      duration: Infinity,
+                      dismissible: false,
+                      unstyled: true,
+                    })
+                  })
+                  .catch(() => {
+                    toast.error('无法安排空闲更新，请稍后重试')
+                  })
+              }}
+            >
+              空闲时更新
+            </button>
+          </div>
+        </div>
+      </div>
+    ), {
+      duration: Infinity,
+      dismissible: false,
+      unstyled: true,
+    })
+  }, [updateStatus])
 
   return null
 }
@@ -334,17 +453,87 @@ function UpdaterInitializer(): null {
  *
  * 加载全部定时任务，并订阅主进程的变更事件（运行完成/状态变化）刷新列表。
  */
+function PlanningShortcutInitializer(): null {
+  useEffect(() => {
+    initShortcutRegistry()
+    void window.electronAPI.getSettings().then((settings) => {
+      updateShortcutOverrides(settings.shortcutOverrides ?? {})
+    }).catch((error) => {
+      console.error('[任务/日程] 加载快捷键设置失败:', error)
+    })
+  }, [])
+  return null
+}
+
+function PlanningInitializer(): null {
+  const setTodos = useSetAtom(todosAtom)
+  const setCalendarEvents = useSetAtom(calendarEventsAtom)
+  const setTodoGroups = useSetAtom(todoPlanningGroupsAtom)
+  const setCalendarGroups = useSetAtom(calendarPlanningGroupsAtom)
+  const setTags = useSetAtom(planningTagsAtom)
+
+  useEffect(() => {
+    let disposed = false
+    const latestRequest = { todos: 0, calendarEvents: 0, todoGroups: 0, calendarGroups: 0, tags: 0 }
+    const loadTodos = (): void => {
+      const requestId = ++latestRequest.todos
+      void window.electronAPI.listTodos().then((todos) => {
+        if (!disposed && requestId === latestRequest.todos) setTodos(todos)
+      }).catch((error: unknown) => console.error('[任务/日程] 加载 Todo 失败:', error))
+    }
+    const loadCalendarEvents = (): void => {
+      const requestId = ++latestRequest.calendarEvents
+      void window.electronAPI.listCalendarEvents().then((events) => {
+        if (!disposed && requestId === latestRequest.calendarEvents) setCalendarEvents(events)
+      }).catch((error: unknown) => console.error('[任务/日程] 加载日程失败:', error))
+    }
+    const loadTodoGroups = (): void => {
+      const requestId = ++latestRequest.todoGroups
+      void window.electronAPI.listPlanningGroups('todo').then((groups) => {
+        if (!disposed && requestId === latestRequest.todoGroups) setTodoGroups(groups)
+      }).catch((error: unknown) => console.error('[任务/日程] 加载 Todo 分组失败:', error))
+    }
+    const loadCalendarGroups = (): void => {
+      const requestId = ++latestRequest.calendarGroups
+      void window.electronAPI.listPlanningGroups('calendar').then((groups) => {
+        if (!disposed && requestId === latestRequest.calendarGroups) setCalendarGroups(groups)
+      }).catch((error: unknown) => console.error('[任务/日程] 加载日程分组失败:', error))
+    }
+    const loadTags = (): void => {
+      const requestId = ++latestRequest.tags
+      void window.electronAPI.listPlanningTags().then((tags) => {
+        if (!disposed && requestId === latestRequest.tags) setTags(tags)
+      }).catch((error: unknown) => console.error('[任务/日程] 加载标签失败:', error))
+    }
+    const load = (resources?: string[]): void => {
+      const includes = (resource: string): boolean => resources === undefined || resources.includes(resource)
+      if (includes('todos')) loadTodos()
+      if (includes('calendar_events')) loadCalendarEvents()
+      if (includes('todo_groups')) loadTodoGroups()
+      if (includes('calendar_groups')) loadCalendarGroups()
+      if (includes('tags')) loadTags()
+    }
+    load()
+    const unsubscribe = window.electronAPI.onPlanningChanged((change) => load(change.resources))
+    return () => { disposed = true; unsubscribe() }
+  }, [setCalendarEvents, setCalendarGroups, setTags, setTodoGroups, setTodos])
+
+  return null
+}
+
 function AutomationInitializer(): null {
   const setAutomations = useSetAtom(automationsAtom)
+  const setAgentSessions = useSetAtom(agentSessionsAtom)
 
   useEffect(() => {
     const load = (): void => {
       window.electronAPI.listAutomations().then(setAutomations).catch(console.error)
+      window.electronAPI.listActiveAgentSessions().then(setAgentSessions).catch(console.error)
     }
     load()
     const unsub = window.electronAPI.onAutomationChanged(load)
     return unsub
-  }, [setAutomations])
+  }, [setAutomations, setAgentSessions])
 
   return null
 }
@@ -360,7 +549,7 @@ function NotificationsInitializer(): null {
   const setSounds = useSetAtom(notificationSoundsAtom)
 
   useEffect(() => {
-    initializeNotifications(setEnabled, setSoundEnabled, setSounds)
+    void initializeNotifications(setEnabled, setSoundEnabled, setSounds)
   }, [setEnabled, setSoundEnabled, setSounds])
 
   return null
@@ -374,9 +563,16 @@ function NotificationsInitializer(): null {
 function DockBadgeInitializer(): null {
   const count = useAtomValue(dockBadgeCountAtom)
   const notificationsEnabled = useAtomValue(notificationsEnabledAtom)
-  const currentSessionId = useAtomValue(currentAgentSessionIdAtom)
+  const tabs = useAtomValue(tabsAtom)
+  const activeTabId = useAtomValue(activeTabIdAtom)
   const setUnviewedCompleted = useSetAtom(unviewedCompletedSessionIdsAtom)
   const badgeCount = notificationsEnabled ? count : 0
+  const activeAgentSessionId = useMemo(() => {
+    const activeTab = activeTabId ? tabs.find((tab) => tab.id === activeTabId) : null
+    return activeTab?.type === 'agent' || activeTab?.type === 'preview'
+      ? activeTab.sessionId
+      : null
+  }, [activeTabId, tabs])
 
   useEffect(() => {
     window.electronAPI.setDockBadgeCount(badgeCount).catch((error) => {
@@ -385,24 +581,27 @@ function DockBadgeInitializer(): null {
   }, [badgeCount])
 
   useEffect(() => {
-    const clearCurrentSessionBadge = (): void => {
-      if (!document.hasFocus() || !currentSessionId) return
+    const clearActiveSessionBadge = (): void => {
+      if (!document.hasFocus() || !activeAgentSessionId) return
+      // 以实际激活的 Agent/预览 Tab 为准。Scratch Pad 会保留 currentAgentSessionId，
+      // 不能仅据此把后台会话误判为已查看。
+      void window.electronAPI.agentIsland.markSessionViewed(activeAgentSessionId).catch(console.error)
       setUnviewedCompleted((prev) => {
-        if (!prev.has(currentSessionId)) return prev
+        if (!prev.has(activeAgentSessionId)) return prev
         const next = new Set(prev)
-        next.delete(currentSessionId)
+        next.delete(activeAgentSessionId)
         return next
       })
     }
 
-    clearCurrentSessionBadge()
-    window.addEventListener('focus', clearCurrentSessionBadge)
-    document.addEventListener('visibilitychange', clearCurrentSessionBadge)
+    clearActiveSessionBadge()
+    window.addEventListener('focus', clearActiveSessionBadge)
+    document.addEventListener('visibilitychange', clearActiveSessionBadge)
     return () => {
-      window.removeEventListener('focus', clearCurrentSessionBadge)
-      document.removeEventListener('visibilitychange', clearCurrentSessionBadge)
+      window.removeEventListener('focus', clearActiveSessionBadge)
+      document.removeEventListener('visibilitychange', clearActiveSessionBadge)
     }
-  }, [currentSessionId, setUnviewedCompleted])
+  }, [activeAgentSessionId, setUnviewedCompleted])
 
   return null
 }
@@ -410,14 +609,22 @@ function DockBadgeInitializer(): null {
 /**
  * UI 偏好初始化组件
  *
- * 从主进程加载 UI 偏好设置（悬浮置顶条等）。
+ * 从主进程加载 UI 偏好设置（悬浮置顶条、输入框 Markdown 渲染等）。
  */
 function UiPreferencesInitializer(): null {
   const setStickyUserMessageEnabled = useSetAtom(stickyUserMessageEnabledAtom)
+  const setLongTextPasteAsAttachmentEnabled = useSetAtom(longTextPasteAsAttachmentEnabledAtom)
+  const setRichTextRenderingEnabled = useSetAtom(richTextRenderingEnabledAtom)
+  const setSessionHoverPreviewEnabled = useSetAtom(sessionHoverPreviewEnabledAtom)
 
   useEffect(() => {
-    initializeUiPreferences(setStickyUserMessageEnabled)
-  }, [setStickyUserMessageEnabled])
+    initializeUiPreferences(
+      setStickyUserMessageEnabled,
+      setLongTextPasteAsAttachmentEnabled,
+      setRichTextRenderingEnabled,
+      setSessionHoverPreviewEnabled
+    )
+  }, [setStickyUserMessageEnabled, setLongTextPasteAsAttachmentEnabled, setRichTextRenderingEnabled, setSessionHoverPreviewEnabled])
 
   return null
 }
@@ -628,16 +835,24 @@ function TabStatePersistenceInitializer(): null {
 
   // 启动恢复：读取 settings.tabState + 校验会话有效性
   useEffect(() => {
-    Promise.all([
-      window.electronAPI.getSettings(),
-      window.electronAPI.listConversations(),
-      window.electronAPI.listAgentSessions(),
-    ]).then(([settings, conversations, agentSessions]) => {
+    const restore = async (): Promise<void> => {
+      const [settings, conversations, activeAgentSessions] = await Promise.all([
+        window.electronAPI.getSettings(),
+        window.electronAPI.listConversations(),
+        window.electronAPI.listActiveAgentSessions(),
+      ])
       const tabState = settings.tabState
-      if (!tabState?.tabs?.length) {
-        restoredRef.current = true
-        return
-      }
+      if (!tabState?.tabs?.length) return
+
+      // 已归档会话仅在上次打开的标签引用它时才读取，以兼容恢复该标签。
+      const activeAgentSessionIds = new Set(activeAgentSessions.map((session) => session.id))
+      const hasArchivedAgentTab = tabState.tabs.some(
+        (tab) => tab.type === 'agent' && !activeAgentSessionIds.has(tab.sessionId),
+      )
+      const archivedAgentSessions = hasArchivedAgentTab
+        ? await window.electronAPI.listArchivedAgentSessions()
+        : []
+      const agentSessions = [...activeAgentSessions, ...archivedAgentSessions]
 
       // 构建有效 sessionId 集合
       const validSessionIds = new Set([
@@ -657,10 +872,7 @@ function TabStatePersistenceInitializer(): null {
           (t.type === 'chat' || t.type === 'agent') &&
           validSessionIds.has(t.sessionId),
       )
-      if (validTabs.length === 0) {
-        restoredRef.current = true
-        return
-      }
+      if (validTabs.length === 0) return
 
       const validTabIds = new Set(validTabs.map((t) => t.id))
 
@@ -694,7 +906,9 @@ function TabStatePersistenceInitializer(): null {
       }
 
       console.log(`[TabRestore] 已恢复当前会话入口，历史标签 ${validTabs.length} 个已收敛到左侧列表`)
-    }).catch((err) => console.error('[TabRestore] 恢复标签页失败:', err))
+    }
+
+    restore().catch((err) => console.error('[TabRestore] 恢复标签页失败:', err))
       .finally(() => { restoredRef.current = true })
   }, [store])
 
@@ -864,13 +1078,12 @@ if (isQuickTaskWindow) {
       </React.StrictMode>
     )
   })
-} else if (isVoiceDictationWindow) {
-  import('./components/voice-dictation/VoiceDictationApp').then(({ VoiceDictationApp }) => {
+} else if (isVoiceDictationIndicatorWindow) {
+  import('./components/voice-dictation/VoiceDictationIndicatorApp').then(({ VoiceDictationIndicatorApp }) => {
     ReactDOM.createRoot(document.getElementById('root')!).render(
       <React.StrictMode>
         <ThemeInitializer />
-        <VoiceDictationApp />
-        <Toaster position="top-right" />
+        <VoiceDictationIndicatorApp />
       </React.StrictMode>
     )
   })
@@ -881,7 +1094,40 @@ if (isQuickTaskWindow) {
         <ThemeInitializer />
         <MarkdownFontSizeInitializer />
         <DetachedPreviewApp />
-        <Toaster position="top-right" />
+        <Toaster position="bottom-right" />
+      </React.StrictMode>
+    )
+  })
+} else if (isPlanningWindow) {
+  import('./components/planning/PlanningWindowApp').then(({ PlanningWindowApp }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <ThemeInitializer />
+        <AgentSettingsInitializer />
+        <PlanningShortcutInitializer />
+        <AutomationInitializer />
+        <PlanningInitializer />
+        <PlanningWindowApp />
+        <Toaster position="bottom-right" />
+      </React.StrictMode>
+    )
+  })
+} else if (isWorkspaceMemoryWindow) {
+  import('./components/agent-skills/WorkspaceMemoryWindowApp').then(({ WorkspaceMemoryWindowApp }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <ThemeInitializer />
+        <WorkspaceMemoryWindowApp />
+        <Toaster position="bottom-right" />
+      </React.StrictMode>
+    )
+  })
+} else if (isAgentStatusHoverWindow) {
+  import('./components/agent-status-hover/HoverPanel').then(({ HoverPanel }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <ThemeInitializer />
+        <HoverPanel />
       </React.StrictMode>
     )
   })
@@ -900,15 +1146,16 @@ if (isQuickTaskWindow) {
       <ChatToolInitializer />
       <UpdaterInitializer />
       <AutomationInitializer />
+      <PlanningInitializer />
       <FeishuInitializer />
       <DingTalkInitializer />
       <TabStatePersistenceInitializer />
       <ScratchPadPersistence />
+      <VoiceDictationApp embedded />
       <GlobalShortcuts />
       <TabSwitcher />
       <App />
-      <UpdateDialog />
-      <Toaster position="top-right" />
+      <Toaster position="bottom-right" />
     </React.StrictMode>
   )
 }

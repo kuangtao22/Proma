@@ -15,6 +15,7 @@ import { Bot, Loader2 } from 'lucide-react'
 import { MessageAction } from '@/components/ai-elements/message'
 import {
   agentChannelIdAtom,
+  agentModelIdAtom,
   agentWorkspacesAtom,
   agentSessionsAtom,
   currentAgentSessionIdAtom,
@@ -52,13 +53,14 @@ export function MigrateToAgentButton({ conversationId }: MigrateToAgentButtonPro
         undefined,
         agentChannelId,
         defaultWorkspaceId ?? undefined,
+        store.get(agentModelIdAtom) || undefined,
       )
 
       // 2. 迁移 Chat 对话记录到新 Agent 会话
       await window.electronAPI.migrateChatToAgent(conversationId, session.id)
 
       // 3. 刷新会话列表
-      const sessions = await window.electronAPI.listAgentSessions()
+      const sessions = await window.electronAPI.listActiveAgentSessions()
       store.set(agentSessionsAtom, sessions)
 
       // 4. 切换到默认工作区

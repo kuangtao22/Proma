@@ -2,8 +2,7 @@
  * Agent Provider 适配器接口
  *
  * 定义 Proma 自己的 Agent 接口层，让底层 SDK 可替换。
- * 当前实现：ClaudeAgentAdapter（基于 @anthropic-ai/claude-agent-sdk）
- * 未来可扩展：PiAgentAdapter 等。
+ * 当前实现：PiAgentAdapter（可选 in-process）与 PiUtilityAdapter（默认 per-session utility runtime）。
  */
 
 import type { SDKMessage } from './agent'
@@ -16,6 +15,16 @@ export interface SDKUserMessageInput {
   priority?: 'now' | 'next' | 'later'
   uuid?: string
   session_id: string
+}
+
+/** 队列消息注入选项 */
+export interface SendQueuedMessageOptions {
+  /** 先取消当前 turn，再把消息作为新一轮用户输入发送 */
+  interrupt?: boolean
+  /** 当前用户输入显式引用的 Skill name（兼容历史 slug 已在编排层归一化） */
+  skillMentions?: string[]
+  /** runtime/adapter 已接收消息后回调；用于调用方区分失败时是否可回滚本地历史 */
+  onAccepted?: () => void
 }
 
 /**
@@ -56,7 +65,7 @@ export interface AgentProviderAdapter {
   /** 释放资源 */
   dispose(): void
   /** 向活跃查询注入队列消息（可选，仅支持队列的 Provider 实现） */
-  sendQueuedMessage?(sessionId: string, message: SDKUserMessageInput): Promise<void>
+  sendQueuedMessage?(sessionId: string, message: SDKUserMessageInput, options?: SendQueuedMessageOptions): Promise<void>
   /** 取消队列中的待发送消息（可选） */
   cancelQueuedMessage?(sessionId: string, messageUuid: string): Promise<void>
   /** 动态切换活跃查询的权限模式（可选，仅支持 SDK 原生 setPermissionMode 的 Provider） */

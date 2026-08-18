@@ -14,6 +14,9 @@ import type {
 } from '@proma/shared'
 import { DingTalkBridge } from './dingtalk-bridge'
 import { getDingTalkMultiBotConfig, getDingTalkBotById } from './dingtalk-config'
+import { getDingTalkBotBindingsPath } from './config-paths'
+import { isBindingForDeletedWorkspace, loadBridgeChatBindings, saveBridgeChatBindings } from './bridge-binding-store'
+import { redactSensitiveLogValue } from './bridge-log-redaction'
 
 class DingTalkBridgeManager {
   /** botId → Bridge 实例 */
@@ -30,7 +33,7 @@ class DingTalkBridgeManager {
       try {
         await this.startBot(bot.id)
       } catch (error) {
-        console.error(`[钉钉 BridgeManager] Bot "${bot.name}" 启动失败:`, error)
+        console.error(`[钉钉 BridgeManager] Bot "${bot.name}" 启动失败:`, redactSensitiveLogValue(error))
       }
     }
 
@@ -45,7 +48,7 @@ class DingTalkBridgeManager {
       try {
         bridge.stop()
       } catch (error) {
-        console.error(`[钉钉 BridgeManager] Bot ${botId} 停止失败:`, error)
+        console.error(`[钉钉 BridgeManager] Bot ${botId} 停止失败:`, redactSensitiveLogValue(error))
       }
     }
     this.bridges.clear()
@@ -121,6 +124,34 @@ class DingTalkBridgeManager {
   /** 获取所有活跃 Bridge 实例 */
   getAllBridges(): Map<string, DingTalkBridge> {
     return this.bridges
+  }
+
+  /**
+   * 清理删除项目的聊天绑定，包括尚未启动的 Bot 的持久化绑定文件。
+   * 活跃 Bot 由其 handler 负责同步内存与持久化；未启动 Bot 直接更新 JSON 文件。
+   */
+  removeBindingsForDeletedWorkspace(workspaceId: string, sessionIds: Iterable<string>): number {
+    const deletedSessionIds = new Set(sessionIds)
+    const config = getDingTalkMultiBotConfig()
+    let removedCount = 0
+
+    for (const bridge of this.bridges.values()) {
+      removedCount += bridge.removeBindingsForDeletedWorkspace(workspaceId, deletedSessionIds)
+    }
+
+    for (const bot of config.bots) {
+      if (this.bridges.has(bot.id)) continue
+
+      const filePath = getDingTalkBotBindingsPath(bot.id)
+      const bindings = loadBridgeChatBindings(filePath, `钉钉 Bridge/${bot.name}`)
+      const retained = bindings.filter((binding) => !isBindingForDeletedWorkspace(binding, workspaceId, deletedSessionIds))
+      if (retained.length === bindings.length) continue
+
+      saveBridgeChatBindings(filePath, retained, `钉钉 Bridge/${bot.name}`)
+      removedCount += bindings.length - retained.length
+    }
+
+    return removedCount
   }
 
   // ===== 连接测试（静态，不影响运行中的 Bridge） =====

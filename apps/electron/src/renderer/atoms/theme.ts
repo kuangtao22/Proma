@@ -11,11 +11,12 @@
  */
 
 import { atom } from 'jotai'
-import type { ThemeMode, ThemeStyle } from '../../types'
+import { DEFAULT_INTERFACE_VARIANT, THEME_STYLES, type InterfaceVariant, type ThemeMode, type ThemeStyle } from '../../types'
 
 /** localStorage 缓存键 */
 const THEME_CACHE_KEY = 'proma-theme-mode'
 const THEME_STYLE_CACHE_KEY = 'proma-theme-style'
+const INTERFACE_VARIANT_CACHE_KEY = 'proma-interface-variant'
 
 /**
  * 从 localStorage 读取缓存的主题模式
@@ -38,13 +39,28 @@ function getCachedThemeMode(): ThemeMode {
 function getCachedThemeStyle(): ThemeStyle {
   try {
     const cached = localStorage.getItem(THEME_STYLE_CACHE_KEY)
-    if (cached === 'default' || cached === 'ocean-light' || cached === 'ocean-dark' || cached === 'forest-light' || cached === 'forest-dark' || cached === 'slate-light' || cached === 'slate-dark') {
-      return cached
+    if ((THEME_STYLES as readonly string[]).includes(cached ?? '')) {
+      return cached as ThemeStyle
     }
   } catch {
     // localStorage 不可用时忽略
   }
   return 'default'
+}
+
+/**
+ * 从 localStorage 读取缓存的界面风格
+ */
+function getCachedInterfaceVariant(): InterfaceVariant {
+  try {
+    const cached = localStorage.getItem(INTERFACE_VARIANT_CACHE_KEY)
+    if (cached === 'classic' || cached === 'modern') {
+      return cached
+    }
+  } catch {
+    // localStorage 不可用时忽略
+  }
+  return DEFAULT_INTERFACE_VARIANT
 }
 
 /**
@@ -69,11 +85,25 @@ function cacheThemeStyle(style: ThemeStyle): void {
   }
 }
 
+/**
+ * 缓存界面风格到 localStorage
+ */
+function cacheInterfaceVariant(variant: InterfaceVariant): void {
+  try {
+    localStorage.setItem(INTERFACE_VARIANT_CACHE_KEY, variant)
+  } catch {
+    // localStorage 不可用时忽略
+  }
+}
+
 /** 用户选择的主题模式 */
 export const themeModeAtom = atom<ThemeMode>(getCachedThemeMode())
 
 /** 用户选择的特殊风格 */
 export const themeStyleAtom = atom<ThemeStyle>(getCachedThemeStyle())
+
+/** 用户选择的界面风格 */
+export const interfaceVariantAtom = atom<InterfaceVariant>(getCachedInterfaceVariant())
 
 /** 系统当前是否为深色模式 */
 export const systemIsDarkAtom = atom<boolean>(true)
@@ -92,15 +122,10 @@ export const resolvedThemeAtom = atom<'light' | 'dark'>((get) => {
   return mode
 })
 
-/** 所有特殊风格 class（用于清理旧值） */
-const ALL_THEME_STYLE_CLASSES = [
-  'theme-ocean-light',
-  'theme-ocean-dark',
-  'theme-forest-light',
-  'theme-forest-dark',
-  'theme-slate-light',
-  'theme-slate-dark',
-] as const
+/** 所有特殊风格 class（用于清理旧值）— 从 THEME_STYLES 单一源派生，排除 'default' */
+const ALL_THEME_STYLE_CLASSES = THEME_STYLES
+  .filter((style) => style !== 'default')
+  .map((style) => `theme-${style}` as const)
 
 /**
  * 应用主题到 DOM
@@ -108,7 +133,7 @@ const ALL_THEME_STYLE_CLASSES = [
  * 在 <html> 元素上切换 dark 类名和特殊风格类名。
  *
  * 幂等实现：先计算目标 class 状态，与当前 DOM 对比，一致时直接 return，
- * 不触发任何 classList mutation。避免与 vibrancy + backdrop-blur 合成层叠加
+ * 不触发任何 classList mutation。避免与 vibrancy 合成层叠加
  * 导致 Chromium 重建合成层造成的全屏闪烁。
  */
 export function applyThemeToDOM(themeMode: ThemeMode, themeStyle: ThemeStyle = 'default', systemIsDark: boolean = true): void {
@@ -156,6 +181,28 @@ export function applyThemeToDOM(themeMode: ThemeMode, themeStyle: ThemeStyle = '
 }
 
 /**
+ * 应用界面风格到 DOM
+ */
+export function applyInterfaceVariantToDOM(variant: InterfaceVariant = DEFAULT_INTERFACE_VARIANT): void {
+  const html = document.documentElement
+  const targetClass = variant === 'classic' ? 'ui-classic' : 'ui-modern'
+  const currentClass = html.classList.contains('ui-classic')
+    ? 'ui-classic'
+    : html.classList.contains('ui-modern')
+      ? 'ui-modern'
+      : null
+
+  if (currentClass === targetClass) {
+    return
+  }
+
+  if (currentClass) {
+    html.classList.remove(currentClass)
+  }
+  html.classList.add(targetClass)
+}
+
+/**
  * 初始化主题系统
  *
  * 从主进程加载设置，监听系统主题变化。
@@ -165,6 +212,7 @@ export async function initializeTheme(
   setThemeMode: (mode: ThemeMode) => void,
   setSystemIsDark: (isDark: boolean) => void,
   setThemeStyle?: (style: ThemeStyle) => void,
+  setInterfaceVariant?: (variant: InterfaceVariant) => void,
 ): Promise<() => void> {
   // 从主进程加载持久化设置
   const settings = await window.electronAPI.getSettings()
@@ -176,6 +224,12 @@ export async function initializeTheme(
     setThemeStyle(settings.themeStyle)
     cacheThemeStyle(settings.themeStyle)
   }
+
+  const interfaceVariant = settings.interfaceVariant || DEFAULT_INTERFACE_VARIANT
+  if (setInterfaceVariant) {
+    setInterfaceVariant(interfaceVariant)
+  }
+  cacheInterfaceVariant(interfaceVariant)
 
   // 获取系统主题
   const isDark = await window.electronAPI.getSystemTheme()
@@ -190,11 +244,16 @@ export async function initializeTheme(
   const cleanupThemeSettings = window.electronAPI.onThemeSettingsChanged((payload) => {
     const mode = payload.themeMode as ThemeMode
     const style = (payload.themeStyle || 'default') as ThemeStyle
+    const variant = (payload.interfaceVariant || DEFAULT_INTERFACE_VARIANT) as InterfaceVariant
     setThemeMode(mode)
     cacheThemeMode(mode)
     if (setThemeStyle) {
       setThemeStyle(style)
       cacheThemeStyle(style)
+    }
+    if (setInterfaceVariant) {
+      setInterfaceVariant(variant)
+      cacheInterfaceVariant(variant)
     }
   })
 
@@ -220,4 +279,12 @@ export async function updateThemeMode(mode: ThemeMode): Promise<void> {
 export async function updateThemeStyle(style: ThemeStyle): Promise<void> {
   cacheThemeStyle(style)
   await window.electronAPI.updateSettings({ themeStyle: style })
+}
+
+/**
+ * 更新界面风格并持久化
+ */
+export async function updateInterfaceVariant(variant: InterfaceVariant): Promise<void> {
+  cacheInterfaceVariant(variant)
+  await window.electronAPI.updateSettings({ interfaceVariant: variant })
 }

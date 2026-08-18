@@ -21,6 +21,10 @@ export interface PreviewFile {
   readOnly?: boolean
   /** 候选基础目录（用于相对路径解析） */
   basePaths?: string[]
+  /** Workspace slug for a relocatable managed Skill path. */
+  workspaceSkillSlug?: string
+  /** Original absolute Skill entry path used only when the managed locator cannot resolve. */
+  legacySkillFilePath?: string
   /** 文件是否落在当前会话的 diff scope 内（与 getUnstagedChanges 的 candidates 对齐） */
   inDiffScope?: boolean
   /** 基准 ref（如 "origin/main"），用于 worktree vs main 模式的 diff 对比 */
@@ -36,10 +40,7 @@ export const previewPanelOpenMapAtom = atom<Map<string, boolean>>(new Map())
 export const previewFileMapAtom = atom<Map<string, PreviewFile | null>>(new Map())
 
 /** 分栏比例（对话占比），持久化 */
-export const previewSplitRatioAtom = atomWithStorage<number>('proma-preview-split-ratio', 0.5)
-
-/** 自动预览开关，持久化（默认关闭以减轻设备性能负担，老用户保留已设置的偏好） */
-export const autoPreviewEnabledAtom = atomWithStorage<boolean>('proma-auto-preview-enabled', false)
+export const previewSplitRatioAtom = atomWithStorage<number>('proma-preview-split-ratio', 0.5, undefined, { getOnInit: true })
 
 /**
  * 预览默认展开方式，持久化。
@@ -52,6 +53,16 @@ export type PreviewModePreference = 'tab' | 'split'
 export const previewModePreferenceAtom = atomWithStorage<PreviewModePreference>(
   'proma-preview-mode-pref',
   'tab',
+  undefined,
+  { getOnInit: true },
+)
+
+/** 代码预览换行偏好（默认不换行，保持现有横向滚动行为） */
+export const previewCodeWrapAtom = atomWithStorage<boolean>(
+  'proma-preview-code-wrap',
+  false,
+  undefined,
+  { getOnInit: true },
 )
 
 /** 当前会话的预览面板是否打开（derived） */
@@ -63,16 +74,33 @@ export const currentSessionPreviewOpenAtom = atom<boolean>((get) => {
 
 // ===== 引用选中文本（Quoted Selection）=====
 
-/** 从预览面板中选中的文本引用 */
+/** 选中文本引用的来源 */
+export type QuotedSelectionSourceType = 'file' | 'agent-history' | 'scratch-pad'
+
+/** 从预览面板或 Agent 历史中选中的文本引用 */
 export interface QuotedSelection {
   /** 选中的文本内容 */
   text: string
-  /** 来源文件路径 */
+  /** 来源文件路径；历史引用时作为兼容展示字段 */
   filePath: string
+  /** 引用来源类型 */
+  sourceType?: QuotedSelectionSourceType
+  /** 面向用户展示的来源名称 */
+  sourceLabel?: string
+  /** Agent 历史消息 ID */
+  messageId?: string
+  /** Agent 历史消息角色 */
+  messageRole?: 'user' | 'assistant' | 'system'
   /** 起始行号（1-based，代码文件可计算，markdown 等无法计算时为 undefined） */
   startLine?: number
   /** 结束行号（1-based） */
   endLine?: number
+  /** Agent 历史消息内选区的起始字符偏移（0-based） */
+  selectionStart?: number
+  /** Agent 历史消息内选区的结束字符偏移（0-based、exclusive） */
+  selectionEnd?: number
+  /** Agent 历史中的所属轮次（1-based；用户消息和对应回复共用同一轮） */
+  turn?: number
   /** 捕获时间戳 */
   capturedAt: number
 }

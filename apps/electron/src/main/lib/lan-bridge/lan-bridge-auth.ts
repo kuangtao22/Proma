@@ -6,12 +6,21 @@
  */
 
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
-import { writeFileSync } from 'node:fs'
+import { rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { getConfigDir } from '../config-paths'
 
 const TOKEN_EXPIRY_MS = 24 * 60 * 60 * 1000 // 24 hours
 const PIN_LENGTH = 6
+const PAIRING_WINDOW_MS = 60_000
+const MAX_PAIRING_FAILURES = 5
+
+/** 单个 IP 的 PIN 配对失败窗口。 */
+interface PairingAttemptState {
+  windowStartedAt: number
+  failures: number
+}
+
+export type PairingVerificationResult = 'valid' | 'invalid' | 'rate_limited'
 
 /** Token payload 结构 */
 interface TokenPayload {
@@ -23,14 +32,29 @@ interface TokenPayload {
 
 let currentPin = ''
 let hmacKey = ''
+const pairingAttempts = new Map<string, PairingAttemptState>()
 
 /** 初始化认证：生成 PIN 和 HMAC 密钥 */
 export function initAuth(): string {
   currentPin = generatePin()
   hmacKey = randomBytes(32).toString('hex')
-  console.log(`[LAN Bridge] PIN 码: ${currentPin}`)
-  try { writeFileSync(join(getConfigDir(), 'lan-bridge-pin.txt'), currentPin) } catch {}
+  pairingAttempts.clear()
   return currentPin
+}
+
+/**
+ * 删除旧版本落盘的明文 PIN 文件。
+ *
+ * @param configDir Proma 配置目录
+ * @returns 是否完成清理；失败不会阻断 LAN Bridge 启动
+ */
+export function removeLegacyPinFile(configDir: string): boolean {
+  try {
+    rmSync(join(configDir, 'lan-bridge-pin.txt'), { force: true })
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** 获取当前 PIN 码 */
@@ -41,7 +65,8 @@ export function getCurrentPin(): string {
 /** 刷新 PIN 码 */
 export function refreshPin(): string {
   currentPin = generatePin()
-  console.log(`[LAN Bridge] PIN 码已刷新: ${currentPin}`)
+  pairingAttempts.clear()
+  console.log('[LAN Bridge] PIN 码已刷新')
   return currentPin
 }
 
@@ -51,6 +76,34 @@ export function verifyPin(pin: string): boolean {
   const b = Buffer.from(currentPin)
   if (a.length !== b.length) return false
   return timingSafeEqual(a, b)
+}
+
+/**
+ * 按客户端 IP 验证配对 PIN，并对连续失败进行独立限速。
+ *
+ * @param pin 客户端提交的 PIN
+ * @param ip 客户端 IP
+ * @param now 当前时间戳，测试可注入固定时间
+ * @returns 配对结果
+ */
+export function verifyPairingPin(pin: string, ip: string, now = Date.now()): PairingVerificationResult {
+  for (const [candidateIp, state] of pairingAttempts) {
+    if (now - state.windowStartedAt >= PAIRING_WINDOW_MS) pairingAttempts.delete(candidateIp)
+  }
+
+  const previous = pairingAttempts.get(ip)
+  if (previous && previous.failures >= MAX_PAIRING_FAILURES) return 'rate_limited'
+
+  if (verifyPin(pin)) {
+    pairingAttempts.delete(ip)
+    return 'valid'
+  }
+
+  pairingAttempts.set(ip, {
+    windowStartedAt: previous?.windowStartedAt ?? now,
+    failures: (previous?.failures ?? 0) + 1,
+  })
+  return 'invalid'
 }
 
 /** 生成 Token */

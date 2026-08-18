@@ -8,17 +8,15 @@
 import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { RefreshCw, Loader2, CheckCircle2, AlertCircle, Info, Terminal, ChevronDown, ChevronUp, ExternalLink, RotateCw } from 'lucide-react'
-import type { EnvironmentCheckResult, RuntimeStatus } from '@proma/shared'
+import type { EnvironmentCheckResult, RuntimeStatus, WindowsShellPreference } from '@proma/shared'
 import {
   SettingsSection,
   SettingsCard,
   SettingsRow,
+  SettingsSelect,
 } from './primitives'
 import { updateStatusAtom, updaterAvailableAtom, checkForUpdates } from '@/atoms/updater'
-import {
-  environmentCheckResultAtom,
-  hasEnvironmentIssuesAtom,
-} from '@/atoms/environment'
+import { environmentCheckResultAtom } from '@/atoms/environment'
 import { EnvironmentCheckCard } from '@/components/environment/EnvironmentCheckCard'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -29,13 +27,14 @@ import { VersionHistory } from './VersionHistory'
 declare const __APP_VERSION__: string
 const APP_VERSION = __APP_VERSION__
 
-const GITHUB_RELEASES_URL = 'https://github.com/ErlichLiu/Proma/releases'
+const GITHUB_RELEASES_URL = 'https://github.com/proma-ai/Proma/releases'
 
 /** 更新状态卡片 */
 function UpdateCard(): React.ReactElement | null {
   const available = useAtomValue(updaterAvailableAtom)
   const status = useAtomValue(updateStatusAtom)
   const [checking, setChecking] = React.useState(false)
+  const [idleInstallScheduled, setIdleInstallScheduled] = React.useState(false)
   const [showReleaseNotes, setShowReleaseNotes] = React.useState(false)
   const [release, setRelease] = React.useState<import('@proma/shared').GitHubRelease | null>(null)
 
@@ -57,11 +56,22 @@ function UpdateCard(): React.ReactElement | null {
     window.electronAPI.openExternal(url)
   }
 
-  const handleQuitAndInstall = (): void => {
-    window.electronAPI.updater?.quitAndInstall()
+  const handleInstallWhenIdle = (): void => {
+    void window.electronAPI.updater?.installWhenIdle()
+      .then((scheduled) => setIdleInstallScheduled(scheduled))
+      .catch(() => setIdleInstallScheduled(false))
+  }
+
+  const handleCancelIdleInstall = (): void => {
+    void window.electronAPI.updater?.cancelIdleInstall()
+      .then(() => setIdleInstallScheduled(false))
   }
 
   // 当检测到新版本时，获取完整的 release 信息
+  React.useEffect(() => {
+    if (status.status !== 'downloaded') setIdleInstallScheduled(false)
+  }, [status.status])
+
   React.useEffect(() => {
     if (status.status === 'available' && status.version && !release) {
       window.electronAPI
@@ -90,13 +100,22 @@ function UpdateCard(): React.ReactElement | null {
 
           {/* 操作按钮 */}
           {status.status === 'downloaded' ? (
-            <button
-              onClick={handleQuitAndInstall}
-              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
-            >
-              <RotateCw className="h-3.5 w-3.5" />
-              立即重启
-            </button>
+            idleInstallScheduled ? (
+              <button
+                onClick={handleCancelIdleInstall}
+                className="inline-flex items-center gap-1.5 rounded-md bg-secondary px-3 py-1.5 text-xs font-medium text-secondary-foreground hover:bg-secondary/80 transition-colors"
+              >
+                取消安排
+              </button>
+            ) : (
+              <button
+                onClick={handleInstallWhenIdle}
+                className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+              >
+                <RotateCw className="h-3.5 w-3.5" />
+                空闲时更新
+              </button>
+            )
           ) : status.status === 'available' ? (
             <button
               onClick={handleGoToDownload}
@@ -203,7 +222,6 @@ function StatusText({ status, version, error }: {
 
 /** 环境检测卡片 */
 function EnvironmentCard(): React.ReactElement {
-  const hasIssues = useAtomValue(hasEnvironmentIssuesAtom)
   const setEnvironmentResult = useSetAtom(environmentCheckResultAtom)
   const [result, setResult] = React.useState<EnvironmentCheckResult | null>(null)
   const [isChecking, setIsChecking] = React.useState(false)
@@ -235,26 +253,23 @@ function EnvironmentCard(): React.ReactElement {
   // Node.js 检测状态
   const nodejsStatus = !result
     ? 'checking'
-    : result.nodejs.installed && result.nodejs.meetsMinimum
-      ? result.nodejs.meetsRecommended
-        ? 'success'
-        : 'warning'
-      : 'error'
+    : result.nodejs.installed && result.nodejs.meetsMinimum && result.nodejs.meetsRecommended
+      ? 'success'
+      : 'warning'
 
-  // Git 检测状态
+  // Git 仅影响仓库状态、Changes 与 Diff，不阻塞基础 Agent。
   const gitStatus = !result
     ? 'checking'
     : result.git.installed && result.git.meetsRequirement
       ? 'success'
-      : 'error'
+      : 'warning'
 
   return (
     <SettingsCard>
       <div className="p-4 border-b">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <h3 className="text-sm font-medium">环境检测</h3>
-            {hasIssues && <Badge variant="destructive">!</Badge>}
+            <h3 className="text-sm font-medium">可选环境能力</h3>
           </div>
           <button
             onClick={handleCheck}
@@ -270,7 +285,7 @@ function EnvironmentCard(): React.ReactElement {
           </button>
         </div>
         <p className="text-xs text-muted-foreground mt-1">
-          Agent 模式需要 Node.js 和 Git 支持
+          基础 Agent 无需 Node.js 或 Git；按需安装以启用 MCP、Git 变更视图等能力
         </p>
       </div>
 
@@ -280,7 +295,7 @@ function EnvironmentCard(): React.ReactElement {
           name="Node.js"
           status={nodejsStatus}
           version={result?.nodejs.version}
-          requirement="推荐 22 LTS，最低 18 LTS"
+          requirement="可选 · 仅 npx / npm 型 MCP 服务器需要（推荐 22 LTS）"
           action={{
             type: 'openExternal',
             url: result?.nodejs.downloadUrl || 'https://nodejs.org/',
@@ -297,7 +312,7 @@ function EnvironmentCard(): React.ReactElement {
           name="Git"
           status={gitStatus}
           version={result?.git.version}
-          requirement="版本 >= 2.0"
+          requirement="可选 · Git 仓库状态、Changes 与 Diff 功能需要"
           action={{
             type: 'openExternal',
             url: result?.git.downloadUrl || 'https://git-scm.com/',
@@ -322,13 +337,17 @@ function EnvironmentCard(): React.ReactElement {
 /** Shell 环境卡片（Windows 平台）*/
 function ShellEnvironmentCard(): React.ReactElement | null {
   const [runtimeStatus, setRuntimeStatus] = React.useState<RuntimeStatus | null>(null)
+  const [shellPreference, setShellPreference] = React.useState<WindowsShellPreference>('auto')
   const [isChecking, setIsChecking] = React.useState(false)
 
-  // 初始化时加载运行时状态
+  // 初始化时加载运行时状态与用户偏好
   React.useEffect(() => {
-    window.electronAPI.getRuntimeStatus().then((status) => {
-      setRuntimeStatus(status)
-    })
+    Promise.all([window.electronAPI.getRuntimeStatus(), window.electronAPI.getSettings()])
+      .then(([status, settings]) => {
+        setRuntimeStatus(status)
+        setShellPreference(settings.windowsShellPreference ?? 'auto')
+      })
+      .catch((error) => console.error('[Shell 环境检测] 读取设置失败:', error))
   }, [])
 
   // 重新检测
@@ -345,6 +364,13 @@ function ShellEnvironmentCard(): React.ReactElement | null {
     }
   }
 
+  const handlePreferenceChange = async (value: string): Promise<void> => {
+    if (value !== 'auto' && value !== 'git-bash' && value !== 'wsl') return
+    const preference = value as WindowsShellPreference
+    await window.electronAPI.updateSettings({ windowsShellPreference: preference })
+    setShellPreference(preference)
+  }
+
   // 非 Windows 平台不显示
   if (!runtimeStatus || !runtimeStatus.shell) {
     return null
@@ -352,6 +378,12 @@ function ShellEnvironmentCard(): React.ReactElement | null {
 
   const { shell } = runtimeStatus
   const hasShell = shell.gitBash?.available || shell.wsl?.available
+  const resolvedShell = shellPreference === 'wsl' && shell.wsl.available
+    ? 'wsl'
+    : shellPreference === 'git-bash' && shell.gitBash.available
+      ? 'git-bash'
+      : shell.recommended
+  const resolvedShellLabel = resolvedShell === 'git-bash' ? 'Git Bash' : resolvedShell === 'wsl' ? 'WSL' : '无可用 Shell'
 
   return (
     <SettingsCard>
@@ -360,7 +392,7 @@ function ShellEnvironmentCard(): React.ReactElement | null {
           <div className="flex items-center gap-2">
             <Terminal className="h-4 w-4 text-muted-foreground" />
             <h3 className="text-sm font-medium">Shell 环境（Windows）</h3>
-            {!hasShell && <Badge variant="destructive">!</Badge>}
+            {!hasShell && <Badge variant="secondary">可选</Badge>}
           </div>
           <button
             onClick={handleCheck}
@@ -376,11 +408,25 @@ function ShellEnvironmentCard(): React.ReactElement | null {
           </button>
         </div>
         <p className="text-xs text-muted-foreground mt-1">
-          Agent 模式需要 Git Bash 或 WSL 支持
+          可选：配置 Git Bash 或 WSL 后，Agent 可执行 Bash 命令
         </p>
       </div>
 
       <div className="p-4 space-y-3">
+        <SettingsSelect
+          label="Agent Shell"
+          description="默认使用 Git Bash，确保 Windows 项目与 Agent 工具使用同一套路径；选择 WSL 后，WSL 不可用时会回退到 Git Bash。"
+          value={shellPreference}
+          onValueChange={(value) => {
+            void handlePreferenceChange(value).catch((error) => console.error('[Shell 环境检测] 保存偏好失败:', error))
+          }}
+          options={[
+            { value: 'auto', label: '自动（推荐：Git Bash 优先）' },
+            { value: 'git-bash', label: 'Git Bash' },
+            { value: 'wsl', label: 'WSL（实验性）' },
+          ]}
+        />
+
         {/* Git Bash 检测卡片 */}
         <EnvironmentCheckCard
           name="Git Bash"
@@ -412,25 +458,23 @@ function ShellEnvironmentCard(): React.ReactElement | null {
           }
         />
 
-        {/* 推荐环境提示 */}
-        {shell.recommended && (
-          <Alert>
-            <Info className="h-4 w-4" />
-            <AlertDescription className="text-xs">
-              <strong>当前使用：</strong>
-              {shell.recommended === 'git-bash' ? 'Git Bash（推荐）' : 'WSL'}
-            </AlertDescription>
-          </Alert>
-        )}
+        <Alert>
+          <Info className="h-4 w-4" />
+          <AlertDescription className="text-xs">
+            <strong>Agent 将使用：</strong>{resolvedShellLabel}
+            {shellPreference === 'wsl' && resolvedShell !== 'wsl' && '（WSL 不可用，已回退）'}
+            {shellPreference === 'git-bash' && resolvedShell !== 'git-bash' && '（Git Bash 不可用，已回退）'}
+          </AlertDescription>
+        </Alert>
 
         {/* 无可用环境警告 */}
         {!hasShell && (
-          <Alert variant="destructive">
+          <Alert>
             <AlertCircle className="h-4 w-4" />
             <AlertDescription className="text-xs">
-              <strong>未检测到可用的 Shell 环境！</strong>
+              <strong>未检测到可用的 Shell 环境。</strong>
               <br />
-              Agent 模式需要 Git Bash 或 WSL 才能运行。请安装其中之一后重启应用。
+              基础 Agent 仍可使用；安装 Git Bash 或 WSL 后可启用 Bash 命令执行。
             </AlertDescription>
           </Alert>
         )}
@@ -467,12 +511,12 @@ export function AboutSettings(): React.ReactElement {
         </SettingsRow>
         <SettingsRow label="项目地址">
           <a
-            href="https://github.com/ErlichLiu/Proma.git"
+            href="https://github.com/proma-ai/Proma.git"
             target="_blank"
             rel="noopener noreferrer"
             className="text-sm text-primary hover:underline"
           >
-            github.com/ErlichLiu/Proma
+            github.com/proma-ai/Proma
           </a>
         </SettingsRow>
       </SettingsCard>

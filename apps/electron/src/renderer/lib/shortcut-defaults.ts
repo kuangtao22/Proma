@@ -26,6 +26,8 @@ export interface ShortcutDefinition {
   category: ShortcutCategory
   /** 是否为全局快捷键（由主进程 globalShortcut 注册） */
   global?: boolean
+  /** 全局注册不可用时，是否仍保留应用内 keydown 回退 */
+  localFallback?: boolean
   /** 是否为只读（仅展示，不可自定义） */
   readonly?: boolean
 }
@@ -71,8 +73,36 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
     name: '切换侧边栏',
     description: '显示或隐藏左侧边栏',
     defaultMac: 'Cmd+B',
-    defaultWin: 'Ctrl+B',
+    defaultWin: 'Ctrl+Shift+E',
     category: 'app',
+  },
+  // 由 Electron 原生菜单角色处理，展示但不允许在应用内修改。
+  {
+    id: 'zoom-in',
+    name: '放大界面',
+    description: '提高 Proma 界面的缩放比例',
+    defaultMac: 'Cmd+Plus',
+    defaultWin: 'Ctrl+Plus',
+    category: 'app',
+    readonly: true,
+  },
+  {
+    id: 'zoom-out',
+    name: '缩小界面',
+    description: '降低 Proma 界面的缩放比例',
+    defaultMac: 'Cmd+Minus',
+    defaultWin: 'Ctrl+Minus',
+    category: 'app',
+    readonly: true,
+  },
+  {
+    id: 'reset-zoom',
+    name: '重置界面缩放',
+    description: '恢复 Proma 界面的默认缩放比例',
+    defaultMac: 'Cmd+0',
+    defaultWin: 'Ctrl+0',
+    category: 'app',
+    readonly: true,
   },
   {
     id: 'toggle-mode',
@@ -91,6 +121,16 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
     category: 'navigation',
   },
   {
+    id: 'open-planning',
+    name: '打开任务/日程',
+    description: '打开或聚焦独立的 Todo、日程与定时任务窗口',
+    defaultMac: 'Cmd+Shift+T',
+    defaultWin: 'Ctrl+Shift+T',
+    category: 'global',
+    global: true,
+    localFallback: true,
+  },
+  {
     id: 'file-find',
     name: '查找',
     description: '在对话中搜索消息，或在文件预览/Diff 面板中查找文件内容',
@@ -107,13 +147,13 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
     category: 'navigation',
   },
 
-  // 编辑级（输入框格式化，仅 macOS — Cmd+B/S 被全局快捷键占用）
+  // 编辑级（输入框格式化 — macOS 上 Cmd+B 被切换侧边栏占用，改用 Ctrl+B；Windows 上 Ctrl+B 直接加粗）
   {
     id: 'editor-bold',
     name: '加粗 / 取消加粗',
-    description: '输入框中切换文字加粗（因 Cmd+B 已用于切换侧边栏）',
+    description: '输入框中切换文字加粗',
     defaultMac: 'Ctrl+B',
-    defaultWin: '',
+    defaultWin: 'Ctrl+B',
     category: 'edit',
     readonly: true,
   },

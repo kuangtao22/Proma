@@ -12,7 +12,7 @@ import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
 import { toast } from 'sonner'
 import { AlertTriangle, ArrowLeft, Bell, Check, Clock, Loader2, Pencil, Play, Settings, X } from 'lucide-react'
-import { detectIsWindows } from '@/lib/platform'
+import { detectIsWindows, WINDOW_CONTROLS_INSET_RIGHT } from '@/lib/platform'
 import { cn } from '@/lib/utils'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
@@ -34,12 +34,12 @@ import {
   automationToDraft,
   type AutomationDraft,
 } from '@/atoms/automation-atoms'
-import { agentWorkspacesAtom, agentSessionsAtom, agentChannelIdsAtom, currentAgentWorkspaceIdAtom } from '@/atoms/agent-atoms'
+import { agentWorkspacesAtom, agentSessionsAtom, currentAgentWorkspaceIdAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
-import { activeViewAtom } from '@/atoms/active-view'
-import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
+import { activeViewAtom, agentSkillsTabAtom } from '@/atoms/active-view'
 import { useOpenSession } from '@/hooks/useOpenSession'
 import { MarkdownRichEditor } from '@/components/diff/MarkdownRichEditor'
+import { LocalProjectBadge } from '@/components/agent/LocalProjectBadge'
 import type {
   AutomationFeishuNotificationTarget,
   AutomationNotificationTarget,
@@ -56,6 +56,36 @@ function formatTime(ts?: number): string {
   return new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
+/** 毫秒时间戳 → <input type="datetime-local"> 需要的本地 "YYYY-MM-DDTHH:MM" 字符串（无时区后缀） */
+function tsToDatetimeLocal(ts?: number): string {
+  if (!ts) return ''
+  const d = new Date(ts)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/** datetime-local 字符串（按本地时区解释）→ 毫秒时间戳；空串返回 undefined */
+function datetimeLocalToTs(value: string): number | undefined {
+  if (!value) return undefined
+  const ts = new Date(value).getTime()
+  return Number.isFinite(ts) ? ts : undefined
+}
+
+function getWeekdayPreset(days?: number[]): 'everyday' | 'weekdays' | 'weekends' | 'custom' {
+  const normalized = [...new Set(days ?? [])].sort((a, b) => a - b)
+  if (normalized.length === 0) return 'everyday'
+  if (normalized.join(',') === '1,2,3,4,5') return 'weekdays'
+  if (normalized.join(',') === '0,6') return 'weekends'
+  return 'custom'
+}
+
+function getWeekdaysFromPreset(value: string, current?: number[]): number[] {
+  if (value === 'weekdays') return [1, 2, 3, 4, 5]
+  if (value === 'weekends') return [0, 6]
+  if (value === 'custom') return current && current.length > 0 ? current : [1]
+  return []
+}
+
 function formatRunStatus(status: AutomationRun['status']): string {
   if (status === 'success') return '完成'
   if (status === 'error') return '失败'
@@ -67,7 +97,7 @@ function canPersistDraft(draft: AutomationDraft): boolean {
   return !!(draft.name.trim() && draft.prompt.trim())
 }
 
-/** 任务是否具备运行 / 启用所需的最小完整度（模型 + 工作区） */
+/** 任务是否具备运行 / 启用所需的最小完整度（模型 + 项目） */
 function isReadyToRun(draft: AutomationDraft): boolean {
   return canPersistDraft(draft) && !!draft.channelId && !!draft.workspaceId
 }
@@ -78,7 +108,7 @@ function listMissingFields(draft: AutomationDraft): string[] {
   if (!draft.name.trim()) missing.push('任务名称')
   if (!draft.prompt.trim()) missing.push('任务描述')
   if (!draft.channelId) missing.push('模型')
-  if (!draft.workspaceId) missing.push('工作区')
+  if (!draft.workspaceId) missing.push('项目')
   return missing
 }
 
@@ -89,9 +119,14 @@ function getDraftSignature(draft: AutomationDraft): string {
     prompt: draft.prompt.trim(),
     scheduleType: draft.scheduleType,
     intervalMinutes: draft.intervalMinutes,
+    activeWindowStart: draft.activeWindowStart ?? '',
+    activeWindowEnd: draft.activeWindowEnd ?? '',
+    activeWeekdays: draft.activeWeekdays ?? [],
     timeOfDay: draft.timeOfDay ?? '',
     dayOfWeek: draft.dayOfWeek ?? '',
     dayOfMonth: draft.dayOfMonth ?? '',
+    scheduledAt: draft.scheduledAt ?? '',
+    maxRuns: draft.maxRuns ?? '',
     channelId: draft.channelId,
     modelId: draft.modelId ?? '',
     workspaceId: draft.workspaceId ?? '',
@@ -108,9 +143,14 @@ function draftToCreateInput(draft: AutomationDraft): CreateAutomationInput {
     prompt: draft.prompt.trim(),
     scheduleType: draft.scheduleType,
     intervalMinutes: draft.intervalMinutes,
+    activeWindowStart: draft.activeWindowStart,
+    activeWindowEnd: draft.activeWindowEnd,
+    activeWeekdays: draft.activeWeekdays,
     timeOfDay: draft.timeOfDay,
     dayOfWeek: draft.dayOfWeek,
     dayOfMonth: draft.dayOfMonth,
+    scheduledAt: draft.scheduledAt,
+    maxRuns: draft.maxRuns ?? null,
     channelId: draft.channelId,
     modelId: draft.modelId,
     workspaceId: draft.workspaceId,
@@ -129,9 +169,14 @@ function draftToUpdateInput(draft: AutomationDraft): UpdateAutomationInput {
     prompt: draft.prompt.trim(),
     scheduleType: draft.scheduleType,
     intervalMinutes: draft.intervalMinutes,
+    activeWindowStart: draft.activeWindowStart ?? null,
+    activeWindowEnd: draft.activeWindowEnd ?? null,
+    activeWeekdays: draft.activeWeekdays ?? null,
     timeOfDay: draft.timeOfDay,
     dayOfWeek: draft.dayOfWeek,
     dayOfMonth: draft.dayOfMonth,
+    scheduledAt: draft.scheduledAt,
+    maxRuns: draft.maxRuns ?? null,
     channelId: draft.channelId,
     modelId: draft.modelId,
     workspaceId: draft.workspaceId ?? '',
@@ -174,14 +219,14 @@ function AutomationPromptEmptyGuide(): React.ReactElement {
         <div>
           <div className="text-[13px] font-semibold text-foreground">推荐：让 Proma Agent 创建</div>
           <div className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            在左侧会话里说清目标，并明确表示要求创建定时任务，Proma Agent 会生成任务描述，并补全周期、工作区和模型等配置，手动编辑更适合微调任务描述。
+            在左侧会话里说清目标，并明确表示要求创建定时任务，Proma Agent 会生成任务描述，并补全周期、项目和模型等配置，手动编辑更适合微调任务描述。
           </div>
         </div>
         <div className="h-px bg-border/50" />
         <div>
           <div className="text-[13px] font-medium text-foreground/85">手动编写时，只写任务本身</div>
           <div className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            例：检查 Proma 仓库新增 issue，主动回复问答类问题，不清楚的部分整理到工作区目录下的 .context/issue-faq.md 文档；真正的 Bug 或请求罗列后发给我，不要记录任何重复的信息。
+            例：检查 Proma 仓库新增 issue，主动回复问答类问题，不清楚的部分整理到项目级 Context 的 .context/issue-faq.md 文档；真正的 Bug 或请求罗列后发给我，不要记录任何重复的信息。
           </div>
         </div>
       </div>
@@ -238,22 +283,21 @@ function SaveStatusBadge({
   )
 }
 
-export function AutomationFormView(): React.ReactElement | null {
+export function AutomationFormView({ standalone = false }: { standalone?: boolean } = {}): React.ReactElement | null {
   const isWindows = React.useMemo(() => detectIsWindows(), [])
   const [formState, setFormState] = useAtom(automationFormAtom)
   const setAutomations = useSetAtom(automationsAtom)
   const workspaces = useAtomValue(agentWorkspacesAtom)
   const automations = useAtomValue(automationsAtom)
-  const agentChannelIds = useAtomValue(agentChannelIdsAtom)
   const [agentSessions, setAgentSessions] = useAtom(agentSessionsAtom)
   const activeSessionId = useAtomValue(activeSessionIdAtom)
   const currentAgentWorkspaceId = useAtomValue(currentAgentWorkspaceIdAtom)
   const setActiveView = useSetAtom(activeViewAtom)
-  const setSettingsOpen = useSetAtom(settingsOpenAtom)
-  const setSettingsTab = useSetAtom(settingsTabAtom)
+  const setAgentSkillsTab = useSetAtom(agentSkillsTabAtom)
   const openSession = useOpenSession()
 
   const [form, setForm] = React.useState<AutomationDraft | null>(null)
+  const [weekdayPresetOverride, setWeekdayPresetOverride] = React.useState<'custom' | null>(null)
   const [editingName, setEditingName] = React.useState(false)
   const [runningNow, setRunningNow] = React.useState(false)
   const [feishuBindings, setFeishuBindings] = React.useState<FeishuChatBinding[]>([])
@@ -275,9 +319,11 @@ export function AutomationFormView(): React.ReactElement | null {
 
   React.useEffect(() => {
     if (formState.open && formState.draft) {
-      setForm({ ...formState.draft })
-      lastSavedSignatureRef.current = formState.draft.id && canPersistDraft(formState.draft)
-        ? getDraftSignature(formState.draft)
+      const draft = formState.draft
+      setForm(draft)
+      setWeekdayPresetOverride(null)
+      lastSavedSignatureRef.current = draft.id && canPersistDraft(draft)
+        ? getDraftSignature(draft)
         : ''
       setSaveStatus('idle')
       setLastSavedAt(null)
@@ -299,7 +345,7 @@ export function AutomationFormView(): React.ReactElement | null {
   React.useEffect(() => {
     if (!formState.open) return
     window.electronAPI.listFeishuBindings()
-      .then(setFeishuBindings)
+      .then((bindings) => setFeishuBindings(bindings.filter((binding) => !binding.archived)))
       .catch((err: unknown) => {
         console.error('[定时任务] 获取飞书绑定失败:', err)
       })
@@ -463,7 +509,7 @@ export function AutomationFormView(): React.ReactElement | null {
   const handleRunNow = async (): Promise<void> => {
     const latest = latestFormRef.current
     if (!latest || !isReadyToRun(latest)) {
-      const missing = latest ? listMissingFields(latest) : ['任务名称', '任务描述', '模型', '工作区']
+      const missing = latest ? listMissingFields(latest) : ['任务名称', '任务描述', '模型', '项目']
       toast.error(`请先补全：${missing.join('、')}`)
       return
     }
@@ -477,7 +523,7 @@ export function AutomationFormView(): React.ReactElement | null {
       if (!automationId) throw new Error('任务尚未创建')
       await window.electronAPI.runAutomationNow(automationId)
       await refreshAutomations()
-      const sessions = await window.electronAPI.listAgentSessions()
+      const sessions = await window.electronAPI.listActiveAgentSessions()
       setAgentSessions(sessions)
     } catch (err) {
       console.error('[定时任务] 立即运行失败:', err)
@@ -555,7 +601,7 @@ export function AutomationFormView(): React.ReactElement | null {
     <div className="titlebar-no-drag absolute inset-0 z-10 bg-content-area flex animate-in fade-in duration-200">
       {/* 左栏：自然语言任务描述（主角） */}
       <div className="flex-1 min-w-0 flex flex-col">
-        <div className="flex items-center gap-2 px-6 py-4 flex-shrink-0">
+        <div className={cn('flex items-center gap-2 px-6 flex-shrink-0', standalone ? 'titlebar-drag-region pt-8 pb-4' : 'py-4')}>
           <button
             type="button"
             onClick={close}
@@ -567,7 +613,7 @@ export function AutomationFormView(): React.ReactElement | null {
           </button>
           <Clock className="size-4 text-primary flex-shrink-0" />
           {editingName ? (
-            <div className="flex items-center gap-1.5 flex-1 min-w-0">
+            <div className="titlebar-no-drag flex items-center gap-1.5 flex-1 min-w-0">
               <input
                 ref={nameInputRef}
                 value={form.name}
@@ -588,7 +634,7 @@ export function AutomationFormView(): React.ReactElement | null {
               </button>
             </div>
           ) : (
-            <div className="flex items-center gap-1.5 flex-1 min-w-0">
+            <div className="titlebar-no-drag flex items-center gap-1.5 flex-1 min-w-0">
               <span className="truncate text-sm font-semibold text-foreground">
                 {form.name.trim() || (isEdit ? '未命名任务' : '新建定时任务')}
               </span>
@@ -633,29 +679,10 @@ export function AutomationFormView(): React.ReactElement | null {
 
       {/* 右栏：配置 sidebar */}
       <div className="w-[340px] flex-shrink-0 border-l border-border/50 flex flex-col bg-content-area">
-        <div className="flex items-center justify-between gap-2 px-4 py-4 flex-shrink-0">
-          <span className="text-sm font-semibold text-foreground">配置</span>
-          <div className="flex items-center gap-1">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span>
-                  <button
-                    type="button"
-                    onClick={() => { void handleRunNow() }}
-                    disabled={runningNow || !isReadyToRun(form)}
-                    className="titlebar-no-drag h-7 px-2.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-sm"
-                  >
-                    {runningNow ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
-                    <span>{runningNow ? '运行中' : '运行一次'}</span>
-                  </button>
-                </span>
-              </TooltipTrigger>
-              {!isReadyToRun(form) && !runningNow && (
-                <TooltipContent side="bottom">
-                  请先补全：{listMissingFields(form).join('、')}
-                </TooltipContent>
-              )}
-            </Tooltip>
+        <div className={cn('relative flex items-center justify-between gap-2 px-4 flex-shrink-0', standalone ? 'titlebar-no-drag pt-8 pb-4' : 'py-4')}>
+          {standalone && <div className={cn('absolute inset-y-0 left-0 z-0 titlebar-drag-region', isWindows ? WINDOW_CONTROLS_INSET_RIGHT : 'right-0')} />}
+          <span className="relative z-[1] text-sm font-semibold text-foreground">配置</span>
+          <div className="relative z-[1] flex items-center gap-1">
             {!isWindows && (
             <button
               onClick={close}
@@ -694,9 +721,33 @@ export function AutomationFormView(): React.ReactElement | null {
               <div className="flex justify-between">
                 <span className="text-muted-foreground">下次运行</span>
                 <span className="text-foreground/80 tabular-nums">
-                  {live?.active ? formatTime(live?.nextRunAt) : '已暂停'}
+                  {live?.completedAt
+                    ? '已完成'
+                    : live?.active
+                      ? formatTime(live?.nextRunAt)
+                      : '已暂停'}
                 </span>
               </div>
+              {/* 已执行次数 / 上限：once 或设了 maxRuns 时才有展示意义 */}
+              {(live?.scheduleType === 'once' || live?.maxRuns !== undefined || (live?.runCount ?? 0) > 0) && (
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">已执行</span>
+                  <span className="text-foreground/80 tabular-nums">
+                    {live?.runCount ?? 0}
+                    {live?.scheduleType === 'once'
+                      ? ' / 1 次'
+                      : live?.maxRuns !== undefined
+                        ? ` / ${live.maxRuns} 次`
+                        : ' 次'}
+                  </span>
+                </div>
+              )}
+              {live?.completedAt && (
+                <div className="flex items-center gap-1.5 pt-0.5 text-emerald-600 dark:text-emerald-400">
+                  <Check className="size-3" />
+                  <span>任务已完成（重新启用可再跑一轮）</span>
+                </div>
+              )}
             </div>
           )}
 
@@ -705,7 +756,62 @@ export function AutomationFormView(): React.ReactElement | null {
             <Label>运行频率</Label>
             <Select
               value={form.scheduleType}
-              onValueChange={(v) => update({ scheduleType: v as AutomationDraft['scheduleType'] })}
+              onValueChange={(v) => {
+                const next = v as AutomationDraft['scheduleType']
+                // 默认值必须写入 draft：展示层 fallback 不会进入自动保存请求。
+                // 同时立即清除不适用字段，避免后端归一化后旧配置仍滞留本地并在切回时复活。
+                const clearIntervalFields = {
+                  activeWindowStart: undefined,
+                  activeWindowEnd: undefined,
+                  activeWeekdays: undefined,
+                }
+                if (next === 'interval') {
+                  update({
+                    scheduleType: next,
+                    intervalMinutes: form.intervalMinutes ?? 10,
+                    timeOfDay: undefined,
+                    dayOfWeek: undefined,
+                    dayOfMonth: undefined,
+                    scheduledAt: undefined,
+                  })
+                } else if (next === 'daily') {
+                  update({
+                    scheduleType: next,
+                    ...clearIntervalFields,
+                    timeOfDay: form.timeOfDay ?? '09:00',
+                    dayOfWeek: undefined,
+                    dayOfMonth: undefined,
+                    scheduledAt: undefined,
+                  })
+                } else if (next === 'weekly') {
+                  update({
+                    scheduleType: next,
+                    ...clearIntervalFields,
+                    timeOfDay: form.timeOfDay ?? '09:00',
+                    dayOfWeek: form.dayOfWeek ?? 1,
+                    dayOfMonth: undefined,
+                    scheduledAt: undefined,
+                  })
+                } else if (next === 'monthly') {
+                  update({
+                    scheduleType: next,
+                    ...clearIntervalFields,
+                    timeOfDay: form.timeOfDay ?? '09:00',
+                    dayOfWeek: undefined,
+                    dayOfMonth: form.dayOfMonth ?? 1,
+                    scheduledAt: undefined,
+                  })
+                } else {
+                  update({
+                    scheduleType: next,
+                    ...clearIntervalFields,
+                    timeOfDay: undefined,
+                    dayOfWeek: undefined,
+                    dayOfMonth: undefined,
+                    scheduledAt: form.scheduledAt ?? Date.now() + 60 * 60 * 1000,
+                  })
+                }
+              }}
             >
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -713,6 +819,7 @@ export function AutomationFormView(): React.ReactElement | null {
                 <SelectItem value="daily">每天定点</SelectItem>
                 <SelectItem value="weekly">每周定点</SelectItem>
                 <SelectItem value="monthly">每月定点</SelectItem>
+                <SelectItem value="once">仅运行一次</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -732,6 +839,76 @@ export function AutomationFormView(): React.ReactElement | null {
                 />
                 <span className="text-xs text-muted-foreground shrink-0">分钟一次</span>
               </div>
+              <div className="flex items-center justify-between pt-1">
+                <div>
+                  <Label htmlFor="auto-window-enabled">仅在每日时段内运行</Label>
+                  <p className="mt-0.5 text-xs text-muted-foreground">留空则全天按间隔运行</p>
+                </div>
+                <Switch
+                  id="auto-window-enabled"
+                  checked={!!(form.activeWindowStart && form.activeWindowEnd)}
+                  onCheckedChange={(enabled) => update(enabled
+                    ? { activeWindowStart: form.activeWindowStart ?? '09:00', activeWindowEnd: form.activeWindowEnd ?? '18:00' }
+                    : { activeWindowStart: undefined, activeWindowEnd: undefined })}
+                />
+              </div>
+              {form.activeWindowStart && form.activeWindowEnd && (
+                <div className="flex items-center gap-2 pt-1">
+                  <input
+                    aria-label="每日运行开始时间"
+                    type="time"
+                    value={form.activeWindowStart}
+                    onChange={(e) => update({ activeWindowStart: e.target.value })}
+                    className="flex h-9 min-w-0 flex-1 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  />
+                  <span className="text-xs text-muted-foreground">至</span>
+                  <input
+                    aria-label="每日运行结束时间"
+                    type="time"
+                    value={form.activeWindowEnd}
+                    onChange={(e) => update({ activeWindowEnd: e.target.value })}
+                    className="flex h-9 min-w-0 flex-1 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  />
+                </div>
+              )}
+              <div className="flex items-center justify-between pt-1">
+                <Label>运行日</Label>
+                <Select
+                  value={weekdayPresetOverride ?? getWeekdayPreset(form.activeWeekdays)}
+                  onValueChange={(value) => {
+                    if (value === 'custom') setWeekdayPresetOverride('custom')
+                    else setWeekdayPresetOverride(null)
+                    update({ activeWeekdays: getWeekdaysFromPreset(value, form.activeWeekdays) })
+                  }}
+                >
+                  <SelectTrigger className="h-9 w-[150px]"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="everyday">每天</SelectItem>
+                    <SelectItem value="weekdays">工作日（周一至周五）</SelectItem>
+                    <SelectItem value="weekends">周末（周六、周日）</SelectItem>
+                    <SelectItem value="custom">自定义</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {(weekdayPresetOverride ?? getWeekdayPreset(form.activeWeekdays)) === 'custom' && (
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  {AUTOMATION_WEEKDAY_OPTIONS.map((option) => {
+                    const selected = (form.activeWeekdays ?? []).includes(option.value)
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() => update({ activeWeekdays: selected
+                          ? (form.activeWeekdays ?? []).filter((day) => day !== option.value)
+                          : [...(form.activeWeekdays ?? []), option.value].sort((a, b) => a - b) })}
+                        className={cn('rounded-md border px-2.5 py-1 text-xs transition-colors', selected ? 'border-primary bg-primary text-primary-foreground' : 'border-input text-muted-foreground hover:bg-foreground/[0.04]')}
+                      >
+                        {option.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           )}
 
@@ -833,50 +1010,74 @@ export function AutomationFormView(): React.ReactElement | null {
             </div>
           )}
 
-          {/* 选择模型（定时任务只能跑 Agent，因此只显示已勾选为 Agent 兼容的渠道模型） */}
+          {/* once 模式：绝对日期 + 时刻（datetime-local） */}
+          {form.scheduleType === 'once' && (
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="auto-once-at">运行时间</Label>
+              <input
+                id="auto-once-at"
+                type="datetime-local"
+                value={tsToDatetimeLocal(form.scheduledAt)}
+                onChange={(e) => update({ scheduledAt: datetimeLocalToTs(e.target.value) })}
+                className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              />
+              <span className="pl-2.5 text-xs text-muted-foreground leading-relaxed">
+                任务将在该时刻运行一次后自动完成。适合"X 小时/天后跑一次"或某个具体时间点的一次性任务。
+              </span>
+            </div>
+          )}
+
+          {/* 运行次数上限（once 模式天然为 1 次，故不显示；其余循环模式可选叠加） */}
+          {form.scheduleType !== 'once' && (
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="auto-max-runs">运行次数上限</Label>
+              <div className="flex items-center gap-2">
+                <input
+                  id="auto-max-runs"
+                  type="number"
+                  min={1}
+                  placeholder="不限"
+                  value={form.maxRuns ?? ''}
+                  onChange={(e) => {
+                    const v = Number(e.target.value)
+                    update({ maxRuns: e.target.value === '' || !Number.isFinite(v) || v < 1 ? undefined : Math.floor(v) })
+                  }}
+                  className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                />
+                <span className="text-xs text-muted-foreground shrink-0">次后停止</span>
+              </div>
+              <span className="pl-2.5 text-xs text-muted-foreground leading-relaxed">
+                留空表示不限次。按实际执行次数计（成功 / 失败都算），达到上限后任务自动完成停用。
+              </span>
+            </div>
+          )}
+
+          {/* Pi supports any enabled model channel. */}
           <div className="flex flex-col gap-2">
             <Label>选择模型</Label>
-            {agentChannelIds.length === 0 ? (
-              <div className="flex items-center gap-2 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
-                <Settings size={14} className="shrink-0" />
-                <span>尚未启用任何 Agent 兼容渠道</span>
-                <button
-                  type="button"
-                  className="ml-auto text-xs underline underline-offset-2 hover:text-foreground transition-colors"
-                  onClick={() => {
-                    setSettingsTab('channels')
-                    setSettingsOpen(true)
-                  }}
-                >
-                  前往渠道设置
-                </button>
-              </div>
-            ) : (
-              <ModelSelector
-                filterChannelIds={agentChannelIds}
-                externalSelectedModel={selectedModel}
-                showChannelInTrigger
-                onModelSelect={(opt) => update({ channelId: opt.channelId, modelId: opt.modelId })}
-              />
-            )}
+            <ModelSelector
+              externalSelectedModel={selectedModel}
+              showChannelInTrigger
+              onModelSelect={(opt) => update({ channelId: opt.channelId, modelId: opt.modelId })}
+            />
           </div>
 
-          {/* 工作区（必选，默认填入当前会话所在工作区） */}
+          {/* 项目（必选，默认填入当前会话所在项目） */}
           <div className="flex flex-col gap-2">
-            <Label>工作区</Label>
+            <Label>项目</Label>
             {workspaces.length === 0 ? (
               <div className="flex items-center gap-2 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
                 <Settings size={14} className="shrink-0" />
-                <span>尚未创建任何工作区</span>
+                <span>尚未创建任何项目</span>
                 <button
                   type="button"
                   className="ml-auto text-xs underline underline-offset-2 hover:text-foreground transition-colors"
                   onClick={() => {
-                    setSettingsTab('agent')
-                    setSettingsOpen(true)
+                    setAgentSkillsTab('mcp')
+                    setActiveView('agent-skills')
                   }}
                 >
-                  前往 Agent 设置
+                  前往 MCP 管理
                 </button>
               </div>
             ) : (
@@ -884,10 +1085,18 @@ export function AutomationFormView(): React.ReactElement | null {
                 value={form.workspaceId ?? ''}
                 onValueChange={(v) => update({ workspaceId: v })}
               >
-                <SelectTrigger><SelectValue placeholder="选择工作区" /></SelectTrigger>
+                <SelectTrigger><SelectValue placeholder="选择项目" /></SelectTrigger>
                 <SelectContent>
                   {workspaces.map((ws) => (
-                    <SelectItem key={ws.id} value={ws.id}>{ws.name}</SelectItem>
+                    <SelectItem key={ws.id} value={ws.id}>
+                      <span className="flex items-center gap-1.5">
+                        <span>{ws.name}</span>
+                        <LocalProjectBadge
+                          projectRootPath={ws.projectRootPath}
+                          projectRootStatus={ws.projectRootStatus}
+                        />
+                      </span>
+                    </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
@@ -974,32 +1183,10 @@ export function AutomationFormView(): React.ReactElement | null {
           {/* 会话模式选择已隐藏：默认采用 daily（同日复用、跨日新建）。
               schema/scheduler/Agent 工具层仍保留 reuse 模式，方便老配置和高级用户继续使用。 */}
 
-          {/* 权限模式 */}
-          <div className="flex flex-col gap-2">
-            <Label>运行权限</Label>
-            <Select
-              value={form.permissionMode}
-              onValueChange={(v) => update({ permissionMode: v as AutomationDraft['permissionMode'] })}
-            >
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="bypassPermissions">完全自动</SelectItem>
-                <SelectItem value="auto">自动审批</SelectItem>
-              </SelectContent>
-            </Select>
-            <span className="text-xs text-muted-foreground leading-relaxed">
-              {form.permissionMode === 'bypassPermissions'
-                ? '所有工具调用自动允许（推荐用于无人值守）。'
-                : '由 SDK 内置审批器判断，危险操作仍会请求确认；无人值守时这些请求会一直挂起，需手动到会话中处理。'}
-            </span>
+          <div className="flex gap-2 rounded-lg bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400">
+            <AlertTriangle className="size-4 shrink-0 mt-0.5" />
+            <span>此任务将以「完全权限」无人值守运行，可自主读写文件、执行命令。请确认任务内容安全可信。</span>
           </div>
-
-          {form.permissionMode === 'bypassPermissions' && (
-            <div className="flex gap-2 rounded-lg bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400">
-              <AlertTriangle className="size-4 shrink-0 mt-0.5" />
-              <span>此任务将以「完全权限」无人值守运行，可自主读写文件、执行命令。请确认任务内容安全可信。</span>
-            </div>
-          )}
 
           {/* 运行历史（编辑模式） */}
           {isEdit && live && (
@@ -1041,17 +1228,28 @@ export function AutomationFormView(): React.ReactElement | null {
             </div>
           )}
         </div>
-        {/* 底部运行测试按钮 */}
-        <div className="flex-shrink-0 px-4 py-3 border-t border-border/50 bg-content-area">
-          <button
-            type="button"
-            onClick={() => { void handleRunNow() }}
-            disabled={runningNow || !canPersistDraft(form)}
-            className="titlebar-no-drag w-full h-8 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50 transition-colors flex items-center justify-center gap-1.5 shadow-sm"
-          >
-            {runningNow ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
-            <span>{runningNow ? '运行中' : '运行测试'}</span>
-          </button>
+        {/* 底部运行一次按钮 */}
+        <div className="flex-shrink-0 px-4 py-6 border-t border-border/50 bg-content-area">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="w-full">
+                <button
+                  type="button"
+                  onClick={() => { void handleRunNow() }}
+                  disabled={runningNow || !isReadyToRun(form)}
+                  className="titlebar-no-drag w-full h-9 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50 transition-colors flex items-center justify-center gap-1.5 shadow-sm"
+                >
+                  {runningNow ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
+                  <span>{runningNow ? '运行中' : '运行一次'}</span>
+                </button>
+              </span>
+            </TooltipTrigger>
+            {!isReadyToRun(form) && !runningNow && (
+              <TooltipContent side="top">
+                请先补全：{listMissingFields(form).join('、')}
+              </TooltipContent>
+            )}
+          </Tooltip>
         </div>
       </div>
     </div>

@@ -7,19 +7,33 @@
  */
 
 import * as React from 'react'
-import { useAtomValue, useSetAtom, useAtom } from 'jotai'
-import { tabsAtom, activeTabIdAtom, activeTabAtom } from '@/atoms/tab-atoms'
+import type { BrowserStateChange, BrowserViewState } from '@proma/shared'
+import { useAtomValue, useSetAtom, useAtom, useStore } from 'jotai'
+import {
+  tabsAtom,
+  activeTabIdAtom,
+  activeTabAtom,
+  scratchPadPanelOpenAtom,
+  rightWorkspaceSplitRatioAtom,
+} from '@/atoms/tab-atoms'
 import { Panel } from '@/components/app-shell/Panel'
 import { WelcomeView } from '@/components/welcome/WelcomeView'
 import { previewPanelOpenMapAtom, previewSplitRatioAtom } from '@/atoms/preview-atoms'
 import { PreviewPanel } from '@/components/diff/PreviewPanel'
+import { ScratchPadPane } from '@/components/scratch-pad/ScratchPadView'
+import { closeScratchInSplit } from '@/components/scratch-pad/scratch-pad-opener'
 import { useTrackSessionView } from '@/hooks/useTrackSessionView'
 import { TabBar } from './TabBar'
 import { TabContent } from './TabContent'
 import { AutomationFormView } from '@/components/automation/AutomationFormView'
-import { AutomationsListView } from '@/components/automation/AutomationsListView'
+import { PlanningView } from '@/components/planning/PlanningView'
+import { AgentSkillsView } from '@/components/agent-skills/AgentSkillsView'
 import { automationFormAtom } from '@/atoms/automation-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
+import { interfaceVariantAtom } from '@/atoms/theme'
+import { cn } from '@/lib/utils'
+import { browserPanelOpenMapAtom, browserPendingNavigationMapAtom, browserStateMapAtom } from '@/atoms/browser-atoms'
+import { BrowserPanel } from '@/components/browser/BrowserPanel'
 
 export function MainArea(): React.ReactElement {
   // 记录每个会话上次停留的视图（对话 / 预览），供切回时重建预览 Tab
@@ -31,19 +45,69 @@ export function MainArea(): React.ReactElement {
   const activeTab = useAtomValue(activeTabAtom)
   const automationFormOpen = useAtomValue(automationFormAtom).open
   const activeView = useAtomValue(activeViewAtom)
+  const interfaceVariant = useAtomValue(interfaceVariantAtom)
+  const isClassic = interfaceVariant === 'classic'
+  const store = useStore()
 
   // Tab 内容渲染降级为非紧急：TabBar 立即高亮新 tab，主区域昂贵渲染（含 PreviewPanel 中
   // DiffTabContent → ProseMirror editor mount + Shiki tokenize）让出主线程，避免点击 tab
   // 后必须等主区域渲染完才能看到 tab 切换效果
   const deferredActiveTabId = React.useDeferredValue(activeTabId)
+  // Agent 历史当前是完整 DOM，切换时使用当前 active tab，避免 deferred value 让旧会话继续占屏。
+  // Chat/Preview 仍保留 deferred 渲染，避免它们的重型编辑器阻塞 TabBar 响应。
+  const contentTabId = activeTab?.type === 'agent' ? activeTabId : deferredActiveTabId
 
   const previewOpenMap = useAtomValue(previewPanelOpenMapAtom)
+  const [browserOpenMap, setBrowserOpenMap] = useAtom(browserPanelOpenMapAtom)
+  const [browserStateMap, setBrowserStateMap] = useAtom(browserStateMapAtom)
+  const setPendingNavigationMap = useSetAtom(browserPendingNavigationMapAtom)
   const [splitRatio, setSplitRatio] = useAtom(previewSplitRatioAtom)
+  const [rightWorkspaceRatio, setRightWorkspaceRatio] = useAtom(rightWorkspaceSplitRatioAtom)
   const previewDragging = React.useRef(false)
+  const rightWorkspaceDragging = React.useRef(false)
+  const browserSessionId = activeTab?.type === 'agent' ? activeTab.sessionId : null
 
+  const publishBrowserState = React.useCallback((state: BrowserStateChange) => {
+    if ('closed' in state) {
+      setBrowserOpenMap((previous) => { const next = new Map(previous); next.set(state.sessionId, false); return next })
+      setBrowserStateMap((previous) => { const next = new Map(previous); next.delete(state.sessionId); return next })
+      setPendingNavigationMap((previous) => { const next = new Map(previous); next.delete(state.sessionId); return next })
+      return
+    }
+    setBrowserStateMap((previous) => { const next = new Map(previous); next.set(state.sessionId, state); return next })
+    setBrowserOpenMap((previous) => { const next = new Map(previous); next.set(state.sessionId, true); return next })
+  }, [setBrowserOpenMap, setBrowserStateMap, setPendingNavigationMap])
+
+  React.useEffect(() => {
+    // Vite renderer 可在 preload 热重载前先更新；旧 bridge 时浏览器功能不可用，
+    // 但绝不能让整个主界面崩溃。完整 Electron preload 就绪后会正常订阅。
+    const subscribe = (window.electronAPI as Partial<typeof window.electronAPI>).onAgentBrowserStateChanged
+    if (typeof subscribe !== 'function') return
+    return subscribe(publishBrowserState)
+  }, [publishBrowserState])
+
+  React.useEffect(() => {
+    if (!browserSessionId) return
+    const getState = (window.electronAPI as Partial<typeof window.electronAPI>).getAgentBrowserState
+    if (typeof getState !== 'function') return
+    let cancelled = false
+    void getState(browserSessionId)
+      .then((state) => {
+        if (!cancelled && state) publishBrowserState(state)
+      })
+      // 后台会话及已删除会话会被主进程拒绝或返回空状态；无需打断当前界面。
+      .catch(() => undefined)
+    return () => { cancelled = true }
+  }, [browserSessionId, publishBrowserState])
+
+  const showBrowserPanel = !!browserSessionId && (browserOpenMap.get(browserSessionId) ?? false) && activeView === 'conversations'
+  const browserState = browserSessionId ? browserStateMap.get(browserSessionId) ?? null : null
   const previewOpen =
-    activeTab?.type === 'agent' && (previewOpenMap.get(activeTab.sessionId) ?? false)
+    activeTab?.type === 'agent' && (previewOpenMap.get(activeTab.sessionId) ?? false) && !showBrowserPanel
   const previewSessionId = activeTab?.type === 'agent' ? activeTab.sessionId : null
+  const scratchPanelOpen = useAtomValue(scratchPadPanelOpenAtom)
+  const showScratchPanel =
+    activeTab?.type === 'agent' && scratchPanelOpen && activeView === 'conversations' && !showBrowserPanel
 
   // 关闭动画状态：当 previewOpen 从 true → false 时，播放退出动画再移除 DOM
   // 在 render 阶段同步派生 closing，避免中间帧出现 flex: 1 1 auto 导致左侧瞬间跳到 100% 宽
@@ -67,7 +131,10 @@ export function MainArea(): React.ReactElement {
     prevPreviewStateRef.current = { open: previewOpen, sessionId: previewSessionId }
   }, [previewOpen, previewSessionId])
 
-  const showPreview = (previewOpen || closing) && previewSessionId
+  const showPreview = (previewOpen || closing) && previewSessionId && activeView === 'conversations'
+  const showPreviewClosingOnly = closing && !previewOpen
+  const showPreviewPane = !!showPreview && !(showPreviewClosingOnly && showScratchPanel)
+  const showBothRightPanels = showPreviewPane && showScratchPanel
 
   const handlePreviewDragStart = React.useCallback((e: React.MouseEvent) => {
     e.preventDefault()
@@ -105,6 +172,46 @@ export function MainArea(): React.ReactElement {
     document.addEventListener('mouseup', onMouseUp)
   }, [splitRatio, setSplitRatio])
 
+  const handleRightWorkspaceDragStart = React.useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    rightWorkspaceDragging.current = true
+    const startX = e.clientX
+    const startRatio = rightWorkspaceRatio
+    const containerEl = (e.currentTarget as HTMLElement).closest('[data-right-workspace]') as HTMLElement | null
+    const containerWidth = containerEl?.clientWidth ?? 1
+    let rafId = 0
+
+    document.body.style.userSelect = 'none'
+    document.body.style.cursor = 'col-resize'
+    document.querySelectorAll('iframe').forEach((f) => { (f as HTMLElement).style.pointerEvents = 'none' })
+
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!rightWorkspaceDragging.current) return
+      if (rafId) return
+      rafId = requestAnimationFrame(() => {
+        rafId = 0
+        const delta = ev.clientX - startX
+        const newRatio = Math.max(0.3, Math.min(0.7, startRatio + delta / containerWidth))
+        setRightWorkspaceRatio(newRatio)
+      })
+    }
+    const onMouseUp = () => {
+      rightWorkspaceDragging.current = false
+      if (rafId) cancelAnimationFrame(rafId)
+      document.body.style.userSelect = ''
+      document.body.style.cursor = ''
+      document.querySelectorAll('iframe').forEach((f) => { (f as HTMLElement).style.pointerEvents = '' })
+      document.removeEventListener('mousemove', onMouseMove)
+      document.removeEventListener('mouseup', onMouseUp)
+    }
+    document.addEventListener('mousemove', onMouseMove)
+    document.addEventListener('mouseup', onMouseUp)
+  }, [rightWorkspaceRatio, setRightWorkspaceRatio])
+
+  const handleCloseScratchPanel = React.useCallback(() => {
+    closeScratchInSplit(store)
+  }, [store])
+
   React.useEffect(() => {
     if (tabs.length === 0) {
       console.warn('[FLASH-DEBUG] MainArea: tabs.length === 0, showing WelcomeView!', new Error().stack)
@@ -131,17 +238,24 @@ export function MainArea(): React.ReactElement {
       }
     : undefined
 
-  // 左侧容器宽度：预览打开时固定占 splitRatio；其他情况（含 closing 动画期间）
+  // 左侧容器宽度：右侧工作区打开时固定占 splitRatio；其他情况（含 closing 动画期间）
   // 直接 1 1 auto 占满——closing 时右侧 absolute 脱离 flex 流，所以左侧自然占 100%。
-  const leftFlexStyle: React.CSSProperties = (previewOpen && previewSessionId)
-    ? { flex: `0 0 calc(${splitRatio * 100}% - 4px)` }
+  const showRightPanel = showBrowserPanel || showScratchPanel || showPreviewPane
+  const leftFlexStyle: React.CSSProperties = showRightPanel
+    ? { flex: `0 0 calc(${splitRatio * 100}% - 6px)` }
+    : { flex: '1 1 auto' }
+  const previewPaneStyle: React.CSSProperties = showBothRightPanels
+    ? { flex: `0 0 calc(${rightWorkspaceRatio * 100}% - 4px)` }
+    : { flex: '1 1 auto' }
+  const scratchPaneStyle: React.CSSProperties = showBothRightPanels
+    ? { flex: `0 0 calc(${(1 - rightWorkspaceRatio) * 100}% - 4px)` }
     : { flex: '1 1 auto' }
 
   return (
     <>
       <Panel
         variant="grow"
-        className="bg-content-area rounded-2xl shadow-xl"
+        className={cn('bg-content-area', isClassic && 'rounded-2xl shadow-xl dark:shadow-sm')}
       >
         <div className="flex flex-1 min-h-0 relative overflow-hidden" data-split-container>
           {/* 左侧：TabBar + TabContent（始终保持在同一 DOM 位置，避免 Tab 切换时 unmount）
@@ -149,17 +263,19 @@ export function MainArea(): React.ReactElement {
               视觉上像"内容从右向左推送"。让左侧瞬间变宽，由右侧 absolute 滑出动画
               覆盖期内呈现"被剥离"的视觉效果。 */}
           <div
-            className="flex flex-col min-w-0 h-full relative"
+            className={cn('flex flex-col min-w-0 h-full relative', showPreview && 'mr-0.5')}
             style={leftFlexStyle}
           >
-            {activeView === 'automations' ? (
+            {activeView === 'planning' ? (
               automationFormOpen ? (
-                // 定时任务设置页：与列表同层级替换中间区，不经过 TabBar，避免切换时闪出会话 Tab。
+                // 自动化设置页：与任务/日程同层级替换中间区，不经过 TabBar。
                 <AutomationFormView />
               ) : (
-                // Automations 列表视图：全屏取代 TabBar + TabContent
-                <AutomationsListView />
+                <PlanningView />
               )
+            ) : activeView === 'agent-skills' ? (
+              // Agent 技能视图：全屏取代 TabBar + TabContent
+              <AgentSkillsView />
             ) : (
               <>
                 <TabBar />
@@ -168,32 +284,60 @@ export function MainArea(): React.ReactElement {
                   <AutomationFormView />
                 ) : tabs.length === 0 ? (
                   <WelcomeView />
-                ) : deferredActiveTabId ? (
+                ) : contentTabId ? (
                   <div className="flex-1 min-h-0 titlebar-no-drag">
-                    <TabContent tabId={deferredActiveTabId} />
+                    <TabContent tabId={contentTabId} />
                   </div>
                 ) : null}
               </>
             )}
           </div>
 
-          {/* 右侧：预览面板。关闭动画期间脱离 flex 流，向右滑出 */}
-          {showPreview && (
+          {/* 右侧：预览/草稿工作区。Preview 和草稿可在同一右侧槽位内并排显示。 */}
+          {showRightPanel && (
             <div
-              className={closing ? 'animate-preview-slide-out' : 'flex flex-1 min-w-0'}
-              style={closingOverlayStyle}
+              className={cn(closing && !showScratchPanel ? 'animate-preview-slide-out' : 'flex flex-1 min-w-0')}
+              style={closing && !showScratchPanel ? closingOverlayStyle : undefined}
               onAnimationEnd={(e) => {
                 if (closing && e.target === e.currentTarget) setClosingState(false)
               }}
             >
-              {!closing && (
+              {!(closing && !showScratchPanel) && (
                 <div
                   className="w-[8px] cursor-col-resize bg-border/40 hover:bg-primary/30 active:bg-primary/50 transition-colors flex-shrink-0 self-stretch"
                   onMouseDown={handlePreviewDragStart}
                 />
               )}
-              <div className="flex-1 min-w-0 h-full overflow-hidden">
-                <PreviewPanel sessionId={previewSessionId} />
+              <div className="flex flex-1 min-w-0 h-full overflow-hidden" data-right-workspace>
+                {showBrowserPanel && browserSessionId && (
+                  <div className="min-w-0 h-full overflow-hidden flex-1">
+                    <BrowserPanel
+                      sessionId={browserSessionId}
+                      state={browserState}
+                      onClose={() => {
+                        setBrowserOpenMap((previous) => { const next = new Map(previous); next.set(browserSessionId, false); return next })
+                        setBrowserStateMap((previous) => { const next = new Map(previous); next.delete(browserSessionId); return next })
+                        setPendingNavigationMap((previous) => { const next = new Map(previous); next.delete(browserSessionId); return next })
+                      }}
+                    />
+                  </div>
+                )}
+                {showPreviewPane && previewSessionId && (
+                  <div className="min-w-0 h-full overflow-hidden" style={previewPaneStyle}>
+                    <PreviewPanel sessionId={previewSessionId} />
+                  </div>
+                )}
+                {showBothRightPanels && (
+                  <div
+                    className="w-[8px] cursor-col-resize bg-border/40 hover:bg-primary/30 active:bg-primary/50 transition-colors flex-shrink-0 self-stretch"
+                    onMouseDown={handleRightWorkspaceDragStart}
+                  />
+                )}
+                {showScratchPanel && (
+                  <div className="min-w-0 h-full overflow-hidden" style={scratchPaneStyle}>
+                    <ScratchPadPane onClose={handleCloseScratchPanel} />
+                  </div>
+                )}
               </div>
             </div>
           )}

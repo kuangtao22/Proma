@@ -38,10 +38,10 @@ jobs:
       - name: 安装 Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: 安装依赖
-        run: bun install
+        run: bun install --frozen-lockfile
 
       # macOS 代码签名准备（需要配置 MAC_CERTS / MAC_CERTS_PASSWORD secrets，未配置则跳过签名）
       - name: 导入 macOS 签名证书
@@ -64,16 +64,29 @@ jobs:
 
           rm $RUNNER_TEMP/cert.p12
 
-      - name: 构建 LAN Bridge 移动端
-        run: bun run --filter='@proma/mobile' build
-
-      - name: 构建 Electron 应用
-        run: bun run electron:build
+      - name: 准备 Electron 打包资源
+        run: bun run --filter='@proma/electron' package:prepare
 
       - name: 打包 (macOS arm64)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --mac --arm64 --publish never
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for i in 1 2 3; do
+            if npx electron-builder --mac --arm64 --publish never; then
+              exit 0
+            fi
+
+            if [ "$i" -lt 3 ]; then
+              echo "Attempt $i failed, retrying in 10s..."
+              sleep 10
+            fi
+          done
+
+          echo "macOS ARM64 packaging failed after 3 attempts"
+          exit 1
         working-directory: apps/electron
 
       - name: 上传产物
@@ -99,10 +112,10 @@ jobs:
       - name: 安装 Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: 安装依赖
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - name: 导入 macOS 签名证书
         if: ${{ env.MAC_CERTS != '' }}
@@ -124,16 +137,29 @@ jobs:
 
           rm $RUNNER_TEMP/cert.p12
 
-      - name: 构建 LAN Bridge 移动端
-        run: bun run --filter='@proma/mobile' build
-
-      - name: 构建 Electron 应用
-        run: bun run electron:build
+      - name: 准备 Electron 打包资源
+        run: bun run --filter='@proma/electron' package:prepare
 
       - name: 打包 (macOS x64)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --mac --x64 --publish never
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for i in 1 2 3; do
+            if npx electron-builder --mac --x64 --publish never; then
+              exit 0
+            fi
+
+            if [ "$i" -lt 3 ]; then
+              echo "Attempt $i failed, retrying in 15s..."
+              sleep 15
+            fi
+          done
+
+          echo "macOS x64 packaging failed after 3 attempts"
+          exit 1
         working-directory: apps/electron
 
       - name: 上传产物
@@ -159,16 +185,13 @@ jobs:
       - name: 安装 Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: 安装依赖
-        run: bun install
+        run: bun install --frozen-lockfile
 
-      - name: 构建 LAN Bridge 移动端
-        run: bun run --filter='@proma/mobile' build
-
-      - name: 构建 Electron 应用
-        run: bun run electron:build
+      - name: 准备 Electron 打包资源
+        run: bun run --filter='@proma/electron' package:prepare
 
       - name: 打包 (Windows)
         env:
@@ -211,6 +234,34 @@ jobs:
       - name: 列出产物
         run: find out -type f | head -50
 
+      - name: 合并自动更新元数据
+        shell: bash
+        run: |
+          ruby -ryaml <<'RUBY'
+          arm = YAML.load_file('out/mac-arm64/latest-mac.yml')
+          intel = YAML.load_file('out/mac-x64/latest-mac.yml')
+          raise 'macOS 更新元数据版本不一致' unless arm['version'] == intel['version']
+
+          files = (arm.fetch('files') + intel.fetch('files')).uniq { |file| file.fetch('url') }
+          preferred = files.find { |file| file.fetch('url').include?('arm64') && file.fetch('url').end_with?('.zip') }
+          preferred ||= files.find { |file| file.fetch('url').end_with?('.zip') }
+          raise 'macOS 更新元数据缺少 ZIP 产物' unless preferred
+
+          merged = arm.merge(
+            'files' => files,
+            'path' => preferred.fetch('url'),
+            'sha512' => preferred.fetch('sha512'),
+          )
+          File.write('out/latest-mac.yml', YAML.dump(merged))
+          RUBY
+
+          mkdir -p out/release-assets
+          find out/mac-arm64 out/mac-x64 out/win-x64 -maxdepth 1 -type f \
+            \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.blockmap' -o -name 'latest.yml' \) \
+            -exec cp {} out/release-assets/ \;
+          cp out/latest-mac.yml out/release-assets/latest-mac.yml
+          find out/release-assets -maxdepth 1 -type f -print
+
       - name: 创建 Release 并上传
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -220,12 +271,8 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "${TAG}" \
             --generate-notes \
-            out/mac-arm64/*.dmg out/mac-arm64/*.zip \
-            out/mac-x64/*.dmg out/mac-x64/*.zip \
-            out/win-x64/*.exe \
+            out/release-assets/* \
             || gh release upload "${TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --clobber \
-              out/mac-arm64/*.dmg out/mac-arm64/*.zip \
-              out/mac-x64/*.dmg out/mac-x64/*.zip \
-              out/win-x64/*.exe
+              out/release-assets/*

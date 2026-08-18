@@ -21,13 +21,16 @@ import {
   openTab,
 } from '@/atoms/tab-atoms'
 import { shortcutOverridesAtom, sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
+import { shortcutGuideOpenAtom } from '@/atoms/shortcut-guide'
 import {
   agentPendingPromptAtom,
   agentSessionDraftHtmlAtom,
   agentSessionDraftsAtom,
+  agentSessionDraftSyncVersionsAtom,
   agentSessionsAtom,
   currentAgentSessionIdAtom,
   agentChannelIdAtom,
+  agentModelIdAtom,
   currentAgentWorkspaceIdAtom,
   agentWorkspacesAtom,
   agentAttachedFilesMapAtom,
@@ -35,6 +38,7 @@ import {
 import {
   chatPendingMessageAtom,
   conversationDraftsAtom,
+  conversationDraftSyncVersionsAtom,
   conversationsAtom,
   currentConversationIdAtom,
   selectedModelAtom,
@@ -48,6 +52,11 @@ import {
   updateShortcutOverrides,
 } from '@/lib/shortcut-registry'
 import { getFileParentPath } from '@/lib/file-utils'
+import {
+  shouldFallbackVoiceDictationToActiveTab,
+  VOICE_DICTATION_CLEAR_PREVIEW_EVENT,
+  VOICE_DICTATION_PREVIEW_EVENT,
+} from '@/lib/voice-input-focus'
 
 /**
  * 快捷键初始化 + 全局 Handler 注册
@@ -60,6 +69,7 @@ export function GlobalShortcuts(): null {
   const channelFormDirty = useAtomValue(channelFormDirtyAtom)
   const setSettingsCloseRequested = useSetAtom(settingsCloseRequestedAtom)
   const [searchOpen, setSearchOpen] = useAtom(searchDialogOpenAtom)
+  const [shortcutGuideOpen, setShortcutGuideOpen] = useAtom(shortcutGuideOpenAtom)
   const [sidebarCollapsed, setSidebarCollapsed] = useAtom(sidebarCollapsedAtom)
   const setShortcutOverrides = useSetAtom(shortcutOverridesAtom)
   const shortcutOverrides = useAtomValue(shortcutOverridesAtom)
@@ -95,6 +105,10 @@ export function GlobalShortcuts(): null {
 
   const handleCloseTab = useCallback(() => {
     // 浮窗优先：有浮窗打开时 Cmd+W 先关闭浮窗而非 tab
+    if (shortcutGuideOpen) {
+      setShortcutGuideOpen(false)
+      return
+    }
     if (settingsOpen) {
       // 渠道表单有未保存内容时，通知 SettingsPanel 弹出确认对话框
       if (channelFormDirty) {
@@ -111,7 +125,7 @@ export function GlobalShortcuts(): null {
 
     if (!activeTabId) return
     requestClose(activeTabId)
-  }, [settingsOpen, setSettingsOpen, channelFormDirty, setSettingsCloseRequested, searchOpen, setSearchOpen, activeTabId, requestClose])
+  }, [shortcutGuideOpen, setShortcutGuideOpen, settingsOpen, setSettingsOpen, channelFormDirty, setSettingsCloseRequested, searchOpen, setSearchOpen, activeTabId, requestClose])
 
   // 监听菜单 IPC 事件（Cmd+W 被 Electron 菜单拦截后通过 IPC 转发）
   useEffect(() => {
@@ -134,6 +148,16 @@ export function GlobalShortcuts(): null {
   useShortcut(
     'global-search',
     useCallback(() => setSearchOpen(true), [setSearchOpen]),
+  )
+
+  // Cmd+Shift+T / Ctrl+Shift+T → 打开或聚焦独立任务/日程窗口
+  useShortcut(
+    'open-planning',
+    useCallback(() => {
+      void window.electronAPI.openPlanningWindow().catch((error) => {
+        console.error('[任务/日程] 打开独立窗口失败:', error)
+      })
+    }, []),
   )
 
   // Cmd+N → 新建对话/会话（根据当前模式）
@@ -204,11 +228,13 @@ export function GlobalShortcuts(): null {
         if (data.mode === 'agent') {
           // Agent 模式：创建会话 + 保存附件到 session 目录
           const channelId = store.get(agentChannelIdAtom) || undefined
+          const modelId = store.get(agentModelIdAtom) || undefined
           const workspaceId = store.get(currentAgentWorkspaceIdAtom) || undefined
           const meta = await window.electronAPI.createAgentSession(
             undefined,
             channelId,
             workspaceId,
+            modelId,
           )
           // 更新 atom 状态
           store.set(agentSessionsAtom, (prev) => [meta, ...prev])
@@ -339,16 +365,39 @@ export function GlobalShortcuts(): null {
   // ===== 语音输入 → 写入当前 Proma 输入框 =====
 
   useEffect(() => {
-    const cleanup = window.electronAPI.onVoiceDictationInsertText(({ text }) => {
-      const trimmed = text.trim()
-      if (!trimmed) return
+    const cleanupPreview = window.electronAPI.onVoiceDictationPreviewText((data) => {
+      if (!data.text.trim()) return
+      window.dispatchEvent(new CustomEvent(VOICE_DICTATION_PREVIEW_EVENT, { detail: data }))
+    })
+    const cleanupClearPreview = window.electronAPI.onVoiceDictationClearPreviewText((data) => {
+      window.dispatchEvent(new CustomEvent(VOICE_DICTATION_CLEAR_PREVIEW_EVENT, { detail: data }))
+    })
+    const cleanup = window.electronAPI.onVoiceDictationInsertText((data) => {
+      const acknowledgeDelivery = (delivered: boolean): void => {
+        window.electronAPI.acknowledgeVoiceDictationTextDelivery({
+          sessionId: data.sessionId,
+          delivered,
+        })
+      }
+      const trimmed = data.text.trim()
+      if (!trimmed) {
+        acknowledgeDelivery(false)
+        return
+      }
 
       const insertedAtCursor = !window.dispatchEvent(new CustomEvent('proma:insert-voice-dictation-text', {
         cancelable: true,
-        detail: { text: trimmed },
+        detail: { ...data, text: trimmed },
       }))
       if (insertedAtCursor) {
+        acknowledgeDelivery(true)
         window.dispatchEvent(new CustomEvent('proma:focus-input'))
+        return
+      }
+
+      if (!shouldFallbackVoiceDictationToActiveTab(data.targetInputId)) {
+        console.warn('[语音输入] 冻结的输入目标已不可用，已丢弃听写结果:', data.targetInputId)
+        acknowledgeDelivery(false)
         return
       }
 
@@ -362,7 +411,10 @@ export function GlobalShortcuts(): null {
           : { type: 'chat' as const, sessionId: store.get(currentConversationIdAtom) }
       const target = activeTab ?? fallbackTarget
 
-      if (!target.sessionId) return
+      if (!target.sessionId) {
+        acknowledgeDelivery(false)
+        return
+      }
 
       store.set(activeViewAtom, 'conversations')
 
@@ -381,7 +433,13 @@ export function GlobalShortcuts(): null {
           map.delete(sessionId)
           return map
         })
+        store.set(agentSessionDraftSyncVersionsAtom, (prev) => {
+          const map = new Map(prev)
+          map.set(sessionId, (map.get(sessionId) ?? 0) + 1)
+          return map
+        })
         window.dispatchEvent(new CustomEvent('proma:focus-input'))
+        acknowledgeDelivery(true)
         return
       }
 
@@ -395,10 +453,23 @@ export function GlobalShortcuts(): null {
           map.set(conversationId, current ? `${current}\n${trimmed}` : trimmed)
           return map
         })
+        store.set(conversationDraftSyncVersionsAtom, (prev) => {
+          const map = new Map(prev)
+          map.set(conversationId, (map.get(conversationId) ?? 0) + 1)
+          return map
+        })
         window.dispatchEvent(new CustomEvent('proma:focus-input'))
+        acknowledgeDelivery(true)
+        return
       }
+
+      acknowledgeDelivery(false)
     })
-    return cleanup
+    return () => {
+      cleanupPreview()
+      cleanupClearPreview()
+      cleanup()
+    }
   }, [store])
 
   // ===== 菜单栏 → 打开 / 创建会话 =====

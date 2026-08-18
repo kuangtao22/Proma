@@ -4,6 +4,17 @@ export default {
   content: [
     './src/renderer/**/*.{js,ts,jsx,tsx}',
   ],
+  // 主题 class 由运行时根据设置拼接到 <html>，Tailwind 无法从 TSX 静态扫描到。
+  // 必须 safelist，否则 @layer base 中对应的 CSS 变量块会在构建时被裁掉。
+  safelist: [
+    'theme-ocean-light',
+    'theme-ocean-dark',
+    'theme-forest-light',
+    'theme-forest-dark',
+    'theme-slate-light',
+    'theme-slate-dark',
+    'theme-terminal-dark',
+  ],
   theme: {
     extend: {
       colors: {
@@ -73,8 +84,8 @@ export default {
         DEFAULT: 'calc(var(--radius) - 2px)',
         md: 'calc(var(--radius) - 2px)',
         lg: 'var(--radius)',
-        xl: 'calc(var(--radius) + 4px)',
-        '2xl': 'calc(var(--radius) + 8px)',
+        xl: 'calc(var(--radius) + var(--radius-xl-extra, 2px))',
+        '2xl': 'calc(var(--radius) + var(--radius-2xl-extra, 4px))',
       },
       // ===== 阴影：覆写 Tailwind 内置的 sm/md/lg/xl/DEFAULT =====
       // 现有 78 处 shadow-md / shadow-lg 等代码无需改动，自动吃多层柔阴影 + 主题自适应

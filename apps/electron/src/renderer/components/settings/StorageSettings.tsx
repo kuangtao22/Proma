@@ -1,11 +1,11 @@
 /**
  * StorageSettings — 磁盘管理设置面板
  *
- * 展示各数据类别的磁盘占用、孤儿数据检测、手动/自动清理。
+ * 展示各数据类别的磁盘占用，以及可安全自动清理的临时文件。
  */
 
 import * as React from 'react'
-import { HardDrive, Trash2, RefreshCw, AlertTriangle } from 'lucide-react'
+import { Trash2, RefreshCw } from 'lucide-react'
 import {
   SettingsSection,
   SettingsCard,
@@ -27,9 +27,6 @@ interface StorageCategory {
   key: string
   bytes: number
   count: number
-  hasOrphans: boolean
-  orphanBytes: number
-  orphanCount: number
 }
 
 interface StorageStats {
@@ -111,24 +108,6 @@ export function StorageSettings(): React.ReactElement {
     }).catch(console.error)
   }, [loadStats])
 
-  const handleCleanCategory = async (key: string, orphansOnly: boolean): Promise<void> => {
-    setCleaningKey(key)
-    setLastResult(null)
-    try {
-      const result = await window.electronAPI.cleanupStorage({
-        categories: [key],
-        orphansOnly,
-        archivedBeforeDays: 0,
-      }) as CleanupResult
-      setLastResult(result)
-      await loadStats()
-    } catch (e) {
-      console.error('[存储管理] 清理失败:', e)
-    } finally {
-      setCleaningKey(null)
-    }
-  }
-
   const handleCleanTemp = async (): Promise<void> => {
     setCleaningKey('temp-files')
     setLastResult(null)
@@ -138,24 +117,6 @@ export function StorageSettings(): React.ReactElement {
       await loadStats()
     } catch (e) {
       console.error('[存储管理] 清理临时文件失败:', e)
-    } finally {
-      setCleaningKey(null)
-    }
-  }
-
-  const handleCleanAllOrphans = async (): Promise<void> => {
-    setCleaningKey('all-orphans')
-    setLastResult(null)
-    try {
-      const result = await window.electronAPI.cleanupStorage({
-        categories: ['agent-sessions', 'sdk-config', 'workspaces'],
-        orphansOnly: true,
-        archivedBeforeDays: 0,
-      }) as CleanupResult
-      setLastResult(result)
-      await loadStats()
-    } catch (e) {
-      console.error('[存储管理] 清理孤儿数据失败:', e)
     } finally {
       setCleaningKey(null)
     }
@@ -179,9 +140,6 @@ export function StorageSettings(): React.ReactElement {
       console.error('[存储管理] 更新自动清理天数失败:', e)
     }
   }
-
-  const totalOrphanBytes = stats?.categories.reduce((sum, c) => sum + c.orphanBytes, 0) ?? 0
-  const hasOrphans = totalOrphanBytes > 0
 
   return (
     <div className="space-y-6">
@@ -218,12 +176,6 @@ export function StorageSettings(): React.ReactElement {
                   <span className="text-sm text-muted-foreground tabular-nums">
                     {formatBytes(cat.bytes)}
                   </span>
-                  {cat.hasOrphans && (
-                    <span className="flex items-center gap-1 text-xs text-amber-500">
-                      <AlertTriangle size={12} />
-                      孤儿 {formatBytes(cat.orphanBytes)}
-                    </span>
-                  )}
                 </div>
                 {cat.key === 'temp-files' ? (
                   <Button
@@ -235,17 +187,6 @@ export function StorageSettings(): React.ReactElement {
                   >
                     <Trash2 size={12} />
                     {cleaningKey === 'temp-files' ? '清理中...' : '清理'}
-                  </Button>
-                ) : cat.hasOrphans ? (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => handleCleanCategory(cat.key, true)}
-                    disabled={cleaningKey !== null}
-                    className="h-7 gap-1 text-xs"
-                  >
-                    <Trash2 size={12} />
-                    {cleaningKey === cat.key ? '清理中...' : '清理孤儿'}
                   </Button>
                 ) : null}
               </div>
@@ -278,38 +219,6 @@ export function StorageSettings(): React.ReactElement {
                 <SelectItem value="90">90 天</SelectItem>
               </SelectContent>
             </Select>
-          </SettingsRow>
-        </SettingsCard>
-      </SettingsSection>
-
-      {/* 深度清理 */}
-      <SettingsSection
-        title="深度清理"
-        description="检测并清理已删除会话遗留的孤儿数据"
-      >
-        <SettingsCard>
-          <SettingsRow
-            label="孤儿数据"
-            description="删除会话后残留的消息文件、SDK 缓存和工作目录"
-          >
-            <div className="flex items-center gap-3">
-              {hasOrphans && (
-                <span className="flex items-center gap-1 text-sm text-amber-500">
-                  <AlertTriangle size={14} />
-                  {formatBytes(totalOrphanBytes)}
-                </span>
-              )}
-              <Button
-                variant={hasOrphans ? 'default' : 'ghost'}
-                size="sm"
-                onClick={handleCleanAllOrphans}
-                disabled={cleaningKey !== null || !hasOrphans}
-                className="gap-1.5"
-              >
-                <HardDrive size={14} />
-                {cleaningKey === 'all-orphans' ? '清理中...' : hasOrphans ? '一键清理' : '无孤儿数据'}
-              </Button>
-            </div>
           </SettingsRow>
         </SettingsCard>
       </SettingsSection>

@@ -10,16 +10,19 @@
 
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
+import { HelpCircle, Keyboard, Globe2, PanelRight } from 'lucide-react'
 import {
   tabsAtom,
   activeTabIdAtom,
   tabIndicatorMapAtom,
+  isAgentContextTab,
 } from '@/atoms/tab-atoms'
 import type { TabItem } from '@/atoms/tab-atoms'
 import type { SessionIndicatorStatus } from '@/atoms/agent-atoms'
 import { currentConversationIdAtom } from '@/atoms/chat-atoms'
 import {
   agentSessionsAtom,
+  currentSessionSidePanelOpenAtom,
   agentWorkspacesAtom,
   currentAgentSessionIdAtom,
   currentAgentWorkspaceIdAtom,
@@ -28,10 +31,19 @@ import {
 import { appModeAtom } from '@/atoms/app-mode'
 import { automationFormAtom } from '@/atoms/automation-atoms'
 import { tearOffPreviewToSplit } from '@/components/diff/preview-opener'
+import { tearOffScratchToSplit } from '@/components/scratch-pad/scratch-pad-opener'
+import { Button } from '@/components/ui/button'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { TabBarItem } from './TabBarItem'
+import { getTabBarActionLayout } from './tab-bar-action-layout'
 import { useCloseTab } from '@/hooks/useCloseTab'
-import { detectIsWindows } from '@/lib/platform'
+import { detectIsWindows, WINDOW_CONTROLS_INSET_RIGHT } from '@/lib/platform'
+import { registerShortcut } from '@/lib/shortcut-registry'
 import { cn } from '@/lib/utils'
+import { shortcutGuideOpenAtom } from '@/atoms/shortcut-guide'
+import { faqDialogOpenAtom } from '@/atoms/faq-dialog'
+import { browserFilePanelManualRestoreSessionIdsAtom, browserPanelOpenMapAtom, browserStateMapAtom } from '@/atoms/browser-atoms'
+// 浏览器入口对所有 Agent 会话开放；来源限制由主进程浏览器策略处理。
 
 export function TabBar(): React.ReactElement {
   const tabs = useAtomValue(tabsAtom)
@@ -54,12 +66,19 @@ export function TabBar(): React.ReactElement {
   const store = useStore()
 
   /**
-   * Tear-off：把 preview Tab 拖出 TabBar 时，转成右侧分屏预览。
-   * 公共实现在 preview-opener.ts，PreviewTabContent 顶栏切换按钮共用同一份逻辑。
+   * Tear-off：把 preview/scratch Tab 拖出 TabBar 时，转成 Agent 右侧分屏。
+   * preview 公共实现在 preview-opener.ts，PreviewTabContent 顶栏切换按钮共用同一份逻辑。
    */
   const handleTearOff = React.useCallback((tabId: string) => {
-    tearOffPreviewToSplit(store, tabId)
-  }, [store])
+    const tab = tabs.find((item) => item.id === tabId)
+    if (tab?.type === 'preview') {
+      tearOffPreviewToSplit(store, tabId)
+      return
+    }
+    if (tab?.type === 'scratch') {
+      tearOffScratchToSplit(store)
+    }
+  }, [store, tabs])
 
   const workspaceNameBySessionId = React.useMemo(() => {
     const workspaceNameMap = new Map(agentWorkspaces.map((workspace) => [workspace.id, workspace.name]))
@@ -75,7 +94,15 @@ export function TabBar(): React.ReactElement {
   const automationSessionIds = React.useMemo(() => {
     const ids = new Set<string>()
     for (const s of agentSessions) {
-      if (s.sourceAutomationId) ids.add(s.id)
+      if (s.sourceAutomationId && !s.sourceDelegationId) ids.add(s.id)
+    }
+    return ids
+  }, [agentSessions])
+
+  const delegationSessionIds = React.useMemo(() => {
+    const ids = new Set<string>()
+    for (const s of agentSessions) {
+      if (s.sourceDelegationId) ids.add(s.id)
     }
     return ids
   }, [agentSessions])
@@ -164,6 +191,7 @@ export function TabBar(): React.ReactElement {
         streamingMap={indicatorMap}
         workspaceNameBySessionId={workspaceNameBySessionId}
         automationSessionIds={automationSessionIds}
+        delegationSessionIds={delegationSessionIds}
         onActivate={handleActivate}
         onClose={requestClose}
         onDragStart={handleDragStart}
@@ -180,6 +208,7 @@ function TabBarInner({
   streamingMap,
   workspaceNameBySessionId,
   automationSessionIds,
+  delegationSessionIds,
   onActivate,
   onClose,
   onDragStart,
@@ -190,6 +219,7 @@ function TabBarInner({
   streamingMap: Map<string, SessionIndicatorStatus>
   workspaceNameBySessionId: Map<string, string>
   automationSessionIds: Set<string>
+  delegationSessionIds: Set<string>
   onActivate: (tabId: string) => void
   onClose: (tabId: string) => void
   onDragStart: (tabId: string, e: React.PointerEvent) => void
@@ -202,20 +232,89 @@ function TabBarInner({
   const fadeTimerRef = React.useRef<ReturnType<typeof setTimeout>>()
   const isWindows = React.useMemo(() => detectIsWindows(), [])
 
+  // 文件面板按会话独立保存；Agent 会话及其归属的预览 Tab 都可切换面板；
+  // 仅 Agent 会话 Tab 在面板关闭时展示右上角"打开"按钮。
+  // 该按钮的 absolute 定位与 DiffPanelTabBar.PanelRightClose 的 mr-1 mb-[3px] 坐标耦合，
+  // 若右侧关闭按钮样式变化，这里需同步调整。
+  const [isPanelOpen, setSidePanelOpen] = useAtom(currentSessionSidePanelOpenAtom)
+  const setShortcutGuideOpen = useSetAtom(shortcutGuideOpenAtom)
+  const setFaqDialogOpen = useSetAtom(faqDialogOpenAtom)
+  const activeTab = React.useMemo(() => tabs.find((t) => t.id === activeTabId), [tabs, activeTabId])
+  const agentSessions = useAtomValue(agentSessionsAtom)
+  const activeAgentSession = activeTab?.type === 'agent'
+    ? agentSessions.find((session) => session.id === activeTab.sessionId)
+    : undefined
+  const showBrowserButton = Boolean(activeAgentSession)
+  const showOpenPanelButton = !isPanelOpen && activeTab?.type === 'agent'
+  const [browserOpenMap, setBrowserOpenMap] = useAtom(browserPanelOpenMapAtom)
+  const setBrowserStateMap = useSetAtom(browserStateMapAtom)
+  const [browserFilePanelManualRestoreSessionIds, setBrowserFilePanelManualRestoreSessionIds] = useAtom(browserFilePanelManualRestoreSessionIdsAtom)
+  const activeBrowserIsOpen = activeAgentSession ? browserOpenMap.get(activeAgentSession.id) === true : false
+  const priorBrowserStateRef = React.useRef<{ sessionId: string | null; open: boolean }>({ sessionId: null, open: false })
+  const actionLayout = getTabBarActionLayout(isWindows, showOpenPanelButton, showBrowserButton)
+
+  const togglePanel = React.useCallback(() => {
+    if (!isAgentContextTab(activeTab)) return
+    if (!isPanelOpen && activeAgentSession && browserOpenMap.get(activeAgentSession.id)) {
+      setBrowserFilePanelManualRestoreSessionIds((previous) => (
+        previous.includes(activeAgentSession.id) ? previous : [...previous, activeAgentSession.id]
+      ))
+    }
+    setSidePanelOpen(!isPanelOpen)
+  }, [activeAgentSession, activeTab, browserOpenMap, isPanelOpen, setBrowserFilePanelManualRestoreSessionIds, setSidePanelOpen])
+
+  const openBrowser = React.useCallback(async () => {
+    if (!activeAgentSession) return
+    const open = (window.electronAPI as Partial<typeof window.electronAPI>).openAgentBrowser
+    if (typeof open !== 'function') return
+    const state = await open(activeAgentSession.id)
+    setBrowserStateMap((previous) => { const next = new Map(previous); next.set(activeAgentSession.id, state); return next })
+    setBrowserOpenMap((previous) => { const next = new Map(previous); next.set(activeAgentSession.id, true); return next })
+  }, [activeAgentSession, setBrowserOpenMap, setBrowserStateMap])
+
+  React.useEffect(() => {
+    const sessionId = activeAgentSession?.id ?? null
+    const previous = priorBrowserStateRef.current
+    const shouldAutoCollapse = Boolean(
+      sessionId &&
+      previous.sessionId === sessionId &&
+      !previous.open &&
+      activeBrowserIsOpen &&
+      isPanelOpen &&
+      !browserFilePanelManualRestoreSessionIds.includes(sessionId),
+    )
+    priorBrowserStateRef.current = { sessionId, open: activeBrowserIsOpen }
+
+    if (!shouldAutoCollapse) return
+    setSidePanelOpen(false)
+  }, [activeAgentSession?.id, activeBrowserIsOpen, browserFilePanelManualRestoreSessionIds, isPanelOpen, setSidePanelOpen])
+
+  const openShortcutGuide = React.useCallback(() => {
+    setShortcutGuideOpen(true)
+  }, [setShortcutGuideOpen])
+
+  const openFaqDialog = React.useCallback(() => {
+    setFaqDialogOpen(true)
+  }, [setFaqDialogOpen])
+
+  React.useEffect(() => {
+    return registerShortcut('toggle-right-panel', togglePanel)
+  }, [togglePanel])
+
   // 滚动容器 ref
   const scrollRef = React.useRef<HTMLDivElement>(null)
 
   // 整条 TabBar 容器 ref，用于拖拽 tear-off 时检测鼠标是否离开 TabBar 区域
   const barRef = React.useRef<HTMLDivElement>(null)
 
-  // 拖出 TabBar 区域时给出视觉提示（仅 preview Tab 可 tear-off）
+  // 拖出 TabBar 区域时给出视觉提示（preview/scratch Tab 可 tear-off）
   const [tearingOff, setTearingOff] = React.useState<string | null>(null)
 
-  // 拦截外层 handleDragStart：若拖出 TabBar 区域且是 preview Tab，触发 tear-off
+  // 拦截外层 handleDragStart：若拖出 TabBar 区域且是 preview/scratch Tab，触发 tear-off
   const handleDragStartWithTearOff = React.useCallback((tabId: string, e: React.PointerEvent) => {
     const tab = tabs.find((t) => t.id === tabId)
-    // 仅 preview Tab 支持拖出转分屏
-    if (!tab || tab.type !== 'preview') {
+    // 仅 preview / scratch Tab 支持拖出转分屏
+    if (!tab || (tab.type !== 'preview' && tab.type !== 'scratch')) {
       onDragStart(tabId, e)
       return
     }
@@ -328,12 +427,12 @@ function TabBarInner({
   }, [])
 
   return (
-    <div ref={barRef} className="flex items-end h-[34px] tabbar-bg relative">
+    <div ref={barRef} className="main-tabbar flex items-end h-[34px] tabbar-bg relative">
       {/* 顶部 TabBar 的空白区域必须保持可拖拽，尤其是 macOS/Windows 自定义标题栏。
           注意：不要把 titlebar-no-drag 加到下面的整条 flex 容器上，否则标签右侧空白会再次失去拖拽能力。
           Windows 上背景拖拽层避开右上角 WindowControls 区域（126px），防止 hitmask 重叠。
           需要交互的单个 Tab 会在 TabBarItem 内部自己声明 titlebar-no-drag。 */}
-      <div className={cn("absolute inset-0 titlebar-drag-region", isWindows && "right-[126px]")} />
+      <div className={cn("absolute inset-0 titlebar-drag-region", isWindows && WINDOW_CONTROLS_INSET_RIGHT)} />
 
       {/* Tear-off 提示遮罩：拖出 TabBar 区域时，让 TabBar 下方出现一条高亮分割线 */}
       {tearingOff && (
@@ -342,7 +441,10 @@ function TabBarInner({
 
       <div
         ref={scrollRef}
-        className={cn("relative flex items-end flex-1 min-w-0 overflow-x-auto scrollbar-none", isWindows && "pr-[126px]")}
+        className={cn(
+          "relative flex items-end flex-1 min-w-0 overflow-x-auto scrollbar-none",
+          actionLayout.scrollPaddingClassName,
+        )}
       >
         {tabs.map((tab) => (
           <TabBarItem
@@ -352,6 +454,7 @@ function TabBarInner({
             title={tab.title}
             workspaceName={tab.type === 'agent' ? workspaceNameBySessionId.get(tab.sessionId) : undefined}
             isAutomation={tab.type === 'agent' && automationSessionIds.has(tab.sessionId)}
+            isDelegation={tab.type === 'agent' && delegationSessionIds.has(tab.sessionId)}
             isActive={tab.id === activeTabId}
             isStreaming={streamingMap.get(tab.id) ?? 'idle'}
             isHovered={hoveredTabId === tab.id}
@@ -368,6 +471,134 @@ function TabBarInner({
           />
         ))}
       </div>
+
+      <ShortcutGuideButton
+        positionClassName={actionLayout.shortcutPositionClassName}
+        showBrowserButton={showBrowserButton}
+        onOpenBrowser={openBrowser}
+        onOpen={openShortcutGuide}
+        onOpenFaq={openFaqDialog}
+      />
+
+      {/* 打开文件面板按钮：与文件面板打开时的 PanelRightClose 同坐标，避免开/关之间按钮位置跳变。
+          Windows 上需让出右上角 WindowControls 区域（126px）。 */}
+      {showOpenPanelButton && (
+        <AgentPanelOpenButton positionClassName={actionLayout.panelPositionClassName} onToggle={togglePanel} />
+      )}
+    </div>
+  )
+}
+
+function ShortcutGuideButton({
+  positionClassName,
+  showBrowserButton,
+  onOpenBrowser,
+  onOpen,
+  onOpenFaq,
+}: {
+  positionClassName: string
+  showBrowserButton: boolean
+  onOpenBrowser: () => void
+  onOpen: () => void
+  onOpenFaq: () => void
+}): React.ReactElement {
+  return (
+    <div
+      className={cn(
+        "absolute flex items-center gap-1 titlebar-no-drag",
+        positionClassName,
+      )}
+    >
+      {/* FAQ 快捷按钮（在快捷键地图左边） */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            onClick={onOpenFaq}
+          >
+            <HelpCircle className="size-3.5" />
+            <span className="sr-only">查看常见问题</span>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">
+          <p>查看常见问题</p>
+        </TooltipContent>
+      </Tooltip>
+
+      {showBrowserButton && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7"
+              onClick={() => void onOpenBrowser()}
+            >
+              <Globe2 className="size-3.5" />
+              <span className="sr-only">打开受管浏览器</span>
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            <p>打开受管浏览器</p>
+          </TooltipContent>
+        </Tooltip>
+      )}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            onClick={onOpen}
+          >
+            <Keyboard className="size-3.5" />
+            <span className="sr-only">查看快捷键地图</span>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">
+          <p>查看快捷键地图</p>
+        </TooltipContent>
+      </Tooltip>
+    </div>
+  )
+}
+
+/** 打开 Agent 文件面板按钮。 */
+function AgentPanelOpenButton({
+  positionClassName,
+  onToggle,
+}: {
+  positionClassName: string
+  onToggle: () => void
+}): React.ReactElement {
+  return (
+    <div
+      className={cn(
+        "absolute flex titlebar-no-drag",
+        positionClassName,
+      )}
+    >
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="relative h-7 w-7"
+            onClick={onToggle}
+          >
+            <PanelRight className="size-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">
+          <p>打开文件面板 ({navigator.platform.includes('Mac') ? '⌘⇧B' : 'Ctrl+Shift+B'})</p>
+        </TooltipContent>
+      </Tooltip>
     </div>
   )
 }

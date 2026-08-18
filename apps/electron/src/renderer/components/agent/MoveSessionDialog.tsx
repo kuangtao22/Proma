@@ -20,32 +20,33 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
+import { LocalProjectBadge } from './LocalProjectBadge'
 import type { AgentWorkspace, AgentSessionMeta } from '@proma/shared'
 
 interface MoveSessionDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   sessionId: string
-  currentWorkspaceId: string | undefined
+  sourceWorkspaceId: string | undefined
   workspaces: AgentWorkspace[]
-  onMoved: (updatedSession: AgentSessionMeta, targetWorkspaceName: string) => void
+  onMoved: (updatedSession: AgentSessionMeta, targetWorkspaceName: string) => void | Promise<void>
 }
 
 export function MoveSessionDialog({
   open,
   onOpenChange,
   sessionId,
-  currentWorkspaceId,
+  sourceWorkspaceId,
   workspaces,
   onMoved,
 }: MoveSessionDialogProps): React.ReactElement {
   const [selectedWorkspaceId, setSelectedWorkspaceId] = React.useState<string>('')
   const [moving, setMoving] = React.useState(false)
 
-  // 过滤掉当前工作区
+  // 过滤掉会话已属的工作区
   const availableWorkspaces = React.useMemo(
-    () => workspaces.filter((ws) => ws.id !== currentWorkspaceId),
-    [workspaces, currentWorkspaceId]
+    () => workspaces.filter((ws) => ws.id !== sourceWorkspaceId),
+    [workspaces, sourceWorkspaceId]
   )
 
   // 打开时重置选择
@@ -66,7 +67,7 @@ export function MoveSessionDialog({
         sessionId,
         targetWorkspaceId: selectedWorkspaceId,
       })
-      onMoved(updated, targetWs?.name ?? '未知工作区')
+      await onMoved(updated, targetWs?.name ?? '未知项目')
       onOpenChange(false)
     } catch (error) {
       console.error('[迁移会话] 迁移失败:', error)
@@ -80,25 +81,31 @@ export function MoveSessionDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>迁移到其他工作区</DialogTitle>
+          <DialogTitle>迁移到其他项目</DialogTitle>
           <DialogDescription>
-            选择目标工作区，会话将完整迁移过去。
+            选择目标项目，会话将完整迁移过去。
           </DialogDescription>
         </DialogHeader>
 
         {availableWorkspaces.length === 0 ? (
           <p className="text-sm text-muted-foreground py-2">
-            没有其他可用的工作区，请先创建新的工作区。
+            没有其他可用的项目，请先创建新的项目。
           </p>
         ) : (
           <Select value={selectedWorkspaceId} onValueChange={setSelectedWorkspaceId}>
             <SelectTrigger>
-              <SelectValue placeholder="选择目标工作区" />
+              <SelectValue placeholder="选择目标项目" />
             </SelectTrigger>
             <SelectContent>
               {availableWorkspaces.map((ws) => (
                 <SelectItem key={ws.id} value={ws.id}>
-                  {ws.name}
+                  <span className="flex items-center gap-1.5">
+                    <span>{ws.name}</span>
+                    <LocalProjectBadge
+                      projectRootPath={ws.projectRootPath}
+                      projectRootStatus={ws.projectRootStatus}
+                    />
+                  </span>
                 </SelectItem>
               ))}
             </SelectContent>

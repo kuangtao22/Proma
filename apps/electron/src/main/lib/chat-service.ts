@@ -22,7 +22,7 @@ import {
   fetchTitle,
 } from '@proma/core'
 import type { ImageAttachmentData, ContinuationMessage } from '@proma/core'
-import { listChannels, decryptApiKey } from './channel-manager'
+import { listChannels, resolveChannelRuntimeApiKey } from './channel-manager'
 import { appendMessage, updateConversationMeta, getConversationMessages } from './conversation-manager'
 import { readAttachmentAsBase64, isImageAttachment } from './attachment-service'
 import { extractTextFromAttachment, isDocumentAttachment } from './document-parser'
@@ -30,6 +30,7 @@ import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
 import { getEnabledTools } from './chat-tool-registry'
 import { executeToolCalls } from './chat-tool-executor'
+import { createFallbackTitle, sanitizeGeneratedTitle, SHORT_MESSAGE_THRESHOLD, TITLE_PROMPT } from './title-generation'
 
 /** 活跃的 AbortController 映射（conversationId → controller） */
 const activeControllers = new Map<string, AbortController>()
@@ -233,10 +234,22 @@ export async function sendMessage(
     return
   }
 
+  // Subscription OAuth uses Pi provider-specific transports, which Chat mode does
+  // not currently implement. Keep this guard for historical conversations that
+  // still reference a formerly selectable subscription model.
+  if (channel.provider === 'openai-codex' || channel.provider === 'xai') {
+    const providerName = channel.provider === 'xai' ? 'xAI（Grok OAuth）' : 'ChatGPT 订阅（Codex OAuth）'
+    emit(CHAT_IPC_CHANNELS.STREAM_ERROR, {
+      conversationId,
+      error: `Chat 模式暂不支持 ${providerName}，请切换到 Agent 模式使用。`,
+    })
+    return
+  }
+
   // 2. 解密 API Key
   let apiKey: string
   try {
-    apiKey = decryptApiKey(channelId)
+    apiKey = await resolveChannelRuntimeApiKey(channelId)
   } catch {
     emit(CHAT_IPC_CHANNELS.STREAM_ERROR, {
       conversationId,
@@ -519,12 +532,26 @@ export async function sendMessage(
         toolActivities: accumulatedToolActivities.length > 0 ? accumulatedToolActivities : undefined,
       }
       appendMessage(conversationId, partialMsg)
-
-      try {
-        updateConversationMeta(conversationId, {})
-      } catch {
-        // 索引更新失败不影响主流程
+    } else {
+      // 即使没有累积内容，也保存一条错误消息到 JSONL，
+      // 确保切换对话或重启后错误仍然可见（而非仅靠临时 atom 横幅）
+      const assistantMsgId = randomUUID()
+      const errorMsg: ChatMessage = {
+        id: assistantMsgId,
+        role: 'assistant',
+        content: '',
+        createdAt: Date.now(),
+        model: modelId,
+        stopped: true,
+        error: errorMessage,
       }
+      appendMessage(conversationId, errorMsg)
+    }
+
+    try {
+      updateConversationMeta(conversationId, {})
+    } catch {
+      // 索引更新失败不影响主流程
     }
 
     emit(CHAT_IPC_CHANNELS.STREAM_ERROR, {
@@ -561,15 +588,6 @@ export function stopAllGenerations(): void {
 
 // ===== 标题生成 =====
 
-/** 标题生成 Prompt */
-const TITLE_PROMPT = '根据用户的第一条消息，生成一个简短的对话标题（10字以内）。只输出标题，不要有任何其他内容、标点符号或引号。如果消息内容过短或无明确主题，直接使用原始消息作为标题。\n\n用户消息：'
-
-/** 短消息阈值：低于此长度直接使用原文作为标题 */
-const SHORT_MESSAGE_THRESHOLD = 4
-
-/** 最大标题长度 */
-const MAX_TITLE_LENGTH = 20
-
 /**
  * 调用 AI 生成对话标题
  *
@@ -586,7 +604,7 @@ export async function generateTitle(input: GenerateTitleInput): Promise<string |
   // 短消息直接使用原文作为标题，避免 AI 幻觉
   const trimmedMessage = userMessage.trim()
   if (trimmedMessage.length <= SHORT_MESSAGE_THRESHOLD) {
-    const shortTitle = trimmedMessage.slice(0, MAX_TITLE_LENGTH)
+    const shortTitle = createFallbackTitle(trimmedMessage)
     console.log('[标题生成] 消息过短，直接使用原文作为标题:', shortTitle)
     return shortTitle
   }
@@ -599,13 +617,20 @@ export async function generateTitle(input: GenerateTitleInput): Promise<string |
     return null
   }
 
+  if (channel.provider === 'openai-codex') {
+    const fallbackTitle = createFallbackTitle(userMessage)
+    console.log('[标题生成] ChatGPT OAuth 渠道使用本地标题:', fallbackTitle)
+    return fallbackTitle
+  }
+
   // 解密 API Key
   let apiKey: string
   try {
-    apiKey = decryptApiKey(channelId)
+    apiKey = await resolveChannelRuntimeApiKey(channelId)
   } catch {
     console.warn('[标题生成] 解密 API Key 失败')
-    return null
+    // OpenCode Go / 自定义渠道无法解密也仍要完成重命名，避免对话长期停在默认标题。
+    return (channel.provider === 'opencode-go-openai' || channel.provider === 'custom') ? createFallbackTitle(userMessage) : null
   }
 
   try {
@@ -620,18 +645,18 @@ export async function generateTitle(input: GenerateTitleInput): Promise<string |
     const proxyUrl = await getEffectiveProxyUrl()
     const fetchFn = getFetchFn(proxyUrl)
     const title = await fetchTitle(request, adapter, fetchFn)
-    if (!title) {
-      console.warn('[标题生成] API 返回空标题')
-      return null
+    const result = title ? sanitizeGeneratedTitle(title) : null
+    if (!result) {
+      console.warn('[标题生成] API 未返回可用标题')
+      // OpenCode Go / 自定义渠道的服务端偶发返回空标题时，仍要完成重命名，避免对话长期停在默认标题。
+      return (channel.provider === 'opencode-go-openai' || channel.provider === 'custom') ? createFallbackTitle(userMessage) : null
     }
 
-    // 截断到最大长度并清理引号
-    const cleaned = title.trim().replace(/^["'""'']+|["'""'']+$/g, '').trim()
-    const result = cleaned.slice(0, MAX_TITLE_LENGTH) || null
     console.log('[标题生成] 成功生成标题:', result)
     return result
   } catch (error) {
     console.warn('[标题生成] 请求失败:', error)
-    return null
+    // OpenCode Go / 自定义渠道的服务端偶发返回空标题/异常响应/超时，异常路径同样要完成重命名。
+    return (channel.provider === 'opencode-go-openai' || channel.provider === 'custom') ? createFallbackTitle(userMessage) : null
   }
 }

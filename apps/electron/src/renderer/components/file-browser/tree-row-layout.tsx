@@ -27,7 +27,7 @@ export function canBeSticky(depth: number): boolean {
  * 固定 depth=0 的根行可直接拼 'top-0 z-10'。
  * 阴影由 globals.css 中的 :has() 规则按 sticky 链路最末一行动态附加。
  */
-export const STICKY_ROW_BASE_CLASS = 'sticky bg-content-area'
+export const STICKY_ROW_BASE_CLASS = 'sticky file-tree-sticky-row'
 
 export interface TreeRowLayout {
   paddingLeft: number
@@ -69,7 +69,7 @@ export function AncestorGuides({ depth, isSelected }: AncestorGuidesProps): Reac
           key={`ancestor-guide-${i}`}
           aria-hidden="true"
           className={cn(
-            'pointer-events-none absolute top-0 bottom-0 w-px',
+            'file-tree-guide pointer-events-none absolute top-0 bottom-0 z-10 w-px',
             isSelected ? 'bg-accent-foreground/30' : 'bg-border/70',
           )}
           style={{ left: TREE_ROW_HORIZONTAL_MARGIN + 8 + i * TREE_INDENT_WIDTH + 7 }}

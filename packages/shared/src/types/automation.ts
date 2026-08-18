@@ -22,15 +22,26 @@ export interface AutomationRun {
 }
 
 /** 调度模式 */
-export type AutomationScheduleType = 'interval' | 'daily' | 'weekly' | 'monthly'
+export type AutomationScheduleType = 'interval' | 'daily' | 'weekly' | 'monthly' | 'once'
+
+/**
+ * interval 调度的每日有效执行窗口和周内运行日。
+ * - 开始包含、结束不包含；例如 10:00–22:00 每 20 分钟会在 10:00 至 21:40 触发。
+ * - activeWeekdays 为空或未设置表示每天；非空时 0=周日，1=周一 … 6=周六。
+ * - 窗口与运行日可以单独使用，但实际产品通常组合为“工作日 10:00–22:00 每 20 分钟”。
+ */
+export interface AutomationActiveWindow {
+  activeWindowStart?: string
+  activeWindowEnd?: string
+  activeWeekdays?: number[]
+}
 
 /**
  * 定时任务的权限模式（无人值守运行场景）
- * - auto：自动审批，SDK 内置审批器判断，危险操作可能挂起等待（不推荐用于无人值守）
  * - bypassPermissions：完全自动，所有工具调用自动允许
  * 不含 plan（计划模式只规划不执行，对定时任务无意义）
  */
-export type AutomationPermissionMode = 'auto' | 'bypassPermissions'
+export type AutomationPermissionMode = 'bypassPermissions'
 
 /** 定时任务默认权限模式（向后兼容：旧任务无此字段时按此值运行） */
 export const AUTOMATION_DEFAULT_PERMISSION_MODE: AutomationPermissionMode = 'bypassPermissions'
@@ -64,7 +75,7 @@ export interface AutomationFeishuNotificationTarget {
 export type AutomationNotificationTarget = AutomationFeishuNotificationTarget
 
 /** 定时任务定义 */
-export interface Automation {
+export interface Automation extends AutomationActiveWindow {
   id: string
   /** 任务名（默认从来源消息生成，可编辑） */
   name: string
@@ -72,16 +83,30 @@ export interface Automation {
   prompt: string
   /** 是否启用调度 */
   active: boolean
-  /** 调度模式：interval=固定间隔；daily=每天定点；weekly=每周某天定点；monthly=每月某天定点 */
+  /** 调度模式：interval=固定间隔；daily=每天定点；weekly=每周某天定点；monthly=每月某天定点；once=指定时刻只运行一次 */
   scheduleType: AutomationScheduleType
   /** 运行间隔（分钟），scheduleType==='interval' 时使用 */
   intervalMinutes: number
+  /** interval 的每日有效开始时刻 "HH:MM"；与 activeWindowEnd 同时存在时生效 */
+  activeWindowStart?: string
+  /** interval 的每日有效结束时刻 "HH:MM"（结束不包含） */
+  activeWindowEnd?: string
+  /** interval 的运行日；为空表示每天，0=周日，1=周一 … 6=周六 */
+  activeWeekdays?: number[]
   /** 触发时刻 "HH:MM"，scheduleType==='daily'|'weekly'|'monthly' 时使用 */
   timeOfDay?: string
   /** 星期几（0=周日 … 6=周六），scheduleType==='weekly' 时使用 */
   dayOfWeek?: number
   /** 每月几号（1-31），scheduleType==='monthly' 时使用 */
   dayOfMonth?: number
+  /** 一次性任务的绝对触发时间戳，scheduleType==='once' 时使用 */
+  scheduledAt?: number
+  /**
+   * 最大运行次数上限：实际执行次数（成功 + 失败，不含 skipped）达到后自动停用。
+   * undefined = 不限次（默认，向后兼容旧任务）。
+   * 与 scheduleType 正交——任意循环模式都可叠加；once 模式语义上等价于 maxRuns=1。
+   */
+  maxRuns?: number
   /** AI 渠道 ID */
   channelId: string
   /** 模型 ID（可选，继承来源会话或渠道默认） */
@@ -108,6 +133,14 @@ export interface Automation {
   lastRunAt?: number
   /** 连续失败次数（用于退避/自动暂停） */
   consecutiveFailures?: number
+  /** 已实际执行次数（成功 + 失败，不含 skipped），用于与 maxRuns 比较 */
+  runCount?: number
+  /**
+   * 因跑满 maxRuns 或 once 完成而自动停用的时间戳。
+   * 区别于用户手动暂停（active=false 但无 completedAt）和连续失败暂停，
+   * 让 UI 能把「已完成」与「已暂停」区分展示。重新启用时会被清空。
+   */
+  completedAt?: number
   /** 最近运行历史（截断保留最新 AUTOMATION_MAX_HISTORY 条） */
   runHistory: AutomationRun[]
 }
@@ -119,7 +152,7 @@ export const AUTOMATION_MAX_HISTORY = 20
 export const AUTOMATION_MAX_CONSECUTIVE_FAILURES = 5
 
 /** 创建定时任务的输入 */
-export interface CreateAutomationInput {
+export interface CreateAutomationInput extends AutomationActiveWindow {
   name: string
   prompt: string
   scheduleType: AutomationScheduleType
@@ -127,6 +160,10 @@ export interface CreateAutomationInput {
   timeOfDay?: string
   dayOfWeek?: number
   dayOfMonth?: number
+  /** 一次性任务的绝对触发时间戳，scheduleType==='once' 时必填 */
+  scheduledAt?: number
+  /** 最大运行次数上限；null/不传 = 不限次 */
+  maxRuns?: number | null
   channelId: string
   modelId?: string
   workspaceId?: string
@@ -145,9 +182,19 @@ export interface UpdateAutomationInput {
   prompt?: string
   scheduleType?: AutomationScheduleType
   intervalMinutes?: number
+  /** null 表示清除每日执行窗口的开始时刻 */
+  activeWindowStart?: string | null
+  /** null 表示清除每日执行窗口 */
+  activeWindowEnd?: string | null
+  /** interval 的运行日；传空数组表示每天，null 表示清除限制 */
+  activeWeekdays?: number[] | null
   timeOfDay?: string
   dayOfWeek?: number
   dayOfMonth?: number
+  /** 一次性任务的绝对触发时间戳，scheduleType==='once' 时使用 */
+  scheduledAt?: number
+  /** 最大运行次数上限；传 null 表示清除上限、不限次 */
+  maxRuns?: number | null
   channelId?: string
   modelId?: string
   /** 工作区（用户可在创建后调整子会话归属的工作区） */

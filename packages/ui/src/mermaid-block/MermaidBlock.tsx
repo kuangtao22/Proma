@@ -22,6 +22,8 @@ import type { DiagramColors, RenderOptions } from 'beautiful-mermaid'
 interface MermaidBlockProps {
   /** mermaid 源码 */
   code: string
+  /** 覆盖默认剪贴板实现（Electron 可注入主进程剪贴板） */
+  onCopy?: (text: string) => Promise<void>
 }
 
 /** 防抖间隔（ms） */
@@ -126,7 +128,7 @@ const zoomOutPath = (
 
 // ===== 主组件 =====
 
-export function MermaidBlock({ code }: MermaidBlockProps): React.ReactElement {
+export function MermaidBlock({ code, onCopy }: MermaidBlockProps): React.ReactElement {
   const [renderedSvg, setRenderedSvg] = React.useState<string | null>(null)
   const [copied, setCopied] = React.useState(false)
   const [scale, setScale] = React.useState<number>(INITIAL_SCALE)
@@ -186,7 +188,7 @@ export function MermaidBlock({ code }: MermaidBlockProps): React.ReactElement {
 
   const handleCopy = React.useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(code)
+      await (onCopy ? onCopy(code) : navigator.clipboard.writeText(code))
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch (error) {
@@ -231,12 +233,10 @@ export function MermaidBlock({ code }: MermaidBlockProps): React.ReactElement {
           </pre>
         ) : (
           <div className="mermaid-block-scroll bg-background overflow-auto min-h-[180px]">
-            <div
-              className="flex justify-center items-center p-4 min-h-[180px] origin-center"
-              style={{ transform: `scale(${scale})` }}
-            >
+            <div className="flex w-max min-w-full items-center justify-start p-4 min-h-[180px]">
               <div
-                className="mermaid-svg [&>svg]:max-w-full [&>svg]:h-auto"
+                className="mermaid-svg inline-block [&>svg]:block [&>svg]:h-auto"
+                style={{ zoom: scale }}
                 dangerouslySetInnerHTML={{ __html: renderedSvg }}
               />
             </div>

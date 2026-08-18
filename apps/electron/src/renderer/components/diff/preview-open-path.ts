@@ -1,7 +1,7 @@
 import type { FileAccessOptions } from '@proma/shared'
 import type { PreviewFile } from '@/atoms/preview-atoms'
 
-function isAbsoluteFilePath(filePath: string): boolean {
+export function isAbsoluteFilePath(filePath: string): boolean {
   return filePath.startsWith('/') || filePath.startsWith('\\\\') || /^[A-Za-z]:[\\/]/.test(filePath)
 }
 
@@ -20,6 +20,18 @@ function uniqueTruthyPaths(paths: Array<string | null | undefined>): string[] {
     result.push(path)
   }
   return result
+}
+
+/**
+ * 相对路径预览必须携带会话工作目录；历史工具调用通常只持久化了 filePath。
+ * 将调用方已有候选目录与会话 workbench 根合并，以便 plan/*.md、attachments/*
+ * 及历史 .context/plan/*.md 等文件正确解析。
+ */
+export function getPreviewCandidateBasePaths(
+  basePaths: readonly string[] | undefined,
+  ...contextPaths: Array<string | null | undefined>
+): string[] {
+  return uniqueTruthyPaths([...(basePaths ?? []), ...contextPaths])
 }
 
 /**
@@ -42,11 +54,15 @@ export function getPreviewFileAccess(
 ): FileAccessOptions {
   return {
     sessionId,
-    candidateBasePaths: uniqueTruthyPaths([
-      ...(file.basePaths ?? []),
+    // 与右侧文件面板一致：预览 Agent 实际操作过的外部路径不受附件白名单限制。
+    unrestricted: true,
+    ...(file.workspaceSkillSlug ? { workspaceSkillSlug: file.workspaceSkillSlug } : {}),
+    ...(file.legacySkillFilePath ? { legacySkillFilePath: file.legacySkillFilePath } : {}),
+    candidateBasePaths: getPreviewCandidateBasePaths(
+      file.basePaths,
       file.gitRoot,
       file.dirPath,
       sessionPath,
-    ]),
+    ),
   }
 }

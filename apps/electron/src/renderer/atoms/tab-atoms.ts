@@ -113,10 +113,57 @@ export interface TabMinimapItem {
 }
 export const tabMinimapCacheAtom = atom<Map<string, TabMinimapItem[]>>(new Map())
 
+/** Scratch Pad 编辑器视图变体，用于隔离全屏页与右侧分屏的滚动位置 */
+export type ScratchPadViewVariant = 'page' | 'pane'
+
+export interface ScratchPadScrollPosition {
+  top: number
+  left: number
+}
+
+export type ScratchPadScrollPositions = Record<ScratchPadViewVariant, ScratchPadScrollPosition>
+
+/**
+ * Scratch Pad 的滚动位置（仅运行期内存态）。
+ * 全屏页和右侧分屏使用不同的滚动容器，不能互相覆盖位置。
+ */
+export const scratchPadScrollPositionsAtom = atom<ScratchPadScrollPositions>({
+  page: { top: 0, left: 0 },
+  pane: { top: 0, left: 0 },
+})
+
+export function updateScratchPadScrollPosition(
+  positions: ScratchPadScrollPositions,
+  variant: ScratchPadViewVariant,
+  position: ScratchPadScrollPosition,
+): ScratchPadScrollPositions {
+  const nextPosition = {
+    top: Math.max(0, position.top),
+    left: Math.max(0, position.left),
+  }
+  const previousPosition = positions[variant]
+  if (
+    previousPosition.top === nextPosition.top
+    && previousPosition.left === nextPosition.left
+  ) {
+    return positions
+  }
+  return { ...positions, [variant]: nextPosition }
+}
+
 /** Scratch Pad 编辑内容（HTML 字符串，供 TipTap 编辑器使用） */
 export const scratchPadContentAtom = atom<string>('')
 /** Scratch Pad 内容是否已从磁盘加载 */
 export const scratchPadLoadedAtom = atom<boolean>(false)
+/** Scratch Pad 是否固定在 Agent 右侧分屏；通过拖出 Scratch Tab 打开 */
+export const scratchPadPanelOpenAtom = atom<boolean>(false)
+/** 右侧工作区中 Preview 与 Scratch 并排时，Preview 占比 */
+export const rightWorkspaceSplitRatioAtom = atomWithStorage<number>(
+  'proma-right-workspace-split-ratio',
+  0.58,
+  undefined,
+  { getOnInit: true },
+)
 
 // ===== 派生 Atoms =====
 
@@ -185,6 +232,25 @@ function createScratchPadTab(): TabItem {
   }
 }
 
+/**
+ * 将固定草稿 Tab 放回顶部并聚焦，同时保留现有会话/预览上下文。
+ * 草稿被拖到右侧分屏时会暂时从 tabsAtom 移除，Ctrl+Tab 需要通过此入口恢复它。
+ */
+export function focusScratchPadTab(tabs: TabItem[]): {
+  tabs: TabItem[]
+  activeTabId: string
+  scratchPanelOpen: false
+} {
+  const scratchTab = tabs.find((tab) => tab.id === SCRATCH_PAD_ID && tab.type === 'scratch')
+    ?? createScratchPadTab()
+  return {
+    tabs: [scratchTab, ...tabs.filter((tab) => tab.id !== SCRATCH_PAD_ID)],
+    activeTabId: SCRATCH_PAD_ID,
+    // 从右侧分屏回到完整草稿页时，必须关闭分屏；否则下次切回 Agent 会话会出现重复草稿。
+    scratchPanelOpen: false,
+  }
+}
+
 export function createPreviewTabId(sessionId: string): string {
   return `${PREVIEW_TAB_PREFIX}${sessionId}`
 }
@@ -199,6 +265,11 @@ export function getPreviewTabTitle(filePath: string): string {
 
 export function isPreviewTab(tab: TabItem): boolean {
   return tab.type === 'preview' || tab.id.startsWith(PREVIEW_TAB_PREFIX)
+}
+
+/** Agent 会话及其归属的文件预览 Tab 都可操作 Agent 侧面板。 */
+export function isAgentContextTab(tab: TabItem | undefined): boolean {
+  return tab?.type === 'agent' || (tab !== undefined && isPreviewTab(tab))
 }
 
 function isSessionTab(tab: TabItem): boolean {

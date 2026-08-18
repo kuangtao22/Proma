@@ -22,6 +22,7 @@ const registeredAccelerators = new Map<string, string>()
 const GLOBAL_SHORTCUT_DEFAULTS: Record<string, { mac: string; win: string }> = {
   'quick-task': { mac: 'Alt+Space', win: 'Alt+Space' },
   'show-main-window': { mac: 'CommandOrControl+Shift+P', win: 'CommandOrControl+Shift+P' },
+  'open-planning': { mac: 'CommandOrControl+Shift+T', win: 'CommandOrControl+Shift+T' },
   'voice-dictation': { mac: 'Ctrl+`', win: 'Ctrl+`' },
 }
 
@@ -137,6 +138,22 @@ export function reregisterAllGlobalShortcuts(): Record<string, boolean> {
     results[id] = registerOne(id)
   }
   return results
+}
+
+/**
+ * 返回已配置全局快捷键的当前注册结果。
+ *
+ * 渲染进程用于区分用户的绑定配置与系统实际接受的全局组合。
+ */
+export function getGlobalShortcutRegistrationStatus(): Record<string, boolean> {
+  const status: Record<string, boolean> = {}
+  for (const id of globalCallbacks.keys()) {
+    status[id] = false
+  }
+  for (const id of registeredAccelerators.values()) {
+    status[id] = true
+  }
+  return status
 }
 
 /**

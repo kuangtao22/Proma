@@ -38,10 +38,17 @@ import {
   DEFAULT_NOTIFICATION_SOUNDS,
 } from '@/atoms/notifications'
 import {
+  longTextPasteAsAttachmentEnabledAtom,
+  richTextRenderingEnabledAtom,
   stickyUserMessageEnabledAtom,
+  sessionHoverPreviewEnabledAtom,
+  updateLongTextPasteAsAttachmentEnabled,
+  updateRichTextRenderingEnabled,
   updateStickyUserMessageEnabled,
+  updateSessionHoverPreviewEnabled,
 } from '@/atoms/ui-preferences'
 import { cn } from '@/lib/utils'
+import { detectIsMac, detectIsWindows } from '@/lib/platform'
 import { Button } from '../ui/button'
 import type { NotificationSoundId, NotificationSoundType, NotificationSoundSettings } from '@/types/settings'
 
@@ -61,18 +68,50 @@ export function GeneralSettings(): React.ReactElement {
   const [notificationSoundEnabled, setNotificationSoundEnabled] = useAtom(notificationSoundEnabledAtom)
   const [notificationSounds, setNotificationSounds] = useAtom(notificationSoundsAtom)
   const [stickyUserMessageEnabled, setStickyUserMessageEnabled] = useAtom(stickyUserMessageEnabledAtom)
+  const [longTextPasteAsAttachmentEnabled, setLongTextPasteAsAttachmentEnabled] = useAtom(longTextPasteAsAttachmentEnabledAtom)
+  const [richTextRenderingEnabled, setRichTextRenderingEnabled] = useAtom(richTextRenderingEnabledAtom)
+  const [sessionHoverPreviewEnabled, setSessionHoverPreviewEnabled] = useAtom(sessionHoverPreviewEnabledAtom)
   const [isEditingName, setIsEditingName] = React.useState(false)
   const [nameInput, setNameInput] = React.useState(userProfile.userName)
   const [showEmojiPicker, setShowEmojiPicker] = React.useState(false)
   const [archiveAfterDays, setArchiveAfterDays] = React.useState<number>(7)
+  /** Git/PR 推广标识：默认开启 */
+  const [gitAttributionEnabled, setGitAttributionEnabled] = React.useState(true)
+  const [agentIslandEnabled, setAgentIslandEnabled] = React.useState(true)
+  const isMac = React.useMemo(() => detectIsMac(), [])
+  const isWindows = React.useMemo(() => detectIsWindows(), [])
   const fileInputRef = React.useRef<HTMLInputElement>(null)
 
-  // 加载归档天数设置
+  // 加载归档天数与 Git/PR 标识设置
   React.useEffect(() => {
     window.electronAPI.getSettings().then((settings) => {
       setArchiveAfterDays(settings.archiveAfterDays ?? 7)
+      setGitAttributionEnabled(settings.gitAttributionEnabled ?? true)
+      setAgentIslandEnabled(settings.agentIsland?.enabled ?? true)
     }).catch(console.error)
   }, [])
+
+  /** 更新 Git/PR 推广标识开关 */
+  const handleGitAttributionChange = async (checked: boolean): Promise<void> => {
+    setGitAttributionEnabled(checked)
+    try {
+      await window.electronAPI.updateSettings({ gitAttributionEnabled: checked })
+    } catch (error) {
+      console.error('[通用设置] 更新 Git/PR 标识失败:', error)
+      setGitAttributionEnabled(!checked)
+    }
+  }
+
+  /** 更新灵动岛开关 */
+  const handleAgentIslandChange = async (checked: boolean): Promise<void> => {
+    setAgentIslandEnabled(checked)
+    try {
+      await window.electronAPI.updateSettings({ agentIsland: { enabled: checked } })
+    } catch (error) {
+      console.error('[通用设置] 更新 Agent 灵动岛失败:', error)
+      setAgentIslandEnabled(!checked)
+    }
+  }
 
   /** 更新归档天数 */
   const handleArchiveDaysChange = async (value: string): Promise<void> => {
@@ -293,6 +332,27 @@ export function GeneralSettings(): React.ReactElement {
               setNotificationSounds(newSounds)
             }}
           />
+          <SoundPicker
+            label="任务/日程提醒音效"
+            type="planningReminder"
+            sounds={notificationSounds}
+            disabled={!notificationsEnabled || !notificationSoundEnabled}
+            onSoundChange={async (type, soundId) => {
+              const newSounds = await updateNotificationSound(type, soundId, notificationSounds)
+              setNotificationSounds(newSounds)
+            }}
+          />
+          {isWindows && (
+            <SettingsToggle
+              label="Agent 状态通知"
+              description="在任务栏托盘显示 Agent 运行状态，悬停查看会话详情"
+              checked={agentIslandEnabled}
+              disabled={!notificationsEnabled}
+              onCheckedChange={(checked) => {
+                void handleAgentIslandChange(checked)
+              }}
+            />
+          )}
           <SettingsRow
             label="自动归档"
             description="超过指定天数未更新的对话将自动归档（置顶对话除外）"
@@ -319,8 +379,54 @@ export function GeneralSettings(): React.ReactElement {
               updateStickyUserMessageEnabled(checked)
             }}
           />
+          <SettingsToggle
+            label="长文本粘贴转附件"
+            description="开启后，输入框粘贴超过 2000 字的文本会自动生成可预览编辑的附件"
+            checked={longTextPasteAsAttachmentEnabled}
+            onCheckedChange={(checked) => {
+              setLongTextPasteAsAttachmentEnabled(checked)
+              updateLongTextPasteAsAttachmentEnabled(checked)
+            }}
+          />
+          <SettingsToggle
+            label="输入框 Markdown 渲染"
+            description="开启后，输入框中的 Markdown 语法（如 **粗体**、# 标题）会实时渲染为富文本；关闭后为纯文本模式，保留 @ 引用等功能"
+            checked={richTextRenderingEnabled}
+            onCheckedChange={(checked) => {
+              setRichTextRenderingEnabled(checked)
+              updateRichTextRenderingEnabled(checked)
+            }}
+          />
+          <SettingsToggle
+            label="会话悬浮预览"
+            description="鼠标悬停在左侧会话列表项上时，弹出会话内容迷你地图预览"
+            checked={sessionHoverPreviewEnabled}
+            onCheckedChange={(checked) => {
+              setSessionHoverPreviewEnabled(checked)
+              updateSessionHoverPreviewEnabled(checked)
+            }}
+          />
+          {isMac && (
+            <SettingsToggle
+              label="Agent 灵动岛"
+              description="在 macOS 刘海屏显示需要接手的 Agent 与 1 小时内的待办/日程"
+              checked={agentIslandEnabled}
+              onCheckedChange={(checked) => {
+                void handleAgentIslandChange(checked)
+              }}
+            />
+          )}
+          <SettingsToggle
+            label="Git/PR 标识"
+            description="Agent 代你提交 commit 或创建 PR 时，附加 Made-with: Proma 与官网链接，便于推广；可随时关闭"
+            checked={gitAttributionEnabled}
+            onCheckedChange={(checked) => {
+              void handleGitAttributionChange(checked)
+            }}
+          />
         </SettingsCard>
       </SettingsSection>
+
     </div>
   )
 }
@@ -362,7 +468,7 @@ function SoundPicker({ label, type, sounds, disabled, onSoundChange }: SoundPick
           size="icon"
           className="h-8 w-8 shrink-0"
           disabled={disabled || currentId === 'none'}
-          onClick={() => playNotificationSound(currentId)}
+          onClick={() => { void playNotificationSound(currentId) }}
           title="试听"
         >
           <Volume2 size={14} />

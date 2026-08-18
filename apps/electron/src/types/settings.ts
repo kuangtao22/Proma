@@ -4,10 +4,10 @@
  * 主题模式、IPC 通道等设置相关定义。
  */
 
-import type { EnvironmentCheckResult, ThinkingConfig, AgentEffort, FeishuSessionMirrorSettings } from '@proma/shared'
+import type { EnvironmentCheckResult, ThinkingConfig, AgentEffort, AgentThinkingLevel, FeishuSessionMirrorSettings, WindowsShellPreference } from '@proma/shared'
 
 /** 通知音场景类型 */
-export type NotificationSoundType = 'taskComplete' | 'permissionRequest' | 'exitPlanMode'
+export type NotificationSoundType = 'taskComplete' | 'permissionRequest' | 'exitPlanMode' | 'planningReminder'
 
 /** 可选通知音 ID */
 export type NotificationSoundId = 'ding' | 'ding-dong' | 'discord' | 'done' | 'down-power' | 'food' | 'lite' | 'quiet' | 'none'
@@ -20,6 +20,8 @@ export interface NotificationSoundSettings {
   permissionRequest?: NotificationSoundId
   /** 计划审批 */
   exitPlanMode?: NotificationSoundId
+  /** Todo / 日程到期提醒 */
+  planningReminder?: NotificationSoundId
 }
 
 /** 语音输入供应商 */
@@ -90,6 +92,36 @@ export interface VoiceDictationStateEvent {
   message?: string
 }
 
+/** 渲染进程请求切换听写时携带的来源输入框。 */
+export interface VoiceDictationToggleInput {
+  sourceInputId?: string
+}
+
+/** 主进程冻结的一次听写输出上下文。 */
+export interface VoiceDictationOutputContext {
+  /** 本次听写是否写入 Proma 内部输入框。 */
+  routeToPromaInput: boolean
+  /** 会话开始时选择的输出模式。 */
+  outputMode: VoiceDictationOutputMode
+}
+
+/** 主进程确认开始听写时，告知渲染进程本次输出是否应路由到 Proma 输入框。 */
+export interface VoiceDictationShownEvent {
+  routeToPromaInput: boolean
+  /** 主进程生成的冻结输出上下文 ID，后续 preview / commit / cancel 必须原样带回。 */
+  outputContextId: string
+  sourceInputId?: string
+}
+
+/** 外部应用听写状态条的实时显示数据。 */
+export interface VoiceDictationIndicatorEvent {
+  state: 'preparing' | 'recording' | 'stopping'
+  /** 已归一化、平滑处理后的麦克风音量（0~1）。 */
+  volume: number
+  /** 尚未提交给第三方应用的实时转写文本。 */
+  transcript: string
+}
+
 /** 开始语音输入会话参数 */
 export interface VoiceDictationStartInput {
   sessionId: string
@@ -101,14 +133,50 @@ export interface VoiceDictationAudioChunkInput {
   data: ArrayBuffer
 }
 
+/** 将当前识别结果作为 Proma 输入框中的临时组合文本预览。 */
+export interface VoiceDictationPreviewInput {
+  sessionId: string
+  text: string
+  /** 本次听写会话冻结的 Proma 输入目标；null 表示不路由到内部输入框。 */
+  targetInputId?: string | null
+  /** 主进程生成的冻结输出上下文 ID。 */
+  outputContextId?: string
+}
+
 /** 结束语音输入会话参数 */
 export interface VoiceDictationStopInput {
+  /** 当前 ASR WebSocket 会话 ID */
   sessionId: string
+  /** 跨 ASR 重连保持稳定的听写会话 ID */
+  previewSessionId?: string
+  /** 取消预览时应清理的 Proma 输入目标。 */
+  targetInputId?: string | null
+  /** 主进程生成的冻结输出上下文 ID。 */
+  outputContextId?: string
 }
 
 /** 输出语音输入文本参数 */
 export interface VoiceDictationCommitInput {
+  sessionId: string
   text: string
+  /** 本次听写会话冻结的 Proma 输入目标；null 表示不路由到内部输入框。 */
+  targetInputId?: string | null
+  /** 主进程生成的冻结输出上下文 ID。 */
+  outputContextId?: string
+}
+
+/** 主窗口接收的语音组合文本事件。 */
+export interface VoiceDictationTextEvent {
+  sessionId: string
+  text: string
+  /** 本次听写会话冻结的 Proma 输入目标；null 表示交给全局 fallback 处理。 */
+  targetInputId?: string | null
+}
+
+/** 渲染进程确认最终听写文本是否被目标输入框消费。 */
+export interface VoiceDictationTextDeliveryInput {
+  sessionId: string
+  delivered: boolean
 }
 
 /** 调整语音输入浮窗尺寸参数 */
@@ -153,8 +221,20 @@ export interface ShortcutOverrides {
 /** 主题模式 */
 export type ThemeMode = 'light' | 'dark' | 'system' | 'special'
 
+/** 所有合法的特殊风格值（白名单，新增主题时只需追加这里） */
+export const THEME_STYLES = [
+  'default',
+  'ocean-light',
+  'ocean-dark',
+  'forest-light',
+  'forest-dark',
+  'slate-light',
+  'slate-dark',
+  'terminal-dark',
+] as const
+
 /** 特殊风格主题 */
-export type ThemeStyle = 'default' | 'ocean-light' | 'ocean-dark' | 'forest-light' | 'forest-dark' | 'slate-light' | 'slate-dark'
+export type ThemeStyle = (typeof THEME_STYLES)[number]
 
 /** 默认主题模式 */
 export const DEFAULT_THEME_MODE: ThemeMode = 'dark'
@@ -162,11 +242,36 @@ export const DEFAULT_THEME_MODE: ThemeMode = 'dark'
 /** 默认特殊风格 */
 export const DEFAULT_THEME_STYLE: ThemeStyle = 'default'
 
+/** 界面风格：经典保留旧版视觉，现代使用当前更克制的 UI */
+export type InterfaceVariant = 'classic' | 'modern'
+
+/** 默认界面风格 */
+export const DEFAULT_INTERFACE_VARIANT: InterfaceVariant = 'modern'
+
 /** Markdown 预览字号档位 */
 export type MarkdownFontSize = 'small' | 'medium' | 'large'
 
 /** 默认 Markdown 字号档位 */
 export const DEFAULT_MARKDOWN_FONT_SIZE: MarkdownFontSize = 'medium'
+
+/** macOS 原生 Agent 灵动岛偏好。 */
+export interface AgentIslandSettings {
+  /** 是否启用 Agent / 近期 Todo 日程的灵动岛提醒，默认 true。 */
+  enabled?: boolean
+}
+
+/**
+ * 给无视觉输入能力的 Agent 使用的独立视觉模型路由。
+ * 仅保存用户已有渠道和模型的 ID，凭据继续由渠道加密存储管理。
+ */
+export interface VisionRelaySettings {
+  enabled: boolean
+  channelId?: string
+  modelId?: string
+}
+
+/** 提升此版本可要求用户重新确认更新后的受管浏览器风险告知。 */
+export const BROWSER_RISK_DISCLAIMER_VERSION = 1
 
 /** 应用设置 */
 export interface AppSettings {
@@ -174,16 +279,22 @@ export interface AppSettings {
   themeMode: ThemeMode
   /** 特殊风格主题 */
   themeStyle?: ThemeStyle
-  /** Agent 默认渠道 ID（仅限 Anthropic 渠道） — 当前选中的渠道 */
+  /** 界面风格 */
+  interfaceVariant?: InterfaceVariant
+  /** Agent 默认渠道 ID（由当前 Agent Core 解释） — 当前选中的渠道 */
   agentChannelId?: string
   /** Agent 默认模型 ID */
   agentModelId?: string
-  /** Agent 启用的渠道 ID 列表（多选，Switch 开关） */
-  agentChannelIds?: string[]
   /** Agent 当前工作区 ID */
   agentWorkspaceId?: string
+  /** Windows 上 Agent Bash 工具的运行环境；默认自动选择 Git Bash，WSL 需用户显式启用。 */
+  windowsShellPreference?: WindowsShellPreference
+  /** 侧栏「自动任务」合成项目组在项目列表中的位置索引（默认 0 = 最靠前；可拖拽调整） */
+  agentAutomationGroupOrder?: number
   /** 是否已完成 Onboarding 流程 */
   onboardingCompleted?: boolean
+  /** 已完成的 Onboarding 版本；低于当前版本时会再次展示引导。 */
+  onboardingVersion?: number
   /** 是否跳过了环境检测 */
   environmentCheckSkipped?: boolean
   /** 最后一次环境检测结果（缓存） */
@@ -200,6 +311,8 @@ export interface AppSettings {
   agentThinking?: ThinkingConfig
   /** Agent 推理深度 */
   agentEffort?: AgentEffort
+  /** OpenAI 新会话默认思考深度 */
+  defaultOpenAIThinkingLevel?: AgentThinkingLevel
   /** Agent 最大预算（美元/次） */
   agentMaxBudgetUsd?: number
   /** Agent 最大轮次（0 或 undefined = SDK 默认） */
@@ -214,6 +327,12 @@ export interface AppSettings {
   shortcutOverrides?: ShortcutOverrides
   /** 是否显示用户消息悬浮置顶条（默认 true） */
   stickyUserMessageEnabled?: boolean
+  /** 左侧会话列表悬浮预览迷你地图（默认 false，需手动开启） */
+  sessionHoverPreviewEnabled?: boolean
+  /** 粘贴超过阈值的长文本时是否自动转为附件（默认 false） */
+  longTextPasteAsAttachmentEnabled?: boolean
+  /** 输入框是否渲染 Markdown 富文本格式（默认 false，关闭后为纯文本模式，仍保留 Mention 引用） */
+  richTextRenderingEnabled?: boolean
   /** Markdown 预览字号档位（默认 'medium'，对应 15px） */
   markdownFontSize?: MarkdownFontSize
   /** 上次是否在 Scratch Pad 页（用于重启恢复） */
@@ -224,12 +343,41 @@ export interface AppSettings {
   voiceDictation?: VoiceDictationPersistedSettings
   /** 飞书 Session 镜像设置：每个 Proma Session 可创建一个仅包含用户与指定 Bot 的飞书群 */
   feishuSessionMirror?: FeishuSessionMirrorSettings
+  /** 无视觉输入能力 Agent 的视觉助手路由 */
+  visionRelay?: VisionRelaySettings
+  /** 已确认的受管浏览器风险告知版本；低于当前版本时首次使用会再次要求确认。 */
+  browserRiskDisclaimerVersion?: number
+  /** 用户手动关闭的 Proma 内置 MCP ID 列表（针对默认开启的内置 MCP） */
+  builtinMcpDisabledIds?: string[]
+  /** 用户手动开启的 Proma 内置 MCP ID 列表（针对默认关闭的内置 MCP，如 nano-banana、mem） */
+  builtinMcpEnabledIds?: string[]
   /** 启动时自动清理临时文件（proma-preview、proma-installers），默认 true */
   autoCleanupTempOnStart?: boolean
   /** 自动清理 N 天前已归档会话的 SDK 数据（0 = 禁用，默认 0） */
   autoCleanupArchivedDays?: number
+  /**
+   * Agent 代创建 git commit / PR 时是否附加 Proma 推广标识。
+   * 默认 true：commit trailer `Made-with: Proma`，PR body 末尾含 https://proma.cool 与 https://github.com/proma-ai/Proma。
+   * 关闭后不注入任何 Proma 归因，并覆盖 Claude SDK 默认 Co-Authored-By。
+   */
+  gitAttributionEnabled?: boolean
+  /** macOS 原生 Agent 灵动岛偏好。 */
+  agentIsland?: AgentIslandSettings
   /** 主窗口状态（大小、位置、是否最大化） */
   mainWindowState?: MainWindowState
+  /** 独立任务/日程窗口状态（大小、位置、是否最大化） */
+  planningWindowState?: MainWindowState
+}
+
+/** 当前发布的 Onboarding 内容版本。提升该值可让所有用户重新完成新版引导。 */
+export const CURRENT_ONBOARDING_VERSION = 2
+
+/** 仅当用户完成过当前版本的引导时，才不再展示 Onboarding。 */
+export function hasCompletedCurrentOnboarding(
+  settings: Pick<AppSettings, 'onboardingCompleted' | 'onboardingVersion'>,
+): boolean {
+  return settings.onboardingCompleted === true
+    && (settings.onboardingVersion ?? 0) >= CURRENT_ONBOARDING_VERSION
 }
 
 /** 主窗口大小、位置和最大化状态 */
@@ -270,6 +418,8 @@ export const SCRATCH_PAD_IPC_CHANNELS = {
   EXPORT: 'scratch-pad:export',
   /** 打开保存对话框选择导出路径 */
   CHOOSE_EXPORT_PATH: 'scratch-pad:choose-export-path',
+  /** 将图片写入系统剪贴板 */
+  COPY_IMAGE: 'scratch-pad:copy-image',
 } as const
 
 /** 应用图标 IPC 通道 */
@@ -294,6 +444,8 @@ export const QUICK_TASK_IPC_CHANNELS = {
   FOCUS: 'quick-task:focus',
   /** 重新注册全局快捷键（设置变更后） */
   REREGISTER_GLOBAL_SHORTCUTS: 'quick-task:reregister-global-shortcuts',
+  /** 查询当前已成功注册的全局快捷键 */
+  GET_GLOBAL_SHORTCUT_REGISTRATION_STATUS: 'quick-task:get-global-shortcut-registration-status',
 } as const
 
 /** 语音输入 IPC 通道 */
@@ -314,6 +466,8 @@ export const VOICE_DICTATION_IPC_CHANNELS = {
   STOP: 'voice-dictation:stop',
   /** 取消语音输入会话 */
   CANCEL: 'voice-dictation:cancel',
+  /** 同步 Proma 输入框中的临时识别文本 */
+  PREVIEW: 'voice-dictation:preview',
   /** 输出最终文本 */
   COMMIT: 'voice-dictation:commit',
   /** 隐藏语音输入窗口 */
@@ -328,8 +482,20 @@ export const VOICE_DICTATION_IPC_CHANNELS = {
   TRANSCRIPT: 'voice-dictation:transcript',
   /** 状态事件 */
   STATE: 'voice-dictation:state',
+  /** 外部应用听写状态条事件 */
+  INDICATOR_STATE: 'voice-dictation:indicator-state',
+  /** 主窗口上报麦克风音量，用于外部应用状态条。 */
+  REPORT_VOLUME: 'voice-dictation:report-volume',
+  /** 主窗口上报实时转写，用于外部应用状态条。 */
+  REPORT_TRANSCRIPT: 'voice-dictation:report-transcript',
   /** 主窗口插入文本 */
   INSERT_TEXT: 'voice-dictation:insert-text',
+  /** 主窗口确认最终文本是否已被输入目标消费。 */
+  ACK_INSERT_TEXT: 'voice-dictation:ack-insert-text',
+  /** 主窗口更新临时组合文本 */
+  PREVIEW_TEXT: 'voice-dictation:preview-text',
+  /** 主窗口撤销临时组合文本 */
+  CLEAR_PREVIEW_TEXT: 'voice-dictation:clear-preview-text',
   /** 检查麦克风权限状态 */
   CHECK_MIC_PERMISSION: 'voice-dictation:check-mic-permission',
   /** 请求麦克风权限 */
@@ -382,6 +548,20 @@ export const TRAY_IPC_CHANNELS = {
   OPEN_AGENT_SESSION: 'tray:open-agent-session',
   /** 创建新会话 */
   CREATE_SESSION: 'tray:create-session',
+} as const
+
+/** Windows Agent Island IPC 通道（主进程 ↔ 渲染进程） */
+export const WINDOWS_AGENT_ISLAND_IPC_CHANNELS = {
+  /** 主进程 → 渲染进程：委托播放提示音 */
+  PLAY_SOUND: 'windows-agent-island:play-sound',
+  /** 渲染进程（悬停窗）→ 主进程：点击跳转到会话 */
+  OPEN_SESSION: 'windows-agent-island:open-session',
+  /** 主进程 → 渲染进程（悬停窗）：推送全量 snapshot */
+  PUSH_SNAPSHOT: 'windows-agent-island:push-snapshot',
+  /** 渲染进程（悬停窗）→ 主进程：鼠标进入气泡区域 */
+  MOUSE_ENTER: 'windows-agent-island:mouse-enter',
+  /** 渲染进程（悬停窗）→ 主进程：鼠标离开气泡区域 */
+  MOUSE_LEAVE: 'windows-agent-island:mouse-leave',
 } as const
 
 /** 存储管理 IPC 通道 */

@@ -14,7 +14,8 @@ import { AlertTriangle, Bot, Loader2, MessageSquare } from 'lucide-react'
 import { UserAvatar } from '@/components/chat/UserAvatar'
 import { tabMinimapCacheAtom, type TabMinimapItem } from '@/atoms/tab-atoms'
 import { userProfileAtom } from '@/atoms/user-profile'
-import { getModelLogo } from '@/lib/model-logo'
+import { getModelLogo, resolveModelProvider } from '@/lib/model-logo'
+import { channelsAtom } from '@/atoms/chat-atoms'
 import { cn } from '@/lib/utils'
 import type {
   ChatMessage,
@@ -25,6 +26,7 @@ import type {
   SDKUserContentBlock,
   SDKUserMessage,
 } from '@proma/shared'
+import { getSDKCompactStatus } from '@proma/shared'
 
 export type SessionMiniMapType = 'chat' | 'agent'
 
@@ -44,6 +46,7 @@ interface UseSessionMiniMapHoverReturn {
   handleMouseLeave: () => void
   handlePanelMouseEnter: () => void
   handlePanelMouseLeave: () => void
+  closeNow: () => void
 }
 
 interface SessionMiniMapPopoverProps {
@@ -103,6 +106,14 @@ export function useSessionMiniMapHover(delayMs = 600, disabled = false): UseSess
     anchorRef.current = node
   }, [])
 
+  const closeNow = React.useCallback((): void => {
+    if (enterTimerRef.current) clearTimeout(enterTimerRef.current)
+    if (leaveTimerRef.current) clearTimeout(leaveTimerRef.current)
+    if (fadeTimerRef.current) clearTimeout(fadeTimerRef.current)
+    setIsOpen(false)
+    setIsLeaving(false)
+  }, [])
+
   const handleMouseEnter = React.useCallback((): void => {
     if (disabled) return
     if (leaveTimerRef.current) clearTimeout(leaveTimerRef.current)
@@ -139,6 +150,7 @@ export function useSessionMiniMapHover(delayMs = 600, disabled = false): UseSess
     handleMouseLeave: closeWithDelay,
     handlePanelMouseEnter,
     handlePanelMouseLeave: closeWithDelay,
+    closeNow,
   }
 }
 
@@ -146,6 +158,7 @@ function normalizePreviewText(text: string): string {
   return text
     .replace(/<attached_files>[\s\S]*?<\/attached_files>\n*/g, '')
     .replace(/<quoted_file[^>]*>[\s\S]*?<\/quoted_file>\n*/g, '')
+    .replace(/<quoted_context[^>]*>[\s\S]*?<\/quoted_context>\n*/g, '')
     .replace(/\r\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
@@ -213,13 +226,18 @@ function buildAgentMinimapItems(messages: SDKMessage[], userAvatar?: string): Ta
 
     if (message.type === 'system') {
       const system = message as SDKSystemMessage
-      const preview = system.subtype === 'compact_boundary'
+      const compactStatus = getSDKCompactStatus(system)
+      const preview = compactStatus === 'success'
         ? '上下文已压缩'
-        : system.subtype === 'compacting'
-          ? '正在压缩上下文...'
-          : system.subtype === 'permission_denied'
-            ? '自动审批已拒绝操作'
-            : ''
+        : compactStatus === 'noop'
+          ? '当前上下文无需压缩'
+          : compactStatus === 'compacting'
+            ? '正在压缩上下文...'
+            : compactStatus === 'failed'
+              ? '上下文压缩失败'
+              : system.subtype === 'permission_denied'
+              ? '权限检查已拒绝操作'
+              : ''
       if (preview) {
         items.push({
           id: `${system.subtype ?? 'system'}-${items.length}`,
@@ -314,13 +332,14 @@ function PreviewText({ text }: { text: string }): React.ReactElement {
 }
 
 function ItemIcon({ item, type }: { item: TabMinimapItem; type: SessionMiniMapType }): React.ReactElement {
+  const channels = useAtomValue(channelsAtom)
   if (item.role === 'user' && item.avatar) {
     return <UserAvatar avatar={item.avatar} size={16} className="mt-0.5" />
   }
   if (item.role === 'assistant' && item.model) {
     return (
       <img
-        src={getModelLogo(item.model)}
+        src={getModelLogo(item.model, resolveModelProvider(item.model, channels))}
         alt=""
         className="size-4 shrink-0 mt-0.5 rounded-[20%] object-cover"
       />
