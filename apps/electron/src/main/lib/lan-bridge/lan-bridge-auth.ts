@@ -56,19 +56,40 @@ export type TokenVerificationResult =
   | { valid: true; deviceId: string }
   | { valid: false; errorCode?: 'TOKEN_INVALID' | 'TOKEN_EXPIRED' | 'DEVICE_REVOKED' }
 
+/** 认证模块用于记录非致命持久化故障的安全 logger。 */
+export interface LanBridgeAuthLogger {
+  /** 记录不含凭据的中文警告。 */
+  warn: (message: string) => void
+}
+
+const DEFAULT_LOGGER: LanBridgeAuthLogger = {
+  warn: message => console.warn(message),
+}
+
 let currentPin = ''
 let hmacKey = ''
 const pairingAttempts = new Map<string, PairingAttemptState>()
 const pairingTickets = new Map<string, PairingTicketState>()
 let activeDeviceStore: LanBridgeDeviceStore | null = null
+let activeLogger: LanBridgeAuthLogger = DEFAULT_LOGGER
 
-/** 初始化认证：生成 PIN 和 HMAC 密钥 */
-export function initAuth(deviceStore: LanBridgeDeviceStore = new LanBridgeDeviceStore()): string {
+/**
+ * 初始化认证：生成 PIN 和 HMAC 密钥。
+ *
+ * @param deviceStore 已配对设备仓库
+ * @param logger 仅记录无凭据警告的安全 logger
+ * @returns 当前配对 PIN
+ */
+export function initAuth(
+  deviceStore: LanBridgeDeviceStore = new LanBridgeDeviceStore(),
+  logger: LanBridgeAuthLogger = DEFAULT_LOGGER,
+): string {
   currentPin = generatePin()
   hmacKey = randomBytes(32).toString('hex')
   pairingAttempts.clear()
   pairingTickets.clear()
   activeDeviceStore = deviceStore
+  activeLogger = logger
   return currentPin
 }
 
@@ -264,8 +285,10 @@ export function verifyTokenDetails(token: string, ip: string, now = Date.now()):
 
     try {
       getDeviceStore().updateLastSeen(device.id, now)
-    } catch {
-      // 最近访问时间是 best-effort 元数据，持久化失败不能改变认证结论。
+    } catch (error) {
+      /** 安全错误摘要只保留类型，不包含可能携带凭据的异常消息。 */
+      const errorName = error instanceof Error ? error.name : 'UnknownError'
+      activeLogger.warn(`[LAN Bridge] 设备 ${device.id} 最近访问时间持久化失败（${errorName}）`)
     }
     return { valid: true, deviceId: device.id }
   } catch {

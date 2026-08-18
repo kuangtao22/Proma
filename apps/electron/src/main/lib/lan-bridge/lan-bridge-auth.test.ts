@@ -136,6 +136,8 @@ describe('LAN Bridge 设备 Token', () => {
   test('lastSeen 原子写失败不改变 Token 认证结果且下次访问会重试', () => {
     /** 当前用例累计的原子写入次数。 */
     let writeCount = 0
+    /** 当前用例捕获的安全 warning，不修改全局 console。 */
+    const warnings: string[] = []
     /** 当前用例独占的配置目录。 */
     const configDir = mkdtempSync(join(tmpdir(), 'proma-lan-auth-last-seen-'))
     temporaryDirectories.push(configDir)
@@ -143,11 +145,11 @@ describe('LAN Bridge 设备 Token', () => {
     const store = new LanBridgeDeviceStore(configDir, {
       writeJson: () => {
         writeCount++
-        if (writeCount === 2) throw new Error('disk failure')
+        if (writeCount === 2) throw new Error('token=secret-credential')
       },
       uuid: () => 'device-1',
     })
-    auth.initAuth(store)
+    auth.initAuth(store, { warn: message => warnings.push(message) })
     /** 用于触发节流持久化的设备 Token。 */
     const result = auth.generateToken('192.168.1.8', 'iPhone', 1_000)
 
@@ -155,11 +157,15 @@ describe('LAN Bridge 设备 Token', () => {
       valid: true,
       deviceId: 'device-1',
     })
+    expect(warnings).toEqual(['[LAN Bridge] 设备 device-1 最近访问时间持久化失败（Error）'])
+    expect(warnings[0]).not.toContain('secret-credential')
+    expect(warnings[0]).not.toContain(result.token)
     expect(auth.verifyTokenDetails(result.token, '192.168.1.8', 61_001)).toEqual({
       valid: true,
       deviceId: 'device-1',
     })
     expect(writeCount).toBe(3)
+    expect(warnings).toHaveLength(1)
   })
 
   test('设备撤销后旧 Token 立即失效', () => {
