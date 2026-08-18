@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import { LAN_BRIDGE_IPC_CHANNELS } from '@proma/shared'
-import type { LanBridgeConfig, LanBridgeRuntimeState } from '@proma/shared'
+import type {
+  LanBridgeConfig,
+  LanBridgeDeviceDto,
+  LanBridgeRuntimeState,
+} from '@proma/shared'
 import type { IpcRendererEvent } from 'electron'
 import {
   createLanBridgePreloadApi,
@@ -42,7 +46,7 @@ function createRecordingIpc(
 }
 
 describe('LAN Bridge preload API', () => {
-  test('Given 七个 invoke API When 逐一调用 Then 使用正确通道参数并返回原值', async () => {
+  test('Given 十个 invoke API When 逐一调用 Then 使用正确通道参数并返回原值', async () => {
     /** 配置查询返回的同一对象。 */
     const config: LanBridgeConfig = { enabled: false, port: 29888, maxConnections: 20 }
     /** 配置更新返回的同一对象。 */
@@ -55,6 +59,20 @@ describe('LAN Bridge preload API', () => {
       localIp: '192.168.1.8',
       connectedClients: [],
     }
+    /** 已配对设备安全元数据。 */
+    const device: LanBridgeDeviceDto = {
+      id: 'device-1',
+      name: 'iPhone',
+      createdAt: 10,
+      lastSeenAt: 20,
+      tokenVersion: 1,
+    }
+    /** 二维码 IPC 返回值。 */
+    const pairingQr = { qrCodeData: 'data:image/png;base64,qr', expiresAt: 120_000 }
+    /** 设备列表 IPC 返回值。 */
+    const devices = { devices: [device] }
+    /** 撤销设备 IPC 返回值。 */
+    const revoked = { revoked: true, device }
     /** 按通道配置 IPC 返回值。 */
     const results = new Map<string, unknown>([
       [LAN_BRIDGE_IPC_CHANNELS.GET_CONFIG, config],
@@ -64,6 +82,9 @@ describe('LAN Bridge preload API', () => {
       [LAN_BRIDGE_IPC_CHANNELS.STOP, undefined],
       [LAN_BRIDGE_IPC_CHANNELS.GET_PIN, '123456'],
       [LAN_BRIDGE_IPC_CHANNELS.REFRESH_PIN, '654321'],
+      [LAN_BRIDGE_IPC_CHANNELS.GET_PAIRING_QR, pairingQr],
+      [LAN_BRIDGE_IPC_CHANNELS.LIST_DEVICES, devices],
+      [LAN_BRIDGE_IPC_CHANNELS.REVOKE_DEVICE, revoked],
     ])
     /** 记录 preload API 产生的 IPC 调用。 */
     const { ipc, invokes } = createRecordingIpc(results)
@@ -79,6 +100,9 @@ describe('LAN Bridge preload API', () => {
     expect(await api.stopLanBridge()).toBeUndefined()
     expect(await api.getLanBridgePin()).toBe('123456')
     expect(await api.refreshLanBridgePin()).toBe('654321')
+    expect(await api.getLanBridgePairingQr()).toBe(pairingQr)
+    expect(await api.listLanBridgeDevices({ includeRevoked: false })).toBe(devices)
+    expect(await api.revokeLanBridgeDevice({ deviceId: device.id })).toBe(revoked)
     expect(invokes).toEqual([
       { channel: LAN_BRIDGE_IPC_CHANNELS.GET_CONFIG, args: [] },
       { channel: LAN_BRIDGE_IPC_CHANNELS.UPDATE_CONFIG, args: [updates] },
@@ -87,6 +111,9 @@ describe('LAN Bridge preload API', () => {
       { channel: LAN_BRIDGE_IPC_CHANNELS.STOP, args: [] },
       { channel: LAN_BRIDGE_IPC_CHANNELS.GET_PIN, args: [] },
       { channel: LAN_BRIDGE_IPC_CHANNELS.REFRESH_PIN, args: [] },
+      { channel: LAN_BRIDGE_IPC_CHANNELS.GET_PAIRING_QR, args: [] },
+      { channel: LAN_BRIDGE_IPC_CHANNELS.LIST_DEVICES, args: [{ includeRevoked: false }] },
+      { channel: LAN_BRIDGE_IPC_CHANNELS.REVOKE_DEVICE, args: [{ deviceId: device.id }] },
     ])
   })
 

@@ -1,5 +1,13 @@
 import { LAN_BRIDGE_IPC_CHANNELS } from '@proma/shared'
-import type { LanBridgeConfig, LanBridgeRuntimeState } from '@proma/shared'
+import type {
+  LanBridgeConfig,
+  LanBridgeGetPairingQrResponse,
+  LanBridgeListDevicesRequest,
+  LanBridgeListDevicesResponse,
+  LanBridgeRevokeDeviceRequest,
+  LanBridgeRevokeDeviceResponse,
+  LanBridgeRuntimeState,
+} from '@proma/shared'
 import type { IpcRendererEvent } from 'electron'
 
 /** LAN Bridge preload 暴露给 renderer 的稳定 API。 */
@@ -18,6 +26,12 @@ export interface LanBridgePreloadApi {
   getLanBridgePin: () => Promise<string>
   /** 刷新并返回配对 PIN。 */
   refreshLanBridgePin: () => Promise<string>
+  /** 创建当前 LAN Bridge 的一次性扫码配对二维码。 */
+  getLanBridgePairingQr: () => Promise<LanBridgeGetPairingQrResponse>
+  /** 查询已配对设备，默认不包含已撤销设备。 */
+  listLanBridgeDevices: (request?: LanBridgeListDevicesRequest) => Promise<LanBridgeListDevicesResponse>
+  /** 撤销设备访问权并断开该设备的现有连接。 */
+  revokeLanBridgeDevice: (request: LanBridgeRevokeDeviceRequest) => Promise<LanBridgeRevokeDeviceResponse>
   /** 订阅 LAN Bridge 状态变化，并返回取消订阅函数。 */
   onLanBridgeStatusChanged: (listener: (state: LanBridgeRuntimeState) => void) => () => void
 }
@@ -48,6 +62,15 @@ export function createLanBridgePreloadApi(ipc: LanBridgePreloadIpc): LanBridgePr
     stopLanBridge: () => ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.STOP) as Promise<void>,
     getLanBridgePin: () => ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.GET_PIN) as Promise<string>,
     refreshLanBridgePin: () => ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.REFRESH_PIN) as Promise<string>,
+    getLanBridgePairingQr: () => (
+      ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.GET_PAIRING_QR) as Promise<LanBridgeGetPairingQrResponse>
+    ),
+    listLanBridgeDevices: (request = {}) => (
+      ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.LIST_DEVICES, request) as Promise<LanBridgeListDevicesResponse>
+    ),
+    revokeLanBridgeDevice: (request) => (
+      ipc.invoke(LAN_BRIDGE_IPC_CHANNELS.REVOKE_DEVICE, request) as Promise<LanBridgeRevokeDeviceResponse>
+    ),
     onLanBridgeStatusChanged: (listener) => {
       /** 转换 Electron 事件参数，只向 renderer listener 传递运行状态。 */
       const handler = (_event: IpcRendererEvent, state: unknown): void => {

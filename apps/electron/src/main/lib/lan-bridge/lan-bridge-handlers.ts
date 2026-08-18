@@ -9,6 +9,21 @@ import type { LanBridgeAuthService, TokenVerificationResult } from './lan-bridge
 import type { ClientConnection, RouteHandler } from './lan-bridge-types'
 import type { LanBridgeSessionManager } from './lan-bridge-session'
 import type { LanBridgePromaAdapter } from './lan-bridge-proma-adapter-core'
+import {
+  LAN_BRIDGE_CAPABILITIES,
+  LAN_BRIDGE_PROTOCOL_VERSION,
+} from '@proma/shared'
+import type { LanBridgeConnectedPayload } from '@proma/shared'
+
+/** 构造 WebSocket 建连后的协议能力声明。 */
+export function createLanBridgeConnectedPayload(serverVersion: string): LanBridgeConnectedPayload {
+  return {
+    message: 'Proma LAN Bridge',
+    protocolVersion: LAN_BRIDGE_PROTOCOL_VERSION,
+    serverVersion,
+    capabilities: [...LAN_BRIDGE_CAPABILITIES],
+  }
+}
 
 /** handlers 的进程级组合依赖。 */
 export interface LanBridgeHandlerDependencies {

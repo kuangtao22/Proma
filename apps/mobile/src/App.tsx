@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useRef } from 'react'
+import { useEffect, useCallback, useRef, useState } from 'react'
 import { useAtom, useSetAtom, useAtomValue } from 'jotai'
 import {
   viewAtom, tokenAtom, connectedAtom, bridgeHostAtom, bridgePortAtom,
@@ -16,6 +16,11 @@ import {
 } from './lib/recovery-guards'
 import { AuthPage } from './components/layout/AuthPage'
 import { AppShell } from './components/layout/AppShell'
+import {
+  consumePairingLink,
+  getPairingFailureMessage,
+  supportsPairingTicket,
+} from './lib/pairing-link'
 
 interface ConvListResponse { conversations: ConvItem[] }
 interface SessionListResponse { sessions: ConvItem[] }
@@ -26,6 +31,20 @@ interface RestoredSettings {
   channelBaseUrl: string | null
   channelId: string | null
 }
+
+/** 启动时立即读取并清除 fragment；票据绝不进入 React 状态或持久化。 */
+let startupPairingLink = consumePairingLink({
+  getHref: () => window.location.href,
+  replaceUrl: cleanUrl => window.history.replaceState(null, '', cleanUrl),
+})
+/** 等待服务端能力声明的一次性票据，完成任一终态后立即清空。 */
+let pendingPairingTicket = startupPairingLink?.ticket ?? null
+/** 扫码链接声明的真实连接目标，避免旧 localStorage 地址覆盖二维码地址。 */
+const startupPairingTarget = startupPairingLink
+  ? readPairingTarget(startupPairingLink.cleanUrl)
+  : null
+// host/port 提取完成后释放原始对象，避免已清空的 ticket 仍被间接长期引用。
+startupPairingLink = null
 
 export interface LoadDataResult {
   conversationsUpdated: boolean
@@ -55,8 +74,16 @@ export function App() {
   const setModelId = useSetAtom(settingsModelIdAtom)
   const setChannelBaseUrl = useSetAtom(settingsChannelBaseUrlAtom)
   const setChannelId = useSetAtom(settingsChannelIdAtom)
+  const [pairingPending, setPairingPending] = useState(pendingPairingTicket !== null)
+  const [pairingError, setPairingError] = useState('')
   /** 每次连接 open 使用独立 generation，旧异步认证无法回写。 */
   const connectionGenerations = useRef(createGenerationTracker())
+
+  /** 保存认证 Token 并进入聊天；凭据只沿用既有 Token 存储语义。 */
+  const handleAuthSuccess = useCallback(async (newToken: string) => {
+    localStorage.setItem('proma_mobile_token', newToken)
+    setToken(newToken); setConnected(true); setView('chat')
+  }, [setToken, setConnected, setView])
 
   // 认证过期处理
   useEffect(() => {
@@ -76,12 +103,38 @@ export function App() {
   // 页面加载时自动连接，并优先恢复已保存的认证 Token。
   useEffect(() => {
     let cancelled = false
+    /** 当前 socket open 对应的 generation，供 connected capability 回调校验。 */
+    let activeGeneration: number | null = null
+    /** 防止同一连接的重复 connected push 并发消费一次性票据。 */
+    let pairingRequestInFlight = false
+    /** 等待 connected capability 的超时任务，完全无法连接时回退 PIN。 */
+    let pairingCapabilityTimer: number | null = pendingPairingTicket
+      ? window.setTimeout(() => {
+          if (cancelled || !pendingPairingTicket) return
+          pendingPairingTicket = null
+          setPairingPending(false)
+          setPairingError('连接超时，请检查电脑与手机是否在同一局域网')
+        }, 15_000)
+      : null
+    /** 清理当前 capability 等待任务。 */
+    const clearPairingCapabilityTimer = (): void => {
+      if (pairingCapabilityTimer === null) return
+      window.clearTimeout(pairingCapabilityTimer)
+      pairingCapabilityTimer = null
+    }
     const unsubscribeOpen = onOpen(async (_ws, isReconnect) => {
       const generation = connectionGenerations.current.begin()
+      activeGeneration = generation
       /** 旧连接 effect 或旧 open 回调均不能继续提交状态。 */
       const isCurrent = () => !cancelled && connectionGenerations.current.isCurrent(generation)
       /** 每次连接建立后重新读取 Token，避免使用首次渲染的陈旧状态。 */
       const currentToken = localStorage.getItem('proma_mobile_token')
+      if (pendingPairingTicket) {
+        if (!isCurrent()) return
+        setToken(null); setConnected(false); setView('auth')
+        setPairingPending(true); setPairingError('')
+        return
+      }
       if (!currentToken) {
         if (!isCurrent()) return
         setToken(null); setConnected(false); setView('auth')
@@ -148,16 +201,63 @@ export function App() {
       }
     })
 
-    connect(host, port)
+    const unsubscribePairing = onPush((message) => {
+      if (message.type !== 'connected' || !pendingPairingTicket || pairingRequestInFlight) return
+      /** capability push 必须属于当前有效连接。 */
+      const generation = activeGeneration
+      if (generation === null || cancelled || !connectionGenerations.current.isCurrent(generation)) return
+      clearPairingCapabilityTimer()
+      if (!supportsPairingTicket(message.data)) {
+        pendingPairingTicket = null
+        setPairingPending(false)
+        setPairingError('当前电脑端不支持扫码配对，请使用 PIN 码连接')
+        return
+      }
+
+      pairingRequestInFlight = true
+      /** 请求期间只在局部变量保留票据，不写日志或长期状态。 */
+      const ticket = pendingPairingTicket
+      void wsReq('auth.pairTicket', { ticket, deviceName: 'Proma 手机端' })
+        .then(async (result) => {
+          if (cancelled || !connectionGenerations.current.isCurrent(generation)) return
+          /** 票据成功消费后立即从内存清除。 */
+          pendingPairingTicket = null
+          pairingRequestInFlight = false
+          setPairingPending(false)
+          const issued = result as { token?: unknown }
+          if (typeof issued.token !== 'string' || !issued.token) {
+            setPairingError('扫码配对响应无效，请使用 PIN 码连接')
+            return
+          }
+          if (startupPairingTarget) {
+            localStorage.setItem('proma_mobile_host', startupPairingTarget.host)
+            localStorage.setItem('proma_mobile_port', startupPairingTarget.port)
+          }
+          await handleAuthSuccess(issued.token)
+        })
+        .catch((error: unknown) => {
+          if (cancelled || !connectionGenerations.current.isCurrent(generation)) return
+          /** 失败票据不重放，保留 PIN 表单作为确定性回退。 */
+          pendingPairingTicket = null
+          pairingRequestInFlight = false
+          setPairingPending(false)
+          setPairingError(getPairingFailureMessage(error))
+        })
+    })
+
+    /** 二维码当前地址优先于旧设备保存的连接目标。 */
+    connect(startupPairingTarget?.host ?? host, startupPairingTarget?.port ?? port)
     return () => {
       cancelled = true
+      clearPairingCapabilityTimer()
       connectionGenerations.current.invalidate()
       unsubscribeOpen()
+      unsubscribePairing()
       close()
     }
   }, [
     host, port, setActive, setChannelBaseUrl, setChannelId, setConnected,
-    setConvs, setCurrentWsId, setModelId, setToken, setView, setWorkspaces,
+    handleAuthSuccess, setConvs, setCurrentWsId, setModelId, setToken, setView, setWorkspaces,
   ])
 
   // 全局推送处理
@@ -180,13 +280,31 @@ export function App() {
     if (view !== 'auth') localStorage.setItem('proma_mobile_view', view)
   }, [view])
 
-  const handleAuthSuccess = useCallback(async (newToken: string) => {
-    localStorage.setItem('proma_mobile_token', newToken)
-    setToken(newToken); setConnected(true); setView('chat')
-  }, [setToken, setConnected, setView])
-
-  if (view === 'auth') return <AuthPage onSuccess={handleAuthSuccess} />
+  if (view === 'auth') {
+    return (
+      <AuthPage
+        onSuccess={handleAuthSuccess}
+        pairingPending={pairingPending}
+        pairingError={pairingError}
+        onManualAttempt={() => setPairingError('')}
+      />
+    )
+  }
   return <AppShell />
+}
+
+/** 从已经清理凭据的地址提取 WebSocket 连接目标。 */
+function readPairingTarget(cleanUrl: string): { host: string; port: string } | null {
+  try {
+    /** 清理后的 URL 不再包含 ticket，可安全用于连接目标解析。 */
+    const url = new URL(cleanUrl)
+    return {
+      host: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? '443' : '80'),
+    }
+  } catch {
+    return null
+  }
 }
 
 /** 安全读取保存的会话；损坏数据按不存在处理。 */

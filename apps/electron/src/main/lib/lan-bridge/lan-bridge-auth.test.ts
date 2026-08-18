@@ -82,6 +82,20 @@ describe('LAN Bridge PIN 配对限速', () => {
 })
 
 describe('LAN Bridge 一次性配对票据', () => {
+  test('刷新二维码签发新票据时旧票据继续保留到自身 TTL', () => {
+    /** 当前用例的隔离认证服务。 */
+    const { service } = initTestAuth()
+    /** 首次展示二维码签发的旧票据。 */
+    const previousTicket = service.createPairingTicket(1_000)
+    /** 用户刷新二维码后签发的新票据。 */
+    const refreshedTicket = service.createPairingTicket(2_000)
+
+    expect(service.consumePairingTicket(previousTicket.value, '192.168.1.8', 'iPhone', 3_000).token)
+      .toBeString()
+    expect(service.consumePairingTicket(refreshedTicket.value, '192.168.1.9', 'Android', 3_000).token)
+      .toBeString()
+  })
+
   test('票据在 120 秒内可消费且只能成功一次', () => {
     /** 当前用例的隔离认证服务。 */
     const { service } = initTestAuth()

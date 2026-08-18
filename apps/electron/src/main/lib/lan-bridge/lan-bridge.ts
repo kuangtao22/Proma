@@ -27,7 +27,10 @@ import { dispatch } from './lan-bridge-router'
 import type { LanBridgeConfig, LanBridgeRuntimeState } from '@proma/shared'
 import { LAN_BRIDGE_IPC_CHANNELS } from '@proma/shared'
 
-import { registerLanBridgeHandlers } from './lan-bridge-handlers'
+import {
+  createLanBridgeConnectedPayload,
+  registerLanBridgeHandlers,
+} from './lan-bridge-handlers'
 import { lanBridgePromaAdapter } from './lan-bridge-proma-adapter'
 import { startSubscription, stopSubscription } from './lan-bridge-subscription'
 import type { AgentEventBus } from '../agent-event-bus'
@@ -148,7 +151,10 @@ export async function startLanBridge(bus?: AgentEventBus): Promise<void> {
       if (!client) return
 
       // 发送连接确认
-      sessionManager!.send(client, { type: 'connected', data: { message: 'Proma LAN Bridge' } })
+      sessionManager!.send(client, {
+        type: 'connected',
+        data: createLanBridgeConnectedPayload(app.getVersion()),
+      })
 
       ws.on('message', (raw: Buffer) => {
         handleMessage(client!, raw)

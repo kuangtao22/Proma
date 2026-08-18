@@ -4,6 +4,8 @@ import {
   LAN_BRIDGE_PROTOCOL_VERSION,
   type LanBridgeConnectedPayload,
 } from '@proma/shared'
+import { createLanBridgeConnectedPayload } from './lan-bridge-handlers'
+import electronPackage from '../../../../package.json'
 
 describe('LAN Bridge 协议协商', () => {
   test('连接确认包含稳定协议版本与能力集合', () => {
@@ -32,5 +34,14 @@ describe('LAN Bridge 协议协商', () => {
       'connection-recovery',
     ])
     expect(new Set(capabilities).size).toBe(capabilities.length)
+  })
+
+  test('Given WebSocket 建连 When 构造 connected push Then 保留旧消息并声明当前应用版本和能力', () => {
+    expect(createLanBridgeConnectedPayload(electronPackage.version)).toEqual({
+      message: 'Proma LAN Bridge',
+      protocolVersion: LAN_BRIDGE_PROTOCOL_VERSION,
+      serverVersion: electronPackage.version,
+      capabilities: [...LAN_BRIDGE_CAPABILITIES],
+    })
   })
 })
