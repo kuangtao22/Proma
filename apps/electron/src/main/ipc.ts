@@ -9,7 +9,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { existsSync, realpathSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, LAN_BRIDGE_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, isPromaPermissionMode, normalizePathForCompare } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, isPromaPermissionMode, normalizePathForCompare } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS, TRAY_IPC_CHANNELS } from '../types'
 import type {
   QuickTaskSubmitInput,
@@ -164,6 +164,7 @@ import { resolveBrowserProfileKey } from './lib/browser-profile-policy'
 import { getUnstagedChanges, invalidateGitDiffCache, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges, getMainRepoRoot } from './lib/git-diff-service'
 import { registerPromaDirectoryPath, registerPromaFilePath } from './lib/local-file-protocol'
 import { registerUpdaterIpc } from './lib/updater/updater-ipc'
+import { registerLanBridgeIpcHandlers } from './lib/lan-bridge/lan-bridge-ipc'
 import {
   listChannels,
   createChannel,
@@ -4992,20 +4993,7 @@ export function registerIpcHandlers(): void {
   )
 
   // ===== LAN Bridge IPC Handlers =====
-
-  const { getLanBridgeStatus, startLanBridge, stopLanBridge, getConfig: getLanBridgeConfig, updateConfig: updateLanBridgeConfig } = require('./lib/lan-bridge/lan-bridge')
-  const { getCurrentPin, refreshPin } = require('./lib/lan-bridge/lan-bridge-auth')
-
-  ipcMain.handle(LAN_BRIDGE_IPC_CHANNELS.GET_CONFIG, async () => getLanBridgeConfig())
-  ipcMain.handle(LAN_BRIDGE_IPC_CHANNELS.UPDATE_CONFIG, async (_event, updates) => updateLanBridgeConfig(updates))
-  ipcMain.handle(LAN_BRIDGE_IPC_CHANNELS.GET_STATUS, async () => getLanBridgeStatus())
-  ipcMain.handle(LAN_BRIDGE_IPC_CHANNELS.START, async () => {
-    const { agentEventBus } = require('./lib/agent-service') as { agentEventBus: import('./lib/agent-event-bus').AgentEventBus }
-    await startLanBridge(agentEventBus)
-  })
-  ipcMain.handle(LAN_BRIDGE_IPC_CHANNELS.STOP, async () => stopLanBridge())
-  ipcMain.handle(LAN_BRIDGE_IPC_CHANNELS.GET_PIN, async () => getCurrentPin())
-  ipcMain.handle(LAN_BRIDGE_IPC_CHANNELS.REFRESH_PIN, async () => refreshPin())
+  registerLanBridgeIpcHandlers(ipcMain)
 
   // ===== 任务 / 日程（Planning）=====
 
