@@ -24,6 +24,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   verify-upstream-merge:
+    name: Verify latest upstream release
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout fork with full history
@@ -37,6 +39,7 @@ jobs:
           bun-version: latest
       - name: Select latest official release tag
         id: upstream
+        shell: bash
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/ErlichLiu/Proma.git
@@ -1597,6 +1600,95 @@ broken: [
       expect(getCheck(files, 'workflow-definition').passed).toBe(false)
     })
   }
+
+  /** job 顶层只能保留当前验证任务实际需要的字段，禁止改变执行条件或容错语义。 */
+  const invalidWorkflowJobKeyCases = [
+    { name: 'if false', yaml: '    if: false' },
+    { name: 'continue-on-error true', yaml: '    continue-on-error: true' },
+    { name: 'continue-on-error false', yaml: '    continue-on-error: false' },
+    { name: 'strategy matrix', yaml: '    strategy:\n      matrix:\n        bun: [latest]' },
+  ]
+
+  for (const keyCase of invalidWorkflowJobKeyCases) {
+    test(`Given verify job 增加 ${keyCase.name} When 检查允许键闭集 Then 明确失败`, () => {
+      /** 在 timeout 后注入未批准的 job 控制字段。 */
+      const workflow = validWorkflow.replace(
+        '    timeout-minutes: 60',
+        `    timeout-minutes: 60\n${keyCase.yaml}`,
+      )
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  test('Given workflow 增加第二个 job When 检查唯一 job 合同 Then 明确失败', () => {
+    /** 附加无副作用 job，证明唯一性检查不依赖禁用命令或 action allowlist。 */
+    const workflow = validWorkflow.replace(
+      'jobs:\n  verify-upstream-merge:',
+      'jobs:\n  passive-extra-job:\n    runs-on: ubuntu-latest\n    steps: []\n  verify-upstream-merge:',
+    )
+    const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+    expect(workflow).not.toBe(validWorkflow)
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
+
+  /** 三个核心验证 run step 均不得通过 if 或 continue-on-error 绕过失败传播。 */
+  const guardedRunStepNames = [
+    'Check fork compatibility seams',
+    'Run LAN and mobile targeted tests',
+    'Typecheck all workspaces',
+  ]
+  const invalidRunStepControlCases = [
+    { name: 'if false', yaml: '        if: false' },
+    { name: 'continue-on-error true', yaml: '        continue-on-error: true' },
+    { name: 'continue-on-error false', yaml: '        continue-on-error: false' },
+  ]
+
+  for (const stepName of guardedRunStepNames) {
+    for (const keyCase of invalidRunStepControlCases) {
+      test(`Given ${stepName} 增加 ${keyCase.name} When 检查 step 允许键闭集 Then 明确失败`, () => {
+        /** 在命令前注入字段，不改变既有 run 文本。 */
+        const workflow = validWorkflow.replace(
+          `      - name: ${stepName}`,
+          `      - name: ${stepName}\n${keyCase.yaml}`,
+        )
+        const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+        expect(workflow).not.toBe(validWorkflow)
+        expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+      })
+    }
+  }
+
+  /** uses step 也不能通过条件字段跳过 checkout 或 Bun 安装。 */
+  for (const stepName of ['Checkout fork with full history', 'Install Bun']) {
+    test(`Given ${stepName} 增加 if false When 检查 action step 允许键闭集 Then 明确失败`, () => {
+      /** action 本身保持不变，仅注入未批准控制字段。 */
+      const workflow = validWorkflow.replace(
+        `      - name: ${stepName}`,
+        `      - name: ${stepName}\n        if: false`,
+      )
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  test('Given 普通 run step 增加 working-directory When 检查允许键闭集 Then 明确失败', () => {
+    /** 未批准的工作目录会改变命令解析边界，即使命令文本未变化也必须拒绝。 */
+    const workflow = validWorkflow.replace(
+      '      - name: Build mobile app',
+      '      - name: Build mobile app\n        working-directory: apps/mobile',
+    )
+    const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+    expect(workflow).not.toBe(validWorkflow)
+    expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+  })
 
   /** targeted tests 必须真实执行 checker 与 helper 测试文件。 */
   const invalidTargetedTestCases = [
