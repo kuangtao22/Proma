@@ -2,8 +2,10 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { WebSocket } from 'ws'
 import * as auth from './lan-bridge-auth'
 import { LanBridgeDeviceStore } from './lan-bridge-device-store'
+import { LanBridgeSessionManager } from './lan-bridge-session'
 
 type PairingResult = 'valid' | 'invalid' | 'rate_limited'
 
@@ -103,7 +105,61 @@ describe('LAN Bridge 设备 Token', () => {
       deviceId: store.listDevices()[0]?.id,
     })
     expect(auth.verifyToken(result.token, '192.168.1.9', 1_001)).toBe(false)
+    expect(auth.verifyToken(result.token, '192.168.1.8', 86_401_000)).toBe(false)
     expect(auth.verifyToken(result.token, '192.168.1.8', 86_401_001)).toBe(false)
+  })
+
+  test('PIN 认证签发的真实设备 Token 可让 SessionManager 记录 deviceId', () => {
+    /** 当前用例的真实设备仓库。 */
+    const store = initTestAuth()
+    /** 当前 PIN 通过既有配对认证入口的结果。 */
+    const pairingResult = auth.verifyPairingPin(auth.getCurrentPin(), '192.168.1.8')
+    expect(pairingResult).toBe('valid')
+    /** PIN 配对成功后按现有 handler 路径签发的设备 Token。 */
+    const token = auth.generateToken('192.168.1.8', 'iPhone').token
+    /** 使用生产默认 Token 验证器的会话管理器。 */
+    const manager = new LanBridgeSessionManager(20, { uuid: () => 'client-1' })
+    /** 测试用最小 WebSocket。 */
+    const socket = {
+      readyState: 1,
+      send: () => undefined,
+      close: () => undefined,
+      terminate: () => undefined,
+    } as unknown as WebSocket
+    /** 等待真实 Token 认证的客户端。 */
+    const client = manager.addClient(socket, '192.168.1.8')!
+
+    expect(manager.authenticateFromData(client, { token })).toBe(true)
+    expect(client.deviceId).toBe(store.listDevices()[0]?.id)
+  })
+
+  test('lastSeen 原子写失败不改变 Token 认证结果且下次访问会重试', () => {
+    /** 当前用例累计的原子写入次数。 */
+    let writeCount = 0
+    /** 当前用例独占的配置目录。 */
+    const configDir = mkdtempSync(join(tmpdir(), 'proma-lan-auth-last-seen-'))
+    temporaryDirectories.push(configDir)
+    /** 注册成功、首次 lastSeen 写失败、下次恢复的设备仓库。 */
+    const store = new LanBridgeDeviceStore(configDir, {
+      writeJson: () => {
+        writeCount++
+        if (writeCount === 2) throw new Error('disk failure')
+      },
+      uuid: () => 'device-1',
+    })
+    auth.initAuth(store)
+    /** 用于触发节流持久化的设备 Token。 */
+    const result = auth.generateToken('192.168.1.8', 'iPhone', 1_000)
+
+    expect(auth.verifyTokenDetails(result.token, '192.168.1.8', 61_000)).toEqual({
+      valid: true,
+      deviceId: 'device-1',
+    })
+    expect(auth.verifyTokenDetails(result.token, '192.168.1.8', 61_001)).toEqual({
+      valid: true,
+      deviceId: 'device-1',
+    })
+    expect(writeCount).toBe(3)
   })
 
   test('设备撤销后旧 Token 立即失效', () => {

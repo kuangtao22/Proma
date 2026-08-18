@@ -38,10 +38,17 @@ export interface LanBridgeDeviceStoreDependencies {
   uuid: () => string
 }
 
-const DEFAULT_DEPENDENCIES: LanBridgeDeviceStoreDependencies = {
-  readJson: filePath => readJsonFileSafe<unknown>(filePath),
-  writeJson: writeJsonFileAtomic,
-  uuid: randomUUID,
+/**
+ * 创建生产设备存储依赖，显式保持与 safe-file 原子 API 的接线。
+ *
+ * @returns 生产环境使用的安全文件与 ID 依赖
+ */
+export function createLanBridgeDeviceStoreDependencies(): LanBridgeDeviceStoreDependencies {
+  return {
+    readJson: readJsonFileSafe,
+    writeJson: writeJsonFileAtomic,
+    uuid: randomUUID,
+  }
 }
 
 /** 管理 `~/.proma/lan-bridge-devices.json` 的设备仓库。 */
@@ -62,7 +69,7 @@ export class LanBridgeDeviceStore {
     dependencies: Partial<LanBridgeDeviceStoreDependencies> = {},
   ) {
     this.filePath = join(configDir, DEVICES_FILENAME)
-    this.dependencies = { ...DEFAULT_DEPENDENCIES, ...dependencies }
+    this.dependencies = { ...createLanBridgeDeviceStoreDependencies(), ...dependencies }
     this.load()
   }
 
@@ -129,8 +136,8 @@ export class LanBridgeDeviceStore {
     /** 最近一次已持久化的访问时间。 */
     const lastPersistedAt = this.persistedLastSeenAt.get(deviceId) ?? device.createdAt
     if (now - lastPersistedAt >= LAST_SEEN_WRITE_INTERVAL_MS) {
-      this.persistedLastSeenAt.set(deviceId, now)
       this.persist()
+      this.persistedLastSeenAt.set(deviceId, now)
     }
     return { ...device }
   }

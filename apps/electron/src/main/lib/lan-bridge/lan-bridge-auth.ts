@@ -251,7 +251,7 @@ export function verifyTokenDetails(token: string, ip: string, now = Date.now()):
     const payload: TokenPayload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8'))
 
     // 检查过期
-    if (now - payload.iat > TOKEN_EXPIRY_MS) return { valid: false, errorCode: 'TOKEN_EXPIRED' }
+    if (now - payload.iat >= TOKEN_EXPIRY_MS) return { valid: false, errorCode: 'TOKEN_EXPIRED' }
 
     // 检查 IP 绑定
     if (payload.ip !== ip) return { valid: false, errorCode: 'TOKEN_INVALID' }
@@ -262,7 +262,11 @@ export function verifyTokenDetails(token: string, ip: string, now = Date.now()):
       return { valid: false, errorCode: 'DEVICE_REVOKED' }
     }
 
-    getDeviceStore().updateLastSeen(device.id, now)
+    try {
+      getDeviceStore().updateLastSeen(device.id, now)
+    } catch {
+      // 最近访问时间是 best-effort 元数据，持久化失败不能改变认证结论。
+    }
     return { valid: true, deviceId: device.id }
   } catch {
     return { valid: false, errorCode: 'TOKEN_INVALID' }
