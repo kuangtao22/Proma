@@ -124,3 +124,30 @@ test('正式安装包名称包含完整版本、平台和架构', () => {
   expect(config.win?.artifactName).toBe('Proma-${version}-windows-${arch}.${ext}')
   expect(config.linux?.artifactName).toBe('Proma-${version}-linux-${arch}.${ext}')
 })
+
+test('Release 工作流在全平台构建前校验 Bone 发布合同', () => {
+  /** Release 工作流原始文本，用于验证 Release 标题和成功门禁。 */
+  const source = readReleaseWorkflow()
+  /** Bun YAML 解析后的 Release 工作流。 */
+  const workflow = Bun.YAML.parse(source) as ReleaseWorkflow
+  /** 全部需要前置校验的跨平台构建任务。 */
+  const buildJobNames = [
+    'build-mac-arm64',
+    'build-mac-x64',
+    'build-windows-x64',
+    'build-linux-x64',
+  ]
+
+  expect(workflow.jobs?.['validate-release']?.steps).toEqual(expect.arrayContaining([
+    expect.objectContaining({ run: 'bun run apps/electron/scripts/validate-release-version.ts' }),
+  ]))
+  for (const jobName of buildJobNames) {
+    expect(workflow.jobs?.[jobName]?.needs).toContain('validate-release')
+  }
+  expect(workflow.jobs?.release?.needs).toEqual(expect.arrayContaining([
+    'validate-release',
+    ...buildJobNames,
+  ]))
+  expect(source).toContain("needs.build-linux-x64.result == 'success'")
+  expect(source).toContain('--title "${RELEASE_TITLE}"')
+})
