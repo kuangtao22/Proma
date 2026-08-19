@@ -16,11 +16,23 @@ interface ReleaseWorkflow {
   jobs?: Record<string, WorkflowJob>
 }
 
+interface ElectronPackageMetadata {
+  /** Debian 等 Linux 安装包需要展示的项目主页。 */
+  homepage?: string
+}
+
 /** 返回仓库中的 Release 工作流文本。 */
 function readReleaseWorkflow(): string {
   /** 当前脚本到仓库根目录的相对路径。 */
   const workflowPath = resolve(import.meta.dir, '../../../.github/workflows/release.yml')
   return readFileSync(workflowPath, 'utf8')
+}
+
+/** 返回 Electron workspace 的包元数据。 */
+function readElectronPackageMetadata(): ElectronPackageMetadata {
+  /** 当前测试脚本到 Electron package.json 的路径。 */
+  const packagePath = resolve(import.meta.dir, '../package.json')
+  return JSON.parse(readFileSync(packagePath, 'utf8')) as ElectronPackageMetadata
 }
 
 test('Release 工作流构建并发布 Linux x64 安装包', () => {
@@ -50,4 +62,10 @@ test('Release 工作流构建并发布 Linux x64 安装包', () => {
   expect(source).toContain("-name '*.AppImage'")
   expect(source).toContain("-name '*.deb'")
   expect(source).toContain("-name 'latest-linux.yml'")
+})
+
+test('Linux deb 包含 Electron Builder 必需的项目主页', () => {
+  /** Electron 安装包元数据。 */
+  const metadata = readElectronPackageMetadata()
+  expect(metadata.homepage).toBe('https://github.com/kuangtao22/Proma')
 })
