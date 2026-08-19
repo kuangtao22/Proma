@@ -2,14 +2,16 @@ import { app, BrowserWindow, dialog, Menu, nativeTheme, protocol, screen, shell 
 import { join } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync } from 'fs'
+import { resolveAppIdentity } from './lib/app-identity'
 
 // Dev 开发模式使用独立的 userData 目录，避免与打包版共享 Chromium SingletonLock
 // 必须在任何会读取 userData 路径的模块加载之前执行
-if (!app.isPackaged) {
-  // 多个 worktree 可显式隔离开发实例，避免其中一个分支抢走另一分支的 Chromium SingletonLock。
-  const instance = process.env.PROMA_DEV_INSTANCE?.replace(/[^a-zA-Z0-9_-]/g, '')
-  if (instance) app.setName(`Proma-${instance}`)
-  app.setPath('userData', join(app.getPath('appData'), instance ? `@proma/electron-dev-${instance}` : '@proma/electron-dev'))
+/** 当前进程应使用的正式或开发身份。 */
+const appIdentity = resolveAppIdentity(app.isPackaged, process.env.PROMA_DEV_INSTANCE)
+if (!app.isPackaged && appIdentity.userDataDirectoryName) {
+  app.setName(appIdentity.displayName)
+  app.setPath('userData', join(app.getPath('appData'), appIdentity.userDataDirectoryName))
+  if (process.platform === 'win32') app.setAppUserModelId(appIdentity.appId)
 }
 
 // 单实例锁：防止重复启动同一个版本（dev/prod 因 userData 已隔离，互不影响）
