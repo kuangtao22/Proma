@@ -61,3 +61,5 @@
 - 2026-08-19：首次 Linux deb 云端构建暴露缺少项目主页元数据，已补充 fork 主页并加入回归测试。
 - 2026-08-19：Linux FPM 会把 `@proma/electron` 默认产物名解释为目录路径，已固定为 `Proma-${version}-${arch}.${ext}` 并加入回归测试。
 - 2026-08-19：确认整理发布版本与开发/正式身份；下一版本采用 `0.17.42-bone.5`，正式版保持 `Proma`，开发版固定显示为 `Proma Dev`。
+- 2026-08-19：完成 `0.17.42-bone.5` 版本体系：应用版本、标签、Release 标题、关于页、更新频道和三平台产物命名统一；GitHub Actions 在四平台构建前校验标签合同，并只在全部构建成功后发布。
+- 2026-08-19：Bun 1.3.14 的 `bun install --lockfile-only` 不会自动刷新 workspace 自身的 `version` 字段；修改应用版本后必须显式检查 `bun.lock` 中 `apps/electron.version` 是否同步。
