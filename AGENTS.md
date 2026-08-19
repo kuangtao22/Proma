@@ -74,7 +74,8 @@ release-notes/                    版本发布日志
 
 ## 版本、提交与文档
 
-- `apps/electron/package.json` 的桌面应用版本必须与当前已合入的最新官方 `v*` 标签一致；fork 自有代码、UI、文档或工程配置改动不单独递增桌面版本。
-- 更新官方版本时，同步将桌面版本改为对应官方标签去掉 `v` 后的版本号。`packages/*/package.json` 跟随合入的官方包版本；默认 Skill 改动仍必须递增其 `SKILL.md` frontmatter 的 `version`。
+- `apps/electron/package.json` 使用 `<官方版本>-bone.<构建号>`，例如 `0.17.42-bone.5`；前三段必须与当前已合入的最新官方 `v*` 标签一致，Bone 构建号只追踪 fork 发布。
+- 正式发布标签必须严格等于 `v${apps/electron/package.json.version}`。同一官方版本递增 Bone 构建号；合入新官方版本后将 Bone 构建号重置为 1。
+- `packages/*/package.json` 继续跟随合入的官方包版本；默认 Skill 改动仍必须递增其 `SKILL.md` frontmatter 的 `version`。
 - 仅在功能行为、安装方式或用户流程发生变化时更新 README / tutorial / release notes；改文档前先取得用户授权。
 - 提交前检查 `git diff`，不要覆盖用户已有改动或提交无关文件。

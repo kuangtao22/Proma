@@ -13,7 +13,7 @@
 - 本地存储优先，使用配置文件与 `JSON`/`JSONL`，不引入本地数据库。
 - 渲染进程状态统一使用 Jotai。
 - 功能变化涉及文档时，修改 `AGENTS.md` 与 `README.md` 前需获得用户允许。
-- 桌面应用版本必须与当前已合入的最新官方 `v*` 标签一致，fork 自有改动不单独递增；提交说明使用中文。
+- Electron 正式应用使用官方基线加 Bone 构建号的 SemVer；正式标签、应用版本和更新元数据必须一致，提交说明使用中文。
 - 凭据只记录存放位置，不记录具体值。
 
 ## 架构决策
@@ -25,8 +25,10 @@
 - 所有桌面安装包入口统一通过 Electron workspace 的 `package:prepare` 构建 Electron、移动端并同步 runtime external 依赖，避免本地与 CI 打包步骤漂移。
 - LAN Bridge 配对 PIN 仅在桌面设置界面显示，不注入移动网页、不写日志或明文文件；配对失败按客户端 IP 独立限速。
 - fork 桌面安装包使用 `com.bone.proma.app` 作为系统应用标识，与官方版 `com.proma.app` 区分；保留 `Proma` 产品显示名和现有数据目录。
-- 桌面版本号只表示当前合入的官方版本；fork 修订通过 Git 提交追踪，不占用额外 patch 版本。
+- 桌面版本前三段表示当前合入的官方版本，`bone.<构建号>` 表示 fork 发布修订；同一官方版本递增 Bone 构建号，合入新官方版本后重置为 1。
 - 开发版与打包版统一使用 `~/.proma` 存储 Skills、模型、渠道、会话等业务数据；仅 Electron 内部 `userData` 保持开发实例隔离。
+- 正式版身份固定为 `Proma` / `com.bone.proma.app`，开发版固定为 `Proma Dev` / `com.bone.proma.dev`；两者隔离 Electron `userData` 和单实例锁，继续共享 `~/.proma` 业务配置。
+- 从纯 `0.17.42` 迁移到 `0.17.42-bone.5` 需要手动安装一次；后续 Bone 版本使用预发布 SemVer 正常递增更新，不开启全局降级。
 - fork 的 LAN、移动端与后续公网能力必须保持为低耦合扩展层；每次合并官方 Proma 新版本后，通过协议契约、适配层和自动化兼容检查确认自有功能不回退，同时继续获得上游新功能与 Bug 修复。
 - LAN 扩展固定按版本化协议、Proma Adapter、IPC、Preload 与 UI 分层；官方运行时服务只允许由 Adapter 接入，降低上游模块重构对移动端功能的影响。
 - LAN 设备认证由进程级唯一 `AuthService`/`DeviceStore` 管理；一次性 ticket 仅经 URL fragment 和内存传递。移动端长期设备凭证永久有效直至桌面撤销，桌面仅保存其 SHA-256 哈希；访问令牌固定 15 分钟，受设备版本与撤销状态约束，IP 只作审计元数据，不参与身份校验。
@@ -58,3 +60,4 @@
 - 2026-08-19：补齐 GitHub Release 的 Linux x64 构建与发布合同，全平台发包统一由 `v*` 标签触发。
 - 2026-08-19：首次 Linux deb 云端构建暴露缺少项目主页元数据，已补充 fork 主页并加入回归测试。
 - 2026-08-19：Linux FPM 会把 `@proma/electron` 默认产物名解释为目录路径，已固定为 `Proma-${version}-${arch}.${ext}` 并加入回归测试。
+- 2026-08-19：确认整理发布版本与开发/正式身份；下一版本采用 `0.17.42-bone.5`，正式版保持 `Proma`，开发版固定显示为 `Proma Dev`。
