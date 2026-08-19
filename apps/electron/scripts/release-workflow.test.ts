@@ -21,6 +21,14 @@ interface ElectronPackageMetadata {
   homepage?: string
 }
 
+interface ElectronBuilderConfig {
+  /** Linux 安装包配置。 */
+  linux?: {
+    /** 避免 workspace scope 进入产物路径的稳定文件名。 */
+    artifactName?: string
+  }
+}
+
 /** 返回仓库中的 Release 工作流文本。 */
 function readReleaseWorkflow(): string {
   /** 当前脚本到仓库根目录的相对路径。 */
@@ -33,6 +41,13 @@ function readElectronPackageMetadata(): ElectronPackageMetadata {
   /** 当前测试脚本到 Electron package.json 的路径。 */
   const packagePath = resolve(import.meta.dir, '../package.json')
   return JSON.parse(readFileSync(packagePath, 'utf8')) as ElectronPackageMetadata
+}
+
+/** 返回 Electron Builder 配置。 */
+function readElectronBuilderConfig(): ElectronBuilderConfig {
+  /** 当前测试脚本到 Electron Builder YAML 的路径。 */
+  const configPath = resolve(import.meta.dir, '../electron-builder.yml')
+  return Bun.YAML.parse(readFileSync(configPath, 'utf8')) as ElectronBuilderConfig
 }
 
 test('Release 工作流构建并发布 Linux x64 安装包', () => {
@@ -68,4 +83,10 @@ test('Linux deb 包含 Electron Builder 必需的项目主页', () => {
   /** Electron 安装包元数据。 */
   const metadata = readElectronPackageMetadata()
   expect(metadata.homepage).toBe('https://github.com/kuangtao22/Proma')
+})
+
+test('Linux 产物名不继承带 scope 的 workspace 包名', () => {
+  /** Electron Builder 的 Linux 安装包配置。 */
+  const config = readElectronBuilderConfig()
+  expect(config.linux?.artifactName).toBe('Proma-${version}-${arch}.${ext}')
 })

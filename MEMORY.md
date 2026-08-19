@@ -37,6 +37,7 @@
 - 手机端视觉与桌面端共享语义设计语言，但主题映射保留在 `apps/mobile` 内；默认通过 `prefers-color-scheme` 跟随系统明暗，不导入桌面 Renderer CSS，也不扩展 LAN 协议或持久化字段。
 - fork 的标签发布工作流覆盖 macOS arm64/x64、Windows x64 与 Linux x64；Linux 同时提供 AppImage 和 deb，并与其他平台产物汇总到同一个 GitHub Release。
 - Linux deb 打包依赖 `apps/electron/package.json` 的 `homepage` 元数据；发布合同测试必须覆盖该字段，避免 AppImage 成功但 deb 在 FPM 阶段失败。
+- Electron workspace 使用带 scope 的包名，Linux 必须显式配置不含 `/` 的 `artifactName`，否则 deb 默认输出路径会被拆成不存在的子目录。
 
 ## 会话记录
 
@@ -56,3 +57,4 @@
 - 2026-08-19：将扫码与 PIN 配对升级为可信设备白名单：稳定设备 ID 和长期凭证支持永久自动续签直至桌面撤销；新增 `trusted-device-credentials` 协议能力及上游兼容检查，IP 仅用于最近访问审计。
 - 2026-08-19：补齐 GitHub Release 的 Linux x64 构建与发布合同，全平台发包统一由 `v*` 标签触发。
 - 2026-08-19：首次 Linux deb 云端构建暴露缺少项目主页元数据，已补充 fork 主页并加入回归测试。
+- 2026-08-19：Linux FPM 会把 `@proma/electron` 默认产物名解释为目录路径，已固定为 `Proma-${version}-${arch}.${ext}` 并加入回归测试。
