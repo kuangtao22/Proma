@@ -8,15 +8,13 @@ import type {
   GitHubRelease,
   GitHubReleaseListOptions,
 } from '@proma/shared'
+import { PROMA_RELEASE_REPOSITORY } from '../../shared/release-config'
 
 /** GitHub API 基础 URL */
 const GITHUB_API_BASE = 'https://api.github.com'
 
-/** GitHub 仓库配置（从 electron-builder.yml） */
-const GITHUB_REPO = {
-  owner: 'ErlichLiu',
-  repo: 'Proma',
-}
+/** GitHub 仓库配置，与自动更新和下载入口保持一致。 */
+const GITHUB_REPO = PROMA_RELEASE_REPOSITORY
 
 /** Release 缓存 */
 interface ReleaseCache {

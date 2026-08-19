@@ -22,12 +22,17 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { ReleaseNotesViewer } from './ReleaseNotesViewer'
 import { VersionHistory } from './VersionHistory'
+import { PROMA_RELEASE_REPOSITORY } from '../../../shared/release-config'
+import { createAppVersionDisplay } from '@/lib/app-version-display'
 
 /** 从 package.json 构建时由 Vite define 注入 */
 declare const __APP_VERSION__: string
+/** Vite 构建时注入的完整应用版本。 */
 const APP_VERSION = __APP_VERSION__
-
-const GITHUB_RELEASES_URL = 'https://github.com/proma-ai/Proma/releases'
+/** 关于页分别展示官方基线与 Bone 构建号。 */
+const APP_VERSION_DISPLAY = createAppVersionDisplay(APP_VERSION)
+/** 手动下载更新时使用的 fork Release 页面。 */
+const GITHUB_RELEASES_URL = `${PROMA_RELEASE_REPOSITORY.webUrl}/releases`
 
 /** 更新状态卡片 */
 function UpdateCard(): React.ReactElement | null {
@@ -490,9 +495,18 @@ export function AboutSettings(): React.ReactElement {
       description="集成通用 AI Agent 的下一代人工智能软件"
     >
       <SettingsCard>
-        <SettingsRow label="版本">
-          <span className="text-sm text-muted-foreground font-mono">{APP_VERSION}</span>
+        <SettingsRow label="官方版本">
+          <span className="text-sm text-muted-foreground font-mono">
+            {APP_VERSION_DISPLAY.upstreamVersion}
+          </span>
         </SettingsRow>
+        {APP_VERSION_DISPLAY.boneBuild !== null && (
+          <SettingsRow label="Bone 构建">
+            <span className="text-sm text-muted-foreground font-mono">
+              {APP_VERSION_DISPLAY.boneBuild}
+            </span>
+          </SettingsRow>
+        )}
         <SettingsRow label="运行时">
           <span className="text-sm text-muted-foreground">Electron + React</span>
         </SettingsRow>
@@ -511,12 +525,12 @@ export function AboutSettings(): React.ReactElement {
         </SettingsRow>
         <SettingsRow label="项目地址">
           <a
-            href="https://github.com/proma-ai/Proma.git"
+            href={PROMA_RELEASE_REPOSITORY.webUrl}
             target="_blank"
             rel="noopener noreferrer"
             className="text-sm text-primary hover:underline"
           >
-            github.com/proma-ai/Proma
+            github.com/{PROMA_RELEASE_REPOSITORY.owner}/{PROMA_RELEASE_REPOSITORY.repo}
           </a>
         </SettingsRow>
       </SettingsCard>
