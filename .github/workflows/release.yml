@@ -1,7 +1,7 @@
 # GitHub Actions: 自动打包分发
 #
 # 触发条件：推送 v* tag（如 v0.4.0）
-# 构建 macOS 和 Windows 产物并发布到 GitHub Releases
+# 构建 macOS、Windows 和 Linux 产物并发布到 GitHub Releases
 #
 # 所需 GitHub Secrets（macOS 签名/公证，可选）:
 # - MAC_CERTS: Base64 编码的 macOS Developer ID Application 证书 (.p12)
@@ -206,10 +206,42 @@ jobs:
           path: apps/electron/out/*
           retention-days: 1
 
+  build-linux-x64:
+    name: build (ubuntu-latest, linux, x64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: 安装依赖
+        run: bun install --frozen-lockfile
+
+      - name: 准备 Electron 打包资源
+        run: bun run --filter='@proma/electron' package:prepare
+
+      - name: 打包 (Linux x64)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bunx electron-builder --linux AppImage deb --x64 --publish never
+        working-directory: apps/electron
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: apps/electron/out/*
+          retention-days: 1
+
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-mac-arm64, build-mac-x64, build-windows-x64]
+    needs: [build-mac-arm64, build-mac-x64, build-windows-x64, build-linux-x64]
     if: always() && !cancelled()
 
     steps:
@@ -230,6 +262,12 @@ jobs:
         with:
           name: win-x64
           path: out/win-x64
+
+      - name: 下载 Linux x64 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x64
+          path: out/linux-x64
 
       - name: 列出产物
         run: find out -type f | head -50
@@ -256,8 +294,8 @@ jobs:
           RUBY
 
           mkdir -p out/release-assets
-          find out/mac-arm64 out/mac-x64 out/win-x64 -maxdepth 1 -type f \
-            \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.blockmap' -o -name 'latest.yml' \) \
+          find out/mac-arm64 out/mac-x64 out/win-x64 out/linux-x64 -maxdepth 1 -type f \
+            \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.blockmap' -o -name 'latest.yml' -o -name 'latest-linux.yml' \) \
             -exec cp {} out/release-assets/ \;
           cp out/latest-mac.yml out/release-assets/latest-mac.yml
           find out/release-assets -maxdepth 1 -type f -print
