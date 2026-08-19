@@ -24,6 +24,7 @@ describe('LAN Bridge 协议协商', () => {
 
     expect(payload.protocolVersion).toBe(2)
     expect(payload.capabilities).toContain('pairing-ticket')
+    expect(payload.capabilities).toContain('trusted-device-credentials')
     expect(payload.capabilities).not.toContain('device-revocation')
   })
 
@@ -35,6 +36,7 @@ describe('LAN Bridge 协议协商', () => {
       'pin-pairing',
       'pairing-ticket',
       'device-revocation',
+      'trusted-device-credentials',
       'streaming',
       'connection-recovery',
     ])
@@ -42,6 +44,7 @@ describe('LAN Bridge 协议协商', () => {
     expect(LAN_BRIDGE_WS_CAPABILITIES).toEqual([
       'pin-pairing',
       'pairing-ticket',
+      'trusted-device-credentials',
       'streaming',
       'connection-recovery',
     ])

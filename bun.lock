@@ -36,7 +36,7 @@
     },
     "apps/electron": {
       "name": "@proma/electron",
-      "version": "0.17.43",
+      "version": "0.17.42",
       "dependencies": {
         "@earendil-works/pi-agent-core": "0.84.2",
         "@earendil-works/pi-ai": "0.84.2",
@@ -153,11 +153,12 @@
     },
     "apps/mobile": {
       "name": "@proma/mobile",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "dependencies": {
         "@proma/shared": "workspace:*",
         "@proma/ui": "workspace:*",
         "jotai": "^2.17.1",
+        "lucide-react": "^0.460.0",
         "react": "^18.3.0",
         "react-dom": "^18.3.0",
       },
@@ -203,14 +204,14 @@
     },
     "packages/shared": {
       "name": "@proma/shared",
-      "version": "0.1.59",
+      "version": "0.1.60",
       "devDependencies": {
         "typescript": "^5.0.0",
       },
     },
     "packages/ui": {
       "name": "@proma/ui",
-      "version": "0.1.9",
+      "version": "0.1.10",
       "dependencies": {
         "@proma/core": "workspace:*",
         "beautiful-mermaid": "1.1.3",

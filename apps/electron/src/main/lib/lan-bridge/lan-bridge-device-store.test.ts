@@ -196,6 +196,23 @@ describe('LAN Bridge 设备存储', () => {
     expect(() => invalidTimeStore.registerDevice('iPhone', -1)).toThrow()
   })
 
+  test('可信设备入口拒绝可污染日志或路径的客户端设备 ID', () => {
+    /** 当前用例的隔离设备仓库。 */
+    const store = new LanBridgeDeviceStore(createConfigDir())
+    /** 合法固定长度的测试凭证哈希。 */
+    const credentialHash = 'a'.repeat(43)
+
+    for (const deviceId of ['device\nforged', '../outside', 'device.with.dot']) {
+      expect(() => store.registerTrustedDevice({
+        deviceId,
+        name: 'iPhone',
+        credentialHash,
+        ip: '192.168.1.8',
+      }, 1_000)).toThrow('设备 ID 无效')
+    }
+    expect(store.listDevices(true)).toEqual([])
+  })
+
   test('设备 JSON 损坏时降级为空列表', () => {
     /** 当前用例的配置目录。 */
     const configDir = createConfigDir()

@@ -19,11 +19,21 @@ export interface PairingConnectionActions {
 }
 
 /** 自动票据配对的外部动作。 */
+export interface TrustedDeviceAuthentication {
+  /** 当前连接使用的短期访问令牌。 */
+  token: string
+  /** 当前浏览器安装的稳定设备标识。 */
+  deviceId: string
+  /** 自动续签访问令牌的长期设备凭证。 */
+  deviceCredential: string
+}
+
+/** 自动票据配对的外部动作。 */
 export interface PairingStartupCallbacks {
-  /** 提交只可消费一次的配对票据并返回认证 Token。 */
-  requestPairTicket: (ticket: string) => Promise<{ token: string }>
+  /** 提交只可消费一次的配对票据并返回完整可信设备认证材料。 */
+  requestPairTicket: (ticket: string) => Promise<TrustedDeviceAuthentication>
   /** 配对成功后交给应用保存认证状态。 */
-  onAuthenticated: (token: string) => void
+  onAuthenticated: (authentication: TrustedDeviceAuthentication) => void
   /** 配对不可用或失败时回退到 PIN 流程。 */
   onFallback: (message: string) => void
 }
@@ -97,7 +107,7 @@ export function createPairingStartupCoordinator(link: PairingLink | null): Pairi
       const requestId = ++nextRequestId
       activeRequestId = requestId
       /** 服务端签发的认证结果。 */
-      let result: { token: string }
+      let result: TrustedDeviceAuthentication
       try {
         result = await callbacks.requestPairTicket(ticket)
       } catch (error) {
@@ -108,11 +118,11 @@ export function createPairingStartupCoordinator(link: PairingLink | null): Pairi
       }
       if (activeRequestId !== requestId) return
       activeRequestId = null
-      if (!result.token) {
+      if (!result.token || !result.deviceId || !result.deviceCredential) {
         callbacks.onFallback('扫码配对响应无效，请使用 PIN 码连接')
         return
       }
-      callbacks.onAuthenticated(result.token)
+      callbacks.onAuthenticated(result)
     },
     cancel: () => {
       /** pending ticket 或 in-flight 请求都代表 UI 仍处于自动配对态。 */

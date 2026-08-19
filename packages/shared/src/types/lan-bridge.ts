@@ -19,6 +19,7 @@ export const LAN_BRIDGE_CAPABILITIES = [
   'pin-pairing',
   'pairing-ticket',
   'device-revocation',
+  'trusted-device-credentials',
   'streaming',
   'connection-recovery',
 ] as const
@@ -30,6 +31,7 @@ export type LanBridgeCapability = typeof LAN_BRIDGE_CAPABILITIES[number]
 export const LAN_BRIDGE_WS_CAPABILITIES = [
   'pin-pairing',
   'pairing-ticket',
+  'trusted-device-credentials',
   'streaming',
   'connection-recovery',
 ] as const satisfies readonly LanBridgeCapability[]
@@ -115,12 +117,17 @@ export type LanBridgeErrorCode =
 /** PIN 配对请求 */
 export interface LanBridgeAuthPairInput {
   pin: string
+  deviceName?: string
+  deviceId?: string
 }
 
 /** PIN 配对响应 */
 export interface LanBridgeAuthPairResult {
   token: string
   expiresIn: number
+  expiresAt: number
+  deviceId: string
+  deviceCredential: string
 }
 
 /** Token 验证请求 */
@@ -135,26 +142,34 @@ export interface LanBridgeAuthVerifyResult {
 
 /** Token 刷新请求 */
 export interface LanBridgeAuthRefreshInput {
-  token: string
+  /** 旧客户端使用的短期访问令牌刷新。 */
+  token?: string
+  /** 新客户端使用的长期可信设备凭证刷新。 */
+  credential?: string
 }
 
 /** Token 刷新响应 */
 export interface LanBridgeAuthRefreshResult {
   token: string
   expiresIn: number
+  expiresAt: number
+  deviceId: string
 }
 
 /** 一次性配对票据认证请求。 */
 export interface LanBridgeAuthPairTicketInput {
   ticket: string
   deviceName: string
+  deviceId: string
 }
 
 /** 一次性配对票据认证响应。 */
 export interface LanBridgeAuthPairTicketResult {
   token: string
   expiresIn: number
+  expiresAt: number
   deviceId: string
+  deviceCredential: string
 }
 
 // ===== 数据查询 =====
@@ -372,6 +387,8 @@ export interface LanBridgeDeviceDto {
   name: string
   createdAt: number
   lastSeenAt: number
+  /** 最近访问 IP，仅用于审计展示，不参与身份校验。 */
+  lastIp?: string
   tokenVersion: number
   revokedAt?: number
 }

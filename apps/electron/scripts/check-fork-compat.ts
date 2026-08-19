@@ -84,6 +84,7 @@ const OFFICIAL_RUNTIME_MODULES = [
 const REQUIRED_WS_CAPABILITIES = [
   'pin-pairing',
   'pairing-ticket',
+  'trusted-device-credentials',
   'streaming',
   'connection-recovery',
 ] as const
@@ -1159,7 +1160,7 @@ function checkProtocolCapabilities(reader: RepositoryReader): ForkCompatCheckRes
     'protocol-capabilities',
     'LAN 协议版本与 WS 能力',
     [PATHS.sharedProtocol, PATHS.handlers],
-    '保留共享协议版本与独立 WS 能力列表；建连 payload 必须引用两者，且不得向移动端声明 device-revocation。',
+    '保留共享协议版本、可信设备凭证与独立 WS 能力列表；建连 payload 必须引用能力常量，且不得向移动端声明 device-revocation。',
     details,
   )
 }
@@ -1250,7 +1251,7 @@ function checkAdapterBoundary(reader: RepositoryReader): ForkCompatCheckResult {
   )
 }
 
-/** 检查 Electron 打包准备流程始终先构建移动端。 */
+/** 检查 Electron 开发与打包流程始终使用当前移动端产物。 */
 function checkMobileBuild(reader: RepositoryReader): ForkCompatCheckResult {
   /** 当前检查的失败原因。 */
   const details: string[] = []
@@ -1264,13 +1265,19 @@ function checkMobileBuild(reader: RepositoryReader): ForkCompatCheckResult {
     const electronPackage = JSON.parse(electronPackageContent) as { scripts?: Record<string, string> }
     /** 移动端 package scripts。 */
     const mobilePackage = JSON.parse(mobilePackageContent) as { name?: string; scripts?: Record<string, string> }
+    /** Electron 开发启动命令。 */
+    const dev = electronPackage.scripts?.dev ?? ''
     /** Electron 的移动构建命令。 */
     const buildMobile = electronPackage.scripts?.['build:mobile'] ?? ''
     /** Electron 的打包准备命令。 */
     const packagePrepare = electronPackage.scripts?.['package:prepare'] ?? ''
-    /** 两个脚本都通过同一个保守 shell 解析器得到顶层命令链。 */
+    /** 三个脚本都通过同一个保守 shell 解析器得到顶层命令链。 */
+    const devCommands = parseConjunctiveShellCommands(dev)
     const buildMobileCommands = parseConjunctiveShellCommands(buildMobile)
     const packagePrepareCommands = parseConjunctiveShellCommands(packagePrepare)
+    /** dev 必须先构建移动端，避免 LAN Bridge 提供与当前服务端协议失配的旧 dist。 */
+    const hasValidDevMobileBuild = (devCommands?.length ?? 0) >= 2
+      && commandEquals(devCommands![0], ['bun', 'run', 'build:mobile'])
     /** build:mobile 唯一允许的真实 workspace 构建命令。 */
     const hasValidMobileBuild = buildMobileCommands?.length === 1
       && commandEquals(buildMobileCommands[0], ['bun', 'run', '--filter=@proma/mobile', 'build'])
@@ -1280,6 +1287,7 @@ function checkMobileBuild(reader: RepositoryReader): ForkCompatCheckResult {
       && commandEquals(packagePrepareCommands[1], ['bun', 'run', 'build:mobile'])
       && commandEquals(packagePrepareCommands[2], ['bun', 'run', 'sync:runtime-deps'])
 
+    if (!hasValidDevMobileBuild) details.push('dev 必须先执行 bun run build:mobile，避免局域网服务加载旧移动端产物')
     if (!hasValidMobileBuild) details.push('build:mobile 必须直接执行 @proma/mobile workspace build')
     if (!hasValidPackagePrepare) details.push('package:prepare 必须按 Electron build、mobile build、runtime 同步顺序直接执行')
     if (mobilePackage.name !== '@proma/mobile' || !mobilePackage.scripts?.build) details.push('apps/mobile 未保留可执行 build script')
@@ -1291,7 +1299,7 @@ function checkMobileBuild(reader: RepositoryReader): ForkCompatCheckResult {
     'mobile-build',
     '移动端构建与打包准备',
     [PATHS.electronPackage, PATHS.mobilePackage],
-    '保留 Electron build:mobile workspace 命令，并让 package:prepare 同时执行 Electron build、mobile build 和 runtime 同步。',
+    '让 dev 首步构建移动端；保留 Electron build:mobile workspace 命令，并让 package:prepare 同时执行 Electron build、mobile build 和 runtime 同步。',
     details,
   )
 }

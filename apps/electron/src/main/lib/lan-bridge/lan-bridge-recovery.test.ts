@@ -35,7 +35,7 @@ describe('LAN Bridge 自愈控制器', () => {
     expect(authService.verifyTokenDetails(issuedToken.token, '192.168.1.2', 2_000)).toEqual({
       valid: true,
       deviceId: 'device-1',
-      expiresAt: 86_401_000,
+      expiresAt: issuedToken.expiresAt,
     })
 
     authService.revokeDevice(issuedToken.deviceId, 3_000)

@@ -3,6 +3,7 @@ import {
   createPairingStartupCoordinator,
   startPairingConnection,
 } from './pairing-startup-coordinator'
+import type { TrustedDeviceAuthentication } from './pairing-startup-coordinator'
 
 /** 可由测试控制结算时机的 Promise。 */
 interface Deferred<T> {
@@ -33,8 +34,8 @@ describe('移动端启动配对协调器', () => {
   test('Given 服务声明 pairing-ticket When connected 重复到达 Then 票据只提交一次且成功进入认证状态', async () => {
     /** 记录真实协调器发出的认证请求。 */
     const submittedTickets: string[] = []
-    /** 记录成功保存的 Token。 */
-    const savedTokens: string[] = []
+    /** 记录成功保存的完整可信设备认证材料。 */
+    const savedAuthentications: unknown[] = []
     const coordinator = createPairingStartupCoordinator({
       ticket: 'ticket-1',
       cleanUrl: 'http://192.168.1.2:29888/',
@@ -42,9 +43,15 @@ describe('移动端启动配对协调器', () => {
     const callbacks = {
       requestPairTicket: async (ticket: string) => {
         submittedTickets.push(ticket)
-        return { token: 'token-1' }
+        return {
+          token: 'token-1',
+          deviceId: 'mobile-device-1',
+          deviceCredential: 'credential-1',
+        }
       },
-      onAuthenticated: (token: string) => savedTokens.push(token),
+      onAuthenticated: (authentication: TrustedDeviceAuthentication) => {
+        savedAuthentications.push(authentication)
+      },
       onFallback: () => undefined,
     }
 
@@ -54,7 +61,11 @@ describe('移动端启动配对协调器', () => {
     ])
 
     expect(submittedTickets).toEqual(['ticket-1'])
-    expect(savedTokens).toEqual(['token-1'])
+    expect(savedAuthentications).toEqual([{
+      token: 'token-1',
+      deviceId: 'mobile-device-1',
+      deviceCredential: 'credential-1',
+    }])
     expect(coordinator.hasPendingTicket()).toBe(false)
   })
 
@@ -71,7 +82,11 @@ describe('移动端启动配对协调器', () => {
     await coordinator.handleConnected({ message: 'old server' }, {
       requestPairTicket: async () => {
         requestCount += 1
-        return { token: 'unexpected' }
+        return {
+          token: 'unexpected',
+          deviceId: 'unexpected-device',
+          deviceCredential: 'unexpected-credential',
+        }
       },
       onAuthenticated: () => undefined,
       onFallback: message => fallbacks.push(message),
@@ -125,11 +140,11 @@ describe('移动端启动配对协调器', () => {
 
   test('Given 自动配对请求仍 pending When 用户切换地址 Then 解除 pending 并连接手工新地址且忽略迟到成功', async () => {
     /** 模拟仍未返回的 pairTicket 请求。 */
-    const deferred = createDeferred<{ token: string }>()
+    const deferred = createDeferred<TrustedDeviceAuthentication>()
     /** 记录 effect 实际连接过的地址。 */
     const connections: string[] = []
     /** 记录迟到成功是否错误触发认证。 */
-    const savedTokens: string[] = []
+    const savedAuthentications: TrustedDeviceAuthentication[] = []
     /** 模拟控制 PIN 按钮可用性的 React 状态。 */
     let pairingPending = true
     const coordinator = createPairingStartupCoordinator({
@@ -148,7 +163,7 @@ describe('移动端启动配对协调器', () => {
     /** 保持请求 pending，模拟用户在响应前修改地址。 */
     const pairingRequest = coordinator.handleConnected({ protocolVersion: 2, capabilities: ['pairing-ticket'] }, {
       requestPairTicket: () => deferred.promise,
-      onAuthenticated: token => savedTokens.push(token),
+      onAuthenticated: authentication => savedAuthentications.push(authentication),
       onFallback: () => undefined,
     })
 
@@ -164,14 +179,18 @@ describe('移动端启动配对协调器', () => {
     expect(pairingPending).toBe(false)
     expect(connections).toEqual(['192.168.1.2:29888', '192.168.1.9:31000'])
     expect(previousTarget).toEqual({ host: '192.168.1.9', port: '31000', protocol: 'http:' })
-    deferred.resolve({ token: 'late-token' })
+    deferred.resolve({
+      token: 'late-token',
+      deviceId: 'mobile-device-1',
+      deviceCredential: 'late-credential',
+    })
     await pairingRequest
-    expect(savedTokens).toEqual([])
+    expect(savedAuthentications).toEqual([])
   })
 
   test('Given 自动配对请求已取消 When 旧请求迟到失败 Then 不显示旧失败且票据不重放', async () => {
     /** 模拟会在取消后失败的 pairTicket 请求。 */
-    const deferred = createDeferred<{ token: string }>()
+    const deferred = createDeferred<TrustedDeviceAuthentication>()
     /** 记录迟到失败是否错误覆盖新连接界面。 */
     const fallbacks: string[] = []
     const coordinator = createPairingStartupCoordinator({

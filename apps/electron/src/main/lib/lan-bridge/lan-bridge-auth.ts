@@ -4,13 +4,13 @@
  * 单个服务固定持有一个设备仓库；Bridge 重启只轮换 PIN 并清理内存票据。
  */
 
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { LanBridgeDeviceStore } from './lan-bridge-device-store'
 import type { LanBridgeDevice } from './lan-bridge-device-store'
 
-const TOKEN_EXPIRY_MS = 24 * 60 * 60 * 1_000
+const ACCESS_TOKEN_EXPIRY_MS = 15 * 60 * 1_000
 export const TOKEN_FUTURE_IAT_TOLERANCE_MS = 30_000
 const PAIRING_TICKET_EXPIRY_MS = 120_000
 const MAX_PAIRING_TICKETS = 1_024
@@ -18,7 +18,8 @@ const PIN_LENGTH = 6
 const PAIRING_WINDOW_MS = 60_000
 const MAX_PAIRING_FAILURES = 5
 const MAX_TOKEN_DEVICE_ID_LENGTH = 128
-const MAX_TOKEN_IP_LENGTH = 128
+const DEVICE_CREDENTIAL_VERSION = 'v1'
+const DEVICE_CREDENTIAL_SECRET_LENGTH = 43
 
 /** 单个 IP 的配对失败窗口。 */
 interface PairingAttemptState {
@@ -31,7 +32,6 @@ interface TokenPayload {
   deviceId: string
   tokenVersion: number
   iat: number
-  ip: string
 }
 
 /** 一次性票据的内存状态。 */
@@ -73,6 +73,12 @@ export interface IssuedDeviceToken {
   expiresIn: number
   expiresAt: number
   deviceId: string
+}
+
+/** 首次配对后返回的短期访问令牌和长期设备凭证。 */
+export interface IssuedTrustedDevice extends IssuedDeviceToken {
+  /** 只返回给当前客户端一次的高熵长期凭证。 */
+  deviceCredential: string
 }
 
 /** Token 的结构化失败结果。 */
@@ -193,7 +199,8 @@ export class LanBridgeAuthService {
     ip: string,
     deviceName: string,
     now = Date.now(),
-  ): IssuedDeviceToken {
+    deviceId?: string,
+  ): IssuedTrustedDevice {
     this.cleanupPairingAttempts(now)
     if (this.isPairingRateLimited(ip)) throwProtocolError('RATE_LIMITED')
 
@@ -212,14 +219,30 @@ export class LanBridgeAuthService {
     }
 
     this.pairingAttempts.delete(ip)
-    return this.generateToken(ip, deviceName, now)
+    return this.generateToken(ip, deviceName, now, deviceId)
   }
 
-  /** 注册设备并签发绑定 IP 和设备版本的 Token。 */
-  generateToken(ip: string, deviceName = 'LAN 设备', now = Date.now()): IssuedDeviceToken {
-    /** PIN 或票据配对注册的新设备。 */
-    const device = this.deviceStore.registerDevice(deviceName, now)
-    return this.issueDeviceToken(device, ip, now)
+  /** 注册可信设备并签发短期访问令牌和长期设备凭证。 */
+  generateToken(
+    ip: string,
+    deviceName = 'LAN 设备',
+    now = Date.now(),
+    deviceId?: string,
+  ): IssuedTrustedDevice {
+    /** 当前设备的高熵长期凭证秘密。 */
+    const credentialSecret = randomBytes(32).toString('base64url')
+    /** 只写入设备仓库的长期凭证哈希。 */
+    const credentialHash = hashDeviceCredentialSecret(credentialSecret)
+    /** PIN 或票据配对注册或重新授权的可信设备。 */
+    const device = this.deviceStore.registerTrustedDevice({
+      deviceId,
+      name: deviceName,
+      credentialHash,
+      ip,
+    }, now)
+    /** 当前客户端持有的版本化长期设备凭证。 */
+    const deviceCredential = createDeviceCredential(device.id, credentialSecret)
+    return { ...this.issueDeviceToken(device, now), deviceCredential }
   }
 
   /** 验证 Token 并返回认证设备和稳定错误码。 */
@@ -249,34 +272,25 @@ export class LanBridgeAuthService {
       /** 通过运行时字段验证的 payload。 */
       const payload = parsed
 
-      /** 当前 Token 按自身签发时间计算的失效时间。 */
-      const tokenExpiresAt = payload.iat + TOKEN_EXPIRY_MS
+      /** 当前访问令牌按自身签发时间计算的失效时间。 */
+      const tokenExpiresAt = payload.iat + ACCESS_TOKEN_EXPIRY_MS
       if (!Number.isFinite(tokenExpiresAt)) return invalidToken('TOKEN_INVALID')
       if (payload.iat - now > TOKEN_FUTURE_IAT_TOLERANCE_MS) return invalidToken('TOKEN_INVALID')
       if (now >= tokenExpiresAt) return invalidToken('TOKEN_EXPIRED')
-      if (payload.ip !== ip) return invalidToken('TOKEN_INVALID')
-
       /** Token payload 对应的当前设备记录。 */
       const device = this.deviceStore.getDevice(payload.deviceId)
       if (!device || device.revokedAt !== undefined || device.tokenVersion !== payload.tokenVersion) {
         return invalidToken('DEVICE_REVOKED')
       }
 
-      /** 首次配对后不可通过刷新延长的设备绝对失效时间。 */
-      const deviceExpiresAt = device.createdAt + TOKEN_EXPIRY_MS
-      if (!Number.isFinite(deviceExpiresAt)) return invalidToken('TOKEN_INVALID')
-      /** 同时受单 Token 和首次配对绝对期限约束的最终失效时间。 */
-      const expiresAt = Math.min(tokenExpiresAt, deviceExpiresAt)
-      if (now >= expiresAt) return invalidToken('TOKEN_EXPIRED')
-
       try {
-        this.deviceStore.updateLastSeen(device.id, now)
+        this.deviceStore.updateLastSeen(device.id, now, ip)
       } catch (error) {
         /** 安全摘要只保留错误类型，不包含异常消息或认证材料。 */
         const errorName = error instanceof Error ? error.name : 'UnknownError'
         this.warnSafely(`[LAN Bridge] 设备 ${device.id} 最近访问时间持久化失败（${errorName}）`)
       }
-      return { valid: true, deviceId: device.id, expiresAt }
+      return { valid: true, deviceId: device.id, expiresAt: tokenExpiresAt }
     } catch {
       return invalidToken('TOKEN_INVALID')
     }
@@ -295,7 +309,49 @@ export class LanBridgeAuthService {
     /** 刷新 Token 时复用的已配对设备。 */
     const device = this.deviceStore.getDevice(verification.deviceId)
     if (!device) return invalidToken('DEVICE_REVOKED')
-    return { valid: true, ...this.issueDeviceToken(device, ip, now) }
+    return { valid: true, ...this.issueDeviceToken(device, now) }
+  }
+
+  /**
+   * 使用长期设备凭证签发新的短期访问令牌。
+   *
+   * @param credential 移动端保存的版本化高熵设备凭证
+   * @param ip 当前来源 IP，仅用于审计
+   * @param now 当前时间戳
+   * @returns 新访问令牌或稳定认证失败码
+   */
+  refreshDeviceCredential(
+    credential: string,
+    ip: string,
+    now = Date.now(),
+  ): TokenRefreshResult {
+    /** 从长期凭证中解析出的设备 ID 和秘密。 */
+    const parsed = parseDeviceCredential(credential)
+    if (!parsed) return invalidToken('TOKEN_INVALID')
+    /** 长期凭证对应的设备记录。 */
+    const device = this.deviceStore.getDevice(parsed.deviceId)
+    if (!device || device.revokedAt !== undefined) return invalidToken('DEVICE_REVOKED')
+    /** 设备仓库中只保存的预期凭证哈希。 */
+    const expectedHash = this.deviceStore.getCredentialHash(parsed.deviceId)
+    if (!expectedHash) return invalidToken('TOKEN_INVALID')
+    /** 客户端秘密计算得到的候选哈希。 */
+    const candidateHash = hashDeviceCredentialSecret(parsed.secret)
+    /** 两个固定长度哈希的字节表示。 */
+    const expectedBuffer = Buffer.from(expectedHash)
+    const candidateBuffer = Buffer.from(candidateHash)
+    if (candidateBuffer.length !== expectedBuffer.length
+      || !timingSafeEqual(candidateBuffer, expectedBuffer)) {
+      return invalidToken('TOKEN_INVALID')
+    }
+
+    try {
+      this.deviceStore.updateLastSeen(device.id, now, ip)
+    } catch (error) {
+      /** 安全摘要只保留错误类型，不包含异常消息或认证材料。 */
+      const errorName = error instanceof Error ? error.name : 'UnknownError'
+      this.warnSafely(`[LAN Bridge] 设备 ${device.id} 最近访问时间持久化失败（${errorName}）`)
+    }
+    return { valid: true, ...this.issueDeviceToken(device, now) }
   }
 
   /** 保留旧客户端使用的 nullable 刷新接口。 */
@@ -319,18 +375,17 @@ export class LanBridgeAuthService {
   }
 
   /** 为已有设备签发 Token，刷新时不会重复注册。 */
-  private issueDeviceToken(device: LanBridgeDevice, ip: string, now: number): IssuedDeviceToken {
-    /** 带设备版本和 IP 绑定的 payload。 */
+  private issueDeviceToken(device: LanBridgeDevice, now: number): IssuedDeviceToken {
+    /** 只绑定设备版本的短期访问令牌 payload。 */
     const payload: TokenPayload = {
       deviceId: device.id,
       tokenVersion: device.tokenVersion,
       iat: now,
-      ip,
     }
     /** 编码后的 payload。 */
     const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url')
-    /** 首次配对后不可通过刷新延长的绝对失效时间。 */
-    const expiresAt = Math.min(now + TOKEN_EXPIRY_MS, device.createdAt + TOKEN_EXPIRY_MS)
+    /** 当前访问令牌的固定短期失效时间。 */
+    const expiresAt = now + ACCESS_TOKEN_EXPIRY_MS
     return {
       token: `${payloadB64}.${this.sign(payloadB64)}`,
       expiresIn: Math.max(0, expiresAt - now),
@@ -453,13 +508,19 @@ export function consumePairingTicket(
   ip: string,
   deviceName: string,
   now = Date.now(),
-): IssuedDeviceToken {
-  return getLanBridgeAuthService().consumePairingTicket(value, ip, deviceName, now)
+  deviceId?: string,
+): IssuedTrustedDevice {
+  return getLanBridgeAuthService().consumePairingTicket(value, ip, deviceName, now, deviceId)
 }
 
 /** 使用生产服务注册设备并签发 Token。 */
-export function generateToken(ip: string, deviceName = 'LAN 设备', now = Date.now()): IssuedDeviceToken {
-  return getLanBridgeAuthService().generateToken(ip, deviceName, now)
+export function generateToken(
+  ip: string,
+  deviceName = 'LAN 设备',
+  now = Date.now(),
+  deviceId?: string,
+): IssuedTrustedDevice {
+  return getLanBridgeAuthService().generateToken(ip, deviceName, now, deviceId)
 }
 
 /** 使用生产服务验证 Token。 */
@@ -513,9 +574,43 @@ function isTokenPayload(value: unknown): value is TokenPayload {
     && typeof candidate.iat === 'number'
     && Number.isFinite(candidate.iat)
     && candidate.iat >= 0
-    && typeof candidate.ip === 'string'
-    && candidate.ip.length > 0
-    && candidate.ip.length <= MAX_TOKEN_IP_LENGTH
+}
+
+/** 从设备 ID 和高熵秘密构造版本化长期凭证。 */
+function createDeviceCredential(deviceId: string, secret: string): string {
+  /** 避免设备 ID 中的分隔符影响凭证解析。 */
+  const encodedDeviceId = Buffer.from(deviceId).toString('base64url')
+  return `${DEVICE_CREDENTIAL_VERSION}.${encodedDeviceId}.${secret}`
+}
+
+/** 解析并严格校验版本化长期设备凭证。 */
+function parseDeviceCredential(
+  credential: string,
+): { deviceId: string; secret: string } | null {
+  /** 长期凭证必须恰好包含版本、设备 ID 和秘密三段。 */
+  const parts = credential.split('.')
+  if (parts.length !== 3 || parts[0] !== DEVICE_CREDENTIAL_VERSION) return null
+  /** base64url 编码的稳定设备标识。 */
+  const encodedDeviceId = parts[1]
+  /** 固定长度的高熵设备秘密。 */
+  const secret = parts[2]
+  if (!encodedDeviceId || !secret || secret.length !== DEVICE_CREDENTIAL_SECRET_LENGTH) return null
+  if (!/^[A-Za-z0-9_-]+$/.test(encodedDeviceId) || !/^[A-Za-z0-9_-]+$/.test(secret)) return null
+  try {
+    /** 解码后的稳定设备标识。 */
+    const deviceId = Buffer.from(encodedDeviceId, 'base64url').toString('utf-8')
+    if (!deviceId || deviceId.length > MAX_TOKEN_DEVICE_ID_LENGTH) return null
+    /** 重新编码必须一致，拒绝非规范 base64url 表示。 */
+    if (Buffer.from(deviceId).toString('base64url') !== encodedDeviceId) return null
+    return { deviceId, secret }
+  } catch {
+    return null
+  }
+}
+
+/** 对高熵长期设备秘密计算固定长度 SHA-256 哈希。 */
+function hashDeviceCredentialSecret(secret: string): string {
+  return createHash('sha256').update(secret).digest('base64url')
 }
 
 /** 创建结构化 Token 失败结果。 */

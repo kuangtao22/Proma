@@ -7,6 +7,12 @@ export interface PairingCountdown {
   label: string
 }
 
+/** 将完整设备标识格式化为设置页可扫描的短标签。 */
+export function formatDeviceIdentifier(deviceId: string): string {
+  if (deviceId.length <= 12) return deviceId
+  return `${deviceId.slice(0, 8)}...${deviceId.slice(-4)}`
+}
+
 /** 计算二维码倒计时展示状态。 */
 export function getPairingCountdown(expiresAt: number, now: number): PairingCountdown {
   /** 向上取整保证剩余不足一秒时仍显示 1 秒，而不是提前过期。 */

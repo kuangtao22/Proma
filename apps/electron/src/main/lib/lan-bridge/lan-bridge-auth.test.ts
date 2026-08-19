@@ -143,65 +143,175 @@ describe('LAN Bridge 一次性配对票据', () => {
 })
 
 describe('LAN Bridge 设备 Token', () => {
-  test('PIN 配对路径签发绑定设备和 IP 的 24 小时 Token', () => {
+  test('Given 二维码授权可信设备 When 完成配对 Then 返回稳定设备标识和长期设备凭证', () => {
+    /** 当前用例的隔离认证服务。 */
+    const { store, service } = initTestAuth()
+    /** 当前扫码页面生成的稳定设备标识。 */
+    const mobileDeviceId = 'mobile-device-1'
+    /** 当前二维码的一次性配对票据。 */
+    const ticket = service.createPairingTicket(1_000)
+
+    /** 扫码后直接签发的可信设备认证材料。 */
+    const result = service.consumePairingTicket(
+      ticket.value,
+      '192.168.1.8',
+      'iPhone',
+      1_001,
+      mobileDeviceId,
+    )
+
+    expect(result.deviceId).toBe(mobileDeviceId)
+    expect(result.deviceCredential).toBeString()
+    expect(result.deviceCredential).not.toContain(result.token)
+    expect(store.getDevice(mobileDeviceId)).toMatchObject({
+      id: mobileDeviceId,
+      name: 'iPhone',
+      lastIp: '192.168.1.8',
+    })
+  })
+
+  test('Given 已授权可信设备 When IP 变化且访问令牌过期 Then 长期凭证仍可自动续签', () => {
+    /** 当前用例的隔离认证服务。 */
+    const { service } = initTestAuth()
+    /** 当前二维码的一次性配对票据。 */
+    const ticket = service.createPairingTicket(1_000)
+    /** 首次扫码签发的认证材料。 */
+    const paired = service.consumePairingTicket(
+      ticket.value,
+      '192.168.1.8',
+      'iPhone',
+      1_001,
+      'mobile-device-1',
+    )
+
+    expect(service.verifyTokenDetails(paired.token, '192.168.1.9', 1_002)).toMatchObject({
+      valid: true,
+      deviceId: 'mobile-device-1',
+    })
+    expect(service.verifyTokenDetails(paired.token, '192.168.1.9', paired.expiresAt)).toEqual({
+      valid: false,
+      errorCode: 'TOKEN_EXPIRED',
+    })
+
+    /** 访问令牌过期后由长期设备凭证签发的新令牌。 */
+    const refreshed = service.refreshDeviceCredential(
+      paired.deviceCredential,
+      '192.168.1.9',
+      paired.expiresAt + 1,
+    )
+    expect(refreshed).toMatchObject({ valid: true, deviceId: 'mobile-device-1' })
+    if (!refreshed.valid) throw new Error('长期设备凭证续签失败')
+    expect(service.verifyTokenDetails(refreshed.token, '192.168.1.10', refreshed.expiresAt - 1).valid)
+      .toBe(true)
+  })
+
+  test('Given Proma 已重启并更换访问令牌签名密钥 When 使用长期设备凭证 Then 仍可恢复可信设备', () => {
+    /** 当前用例跨认证服务重启复用的设备仓库。 */
+    const store = createIsolatedDeviceStore('proma-lan-auth-restart-')
+    /** 重启前签发长期设备凭证的认证服务。 */
+    const previousService = createTestAuthService(store)
+    /** 当前二维码的一次性配对票据。 */
+    const ticket = previousService.createPairingTicket(1_000)
+    /** 重启前签发的认证材料。 */
+    const paired = previousService.consumePairingTicket(
+      ticket.value,
+      '192.168.1.8',
+      'iPhone',
+      1_001,
+      'mobile-device-1',
+    )
+    /** 模拟 Proma 重启后持有新 HMAC 密钥的认证服务。 */
+    const restartedService = createTestAuthService(store)
+
+    expect(restartedService.verifyTokenDetails(paired.token, '192.168.1.8', 1_002)).toEqual({
+      valid: false,
+      errorCode: 'TOKEN_INVALID',
+    })
+    expect(restartedService.refreshDeviceCredential(
+      paired.deviceCredential,
+      '192.168.1.9',
+      1_002,
+    )).toMatchObject({ valid: true, deviceId: 'mobile-device-1' })
+  })
+
+  test('Given 可信设备已被撤销 When 使用长期设备凭证续签 Then 返回 DEVICE_REVOKED', () => {
+    /** 当前用例的设备仓库与认证服务。 */
+    const { store, service } = initTestAuth()
+    /** 当前二维码的一次性配对票据。 */
+    const ticket = service.createPairingTicket(1_000)
+    /** 撤销前签发的认证材料。 */
+    const paired = service.consumePairingTicket(
+      ticket.value,
+      '192.168.1.8',
+      'iPhone',
+      1_001,
+      'mobile-device-1',
+    )
+    store.revokeDevice(paired.deviceId, 2_000)
+
+    expect(service.refreshDeviceCredential(paired.deviceCredential, '192.168.1.9', 2_001)).toEqual({
+      valid: false,
+      errorCode: 'DEVICE_REVOKED',
+    })
+  })
+
+  test('PIN 配对路径签发不绑定 IP 的 15 分钟访问令牌', () => {
     /** 当前用例的设备仓库。 */
     const { store, service } = initTestAuth()
     /** PIN 配对路径签发的设备 Token。 */
     const result = service.generateToken('192.168.1.8', 'iPhone', 1_000)
 
-    expect(result.expiresIn).toBe(24 * 60 * 60 * 1_000)
-    expect(result.expiresAt).toBe(86_401_000)
+    expect(result.expiresIn).toBe(15 * 60 * 1_000)
+    expect(result.expiresAt).toBe(901_000)
     expect(store.listDevices()).toHaveLength(1)
-    expect(service.verifyTokenDetails(result.token, '192.168.1.8', 86_400_999)).toMatchObject({
+    expect(service.verifyTokenDetails(result.token, '192.168.1.9', 900_999)).toMatchObject({
       valid: true,
       deviceId: store.listDevices()[0]?.id,
-      expiresAt: 86_401_000,
+      expiresAt: 901_000,
     })
-    expect(service.verifyToken(result.token, '192.168.1.9', 1_001)).toBe(false)
-    expect(service.verifyToken(result.token, '192.168.1.8', 86_401_000)).toBe(false)
-    expect(service.verifyToken(result.token, '192.168.1.8', 86_401_001)).toBe(false)
+    expect(service.verifyToken(result.token, '192.168.1.9', 1_001)).toBe(true)
+    expect(service.verifyToken(result.token, '192.168.1.8', 901_000)).toBe(false)
+    expect(service.verifyToken(result.token, '192.168.1.8', 901_001)).toBe(false)
   })
 
-  test('连续刷新不能越过首次配对后的 24 小时绝对期限', () => {
+  test('旧客户端的访问令牌刷新入口仍按 15 分钟滚动续签', () => {
     /** 当前用例的隔离认证服务。 */
     const { service } = initTestAuth()
     /** 首次配对时刻。 */
     const pairedAt = 1_000
-    /** 首次配对后不可延长的绝对失效时间。 */
-    const absoluteExpiresAt = pairedAt + 24 * 60 * 60 * 1_000
     /** 首次配对签发的设备 Token。 */
     const initialToken = service.generateToken('192.168.1.8', 'iPhone', pairedAt)
 
-    /** 配对 12 小时后的首次刷新结果。 */
+    /** 首个访问令牌过期前的首次刷新结果。 */
     const firstRefresh = service.refreshTokenDetails(
       initialToken.token,
       '192.168.1.8',
-      pairedAt + 12 * 60 * 60 * 1_000,
+      600_000,
     )
     expect(firstRefresh.valid).toBe(true)
     if (!firstRefresh.valid) throw new Error('首次刷新失败')
-    expect(firstRefresh.expiresAt).toBe(absoluteExpiresAt)
-    expect(firstRefresh.expiresIn).toBe(12 * 60 * 60 * 1_000)
+    expect(firstRefresh.expiresAt).toBe(1_500_000)
+    expect(firstRefresh.expiresIn).toBe(15 * 60 * 1_000)
 
-    /** 绝对期限前一秒的连续刷新结果。 */
+    /** 首次刷新令牌过期前的连续刷新结果。 */
     const secondRefresh = service.refreshTokenDetails(
       firstRefresh.token,
       '192.168.1.8',
-      absoluteExpiresAt - 1_000,
+      1_499_000,
     )
     expect(secondRefresh.valid).toBe(true)
     if (!secondRefresh.valid) throw new Error('连续刷新失败')
-    expect(secondRefresh.expiresAt).toBe(absoluteExpiresAt)
-    expect(secondRefresh.expiresIn).toBe(1_000)
+    expect(secondRefresh.expiresAt).toBe(2_399_000)
+    expect(secondRefresh.expiresIn).toBe(15 * 60 * 1_000)
     expect(service.verifyTokenDetails(
       secondRefresh.token,
       '192.168.1.8',
-      absoluteExpiresAt,
+      2_399_000,
     )).toEqual({ valid: false, errorCode: 'TOKEN_EXPIRED' })
     expect(service.refreshTokenDetails(
       secondRefresh.token,
       '192.168.1.8',
-      absoluteExpiresAt,
+      2_399_000,
     )).toEqual({ valid: false, errorCode: 'TOKEN_EXPIRED' })
   })
 
@@ -257,7 +367,7 @@ describe('LAN Bridge 设备 Token', () => {
     expect(service.verifyTokenDetails(result.token, '192.168.1.8', 61_000)).toEqual({
       valid: true,
       deviceId: 'device-1',
-      expiresAt: 86_401_000,
+      expiresAt: 901_000,
     })
     expect(warnings).toEqual(['[LAN Bridge] 设备 device-1 最近访问时间持久化失败（Error）'])
     expect(warnings[0]).not.toContain('secret-credential')
@@ -265,7 +375,7 @@ describe('LAN Bridge 设备 Token', () => {
     expect(service.verifyTokenDetails(result.token, '192.168.1.8', 61_001)).toEqual({
       valid: true,
       deviceId: 'device-1',
-      expiresAt: 86_401_000,
+      expiresAt: 901_000,
     })
     expect(writeCount).toBe(3)
     expect(warnings).toHaveLength(1)
@@ -295,7 +405,7 @@ describe('LAN Bridge 设备 Token', () => {
     expect(service.verifyTokenDetails(issued.token, '192.168.1.8', 61_000)).toEqual({
       valid: true,
       deviceId: 'device-1',
-      expiresAt: 86_401_000,
+      expiresAt: 901_000,
     })
   })
 

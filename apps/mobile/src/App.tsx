@@ -6,12 +6,11 @@ import {
   currentWorkspaceIdAtom, type ConvItem,
   settingsModelIdAtom, settingsChannelBaseUrlAtom, settingsChannelIdAtom,
 } from './atoms'
-import { connect, onPush, onOpen, wsReq, close, WsClientError } from './lib/ws-client'
+import { connect, onPush, onOpen, wsReq, close } from './lib/ws-client'
 import {
   combineAuthoritativeLists,
   createGenerationTracker,
   createPriorityTaskCoordinator,
-  isAuthenticationFailureCode,
   type TaskPriority,
 } from './lib/recovery-guards'
 import { AuthPage } from './components/layout/AuthPage'
@@ -24,7 +23,16 @@ import {
   startPairingConnection,
 } from './lib/pairing-startup-coordinator'
 import type { PairingConnectionTarget } from './lib/pairing-startup-coordinator'
+import type { TrustedDeviceAuthentication } from './lib/pairing-startup-coordinator'
 import type { WebSocketSourceProtocol } from './lib/ws-client'
+import {
+  clearTrustedDeviceAuthentication,
+  createRandomDeviceId,
+  getOrCreateDeviceId,
+  readTrustedDeviceAuthentication,
+  saveTrustedDeviceAuthentication,
+} from './lib/device-credentials'
+import { recoverTrustedDeviceAuth } from './lib/auth-recovery'
 
 interface ConvListResponse { conversations: ConvItem[] }
 interface SessionListResponse { sessions: ConvItem[] }
@@ -41,6 +49,9 @@ const startupPairingCoordinator = createPairingStartupCoordinator(consumePairing
   getHref: () => window.location.href,
   replaceUrl: cleanUrl => window.history.replaceState(null, '', cleanUrl),
 }))
+
+/** 当前浏览器安装持久化复用的稳定设备标识。 */
+const mobileDeviceId = getOrCreateDeviceId(localStorage, createRandomDeviceId)
 
 export interface LoadDataResult {
   conversationsUpdated: boolean
@@ -84,6 +95,8 @@ export function App() {
   const connectionGenerations = useRef(createGenerationTracker())
   /** 记录上一轮实际连接目标，用于识别来自任意 atom 更新源的地址切换。 */
   const previousConnectionTarget = useRef<PairingConnectionTarget | null>(null)
+  /** 防止同一认证失效事件并发触发多次长期凭证续签。 */
+  const authenticationRecoveryPending = useRef(false)
 
   /** 将扫码 origin 一次性同步进现有地址 atoms，之后完全由表单/atoms 驱动连接。 */
   useLayoutEffect(() => {
@@ -96,18 +109,52 @@ export function App() {
     setStartupTargetPending(false)
   }, [setHost, setPort])
 
-  /** 保存认证 Token 并进入聊天；凭据只沿用既有 Token 存储语义。 */
-  const handleAuthSuccess = useCallback(async (newToken: string) => {
-    localStorage.setItem('proma_mobile_token', newToken)
-    setToken(newToken); setConnected(true); setView('chat')
+  /** 保存完整可信设备认证材料并进入聊天。 */
+  const handleAuthSuccess = useCallback(async (authentication: TrustedDeviceAuthentication) => {
+    saveTrustedDeviceAuthentication(localStorage, authentication)
+    setToken(authentication.token); setConnected(true); setView('chat')
   }, [setToken, setConnected, setView])
 
   // 认证过期处理
   useEffect(() => {
     const handler = () => {
+      if (authenticationRecoveryPending.current) return
       connectionGenerations.current.invalidate()
-      localStorage.removeItem('proma_mobile_token')
-      setToken(null); setConnected(false); setView('auth')
+      /** 当前浏览器保存的长期设备认证材料。 */
+      const saved = readTrustedDeviceAuthentication(localStorage)
+      if (!saved.deviceCredential) {
+        clearTrustedDeviceAuthentication(localStorage)
+        setToken(null); setConnected(false); setView('auth')
+        return
+      }
+      authenticationRecoveryPending.current = true
+      void recoverTrustedDeviceAuth({
+        token: null,
+        deviceCredential: saved.deviceCredential,
+      }, {
+        verifyToken: async candidate => wsReq('auth.verify', { token: candidate }) as Promise<{
+          valid: boolean
+          errorCode?: string
+        }>,
+        refreshCredential: async credential => wsReq('auth.refresh', { credential }) as Promise<{
+          token: string
+        }>,
+      }).then((result) => {
+        if (result.status === 'authenticated') {
+          localStorage.setItem('proma_mobile_token', result.token)
+          setToken(result.token); setConnected(true); setView('chat')
+          window.dispatchEvent(new CustomEvent('proma:ws-reconnected'))
+          return
+        }
+        if (result.status === 'invalidated' || result.status === 'anonymous') {
+          clearTrustedDeviceAuthentication(localStorage)
+          setToken(null); setConnected(false); setView('auth')
+          return
+        }
+        setConnected(false)
+      }).finally(() => {
+        authenticationRecoveryPending.current = false
+      })
     }
     window.addEventListener('proma:auth-expired', handler)
     window.addEventListener('proma:auth-invalidated', handler)
@@ -144,45 +191,43 @@ export function App() {
       activeGeneration = generation
       /** 旧连接 effect 或旧 open 回调均不能继续提交状态。 */
       const isCurrent = () => !cancelled && connectionGenerations.current.isCurrent(generation)
-      /** 每次连接建立后重新读取 Token，避免使用首次渲染的陈旧状态。 */
-      const currentToken = localStorage.getItem('proma_mobile_token')
+      /** 每次连接建立后重新读取完整认证材料，避免使用首次渲染的陈旧状态。 */
+      const savedAuthentication = readTrustedDeviceAuthentication(localStorage)
       if (startupPairingCoordinator.hasPendingTicket()) {
         if (!isCurrent()) return
         setToken(null); setConnected(false); setView('auth')
         setPairingPending(true); setPairingError('')
         return
       }
-      if (!currentToken) {
-        if (!isCurrent()) return
+      authenticationRecoveryPending.current = true
+      /** 短期令牌失效时自动使用长期设备凭证恢复。 */
+      const recovery = await recoverTrustedDeviceAuth({
+        token: savedAuthentication.token,
+        deviceCredential: savedAuthentication.deviceCredential,
+      }, {
+        verifyToken: async candidate => wsReq('auth.verify', { token: candidate }) as Promise<{
+          valid: boolean
+          errorCode?: string
+        }>,
+        refreshCredential: async credential => wsReq('auth.refresh', { credential }) as Promise<{
+          token: string
+        }>,
+      })
+      authenticationRecoveryPending.current = false
+      if (!isCurrent()) return
+      if (recovery.status === 'invalidated' || recovery.status === 'anonymous') {
+        clearTrustedDeviceAuthentication(localStorage)
         setToken(null); setConnected(false); setView('auth')
         return
       }
-
-      let verification: { valid: boolean }
-      try {
-        verification = await wsReq('auth.verify', { token: currentToken }) as { valid: boolean }
-      } catch (error) {
-        if (!isCurrent()) return
-        if (error instanceof WsClientError && isAuthenticationFailureCode(error.code)) {
-          localStorage.removeItem('proma_mobile_token')
-          setToken(null); setConnected(false); setView('auth')
-        } else {
-          /** 传输错误保留 Token，等待 ws-client 自动重连后再次验证。 */
-          setConnected(false)
-        }
-        return
-      }
-      if (!isCurrent()) return
-      if (verification.valid !== true) {
-        if (verification.valid === false) {
-          localStorage.removeItem('proma_mobile_token')
-          setToken(null); setConnected(false); setView('auth')
-        } else {
-          setConnected(false)
-        }
+      if (recovery.status === 'unavailable') {
+        setConnected(false)
         return
       }
 
+      /** 当前连接最终可用的短期访问令牌。 */
+      const currentToken = recovery.token
+      if (recovery.refreshed) localStorage.setItem('proma_mobile_token', currentToken)
       setToken(currentToken); setConnected(true)
       const loadResult = await loadData(
         setConvs,
@@ -227,18 +272,26 @@ export function App() {
       void startupPairingCoordinator.handleConnected(message.data, {
         requestPairTicket: async (ticket) => {
           /** 请求期间 ticket 只存在于调用栈，不写日志或持久化。 */
-          const result = await wsReq('auth.pairTicket', { ticket, deviceName: 'Proma 手机端' })
+          const result = await wsReq('auth.pairTicket', {
+            ticket,
+            deviceName: 'Proma 手机端',
+            deviceId: mobileDeviceId,
+          })
           /** 未知协议响应在协调器中按无效结果回退 PIN。 */
-          const issued = result as { token?: unknown }
-          return { token: typeof issued.token === 'string' ? issued.token : '' }
+          const issued = result as Record<string, unknown>
+          return {
+            token: typeof issued.token === 'string' ? issued.token : '',
+            deviceId: typeof issued.deviceId === 'string' ? issued.deviceId : '',
+            deviceCredential: typeof issued.deviceCredential === 'string' ? issued.deviceCredential : '',
+          }
         },
-        onAuthenticated: (issuedToken) => {
+        onAuthenticated: (authentication) => {
           if (cancelled || !connectionGenerations.current.isCurrent(generation)) return
           setPairingPending(false)
           /** 只保存本次 socket 实际使用的 atoms 快照，避免记录旧扫码端口。 */
           localStorage.setItem('proma_mobile_host', host)
           localStorage.setItem('proma_mobile_port', port)
-          void handleAuthSuccess(issuedToken)
+          void handleAuthSuccess(authentication)
         },
         onFallback: (messageText) => {
           if (cancelled || !connectionGenerations.current.isCurrent(generation)) return
@@ -296,6 +349,7 @@ export function App() {
     return (
       <AuthPage
         onSuccess={handleAuthSuccess}
+        deviceId={mobileDeviceId}
         pairingPending={pairingPending}
         pairingError={pairingError}
         onManualAttempt={() => setPairingError('')}

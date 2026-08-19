@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type { LanBridgeDeviceDto } from '@proma/shared'
 import {
   createLanBridgeSettingsRequestCoordinator,
+  formatDeviceIdentifier,
   getPairingCountdown,
   removeRevokedDevice,
   shouldRunPairingCountdown,
@@ -33,6 +34,11 @@ function createDeferred<T>(): Deferred<T> {
 }
 
 describe('LAN Bridge 设置页纯逻辑', () => {
+  test('Given 完整设备 ID When 设置页展示 Then 保留首尾片段便于核对', () => {
+    expect(formatDeviceIdentifier('mobile-device-1234567890')).toBe('mobile-d...7890')
+    expect(formatDeviceIdentifier('device-1')).toBe('device-1')
+  })
+
   test('Given 二维码仍有效 When 计算倒计时 Then 向上取整并生成稳定中文时间', () => {
     expect(getPairingCountdown(61_001, 0)).toEqual({
       expired: false,

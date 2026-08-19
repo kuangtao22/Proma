@@ -230,10 +230,10 @@ const validFiles: Record<string, string> = {
   'packages/shared/src/types/lan-bridge.ts': `
     export const LAN_BRIDGE_PROTOCOL_VERSION = 2
     export const LAN_BRIDGE_CAPABILITIES = [
-      'pin-pairing', 'pairing-ticket', 'device-revocation', 'streaming', 'connection-recovery',
+      'pin-pairing', 'pairing-ticket', 'device-revocation', 'trusted-device-credentials', 'streaming', 'connection-recovery',
     ] as const
     export const LAN_BRIDGE_WS_CAPABILITIES = [
-      'pin-pairing', 'pairing-ticket', 'streaming', 'connection-recovery',
+      'pin-pairing', 'pairing-ticket', 'trusted-device-credentials', 'streaming', 'connection-recovery',
     ] as const satisfies readonly LanBridgeCapability[]
     export const LAN_BRIDGE_IPC_CHANNELS = {
       GET_CONFIG: 'lan-bridge:get-config',
@@ -277,6 +277,7 @@ const validFiles: Record<string, string> = {
   `,
   'apps/electron/package.json': JSON.stringify({
     scripts: {
+      dev: 'bun run build:mobile && bun run scripts/dev-kill.ts --vite && concurrently -k',
       'build:mobile': "bun run --filter='@proma/mobile' build",
       'package:prepare': 'bun run build && bun run build:mobile && bun run sync:runtime-deps',
     },
@@ -347,8 +348,8 @@ describe('fork 上游兼容检查器', () => {
       id: 'protocol-capabilities',
       path: 'packages/shared/src/types/lan-bridge.ts',
       mutate: (content) => content.replace(
-        "export const LAN_BRIDGE_WS_CAPABILITIES = [\n      'pin-pairing', 'pairing-ticket', 'streaming',",
-        "export const LAN_BRIDGE_WS_CAPABILITIES = [\n      'pin-pairing', 'pairing-ticket', 'streaming', 'device-revocation',",
+        "'pairing-ticket', 'trusted-device-credentials', 'streaming'",
+        "'pairing-ticket', 'streaming'",
       ),
     },
     {
@@ -1172,6 +1173,7 @@ describe('fork 上游兼容检查器', () => {
       ...validFiles,
       'apps/electron/package.json': JSON.stringify({
         scripts: {
+          dev: 'bun run build:mobile && bun run scripts/dev-kill.ts --vite && concurrently -k',
           'build:mobile': 'bun run --filter=@proma/mobile build',
           'package:prepare': 'bun run build && bun run build:mobile && bun run sync:runtime-deps',
         },
@@ -1179,6 +1181,23 @@ describe('fork 上游兼容检查器', () => {
     }
 
     expect(getCheck(files, 'mobile-build').passed).toBe(true)
+  })
+
+  test('Given 开发启动跳过移动端构建 When 检查移动构建 Then 明确失败', () => {
+    /** 保留打包构建合同，只移除开发启动前的移动端构建。 */
+    const electronPackage = JSON.parse(validFiles['apps/electron/package.json']!) as {
+      scripts: Record<string, string>
+    }
+    electronPackage.scripts.dev = 'bun run scripts/dev-kill.ts --vite && concurrently -k'
+    const files = {
+      ...validFiles,
+      'apps/electron/package.json': JSON.stringify(electronPackage),
+    }
+
+    /** 开发态旧 dist 会与新服务端协议失配，必须由兼容检查提前阻断。 */
+    const result = getCheck(files, 'mobile-build')
+    expect(result.passed).toBe(false)
+    expect(result.details.join('\n')).toContain('dev')
   })
 
   /** 两个打包脚本都必须拒绝无法保证执行目标命令的 shell 结构。 */

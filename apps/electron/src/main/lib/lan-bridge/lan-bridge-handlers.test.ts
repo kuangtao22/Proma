@@ -178,12 +178,62 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     const response = await request(client, socket, 'auth.pairTicket', {
       ticket: ticket.value,
       deviceName: 'iPhone',
+      deviceId: 'mobile-device-1',
     })
     /** handler 签发的设备信息。 */
-    const data = response.data as { token: string; deviceId: string }
+    const data = response.data as { token: string; deviceId: string; deviceCredential: string }
     expect(response.ok).toBe(true)
+    expect(data.deviceId).toBe('mobile-device-1')
+    expect(data.deviceCredential).toBeString()
     expect(client.deviceId).toBe(data.deviceId)
     expect(client.authToken).toBe(data.token)
+  })
+
+  test('长期设备凭证可从新 IP 自动续签并恢复连接认证', async () => {
+    /** 当前用例的隔离认证服务。 */
+    const authService = createAuthService()
+    /** 当前用例的真实会话管理器。 */
+    let nextClientId = 0
+    const manager = new LanBridgeSessionManager(10, { uuid: () => `client-credential-${++nextClientId}` })
+    registerLanBridgeHandlers({
+      authService,
+      promaAdapter: { hasAgentSession: () => true } as unknown as LanBridgePromaAdapter,
+      getSessionManager: () => manager,
+    })
+    /** 首次扫码连接。 */
+    const pairSocket = new FakeWebSocket()
+    /** 首次扫码客户端。 */
+    const pairClient = manager.addClient(pairSocket as unknown as WebSocket, '192.168.1.8')!
+    /** 当前二维码的一次性配对票据。 */
+    const ticket = authService.createPairingTicket()
+    /** 首次扫码签发的短期令牌和长期凭证。 */
+    const pairResponse = await request(pairClient, pairSocket, 'auth.pairTicket', {
+      ticket: ticket.value,
+      deviceName: 'iPhone',
+      deviceId: 'mobile-device-1',
+    })
+    /** 配对响应中的可信设备认证材料。 */
+    const paired = pairResponse.data as {
+      token: string
+      deviceId: string
+      deviceCredential: string
+    }
+
+    /** DHCP 地址变化后的新连接。 */
+    const refreshSocket = new FakeWebSocket()
+    /** 尚未认证的新 IP 客户端。 */
+    const refreshClient = manager.addClient(refreshSocket as unknown as WebSocket, '192.168.1.9')!
+    /** 只提交长期设备凭证的自动续签响应。 */
+    const refreshResponse = await request(refreshClient, refreshSocket, 'auth.refresh', {
+      credential: paired.deviceCredential,
+    })
+    /** 自动续签签发的新访问令牌。 */
+    const refreshed = refreshResponse.data as { token: string; deviceId: string }
+
+    expect(refreshResponse.ok).toBe(true)
+    expect(refreshed.deviceId).toBe(paired.deviceId)
+    expect(refreshClient.deviceId).toBe(paired.deviceId)
+    expect(refreshClient.authToken).toBe(refreshed.token)
   })
 
   test('PIN 签发后 verify、refresh 和受保护路由记录同一实际设备', async () => {
@@ -232,7 +282,7 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     expect(protectedResponse).toMatchObject({ ok: true, data: { subscribed: 'session-1' } })
   })
 
-  test('refresh 为连接提交新 Token 并保留首次配对的绝对期限', async () => {
+  test('旧 token refresh 为连接提交新的 15 分钟访问令牌', async () => {
     /** 当前用例的隔离认证服务。 */
     const authService = createAuthService()
     /** 当前用例的真实会话管理器。 */
@@ -256,7 +306,7 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     /** 刷新后签发的认证数据。 */
     const refreshed = refreshResponse.data as { token: string; expiresAt: number }
 
-    expect(refreshed.expiresAt).toBe(oldToken.expiresAt)
+    expect(refreshed.expiresAt).toBeGreaterThan(oldToken.expiresAt)
     expect(client.authToken).toBe(refreshed.token)
     expect(client.authExpiresAt).toBe(refreshed.expiresAt)
   })

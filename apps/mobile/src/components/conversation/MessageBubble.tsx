@@ -1,3 +1,4 @@
+import { Bot, Brain, UserRound } from 'lucide-react'
 import { ToolUseBlock } from './ToolUseBlock'
 import { renderMd } from '../../utils/markdown'
 import type { Message, ContentBlock, ToolUseContent, ToolResultContent } from '../../atoms'
@@ -43,6 +44,31 @@ function hasToolResult(m: Message): boolean {
   return asBlocks(getContent(m)).some((c): c is ToolResultContent => c.type === 'tool_result')
 }
 
+/** 渲染移动端统一的 Proma 助手标识。 */
+function AssistantAvatar() {
+  return (
+    <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-card text-card-foreground">
+      <Bot aria-hidden="true" className="h-3.5 w-3.5 text-muted-foreground" />
+    </div>
+  )
+}
+
+/** 渲染可折叠的思考内容，保持正文视觉层级安静。 */
+function ReasoningBlock({ reasoning }: { reasoning: string }) {
+  return (
+    <details className="group overflow-hidden rounded-md border border-border bg-muted/40">
+      <summary className="flex min-h-9 cursor-pointer select-none items-center gap-2 px-2.5 py-1.5 text-xs text-muted-foreground [&::-webkit-details-marker]:hidden">
+        <Brain aria-hidden="true" className="h-3.5 w-3.5" />
+        <span>思考过程</span>
+      </summary>
+      <div
+        className="border-t border-border px-3 py-2 text-xs leading-5 text-muted-foreground break-words [overflow-wrap:anywhere]"
+        dangerouslySetInnerHTML={{ __html: renderMd(reasoning) }}
+      />
+    </details>
+  )
+}
+
 export function MessageBubble({ message: m, resultMap }: { message: Message; resultMap: Map<string, ToolResultContent> }) {
   const isUser = m.type === 'user' || m.role === 'user'
   const text = extractText(m)
@@ -54,30 +80,25 @@ export function MessageBubble({ message: m, resultMap }: { message: Message; res
 
   if (!isUser && !text && !reasoning && toolUses.length > 0) {
     return (
-      <div className="flex gap-2 min-w-0">
-        <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-500 flex items-center justify-center text-white text-[10px] font-bold flex-shrink-0">AI</div>
-        <div className="flex-1 min-w-0 space-y-1">
+      <article data-message-role="assistant" className="flex min-w-0 gap-2.5">
+        <AssistantAvatar />
+        <div className="min-w-0 flex-1 space-y-1.5">
           {toolUses.map(tu => (
             <ToolUseBlock key={tu.id} toolUse={tu} result={resultMap.get(tu.id)} />
           ))}
         </div>
-      </div>
+      </article>
     )
   }
 
   if (!isUser && !text && toolUses.length === 0 && reasoning) {
     return (
-      <div className="flex gap-2 min-w-0">
-        <div className="w-7 h-7 rounded-lg flex items-center justify-center text-[10px] font-bold flex-shrink-0 bg-gradient-to-br from-indigo-500 to-purple-500 text-white">AI</div>
-        <div className="flex-1 min-w-0">
-          <div className="rounded-xl px-3 py-2 text-sm bg-muted text-foreground rounded-tl-sm">
-            <details>
-              <summary className="text-xs text-purple-400 cursor-pointer">🧠 思考过程</summary>
-              <div className="mt-1 text-xs text-muted-foreground border-l-2 border-purple-500/30 pl-2 overflow-x-auto" dangerouslySetInnerHTML={{ __html: renderMd(reasoning) }} />
-            </details>
-          </div>
+      <article data-message-role="assistant" className="flex min-w-0 gap-2.5">
+        <AssistantAvatar />
+        <div className="min-w-0 flex-1">
+          <ReasoningBlock reasoning={reasoning} />
         </div>
-      </div>
+      </article>
     )
   }
 
@@ -85,60 +106,48 @@ export function MessageBubble({ message: m, resultMap }: { message: Message; res
 
   if (!isUser) {
     return (
-      <div className="flex gap-2 min-w-0">
-        <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-500 flex items-center justify-center text-white text-[10px] font-bold flex-shrink-0">AI</div>
-        <div className="flex-1 min-w-0 space-y-1">
-          <div className="flex items-center gap-2 mb-0.5">
-            <span className="text-[11px] font-medium text-foreground/60">{m.model || 'AI 助手'}</span>
+      <article data-message-role="assistant" className="flex min-w-0 gap-2.5">
+        <AssistantAvatar />
+        <div className="min-w-0 flex-1 space-y-1.5">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-[11px] font-medium text-foreground/70">{m.model || 'Proma'}</span>
             {m.createdAt && <span className="text-[10px] text-muted-foreground">{new Date(m.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</span>}
           </div>
           {toolUses.map(tu => (
             <ToolUseBlock key={tu.id} toolUse={tu} result={resultMap.get(tu.id)} />
           ))}
-          {reasoning && (
-            <div className="rounded-xl px-3 py-2 text-sm bg-muted text-foreground rounded-tl-sm">
-              <details>
-                <summary className="text-xs text-purple-400 cursor-pointer">🧠 思考过程</summary>
-                <div className="mt-1 text-xs text-muted-foreground border-l-2 border-purple-500/30 pl-2 overflow-x-auto" dangerouslySetInnerHTML={{ __html: renderMd(reasoning) }} />
-              </details>
-            </div>
-          )}
+          {reasoning && <ReasoningBlock reasoning={reasoning} />}
           {text && (
-            <div className="rounded-xl px-3 py-2 text-sm bg-muted text-foreground rounded-tl-sm">
-              <div className="prose prose-sm prose-invert max-w-none break-words overflow-x-auto" dangerouslySetInnerHTML={{ __html: renderMd(text) }} />
-            </div>
+            <div
+              className="prose prose-sm max-w-none break-words text-sm leading-6 text-foreground [overflow-wrap:anywhere]"
+              dangerouslySetInnerHTML={{ __html: renderMd(text) }}
+            />
           )}
         </div>
-      </div>
-    )
-  }
-
-  if (isUser && hasToolResult(m) && text) {
-    return (
-      <div className="flex gap-2 flex-row-reverse min-w-0">
-        <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-orange-500 flex items-center justify-center text-white text-[10px] font-bold flex-shrink-0">我</div>
-        <div className="flex flex-col items-end min-w-0" style={{ maxWidth: 'calc(100% - 36px)' }}>
-          <div className="bg-primary/10 text-foreground rounded-xl rounded-tr-sm px-3 py-2 text-sm">
-            <div className="prose prose-sm prose-invert max-w-none break-words" dangerouslySetInnerHTML={{ __html: renderMd(text) }} />
-          </div>
-        </div>
-      </div>
+      </article>
     )
   }
 
   return (
-    <div className="flex gap-2 flex-row-reverse min-w-0">
-      <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-orange-500 flex items-center justify-center text-white text-[10px] font-bold flex-shrink-0">我</div>
-      <div className="flex flex-col items-end min-w-0" style={{ maxWidth: 'calc(100% - 36px)' }}>
-        <div className="flex items-center gap-2 mb-0.5">
-          <span className="text-[11px] font-medium text-foreground/60">我</span>
-          {m.createdAt && <span className="text-[10px] text-muted-foreground">{new Date(m.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</span>}
-        </div>
-        <div className="bg-primary/10 text-foreground rounded-xl rounded-tr-sm px-3 py-2 text-sm">
-          <div className="prose prose-sm prose-invert max-w-none break-words" dangerouslySetInnerHTML={{ __html: renderMd(text) }} />
+    <article data-message-role="user" className="flex min-w-0 flex-row-reverse gap-2.5">
+      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-card text-card-foreground">
+        <UserRound aria-hidden="true" className="h-3.5 w-3.5 text-muted-foreground" />
+      </div>
+      <div className="flex min-w-0 flex-col items-end" style={{ maxWidth: 'calc(100% - 38px)' }}>
+        {!hasToolResult(m) && (
+          <div className="mb-1 flex items-center gap-2">
+            <span className="text-[11px] font-medium text-foreground/70">我</span>
+            {m.createdAt && <span className="text-[10px] text-muted-foreground">{new Date(m.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</span>}
+          </div>
+        )}
+        <div className="min-w-0 rounded-md bg-secondary px-3 py-2 text-sm leading-6 text-secondary-foreground">
+          <div
+            className="prose prose-sm max-w-none break-words [overflow-wrap:anywhere]"
+            dangerouslySetInnerHTML={{ __html: renderMd(text) }}
+          />
         </div>
       </div>
-    </div>
+    </article>
   )
 }
 

@@ -29,6 +29,7 @@ import { SettingsInput } from './primitives/SettingsInput'
 import { lanBridgeStateAtom, lanBridgeConfigAtom } from '@/atoms/lan-bridge-atoms'
 import {
   createLanBridgeSettingsRequestCoordinator,
+  formatDeviceIdentifier,
   getPairingCountdown,
   removeRevokedDevice,
   shouldRunPairingCountdown,
@@ -453,6 +454,14 @@ export function LanBridgeSettings(): React.ReactElement {
                     <p className="mt-0.5 truncate text-sm text-muted-foreground">
                       最近访问 {formatDeviceTime(device.lastSeenAt)}
                     </p>
+                    <p className="mt-0.5 truncate text-xs text-muted-foreground" title={device.id}>
+                      设备 ID {formatDeviceIdentifier(device.id)} · 首次授权 {formatDeviceTime(device.createdAt)}
+                    </p>
+                    {device.lastIp && (
+                      <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                        最近 IP {device.lastIp}
+                      </p>
+                    )}
                   </div>
                   <div className="shrink-0">
                   <AlertDialog>

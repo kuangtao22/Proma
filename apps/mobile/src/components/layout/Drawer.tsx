@@ -1,4 +1,5 @@
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
+import { CircleDot, LogOut, Pin, Plus, RefreshCw, X } from 'lucide-react'
 import {
   viewAtom, tokenAtom, connectedAtom, activeConvAtom,
   conversationsAtom, agentSessionGroupsAtom, chatConvsAtom,
@@ -58,21 +59,28 @@ export function Drawer({ onClose }: Props) {
   }
 
   return (
-    <nav className="w-72 max-w-[80vw] bg-[#141416] border-r border-border h-full z-50 flex flex-col shadow-xl">
+    <nav aria-label="会话抽屉" className="z-50 flex h-full w-72 max-w-[84vw] flex-col border-r border-border bg-sidebar text-foreground shadow-xl">
       {/* 头部 */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
+      <div className="flex h-12 flex-shrink-0 items-center justify-between border-b border-border px-3">
         <h2 className="text-sm font-semibold text-foreground">Proma</h2>
-        <button onClick={onClose} className="text-muted-foreground hover:text-foreground p-1">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+        <button
+          aria-label="关闭会话抽屉"
+          onClick={onClose}
+          className="flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-control hover:text-foreground"
+        >
+          <X aria-hidden="true" className="h-[18px] w-[18px]" />
         </button>
       </div>
 
       {/* Tab 切换 */}
-      <div className="px-3 py-2 border-b border-border flex-shrink-0">
-        <div className="flex rounded-lg bg-muted p-0.5">
+      <div className="flex-shrink-0 border-b border-border px-3 py-2.5">
+        <div className="flex rounded-md bg-sidebar-control p-1">
           {(['agent', 'chat'] as TabType[]).map(t => (
-            <button key={t} onClick={() => setTab(t)}
-              className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-colors ${tab === t ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground'}`}
+            <button
+              key={t}
+              aria-pressed={tab === t}
+              onClick={() => setTab(t)}
+              className={`min-h-8 flex-1 rounded-[4px] px-2 text-xs font-medium transition-colors ${tab === t ? 'bg-content text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
             >{t === 'agent' ? 'Agent' : 'Chat'}</button>
           ))}
         </div>
@@ -80,14 +88,21 @@ export function Drawer({ onClose }: Props) {
 
       {/* 工作区选择器 */}
       {tab === 'agent' && workspaces.length > 1 && (
-        <div className="px-3 py-1.5 border-b border-border flex-shrink-0 flex gap-1 overflow-x-auto">
-          <button onClick={() => setWsId(null)}
-            className={`px-2 py-1 text-[10px] rounded-md whitespace-nowrap transition-colors ${!wsId ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground'}`}>
+        <div className="flex flex-shrink-0 gap-1.5 overflow-x-auto border-b border-border px-3 py-2">
+          <button
+            aria-pressed={!wsId}
+            onClick={() => setWsId(null)}
+            className={`min-h-8 whitespace-nowrap rounded-md px-2.5 text-[11px] transition-colors ${!wsId ? 'bg-primary text-primary-foreground' : 'bg-sidebar-control text-muted-foreground hover:bg-sidebar-control-hover'}`}
+          >
             全部
           </button>
           {workspaces.map(ws => (
-            <button key={ws.id} onClick={() => setWsId(ws.id)}
-              className={`px-2 py-1 text-[10px] rounded-md whitespace-nowrap transition-colors ${wsId === ws.id ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground'}`}>
+            <button
+              key={ws.id}
+              aria-pressed={wsId === ws.id}
+              onClick={() => setWsId(ws.id)}
+              className={`min-h-8 whitespace-nowrap rounded-md px-2.5 text-[11px] transition-colors ${wsId === ws.id ? 'bg-primary text-primary-foreground' : 'bg-sidebar-control text-muted-foreground hover:bg-sidebar-control-hover'}`}
+            >
               {ws.name}
             </button>
           ))}
@@ -97,27 +112,35 @@ export function Drawer({ onClose }: Props) {
       {/* 列表内容 */}
       <div className="flex-1 overflow-y-auto min-w-0">
         {tab === 'agent' ? (
-          <div className="py-1">
-            <button onClick={() => handleCreate(wsId ?? undefined)}
-              className="w-full text-left px-4 py-2.5 text-sm text-primary hover:bg-accent/30 transition-colors flex items-center gap-2">
-              <span className="text-base">+</span> 新建对话
+          <div className="py-1.5">
+            <button
+              onClick={() => handleCreate(wsId ?? undefined)}
+              className="flex min-h-10 w-full items-center gap-2 px-3.5 py-2 text-left text-sm font-medium text-foreground transition-colors hover:bg-sidebar-control"
+            >
+              <Plus aria-hidden="true" className="h-4 w-4 text-muted-foreground" />
+              新建对话
             </button>
 
             {agentGroups.map(g => (
               <div key={g.key}>
-                <div className="px-4 py-1.5 text-[10px] font-medium text-muted-foreground/70 uppercase tracking-wider">
+                <div className="px-3.5 pb-1 pt-3 text-[10px] font-medium uppercase text-muted-foreground">
                   {g.label}
                 </div>
                 {g.convs.map(c => (
-                  <button key={c.id} onClick={() => handleOpen(c)}
-                    className={`w-full text-left px-4 py-2 text-sm transition-colors flex items-center gap-2 ${active?.id === c.id ? 'bg-primary/10 text-primary' : 'text-foreground hover:bg-accent/20'}`}>
-                    <span className="truncate flex-1">
-                      {c.pinned && <span className="text-yellow-400 mr-1">📌</span>}
-                      {c.manualWorking && <span className="text-blue-400 mr-1">●</span>}
+                  <button
+                    key={c.id}
+                    onClick={() => handleOpen(c)}
+                    className={`flex min-h-10 w-full items-center gap-2 px-3.5 py-2 text-left text-sm transition-colors ${active?.id === c.id ? 'bg-sidebar-control text-foreground' : 'text-foreground hover:bg-sidebar-control/70'}`}
+                  >
+                    <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                      {c.pinned && <Pin aria-label="置顶" className="h-3 w-3 shrink-0 text-muted-foreground" />}
+                      {c.manualWorking && <CircleDot aria-label="工作中" className="h-3 w-3 shrink-0 text-foreground" />}
+                      <span className="truncate">
                       {c.title || '新对话'}
+                      </span>
                     </span>
                     {c.updatedAt ? (
-                      <span className="text-[10px] text-muted-foreground flex-shrink-0">{formatRelativeTime(c.updatedAt)}</span>
+                      <span className="flex-shrink-0 text-[10px] text-muted-foreground">{formatRelativeTime(c.updatedAt)}</span>
                     ) : null}
                   </button>
                 ))}
@@ -125,35 +148,44 @@ export function Drawer({ onClose }: Props) {
             ))}
 
             {agentGroups.length === 0 && (
-              <p className="text-center text-muted-foreground text-xs py-6">暂无 Agent 对话</p>
+              <p className="px-4 py-8 text-center text-xs text-muted-foreground">暂无 Agent 对话</p>
             )}
           </div>
         ) : (
-          <div className="py-1">
+          <div className="py-1.5">
             {chatConvs.map(c => (
-              <button key={c.id} onClick={() => handleOpen(c)}
-                className={`w-full text-left px-4 py-2.5 text-sm transition-colors flex items-center gap-2 border-b border-border/30 ${active?.id === c.id ? 'bg-primary/10 text-primary' : 'text-foreground hover:bg-accent/20'}`}>
-                <span className="truncate flex-1">{c.title || '新对话'}</span>
+              <button
+                key={c.id}
+                onClick={() => handleOpen(c)}
+                className={`flex min-h-10 w-full items-center gap-2 px-3.5 py-2 text-left text-sm transition-colors ${active?.id === c.id ? 'bg-sidebar-control text-foreground' : 'text-foreground hover:bg-sidebar-control/70'}`}
+              >
+                <span className="min-w-0 flex-1 truncate">{c.title || '新对话'}</span>
                 {c.updatedAt ? (
-                  <span className="text-[10px] text-muted-foreground flex-shrink-0">{formatRelativeTime(c.updatedAt)}</span>
+                  <span className="flex-shrink-0 text-[10px] text-muted-foreground">{formatRelativeTime(c.updatedAt)}</span>
                 ) : null}
               </button>
             ))}
             {chatConvs.length === 0 && (
-              <p className="text-center text-muted-foreground text-xs py-6">暂无 Chat 对话</p>
+              <p className="px-4 py-8 text-center text-xs text-muted-foreground">暂无 Chat 对话</p>
             )}
           </div>
         )}
       </div>
 
       {/* 底部操作 */}
-      <div className="border-t border-border px-3 py-2 flex gap-2 flex-shrink-0">
-        <button onClick={handleRefresh}
-          className="flex-1 text-xs text-center py-1.5 rounded-lg bg-muted text-muted-foreground hover:bg-accent/20 transition-colors">
+      <div className="flex flex-shrink-0 gap-2 border-t border-border px-3 py-2.5">
+        <button
+          onClick={handleRefresh}
+          className="flex min-h-10 flex-1 items-center justify-center gap-1.5 rounded-md bg-sidebar-control px-2 text-xs text-muted-foreground transition-colors hover:bg-sidebar-control-hover hover:text-foreground"
+        >
+          <RefreshCw aria-hidden="true" className="h-3.5 w-3.5" />
           刷新
         </button>
-        <button onClick={handleDisconnect}
-          className="flex-1 text-xs text-center py-1.5 rounded-lg text-red-400 hover:bg-red-400/10 transition-colors">
+        <button
+          onClick={handleDisconnect}
+          className="flex min-h-10 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-xs text-destructive transition-colors hover:bg-destructive/10"
+        >
+          <LogOut aria-hidden="true" className="h-3.5 w-3.5" />
           断开
         </button>
       </div>

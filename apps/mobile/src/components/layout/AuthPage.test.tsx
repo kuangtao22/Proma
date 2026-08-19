@@ -17,7 +17,9 @@ describe('移动端配对表单可访问性', () => {
     const { renderToStaticMarkup } = await import('react-dom/server')
     const { AuthPage } = await import('./AuthPage')
     /** 静态标记用于验证浏览器和读屏依赖的原生标签关联。 */
-    const markup = renderToStaticMarkup(<AuthPage onSuccess={() => undefined} />)
+    const markup = renderToStaticMarkup(
+      <AuthPage deviceId="mobile-device-1" onSuccess={() => undefined} />,
+    )
     /** 每个可见字段应使用稳定且互不重复的输入框标识。 */
     const fields = [
       { label: '地址', id: 'auth-host' },
@@ -36,14 +38,37 @@ describe('移动端配对表单可访问性', () => {
     const { renderToStaticMarkup } = await import('react-dom/server')
     const { AuthPage } = await import('./AuthPage')
     /** 默认表单保留可提交的连接按钮。 */
-    const readyMarkup = renderToStaticMarkup(<AuthPage onSuccess={() => undefined} />)
+    const readyMarkup = renderToStaticMarkup(
+      <AuthPage deviceId="mobile-device-1" onSuccess={() => undefined} />,
+    )
     /** 扫码验证期间按钮仍保留名称并通过 disabled 阻止重复提交。 */
     const pendingMarkup = renderToStaticMarkup(
-      <AuthPage onSuccess={() => undefined} pairingPending />,
+      <AuthPage deviceId="mobile-device-1" onSuccess={() => undefined} pairingPending />,
     )
 
     expect(readyMarkup).toMatch(/<button[^>]*type="submit"[^>]*>连接<\/button>/)
     expect(readyMarkup).not.toMatch(/<button[^>]*disabled=""[^>]*>连接<\/button>/)
     expect(pendingMarkup).toMatch(/<button[^>]*type="submit"[^>]*disabled=""[^>]*>连接<\/button>/)
+  })
+
+  test('Given 扫码等待或失败 When 渲染连接页 Then 状态可被读屏识别且手工回退始终存在', async () => {
+    const { renderToStaticMarkup } = await import('react-dom/server')
+    const { AuthPage } = await import('./AuthPage')
+    /** 同时提供等待与错误，验证二者不会遮蔽手工回退字段。 */
+    const markup = renderToStaticMarkup(
+      <AuthPage
+        deviceId="mobile-device-1"
+        onSuccess={() => undefined}
+        pairingPending
+        pairingError="二维码已失效"
+      />,
+    )
+
+    expect(markup).toContain('role="status"')
+    expect(markup).toContain('role="alert"')
+    expect(markup).toContain('正在验证扫码连接')
+    expect(markup).toContain('二维码已失效')
+    expect(markup).toContain('id="auth-pin"')
+    expect(markup).toContain('aria-label="连接到桌面 Proma"')
   })
 })

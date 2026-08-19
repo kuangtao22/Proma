@@ -116,6 +116,8 @@ function handlePair(
   const issuedToken = context.authService.generateToken(
     client.ip,
     typeof data.deviceName === 'string' ? data.deviceName : undefined,
+    Date.now(),
+    typeof data.deviceId === 'string' ? data.deviceId : undefined,
   )
   markAuthenticated(client, issuedToken.token, issuedToken.deviceId, issuedToken.expiresAt)
   return issuedToken
@@ -133,6 +135,8 @@ function handlePairTicket(
     ticket,
     client.ip,
     typeof data.deviceName === 'string' ? data.deviceName : 'LAN 设备',
+    Date.now(),
+    typeof data.deviceId === 'string' ? data.deviceId : undefined,
   )
   markAuthenticated(client, issuedToken.token, issuedToken.deviceId, issuedToken.expiresAt)
   return issuedToken
@@ -158,12 +162,16 @@ function handleRefresh(
   client: ClientConnection,
   data: Record<string, unknown>,
 ) {
+  /** 新客户端优先提交的长期设备凭证。 */
+  const credential = typeof data.credential === 'string' ? data.credential : undefined
   const token = data.token as string | undefined
-  if (!token) {
+  if (!credential && !token) {
     throw Object.assign(new Error('Token required'), { errorCode: 'AUTH_REQUIRED' })
   }
-  /** 保留具体失败语义的结构化刷新结果。 */
-  const result = context.authService.refreshTokenDetails(token, client.ip)
+  /** 长期设备凭证支持跨 IP、跨进程续签；旧 Token 路径继续兼容既有客户端。 */
+  const result = credential
+    ? context.authService.refreshDeviceCredential(credential, client.ip)
+    : context.authService.refreshTokenDetails(token!, client.ip)
   if (!result.valid) throwAuthError(result.errorCode)
   markAuthenticated(client, result.token, result.deviceId, result.expiresAt)
   /** 旧客户端继续读取 token/expiresIn，新增 deviceId 不破坏兼容。 */
