@@ -17,16 +17,30 @@ interface ReleaseWorkflow {
 }
 
 interface ElectronPackageMetadata {
+  /** 当前桌面应用完整版本。 */
+  version?: string
   /** Debian 等 Linux 安装包需要展示的项目主页。 */
   homepage?: string
 }
 
+interface PlatformArtifactConfig {
+  /** 当前平台的安装包文件名模板。 */
+  artifactName?: string
+}
+
 interface ElectronBuilderConfig {
+  /** 正式安装包系统标识。 */
+  appId?: string
+  /** 正式安装包产品名。 */
+  productName?: string
+  /** 是否根据预发布后缀自动改变更新频道。 */
+  detectUpdateChannel?: boolean
+  /** macOS 安装包配置。 */
+  mac?: PlatformArtifactConfig
+  /** Windows 安装包配置。 */
+  win?: PlatformArtifactConfig
   /** Linux 安装包配置。 */
-  linux?: {
-    /** 避免 workspace scope 进入产物路径的稳定文件名。 */
-    artifactName?: string
-  }
+  linux?: PlatformArtifactConfig
 }
 
 /** 返回仓库中的 Release 工作流文本。 */
@@ -85,8 +99,28 @@ test('Linux deb 包含 Electron Builder 必需的项目主页', () => {
   expect(metadata.homepage).toBe('https://github.com/kuangtao22/Proma')
 })
 
-test('Linux 产物名不继承带 scope 的 workspace 包名', () => {
-  /** Electron Builder 的 Linux 安装包配置。 */
+test('Bone 应用版本与更新频道保持一致', () => {
+  /** Electron workspace 的发布元数据。 */
+  const metadata = readElectronPackageMetadata()
+  /** Electron Builder 的正式打包配置。 */
   const config = readElectronBuilderConfig()
-  expect(config.linux?.artifactName).toBe('Proma-${version}-${arch}.${ext}')
+  /** 自动更新初始化源码，用于锁定预发布设置。 */
+  const updaterSource = readFileSync(
+    resolve(import.meta.dir, '../src/main/lib/updater/auto-updater.ts'),
+    'utf8',
+  )
+
+  expect(metadata.version).toBe('0.17.42-bone.5')
+  expect(config.detectUpdateChannel).toBe(false)
+  expect(updaterSource).toContain('autoUpdater.allowPrerelease = true')
+})
+
+test('正式安装包名称包含完整版本、平台和架构', () => {
+  /** Electron Builder 的正式打包配置。 */
+  const config = readElectronBuilderConfig()
+  expect(config.appId).toBe('com.bone.proma.app')
+  expect(config.productName).toBe('Proma')
+  expect(config.mac?.artifactName).toBe('Proma-${version}-macos-${arch}.${ext}')
+  expect(config.win?.artifactName).toBe('Proma-${version}-windows-${arch}.${ext}')
+  expect(config.linux?.artifactName).toBe('Proma-${version}-linux-${arch}.${ext}')
 })

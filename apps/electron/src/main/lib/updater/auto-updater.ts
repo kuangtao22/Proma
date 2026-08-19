@@ -161,6 +161,9 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
     debug: (...args: unknown[]) => console.log('[更新-updater:debug]', ...args),
   }
 
+  // Bone 使用预发布 SemVer；显式允许同一官方基线内递增更新。
+  autoUpdater.allowPrerelease = true
+
   // 自动下载，但不在用户正常退出时自动安装，避免重启应用后被动进入更新流程。
   autoUpdater.autoDownload = true
   autoUpdater.autoInstallOnAppQuit = false
