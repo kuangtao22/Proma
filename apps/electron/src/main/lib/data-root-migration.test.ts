@@ -457,12 +457,20 @@ describe('DataRootMigrationCoordinator', () => {
 
     await harness.coordinator.createPlan(targetRoot)
 
-    expect(existsSync(`${harness.lockPath}.recover`)).toBe(false)
+    expect(JSON.parse(readFileSync(`${harness.lockPath}.recover`, 'utf-8'))).toEqual(staleRecoveryLock)
     expect(JSON.parse(readFileSync(harness.lockPath, 'utf-8'))).not.toMatchObject({
       ownerToken: staleLock.ownerToken,
     })
     await harness.coordinator.cancel()
     expect(existsSync(harness.lockPath)).toBe(false)
+
+    const nextHarness = createHarness({ isPidRunning: () => false })
+    writeFileSync(nextHarness.lockPath, JSON.stringify({
+      version: 1, pid: 44, createdAt: 3, ownerToken: 'next-stale-owner',
+    }))
+    await nextHarness.coordinator.createPlan(targetRoot)
+    await nextHarness.coordinator.cancel()
+    expect(existsSync(nextHarness.lockPath)).toBe(false)
   })
 
   test('Given recovery mutex 无法确认归属 When 接管陈旧主锁 Then 拒绝且不修改任一锁', async () => {
@@ -478,42 +486,51 @@ describe('DataRootMigrationCoordinator', () => {
     expect(JSON.parse(readFileSync(`${harness.lockPath}.recover`, 'utf-8'))).toEqual(invalidRecoveryLock)
   })
 
-  test('Given recovery mutex 死亡检查期间被其他 owner 替换 When 接管 Then 拒绝且保留新 owner', async () => {
-    const lockPath = join(homeDir, '.proma-data-root-migration.lock')
+  test('Given 两个 contender 在陈旧 recovery 检查期间交错 When B 先取得主锁 Then A 拒绝且不删除 B', async () => {
     const staleLock = { version: 1, pid: 42, createdAt: 1, ownerToken: 'stale-owner' }
     const staleRecoveryLock = { version: 1, pid: 43, createdAt: 2, ownerToken: 'stale-recovery-owner' }
-    const replacementRecoveryLock = { version: 1, pid: 44, createdAt: 3, ownerToken: 'replacement-recovery-owner' }
-    let pidChecks = 0
-    const harness = createHarness({
-      isPidRunning: () => {
-        pidChecks += 1
-        if (pidChecks === 2) writeFileSync(`${lockPath}.recover`, JSON.stringify(replacementRecoveryLock))
-        return false
+    let contenderBPlan: Promise<DataRootMigrationProgress> | null = null
+    const contenderB = createHarness({
+      createLockOwnerToken: createTokenSequence(['b-main-owner', 'b-recovery-owner']),
+      isPidRunning: () => false,
+    })
+    const contenderA = createHarness({
+      createLockOwnerToken: createTokenSequence(['a-main-owner', 'a-recovery-owner']),
+      isPidRunning: (pid) => {
+        if (pid === staleRecoveryLock.pid && contenderBPlan === null) {
+          contenderBPlan = contenderB.coordinator.createPlan(targetRoot)
+        }
+        return pid === process.pid
       },
     })
-    writeFileSync(harness.lockPath, JSON.stringify(staleLock))
-    writeFileSync(`${harness.lockPath}.recover`, JSON.stringify(staleRecoveryLock))
+    writeFileSync(contenderA.lockPath, JSON.stringify(staleLock))
+    writeFileSync(`${contenderA.lockPath}.recover`, JSON.stringify(staleRecoveryLock))
 
-    await expect(harness.coordinator.createPlan(targetRoot)).rejects.toMatchObject({ code: 'MIGRATION_LOCKED' })
+    await expect(contenderA.coordinator.createPlan(targetRoot)).rejects.toMatchObject({ code: 'MIGRATION_LOCKED' })
+    expect(contenderBPlan).not.toBeNull()
+    await contenderBPlan
 
-    expect(JSON.parse(readFileSync(harness.lockPath, 'utf-8'))).toEqual(staleLock)
-    expect(JSON.parse(readFileSync(`${harness.lockPath}.recover`, 'utf-8'))).toEqual(replacementRecoveryLock)
+    expect(JSON.parse(readFileSync(contenderB.lockPath, 'utf-8'))).toMatchObject({ ownerToken: 'b-main-owner' })
+    expect(JSON.parse(readFileSync(`${contenderB.lockPath}.recover`, 'utf-8'))).toEqual(staleRecoveryLock)
+    await contenderB.coordinator.cancel()
+    expect(existsSync(contenderB.lockPath)).toBe(false)
   })
 
-  test('Given 当前 owner 锁在运行中被替换 When 释放 Then 不删除其他 owner 的锁', async () => {
-    const harness = createHarness({
-      copyDirectory: async () => {
-        writeFileSync(harness.lockPath, JSON.stringify({
-          version: 1, pid: 99, createdAt: 2, ownerToken: 'replacement-owner',
-        }))
-        throw new Error('copy failed')
-      },
+  test('Given 当前 holder 已原子释放 When 新 owner 随后获取主锁 Then 旧 holder 不再删除新锁', async () => {
+    const holder = createHarness({
+      createLockOwnerToken: createTokenSequence(['holder-main-owner']),
     })
-    await harness.coordinator.createPlan(targetRoot)
+    await holder.coordinator.createPlan(targetRoot)
+    await holder.coordinator.cancel()
 
-    await expect(harness.coordinator.runPending()).rejects.toBeInstanceOf(DataRootMigrationError)
+    const nextOwner = createHarness({
+      createLockOwnerToken: createTokenSequence(['next-main-owner']),
+    })
+    await nextOwner.coordinator.createPlan(targetRoot)
 
-    expect(JSON.parse(readFileSync(harness.lockPath, 'utf-8'))).toMatchObject({ ownerToken: 'replacement-owner' })
+    expect(JSON.parse(readFileSync(nextOwner.lockPath, 'utf-8'))).toMatchObject({ ownerToken: 'next-main-owner' })
+    await nextOwner.coordinator.cancel()
+    expect(existsSync(nextOwner.lockPath)).toBe(false)
   })
 
   test('Given 高频文件进度 When 运行 Then 对外单调且 locator 写入被节流', async () => {
@@ -642,6 +659,17 @@ describe('DataRootMigrationCoordinator', () => {
     expect(harness.copyCalls.map((call) => call.migrationId)).toEqual(['migration-1', 'migration-1'])
     expect(harness.locator.requireActiveRoot()).toBe(targetRoot)
   })
+
+  /** 按顺序生成可断言的锁 owner token，调用超出预期时立即失败。 */
+  function createTokenSequence(tokens: readonly string[]): () => string {
+    let index = 0
+    return () => {
+      const token = tokens[index]
+      index += 1
+      if (!token) throw new Error('锁 owner token 调用次数超出测试预期')
+      return token
+    }
+  }
 
   /** 创建使用真实 locator、可替换执行依赖的协调器。 */
   function createHarness(overrides: Partial<DataRootMigrationCoordinatorOptions> = {}): TestHarness {

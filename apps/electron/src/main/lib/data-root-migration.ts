@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   accessSync,
   closeSync,
@@ -80,6 +80,9 @@ interface MigrationLockRecord {
   createdAt: number
   ownerToken: string
 }
+
+/** 限制异常崩溃形成的 recovery claim 链深度，损坏或恶意链条必须人工检查。 */
+const MAX_RECOVERY_CLAIM_DEPTH = 64
 
 /** 单次 run 独占的取消令牌，创建后 latch 只会从 false 变为 true。 */
 interface MigrationRunToken {
@@ -563,7 +566,7 @@ export class DataRootMigrationCoordinator {
 
     const recoveryPath = `${this.lockPath}.recover`
     const recoveryOwnerToken = this.createLockOwnerToken()
-    this.acquireRecoveryLock(recoveryPath, recoveryOwnerToken)
+    const recoveryClaimPath = this.acquireRecoveryLock(recoveryPath, recoveryOwnerToken)
     try {
       const initial = readMigrationLock(this.lockPath)
       if (!initial || this.isPidRunning(initial.pid)) {
@@ -579,34 +582,35 @@ export class DataRootMigrationCoordinator {
       }
       this.lockOwnerToken = ownerToken
     } finally {
-      removeOwnedMigrationLock(recoveryPath, recoveryOwnerToken)
+      releaseActiveLockClaim(recoveryClaimPath)
     }
   }
 
-  /** 获取 recovery mutex；仅在 schema 合法、PID 明确死亡且 owner 未变化时回收残留锁。 */
-  private acquireRecoveryLock(recoveryPath: string, ownerToken: string): void {
-    if (tryCreateMigrationLock(recoveryPath, ownerToken, this.now())) return
-    const initial = readMigrationLock(recoveryPath)
-    if (!initial || this.isPidRunning(initial.pid)) {
-      throw new DataRootMigrationError('MIGRATION_LOCKED', '另一个实例正在接管陈旧迁移锁')
+  /**
+   * 获取 recovery mutex：陈旧 claim 永不删除，竞争者只原子创建同一个确定性 successor。
+   * 这避免了 Node 缺少原子 compare-unlink 时，旧 contender 误删新 owner 的竞态。
+   */
+  private acquireRecoveryLock(recoveryPath: string, ownerToken: string): string {
+    let claimPath = recoveryPath
+    for (let depth = 0; depth < MAX_RECOVERY_CLAIM_DEPTH; depth += 1) {
+      if (tryCreateMigrationLock(claimPath, ownerToken, this.now())) return claimPath
+      const initial = readMigrationLock(claimPath)
+      if (!initial || this.isPidRunning(initial.pid)) {
+        throw new DataRootMigrationError('MIGRATION_LOCKED', '另一个实例正在接管陈旧迁移锁')
+      }
+      const confirmed = readMigrationLock(claimPath)
+      if (!confirmed || confirmed.ownerToken !== initial.ownerToken || this.isPidRunning(confirmed.pid)) {
+        throw new DataRootMigrationError('MIGRATION_LOCKED', 'recovery mutex owner 在检查期间发生变化')
+      }
+      claimPath = getRecoverySuccessorPath(recoveryPath, claimPath, initial.ownerToken)
     }
-    const confirmed = readMigrationLock(recoveryPath)
-    if (!confirmed || confirmed.ownerToken !== initial.ownerToken || this.isPidRunning(confirmed.pid)) {
-      throw new DataRootMigrationError('MIGRATION_LOCKED', 'recovery mutex owner 在回收期间发生变化')
-    }
-    if (!removeOwnedMigrationLock(recoveryPath, initial.ownerToken)) {
-      throw new DataRootMigrationError('MIGRATION_LOCKED', 'recovery mutex owner 在删除前发生变化')
-    }
-    if (!tryCreateMigrationLock(recoveryPath, ownerToken, this.now())) {
-      throw new DataRootMigrationError('MIGRATION_LOCKED', '陈旧 recovery mutex 回收后被其他实例占用')
-    }
+    throw new DataRootMigrationError('MIGRATION_LOCKED', '陈旧 recovery mutex 链过深，无法安全接管')
   }
 
   /** 仅删除由当前 coordinator 成功创建的锁。 */
   private releaseLock(): void {
-    const ownerToken = this.lockOwnerToken
-    if (ownerToken === null) return
-    removeOwnedMigrationLock(this.lockPath, ownerToken)
+    if (this.lockOwnerToken === null) return
+    releaseActiveLockClaim(this.lockPath)
     this.lockOwnerToken = null
   }
 }
@@ -754,16 +758,23 @@ function tryCreateMigrationLock(lockPath: string, ownerToken: string, createdAt:
   }
 }
 
-/** 仅当磁盘记录仍属于指定 owner 时删除锁，并返回是否确实删除。 */
-function removeOwnedMigrationLock(lockPath: string, ownerToken: string): boolean {
-  const record = readMigrationLock(lockPath)
-  if (!record || record.ownerToken !== ownerToken) return false
+/** 根据不可变前驱 claim 生成所有 contender 一致竞争的固定长度 successor 路径。 */
+function getRecoverySuccessorPath(recoveryPath: string, claimPath: string, ownerToken: string): string {
+  const claimDigest = createHash('sha256')
+    .update(claimPath)
+    .update('\0')
+    .update(ownerToken)
+    .digest('hex')
+    .slice(0, 32)
+  return `${recoveryPath}.claim-${claimDigest}`
+}
+
+/** 活跃 holder 直接释放自己原子创建的 claim；其他 owner 只能在该 syscall 返回后创建。 */
+function releaseActiveLockClaim(claimPath: string): void {
   try {
-    unlinkSync(lockPath)
-    return true
+    unlinkSync(claimPath)
   } catch (error) {
-    if (isFileMissingError(error)) return false
-    throw error
+    if (!isFileMissingError(error)) throw error
   }
 }
 
