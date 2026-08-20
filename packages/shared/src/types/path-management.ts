@@ -2,7 +2,7 @@
 export type DataRootAvailability = 'available' | 'missing' | 'unavailable' | 'invalid'
 
 /** 可恢复迁移任务的执行阶段。 */
-export type DataRootMigrationStage = 'pending' | 'copying' | 'verifying' | 'rebasing' | 'failed'
+export type DataRootMigrationStage = 'pending' | 'copying' | 'verifying' | 'rebasing' | 'switching' | 'failed'
 
 /** 提供给界面的数据根迁移进度。 */
 export interface DataRootMigrationProgress {
@@ -16,7 +16,7 @@ export interface DataRootMigrationProgress {
 
 /** 路径管理界面与主进程共享的当前状态。 */
 export interface PathManagementState {
-  activeRoot: string
+  activeRoot: string | null
   previousRoot?: string
   availability: DataRootAvailability
   deviceType: 'local' | 'removable' | 'network' | 'unknown'

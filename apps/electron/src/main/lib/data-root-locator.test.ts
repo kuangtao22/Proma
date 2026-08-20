@@ -5,6 +5,41 @@ import { join } from 'node:path'
 import type { DataRootLocatorFile } from '@proma/shared'
 import { DataRootLocator } from './data-root-locator'
 
+/** 迁移提交拒绝矩阵使用的定位文件参数。 */
+interface MigrationLocatorFixture {
+  sourceRoot: string
+  targetRoot: string
+  stage: string
+  migrationId?: string
+  completedBytes?: number
+  totalBytes?: number
+}
+
+/**
+ * 写入迁移提交测试所需的原始定位文件。
+ *
+ * @param filePath 固定定位文件路径。
+ * @param fixture 迁移根路径、阶段与进度参数。
+ */
+function writeMigrationLocator(filePath: string, fixture: MigrationLocatorFixture): void {
+  /** 迁移总字节数的测试默认值。 */
+  const totalBytes = fixture.totalBytes ?? 100
+  writeFileSync(filePath, JSON.stringify({
+    version: 1,
+    activeRoot: fixture.sourceRoot,
+    migration: {
+      id: fixture.migrationId ?? 'migration-commit',
+      sourceRoot: fixture.sourceRoot,
+      targetRoot: fixture.targetRoot,
+      stage: fixture.stage,
+      completedBytes: fixture.completedBytes ?? totalBytes,
+      totalBytes,
+      startedAt: 1000,
+      updatedAt: 2000,
+    },
+  }), 'utf-8')
+}
+
 describe('DataRootLocator', () => {
   /** 每个用例独立使用的临时 home，避免读写真实用户目录。 */
   let homeDir: string
@@ -93,17 +128,39 @@ describe('DataRootLocator', () => {
     expect(JSON.parse(readFileSync(locatorPath, 'utf-8'))).toEqual({ version: 1, activeRoot: customRoot })
   })
 
+  test('Given a schema-invalid primary locator and valid backup When inspecting Then it recovers from backup', () => {
+    /** 备份中保存的有效自定义数据根。 */
+    const customRoot = join(homeDir, 'schema-backup-root')
+    mkdirSync(customRoot)
+    /** 固定定位文件路径。 */
+    const locatorPath = join(homeDir, '.proma-location.json')
+    writeFileSync(locatorPath, JSON.stringify({ version: 2, activeRoot: customRoot }), 'utf-8')
+    writeFileSync(`${locatorPath}.bak`, JSON.stringify({ version: 1, activeRoot: customRoot }), 'utf-8')
+
+    expect(new DataRootLocator({ homeDir }).inspect()).toMatchObject({
+      status: 'ready',
+      state: { activeRoot: customRoot, availability: 'available' },
+    })
+    expect(JSON.parse(readFileSync(locatorPath, 'utf-8'))).toEqual({ version: 1, activeRoot: customRoot })
+  })
+
   test('Given all locator candidates are damaged When inspecting Then it reports invalid without falling back', () => {
     /** 固定定位文件路径。 */
     const locatorPath = join(homeDir, '.proma-location.json')
+    /** invalid 状态绝不能隐式创建的默认数据根。 */
+    const defaultRoot = join(homeDir, '.proma')
     writeFileSync(locatorPath, '{broken-primary', 'utf-8')
     writeFileSync(`${locatorPath}.tmp`, '{broken-temp', 'utf-8')
     writeFileSync(`${locatorPath}.bak`, '{broken-backup', 'utf-8')
+    /** 读取全部损坏候选的定位器。 */
+    const locator = new DataRootLocator({ homeDir })
 
-    expect(new DataRootLocator({ homeDir }).inspect()).toMatchObject({
+    expect(locator.inspect()).toMatchObject({
       status: 'invalid',
-      state: { availability: 'invalid' },
+      state: { activeRoot: null, availability: 'invalid' },
     })
+    expect(() => locator.requireActiveRoot({ createDefault: true })).toThrow('数据根定位文件无效')
+    expect(existsSync(defaultRoot)).toBe(false)
   })
 
   test('Given an active migration When inspecting Then it keeps the source root active and exposes progress', () => {
@@ -169,7 +226,7 @@ describe('DataRootLocator', () => {
         id: 'migration-2',
         sourceRoot,
         targetRoot,
-        stage: 'verifying',
+        stage: 'switching',
         completedBytes: 100,
         totalBytes: 100,
         startedAt: 1000,
@@ -178,7 +235,7 @@ describe('DataRootLocator', () => {
     })
     expect(locator.inspect()).toMatchObject({ status: 'migration', state: { activeRoot: sourceRoot } })
 
-    locator.commitMigration()
+    locator.commitMigration('migration-2')
     expect(locator.inspect()).toMatchObject({
       status: 'ready',
       state: { activeRoot: targetRoot, previousRoot: sourceRoot, migration: null },
@@ -188,6 +245,84 @@ describe('DataRootLocator', () => {
       activeRoot: targetRoot,
       previousRoot: sourceRoot,
     })
+  })
+
+  test('Given a mismatched migration ID When committing Then it rejects without switching the active root', () => {
+    /** 提交前仍生效的源数据根。 */
+    const sourceRoot = join(homeDir, 'id-source-root')
+    /** 已完成迁移的在线目标根。 */
+    const targetRoot = join(homeDir, 'id-target-root')
+    mkdirSync(sourceRoot)
+    mkdirSync(targetRoot)
+    /** 固定定位文件路径。 */
+    const locatorPath = join(homeDir, '.proma-location.json')
+    writeMigrationLocator(locatorPath, { sourceRoot, targetRoot, stage: 'switching' })
+    /** 读取并尝试提交迁移的定位器。 */
+    const locator = new DataRootLocator({ homeDir })
+
+    expect(() => locator.commitMigration('different-id')).toThrow('迁移 ID 不匹配')
+    expect(JSON.parse(readFileSync(locatorPath, 'utf-8')).activeRoot).toBe(sourceRoot)
+  })
+
+  /** 所有尚未达到原子切换点的迁移阶段。 */
+  const nonSwitchingStages = ['pending', 'copying', 'verifying', 'rebasing', 'failed'] as const
+  for (const stage of nonSwitchingStages) {
+    test(`Given migration stage ${stage} When committing Then it rejects without switching the active root`, () => {
+      /** 提交前仍生效的源数据根。 */
+      const sourceRoot = join(homeDir, `${stage}-source-root`)
+      /** 阶段未就绪时即使在线也不得切换的目标根。 */
+      const targetRoot = join(homeDir, `${stage}-target-root`)
+      mkdirSync(sourceRoot)
+      mkdirSync(targetRoot)
+      /** 固定定位文件路径。 */
+      const locatorPath = join(homeDir, '.proma-location.json')
+      writeMigrationLocator(locatorPath, { sourceRoot, targetRoot, stage })
+      /** 读取并尝试提交迁移的定位器。 */
+      const locator = new DataRootLocator({ homeDir })
+
+      expect(() => locator.commitMigration('migration-commit')).toThrow('迁移尚未进入切换阶段')
+      expect(JSON.parse(readFileSync(locatorPath, 'utf-8')).activeRoot).toBe(sourceRoot)
+    })
+  }
+
+  test('Given incomplete migration bytes When committing Then it rejects without switching the active root', () => {
+    /** 提交前仍生效的源数据根。 */
+    const sourceRoot = join(homeDir, 'incomplete-source-root')
+    /** 尚未完整复制时不得切换的目标根。 */
+    const targetRoot = join(homeDir, 'incomplete-target-root')
+    mkdirSync(sourceRoot)
+    mkdirSync(targetRoot)
+    /** 固定定位文件路径。 */
+    const locatorPath = join(homeDir, '.proma-location.json')
+    writeMigrationLocator(locatorPath, {
+      sourceRoot,
+      targetRoot,
+      stage: 'switching',
+      completedBytes: 99,
+      totalBytes: 100,
+    })
+    /** 读取并尝试提交迁移的定位器。 */
+    const locator = new DataRootLocator({ homeDir })
+
+    expect(() => locator.commitMigration('migration-commit')).toThrow('迁移数据尚未完成')
+    expect(JSON.parse(readFileSync(locatorPath, 'utf-8')).activeRoot).toBe(sourceRoot)
+  })
+
+  test('Given an offline migration target When committing Then it rejects without switching the active root', () => {
+    /** 提交前仍生效的源数据根。 */
+    const sourceRoot = join(homeDir, 'offline-target-source-root')
+    /** 模拟离线卷上不存在的目标根。 */
+    const targetRoot = join(homeDir, 'offline-volume', 'target-root')
+    mkdirSync(sourceRoot)
+    /** 固定定位文件路径。 */
+    const locatorPath = join(homeDir, '.proma-location.json')
+    writeMigrationLocator(locatorPath, { sourceRoot, targetRoot, stage: 'switching' })
+    /** 读取并尝试提交迁移的定位器。 */
+    const locator = new DataRootLocator({ homeDir })
+
+    expect(() => locator.commitMigration('migration-commit')).toThrow('迁移目标根不可用')
+    expect(JSON.parse(readFileSync(locatorPath, 'utf-8')).activeRoot).toBe(sourceRoot)
+    expect(existsSync(targetRoot)).toBe(false)
   })
 
   test('Given malformed locator fields When inspecting Then it reports invalid', () => {

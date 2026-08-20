@@ -8,6 +8,12 @@
 
 import { writeFileSync, renameSync, existsSync, copyFileSync, readFileSync, unlinkSync } from 'node:fs'
 
+/** 安全 JSON 读取的可选 schema 校验配置。 */
+export interface ReadJsonFileSafeOptions<T> {
+  /** 判断解析结果是否符合调用方要求的运行时 schema。 */
+  validate?: (value: unknown) => value is T
+}
+
 /**
  * 原子写入 JSON 文件：write-to-temp → rename
  * 写入前自动保留 .bak 备份
@@ -41,10 +47,16 @@ export function writeTextFileAtomic(filePath: string, content: string): void {
 
 /**
  * 安全读取 JSON 索引文件
- * 优先读主文件，损坏则尝试 .tmp / .bak，都失败返回 null
+ * 优先读主文件，语法或 schema 无效时尝试 .tmp / .bak，都失败返回 null。
+ *
+ * @param filePath 主 JSON 文件路径。
+ * @param options 可选的运行时 schema validator；省略时保持原有 parse-only 行为。
+ * @returns 第一个有效候选，全部无效时返回 null。
  */
-export function readJsonFileSafe<T>(filePath: string): T | null {
+export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeOptions<T> = {}): T | null {
+  /** 上次原子写可能遗留的临时文件路径。 */
   const tmpPath = filePath + '.tmp'
+  /** 上次成功主文件的备份路径。 */
   const bakPath = filePath + '.bak'
 
   // 1. 尝试读取主文件
@@ -52,7 +64,11 @@ export function readJsonFileSafe<T>(filePath: string): T | null {
     try {
       const raw = readFileSync(filePath, 'utf-8')
       if (raw.trim().length > 0) {
-        return JSON.parse(raw) as T
+        /** 主文件解析后的未知值，需按调用方 schema 再校验。 */
+        const parsed: unknown = JSON.parse(raw)
+        if (isAcceptedJsonValue(parsed, options.validate)) {
+          return parsed
+        }
       }
     } catch {
       console.warn(`[数据恢复] 主索引文件损坏: ${filePath}`)
@@ -64,11 +80,14 @@ export function readJsonFileSafe<T>(filePath: string): T | null {
     try {
       const raw = readFileSync(tmpPath, 'utf-8')
       if (raw.trim().length > 0) {
-        const parsed = JSON.parse(raw) as T
-        // .tmp 有效 → 提升为主文件
-        renameSync(tmpPath, filePath)
-        console.log(`[数据恢复] 从 .tmp 文件恢复: ${filePath}`)
-        return parsed
+        /** 临时文件解析后的未知值，schema 无效时禁止提升。 */
+        const parsed: unknown = JSON.parse(raw)
+        if (isAcceptedJsonValue(parsed, options.validate)) {
+          // .tmp 有效 → 提升为主文件
+          renameSync(tmpPath, filePath)
+          console.log(`[数据恢复] 从 .tmp 文件恢复: ${filePath}`)
+          return parsed
+        }
       }
     } catch {
       // .tmp 也损坏，继续 fallback
@@ -82,11 +101,14 @@ export function readJsonFileSafe<T>(filePath: string): T | null {
     try {
       const raw = readFileSync(bakPath, 'utf-8')
       if (raw.trim().length > 0) {
-        const parsed = JSON.parse(raw) as T
-        // 用 .bak 恢复主文件（跳过备份，避免用损坏的主文件覆盖好的 .bak）
-        writeJsonFileAtomic(filePath, parsed as object, true)
-        console.log(`[数据恢复] 从 .bak 文件恢复: ${filePath}`)
-        return parsed
+        /** 备份解析后的未知值，仅在 schema 有效时覆盖主文件。 */
+        const parsed: unknown = JSON.parse(raw)
+        if (isAcceptedJsonValue(parsed, options.validate)) {
+          // 用 .bak 恢复主文件（跳过备份，避免用损坏的主文件覆盖好的 .bak）
+          writeJsonFileAtomic(filePath, parsed as object, true)
+          console.log(`[数据恢复] 从 .bak 文件恢复: ${filePath}`)
+          return parsed
+        }
       }
     } catch {
       console.error(`[数据恢复] .bak 文件也损坏: ${bakPath}`)
@@ -94,4 +116,18 @@ export function readJsonFileSafe<T>(filePath: string): T | null {
   }
 
   return null // 全部失败，需要上层从 JSONL 重建
+}
+
+/**
+ * 判断解析后的 JSON 是否满足可选 schema。
+ *
+ * @param value JSON.parse 返回的未知值。
+ * @param validate 调用方可选的类型守卫。
+ * @returns 未提供 validator 或校验通过时返回 true。
+ */
+function isAcceptedJsonValue<T>(
+  value: unknown,
+  validate: ReadJsonFileSafeOptions<T>['validate'],
+): value is T {
+  return validate === undefined || validate(value)
 }

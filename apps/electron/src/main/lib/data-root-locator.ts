@@ -38,6 +38,7 @@ const DATA_ROOT_MIGRATION_STAGES: ReadonlySet<DataRootMigrationStage> = new Set(
   'copying',
   'verifying',
   'rebasing',
+  'switching',
   'failed',
 ])
 
@@ -91,11 +92,11 @@ export class DataRootLocator {
     }
 
     /** safe-file 会依次尝试主文件、临时文件和备份文件。 */
-    const rawLocatorFile = readJsonFileSafe<unknown>(this.locatorPath)
-    if (!isDataRootLocatorFile(rawLocatorFile)) {
+    const rawLocatorFile = readJsonFileSafe(this.locatorPath, { validate: isDataRootLocatorFile })
+    if (rawLocatorFile === null) {
       this.cachedResult = {
         status: 'invalid',
-        state: createPathManagementState('', 'invalid', null),
+        state: createPathManagementState(null, 'invalid', null),
         error: '数据根定位文件损坏或字段无效',
       }
       return this.cachedResult
@@ -114,8 +115,10 @@ export class DataRootLocator {
   requireActiveRoot(options: RequireActiveRootOptions = {}): string {
     /** 获取当前缓存状态，避免重复读取固定定位文件。 */
     const result = this.inspect()
+    /** invalid 状态为 null，其余可用状态必须收窄为绝对路径。 */
+    const activeRoot = result.state.activeRoot
     /** 仅无定位文件时解析出的默认路径拥有自动创建权限。 */
-    const usesImplicitDefault = result.locatorFile === undefined && result.state.activeRoot === this.defaultRoot
+    const usesImplicitDefault = result.locatorFile === undefined && activeRoot === this.defaultRoot
 
     if (result.status === 'ready' && result.state.availability === 'missing' && usesImplicitDefault && options.createDefault) {
       mkdirSync(this.defaultRoot, { recursive: true })
@@ -123,8 +126,12 @@ export class DataRootLocator {
       return this.defaultRoot
     }
 
-    if ((result.status === 'ready' || result.status === 'migration') && result.state.availability === 'available') {
-      return result.state.activeRoot
+    if (
+      (result.status === 'ready' || result.status === 'migration')
+      && result.state.availability === 'available'
+      && activeRoot !== null
+    ) {
+      return activeRoot
     }
 
     throw new Error(result.status === 'invalid' ? '数据根定位文件无效' : '数据根不可用')
@@ -149,15 +156,28 @@ export class DataRootLocator {
   /**
    * 完成当前迁移：原子切换到目标根、记录源根并清除迁移状态。
    *
+   * @param migrationId 调用方确认要提交的迁移 ID。
    * @returns 切换后重新解析得到的最新状态。
    */
-  commitMigration(): DataRootLocatorResult {
+  commitMigration(migrationId: string): DataRootLocatorResult {
     /** 从缓存或磁盘获取已严格校验的定位文件。 */
     const result = this.inspect()
     /** 待提交的持久化迁移记录。 */
     const migration = result.locatorFile?.migration
     if (migration === undefined) {
       throw new Error('当前没有可提交的数据根迁移')
+    }
+    if (migration.id !== migrationId) {
+      throw new Error('迁移 ID 不匹配')
+    }
+    if (migration.stage !== 'switching') {
+      throw new Error('迁移尚未进入切换阶段')
+    }
+    if (migration.completedBytes !== migration.totalBytes) {
+      throw new Error('迁移数据尚未完成')
+    }
+    if (inspectRootAvailability(migration.targetRoot) !== 'available') {
+      throw new Error('迁移目标根不可用')
     }
 
     return this.write({
@@ -240,13 +260,13 @@ function inspectRootAvailability(root: string): PathManagementState['availabilit
 /**
  * 创建不含容量信息的基础路径管理状态。
  *
- * @param activeRoot 当前活动根。
+ * @param activeRoot 当前活动根；定位文件无效且无法恢复时为 null。
  * @param availability 当前可访问性。
  * @param migration 当前迁移进度。
  * @returns 共享路径管理状态。
  */
 function createPathManagementState(
-  activeRoot: string,
+  activeRoot: string | null,
   availability: PathManagementState['availability'],
   migration: DataRootMigrationProgress | null,
 ): PathManagementState {
