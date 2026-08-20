@@ -52,6 +52,51 @@ test('Given 环境变量与 locator 同时存在 When 解析 CLI 配置根 Then 
   )).toBe(envRoot)
 })
 
+test('Given 相对 config-dir flag When 解析 CLI 配置根 Then 拒绝非绝对路径', () => {
+  /** flag 的公开合同要求绝对路径，不能受当前 cwd 隐式影响。 */
+  const { homeDir } = createCliPathFixture()
+
+  expect(() => resolveConfigDir(
+    { configDir: 'relative/Proma Data' },
+    { homeDir, env: {} },
+  )).toThrow('--config-dir 必须是绝对路径')
+})
+
+test('Given 相对 PROMA_CONFIG_DIR When 解析 CLI 配置根 Then 拒绝非绝对路径', () => {
+  /** 环境变量同样不能把会话读取重定向到进程 cwd。 */
+  const { homeDir } = createCliPathFixture()
+
+  expect(() => resolveConfigDir(
+    {},
+    { homeDir, env: { PROMA_CONFIG_DIR: 'relative/Proma Data' } },
+  )).toThrow('PROMA_CONFIG_DIR 必须是绝对路径')
+})
+
+test('Given 显式配置根为空 When 解析 CLI 配置根 Then 不把空值静默当作缺省', () => {
+  /** 来源存在即校验，避免无效输入绕过绝对路径合同。 */
+  const { homeDir } = createCliPathFixture()
+
+  expect(() => resolveConfigDir({ configDir: '' }, { homeDir, env: {} }))
+    .toThrow('--config-dir 必须是绝对路径')
+  expect(() => resolveConfigDir({}, { homeDir, env: { PROMA_CONFIG_DIR: '' } }))
+    .toThrow('PROMA_CONFIG_DIR 必须是绝对路径')
+})
+
+test('Given POSIX、Win32 drive 与 UNC 绝对路径 When 解析显式配置根 Then 跨平台接受', () => {
+  /** 即使测试运行在 POSIX Bun，也必须识别 Windows 调用方传入的绝对路径。 */
+  const { homeDir } = createCliPathFixture()
+  const absoluteRoots = [
+    '/Volumes/Work/Proma Data',
+    'D:\\Proma Data',
+    '\\\\server\\share\\Proma Data',
+  ]
+
+  for (const configDir of absoluteRoots) {
+    expect(resolveConfigDir({ configDir }, { homeDir, env: {} })).toBe(configDir)
+    expect(resolveConfigDir({}, { homeDir, env: { PROMA_CONFIG_DIR: configDir } })).toBe(configDir)
+  }
+})
+
 test('Given 未显式覆盖 When 解析 CLI 配置根 Then 读取固定 locator 的自定义根', () => {
   /** 有效 locator 提供的自定义根。 */
   const { homeDir, activeRoot } = createCliPathFixture()

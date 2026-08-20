@@ -11,7 +11,7 @@
  */
 import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute, join, win32 } from 'node:path'
 import type { DataRootLocatorFile, DataRootMigrationRecord, DataRootMigrationStage } from '@proma/shared'
 
 export interface PathOptions {
@@ -45,8 +45,10 @@ export function resolveConfigDir(
   opts: PathOptions = {},
   context: PathResolutionContext = { homeDir: homedir(), env: process.env },
 ): string {
-  if (opts.configDir) return opts.configDir
-  if (context.env.PROMA_CONFIG_DIR) return context.env.PROMA_CONFIG_DIR
+  if (opts.configDir !== undefined) return requireAbsoluteConfigDir(opts.configDir, '--config-dir')
+  if (context.env.PROMA_CONFIG_DIR !== undefined) {
+    return requireAbsoluteConfigDir(context.env.PROMA_CONFIG_DIR, 'PROMA_CONFIG_DIR')
+  }
 
   /** 保留既有 CLI 开发目录开关的显式覆盖语义。 */
   const useDev = opts.dev || context.env.PROMA_DEV === '1'
@@ -63,6 +65,12 @@ export function resolveConfigDir(
   const locatorFile = readFirstValidLocatorFile(existingCandidates)
   assertReadableDataRoot(locatorFile.activeRoot)
   return locatorFile.activeRoot
+}
+
+/** 校验显式配置根，拒绝依赖当前工作目录的相对路径。 */
+function requireAbsoluteConfigDir(value: string, source: '--config-dir' | 'PROMA_CONFIG_DIR'): string {
+  if (!isPortableAbsolutePath(value)) throw new Error(`${source} 必须是绝对路径`)
+  return value
 }
 
 /** 按顺序读取候选，返回首个通过 schema 校验的 locator。 */
@@ -127,7 +135,12 @@ function isNonEmptyString(value: unknown): value is string {
 
 /** 判断 unknown 是否为绝对路径字符串。 */
 function isAbsolutePath(value: unknown): value is string {
-  return isNonEmptyString(value) && isAbsolute(value)
+  return isNonEmptyString(value) && isPortableAbsolutePath(value)
+}
+
+/** 跨宿主平台识别 POSIX、Win32 drive 与 UNC 绝对路径。 */
+function isPortableAbsolutePath(value: string): boolean {
+  return isAbsolute(value) || win32.isAbsolute(value)
 }
 
 /** 判断 unknown 是否为有限非负数。 */

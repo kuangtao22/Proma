@@ -6,8 +6,9 @@
 import type { PromaPermissionMode, SessionWorkbenchLayout } from '@proma/shared'
 import { join, resolve } from 'node:path'
 import { getUserProfile } from './user-profile-service'
-import { getAgentWorkspaceBySlug, getWorkspaceMcpConfig, type WorkspaceMemoryGuidance } from './agent-workspace-manager'
-import { getAgentWorkspacePath } from './config-paths'
+import { getWorkspaceMcpConfig, type WorkspaceMemoryGuidance } from './agent-workspace-manager'
+import { getAgentWorkspacePath, getConfigDir, type ConfigRootResolver } from './config-paths'
+import { readJsonFileSafe } from './safe-file'
 import { buildGitAttributionPromptSection, isGitAttributionEnabled } from './agent-git-attribution'
 import { getSettings } from './settings-service'
 import type { ProjectInstructionSource } from './project-instruction-resolver'
@@ -59,21 +60,38 @@ export interface WorkspacePromptContext {
   isLocalProject: boolean
 }
 
-/** 从进程级唯一活动数据根解析完整工作区上下文。 */
-function resolveDefaultWorkspaceContext(slug: string): WorkspacePromptContext {
-  /** config-paths 的默认 resolver 在进程内唯一，因此路径与索引读取共享同一活动根。 */
-  const workspaceRoot = getAgentWorkspacePath(slug)
-  const workspace = getAgentWorkspaceBySlug(slug)
-  return {
-    workspaceRoot,
-    projectRoot: workspace?.projectRootPath ?? join(workspaceRoot, 'workspace-files'),
-    isLocalProject: Boolean(workspace?.projectRootPath),
+/** provider 读取的最小工作区索引结构。 */
+interface WorkspacePromptIndex {
+  workspaces: Array<{ slug: string; projectRootPath?: string }>
+}
+
+/** 创建只依赖单个活动数据根解析器的 workspace context provider。 */
+export function createWorkspacePromptContextProvider(
+  configRootResolver: ConfigRootResolver,
+): (slug: string) => WorkspacePromptContext {
+  return (slug) => {
+    /** 每次构建先固定活动根，后续路径和元数据都从该根派生。 */
+    const configRoot = getConfigDir(configRootResolver)
+    const fixedRootResolver: ConfigRootResolver = { requireActiveRoot: () => configRoot }
+    const workspaceRoot = getAgentWorkspacePath(slug, fixedRootResolver)
+    const index = readJsonFileSafe<WorkspacePromptIndex>(join(configRoot, 'agent-workspaces.json'))
+    const workspace = index?.workspaces.find((item) => item.slug === slug)
+    return {
+      workspaceRoot,
+      projectRoot: workspace?.projectRootPath ?? join(workspaceRoot, 'workspace-files'),
+      isLocalProject: Boolean(workspace?.projectRootPath),
+    }
   }
 }
 
+/** 生产 provider 延迟调用 config-paths 的进程级唯一 locator。 */
+const DEFAULT_WORKSPACE_PROMPT_CONTEXT_PROVIDER = createWorkspacePromptContextProvider({
+  requireActiveRoot: () => getConfigDir(),
+})
+
 /** 生产环境统一使用现有服务，测试只能整体替换，避免半注入。 */
 const DEFAULT_SYSTEM_PROMPT_DEPENDENCIES: SystemPromptDependencies = {
-  resolveWorkspaceContext: resolveDefaultWorkspaceContext,
+  resolveWorkspaceContext: DEFAULT_WORKSPACE_PROMPT_CONTEXT_PROVIDER,
   getUserName: () => getUserProfile().userName || '用户',
   isGitAttributionEnabled: () => isGitAttributionEnabled(getSettings().gitAttributionEnabled),
 }

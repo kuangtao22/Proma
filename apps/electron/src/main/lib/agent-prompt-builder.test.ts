@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildSystemPrompt } from './agent-prompt-builder'
+import { buildSystemPrompt, createWorkspacePromptContextProvider } from './agent-prompt-builder'
+import { DataRootLocator } from './data-root-locator'
 
 /** 当前测试创建的临时目录，测试结束后统一清理。 */
 const temporaryDirs: string[] = []
@@ -42,24 +43,14 @@ test('Given 自定义数据根 When 构建系统提示词 Then 工作区 AGENTS 
     'utf-8',
   )
 
-  /** 单个 provider 从指定 fixture 根一次性返回完整 workspace 上下文。 */
+  /** 生产 provider factory 通过真实 locator 从同一活动根解析路径和元数据。 */
+  const resolveWorkspaceContext = createWorkspacePromptContextProvider(new DataRootLocator({ homeDir }))
   const prompt = buildSystemPrompt({
     workspaceSlug: 'proma',
     sessionId: 'session-1',
     permissionMode: 'bypassPermissions',
     dependencies: {
-      resolveWorkspaceContext: (slug) => {
-        /** provider 内的路径和元数据始终来自同一个自定义根。 */
-        const index = JSON.parse(readFileSync(join(customRoot, 'agent-workspaces.json'), 'utf-8')) as {
-          workspaces: Array<{ slug: string; projectRootPath?: string }>
-        }
-        const workspace = index.workspaces.find((item) => item.slug === slug)
-        return {
-          workspaceRoot: join(customRoot, 'agent-workspaces', slug),
-          projectRoot: workspace?.projectRootPath ?? join(customRoot, 'agent-workspaces', slug, 'workspace-files'),
-          isLocalProject: Boolean(workspace?.projectRootPath),
-        }
-      },
+      resolveWorkspaceContext,
       getUserName: () => '测试用户',
       isGitAttributionEnabled: () => true,
     },
