@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test'
+import { renderToStaticMarkup } from 'react-dom/server'
 import type { PathManagementState } from '@proma/shared'
 import {
   createDataRootMigrationViewState,
-  DATA_ROOT_RECOVERY_ACTIONS,
+  DataRootRecoveryControls,
   confirmRestorePreviousDataRoot,
 } from './DataRootMigrationApp'
 
@@ -54,7 +55,7 @@ describe('DataRootMigrationApp', () => {
     }), 'data-root-recovery')
 
     expect(view.kind).toBe('recovery')
-    expect(DATA_ROOT_RECOVERY_ACTIONS.map(({ action }) => action)).toEqual([
+    expect(view.recoveryActions).toEqual([
       'recheck',
       'relocate',
       'restore-previous',
@@ -90,7 +91,37 @@ describe('DataRootMigrationApp', () => {
 
     expect(view.kind).toBe('recovery')
     expect(view.error).toBe('目标盘离线，清理尚未完成')
-    expect(DATA_ROOT_RECOVERY_ACTIONS.some(({ action }) => action === 'recheck')).toBe(true)
+    expect(view.recoveryActions).toEqual(['recheck'])
+  })
+
+  test('Given recovery 模式且 cleanup 未解决 When 渲染按钮 Then 只显示重新检测与退出', () => {
+    const view = createDataRootMigrationViewState(createState({
+      availability: 'unavailable',
+      previousRoot: '/data/proma-backup',
+      postCommitCleanup: {
+        migrationId: 'migration-1',
+        targetRoot: '/data/proma',
+        status: 'failed',
+        error: '目标盘离线',
+      },
+    }), 'data-root-recovery')
+    /** 静态按钮测试不执行事件，只校验实际可见操作。 */
+    const noop = (): void => undefined
+    const html = renderToStaticMarkup(
+      <DataRootRecoveryControls
+        view={view}
+        isBusy={false}
+        onRecheck={noop}
+        onRelocate={noop}
+        onRestorePrevious={noop}
+        onExit={noop}
+      />,
+    )
+
+    expect(html).toContain('重新检测')
+    expect(html).toContain('退出')
+    expect(html).not.toContain('重新定位')
+    expect(html).not.toContain('切回旧备份')
   })
 
   test('Given 用户切回旧根 When 尚未确认 Then 不调用恢复 API', async () => {

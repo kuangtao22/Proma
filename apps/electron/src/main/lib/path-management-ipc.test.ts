@@ -415,6 +415,40 @@ describe('路径管理 IPC', () => {
     )).toEqual({ owner: 'proma', version: 1 })
   })
 
+  test('Given 迁移后的 marker-only 根重新在线 When recovery 重新定位 Then 不要求 legacy 文件', async () => {
+    /** 模拟迁移目标仅保留所有权 marker，业务配置均为可选。 */
+    const homeDir = await mkdtemp(join(tmpdir(), 'proma-path-marker-only-recovery-'))
+    const offlineRoot = join(homeDir, 'offline-root')
+    const markerOnlyRoot = join(homeDir, 'marker-only-root')
+    mkdirSync(markerOnlyRoot)
+    writeFileSync(
+      join(markerOnlyRoot, PROMA_DATA_ROOT_MARKER_FILE),
+      '{"owner":"proma","version":1}',
+    )
+    new DataRootLocator({ homeDir }).write({ version: 1, activeRoot: offlineRoot })
+    /** 保存 recovery handler，证明完整 IPC 路径接受 marker-only 根。 */
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+
+    registerPathManagementIpcHandlers({
+      mode: 'data-root-recovery',
+      homeDir,
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getAllWindows: () => [],
+    })
+
+    const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
+    if (!handler) throw new Error('未注册数据根恢复通道')
+    expect(() => handler({}, { action: 'relocate', selectedRoot: markerOnlyRoot })).not.toThrow()
+    expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({
+      activeRoot: markerOnlyRoot,
+      previousRoot: offlineRoot,
+    })
+  })
+
   test('Given 候选为空目录或普通目录 When 重新定位 Then 拒绝且 locator 不变', async () => {
     /** 隔离 locator 与候选目录的测试 home。 */
     const homeDir = await mkdtemp(join(tmpdir(), 'proma-path-invalid-root-'))

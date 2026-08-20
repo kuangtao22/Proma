@@ -1,11 +1,12 @@
 import {
   closeSync,
-  existsSync,
+  constants,
+  fstatSync,
+  lstatSync,
   openSync,
   readSync,
-  readdirSync,
 } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { DataRootLocator } from './data-root-locator'
 import type { DataRootLocatorResult } from './data-root-locator'
 import { writeJsonFileAtomic } from './safe-file'
@@ -54,10 +55,20 @@ const LEGACY_PROMA_JSON_FILES: ReadonlyArray<{
   { name: 'automations.json', validate: (value) => isJsonRecord(value) && Array.isArray(value.automations) },
 ]
 
-/** 初始化 marker 时允许的受控例外。 */
-export interface EnsurePromaDataRootMarkerOptions {
-  /** 仅隐式默认根可允许无任何文件时建立初始所有权。 */
-  allowEmptyRoot?: boolean
+/** 身份文件安全打开后的结果。 */
+interface IdentityFileOpenResult {
+  /** missing 表示路径不可确认存在，invalid 表示存在但不安全，opened 表示可有界读取。 */
+  status: 'missing' | 'invalid' | 'opened'
+  /** 仅 opened 状态携带调用方负责关闭的文件描述符。 */
+  descriptor?: number
+}
+
+/** JSON 身份文件的有界读取结果。 */
+interface BoundedJsonReadResult {
+  /** 用于让显式 marker 存在但无效时阻断 legacy 回退。 */
+  exists: boolean
+  /** 解析成功的未知 JSON 值；读取或解析失败时为 null。 */
+  value: unknown | null
 }
 
 /**
@@ -69,21 +80,23 @@ export interface EnsurePromaDataRootMarkerOptions {
 export function inspectPromaDataRootIdentity(root: string): 'marker' | 'legacy' | null {
   /** 显式 marker 一旦存在就必须精确有效，不允许回退到 legacy 证据。 */
   const markerPath = join(root, PROMA_DATA_ROOT_MARKER_FILE)
-  if (existsSync(markerPath)) {
-    return isPromaDataRootMarker(readBoundedJson(markerPath)) ? 'marker' : null
+  /** marker 读取结果保留存在性，避免损坏 marker 被 legacy 文件掩盖。 */
+  const marker = readBoundedJson(markerPath)
+  if (marker.exists) {
+    return isPromaDataRootMarker(marker.value) ? 'marker' : null
   }
 
   for (const candidate of LEGACY_PROMA_JSON_FILES) {
     /** 每个 legacy 文件独立受大小上限约束，损坏或超限时不作为身份证据。 */
     const candidatePath = join(root, candidate.name)
-    if (existsSync(candidatePath) && candidate.validate(readBoundedJson(candidatePath))) {
+    if (candidate.validate(readBoundedJson(candidatePath).value)) {
       return 'legacy'
     }
   }
 
   /** SQLite 只读取固定 16 字节 header，禁止把 planning.db 整体载入内存。 */
   const planningPath = join(root, 'planning.db')
-  if (existsSync(planningPath) && hasSqliteHeader(planningPath)) return 'legacy'
+  if (hasSqliteHeader(planningPath)) return 'legacy'
   return null
 }
 
@@ -91,25 +104,13 @@ export function inspectPromaDataRootIdentity(root: string): 'marker' | 'legacy' 
  * 确保已证明所有权的数据根拥有精确 marker，并在写后重新校验。
  *
  * @param root 已确认在线且可写的数据根目录。
- * @param options 隐式默认空根的受控初始化选项。
  */
-export function ensurePromaDataRootMarker(
-  root: string,
-  options: EnsurePromaDataRootMarkerOptions = {},
-): void {
+export function ensurePromaDataRootMarker(root: string): void {
   /** 写入前的身份结果，决定直接接受、升级或拒绝。 */
   const identity = inspectPromaDataRootIdentity(root)
   if (identity === 'marker') return
-  if (identity === null && !(options.allowEmptyRoot === true && isEmptyDirectory(root))) {
-    throw new Error('所选目录不是可识别的 Proma 数据根')
-  }
-
-  /** marker 使用共享原子写封装，避免崩溃留下截断身份文件。 */
-  const markerPath = join(root, PROMA_DATA_ROOT_MARKER_FILE)
-  writeJsonFileAtomic(markerPath, PROMA_DATA_ROOT_MARKER)
-  if (inspectPromaDataRootIdentity(root) !== 'marker') {
-    throw new Error('Proma 数据根标记写入后校验失败')
-  }
+  if (identity === null) throw new Error('所选目录不是可识别的 Proma 数据根')
+  writeAndVerifyPromaDataRootMarker(root)
 }
 
 /**
@@ -124,59 +125,127 @@ export function prepareNormalDataRoot(
   locatorResult: DataRootLocatorResult,
 ): string {
   if (locatorResult.status !== 'ready') throw new Error('数据根不可用')
-  /** 无 locator 文件时才是允许创建和初始化空目录的隐式默认根。 */
-  const usesImplicitDefault = locatorResult.locatorFile === undefined
-  /** 仅隐式默认根允许按启动合同创建，custom 根离线时保持零写入。 */
-  const activeRoot = locator.requireActiveRoot({ createDefault: usesImplicitDefault })
-  ensurePromaDataRootMarker(activeRoot, { allowEmptyRoot: usesImplicitDefault })
+  /** locator 文件缺失时解析出的唯一受控默认根。 */
+  const expectedDefaultRoot = join(dirname(locator.getLocatorPath()), '.proma')
+  /** 无 locator 文件时才允许创建固定默认根。 */
+  const hasNoLocator = locatorResult.locatorFile === undefined
+  /** custom 根离线时不创建目录，默认根缺失时按启动合同创建。 */
+  const activeRoot = locator.requireActiveRoot({ createDefault: hasNoLocator })
+  /** 默认根例外必须同时满足 locator 缺失与精确固定路径，不能扩散到 custom 根。 */
+  const isControlledDefaultRoot = hasNoLocator && resolve(activeRoot) === resolve(expectedDefaultRoot)
+  if (isControlledDefaultRoot) {
+    writeAndVerifyPromaDataRootMarker(activeRoot)
+  } else {
+    ensurePromaDataRootMarker(activeRoot)
+  }
   return activeRoot
 }
 
-/** 有界读取并解析 JSON；超限、短读异常或语法错误统一返回 null。 */
-function readBoundedJson(path: string): unknown {
+/** 原子写入唯一合法 marker，并通过同一 no-follow 读取链精确复验。 */
+function writeAndVerifyPromaDataRootMarker(root: string): void {
+  /** marker 使用共享原子写封装，避免崩溃留下截断身份文件。 */
+  const markerPath = join(root, PROMA_DATA_ROOT_MARKER_FILE)
+  writeJsonFileAtomic(markerPath, PROMA_DATA_ROOT_MARKER)
+  if (inspectPromaDataRootIdentity(root) !== 'marker') {
+    throw new Error('Proma 数据根标记写入后校验失败')
+  }
+}
+
+/** 有界读取并解析普通 JSON 文件；不安全、超限或语法错误均 fail closed。 */
+function readBoundedJson(path: string): BoundedJsonReadResult {
+  /** 打开前后都校验普通文件与大小，最终路径不跟随 symlink。 */
+  const opened = openIdentityFile(path, DATA_ROOT_IDENTITY_JSON_MAX_BYTES)
+  if (opened.status !== 'opened' || opened.descriptor === undefined) {
+    return { exists: opened.status === 'invalid', value: null }
+  }
   /** 多分配一个字节，用于可靠识别超过上限的文件。 */
   const buffer = Buffer.alloc(DATA_ROOT_IDENTITY_JSON_MAX_BYTES + 1)
-  /** 只读文件描述符，确保身份探测本身不修改文件。 */
-  const descriptor = openSync(path, 'r')
+  /** 读取、解析与关闭全部成功后才返回可验证的 JSON 值。 */
+  let value: unknown | null = null
+  /** close 失败同样视为当前 evidence 无效。 */
+  let closed = false
   try {
     /** 循环处理合法的短读，累计量仍严格受 buffer 大小约束。 */
     let bytesRead = 0
     while (bytesRead < buffer.length) {
       /** 本次读取量最多填满剩余的有界 buffer。 */
-      const currentRead = readSync(descriptor, buffer, bytesRead, buffer.length - bytesRead, null)
+      const currentRead = readSync(opened.descriptor, buffer, bytesRead, buffer.length - bytesRead, null)
       if (currentRead === 0) break
       bytesRead += currentRead
     }
-    if (bytesRead > DATA_ROOT_IDENTITY_JSON_MAX_BYTES) return null
-    return JSON.parse(buffer.subarray(0, bytesRead).toString('utf8')) as unknown
+    if (bytesRead <= DATA_ROOT_IDENTITY_JSON_MAX_BYTES) {
+      value = JSON.parse(buffer.subarray(0, bytesRead).toString('utf8')) as unknown
+    }
   } catch {
-    return null
+    value = null
   } finally {
-    closeSync(descriptor)
+    closed = closeIdentityFile(opened.descriptor)
   }
+  return { exists: true, value: closed ? value : null }
 }
 
 /** 仅读取 planning.db 的固定 SQLite header。 */
 function hasSqliteHeader(path: string): boolean {
+  /** SQLite 文件也必须是 no-follow 打开的普通文件。 */
+  const opened = openIdentityFile(path)
+  if (opened.status !== 'opened' || opened.descriptor === undefined) return false
   /** SQLite 稳定文件头固定为 16 字节。 */
   const buffer = Buffer.alloc(16)
-  /** 只读打开数据库，避免身份检查触发写入。 */
-  const descriptor = openSync(path, 'r')
+  /** 读取与关闭都成功时才接受稳定 header。 */
+  let matchesHeader = false
+  /** close 异常必须使当前 evidence 失效。 */
+  let closed = false
   try {
     /** 数据库不足 16 字节时不能证明 SQLite 身份。 */
-    const bytesRead = readSync(descriptor, buffer, 0, buffer.length, null)
-    return bytesRead === buffer.length && buffer.toString('utf8') === 'SQLite format 3\u0000'
+    const bytesRead = readSync(opened.descriptor, buffer, 0, buffer.length, null)
+    matchesHeader = bytesRead === buffer.length && buffer.toString('utf8') === 'SQLite format 3\u0000'
   } catch {
-    return false
+    matchesHeader = false
   } finally {
-    closeSync(descriptor)
+    closed = closeIdentityFile(opened.descriptor)
+  }
+  return closed && matchesHeader
+}
+
+/** 在 no-follow lstat 判型后安全打开并用 fstat 复验同一身份文件。 */
+function openIdentityFile(path: string, maxBytes?: number): IdentityFileOpenResult {
+  /** 打开前的路径状态，不跟随最终 symlink。 */
+  let pathStat: ReturnType<typeof lstatSync>
+  try {
+    pathStat = lstatSync(path)
+  } catch {
+    return { status: 'missing' }
+  }
+  if (!pathStat.isFile() || (maxBytes !== undefined && pathStat.size > maxBytes)) {
+    return { status: 'invalid' }
+  }
+
+  /** O_NONBLOCK 防止判型后的替换竞态把主进程阻塞在 FIFO/device。 */
+  const openFlags = constants.O_RDONLY
+    | (constants.O_NOFOLLOW ?? 0)
+    | (constants.O_NONBLOCK ?? 0)
+  /** 打开失败与打开后的身份不匹配都作为无效 evidence。 */
+  let descriptor: number | null = null
+  try {
+    descriptor = openSync(path, openFlags)
+    /** 打开后的文件状态用于阻断 lstat 与 open 之间的替换竞态。 */
+    const openedStat = fstatSync(descriptor)
+    if (!openedStat.isFile() || (maxBytes !== undefined && openedStat.size > maxBytes)) {
+      closeIdentityFile(descriptor)
+      return { status: 'invalid' }
+    }
+    return { status: 'opened', descriptor }
+  } catch {
+    if (descriptor !== null) closeIdentityFile(descriptor)
+    return { status: 'invalid' }
   }
 }
 
-/** 判断目录在初始化 marker 前确实为空。 */
-function isEmptyDirectory(root: string): boolean {
+/** 捕获 closeSync 异常，避免一个坏 evidence 中断后续合法身份检查。 */
+function closeIdentityFile(descriptor: number): boolean {
   try {
-    return readdirSync(root).length === 0
+    closeSync(descriptor)
+    return true
   } catch {
     return false
   }

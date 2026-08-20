@@ -7,15 +7,15 @@ import type {
 } from '@proma/shared'
 import { Button } from '@/components/ui/button'
 
-/** 恢复页公开的动作与中文文案。 */
-export const DATA_ROOT_RECOVERY_ACTIONS: ReadonlyArray<{
-  action: DataRootRecoveryAction
-  label: string
-}> = [
-  { action: 'recheck', label: '重新检测' },
-  { action: 'relocate', label: '重新定位' },
-  { action: 'restore-previous', label: '切回旧备份' },
+/** 普通 recovery 状态允许的完整动作集合。 */
+const DATA_ROOT_RECOVERY_ACTIONS: ReadonlyArray<DataRootRecoveryAction> = [
+  'recheck',
+  'relocate',
+  'restore-previous',
 ]
+
+/** cleanup 未解决时只能重新检测，避免先弹出必然失败的选择器。 */
+const CLEANUP_RECOVERY_ACTIONS: ReadonlyArray<DataRootRecoveryAction> = ['recheck']
 
 /** 迁移页经过归一化后用于渲染的稳定视图状态。 */
 export interface DataRootMigrationViewState {
@@ -29,6 +29,8 @@ export interface DataRootMigrationViewState {
   error?: string
   /** 是否存在经过 locator 保存的旧根候选。 */
   canRestorePrevious: boolean
+  /** 当前状态实际允许渲染和执行的 recovery 动作。 */
+  recoveryActions: ReadonlyArray<DataRootRecoveryAction>
 }
 
 /** 将路径状态转换为无副作用、可单元测试的恢复页视图。 */
@@ -49,6 +51,7 @@ export function createDataRootMigrationViewState(
       percent,
       ...(state.migration.error === undefined ? {} : { error: state.migration.error }),
       canRestorePrevious: state.previousRoot !== undefined,
+      recoveryActions: [],
     }
   }
   if (mode === 'data-root-recovery' || state.availability !== 'available') {
@@ -58,6 +61,9 @@ export function createDataRootMigrationViewState(
       percent: 0,
       ...(state.postCommitCleanup?.error === undefined ? {} : { error: state.postCommitCleanup.error }),
       canRestorePrevious: state.previousRoot !== undefined,
+      recoveryActions: state.postCommitCleanup === undefined
+        ? DATA_ROOT_RECOVERY_ACTIONS
+        : CLEANUP_RECOVERY_ACTIONS,
     }
   }
   if (state.postCommitCleanup !== undefined) {
@@ -67,6 +73,7 @@ export function createDataRootMigrationViewState(
       percent: 100,
       ...(state.postCommitCleanup.error === undefined ? {} : { error: state.postCommitCleanup.error }),
       canRestorePrevious: state.previousRoot !== undefined,
+      recoveryActions: [],
     }
   }
   return {
@@ -74,6 +81,7 @@ export function createDataRootMigrationViewState(
     stageLabel: '等待迁移',
     percent: 0,
     canRestorePrevious: state.previousRoot !== undefined,
+    recoveryActions: [],
   }
 }
 
@@ -84,6 +92,55 @@ export async function confirmRestorePreviousDataRoot(
 ): Promise<void> {
   if (!confirm()) return
   await restore()
+}
+
+/** recovery 按钮区只接收已派生的允许动作与无状态回调。 */
+export interface DataRootRecoveryControlsProps {
+  /** 当前 recovery 视图及允许动作。 */
+  view: DataRootMigrationViewState
+  /** 是否正在执行上一条路径操作。 */
+  isBusy: boolean
+  /** 重新检测当前数据根。 */
+  onRecheck: () => void
+  /** 打开选择器重新定位数据根。 */
+  onRelocate: () => void
+  /** 确认后切回旧备份。 */
+  onRestorePrevious: () => void
+  /** 退出路径管理窗口。 */
+  onExit: () => void
+}
+
+/** 按当前状态允许集合渲染 recovery 操作，避免展示后端必然阻断的入口。 */
+export function DataRootRecoveryControls({
+  view,
+  isBusy,
+  onRecheck,
+  onRelocate,
+  onRestorePrevious,
+  onExit,
+}: DataRootRecoveryControlsProps): React.JSX.Element {
+  return (
+    <div className="flex flex-wrap gap-3">
+      {view.recoveryActions.includes('recheck') ? (
+        <Button disabled={isBusy} onClick={onRecheck}>
+          <RefreshCw aria-hidden="true" />重新检测
+        </Button>
+      ) : null}
+      {view.recoveryActions.includes('relocate') ? (
+        <Button variant="outline" disabled={isBusy} onClick={onRelocate}>
+          <FolderOpen aria-hidden="true" />重新定位
+        </Button>
+      ) : null}
+      {view.recoveryActions.includes('restore-previous') ? (
+        <Button variant="outline" disabled={isBusy || !view.canRestorePrevious} onClick={onRestorePrevious}>
+          <RotateCcw aria-hidden="true" />切回旧备份
+        </Button>
+      ) : null}
+      <Button variant="ghost" disabled={isBusy} onClick={onExit}>
+        <X aria-hidden="true" />退出
+      </Button>
+    </div>
+  )
 }
 
 /** 数据根迁移与离线恢复使用的轻量 renderer。 */
@@ -192,32 +249,26 @@ export function DataRootMigrationApp(): React.JSX.Element {
         ) : null}
 
         {view.kind === 'recovery' ? (
-          <div className="flex flex-wrap gap-3">
-            <Button disabled={isBusy} onClick={() => void runAction(async () => {
+          <DataRootRecoveryControls
+            view={view}
+            isBusy={isBusy}
+            onRecheck={() => void runAction(async () => {
               await window.pathManagementAPI.recoverDataRoot({ action: 'recheck' })
-            })}>
-              <RefreshCw aria-hidden="true" />重新检测
-            </Button>
-            <Button variant="outline" disabled={isBusy} onClick={() => void runAction(async () => {
+            })}
+            onRelocate={() => void runAction(async () => {
               /** 系统选择器返回的已授权候选目录。 */
               const selectedRoot = await window.pathManagementAPI.pickDataRoot()
               if (selectedRoot === null) return
               await window.pathManagementAPI.recoverDataRoot({ action: 'relocate', selectedRoot })
-            })}>
-              <FolderOpen aria-hidden="true" />重新定位
-            </Button>
-            <Button variant="outline" disabled={isBusy || !view.canRestorePrevious} onClick={() => void runAction(async () => {
+            })}
+            onRestorePrevious={() => void runAction(async () => {
               await confirmRestorePreviousDataRoot(
                 () => window.confirm('切回旧备份后，当前离线数据根将保留为可恢复位置。是否继续？'),
                 () => window.pathManagementAPI.recoverDataRoot({ action: 'restore-previous' }),
               )
-            })}>
-              <RotateCcw aria-hidden="true" />切回旧备份
-            </Button>
-            <Button variant="ghost" disabled={isBusy} onClick={() => void window.pathManagementAPI.exitDataRootManagement()}>
-              <X aria-hidden="true" />退出
-            </Button>
-          </div>
+            })}
+            onExit={() => void window.pathManagementAPI.exitDataRootManagement()}
+          />
         ) : (
           <div className="flex flex-wrap gap-3">
             {view.kind === 'migration' ? (
