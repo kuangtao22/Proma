@@ -19,6 +19,7 @@ import { join } from 'node:path'
 import { rebaseDataRootOwnedPaths, rebaseOwnedPath } from './owned-path-rebaser'
 import {
   captureDirectoryGuard,
+  fsyncParentDirectory,
   preflightPersistentJson,
   recoverPersistentJson,
   validateDataRoots,
@@ -79,6 +80,98 @@ function isCaseInsensitiveFileSystem(): boolean {
 const HARD_LINKS_SUPPORTED = supportsHardLinks()
 /** 当前测试文件系统的大小写语义。 */
 const CASE_INSENSITIVE_FILE_SYSTEM = isCaseInsensitiveFileSystem()
+
+/** 创建带 Node 文件系统错误码的测试异常。 */
+function createFileSystemError(code: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(`filesystem error: ${code}`), { code })
+}
+
+describe('fsyncParentDirectory', () => {
+  test('Given 目录 fsync 成功 When 刷盘 Then 依次打开、fsync 并关闭且不告警', () => {
+    /** 记录依赖调用顺序。 */
+    const calls: string[] = []
+    /** 收集不应出现的 warning。 */
+    const warnings: string[] = []
+
+    fsyncParentDirectory('/target', {
+      openDirectory: (directoryPath) => {
+        calls.push(`open:${directoryPath}`)
+        return 42
+      },
+      fsync: (descriptor) => calls.push(`fsync:${descriptor}`),
+      close: (descriptor) => calls.push(`close:${descriptor}`),
+      warn: (message) => warnings.push(message),
+    })
+
+    expect(calls).toEqual(['open:/target', 'fsync:42', 'close:42'])
+    expect(warnings).toEqual([])
+  })
+
+  test('Given 平台明确不支持目录 fsync When 刷盘 Then warning 后继续', () => {
+    /** 明确表示能力不支持的错误。 */
+    const unsupportedError = createFileSystemError('ENOTSUP')
+    /** 收集降级 warning。 */
+    const warnings: string[] = []
+    /** 记录目录 fd 是否关闭。 */
+    let closed = false
+
+    expect(() => fsyncParentDirectory('/target', {
+      openDirectory: () => 43,
+      fsync: () => { throw unsupportedError },
+      close: () => { closed = true },
+      warn: (message) => warnings.push(message),
+    })).not.toThrow()
+    expect(closed).toBe(true)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('ENOTSUP')
+  })
+
+  test('Given 打开目录失败 When 刷盘 Then 仅明确 unsupported 错误允许降级', () => {
+    /** 收集 open unsupported 的降级 warning。 */
+    const warnings: string[] = []
+    expect(() => fsyncParentDirectory('/target', {
+      openDirectory: () => { throw createFileSystemError('ENOSYS') },
+      fsync: () => { throw new Error('不应调用 fsync') },
+      close: () => { throw new Error('不应调用 close') },
+      warn: (message) => warnings.push(message),
+    })).not.toThrow()
+    expect(warnings).toHaveLength(1)
+
+    for (const code of ['ENOENT', 'EIO']) {
+      /** 当前 open 必须传播的原始错误。 */
+      const expectedError = createFileSystemError(code)
+      expect(() => fsyncParentDirectory('/target', {
+        openDirectory: () => { throw expectedError },
+        fsync: () => { throw new Error('不应调用 fsync') },
+        close: () => { throw new Error('不应调用 close') },
+        warn: (message) => warnings.push(message),
+      })).toThrow(expectedError)
+    }
+    expect(warnings).toHaveLength(1)
+  })
+
+  test('Given 目录 fsync 遇到持久化或未知错误 When 刷盘 Then 原样传播', () => {
+    /** 不得降级的错误码；空字符串代表未知错误。 */
+    const fatalCodes = ['EIO', 'ENOSPC', 'EROFS', 'EBADF', '']
+    for (const code of fatalCodes) {
+      /** 当前待传播的原始错误对象。 */
+      const expectedError = code ? createFileSystemError(code) : new Error('unknown fsync failure')
+      /** 收集不应出现的 warning。 */
+      const warnings: string[] = []
+      /** 记录异常路径是否关闭目录 fd。 */
+      let closed = false
+
+      expect(() => fsyncParentDirectory('/target', {
+        openDirectory: () => 44,
+        fsync: () => { throw expectedError },
+        close: () => { closed = true },
+        warn: (message) => warnings.push(message),
+      })).toThrow(expectedError)
+      expect(closed).toBe(true)
+      expect(warnings).toEqual([])
+    }
+  })
+})
 
 /** 将测试对象写成持久化 JSON。 */
 function writeJson(filePath: string, value: object): void {
@@ -817,6 +910,28 @@ describe('rebaseDataRootOwnedPaths', () => {
     expect(() => writePersistentJson(persistent, targetGuard)).toThrow('内容 SHA-256')
     expect(readFileSync(configPath).equals(tamperedBytes)).toBe(true)
     expect(readFileSync(backupPath).equals(originalBackup)).toBe(true)
+  })
+
+  test('Given backup rename 后父目录 fsync 返回 EIO When 写回 Then 上层抛错且不提交 main', () => {
+    /** 待提交的 workspace config。 */
+    const configPath = join(targetRoot, 'config.json')
+    writeJson(configPath, { attachedFiles: [join(sourceRoot, 'a.txt')] })
+    /** 提交前 main 原始字节。 */
+    const originalMain = readFileSync(configPath)
+    /** 目标根和候选的预检身份。 */
+    const targetGuard = validateDataRoots(sourceRoot, targetRoot)
+    const preflight = preflightPersistentJson(configPath, isWorkspaceConfig, targetGuard, [])
+    if (!preflight) throw new Error('测试夹具缺少配置预检结果')
+    /** 仍只存在内存、尚未写回的配置恢复值。 */
+    const persistent = recoverPersistentJson(preflight, isWorkspaceConfig, targetGuard)
+    persistent.value.attachedFiles = [join(targetRoot, 'a.txt')]
+    /** 必须由上层观察到的持久化错误。 */
+    const ioError = createFileSystemError('EIO')
+
+    expect(() => writePersistentJson(persistent, targetGuard, {
+      fsyncParentDirectory: () => { throw ioError },
+    })).toThrow(ioError)
+    expect(readFileSync(configPath).equals(originalMain)).toBe(true)
   })
 
   test('Given sourceRoot 通过父目录 symlink 与 targetRoot 指向同一物理目录 When 重写 Then 拒绝物理别名', () => {

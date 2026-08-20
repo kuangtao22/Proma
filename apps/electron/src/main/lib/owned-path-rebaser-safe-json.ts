@@ -67,6 +67,47 @@ interface CapturedFile {
   bytes: Buffer
 }
 
+/** 目录 fsync 的可注入底层依赖，供跨平台错误分类测试。 */
+export interface FsyncParentDirectoryDependencies {
+  /** 以只读方式打开父目录并返回 fd。 */
+  openDirectory(directoryPath: string): number
+  /** 将目录项更新刷入稳定存储。 */
+  fsync(descriptor: number): void
+  /** 关闭目录 fd。 */
+  close(descriptor: number): void
+  /** 输出明确 unsupported 的降级告警。 */
+  warn(message: string): void
+}
+
+/** Task4 JSON 提交可注入依赖。 */
+export interface PersistentJsonWriteDependencies {
+  /** 成功 rename 后同步父目录。 */
+  fsyncParentDirectory(directoryPath: string): void
+}
+
+/** 明确表示平台不支持目录 fd 或目录 fsync 的错误码。 */
+const DIRECTORY_FSYNC_UNSUPPORTED_CODES = new Set([
+  'EINVAL',
+  'ENOTSUP',
+  'EOPNOTSUPP',
+  'ENOSYS',
+  'EPERM',
+  'EISDIR',
+])
+
+/** 生产环境目录 fsync 的 Node 文件系统依赖。 */
+const DEFAULT_FSYNC_PARENT_DIRECTORY_DEPENDENCIES: FsyncParentDirectoryDependencies = {
+  openDirectory: (directoryPath) => openSync(directoryPath, constants.O_RDONLY),
+  fsync: (descriptor) => fsyncSync(descriptor),
+  close: (descriptor) => closeSync(descriptor),
+  warn: (message) => console.warn(message),
+}
+
+/** 生产环境 Task4 JSON 提交依赖。 */
+const DEFAULT_PERSISTENT_JSON_WRITE_DEPENDENCIES: PersistentJsonWriteDependencies = {
+  fsyncParentDirectory,
+}
+
 /** 目标数据根在整个重写过程中的稳定身份。 */
 export interface TargetRootGuard extends DirectoryGuard {
   /** 迁移前数据根的物理路径，用于拒绝物理别名和嵌套。 */
@@ -224,7 +265,11 @@ export function needsPersistentJsonCommit(file: PersistentJson<JsonObject>): boo
 }
 
 /** 原子写回已完成全量预检的 JSON，并让 main 与 backup 保存同一目标内容。 */
-export function writePersistentJson(file: PersistentJson<JsonObject>, targetGuard: TargetRootGuard): void {
+export function writePersistentJson(
+  file: PersistentJson<JsonObject>,
+  targetGuard: TargetRootGuard,
+  dependencies: PersistentJsonWriteDependencies = DEFAULT_PERSISTENT_JSON_WRITE_DEPENDENCIES,
+): void {
   verifyTargetRootGuard(targetGuard)
   verifyDirectoryGuards(file.directoryGuards, targetGuard)
   /** 写入前复验的全部固定候选状态。 */
@@ -238,6 +283,7 @@ export function writePersistentJson(file: PersistentJson<JsonObject>, targetGuar
     content,
     file.directoryGuards,
     targetGuard,
+    dependencies,
   )
   replaceWithAtomicLeaf(
     file.filePath,
@@ -245,6 +291,7 @@ export function writePersistentJson(file: PersistentJson<JsonObject>, targetGuar
     content,
     file.directoryGuards,
     targetGuard,
+    dependencies,
   )
   cleanupControlledTemporary(file.filePath, beforeWrite.temporary.guard, file.directoryGuards, targetGuard)
   verifyTargetRootGuard(targetGuard)
@@ -513,6 +560,7 @@ function replaceWithAtomicLeaf(
   content: string,
   directoryGuards: DirectoryGuard[],
   targetGuard: TargetRootGuard,
+  dependencies: PersistentJsonWriteDependencies,
 ): void {
   /** 随机且不可预测的同目录临时叶子。 */
   const temporaryPath = join(dirname(destinationPath), `.proma-atomic-${randomBytes(16).toString('hex')}`)
@@ -571,7 +619,7 @@ function replaceWithAtomicLeaf(
     assertSameGuard(temporaryGuard, currentTemporary, `提交前原子临时文件被替换: ${temporaryPath}`)
     renameSync(temporaryPath, destinationPath)
     committed = true
-    fsyncParentDirectoryBestEffort(dirname(destinationPath))
+    dependencies.fsyncParentDirectory(dirname(destinationPath))
     verifyTargetRootGuard(targetGuard)
     verifyDirectoryGuards(directoryGuards, targetGuard)
     /** rename 后目标文件必须保持临时 inode 的身份和目标字节。 */
@@ -586,26 +634,55 @@ function replaceWithAtomicLeaf(
   }
 }
 
-/** 成功 rename 后尽力刷盘父目录；平台不支持目录 fd 时告警但不回滚已完成提交。 */
-function fsyncParentDirectoryBestEffort(directoryPath: string): void {
-  /** 父目录只读 fd；部分平台不允许打开目录。 */
-  let descriptor: number | null = null
+/** 成功 rename 后刷盘父目录；仅明确 unsupported 的平台错误允许告警降级。 */
+export function fsyncParentDirectory(
+  directoryPath: string,
+  dependencies: FsyncParentDirectoryDependencies = DEFAULT_FSYNC_PARENT_DIRECTORY_DEPENDENCIES,
+): void {
+  /** 已成功打开的父目录 fd。 */
+  let descriptor: number
   try {
-    descriptor = openSync(directoryPath, constants.O_RDONLY)
-    fsyncSync(descriptor)
+    descriptor = dependencies.openDirectory(directoryPath)
   } catch (error) {
-    /** 用于跨平台诊断的文件系统错误码。 */
-    const code = isNodeError(error) ? error.code : undefined
-    console.warn(`[路径迁移] 父目录 fsync 不可用，已保留原子 rename 结果: ${directoryPath}${code ? ` (${code})` : ''}`)
-  } finally {
-    if (descriptor !== null) {
-      try {
-        closeSync(descriptor)
-      } catch {
-        // rename 已成功，目录 fd 关闭失败仅影响资源回收诊断，不得伪装为提交失败。
-      }
-    }
+    if (!isDirectoryFsyncUnsupported(error)) throw error
+    warnDirectoryFsyncUnsupported(directoryPath, error, dependencies)
+    return
   }
+
+  try {
+    dependencies.fsync(descriptor)
+  } catch (error) {
+    if (isDirectoryFsyncUnsupported(error)) {
+      dependencies.close(descriptor)
+      warnDirectoryFsyncUnsupported(directoryPath, error, dependencies)
+      return
+    }
+    try {
+      dependencies.close(descriptor)
+    } catch {
+      // 保留 fsync 的原始持久化错误，避免 close 错误掩盖根因。
+    }
+    throw error
+  }
+  dependencies.close(descriptor)
+}
+
+/** 判断错误是否明确表示当前平台不支持目录 fsync。 */
+function isDirectoryFsyncUnsupported(error: unknown): boolean {
+  return isNodeError(error)
+    && typeof error.code === 'string'
+    && DIRECTORY_FSYNC_UNSUPPORTED_CODES.has(error.code)
+}
+
+/** 输出目录 fsync unsupported 的统一降级告警。 */
+function warnDirectoryFsyncUnsupported(
+  directoryPath: string,
+  error: unknown,
+  dependencies: FsyncParentDirectoryDependencies,
+): void {
+  /** 已由 unsupported 分类保证存在的 Node 错误码。 */
+  const code = isNodeError(error) ? error.code : undefined
+  dependencies.warn(`[路径迁移] 当前平台不支持父目录 fsync，已保留原子 rename 结果: ${directoryPath} (${code ?? 'unknown'})`)
 }
 
 /** 仅当随机临时叶子仍指向本次创建的单链接 inode 时清理。 */
