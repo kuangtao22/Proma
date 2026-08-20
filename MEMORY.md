@@ -40,6 +40,7 @@
 - fork 的标签发布工作流覆盖 macOS arm64/x64、Windows x64 与 Linux x64；Linux 同时提供 AppImage 和 deb，并与其他平台产物汇总到同一个 GitHub Release。
 - Linux deb 打包依赖 `apps/electron/package.json` 的 `homepage` 元数据；发布合同测试必须覆盖该字段，避免 AppImage 成功但 deb 在 FPM 阶段失败。
 - Electron workspace 使用带 scope 的包名，Linux 必须显式配置不含 `/` 的 `artifactName`，否则 deb 默认输出路径会被拆成不存在的子目录。
+- 路径管理采用固定 `~/.proma-location.json` 定位文件与重启迁移模式：业务模块继续通过 `getConfigDir()` 解析当前数据根，复制、校验和 Proma-owned 绝对路径重写全部成功后才切换；项目文件迁移独立使用工作区锁，源目录始终保留。
 
 ## 会话记录
 
@@ -63,3 +64,4 @@
 - 2026-08-19：确认整理发布版本与开发/正式身份；下一版本采用 `0.17.42-bone.5`，正式版保持 `Proma`，开发版固定显示为 `Proma Dev`。
 - 2026-08-19：完成 `0.17.42-bone.5` 版本体系：应用版本、标签、Release 标题、关于页、更新频道和三平台产物命名统一；GitHub Actions 在四平台构建前校验标签合同，并只在全部构建成功后发布。
 - 2026-08-19：Bun 1.3.14 的 `bun install --lockfile-only` 不会自动刷新 workspace 自身的 `version` 字段；修改应用版本后必须显式检查 `bun.lock` 中 `apps/electron.version` 是否同步。
+- 2026-08-20：确认文件路径管理设计：全局数据根与单项目路径作为两个独立功能；采用复制、SHA-256 校验、原子切换和保留旧目录策略，移动盘/NAS 离线时禁止静默回退。
