@@ -284,7 +284,10 @@ import {
   searchAgentSessionMessages,
   searchAgentSessionReferences,
 } from './lib/agent-session-manager'
-import { agentEventBus, runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, queueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
+import { agentEventBus, runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, hasActiveAgentSessions, queueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
+import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
+import { getDefaultDataRootInstanceLeaseRegistry } from './lib/data-root-instance-lease'
+import { hasRunningAutomations } from './lib/automation-scheduler'
 import { permissionService } from './lib/agent-permission-service'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
@@ -1020,6 +1023,20 @@ async function withOAuthDeviceCodeQr<T extends CodexOAuthDeviceCode | XaiOAuthDe
 
 export function registerIpcHandlers(): void {
   console.log('[IPC] 正在注册 IPC 处理器...')
+
+  /** normal 模式共享的实例 lease，用于迁移前排除 dev/prod 其他进程。 */
+  const dataRootInstanceLease = getDefaultDataRootInstanceLeaseRegistry()
+  registerPathManagementIpcHandlers({
+    mode: 'normal',
+    ipc: ipcMain,
+    app,
+    dialog,
+    shell,
+    getAllWindows: () => BrowserWindow.getAllWindows(),
+    hasActiveTasks: () => hasActiveAgentSessions() || hasRunningAutomations(),
+    hasOtherPromaInstance: () => dataRootInstanceLease.hasOtherActiveLease(),
+    acquireMigrationGuard: () => dataRootInstanceLease.acquireMigrationGuard(),
+  })
 
   // ===== 运行时相关 =====
 
@@ -4947,14 +4964,6 @@ export function registerIpcHandlers(): void {
       return requestMicrophonePermission()
     }
   )
-
-  // ===== 数据迁移 =====
-
-  ipcMain.handle('migration:open-data-folder', async (): Promise<void> => {
-    const dataDir = getConfigDir()
-    const error = await shell.openPath(dataDir)
-    if (error) throw new Error(`无法打开 Proma 数据文件夹：${error}`)
-  })
 
   // ===== 窗口控制（Windows 自定义标题栏按钮）=====
 

@@ -6,9 +6,11 @@
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import { createLanBridgePreloadApi } from './lan-bridge-preload'
 import type { LanBridgePreloadApi } from './lan-bridge-preload'
+import { createPathManagementPreloadApi } from './path-management-preload'
+import type { PathManagementPreloadApi } from './path-management-preload'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS } from '../types'
 import type {
   RuntimeStatus,
@@ -185,7 +187,7 @@ import { QUICK_TASK_IPC_CHANNELS, TRAY_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNEL
 /**
  * 暴露给渲染进程的 API 接口定义
  */
-export interface ElectronAPI extends LanBridgePreloadApi {
+export interface ElectronAPI extends LanBridgePreloadApi, PathManagementPreloadApi {
   // ===== 运行时相关 =====
 
   /**
@@ -1281,8 +1283,12 @@ export interface ElectronAPI extends LanBridgePreloadApi {
  */
 /** 根 preload 唯一创建的 LAN API 组合对象。 */
 const lanBridgePreloadApi = createLanBridgePreloadApi(ipcRenderer)
+/** 根 preload 唯一创建的路径管理 API 组合对象。 */
+const pathManagementPreloadApi = createPathManagementPreloadApi(ipcRenderer)
 
 const electronAPI: ElectronAPI = {
+  ...pathManagementPreloadApi,
+
   // 运行时
   getRuntimeStatus: () => {
     return ipcRenderer.invoke(IPC_CHANNELS.GET_RUNTIME_STATUS)
@@ -2779,7 +2785,7 @@ const electronAPI: ElectronAPI = {
     return () => { ipcRenderer.removeListener(TRAY_IPC_CHANNELS.CREATE_SESSION, listener) }
   },
 
-  openMigrationDataFolder: () => ipcRenderer.invoke('migration:open-data-folder'),
+  openMigrationDataFolder: () => ipcRenderer.invoke(PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT),
 
   // ===== 存储管理 =====
 

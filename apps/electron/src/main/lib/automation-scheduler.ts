@@ -98,6 +98,11 @@ let tickTimer: NodeJS.Timeout | undefined
 /** 正在执行中的 automation id 集合，防止同一任务重入 */
 const runningAutomations = new Set<string>()
 
+/** 是否存在正在调度或执行的 Automation，供数据根迁移二次预检。 */
+export function hasRunningAutomations(): boolean {
+  return runningAutomations.size > 0
+}
+
 /** 向所有渲染窗口广播任务列表变更，触发前端刷新 */
 export function broadcastChanged(): void {
   for (const win of BrowserWindow.getAllWindows()) {

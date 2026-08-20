@@ -95,9 +95,11 @@ const isDetachedPreviewWindow = new URLSearchParams(window.location.search).get(
 const isPlanningWindow = new URLSearchParams(window.location.search).get('window') === 'planning'
 const isWorkspaceMemoryWindow = new URLSearchParams(window.location.search).get('window') === 'workspace-memory'
 const isAgentStatusHoverWindow = new URLSearchParams(window.location.search).get('window') === 'agent-status-hover'
-const isMainWindow = !isQuickTaskWindow && !isVoiceDictationIndicatorWindow && !isDetachedPreviewWindow && !isPlanningWindow && !isWorkspaceMemoryWindow && !isAgentStatusHoverWindow
+/** 数据根窗口必须在任何会读取业务数据的 initializer 前识别。 */
+const isDataRootMigrationWindow = new URLSearchParams(window.location.search).get('window') === 'data-root-migration'
+const isMainWindow = !isQuickTaskWindow && !isVoiceDictationIndicatorWindow && !isDetachedPreviewWindow && !isPlanningWindow && !isWorkspaceMemoryWindow && !isAgentStatusHoverWindow && !isDataRootMigrationWindow
 
-initializePerformanceMonitor()
+if (!isDataRootMigrationWindow) initializePerformanceMonitor()
 
 // 主窗口和独立规划窗口均由内部面板管理滚动，避免页面本身出现第二层滚动。
 if (isMainWindow || isPlanningWindow || isWorkspaceMemoryWindow) {
@@ -1068,8 +1070,16 @@ function ScratchPadPersistence(): null {
   return null
 }
 
-// ===== 快速任务窗口：轻量渲染 =====
-if (isQuickTaskWindow) {
+// ===== 数据根迁移/恢复窗口：不挂载任何普通业务 initializer =====
+if (isDataRootMigrationWindow) {
+  import('./components/path-management/DataRootMigrationApp').then(({ DataRootMigrationApp }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <DataRootMigrationApp />
+      </React.StrictMode>
+    )
+  })
+} else if (isQuickTaskWindow) {
   import('./components/quick-task/QuickTaskApp').then(({ QuickTaskApp }) => {
     ReactDOM.createRoot(document.getElementById('root')!).render(
       <React.StrictMode>

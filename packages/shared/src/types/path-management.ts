@@ -37,6 +37,9 @@ export interface DataRootPostCommitCleanupProgress {
 /** 数据根不可用时允许用户选择的恢复动作。 */
 export type DataRootRecoveryAction = 'recheck' | 'relocate' | 'restore-previous'
 
+/** Electron 启动时根据固定 locator 选择的业务隔离模式。 */
+export type DataRootStartupMode = 'normal' | 'data-root-migration' | 'data-root-recovery'
+
 /** 数据根恢复请求。 */
 export interface RecoverDataRootInput {
   action: DataRootRecoveryAction
@@ -153,5 +156,7 @@ export const PATH_MANAGEMENT_IPC_CHANNELS = {
   RESUME_DATA_ROOT_MIGRATION: 'path-management:resume-data-root-migration',
   CANCEL_DATA_ROOT_MIGRATION: 'path-management:cancel-data-root-migration',
   RECOVER_DATA_ROOT: 'path-management:recover-data-root',
+  OPEN_DATA_ROOT: 'path-management:open-data-root',
+  EXIT_APP: 'path-management:exit-app',
   PROGRESS: 'path-management:progress',
 } as const

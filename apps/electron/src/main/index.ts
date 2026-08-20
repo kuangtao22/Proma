@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, Menu, nativeTheme, protocol, screen, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, protocol, screen, shell } from 'electron'
 import { join } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync } from 'fs'
@@ -132,7 +132,22 @@ import {
 import { registerGlobalShortcut, unregisterAllGlobalShortcuts } from './lib/global-shortcut-service'
 import { setPromaVersion } from '@proma/core'
 import { canRecoverRenderer, RENDERER_RECOVERY_WINDOW_MS } from './lib/renderer-process-recovery'
+import {
+  getDefaultDataRootLocator,
+  registerPathManagementIpcHandlers,
+  resolveDataRootStartupMode,
+} from './lib/path-management-ipc'
+import {
+  getDefaultDataRootInstanceLeaseRegistry,
+  type DataRootInstanceLeaseRegistry,
+} from './lib/data-root-instance-lease'
+import type { DataRootStartupMode } from '@proma/shared'
 import { TRAY_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS } from '../types'
+
+/** normal 模式成功取得的共享数据根实例 lease；非 normal 始终为 null。 */
+let dataRootInstanceLease: DataRootInstanceLeaseRegistry | null = null
+/** 启动门失败后禁止顶层兜底误启普通业务窗口。 */
+let dataRootBusinessStartupBlocked = false
 
 /** macOS 26+ 使用 Swift/AppKit NSPanel；其他平台不创建 Agent Island surface。 */
 function startAgentIslandSurface(): void {
@@ -643,6 +658,41 @@ function createWindow(): void {
   })
 }
 
+/** 创建不读取 settings 或业务数据的迁移/离线恢复窗口。 */
+function createDataRootManagementWindow(mode: Exclude<DataRootStartupMode, 'normal'>): void {
+  /** 轻量窗口只依赖 preload 的路径管理桥。 */
+  const window = new BrowserWindow({
+    width: 760,
+    height: 560,
+    minWidth: 640,
+    minHeight: 480,
+    show: false,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#09090b' : '#ffffff',
+    webPreferences: {
+      preload: join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+  mainWindow = window
+  setStoredMainWindow(window)
+  window.once('ready-to-show', () => window.show())
+  window.on('closed', () => {
+    if (mainWindow === window) mainWindow = null
+    setStoredMainWindow(null)
+    // 轻量模式没有普通 activate 生命周期；关闭专用窗口即退出，避免 macOS 后台残留。
+    app.quit()
+  })
+  /** renderer 只通过固定 query 识别轻量路径窗口。 */
+  const query = { window: 'data-root-migration', mode }
+  if (app.isPackaged) {
+    void window.loadFile(join(__dirname, 'renderer', 'index.html'), { query })
+  } else {
+    void window.loadURL(`http://127.0.0.1:5174?window=data-root-migration&mode=${mode}`)
+  }
+}
+
 function sendToMainWindow(channel: string, data?: unknown): void {
   showAndFocusMainWindow()
 
@@ -669,6 +719,36 @@ app.whenReady().then(bootstrap).catch(handleBootstrapFailure)
  * 单点失败不应阻止窗口和托盘的创建（用户至少要能看到界面）。
  */
 async function bootstrap(): Promise<void> {
+  /** 首次且无副作用检查固定 locator，决定是否允许普通业务初始化。 */
+  const locatorResult = getDefaultDataRootLocator().inspect()
+  /** 数据根启动隔离模式。 */
+  const dataRootMode = resolveDataRootStartupMode(locatorResult)
+  if (dataRootMode !== 'normal') {
+    // 非 normal 的任何启动失败都禁止落入普通业务兜底。
+    dataRootBusinessStartupBlocked = true
+    registerPathManagementIpcHandlers({
+      mode: dataRootMode,
+      ipc: ipcMain,
+      app,
+      dialog,
+      shell,
+      getAllWindows: () => BrowserWindow.getAllWindows(),
+    })
+    createDataRootManagementWindow(dataRootMode)
+    return
+  }
+
+  /** normal 模式必须在任何普通服务前注册共享 lease。 */
+  const activeRoot = locatorResult.state.activeRoot
+  if (activeRoot === null) throw new Error('normal 模式缺少活动数据根')
+  try {
+    dataRootInstanceLease = getDefaultDataRootInstanceLeaseRegistry()
+    dataRootInstanceLease.acquire(activeRoot)
+  } catch (error) {
+    dataRootBusinessStartupBlocked = true
+    throw error
+  }
+
   // 初始化 Proma 版本号（供 User-Agent 等全局标识使用）
   setPromaVersion(app.getVersion())
 
@@ -888,6 +968,11 @@ function handleBootstrapFailure(err: unknown): void {
     /* dialog 也失败，无能为力 */
   }
 
+  if (dataRootBusinessStartupBlocked) {
+    app.quit()
+    return
+  }
+
   try {
     registerIpcHandlers()
     createWindow()
@@ -941,4 +1026,10 @@ app.on('before-quit', () => {
   disposePiMcpConnections().catch(() => {})
   // Clean up system tray before quitting
   destroyTray()
+})
+
+app.on('will-quit', () => {
+  // 普通服务完成同步退出清理后，再释放当前 owner token 对应的 normal lease。
+  dataRootInstanceLease?.release()
+  dataRootInstanceLease = null
 })
