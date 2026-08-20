@@ -1,5 +1,6 @@
 import { getAgentSessionMeta, getAgentSessionSDKMessages } from './agent-session-manager'
-import { getBundledCliPath, getConfigDirName } from './config-paths'
+import { join } from 'node:path'
+import { getBundledCliPath, getConfigDir, type ConfigRootResolver } from './config-paths'
 
 /** 最大回填消息条数 */
 export const MAX_CONTEXT_MESSAGES = 20
@@ -10,10 +11,12 @@ const MAX_TOOL_SUMMARY_LENGTH = 200
 interface SessionPromptHint {
   agentCwd: string
   workspaceSlug?: string
+  /** 当前会话使用的活动数据根解析器；测试可注入独立实例。 */
+  configRootResolver?: ConfigRootResolver
 }
 
-function getSessionHistoryPath(sessionId: string): string {
-  return `~/${getConfigDirName()}/agent-sessions/${sessionId}.jsonl`
+function getSessionHistoryPath(sessionId: string, resolver?: ConfigRootResolver): string {
+  return join(getConfigDir(resolver), 'agent-sessions', `${sessionId}.jsonl`)
 }
 
 function canUseSessionCleaner(): boolean {
@@ -30,25 +33,38 @@ function getSessionCliCommandPrefix(): string {
   return getBundledCliPath() ? '"$PROMA_CLI"' : 'proma'
 }
 
-function buildSessionCliAccessGuide(sessionId: string, historyPath: string, workspaceSlug?: string): string {
+function buildSessionCliAccessGuide(
+  sessionId: string,
+  historyPath: string,
+  workspaceSlug?: string,
+  resolver?: ConfigRootResolver,
+): string {
   const cli = getSessionCliCommandPrefix()
   const skillName = getSessionCleanerSkillName(workspaceSlug)
+  /** 显式参数确保独立 CLI 与 Electron 当前数据根一致。 */
+  const configDirFlag = `--config-dir ${JSON.stringify(getConfigDir(resolver))}`
+  /** 为每条建议命令追加相同配置根，避免依赖调用方环境。 */
+  const command = (args: string): string => `${cli} session ${args} ${configDirFlag}`
   return [
     `优先使用 session-cleaner skill（${skillName}）读取当前会话历史；它是 Proma CLI 的薄封装，会把 Agent JSONL 清洗为干净对话。`,
     `可用 CLI 命令前缀: ${cli}`,
     `建议流程:`,
-    `1. ${cli} session info ${sessionId}`,
-    `2. ${cli} session outline ${sessionId}`,
-    `3. 根据 outline/search 定位后，用 ${cli} session export ${sessionId} --turns A-B 或 ${cli} session export ${sessionId} --tail N 读取片段。`,
-    `4. 只有会话很小或 CLI 护栏允许时，才用 ${cli} session export ${sessionId} 读取全量。`,
+    `1. ${command(`info ${sessionId}`)}`,
+    `2. ${command(`outline ${sessionId}`)}`,
+    `3. 根据 outline/search 定位后，用 ${command(`export ${sessionId} --turns A-B`)} 或 ${command(`export ${sessionId} --tail N`)} 读取片段。`,
+    `4. 只有会话很小或 CLI 护栏允许时，才用 ${command(`export ${sessionId}`)} 读取全量。`,
     `不要直接 Read 原始 .jsonl 历史文件；CLI / skill 不可用或读取失败时，才兜底读取: ${historyPath}`,
   ].join('\n')
 }
 
-function buildCurrentSessionHistoryInstruction(sessionId: string, workspaceSlug?: string): string {
-  const historyPath = getSessionHistoryPath(sessionId)
+function buildCurrentSessionHistoryInstruction(
+  sessionId: string,
+  workspaceSlug?: string,
+  resolver?: ConfigRootResolver,
+): string {
+  const historyPath = getSessionHistoryPath(sessionId, resolver)
   if (canUseSessionCleaner()) {
-    return buildSessionCliAccessGuide(sessionId, historyPath, workspaceSlug)
+    return buildSessionCliAccessGuide(sessionId, historyPath, workspaceSlug, resolver)
   }
 
   return `请先读取上述完整历史文件以恢复上下文。会话历史文件（.jsonl）可能包含大量消息和 tool results，文件较大；如果完整读取风险较高，请优先使用 Grep 搜索关键词定位相关消息片段，再局部读取。History path: ${historyPath}`
@@ -132,9 +148,9 @@ export function buildContextPrompt(sessionId: string, currentUserMessage: string
   // 避免「从零重新执行整个任务」（#903）。
   const sessionInfoBlock = sessionHint
     ? `\n<session_info>\nSession ID: ${sessionId}\nSession CWD: ${sessionHint.agentCwd}\n` +
-      `History path: ${getSessionHistoryPath(sessionId)}\n` +
+      `History path: ${getSessionHistoryPath(sessionId, sessionHint.configRootResolver)}\n` +
       `重要：上方仅为最近 ${MAX_CONTEXT_MESSAGES} 条对话摘要，可能不完整。在继续之前，` +
-      `${buildCurrentSessionHistoryInstruction(sessionId, sessionHint.workspaceSlug)}\n` +
+      `${buildCurrentSessionHistoryInstruction(sessionId, sessionHint.workspaceSlug, sessionHint.configRootResolver)}\n` +
       `恢复时先确认「已经完成了哪些工作、进行到哪一步」，然后从中断处继续，切勿重复执行已完成的步骤。\n</session_info>\n`
     : ''
 
@@ -156,7 +172,7 @@ export function buildRecoveryPrompt(
 ): string {
   const meta = getAgentSessionMeta(sessionId)
   const title = meta ? escapeContextAttr(meta.title) : sessionId
-  const historyPath = getSessionHistoryPath(sessionId)
+  const historyPath = getSessionHistoryPath(sessionId, sessionHint.configRootResolver)
 
   const recoveryBlock =
     `<session_recovery>\n` +
@@ -165,7 +181,7 @@ export function buildRecoveryPrompt(
     `<session id="${sessionId}" title="${title}" cwd="${sessionHint.agentCwd}">\n` +
     `History path: ${historyPath}\n` +
     `</session>\n` +
-    `${buildCurrentSessionHistoryInstruction(sessionId, sessionHint.workspaceSlug)}\n` +
+    `${buildCurrentSessionHistoryInstruction(sessionId, sessionHint.workspaceSlug, sessionHint.configRootResolver)}\n` +
     `</session_recovery>`
 
   console.log(`[Agent 编排] buildRecoveryPrompt: 注入 session 自引用 → ${historyPath}`)
@@ -184,6 +200,7 @@ export function buildReferencedSessionsPrompt(
   currentSessionId: string,
   mentionedSessionIds?: string[],
   workspaceSlug?: string,
+  configRootResolver?: ConfigRootResolver,
 ): string {
   const uniqueIds = [...new Set((mentionedSessionIds ?? []).filter(Boolean))]
   if (uniqueIds.length === 0) return ''
@@ -197,7 +214,7 @@ export function buildReferencedSessionsPrompt(
     if (!meta || meta.archived) continue
 
     const title = escapeContextAttr(meta.title)
-    const historyPath = getSessionHistoryPath(referencedSessionId)
+    const historyPath = getSessionHistoryPath(referencedSessionId, configRootResolver)
     sessionBlocks.push(
       `<session id="${referencedSessionId}" title="${title}" updatedAt="${meta.updatedAt}">\n` +
       `CLI target: ${referencedSessionId}\n` +

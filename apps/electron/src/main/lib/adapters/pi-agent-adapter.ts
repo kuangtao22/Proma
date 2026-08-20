@@ -1070,6 +1070,7 @@ function buildPromaProductToolDefinitions(sdk: PiSdk, canUseTool: PiAgentQueryOp
 
 const WSL_EXPORT_ENV_KEYS = [
   'PROMA_CLI',
+  'PROMA_CONFIG_DIR',
   'HTTP_PROXY',
   'HTTPS_PROXY',
   'ALL_PROXY',
@@ -1099,7 +1100,9 @@ function buildWslCommand(command: string, env: NodeJS.ProcessEnv | undefined): s
   for (const key of WSL_EXPORT_ENV_KEYS) {
     const rawValue = env?.[key]
     if (!rawValue) continue
-    const value = key === 'PROMA_CLI' ? windowsPathToWslPath(rawValue) : rawValue
+    const value = key === 'PROMA_CLI' || key === 'PROMA_CONFIG_DIR'
+      ? windowsPathToWslPath(rawValue)
+      : rawValue
     exportLines.push(`export ${key}=${shellQuote(value)}`)
   }
 

@@ -8,7 +8,7 @@
  *
  * 全局 flag：
  *   --json            输出机器可读 JSON
- *   --config-dir DIR  指定 Proma 配置目录（默认 ~/.proma，PROMA_DEV=1 → ~/.proma-dev）
+ *   --config-dir DIR  指定 Proma 配置目录（优先于 PROMA_CONFIG_DIR 与固定 locator）
  *   --dev             使用 ~/.proma-dev
  *
  * 设计：命令注册表驱动（registry.ts）。`session` 是一个命名空间，

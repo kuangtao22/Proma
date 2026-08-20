@@ -35,8 +35,28 @@ interface SystemPromptContext {
   memoryGuidance?: WorkspaceMemoryGuidance
   /** 惰性周检命中时才提供；它只邀请用户复查，绝不自动读写历史。 */
   memoryRefreshOpportunity?: { memoryUpdatedAt?: number; newestSessionAt: number; newerSessionCount: number }
-  /** 测试可注入独立数据根解析器；生产缺省使用进程级默认定位器。 */
-  configRootResolver?: ConfigRootResolver
+  /** 测试可整体替换路径与元数据来源，避免同一提示词混用不同数据根。 */
+  dependencies?: SystemPromptDependencies
+}
+
+/** 提示词构建所需的完整可变依赖，注入时必须作为一个整体提供。 */
+export interface SystemPromptDependencies {
+  /** 当前进程活动数据根解析器；缺省值表示使用 config-paths 默认实例。 */
+  configRootResolver: ConfigRootResolver | undefined
+  /** 按 slug 查询与同一数据根对应的工作区元数据。 */
+  getWorkspaceBySlug: (slug: string) => { projectRootPath?: string } | undefined
+  /** 返回系统提示词中使用的用户名称。 */
+  getUserName: () => string
+  /** 返回当前 Git 归因开关。 */
+  isGitAttributionEnabled: () => boolean
+}
+
+/** 生产环境统一使用现有服务，测试只能整体替换，避免半注入。 */
+const DEFAULT_SYSTEM_PROMPT_DEPENDENCIES: SystemPromptDependencies = {
+  configRootResolver: undefined,
+  getWorkspaceBySlug: (slug) => getAgentWorkspaceBySlug(slug),
+  getUserName: () => getUserProfile().userName || '用户',
+  isGitAttributionEnabled: () => isGitAttributionEnabled(getSettings().gitAttributionEnabled),
 }
 
 function buildWorkspacePaths(
@@ -44,13 +64,13 @@ function buildWorkspacePaths(
   sessionId: string,
   agentCwd?: string,
   sessionWorkbenchLayout: SessionWorkbenchLayout = 'legacy-context',
-  configRootResolver?: ConfigRootResolver,
+  dependencies: SystemPromptDependencies = DEFAULT_SYSTEM_PROMPT_DEPENDENCIES,
 ) {
   /** 所有 Proma 受管路径都从统一配置路径入口解析。 */
-  const workspaceRoot = getAgentWorkspacePath(workspaceSlug, configRootResolver)
+  const workspaceRoot = getAgentWorkspacePath(workspaceSlug, dependencies.configRootResolver)
   const sessionDir = join(workspaceRoot, sessionId)
   /** 本地项目沿用用户目录；托管项目直接位于当前数据根的工作区内。 */
-  const agentWorkspace = getAgentWorkspaceBySlug(workspaceSlug)
+  const agentWorkspace = dependencies.getWorkspaceBySlug(workspaceSlug)
   const projectRoot = agentWorkspace?.projectRootPath ?? join(workspaceRoot, 'workspace-files')
   const effectiveAgentCwd = agentCwd ?? projectRoot
 
@@ -75,14 +95,16 @@ function buildWorkspacePaths(
 
 /** 构建 Pi Agent 的静态系统提示词。 */
 export function buildSystemPrompt(ctx: SystemPromptContext): string {
-  const userName = getUserProfile().userName || '用户'
+  /** 一次构建只选择一个完整依赖集合，禁止逐项回退到默认根。 */
+  const dependencies = ctx.dependencies ?? DEFAULT_SYSTEM_PROMPT_DEPENDENCIES
+  const userName = dependencies.getUserName()
   const workspace = ctx.workspaceSlug
     ? buildWorkspacePaths(
         ctx.workspaceSlug,
         ctx.sessionId,
         ctx.agentCwd,
         ctx.sessionWorkbenchLayout,
-        ctx.configRootResolver,
+        dependencies,
       )
     : undefined
   const sessionContextDir = workspace?.sessionContextDir ?? '.context'
@@ -149,7 +171,7 @@ ${agentsMaintenanceRequirement}
 只调研和规划。计划写入 \`${sessionContextDir}/plan/\`；先展示摘要并等待用户批准，再退出计划模式和执行。`
       : `## 计划模式
 进入计划模式时，计划文件写入 \`${sessionContextDir}/plan/\`（如 \`${sessionContextDir}/plan/my-plan.md\`），不要写到项目根。`,
-    buildGitAttributionPromptSection(isGitAttributionEnabled(getSettings().gitAttributionEnabled)),
+    buildGitAttributionPromptSection(dependencies.isGitAttributionEnabled()),
     '## 回复\n日常回复简洁直接；文本交付物需要完整时再展开。复杂任务中定期核对相关规则、记忆、Skills 与 Context。',
   ]
 

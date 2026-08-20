@@ -24,6 +24,19 @@ const wsl: WslStatus = {
 const bothShells = runtimeStatus({ gitBash, wsl, recommended: 'git-bash' })
 
 describe('Agent Windows Shell 运行环境', () => {
+  test('Given Electron 已解析活动数据根 When 构建 Agent 环境 Then 传递给 session-cleaner CLI', () => {
+    /** 模拟带空格的自定义业务数据根。 */
+    const configDir = '/Volumes/Work/Proma Data'
+    const result = buildAgentRuntimeEnv({
+      bundledCliPath: '/Applications/Proma.app/Contents/Resources/bin/proma',
+      configDir,
+      platform: 'darwin',
+      processEnv: {},
+    })
+
+    expect(result.env.PROMA_CONFIG_DIR).toBe(configDir)
+  })
+
   test('Given Git Bash 与 WSL 均可用 When 使用默认策略 Then 优先使用 Git Bash', () => {
     const result = buildAgentRuntimeEnv({
       bundledCliPath: '',

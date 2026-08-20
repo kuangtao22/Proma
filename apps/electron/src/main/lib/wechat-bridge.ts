@@ -392,28 +392,40 @@ class WeChatBridge {
   private static readonly PENDING_FILES_MAX = 15
   private pendingImagesCleanupTimer: ReturnType<typeof setInterval> | null = null
 
-  /** 通用命令处理器（命令路由 + Agent 消息路由 + EventBus 监听） */
-  private commandHandler = new BridgeCommandHandler({
-    platformName: '微信',
-    adapter: {
-      sendText: async (chatId: string, text: string, meta?: unknown) => {
-        if (!this.client) return
-        const ctx = meta as { contextToken?: string } | undefined
-        const contextToken = ctx?.contextToken ?? ''
-        // 微信单条消息有长度限制，超长分段
-        const MAX_LEN = 4000
-        const chunks = text.length <= MAX_LEN
-          ? [text]
-          : text.match(new RegExp(`.{1,${MAX_LEN}}`, 'gs')) ?? [text]
-        for (const chunk of chunks) {
-          await this.client.sendText(chatId, chunk, contextToken)
-        }
+  /** 通用命令处理器延迟到 Bridge 真正启用，避免模块导入抢跑访问离线数据根。 */
+  private commandHandler: BridgeCommandHandler | null = null
+
+  /**
+   * 首次业务调用时创建命令处理器并加载聊天绑定。
+   *
+   * @returns 当前进程复用的微信命令处理器。
+   */
+  private getCommandHandler(): BridgeCommandHandler {
+    if (this.commandHandler !== null) return this.commandHandler
+
+    this.commandHandler = new BridgeCommandHandler({
+      platformName: '微信',
+      adapter: {
+        sendText: async (chatId: string, text: string, meta?: unknown) => {
+          if (!this.client) return
+          const ctx = meta as { contextToken?: string } | undefined
+          const contextToken = ctx?.contextToken ?? ''
+          // 微信单条消息有长度限制，超长分段
+          const MAX_LEN = 4000
+          const chunks = text.length <= MAX_LEN
+            ? [text]
+            : text.match(new RegExp(`.{1,${MAX_LEN}}`, 'gs')) ?? [text]
+          for (const chunk of chunks) {
+            await this.client.sendText(chatId, chunk, contextToken)
+          }
+        },
       },
-    },
-    getDefaultWorkspaceId: () => getWeChatConfig().defaultWorkspaceId,
-    bindingStore: createJsonBridgeChatBindingStore(getWeChatBindingsPath(), '微信 Bridge'),
-    onWorkspaceSwitched: (workspaceId) => updateWeChatDefaultWorkspace(workspaceId),
-  })
+      getDefaultWorkspaceId: () => getWeChatConfig().defaultWorkspaceId,
+      bindingStore: createJsonBridgeChatBindingStore(getWeChatBindingsPath(), '微信 Bridge'),
+      onWorkspaceSwitched: (workspaceId) => updateWeChatDefaultWorkspace(workspaceId),
+    })
+    return this.commandHandler
+  }
 
   /** 获取当前状态 */
   getStatus(): WeChatBridgeState {
@@ -422,7 +434,7 @@ class WeChatBridge {
 
   /** 在删除项目时清理指向其会话的聊天绑定。 */
   removeBindingsForDeletedWorkspace(workspaceId: string, sessionIds: Iterable<string>): number {
-    return this.commandHandler.removeBindingsForDeletedWorkspace(workspaceId, sessionIds)
+    return this.getCommandHandler().removeBindingsForDeletedWorkspace(workspaceId, sessionIds)
   }
 
   /** 开始扫码登录流程 */
@@ -484,7 +496,7 @@ class WeChatBridge {
     this.pollAbortController = null
     this.client = null
     this.polling = false
-    this.commandHandler.unsubscribe()
+    this.commandHandler?.unsubscribe()
     if (this.pendingImagesCleanupTimer) {
       clearInterval(this.pendingImagesCleanupTimer)
       this.pendingImagesCleanupTimer = null
@@ -582,7 +594,7 @@ class WeChatBridge {
     this.loadSyncBuf()
 
     // 订阅 Agent EventBus 接收 Agent 回复
-    this.commandHandler.subscribe()
+    this.getCommandHandler().subscribe()
 
     // 定期清理过期的图片缓冲
     this.pendingImagesCleanupTimer = setInterval(() => this.cleanExpiredPendingImages(), PENDING_IMAGES_CLEANUP_INTERVAL)
@@ -814,7 +826,7 @@ class WeChatBridge {
 
     // 无媒体 → 原有纯文本路径
     if (allImages.length === 0 && allFiles.length === 0) {
-      await this.commandHandler.handleIncomingMessage(chatId, text, { contextToken })
+      await this.getCommandHandler().handleIncomingMessage(chatId, text, { contextToken })
       return
     }
 
@@ -826,12 +838,12 @@ class WeChatBridge {
       if (allFiles.length > 0) {
         this.pendingFiles.set(chatId, { files: allFiles, createdAt: Date.now() })
       }
-      await this.commandHandler.handleIncomingMessage(chatId, text, { contextToken })
+      await this.getCommandHandler().handleIncomingMessage(chatId, text, { contextToken })
       return
     }
 
     // 有媒体：先检查 session 是否正在运行
-    if (this.commandHandler.isSessionActive(chatId)) {
+    if (this.getCommandHandler().isSessionActive(chatId)) {
       if (allImages.length > 0) {
         this.pendingImages.set(chatId, { images: allImages, createdAt: Date.now() })
       }
@@ -843,7 +855,7 @@ class WeChatBridge {
     }
 
     // 确保 binding 存在，保存媒体到会话目录
-    const binding = this.commandHandler.ensureBinding(chatId)
+    const binding = this.getCommandHandler().ensureBinding(chatId)
     if (!binding) {
       await this.client.sendText(chatId, '请先在 Proma 设置中选择 Agent 渠道。', contextToken)
       return
@@ -881,7 +893,7 @@ class WeChatBridge {
       attachments.push({ absolutePath, label: file.fileName, kind: 'file' as const })
     }
 
-    await this.commandHandler.handleIncomingMessage(chatId, text, { contextToken }, attachments)
+    await this.getCommandHandler().handleIncomingMessage(chatId, text, { contextToken }, attachments)
   }
 
   // ===== 同步游标持久化 =====

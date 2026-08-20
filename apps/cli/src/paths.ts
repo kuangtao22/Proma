@@ -1,19 +1,18 @@
 /**
  * 会话存储路径解析（electron-free）。
  *
- * Proma 主进程用 config-paths.ts 里的 getConfigDir()，其中通过 require('electron')
- * 判断 isPackaged 来在 .proma / .proma-dev 间切换——CLI 没有 electron 运行时，
- * 因此这里独立实现一份等价逻辑：
- *   - 默认 ~/.proma
- *   - 环境变量 PROMA_DEV=1 → ~/.proma-dev
- *   - 显式 configDir 覆盖（CLI 的 --config-dir）优先级最高
+ * CLI 不依赖 Electron，通过固定 `~/.proma-location.json` 读取活动数据根。
+ * 优先级：显式 `--config-dir` > `PROMA_CONFIG_DIR` > 开发目录开关 >
+ * 固定 locator > 默认 `~/.proma`。locator 指向离线根时明确报错，不静默回退。
  *
  * 与 config-paths.ts 的目录布局保持一致：
  *   <configDir>/agent-sessions.json        会话索引
  *   <configDir>/agent-sessions/<id>.jsonl   单会话消息
  */
+import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
+import type { DataRootLocatorFile, DataRootMigrationRecord, DataRootMigrationStage } from '@proma/shared'
 
 export interface PathOptions {
   /** 显式指定配置目录（绝对路径）。优先级最高。 */
@@ -22,10 +21,112 @@ export interface PathOptions {
   dev?: boolean
 }
 
-export function resolveConfigDir(opts: PathOptions = {}): string {
+/** CLI 路径解析的进程依赖；测试按实例注入，避免修改全局环境。 */
+export interface PathResolutionContext {
+  /** 固定 locator 所在的用户 home。 */
+  homeDir: string
+  /** 当前 CLI 进程环境变量。 */
+  env: NodeJS.ProcessEnv
+}
+
+/** 支持的迁移阶段，仅用于校验 locator，不执行迁移状态机。 */
+const DATA_ROOT_MIGRATION_STAGES: ReadonlySet<DataRootMigrationStage> = new Set([
+  'pending', 'copying', 'verifying', 'rebasing', 'switching', 'failed',
+])
+
+/**
+ * 按固定优先级解析 CLI 业务配置根。
+ *
+ * @param opts 命令行显式路径选项。
+ * @param context home 与环境变量依赖；测试可注入独立实例。
+ * @returns 当前 CLI 应读取的业务数据根。
+ */
+export function resolveConfigDir(
+  opts: PathOptions = {},
+  context: PathResolutionContext = { homeDir: homedir(), env: process.env },
+): string {
   if (opts.configDir) return opts.configDir
-  const useDev = opts.dev || process.env.PROMA_DEV === '1'
-  return join(homedir(), useDev ? '.proma-dev' : '.proma')
+  if (context.env.PROMA_CONFIG_DIR) return context.env.PROMA_CONFIG_DIR
+
+  /** 保留既有 CLI 开发目录开关的显式覆盖语义。 */
+  const useDev = opts.dev || context.env.PROMA_DEV === '1'
+  if (useDev) return join(context.homeDir, '.proma-dev')
+
+  /** locator 位于可迁移数据根之外，因此离线时仍可读取。 */
+  const locatorPath = join(context.homeDir, '.proma-location.json')
+  if (!existsSync(locatorPath)) return join(context.homeDir, '.proma')
+
+  /** 只恢复 CLI 所需的活动根字段，不复制迁移执行状态机。 */
+  const locatorFile = readLocatorFile(locatorPath)
+  assertReadableDataRoot(locatorFile.activeRoot)
+  return locatorFile.activeRoot
+}
+
+/** 读取并严格校验固定 locator。 */
+function readLocatorFile(locatorPath: string): DataRootLocatorFile {
+  try {
+    /** JSON 先保持 unknown，校验通过后才作为路径使用。 */
+    const value: unknown = JSON.parse(readFileSync(locatorPath, 'utf-8'))
+    if (!isDataRootLocatorFile(value)) throw new Error('schema')
+    return value
+  } catch {
+    throw new Error('数据根定位文件无效')
+  }
+}
+
+/** locator 存在时必须使用其活动根；离线或权限不足均不回退。 */
+function assertReadableDataRoot(root: string): void {
+  try {
+    if (!statSync(root).isDirectory()) throw new Error('not-directory')
+    accessSync(root, constants.R_OK | constants.X_OK)
+  } catch {
+    throw new Error('数据根不可用')
+  }
+}
+
+/** 校验 CLI 会消费的 locator v1 完整结构。 */
+function isDataRootLocatorFile(value: unknown): value is DataRootLocatorFile {
+  if (!isRecord(value) || value.version !== 1 || !isAbsolutePath(value.activeRoot)) return false
+  if (value.previousRoot !== undefined && !isAbsolutePath(value.previousRoot)) return false
+  return value.migration === undefined
+    || (isDataRootMigrationRecord(value.migration) && value.migration.sourceRoot === value.activeRoot)
+}
+
+/** 校验 locator 中可选迁移记录，CLI 仅验证而不推进阶段。 */
+function isDataRootMigrationRecord(value: unknown): value is DataRootMigrationRecord {
+  if (!isRecord(value)) return false
+  return isNonEmptyString(value.id)
+    && isAbsolutePath(value.sourceRoot)
+    && isAbsolutePath(value.targetRoot)
+    && typeof value.stage === 'string'
+    && DATA_ROOT_MIGRATION_STAGES.has(value.stage as DataRootMigrationStage)
+    && isNonNegativeFiniteNumber(value.completedBytes)
+    && isNonNegativeFiniteNumber(value.totalBytes)
+    && value.completedBytes <= value.totalBytes
+    && isNonNegativeFiniteNumber(value.startedAt)
+    && isNonNegativeFiniteNumber(value.updatedAt)
+    && value.updatedAt >= value.startedAt
+    && (value.error === undefined || typeof value.error === 'string')
+}
+
+/** 判断 unknown 是否为可按键访问的普通对象。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** 判断 unknown 是否为非空字符串。 */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+/** 判断 unknown 是否为绝对路径字符串。 */
+function isAbsolutePath(value: unknown): value is string {
+  return isNonEmptyString(value) && isAbsolute(value)
+}
+
+/** 判断 unknown 是否为有限非负数。 */
+function isNonNegativeFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }
 
 export function getSessionsIndexPath(opts: PathOptions = {}): string {

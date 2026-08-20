@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import * as os from 'node:os'
 import { join } from 'node:path'
+import { DataRootLocator } from './data-root-locator'
 
 type AgentSessionManager = typeof import('./agent-session-manager')
 type AgentSessionContextPrompt = typeof import('./agent-session-context-prompt')
@@ -565,6 +566,52 @@ describe('Pi entry binding recovery', () => {
 })
 
 describe('Agent 会话引用 prompt', () => {
+  test('Given 自定义数据根 When 构建恢复提示 Then History 与 CLI 参数使用同一绝对根', () => {
+    /** 模拟带空格的活动数据根。 */
+    const customRoot = join(tempHome, 'Proma Data')
+    /** 模拟随应用分发的 CLI，使提示词进入 session-cleaner 分支。 */
+    const bundledCliPath = join(tempHome, 'bin', 'proma')
+    mkdirSync(customRoot, { recursive: true })
+    mkdirSync(join(tempHome, 'bin'), { recursive: true })
+    writeFileSync(bundledCliPath, '', 'utf-8')
+    writeFileSync(
+      join(tempHome, '.proma-location.json'),
+      JSON.stringify({ version: 1, activeRoot: customRoot }),
+      'utf-8',
+    )
+
+    /** 独立 locator 保证提示词路径与工作区数据根一致。 */
+    const configRootResolver = new DataRootLocator({ homeDir: tempHome })
+    const processWithResourcesPath = process as NodeJS.Process & { resourcesPath?: string }
+    const originalResourcesPath = processWithResourcesPath.resourcesPath
+    Object.defineProperty(processWithResourcesPath, 'resourcesPath', {
+      value: tempHome,
+      configurable: true,
+      writable: true,
+    })
+    try {
+      /** 使用真实恢复提示入口验证 raw History 与推荐命令。 */
+      const prompt = contextPrompt.buildRecoveryPrompt(
+        'session-1',
+        '继续任务',
+        { agentCwd: customRoot, workspaceSlug: 'proma', configRootResolver },
+      )
+
+      expect(prompt).toContain(join(customRoot, 'agent-sessions', 'session-1.jsonl'))
+      expect(prompt).toContain(`--config-dir "${customRoot}"`)
+      expect(prompt).not.toContain('~/.proma/agent-sessions')
+    } finally {
+      Object.defineProperty(processWithResourcesPath, 'resourcesPath', {
+        value: originalResourcesPath,
+        configurable: true,
+        writable: true,
+      })
+      rmSync(join(tempHome, '.proma-location.json'), { force: true })
+      rmSync(customRoot, { recursive: true, force: true })
+      rmSync(join(tempHome, 'bin'), { recursive: true, force: true })
+    }
+  })
+
   test('Given 用户显式引用跨工作区会话 When 构建发送 prompt Then 保留该会话上下文', () => {
     writeAgentSessionsIndex([
       { id: 'current-session', title: '当前工作区会话', workspaceId: 'workspace-a', createdAt: 1, updatedAt: 1 },
@@ -573,7 +620,11 @@ describe('Agent 会话引用 prompt', () => {
 
     const processWithResourcesPath = process as NodeJS.Process & { resourcesPath?: string }
     const originalResourcesPath = processWithResourcesPath.resourcesPath
-    processWithResourcesPath.resourcesPath = tempHome
+    Object.defineProperty(processWithResourcesPath, 'resourcesPath', {
+      value: tempHome,
+      configurable: true,
+      writable: true,
+    })
     try {
       const prompt = contextPrompt.buildReferencedSessionsPrompt(
         'current-session',

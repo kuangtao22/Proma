@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs'
 import { delimiter, dirname, join, win32 } from 'node:path'
 import type { RuntimeStatus, WindowsShellPreference } from '@proma/shared'
-import { getBundledCliPath } from './config-paths'
+import { getBundledCliPath, getConfigDir } from './config-paths'
 import { selectWindowsShell, type WindowsShellKind } from './windows-shell-selection'
 
 export type AgentRuntimeShellKind = WindowsShellKind
@@ -19,6 +19,8 @@ export interface BuildAgentRuntimeEnvOptions {
   runtimeStatus?: RuntimeStatus | null
   windowsShellPreference?: WindowsShellPreference
   bundledCliPath?: string
+  /** Electron 已解析的活动业务数据根；供随应用分发的 CLI 使用。 */
+  configDir?: string
   processEnv?: NodeJS.ProcessEnv
   platform?: NodeJS.Platform
   pathDelimiter?: string
@@ -33,6 +35,7 @@ const CASE_INSENSITIVE_MERGE_KEYS = new Set([
   'all_proxy',
   'no_proxy',
   'proma_cli',
+  'proma_config_dir',
   'claude_code_shell',
   'shell',
   'proma_windows_shell',
@@ -190,6 +193,8 @@ export function buildAgentRuntimeEnv(options: BuildAgentRuntimeEnvOptions = {}):
 
   if (bundledCliPath) {
     env.PROMA_CLI = bundledCliPath
+    /** 仅存在随应用 CLI 时解析业务根，避免无关环境探测产生路径副作用。 */
+    env.PROMA_CONFIG_DIR = options.configDir ?? getConfigDir()
   }
 
   const pathKey = getPathKey(processEnv)
