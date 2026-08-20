@@ -28,6 +28,7 @@ import {
 } from './verified-directory-copy-filesystem'
 import {
   getDirectoryCopySidecarPath,
+  inspectDirectoryCopyOwnership,
   prepareDirectoryCopySidecar,
 } from './verified-directory-copy-sidecar'
 
@@ -113,6 +114,21 @@ export interface CopyDirectoryResult {
   verifiedFiles: number
   reusedFiles: number
   totalBytes: number
+}
+
+/** 只读计算断点恢复所需空间的输入。 */
+export interface InspectDirectoryCopySpaceInput {
+  migrationId: string
+  sourceRoot: string
+  targetRoot: string
+  signal?: AbortSignal
+}
+
+/** 已验证目标复用情况与仍需写入的普通文件字节。 */
+export interface DirectoryCopySpace {
+  totalBytes: number
+  reusableBytes: number
+  remainingBytes: number
 }
 
 /** 流式复制目录树并逐文件校验，成功后保留树外 sidecar 等待 finalize。 */
@@ -201,6 +217,64 @@ export async function copyDirectoryVerified(input: CopyDirectoryInput): Promise<
   } finally {
     executionController.abort()
     input.signal?.removeEventListener('abort', abortExecution)
+  }
+}
+
+/** 只读复验 owned sidecar 与实际目标文件，计算恢复时仍需写入的字节。 */
+export async function inspectDirectoryCopySpace(
+  input: InspectDirectoryCopySpaceInput,
+): Promise<DirectoryCopySpace> {
+  throwIfAborted(input.signal)
+  /** 调用方路径用于 sidecar 严格归属验证。 */
+  const requestedSourceRoot = resolve(input.sourceRoot)
+  const requestedTargetRoot = resolve(input.targetRoot)
+  /** sidecar 相对本次迁移参数的只读归属判定。 */
+  const ownership = await inspectDirectoryCopyOwnership({
+    migrationId: input.migrationId,
+    sourceRoot: requestedSourceRoot,
+    targetRoot: requestedTargetRoot,
+  })
+  if (ownership !== 'owned') throw new Error('目标副本不属于当前迁移')
+  /** 源根必须是 no-follow 实际目录。 */
+  const sourceStats = await lstat(requestedSourceRoot, { bigint: true })
+  if (!sourceStats.isDirectory()) throw new Error('复制源根必须是实际目录')
+  /** 解析符号链接后的规范源根路径。 */
+  const canonicalSourceRoot = await realpath(requestedSourceRoot)
+  /** 目标根在断点恢复阶段必须已经存在且为实际目录。 */
+  const targetStats = await lstat(requestedTargetRoot, { bigint: true })
+  if (!targetStats.isDirectory()) throw new Error('复制目标根必须是实际目录')
+  /** 目标根的路径与 inode 身份，用于防止扫描期间被替换。 */
+  const targetRootIdentity = await captureDirectoryIdentity(requestedTargetRoot)
+  validateRootRelationship(canonicalSourceRoot, targetRootIdentity.canonicalPath)
+  /** 与正式复制相同的源清单和目标 no-follow 快照。 */
+  const manifest = await scanDirectory(canonicalSourceRoot, input.signal)
+  const snapshot = await scanTargetTree(targetRootIdentity, input.signal)
+  /** 按相对路径索引的目标树 no-follow 快照。 */
+  const targetEntries = new Map(snapshot.entries.map((entry) => [entry.relativePath, entry]))
+  /** 统一后的取消信号，确保哈希与校验路径始终可中断。 */
+  const signal = input.signal ?? new AbortController().signal
+  /** 经大小、哈希和父目录身份共同验证后可复用的累计字节数。 */
+  let reusableBytes = 0
+  for (const entry of manifest.leaves) {
+    if (entry.kind !== 'file') continue
+    throwIfAborted(signal)
+    /** 与当前源文件相同相对路径的目标快照项。 */
+    const targetEntry = targetEntries.get(entry.relativePath)
+    if (targetEntry?.kind !== 'file') continue
+    /** 目标文件父目录在扫描时记录的稳定身份。 */
+    const parentIdentity = snapshot.directoryIdentities.get(relativeParent(entry.relativePath))
+    if (!parentIdentity) continue
+    /** 当前源文件内容哈希，用于判断目标文件是否可安全复用。 */
+    const sourceHash = await hashManifestFile(entry, signal)
+    if (!await isVerifiedTargetFile(targetEntry.path, parentIdentity, entry, sourceHash, signal)) continue
+    reusableBytes += entry.size
+    if (!Number.isSafeInteger(reusableBytes)) throw new Error('可复用字节数超过安全整数范围')
+  }
+  await assertDirectoryIdentity(targetRootIdentity)
+  return {
+    totalBytes: manifest.totalBytes,
+    reusableBytes,
+    remainingBytes: manifest.totalBytes - reusableBytes,
   }
 }
 

@@ -26,6 +26,7 @@ import {
   getDirectoryCopySidecarPath,
   hashFile,
   inspectDirectoryCopyOwnership,
+  inspectDirectoryCopySpace,
   type CopyDirectoryResult,
 } from './verified-directory-copier'
 
@@ -205,6 +206,30 @@ describe('verified-directory-copier', () => {
       sourceRoot: fixture.sourceRoot,
       targetRoot: fixture.targetRoot,
     })).resolves.toBe('absent')
+  })
+
+  test('Given owned sidecar 与部分可复用目标 When 检查剩余空间 Then 只计算尚未验证的普通文件字节', async () => {
+    const fixture = createFixture(testRoot)
+    writeFileSync(join(fixture.sourceRoot, 'reused.bin'), '1234')
+    writeFileSync(join(fixture.sourceRoot, 'pending.bin'), '123456')
+    mkdirSync(fixture.targetRoot)
+    writeFileSync(join(fixture.targetRoot, 'reused.bin'), '1234')
+    writeFileSync(getSidecarPath(fixture.targetRoot), JSON.stringify({
+      version: 1,
+      migrationId: 'migration-current',
+      sourceRoot: resolve(fixture.sourceRoot),
+      targetRoot: resolve(fixture.targetRoot),
+    }))
+
+    await expect(inspectDirectoryCopySpace({
+      migrationId: 'migration-current',
+      sourceRoot: fixture.sourceRoot,
+      targetRoot: fixture.targetRoot,
+    })).resolves.toEqual({
+      totalBytes: 10,
+      reusableBytes: 4,
+      remainingBytes: 6,
+    })
   })
 
   test('Given 空源目录与经符号链接父目录指回源的目标别名 When 复制 Then copier 自身拒绝物理同路径', async () => {

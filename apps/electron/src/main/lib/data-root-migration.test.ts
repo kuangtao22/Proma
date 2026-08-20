@@ -68,6 +68,21 @@ describe('DataRootMigrationCoordinator', () => {
     })
   })
 
+  test('Given coordinator 已持有 pending lease When 重复创建计划失败 Then 不释放原有 lease', async () => {
+    const holder = createHarness({ isPidRunning: () => true })
+    await holder.coordinator.createPlan(targetRoot)
+
+    await expect(holder.coordinator.createPlan(join(homeDir, 'other-target'))).rejects.toThrow()
+
+    expect(existsSync(holder.lockPath)).toBe(true)
+    const contender = createHarness({ isPidRunning: () => true })
+    await expect(contender.coordinator.createPlan(join(homeDir, 'contender-target'))).rejects.toMatchObject({
+      code: 'MIGRATION_LOCKED',
+    })
+    await holder.coordinator.cancel()
+    expect(existsSync(holder.lockPath)).toBe(false)
+  })
+
   test('Given pending 迁移 When 完整运行 Then 按阶段切换并在 commit 后 finalize', async () => {
     const stages: string[] = []
     let harness: TestHarness
@@ -234,7 +249,7 @@ describe('DataRootMigrationCoordinator', () => {
     }
   })
 
-  test('Given commit 后 finalize 失败 When 本次结束和下次恢复 Then 不回滚并幂等清理', async () => {
+  test('Given commit 后 finalize 失败 When 状态查询和新实例启动 Then 公开错误并自动重试清理', async () => {
     let finalizeAttempts = 0
     const first = createHarness({
       finalizeCopy: async () => {
@@ -244,20 +259,52 @@ describe('DataRootMigrationCoordinator', () => {
     })
     await first.coordinator.createPlan(targetRoot)
 
-    await first.coordinator.runPending()
+    await expect(first.coordinator.runPending()).rejects.toMatchObject({ code: 'CLEANUP_FAILED' })
 
     expect(first.locator.requireActiveRoot()).toBe(targetRoot)
     expect(first.locator.inspect().locatorFile?.migration).toBeUndefined()
     expect(first.locator.inspect().locatorFile?.postCommitCleanup).toBeDefined()
+    expect(first.coordinator.getStatus()).toMatchObject({
+      postCommitCleanup: {
+        migrationId: 'migration-1',
+        status: 'failed',
+        error: '清理迁移断点失败',
+      },
+    })
 
     const second = createHarness({
       locator: first.locator,
       finalizeCopy: async () => { finalizeAttempts += 1 },
     })
-    await second.coordinator.resumePending()
+    await waitForCondition(() => finalizeAttempts === 2)
 
     expect(finalizeAttempts).toBe(2)
     expect(second.locator.inspect().locatorFile?.postCommitCleanup).toBeUndefined()
+  })
+
+  test('Given cleanup 自动重试仍失败 When 创建新计划 Then 返回明确可操作错误且不覆盖 cleanup', async () => {
+    const locator = new DataRootLocator({ homeDir })
+    locator.write({
+      version: 1,
+      activeRoot: sourceRoot,
+      postCommitCleanup: {
+        migrationId: 'cleanup-migration',
+        targetRoot: sourceRoot,
+      },
+    })
+    const harness = createHarness({
+      locator,
+      finalizeCopy: async () => { throw new Error('sidecar locked') },
+    })
+    await waitForCondition(() => harness.finalizeCalls.length >= 1)
+
+    await expect(harness.coordinator.createPlan(targetRoot)).rejects.toMatchObject({ code: 'CLEANUP_FAILED' })
+
+    expect(locator.inspect().locatorFile?.postCommitCleanup).toMatchObject({
+      migrationId: 'cleanup-migration',
+      error: '清理迁移断点失败',
+    })
+    expect(locator.inspect().locatorFile?.migration).toBeUndefined()
   })
 
   test('Given copying 进行中 When 取消 Then 中止复制、清除记录并保持源根', async () => {
@@ -376,6 +423,28 @@ describe('DataRootMigrationCoordinator', () => {
     expect(harness.copyCalls).toEqual([])
     expect(harness.locator.requireActiveRoot()).toBe(sourceRoot)
     expect(harness.locator.inspect().locatorFile?.migration?.stage).toBe('failed')
+  })
+
+  test('Given copying 断点已有可验证复用文件 When 剩余空间足够 Then 按 remainingBytes 恢复', async () => {
+    let capacityChecks = 0
+    const harness = createHarness({
+      getAvailableBytes: async () => {
+        capacityChecks += 1
+        return capacityChecks === 1 ? 1_000_000 : 0
+      },
+      inspectCopySpace: async () => ({
+        totalBytes: 16,
+        reusableBytes: 16,
+        remainingBytes: 0,
+      }),
+    })
+    await harness.coordinator.createPlan(targetRoot)
+    harness.locator.updateMigration('migration-1', { stage: 'copying', updatedAt: 1_001 })
+
+    await harness.coordinator.runPending()
+
+    expect(harness.copyCalls).toHaveLength(1)
+    expect(harness.locator.requireActiveRoot()).toBe(targetRoot)
   })
 
   test('Given plan 后目标父目录变为 source 物理 alias When run 复检 Then 不复制也不切换', async () => {
@@ -565,6 +634,18 @@ describe('DataRootMigrationCoordinator', () => {
     expect(progressWrites).toBeLessThan(4)
   })
 
+  test('Given observer 在阶段和文件进度回调中抛错 When 运行迁移 Then 事务仍完成且不误报 locator 失败', async () => {
+    const harness = createHarness()
+    await harness.coordinator.createPlan(targetRoot)
+
+    await harness.coordinator.runPending(() => {
+      throw new Error('observer disconnected')
+    })
+
+    expect(harness.locator.requireActiveRoot()).toBe(targetRoot)
+    expect(harness.locator.inspect().locatorFile?.migration).toBeUndefined()
+  })
+
   test('Given locator 阶段写入失败 When 运行 Then 不会继续到 rebase 或切换', async () => {
     const harness = createHarness()
     await harness.coordinator.createPlan(targetRoot)
@@ -660,6 +741,19 @@ describe('DataRootMigrationCoordinator', () => {
     expect(harness.locator.requireActiveRoot()).toBe(targetRoot)
   })
 
+  test('Given 源目录包含 FIFO When 创建计划 Then no-follow 扫描立即拒绝特殊文件', async () => {
+    if (process.platform === 'win32') return
+    const fifoPath = join(sourceRoot, 'events.fifo')
+    const created = Bun.spawnSync(['mkfifo', fifoPath])
+    if (created.exitCode !== 0) return
+    const harness = createHarness()
+
+    await expect(harness.coordinator.createPlan(targetRoot)).rejects.toMatchObject({ code: 'INVALID_SOURCE' })
+
+    expect(harness.locator.inspect().locatorFile?.migration).toBeUndefined()
+    expect(existsSync(targetRoot)).toBe(false)
+  })
+
   /** 按顺序生成可断言的锁 owner token，调用超出预期时立即失败。 */
   function createTokenSequence(tokens: readonly string[]): () => string {
     let index = 0
@@ -669,6 +763,15 @@ describe('DataRootMigrationCoordinator', () => {
       if (!token) throw new Error('锁 owner token 调用次数超出测试预期')
       return token
     }
+  }
+
+  /** 等待构造阶段启动的 cleanup 自动重试完成。 */
+  async function waitForCondition(condition: () => boolean): Promise<void> {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (condition()) return
+      await Bun.sleep(2)
+    }
+    throw new Error('等待异步条件超时')
   }
 
   /** 创建使用真实 locator、可替换执行依赖的协调器。 */
@@ -707,6 +810,11 @@ describe('DataRootMigrationCoordinator', () => {
         await finalizeOverride?.(input)
       },
       inspectCopyOwnership: overrides.inspectCopyOwnership ?? (async () => 'owned'),
+      inspectCopySpace: overrides.inspectCopySpace ?? (async () => ({
+        totalBytes: 16,
+        reusableBytes: 0,
+        remainingBytes: 16,
+      })),
       progressPersistIntervalMs: overrides.progressPersistIntervalMs ?? 250,
     }
     return {

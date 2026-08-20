@@ -249,6 +249,21 @@ describe('DataRootLocator', () => {
         targetRoot,
       },
     })
+    expect(locator.inspect().state.postCommitCleanup).toEqual({
+      migrationId: 'migration-2',
+      targetRoot,
+      status: 'pending',
+    })
+
+    locator.updatePostCommitCleanupError('migration-2', '清理迁移断点失败')
+    expect(locator.inspect().state.postCommitCleanup).toEqual({
+      migrationId: 'migration-2',
+      targetRoot,
+      status: 'failed',
+      error: '清理迁移断点失败',
+    })
+    locator.updatePostCommitCleanupError('migration-2')
+    expect(locator.inspect().state.postCommitCleanup?.status).toBe('pending')
 
     locator.clearPostCommitCleanup('migration-2')
     expect(JSON.parse(readFileSync(locator.getLocatorPath(), 'utf-8'))).toEqual({

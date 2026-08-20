@@ -22,12 +22,19 @@ import type {
   PathManagementState,
 } from '@proma/shared'
 import { DataRootLocator } from './data-root-locator'
-import type { CopyDirectoryInput, CopyDirectoryResult } from './verified-directory-copier'
-import type { DirectoryCopyOwnership, InspectDirectoryCopyOwnershipInput } from './verified-directory-copier'
+import type {
+  CopyDirectoryInput,
+  CopyDirectoryResult,
+  DirectoryCopyOwnership,
+  DirectoryCopySpace,
+  InspectDirectoryCopyOwnershipInput,
+  InspectDirectoryCopySpaceInput,
+} from './verified-directory-copier'
 import {
   copyDirectoryVerified,
   finalizeDirectoryCopy,
   inspectDirectoryCopyOwnership,
+  inspectDirectoryCopySpace,
 } from './verified-directory-copier'
 import type { RebaseDataRootOwnedPathsInput, RebaseDataRootOwnedPathsResult } from './owned-path-rebaser'
 import { rebaseDataRootOwnedPaths } from './owned-path-rebaser'
@@ -43,6 +50,7 @@ export type DataRootMigrationErrorCode =
   | 'MIGRATION_BUSY'
   | 'COPY_FAILED'
   | 'REBASE_FAILED'
+  | 'CLEANUP_FAILED'
   | 'LOCATOR_WRITE_FAILED'
 
 /** 对外仅暴露稳定摘要，底层异常保留在 cause。 */
@@ -70,6 +78,7 @@ export interface DataRootMigrationCoordinatorOptions {
   rebaseOwnedPaths?: (input: RebaseDataRootOwnedPathsInput) => RebaseDataRootOwnedPathsResult
   finalizeCopy?: (input: { migrationId: string; targetRoot: string }) => Promise<void>
   inspectCopyOwnership?: (input: InspectDirectoryCopyOwnershipInput) => Promise<DirectoryCopyOwnership>
+  inspectCopySpace?: (input: InspectDirectoryCopySpaceInput) => Promise<DirectoryCopySpace>
   progressPersistIntervalMs?: number
 }
 
@@ -102,6 +111,7 @@ interface MigrationPreflightOptions {
   expectedSourceRoot?: string
   requireOwnedSidecar?: boolean
   checkSpace?: boolean
+  checkRemainingSpace?: boolean
 }
 
 /** 数据根迁移协调器：先复制与重写，最后原子切换 locator。 */
@@ -130,6 +140,8 @@ export class DataRootMigrationCoordinator {
   private readonly inspectCopyOwnership: (
     input: InspectDirectoryCopyOwnershipInput,
   ) => Promise<DirectoryCopyOwnership>
+  /** Task3 只读校验实际可复用文件并计算剩余写入字节。 */
+  private readonly inspectCopySpace: (input: InspectDirectoryCopySpaceInput) => Promise<DirectoryCopySpace>
   /** 高频进度允许落盘的最短时间间隔。 */
   private readonly progressPersistIntervalMs: number
   /** 当前进程是否持有锁文件。 */
@@ -138,6 +150,8 @@ export class DataRootMigrationCoordinator {
   private activeRun: Promise<void> | null = null
   /** copying 阶段使用的取消控制器。 */
   private activeRunToken: MigrationRunToken | null = null
+  /** 构造后自动触发一次 post-commit cleanup 重试，公开方法会等待它结束。 */
+  private readonly startupCleanupRetry: Promise<void> | null
 
   constructor(options: DataRootMigrationCoordinatorOptions) {
     this.locator = options.locator
@@ -151,11 +165,21 @@ export class DataRootMigrationCoordinator {
     this.rebaseOwnedPaths = options.rebaseOwnedPaths ?? rebaseDataRootOwnedPaths
     this.finalizeCopy = options.finalizeCopy ?? finalizeDirectoryCopy
     this.inspectCopyOwnership = options.inspectCopyOwnership ?? inspectDirectoryCopyOwnership
+    this.inspectCopySpace = options.inspectCopySpace ?? inspectDirectoryCopySpace
     this.progressPersistIntervalMs = options.progressPersistIntervalMs ?? 250
     if (!isAbsolute(this.lockPath)) throw new Error('迁移锁路径必须是绝对路径')
     if (!Number.isFinite(this.progressPersistIntervalMs) || this.progressPersistIntervalMs < 0) {
       throw new Error('进度持久化间隔必须是非负有限数')
     }
+    this.startupCleanupRetry = this.locator.inspect().locatorFile?.postCommitCleanup === undefined
+      ? null
+      : Promise.resolve().then(async () => {
+          try {
+            await this.retryCommittedCleanupOnStartup()
+          } catch {
+            // 后台重试错误已持久化到公开 cleanup 状态，由后续显式操作返回可处理错误。
+          }
+        })
   }
 
   /** 无副作用返回 locator 当前状态。 */
@@ -171,8 +195,11 @@ export class DataRootMigrationCoordinator {
    */
   async createPlan(targetRoot: string): Promise<DataRootMigrationProgress> {
     if (this.activeRun !== null) throw new DataRootMigrationError('MIGRATION_BUSY', '数据根迁移正在运行')
-    this.acquireLock()
+    if (this.startupCleanupRetry) await this.startupCleanupRetry
+    /** 标记本次规划调用是否新建 lease，避免释放已有待执行计划持有的 lease。 */
+    const acquiredLease = this.acquireLock()
     try {
+      await this.cleanupCommittedMigration()
       const migrationId = this.createMigrationId()
       const preflight = await this.preflight(targetRoot, migrationId)
       const timestamp = this.now()
@@ -189,7 +216,7 @@ export class DataRootMigrationCoordinator {
       this.locator.beginMigration(migration)
       return toProgress(migration)
     } catch (error) {
-      this.releaseLock()
+      if (acquiredLease) this.releaseLock()
       throw error
     }
   }
@@ -241,6 +268,7 @@ export class DataRootMigrationCoordinator {
     token: MigrationRunToken,
     onProgress: (progress: DataRootMigrationProgress) => void,
   ): Promise<void> {
+    if (this.startupCleanupRetry) await this.startupCleanupRetry
     this.acquireLock()
     try {
       await this.cleanupCommittedMigration()
@@ -252,6 +280,7 @@ export class DataRootMigrationCoordinator {
           expectedSourceRoot: migration.sourceRoot,
           requireOwnedSidecar: ['verifying', 'rebasing', 'switching'].includes(migration.stage),
           checkSpace: ['pending', 'failed', 'copying'].includes(migration.stage),
+          checkRemainingSpace: ['failed', 'copying'].includes(migration.stage),
         }, token)
         if (
           ['pending', 'failed', 'copying'].includes(migration.stage)
@@ -292,18 +321,19 @@ export class DataRootMigrationCoordinator {
             signal: token.controller.signal,
             onProgress: (progress) => {
               observedBytes = Math.max(observedBytes, Math.min(migration!.totalBytes, progress.completedBytes))
-              onProgress({
+              const publicProgress: DataRootMigrationProgress = {
                 ...progress,
                 stage: 'copying',
                 completedBytes: observedBytes,
                 totalBytes: migration!.totalBytes,
-              })
+              }
               const currentTime = this.now()
               if (observedBytes > persistedBytes && currentTime - lastPersistedAt >= this.progressPersistIntervalMs) {
                 this.locator.updateMigration(migration!.id, { completedBytes: observedBytes, updatedAt: currentTime })
                 persistedBytes = observedBytes
                 lastPersistedAt = currentTime
               }
+              this.notifyProgress(onProgress, publicProgress)
             },
           })
           this.throwIfCancelled(token)
@@ -396,17 +426,33 @@ export class DataRootMigrationCoordinator {
     stage: DataRootMigrationStage,
     onProgress: (progress: DataRootMigrationProgress) => void,
   ): DataRootMigrationRecord {
+    /** 已成功持久化的新迁移记录。 */
+    let updated: DataRootMigrationRecord
     try {
       const result = this.locator.updateMigration(migration.id, {
         stage,
         updatedAt: Math.max(this.now(), migration.updatedAt),
       })
-      const updated = result.locatorFile?.migration
-      if (!updated) throw new Error('迁移阶段写入后记录缺失')
-      onProgress(toProgress(updated))
-      return updated
+      /** 从 locator 回读的持久化迁移记录。 */
+      const persisted = result.locatorFile?.migration
+      if (!persisted) throw new Error('迁移阶段写入后记录缺失')
+      updated = persisted
     } catch (error) {
       throw this.persistFailure(migration.id, '保存迁移阶段失败', 'LOCATOR_WRITE_FAILED', error)
+    }
+    this.notifyProgress(onProgress, toProgress(updated))
+    return updated
+  }
+
+  /** observer/IPC 通知属于 best-effort，不参与 locator 与迁移事务成败。 */
+  private notifyProgress(
+    onProgress: (progress: DataRootMigrationProgress) => void,
+    progress: DataRootMigrationProgress,
+  ): void {
+    try {
+      onProgress(progress)
+    } catch {
+      // observer 生命周期独立于迁移事务，断连或消费异常不应回滚已持久化状态。
     }
   }
 
@@ -455,15 +501,37 @@ export class DataRootMigrationCoordinator {
     return new DataRootMigrationError(code, message, cause)
   }
 
-  /** commit 已成功时清理 sidecar；清理失败只保留意图，不回滚或标记失败。 */
+  /** 构造阶段自动重试遗留 cleanup，并独占本次新建的实例 lease。 */
+  private async retryCommittedCleanupOnStartup(): Promise<void> {
+    if (!this.locator.inspect().locatorFile?.postCommitCleanup) return
+    /** 标记启动清理是否新建 lease，避免误释放同实例已有 lease。 */
+    const acquiredLease = this.acquireLock()
+    try {
+      await this.cleanupCommittedMigration()
+    } finally {
+      if (acquiredLease) this.releaseLock()
+    }
+  }
+
+  /** commit 已成功时清理 sidecar；失败公开持久化并返回可处理错误。 */
   private async cleanupCommittedMigration(): Promise<void> {
     const cleanup = this.locator.inspect().locatorFile?.postCommitCleanup
     if (!cleanup) return
     try {
+      this.locator.updatePostCommitCleanupError(cleanup.migrationId)
       await this.finalizeCopy({ migrationId: cleanup.migrationId, targetRoot: cleanup.targetRoot })
       this.locator.clearPostCommitCleanup(cleanup.migrationId)
-    } catch {
-      // 活动根已经提交；保留 cleanup record 供下次启动幂等重试。
+    } catch (error) {
+      try {
+        this.locator.updatePostCommitCleanupError(cleanup.migrationId, '清理迁移断点失败')
+      } catch (locatorError) {
+        throw new DataRootMigrationError('LOCATOR_WRITE_FAILED', '保存迁移清理错误失败', locatorError)
+      }
+      throw new DataRootMigrationError(
+        'CLEANUP_FAILED',
+        '迁移已完成，但清理断点失败；请重试后再创建新迁移',
+        error,
+      )
     }
   }
 
@@ -540,6 +608,35 @@ export class DataRootMigrationCoordinator {
       }
       if (token) this.throwIfCancelled(token)
     }
+    /** 当前阶段实际仍需写入目标磁盘的字节数。 */
+    let requiredBytes = totalBytes
+    if (options.checkSpace !== false && options.checkRemainingSpace && ownership === 'owned') {
+      /** sidecar 与目标文件复验得到的空间占用明细。 */
+      let copySpace: DirectoryCopySpace
+      try {
+        copySpace = await this.inspectCopySpace({
+          migrationId,
+          sourceRoot,
+          targetRoot: normalizedTarget,
+          ...(token === undefined ? {} : { signal: token.controller.signal }),
+        })
+      } catch (error) {
+        throw new DataRootMigrationError('COPY_FAILED', '无法验证断点可复用数据', error)
+      }
+      if (
+        !Number.isSafeInteger(copySpace.totalBytes)
+        || !Number.isSafeInteger(copySpace.reusableBytes)
+        || !Number.isSafeInteger(copySpace.remainingBytes)
+        || copySpace.totalBytes !== totalBytes
+        || copySpace.reusableBytes < 0
+        || copySpace.remainingBytes < 0
+        || copySpace.reusableBytes + copySpace.remainingBytes !== copySpace.totalBytes
+      ) {
+        throw new DataRootMigrationError('COPY_FAILED', '断点空间估算结果无效')
+      }
+      requiredBytes = copySpace.remainingBytes
+      if (token) this.throwIfCancelled(token)
+    }
     if (options.checkSpace !== false) {
       let availableBytes: number
       try {
@@ -548,20 +645,20 @@ export class DataRootMigrationCoordinator {
         throw new DataRootMigrationError('TARGET_NOT_WRITABLE', '无法读取目标磁盘可用空间', error)
       }
       if (token) this.throwIfCancelled(token)
-      if (!Number.isFinite(availableBytes) || availableBytes < totalBytes) {
+      if (!Number.isSafeInteger(availableBytes) || availableBytes < 0 || availableBytes < requiredBytes) {
         throw new DataRootMigrationError('INSUFFICIENT_SPACE', '目标磁盘可用空间不足')
       }
     }
     return { sourceRoot: resolve(sourceRoot), targetRoot: normalizedTarget, totalBytes }
   }
 
-  /** open(wx) 建立进程锁，仅确认 PID 不存在时删除陈旧锁。 */
-  private acquireLock(): void {
-    if (this.lockOwnerToken !== null) return
+  /** open(wx) 建立进程锁，返回本次调用是否新建 lease。 */
+  private acquireLock(): boolean {
+    if (this.lockOwnerToken !== null) return false
     const ownerToken = this.createLockOwnerToken()
     if (tryCreateMigrationLock(this.lockPath, ownerToken, this.now())) {
       this.lockOwnerToken = ownerToken
-      return
+      return true
     }
 
     const recoveryPath = `${this.lockPath}.recover`
@@ -581,6 +678,7 @@ export class DataRootMigrationCoordinator {
         throw new DataRootMigrationError('MIGRATION_LOCKED', '陈旧锁接管后主锁被其他实例占用')
       }
       this.lockOwnerToken = ownerToken
+      return true
     } finally {
       releaseActiveLockClaim(recoveryClaimPath)
     }
@@ -617,8 +715,13 @@ export class DataRootMigrationCoordinator {
 
 /** 使用 Node statfs 计算普通用户可用字节。 */
 async function getStatfsAvailableBytes(directoryPath: string): Promise<number> {
+  /** 文件系统以 bigint 返回的容量统计，避免乘法阶段溢出。 */
   const stats = await statfs(directoryPath, { bigint: true })
-  return Number(stats.bavail * stats.bsize)
+  /** 普通用户可用块数换算得到的原始字节数。 */
+  const availableBytes = stats.bavail * stats.bsize
+  return availableBytes > BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number.MAX_SAFE_INTEGER
+    : Number(availableBytes)
 }
 
 /** kill(pid, 0) 不发送信号，仅判断 PID 是否仍存在。 */
@@ -632,7 +735,7 @@ function isProcessRunning(pid: number): boolean {
   }
 }
 
-/** 递归统计普通文件字节；符号链接不跟随，特殊文件交由 copier 严格拒绝。 */
+/** no-follow 递归统计普通文件字节；符号链接计零，特殊文件在计划阶段明确拒绝。 */
 async function scanSourceBytes(rootPath: string): Promise<number> {
   let totalBytes = 0
   const pending = [rootPath]
@@ -642,8 +745,19 @@ async function scanSourceBytes(rootPath: string): Promise<number> {
     const directory = await opendir(current)
     for await (const entry of directory) {
       const entryPath = resolve(current, entry.name)
-      if (entry.isDirectory()) pending.push(entryPath)
-      else if (entry.isFile()) totalBytes += (await lstat(entryPath)).size
+      /** no-follow 获取的目录项真实类型与大小。 */
+      const stats = await lstat(entryPath, { bigint: true })
+      if (stats.isDirectory()) {
+        pending.push(entryPath)
+      } else if (stats.isFile()) {
+        if (stats.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+          throw new Error('普通文件过大，无法安全计数')
+        }
+        totalBytes += Number(stats.size)
+        if (!Number.isSafeInteger(totalBytes)) throw new Error('目录总字节数超过安全整数范围')
+      } else if (!stats.isSymbolicLink()) {
+        throw new Error('源目录包含不支持的特殊文件')
+      }
     }
   }
   return totalBytes

@@ -23,6 +23,15 @@ export interface PathManagementState {
   occupiedBytes?: number
   availableBytes?: number
   migration: DataRootMigrationProgress | null
+  postCommitCleanup?: DataRootPostCommitCleanupProgress
+}
+
+/** 已提交迁移仍待完成的 sidecar 清理状态。 */
+export interface DataRootPostCommitCleanupProgress {
+  migrationId: string
+  targetRoot: string
+  status: 'pending' | 'failed'
+  error?: string
 }
 
 /** 数据根不可用时允许用户选择的恢复动作。 */
@@ -51,6 +60,7 @@ export interface DataRootMigrationRecord {
 export interface DataRootPostCommitCleanupRecord {
   migrationId: string
   targetRoot: string
+  error?: string
 }
 
 /** 位于用户 home 下、独立于可迁移数据根的固定定位文件。 */
@@ -102,11 +112,13 @@ function isDataRootMigrationRecord(value: unknown): value is DataRootMigrationRe
 function isDataRootPostCommitCleanupRecord(value: unknown): value is DataRootPostCommitCleanupRecord {
   if (!isRecord(value)) return false
   const keys = Object.keys(value).sort()
-  return keys.length === 2
-    && keys[0] === 'migrationId'
-    && keys[1] === 'targetRoot'
+  const hasError = value.error !== undefined
+  const expectedKeys = hasError ? ['error', 'migrationId', 'targetRoot'] : ['migrationId', 'targetRoot']
+  return keys.length === expectedKeys.length
+    && keys.every((key, index) => key === expectedKeys[index])
     && isNonEmptyString(value.migrationId)
     && isPortableAbsolutePath(value.targetRoot)
+    && (!hasError || isNonEmptyString(value.error))
 }
 
 /** 识别 POSIX、Windows drive、反斜杠 UNC 与 slash UNC 绝对路径。 */

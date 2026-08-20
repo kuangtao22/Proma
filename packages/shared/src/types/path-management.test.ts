@@ -26,6 +26,12 @@ describe('isDataRootLocatorFile', () => {
       previousRoot: sourceRoot,
       postCommitCleanup: { migrationId: 'migration-1', targetRoot },
     })).toBe(true)
+    expect(isDataRootLocatorFile({
+      version: 1,
+      activeRoot: targetRoot,
+      previousRoot: sourceRoot,
+      postCommitCleanup: { migrationId: 'migration-1', targetRoot, error: '清理迁移断点失败' },
+    })).toBe(true)
   })
 
   test('Given cleanup incomplete、mismatch or coexisting migration When validating Then rejects', () => {
@@ -33,6 +39,7 @@ describe('isDataRootLocatorFile', () => {
       { version: 1, activeRoot: targetRoot, postCommitCleanup: { migrationId: '', targetRoot } },
       { version: 1, activeRoot: targetRoot, postCommitCleanup: { migrationId: 'migration-1', targetRoot: 'relative' } },
       { version: 1, activeRoot: targetRoot, postCommitCleanup: { migrationId: 'migration-1', targetRoot: sourceRoot } },
+      { version: 1, activeRoot: targetRoot, postCommitCleanup: { migrationId: 'migration-1', targetRoot, error: '' } },
       {
         version: 1,
         activeRoot: sourceRoot,

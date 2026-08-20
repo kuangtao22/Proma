@@ -277,6 +277,29 @@ export class DataRootLocator {
   }
 
   /**
+   * 更新 post-commit cleanup 的公开错误；传入 undefined 表示重试已开始。
+   *
+   * @param migrationId 待清理迁移 ID。
+   * @param error 清理失败摘要；重试开始时省略。
+   * @returns 更新后重新解析得到的定位状态。
+   */
+  updatePostCommitCleanupError(migrationId: string, error?: string): DataRootLocatorResult {
+    const result = this.inspect()
+    const locatorFile = result.locatorFile
+    const cleanup = locatorFile?.postCommitCleanup
+    if (!locatorFile || !cleanup) throw new Error('当前没有待处理的迁移清理')
+    if (cleanup.migrationId !== migrationId) throw new Error('清理记录的迁移 ID 不匹配')
+    return this.write({
+      ...locatorFile,
+      postCommitCleanup: {
+        migrationId: cleanup.migrationId,
+        targetRoot: cleanup.targetRoot,
+        ...(error === undefined ? {} : { error }),
+      },
+    })
+  }
+
+  /**
    * 判断主定位文件或恢复候选是否存在。
    *
    * @returns 任一候选文件存在时返回 true。
@@ -318,6 +341,20 @@ export class DataRootLocator {
       state: {
         ...createPathManagementState(activeRoot, availability, migration),
         ...(locatorFile?.previousRoot === undefined ? {} : { previousRoot: locatorFile.previousRoot }),
+        ...(locatorFile?.postCommitCleanup === undefined
+          ? {}
+          : {
+              postCommitCleanup: {
+                migrationId: locatorFile.postCommitCleanup.migrationId,
+                targetRoot: locatorFile.postCommitCleanup.targetRoot,
+                status: locatorFile.postCommitCleanup.error === undefined
+                  ? 'pending' as const
+                  : 'failed' as const,
+                ...(locatorFile.postCommitCleanup.error === undefined
+                  ? {}
+                  : { error: locatorFile.postCommitCleanup.error }),
+              },
+            }),
       },
       ...(locatorFile === undefined ? {} : { locatorFile }),
     }
