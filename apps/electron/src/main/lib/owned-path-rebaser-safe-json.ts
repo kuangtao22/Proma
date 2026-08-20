@@ -11,6 +11,12 @@ interface FileSystemIdentity {
   ino: number | bigint
 }
 
+/** 编排层用于判定物理所有权唯一的只读摘要。 */
+export interface PersistentPathOwnership extends FileSystemIdentity {
+  /** realpath 解析后的物理路径。 */
+  canonicalPath: string
+}
+
 /** 已验证目录的路径、物理位置与身份。 */
 export interface DirectoryGuard extends FileSystemIdentity {
   /** 调用方使用的目录路径。 */
@@ -212,6 +218,15 @@ export function captureDirectoryGuard(
   const canonicalPath = realpathSync(directoryPath)
   assertCanonicalContainment(canonicalPath, targetGuard.canonicalPath, directoryPath)
   return { requestedPath: directoryPath, canonicalPath, dev: directoryStat.dev, ino: directoryStat.ino }
+}
+
+/** 返回预检时存在的主文件物理所有权；主文件缺失时返回 null。 */
+export function getPreflightPrimaryOwnership(
+  preflight: PreflightPersistentJson<JsonObject>,
+): PersistentPathOwnership | null {
+  /** 预检时的主文件 guard。 */
+  const guard = preflight.candidateStates.primary.guard
+  return guard ? { canonicalPath: guard.canonicalPath, dev: guard.dev, ino: guard.ino } : null
 }
 
 /** 复验目标根没有被替换、改成 symlink 或改变物理位置。 */

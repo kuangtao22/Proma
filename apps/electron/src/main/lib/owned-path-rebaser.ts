@@ -2,6 +2,7 @@ import { basename, isAbsolute, join, posix, relative, resolve, sep, win32 } from
 import type { PlatformPath } from 'node:path'
 import {
   captureDirectoryGuard,
+  getPreflightPrimaryOwnership,
   preflightPersistentJson,
   recoverPersistentJson,
   validateDataRoots,
@@ -118,11 +119,17 @@ export function rebaseDataRootOwnedPaths(
 
   /** 实际发生 owned 字段变化的文件。 */
   const changedFiles: Array<PersistentJson<JsonObject>> = []
+  /** 防止同一恢复对象被重复加入写队列。 */
+  const queuedFiles = new Set<PersistentJson<JsonObject>>()
+  /** 防止不同对象以同一路径重复加入写队列。 */
+  const queuedPaths = new Set<string>()
   if (sessionsFile && rebaseSessionsIndex(sessionsFile.value, input.sourceRoot, input.targetRoot)) {
-    changedFiles.push(sessionsFile)
+    queueChangedFile(sessionsFile, changedFiles, queuedFiles, queuedPaths)
   }
   for (const configFile of workspaceConfigFiles) {
-    if (rebaseWorkspaceConfig(configFile.value, input.sourceRoot, input.targetRoot)) changedFiles.push(configFile)
+    if (rebaseWorkspaceConfig(configFile.value, input.sourceRoot, input.targetRoot)) {
+      queueChangedFile(configFile, changedFiles, queuedFiles, queuedPaths)
+    }
   }
   for (const changedFile of changedFiles) {
     writePersistentJson(changedFile, targetGuard)
@@ -174,16 +181,28 @@ function validateSemanticRootRelationship(sourceRoot: string, targetRoot: string
 
 /** 根据工作区索引只读预检所有实际配置文件。 */
 function preflightWorkspaceConfigFiles(
-  index: JsonObject & { workspaces: Array<JsonObject & { slug: string }> },
+  index: JsonObject & { workspaces: Array<JsonObject & { id: string; slug: string }> },
   targetGuard: TargetRootGuard,
   inspectedFiles: string[],
 ): Array<PreflightPersistentJson<JsonObject>> {
+  /** 已声明的 workspace id，用于建立唯一所有权。 */
+  const workspaceIds = new Set<string>()
+  /** 已声明的 workspace slug，用于阻止同一配置被重复处理。 */
+  const workspaceSlugs = new Set<string>()
   for (const workspace of index.workspaces) {
     /** 在目录缺失快速路径前也必须校验的 slug。 */
     const slug = workspace.slug
     if (slug.length === 0 || basename(slug) !== slug) {
       throw new Error(`工作区配置路径越过目标数据根: ${slug}`)
     }
+    if (workspaceIds.has(workspace.id)) {
+      throw new Error(`agent-workspaces.json 存在重复 workspace id: ${workspace.id}`)
+    }
+    if (workspaceSlugs.has(slug)) {
+      throw new Error(`agent-workspaces.json 存在重复 workspace slug: ${slug}`)
+    }
+    workspaceIds.add(workspace.id)
+    workspaceSlugs.add(slug)
   }
   /** 目标副本中的工作区容器目录及 guard。 */
   const workspacesRootPath = resolve(targetGuard.requestedPath, 'agent-workspaces')
@@ -191,12 +210,28 @@ function preflightWorkspaceConfigFiles(
   if (!workspacesRootGuard) return []
   /** 已完成 schema 预检的配置文件。 */
   const configFiles: Array<PreflightPersistentJson<JsonObject>> = []
+  /** 已认领的 workspace 目录 canonical 路径。 */
+  const workspaceDirectoryCanonicalPaths = new Set<string>()
+  /** 已认领的 workspace 目录 dev/ino。 */
+  const workspaceDirectoryIdentities = new Set<string>()
+  /** 已认领的 config 主文件 canonical 路径。 */
+  const configCanonicalPaths = new Set<string>()
+  /** 已认领的 config 主文件 dev/ino。 */
+  const configIdentities = new Set<string>()
 
   for (const workspace of index.workspaces) {
     /** 当前工作区目录和配置路径。 */
     const workspaceDirPath = resolve(workspacesRootPath, workspace.slug)
     const workspaceDirGuard = captureDirectoryGuard(workspaceDirPath, targetGuard)
     if (!workspaceDirGuard) continue
+    claimUniquePhysicalOwnership(
+      workspaceDirGuard.canonicalPath,
+      workspaceDirGuard.dev,
+      workspaceDirGuard.ino,
+      workspaceDirectoryCanonicalPaths,
+      workspaceDirectoryIdentities,
+      'workspace 目录',
+    )
     const configPath = resolve(workspaceDirPath, 'config.json')
     if (!isContainedPath(configPath, targetGuard.requestedPath)) {
       throw new Error(`工作区配置路径越过目标数据根: ${workspace.slug}`)
@@ -206,10 +241,57 @@ function preflightWorkspaceConfigFiles(
     /** 只读预检结果。 */
     const configFile = preflightPersistentJson(configPath, isWorkspaceConfig, targetGuard, directoryGuards)
     if (!configFile) continue
+    /** config 主文件存在时的物理所有权。 */
+    const configOwnership = getPreflightPrimaryOwnership(configFile)
+    if (configOwnership) {
+      claimUniquePhysicalOwnership(
+        configOwnership.canonicalPath,
+        configOwnership.dev,
+        configOwnership.ino,
+        configCanonicalPaths,
+        configIdentities,
+        'workspace config 主文件',
+      )
+    }
     inspectedFiles.push(configPath)
     configFiles.push(configFile)
   }
   return configFiles
+}
+
+/** 声明 canonical 路径和 dev/ino 的唯一所有权。 */
+function claimUniquePhysicalOwnership(
+  canonicalPath: string,
+  dev: number | bigint,
+  ino: number | bigint,
+  canonicalPaths: Set<string>,
+  identities: Set<string>,
+  label: string,
+): void {
+  /** 跨 number/bigint 稳定表示的设备和 inode 组合。 */
+  const identity = `${String(dev)}:${String(ino)}`
+  if (canonicalPaths.has(canonicalPath) || identities.has(identity)) {
+    throw new Error(`${label}物理身份重复: ${canonicalPath}`)
+  }
+  canonicalPaths.add(canonicalPath)
+  identities.add(identity)
+}
+
+/** 将变化文件加入写队列，并拒绝对象或主路径重复。 */
+function queueChangedFile(
+  file: PersistentJson<JsonObject>,
+  changedFiles: Array<PersistentJson<JsonObject>>,
+  queuedFiles: Set<PersistentJson<JsonObject>>,
+  queuedPaths: Set<string>,
+): void {
+  /** 归一化后的写回主路径。 */
+  const normalizedPath = resolve(file.filePath)
+  if (queuedFiles.has(file) || queuedPaths.has(normalizedPath)) {
+    throw new Error(`PersistentJson 重复加入写队列: ${file.filePath}`)
+  }
+  queuedFiles.add(file)
+  queuedPaths.add(normalizedPath)
+  changedFiles.push(file)
 }
 
 /** 重写会话索引的声明路径字段。 */

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { rebaseDataRootOwnedPaths, rebaseOwnedPath } from './owned-path-rebaser'
@@ -344,6 +344,113 @@ describe('rebaseDataRootOwnedPaths', () => {
     expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
       .toThrow('agent-workspaces.json 损坏或 schema 无法安全解释')
     expect(readFileSync(sessionsPath, 'utf-8')).toBe(brokenPrimary)
+  })
+
+  test('Given 两个完整 workspace 重复 slug When 全量预检 Then 失败且所有候选字节不变', () => {
+    /** 需要 bak 恢复但不得在所有权校验前恢复的会话主文件。 */
+    const sessionsPath = join(targetRoot, 'agent-sessions.json')
+    /** 会话备份候选。 */
+    const sessionsBackupPath = `${sessionsPath}.bak`
+    /** 含重复 slug 的工作区索引。 */
+    const workspacesPath = join(targetRoot, 'agent-workspaces.json')
+    /** 重复条目共同指向的工作区目录。 */
+    const workspaceDir = join(targetRoot, 'agent-workspaces', 'alpha')
+    /** 重复条目共同指向的配置文件。 */
+    const configPath = join(workspaceDir, 'config.json')
+    mkdirSync(workspaceDir, { recursive: true })
+    writeFileSync(sessionsPath, '{broken', 'utf-8')
+    writeJson(sessionsBackupPath, { version: 2, sessions: [createSession()] })
+    writeJson(workspacesPath, {
+      version: 2,
+      workspaces: [
+        createWorkspace({ id: 'workspace-a', name: '项目 A', slug: 'alpha' }),
+        createWorkspace({ id: 'workspace-b', name: '项目 B', slug: 'alpha' }),
+      ],
+    })
+    writeJson(configPath, { attachedFiles: [join(sourceRoot, 'file.txt')] })
+    /** 调用前每个现存候选的原始字节。 */
+    const originalBytes = new Map([
+      [sessionsPath, readFileSync(sessionsPath)],
+      [sessionsBackupPath, readFileSync(sessionsBackupPath)],
+      [workspacesPath, readFileSync(workspacesPath)],
+      [configPath, readFileSync(configPath)],
+    ])
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('agent-workspaces.json 存在重复 workspace slug')
+    for (const [filePath, content] of originalBytes) {
+      expect(readFileSync(filePath).equals(content)).toBe(true)
+    }
+    expect(existsSync(`${sessionsPath}.tmp`)).toBe(false)
+    expect(existsSync(`${workspacesPath}.bak`)).toBe(false)
+    expect(existsSync(`${configPath}.bak`)).toBe(false)
+  })
+
+  test('Given 两个完整 workspace 重复 id When 全量预检 Then 视为索引损坏', () => {
+    /** 含重复 id、不同 slug 的工作区索引。 */
+    const workspacesPath = join(targetRoot, 'agent-workspaces.json')
+    writeJson(workspacesPath, {
+      version: 2,
+      workspaces: [
+        createWorkspace({ id: 'workspace-duplicate', slug: 'alpha' }),
+        createWorkspace({ id: 'workspace-duplicate', slug: 'beta' }),
+      ],
+    })
+    /** 失败前索引原始字节。 */
+    const originalIndex = readFileSync(workspacesPath)
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('agent-workspaces.json 存在重复 workspace id')
+    expect(readFileSync(workspacesPath).equals(originalIndex)).toBe(true)
+  })
+
+  test('Given 唯一 workspace 的 config 主文件共享物理 identity When 预检 Then 拒绝重复所有权', () => {
+    /** 两个唯一工作区的容器目录。 */
+    const workspacesDir = join(targetRoot, 'agent-workspaces')
+    /** 两个不同请求路径的配置文件。 */
+    const alphaConfigPath = join(workspacesDir, 'alpha', 'config.json')
+    const betaConfigPath = join(workspacesDir, 'beta', 'config.json')
+    mkdirSync(join(workspacesDir, 'alpha'), { recursive: true })
+    mkdirSync(join(workspacesDir, 'beta'), { recursive: true })
+    writeJson(join(targetRoot, 'agent-workspaces.json'), {
+      version: 2,
+      workspaces: [
+        createWorkspace({ id: 'workspace-alpha', slug: 'alpha' }),
+        createWorkspace({ id: 'workspace-beta', slug: 'beta' }),
+      ],
+    })
+    writeJson(alphaConfigPath, { attachedFiles: [join(sourceRoot, 'shared.txt')] })
+    linkSync(alphaConfigPath, betaConfigPath)
+    /** 失败前共享 inode 的原始字节。 */
+    const originalConfig = readFileSync(alphaConfigPath)
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('workspace config 主文件物理身份重复')
+    expect(readFileSync(alphaConfigPath).equals(originalConfig)).toBe(true)
+    expect(readFileSync(betaConfigPath).equals(originalConfig)).toBe(true)
+    expect(existsSync(`${alphaConfigPath}.bak`)).toBe(false)
+    expect(existsSync(`${betaConfigPath}.bak`)).toBe(false)
+  })
+
+  test('Given 文件系统将大小写 slug 解析为同一目录 When 预检 Then 拒绝目录物理所有权重复', () => {
+    /** 用于探测当前文件系统大小写语义的工作区容器。 */
+    const workspacesDir = join(targetRoot, 'agent-workspaces')
+    /** 小写实际目录。 */
+    const lowercaseDir = join(workspacesDir, 'alpha')
+    /** 仅大小写不同的请求目录。 */
+    const uppercaseDir = join(workspacesDir, 'ALPHA')
+    mkdirSync(lowercaseDir, { recursive: true })
+    if (!existsSync(uppercaseDir)) return
+    writeJson(join(targetRoot, 'agent-workspaces.json'), {
+      version: 2,
+      workspaces: [
+        createWorkspace({ id: 'workspace-lower', slug: 'alpha' }),
+        createWorkspace({ id: 'workspace-upper', slug: 'ALPHA' }),
+      ],
+    })
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('workspace 目录物理身份重复')
   })
 
   test('Given worktree repo 缺少必填字段 When 预检 Then 不部分写其它文件', () => {

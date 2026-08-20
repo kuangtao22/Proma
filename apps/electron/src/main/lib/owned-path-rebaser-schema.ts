@@ -69,7 +69,7 @@ function isAgentSessionMeta(value: unknown): value is JsonObject {
 /** 校验工作区索引及所有已知 AgentWorkspace 字段。 */
 export function isAgentWorkspacesIndex(
   value: unknown,
-): value is JsonObject & { workspaces: Array<JsonObject & { slug: string }> } {
+): value is JsonObject & { workspaces: Array<JsonObject & { id: string; slug: string }> } {
   return isJsonObject(value)
     && isVersion(value.version)
     && Array.isArray(value.workspaces)
@@ -77,7 +77,7 @@ export function isAgentWorkspacesIndex(
 }
 
 /** 校验 AgentWorkspace 的必填字段和已知可选字段。 */
-function isAgentWorkspace(value: unknown): value is JsonObject & { slug: string } {
+function isAgentWorkspace(value: unknown): value is JsonObject & { id: string; slug: string } {
   return isJsonObject(value)
     && isString(value.id)
     && isString(value.name)
