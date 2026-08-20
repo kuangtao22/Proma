@@ -15,11 +15,10 @@ import { getLanBridgeConfig, updateLanBridgeConfig } from './lan-bridge-config'
 import {
   getCurrentPin,
   getLanBridgeAuthService,
-  initAuth,
   refreshPin,
   removeLegacyPinFile,
 } from './lan-bridge-auth'
-import type { PairingTicket } from './lan-bridge-auth'
+import type { LanBridgeAuthService, PairingTicket } from './lan-bridge-auth'
 import type { LanBridgeDevice } from './lan-bridge-device-store'
 import { getConfigDir } from '../config-paths'
 import { LanBridgeSessionManager } from './lan-bridge-session'
@@ -56,14 +55,21 @@ let errorMessage: string | undefined
 /** 进程内唯一的启动协调器。 */
 const startCoordinator = createLanBridgeStartCoordinator()
 
-/** 组合根首次加载时固定的生产认证服务，Bridge restart 继续复用。 */
-const lanBridgeAuthService = getLanBridgeAuthService()
+/** 首次使用 LAN 业务能力时才固定的认证服务，模块求值不读取数据根。 */
+let lanBridgeAuthService: LanBridgeAuthService | null = null
 
-registerLanBridgeHandlers({
-  authService: lanBridgeAuthService,
-  promaAdapter: lanBridgePromaAdapter,
-  getSessionManager: () => sessionManager,
-})
+/** 惰性创建 Auth/DeviceStore 并只注册一次依赖它的路由 handler。 */
+function ensureLanBridgeAuthService(): LanBridgeAuthService {
+  if (lanBridgeAuthService !== null) return lanBridgeAuthService
+  /** normal gate 后首次 LAN 调用才允许创建持久化设备仓库。 */
+  lanBridgeAuthService = getLanBridgeAuthService()
+  registerLanBridgeHandlers({
+    authService: lanBridgeAuthService,
+    promaAdapter: lanBridgePromaAdapter,
+    getSessionManager: () => sessionManager,
+  })
+  return lanBridgeAuthService
+}
 
 const recoveryController = createLanBridgeRecoveryController({
   isEnabled: () => getLanBridgeConfig().enabled,
@@ -93,7 +99,7 @@ async function performStartLanBridge(
   errorMessage = undefined
 
   try {
-    initAuth()
+    ensureLanBridgeAuthService().initialize()
     removeLegacyPinFile(getConfigDir())
 
     sessionManager = new LanBridgeSessionManager(config.maxConnections)
@@ -241,6 +247,7 @@ export function stopLanBridge(): void {
 
 /** 获取运行时状态 */
 export function getLanBridgeStatus(): LanBridgeRuntimeState {
+  ensureLanBridgeAuthService()
   const config = getLanBridgeConfig()
   return {
     status,
@@ -254,17 +261,18 @@ export function getLanBridgeStatus(): LanBridgeRuntimeState {
 
 /** 刷新 PIN 码 */
 export function refreshLanBridgePin(): string {
+  ensureLanBridgeAuthService()
   return refreshPin()
 }
 
 /** 为 Task 7 二维码入口创建生产认证服务的一次性票据。 */
 export function createLanBridgePairingTicket(now = Date.now()): PairingTicket {
-  return lanBridgeAuthService.createPairingTicket(now)
+  return ensureLanBridgeAuthService().createPairingTicket(now)
 }
 
 /** 列出生产认证服务固定仓库中的设备。 */
 export function listLanBridgeDevices(includeRevoked = false): LanBridgeDevice[] {
-  return lanBridgeAuthService.listDevices(includeRevoked)
+  return ensureLanBridgeAuthService().listDevices(includeRevoked)
 }
 
 /**
@@ -276,7 +284,7 @@ export function listLanBridgeDevices(includeRevoked = false): LanBridgeDevice[] 
  */
 export function revokeLanBridgeDevice(deviceId: string, now = Date.now()): LanBridgeDevice | undefined {
   return executeLanBridgeDeviceRevocation({
-    revokeDevice: () => lanBridgeAuthService.revokeDevice(deviceId, now),
+    revokeDevice: () => ensureLanBridgeAuthService().revokeDevice(deviceId, now),
     disconnectDevice: () => sessionManager?.disconnectDevice(deviceId),
     notifyStatusChanged,
   })

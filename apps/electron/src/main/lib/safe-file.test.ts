@@ -1,8 +1,19 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readJsonFileSafe } from './safe-file'
+import { readJsonFileSafe, writeJsonFileAtomicSecure } from './safe-file'
 
 /** safe-file validator 测试使用的最小 schema。 */
 interface VersionedValue {
@@ -163,5 +174,84 @@ describe('readJsonFileSafe validator', () => {
     expect(caughtError).toBeInstanceOf(Error)
     expect(statSync(filePath).isDirectory()).toBe(true)
     expect(readFileSync(`${filePath}.bak`, 'utf-8')).toBe(backupContent)
+  })
+})
+
+describe('writeJsonFileAtomicSecure', () => {
+  test('Given 固定 .tmp 是根外 symlink When 安全写入 Then 不跟随且根外文件保持不变', () => {
+    /** 隔离目录与根外哨兵文件。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-'))
+    const filePath = join(tempDir, 'marker.json')
+    const outsidePath = join(tempDir, 'outside.json')
+    writeFileSync(outsidePath, 'outside')
+    symlinkSync(outsidePath, `${filePath}.tmp`)
+
+    try {
+      writeJsonFileAtomicSecure(filePath, { owner: 'proma', version: 1 })
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ owner: 'proma', version: 1 })
+      expect(readFileSync(outsidePath, 'utf8')).toBe('outside')
+      expect(statSync(`${filePath}.tmp`).isFile()).toBe(true)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 目的路径是 symlink When 安全写入 Then 拒绝且根外文件保持不变', () => {
+    /** 目的 symlink 不得被备份或 rename 覆盖。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-dest-'))
+    const filePath = join(tempDir, 'marker.json')
+    const outsidePath = join(tempDir, 'outside.json')
+    writeFileSync(outsidePath, 'outside')
+    symlinkSync(outsidePath, filePath)
+
+    try {
+      expect(() => writeJsonFileAtomicSecure(filePath, { owner: 'proma', version: 1 }))
+        .toThrow('安全原子写入目标不是普通文件')
+      expect(readFileSync(outsidePath, 'utf8')).toBe('outside')
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 随机 temp 在提交前被置换 When 安全写入 Then 拒绝且不删除攻击者文件', () => {
+    /** 注入点模拟同目录攻击者替换已关闭的随机 temp。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-temp-race-'))
+    const filePath = join(tempDir, 'marker.json')
+    let attackerTempPath = ''
+
+    try {
+      expect(() => writeJsonFileAtomicSecure(filePath, { owner: 'proma', version: 1 }, {
+        beforeRename: (tempPath) => {
+          attackerTempPath = tempPath
+          unlinkSync(tempPath)
+          writeFileSync(tempPath, 'attacker')
+        },
+      })).toThrow('安全原子写入临时文件身份已变化')
+      expect(readFileSync(attackerTempPath, 'utf8')).toBe('attacker')
+      expect(existsSync(filePath)).toBe(false)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 父目录在提交前被替换 When 安全写入 Then 拒绝提交到新目录', () => {
+    /** 替换父目录模拟挂载点或目录交换竞态。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-parent-race-'))
+    const parentPath = join(tempDir, 'parent')
+    const movedParentPath = join(tempDir, 'parent-old')
+    const filePath = join(parentPath, 'marker.json')
+    mkdirSync(parentPath)
+
+    try {
+      expect(() => writeJsonFileAtomicSecure(filePath, { owner: 'proma', version: 1 }, {
+        beforeRename: () => {
+          renameSync(parentPath, movedParentPath)
+          mkdirSync(parentPath)
+        },
+      })).toThrow('安全原子写入父目录身份已变化')
+      expect(existsSync(filePath)).toBe(false)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
   })
 })

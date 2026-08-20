@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import type { PathManagementState } from '@proma/shared'
 import {
   createDataRootMigrationViewState,
+  DataRootMigrationProgressBar,
   DataRootRecoveryControls,
   confirmRestorePreviousDataRoot,
 } from './DataRootMigrationApp'
@@ -122,6 +123,16 @@ describe('DataRootMigrationApp', () => {
     expect(html).toContain('退出')
     expect(html).not.toContain('重新定位')
     expect(html).not.toContain('切回旧备份')
+  })
+
+  test('Given 迁移进度 When 渲染页面 Then 暴露标准 progressbar 数值语义', () => {
+    /** 无状态组件直接锁定最终输出的无障碍数值属性。 */
+    const html = renderToStaticMarkup(<DataRootMigrationProgressBar percent={25} />)
+
+    expect(html).toContain('role="progressbar"')
+    expect(html).toContain('aria-valuemin="0"')
+    expect(html).toContain('aria-valuemax="100"')
+    expect(html).toContain('aria-valuenow="25"')
   })
 
   test('Given 用户切回旧根 When 尚未确认 Then 不调用恢复 API', async () => {

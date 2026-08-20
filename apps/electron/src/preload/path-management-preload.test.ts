@@ -28,8 +28,6 @@ describe('路径管理 preload API', () => {
 
     await api.getPathManagementState()
     await api.pickDataRoot()
-    await api.startDataRootMigration('/data/new')
-    await api.getDataRootMigrationStatus()
     await api.resumeDataRootMigration()
     await api.cancelDataRootMigration()
     await api.recoverDataRoot({ action: 'relocate', selectedRoot: '/data/found' })
@@ -39,8 +37,6 @@ describe('路径管理 preload API', () => {
     expect(invokes).toEqual([
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, args: [] },
-      { channel: PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, args: ['/data/new'] },
-      { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_DATA_ROOT_MIGRATION, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT, args: [{ action: 'relocate', selectedRoot: '/data/found' }] },

@@ -94,6 +94,33 @@ export async function confirmRestorePreviousDataRoot(
   await restore()
 }
 
+/** 数据根迁移进度条属性。 */
+export interface DataRootMigrationProgressBarProps {
+  /** 已归一化到 0-100 的迁移百分比。 */
+  percent: number
+}
+
+/** 渲染同时具备视觉宽度与辅助技术数值语义的迁移进度。 */
+export function DataRootMigrationProgressBar({
+  percent,
+}: DataRootMigrationProgressBarProps): React.JSX.Element {
+  return (
+    <div
+      role="progressbar"
+      aria-label={`迁移进度 ${percent}%`}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={percent}
+      className="mb-8 h-2 w-full overflow-hidden rounded-sm bg-muted"
+    >
+      <div
+        className="h-full bg-primary transition-[width] duration-200"
+        style={{ width: `${percent}%` }}
+      />
+    </div>
+  )
+}
+
 /** recovery 按钮区只接收已派生的允许动作与无状态回调。 */
 export interface DataRootRecoveryControlsProps {
   /** 当前 recovery 视图及允许动作。 */
@@ -234,12 +261,7 @@ export function DataRootMigrationApp(): React.JSX.Element {
         </div>
 
         {view.kind === 'migration' || view.kind === 'cleanup' ? (
-          <div aria-label={`迁移进度 ${view.percent}%`} className="mb-8 h-2 w-full overflow-hidden rounded-sm bg-muted">
-            <div
-              className="h-full bg-primary transition-[width] duration-200"
-              style={{ width: `${view.percent}%` }}
-            />
-          </div>
+          <DataRootMigrationProgressBar percent={view.percent} />
         ) : null}
 
         {visibleError ? (

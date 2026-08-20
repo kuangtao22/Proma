@@ -231,10 +231,6 @@ registerBridge({
   stop: () => wechatBridge.stop(),
 })
 
-// LAN Bridge 只接收根组合点显式注入的 EventBus，不在自有模块获取官方 runtime。
-import { createLanBridgeRegistration } from './lib/lan-bridge/lan-bridge'
-registerBridge(createLanBridgeRegistration(agentEventBus))
-
 async function recoverEnabledFeishuBots(): Promise<void> {
   const config = getFeishuMultiBotConfig()
   let failedCount = 0
@@ -753,7 +749,7 @@ async function bootstrap(): Promise<void> {
       app,
       dialog,
       shell,
-      getAllWindows: () => BrowserWindow.getAllWindows(),
+      getExpectedWebContents: () => getStoredMainWindow()?.webContents ?? null,
     })
     dataRootStartupRouter.resolveMode(dataRootMode)
     showAndFocusDataRootManagementWindow(dataRootMode)
@@ -765,11 +761,15 @@ async function bootstrap(): Promise<void> {
   try {
     activeRoot = prepareNormalDataRoot(dataRootLocator, locatorResult)
     dataRootInstanceLease = getDefaultDataRootInstanceLeaseRegistry()
-    dataRootInstanceLease.acquire(activeRoot)
+    await dataRootInstanceLease.acquire(activeRoot)
   } catch (error) {
     dataRootBusinessStartupBlocked = true
     throw error
   }
+
+  /** LAN 组合根只能在 normal gate 与共享实例 lease 之后求值，离线模式不得读取业务根。 */
+  const { createLanBridgeRegistration } = await import('./lib/lan-bridge/lan-bridge')
+  registerBridge(createLanBridgeRegistration(agentEventBus))
 
   // 初始化 Proma 版本号（供 User-Agent 等全局标识使用）
   setPromaVersion(app.getVersion())

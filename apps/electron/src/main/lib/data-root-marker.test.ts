@@ -147,6 +147,21 @@ describe('Proma 数据根 marker', () => {
     expect(existsSync(join(root, PROMA_DATA_ROOT_MARKER_FILE))).toBe(false)
   })
 
+  test('Given 默认根预置 fixed .tmp symlink When 补 marker Then 根外文件不变', () => {
+    /** 旧 safe-file 固定临时路径可被 symlink 预置，marker 必须改走随机 no-follow helper。 */
+    const activeRoot = join(homeDir, '.proma')
+    const outsidePath = join(homeDir, 'outside-marker.json')
+    const markerPath = join(activeRoot, PROMA_DATA_ROOT_MARKER_FILE)
+    mkdirSync(activeRoot)
+    writeFileSync(outsidePath, 'outside')
+    symlinkSync(outsidePath, `${markerPath}.tmp`)
+    const locator = new DataRootLocator({ homeDir })
+
+    expect(prepareNormalDataRoot(locator, locator.inspect())).toBe(activeRoot)
+    expect(readMarker(activeRoot)).toEqual({ owner: 'proma', version: 1 })
+    expect(readFileSync(outsidePath, 'utf8')).toBe('outside')
+  })
+
   test('Given legacy 文件是 symlink When 识别 Then 不跟随且仍可检查后续合法 evidence', () => {
     /** 根外 settings 内容即使合法也不能证明候选目录所有权。 */
     const root = join(homeDir, 'symlink-root')

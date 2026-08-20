@@ -1,7 +1,6 @@
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import type {
   DataRootMigrationProgress,
-  DataRootMigrationStatus,
   PathManagementState,
   RecoverDataRootInput,
 } from '@proma/shared'
@@ -23,10 +22,6 @@ export interface PathManagementPreloadApi {
   getPathManagementState: () => Promise<PathManagementState>
   /** 使用系统选择器选择数据根目录。 */
   pickDataRoot: () => Promise<string | null>
-  /** 创建迁移计划并请求重启。 */
-  startDataRootMigration: (targetRoot: string) => Promise<void>
-  /** 获取当前迁移进度。 */
-  getDataRootMigrationStatus: () => Promise<DataRootMigrationStatus>
   /** 从已校验断点继续迁移。 */
   resumeDataRootMigration: () => Promise<void>
   /** 取消尚未切换的数据根迁移计划。 */
@@ -50,13 +45,6 @@ export function createPathManagementPreloadApi(ipc: PathManagementPreloadIpc): P
     pickDataRoot: () => ipc.invoke(
       PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
     ) as Promise<string | null>,
-    startDataRootMigration: (targetRoot) => ipc.invoke(
-      PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
-      targetRoot,
-    ) as Promise<void>,
-    getDataRootMigrationStatus: () => ipc.invoke(
-      PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS,
-    ) as Promise<DataRootMigrationStatus>,
     resumeDataRootMigration: () => ipc.invoke(
       PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION,
     ) as Promise<void>,

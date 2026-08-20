@@ -9,7 +9,7 @@ import {
 import { dirname, join, resolve } from 'node:path'
 import { DataRootLocator } from './data-root-locator'
 import type { DataRootLocatorResult } from './data-root-locator'
-import { writeJsonFileAtomic } from './safe-file'
+import { writeJsonFileAtomicSecure } from './safe-file'
 
 /** Proma 数据根所有权 marker 的固定文件名。 */
 export const PROMA_DATA_ROOT_MARKER_FILE = '.proma-data-root.json'
@@ -147,7 +147,7 @@ export function prepareNormalDataRoot(
 function writeAndVerifyPromaDataRootMarker(root: string): void {
   /** marker 使用共享原子写封装，避免崩溃留下截断身份文件。 */
   const markerPath = join(root, PROMA_DATA_ROOT_MARKER_FILE)
-  writeJsonFileAtomic(markerPath, PROMA_DATA_ROOT_MARKER)
+  writeJsonFileAtomicSecure(markerPath, PROMA_DATA_ROOT_MARKER)
   if (inspectPromaDataRootIdentity(root) !== 'marker') {
     throw new Error('Proma 数据根标记写入后校验失败')
   }

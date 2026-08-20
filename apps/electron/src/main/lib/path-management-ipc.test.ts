@@ -12,6 +12,11 @@ import {
   resolveDataRootStartupMode,
 } from './path-management-ipc'
 
+/** 测试中唯一获授权的 renderer webContents。 */
+const expectedWebContents = { send: () => undefined }
+/** 通过 sender 身份门的最小 IPC event。 */
+const expectedEvent = { sender: expectedWebContents }
+
 /** 创建测试用 locator 检查结果，避免触碰真实 home 目录。 */
 function createLocatorResult(
   overrides: Partial<DataRootLocatorResult> = {},
@@ -84,58 +89,13 @@ describe('数据根启动模式', () => {
 })
 
 describe('路径管理 IPC', () => {
-  test('Given 仅存在提交后清理 When 查询迁移状态 Then 返回 cleanup 而不是 null', () => {
-    /** 保存注册的 invoke handler。 */
-    const handlers = new Map<string, (...args: unknown[]) => unknown>()
-    /** 仅包含提交后清理的完整路径状态。 */
-    const cleanupState = createLocatorResult({
-      state: {
-        activeRoot: '/data/proma-new',
-        previousRoot: '/data/proma-old',
-        availability: 'available',
-        deviceType: 'unknown',
-        migration: null,
-        postCommitCleanup: {
-          migrationId: 'migration-1',
-          targetRoot: '/data/proma-new',
-          status: 'failed',
-          error: '清理 sidecar 失败',
-        },
-      },
-    }).state
-
-    registerPathManagementIpcHandlers({
-      mode: 'normal',
-      ipc: {
-        handle: (channel, handler) => { handlers.set(channel, handler) },
-        removeHandler: () => undefined,
-      },
-      app: { relaunch: () => undefined, quit: () => undefined },
-      getAllWindows: () => [],
-      coordinator: {
-        getStatus: () => cleanupState,
-        createPlan: async () => { throw new Error('不应执行') },
-        runPending: async () => undefined,
-        resumePending: async () => undefined,
-        cancel: async () => undefined,
-      },
-    })
-
-    const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS)
-    if (!handler) throw new Error('未注册迁移状态通道')
-    expect(handler({})).toEqual({
-      migration: null,
-      postCommitCleanup: cleanupState.postCommitCleanup,
-    })
-  })
-
   test('Given recovery 模式 When 注册 IPC Then 不读取或构造迁移协调器', () => {
     /** 通过 getter 证明 recovery 注册链没有触碰协调器依赖。 */
     const options = {
       mode: 'data-root-recovery' as const,
       ipc: { handle: () => undefined, removeHandler: () => undefined },
       app: { relaunch: () => undefined, quit: () => undefined },
-      getAllWindows: () => [],
+      getExpectedWebContents: () => expectedWebContents,
       get coordinator(): never {
         throw new Error('recovery 不得构造迁移协调器')
       },
@@ -144,46 +104,110 @@ describe('路径管理 IPC', () => {
     expect(() => registerPathManagementIpcHandlers(options)).not.toThrow()
   })
 
-  test('Given 迁移模式 When 注册 IPC Then 只暴露路径恢复合同', () => {
-    /** 记录主进程注册的全部通道。 */
-    const registeredChannels: string[] = []
+  test('Given 三种启动模式 When 注册 IPC Then 各自只暴露最小通道集合', () => {
+    /** 统一协调器避免通道审计触碰真实业务目录。 */
+    const coordinator = {
+      getStatus: () => createLocatorResult().state,
+      createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending' as const, completedBytes: 0, totalBytes: 100 }),
+      runPending: async () => undefined,
+      resumePending: async () => undefined,
+      cancel: async () => undefined,
+    }
+    /** 各模式允许的精确 invoke 通道。 */
+    const modeChannels = new Map([
+      ['normal', [
+        PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
+        PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
+      ]],
+      ['data-root-migration', [
+        PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
+        PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION,
+        PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_DATA_ROOT_MIGRATION,
+        PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
+        PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP,
+      ]],
+      ['data-root-recovery', [
+        PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
+        PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
+        PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT,
+        PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
+        PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP,
+      ]],
+    ] as const)
 
-    const channels = registerPathManagementIpcHandlers({
-      mode: 'data-root-migration',
-      ipc: {
-        handle: (channel) => { registeredChannels.push(channel) },
-        removeHandler: () => undefined,
-      },
-      app: {
-        relaunch: () => undefined,
-        quit: () => undefined,
-      },
-      getAllWindows: () => [],
+    for (const [mode, expectedChannels] of modeChannels) {
+      const channels = registerPathManagementIpcHandlers({
+        mode,
+        ipc: { handle: () => undefined, removeHandler: () => undefined },
+        app: { relaunch: () => undefined, quit: () => undefined },
+        getExpectedWebContents: () => expectedWebContents,
+        coordinator,
+      })
+      expect(channels).toEqual([...expectedChannels])
+    }
+  })
+
+  test('Given 开发热重载从 recovery 切到 normal When 重新注册 Then 不残留旧敏感 handler', () => {
+    /** 真实模拟 removeHandler 对同一个 ipcMain handler 表的影响。 */
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    const ipc = {
+      handle: (channel: string, handler: (...args: unknown[]) => unknown): void => { handlers.set(channel, handler) },
+      removeHandler: (channel: string): void => { handlers.delete(channel) },
+    }
+    const common = {
+      ipc,
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
       coordinator: {
         getStatus: () => createLocatorResult().state,
-        createPlan: async () => ({
-          migrationId: 'migration-1',
-          stage: 'pending',
-          completedBytes: 0,
-          totalBytes: 100,
-        }),
+        createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending' as const, completedBytes: 0, totalBytes: 1 }),
         runPending: async () => undefined,
         resumePending: async () => undefined,
         cancel: async () => undefined,
       },
-    })
+    }
 
-    expect(channels).toEqual([
-      PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
-      PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
-      PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS,
-      PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION,
-      PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_DATA_ROOT_MIGRATION,
-      PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT,
+    registerPathManagementIpcHandlers({ ...common, mode: 'data-root-recovery' })
+    registerPathManagementIpcHandlers({ ...common, mode: 'normal' })
+
+    expect([...handlers.keys()]).toEqual([
+      PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
       PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
-      PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP,
     ])
-    expect(registeredChannels).toEqual(channels)
+  })
+
+  test('Given 普通或路径窗口之外的 sender When 调用敏感通道 Then 一律拒绝', () => {
+    /** 分别保存 normal/recovery handler，模拟 planning/其他普通窗口直接 invoke。 */
+    const registerMode = (mode: 'normal' | 'data-root-recovery'): Map<string, (...args: unknown[]) => unknown> => {
+      const handlers = new Map<string, (...args: unknown[]) => unknown>()
+      registerPathManagementIpcHandlers({
+        mode,
+        homeDir: '/tmp/proma-wrong-sender-test',
+        ipc: {
+          handle: (channel, handler) => { handlers.set(channel, handler) },
+          removeHandler: (channel) => { handlers.delete(channel) },
+        },
+        app: { relaunch: () => undefined, quit: () => undefined },
+        getExpectedWebContents: () => expectedWebContents,
+        coordinator: {
+          getStatus: () => createLocatorResult().state,
+          createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }),
+          runPending: async () => undefined,
+          resumePending: async () => undefined,
+          cancel: async () => undefined,
+        },
+      })
+      return handlers
+    }
+    const normalHandlers = registerMode('normal')
+    const recoveryHandlers = registerMode('data-root-recovery')
+
+    expect(() => normalHandlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)?.({ sender: {} }, '/data/new'))
+      .toThrow('当前窗口无权执行路径管理操作')
+    expect(() => recoveryHandlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)?.({ sender: {} }, { action: 'recheck' }))
+      .toThrow('当前窗口无权执行路径管理操作')
+    expect(() => recoveryHandlers.get(PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP)?.({ sender: {} }))
+      .toThrow('当前窗口无权执行路径管理操作')
   })
 
   test('Given 正常模式且没有活跃任务 When 创建计划 Then 计划落盘后立即重启退出', async () => {
@@ -202,7 +226,7 @@ describe('路径管理 IPC', () => {
         relaunch: () => { calls.push('relaunch') },
         quit: () => { calls.push('quit') },
       },
-      getAllWindows: () => [],
+      getExpectedWebContents: () => expectedWebContents,
       hasActiveTasks: () => {
         calls.push('check-tasks')
         return false
@@ -234,7 +258,7 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
-    await handler({}, '/data/proma-new')
+    await handler(expectedEvent, '/data/proma-new')
 
     expect(calls).toEqual([
       'check-tasks',
@@ -263,7 +287,7 @@ describe('路径管理 IPC', () => {
         removeHandler: () => undefined,
       },
       app: { relaunch: () => undefined, quit: () => undefined },
-      getAllWindows: () => [],
+      getExpectedWebContents: () => expectedWebContents,
       hasActiveTasks: () => true,
       coordinator: {
         getStatus: () => createLocatorResult().state,
@@ -279,7 +303,7 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
-    await expect(handler({}, '/data/proma-new')).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
+    await expect(handler(expectedEvent, '/data/proma-new')).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
     expect(created).toBe(false)
   })
 
@@ -303,7 +327,7 @@ describe('路径管理 IPC', () => {
         relaunch: () => { relaunchCalls.push('relaunch') },
         quit: () => { relaunchCalls.push('quit') },
       },
-      getAllWindows: () => [],
+      getExpectedWebContents: () => expectedWebContents,
       hasActiveTasks: () => {
         activeChecks += 1
         return activeChecks === 3
@@ -326,7 +350,7 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
-    await expect(handler({}, '/data/proma-new')).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
+    await expect(handler(expectedEvent, '/data/proma-new')).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
     expect(cancelled).toBe(true)
     expect(relaunchCalls).toEqual([])
   })
@@ -357,12 +381,12 @@ describe('路径管理 IPC', () => {
         relaunch: () => { calls.push('relaunch') },
         quit: () => { calls.push('quit') },
       },
-      getAllWindows: () => [],
+      getExpectedWebContents: () => expectedWebContents,
     })
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
     if (!handler) throw new Error('未注册数据根恢复通道')
-    handler({}, { action: 'relocate', selectedRoot: relocatedRoot })
+    handler(expectedEvent, { action: 'relocate', selectedRoot: relocatedRoot })
 
     expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({
       activeRoot: relocatedRoot,
@@ -399,12 +423,12 @@ describe('路径管理 IPC', () => {
         removeHandler: () => undefined,
       },
       app: { relaunch: () => undefined, quit: () => undefined },
-      getAllWindows: () => [],
+      getExpectedWebContents: () => expectedWebContents,
     })
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
     if (!handler) throw new Error('未注册数据根恢复通道')
-    handler({}, { action: 'restore-previous' })
+    handler(expectedEvent, { action: 'restore-previous' })
 
     expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({
       activeRoot: previousRoot,
@@ -437,12 +461,12 @@ describe('路径管理 IPC', () => {
         removeHandler: () => undefined,
       },
       app: { relaunch: () => undefined, quit: () => undefined },
-      getAllWindows: () => [],
+      getExpectedWebContents: () => expectedWebContents,
     })
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
     if (!handler) throw new Error('未注册数据根恢复通道')
-    expect(() => handler({}, { action: 'relocate', selectedRoot: markerOnlyRoot })).not.toThrow()
+    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: markerOnlyRoot })).not.toThrow()
     expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({
       activeRoot: markerOnlyRoot,
       previousRoot: offlineRoot,
@@ -473,14 +497,14 @@ describe('路径管理 IPC', () => {
         removeHandler: () => undefined,
       },
       app: { relaunch: () => undefined, quit: () => undefined },
-      getAllWindows: () => [],
+      getExpectedWebContents: () => expectedWebContents,
     })
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
     if (!handler) throw new Error('未注册数据根恢复通道')
-    expect(() => handler({}, { action: 'relocate', selectedRoot: emptyRoot }))
+    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: emptyRoot }))
       .toThrow('所选目录不是可识别的 Proma 数据根')
-    expect(() => handler({}, { action: 'relocate', selectedRoot: ordinaryRoot }))
+    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: ordinaryRoot }))
       .toThrow('所选目录不是可识别的 Proma 数据根')
     expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({ activeRoot: offlineRoot })
   })
@@ -516,14 +540,14 @@ describe('路径管理 IPC', () => {
         removeHandler: () => undefined,
       },
       app: { relaunch: () => undefined, quit: () => undefined },
-      getAllWindows: () => [],
+      getExpectedWebContents: () => expectedWebContents,
     })
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
     if (!handler) throw new Error('未注册数据根恢复通道')
-    expect(() => handler({}, { action: 'relocate', selectedRoot: relocatedRoot }))
+    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: relocatedRoot }))
       .toThrow('迁移已提交但仍待清理')
-    expect(() => handler({}, { action: 'restore-previous' }))
+    expect(() => handler(expectedEvent, { action: 'restore-previous' }))
       .toThrow('迁移已提交但仍待清理')
     expect(locator.inspect().locatorFile).toEqual({
       version: 1,

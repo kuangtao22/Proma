@@ -17,6 +17,25 @@ import { ensurePromaDataRootMarker } from './data-root-marker'
 /** 路径 IPC handler 接收 Electron event 和经过 preload 约束的参数。 */
 type PathManagementHandler = (event: unknown, ...args: unknown[]) => unknown
 
+/** 所有 invoke handler 通道；每次按 mode 注册前统一清除旧集合。 */
+const PATH_MANAGEMENT_HANDLER_CHANNELS: readonly string[] = [
+  PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
+  PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
+  PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
+  PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS,
+  PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION,
+  PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_DATA_ROOT_MIGRATION,
+  PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT,
+  PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
+  PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP,
+]
+
+/** 路径 IPC event 必须携带调用方 webContents 身份。 */
+interface PathManagementInvokeEvent {
+  /** Electron invoke 调用的 renderer webContents。 */
+  sender: object
+}
+
 /** 路径 IPC 注册所需的最小 Electron 主进程接口。 */
 export interface PathManagementIpcRegistrar {
   /** 注册一个 invoke handler。 */
@@ -78,8 +97,8 @@ export interface RegisterPathManagementIpcOptions {
   ipc: PathManagementIpcRegistrar
   /** Electron 应用生命周期接口。 */
   app: PathManagementApp
-  /** 获取当前全部窗口，用于广播进度。 */
-  getAllWindows: () => PathManagementWindow[]
+  /** 动态取得当前模式唯一获授权的 renderer webContents。 */
+  getExpectedWebContents: () => PathManagementWindow['webContents'] | null
   /** 可选目录选择器；测试与无 UI 环境可省略。 */
   dialog?: PathManagementDialog
   /** 可选系统文件管理器；测试与无 UI 环境可省略。 */
@@ -89,9 +108,9 @@ export interface RegisterPathManagementIpcOptions {
   /** 正常模式迁移前检查 Agent 与 Automation 是否活跃。 */
   hasActiveTasks?: () => boolean
   /** 正常模式迁移前检查是否存在共享数据根的其他实例。 */
-  hasOtherPromaInstance?: () => boolean
+  hasOtherPromaInstance?: () => boolean | Promise<boolean>
   /** 取得跨 dev/prod 共享的迁移 intent，阻止新 normal 实例进入。 */
-  acquireMigrationGuard?: () => DataRootMigrationGuard
+  acquireMigrationGuard?: () => DataRootMigrationGuard | Promise<DataRootMigrationGuard>
   /** 测试可注入独立 home；生产固定使用系统 home。 */
   homeDir?: string
 }
@@ -131,17 +150,19 @@ export function registerPathManagementIpcHandlers(
   }
   /** 本次实际注册的通道，防止迁移模式意外暴露业务 IPC。 */
   const registeredChannels: string[] = []
+  /** mode 可能在开发热重载中变化，先删除全部旧 handler 再建立最小 allowlist。 */
+  for (const channel of PATH_MANAGEMENT_HANDLER_CHANNELS) options.ipc.removeHandler(channel)
   /** 注册前先移除同名 handler，兼容 Electron 开发热重载。 */
   const register = (channel: string, handler: PathManagementHandler): void => {
-    options.ipc.removeHandler(channel)
-    options.ipc.handle(channel, handler)
+    options.ipc.handle(channel, (event, ...args) => {
+      assertExpectedSender(event, options.getExpectedWebContents())
+      return handler(event, ...args)
+    })
     registeredChannels.push(channel)
   }
-  /** 向仍存活的路径窗口广播进度。 */
+  /** 只向当前获授权的路径窗口推送迁移进度。 */
   const broadcastProgress = (progress: DataRootMigrationProgress): void => {
-    for (const window of options.getAllWindows()) {
-      if (!window.isDestroyed()) window.webContents.send(PATH_MANAGEMENT_IPC_CHANNELS.PROGRESS, progress)
-    }
+    options.getExpectedWebContents()?.send(PATH_MANAGEMENT_IPC_CHANNELS.PROGRESS, progress)
   }
   /** 同一调用栈请求重启并退出，不留下 setImmediate 竞态窗口。 */
   const relaunchNow = (): void => {
@@ -153,39 +174,19 @@ export function registerPathManagementIpcHandlers(
     homeDir: options.homeDir ?? homedir(),
   }).inspect()
 
-  register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, () => (
-    options.mode === 'data-root-recovery' ? inspectFresh().state : getCoordinator().getStatus()
-  ))
-  register(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, async () => {
-    if (!options.dialog) throw new Error('当前环境不支持选择数据根目录')
-    /** 用户通过系统对话框选择的目录结果。 */
-    const result = await options.dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
-    return result.canceled ? null : result.filePaths[0] ?? null
-  })
-  register(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, () => {
-    /** recovery 直接读取 locator，其他模式复用协调器的 cleanup 重试结果。 */
-    const state = options.mode === 'data-root-recovery'
-      ? inspectFresh().state
-      : getCoordinator().getStatus()
-    return {
-      migration: state.migration,
-      ...(state.postCommitCleanup === undefined ? {} : { postCommitCleanup: state.postCommitCleanup }),
-    }
-  })
-
   if (options.mode === 'normal') {
     register(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, async (_event, targetRoot) => {
       if (typeof targetRoot !== 'string') throw new Error('目标数据根必须是字符串')
-      assertMigrationCanStart(options)
+      await assertMigrationCanStart(options)
       /** intent guard 关闭其他 normal 实例的新入口，直到当前进程退出。 */
-      const migrationGuard = options.acquireMigrationGuard?.()
+      const migrationGuard = await options.acquireMigrationGuard?.()
       try {
         // 取得 intent 后二次预检，排除 intent 竞争窗口内进入的实例与任务。
-        assertMigrationCanStart(options)
+        await assertMigrationCanStart(options)
         await getCoordinator().createPlan(targetRoot)
         try {
           // createPlan 的磁盘预检会让出事件循环；落盘后复检并撤销期间新出现的任务。
-          assertMigrationCanStart(options)
+          await assertMigrationCanStart(options)
         } catch (error) {
           await getCoordinator().cancel()
           throw error
@@ -198,6 +199,7 @@ export function registerPathManagementIpcHandlers(
       }
     })
   } else if (options.mode === 'data-root-migration') {
+    register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, () => getCoordinator().getStatus())
     register(PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION, async () => {
       await getCoordinator().resumePending(broadcastProgress)
       relaunchNow()
@@ -206,12 +208,20 @@ export function registerPathManagementIpcHandlers(
       await getCoordinator().cancel()
       relaunchNow()
     })
+  } else {
+    register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, () => inspectFresh().state)
+    register(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, async () => {
+      if (!options.dialog) throw new Error('当前环境不支持选择数据根目录')
+      /** 用户通过系统对话框选择的目录结果。 */
+      const result = await options.dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
+      return result.canceled ? null : result.filePaths[0] ?? null
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT, (_event, input) => {
+      recoverDataRoot(input, options.homeDir ?? homedir(), inspectFresh())
+      if (isRecoveryResolved(input, inspectFresh())) relaunchNow()
+    })
   }
 
-  register(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT, (_event, input) => {
-    recoverDataRoot(input, options.homeDir ?? homedir(), inspectFresh())
-    if (isRecoveryResolved(input, inspectFresh())) relaunchNow()
-  })
   register(PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, async () => {
     if (!options.shell) throw new Error('当前环境不支持打开数据根目录')
     /** 优先使用新鲜 recovery 状态，普通模式复用协调器状态。 */
@@ -223,9 +233,18 @@ export function registerPathManagementIpcHandlers(
     const error = await options.shell.openPath(activeRoot)
     if (error) throw new Error(error)
   })
-  register(PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP, () => { options.app.quit() })
+  if (options.mode !== 'normal') {
+    register(PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP, () => { options.app.quit() })
+  }
 
   return registeredChannels
+}
+
+/** 拒绝任何非当前模式预期窗口发起的路径 IPC。 */
+function assertExpectedSender(event: unknown, expected: object | null): asserts event is PathManagementInvokeEvent {
+  if (expected === null || typeof event !== 'object' || event === null || !('sender' in event) || event.sender !== expected) {
+    throw new Error('当前窗口无权执行路径管理操作')
+  }
 }
 
 /** 延迟创建默认协调器，确保 recovery 模式不会触发迁移或 cleanup。 */
@@ -235,9 +254,11 @@ function getDefaultCoordinator(locator: DataRootLocator): DataRootMigrationCoord
 }
 
 /** 正常模式迁移计划写入前检查全部运行时互斥条件。 */
-function assertMigrationCanStart(options: RegisterPathManagementIpcOptions): void {
+async function assertMigrationCanStart(options: RegisterPathManagementIpcOptions): Promise<void> {
   if (options.hasActiveTasks?.() === true) throw new Error('仍有 Agent 或 Automation 正在运行，无法迁移数据根')
-  if (options.hasOtherPromaInstance?.() === true) throw new Error('另一个 Proma 实例正在使用数据根，无法迁移')
+  if (await options.hasOtherPromaInstance?.() === true) {
+    throw new Error('另一个 Proma 实例正在使用数据根，无法迁移')
+  }
 }
 
 /** 执行无普通业务依赖的数据根恢复动作。 */
