@@ -240,14 +240,26 @@ export async function inspectDirectoryCopySpace(
   if (!sourceStats.isDirectory()) throw new Error('复制源根必须是实际目录')
   /** 解析符号链接后的规范源根路径。 */
   const canonicalSourceRoot = await realpath(requestedSourceRoot)
-  /** 目标根在断点恢复阶段必须已经存在且为实际目录。 */
+  /** 目标最近现存祖先与预计规范路径，用于覆盖 sidecar 后、mkdir 前崩溃的恢复窗口。 */
+  const prospectiveTarget = await resolveProspectivePath(requestedTargetRoot)
+  validateRootRelationship(canonicalSourceRoot, prospectiveTarget.canonicalPath)
+  /** 与正式复制相同的源清单。 */
+  const manifest = await scanDirectory(canonicalSourceRoot, input.signal)
+  if (!prospectiveTarget.exists) {
+    await assertDirectoryIdentity(prospectiveTarget.anchor)
+    return {
+      totalBytes: manifest.totalBytes,
+      reusableBytes: 0,
+      remainingBytes: manifest.totalBytes,
+    }
+  }
+  /** 已存在目标根必须是 no-follow 实际目录。 */
   const targetStats = await lstat(requestedTargetRoot, { bigint: true })
   if (!targetStats.isDirectory()) throw new Error('复制目标根必须是实际目录')
   /** 目标根的路径与 inode 身份，用于防止扫描期间被替换。 */
   const targetRootIdentity = await captureDirectoryIdentity(requestedTargetRoot)
   validateRootRelationship(canonicalSourceRoot, targetRootIdentity.canonicalPath)
-  /** 与正式复制相同的源清单和目标 no-follow 快照。 */
-  const manifest = await scanDirectory(canonicalSourceRoot, input.signal)
+  /** 与正式复制相同的目标 no-follow 快照。 */
   const snapshot = await scanTargetTree(targetRootIdentity, input.signal)
   /** 按相对路径索引的目标树 no-follow 快照。 */
   const targetEntries = new Map(snapshot.entries.map((entry) => [entry.relativePath, entry]))
@@ -266,7 +278,7 @@ export async function inspectDirectoryCopySpace(
     if (!parentIdentity) continue
     /** 当前源文件内容哈希，用于判断目标文件是否可安全复用。 */
     const sourceHash = await hashManifestFile(entry, signal)
-    if (!await isVerifiedTargetFile(targetEntry.path, parentIdentity, entry, sourceHash, signal)) continue
+    if (!await isReusableFile(targetEntry.path, parentIdentity, entry, sourceHash, signal)) continue
     reusableBytes += entry.size
     if (!Number.isSafeInteger(reusableBytes)) throw new Error('可复用字节数超过安全整数范围')
   }

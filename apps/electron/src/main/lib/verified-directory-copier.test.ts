@@ -212,14 +212,8 @@ describe('verified-directory-copier', () => {
     const fixture = createFixture(testRoot)
     writeFileSync(join(fixture.sourceRoot, 'reused.bin'), '1234')
     writeFileSync(join(fixture.sourceRoot, 'pending.bin'), '123456')
-    mkdirSync(fixture.targetRoot)
-    writeFileSync(join(fixture.targetRoot, 'reused.bin'), '1234')
-    writeFileSync(getSidecarPath(fixture.targetRoot), JSON.stringify({
-      version: 1,
-      migrationId: 'migration-current',
-      sourceRoot: resolve(fixture.sourceRoot),
-      targetRoot: resolve(fixture.targetRoot),
-    }))
+    await copyFixture(fixture)
+    unlinkSync(join(fixture.targetRoot, 'pending.bin'))
 
     await expect(inspectDirectoryCopySpace({
       migrationId: 'migration-current',
@@ -230,6 +224,57 @@ describe('verified-directory-copier', () => {
       reusableBytes: 4,
       remainingBytes: 6,
     })
+  })
+
+  test('Given 目标内容相同但 metadata 不一致 When 检查剩余空间 Then 按实际 copier 谓词计为全量待写入', async () => {
+    const fixture = createFixture(testRoot)
+    /** 用于制造 metadata 漂移的源文件。 */
+    const sourceFile = join(fixture.sourceRoot, 'metadata.bin')
+    /** 已由真实 copier 创建、随后修改时间漂移的目标文件。 */
+    const targetFile = join(fixture.targetRoot, 'metadata.bin')
+    writeFileSync(sourceFile, '1234')
+    await copyFixture(fixture)
+    utimesSync(targetFile, new Date(0), new Date(0))
+
+    await expect(inspectDirectoryCopySpace({
+      migrationId: 'migration-current',
+      sourceRoot: fixture.sourceRoot,
+      targetRoot: fixture.targetRoot,
+    })).resolves.toEqual({
+      totalBytes: 4,
+      reusableBytes: 0,
+      remainingBytes: 4,
+    })
+  })
+
+  test('Given owned sidecar 已写入但目标根尚未创建 When 检查剩余空间 Then 返回全量并允许 copier 创建目标', async () => {
+    const fixture = createFixture(testRoot)
+    writeFileSync(join(fixture.sourceRoot, 'pending.bin'), '123456')
+    writeFileSync(getSidecarPath(fixture.targetRoot), JSON.stringify({
+      version: 1,
+      migrationId: 'migration-current',
+      sourceRoot: resolve(fixture.sourceRoot),
+      targetRoot: resolve(fixture.targetRoot),
+    }))
+
+    await expect(inspectDirectoryCopySpace({
+      migrationId: 'foreign-migration',
+      sourceRoot: fixture.sourceRoot,
+      targetRoot: fixture.targetRoot,
+    })).rejects.toThrow('不属于当前迁移')
+    await expect(inspectDirectoryCopySpace({
+      migrationId: 'migration-current',
+      sourceRoot: fixture.sourceRoot,
+      targetRoot: fixture.targetRoot,
+    })).resolves.toEqual({
+      totalBytes: 6,
+      reusableBytes: 0,
+      remainingBytes: 6,
+    })
+    expect(existsSync(fixture.targetRoot)).toBe(false)
+
+    await copyFixture(fixture)
+    expect(readFileSync(join(fixture.targetRoot, 'pending.bin'), 'utf-8')).toBe('123456')
   })
 
   test('Given 空源目录与经符号链接父目录指回源的目标别名 When 复制 Then copier 自身拒绝物理同路径', async () => {
