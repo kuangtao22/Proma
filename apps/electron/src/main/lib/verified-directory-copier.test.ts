@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -9,6 +10,7 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
@@ -159,6 +161,22 @@ describe('verified-directory-copier', () => {
       targetRoot: aliasedTarget,
       onProgress: () => {},
     })).rejects.toThrow('物理路径')
+  })
+
+  test('Given sourceRoot 本身是符号链接 When 开始复制 Then 在 realpath 前拒绝链接根', async () => {
+    if (process.platform === 'win32') return
+    /** 当前用例的真实源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    /** 直接指向真实源根的符号链接路径。 */
+    const linkedSourceRoot = join(testRoot, 'linked-source')
+    symlinkSync(fixture.sourceRoot, linkedSourceRoot, 'dir')
+
+    await expect(copyDirectoryVerified({
+      migrationId: 'migration-current',
+      sourceRoot: linkedSourceRoot,
+      targetRoot: fixture.targetRoot,
+      onProgress: () => {},
+    })).rejects.toThrow('实际目录')
   })
 
   test('Given 不同迁移标识的目标 marker When 开始复制 Then 拒绝接管目标', async () => {
@@ -425,6 +443,47 @@ describe('verified-directory-copier', () => {
       },
     })).rejects.toThrow('源目录')
     expect(existsSync(getSidecarPath(fixture.targetRoot))).toBe(true)
+  })
+
+  test('Given 复制验证阶段源文件 chmod 变化 When 最终重扫 Then 因 mode 变化失败', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    /** 验证阶段将被修改权限的源文件。 */
+    const sourceFile = join(fixture.sourceRoot, 'mode-change.txt')
+    writeFileSync(sourceFile, 'stable-content')
+    chmodSync(sourceFile, 0o600)
+    /** 是否已经修改过源文件权限。 */
+    let changedMode = false
+
+    await expect(copyFixture(fixture, {
+      onProgress: (progress) => {
+        if (progress.stage !== 'verifying' || changedMode) return
+        changedMode = true
+        chmodSync(sourceFile, 0o640)
+      },
+    })).rejects.toThrow('源目录')
+  })
+
+  test('Given 同大小源内容变化且恢复旧 mtime When 最终源哈希复验 Then 仍明确失败', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    /** 将在复制后被同大小改写的源文件。 */
+    const sourceFile = join(fixture.sourceRoot, 'content-change.txt')
+    writeFileSync(sourceFile, 'before')
+    /** 可精确恢复到毫秒边界的固定时间。 */
+    const fixedTime = new Date('2026-01-02T03:04:05.000Z')
+    utimesSync(sourceFile, fixedTime, fixedTime)
+    /** 是否已经完成同大小内容替换。 */
+    let changedContent = false
+
+    await expect(copyFixture(fixture, {
+      onProgress: (progress) => {
+        if (progress.stage !== 'verifying' || changedContent) return
+        changedContent = true
+        writeFileSync(sourceFile, 'after!')
+        utimesSync(sourceFile, fixedTime, fixedTime)
+      },
+    })).rejects.toThrow('源文件内容')
   })
 
   test('Given concurrency=2 且一个 worker 回调失败 When 任务拒绝 Then 其他 worker 中断并且不再后台提交', async () => {

@@ -464,6 +464,7 @@ async function assertOpenSourceMatchesManifest(handle: FileHandle, entry: Scanne
   if (!stats.isFile()
     || stats.dev !== entry.dev
     || stats.ino !== entry.ino
+    || Number(stats.mode) !== entry.mode
     || stats.size !== entry.sizeBigInt
     || stats.mtimeNs !== entry.mtimeNs) {
     throw new Error(`源目录普通文件在复制期间发生变化: ${entry.relativePath}`)

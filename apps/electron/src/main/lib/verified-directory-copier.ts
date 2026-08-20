@@ -173,6 +173,7 @@ export async function copyDirectoryVerified(input: CopyDirectoryInput): Promise<
     /** 最终源重扫捕获新增、删除、类型、大小、mtime 和身份变化。 */
     const finalManifest = await scanDirectory(normalizedInput.sourceRoot, input.signal)
     assertManifestUnchanged(manifest, finalManifest)
+    await assertSourceFilesMatchHashes(context)
     await assertStableRoots(context)
     /** 完成前再次 reconciliation 并精确验证目标集合。 */
     context.targetDirectories = await reconcileTarget(manifest, roots.targetRootIdentity, input.signal)
@@ -200,6 +201,9 @@ async function normalizeInput(input: CopyDirectoryInput): Promise<NormalizedCopy
   const requestedSourceRoot = resolve(input.sourceRoot)
   /** marker 中保留的调用方目标绝对路径。 */
   const requestedTargetRoot = resolve(input.targetRoot)
+  /** realpath 前的源根 no-follow lstat，源根本身不能是符号链接。 */
+  const requestedSourceStats = await lstat(requestedSourceRoot, { bigint: true })
+  if (!requestedSourceStats.isDirectory()) throw new Error('复制源根必须是实际目录，不能是符号链接或普通文件')
   /** 现存源根的真实路径。 */
   const canonicalSourceRoot = await realpath(requestedSourceRoot)
   /** 目标最近现存祖先解析后的预计真实路径。 */
@@ -346,7 +350,11 @@ function assertManifestUnchanged(initial: DirectoryManifest, current: DirectoryM
 
 /** 比较两个清单条目的类型、身份、mtime 和类型专属字段。 */
 function sameScannedEntry(left: ScannedEntry, right: ScannedEntry): boolean {
-  if (left.kind !== right.kind || left.dev !== right.dev || left.ino !== right.ino || left.mtimeNs !== right.mtimeNs) return false
+  if (left.kind !== right.kind
+    || left.dev !== right.dev
+    || left.ino !== right.ino
+    || left.mode !== right.mode
+    || left.mtimeNs !== right.mtimeNs) return false
   if (left.kind === 'file' && right.kind === 'file') return left.sizeBigInt === right.sizeBigInt
   if (left.kind === 'symbolic-link' && right.kind === 'symbolic-link') return left.linkTarget === right.linkTarget
   return left.kind === 'directory' && right.kind === 'directory'
@@ -573,6 +581,19 @@ async function assertTargetMatchesManifest(context: CopyContext): Promise<void> 
         throw new Error(`最终目标符号链接校验失败: ${sourceEntry.relativePath}`)
       }
     }
+  }
+}
+
+/** 最终重新哈希所有普通源文件，捕获伪造回旧 mtime 的同大小内容变化。 */
+async function assertSourceFilesMatchHashes(context: CopyContext): Promise<void> {
+  for (const entry of context.manifest.leaves) {
+    if (entry.kind !== 'file') continue
+    /** 复制前记录的源 SHA-256。 */
+    const expectedHash = context.sourceHashes.get(entry.relativePath)
+    if (!expectedHash) throw new Error(`缺少源文件哈希: ${entry.relativePath}`)
+    /** 最终通过稳定句柄重新计算的源 SHA-256。 */
+    const currentHash = await hashManifestFile(entry, context.signal)
+    if (currentHash !== expectedHash) throw new Error(`源文件内容在复制期间发生变化: ${entry.relativePath}`)
   }
 }
 
