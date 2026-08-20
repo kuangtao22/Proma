@@ -10,6 +10,16 @@ import { join, basename, relative, resolve } from 'node:path'
 import { mkdirSync, existsSync, cpSync, rmSync, readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { rmSyncWithRetry } from './fs-retry'
+import { DataRootLocator, type RequireActiveRootOptions } from './data-root-locator'
+
+/** 配置路径只依赖活动数据根解析能力，便于测试按实例隔离。 */
+export interface ConfigRootResolver {
+  /** 返回当前进程固定使用的活动数据根。 */
+  requireActiveRoot(options?: RequireActiveRootOptions): string
+}
+
+/** 默认定位器在模块生命周期内唯一，确保正常运行中数据根不会热切换。 */
+const defaultConfigRootResolver: ConfigRootResolver = new DataRootLocator({ homeDir: homedir() })
 
 /**
  * 获取配置目录名称
@@ -24,18 +34,13 @@ export function getConfigDirName(): string {
 /**
  * 获取配置目录路径
  *
- * 开发版与打包版均返回 ~/.proma/。
- * 如果目录不存在则自动创建。
+ * 开发版与打包版默认返回 ~/.proma/，配置自定义数据根后返回其绝对路径。
+ * 缺失的默认根会按需创建；已配置但不可用的自定义根不会静默回退。
+ *
+ * @param resolver 活动数据根解析器；测试可注入独立实例，生产使用进程级默认实例。
  */
-export function getConfigDir(): string {
-  const configDir = join(homedir(), getConfigDirName())
-
-  if (!existsSync(configDir)) {
-    mkdirSync(configDir, { recursive: true })
-    console.log(`[配置] 已创建配置目录: ${configDir}`)
-  }
-
-  return configDir
+export function getConfigDir(resolver: ConfigRootResolver = defaultConfigRootResolver): string {
+  return resolver.requireActiveRoot({ createDefault: true })
 }
 
 /**
@@ -239,8 +244,9 @@ export function getAgentWorkspacesIndexPath(): string {
  *
  * @returns ~/.proma/agent-workspaces/
  */
-export function getAgentWorkspacesDir(): string {
-  const dir = join(getConfigDir(), 'agent-workspaces')
+export function getAgentWorkspacesDir(resolver: ConfigRootResolver = defaultConfigRootResolver): string {
+  /** Agent 工作区根必须与调用方解析出的业务数据根保持一致。 */
+  const dir = join(getConfigDir(resolver), 'agent-workspaces')
 
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true })
@@ -256,10 +262,15 @@ export function getAgentWorkspacesDir(): string {
  * 如果目录不存在则自动创建。
  *
  * @param slug 工作区 slug
+ * @param resolver 活动数据根解析器；测试可注入独立实例。
  * @returns ~/.proma/agent-workspaces/{slug}/
  */
-export function getAgentWorkspacePath(slug: string): string {
-  const dir = join(getAgentWorkspacesDir(), slug)
+export function getAgentWorkspacePath(
+  slug: string,
+  resolver: ConfigRootResolver = defaultConfigRootResolver,
+): string {
+  /** 指定工作区必须沿用同一次调用传入的数据根解析器。 */
+  const dir = join(getAgentWorkspacesDir(resolver), slug)
 
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true })

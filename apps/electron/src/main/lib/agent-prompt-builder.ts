@@ -4,11 +4,10 @@
  */
 
 import type { PromaPermissionMode, SessionWorkbenchLayout } from '@proma/shared'
-import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { getUserProfile } from './user-profile-service'
-import { getAgentWorkspaceBySlug, getProjectFilesPath, getWorkspaceMcpConfig, type WorkspaceMemoryGuidance } from './agent-workspace-manager'
-import { getConfigDirName } from './config-paths'
+import { getAgentWorkspaceBySlug, getWorkspaceMcpConfig, type WorkspaceMemoryGuidance } from './agent-workspace-manager'
+import { getAgentWorkspacePath, type ConfigRootResolver } from './config-paths'
 import { buildGitAttributionPromptSection, isGitAttributionEnabled } from './agent-git-attribution'
 import { getSettings } from './settings-service'
 import type { ProjectInstructionSource } from './project-instruction-resolver'
@@ -36,6 +35,8 @@ interface SystemPromptContext {
   memoryGuidance?: WorkspaceMemoryGuidance
   /** 惰性周检命中时才提供；它只邀请用户复查，绝不自动读写历史。 */
   memoryRefreshOpportunity?: { memoryUpdatedAt?: number; newestSessionAt: number; newerSessionCount: number }
+  /** 测试可注入独立数据根解析器；生产缺省使用进程级默认定位器。 */
+  configRootResolver?: ConfigRootResolver
 }
 
 function buildWorkspacePaths(
@@ -43,11 +44,14 @@ function buildWorkspacePaths(
   sessionId: string,
   agentCwd?: string,
   sessionWorkbenchLayout: SessionWorkbenchLayout = 'legacy-context',
+  configRootResolver?: ConfigRootResolver,
 ) {
-  const configDirName = getConfigDirName()
-  const workspaceRoot = join(homedir(), configDirName, 'agent-workspaces', workspaceSlug)
+  /** 所有 Proma 受管路径都从统一配置路径入口解析。 */
+  const workspaceRoot = getAgentWorkspacePath(workspaceSlug, configRootResolver)
   const sessionDir = join(workspaceRoot, sessionId)
-  const projectRoot = getProjectFilesPath(workspaceSlug)
+  /** 本地项目沿用用户目录；托管项目直接位于当前数据根的工作区内。 */
+  const agentWorkspace = getAgentWorkspaceBySlug(workspaceSlug)
+  const projectRoot = agentWorkspace?.projectRootPath ?? join(workspaceRoot, 'workspace-files')
   const effectiveAgentCwd = agentCwd ?? projectRoot
 
   return {
@@ -59,7 +63,7 @@ function buildWorkspacePaths(
     workspaceContextDir: join(projectRoot, '.context'),
     agentCwd: effectiveAgentCwd,
     isProjectCwd: resolve(effectiveAgentCwd) === resolve(projectRoot),
-    isLocalProject: Boolean(getAgentWorkspaceBySlug(workspaceSlug)?.projectRootPath),
+    isLocalProject: Boolean(agentWorkspace?.projectRootPath),
     agentsMd: join(workspaceRoot, 'AGENTS.md'),
     projectAgentsMd: join(projectRoot, 'AGENTS.md'),
     autoMemoryDir: join(workspaceRoot, 'memory'),
@@ -73,7 +77,13 @@ function buildWorkspacePaths(
 export function buildSystemPrompt(ctx: SystemPromptContext): string {
   const userName = getUserProfile().userName || '用户'
   const workspace = ctx.workspaceSlug
-    ? buildWorkspacePaths(ctx.workspaceSlug, ctx.sessionId, ctx.agentCwd, ctx.sessionWorkbenchLayout)
+    ? buildWorkspacePaths(
+        ctx.workspaceSlug,
+        ctx.sessionId,
+        ctx.agentCwd,
+        ctx.sessionWorkbenchLayout,
+        ctx.configRootResolver,
+      )
     : undefined
   const sessionContextDir = workspace?.sessionContextDir ?? '.context'
   const projectContextDir = workspace?.workspaceContextDir ?? '.context'
