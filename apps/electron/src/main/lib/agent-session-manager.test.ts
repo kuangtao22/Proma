@@ -566,7 +566,7 @@ describe('Pi entry binding recovery', () => {
 })
 
 describe('Agent 会话引用 prompt', () => {
-  test('Given 自定义数据根 When 构建恢复提示 Then History 与 CLI 参数使用同一绝对根', () => {
+  test('Given bundled CLI 与自定义数据根 When 构建恢复提示 Then 命令依赖运行环境且不重复绝对路径参数', () => {
     /** 模拟带空格的活动数据根。 */
     const customRoot = join(tempHome, 'Proma Data')
     /** 模拟随应用分发的 CLI，使提示词进入 session-cleaner 分支。 */
@@ -598,7 +598,8 @@ describe('Agent 会话引用 prompt', () => {
       )
 
       expect(prompt).toContain(join(customRoot, 'agent-sessions', 'session-1.jsonl'))
-      expect(prompt).toContain(`--config-dir "${customRoot}"`)
+      expect(prompt).toContain('"$PROMA_CLI" session info session-1')
+      expect(prompt).not.toContain('--config-dir')
       expect(prompt).not.toContain('~/.proma/agent-sessions')
     } finally {
       Object.defineProperty(processWithResourcesPath, 'resourcesPath', {
@@ -609,6 +610,36 @@ describe('Agent 会话引用 prompt', () => {
       rmSync(join(tempHome, '.proma-location.json'), { force: true })
       rmSync(customRoot, { recursive: true, force: true })
       rmSync(join(tempHome, 'bin'), { recursive: true, force: true })
+    }
+  })
+
+  test('Given 非 bundled CLI When 构建恢复提示 Then 推荐 proma 并依赖相同运行环境', () => {
+    /** 空 resources 目录保证不存在随应用分发的 CLI。 */
+    const resourcesDir = join(tempHome, 'resources-without-cli')
+    mkdirSync(resourcesDir, { recursive: true })
+    const processWithResourcesPath = process as NodeJS.Process & { resourcesPath?: string }
+    const originalResourcesPath = processWithResourcesPath.resourcesPath
+    Object.defineProperty(processWithResourcesPath, 'resourcesPath', {
+      value: resourcesDir,
+      configurable: true,
+      writable: true,
+    })
+    try {
+      const prompt = contextPrompt.buildRecoveryPrompt(
+        'session-1',
+        '继续任务',
+        { agentCwd: tempHome, workspaceSlug: 'proma' },
+      )
+
+      expect(prompt).toContain('proma session info session-1')
+      expect(prompt).not.toContain('--config-dir')
+    } finally {
+      Object.defineProperty(processWithResourcesPath, 'resourcesPath', {
+        value: originalResourcesPath,
+        configurable: true,
+        writable: true,
+      })
+      rmSync(resourcesDir, { recursive: true, force: true })
     }
   })
 

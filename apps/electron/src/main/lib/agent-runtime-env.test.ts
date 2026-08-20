@@ -37,9 +37,24 @@ describe('Agent Windows Shell 运行环境', () => {
     expect(result.env.PROMA_CONFIG_DIR).toBe(configDir)
   })
 
+  test('Given 没有随应用 CLI When 构建 Agent 环境 Then 仍注入活动数据根', () => {
+    /** 模拟系统 PATH 中的 proma CLI 与 Electron 共享的业务数据根。 */
+    const configDir = 'C:\\Users\\alice\\Proma Data'
+    const result = buildAgentRuntimeEnv({
+      bundledCliPath: '',
+      configDir,
+      platform: 'win32',
+      processEnv: {},
+    })
+
+    expect(result.env.PROMA_CONFIG_DIR).toBe(configDir)
+    expect(result.env.PROMA_CLI).toBeUndefined()
+  })
+
   test('Given Git Bash 与 WSL 均可用 When 使用默认策略 Then 优先使用 Git Bash', () => {
     const result = buildAgentRuntimeEnv({
       bundledCliPath: '',
+      configDir: 'C:\\Users\\alice\\.proma',
       platform: 'win32',
       processEnv: {},
       runtimeStatus: bothShells,
@@ -57,6 +72,7 @@ describe('Agent Windows Shell 运行环境', () => {
   test('Given Git Bash 与 WSL 均可用 When 用户显式选择 WSL Then 使用 WSL', () => {
     const result = buildAgentRuntimeEnv({
       bundledCliPath: '',
+      configDir: 'C:\\Users\\alice\\.proma',
       platform: 'win32',
       processEnv: {},
       runtimeStatus: bothShells,
@@ -77,6 +93,7 @@ describe('Agent Windows Shell 运行环境', () => {
   test('Given WSL 首选项不可用 When Git Bash 可用 Then 回退到 Git Bash', () => {
     const result = buildAgentRuntimeEnv({
       bundledCliPath: '',
+      configDir: 'C:\\Users\\alice\\.proma',
       platform: 'win32',
       processEnv: {},
       windowsShellPreference: 'wsl',

@@ -19,7 +19,7 @@ export interface BuildAgentRuntimeEnvOptions {
   runtimeStatus?: RuntimeStatus | null
   windowsShellPreference?: WindowsShellPreference
   bundledCliPath?: string
-  /** Electron 已解析的活动业务数据根；供随应用分发的 CLI 使用。 */
+  /** Electron 已解析的活动业务数据根；供 bundled 与 PATH 中的 CLI 共同使用。 */
   configDir?: string
   processEnv?: NodeJS.ProcessEnv
   platform?: NodeJS.Platform
@@ -191,10 +191,11 @@ export function buildAgentRuntimeEnv(options: BuildAgentRuntimeEnvOptions = {}):
   const bundledCliPath = options.bundledCliPath ?? getBundledCliPath()
   const env: Record<string, string> = {}
 
+  /** bundled CLI 与 PATH 中的 proma 都必须继承 Electron 已解析的同一业务根。 */
+  env.PROMA_CONFIG_DIR = options.configDir ?? getConfigDir()
+
   if (bundledCliPath) {
     env.PROMA_CLI = bundledCliPath
-    /** 仅存在随应用 CLI 时解析业务根，避免无关环境探测产生路径副作用。 */
-    env.PROMA_CONFIG_DIR = options.configDir ?? getConfigDir()
   }
 
   const pathKey = getPathKey(processEnv)

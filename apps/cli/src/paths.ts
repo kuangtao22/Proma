@@ -54,24 +54,30 @@ export function resolveConfigDir(
 
   /** locator 位于可迁移数据根之外，因此离线时仍可读取。 */
   const locatorPath = join(context.homeDir, '.proma-location.json')
-  if (!existsSync(locatorPath)) return join(context.homeDir, '.proma')
+  /** 与 Electron 保持相同恢复顺序：主文件、原子写临时文件、备份文件。 */
+  const locatorCandidates = [locatorPath, `${locatorPath}.tmp`, `${locatorPath}.bak`]
+  const existingCandidates = locatorCandidates.filter((candidatePath) => existsSync(candidatePath))
+  if (existingCandidates.length === 0) return join(context.homeDir, '.proma')
 
-  /** 只恢复 CLI 所需的活动根字段，不复制迁移执行状态机。 */
-  const locatorFile = readLocatorFile(locatorPath)
+  /** 首个 schema-valid 候选即为权威 locator；可用性失败时禁止尝试旧备份。 */
+  const locatorFile = readFirstValidLocatorFile(existingCandidates)
   assertReadableDataRoot(locatorFile.activeRoot)
   return locatorFile.activeRoot
 }
 
-/** 读取并严格校验固定 locator。 */
-function readLocatorFile(locatorPath: string): DataRootLocatorFile {
-  try {
-    /** JSON 先保持 unknown，校验通过后才作为路径使用。 */
-    const value: unknown = JSON.parse(readFileSync(locatorPath, 'utf-8'))
-    if (!isDataRootLocatorFile(value)) throw new Error('schema')
-    return value
-  } catch {
-    throw new Error('数据根定位文件无效')
+/** 按顺序读取候选，返回首个通过 schema 校验的 locator。 */
+function readFirstValidLocatorFile(locatorPaths: string[]): DataRootLocatorFile {
+  for (const locatorPath of locatorPaths) {
+    try {
+      /** JSON 先保持 unknown，校验通过后才作为路径使用。 */
+      const value: unknown = JSON.parse(readFileSync(locatorPath, 'utf-8'))
+      if (isDataRootLocatorFile(value)) return value
+    } catch {
+      /** 单个候选损坏时继续读取下一个恢复候选。 */
+    }
   }
+
+  throw new Error('数据根定位文件无效')
 }
 
 /** locator 存在时必须使用其活动根；离线或权限不足均不回退。 */

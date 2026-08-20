@@ -7,7 +7,7 @@ import type { PromaPermissionMode, SessionWorkbenchLayout } from '@proma/shared'
 import { join, resolve } from 'node:path'
 import { getUserProfile } from './user-profile-service'
 import { getAgentWorkspaceBySlug, getWorkspaceMcpConfig, type WorkspaceMemoryGuidance } from './agent-workspace-manager'
-import { getAgentWorkspacePath, type ConfigRootResolver } from './config-paths'
+import { getAgentWorkspacePath } from './config-paths'
 import { buildGitAttributionPromptSection, isGitAttributionEnabled } from './agent-git-attribution'
 import { getSettings } from './settings-service'
 import type { ProjectInstructionSource } from './project-instruction-resolver'
@@ -41,20 +41,39 @@ interface SystemPromptContext {
 
 /** 提示词构建所需的完整可变依赖，注入时必须作为一个整体提供。 */
 export interface SystemPromptDependencies {
-  /** 当前进程活动数据根解析器；缺省值表示使用 config-paths 默认实例。 */
-  configRootResolver: ConfigRootResolver | undefined
-  /** 按 slug 查询与同一数据根对应的工作区元数据。 */
-  getWorkspaceBySlug: (slug: string) => { projectRootPath?: string } | undefined
+  /** 一次返回同一活动数据根下的工作区路径与元数据，禁止调用方拆分来源。 */
+  resolveWorkspaceContext: (slug: string) => WorkspacePromptContext
   /** 返回系统提示词中使用的用户名称。 */
   getUserName: () => string
   /** 返回当前 Git 归因开关。 */
   isGitAttributionEnabled: () => boolean
 }
 
+/** 系统提示词消费的完整工作区上下文。 */
+export interface WorkspacePromptContext {
+  /** Proma 管理的工作区根目录。 */
+  workspaceRoot: string
+  /** 用户本地项目或 Proma 托管项目文件根目录。 */
+  projectRoot: string
+  /** 是否使用用户本地项目目录。 */
+  isLocalProject: boolean
+}
+
+/** 从进程级唯一活动数据根解析完整工作区上下文。 */
+function resolveDefaultWorkspaceContext(slug: string): WorkspacePromptContext {
+  /** config-paths 的默认 resolver 在进程内唯一，因此路径与索引读取共享同一活动根。 */
+  const workspaceRoot = getAgentWorkspacePath(slug)
+  const workspace = getAgentWorkspaceBySlug(slug)
+  return {
+    workspaceRoot,
+    projectRoot: workspace?.projectRootPath ?? join(workspaceRoot, 'workspace-files'),
+    isLocalProject: Boolean(workspace?.projectRootPath),
+  }
+}
+
 /** 生产环境统一使用现有服务，测试只能整体替换，避免半注入。 */
 const DEFAULT_SYSTEM_PROMPT_DEPENDENCIES: SystemPromptDependencies = {
-  configRootResolver: undefined,
-  getWorkspaceBySlug: (slug) => getAgentWorkspaceBySlug(slug),
+  resolveWorkspaceContext: resolveDefaultWorkspaceContext,
   getUserName: () => getUserProfile().userName || '用户',
   isGitAttributionEnabled: () => isGitAttributionEnabled(getSettings().gitAttributionEnabled),
 }
@@ -66,12 +85,10 @@ function buildWorkspacePaths(
   sessionWorkbenchLayout: SessionWorkbenchLayout = 'legacy-context',
   dependencies: SystemPromptDependencies = DEFAULT_SYSTEM_PROMPT_DEPENDENCIES,
 ) {
-  /** 所有 Proma 受管路径都从统一配置路径入口解析。 */
-  const workspaceRoot = getAgentWorkspacePath(workspaceSlug, dependencies.configRootResolver)
+  /** 单次 provider 调用同时确定路径与元数据，避免同 slug 跨数据根串读。 */
+  const workspaceContext = dependencies.resolveWorkspaceContext(workspaceSlug)
+  const { workspaceRoot, projectRoot, isLocalProject } = workspaceContext
   const sessionDir = join(workspaceRoot, sessionId)
-  /** 本地项目沿用用户目录；托管项目直接位于当前数据根的工作区内。 */
-  const agentWorkspace = dependencies.getWorkspaceBySlug(workspaceSlug)
-  const projectRoot = agentWorkspace?.projectRootPath ?? join(workspaceRoot, 'workspace-files')
   const effectiveAgentCwd = agentCwd ?? projectRoot
 
   return {
@@ -83,7 +100,7 @@ function buildWorkspacePaths(
     workspaceContextDir: join(projectRoot, '.context'),
     agentCwd: effectiveAgentCwd,
     isProjectCwd: resolve(effectiveAgentCwd) === resolve(projectRoot),
-    isLocalProject: Boolean(agentWorkspace?.projectRootPath),
+    isLocalProject,
     agentsMd: join(workspaceRoot, 'AGENTS.md'),
     projectAgentsMd: join(projectRoot, 'AGENTS.md'),
     autoMemoryDir: join(workspaceRoot, 'memory'),

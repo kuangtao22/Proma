@@ -21,6 +21,7 @@ import { getDecryptedCredentials, saveWeChatCredentials, clearWeChatCredentials,
 import { getWeChatBindingsPath, getWeChatSyncPath } from './config-paths'
 import { BridgeCommandHandler, type BridgeAttachment } from './bridge-command-handler'
 import { createJsonBridgeChatBindingStore } from './bridge-binding-store'
+import { createLazyBridgeCommandHandler } from './lazy-bridge-command-handler'
 import { inferImageMediaType, saveImageToSession, saveFileToSession, inferExtension, MAX_IMAGE_SIZE } from './bridge-attachment-utils'
 import { getAgentWorkspace } from './agent-workspace-manager'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
@@ -392,18 +393,10 @@ class WeChatBridge {
   private static readonly PENDING_FILES_MAX = 15
   private pendingImagesCleanupTimer: ReturnType<typeof setInterval> | null = null
 
-  /** 通用命令处理器延迟到 Bridge 真正启用，避免模块导入抢跑访问离线数据根。 */
-  private commandHandler: BridgeCommandHandler | null = null
-
-  /**
-   * 首次业务调用时创建命令处理器并加载聊天绑定。
-   *
-   * @returns 当前进程复用的微信命令处理器。
-   */
-  private getCommandHandler(): BridgeCommandHandler {
-    if (this.commandHandler !== null) return this.commandHandler
-
-    this.commandHandler = new BridgeCommandHandler({
+  /** 通用命令处理器延迟到 Bridge 首次业务调用，避免模块导入抢跑访问离线数据根。 */
+  private readonly commandHandler = createLazyBridgeCommandHandler({
+    createBindingStore: () => createJsonBridgeChatBindingStore(getWeChatBindingsPath(), '微信 Bridge'),
+    createCommandHandler: (bindingStore) => new BridgeCommandHandler({
       platformName: '微信',
       adapter: {
         sendText: async (chatId: string, text: string, meta?: unknown) => {
@@ -421,10 +414,18 @@ class WeChatBridge {
         },
       },
       getDefaultWorkspaceId: () => getWeChatConfig().defaultWorkspaceId,
-      bindingStore: createJsonBridgeChatBindingStore(getWeChatBindingsPath(), '微信 Bridge'),
+      bindingStore,
       onWorkspaceSwitched: (workspaceId) => updateWeChatDefaultWorkspace(workspaceId),
-    })
-    return this.commandHandler
+    }),
+  })
+
+  /**
+   * 首次业务调用时创建命令处理器并加载聊天绑定。
+   *
+   * @returns 当前进程复用的微信命令处理器。
+   */
+  private getCommandHandler(): BridgeCommandHandler {
+    return this.commandHandler.get()
   }
 
   /** 获取当前状态 */
@@ -496,7 +497,7 @@ class WeChatBridge {
     this.pollAbortController = null
     this.client = null
     this.polling = false
-    this.commandHandler?.unsubscribe()
+    this.commandHandler.peek()?.unsubscribe()
     if (this.pendingImagesCleanupTimer) {
       clearInterval(this.pendingImagesCleanupTimer)
       this.pendingImagesCleanupTimer = null

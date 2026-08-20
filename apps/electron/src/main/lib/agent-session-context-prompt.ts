@@ -19,10 +19,6 @@ function getSessionHistoryPath(sessionId: string, resolver?: ConfigRootResolver)
   return join(getConfigDir(resolver), 'agent-sessions', `${sessionId}.jsonl`)
 }
 
-function canUseSessionCleaner(): boolean {
-  return !!getBundledCliPath()
-}
-
 function getSessionCleanerSkillName(workspaceSlug?: string): string {
   return workspaceSlug
     ? `proma-workspace-${workspaceSlug}:session-cleaner`
@@ -37,14 +33,11 @@ function buildSessionCliAccessGuide(
   sessionId: string,
   historyPath: string,
   workspaceSlug?: string,
-  resolver?: ConfigRootResolver,
 ): string {
   const cli = getSessionCliCommandPrefix()
   const skillName = getSessionCleanerSkillName(workspaceSlug)
-  /** 显式参数确保独立 CLI 与 Electron 当前数据根一致。 */
-  const configDirFlag = `--config-dir ${JSON.stringify(getConfigDir(resolver))}`
-  /** 为每条建议命令追加相同配置根，避免依赖调用方环境。 */
-  const command = (args: string): string => `${cli} session ${args} ${configDirFlag}`
+  /** CLI 通过 Agent 运行环境中的 PROMA_CONFIG_DIR 继承活动根，命令不重复平台路径。 */
+  const command = (args: string): string => `${cli} session ${args}`
   return [
     `优先使用 session-cleaner skill（${skillName}）读取当前会话历史；它是 Proma CLI 的薄封装，会把 Agent JSONL 清洗为干净对话。`,
     `可用 CLI 命令前缀: ${cli}`,
@@ -63,20 +56,12 @@ function buildCurrentSessionHistoryInstruction(
   resolver?: ConfigRootResolver,
 ): string {
   const historyPath = getSessionHistoryPath(sessionId, resolver)
-  if (canUseSessionCleaner()) {
-    return buildSessionCliAccessGuide(sessionId, historyPath, workspaceSlug, resolver)
-  }
-
-  return `请先读取上述完整历史文件以恢复上下文。会话历史文件（.jsonl）可能包含大量消息和 tool results，文件较大；如果完整读取风险较高，请优先使用 Grep 搜索关键词定位相关消息片段，再局部读取。History path: ${historyPath}`
+  return buildSessionCliAccessGuide(sessionId, historyPath, workspaceSlug)
 }
 
 function buildReferencedSessionsHistoryInstruction(workspaceSlug?: string): string {
-  if (canUseSessionCleaner()) {
-    const skillName = getSessionCleanerSkillName(workspaceSlug)
-    return `需要这些会话的上下文时，优先使用 session-cleaner skill（${skillName}）或 Proma CLI 读取清洗后的会话历史。按 info → outline/search → export 的顺序渐进式读取；不要假设会话内容，也不要直接 Read 原始 .jsonl 历史文件。`
-  }
-
-  return `不要假设这些会话的内容；需要上下文时，请先读取对应的 History path，再基于读取结果继续完成任务。\n\n重要提示：会话历史文件（.jsonl）可能包含大量消息和 tool results，文件较大。请优先使用 Grep 搜索关键词定位相关消息片段，再局部读取。避免一次性 Read 整个大文件。`
+  const skillName = getSessionCleanerSkillName(workspaceSlug)
+  return `需要这些会话的上下文时，优先使用 session-cleaner skill（${skillName}）或 Proma CLI 读取清洗后的会话历史。按 info → outline/search → export 的顺序渐进式读取；不要假设会话内容，也不要直接 Read 原始 .jsonl 历史文件。`
 }
 
 /**
