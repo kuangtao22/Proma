@@ -1,5 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { rebaseDataRootOwnedPaths, rebaseOwnedPath } from './owned-path-rebaser'
@@ -8,8 +20,63 @@ import {
   preflightPersistentJson,
   recoverPersistentJson,
   validateDataRoots,
+  writePersistentJson,
 } from './owned-path-rebaser-safe-json'
 import { isWorkspaceConfig } from './owned-path-rebaser-schema'
+import { readJsonFileSafe } from './safe-file'
+
+/** 明确允许硬链接能力探测吞掉的平台或权限错误码。 */
+const HARD_LINK_UNAVAILABLE_CODES = new Set([
+  'EACCES',
+  'ENOSYS',
+  'ENOTSUP',
+  'EOPNOTSUPP',
+  'EPERM',
+  'EXDEV',
+])
+
+/** 探测当前临时文件系统是否支持硬链接，并清理探测文件。 */
+function supportsHardLinks(): boolean {
+  /** 隔离的硬链接能力探测目录。 */
+  const probeDir = mkdtempSync(join(tmpdir(), 'proma-owned-path-hardlink-probe-'))
+  /** 探测源文件。 */
+  const sourcePath = join(probeDir, 'source')
+  /** 探测硬链接。 */
+  const linkPath = join(probeDir, 'link')
+  try {
+    writeFileSync(sourcePath, 'probe')
+    linkSync(sourcePath, linkPath)
+    return true
+  } catch (error) {
+    /** Node 文件系统错误码用于区分能力不足与测试故障。 */
+    const code = error instanceof Error && 'code' in error
+      ? (error as NodeJS.ErrnoException).code
+      : undefined
+    if (code && HARD_LINK_UNAVAILABLE_CODES.has(code)) return false
+    throw error
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true })
+  }
+}
+
+/** 探测当前临时文件系统是否大小写不敏感。 */
+function isCaseInsensitiveFileSystem(): boolean {
+  /** 隔离的大小写能力探测目录。 */
+  const probeDir = mkdtempSync(join(tmpdir(), 'proma-owned-path-case-probe-'))
+  /** 小写探测文件。 */
+  const lowercasePath = join(probeDir, 'probe')
+  try {
+    writeFileSync(lowercasePath, 'probe')
+    return existsSync(join(probeDir, 'PROBE'))
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true })
+  }
+}
+
+/** 当前测试文件系统的硬链接能力。 */
+const HARD_LINKS_SUPPORTED = supportsHardLinks()
+/** 当前测试文件系统的大小写语义。 */
+const CASE_INSENSITIVE_FILE_SYSTEM = isCaseInsensitiveFileSystem()
 
 /** 将测试对象写成持久化 JSON。 */
 function writeJson(filePath: string, value: object): void {
@@ -135,6 +202,9 @@ describe('rebaseDataRootOwnedPaths', () => {
         attachedDirectories: [join(sourceRoot, 'attachments'), externalPath, join(sourceRoot, 'attachments')],
         attachedFiles: [join(sourceRoot, 'attachments', 'a.png'), similarPrefixPath, join(sourceRoot, 'attachments', 'a.png')],
         sdkSessionId: 'pi-sdk-id',
+        permissionMode: 'auto',
+        reasoningLevel: 'future-reasoning-level',
+        agentCwdMode: 'future-cwd-mode',
         piEntryBindings: { ui: 'entry' },
         activeWorktree: {
           path: join(sourceRoot, '不要改'),
@@ -206,6 +276,9 @@ describe('rebaseDataRootOwnedPaths', () => {
       join(targetRoot, 'attachments', 'a.png'),
     ])
     expect(session.sdkSessionId).toBe('pi-sdk-id')
+    expect(session.permissionMode).toBe('auto')
+    expect(session.reasoningLevel).toBe('future-reasoning-level')
+    expect(session.agentCwdMode).toBe('future-cwd-mode')
     expect(session.piEntryBindings).toEqual({ ui: 'entry' })
     expect(session.activeWorktree).toEqual({
       path: join(sourceRoot, '不要改'),
@@ -242,6 +315,10 @@ describe('rebaseDataRootOwnedPaths', () => {
     }])
     expect(config.note).toBe(`普通说明 ${sourceRoot}`)
     expect(config.unknown).toEqual({ nestedPath: join(sourceRoot, '不得递归替换') })
+    expect(readFileSync(`${sessionsPath}.bak`).equals(readFileSync(sessionsPath))).toBe(true)
+    expect(readFileSync(`${workspaceConfigPath}.bak`).equals(readFileSync(workspaceConfigPath))).toBe(true)
+    expect(readdirSync(targetRoot).filter((name) => name.startsWith('.proma-atomic-'))).toEqual([])
+    expect(readdirSync(workspaceDir).filter((name) => name.startsWith('.proma-atomic-'))).toEqual([])
 
     /** 首次重写后的稳定文件内容，用于证明第二次运行无写入。 */
     const stableSessionsContent = readFileSync(sessionsPath, 'utf-8')
@@ -275,6 +352,36 @@ describe('rebaseDataRootOwnedPaths', () => {
     const recoveredSession = (readJson(sessionsPath).sessions as Array<Record<string, unknown>>)[0]
     expect(recoveredSession).toBeDefined()
     expect(recoveredSession?.piSessionFile).toBe(join(targetRoot, 'sessions', 's.jsonl'))
+    expect(readJson(`${sessionsPath}.bak`)).toEqual(readJson(sessionsPath))
+    writeFileSync(sessionsPath, '{broken-again', 'utf-8')
+    /** 使用全局 safe-file 从 Task4 生成的备份恢复出的最终值。 */
+    const safeRecovered = readJsonFileSafe<Record<string, unknown>>(sessionsPath, {
+      validate: (value): value is Record<string, unknown> => (
+        typeof value === 'object' && value !== null && !Array.isArray(value)
+      ),
+    })
+    /** safe-file 恢复出的会话数组。 */
+    const safeRecoveredSessions = safeRecovered && 'sessions' in safeRecovered
+      ? safeRecovered.sessions as Array<Record<string, unknown>>
+      : []
+    expect(safeRecoveredSessions[0]?.piSessionFile)
+      .toBe(join(targetRoot, 'sessions', 's.jsonl'))
+  })
+
+  test('Given 主文件已是目标路径但 bak 仍是旧路径 When 二次执行 Then 修复 bak 且不误报 owned 更新', () => {
+    /** 已完成迁移的会话主文件。 */
+    const sessionsPath = join(targetRoot, 'agent-sessions.json')
+    writeJson(sessionsPath, {
+      version: 2,
+      sessions: [createSession({ piSessionFile: join(targetRoot, 'sessions', 'stable.jsonl') })],
+    })
+    writeJson(`${sessionsPath}.bak`, {
+      version: 2,
+      sessions: [createSession({ piSessionFile: join(sourceRoot, 'sessions', 'stale.jsonl') })],
+    })
+
+    expect(rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }).updatedFiles).toEqual([])
+    expect(readJson(`${sessionsPath}.bak`)).toEqual(readJson(sessionsPath))
   })
 
   test('Given 持久化 JSON 无可用恢复候选 When 重写 Then 明确失败', () => {
@@ -404,7 +511,7 @@ describe('rebaseDataRootOwnedPaths', () => {
     expect(readFileSync(workspacesPath).equals(originalIndex)).toBe(true)
   })
 
-  test('Given 唯一 workspace 的 config 主文件共享物理 identity When 预检 Then 拒绝重复所有权', () => {
+  test.skipIf(!HARD_LINKS_SUPPORTED)('Given 唯一 workspace 的 config 主文件共享物理 identity When 预检 Then 拒绝重复所有权', () => {
     /** 两个唯一工作区的容器目录。 */
     const workspacesDir = join(targetRoot, 'agent-workspaces')
     /** 两个不同请求路径的配置文件。 */
@@ -425,14 +532,59 @@ describe('rebaseDataRootOwnedPaths', () => {
     const originalConfig = readFileSync(alphaConfigPath)
 
     expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
-      .toThrow('workspace config 主文件物理身份重复')
+      .toThrow('配置候选不得是多链接文件')
     expect(readFileSync(alphaConfigPath).equals(originalConfig)).toBe(true)
     expect(readFileSync(betaConfigPath).equals(originalConfig)).toBe(true)
     expect(existsSync(`${alphaConfigPath}.bak`)).toBe(false)
     expect(existsSync(`${betaConfigPath}.bak`)).toBe(false)
   })
 
-  test('Given 文件系统将大小写 slug 解析为同一目录 When 预检 Then 拒绝目录物理所有权重复', () => {
+  test.skipIf(!HARD_LINKS_SUPPORTED)('Given main tmp bak 候选含根外硬链接或互相别名 When 预检 Then 拒绝且 sentinel 字节不变', () => {
+    /** 目标根外不可被 Task4 修改的 sentinel。 */
+    const sentinelPath = join(tempDir, 'outside-sentinel.json')
+    /** 会话主文件路径。 */
+    const sessionsPath = join(targetRoot, 'agent-sessions.json')
+    writeJson(sentinelPath, {
+      version: 2,
+      sessions: [createSession({ piSessionFile: join(sourceRoot, 'outside.jsonl') })],
+    })
+    linkSync(sentinelPath, sessionsPath)
+    /** 调用前 sentinel 原始字节。 */
+    const originalSentinel = readFileSync(sentinelPath)
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot })).toThrow('多链接')
+    expect(readFileSync(sentinelPath).equals(originalSentinel)).toBe(true)
+
+    unlinkSync(sessionsPath)
+    writeJson(sessionsPath, { version: 2, sessions: [createSession()] })
+    linkSync(sentinelPath, `${sessionsPath}.tmp`)
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot })).toThrow('多链接')
+    expect(readFileSync(sentinelPath).equals(originalSentinel)).toBe(true)
+    unlinkSync(`${sessionsPath}.tmp`)
+
+    linkSync(sentinelPath, `${sessionsPath}.bak`)
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot })).toThrow('多链接')
+    expect(readFileSync(sentinelPath).equals(originalSentinel)).toBe(true)
+    unlinkSync(`${sessionsPath}.bak`)
+
+    linkSync(sessionsPath, `${sessionsPath}.tmp`)
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot })).toThrow('多链接')
+    expect(readdirSync(targetRoot).filter((name) => name.startsWith('.proma-atomic-'))).toEqual([])
+  })
+
+  test('Given owned 路径字段类型错误 When 预检 Then 仍拒绝损坏数据', () => {
+    /** owned 字段类型错误的会话索引。 */
+    const sessionsPath = join(targetRoot, 'agent-sessions.json')
+    writeJson(sessionsPath, {
+      version: 2,
+      sessions: [createSession({ attachedFiles: { invalid: true } })],
+    })
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('agent-sessions.json 损坏或 schema 无法安全解释')
+  })
+
+  test.skipIf(!CASE_INSENSITIVE_FILE_SYSTEM)('Given 文件系统将大小写 slug 解析为同一目录 When 预检 Then 拒绝目录物理所有权重复', () => {
     /** 用于探测当前文件系统大小写语义的工作区容器。 */
     const workspacesDir = join(targetRoot, 'agent-workspaces')
     /** 小写实际目录。 */
@@ -440,7 +592,6 @@ describe('rebaseDataRootOwnedPaths', () => {
     /** 仅大小写不同的请求目录。 */
     const uppercaseDir = join(workspacesDir, 'ALPHA')
     mkdirSync(lowercaseDir, { recursive: true })
-    if (!existsSync(uppercaseDir)) return
     writeJson(join(targetRoot, 'agent-workspaces.json'), {
       version: 2,
       workspaces: [
@@ -524,7 +675,7 @@ describe('rebaseDataRootOwnedPaths', () => {
       .toEqual([join(sourceRoot, 'secret.txt')])
   })
 
-  test('Given 配置预检后 workspace 目录被替换 When 恢复读取 Then 按目录身份拒绝', () => {
+  test('Given 配置恢复确认后 workspace 目录被替换 When 原子提交 Then 按目录身份拒绝', () => {
     /** 工作区容器目录。 */
     const workspacesDir = join(targetRoot, 'agent-workspaces')
     /** 预检时的工作区目录。 */
@@ -550,12 +701,42 @@ describe('rebaseDataRootOwnedPaths', () => {
       [workspacesGuard, workspaceGuard],
     )
     if (!preflight) throw new Error('测试夹具缺少配置预检结果')
+    /** 仍只存在内存、尚未写回的配置恢复值。 */
+    const persistent = recoverPersistentJson(preflight, isWorkspaceConfig, targetGuard)
+    persistent.value.attachedFiles = [join(targetRoot, 'file.txt')]
     renameSync(workspaceDir, replacedWorkspaceDir)
     mkdirSync(workspaceDir)
     writeJson(configPath, { attachedFiles: [] })
 
-    expect(() => recoverPersistentJson(preflight, isWorkspaceConfig, targetGuard))
+    expect(() => writePersistentJson(persistent, targetGuard))
       .toThrow('工作区配置目录被替换')
+  })
+
+  test('Given 恢复确认后主文件被替换为根外 symlink When 原子提交 Then 失败且根外字节不变', () => {
+    /** 会话主文件路径。 */
+    const sessionsPath = join(targetRoot, 'agent-sessions.json')
+    /** 目标根外不可被写入的 sentinel。 */
+    const sentinelPath = join(tempDir, 'late-sentinel.json')
+    writeJson(sessionsPath, { version: 2, sessions: [createSession()] })
+    writeJson(sentinelPath, { protected: true })
+    /** 目标根和候选的预检身份。 */
+    const targetGuard = validateDataRoots(sourceRoot, targetRoot)
+    const preflight = preflightPersistentJson(sessionsPath, (value): value is Record<string, unknown> => (
+      typeof value === 'object' && value !== null && !Array.isArray(value)
+    ), targetGuard, [])
+    if (!preflight) throw new Error('测试夹具缺少会话预检结果')
+    /** 仍只存在内存、尚未写回的会话恢复值。 */
+    const persistent = recoverPersistentJson(preflight, (value): value is Record<string, unknown> => (
+      typeof value === 'object' && value !== null && !Array.isArray(value)
+    ), targetGuard)
+    persistent.value.marker = 'changed'
+    /** 调用前 sentinel 原始字节。 */
+    const originalSentinel = readFileSync(sentinelPath)
+    renameSync(sessionsPath, `${sessionsPath}.replaced`)
+    symlinkSync(sentinelPath, sessionsPath)
+
+    expect(() => writePersistentJson(persistent, targetGuard)).toThrow('配置候选必须是普通文件')
+    expect(readFileSync(sentinelPath).equals(originalSentinel)).toBe(true)
   })
 
   test('Given sourceRoot 通过父目录 symlink 与 targetRoot 指向同一物理目录 When 重写 Then 拒绝物理别名', () => {

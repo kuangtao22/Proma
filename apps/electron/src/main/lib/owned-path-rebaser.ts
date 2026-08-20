@@ -2,10 +2,11 @@ import { basename, isAbsolute, join, posix, relative, resolve, sep, win32 } from
 import type { PlatformPath } from 'node:path'
 import {
   captureDirectoryGuard,
-  getPreflightPrimaryOwnership,
+  needsPersistentJsonCommit,
   preflightPersistentJson,
   recoverPersistentJson,
   validateDataRoots,
+  validateUniqueCandidateOwnership,
   verifyTargetRootGuard,
   writePersistentJson,
 } from './owned-path-rebaser-safe-json'
@@ -106,34 +107,53 @@ export function rebaseDataRootOwnedPaths(
   const workspaceConfigPreflights = workspacesPreflight
     ? preflightWorkspaceConfigFiles(workspacesPreflight.value, targetGuard, inspectedFiles)
     : []
+  /** 所有 main/tmp/bak 候选必须在任何恢复或提交前拥有唯一物理身份。 */
+  const allPreflights = [sessionsPreflight, workspacesPreflight, ...workspaceConfigPreflights]
+    .filter((preflight): preflight is PreflightPersistentJson<JsonObject> => preflight !== null)
+  validateUniqueCandidateOwnership(allPreflights)
 
-  /** 全量 schema 通过后才执行 safe-file 恢复。 */
+  /** 全量 schema 与所有权预检通过后，仅在内存中选择恢复值。 */
   const sessionsFile = sessionsPreflight
     ? recoverPersistentJson(sessionsPreflight, isAgentSessionsIndex, targetGuard)
     : null
-  if (workspacesPreflight) recoverPersistentJson(workspacesPreflight, isAgentWorkspacesIndex, targetGuard)
+  const workspacesFile = workspacesPreflight
+    ? recoverPersistentJson(workspacesPreflight, isAgentWorkspacesIndex, targetGuard)
+    : null
   /** 恢复完成、可进入内存重写的工作区配置。 */
   const workspaceConfigFiles = workspaceConfigPreflights.map((preflight) => (
     recoverPersistentJson(preflight, isWorkspaceConfig, targetGuard)
   ))
 
-  /** 实际发生 owned 字段变化的文件。 */
-  const changedFiles: Array<PersistentJson<JsonObject>> = []
+  /** owned 变化或候选恢复需要提交的文件。 */
+  const filesToCommit: Array<PersistentJson<JsonObject>> = []
   /** 防止同一恢复对象被重复加入写队列。 */
   const queuedFiles = new Set<PersistentJson<JsonObject>>()
   /** 防止不同对象以同一路径重复加入写队列。 */
   const queuedPaths = new Set<string>()
-  if (sessionsFile && rebaseSessionsIndex(sessionsFile.value, input.sourceRoot, input.targetRoot)) {
-    queueChangedFile(sessionsFile, changedFiles, queuedFiles, queuedPaths)
+  /** 仅记录实际发生 owned 路径变化的文件，保持结果合同稳定。 */
+  const ownedChangedPaths = new Set<string>()
+  if (sessionsFile) {
+    if (rebaseSessionsIndex(sessionsFile.value, input.sourceRoot, input.targetRoot)) {
+      ownedChangedPaths.add(sessionsFile.filePath)
+    }
+    if (ownedChangedPaths.has(sessionsFile.filePath) || needsPersistentJsonCommit(sessionsFile)) {
+      queuePersistentCommit(sessionsFile, filesToCommit, queuedFiles, queuedPaths)
+    }
+  }
+  if (workspacesFile && needsPersistentJsonCommit(workspacesFile)) {
+    queuePersistentCommit(workspacesFile, filesToCommit, queuedFiles, queuedPaths)
   }
   for (const configFile of workspaceConfigFiles) {
     if (rebaseWorkspaceConfig(configFile.value, input.sourceRoot, input.targetRoot)) {
-      queueChangedFile(configFile, changedFiles, queuedFiles, queuedPaths)
+      ownedChangedPaths.add(configFile.filePath)
+    }
+    if (ownedChangedPaths.has(configFile.filePath) || needsPersistentJsonCommit(configFile)) {
+      queuePersistentCommit(configFile, filesToCommit, queuedFiles, queuedPaths)
     }
   }
-  for (const changedFile of changedFiles) {
-    writePersistentJson(changedFile, targetGuard)
-    updatedFiles.push(changedFile.filePath)
+  for (const file of filesToCommit) {
+    writePersistentJson(file, targetGuard)
+    if (ownedChangedPaths.has(file.filePath)) updatedFiles.push(file.filePath)
   }
   verifyTargetRootGuard(targetGuard)
   return { inspectedFiles, updatedFiles }
@@ -214,10 +234,6 @@ function preflightWorkspaceConfigFiles(
   const workspaceDirectoryCanonicalPaths = new Set<string>()
   /** 已认领的 workspace 目录 dev/ino。 */
   const workspaceDirectoryIdentities = new Set<string>()
-  /** 已认领的 config 主文件 canonical 路径。 */
-  const configCanonicalPaths = new Set<string>()
-  /** 已认领的 config 主文件 dev/ino。 */
-  const configIdentities = new Set<string>()
 
   for (const workspace of index.workspaces) {
     /** 当前工作区目录和配置路径。 */
@@ -241,18 +257,6 @@ function preflightWorkspaceConfigFiles(
     /** 只读预检结果。 */
     const configFile = preflightPersistentJson(configPath, isWorkspaceConfig, targetGuard, directoryGuards)
     if (!configFile) continue
-    /** config 主文件存在时的物理所有权。 */
-    const configOwnership = getPreflightPrimaryOwnership(configFile)
-    if (configOwnership) {
-      claimUniquePhysicalOwnership(
-        configOwnership.canonicalPath,
-        configOwnership.dev,
-        configOwnership.ino,
-        configCanonicalPaths,
-        configIdentities,
-        'workspace config 主文件',
-      )
-    }
     inspectedFiles.push(configPath)
     configFiles.push(configFile)
   }
@@ -277,8 +281,8 @@ function claimUniquePhysicalOwnership(
   identities.add(identity)
 }
 
-/** 将变化文件加入写队列，并拒绝对象或主路径重复。 */
-function queueChangedFile(
+/** 将待归一化文件加入提交队列，并拒绝对象或主路径重复。 */
+function queuePersistentCommit(
   file: PersistentJson<JsonObject>,
   changedFiles: Array<PersistentJson<JsonObject>>,
   queuedFiles: Set<PersistentJson<JsonObject>>,
