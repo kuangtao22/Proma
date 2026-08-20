@@ -674,6 +674,7 @@ function createDataRootManagementWindow(mode: Exclude<DataRootStartupMode, 'norm
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      additionalArguments: [`--proma-path-mode=${mode}`],
     },
   })
   mainWindow = window

@@ -1,10 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, FolderOpen, RefreshCw, RotateCcw, X } from 'lucide-react'
 import type {
+  DataRootMigrationProgress,
   DataRootRecoveryAction,
   DataRootStartupMode,
   PathManagementState,
 } from '@proma/shared'
+import type {
+  DataRootMigrationPreloadApi,
+  DataRootRecoveryPreloadApi,
+  PathManagementPreloadApi,
+} from '../../../preload/path-management-preload'
 import { Button } from '@/components/ui/button'
 
 /** 普通 recovery 状态允许的完整动作集合。 */
@@ -94,6 +100,15 @@ export async function confirmRestorePreviousDataRoot(
   await restore()
 }
 
+/** 仅 migration API 注册进度 listener；recovery API 返回稳定 no-op。 */
+export function subscribeToDataRootMigrationProgress(
+  api: PathManagementPreloadApi,
+  callback: (progress: DataRootMigrationProgress) => void,
+): () => void {
+  if (!('onDataRootMigrationProgress' in api)) return () => undefined
+  return api.onDataRootMigrationProgress(callback)
+}
+
 /** 数据根迁移进度条属性。 */
 export interface DataRootMigrationProgressBarProps {
   /** 已归一化到 0-100 的迁移百分比。 */
@@ -178,6 +193,10 @@ export function DataRootMigrationApp(): React.JSX.Element {
     const value = new URLSearchParams(window.location.search).get('mode')
     return value === 'data-root-recovery' ? value : 'data-root-migration'
   }, [])
+  /** 主进程保证 URL mode 与 preload additionalArgument 同源，分支内据此收窄真实 API。 */
+  const migrationApi = window.pathManagementAPI as DataRootMigrationPreloadApi
+  /** recovery 分支只调用恢复对象实际拥有的方法。 */
+  const recoveryApi = window.pathManagementAPI as DataRootRecoveryPreloadApi
   /** 主进程返回的当前路径管理状态。 */
   const [state, setState] = useState<PathManagementState | null>(null)
   /** 当前动作产生的用户可处理错误。 */
@@ -198,7 +217,7 @@ export function DataRootMigrationApp(): React.JSX.Element {
       if (mounted) setActionError(toErrorMessage(error))
     })
     /** 迁移进度直接合并到当前状态，避免高频全量查询。 */
-    const unsubscribe = window.pathManagementAPI.onDataRootMigrationProgress((migration) => {
+    const unsubscribe = subscribeToDataRootMigrationProgress(window.pathManagementAPI, (migration) => {
       if (mounted) setState((current) => current === null ? current : { ...current, migration })
     })
     /** recovery renderer 直接跟随系统明暗，不读取业务 settings。 */
@@ -275,35 +294,35 @@ export function DataRootMigrationApp(): React.JSX.Element {
             view={view}
             isBusy={isBusy}
             onRecheck={() => void runAction(async () => {
-              await window.pathManagementAPI.recoverDataRoot({ action: 'recheck' })
+              await recoveryApi.recoverDataRoot({ action: 'recheck' })
             })}
             onRelocate={() => void runAction(async () => {
               /** 系统选择器返回的已授权候选目录。 */
-              const selectedRoot = await window.pathManagementAPI.pickDataRoot()
+              const selectedRoot = await recoveryApi.pickDataRoot()
               if (selectedRoot === null) return
-              await window.pathManagementAPI.recoverDataRoot({ action: 'relocate', selectedRoot })
+              await recoveryApi.recoverDataRoot({ action: 'relocate', selectedRoot })
             })}
             onRestorePrevious={() => void runAction(async () => {
               await confirmRestorePreviousDataRoot(
                 () => window.confirm('切回旧备份后，当前离线数据根将保留为可恢复位置。是否继续？'),
-                () => window.pathManagementAPI.recoverDataRoot({ action: 'restore-previous' }),
+                () => recoveryApi.recoverDataRoot({ action: 'restore-previous' }),
               )
             })}
-            onExit={() => void window.pathManagementAPI.exitDataRootManagement()}
+            onExit={() => void recoveryApi.exitDataRootManagement()}
           />
         ) : (
           <div className="flex flex-wrap gap-3">
             {view.kind === 'migration' ? (
-              <Button disabled={isBusy} onClick={() => void runAction(() => window.pathManagementAPI.resumeDataRootMigration())}>
+              <Button disabled={isBusy} onClick={() => void runAction(() => migrationApi.resumeDataRootMigration())}>
                 <RefreshCw aria-hidden="true" />继续迁移
               </Button>
             ) : null}
             {state.migration !== null && ['pending', 'copying', 'failed'].includes(state.migration.stage) ? (
-              <Button variant="outline" disabled={isBusy} onClick={() => void runAction(() => window.pathManagementAPI.cancelDataRootMigration())}>
+              <Button variant="outline" disabled={isBusy} onClick={() => void runAction(() => migrationApi.cancelDataRootMigration())}>
                 取消迁移
               </Button>
             ) : null}
-            <Button variant="ghost" disabled={isBusy} onClick={() => void window.pathManagementAPI.exitDataRootManagement()}>
+            <Button variant="ghost" disabled={isBusy} onClick={() => void migrationApi.exitDataRootManagement()}>
               <X aria-hidden="true" />退出
             </Button>
           </div>

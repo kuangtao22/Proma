@@ -130,6 +130,8 @@ export class DataRootInstanceLeaseRegistry {
   private ownLeaseIdentity: FileIdentity | null = null
   /** 当前进程是否成功取得 lease。 */
   private acquired = false
+  /** 当前 registry 持有的迁移 intent guard，graceful quit 时统一释放。 */
+  private activeMigrationGuard: DataRootMigrationGuard | null = null
 
   /** 根据共享 home 创建实例 registry。 */
   constructor(options: DataRootInstanceLeaseRegistryOptions) {
@@ -206,6 +208,7 @@ export class DataRootInstanceLeaseRegistry {
 
   /** 取得迁移独占 intent；死亡 claim 通过确定性后继链线性接管，绝不删除前驱。 */
   async acquireMigrationGuard(): Promise<DataRootMigrationGuard> {
+    if (this.activeMigrationGuard !== null) throw new Error('当前实例已持有数据根迁移 intent')
     mkdirSync(this.registryDir, { recursive: true })
     const server = await this.ensureLivenessServer()
     /** 当前迁移预检绑定同一个实例 challenge。 */
@@ -228,24 +231,31 @@ export class DataRootInstanceLeaseRegistry {
       try {
         const identity = writeExclusiveJson(claimPath, intent)
         /** release 只删除本次成功 O_EXCL 创建且仍为同 inode/token 的 active claim。 */
-        return {
-          release: () => removeImmutableOwnedPath(
-            claimPath,
-            this.ownerToken,
-            identity,
-            readMigrationIntentRecord,
-          ),
+        const guard: DataRootMigrationGuard = {
+          release: () => {
+            if (this.activeMigrationGuard !== guard) return
+            removeImmutableOwnedPath(
+              claimPath,
+              this.ownerToken,
+              identity,
+              readMigrationIntentRecord,
+            )
+            if (this.activeMigrationGuard === guard) this.activeMigrationGuard = null
+          },
         }
+        this.activeMigrationGuard = guard
+        return guard
       } catch (error) {
         if (!isAlreadyExistsError(error)) throw error
         // 另一个 contender 先创建同一后继；重新读取整条链并验证赢家。
       }
     }
-    throw new Error('迁移 intent claim 链过长，拒绝继续接管')
+    throw createIntentChainRecoveryError(this.registryDir)
   }
 
   /** graceful quit 时释放自身 lease 与 challenge server。 */
   release(): void {
+    this.activeMigrationGuard?.release()
     if (this.ownLeaseIdentity !== null) {
       removeImmutableOwnedPath(
         this.ownLeasePath,
@@ -464,7 +474,14 @@ function readIntentChain(registryDir: string): IntentChainSnapshot {
     claims.push(claim)
     claimPath = getIntentSuccessorPath(registryDir, claim.raw)
   }
-  throw new Error('迁移 intent claim 链过长，拒绝继续协调')
+  throw createIntentChainRecoveryError(registryDir)
+}
+
+/** 提供 crash 链耗尽后的明确人工恢复路径，同时保持默认 fail closed。 */
+function createIntentChainRecoveryError(registryDir: string): Error {
+  return new Error(
+    `迁移 intent claim 链过长。请完全退出所有 Proma 实例，备份后删除 ${registryDir}，再重新启动 Proma`,
+  )
 }
 
 /** 判断文件独占创建是否因目标已存在失败。 */

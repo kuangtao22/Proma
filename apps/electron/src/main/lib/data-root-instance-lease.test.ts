@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -216,5 +216,93 @@ describe('DataRootInstanceLeaseRegistry', () => {
 
     await expect(newcomer.acquire('/data/proma')).rejects.toThrow('数据根正在准备迁移')
     guard.release()
+  })
+
+  test('Given registry 持有 active guard When graceful release Then 清理 claim 且下次从根路径获取', async () => {
+    const homeDir = await createTempHome()
+    const harness = createLivenessHarness()
+    const first = createRegistry(homeDir, 'first-owner', 101, harness)
+    await first.acquireMigrationGuard()
+
+    first.release()
+
+    const second = createRegistry(homeDir, 'second-owner', 202, harness)
+    const secondGuard = await second.acquireMigrationGuard()
+    /** graceful release 后不得残留死亡前驱并迫使下次增长 successor。 */
+    const claims = readdirSync(join(homeDir, '.proma-instance-leases'))
+      .filter((name) => name.endsWith('.claim'))
+    expect(claims).toEqual(['migration.intent.claim'])
+    secondGuard.release()
+  })
+
+  test('Given active guard 首次释放失败 When claim 恢复可读 Then graceful release 可重试清理', async () => {
+    const homeDir = await createTempHome()
+    const harness = createLivenessHarness()
+    const registry = createRegistry(homeDir, 'retry-owner', 101, harness)
+    const guard = await registry.acquireMigrationGuard()
+    const claimPath = join(homeDir, '.proma-instance-leases', 'migration.intent.claim')
+    /** 保存原 claim，模拟临时损坏后恢复同一 inode 内容。 */
+    const originalClaim = readFileSync(claimPath, 'utf8')
+    writeFileSync(claimPath, '{broken')
+
+    expect(() => guard.release()).toThrow('迁移 intent 损坏')
+    writeFileSync(claimPath, originalClaim)
+    registry.release()
+
+    expect(existsSync(claimPath)).toBe(false)
+  })
+
+  test('Given 100 次计划已持久化后的 clean release When 重复获取 Then claim 不增长也不阻断', async () => {
+    const homeDir = await createTempHome()
+    const harness = createLivenessHarness()
+    const registry = createRegistry(homeDir, 'clean-owner', 101, harness)
+
+    for (let index = 0; index < 100; index += 1) {
+      const guard = await registry.acquireMigrationGuard()
+      /** 模拟 locator pending 已持久化后的安全释放点。 */
+      guard.release()
+    }
+
+    const claims = readdirSync(join(homeDir, '.proma-instance-leases'))
+      .filter((name) => name.endsWith('.claim'))
+    expect(claims).toEqual([])
+  })
+
+  test('Given crash 前驱与 clean successor When 再次获取 Then 复用同一 successor 路径', async () => {
+    const homeDir = await createTempHome()
+    const harness = createLivenessHarness()
+    const crashed = createRegistry(homeDir, 'crashed-owner', 101, harness)
+    await crashed.acquireMigrationGuard()
+    harness.crash('crashed-owner')
+    const clean = createRegistry(homeDir, 'clean-owner', 202, harness)
+    const cleanGuard = await clean.acquireMigrationGuard()
+    const registryDir = join(homeDir, '.proma-instance-leases')
+    /** 第一次 clean acquisition 使用的确定性 successor。 */
+    const firstSuccessor = readdirSync(registryDir)
+      .filter((name) => name !== 'migration.intent.claim' && name.endsWith('.claim'))
+    cleanGuard.release()
+
+    const next = createRegistry(homeDir, 'next-owner', 303, harness)
+    const nextGuard = await next.acquireMigrationGuard()
+    const secondSuccessor = readdirSync(registryDir)
+      .filter((name) => name !== 'migration.intent.claim' && name.endsWith('.claim'))
+
+    expect(firstSuccessor).toEqual(secondSuccessor)
+    nextGuard.release()
+  })
+
+  test('Given 256 个 crash claim When 再次接管 Then 返回可操作的恢复错误', async () => {
+    const homeDir = await createTempHome()
+    const harness = createLivenessHarness()
+    for (let index = 0; index < 256; index += 1) {
+      const ownerToken = `crash-owner-${index}`
+      const registry = createRegistry(homeDir, ownerToken, index + 1, harness)
+      await registry.acquireMigrationGuard()
+      harness.crash(ownerToken)
+    }
+    const contender = createRegistry(homeDir, 'overflow-owner', 999, harness)
+
+    await expect(contender.acquireMigrationGuard())
+      .rejects.toThrow('完全退出所有 Proma 实例')
   })
 })

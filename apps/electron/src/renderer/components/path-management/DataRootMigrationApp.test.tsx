@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { PathManagementState } from '@proma/shared'
+import type { PathManagementPreloadApi } from '../../../preload/path-management-preload'
+import * as dataRootMigrationModule from './DataRootMigrationApp'
 import {
   createDataRootMigrationViewState,
   DataRootMigrationProgressBar,
@@ -20,6 +22,27 @@ function createState(overrides: Partial<PathManagementState> = {}): PathManageme
 }
 
 describe('DataRootMigrationApp', () => {
+  test('Given recovery API 不含进度订阅 When 页面初始化 Then 安全返回 no-op 取消函数', () => {
+    /** 目标模块在 RED 阶段可能尚未导出安全订阅 helper。 */
+    const subscribe = (dataRootMigrationModule as unknown as {
+      subscribeToDataRootMigrationProgress?: (
+        api: PathManagementPreloadApi,
+        callback: () => void,
+      ) => () => void
+    }).subscribeToDataRootMigrationProgress
+    expect(typeof subscribe).toBe('function')
+    /** 真实 recovery API 形状不包含迁移进度 key。 */
+    const recoveryApi: PathManagementPreloadApi = {
+      getPathManagementState: async () => createState(),
+      pickDataRoot: async () => null,
+      recoverDataRoot: async () => undefined,
+      openDataRoot: async () => undefined,
+      exitDataRootManagement: async () => undefined,
+    }
+
+    expect(() => subscribe?.(recoveryApi, () => undefined)()).not.toThrow()
+  })
+
   test('Given copying/verifying/rebasing 进度 When 生成视图 Then 显示复制/校验/重写阶段与稳定百分比', () => {
     expect(createDataRootMigrationViewState(createState({
       migration: {

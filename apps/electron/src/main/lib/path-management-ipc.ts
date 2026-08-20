@@ -175,6 +175,13 @@ export function registerPathManagementIpcHandlers(
   }).inspect()
 
   if (options.mode === 'normal') {
+    register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, () => getCoordinator().getStatus())
+    register(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, async () => {
+      if (!options.dialog) throw new Error('当前环境不支持选择数据根目录')
+      /** 用户通过系统对话框选择的迁移目标目录。 */
+      const result = await options.dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
+      return result.canceled ? null : result.filePaths[0] ?? null
+    })
     register(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, async (_event, targetRoot) => {
       if (typeof targetRoot !== 'string') throw new Error('目标数据根必须是字符串')
       await assertMigrationCanStart(options)
@@ -191,11 +198,19 @@ export function registerPathManagementIpcHandlers(
           await getCoordinator().cancel()
           throw error
         }
-        // Promise continuation 在处理下一个 IPC 前执行，计划写入后不再开放新的任务事件循环。
+        // locator pending 已持久化，后续 normal 启动会被启动门阻止，此时可安全释放 intent。
+        migrationGuard?.release()
         relaunchNow()
       } catch (error) {
         migrationGuard?.release()
         throw error
+      }
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, () => {
+      const state = getCoordinator().getStatus()
+      return {
+        migration: state.migration,
+        ...(state.postCommitCleanup === undefined ? {} : { postCommitCleanup: state.postCommitCleanup }),
       }
     })
   } else if (options.mode === 'data-root-migration') {

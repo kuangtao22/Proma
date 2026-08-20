@@ -116,7 +116,10 @@ describe('路径管理 IPC', () => {
     /** 各模式允许的精确 invoke 通道。 */
     const modeChannels = new Map([
       ['normal', [
+        PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
+        PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
         PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
+        PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS,
         PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
       ]],
       ['data-root-migration', [
@@ -171,7 +174,10 @@ describe('路径管理 IPC', () => {
     registerPathManagementIpcHandlers({ ...common, mode: 'normal' })
 
     expect([...handlers.keys()]).toEqual([
+      PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
+      PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
       PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
+      PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS,
       PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
     ])
   })
@@ -269,6 +275,7 @@ describe('路径管理 IPC', () => {
       'create-plan',
       'check-tasks',
       'check-instances',
+      'release-intent',
       'relaunch',
       'quit',
     ])
