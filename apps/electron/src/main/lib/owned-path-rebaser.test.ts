@@ -1,8 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { rebaseDataRootOwnedPaths, rebaseOwnedPath } from './owned-path-rebaser'
+import {
+  captureDirectoryGuard,
+  preflightPersistentJson,
+  recoverPersistentJson,
+  validateDataRoots,
+} from './owned-path-rebaser-safe-json'
+import { isWorkspaceConfig } from './owned-path-rebaser-schema'
 
 /** 将测试对象写成持久化 JSON。 */
 function writeJson(filePath: string, value: object): void {
@@ -12,6 +19,29 @@ function writeJson(filePath: string, value: object): void {
 /** 读取测试生成的 JSON 对象。 */
 function readJson(filePath: string): Record<string, unknown> {
   return JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>
+}
+
+/** 创建符合 AgentSessionMeta 必填合同的会话测试数据。 */
+function createSession(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'session-1',
+    title: '测试会话',
+    createdAt: 1,
+    updatedAt: 2,
+    ...overrides,
+  }
+}
+
+/** 创建符合 AgentWorkspace 必填合同的工作区测试数据。 */
+function createWorkspace(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'workspace-1',
+    name: '测试项目',
+    slug: 'alpha',
+    createdAt: 1,
+    updatedAt: 2,
+    ...overrides,
+  }
 }
 
 describe('rebaseOwnedPath', () => {
@@ -41,6 +71,14 @@ describe('rebaseOwnedPath', () => {
       .toBe('\\\\server2\\data\\proma\\sessions\\a.jsonl')
     expect(rebaseOwnedPath('\\\\server\\share\\proma-other\\a.jsonl', '\\\\server\\share\\proma', '\\\\server2\\data\\proma'))
       .toBe('\\\\server\\share\\proma-other\\a.jsonl')
+    expect(rebaseOwnedPath('//server/share/proma/sessions/a.jsonl', '//server/share/proma', '//server2/data/proma'))
+      .toBe('\\\\server2\\data\\proma\\sessions\\a.jsonl')
+    expect(rebaseOwnedPath('//server/share2/proma/a.jsonl', '//server/share/proma', '//server2/data/proma'))
+      .toBe('//server/share2/proma/a.jsonl')
+    expect(rebaseOwnedPath('//server/share/proma2/a.jsonl', '//server/share/proma', '//server2/data/proma'))
+      .toBe('//server/share/proma2/a.jsonl')
+    expect(rebaseOwnedPath('\\\\server2\\data\\proma\\sessions\\a.jsonl', '\\\\server\\share\\proma', '\\\\server2\\data\\proma'))
+      .toBe('\\\\server2\\data\\proma\\sessions\\a.jsonl')
   })
 
   test('Given 相同或嵌套的数据根 When 重写单值 Then 拒绝不安全根关系', () => {
@@ -90,37 +128,45 @@ describe('rebaseDataRootOwnedPaths', () => {
 
     writeJson(sessionsPath, {
       version: 4,
-      sessions: [{
-        id: 'session-1',
+      sessions: [createSession({
         title: '保留会话',
         piSessionFile: join(sourceRoot, 'sdk-config', 'sessions', 'a.jsonl'),
         forkSourceDir: sourceRoot,
-        attachedDirectories: [join(sourceRoot, 'attachments'), externalPath, null],
-        attachedFiles: [join(sourceRoot, 'attachments', 'a.png'), similarPrefixPath],
+        attachedDirectories: [join(sourceRoot, 'attachments'), externalPath, join(sourceRoot, 'attachments')],
+        attachedFiles: [join(sourceRoot, 'attachments', 'a.png'), similarPrefixPath, join(sourceRoot, 'attachments', 'a.png')],
         sdkSessionId: 'pi-sdk-id',
         piEntryBindings: { ui: 'entry' },
-        activeWorktree: { path: join(sourceRoot, '不要改'), mainRepoRoot: join(sourceRoot, '也不要改') },
+        activeWorktree: {
+          path: join(sourceRoot, '不要改'),
+          mainRepoRoot: join(sourceRoot, '也不要改'),
+          branch: 'main',
+          selectedAt: 3,
+        },
         note: `说明文字 ${join(sourceRoot, 'sdk-config')}`,
         unknown: { preserved: true },
-      }],
+      })],
       unknownRoot: ['keep'],
     })
     writeJson(workspacesPath, {
       version: 2,
-      workspaces: [{
-        id: 'workspace-1',
+      workspaces: [createWorkspace({
         name: 'Alpha',
-        slug: 'alpha',
         projectRootPath: join(sourceRoot, '用户项目路径不属于 Proma-owned 字段'),
-        createdAt: 1,
-        updatedAt: 2,
         unknown: 'keep',
-      }],
+      })],
       unknownRoot: true,
     })
     writeJson(workspaceConfigPath, {
-      attachedDirectories: [join(sourceRoot, 'agent-workspaces', 'alpha', 'workspace-files'), externalPath, null],
-      attachedFiles: [join(sourceRoot, 'agent-workspaces', 'alpha', 'file.txt'), similarPrefixPath],
+      attachedDirectories: [
+        join(sourceRoot, 'agent-workspaces', 'alpha', 'workspace-files'),
+        externalPath,
+        join(sourceRoot, 'agent-workspaces', 'alpha', 'workspace-files'),
+      ],
+      attachedFiles: [
+        join(sourceRoot, 'agent-workspaces', 'alpha', 'file.txt'),
+        similarPrefixPath,
+        join(sourceRoot, 'agent-workspaces', 'alpha', 'file.txt'),
+      ],
       worktreeRepos: [{
         name: 'managed',
         repoPath: join(sourceRoot, 'repos', 'main'),
@@ -131,7 +177,7 @@ describe('rebaseDataRootOwnedPaths', () => {
         name: 'external',
         repoPath: externalPath,
         worktreesPath: '',
-      }, null],
+      }],
       projectKnowledgeMaintenanceApproved: true,
       note: `普通说明 ${sourceRoot}`,
       unknown: { nestedPath: join(sourceRoot, '不得递归替换') },
@@ -153,11 +199,20 @@ describe('rebaseDataRootOwnedPaths', () => {
     if (!session) throw new Error('测试夹具缺少会话记录')
     expect(session.piSessionFile).toBe(join(targetRoot, 'sdk-config', 'sessions', 'a.jsonl'))
     expect(session.forkSourceDir).toBe(sourceRoot)
-    expect(session.attachedDirectories).toEqual([join(targetRoot, 'attachments'), externalPath, null])
-    expect(session.attachedFiles).toEqual([join(targetRoot, 'attachments', 'a.png'), similarPrefixPath])
+    expect(session.attachedDirectories).toEqual([join(targetRoot, 'attachments'), externalPath, join(targetRoot, 'attachments')])
+    expect(session.attachedFiles).toEqual([
+      join(targetRoot, 'attachments', 'a.png'),
+      similarPrefixPath,
+      join(targetRoot, 'attachments', 'a.png'),
+    ])
     expect(session.sdkSessionId).toBe('pi-sdk-id')
     expect(session.piEntryBindings).toEqual({ ui: 'entry' })
-    expect(session.activeWorktree).toEqual({ path: join(sourceRoot, '不要改'), mainRepoRoot: join(sourceRoot, '也不要改') })
+    expect(session.activeWorktree).toEqual({
+      path: join(sourceRoot, '不要改'),
+      mainRepoRoot: join(sourceRoot, '也不要改'),
+      branch: 'main',
+      selectedAt: 3,
+    })
     expect(session.note).toBe(`说明文字 ${join(sourceRoot, 'sdk-config')}`)
     expect(session.unknown).toEqual({ preserved: true })
     expect(sessions.unknownRoot).toEqual(['keep'])
@@ -167,9 +222,13 @@ describe('rebaseDataRootOwnedPaths', () => {
     expect(config.attachedDirectories).toEqual([
       join(targetRoot, 'agent-workspaces', 'alpha', 'workspace-files'),
       externalPath,
-      null,
+      join(targetRoot, 'agent-workspaces', 'alpha', 'workspace-files'),
     ])
-    expect(config.attachedFiles).toEqual([join(targetRoot, 'agent-workspaces', 'alpha', 'file.txt'), similarPrefixPath])
+    expect(config.attachedFiles).toEqual([
+      join(targetRoot, 'agent-workspaces', 'alpha', 'file.txt'),
+      similarPrefixPath,
+      join(targetRoot, 'agent-workspaces', 'alpha', 'file.txt'),
+    ])
     expect(config.worktreeRepos).toEqual([{
       name: 'managed',
       repoPath: join(targetRoot, 'repos', 'main'),
@@ -180,7 +239,7 @@ describe('rebaseDataRootOwnedPaths', () => {
       name: 'external',
       repoPath: externalPath,
       worktreesPath: '',
-    }, null])
+    }])
     expect(config.note).toBe(`普通说明 ${sourceRoot}`)
     expect(config.unknown).toEqual({ nestedPath: join(sourceRoot, '不得递归替换') })
 
@@ -208,7 +267,7 @@ describe('rebaseDataRootOwnedPaths', () => {
     writeFileSync(sessionsPath, '{broken', 'utf-8')
     writeJson(`${sessionsPath}.bak`, {
       version: 4,
-      sessions: [{ id: 's', piSessionFile: join(sourceRoot, 'sessions', 's.jsonl') }],
+      sessions: [createSession({ id: 's', piSessionFile: join(sourceRoot, 'sessions', 's.jsonl') })],
     })
 
     expect(rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }).updatedFiles).toEqual([sessionsPath])
@@ -227,6 +286,182 @@ describe('rebaseDataRootOwnedPaths', () => {
       .toThrow('agent-sessions.json 损坏或 schema 无法安全解释')
   })
 
+  test('Given 主文件缺失且 tmp 会话索引合法 When 重写 Then 先恢复再更新根内路径', () => {
+    /** 仅存在安全写残留的会话主路径。 */
+    const sessionsPath = join(targetRoot, 'agent-sessions.json')
+    writeJson(`${sessionsPath}.tmp`, {
+      version: 2,
+      sessions: [createSession({ piSessionFile: join(sourceRoot, 'sessions', 'tmp.jsonl') })],
+    })
+
+    expect(rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }).updatedFiles).toEqual([sessionsPath])
+    expect(existsSync(`${sessionsPath}.tmp`)).toBe(false)
+    /** 从 tmp 提升并重写后的会话。 */
+    const restoredSession = (readJson(sessionsPath).sessions as Array<Record<string, unknown>>)[0]
+    expect(restoredSession?.piSessionFile).toBe(join(targetRoot, 'sessions', 'tmp.jsonl'))
+  })
+
+  test('Given 会话缺少真实必填字段 When 重写 Then schema 失败且不创建备份', () => {
+    /** schema 合法 JSON 但不符合 AgentSessionMeta 的索引路径。 */
+    const sessionsPath = join(targetRoot, 'agent-sessions.json')
+    writeJson(sessionsPath, { version: 2, sessions: [{}] })
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('agent-sessions.json 损坏或 schema 无法安全解释')
+    expect(existsSync(`${sessionsPath}.bak`)).toBe(false)
+  })
+
+  test('Given 后续工作区索引 schema 无效 When 预检 Then 不部分写已读取的会话索引', () => {
+    /** 原本会被重写的合法会话索引。 */
+    const sessionsPath = join(targetRoot, 'agent-sessions.json')
+    /** 缺少 name 和时间戳的非法工作区索引。 */
+    const workspacesPath = join(targetRoot, 'agent-workspaces.json')
+    writeJson(sessionsPath, {
+      version: 2,
+      sessions: [createSession({ piSessionFile: join(sourceRoot, 'sessions', 'a.jsonl') })],
+    })
+    writeJson(workspacesPath, { version: 2, workspaces: [{ id: 'w', slug: 'alpha' }] })
+    /** 失败前必须保持的会话文件原文。 */
+    const originalSessions = readFileSync(sessionsPath, 'utf-8')
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('agent-workspaces.json 损坏或 schema 无法安全解释')
+    expect(readFileSync(sessionsPath, 'utf-8')).toBe(originalSessions)
+    expect(existsSync(`${sessionsPath}.bak`)).toBe(false)
+  })
+
+  test('Given 会话需要 bak 恢复但后续 schema 无效 When 预检 Then 不提前恢复任何文件', () => {
+    /** 保持损坏状态直到全量 schema 通过的会话主文件。 */
+    const sessionsPath = join(targetRoot, 'agent-sessions.json')
+    /** 后续会触发预检失败的工作区索引。 */
+    const workspacesPath = join(targetRoot, 'agent-workspaces.json')
+    /** 预检失败后必须保持不变的损坏主文件原文。 */
+    const brokenPrimary = '{broken'
+    writeFileSync(sessionsPath, brokenPrimary, 'utf-8')
+    writeJson(`${sessionsPath}.bak`, { version: 2, sessions: [createSession()] })
+    writeJson(workspacesPath, { version: 2, workspaces: [{ slug: 'alpha' }] })
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('agent-workspaces.json 损坏或 schema 无法安全解释')
+    expect(readFileSync(sessionsPath, 'utf-8')).toBe(brokenPrimary)
+  })
+
+  test('Given worktree repo 缺少必填字段 When 预检 Then 不部分写其它文件', () => {
+    /** 原本会被重写的合法会话索引。 */
+    const sessionsPath = join(targetRoot, 'agent-sessions.json')
+    /** 指向非法 config 的工作区索引。 */
+    const workspacesPath = join(targetRoot, 'agent-workspaces.json')
+    /** 当前工作区目录。 */
+    const workspaceDir = join(targetRoot, 'agent-workspaces', 'alpha')
+    mkdirSync(workspaceDir, { recursive: true })
+    writeJson(sessionsPath, {
+      version: 2,
+      sessions: [createSession({ piSessionFile: join(sourceRoot, 'sessions', 'a.jsonl') })],
+    })
+    writeJson(workspacesPath, { version: 2, workspaces: [createWorkspace()] })
+    writeJson(join(workspaceDir, 'config.json'), {
+      worktreeRepos: [{ repoPath: join(sourceRoot, 'repo'), worktreesPath: join(sourceRoot, 'trees') }],
+    })
+    /** 失败前必须保持的会话文件原文。 */
+    const originalSessions = readFileSync(sessionsPath, 'utf-8')
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('config.json 损坏或 schema 无法安全解释')
+    expect(readFileSync(sessionsPath, 'utf-8')).toBe(originalSessions)
+  })
+
+  test('Given 目标根本身是 symlink When 重写 Then 在读取索引前拒绝', () => {
+    /** symlink 指向的实际目标目录。 */
+    const actualTarget = join(tempDir, 'actual-target')
+    rmSync(targetRoot, { recursive: true })
+    mkdirSync(actualTarget)
+    symlinkSync(actualTarget, targetRoot)
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('targetRoot 必须是实际目录')
+  })
+
+  test('Given 目标根是普通文件 When 重写 Then 在读取索引前拒绝', () => {
+    rmSync(targetRoot, { recursive: true })
+    writeFileSync(targetRoot, 'not-directory', 'utf-8')
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('targetRoot 必须是实际目录')
+  })
+
+  test('Given 会话索引候选是 symlink When 重写 Then 拒绝读取根外文件', () => {
+    /** 目标根外的合法会话索引。 */
+    const externalIndexPath = join(tempDir, 'external-sessions.json')
+    writeJson(externalIndexPath, { version: 2, sessions: [createSession()] })
+    symlinkSync(externalIndexPath, join(targetRoot, 'agent-sessions.json'))
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('配置候选必须是普通文件')
+    expect(readJson(externalIndexPath).sessions).toEqual([createSession()])
+  })
+
+  test('Given workspace 目录是 symlink When 重写 Then 拒绝读取根外配置', () => {
+    /** 目标根外的真实工作区目录。 */
+    const externalWorkspaceDir = join(tempDir, 'external-workspace')
+    /** 目标根内的 workspace 容器。 */
+    const workspacesDir = join(targetRoot, 'agent-workspaces')
+    mkdirSync(externalWorkspaceDir)
+    mkdirSync(workspacesDir)
+    writeJson(join(targetRoot, 'agent-workspaces.json'), { version: 2, workspaces: [createWorkspace()] })
+    writeJson(join(externalWorkspaceDir, 'config.json'), { attachedFiles: [join(sourceRoot, 'secret.txt')] })
+    symlinkSync(externalWorkspaceDir, join(workspacesDir, 'alpha'))
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('工作区配置目录必须是普通目录')
+    expect(readJson(join(externalWorkspaceDir, 'config.json')).attachedFiles)
+      .toEqual([join(sourceRoot, 'secret.txt')])
+  })
+
+  test('Given 配置预检后 workspace 目录被替换 When 恢复读取 Then 按目录身份拒绝', () => {
+    /** 工作区容器目录。 */
+    const workspacesDir = join(targetRoot, 'agent-workspaces')
+    /** 预检时的工作区目录。 */
+    const workspaceDir = join(workspacesDir, 'alpha')
+    /** 被移走的原工作区目录。 */
+    const replacedWorkspaceDir = join(workspacesDir, 'alpha-replaced')
+    /** 待预检的配置路径。 */
+    const configPath = join(workspaceDir, 'config.json')
+    mkdirSync(workspaceDir, { recursive: true })
+    writeJson(configPath, { attachedFiles: [join(sourceRoot, 'file.txt')] })
+    /** 目标根稳定身份。 */
+    const targetGuard = validateDataRoots(sourceRoot, targetRoot)
+    /** 工作区容器稳定身份。 */
+    const workspacesGuard = captureDirectoryGuard(workspacesDir, targetGuard)
+    /** 工作区目录稳定身份。 */
+    const workspaceGuard = captureDirectoryGuard(workspaceDir, targetGuard)
+    if (!workspacesGuard || !workspaceGuard) throw new Error('测试夹具缺少工作区目录 guard')
+    /** 目录替换前完成的只读配置预检。 */
+    const preflight = preflightPersistentJson(
+      configPath,
+      isWorkspaceConfig,
+      targetGuard,
+      [workspacesGuard, workspaceGuard],
+    )
+    if (!preflight) throw new Error('测试夹具缺少配置预检结果')
+    renameSync(workspaceDir, replacedWorkspaceDir)
+    mkdirSync(workspaceDir)
+    writeJson(configPath, { attachedFiles: [] })
+
+    expect(() => recoverPersistentJson(preflight, isWorkspaceConfig, targetGuard))
+      .toThrow('工作区配置目录被替换')
+  })
+
+  test('Given sourceRoot 通过父目录 symlink 与 targetRoot 指向同一物理目录 When 重写 Then 拒绝物理别名', () => {
+    /** 指向临时父目录的物理别名。 */
+    const aliasParent = join(tempDir, 'alias-parent')
+    symlinkSync(tempDir, aliasParent)
+    /** 经父目录别名访问到目标根的 sourceRoot。 */
+    const aliasedSourceRoot = join(aliasParent, 'target')
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot: aliasedSourceRoot, targetRoot }))
+      .toThrow('必须不同')
+  })
+
   test('Given workspace 配置候选是 symlink When 重写 Then 拒绝跟随', () => {
     /** 工作区目录。 */
     const workspaceDir = join(targetRoot, 'agent-workspaces', 'alpha')
@@ -235,7 +470,7 @@ describe('rebaseDataRootOwnedPaths', () => {
     mkdirSync(workspaceDir, { recursive: true })
     writeJson(join(targetRoot, 'agent-workspaces.json'), {
       version: 2,
-      workspaces: [{ slug: 'alpha' }],
+      workspaces: [createWorkspace()],
     })
     writeJson(externalConfigPath, { attachedFiles: [join(sourceRoot, 'secret.txt')] })
     symlinkSync(externalConfigPath, join(workspaceDir, 'config.json'))
@@ -248,7 +483,7 @@ describe('rebaseDataRootOwnedPaths', () => {
   test('Given workspace slug 会逃逸目标根 When 重写 Then 在读取配置前拒绝', () => {
     writeJson(join(targetRoot, 'agent-workspaces.json'), {
       version: 2,
-      workspaces: [{ slug: '../../outside' }],
+      workspaces: [createWorkspace({ slug: '../../outside' })],
     })
 
     expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
