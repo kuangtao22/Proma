@@ -325,6 +325,24 @@ describe('DataRootLocator', () => {
     expect(existsSync(targetRoot)).toBe(false)
   })
 
+  test('Given a migration target that is a regular file When committing Then it rejects without switching the active root', () => {
+    /** 提交前仍生效的源数据根。 */
+    const sourceRoot = join(homeDir, 'file-target-source-root')
+    /** 存在但不是目录的迁移目标路径。 */
+    const targetRoot = join(homeDir, 'file-target')
+    mkdirSync(sourceRoot)
+    writeFileSync(targetRoot, 'not-a-directory', 'utf-8')
+    /** 固定定位文件路径。 */
+    const locatorPath = join(homeDir, '.proma-location.json')
+    writeMigrationLocator(locatorPath, { sourceRoot, targetRoot, stage: 'switching' })
+    /** 读取并尝试提交迁移的定位器。 */
+    const locator = new DataRootLocator({ homeDir })
+
+    expect(() => locator.commitMigration('migration-commit')).toThrow('迁移目标根不可用')
+    expect(JSON.parse(readFileSync(locatorPath, 'utf-8')).activeRoot).toBe(sourceRoot)
+    expect(readFileSync(targetRoot, 'utf-8')).toBe('not-a-directory')
+  })
+
   test('Given malformed locator fields When inspecting Then it reports invalid', () => {
     /** 覆盖版本、路径与迁移字段校验的无效定位文件。 */
     const invalidFiles: object[] = [

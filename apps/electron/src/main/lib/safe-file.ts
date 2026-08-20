@@ -61,36 +61,44 @@ export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeO
 
   // 1. 尝试读取主文件
   if (existsSync(filePath)) {
+    /** 主文件是否成功读取并解析为 JSON。 */
+    let parsedPrimary = false
+    /** 主文件解析后的未知值，仅在 parsedPrimary 为 true 时校验。 */
+    let primaryValue: unknown
     try {
       const raw = readFileSync(filePath, 'utf-8')
       if (raw.trim().length > 0) {
-        /** 主文件解析后的未知值，需按调用方 schema 再校验。 */
-        const parsed: unknown = JSON.parse(raw)
-        if (isAcceptedJsonValue(parsed, options.validate)) {
-          return parsed
-        }
+        primaryValue = JSON.parse(raw)
+        parsedPrimary = true
       }
     } catch {
       console.warn(`[数据恢复] 主索引文件损坏: ${filePath}`)
+    }
+    if (parsedPrimary && isAcceptedJsonValue(primaryValue, options.validate)) {
+      return primaryValue
     }
   }
 
   // 2. 检查是否有未完成的 .tmp 文件（上次 rename 前崩溃）
   if (existsSync(tmpPath)) {
+    /** 临时文件是否成功读取并解析为 JSON。 */
+    let parsedTmp = false
+    /** 临时文件解析后的未知值，仅在 parsedTmp 为 true 时校验。 */
+    let tmpValue: unknown
     try {
       const raw = readFileSync(tmpPath, 'utf-8')
       if (raw.trim().length > 0) {
-        /** 临时文件解析后的未知值，schema 无效时禁止提升。 */
-        const parsed: unknown = JSON.parse(raw)
-        if (isAcceptedJsonValue(parsed, options.validate)) {
-          // .tmp 有效 → 提升为主文件
-          renameSync(tmpPath, filePath)
-          console.log(`[数据恢复] 从 .tmp 文件恢复: ${filePath}`)
-          return parsed
-        }
+        tmpValue = JSON.parse(raw)
+        parsedTmp = true
       }
     } catch {
       // .tmp 也损坏，继续 fallback
+    }
+    if (parsedTmp && isAcceptedJsonValue(tmpValue, options.validate)) {
+      // .tmp 有效 → 提升为主文件；提升失败必须保留 tmp 并向上传播。
+      renameSync(tmpPath, filePath)
+      console.log(`[数据恢复] 从 .tmp 文件恢复: ${filePath}`)
+      return tmpValue
     }
     // 清理无效的 .tmp
     try { unlinkSync(tmpPath) } catch { /* ignore */ }
@@ -98,20 +106,24 @@ export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeO
 
   // 3. Fallback 到 .bak
   if (existsSync(bakPath)) {
+    /** 备份文件是否成功读取并解析为 JSON。 */
+    let parsedBackup = false
+    /** 备份文件解析后的未知值，仅在 parsedBackup 为 true 时校验。 */
+    let backupValue: unknown
     try {
       const raw = readFileSync(bakPath, 'utf-8')
       if (raw.trim().length > 0) {
-        /** 备份解析后的未知值，仅在 schema 有效时覆盖主文件。 */
-        const parsed: unknown = JSON.parse(raw)
-        if (isAcceptedJsonValue(parsed, options.validate)) {
-          // 用 .bak 恢复主文件（跳过备份，避免用损坏的主文件覆盖好的 .bak）
-          writeJsonFileAtomic(filePath, parsed as object, true)
-          console.log(`[数据恢复] 从 .bak 文件恢复: ${filePath}`)
-          return parsed
-        }
+        backupValue = JSON.parse(raw)
+        parsedBackup = true
       }
     } catch {
       console.error(`[数据恢复] .bak 文件也损坏: ${bakPath}`)
+    }
+    if (parsedBackup && isAcceptedJsonValue(backupValue, options.validate)) {
+      // 用 .bak 恢复主文件；恢复失败必须原样向上传播。
+      writeJsonFileAtomic(filePath, backupValue as object, true)
+      console.log(`[数据恢复] 从 .bak 文件恢复: ${filePath}`)
+      return backupValue
     }
   }
 

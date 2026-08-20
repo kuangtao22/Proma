@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readJsonFileSafe } from './safe-file'
@@ -72,5 +72,96 @@ describe('readJsonFileSafe validator', () => {
     writeFileSync(filePath, JSON.stringify(parseableValue), 'utf-8')
 
     expect(readJsonFileSafe<typeof parseableValue>(filePath)).toEqual(parseableValue)
+  })
+
+  test('Given valid primary JSON and a throwing validator When reading Then it propagates without restoring backup', () => {
+    /** validator 抛错前主文件保存的原始内容。 */
+    const primaryContent = JSON.stringify({ version: 1, value: 'primary' })
+    /** 即使 schema 合法也不得在 validator 异常后恢复的备份内容。 */
+    const backupContent = JSON.stringify({ version: 1, value: 'backup' })
+    /** 必须保持对象身份向上传播的 validator 原始错误。 */
+    const validatorError = new Error('validator execution failed')
+    /** 模拟调用方 validator 自身异常的类型守卫。 */
+    const throwingValidator = (_value: unknown): _value is VersionedValue => {
+      throw validatorError
+    }
+    writeFileSync(filePath, primaryContent, 'utf-8')
+    writeFileSync(`${filePath}.bak`, backupContent, 'utf-8')
+    /** 捕获 readJsonFileSafe 向上传播的错误以验证对象身份。 */
+    let caughtError: unknown
+
+    try {
+      readJsonFileSafe(filePath, { validate: throwingValidator })
+    } catch (error) {
+      caughtError = error
+    }
+
+    expect(readFileSync(filePath, 'utf-8')).toBe(primaryContent)
+    expect(readFileSync(`${filePath}.bak`, 'utf-8')).toBe(backupContent)
+    expect(caughtError).toBe(validatorError)
+  })
+
+  test('Given valid tmp JSON and a throwing validator When reading Then it propagates without deleting tmp', () => {
+    /** validator 抛错前临时文件保存的原始内容。 */
+    const tmpContent = JSON.stringify({ version: 1, value: 'temporary' })
+    /** 必须保持对象身份向上传播的 validator 原始错误。 */
+    const validatorError = new Error('tmp validator execution failed')
+    /** 模拟调用方 validator 自身异常的类型守卫。 */
+    const throwingValidator = (_value: unknown): _value is VersionedValue => {
+      throw validatorError
+    }
+    writeFileSync(`${filePath}.tmp`, tmpContent, 'utf-8')
+    /** 捕获 readJsonFileSafe 向上传播的错误以验证对象身份。 */
+    let caughtError: unknown
+
+    try {
+      readJsonFileSafe(filePath, { validate: throwingValidator })
+    } catch (error) {
+      caughtError = error
+    }
+
+    expect(existsSync(filePath)).toBe(false)
+    expect(readFileSync(`${filePath}.tmp`, 'utf-8')).toBe(tmpContent)
+    expect(caughtError).toBe(validatorError)
+  })
+
+  test('Given valid tmp JSON and a deterministic promotion failure When reading Then it throws and preserves tmp', () => {
+    /** 让主路径成为目录，从而稳定触发文件覆盖目录的 rename 失败。 */
+    mkdirSync(filePath)
+    /** rename 失败后必须保留的有效临时文件内容。 */
+    const tmpContent = JSON.stringify({ version: 1, value: 'temporary' })
+    writeFileSync(`${filePath}.tmp`, tmpContent, 'utf-8')
+    /** 捕获底层 renameSync 原始错误，验证不会被恢复链吞掉。 */
+    let caughtError: unknown
+
+    try {
+      readJsonFileSafe(filePath, { validate: isVersionedValue })
+    } catch (error) {
+      caughtError = error
+    }
+
+    expect(caughtError).toBeInstanceOf(Error)
+    expect(statSync(filePath).isDirectory()).toBe(true)
+    expect(readFileSync(`${filePath}.tmp`, 'utf-8')).toBe(tmpContent)
+  })
+
+  test('Given valid backup JSON and a deterministic atomic restore failure When reading Then it throws', () => {
+    /** 让主路径成为目录，从而稳定触发原子恢复最后的 rename 失败。 */
+    mkdirSync(filePath)
+    /** 原子恢复失败后必须保持原内容的有效备份。 */
+    const backupContent = JSON.stringify({ version: 1, value: 'backup' })
+    writeFileSync(`${filePath}.bak`, backupContent, 'utf-8')
+    /** 捕获 writeJsonFileAtomic 内部 renameSync 原始错误。 */
+    let caughtError: unknown
+
+    try {
+      readJsonFileSafe(filePath, { validate: isVersionedValue })
+    } catch (error) {
+      caughtError = error
+    }
+
+    expect(caughtError).toBeInstanceOf(Error)
+    expect(statSync(filePath).isDirectory()).toBe(true)
+    expect(readFileSync(`${filePath}.bak`, 'utf-8')).toBe(backupContent)
   })
 })
