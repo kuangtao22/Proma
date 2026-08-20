@@ -448,6 +448,58 @@ describe('DataRootMigrationCoordinator', () => {
     expect(JSON.parse(readFileSync(`${harness.lockPath}.recover`, 'utf-8'))).toEqual(recoveryLock)
   })
 
+  test('Given 主锁与 recovery mutex 均属于死亡进程 When 创建计划 Then 回收两把陈旧锁并继续', async () => {
+    const harness = createHarness({ isPidRunning: () => false })
+    const staleLock = { version: 1, pid: 42, createdAt: 1, ownerToken: 'stale-owner' }
+    const staleRecoveryLock = { version: 1, pid: 43, createdAt: 2, ownerToken: 'stale-recovery-owner' }
+    writeFileSync(harness.lockPath, JSON.stringify(staleLock))
+    writeFileSync(`${harness.lockPath}.recover`, JSON.stringify(staleRecoveryLock))
+
+    await harness.coordinator.createPlan(targetRoot)
+
+    expect(existsSync(`${harness.lockPath}.recover`)).toBe(false)
+    expect(JSON.parse(readFileSync(harness.lockPath, 'utf-8'))).not.toMatchObject({
+      ownerToken: staleLock.ownerToken,
+    })
+    await harness.coordinator.cancel()
+    expect(existsSync(harness.lockPath)).toBe(false)
+  })
+
+  test('Given recovery mutex 无法确认归属 When 接管陈旧主锁 Then 拒绝且不修改任一锁', async () => {
+    const harness = createHarness({ isPidRunning: () => false })
+    const staleLock = { version: 1, pid: 42, createdAt: 1, ownerToken: 'stale-owner' }
+    const invalidRecoveryLock = { version: 1, pid: 43, createdAt: 2 }
+    writeFileSync(harness.lockPath, JSON.stringify(staleLock))
+    writeFileSync(`${harness.lockPath}.recover`, JSON.stringify(invalidRecoveryLock))
+
+    await expect(harness.coordinator.createPlan(targetRoot)).rejects.toMatchObject({ code: 'MIGRATION_LOCKED' })
+
+    expect(JSON.parse(readFileSync(harness.lockPath, 'utf-8'))).toEqual(staleLock)
+    expect(JSON.parse(readFileSync(`${harness.lockPath}.recover`, 'utf-8'))).toEqual(invalidRecoveryLock)
+  })
+
+  test('Given recovery mutex 死亡检查期间被其他 owner 替换 When 接管 Then 拒绝且保留新 owner', async () => {
+    const lockPath = join(homeDir, '.proma-data-root-migration.lock')
+    const staleLock = { version: 1, pid: 42, createdAt: 1, ownerToken: 'stale-owner' }
+    const staleRecoveryLock = { version: 1, pid: 43, createdAt: 2, ownerToken: 'stale-recovery-owner' }
+    const replacementRecoveryLock = { version: 1, pid: 44, createdAt: 3, ownerToken: 'replacement-recovery-owner' }
+    let pidChecks = 0
+    const harness = createHarness({
+      isPidRunning: () => {
+        pidChecks += 1
+        if (pidChecks === 2) writeFileSync(`${lockPath}.recover`, JSON.stringify(replacementRecoveryLock))
+        return false
+      },
+    })
+    writeFileSync(harness.lockPath, JSON.stringify(staleLock))
+    writeFileSync(`${harness.lockPath}.recover`, JSON.stringify(staleRecoveryLock))
+
+    await expect(harness.coordinator.createPlan(targetRoot)).rejects.toMatchObject({ code: 'MIGRATION_LOCKED' })
+
+    expect(JSON.parse(readFileSync(harness.lockPath, 'utf-8'))).toEqual(staleLock)
+    expect(JSON.parse(readFileSync(`${harness.lockPath}.recover`, 'utf-8'))).toEqual(replacementRecoveryLock)
+  })
+
   test('Given 当前 owner 锁在运行中被替换 When 释放 Then 不删除其他 owner 的锁', async () => {
     const harness = createHarness({
       copyDirectory: async () => {

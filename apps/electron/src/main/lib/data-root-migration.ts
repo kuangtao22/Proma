@@ -563,9 +563,7 @@ export class DataRootMigrationCoordinator {
 
     const recoveryPath = `${this.lockPath}.recover`
     const recoveryOwnerToken = this.createLockOwnerToken()
-    if (!tryCreateMigrationLock(recoveryPath, recoveryOwnerToken, this.now())) {
-      throw new DataRootMigrationError('MIGRATION_LOCKED', '另一个实例正在接管陈旧迁移锁')
-    }
+    this.acquireRecoveryLock(recoveryPath, recoveryOwnerToken)
     try {
       const initial = readMigrationLock(this.lockPath)
       if (!initial || this.isPidRunning(initial.pid)) {
@@ -582,6 +580,25 @@ export class DataRootMigrationCoordinator {
       this.lockOwnerToken = ownerToken
     } finally {
       removeOwnedMigrationLock(recoveryPath, recoveryOwnerToken)
+    }
+  }
+
+  /** 获取 recovery mutex；仅在 schema 合法、PID 明确死亡且 owner 未变化时回收残留锁。 */
+  private acquireRecoveryLock(recoveryPath: string, ownerToken: string): void {
+    if (tryCreateMigrationLock(recoveryPath, ownerToken, this.now())) return
+    const initial = readMigrationLock(recoveryPath)
+    if (!initial || this.isPidRunning(initial.pid)) {
+      throw new DataRootMigrationError('MIGRATION_LOCKED', '另一个实例正在接管陈旧迁移锁')
+    }
+    const confirmed = readMigrationLock(recoveryPath)
+    if (!confirmed || confirmed.ownerToken !== initial.ownerToken || this.isPidRunning(confirmed.pid)) {
+      throw new DataRootMigrationError('MIGRATION_LOCKED', 'recovery mutex owner 在回收期间发生变化')
+    }
+    if (!removeOwnedMigrationLock(recoveryPath, initial.ownerToken)) {
+      throw new DataRootMigrationError('MIGRATION_LOCKED', 'recovery mutex owner 在删除前发生变化')
+    }
+    if (!tryCreateMigrationLock(recoveryPath, ownerToken, this.now())) {
+      throw new DataRootMigrationError('MIGRATION_LOCKED', '陈旧 recovery mutex 回收后被其他实例占用')
     }
   }
 
@@ -737,14 +754,16 @@ function tryCreateMigrationLock(lockPath: string, ownerToken: string, createdAt:
   }
 }
 
-/** 仅当磁盘记录仍属于指定 owner 时删除锁。 */
-function removeOwnedMigrationLock(lockPath: string, ownerToken: string): void {
+/** 仅当磁盘记录仍属于指定 owner 时删除锁，并返回是否确实删除。 */
+function removeOwnedMigrationLock(lockPath: string, ownerToken: string): boolean {
   const record = readMigrationLock(lockPath)
-  if (!record || record.ownerToken !== ownerToken) return
+  if (!record || record.ownerToken !== ownerToken) return false
   try {
     unlinkSync(lockPath)
+    return true
   } catch (error) {
-    if (!isFileMissingError(error)) throw error
+    if (isFileMissingError(error)) return false
+    throw error
   }
 }
 
