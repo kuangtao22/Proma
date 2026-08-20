@@ -45,6 +45,31 @@ interface FileHandleMetadataPrototype {
   utimes(atime: string | number | Date, mtime: string | number | Date): Promise<void>
 }
 
+/** 明确允许硬链接能力探测吞掉的平台或权限错误码。 */
+const HARD_LINK_UNAVAILABLE_CODES = new Set([
+  'EACCES',
+  'ENOSYS',
+  'ENOTSUP',
+  'EOPNOTSUPP',
+  'EPERM',
+  'EXDEV',
+])
+
+/** 尝试创建硬链接；只有明确不支持或权限不足时返回 false。 */
+function tryCreateHardLink(existingPath: string, newPath: string): boolean {
+  try {
+    linkSync(existingPath, newPath)
+    return true
+  } catch (error) {
+    /** Node 文件系统错误码用于区分能力不足与真实测试故障。 */
+    const code = error instanceof Error && 'code' in error
+      ? (error as NodeJS.ErrnoException).code
+      : undefined
+    if (code && HARD_LINK_UNAVAILABLE_CODES.has(code)) return false
+    throw error
+  }
+}
+
 /** 创建彼此隔离的复制测试目录。 */
 function createFixture(testRoot: string): CopyFixture {
   /** 当前测试使用的源目录。 */
@@ -598,7 +623,6 @@ describe('verified-directory-copier', () => {
   })
 
   test('Given 目标文件与树外文件硬链接 When 恢复迁移 Then 原子替换且不修改树外 inode 权限', async () => {
-    if (process.platform === 'win32') return
     /** 当前用例的源目录和目标目录。 */
     const fixture = createFixture(testRoot)
     /** 需要恢复为源权限的普通文件路径。 */
@@ -608,7 +632,7 @@ describe('verified-directory-copier', () => {
     await copyFixture(fixture)
     /** 位于目标树外、与目标共享 inode 的硬链接。 */
     const outsideLink = join(testRoot, 'outside-linked.txt')
-    linkSync(join(fixture.targetRoot, 'linked.txt'), outsideLink)
+    if (!tryCreateHardLink(join(fixture.targetRoot, 'linked.txt'), outsideLink)) return
     chmodSync(outsideLink, 0o640)
 
     await copyFixture(fixture)
@@ -619,7 +643,6 @@ describe('verified-directory-copier', () => {
   })
 
   test('Given 目标树内两个路径共享硬链接 When 恢复迁移 Then 两个目标都拆分为独立 inode', async () => {
-    if (process.platform === 'win32') return
     /** 当前用例的源目录和目标目录。 */
     const fixture = createFixture(testRoot)
     writeFileSync(join(fixture.sourceRoot, 'first.txt'), 'same')
@@ -630,7 +653,7 @@ describe('verified-directory-copier', () => {
     /** 需要拆分为独立 inode 的第二个目标。 */
     const secondTarget = join(fixture.targetRoot, 'second.txt')
     unlinkSync(secondTarget)
-    linkSync(firstTarget, secondTarget)
+    if (!tryCreateHardLink(firstTarget, secondTarget)) return
 
     await copyFixture(fixture)
 
@@ -639,14 +662,16 @@ describe('verified-directory-copier', () => {
     expect(statSync(firstTarget).ino).not.toBe(statSync(secondTarget).ino)
   })
 
-  test('Given 文件系统拒绝写入 mtime When 内容与身份验证通过 Then 迁移成功并输出 warning', async () => {
+  test('Given metadata best-effort 失败后另一文件取消 When 同 migrationId 恢复 Then 内容基线单调且不重复计数', async () => {
     /** 当前用例的源目录和目标目录。 */
     const fixture = createFixture(testRoot)
     /** 使用固定旧时间确保临时文件默认 mtime 不会偶然匹配。 */
     const fixedTime = new Date('2020-01-02T03:04:05.000Z')
     /** 需要验证内容成功迁移的源文件。 */
     const sourceFile = join(fixture.sourceRoot, 'metadata-warning.txt')
-    writeFileSync(sourceFile, 'stable-content')
+    /** 首次调用已通过内容验收的文件内容。 */
+    const stableContent = 'stable-content'
+    writeFileSync(sourceFile, stableContent)
     utimesSync(sourceFile, fixedTime, fixedTime)
     /** 用于获取未来文件句柄共享原型的探测句柄。 */
     const probeHandle = await open(sourceFile, 'r')
@@ -659,19 +684,53 @@ describe('verified-directory-copier', () => {
     })
     /** 捕获 best-effort 元数据告警且避免污染测试输出。 */
     const warningSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    /** 合并首次完成、取消和恢复三次调用的进度。 */
+    const progressEvents: DataRootMigrationProgress[] = []
+    /** 是否捕获到当前文件的 mtime 告警。 */
+    let warnedForFile = false
 
     try {
       /** 元数据失败时仍应返回的复制统计。 */
-      const result = await copyFixture(fixture)
+      const result = await copyFixture(fixture, {
+        onProgress: (progress) => progressEvents.push({ ...progress }),
+      })
       expect(result.verifiedFiles).toBe(1)
       expect(await hashFile(join(fixture.targetRoot, 'metadata-warning.txt'))).toBe(await hashFile(sourceFile))
-      expect(warningSpy.mock.calls.some(([message]) => (
+      warnedForFile = warningSpy.mock.calls.some(([message]) => (
         typeof message === 'string' && message.includes('文件时间 metadata-warning.txt')
-      ))).toBe(true)
+      ))
     } finally {
       warningSpy.mockRestore()
       utimesSpy.mockRestore()
     }
+    expect(warnedForFile).toBe(true)
+
+    /** 后续调用中需要被取消的另一个文件。 */
+    const cancelledFileSize = 128 * 1024
+    writeFileSync(join(fixture.sourceRoot, 'z-cancelled.bin'), Buffer.alloc(cancelledFileSize, 7))
+    /** 第二次调用进度在合并数组中的起始位置。 */
+    const cancellationProgressStart = progressEvents.length
+    /** 控制第二次调用在另一个文件开始复制时取消。 */
+    const controller = new AbortController()
+    await expect(copyFixture(fixture, {
+      concurrency: 1,
+      signal: controller.signal,
+      onProgress: (progress) => {
+        progressEvents.push({ ...progress })
+        if (progress.currentRelativePath === 'z-cancelled.bin') controller.abort()
+      },
+    })).rejects.toMatchObject({ name: 'AbortError' })
+
+    /** 第三次调用恢复并完成全部内容。 */
+    const resumed = await copyFixture(fixture, {
+      concurrency: 1,
+      onProgress: (progress) => progressEvents.push({ ...progress }),
+    })
+
+    expect(progressEvents[cancellationProgressStart]?.completedBytes).toBeGreaterThanOrEqual(Buffer.byteLength(stableContent))
+    expect(progressEvents.every((progress) => progress.completedBytes <= progress.totalBytes)).toBe(true)
+    expect(progressEvents.every((progress, index) => index === 0 || progress.completedBytes >= progressEvents[index - 1]!.completedBytes)).toBe(true)
+    expect(progressEvents.at(-1)?.completedBytes).toBe(resumed.totalBytes)
   })
 
   test('Given 单链接目标内容相同但 metadata 不一致 When 恢复迁移 Then 不复用旧 inode', async () => {
@@ -696,21 +755,28 @@ describe('verified-directory-copier', () => {
     expect(statSync(targetFile).mode & 0o777).toBe(0o600)
   })
 
-  test('Given 普通文件完成后由后续链接回调新增硬链接 When 最终验证 Then 拒绝多链接目标 inode', async () => {
-    if (process.platform === 'win32') return
+  test('Given 普通文件复用提交回调新增硬链接 When 最终验证 Then 拒绝多链接目标 inode', async () => {
     /** 当前用例的源目录和目标目录。 */
     const fixture = createFixture(testRoot)
     writeFileSync(join(fixture.sourceRoot, 'a-file.txt'), 'stable')
-    symlinkSync('a-file.txt', join(fixture.sourceRoot, 'z-link'))
+    await copyFixture(fixture)
     /** 最终验证前创建的树外硬链接。 */
     const outsideLink = join(testRoot, 'late-hard-link.txt')
-    /** 是否已经在后续符号链接验证回调中创建硬链接。 */
+    /** 提前探测当前文件系统是否允许创建硬链接。 */
+    const probeLink = join(testRoot, 'hard-link-probe.txt')
+    if (!tryCreateHardLink(join(fixture.targetRoot, 'a-file.txt'), probeLink)) return
+    unlinkSync(probeLink)
+    /** 是否已经在复用提交回调中创建硬链接。 */
     let linked = false
+    /** 复用文件的 verifying 回调次数。 */
+    let verificationCount = 0
 
     await expect(copyFixture(fixture, {
       concurrency: 1,
       onProgress: (progress) => {
-        if (progress.currentRelativePath !== 'z-link' || progress.stage !== 'verifying' || linked) return
+        if (progress.currentRelativePath !== 'a-file.txt' || progress.stage !== 'verifying' || linked) return
+        verificationCount += 1
+        if (verificationCount !== 2) return
         linked = true
         linkSync(join(fixture.targetRoot, 'a-file.txt'), outsideLink)
       },

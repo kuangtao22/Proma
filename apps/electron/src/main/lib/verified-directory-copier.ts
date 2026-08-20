@@ -497,18 +497,18 @@ async function copyAndVerifyFile(
     sourceHash = await hashManifestFile(entry, context.signal)
     context.sourceHashes.set(entry.relativePath, sourceHash)
   }
-  /** 恢复基线中已通过完整复用验证的文件。 */
-  const reusableAtStart = context.committedFiles.has(entry.relativePath)
-  if (!reusableAtStart) await copyFile(entry, targetPath, parentIdentity, context)
+  /** 恢复基线中已通过内容与身份验收的文件。 */
+  const committedAtStart = context.committedFiles.has(entry.relativePath)
+  if (!committedAtStart) await copyFile(entry, targetPath, parentIdentity, context)
   /** 首次和局部重拷后的验证序号。 */
   for (let attempt = 0; attempt < 2; attempt += 1) {
     emitProgress(entry.relativePath, 'verifying', context)
     /** 旧 inode 仍需严格复用校验；新提交 inode 只强制内容与身份。 */
-    const verified = reusableAtStart && attempt === 0
+    const verified = committedAtStart && attempt === 0
       ? await isReusableFile(targetPath, parentIdentity, entry, sourceHash, context.signal)
       : await isVerifiedTargetFile(targetPath, parentIdentity, entry, sourceHash, context.signal)
     if (verified) {
-      if (reusableAtStart && attempt === 0) context.state.reusedFiles += 1
+      if (committedAtStart && attempt === 0) context.state.reusedFiles += 1
       markFileCommitted(entry, context)
       return
     }
@@ -632,7 +632,7 @@ function getTargetParentIdentity(relativePath: string, context: CopyContext): Fi
   return identity
 }
 
-/** worker 启动前验证目标可复用文件，并建立跨调用恢复进度基线。 */
+/** worker 启动前验收目标内容，并建立跨调用恢复进度基线。 */
 async function initializeCommittedFiles(context: CopyContext): Promise<void> {
   for (const entry of context.manifest.leaves) {
     if (entry.kind !== 'file') continue
@@ -646,7 +646,7 @@ async function initializeCommittedFiles(context: CopyContext): Promise<void> {
     context.sourceHashes.set(entry.relativePath, sourceHash)
     /** 当前普通文件父目录的稳定身份。 */
     const parentIdentity = getTargetParentIdentity(entry.relativePath, context)
-    if (!await isReusableFile(targetPath, parentIdentity, entry, sourceHash, context.signal)) continue
+    if (!await isVerifiedTargetFile(targetPath, parentIdentity, entry, sourceHash, context.signal)) continue
     context.committedFiles.add(entry.relativePath)
     context.state.completedBytes += entry.size
   }
