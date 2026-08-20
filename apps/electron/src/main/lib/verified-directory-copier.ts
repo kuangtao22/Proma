@@ -6,14 +6,12 @@ import {
   captureDirectoryIdentity,
   copyFileAtomic,
   hashManifestFile,
-  hashTargetFile,
   isReusableFile,
   isReusableSymbolicLink,
   lstatOrNull,
   metadataFromStats,
   pathDepth,
   preserveDirectoryMetadata,
-  preserveFileMetadata,
   preserveSymbolicLinkMetadata,
   relativeParent,
   replaceSymbolicLinkAtomic,
@@ -88,6 +86,7 @@ interface CopyContext {
   targetAnchorIdentity: FileSystemIdentity
   targetDirectories: Map<string, FileSystemIdentity>
   sourceHashes: Map<string, string>
+  committedFiles: Set<string>
 }
 
 /** 可恢复目录复制的调用参数。 */
@@ -130,6 +129,8 @@ export async function copyDirectoryVerified(input: CopyDirectoryInput): Promise<
   const state: CopyState = { completedBytes: 0, verifiedFiles: 0, reusedFiles: 0 }
   /** 已计算的源普通文件哈希，最终目标复验时复用。 */
   const sourceHashes = new Map<string, string>()
+  /** 已验证复用或已原子提交的普通文件路径。 */
+  const committedFiles = new Set<string>()
   /** worker 每次领取的下一个清单位置。 */
   let nextIndex = 0
   /** 首个业务错误优先于随后产生的 AbortError。 */
@@ -145,6 +146,7 @@ export async function copyDirectoryVerified(input: CopyDirectoryInput): Promise<
     targetAnchorIdentity: roots.targetAnchorIdentity,
     targetDirectories,
     sourceHashes,
+    committedFiles,
   }
   /** 单个 worker 循环领取条目，异常时终止其他 worker。 */
   const runWorker = async (): Promise<void> => {
@@ -165,6 +167,8 @@ export async function copyDirectoryVerified(input: CopyDirectoryInput): Promise<
   }
 
   try {
+    /** worker 启动前验证可复用文件并恢复已提交字节基线。 */
+    await initializeCommittedFiles(context)
     /** 实际 worker 数不会超过条目数，也不会低于一。 */
     const workerCount = Math.max(1, Math.min(normalizedInput.concurrency, manifest.leaves.length || 1))
     await Promise.all(Array.from({ length: workerCount }, runWorker))
@@ -486,46 +490,43 @@ async function copyAndVerifyFile(
   parentIdentity: FileSystemIdentity,
   context: CopyContext,
 ): Promise<void> {
-  /** 对源句柄执行身份校验后得到的基准 SHA-256。 */
-  const sourceHash = await hashManifestFile(entry, context.signal)
-  context.sourceHashes.set(entry.relativePath, sourceHash)
-  /** 已有目标是否可以直接复用。 */
-  const reusable = await isReusableFile(targetPath, parentIdentity, entry.sizeBigInt, sourceHash, context.signal)
-  if (reusable) {
-    context.state.reusedFiles += 1
-    advanceProgress(entry, entry.size, context)
-  } else {
-    await copyFile(entry, targetPath, parentIdentity, context, true)
+  /** 恢复扫描已计算或当前 worker 新计算的源 SHA-256。 */
+  let sourceHash = context.sourceHashes.get(entry.relativePath)
+  if (!sourceHash) {
+    sourceHash = await hashManifestFile(entry, context.signal)
+    context.sourceHashes.set(entry.relativePath, sourceHash)
   }
-  await preserveFileMetadata(entry, targetPath, parentIdentity)
+  /** 恢复基线中已通过完整复用验证的文件。 */
+  const reusableAtStart = context.committedFiles.has(entry.relativePath)
+  if (!reusableAtStart) await copyFile(entry, targetPath, parentIdentity, context)
   /** 首次和局部重拷后的验证序号。 */
   for (let attempt = 0; attempt < 2; attempt += 1) {
     emitProgress(entry.relativePath, 'verifying', context)
-    if (await hashTargetFile(targetPath, parentIdentity, context.signal) === sourceHash) return
+    if (await isReusableFile(targetPath, parentIdentity, entry, sourceHash, context.signal)) {
+      if (reusableAtStart && attempt === 0) context.state.reusedFiles += 1
+      markFileCommitted(entry, context)
+      return
+    }
     if (attempt === 0) {
-      await copyFile(entry, targetPath, parentIdentity, context, false)
-      await preserveFileMetadata(entry, targetPath, parentIdentity)
+      await copyFile(entry, targetPath, parentIdentity, context)
     }
   }
   throw new Error(`文件校验失败，重试后仍不一致: ${entry.relativePath}`)
 }
 
-/** 调用受控文件系统 primitive，并把数据块映射为迁移进度。 */
+/** 调用受控文件系统 primitive 原子提交单个普通文件。 */
 async function copyFile(
   entry: ScannedFileEntry,
   targetPath: string,
   parentIdentity: FileSystemIdentity,
   context: CopyContext,
-  trackProgress: boolean,
 ): Promise<void> {
   await copyFileAtomic({
     entry,
     targetPath,
     parentIdentity,
     signal: context.signal,
-    trackProgress,
-    onChunk: (chunkBytes) => advanceProgress(entry, chunkBytes, context),
-    onEmptyFile: () => emitProgress(entry.relativePath, 'copying', context),
+    onStart: () => emitProgress(entry.relativePath, 'copying', context),
   })
 }
 
@@ -571,7 +572,7 @@ async function assertTargetMatchesManifest(context: CopyContext): Promise<void> 
       if (!sourceHash) throw new Error(`缺少源文件哈希: ${sourceEntry.relativePath}`)
       /** 当前文件父目录稳定身份。 */
       const parentIdentity = getTargetParentIdentity(sourceEntry.relativePath, context)
-      if (await hashTargetFile(targetEntry.path, parentIdentity, context.signal) !== sourceHash) {
+      if (!await isReusableFile(targetEntry.path, parentIdentity, sourceEntry, sourceHash, context.signal)) {
         throw new Error(`最终目标文件校验失败: ${sourceEntry.relativePath}`)
       }
     } else if (sourceEntry.kind === 'symbolic-link') {
@@ -626,13 +627,36 @@ function getTargetParentIdentity(relativePath: string, context: CopyContext): Fi
   return identity
 }
 
-/** 更新普通文件已完成字节并发出单调进度。 */
-function advanceProgress(entry: ScannedFileEntry, completedChunkBytes: number, context: CopyContext): void {
-  context.state.completedBytes = Math.min(
-    context.manifest.totalBytes,
-    context.state.completedBytes + completedChunkBytes,
-  )
-  emitProgress(entry.relativePath, 'copying', context)
+/** worker 启动前验证目标可复用文件，并建立跨调用恢复进度基线。 */
+async function initializeCommittedFiles(context: CopyContext): Promise<void> {
+  for (const entry of context.manifest.leaves) {
+    if (entry.kind !== 'file') continue
+    /** 当前普通文件的受控目标路径。 */
+    const targetPath = resolveContainedPath(context.input.targetRoot, entry.relativePath)
+    /** 缺失或非普通目标不可能贡献恢复基线，交由 worker 原子替换。 */
+    const targetStats = await lstatOrNull(targetPath)
+    if (!targetStats?.isFile()) continue
+    /** 现存普通文件候选需要计算源哈希才能验证复用。 */
+    const sourceHash = await hashManifestFile(entry, context.signal)
+    context.sourceHashes.set(entry.relativePath, sourceHash)
+    /** 当前普通文件父目录的稳定身份。 */
+    const parentIdentity = getTargetParentIdentity(entry.relativePath, context)
+    if (!await isReusableFile(targetPath, parentIdentity, entry, sourceHash, context.signal)) continue
+    context.committedFiles.add(entry.relativePath)
+    context.state.completedBytes += entry.size
+  }
+}
+
+/** 单个普通文件完成稳定复验后，只把完整文件字节计入一次。 */
+function markFileCommitted(entry: ScannedFileEntry, context: CopyContext): void {
+  if (!context.committedFiles.has(entry.relativePath)) {
+    context.committedFiles.add(entry.relativePath)
+    context.state.completedBytes = Math.min(
+      context.manifest.totalBytes,
+      context.state.completedBytes + entry.size,
+    )
+  }
+  emitProgress(entry.relativePath, 'verifying', context)
 }
 
 /** 发出单个条目当前阶段的稳定进度快照。 */

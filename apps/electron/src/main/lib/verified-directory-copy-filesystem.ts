@@ -73,9 +73,8 @@ export interface AtomicFileCopyInput {
   targetPath: string
   parentIdentity: FileSystemIdentity
   signal: AbortSignal
-  trackProgress: boolean
-  onChunk: (chunkBytes: number) => void
-  onEmptyFile: () => void
+  /** 源和临时句柄就绪后、pipeline 开始前汇报当前文件。 */
+  onStart: () => void
 }
 
 /** 以固定大小缓冲和 pipeline 计算普通文件 SHA-256。 */
@@ -104,43 +103,38 @@ export async function hashManifestFile(entry: ScannedFileEntry, signal: AbortSig
   }
 }
 
-/** 在父目录身份复验之间打开并哈希目标普通文件。 */
-export async function hashTargetFile(
-  targetPath: string,
-  parentIdentity: FileSystemIdentity,
-  signal: AbortSignal,
-): Promise<string> {
-  await assertDirectoryIdentity(parentIdentity)
-  /** no-follow 打开的目标普通文件句柄。 */
-  const handle = await openRegularFileNoFollow(targetPath)
-  try {
-    /** 目标文件流式 SHA-256。 */
-    const hash = await hashOpenFile(handle, signal)
-    await assertDirectoryIdentity(parentIdentity)
-    return hash
-  } finally {
-    await handle.close()
-  }
-}
-
-/** 判断目标普通文件是否大小和内容都可复用。 */
+/** 通过稳定句柄判断目标普通文件是否可安全复用。 */
 export async function isReusableFile(
   targetPath: string,
   parentIdentity: FileSystemIdentity,
-  expectedSize: bigint,
+  entry: ScannedFileEntry,
   expectedHash: string,
   signal: AbortSignal,
 ): Promise<boolean> {
   await assertDirectoryIdentity(parentIdentity)
   /** 已有目标条目的 no-follow lstat。 */
-  const stats = await lstatOrNull(targetPath)
-  if (!stats?.isFile() || BigInt(stats.size) !== expectedSize) return false
-  return await hashTargetFile(targetPath, parentIdentity, signal) === expectedHash
+  const pathStats = await lstatOrNull(targetPath)
+  if (!pathStats?.isFile()) return false
+  /** no-follow 打开的目标稳定句柄。 */
+  const handle = await openRegularFileNoFollow(targetPath)
+  try {
+    /** 哈希前的实时元数据必须匹配源清单且 inode 仅有一个链接。 */
+    const beforeStats = await handle.stat({ bigint: true })
+    if (!targetMetadataMatchesManifest(beforeStats, entry)) return false
+    /** 同一稳定句柄上的目标内容哈希。 */
+    const actualHash = await hashOpenFile(handle, signal)
+    /** 哈希后再次复验，捕获读取期间新增硬链接或元数据变化。 */
+    const afterStats = await handle.stat({ bigint: true })
+    await assertDirectoryIdentity(parentIdentity)
+    return targetMetadataMatchesManifest(afterStats, entry) && actualHash === expectedHash
+  } finally {
+    await handle.close()
+  }
 }
 
 /** 使用随机临时叶子、exclusive/no-follow open、pipeline 和原子 rename 复制普通文件。 */
 export async function copyFileAtomic(input: AtomicFileCopyInput): Promise<void> {
-  const { entry, targetPath, parentIdentity, signal, trackProgress, onChunk, onEmptyFile } = input
+  const { entry, targetPath, parentIdentity, signal, onStart } = input
   throwIfAborted(signal)
   await assertDirectoryIdentity(parentIdentity)
   /** 与最终文件同目录、名称不可预测的临时叶子。 */
@@ -162,15 +156,15 @@ export async function copyFileAtomic(input: AtomicFileCopyInput): Promise<void> 
     const temporaryStats = await temporaryHandle.stat({ bigint: true })
     if (!temporaryStats.isFile()) throw new Error(`复制临时叶子不是普通文件: ${entry.relativePath}`)
     temporaryIdentity = { dev: temporaryStats.dev, ino: temporaryStats.ino }
+    onStart()
+    throwIfAborted(signal)
     await assertDirectoryIdentity(parentIdentity)
     /** 源读取流从创建起立即交给 pipeline 统一监听错误。 */
     const readable = sourceHandle.createReadStream({ autoClose: false, highWaterMark: STREAM_BUFFER_SIZE })
-    /** 进度 Transform 在每个数据块边界同步检查取消。 */
-    const progressTransform = new Transform({
+    /** 取消 Transform 在每个固定数据块边界同步检查信号。 */
+    const cancellationTransform = new Transform({
       transform: (chunk: Buffer, _encoding, callback) => {
         try {
-          throwIfAborted(signal)
-          if (trackProgress) onChunk(chunk.byteLength)
           throwIfAborted(signal)
           callback(null, chunk)
         } catch (error) {
@@ -180,8 +174,32 @@ export async function copyFileAtomic(input: AtomicFileCopyInput): Promise<void> 
     })
     /** 临时写入流由 pipeline 从创建时统一接管错误、关闭 fd 与 AbortSignal。 */
     const writable = temporaryHandle.createWriteStream({ autoClose: true })
-    await pipeline(readable, progressTransform, writable, { signal })
+    await pipeline(readable, cancellationTransform, writable, { signal })
+    temporaryHandle = undefined
     await assertOpenSourceMatchesManifest(sourceHandle, entry)
+    /** pipeline 关闭写句柄后 no-follow 重开随机临时叶子。 */
+    const metadataHandle = await openRegularFileNoFollow(temporaryPath)
+    try {
+      /** rename 前只修改复制器独占的临时 inode，避免触碰目标树外硬链接。 */
+      const metadataStats = await metadataHandle.stat({ bigint: true })
+      if (metadataStats.dev !== temporaryIdentity.dev
+        || metadataStats.ino !== temporaryIdentity.ino
+        || metadataStats.nlink !== 1n) {
+        throw new Error(`复制临时叶子元数据处理前身份不一致: ${entry.relativePath}`)
+      }
+      await bestEffortMetadata(`文件权限 ${entry.relativePath}`, () => metadataHandle.chmod(entry.mode))
+      await bestEffortMetadata(`文件时间 ${entry.relativePath}`, () => metadataHandle.utimes(entry.atime, entry.mtime))
+    } finally {
+      await metadataHandle.close()
+    }
+    /** 关闭句柄后临时路径仍必须指向原先创建的 inode。 */
+    const closedTemporaryStats = await lstat(temporaryPath, { bigint: true })
+    if (!closedTemporaryStats.isFile()
+      || closedTemporaryStats.dev !== temporaryIdentity.dev
+      || closedTemporaryStats.ino !== temporaryIdentity.ino
+      || closedTemporaryStats.nlink !== 1n) {
+      throw new Error(`复制临时叶子关闭后身份不一致: ${entry.relativePath}`)
+    }
     await assertDirectoryIdentity(parentIdentity)
     // Node 无跨平台 openat/renameat：随机临时名与前后 dev/ino/canonical 复验只能收敛竞态窗，无法形式化消除两次系统调用之间的目录替换。
     await rename(temporaryPath, targetPath)
@@ -190,11 +208,11 @@ export async function copyFileAtomic(input: AtomicFileCopyInput): Promise<void> 
     const targetStats = await lstat(targetPath, { bigint: true })
     if (!targetStats.isFile()
       || targetStats.dev !== temporaryIdentity.dev
-      || targetStats.ino !== temporaryIdentity.ino) {
+      || targetStats.ino !== temporaryIdentity.ino
+      || targetStats.nlink !== 1n) {
       throw new Error(`目标文件原子提交后身份不一致: ${entry.relativePath}`)
     }
     await assertDirectoryIdentity(parentIdentity)
-    if (entry.size === 0 && trackProgress) onEmptyFile()
   } catch (error) {
     await safelyRemoveTemporaryLeaf(temporaryPath, parentIdentity)
     throw normalizePipelineAbort(error, signal)
@@ -247,24 +265,6 @@ export async function replaceSymbolicLinkAtomic(
     }
     throw error
   }
-}
-
-/** 尽力通过 no-follow 文件句柄保留权限与时间，路径身份失败仍终止迁移。 */
-export async function preserveFileMetadata(
-  entry: ScannedFileEntry,
-  targetPath: string,
-  parentIdentity: FileSystemIdentity,
-): Promise<void> {
-  await assertDirectoryIdentity(parentIdentity)
-  /** no-follow 打开的目标文件句柄。 */
-  const handle = await openRegularFileNoFollow(targetPath)
-  try {
-    await bestEffortMetadata(`文件权限 ${entry.relativePath}`, () => handle.chmod(entry.mode))
-    await bestEffortMetadata(`文件时间 ${entry.relativePath}`, () => handle.utimes(entry.atime, entry.mtime))
-  } finally {
-    await handle.close()
-  }
-  await assertDirectoryIdentity(parentIdentity)
 }
 
 /** 尽力保留符号链接时间，不 chmod 以免平台跟随外部链接目标。 */
@@ -469,6 +469,17 @@ async function assertOpenSourceMatchesManifest(handle: FileHandle, entry: Scanne
     || stats.mtimeNs !== entry.mtimeNs) {
     throw new Error(`源目录普通文件在复制期间发生变化: ${entry.relativePath}`)
   }
+}
+
+/** 判断目标句柄元数据是否与源清单一致且没有其他硬链接。 */
+function targetMetadataMatchesManifest(stats: BigIntStats, entry: ScannedFileEntry): boolean {
+  /** Date 精度为毫秒，目标 utimes 也按同一精度写入。 */
+  const expectedMtimeNs = BigInt(entry.mtime.getTime()) * 1_000_000n
+  return stats.isFile()
+    && stats.nlink === 1n
+    && stats.size === entry.sizeBigInt
+    && Number(stats.mode) === entry.mode
+    && stats.mtimeNs === expectedMtimeNs
 }
 
 /** 仅在父目录身份仍可信时清理随机临时叶子。 */
