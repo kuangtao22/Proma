@@ -47,12 +47,19 @@ export interface DataRootMigrationRecord {
   error?: string
 }
 
+/** 数据根已切换后仍待完成的幂等清理意图。 */
+export interface DataRootPostCommitCleanupRecord {
+  migrationId: string
+  targetRoot: string
+}
+
 /** 位于用户 home 下、独立于可迁移数据根的固定定位文件。 */
 export interface DataRootLocatorFile {
   version: 1
   activeRoot: string
   previousRoot?: string
   migration?: DataRootMigrationRecord
+  postCommitCleanup?: DataRootPostCommitCleanupRecord
 }
 
 /** 路径管理四层 IPC 合同使用的稳定通道名。 */

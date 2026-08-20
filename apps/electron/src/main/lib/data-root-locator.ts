@@ -5,6 +5,7 @@ import type {
   DataRootMigrationProgress,
   DataRootMigrationRecord,
   DataRootMigrationStage,
+  DataRootPostCommitCleanupRecord,
   PathManagementState,
 } from '@proma/shared'
 import { readJsonFileSafe, writeJsonFileAtomic } from './safe-file'
@@ -29,6 +30,14 @@ export interface DataRootLocatorResult {
   status: DataRootLocatorStatus
   state: PathManagementState
   locatorFile?: DataRootLocatorFile
+  error?: string
+}
+
+/** 单次迁移更新允许修改的字段。 */
+export interface DataRootMigrationUpdate {
+  stage?: DataRootMigrationStage
+  completedBytes?: number
+  updatedAt: number
   error?: string
 }
 
@@ -154,6 +163,76 @@ export class DataRootLocator {
   }
 
   /**
+   * 创建唯一 pending 迁移记录，不改变当前活动根。
+   *
+   * @param migration 已完成预检的迁移记录。
+   * @returns 写入后的定位状态。
+   */
+  beginMigration(migration: DataRootMigrationRecord): DataRootLocatorResult {
+    const result = this.inspect()
+    const activeRoot = result.state.activeRoot
+    if (activeRoot === null || result.state.availability !== 'available') throw new Error('当前活动数据根不可用')
+    if (result.locatorFile?.migration !== undefined) throw new Error('已有数据根迁移正在进行')
+    if (result.locatorFile?.postCommitCleanup !== undefined) throw new Error('上一次数据根迁移尚未完成清理')
+    if (migration.sourceRoot !== activeRoot) throw new Error('迁移源根必须是当前活动数据根')
+    if (migration.stage !== 'pending' || migration.completedBytes !== 0) throw new Error('新迁移必须从 pending 零进度开始')
+    return this.write({
+      version: 1,
+      activeRoot,
+      ...(result.locatorFile?.previousRoot === undefined ? {} : { previousRoot: result.locatorFile.previousRoot }),
+      migration,
+    })
+  }
+
+  /**
+   * 按迁移 ID 原子更新进度，并拒绝阶段或字节回退。
+   *
+   * @param migrationId 当前迁移 ID。
+   * @param update 阶段、已提交字节和错误摘要。
+   * @returns 写入后的定位状态。
+   */
+  updateMigration(migrationId: string, update: DataRootMigrationUpdate): DataRootLocatorResult {
+    const result = this.inspect()
+    const locatorFile = result.locatorFile
+    const current = locatorFile?.migration
+    if (!locatorFile || !current) throw new Error('当前没有可更新的数据根迁移')
+    if (current.id !== migrationId) throw new Error('迁移 ID 不匹配')
+    const nextStage = update.stage ?? current.stage
+    const nextCompletedBytes = update.completedBytes ?? current.completedBytes
+    if (!isAllowedMigrationTransition(current.stage, nextStage)) throw new Error('数据根迁移阶段不能跳转或倒退')
+    if (nextCompletedBytes < current.completedBytes || nextCompletedBytes > current.totalBytes) {
+      throw new Error('数据根迁移已完成字节必须单调且不超过总量')
+    }
+    if (update.updatedAt < current.updatedAt) throw new Error('数据根迁移更新时间不能倒退')
+    const migration: DataRootMigrationRecord = {
+      ...current,
+      stage: nextStage,
+      completedBytes: nextCompletedBytes,
+      updatedAt: update.updatedAt,
+      ...(update.error === undefined ? {} : { error: update.error }),
+    }
+    if (update.error === undefined && nextStage !== 'failed') delete migration.error
+    return this.write({ ...locatorFile, migration })
+  }
+
+  /**
+   * 在切换前取消迁移并保留目标副本。
+   *
+   * @param migrationId 当前迁移 ID。
+   * @returns 清除迁移记录后的定位状态。
+   */
+  cancelMigration(migrationId: string): DataRootLocatorResult {
+    const result = this.inspect()
+    const locatorFile = result.locatorFile
+    const migration = locatorFile?.migration
+    if (!locatorFile || !migration) throw new Error('当前没有可取消的数据根迁移')
+    if (migration.id !== migrationId) throw new Error('迁移 ID 不匹配')
+    if (!['pending', 'failed', 'copying'].includes(migration.stage)) throw new Error('当前迁移阶段不能取消')
+    const { migration: _migration, ...remaining } = locatorFile
+    return this.write(remaining)
+  }
+
+  /**
    * 完成当前迁移：原子切换到目标根、记录源根并清除迁移状态。
    *
    * @param migrationId 调用方确认要提交的迁移 ID。
@@ -184,7 +263,27 @@ export class DataRootLocator {
       version: 1,
       activeRoot: migration.targetRoot,
       previousRoot: migration.sourceRoot,
+      postCommitCleanup: {
+        migrationId: migration.id,
+        targetRoot: migration.targetRoot,
+      },
     })
+  }
+
+  /**
+   * finalize 成功后清除 post-commit cleanup 意图。
+   *
+   * @param migrationId 已完成清理的迁移 ID。
+   * @returns 清理后的定位状态。
+   */
+  clearPostCommitCleanup(migrationId: string): DataRootLocatorResult {
+    const result = this.inspect()
+    const locatorFile = result.locatorFile
+    const cleanup = locatorFile?.postCommitCleanup
+    if (!locatorFile || !cleanup) return result
+    if (cleanup.migrationId !== migrationId) throw new Error('清理记录的迁移 ID 不匹配')
+    const { postCommitCleanup: _cleanup, ...remaining } = locatorFile
+    return this.write(remaining)
   }
 
   /**
@@ -307,12 +406,36 @@ function isDataRootLocatorFile(value: unknown): value is DataRootLocatorFile {
   if (value.previousRoot !== undefined && !isAbsolutePath(value.previousRoot)) {
     return false
   }
+  if (value.postCommitCleanup !== undefined) {
+    if (!isDataRootPostCommitCleanupRecord(value.postCommitCleanup)) return false
+    if (value.postCommitCleanup.targetRoot !== value.activeRoot) return false
+    if (value.migration !== undefined) return false
+  }
   if (value.migration !== undefined) {
     if (!isDataRootMigrationRecord(value.migration) || value.migration.sourceRoot !== value.activeRoot) {
       return false
     }
   }
   return true
+}
+
+/** 校验 commit 后清理记录与活动目标根的绑定。 */
+function isDataRootPostCommitCleanupRecord(value: unknown): value is DataRootPostCommitCleanupRecord {
+  return isRecord(value)
+    && isNonEmptyString(value.migrationId)
+    && isAbsolutePath(value.targetRoot)
+}
+
+/** 迁移主路径只允许向前推进，failed 仅允许回到 copying 重试。 */
+function isAllowedMigrationTransition(
+  current: DataRootMigrationStage,
+  next: DataRootMigrationStage,
+): boolean {
+  if (current === next) return true
+  if (next === 'failed') return current !== 'switching'
+  if (current === 'failed') return next === 'copying'
+  const order: DataRootMigrationStage[] = ['pending', 'copying', 'verifying', 'rebasing', 'switching']
+  return order.indexOf(next) === order.indexOf(current) + 1
 }
 
 /**

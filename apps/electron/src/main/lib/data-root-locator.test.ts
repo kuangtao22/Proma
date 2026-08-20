@@ -244,7 +244,70 @@ describe('DataRootLocator', () => {
       version: 1,
       activeRoot: targetRoot,
       previousRoot: sourceRoot,
+      postCommitCleanup: {
+        migrationId: 'migration-2',
+        targetRoot,
+      },
     })
+
+    locator.clearPostCommitCleanup('migration-2')
+    expect(JSON.parse(readFileSync(locator.getLocatorPath(), 'utf-8'))).toEqual({
+      version: 1,
+      activeRoot: targetRoot,
+      previousRoot: sourceRoot,
+    })
+  })
+
+  test('Given pending migration When updating Then stages and completed bytes only move forward', () => {
+    const sourceRoot = join(homeDir, 'ordered-source-root')
+    const targetRoot = join(homeDir, 'ordered-target-root')
+    mkdirSync(sourceRoot)
+    const locator = new DataRootLocator({ homeDir })
+    locator.write({ version: 1, activeRoot: sourceRoot })
+    locator.beginMigration({
+      id: 'ordered-migration',
+      sourceRoot,
+      targetRoot,
+      stage: 'pending',
+      completedBytes: 0,
+      totalBytes: 100,
+      startedAt: 1000,
+      updatedAt: 1000,
+    })
+
+    locator.updateMigration('ordered-migration', { stage: 'copying', completedBytes: 40, updatedAt: 1100 })
+    expect(() => locator.updateMigration('ordered-migration', {
+      stage: 'pending',
+      completedBytes: 40,
+      updatedAt: 1200,
+    })).toThrow('不能跳转或倒退')
+    expect(() => locator.updateMigration('ordered-migration', {
+      completedBytes: 39,
+      updatedAt: 1200,
+    })).toThrow('必须单调')
+    expect(locator.inspect().locatorFile?.migration).toMatchObject({ stage: 'copying', completedBytes: 40 })
+  })
+
+  test('Given invalid begin or late-stage cancel When mutating Then locator rejects unsafe state changes', () => {
+    const sourceRoot = join(homeDir, 'guarded-source-root')
+    const targetRoot = join(homeDir, 'guarded-target-root')
+    mkdirSync(sourceRoot)
+    const locator = new DataRootLocator({ homeDir })
+    locator.write({ version: 1, activeRoot: sourceRoot })
+    const record = {
+      id: 'guarded-migration',
+      sourceRoot,
+      targetRoot,
+      stage: 'copying' as const,
+      completedBytes: 1,
+      totalBytes: 100,
+      startedAt: 1000,
+      updatedAt: 1000,
+    }
+
+    expect(() => locator.beginMigration(record)).toThrow('pending 零进度')
+    locator.write({ version: 1, activeRoot: sourceRoot, migration: { ...record, stage: 'rebasing' } })
+    expect(() => locator.cancelMigration('guarded-migration')).toThrow('不能取消')
   })
 
   test('Given a mismatched migration ID When committing Then it rejects without switching the active root', () => {
