@@ -6,7 +6,9 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { spawnSync } from 'node:child_process'
@@ -62,6 +64,29 @@ describe('Proma 数据根 marker', () => {
 
     expect(prepareNormalDataRoot(locator, locator.inspect())).toBe(activeRoot)
     expect(readMarker(activeRoot)).toEqual({ owner: 'proma', version: 1 })
+  })
+
+  test('Given 默认根已有合法 marker When 再次正常启动 Then 不重写 marker 或生成备份', () => {
+    /** 同一个无 locator 默认根模拟开发版与正式版先后执行 normal 准备。 */
+    const locator = new DataRootLocator({ homeDir })
+    const activeRoot = prepareNormalDataRoot(locator, locator.inspect())
+    /** 固定旧时间戳，避免依赖文件系统时间精度判断是否发生原子替换。 */
+    const markerPath = join(activeRoot, PROMA_DATA_ROOT_MARKER_FILE)
+    const fixedTime = new Date('2020-01-02T03:04:05.000Z')
+    utimesSync(markerPath, fixedTime, fixedTime)
+    /** 首次准备后的内容与文件身份用于验证第二次调用完全无写入。 */
+    const contentBefore = readFileSync(markerPath, 'utf8')
+    const statBefore = statSync(markerPath, { bigint: true })
+
+    expect(existsSync(`${markerPath}.bak`)).toBe(false)
+    expect(prepareNormalDataRoot(locator, locator.inspect())).toBe(activeRoot)
+
+    /** 合法 marker 必须原样复用，不能触发 safe-file 的备份或原子替换。 */
+    const statAfter = statSync(markerPath, { bigint: true })
+    expect(readFileSync(markerPath, 'utf8')).toBe(contentBefore)
+    expect(statAfter.ino).toBe(statBefore.ino)
+    expect(statAfter.mtimeNs).toBe(statBefore.mtimeNs)
+    expect(existsSync(`${markerPath}.bak`)).toBe(false)
   })
 
   test('Given custom 根只有 default-skills 目录 When 正常启动 Then 仍拒绝补 marker', () => {

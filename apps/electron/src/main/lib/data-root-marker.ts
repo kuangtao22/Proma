@@ -131,14 +131,16 @@ export function prepareNormalDataRoot(
   const hasNoLocator = locatorResult.locatorFile === undefined
   /** custom 根离线时不创建目录，默认根缺失时按启动合同创建。 */
   const activeRoot = locator.requireActiveRoot({ createDefault: hasNoLocator })
+  /** 已有合法 marker 时保持启动只读，避免生成备份或替换文件身份。 */
+  const identity = inspectPromaDataRootIdentity(activeRoot)
+  if (identity === 'marker') return activeRoot
   /** 默认根例外必须同时满足 locator 缺失与精确固定路径，不能扩散到 custom 根。 */
   const isControlledDefaultRoot = hasNoLocator && resolve(activeRoot) === resolve(expectedDefaultRoot)
-  if (isControlledDefaultRoot) {
+  if (identity === 'legacy' || isControlledDefaultRoot) {
     writeAndVerifyPromaDataRootMarker(activeRoot)
-  } else {
-    ensurePromaDataRootMarker(activeRoot)
+    return activeRoot
   }
-  return activeRoot
+  throw new Error('所选目录不是可识别的 Proma 数据根')
 }
 
 /** 原子写入唯一合法 marker，并通过同一 no-follow 读取链精确复验。 */
