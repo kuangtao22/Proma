@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
@@ -281,6 +281,120 @@ describe('路径管理 IPC', () => {
     ])
   })
 
+  test('Given pending 已持久化且 guard 每次释放都失败 When 创建计划 Then 保留 pending 并必然重启退出', async () => {
+    /** 隔离真实 locator，证明 guard 清理失败不会撤销已持久化计划。 */
+    const homeDir = await mkdtemp(join(tmpdir(), 'proma-path-guard-release-'))
+    /** 当前活动根只用于构造合法 locator 状态。 */
+    const sourceRoot = join(homeDir, 'source-root')
+    /** 迁移目标根由测试协调器直接写入 pending 记录。 */
+    const targetRoot = join(homeDir, 'target-root')
+    mkdirSync(sourceRoot)
+    const locator = new DataRootLocator({ homeDir })
+    locator.write({ version: 1, activeRoot: sourceRoot })
+    /** 记录 guard 清理和应用退出的严格调用顺序。 */
+    const calls: string[] = []
+    /** 保存注册的迁移启动 handler。 */
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    /** 抑制预期的受控警告，同时验证失败未向 renderer 传播。 */
+    const warningSpy = spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      registerPathManagementIpcHandlers({
+        mode: 'normal',
+        homeDir,
+        ipc: {
+          handle: (channel, handler) => { handlers.set(channel, handler) },
+          removeHandler: () => undefined,
+        },
+        app: {
+          relaunch: () => { calls.push('relaunch') },
+          quit: () => { calls.push('quit') },
+        },
+        getExpectedWebContents: () => expectedWebContents,
+        acquireMigrationGuard: () => ({
+          release: () => {
+            calls.push('release-intent')
+            throw new Error('模拟 intent 清理持续失败')
+          },
+        }),
+        coordinator: {
+          getStatus: () => locator.inspect().state,
+          createPlan: async () => {
+            calls.push('create-plan')
+            locator.beginMigration({
+              id: 'migration-guard-release',
+              sourceRoot,
+              targetRoot,
+              stage: 'pending',
+              completedBytes: 0,
+              totalBytes: 100,
+              startedAt: 1,
+              updatedAt: 1,
+            })
+            return {
+              migrationId: 'migration-guard-release',
+              stage: 'pending',
+              completedBytes: 0,
+              totalBytes: 100,
+            }
+          },
+          runPending: async () => undefined,
+          resumePending: async () => undefined,
+          cancel: async () => { calls.push('cancel') },
+        },
+      })
+
+      const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
+      if (!handler) throw new Error('未注册创建迁移计划通道')
+      await expect(handler(expectedEvent, targetRoot)).resolves.toBeUndefined()
+
+      expect(calls).toEqual(['create-plan', 'release-intent', 'relaunch', 'quit'])
+      expect(locator.inspect().locatorFile?.migration).toMatchObject({
+        id: 'migration-guard-release',
+        stage: 'pending',
+      })
+      expect(warningSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      warningSpy.mockRestore()
+    }
+  })
+
+  test('Given createPlan 失败 When 启动迁移 Then 释放 guard 且不重启', async () => {
+    /** 记录计划失败后的清理与禁止发生的重启动作。 */
+    const calls: string[] = []
+    /** 保存注册的迁移启动 handler。 */
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: {
+        relaunch: () => { calls.push('relaunch') },
+        quit: () => { calls.push('quit') },
+      },
+      getExpectedWebContents: () => expectedWebContents,
+      acquireMigrationGuard: () => ({ release: () => { calls.push('release-intent') } }),
+      coordinator: {
+        getStatus: () => createLocatorResult().state,
+        createPlan: async () => {
+          calls.push('create-plan')
+          throw new Error('模拟计划创建失败')
+        },
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => { calls.push('cancel') },
+      },
+    })
+
+    const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
+    if (!handler) throw new Error('未注册创建迁移计划通道')
+    await expect(handler(expectedEvent, '/data/proma-new')).rejects.toThrow('模拟计划创建失败')
+    expect(calls).toEqual(['create-plan', 'release-intent'])
+  })
+
   test('Given 存在活跃 Agent 或 Automation When 创建计划 Then 拒绝且不写计划', async () => {
     /** 标记测试中是否错误写入迁移计划。 */
     let created = false
@@ -314,14 +428,14 @@ describe('路径管理 IPC', () => {
     expect(created).toBe(false)
   })
 
-  test('Given 异步预检期间启动新任务 When 计划刚落盘 Then 撤销计划且不重启', async () => {
+  test('Given 异步预检期间启动新任务 When 计划刚落盘 Then 撤销计划并退出 normal 进程', async () => {
     /** 前两次预检通过，计划落盘后的第三次检查发现新任务。 */
     let activeChecks = 0
     /** 标记已落盘计划是否被安全撤销。 */
     let cancelled = false
     /** 保存注册的 invoke handler。 */
     const handlers = new Map<string, (...args: unknown[]) => unknown>()
-    /** 记录禁止发生的应用重启。 */
+    /** 记录计划成功后必须发生的应用重启。 */
     const relaunchCalls: string[] = []
 
     registerPathManagementIpcHandlers({
@@ -359,7 +473,7 @@ describe('路径管理 IPC', () => {
     if (!handler) throw new Error('未注册创建迁移计划通道')
     await expect(handler(expectedEvent, '/data/proma-new')).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
     expect(cancelled).toBe(true)
-    expect(relaunchCalls).toEqual([])
+    expect(relaunchCalls).toEqual(['relaunch', 'quit'])
   })
 
   test('Given 数据根已移动到新目录 When 重新定位 Then 原子更新 locator 并重启', async () => {

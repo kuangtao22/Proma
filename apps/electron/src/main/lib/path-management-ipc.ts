@@ -187,10 +187,13 @@ export function registerPathManagementIpcHandlers(
       await assertMigrationCanStart(options)
       /** intent guard 关闭其他 normal 实例的新入口，直到当前进程退出。 */
       const migrationGuard = await options.acquireMigrationGuard?.()
+      /** createPlan 返回即表示 pending 已持久化，此后当前 normal 进程必须退出。 */
+      let migrationPlanPersisted = false
       try {
         // 取得 intent 后二次预检，排除 intent 竞争窗口内进入的实例与任务。
         await assertMigrationCanStart(options)
         await getCoordinator().createPlan(targetRoot)
+        migrationPlanPersisted = true
         try {
           // createPlan 的磁盘预检会让出事件循环；落盘后复检并撤销期间新出现的任务。
           await assertMigrationCanStart(options)
@@ -198,12 +201,16 @@ export function registerPathManagementIpcHandlers(
           await getCoordinator().cancel()
           throw error
         }
-        // locator pending 已持久化，后续 normal 启动会被启动门阻止，此时可安全释放 intent。
-        migrationGuard?.release()
-        relaunchNow()
-      } catch (error) {
-        migrationGuard?.release()
-        throw error
+      } finally {
+        try {
+          // guard 只负责缩小竞争窗口；释放失败保留 stale claim，由新进程 challenge 回收。
+          migrationGuard?.release()
+        } catch (error) {
+          /** 受控记录 guard 清理失败，不覆盖迁移事务原始结果。 */
+          const message = error instanceof Error ? error.message : String(error)
+          console.warn(`[路径管理] 迁移 intent 清理失败，将由新进程回收: ${message}`)
+        }
+        if (migrationPlanPersisted) relaunchNow()
       }
     })
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, () => {
