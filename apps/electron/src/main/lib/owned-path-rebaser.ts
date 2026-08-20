@@ -1,4 +1,4 @@
-import { basename, isAbsolute, join, posix, relative, resolve, sep, win32 } from 'node:path'
+import { isAbsolute, join, posix, relative, resolve, sep, win32 } from 'node:path'
 import type { PlatformPath } from 'node:path'
 import {
   captureDirectoryGuard,
@@ -23,6 +23,7 @@ import {
   isWorkspaceConfig,
 } from './owned-path-rebaser-schema'
 import type { JsonObject } from './owned-path-rebaser-schema'
+import { isWorkspaceSlug } from './workspace-slug'
 
 /** 数据根重写参数。 */
 export interface RebaseDataRootOwnedPathsInput {
@@ -212,9 +213,7 @@ function preflightWorkspaceConfigFiles(
   for (const workspace of index.workspaces) {
     /** 在目录缺失快速路径前也必须校验的 slug。 */
     const slug = workspace.slug
-    if (slug.length === 0 || basename(slug) !== slug) {
-      throw new Error(`工作区配置路径越过目标数据根: ${slug}`)
-    }
+    if (!isWorkspaceSlug(slug)) throw new Error(`workspace slug 不符合生成合同: ${slug}`)
     if (workspaceIds.has(workspace.id)) {
       throw new Error(`agent-workspaces.json 存在重复 workspace id: ${workspace.id}`)
     }

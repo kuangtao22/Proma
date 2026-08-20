@@ -29,6 +29,7 @@ import {
 import { findAllGitRoots, normalizeGitRoot } from './git-diff-service'
 import { listBuiltinMcpServers } from './builtin-mcp/catalog'
 import { RESERVED_BUILTIN_KEYS } from './builtin-mcp/baseline'
+import { createWorkspaceSlug } from './workspace-slug'
 import { inferMcpTransportType, normalizeMcpTransportType } from '@proma/shared'
 import type { AgentWorkspace, CreateAgentWorkspaceInput, LocalProjectRootStatus, WorkspaceMcpConfig, SkillMeta, SkillImportSource, OtherWorkspaceSkillsGroup, WorkspaceCapabilities, SkillFileNode, SkillFileContent, WorkspaceMemorySummary, BulkImportSkillItemResult, BulkImportSkillsResult, BulkImportWorkspaceSelection } from '@proma/shared'
 
@@ -38,31 +39,6 @@ interface AgentWorkspacesIndex {
 }
 
 const INDEX_VERSION = 2
-const WINDOWS_RESERVED_SLUGS = new Set([
-  'con',
-  'prn',
-  'aux',
-  'nul',
-  'com1',
-  'com2',
-  'com3',
-  'com4',
-  'com5',
-  'com6',
-  'com7',
-  'com8',
-  'com9',
-  'lpt1',
-  'lpt2',
-  'lpt3',
-  'lpt4',
-  'lpt5',
-  'lpt6',
-  'lpt7',
-  'lpt8',
-  'lpt9',
-])
-
 /** 读取工作区索引文件，自动执行版本迁移 */
 function readIndex(): AgentWorkspacesIndex {
   const indexPath = getAgentWorkspacesIndexPath()
@@ -124,30 +100,6 @@ function writeIndex(index: AgentWorkspacesIndex): void {
     console.error('[Agent 工作区] 写入索引文件失败:', error)
     throw new Error('写入项目配置索引失败')
   }
-}
-
-/** 名称转 URL-safe slug，非 ASCII 名称 fallback 为 workspace-{timestamp} */
-function slugify(name: string, existingSlugs: Set<string>): string {
-  let base = name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '')
-
-  if (!base) {
-    base = `workspace-${Date.now()}`
-  }
-  if (WINDOWS_RESERVED_SLUGS.has(base)) {
-    base = `workspace-${base}`
-  }
-
-  let slug = base
-  let counter = 1
-  while (existingSlugs.has(slug)) {
-    slug = `${base}-${counter}`
-    counter++
-  }
-
-  return slug
 }
 
 /** 返回索引中的存储顺序（与 UI 拖拽顺序一致）；返回副本，避免调用方 sort 等操作误改索引数组 */
@@ -265,7 +217,7 @@ export function createAgentWorkspace(input: string | CreateAgentWorkspaceInput):
   }
 
   const existingSlugs = new Set(index.workspaces.map((w) => w.slug))
-  const slug = slugify(name, existingSlugs)
+  const slug = createWorkspaceSlug(name, existingSlugs)
   const now = Date.now()
   let normalizedProjectRootPath: string | undefined
 

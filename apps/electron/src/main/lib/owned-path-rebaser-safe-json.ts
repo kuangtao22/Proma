@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import {
   closeSync,
   constants,
@@ -23,6 +23,18 @@ interface FileSystemIdentity {
   ino: number | bigint
 }
 
+/** Stats 与 BigIntStats 共用的文件稳定属性。 */
+interface FileSystemStat extends FileSystemIdentity {
+  /** 文件字节数。 */
+  size: number | bigint
+  /** 文件最后修改时间。 */
+  mtimeMs: number | bigint
+  /** 文件硬链接数。 */
+  nlink: number | bigint
+  /** 判断 stat 对象是否表示普通文件。 */
+  isFile(): boolean
+}
+
 /** 已验证目录的路径、物理位置与身份。 */
 export interface DirectoryGuard extends FileSystemIdentity {
   /** 调用方使用的目录路径。 */
@@ -42,7 +54,17 @@ interface FileGuard extends FileSystemIdentity {
   /** 检测同 inode 原地修改的最后修改时间。 */
   mtimeMs: number | bigint
   /** 拒绝树外硬链接和候选别名。 */
-  nlink: number
+  nlink: number | bigint
+  /** 受控 fd 读取的原始字节 SHA-256。 */
+  contentSha256: string
+}
+
+/** 单次受控 fd 读取返回的文件 guard 与原始字节。 */
+interface CapturedFile {
+  /** 包含内容摘要的稳定 guard。 */
+  guard: FileGuard
+  /** 与 guard 摘要对应的原始字节。 */
+  bytes: Buffer
 }
 
 /** 目标数据根在整个重写过程中的稳定身份。 */
@@ -59,6 +81,8 @@ interface CandidateState<T> {
   valid: boolean
   /** schema 合法时解析出的值。 */
   value?: T
+  /** 本次受控 fd 读取的原始字节 SHA-256。 */
+  contentSha256: string | null
 }
 
 /** safe-file 主/tmp/bak 候选状态。 */
@@ -230,7 +254,7 @@ export function writePersistentJson(file: PersistentJson<JsonObject>, targetGuar
   if (!afterWrite.primary.valid || !afterWrite.backup.valid || afterWrite.temporary.guard) {
     throw new Error(`原子写回结果异常: ${file.filePath}`)
   }
-  if (!readFileSync(file.filePath).equals(readFileSync(`${file.filePath}.bak`))) {
+  if (afterWrite.primary.contentSha256 !== afterWrite.backup.contentSha256) {
     throw new Error(`原子写回 main 与 backup 内容不一致: ${file.filePath}`)
   }
 }
@@ -295,61 +319,50 @@ function inspectCandidateStates<T>(
   validate: (value: unknown) => value is T,
   targetGuard: TargetRootGuard,
 ): CandidateStates<T> {
-  /** 三个候选各自的 no-follow guard。 */
-  const primaryGuard = captureFileGuard(filePath, targetGuard)
-  const temporaryGuard = captureFileGuard(`${filePath}.tmp`, targetGuard)
-  const backupGuard = captureFileGuard(`${filePath}.bak`, targetGuard)
   return {
-    primary: readCandidateState(primaryGuard, validate, targetGuard),
-    temporary: readCandidateState(temporaryGuard, validate, targetGuard),
-    backup: readCandidateState(backupGuard, validate, targetGuard),
+    primary: readCandidateState(filePath, validate, targetGuard),
+    temporary: readCandidateState(`${filePath}.tmp`, validate, targetGuard),
+    backup: readCandidateState(`${filePath}.bak`, validate, targetGuard),
   }
 }
 
-/** 读取候选内容并复验同一文件身份。 */
+/** 单次受控 fd 读取候选，复用同一原始字节计算摘要、解析 JSON 和校验 schema。 */
 function readCandidateState<T>(
-  guard: FileGuard | null,
+  filePath: string,
   validate: (value: unknown) => value is T,
   targetGuard: TargetRootGuard,
 ): CandidateState<T> {
-  if (!guard) return { guard: null, valid: false }
-  /** 使用 no-follow 打开的候选文件描述符。 */
-  const descriptor = openSync(guard.filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-  /** 候选文件原文。 */
-  let raw: string
+  /** 候选 guard 与对应原始字节。 */
+  const captured = captureFile(filePath, targetGuard)
+  if (!captured) return { guard: null, valid: false, contentSha256: null }
+  /** 本次解析与摘要共用的原始字节。 */
+  const raw = captured.bytes
+  /** 本次受控读取的内容身份。 */
+  const contentSha256 = captured.guard.contentSha256
   try {
-    /** fd 读取前的稳定身份。 */
-    const beforeRead = fstatSync(descriptor)
-    if (!sameStableSnapshot(guard, beforeRead)) {
-      throw new Error(`读取前配置候选被替换: ${guard.filePath}`)
+    if (raw.toString('utf-8').trim().length === 0) {
+      return { guard: captured.guard, valid: false, contentSha256 }
     }
-    raw = readFileSync(descriptor, 'utf-8')
-    /** fd 读取后的稳定身份。 */
-    const afterRead = fstatSync(descriptor)
-    if (!sameStableSnapshot(guard, afterRead)) {
-      throw new Error(`读取期间配置候选被替换: ${guard.filePath}`)
-    }
-  } finally {
-    closeSync(descriptor)
-  }
-  try {
-    /** 路径在读取后仍必须指向刚才读取的同一普通文件。 */
-    const afterPathRead = captureFileGuard(guard.filePath, targetGuard)
-    if (!afterPathRead || !sameStableFile(guard, afterPathRead)) {
-      throw new Error(`读取期间配置候选路径被替换: ${guard.filePath}`)
-    }
-    if (raw.trim().length === 0) return { guard, valid: false }
     /** 候选 JSON 解析值。 */
-    const parsed: unknown = JSON.parse(raw)
-    return validate(parsed) ? { guard, valid: true, value: parsed } : { guard, valid: false }
+    const parsed: unknown = JSON.parse(raw.toString('utf-8'))
+    return validate(parsed)
+      ? { guard: captured.guard, valid: true, value: parsed, contentSha256 }
+      : { guard: captured.guard, valid: false, contentSha256 }
   } catch (error) {
-    if (error instanceof SyntaxError) return { guard, valid: false }
+    if (error instanceof SyntaxError) {
+      return { guard: captured.guard, valid: false, contentSha256 }
+    }
     throw error
   }
 }
 
-/** 捕获目标根内一个普通文件候选的身份。 */
+/** 捕获目标根内一个普通文件候选的身份与内容摘要。 */
 function captureFileGuard(filePath: string, targetGuard: TargetRootGuard): FileGuard | null {
+  return captureFile(filePath, targetGuard)?.guard ?? null
+}
+
+/** 通过 no-follow fd 单次读取普通文件，并将路径、fd 元数据与 SHA-256 绑定。 */
+function captureFile(filePath: string, targetGuard: TargetRootGuard): CapturedFile | null {
   verifyTargetRootGuard(targetGuard)
   /** 不跟随最终 symlink 取得的候选状态。 */
   const fileStat = lstatIfPresent(filePath)
@@ -361,14 +374,50 @@ function captureFileGuard(filePath: string, targetGuard: TargetRootGuard): FileG
   /** 候选物理路径。 */
   const canonicalPath = realpathSync(filePath)
   assertCanonicalContainment(canonicalPath, targetGuard.canonicalPath, filePath)
+  /** 使用 no-follow 打开的候选文件描述符。 */
+  const descriptor = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  /** 候选原始字节。 */
+  let bytes: Buffer
+  try {
+    /** fd 读取前必须仍匹配路径预检元数据。 */
+    const beforeRead = fstatSync(descriptor)
+    if (!sameMetadataSnapshot(fileStat, beforeRead)) {
+      throw new Error(`读取前配置候选被替换: ${filePath}`)
+    }
+    bytes = readFileSync(descriptor)
+    /** fd 读取后不得发生 inode、长度、mtime 或链接数变化。 */
+    const afterRead = fstatSync(descriptor)
+    if (!sameMetadataSnapshot(beforeRead, afterRead)) {
+      throw new Error(`读取期间配置候选被替换: ${filePath}`)
+    }
+  } finally {
+    closeSync(descriptor)
+  }
+  /** 读取后路径必须仍指向相同普通单链接文件。 */
+  const afterPathRead = lstatIfPresent(filePath)
+  if (
+    !afterPathRead
+    || afterPathRead.isSymbolicLink()
+    || !afterPathRead.isFile()
+    || !sameMetadataSnapshot(fileStat, afterPathRead)
+    || realpathSync(filePath) !== canonicalPath
+  ) {
+    throw new Error(`读取期间配置候选路径被替换: ${filePath}`)
+  }
+  /** 与本次返回 bytes 对应的内容摘要。 */
+  const contentSha256 = createHash('sha256').update(bytes).digest('hex')
   return {
-    filePath,
-    canonicalPath,
-    dev: fileStat.dev,
-    ino: fileStat.ino,
-    size: fileStat.size,
-    mtimeMs: fileStat.mtimeMs,
-    nlink: fileStat.nlink,
+    bytes,
+    guard: {
+      filePath,
+      canonicalPath,
+      dev: afterPathRead.dev,
+      ino: afterPathRead.ino,
+      size: afterPathRead.size,
+      mtimeMs: afterPathRead.mtimeMs,
+      nlink: afterPathRead.nlink,
+      contentSha256,
+    },
   }
 }
 
@@ -420,7 +469,10 @@ function assertCanonicalContainment(candidate: string, canonicalRoot: string, re
 /** 比较可选文件 guard 的存在性和稳定文件属性。 */
 function assertOptionalGuardUnchanged(expected: FileGuard | null, actual: FileGuard | null, message: string): void {
   if (!expected && !actual) return
-  if (!expected || !actual || !sameStableFile(expected, actual)) throw new Error(message)
+  if (!expected || !actual || !sameFileMetadata(expected, actual)) throw new Error(message)
+  if (expected.contentSha256 !== actual.contentSha256) {
+    throw new Error(`${message}（内容 SHA-256 不一致）`)
+  }
 }
 
 /** 断言两个文件 guard 稳定属性相同。 */
@@ -430,18 +482,27 @@ function assertSameGuard(expected: FileGuard, actual: FileGuard | null, message:
 
 /** 比较文件身份、大小和修改时间。 */
 function sameStableFile(left: FileGuard, right: FileGuard): boolean {
+  return sameFileMetadata(left, right) && left.contentSha256 === right.contentSha256
+}
+
+/** 比较不含内容摘要的稳定文件元数据。 */
+function sameFileMetadata(left: FileGuard, right: FileGuard): boolean {
   return sameIdentity(left, right)
     && left.size === right.size
     && left.mtimeMs === right.mtimeMs
     && left.nlink === right.nlink
 }
 
-/** 比较路径 guard 与 fd stat 的稳定属性。 */
-function sameStableSnapshot(left: FileGuard, right: ReturnType<typeof fstatSync>): boolean {
+/** 比较两次 stat 的稳定元数据。 */
+function sameMetadataSnapshot(
+  left: FileSystemStat,
+  right: FileSystemStat,
+): boolean {
   return sameIdentity(left, right)
     && left.size === right.size
     && left.mtimeMs === right.mtimeMs
     && left.nlink === right.nlink
+    && left.isFile()
     && right.isFile()
 }
 
@@ -510,6 +571,7 @@ function replaceWithAtomicLeaf(
     assertSameGuard(temporaryGuard, currentTemporary, `提交前原子临时文件被替换: ${temporaryPath}`)
     renameSync(temporaryPath, destinationPath)
     committed = true
+    fsyncParentDirectoryBestEffort(dirname(destinationPath))
     verifyTargetRootGuard(targetGuard)
     verifyDirectoryGuards(directoryGuards, targetGuard)
     /** rename 后目标文件必须保持临时 inode 的身份和目标字节。 */
@@ -521,6 +583,28 @@ function replaceWithAtomicLeaf(
   } finally {
     if (descriptorOpen) closeSync(descriptor)
     if (!committed && temporaryIdentity) cleanupRandomTemporary(temporaryPath, temporaryIdentity, targetGuard)
+  }
+}
+
+/** 成功 rename 后尽力刷盘父目录；平台不支持目录 fd 时告警但不回滚已完成提交。 */
+function fsyncParentDirectoryBestEffort(directoryPath: string): void {
+  /** 父目录只读 fd；部分平台不允许打开目录。 */
+  let descriptor: number | null = null
+  try {
+    descriptor = openSync(directoryPath, constants.O_RDONLY)
+    fsyncSync(descriptor)
+  } catch (error) {
+    /** 用于跨平台诊断的文件系统错误码。 */
+    const code = isNodeError(error) ? error.code : undefined
+    console.warn(`[路径迁移] 父目录 fsync 不可用，已保留原子 rename 结果: ${directoryPath}${code ? ` (${code})` : ''}`)
+  } finally {
+    if (descriptor !== null) {
+      try {
+        closeSync(descriptor)
+      } catch {
+        // rename 已成功，目录 fd 关闭失败仅影响资源回收诊断，不得伪装为提交失败。
+      }
+    }
   }
 }
 

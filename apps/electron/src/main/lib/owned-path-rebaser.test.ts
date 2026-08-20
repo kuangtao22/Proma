@@ -8,8 +8,10 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -584,7 +586,51 @@ describe('rebaseDataRootOwnedPaths', () => {
       .toThrow('agent-sessions.json 损坏或 schema 无法安全解释')
   })
 
-  test.skipIf(!CASE_INSENSITIVE_FILE_SYSTEM)('Given 文件系统将大小写 slug 解析为同一目录 When 预检 Then 拒绝目录物理所有权重复', () => {
+  test('Given workspace slug 为点目录 When 预检 Then 不读取或写入工作区容器 config', () => {
+    /** 工作区容器路径。 */
+    const workspacesDir = join(targetRoot, 'agent-workspaces')
+    /** 点目录会错误映射到的容器 config。 */
+    const containerConfigPath = join(workspacesDir, 'config.json')
+    mkdirSync(workspacesDir)
+    writeJson(join(targetRoot, 'agent-workspaces.json'), {
+      version: 2,
+      workspaces: [createWorkspace({ slug: '.' })],
+    })
+    writeJson(containerConfigPath, { attachedFiles: [join(sourceRoot, 'protected.txt')] })
+    /** 调用前容器 config 原始字节。 */
+    const originalConfig = readFileSync(containerConfigPath)
+
+    expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+      .toThrow('workspace slug 不符合生成合同')
+    expect(readFileSync(containerConfigPath).equals(originalConfig)).toBe(true)
+    expect(existsSync(`${containerConfigPath}.bak`)).toBe(false)
+  })
+
+  test('Given 保留名或非规范 workspace slug When 预检 Then 在目录 I/O 前拒绝', () => {
+    /** manager 永远不会生成的 slug 值。 */
+    const invalidSlugs = ['..', 'CON', 'alpha beta', 'Alpha', 'alpha_beta', 'alpha/beta', 'alpha\\beta', '-alpha', 'alpha-']
+    for (const slug of invalidSlugs) {
+      writeJson(join(targetRoot, 'agent-workspaces.json'), {
+        version: 2,
+        workspaces: [createWorkspace({ slug })],
+      })
+      expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
+        .toThrow('workspace slug 不符合生成合同')
+    }
+  })
+
+  test('Given manager 可生成或默认创建的 workspace slug When 预检 Then 保持兼容', () => {
+    /** 仓库真实生成合同中的合法 slug。 */
+    const validSlugs = ['default', 'proma', 'product-dev', 'workspace-1720000000000', 'product-dev-2']
+    writeJson(join(targetRoot, 'agent-workspaces.json'), {
+      version: 2,
+      workspaces: validSlugs.map((slug, index) => createWorkspace({ id: `workspace-${index}`, slug })),
+    })
+
+    expect(rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }).updatedFiles).toEqual([])
+  })
+
+  test.skipIf(!CASE_INSENSITIVE_FILE_SYSTEM)('Given 大小写不敏感文件系统和大写 slug When 预检 Then 先拒绝非规范 slug', () => {
     /** 用于探测当前文件系统大小写语义的工作区容器。 */
     const workspacesDir = join(targetRoot, 'agent-workspaces')
     /** 小写实际目录。 */
@@ -601,7 +647,7 @@ describe('rebaseDataRootOwnedPaths', () => {
     })
 
     expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
-      .toThrow('workspace 目录物理身份重复')
+      .toThrow('workspace slug 不符合生成合同')
   })
 
   test('Given worktree repo 缺少必填字段 When 预检 Then 不部分写其它文件', () => {
@@ -739,6 +785,40 @@ describe('rebaseDataRootOwnedPaths', () => {
     expect(readFileSync(sentinelPath).equals(originalSentinel)).toBe(true)
   })
 
+  test('Given 恢复确认后候选同长度同mtime原地变更 When 原子提交 Then SHA校验失败且所有字节不变', () => {
+    /** 待提交的 workspace config。 */
+    const configPath = join(targetRoot, 'config.json')
+    /** 固定 backup 候选。 */
+    const backupPath = `${configPath}.bak`
+    writeJson(configPath, { attachedFiles: [join(sourceRoot, 'a.txt')] })
+    writeJson(backupPath, { attachedFiles: [join(sourceRoot, 'backup.txt')] })
+    /** 文件系统可精确恢复的整秒固定时间。 */
+    const fixedTime = new Date('2026-01-01T00:00:00.000Z')
+    utimesSync(configPath, fixedTime, fixedTime)
+    /** 预检时主文件的原始时间。 */
+    const originalStat = statSync(configPath)
+    /** 目标根和候选的预检身份。 */
+    const targetGuard = validateDataRoots(sourceRoot, targetRoot)
+    const preflight = preflightPersistentJson(configPath, isWorkspaceConfig, targetGuard, [])
+    if (!preflight) throw new Error('测试夹具缺少配置预检结果')
+    /** 仍只存在内存、尚未写回的配置恢复值。 */
+    const persistent = recoverPersistentJson(preflight, isWorkspaceConfig, targetGuard)
+    persistent.value.attachedFiles = [join(targetRoot, 'a.txt')]
+
+    /** 与原文件等长但内容不同的 JSON 字节。 */
+    const tampered = readFileSync(configPath, 'utf-8').replace('a.txt', 'b.txt')
+    writeFileSync(configPath, tampered, 'utf-8')
+    utimesSync(configPath, originalStat.atime, originalStat.mtime)
+    /** 提交调用前主文件篡改字节。 */
+    const tamperedBytes = readFileSync(configPath)
+    /** 提交调用前 backup 原始字节。 */
+    const originalBackup = readFileSync(backupPath)
+
+    expect(() => writePersistentJson(persistent, targetGuard)).toThrow('内容 SHA-256')
+    expect(readFileSync(configPath).equals(tamperedBytes)).toBe(true)
+    expect(readFileSync(backupPath).equals(originalBackup)).toBe(true)
+  })
+
   test('Given sourceRoot 通过父目录 symlink 与 targetRoot 指向同一物理目录 When 重写 Then 拒绝物理别名', () => {
     /** 指向临时父目录的物理别名。 */
     const aliasParent = join(tempDir, 'alias-parent')
@@ -775,7 +855,7 @@ describe('rebaseDataRootOwnedPaths', () => {
     })
 
     expect(() => rebaseDataRootOwnedPaths({ sourceRoot, targetRoot }))
-      .toThrow('工作区配置路径越过目标数据根')
+      .toThrow('workspace slug 不符合生成合同')
   })
 
   test('Given 数据根相同、相对或嵌套 When 重写 Then 在 I/O 前拒绝', () => {
