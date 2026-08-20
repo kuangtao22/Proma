@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   chmodSync,
   existsSync,
@@ -16,6 +16,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
+import { open } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { DataRootMigrationProgress } from '@proma/shared'
@@ -36,6 +37,12 @@ function getSidecarPath(targetRoot: string): string {
 interface CopyFixture {
   sourceRoot: string
   targetRoot: string
+}
+
+/** 测试中可注入失败的文件句柄元数据方法。 */
+interface FileHandleMetadataPrototype {
+  /** 设置文件访问时间和修改时间。 */
+  utimes(atime: string | number | Date, mtime: string | number | Date): Promise<void>
 }
 
 /** 创建彼此隔离的复制测试目录。 */
@@ -630,6 +637,63 @@ describe('verified-directory-copier', () => {
     expect(statSync(firstTarget).nlink).toBe(1)
     expect(statSync(secondTarget).nlink).toBe(1)
     expect(statSync(firstTarget).ino).not.toBe(statSync(secondTarget).ino)
+  })
+
+  test('Given 文件系统拒绝写入 mtime When 内容与身份验证通过 Then 迁移成功并输出 warning', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    /** 使用固定旧时间确保临时文件默认 mtime 不会偶然匹配。 */
+    const fixedTime = new Date('2020-01-02T03:04:05.000Z')
+    /** 需要验证内容成功迁移的源文件。 */
+    const sourceFile = join(fixture.sourceRoot, 'metadata-warning.txt')
+    writeFileSync(sourceFile, 'stable-content')
+    utimesSync(sourceFile, fixedTime, fixedTime)
+    /** 用于获取未来文件句柄共享原型的探测句柄。 */
+    const probeHandle = await open(sourceFile, 'r')
+    /** Bun spy 注入的文件句柄原型。 */
+    const handlePrototype = Object.getPrototypeOf(probeHandle) as FileHandleMetadataPrototype
+    await probeHandle.close()
+    /** 注入所有 FileHandle.utimes 调用失败。 */
+    const utimesSpy = spyOn(handlePrototype, 'utimes').mockImplementation(async () => {
+      throw new Error('测试元数据写入失败')
+    })
+    /** 捕获 best-effort 元数据告警且避免污染测试输出。 */
+    const warningSpy = spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      /** 元数据失败时仍应返回的复制统计。 */
+      const result = await copyFixture(fixture)
+      expect(result.verifiedFiles).toBe(1)
+      expect(await hashFile(join(fixture.targetRoot, 'metadata-warning.txt'))).toBe(await hashFile(sourceFile))
+      expect(warningSpy.mock.calls.some(([message]) => (
+        typeof message === 'string' && message.includes('文件时间 metadata-warning.txt')
+      ))).toBe(true)
+    } finally {
+      warningSpy.mockRestore()
+      utimesSpy.mockRestore()
+    }
+  })
+
+  test('Given 单链接目标内容相同但 metadata 不一致 When 恢复迁移 Then 不复用旧 inode', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    /** 需要严格验证复用 metadata 的源文件。 */
+    const sourceFile = join(fixture.sourceRoot, 'metadata-mismatch.txt')
+    writeFileSync(sourceFile, 'stable-content')
+    chmodSync(sourceFile, 0o600)
+    await copyFixture(fixture)
+    /** 人为修改 metadata 但保持内容和单链接身份的目标文件。 */
+    const targetFile = join(fixture.targetRoot, 'metadata-mismatch.txt')
+    /** 恢复前目标文件的旧 inode。 */
+    const previousInode = statSync(targetFile).ino
+    chmodSync(targetFile, 0o640)
+
+    /** metadata 不一致后的恢复统计。 */
+    const result = await copyFixture(fixture)
+
+    expect(result.reusedFiles).toBe(0)
+    expect(statSync(targetFile).ino).not.toBe(previousInode)
+    expect(statSync(targetFile).mode & 0o777).toBe(0o600)
   })
 
   test('Given 普通文件完成后由后续链接回调新增硬链接 When 最终验证 Then 拒绝多链接目标 inode', async () => {

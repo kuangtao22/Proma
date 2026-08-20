@@ -111,6 +111,29 @@ export async function isReusableFile(
   expectedHash: string,
   signal: AbortSignal,
 ): Promise<boolean> {
+  return await targetFileMatchesManifest(targetPath, parentIdentity, entry, expectedHash, signal, true)
+}
+
+/** 验证复制后目标的身份、链接数、大小和内容，不强制 best-effort 元数据。 */
+export async function isVerifiedTargetFile(
+  targetPath: string,
+  parentIdentity: FileSystemIdentity,
+  entry: ScannedFileEntry,
+  expectedHash: string,
+  signal: AbortSignal,
+): Promise<boolean> {
+  return await targetFileMatchesManifest(targetPath, parentIdentity, entry, expectedHash, signal, false)
+}
+
+/** 通过稳定句柄验证目标内容，并按复用场景选择是否强制 metadata。 */
+async function targetFileMatchesManifest(
+  targetPath: string,
+  parentIdentity: FileSystemIdentity,
+  entry: ScannedFileEntry,
+  expectedHash: string,
+  signal: AbortSignal,
+  requireMetadata: boolean,
+): Promise<boolean> {
   await assertDirectoryIdentity(parentIdentity)
   /** 已有目标条目的 no-follow lstat。 */
   const pathStats = await lstatOrNull(targetPath)
@@ -118,15 +141,20 @@ export async function isReusableFile(
   /** no-follow 打开的目标稳定句柄。 */
   const handle = await openRegularFileNoFollow(targetPath)
   try {
-    /** 哈希前的实时元数据必须匹配源清单且 inode 仅有一个链接。 */
+    /** 哈希前强制内容身份字段，复用场景再额外强制 metadata。 */
     const beforeStats = await handle.stat({ bigint: true })
-    if (!targetMetadataMatchesManifest(beforeStats, entry)) return false
+    if (!targetContentIdentityMatchesManifest(beforeStats, entry)
+      || (requireMetadata && !targetMetadataMatchesManifest(beforeStats, entry))) return false
     /** 同一稳定句柄上的目标内容哈希。 */
     const actualHash = await hashOpenFile(handle, signal)
     /** 哈希后再次复验，捕获读取期间新增硬链接或元数据变化。 */
     const afterStats = await handle.stat({ bigint: true })
     await assertDirectoryIdentity(parentIdentity)
-    return targetMetadataMatchesManifest(afterStats, entry) && actualHash === expectedHash
+    return afterStats.dev === beforeStats.dev
+      && afterStats.ino === beforeStats.ino
+      && targetContentIdentityMatchesManifest(afterStats, entry)
+      && (!requireMetadata || targetMetadataMatchesManifest(afterStats, entry))
+      && actualHash === expectedHash
   } finally {
     await handle.close()
   }
@@ -471,14 +499,18 @@ async function assertOpenSourceMatchesManifest(handle: FileHandle, entry: Scanne
   }
 }
 
-/** 判断目标句柄元数据是否与源清单一致且没有其他硬链接。 */
-function targetMetadataMatchesManifest(stats: BigIntStats, entry: ScannedFileEntry): boolean {
-  /** Date 精度为毫秒，目标 utimes 也按同一精度写入。 */
-  const expectedMtimeNs = BigInt(entry.mtime.getTime()) * 1_000_000n
+/** 判断目标句柄是否为大小一致且只有一个链接的普通文件。 */
+function targetContentIdentityMatchesManifest(stats: BigIntStats, entry: ScannedFileEntry): boolean {
   return stats.isFile()
     && stats.nlink === 1n
     && stats.size === entry.sizeBigInt
-    && Number(stats.mode) === entry.mode
+}
+
+/** 判断目标句柄的权限和毫秒级修改时间是否与源清单一致。 */
+function targetMetadataMatchesManifest(stats: BigIntStats, entry: ScannedFileEntry): boolean {
+  /** Date 精度为毫秒，目标 utimes 也按同一精度写入。 */
+  const expectedMtimeNs = BigInt(entry.mtime.getTime()) * 1_000_000n
+  return Number(stats.mode) === entry.mode
     && stats.mtimeNs === expectedMtimeNs
 }
 

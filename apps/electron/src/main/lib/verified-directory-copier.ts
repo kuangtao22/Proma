@@ -8,6 +8,7 @@ import {
   hashManifestFile,
   isReusableFile,
   isReusableSymbolicLink,
+  isVerifiedTargetFile,
   lstatOrNull,
   metadataFromStats,
   pathDepth,
@@ -502,7 +503,11 @@ async function copyAndVerifyFile(
   /** 首次和局部重拷后的验证序号。 */
   for (let attempt = 0; attempt < 2; attempt += 1) {
     emitProgress(entry.relativePath, 'verifying', context)
-    if (await isReusableFile(targetPath, parentIdentity, entry, sourceHash, context.signal)) {
+    /** 旧 inode 仍需严格复用校验；新提交 inode 只强制内容与身份。 */
+    const verified = reusableAtStart && attempt === 0
+      ? await isReusableFile(targetPath, parentIdentity, entry, sourceHash, context.signal)
+      : await isVerifiedTargetFile(targetPath, parentIdentity, entry, sourceHash, context.signal)
+    if (verified) {
       if (reusableAtStart && attempt === 0) context.state.reusedFiles += 1
       markFileCommitted(entry, context)
       return
@@ -572,7 +577,7 @@ async function assertTargetMatchesManifest(context: CopyContext): Promise<void> 
       if (!sourceHash) throw new Error(`缺少源文件哈希: ${sourceEntry.relativePath}`)
       /** 当前文件父目录稳定身份。 */
       const parentIdentity = getTargetParentIdentity(sourceEntry.relativePath, context)
-      if (!await isReusableFile(targetEntry.path, parentIdentity, sourceEntry, sourceHash, context.signal)) {
+      if (!await isVerifiedTargetFile(targetEntry.path, parentIdentity, sourceEntry, sourceHash, context.signal)) {
         throw new Error(`最终目标文件校验失败: ${sourceEntry.relativePath}`)
       }
     } else if (sourceEntry.kind === 'symbolic-link') {
