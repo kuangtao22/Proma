@@ -1095,12 +1095,20 @@ export function windowsPathToWslPath(value: string): string {
   return `/mnt/${drive}/${rest}`
 }
 
+/** 判断 CLI 是否为通过 WSL interop 启动的 Windows 可执行文件。 */
+function isWindowsCliExecutable(value: string | undefined): boolean {
+  if (!value || !value.toLowerCase().endsWith('.exe')) return false
+  return windowsPathToWslPath(value) !== value
+}
+
 function buildWslCommand(command: string, env: NodeJS.ProcessEnv | undefined): string {
+  /** Windows exe 内部仍按 Win32 语义解析 PROMA_CONFIG_DIR。 */
+  const usesWindowsCliInterop = isWindowsCliExecutable(env?.PROMA_CLI)
   const exportLines: string[] = []
   for (const key of WSL_EXPORT_ENV_KEYS) {
     const rawValue = env?.[key]
     if (!rawValue) continue
-    const value = key === 'PROMA_CLI' || key === 'PROMA_CONFIG_DIR'
+    const value = key === 'PROMA_CLI' || (key === 'PROMA_CONFIG_DIR' && !usesWindowsCliInterop)
       ? windowsPathToWslPath(rawValue)
       : rawValue
     exportLines.push(`export ${key}=${shellQuote(value)}`)
