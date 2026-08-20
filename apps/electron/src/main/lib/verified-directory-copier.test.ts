@@ -7,6 +7,7 @@ import {
   readlinkSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -148,6 +149,52 @@ describe('verified-directory-copier', () => {
     expect(existsSync(join(fixture.targetRoot, DIRECTORY_COPY_MARKER_FILE))).toBe(true)
   })
 
+  test('Given main marker 是根外符号链接且 tmp 有效 When 恢复复制 Then 整体拒绝且不触碰根外文件', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    mkdirSync(fixture.targetRoot)
+    writeFileSync(join(fixture.sourceRoot, 'resume.txt'), 'resume')
+    /** 位于目标根外、不得被 safe-file 跟随读取或改写的文件。 */
+    const outsideMarker = join(testRoot, 'outside-marker.json')
+    writeFileSync(outsideMarker, 'outside-must-stay')
+    /** 模拟 rename 前崩溃留下的合法临时 marker。 */
+    const validMarker = {
+      version: 1,
+      migrationId: 'migration-current',
+      sourceRoot: resolve(fixture.sourceRoot),
+      targetRoot: resolve(fixture.targetRoot),
+    }
+    /** 恶意主 marker 指向目标根之外。 */
+    const markerPath = join(fixture.targetRoot, DIRECTORY_COPY_MARKER_FILE)
+    symlinkSync(outsideMarker, markerPath)
+    writeFileSync(`${markerPath}.tmp`, JSON.stringify(validMarker))
+
+    await expect(copyFixture(fixture)).rejects.toThrow('普通文件')
+    expect(readFileSync(outsideMarker, 'utf-8')).toBe('outside-must-stay')
+  })
+
+  test('Given 平台支持 FIFO 且 bak marker 是 FIFO When main 有效 Then 仍整体拒绝且不读取 FIFO', async () => {
+    if (process.platform === 'win32') return
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    mkdirSync(fixture.targetRoot)
+    /** 可独立通过 schema 校验的主 marker。 */
+    const validMarker = {
+      version: 1,
+      migrationId: 'migration-current',
+      sourceRoot: resolve(fixture.sourceRoot),
+      targetRoot: resolve(fixture.targetRoot),
+    }
+    /** 主 marker 路径及其恶意 FIFO 备份候选。 */
+    const markerPath = join(fixture.targetRoot, DIRECTORY_COPY_MARKER_FILE)
+    writeFileSync(markerPath, JSON.stringify(validMarker))
+    /** 创建特殊备份候选的系统命令结果。 */
+    const created = Bun.spawnSync(['mkfifo', `${markerPath}.bak`])
+    if (created.exitCode !== 0) return
+
+    await expect(copyFixture(fixture)).rejects.toThrow('普通文件')
+  })
+
   test('Given 平台支持 FIFO When 扫描特殊文件 Then 明确拒绝不完整迁移', async () => {
     if (process.platform === 'win32') return
     /** 当前用例的源目录和目标目录。 */
@@ -218,6 +265,51 @@ describe('verified-directory-copier', () => {
         }
       },
     })).rejects.toThrow('校验失败')
+    expect(corruptionCount).toBe(2)
+  })
+
+  test('Given 首次符号链接校验发现目标链接损坏 When 自动重建 Then 只重试该链接并成功', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    symlinkSync('expected-target', join(fixture.sourceRoot, 'retry-link'))
+    /** 目标链接被验证的次数。 */
+    let verificationCount = 0
+
+    /** 首次链接损坏后完成局部重建的结果。 */
+    const result = await copyFixture(fixture, {
+      onProgress: (progress) => {
+        if (progress.stage !== 'verifying') return
+        verificationCount += 1
+        if (verificationCount !== 1) return
+        /** 当前验证回调中需要替换的目标链接。 */
+        const targetLink = join(fixture.targetRoot, 'retry-link')
+        unlinkSync(targetLink)
+        symlinkSync('wrong-target', targetLink)
+      },
+    })
+
+    expect(result.verifiedFiles).toBe(1)
+    expect(verificationCount).toBe(2)
+    expect(readlinkSync(join(fixture.targetRoot, 'retry-link'))).toBe('expected-target')
+  })
+
+  test('Given 两次符号链接校验都发现目标损坏 When 链接重试耗尽 Then 明确失败', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    symlinkSync('expected-target', join(fixture.sourceRoot, 'always-bad-link'))
+    /** 每次验证阶段主动替换目标链接的计数。 */
+    let corruptionCount = 0
+
+    await expect(copyFixture(fixture, {
+      onProgress: (progress) => {
+        if (progress.stage !== 'verifying') return
+        corruptionCount += 1
+        /** 当前验证回调中需要替换的目标链接。 */
+        const targetLink = join(fixture.targetRoot, 'always-bad-link')
+        unlinkSync(targetLink)
+        symlinkSync(`wrong-target-${corruptionCount}`, targetLink)
+      },
+    })).rejects.toThrow('符号链接校验失败')
     expect(corruptionCount).toBe(2)
   })
 

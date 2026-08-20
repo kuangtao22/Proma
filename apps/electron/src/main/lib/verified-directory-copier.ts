@@ -299,7 +299,18 @@ async function prepareTargetRoot(input: NormalizedCopyDirectoryInput): Promise<v
     `${DIRECTORY_COPY_MARKER_FILE}.tmp`,
     `${DIRECTORY_COPY_MARKER_FILE}.bak`,
   ]
-  if (!targetNames.some((name) => markerCandidateNames.includes(name))) {
+  /** 三个固定候选中是否至少存在一个普通文件。 */
+  let hasMarkerCandidate = false
+  for (const candidateName of markerCandidateNames) {
+    /** 当前已存在 marker 候选的 lstat，禁止 safe-file 跟随链接或读取特殊文件。 */
+    const candidateStats = await lstatOrNull(join(input.targetRoot, candidateName))
+    if (!candidateStats) continue
+    if (!candidateStats.isFile()) {
+      throw new Error(`复制目标 marker 候选必须是普通文件: ${candidateName}`)
+    }
+    hasMarkerCandidate = true
+  }
+  if (!hasMarkerCandidate) {
     throw new Error('复制目标非空且没有可信断点 marker，拒绝覆盖')
   }
 
@@ -470,13 +481,21 @@ async function copyAndVerifySymbolicLink(
   }
   emitProgress(entry.relativePath, 'copying', context)
   await preserveSymbolicLinkMetadata(entry, targetPath)
-  emitProgress(entry.relativePath, 'verifying', context)
-  throwIfAborted(context.input.signal)
-  /** 验证时重新 lstat，确保目标没有被替换成普通文件。 */
-  const targetStats = await lstatOrNull(targetPath)
-  if (!targetStats?.isSymbolicLink() || await readlink(targetPath) !== entry.linkTarget) {
-    throw new Error(`符号链接校验失败: ${entry.relativePath}`)
+
+  /** 首次和重建后的链接验证序号，最多执行两次。 */
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    emitProgress(entry.relativePath, 'verifying', context)
+    throwIfAborted(context.input.signal)
+    /** 验证时重新 lstat，确保目标没有被替换成普通文件。 */
+    const targetStats = await lstatOrNull(targetPath)
+    if (targetStats?.isSymbolicLink() === true && await readlink(targetPath) === entry.linkTarget) return
+    if (attempt === 0) {
+      await removeTargetEntry(targetPath)
+      await symlink(entry.linkTarget, targetPath)
+      await preserveSymbolicLinkMetadata(entry, targetPath)
+    }
   }
+  throw new Error(`符号链接校验失败，重试后仍不一致: ${entry.relativePath}`)
 }
 
 /** 判断已有目标是否为链接文本完全相同的符号链接。 */
