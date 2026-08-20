@@ -1,90 +1,93 @@
-import {
-  chmod,
-  lstat,
-  lutimes,
-  mkdir,
-  opendir,
-  readlink,
-  rm,
-  symlink,
-  utimes,
-} from 'node:fs/promises'
-import { createReadStream, createWriteStream } from 'node:fs'
-import { createHash } from 'node:crypto'
-import { once } from 'node:events'
-import { finished } from 'node:stream/promises'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
-import type { Stats } from 'node:fs'
+import { lstat, mkdir, opendir, readlink, realpath, rmdir, unlink } from 'node:fs/promises'
+import { basename, dirname, join, resolve } from 'node:path'
 import type { DataRootMigrationProgress } from '@proma/shared'
-import { readJsonFileSafe, writeJsonFileAtomic } from './safe-file'
+import {
+  assertDirectoryIdentity,
+  captureDirectoryIdentity,
+  copyFileAtomic,
+  hashManifestFile,
+  hashTargetFile,
+  isReusableFile,
+  isReusableSymbolicLink,
+  lstatOrNull,
+  metadataFromStats,
+  pathDepth,
+  preserveDirectoryMetadata,
+  preserveFileMetadata,
+  preserveSymbolicLinkMetadata,
+  relativeParent,
+  replaceSymbolicLinkAtomic,
+  resolveContainedPath,
+  resolveProspectivePath,
+  throwIfAborted,
+  validateRootRelationship,
+  type FileSystemIdentity,
+  type ScannedDirectoryEntry,
+  type ScannedEntry,
+  type ScannedFileEntry,
+  type ScannedSymbolicLinkEntry,
+} from './verified-directory-copy-filesystem'
+import {
+  getDirectoryCopySidecarPath,
+  prepareDirectoryCopySidecar,
+} from './verified-directory-copy-sidecar'
 
-/** 复制断点在目标目录内使用的保留文件名。 */
-export const DIRECTORY_COPY_MARKER_FILE = '.proma-directory-copy.json'
+export { hashFile } from './verified-directory-copy-filesystem'
+export { finalizeDirectoryCopy, getDirectoryCopySidecarPath } from './verified-directory-copy-sidecar'
+export type { FinalizeDirectoryCopyInput } from './verified-directory-copy-sidecar'
 
-/** 单个流缓冲区固定为 64 KiB，避免内存随文件大小增长。 */
-const STREAM_BUFFER_SIZE = 64 * 1024
-
-/** 断点 marker 的稳定 schema。 */
-interface DirectoryCopyMarker {
-  version: 1
-  migrationId: string
-  sourceRoot: string
-  targetRoot: string
-}
-
-/** 目录树内所有条目共享的扫描信息。 */
-interface ScannedEntryBase {
-  relativePath: string
-  sourcePath: string
-  mode: number
-  atime: Date
-  mtime: Date
-}
-
-/** 扫描得到的普通文件。 */
-interface ScannedFileEntry extends ScannedEntryBase {
-  kind: 'file'
-  size: number
-}
-
-/** 扫描得到的目录。 */
-interface ScannedDirectoryEntry extends ScannedEntryBase {
-  kind: 'directory'
-}
-
-/** 扫描得到的符号链接；链接目标仅保存文本，不解析或跟随。 */
-interface ScannedSymbolicLinkEntry extends ScannedEntryBase {
-  kind: 'symbolic-link'
-  linkTarget: string
-}
-
-/** 完整扫描结果，普通文件字节数用于稳定进度上限。 */
+/** 源目录的稳定清单。 */
 interface DirectoryManifest {
   root: ScannedDirectoryEntry
+  entries: Map<string, ScannedEntry>
   directories: ScannedDirectoryEntry[]
   leaves: Array<ScannedFileEntry | ScannedSymbolicLinkEntry>
   totalBytes: number
 }
 
-/** 并发 worker 共享的执行统计与进度状态。 */
+/** 目标扫描条目，用于精确 reconciliation。 */
+interface TargetEntry {
+  relativePath: string
+  path: string
+  parentRelativePath: string
+  kind: ScannedEntry['kind'] | 'special'
+  depth: number
+}
+
+/** 一次目标扫描同时返回条目与已验证目录身份。 */
+interface TargetTreeSnapshot {
+  entries: TargetEntry[]
+  directoryIdentities: Map<string, FileSystemIdentity>
+}
+
+/** 复制期间共享的单调统计。 */
 interface CopyState {
   completedBytes: number
   verifiedFiles: number
   reusedFiles: number
 }
 
-/** 单个文件或链接复制时使用的稳定上下文。 */
+/** 归一化后的调用参数，同时保留 marker 使用的调用方绝对路径。 */
+interface NormalizedCopyDirectoryInput extends CopyDirectoryInput {
+  sourceRoot: string
+  targetRoot: string
+  requestedSourceRoot: string
+  requestedTargetRoot: string
+  sidecarPath: string
+  concurrency: number
+}
+
+/** 单次复制持有的受控目录身份与取消上下文。 */
 interface CopyContext {
   input: NormalizedCopyDirectoryInput
   manifest: DirectoryManifest
   state: CopyState
-}
-
-/** 解析为绝对路径并补齐默认并发数的输入。 */
-interface NormalizedCopyDirectoryInput extends CopyDirectoryInput {
-  sourceRoot: string
-  targetRoot: string
-  concurrency: number
+  signal: AbortSignal
+  sourceRootIdentity: FileSystemIdentity
+  targetRootIdentity: FileSystemIdentity
+  targetAnchorIdentity: FileSystemIdentity
+  targetDirectories: Map<string, FileSystemIdentity>
+  sourceHashes: Map<string, string>
 }
 
 /** 可恢复目录复制的调用参数。 */
@@ -104,427 +107,514 @@ export interface CopyDirectoryResult {
   totalBytes: number
 }
 
-/**
- * 以固定大小读取缓冲计算普通文件 SHA-256。
- *
- * @param filePath 需要哈希的普通文件路径。
- * @returns 小写十六进制 SHA-256。
- */
-export async function hashFile(filePath: string): Promise<string> {
-  return hashFileWithSignal(filePath)
-}
-
-/**
- * 流式复制目录树并逐文件校验，支持同 migrationId 的断点恢复。
- *
- * @param input 迁移标识、源目标目录、取消信号和进度回调。
- * @returns 已校验、已复用条目数及普通文件总字节数。
- */
+/** 流式复制目录树并逐文件校验，成功后保留树外 sidecar 等待 finalize。 */
 export async function copyDirectoryVerified(input: CopyDirectoryInput): Promise<CopyDirectoryResult> {
-  /** 完成默认值与绝对路径归一化后的复制参数。 */
-  const normalizedInput = normalizeInput(input)
-  validateRootRelationship(normalizedInput.sourceRoot, normalizedInput.targetRoot)
-  throwIfAborted(normalizedInput.signal)
-
-  /** 源目录的一次性清单，保证特殊文件在写目标前被拒绝。 */
-  const manifest = await scanDirectory(normalizedInput.sourceRoot, normalizedInput.signal)
-  await prepareTargetRoot(normalizedInput)
-  await prepareTargetDirectories(manifest, normalizedInput)
-
-  /** 所有低并发 worker 共享的单调进度和结果统计。 */
+  throwIfAborted(input.signal)
+  /** canonicalize 后用于所有数据树操作的输入。 */
+  const normalizedInput = await normalizeInput(input)
+  /** 初始源清单，特殊文件会在目标数据修改前被拒绝。 */
+  const manifest = await scanDirectory(normalizedInput.sourceRoot, input.signal)
+  /** 源根初始身份用于最终稳定性复验。 */
+  const sourceRootIdentity = await captureDirectoryIdentity(normalizedInput.sourceRoot)
+  /** 目标创建、授权和物理别名检查结果。 */
+  const roots = await prepareRoots(normalizedInput, sourceRootIdentity)
+  /** 初次 reconciliation 删除同一迁移拥有的过期残留。 */
+  const targetDirectories = await reconcileTarget(manifest, roots.targetRootIdentity, input.signal)
+  /** 单次执行内部控制器用于一个 worker 失败时中断所有 pipeline。 */
+  const executionController = new AbortController()
+  /** 将调用方取消同步到内部控制器。 */
+  const abortExecution = (): void => executionController.abort()
+  input.signal?.addEventListener('abort', abortExecution, { once: true })
+  if (input.signal?.aborted) executionController.abort()
+  /** 所有 worker 共享的统计。 */
   const state: CopyState = { completedBytes: 0, verifiedFiles: 0, reusedFiles: 0 }
-  /** worker 每次领取下一个条目的共享下标。 */
+  /** 已计算的源普通文件哈希，最终目标复验时复用。 */
+  const sourceHashes = new Map<string, string>()
+  /** worker 每次领取的下一个清单位置。 */
   let nextIndex = 0
-  /** 首个 worker 错误，用于停止领取新任务并在全部 worker 收敛后抛出。 */
+  /** 首个业务错误优先于随后产生的 AbortError。 */
   let firstError: unknown
-  /** 单个 worker 循环领取文件或链接并完成复制校验。 */
+  /** worker 使用的完整稳定上下文。 */
+  const context: CopyContext = {
+    input: normalizedInput,
+    manifest,
+    state,
+    signal: executionController.signal,
+    sourceRootIdentity,
+    targetRootIdentity: roots.targetRootIdentity,
+    targetAnchorIdentity: roots.targetAnchorIdentity,
+    targetDirectories,
+    sourceHashes,
+  }
+  /** 单个 worker 循环领取条目，异常时终止其他 worker。 */
   const runWorker = async (): Promise<void> => {
-    while (firstError === undefined) {
+    while (!executionController.signal.aborted) {
       /** 当前 worker 独占领取的清单下标。 */
       const currentIndex = nextIndex
       nextIndex += 1
-      /** 当前 worker 需要处理的文件或链接。 */
+      /** 当前 worker 处理的普通文件或符号链接。 */
       const entry = manifest.leaves[currentIndex]
       if (!entry) return
       try {
-        await copyAndVerifyEntry(entry, { input: normalizedInput, manifest, state })
+        await copyAndVerifyEntry(entry, context)
       } catch (error) {
         if (firstError === undefined) firstError = error
+        executionController.abort()
       }
     }
   }
-  /** 实际 worker 数不会超过文件数，也不会低于一。 */
-  const workerCount = Math.max(1, Math.min(normalizedInput.concurrency, manifest.leaves.length || 1))
-  await Promise.all(Array.from({ length: workerCount }, runWorker))
-  if (firstError !== undefined) throw firstError
 
-  await preserveAllDirectoryMetadata(manifest, normalizedInput.targetRoot)
-  return {
-    verifiedFiles: state.verifiedFiles,
-    reusedFiles: state.reusedFiles,
-    totalBytes: manifest.totalBytes,
+  try {
+    /** 实际 worker 数不会超过条目数，也不会低于一。 */
+    const workerCount = Math.max(1, Math.min(normalizedInput.concurrency, manifest.leaves.length || 1))
+    await Promise.all(Array.from({ length: workerCount }, runWorker))
+    if (firstError !== undefined) throw firstError
+    throwIfAborted(input.signal)
+    /** 最终源重扫捕获新增、删除、类型、大小、mtime 和身份变化。 */
+    const finalManifest = await scanDirectory(normalizedInput.sourceRoot, input.signal)
+    assertManifestUnchanged(manifest, finalManifest)
+    await assertStableRoots(context)
+    /** 完成前再次 reconciliation 并精确验证目标集合。 */
+    context.targetDirectories = await reconcileTarget(manifest, roots.targetRootIdentity, input.signal)
+    await assertTargetMatchesManifest(context)
+    await preserveAllDirectoryMetadata(manifest, context.targetDirectories)
+    await assertStableRoots(context)
+    return {
+      verifiedFiles: state.verifiedFiles,
+      reusedFiles: state.reusedFiles,
+      totalBytes: manifest.totalBytes,
+    }
+  } finally {
+    executionController.abort()
+    input.signal?.removeEventListener('abort', abortExecution)
   }
 }
 
-/** 校验和标准化外部输入，避免无界并发或空迁移标识。 */
-function normalizeInput(input: CopyDirectoryInput): NormalizedCopyDirectoryInput {
+/** 归一化输入并把数据树操作根切换为 canonical 路径。 */
+async function normalizeInput(input: CopyDirectoryInput): Promise<NormalizedCopyDirectoryInput> {
   /** 调用方指定或默认使用的低并发数。 */
   const concurrency = input.concurrency ?? 2
   if (input.migrationId.trim().length === 0) throw new Error('目录复制 migrationId 不能为空')
   if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error('目录复制 concurrency 必须是正整数')
+  /** marker 中保留的调用方源绝对路径。 */
+  const requestedSourceRoot = resolve(input.sourceRoot)
+  /** marker 中保留的调用方目标绝对路径。 */
+  const requestedTargetRoot = resolve(input.targetRoot)
+  /** 现存源根的真实路径。 */
+  const canonicalSourceRoot = await realpath(requestedSourceRoot)
+  /** 目标最近现存祖先解析后的预计真实路径。 */
+  const prospectiveTarget = await resolveProspectivePath(requestedTargetRoot)
+  validateRootRelationship(canonicalSourceRoot, prospectiveTarget.canonicalPath)
   return {
     ...input,
-    migrationId: input.migrationId,
-    sourceRoot: resolve(input.sourceRoot),
-    targetRoot: resolve(input.targetRoot),
+    sourceRoot: canonicalSourceRoot,
+    targetRoot: prospectiveTarget.canonicalPath,
+    requestedSourceRoot,
+    requestedTargetRoot,
+    sidecarPath: join(
+      dirname(prospectiveTarget.canonicalPath),
+      basename(getDirectoryCopySidecarPath(requestedTargetRoot)),
+    ),
     concurrency,
   }
 }
 
-/** 拒绝相同或互相嵌套的源目标根，防止递归复制和源数据覆盖。 */
-function validateRootRelationship(sourceRoot: string, targetRoot: string): void {
-  if (sourceRoot === targetRoot || isPathInside(sourceRoot, targetRoot) || isPathInside(targetRoot, sourceRoot)) {
-    throw new Error('目录复制的源目录与目标目录不能相同或互相嵌套')
+/** 创建或恢复目标根，并在创建前后重复验证物理路径和身份。 */
+async function prepareRoots(
+  input: NormalizedCopyDirectoryInput,
+  sourceRootIdentity: FileSystemIdentity,
+): Promise<{ targetRootIdentity: FileSystemIdentity; targetAnchorIdentity: FileSystemIdentity }> {
+  /** 创建前目标最近现存祖先及预计真实路径。 */
+  const prospectiveTarget = await resolveProspectivePath(input.requestedTargetRoot)
+  validateRootRelationship(sourceRootIdentity.canonicalPath, prospectiveTarget.canonicalPath)
+  if (prospectiveTarget.exists) {
+    /** 已存在目标根不得是链接或非目录。 */
+    const existingTargetStats = await lstat(input.targetRoot, { bigint: true })
+    if (!existingTargetStats.isDirectory()) throw new Error(`复制目标根不是普通目录: ${input.requestedTargetRoot}`)
+    if (existingTargetStats.dev === sourceRootIdentity.dev && existingTargetStats.ino === sourceRootIdentity.ino) {
+      throw new Error('复制源与目标解析为同一物理路径')
+    }
   }
+  /** 已存在目标根是否为空。 */
+  const targetIsEmpty = prospectiveTarget.exists ? await isDirectoryEmpty(input.targetRoot) : true
+  await prepareDirectoryCopySidecar({
+    migrationId: input.migrationId,
+    requestedSourceRoot: input.requestedSourceRoot,
+    requestedTargetRoot: input.requestedTargetRoot,
+    sidecarPath: input.sidecarPath,
+    targetIsEmpty,
+  })
+  await assertDirectoryIdentity(prospectiveTarget.anchor)
+  if (!prospectiveTarget.exists) await mkdir(input.targetRoot, { recursive: true })
+  await assertDirectoryIdentity(prospectiveTarget.anchor)
+  /** 创建后的目标根稳定身份。 */
+  const targetRootIdentity = await captureDirectoryIdentity(input.targetRoot)
+  validateRootRelationship(sourceRootIdentity.canonicalPath, targetRootIdentity.canonicalPath)
+  if (targetRootIdentity.dev === sourceRootIdentity.dev && targetRootIdentity.ino === sourceRootIdentity.ino) {
+    throw new Error('复制源与目标解析为同一物理路径')
+  }
+  return { targetRootIdentity, targetAnchorIdentity: prospectiveTarget.anchor }
 }
 
-/** 递归扫描源目录，符号链接只读取链接文本，任何特殊文件都明确失败。 */
+/** 递归扫描源目录，符号链接只读取文本，特殊文件明确失败。 */
 async function scanDirectory(sourceRoot: string, signal?: AbortSignal): Promise<DirectoryManifest> {
   throwIfAborted(signal)
-  /** 源根目录自身的 lstat，不允许把根符号链接当目录跟随。 */
-  const rootStats = await lstat(sourceRoot)
+  /** 源根目录自身的 no-follow lstat。 */
+  const rootStats = await lstat(sourceRoot, { bigint: true })
   if (!rootStats.isDirectory()) throw new Error(`复制源根不是普通目录: ${sourceRoot}`)
-  /** 用于最终保留目标根元数据的根条目。 */
-  const root = createDirectoryEntry('', sourceRoot, rootStats)
-  /** 按扫描顺序保存的全部子目录。 */
+  /** 根目录清单条目。 */
+  const root: ScannedDirectoryEntry = {
+    kind: 'directory', relativePath: '', sourcePath: sourceRoot, ...metadataFromStats(rootStats),
+  }
+  /** 按相对路径索引的全部子条目。 */
+  const entries = new Map<string, ScannedEntry>()
+  /** 按扫描顺序保存的目录。 */
   const directories: ScannedDirectoryEntry[] = []
-  /** 等待低并发复制与校验的普通文件和符号链接。 */
+  /** 等待复制的文件和链接。 */
   const leaves: Array<ScannedFileEntry | ScannedSymbolicLinkEntry> = []
-  /** 普通文件内容的总字节数。 */
+  /** 普通文件总字节数。 */
   let totalBytes = 0
-
-  /** 扫描单个目录，不跟随扫描中遇到的符号链接。 */
+  /** 扫描单个目录并在每个条目边界响应取消。 */
   const visit = async (relativeDirectory: string): Promise<void> => {
     throwIfAborted(signal)
-    /** 当前扫描目录的绝对路径。 */
-    const directoryPath = relativeDirectory.length === 0 ? sourceRoot : resolveContainedPath(sourceRoot, relativeDirectory)
-    /** 使用异步目录迭代避免一次读取超大目录的全部名称。 */
+    /** containment 校验后的当前目录绝对路径。 */
+    const directoryPath = relativeDirectory.length === 0
+      ? sourceRoot
+      : resolveContainedPath(sourceRoot, relativeDirectory)
+    /** 异步目录迭代器避免一次载入全部名称。 */
     const handle = await opendir(directoryPath)
     for await (const directoryEntry of handle) {
       throwIfAborted(signal)
-      /** 当前条目相对源根的跨平台路径。 */
+      /** 当前条目相对源根的路径。 */
       const relativePath = relativeDirectory.length === 0
         ? directoryEntry.name
         : join(relativeDirectory, directoryEntry.name)
-      if (relativePath === DIRECTORY_COPY_MARKER_FILE) {
-        throw new Error(`源目录包含复制器保留文件名: ${DIRECTORY_COPY_MARKER_FILE}`)
-      }
-      /** 当前条目经过 containment 校验后的绝对路径。 */
+      /** containment 校验后的源绝对路径。 */
       const sourcePath = resolveContainedPath(sourceRoot, relativePath)
-      /** lstat 保证符号链接不会被透明跟随。 */
-      const stats = await lstat(sourcePath)
+      /** no-follow lstat 保证链接不会被透明跟随。 */
+      const stats = await lstat(sourcePath, { bigint: true })
       if (stats.isDirectory()) {
-        /** 当前扫描到的目录条目。 */
-        const childDirectory = createDirectoryEntry(relativePath, sourcePath, stats)
-        directories.push(childDirectory)
+        /** 当前目录清单条目。 */
+        const entry: ScannedDirectoryEntry = {
+          kind: 'directory', relativePath, sourcePath, ...metadataFromStats(stats),
+        }
+        entries.set(relativePath, entry)
+        directories.push(entry)
         await visit(relativePath)
       } else if (stats.isFile()) {
-        leaves.push({
-          kind: 'file',
-          relativePath,
-          sourcePath,
-          size: stats.size,
+        if (stats.size > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`普通文件过大，无法安全计数: ${relativePath}`)
+        /** 当前普通文件清单条目。 */
+        const entry: ScannedFileEntry = {
+          kind: 'file', relativePath, sourcePath, size: Number(stats.size), sizeBigInt: stats.size,
           ...metadataFromStats(stats),
-        })
-        totalBytes += stats.size
+        }
+        entries.set(relativePath, entry)
+        leaves.push(entry)
+        totalBytes += entry.size
+        if (!Number.isSafeInteger(totalBytes)) throw new Error('目录总字节数超过安全整数范围')
       } else if (stats.isSymbolicLink()) {
-        /** 链接目标保持原始文本，绝不 realpath 或 stat。 */
+        /** 链接目标保持原始文本，绝不 stat 或读取目标内容。 */
         const linkTarget = await readlink(sourcePath)
-        leaves.push({
-          kind: 'symbolic-link',
-          relativePath,
-          sourcePath,
-          linkTarget,
-          ...metadataFromStats(stats),
-        })
+        /** 当前符号链接清单条目。 */
+        const entry: ScannedSymbolicLinkEntry = {
+          kind: 'symbolic-link', relativePath, sourcePath, linkTarget, ...metadataFromStats(stats),
+        }
+        entries.set(relativePath, entry)
+        leaves.push(entry)
       } else {
         throw new Error(`源目录包含不支持的特殊文件: ${relativePath}`)
       }
     }
   }
-
   await visit('')
-  return { root, directories, leaves, totalBytes }
+  return { root, entries, directories, leaves, totalBytes }
 }
 
-/** 从 lstat 结果提取尽力保留的通用元数据。 */
-function metadataFromStats(stats: Stats): Pick<ScannedEntryBase, 'mode' | 'atime' | 'mtime'> {
-  return { mode: stats.mode, atime: stats.atime, mtime: stats.mtime }
-}
-
-/** 创建一个目录扫描条目。 */
-function createDirectoryEntry(relativePath: string, sourcePath: string, stats: Stats): ScannedDirectoryEntry {
-  return { kind: 'directory', relativePath, sourcePath, ...metadataFromStats(stats) }
-}
-
-/** 校验目标为空或归属于同一个 migrationId，并使用 safe-file 原子创建新 marker。 */
-async function prepareTargetRoot(input: NormalizedCopyDirectoryInput): Promise<void> {
-  throwIfAborted(input.signal)
-  /** 目标根存在时的 lstat；符号链接根不得被跟随。 */
-  const targetStats = await lstatOrNull(input.targetRoot)
-  if (targetStats && !targetStats.isDirectory()) throw new Error(`复制目标根不是普通目录: ${input.targetRoot}`)
-  if (!targetStats) await mkdir(input.targetRoot, { recursive: true })
-
-  /** 目标根当前直接包含的名称。 */
-  const targetNames: string[] = []
-  /** 异步遍历目标根，避免为超大断点目录额外分配 Dirent 数组。 */
-  const targetHandle = await opendir(input.targetRoot)
-  for await (const entry of targetHandle) targetNames.push(entry.name)
-  /** 目标断点 marker 的固定路径。 */
-  const markerPath = join(input.targetRoot, DIRECTORY_COPY_MARKER_FILE)
-  if (targetNames.length === 0) {
-    /** 首次复制使用的严格 marker。 */
-    const marker: DirectoryCopyMarker = {
-      version: 1,
-      migrationId: input.migrationId,
-      sourceRoot: input.sourceRoot,
-      targetRoot: input.targetRoot,
+/** 比较初始与最终源清单，任何集合或元数据变化都失败。 */
+function assertManifestUnchanged(initial: DirectoryManifest, current: DirectoryManifest): void {
+  if (!sameScannedEntry(initial.root, current.root) || initial.entries.size !== current.entries.size) {
+    throw new Error('源目录在复制期间发生变化，保留断点等待恢复')
+  }
+  for (const [relativePath, initialEntry] of initial.entries) {
+    /** 最终重扫中相同相对路径的条目。 */
+    const currentEntry = current.entries.get(relativePath)
+    if (!currentEntry || !sameScannedEntry(initialEntry, currentEntry)) {
+      throw new Error(`源目录在复制期间发生变化: ${relativePath}`)
     }
-    writeJsonFileAtomic(markerPath, marker)
-    return
-  }
-  /** safe-file 可能在崩溃边界留下的三个可信 marker 候选名称。 */
-  const markerCandidateNames = [
-    DIRECTORY_COPY_MARKER_FILE,
-    `${DIRECTORY_COPY_MARKER_FILE}.tmp`,
-    `${DIRECTORY_COPY_MARKER_FILE}.bak`,
-  ]
-  /** 三个固定候选中是否至少存在一个普通文件。 */
-  let hasMarkerCandidate = false
-  for (const candidateName of markerCandidateNames) {
-    /** 当前已存在 marker 候选的 lstat，禁止 safe-file 跟随链接或读取特殊文件。 */
-    const candidateStats = await lstatOrNull(join(input.targetRoot, candidateName))
-    if (!candidateStats) continue
-    if (!candidateStats.isFile()) {
-      throw new Error(`复制目标 marker 候选必须是普通文件: ${candidateName}`)
-    }
-    hasMarkerCandidate = true
-  }
-  if (!hasMarkerCandidate) {
-    throw new Error('复制目标非空且没有可信断点 marker，拒绝覆盖')
-  }
-
-  /** 经 safe-file 语法恢复和严格 schema 校验后的 marker。 */
-  const marker = readJsonFileSafe<DirectoryCopyMarker>(markerPath, { validate: isDirectoryCopyMarker })
-  if (!marker) throw new Error('复制目标 marker 无效，拒绝恢复')
-  if (marker.migrationId !== input.migrationId) throw new Error('复制目标的迁移标识与当前任务不一致')
-  if (marker.sourceRoot !== input.sourceRoot || marker.targetRoot !== input.targetRoot) {
-    throw new Error('复制目标 marker 的源目标路径与当前任务不一致')
   }
 }
 
-/** 严格校验 marker 字段集合和值类型，拒绝宽松兼容未知 schema。 */
-function isDirectoryCopyMarker(value: unknown): value is DirectoryCopyMarker {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
-  /** 转成只读未知字段映射后逐项校验。 */
-  const record = value as Record<string, unknown>
-  /** marker 允许的完整字段集合。 */
-  const expectedKeys = ['migrationId', 'sourceRoot', 'targetRoot', 'version']
-  /** 实际字段按字典序排列后用于严格比较。 */
-  const actualKeys = Object.keys(record).sort()
-  return actualKeys.length === expectedKeys.length
-    && actualKeys.every((key, index) => key === expectedKeys[index])
-    && record.version === 1
-    && typeof record.migrationId === 'string'
-    && typeof record.sourceRoot === 'string'
-    && typeof record.targetRoot === 'string'
+/** 比较两个清单条目的类型、身份、mtime 和类型专属字段。 */
+function sameScannedEntry(left: ScannedEntry, right: ScannedEntry): boolean {
+  if (left.kind !== right.kind || left.dev !== right.dev || left.ino !== right.ino || left.mtimeNs !== right.mtimeNs) return false
+  if (left.kind === 'file' && right.kind === 'file') return left.sizeBigInt === right.sizeBigInt
+  if (left.kind === 'symbolic-link' && right.kind === 'symbolic-link') return left.linkTarget === right.linkTarget
+  return left.kind === 'directory' && right.kind === 'directory'
 }
 
-/** 按源目录层级创建目标目录，并拒绝任何已有符号链接目录。 */
-async function prepareTargetDirectories(
+/** 精确清理迁移拥有的目标，并返回所有期望目录的稳定身份。 */
+async function reconcileTarget(
   manifest: DirectoryManifest,
-  input: NormalizedCopyDirectoryInput,
-): Promise<void> {
-  for (const entry of manifest.directories) {
-    throwIfAborted(input.signal)
-    await ensureContainedDirectory(input.targetRoot, entry.relativePath)
+  targetRootIdentity: FileSystemIdentity,
+  signal?: AbortSignal,
+): Promise<Map<string, FileSystemIdentity>> {
+  throwIfAborted(signal)
+  await assertDirectoryIdentity(targetRootIdentity)
+  /** 目标当前所有条目的 no-follow 扫描结果。 */
+  const snapshot = await scanTargetTree(targetRootIdentity, signal)
+  /** 从深到浅删除源清单中不存在或类型不一致的残留。 */
+  const removalOrder = [...snapshot.entries].sort((left, right) => right.depth - left.depth)
+  /** 扫描时同步捕获的现存目录身份。 */
+  const directoryIdentities = snapshot.directoryIdentities
+  for (const actualEntry of removalOrder) {
+    throwIfAborted(signal)
+    /** 源清单对当前路径的期望条目。 */
+    const expectedEntry = manifest.entries.get(actualEntry.relativePath)
+    if (expectedEntry && expectedEntry.kind === actualEntry.kind) continue
+    /** 删除前复验父目录身份。 */
+    const parentIdentity = directoryIdentities.get(actualEntry.parentRelativePath)
+    if (!parentIdentity) throw new Error(`目标目录身份缺失: ${actualEntry.parentRelativePath}`)
+    await assertDirectoryIdentity(parentIdentity)
+    if (actualEntry.kind === 'directory') await rmdir(actualEntry.path)
+    else await unlink(actualEntry.path)
+    await assertDirectoryIdentity(parentIdentity)
+    directoryIdentities.delete(actualEntry.relativePath)
   }
+  /** 由浅到深创建缺失目录并持有身份。 */
+  const orderedDirectories = [...manifest.directories].sort(
+    (left, right) => pathDepth(left.relativePath) - pathDepth(right.relativePath),
+  )
+  for (const entry of orderedDirectories) {
+    throwIfAborted(signal)
+    /** 当前目录父级的稳定身份。 */
+    const parentIdentity = directoryIdentities.get(relativeParent(entry.relativePath))
+    if (!parentIdentity) throw new Error(`目标目录身份缺失: ${relativeParent(entry.relativePath)}`)
+    await assertDirectoryIdentity(parentIdentity)
+    /** containment 校验后的目标目录路径。 */
+    const targetPath = resolveContainedPath(targetRootIdentity.path, entry.relativePath)
+    /** 当前目录已有条目的 no-follow lstat。 */
+    const stats = await lstatOrNull(targetPath)
+    if (!stats) await mkdir(targetPath)
+    else if (!stats.isDirectory()) throw new Error(`目标目录类型 reconciliation 失败: ${entry.relativePath}`)
+    await assertDirectoryIdentity(parentIdentity)
+    directoryIdentities.set(entry.relativePath, await captureDirectoryIdentity(targetPath))
+  }
+  await assertDirectoryIdentity(targetRootIdentity)
+  return directoryIdentities
 }
 
-/** 逐层创建目录，确保中间层不会通过符号链接逃逸到目标根外。 */
-async function ensureContainedDirectory(targetRoot: string, relativePath: string): Promise<void> {
-  /** containment 校验后的最终目录路径。 */
-  const finalPath = resolveContainedPath(targetRoot, relativePath)
-  /** 从目标根到最终目录的路径片段。 */
-  const segments = relative(targetRoot, finalPath).split(sep).filter((segment) => segment.length > 0)
-  /** 当前逐层校验或创建的路径。 */
-  let currentPath = targetRoot
-  for (const segment of segments) {
-    currentPath = join(currentPath, segment)
-    /** 当前层已有文件系统条目的 lstat。 */
-    const stats = await lstatOrNull(currentPath)
-    if (!stats) {
-      await mkdir(currentPath)
-    } else if (!stats.isDirectory()) {
-      throw new Error(`目标目录层级包含非目录条目: ${relativePath}`)
+/** no-follow 扫描目标树；特殊文件只作为待清理条目。 */
+async function scanTargetTree(
+  targetRootIdentity: FileSystemIdentity,
+  signal?: AbortSignal,
+): Promise<TargetTreeSnapshot> {
+  /** 扫描得到的目标条目。 */
+  const entries: TargetEntry[] = []
+  /** 根目录和扫描到的全部子目录身份。 */
+  const directoryIdentities = new Map<string, FileSystemIdentity>([['', targetRootIdentity]])
+  /** 递归扫描单个已验证目录。 */
+  const visit = async (directoryIdentity: FileSystemIdentity, relativeDirectory: string): Promise<void> => {
+    throwIfAborted(signal)
+    await assertDirectoryIdentity(directoryIdentity)
+    /** 当前目标目录迭代器。 */
+    const handle = await opendir(directoryIdentity.path)
+    for await (const directoryEntry of handle) {
+      throwIfAborted(signal)
+      /** 当前目标条目的相对路径。 */
+      const relativePath = relativeDirectory.length === 0
+        ? directoryEntry.name
+        : join(relativeDirectory, directoryEntry.name)
+      /** containment 校验后的当前目标路径。 */
+      const targetPath = resolveContainedPath(targetRootIdentity.path, relativePath)
+      /** no-follow lstat 防止目标链接逃逸。 */
+      const stats = await lstat(targetPath, { bigint: true })
+      /** 当前条目的种类。 */
+      const kind: TargetEntry['kind'] = stats.isDirectory()
+        ? 'directory'
+        : stats.isFile()
+          ? 'file'
+          : stats.isSymbolicLink()
+            ? 'symbolic-link'
+            : 'special'
+      entries.push({
+        relativePath,
+        path: targetPath,
+        parentRelativePath: relativeDirectory,
+        kind,
+        depth: pathDepth(relativePath),
+      })
+      if (kind === 'directory') {
+        /** 当前子目录的稳定身份。 */
+        const childIdentity = await captureDirectoryIdentity(targetPath)
+        directoryIdentities.set(relativePath, childIdentity)
+        await visit(childIdentity, relativePath)
+      }
     }
+    await assertDirectoryIdentity(directoryIdentity)
   }
+  await visit(targetRootIdentity, '')
+  return { entries, directoryIdentities }
 }
 
-/** 复制并校验单个普通文件或符号链接。 */
+/** 复制并校验单个文件或链接。 */
 async function copyAndVerifyEntry(
   entry: ScannedFileEntry | ScannedSymbolicLinkEntry,
   context: CopyContext,
 ): Promise<void> {
-  throwIfAborted(context.input.signal)
-  /** containment 校验后的目标条目路径。 */
+  throwIfAborted(context.signal)
+  /** 当前叶子的父目录身份。 */
+  const parentIdentity = getTargetParentIdentity(entry.relativePath, context)
+  /** containment 校验后的最终目标路径。 */
   const targetPath = resolveContainedPath(context.input.targetRoot, entry.relativePath)
-  if (entry.kind === 'file') {
-    await copyAndVerifyFile(entry, targetPath, context)
-  } else {
-    await copyAndVerifySymbolicLink(entry, targetPath, context)
-  }
+  if (entry.kind === 'file') await copyAndVerifyFile(entry, targetPath, parentIdentity, context)
+  else await copyAndVerifySymbolicLink(entry, targetPath, parentIdentity, context)
   context.state.verifiedFiles += 1
 }
 
-/** 按 SHA-256 复用或复制普通文件，并在不一致时只重拷一次。 */
+/** 按 SHA-256 复用或原子复制普通文件，并只局部重试一次。 */
 async function copyAndVerifyFile(
   entry: ScannedFileEntry,
   targetPath: string,
+  parentIdentity: FileSystemIdentity,
   context: CopyContext,
 ): Promise<void> {
-  /** 复制开始前计算的源内容基准哈希。 */
-  const sourceHash = await hashFileWithSignal(entry.sourcePath, context.input.signal)
-  /** 目标是否已经是可复用的同内容普通文件。 */
-  const reusable = await isReusableFile(targetPath, entry.size, sourceHash, context.input.signal)
+  /** 对源句柄执行身份校验后得到的基准 SHA-256。 */
+  const sourceHash = await hashManifestFile(entry, context.signal)
+  context.sourceHashes.set(entry.relativePath, sourceHash)
+  /** 已有目标是否可以直接复用。 */
+  const reusable = await isReusableFile(targetPath, parentIdentity, entry.sizeBigInt, sourceHash, context.signal)
   if (reusable) {
     context.state.reusedFiles += 1
-    advanceProgress(entry, entry.size, 'copying', context)
+    advanceProgress(entry, entry.size, context)
   } else {
-    await removeTargetEntry(targetPath)
-    await streamCopyFile(entry, targetPath, context, true)
+    await copyFile(entry, targetPath, parentIdentity, context, true)
   }
-  await preserveFileMetadata(entry, targetPath)
-
-  /** 首次和重拷后的验证序号，最多执行两次。 */
+  await preserveFileMetadata(entry, targetPath, parentIdentity)
+  /** 首次和局部重拷后的验证序号。 */
   for (let attempt = 0; attempt < 2; attempt += 1) {
     emitProgress(entry.relativePath, 'verifying', context)
-    throwIfAborted(context.input.signal)
-    /** 当前目标内容的 SHA-256。 */
-    const targetHash = await hashFileWithSignal(targetPath, context.input.signal)
-    if (targetHash === sourceHash) return
+    if (await hashTargetFile(targetPath, parentIdentity, context.signal) === sourceHash) return
     if (attempt === 0) {
-      await removeTargetEntry(targetPath)
-      await streamCopyFile(entry, targetPath, context, false)
-      await preserveFileMetadata(entry, targetPath)
+      await copyFile(entry, targetPath, parentIdentity, context, false)
+      await preserveFileMetadata(entry, targetPath, parentIdentity)
     }
   }
   throw new Error(`文件校验失败，重试后仍不一致: ${entry.relativePath}`)
 }
 
-/** 判断已有目标是否为大小与 SHA-256 都一致的普通文件。 */
-async function isReusableFile(
-  targetPath: string,
-  expectedSize: number,
-  expectedHash: string,
-  signal?: AbortSignal,
-): Promise<boolean> {
-  /** 已有目标条目的 lstat。 */
-  const targetStats = await lstatOrNull(targetPath)
-  if (!targetStats?.isFile() || targetStats.size !== expectedSize) return false
-  return await hashFileWithSignal(targetPath, signal) === expectedHash
-}
-
-/** 流式复制普通文件；重试时不重复增加已完成字节。 */
-async function streamCopyFile(
+/** 调用受控文件系统 primitive，并把数据块映射为迁移进度。 */
+async function copyFile(
   entry: ScannedFileEntry,
   targetPath: string,
+  parentIdentity: FileSystemIdentity,
   context: CopyContext,
   trackProgress: boolean,
 ): Promise<void> {
-  throwIfAborted(context.input.signal)
-  /** 固定缓冲区的源读取流。 */
-  const readable = createReadStream(entry.sourcePath, { highWaterMark: STREAM_BUFFER_SIZE })
-  /** 直接覆盖当前迁移拥有的目标文件的写入流。 */
-  const writable = createWriteStream(targetPath, { flags: 'w', mode: entry.mode })
-  try {
-    for await (const chunk of readable) {
-      throwIfAborted(context.input.signal)
-      /** 当前 Buffer 数据块写入内核缓冲区的结果。 */
-      const accepted = writable.write(chunk)
-      if (trackProgress) advanceProgress(entry, chunk.byteLength, 'copying', context)
-      throwIfAborted(context.input.signal)
-      if (!accepted) await once(writable, 'drain')
-    }
-    writable.end()
-    await finished(writable)
-    if (entry.size === 0 && trackProgress) emitProgress(entry.relativePath, 'copying', context)
-  } finally {
-    readable.destroy()
-    writable.destroy()
-  }
+  await copyFileAtomic({
+    entry,
+    targetPath,
+    parentIdentity,
+    signal: context.signal,
+    trackProgress,
+    onChunk: (chunkBytes) => advanceProgress(entry, chunkBytes, context),
+    onEmptyFile: () => emitProgress(entry.relativePath, 'copying', context),
+  })
 }
 
-/** 按链接文本复用或复制符号链接，并验证目标仍是同一链接。 */
+/** 按链接文本复用或原子重建符号链接，并只局部重试一次。 */
 async function copyAndVerifySymbolicLink(
   entry: ScannedSymbolicLinkEntry,
   targetPath: string,
+  parentIdentity: FileSystemIdentity,
   context: CopyContext,
 ): Promise<void> {
-  /** 目标是否已经是相同文本的符号链接。 */
-  const reusable = await isReusableSymbolicLink(targetPath, entry.linkTarget)
-  if (reusable) {
-    context.state.reusedFiles += 1
-  } else {
-    await removeTargetEntry(targetPath)
-    await symlink(entry.linkTarget, targetPath)
-  }
+  /** 已有目标是否为相同文本链接。 */
+  const reusable = await isReusableSymbolicLink(targetPath, parentIdentity, entry.linkTarget)
+  if (reusable) context.state.reusedFiles += 1
+  else await replaceSymbolicLinkAtomic(entry, targetPath, parentIdentity)
   emitProgress(entry.relativePath, 'copying', context)
-  await preserveSymbolicLinkMetadata(entry, targetPath)
-
-  /** 首次和重建后的链接验证序号，最多执行两次。 */
+  await preserveSymbolicLinkMetadata(entry, targetPath, parentIdentity)
+  /** 首次和局部重建后的验证序号。 */
   for (let attempt = 0; attempt < 2; attempt += 1) {
     emitProgress(entry.relativePath, 'verifying', context)
-    throwIfAborted(context.input.signal)
-    /** 验证时重新 lstat，确保目标没有被替换成普通文件。 */
-    const targetStats = await lstatOrNull(targetPath)
-    if (targetStats?.isSymbolicLink() === true && await readlink(targetPath) === entry.linkTarget) return
+    if (await isReusableSymbolicLink(targetPath, parentIdentity, entry.linkTarget)) return
     if (attempt === 0) {
-      await removeTargetEntry(targetPath)
-      await symlink(entry.linkTarget, targetPath)
-      await preserveSymbolicLinkMetadata(entry, targetPath)
+      await replaceSymbolicLinkAtomic(entry, targetPath, parentIdentity)
+      await preserveSymbolicLinkMetadata(entry, targetPath, parentIdentity)
     }
   }
   throw new Error(`符号链接校验失败，重试后仍不一致: ${entry.relativePath}`)
 }
 
-/** 判断已有目标是否为链接文本完全相同的符号链接。 */
-async function isReusableSymbolicLink(targetPath: string, expectedTarget: string): Promise<boolean> {
-  /** 已有目标条目的 lstat。 */
-  const targetStats = await lstatOrNull(targetPath)
-  return targetStats?.isSymbolicLink() === true && await readlink(targetPath) === expectedTarget
+/** 最终精确验证目标集合、文件哈希和链接文本。 */
+async function assertTargetMatchesManifest(context: CopyContext): Promise<void> {
+  /** 最终目标树的 no-follow 扫描结果。 */
+  const snapshot = await scanTargetTree(context.targetRootIdentity, context.signal)
+  if (snapshot.entries.length !== context.manifest.entries.size) throw new Error('目标目录条目集合与源清单不一致')
+  for (const targetEntry of snapshot.entries) {
+    /** 源清单对应条目。 */
+    const sourceEntry = context.manifest.entries.get(targetEntry.relativePath)
+    if (!sourceEntry || sourceEntry.kind !== targetEntry.kind) {
+      throw new Error(`目标目录条目集合与源清单不一致: ${targetEntry.relativePath}`)
+    }
+    if (sourceEntry.kind === 'file') {
+      /** 复制阶段保存的源哈希。 */
+      const sourceHash = context.sourceHashes.get(sourceEntry.relativePath)
+      if (!sourceHash) throw new Error(`缺少源文件哈希: ${sourceEntry.relativePath}`)
+      /** 当前文件父目录稳定身份。 */
+      const parentIdentity = getTargetParentIdentity(sourceEntry.relativePath, context)
+      if (await hashTargetFile(targetEntry.path, parentIdentity, context.signal) !== sourceHash) {
+        throw new Error(`最终目标文件校验失败: ${sourceEntry.relativePath}`)
+      }
+    } else if (sourceEntry.kind === 'symbolic-link') {
+      /** 当前链接父目录稳定身份。 */
+      const parentIdentity = getTargetParentIdentity(sourceEntry.relativePath, context)
+      if (!await isReusableSymbolicLink(targetEntry.path, parentIdentity, sourceEntry.linkTarget)) {
+        throw new Error(`最终目标符号链接校验失败: ${sourceEntry.relativePath}`)
+      }
+    }
+  }
 }
 
-/** 删除当前迁移目标中的单个冲突条目，调用前路径已通过 containment 校验。 */
-async function removeTargetEntry(targetPath: string): Promise<void> {
-  if (await lstatOrNull(targetPath)) await rm(targetPath, { recursive: true, force: true })
+/** 内容与校验完成后由深到浅保留目录元数据。 */
+async function preserveAllDirectoryMetadata(
+  manifest: DirectoryManifest,
+  directoryIdentities: Map<string, FileSystemIdentity>,
+): Promise<void> {
+  /** 深层目录优先，避免后续子目录操作改变父目录时间。 */
+  const directories = [...manifest.directories].sort(
+    (left, right) => pathDepth(right.relativePath) - pathDepth(left.relativePath),
+  )
+  for (const entry of directories) {
+    /** reconciliation 捕获的目标目录身份。 */
+    const identity = directoryIdentities.get(entry.relativePath)
+    if (!identity) throw new Error(`目标目录身份缺失: ${entry.relativePath}`)
+    await preserveDirectoryMetadata(entry, identity)
+  }
+  /** 目标根的稳定身份。 */
+  const rootIdentity = directoryIdentities.get('')
+  if (!rootIdentity) throw new Error('目标根目录身份缺失')
+  await preserveDirectoryMetadata(manifest.root, rootIdentity)
 }
 
-/** 更新普通文件已完成字节，并同步发出不超过总量的单调进度。 */
-function advanceProgress(
-  entry: ScannedFileEntry,
-  completedChunkBytes: number,
-  stage: 'copying' | 'verifying',
-  context: CopyContext,
-): void {
+/** 获取条目父目录在 reconciliation 后持有的稳定身份。 */
+function getTargetParentIdentity(relativePath: string, context: CopyContext): FileSystemIdentity {
+  /** reconciliation 捕获的父目录身份。 */
+  const identity = context.targetDirectories.get(relativeParent(relativePath))
+  if (!identity) throw new Error(`目标目录身份缺失: ${relativeParent(relativePath)}`)
+  return identity
+}
+
+/** 更新普通文件已完成字节并发出单调进度。 */
+function advanceProgress(entry: ScannedFileEntry, completedChunkBytes: number, context: CopyContext): void {
   context.state.completedBytes = Math.min(
     context.manifest.totalBytes,
     context.state.completedBytes + completedChunkBytes,
   )
-  emitProgress(entry.relativePath, stage, context)
+  emitProgress(entry.relativePath, 'copying', context)
 }
 
-/** 发出单个文件或链接当前阶段的稳定进度快照。 */
+/** 发出单个条目当前阶段的稳定进度快照。 */
 function emitProgress(
   currentRelativePath: string,
   stage: 'copying' | 'verifying',
@@ -539,106 +629,20 @@ function emitProgress(
   })
 }
 
-/** 使用固定缓冲流计算 SHA-256，并在每个数据块前后响应取消。 */
-async function hashFileWithSignal(filePath: string, signal?: AbortSignal): Promise<string> {
-  throwIfAborted(signal)
-  /** 当前文件的增量 SHA-256 计算器。 */
-  const hash = createHash('sha256')
-  /** 固定 64 KiB 缓冲的文件读取流。 */
-  const readable = createReadStream(filePath, { highWaterMark: STREAM_BUFFER_SIZE })
+/** 复验源根、目标现存祖先与目标根身份。 */
+async function assertStableRoots(context: CopyContext): Promise<void> {
+  await assertDirectoryIdentity(context.sourceRootIdentity)
+  await assertDirectoryIdentity(context.targetAnchorIdentity)
+  await assertDirectoryIdentity(context.targetRootIdentity)
+}
+
+/** 判断目录是否没有任何直接条目。 */
+async function isDirectoryEmpty(directoryPath: string): Promise<boolean> {
+  /** 只需读取第一个名称即可判断是否为空。 */
+  const handle = await opendir(directoryPath)
   try {
-    for await (const chunk of readable) {
-      throwIfAborted(signal)
-      hash.update(chunk)
-      throwIfAborted(signal)
-    }
-    return hash.digest('hex')
+    return await handle.read() === null
   } finally {
-    readable.destroy()
+    await handle.close()
   }
-}
-
-/** 尽力保留普通文件权限与时间，失败只告警且不影响内容校验。 */
-async function preserveFileMetadata(entry: ScannedFileEntry, targetPath: string): Promise<void> {
-  await bestEffortMetadata(`文件权限 ${entry.relativePath}`, () => chmod(targetPath, entry.mode))
-  await bestEffortMetadata(`文件时间 ${entry.relativePath}`, () => utimes(targetPath, entry.atime, entry.mtime))
-}
-
-/** 尽力保留符号链接时间；不使用 chmod，避免平台跟随链接修改外部目标。 */
-async function preserveSymbolicLinkMetadata(
-  entry: ScannedSymbolicLinkEntry,
-  targetPath: string,
-): Promise<void> {
-  await bestEffortMetadata(`符号链接时间 ${entry.relativePath}`, () => lutimes(targetPath, entry.atime, entry.mtime))
-}
-
-/** 内容完成后由深到浅保留目录权限和时间，最后处理目标根。 */
-async function preserveAllDirectoryMetadata(manifest: DirectoryManifest, targetRoot: string): Promise<void> {
-  /** 深层目录优先，避免后续子目录元数据操作再次改变父目录时间。 */
-  const directories = [...manifest.directories].sort(
-    (left, right) => right.relativePath.split(sep).length - left.relativePath.split(sep).length,
-  )
-  for (const entry of directories) {
-    /** containment 校验后的目标目录路径。 */
-    const targetPath = resolveContainedPath(targetRoot, entry.relativePath)
-    await preserveDirectoryMetadata(entry, targetPath)
-  }
-  await preserveDirectoryMetadata(manifest.root, targetRoot)
-}
-
-/** 尽力保留单个目录的权限与时间。 */
-async function preserveDirectoryMetadata(entry: ScannedDirectoryEntry, targetPath: string): Promise<void> {
-  await bestEffortMetadata(`目录权限 ${entry.relativePath || '.'}`, () => chmod(targetPath, entry.mode))
-  await bestEffortMetadata(`目录时间 ${entry.relativePath || '.'}`, () => utimes(targetPath, entry.atime, entry.mtime))
-}
-
-/** 执行平台相关元数据操作，失败只输出 warning。 */
-async function bestEffortMetadata(label: string, operation: () => Promise<void>): Promise<void> {
-  try {
-    await operation()
-  } catch (error) {
-    console.warn(`[目录复制] 无法保留${label}:`, error)
-  }
-}
-
-/** lstat 不存在路径时返回 null，其他错误保持原样抛出。 */
-async function lstatOrNull(filePath: string): Promise<Stats | null> {
-  try {
-    return await lstat(filePath)
-  } catch (error) {
-    if (isNodeError(error) && error.code === 'ENOENT') return null
-    throw error
-  }
-}
-
-/** 判断未知错误是否携带 Node.js 文件系统错误码。 */
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && 'code' in error
-}
-
-/** 将相对条目解析到根内，并拒绝根本身与任何路径逃逸。 */
-function resolveContainedPath(root: string, relativePath: string): string {
-  /** 解析后的绝对候选路径。 */
-  const candidate = resolve(root, relativePath)
-  if (!isPathInside(root, candidate)) throw new Error(`目录条目路径逃逸目标根: ${relativePath}`)
-  return candidate
-}
-
-/** 使用 path.relative 判断 candidate 是否严格位于 root 内。 */
-function isPathInside(root: string, candidate: string): boolean {
-  /** 从根到候选路径的相对表达。 */
-  const relativePath = relative(root, candidate)
-  return relativePath.length > 0
-    && relativePath !== '..'
-    && !relativePath.startsWith(`..${sep}`)
-    && !isAbsolute(relativePath)
-}
-
-/** 在入口、每个文件和每个数据块边界抛出标准 AbortError。 */
-function throwIfAborted(signal?: AbortSignal): void {
-  if (!signal?.aborted) return
-  /** 对调用方可识别的标准取消错误。 */
-  const error = new Error('目录复制已取消')
-  error.name = 'AbortError'
-  throw error
 }

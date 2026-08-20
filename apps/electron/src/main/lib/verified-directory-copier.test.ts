@@ -5,6 +5,8 @@ import {
   mkdtempSync,
   readFileSync,
   readlinkSync,
+  readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -14,11 +16,17 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { DataRootMigrationProgress } from '@proma/shared'
 import {
-  DIRECTORY_COPY_MARKER_FILE,
   copyDirectoryVerified,
+  finalizeDirectoryCopy,
+  getDirectoryCopySidecarPath,
   hashFile,
   type CopyDirectoryResult,
 } from './verified-directory-copier'
+
+/** 返回目标根外、与目标路径稳定绑定的迁移 sidecar 路径。 */
+function getSidecarPath(targetRoot: string): string {
+  return getDirectoryCopySidecarPath(targetRoot)
+}
 
 /** 为单个测试创建的源目录与目标目录。 */
 interface CopyFixture {
@@ -81,6 +89,8 @@ describe('verified-directory-copier', () => {
     expect(await hashFile(join(fixture.targetRoot, '含 空格', '数据.txt'))).toBe(
       await hashFile(join(fixture.sourceRoot, '含 空格', '数据.txt')),
     )
+    expect(readdirSync(fixture.targetRoot).some((name) => name.includes('directory-copy'))).toBe(false)
+    expect(existsSync(getSidecarPath(fixture.targetRoot))).toBe(true)
   })
 
   test('Given 同迁移留下的完整目标 When 恢复迁移 Then 复用哈希一致的文件和链接', async () => {
@@ -94,6 +104,61 @@ describe('verified-directory-copier', () => {
     const result = await copyFixture(fixture)
 
     expect(result).toEqual({ verifiedFiles: 2, reusedFiles: 2, totalBytes: 6 })
+  })
+
+  test('Given 同迁移目标残留已从源删除的文件 When 恢复复制 Then 精确清理残留而不复活旧数据', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    writeFileSync(join(fixture.sourceRoot, 'keep.txt'), 'keep')
+    writeFileSync(join(fixture.sourceRoot, 'deleted.txt'), 'deleted')
+    await copyFixture(fixture)
+    unlinkSync(join(fixture.sourceRoot, 'deleted.txt'))
+
+    /** 源删除文件后的恢复结果。 */
+    const result = await copyFixture(fixture)
+
+    expect(result).toEqual({ verifiedFiles: 1, reusedFiles: 1, totalBytes: 4 })
+    expect(existsSync(join(fixture.targetRoot, 'deleted.txt'))).toBe(false)
+  })
+
+  test('Given 复制成功且重复恢复 When 显式 finalize Then sidecar 全部清理且数据保留', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    writeFileSync(join(fixture.sourceRoot, 'stable.txt'), 'stable')
+    await copyFixture(fixture)
+    /** 同 migrationId 的重复执行结果。 */
+    const repeated = await copyFixture(fixture)
+    /** 目标根外的主 sidecar 路径。 */
+    const sidecarPath = getSidecarPath(fixture.targetRoot)
+
+    expect(repeated.reusedFiles).toBe(1)
+    expect(existsSync(sidecarPath)).toBe(true)
+    await finalizeDirectoryCopy({
+      migrationId: 'migration-current',
+      targetRoot: fixture.targetRoot,
+    })
+    expect(existsSync(sidecarPath)).toBe(false)
+    expect(existsSync(`${sidecarPath}.tmp`)).toBe(false)
+    expect(existsSync(`${sidecarPath}.bak`)).toBe(false)
+    expect(readFileSync(join(fixture.targetRoot, 'stable.txt'), 'utf-8')).toBe('stable')
+  })
+
+  test('Given 空源目录与经符号链接父目录指回源的目标别名 When 复制 Then copier 自身拒绝物理同路径', async () => {
+    if (process.platform === 'win32') return
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    /** 指回测试根的父目录符号链接。 */
+    const aliasParent = join(testRoot, 'alias-parent')
+    symlinkSync(testRoot, aliasParent, 'dir')
+    /** 经符号链接父目录解析后与 sourceRoot 相同的目标。 */
+    const aliasedTarget = join(aliasParent, 'source')
+
+    await expect(copyDirectoryVerified({
+      migrationId: 'migration-current',
+      sourceRoot: fixture.sourceRoot,
+      targetRoot: aliasedTarget,
+      onProgress: () => {},
+    })).rejects.toThrow('物理路径')
   })
 
   test('Given 不同迁移标识的目标 marker When 开始复制 Then 拒绝接管目标', async () => {
@@ -123,7 +188,7 @@ describe('verified-directory-copier', () => {
     /** 当前用例的源目录和目标目录。 */
     const fixture = createFixture(testRoot)
     mkdirSync(fixture.targetRoot)
-    writeFileSync(join(fixture.targetRoot, DIRECTORY_COPY_MARKER_FILE), JSON.stringify({ migrationId: 'migration-current' }))
+    writeFileSync(getSidecarPath(fixture.targetRoot), JSON.stringify({ migrationId: 'migration-current' }))
 
     await expect(copyFixture(fixture)).rejects.toThrow('marker')
   })
@@ -140,13 +205,13 @@ describe('verified-directory-copier', () => {
       sourceRoot: resolve(fixture.sourceRoot),
       targetRoot: resolve(fixture.targetRoot),
     }
-    writeFileSync(`${join(fixture.targetRoot, DIRECTORY_COPY_MARKER_FILE)}.tmp`, JSON.stringify(marker))
+    writeFileSync(`${getSidecarPath(fixture.targetRoot)}.tmp`, JSON.stringify(marker))
 
     /** 从临时 marker 恢复后的复制结果。 */
     const result = await copyFixture(fixture)
 
     expect(result.verifiedFiles).toBe(1)
-    expect(existsSync(join(fixture.targetRoot, DIRECTORY_COPY_MARKER_FILE))).toBe(true)
+    expect(existsSync(getSidecarPath(fixture.targetRoot))).toBe(true)
   })
 
   test('Given main marker 是根外符号链接且 tmp 有效 When 恢复复制 Then 整体拒绝且不触碰根外文件', async () => {
@@ -165,7 +230,7 @@ describe('verified-directory-copier', () => {
       targetRoot: resolve(fixture.targetRoot),
     }
     /** 恶意主 marker 指向目标根之外。 */
-    const markerPath = join(fixture.targetRoot, DIRECTORY_COPY_MARKER_FILE)
+    const markerPath = getSidecarPath(fixture.targetRoot)
     symlinkSync(outsideMarker, markerPath)
     writeFileSync(`${markerPath}.tmp`, JSON.stringify(validMarker))
 
@@ -186,7 +251,7 @@ describe('verified-directory-copier', () => {
       targetRoot: resolve(fixture.targetRoot),
     }
     /** 主 marker 路径及其恶意 FIFO 备份候选。 */
-    const markerPath = join(fixture.targetRoot, DIRECTORY_COPY_MARKER_FILE)
+    const markerPath = getSidecarPath(fixture.targetRoot)
     writeFileSync(markerPath, JSON.stringify(validMarker))
     /** 创建特殊备份候选的系统命令结果。 */
     const created = Bun.spawnSync(['mkfifo', `${markerPath}.bak`])
@@ -226,7 +291,10 @@ describe('verified-directory-copier', () => {
     })
 
     await expect(copying).rejects.toMatchObject({ name: 'AbortError' })
-    expect(existsSync(join(fixture.targetRoot, DIRECTORY_COPY_MARKER_FILE))).toBe(true)
+    expect(existsSync(getSidecarPath(fixture.targetRoot))).toBe(true)
+    expect(existsSync(join(fixture.targetRoot, 'large.bin'))).toBe(false)
+    await Bun.sleep(50)
+    expect(readdirSync(fixture.targetRoot).some((name) => name.includes('.proma-copy-'))).toBe(false)
   })
 
   test('Given 首次校验发现目标损坏 When 自动重拷 Then 仅重试该文件并成功', async () => {
@@ -313,7 +381,74 @@ describe('verified-directory-copier', () => {
     expect(corruptionCount).toBe(2)
   })
 
-  test('Given 多文件并发复制 When 汇报进度 Then 字节单调且不超过普通文件总量', async () => {
+  test('Given 复制中目标目录被替换为根外符号链接 When 原子提交文件 Then 身份复验失败且根外保持为空', async () => {
+    if (process.platform === 'win32') return
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    mkdirSync(join(fixture.sourceRoot, 'nested'))
+    writeFileSync(join(fixture.sourceRoot, 'nested', 'large.bin'), Buffer.alloc(512 * 1024, 3))
+    /** 竞态攻击试图引导写入的根外目录。 */
+    const outsideDirectory = join(testRoot, 'outside-directory')
+    mkdirSync(outsideDirectory)
+    /** 是否已经在复制数据块回调中替换过目标目录。 */
+    let replacedDirectory = false
+
+    await expect(copyFixture(fixture, {
+      concurrency: 1,
+      onProgress: (progress) => {
+        if (progress.stage !== 'copying' || replacedDirectory) return
+        replacedDirectory = true
+        /** 原目标目录被移走后的保留路径。 */
+        const displacedDirectory = join(fixture.targetRoot, 'nested-displaced')
+        renameSync(join(fixture.targetRoot, 'nested'), displacedDirectory)
+        symlinkSync(outsideDirectory, join(fixture.targetRoot, 'nested'), 'dir')
+      },
+    })).rejects.toThrow('身份')
+    expect(readdirSync(outsideDirectory)).toEqual([])
+  })
+
+  test('Given 普通文件复制期间源文件被删除 When 最终重扫 Then 失败并保留可恢复 sidecar', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    /** 复制期间将被删除但已由打开文件描述符持有的源文件。 */
+    const sourceFile = join(fixture.sourceRoot, 'changing.bin')
+    writeFileSync(sourceFile, Buffer.alloc(512 * 1024, 4))
+    /** 是否已经删除过源文件。 */
+    let removedSource = false
+
+    await expect(copyFixture(fixture, {
+      concurrency: 1,
+      onProgress: (progress) => {
+        if (progress.stage !== 'copying' || removedSource) return
+        removedSource = true
+        unlinkSync(sourceFile)
+      },
+    })).rejects.toThrow('源目录')
+    expect(existsSync(getSidecarPath(fixture.targetRoot))).toBe(true)
+  })
+
+  test('Given concurrency=2 且一个 worker 回调失败 When 任务拒绝 Then 其他 worker 中断并且不再后台提交', async () => {
+    /** 当前用例的源目录和目标目录。 */
+    const fixture = createFixture(testRoot)
+    writeFileSync(join(fixture.sourceRoot, 'a-fail.bin'), Buffer.alloc(128 * 1024, 5))
+    writeFileSync(join(fixture.sourceRoot, 'z-other.bin'), Buffer.alloc(8 * 1024 * 1024, 6))
+
+    await expect(copyFixture(fixture, {
+      concurrency: 2,
+      onProgress: (progress) => {
+        if (progress.stage === 'copying' && progress.currentRelativePath === 'a-fail.bin') {
+          throw new Error('测试 worker 失败')
+        }
+      },
+    })).rejects.toThrow('测试 worker 失败')
+    /** worker 全部收敛时另一个文件不得被后台提交。 */
+    const otherTarget = join(fixture.targetRoot, 'z-other.bin')
+    expect(existsSync(otherTarget)).toBe(false)
+    await Bun.sleep(50)
+    expect(existsSync(otherTarget)).toBe(false)
+  })
+
+  test('Given concurrency=2 多文件真实并发复制 When 汇报进度 Then 字节单调且不超过普通文件总量', async () => {
     /** 当前用例的源目录和目标目录。 */
     const fixture = createFixture(testRoot)
     writeFileSync(join(fixture.sourceRoot, 'first.bin'), Buffer.alloc(160 * 1024, 1))
@@ -321,9 +456,9 @@ describe('verified-directory-copier', () => {
     /** 记录复制器发出的全部进度快照。 */
     const progressEvents: DataRootMigrationProgress[] = []
 
-    /** 并发数覆盖为 1 后完成的复制结果。 */
+    /** 并发数覆盖为 2 后完成的复制结果。 */
     const result = await copyFixture(fixture, {
-      concurrency: 1,
+      concurrency: 2,
       onProgress: (progress) => progressEvents.push({ ...progress }),
     })
 
