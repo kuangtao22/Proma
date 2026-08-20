@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
-import { unlink, realpath } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { open, unlink, realpath } from 'node:fs/promises'
+import type { FileHandle } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { readJsonFileSafe, writeJsonFileAtomic } from './safe-file'
 import {
@@ -34,6 +36,16 @@ export interface FinalizeDirectoryCopyInput {
   targetRoot: string
 }
 
+/** 只读检查 sidecar 归属所需字段。 */
+export interface InspectDirectoryCopyOwnershipInput {
+  migrationId: string
+  sourceRoot: string
+  targetRoot: string
+}
+
+/** sidecar 对指定迁移的只读归属结果。 */
+export type DirectoryCopyOwnership = 'absent' | 'owned' | 'foreign' | 'invalid'
+
 /** 返回与目标绝对路径稳定绑定的树外 sidecar 路径。 */
 export function getDirectoryCopySidecarPath(targetRoot: string): string {
   /** 调用方目标路径的绝对字符串，仅用于稳定哈希。 */
@@ -41,6 +53,45 @@ export function getDirectoryCopySidecarPath(targetRoot: string): string {
   /** 目标路径哈希避免同一父目录下的多个迁移互相覆盖。 */
   const targetHash = createHash('sha256').update(normalizePathForIdentity(requestedTargetRoot)).digest('hex').slice(0, 32)
   return join(dirname(requestedTargetRoot), `${DIRECTORY_COPY_SIDECAR_PREFIX}${targetHash}.json`)
+}
+
+/** 只读检查 main/tmp/bak sidecar，不提升、删除或改写任何候选。 */
+export async function inspectDirectoryCopyOwnership(
+  input: InspectDirectoryCopyOwnershipInput,
+): Promise<DirectoryCopyOwnership> {
+  const requestedSourceRoot = resolve(input.sourceRoot)
+  const requestedTargetRoot = resolve(input.targetRoot)
+  const sidecarPath = getDirectoryCopySidecarPath(requestedTargetRoot)
+  let hasCandidate: boolean
+  try {
+    hasCandidate = await validateSidecarCandidateTypes(sidecarPath)
+  } catch {
+    return 'invalid'
+  }
+  if (!hasCandidate) return 'absent'
+  for (const candidatePath of sidecarCandidatePaths(sidecarPath)) {
+    const stats = await lstatOrNull(candidatePath)
+    if (!stats) continue
+    if (!stats.isFile()) return 'invalid'
+    let handle: FileHandle | undefined
+    try {
+      handle = await open(candidatePath, constants.O_RDONLY | constants.O_NOFOLLOW)
+      if (!(await handle.stat()).isFile()) return 'invalid'
+      const value: unknown = JSON.parse(await handle.readFile('utf-8'))
+      if (!isDirectoryCopyMarker(value)) continue
+      if (
+        value.migrationId === input.migrationId
+        && value.sourceRoot === requestedSourceRoot
+        && value.targetRoot === requestedTargetRoot
+      ) return 'owned'
+      return 'foreign'
+    } catch {
+      // 当前候选损坏时继续只读检查后续原子恢复候选。
+    } finally {
+      await handle?.close()
+    }
+  }
+  return 'invalid'
 }
 
 /** 验证或原子创建树外 sidecar，非空目标只有同 migrationId 才视为迁移拥有。 */

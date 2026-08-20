@@ -23,7 +23,12 @@ import type {
 } from '@proma/shared'
 import { DataRootLocator } from './data-root-locator'
 import type { CopyDirectoryInput, CopyDirectoryResult } from './verified-directory-copier'
-import { copyDirectoryVerified, finalizeDirectoryCopy } from './verified-directory-copier'
+import type { DirectoryCopyOwnership, InspectDirectoryCopyOwnershipInput } from './verified-directory-copier'
+import {
+  copyDirectoryVerified,
+  finalizeDirectoryCopy,
+  inspectDirectoryCopyOwnership,
+} from './verified-directory-copier'
 import type { RebaseDataRootOwnedPathsInput, RebaseDataRootOwnedPathsResult } from './owned-path-rebaser'
 import { rebaseDataRootOwnedPaths } from './owned-path-rebaser'
 
@@ -57,12 +62,14 @@ export interface DataRootMigrationCoordinatorOptions {
   locator: DataRootLocator
   lockPath?: string
   createMigrationId?: () => string
+  createLockOwnerToken?: () => string
   now?: () => number
   getAvailableBytes?: (existingTargetAncestor: string) => Promise<number>
   isPidRunning?: (pid: number) => boolean
   copyDirectory?: (input: CopyDirectoryInput) => Promise<CopyDirectoryResult>
   rebaseOwnedPaths?: (input: RebaseDataRootOwnedPathsInput) => RebaseDataRootOwnedPathsResult
   finalizeCopy?: (input: { migrationId: string; targetRoot: string }) => Promise<void>
+  inspectCopyOwnership?: (input: InspectDirectoryCopyOwnershipInput) => Promise<DirectoryCopyOwnership>
   progressPersistIntervalMs?: number
 }
 
@@ -71,6 +78,13 @@ interface MigrationLockRecord {
   version: 1
   pid: number
   createdAt: number
+  ownerToken: string
+}
+
+/** 单次 run 独占的取消令牌，创建后 latch 只会从 false 变为 true。 */
+interface MigrationRunToken {
+  controller: AbortController
+  cancelled: boolean
 }
 
 /** 预检得到且不创建目标目录的稳定信息。 */
@@ -78,6 +92,13 @@ interface MigrationPreflight {
   sourceRoot: string
   targetRoot: string
   totalBytes: number
+}
+
+/** plan 与 resume 共用的只读预检策略。 */
+interface MigrationPreflightOptions {
+  expectedSourceRoot?: string
+  requireOwnedSidecar?: boolean
+  checkSpace?: boolean
 }
 
 /** 数据根迁移协调器：先复制与重写，最后原子切换 locator。 */
@@ -88,6 +109,8 @@ export class DataRootMigrationCoordinator {
   private readonly lockPath: string
   /** 生成不参与路径拼接的唯一迁移 ID。 */
   private readonly createMigrationId: () => string
+  /** 锁 owner token 与迁移 ID 分离，避免释放他人锁。 */
+  private readonly createLockOwnerToken: () => string
   /** 可注入时钟。 */
   private readonly now: () => number
   /** 可注入目标可用容量读取器。 */
@@ -100,27 +123,31 @@ export class DataRootMigrationCoordinator {
   private readonly rebaseOwnedPaths: (input: RebaseDataRootOwnedPathsInput) => RebaseDataRootOwnedPathsResult
   /** commit 后幂等清理 Task3 sidecar。 */
   private readonly finalizeCopy: (input: { migrationId: string; targetRoot: string }) => Promise<void>
+  /** Task3 只读 sidecar 归属检查。 */
+  private readonly inspectCopyOwnership: (
+    input: InspectDirectoryCopyOwnershipInput,
+  ) => Promise<DirectoryCopyOwnership>
   /** 高频进度允许落盘的最短时间间隔。 */
   private readonly progressPersistIntervalMs: number
   /** 当前进程是否持有锁文件。 */
-  private ownsLock = false
+  private lockOwnerToken: string | null = null
   /** 当前执行中的唯一迁移 Promise。 */
   private activeRun: Promise<void> | null = null
   /** copying 阶段使用的取消控制器。 */
-  private abortController: AbortController | null = null
-  /** 取消请求用于区分用户取消与复制故障。 */
-  private cancellationRequested = false
+  private activeRunToken: MigrationRunToken | null = null
 
   constructor(options: DataRootMigrationCoordinatorOptions) {
     this.locator = options.locator
     this.lockPath = options.lockPath ?? resolve(dirname(options.locator.getLocatorPath()), '.proma-data-root-migration.lock')
     this.createMigrationId = options.createMigrationId ?? randomUUID
+    this.createLockOwnerToken = options.createLockOwnerToken ?? randomUUID
     this.now = options.now ?? Date.now
     this.getAvailableBytes = options.getAvailableBytes ?? getStatfsAvailableBytes
     this.isPidRunning = options.isPidRunning ?? isProcessRunning
     this.copyDirectory = options.copyDirectory ?? copyDirectoryVerified
     this.rebaseOwnedPaths = options.rebaseOwnedPaths ?? rebaseDataRootOwnedPaths
     this.finalizeCopy = options.finalizeCopy ?? finalizeDirectoryCopy
+    this.inspectCopyOwnership = options.inspectCopyOwnership ?? inspectDirectoryCopyOwnership
     this.progressPersistIntervalMs = options.progressPersistIntervalMs ?? 250
     if (!isAbsolute(this.lockPath)) throw new Error('迁移锁路径必须是绝对路径')
     if (!Number.isFinite(this.progressPersistIntervalMs) || this.progressPersistIntervalMs < 0) {
@@ -143,10 +170,11 @@ export class DataRootMigrationCoordinator {
     if (this.activeRun !== null) throw new DataRootMigrationError('MIGRATION_BUSY', '数据根迁移正在运行')
     this.acquireLock()
     try {
-      const preflight = await this.preflight(targetRoot)
+      const migrationId = this.createMigrationId()
+      const preflight = await this.preflight(targetRoot, migrationId)
       const timestamp = this.now()
       const migration: DataRootMigrationRecord = {
-        id: this.createMigrationId(),
+        id: migrationId,
         sourceRoot: preflight.sourceRoot,
         targetRoot: preflight.targetRoot,
         stage: 'pending',
@@ -166,12 +194,15 @@ export class DataRootMigrationCoordinator {
   /** 运行 locator 中的 pending/failed/switching 迁移。 */
   async runPending(onProgress: (progress: DataRootMigrationProgress) => void = () => {}): Promise<void> {
     if (this.activeRun !== null) throw new DataRootMigrationError('MIGRATION_BUSY', '数据根迁移正在运行')
-    const execution = this.executePending(onProgress)
+    const token: MigrationRunToken = { controller: new AbortController(), cancelled: false }
+    this.activeRunToken = token
+    const execution = this.executePending(token, onProgress)
     this.activeRun = execution
     try {
       await execution
     } finally {
       this.activeRun = null
+      if (this.activeRunToken === token) this.activeRunToken = null
     }
   }
 
@@ -186,8 +217,11 @@ export class DataRootMigrationCoordinator {
     if (!migration) throw new Error('当前没有可取消的数据根迁移')
     if (!['pending', 'failed', 'copying'].includes(migration.stage)) throw new Error('切换阶段不能取消')
     if (this.activeRun !== null) {
-      this.cancellationRequested = true
-      this.abortController?.abort()
+      const token = this.activeRunToken
+      if (token) {
+        token.cancelled = true
+        token.controller.abort()
+      }
       try {
         await this.activeRun
       } catch (error) {
@@ -200,21 +234,49 @@ export class DataRootMigrationCoordinator {
   }
 
   /** 串行执行恢复、复制、重写、切换和 post-commit cleanup。 */
-  private async executePending(onProgress: (progress: DataRootMigrationProgress) => void): Promise<void> {
+  private async executePending(
+    token: MigrationRunToken,
+    onProgress: (progress: DataRootMigrationProgress) => void,
+  ): Promise<void> {
     this.acquireLock()
     try {
       await this.cleanupCommittedMigration()
+      this.throwIfCancelled(token)
       let migration = this.locator.inspect().locatorFile?.migration
       if (!migration) return
+      try {
+        const recheck = await this.preflight(migration.targetRoot, migration.id, {
+          expectedSourceRoot: migration.sourceRoot,
+          requireOwnedSidecar: ['verifying', 'rebasing', 'switching'].includes(migration.stage),
+          checkSpace: ['pending', 'failed', 'copying'].includes(migration.stage),
+        }, token)
+        if (
+          ['pending', 'failed', 'copying'].includes(migration.stage)
+          && recheck.totalBytes !== migration.totalBytes
+        ) throw new DataRootMigrationError('COPY_FAILED', '源目录容量在计划创建后发生变化')
+        this.throwIfCancelled(token)
+      } catch (error) {
+        if (isAbortError(error)) throw error
+        const migrationError = error instanceof DataRootMigrationError
+          ? error
+          : new DataRootMigrationError('COPY_FAILED', '迁移环境复检失败', error)
+        if (migration.stage === 'switching') {
+          throw this.persistSwitchingError(migration.id, migrationError.message, migrationError.code, migrationError)
+        }
+        throw this.persistFailure(migration.id, migrationError.message, migrationError.code, migrationError)
+      }
       if (migration.stage === 'switching') {
+        if (migration.completedBytes !== migration.totalBytes) {
+          throw new DataRootMigrationError('COPY_FAILED', '切换前目标数据未完整校验')
+        }
         this.locator.commitMigration(migration.id)
         await this.cleanupCommittedMigration()
+        this.throwIfCancelled(token)
         return
       }
 
       if (migration.stage === 'pending' || migration.stage === 'failed' || migration.stage === 'copying') {
-        this.cancellationRequested = false
-        this.abortController = new AbortController()
+        this.throwIfCancelled(token)
         migration = this.transition(migration, 'copying', onProgress)
         let lastPersistedAt = this.now()
         let persistedBytes = migration.completedBytes
@@ -224,10 +286,15 @@ export class DataRootMigrationCoordinator {
             migrationId: migration.id,
             sourceRoot: migration.sourceRoot,
             targetRoot: migration.targetRoot,
-            signal: this.abortController.signal,
+            signal: token.controller.signal,
             onProgress: (progress) => {
               observedBytes = Math.max(observedBytes, Math.min(migration!.totalBytes, progress.completedBytes))
-              onProgress({ ...progress, completedBytes: observedBytes, totalBytes: migration!.totalBytes })
+              onProgress({
+                ...progress,
+                stage: 'copying',
+                completedBytes: observedBytes,
+                totalBytes: migration!.totalBytes,
+              })
               const currentTime = this.now()
               if (observedBytes > persistedBytes && currentTime - lastPersistedAt >= this.progressPersistIntervalMs) {
                 this.locator.updateMigration(migration!.id, { completedBytes: observedBytes, updatedAt: currentTime })
@@ -236,7 +303,7 @@ export class DataRootMigrationCoordinator {
               }
             },
           })
-          if (this.cancellationRequested) throw createAbortError()
+          this.throwIfCancelled(token)
           if (result.totalBytes !== migration.totalBytes) throw new Error('源目录容量在计划创建后发生变化')
           migration = this.locator.inspect().locatorFile?.migration ?? migration
           if (migration.completedBytes < migration.totalBytes) {
@@ -247,8 +314,8 @@ export class DataRootMigrationCoordinator {
             migration = this.locator.inspect().locatorFile?.migration ?? migration
           }
         } catch (error) {
-          if (this.cancellationRequested || isAbortError(error)) {
-            this.locator.cancelMigration(migration.id)
+          if (token.cancelled || isAbortError(error)) {
+            if (this.locator.inspect().locatorFile?.migration) this.locator.cancelMigration(migration.id)
             throw error
           }
           const current = this.locator.inspect().locatorFile?.migration
@@ -263,30 +330,61 @@ export class DataRootMigrationCoordinator {
             }
           }
           throw this.persistFailure(migration.id, '复制数据失败', 'COPY_FAILED', error)
-        } finally {
-          this.abortController = null
         }
+        this.throwIfCancelled(token)
         migration = this.transition(migration, 'verifying', onProgress)
       }
 
+      this.throwIfCancelled(token)
       if (migration.stage === 'verifying') migration = this.transition(migration, 'rebasing', onProgress)
       try {
         this.rebaseOwnedPaths({ sourceRoot: migration.sourceRoot, targetRoot: migration.targetRoot })
       } catch (error) {
         throw this.persistFailure(migration.id, '更新 Proma-owned 路径失败', 'REBASE_FAILED', error)
       }
+      this.throwIfCancelled(token)
       migration = this.transition(migration, 'switching', onProgress)
+      try {
+        await this.preflight(migration.targetRoot, migration.id, {
+          expectedSourceRoot: migration.sourceRoot,
+          requireOwnedSidecar: true,
+          checkSpace: false,
+        }, token)
+        this.throwIfCancelled(token)
+      } catch (error) {
+        if (isAbortError(error)) throw error
+        throw this.persistSwitchingError(
+          migration.id,
+          '切换前目标副本复检失败',
+          'COPY_FAILED',
+          error,
+        )
+      }
       try {
         this.locator.commitMigration(migration.id)
       } catch (error) {
-        throw new DataRootMigrationError('LOCATOR_WRITE_FAILED', '切换数据根失败', error)
+        throw this.persistSwitchingError(
+          migration.id,
+          '切换数据根失败',
+          'LOCATOR_WRITE_FAILED',
+          error,
+        )
       }
       await this.cleanupCommittedMigration()
+      this.throwIfCancelled(token)
     } finally {
-      this.abortController = null
-      this.cancellationRequested = false
       this.releaseLock()
     }
+  }
+
+  /** 每个 await 与阶段边界后检查单向取消 latch。 */
+  private throwIfCancelled(token: MigrationRunToken): void {
+    if (!token.cancelled && !token.controller.signal.aborted) return
+    const migration = this.locator.inspect().locatorFile?.migration
+    if (migration && ['pending', 'failed', 'copying'].includes(migration.stage)) {
+      this.locator.cancelMigration(migration.id)
+    }
+    throw createAbortError()
   }
 
   /** 阶段边界立即落盘并发送事件。 */
@@ -332,6 +430,28 @@ export class DataRootMigrationCoordinator {
     return new DataRootMigrationError(code, message, cause)
   }
 
+  /** switching 失败保持阶段不倒退，只原子记录可读错误供下次恢复。 */
+  private persistSwitchingError(
+    migrationId: string,
+    message: string,
+    code: DataRootMigrationErrorCode,
+    cause: unknown,
+  ): DataRootMigrationError {
+    try {
+      const current = this.locator.inspect().locatorFile?.migration
+      if (current?.stage === 'switching') {
+        this.locator.updateMigration(migrationId, {
+          stage: 'switching',
+          updatedAt: Math.max(this.now(), current.updatedAt),
+          error: message,
+        })
+      }
+    } catch (locatorError) {
+      return new DataRootMigrationError('LOCATOR_WRITE_FAILED', '保存切换错误状态失败', locatorError)
+    }
+    return new DataRootMigrationError(code, message, cause)
+  }
+
   /** commit 已成功时清理 sidecar；清理失败只保留意图，不回滚或标记失败。 */
   private async cleanupCommittedMigration(): Promise<void> {
     const cleanup = this.locator.inspect().locatorFile?.postCommitCleanup
@@ -345,11 +465,19 @@ export class DataRootMigrationCoordinator {
   }
 
   /** 只读验证源、目标物理关系、写权限与容量，不创建目标目录。 */
-  private async preflight(targetRoot: string): Promise<MigrationPreflight> {
+  private async preflight(
+    targetRoot: string,
+    migrationId: string,
+    options: MigrationPreflightOptions = {},
+    token?: MigrationRunToken,
+  ): Promise<MigrationPreflight> {
     if (!isAbsolute(targetRoot)) throw new DataRootMigrationError('UNSAFE_TARGET', '目标数据根必须是绝对路径')
     let sourceRoot: string
     try {
       sourceRoot = this.locator.requireActiveRoot()
+      if (options.expectedSourceRoot !== undefined && sourceRoot !== options.expectedSourceRoot) {
+        throw new Error('活动数据根与迁移源根不一致')
+      }
       if (!lstatSync(sourceRoot).isDirectory()) throw new Error('活动数据根必须是实际目录')
       accessSync(sourceRoot, constants.R_OK | constants.W_OK | constants.X_OK)
     } catch (error) {
@@ -364,9 +492,6 @@ export class DataRootMigrationCoordinator {
         if (!lstatSync(normalizedTarget).isDirectory()) {
           throw new DataRootMigrationError('TARGET_NOT_WRITABLE', '目标数据根必须是目录')
         }
-        if (readdirSync(normalizedTarget).length > 0) {
-          throw new DataRootMigrationError('TARGET_NOT_EMPTY', '目标数据根必须为空')
-        }
       }
     } catch (error) {
       if (error instanceof DataRootMigrationError) throw error
@@ -380,61 +505,92 @@ export class DataRootMigrationCoordinator {
     } catch (error) {
       throw new DataRootMigrationError('TARGET_NOT_WRITABLE', '目标数据根不可写', error)
     }
-    let totalBytes: number
+    let ownership: DirectoryCopyOwnership
     try {
-      totalBytes = await scanSourceBytes(sourceRoot)
+      ownership = await this.inspectCopyOwnership({
+        migrationId,
+        sourceRoot,
+        targetRoot: normalizedTarget,
+      })
     } catch (error) {
-      throw new DataRootMigrationError('INVALID_SOURCE', '无法扫描当前数据根', error)
+      throw new DataRootMigrationError('UNSAFE_TARGET', '无法验证目标迁移归属', error)
     }
-    let availableBytes: number
-    try {
-      availableBytes = await this.getAvailableBytes(prospectiveTarget.existingAncestor)
-    } catch (error) {
-      throw new DataRootMigrationError('TARGET_NOT_WRITABLE', '无法读取目标磁盘可用空间', error)
+    if (token) this.throwIfCancelled(token)
+    if (ownership === 'foreign' || ownership === 'invalid') {
+      throw new DataRootMigrationError('UNSAFE_TARGET', '目标 sidecar 不属于当前迁移或已损坏')
     }
-    if (!Number.isFinite(availableBytes) || availableBytes < totalBytes) {
-      throw new DataRootMigrationError('INSUFFICIENT_SPACE', '目标磁盘可用空间不足')
+    if (options.requireOwnedSidecar && ownership !== 'owned') {
+      throw new DataRootMigrationError('UNSAFE_TARGET', '目标副本不属于当前迁移')
+    }
+    if (options.requireOwnedSidecar && !existsSync(normalizedTarget)) {
+      throw new DataRootMigrationError('UNSAFE_TARGET', '目标副本目录不存在')
+    }
+    if (existsSync(normalizedTarget) && readdirSync(normalizedTarget).length > 0 && ownership !== 'owned') {
+      throw new DataRootMigrationError('TARGET_NOT_EMPTY', '非空目标不属于当前迁移')
+    }
+    let totalBytes = 0
+    if (options.checkSpace !== false) {
+      try {
+        totalBytes = await scanSourceBytes(sourceRoot)
+      } catch (error) {
+        throw new DataRootMigrationError('INVALID_SOURCE', '无法扫描当前数据根', error)
+      }
+      if (token) this.throwIfCancelled(token)
+    }
+    if (options.checkSpace !== false) {
+      let availableBytes: number
+      try {
+        availableBytes = await this.getAvailableBytes(prospectiveTarget.existingAncestor)
+      } catch (error) {
+        throw new DataRootMigrationError('TARGET_NOT_WRITABLE', '无法读取目标磁盘可用空间', error)
+      }
+      if (token) this.throwIfCancelled(token)
+      if (!Number.isFinite(availableBytes) || availableBytes < totalBytes) {
+        throw new DataRootMigrationError('INSUFFICIENT_SPACE', '目标磁盘可用空间不足')
+      }
     }
     return { sourceRoot: resolve(sourceRoot), targetRoot: normalizedTarget, totalBytes }
   }
 
   /** open(wx) 建立进程锁，仅确认 PID 不存在时删除陈旧锁。 */
   private acquireLock(): void {
-    if (this.ownsLock) return
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        const descriptor = openSync(this.lockPath, 'wx', 0o600)
-        try {
-          const record: MigrationLockRecord = { version: 1, pid: process.pid, createdAt: this.now() }
-          writeFileSync(descriptor, JSON.stringify(record), 'utf-8')
-          fsyncSync(descriptor)
-        } finally {
-          closeSync(descriptor)
-        }
-        this.ownsLock = true
-        return
-      } catch (error) {
-        if (!isFileExistsError(error)) throw new DataRootMigrationError('MIGRATION_LOCKED', '无法建立迁移实例锁', error)
-        const record = readMigrationLock(this.lockPath)
-        if (!record || this.isPidRunning(record.pid)) {
-          throw new DataRootMigrationError('MIGRATION_LOCKED', '另一个 Proma 实例正在使用数据根迁移')
-        }
-        unlinkSync(this.lockPath)
-      }
+    if (this.lockOwnerToken !== null) return
+    const ownerToken = this.createLockOwnerToken()
+    if (tryCreateMigrationLock(this.lockPath, ownerToken, this.now())) {
+      this.lockOwnerToken = ownerToken
+      return
     }
-    throw new DataRootMigrationError('MIGRATION_LOCKED', '无法取得迁移实例锁')
+
+    const recoveryPath = `${this.lockPath}.recover`
+    const recoveryOwnerToken = this.createLockOwnerToken()
+    if (!tryCreateMigrationLock(recoveryPath, recoveryOwnerToken, this.now())) {
+      throw new DataRootMigrationError('MIGRATION_LOCKED', '另一个实例正在接管陈旧迁移锁')
+    }
+    try {
+      const initial = readMigrationLock(this.lockPath)
+      if (!initial || this.isPidRunning(initial.pid)) {
+        throw new DataRootMigrationError('MIGRATION_LOCKED', '另一个 Proma 实例正在使用数据根迁移')
+      }
+      const confirmed = readMigrationLock(this.lockPath)
+      if (!confirmed || confirmed.ownerToken !== initial.ownerToken || this.isPidRunning(confirmed.pid)) {
+        throw new DataRootMigrationError('MIGRATION_LOCKED', '迁移锁 owner 在接管期间发生变化')
+      }
+      unlinkSync(this.lockPath)
+      if (!tryCreateMigrationLock(this.lockPath, ownerToken, this.now())) {
+        throw new DataRootMigrationError('MIGRATION_LOCKED', '陈旧锁接管后主锁被其他实例占用')
+      }
+      this.lockOwnerToken = ownerToken
+    } finally {
+      removeOwnedMigrationLock(recoveryPath, recoveryOwnerToken)
+    }
   }
 
   /** 仅删除由当前 coordinator 成功创建的锁。 */
   private releaseLock(): void {
-    if (!this.ownsLock) return
-    try {
-      unlinkSync(this.lockPath)
-    } catch (error) {
-      if (!isFileMissingError(error)) throw error
-    } finally {
-      this.ownsLock = false
-    }
+    const ownerToken = this.lockOwnerToken
+    if (ownerToken === null) return
+    removeOwnedMigrationLock(this.lockPath, ownerToken)
+    this.lockOwnerToken = null
   }
 }
 
@@ -522,10 +678,73 @@ function readMigrationLock(lockPath: string): MigrationLockRecord | null {
     const value: unknown = JSON.parse(readFileSync(lockPath, 'utf-8'))
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
     const record = value as Record<string, unknown>
-    if (record.version !== 1 || !Number.isSafeInteger(record.pid) || typeof record.createdAt !== 'number') return null
-    return { version: 1, pid: record.pid as number, createdAt: record.createdAt }
+    const keys = Object.keys(record).sort()
+    if (
+      keys.length !== 4
+      || keys[0] !== 'createdAt'
+      || keys[1] !== 'ownerToken'
+      || keys[2] !== 'pid'
+      || keys[3] !== 'version'
+      || record.version !== 1
+      || !Number.isSafeInteger(record.pid)
+      || (record.pid as number) <= 0
+      || typeof record.createdAt !== 'number'
+      || !Number.isFinite(record.createdAt)
+      || record.createdAt < 0
+      || typeof record.ownerToken !== 'string'
+      || record.ownerToken.trim().length === 0
+    ) return null
+    return {
+      version: 1,
+      pid: record.pid as number,
+      createdAt: record.createdAt,
+      ownerToken: record.ownerToken,
+    }
   } catch {
     return null
+  }
+}
+
+/** 用 open(wx) 创建带随机 owner 的锁；已存在时返回 false。 */
+function tryCreateMigrationLock(lockPath: string, ownerToken: string, createdAt: number): boolean {
+  if (ownerToken.trim().length === 0 || !Number.isFinite(createdAt) || createdAt < 0) {
+    throw new DataRootMigrationError('MIGRATION_LOCKED', '迁移锁 owner 或时间无效')
+  }
+  let created = false
+  try {
+    const descriptor = openSync(lockPath, 'wx', 0o600)
+    created = true
+    try {
+      const record: MigrationLockRecord = { version: 1, pid: process.pid, createdAt, ownerToken }
+      writeFileSync(descriptor, JSON.stringify(record), 'utf-8')
+      fsyncSync(descriptor)
+    } finally {
+      closeSync(descriptor)
+    }
+    return true
+  } catch (error) {
+    if (isFileExistsError(error)) return false
+    if (created) {
+      try {
+        unlinkSync(lockPath)
+      } catch (unlinkError) {
+        if (!isFileMissingError(unlinkError)) {
+          throw new DataRootMigrationError('MIGRATION_LOCKED', '清理未完成的迁移实例锁失败', unlinkError)
+        }
+      }
+    }
+    throw new DataRootMigrationError('MIGRATION_LOCKED', '无法建立迁移实例锁', error)
+  }
+}
+
+/** 仅当磁盘记录仍属于指定 owner 时删除锁。 */
+function removeOwnedMigrationLock(lockPath: string, ownerToken: string): void {
+  const record = readMigrationLock(lockPath)
+  if (!record || record.ownerToken !== ownerToken) return
+  try {
+    unlinkSync(lockPath)
+  } catch (error) {
+    if (!isFileMissingError(error)) throw error
   }
 }
 

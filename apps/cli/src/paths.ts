@@ -12,7 +12,8 @@
 import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join, win32 } from 'node:path'
-import type { DataRootLocatorFile, DataRootMigrationRecord, DataRootMigrationStage } from '@proma/shared'
+import { isDataRootLocatorFile } from '@proma/shared'
+import type { DataRootLocatorFile } from '@proma/shared'
 
 export interface PathOptions {
   /** 显式指定配置目录（绝对路径）。优先级最高。 */
@@ -28,11 +29,6 @@ export interface PathResolutionContext {
   /** 当前 CLI 进程环境变量。 */
   env: NodeJS.ProcessEnv
 }
-
-/** 支持的迁移阶段，仅用于校验 locator，不执行迁移状态机。 */
-const DATA_ROOT_MIGRATION_STAGES: ReadonlySet<DataRootMigrationStage> = new Set([
-  'pending', 'copying', 'verifying', 'rebasing', 'switching', 'failed',
-])
 
 /**
  * 按固定优先级解析 CLI 业务配置根。
@@ -98,54 +94,9 @@ function assertReadableDataRoot(root: string): void {
   }
 }
 
-/** 校验 CLI 会消费的 locator v1 完整结构。 */
-function isDataRootLocatorFile(value: unknown): value is DataRootLocatorFile {
-  if (!isRecord(value) || value.version !== 1 || !isAbsolutePath(value.activeRoot)) return false
-  if (value.previousRoot !== undefined && !isAbsolutePath(value.previousRoot)) return false
-  return value.migration === undefined
-    || (isDataRootMigrationRecord(value.migration) && value.migration.sourceRoot === value.activeRoot)
-}
-
-/** 校验 locator 中可选迁移记录，CLI 仅验证而不推进阶段。 */
-function isDataRootMigrationRecord(value: unknown): value is DataRootMigrationRecord {
-  if (!isRecord(value)) return false
-  return isNonEmptyString(value.id)
-    && isAbsolutePath(value.sourceRoot)
-    && isAbsolutePath(value.targetRoot)
-    && typeof value.stage === 'string'
-    && DATA_ROOT_MIGRATION_STAGES.has(value.stage as DataRootMigrationStage)
-    && isNonNegativeFiniteNumber(value.completedBytes)
-    && isNonNegativeFiniteNumber(value.totalBytes)
-    && value.completedBytes <= value.totalBytes
-    && isNonNegativeFiniteNumber(value.startedAt)
-    && isNonNegativeFiniteNumber(value.updatedAt)
-    && value.updatedAt >= value.startedAt
-    && (value.error === undefined || typeof value.error === 'string')
-}
-
-/** 判断 unknown 是否为可按键访问的普通对象。 */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-/** 判断 unknown 是否为非空字符串。 */
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0
-}
-
-/** 判断 unknown 是否为绝对路径字符串。 */
-function isAbsolutePath(value: unknown): value is string {
-  return isNonEmptyString(value) && isPortableAbsolutePath(value)
-}
-
 /** 跨宿主平台识别 POSIX、Win32 drive 与 UNC 绝对路径。 */
 function isPortableAbsolutePath(value: string): boolean {
   return isAbsolute(value) || win32.isAbsolute(value)
-}
-
-/** 判断 unknown 是否为有限非负数。 */
-function isNonNegativeFiniteNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }
 
 export function getSessionsIndexPath(opts: PathOptions = {}): string {

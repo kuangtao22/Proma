@@ -32,8 +32,16 @@ import {
 } from './verified-directory-copy-sidecar'
 
 export { hashFile } from './verified-directory-copy-filesystem'
-export { finalizeDirectoryCopy, getDirectoryCopySidecarPath } from './verified-directory-copy-sidecar'
-export type { FinalizeDirectoryCopyInput } from './verified-directory-copy-sidecar'
+export {
+  finalizeDirectoryCopy,
+  getDirectoryCopySidecarPath,
+  inspectDirectoryCopyOwnership,
+} from './verified-directory-copy-sidecar'
+export type {
+  DirectoryCopyOwnership,
+  FinalizeDirectoryCopyInput,
+  InspectDirectoryCopyOwnershipInput,
+} from './verified-directory-copy-sidecar'
 
 /** 源目录的稳定清单。 */
 interface DirectoryManifest {

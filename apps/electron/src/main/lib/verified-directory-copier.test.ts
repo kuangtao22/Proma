@@ -25,6 +25,7 @@ import {
   finalizeDirectoryCopy,
   getDirectoryCopySidecarPath,
   hashFile,
+  inspectDirectoryCopyOwnership,
   type CopyDirectoryResult,
 } from './verified-directory-copier'
 
@@ -177,6 +178,33 @@ describe('verified-directory-copier', () => {
     expect(existsSync(`${sidecarPath}.tmp`)).toBe(false)
     expect(existsSync(`${sidecarPath}.bak`)).toBe(false)
     expect(readFileSync(join(fixture.targetRoot, 'stable.txt'), 'utf-8')).toBe('stable')
+  })
+
+  test('Given owned、foreign 或缺失 sidecar When 只读检查 Then 返回归属且不修改候选', async () => {
+    const fixture = createFixture(testRoot)
+    writeFileSync(join(fixture.sourceRoot, 'owned.txt'), 'owned')
+    await copyFixture(fixture)
+    const sidecarPath = getSidecarPath(fixture.targetRoot)
+    const originalBytes = readFileSync(sidecarPath)
+
+    await expect(inspectDirectoryCopyOwnership({
+      migrationId: 'migration-current',
+      sourceRoot: fixture.sourceRoot,
+      targetRoot: fixture.targetRoot,
+    })).resolves.toBe('owned')
+    await expect(inspectDirectoryCopyOwnership({
+      migrationId: 'foreign-migration',
+      sourceRoot: fixture.sourceRoot,
+      targetRoot: fixture.targetRoot,
+    })).resolves.toBe('foreign')
+    expect(readFileSync(sidecarPath)).toEqual(originalBytes)
+
+    await finalizeDirectoryCopy({ migrationId: 'migration-current', targetRoot: fixture.targetRoot })
+    await expect(inspectDirectoryCopyOwnership({
+      migrationId: 'migration-current',
+      sourceRoot: fixture.sourceRoot,
+      targetRoot: fixture.targetRoot,
+    })).resolves.toBe('absent')
   })
 
   test('Given 空源目录与经符号链接父目录指回源的目标别名 When 复制 Then copier 自身拒绝物理同路径', async () => {

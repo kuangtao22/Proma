@@ -62,6 +62,76 @@ export interface DataRootLocatorFile {
   postCommitCleanup?: DataRootPostCommitCleanupRecord
 }
 
+/** 支持的迁移阶段集合，供 Electron 与 CLI 共用运行时 schema。 */
+const DATA_ROOT_MIGRATION_STAGES: ReadonlySet<DataRootMigrationStage> = new Set([
+  'pending', 'copying', 'verifying', 'rebasing', 'switching', 'failed',
+])
+
+/** 浏览器安全地校验 locator v1，不依赖 node:path。 */
+export function isDataRootLocatorFile(value: unknown): value is DataRootLocatorFile {
+  if (!isRecord(value) || value.version !== 1 || !isPortableAbsolutePath(value.activeRoot)) return false
+  if (value.previousRoot !== undefined && !isPortableAbsolutePath(value.previousRoot)) return false
+  if (value.migration !== undefined) {
+    if (!isDataRootMigrationRecord(value.migration) || value.migration.sourceRoot !== value.activeRoot) return false
+  }
+  if (value.postCommitCleanup !== undefined) {
+    if (value.migration !== undefined || !isDataRootPostCommitCleanupRecord(value.postCommitCleanup)) return false
+    if (value.postCommitCleanup.targetRoot !== value.activeRoot) return false
+  }
+  return true
+}
+
+/** 校验可恢复迁移记录的完整数值与路径约束。 */
+function isDataRootMigrationRecord(value: unknown): value is DataRootMigrationRecord {
+  if (!isRecord(value)) return false
+  return isNonEmptyString(value.id)
+    && isPortableAbsolutePath(value.sourceRoot)
+    && isPortableAbsolutePath(value.targetRoot)
+    && typeof value.stage === 'string'
+    && DATA_ROOT_MIGRATION_STAGES.has(value.stage as DataRootMigrationStage)
+    && isNonNegativeFiniteNumber(value.completedBytes)
+    && isNonNegativeFiniteNumber(value.totalBytes)
+    && value.completedBytes <= value.totalBytes
+    && isNonNegativeFiniteNumber(value.startedAt)
+    && isNonNegativeFiniteNumber(value.updatedAt)
+    && value.updatedAt >= value.startedAt
+    && (value.error === undefined || typeof value.error === 'string')
+}
+
+/** cleanup 记录只接受完整且无额外字段的固定 schema。 */
+function isDataRootPostCommitCleanupRecord(value: unknown): value is DataRootPostCommitCleanupRecord {
+  if (!isRecord(value)) return false
+  const keys = Object.keys(value).sort()
+  return keys.length === 2
+    && keys[0] === 'migrationId'
+    && keys[1] === 'targetRoot'
+    && isNonEmptyString(value.migrationId)
+    && isPortableAbsolutePath(value.targetRoot)
+}
+
+/** 识别 POSIX、Windows drive、反斜杠 UNC 与 slash UNC 绝对路径。 */
+function isPortableAbsolutePath(value: unknown): value is string {
+  if (!isNonEmptyString(value)) return false
+  return value.startsWith('/')
+    || /^[a-zA-Z]:[\\/]/.test(value)
+    || /^\\\\[^\\/]+[\\/][^\\/]+/.test(value)
+}
+
+/** 判断 unknown 是否为普通 JSON 对象。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** 判断 unknown 是否为非空字符串。 */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+/** 判断 unknown 是否为有限非负数。 */
+function isNonNegativeFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
 /** 路径管理四层 IPC 合同使用的稳定通道名。 */
 export const PATH_MANAGEMENT_IPC_CHANNELS = {
   GET_STATE: 'path-management:get-state',

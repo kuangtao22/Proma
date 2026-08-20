@@ -1,7 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { DataRootMigrationProgress } from '@proma/shared'
 import { DataRootLocator } from './data-root-locator'
 import {
@@ -90,7 +100,7 @@ describe('DataRootMigrationCoordinator', () => {
 
     await harness.coordinator.runPending((progress) => stages.push(progress.stage))
 
-    expect(stages).toEqual(['copying', 'copying', 'verifying', 'verifying', 'rebasing', 'switching'])
+    expect(stages).toEqual(['copying', 'copying', 'copying', 'verifying', 'rebasing', 'switching'])
     expect(harness.rebaseCalls).toEqual([{ sourceRoot, targetRoot }])
     expect(harness.finalizeCalls).toEqual([{ migrationId: 'migration-1', targetRoot }])
     expect(harness.locator.inspect().locatorFile).toMatchObject({
@@ -102,6 +112,26 @@ describe('DataRootMigrationCoordinator', () => {
   })
 
   test('Given 真实 Task3 和 Task4 依赖 When 运行 Then 复制内容、切换 locator 并清理 sidecar', async () => {
+    const progressEvents: DataRootMigrationProgress[] = []
+    const externalPath = join(homeDir, 'external-project')
+    const workspaceDir = join(sourceRoot, 'agent-workspaces', 'alpha')
+    mkdirSync(workspaceDir, { recursive: true })
+    writeFileSync(join(sourceRoot, 'agent-sessions.json'), JSON.stringify({
+      version: 4,
+      sessions: [{
+        id: 'session-1', title: '测试会话', createdAt: 1, updatedAt: 2,
+        piSessionFile: join(sourceRoot, 'sdk-config', 'sessions', 'a.jsonl'),
+        attachedDirectories: [externalPath],
+      }],
+    }))
+    writeFileSync(join(sourceRoot, 'agent-workspaces.json'), JSON.stringify({
+      version: 2,
+      workspaces: [{ id: 'workspace-1', name: 'Alpha', slug: 'alpha', createdAt: 1, updatedAt: 2 }],
+    }))
+    writeFileSync(join(workspaceDir, 'config.json'), JSON.stringify({
+      attachedFiles: [join(sourceRoot, 'agent-workspaces', 'alpha', 'owned.txt'), externalPath],
+      note: `保留普通文本 ${sourceRoot}`,
+    }))
     const locator = new DataRootLocator({ homeDir })
     const coordinator = new DataRootMigrationCoordinator({
       locator,
@@ -112,9 +142,27 @@ describe('DataRootMigrationCoordinator', () => {
     })
 
     await coordinator.createPlan(targetRoot)
-    await coordinator.runPending()
+    await coordinator.runPending((progress) => progressEvents.push(progress))
 
     expect(readFileSync(join(targetRoot, 'settings.json'), 'utf-8')).toBe('{"theme":"dark"}')
+    const sessions = JSON.parse(readFileSync(join(targetRoot, 'agent-sessions.json'), 'utf-8')) as {
+      sessions: Array<{ piSessionFile: string; attachedDirectories: string[] }>
+    }
+    const workspaceConfig = JSON.parse(
+      readFileSync(join(targetRoot, 'agent-workspaces', 'alpha', 'config.json'), 'utf-8'),
+    ) as { attachedFiles: string[]; note: string }
+    expect(sessions.sessions[0]?.piSessionFile).toBe(join(targetRoot, 'sdk-config', 'sessions', 'a.jsonl'))
+    expect(sessions.sessions[0]?.attachedDirectories).toEqual([externalPath])
+    expect(workspaceConfig.attachedFiles).toEqual([
+      join(targetRoot, 'agent-workspaces', 'alpha', 'owned.txt'),
+      externalPath,
+    ])
+    expect(workspaceConfig.note).toBe(`保留普通文本 ${sourceRoot}`)
+    const stageOrder = ['copying', 'verifying', 'rebasing', 'switching']
+    expect(progressEvents.map((progress) => stageOrder.indexOf(progress.stage))).toEqual(
+      progressEvents.map((progress) => stageOrder.indexOf(progress.stage)).sort((left, right) => left - right),
+    )
+    expect(progressEvents.some((progress) => progress.stage === 'verifying')).toBe(true)
     expect(locator.requireActiveRoot()).toBe(targetRoot)
     expect(existsSync(getDirectoryCopySidecarPath(targetRoot))).toBe(false)
   })
@@ -236,6 +284,24 @@ describe('DataRootMigrationCoordinator', () => {
     expect(harness.locator.inspect().locatorFile?.migration).toBeUndefined()
   })
 
+  test('Given runPending 后立即 cancel When 尚未进入 copier Then latch 不丢失且不切换', async () => {
+    const harness = createHarness({
+      copyDirectory: async (input) => {
+        expect(input.signal?.aborted).toBe(true)
+        throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+      },
+    })
+    await harness.coordinator.createPlan(targetRoot)
+
+    const running = harness.coordinator.runPending()
+    await harness.coordinator.cancel()
+    await expect(running).rejects.toMatchObject({ name: 'AbortError' })
+
+    expect(harness.copyCalls.length === 0 || harness.copyCalls[0]?.signal?.aborted).toBe(true)
+    expect(harness.locator.inspect().locatorFile?.migration).toBeUndefined()
+    expect(harness.locator.requireActiveRoot()).toBe(sourceRoot)
+  })
+
   test('Given switching 或已提交 When 取消 Then 明确拒绝', async () => {
     const switching = createHarness()
     mkdirSync(targetRoot)
@@ -274,8 +340,79 @@ describe('DataRootMigrationCoordinator', () => {
     expect(existsSync(harness.lockPath)).toBe(false)
   })
 
-  test('Given 目标嵌套源根或物理 alias When 创建计划 Then 预检拒绝且无副作用', async () => {
+  test('Given 目标由即将生成的 migrationId sidecar 拥有 When 创建计划 Then 接受非空断点目标', async () => {
+    mkdirSync(targetRoot)
+    writeFileSync(join(targetRoot, 'partial.txt'), 'partial')
+    writeFileSync(getDirectoryCopySidecarPath(targetRoot), JSON.stringify({
+      version: 1,
+      migrationId: 'migration-1',
+      sourceRoot: resolve(sourceRoot),
+      targetRoot: resolve(targetRoot),
+    }))
+    const locator = new DataRootLocator({ homeDir })
+    const coordinator = new DataRootMigrationCoordinator({
+      locator,
+      lockPath: join(homeDir, '.owned-plan.lock'),
+      createMigrationId: () => 'migration-1',
+      getAvailableBytes: async () => 1_000_000,
+      isPidRunning: () => false,
+    })
+
+    await expect(coordinator.createPlan(targetRoot)).resolves.toMatchObject({ migrationId: 'migration-1' })
+  })
+
+  test('Given plan 后空间变为不足 When run 复检 Then 保存 failed 且不调用 copier', async () => {
+    let checks = 0
+    const harness = createHarness({
+      getAvailableBytes: async () => {
+        checks += 1
+        return checks === 1 ? 1_000_000 : 1
+      },
+    })
+    await harness.coordinator.createPlan(targetRoot)
+
+    await expect(harness.coordinator.runPending()).rejects.toMatchObject({ code: 'INSUFFICIENT_SPACE' })
+
+    expect(harness.copyCalls).toEqual([])
+    expect(harness.locator.requireActiveRoot()).toBe(sourceRoot)
+    expect(harness.locator.inspect().locatorFile?.migration?.stage).toBe('failed')
+  })
+
+  test('Given plan 后目标父目录变为 source 物理 alias When run 复检 Then 不复制也不切换', async () => {
+    const targetParent = join(homeDir, 'target-parent')
+    const originalParent = join(homeDir, 'target-parent-original')
+    const selectedTarget = join(targetParent, 'target')
+    mkdirSync(targetParent)
     const harness = createHarness()
+    await harness.coordinator.createPlan(selectedTarget)
+    renameSync(targetParent, originalParent)
+    symlinkSync(sourceRoot, targetParent, 'dir')
+
+    await expect(harness.coordinator.runPending()).rejects.toMatchObject({ code: 'UNSAFE_TARGET' })
+
+    expect(harness.copyCalls).toEqual([])
+    expect(harness.locator.requireActiveRoot()).toBe(sourceRoot)
+  })
+
+  test('Given plan 后目标父目录失去写权限 When run 复检 Then 不调用 copier', async () => {
+    if (process.platform === 'win32') return
+    const targetParent = join(homeDir, 'readonly-target-parent')
+    const selectedTarget = join(targetParent, 'target')
+    mkdirSync(targetParent)
+    const harness = createHarness()
+    await harness.coordinator.createPlan(selectedTarget)
+    chmodSync(targetParent, 0o500)
+    try {
+      await expect(harness.coordinator.runPending()).rejects.toMatchObject({ code: 'TARGET_NOT_WRITABLE' })
+      expect(harness.copyCalls).toEqual([])
+      expect(harness.locator.requireActiveRoot()).toBe(sourceRoot)
+    } finally {
+      chmodSync(targetParent, 0o700)
+    }
+  })
+
+  test('Given 目标嵌套源根或物理 alias When 创建计划 Then 预检拒绝且无副作用', async () => {
+    const harness = createHarness({ inspectCopyOwnership: async () => 'absent' })
     await expect(harness.coordinator.createPlan(join(sourceRoot, 'nested'))).rejects.toMatchObject({ code: 'UNSAFE_TARGET' })
     await expect(harness.coordinator.createPlan(sourceRoot)).rejects.toMatchObject({ code: 'UNSAFE_TARGET' })
     const aliasRoot = join(homeDir, 'source-alias')
@@ -286,16 +423,45 @@ describe('DataRootMigrationCoordinator', () => {
 
   test('Given 活锁或确认死亡的陈旧锁 When 创建计划 Then 分别拒绝或恢复', async () => {
     const active = createHarness({ isPidRunning: () => true })
-    writeFileSync(active.lockPath, JSON.stringify({ version: 1, pid: 42, createdAt: 1 }))
+    writeFileSync(active.lockPath, JSON.stringify({ version: 1, pid: 42, createdAt: 1, ownerToken: 'active-owner' }))
     await expect(active.coordinator.createPlan(targetRoot)).rejects.toMatchObject({ code: 'MIGRATION_LOCKED' })
 
     rmSync(active.lockPath)
     const stale = createHarness({ isPidRunning: () => false })
-    writeFileSync(stale.lockPath, JSON.stringify({ version: 1, pid: 42, createdAt: 1 }))
+    writeFileSync(stale.lockPath, JSON.stringify({ version: 1, pid: 42, createdAt: 1, ownerToken: 'stale-owner' }))
     await stale.coordinator.createPlan(targetRoot)
     expect(existsSync(stale.lockPath)).toBe(true)
     await stale.coordinator.cancel()
     expect(existsSync(stale.lockPath)).toBe(false)
+  })
+
+  test('Given 另一个 contender 持有 recovery mutex When 接管陈旧锁 Then 不删除主锁', async () => {
+    const harness = createHarness({ isPidRunning: (pid) => pid === process.pid })
+    const staleLock = { version: 1, pid: 42, createdAt: 1, ownerToken: 'stale-owner' }
+    const recoveryLock = { version: 1, pid: process.pid, createdAt: 2, ownerToken: 'recovery-owner' }
+    writeFileSync(harness.lockPath, JSON.stringify(staleLock))
+    writeFileSync(`${harness.lockPath}.recover`, JSON.stringify(recoveryLock))
+
+    await expect(harness.coordinator.createPlan(targetRoot)).rejects.toMatchObject({ code: 'MIGRATION_LOCKED' })
+
+    expect(JSON.parse(readFileSync(harness.lockPath, 'utf-8'))).toEqual(staleLock)
+    expect(JSON.parse(readFileSync(`${harness.lockPath}.recover`, 'utf-8'))).toEqual(recoveryLock)
+  })
+
+  test('Given 当前 owner 锁在运行中被替换 When 释放 Then 不删除其他 owner 的锁', async () => {
+    const harness = createHarness({
+      copyDirectory: async () => {
+        writeFileSync(harness.lockPath, JSON.stringify({
+          version: 1, pid: 99, createdAt: 2, ownerToken: 'replacement-owner',
+        }))
+        throw new Error('copy failed')
+      },
+    })
+    await harness.coordinator.createPlan(targetRoot)
+
+    await expect(harness.coordinator.runPending()).rejects.toBeInstanceOf(DataRootMigrationError)
+
+    expect(JSON.parse(readFileSync(harness.lockPath, 'utf-8'))).toMatchObject({ ownerToken: 'replacement-owner' })
   })
 
   test('Given 高频文件进度 When 运行 Then 对外单调且 locator 写入被节流', async () => {
@@ -324,6 +490,9 @@ describe('DataRootMigrationCoordinator', () => {
     await harness.coordinator.runPending((progress) => events.push(progress))
 
     expect(events.every((event, index) => index === 0 || event.completedBytes >= events[index - 1]!.completedBytes)).toBe(true)
+    expect(events.map((event) => event.stage)).toEqual([
+      'copying', 'copying', 'copying', 'copying', 'copying', 'verifying', 'rebasing', 'switching',
+    ])
     expect(progressWrites).toBeLessThan(4)
   })
 
@@ -355,11 +524,28 @@ describe('DataRootMigrationCoordinator', () => {
 
     await expect(harness.coordinator.runPending()).rejects.toMatchObject({ code: 'LOCATOR_WRITE_FAILED' })
     expect(harness.locator.requireActiveRoot()).toBe(sourceRoot)
-    expect(harness.locator.inspect().locatorFile?.migration?.stage).toBe('switching')
+    expect(harness.locator.inspect().locatorFile?.migration).toMatchObject({
+      stage: 'switching',
+      error: '切换数据根失败',
+    })
 
     await harness.coordinator.resumePending()
     expect(harness.locator.requireActiveRoot()).toBe(targetRoot)
     expect(commitAttempts).toBe(2)
+  })
+
+  test('Given switching 目标或 sidecar 异常 When resume Then 拒绝盲切且活动根保持 source', async () => {
+    const harness = createHarness({ inspectCopyOwnership: async () => 'absent' })
+    mkdirSync(targetRoot)
+    harness.locator.write({ version: 1, activeRoot: sourceRoot, migration: createRecord('switching', 16, 16) })
+
+    await expect(harness.coordinator.resumePending()).rejects.toBeInstanceOf(DataRootMigrationError)
+
+    expect(harness.locator.requireActiveRoot()).toBe(sourceRoot)
+    expect(harness.locator.inspect().locatorFile?.migration).toMatchObject({
+      stage: 'switching',
+      error: '目标副本不属于当前迁移',
+    })
   })
 
   test('Given 节流窗口内文件已提交后复制失败 When 保存 failed Then 立即落盘最后 completedBytes', async () => {
@@ -440,6 +626,7 @@ describe('DataRootMigrationCoordinator', () => {
         finalizeCalls.push(input)
         await finalizeOverride?.(input)
       },
+      inspectCopyOwnership: overrides.inspectCopyOwnership ?? (async () => 'owned'),
       progressPersistIntervalMs: overrides.progressPersistIntervalMs ?? 250,
     }
     return {

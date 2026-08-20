@@ -1,11 +1,11 @@
 import { accessSync, constants, existsSync, mkdirSync, statSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
+import { isDataRootLocatorFile } from '@proma/shared'
 import type {
   DataRootLocatorFile,
   DataRootMigrationProgress,
   DataRootMigrationRecord,
   DataRootMigrationStage,
-  DataRootPostCommitCleanupRecord,
   PathManagementState,
 } from '@proma/shared'
 import { readJsonFileSafe, writeJsonFileAtomic } from './safe-file'
@@ -40,16 +40,6 @@ export interface DataRootMigrationUpdate {
   updatedAt: number
   error?: string
 }
-
-/** 支持的迁移阶段集合，用于运行时严格校验 JSON。 */
-const DATA_ROOT_MIGRATION_STAGES: ReadonlySet<DataRootMigrationStage> = new Set([
-  'pending',
-  'copying',
-  'verifying',
-  'rebasing',
-  'switching',
-  'failed',
-])
 
 /**
  * 管理固定 `~/.proma-location.json`，让开发版与正式版解析同一个业务数据根。
@@ -393,39 +383,6 @@ function toMigrationProgress(record: DataRootMigrationRecord): DataRootMigration
   }
 }
 
-/**
- * 严格校验固定定位文件的版本、绝对路径和迁移字段。
- *
- * @param value 从 JSON 恢复链读取的未知数据。
- * @returns 数据符合 v1 定位合同的类型判断结果。
- */
-function isDataRootLocatorFile(value: unknown): value is DataRootLocatorFile {
-  if (!isRecord(value) || value.version !== 1 || !isAbsolutePath(value.activeRoot)) {
-    return false
-  }
-  if (value.previousRoot !== undefined && !isAbsolutePath(value.previousRoot)) {
-    return false
-  }
-  if (value.postCommitCleanup !== undefined) {
-    if (!isDataRootPostCommitCleanupRecord(value.postCommitCleanup)) return false
-    if (value.postCommitCleanup.targetRoot !== value.activeRoot) return false
-    if (value.migration !== undefined) return false
-  }
-  if (value.migration !== undefined) {
-    if (!isDataRootMigrationRecord(value.migration) || value.migration.sourceRoot !== value.activeRoot) {
-      return false
-    }
-  }
-  return true
-}
-
-/** 校验 commit 后清理记录与活动目标根的绑定。 */
-function isDataRootPostCommitCleanupRecord(value: unknown): value is DataRootPostCommitCleanupRecord {
-  return isRecord(value)
-    && isNonEmptyString(value.migrationId)
-    && isAbsolutePath(value.targetRoot)
-}
-
 /** 迁移主路径只允许向前推进，failed 仅允许回到 copying 重试。 */
 function isAllowedMigrationTransition(
   current: DataRootMigrationStage,
@@ -436,69 +393,4 @@ function isAllowedMigrationTransition(
   if (current === 'failed') return next === 'copying'
   const order: DataRootMigrationStage[] = ['pending', 'copying', 'verifying', 'rebasing', 'switching']
   return order.indexOf(next) === order.indexOf(current) + 1
-}
-
-/**
- * 严格校验可恢复迁移记录。
- *
- * @param value 待校验的未知迁移数据。
- * @returns 数据符合迁移记录合同的类型判断结果。
- */
-function isDataRootMigrationRecord(value: unknown): value is DataRootMigrationRecord {
-  if (!isRecord(value)) {
-    return false
-  }
-
-  return isNonEmptyString(value.id)
-    && isAbsolutePath(value.sourceRoot)
-    && isAbsolutePath(value.targetRoot)
-    && typeof value.stage === 'string'
-    && DATA_ROOT_MIGRATION_STAGES.has(value.stage as DataRootMigrationStage)
-    && isNonNegativeFiniteNumber(value.completedBytes)
-    && isNonNegativeFiniteNumber(value.totalBytes)
-    && value.completedBytes <= value.totalBytes
-    && isNonNegativeFiniteNumber(value.startedAt)
-    && isNonNegativeFiniteNumber(value.updatedAt)
-    && value.updatedAt >= value.startedAt
-    && (value.error === undefined || typeof value.error === 'string')
-}
-
-/**
- * 判断未知值是否为可安全按键访问的对象。
- *
- * @param value 待判断值。
- * @returns 非空且非数组对象时返回 true。
- */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-/**
- * 判断未知值是否为非空字符串。
- *
- * @param value 待判断值。
- * @returns 去除首尾空白后仍有内容时返回 true。
- */
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0
-}
-
-/**
- * 判断未知值是否为绝对路径。
- *
- * @param value 待判断值。
- * @returns 非空绝对路径时返回 true。
- */
-function isAbsolutePath(value: unknown): value is string {
-  return isNonEmptyString(value) && isAbsolute(value)
-}
-
-/**
- * 判断未知值是否为有限非负数。
- *
- * @param value 待判断值。
- * @returns 有限且不小于零时返回 true。
- */
-function isNonNegativeFiniteNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }

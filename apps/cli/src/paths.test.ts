@@ -181,3 +181,18 @@ test('Given 首个有效候选指向离线根 When 后续备份可用 Then 报�
 
   expect(() => resolveConfigDir({}, { homeDir, env: {} })).toThrow('数据根不可用')
 })
+
+test('Given 主 locator cleanup 与 activeRoot 不匹配 When bak 有效 Then CLI 使用 shared validator 恢复', () => {
+  const homeDir = mkdtempSync(join(tmpdir(), 'proma-cli-cleanup-validator-'))
+  const activeRoot = join(homeDir, 'Proma Data')
+  temporaryHomes.push(homeDir)
+  mkdirSync(activeRoot)
+  writeFileSync(join(homeDir, '.proma-location.json'), JSON.stringify({
+    version: 1,
+    activeRoot,
+    postCommitCleanup: { migrationId: 'migration-1', targetRoot: join(homeDir, 'different-root') },
+  }))
+  writeFileSync(join(homeDir, '.proma-location.json.bak'), JSON.stringify({ version: 1, activeRoot }))
+
+  expect(resolveConfigDir({}, { homeDir, env: {} })).toBe(activeRoot)
+})
