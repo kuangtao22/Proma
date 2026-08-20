@@ -1,6 +1,6 @@
-import { accessSync, constants, statSync } from 'node:fs'
+import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { isAbsolute, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import type {
   DataRootMigrationProgress,
@@ -121,8 +121,13 @@ export function registerPathManagementIpcHandlers(
   const locator = options.homeDir === undefined
     ? getDefaultDataRootLocator()
     : new DataRootLocator({ homeDir: options.homeDir })
-  /** 当前模式共用的迁移协调器。 */
-  const coordinator = options.coordinator ?? getDefaultCoordinator(locator)
+  /** 当前模式按需创建的迁移协调器；recovery 全程不得触碰。 */
+  let coordinator: PathManagementCoordinator | null = null
+  /** 仅 normal/migration handler 调用，避免 recovery 注册阶段自动重试 cleanup。 */
+  const getCoordinator = (): PathManagementCoordinator => {
+    if (coordinator === null) coordinator = options.coordinator ?? getDefaultCoordinator(locator)
+    return coordinator
+  }
   /** 本次实际注册的通道，防止迁移模式意外暴露业务 IPC。 */
   const registeredChannels: string[] = []
   /** 注册前先移除同名 handler，兼容 Electron 开发热重载。 */
@@ -148,7 +153,7 @@ export function registerPathManagementIpcHandlers(
   }).inspect()
 
   register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, () => (
-    options.mode === 'data-root-recovery' ? inspectFresh().state : coordinator.getStatus()
+    options.mode === 'data-root-recovery' ? inspectFresh().state : getCoordinator().getStatus()
   ))
   register(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, async () => {
     if (!options.dialog) throw new Error('当前环境不支持选择数据根目录')
@@ -156,7 +161,16 @@ export function registerPathManagementIpcHandlers(
     const result = await options.dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
     return result.canceled ? null : result.filePaths[0] ?? null
   })
-  register(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, () => coordinator.getStatus().migration)
+  register(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, () => {
+    /** recovery 直接读取 locator，其他模式复用协调器的 cleanup 重试结果。 */
+    const state = options.mode === 'data-root-recovery'
+      ? inspectFresh().state
+      : getCoordinator().getStatus()
+    return {
+      migration: state.migration,
+      ...(state.postCommitCleanup === undefined ? {} : { postCommitCleanup: state.postCommitCleanup }),
+    }
+  })
 
   if (options.mode === 'normal') {
     register(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, async (_event, targetRoot) => {
@@ -167,12 +181,12 @@ export function registerPathManagementIpcHandlers(
       try {
         // 取得 intent 后二次预检，排除 intent 竞争窗口内进入的实例与任务。
         assertMigrationCanStart(options)
-        await coordinator.createPlan(targetRoot)
+        await getCoordinator().createPlan(targetRoot)
         try {
           // createPlan 的磁盘预检会让出事件循环；落盘后复检并撤销期间新出现的任务。
           assertMigrationCanStart(options)
         } catch (error) {
-          await coordinator.cancel()
+          await getCoordinator().cancel()
           throw error
         }
         // Promise continuation 在处理下一个 IPC 前执行，计划写入后不再开放新的任务事件循环。
@@ -184,11 +198,11 @@ export function registerPathManagementIpcHandlers(
     })
   } else if (options.mode === 'data-root-migration') {
     register(PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION, async () => {
-      await coordinator.resumePending(broadcastProgress)
+      await getCoordinator().resumePending(broadcastProgress)
       relaunchNow()
     })
     register(PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_DATA_ROOT_MIGRATION, async () => {
-      await coordinator.cancel()
+      await getCoordinator().cancel()
       relaunchNow()
     })
   }
@@ -202,7 +216,7 @@ export function registerPathManagementIpcHandlers(
     /** 优先使用新鲜 recovery 状态，普通模式复用协调器状态。 */
     const activeRoot = options.mode === 'data-root-recovery'
       ? inspectFresh().state.activeRoot
-      : coordinator.getStatus().activeRoot
+      : getCoordinator().getStatus().activeRoot
     if (activeRoot === null) throw new Error('当前没有可打开的数据根目录')
     /** Electron openPath 成功时返回空字符串，失败时返回错误摘要。 */
     const error = await options.shell.openPath(activeRoot)
@@ -229,12 +243,16 @@ function assertMigrationCanStart(options: RegisterPathManagementIpcOptions): voi
 function recoverDataRoot(input: unknown, homeDir: string, current: DataRootLocatorResult): void {
   if (!isRecoverDataRootInput(input)) throw new Error('数据根恢复请求无效')
   if (input.action === 'recheck') return
+  if (current.state.postCommitCleanup !== undefined) {
+    throw new Error('迁移已提交但仍待清理，请恢复当前目标盘后重新检测；此时不能重新定位或切回旧根')
+  }
   /** 恢复写入必须基于当前磁盘 locator，而不是启动缓存。 */
   const locator = new DataRootLocator({ homeDir })
   /** 用户重新定位或切回的候选根目录。 */
   const candidateRoot = input.action === 'relocate' ? input.selectedRoot : current.state.previousRoot
   if (!candidateRoot) throw new Error(input.action === 'relocate' ? '请选择新的数据根目录' : '没有可切回的旧数据根')
   assertAvailableDirectory(candidateRoot)
+  assertPromaDataRoot(candidateRoot)
   /** 当前离线根保留为 previousRoot，便于用户在设备恢复后再次定位。 */
   const unavailableRoot = current.state.activeRoot
   locator.write({
@@ -269,4 +287,84 @@ function assertAvailableDirectory(root: string): void {
     if (error instanceof Error && error.message === '数据根必须是目录') throw error
     throw new Error('所选数据根当前不可读写', { cause: error })
   }
+}
+
+/** Proma 数据根 marker 文件名；新格式可用固定 schema 明确证明目录所有权。 */
+const PROMA_DATA_ROOT_MARKER = '.proma-data-root.json'
+
+/** 历史 settings 至少命中一个稳定 Proma 键，拒绝仅同名的普通项目配置。 */
+const PROMA_SETTINGS_KEYS: ReadonlySet<string> = new Set([
+  'theme',
+  'themeMode',
+  'themeStyle',
+  'interfaceVariant',
+  'onboardingCompleted',
+  'environmentCheckSkipped',
+  'notificationsEnabled',
+  'agentChannelId',
+  'agentModelId',
+  'builtinMcpDisabledIds',
+])
+
+/** 兼容尚未写入 marker 的旧数据根，只接受有稳定结构的 Proma-owned 文件。 */
+const LEGACY_PROMA_JSON_FILES: ReadonlyArray<{
+  name: string
+  validate: (value: unknown) => boolean
+}> = [
+  { name: 'settings.json', validate: isPromaSettings },
+  { name: 'channels.json', validate: (value) => isJsonRecord(value) && Array.isArray(value.channels) },
+  { name: 'agent-workspaces.json', validate: (value) => isJsonRecord(value) && Array.isArray(value.workspaces) },
+  { name: 'automations.json', validate: (value) => isJsonRecord(value) && Array.isArray(value.automations) },
+]
+
+/** 验证候选目录确实属于 Proma，防止把空目录或普通目录切成活动数据根。 */
+function assertPromaDataRoot(root: string): void {
+  /** 显式 marker 优先，且必须满足精确 owner/version 合同。 */
+  const markerPath = join(root, PROMA_DATA_ROOT_MARKER)
+  if (existsSync(markerPath)) {
+    const marker = readJson(markerPath)
+    if (
+      isJsonRecord(marker)
+      && Object.keys(marker).length === 2
+      && marker.owner === 'proma'
+      && marker.version === 1
+    ) return
+    throw new Error('所选目录的 Proma 数据根标记无效')
+  }
+
+  for (const candidate of LEGACY_PROMA_JSON_FILES) {
+    /** 单个合法旧配置足以兼容精简数据根，损坏文件不会被当作身份证明。 */
+    const path = join(root, candidate.name)
+    if (existsSync(path) && candidate.validate(readJson(path))) return
+  }
+
+  /** SQLite 文件至少检查稳定 header，避免同名普通文件被误接受。 */
+  const planningPath = join(root, 'planning.db')
+  if (existsSync(planningPath)) {
+    try {
+      if (readFileSync(planningPath).subarray(0, 16).toString('utf8') === 'SQLite format 3\u0000') return
+    } catch {
+      // 统一落入不可识别错误，避免向 renderer 暴露底层路径细节。
+    }
+  }
+  throw new Error('所选目录不是可识别的 Proma 数据根')
+}
+
+/** 安全解析候选根内的 JSON；语法或读取失败统一返回 null。 */
+function readJson(path: string): unknown {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')) as unknown
+  } catch {
+    return null
+  }
+}
+
+/** 判断解析结果为非数组 JSON 对象。 */
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** 判断旧 settings 文件至少包含一个 Proma 稳定字段。 */
+function isPromaSettings(value: unknown): boolean {
+  return isJsonRecord(value) && Object.keys(value).some((key) => PROMA_SETTINGS_KEYS.has(key))
 }

@@ -76,6 +76,15 @@ export function createDataRootMigrationViewState(
   }
 }
 
+/** 用户确认后才执行切回旧数据根，取消时保持 locator 不变。 */
+export async function confirmRestorePreviousDataRoot(
+  confirm: () => boolean,
+  restore: () => Promise<void>,
+): Promise<void> {
+  if (!confirm()) return
+  await restore()
+}
+
 /** 数据根迁移与离线恢复使用的轻量 renderer。 */
 export function DataRootMigrationApp(): React.JSX.Element {
   /** URL 中由主进程写入的隔离启动模式。 */
@@ -93,7 +102,7 @@ export function DataRootMigrationApp(): React.JSX.Element {
 
   /** 从唯一的路径 IPC 刷新公开状态。 */
   const refreshState = useCallback(async (): Promise<void> => {
-    const nextState = await window.electronAPI.getPathManagementState()
+    const nextState = await window.pathManagementAPI.getPathManagementState()
     setState(nextState)
   }, [])
 
@@ -104,7 +113,7 @@ export function DataRootMigrationApp(): React.JSX.Element {
       if (mounted) setActionError(toErrorMessage(error))
     })
     /** 迁移进度直接合并到当前状态，避免高频全量查询。 */
-    const unsubscribe = window.electronAPI.onDataRootMigrationProgress((migration) => {
+    const unsubscribe = window.pathManagementAPI.onDataRootMigrationProgress((migration) => {
       if (mounted) setState((current) => current === null ? current : { ...current, migration })
     })
     /** recovery renderer 直接跟随系统明暗，不读取业务 settings。 */
@@ -184,40 +193,43 @@ export function DataRootMigrationApp(): React.JSX.Element {
         {view.kind === 'recovery' ? (
           <div className="flex flex-wrap gap-3">
             <Button disabled={isBusy} onClick={() => void runAction(async () => {
-              await window.electronAPI.recoverDataRoot({ action: 'recheck' })
+              await window.pathManagementAPI.recoverDataRoot({ action: 'recheck' })
             })}>
               <RefreshCw aria-hidden="true" />重新检测
             </Button>
             <Button variant="outline" disabled={isBusy} onClick={() => void runAction(async () => {
               /** 系统选择器返回的已授权候选目录。 */
-              const selectedRoot = await window.electronAPI.pickDataRoot()
+              const selectedRoot = await window.pathManagementAPI.pickDataRoot()
               if (selectedRoot === null) return
-              await window.electronAPI.recoverDataRoot({ action: 'relocate', selectedRoot })
+              await window.pathManagementAPI.recoverDataRoot({ action: 'relocate', selectedRoot })
             })}>
               <FolderOpen aria-hidden="true" />重新定位
             </Button>
             <Button variant="outline" disabled={isBusy || !view.canRestorePrevious} onClick={() => void runAction(async () => {
-              await window.electronAPI.recoverDataRoot({ action: 'restore-previous' })
+              await confirmRestorePreviousDataRoot(
+                () => window.confirm('切回旧备份后，当前离线数据根将保留为可恢复位置。是否继续？'),
+                () => window.pathManagementAPI.recoverDataRoot({ action: 'restore-previous' }),
+              )
             })}>
               <RotateCcw aria-hidden="true" />切回旧备份
             </Button>
-            <Button variant="ghost" disabled={isBusy} onClick={() => void window.electronAPI.exitDataRootManagement()}>
+            <Button variant="ghost" disabled={isBusy} onClick={() => void window.pathManagementAPI.exitDataRootManagement()}>
               <X aria-hidden="true" />退出
             </Button>
           </div>
         ) : (
           <div className="flex flex-wrap gap-3">
             {view.kind === 'migration' ? (
-              <Button disabled={isBusy} onClick={() => void runAction(() => window.electronAPI.resumeDataRootMigration())}>
+              <Button disabled={isBusy} onClick={() => void runAction(() => window.pathManagementAPI.resumeDataRootMigration())}>
                 <RefreshCw aria-hidden="true" />继续迁移
               </Button>
             ) : null}
             {state.migration !== null && ['pending', 'copying', 'failed'].includes(state.migration.stage) ? (
-              <Button variant="outline" disabled={isBusy} onClick={() => void runAction(() => window.electronAPI.cancelDataRootMigration())}>
+              <Button variant="outline" disabled={isBusy} onClick={() => void runAction(() => window.pathManagementAPI.cancelDataRootMigration())}>
                 取消迁移
               </Button>
             ) : null}
-            <Button variant="ghost" disabled={isBusy} onClick={() => void window.electronAPI.exitDataRootManagement()}>
+            <Button variant="ghost" disabled={isBusy} onClick={() => void window.pathManagementAPI.exitDataRootManagement()}>
               <X aria-hidden="true" />退出
             </Button>
           </div>

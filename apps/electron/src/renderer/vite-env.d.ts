@@ -48,4 +48,6 @@ interface Window {
   __pendingAgentFileData?: Map<string, string>
   /** 仅在 ?perf=1 或 proma-performance-debug=1 时安装的性能诊断接口。 */
   __promaPerformance?: PromaPerformanceDiagnostics
+  /** 仅路径迁移/恢复窗口由专用 preload 暴露。 */
+  pathManagementAPI: import('../preload/path-management-preload').PathManagementPreloadApi
 }

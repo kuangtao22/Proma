@@ -34,6 +34,12 @@ export interface DataRootPostCommitCleanupProgress {
   error?: string
 }
 
+/** 迁移与提交后清理的完整状态，避免 cleanup-only 被误判为无任务。 */
+export interface DataRootMigrationStatus {
+  migration: DataRootMigrationProgress | null
+  postCommitCleanup?: DataRootPostCommitCleanupProgress
+}
+
 /** 数据根不可用时允许用户选择的恢复动作。 */
 export type DataRootRecoveryAction = 'recheck' | 'relocate' | 'restore-previous'
 

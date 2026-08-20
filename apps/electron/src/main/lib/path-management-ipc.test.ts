@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -83,6 +83,66 @@ describe('数据根启动模式', () => {
 })
 
 describe('路径管理 IPC', () => {
+  test('Given 仅存在提交后清理 When 查询迁移状态 Then 返回 cleanup 而不是 null', () => {
+    /** 保存注册的 invoke handler。 */
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    /** 仅包含提交后清理的完整路径状态。 */
+    const cleanupState = createLocatorResult({
+      state: {
+        activeRoot: '/data/proma-new',
+        previousRoot: '/data/proma-old',
+        availability: 'available',
+        deviceType: 'unknown',
+        migration: null,
+        postCommitCleanup: {
+          migrationId: 'migration-1',
+          targetRoot: '/data/proma-new',
+          status: 'failed',
+          error: '清理 sidecar 失败',
+        },
+      },
+    }).state
+
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getAllWindows: () => [],
+      coordinator: {
+        getStatus: () => cleanupState,
+        createPlan: async () => { throw new Error('不应执行') },
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+    })
+
+    const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS)
+    if (!handler) throw new Error('未注册迁移状态通道')
+    expect(handler({})).toEqual({
+      migration: null,
+      postCommitCleanup: cleanupState.postCommitCleanup,
+    })
+  })
+
+  test('Given recovery 模式 When 注册 IPC Then 不读取或构造迁移协调器', () => {
+    /** 通过 getter 证明 recovery 注册链没有触碰协调器依赖。 */
+    const options = {
+      mode: 'data-root-recovery' as const,
+      ipc: { handle: () => undefined, removeHandler: () => undefined },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getAllWindows: () => [],
+      get coordinator(): never {
+        throw new Error('recovery 不得构造迁移协调器')
+      },
+    }
+
+    expect(() => registerPathManagementIpcHandlers(options)).not.toThrow()
+  })
+
   test('Given 迁移模式 When 注册 IPC Then 只暴露路径恢复合同', () => {
     /** 记录主进程注册的全部通道。 */
     const registeredChannels: string[] = []
@@ -278,6 +338,7 @@ describe('路径管理 IPC', () => {
     /** 用户重新找到的可用数据根。 */
     const relocatedRoot = join(homeDir, 'relocated-root')
     mkdirSync(relocatedRoot)
+    writeFileSync(join(relocatedRoot, 'settings.json'), '{"themeMode":"dark"}')
     new DataRootLocator({ homeDir }).write({ version: 1, activeRoot: offlineRoot })
     /** 保存注册的 recovery handler。 */
     const handlers = new Map<string, (...args: unknown[]) => unknown>()
@@ -317,6 +378,7 @@ describe('路径管理 IPC', () => {
     /** 已重新在线的旧备份根。 */
     const previousRoot = join(homeDir, 'previous-root')
     mkdirSync(previousRoot)
+    writeFileSync(join(previousRoot, 'settings.json'), '{"themeMode":"dark"}')
     new DataRootLocator({ homeDir }).write({
       version: 1,
       activeRoot: offlineRoot,
@@ -343,6 +405,90 @@ describe('路径管理 IPC', () => {
     expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({
       activeRoot: previousRoot,
       previousRoot: offlineRoot,
+    })
+  })
+
+  test('Given 候选为空目录或普通目录 When 重新定位 Then 拒绝且 locator 不变', async () => {
+    /** 隔离 locator 与候选目录的测试 home。 */
+    const homeDir = await mkdtemp(join(tmpdir(), 'proma-path-invalid-root-'))
+    /** 当前离线根必须在失败后保持不变。 */
+    const offlineRoot = join(homeDir, 'offline-root')
+    /** 两种不能证明为 Proma 数据根的候选目录。 */
+    const emptyRoot = join(homeDir, 'empty-root')
+    const ordinaryRoot = join(homeDir, 'ordinary-root')
+    mkdirSync(emptyRoot)
+    mkdirSync(ordinaryRoot)
+    writeFileSync(join(ordinaryRoot, 'notes.txt'), 'ordinary')
+    writeFileSync(join(ordinaryRoot, 'settings.json'), '{"project":"ordinary"}')
+    new DataRootLocator({ homeDir }).write({ version: 1, activeRoot: offlineRoot })
+    /** 保存注册的 recovery handler。 */
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+
+    registerPathManagementIpcHandlers({
+      mode: 'data-root-recovery',
+      homeDir,
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getAllWindows: () => [],
+    })
+
+    const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
+    if (!handler) throw new Error('未注册数据根恢复通道')
+    expect(() => handler({}, { action: 'relocate', selectedRoot: emptyRoot }))
+      .toThrow('所选目录不是可识别的 Proma 数据根')
+    expect(() => handler({}, { action: 'relocate', selectedRoot: ordinaryRoot }))
+      .toThrow('所选目录不是可识别的 Proma 数据根')
+    expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({ activeRoot: offlineRoot })
+  })
+
+  test('Given cleanup 尚未解决 When 重新定位或切回旧根 Then 阻断且保留完整 locator', async () => {
+    /** 隔离 locator 与候选目录的测试 home。 */
+    const homeDir = await mkdtemp(join(tmpdir(), 'proma-path-cleanup-block-'))
+    /** cleanup 指向的当前目标盘离线。 */
+    const activeRoot = join(homeDir, 'offline-active-root')
+    /** 可识别的新位置与旧根都不能覆盖 cleanup 意图。 */
+    const relocatedRoot = join(homeDir, 'relocated-root')
+    const previousRoot = join(homeDir, 'previous-root')
+    mkdirSync(relocatedRoot)
+    mkdirSync(previousRoot)
+    writeFileSync(join(relocatedRoot, 'settings.json'), '{"themeMode":"dark"}')
+    writeFileSync(join(previousRoot, 'settings.json'), '{"themeMode":"dark"}')
+    /** cleanup 状态用于证明恢复动作不会静默丢弃提交后清理。 */
+    const cleanup = {
+      migrationId: 'migration-1',
+      targetRoot: activeRoot,
+      error: '目标盘离线',
+    }
+    const locator = new DataRootLocator({ homeDir })
+    locator.write({ version: 1, activeRoot, previousRoot, postCommitCleanup: cleanup })
+    /** 保存注册的 recovery handler。 */
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+
+    registerPathManagementIpcHandlers({
+      mode: 'data-root-recovery',
+      homeDir,
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getAllWindows: () => [],
+    })
+
+    const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
+    if (!handler) throw new Error('未注册数据根恢复通道')
+    expect(() => handler({}, { action: 'relocate', selectedRoot: relocatedRoot }))
+      .toThrow('迁移已提交但仍待清理')
+    expect(() => handler({}, { action: 'restore-previous' }))
+      .toThrow('迁移已提交但仍待清理')
+    expect(locator.inspect().locatorFile).toEqual({
+      version: 1,
+      activeRoot,
+      previousRoot,
+      postCommitCleanup: cleanup,
     })
   })
 })

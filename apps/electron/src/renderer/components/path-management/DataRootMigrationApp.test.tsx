@@ -3,6 +3,7 @@ import type { PathManagementState } from '@proma/shared'
 import {
   createDataRootMigrationViewState,
   DATA_ROOT_RECOVERY_ACTIONS,
+  confirmRestorePreviousDataRoot,
 } from './DataRootMigrationApp'
 
 /** 创建恢复页测试使用的最小路径状态。 */
@@ -74,5 +75,25 @@ describe('DataRootMigrationApp', () => {
 
     expect(view.kind).toBe('cleanup')
     expect(view.error).toBe('清理 sidecar 失败')
+  })
+
+  test('Given 用户切回旧根 When 尚未确认 Then 不调用恢复 API', async () => {
+    /** 记录是否错误执行不可逆的 locator 切换。 */
+    let recovered = false
+    await confirmRestorePreviousDataRoot(
+      () => false,
+      async () => { recovered = true },
+    )
+    expect(recovered).toBe(false)
+  })
+
+  test('Given 用户切回旧根 When 明确确认 Then 调用一次恢复 API', async () => {
+    /** 记录确认后恢复 API 的调用次数。 */
+    let recoverCount = 0
+    await confirmRestorePreviousDataRoot(
+      () => true,
+      async () => { recoverCount += 1 },
+    )
+    expect(recoverCount).toBe(1)
   })
 })

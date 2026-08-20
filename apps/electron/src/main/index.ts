@@ -47,11 +47,7 @@ function registerProtocolsAndHandlers(): void {
 
   // Windows 等平台通过 second-instance 唤起已有主窗口。
   app.on('second-instance', (_event, argv) => {
-    if (hasOpenPlanningArgument(argv)) {
-      showPlanningWindow()
-      return
-    }
-    showAndFocusMainWindow()
+    dataRootStartupRouter.handleSecondInstance(argv)
   })
 }
 
@@ -142,12 +138,20 @@ import {
   type DataRootInstanceLeaseRegistry,
 } from './lib/data-root-instance-lease'
 import type { DataRootStartupMode } from '@proma/shared'
+import { createDataRootStartupRouter } from './lib/data-root-startup-routing'
 import { TRAY_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS } from '../types'
 
 /** normal 模式成功取得的共享数据根实例 lease；非 normal 始终为 null。 */
 let dataRootInstanceLease: DataRootInstanceLeaseRegistry | null = null
 /** 启动门失败后禁止顶层兜底误启普通业务窗口。 */
 let dataRootBusinessStartupBlocked = false
+/** second-instance 必须等待 bootstrap 明确允许的窗口边界。 */
+const dataRootStartupRouter = createDataRootStartupRouter({
+  hasOpenPlanningArgument,
+  showPlanningWindow,
+  showMainWindow: showAndFocusMainWindow,
+  showPathManagementWindow: showAndFocusDataRootManagementWindow,
+})
 
 /** macOS 26+ 使用 Swift/AppKit NSPanel；其他平台不创建 Agent Island surface。 */
 function startAgentIslandSurface(): void {
@@ -669,7 +673,7 @@ function createDataRootManagementWindow(mode: Exclude<DataRootStartupMode, 'norm
     show: false,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#09090b' : '#ffffff',
     webPreferences: {
-      preload: join(__dirname, 'preload.cjs'),
+      preload: join(__dirname, 'path-management-preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -691,6 +695,20 @@ function createDataRootManagementWindow(mode: Exclude<DataRootStartupMode, 'norm
   } else {
     void window.loadURL(`http://127.0.0.1:5174?window=data-root-migration&mode=${mode}`)
   }
+}
+
+/** 创建或聚焦隔离路径窗口，供 bootstrap 与 second-instance 共用。 */
+function showAndFocusDataRootManagementWindow(
+  mode: Exclude<DataRootStartupMode, 'normal'>,
+): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createDataRootManagementWindow(mode)
+    return
+  }
+  ensureWindowOnScreen(mainWindow)
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
 }
 
 function sendToMainWindow(channel: string, data?: unknown): void {
@@ -734,7 +752,8 @@ async function bootstrap(): Promise<void> {
       shell,
       getAllWindows: () => BrowserWindow.getAllWindows(),
     })
-    createDataRootManagementWindow(dataRootMode)
+    dataRootStartupRouter.resolveMode(dataRootMode)
+    showAndFocusDataRootManagementWindow(dataRootMode)
     return
   }
 
@@ -803,6 +822,7 @@ async function bootstrap(): Promise<void> {
       showPlanningWindow,
     })
   })
+  dataRootStartupRouter.resolveMode('normal')
   if (hasOpenPlanningArgument(process.argv)) showPlanningWindow()
 
   // Create system tray icon
@@ -976,6 +996,7 @@ function handleBootstrapFailure(err: unknown): void {
   try {
     registerIpcHandlers()
     createWindow()
+    dataRootStartupRouter.resolveMode('normal')
   } catch (fallbackErr) {
     console.error('[启动] 降级窗口创建也失败:', fallbackErr)
   }
