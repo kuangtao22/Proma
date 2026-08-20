@@ -137,6 +137,7 @@ import {
   getDefaultDataRootInstanceLeaseRegistry,
   type DataRootInstanceLeaseRegistry,
 } from './lib/data-root-instance-lease'
+import { prepareNormalDataRoot } from './lib/data-root-marker'
 import type { DataRootStartupMode } from '@proma/shared'
 import { createDataRootStartupRouter } from './lib/data-root-startup-routing'
 import { TRAY_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS } from '../types'
@@ -738,7 +739,9 @@ app.whenReady().then(bootstrap).catch(handleBootstrapFailure)
  */
 async function bootstrap(): Promise<void> {
   /** 首次且无副作用检查固定 locator，决定是否允许普通业务初始化。 */
-  const locatorResult = getDefaultDataRootLocator().inspect()
+  const dataRootLocator = getDefaultDataRootLocator()
+  /** bootstrap 复用同一 locator 的首次无副作用检查结果。 */
+  const locatorResult = dataRootLocator.inspect()
   /** 数据根启动隔离模式。 */
   const dataRootMode = resolveDataRootStartupMode(locatorResult)
   if (dataRootMode !== 'normal') {
@@ -757,10 +760,10 @@ async function bootstrap(): Promise<void> {
     return
   }
 
-  /** normal 模式必须在任何普通服务前注册共享 lease。 */
-  const activeRoot = locatorResult.state.activeRoot
-  if (activeRoot === null) throw new Error('normal 模式缺少活动数据根')
+  /** marker 初始化与共享 lease 都必须早于任何普通业务服务。 */
+  let activeRoot: string
   try {
+    activeRoot = prepareNormalDataRoot(dataRootLocator, locatorResult)
     dataRootInstanceLease = getDefaultDataRootInstanceLeaseRegistry()
     dataRootInstanceLease.acquire(activeRoot)
   } catch (error) {

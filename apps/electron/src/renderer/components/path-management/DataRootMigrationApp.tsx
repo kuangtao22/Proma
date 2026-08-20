@@ -51,20 +51,21 @@ export function createDataRootMigrationViewState(
       canRestorePrevious: state.previousRoot !== undefined,
     }
   }
+  if (mode === 'data-root-recovery' || state.availability !== 'available') {
+    return {
+      kind: 'recovery',
+      stageLabel: '数据根当前不可用',
+      percent: 0,
+      ...(state.postCommitCleanup?.error === undefined ? {} : { error: state.postCommitCleanup.error }),
+      canRestorePrevious: state.previousRoot !== undefined,
+    }
+  }
   if (state.postCommitCleanup !== undefined) {
     return {
       kind: 'cleanup',
       stageLabel: state.postCommitCleanup.status === 'pending' ? '正在清理迁移断点' : '迁移完成，清理需要重试',
       percent: 100,
       ...(state.postCommitCleanup.error === undefined ? {} : { error: state.postCommitCleanup.error }),
-      canRestorePrevious: state.previousRoot !== undefined,
-    }
-  }
-  if (mode === 'data-root-recovery' || state.availability !== 'available') {
-    return {
-      kind: 'recovery',
-      stageLabel: '数据根当前不可用',
-      percent: 0,
       canRestorePrevious: state.previousRoot !== undefined,
     }
   }

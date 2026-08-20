@@ -77,6 +77,22 @@ describe('DataRootMigrationApp', () => {
     expect(view.error).toBe('清理 sidecar 失败')
   })
 
+  test('Given recovery 模式且 cleanup 未解决 When 生成视图 Then 保留重新检测入口并展示 cleanup 错误', () => {
+    const view = createDataRootMigrationViewState(createState({
+      availability: 'unavailable',
+      postCommitCleanup: {
+        migrationId: 'migration-1',
+        targetRoot: '/data/proma',
+        status: 'failed',
+        error: '目标盘离线，清理尚未完成',
+      },
+    }), 'data-root-recovery')
+
+    expect(view.kind).toBe('recovery')
+    expect(view.error).toBe('目标盘离线，清理尚未完成')
+    expect(DATA_ROOT_RECOVERY_ACTIONS.some(({ action }) => action === 'recheck')).toBe(true)
+  })
+
   test('Given 用户切回旧根 When 尚未确认 Then 不调用恢复 API', async () => {
     /** 记录是否错误执行不可逆的 locator 切换。 */
     let recovered = false

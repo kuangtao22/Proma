@@ -1,11 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { DataRootLocator } from './data-root-locator'
 import type { DataRootLocatorResult } from './data-root-locator'
+import { PROMA_DATA_ROOT_MARKER_FILE } from './data-root-marker'
 import {
   registerPathManagementIpcHandlers,
   resolveDataRootStartupMode,
@@ -367,6 +368,9 @@ describe('路径管理 IPC', () => {
       activeRoot: relocatedRoot,
       previousRoot: offlineRoot,
     })
+    expect(JSON.parse(
+      readFileSync(join(relocatedRoot, PROMA_DATA_ROOT_MARKER_FILE), 'utf8'),
+    )).toEqual({ owner: 'proma', version: 1 })
     expect(calls).toEqual(['relaunch', 'quit'])
   })
 
@@ -406,6 +410,9 @@ describe('路径管理 IPC', () => {
       activeRoot: previousRoot,
       previousRoot: offlineRoot,
     })
+    expect(JSON.parse(
+      readFileSync(join(previousRoot, PROMA_DATA_ROOT_MARKER_FILE), 'utf8'),
+    )).toEqual({ owner: 'proma', version: 1 })
   })
 
   test('Given 候选为空目录或普通目录 When 重新定位 Then 拒绝且 locator 不变', async () => {

@@ -1,6 +1,6 @@
-import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs'
+import { accessSync, constants, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+import { isAbsolute, resolve } from 'node:path'
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import type {
   DataRootMigrationProgress,
@@ -12,6 +12,7 @@ import { DataRootLocator } from './data-root-locator'
 import type { DataRootLocatorResult } from './data-root-locator'
 import { DataRootMigrationCoordinator } from './data-root-migration'
 import type { DataRootMigrationGuard } from './data-root-instance-lease'
+import { ensurePromaDataRootMarker } from './data-root-marker'
 
 /** 路径 IPC handler 接收 Electron event 和经过 preload 约束的参数。 */
 type PathManagementHandler = (event: unknown, ...args: unknown[]) => unknown
@@ -252,7 +253,7 @@ function recoverDataRoot(input: unknown, homeDir: string, current: DataRootLocat
   const candidateRoot = input.action === 'relocate' ? input.selectedRoot : current.state.previousRoot
   if (!candidateRoot) throw new Error(input.action === 'relocate' ? '请选择新的数据根目录' : '没有可切回的旧数据根')
   assertAvailableDirectory(candidateRoot)
-  assertPromaDataRoot(candidateRoot)
+  ensurePromaDataRootMarker(candidateRoot)
   /** 当前离线根保留为 previousRoot，便于用户在设备恢复后再次定位。 */
   const unavailableRoot = current.state.activeRoot
   locator.write({
@@ -287,84 +288,4 @@ function assertAvailableDirectory(root: string): void {
     if (error instanceof Error && error.message === '数据根必须是目录') throw error
     throw new Error('所选数据根当前不可读写', { cause: error })
   }
-}
-
-/** Proma 数据根 marker 文件名；新格式可用固定 schema 明确证明目录所有权。 */
-const PROMA_DATA_ROOT_MARKER = '.proma-data-root.json'
-
-/** 历史 settings 至少命中一个稳定 Proma 键，拒绝仅同名的普通项目配置。 */
-const PROMA_SETTINGS_KEYS: ReadonlySet<string> = new Set([
-  'theme',
-  'themeMode',
-  'themeStyle',
-  'interfaceVariant',
-  'onboardingCompleted',
-  'environmentCheckSkipped',
-  'notificationsEnabled',
-  'agentChannelId',
-  'agentModelId',
-  'builtinMcpDisabledIds',
-])
-
-/** 兼容尚未写入 marker 的旧数据根，只接受有稳定结构的 Proma-owned 文件。 */
-const LEGACY_PROMA_JSON_FILES: ReadonlyArray<{
-  name: string
-  validate: (value: unknown) => boolean
-}> = [
-  { name: 'settings.json', validate: isPromaSettings },
-  { name: 'channels.json', validate: (value) => isJsonRecord(value) && Array.isArray(value.channels) },
-  { name: 'agent-workspaces.json', validate: (value) => isJsonRecord(value) && Array.isArray(value.workspaces) },
-  { name: 'automations.json', validate: (value) => isJsonRecord(value) && Array.isArray(value.automations) },
-]
-
-/** 验证候选目录确实属于 Proma，防止把空目录或普通目录切成活动数据根。 */
-function assertPromaDataRoot(root: string): void {
-  /** 显式 marker 优先，且必须满足精确 owner/version 合同。 */
-  const markerPath = join(root, PROMA_DATA_ROOT_MARKER)
-  if (existsSync(markerPath)) {
-    const marker = readJson(markerPath)
-    if (
-      isJsonRecord(marker)
-      && Object.keys(marker).length === 2
-      && marker.owner === 'proma'
-      && marker.version === 1
-    ) return
-    throw new Error('所选目录的 Proma 数据根标记无效')
-  }
-
-  for (const candidate of LEGACY_PROMA_JSON_FILES) {
-    /** 单个合法旧配置足以兼容精简数据根，损坏文件不会被当作身份证明。 */
-    const path = join(root, candidate.name)
-    if (existsSync(path) && candidate.validate(readJson(path))) return
-  }
-
-  /** SQLite 文件至少检查稳定 header，避免同名普通文件被误接受。 */
-  const planningPath = join(root, 'planning.db')
-  if (existsSync(planningPath)) {
-    try {
-      if (readFileSync(planningPath).subarray(0, 16).toString('utf8') === 'SQLite format 3\u0000') return
-    } catch {
-      // 统一落入不可识别错误，避免向 renderer 暴露底层路径细节。
-    }
-  }
-  throw new Error('所选目录不是可识别的 Proma 数据根')
-}
-
-/** 安全解析候选根内的 JSON；语法或读取失败统一返回 null。 */
-function readJson(path: string): unknown {
-  try {
-    return JSON.parse(readFileSync(path, 'utf8')) as unknown
-  } catch {
-    return null
-  }
-}
-
-/** 判断解析结果为非数组 JSON 对象。 */
-function isJsonRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-/** 判断旧 settings 文件至少包含一个 Proma 稳定字段。 */
-function isPromaSettings(value: unknown): boolean {
-  return isJsonRecord(value) && Object.keys(value).some((key) => PROMA_SETTINGS_KEYS.has(key))
 }

@@ -15,6 +15,10 @@ import { join, resolve } from 'node:path'
 import type { DataRootMigrationProgress } from '@proma/shared'
 import { DataRootLocator } from './data-root-locator'
 import {
+  PROMA_DATA_ROOT_MARKER_FILE,
+  ensurePromaDataRootMarker,
+} from './data-root-marker'
+import {
   DataRootMigrationCoordinator,
   DataRootMigrationError,
   type DataRootMigrationCoordinatorOptions,
@@ -148,6 +152,7 @@ describe('DataRootMigrationCoordinator', () => {
       note: `保留普通文本 ${sourceRoot}`,
     }))
     const locator = new DataRootLocator({ homeDir })
+    ensurePromaDataRootMarker(sourceRoot)
     const coordinator = new DataRootMigrationCoordinator({
       locator,
       lockPath: join(homeDir, '.real-migration.lock'),
@@ -160,6 +165,9 @@ describe('DataRootMigrationCoordinator', () => {
     await coordinator.runPending((progress) => progressEvents.push(progress))
 
     expect(readFileSync(join(targetRoot, 'settings.json'), 'utf-8')).toBe('{"theme":"dark"}')
+    expect(JSON.parse(
+      readFileSync(join(targetRoot, PROMA_DATA_ROOT_MARKER_FILE), 'utf8'),
+    )).toEqual({ owner: 'proma', version: 1 })
     const sessions = JSON.parse(readFileSync(join(targetRoot, 'agent-sessions.json'), 'utf-8')) as {
       sessions: Array<{ piSessionFile: string; attachedDirectories: string[] }>
     }
