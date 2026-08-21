@@ -78,7 +78,12 @@ import { claimWorkspaceMemoryRefreshOpportunity } from './agent-memory-refresh-s
 import { browserController } from './browser-controller'
 import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
-import { runAgentLifecycle } from './agent-run-lifecycle'
+import {
+  consumeStoppedGeneration,
+  isLatestRunGeneration,
+  markStoppedGeneration,
+  runAgentLifecycle,
+} from './agent-run-lifecycle'
 
 /** Agent 入口使用会话元数据解析权威工作区，并共享进程级迁移锁。 */
 const workspaceOperationGuard = createWorkspaceOperationGuard({
@@ -246,7 +251,9 @@ export class AgentOrchestrator {
   private pendingUserSkillActivations = new Map<string, Map<string, SkillActivation[]>>()
 
   /** 被用户手动中止的运行代际（在 stop 中标记，在对应运行的终态路径消费）。 */
-  private stoppedBySessions = new Map<string, number>()
+  private stoppedBySessions = new Map<string, Set<number>>()
+  /** 每个会话最新启动的运行代际；完成后保留，用于拒绝迟到旧 run 写 session-wide 状态。 */
+  private latestRunGenerations = new Map<string, number>()
   /** 队列启动投影已显示、但运行槽尚未占用时的停止请求。 */
   private stoppedBeforeRunSessions = new Set<string>()
 
@@ -265,9 +272,7 @@ export class AgentOrchestrator {
    * 因此停止标记必须在所有终态路径统一消费，而不能只依赖 catch 块。
    */
   private consumeStoppedByUser(sessionId: string, runGeneration: number): boolean {
-    if (this.stoppedBySessions.get(sessionId) !== runGeneration) return false
-    this.stoppedBySessions.delete(sessionId)
-    return true
+    return consumeStoppedGeneration(this.stoppedBySessions, sessionId, runGeneration)
   }
 
   /**
@@ -740,6 +745,7 @@ export class AgentOrchestrator {
     }
     runGeneration = ++this.nextRunGeneration
     this.activeSessions.set(sessionId, runGeneration)
+    this.latestRunGenerations.set(sessionId, runGeneration)
 
     await runAgentLifecycle({
       isCurrent: () => this.activeSessions.get(sessionId) === runGeneration,
@@ -1957,7 +1963,9 @@ export class AgentOrchestrator {
           // 15. 持久化 assistant 消息
           this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
 
-          try { updateAgentSessionMeta(sessionId, wasStoppedByUser ? { stoppedByUser: true } : {}) } catch { /* 忽略 */ }
+          if (isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) {
+            try { updateAgentSessionMeta(sessionId, wasStoppedByUser ? { stoppedByUser: true } : {}) } catch { /* 忽略 */ }
+          }
 
           if (!wasStoppedByUser && visibleRunMessageCount === 0) {
             const errorContent = this.persistEmptyResponseError(sessionId, capturedResultSubtype, capturedResultErrors)
@@ -1987,7 +1995,9 @@ export class AgentOrchestrator {
           if (this.activeSessions.get(sessionId) !== runGeneration) {
             const wasStoppedByUser = this.consumeStoppedByUser(sessionId, runGeneration)
             this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
-            try { updateAgentSessionMeta(sessionId, { stoppedByUser: wasStoppedByUser }) } catch { /* 会话可能已删除 */ }
+            if (isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) {
+              try { updateAgentSessionMeta(sessionId, { stoppedByUser: wasStoppedByUser }) } catch { /* 会话可能已删除 */ }
+            }
             completeRun(getAgentSessionMessages(sessionId), { stoppedByUser: wasStoppedByUser, startedAt: streamStartedAt })
             return
           }
@@ -2164,7 +2174,7 @@ export class AgentOrchestrator {
     this.sessionPermissionModes.delete(sessionId)
     browserController.cancelSession(sessionId)
     if (runGeneration != null) {
-      this.stoppedBySessions.set(sessionId, runGeneration)
+      markStoppedGeneration(this.stoppedBySessions, sessionId, runGeneration)
     } else if (stopBeforeRun) {
       // 队列启动状态已投影给 renderer 后，run 仍可能卡在预检阶段。
       // 记录这次停止，防止预检完成后错误地创建一个无法终止的新 query。
@@ -2275,6 +2285,8 @@ export class AgentOrchestrator {
     this.adapter.dispose()
     this.activeSessions.clear()
     this.sessionPermissionModes.clear()
+    this.stoppedBySessions.clear()
+    this.latestRunGenerations.clear()
     this.stoppedBeforeRunSessions.clear()
     this.queuedMessageUuids.clear()
     this.pendingUserSkillActivations.clear()

@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test'
-import { runAgentLifecycle } from './agent-run-lifecycle'
+import {
+  consumeStoppedGeneration,
+  isLatestRunGeneration,
+  markStoppedGeneration,
+  runAgentLifecycle,
+} from './agent-run-lifecycle'
 import { createWorkspaceOperationRegistry } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 
@@ -103,5 +108,29 @@ describe('Agent 运行生命周期', () => {
     await expect(running).rejects.toThrow('项目正在迁移，请等待完成后重试')
     expect(adapterStarts).toBe(0)
     expect(activeGeneration).toBeUndefined()
+  })
+
+  test('Given 同会话连续停止两个 generation When 分别消费 Then 两个停止标记互不覆盖', () => {
+    /** 同一会话可同时保留多个尚未收尾的停止代际。 */
+    const stoppedGenerations = new Map<string, Set<number>>()
+    markStoppedGeneration(stoppedGenerations, 'session-1', 1)
+    markStoppedGeneration(stoppedGenerations, 'session-1', 2)
+
+    expect(consumeStoppedGeneration(stoppedGenerations, 'session-1', 1)).toBe(true)
+    expect(stoppedGenerations.get('session-1')).toEqual(new Set([2]))
+    expect(consumeStoppedGeneration(stoppedGenerations, 'session-1', 2)).toBe(true)
+    expect(stoppedGenerations.has('session-1')).toBe(false)
+  })
+
+  test('Given generation2 已启动 When generation1 在其运行中或完成后迟到 Then generation1 始终无权写 session meta', () => {
+    /** 最新代际记录在 generation2 完成释放 active 后仍保留。 */
+    const latestGenerations = new Map([['session-1', 2]])
+    /** 模拟 generation2 尚在运行的 active 槽。 */
+    const activeGenerations = new Map([['session-1', 2]])
+    expect(isLatestRunGeneration(latestGenerations, 'session-1', 1)).toBe(false)
+    activeGenerations.delete('session-1')
+    expect(activeGenerations.has('session-1')).toBe(false)
+    expect(isLatestRunGeneration(latestGenerations, 'session-1', 1)).toBe(false)
+    expect(isLatestRunGeneration(latestGenerations, 'session-1', 2)).toBe(true)
   })
 })

@@ -182,4 +182,26 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(canClearPending(undefined, 1)).toBe(true)
     expect(canClearPending(1, 1)).toBe(true)
   })
+
+  test('Given 多代际停止与迟到收尾 When 检查生产接入 Then 独立消费 marker 且仅 latest generation 写 meta', () => {
+    /** 读取真实编排源码，约束 generation 状态不退化为 session 单值或 active 判定。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** sendMessage 函数体。 */
+    const sendStart = source.indexOf('  async sendMessage(')
+    const sendEnd = source.indexOf('\n  /**\n   * 中止指定会话', sendStart)
+    const sendBody = source.slice(sendStart, sendEnd)
+    /** stopAll 函数体。 */
+    const stopAllStart = source.indexOf('  stopAll(): void {')
+    const stopAllEnd = source.indexOf('\n  // ===== 队列消息管理 =====', stopAllStart)
+    const stopAllBody = source.slice(stopAllStart, stopAllEnd)
+
+    expect(source).toContain('private stoppedBySessions = new Map<string, Set<number>>()')
+    expect(source).toContain('private latestRunGenerations = new Map<string, number>()')
+    expect(sendBody).toContain('this.latestRunGenerations.set(sessionId, runGeneration)')
+    expect(sendBody.match(/isLatestRunGeneration\(this\.latestRunGenerations, sessionId, runGeneration\)/g)?.length).toBe(2)
+    expect(source).toContain('markStoppedGeneration(this.stoppedBySessions, sessionId, runGeneration)')
+    expect(source).toContain('consumeStoppedGeneration(this.stoppedBySessions, sessionId, runGeneration)')
+    expect(stopAllBody).toContain('this.stoppedBySessions.clear()')
+    expect(stopAllBody).toContain('this.latestRunGenerations.clear()')
+  })
 })
