@@ -6,7 +6,19 @@ import * as storageModule from './data-root-migration'
 
 /** RED 阶段期望的存储检查模块合同。 */
 interface ExpectedStorageModule {
-  scanDataRootBytes: (rootPath: string) => Promise<number>
+  scanDataRootBytes: (rootPath: string, options?: {
+    signal?: AbortSignal
+    concurrency?: number
+    maxEntries?: number
+    timeoutMs?: number
+    now?: () => number
+    readDirectory?: (path: string) => AsyncIterable<{ name: string }>
+    lstat?: (path: string) => Promise<{
+      size: bigint
+      isDirectory: () => boolean
+      isFile: () => boolean
+    }>
+  }) => Promise<number>
   toSafeByteCount: (value: bigint) => number
   classifyMacDiskInfo: (xml: string) => 'local' | 'removable' | 'network' | 'unknown'
   classifyWindowsDriveType: (driveType: number) => 'local' | 'removable' | 'network' | 'unknown'
@@ -25,20 +37,24 @@ interface ExpectedStorageModule {
     readFile: (path: string) => Promise<string>
     realpath: (path: string) => Promise<string>
   }) => Promise<string | null>
-  DataRootStorageInspector: new (options: {
+  DataRootStorageInspector: new (options?: {
     now: () => number
     cacheTtlMs: number
-    inspectFresh: (rootPath: string) => Promise<{
-      occupiedBytes: number
-      availableBytes: number
-      deviceType: 'local' | 'removable' | 'network' | 'unknown'
-    }>
+    inspectOccupiedFresh: (rootPath: string, options: { signal: AbortSignal }) => Promise<number>
   }) => {
-    inspect: (rootPath: string) => Promise<{
-      occupiedBytes: number
-      availableBytes: number
-      deviceType: 'local' | 'removable' | 'network' | 'unknown'
+    inspectOccupied: (rootPath: string, signal?: AbortSignal) => Promise<{
+      occupiedBytes?: number
+      occupiedStatus: 'ready' | 'unavailable'
+      storageIssue?: {
+        code: 'SCAN_FAILED' | 'SCAN_LIMIT_EXCEEDED' | 'SCAN_TIMEOUT' | 'SCAN_CANCELLED'
+        message: string
+      }
     }>
+    getCachedOccupied: (rootPath: string) => {
+      occupiedBytes?: number
+      occupiedStatus: 'ready' | 'unavailable'
+      storageIssue?: { code: string; message: string }
+    } | undefined
     invalidate: (rootPath?: string) => void
   }
 }
@@ -76,7 +92,7 @@ describe('数据根存储检查', () => {
     expect(await scanDataRootBytes(dataRoot)).toBe(10)
   })
 
-  test('Given 并发读取与短缓存 When 检查同一路径 Then 单飞复用并可显式失效', async () => {
+  test('Given 并发读取与会话缓存 When 检查同一路径 Then 单飞复用并可显式失效', async () => {
     const { DataRootStorageInspector } = getExpectedStorageModule()
     expect(typeof DataRootStorageInspector).toBe('function')
     /** 可控时钟，验证 TTL 前后行为。 */
@@ -84,63 +100,179 @@ describe('数据根存储检查', () => {
     /** 记录真实检查次数。 */
     let inspections = 0
     /** 测试使用的固定快照。 */
-    const snapshot = { occupiedBytes: 10, availableBytes: 100, deviceType: 'local' as const }
     const inspector = new DataRootStorageInspector({
       now: () => now,
       cacheTtlMs: 500,
-      inspectFresh: async () => {
+      inspectOccupiedFresh: async () => {
         inspections += 1
         await Promise.resolve()
-        return snapshot
+        return 10
       },
     })
 
-    const [first, second] = await Promise.all([inspector.inspect('/data/proma'), inspector.inspect('/data/proma')])
-    expect(first).toEqual(snapshot)
-    expect(second).toEqual(snapshot)
+    const [first, second] = await Promise.all([
+      inspector.inspectOccupied('/data/proma'),
+      inspector.inspectOccupied('/data/proma'),
+    ])
+    expect(first).toEqual({ occupiedBytes: 10, occupiedStatus: 'ready' })
+    expect(second).toEqual(first)
     expect(inspections).toBe(1)
-    await inspector.inspect('/data/proma')
+    await inspector.inspectOccupied('/data/proma')
     expect(inspections).toBe(1)
     inspector.invalidate('/data/proma')
-    await inspector.inspect('/data/proma')
+    await inspector.inspectOccupied('/data/proma')
     expect(inspections).toBe(2)
     now += 501
-    await inspector.inspect('/data/proma')
+    await inspector.inspectOccupied('/data/proma')
     expect(inspections).toBe(3)
   })
 
   test('Given A 检查未完成 When invalidate 后启动 B Then A 不覆盖 B 缓存或删除 B 单飞', async () => {
     const { DataRootStorageInspector } = getExpectedStorageModule()
     /** 保存两代检查的外部 resolver，精确控制 A/B 完成顺序。 */
-    const resolvers: Array<(snapshot: { occupiedBytes: number; availableBytes: number; deviceType: 'local' }) => void> = []
+    const resolvers: Array<(occupiedBytes: number) => void> = []
     let inspections = 0
     const inspector = new DataRootStorageInspector({
       now: () => 1000,
       cacheTtlMs: 5000,
-      inspectFresh: async () => await new Promise((resolve) => {
+      inspectOccupiedFresh: async () => await new Promise((resolve) => {
         inspections += 1
         resolvers.push(resolve)
       }),
     })
 
-    const inspectionA = inspector.inspect('/data/proma')
+    const inspectionA = inspector.inspectOccupied('/data/proma')
     inspector.invalidate('/data/proma')
-    const inspectionB = inspector.inspect('/data/proma')
-    const inspectionBConcurrent = inspector.inspect('/data/proma')
+    const inspectionB = inspector.inspectOccupied('/data/proma')
+    const inspectionBConcurrent = inspector.inspectOccupied('/data/proma')
     expect(inspections).toBe(2)
-    resolvers[0]?.({ occupiedBytes: 1, availableBytes: 10, deviceType: 'local' })
+    resolvers[0]?.(1)
     expect(await inspectionA).toMatchObject({ occupiedBytes: 1 })
     /** A 的 finally 不得删除仍在运行的 B，因此第三次仍复用 B。 */
-    const inspectionBAfterA = inspector.inspect('/data/proma')
+    const inspectionBAfterA = inspector.inspectOccupied('/data/proma')
     expect(inspections).toBe(2)
-    resolvers[1]?.({ occupiedBytes: 2, availableBytes: 20, deviceType: 'local' })
+    resolvers[1]?.(2)
     expect(await Promise.all([inspectionB, inspectionBConcurrent, inspectionBAfterA])).toEqual([
-      { occupiedBytes: 2, availableBytes: 20, deviceType: 'local' },
-      { occupiedBytes: 2, availableBytes: 20, deviceType: 'local' },
-      { occupiedBytes: 2, availableBytes: 20, deviceType: 'local' },
+      { occupiedBytes: 2, occupiedStatus: 'ready' },
+      { occupiedBytes: 2, occupiedStatus: 'ready' },
+      { occupiedBytes: 2, occupiedStatus: 'ready' },
     ])
-    expect(await inspector.inspect('/data/proma')).toMatchObject({ occupiedBytes: 2 })
+    expect(await inspector.inspectOccupied('/data/proma')).toMatchObject({ occupiedBytes: 2 })
     expect(inspections).toBe(2)
+  })
+
+  test('Given 大目录慢 lstat When 扫描 Then 并发不超过八且累计全部文件', async () => {
+    const { scanDataRootBytes } = getExpectedStorageModule()
+    /** 模拟单层包含 24 个文件的大目录。 */
+    const entries = Array.from({ length: 24 }, (_, index) => ({ name: `file-${index}` }))
+    let active = 0
+    let maximumActive = 0
+    /** 保存每批 lstat resolver，精确观察并发上限。 */
+    const pendingResolvers: Array<() => void> = []
+    const scan = scanDataRootBytes('/data/proma', {
+      concurrency: 8,
+      readDirectory: async function* () { yield* entries },
+      lstat: async () => {
+        active += 1
+        maximumActive = Math.max(maximumActive, active)
+        await new Promise<void>((resolve) => { pendingResolvers.push(resolve) })
+        active -= 1
+        return { size: 1n, isDirectory: () => false, isFile: () => true }
+      },
+    })
+
+    for (let batch = 0; batch < 3; batch += 1) {
+      for (let spin = 0; spin < 20 && pendingResolvers.length < 8; spin += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve))
+      }
+      expect(active).toBe(8)
+      pendingResolvers.splice(0).forEach((resolve) => resolve())
+      await Promise.resolve()
+    }
+    expect(await scan).toBe(24)
+    expect(maximumActive).toBe(8)
+  })
+
+  test('Given 扫描进行中 When abort Then 不等待慢 lstat 且返回取消错误', async () => {
+    const { DataRootStorageInspector } = getExpectedStorageModule()
+    const controller = new AbortController()
+    const inspector = new DataRootStorageInspector({
+      now: Date.now,
+      cacheTtlMs: 60_000,
+      inspectOccupiedFresh: async (_rootPath, options) => await new Promise<number>((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+      }),
+    })
+
+    const inspection = inspector.inspectOccupied('/data/proma', controller.signal)
+    controller.abort()
+
+    expect(await inspection).toMatchObject({
+      occupiedStatus: 'unavailable',
+      storageIssue: { code: 'SCAN_CANCELLED' },
+    })
+    expect(inspector.getCachedOccupied('/data/proma')).toBeUndefined()
+  })
+
+  test('Given lstat 永不返回或文件数超限 When 扫描 Then 按耗时和条目预算返回明确 issue', async () => {
+    const { DataRootStorageInspector, scanDataRootBytes } = getExpectedStorageModule()
+    const timeoutInspector = new DataRootStorageInspector({
+      now: Date.now,
+      cacheTtlMs: 60_000,
+      inspectOccupiedFresh: async (_rootPath, options) => await scanDataRootBytes('/data/proma', {
+        signal: options.signal,
+        timeoutMs: 5,
+        readDirectory: async function* () { yield { name: 'slow' } },
+        lstat: async () => await new Promise(() => undefined),
+      }),
+    })
+    const timeoutController = new AbortController()
+    const timeoutResult = await Promise.race([
+      timeoutInspector.inspectOccupied('/data/proma', timeoutController.signal),
+      new Promise<'still-running'>((resolve) => setTimeout(() => resolve('still-running'), 30)),
+    ])
+    if (timeoutResult === 'still-running') timeoutController.abort()
+    expect(timeoutResult).toMatchObject({
+      occupiedStatus: 'unavailable',
+      storageIssue: { code: 'SCAN_TIMEOUT' },
+    })
+
+    const limitInspector = new DataRootStorageInspector({
+      now: Date.now,
+      cacheTtlMs: 60_000,
+      inspectOccupiedFresh: async (_rootPath, options) => await scanDataRootBytes('/data/proma', {
+        signal: options.signal,
+        maxEntries: 1,
+        readDirectory: async function* () { yield { name: 'first' }; yield { name: 'second' } },
+        lstat: async () => ({ size: 1n, isDirectory: () => false, isFile: () => true }),
+      }),
+    })
+    expect(await limitInspector.inspectOccupied('/data/proma')).toMatchObject({
+      occupiedStatus: 'unavailable',
+      storageIssue: { code: 'SCAN_LIMIT_EXCEEDED' },
+    })
+  })
+
+  test('Given 文件在 lstat 前消失或读取失败 When 扫描 Then ENOENT 跳过且其他错误形成 occupied issue', async () => {
+    const { DataRootStorageInspector, scanDataRootBytes } = getExpectedStorageModule()
+    const scanOptions = {
+      readDirectory: async function* () { yield { name: 'kept' }; yield { name: 'removed' } },
+      lstat: async (path: string) => {
+        if (path.endsWith('/removed')) throw Object.assign(new Error('gone'), { code: 'ENOENT' })
+        return { size: 7n, isDirectory: () => false, isFile: () => true }
+      },
+    }
+    expect(await scanDataRootBytes('/data/proma', scanOptions)).toBe(7)
+
+    const inspector = new DataRootStorageInspector({
+      now: Date.now,
+      cacheTtlMs: 60_000,
+      inspectOccupiedFresh: async () => { throw Object.assign(new Error('permission denied'), { code: 'EACCES' }) },
+    })
+    expect(await inspector.inspectOccupied('/data/proma')).toMatchObject({
+      occupiedStatus: 'unavailable',
+      storageIssue: { code: 'SCAN_FAILED' },
+    })
   })
 
   test('Given statfs 字节超过安全整数 When 转换 Then 饱和到 MAX_SAFE_INTEGER', () => {

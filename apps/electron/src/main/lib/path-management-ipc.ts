@@ -7,6 +7,7 @@ import type {
   DataRootMigrationPreview,
   DataRootMigrationProgress,
   DataRootMigrationSelectionInput,
+  DataRootOccupiedStorage,
   DataRootSelection,
   DataRootStartupMode,
   OpenDataRootTarget,
@@ -19,7 +20,8 @@ import { DataRootMigrationCoordinator } from './data-root-migration'
 import type { DataRootMigrationGuard } from './data-root-instance-lease'
 import { ensurePromaDataRootMarker } from './data-root-marker'
 import {
-  inspectDataRootStorage,
+  inspectDataRootOccupied,
+  inspectDataRootStorageFast,
   invalidateDataRootStorage,
 } from './data-root-storage'
 import type { DataRootStorageSnapshot } from './data-root-storage'
@@ -30,6 +32,7 @@ type PathManagementHandler = (event: unknown, ...args: unknown[]) => unknown
 /** 所有 invoke handler 通道；每次按 mode 注册前统一清除旧集合。 */
 const PATH_MANAGEMENT_HANDLER_CHANNELS: readonly string[] = [
   PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
+  PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_OCCUPIED_STORAGE,
   PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
   PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION,
   PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
@@ -126,8 +129,10 @@ export interface RegisterPathManagementIpcOptions {
   acquireMigrationGuard?: () => DataRootMigrationGuard | Promise<DataRootMigrationGuard>
   /** 测试可注入独立 home；生产固定使用系统 home。 */
   homeDir?: string
-  /** 注入数据根存储检查，测试可避免真实磁盘扫描。 */
-  inspectStorage?: (rootPath: string) => Promise<DataRootStorageSnapshot>
+  /** 注入快速卷检查，测试可避免真实 statfs 与设备查询。 */
+  inspectStorageFast?: (rootPath: string) => Promise<DataRootStorageSnapshot>
+  /** 注入独立占用扫描，测试可精确控制慢扫描。 */
+  inspectOccupiedStorage?: (rootPath: string) => Promise<DataRootOccupiedStorage>
   /** 注入服务端随机 selectionId，测试可稳定断言代次。 */
   createSelectionId?: () => string
 }
@@ -208,14 +213,18 @@ export function registerPathManagementIpcHandlers(
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, async () => {
       const state = getCoordinator().getStatus()
       if (state.activeRoot === null || state.availability !== 'available') return state
-      try {
-        const storage = await (options.inspectStorage ?? inspectDataRootStorage)(state.activeRoot)
-        return { ...state, ...storage }
-      } catch {
-        /** 设置页仍可操作；失败只降级实时容量和设备信息。 */
-        const { occupiedBytes: _occupiedBytes, availableBytes: _availableBytes, ...baseState } = state
-        return { ...baseState, deviceType: 'unknown' }
+      const storage = await (options.inspectStorageFast ?? inspectDataRootStorageFast)(state.activeRoot)
+      return { ...state, ...storage }
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_OCCUPIED_STORAGE, async () => {
+      const state = getCoordinator().getStatus()
+      if (state.activeRoot === null || state.availability !== 'available') {
+        return {
+          occupiedStatus: 'unavailable',
+          storageIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
+        } satisfies DataRootOccupiedStorage
       }
+      return await (options.inspectOccupiedStorage ?? inspectDataRootOccupied)(state.activeRoot)
     })
     register(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, async () => {
       if (!options.dialog) throw new Error('当前环境不支持选择数据根目录')

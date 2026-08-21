@@ -98,6 +98,19 @@ describe('DataRootMigrationCoordinator', () => {
     expect(harness.locator.inspect().locatorFile?.migration).toBeUndefined()
   })
 
+  test('Given 设置页已有新鲜 occupied When preview 后源文件变化并 start Then 预览复用缓存但计划完整复检', async () => {
+    const harness = createHarness({
+      getCachedSourceOccupied: () => ({ occupiedBytes: 8, occupiedStatus: 'ready' }),
+    } as Partial<DataRootMigrationCoordinatorOptions>)
+
+    const preview = await harness.coordinator.previewTarget(targetRoot)
+    writeFileSync(join(sourceRoot, 'settings.json'), '{"theme":"dark","expanded":true}')
+    const plan = await harness.coordinator.createPlan(targetRoot)
+
+    expect(preview.requiredBytes).toBe(8)
+    expect(plan.totalBytes).toBe(Buffer.byteLength('{"theme":"dark","expanded":true}'))
+  })
+
   test('Given 非空目标 When 只读 preview Then 返回 blocker 且不创建迁移计划', async () => {
     mkdirSync(targetRoot)
     writeFileSync(join(targetRoot, 'foreign.txt'), 'foreign')

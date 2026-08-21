@@ -63,6 +63,12 @@ interface ExpectedPathManagementSettingsModule {
     previewLoading: boolean
     isBusy: boolean
   }) => boolean
+  createPathManagementRequestGate: () => {
+    mount: () => void
+    begin: () => { generation: number; signal: AbortSignal }
+    isCurrent: (request: { generation: number; signal: AbortSignal }) => boolean
+    dispose: () => void
+  }
 }
 
 /** RED 阶段通过可选合同读取新增导出，避免模块不存在导致测试环境错误。 */
@@ -355,6 +361,44 @@ describe('PathManagementSettings', () => {
     expect(getDataRootDeviceRisk('network')).toContain('断连')
     expect(getDataRootDeviceRisk('removable')).toContain('性能')
     expect(getDataRootDeviceRisk('local')).toBeNull()
+  })
+
+  test('Given occupied 后台加载或失败 When 渲染位置区块 Then 首屏路径卷信息稳定且风险提示不丢失', () => {
+    const { DataRootLocationSection } = getExpectedModule()
+    const loadingHtml = renderToStaticMarkup(<DataRootLocationSection state={createState({
+      deviceType: 'network',
+      occupiedBytes: undefined,
+      occupiedStatus: 'loading',
+    })} />)
+    const unavailableHtml = renderToStaticMarkup(<DataRootLocationSection state={createState({
+      deviceType: 'network',
+      occupiedBytes: undefined,
+      occupiedStatus: 'unavailable',
+      storageIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
+    })} />)
+
+    expect(loadingHtml).toContain('正在计算')
+    expect(loadingHtml).toContain('/Users/example/.proma')
+    expect(unavailableHtml).toContain('占用空间暂不可用')
+    expect(unavailableHtml).toContain('断连')
+  })
+
+  test('Given 慢旧请求、进度新请求与卸载 When 请求门控 Then 旧结果和卸载后结果不可提交', () => {
+    const { createPathManagementRequestGate } = getExpectedModule()
+    expect(typeof createPathManagementRequestGate).toBe('function')
+    const gate = createPathManagementRequestGate()
+    const initialLoad = gate.begin()
+    const progressRefresh = gate.begin()
+
+    expect(initialLoad.signal.aborted).toBe(true)
+    expect(gate.isCurrent(initialLoad)).toBe(false)
+    expect(gate.isCurrent(progressRefresh)).toBe(true)
+    gate.dispose()
+    expect(progressRefresh.signal.aborted).toBe(true)
+    expect(gate.isCurrent(progressRefresh)).toBe(false)
+    gate.mount()
+    const strictModeRemount = gate.begin()
+    expect(gate.isCurrent(strictModeRemount)).toBe(true)
   })
 
   test('Given 当前与上次数据根 When 渲染位置区块 Then 完整路径可访问且没有删除旧目录入口', () => {

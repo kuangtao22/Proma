@@ -75,6 +75,7 @@ describe('路径管理 preload API', () => {
 
     expect(Object.keys(api).sort()).toEqual([
       'getDataRootMigrationStatus',
+      'getDataRootOccupiedStorage',
       'getPathManagementState',
       'onDataRootMigrationProgress',
       'openDataRoot',
@@ -84,6 +85,7 @@ describe('路径管理 preload API', () => {
     ])
 
     await invokeApi(api, 'getPathManagementState')
+    await invokeApi(api, 'getDataRootOccupiedStorage')
     await invokeApi(api, 'pickDataRoot')
     await invokeApi(api, 'previewDataRootMigration', selection)
     await invokeApi(api, 'startDataRootMigration', selection)
@@ -91,6 +93,7 @@ describe('路径管理 preload API', () => {
     await invokeApi(api, 'openDataRoot', 'previous')
     expect(recorded.invokes).toEqual([
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, args: [] },
+      { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_OCCUPIED_STORAGE, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, args: [] },
       { channel: 'path-management:preview-data-root-migration', args: [selection] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, args: [selection] },

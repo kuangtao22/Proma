@@ -191,6 +191,46 @@ export function isDataRootMigrationConfirmDisabled(input: {
   return input.isBusy || input.previewLoading || input.preview === null || input.preview.blockers.length > 0
 }
 
+/** 单个异步域只允许最新请求提交结果，并支持 StrictMode effect 重新挂载。 */
+export interface PathManagementRequestGate {
+  /** 激活新挂载周期并取消上一周期遗留请求。 */
+  mount(): void
+  /** 开始新请求并取消同域旧请求。 */
+  begin(): { generation: number; signal: AbortSignal }
+  /** 判断请求是否仍是已挂载页面的最新一代。 */
+  isCurrent(request: { generation: number; signal: AbortSignal }): boolean
+  /** 卸载页面并取消当前请求。 */
+  dispose(): void
+}
+
+/** 创建设置页异步请求代次门控。 */
+export function createPathManagementRequestGate(): PathManagementRequestGate {
+  let mounted = true
+  let generation = 0
+  let controller: AbortController | null = null
+  return {
+    mount: () => {
+      controller?.abort()
+      mounted = true
+      generation += 1
+      controller = null
+    },
+    begin: () => {
+      controller?.abort()
+      controller = new AbortController()
+      generation += 1
+      return { generation, signal: controller.signal }
+    },
+    isCurrent: (request) => mounted && request.generation === generation && !request.signal.aborted,
+    dispose: () => {
+      mounted = false
+      generation += 1
+      controller?.abort()
+      controller = null
+    },
+  }
+}
+
 /** 返回已知数据根设备类型对应的断连或性能提醒。 */
 export function getDataRootDeviceRisk(deviceType: PathManagementState['deviceType']): string | null {
   if (deviceType === 'network') return '网络数据位置断连时 Proma 将无法启动，访问性能也取决于网络质量。'
@@ -236,6 +276,12 @@ export function DataRootLocationSection({
 }: DataRootLocationSectionProps): React.ReactElement {
   /** 当前状态对应的图标与颜色。 */
   const statusAvailable = state.availability === 'available'
+  /** 占用扫描独立于卷信息，首屏和失败态使用明确文案。 */
+  const occupiedLabel = state.occupiedStatus === 'loading'
+    ? '正在计算...'
+    : state.occupiedStatus === 'unavailable'
+      ? (state.storageIssue?.message ?? '占用空间暂不可用')
+      : formatBytes(state.occupiedBytes)
   return (
     <SettingsSection
       title="Proma 数据位置"
@@ -269,7 +315,7 @@ export function DataRootLocationSection({
         >
           <div className="text-right text-xs text-muted-foreground">
             <div>{getAvailabilityLabel(state.availability)} · {getDeviceTypeLabel(state.deviceType)}</div>
-            <div className="mt-1 tabular-nums">已占用 {formatBytes(state.occupiedBytes)} · 可用 {formatBytes(state.availableBytes)}</div>
+            <div className="mt-1 tabular-nums">已占用 {occupiedLabel} · 可用 {formatBytes(state.availableBytes)}</div>
           </div>
         </SettingsRow>
         {state.previousRoot !== undefined ? (
@@ -382,91 +428,152 @@ export function PathManagementSettings(): React.ReactElement {
   const migrationFlowId = React.useRef(0)
   /** 防止进度事件并发查询相同迁移状态。 */
   const statusRefreshPending = React.useRef(false)
+  /** 状态、占用与用户动作分域门控，互不取消但各自只允许最新请求提交。 */
+  const stateRequestGate = React.useRef<PathManagementRequestGate | null>(null)
+  const occupiedRequestGate = React.useRef<PathManagementRequestGate | null>(null)
+  const actionRequestGate = React.useRef<PathManagementRequestGate | null>(null)
+  if (stateRequestGate.current === null) stateRequestGate.current = createPathManagementRequestGate()
+  if (occupiedRequestGate.current === null) occupiedRequestGate.current = createPathManagementRequestGate()
+  if (actionRequestGate.current === null) actionRequestGate.current = createPathManagementRequestGate()
+  /** 进度事件读取最新活动根，避免闭包持有旧首屏状态。 */
+  const activeRootRef = React.useRef<string | null>(null)
+
+  /** 后台刷新占用空间；失败只更新 occupied 字段，不覆盖卷信息。 */
+  const refreshOccupied = React.useCallback(async (activeRoot: string | null): Promise<void> => {
+    if (activeRoot === null || occupiedRequestGate.current === null) return
+    const request = occupiedRequestGate.current.begin()
+    try {
+      const occupied = await window.electronAPI.getDataRootOccupiedStorage()
+      if (!occupiedRequestGate.current.isCurrent(request)) return
+      setState((current) => current?.activeRoot === activeRoot ? { ...current, ...occupied } : current)
+    } catch {
+      if (!occupiedRequestGate.current.isCurrent(request)) return
+      setState((current) => current?.activeRoot === activeRoot ? {
+        ...current,
+        occupiedBytes: undefined,
+        occupiedStatus: 'unavailable',
+        storageIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
+      } : current)
+    }
+  }, [])
 
   /** 合并完整状态与独立迁移状态，确保 cleanup-only 不丢失。 */
   const loadState = React.useCallback(async (): Promise<void> => {
-    const [nextState, migrationStatus] = await Promise.all([
-      window.electronAPI.getPathManagementState(),
-      window.electronAPI.getDataRootMigrationStatus(),
-    ])
-    setState(mergePathManagementStatus(nextState, migrationStatus))
-    dispatchUi({ type: 'load-succeeded' })
-  }, [])
+    if (stateRequestGate.current === null) return
+    const request = stateRequestGate.current.begin()
+    try {
+      const [nextState, migrationStatus] = await Promise.all([
+        window.electronAPI.getPathManagementState(),
+        window.electronAPI.getDataRootMigrationStatus(),
+      ])
+      if (!stateRequestGate.current.isCurrent(request)) return
+      const mergedState = mergePathManagementStatus(nextState, migrationStatus)
+      activeRootRef.current = mergedState.activeRoot
+      setState(mergedState)
+      dispatchUi({ type: 'load-succeeded' })
+      void refreshOccupied(mergedState.activeRoot)
+    } catch (loadError) {
+      if (!stateRequestGate.current.isCurrent(request)) return
+      dispatchUi({ type: 'load-failed', message: toErrorMessage(loadError, '无法读取路径状态') })
+    }
+  }, [refreshOccupied])
 
   React.useEffect(() => {
-    /** 卸载后阻止异步回调写入页面。 */
-    let mounted = true
-    loadState().catch((loadError: unknown) => {
-      if (mounted) dispatchUi({ type: 'load-failed', message: toErrorMessage(loadError, '无法读取路径状态') })
-    })
+    stateRequestGate.current?.mount()
+    occupiedRequestGate.current?.mount()
+    actionRequestGate.current?.mount()
+    void loadState()
     /** 进度事件先更新轻量进度，再串行刷新完整状态。 */
     const unsubscribe = window.electronAPI.onDataRootMigrationProgress((migration) => {
-      if (!mounted) return
+      if (stateRequestGate.current === null) return
       setState((current) => current === null ? current : { ...current, migration })
+      void refreshOccupied(activeRootRef.current)
       if (statusRefreshPending.current) return
       statusRefreshPending.current = true
+      const request = stateRequestGate.current.begin()
       void window.electronAPI.getDataRootMigrationStatus().then((status) => {
-        if (!mounted) return
+        if (!stateRequestGate.current?.isCurrent(request)) return
         setState((current) => current === null ? current : mergePathManagementStatus(current, status))
       }).catch((statusError: unknown) => {
-        if (mounted) dispatchUi({ type: 'load-failed', message: toErrorMessage(statusError, '无法刷新迁移状态') })
+        if (stateRequestGate.current?.isCurrent(request)) {
+          dispatchUi({ type: 'load-failed', message: toErrorMessage(statusError, '无法刷新迁移状态') })
+        }
       }).finally(() => { statusRefreshPending.current = false })
     })
     return () => {
-      mounted = false
+      stateRequestGate.current?.dispose()
+      occupiedRequestGate.current?.dispose()
+      actionRequestGate.current?.dispose()
+      migrationFlowId.current += 1
       confirmationResolver.current?.(false)
       confirmationResolver.current = null
       unsubscribe()
     }
-  }, [loadState])
+  }, [loadState, refreshOccupied])
 
   /** 打开 locator 中的当前或上次数据根。 */
   const handleOpenRoot = async (target: OpenDataRootTarget): Promise<void> => {
+    if (actionRequestGate.current === null) return
+    const request = actionRequestGate.current.begin()
     setIsBusy(true)
     dispatchUi({ type: 'action-succeeded' })
     try {
       await window.electronAPI.openDataRoot(target)
     } catch (openError) {
+      if (!actionRequestGate.current.isCurrent(request)) return
       dispatchUi({
         type: 'action-failed',
         message: toErrorMessage(openError, target === 'previous' ? '无法打开上次路径' : '无法打开当前路径'),
       })
     } finally {
-      setIsBusy(false)
+      if (actionRequestGate.current.isCurrent(request)) setIsBusy(false)
     }
   }
 
   /** 打开选择器并等待可取消的确认对话框，再由主进程创建迁移计划。 */
   const handleMigration = async (): Promise<void> => {
-    if (state === null) return
+    if (state === null || actionRequestGate.current === null) return
+    const request = actionRequestGate.current.begin()
     /** 本次选择流程的稳定代次。 */
     const flowId = migrationFlowId.current + 1
     migrationFlowId.current = flowId
     setIsBusy(true)
     dispatchUi({ type: 'pick-started' })
+    /** 每个异步边界后统一检查组件、动作代次与迁移流程代次。 */
+    const isCurrentFlow = (): boolean => actionRequestGate.current?.isCurrent(request) === true
+      && migrationFlowId.current === flowId
     try {
       await requestDataRootMigration(state, {
-        pickDataRoot: window.electronAPI.pickDataRoot,
+        pickDataRoot: async () => {
+          const selection = await window.electronAPI.pickDataRoot()
+          return isCurrentFlow() ? selection : null
+        },
         previewDataRootMigration: async (selection) => {
+          if (!isCurrentFlow()) throw new Error('路径选择流程已取消')
           dispatchUi({ type: 'preview-started', targetRoot: selection.targetRoot })
           const preview = await window.electronAPI.previewDataRootMigration(selection)
-          if (migrationFlowId.current === flowId) dispatchUi({ type: 'preview-succeeded', preview })
+          if (isCurrentFlow()) dispatchUi({ type: 'preview-succeeded', preview })
           return preview
         },
         confirmMigration: async () => {
-          if (migrationFlowId.current !== flowId) return false
+          if (!isCurrentFlow()) return false
           setIsBusy(false)
           const confirmed = await new Promise<boolean>((resolve) => { confirmationResolver.current = resolve })
+          if (!isCurrentFlow()) return false
           if (confirmed) setIsBusy(true)
           return confirmed
         },
-        startDataRootMigration: window.electronAPI.startDataRootMigration,
+        startDataRootMigration: async (selection) => {
+          if (!isCurrentFlow()) throw new Error('路径选择流程已取消')
+          await window.electronAPI.startDataRootMigration(selection)
+        },
       })
     } catch (migrationError) {
+      if (!isCurrentFlow()) return
       dispatchUi({ type: 'migration-failed', message: toErrorMessage(migrationError, '无法创建迁移计划') })
-      await loadState().catch(() => undefined)
+      await loadState()
     } finally {
-      if (migrationFlowId.current === flowId) setIsBusy(false)
+      if (isCurrentFlow()) setIsBusy(false)
     }
   }
 

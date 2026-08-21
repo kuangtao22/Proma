@@ -4,6 +4,7 @@ import type {
   DataRootMigrationPreview,
   DataRootMigrationSelectionInput,
   DataRootMigrationStatus,
+  DataRootOccupiedStorage,
   DataRootSelection,
   OpenDataRootTarget,
   PathManagementState,
@@ -25,6 +26,8 @@ export interface PathManagementPreloadIpc {
 export interface NormalPathManagementPreloadApi {
   /** 获取当前路径管理状态。 */
   getPathManagementState: () => Promise<PathManagementState>
+  /** 独立刷新当前数据根占用空间，不阻塞首屏卷信息。 */
+  getDataRootOccupiedStorage: () => Promise<DataRootOccupiedStorage>
   /** 使用系统选择器选择迁移目标目录。 */
   pickDataRoot: () => Promise<DataRootSelection | null>
   /** 只读预检系统选择器刚返回的目标目录。 */
@@ -81,6 +84,9 @@ export function createNormalPathManagementPreloadApi(
 ): NormalPathManagementPreloadApi {
   return {
     getPathManagementState: () => invokePathManagementState(ipc),
+    getDataRootOccupiedStorage: () => ipc.invoke(
+      PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_OCCUPIED_STORAGE,
+    ) as Promise<DataRootOccupiedStorage>,
     pickDataRoot: () => invokePickDataRoot<DataRootSelection>(ipc),
     previewDataRootMigration: (input) => ipc.invoke(
       PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION,

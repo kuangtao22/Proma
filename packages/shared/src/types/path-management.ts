@@ -4,6 +4,25 @@ export type DataRootAvailability = 'available' | 'missing' | 'unavailable' | 'in
 /** 数据根所在存储设备的系统分类。 */
 export type DataRootDeviceType = 'local' | 'removable' | 'network' | 'unknown'
 
+/** 数据根占用空间扫描状态。 */
+export type DataRootOccupiedStatus = 'loading' | 'ready' | 'unavailable'
+
+/** 占用空间扫描可公开给界面的稳定错误分类。 */
+export type DataRootStorageIssueCode = 'SCAN_FAILED' | 'SCAN_LIMIT_EXCEEDED' | 'SCAN_TIMEOUT' | 'SCAN_CANCELLED'
+
+/** 占用空间扫描问题，不暴露底层文件路径或系统错误详情。 */
+export interface DataRootStorageIssue {
+  code: DataRootStorageIssueCode
+  message: string
+}
+
+/** 独立于卷容量查询的占用空间结果。 */
+export interface DataRootOccupiedStorage {
+  occupiedBytes?: number
+  occupiedStatus: Exclude<DataRootOccupiedStatus, 'loading'>
+  storageIssue?: DataRootStorageIssue
+}
+
 /** 可恢复迁移任务的执行阶段。 */
 export type DataRootMigrationStage = 'pending' | 'copying' | 'verifying' | 'rebasing' | 'switching' | 'failed'
 
@@ -24,6 +43,8 @@ export interface PathManagementState {
   availability: DataRootAvailability
   deviceType: DataRootDeviceType
   occupiedBytes?: number
+  occupiedStatus?: DataRootOccupiedStatus
+  storageIssue?: DataRootStorageIssue
   availableBytes?: number
   migration: DataRootMigrationProgress | null
   postCommitCleanup?: DataRootPostCommitCleanupProgress
@@ -194,6 +215,7 @@ function isNonNegativeFiniteNumber(value: unknown): value is number {
 /** 路径管理四层 IPC 合同使用的稳定通道名。 */
 export const PATH_MANAGEMENT_IPC_CHANNELS = {
   GET_STATE: 'path-management:get-state',
+  GET_DATA_ROOT_OCCUPIED_STORAGE: 'path-management:get-data-root-occupied-storage',
   PICK_DATA_ROOT: 'path-management:pick-data-root',
   PREVIEW_DATA_ROOT_MIGRATION: 'path-management:preview-data-root-migration',
   START_DATA_ROOT_MIGRATION: 'path-management:start-data-root-migration',

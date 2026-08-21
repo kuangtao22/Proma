@@ -119,7 +119,7 @@ describe('数据根目录打开', () => {
     registerPathManagementIpcHandlers({
       mode: 'normal',
       ipc: {
-        handle: (channel, handler) => { handlers.set(channel, handler) },
+        handle: (channel: string, handler: (...args: unknown[]) => unknown) => { handlers.set(channel, handler) },
         removeHandler: () => undefined,
       },
       app: { relaunch: () => undefined, quit: () => undefined },
@@ -208,6 +208,7 @@ describe('路径管理 IPC', () => {
     const modeChannels = new Map([
       ['normal', [
         PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
+        PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_OCCUPIED_STORAGE,
         PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
         'path-management:preview-data-root-migration',
         PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
@@ -267,6 +268,7 @@ describe('路径管理 IPC', () => {
 
     expect([...handlers.keys()]).toEqual([
       PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
+      PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_OCCUPIED_STORAGE,
       PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
       PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION,
       PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
@@ -283,7 +285,7 @@ describe('路径管理 IPC', () => {
     registerPathManagementIpcHandlers({
       mode: 'normal',
       ipc: {
-        handle: (channel, handler) => { handlers.set(channel, handler) },
+        handle: (channel: string, handler: (...args: unknown[]) => unknown) => { handlers.set(channel, handler) },
         removeHandler: () => undefined,
       },
       app: { relaunch: () => undefined, quit: () => undefined },
@@ -590,40 +592,62 @@ describe('路径管理 IPC', () => {
     expect(() => readFileSync(targetRoot)).toThrow()
   })
 
-  test('Given normal 状态查询 When 存储检查成功或失败 Then 合并真实元数据或安全降级', async () => {
-    /** 注册两次独立 handler，验证异常不会让设置页整体加载失败。 */
-    const registerGetState = (inspectStorage: () => Promise<{
-      occupiedBytes: number
-      availableBytes: number
-      deviceType: 'network'
-    }>): ((...args: unknown[]) => unknown) => {
-      const handlers = new Map<string, (...args: unknown[]) => unknown>()
-      registerPathManagementIpcHandlers({
-        mode: 'normal',
-        ipc: {
-          handle: (channel, handler) => { handlers.set(channel, handler) },
-          removeHandler: () => undefined,
-        },
-        app: { relaunch: () => undefined, quit: () => undefined },
-        getExpectedWebContents: () => expectedWebContents,
-        coordinator: {
-          getStatus: () => createLocatorResult().state,
-          createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }),
-          runPending: async () => undefined,
-          resumePending: async () => undefined,
-          cancel: async () => undefined,
-        },
-        inspectStorage,
-      })
-      const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE)
-      if (!handler) throw new Error('缺少状态 handler')
-      return handler
-    }
-    const success = registerGetState(async () => ({ occupiedBytes: 10, availableBytes: 90, deviceType: 'network' }))
-    const failure = registerGetState(async () => { throw new Error('模拟 statfs 失败') })
+  test('Given 占用扫描很慢且最终失败 When normal 查询状态 Then 首屏先返回卷信息并独立结算 occupied issue', async () => {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    /** 保存慢扫描 resolver，证明 GET_STATE 不等待它。 */
+    let resolveOccupied: ((value: {
+      occupiedStatus: 'unavailable'
+      storageIssue: { code: 'SCAN_FAILED'; message: string }
+    }) => void) | undefined
+    let occupiedCalls = 0
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel: string, handler: (...args: unknown[]) => unknown) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      coordinator: {
+        getStatus: () => createLocatorResult().state,
+        createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }),
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+      inspectStorageFast: async () => ({
+        availableBytes: 90,
+        deviceType: 'network',
+        occupiedStatus: 'loading',
+      }),
+      inspectOccupiedStorage: async () => await new Promise((resolve) => {
+        occupiedCalls += 1
+        resolveOccupied = resolve
+      }),
+    } as unknown as Parameters<typeof registerPathManagementIpcHandlers>[0])
+    const getState = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE)
+    const occupiedChannel = PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_OCCUPIED_STORAGE
+    expect(typeof occupiedChannel).toBe('string')
+    const getOccupied = handlers.get(occupiedChannel)
+    if (!getState || !getOccupied) throw new Error('缺少 fast/occupied handler')
 
-    expect(await success(expectedEvent)).toMatchObject({ occupiedBytes: 10, availableBytes: 90, deviceType: 'network' })
-    expect(await failure(expectedEvent)).toMatchObject({ availability: 'available', deviceType: 'unknown' })
+    expect(await getState(expectedEvent)).toMatchObject({
+      availability: 'available',
+      availableBytes: 90,
+      deviceType: 'network',
+      occupiedStatus: 'loading',
+    })
+    expect(occupiedCalls).toBe(0)
+    const occupied = Promise.resolve(getOccupied(expectedEvent))
+    expect(occupiedCalls).toBe(1)
+    resolveOccupied?.({
+      occupiedStatus: 'unavailable',
+      storageIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
+    })
+    expect(await occupied).toMatchObject({
+      occupiedStatus: 'unavailable',
+      storageIssue: { code: 'SCAN_FAILED' },
+    })
   })
 
   test('Given 普通或路径窗口之外的 sender When 调用敏感通道 Then 一律拒绝', () => {

@@ -22,6 +22,7 @@ import type {
   DataRootMigrationProgress,
   DataRootMigrationRecord,
   DataRootMigrationStage,
+  DataRootOccupiedStorage,
   PathManagementState,
 } from '@proma/shared'
 import { DataRootLocator } from './data-root-locator'
@@ -41,7 +42,7 @@ import {
 } from './verified-directory-copier'
 import type { RebaseDataRootOwnedPathsInput, RebaseDataRootOwnedPathsResult } from './owned-path-rebaser'
 import { rebaseDataRootOwnedPaths } from './owned-path-rebaser'
-import { inspectDataRootVolume } from './data-root-storage'
+import { getCachedDataRootOccupied, inspectDataRootVolume } from './data-root-storage'
 import type { DataRootVolumeSnapshot } from './data-root-storage'
 
 export {
@@ -94,6 +95,8 @@ export interface DataRootMigrationCoordinatorOptions {
   getAvailableBytes?: (existingTargetAncestor: string) => Promise<number>
   /** 可注入目标卷元数据检查；指定 getAvailableBytes 时设备类型按 unknown 处理。 */
   inspectTargetVolume?: (existingTargetAncestor: string) => Promise<DataRootVolumeSnapshot>
+  /** preview 可复用的会话期源占用缓存；最终计划不会使用。 */
+  getCachedSourceOccupied?: (sourceRoot: string) => DataRootOccupiedStorage | undefined
   isPidRunning?: (pid: number) => boolean
   copyDirectory?: (input: CopyDirectoryInput) => Promise<CopyDirectoryResult>
   rebaseOwnedPaths?: (input: RebaseDataRootOwnedPathsInput) => RebaseDataRootOwnedPathsResult
@@ -136,6 +139,7 @@ interface MigrationPreflightOptions {
   requireOwnedSidecar?: boolean
   checkSpace?: boolean
   checkRemainingSpace?: boolean
+  reuseCachedSourceSize?: boolean
 }
 
 /** 数据根迁移协调器：先复制与重写，最后原子切换 locator。 */
@@ -152,6 +156,8 @@ export class DataRootMigrationCoordinator {
   private readonly now: () => number
   /** 读取目标所在卷容量与设备分类。 */
   private readonly inspectTargetVolume: (existingTargetAncestor: string) => Promise<DataRootVolumeSnapshot>
+  /** 同步读取设置页已完成的源占用缓存。 */
+  private readonly getCachedSourceOccupied: (sourceRoot: string) => DataRootOccupiedStorage | undefined
   /** 可注入 PID 存活检查。 */
   private readonly isPidRunning: (pid: number) => boolean
   /** Task3 可恢复复制公开入口。 */
@@ -187,6 +193,7 @@ export class DataRootMigrationCoordinator {
       ?? (options.getAvailableBytes === undefined
         ? inspectDataRootVolume
         : async (target) => ({ availableBytes: await options.getAvailableBytes?.(target) ?? 0, deviceType: 'unknown' }))
+    this.getCachedSourceOccupied = options.getCachedSourceOccupied ?? getCachedDataRootOccupied
     this.isPidRunning = options.isPidRunning ?? isProcessRunning
     this.copyDirectory = options.copyDirectory ?? copyDirectoryVerified
     this.rebaseOwnedPaths = options.rebaseOwnedPaths ?? rebaseDataRootOwnedPaths
@@ -218,7 +225,11 @@ export class DataRootMigrationCoordinator {
   async previewTarget(targetRoot: string): Promise<DataRootMigrationPreview> {
     const normalizedTarget = resolve(targetRoot)
     try {
-      const preflight = await this.preflight(targetRoot, `preview-${this.createMigrationId()}`)
+      const preflight = await this.preflight(
+        targetRoot,
+        `preview-${this.createMigrationId()}`,
+        { reuseCachedSourceSize: true },
+      )
       return {
         targetRoot: preflight.targetRoot,
         deviceType: preflight.deviceType,
@@ -248,7 +259,11 @@ export class DataRootMigrationCoordinator {
   }> {
     let requiredBytes = 0
     try {
-      requiredBytes = await scanSourceBytes(this.locator.requireActiveRoot())
+      const sourceRoot = this.locator.requireActiveRoot()
+      const cached = this.getCachedSourceOccupied(sourceRoot)
+      requiredBytes = cached?.occupiedStatus === 'ready' && cached.occupiedBytes !== undefined
+        ? cached.occupiedBytes
+        : await scanSourceBytes(sourceRoot)
     } catch {
       // INVALID_SOURCE blocker 已携带可处理原因，摘要保持 0。
     }
@@ -676,7 +691,10 @@ export class DataRootMigrationCoordinator {
     let totalBytes = 0
     if (options.checkSpace !== false) {
       try {
-        totalBytes = await scanSourceBytes(sourceRoot)
+        const cached = options.reuseCachedSourceSize ? this.getCachedSourceOccupied(sourceRoot) : undefined
+        totalBytes = cached?.occupiedStatus === 'ready' && cached.occupiedBytes !== undefined
+          ? cached.occupiedBytes
+          : await scanSourceBytes(sourceRoot)
       } catch (error) {
         throw new DataRootMigrationError('INVALID_SOURCE', '无法扫描当前数据根', error)
       }
