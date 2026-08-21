@@ -27,8 +27,23 @@ interface ExpectedStorageModule {
   }) => Promise<{
     availableBytes?: number
     deviceType: 'local' | 'removable' | 'network' | 'unknown'
-    storageIssue?: { code: string; message: string }
+    capacityIssue?: { code: string; message: string }
   }>
+  mergeDataRootStorageSnapshot: (
+    volume: {
+      availableBytes?: number
+      deviceType: 'local' | 'removable' | 'network' | 'unknown'
+      capacityIssue?: { code: 'CAPACITY_UNAVAILABLE'; message: string }
+    },
+    occupied: {
+      occupiedBytes?: number
+      occupiedStatus: 'ready' | 'unavailable'
+      occupiedIssue?: { code: 'SCAN_FAILED' | 'SCAN_LIMIT_EXCEEDED' | 'SCAN_TIMEOUT' | 'SCAN_CANCELLED'; message: string }
+    },
+  ) => {
+    capacityIssue?: { code: string; message: string }
+    occupiedIssue?: { code: string; message: string }
+  }
   classifyMacDiskInfo: (xml: string) => 'local' | 'removable' | 'network' | 'unknown'
   classifyWindowsDriveType: (driveType: number) => 'local' | 'removable' | 'network' | 'unknown'
   classifyLinuxMountInfo: (
@@ -54,7 +69,7 @@ interface ExpectedStorageModule {
     inspectOccupied: (rootPath: string, signal?: AbortSignal) => Promise<{
       occupiedBytes?: number
       occupiedStatus: 'ready' | 'unavailable'
-      storageIssue?: {
+      occupiedIssue?: {
         code: 'SCAN_FAILED' | 'SCAN_LIMIT_EXCEEDED' | 'SCAN_TIMEOUT' | 'SCAN_CANCELLED'
         message: string
       }
@@ -62,7 +77,7 @@ interface ExpectedStorageModule {
     getCachedOccupied: (rootPath: string) => {
       occupiedBytes?: number
       occupiedStatus: 'ready' | 'unavailable'
-      storageIssue?: { code: string; message: string }
+      occupiedIssue?: { code: string; message: string }
     } | undefined
     invalidate: (rootPath?: string) => void
   }
@@ -218,7 +233,7 @@ describe('数据根存储检查', () => {
 
     expect(await inspection).toMatchObject({
       occupiedStatus: 'unavailable',
-      storageIssue: { code: 'SCAN_CANCELLED' },
+      occupiedIssue: { code: 'SCAN_CANCELLED' },
     })
     expect(inspector.getCachedOccupied('/data/proma')).toBeUndefined()
   })
@@ -249,6 +264,27 @@ describe('数据根存储检查', () => {
     ])
     expect(await result).toMatchObject({ code: 'SCAN_TIMEOUT' })
     expect(returnCalls).toBe(1)
+  })
+
+  test('Given openDirectory 超时后才返回句柄 When 扫描已失败 Then 迟到句柄仍有界关闭一次', async () => {
+    const { scanDataRootBytes } = getExpectedStorageModule()
+    let closeCalls = 0
+    /** 迟到目录模拟真实 opendir 在 deadline 后才完成。 */
+    const lateDirectory: AsyncIterable<{ name: string }> & { close(): Promise<void> } = {
+      close: async () => { closeCalls += 1 },
+      [Symbol.asyncIterator]: async function* () { yield { name: 'late.txt' } },
+    }
+    const scan = scanDataRootBytes('/data/proma', {
+      timeoutMs: 5,
+      openDirectory: async () => {
+        await Bun.sleep(20)
+        return lateDirectory
+      },
+    })
+
+    await expect(scan).rejects.toMatchObject({ code: 'SCAN_TIMEOUT' })
+    await Bun.sleep(30)
+    expect(closeCalls).toBe(1)
   })
 
   test('Given abort 发生在 iterator.next 等待中 When 扫描 Then 立即取消并尽力关闭 iterator', async () => {
@@ -299,7 +335,7 @@ describe('数据根存储检查', () => {
     const waiterB = inspector.inspectOccupied('/data/proma')
     controllerA.abort()
 
-    expect(await waiterA).toMatchObject({ storageIssue: { code: 'SCAN_CANCELLED' } })
+    expect(await waiterA).toMatchObject({ occupiedIssue: { code: 'SCAN_CANCELLED' } })
     expect(sharedSignal?.aborted).toBe(false)
     resolveInspection?.(42)
     expect(await waiterB).toEqual({ occupiedBytes: 42, occupiedStatus: 'ready' })
@@ -326,7 +362,7 @@ describe('数据根存储检查', () => {
     if (timeoutResult === 'still-running') timeoutController.abort()
     expect(timeoutResult).toMatchObject({
       occupiedStatus: 'unavailable',
-      storageIssue: { code: 'SCAN_TIMEOUT' },
+      occupiedIssue: { code: 'SCAN_TIMEOUT' },
     })
 
     const limitInspector = new DataRootStorageInspector({
@@ -341,7 +377,7 @@ describe('数据根存储检查', () => {
     })
     expect(await limitInspector.inspectOccupied('/data/proma')).toMatchObject({
       occupiedStatus: 'unavailable',
-      storageIssue: { code: 'SCAN_LIMIT_EXCEEDED' },
+      occupiedIssue: { code: 'SCAN_LIMIT_EXCEEDED' },
     })
   })
 
@@ -363,7 +399,7 @@ describe('数据根存储检查', () => {
     })
     expect(await inspector.inspectOccupied('/data/proma')).toMatchObject({
       occupiedStatus: 'unavailable',
-      storageIssue: { code: 'SCAN_FAILED' },
+      occupiedIssue: { code: 'SCAN_FAILED' },
     })
   })
 
@@ -384,7 +420,7 @@ describe('数据根存储检查', () => {
 
     expect(result).toEqual({
       deviceType: 'network',
-      storageIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+      capacityIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
     })
   })
 
@@ -396,6 +432,25 @@ describe('数据根存储检查', () => {
     })
 
     expect(result).toEqual({ availableBytes: 40, deviceType: 'unknown' })
+  })
+
+  test('Given 容量与占用检查同时失败 When 合并存储快照 Then 两类诊断互不覆盖', () => {
+    const { mergeDataRootStorageSnapshot } = getExpectedStorageModule()
+    expect(typeof mergeDataRootStorageSnapshot).toBe('function')
+
+    expect(mergeDataRootStorageSnapshot(
+      {
+        deviceType: 'network',
+        capacityIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+      },
+      {
+        occupiedStatus: 'unavailable',
+        occupiedIssue: { code: 'SCAN_TIMEOUT', message: '占用空间统计超时' },
+      },
+    )).toMatchObject({
+      capacityIssue: { code: 'CAPACITY_UNAVAILABLE' },
+      occupiedIssue: { code: 'SCAN_TIMEOUT' },
+    })
   })
 
   test('Given macOS 卷元数据 When 分类 Then 优先识别网络、可移除与本地卷', () => {

@@ -216,6 +216,8 @@ describe('路径管理 preload API', () => {
       activeRoot: '/data/proma',
       availability: 'available',
       deviceType: 'local',
+      capacityIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+      occupiedIssue: { code: 'SCAN_TIMEOUT', message: '占用空间统计超时' },
       migration: null,
     }
     /** 仅状态查询返回对象的 ipcRenderer。 */
@@ -231,5 +233,7 @@ describe('路径管理 preload API', () => {
     if (typeof getState !== 'function') throw new Error('normal API 缺少状态查询')
 
     expect(await getState()).toBe(state)
+    expect((await getState()).capacityIssue?.code).toBe('CAPACITY_UNAVAILABLE')
+    expect((await getState()).occupiedIssue?.code).toBe('SCAN_TIMEOUT')
   })
 })

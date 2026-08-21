@@ -54,6 +54,7 @@ export {
   inspectDataRootStorage,
   invalidateDataRootStorage,
   inspectDataRootVolume,
+  mergeDataRootStorageSnapshot,
   readLinuxBlockRemovable,
   scanDataRootBytes,
   toSafeByteCount,

@@ -7,17 +7,22 @@ export type DataRootDeviceType = 'local' | 'removable' | 'network' | 'unknown'
 /** 数据根占用空间扫描状态。 */
 export type DataRootOccupiedStatus = 'loading' | 'ready' | 'unavailable'
 
-/** 存储容量与占用扫描可公开给界面的稳定错误分类。 */
-export type DataRootStorageIssueCode =
-  | 'CAPACITY_UNAVAILABLE'
+/** 占用扫描可公开给界面的稳定错误分类。 */
+export type DataRootOccupiedIssueCode =
   | 'SCAN_FAILED'
   | 'SCAN_LIMIT_EXCEEDED'
   | 'SCAN_TIMEOUT'
   | 'SCAN_CANCELLED'
 
-/** 存储检查问题，不暴露底层文件路径或系统错误详情。 */
-export interface DataRootStorageIssue {
-  code: DataRootStorageIssueCode
+/** 容量查询问题，与占用扫描诊断独立。 */
+export interface DataRootCapacityIssue {
+  code: 'CAPACITY_UNAVAILABLE'
+  message: string
+}
+
+/** 占用扫描问题，不暴露底层文件路径或系统错误详情。 */
+export interface DataRootOccupiedIssue {
+  code: DataRootOccupiedIssueCode
   message: string
 }
 
@@ -25,7 +30,7 @@ export interface DataRootStorageIssue {
 export interface DataRootOccupiedStorage {
   occupiedBytes?: number
   occupiedStatus: Exclude<DataRootOccupiedStatus, 'loading'>
-  storageIssue?: DataRootStorageIssue
+  occupiedIssue?: DataRootOccupiedIssue
 }
 
 /** 可恢复迁移任务的执行阶段。 */
@@ -49,7 +54,8 @@ export interface PathManagementState {
   deviceType: DataRootDeviceType
   occupiedBytes?: number
   occupiedStatus?: DataRootOccupiedStatus
-  storageIssue?: DataRootStorageIssue
+  capacityIssue?: DataRootCapacityIssue
+  occupiedIssue?: DataRootOccupiedIssue
   availableBytes?: number
   migration: DataRootMigrationProgress | null
   postCommitCleanup?: DataRootPostCommitCleanupProgress

@@ -222,7 +222,7 @@ export function registerPathManagementIpcHandlers(
           ...state,
           deviceType: 'unknown' as const,
           occupiedStatus: 'loading' as const,
-          storageIssue: { code: 'CAPACITY_UNAVAILABLE' as const, message: '可用空间暂不可用' },
+          capacityIssue: { code: 'CAPACITY_UNAVAILABLE' as const, message: '可用空间暂不可用' },
         }
       }
     })
@@ -231,7 +231,7 @@ export function registerPathManagementIpcHandlers(
       if (state.activeRoot === null || state.availability !== 'available') {
         return {
           occupiedStatus: 'unavailable',
-          storageIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
+          occupiedIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
         } satisfies DataRootOccupiedStorage
       }
       return await (options.inspectOccupiedStorage ?? inspectDataRootOccupied)(state.activeRoot)

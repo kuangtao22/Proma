@@ -456,7 +456,7 @@ describe('DataRootMigrationCoordinator', () => {
     const harness = createHarness({
       inspectTargetVolume: async () => ({
         deviceType: 'network',
-        storageIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+        capacityIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
       }),
     })
 

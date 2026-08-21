@@ -5,10 +5,10 @@ import { dirname, join, resolve, win32 } from 'node:path'
 import { promisify } from 'node:util'
 import { DOMParser } from '@xmldom/xmldom'
 import type {
+  DataRootCapacityIssue,
   DataRootDeviceType,
+  DataRootOccupiedIssueCode,
   DataRootOccupiedStorage,
-  DataRootStorageIssue,
-  DataRootStorageIssueCode,
 } from '@proma/shared'
 
 /** 数据根设备类型。 */
@@ -19,7 +19,7 @@ export interface DataRootVolumeSnapshot {
   availableBytes?: number
   deviceType: DataRootDeviceType
   /** 容量查询失败时保留设备类型并公开稳定问题。 */
-  storageIssue?: DataRootStorageIssue
+  capacityIssue?: DataRootCapacityIssue
 }
 
 /** 数据根设置页需要的真实存储快照。 */
@@ -28,6 +28,8 @@ export interface DataRootStorageSnapshot extends DataRootVolumeSnapshot {
   occupiedBytes?: number
   /** 占用空间是否仍在后台计算或暂不可用。 */
   occupiedStatus: 'loading' | 'ready' | 'unavailable'
+  /** 占用扫描失败时的独立稳定问题。 */
+  occupiedIssue?: DataRootOccupiedStorage['occupiedIssue']
 }
 
 /** 目录扫描可替换依赖与安全预算。 */
@@ -95,7 +97,7 @@ const execFileAsync = promisify(execFile)
 
 /** 占用扫描内部错误，统一映射为 renderer 可处理的稳定分类。 */
 class DataRootScanError extends Error {
-  constructor(readonly code: DataRootStorageIssueCode, message: string) {
+  constructor(readonly code: DataRootOccupiedIssueCode, message: string) {
     super(message)
     this.name = 'DataRootScanError'
   }
@@ -149,7 +151,7 @@ export class DataRootStorageInspector {
       occupiedBytes,
       occupiedStatus: 'ready' as const,
     })).catch((error: unknown) => toOccupiedStorageIssue(error)).then((snapshot) => {
-      if (snapshot.storageIssue?.code !== 'SCAN_CANCELLED'
+      if (snapshot.occupiedIssue?.code !== 'SCAN_CANCELLED'
         && (this.generations.get(normalizedRoot) ?? 0) === generation) {
         this.cache.set(normalizedRoot, { expiresAt: this.now() + this.cacheTtlMs, snapshot })
       }
@@ -203,7 +205,7 @@ export async function inspectDataRootStorageFast(rootPath: string): Promise<Data
     inspectDataRootVolume(rootPath),
     Promise.resolve(defaultStorageInspector.getCachedOccupied(rootPath)),
   ])
-  return { ...volume, ...(occupied ?? { occupiedStatus: 'loading' as const }) }
+  return mergeDataRootStorageSnapshot(volume, occupied ?? { occupiedStatus: 'loading' as const })
 }
 
 /** 独立刷新数据根占用空间。 */
@@ -222,6 +224,14 @@ export async function inspectDataRootStorage(rootPath: string): Promise<DataRoot
     inspectDataRootVolume(rootPath),
     inspectDataRootOccupied(rootPath),
   ])
+  return mergeDataRootStorageSnapshot(volume, occupied)
+}
+
+/** 合并卷容量与占用扫描结果，两类诊断使用独立字段。 */
+export function mergeDataRootStorageSnapshot(
+  volume: DataRootVolumeSnapshot,
+  occupied: DataRootOccupiedStorage | { occupiedStatus: 'loading' },
+): DataRootStorageSnapshot {
   return { ...volume, ...occupied }
 }
 
@@ -283,11 +293,23 @@ export async function scanDataRootBytes(rootPath: string, options: ScanDataRootO
       assertScanBudget(options.signal, now, startedAt, timeoutMs)
     }
     /** 显式驱动 iterator，确保 opendir、获取 iterator 和每次 next 都能取消或超时。 */
-    const directory = await raceWithScanBudget(
-      Promise.resolve().then(async () => await openDirectory(currentDirectory)),
-      options.signal,
-      remainingScanBudget(now, startedAt, timeoutMs),
-    )
+    /** 保留原始 open Promise，deadline 后迟到的句柄仍必须关闭。 */
+    const directoryPromise = Promise.resolve().then(async () => await openDirectory(currentDirectory))
+    let directory: AsyncIterable<{ name: string }>
+    try {
+      directory = await raceWithScanBudget(
+        directoryPromise,
+        options.signal,
+        remainingScanBudget(now, startedAt, timeoutMs),
+      )
+    } catch (error) {
+      /** race 已结束后才注册迟到清理，成功路径不会与正常 finally 双重关闭。 */
+      void directoryPromise.then(
+        async (lateDirectory) => { await closeDirectoryResource(lateDirectory) },
+        () => undefined,
+      )
+      throw error
+    }
     const iterator = await raceWithScanBudget(
       Promise.resolve().then(() => directory[Symbol.asyncIterator]()),
       options.signal,
@@ -397,7 +419,7 @@ export async function inspectDataRootVolume(
   if (fileSystemResult.status === 'fulfilled') {
     snapshot.availableBytes = toSafeByteCount(fileSystemResult.value.bavail * fileSystemResult.value.bsize)
   } else {
-    snapshot.storageIssue = { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' }
+    snapshot.capacityIssue = { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' }
   }
   return snapshot
 }
@@ -464,6 +486,23 @@ async function closeDirectoryIterator(
   await raceWithScanBudget(closeOperation, undefined, DEFAULT_SCAN_CLOSE_TIMEOUT_MS).catch(() => undefined)
 }
 
+/** 关闭尚未取得 iterator 的迟到目录句柄，并限制 close/return 等待时间。 */
+async function closeDirectoryResource(directory: AsyncIterable<{ name: string }>): Promise<void> {
+  /** Node Dir 暴露 close；其他 AsyncIterable 至少可通过 iterator.return 尝试释放。 */
+  const closeable = directory as AsyncIterable<{ name: string }> & { close?: () => Promise<void> }
+  if (closeable.close !== undefined) {
+    const closeOperation = Promise.resolve().then(async () => { await closeable.close?.() })
+    await raceWithScanBudget(closeOperation, undefined, DEFAULT_SCAN_CLOSE_TIMEOUT_MS).catch(() => undefined)
+    return
+  }
+  try {
+    const iterator = directory[Symbol.asyncIterator]()
+    await closeDirectoryIterator(iterator, directory)
+  } catch {
+    /** 获取 iterator 本身失败时已无其他可用释放入口。 */
+  }
+}
+
 /** 消费者取消只结束自己的等待，不传播到共享单飞扫描。 */
 function waitForOccupiedConsumer(
   inspection: Promise<DataRootOccupiedStorage>,
@@ -499,14 +538,13 @@ function toOccupiedStorageIssue(error: unknown): DataRootOccupiedStorage {
   const code = error instanceof DataRootScanError
     ? error.code
     : isAbortError(error) ? 'SCAN_CANCELLED' : 'SCAN_FAILED'
-  const messages: Record<DataRootStorageIssueCode, string> = {
-    CAPACITY_UNAVAILABLE: '可用空间暂不可用',
+  const messages: Record<DataRootOccupiedIssueCode, string> = {
     SCAN_FAILED: '占用空间暂不可用',
     SCAN_LIMIT_EXCEEDED: '数据文件过多，暂无法统计占用空间',
     SCAN_TIMEOUT: '占用空间统计超时',
     SCAN_CANCELLED: '占用空间统计已取消',
   }
-  return { occupiedStatus: 'unavailable', storageIssue: { code, message: messages[code] } }
+  return { occupiedStatus: 'unavailable', occupiedIssue: { code, message: messages[code] } }
 }
 
 /** 判断 Node 风格错误码。 */

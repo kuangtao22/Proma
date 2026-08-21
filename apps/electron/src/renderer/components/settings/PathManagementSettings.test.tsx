@@ -67,6 +67,7 @@ interface ExpectedPathManagementSettingsModule {
     mount: () => void
     begin: () => { generation: number; signal: AbortSignal }
     isCurrent: (request: { generation: number; signal: AbortSignal }) => boolean
+    isMounted: () => boolean
     dispose: () => void
   }
   refreshPathManagementProgressStatus: (dependencies: {
@@ -77,6 +78,30 @@ interface ExpectedPathManagementSettingsModule {
     loadState: () => Promise<void>
     reportError: (error: unknown) => void
   }) => Promise<void>
+  createPathManagementProgressRefreshController: (dependencies: {
+    getStatus: () => Promise<DataRootMigrationStatus>
+    getCurrentState: () => PathManagementState | null
+    commitStatus: (status: DataRootMigrationStatus) => void
+    loadState: () => Promise<void>
+    reportError: (error: unknown) => void
+  }) => {
+    mount: () => void
+    dispose: () => void
+    requestRefresh: () => Promise<void>
+  }
+  mergePathManagementOccupiedStorage: (
+    state: PathManagementState & {
+      capacityIssue?: { code: 'CAPACITY_UNAVAILABLE'; message: string }
+    },
+    occupied: {
+      occupiedStatus: 'ready' | 'unavailable'
+      occupiedBytes?: number
+      occupiedIssue?: { code: 'SCAN_TIMEOUT'; message: string }
+    },
+  ) => PathManagementState & {
+    capacityIssue?: { code: string; message: string }
+    occupiedIssue?: { code: string; message: string }
+  }
 }
 
 /** RED 阶段通过可选合同读取新增导出，避免模块不存在导致测试环境错误。 */
@@ -382,11 +407,11 @@ describe('PathManagementSettings', () => {
       deviceType: 'network',
       occupiedBytes: undefined,
       occupiedStatus: 'unavailable',
-      storageIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
+      occupiedIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
     })} />)
     const capacityUnavailableHtml = renderToStaticMarkup(<DataRootLocationSection state={createState({
       availableBytes: undefined,
-      storageIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+      capacityIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
     })} />)
 
     expect(loadingHtml).toContain('正在计算')
@@ -394,6 +419,27 @@ describe('PathManagementSettings', () => {
     expect(unavailableHtml).toContain('占用空间暂不可用')
     expect(unavailableHtml).toContain('断连')
     expect(capacityUnavailableHtml).toContain('可用 可用空间暂不可用')
+  })
+
+  test('Given 容量与占用检查都失败 When 合并后台结果 Then 两类错误同时保留并显示', () => {
+    const { DataRootLocationSection, mergePathManagementOccupiedStorage } = getExpectedModule()
+    expect(typeof mergePathManagementOccupiedStorage).toBe('function')
+    const stateWithCapacityIssue = createState({
+      availableBytes: undefined,
+      capacityIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+    } as Partial<PathManagementState>) as PathManagementState & {
+      capacityIssue: { code: 'CAPACITY_UNAVAILABLE'; message: string }
+    }
+    const merged = mergePathManagementOccupiedStorage(stateWithCapacityIssue, {
+      occupiedStatus: 'unavailable',
+      occupiedIssue: { code: 'SCAN_TIMEOUT', message: '占用空间统计超时' },
+    })
+    const html = renderToStaticMarkup(<DataRootLocationSection state={merged} />)
+
+    expect(merged.capacityIssue?.code).toBe('CAPACITY_UNAVAILABLE')
+    expect(merged.occupiedIssue?.code).toBe('SCAN_TIMEOUT')
+    expect(html).toContain('可用 可用空间暂不可用')
+    expect(html).toContain('已占用 占用空间统计超时')
   })
 
   test('Given progress 早于 initial 返回 When 刷新状态 Then 触发新完整加载且旧 initial 不可提交', async () => {
@@ -451,6 +497,105 @@ describe('PathManagementSettings', () => {
     progressRefreshGate.mount()
     const strictModeRemount = progressRefreshGate.begin()
     expect(progressRefreshGate.isCurrent(strictModeRemount)).toBe(true)
+  })
+
+  test('Given A status pending 时收到 B progress When A 旧快照晚返回 Then 串行追拉且只提交最新状态', async () => {
+    const { createPathManagementProgressRefreshController, mergePathManagementStatus } = getExpectedModule()
+    expect(typeof createPathManagementProgressRefreshController).toBe('function')
+    /** 保存每次 status 请求 resolver，精确控制 A/B 返回顺序。 */
+    const statusResolvers: Array<(status: DataRootMigrationStatus) => void> = []
+    let activeRequests = 0
+    let maximumActiveRequests = 0
+    let currentState = createState()
+    const committedBytes: number[] = []
+    const controller = createPathManagementProgressRefreshController({
+      getStatus: async () => {
+        activeRequests += 1
+        maximumActiveRequests = Math.max(maximumActiveRequests, activeRequests)
+        return await new Promise<DataRootMigrationStatus>((resolve) => {
+          statusResolvers.push((status) => {
+            activeRequests -= 1
+            resolve(status)
+          })
+        })
+      },
+      getCurrentState: () => currentState,
+      commitStatus: (status) => {
+        const completedBytes = status.migration?.completedBytes ?? 0
+        committedBytes.push(completedBytes)
+        currentState = mergePathManagementStatus(currentState, status)
+      },
+      loadState: async () => undefined,
+      reportError: () => undefined,
+    })
+    controller.mount()
+    const refreshA = controller.requestRefresh()
+    /** B progress 先直接进入 UI，再请求 controller 标记 dirty。 */
+    currentState = { ...currentState, migration: {
+      migrationId: 'migration-1',
+      stage: 'copying',
+      completedBytes: 20,
+      totalBytes: 100,
+    } }
+    const refreshB = controller.requestRefresh()
+    statusResolvers[0]?.({ migration: {
+      migrationId: 'migration-1',
+      stage: 'copying',
+      completedBytes: 10,
+      totalBytes: 100,
+    } })
+    for (let spin = 0; spin < 10 && statusResolvers.length < 2; spin += 1) await Promise.resolve()
+    expect(committedBytes).toEqual([])
+    statusResolvers[1]?.({ migration: {
+      migrationId: 'migration-1',
+      stage: 'copying',
+      completedBytes: 20,
+      totalBytes: 100,
+    } })
+    await Promise.all([refreshA, refreshB])
+
+    expect(committedBytes).toEqual([20])
+    expect(currentState.migration?.completedBytes).toBe(20)
+    expect(maximumActiveRequests).toBe(1)
+  })
+
+  test('Given status pending 时卸载或 StrictMode 重挂载 When 旧请求返回 Then 分别停止或串行追拉', async () => {
+    const { createPathManagementProgressRefreshController } = getExpectedModule()
+    /** 创建可控 status 依赖并记录提交次数。 */
+    const createControlledController = () => {
+      const resolvers: Array<(status: DataRootMigrationStatus) => void> = []
+      let commits = 0
+      const controller = createPathManagementProgressRefreshController({
+        getStatus: async () => await new Promise((resolve) => { resolvers.push(resolve) }),
+        getCurrentState: () => createState(),
+        commitStatus: () => { commits += 1 },
+        loadState: async () => undefined,
+        reportError: () => undefined,
+      })
+      return { controller, resolvers, getCommits: () => commits }
+    }
+
+    const unmounted = createControlledController()
+    unmounted.controller.mount()
+    const unmountedRefresh = unmounted.controller.requestRefresh()
+    unmounted.controller.dispose()
+    unmounted.resolvers[0]?.({ migration: null })
+    await unmountedRefresh
+    expect(unmounted.getCommits()).toBe(0)
+    expect(unmounted.resolvers).toHaveLength(1)
+
+    const strictMode = createControlledController()
+    strictMode.controller.mount()
+    const strictRefresh = strictMode.controller.requestRefresh()
+    strictMode.controller.dispose()
+    strictMode.controller.mount()
+    strictMode.resolvers[0]?.({ migration: null })
+    for (let spin = 0; spin < 10 && strictMode.resolvers.length < 2; spin += 1) await Promise.resolve()
+    expect(strictMode.getCommits()).toBe(0)
+    strictMode.resolvers[1]?.({ migration: null })
+    await strictRefresh
+    expect(strictMode.getCommits()).toBe(1)
+    expect(strictMode.resolvers).toHaveLength(2)
   })
 
   test('Given 当前与上次数据根 When 渲染位置区块 Then 完整路径可访问且没有删除旧目录入口', () => {

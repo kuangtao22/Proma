@@ -597,7 +597,7 @@ describe('路径管理 IPC', () => {
     /** 保存慢扫描 resolver，证明 GET_STATE 不等待它。 */
     let resolveOccupied: ((value: {
       occupiedStatus: 'unavailable'
-      storageIssue: { code: 'SCAN_FAILED'; message: string }
+      occupiedIssue: { code: 'SCAN_FAILED'; message: string }
     }) => void) | undefined
     let occupiedCalls = 0
     registerPathManagementIpcHandlers({
@@ -642,11 +642,11 @@ describe('路径管理 IPC', () => {
     expect(occupiedCalls).toBe(1)
     resolveOccupied?.({
       occupiedStatus: 'unavailable',
-      storageIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
+      occupiedIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
     })
     expect(await occupied).toMatchObject({
       occupiedStatus: 'unavailable',
-      storageIssue: { code: 'SCAN_FAILED' },
+      occupiedIssue: { code: 'SCAN_FAILED' },
     })
   })
 
@@ -677,7 +677,40 @@ describe('路径管理 IPC', () => {
       availability: 'available',
       deviceType: 'unknown',
       occupiedStatus: 'loading',
-      storageIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+      capacityIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+    })
+  })
+
+  test('Given 容量与缓存占用同时失败 When normal 查询状态 Then GET_STATE 同时保留两类诊断', async () => {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      coordinator: {
+        getStatus: () => createLocatorResult().state,
+        createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }),
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+      inspectStorageFast: async () => ({
+        deviceType: 'network',
+        occupiedStatus: 'unavailable',
+        capacityIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+        occupiedIssue: { code: 'SCAN_TIMEOUT', message: '占用空间统计超时' },
+      }),
+    })
+    const getState = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE)
+    if (!getState) throw new Error('缺少 GET_STATE handler')
+
+    await expect(Promise.resolve(getState(expectedEvent))).resolves.toMatchObject({
+      capacityIssue: { code: 'CAPACITY_UNAVAILABLE' },
+      occupiedIssue: { code: 'SCAN_TIMEOUT' },
     })
   })
 
