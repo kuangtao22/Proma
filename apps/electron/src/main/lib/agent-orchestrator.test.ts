@@ -108,4 +108,22 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(catchIndex).toBeGreaterThan(callIndex)
     expect(checkpointIndex).toBeGreaterThan(catchIndex)
   })
+
+  test('Given 旧 generation 停止且新 generation 已占槽 When 检查 adapter 启动边界 Then checkpoint 位于业务 catch 外', () => {
+    /** 读取真实编排源码，避免停止 sentinel 被 query 的普通错误处理吞掉。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** 截取 adapter 重试循环到异步迭代器创建的结构。 */
+    const loopStart = source.indexOf('for (let attempt = 1; attempt <= MAX_QUERY_ATTEMPTS; attempt++)')
+    const adapterStart = source.indexOf('const queryIterable = this.adapter.query(queryOptions)', loopStart)
+    const attemptPrefix = source.slice(loopStart, adapterStart)
+    /** 每次 attempt 的业务异常捕获边界。 */
+    const businessTryIndex = attemptPrefix.lastIndexOf('try {')
+    /** adapter 启动前的 generation 检查点。 */
+    const checkpointIndex = attemptPrefix.lastIndexOf('checkpoint()')
+
+    expect(loopStart).toBeGreaterThan(-1)
+    expect(adapterStart).toBeGreaterThan(loopStart)
+    expect(checkpointIndex).toBeGreaterThan(-1)
+    expect(checkpointIndex).toBeLessThan(businessTryIndex)
+  })
 })

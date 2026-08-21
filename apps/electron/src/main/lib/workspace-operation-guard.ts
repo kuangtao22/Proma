@@ -53,7 +53,7 @@ export interface WorkspaceOperationGuard {
   runAgentServiceEffects: (
     input: Pick<AgentWorkspaceAdmissionInput, 'sessionWorkspaceId' | 'requestedWorkspaceId'>,
     effect: () => void,
-  ) => boolean
+  ) => void
 }
 
 /** 创建只负责解析工作区归属与检查独占操作锁的守卫。 */
@@ -114,9 +114,8 @@ export function createWorkspaceOperationGuard(
     },
     runAgentServiceEffects: (input, effect) => {
       const workspaceId = input.sessionWorkspaceId ?? input.requestedWorkspaceId
-      if (workspaceId && dependencies.getWorkspaceOperationBlockReason(workspaceId)) return false
+      if (workspaceId) assertWorkspaceWritable(workspaceId)
       effect()
-      return true
     },
   }
 }

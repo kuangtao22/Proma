@@ -1610,9 +1610,10 @@ export class AgentOrchestrator {
         const wasResuming = !!queryOptions.resumeSessionId
         let shouldRetryFromError = false
 
+        // 停止 sentinel 必须在 query 业务 catch 外抛出，仅由 runAgentLifecycle 消费。
+        checkpoint()
         try {
           // 获取异步迭代器（手动 .next() 以支持 Promise.race 中断）
-          checkpoint()
           const queryIterable = this.adapter.query(queryOptions)
           const queryIterator = queryIterable[Symbol.asyncIterator]()
 

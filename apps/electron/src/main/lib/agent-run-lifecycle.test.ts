@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { runAgentLifecycle } from './agent-run-lifecycle'
 import { createWorkspaceOperationRegistry } from './workspace-operation-lock'
+import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 
 /** 创建可控 Promise 及其完成函数。 */
 function createDeferred(): { promise: Promise<void>; resolve: () => void } {
@@ -70,6 +71,37 @@ describe('Agent 运行生命周期', () => {
     })
 
     await expect(running).rejects.toBe(proxyError)
+    expect(activeGeneration).toBeUndefined()
+  })
+
+  test('Given onRunStarted 时项目进入迁移 When service guard 抛错 Then 不启动 adapter 且释放 active generation', async () => {
+    /** 模拟 activeSessions 中当前会话的运行代际。 */
+    let activeGeneration: number | undefined = 1
+    /** 记录 adapter closure 是否被错误启动。 */
+    let adapterStarts = 0
+    /** 模拟 service onRunStarted 使用的真实守卫。 */
+    const guard = createWorkspaceOperationGuard({
+      getWorkspaceIdBySessionId: () => 'workspace-locked',
+      getWorkspaceIdBySlug: () => undefined,
+      getWorkspaceOperationBlockReason: () => '项目正在迁移，请等待完成后重试',
+    })
+
+    const running = runAgentLifecycle({
+      isCurrent: () => activeGeneration === 1,
+      release: () => {
+        if (activeGeneration === 1) activeGeneration = undefined
+      },
+      onStopped: () => undefined,
+    }, async () => {
+      guard.runAgentServiceEffects({
+        sessionWorkspaceId: 'workspace-locked',
+        requestedWorkspaceId: 'workspace-locked',
+      }, () => undefined)
+      adapterStarts += 1
+    })
+
+    await expect(running).rejects.toThrow('项目正在迁移，请等待完成后重试')
+    expect(adapterStarts).toBe(0)
     expect(activeGeneration).toBeUndefined()
   })
 })

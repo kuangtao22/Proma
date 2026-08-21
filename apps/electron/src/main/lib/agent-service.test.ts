@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 
 describe('Agent service 迁移准入', () => {
-  test('Given 会话权威工作区正在迁移 When 准备 service 运行副作用 Then 不注册 renderer、不写 meta 且不 emit', () => {
+  test('Given 会话权威工作区正在迁移 When 准备 service 运行副作用 Then 抛固定原因且不执行副作用', () => {
     /** 记录 service 在准入后才允许执行的副作用。 */
     const effects: string[] = []
     /** 锁定会话权威工作区的守卫。 */
@@ -16,7 +16,7 @@ describe('Agent service 迁移准入', () => {
       ),
     })
 
-    const admitted = guard.runAgentServiceEffects({
+    expect(() => guard.runAgentServiceEffects({
       sessionWorkspaceId: 'workspace-authoritative',
       requestedWorkspaceId: 'workspace-renderer-other',
     }, () => {
@@ -24,9 +24,8 @@ describe('Agent service 迁移准入', () => {
       effects.push('update-completed-meta')
       effects.push('graduate-automation')
       effects.push('emit')
-    })
+    })).toThrow('项目正在迁移，请等待完成后重试')
 
-    expect(admitted).toBe(false)
     expect(effects).toEqual([])
   })
 
@@ -40,10 +39,10 @@ describe('Agent service 迁移准入', () => {
       getWorkspaceOperationBlockReason: () => undefined,
     })
 
-    expect(guard.runAgentServiceEffects({
+    expect(() => guard.runAgentServiceEffects({
       sessionWorkspaceId: 'workspace-free',
       requestedWorkspaceId: 'workspace-free',
-    }, () => { effects.push('effects') })).toBe(true)
+    }, () => { effects.push('effects') })).not.toThrow()
     expect(effects).toEqual(['effects'])
   })
 
