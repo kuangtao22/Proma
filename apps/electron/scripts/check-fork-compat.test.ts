@@ -349,6 +349,19 @@ describe('fork 上游兼容检查器', () => {
     expect(getCheck(files, 'bridge-composition').passed).toBe(true)
   })
 
+  test('Given gated dynamic 模式仅增加 LAN type-only import When 检查 Bridge 组合点 Then 仍通过', () => {
+    /** type-only import 不会在 normal gate 前求值 LAN 运行时模块。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/index.ts': `
+        import type { LanBridgeRegistration } from './lib/lan-bridge/lan-bridge'
+        ${createGatedBridgeMain()}
+      `,
+    }
+
+    expect(getCheck(files, 'bridge-composition').passed).toBe(true)
+  })
+
   /** 延迟加载只允许精确模块、直接 bootstrap 路径和 normal gate 后顺序。 */
   const invalidGatedBridgeCases = [
     {
@@ -373,6 +386,20 @@ describe('fork 上游兼容检查器', () => {
         "      const { createLanBridgeRegistration } = await import('./lib/lan-bridge/lan-bridge')\n      registerBridge(createLanBridgeRegistration(agentEventBus))",
         "      async function registerLater(): Promise<void> {\n        const { createLanBridgeRegistration } = await import('./lib/lan-bridge/lan-bridge')\n        registerBridge(createLanBridgeRegistration(agentEventBus))\n      }",
       ),
+    },
+    {
+      name: 'normal gate 前存在未使用的 named alias runtime import',
+      mutate: (source: string) => `
+        import { createLanBridgeRegistration as eagerLanFactory } from './lib/lan-bridge/lan-bridge'
+        ${source}
+      `,
+    },
+    {
+      name: 'normal gate 前存在 side-effect runtime import',
+      mutate: (source: string) => `
+        import './lib/lan-bridge/lan-bridge'
+        ${source}
+      `,
     },
   ]
 

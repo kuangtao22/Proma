@@ -211,6 +211,16 @@ function hasRuntimeImport(importClause: ts.ImportClause | undefined): boolean {
   return importClause.namedBindings.elements.some((element) => !element.isTypeOnly)
 }
 
+/** 判断目标模块是否在 Program 顶层存在会提前求值的运行时 import。 */
+function hasTopLevelRuntimeImport(sourceFile: ts.SourceFile, modulePath: string): boolean {
+  return sourceFile.statements.some((statement) => (
+    ts.isImportDeclaration(statement)
+    && ts.isStringLiteralLike(statement.moduleSpecifier)
+    && statement.moduleSpecifier.text === modulePath
+    && hasRuntimeImport(statement.importClause)
+  ))
+}
+
 /** 判断 export clause 是否会生成运行时代码。 */
 function hasRuntimeExport(node: ts.ExportDeclaration): boolean {
   if (node.isTypeOnly) return false
@@ -1064,6 +1074,9 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     './lib/lan-bridge/lan-bridge',
     'createLanBridgeRegistration',
   )
+  /** 动态门控模式禁止顶层提前求值同一 LAN 运行时模块。 */
+  const hasEagerLanRuntimeImport = deferredFactoryBindings.size > 0
+    && hasTopLevelRuntimeImport(mainSource, './lib/lan-bridge/lan-bridge')
   /** 静态与受控延迟 factory 都以 symbol identity 参与重复注册统计。 */
   const allFactoryBindings = new Map([...factoryBindings, ...deferredFactoryBindings])
   const eventBusBindings = collectImportedLocalBindings(
@@ -1111,6 +1124,9 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
 
   if (registrationCount !== 1 || topLevelRegistrationCount + gatedRegistrationCount !== 1) {
     details.push('主进程必须且只能在 Program 顶层或数据根 normal gate 后注册一次 createLanBridgeRegistration(agentEventBus)')
+  }
+  if (hasEagerLanRuntimeImport) {
+    details.push('数据根 gated dynamic 模式禁止在 Program 顶层运行时导入 LAN Bridge 模块')
   }
   if (!hasReachableStart) details.push('主进程 bootstrap 可达顶层路径未启动统一 Bridge 生命周期')
   if (!registrationFactory) details.push('LAN Bridge 未导出 createLanBridgeRegistration')

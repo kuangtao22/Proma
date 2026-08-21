@@ -19,20 +19,34 @@ export interface DataRootContractCliOutput {
   error: (message: string) => void
 }
 
-/** 单文件中可确认来源的 Node 路径与 home API 绑定。 */
+/** 单文件 TypeScript binder 上下文。 */
+interface TypeScriptBindingContext {
+  /** 当前文件已完成 binder 处理的 AST。 */
+  sourceFile: ts.SourceFile
+  /** 查询 import 与使用位置 symbol identity 的检查器。 */
+  checker: ts.TypeChecker
+  /** 当前文件的语法诊断，非空时扫描必须 fail closed。 */
+  syntacticDiagnostics: readonly ts.Diagnostic[]
+}
+
+/** 单文件中可确认来源的 Node/Electron 路径 API 绑定。 */
 interface RuntimePathBindings {
-  /** 从 node:path 导入的 join/resolve 本地名称。 */
-  pathBuilders: Set<string>
-  /** node:path namespace 本地名称。 */
-  pathNamespaces: Set<string>
-  /** 从 node:os 导入的 homedir 本地名称。 */
-  homeFunctions: Set<string>
-  /** node:os namespace 本地名称。 */
-  osNamespaces: Set<string>
-  /** 从 node:fs 导入的运行时文件 API 本地名称。 */
-  fsFunctions: Set<string>
-  /** node:fs namespace 本地名称。 */
-  fsNamespaces: Set<string>
+  /** 从 node:path 导入的 join/resolve symbol。 */
+  pathBuilders: Set<ts.Symbol>
+  /** node:path default/namespace import symbol。 */
+  pathNamespaces: Set<ts.Symbol>
+  /** 从 node:os 导入的 homedir symbol。 */
+  homeFunctions: Set<ts.Symbol>
+  /** node:os default/namespace import symbol。 */
+  osNamespaces: Set<ts.Symbol>
+  /** 从 node:fs 导入的函数 symbol 及真实导出名。 */
+  fsFunctions: Map<ts.Symbol, string>
+  /** node:fs default/namespace import symbol。 */
+  fsNamespaces: Set<ts.Symbol>
+  /** 从 electron 导入的 shell symbol。 */
+  electronShells: Set<ts.Symbol>
+  /** electron default/namespace import symbol。 */
+  electronNamespaces: Set<ts.Symbol>
 }
 
 /** 把平台相对路径统一转换成稳定 POSIX 格式。 */
@@ -75,19 +89,70 @@ function readSourceFile(path: string): string {
   }
 }
 
-/** 收集 Node 内置模块的真实 import 本地名称，支持 named alias 与 namespace。 */
-function collectRuntimePathBindings(sourceFile: ts.SourceFile): RuntimePathBindings {
+/** 创建只绑定当前虚拟源码的 TypeScript Program。 */
+function createTypeScriptBindingContext(path: string, content: string): TypeScriptBindingContext {
+  /** 单文件合同只需要语法、binder 与本地 symbol，不解析外部模块。 */
+  const options: ts.CompilerOptions = {
+    module: ts.ModuleKind.ESNext,
+    noLib: true,
+    noResolve: true,
+    target: ts.ScriptTarget.Latest,
+  }
+  /** 根据扩展名选择正确 JSX 解析模式。 */
+  const scriptKind = path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
+  /** 当前虚拟源码 AST。 */
+  const sourceFile = ts.createSourceFile(path, content, ts.ScriptTarget.Latest, true, scriptKind)
+  /** 限制 compiler host 只能读取当前文件。 */
+  const host = ts.createCompilerHost(options)
+  host.fileExists = (fileName) => fileName === path
+  host.getSourceFile = (fileName) => fileName === path ? sourceFile : undefined
+  host.readFile = (fileName) => fileName === path ? content : undefined
+  /** Program 提供语法诊断和统一的 symbol identity。 */
+  const program = ts.createProgram([path], options, host)
+  return {
+    sourceFile,
+    checker: program.getTypeChecker(),
+    syntacticDiagnostics: program.getSyntacticDiagnostics(sourceFile),
+  }
+}
+
+/** 把标识符对应的 binder symbol 加入目标集合。 */
+function addIdentifierSymbol(
+  identifier: ts.Identifier,
+  symbols: Set<ts.Symbol>,
+  checker: ts.TypeChecker,
+): void {
+  /** import 本地 binding 的唯一 symbol。 */
+  const symbol = checker.getSymbolAtLocation(identifier)
+  if (symbol) symbols.add(symbol)
+}
+
+/** 判断使用位置是否绑定到目标 import symbol，阻断同名 shadow。 */
+function identifierUsesBinding(
+  identifier: ts.Identifier,
+  symbols: ReadonlySet<ts.Symbol>,
+  checker: ts.TypeChecker,
+): boolean {
+  /** 当前使用位置解析出的 binder symbol。 */
+  const symbol = checker.getSymbolAtLocation(identifier)
+  return symbol !== undefined && symbols.has(symbol)
+}
+
+/** 收集 Node/Electron 模块的真实 import bindings，支持 default、named alias 与 namespace。 */
+function collectRuntimePathBindings(context: TypeScriptBindingContext): RuntimePathBindings {
   /** 当前文件全部已确认来源的运行时绑定。 */
   const bindings: RuntimePathBindings = {
     pathBuilders: new Set(),
     pathNamespaces: new Set(),
     homeFunctions: new Set(),
     osNamespaces: new Set(),
-    fsFunctions: new Set(),
+    fsFunctions: new Map(),
     fsNamespaces: new Set(),
+    electronShells: new Set(),
+    electronNamespaces: new Set(),
   }
 
-  for (const statement of sourceFile.statements) {
+  for (const statement of context.sourceFile.statements) {
     if (
       !ts.isImportDeclaration(statement)
       || statement.importClause?.isTypeOnly
@@ -95,56 +160,105 @@ function collectRuntimePathBindings(sourceFile: ts.SourceFile): RuntimePathBindi
     ) continue
     /** 归一化 node: 前缀后的内置模块名。 */
     const moduleName = statement.moduleSpecifier.text.replace(/^node:/, '')
+    /** default import 与 namespace import 都代表模块对象。 */
+    const defaultBinding = statement.importClause?.name
+    if (defaultBinding) {
+      if (moduleName === 'path') addIdentifierSymbol(defaultBinding, bindings.pathNamespaces, context.checker)
+      if (moduleName === 'os') addIdentifierSymbol(defaultBinding, bindings.osNamespaces, context.checker)
+      if (moduleName === 'fs') addIdentifierSymbol(defaultBinding, bindings.fsNamespaces, context.checker)
+      if (moduleName === 'electron') addIdentifierSymbol(defaultBinding, bindings.electronNamespaces, context.checker)
+    }
     /** 当前 import 的命名或 namespace 绑定。 */
     const namedBindings = statement.importClause?.namedBindings
     if (!namedBindings) continue
     if (ts.isNamespaceImport(namedBindings)) {
-      if (moduleName === 'path') bindings.pathNamespaces.add(namedBindings.name.text)
-      if (moduleName === 'os') bindings.osNamespaces.add(namedBindings.name.text)
-      if (moduleName === 'fs') bindings.fsNamespaces.add(namedBindings.name.text)
+      if (moduleName === 'path') addIdentifierSymbol(namedBindings.name, bindings.pathNamespaces, context.checker)
+      if (moduleName === 'os') addIdentifierSymbol(namedBindings.name, bindings.osNamespaces, context.checker)
+      if (moduleName === 'fs') addIdentifierSymbol(namedBindings.name, bindings.fsNamespaces, context.checker)
+      if (moduleName === 'electron') addIdentifierSymbol(namedBindings.name, bindings.electronNamespaces, context.checker)
       continue
     }
     for (const element of namedBindings.elements) {
       if (element.isTypeOnly) continue
       /** import alias 前的真实导出名称。 */
       const importedName = element.propertyName?.text ?? element.name.text
-      /** 当前文件实际使用的本地名称。 */
-      const localName = element.name.text
+      /** 当前 named import 本地 binding 的 binder symbol。 */
+      const symbol = context.checker.getSymbolAtLocation(element.name)
+      if (!symbol) continue
       if (moduleName === 'path' && (importedName === 'join' || importedName === 'resolve')) {
-        bindings.pathBuilders.add(localName)
+        bindings.pathBuilders.add(symbol)
       }
-      if (moduleName === 'os' && importedName === 'homedir') bindings.homeFunctions.add(localName)
-      if (moduleName === 'fs') bindings.fsFunctions.add(localName)
+      if (moduleName === 'os' && importedName === 'homedir') bindings.homeFunctions.add(symbol)
+      if (moduleName === 'fs') bindings.fsFunctions.set(symbol, importedName)
+      if (moduleName === 'electron' && importedName === 'shell') bindings.electronShells.add(symbol)
     }
   }
   return bindings
 }
 
 /** 判断表达式是否为已确认来源的 homedir() 调用。 */
-function isHomeDirectoryCall(expression: ts.Expression, bindings: RuntimePathBindings): boolean {
+function isHomeDirectoryCall(
+  expression: ts.Expression,
+  bindings: RuntimePathBindings,
+  checker: ts.TypeChecker,
+): boolean {
   if (!ts.isCallExpression(expression)) return false
-  if (ts.isIdentifier(expression.expression)) return bindings.homeFunctions.has(expression.expression.text)
+  if (ts.isIdentifier(expression.expression)) {
+    return identifierUsesBinding(expression.expression, bindings.homeFunctions, checker)
+  }
   return ts.isPropertyAccessExpression(expression.expression)
     && expression.expression.name.text === 'homedir'
     && ts.isIdentifier(expression.expression.expression)
-    && bindings.osNamespaces.has(expression.expression.expression.text)
+    && identifierUsesBinding(expression.expression.expression, bindings.osNamespaces, checker)
 }
 
 /** 判断调用是否为已确认来源的 join/resolve。 */
-function isPathBuilderCall(node: ts.CallExpression, bindings: RuntimePathBindings): boolean {
-  if (ts.isIdentifier(node.expression)) return bindings.pathBuilders.has(node.expression.text)
+function isPathBuilderCall(
+  node: ts.CallExpression,
+  bindings: RuntimePathBindings,
+  checker: ts.TypeChecker,
+): boolean {
+  if (ts.isIdentifier(node.expression)) return identifierUsesBinding(node.expression, bindings.pathBuilders, checker)
   return ts.isPropertyAccessExpression(node.expression)
     && (node.expression.name.text === 'join' || node.expression.name.text === 'resolve')
     && ts.isIdentifier(node.expression.expression)
-    && bindings.pathNamespaces.has(node.expression.expression.text)
+    && identifierUsesBinding(node.expression.expression, bindings.pathNamespaces, checker)
 }
 
-/** 判断调用是否为已确认来源的文件系统 API。 */
-function isFileSystemCall(node: ts.CallExpression, bindings: RuntimePathBindings): boolean {
-  if (ts.isIdentifier(node.expression)) return bindings.fsFunctions.has(node.expression.text)
-  return ts.isPropertyAccessExpression(node.expression)
+/** 返回已确认来源的文件系统调用真实方法名。 */
+function getFileSystemMethodName(
+  node: ts.CallExpression,
+  bindings: RuntimePathBindings,
+  checker: ts.TypeChecker,
+): string | undefined {
+  if (ts.isIdentifier(node.expression)) {
+    /** named import 使用位置的 binder symbol。 */
+    const symbol = checker.getSymbolAtLocation(node.expression)
+    return symbol ? bindings.fsFunctions.get(symbol) : undefined
+  }
+  if (
+    ts.isPropertyAccessExpression(node.expression)
     && ts.isIdentifier(node.expression.expression)
-    && bindings.fsNamespaces.has(node.expression.expression.text)
+    && identifierUsesBinding(node.expression.expression, bindings.fsNamespaces, checker)
+  ) return node.expression.name.text
+  return undefined
+}
+
+/** 判断调用是否为 electron shell.openPath 的精确 path sink。 */
+function isElectronOpenPathCall(
+  node: ts.CallExpression,
+  bindings: RuntimePathBindings,
+  checker: ts.TypeChecker,
+): boolean {
+  if (!ts.isPropertyAccessExpression(node.expression) || node.expression.name.text !== 'openPath') return false
+  /** named import `shell.openPath()`。 */
+  const receiver = node.expression.expression
+  if (ts.isIdentifier(receiver)) return identifierUsesBinding(receiver, bindings.electronShells, checker)
+  /** default/namespace import `electron.shell.openPath()`。 */
+  return ts.isPropertyAccessExpression(receiver)
+    && receiver.name.text === 'shell'
+    && ts.isIdentifier(receiver.expression)
+    && identifierUsesBinding(receiver.expression, bindings.electronNamespaces, checker)
 }
 
 /** 判断文本是否包含精确 `.proma` 路径段，排除 locator、临时文件和相似前缀。 */
@@ -152,8 +266,24 @@ function containsDataRootSegment(text: string): boolean {
   return /(?:^|[~\\/])\.proma(?:$|[\\/])/.test(text)
 }
 
-/** 判断表达式子树是否包含精确数据根路径段。 */
-function expressionContainsDataRootSegment(expression: ts.Expression): boolean {
+/** 去除不改变路径值的数据类型包装。 */
+function unwrapExpression(expression: ts.Expression): ts.Expression {
+  if (ts.isParenthesizedExpression(expression)) return unwrapExpression(expression.expression)
+  if (ts.isAsExpression(expression)) return unwrapExpression(expression.expression)
+  if (ts.isTypeAssertionExpression(expression)) return unwrapExpression(expression.expression)
+  if (ts.isSatisfiesExpression(expression)) return unwrapExpression(expression.expression)
+  if (ts.isNonNullExpression(expression)) return unwrapExpression(expression.expression)
+  return expression
+}
+
+/** 判断表达式及其局部常量来源是否包含精确数据根路径段。 */
+function expressionContainsDataRootSegment(
+  rawExpression: ts.Expression,
+  context: TypeScriptBindingContext,
+  visitedSymbols: Set<ts.Symbol> = new Set(),
+): boolean {
+  /** 当前去除类型包装后的表达式。 */
+  const expression = unwrapExpression(rawExpression)
   if (ts.isStringLiteralLike(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
     return containsDataRootSegment(expression.text)
   }
@@ -162,36 +292,65 @@ function expressionContainsDataRootSegment(expression: ts.Expression): boolean {
       || expression.templateSpans.some((span) => containsDataRootSegment(span.literal.text))
   }
   if (ts.isBinaryExpression(expression)) {
-    return expressionContainsDataRootSegment(expression.left)
-      || expressionContainsDataRootSegment(expression.right)
+    return expressionContainsDataRootSegment(expression.left, context, visitedSymbols)
+      || expressionContainsDataRootSegment(expression.right, context, visitedSymbols)
+  }
+  if (ts.isIdentifier(expression)) {
+    /** 当前标识符解析到的局部值 symbol。 */
+    const symbol = context.checker.getSymbolAtLocation(expression)
+    if (!symbol || visitedSymbols.has(symbol)) return false
+    /** 仅追踪可证明的同文件简单变量初始化值。 */
+    const declaration = symbol.valueDeclaration
+    if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return false
+    visitedSymbols.add(symbol)
+    return expressionContainsDataRootSegment(declaration.initializer, context, visitedSymbols)
   }
   return false
 }
 
 /** 判断表达式子树是否包含已确认来源的 home 目录调用。 */
-function expressionContainsHomeDirectory(expression: ts.Expression, bindings: RuntimePathBindings): boolean {
-  if (isHomeDirectoryCall(expression, bindings)) return true
+function expressionContainsHomeDirectory(
+  expression: ts.Expression,
+  bindings: RuntimePathBindings,
+  checker: ts.TypeChecker,
+): boolean {
+  if (isHomeDirectoryCall(expression, bindings, checker)) return true
   if (ts.isTemplateExpression(expression)) {
-    return expression.templateSpans.some((span) => expressionContainsHomeDirectory(span.expression, bindings))
+    return expression.templateSpans.some((span) => expressionContainsHomeDirectory(span.expression, bindings, checker))
   }
   if (ts.isBinaryExpression(expression)) {
-    return expressionContainsHomeDirectory(expression.left, bindings)
-      || expressionContainsHomeDirectory(expression.right, bindings)
+    return expressionContainsHomeDirectory(expression.left, bindings, checker)
+      || expressionContainsHomeDirectory(expression.right, bindings, checker)
   }
   return false
 }
 
-/** 判断变量名是否明确表达运行时路径职责，避免把普通说明字符串当成路径。 */
-function isPathLikeVariableName(name: ts.BindingName): boolean {
-  return ts.isIdentifier(name) && /(?:path|root|dir|directory|config)/i.test(name.text)
+/** 返回 fs 方法中代表路径的参数位置。 */
+function getFileSystemPathArgumentIndexes(methodName: string): readonly number[] {
+  /** 同时接收源路径与目标路径的稳定 fs API。 */
+  const twoPathMethods = new Set(['copyFile', 'copyFileSync', 'cp', 'cpSync', 'link', 'linkSync', 'rename', 'renameSync', 'symlink', 'symlinkSync'])
+  return twoPathMethods.has(methodName) ? [0, 1] : [0]
+}
+
+/** 把首个语法诊断转换为包含 POSIX 相对路径的位置错误。 */
+function throwFirstSyntaxDiagnostic(context: TypeScriptBindingContext, path: string): void {
+  /** 当前文件首个语法错误即可使扫描 fail closed。 */
+  const diagnostic = context.syntacticDiagnostics[0]
+  if (!diagnostic) return
+  /** 诊断起点对应的一基行列。 */
+  const position = context.sourceFile.getLineAndCharacterOfPosition(diagnostic.start ?? 0)
+  /** TypeScript 诊断文本可能是嵌套消息链。 */
+  const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')
+  throw new Error(`TypeScript 语法错误：${path}:${position.line + 1}:${position.character + 1} ${message}`)
 }
 
 /** 判断当前源码 AST 是否直接构造或消费固定数据根路径。 */
 function sourceHasHardcodedDataRoot(path: string, content: string): boolean {
-  /** 当前源码 AST，字符串和注释由语法结构区分。 */
-  const sourceFile = ts.createSourceFile(path, content, ts.ScriptTarget.Latest, true, path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
-  /** 当前文件中来自 Node 内置模块的可信运行时绑定。 */
-  const bindings = collectRuntimePathBindings(sourceFile)
+  /** 当前源码 binder 上下文，字符串和注释由语法结构区分。 */
+  const context = createTypeScriptBindingContext(path, content)
+  throwFirstSyntaxDiagnostic(context, path)
+  /** 当前文件中来自 Node/Electron 模块的可信运行时绑定。 */
+  const bindings = collectRuntimePathBindings(context)
   /** 首次命中后停止继续遍历。 */
   let found = false
 
@@ -200,30 +359,33 @@ function sourceHasHardcodedDataRoot(path: string, content: string): boolean {
     if (found) return
     if (ts.isCallExpression(node)) {
       if (
-        isPathBuilderCall(node, bindings)
-        && node.arguments.some(expressionContainsDataRootSegment)
+        isPathBuilderCall(node, bindings, context.checker)
+        && node.arguments.some((argument) => expressionContainsDataRootSegment(argument, context))
       ) found = true
-      else if (
-        isFileSystemCall(node, bindings)
-        && node.arguments.some(expressionContainsDataRootSegment)
-      ) found = true
+      else {
+        /** fs path sink 只检查路径参数，避免把文件内容说明文本误判为路径。 */
+        const fsMethodName = getFileSystemMethodName(node, bindings, context.checker)
+        if (fsMethodName) {
+          found = getFileSystemPathArgumentIndexes(fsMethodName).some((index) => {
+            /** 当前 fs 方法约定位置上的路径参数。 */
+            const argument = node.arguments[index]
+            return argument !== undefined && expressionContainsDataRootSegment(argument, context)
+          })
+        } else if (isElectronOpenPathCall(node, bindings, context.checker)) {
+          /** Electron openPath 的首个参数是唯一目标路径。 */
+          const argument = node.arguments[0]
+          found = argument !== undefined && expressionContainsDataRootSegment(argument, context)
+        }
+      }
     } else if (
       (ts.isTemplateExpression(node) || ts.isBinaryExpression(node))
-      && expressionContainsDataRootSegment(node)
-      && (
-        expressionContainsHomeDirectory(node, bindings)
-      )
-    ) found = true
-    else if (
-      ts.isVariableDeclaration(node)
-      && node.initializer
-      && isPathLikeVariableName(node.name)
-      && expressionContainsDataRootSegment(node.initializer)
+      && expressionContainsDataRootSegment(node, context)
+      && expressionContainsHomeDirectory(node, bindings, context.checker)
     ) found = true
     if (!found) ts.forEachChild(node, visit)
   }
 
-  visit(sourceFile)
+  visit(context.sourceFile)
   return found
 }
 
