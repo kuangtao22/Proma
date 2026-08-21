@@ -40,6 +40,17 @@ export function reduceWorkspaceActionPhase(
   return phase
 }
 
+/** 删除已放弃项目的本地进度，同时保留其他项目的事件缓存。 */
+export function removeWorkspaceRelocationProgress(
+  current: Record<string, WorkspaceRelocationProgress>,
+  workspaceId: string,
+): Record<string, WorkspaceRelocationProgress> {
+  /** 浅拷贝避免直接修改 React 现有状态对象。 */
+  const next = { ...current }
+  delete next[workspaceId]
+  return next
+}
+
 /** 项目路径动作需要的 renderer API，测试可注入窄替身。 */
 export interface WorkspacePathActionDependencies {
   pickWorkspaceTarget(input: PickWorkspaceTargetInput): Promise<WorkspaceTargetSelection | null>
@@ -213,6 +224,7 @@ export function WorkspacePathList({
         workspaceId: progress.workspaceId,
         operationId: progress.operationId,
       })
+      setProgressByWorkspace((current) => removeWorkspaceRelocationProgress(current, progress.workspaceId))
       onChanged?.()
     } catch (abandonError) {
       setActionError(toErrorMessage(abandonError, '无法放弃项目迁移'))

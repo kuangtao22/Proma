@@ -17,6 +17,18 @@ function createWorkspace(overrides: Partial<WorkspacePathState>): WorkspacePathS
 }
 
 describe('WorkspacePathList', () => {
+  test('Given 放弃迁移成功 When 清理本地进度 Then 删除当前项目且保留其他项目缓存', () => {
+    const { removeWorkspaceRelocationProgress } = workspacePathModule
+    const current = {
+      'workspace-1': { operationId: 'operation-1', workspaceId: 'workspace-1', stage: 'failed' as const, completedBytes: 2, totalBytes: 4 },
+      'workspace-2': { operationId: 'operation-2', workspaceId: 'workspace-2', stage: 'copying' as const, completedBytes: 1, totalBytes: 4 },
+    }
+
+    expect(removeWorkspaceRelocationProgress(current, 'workspace-1')).toEqual({
+      'workspace-2': current['workspace-2'],
+    })
+  })
+
   test('Given start Promise 仍 pending When 收到 copying 后点击取消 Then starting 转 running 且仅 cancelling 禁用取消', () => {
     const { reduceWorkspaceActionPhase } = workspacePathModule
     const starting = reduceWorkspaceActionPhase('idle', { type: 'start-requested' })
