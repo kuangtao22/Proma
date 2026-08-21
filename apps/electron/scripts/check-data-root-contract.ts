@@ -49,6 +49,16 @@ interface RuntimePathBindings {
   electronNamespaces: Set<ts.Symbol>
 }
 
+/** 使用位置前可证明的最近局部定义。 */
+interface ReachingDefinition {
+  /** 是否已经在当前或外层词法语句块中找到定义。 */
+  found: boolean
+  /** 无法线性证明唯一结果时按违规 fail closed。 */
+  uncertain: boolean
+  /** 最近简单 initializer 或 `=` 右值；无 initializer 时为空。 */
+  value?: ts.Expression
+}
+
 /** 把平台相对路径统一转换成稳定 POSIX 格式。 */
 function toPosixPath(path: string): string {
   return path.split(sep).join(posix.sep)
@@ -165,7 +175,9 @@ function collectRuntimePathBindings(context: TypeScriptBindingContext): RuntimeP
     if (defaultBinding) {
       if (moduleName === 'path') addIdentifierSymbol(defaultBinding, bindings.pathNamespaces, context.checker)
       if (moduleName === 'os') addIdentifierSymbol(defaultBinding, bindings.osNamespaces, context.checker)
-      if (moduleName === 'fs') addIdentifierSymbol(defaultBinding, bindings.fsNamespaces, context.checker)
+      if (moduleName === 'fs' || moduleName === 'fs/promises') {
+        addIdentifierSymbol(defaultBinding, bindings.fsNamespaces, context.checker)
+      }
       if (moduleName === 'electron') addIdentifierSymbol(defaultBinding, bindings.electronNamespaces, context.checker)
     }
     /** 当前 import 的命名或 namespace 绑定。 */
@@ -174,7 +186,9 @@ function collectRuntimePathBindings(context: TypeScriptBindingContext): RuntimeP
     if (ts.isNamespaceImport(namedBindings)) {
       if (moduleName === 'path') addIdentifierSymbol(namedBindings.name, bindings.pathNamespaces, context.checker)
       if (moduleName === 'os') addIdentifierSymbol(namedBindings.name, bindings.osNamespaces, context.checker)
-      if (moduleName === 'fs') addIdentifierSymbol(namedBindings.name, bindings.fsNamespaces, context.checker)
+      if (moduleName === 'fs' || moduleName === 'fs/promises') {
+        addIdentifierSymbol(namedBindings.name, bindings.fsNamespaces, context.checker)
+      }
       if (moduleName === 'electron') addIdentifierSymbol(namedBindings.name, bindings.electronNamespaces, context.checker)
       continue
     }
@@ -189,7 +203,9 @@ function collectRuntimePathBindings(context: TypeScriptBindingContext): RuntimeP
         bindings.pathBuilders.add(symbol)
       }
       if (moduleName === 'os' && importedName === 'homedir') bindings.homeFunctions.add(symbol)
-      if (moduleName === 'fs') bindings.fsFunctions.set(symbol, importedName)
+      if (moduleName === 'fs/promises') bindings.fsFunctions.set(symbol, importedName)
+      else if (moduleName === 'fs' && importedName === 'promises') bindings.fsNamespaces.add(symbol)
+      else if (moduleName === 'fs') bindings.fsFunctions.set(symbol, importedName)
       if (moduleName === 'electron' && importedName === 'shell') bindings.electronShells.add(symbol)
     }
   }
@@ -241,6 +257,13 @@ function getFileSystemMethodName(
     && ts.isIdentifier(node.expression.expression)
     && identifierUsesBinding(node.expression.expression, bindings.fsNamespaces, checker)
   ) return node.expression.name.text
+  if (
+    ts.isPropertyAccessExpression(node.expression)
+    && ts.isPropertyAccessExpression(node.expression.expression)
+    && node.expression.expression.name.text === 'promises'
+    && ts.isIdentifier(node.expression.expression.expression)
+    && identifierUsesBinding(node.expression.expression.expression, bindings.fsNamespaces, checker)
+  ) return node.expression.name.text
   return undefined
 }
 
@@ -276,7 +299,186 @@ function unwrapExpression(expression: ts.Expression): ts.Expression {
   return expression
 }
 
-/** 判断表达式及其局部常量来源是否包含精确数据根路径段。 */
+/** 判断节点是否建立新的函数执行边界，外部 reaching definition 不读取其内部写入。 */
+function isFunctionBoundary(node: ts.Node): boolean {
+  return ts.isFunctionDeclaration(node)
+    || ts.isFunctionExpression(node)
+    || ts.isArrowFunction(node)
+    || ts.isMethodDeclaration(node)
+    || ts.isConstructorDeclaration(node)
+    || ts.isGetAccessorDeclaration(node)
+    || ts.isSetAccessorDeclaration(node)
+}
+
+/** 判断赋值目标是否直接或通过解构写入指定 symbol。 */
+function assignmentTargetUsesSymbol(
+  target: ts.Expression,
+  symbol: ts.Symbol,
+  checker: ts.TypeChecker,
+): boolean {
+  if (ts.isIdentifier(target)) return checker.getSymbolAtLocation(target) === symbol
+  if (ts.isParenthesizedExpression(target)) {
+    return assignmentTargetUsesSymbol(target.expression, symbol, checker)
+  }
+  if (ts.isArrayLiteralExpression(target)) {
+    return target.elements.some((element) => (
+      ts.isExpression(element) && assignmentTargetUsesSymbol(element, symbol, checker)
+    ))
+  }
+  if (ts.isObjectLiteralExpression(target)) {
+    return target.properties.some((property) => {
+      if (ts.isShorthandPropertyAssignment(property)) {
+        return checker.getSymbolAtLocation(property.name) === symbol
+      }
+      if (ts.isPropertyAssignment(property)) {
+        return assignmentTargetUsesSymbol(property.initializer, symbol, checker)
+      }
+      if (ts.isSpreadAssignment(property)) {
+        return assignmentTargetUsesSymbol(property.expression, symbol, checker)
+      }
+      return false
+    })
+  }
+  return false
+}
+
+/** 判断节点子树是否直接包含固定数据根字面量。 */
+function nodeContainsDataRootLiteral(node: ts.Node): boolean {
+  if (ts.isStringLiteralLike(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+    return containsDataRootSegment(node.text)
+  }
+  if (ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) {
+    return containsDataRootSegment(node.text)
+  }
+  /** 子节点只检查静态字面量，不把动态未知值臆测为固定根。 */
+  let found = false
+  ts.forEachChild(node, (child) => {
+    if (!found && nodeContainsDataRootLiteral(child)) found = true
+  })
+  return found
+}
+
+/** 判断语句是否在非线性或复杂位置把固定根写入指定 symbol。 */
+function statementHasUncertainHardcodedWrite(
+  statement: ts.Statement,
+  symbol: ts.Symbol,
+  context: TypeScriptBindingContext,
+): boolean {
+  /** 当前语句中是否发现无法作为直接 reaching definition 建模的写入。 */
+  let found = false
+  const visit = (node: ts.Node): void => {
+    if (found || (node !== statement && isFunctionBoundary(node))) return
+    if (
+      ts.isBinaryExpression(node)
+      && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+      && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+      && assignmentTargetUsesSymbol(node.left, symbol, context.checker)
+    ) {
+      if (
+        nodeContainsDataRootLiteral(node.right)
+        || expressionContainsDataRootSegment(node.right, context, new Set([symbol]))
+      ) found = true
+      if (found) return
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(statement)
+  return found
+}
+
+/** 返回使用位置所在的直接语句及其顺序容器。 */
+function findStatementPosition(node: ts.Node): {
+  container: ts.Block | ts.SourceFile
+  index: number
+} | undefined {
+  /** 向上找到第一个由 SourceFile 或 Block 直接持有的语句。 */
+  let current: ts.Node = node
+  while (current.parent) {
+    const parent = current.parent
+    if ((ts.isSourceFile(parent) || ts.isBlock(parent)) && ts.isStatement(current)) {
+      return { container: parent, index: parent.statements.indexOf(current) }
+    }
+    current = parent
+  }
+  return undefined
+}
+
+/** 判断变量解构 binding 是否声明指定 symbol。 */
+function bindingNameUsesSymbol(
+  name: ts.BindingName,
+  symbol: ts.Symbol,
+  checker: ts.TypeChecker,
+): boolean {
+  if (ts.isIdentifier(name)) return checker.getSymbolAtLocation(name) === symbol
+  return name.elements.some((element) => (
+    !ts.isOmittedExpression(element)
+    && bindingNameUsesSymbol(element.name, symbol, checker)
+  ))
+}
+
+/** 在单条顺序语句中提取指定 symbol 的直接定义。 */
+function getDirectDefinition(
+  statement: ts.Statement,
+  symbol: ts.Symbol,
+  context: TypeScriptBindingContext,
+): ReachingDefinition {
+  if (ts.isVariableStatement(statement)) {
+    for (const declaration of statement.declarationList.declarations) {
+      if (ts.isIdentifier(declaration.name) && context.checker.getSymbolAtLocation(declaration.name) === symbol) {
+        return { found: true, uncertain: false, value: declaration.initializer }
+      }
+      if (!ts.isIdentifier(declaration.name) && bindingNameUsesSymbol(declaration.name, symbol, context.checker)) {
+        return {
+          found: true,
+          uncertain: Boolean(
+            declaration.initializer
+            && (
+              nodeContainsDataRootLiteral(declaration.initializer)
+              || expressionContainsDataRootSegment(declaration.initializer, context, new Set([symbol]))
+            )
+          ),
+        }
+      }
+    }
+  }
+  if (ts.isExpressionStatement(statement) && ts.isBinaryExpression(statement.expression)) {
+    /** 仅简单标识符 `=` 可以确定性覆盖旧值。 */
+    const assignment = statement.expression
+    if (
+      assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && ts.isIdentifier(assignment.left)
+      && context.checker.getSymbolAtLocation(assignment.left) === symbol
+    ) return { found: true, uncertain: false, value: assignment.right }
+  }
+  if (statementHasUncertainHardcodedWrite(statement, symbol, context)) {
+    return { found: true, uncertain: true }
+  }
+  return { found: false, uncertain: false }
+}
+
+/** 从使用位置向外按语句顺序查找同一 symbol 的最近定义。 */
+function findReachingDefinition(
+  identifier: ts.Identifier,
+  symbol: ts.Symbol,
+  context: TypeScriptBindingContext,
+): ReachingDefinition {
+  /** 每层从容器开头扫描到当前语句，后定义自然覆盖前定义。 */
+  let queryNode: ts.Node = identifier
+  while (true) {
+    const position = findStatementPosition(queryNode)
+    if (!position || position.index < 0) return { found: false, uncertain: false }
+    let latest: ReachingDefinition = { found: false, uncertain: false }
+    for (let index = 0; index < position.index; index += 1) {
+      const definition = getDirectDefinition(position.container.statements[index]!, symbol, context)
+      if (definition.found) latest = definition
+    }
+    if (latest.found) return latest
+    if (ts.isSourceFile(position.container)) return latest
+    queryNode = position.container
+  }
+}
+
+/** 判断表达式及其按顺序可达的局部值是否包含精确数据根路径段。 */
 function expressionContainsDataRootSegment(
   rawExpression: ts.Expression,
   context: TypeScriptBindingContext,
@@ -289,7 +491,10 @@ function expressionContainsDataRootSegment(
   }
   if (ts.isTemplateExpression(expression)) {
     return containsDataRootSegment(expression.head.text)
-      || expression.templateSpans.some((span) => containsDataRootSegment(span.literal.text))
+      || expression.templateSpans.some((span) => (
+        containsDataRootSegment(span.literal.text)
+        || expressionContainsDataRootSegment(span.expression, context, visitedSymbols)
+      ))
   }
   if (ts.isBinaryExpression(expression)) {
     return expressionContainsDataRootSegment(expression.left, context, visitedSymbols)
@@ -299,11 +504,12 @@ function expressionContainsDataRootSegment(
     /** 当前标识符解析到的局部值 symbol。 */
     const symbol = context.checker.getSymbolAtLocation(expression)
     if (!symbol || visitedSymbols.has(symbol)) return false
-    /** 仅追踪可证明的同文件简单变量初始化值。 */
-    const declaration = symbol.valueDeclaration
-    if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return false
+    /** 按使用位置查找最近顺序定义；非线性写入按违规 fail closed。 */
+    const definition = findReachingDefinition(expression, symbol, context)
+    if (definition.uncertain) return true
+    if (!definition.found || !definition.value) return false
     visitedSymbols.add(symbol)
-    return expressionContainsDataRootSegment(declaration.initializer, context, visitedSymbols)
+    return expressionContainsDataRootSegment(definition.value, context, visitedSymbols)
   }
   return false
 }

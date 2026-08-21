@@ -113,6 +113,137 @@ describe('数据根合同检查器', () => {
     }
   })
 
+  test('Given 局部路径变量被顺序赋值 When 流入文件 sink Then 只按 sink 前最近定义判定', () => {
+    /** 简单赋值必须按同一词法语句块的执行顺序覆盖 initializer。 */
+    const rootDir = createFixture({
+      'apps/electron/src/main/unsafe-after-initializer.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        runtimePath = '~/.proma/settings.json'
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/safe-after-hardcoded.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '~/.proma/settings.json'
+        runtimePath = '/tmp/safe.json'
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/unsafe-after-declaration.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath: string
+        runtimePath = '~/.proma/settings.json'
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/unsafe-before-safe-assignment.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '~/.proma/settings.json'
+        readFileSync(runtimePath, 'utf8')
+        runtimePath = '/tmp/safe.json'
+      `,
+      'apps/electron/src/main/separate-scopes.ts': `
+        import { readFileSync } from 'node:fs'
+        {
+          let blockPath = '/tmp/unused.json'
+          blockPath = '~/.proma/settings.json'
+        }
+        {
+          let blockPath = '~/.proma/settings.json'
+          blockPath = '/tmp/safe.json'
+          readFileSync(blockPath, 'utf8')
+        }
+        function mutateOtherScope(): void {
+          let runtimePath = '/tmp/unused.json'
+          runtimePath = '~/.proma/settings.json'
+        }
+        function readSafePath(): void {
+          let runtimePath = '~/.proma/settings.json'
+          runtimePath = '/tmp/safe.json'
+          readFileSync(runtimePath, 'utf8')
+        }
+      `,
+      'apps/electron/src/main/uncertain-branch.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        if (shouldUseLegacyRoot) runtimePath = '~/.proma/settings.json'
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/uncertain-branch-alias.ts': `
+        import { readFileSync } from 'node:fs'
+        const legacyPath = '~/.proma/settings.json'
+        let runtimePath = '/tmp/safe.json'
+        if (shouldUseLegacyRoot) runtimePath = legacyPath
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/uncertain-destructuring.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        ;[runtimePath] = ['~/.proma/settings.json']
+        readFileSync(runtimePath, 'utf8')
+      `,
+    })
+
+    try {
+      expect(findHardcodedDataRoots(rootDir)).toEqual([
+        'apps/electron/src/main/uncertain-branch-alias.ts',
+        'apps/electron/src/main/uncertain-branch.ts',
+        'apps/electron/src/main/uncertain-destructuring.ts',
+        'apps/electron/src/main/unsafe-after-declaration.ts',
+        'apps/electron/src/main/unsafe-after-initializer.ts',
+        'apps/electron/src/main/unsafe-before-safe-assignment.ts',
+      ])
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given fs promises 的真实 import 绑定 When 路径流入异步文件 API Then 全部识别且不误报 shadow', () => {
+    /** promises 子模块、promises 属性与 named alias 都应归一为同一类 fs sink。 */
+    const rootDir = createFixture({
+      'apps/electron/src/main/promises-named.ts': `
+        import { readFile } from 'node:fs/promises'
+        await readFile('~/.proma/settings.json', 'utf8')
+      `,
+      'apps/electron/src/main/promises-namespace.ts': `
+        import * as fs from 'node:fs/promises'
+        await fs.readFile('~/.proma/settings.json', 'utf8')
+      `,
+      'apps/electron/src/main/promises-default.ts': `
+        import fs from 'fs/promises'
+        await fs.readFile('~/.proma/settings.json', 'utf8')
+      `,
+      'apps/electron/src/main/promises-alias.ts': `
+        import { promises as fs } from 'node:fs'
+        await fs.readFile('~/.proma/settings.json', 'utf8')
+      `,
+      'apps/electron/src/main/promises-property.ts': `
+        import * as fs from 'node:fs'
+        await fs.promises.readFile('~/.proma/settings.json', 'utf8')
+      `,
+      'apps/electron/src/main/promises-safe.ts': `
+        import { readFile } from 'node:fs/promises'
+        await readFile('/tmp/safe.json', 'utf8')
+      `,
+      'apps/electron/src/main/promises-shadow.ts': `
+        import * as fs from 'node:fs/promises'
+        function explain(fs: { readFile: (message: string) => void }): void {
+          fs.readFile('请查看 ~/.proma 后重试')
+        }
+      `,
+    })
+
+    try {
+      expect(findHardcodedDataRoots(rootDir)).toEqual([
+        'apps/electron/src/main/promises-alias.ts',
+        'apps/electron/src/main/promises-default.ts',
+        'apps/electron/src/main/promises-named.ts',
+        'apps/electron/src/main/promises-namespace.ts',
+        'apps/electron/src/main/promises-property.ts',
+      ])
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true })
+    }
+  })
+
   test('Given 仅有说明文本、测试和权威边界 When 扫描主进程 Then 不误报', () => {
     /** 注释、JSDoc、用户可见文本与精确白名单都不构成业务路径绕过。 */
     const rootDir = createFixture({

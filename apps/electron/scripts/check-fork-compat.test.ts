@@ -362,6 +362,21 @@ describe('fork 上游兼容检查器', () => {
     expect(getCheck(files, 'bridge-composition').passed).toBe(true)
   })
 
+  test('Given gated dynamic 模式仅增加 type-only export 与 shadowed require When 检查 Bridge 组合点 Then 仍通过', () => {
+    /** 类型转出不求值模块，本地 require binding 也不是 CommonJS 依赖。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/index.ts': `
+        export type { LanBridgeRegistration } from './lib/lan-bridge/lan-bridge'
+        function require(_specifier: string): object { return {} }
+        void require('./lib/lan-bridge/lan-bridge')
+        ${createGatedBridgeMain()}
+      `,
+    }
+
+    expect(getCheck(files, 'bridge-composition').passed).toBe(true)
+  })
+
   /** 延迟加载只允许精确模块、直接 bootstrap 路径和 normal gate 后顺序。 */
   const invalidGatedBridgeCases = [
     {
@@ -398,6 +413,34 @@ describe('fork 上游兼容检查器', () => {
       name: 'normal gate 前存在 side-effect runtime import',
       mutate: (source: string) => `
         import './lib/lan-bridge/lan-bridge'
+        ${source}
+      `,
+    },
+    {
+      name: 'normal gate 前存在顶层 dynamic import',
+      mutate: (source: string) => `
+        void import('./lib/lan-bridge/lan-bridge')
+        ${source}
+      `,
+    },
+    {
+      name: 'normal gate 前存在 CommonJS require',
+      mutate: (source: string) => `
+        require('./lib/lan-bridge/lan-bridge')
+        ${source}
+      `,
+    },
+    {
+      name: 'normal gate 前存在 runtime export star',
+      mutate: (source: string) => `
+        export * from './lib/lan-bridge/lan-bridge'
+        ${source}
+      `,
+    },
+    {
+      name: 'normal gate 前存在 runtime named re-export',
+      mutate: (source: string) => `
+        export { createLanBridgeRegistration } from './lib/lan-bridge/lan-bridge'
         ${source}
       `,
     },

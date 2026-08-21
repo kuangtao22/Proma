@@ -211,16 +211,6 @@ function hasRuntimeImport(importClause: ts.ImportClause | undefined): boolean {
   return importClause.namedBindings.elements.some((element) => !element.isTypeOnly)
 }
 
-/** 判断目标模块是否在 Program 顶层存在会提前求值的运行时 import。 */
-function hasTopLevelRuntimeImport(sourceFile: ts.SourceFile, modulePath: string): boolean {
-  return sourceFile.statements.some((statement) => (
-    ts.isImportDeclaration(statement)
-    && ts.isStringLiteralLike(statement.moduleSpecifier)
-    && statement.moduleSpecifier.text === modulePath
-    && hasRuntimeImport(statement.importClause)
-  ))
-}
-
 /** 判断 export clause 是否会生成运行时代码。 */
 function hasRuntimeExport(node: ts.ExportDeclaration): boolean {
   if (node.isTypeOnly) return false
@@ -228,6 +218,51 @@ function hasRuntimeExport(node: ts.ExportDeclaration): boolean {
   if (ts.isNamespaceExport(node.exportClause)) return true
   if (node.exportClause.elements.length === 0) return true
   return node.exportClause.elements.some((element) => !element.isTypeOnly)
+}
+
+/** 统计绑定明确的目标模块运行时依赖，排除 type-only 与局部 shadow require。 */
+function countRuntimeDependenciesForModule(
+  context: TypeScriptBindingContext,
+  modulePath: string,
+): number {
+  /** 当前文件中会求值目标模块的依赖数量。 */
+  let count = 0
+  /** 只接受精确字符串模块说明符。 */
+  const isTargetModule = (expression: ts.Expression | undefined): boolean => (
+    expression !== undefined
+    && ts.isStringLiteralLike(expression)
+    && expression.text === modulePath
+  )
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isImportDeclaration(node)
+      && hasRuntimeImport(node.importClause)
+      && isTargetModule(node.moduleSpecifier)
+    ) count += 1
+    else if (
+      ts.isExportDeclaration(node)
+      && node.moduleSpecifier
+      && hasRuntimeExport(node)
+      && isTargetModule(node.moduleSpecifier)
+    ) count += 1
+    else if (
+      ts.isImportEqualsDeclaration(node)
+      && !node.isTypeOnly
+      && ts.isExternalModuleReference(node.moduleReference)
+      && isTargetModule(node.moduleReference.expression)
+    ) count += 1
+    else if (ts.isCallExpression(node) && isTargetModule(node.arguments[0])) {
+      /** import() 无本地 binding；require 仅在未绑定全局形态下算 CommonJS 依赖。 */
+      const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword
+      const isUnboundRequire = ts.isIdentifier(node.expression)
+        && node.expression.text === 'require'
+        && context.checker.getSymbolAtLocation(node.expression) === undefined
+      if (isDynamicImport || isUnboundRequire) count += 1
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(context.sourceFile)
+  return count
 }
 
 /** 提取源码中真实存在的运行时模块依赖，覆盖静态、动态、require 与 re-export。 */
@@ -1074,9 +1109,9 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     './lib/lan-bridge/lan-bridge',
     'createLanBridgeRegistration',
   )
-  /** 动态门控模式禁止顶层提前求值同一 LAN 运行时模块。 */
-  const hasEagerLanRuntimeImport = deferredFactoryBindings.size > 0
-    && hasTopLevelRuntimeImport(mainSource, './lib/lan-bridge/lan-bridge')
+  /** 动态门控模式只允许注册相邻的唯一目标模块 dynamic import。 */
+  const hasUnexpectedLanRuntimeDependency = deferredFactoryBindings.size > 0
+    && countRuntimeDependenciesForModule(mainContext, './lib/lan-bridge/lan-bridge') !== 1
   /** 静态与受控延迟 factory 都以 symbol identity 参与重复注册统计。 */
   const allFactoryBindings = new Map([...factoryBindings, ...deferredFactoryBindings])
   const eventBusBindings = collectImportedLocalBindings(
@@ -1125,8 +1160,8 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
   if (registrationCount !== 1 || topLevelRegistrationCount + gatedRegistrationCount !== 1) {
     details.push('主进程必须且只能在 Program 顶层或数据根 normal gate 后注册一次 createLanBridgeRegistration(agentEventBus)')
   }
-  if (hasEagerLanRuntimeImport) {
-    details.push('数据根 gated dynamic 模式禁止在 Program 顶层运行时导入 LAN Bridge 模块')
+  if (hasUnexpectedLanRuntimeDependency) {
+    details.push('数据根 gated dynamic 模式只允许 normal gate 后与注册相邻的唯一 LAN Bridge dynamic import')
   }
   if (!hasReachableStart) details.push('主进程 bootstrap 可达顶层路径未启动统一 Bridge 生命周期')
   if (!registrationFactory) details.push('LAN Bridge 未导出 createLanBridgeRegistration')
