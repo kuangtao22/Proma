@@ -415,6 +415,93 @@ describe('fork 上游兼容检查器', () => {
     expect(getCheck(files, 'bridge-composition').passed).toBe(false)
   })
 
+  test('Given normal gate 关键证明声明使用 let 或在 guard 前重赋 When 检查 Bridge 组合点 Then 全部失败', () => {
+    /** 不可变合同要求 locator、inspect result 和 mode 均由单一 const 声明固定。 */
+    const invalidMains = [
+      createGatedBridgeMain().replace('const dataRootLocator =', 'let dataRootLocator ='),
+      createGatedBridgeMain().replace('const locatorResult =', 'let locatorResult ='),
+      createGatedBridgeMain().replace('const dataRootMode =', 'let dataRootMode ='),
+      createGatedBridgeMain()
+        .replace('const dataRootLocator =', 'let dataRootLocator =')
+        .replace(
+          '      const locatorResult = dataRootLocator.inspect()',
+          '      dataRootLocator = getDefaultDataRootLocator()\n      const locatorResult = dataRootLocator.inspect()',
+        ),
+      createGatedBridgeMain()
+        .replace('const locatorResult =', 'let locatorResult =')
+        .replace(
+          '      const dataRootMode = resolveDataRootStartupMode(locatorResult)',
+          '      locatorResult = dataRootLocator.inspect()\n      const dataRootMode = resolveDataRootStartupMode(locatorResult)',
+        ),
+      createGatedBridgeMain()
+        .replace('const dataRootMode =', 'let dataRootMode =')
+        .replace(
+          "      if (dataRootMode !== 'normal') {",
+          "      dataRootMode = 'normal'\n      if (dataRootMode !== 'normal') {",
+        ),
+    ]
+
+    for (const main of invalidMains) {
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/index.ts': main,
+      }
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    }
+  })
+
+  test('Given normal gate 关键证明声明含多个 declarator When 检查 Bridge 组合点 Then 全部失败', () => {
+    /** 每个证明值都必须独占一条 const 语句，避免多 declarator 带来审计歧义。 */
+    const invalidMains = [
+      createGatedBridgeMain().replace(
+        'const dataRootLocator = getDefaultDataRootLocator()',
+        'const dataRootLocator = getDefaultDataRootLocator(), unrelatedLocatorValue = 1',
+      ),
+      createGatedBridgeMain().replace(
+        'const locatorResult = dataRootLocator.inspect()',
+        'const locatorResult = dataRootLocator.inspect(), unrelatedInspectValue = 1',
+      ),
+      createGatedBridgeMain().replace(
+        'const dataRootMode = resolveDataRootStartupMode(locatorResult)',
+        'const dataRootMode = resolveDataRootStartupMode(locatorResult), unrelatedModeValue = 1',
+      ),
+    ]
+
+    for (const main of invalidMains) {
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/index.ts': main,
+      }
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    }
+  })
+
+  test('Given normal gate proof chain 间插入赋值或调用 When 检查 Bridge 组合点 Then 全部失败', () => {
+    /** factory、inspect、resolver 与 guard 必须直接相邻，中间不允许任何可影响证明链的语句。 */
+    const invalidMains = [
+      createGatedBridgeMain().replace(
+        '      const locatorResult = dataRootLocator.inspect()',
+        '      refreshDataRootLocator()\n      const locatorResult = dataRootLocator.inspect()',
+      ),
+      createGatedBridgeMain().replace(
+        '      const dataRootMode = resolveDataRootStartupMode(locatorResult)',
+        '      proofState = locatorResult\n      const dataRootMode = resolveDataRootStartupMode(locatorResult)',
+      ),
+      createGatedBridgeMain().replace(
+        "      if (dataRootMode !== 'normal') {",
+        "      auditStartupMode(dataRootMode)\n      if (dataRootMode !== 'normal') {",
+      ),
+    ]
+
+    for (const main of invalidMains) {
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/index.ts': main,
+      }
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    }
+  })
+
   test('Given gated dynamic 模式仅增加 LAN type-only import When 检查 Bridge 组合点 Then 仍通过', () => {
     /** type-only import 不会在 normal gate 前求值 LAN 运行时模块。 */
     const files = {

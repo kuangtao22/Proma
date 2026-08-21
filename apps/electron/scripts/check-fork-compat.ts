@@ -629,63 +629,72 @@ function hasNormalModeGuardBefore(
   resolverBindings: ReadonlyMap<string, ts.Symbol>,
   checker: ts.TypeChecker,
 ): boolean {
-  /** 返回指定位置前第一个满足来源合同的直接变量声明及其语句位置。 */
-  const findDeclaration = (
-    afterIndex: number,
-    predicate: (declaration: ts.VariableDeclaration) => boolean,
-  ): { declaration: ts.VariableDeclaration; index: number } | undefined => {
-    for (let index = afterIndex + 1; index < beforeIndex; index += 1) {
-      const statement = statements[index]
-      if (!statement || !ts.isVariableStatement(statement)) continue
-      const declaration = statement.declarationList.declarations.find(predicate)
-      if (declaration) return { declaration, index }
-    }
-    return undefined
+  /** 关键证明值必须由独立、单 declarator 的 const 语句固定。 */
+  const getSingleConstDeclaration = (statement: ts.Statement | undefined): ts.VariableDeclaration | undefined => {
+    if (
+      !statement
+      || !ts.isVariableStatement(statement)
+      || (statement.declarationList.flags & ts.NodeFlags.Const) === 0
+      || statement.declarationList.declarations.length !== 1
+    ) return undefined
+    return statement.declarationList.declarations[0]
   }
-  /** locator 必须由 path-management-ipc 的真实 factory 直接创建。 */
-  const locator = findDeclaration(-1, (declaration) => (
-    ts.isIdentifier(declaration.name)
-    && declaration.initializer !== undefined
-    && ts.isCallExpression(declaration.initializer)
-    && declaration.initializer.arguments.length === 0
-    && ts.isIdentifier(declaration.initializer.expression)
-    && identifierUsesImportedBinding(declaration.initializer.expression, locatorFactoryBindings, checker)
-  ))
-  if (!locator || !ts.isIdentifier(locator.declaration.name)) return false
-  const locatorSymbol = checker.getSymbolAtLocation(locator.declaration.name)
-  if (!locatorSymbol) return false
-  /** inspect 结果必须直接来自同一 locator symbol，不能用同名或其他对象伪造。 */
-  const inspection = findDeclaration(locator.index, (declaration) => (
-    ts.isIdentifier(declaration.name)
-    && declaration.initializer !== undefined
-    && ts.isCallExpression(declaration.initializer)
-    && declaration.initializer.arguments.length === 0
-    && ts.isPropertyAccessExpression(declaration.initializer.expression)
-    && declaration.initializer.expression.name.text === 'inspect'
-    && ts.isIdentifier(declaration.initializer.expression.expression)
-    && checker.getSymbolAtLocation(declaration.initializer.expression.expression) === locatorSymbol
-  ))
-  if (!inspection || !ts.isIdentifier(inspection.declaration.name)) return false
-  const inspectionSymbol = checker.getSymbolAtLocation(inspection.declaration.name)
-  if (!inspectionSymbol) return false
-  /** startup mode 必须由真实 resolver 消费同一 inspect 结果。 */
-  const mode = findDeclaration(inspection.index, (declaration) => (
-    ts.isIdentifier(declaration.name)
-    && declaration.initializer !== undefined
-    && ts.isCallExpression(declaration.initializer)
-    && ts.isIdentifier(declaration.initializer.expression)
-    && identifierUsesImportedBinding(declaration.initializer.expression, resolverBindings, checker)
-    && declaration.initializer.arguments.length === 1
-    && ts.isIdentifier(declaration.initializer.arguments[0])
-    && checker.getSymbolAtLocation(declaration.initializer.arguments[0]) === inspectionSymbol
-  ))
-  if (!mode || !ts.isIdentifier(mode.declaration.name)) return false
-  const modeSymbol = checker.getSymbolAtLocation(mode.declaration.name)
-  if (!modeSymbol) return false
-  return statements.some((statement, index) => {
-    if (index <= mode.index || index >= beforeIndex || !ts.isIfStatement(statement)) return false
+  /** 连续扫描 factory 起点，只接受 factory → inspect → resolver → guard 四条相邻语句。 */
+  for (let locatorIndex = 0; locatorIndex + 3 < beforeIndex; locatorIndex += 1) {
+    /** locator 必须由 path-management-ipc 的真实 factory 直接创建。 */
+    const locator = getSingleConstDeclaration(statements[locatorIndex])
+    if (
+      !locator
+      || !ts.isIdentifier(locator.name)
+      || !locator.initializer
+      || !ts.isCallExpression(locator.initializer)
+      || locator.initializer.arguments.length !== 0
+      || !ts.isIdentifier(locator.initializer.expression)
+      || !identifierUsesImportedBinding(locator.initializer.expression, locatorFactoryBindings, checker)
+    ) continue
+    /** locator symbol 用于绑定紧随其后的 inspect 调用。 */
+    const locatorSymbol = checker.getSymbolAtLocation(locator.name)
+    if (!locatorSymbol) continue
+
+    /** inspect 结果必须在下一条语句中直接来自同一 locator symbol。 */
+    const inspection = getSingleConstDeclaration(statements[locatorIndex + 1])
+    if (
+      !inspection
+      || !ts.isIdentifier(inspection.name)
+      || !inspection.initializer
+      || !ts.isCallExpression(inspection.initializer)
+      || inspection.initializer.arguments.length !== 0
+      || !ts.isPropertyAccessExpression(inspection.initializer.expression)
+      || inspection.initializer.expression.name.text !== 'inspect'
+      || !ts.isIdentifier(inspection.initializer.expression.expression)
+      || checker.getSymbolAtLocation(inspection.initializer.expression.expression) !== locatorSymbol
+    ) continue
+    /** inspection symbol 用于绑定紧随其后的 startup mode resolver 参数。 */
+    const inspectionSymbol = checker.getSymbolAtLocation(inspection.name)
+    if (!inspectionSymbol) continue
+
+    /** startup mode 必须在下一条语句中由真实 resolver 消费同一 inspect 结果。 */
+    const mode = getSingleConstDeclaration(statements[locatorIndex + 2])
+    if (
+      !mode
+      || !ts.isIdentifier(mode.name)
+      || !mode.initializer
+      || !ts.isCallExpression(mode.initializer)
+      || !ts.isIdentifier(mode.initializer.expression)
+      || !identifierUsesImportedBinding(mode.initializer.expression, resolverBindings, checker)
+      || mode.initializer.arguments.length !== 1
+      || !ts.isIdentifier(mode.initializer.arguments[0])
+      || checker.getSymbolAtLocation(mode.initializer.arguments[0]) !== inspectionSymbol
+    ) continue
+    /** mode symbol 用于确保紧随其后的 guard 判定同一 resolver 结果。 */
+    const modeSymbol = checker.getSymbolAtLocation(mode.name)
+    if (!modeSymbol) continue
+
+    /** guard 必须直接紧随 mode 声明，不允许中间变更 proof chain。 */
+    const guard = statements[locatorIndex + 3]
+    if (!guard || !ts.isIfStatement(guard)) continue
     /** 只接受 dataRootMode !== 'normal' 的精确 fail-closed 判别。 */
-    const condition = statement.expression
+    const condition = guard.expression
     if (
       !ts.isBinaryExpression(condition)
       || condition.operatorToken.kind !== ts.SyntaxKind.ExclamationEqualsEqualsToken
@@ -693,11 +702,14 @@ function hasNormalModeGuardBefore(
       || checker.getSymbolAtLocation(condition.left) !== modeSymbol
       || !ts.isStringLiteralLike(condition.right)
       || condition.right.text !== 'normal'
-    ) return false
+    ) continue
     /** 非 normal 分支必须直接包含 return，阻断后续业务组合。 */
-    return ts.isBlock(statement.thenStatement)
-      && statement.thenStatement.statements.some(ts.isReturnStatement)
-  })
+    if (
+      ts.isBlock(guard.thenStatement)
+      && guard.thenStatement.statements.some(ts.isReturnStatement)
+    ) return true
+  }
+  return false
 }
 
 /** 返回 gated 注册紧邻且由 normal guard 保护的唯一允许 dynamic import 调用。 */
