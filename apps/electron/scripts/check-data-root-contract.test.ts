@@ -239,6 +239,61 @@ describe('数据根合同检查器', () => {
     }
   })
 
+  test('Given sink 与路径定义位于同一语句 When 扫描当前语句 Then 只合并 sink 求值前的最后事件', () => {
+    /** 当前 statement 内也必须按事件完成位置过滤，不能读取 sink 后的赋值。 */
+    const rootDir = createFixture({
+      'apps/electron/src/main/unsafe-current-comma.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        runtimePath = '~/.proma/settings.json', readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/safe-current-comma.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '~/.proma/settings.json'
+        runtimePath = '/tmp/safe.json', readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/unsafe-current-declarator.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json', result = (
+          runtimePath = '~/.proma/settings.json',
+          readFileSync(runtimePath, 'utf8')
+        )
+      `,
+      'apps/electron/src/main/safe-current-declarator.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '~/.proma/settings.json', result = (
+          runtimePath = '/tmp/safe.json',
+          readFileSync(runtimePath, 'utf8')
+        )
+      `,
+      'apps/electron/src/main/sink-before-current-assignment.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        readFileSync(runtimePath, 'utf8'), runtimePath = '~/.proma/settings.json'
+      `,
+      'apps/electron/src/main/safe-multiple-current-assignments.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/initial.json'
+        runtimePath = '~/.proma/settings.json', runtimePath = '/tmp/safe.json', readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/unsafe-multiple-current-assignments.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/initial.json'
+        runtimePath = '/tmp/safe.json', runtimePath = '~/.proma/settings.json', readFileSync(runtimePath, 'utf8')
+      `,
+    })
+
+    try {
+      expect(findHardcodedDataRoots(rootDir)).toEqual([
+        'apps/electron/src/main/unsafe-current-comma.ts',
+        'apps/electron/src/main/unsafe-current-declarator.ts',
+        'apps/electron/src/main/unsafe-multiple-current-assignments.ts',
+      ])
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true })
+    }
+  })
+
   test('Given 路径赋值位于明确 IIFE 或未调用函数 When 流入文件 sink Then 只执行 IIFE 定义事件', () => {
     /** 仅语法上明确立即调用的 function/arrow 才参与当前控制流。 */
     const rootDir = createFixture({

@@ -59,6 +59,12 @@ interface ReachingDefinition {
   value?: ts.Expression
 }
 
+/** 单个定义写入完成时的位置，用于过滤同 statement 内 sink 后事件。 */
+interface DefinitionEvent extends ReachingDefinition {
+  /** 写入完成的源码位置；同一线性表达式中与执行顺序一致。 */
+  position: number
+}
+
 /** 把平台相对路径统一转换成稳定 POSIX 格式。 */
 function toPosixPath(path: string): string {
   return path.split(sep).join(posix.sep)
@@ -358,16 +364,16 @@ function nodeContainsDataRootLiteral(node: ts.Node): boolean {
   return found
 }
 
-/** 判断节点是否在非线性或复杂位置把固定根写入指定 symbol。 */
-function nodeHasHardcodedWrite(
+/** 收集节点中无法线性建模但有固定根证据的实际写入完成位置。 */
+function collectHardcodedWritePositions(
   root: ts.Node,
   symbol: ts.Symbol,
   context: TypeScriptBindingContext,
-): boolean {
-  /** 当前节点中是否发现无法作为顺序定义事件建模的写入。 */
-  let found = false
+): number[] {
+  /** 当前节点内按源码位置排序的硬编码写入完成位置。 */
+  const positions: number[] = []
   const visit = (node: ts.Node): void => {
-    if (found || isFunctionBoundary(node)) return
+    if (isFunctionBoundary(node)) return
     if (
       ts.isBinaryExpression(node)
       && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
@@ -377,13 +383,12 @@ function nodeHasHardcodedWrite(
       if (
         nodeContainsDataRootLiteral(node.right)
         || expressionContainsDataRootSegment(node.right, context, new Set([symbol]))
-      ) found = true
-      if (found) return
+      ) positions.push(node.end)
     }
     ts.forEachChild(node, visit)
   }
   visit(root)
-  return found
+  return positions.sort((left, right) => left - right)
 }
 
 /** 去除 IIFE callee 外层不改变函数值的括号与类型包装。 */
@@ -409,14 +414,16 @@ function collectExpressionDefinitionEvents(
   rawExpression: ts.Expression,
   symbol: ts.Symbol,
   context: TypeScriptBindingContext,
-): ReachingDefinition[] {
+): DefinitionEvent[] {
   /** 去除不改变求值顺序的包装。 */
   const expression = unwrapExpression(rawExpression)
   if (isFunctionBoundary(expression)) return []
   if (isNonLinearExpression(expression)) {
-    return nodeHasHardcodedWrite(expression, symbol, context)
-      ? [{ found: true, uncertain: true }]
-      : []
+    return collectHardcodedWritePositions(expression, symbol, context).map((position) => ({
+      found: true,
+      uncertain: true,
+      position,
+    }))
   }
   if (ts.isCallExpression(expression)) {
     /** 参数在函数体前求值；直接 function/arrow callee 才展开为当前执行流。 */
@@ -444,12 +451,17 @@ function collectExpressionDefinitionEvents(
         expression.operatorToken.kind === ts.SyntaxKind.EqualsToken
         && ts.isIdentifier(expression.left)
       ) {
-        events.push({ found: true, uncertain: false, value: expression.right })
+        events.push({
+          found: true,
+          uncertain: false,
+          value: expression.right,
+          position: expression.end,
+        })
       } else if (
         nodeContainsDataRootLiteral(expression.right)
         || expressionContainsDataRootSegment(expression.right, context, new Set([symbol]))
       ) {
-        events.push({ found: true, uncertain: true })
+        events.push({ found: true, uncertain: true, position: expression.end })
       }
       return events
     }
@@ -459,7 +471,7 @@ function collectExpressionDefinitionEvents(
     ]
   }
   /** 普通表达式按语法子节点顺序求值，并跳过未调用的函数体。 */
-  const events: ReachingDefinition[] = []
+  const events: DefinitionEvent[] = []
   ts.forEachChild(expression, (child) => {
     if (ts.isExpression(child)) {
       events.push(...collectExpressionDefinitionEvents(child, symbol, context))
@@ -503,17 +515,22 @@ function collectStatementDefinitionEvents(
   statement: ts.Statement,
   symbol: ts.Symbol,
   context: TypeScriptBindingContext,
-): ReachingDefinition[] {
+): DefinitionEvent[] {
   if (isFunctionBoundary(statement)) return []
   if (ts.isVariableStatement(statement)) {
     /** 同一 VariableStatement 的 declarations 与 initializer 从左到右执行。 */
-    const events: ReachingDefinition[] = []
+    const events: DefinitionEvent[] = []
     for (const declaration of statement.declarationList.declarations) {
       if (declaration.initializer) {
         events.push(...collectExpressionDefinitionEvents(declaration.initializer, symbol, context))
       }
       if (ts.isIdentifier(declaration.name) && context.checker.getSymbolAtLocation(declaration.name) === symbol) {
-        events.push({ found: true, uncertain: false, value: declaration.initializer })
+        events.push({
+          found: true,
+          uncertain: false,
+          value: declaration.initializer,
+          position: declaration.end,
+        })
       }
       if (!ts.isIdentifier(declaration.name) && bindingNameUsesSymbol(declaration.name, symbol, context.checker)) {
         events.push({
@@ -525,6 +542,7 @@ function collectStatementDefinitionEvents(
               || expressionContainsDataRootSegment(declaration.initializer, context, new Set([symbol]))
             )
           ),
+          position: declaration.end,
         })
       }
     }
@@ -536,9 +554,11 @@ function collectStatementDefinitionEvents(
   if (ts.isBlock(statement)) {
     return collectSequentialDefinitionEvents(statement.statements, symbol, context)
   }
-  return nodeHasHardcodedWrite(statement, symbol, context)
-    ? [{ found: true, uncertain: true }]
-    : []
+  return collectHardcodedWritePositions(statement, symbol, context).map((position) => ({
+    found: true,
+    uncertain: true,
+    position,
+  }))
 }
 
 /** 合并顺序语句的定义事件；终止语句后的复杂控制流由 fail-closed 用例约束。 */
@@ -546,7 +566,7 @@ function collectSequentialDefinitionEvents(
   statements: readonly ts.Statement[],
   symbol: ts.Symbol,
   context: TypeScriptBindingContext,
-): ReachingDefinition[] {
+): DefinitionEvent[] {
   /** 条件、循环或终止语句会让前后定义不再具有单一必然执行顺序。 */
   const hasComplexControlFlow = statements.some((statement) => (
     !ts.isVariableStatement(statement)
@@ -555,10 +575,19 @@ function collectSequentialDefinitionEvents(
     && !ts.isEmptyStatement(statement)
     && !isFunctionBoundary(statement)
   ))
-  if (
-    hasComplexControlFlow
-    && statements.some((statement) => nodeHasHardcodedWrite(statement, symbol, context))
-  ) return [{ found: true, uncertain: true }]
+  if (hasComplexControlFlow) {
+    /** 复杂控制流保留每个有证据写入的位置，供当前 statement 的 sink 前过滤复用。 */
+    const positions = statements.flatMap((statement) => (
+      collectHardcodedWritePositions(statement, symbol, context)
+    ))
+    if (positions.length > 0) {
+      return positions.sort((left, right) => left - right).map((position) => ({
+        found: true,
+        uncertain: true,
+        position,
+      }))
+    }
+  }
   return statements.flatMap((statement) => collectStatementDefinitionEvents(statement, symbol, context))
 }
 
@@ -568,6 +597,8 @@ function findReachingDefinition(
   symbol: ts.Symbol,
   context: TypeScriptBindingContext,
 ): ReachingDefinition {
+  /** 当前 sink identifier 的求值起点，严格排除同 statement 中更晚的写入。 */
+  const usePosition = identifier.getStart(context.sourceFile)
   /** 每层从容器开头扫描到当前语句，后定义自然覆盖前定义。 */
   let queryNode: ts.Node = identifier
   while (true) {
@@ -579,6 +610,15 @@ function findReachingDefinition(
       for (const definition of events) {
         if (definition.found) latest = definition
       }
+    }
+    /** 当前 statement 内只合并在 sink identifier 求值前已经完成的定义事件。 */
+    const currentEvents = collectStatementDefinitionEvents(
+      position.container.statements[position.index]!,
+      symbol,
+      context,
+    )
+    for (const definition of currentEvents) {
+      if (definition.position < usePosition) latest = definition
     }
     if (latest.found) return latest
     if (ts.isSourceFile(position.container)) return latest
