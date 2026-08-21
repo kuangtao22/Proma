@@ -14,7 +14,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readJsonFileSafe, removeFileAtomic, writeJsonFileAtomicSecure } from './safe-file'
+import { ensureDirectoryDurable, readJsonFileSafe, removeFileAtomic, writeJsonFileAtomicSecure } from './safe-file'
 
 /** safe-file validator 测试使用的最小 schema。 */
 interface VersionedValue {
@@ -255,6 +255,60 @@ describe('writeJsonFileAtomicSecure', () => {
       rmSync(tempDir, { recursive: true, force: true })
     }
   })
+
+  test('Given 安全原子写完成 rename When 返回成功 Then 已同步父目录且文件可见', () => {
+    /** 通过窄注入观察目录同步发生时 rename 已完成。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-durable-'))
+    const filePath = join(tempDir, 'marker.json')
+    let syncCalls = 0
+    try {
+      writeJsonFileAtomicSecure(filePath, { durable: true }, {
+        syncDirectory: (directoryPath) => {
+          syncCalls += 1
+          expect(directoryPath).toBe(tempDir)
+          expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ durable: true })
+        },
+      })
+
+      expect(syncCalls).toBe(1)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('ensureDirectoryDurable', () => {
+  test('Given journal 目录首次创建 When 返回成功 Then 依次同步父目录与新目录', () => {
+    /** 记录目录创建后的两次同步顺序。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-durable-directory-'))
+    const directoryPath = join(tempDir, 'workspace-relocations')
+    const syncedDirectories: string[] = []
+    try {
+      ensureDirectoryDurable(directoryPath, {
+        syncDirectory: (currentPath) => {
+          expect(statSync(directoryPath).isDirectory()).toBe(true)
+          syncedDirectories.push(currentPath)
+        },
+      })
+
+      expect(syncedDirectories).toEqual([tempDir, directoryPath])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 当前平台目录同步失败 When 首次创建 Then 明确向上传播 durability 错误', () => {
+    /** 注入不支持目录 fsync 的平台错误。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-durable-directory-error-'))
+    const directoryPath = join(tempDir, 'workspace-relocations')
+    try {
+      expect(() => ensureDirectoryDurable(directoryPath, {
+        syncDirectory: () => { throw new Error('directory fsync unsupported') },
+      })).toThrow('directory fsync unsupported')
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('removeFileAtomic', () => {
@@ -327,7 +381,33 @@ describe('removeFileAtomic', () => {
         unlinkTombstone: () => { throw new Error('disk busy') },
       })).toThrow('原子删除已提交，但 tombstone 清理失败')
       expect(existsSync(filePath)).toBe(false)
-      expect(readFileNames(tempDir)).toHaveLength(1)
+      const tombstoneNames = readFileNames(tempDir)
+      expect(tombstoneNames).toHaveLength(1)
+      expect(tombstoneNames[0]).not.toContain('journal.json')
+
+      removeFileAtomic(filePath)
+      expect(readFileNames(tempDir)).toEqual([])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 原子删除完成 rename 与 unlink When 返回成功 Then 每个目录项变更后都同步父目录', () => {
+    /** 捕获 tombstone 路径与两次目录同步时的可见状态。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-durable-'))
+    const filePath = join(tempDir, 'journal.json')
+    let tombstonePath = ''
+    const syncStates: string[] = []
+    writeFileSync(filePath, '{}', 'utf8')
+    try {
+      removeFileAtomic(filePath, {
+        afterRenameBeforeVerify: (currentTombstonePath) => { tombstonePath = currentTombstonePath },
+        syncDirectory: () => {
+          syncStates.push(existsSync(tombstonePath) ? 'renamed' : 'unlinked')
+        },
+      })
+
+      expect(syncStates).toEqual(['renamed', 'unlinked'])
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }
@@ -350,6 +430,9 @@ describe('removeFileAtomic', () => {
       })).toThrow('tombstone 身份已变化')
       expect(readFileSync(tombstonePath, 'utf8')).toBe('replacement')
       expect(existsSync(filePath)).toBe(false)
+
+      expect(() => removeFileAtomic(filePath)).toThrow('无法安全回收')
+      expect(readFileSync(tombstonePath, 'utf8')).toBe('replacement')
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }

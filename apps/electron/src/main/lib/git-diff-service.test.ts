@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getUnstagedChanges, invalidateGitDiffCache, listWorktreesStrict } from './git-diff-service'
@@ -151,6 +151,74 @@ describe('strict worktree query', () => {
       execFileSync('git', ['worktree', 'remove', '--force', linkedWorktreePath], { cwd: nestedRepoPath, stdio: 'pipe' })
       rmSync(parentPath, { recursive: true, force: true })
       rmSync(linkedParentPath, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    ['断链', (parentPath: string) => symlinkSync(join(parentPath, 'missing-target'), join(parentPath, 'dangling'))],
+    ['指向根外仓库', (parentPath: string, outsideRepoPath: string) => symlinkSync(outsideRepoPath, join(parentPath, 'outside-repo'))],
+  ])('Given 非 Git 父目录含%s目录 symlink When 严格发现 Then 不跟随且返回空数组', async (_label, createLink) => {
+    /** 隔离扫描根与根外真实仓库。 */
+    const parentPath = mkdtempSync(join(tmpdir(), 'proma-strict-symlink-root-'))
+    const outsideRepoPath = mkdtempSync(join(tmpdir(), 'proma-strict-symlink-outside-'))
+    initializeRepository(outsideRepoPath, 'outside.txt')
+    try {
+      createLink(parentPath, outsideRepoPath)
+
+      await expect(listWorktreesStrict(parentPath)).resolves.toEqual([])
+    } finally {
+      rmSync(parentPath, { recursive: true, force: true })
+      rmSync(outsideRepoPath, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 五层以上目录内仓库含 linked worktree When 严格发现 Then 返回 linked blocker', async () => {
+    /** 深层扫描根、仓库和根外 linked worktree。 */
+    const parentPath = mkdtempSync(join(tmpdir(), 'proma-strict-deep-root-'))
+    const nestedRepoPath = join(parentPath, 'one', 'two', 'three', 'four', 'five', 'repo')
+    const linkedParentPath = mkdtempSync(join(tmpdir(), 'proma-strict-deep-linked-'))
+    const linkedWorktreePath = join(linkedParentPath, 'linked')
+    mkdirSync(nestedRepoPath, { recursive: true })
+    initializeRepository(nestedRepoPath, 'deep.txt')
+    try {
+      execFileSync('git', ['worktree', 'add', '-b', 'strict-deep-linked', linkedWorktreePath], {
+        cwd: nestedRepoPath,
+        stdio: 'pipe',
+      })
+
+      const worktrees = await listWorktreesStrict(parentPath)
+
+      expect(worktrees.find((item) => realpathSync(item.path) === realpathSync(linkedWorktreePath))?.isMain).toBe(false)
+    } finally {
+      execFileSync('git', ['worktree', 'remove', '--force', linkedWorktreePath], { cwd: nestedRepoPath, stdio: 'pipe' })
+      rmSync(parentPath, { recursive: true, force: true })
+      rmSync(linkedParentPath, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 非 Git 目录扫描条目超过预算 When 严格发现 Then 明确阻断', async () => {
+    /** 两个条目确保一条预算无法完成扫描。 */
+    const parentPath = mkdtempSync(join(tmpdir(), 'proma-strict-budget-'))
+    mkdirSync(join(parentPath, 'first'))
+    mkdirSync(join(parentPath, 'second'))
+    try {
+      await expect(listWorktreesStrict(parentPath, { maxDiscoveryEntries: 1 })).rejects.toThrow('预算')
+    } finally {
+      rmSync(parentPath, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 扫描子目录不可读 When 严格发现 Then I/O 错误向上传播', async () => {
+    /** chmod 000 稳定触发真实目录读取失败。 */
+    const parentPath = mkdtempSync(join(tmpdir(), 'proma-strict-io-'))
+    const unreadablePath = join(parentPath, 'unreadable')
+    mkdirSync(unreadablePath)
+    chmodSync(unreadablePath, 0o000)
+    try {
+      await expect(listWorktreesStrict(parentPath)).rejects.toThrow()
+    } finally {
+      chmodSync(unreadablePath, 0o700)
+      rmSync(parentPath, { recursive: true, force: true })
     }
   })
 

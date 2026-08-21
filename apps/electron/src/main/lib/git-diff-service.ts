@@ -18,6 +18,8 @@ import type { ChangeSource, ChangedFileStatus } from '@proma/shared'
 export interface ListWorktreesStrictOptions {
   /** 执行 Git 命令并在任何失败时抛错。 */
   runGitCommand?: (args: string[], cwd: string) => Promise<string>
+  /** strict 仓库发现允许检查的最大目录条目数，主要供边界测试窄化。 */
+  maxDiscoveryEntries?: number
 }
 
 /** 大文件读取上限：超过则跳过，避免 IPC 序列化撑爆内存 */
@@ -127,6 +129,8 @@ function normalizeSafePath(root: string, filePath: string): string | null {
 const MAX_CONCURRENT_GIT_COMMANDS = 6
 /** 未追踪文件并发读取上限，避免大量新文件占满文件系统线程池。 */
 const MAX_CONCURRENT_UNTRACKED_FILE_READS = 6
+/** strict 仓库发现默认条目预算，避免异常目录树无限放大迁移预检。 */
+const DEFAULT_STRICT_GIT_DISCOVERY_ENTRIES = 200_000
 
 class AsyncSemaphore {
   private active = 0
@@ -1015,38 +1019,50 @@ export async function listWorktrees(repoPath: string): Promise<import('@proma/sh
   return Array.from(worktreesByPath.values())
 }
 
-/** 严格检查目录内是否存在 `.git` 标记，只有明确不存在时返回 false。 */
-function hasGitMarkerStrict(directoryPath: string): boolean {
-  try {
-    lstatSync(join(directoryPath, '.git'))
-    return true
-  } catch (error) {
-    if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
-      return false
-    }
-    throw error
-  }
+/** strict 仓库发现的有限扫描状态。 */
+interface StrictGitDiscoveryState {
+  /** 尚可检查的目录条目数。 */
+  remainingEntries: number
+  /** 已访问目录的设备与 inode，阻断绑定挂载等形成的循环。 */
+  visitedDirectories: Set<string>
 }
 
-/** 严格向下发现 `.git` 候选目录，任何目录读取或状态检查失败都向上传播。 */
-function findGitCandidatesDownStrict(directoryPath: string, maxDepth: number): string[] {
-  if (maxDepth <= 0) return []
-  /** 当前层发现的 Git 候选目录。 */
+/**
+ * 严格向下发现 `.git` 候选目录，不跟随任何符号链接。
+ *
+ * @param directoryPath 当前扫描的实际目录。
+ * @param state 跨递归共享的条目预算与目录身份集合。
+ * @returns 当前目录树内发现的 Git 候选目录。
+ */
+function findGitCandidatesDownStrict(directoryPath: string, state: StrictGitDiscoveryState): string[] {
+  /** 当前目录树发现的 Git 候选目录。 */
   const candidates: string[] = []
-  for (const name of readdirSync(directoryPath)) {
-    if (name === '.git') {
-      candidates.push(directoryPath)
-      continue
-    }
-    if (name.startsWith('.') || name === 'node_modules') continue
+  /** 迭代栈避免深目录树耗尽 JavaScript 调用栈。 */
+  const pendingDirectories = [directoryPath]
+  while (pendingDirectories.length > 0) {
+    const currentDirectory = pendingDirectories.pop()!
+    /** 当前目录的 no-follow 身份，I/O 错误必须向上传播。 */
+    const directoryStat = lstatSync(currentDirectory)
+    if (!directoryStat.isDirectory()) throw new Error('strict Git 发现路径不是实际目录')
+    /** 同一目录 inode 只扫描一次，避免特殊挂载拓扑形成循环。 */
+    const directoryIdentity = `${directoryStat.dev}:${directoryStat.ino}`
+    if (state.visitedDirectories.has(directoryIdentity)) continue
+    state.visitedDirectories.add(directoryIdentity)
 
-    const childPath = join(directoryPath, name)
-    if (!statSync(childPath).isDirectory()) continue
-    if (hasGitMarkerStrict(childPath)) {
-      candidates.push(childPath)
-      continue
+    for (const entry of readdirSync(currentDirectory, { withFileTypes: true })) {
+      if (state.remainingEntries <= 0) throw new Error('strict Git 仓库发现扫描预算已耗尽')
+      state.remainingEntries -= 1
+
+      /** 条目实际身份以 lstat 为准，Dirent 只用于明确识别 symlink。 */
+      const childPath = join(currentDirectory, entry.name)
+      const childStat = lstatSync(childPath)
+      if (entry.isSymbolicLink() || childStat.isSymbolicLink()) continue
+      if (entry.name === '.git') {
+        candidates.push(currentDirectory)
+        continue
+      }
+      if (childStat.isDirectory()) pendingDirectories.push(childPath)
     }
-    candidates.push(...findGitCandidatesDownStrict(childPath, maxDepth - 1))
   }
   return candidates
 }
@@ -1058,8 +1074,12 @@ function findGitCandidatesDownStrict(directoryPath: string, maxDepth: number): s
 async function findAllGitRootsStrict(
   baseDir: string,
   runCommand: NonNullable<ListWorktreesStrictOptions['runGitCommand']>,
+  maxDiscoveryEntries: number,
 ): Promise<string[]> {
-  if (!statSync(baseDir).isDirectory()) throw new Error('严格 worktree 查询路径不是目录')
+  if (!Number.isSafeInteger(maxDiscoveryEntries) || maxDiscoveryEntries <= 0) {
+    throw new Error('strict Git 仓库发现扫描预算无效')
+  }
+  if (!lstatSync(baseDir).isDirectory()) throw new Error('严格 worktree 查询路径不是实际目录')
   /** 按规范化路径去重后的仓库根。 */
   const rootsByPath = new Map<string, string>()
   try {
@@ -1073,7 +1093,12 @@ async function findAllGitRootsStrict(
     if (!isExplicitNonGitDirectory(error)) throw error
   }
 
-  for (const candidatePath of findGitCandidatesDownStrict(baseDir, 3)) {
+  /** 整次发现共享同一有限预算和目录身份集合。 */
+  const discoveryState: StrictGitDiscoveryState = {
+    remainingEntries: maxDiscoveryEntries,
+    visitedDirectories: new Set<string>(),
+  }
+  for (const candidatePath of findGitCandidatesDownStrict(baseDir, discoveryState)) {
     const normalizedCandidate = normalizeGitRoot(candidatePath)
     if (rootsByPath.has(normalizedCandidate)) continue
     const repositoryRoot = await runCommand(['rev-parse', '--show-toplevel'], candidatePath)
@@ -1092,7 +1117,11 @@ export async function listWorktreesStrict(
   options: ListWorktreesStrictOptions = {},
 ): Promise<import('@proma/shared').WorktreeInfo[]> {
   const runCommand = options.runGitCommand ?? runGitCommandStrict
-  const roots = await findAllGitRootsStrict(repoPath, runCommand)
+  const roots = await findAllGitRootsStrict(
+    repoPath,
+    runCommand,
+    options.maxDiscoveryEntries ?? DEFAULT_STRICT_GIT_DISCOVERY_ENTRIES,
+  )
   /** 跨仓库按规范化路径去重后的 worktree。 */
   const worktreesByPath = new Map<string, import('@proma/shared').WorktreeInfo>()
   for (const root of roots) {

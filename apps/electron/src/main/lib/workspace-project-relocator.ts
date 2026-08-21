@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { accessSync, constants, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync } from 'node:fs'
+import { accessSync, constants, existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs'
+import type { Stats } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type {
   AgentSessionMeta,
@@ -9,7 +10,7 @@ import type {
   WorktreeInfo,
 } from '@proma/shared'
 import { inspectDataRootVolume, scanDataRootBytes, type DataRootVolumeSnapshot } from './data-root-storage'
-import { removeFileAtomic, readJsonFileSafe, writeJsonFileAtomicSecure } from './safe-file'
+import { ensureDirectoryDurable, removeFileAtomic, readJsonFileSafe, writeJsonFileAtomicSecure } from './safe-file'
 import {
   copyDirectoryVerified,
   finalizeDirectoryCopy,
@@ -66,6 +67,26 @@ export interface WorkspaceRelocationPreflight {
   kind: 'managed' | 'external'
 }
 
+/** 仅供锁前/锁内一致性比较的文件系统身份。 */
+interface RelocationFileSystemIdentity {
+  /** 所在设备编号。 */
+  dev: number
+  /** 同一设备内 inode/file index。 */
+  ino: number
+}
+
+/** 不向 renderer 暴露的权威预检快照。 */
+interface WorkspaceRelocationPreflightSnapshot extends WorkspaceRelocationPreflight {
+  /** canonical 源目录的稳定身份。 */
+  sourceIdentity: RelocationFileSystemIdentity
+  /** 目标已存在时为目标身份，否则为最近现存祖先身份。 */
+  targetBoundaryIdentity: RelocationFileSystemIdentity
+  /** 预检时目标根是否已经存在。 */
+  targetExisted: boolean
+  /** 目标 sidecar 在本次预检中的归属。 */
+  targetOwnership: DirectoryCopyOwnership
+}
+
 /** 项目迁移器的业务依赖与窄测试替身。 */
 export interface WorkspaceProjectRelocatorOptions {
   /** 返回当前活动业务数据根。 */
@@ -104,6 +125,10 @@ export interface WorkspaceProjectRelocatorOptions {
   finalizeCopy?: (input: FinalizeDirectoryCopyInput) => Promise<void>
   /** 生成不可预测迁移 ID。 */
   createOperationId?: () => string
+  /** 持久创建 journal 目录的窄测试边界。 */
+  ensureJournalDirectory?: (directoryPath: string) => void
+  /** 持久写入 journal 的窄测试边界。 */
+  writeJournalFile?: (filePath: string, data: object) => void
 }
 
 /** 单次预检内部允许的恢复上下文。 */
@@ -131,6 +156,10 @@ export class WorkspaceProjectRelocator {
   private readonly finalizeCopy: (input: FinalizeDirectoryCopyInput) => Promise<void>
   /** operationId 生成器。 */
   private readonly createOperationId: () => string
+  /** 首次 journal 写入前持久创建目录。 */
+  private readonly ensureJournalDirectory: (directoryPath: string) => void
+  /** 每次阶段推进使用的 durable journal 写入。 */
+  private readonly writeJournalFile: (filePath: string, data: object) => void
 
   constructor(private readonly options: WorkspaceProjectRelocatorOptions) {
     this.copyDirectory = options.copyDirectory ?? copyDirectoryVerified
@@ -142,13 +171,16 @@ export class WorkspaceProjectRelocator {
     this.inspectTargetVolume = options.inspectTargetVolume ?? inspectDataRootVolume
     this.finalizeCopy = options.finalizeCopy ?? finalizeDirectoryCopy
     this.createOperationId = options.createOperationId ?? randomUUID
+    this.ensureJournalDirectory = options.ensureJournalDirectory ?? ensureDirectoryDurable
+    this.writeJournalFile = options.writeJournalFile ?? writeJsonFileAtomicSecure
   }
 
   /** 只读执行完整迁移预检，不创建 journal 或目标数据。 */
   async preflight(input: { workspaceId: string; targetRoot: string }): Promise<WorkspaceRelocationPreflight> {
     /** 本次预检生成的候选操作 ID，正式 run 可生成自己的持久化 ID。 */
     const operationId = this.createOperationId()
-    return await this.performPreflight(input, { operationId, allowOwnedTarget: false })
+    const snapshot = await this.performPreflight(input, { operationId, allowOwnedTarget: false })
+    return toPublicPreflight(snapshot)
   }
 
   /** 运行新迁移，或复用同 workspace/源/目标的复制阶段 journal 继续复制。 */
@@ -174,15 +206,26 @@ export class WorkspaceProjectRelocator {
     if (existingJournal && !journalMatchesPreflight(existingJournal, initialPreflight)) {
       throw new Error('现有项目迁移 journal 与当前源目标不一致')
     }
-    /** 锁使新 Agent/Automation admission 与二次活动检查线性互斥。 */
+    /** 锁使新 Agent/Automation admission 与权威预检线性互斥。 */
     const release = this.options.acquireWorkspaceOperation(input.workspaceId, 'relocation')
-    /** 复制阶段可由 cancel(operationId) 中断。 */
-    const controller = new AbortController()
-    this.controllers.set(operationId, controller)
     try {
-      /** 锁内同步二次检查活动写；复制器随后会复验源目标身份和目标归属。 */
+      /** 锁内重跑全部安全检查，不信任锁前 preview 的可变文件系统结果。 */
+      const authoritativePreflight = await this.performPreflight(input, {
+        operationId,
+        allowOwnedTarget: existingJournal !== null,
+      })
+      if (!preflightSnapshotsMatch(initialPreflight, authoritativePreflight)) {
+        throw new Error('项目迁移环境在预检后发生变化，请重新预检')
+      }
+      if (existingJournal && !journalMatchesPreflight(existingJournal, authoritativePreflight)) {
+        throw new Error('现有项目迁移 journal 与锁内权威预检不一致')
+      }
+      /** 异步权威预检结束后同步确认活动写仍为空。 */
       this.assertWorkspaceInactive(input.workspaceId)
-      const preflight = initialPreflight
+      const preflight = authoritativePreflight
+      /** 只有进入复制阶段后才注册可取消控制器。 */
+      const controller = new AbortController()
+      this.controllers.set(operationId, controller)
       /** 复制开始前持久化可恢复参数。 */
       let journal: WorkspaceRelocationJournal = existingJournal ?? {
         version: JOURNAL_VERSION,
@@ -239,6 +282,8 @@ export class WorkspaceProjectRelocator {
         throw error
       }
 
+      /** 提交协议不可取消；在公开 committing 之前同步移除可取消控制器。 */
+      this.controllers.delete(operationId)
       journal = { ...journal, stage: 'committing', completedCommitSteps: 0, error: undefined }
       this.writeJournal(journal)
       onProgress?.(toPublicProgress(journal))
@@ -331,7 +376,7 @@ export class WorkspaceProjectRelocator {
   private async performPreflight(
     input: { workspaceId: string; targetRoot: string },
     context: PreflightContext,
-  ): Promise<WorkspaceRelocationPreflight> {
+  ): Promise<WorkspaceRelocationPreflightSnapshot> {
     assertWorkspaceId(input.workspaceId)
     assertOperationId(context.operationId)
     if (!isAbsolute(input.targetRoot)) throw new Error('项目迁移目标必须是绝对路径')
@@ -346,6 +391,8 @@ export class WorkspaceProjectRelocator {
     assertAccessibleSource(sourceRoot)
     /** canonical 源根用于物理别名和嵌套判断。 */
     const canonicalSourceRoot = realpathSync(sourceRoot)
+    /** canonical 源根的稳定身份，用于锁前/锁内置换检测。 */
+    const sourceIdentity = toRelocationIdentity(lstatSync(canonicalSourceRoot))
     /** linked worktree 在复制前必须由用户移除。 */
     const worktrees = await this.options.listWorktrees(canonicalSourceRoot)
     if (worktrees.some((worktree) => !worktree.isMain)) {
@@ -355,6 +402,10 @@ export class WorkspaceProjectRelocator {
     const targetRoot = resolve(input.targetRoot)
     /** 目标最近现存祖先与预计 canonical 路径。 */
     const prospectiveTarget = resolveProspectiveTarget(targetRoot)
+    /** 目标是否已经存在，锁内变化必须拒绝。 */
+    const targetExisted = existsSync(targetRoot)
+    /** 目标或最近现存祖先的稳定身份。 */
+    let targetBoundaryIdentity = toRelocationIdentity(lstatSync(prospectiveTarget.existingAncestor))
     validateRootRelationship(canonicalSourceRoot, prospectiveTarget.canonicalPath)
     /** sidecar 归属决定非空目标能否作为本次 failed journal 断点复用。 */
     const ownership = await this.inspectCopyOwnership({
@@ -363,10 +414,11 @@ export class WorkspaceProjectRelocator {
       targetRoot,
     })
     if (ownership === 'foreign' || ownership === 'invalid') throw new Error('目标副本归属无效')
-    if (existsSync(targetRoot)) {
+    if (targetExisted) {
       /** no-follow：目标根本身不能是符号链接。 */
       const targetStat = lstatSync(targetRoot)
       if (!targetStat.isDirectory()) throw new Error('项目迁移目标必须是实际目录')
+      targetBoundaryIdentity = toRelocationIdentity(targetStat)
       /** 现存目标 canonical 身份再次检查物理别名和嵌套。 */
       const canonicalTargetRoot = realpathSync(targetRoot)
       validateRootRelationship(canonicalSourceRoot, canonicalTargetRoot)
@@ -417,6 +469,10 @@ export class WorkspaceProjectRelocator {
       remainingBytes,
       availableBytes: volume.availableBytes,
       kind: workspace.projectRootPath ? 'external' : 'managed',
+      sourceIdentity,
+      targetBoundaryIdentity,
+      targetExisted,
+      targetOwnership: ownership,
     }
   }
 
@@ -542,8 +598,8 @@ export class WorkspaceProjectRelocator {
     if (!isWorkspaceRelocationJournal(journal)) throw new Error('拒绝写入无效项目迁移 journal')
     /** 首次写入前只创建稳定容器目录。 */
     const journalDirectory = this.getJournalDirectory()
-    mkdirSync(journalDirectory, { recursive: true })
-    writeJsonFileAtomicSecure(join(journalDirectory, `${journal.operationId}.json`), journal)
+    this.ensureJournalDirectory(journalDirectory)
+    this.writeJournalFile(join(journalDirectory, `${journal.operationId}.json`), journal)
   }
 
   /** 安全删除 journal 主文件和原子恢复候选。 */
@@ -563,6 +619,53 @@ export class WorkspaceProjectRelocator {
     if (!isAbsolute(configDir) || resolve(configDir) !== configDir) throw new Error('活动数据根路径无效')
     return join(configDir, JOURNAL_DIRECTORY_NAME)
   }
+}
+
+/** 将内部权威快照转换为 renderer 可见的稳定预检合同。 */
+function toPublicPreflight(snapshot: WorkspaceRelocationPreflightSnapshot): WorkspaceRelocationPreflight {
+  return {
+    operationId: snapshot.operationId,
+    workspaceId: snapshot.workspaceId,
+    workspaceSlug: snapshot.workspaceSlug,
+    sourceRoot: snapshot.sourceRoot,
+    targetRoot: snapshot.targetRoot,
+    totalBytes: snapshot.totalBytes,
+    remainingBytes: snapshot.remainingBytes,
+    availableBytes: snapshot.availableBytes,
+    kind: snapshot.kind,
+  }
+}
+
+/** 提取目录状态中用于置换检测的稳定身份。 */
+function toRelocationIdentity(stat: Stats): RelocationFileSystemIdentity {
+  return { dev: stat.dev, ino: stat.ino }
+}
+
+/** 比较两个文件系统身份是否指向同一对象。 */
+function relocationIdentitiesMatch(
+  left: RelocationFileSystemIdentity,
+  right: RelocationFileSystemIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino
+}
+
+/** 锁前 preview 与锁内权威快照只有安全相关状态完全一致时才可继续。 */
+function preflightSnapshotsMatch(
+  initial: WorkspaceRelocationPreflightSnapshot,
+  authoritative: WorkspaceRelocationPreflightSnapshot,
+): boolean {
+  return initial.operationId === authoritative.operationId
+    && initial.workspaceId === authoritative.workspaceId
+    && initial.workspaceSlug === authoritative.workspaceSlug
+    && initial.sourceRoot === authoritative.sourceRoot
+    && initial.targetRoot === authoritative.targetRoot
+    && initial.totalBytes === authoritative.totalBytes
+    && initial.remainingBytes === authoritative.remainingBytes
+    && initial.kind === authoritative.kind
+    && initial.targetExisted === authoritative.targetExisted
+    && initial.targetOwnership === authoritative.targetOwnership
+    && relocationIdentitiesMatch(initial.sourceIdentity, authoritative.sourceIdentity)
+    && relocationIdentitiesMatch(initial.targetBoundaryIdentity, authoritative.targetBoundaryIdentity)
 }
 
 /** 将 copier 原生进度映射到 journal。 */
@@ -679,11 +782,11 @@ function assertOperationId(operationId: string): void {
   if (!OPERATION_ID_PATTERN.test(operationId)) throw new Error('项目迁移 operationId 无效')
 }
 
-/** 校验源目录存在、no-follow 为实际目录且可读写进入。 */
+/** 校验源目录存在、no-follow 为实际目录且可读取进入。 */
 function assertAccessibleSource(sourceRoot: string): void {
   if (!existsSync(sourceRoot)) throw new Error('项目迁移源目录不存在')
   if (!lstatSync(sourceRoot).isDirectory()) throw new Error('项目迁移源必须是实际目录')
-  accessSync(sourceRoot, constants.R_OK | constants.W_OK | constants.X_OK)
+  accessSync(sourceRoot, constants.R_OK | constants.X_OK)
 }
 
 /** 解析缺失目标基于最近现存祖先的预计 canonical 路径。 */

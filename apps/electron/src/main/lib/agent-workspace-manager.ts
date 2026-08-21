@@ -31,7 +31,7 @@ import { listBuiltinMcpServers } from './builtin-mcp/catalog'
 import { RESERVED_BUILTIN_KEYS } from './builtin-mcp/baseline'
 import { createWorkspaceSlug } from './workspace-slug'
 import { inferMcpTransportType, normalizeMcpTransportType } from '@proma/shared'
-import { isWorkspaceConfig } from './owned-path-rebaser-schema'
+import { isAgentWorkspacesIndex, isWorkspaceConfig } from './owned-path-rebaser-schema'
 import type { AgentWorkspace, CreateAgentWorkspaceInput, LocalProjectRootStatus, WorkspaceMcpConfig, SkillMeta, SkillImportSource, OtherWorkspaceSkillsGroup, WorkspaceCapabilities, SkillFileNode, SkillFileContent, WorkspaceMemorySummary, BulkImportSkillItemResult, BulkImportSkillsResult, BulkImportWorkspaceSelection } from '@proma/shared'
 
 interface AgentWorkspacesIndex {
@@ -54,6 +54,21 @@ function readIndex(): AgentWorkspacesIndex {
   }
 
   return { version: INDEX_VERSION, workspaces: [] }
+}
+
+/** 迁移最终提交专用严格读取；候选存在但损坏时禁止降级为空索引。 */
+function readIndexForRelocation(): AgentWorkspacesIndex {
+  const indexPath = getAgentWorkspacesIndexPath()
+  const data = readJsonFileStrict<AgentWorkspacesIndex>(indexPath, {
+    validate: isAgentWorkspacesIndexForManager,
+    description: '工作区索引',
+  })
+  return data ?? { version: INDEX_VERSION, workspaces: [] }
+}
+
+/** 将共享 JSON schema 收窄为 manager 内部的 AgentWorkspacesIndex。 */
+function isAgentWorkspacesIndexForManager(value: unknown): value is AgentWorkspacesIndex {
+  return isAgentWorkspacesIndex(value)
 }
 
 function migrateIndex(index: AgentWorkspacesIndex): void {
@@ -342,7 +357,7 @@ export function relinkAgentWorkspaceProjectRoot(id: string, projectRootPath: str
  * @returns 切换后的工作区记录。
  */
 export function updateAgentWorkspaceProjectRoot(workspaceId: string, targetRoot: string): AgentWorkspace {
-  const index = readIndex()
+  const index = readIndexForRelocation()
   /** 目标工作区在索引中的位置。 */
   const workspaceIndex = index.workspaces.findIndex((workspace) => workspace.id === workspaceId)
   if (workspaceIndex === -1) throw new Error(`项目不存在: ${workspaceId}`)

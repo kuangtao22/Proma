@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import * as os from 'node:os'
 import { join } from 'node:path'
 import { DataRootLocator } from './data-root-locator'
+import { listWorktreesStrict } from './git-diff-service'
+import { WorkspaceProjectRelocator } from './workspace-project-relocator'
 
 type AgentSessionManager = typeof import('./agent-session-manager')
 type AgentSessionContextPrompt = typeof import('./agent-session-context-prompt')
@@ -246,6 +248,67 @@ describe('Agent 会话 runtime 元数据', () => {
     expect(readFileSync(indexPath, 'utf8')).toBe(candidates[0]!)
   })
 
+  test('Given 真实文件树、journal 与三类 manager 引用 When 迁移成功 Then 源保留且目标和索引一致切换', async () => {
+    /** 组合测试使用的真实源、目标与工作区身份。 */
+    const sourceRoot = join(tempHome, 'integrated-relocation-source')
+    const targetRoot = join(tempHome, 'integrated-relocation-target')
+    const workspaceId = 'integrated-relocation-workspace'
+    const workspaceSlug = 'integrated-relocation-workspace'
+    mkdirSync(sourceRoot, { recursive: true })
+    mkdirSync(targetRoot, { recursive: true })
+    writeFileSync(join(sourceRoot, 'README.md'), 'integrated-copy', 'utf8')
+    writeAgentWorkspacesIndex([{
+      id: workspaceId,
+      name: '真实组合迁移',
+      slug: workspaceSlug,
+      projectRootPath: realpathSync(sourceRoot),
+      createdAt: 1,
+      updatedAt: 1,
+    }])
+    writeAgentSessionsIndex([{
+      id: 'integrated-relocation-session',
+      title: '真实组合会话',
+      workspaceId,
+      createdAt: 1,
+      updatedAt: 1,
+      attachedDirectories: [realpathSync(sourceRoot)],
+      attachedFiles: [join(realpathSync(sourceRoot), 'README.md')],
+    }])
+    /** 创建真实 workspace config 以覆盖第二步 rebase。 */
+    const workspaceDirectory = join(tempHome, '.proma', 'agent-workspaces', workspaceSlug)
+    const configPath = join(workspaceDirectory, 'config.json')
+    mkdirSync(workspaceDirectory, { recursive: true })
+    writeFileSync(configPath, JSON.stringify({ attachedDirectories: [realpathSync(sourceRoot)] }), 'utf8')
+
+    const relocator = new WorkspaceProjectRelocator({
+      getConfigDir: () => join(tempHome, '.proma'),
+      getWorkspace: workspaceManager.getAgentWorkspace,
+      getManagedProjectRoot: () => sourceRoot,
+      acquireWorkspaceOperation: () => () => {},
+      hasActiveAgentDataWritesForWorkspace: () => false,
+      hasRunningAutomationForWorkspace: () => false,
+      listWorkspaceSessions: () => [],
+      listWorktrees: listWorktreesStrict,
+      inspectTargetVolume: async () => ({ availableBytes: 1_000_000, deviceType: 'local' }),
+      rebaseWorkspaceSessionPaths: manager.rebaseWorkspaceSessionPaths,
+      rebaseWorkspaceConfigPaths: workspaceManager.rebaseWorkspaceConfigPaths,
+      updateAgentWorkspaceProjectRoot: workspaceManager.updateAgentWorkspaceProjectRoot,
+    })
+
+    await expect(relocator.run({ workspaceId, targetRoot })).resolves.toMatchObject({ stage: 'completed' })
+
+    expect(readFileSync(join(sourceRoot, 'README.md'), 'utf8')).toBe('integrated-copy')
+    expect(readFileSync(join(targetRoot, 'README.md'), 'utf8')).toBe('integrated-copy')
+    expect(workspaceManager.getAgentWorkspace(workspaceId)?.projectRootPath).toBe(realpathSync(targetRoot))
+    const sessionIndex = JSON.parse(readFileSync(join(tempHome, '.proma', 'agent-sessions.json'), 'utf8')) as {
+      sessions: Array<{ attachedDirectories?: string[]; attachedFiles?: string[] }>
+    }
+    const workspaceConfig = JSON.parse(readFileSync(configPath, 'utf8')) as { attachedDirectories?: string[] }
+    expect(sessionIndex.sessions[0]?.attachedDirectories?.map((path) => realpathSync(path))).toEqual([realpathSync(targetRoot)])
+    expect(sessionIndex.sessions[0]?.attachedFiles?.map((path) => realpathSync(path))).toEqual([realpathSync(join(targetRoot, 'README.md'))])
+    expect(workspaceConfig.attachedDirectories?.map((path) => realpathSync(path))).toEqual([realpathSync(targetRoot)])
+  })
+
   test('Given 工作区配置含项目内外附加路径 When 重写配置并切换索引 Then 仅根内变化且重复提交幂等', () => {
     /** 真实源、目标和外部附加路径。 */
     const sourceRoot = join(tempHome, 'workspace-source')
@@ -288,6 +351,57 @@ describe('Agent 会话 runtime 元数据', () => {
     expect(config.attachedDirectories).toEqual([realpathSync(targetRoot), join(realpathSync(targetRoot), 'docs'), outsideRoot])
     expect(config.attachedFiles).toEqual([join(realpathSync(targetRoot), 'README.md'), join(outsideRoot, 'note.md')])
     expect(index.workspaces[0]?.projectRootPath).toBe(realpathSync(targetRoot))
+  })
+
+  test('Given 工作区索引主文件损坏但 backup 有效 When 迁移最终提交 Then 恢复 backup 后切换项目根', () => {
+    /** 最终提交使用的真实目标根和索引候选。 */
+    const targetRoot = join(tempHome, 'strict-workspace-index-target')
+    const indexPath = join(tempHome, '.proma', 'agent-workspaces.json')
+    const workspaceId = 'strict-workspace-index'
+    mkdirSync(targetRoot, { recursive: true })
+    mkdirSync(join(tempHome, '.proma'), { recursive: true })
+    writeFileSync(indexPath, '{ 主文件损坏', 'utf8')
+    writeFileSync(`${indexPath}.bak`, JSON.stringify({
+      version: 2,
+      workspaces: [{
+        id: workspaceId,
+        name: '严格索引工作区',
+        slug: 'strict-workspace-index',
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    }), 'utf8')
+    rmSync(`${indexPath}.tmp`, { force: true })
+
+    workspaceManager.updateAgentWorkspaceProjectRoot(workspaceId, targetRoot)
+
+    const recovered = JSON.parse(readFileSync(indexPath, 'utf8')) as {
+      workspaces: Array<{ projectRootPath?: string }>
+    }
+    expect(recovered.workspaces[0]?.projectRootPath).toBe(realpathSync(targetRoot))
+  })
+
+  test.each([
+    ['所有候选语法损坏', ['{ bad-main', '{ bad-tmp', '{ bad-backup']],
+    ['任一 workspace schema 非法', [JSON.stringify({
+      version: 2,
+      workspaces: [
+        { id: 'strict-target', name: '目标', slug: 'strict-target', createdAt: 1, updatedAt: 1 },
+        { id: 'invalid', name: '非法', slug: 'invalid', createdAt: 1, updatedAt: 1, projectRootPath: 42 },
+      ],
+    }), '{ bad-tmp', '{ bad-backup']],
+  ])('Given 工作区索引%s When 迁移最终提交 Then 严格拒绝且零写入', (_label, candidates) => {
+    /** 隔离 strict 最终提交目标与三个索引候选。 */
+    const targetRoot = join(tempHome, 'strict-workspace-invalid-target')
+    const indexPath = join(tempHome, '.proma', 'agent-workspaces.json')
+    mkdirSync(targetRoot, { recursive: true })
+    writeFileSync(indexPath, candidates[0]!, 'utf8')
+    writeFileSync(`${indexPath}.tmp`, candidates[1]!, 'utf8')
+    writeFileSync(`${indexPath}.bak`, candidates[2]!, 'utf8')
+
+    expect(() => workspaceManager.updateAgentWorkspaceProjectRoot('strict-target', targetRoot))
+      .toThrow('工作区索引')
+    expect(readFileSync(indexPath, 'utf8')).toBe(candidates[0]!)
   })
 
   test('Given 工作区配置主文件损坏但 backup 有效 When 迁移重写 Then 恢复 backup 后完成 rebase', () => {

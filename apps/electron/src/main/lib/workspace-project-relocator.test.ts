@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { AgentSessionMeta, AgentWorkspace, DataRootMigrationProgress, WorktreeInfo } from '@proma/shared'
+import { ensureDirectoryDurable, writeJsonFileAtomicSecure } from './safe-file'
 import { WorkspaceProjectRelocator, type WorkspaceProjectRelocatorOptions } from './workspace-project-relocator'
 
 describe('WorkspaceProjectRelocator', () => {
@@ -216,6 +217,79 @@ describe('WorkspaceProjectRelocator', () => {
     expect(copyCalls).toBe(0)
   })
 
+  test('Given 锁前预检安全但锁后新增 linked worktree When 运行 Then 权威预检拒绝且释放锁', async () => {
+    /** 两次完整预检的 Git 查询次数。 */
+    let worktreeChecks = 0
+    /** 验证任何拒绝路径都会释放工作区锁。 */
+    let releases = 0
+    const relocator = createRelocator({
+      listWorktrees: async () => {
+        worktreeChecks += 1
+        return worktreeChecks === 1 ? [] : [{ path: sourceRoot, isMain: false }] as WorktreeInfo[]
+      },
+      acquireWorkspaceOperation: () => () => { releases += 1 },
+    })
+
+    await expect(relocator.run({ workspaceId: workspace.id, targetRoot })).rejects.toThrow('linked worktree')
+
+    expect(worktreeChecks).toBe(2)
+    expect(copyCalls).toBe(0)
+    expect(releases).toBe(1)
+  })
+
+  test('Given 锁前预检安全但锁后 workspace 切换源根 When 运行 Then 拒绝身份变化且不复制', async () => {
+    /** 锁后替换到的另一实际源目录。 */
+    const replacementSourceRoot = join(tempDir, 'replacement-source')
+    mkdirSync(replacementSourceRoot)
+    writeFileSync(join(replacementSourceRoot, 'README.md'), 'replacement', 'utf8')
+    let releases = 0
+    const relocator = createRelocator({
+      acquireWorkspaceOperation: () => {
+        workspace.projectRootPath = replacementSourceRoot
+        return () => { releases += 1 }
+      },
+    })
+
+    await expect(relocator.run({ workspaceId: workspace.id, targetRoot })).rejects.toThrow('预检后发生变化')
+
+    expect(copyCalls).toBe(0)
+    expect(releases).toBe(1)
+  })
+
+  test('Given 锁前预检安全但锁后同路径源目录 inode 被替换 When 运行 Then 拒绝身份变化且不复制', async () => {
+    /** 保存锁前源目录的改名路径。 */
+    const replacedSourceRoot = join(tempDir, 'source-before-lock')
+    const relocator = createRelocator({
+      acquireWorkspaceOperation: () => {
+        renameSync(sourceRoot, replacedSourceRoot)
+        mkdirSync(sourceRoot)
+        writeFileSync(join(sourceRoot, 'README.md'), 'replacement', 'utf8')
+        return () => {}
+      },
+    })
+
+    await expect(relocator.run({ workspaceId: workspace.id, targetRoot })).rejects.toThrow('预检后发生变化')
+    expect(copyCalls).toBe(0)
+  })
+
+  test('Given 锁前预检安全但锁后目标目录被原地替换 When 运行 Then 拒绝身份变化且不复制', async () => {
+    /** 保留锁前目标 inode 的改名路径。 */
+    const replacedTargetRoot = join(tempDir, 'target-before-lock')
+    let releases = 0
+    const relocator = createRelocator({
+      acquireWorkspaceOperation: () => {
+        renameSync(targetRoot, replacedTargetRoot)
+        mkdirSync(targetRoot)
+        return () => { releases += 1 }
+      },
+    })
+
+    await expect(relocator.run({ workspaceId: workspace.id, targetRoot })).rejects.toThrow('预检后发生变化')
+
+    expect(copyCalls).toBe(0)
+    expect(releases).toBe(1)
+  })
+
   test.each([0, 1, 2])('Given committing journal 在第 %i 步崩溃 When 恢复 Then 幂等完成并清 journal', async (crashStep) => {
     /** 每步第一次执行后故障，恢复时同一步允许再次执行。 */
     const attempts = [0, 0, 0]
@@ -241,6 +315,23 @@ describe('WorkspaceProjectRelocator', () => {
     expect(attempts[crashStep]).toBe(2)
     expect(workspace.projectRootPath).toBe(resolve(targetRoot))
     expect(relocator.getStatus(workspace.id)).toBeNull()
+  })
+
+  test('Given 最终工作区索引 strict 提交失败 When 运行 Then journal 不推进第三步', async () => {
+    const relocator = createRelocator({
+      updateAgentWorkspaceProjectRoot: () => { throw new Error('工作区索引的所有 JSON 候选均损坏') },
+    })
+
+    await expect(relocator.run({ workspaceId: workspace.id, targetRoot })).rejects.toThrow('工作区索引')
+
+    const journalName = readdirSync(join(configDir, 'workspace-relocations')).find((name) => name.endsWith('.json'))
+    expect(journalName).toBeString()
+    const journal = JSON.parse(readFileSync(join(configDir, 'workspace-relocations', journalName!), 'utf8')) as {
+      stage: string
+      completedCommitSteps: number
+    }
+    expect(journal.stage).toBe('committing')
+    expect(journal.completedCommitSteps).toBe(2)
   })
 
   test.each([
@@ -348,6 +439,79 @@ describe('WorkspaceProjectRelocator', () => {
     expect(relocator.cancel(operationId!)).toBe(true)
     await expect(running).rejects.toThrow('aborted')
     expect(relocator.getStatus(workspace.id)?.stage).toBe('failed')
+  })
+
+  test('Given 运行已进入 committing When 按 operationId 取消 Then 返回 false 且提交继续完成', async () => {
+    /** 提交阶段完整性检查的 deferred 控制。 */
+    let continueCommit: (() => void) | undefined
+    const commitGate = new Promise<void>((resolveCommit) => { continueCommit = resolveCommit })
+    /** 通知测试运行已真实进入 committing 的异步边界。 */
+    let notifyCommitting: (() => void) | undefined
+    const committingStarted = new Promise<void>((resolveStarted) => { notifyCommitting = resolveStarted })
+    const relocator = createRelocator({
+      inspectCopyOwnership: async () => {
+        if (copyCalls === 0) return 'absent'
+        notifyCommitting?.()
+        await commitGate
+        return 'owned'
+      },
+    })
+    /** 从公开进度事件捕获稳定 operationId。 */
+    let operationId = ''
+    const running = relocator.run({ workspaceId: workspace.id, targetRoot }, (progress) => {
+      if (progress.stage === 'committing') operationId = progress.operationId
+    })
+    await committingStarted
+
+    expect(operationId).toBeString()
+    expect(relocator.cancel(operationId)).toBe(false)
+    continueCommit?.()
+    await expect(running).resolves.toMatchObject({ stage: 'completed' })
+    expect(commitCalls).toEqual(['sessions', 'config', 'index'])
+  })
+
+  test('Given 首次迁移 When 启动 copier Then journal 目录和首个 journal 已先持久化', async () => {
+    /** 记录 durable 边界与 copier 启动的严格顺序。 */
+    const events: string[] = []
+    const relocator = createRelocator({
+      ensureJournalDirectory: (directoryPath) => {
+        ensureDirectoryDurable(directoryPath)
+        events.push('directory-durable')
+      },
+      writeJournalFile: (filePath, data) => {
+        writeJsonFileAtomicSecure(filePath, data)
+        events.push('journal-durable')
+      },
+      copyDirectory: async () => {
+        events.push('copier')
+        copyCalls += 1
+        return { verifiedFiles: 1, reusedFiles: 0, totalBytes: 4 }
+      },
+    })
+
+    await relocator.run({ workspaceId: workspace.id, targetRoot })
+
+    expect(events.slice(0, 3)).toEqual(['directory-durable', 'journal-durable', 'copier'])
+  })
+
+  test('Given 首个 durable journal 写入失败 When 运行迁移 Then copier 保持零调用', async () => {
+    const relocator = createRelocator({
+      writeJournalFile: () => { throw new Error('journal fsync failed') },
+    })
+
+    await expect(relocator.run({ workspaceId: workspace.id, targetRoot })).rejects.toThrow('journal fsync failed')
+    expect(copyCalls).toBe(0)
+  })
+
+  test('Given 源目录只读但可读取和进入 When 运行迁移 Then 不要求源写权限', async () => {
+    chmodSync(sourceRoot, 0o500)
+    try {
+      const relocator = createRelocator()
+
+      await expect(relocator.run({ workspaceId: workspace.id, targetRoot })).resolves.toMatchObject({ stage: 'completed' })
+    } finally {
+      chmodSync(sourceRoot, 0o700)
+    }
   })
 
   /** 创建带真实 journal I/O 与可观察业务依赖的迁移器。 */

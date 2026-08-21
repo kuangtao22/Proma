@@ -46,6 +46,16 @@ function isAgentWorkspace(value: unknown): value is JsonObject & { id: string; s
     && isString(value.slug)
     && isNumber(value.createdAt)
     && isNumber(value.updatedAt)
+    && isOptional(value.projectRootPath, isString)
+    && isOptional(value.projectRootStatus, isLocalProjectRootStatus)
+}
+
+/** 校验 AgentWorkspace 的运行时项目根状态。 */
+function isLocalProjectRootStatus(value: unknown): boolean {
+  return value === 'available'
+    || value === 'missing'
+    || value === 'not_directory'
+    || value === 'unavailable'
 }
 
 /** 校验 WorkspaceConfig 中 Task4 owned 路径及其容器结构。 */
