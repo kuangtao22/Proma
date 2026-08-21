@@ -114,7 +114,7 @@ describe('Agent sendMessage 准入顺序合同', () => {
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
     /** 截取 adapter 重试循环到异步迭代器创建的结构。 */
     const loopStart = source.indexOf('for (let attempt = 1; attempt <= MAX_QUERY_ATTEMPTS; attempt++)')
-    const adapterStart = source.indexOf('const queryIterable = this.adapter.query(queryOptions)', loopStart)
+    const adapterStart = source.indexOf('const queryIterable = this.adapter.query(queryOptions, queryToken)', loopStart)
     const attemptPrefix = source.slice(loopStart, adapterStart)
     /** 每次 attempt 的业务异常捕获边界。 */
     const businessTryIndex = attemptPrefix.lastIndexOf('try {')
@@ -312,7 +312,7 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(sendBody).toContain('.finally(() => {')
     expect(sendBody).toContain('releaseGenerationTask(')
     expect(sendBody.match(/await closeAgentQueryIterator\(/g)?.length ?? 0).toBe(2)
-    expect(sendBody).toContain('await this.adapter.forceCloseQuery(sessionId)')
+    expect(sendBody).toContain('await this.adapter.forceCloseQuery(queryToken)')
   })
 
   test('Given 标题仍可能写入数据根 When 检查迁移查询 Then 数据写活跃与 UI 运行态保持独立', () => {
@@ -346,7 +346,8 @@ describe('Agent sendMessage 准入顺序合同', () => {
     /** utility Pi adapter 实现。 */
     const utilitySource = readFileSync(join(import.meta.dir, 'adapters/pi-utility-adapter.ts'), 'utf8')
 
-    expect(providerSource).toContain('forceCloseQuery(sessionId: string): Promise<void>')
+    expect(providerSource).toContain('query(input: AgentQueryInput, queryToken: string): AsyncIterable<SDKMessage>')
+    expect(providerSource).toContain('forceCloseQuery(queryToken: string): Promise<void>')
     expect(inProcessSource).toContain('active.forceClosePromise ??=')
     expect(inProcessSource).toContain('await active.closed')
     expect(utilitySource).toContain('if (pending.forceClosePromise) return pending.forceClosePromise')

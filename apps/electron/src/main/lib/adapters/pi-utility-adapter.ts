@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto'
 import type {
   AgentRuntimeEvent,
   AgentRuntimeRequest,
@@ -45,11 +44,15 @@ type AsyncEventQueue<T> = {
  * through capability RPC so business ownership stays in the main process.
  */
 export class PiUtilityAdapter {
+  /** 按不可复用 query token 保存每个独立 utility runtime。 */
   private readonly pendingQueries = new Map<string, PendingQuery>()
+  /** 每个会话当前接受用户操作的 query token。 */
+  private readonly currentQueryTokens = new Map<string, string>()
   private readonly capabilityAbortControllers = new Map<string, CapabilityRequest>()
 
-  async *query(input: PiAgentQueryOptions): AsyncIterable<SDKMessage> {
-    const queryId = randomUUID()
+  async *query(input: PiAgentQueryOptions, queryToken: string): AsyncIterable<SDKMessage> {
+    /** utility 协议 queryId 直接复用编排层生成的唯一 token。 */
+    const queryId = queryToken
     const client = new AgentRuntimeClient({ sessionId: input.sessionId })
     const pending: PendingQuery = {
       queryId,
@@ -62,8 +65,9 @@ export class PiUtilityAdapter {
       runtimeFailed: false,
     }
     this.pendingQueries.set(queryId, pending)
+    this.currentQueryTokens.set(input.sessionId, queryId)
     client.setRequestHandler((request) => this.handleRuntimeRequest(request))
-    const unsubscribe = client.onEvent((event) => this.handleRuntimeEvent(event))
+    const unsubscribe = client.onEvent((event) => this.handleRuntimeEvent(event, queryId))
 
     try {
       await client.call(
@@ -85,6 +89,9 @@ export class PiUtilityAdapter {
       pending.ended = true
       unsubscribe()
       this.pendingQueries.delete(queryId)
+      if (this.currentQueryTokens.get(input.sessionId) === queryId) {
+        this.currentQueryTokens.delete(input.sessionId)
+      }
       if (pending.forceClosePromise) {
         await pending.forceClosePromise
       } else {
@@ -95,14 +102,14 @@ export class PiUtilityAdapter {
   }
 
   abort(sessionId: string): void {
-    const pending = this.findPending(sessionId)
+    const pending = this.findCurrentPending(sessionId)
     if (!pending) return
     void this.requestRuntimeAbort(pending)
   }
 
   /** 先结束 utility runtime 与事件队列，使调用方随后可等待 async generator cleanup。 */
-  forceCloseQuery(sessionId: string): Promise<void> {
-    const pending = this.findPending(sessionId)
+  forceCloseQuery(queryToken: string): Promise<void> {
+    const pending = this.pendingQueries.get(queryToken)
     if (!pending) return Promise.resolve()
     return this.forceClosePendingQuery(pending)
   }
@@ -112,7 +119,7 @@ export class PiUtilityAdapter {
     message: SDKUserMessageInput,
     options?: SendQueuedMessageOptions,
   ): Promise<void> {
-    const pending = this.findPending(sessionId)
+    const pending = this.findCurrentPending(sessionId)
     if (!pending) throw new Error('当前会话没有正在运行的 Agent')
     const { onAccepted: _onAccepted, ...serializableOptions } = options ?? {}
     await pending.client.call(
@@ -124,7 +131,7 @@ export class PiUtilityAdapter {
   }
 
   async setPermissionMode(sessionId: string, mode: string): Promise<void> {
-    const pending = this.findPending(sessionId)
+    const pending = this.findCurrentPending(sessionId)
     if (!pending) return
     await pending.client.call(
       AGENT_RUNTIME_METHODS.QUERY_SET_PERMISSION_MODE,
@@ -203,8 +210,10 @@ export class PiUtilityAdapter {
     throw new Error(`Unsupported Agent runtime request: ${request.method}`)
   }
 
-  private findPending(sessionId: string): PendingQuery | undefined {
-    return Array.from(this.pendingQueries.values()).find((item) => item.sessionId === sessionId)
+  /** 返回会话当前 query；旧 generation 即使尚未 cleanup 也不会被用户操作命中。 */
+  private findCurrentPending(sessionId: string): PendingQuery | undefined {
+    const queryToken = this.currentQueryTokens.get(sessionId)
+    return queryToken ? this.pendingQueries.get(queryToken) : undefined
   }
 
   /** 复用单个 runtime abort 请求，避免 stop 与 drain timeout 重复终止同一 query。 */
@@ -236,11 +245,12 @@ export class PiUtilityAdapter {
     return pending.forceClosePromise
   }
 
-  private handleRuntimeEvent(event: AgentRuntimeEvent): void {
+  private handleRuntimeEvent(event: AgentRuntimeEvent, sourceQueryToken: string): void {
     if (event.method === AGENT_RUNTIME_METHODS.EVENT_CRASHED) {
       const error = toRuntimeError(event.payload)
-      const failed = Array.from(this.pendingQueries.values())
-        .filter((pending) => pending.sessionId === event.sessionId)
+      /** crash 只属于发出事件的 utility process，不能波及同 session 的新 generation。 */
+      const failed = [this.pendingQueries.get(sourceQueryToken)]
+        .filter((pending): pending is PendingQuery => pending !== undefined)
       for (const pending of failed) {
         pending.runtimeFailed = true
         pending.queue.fail(error)

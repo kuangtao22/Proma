@@ -1720,8 +1720,10 @@ export class AgentOrchestrator {
         // 停止 sentinel 必须在 query 业务 catch 外抛出，仅由 runAgentLifecycle 消费。
         checkpoint()
         try {
+          /** 唯一标识本次 adapter query，使旧 generation 只能关闭自身 runtime。 */
+          const queryToken = randomUUID()
           // 获取异步迭代器（手动 .next() 以支持 Promise.race 中断）
-          const queryIterable = this.adapter.query(queryOptions)
+          const queryIterable = this.adapter.query(queryOptions, queryToken)
           const queryIterator = queryIterable[Symbol.asyncIterator]()
 
           // 手动事件循环：Promise.race（SDKMessage vs result drain timeout）
@@ -1759,7 +1761,7 @@ export class AgentOrchestrator {
               console.warn(`[Agent 编排] drain timeout: SDK iterator 在 result 后 ${RESULT_DRAIN_TIMEOUT_MS}ms 内未关闭，强制退出`)
               pendingNext?.catch(() => {})
               pendingNext = null
-              await this.adapter.forceCloseQuery(sessionId).catch((error) => {
+              await this.adapter.forceCloseQuery(queryToken).catch((error) => {
                 console.error('[Agent 编排] drain timeout 强制关闭 Agent runtime 失败:', error)
               })
               await closeAgentQueryIterator(queryIterator, (error) => {
@@ -1773,7 +1775,7 @@ export class AgentOrchestrator {
 
             if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) {
               pendingNext = null
-              await this.adapter.forceCloseQuery(sessionId).catch((error) => {
+              await this.adapter.forceCloseQuery(queryToken).catch((error) => {
                 console.error('[Agent 编排] stale generation 强制关闭 Agent runtime 失败:', error)
               })
               await closeAgentQueryIterator(queryIterator, (error) => {

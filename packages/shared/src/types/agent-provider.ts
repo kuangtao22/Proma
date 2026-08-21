@@ -53,12 +53,12 @@ export interface AgentQueryInput {
  * SDK 返回完整 JSON 对象（includePartialMessages: false），外部直接透传。
  */
 export interface AgentProviderAdapter {
-  /** 发起查询，返回 SDKMessage 异步迭代流 */
-  query(input: AgentQueryInput): AsyncIterable<SDKMessage>
+  /** 发起查询；queryToken 唯一标识本次请求实例，返回 SDKMessage 异步迭代流。 */
+  query(input: AgentQueryInput, queryToken: string): AsyncIterable<SDKMessage>
   /** 中止指定会话的执行 */
   abort(sessionId: string): void
-  /** 强制关闭指定查询，并在底层 runtime 与 iterator 上游队列完成收尾后 resolve。 */
-  forceCloseQuery(sessionId: string): Promise<void>
+  /** 按不可复用 token 强制关闭指定查询，并在底层 runtime 与 iterator 上游队列完成收尾后 resolve。 */
+  forceCloseQuery(queryToken: string): Promise<void>
   /**
    * 软中断当前 turn，但保留活跃 Query/Channel 以便继续注入下一条用户消息。
    * 与 abort() 的区别：不杀子进程，允许立即续跑新消息。

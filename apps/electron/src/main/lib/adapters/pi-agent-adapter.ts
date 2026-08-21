@@ -1328,11 +1328,15 @@ export function installRuntimeGuardHooks(session: AgentSession, guard: AgentRunt
 }
 
 export class PiAgentAdapter implements AgentProviderAdapter {
+  /** 每个会话当前可接受用户操作的 query。 */
   private activeSessions = new Map<string, ActivePiSession>()
+  /** 每个不可复用 token 对应的 query，用于旧 generation 精确收尾。 */
+  private activeQueries = new Map<string, ActivePiSession>()
 
-  async *query(input: PiAgentQueryOptions): AsyncIterable<SDKMessage> {
+  async *query(input: PiAgentQueryOptions, queryToken: string): AsyncIterable<SDKMessage> {
     const active = createActivePiSession()
     this.activeSessions.set(input.sessionId, active)
+    this.activeQueries.set(queryToken, active)
     const queue = createAsyncQueue<SDKMessage>()
     const runtimeGuard = createAgentRuntimeGuard(input)
     // 同一 session 的新请求可能在旧 IPC 事件之后开始；所有 retry 生命周期均携带这一轮标识。
@@ -1355,6 +1359,9 @@ export class PiAgentAdapter implements AgentProviderAdapter {
         }
         if (this.activeSessions.get(input.sessionId) === active) {
           this.activeSessions.delete(input.sessionId)
+        }
+        if (this.activeQueries.get(queryToken) === active) {
+          this.activeQueries.delete(queryToken)
         }
       } finally {
         active.resolveClosed()
@@ -1955,29 +1962,34 @@ export class PiAgentAdapter implements AgentProviderAdapter {
   abort(sessionId: string): void {
     const active = this.activeSessions.get(sessionId)
     if (!active) return
+    this.abortActiveQuery(active, `sessionId=${sessionId}`)
+  }
+
+  /** 中止指定 query 对象，不重新按 session 查询，避免旧 generation 误停当前请求。 */
+  private abortActiveQuery(active: ActivePiSession, logIdentity: string): void {
     active.abortRequested = true
     rejectPendingInterruptPrompts(active, createAbortError())
     if (!active.session) rejectActiveReady(active, createAbortError())
     try {
       active.session?.abortCompaction()
     } catch (error) {
-      console.warn(`[PiAgentAdapter] abort compaction failed: sessionId=${sessionId}`, error)
+      console.warn(`[PiAgentAdapter] abort compaction failed: ${logIdentity}`, error)
     }
     try {
       active.session?.abort().catch((error) => {
-        console.warn(`[PiAgentAdapter] abort failed: sessionId=${sessionId}`, error)
+        console.warn(`[PiAgentAdapter] abort failed: ${logIdentity}`, error)
       })
     } catch (error) {
-      console.warn(`[PiAgentAdapter] abort failed: sessionId=${sessionId}`, error)
+      console.warn(`[PiAgentAdapter] abort failed: ${logIdentity}`, error)
     }
   }
 
   /** 中止 in-process Pi session，并等待其 cleanupActiveSession 完成。 */
-  forceCloseQuery(sessionId: string): Promise<void> {
-    const active = this.activeSessions.get(sessionId)
+  forceCloseQuery(queryToken: string): Promise<void> {
+    const active = this.activeQueries.get(queryToken)
     if (!active) return Promise.resolve()
     active.forceClosePromise ??= (async () => {
-      this.abort(sessionId)
+      this.abortActiveQuery(active, `queryToken=${queryToken}`)
       await active.closed
     })()
     return active.forceClosePromise
@@ -2064,7 +2076,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
   }
 
   dispose(): void {
-    for (const active of this.activeSessions.values()) {
+    for (const active of this.activeQueries.values()) {
       try {
         if (!active.disposed) {
           active.disposed = true
@@ -2080,5 +2092,6 @@ export class PiAgentAdapter implements AgentProviderAdapter {
       }
     }
     this.activeSessions.clear()
+    this.activeQueries.clear()
   }
 }
