@@ -49,9 +49,11 @@ export {
   classifyLinuxMountInfo,
   classifyMacDiskInfo,
   classifyWindowsDriveType,
+  detectDataRootDeviceType,
   inspectDataRootStorage,
   invalidateDataRootStorage,
   inspectDataRootVolume,
+  readLinuxBlockRemovable,
   scanDataRootBytes,
   toSafeByteCount,
 } from './data-root-storage'

@@ -70,6 +70,8 @@ describe('路径管理 preload API', () => {
     const recorded = createRecordedIpc()
     /** 普通窗口实际暴露的路径 API。 */
     const api = createNormalPathManagementPreloadApi(recorded.ipc)
+    /** 主进程签发的目标选择授权必须原样传给 preview/start。 */
+    const selection = { selectionId: 'selection-1', targetRoot: '/data/new' }
 
     expect(Object.keys(api).sort()).toEqual([
       'getDataRootMigrationStatus',
@@ -83,15 +85,15 @@ describe('路径管理 preload API', () => {
 
     await invokeApi(api, 'getPathManagementState')
     await invokeApi(api, 'pickDataRoot')
-    await invokeApi(api, 'previewDataRootMigration', '/data/new')
-    await invokeApi(api, 'startDataRootMigration', '/data/new')
+    await invokeApi(api, 'previewDataRootMigration', selection)
+    await invokeApi(api, 'startDataRootMigration', selection)
     await invokeApi(api, 'getDataRootMigrationStatus')
     await invokeApi(api, 'openDataRoot', 'previous')
     expect(recorded.invokes).toEqual([
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, args: [] },
-      { channel: 'path-management:preview-data-root-migration', args: ['/data/new'] },
-      { channel: PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, args: ['/data/new'] },
+      { channel: 'path-management:preview-data-root-migration', args: [selection] },
+      { channel: PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, args: [selection] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, args: ['previous'] },
     ])

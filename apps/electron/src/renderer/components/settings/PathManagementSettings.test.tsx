@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import type { ComponentType } from 'react'
 import type {
   DataRootMigrationPreview,
+  DataRootSelection,
   DataRootMigrationStatus,
   PathManagementState,
 } from '@proma/shared'
@@ -19,10 +20,10 @@ interface ExpectedPathManagementSettingsModule {
   requestDataRootMigration: (
     state: PathManagementState,
     dependencies: {
-      pickDataRoot: () => Promise<string | null>
-      previewDataRootMigration: (targetRoot: string) => Promise<DataRootMigrationPreview>
+      pickDataRoot: () => Promise<DataRootSelection | null>
+      previewDataRootMigration: (selection: DataRootSelection) => Promise<DataRootMigrationPreview>
       confirmMigration: (preview: DataRootMigrationPreview) => Promise<boolean>
-      startDataRootMigration: (targetRoot: string) => Promise<void>
+      startDataRootMigration: (selection: DataRootSelection) => Promise<void>
     },
   ) => Promise<'cancelled' | 'started'>
   getDataRootDeviceRisk: (deviceType: PathManagementState['deviceType']) => string | null
@@ -87,6 +88,11 @@ function createPreview(overrides: Partial<DataRootMigrationPreview> = {}): DataR
     blockers: [],
     ...overrides,
   }
+}
+
+/** 创建主进程签发的测试 selection。 */
+function createSelection(targetRoot = '/Volumes/New/Proma'): DataRootSelection {
+  return { selectionId: 'selection-1', targetRoot }
 }
 
 describe('PathManagementSettings', () => {
@@ -155,7 +161,7 @@ describe('PathManagementSettings', () => {
       startDataRootMigration: async () => { started = true },
     })
     const cancelledAtDialog = await requestDataRootMigration(createState(), {
-      pickDataRoot: async () => '/Volumes/New/Proma',
+      pickDataRoot: async () => createSelection(),
       previewDataRootMigration: async () => createPreview(),
       confirmMigration: async () => false,
       startDataRootMigration: async () => { started = true },
@@ -175,27 +181,27 @@ describe('PathManagementSettings', () => {
     const result = await requestDataRootMigration(createState(), {
       pickDataRoot: async () => {
         calls.push('pick')
-        return '/Volumes/New/Proma'
+        return createSelection()
       },
-      previewDataRootMigration: async (targetRoot) => {
-        calls.push(`preview:${targetRoot}`)
-        return createPreview({ targetRoot })
+      previewDataRootMigration: async (selection) => {
+        calls.push(`preview:${selection.selectionId}:${selection.targetRoot}`)
+        return createPreview({ targetRoot: selection.targetRoot })
       },
       confirmMigration: async (preview) => {
         calls.push(`confirm:${preview.targetRoot}`)
         return true
       },
-      startDataRootMigration: async (targetRoot) => {
-        calls.push(`start:${targetRoot}`)
+      startDataRootMigration: async (selection) => {
+        calls.push(`start:${selection.selectionId}:${selection.targetRoot}`)
       },
     })
 
     expect(result).toBe('started')
     expect(calls).toEqual([
       'pick',
-      'preview:/Volumes/New/Proma',
+      'preview:selection-1:/Volumes/New/Proma',
       'confirm:/Volumes/New/Proma',
-      'start:/Volumes/New/Proma',
+      'start:selection-1:/Volumes/New/Proma',
     ])
   })
 
@@ -213,7 +219,7 @@ describe('PathManagementSettings', () => {
     })
 
     expect(requestDataRootMigration(blockedState, {
-      pickDataRoot: async () => { picked = true; return '/Volumes/New/Proma' },
+      pickDataRoot: async () => { picked = true; return createSelection() },
       previewDataRootMigration: async () => createPreview(),
       confirmMigration: async () => true,
       startDataRootMigration: async () => undefined,
@@ -228,7 +234,7 @@ describe('PathManagementSettings', () => {
     let started = false
 
     const result = await requestDataRootMigration(createState(), {
-      pickDataRoot: async () => '/Volumes/New/Proma',
+      pickDataRoot: async () => createSelection(),
       previewDataRootMigration: async () => createPreview({
         blockers: [{ code: 'TARGET_NOT_EMPTY', message: '目标目录必须为空' }],
       }),

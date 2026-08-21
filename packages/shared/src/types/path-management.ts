@@ -52,6 +52,15 @@ export interface DataRootMigrationPreview {
   blockers: DataRootMigrationPreviewBlocker[]
 }
 
+/** 主进程系统选择器签发的单次迁移目标授权。 */
+export interface DataRootSelection {
+  selectionId: string
+  targetRoot: string
+}
+
+/** preview/start 必须原样回传的服务端选择授权。 */
+export type DataRootMigrationSelectionInput = DataRootSelection
+
 /** 已提交迁移仍待完成的 sidecar 清理状态。 */
 export interface DataRootPostCommitCleanupProgress {
   migrationId: string

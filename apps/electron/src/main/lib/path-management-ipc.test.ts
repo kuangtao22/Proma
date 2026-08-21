@@ -18,6 +18,23 @@ const expectedWebContents = { send: () => undefined }
 /** 通过 sender 身份门的最小 IPC event。 */
 const expectedEvent = { sender: expectedWebContents }
 
+/** normal 启动测试通过真实 pick/preview handler 取得服务端授权。 */
+async function authorizeMigrationSelection(
+  handlers: Map<string, (...args: unknown[]) => unknown>,
+): Promise<{ selectionId: string; targetRoot: string }> {
+  const pick = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)
+  const preview = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION)
+  if (!pick || !preview) throw new Error('缺少 selection 授权 handler')
+  const selection = await pick(expectedEvent) as { selectionId: string; targetRoot: string }
+  await preview(expectedEvent, selection)
+  return selection
+}
+
+/** 启动测试使用的无 blocker 目标预览。 */
+async function createSafePreview(targetRoot: string) {
+  return { targetRoot, deviceType: 'local' as const, requiredBytes: 1, blockers: [] }
+}
+
 /** 创建测试用 locator 检查结果，避免触碰真实 home 目录。 */
 function createLocatorResult(
   overrides: Partial<DataRootLocatorResult> = {},
@@ -272,6 +289,7 @@ describe('路径管理 IPC', () => {
       app: { relaunch: () => undefined, quit: () => undefined },
       getExpectedWebContents: () => expectedWebContents,
       dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/proma-new'] }) },
+      createSelectionId: () => 'selection-new',
       coordinator: {
         getStatus: () => createLocatorResult().state,
         previewTarget: async (targetRoot) => {
@@ -297,11 +315,236 @@ describe('路径管理 IPC', () => {
     const previewHandler = handlers.get('path-management:preview-data-root-migration')
     if (!pickHandler || !previewHandler) throw new Error('缺少 pick 或 preview handler')
 
-    expect(await pickHandler(expectedEvent)).toBe('/data/proma-new')
-    expect(await previewHandler(expectedEvent, '/data/proma-new')).toMatchObject({ deviceType: 'removable', blockers: [] })
-    await expect(previewHandler(expectedEvent, '/data/other')).rejects.toThrow('只能预检刚刚选择的目标目录')
-    await expect(previewHandler(expectedEvent, 'relative')).rejects.toThrow('目标数据根必须是绝对路径')
+    const selection = await pickHandler(expectedEvent)
+    expect(selection).toEqual({ selectionId: 'selection-new', targetRoot: '/data/proma-new' })
+    expect(await previewHandler(expectedEvent, selection)).toMatchObject({ deviceType: 'removable', blockers: [] })
+    await expect(previewHandler(expectedEvent, { selectionId: 'selection-new', targetRoot: '/data/other' }))
+      .rejects.toThrow('目标选择已失效')
+    await expect(previewHandler(expectedEvent, { selectionId: 'selection-new', targetRoot: 'relative' }))
+      .rejects.toThrow('数据根目标选择无效')
     expect(calls).toEqual(['preview:/data/proma-new'])
+  })
+
+  test('Given 未 preview、旧 selection 或 A-token/B-path When start Then 服务端全部拒绝', async () => {
+    /** 系统选择器依次授权 A、B 两个目录。 */
+    const pickedRoots = ['/data/a', '/data/b']
+    /** 生成可断言的服务端 selectionId。 */
+    const selectionIds = ['selection-a', 'selection-b']
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    let createdPlans = 0
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      dialog: {
+        showOpenDialog: async () => ({ canceled: false, filePaths: [pickedRoots.shift() ?? '/data/missing'] }),
+      },
+      createSelectionId: () => selectionIds.shift() ?? 'selection-extra',
+      coordinator: {
+        getStatus: () => createLocatorResult().state,
+        previewTarget: async (targetRoot) => ({
+          targetRoot,
+          deviceType: 'local',
+          availableBytes: 1000,
+          requiredBytes: 10,
+          blockers: [],
+        }),
+        createPlan: async () => {
+          createdPlans += 1
+          return { migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 10 }
+        },
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+    })
+    const pick = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)
+    const preview = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION)
+    const start = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
+    if (!pick || !preview || !start) throw new Error('缺少 selection 状态机 handler')
+
+    const selectionA = await pick(expectedEvent) as { selectionId: string; targetRoot: string }
+    await expect(start(expectedEvent, selectionA)).rejects.toThrow('目标选择尚未完成预检')
+    await preview(expectedEvent, selectionA)
+    const selectionB = await pick(expectedEvent) as { selectionId: string; targetRoot: string }
+    await expect(start(expectedEvent, selectionA)).rejects.toThrow('目标选择已失效')
+    await expect(start(expectedEvent, { selectionId: selectionA.selectionId, targetRoot: selectionB.targetRoot }))
+      .rejects.toThrow('目标选择已失效')
+    expect(createdPlans).toBe(0)
+  })
+
+  test('Given coordinator 返回不同目标 When preview Then 不记录 previewed 授权', async () => {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/a'] }) },
+      createSelectionId: () => 'selection-a',
+      coordinator: {
+        getStatus: () => createLocatorResult().state,
+        previewTarget: async () => ({ targetRoot: '/data/other', deviceType: 'local', requiredBytes: 1, blockers: [] }),
+        createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }),
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+    })
+    const pick = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)
+    const preview = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION)
+    const start = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
+    if (!pick || !preview || !start) throw new Error('缺少目标一致性 handler')
+    const selection = await pick(expectedEvent) as { selectionId: string; targetRoot: string }
+
+    await expect(preview(expectedEvent, selection)).rejects.toThrow('预检返回的目标数据根不一致')
+    await expect(start(expectedEvent, selection)).rejects.toThrow('目标选择尚未完成预检')
+  })
+
+  test('Given 新 pick 已开始或旧 pick 晚返回 When preview/start Then 旧代次永不恢复授权', async () => {
+    /** 精确控制两个系统选择器完成顺序。 */
+    const dialogResolvers: Array<(value: { canceled: boolean; filePaths: string[] }) => void> = []
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      dialog: {
+        showOpenDialog: async () => await new Promise((resolve) => { dialogResolvers.push(resolve) }),
+      },
+      createSelectionId: () => 'selection-current',
+      coordinator: {
+        getStatus: () => createLocatorResult().state,
+        previewTarget: async (targetRoot) => ({
+          targetRoot,
+          deviceType: 'local',
+          requiredBytes: 1,
+          blockers: [],
+        }),
+        createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }),
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+    })
+    const pick = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)
+    const preview = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION)
+    if (!pick || !preview) throw new Error('缺少并发 pick handler')
+
+    const pickA = Promise.resolve(pick(expectedEvent))
+    const pickB = Promise.resolve(pick(expectedEvent))
+    dialogResolvers[1]?.({ canceled: false, filePaths: ['/data/b'] })
+    const selectionB = await pickB as { selectionId: string; targetRoot: string }
+    dialogResolvers[0]?.({ canceled: false, filePaths: ['/data/a'] })
+    expect(await pickA).toBeNull()
+    expect(selectionB).toEqual({ selectionId: 'selection-current', targetRoot: '/data/b' })
+    await expect(preview(expectedEvent, { selectionId: 'stale-a', targetRoot: '/data/a' }))
+      .rejects.toThrow('目标选择已失效')
+    await expect(preview(expectedEvent, selectionB)).resolves.toMatchObject({ targetRoot: '/data/b' })
+  })
+
+  test('Given preview A 尚未完成 When pick B Then A 晚完成也不能给 B 或 A 授权', async () => {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    const roots = ['/data/a', '/data/b']
+    const ids = ['selection-a', 'selection-b']
+    /** 第一轮 preview 的 resolver 用于制造 A-preview/B-pick 交错。 */
+    const previewResolvers: Array<(value: Awaited<ReturnType<typeof createSafePreview>>) => void> = []
+    let previewCalls = 0
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [roots.shift() ?? '/data/missing'] }) },
+      createSelectionId: () => ids.shift() ?? 'selection-extra',
+      coordinator: {
+        getStatus: () => createLocatorResult().state,
+        previewTarget: async (targetRoot) => {
+          previewCalls += 1
+          if (previewCalls === 1) {
+            return await new Promise((resolve) => { previewResolvers.push(resolve) })
+          }
+          return createSafePreview(targetRoot)
+        },
+        createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }),
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+    })
+    const pick = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)
+    const preview = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION)
+    if (!pick || !preview) throw new Error('缺少 preview 交错 handler')
+    const selectionA = await pick(expectedEvent) as { selectionId: string; targetRoot: string }
+    const previewA = Promise.resolve(preview(expectedEvent, selectionA))
+    const selectionB = await pick(expectedEvent) as { selectionId: string; targetRoot: string }
+    previewResolvers[0]?.(await createSafePreview(selectionA.targetRoot))
+
+    await expect(previewA).rejects.toThrow('目标选择已失效')
+    await expect(preview(expectedEvent, selectionB)).resolves.toMatchObject({ targetRoot: '/data/b' })
+  })
+
+  test('Given 已成功 preview When 两次并发 start Then selection 只允许一个调用占用', async () => {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    /** 首次 start 在 createPlan 内暂停，暴露第二次并发调用窗口。 */
+    const createPlanResolvers: Array<() => void> = []
+    let createPlanCalls = 0
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/a'] }) },
+      createSelectionId: () => 'selection-a',
+      coordinator: {
+        getStatus: () => createLocatorResult().state,
+        previewTarget: async (targetRoot) => ({
+          targetRoot,
+          deviceType: 'local',
+          requiredBytes: 1,
+          blockers: [],
+        }),
+        createPlan: async () => {
+          createPlanCalls += 1
+          await new Promise<void>((resolve) => { createPlanResolvers.push(resolve) })
+          return { migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }
+        },
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+    })
+    const pick = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)
+    const preview = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION)
+    const start = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
+    if (!pick || !preview || !start) throw new Error('缺少并发 start handler')
+    const selection = await pick(expectedEvent) as { selectionId: string; targetRoot: string }
+    await preview(expectedEvent, selection)
+
+    const firstStart = Promise.resolve(start(expectedEvent, selection))
+    await expect(start(expectedEvent, selection)).rejects.toThrow('目标选择正在启动或已消费')
+    for (let attempt = 0; attempt < 10 && createPlanResolvers.length === 0; attempt += 1) await Promise.resolve()
+    expect(createPlanCalls).toBe(1)
+    createPlanResolvers[0]?.()
+    await expect(firstStart).resolves.toBeUndefined()
+    expect(createPlanCalls).toBe(1)
   })
 
   test('Given 真实 coordinator 与 IPC When renderer 选择并预览 Then 返回真实预检且无磁盘写入', async () => {
@@ -335,8 +578,9 @@ describe('路径管理 IPC', () => {
     const preview = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION)
     if (!pick || !preview) throw new Error('缺少真实预览链 handler')
 
-    expect(await pick(expectedEvent)).toBe(targetRoot)
-    expect(await preview(expectedEvent, targetRoot)).toMatchObject({
+    const selection = await pick(expectedEvent) as { selectionId: string; targetRoot: string }
+    expect(selection.targetRoot).toBe(targetRoot)
+    expect(await preview(expectedEvent, selection)).toMatchObject({
       targetRoot,
       requiredBytes: Buffer.byteLength('{"theme":"dark"}'),
       availableBytes: 10_000,
@@ -433,6 +677,7 @@ describe('路径管理 IPC', () => {
         quit: () => { calls.push('quit') },
       },
       getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/proma-new'] }) },
       hasActiveTasks: () => {
         calls.push('check-tasks')
         return false
@@ -447,6 +692,7 @@ describe('路径管理 IPC', () => {
       },
       coordinator: {
         getStatus: () => createLocatorResult().state,
+        previewTarget: createSafePreview,
         createPlan: async () => {
           calls.push('create-plan')
           return {
@@ -464,7 +710,8 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
-    await handler(expectedEvent, '/data/proma-new')
+    const selection = await authorizeMigrationSelection(handlers)
+    await handler(expectedEvent, selection)
 
     expect(calls).toEqual([
       'check-tasks',
@@ -511,6 +758,7 @@ describe('路径管理 IPC', () => {
           quit: () => { calls.push('quit') },
         },
         getExpectedWebContents: () => expectedWebContents,
+        dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [targetRoot] }) },
         acquireMigrationGuard: () => ({
           release: () => {
             calls.push('release-intent')
@@ -519,6 +767,7 @@ describe('路径管理 IPC', () => {
         }),
         coordinator: {
           getStatus: () => locator.inspect().state,
+          previewTarget: createSafePreview,
           createPlan: async () => {
             calls.push('create-plan')
             locator.beginMigration({
@@ -546,7 +795,8 @@ describe('路径管理 IPC', () => {
 
       const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
       if (!handler) throw new Error('未注册创建迁移计划通道')
-      await expect(handler(expectedEvent, targetRoot)).resolves.toBeUndefined()
+      const selection = await authorizeMigrationSelection(handlers)
+      await expect(handler(expectedEvent, selection)).resolves.toBeUndefined()
 
       expect(calls).toEqual(['create-plan', 'release-intent', 'relaunch', 'quit'])
       expect(locator.inspect().locatorFile?.migration).toMatchObject({
@@ -576,9 +826,11 @@ describe('路径管理 IPC', () => {
         quit: () => { calls.push('quit') },
       },
       getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/proma-new'] }) },
       acquireMigrationGuard: () => ({ release: () => { calls.push('release-intent') } }),
       coordinator: {
         getStatus: () => createLocatorResult().state,
+        previewTarget: createSafePreview,
         createPlan: async () => {
           calls.push('create-plan')
           throw new Error('模拟计划创建失败')
@@ -591,7 +843,8 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
-    await expect(handler(expectedEvent, '/data/proma-new')).rejects.toThrow('模拟计划创建失败')
+    const selection = await authorizeMigrationSelection(handlers)
+    await expect(handler(expectedEvent, selection)).rejects.toThrow('模拟计划创建失败')
     expect(calls).toEqual(['create-plan', 'release-intent'])
   })
 
@@ -612,6 +865,7 @@ describe('路径管理 IPC', () => {
         quit: () => { calls.push('quit') },
       },
       getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/proma-new'] }) },
       acquireMigrationGuard: () => ({
         release: () => {
           calls.push('release-intent')
@@ -620,6 +874,7 @@ describe('路径管理 IPC', () => {
       }),
       coordinator: {
         getStatus: () => createLocatorResult().state,
+        previewTarget: createSafePreview,
         createPlan: async () => {
           calls.push('create-plan')
           throw new Error('模拟计划创建失败')
@@ -632,7 +887,8 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
-    await expect(handler(expectedEvent, '/data/proma-new')).rejects.toThrow('请完全退出所有 Proma 实例后重试')
+    const selection = await authorizeMigrationSelection(handlers)
+    await expect(handler(expectedEvent, selection)).rejects.toThrow('请完全退出所有 Proma 实例后重试')
     expect(calls).toEqual(['create-plan', 'release-intent'])
   })
 
@@ -650,9 +906,11 @@ describe('路径管理 IPC', () => {
       },
       app: { relaunch: () => undefined, quit: () => undefined },
       getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/proma-new'] }) },
       hasActiveTasks: () => true,
       coordinator: {
         getStatus: () => createLocatorResult().state,
+        previewTarget: createSafePreview,
         createPlan: async () => {
           created = true
           throw new Error('不应执行')
@@ -665,7 +923,8 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
-    await expect(handler(expectedEvent, '/data/proma-new')).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
+    const selection = await authorizeMigrationSelection(handlers)
+    await expect(handler(expectedEvent, selection)).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
     expect(created).toBe(false)
   })
 
@@ -690,6 +949,7 @@ describe('路径管理 IPC', () => {
         quit: () => { relaunchCalls.push('quit') },
       },
       getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/proma-new'] }) },
       hasActiveTasks: () => {
         activeChecks += 1
         return activeChecks === 3
@@ -698,6 +958,7 @@ describe('路径管理 IPC', () => {
       acquireMigrationGuard: () => ({ release: () => undefined }),
       coordinator: {
         getStatus: () => createLocatorResult().state,
+        previewTarget: createSafePreview,
         createPlan: async () => ({
           migrationId: 'migration-1',
           stage: 'pending',
@@ -712,7 +973,8 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
-    await expect(handler(expectedEvent, '/data/proma-new')).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
+    const selection = await authorizeMigrationSelection(handlers)
+    await expect(handler(expectedEvent, selection)).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
     expect(cancelled).toBe(true)
     expect(relaunchCalls).toEqual([])
   })
@@ -736,6 +998,7 @@ describe('路径管理 IPC', () => {
         quit: () => { calls.push('quit') },
       },
       getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/proma-new'] }) },
       hasActiveTasks: () => {
         activeChecks += 1
         return activeChecks === 3
@@ -757,6 +1020,7 @@ describe('路径管理 IPC', () => {
             },
           },
         }).state,
+        previewTarget: createSafePreview,
         createPlan: async () => ({
           migrationId: 'migration-1',
           stage: 'pending',
@@ -774,7 +1038,8 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
-    await expect(handler(expectedEvent, '/data/proma-new')).rejects.toThrow('模拟 pending 撤销失败')
+    const selection = await authorizeMigrationSelection(handlers)
+    await expect(handler(expectedEvent, selection)).rejects.toThrow('模拟 pending 撤销失败')
     expect(calls).toEqual(['cancel', 'release-intent', 'relaunch', 'quit'])
   })
 

@@ -2,7 +2,9 @@ import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import type {
   DataRootMigrationProgress,
   DataRootMigrationPreview,
+  DataRootMigrationSelectionInput,
   DataRootMigrationStatus,
+  DataRootSelection,
   OpenDataRootTarget,
   PathManagementState,
   RecoverDataRootInput,
@@ -24,11 +26,11 @@ export interface NormalPathManagementPreloadApi {
   /** 获取当前路径管理状态。 */
   getPathManagementState: () => Promise<PathManagementState>
   /** 使用系统选择器选择迁移目标目录。 */
-  pickDataRoot: () => Promise<string | null>
+  pickDataRoot: () => Promise<DataRootSelection | null>
   /** 只读预检系统选择器刚返回的目标目录。 */
-  previewDataRootMigration: (targetRoot: string) => Promise<DataRootMigrationPreview>
+  previewDataRootMigration: (input: DataRootMigrationSelectionInput) => Promise<DataRootMigrationPreview>
   /** 创建迁移计划并请求重启。 */
-  startDataRootMigration: (targetRoot: string) => Promise<void>
+  startDataRootMigration: (input: DataRootMigrationSelectionInput) => Promise<void>
   /** 获取当前迁移与提交后清理状态。 */
   getDataRootMigrationStatus: () => Promise<DataRootMigrationStatus>
   /** 在系统文件管理器打开 locator 中的当前或上次数据根。 */
@@ -79,14 +81,14 @@ export function createNormalPathManagementPreloadApi(
 ): NormalPathManagementPreloadApi {
   return {
     getPathManagementState: () => invokePathManagementState(ipc),
-    pickDataRoot: () => invokePickDataRoot(ipc),
-    previewDataRootMigration: (targetRoot) => ipc.invoke(
+    pickDataRoot: () => invokePickDataRoot<DataRootSelection>(ipc),
+    previewDataRootMigration: (input) => ipc.invoke(
       PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION,
-      targetRoot,
+      input,
     ) as Promise<DataRootMigrationPreview>,
-    startDataRootMigration: (targetRoot) => ipc.invoke(
+    startDataRootMigration: (input) => ipc.invoke(
       PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
-      targetRoot,
+      input,
     ) as Promise<void>,
     getDataRootMigrationStatus: () => ipc.invoke(
       PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS,
@@ -120,7 +122,7 @@ export function createRecoveryPathManagementPreloadApi(
 ): DataRootRecoveryPreloadApi {
   return {
     getPathManagementState: () => invokePathManagementState(ipc),
-    pickDataRoot: () => invokePickDataRoot(ipc),
+    pickDataRoot: () => invokePickDataRoot<string>(ipc),
     recoverDataRoot: (input) => ipc.invoke(
       PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT,
       input,
@@ -146,8 +148,8 @@ function invokePathManagementState(ipc: PathManagementPreloadIpc): Promise<PathM
 }
 
 /** 调用 normal/recovery 共用的目录选择通道。 */
-function invokePickDataRoot(ipc: PathManagementPreloadIpc): Promise<string | null> {
-  return ipc.invoke(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT) as Promise<string | null>
+function invokePickDataRoot<T extends string | DataRootSelection>(ipc: PathManagementPreloadIpc): Promise<T | null> {
+  return ipc.invoke(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT) as Promise<T | null>
 }
 
 /** 调用所有 mode 共用的打开数据根通道。 */

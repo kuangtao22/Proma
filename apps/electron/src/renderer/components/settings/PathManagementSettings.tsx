@@ -11,7 +11,9 @@ import {
 import { toast } from 'sonner'
 import type {
   DataRootMigrationPreview,
+  DataRootMigrationSelectionInput,
   DataRootMigrationStatus,
+  DataRootSelection,
   OpenDataRootTarget,
   PathManagementState,
 } from '@proma/shared'
@@ -89,13 +91,13 @@ export function createPathManagementSettingsView(
 /** 迁移按钮依赖，便于以真实调用顺序覆盖选择、确认与启动行为。 */
 export interface DataRootMigrationRequestDependencies {
   /** 打开系统目录选择器。 */
-  pickDataRoot: () => Promise<string | null>
+  pickDataRoot: () => Promise<DataRootSelection | null>
   /** 只读预检刚选择的目标目录。 */
-  previewDataRootMigration: (targetRoot: string) => Promise<DataRootMigrationPreview>
+  previewDataRootMigration: (input: DataRootMigrationSelectionInput) => Promise<DataRootMigrationPreview>
   /** 显示迁移确认对话框。 */
   confirmMigration: (preview: DataRootMigrationPreview) => Promise<boolean>
   /** 创建迁移计划并请求重启。 */
-  startDataRootMigration: (targetRoot: string) => Promise<void>
+  startDataRootMigration: (input: DataRootMigrationSelectionInput) => Promise<void>
 }
 
 /** 严格按选择、确认、启动顺序请求迁移，不直接修改 locator。 */
@@ -107,14 +109,14 @@ export async function requestDataRootMigration(
     throw new Error('当前路径状态不允许创建新的迁移计划')
   }
   /** 用户通过系统选择器授权的目标目录。 */
-  const targetRoot = await dependencies.pickDataRoot()
-  if (targetRoot === null) return 'cancelled'
+  const selection = await dependencies.pickDataRoot()
+  if (selection === null) return 'cancelled'
   /** 预览不会创建计划；启动时主进程仍会完整复检。 */
-  const preview = await dependencies.previewDataRootMigration(targetRoot)
+  const preview = await dependencies.previewDataRootMigration(selection)
   /** 只有明确确认后才允许主进程创建计划。 */
   const confirmed = await dependencies.confirmMigration(preview)
   if (!confirmed || preview.blockers.length > 0) return 'cancelled'
-  await dependencies.startDataRootMigration(targetRoot)
+  await dependencies.startDataRootMigration(selection)
   return 'started'
 }
 
@@ -435,9 +437,9 @@ export function PathManagementSettings(): React.ReactElement {
     try {
       await requestDataRootMigration(state, {
         pickDataRoot: window.electronAPI.pickDataRoot,
-        previewDataRootMigration: async (targetRoot) => {
-          dispatchUi({ type: 'preview-started', targetRoot })
-          const preview = await window.electronAPI.previewDataRootMigration(targetRoot)
+        previewDataRootMigration: async (selection) => {
+          dispatchUi({ type: 'preview-started', targetRoot: selection.targetRoot })
+          const preview = await window.electronAPI.previewDataRootMigration(selection)
           if (migrationFlowId.current === flowId) dispatchUi({ type: 'preview-succeeded', preview })
           return preview
         },

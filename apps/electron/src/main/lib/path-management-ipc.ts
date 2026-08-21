@@ -1,10 +1,13 @@
 import { accessSync, constants, statSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import type {
   DataRootMigrationPreview,
   DataRootMigrationProgress,
+  DataRootMigrationSelectionInput,
+  DataRootSelection,
   DataRootStartupMode,
   OpenDataRootTarget,
   PathManagementState,
@@ -125,6 +128,14 @@ export interface RegisterPathManagementIpcOptions {
   homeDir?: string
   /** 注入数据根存储检查，测试可避免真实磁盘扫描。 */
   inspectStorage?: (rootPath: string) => Promise<DataRootStorageSnapshot>
+  /** 注入服务端随机 selectionId，测试可稳定断言代次。 */
+  createSelectionId?: () => string
+}
+
+/** normal 窗口内单次目标授权的服务端状态。 */
+interface DataRootSelectionState extends DataRootSelection {
+  generation: number
+  status: 'selected' | 'previewing' | 'previewed' | 'starting'
 }
 
 /** 进程级 locator 延迟创建，模块导入本身不读取文件系统。 */
@@ -162,8 +173,12 @@ export function registerPathManagementIpcHandlers(
   }
   /** 本次实际注册的通道，防止迁移模式意外暴露业务 IPC。 */
   const registeredChannels: string[] = []
-  /** normal 窗口最近一次由系统选择器授权的原始绝对路径。 */
-  let lastPickedDataRoot: string | null = null
+  /** normal 窗口当前仍有效的服务端目标授权。 */
+  let currentSelection: DataRootSelectionState | null = null
+  /** pick 调用代次，较早对话框晚返回时不得恢复旧授权。 */
+  let selectionGeneration = 0
+  /** 生产使用密码学随机 UUID，renderer 无法猜测或自造授权。 */
+  const createSelectionId = options.createSelectionId ?? randomUUID
   /** mode 可能在开发热重载中变化，先删除全部旧 handler 再建立最小 allowlist。 */
   for (const channel of PATH_MANAGEMENT_HANDLER_CHANNELS) options.ipc.removeHandler(channel)
   /** 注册前先移除同名 handler，兼容 Electron 开发热重载。 */
@@ -204,86 +219,126 @@ export function registerPathManagementIpcHandlers(
     })
     register(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, async () => {
       if (!options.dialog) throw new Error('当前环境不支持选择数据根目录')
+      /** 新 pick 一开始即使旧 selection 失效，不等待系统对话框返回。 */
+      const generation = selectionGeneration + 1
+      selectionGeneration = generation
+      currentSelection = null
       /** 用户通过系统对话框选择的迁移目标目录。 */
       const result = await options.dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
+      if (generation !== selectionGeneration) return null
       const targetRoot = result.canceled ? null : result.filePaths[0] ?? null
-      lastPickedDataRoot = targetRoot
-      return targetRoot
-    })
-    register(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION, async (_event, targetRoot) => {
-      if (typeof targetRoot !== 'string' || !isAbsolute(targetRoot)) {
-        throw new Error('目标数据根必须是绝对路径')
+      if (targetRoot === null) return null
+      if (!isAbsolute(targetRoot)) throw new Error('系统选择器返回的目标数据根不是绝对路径')
+      /** 只有当前代次返回时才签发新授权。 */
+      const selection: DataRootSelectionState = {
+        selectionId: createSelectionId(),
+        targetRoot,
+        generation,
+        status: 'selected',
       }
-      if (targetRoot !== lastPickedDataRoot) throw new Error('只能预检刚刚选择的目标目录')
+      currentSelection = selection
+      return { selectionId: selection.selectionId, targetRoot: selection.targetRoot }
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION, async (_event, rawInput) => {
+      const input = assertDataRootSelectionInput(rawInput)
+      const selection = requireCurrentSelection(currentSelection, input)
+      if (selection.status === 'starting') throw new Error('目标选择正在启动或已消费')
+      if (selection.status === 'previewing') throw new Error('目标选择正在预检')
       const previewTarget = getCoordinator().previewTarget
       if (!previewTarget) throw new Error('当前环境不支持预检数据根目录')
-      return previewTarget.call(getCoordinator(), targetRoot)
-    })
-    register(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, async (_event, targetRoot) => {
-      if (typeof targetRoot !== 'string') throw new Error('目标数据根必须是字符串')
-      await assertMigrationCanStart(options)
-      /** intent guard 关闭其他 normal 实例的新入口，直到当前进程退出。 */
-      const migrationGuard = await options.acquireMigrationGuard?.()
-      /** 当前调用使用的协调器；只有实际尝试创建计划后才需要复检 pending。 */
-      let migrationCoordinator: PathManagementCoordinator | null = null
-      /** 标记 locator 当前是否仍持有 pending，决定当前 normal 进程能否继续。 */
-      let migrationPending = false
-      /** 安全复检 locator；状态不可读时按仍有 pending 处理，避免继续 normal 服务。 */
-      const inspectMigrationPending = (): boolean => {
-        if (migrationCoordinator === null) return false
-        try {
-          return migrationCoordinator.getStatus().migration !== null
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          console.warn(`[路径管理] 无法确认 pending 状态，按迁移仍存在处理: ${message}`)
-          return true
-        }
-      }
+      selection.status = 'previewing'
       try {
-        invalidateDataRootStorage()
-        // 取得 intent 后二次预检，排除 intent 竞争窗口内进入的实例与任务。
+        const preview = await previewTarget.call(getCoordinator(), selection.targetRoot)
+        if (currentSelection !== selection || selection.generation !== selectionGeneration) {
+          throw new Error('目标选择已失效')
+        }
+        if (preview.targetRoot !== selection.targetRoot) throw new Error('预检返回的目标数据根不一致')
+        selection.status = preview.blockers.length === 0 ? 'previewed' : 'selected'
+        return preview
+      } catch (error) {
+        if (currentSelection === selection && selection.status === 'previewing') selection.status = 'selected'
+        throw error
+      }
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, async (_event, rawInput) => {
+      const input = assertDataRootSelectionInput(rawInput)
+      const selection = requireCurrentSelection(currentSelection, input)
+      if (selection.status === 'selected') throw new Error('目标选择尚未完成预检')
+      if (selection.status === 'previewing') throw new Error('目标选择正在预检')
+      if (selection.status === 'starting') throw new Error('目标选择正在启动或已消费')
+      /** 在第一个 await 前占用 selection，阻止并发双 start。 */
+      selection.status = 'starting'
+      try {
         await assertMigrationCanStart(options)
-        migrationCoordinator = getCoordinator()
-        try {
-          await migrationCoordinator.createPlan(targetRoot)
-          migrationPending = true
-        } catch (error) {
-          // createPlan 理论上原子落盘；失败后仍复检，防止异常发生在持久化边界之后。
-          migrationPending = inspectMigrationPending()
-          throw error
-        }
-        try {
-          // createPlan 的磁盘预检会让出事件循环；落盘后复检并撤销期间新出现的任务。
-          await assertMigrationCanStart(options)
-        } catch (error) {
+        /** intent guard 关闭其他 normal 实例的新入口，直到当前进程退出。 */
+        const migrationGuard = await options.acquireMigrationGuard?.()
+        /** 当前调用使用的协调器；只有实际尝试创建计划后才需要复检 pending。 */
+        let migrationCoordinator: PathManagementCoordinator | null = null
+        /** 标记 locator 当前是否仍持有 pending，决定当前 normal 进程能否继续。 */
+        let migrationPending = false
+        /** 安全复检 locator；状态不可读时按仍有 pending 处理，避免继续 normal 服务。 */
+        const inspectMigrationPending = (): boolean => {
+          if (migrationCoordinator === null) return false
           try {
-            await migrationCoordinator.cancel()
-            migrationPending = inspectMigrationPending()
-          } catch (cancelError) {
-            // 撤销失败时不能假定 pending 已清除，当前 normal 进程必须退出。
-            migrationPending = true
-            throw cancelError
+            return migrationCoordinator.getStatus().migration !== null
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            console.warn(`[路径管理] 无法确认 pending 状态，按迁移仍存在处理: ${message}`)
+            return true
           }
-          throw error
         }
-      } finally {
-        /** guard 释放错误；是否允许降级取决于 locator 是否仍有 pending。 */
-        let guardReleaseError: unknown = null
         try {
-          migrationGuard?.release()
-        } catch (error) {
-          guardReleaseError = error
-        }
-        if (migrationPending) {
-          if (guardReleaseError !== null) {
-            const message = guardReleaseError instanceof Error ? guardReleaseError.message : String(guardReleaseError)
-            console.warn(`[路径管理] 迁移 intent 清理失败，将由新进程回收: ${message}`)
+          invalidateDataRootStorage()
+          // 取得 intent 后二次预检，排除 intent 竞争窗口内进入的实例与任务。
+          await assertMigrationCanStart(options)
+          migrationCoordinator = getCoordinator()
+          try {
+            await migrationCoordinator.createPlan(selection.targetRoot)
+            migrationPending = true
+            /** plan 成功落盘即消费授权，后续任何重复 start 都无法复用。 */
+            if (currentSelection === selection) currentSelection = null
+          } catch (error) {
+            // createPlan 理论上原子落盘；失败后仍复检，防止异常发生在持久化边界之后。
+            migrationPending = inspectMigrationPending()
+            throw error
           }
-          relaunchNow()
-        } else if (guardReleaseError !== null) {
-          const message = guardReleaseError instanceof Error ? guardReleaseError.message : String(guardReleaseError)
-          throw new Error(`迁移计划未创建，但迁移 intent 清理失败；请完全退出所有 Proma 实例后重试。原因: ${message}`)
+          try {
+            // createPlan 的磁盘预检会让出事件循环；落盘后复检并撤销期间新出现的任务。
+            await assertMigrationCanStart(options)
+          } catch (error) {
+            try {
+              await migrationCoordinator.cancel()
+              migrationPending = inspectMigrationPending()
+            } catch (cancelError) {
+              // 撤销失败时不能假定 pending 已清除，当前 normal 进程必须退出。
+              migrationPending = true
+              throw cancelError
+            }
+            throw error
+          }
+        } finally {
+          /** guard 释放错误；是否允许降级取决于 locator 是否仍有 pending。 */
+          let guardReleaseError: unknown = null
+          try {
+            migrationGuard?.release()
+          } catch (error) {
+            guardReleaseError = error
+          }
+          if (migrationPending) {
+            if (guardReleaseError !== null) {
+              const message = guardReleaseError instanceof Error ? guardReleaseError.message : String(guardReleaseError)
+              console.warn(`[路径管理] 迁移 intent 清理失败，将由新进程回收: ${message}`)
+            }
+            relaunchNow()
+          } else if (guardReleaseError !== null) {
+            const message = guardReleaseError instanceof Error ? guardReleaseError.message : String(guardReleaseError)
+            throw new Error(`迁移计划未创建，但迁移 intent 清理失败；请完全退出所有 Proma 实例后重试。原因: ${message}`)
+          }
         }
+      } catch (error) {
+        /** plan 尚未创建时允许同一预览重试；已消费 selection 不会被恢复。 */
+        if (currentSelection === selection && selection.status === 'starting') selection.status = 'previewed'
+        throw error
       }
     })
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, () => {
@@ -358,6 +413,34 @@ export function registerPathManagementIpcHandlers(
 function assertOpenDataRootTarget(value: unknown): OpenDataRootTarget {
   if (value === 'current' || value === 'previous') return value
   throw new Error('数据根打开目标无效')
+}
+
+/** 严格校验 renderer 回传的 selection 对象，不接受裸路径。 */
+function assertDataRootSelectionInput(value: unknown): DataRootMigrationSelectionInput {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('数据根目标选择无效')
+  }
+  const input = value as { selectionId?: unknown; targetRoot?: unknown }
+  if (
+    typeof input.selectionId !== 'string'
+    || input.selectionId.trim().length === 0
+    || typeof input.targetRoot !== 'string'
+    || !isAbsolute(input.targetRoot)
+  ) throw new Error('数据根目标选择无效')
+  return { selectionId: input.selectionId, targetRoot: input.targetRoot }
+}
+
+/** 只接受当前窗口最新、服务端签发且路径完全一致的 selection。 */
+function requireCurrentSelection(
+  current: DataRootSelectionState | null,
+  input: DataRootMigrationSelectionInput,
+): DataRootSelectionState {
+  if (
+    current === null
+    || current.selectionId !== input.selectionId
+    || current.targetRoot !== input.targetRoot
+  ) throw new Error('目标选择已失效')
+  return current
 }
 
 /** 拒绝任何非当前模式预期窗口发起的路径 IPC。 */

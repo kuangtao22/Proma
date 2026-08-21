@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { readFile, realpath } from 'node:fs/promises'
 import { lstat, opendir, statfs } from 'node:fs/promises'
-import { parse, resolve } from 'node:path'
+import { dirname, join, resolve, win32 } from 'node:path'
 import { promisify } from 'node:util'
 import { DOMParser } from '@xmldom/xmldom'
 import type { DataRootDeviceType } from '@proma/shared'
@@ -41,6 +41,14 @@ interface StorageCacheEntry {
   snapshot: DataRootStorageSnapshot
 }
 
+/** 平台设备类型检查的可替换系统依赖。 */
+export interface DeviceTypeDetectionOptions {
+  platform?: NodeJS.Platform
+  execFile?: (file: string, args: string[]) => Promise<{ stdout: string }>
+  readFile?: (path: string) => Promise<string>
+  realpath?: (path: string) => Promise<string>
+}
+
 const DEFAULT_CACHE_TTL_MS = 5_000
 const execFileAsync = promisify(execFile)
 
@@ -54,8 +62,10 @@ export class DataRootStorageInspector {
   private readonly inspectFresh: (rootPath: string) => Promise<DataRootStorageSnapshot>
   /** 按规范化绝对路径保存成功快照。 */
   private readonly cache = new Map<string, StorageCacheEntry>()
-  /** 按规范化绝对路径保存进行中 Promise。 */
-  private readonly inFlight = new Map<string, Promise<DataRootStorageSnapshot>>()
+  /** 按规范化绝对路径保存进行中 Promise 及其代次。 */
+  private readonly inFlight = new Map<string, { generation: number; promise: Promise<DataRootStorageSnapshot> }>()
+  /** 每条路径的失效代次，旧 Promise 完成后不得回写新代缓存。 */
+  private readonly generations = new Map<string, number>()
 
   constructor(options: DataRootStorageInspectorOptions = {}) {
     this.now = options.now ?? Date.now
@@ -68,28 +78,45 @@ export class DataRootStorageInspector {
   inspect(rootPath: string): Promise<DataRootStorageSnapshot> {
     /** 统一缓存 key，避免等价路径重复扫描。 */
     const normalizedRoot = resolve(rootPath)
+    /** 当前调用绑定的路径代次。 */
+    const generation = this.generations.get(normalizedRoot) ?? 0
     /** 未过期成功快照可直接复用。 */
     const cached = this.cache.get(normalizedRoot)
     if (cached !== undefined && cached.expiresAt >= this.now()) return Promise.resolve(cached.snapshot)
     /** 已有扫描进行中时复用同一个 Promise。 */
     const pending = this.inFlight.get(normalizedRoot)
-    if (pending !== undefined) return pending
+    if (pending !== undefined && pending.generation === generation) return pending.promise
     /** 只缓存成功结果，失败允许下一次立即重试。 */
-    const inspection = this.inspectFresh(normalizedRoot).then((snapshot) => {
-      this.cache.set(normalizedRoot, { expiresAt: this.now() + this.cacheTtlMs, snapshot })
+    let inspection: Promise<DataRootStorageSnapshot>
+    inspection = this.inspectFresh(normalizedRoot).then((snapshot) => {
+      if ((this.generations.get(normalizedRoot) ?? 0) === generation) {
+        this.cache.set(normalizedRoot, { expiresAt: this.now() + this.cacheTtlMs, snapshot })
+      }
       return snapshot
-    }).finally(() => { this.inFlight.delete(normalizedRoot) })
-    this.inFlight.set(normalizedRoot, inspection)
+    }).finally(() => {
+      const latest = this.inFlight.get(normalizedRoot)
+      if (latest?.generation === generation && latest.promise === inspection) this.inFlight.delete(normalizedRoot)
+    })
+    this.inFlight.set(normalizedRoot, { generation, promise: inspection })
     return inspection
   }
 
   /** 迁移计划、进度或完成事件发生时失效单路径或全部成功缓存。 */
   invalidate(rootPath?: string): void {
     if (rootPath === undefined) {
+      /** 全量失效只需推进当前已知路径，后续新路径默认从 0 开始。 */
+      const knownRoots = new Set([...this.generations.keys(), ...this.cache.keys(), ...this.inFlight.keys()])
+      for (const knownRoot of knownRoots) {
+        this.generations.set(knownRoot, (this.generations.get(knownRoot) ?? 0) + 1)
+      }
       this.cache.clear()
+      this.inFlight.clear()
       return
     }
-    this.cache.delete(resolve(rootPath))
+    const normalizedRoot = resolve(rootPath)
+    this.generations.set(normalizedRoot, (this.generations.get(normalizedRoot) ?? 0) + 1)
+    this.cache.delete(normalizedRoot)
+    this.inFlight.delete(normalizedRoot)
   }
 }
 
@@ -138,8 +165,18 @@ export function toSafeByteCount(value: bigint): number {
 
 /** 从 diskutil plist 中读取可信卷布尔元数据。 */
 export function classifyMacDiskInfo(xml: string): DataRootDeviceType {
-  if (readPlistBoolean(xml, 'Network') === true) return 'network'
-  if (readPlistBoolean(xml, 'RemovableMedia') === true || readPlistBoolean(xml, 'Ejectable') === true) return 'removable'
+  /** diskutil 不同 macOS 版本使用 DAVolumeNetwork 或文件系统类型标记网络卷。 */
+  const fileSystemType = readPlistString(xml, 'FilesystemType')?.toLowerCase()
+  if (
+    readPlistBoolean(xml, 'DAVolumeNetwork') === true
+    || readPlistBoolean(xml, 'Network') === true
+    || (fileSystemType !== undefined && MAC_NETWORK_FILE_SYSTEMS.has(fileSystemType))
+  ) return 'network'
+  if (
+    readPlistBoolean(xml, 'RemovableMediaOrExternalDevice') === true
+    || readPlistBoolean(xml, 'RemovableMedia') === true
+    || readPlistBoolean(xml, 'Ejectable') === true
+  ) return 'removable'
   if (readPlistBoolean(xml, 'Internal') === true) return 'local'
   return 'unknown'
 }
@@ -179,8 +216,11 @@ interface LinuxMount {
 }
 
 const NETWORK_FILE_SYSTEMS = new Set([
-  'nfs', 'nfs4', 'cifs', 'smb3', 'sshfs', 'fuse.sshfs', '9p', 'ceph', 'glusterfs', 'davfs',
+  'nfs', 'nfs4', 'cifs', 'smbfs', 'smb3', 'sshfs', 'fuse.sshfs', '9p', 'ceph', 'glusterfs',
+  'davfs', 'webdav', 'fuse.davfs', 'fuse.webdav',
 ])
+
+const MAC_NETWORK_FILE_SYSTEMS = new Set(['smbfs', 'nfs', 'webdav', 'afpfs', 'cifs'])
 
 /** 执行一次无缓存数据根检查。 */
 async function inspectDataRootStorageFresh(rootPath: string): Promise<DataRootStorageSnapshot> {
@@ -208,34 +248,70 @@ export async function inspectDataRootVolume(rootPath: string): Promise<DataRootV
 }
 
 /** 按当前平台读取系统卷元数据；失败时明确返回 unknown。 */
-async function detectDataRootDeviceType(rootPath: string): Promise<DataRootDeviceType> {
+export async function detectDataRootDeviceType(
+  rootPath: string,
+  options: DeviceTypeDetectionOptions = {},
+): Promise<DataRootDeviceType> {
+  /** 默认依赖封装成窄接口，测试可精确断言命令是否执行。 */
+  const execute = options.execFile ?? (async (file, args) => {
+    const result = await execFileAsync(file, args, { encoding: 'utf8' })
+    return { stdout: String(result.stdout) }
+  })
+  const readTextFile = options.readFile ?? (async (path) => await readFile(path, 'utf8'))
+  const resolveRealPath = options.realpath ?? realpath
+  const platform = options.platform ?? process.platform
   try {
-    if (process.platform === 'darwin') {
+    if (platform === 'darwin') {
       /** diskutil plist 是 macOS 的卷元数据来源。 */
-      const result = await execFileAsync('diskutil', ['info', '-plist', rootPath], { encoding: 'utf8' })
+      const result = await execute('diskutil', ['info', '-plist', rootPath])
       return classifyMacDiskInfo(result.stdout)
     }
-    if (process.platform === 'win32') {
-      /** PowerShell 只返回系统 DriveType 枚举。 */
-      const driveRoot = parse(resolve(rootPath)).root.replace(/[\\/]$/, '')
-      const script = `(Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='${driveRoot}'\").DriveType`
-      const result = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8' })
+    if (platform === 'win32') {
+      /** UNC 由路径语法即可确定为网络位置，绝不进入命令解释器。 */
+      if (/^\\\\[^\\]+\\[^\\]+/.test(rootPath)) return 'network'
+      /** 只允许 win32 parser 得到的单字母规范盘符进入固定脚本。 */
+      const driveRoot = win32.parse(rootPath).root.replace(/[\\/]$/, '').toUpperCase()
+      if (!/^[A-Z]:$/.test(driveRoot)) return 'unknown'
+      const script = '$drive = $args[0]; (Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID=\'" + $drive + "\'")).DriveType'
+      const result = await execute('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command', script, driveRoot,
+      ])
       return classifyWindowsDriveType(Number.parseInt(result.stdout.trim(), 10))
     }
-    if (process.platform === 'linux') {
-      const mountInfo = await readFile('/proc/self/mountinfo', 'utf8')
-      return classifyLinuxMountInfo(rootPath, mountInfo, async (majorMinor) => {
-        try {
-          return await readFile(`/sys/dev/block/${majorMinor}/removable`, 'utf8')
-        } catch {
-          return null
-        }
-      })
+    if (platform === 'linux') {
+      const mountInfo = await readTextFile('/proc/self/mountinfo')
+      return classifyLinuxMountInfo(rootPath, mountInfo, async (majorMinor) => await readLinuxBlockRemovable(
+        majorMinor,
+        { readFile: readTextFile, realpath: resolveRealPath },
+      ))
     }
   } catch {
     return 'unknown'
   }
   return 'unknown'
+}
+
+/** 沿 sysfs 分区到父 block device 查找 removable 标记。 */
+export async function readLinuxBlockRemovable(
+  majorMinor: string,
+  options: Required<Pick<DeviceTypeDetectionOptions, 'readFile' | 'realpath'>>,
+): Promise<string | null> {
+  let currentPath: string
+  try {
+    currentPath = await options.realpath(`/sys/dev/block/${majorMinor}`)
+  } catch {
+    return null
+  }
+  for (let depth = 0; depth < 16 && currentPath.startsWith('/sys/'); depth += 1) {
+    try {
+      return await options.readFile(join(currentPath, 'removable'))
+    } catch {
+      const parentPath = dirname(currentPath)
+      if (parentPath === currentPath) return null
+      currentPath = parentPath
+    }
+  }
+  return null
 }
 
 /** 从 plist dict 中读取指定布尔 key。 */
@@ -250,6 +326,20 @@ function readPlistBoolean(xml: string, keyName: string): boolean | undefined {
     while (valueNode !== null && valueNode.nodeType !== 1) valueNode = valueNode.nextSibling
     if (valueNode?.nodeName === 'true') return true
     if (valueNode?.nodeName === 'false') return false
+  }
+  return undefined
+}
+
+/** 从 plist dict 中读取指定字符串 key。 */
+function readPlistString(xml: string, keyName: string): string | undefined {
+  const document = new DOMParser().parseFromString(xml, 'application/xml')
+  const keys = document.getElementsByTagName('key')
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys.item(index)
+    if (key?.textContent !== keyName) continue
+    let valueNode = key.nextSibling
+    while (valueNode !== null && valueNode.nodeType !== 1) valueNode = valueNode.nextSibling
+    if (valueNode?.nodeName === 'string') return valueNode.textContent ?? undefined
   }
   return undefined
 }
