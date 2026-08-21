@@ -30,6 +30,14 @@ export interface ReadJsonFileSafeOptions<T> {
   validate?: (value: unknown) => value is T
 }
 
+/** 严格 JSON 读取的 schema 与错误上下文。 */
+export interface ReadJsonFileStrictOptions<T> {
+  /** 判断解析结果是否符合迁移提交要求的运行时 schema。 */
+  validate: (value: unknown) => value is T
+  /** 候选全部损坏时用于错误消息的业务对象名称。 */
+  description: string
+}
+
 /** no-follow 原子 JSON 写入的故障注入配置。 */
 export interface SecureAtomicJsonWriteOptions {
   /** 临时文件完成 fsync/close 后、最终身份复验前调用，仅供竞态回归测试。 */
@@ -38,6 +46,8 @@ export interface SecureAtomicJsonWriteOptions {
 
 /** 原子删除普通文件时允许替换的窄测试依赖。 */
 export interface AtomicFileRemoveOptions {
+  /** rename 完成后、身份复验前调用，仅供稳定覆盖置换竞态。 */
+  afterRenameBeforeVerify?: (tombstonePath: string) => void
   /** rename 已提交后清理 tombstone；生产默认使用 unlinkSync。 */
   unlinkTombstone?: (tombstonePath: string) => void
 }
@@ -94,10 +104,22 @@ export function removeFileAtomic(filePath: string, options: AtomicFileRemoveOpti
     throw error
   }
   if (!targetStat.isFile()) throw new Error('原子删除目标不是普通文件')
+  const targetIdentity = toIdentity(targetStat)
+  /** 父目录在检查、rename 和 tombstone 清理前必须保持同一身份。 */
+  const parentPath = dirname(filePath)
+  const parentStat = lstatSync(parentPath)
+  if (!parentStat.isDirectory()) throw new Error('原子删除父路径不是目录')
+  const parentIdentity = toIdentity(parentStat)
 
   /** 同目录随机 tombstone，避免与并发删除或历史残留冲突。 */
-  const tombstonePath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.deleted`)
+  const tombstonePath = join(parentPath, `.${basename(filePath)}.${randomUUID()}.deleted`)
+  assertIdentityUnchanged(parentPath, parentIdentity, '原子删除父目录身份已变化', true)
+  assertIdentityUnchanged(filePath, targetIdentity, '原子删除目标身份已变化', false)
   renameSync(filePath, tombstonePath)
+  options.afterRenameBeforeVerify?.(tombstonePath)
+  /** rename 后任何置换都 fail closed：保留当前路径，不猜测哪个对象可以删除。 */
+  assertIdentityUnchanged(parentPath, parentIdentity, '原子删除父目录身份已变化', true)
+  assertIdentityUnchanged(tombstonePath, targetIdentity, '原子删除 tombstone 身份已变化', false)
   try {
     /** 生产使用 unlinkSync，测试可稳定注入 rename 后清理失败。 */
     const unlinkTombstone = options.unlinkTombstone ?? unlinkSync
@@ -328,6 +350,35 @@ export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeO
   }
 
   return null // 全部失败，需要上层从 JSONL 重建
+}
+
+/**
+ * 严格读取主/tmp/bak JSON 候选：真正全部缺失返回 null，存在但全部损坏则抛错。
+ * 普通展示读取继续使用 readJsonFileSafe；该边界只供不可丢数据的迁移提交使用。
+ *
+ * @param filePath 主 JSON 文件路径。
+ * @param options 必需的运行时 schema 与业务错误上下文。
+ * @returns 第一个合法候选，三个候选真正缺失时返回 null。
+ */
+export function readJsonFileStrict<T>(filePath: string, options: ReadJsonFileStrictOptions<T>): T | null {
+  /** 读取前确认是否至少存在一个候选，区分“尚未创建”和“数据全部损坏”。 */
+  const candidatePaths = [filePath, `${filePath}.tmp`, `${filePath}.bak`]
+  const hasCandidate = candidatePaths.some(jsonCandidateExistsStrict)
+  if (!hasCandidate) return null
+  const value = readJsonFileSafe<T>(filePath, { validate: options.validate })
+  if (value === null) throw new Error(`${options.description}的所有 JSON 候选均损坏`)
+  return value
+}
+
+/** lstat 候选并只把明确不存在视为缺失，权限和 I/O 错误继续向上传播。 */
+function jsonCandidateExistsStrict(candidatePath: string): boolean {
+  try {
+    lstatSync(candidatePath)
+    return true
+  } catch (error) {
+    if (isMissingPathError(error)) return false
+    throw error
+  }
 }
 
 /**

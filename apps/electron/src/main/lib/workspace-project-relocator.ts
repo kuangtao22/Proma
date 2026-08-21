@@ -151,21 +151,25 @@ export class WorkspaceProjectRelocator {
     return await this.performPreflight(input, { operationId, allowOwnedTarget: false })
   }
 
-  /** 运行新迁移，或复用同 workspace/源/目标的 failed journal 继续复制。 */
+  /** 运行新迁移，或复用同 workspace/源/目标的复制阶段 journal 继续复制。 */
   async run(
     input: { workspaceId: string; targetRoot: string },
     onProgress?: (progress: WorkspaceRelocationProgress) => void,
   ): Promise<WorkspaceRelocationProgress> {
-    /** 已存在的失败断点只有源目标完全匹配时才允许复用。 */
+    /** 已存在的复制断点只有源目标完全匹配时才允许复用。 */
     const existingJournal = this.getJournalForWorkspace(input.workspaceId)
-    /** 新任务或失败任务复用的稳定 ID。 */
-    const operationId = existingJournal?.stage === 'failed'
-      ? existingJournal.operationId
-      : this.createOperationId()
+    if (existingJournal?.stage === 'committing') {
+      throw new Error('项目迁移正在提交，请通过启动恢复继续')
+    }
+    if (existingJournal && this.controllers.has(existingJournal.operationId)) {
+      throw new Error('项目迁移正在运行，不能重复启动')
+    }
+    /** 新任务生成 ID；复制、校验或失败断点复用原稳定 ID 和 sidecar。 */
+    const operationId = existingJournal?.operationId ?? this.createOperationId()
     /** 锁前预检尽早给出可处理错误。 */
     const initialPreflight = await this.performPreflight(input, {
       operationId,
-      allowOwnedTarget: existingJournal?.stage === 'failed',
+      allowOwnedTarget: existingJournal !== null,
     })
     if (existingJournal && !journalMatchesPreflight(existingJournal, initialPreflight)) {
       throw new Error('现有项目迁移 journal 与当前源目标不一致')
@@ -276,7 +280,6 @@ export class WorkspaceProjectRelocator {
       const release = this.options.acquireWorkspaceOperation(journal.workspaceId, 'relocation')
       try {
         this.assertWorkspaceInactive(journal.workspaceId)
-        await this.assertJournalRuntimeContext(journal)
         completed.push(await this.commitJournal(journal, onProgress))
       } finally {
         release()
@@ -293,6 +296,11 @@ export class WorkspaceProjectRelocator {
     /** 每一步都替换为最新落盘状态。 */
     let journal = initialJournal
     try {
+      /** 初次提交与启动恢复共用同一完整性证明，任何 rebase 前必须确认副本完整。 */
+      const ownership = await this.assertJournalRuntimeContext(journal)
+      if (journal.completedCommitSteps === 3 && ownership === 'absent') {
+        return this.completeJournal(journal, onProgress)
+      }
       if (journal.completedCommitSteps < 1) {
         this.options.rebaseWorkspaceSessionPaths(journal.workspaceId, journal.sourceRoot, journal.targetRoot)
         journal = { ...journal, completedCommitSteps: 1, error: undefined }
@@ -309,18 +317,7 @@ export class WorkspaceProjectRelocator {
         this.writeJournal(journal)
       }
       await this.finalizeCopy({ migrationId: journal.operationId, targetRoot: journal.targetRoot })
-      /** journal 主文件和 safe-file 恢复候选一并安全删除。 */
-      this.removeJournal(journal.operationId)
-      /** 完成态只作为返回值/事件，不再持久化为活动 journal。 */
-      const completed: WorkspaceRelocationProgress = {
-        operationId: journal.operationId,
-        workspaceId: journal.workspaceId,
-        stage: 'completed',
-        completedBytes: journal.totalBytes,
-        totalBytes: journal.totalBytes,
-      }
-      onProgress?.(completed)
-      return completed
+      return this.completeJournal(journal, onProgress)
     } catch (error) {
       /** committing 保持可恢复，仅附加诊断；不得降级为不可自动恢复的 failed。 */
       journal = { ...journal, stage: 'committing', error: errorMessage(error) }
@@ -343,7 +340,9 @@ export class WorkspaceProjectRelocator {
     if (!workspace) throw new Error(`项目不存在: ${input.workspaceId}`)
     this.assertWorkspaceInactive(workspace.id)
     /** 外部项目使用索引根，托管项目使用 workspace-files 实际根。 */
-    const sourceRoot = resolve(workspace.projectRootPath ?? this.options.getManagedProjectRoot(workspace.slug))
+    const requestedSourceRoot = workspace.projectRootPath ?? this.options.getManagedProjectRoot(workspace.slug)
+    if (!isAbsolute(requestedSourceRoot)) throw new Error('项目迁移源路径必须是绝对路径')
+    const sourceRoot = resolve(requestedSourceRoot)
     assertAccessibleSource(sourceRoot)
     /** canonical 源根用于物理别名和嵌套判断。 */
     const canonicalSourceRoot = realpathSync(sourceRoot)
@@ -435,12 +434,14 @@ export class WorkspaceProjectRelocator {
   }
 
   /** 校验恢复 journal 仍属于当前工作区和现存目标。 */
-  private async assertJournalRuntimeContext(journal: WorkspaceRelocationJournal): Promise<void> {
+  private async assertJournalRuntimeContext(journal: WorkspaceRelocationJournal): Promise<DirectoryCopyOwnership> {
     /** 当前工作区必须保持相同 slug，索引根允许处于 source 或已切到 target。 */
     const workspace = this.options.getWorkspace(journal.workspaceId)
     if (!workspace || workspace.slug !== journal.workspaceSlug) throw new Error('项目迁移 journal 的工作区身份无效')
     /** 第三步可能已经执行但 journal 还没推进，故允许当前索引已指向 target。 */
-    const currentRoot = resolve(workspace.projectRootPath ?? this.options.getManagedProjectRoot(workspace.slug))
+    const requestedCurrentRoot = workspace.projectRootPath ?? this.options.getManagedProjectRoot(workspace.slug)
+    if (!isAbsolute(requestedCurrentRoot)) throw new Error('项目迁移 journal 的当前项目根不是绝对路径')
+    const currentRoot = resolve(requestedCurrentRoot)
     if (!pathsReferToSameDirectory(currentRoot, journal.sourceRoot)
       && !pathsReferToSameDirectory(currentRoot, journal.targetRoot)) {
       throw new Error('项目迁移 journal 与当前项目根不一致')
@@ -471,6 +472,37 @@ export class WorkspaceProjectRelocator {
       || (journal.completedCommitSteps < 3 && ownership !== 'owned')) {
       throw new Error('项目迁移 journal 的目标副本归属无效')
     }
+    if (ownership === 'owned') {
+      /** sidecar 仍在时必须重新哈希/盘点，防止目标在崩溃窗口被删改。 */
+      const copySpace = await this.inspectCopySpace({
+        migrationId: journal.operationId,
+        sourceRoot: journal.sourceRoot,
+        targetRoot: journal.targetRoot,
+      })
+      assertCopySpace(copySpace)
+      if (copySpace.remainingBytes !== 0 || copySpace.totalBytes !== journal.totalBytes) {
+        throw new Error('项目迁移目标副本不完整，拒绝提交')
+      }
+    }
+    return ownership
+  }
+
+  /** 删除已完成 journal 并发送仅存在于内存中的 completed 事件。 */
+  private completeJournal(
+    journal: WorkspaceRelocationJournal,
+    onProgress?: (progress: WorkspaceRelocationProgress) => void,
+  ): WorkspaceRelocationProgress {
+    /** journal 主文件和 safe-file 恢复候选一并安全删除。 */
+    this.removeJournal(journal.operationId)
+    const completed: WorkspaceRelocationProgress = {
+      operationId: journal.operationId,
+      workspaceId: journal.workspaceId,
+      stage: 'completed',
+      completedBytes: journal.totalBytes,
+      totalBytes: journal.totalBytes,
+    }
+    onProgress?.(completed)
+    return completed
   }
 
   /** 返回 workspace 唯一 journal，重复 journal 明确失败。 */
@@ -566,6 +598,35 @@ function toPublicProgress(journal: WorkspaceRelocationJournal): WorkspaceRelocat
 /** 严格校验 journal 的运行时 schema 与路径边界。 */
 function isWorkspaceRelocationJournal(value: unknown): value is WorkspaceRelocationJournal {
   if (!isRecord(value)) return false
+  /** 只接受当前版本定义的精确字段集，避免未知状态被旧代码静默解释。 */
+  const allowedFields = new Set([
+    'version',
+    'operationId',
+    'workspaceId',
+    'workspaceSlug',
+    'sourceRoot',
+    'targetRoot',
+    'stage',
+    'completedBytes',
+    'totalBytes',
+    'currentRelativePath',
+    'error',
+    'completedCommitSteps',
+  ])
+  if (Object.keys(value).some((field) => !allowedFields.has(field))) return false
+  const requiredFields = [
+    'version',
+    'operationId',
+    'workspaceId',
+    'workspaceSlug',
+    'sourceRoot',
+    'targetRoot',
+    'stage',
+    'completedBytes',
+    'totalBytes',
+    'completedCommitSteps',
+  ]
+  if (requiredFields.some((field) => !Object.hasOwn(value, field))) return false
   if (value.version !== JOURNAL_VERSION) return false
   if (typeof value.operationId !== 'string' || !OPERATION_ID_PATTERN.test(value.operationId)) return false
   if (typeof value.workspaceId !== 'string' || value.workspaceId.length === 0 || value.workspaceId !== value.workspaceId.trim()) return false
@@ -581,6 +642,15 @@ function isWorkspaceRelocationJournal(value: unknown): value is WorkspaceRelocat
     || value.completedCommitSteps > 3) return false
   if (value.currentRelativePath !== undefined && typeof value.currentRelativePath !== 'string') return false
   if (value.error !== undefined && typeof value.error !== 'string') return false
+  if (value.stage === 'copying') {
+    if (value.completedCommitSteps !== 0 || value.error !== undefined) return false
+  } else if (value.stage === 'verifying') {
+    if (value.completedCommitSteps !== 0 || value.completedBytes !== value.totalBytes || value.error !== undefined) return false
+  } else if (value.stage === 'failed') {
+    if (value.completedCommitSteps !== 0 || typeof value.error !== 'string' || value.error.length === 0) return false
+  } else if (value.stage === 'committing') {
+    if (value.completedBytes !== value.totalBytes || value.currentRelativePath !== undefined) return false
+  }
   try {
     validateRootRelationship(value.sourceRoot, value.targetRoot)
   } catch {
@@ -700,6 +770,7 @@ function journalMatchesPreflight(
     && journal.workspaceSlug === preflight.workspaceSlug
     && journal.sourceRoot === preflight.sourceRoot
     && journal.targetRoot === preflight.targetRoot
+    && journal.totalBytes === preflight.totalBytes
 }
 
 /** 比较两个现存目录的逻辑路径或 canonical 物理路径。 */

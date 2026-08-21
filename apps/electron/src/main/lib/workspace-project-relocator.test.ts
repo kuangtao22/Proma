@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { AgentSessionMeta, AgentWorkspace, DataRootMigrationProgress, WorktreeInfo } from '@proma/shared'
@@ -93,6 +93,68 @@ describe('WorkspaceProjectRelocator', () => {
     expect(relocator.getStatus(workspace.id)).toMatchObject({ stage: 'failed', error: 'checksum mismatch' })
   })
 
+  test.each(['copying', 'verifying', 'failed'] as const)(
+    'Given 新进程读取 %s journal When 继续迁移 Then 复用原 operationId 和目标副本',
+    async (stage) => {
+      /** 模拟上个进程留下的稳定操作 ID。 */
+      const operationId = '12345678-1234-4234-8234-123456789abc'
+      writeRelocationJournal(operationId, {
+        stage,
+        completedBytes: stage === 'copying' ? 2 : 4,
+        ...(stage === 'failed' ? { error: '上次复制中断' } : {}),
+      })
+      /** 捕获 copier 收到的恢复 ID。 */
+      let resumedOperationId = ''
+      const relocator = createRelocator({
+        createOperationId: () => 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        inspectCopyOwnership: async () => 'owned',
+        copyDirectory: async (input) => {
+          copyCalls += 1
+          resumedOperationId = input.migrationId
+          return { verifiedFiles: 1, reusedFiles: 1, totalBytes: 4 }
+        },
+      })
+
+      const result = await relocator.run({ workspaceId: workspace.id, targetRoot })
+
+      expect(result.operationId).toBe(operationId)
+      expect(resumedOperationId).toBe(operationId)
+      expect(copyCalls).toBe(1)
+    },
+  )
+
+  test('Given 同一进程迁移仍在复制 When 再次运行 Then 立即拒绝且不创建第二个控制器', async () => {
+    const operationIds = [
+      '12345678-1234-4234-8234-123456789abc',
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    ]
+    let operationIdCalls = 0
+    /** 捕获嵌套 run 的拒绝消息。 */
+    let duplicateError = ''
+    let relocator: WorkspaceProjectRelocator
+    relocator = createRelocator({
+      createOperationId: () => operationIds[operationIdCalls++]!,
+      inspectCopyOwnership: async () => copyCalls > 0 ? 'owned' : 'absent',
+      copyDirectory: async () => {
+        copyCalls += 1
+        if (copyCalls === 1) {
+          try {
+            await relocator.run({ workspaceId: workspace.id, targetRoot })
+          } catch (error) {
+            duplicateError = error instanceof Error ? error.message : String(error)
+          }
+        }
+        return { verifiedFiles: 1, reusedFiles: 0, totalBytes: 4 }
+      },
+    })
+
+    await relocator.run({ workspaceId: workspace.id, targetRoot })
+
+    expect(duplicateError).toContain('正在运行')
+    expect(copyCalls).toBe(1)
+    expect(operationIdCalls).toBe(1)
+  })
+
   test.each([
     ['active Agent', { hasActiveAgentDataWritesForWorkspace: () => true }],
     ['Automation', { hasRunningAutomationForWorkspace: () => true }],
@@ -181,6 +243,27 @@ describe('WorkspaceProjectRelocator', () => {
     expect(relocator.getStatus(workspace.id)).toBeNull()
   })
 
+  test.each([
+    ['仍有未复制字节', { totalBytes: 4, reusableBytes: 3, remainingBytes: 1 }],
+    ['总字节数与 journal 不一致', { totalBytes: 5, reusableBytes: 5, remainingBytes: 0 }],
+  ])('Given committing journal 的目标%s When 启动恢复 Then 提交前失败且不执行 rebase', async (_label, copySpace) => {
+    /** 先制造第一步提交失败后留下的 committing journal。 */
+    const initialRelocator = createRelocator({
+      rebaseWorkspaceSessionPaths: () => { throw new Error('crash-before-step') },
+    })
+    await expect(initialRelocator.run({ workspaceId: workspace.id, targetRoot })).rejects.toThrow('crash-before-step')
+    commitCalls = []
+    const recoveringRelocator = createRelocator({
+      inspectCopyOwnership: async () => 'owned',
+      inspectCopySpace: async () => copySpace,
+    })
+
+    await expect(recoveringRelocator.resumeCommittingJournals()).rejects.toThrow('完整')
+
+    expect(commitCalls).toEqual([])
+    expect(recoveringRelocator.getStatus(workspace.id)?.completedBytes).toBe(4)
+  })
+
   test('Given journal JSON 损坏或路径不合法 When 恢复 Then 不静默提交', async () => {
     /** 与生产实现约定的稳定 journal 目录。 */
     const journalDir = join(configDir, 'workspace-relocations')
@@ -199,7 +282,7 @@ describe('WorkspaceProjectRelocator', () => {
       operationId,
       workspaceId: workspace.id,
       workspaceSlug: workspace.slug,
-      sourceRoot,
+      sourceRoot: realpathSync(sourceRoot),
       targetRoot: 'relative-target',
       stage: 'committing',
       completedBytes: 4,
@@ -208,6 +291,39 @@ describe('WorkspaceProjectRelocator', () => {
     }), 'utf8')
     await expect(relocator.resumeCommittingJournals()).rejects.toThrow('journal')
     expect(commitCalls).toEqual([])
+  })
+
+  test.each([
+    ['包含未知字段', { stage: 'committing', completedBytes: 4, completedCommitSteps: 0, unexpected: true }],
+    ['复制阶段已有提交步数', { stage: 'copying', completedBytes: 2, completedCommitSteps: 1 }],
+    ['校验阶段字节未完成', { stage: 'verifying', completedBytes: 2, completedCommitSteps: 0 }],
+    ['提交阶段字节未完成', { stage: 'committing', completedBytes: 2, completedCommitSteps: 0 }],
+  ])('Given journal %s When 读取状态 Then 按精确状态机拒绝', (_label, fields) => {
+    const operationId = '12345678-1234-4234-8234-123456789abc'
+    writeRelocationJournal(operationId, fields)
+    const relocator = createRelocator({ inspectCopyOwnership: async () => 'owned' })
+
+    expect(() => relocator.getStatus(workspace.id)).toThrow('journal')
+    expect(commitCalls).toEqual([])
+  })
+
+  test.each([
+    ['外部项目索引', () => { workspace.projectRootPath = 'relative-source' }, {}],
+    ['托管项目 provider', () => { workspace.projectRootPath = undefined }, { managedRoot: 'relative-managed-source' }],
+  ] as const)('Given %s 返回相对源路径 When 预检 Then 在路径解析前拒绝', async (_label, prepare, overrides) => {
+    prepare()
+    /** 若进入 Git 查询则说明相对路径已被错误解析。 */
+    let listedWorktrees = false
+    const relocator = createRelocator({
+      ...overrides,
+      listWorktrees: async () => {
+        listedWorktrees = true
+        return []
+      },
+    })
+
+    await expect(relocator.preflight({ workspaceId: workspace.id, targetRoot })).rejects.toThrow('源路径必须是绝对路径')
+    expect(listedWorktrees).toBe(false)
   })
 
   test('Given 复制进行中 When 按 operationId 取消 Then AbortSignal 中止且 failed journal 可见', async () => {
@@ -254,7 +370,9 @@ describe('WorkspaceProjectRelocator', () => {
       listWorktrees: async () => [],
       copyDirectory,
       inspectCopyOwnership: async () => copyCalls > 0 ? 'owned' : 'absent',
-      inspectCopySpace: async () => ({ totalBytes: 4, reusableBytes: 0, remainingBytes: 4 }),
+      inspectCopySpace: async () => copyCalls > 0
+        ? { totalBytes: 4, reusableBytes: 4, remainingBytes: 0 }
+        : { totalBytes: 4, reusableBytes: 0, remainingBytes: 4 },
       scanSourceBytes: async () => 4,
       inspectTargetVolume: async () => ({ availableBytes: 100, deviceType: 'local' }),
       finalizeCopy: async () => {},
@@ -266,6 +384,25 @@ describe('WorkspaceProjectRelocator', () => {
       },
       ...overrides,
     })
+  }
+
+  /** 写入可按字段覆盖的真实迁移 journal，驱动公开恢复边界测试。 */
+  function writeRelocationJournal(operationId: string, fields: Record<string, unknown>): void {
+    const journalDirectory = join(configDir, 'workspace-relocations')
+    mkdirSync(journalDirectory, { recursive: true })
+    writeFileSync(join(journalDirectory, `${operationId}.json`), JSON.stringify({
+      version: 1,
+      operationId,
+      workspaceId: workspace.id,
+      workspaceSlug: workspace.slug,
+      sourceRoot: realpathSync(sourceRoot),
+      targetRoot,
+      stage: 'committing',
+      completedBytes: 4,
+      totalBytes: 4,
+      completedCommitSteps: 0,
+      ...fields,
+    }), 'utf8')
   }
 })
 

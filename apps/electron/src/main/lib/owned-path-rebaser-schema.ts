@@ -18,7 +18,11 @@ export function isAgentSessionsIndex(value: unknown): value is JsonObject & { se
 /** 校验 AgentSessionMeta 的身份必填字段和 Task4 owned 路径字段。 */
 function isAgentSessionMeta(value: unknown): value is JsonObject {
   if (!isJsonObject(value)) return false
-  if (!isString(value.id) || !isString(value.title) || !isNumber(value.createdAt) || !isNumber(value.updatedAt)) return false
+  if (!isString(value.id)
+    || !isString(value.title)
+    || !isString(value.workspaceId)
+    || !isNumber(value.createdAt)
+    || !isNumber(value.updatedAt)) return false
   if (!SESSION_OPTIONAL_PATH_FIELDS.every((field) => isOptional(value[field], isString))) return false
   if (!SESSION_PATH_ARRAY_FIELDS.every((field) => isOptional(value[field], isStringArray))) return false
   return true

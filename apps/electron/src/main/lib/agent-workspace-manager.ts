@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, cpSync, mkdirSync
 import { cp as cpAsync, readFile as readFileAsync, writeFile as writeFileAsync } from 'node:fs/promises'
 import type { Dirent } from 'node:fs'
 import { rmSyncWithRetry, renameIfDestinationAbsentWithRetry, renameWithRetry } from './fs-retry'
-import { writeJsonFileAtomic, readJsonFileSafe, writeTextFileAtomic } from './safe-file'
+import { writeJsonFileAtomic, readJsonFileSafe, readJsonFileStrict, writeTextFileAtomic } from './safe-file'
 import { randomUUID } from 'node:crypto'
 import { join, resolve, relative, isAbsolute, dirname, basename, sep } from 'node:path'
 import {
@@ -31,6 +31,7 @@ import { listBuiltinMcpServers } from './builtin-mcp/catalog'
 import { RESERVED_BUILTIN_KEYS } from './builtin-mcp/baseline'
 import { createWorkspaceSlug } from './workspace-slug'
 import { inferMcpTransportType, normalizeMcpTransportType } from '@proma/shared'
+import { isWorkspaceConfig } from './owned-path-rebaser-schema'
 import type { AgentWorkspace, CreateAgentWorkspaceInput, LocalProjectRootStatus, WorkspaceMcpConfig, SkillMeta, SkillImportSource, OtherWorkspaceSkillsGroup, WorkspaceCapabilities, SkillFileNode, SkillFileContent, WorkspaceMemorySummary, BulkImportSkillItemResult, BulkImportSkillsResult, BulkImportWorkspaceSelection } from '@proma/shared'
 
 interface AgentWorkspacesIndex {
@@ -1851,6 +1852,19 @@ function readWorkspaceConfig(workspaceSlug: string): WorkspaceConfig {
   }
 }
 
+/** 迁移提交专用严格读取；候选全部损坏时禁止回退为空配置。 */
+function readWorkspaceConfigForRelocation(workspaceSlug: string): WorkspaceConfig {
+  return readJsonFileStrict<WorkspaceConfig>(getWorkspaceConfigPath(workspaceSlug), {
+    validate: isWorkspaceConfigForRelocation,
+    description: '工作区配置',
+  }) ?? {}
+}
+
+/** 将共享的保留未知字段 schema 收窄为当前工作区配置业务类型。 */
+function isWorkspaceConfigForRelocation(value: unknown): value is WorkspaceConfig {
+  return isWorkspaceConfig(value)
+}
+
 function writeWorkspaceConfig(workspaceSlug: string, config: WorkspaceConfig): void {
   const configPath = getWorkspaceConfigPath(workspaceSlug)
   writeJsonFileAtomic(configPath, config)
@@ -1870,7 +1884,7 @@ export function rebaseWorkspaceConfigPaths(
 ): void {
   if (!isAbsolute(sourceRoot) || !isAbsolute(targetRoot)) throw new Error('项目迁移根必须是绝对路径')
   /** 当前工作区配置。 */
-  const config = readWorkspaceConfig(workspaceSlug)
+  const config = readWorkspaceConfigForRelocation(workspaceSlug)
   /** 保持外部目录与原顺序不变的映射结果。 */
   const attachedDirectories = rebaseWorkspacePathArray(config.attachedDirectories, sourceRoot, targetRoot)
   /** 保持外部文件与原顺序不变的映射结果。 */

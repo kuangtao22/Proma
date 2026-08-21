@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { getUnstagedChanges, invalidateGitDiffCache } from './git-diff-service'
+import { getUnstagedChanges, invalidateGitDiffCache, listWorktreesStrict } from './git-diff-service'
 
 let repoPath = ''
 
@@ -96,5 +96,49 @@ describe('git diff scan cache', () => {
       invalidateGitDiffCache(secondRepo)
       rmSync(secondRepo, { recursive: true, force: true })
     }
+  })
+})
+
+describe('strict worktree query', () => {
+  test('Given 普通非 Git 目录 When 严格查询 worktree Then 安全返回空数组', async () => {
+    const nonGitPath = mkdtempSync(join(tmpdir(), 'proma-non-git-'))
+    try {
+      await expect(listWorktreesStrict(nonGitPath)).resolves.toEqual([])
+    } finally {
+      rmSync(nonGitPath, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 主仓库含 linked worktree When 分别从主仓库和 linked 查询 Then 都返回正确主从身份', async () => {
+    const linkedParentPath = mkdtempSync(join(tmpdir(), 'proma-strict-worktree-'))
+    const linkedWorktreePath = join(linkedParentPath, 'linked')
+    try {
+      execFileSync('git', ['worktree', 'add', '-b', 'strict-linked-test', linkedWorktreePath], { cwd: repoPath, stdio: 'pipe' })
+
+      const fromMain = await listWorktreesStrict(repoPath)
+      const fromLinked = await listWorktreesStrict(linkedWorktreePath)
+      const expectedMain = realpathSync(repoPath)
+      const expectedLinked = realpathSync(linkedWorktreePath)
+
+      expect(fromMain.find((item) => realpathSync(item.path) === expectedMain)?.isMain).toBe(true)
+      expect(fromMain.find((item) => realpathSync(item.path) === expectedLinked)?.isMain).toBe(false)
+      expect(fromLinked.find((item) => realpathSync(item.path) === expectedMain)?.isMain).toBe(true)
+      expect(fromLinked.find((item) => realpathSync(item.path) === expectedLinked)?.isMain).toBe(false)
+    } finally {
+      execFileSync('git', ['worktree', 'remove', '--force', linkedWorktreePath], { cwd: repoPath, stdio: 'pipe' })
+      rmSync(linkedParentPath, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 已确认 Git 仓库但 worktree 命令失败 When 严格查询 Then 向上传播错误', async () => {
+    /** 只在 worktree list 阶段注入失败，其余发现命令返回真实合同值。 */
+    const runGitCommand = async (args: string[]): Promise<string> => {
+      if (args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree') return 'true'
+      if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return realpathSync(repoPath)
+      if (args[0] === 'rev-parse' && args.includes('--git-common-dir')) return join(realpathSync(repoPath), '.git')
+      throw new Error('forced worktree failure')
+    }
+
+    await expect(listWorktreesStrict(repoPath, { runGitCommand })).rejects.toThrow('forced worktree failure')
   })
 })

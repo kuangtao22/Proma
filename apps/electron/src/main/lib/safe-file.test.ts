@@ -286,6 +286,17 @@ describe('removeFileAtomic', () => {
     }
   })
 
+  test('Given journal 与父目录均已不存在 When 重复原子删除 Then 仍幂等成功', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-missing-parent-'))
+    const filePath = join(tempDir, 'removed-parent', 'journal.json')
+
+    try {
+      expect(() => removeFileAtomic(filePath)).not.toThrow()
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('Given 删除目标是目录或符号链接 When 原子删除 Then 拒绝误删', () => {
     /** 同时放置目录、外部文件与指向外部文件的符号链接。 */
     const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-unsafe-'))
@@ -317,6 +328,54 @@ describe('removeFileAtomic', () => {
       })).toThrow('原子删除已提交，但 tombstone 清理失败')
       expect(existsSync(filePath)).toBe(false)
       expect(readFileNames(tempDir)).toHaveLength(1)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given rename 后 tombstone 路径被替换 When 原子删除 Then 拒绝 unlink 替换文件', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-tombstone-race-'))
+    const filePath = join(tempDir, 'journal.json')
+    writeFileSync(filePath, 'proma-owned', 'utf8')
+    /** 捕获随机 tombstone 路径以验证攻击者文件仍存在。 */
+    let tombstonePath = ''
+
+    try {
+      expect(() => removeFileAtomic(filePath, {
+        afterRenameBeforeVerify: (currentTombstonePath) => {
+          tombstonePath = currentTombstonePath
+          unlinkSync(currentTombstonePath)
+          writeFileSync(currentTombstonePath, 'replacement', 'utf8')
+        },
+      })).toThrow('tombstone 身份已变化')
+      expect(readFileSync(tombstonePath, 'utf8')).toBe('replacement')
+      expect(existsSync(filePath)).toBe(false)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given rename 后父目录被移走并同名重建 When 原子删除 Then 新目录文件不被误删且旧 tombstone 保留', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-parent-race-'))
+    const parentPath = join(tempDir, 'parent')
+    const movedParentPath = join(tempDir, 'parent-old')
+    const filePath = join(parentPath, 'journal.json')
+    mkdirSync(parentPath)
+    writeFileSync(filePath, 'proma-owned', 'utf8')
+    /** 随机 tombstone 文件名，用于同时检查新旧父目录。 */
+    let tombstoneName = ''
+
+    try {
+      expect(() => removeFileAtomic(filePath, {
+        afterRenameBeforeVerify: (tombstonePath) => {
+          tombstoneName = tombstonePath.slice(parentPath.length + 1)
+          renameSync(parentPath, movedParentPath)
+          mkdirSync(parentPath)
+          writeFileSync(join(parentPath, tombstoneName), 'replacement', 'utf8')
+        },
+      })).toThrow('父目录身份已变化')
+      expect(readFileSync(join(parentPath, tombstoneName), 'utf8')).toBe('replacement')
+      expect(readFileSync(join(movedParentPath, tombstoneName), 'utf8')).toBe('proma-owned')
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }

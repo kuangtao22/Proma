@@ -201,6 +201,51 @@ describe('Agent 会话 runtime 元数据', () => {
     expect(session?.piEntryBindings).toEqual({ 'assistant-1': 'entry-1' })
   })
 
+  test('Given 会话索引主文件损坏但 backup 有效 When 迁移重写 Then 恢复 backup 后完成 rebase', () => {
+    /** 迁移路径和会话索引候选。 */
+    const sourceRoot = join(tempHome, 'strict-session-source')
+    const targetRoot = join(tempHome, 'strict-session-target')
+    const indexPath = join(tempHome, '.proma', 'agent-sessions.json')
+    const validIndex = {
+      version: 2,
+      sessions: [{
+        id: 'strict-session-backup',
+        title: '严格恢复会话',
+        workspaceId: 'workspace-strict',
+        createdAt: 1,
+        updatedAt: 1,
+        forkSourceDir: join(sourceRoot, 'fork'),
+      }],
+    }
+    mkdirSync(join(tempHome, '.proma'), { recursive: true })
+    writeFileSync(indexPath, '{ 主文件损坏', 'utf8')
+    writeFileSync(`${indexPath}.bak`, JSON.stringify(validIndex), 'utf8')
+    rmSync(`${indexPath}.tmp`, { force: true })
+
+    manager.rebaseWorkspaceSessionPaths('workspace-strict', sourceRoot, targetRoot)
+
+    const recovered = JSON.parse(readFileSync(indexPath, 'utf8')) as typeof validIndex
+    expect(recovered.sessions[0]?.forkSourceDir).toBe(join(targetRoot, 'fork'))
+  })
+
+  test.each([
+    ['所有候选语法损坏', ['{ bad-main', '{ bad-tmp', '{ bad-backup']],
+    ['候选 schema 非法', [JSON.stringify({ version: 2, sessions: [{ id: 'missing-fields' }] }), '{ bad-tmp', '{ bad-backup']],
+  ])('Given 会话索引%s When 迁移重写 Then 抛错且不生成空索引', (_label, candidates) => {
+    const indexPath = join(tempHome, '.proma', 'agent-sessions.json')
+    mkdirSync(join(tempHome, '.proma'), { recursive: true })
+    writeFileSync(indexPath, candidates[0]!, 'utf8')
+    writeFileSync(`${indexPath}.tmp`, candidates[1]!, 'utf8')
+    writeFileSync(`${indexPath}.bak`, candidates[2]!, 'utf8')
+
+    expect(() => manager.rebaseWorkspaceSessionPaths(
+      'workspace-strict',
+      join(tempHome, 'strict-session-source'),
+      join(tempHome, 'strict-session-target'),
+    )).toThrow('会话索引')
+    expect(readFileSync(indexPath, 'utf8')).toBe(candidates[0]!)
+  })
+
   test('Given 工作区配置含项目内外附加路径 When 重写配置并切换索引 Then 仅根内变化且重复提交幂等', () => {
     /** 真实源、目标和外部附加路径。 */
     const sourceRoot = join(tempHome, 'workspace-source')
@@ -243,6 +288,43 @@ describe('Agent 会话 runtime 元数据', () => {
     expect(config.attachedDirectories).toEqual([realpathSync(targetRoot), join(realpathSync(targetRoot), 'docs'), outsideRoot])
     expect(config.attachedFiles).toEqual([join(realpathSync(targetRoot), 'README.md'), join(outsideRoot, 'note.md')])
     expect(index.workspaces[0]?.projectRootPath).toBe(realpathSync(targetRoot))
+  })
+
+  test('Given 工作区配置主文件损坏但 backup 有效 When 迁移重写 Then 恢复 backup 后完成 rebase', () => {
+    /** 隔离的工作区配置候选。 */
+    const workspaceSlug = 'strict-config-backup'
+    const sourceRoot = join(tempHome, 'strict-config-source')
+    const targetRoot = join(tempHome, 'strict-config-target')
+    const configDirectory = join(tempHome, '.proma', 'agent-workspaces', workspaceSlug)
+    const configPath = join(configDirectory, 'config.json')
+    mkdirSync(configDirectory, { recursive: true })
+    writeFileSync(configPath, '{ 主文件损坏', 'utf8')
+    writeFileSync(`${configPath}.bak`, JSON.stringify({ attachedDirectories: [sourceRoot] }), 'utf8')
+
+    workspaceManager.rebaseWorkspaceConfigPaths(workspaceSlug, sourceRoot, targetRoot)
+
+    const recovered = JSON.parse(readFileSync(configPath, 'utf8')) as { attachedDirectories: string[] }
+    expect(recovered.attachedDirectories).toEqual([targetRoot])
+  })
+
+  test.each([
+    ['所有候选语法损坏', ['{ bad-main', '{ bad-tmp', '{ bad-backup']],
+    ['候选 schema 非法', [JSON.stringify({ attachedDirectories: [1] }), '{ bad-tmp', '{ bad-backup']],
+  ])('Given 工作区配置%s When 迁移重写 Then 抛错且不写空配置', (_label, candidates) => {
+    const workspaceSlug = 'strict-config-invalid'
+    const configDirectory = join(tempHome, '.proma', 'agent-workspaces', workspaceSlug)
+    const configPath = join(configDirectory, 'config.json')
+    mkdirSync(configDirectory, { recursive: true })
+    writeFileSync(configPath, candidates[0]!, 'utf8')
+    writeFileSync(`${configPath}.tmp`, candidates[1]!, 'utf8')
+    writeFileSync(`${configPath}.bak`, candidates[2]!, 'utf8')
+
+    expect(() => workspaceManager.rebaseWorkspaceConfigPaths(
+      workspaceSlug,
+      join(tempHome, 'strict-config-source'),
+      join(tempHome, 'strict-config-target'),
+    )).toThrow('工作区配置')
+    expect(readFileSync(configPath, 'utf8')).toBe(candidates[0]!)
   })
 
   test('Given 已保存 OpenAI medium 默认值 When 新建会话 Then 始终创建并持久化 Pi 会话', () => {

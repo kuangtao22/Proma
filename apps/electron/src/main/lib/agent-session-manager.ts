@@ -10,7 +10,7 @@
 
 import { readFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, createReadStream, createWriteStream, statSync, type WriteStream } from 'node:fs'
 import { createInterface } from 'node:readline'
-import { writeJsonFileAtomic, writeTextFileAtomic, readJsonFileSafe } from './safe-file'
+import { writeJsonFileAtomic, writeTextFileAtomic, readJsonFileSafe, readJsonFileStrict } from './safe-file'
 import { randomUUID } from 'node:crypto'
 import { rmSyncWithRetry, renameWithRetry } from './fs-retry'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -51,6 +51,7 @@ import { convertLegacyMessage } from '@proma/session-core'
 import { clearNanoBananaAgentHistory } from './chat-tools/nano-banana-mcp'
 import { assertEnabledModelForChannel } from './agent-model-selection'
 import { copyForkWorkspaceFiles } from './agent-fork-workspace-copy'
+import { isAgentSessionsIndex } from './owned-path-rebaser-schema'
 
 /**
  * 会话索引文件格式
@@ -272,6 +273,24 @@ function readIndex(): AgentSessionsIndex {
   }
 }
 
+/** 迁移提交专用严格读取；绕过展示缓存并拒绝把损坏候选解释为空索引。 */
+function readIndexForRelocation(): AgentSessionsIndex {
+  const data = readJsonFileStrict<AgentSessionsIndex>(getAgentSessionsIndexPath(), {
+    validate: isAgentSessionsIndexForRelocation,
+    description: 'Agent 会话索引',
+  })
+  return data ?? {
+    version: INDEX_VERSION,
+    sessions: [],
+    openAIThinkingDefaultEnabledMigrationCompleted: true,
+  }
+}
+
+/** 将共享的保留未知字段 schema 收窄为当前会话索引业务类型。 */
+function isAgentSessionsIndexForRelocation(value: unknown): value is AgentSessionsIndex {
+  return isAgentSessionsIndex(value)
+}
+
 /**
  * 写入会话索引文件
  */
@@ -324,7 +343,7 @@ export function rebaseWorkspaceSessionPaths(
 ): void {
   assertRelocationRoots(sourceRoot, targetRoot)
   /** 当前会话索引，仅在至少一个声明字段变化时写回。 */
-  const index = readIndex()
+  const index = readIndexForRelocation()
   /** 是否存在需要原子持久化的路径变化。 */
   let changed = false
   for (const session of index.sessions) {

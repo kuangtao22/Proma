@@ -7,12 +7,18 @@
 
 import { spawn } from 'child_process'
 import { createHash } from 'node:crypto'
-import { constants, existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs'
+import { constants, existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path'
 import type { ChangedFileEntry, UnstagedChangesResult, UntrackedFileEntry } from '@proma/shared'
 import { normalizePathForCompare } from '@proma/shared'
 import type { ChangeSource, ChangedFileStatus } from '@proma/shared'
+
+/** strict worktree 查询可替换的命令执行边界。 */
+export interface ListWorktreesStrictOptions {
+  /** 执行 Git 命令并在任何失败时抛错。 */
+  runGitCommand?: (args: string[], cwd: string) => Promise<string>
+}
 
 /** 大文件读取上限：超过则跳过，避免 IPC 序列化撑爆内存 */
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
@@ -220,6 +226,91 @@ function runGitProcess(args: string[], cwd: string, options?: { quiet?: boolean 
 
 function runGitCommand(args: string[], cwd: string, options?: { quiet?: boolean }): Promise<string | null> {
   return gitCommandSemaphore.run(() => runGitProcess(args, cwd, options))
+}
+
+/** 保留 Git stderr 与退出码，供 strict 查询只识别明确的非仓库结果。 */
+class StrictGitCommandError extends Error {
+  constructor(
+    message: string,
+    readonly stderr: string,
+    readonly exitCode: number | null,
+    options?: ErrorOptions,
+  ) {
+    super(message, options)
+    this.name = 'StrictGitCommandError'
+  }
+}
+
+/** 执行不得吞错的 Git 子进程，供迁移预检使用。 */
+function runGitProcessStrict(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolveCommand, rejectCommand) => {
+    try {
+      const child = spawn('git', ['-c', 'core.quotePath=false', ...args], {
+        cwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: '0',
+          LC_ALL: 'C',
+        },
+      })
+      child.stdout?.setEncoding('utf-8')
+      child.stderr?.setEncoding('utf-8')
+      /** 完整 stdout，worktree porcelain 需要跨行解析。 */
+      let stdout = ''
+      /** 完整 stderr，用于严格区分非仓库和执行失败。 */
+      let stderr = ''
+      let settled = false
+      const timeout = setTimeout(() => {
+        if (settled) return
+        settled = true
+        child.kill('SIGKILL')
+        rejectCommand(new StrictGitCommandError(`Git 命令超时: ${args.join(' ')}`, stderr.trim(), null))
+      }, 10_000)
+      /** 只允许首个 close/error/timeout 完成 Promise。 */
+      const settle = (operation: () => void): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        operation()
+      }
+      child.stdout?.on('data', (data) => { stdout += data })
+      child.stderr?.on('data', (data) => { stderr += data })
+      child.on('close', (code) => {
+        settle(() => {
+          if (code === 0) {
+            resolveCommand(stdout.trim())
+            return
+          }
+          rejectCommand(new StrictGitCommandError(
+            `Git 命令失败: ${args.join(' ')}`,
+            stderr.trim(),
+            code,
+          ))
+        })
+      })
+      child.on('error', (error) => {
+        settle(() => rejectCommand(new StrictGitCommandError(
+          `Git 命令启动失败: ${args.join(' ')}`,
+          stderr.trim(),
+          null,
+          { cause: error },
+        )))
+      })
+    } catch (error) {
+      rejectCommand(new StrictGitCommandError(
+        `Git 命令启动失败: ${args.join(' ')}`,
+        '',
+        null,
+        { cause: error },
+      ))
+    }
+  })
+}
+
+/** 通过现有 semaphore 执行 strict Git 命令，避免迁移绕过全局进程上限。 */
+function runGitCommandStrict(args: string[], cwd: string): Promise<string> {
+  return gitCommandSemaphore.run(() => runGitProcessStrict(args, cwd))
 }
 
 const WORKTREE_FETCH_TTL_MS = 30_000
@@ -922,6 +1013,92 @@ export async function listWorktrees(repoPath: string): Promise<import('@proma/sh
   }
 
   return Array.from(worktreesByPath.values())
+}
+
+/**
+ * 严格列出单一项目所属仓库的全部 worktree。
+ * 普通非 Git 目录返回空数组；确认进入 Git 后，任何命令或 I/O 失败都向上传播。
+ */
+export async function listWorktreesStrict(
+  repoPath: string,
+  options: ListWorktreesStrictOptions = {},
+): Promise<import('@proma/shared').WorktreeInfo[]> {
+  const runCommand = options.runGitCommand ?? runGitCommandStrict
+  /** 只有 Git 明确报告非仓库时才是安全空结果。 */
+  let insideWorktree: string
+  try {
+    insideWorktree = await runCommand(['rev-parse', '--is-inside-work-tree'], repoPath)
+  } catch (error) {
+    if (isExplicitNonGitDirectory(error)) return []
+    throw error
+  }
+  if (insideWorktree !== 'true') return []
+
+  /** 当前主/linked worktree 的顶层目录。 */
+  const currentRoot = await runCommand(['rev-parse', '--show-toplevel'], repoPath)
+  if (!isAbsolute(currentRoot)) throw new Error('Git 仓库顶层路径不是绝对路径')
+  /** common dir 在 linked worktree 中仍指向主仓库的 .git。 */
+  const commonDir = await runCommand(
+    ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+    currentRoot,
+  )
+  if (!isAbsolute(commonDir)) throw new Error('Git common dir 不是绝对路径')
+  const normalizedMainRoot = normalizeGitRoot(dirname(commonDir))
+  const output = await runCommand(['worktree', 'list', '--porcelain'], currentRoot)
+  return parseStrictWorktreeOutput(output, normalizedMainRoot)
+}
+
+/** 只识别 Git 的稳定英文非仓库诊断，其他命令失败继续 fail closed。 */
+function isExplicitNonGitDirectory(error: unknown): boolean {
+  return error instanceof StrictGitCommandError
+    && error.exitCode !== null
+    && /not a git repository|not a git work tree/i.test(error.stderr)
+}
+
+/** 解析 strict porcelain 输出，并对 worktree 路径 I/O 采用 fail-closed 检查。 */
+function parseStrictWorktreeOutput(
+  output: string,
+  normalizedMainRoot: string,
+): import('@proma/shared').WorktreeInfo[] {
+  /** 按规范化路径去重后的 worktree。 */
+  const worktreesByPath = new Map<string, import('@proma/shared').WorktreeInfo>()
+  for (const block of output.split('\n\n').filter(Boolean)) {
+    let path = ''
+    let head = ''
+    let branch = ''
+    let prunable = false
+    for (const line of block.split('\n')) {
+      if (line.startsWith('worktree ')) path = line.slice('worktree '.length)
+      else if (line.startsWith('HEAD ')) head = line.slice('HEAD '.length).slice(0, 7)
+      else if (line.startsWith('branch refs/heads/')) branch = line.slice('branch refs/heads/'.length)
+      else if (line === 'detached') branch = '(detached)'
+      else if (line.startsWith('prunable')) prunable = true
+    }
+    if (!path || prunable || !strictPathExists(path)) continue
+    const key = normalizeGitRoot(path)
+    if (worktreesByPath.has(key)) continue
+    worktreesByPath.set(key, {
+      path,
+      branch: branch || 'unknown',
+      head,
+      isMain: key === normalizedMainRoot,
+      name: basename(path),
+    })
+  }
+  return Array.from(worktreesByPath.values())
+}
+
+/** strict 查询只把明确缺失视为不存在，权限和其他文件系统错误继续抛出。 */
+function strictPathExists(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
+      return false
+    }
+    throw error
+  }
 }
 
 /**
