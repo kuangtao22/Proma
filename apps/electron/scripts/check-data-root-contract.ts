@@ -35,6 +35,8 @@ interface RuntimePathBindings {
   pathBuilders: Set<ts.Symbol>
   /** node:path default/namespace import symbol。 */
   pathNamespaces: Set<ts.Symbol>
+  /** 从 node:path 命名导入的 win32/posix 平台 namespace symbol。 */
+  pathPlatformNamespaces: Set<ts.Symbol>
   /** 从 node:os 导入的 homedir symbol。 */
   homeFunctions: Set<ts.Symbol>
   /** node:os default/namespace import symbol。 */
@@ -160,6 +162,7 @@ function collectRuntimePathBindings(context: TypeScriptBindingContext): RuntimeP
   const bindings: RuntimePathBindings = {
     pathBuilders: new Set(),
     pathNamespaces: new Set(),
+    pathPlatformNamespaces: new Set(),
     homeFunctions: new Set(),
     osNamespaces: new Set(),
     fsFunctions: new Map(),
@@ -208,6 +211,9 @@ function collectRuntimePathBindings(context: TypeScriptBindingContext): RuntimeP
       if (moduleName === 'path' && (importedName === 'join' || importedName === 'resolve')) {
         bindings.pathBuilders.add(symbol)
       }
+      if (moduleName === 'path' && (importedName === 'win32' || importedName === 'posix')) {
+        bindings.pathPlatformNamespaces.add(symbol)
+      }
       if (moduleName === 'os' && importedName === 'homedir') bindings.homeFunctions.add(symbol)
       if (moduleName === 'fs/promises') bindings.fsFunctions.set(symbol, importedName)
       else if (moduleName === 'fs' && importedName === 'promises') bindings.fsNamespaces.add(symbol)
@@ -241,10 +247,21 @@ function isPathBuilderCall(
   checker: ts.TypeChecker,
 ): boolean {
   if (ts.isIdentifier(node.expression)) return identifierUsesBinding(node.expression, bindings.pathBuilders, checker)
-  return ts.isPropertyAccessExpression(node.expression)
-    && (node.expression.name.text === 'join' || node.expression.name.text === 'resolve')
-    && ts.isIdentifier(node.expression.expression)
-    && identifierUsesBinding(node.expression.expression, bindings.pathNamespaces, checker)
+  if (
+    !ts.isPropertyAccessExpression(node.expression)
+    || (node.expression.name.text !== 'join' && node.expression.name.text !== 'resolve')
+  ) return false
+  /** named `win32/posix` import alias 可直接作为 join/resolve receiver。 */
+  const receiver = node.expression.expression
+  if (ts.isIdentifier(receiver)) {
+    return identifierUsesBinding(receiver, bindings.pathNamespaces, checker)
+      || identifierUsesBinding(receiver, bindings.pathPlatformNamespaces, checker)
+  }
+  /** default/namespace path import 的 win32/posix 子 namespace。 */
+  return ts.isPropertyAccessExpression(receiver)
+    && (receiver.name.text === 'win32' || receiver.name.text === 'posix')
+    && ts.isIdentifier(receiver.expression)
+    && identifierUsesBinding(receiver.expression, bindings.pathNamespaces, checker)
 }
 
 /** 返回已确认来源的文件系统调用真实方法名。 */

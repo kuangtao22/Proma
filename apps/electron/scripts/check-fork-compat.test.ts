@@ -314,14 +314,20 @@ function createGatedBridgeMain(): string {
   return `
     import { registerBridge, startAllBridges } from './lib/bridge-registry'
     import { agentEventBus } from './lib/agent-service'
+    import {
+      getDefaultDataRootLocator,
+      resolveDataRootStartupMode,
+    } from './lib/path-management-ipc'
     app.whenReady().then(bootstrap).catch(handleBootstrapFailure)
     async function bootstrap(): Promise<void> {
+      const dataRootLocator = getDefaultDataRootLocator()
+      const locatorResult = dataRootLocator.inspect()
       const dataRootMode = resolveDataRootStartupMode(locatorResult)
       if (dataRootMode !== 'normal') {
         showDataRootManagementWindow(dataRootMode)
         return
       }
-      const activeRoot = prepareNormalDataRoot(locator, locatorResult)
+      const activeRoot = prepareNormalDataRoot(dataRootLocator, locatorResult)
       await dataRootInstanceLease.acquire(activeRoot)
       const { createLanBridgeRegistration } = await import('./lib/lan-bridge/lan-bridge')
       registerBridge(createLanBridgeRegistration(agentEventBus))
@@ -347,6 +353,66 @@ describe('fork 上游兼容检查器', () => {
     }
 
     expect(getCheck(files, 'bridge-composition').passed).toBe(true)
+  })
+
+  test('Given normal gate resolver 使用合法 import alias When 检查 Bridge 组合点 Then 仍通过', () => {
+    /** resolver 本地名称可变，但 export 来源和调用 symbol 必须保持可信。 */
+    const main = createGatedBridgeMain()
+      .replace('resolveDataRootStartupMode,', 'resolveDataRootStartupMode as resolveMode,')
+      .replace("from './lib/path-management-ipc'", "from './lib/path-management-ipc.js'")
+      .replace('resolveDataRootStartupMode(locatorResult)', 'resolveMode(locatorResult)')
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/index.ts': main,
+    }
+
+    expect(getCheck(files, 'bridge-composition').passed).toBe(true)
+  })
+
+  test('Given normal gate 使用伪 resolver、错误模块或错误 inspect 参数 When 检查 Bridge 组合点 Then 全部失败', () => {
+    /** 文本同名不足以证明 normal gate；必须追踪 import 与 locator inspect 结果的 symbol identity。 */
+    const invalidMains = [
+      createGatedBridgeMain()
+        .replace('resolveDataRootStartupMode,', 'resolveDataRootStartupMode as importedResolver,')
+        .replace(
+          "    app.whenReady().then(bootstrap).catch(handleBootstrapFailure)",
+          "    function resolveDataRootStartupMode(): 'normal' { return 'normal' }\n    app.whenReady().then(bootstrap).catch(handleBootstrapFailure)",
+        ),
+      createGatedBridgeMain().replace(
+        `    import {
+      getDefaultDataRootLocator,
+      resolveDataRootStartupMode,
+    } from './lib/path-management-ipc'`,
+        `    import { getDefaultDataRootLocator } from './lib/path-management-ipc'
+    import { resolveDataRootStartupMode } from './lib/not-path-management-ipc'`,
+      ),
+      createGatedBridgeMain().replace(
+        'resolveDataRootStartupMode(locatorResult)',
+        'resolveDataRootStartupMode(dataRootLocator)',
+      ),
+    ]
+
+    for (const main of invalidMains) {
+      const files = {
+        ...validFiles,
+        'apps/electron/src/main/index.ts': main,
+      }
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    }
+  })
+
+  test('Given normal guard condition 绑定 shadowed mode symbol When 检查 Bridge 组合点 Then 明确失败', () => {
+    /** 同名参数会让 condition 绑定另一个 symbol，不能替代 resolver 结果声明。 */
+    const main = createGatedBridgeMain().replace(
+      'async function bootstrap(): Promise<void> {',
+      'async function bootstrap(dataRootMode: string): Promise<void> {',
+    )
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/index.ts': main,
+    }
+
+    expect(getCheck(files, 'bridge-composition').passed).toBe(false)
   })
 
   test('Given gated dynamic 模式仅增加 LAN type-only import When 检查 Bridge 组合点 Then 仍通过', () => {

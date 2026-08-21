@@ -450,6 +450,12 @@ function bootstrapStartsAllBridges(
   return false
 }
 
+/** 归一化相对 TypeScript 模块说明符，允许源码 import 显式携带运行时扩展名。 */
+function normalizeTypeScriptModuleSpecifier(specifier: string): string {
+  if (!specifier.startsWith('.')) return specifier
+  return specifier.replace(/\.(?:[cm]?[jt]sx?)$/, '')
+}
+
 /** 收集目标模块真实运行时 named import 的 local binding，支持 import alias。 */
 function collectImportedLocalBindings(
   context: TypeScriptBindingContext,
@@ -461,7 +467,8 @@ function collectImportedLocalBindings(
   for (const statement of context.sourceFile.statements) {
     if (!ts.isImportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) continue
     if (
-      statement.moduleSpecifier.text !== modulePath
+      normalizeTypeScriptModuleSpecifier(statement.moduleSpecifier.text)
+        !== normalizeTypeScriptModuleSpecifier(modulePath)
       || statement.importClause?.isTypeOnly
       || !statement.importClause?.namedBindings
     ) continue
@@ -615,29 +622,75 @@ function statementDeclaresDeferredBinding(
 }
 
 /** 判断 bootstrap 在指定位置前建立了可直接返回的 normal 模式门。 */
-function hasNormalModeGuardBefore(statements: readonly ts.Statement[], beforeIndex: number): boolean {
-  /** dataRootMode 必须由固定 resolver 调用直接声明。 */
-  const modeDeclarationIndex = statements.findIndex((statement, index) => {
-    if (index >= beforeIndex || !ts.isVariableStatement(statement)) return false
-    return statement.declarationList.declarations.some((declaration) => (
-      ts.isIdentifier(declaration.name)
-      && declaration.name.text === 'dataRootMode'
-      && declaration.initializer !== undefined
-      && ts.isCallExpression(declaration.initializer)
-      && ts.isIdentifier(declaration.initializer.expression)
-      && declaration.initializer.expression.text === 'resolveDataRootStartupMode'
-    ))
-  })
-  if (modeDeclarationIndex < 0) return false
+function hasNormalModeGuardBefore(
+  statements: readonly ts.Statement[],
+  beforeIndex: number,
+  locatorFactoryBindings: ReadonlyMap<string, ts.Symbol>,
+  resolverBindings: ReadonlyMap<string, ts.Symbol>,
+  checker: ts.TypeChecker,
+): boolean {
+  /** 返回指定位置前第一个满足来源合同的直接变量声明及其语句位置。 */
+  const findDeclaration = (
+    afterIndex: number,
+    predicate: (declaration: ts.VariableDeclaration) => boolean,
+  ): { declaration: ts.VariableDeclaration; index: number } | undefined => {
+    for (let index = afterIndex + 1; index < beforeIndex; index += 1) {
+      const statement = statements[index]
+      if (!statement || !ts.isVariableStatement(statement)) continue
+      const declaration = statement.declarationList.declarations.find(predicate)
+      if (declaration) return { declaration, index }
+    }
+    return undefined
+  }
+  /** locator 必须由 path-management-ipc 的真实 factory 直接创建。 */
+  const locator = findDeclaration(-1, (declaration) => (
+    ts.isIdentifier(declaration.name)
+    && declaration.initializer !== undefined
+    && ts.isCallExpression(declaration.initializer)
+    && declaration.initializer.arguments.length === 0
+    && ts.isIdentifier(declaration.initializer.expression)
+    && identifierUsesImportedBinding(declaration.initializer.expression, locatorFactoryBindings, checker)
+  ))
+  if (!locator || !ts.isIdentifier(locator.declaration.name)) return false
+  const locatorSymbol = checker.getSymbolAtLocation(locator.declaration.name)
+  if (!locatorSymbol) return false
+  /** inspect 结果必须直接来自同一 locator symbol，不能用同名或其他对象伪造。 */
+  const inspection = findDeclaration(locator.index, (declaration) => (
+    ts.isIdentifier(declaration.name)
+    && declaration.initializer !== undefined
+    && ts.isCallExpression(declaration.initializer)
+    && declaration.initializer.arguments.length === 0
+    && ts.isPropertyAccessExpression(declaration.initializer.expression)
+    && declaration.initializer.expression.name.text === 'inspect'
+    && ts.isIdentifier(declaration.initializer.expression.expression)
+    && checker.getSymbolAtLocation(declaration.initializer.expression.expression) === locatorSymbol
+  ))
+  if (!inspection || !ts.isIdentifier(inspection.declaration.name)) return false
+  const inspectionSymbol = checker.getSymbolAtLocation(inspection.declaration.name)
+  if (!inspectionSymbol) return false
+  /** startup mode 必须由真实 resolver 消费同一 inspect 结果。 */
+  const mode = findDeclaration(inspection.index, (declaration) => (
+    ts.isIdentifier(declaration.name)
+    && declaration.initializer !== undefined
+    && ts.isCallExpression(declaration.initializer)
+    && ts.isIdentifier(declaration.initializer.expression)
+    && identifierUsesImportedBinding(declaration.initializer.expression, resolverBindings, checker)
+    && declaration.initializer.arguments.length === 1
+    && ts.isIdentifier(declaration.initializer.arguments[0])
+    && checker.getSymbolAtLocation(declaration.initializer.arguments[0]) === inspectionSymbol
+  ))
+  if (!mode || !ts.isIdentifier(mode.declaration.name)) return false
+  const modeSymbol = checker.getSymbolAtLocation(mode.declaration.name)
+  if (!modeSymbol) return false
   return statements.some((statement, index) => {
-    if (index <= modeDeclarationIndex || index >= beforeIndex || !ts.isIfStatement(statement)) return false
+    if (index <= mode.index || index >= beforeIndex || !ts.isIfStatement(statement)) return false
     /** 只接受 dataRootMode !== 'normal' 的精确 fail-closed 判别。 */
     const condition = statement.expression
     if (
       !ts.isBinaryExpression(condition)
       || condition.operatorToken.kind !== ts.SyntaxKind.ExclamationEqualsEqualsToken
       || !ts.isIdentifier(condition.left)
-      || condition.left.text !== 'dataRootMode'
+      || checker.getSymbolAtLocation(condition.left) !== modeSymbol
       || !ts.isStringLiteralLike(condition.right)
       || condition.right.text !== 'normal'
     ) return false
@@ -653,6 +706,8 @@ function findAllowedGatedLanDynamicImport(
   registerBridgeBindings: ReadonlyMap<string, ts.Symbol>,
   deferredFactoryBindings: ReadonlyMap<string, ts.Symbol>,
   eventBusBindings: ReadonlyMap<string, ts.Symbol>,
+  locatorFactoryBindings: ReadonlyMap<string, ts.Symbol>,
+  resolverBindings: ReadonlyMap<string, ts.Symbol>,
   checker: ts.TypeChecker,
   modulePath: string,
 ): ts.CallExpression | undefined {
@@ -671,7 +726,13 @@ function findAllowedGatedLanDynamicImport(
         true,
       )
       || !statementDeclaresDeferredBinding(statements[index - 1], deferredFactoryBindings, checker)
-      || !hasNormalModeGuardBefore(statements, index - 1)
+      || !hasNormalModeGuardBefore(
+        statements,
+        index - 1,
+        locatorFactoryBindings,
+        resolverBindings,
+        checker,
+      )
     ) continue
     /** 前一条声明中精确目标 dynamic import 是本文件唯一允许的运行时加载点。 */
     let allowedImport: ts.CallExpression | undefined
@@ -697,6 +758,8 @@ function countGatedBootstrapLanBridgeRegistrations(
   registerBridgeBindings: ReadonlyMap<string, ts.Symbol>,
   deferredFactoryBindings: ReadonlyMap<string, ts.Symbol>,
   eventBusBindings: ReadonlyMap<string, ts.Symbol>,
+  locatorFactoryBindings: ReadonlyMap<string, ts.Symbol>,
+  resolverBindings: ReadonlyMap<string, ts.Symbol>,
   checker: ts.TypeChecker,
 ): number {
   if (!bootstrap?.body || deferredFactoryBindings.size === 0) return 0
@@ -718,7 +781,13 @@ function countGatedBootstrapLanBridgeRegistrations(
     /** 动态 import 必须紧邻注册且位于明确 normal gate 之后。 */
     if (
       statementDeclaresDeferredBinding(statements[index - 1], deferredFactoryBindings, checker)
-      && hasNormalModeGuardBefore(statements, index - 1)
+      && hasNormalModeGuardBefore(
+        statements,
+        index - 1,
+        locatorFactoryBindings,
+        resolverBindings,
+        checker,
+      )
     ) count += 1
   }
   return count
@@ -1211,12 +1280,25 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     './lib/agent-service',
     'agentEventBus',
   )
+  /** normal gate 必须绑定 path-management-ipc 的真实 locator factory 与 resolver。 */
+  const locatorFactoryBindings = collectImportedLocalBindings(
+    mainContext,
+    './lib/path-management-ipc',
+    'getDefaultDataRootLocator',
+  )
+  const resolverBindings = collectImportedLocalBindings(
+    mainContext,
+    './lib/path-management-ipc',
+    'resolveDataRootStartupMode',
+  )
   /** 找出唯一允许的 gated import，再对其余动态依赖做保守静态求值。 */
   const allowedLanDynamicImport = findAllowedGatedLanDynamicImport(
     bootstrap,
     registerBridgeBindings,
     deferredFactoryBindings,
     eventBusBindings,
+    locatorFactoryBindings,
+    resolverBindings,
     mainContext.checker,
     './lib/lan-bridge/lan-bridge',
   )
@@ -1251,6 +1333,8 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     registerBridgeBindings,
     deferredFactoryBindings,
     eventBusBindings,
+    locatorFactoryBindings,
+    resolverBindings,
     mainContext.checker,
   )
   const hasReachableStart = hasReachableBootstrapRegistration(mainSource)

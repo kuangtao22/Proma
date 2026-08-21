@@ -54,6 +54,95 @@ describe('数据根合同检查器', () => {
     }
   })
 
+  test('Given path 平台 namespace 构造默认根 When 扫描主进程 Then 只报告真实 node:path binding', () => {
+    /** default、namespace 与 named platform alias 都必须追踪 import symbol，并排除同名局部对象。 */
+    const rootDir = createFixture({
+      'apps/electron/src/main/default-win32.ts': `
+        import path from 'node:path'
+        import { homedir } from 'node:os'
+        export const root = path.win32.join(homedir(), '.proma')
+      `,
+      'apps/electron/src/main/namespace-posix.ts': `
+        import * as path from 'node:path'
+        import os from 'node:os'
+        export const root = path.posix.resolve(os.homedir(), '.proma')
+      `,
+      'apps/electron/src/main/named-win32-alias.ts': `
+        import { win32 as pathApi } from 'node:path'
+        import { homedir as getHome } from 'node:os'
+        export const root = pathApi.join(getHome(), '.proma')
+      `,
+      'apps/electron/src/main/named-posix-alias.ts': `
+        import { posix as pathApi } from 'path'
+        import { homedir } from 'os'
+        export const root = pathApi.resolve(homedir(), '.proma')
+      `,
+      'apps/electron/src/main/shadowed-path-platform.ts': `
+        import path from 'node:path'
+        import { homedir } from 'node:os'
+        function build(path: { win32: { join: (...parts: string[]) => string } }): string {
+          return path.win32.join(homedir(), '.proma')
+        }
+        void build
+      `,
+      'apps/electron/src/main/local-platform-alias.ts': `
+        import { homedir } from 'node:os'
+        const pathApi = { join: (...parts: string[]) => parts.join('/') }
+        export const root = pathApi.join(homedir(), '.proma')
+      `,
+      'apps/electron/src/main/shadowed-named-platform-alias.ts': `
+        import { win32 as pathApi } from 'node:path'
+        import { homedir } from 'node:os'
+        function build(pathApi: { join: (...parts: string[]) => string }): string {
+          return pathApi.join(homedir(), '.proma')
+        }
+        void build
+      `,
+      'apps/electron/src/main/unsupported-platform-method.ts': `
+        import { posix as pathApi } from 'node:path'
+        export const root = pathApi.normalize('.proma')
+      `,
+    })
+
+    try {
+      expect(findHardcodedDataRoots(rootDir)).toEqual([
+        'apps/electron/src/main/default-win32.ts',
+        'apps/electron/src/main/named-posix-alias.ts',
+        'apps/electron/src/main/named-win32-alias.ts',
+        'apps/electron/src/main/namespace-posix.ts',
+      ])
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given Windows 分隔符数据根字面量流入文件 sink When 扫描主进程 Then 识别等价路径段', () => {
+    /** `.proma` 路径段同时接受正斜杠与反斜杠，不把相似名称当成数据根。 */
+    const rootDir = createFixture({
+      'apps/electron/src/main/windows-home-root.ts': `
+        import { readFileSync } from 'node:fs'
+        export const settings = readFileSync('~\\\\.proma\\\\settings.json', 'utf8')
+      `,
+      'apps/electron/src/main/windows-absolute-root.ts': `
+        import { readFileSync } from 'node:fs'
+        export const settings = readFileSync('C:\\\\Users\\\\tester\\\\.proma\\\\settings.json', 'utf8')
+      `,
+      'apps/electron/src/main/windows-similar-root.ts': `
+        import { readFileSync } from 'node:fs'
+        export const settings = readFileSync('C:\\\\Users\\\\tester\\\\.proma-copy\\\\settings.json', 'utf8')
+      `,
+    })
+
+    try {
+      expect(findHardcodedDataRoots(rootDir)).toEqual([
+        'apps/electron/src/main/windows-absolute-root.ts',
+        'apps/electron/src/main/windows-home-root.ts',
+      ])
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true })
+    }
+  })
+
   test('Given 模板、字符串拼接和文件 API 使用硬编码根 When 扫描主进程 Then 全部报告', () => {
     /** 三种不经过 join/resolve 的运行时路径构造。 */
     const rootDir = createFixture({
