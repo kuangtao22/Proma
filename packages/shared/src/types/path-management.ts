@@ -62,7 +62,7 @@ export type WorkspaceOperationKind = 'relocation'
 export interface StartWorkspaceRelocationInput {
   workspaceId: string
   /**
-   * Task 4 handler 只能接受主进程原生选择器已授权并重新验证的路径，
+   * 主进程 handler 只能接受原生选择器已授权并在执行前重新验证的路径，
    * 不得信任 renderer 直接传入的任意字符串。
    */
   targetRoot: string

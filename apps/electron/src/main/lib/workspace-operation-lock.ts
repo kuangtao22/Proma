@@ -20,8 +20,8 @@ interface WorkspaceOperationEntry {
 const WORKSPACE_RELOCATION_BLOCK_REASON = '项目正在迁移，请等待完成后重试'
 
 /** 拒绝空白或带首尾空白的 ID，避免不同原始 ID 被静默合并。 */
-function assertWorkspaceId(workspaceId: string): void {
-  if (workspaceId.length === 0 || workspaceId !== workspaceId.trim()) {
+function assertWorkspaceId(workspaceId: unknown): asserts workspaceId is string {
+  if (typeof workspaceId !== 'string' || workspaceId.length === 0 || workspaceId !== workspaceId.trim()) {
     throw new Error('工作区 ID 无效')
   }
 }
