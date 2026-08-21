@@ -7,6 +7,7 @@ import { DOMParser } from '@xmldom/xmldom'
 import type {
   DataRootDeviceType,
   DataRootOccupiedStorage,
+  DataRootStorageIssue,
   DataRootStorageIssueCode,
 } from '@proma/shared'
 
@@ -15,8 +16,10 @@ export type { DataRootDeviceType } from '@proma/shared'
 
 /** 数据根所在卷的轻量元数据，不扫描目录内容。 */
 export interface DataRootVolumeSnapshot {
-  availableBytes: number
+  availableBytes?: number
   deviceType: DataRootDeviceType
+  /** 容量查询失败时保留设备类型并公开稳定问题。 */
+  storageIssue?: DataRootStorageIssue
 }
 
 /** 数据根设置页需要的真实存储快照。 */
@@ -25,8 +28,6 @@ export interface DataRootStorageSnapshot extends DataRootVolumeSnapshot {
   occupiedBytes?: number
   /** 占用空间是否仍在后台计算或暂不可用。 */
   occupiedStatus: 'loading' | 'ready' | 'unavailable'
-  /** 占用扫描失败时的稳定公开问题。 */
-  storageIssue?: DataRootOccupiedStorage['storageIssue']
 }
 
 /** 目录扫描可替换依赖与安全预算。 */
@@ -43,6 +44,8 @@ export interface ScanDataRootOptions {
   now?: () => number
   /** 可注入目录枚举。 */
   readDirectory?: (path: string) => AsyncIterable<{ name: string }>
+  /** 可注入目录打开操作，覆盖 opendir 与 iterator 获取的超时测试。 */
+  openDirectory?: (path: string) => Promise<AsyncIterable<{ name: string }>>
   /** 可注入 no-follow 文件状态读取。 */
   lstat?: (path: string) => Promise<{
     size: bigint
@@ -59,6 +62,14 @@ export interface DataRootStorageInspectorOptions {
   cacheTtlMs?: number
   /** 可注入占用扫描，测试无需触碰真实目录。 */
   inspectOccupiedFresh?: (rootPath: string, options: { signal: AbortSignal }) => Promise<number>
+}
+
+/** 卷信息检查的可替换系统依赖。 */
+export interface DataRootVolumeInspectionOptions {
+  /** 读取文件系统容量。 */
+  statfs?: (path: string) => Promise<{ bavail: bigint; bsize: bigint }>
+  /** 检测数据根设备类型。 */
+  detectDeviceType?: (path: string) => Promise<DataRootDeviceType>
 }
 
 /** 单条成功缓存。 */
@@ -79,6 +90,7 @@ const DEFAULT_CACHE_TTL_MS = 60_000
 const DEFAULT_SCAN_CONCURRENCY = 8
 const DEFAULT_SCAN_MAX_ENTRIES = 100_000
 const DEFAULT_SCAN_TIMEOUT_MS = 15_000
+const DEFAULT_SCAN_CLOSE_TIMEOUT_MS = 25
 const execFileAsync = promisify(execFile)
 
 /** 占用扫描内部错误，统一映射为 renderer 可处理的稳定分类。 */
@@ -128,11 +140,9 @@ export class DataRootStorageInspector {
     /** 已有扫描进行中时复用同一个 Promise。 */
     const pending = this.inFlight.get(normalizedRoot)
     if (pending !== undefined && pending.generation === generation) {
-      const unlinkSignal = forwardAbort(signal, pending.controller)
-      return pending.promise.finally(unlinkSignal)
+      return waitForOccupiedConsumer(pending.promise, signal)
     }
     const controller = new AbortController()
-    const unlinkSignal = forwardAbort(signal, controller)
     /** 成功或稳定失败结果均短期缓存，取消不缓存。 */
     let inspection: Promise<DataRootOccupiedStorage>
     inspection = this.inspectOccupiedFresh(normalizedRoot, { signal: controller.signal }).then<DataRootOccupiedStorage>((occupiedBytes) => ({
@@ -145,12 +155,11 @@ export class DataRootStorageInspector {
       }
       return snapshot
     }).finally(() => {
-      unlinkSignal()
       const latest = this.inFlight.get(normalizedRoot)
       if (latest?.generation === generation && latest.promise === inspection) this.inFlight.delete(normalizedRoot)
     })
     this.inFlight.set(normalizedRoot, { generation, controller, promise: inspection })
-    return inspection
+    return waitForOccupiedConsumer(inspection, signal)
   }
 
   /** 同步返回设置页会话期内的新鲜占用缓存。 */
@@ -227,7 +236,11 @@ export async function scanDataRootBytes(rootPath: string, options: ScanDataRootO
   const maxEntries = options.maxEntries ?? DEFAULT_SCAN_MAX_ENTRIES
   const timeoutMs = options.timeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS
   const now = options.now ?? Date.now
-  const readDirectory = options.readDirectory ?? readDirectoryEntries
+  /** 目录打开与 iterator 获取必须纳入和 lstat 相同的全局截止时间。 */
+  const openDirectory = options.openDirectory ?? (async (path: string) => {
+    if (options.readDirectory !== undefined) return options.readDirectory(path)
+    return await opendir(path)
+  })
   const inspectEntry = options.lstat ?? (async (path) => await lstat(path, { bigint: true }))
   if (!Number.isInteger(concurrency) || concurrency <= 0) throw new Error('扫描并发数必须是正整数')
   if (!Number.isInteger(maxEntries) || maxEntries <= 0) throw new Error('扫描条目上限必须是正整数')
@@ -269,12 +282,34 @@ export async function scanDataRootBytes(rootPath: string, options: ScanDataRootO
       }
       assertScanBudget(options.signal, now, startedAt, timeoutMs)
     }
-    for await (const entry of readDirectory(currentDirectory)) {
-      assertScanBudget(options.signal, now, startedAt, timeoutMs)
-      entryCount += 1
-      if (entryCount > maxEntries) throw new DataRootScanError('SCAN_LIMIT_EXCEEDED', '数据文件过多，无法在安全预算内统计占用空间')
-      batch.push(resolve(currentDirectory, entry.name))
-      if (batch.length >= concurrency) await processBatch()
+    /** 显式驱动 iterator，确保 opendir、获取 iterator 和每次 next 都能取消或超时。 */
+    const directory = await raceWithScanBudget(
+      Promise.resolve().then(async () => await openDirectory(currentDirectory)),
+      options.signal,
+      remainingScanBudget(now, startedAt, timeoutMs),
+    )
+    const iterator = await raceWithScanBudget(
+      Promise.resolve().then(() => directory[Symbol.asyncIterator]()),
+      options.signal,
+      remainingScanBudget(now, startedAt, timeoutMs),
+    )
+    try {
+      while (true) {
+        const iteration = await raceWithScanBudget(
+          Promise.resolve().then(async () => await iterator.next()),
+          options.signal,
+          remainingScanBudget(now, startedAt, timeoutMs),
+        )
+        if (iteration.done === true) break
+        entryCount += 1
+        if (entryCount > maxEntries) {
+          throw new DataRootScanError('SCAN_LIMIT_EXCEEDED', '数据文件过多，无法在安全预算内统计占用空间')
+        }
+        batch.push(resolve(currentDirectory, iteration.value.name))
+        if (batch.length >= concurrency) await processBatch()
+      }
+    } finally {
+      await closeDirectoryIterator(iterator, directory)
     }
     if (batch.length > 0) await processBatch()
   }
@@ -347,21 +382,24 @@ const NETWORK_FILE_SYSTEMS = new Set([
 const MAC_NETWORK_FILE_SYSTEMS = new Set(['smbfs', 'nfs', 'webdav', 'afpfs', 'cifs'])
 
 /** 读取目标所在卷容量与设备类型，不遍历目标目录。 */
-export async function inspectDataRootVolume(rootPath: string): Promise<DataRootVolumeSnapshot> {
-  const [fileSystemStats, deviceType] = await Promise.all([
-    statfs(rootPath, { bigint: true }),
-    detectDataRootDeviceType(rootPath),
+export async function inspectDataRootVolume(
+  rootPath: string,
+  options: DataRootVolumeInspectionOptions = {},
+): Promise<DataRootVolumeSnapshot> {
+  /** 两个系统查询独立结算，单字段失败不得丢失另一字段。 */
+  const [fileSystemResult, deviceResult] = await Promise.allSettled([
+    options.statfs?.(rootPath) ?? statfs(rootPath, { bigint: true }),
+    options.detectDeviceType?.(rootPath) ?? detectDataRootDeviceType(rootPath),
   ])
-  return {
-    availableBytes: toSafeByteCount(fileSystemStats.bavail * fileSystemStats.bsize),
-    deviceType,
+  const snapshot: DataRootVolumeSnapshot = {
+    deviceType: deviceResult.status === 'fulfilled' ? deviceResult.value : 'unknown',
   }
-}
-
-/** 默认目录枚举器，确保 Dir 句柄由异步迭代器正常关闭。 */
-async function* readDirectoryEntries(path: string): AsyncIterable<{ name: string }> {
-  const directory = await opendir(path)
-  for await (const entry of directory) yield { name: entry.name }
+  if (fileSystemResult.status === 'fulfilled') {
+    snapshot.availableBytes = toSafeByteCount(fileSystemResult.value.bavail * fileSystemResult.value.bsize)
+  } else {
+    snapshot.storageIssue = { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' }
+  }
+  return snapshot
 }
 
 /** 在每个批次边界检查取消与耗时预算。 */
@@ -373,6 +411,11 @@ function assertScanBudget(
 ): void {
   if (signal?.aborted) throw new DataRootScanError('SCAN_CANCELLED', '占用空间统计已取消')
   if (now() - startedAt > timeoutMs) throw new DataRootScanError('SCAN_TIMEOUT', '占用空间统计超时')
+}
+
+/** 返回当前扫描共享截止时间的剩余毫秒数。 */
+function remainingScanBudget(now: () => number, startedAt: number, timeoutMs: number): number {
+  return Math.max(0, timeoutMs - (now() - startedAt))
 }
 
 /** 让不原生支持 AbortSignal 的 lstat 也能及时结束等待。 */
@@ -405,13 +448,50 @@ async function raceWithScanBudget<T>(
   })
 }
 
-/** 把外部取消转发给同路径单飞扫描。 */
-function forwardAbort(signal: AbortSignal | undefined, controller: AbortController): () => void {
-  if (signal === undefined) return () => undefined
-  const handleAbort = (): void => controller.abort(signal.reason)
-  if (signal.aborted) handleAbort()
-  else signal.addEventListener('abort', handleAbort, { once: true })
-  return () => signal.removeEventListener('abort', handleAbort)
+/** 尽力关闭目录 iterator；关闭自身也受独立短预算约束。 */
+async function closeDirectoryIterator(
+  iterator: AsyncIterator<{ name: string }>,
+  directory: AsyncIterable<{ name: string }>,
+): Promise<void> {
+  /** Node Dir iterator 提供 return；自定义目录对象可能只提供 close。 */
+  const closeable = directory as AsyncIterable<{ name: string }> & { close?: () => Promise<void> }
+  const closeOperation = iterator.return !== undefined
+    ? Promise.resolve().then(async () => { await iterator.return?.() })
+    : closeable.close !== undefined
+      ? Promise.resolve().then(async () => { await closeable.close?.() })
+      : null
+  if (closeOperation === null) return
+  await raceWithScanBudget(closeOperation, undefined, DEFAULT_SCAN_CLOSE_TIMEOUT_MS).catch(() => undefined)
+}
+
+/** 消费者取消只结束自己的等待，不传播到共享单飞扫描。 */
+function waitForOccupiedConsumer(
+  inspection: Promise<DataRootOccupiedStorage>,
+  signal: AbortSignal | undefined,
+): Promise<DataRootOccupiedStorage> {
+  if (signal === undefined) return inspection
+  if (signal.aborted) return Promise.resolve(toOccupiedStorageIssue(new DataRootScanError(
+    'SCAN_CANCELLED',
+    '占用空间统计已取消',
+  )))
+  return new Promise((resolvePromise, rejectPromise) => {
+    let settled = false
+    const settle = (callback: () => void): void => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', handleAbort)
+      callback()
+    }
+    const handleAbort = (): void => settle(() => resolvePromise(toOccupiedStorageIssue(new DataRootScanError(
+      'SCAN_CANCELLED',
+      '占用空间统计已取消',
+    ))))
+    signal.addEventListener('abort', handleAbort, { once: true })
+    inspection.then(
+      (snapshot) => settle(() => resolvePromise(snapshot)),
+      (error: unknown) => settle(() => rejectPromise(error)),
+    )
+  })
 }
 
 /** 把扫描异常转换为不泄露路径的稳定 occupied 结果。 */
@@ -420,6 +500,7 @@ function toOccupiedStorageIssue(error: unknown): DataRootOccupiedStorage {
     ? error.code
     : isAbortError(error) ? 'SCAN_CANCELLED' : 'SCAN_FAILED'
   const messages: Record<DataRootStorageIssueCode, string> = {
+    CAPACITY_UNAVAILABLE: '可用空间暂不可用',
     SCAN_FAILED: '占用空间暂不可用',
     SCAN_LIMIT_EXCEEDED: '数据文件过多，暂无法统计占用空间',
     SCAN_TIMEOUT: '占用空间统计超时',

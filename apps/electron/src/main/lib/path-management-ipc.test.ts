@@ -650,6 +650,37 @@ describe('路径管理 IPC', () => {
     })
   })
 
+  test('Given 快速存储检查整体失败 When normal 查询状态 Then 保留 locator 状态并返回类型化容量问题', async () => {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      coordinator: {
+        getStatus: () => createLocatorResult().state,
+        createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }),
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+      inspectStorageFast: async () => { throw new Error('volume inspection failed') },
+    })
+    const getState = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE)
+    if (!getState) throw new Error('缺少 GET_STATE handler')
+
+    await expect(Promise.resolve(getState(expectedEvent))).resolves.toMatchObject({
+      activeRoot: '/data/proma',
+      availability: 'available',
+      deviceType: 'unknown',
+      occupiedStatus: 'loading',
+      storageIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+    })
+  })
+
   test('Given 普通或路径窗口之外的 sender When 调用敏感通道 Then 一律拒绝', () => {
     /** 分别保存 normal/recovery handler，模拟 planning/其他普通窗口直接 invoke。 */
     const registerMode = (mode: 'normal' | 'data-root-recovery'): Map<string, (...args: unknown[]) => unknown> => {

@@ -452,6 +452,19 @@ describe('DataRootMigrationCoordinator', () => {
     expect(existsSync(harness.lockPath)).toBe(false)
   })
 
+  test('Given 目标容量不可用 When 创建计划 Then 返回容量读取错误且无 locator 副作用', async () => {
+    const harness = createHarness({
+      inspectTargetVolume: async () => ({
+        deviceType: 'network',
+        storageIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+      }),
+    })
+
+    await expect(harness.coordinator.createPlan(targetRoot)).rejects.toMatchObject({ code: 'TARGET_NOT_WRITABLE' })
+    expect(existsSync(harness.locator.getLocatorPath())).toBe(false)
+    expect(existsSync(harness.lockPath)).toBe(false)
+  })
+
   test('Given 目标由即将生成的 migrationId sidecar 拥有 When 创建计划 Then 接受非空断点目标', async () => {
     mkdirSync(targetRoot)
     writeFileSync(join(targetRoot, 'partial.txt'), 'partial')

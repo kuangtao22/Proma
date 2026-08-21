@@ -740,7 +740,10 @@ export class DataRootMigrationCoordinator {
         throw new DataRootMigrationError('TARGET_NOT_WRITABLE', '无法读取目标磁盘可用空间', error)
       }
       if (token) this.throwIfCancelled(token)
-      if (!Number.isSafeInteger(availableBytes) || availableBytes < 0 || availableBytes < requiredBytes) {
+      if (availableBytes === undefined || !Number.isSafeInteger(availableBytes) || availableBytes < 0) {
+        throw new DataRootMigrationError('TARGET_NOT_WRITABLE', '无法读取目标磁盘可用空间')
+      }
+      if (availableBytes < requiredBytes) {
         throw new DataRootMigrationError('INSUFFICIENT_SPACE', '目标磁盘可用空间不足')
       }
     }

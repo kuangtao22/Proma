@@ -69,6 +69,14 @@ interface ExpectedPathManagementSettingsModule {
     isCurrent: (request: { generation: number; signal: AbortSignal }) => boolean
     dispose: () => void
   }
+  refreshPathManagementProgressStatus: (dependencies: {
+    gate: ReturnType<ExpectedPathManagementSettingsModule['createPathManagementRequestGate']>
+    getStatus: () => Promise<DataRootMigrationStatus>
+    getCurrentState: () => PathManagementState | null
+    commitStatus: (status: DataRootMigrationStatus) => void
+    loadState: () => Promise<void>
+    reportError: (error: unknown) => void
+  }) => Promise<void>
 }
 
 /** RED 阶段通过可选合同读取新增导出，避免模块不存在导致测试环境错误。 */
@@ -376,29 +384,73 @@ describe('PathManagementSettings', () => {
       occupiedStatus: 'unavailable',
       storageIssue: { code: 'SCAN_FAILED', message: '占用空间暂不可用' },
     })} />)
+    const capacityUnavailableHtml = renderToStaticMarkup(<DataRootLocationSection state={createState({
+      availableBytes: undefined,
+      storageIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+    })} />)
 
     expect(loadingHtml).toContain('正在计算')
     expect(loadingHtml).toContain('/Users/example/.proma')
     expect(unavailableHtml).toContain('占用空间暂不可用')
     expect(unavailableHtml).toContain('断连')
+    expect(capacityUnavailableHtml).toContain('可用 可用空间暂不可用')
   })
 
-  test('Given 慢旧请求、进度新请求与卸载 When 请求门控 Then 旧结果和卸载后结果不可提交', () => {
-    const { createPathManagementRequestGate } = getExpectedModule()
+  test('Given progress 早于 initial 返回 When 刷新状态 Then 触发新完整加载且旧 initial 不可提交', async () => {
+    const { createPathManagementRequestGate, refreshPathManagementProgressStatus } = getExpectedModule()
     expect(typeof createPathManagementRequestGate).toBe('function')
-    const gate = createPathManagementRequestGate()
-    const initialLoad = gate.begin()
-    const progressRefresh = gate.begin()
+    expect(typeof refreshPathManagementProgressStatus).toBe('function')
+    const stateLoadGate = createPathManagementRequestGate()
+    const progressRefreshGate = createPathManagementRequestGate()
+    stateLoadGate.mount()
+    progressRefreshGate.mount()
+    const oldInitialLoad = stateLoadGate.begin()
+    let currentState: PathManagementState | null = null
+    let replacementLoad: ReturnType<typeof stateLoadGate.begin> | undefined
+    let committedStatuses = 0
 
-    expect(initialLoad.signal.aborted).toBe(true)
-    expect(gate.isCurrent(initialLoad)).toBe(false)
-    expect(gate.isCurrent(progressRefresh)).toBe(true)
-    gate.dispose()
-    expect(progressRefresh.signal.aborted).toBe(true)
-    expect(gate.isCurrent(progressRefresh)).toBe(false)
-    gate.mount()
-    const strictModeRemount = gate.begin()
-    expect(gate.isCurrent(strictModeRemount)).toBe(true)
+    await refreshPathManagementProgressStatus({
+      gate: progressRefreshGate,
+      getStatus: async () => ({ migration: null }),
+      getCurrentState: () => currentState,
+      commitStatus: () => { committedStatuses += 1 },
+      loadState: async () => {
+        replacementLoad = stateLoadGate.begin()
+        currentState = createState()
+      },
+      reportError: () => undefined,
+    })
+
+    expect(oldInitialLoad.signal.aborted).toBe(true)
+    expect(stateLoadGate.isCurrent(oldInitialLoad)).toBe(false)
+    expect(replacementLoad === undefined ? false : stateLoadGate.isCurrent(replacementLoad)).toBe(true)
+    expect(committedStatuses).toBe(0)
+  })
+
+  test('Given progress 等待中卸载 When 状态晚返回 Then 不提交、不重载且 StrictMode 可重新挂载', async () => {
+    const { createPathManagementRequestGate, refreshPathManagementProgressStatus } = getExpectedModule()
+    const progressRefreshGate = createPathManagementRequestGate()
+    /** 外部 resolver 精确制造卸载后的晚返回。 */
+    let resolveStatus: ((status: DataRootMigrationStatus) => void) | undefined
+    let committedStatuses = 0
+    let loadCalls = 0
+    let errorCalls = 0
+    const refresh = refreshPathManagementProgressStatus({
+      gate: progressRefreshGate,
+      getStatus: async () => await new Promise((resolve) => { resolveStatus = resolve }),
+      getCurrentState: () => createState(),
+      commitStatus: () => { committedStatuses += 1 },
+      loadState: async () => { loadCalls += 1 },
+      reportError: () => { errorCalls += 1 },
+    })
+
+    progressRefreshGate.dispose()
+    resolveStatus?.({ migration: null })
+    await refresh
+    expect({ committedStatuses, loadCalls, errorCalls }).toEqual({ committedStatuses: 0, loadCalls: 0, errorCalls: 0 })
+    progressRefreshGate.mount()
+    const strictModeRemount = progressRefreshGate.begin()
+    expect(progressRefreshGate.isCurrent(strictModeRemount)).toBe(true)
   })
 
   test('Given 当前与上次数据根 When 渲染位置区块 Then 完整路径可访问且没有删除旧目录入口', () => {

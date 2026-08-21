@@ -213,8 +213,18 @@ export function registerPathManagementIpcHandlers(
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, async () => {
       const state = getCoordinator().getStatus()
       if (state.activeRoot === null || state.availability !== 'available') return state
-      const storage = await (options.inspectStorageFast ?? inspectDataRootStorageFast)(state.activeRoot)
-      return { ...state, ...storage }
+      try {
+        const storage = await (options.inspectStorageFast ?? inspectDataRootStorageFast)(state.activeRoot)
+        return { ...state, ...storage }
+      } catch {
+        /** 存储元数据异常不得抹掉 locator 与迁移状态。 */
+        return {
+          ...state,
+          deviceType: 'unknown' as const,
+          occupiedStatus: 'loading' as const,
+          storageIssue: { code: 'CAPACITY_UNAVAILABLE' as const, message: '可用空间暂不可用' },
+        }
+      }
     })
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_OCCUPIED_STORAGE, async () => {
       const state = getCoordinator().getStatus()

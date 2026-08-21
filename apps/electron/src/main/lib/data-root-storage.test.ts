@@ -12,6 +12,7 @@ interface ExpectedStorageModule {
     maxEntries?: number
     timeoutMs?: number
     now?: () => number
+    openDirectory?: (path: string) => Promise<AsyncIterable<{ name: string }>>
     readDirectory?: (path: string) => AsyncIterable<{ name: string }>
     lstat?: (path: string) => Promise<{
       size: bigint
@@ -20,6 +21,14 @@ interface ExpectedStorageModule {
     }>
   }) => Promise<number>
   toSafeByteCount: (value: bigint) => number
+  inspectDataRootVolume: (rootPath: string, options?: {
+    statfs: (path: string) => Promise<{ bavail: bigint; bsize: bigint }>
+    detectDeviceType: (path: string) => Promise<'local' | 'removable' | 'network' | 'unknown'>
+  }) => Promise<{
+    availableBytes?: number
+    deviceType: 'local' | 'removable' | 'network' | 'unknown'
+    storageIssue?: { code: string; message: string }
+  }>
   classifyMacDiskInfo: (xml: string) => 'local' | 'removable' | 'network' | 'unknown'
   classifyWindowsDriveType: (driveType: number) => 'local' | 'removable' | 'network' | 'unknown'
   classifyLinuxMountInfo: (
@@ -214,6 +223,89 @@ describe('数据根存储检查', () => {
     expect(inspector.getCachedOccupied('/data/proma')).toBeUndefined()
   })
 
+  test('Given opendir 或 iterator.next 永不返回 When 扫描 Then 共用截止时间超时并有界关闭', async () => {
+    const { scanDataRootBytes } = getExpectedStorageModule()
+    await expect(scanDataRootBytes('/data/proma', {
+      timeoutMs: 5,
+      openDirectory: async () => await new Promise(() => undefined),
+    })).rejects.toMatchObject({ code: 'SCAN_TIMEOUT' })
+
+    let returnCalls = 0
+    /** 模拟 next 与 return 都永久挂起的目录 iterator。 */
+    const hangingIterator: AsyncIterableIterator<{ name: string }> = {
+      [Symbol.asyncIterator]() { return this },
+      next: async () => await new Promise(() => undefined),
+      return: async () => {
+        returnCalls += 1
+        return await new Promise(() => undefined)
+      },
+    }
+    const result = Promise.race([
+      scanDataRootBytes('/data/proma', {
+        timeoutMs: 5,
+        openDirectory: async () => hangingIterator,
+      }).then(() => 'completed', (error: unknown) => error),
+      new Promise<'still-running'>((resolve) => setTimeout(() => resolve('still-running'), 100)),
+    ])
+    expect(await result).toMatchObject({ code: 'SCAN_TIMEOUT' })
+    expect(returnCalls).toBe(1)
+  })
+
+  test('Given abort 发生在 iterator.next 等待中 When 扫描 Then 立即取消并尽力关闭 iterator', async () => {
+    const { scanDataRootBytes } = getExpectedStorageModule()
+    const controller = new AbortController()
+    let returnCalls = 0
+    /** 精确等待扫描已进入 next，避免把用例退化成 openDirectory 前取消。 */
+    let markNextStarted: (() => void) | undefined
+    const nextStarted = new Promise<void>((resolve) => { markNextStarted = resolve })
+    /** 模拟 next 等待期间可正常 return 的目录 iterator。 */
+    const cancellableIterator: AsyncIterableIterator<{ name: string }> = {
+      [Symbol.asyncIterator]() { return this },
+      next: async () => {
+        markNextStarted?.()
+        return await new Promise(() => undefined)
+      },
+      return: async () => {
+        returnCalls += 1
+        return { done: true, value: undefined }
+      },
+    }
+    const scan = scanDataRootBytes('/data/proma', {
+      signal: controller.signal,
+      timeoutMs: 1000,
+      openDirectory: async () => cancellableIterator,
+    })
+    await nextStarted
+    controller.abort()
+
+    await expect(scan).rejects.toMatchObject({ code: 'SCAN_CANCELLED' })
+    expect(returnCalls).toBe(1)
+  })
+
+  test('Given 两个 waiter 复用扫描 When A 取消 Then B 仍完成并写入缓存', async () => {
+    const { DataRootStorageInspector } = getExpectedStorageModule()
+    let resolveInspection: ((value: number) => void) | undefined
+    let sharedSignal: AbortSignal | undefined
+    const inspector = new DataRootStorageInspector({
+      now: () => 1000,
+      cacheTtlMs: 5000,
+      inspectOccupiedFresh: async (_rootPath, options) => {
+        sharedSignal = options.signal
+        return await new Promise((resolve) => { resolveInspection = resolve })
+      },
+    })
+    const controllerA = new AbortController()
+    const waiterA = inspector.inspectOccupied('/data/proma', controllerA.signal)
+    const waiterB = inspector.inspectOccupied('/data/proma')
+    controllerA.abort()
+
+    expect(await waiterA).toMatchObject({ storageIssue: { code: 'SCAN_CANCELLED' } })
+    expect(sharedSignal?.aborted).toBe(false)
+    resolveInspection?.(42)
+    expect(await waiterB).toEqual({ occupiedBytes: 42, occupiedStatus: 'ready' })
+    expect(inspector.getCachedOccupied('/data/proma')).toEqual({ occupiedBytes: 42, occupiedStatus: 'ready' })
+  })
+
   test('Given lstat 永不返回或文件数超限 When 扫描 Then 按耗时和条目预算返回明确 issue', async () => {
     const { DataRootStorageInspector, scanDataRootBytes } = getExpectedStorageModule()
     const timeoutInspector = new DataRootStorageInspector({
@@ -281,6 +373,29 @@ describe('数据根存储检查', () => {
 
     expect(toSafeByteCount(1024n)).toBe(1024)
     expect(toSafeByteCount(BigInt(Number.MAX_SAFE_INTEGER) + 1n)).toBe(Number.MAX_SAFE_INTEGER)
+  })
+
+  test('Given statfs 失败但设备识别成功 When 检查卷 Then 保留设备类型并返回容量问题', async () => {
+    const { inspectDataRootVolume } = getExpectedStorageModule()
+    const result = await inspectDataRootVolume('/data/proma', {
+      statfs: async () => { throw new Error('capacity unavailable') },
+      detectDeviceType: async () => 'network',
+    })
+
+    expect(result).toEqual({
+      deviceType: 'network',
+      storageIssue: { code: 'CAPACITY_UNAVAILABLE', message: '可用空间暂不可用' },
+    })
+  })
+
+  test('Given 设备识别失败但 statfs 成功 When 检查卷 Then 保留容量并降级为 unknown', async () => {
+    const { inspectDataRootVolume } = getExpectedStorageModule()
+    const result = await inspectDataRootVolume('/data/proma', {
+      statfs: async () => ({ bavail: 10n, bsize: 4n }),
+      detectDeviceType: async () => { throw new Error('device unavailable') },
+    })
+
+    expect(result).toEqual({ availableBytes: 40, deviceType: 'unknown' })
   })
 
   test('Given macOS 卷元数据 When 分类 Then 优先识别网络、可移除与本地卷', () => {

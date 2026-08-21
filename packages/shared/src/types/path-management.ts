@@ -7,10 +7,15 @@ export type DataRootDeviceType = 'local' | 'removable' | 'network' | 'unknown'
 /** 数据根占用空间扫描状态。 */
 export type DataRootOccupiedStatus = 'loading' | 'ready' | 'unavailable'
 
-/** 占用空间扫描可公开给界面的稳定错误分类。 */
-export type DataRootStorageIssueCode = 'SCAN_FAILED' | 'SCAN_LIMIT_EXCEEDED' | 'SCAN_TIMEOUT' | 'SCAN_CANCELLED'
+/** 存储容量与占用扫描可公开给界面的稳定错误分类。 */
+export type DataRootStorageIssueCode =
+  | 'CAPACITY_UNAVAILABLE'
+  | 'SCAN_FAILED'
+  | 'SCAN_LIMIT_EXCEEDED'
+  | 'SCAN_TIMEOUT'
+  | 'SCAN_CANCELLED'
 
-/** 占用空间扫描问题，不暴露底层文件路径或系统错误详情。 */
+/** 存储检查问题，不暴露底层文件路径或系统错误详情。 */
 export interface DataRootStorageIssue {
   code: DataRootStorageIssueCode
   message: string

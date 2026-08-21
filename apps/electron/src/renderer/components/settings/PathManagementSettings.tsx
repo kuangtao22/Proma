@@ -231,6 +231,41 @@ export function createPathManagementRequestGate(): PathManagementRequestGate {
   }
 }
 
+/** 迁移进度状态刷新依赖，允许无 DOM 精确覆盖异步交错。 */
+export interface PathManagementProgressRefreshDependencies {
+  /** 只管理进度状态请求，不得与完整状态加载共用。 */
+  gate: PathManagementRequestGate
+  /** 读取轻量迁移状态。 */
+  getStatus(): Promise<DataRootMigrationStatus>
+  /** 读取最近一次已提交的完整路径状态。 */
+  getCurrentState(): PathManagementState | null
+  /** 把迁移状态合并到已有完整状态。 */
+  commitStatus(status: DataRootMigrationStatus): void
+  /** 完整状态尚未就绪时重新触发完整加载。 */
+  loadState(): Promise<void>
+  /** 报告当前代请求错误。 */
+  reportError(error: unknown): void
+}
+
+/** 独立刷新迁移状态；缺少完整状态时改为等待一次完整加载。 */
+export async function refreshPathManagementProgressStatus(
+  dependencies: PathManagementProgressRefreshDependencies,
+): Promise<void> {
+  /** 本次进度刷新代次。 */
+  const request = dependencies.gate.begin()
+  try {
+    const status = await dependencies.getStatus()
+    if (!dependencies.gate.isCurrent(request)) return
+    if (dependencies.getCurrentState() === null) {
+      await dependencies.loadState()
+      return
+    }
+    dependencies.commitStatus(status)
+  } catch (error) {
+    if (dependencies.gate.isCurrent(request)) dependencies.reportError(error)
+  }
+}
+
 /** 返回已知数据根设备类型对应的断连或性能提醒。 */
 export function getDataRootDeviceRisk(deviceType: PathManagementState['deviceType']): string | null {
   if (deviceType === 'network') return '网络数据位置断连时 Proma 将无法启动，访问性能也取决于网络质量。'
@@ -282,6 +317,10 @@ export function DataRootLocationSection({
     : state.occupiedStatus === 'unavailable'
       ? (state.storageIssue?.message ?? '占用空间暂不可用')
       : formatBytes(state.occupiedBytes)
+  /** 容量查询错误显示在可用空间字段，避免与独立占用扫描状态混淆。 */
+  const availableLabel = state.storageIssue?.code === 'CAPACITY_UNAVAILABLE'
+    ? state.storageIssue.message
+    : formatBytes(state.availableBytes)
   return (
     <SettingsSection
       title="Proma 数据位置"
@@ -315,7 +354,7 @@ export function DataRootLocationSection({
         >
           <div className="text-right text-xs text-muted-foreground">
             <div>{getAvailabilityLabel(state.availability)} · {getDeviceTypeLabel(state.deviceType)}</div>
-            <div className="mt-1 tabular-nums">已占用 {occupiedLabel} · 可用 {formatBytes(state.availableBytes)}</div>
+            <div className="mt-1 tabular-nums">已占用 {occupiedLabel} · 可用 {availableLabel}</div>
           </div>
         </SettingsRow>
         {state.previousRoot !== undefined ? (
@@ -428,13 +467,19 @@ export function PathManagementSettings(): React.ReactElement {
   const migrationFlowId = React.useRef(0)
   /** 防止进度事件并发查询相同迁移状态。 */
   const statusRefreshPending = React.useRef(false)
-  /** 状态、占用与用户动作分域门控，互不取消但各自只允许最新请求提交。 */
+  /** 当前进度刷新代次，防止 StrictMode 旧 finally 清除新周期 pending。 */
+  const statusRefreshId = React.useRef(0)
+  /** 完整状态、进度、占用与用户动作分域门控，互不取消但各自只允许最新请求提交。 */
   const stateRequestGate = React.useRef<PathManagementRequestGate | null>(null)
+  const progressRequestGate = React.useRef<PathManagementRequestGate | null>(null)
   const occupiedRequestGate = React.useRef<PathManagementRequestGate | null>(null)
   const actionRequestGate = React.useRef<PathManagementRequestGate | null>(null)
   if (stateRequestGate.current === null) stateRequestGate.current = createPathManagementRequestGate()
+  if (progressRequestGate.current === null) progressRequestGate.current = createPathManagementRequestGate()
   if (occupiedRequestGate.current === null) occupiedRequestGate.current = createPathManagementRequestGate()
   if (actionRequestGate.current === null) actionRequestGate.current = createPathManagementRequestGate()
+  /** 保存最近一次完整状态，供进度刷新判断是否可以安全合并。 */
+  const stateRef = React.useRef<PathManagementState | null>(null)
   /** 进度事件读取最新活动根，避免闭包持有旧首屏状态。 */
   const activeRootRef = React.useRef<string | null>(null)
 
@@ -468,6 +513,7 @@ export function PathManagementSettings(): React.ReactElement {
       ])
       if (!stateRequestGate.current.isCurrent(request)) return
       const mergedState = mergePathManagementStatus(nextState, migrationStatus)
+      stateRef.current = mergedState
       activeRootRef.current = mergedState.activeRoot
       setState(mergedState)
       dispatchUi({ type: 'load-succeeded' })
@@ -480,30 +526,49 @@ export function PathManagementSettings(): React.ReactElement {
 
   React.useEffect(() => {
     stateRequestGate.current?.mount()
+    progressRequestGate.current?.mount()
     occupiedRequestGate.current?.mount()
     actionRequestGate.current?.mount()
     void loadState()
     /** 进度事件先更新轻量进度，再串行刷新完整状态。 */
     const unsubscribe = window.electronAPI.onDataRootMigrationProgress((migration) => {
-      if (stateRequestGate.current === null) return
-      setState((current) => current === null ? current : { ...current, migration })
+      if (progressRequestGate.current === null) return
+      setState((current) => {
+        const nextState = current === null ? current : { ...current, migration }
+        stateRef.current = nextState
+        return nextState
+      })
       void refreshOccupied(activeRootRef.current)
       if (statusRefreshPending.current) return
       statusRefreshPending.current = true
-      const request = stateRequestGate.current.begin()
-      void window.electronAPI.getDataRootMigrationStatus().then((status) => {
-        if (!stateRequestGate.current?.isCurrent(request)) return
-        setState((current) => current === null ? current : mergePathManagementStatus(current, status))
-      }).catch((statusError: unknown) => {
-        if (stateRequestGate.current?.isCurrent(request)) {
+      const refreshId = statusRefreshId.current + 1
+      statusRefreshId.current = refreshId
+      void refreshPathManagementProgressStatus({
+        gate: progressRequestGate.current,
+        getStatus: window.electronAPI.getDataRootMigrationStatus,
+        getCurrentState: () => stateRef.current,
+        commitStatus: (status) => {
+          setState((current) => {
+            const nextState = current === null ? current : mergePathManagementStatus(current, status)
+            stateRef.current = nextState
+            return nextState
+          })
+        },
+        loadState,
+        reportError: (statusError) => {
           dispatchUi({ type: 'load-failed', message: toErrorMessage(statusError, '无法刷新迁移状态') })
-        }
-      }).finally(() => { statusRefreshPending.current = false })
+        },
+      }).finally(() => {
+        if (statusRefreshId.current === refreshId) statusRefreshPending.current = false
+      })
     })
     return () => {
       stateRequestGate.current?.dispose()
+      progressRequestGate.current?.dispose()
       occupiedRequestGate.current?.dispose()
       actionRequestGate.current?.dispose()
+      statusRefreshId.current += 1
+      statusRefreshPending.current = false
       migrationFlowId.current += 1
       confirmationResolver.current?.(false)
       confirmationResolver.current = null
