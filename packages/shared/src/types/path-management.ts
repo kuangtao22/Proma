@@ -46,6 +46,49 @@ export interface DataRootMigrationProgress {
   error?: string
 }
 
+/** 项目路径迁移从预检到完成的稳定执行阶段。 */
+export type WorkspaceRelocationStage =
+  | 'preflight'
+  | 'copying'
+  | 'verifying'
+  | 'committing'
+  | 'failed'
+  | 'completed'
+
+/** 当前允许占用工作区独占锁的操作类型。 */
+export type WorkspaceOperationKind = 'relocation'
+
+/** 启动项目路径迁移的共享请求。 */
+export interface StartWorkspaceRelocationInput {
+  workspaceId: string
+  /**
+   * Task 4 handler 只能接受主进程原生选择器已授权并重新验证的路径，
+   * 不得信任 renderer 直接传入的任意字符串。
+   */
+  targetRoot: string
+}
+
+/** 提供给界面的项目路径迁移进度。 */
+export interface WorkspaceRelocationProgress {
+  operationId: string
+  workspaceId: string
+  stage: WorkspaceRelocationStage
+  completedBytes: number
+  totalBytes: number
+  currentRelativePath?: string
+  error?: string
+}
+
+/** 路径管理界面使用的单个项目路径状态。 */
+export interface WorkspacePathState {
+  workspaceId: string
+  name: string
+  sourceRoot: string
+  kind: 'managed' | 'external'
+  availability: 'available' | 'missing' | 'unavailable'
+  relocation: WorkspaceRelocationProgress | null
+}
+
 /** 路径管理界面与主进程共享的当前状态。 */
 export interface PathManagementState {
   activeRoot: string | null
@@ -59,6 +102,11 @@ export interface PathManagementState {
   availableBytes?: number
   migration: DataRootMigrationProgress | null
   postCommitCleanup?: DataRootPostCommitCleanupProgress
+  /**
+   * normal settings 模式后续由 Task 4 填充；migration/recovery 轻量窗口不加载业务工作区，
+   * 避免状态生产者为了展示离线数据根恢复界面而访问不可用的数据根。
+   */
+  workspaces?: WorkspacePathState[]
 }
 
 /** 只读目标预检允许公开给用户处理的稳定错误分类。 */
@@ -233,6 +281,10 @@ export const PATH_MANAGEMENT_IPC_CHANNELS = {
   GET_DATA_ROOT_MIGRATION_STATUS: 'path-management:get-data-root-migration-status',
   RESUME_DATA_ROOT_MIGRATION: 'path-management:resume-data-root-migration',
   CANCEL_DATA_ROOT_MIGRATION: 'path-management:cancel-data-root-migration',
+  START_WORKSPACE_RELOCATION: 'path-management:start-workspace-relocation',
+  GET_WORKSPACE_RELOCATION_STATUS: 'path-management:get-workspace-relocation-status',
+  CANCEL_WORKSPACE_RELOCATION: 'path-management:cancel-workspace-relocation',
+  WORKSPACE_RELOCATION_PROGRESS: 'path-management:workspace-relocation-progress',
   RECOVER_DATA_ROOT: 'path-management:recover-data-root',
   OPEN_DATA_ROOT: 'path-management:open-data-root',
   EXIT_APP: 'path-management:exit-app',
