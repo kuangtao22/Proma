@@ -40,6 +40,9 @@ export interface DataRootMigrationStatus {
   postCommitCleanup?: DataRootPostCommitCleanupProgress
 }
 
+/** 设置页允许打开的数据根位置，禁止 renderer 传入任意文件系统路径。 */
+export type OpenDataRootTarget = 'current' | 'previous'
+
 /** 数据根不可用时允许用户选择的恢复动作。 */
 export type DataRootRecoveryAction = 'recheck' | 'relocate' | 'restore-previous'
 

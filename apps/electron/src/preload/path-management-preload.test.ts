@@ -84,13 +84,13 @@ describe('路径管理 preload API', () => {
     await invokeApi(api, 'pickDataRoot')
     await invokeApi(api, 'startDataRootMigration', '/data/new')
     await invokeApi(api, 'getDataRootMigrationStatus')
-    await invokeApi(api, 'openDataRoot')
+    await invokeApi(api, 'openDataRoot', 'previous')
     expect(recorded.invokes).toEqual([
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, args: ['/data/new'] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, args: [] },
-      { channel: PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, args: [] },
+      { channel: PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, args: ['previous'] },
     ])
   })
 

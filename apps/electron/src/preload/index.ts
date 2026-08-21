@@ -1190,11 +1190,6 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   /** 订阅菜单栏创建会话事件 */
   onTrayCreateSession: (callback: (data: TrayCreateSessionData) => void) => () => void
 
-  // ===== 数据迁移 =====
-
-  /** 在系统文件管理器中打开 Proma 数据文件夹 */
-  openMigrationDataFolder: () => Promise<void>
-
   // ===== 存储管理 =====
 
   /** 获取各目录存储统计 */
@@ -2784,8 +2779,6 @@ const electronAPI: ElectronAPI = {
     ipcRenderer.on(TRAY_IPC_CHANNELS.CREATE_SESSION, listener)
     return () => { ipcRenderer.removeListener(TRAY_IPC_CHANNELS.CREATE_SESSION, listener) }
   },
-
-  openMigrationDataFolder: () => ipcRenderer.invoke(PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT),
 
   // ===== 存储管理 =====
 

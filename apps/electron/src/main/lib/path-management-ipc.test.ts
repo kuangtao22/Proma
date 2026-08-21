@@ -88,6 +88,72 @@ describe('数据根启动模式', () => {
   })
 })
 
+describe('数据根目录打开', () => {
+  /** 注册 normal 模式并返回 OPEN_DATA_ROOT handler 与实际打开记录。 */
+  function createOpenDataRootHarness(previousRoot?: string): {
+    open: (...args: unknown[]) => unknown
+    openedPaths: string[]
+  } {
+    /** 保存测试所需的通道 handler。 */
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    /** 保存 shell 实际收到的可信路径。 */
+    const openedPaths: string[] = []
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      shell: {
+        openPath: async (path) => {
+          openedPaths.push(path)
+          return ''
+        },
+      },
+      coordinator: {
+        getStatus: () => ({
+          activeRoot: '/data/current',
+          ...(previousRoot === undefined ? {} : { previousRoot }),
+          availability: 'available',
+          deviceType: 'local',
+          migration: null,
+        }),
+        createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }),
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+    })
+    const open = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT)
+    if (!open) throw new Error('缺少打开数据根 handler')
+    return { open, openedPaths }
+  }
+
+  test('Given 存在上次数据根 When 打开 previous Then 只打开 locator 中的 previousRoot', async () => {
+    const harness = createOpenDataRootHarness('/data/previous')
+
+    await harness.open(expectedEvent, 'previous')
+
+    expect(harness.openedPaths).toEqual(['/data/previous'])
+  })
+
+  test('Given 不存在上次数据根 When 打开 previous Then 明确拒绝且不打开其他目录', async () => {
+    const harness = createOpenDataRootHarness()
+
+    expect(harness.open(expectedEvent, 'previous')).rejects.toThrow('当前没有可打开的上次数据根目录')
+    expect(harness.openedPaths).toEqual([])
+  })
+
+  test('Given renderer 传入任意路径 When 打开数据根 Then 运行时拒绝不可信目标', async () => {
+    const harness = createOpenDataRootHarness('/data/previous')
+
+    expect(harness.open(expectedEvent, '/tmp/untrusted')).rejects.toThrow('数据根打开目标无效')
+    expect(harness.openedPaths).toEqual([])
+  })
+})
+
 describe('路径管理 IPC', () => {
   test('Given recovery 模式 When 注册 IPC Then 不读取或构造迁移协调器', () => {
     /** 通过 getter 证明 recovery 注册链没有触碰协调器依赖。 */

@@ -5,6 +5,7 @@ import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import type {
   DataRootMigrationProgress,
   DataRootStartupMode,
+  OpenDataRootTarget,
   PathManagementState,
   RecoverDataRootInput,
 } from '@proma/shared'
@@ -279,22 +280,38 @@ export function registerPathManagementIpcHandlers(
     })
   }
 
-  register(PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, async () => {
+  register(PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, async (_event, rawTarget) => {
     if (!options.shell) throw new Error('当前环境不支持打开数据根目录')
+    /** 省略参数兼容旧调用；其他输入必须是固定枚举，禁止 renderer 指定任意路径。 */
+    const target: OpenDataRootTarget = rawTarget === undefined ? 'current' : assertOpenDataRootTarget(rawTarget)
     /** 优先使用新鲜 recovery 状态，普通模式复用协调器状态。 */
-    const activeRoot = options.mode === 'data-root-recovery'
-      ? inspectFresh().state.activeRoot
-      : getCoordinator().getStatus().activeRoot
-    if (activeRoot === null) throw new Error('当前没有可打开的数据根目录')
+    const resolvedState = options.mode === 'data-root-recovery'
+      ? inspectFresh().state
+      : getCoordinator().getStatus()
+    /** 目录只能来自可信 locator 状态。 */
+    const root = target === 'previous' ? resolvedState.previousRoot : resolvedState.activeRoot
+    if (!root) {
+      throw new Error(target === 'previous'
+        ? '当前没有可打开的上次数据根目录'
+        : '当前没有可打开的数据根目录')
+    }
     /** Electron openPath 成功时返回空字符串，失败时返回错误摘要。 */
-    const error = await options.shell.openPath(activeRoot)
-    if (error) throw new Error(error)
+    const error = await options.shell.openPath(root)
+    if (error) {
+      throw new Error(target === 'previous' ? `无法打开上次数据根目录：${error}` : error)
+    }
   })
   if (options.mode !== 'normal') {
     register(PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP, () => { options.app.quit() })
   }
 
   return registeredChannels
+}
+
+/** 运行时校验打开目标，避免 renderer 绕过 locator 打开任意路径。 */
+function assertOpenDataRootTarget(value: unknown): OpenDataRootTarget {
+  if (value === 'current' || value === 'previous') return value
+  throw new Error('数据根打开目标无效')
 }
 
 /** 拒绝任何非当前模式预期窗口发起的路径 IPC。 */

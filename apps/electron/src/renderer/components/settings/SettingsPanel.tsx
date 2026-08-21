@@ -64,7 +64,7 @@ import { ToolSettings } from "./ToolSettings";
 import { BotHubSettings } from "./BotHubSettings";
 import { ShortcutSettings } from "./ShortcutSettings";
 import { VoiceInputSettings } from "./VoiceInputSettings";
-import { MigrationSettings } from "./MigrationSettings";
+import { PathManagementSettings } from "./PathManagementSettings";
 import { StorageSettings } from "./StorageSettings";
 import { OnboardingSettings } from "./OnboardingSettings";
 import { useOpenSession } from '@/hooks/useOpenSession'
@@ -117,7 +117,7 @@ const VOICE_INPUT_TAB: TabItem = {
 };
 /** 尾部 Tabs */
 const TAIL_TABS: TabItem[] = [
-  { id: "migration", label: "数据迁移", icon: <HardDriveDownload size={16} /> },
+  { id: "migration", label: "路径与迁移", icon: <HardDriveDownload size={16} /> },
   { id: "storage", label: "磁盘管理", icon: <HardDrive size={16} /> },
   { id: "appearance", label: "外观设置", icon: <Palette size={16} /> },
   ONBOARDING_TAB,
@@ -150,7 +150,7 @@ function renderTabContent(tab: SettingsTab): React.ReactElement {
     case "voice-input":
       return <VoiceInputSettings />;
     case "migration":
-      return <MigrationSettings />;
+      return <PathManagementSettings />;
     case "storage":
       return <StorageSettings />;
     case "onboarding":
