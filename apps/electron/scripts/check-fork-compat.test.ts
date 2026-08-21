@@ -377,6 +377,21 @@ describe('fork 上游兼容检查器', () => {
     expect(getCheck(files, 'bridge-composition').passed).toBe(true)
   })
 
+  test('Given gated dynamic 模式额外加载明确非目标模块 When 检查 Bridge 组合点 Then 仍通过', () => {
+    /** 可静态求值为非 LAN 目标的额外动态依赖不破坏目标模块闭集。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/index.ts': `
+        const unrelatedModule = './lib/unrelated-runtime'
+        void import(unrelatedModule)
+        require('./lib/' + 'other-runtime')
+        ${createGatedBridgeMain()}
+      `,
+    }
+
+    expect(getCheck(files, 'bridge-composition').passed).toBe(true)
+  })
+
   /** 延迟加载只允许精确模块、直接 bootstrap 路径和 normal gate 后顺序。 */
   const invalidGatedBridgeCases = [
     {
@@ -427,6 +442,47 @@ describe('fork 上游兼容检查器', () => {
       name: 'normal gate 前存在 CommonJS require',
       mutate: (source: string) => `
         require('./lib/lan-bridge/lan-bridge')
+        ${source}
+      `,
+    },
+    {
+      name: 'normal gate 前 const specifier 指向目标 dynamic import',
+      mutate: (source: string) => `
+        const lanModule = './lib/lan-bridge/lan-bridge'
+        void import(lanModule)
+        ${source}
+      `,
+    },
+    {
+      name: 'normal gate 前 const alias chain 指向目标 dynamic import',
+      mutate: (source: string) => `
+        const lanModuleBase = './lib/lan-bridge/'
+        const lanModule = lanModuleBase + 'lan-bridge'
+        const lanModuleAlias = lanModule
+        void import(lanModuleAlias)
+        ${source}
+      `,
+    },
+    {
+      name: 'normal gate 前字符串拼接指向目标 CommonJS require',
+      mutate: (source: string) => `
+        require('./lib/lan-bridge/' + 'lan-bridge')
+        ${source}
+      `,
+    },
+    {
+      name: 'normal gate 前未知 dynamic import',
+      mutate: (source: string) => `
+        let runtimeModule = './lib/unrelated-runtime'
+        runtimeModule = resolveRuntimeModule()
+        void import(runtimeModule)
+        ${source}
+      `,
+    },
+    {
+      name: 'normal gate 前未知 CommonJS require',
+      mutate: (source: string) => `
+        require(resolveRuntimeModule())
         ${source}
       `,
     },

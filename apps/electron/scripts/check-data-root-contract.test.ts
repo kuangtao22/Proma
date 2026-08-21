@@ -196,6 +196,120 @@ describe('数据根合同检查器', () => {
     }
   })
 
+  test('Given 同一语句包含多次路径定义 When 流入文件 sink Then 按执行顺序取最后定义', () => {
+    /** declaration initializer、内嵌赋值与 comma sequence 必须共享同一有序定义事件流。 */
+    const rootDir = createFixture({
+      'apps/electron/src/main/unsafe-variable-statement.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json', sideEffect = (runtimePath = '~/.proma/settings.json')
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/safe-variable-statement.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '~/.proma/settings.json', sideEffect = (runtimePath = '/tmp/safe.json')
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/unsafe-comma-sequence.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/initial.json'
+        runtimePath = '/tmp/safe.json', runtimePath = '~/.proma/settings.json'
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/safe-comma-sequence.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/initial.json'
+        runtimePath = '~/.proma/settings.json', runtimePath = '/tmp/safe.json'
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/sink-before-comma-sequence.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        readFileSync(runtimePath, 'utf8')
+        runtimePath = '/tmp/other.json', runtimePath = '~/.proma/settings.json'
+      `,
+    })
+
+    try {
+      expect(findHardcodedDataRoots(rootDir)).toEqual([
+        'apps/electron/src/main/unsafe-comma-sequence.ts',
+        'apps/electron/src/main/unsafe-variable-statement.ts',
+      ])
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 路径赋值位于明确 IIFE 或未调用函数 When 流入文件 sink Then 只执行 IIFE 定义事件', () => {
+    /** 仅语法上明确立即调用的 function/arrow 才参与当前控制流。 */
+    const rootDir = createFixture({
+      'apps/electron/src/main/unsafe-function-iife.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        ;(function () { runtimePath = '~/.proma/settings.json' })()
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/unsafe-arrow-iife.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        ;(() => { runtimePath = '~/.proma/settings.json' })()
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/safe-ordered-iife.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/initial.json'
+        ;(() => {
+          runtimePath = '~/.proma/settings.json'
+          runtimePath = '/tmp/safe.json'
+        })()
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/unsafe-complex-iife.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        ;(() => { if (shouldUseLegacyRoot) runtimePath = '~/.proma/settings.json' })()
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/unsafe-returning-iife.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/initial.json'
+        ;(() => {
+          runtimePath = '~/.proma/settings.json'
+          if (shouldStop) return
+          runtimePath = '/tmp/safe.json'
+        })()
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/uninvoked-functions.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        function mutateDeclaration(): void { runtimePath = '~/.proma/declaration.json' }
+        const mutateExpression = function (): void { runtimePath = '~/.proma/expression.json' }
+        const mutateArrow = (): void => { runtimePath = '~/.proma/arrow.json' }
+        void mutateDeclaration
+        void mutateExpression
+        void mutateArrow
+        readFileSync(runtimePath, 'utf8')
+      `,
+      'apps/electron/src/main/iife-after-sink.ts': `
+        import { readFileSync } from 'node:fs'
+        let runtimePath = '/tmp/safe.json'
+        readFileSync(runtimePath, 'utf8')
+        ;(() => { runtimePath = '~/.proma/settings.json' })()
+      `,
+    })
+
+    try {
+      expect(findHardcodedDataRoots(rootDir)).toEqual([
+        'apps/electron/src/main/unsafe-arrow-iife.ts',
+        'apps/electron/src/main/unsafe-complex-iife.ts',
+        'apps/electron/src/main/unsafe-function-iife.ts',
+        'apps/electron/src/main/unsafe-returning-iife.ts',
+      ])
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true })
+    }
+  })
+
   test('Given fs promises 的真实 import 绑定 When 路径流入异步文件 API Then 全部识别且不误报 shadow', () => {
     /** promises 子模块、promises 属性与 named alias 都应归一为同一类 fs sink。 */
     const rootDir = createFixture({

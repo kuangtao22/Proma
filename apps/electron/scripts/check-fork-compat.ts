@@ -131,6 +131,14 @@ interface TypeScriptBindingContext {
   checker: ts.TypeChecker
 }
 
+/** gated LAN 动态依赖闭集的审计结果。 */
+interface GatedLanDependencyAudit {
+  /** 允许点之外存在可静态证明指向 LAN 目标的运行时依赖。 */
+  hasExtraTarget: boolean
+  /** 允许点之外存在无法静态求值的动态 import 或未绑定 require。 */
+  hasUnknownDynamicDependency: boolean
+}
+
 /** 创建一个成功或失败格式一致的检查结果。 */
 function createResult(
   id: string,
@@ -220,15 +228,56 @@ function hasRuntimeExport(node: ts.ExportDeclaration): boolean {
   return node.exportClause.elements.some((element) => !element.isTypeOnly)
 }
 
-/** 统计绑定明确的目标模块运行时依赖，排除 type-only 与局部 shadow require。 */
-function countRuntimeDependenciesForModule(
+/** cycle-safe 求值同文件 const 字符串、alias 与 `+` 拼接。 */
+function evaluateStaticString(
+  rawExpression: ts.Expression | undefined,
+  context: TypeScriptBindingContext,
+  visitedSymbols: Set<ts.Symbol> = new Set(),
+): string | undefined {
+  if (!rawExpression) return undefined
+  /** 类型包装和括号不改变静态字符串值。 */
+  const expression = unwrapTypeScriptExpression(rawExpression)
+  if (ts.isStringLiteralLike(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
+    return expression.text
+  }
+  if (
+    ts.isBinaryExpression(expression)
+    && expression.operatorToken.kind === ts.SyntaxKind.PlusToken
+  ) {
+    /** `+` 只有两侧都能证明为字符串时才可静态拼接。 */
+    const left = evaluateStaticString(expression.left, context, visitedSymbols)
+    const right = evaluateStaticString(expression.right, context, visitedSymbols)
+    return left === undefined || right === undefined ? undefined : left + right
+  }
+  if (!ts.isIdentifier(expression)) return undefined
+  /** const alias 必须绑定到同文件单一 initializer，let/var 与循环引用均返回未知。 */
+  const symbol = context.checker.getSymbolAtLocation(expression)
+  if (!symbol || visitedSymbols.has(symbol)) return undefined
+  const declaration = symbol.valueDeclaration
+  if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer) return undefined
+  const declarationList = declaration.parent
+  if (!ts.isVariableDeclarationList(declarationList) || !(declarationList.flags & ts.NodeFlags.Const)) {
+    return undefined
+  }
+  visitedSymbols.add(symbol)
+  const value = evaluateStaticString(declaration.initializer, context, visitedSymbols)
+  visitedSymbols.delete(symbol)
+  return value
+}
+
+/** 审计 gated 模式的 LAN 运行时依赖，只豁免已验证的相邻 dynamic import。 */
+function auditGatedLanRuntimeDependencies(
   context: TypeScriptBindingContext,
   modulePath: string,
-): number {
-  /** 当前文件中会求值目标模块的依赖数量。 */
-  let count = 0
-  /** 只接受精确字符串模块说明符。 */
-  const isTargetModule = (expression: ts.Expression | undefined): boolean => (
+  allowedDynamicImport: ts.CallExpression | undefined,
+): GatedLanDependencyAudit {
+  /** 当前文件的闭集审计累计结果。 */
+  const audit: GatedLanDependencyAudit = {
+    hasExtraTarget: false,
+    hasUnknownDynamicDependency: false,
+  }
+  /** 静态 import/export/import= 的模块说明符只能是字面量。 */
+  const isTargetLiteral = (expression: ts.Expression | undefined): boolean => (
     expression !== undefined
     && ts.isStringLiteralLike(expression)
     && expression.text === modulePath
@@ -237,32 +286,36 @@ function countRuntimeDependenciesForModule(
     if (
       ts.isImportDeclaration(node)
       && hasRuntimeImport(node.importClause)
-      && isTargetModule(node.moduleSpecifier)
-    ) count += 1
+      && isTargetLiteral(node.moduleSpecifier)
+    ) audit.hasExtraTarget = true
     else if (
       ts.isExportDeclaration(node)
       && node.moduleSpecifier
       && hasRuntimeExport(node)
-      && isTargetModule(node.moduleSpecifier)
-    ) count += 1
+      && isTargetLiteral(node.moduleSpecifier)
+    ) audit.hasExtraTarget = true
     else if (
       ts.isImportEqualsDeclaration(node)
       && !node.isTypeOnly
       && ts.isExternalModuleReference(node.moduleReference)
-      && isTargetModule(node.moduleReference.expression)
-    ) count += 1
-    else if (ts.isCallExpression(node) && isTargetModule(node.arguments[0])) {
-      /** import() 无本地 binding；require 仅在未绑定全局形态下算 CommonJS 依赖。 */
+      && isTargetLiteral(node.moduleReference.expression)
+    ) audit.hasExtraTarget = true
+    else if (ts.isCallExpression(node) && node !== allowedDynamicImport) {
+      /** import() 无本地 binding；require 仅在未绑定全局形态下进入保守闭集。 */
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword
       const isUnboundRequire = ts.isIdentifier(node.expression)
         && node.expression.text === 'require'
         && context.checker.getSymbolAtLocation(node.expression) === undefined
-      if (isDynamicImport || isUnboundRequire) count += 1
+      if (isDynamicImport || isUnboundRequire) {
+        const specifier = evaluateStaticString(node.arguments[0], context)
+        if (specifier === undefined) audit.hasUnknownDynamicDependency = true
+        else if (specifier === modulePath) audit.hasExtraTarget = true
+      }
     }
     ts.forEachChild(node, visit)
   }
   visit(context.sourceFile)
-  return count
+  return audit
 }
 
 /** 提取源码中真实存在的运行时模块依赖，覆盖静态、动态、require 与 re-export。 */
@@ -592,6 +645,50 @@ function hasNormalModeGuardBefore(statements: readonly ts.Statement[], beforeInd
     return ts.isBlock(statement.thenStatement)
       && statement.thenStatement.statements.some(ts.isReturnStatement)
   })
+}
+
+/** 返回 gated 注册紧邻且由 normal guard 保护的唯一允许 dynamic import 调用。 */
+function findAllowedGatedLanDynamicImport(
+  bootstrap: ts.FunctionDeclaration | undefined,
+  registerBridgeBindings: ReadonlyMap<string, ts.Symbol>,
+  deferredFactoryBindings: ReadonlyMap<string, ts.Symbol>,
+  eventBusBindings: ReadonlyMap<string, ts.Symbol>,
+  checker: ts.TypeChecker,
+  modulePath: string,
+): ts.CallExpression | undefined {
+  if (!bootstrap?.body || deferredFactoryBindings.size === 0) return undefined
+  /** bootstrap 直接语句用于证明 guard、import 与 registration 的相邻顺序。 */
+  const statements = bootstrap.body.statements
+  for (const [index, statement] of statements.entries()) {
+    if (
+      !ts.isExpressionStatement(statement)
+      || !isLanBridgeRegistrationCall(
+        statement.expression,
+        registerBridgeBindings,
+        deferredFactoryBindings,
+        eventBusBindings,
+        checker,
+        true,
+      )
+      || !statementDeclaresDeferredBinding(statements[index - 1], deferredFactoryBindings, checker)
+      || !hasNormalModeGuardBefore(statements, index - 1)
+    ) continue
+    /** 前一条声明中精确目标 dynamic import 是本文件唯一允许的运行时加载点。 */
+    let allowedImport: ts.CallExpression | undefined
+    const visit = (node: ts.Node): void => {
+      if (
+        !allowedImport
+        && ts.isCallExpression(node)
+        && node.expression.kind === ts.SyntaxKind.ImportKeyword
+        && ts.isStringLiteralLike(node.arguments[0])
+        && node.arguments[0].text === modulePath
+      ) allowedImport = node
+      if (!allowedImport) ts.forEachChild(node, visit)
+    }
+    visit(statements[index - 1]!)
+    if (allowedImport) return allowedImport
+  }
+  return undefined
 }
 
 /** 统计 normal gate 后在 bootstrap 直接路径完成的延迟 LAN 注册。 */
@@ -1109,16 +1206,29 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     './lib/lan-bridge/lan-bridge',
     'createLanBridgeRegistration',
   )
-  /** 动态门控模式只允许注册相邻的唯一目标模块 dynamic import。 */
-  const hasUnexpectedLanRuntimeDependency = deferredFactoryBindings.size > 0
-    && countRuntimeDependenciesForModule(mainContext, './lib/lan-bridge/lan-bridge') !== 1
-  /** 静态与受控延迟 factory 都以 symbol identity 参与重复注册统计。 */
-  const allFactoryBindings = new Map([...factoryBindings, ...deferredFactoryBindings])
   const eventBusBindings = collectImportedLocalBindings(
     mainContext,
     './lib/agent-service',
     'agentEventBus',
   )
+  /** 找出唯一允许的 gated import，再对其余动态依赖做保守静态求值。 */
+  const allowedLanDynamicImport = findAllowedGatedLanDynamicImport(
+    bootstrap,
+    registerBridgeBindings,
+    deferredFactoryBindings,
+    eventBusBindings,
+    mainContext.checker,
+    './lib/lan-bridge/lan-bridge',
+  )
+  const gatedLanDependencyAudit = deferredFactoryBindings.size > 0
+    ? auditGatedLanRuntimeDependencies(
+        mainContext,
+        './lib/lan-bridge/lan-bridge',
+        allowedLanDynamicImport,
+      )
+    : { hasExtraTarget: false, hasUnknownDynamicDependency: false }
+  /** 静态与受控延迟 factory 都以 symbol identity 参与重复注册统计。 */
+  const allFactoryBindings = new Map([...factoryBindings, ...deferredFactoryBindings])
   /** 只统计真实 registry 与 LAN factory 组合的注册调用。 */
   const registrationCount = countLanBridgeRegistrations(
     mainSource,
@@ -1160,8 +1270,11 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
   if (registrationCount !== 1 || topLevelRegistrationCount + gatedRegistrationCount !== 1) {
     details.push('主进程必须且只能在 Program 顶层或数据根 normal gate 后注册一次 createLanBridgeRegistration(agentEventBus)')
   }
-  if (hasUnexpectedLanRuntimeDependency) {
+  if (gatedLanDependencyAudit.hasExtraTarget) {
     details.push('数据根 gated dynamic 模式只允许 normal gate 后与注册相邻的唯一 LAN Bridge dynamic import')
+  }
+  if (gatedLanDependencyAudit.hasUnknownDynamicDependency) {
+    details.push('数据根 gated dynamic 模式存在无法静态求值的额外 import()/require()，为保证 LAN 依赖闭集已 fail closed')
   }
   if (!hasReachableStart) details.push('主进程 bootstrap 可达顶层路径未启动统一 Bridge 生命周期')
   if (!registrationFactory) details.push('LAN Bridge 未导出 createLanBridgeRegistration')

@@ -358,16 +358,16 @@ function nodeContainsDataRootLiteral(node: ts.Node): boolean {
   return found
 }
 
-/** 判断语句是否在非线性或复杂位置把固定根写入指定 symbol。 */
-function statementHasUncertainHardcodedWrite(
-  statement: ts.Statement,
+/** 判断节点是否在非线性或复杂位置把固定根写入指定 symbol。 */
+function nodeHasHardcodedWrite(
+  root: ts.Node,
   symbol: ts.Symbol,
   context: TypeScriptBindingContext,
 ): boolean {
-  /** 当前语句中是否发现无法作为直接 reaching definition 建模的写入。 */
+  /** 当前节点中是否发现无法作为顺序定义事件建模的写入。 */
   let found = false
   const visit = (node: ts.Node): void => {
-    if (found || (node !== statement && isFunctionBoundary(node))) return
+    if (found || isFunctionBoundary(node)) return
     if (
       ts.isBinaryExpression(node)
       && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
@@ -382,8 +382,90 @@ function statementHasUncertainHardcodedWrite(
     }
     ts.forEachChild(node, visit)
   }
-  visit(statement)
+  visit(root)
   return found
+}
+
+/** 去除 IIFE callee 外层不改变函数值的括号与类型包装。 */
+function getImmediatelyInvokedFunction(expression: ts.Expression): ts.FunctionExpression | ts.ArrowFunction | undefined {
+  /** 当前调用目标去除括号与类型包装后的表达式。 */
+  const callee = unwrapExpression(expression)
+  return ts.isFunctionExpression(callee) || ts.isArrowFunction(callee) ? callee : undefined
+}
+
+/** 判断表达式是否包含无法线性确定执行分支的短路或条件求值。 */
+function isNonLinearExpression(expression: ts.Expression): boolean {
+  if (ts.isConditionalExpression(expression)) return true
+  return ts.isBinaryExpression(expression)
+    && (
+      expression.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+      || expression.operatorToken.kind === ts.SyntaxKind.BarBarToken
+      || expression.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken
+    )
+}
+
+/** 按明确执行顺序收集表达式中对指定 symbol 的定义事件。 */
+function collectExpressionDefinitionEvents(
+  rawExpression: ts.Expression,
+  symbol: ts.Symbol,
+  context: TypeScriptBindingContext,
+): ReachingDefinition[] {
+  /** 去除不改变求值顺序的包装。 */
+  const expression = unwrapExpression(rawExpression)
+  if (isFunctionBoundary(expression)) return []
+  if (isNonLinearExpression(expression)) {
+    return nodeHasHardcodedWrite(expression, symbol, context)
+      ? [{ found: true, uncertain: true }]
+      : []
+  }
+  if (ts.isCallExpression(expression)) {
+    /** 参数在函数体前求值；直接 function/arrow callee 才展开为当前执行流。 */
+    const events = expression.arguments.flatMap((argument) => (
+      collectExpressionDefinitionEvents(argument, symbol, context)
+    ))
+    const invokedFunction = getImmediatelyInvokedFunction(expression.expression)
+    if (!invokedFunction) return events
+    if (ts.isBlock(invokedFunction.body)) {
+      events.push(...collectSequentialDefinitionEvents(invokedFunction.body.statements, symbol, context))
+    } else {
+      events.push(...collectExpressionDefinitionEvents(invokedFunction.body, symbol, context))
+    }
+    return events
+  }
+  if (ts.isBinaryExpression(expression)) {
+    /** 赋值先求右值，再写入目标；comma 等普通二元表达式按左右顺序求值。 */
+    if (
+      expression.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+      && expression.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+    ) {
+      const events = collectExpressionDefinitionEvents(expression.right, symbol, context)
+      if (!assignmentTargetUsesSymbol(expression.left, symbol, context.checker)) return events
+      if (
+        expression.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        && ts.isIdentifier(expression.left)
+      ) {
+        events.push({ found: true, uncertain: false, value: expression.right })
+      } else if (
+        nodeContainsDataRootLiteral(expression.right)
+        || expressionContainsDataRootSegment(expression.right, context, new Set([symbol]))
+      ) {
+        events.push({ found: true, uncertain: true })
+      }
+      return events
+    }
+    return [
+      ...collectExpressionDefinitionEvents(expression.left, symbol, context),
+      ...collectExpressionDefinitionEvents(expression.right, symbol, context),
+    ]
+  }
+  /** 普通表达式按语法子节点顺序求值，并跳过未调用的函数体。 */
+  const events: ReachingDefinition[] = []
+  ts.forEachChild(expression, (child) => {
+    if (ts.isExpression(child)) {
+      events.push(...collectExpressionDefinitionEvents(child, symbol, context))
+    }
+  })
+  return events
 }
 
 /** 返回使用位置所在的直接语句及其顺序容器。 */
@@ -416,19 +498,25 @@ function bindingNameUsesSymbol(
   ))
 }
 
-/** 在单条顺序语句中提取指定 symbol 的直接定义。 */
-function getDirectDefinition(
+/** 在单条语句中按明确执行顺序提取指定 symbol 的定义事件。 */
+function collectStatementDefinitionEvents(
   statement: ts.Statement,
   symbol: ts.Symbol,
   context: TypeScriptBindingContext,
-): ReachingDefinition {
+): ReachingDefinition[] {
+  if (isFunctionBoundary(statement)) return []
   if (ts.isVariableStatement(statement)) {
+    /** 同一 VariableStatement 的 declarations 与 initializer 从左到右执行。 */
+    const events: ReachingDefinition[] = []
     for (const declaration of statement.declarationList.declarations) {
+      if (declaration.initializer) {
+        events.push(...collectExpressionDefinitionEvents(declaration.initializer, symbol, context))
+      }
       if (ts.isIdentifier(declaration.name) && context.checker.getSymbolAtLocation(declaration.name) === symbol) {
-        return { found: true, uncertain: false, value: declaration.initializer }
+        events.push({ found: true, uncertain: false, value: declaration.initializer })
       }
       if (!ts.isIdentifier(declaration.name) && bindingNameUsesSymbol(declaration.name, symbol, context.checker)) {
-        return {
+        events.push({
           found: true,
           uncertain: Boolean(
             declaration.initializer
@@ -437,23 +525,41 @@ function getDirectDefinition(
               || expressionContainsDataRootSegment(declaration.initializer, context, new Set([symbol]))
             )
           ),
-        }
+        })
       }
     }
+    return events
   }
-  if (ts.isExpressionStatement(statement) && ts.isBinaryExpression(statement.expression)) {
-    /** 仅简单标识符 `=` 可以确定性覆盖旧值。 */
-    const assignment = statement.expression
-    if (
-      assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken
-      && ts.isIdentifier(assignment.left)
-      && context.checker.getSymbolAtLocation(assignment.left) === symbol
-    ) return { found: true, uncertain: false, value: assignment.right }
+  if (ts.isExpressionStatement(statement)) {
+    return collectExpressionDefinitionEvents(statement.expression, symbol, context)
   }
-  if (statementHasUncertainHardcodedWrite(statement, symbol, context)) {
-    return { found: true, uncertain: true }
+  if (ts.isBlock(statement)) {
+    return collectSequentialDefinitionEvents(statement.statements, symbol, context)
   }
-  return { found: false, uncertain: false }
+  return nodeHasHardcodedWrite(statement, symbol, context)
+    ? [{ found: true, uncertain: true }]
+    : []
+}
+
+/** 合并顺序语句的定义事件；终止语句后的复杂控制流由 fail-closed 用例约束。 */
+function collectSequentialDefinitionEvents(
+  statements: readonly ts.Statement[],
+  symbol: ts.Symbol,
+  context: TypeScriptBindingContext,
+): ReachingDefinition[] {
+  /** 条件、循环或终止语句会让前后定义不再具有单一必然执行顺序。 */
+  const hasComplexControlFlow = statements.some((statement) => (
+    !ts.isVariableStatement(statement)
+    && !ts.isExpressionStatement(statement)
+    && !ts.isBlock(statement)
+    && !ts.isEmptyStatement(statement)
+    && !isFunctionBoundary(statement)
+  ))
+  if (
+    hasComplexControlFlow
+    && statements.some((statement) => nodeHasHardcodedWrite(statement, symbol, context))
+  ) return [{ found: true, uncertain: true }]
+  return statements.flatMap((statement) => collectStatementDefinitionEvents(statement, symbol, context))
 }
 
 /** 从使用位置向外按语句顺序查找同一 symbol 的最近定义。 */
@@ -469,8 +575,10 @@ function findReachingDefinition(
     if (!position || position.index < 0) return { found: false, uncertain: false }
     let latest: ReachingDefinition = { found: false, uncertain: false }
     for (let index = 0; index < position.index; index += 1) {
-      const definition = getDirectDefinition(position.container.statements[index]!, symbol, context)
-      if (definition.found) latest = definition
+      const events = collectStatementDefinitionEvents(position.container.statements[index]!, symbol, context)
+      for (const definition of events) {
+        if (definition.found) latest = definition
+      }
     }
     if (latest.found) return latest
     if (ts.isSourceFile(position.container)) return latest
