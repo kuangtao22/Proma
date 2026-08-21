@@ -78,6 +78,7 @@ import { claimWorkspaceMemoryRefreshOpportunity } from './agent-memory-refresh-s
 import { browserController } from './browser-controller'
 import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
+import { runAgentLifecycle } from './agent-run-lifecycle'
 
 /** Agent 入口使用会话元数据解析权威工作区，并共享进程级迁移锁。 */
 const workspaceOperationGuard = createWorkspaceOperationGuard({
@@ -712,14 +713,12 @@ export class AgentOrchestrator {
     }
 
     // 0. 工作区迁移准入必须早于运行槽、重试错误删除、消息落盘与任何 await。
-    const admission = workspaceOperationGuard.admitAgentRun({
+    return workspaceOperationGuard.runAdmittedAgentRun({
       sessionWorkspaceId: sessionMeta?.workspaceId,
       requestedWorkspaceId,
       onError: callbacks.onError,
       onComplete: completeBeforeRun,
-    })
-    if (!admission.admitted) return
-    const workspaceId = admission.workspaceId
+    }, async (workspaceId) => {
 
     // 0.1 并发保护
     const hasActiveRun = this.activeSessions.has(sessionId)
@@ -741,6 +740,16 @@ export class AgentOrchestrator {
     }
     runGeneration = ++this.nextRunGeneration
     this.activeSessions.set(sessionId, runGeneration)
+
+    await runAgentLifecycle({
+      isCurrent: () => this.activeSessions.get(sessionId) === runGeneration,
+      release: releaseActiveRun,
+      onStopped: () => {
+        this.consumeStoppedByUser(sessionId, runGeneration)
+        // 旧 generation 只能完成自己的回调，不能消费后来 generation 的 stoppedBeforeRun 标记。
+        callbacks.onComplete([], { startedAt: streamStartedAt, stoppedByUser: true })
+      },
+    }, async (checkpoint) => {
 
     // 手动重试直接删除原错误，避免它在下一轮完成后仍被历史回放。
     // 删除失败不阻断重试（例如旧版本遗留的无 UUID 错误）。
@@ -872,6 +881,7 @@ export class AgentOrchestrator {
         apiKey = decryptApiKey(channelId)
       }
     } catch (err) {
+      checkpoint()
       if (channel.provider === 'openai-codex' || channel.provider === 'xai') {
         const isXai = channel.provider === 'xai'
         reportPreflightError({
@@ -898,6 +908,7 @@ export class AgentOrchestrator {
       })
       return
     }
+    checkpoint()
 
     const appSettings = getSettings()
 
@@ -933,6 +944,7 @@ export class AgentOrchestrator {
 
     // 3. 构建 Pi runtime 环境（代理与 Windows shell 配置）。
     const proxyUrl = await getEffectiveProxyUrl()
+    checkpoint()
     const runtimeEnv = buildAgentRuntimeEnv({
       proxyUrl,
       runtimeStatus: getRuntimeStatus(),
@@ -980,6 +992,7 @@ export class AgentOrchestrator {
         if (activeWorktree) {
           const activeWorktreePath = getActiveWorktreePath(sessionMeta)
           const currentMainRepoRoot = activeWorktreePath ? await getMainRepoRoot(activeWorktreePath) : null
+          checkpoint()
           if (!activeWorktreePath || !currentMainRepoRoot || normalizePathForCompare(currentMainRepoRoot) !== normalizePathForCompare(activeWorktree.mainRepoRoot)) {
             console.warn(`[Agent 编排] 活动 worktree 已失效，回退默认 cwd: ${activeWorktree.path}`)
             sessionMeta = updateAgentSessionMeta(sessionId, { activeWorktree: undefined })
@@ -1029,6 +1042,7 @@ export class AgentOrchestrator {
       let piBuiltinTools: unknown[] = []
       let piMcpTools: unknown[] = []
       const piSdk = await import('@earendil-works/pi-coding-agent')
+      checkpoint()
       const builtinMcpResult = await buildPiBuiltinTools(piSdk, {
         sessionId,
         channelId,
@@ -1041,6 +1055,7 @@ export class AgentOrchestrator {
         triggeredBy: input.triggeredBy,
         windowsShellAvailable: process.platform !== 'win32' || runtimeEnv.shellKind != null,
       })
+      checkpoint()
       piBuiltinTools = builtinMcpResult.tools
       const collaborationAvailable = builtinMcpResult.collaborationAvailable
 
@@ -1053,6 +1068,7 @@ export class AgentOrchestrator {
         } catch (error) {
           console.warn('[Agent 编排] Pi MCP 工具桥接失败，已跳过用户 MCP:', error)
         }
+        checkpoint()
       }
 
       // 11. 构建动态上下文和最终 prompt
@@ -1387,6 +1403,7 @@ export class AgentOrchestrator {
         ? appSettings.agentMaxTurns
         : undefined
       const piReasoningCapability = await resolvePiReasoningCapability(channel.provider, selectedModelId)
+      checkpoint()
       const piThinkingLevel = resolvePiThinkingLevel(appSettings, sessionMeta, channel.provider, selectedModelId, piReasoningCapability)
       const projectInstructions = workspaceSlug
         ? (() => {
@@ -1595,6 +1612,7 @@ export class AgentOrchestrator {
 
         try {
           // 获取异步迭代器（手动 .next() 以支持 Promise.race 中断）
+          checkpoint()
           const queryIterable = this.adapter.query(queryOptions)
           const queryIterator = queryIterable[Symbol.asyncIterator]()
 
@@ -2123,6 +2141,8 @@ export class AgentOrchestrator {
       // 仅在会话真正删除时（DELETE_SESSION IPC）才清理。
       exitPlanService.clearSessionPending(sessionId)
     }
+    })
+    })
   }
 
   /**

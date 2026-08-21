@@ -44,6 +44,8 @@ import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
 import { sendAgentStreamComplete } from './agent-completion-payload'
 import { AgentStreamForwarder } from './agent-stream-forwarder'
 import { AgentQueueCoordinator } from './agent-queue-coordinator'
+import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
+import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 
 // ===== 实例创建 =====
 
@@ -52,6 +54,15 @@ const useUtilityAgentRuntime = process.env.PROMA_AGENT_RUNTIME !== 'in-process'
   && process.env.PROMA_AGENT_RUNTIME !== 'off'
 const adapter = useUtilityAgentRuntime ? new PiUtilityAdapter() : new PiAgentAdapter()
 const orchestrator = new AgentOrchestrator(adapter, eventBus)
+/** Agent service 与队列写入口共享的工作区迁移守卫。 */
+const workspaceOperationGuard = createWorkspaceOperationGuard({
+  getWorkspaceIdBySessionId: (sessionId) => {
+    const sessionMeta = getAgentSessionMeta(sessionId)
+    return sessionMeta ? sessionMeta.workspaceId ?? null : undefined
+  },
+  getWorkspaceIdBySlug: () => undefined,
+  getWorkspaceOperationBlockReason,
+})
 
 /** 导出 EventBus 供飞书 Bridge 等外部服务订阅事件 */
 export { eventBus as agentEventBus }
@@ -204,29 +215,10 @@ export async function runAgent(
   input: AgentSendInput,
   webContents: WebContents,
 ): Promise<void> {
-  // 更新 webContents 映射（允许覆盖 — 由 orchestrator.activeSessions 处理真正的并发保护）
-  registerWebContents(input.sessionId, webContents)
   // deferred queue runs carry their queue id as an internal extension.
   const queueMessageId = (input as Partial<AgentDeferredQueueMessageInput>).queueMessageId
-  // 开始新一轮执行时清除"完成未确认"标记
-  try {
-    updateAgentSessionMeta(input.sessionId, { completedButUnconfirmed: false })
-  } catch { /* 新会话可能尚未写入索引 */ }
-  // 自动任务会话"毕业"：用户手动发消息（非定时触发）即视为接管，标记后该会话回到普通项目列表，
-  // 调度器也不再复用它注入新的定时运行。
-  if (input.triggeredBy !== 'automation') {
-    try {
-      const meta = getAgentSessionMeta(input.sessionId)
-      if (meta?.sourceAutomationId && !meta.automationGraduated) {
-        updateAgentSessionMeta(input.sessionId, { automationGraduated: true })
-        // 向渲染进程发送毕业事件，触发 toast 提示
-        eventBus.emit(input.sessionId, {
-          kind: 'proma_event',
-          event: { type: 'automation_graduated' },
-        })
-      }
-    } catch { /* 新会话可能尚未写入索引 */ }
-  }
+  /** 标记当前入口是否真正通过 Orchestrator 准入并注册 renderer。 */
+  let runStarted = false
   try {
     await orchestrator.sendMessage(input, {
       onError: (error) => {
@@ -259,9 +251,34 @@ export async function runAgent(
         )
       },
       onRunStarted: ({ startedAt }) => {
-        eventBus.emit(input.sessionId, {
-          kind: 'proma_event',
-          event: { type: 'run_started', startedAt },
+        const sessionMeta = getAgentSessionMeta(input.sessionId)
+        workspaceOperationGuard.runAgentServiceEffects({
+          sessionWorkspaceId: sessionMeta?.workspaceId,
+          requestedWorkspaceId: input.workspaceId,
+        }, () => {
+          // 只有 Orchestrator 真正准入后才绑定 renderer 并修改会话状态。
+          registerWebContents(input.sessionId, webContents)
+          runStarted = true
+          try {
+            updateAgentSessionMeta(input.sessionId, { completedButUnconfirmed: false })
+          } catch { /* 新会话可能尚未写入索引 */ }
+          // 用户手动接管自动任务会话后，调度器不再复用它注入新运行。
+          if (input.triggeredBy !== 'automation') {
+            try {
+              const meta = getAgentSessionMeta(input.sessionId)
+              if (meta?.sourceAutomationId && !meta.automationGraduated) {
+                updateAgentSessionMeta(input.sessionId, { automationGraduated: true })
+                eventBus.emit(input.sessionId, {
+                  kind: 'proma_event',
+                  event: { type: 'automation_graduated' },
+                })
+              }
+            } catch { /* 新会话可能尚未写入索引 */ }
+          }
+          eventBus.emit(input.sessionId, {
+            kind: 'proma_event',
+            event: { type: 'run_started', startedAt },
+          })
         })
       },
       onTitleUpdated: (title) => {
@@ -294,7 +311,7 @@ export async function runAgent(
   } finally {
     // 仅在 orchestrator 已完成此会话时清理映射
     // 避免被拒绝的请求误删仍在运行的会话映射
-    if (!orchestrator.isActive(input.sessionId)) {
+    if (runStarted && !orchestrator.isActive(input.sessionId)) {
       sessionWebContents.delete(input.sessionId)
       streamForwarder.clear(input.sessionId)
     }
@@ -326,9 +343,8 @@ export async function runAgentHeadless(
   )
   const runInput: AgentSendInput = input.startedAt != null ? input : { ...input, startedAt: Date.now() }
   const startedAt = runInput.startedAt!
-  if (wc) {
-    registerWebContents(runInput.sessionId, wc)
-  }
+  /** 标记 headless 入口是否真正开始并注册 renderer。 */
+  let runStarted = false
 
   try {
     await orchestrator.sendMessage(runInput, {
@@ -381,18 +397,25 @@ export async function runAgentHeadless(
       },
       onRunStarted: ({ startedAt: persistedStartedAt }) => {
         const session = getAgentSessionMeta(runInput.sessionId)
-        eventBus.emit(runInput.sessionId, {
-          kind: 'proma_event',
-          event: {
-            type: 'external_run_started',
-            source: callbacks.source ?? 'bridge',
-            sessionId: runInput.sessionId,
-            title: session?.title,
-            workspaceId: runInput.workspaceId ?? session?.workspaceId,
-            modelId: runInput.modelId,
-            startedAt: persistedStartedAt,
-            ...(session ? { session } : {}),
-          },
+        workspaceOperationGuard.runAgentServiceEffects({
+          sessionWorkspaceId: session?.workspaceId,
+          requestedWorkspaceId: runInput.workspaceId,
+        }, () => {
+          if (wc) registerWebContents(runInput.sessionId, wc)
+          runStarted = true
+          eventBus.emit(runInput.sessionId, {
+            kind: 'proma_event',
+            event: {
+              type: 'external_run_started',
+              source: callbacks.source ?? 'bridge',
+              sessionId: runInput.sessionId,
+              title: session?.title,
+              workspaceId: runInput.workspaceId ?? session?.workspaceId,
+              modelId: runInput.modelId,
+              startedAt: persistedStartedAt,
+              ...(session ? { session } : {}),
+            },
+          })
         })
       },
     }, extensions)
@@ -411,7 +434,7 @@ export async function runAgentHeadless(
     }
     agentQueueCoordinator.onRunComplete(runInput.sessionId, undefined, false, false)
   } finally {
-    if (!orchestrator.isActive(runInput.sessionId)) {
+    if (runStarted && !orchestrator.isActive(runInput.sessionId)) {
       sessionWebContents.delete(runInput.sessionId)
       streamForwarder.clear(runInput.sessionId)
     }
@@ -499,8 +522,10 @@ export async function queueAgentMessage(
 }
 
 export function enqueueAgentQueuedMessage(input: AgentDeferredQueueMessageInput, webContents: WebContents): void {
-  registerWebContents(input.sessionId, webContents)
-  agentQueueCoordinator.enqueue(input)
+  workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
+    registerWebContents(input.sessionId, webContents)
+    agentQueueCoordinator.enqueue(input)
+  })
 }
 
 export function cancelAgentQueuedMessage(input: AgentQueuedMessageControlInput): boolean {

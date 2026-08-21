@@ -2485,14 +2485,15 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.RELINK_WORKSPACE_PROJECT_ROOT,
     async (_, id: string, projectRootPath: string): Promise<AgentWorkspace> => {
-      workspaceOperationGuard.assertWorkspaceWritable(id)
-      const previousRoot = getAgentWorkspace(id)?.projectRootPath
-      const updated = relinkAgentWorkspaceProjectRoot(id, projectRootPath)
-      if (previousRoot && previousRoot !== updated.projectRootPath) {
-        releaseDirectoryWatcherIfUnreferenced(previousRoot)
-      }
-      if (updated.projectRootPath) watchAttachedDirectory(updated.projectRootPath)
-      return updated
+      return workspaceOperationGuard.runWorkspaceWrite(id, () => {
+        const previousRoot = getAgentWorkspace(id)?.projectRootPath
+        const updated = relinkAgentWorkspaceProjectRoot(id, projectRootPath)
+        if (previousRoot && previousRoot !== updated.projectRootPath) {
+          releaseDirectoryWatcherIfUnreferenced(previousRoot)
+        }
+        if (updated.projectRootPath) watchAttachedDirectory(updated.projectRootPath)
+        return updated
+      })
     }
   )
 
@@ -2500,10 +2501,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.RESTORE_WORKSPACE_PROJECT_ROOT,
     async (_, id: string): Promise<AgentWorkspace> => {
-      workspaceOperationGuard.assertWorkspaceWritable(id)
-      const updated = restoreAgentWorkspaceProjectRoot(id)
-      if (updated.projectRootPath) watchAttachedDirectory(updated.projectRootPath)
-      return updated
+      return workspaceOperationGuard.runWorkspaceWrite(id, () => {
+        const updated = restoreAgentWorkspaceProjectRoot(id)
+        if (updated.projectRootPath) watchAttachedDirectory(updated.projectRootPath)
+        return updated
+      })
     }
   )
 
@@ -2511,62 +2513,63 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DELETE_WORKSPACE,
     async (_, id: string): Promise<void> => {
-      workspaceOperationGuard.assertWorkspaceWritable(id)
-      const deletingWorkspace = getAgentWorkspace(id)
-      if (!deletingWorkspace) {
-        return deleteAgentWorkspace(id)
-      }
-
-      // 守卫前置：在删除任何会话/自动任务前就拦截不可删除的工作区，
-      // 否则会先把绑定数据删光、再由 deleteAgentWorkspace 抛错，造成数据丢失与状态不一致
-      if (deletingWorkspace.slug === 'default') {
-        throw new Error('默认项目不能删除')
-      }
-      if (listAgentWorkspaces().length <= 1) {
-        throw new Error('至少需要保留一个项目')
-      }
-
-      const affectedSessions = listAgentSessions()
-        .filter((session) => session.workspaceId === id)
-      const affectedSessionIds = affectedSessions.map((session) => session.id)
-      const deletedAttachedFiles = [
-        ...affectedSessions.flatMap((session) => session.attachedFiles ?? []),
-        ...getWorkspaceAttachedFiles(deletingWorkspace.slug),
-      ]
-      const affectedAutomationIds = listAutomations()
-        .filter((automation) => automation.workspaceId === id)
-        .map((automation) => automation.id)
-      const deletedProjectRoot = deletingWorkspace.projectRootPath
-      const removedDingTalkBindings = dingtalkBridgeManager.removeBindingsForDeletedWorkspace(id, affectedSessionIds)
-      const removedWeChatBindings = wechatBridge.removeBindingsForDeletedWorkspace(id, affectedSessionIds)
-      const removedFeishuBindings = feishuBridgeManager.removeBindingsForDeletedWorkspace(id, affectedSessionIds)
-
-      if (removedDingTalkBindings > 0) {
-        console.log(`[项目删除] 已移除 ${removedDingTalkBindings} 条钉钉聊天绑定`)
-      }
-      if (removedWeChatBindings > 0) {
-        console.log(`[项目删除] 已移除 ${removedWeChatBindings} 条微信聊天绑定`)
-      }
-      if (removedFeishuBindings > 0) {
-        console.log(`[项目删除] 已移除 ${removedFeishuBindings} 条飞书聊天绑定`)
-      }
-
-      for (const sessionId of affectedSessionIds) {
-        if (isAgentSessionActive(sessionId)) {
-          stopAgent(sessionId)
+      return workspaceOperationGuard.runWorkspaceWrite(id, () => {
+        const deletingWorkspace = getAgentWorkspace(id)
+        if (!deletingWorkspace) {
+          return deleteAgentWorkspace(id)
         }
-        deleteAgentSession(sessionId)
-      }
-      for (const automationId of affectedAutomationIds) {
-        deleteAutomation(automationId)
-      }
-      if (affectedAutomationIds.length > 0) {
-        broadcastAutomationsChanged()
-      }
-      deleteAgentWorkspace(id)
 
-      releaseAttachedFileWatchers(deletedAttachedFiles)
-      if (deletedProjectRoot) releaseDirectoryWatcherIfUnreferenced(deletedProjectRoot)
+        // 守卫前置：在删除任何会话/自动任务前就拦截不可删除的工作区，
+        // 否则会先把绑定数据删光、再由 deleteAgentWorkspace 抛错，造成数据丢失与状态不一致
+        if (deletingWorkspace.slug === 'default') {
+          throw new Error('默认项目不能删除')
+        }
+        if (listAgentWorkspaces().length <= 1) {
+          throw new Error('至少需要保留一个项目')
+        }
+
+        const affectedSessions = listAgentSessions()
+          .filter((session) => session.workspaceId === id)
+        const affectedSessionIds = affectedSessions.map((session) => session.id)
+        const deletedAttachedFiles = [
+          ...affectedSessions.flatMap((session) => session.attachedFiles ?? []),
+          ...getWorkspaceAttachedFiles(deletingWorkspace.slug),
+        ]
+        const affectedAutomationIds = listAutomations()
+          .filter((automation) => automation.workspaceId === id)
+          .map((automation) => automation.id)
+        const deletedProjectRoot = deletingWorkspace.projectRootPath
+        const removedDingTalkBindings = dingtalkBridgeManager.removeBindingsForDeletedWorkspace(id, affectedSessionIds)
+        const removedWeChatBindings = wechatBridge.removeBindingsForDeletedWorkspace(id, affectedSessionIds)
+        const removedFeishuBindings = feishuBridgeManager.removeBindingsForDeletedWorkspace(id, affectedSessionIds)
+
+        if (removedDingTalkBindings > 0) {
+          console.log(`[项目删除] 已移除 ${removedDingTalkBindings} 条钉钉聊天绑定`)
+        }
+        if (removedWeChatBindings > 0) {
+          console.log(`[项目删除] 已移除 ${removedWeChatBindings} 条微信聊天绑定`)
+        }
+        if (removedFeishuBindings > 0) {
+          console.log(`[项目删除] 已移除 ${removedFeishuBindings} 条飞书聊天绑定`)
+        }
+
+        for (const sessionId of affectedSessionIds) {
+          if (isAgentSessionActive(sessionId)) {
+            stopAgent(sessionId)
+          }
+          deleteAgentSession(sessionId)
+        }
+        for (const automationId of affectedAutomationIds) {
+          deleteAutomation(automationId)
+        }
+        if (affectedAutomationIds.length > 0) {
+          broadcastAutomationsChanged()
+        }
+        deleteAgentWorkspace(id)
+
+        releaseAttachedFileWatchers(deletedAttachedFiles)
+        if (deletedProjectRoot) releaseDirectoryWatcherIfUnreferenced(deletedProjectRoot)
+      })
     }
   )
 
@@ -3307,18 +3310,19 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_DIRECTORY,
     async (_, input: AgentAttachDirectoryInput): Promise<string[]> => {
-      workspaceOperationGuard.assertSessionWritable(input.sessionId)
-      const meta = getAgentSessionMeta(input.sessionId)
-      if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
+      return workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
+        const meta = getAgentSessionMeta(input.sessionId)
+        if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
 
-      const existing = meta.attachedDirectories ?? []
-      if (existing.includes(input.directoryPath)) return existing
+        const existing = meta.attachedDirectories ?? []
+        if (existing.includes(input.directoryPath)) return existing
 
-      const updated = [...existing, input.directoryPath]
-      updateAgentSessionMeta(input.sessionId, { attachedDirectories: updated })
-      // 启动附加目录文件监听
-      watchAttachedDirectory(input.directoryPath)
-      return updated
+        const updated = [...existing, input.directoryPath]
+        updateAgentSessionMeta(input.sessionId, { attachedDirectories: updated })
+        // 启动附加目录文件监听
+        watchAttachedDirectory(input.directoryPath)
+        return updated
+      })
     }
   )
 
@@ -3326,15 +3330,16 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DETACH_DIRECTORY,
     async (_, input: AgentAttachDirectoryInput): Promise<string[]> => {
-      workspaceOperationGuard.assertSessionWritable(input.sessionId)
-      const meta = getAgentSessionMeta(input.sessionId)
-      if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
+      return workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
+        const meta = getAgentSessionMeta(input.sessionId)
+        if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
 
-      const existing = meta.attachedDirectories ?? []
-      const updated = existing.filter((d) => d !== input.directoryPath)
-      updateAgentSessionMeta(input.sessionId, { attachedDirectories: updated })
-      releaseDirectoryWatcherIfUnreferenced(input.directoryPath)
-      return updated
+        const existing = meta.attachedDirectories ?? []
+        const updated = existing.filter((d) => d !== input.directoryPath)
+        updateAgentSessionMeta(input.sessionId, { attachedDirectories: updated })
+        releaseDirectoryWatcherIfUnreferenced(input.directoryPath)
+        return updated
+      })
     }
   )
 
@@ -3342,23 +3347,24 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_FILE,
     async (_, input: AgentAttachFileInput): Promise<string[]> => {
-      workspaceOperationGuard.assertSessionWritable(input.sessionId)
-      const meta = getAgentSessionMeta(input.sessionId)
-      if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
+      return workspaceOperationGuard.runSessionWrite(input.sessionId, async () => {
+        const meta = getAgentSessionMeta(input.sessionId)
+        if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
 
-      const { realpathSync, statSync } = await import('node:fs')
-      const { resolve } = await import('node:path')
-      const safePath = realpathSync(resolve(input.filePath))
-      const stats = statSync(safePath)
-      if (!stats.isFile()) throw new Error('只能附加文件')
+        const { realpathSync, statSync } = await import('node:fs')
+        const { resolve } = await import('node:path')
+        const safePath = realpathSync(resolve(input.filePath))
+        const stats = statSync(safePath)
+        if (!stats.isFile()) throw new Error('只能附加文件')
 
-      const existing = meta.attachedFiles ?? []
-      if (existing.includes(safePath)) return existing
+        const existing = meta.attachedFiles ?? []
+        if (existing.includes(safePath)) return existing
 
-      const updated = [...existing, safePath]
-      updateAgentSessionMeta(input.sessionId, { attachedFiles: updated })
-      watchAttachedDirectory(dirname(safePath))
-      return updated
+        const updated = [...existing, safePath]
+        updateAgentSessionMeta(input.sessionId, { attachedFiles: updated })
+        watchAttachedDirectory(dirname(safePath))
+        return updated
+      })
     }
   )
 
@@ -3366,15 +3372,16 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DETACH_FILE,
     async (_, input: AgentAttachFileInput): Promise<string[]> => {
-      workspaceOperationGuard.assertSessionWritable(input.sessionId)
-      const meta = getAgentSessionMeta(input.sessionId)
-      if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
+      return workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
+        const meta = getAgentSessionMeta(input.sessionId)
+        if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
 
-      const existing = meta.attachedFiles ?? []
-      const updated = existing.filter((f) => f !== input.filePath)
-      updateAgentSessionMeta(input.sessionId, { attachedFiles: updated })
-      releaseDirectoryWatcherIfUnreferenced(dirname(input.filePath))
-      return updated
+        const existing = meta.attachedFiles ?? []
+        const updated = existing.filter((f) => f !== input.filePath)
+        updateAgentSessionMeta(input.sessionId, { attachedFiles: updated })
+        releaseDirectoryWatcherIfUnreferenced(dirname(input.filePath))
+        return updated
+      })
     }
   )
 
@@ -3382,10 +3389,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_WORKSPACE_DIRECTORY,
     async (_, input: WorkspaceAttachDirectoryInput): Promise<string[]> => {
-      workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)
-      const updated = attachWorkspaceDirectory(input.workspaceSlug, input.directoryPath)
-      watchAttachedDirectory(input.directoryPath)
-      return updated
+      return workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () => {
+        const updated = attachWorkspaceDirectory(input.workspaceSlug, input.directoryPath)
+        watchAttachedDirectory(input.directoryPath)
+        return updated
+      })
     }
   )
 
@@ -3393,10 +3401,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DETACH_WORKSPACE_DIRECTORY,
     async (_, input: WorkspaceAttachDirectoryInput): Promise<string[]> => {
-      workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)
-      const updated = detachWorkspaceDirectory(input.workspaceSlug, input.directoryPath)
-      releaseDirectoryWatcherIfUnreferenced(input.directoryPath)
-      return updated
+      return workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () => {
+        const updated = detachWorkspaceDirectory(input.workspaceSlug, input.directoryPath)
+        releaseDirectoryWatcherIfUnreferenced(input.directoryPath)
+        return updated
+      })
     }
   )
 
@@ -3404,16 +3413,17 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_WORKSPACE_FILE,
     async (_, input: WorkspaceAttachFileInput): Promise<string[]> => {
-      workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)
-      const { realpathSync, statSync } = await import('node:fs')
-      const { resolve } = await import('node:path')
-      const safePath = realpathSync(resolve(input.filePath))
-      const stats = statSync(safePath)
-      if (!stats.isFile()) throw new Error('只能附加文件')
+      return workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, async () => {
+        const { realpathSync, statSync } = await import('node:fs')
+        const { resolve } = await import('node:path')
+        const safePath = realpathSync(resolve(input.filePath))
+        const stats = statSync(safePath)
+        if (!stats.isFile()) throw new Error('只能附加文件')
 
-      const updated = attachWorkspaceFile(input.workspaceSlug, safePath)
-      watchAttachedDirectory(dirname(safePath))
-      return updated
+        const updated = attachWorkspaceFile(input.workspaceSlug, safePath)
+        watchAttachedDirectory(dirname(safePath))
+        return updated
+      })
     }
   )
 
@@ -3421,10 +3431,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DETACH_WORKSPACE_FILE,
     async (_, input: WorkspaceAttachFileInput): Promise<string[]> => {
-      workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)
-      const updated = detachWorkspaceFile(input.workspaceSlug, input.filePath)
-      releaseDirectoryWatcherIfUnreferenced(dirname(input.filePath))
-      return updated
+      return workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () => {
+        const updated = detachWorkspaceFile(input.workspaceSlug, input.filePath)
+        releaseDirectoryWatcherIfUnreferenced(dirname(input.filePath))
+        return updated
+      })
     }
   )
 

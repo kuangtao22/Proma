@@ -65,6 +65,30 @@ describe('工作区写操作守卫', () => {
     expect(() => guard.assertSessionWritable('missing-session')).toThrow('会话不存在: missing-session')
     expect(() => guard.assertWorkspaceSlugWritable('missing-workspace')).toThrow('项目不存在: missing-workspace')
   })
+
+  test('Given 工作区正在迁移 When 执行受保护 effect closure Then closure 完全不调用', () => {
+    /** 记录 manager、realpath、文件系统和 watcher 模拟副作用。 */
+    const effects: string[] = []
+    /** 仅锁定目标工作区的守卫实例。 */
+    const guard = createWorkspaceOperationGuard({
+      getWorkspaceIdBySessionId: () => 'workspace-locked',
+      getWorkspaceIdBySlug: () => 'workspace-locked',
+      getWorkspaceOperationBlockReason: () => '项目正在迁移，请等待完成后重试',
+    })
+    /** 模拟真实 handler 内全部副作用的 closure。 */
+    const effect = (): string => {
+      effects.push('manager')
+      effects.push('realpath')
+      effects.push('fs')
+      effects.push('watcher')
+      return 'written'
+    }
+
+    expect(() => guard.runWorkspaceWrite('workspace-locked', effect)).toThrow('项目正在迁移，请等待完成后重试')
+    expect(() => guard.runSessionWrite('session-1', effect)).toThrow('项目正在迁移，请等待完成后重试')
+    expect(() => guard.runWorkspaceSlugWrite('locked', effect)).toThrow('项目正在迁移，请等待完成后重试')
+    expect(effects).toEqual([])
+  })
 })
 
 describe('工作区写 IPC 守卫合同', () => {
@@ -73,17 +97,17 @@ describe('工作区写 IPC 守卫合同', () => {
     const source = readFileSync(join(import.meta.dir, '..', 'ipc.ts'), 'utf8')
     /** IPC 通道、守卫调用与最早可能副作用 token 的合同。 */
     const contracts: Array<{ channel: string; guardCall: string; sideEffects: string[] }> = [
-      { channel: 'RELINK_WORKSPACE_PROJECT_ROOT', guardCall: 'workspaceOperationGuard.assertWorkspaceWritable(id)', sideEffects: ['getAgentWorkspace(id)', 'relinkAgentWorkspaceProjectRoot(', 'releaseDirectoryWatcherIfUnreferenced(', 'watchAttachedDirectory('] },
-      { channel: 'RESTORE_WORKSPACE_PROJECT_ROOT', guardCall: 'workspaceOperationGuard.assertWorkspaceWritable(id)', sideEffects: ['restoreAgentWorkspaceProjectRoot(', 'watchAttachedDirectory('] },
-      { channel: 'DELETE_WORKSPACE', guardCall: 'workspaceOperationGuard.assertWorkspaceWritable(id)', sideEffects: ['getAgentWorkspace(id)', 'listAgentWorkspaces()', 'removeBindingsForDeletedWorkspace(', 'deleteAgentSession(', 'deleteAgentWorkspace('] },
-      { channel: 'ATTACH_DIRECTORY', guardCall: 'workspaceOperationGuard.assertSessionWritable(input.sessionId)', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'watchAttachedDirectory('] },
-      { channel: 'DETACH_DIRECTORY', guardCall: 'workspaceOperationGuard.assertSessionWritable(input.sessionId)', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'releaseDirectoryWatcherIfUnreferenced('] },
-      { channel: 'ATTACH_FILE', guardCall: 'workspaceOperationGuard.assertSessionWritable(input.sessionId)', sideEffects: ['getAgentSessionMeta(', "await import('node:fs')", 'realpathSync(', 'updateAgentSessionMeta(', 'watchAttachedDirectory('] },
-      { channel: 'DETACH_FILE', guardCall: 'workspaceOperationGuard.assertSessionWritable(input.sessionId)', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'releaseDirectoryWatcherIfUnreferenced('] },
-      { channel: 'ATTACH_WORKSPACE_DIRECTORY', guardCall: 'workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)', sideEffects: ['attachWorkspaceDirectory(', 'watchAttachedDirectory('] },
-      { channel: 'DETACH_WORKSPACE_DIRECTORY', guardCall: 'workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)', sideEffects: ['detachWorkspaceDirectory(', 'releaseDirectoryWatcherIfUnreferenced('] },
-      { channel: 'ATTACH_WORKSPACE_FILE', guardCall: 'workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)', sideEffects: ["await import('node:fs')", 'realpathSync(', 'attachWorkspaceFile(', 'watchAttachedDirectory('] },
-      { channel: 'DETACH_WORKSPACE_FILE', guardCall: 'workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)', sideEffects: ['detachWorkspaceFile(', 'releaseDirectoryWatcherIfUnreferenced('] },
+      { channel: 'RELINK_WORKSPACE_PROJECT_ROOT', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, () =>', sideEffects: ['getAgentWorkspace(id)', 'relinkAgentWorkspaceProjectRoot(', 'releaseDirectoryWatcherIfUnreferenced(', 'watchAttachedDirectory('] },
+      { channel: 'RESTORE_WORKSPACE_PROJECT_ROOT', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, () =>', sideEffects: ['restoreAgentWorkspaceProjectRoot(', 'watchAttachedDirectory('] },
+      { channel: 'DELETE_WORKSPACE', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, () =>', sideEffects: ['getAgentWorkspace(id)', 'listAgentWorkspaces()', 'removeBindingsForDeletedWorkspace(', 'deleteAgentSession(', 'deleteAgentWorkspace('] },
+      { channel: 'ATTACH_DIRECTORY', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'watchAttachedDirectory('] },
+      { channel: 'DETACH_DIRECTORY', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'releaseDirectoryWatcherIfUnreferenced('] },
+      { channel: 'ATTACH_FILE', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, async () =>', sideEffects: ['getAgentSessionMeta(', "await import('node:fs')", 'realpathSync(', 'updateAgentSessionMeta(', 'watchAttachedDirectory('] },
+      { channel: 'DETACH_FILE', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'releaseDirectoryWatcherIfUnreferenced('] },
+      { channel: 'ATTACH_WORKSPACE_DIRECTORY', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () =>', sideEffects: ['attachWorkspaceDirectory(', 'watchAttachedDirectory('] },
+      { channel: 'DETACH_WORKSPACE_DIRECTORY', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () =>', sideEffects: ['detachWorkspaceDirectory(', 'releaseDirectoryWatcherIfUnreferenced('] },
+      { channel: 'ATTACH_WORKSPACE_FILE', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, async () =>', sideEffects: ["await import('node:fs')", 'realpathSync(', 'attachWorkspaceFile(', 'watchAttachedDirectory('] },
+      { channel: 'DETACH_WORKSPACE_FILE', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () =>', sideEffects: ['detachWorkspaceFile(', 'releaseDirectoryWatcherIfUnreferenced('] },
     ]
 
     for (const contract of contracts) {

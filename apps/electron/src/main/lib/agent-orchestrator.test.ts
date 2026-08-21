@@ -16,21 +16,21 @@ describe('Agent 工作区迁移准入', () => {
         return workspaceId === 'workspace-authoritative' ? '项目正在迁移，请等待完成后重试' : undefined
       },
     })
-    /** 执行与 sendMessage 相同的准入分支，只有 admitted 才允许后续副作用。 */
-    const admission = guard.admitAgentRun({
+    /** 通过生产准入执行器提交完整后续副作用 closure。 */
+    const result = guard.runAdmittedAgentRun({
       sessionWorkspaceId: 'workspace-authoritative',
       requestedWorkspaceId: 'workspace-renderer-other',
       onError: (error) => calls.push(`error:${error}`),
       onComplete: () => calls.push('complete'),
-    })
-    if (admission.admitted) {
+    }, () => {
       calls.push('active')
       calls.push('remove-retry-error')
       calls.push('persist-user-message')
       calls.push('adapter')
-    }
+      return 'started'
+    })
 
-    expect(admission).toEqual({ admitted: false, workspaceId: 'workspace-authoritative' })
+    expect(result).toBeUndefined()
     expect(calls).toEqual([
       'lock:workspace-authoritative',
       'error:项目正在迁移，请等待完成后重试',
@@ -74,7 +74,7 @@ describe('Agent sendMessage 准入顺序合同', () => {
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .replace(/\/\/.*$/gm, '')
     /** 迁移准入调用位置。 */
-    const admissionIndex = executableBody.indexOf('workspaceOperationGuard.admitAgentRun(')
+    const admissionIndex = executableBody.indexOf('workspaceOperationGuard.runAdmittedAgentRun(')
     /** 同步 active 槽注册位置。 */
     const activeIndex = executableBody.indexOf('this.activeSessions.set(sessionId, runGeneration)')
     /** 重试错误删除副作用位置。 */
@@ -89,5 +89,23 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(retryDeleteIndex).toBeGreaterThan(activeIndex)
     expect(persistIndex).toBeGreaterThan(activeIndex)
     expect(firstAwaitIndex).toBeGreaterThan(activeIndex)
+  })
+
+  test('Given MCP preflight 支持降级 When 检查 generation checkpoint Then checkpoint 位于降级 catch 之后且 adapter 之前', () => {
+    /** 读取真实 orchestrator 源码约束停止信号不会被 MCP 降级 catch 吞掉。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** MCP preflight 局部区域。 */
+    const sendMessageStart = source.indexOf('  async sendMessage(')
+    const start = source.indexOf('if (Object.keys(mcpServers).length > 0)', sendMessageStart)
+    const end = source.indexOf('// 11. 构建动态上下文', start)
+    const body = source.slice(start, end)
+    /** MCP 调用、catch 和 catch 后 checkpoint 的位置。 */
+    const callIndex = body.indexOf('await buildPiMcpTools(mcpServers)')
+    const catchIndex = body.indexOf('} catch (error)')
+    const checkpointIndex = body.lastIndexOf('checkpoint()')
+
+    expect(callIndex).toBeGreaterThan(-1)
+    expect(catchIndex).toBeGreaterThan(callIndex)
+    expect(checkpointIndex).toBeGreaterThan(catchIndex)
   })
 })
