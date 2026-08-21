@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { DataRootLocator } from './data-root-locator'
 import type { DataRootLocatorResult } from './data-root-locator'
+import { DataRootMigrationCoordinator } from './data-root-migration'
 import { PROMA_DATA_ROOT_MARKER_FILE } from './data-root-marker'
 import {
   registerPathManagementIpcHandlers,
@@ -152,6 +153,13 @@ describe('数据根目录打开', () => {
     expect(harness.open(expectedEvent, '/tmp/untrusted')).rejects.toThrow('数据根打开目标无效')
     expect(harness.openedPaths).toEqual([])
   })
+
+  test('Given renderer 未传 target When 打开数据根 Then 拒绝缺省参数', async () => {
+    const harness = createOpenDataRootHarness('/data/previous')
+
+    expect(harness.open(expectedEvent)).rejects.toThrow('数据根打开目标无效')
+    expect(harness.openedPaths).toEqual([])
+  })
 })
 
 describe('路径管理 IPC', () => {
@@ -184,6 +192,7 @@ describe('路径管理 IPC', () => {
       ['normal', [
         PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
         PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
+        'path-management:preview-data-root-migration',
         PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
         PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS,
         PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
@@ -242,10 +251,135 @@ describe('路径管理 IPC', () => {
     expect([...handlers.keys()]).toEqual([
       PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
       PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
+      PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION,
       PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
       PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS,
       PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
     ])
+  })
+
+  test('Given normal 窗口已 pick 绝对目标 When preview Then 只预检同一目标且不创建计划', async () => {
+    /** 保存 normal 模式 handler。 */
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    /** 记录 preview 与 createPlan 调用。 */
+    const calls: string[] = []
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/proma-new'] }) },
+      coordinator: {
+        getStatus: () => createLocatorResult().state,
+        previewTarget: async (targetRoot) => {
+          calls.push(`preview:${targetRoot}`)
+          return {
+            targetRoot,
+            deviceType: 'removable',
+            availableBytes: 1000,
+            requiredBytes: 100,
+            blockers: [],
+          }
+        },
+        createPlan: async (targetRoot) => {
+          calls.push(`create:${targetRoot}`)
+          return { migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 100 }
+        },
+        runPending: async () => undefined,
+        resumePending: async () => undefined,
+        cancel: async () => undefined,
+      },
+    })
+    const pickHandler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)
+    const previewHandler = handlers.get('path-management:preview-data-root-migration')
+    if (!pickHandler || !previewHandler) throw new Error('缺少 pick 或 preview handler')
+
+    expect(await pickHandler(expectedEvent)).toBe('/data/proma-new')
+    expect(await previewHandler(expectedEvent, '/data/proma-new')).toMatchObject({ deviceType: 'removable', blockers: [] })
+    await expect(previewHandler(expectedEvent, '/data/other')).rejects.toThrow('只能预检刚刚选择的目标目录')
+    await expect(previewHandler(expectedEvent, 'relative')).rejects.toThrow('目标数据根必须是绝对路径')
+    expect(calls).toEqual(['preview:/data/proma-new'])
+  })
+
+  test('Given 真实 coordinator 与 IPC When renderer 选择并预览 Then 返回真实预检且无磁盘写入', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'proma-path-preview-chain-'))
+    const sourceRoot = join(homeDir, 'source')
+    const targetRoot = join(homeDir, 'target')
+    mkdirSync(sourceRoot)
+    writeFileSync(join(sourceRoot, 'settings.json'), '{"theme":"dark"}')
+    const locator = new DataRootLocator({ homeDir })
+    locator.write({ version: 1, activeRoot: sourceRoot })
+    const coordinator = new DataRootMigrationCoordinator({
+      locator,
+      lockPath: join(homeDir, 'migration.lock'),
+      createMigrationId: () => 'preview-chain',
+      getAvailableBytes: async () => 10_000,
+    })
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      homeDir,
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => expectedWebContents,
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [targetRoot] }) },
+      coordinator,
+    })
+    const pick = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)
+    const preview = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION)
+    if (!pick || !preview) throw new Error('缺少真实预览链 handler')
+
+    expect(await pick(expectedEvent)).toBe(targetRoot)
+    expect(await preview(expectedEvent, targetRoot)).toMatchObject({
+      targetRoot,
+      requiredBytes: Buffer.byteLength('{"theme":"dark"}'),
+      availableBytes: 10_000,
+      blockers: [],
+    })
+    expect(locator.inspect().locatorFile?.migration).toBeUndefined()
+    expect(() => readFileSync(targetRoot)).toThrow()
+  })
+
+  test('Given normal 状态查询 When 存储检查成功或失败 Then 合并真实元数据或安全降级', async () => {
+    /** 注册两次独立 handler，验证异常不会让设置页整体加载失败。 */
+    const registerGetState = (inspectStorage: () => Promise<{
+      occupiedBytes: number
+      availableBytes: number
+      deviceType: 'network'
+    }>): ((...args: unknown[]) => unknown) => {
+      const handlers = new Map<string, (...args: unknown[]) => unknown>()
+      registerPathManagementIpcHandlers({
+        mode: 'normal',
+        ipc: {
+          handle: (channel, handler) => { handlers.set(channel, handler) },
+          removeHandler: () => undefined,
+        },
+        app: { relaunch: () => undefined, quit: () => undefined },
+        getExpectedWebContents: () => expectedWebContents,
+        coordinator: {
+          getStatus: () => createLocatorResult().state,
+          createPlan: async () => ({ migrationId: 'migration-1', stage: 'pending', completedBytes: 0, totalBytes: 1 }),
+          runPending: async () => undefined,
+          resumePending: async () => undefined,
+          cancel: async () => undefined,
+        },
+        inspectStorage,
+      })
+      const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE)
+      if (!handler) throw new Error('缺少状态 handler')
+      return handler
+    }
+    const success = registerGetState(async () => ({ occupiedBytes: 10, availableBytes: 90, deviceType: 'network' }))
+    const failure = registerGetState(async () => { throw new Error('模拟 statfs 失败') })
+
+    expect(await success(expectedEvent)).toMatchObject({ occupiedBytes: 10, availableBytes: 90, deviceType: 'network' })
+    expect(await failure(expectedEvent)).toMatchObject({ availability: 'available', deviceType: 'unknown' })
   })
 
   test('Given 普通或路径窗口之外的 sender When 调用敏感通道 Then 一律拒绝', () => {

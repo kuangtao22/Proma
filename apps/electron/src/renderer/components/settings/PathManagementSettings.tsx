@@ -9,7 +9,12 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import type { DataRootMigrationStatus, OpenDataRootTarget, PathManagementState } from '@proma/shared'
+import type {
+  DataRootMigrationPreview,
+  DataRootMigrationStatus,
+  OpenDataRootTarget,
+  PathManagementState,
+} from '@proma/shared'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -85,8 +90,10 @@ export function createPathManagementSettingsView(
 export interface DataRootMigrationRequestDependencies {
   /** 打开系统目录选择器。 */
   pickDataRoot: () => Promise<string | null>
+  /** 只读预检刚选择的目标目录。 */
+  previewDataRootMigration: (targetRoot: string) => Promise<DataRootMigrationPreview>
   /** 显示迁移确认对话框。 */
-  confirmMigration: (targetRoot: string) => Promise<boolean>
+  confirmMigration: (preview: DataRootMigrationPreview) => Promise<boolean>
   /** 创建迁移计划并请求重启。 */
   startDataRootMigration: (targetRoot: string) => Promise<void>
 }
@@ -102,11 +109,74 @@ export async function requestDataRootMigration(
   /** 用户通过系统选择器授权的目标目录。 */
   const targetRoot = await dependencies.pickDataRoot()
   if (targetRoot === null) return 'cancelled'
+  /** 预览不会创建计划；启动时主进程仍会完整复检。 */
+  const preview = await dependencies.previewDataRootMigration(targetRoot)
   /** 只有明确确认后才允许主进程创建计划。 */
-  const confirmed = await dependencies.confirmMigration(targetRoot)
-  if (!confirmed) return 'cancelled'
+  const confirmed = await dependencies.confirmMigration(preview)
+  if (!confirmed || preview.blockers.length > 0) return 'cancelled'
   await dependencies.startDataRootMigration(targetRoot)
   return 'started'
+}
+
+/** 设置页局部交互状态；加载错误与普通操作错误必须独立。 */
+export interface PathManagementUiState {
+  loadError?: string
+  actionError?: string
+  selectedTarget: string | null
+  preview: DataRootMigrationPreview | null
+  previewLoading: boolean
+}
+
+/** 设置页局部状态允许的稳定转换。 */
+export type PathManagementUiAction =
+  | { type: 'load-failed'; message: string }
+  | { type: 'load-succeeded' }
+  | { type: 'action-failed'; message: string }
+  | { type: 'action-succeeded' }
+  | { type: 'pick-started' }
+  | { type: 'preview-started'; targetRoot: string }
+  | { type: 'preview-succeeded'; preview: DataRootMigrationPreview }
+  | { type: 'preview-closed' }
+
+/** 创建无错误、无目标的初始设置页局部状态。 */
+export function createPathManagementUiState(): PathManagementUiState {
+  return { selectedTarget: null, preview: null, previewLoading: false }
+}
+
+/** 对交互事件做纯状态转换，便于覆盖错误清除和预览边界。 */
+export function reducePathManagementUiState(
+  state: PathManagementUiState,
+  action: PathManagementUiAction,
+): PathManagementUiState {
+  if (action.type === 'load-failed') return { ...state, loadError: action.message }
+  if (action.type === 'load-succeeded') {
+    const { loadError: _loadError, ...rest } = state
+    return rest
+  }
+  if (action.type === 'action-failed') return { ...state, actionError: action.message }
+  if (action.type === 'action-succeeded' || action.type === 'pick-started') {
+    const { actionError: _actionError, ...rest } = state
+    return action.type === 'pick-started'
+      ? { ...rest, selectedTarget: null, preview: null, previewLoading: false }
+      : rest
+  }
+  if (action.type === 'preview-started') {
+    return { ...state, selectedTarget: action.targetRoot, preview: null, previewLoading: true }
+  }
+  if (action.type === 'preview-succeeded') {
+    const { actionError: _actionError, ...rest } = state
+    return { ...rest, selectedTarget: action.preview.targetRoot, preview: action.preview, previewLoading: false }
+  }
+  return { ...state, selectedTarget: null, preview: null, previewLoading: false }
+}
+
+/** 确认按钮只由忙碌、预览未完成或真实 blocker 禁用。 */
+export function isDataRootMigrationConfirmDisabled(input: {
+  preview: DataRootMigrationPreview | null
+  previewLoading: boolean
+  isBusy: boolean
+}): boolean {
+  return input.isBusy || input.previewLoading || input.preview === null || input.preview.blockers.length > 0
 }
 
 /** 返回已知数据根设备类型对应的断连或性能提醒。 */
@@ -290,14 +360,14 @@ export function CrossDeviceMigrationSection(): React.ReactElement {
 export function PathManagementSettings(): React.ReactElement {
   /** 主进程返回的当前路径状态。 */
   const [state, setState] = React.useState<PathManagementState | null>(null)
-  /** 状态读取或操作错误。 */
-  const [error, setError] = React.useState<string | undefined>()
+  /** 加载错误、操作错误与目标预览的独立局部状态。 */
+  const [uiState, dispatchUi] = React.useReducer(reducePathManagementUiState, undefined, createPathManagementUiState)
   /** 防止重复选择、打开或启动迁移。 */
   const [isBusy, setIsBusy] = React.useState(false)
-  /** 确认对话框当前目标路径。 */
-  const [selectedTarget, setSelectedTarget] = React.useState<string | null>(null)
   /** 等待对话框确认结果的 resolver。 */
   const confirmationResolver = React.useRef<((confirmed: boolean) => void) | null>(null)
+  /** 迁移选择流程代次，阻止已关闭预览的异步结果重新打开对话框。 */
+  const migrationFlowId = React.useRef(0)
   /** 防止进度事件并发查询相同迁移状态。 */
   const statusRefreshPending = React.useRef(false)
 
@@ -308,13 +378,14 @@ export function PathManagementSettings(): React.ReactElement {
       window.electronAPI.getDataRootMigrationStatus(),
     ])
     setState(mergePathManagementStatus(nextState, migrationStatus))
+    dispatchUi({ type: 'load-succeeded' })
   }, [])
 
   React.useEffect(() => {
     /** 卸载后阻止异步回调写入页面。 */
     let mounted = true
     loadState().catch((loadError: unknown) => {
-      if (mounted) setError(toErrorMessage(loadError, '无法读取路径状态'))
+      if (mounted) dispatchUi({ type: 'load-failed', message: toErrorMessage(loadError, '无法读取路径状态') })
     })
     /** 进度事件先更新轻量进度，再串行刷新完整状态。 */
     const unsubscribe = window.electronAPI.onDataRootMigrationProgress((migration) => {
@@ -326,7 +397,7 @@ export function PathManagementSettings(): React.ReactElement {
         if (!mounted) return
         setState((current) => current === null ? current : mergePathManagementStatus(current, status))
       }).catch((statusError: unknown) => {
-        if (mounted) setError(toErrorMessage(statusError, '无法刷新迁移状态'))
+        if (mounted) dispatchUi({ type: 'load-failed', message: toErrorMessage(statusError, '无法刷新迁移状态') })
       }).finally(() => { statusRefreshPending.current = false })
     })
     return () => {
@@ -340,11 +411,14 @@ export function PathManagementSettings(): React.ReactElement {
   /** 打开 locator 中的当前或上次数据根。 */
   const handleOpenRoot = async (target: OpenDataRootTarget): Promise<void> => {
     setIsBusy(true)
-    setError(undefined)
+    dispatchUi({ type: 'action-succeeded' })
     try {
       await window.electronAPI.openDataRoot(target)
     } catch (openError) {
-      setError(toErrorMessage(openError, target === 'previous' ? '无法打开上次路径' : '无法打开当前路径'))
+      dispatchUi({
+        type: 'action-failed',
+        message: toErrorMessage(openError, target === 'previous' ? '无法打开上次路径' : '无法打开当前路径'),
+      })
     } finally {
       setIsBusy(false)
     }
@@ -353,22 +427,34 @@ export function PathManagementSettings(): React.ReactElement {
   /** 打开选择器并等待可取消的确认对话框，再由主进程创建迁移计划。 */
   const handleMigration = async (): Promise<void> => {
     if (state === null) return
+    /** 本次选择流程的稳定代次。 */
+    const flowId = migrationFlowId.current + 1
+    migrationFlowId.current = flowId
     setIsBusy(true)
-    setError(undefined)
+    dispatchUi({ type: 'pick-started' })
     try {
       await requestDataRootMigration(state, {
         pickDataRoot: window.electronAPI.pickDataRoot,
-        confirmMigration: async (targetRoot) => {
-          setSelectedTarget(targetRoot)
-          return await new Promise<boolean>((resolve) => { confirmationResolver.current = resolve })
+        previewDataRootMigration: async (targetRoot) => {
+          dispatchUi({ type: 'preview-started', targetRoot })
+          const preview = await window.electronAPI.previewDataRootMigration(targetRoot)
+          if (migrationFlowId.current === flowId) dispatchUi({ type: 'preview-succeeded', preview })
+          return preview
+        },
+        confirmMigration: async () => {
+          if (migrationFlowId.current !== flowId) return false
+          setIsBusy(false)
+          const confirmed = await new Promise<boolean>((resolve) => { confirmationResolver.current = resolve })
+          if (confirmed) setIsBusy(true)
+          return confirmed
         },
         startDataRootMigration: window.electronAPI.startDataRootMigration,
       })
     } catch (migrationError) {
-      setError(toErrorMessage(migrationError, '无法创建迁移计划'))
+      dispatchUi({ type: 'action-failed', message: toErrorMessage(migrationError, '无法创建迁移计划') })
       await loadState().catch(() => undefined)
     } finally {
-      setIsBusy(false)
+      if (migrationFlowId.current === flowId) setIsBusy(false)
     }
   }
 
@@ -376,19 +462,27 @@ export function PathManagementSettings(): React.ReactElement {
   const resolveConfirmation = (confirmed: boolean): void => {
     const resolver = confirmationResolver.current
     confirmationResolver.current = null
-    setSelectedTarget(null)
+    if (!confirmed) migrationFlowId.current += 1
+    dispatchUi({ type: 'preview-closed' })
+    if (!confirmed && resolver === null) setIsBusy(false)
     resolver?.(confirmed)
   }
 
   /** 支持 Escape、遮罩和关闭按钮统一取消确认。 */
   const handleDialogOpenChange = (open: boolean): void => {
-    if (!open && selectedTarget !== null) resolveConfirmation(false)
+    if (!open && uiState.selectedTarget !== null) resolveConfirmation(false)
   }
 
   /** 当前页面视图。 */
-  const view = createPathManagementSettingsView(state, error)
+  const view = createPathManagementSettingsView(state, uiState.loadError)
   /** 当前设备类型风险。 */
-  const deviceRisk = state === null ? null : getDataRootDeviceRisk(state.deviceType)
+  const deviceRisk = uiState.preview === null ? null : getDataRootDeviceRisk(uiState.preview.deviceType)
+  /** 当前预览是否阻断最终确认。 */
+  const confirmDisabled = isDataRootMigrationConfirmDisabled({
+    preview: uiState.preview,
+    previewLoading: uiState.previewLoading,
+    isBusy,
+  })
 
   return (
     <div className="space-y-6">
@@ -410,15 +504,15 @@ export function PathManagementSettings(): React.ReactElement {
         />
       )}
 
-      {error !== undefined && state !== null ? (
+      {uiState.actionError !== undefined && state !== null ? (
         <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {error}
+          {uiState.actionError}
         </p>
       ) : null}
 
       <CrossDeviceMigrationSection />
 
-      <Dialog open={selectedTarget !== null} onOpenChange={handleDialogOpenChange}>
+      <Dialog open={uiState.selectedTarget !== null} onOpenChange={handleDialogOpenChange}>
         <DialogContent className="max-w-xl rounded-lg" aria-describedby="data-root-migration-description">
           <DialogHeader>
             <DialogTitle>确认迁移 Proma 数据位置</DialogTitle>
@@ -428,11 +522,21 @@ export function PathManagementSettings(): React.ReactElement {
           </DialogHeader>
           <div className="space-y-3 text-sm">
             <PathSummary label="源位置" path={state?.activeRoot ?? '未知'} />
-            <PathSummary label="目标位置" path={selectedTarget ?? '未选择'} />
+            <PathSummary label="目标位置" path={uiState.selectedTarget ?? '未选择'} />
             <div className="grid grid-cols-2 gap-3 rounded-md border border-border/50 bg-muted/20 p-3 text-xs text-muted-foreground">
-              <span>待迁移数据：{formatBytes(state?.occupiedBytes)}</span>
-              <span>当前可用空间：{formatBytes(state?.availableBytes)}</span>
+              <span>待迁移数据：{formatBytes(uiState.preview?.requiredBytes)}</span>
+              <span>目标可用空间：{formatBytes(uiState.preview?.availableBytes)}</span>
             </div>
+            {uiState.previewLoading ? (
+              <p role="status" className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" aria-hidden="true" />正在检查目标位置...
+              </p>
+            ) : null}
+            {uiState.preview?.blockers.map((blocker) => (
+              <p key={blocker.code} role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
+                {blocker.message}
+              </p>
+            ))}
             {deviceRisk ? (
               <p className="flex gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-5 text-amber-800 dark:text-amber-200">
                 <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />{deviceRisk}
@@ -440,8 +544,13 @@ export function PathManagementSettings(): React.ReactElement {
             ) : null}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => resolveConfirmation(false)}>取消</Button>
-            <Button onClick={() => resolveConfirmation(true)}>确认并重启迁移</Button>
+            {uiState.preview?.blockers.length ? (
+              <Button variant="outline" onClick={() => {
+                resolveConfirmation(false)
+                queueMicrotask(() => { void handleMigration() })
+              }}>换一个位置</Button>
+            ) : <Button variant="outline" onClick={() => resolveConfirmation(false)}>取消</Button>}
+            <Button disabled={confirmDisabled} onClick={() => resolveConfirmation(true)}>确认并重启迁移</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

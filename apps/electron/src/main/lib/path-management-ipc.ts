@@ -3,6 +3,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import type {
+  DataRootMigrationPreview,
   DataRootMigrationProgress,
   DataRootStartupMode,
   OpenDataRootTarget,
@@ -14,6 +15,11 @@ import type { DataRootLocatorResult } from './data-root-locator'
 import { DataRootMigrationCoordinator } from './data-root-migration'
 import type { DataRootMigrationGuard } from './data-root-instance-lease'
 import { ensurePromaDataRootMarker } from './data-root-marker'
+import {
+  inspectDataRootStorage,
+  invalidateDataRootStorage,
+} from './data-root-storage'
+import type { DataRootStorageSnapshot } from './data-root-storage'
 
 /** 路径 IPC handler 接收 Electron event 和经过 preload 约束的参数。 */
 type PathManagementHandler = (event: unknown, ...args: unknown[]) => unknown
@@ -22,6 +28,7 @@ type PathManagementHandler = (event: unknown, ...args: unknown[]) => unknown
 const PATH_MANAGEMENT_HANDLER_CHANNELS: readonly string[] = [
   PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE,
   PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT,
+  PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION,
   PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
   PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS,
   PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION,
@@ -80,6 +87,8 @@ export interface PathManagementShell {
 export interface PathManagementCoordinator {
   /** 返回 locator 与迁移的公开状态。 */
   getStatus(): PathManagementState
+  /** 只读预检用户刚选择的目标目录。 */
+  previewTarget?: (targetRoot: string) => Promise<DataRootMigrationPreview>
   /** 创建已完成预检的迁移计划。 */
   createPlan(targetRoot: string): Promise<DataRootMigrationProgress>
   /** 执行当前 pending 迁移。 */
@@ -114,6 +123,8 @@ export interface RegisterPathManagementIpcOptions {
   acquireMigrationGuard?: () => DataRootMigrationGuard | Promise<DataRootMigrationGuard>
   /** 测试可注入独立 home；生产固定使用系统 home。 */
   homeDir?: string
+  /** 注入数据根存储检查，测试可避免真实磁盘扫描。 */
+  inspectStorage?: (rootPath: string) => Promise<DataRootStorageSnapshot>
 }
 
 /** 进程级 locator 延迟创建，模块导入本身不读取文件系统。 */
@@ -151,6 +162,8 @@ export function registerPathManagementIpcHandlers(
   }
   /** 本次实际注册的通道，防止迁移模式意外暴露业务 IPC。 */
   const registeredChannels: string[] = []
+  /** normal 窗口最近一次由系统选择器授权的原始绝对路径。 */
+  let lastPickedDataRoot: string | null = null
   /** mode 可能在开发热重载中变化，先删除全部旧 handler 再建立最小 allowlist。 */
   for (const channel of PATH_MANAGEMENT_HANDLER_CHANNELS) options.ipc.removeHandler(channel)
   /** 注册前先移除同名 handler，兼容 Electron 开发热重载。 */
@@ -163,6 +176,7 @@ export function registerPathManagementIpcHandlers(
   }
   /** 只向当前获授权的路径窗口推送迁移进度。 */
   const broadcastProgress = (progress: DataRootMigrationProgress): void => {
+    invalidateDataRootStorage()
     options.getExpectedWebContents()?.send(PATH_MANAGEMENT_IPC_CHANNELS.PROGRESS, progress)
   }
   /** 同一调用栈请求重启并退出，不留下 setImmediate 竞态窗口。 */
@@ -176,12 +190,34 @@ export function registerPathManagementIpcHandlers(
   }).inspect()
 
   if (options.mode === 'normal') {
-    register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, () => getCoordinator().getStatus())
+    register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, async () => {
+      const state = getCoordinator().getStatus()
+      if (state.activeRoot === null || state.availability !== 'available') return state
+      try {
+        const storage = await (options.inspectStorage ?? inspectDataRootStorage)(state.activeRoot)
+        return { ...state, ...storage }
+      } catch {
+        /** 设置页仍可操作；失败只降级实时容量和设备信息。 */
+        const { occupiedBytes: _occupiedBytes, availableBytes: _availableBytes, ...baseState } = state
+        return { ...baseState, deviceType: 'unknown' }
+      }
+    })
     register(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, async () => {
       if (!options.dialog) throw new Error('当前环境不支持选择数据根目录')
       /** 用户通过系统对话框选择的迁移目标目录。 */
       const result = await options.dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
-      return result.canceled ? null : result.filePaths[0] ?? null
+      const targetRoot = result.canceled ? null : result.filePaths[0] ?? null
+      lastPickedDataRoot = targetRoot
+      return targetRoot
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION, async (_event, targetRoot) => {
+      if (typeof targetRoot !== 'string' || !isAbsolute(targetRoot)) {
+        throw new Error('目标数据根必须是绝对路径')
+      }
+      if (targetRoot !== lastPickedDataRoot) throw new Error('只能预检刚刚选择的目标目录')
+      const previewTarget = getCoordinator().previewTarget
+      if (!previewTarget) throw new Error('当前环境不支持预检数据根目录')
+      return previewTarget.call(getCoordinator(), targetRoot)
     })
     register(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, async (_event, targetRoot) => {
       if (typeof targetRoot !== 'string') throw new Error('目标数据根必须是字符串')
@@ -204,6 +240,7 @@ export function registerPathManagementIpcHandlers(
         }
       }
       try {
+        invalidateDataRootStorage()
         // 取得 intent 后二次预检，排除 intent 竞争窗口内进入的实例与任务。
         await assertMigrationCanStart(options)
         migrationCoordinator = getCoordinator()
@@ -259,12 +296,21 @@ export function registerPathManagementIpcHandlers(
   } else if (options.mode === 'data-root-migration') {
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, () => getCoordinator().getStatus())
     register(PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION, async () => {
-      await getCoordinator().resumePending(broadcastProgress)
-      relaunchNow()
+      invalidateDataRootStorage()
+      try {
+        await getCoordinator().resumePending(broadcastProgress)
+        relaunchNow()
+      } finally {
+        invalidateDataRootStorage()
+      }
     })
     register(PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_DATA_ROOT_MIGRATION, async () => {
-      await getCoordinator().cancel()
-      relaunchNow()
+      try {
+        await getCoordinator().cancel()
+        relaunchNow()
+      } finally {
+        invalidateDataRootStorage()
+      }
     })
   } else {
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, () => inspectFresh().state)
@@ -282,8 +328,8 @@ export function registerPathManagementIpcHandlers(
 
   register(PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, async (_event, rawTarget) => {
     if (!options.shell) throw new Error('当前环境不支持打开数据根目录')
-    /** 省略参数兼容旧调用；其他输入必须是固定枚举，禁止 renderer 指定任意路径。 */
-    const target: OpenDataRootTarget = rawTarget === undefined ? 'current' : assertOpenDataRootTarget(rawTarget)
+    /** 必须显式声明 current/previous，禁止 renderer 依赖含糊的缺省行为。 */
+    const target: OpenDataRootTarget = assertOpenDataRootTarget(rawTarget)
     /** 优先使用新鲜 recovery 状态，普通模式复用协调器状态。 */
     const resolvedState = options.mode === 'data-root-recovery'
       ? inspectFresh().state

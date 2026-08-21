@@ -72,6 +72,50 @@ describe('DataRootMigrationCoordinator', () => {
     })
   })
 
+  test('Given 安全空目标 When 只读 preview Then 返回容量且不写 locator 或创建目标', async () => {
+    const harness = createHarness()
+    /** RED 阶段按目标合同读取 preview 方法。 */
+    const previewTarget = (harness.coordinator as unknown as {
+      previewTarget?: (targetRoot: string) => Promise<{
+        targetRoot: string
+        deviceType: string
+        availableBytes?: number
+        requiredBytes: number
+        blockers: Array<{ code: string; message: string }>
+      }>
+    }).previewTarget
+    expect(typeof previewTarget).toBe('function')
+
+    const preview = await previewTarget?.call(harness.coordinator, targetRoot)
+
+    expect(preview).toMatchObject({
+      targetRoot,
+      availableBytes: 1_000_000,
+      requiredBytes: Buffer.byteLength('{"theme":"dark"}'),
+      blockers: [],
+    })
+    expect(existsSync(targetRoot)).toBe(false)
+    expect(harness.locator.inspect().locatorFile?.migration).toBeUndefined()
+  })
+
+  test('Given 非空目标 When 只读 preview Then 返回 blocker 且不创建迁移计划', async () => {
+    mkdirSync(targetRoot)
+    writeFileSync(join(targetRoot, 'foreign.txt'), 'foreign')
+    const harness = createHarness({ inspectCopyOwnership: async () => 'absent' })
+    /** RED 阶段按目标合同读取 preview 方法。 */
+    const previewTarget = (harness.coordinator as unknown as {
+      previewTarget?: (targetRoot: string) => Promise<{
+        blockers: Array<{ code: string; message: string }>
+      }>
+    }).previewTarget
+    expect(typeof previewTarget).toBe('function')
+
+    const preview = await previewTarget?.call(harness.coordinator, targetRoot)
+
+    expect(preview?.blockers).toContainEqual({ code: 'TARGET_NOT_EMPTY', message: '非空目标不属于当前迁移' })
+    expect(harness.locator.inspect().locatorFile?.migration).toBeUndefined()
+  })
+
   test('Given coordinator 已持有 pending lease When 重复创建计划失败 Then 不释放原有 lease', async () => {
     const holder = createHarness({ isPidRunning: () => true })
     await holder.coordinator.createPlan(targetRoot)

@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ComponentType } from 'react'
-import type { DataRootMigrationStatus, PathManagementState } from '@proma/shared'
+import type {
+  DataRootMigrationPreview,
+  DataRootMigrationStatus,
+  PathManagementState,
+} from '@proma/shared'
 import { readFileSync } from 'node:fs'
 import * as migrationSettingsModule from './PathManagementSettings'
 
@@ -16,7 +20,8 @@ interface ExpectedPathManagementSettingsModule {
     state: PathManagementState,
     dependencies: {
       pickDataRoot: () => Promise<string | null>
-      confirmMigration: (targetRoot: string) => Promise<boolean>
+      previewDataRootMigration: (targetRoot: string) => Promise<DataRootMigrationPreview>
+      confirmMigration: (preview: DataRootMigrationPreview) => Promise<boolean>
       startDataRootMigration: (targetRoot: string) => Promise<void>
     },
   ) => Promise<'cancelled' | 'started'>
@@ -27,6 +32,30 @@ interface ExpectedPathManagementSettingsModule {
   ) => PathManagementState
   DataRootLocationSection: ComponentType<{ state: PathManagementState }>
   CrossDeviceMigrationSection: ComponentType
+  createPathManagementUiState: () => {
+    loadError?: string
+    actionError?: string
+    selectedTarget: string | null
+    preview: DataRootMigrationPreview | null
+    previewLoading: boolean
+  }
+  reducePathManagementUiState: (
+    state: ReturnType<ExpectedPathManagementSettingsModule['createPathManagementUiState']>,
+    action:
+      | { type: 'load-failed'; message: string }
+      | { type: 'load-succeeded' }
+      | { type: 'action-failed'; message: string }
+      | { type: 'action-succeeded' }
+      | { type: 'pick-started' }
+      | { type: 'preview-started'; targetRoot: string }
+      | { type: 'preview-succeeded'; preview: DataRootMigrationPreview }
+      | { type: 'preview-closed' },
+  ) => ReturnType<ExpectedPathManagementSettingsModule['createPathManagementUiState']>
+  isDataRootMigrationConfirmDisabled: (input: {
+    preview: DataRootMigrationPreview | null
+    previewLoading: boolean
+    isBusy: boolean
+  }) => boolean
 }
 
 /** RED 阶段通过可选合同读取新增导出，避免模块不存在导致测试环境错误。 */
@@ -44,6 +73,18 @@ function createState(overrides: Partial<PathManagementState> = {}): PathManageme
     occupiedBytes: 1024 * 1024,
     availableBytes: 10 * 1024 * 1024,
     migration: null,
+    ...overrides,
+  }
+}
+
+/** 创建目标预览行为测试使用的安全结果。 */
+function createPreview(overrides: Partial<DataRootMigrationPreview> = {}): DataRootMigrationPreview {
+  return {
+    targetRoot: '/Volumes/New/Proma',
+    deviceType: 'removable',
+    availableBytes: 20 * 1024 * 1024,
+    requiredBytes: 1024 * 1024,
+    blockers: [],
     ...overrides,
   }
 }
@@ -109,11 +150,13 @@ describe('PathManagementSettings', () => {
 
     const cancelledAtPicker = await requestDataRootMigration(createState(), {
       pickDataRoot: async () => null,
+      previewDataRootMigration: async () => createPreview(),
       confirmMigration: async () => true,
       startDataRootMigration: async () => { started = true },
     })
     const cancelledAtDialog = await requestDataRootMigration(createState(), {
       pickDataRoot: async () => '/Volumes/New/Proma',
+      previewDataRootMigration: async () => createPreview(),
       confirmMigration: async () => false,
       startDataRootMigration: async () => { started = true },
     })
@@ -134,8 +177,12 @@ describe('PathManagementSettings', () => {
         calls.push('pick')
         return '/Volumes/New/Proma'
       },
-      confirmMigration: async (targetRoot) => {
-        calls.push(`confirm:${targetRoot}`)
+      previewDataRootMigration: async (targetRoot) => {
+        calls.push(`preview:${targetRoot}`)
+        return createPreview({ targetRoot })
+      },
+      confirmMigration: async (preview) => {
+        calls.push(`confirm:${preview.targetRoot}`)
         return true
       },
       startDataRootMigration: async (targetRoot) => {
@@ -144,7 +191,12 @@ describe('PathManagementSettings', () => {
     })
 
     expect(result).toBe('started')
-    expect(calls).toEqual(['pick', 'confirm:/Volumes/New/Proma', 'start:/Volumes/New/Proma'])
+    expect(calls).toEqual([
+      'pick',
+      'preview:/Volumes/New/Proma',
+      'confirm:/Volumes/New/Proma',
+      'start:/Volumes/New/Proma',
+    ])
   })
 
   test('Given 状态已被迁移或 cleanup 阻断 When 请求迁移 Then 不打开目录选择器', async () => {
@@ -162,10 +214,88 @@ describe('PathManagementSettings', () => {
 
     expect(requestDataRootMigration(blockedState, {
       pickDataRoot: async () => { picked = true; return '/Volumes/New/Proma' },
+      previewDataRootMigration: async () => createPreview(),
       confirmMigration: async () => true,
       startDataRootMigration: async () => undefined,
     })).rejects.toThrow('当前路径状态不允许创建新的迁移计划')
     expect(picked).toBe(false)
+  })
+
+  test('Given 目标预览存在 blocker When 请求迁移 Then 展示预览但不允许启动', async () => {
+    const { requestDataRootMigration } = getExpectedModule()
+    /** 记录 blocker 预览是否仍进入可更换位置的确认界面。 */
+    let confirmedBlockerCount = 0
+    let started = false
+
+    const result = await requestDataRootMigration(createState(), {
+      pickDataRoot: async () => '/Volumes/New/Proma',
+      previewDataRootMigration: async () => createPreview({
+        blockers: [{ code: 'TARGET_NOT_EMPTY', message: '目标目录必须为空' }],
+      }),
+      confirmMigration: async (preview) => {
+        confirmedBlockerCount = preview.blockers.length
+        return true
+      },
+      startDataRootMigration: async () => { started = true },
+    })
+
+    expect(result).toBe('cancelled')
+    expect(confirmedBlockerCount).toBe(1)
+    expect(started).toBe(false)
+  })
+
+  test('Given 加载与普通操作分别失败 When 状态转换 Then 错误独立清除且操作错误不阻断迁移', () => {
+    const {
+      createPathManagementUiState,
+      createPathManagementSettingsView,
+      reducePathManagementUiState,
+      isDataRootMigrationConfirmDisabled,
+    } = getExpectedModule()
+    expect(typeof reducePathManagementUiState).toBe('function')
+    /** 首次载入失败只影响 loadError。 */
+    const loadFailed = reducePathManagementUiState(createPathManagementUiState(), {
+      type: 'load-failed',
+      message: '无法读取路径状态',
+    })
+    /** 普通打开失败只影响 actionError。 */
+    const actionFailed = reducePathManagementUiState(loadFailed, {
+      type: 'action-failed',
+      message: '无法打开当前路径',
+    })
+    const reloaded = reducePathManagementUiState(actionFailed, { type: 'load-succeeded' })
+    const repicked = reducePathManagementUiState(reloaded, { type: 'pick-started' })
+
+    expect(actionFailed).toMatchObject({ loadError: '无法读取路径状态', actionError: '无法打开当前路径' })
+    expect(reloaded.loadError).toBeUndefined()
+    expect(reloaded.actionError).toBe('无法打开当前路径')
+    expect(repicked.actionError).toBeUndefined()
+    expect(createPathManagementSettingsView(createState(), repicked.loadError).migrationBlocked).toBe(false)
+    expect(isDataRootMigrationConfirmDisabled({
+      preview: createPreview(),
+      previewLoading: false,
+      isBusy: false,
+    })).toBe(false)
+  })
+
+  test('Given 预览加载中或存在 blocker When 派生确认状态 Then 禁用确认但仍保留目标', () => {
+    const {
+      createPathManagementUiState,
+      reducePathManagementUiState,
+      isDataRootMigrationConfirmDisabled,
+    } = getExpectedModule()
+    const previewing = reducePathManagementUiState(createPathManagementUiState(), {
+      type: 'preview-started',
+      targetRoot: '/Volumes/New/Proma',
+    })
+    const blocked = reducePathManagementUiState(previewing, {
+      type: 'preview-succeeded',
+      preview: createPreview({ blockers: [{ code: 'INSUFFICIENT_SPACE', message: '空间不足' }] }),
+    })
+
+    expect(previewing).toMatchObject({ selectedTarget: '/Volumes/New/Proma', previewLoading: true })
+    expect(isDataRootMigrationConfirmDisabled({ preview: null, previewLoading: true, isBusy: false })).toBe(true)
+    expect(blocked.selectedTarget).toBe('/Volumes/New/Proma')
+    expect(isDataRootMigrationConfirmDisabled({ preview: blocked.preview, previewLoading: false, isBusy: false })).toBe(true)
   })
 
   test('Given network 或 removable 数据根 When 生成风险 Then 显示断连或性能提醒', () => {

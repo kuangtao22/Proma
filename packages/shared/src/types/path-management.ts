@@ -1,6 +1,9 @@
 /** 数据根当前可访问性。 */
 export type DataRootAvailability = 'available' | 'missing' | 'unavailable' | 'invalid'
 
+/** 数据根所在存储设备的系统分类。 */
+export type DataRootDeviceType = 'local' | 'removable' | 'network' | 'unknown'
+
 /** 可恢复迁移任务的执行阶段。 */
 export type DataRootMigrationStage = 'pending' | 'copying' | 'verifying' | 'rebasing' | 'switching' | 'failed'
 
@@ -19,11 +22,34 @@ export interface PathManagementState {
   activeRoot: string | null
   previousRoot?: string
   availability: DataRootAvailability
-  deviceType: 'local' | 'removable' | 'network' | 'unknown'
+  deviceType: DataRootDeviceType
   occupiedBytes?: number
   availableBytes?: number
   migration: DataRootMigrationProgress | null
   postCommitCleanup?: DataRootPostCommitCleanupProgress
+}
+
+/** 只读目标预检允许公开给用户处理的稳定错误分类。 */
+export type DataRootMigrationPreviewBlockerCode =
+  | 'INVALID_SOURCE'
+  | 'UNSAFE_TARGET'
+  | 'TARGET_NOT_WRITABLE'
+  | 'TARGET_NOT_EMPTY'
+  | 'INSUFFICIENT_SPACE'
+
+/** 只读目标预检发现的阻断项。 */
+export interface DataRootMigrationPreviewBlocker {
+  code: DataRootMigrationPreviewBlockerCode
+  message: string
+}
+
+/** 用户确认迁移前展示的目标卷与容量信息。 */
+export interface DataRootMigrationPreview {
+  targetRoot: string
+  deviceType: DataRootDeviceType
+  availableBytes?: number
+  requiredBytes: number
+  blockers: DataRootMigrationPreviewBlocker[]
 }
 
 /** 已提交迁移仍待完成的 sidecar 清理状态。 */
@@ -160,6 +186,7 @@ function isNonNegativeFiniteNumber(value: unknown): value is number {
 export const PATH_MANAGEMENT_IPC_CHANNELS = {
   GET_STATE: 'path-management:get-state',
   PICK_DATA_ROOT: 'path-management:pick-data-root',
+  PREVIEW_DATA_ROOT_MIGRATION: 'path-management:preview-data-root-migration',
   START_DATA_ROOT_MIGRATION: 'path-management:start-data-root-migration',
   GET_DATA_ROOT_MIGRATION_STATUS: 'path-management:get-data-root-migration-status',
   RESUME_DATA_ROOT_MIGRATION: 'path-management:resume-data-root-migration',

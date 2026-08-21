@@ -14,8 +14,11 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
-import { lstat, opendir, statfs } from 'node:fs/promises'
+import { lstat, opendir } from 'node:fs/promises'
 import type {
+  DataRootDeviceType,
+  DataRootMigrationPreview,
+  DataRootMigrationPreviewBlockerCode,
   DataRootMigrationProgress,
   DataRootMigrationRecord,
   DataRootMigrationStage,
@@ -38,6 +41,20 @@ import {
 } from './verified-directory-copier'
 import type { RebaseDataRootOwnedPathsInput, RebaseDataRootOwnedPathsResult } from './owned-path-rebaser'
 import { rebaseDataRootOwnedPaths } from './owned-path-rebaser'
+import { inspectDataRootVolume } from './data-root-storage'
+import type { DataRootVolumeSnapshot } from './data-root-storage'
+
+export {
+  DataRootStorageInspector,
+  classifyLinuxMountInfo,
+  classifyMacDiskInfo,
+  classifyWindowsDriveType,
+  inspectDataRootStorage,
+  invalidateDataRootStorage,
+  inspectDataRootVolume,
+  scanDataRootBytes,
+  toSafeByteCount,
+} from './data-root-storage'
 
 /** 用户可处理的迁移错误分类。 */
 export type DataRootMigrationErrorCode =
@@ -73,6 +90,8 @@ export interface DataRootMigrationCoordinatorOptions {
   createLockOwnerToken?: () => string
   now?: () => number
   getAvailableBytes?: (existingTargetAncestor: string) => Promise<number>
+  /** 可注入目标卷元数据检查；指定 getAvailableBytes 时设备类型按 unknown 处理。 */
+  inspectTargetVolume?: (existingTargetAncestor: string) => Promise<DataRootVolumeSnapshot>
   isPidRunning?: (pid: number) => boolean
   copyDirectory?: (input: CopyDirectoryInput) => Promise<CopyDirectoryResult>
   rebaseOwnedPaths?: (input: RebaseDataRootOwnedPathsInput) => RebaseDataRootOwnedPathsResult
@@ -104,6 +123,9 @@ interface MigrationPreflight {
   sourceRoot: string
   targetRoot: string
   totalBytes: number
+  requiredBytes: number
+  availableBytes?: number
+  deviceType: DataRootDeviceType
 }
 
 /** plan 与 resume 共用的只读预检策略。 */
@@ -126,8 +148,8 @@ export class DataRootMigrationCoordinator {
   private readonly createLockOwnerToken: () => string
   /** 可注入时钟。 */
   private readonly now: () => number
-  /** 可注入目标可用容量读取器。 */
-  private readonly getAvailableBytes: (existingTargetAncestor: string) => Promise<number>
+  /** 读取目标所在卷容量与设备分类。 */
+  private readonly inspectTargetVolume: (existingTargetAncestor: string) => Promise<DataRootVolumeSnapshot>
   /** 可注入 PID 存活检查。 */
   private readonly isPidRunning: (pid: number) => boolean
   /** Task3 可恢复复制公开入口。 */
@@ -159,7 +181,10 @@ export class DataRootMigrationCoordinator {
     this.createMigrationId = options.createMigrationId ?? randomUUID
     this.createLockOwnerToken = options.createLockOwnerToken ?? randomUUID
     this.now = options.now ?? Date.now
-    this.getAvailableBytes = options.getAvailableBytes ?? getStatfsAvailableBytes
+    this.inspectTargetVolume = options.inspectTargetVolume
+      ?? (options.getAvailableBytes === undefined
+        ? inspectDataRootVolume
+        : async (target) => ({ availableBytes: await options.getAvailableBytes?.(target) ?? 0, deviceType: 'unknown' }))
     this.isPidRunning = options.isPidRunning ?? isProcessRunning
     this.copyDirectory = options.copyDirectory ?? copyDirectoryVerified
     this.rebaseOwnedPaths = options.rebaseOwnedPaths ?? rebaseDataRootOwnedPaths
@@ -185,6 +210,53 @@ export class DataRootMigrationCoordinator {
   /** 无副作用返回 locator 当前状态。 */
   getStatus(): PathManagementState {
     return this.locator.inspect().state
+  }
+
+  /** 复用迁移预检生成只读目标预览，不获取锁、不写 locator、不创建目录。 */
+  async previewTarget(targetRoot: string): Promise<DataRootMigrationPreview> {
+    const normalizedTarget = resolve(targetRoot)
+    try {
+      const preflight = await this.preflight(targetRoot, `preview-${this.createMigrationId()}`)
+      return {
+        targetRoot: preflight.targetRoot,
+        deviceType: preflight.deviceType,
+        ...(preflight.availableBytes === undefined ? {} : { availableBytes: preflight.availableBytes }),
+        requiredBytes: preflight.requiredBytes,
+        blockers: [],
+      }
+    } catch (error) {
+      const blocker = toPreviewBlocker(error)
+      /** 阻断不应隐藏仍可安全读取的容量摘要。 */
+      const metadata = await this.inspectPreviewMetadata(normalizedTarget)
+      return {
+        targetRoot: normalizedTarget,
+        deviceType: metadata.deviceType,
+        ...(metadata.availableBytes === undefined ? {} : { availableBytes: metadata.availableBytes }),
+        requiredBytes: metadata.requiredBytes,
+        blockers: [blocker],
+      }
+    }
+  }
+
+  /** blocker 场景下尽最大努力读取源大小与目标卷，不让展示元数据覆盖真实阻断原因。 */
+  private async inspectPreviewMetadata(targetRoot: string): Promise<{
+    requiredBytes: number
+    availableBytes?: number
+    deviceType: DataRootDeviceType
+  }> {
+    let requiredBytes = 0
+    try {
+      requiredBytes = await scanSourceBytes(this.locator.requireActiveRoot())
+    } catch {
+      // INVALID_SOURCE blocker 已携带可处理原因，摘要保持 0。
+    }
+    try {
+      const prospectiveTarget = resolveProspectiveTarget(targetRoot)
+      const volume = await this.inspectTargetVolume(prospectiveTarget.existingAncestor)
+      return { requiredBytes, ...volume }
+    } catch {
+      return { requiredBytes, deviceType: 'unknown' }
+    }
   }
 
   /**
@@ -637,10 +709,13 @@ export class DataRootMigrationCoordinator {
       requiredBytes = copySpace.remainingBytes
       if (token) this.throwIfCancelled(token)
     }
+    let availableBytes: number | undefined
+    let deviceType: DataRootDeviceType = 'unknown'
     if (options.checkSpace !== false) {
-      let availableBytes: number
       try {
-        availableBytes = await this.getAvailableBytes(prospectiveTarget.existingAncestor)
+        const volume = await this.inspectTargetVolume(prospectiveTarget.existingAncestor)
+        availableBytes = volume.availableBytes
+        deviceType = volume.deviceType
       } catch (error) {
         throw new DataRootMigrationError('TARGET_NOT_WRITABLE', '无法读取目标磁盘可用空间', error)
       }
@@ -649,7 +724,14 @@ export class DataRootMigrationCoordinator {
         throw new DataRootMigrationError('INSUFFICIENT_SPACE', '目标磁盘可用空间不足')
       }
     }
-    return { sourceRoot: resolve(sourceRoot), targetRoot: normalizedTarget, totalBytes }
+    return {
+      sourceRoot: resolve(sourceRoot),
+      targetRoot: normalizedTarget,
+      totalBytes,
+      requiredBytes,
+      availableBytes,
+      deviceType,
+    }
   }
 
   /** open(wx) 建立进程锁，返回本次调用是否新建 lease。 */
@@ -711,17 +793,6 @@ export class DataRootMigrationCoordinator {
     releaseActiveLockClaim(this.lockPath)
     this.lockOwnerToken = null
   }
-}
-
-/** 使用 Node statfs 计算普通用户可用字节。 */
-async function getStatfsAvailableBytes(directoryPath: string): Promise<number> {
-  /** 文件系统以 bigint 返回的容量统计，避免乘法阶段溢出。 */
-  const stats = await statfs(directoryPath, { bigint: true })
-  /** 普通用户可用块数换算得到的原始字节数。 */
-  const availableBytes = stats.bavail * stats.bsize
-  return availableBytes > BigInt(Number.MAX_SAFE_INTEGER)
-    ? Number.MAX_SAFE_INTEGER
-    : Number(availableBytes)
 }
 
 /** kill(pid, 0) 不发送信号，仅判断 PID 是否仍存在。 */
@@ -805,6 +876,22 @@ function toProgress(record: DataRootMigrationRecord): DataRootMigrationProgress 
     totalBytes: record.totalBytes,
     ...(record.error === undefined ? {} : { error: record.error }),
   }
+}
+
+/** 把 coordinator 错误收敛为预览允许公开的稳定 blocker。 */
+function toPreviewBlocker(error: unknown): {
+  code: DataRootMigrationPreviewBlockerCode
+  message: string
+} {
+  if (error instanceof DataRootMigrationError && isPreviewBlockerCode(error.code)) {
+    return { code: error.code, message: error.message }
+  }
+  return { code: 'UNSAFE_TARGET', message: error instanceof Error ? error.message : '无法预检目标数据根' }
+}
+
+/** 预览只公开用户可在确认前处理的预检错误。 */
+function isPreviewBlockerCode(code: DataRootMigrationErrorCode): code is DataRootMigrationPreviewBlockerCode {
+  return ['INVALID_SOURCE', 'UNSAFE_TARGET', 'TARGET_NOT_WRITABLE', 'TARGET_NOT_EMPTY', 'INSUFFICIENT_SPACE'].includes(code)
 }
 
 /** 严格读取锁记录，损坏锁不允许自动删除。 */

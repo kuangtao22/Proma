@@ -1,6 +1,7 @@
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import type {
   DataRootMigrationProgress,
+  DataRootMigrationPreview,
   DataRootMigrationStatus,
   OpenDataRootTarget,
   PathManagementState,
@@ -24,12 +25,14 @@ export interface NormalPathManagementPreloadApi {
   getPathManagementState: () => Promise<PathManagementState>
   /** 使用系统选择器选择迁移目标目录。 */
   pickDataRoot: () => Promise<string | null>
+  /** 只读预检系统选择器刚返回的目标目录。 */
+  previewDataRootMigration: (targetRoot: string) => Promise<DataRootMigrationPreview>
   /** 创建迁移计划并请求重启。 */
   startDataRootMigration: (targetRoot: string) => Promise<void>
   /** 获取当前迁移与提交后清理状态。 */
   getDataRootMigrationStatus: () => Promise<DataRootMigrationStatus>
   /** 在系统文件管理器打开 locator 中的当前或上次数据根。 */
-  openDataRoot: (target?: OpenDataRootTarget) => Promise<void>
+  openDataRoot: (target: OpenDataRootTarget) => Promise<void>
   /** 订阅数据根迁移进度。 */
   onDataRootMigrationProgress: (callback: (progress: DataRootMigrationProgress) => void) => () => void
 }
@@ -43,7 +46,7 @@ export interface DataRootMigrationPreloadApi {
   /** 取消尚未切换的数据根迁移计划。 */
   cancelDataRootMigration: () => Promise<void>
   /** 在系统文件管理器打开 locator 中的当前或上次数据根。 */
-  openDataRoot: (target?: OpenDataRootTarget) => Promise<void>
+  openDataRoot: (target: OpenDataRootTarget) => Promise<void>
   /** 退出轻量路径管理窗口。 */
   exitDataRootManagement: () => Promise<void>
   /** 订阅数据根迁移进度。 */
@@ -59,7 +62,7 @@ export interface DataRootRecoveryPreloadApi {
   /** 执行离线数据根恢复动作。 */
   recoverDataRoot: (input: RecoverDataRootInput) => Promise<void>
   /** 在系统文件管理器打开 locator 中的当前或上次数据根。 */
-  openDataRoot: (target?: OpenDataRootTarget) => Promise<void>
+  openDataRoot: (target: OpenDataRootTarget) => Promise<void>
   /** 退出轻量路径管理窗口。 */
   exitDataRootManagement: () => Promise<void>
 }
@@ -77,6 +80,10 @@ export function createNormalPathManagementPreloadApi(
   return {
     getPathManagementState: () => invokePathManagementState(ipc),
     pickDataRoot: () => invokePickDataRoot(ipc),
+    previewDataRootMigration: (targetRoot) => ipc.invoke(
+      PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_DATA_ROOT_MIGRATION,
+      targetRoot,
+    ) as Promise<DataRootMigrationPreview>,
     startDataRootMigration: (targetRoot) => ipc.invoke(
       PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION,
       targetRoot,
@@ -144,10 +151,8 @@ function invokePickDataRoot(ipc: PathManagementPreloadIpc): Promise<string | nul
 }
 
 /** 调用所有 mode 共用的打开数据根通道。 */
-function invokeOpenDataRoot(ipc: PathManagementPreloadIpc, target?: OpenDataRootTarget): Promise<void> {
-  return target === undefined
-    ? ipc.invoke(PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT) as Promise<void>
-    : ipc.invoke(PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, target) as Promise<void>
+function invokeOpenDataRoot(ipc: PathManagementPreloadIpc, target: OpenDataRootTarget): Promise<void> {
+  return ipc.invoke(PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, target) as Promise<void>
 }
 
 /** 调用 dedicated mode 共用的退出通道。 */

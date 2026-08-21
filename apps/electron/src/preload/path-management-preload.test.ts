@@ -77,17 +77,20 @@ describe('路径管理 preload API', () => {
       'onDataRootMigrationProgress',
       'openDataRoot',
       'pickDataRoot',
+      'previewDataRootMigration',
       'startDataRootMigration',
     ])
 
     await invokeApi(api, 'getPathManagementState')
     await invokeApi(api, 'pickDataRoot')
+    await invokeApi(api, 'previewDataRootMigration', '/data/new')
     await invokeApi(api, 'startDataRootMigration', '/data/new')
     await invokeApi(api, 'getDataRootMigrationStatus')
     await invokeApi(api, 'openDataRoot', 'previous')
     expect(recorded.invokes).toEqual([
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, args: [] },
+      { channel: 'path-management:preview-data-root-migration', args: ['/data/new'] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, args: ['/data/new'] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, args: ['previous'] },
@@ -113,13 +116,13 @@ describe('路径管理 preload API', () => {
     await invokeApi(api, 'getPathManagementState')
     await invokeApi(api, 'resumeDataRootMigration')
     await invokeApi(api, 'cancelDataRootMigration')
-    await invokeApi(api, 'openDataRoot')
+    await invokeApi(api, 'openDataRoot', 'current')
     await invokeApi(api, 'exitDataRootManagement')
     expect(recorded.invokes).toEqual([
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_DATA_ROOT_MIGRATION, args: [] },
-      { channel: PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, args: [] },
+      { channel: PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, args: ['current'] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP, args: [] },
     ])
   })
@@ -142,13 +145,13 @@ describe('路径管理 preload API', () => {
     await invokeApi(api, 'getPathManagementState')
     await invokeApi(api, 'pickDataRoot')
     await invokeApi(api, 'recoverDataRoot', { action: 'relocate', selectedRoot: '/data/found' })
-    await invokeApi(api, 'openDataRoot')
+    await invokeApi(api, 'openDataRoot', 'current')
     await invokeApi(api, 'exitDataRootManagement')
     expect(recorded.invokes).toEqual([
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT, args: [{ action: 'relocate', selectedRoot: '/data/found' }] },
-      { channel: PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, args: [] },
+      { channel: PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, args: ['current'] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP, args: [] },
     ])
   })
