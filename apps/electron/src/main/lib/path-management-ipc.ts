@@ -187,30 +187,65 @@ export function registerPathManagementIpcHandlers(
       await assertMigrationCanStart(options)
       /** intent guard 关闭其他 normal 实例的新入口，直到当前进程退出。 */
       const migrationGuard = await options.acquireMigrationGuard?.()
-      /** createPlan 返回即表示 pending 已持久化，此后当前 normal 进程必须退出。 */
-      let migrationPlanPersisted = false
+      /** 当前调用使用的协调器；只有实际尝试创建计划后才需要复检 pending。 */
+      let migrationCoordinator: PathManagementCoordinator | null = null
+      /** 标记 locator 当前是否仍持有 pending，决定当前 normal 进程能否继续。 */
+      let migrationPending = false
+      /** 安全复检 locator；状态不可读时按仍有 pending 处理，避免继续 normal 服务。 */
+      const inspectMigrationPending = (): boolean => {
+        if (migrationCoordinator === null) return false
+        try {
+          return migrationCoordinator.getStatus().migration !== null
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          console.warn(`[路径管理] 无法确认 pending 状态，按迁移仍存在处理: ${message}`)
+          return true
+        }
+      }
       try {
         // 取得 intent 后二次预检，排除 intent 竞争窗口内进入的实例与任务。
         await assertMigrationCanStart(options)
-        await getCoordinator().createPlan(targetRoot)
-        migrationPlanPersisted = true
+        migrationCoordinator = getCoordinator()
+        try {
+          await migrationCoordinator.createPlan(targetRoot)
+          migrationPending = true
+        } catch (error) {
+          // createPlan 理论上原子落盘；失败后仍复检，防止异常发生在持久化边界之后。
+          migrationPending = inspectMigrationPending()
+          throw error
+        }
         try {
           // createPlan 的磁盘预检会让出事件循环；落盘后复检并撤销期间新出现的任务。
           await assertMigrationCanStart(options)
         } catch (error) {
-          await getCoordinator().cancel()
+          try {
+            await migrationCoordinator.cancel()
+            migrationPending = inspectMigrationPending()
+          } catch (cancelError) {
+            // 撤销失败时不能假定 pending 已清除，当前 normal 进程必须退出。
+            migrationPending = true
+            throw cancelError
+          }
           throw error
         }
       } finally {
+        /** guard 释放错误；是否允许降级取决于 locator 是否仍有 pending。 */
+        let guardReleaseError: unknown = null
         try {
-          // guard 只负责缩小竞争窗口；释放失败保留 stale claim，由新进程 challenge 回收。
           migrationGuard?.release()
         } catch (error) {
-          /** 受控记录 guard 清理失败，不覆盖迁移事务原始结果。 */
-          const message = error instanceof Error ? error.message : String(error)
-          console.warn(`[路径管理] 迁移 intent 清理失败，将由新进程回收: ${message}`)
+          guardReleaseError = error
         }
-        if (migrationPlanPersisted) relaunchNow()
+        if (migrationPending) {
+          if (guardReleaseError !== null) {
+            const message = guardReleaseError instanceof Error ? guardReleaseError.message : String(guardReleaseError)
+            console.warn(`[路径管理] 迁移 intent 清理失败，将由新进程回收: ${message}`)
+          }
+          relaunchNow()
+        } else if (guardReleaseError !== null) {
+          const message = guardReleaseError instanceof Error ? guardReleaseError.message : String(guardReleaseError)
+          throw new Error(`迁移计划未创建，但迁移 intent 清理失败；请完全退出所有 Proma 实例后重试。原因: ${message}`)
+        }
       }
     })
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, () => {
