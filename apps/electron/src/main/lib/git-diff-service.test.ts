@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getUnstagedChanges, invalidateGitDiffCache, listWorktreesStrict } from './git-diff-service'
@@ -130,6 +130,52 @@ describe('strict worktree query', () => {
     }
   })
 
+  test('Given 非 Git 父目录包含带 linked worktree 的嵌套仓库 When 严格查询 Then 仍返回 linked blocker', async () => {
+    /** 非 Git 容器、嵌套仓库和容器外 linked worktree。 */
+    const parentPath = mkdtempSync(join(tmpdir(), 'proma-strict-multi-root-'))
+    const nestedRepoPath = join(parentPath, 'nested-repo')
+    const linkedParentPath = mkdtempSync(join(tmpdir(), 'proma-strict-multi-linked-'))
+    const linkedWorktreePath = join(linkedParentPath, 'linked')
+    mkdirSync(nestedRepoPath)
+    initializeRepository(nestedRepoPath, 'nested.txt')
+    try {
+      execFileSync('git', ['worktree', 'add', '-b', 'strict-multi-linked', linkedWorktreePath], {
+        cwd: nestedRepoPath,
+        stdio: 'pipe',
+      })
+
+      const worktrees = await listWorktreesStrict(parentPath)
+
+      expect(worktrees.find((item) => realpathSync(item.path) === realpathSync(linkedWorktreePath))?.isMain).toBe(false)
+    } finally {
+      execFileSync('git', ['worktree', 'remove', '--force', linkedWorktreePath], { cwd: nestedRepoPath, stdio: 'pipe' })
+      rmSync(parentPath, { recursive: true, force: true })
+      rmSync(linkedParentPath, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    ['prunable linked', join(tmpdir(), 'proma-prunable-linked'), 'prunable gitdir file points to non-existent location'],
+    ['missing linked', join(tmpdir(), 'proma-missing-linked'), ''],
+  ])('Given porcelain 含 %s record When 严格查询 Then 保留为 linked blocker', async (_label, linkedPath, stateLine) => {
+    /** 生成包含主记录与异常 linked 注册项的固定 porcelain。 */
+    const porcelain = [
+      `worktree ${realpathSync(repoPath)}\nHEAD 1234567890abcdef\nbranch refs/heads/main`,
+      `worktree ${linkedPath}\nHEAD abcdef1234567890\nbranch refs/heads/stale${stateLine ? `\n${stateLine}` : ''}`,
+    ].join('\n\n')
+    const runGitCommand = async (args: string[]): Promise<string> => {
+      if (args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree') return 'true'
+      if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return realpathSync(repoPath)
+      if (args[0] === 'rev-parse' && args.includes('--git-common-dir')) return join(realpathSync(repoPath), '.git')
+      if (args[0] === 'worktree') return porcelain
+      throw new Error(`unexpected git command: ${args.join(' ')}`)
+    }
+
+    const worktrees = await listWorktreesStrict(repoPath, { runGitCommand })
+
+    expect(worktrees.find((item) => item.path === linkedPath)?.isMain).toBe(false)
+  })
+
   test('Given 已确认 Git 仓库但 worktree 命令失败 When 严格查询 Then 向上传播错误', async () => {
     /** 只在 worktree list 阶段注入失败，其余发现命令返回真实合同值。 */
     const runGitCommand = async (args: string[]): Promise<string> => {
@@ -142,3 +188,13 @@ describe('strict worktree query', () => {
     await expect(listWorktreesStrict(repoPath, { runGitCommand })).rejects.toThrow('forced worktree failure')
   })
 })
+
+/** 在指定已有目录初始化带首个提交的最小 Git 仓库。 */
+function initializeRepository(repositoryPath: string, fileName: string): void {
+  execFileSync('git', ['init'], { cwd: repositoryPath, stdio: 'pipe' })
+  execFileSync('git', ['config', 'user.email', 'test@proma.local'], { cwd: repositoryPath, stdio: 'pipe' })
+  execFileSync('git', ['config', 'user.name', 'Proma Test'], { cwd: repositoryPath, stdio: 'pipe' })
+  writeFileSync(join(repositoryPath, fileName), 'base\n')
+  execFileSync('git', ['add', fileName], { cwd: repositoryPath, stdio: 'pipe' })
+  execFileSync('git', ['commit', '-m', 'initial'], { cwd: repositoryPath, stdio: 'pipe' })
+}

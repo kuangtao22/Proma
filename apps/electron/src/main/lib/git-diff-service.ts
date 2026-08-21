@@ -1015,37 +1015,101 @@ export async function listWorktrees(repoPath: string): Promise<import('@proma/sh
   return Array.from(worktreesByPath.values())
 }
 
+/** 严格检查目录内是否存在 `.git` 标记，只有明确不存在时返回 false。 */
+function hasGitMarkerStrict(directoryPath: string): boolean {
+  try {
+    lstatSync(join(directoryPath, '.git'))
+    return true
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
+      return false
+    }
+    throw error
+  }
+}
+
+/** 严格向下发现 `.git` 候选目录，任何目录读取或状态检查失败都向上传播。 */
+function findGitCandidatesDownStrict(directoryPath: string, maxDepth: number): string[] {
+  if (maxDepth <= 0) return []
+  /** 当前层发现的 Git 候选目录。 */
+  const candidates: string[] = []
+  for (const name of readdirSync(directoryPath)) {
+    if (name === '.git') {
+      candidates.push(directoryPath)
+      continue
+    }
+    if (name.startsWith('.') || name === 'node_modules') continue
+
+    const childPath = join(directoryPath, name)
+    if (!statSync(childPath).isDirectory()) continue
+    if (hasGitMarkerStrict(childPath)) {
+      candidates.push(childPath)
+      continue
+    }
+    candidates.push(...findGitCandidatesDownStrict(childPath, maxDepth - 1))
+  }
+  return candidates
+}
+
 /**
- * 严格列出单一项目所属仓库的全部 worktree。
- * 普通非 Git 目录返回空数组；确认进入 Git 后，任何命令或 I/O 失败都向上传播。
+ * 严格发现项目自身及其三层子目录内的全部 Git 根。
+ * 普通非 Git 结果允许继续向下扫描；其他 Git 命令和文件系统错误全部 fail closed。
+ */
+async function findAllGitRootsStrict(
+  baseDir: string,
+  runCommand: NonNullable<ListWorktreesStrictOptions['runGitCommand']>,
+): Promise<string[]> {
+  if (!statSync(baseDir).isDirectory()) throw new Error('严格 worktree 查询路径不是目录')
+  /** 按规范化路径去重后的仓库根。 */
+  const rootsByPath = new Map<string, string>()
+  try {
+    const insideWorktree = await runCommand(['rev-parse', '--is-inside-work-tree'], baseDir)
+    if (insideWorktree === 'true') {
+      const currentRoot = await runCommand(['rev-parse', '--show-toplevel'], baseDir)
+      if (!isAbsolute(currentRoot)) throw new Error('Git 仓库顶层路径不是绝对路径')
+      rootsByPath.set(normalizeGitRoot(currentRoot), currentRoot)
+    }
+  } catch (error) {
+    if (!isExplicitNonGitDirectory(error)) throw error
+  }
+
+  for (const candidatePath of findGitCandidatesDownStrict(baseDir, 3)) {
+    const normalizedCandidate = normalizeGitRoot(candidatePath)
+    if (rootsByPath.has(normalizedCandidate)) continue
+    const repositoryRoot = await runCommand(['rev-parse', '--show-toplevel'], candidatePath)
+    if (!isAbsolute(repositoryRoot)) throw new Error('Git 仓库顶层路径不是绝对路径')
+    rootsByPath.set(normalizeGitRoot(repositoryRoot), repositoryRoot)
+  }
+  return Array.from(rootsByPath.values())
+}
+
+/**
+ * 严格列出项目自身及其子目录仓库的全部 worktree。
+ * 真正不含 Git 的普通目录返回空数组；发现、Git 命令或 I/O 失败都向上传播。
  */
 export async function listWorktreesStrict(
   repoPath: string,
   options: ListWorktreesStrictOptions = {},
 ): Promise<import('@proma/shared').WorktreeInfo[]> {
   const runCommand = options.runGitCommand ?? runGitCommandStrict
-  /** 只有 Git 明确报告非仓库时才是安全空结果。 */
-  let insideWorktree: string
-  try {
-    insideWorktree = await runCommand(['rev-parse', '--is-inside-work-tree'], repoPath)
-  } catch (error) {
-    if (isExplicitNonGitDirectory(error)) return []
-    throw error
+  const roots = await findAllGitRootsStrict(repoPath, runCommand)
+  /** 跨仓库按规范化路径去重后的 worktree。 */
+  const worktreesByPath = new Map<string, import('@proma/shared').WorktreeInfo>()
+  for (const root of roots) {
+    /** common dir 在 linked worktree 中仍指向主仓库的 .git。 */
+    const commonDir = await runCommand(
+      ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+      root,
+    )
+    if (!isAbsolute(commonDir)) throw new Error('Git common dir 不是绝对路径')
+    const normalizedMainRoot = normalizeGitRoot(dirname(commonDir))
+    const output = await runCommand(['worktree', 'list', '--porcelain'], root)
+    for (const worktree of parseStrictWorktreeOutput(output, normalizedMainRoot)) {
+      const key = normalizeGitRoot(worktree.path)
+      if (!worktreesByPath.has(key)) worktreesByPath.set(key, worktree)
+    }
   }
-  if (insideWorktree !== 'true') return []
-
-  /** 当前主/linked worktree 的顶层目录。 */
-  const currentRoot = await runCommand(['rev-parse', '--show-toplevel'], repoPath)
-  if (!isAbsolute(currentRoot)) throw new Error('Git 仓库顶层路径不是绝对路径')
-  /** common dir 在 linked worktree 中仍指向主仓库的 .git。 */
-  const commonDir = await runCommand(
-    ['rev-parse', '--path-format=absolute', '--git-common-dir'],
-    currentRoot,
-  )
-  if (!isAbsolute(commonDir)) throw new Error('Git common dir 不是绝对路径')
-  const normalizedMainRoot = normalizeGitRoot(dirname(commonDir))
-  const output = await runCommand(['worktree', 'list', '--porcelain'], currentRoot)
-  return parseStrictWorktreeOutput(output, normalizedMainRoot)
+  return Array.from(worktreesByPath.values())
 }
 
 /** 只识别 Git 的稳定英文非仓库诊断，其他命令失败继续 fail closed。 */
@@ -1055,7 +1119,7 @@ function isExplicitNonGitDirectory(error: unknown): boolean {
     && /not a git repository|not a git work tree/i.test(error.stderr)
 }
 
-/** 解析 strict porcelain 输出，并对 worktree 路径 I/O 采用 fail-closed 检查。 */
+/** 解析 strict porcelain 输出；Git 已注册的异常或缺失 worktree 仍必须作为迁移 blocker。 */
 function parseStrictWorktreeOutput(
   output: string,
   normalizedMainRoot: string,
@@ -1066,15 +1130,13 @@ function parseStrictWorktreeOutput(
     let path = ''
     let head = ''
     let branch = ''
-    let prunable = false
     for (const line of block.split('\n')) {
       if (line.startsWith('worktree ')) path = line.slice('worktree '.length)
       else if (line.startsWith('HEAD ')) head = line.slice('HEAD '.length).slice(0, 7)
       else if (line.startsWith('branch refs/heads/')) branch = line.slice('branch refs/heads/'.length)
       else if (line === 'detached') branch = '(detached)'
-      else if (line.startsWith('prunable')) prunable = true
     }
-    if (!path || prunable || !strictPathExists(path)) continue
+    if (!path) throw new Error('Git worktree porcelain 记录缺少路径')
     const key = normalizeGitRoot(path)
     if (worktreesByPath.has(key)) continue
     worktreesByPath.set(key, {
@@ -1086,19 +1148,6 @@ function parseStrictWorktreeOutput(
     })
   }
   return Array.from(worktreesByPath.values())
-}
-
-/** strict 查询只把明确缺失视为不存在，权限和其他文件系统错误继续抛出。 */
-function strictPathExists(path: string): boolean {
-  try {
-    lstatSync(path)
-    return true
-  } catch (error) {
-    if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
-      return false
-    }
-    throw error
-  }
 }
 
 /**
