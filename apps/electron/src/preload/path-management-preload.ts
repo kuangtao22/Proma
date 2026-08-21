@@ -12,6 +12,7 @@ import type {
   RecoverDataRootInput,
   WorkspaceRelocationPreview,
   WorkspaceRelocationProgress,
+  WorkspaceRelocationRecoveryInput,
   WorkspaceTargetSelection,
 } from '@proma/shared'
 import type { IpcRendererEvent } from 'electron'
@@ -54,6 +55,10 @@ export interface NormalPathManagementPreloadApi {
   getWorkspaceRelocationStatus: (workspaceId: string) => Promise<WorkspaceRelocationProgress | null>
   /** 取消仍处于 copying 的项目迁移。 */
   cancelWorkspaceRelocation: (operationId: string) => Promise<boolean>
+  /** 使用持久化 journal 的原路径继续迁移。 */
+  resumeWorkspaceRelocation: (input: WorkspaceRelocationRecoveryInput) => Promise<WorkspaceRelocationProgress>
+  /** 放弃持久化迁移，仅清理 Proma 管理的恢复元数据。 */
+  abandonWorkspaceRelocation: (input: WorkspaceRelocationRecoveryInput) => Promise<void>
   /** 离线项目仅重新绑定已存在目录，不执行复制。 */
   relinkWorkspace: (input: WorkspaceTargetSelection) => Promise<void>
   /** 订阅项目迁移进度并返回 listener 清理函数。 */
@@ -139,6 +144,14 @@ export function createNormalPathManagementPreloadApi(
       PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_WORKSPACE_RELOCATION,
       operationId,
     ) as Promise<boolean>,
+    resumeWorkspaceRelocation: (input) => ipc.invoke(
+      PATH_MANAGEMENT_IPC_CHANNELS.RESUME_WORKSPACE_RELOCATION,
+      input,
+    ) as Promise<WorkspaceRelocationProgress>,
+    abandonWorkspaceRelocation: (input) => ipc.invoke(
+      PATH_MANAGEMENT_IPC_CHANNELS.ABANDON_WORKSPACE_RELOCATION,
+      input,
+    ) as Promise<void>,
     relinkWorkspace: (input) => ipc.invoke(
       PATH_MANAGEMENT_IPC_CHANNELS.RELINK_WORKSPACE,
       input,

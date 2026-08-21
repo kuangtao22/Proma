@@ -17,6 +17,7 @@ import type {
   WorkspacePathState,
   WorkspaceRelocationPreview,
   WorkspaceRelocationProgress,
+  WorkspaceRelocationRecoveryInput,
   WorkspaceTargetPurpose,
   WorkspaceTargetSelection,
 } from '@proma/shared'
@@ -51,6 +52,8 @@ const PATH_MANAGEMENT_HANDLER_CHANNELS: readonly string[] = [
   PATH_MANAGEMENT_IPC_CHANNELS.START_WORKSPACE_RELOCATION,
   PATH_MANAGEMENT_IPC_CHANNELS.GET_WORKSPACE_RELOCATION_STATUS,
   PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_WORKSPACE_RELOCATION,
+  PATH_MANAGEMENT_IPC_CHANNELS.RESUME_WORKSPACE_RELOCATION,
+  PATH_MANAGEMENT_IPC_CHANNELS.ABANDON_WORKSPACE_RELOCATION,
   PATH_MANAGEMENT_IPC_CHANNELS.RELINK_WORKSPACE,
   PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT,
   PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
@@ -150,6 +153,7 @@ export interface RegisterPathManagementIpcOptions {
   createSelectionId?: () => string
   /** 项目迁移器；normal production 由 IPC bootstrap 注入真实依赖。 */
   workspaceRelocator?: Pick<WorkspaceProjectRelocator, 'preflight' | 'run' | 'getStatus' | 'cancel'>
+    & Partial<Pick<WorkspaceProjectRelocator, 'resume' | 'abandon'>>
   /** 枚举设置页需要的 managed/external/offline 项目状态。 */
   listWorkspacePathStates?: () => WorkspacePathState[]
   /** 离线项目重新绑定现存目录，不触发复制器。 */
@@ -507,6 +511,31 @@ export function registerPathManagementIpcHandlers(
       if (!options.workspaceRelocator) throw new Error('当前环境不支持项目迁移')
       return options.workspaceRelocator.cancel(assertNonEmptyString(rawOperationId, '项目迁移操作 ID 无效'))
     })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.RESUME_WORKSPACE_RELOCATION, async (_event, rawInput) => {
+      const input = assertWorkspaceRelocationRecoveryInput(rawInput)
+      if (!options.workspaceRelocator?.resume) throw new Error('当前环境不支持项目迁移恢复')
+      /** 恢复前的索引根只从主进程受信任状态读取。 */
+      const sourceRoot = options.listWorkspacePathStates?.()
+        .find((workspace) => workspace.workspaceId === input.workspaceId)?.sourceRoot
+      const progress = await options.workspaceRelocator.resume(input, broadcastWorkspaceProgress)
+      try {
+        /** 成功提交后的索引根同样由主进程重读，renderer 不参与路径决策。 */
+        const targetRoot = options.listWorkspacePathStates?.()
+          .find((workspace) => workspace.workspaceId === input.workspaceId)?.sourceRoot
+        if (progress.stage === 'completed' && sourceRoot && targetRoot && sourceRoot !== targetRoot) {
+          options.switchWorkspaceWatcher?.(sourceRoot, targetRoot)
+        }
+      } finally {
+        options.refreshWorkspaceRenderer?.()
+      }
+      return progress
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.ABANDON_WORKSPACE_RELOCATION, async (_event, rawInput) => {
+      const input = assertWorkspaceRelocationRecoveryInput(rawInput)
+      if (!options.workspaceRelocator?.abandon) throw new Error('当前环境不支持放弃项目迁移')
+      await options.workspaceRelocator.abandon(input)
+      options.refreshWorkspaceRenderer?.()
+    })
     register(PATH_MANAGEMENT_IPC_CHANNELS.RELINK_WORKSPACE, (event, rawInput) => {
       const input = assertWorkspaceTargetSelection(rawInput)
       const selection = requireCurrentWorkspaceSelection(
@@ -648,6 +677,24 @@ function assertWorkspaceTargetSelection(value: unknown): WorkspaceTargetSelectio
     selectionId: assertNonEmptyString(input.selectionId, '项目目标选择无效'),
     targetRoot,
   }
+}
+
+/** 运行时严格校验持久化迁移恢复身份，不接受目标路径等额外决策字段。 */
+function assertWorkspaceRelocationRecoveryInput(value: unknown): WorkspaceRelocationRecoveryInput {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('项目迁移恢复请求无效')
+  }
+  const keys = Object.keys(value).sort()
+  if (keys.length !== 2 || keys[0] !== 'operationId' || keys[1] !== 'workspaceId') {
+    throw new Error('项目迁移恢复请求无效')
+  }
+  const input = value as { workspaceId?: unknown; operationId?: unknown }
+  const workspaceId = assertNonEmptyString(input.workspaceId, '项目迁移恢复请求无效')
+  const operationId = assertNonEmptyString(input.operationId, '项目迁移恢复请求无效')
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(operationId)) {
+    throw new Error('项目迁移恢复请求无效')
+  }
+  return { workspaceId, operationId }
 }
 
 /** 校验项目 selection 用途，保持 relocation/relink scope 隔离。 */

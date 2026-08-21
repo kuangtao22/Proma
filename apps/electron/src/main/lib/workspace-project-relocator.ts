@@ -145,6 +145,8 @@ interface PreflightContext {
 export class WorkspaceProjectRelocator {
   /** 当前进程内运行中的取消控制器。 */
   private readonly controllers = new Map<string, AbortController>()
+  /** 从恢复预检到完成期间占用 operation，阻止并发继续或放弃。 */
+  private readonly recoveryClaims = new Set<string>()
   /** 流式复制实现。 */
   private readonly copyDirectory: (input: CopyDirectoryInput) => Promise<CopyDirectoryResult>
   /** sidecar 归属检查。 */
@@ -247,7 +249,7 @@ export class WorkspaceProjectRelocator {
       }
       journal = { ...journal, stage: 'copying', error: undefined, totalBytes: preflight.totalBytes }
       this.writeJournal(journal)
-      onProgress?.(toPublicProgress(journal))
+      onProgress?.(toPublicProgress(journal, true))
 
       try {
         /** 上一次把连续字节进度写入 journal 的时刻。 */
@@ -266,7 +268,7 @@ export class WorkspaceProjectRelocator {
               this.writeJournal(journal)
               lastPersistedAt = currentTime
             }
-            onProgress?.(toPublicProgress(journal))
+            onProgress?.(toPublicProgress(journal, true))
           },
         })
         if (copyResult.totalBytes !== preflight.totalBytes) {
@@ -280,7 +282,7 @@ export class WorkspaceProjectRelocator {
           currentRelativePath: undefined,
         }
         this.writeJournal(journal)
-        onProgress?.(toPublicProgress(journal))
+        onProgress?.(toPublicProgress(journal, true))
       } catch (error) {
         journal = { ...journal, stage: 'failed', error: errorMessage(error) }
         this.writeJournal(journal)
@@ -304,7 +306,49 @@ export class WorkspaceProjectRelocator {
   getStatus(workspaceId: string): WorkspaceRelocationProgress | null {
     /** 当前 workspace 唯一 journal。 */
     const journal = this.getJournalForWorkspace(workspaceId)
-    return journal ? toPublicProgress(journal) : null
+    return journal ? toPublicProgress(journal, this.controllers.has(journal.operationId)) : null
+  }
+
+  /** 使用持久化 journal 的精确身份继续迁移，不接受 renderer 重新提供目标路径。 */
+  async resume(
+    input: { workspaceId: string; operationId: string },
+    onProgress?: (progress: WorkspaceRelocationProgress) => void,
+  ): Promise<WorkspaceRelocationProgress> {
+    const journal = this.requireRecoveryJournal(input)
+    if (journal.stage === 'committing') throw new Error('项目迁移正在提交，请通过启动恢复继续')
+    if (this.controllers.has(journal.operationId) || this.recoveryClaims.has(journal.operationId)) {
+      throw new Error('项目迁移正在运行，不能重复继续')
+    }
+    this.recoveryClaims.add(journal.operationId)
+    try {
+      return await this.run({ workspaceId: journal.workspaceId, targetRoot: journal.targetRoot }, onProgress)
+    } finally {
+      this.recoveryClaims.delete(journal.operationId)
+    }
+  }
+
+  /** 放弃未提交迁移，只删除 Proma sidecar 与 journal，保留源目录和已复制目标文件。 */
+  async abandon(input: { workspaceId: string; operationId: string }): Promise<void> {
+    const journal = this.requireRecoveryJournal(input)
+    if (journal.stage === 'committing') throw new Error('项目迁移正在提交，不能放弃')
+    if (this.controllers.has(journal.operationId) || this.recoveryClaims.has(journal.operationId)) {
+      throw new Error('项目迁移正在运行，不能放弃')
+    }
+    this.recoveryClaims.add(journal.operationId)
+    try {
+      const ownership = await this.inspectCopyOwnership({
+        migrationId: journal.operationId,
+        sourceRoot: journal.sourceRoot,
+        targetRoot: journal.targetRoot,
+      })
+      if (ownership === 'foreign' || ownership === 'invalid') throw new Error('项目迁移目标副本归属无效')
+      if (ownership === 'owned') {
+        await this.finalizeCopy({ migrationId: journal.operationId, targetRoot: journal.targetRoot })
+      }
+      this.removeJournal(journal.operationId)
+    } finally {
+      this.recoveryClaims.delete(journal.operationId)
+    }
   }
 
   /** 取消当前进程内仍处于复制/校验阶段的操作。 */
@@ -576,6 +620,15 @@ export class WorkspaceProjectRelocator {
     return matches[0] ?? null
   }
 
+  /** 按 workspace 与 operation 双重匹配恢复 journal，拒绝陈旧界面操作。 */
+  private requireRecoveryJournal(input: { workspaceId: string; operationId: string }): WorkspaceRelocationJournal {
+    assertWorkspaceId(input.workspaceId)
+    assertOperationId(input.operationId)
+    const journal = this.getJournalForWorkspace(input.workspaceId)
+    if (!journal || journal.operationId !== input.operationId) throw new Error('项目迁移恢复状态已失效')
+    return journal
+  }
+
   /** 严格读取 journal 目录；任一损坏或非法文件名都阻断恢复。 */
   private readAllJournals(): WorkspaceRelocationJournal[] {
     /** 活动数据根下的稳定 journal 目录。 */
@@ -698,13 +751,14 @@ function applyCopyProgress(
 }
 
 /** 将持久化 journal 转换为共享进度合同。 */
-function toPublicProgress(journal: WorkspaceRelocationJournal): WorkspaceRelocationProgress {
+function toPublicProgress(journal: WorkspaceRelocationJournal, active = false): WorkspaceRelocationProgress {
   return {
     operationId: journal.operationId,
     workspaceId: journal.workspaceId,
     stage: journal.stage,
     completedBytes: journal.completedBytes,
     totalBytes: journal.totalBytes,
+    active,
     ...(journal.currentRelativePath === undefined ? {} : { currentRelativePath: journal.currentRelativePath }),
     ...(journal.error === undefined ? {} : { error: journal.error }),
   }

@@ -124,6 +124,98 @@ describe('WorkspaceProjectRelocator', () => {
     },
   )
 
+  test('Given persisted failed journal When 明确继续迁移 Then 不重新选择且严格复用 operation/workspace/target', async () => {
+    const operationId = '12345678-1234-4234-8234-123456789abc'
+    writeRelocationJournal(operationId, { stage: 'failed', completedBytes: 2, error: '上次中断' })
+    /** 捕获恢复复制使用的稳定 operationId。 */
+    let copiedOperationId = ''
+    const relocator = createRelocator({
+      inspectCopyOwnership: async () => 'owned',
+      copyDirectory: async (input) => {
+        copyCalls += 1
+        copiedOperationId = input.migrationId
+        return { verifiedFiles: 1, reusedFiles: 1, totalBytes: 4 }
+      },
+    })
+
+    await expect(relocator.resume({ workspaceId: workspace.id, operationId })).resolves.toMatchObject({
+      operationId,
+      stage: 'completed',
+    })
+    expect(copiedOperationId).toBe(operationId)
+    await expect(relocator.resume({ workspaceId: 'other', operationId })).rejects.toThrow('恢复状态已失效')
+  })
+
+  test('Given persisted copying journal When 放弃迁移 Then 只清 journal 与 owned sidecar 并保留源目标文件', async () => {
+    const operationId = '12345678-1234-4234-8234-123456789abc'
+    writeRelocationJournal(operationId, { stage: 'copying', completedBytes: 2 })
+    writeFileSync(join(targetRoot, 'partial.txt'), 'partial', 'utf8')
+    /** 捕获 sidecar 清理调用。 */
+    const finalized: string[] = []
+    const relocator = createRelocator({
+      inspectCopyOwnership: async () => 'owned',
+      finalizeCopy: async (input) => { finalized.push(`${input.migrationId}:${input.targetRoot}`) },
+    })
+
+    await relocator.abandon({ workspaceId: workspace.id, operationId })
+
+    expect(relocator.getStatus(workspace.id)).toBeNull()
+    expect(finalized).toEqual([`${operationId}:${targetRoot}`])
+    expect(readFileSync(join(sourceRoot, 'README.md'), 'utf8')).toBe('data')
+    expect(readFileSync(join(targetRoot, 'partial.txt'), 'utf8')).toBe('partial')
+  })
+
+  test('Given 同进程 copying active When 继续或放弃 Then 拒绝重复恢复并保留当前任务', async () => {
+    const operationId = '12345678-1234-4234-8234-123456789abc'
+    /** 捕获 active 期间两个恢复动作的错误。 */
+    const errors: string[] = []
+    let relocator: WorkspaceProjectRelocator
+    relocator = createRelocator({
+      createOperationId: () => operationId,
+      copyDirectory: async () => {
+        copyCalls += 1
+        for (const action of [
+          () => relocator.resume({ workspaceId: workspace.id, operationId }),
+          () => relocator.abandon({ workspaceId: workspace.id, operationId }),
+        ]) {
+          try { await action() } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
+        }
+        return { verifiedFiles: 1, reusedFiles: 0, totalBytes: 4 }
+      },
+    })
+
+    await relocator.run({ workspaceId: workspace.id, targetRoot })
+    expect(errors).toEqual(['项目迁移正在运行，不能重复继续', '项目迁移正在运行，不能放弃'])
+  })
+
+  test('Given 恢复仍在异步预检 When 再次继续 Then 立即拒绝并只执行一个恢复任务', async () => {
+    const operationId = '12345678-1234-4234-8234-123456789abc'
+    writeRelocationJournal(operationId, { stage: 'failed', completedBytes: 2, error: '上次中断' })
+    /** 由测试控制首个恢复何时完成异步预检。 */
+    let finishPreflight: ((worktrees: WorktreeInfo[]) => void) | undefined
+    /** 仅挂起第一次检查，使重复恢复在旧实现中能够暴露。 */
+    let listWorktreeCalls = 0
+    const relocator = createRelocator({
+      inspectCopyOwnership: async () => 'owned',
+      listWorktrees: () => {
+        listWorktreeCalls += 1
+        if (listWorktreeCalls > 1) return Promise.resolve([])
+        return new Promise((resolveList) => { finishPreflight = resolveList })
+      },
+      copyDirectory: async () => {
+        copyCalls += 1
+        return { verifiedFiles: 1, reusedFiles: 1, totalBytes: 4 }
+      },
+    })
+
+    const firstResume = relocator.resume({ workspaceId: workspace.id, operationId })
+    await expect(relocator.resume({ workspaceId: workspace.id, operationId }))
+      .rejects.toThrow('项目迁移正在运行，不能重复继续')
+    finishPreflight?.([])
+    await expect(firstResume).resolves.toMatchObject({ stage: 'completed' })
+    expect(copyCalls).toBe(1)
+  })
+
   test('Given 同一进程迁移仍在复制 When 再次运行 Then 立即拒绝且不创建第二个控制器', async () => {
     const operationIds = [
       '12345678-1234-4234-8234-123456789abc',

@@ -15,6 +15,41 @@ function createCoordinator() {
 }
 
 describe('项目路径管理 IPC', () => {
+  test('Given persisted journal When 继续或放弃 Then 运行时校验并直接调用恢复合同而不要求 selection', async () => {
+    const owner = { send: () => undefined }
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    /** 捕获恢复合同调用。 */
+    const calls: string[] = []
+    registerPathManagementIpcHandlers({
+      mode: 'normal',
+      ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: () => undefined },
+      app: { relaunch: () => undefined, quit: () => undefined },
+      getExpectedWebContents: () => owner,
+      coordinator: createCoordinator(),
+      inspectStorageFast: async () => ({ deviceType: 'local', availableBytes: 1, occupiedStatus: 'loading' }),
+      workspaceRelocator: {
+        preflight: async () => { throw new Error('不应要求新预检') },
+        run: async () => { throw new Error('不应直接 run') },
+        resume: async (input) => {
+          calls.push(`resume:${input.workspaceId}:${input.operationId}`)
+          return { ...input, stage: 'completed', completedBytes: 4, totalBytes: 4 }
+        },
+        abandon: async (input) => { calls.push(`abandon:${input.workspaceId}:${input.operationId}`) },
+        getStatus: () => null,
+        cancel: () => false,
+      },
+      listWorkspacePathStates: () => [],
+    })
+    const input = { workspaceId: 'workspace-1', operationId: '12345678-1234-4234-8234-123456789abc' }
+    await handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RESUME_WORKSPACE_RELOCATION)!({ sender: owner }, input)
+    await handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.ABANDON_WORKSPACE_RELOCATION)!({ sender: owner }, input)
+    expect(calls).toEqual([
+      `resume:${input.workspaceId}:${input.operationId}`,
+      `abandon:${input.workspaceId}:${input.operationId}`,
+    ])
+    expect(handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RESUME_WORKSPACE_RELOCATION)!({ sender: owner }, { workspaceId: '', operationId: 'bad' }))
+      .rejects.toThrow('项目迁移恢复请求无效')
+  })
   test('Given 两个窗口与两次选择 When 预检或启动 Then 只接受当前 owner 最新一次 relocation 授权并一次性消费', async () => {
     /** 当前主窗口身份。 */
     const ownerA = { send: () => undefined }

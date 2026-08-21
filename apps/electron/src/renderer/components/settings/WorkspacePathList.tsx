@@ -5,6 +5,7 @@ import type {
   WorkspacePathState,
   WorkspaceRelocationPreview,
   WorkspaceRelocationProgress,
+  WorkspaceRelocationStage,
   WorkspaceTargetSelection,
 } from '@proma/shared'
 import { Button } from '@/components/ui/button'
@@ -17,6 +18,27 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { SettingsCard, SettingsRow, SettingsSection } from './primitives'
+
+/** 单个项目迁移动作的 renderer 交互阶段。 */
+export type WorkspaceActionPhase = 'idle' | 'starting' | 'running' | 'cancelling'
+
+/** 迁移 Promise 与异步进度事件共用的确定性状态机。 */
+export function reduceWorkspaceActionPhase(
+  phase: WorkspaceActionPhase,
+  action:
+    | { type: 'start-requested' }
+    | { type: 'progress'; stage: WorkspaceRelocationStage }
+    | { type: 'cancel-requested' }
+    | { type: 'cancel-finished' }
+    | { type: 'settled' },
+): WorkspaceActionPhase {
+  if (action.type === 'start-requested') return 'starting'
+  if (action.type === 'cancel-requested') return 'cancelling'
+  if (action.type === 'cancel-finished') return phase === 'cancelling' ? 'running' : phase
+  if (action.type === 'settled' || action.stage === 'completed' || action.stage === 'failed') return 'idle'
+  if (action.stage === 'copying' || action.stage === 'verifying') return 'running'
+  return phase
+}
 
 /** 项目路径动作需要的 renderer API，测试可注入窄替身。 */
 export interface WorkspacePathActionDependencies {
@@ -69,6 +91,8 @@ export function WorkspacePathList({
   const [preview, setPreview] = React.useState<WorkspaceRelocationPreview | null>(null)
   /** 当前选目录、预检、迁移或 relink 的项目 ID。 */
   const [busyWorkspaceId, setBusyWorkspaceId] = React.useState<string | null>(null)
+  /** 各项目启动、运行与取消请求状态，避免 start Promise 独占取消按钮。 */
+  const [actionPhaseByWorkspace, setActionPhaseByWorkspace] = React.useState<Record<string, WorkspaceActionPhase>>({})
   /** 对话框或行级用户可见错误。 */
   const [actionError, setActionError] = React.useState<string | null>(null)
   /** 事件流覆盖首屏状态，避免等待完整状态刷新。 */
@@ -76,8 +100,26 @@ export function WorkspacePathList({
 
   React.useEffect(() => window.electronAPI.onWorkspaceRelocationProgress((progress) => {
     setProgressByWorkspace((current) => ({ ...current, [progress.workspaceId]: progress }))
+    setActionPhaseByWorkspace((current) => ({
+      ...current,
+      [progress.workspaceId]: reduceWorkspaceActionPhase(current[progress.workspaceId] ?? 'idle', {
+        type: 'progress',
+        stage: progress.stage,
+      }),
+    }))
     if (progress.stage === 'completed') onChanged?.()
   }), [onChanged])
+
+  /** 对指定项目执行一次状态机动作。 */
+  const dispatchWorkspacePhase = (
+    workspaceId: string,
+    action: Parameters<typeof reduceWorkspaceActionPhase>[1],
+  ): void => {
+    setActionPhaseByWorkspace((current) => ({
+      ...current,
+      [workspaceId]: reduceWorkspaceActionPhase(current[workspaceId] ?? 'idle', action),
+    }))
+  }
 
   /** 清理确认对话框状态，Radix 会恢复触发按钮焦点。 */
   const closeDialog = (): void => {
@@ -117,7 +159,8 @@ export function WorkspacePathList({
   /** 用户确认后消费 selection 并启动迁移。 */
   const handleConfirm = async (): Promise<void> => {
     if (selection === null || selectedWorkspace === null) return
-    setBusyWorkspaceId(selectedWorkspace.workspaceId)
+    const workspaceId = selectedWorkspace.workspaceId
+    dispatchWorkspacePhase(workspaceId, { type: 'start-requested' })
     setActionError(null)
     try {
       const progress = await window.electronAPI.startWorkspaceRelocation(selection)
@@ -127,17 +170,52 @@ export function WorkspacePathList({
     } catch (startError) {
       setActionError(toErrorMessage(startError, '项目迁移失败'))
     } finally {
-      setBusyWorkspaceId(null)
+      dispatchWorkspacePhase(workspaceId, { type: 'settled' })
     }
   }
 
-  /** copying 阶段允许显式取消；committing 会由主进程返回 false。 */
+  /** copying/verifying 阶段允许显式取消；仅取消请求本身 pending 时禁用按钮。 */
   const handleCancel = async (progress: WorkspaceRelocationProgress): Promise<void> => {
-    setBusyWorkspaceId(progress.workspaceId)
+    dispatchWorkspacePhase(progress.workspaceId, { type: 'cancel-requested' })
     try {
       await window.electronAPI.cancelWorkspaceRelocation(progress.operationId)
     } catch (cancelError) {
       setActionError(toErrorMessage(cancelError, '无法取消项目迁移'))
+    } finally {
+      dispatchWorkspacePhase(progress.workspaceId, { type: 'cancel-finished' })
+    }
+  }
+
+  /** 使用主进程 journal 保存的原目标继续迁移，不重新打开目录选择器。 */
+  const handleResume = async (progress: WorkspaceRelocationProgress): Promise<void> => {
+    dispatchWorkspacePhase(progress.workspaceId, { type: 'start-requested' })
+    setActionError(null)
+    try {
+      const completed = await window.electronAPI.resumeWorkspaceRelocation({
+        workspaceId: progress.workspaceId,
+        operationId: progress.operationId,
+      })
+      setProgressByWorkspace((current) => ({ ...current, [completed.workspaceId]: completed }))
+      onChanged?.()
+    } catch (resumeError) {
+      setActionError(toErrorMessage(resumeError, '无法继续项目迁移'))
+    } finally {
+      dispatchWorkspacePhase(progress.workspaceId, { type: 'settled' })
+    }
+  }
+
+  /** 放弃恢复任务，只请求主进程清理 journal 与 Proma sidecar。 */
+  const handleAbandon = async (progress: WorkspaceRelocationProgress): Promise<void> => {
+    setBusyWorkspaceId(progress.workspaceId)
+    setActionError(null)
+    try {
+      await window.electronAPI.abandonWorkspaceRelocation({
+        workspaceId: progress.workspaceId,
+        operationId: progress.operationId,
+      })
+      onChanged?.()
+    } catch (abandonError) {
+      setActionError(toErrorMessage(abandonError, '无法放弃项目迁移'))
     } finally {
       setBusyWorkspaceId(null)
     }
@@ -147,6 +225,11 @@ export function WorkspacePathList({
   const dialogProgress = selectedWorkspace === null
     ? null
     : progressByWorkspace[selectedWorkspace.workspaceId] ?? selectedWorkspace.relocation
+  /** 对话框动作阶段与列表共用同一项目状态机。 */
+  const dialogPhase = selectedWorkspace === null ? 'idle' : actionPhaseByWorkspace[selectedWorkspace.workspaceId] ?? 'idle'
+  /** 活动进度允许在 start Promise 未返回时立即取消。 */
+  const dialogRunning = dialogProgress !== null
+    && (dialogPhase === 'running' || dialogPhase === 'cancelling' || isWorkspaceRelocationActive(dialogProgress))
 
   return (
     <SettingsSection title="项目文件位置" description="管理每个项目实际使用的文件目录。">
@@ -161,8 +244,15 @@ export function WorkspacePathList({
           {workspaces.map((workspace) => {
             /** 优先使用最新事件进度。 */
             const progress = progressByWorkspace[workspace.workspaceId] ?? workspace.relocation
+            /** 进程内阶段优先；首屏持久化 active 状态可直接恢复取消能力。 */
+            const storedPhase = actionPhaseByWorkspace[workspace.workspaceId] ?? 'idle'
+            const phase = storedPhase === 'idle' && isWorkspaceRelocationActive(progress) ? 'running' : storedPhase
+            const stale = isWorkspaceRelocationStale(progress)
             const migrating = progress !== null && progress.stage !== 'completed' && progress.stage !== 'failed'
-            const busy = busyWorkspaceId === workspace.workspaceId || migrating
+            const busy = busyWorkspaceId === workspace.workspaceId
+              || phase === 'starting'
+              || phase === 'cancelling'
+              || (migrating && phase !== 'running' && !stale)
             return (
               <SettingsRow
                 key={workspace.workspaceId}
@@ -170,16 +260,28 @@ export function WorkspacePathList({
                 icon={<FolderInput className="size-4 text-muted-foreground" aria-hidden="true" />}
                 description={<WorkspacePathDescription workspace={workspace} progress={progress} />}
               >
-                <div className="flex w-24 justify-end">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={busy}
-                    onClick={() => void handleAction(workspace)}
-                  >
-                    {busyWorkspaceId === workspace.workspaceId ? <Loader2 className="animate-spin" aria-hidden="true" /> : null}
-                    {getWorkspaceActionLabel(workspace)}
-                  </Button>
+                <div className="flex min-w-24 justify-end gap-2">
+                  {(phase === 'running' || phase === 'cancelling') && progress ? (
+                    <Button size="sm" variant="outline" disabled={phase === 'cancelling'} onClick={() => void handleCancel(progress)}>
+                      {phase === 'cancelling' ? <Loader2 className="animate-spin" aria-hidden="true" /> : null}
+                      取消迁移
+                    </Button>
+                  ) : stale && progress ? (
+                    <>
+                      <Button size="sm" variant="outline" disabled={busy} onClick={() => void handleResume(progress)}>继续迁移</Button>
+                      <Button size="sm" variant="outline" disabled={busy} onClick={() => void handleAbandon(progress)}>放弃迁移</Button>
+                    </>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={busy}
+                      onClick={() => void handleAction(workspace)}
+                    >
+                      {busyWorkspaceId === workspace.workspaceId || phase === 'starting' ? <Loader2 className="animate-spin" aria-hidden="true" /> : null}
+                      {getWorkspaceActionLabel(workspace)}
+                    </Button>
+                  )}
                 </div>
               </SettingsRow>
             )
@@ -193,7 +295,7 @@ export function WorkspacePathList({
         </p>
       ) : null}
 
-      <Dialog open={selectedWorkspace !== null} onOpenChange={(open) => { if (!open && busyWorkspaceId === null) closeDialog() }}>
+      <Dialog open={selectedWorkspace !== null} onOpenChange={(open) => { if (!open && busyWorkspaceId === null && dialogPhase === 'idle') closeDialog() }}>
         <DialogContent className="max-w-xl rounded-lg" aria-describedby="workspace-relocation-description">
           <DialogHeader>
             <DialogTitle>确认迁移项目文件</DialogTitle>
@@ -216,13 +318,16 @@ export function WorkspacePathList({
             ) : null}
           </div>
           <DialogFooter>
-            {dialogProgress?.stage === 'copying' ? (
-              <Button variant="outline" disabled={busyWorkspaceId !== null} onClick={() => void handleCancel(dialogProgress)}>取消迁移</Button>
+            {dialogRunning && dialogProgress ? (
+              <Button variant="outline" disabled={dialogPhase === 'cancelling'} onClick={() => void handleCancel(dialogProgress)}>
+                {dialogPhase === 'cancelling' ? <Loader2 className="animate-spin" aria-hidden="true" /> : null}
+                取消迁移
+              </Button>
             ) : (
-              <Button variant="outline" disabled={busyWorkspaceId !== null} onClick={closeDialog}>取消</Button>
+              <Button variant="outline" disabled={busyWorkspaceId !== null || dialogPhase !== 'idle'} onClick={closeDialog}>取消</Button>
             )}
-            <Button disabled={busyWorkspaceId !== null || preview === null || dialogProgress !== null} onClick={() => void handleConfirm()}>
-              {busyWorkspaceId !== null ? <Loader2 className="animate-spin" aria-hidden="true" /> : null}
+            <Button disabled={busyWorkspaceId !== null || dialogPhase !== 'idle' || preview === null || dialogProgress !== null} onClick={() => void handleConfirm()}>
+              {dialogPhase === 'starting' ? <Loader2 className="animate-spin" aria-hidden="true" /> : null}
               确认迁移
             </Button>
           </DialogFooter>
@@ -230,6 +335,18 @@ export function WorkspacePathList({
       </Dialog>
     </SettingsSection>
   )
+}
+
+/** 只有当前进程活动的复制或校验任务允许取消。 */
+function isWorkspaceRelocationActive(progress: WorkspaceRelocationProgress | null): boolean {
+  return progress?.active === true && (progress.stage === 'copying' || progress.stage === 'verifying')
+}
+
+/** 新进程读取到的复制、校验或失败 journal 允许继续或放弃。 */
+function isWorkspaceRelocationStale(progress: WorkspaceRelocationProgress | null): boolean {
+  return progress !== null
+    && progress.active !== true
+    && (progress.stage === 'copying' || progress.stage === 'verifying' || progress.stage === 'failed')
 }
 
 /** loading/error/empty 共用固定高度状态。 */

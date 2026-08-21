@@ -17,6 +17,28 @@ function createWorkspace(overrides: Partial<WorkspacePathState>): WorkspacePathS
 }
 
 describe('WorkspacePathList', () => {
+  test('Given start Promise 仍 pending When 收到 copying 后点击取消 Then starting 转 running 且仅 cancelling 禁用取消', () => {
+    const { reduceWorkspaceActionPhase } = workspacePathModule
+    const starting = reduceWorkspaceActionPhase('idle', { type: 'start-requested' })
+    const running = reduceWorkspaceActionPhase(starting, { type: 'progress', stage: 'copying' })
+    const cancelling = reduceWorkspaceActionPhase(running, { type: 'cancel-requested' })
+    expect([starting, running, cancelling]).toEqual(['starting', 'running', 'cancelling'])
+    expect(reduceWorkspaceActionPhase(cancelling, { type: 'settled' })).toBe('idle')
+  })
+
+  test('Given stale 与 active persisted journal When 渲染 Then 分别显示继续放弃或取消迁移', () => {
+    const { WorkspacePathList } = workspacePathModule
+    const staleHtml = renderToStaticMarkup(<WorkspacePathList workspaces={[createWorkspace({
+      relocation: { operationId: 'operation-1', workspaceId: 'workspace-1', stage: 'failed', completedBytes: 2, totalBytes: 4, active: false },
+    })]} />)
+    const activeHtml = renderToStaticMarkup(<WorkspacePathList workspaces={[createWorkspace({
+      relocation: { operationId: 'operation-1', workspaceId: 'workspace-1', stage: 'copying', completedBytes: 2, totalBytes: 4, active: true },
+    })]} />)
+    expect(staleHtml).toContain('继续迁移')
+    expect(staleHtml).toContain('放弃迁移')
+    expect(activeHtml).toContain('取消迁移')
+    expect(activeHtml).not.toContain('继续迁移')
+  })
   test('Given external、managed、offline 三类项目 When 渲染列表 Then 展示迁移、迁出、重定位动作与截断路径', () => {
     const { WorkspacePathList } = workspacePathModule
     const html = renderToStaticMarkup(<WorkspacePathList
@@ -85,7 +107,8 @@ describe('WorkspacePathList', () => {
       relocation: { operationId: 'operation-1', workspaceId: 'external', stage: 'copying', completedBytes: 25, totalBytes: 100 },
     })]} />)
     expect(progressHtml).toContain('aria-valuenow="25"')
-    expect(progressHtml).toContain('disabled=""')
+    expect(progressHtml).toContain('继续迁移')
+    expect(progressHtml).toContain('放弃迁移')
     expect(progressHtml).toContain('h-1.5')
   })
 

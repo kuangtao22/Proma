@@ -69,6 +69,8 @@ describe('workspace path management contract', () => {
       START_WORKSPACE_RELOCATION: 'path-management:start-workspace-relocation',
       GET_WORKSPACE_RELOCATION_STATUS: 'path-management:get-workspace-relocation-status',
       CANCEL_WORKSPACE_RELOCATION: 'path-management:cancel-workspace-relocation',
+      RESUME_WORKSPACE_RELOCATION: 'path-management:resume-workspace-relocation',
+      ABANDON_WORKSPACE_RELOCATION: 'path-management:abandon-workspace-relocation',
       RELINK_WORKSPACE: 'path-management:relink-workspace',
       WORKSPACE_RELOCATION_PROGRESS: 'path-management:workspace-relocation-progress',
     })

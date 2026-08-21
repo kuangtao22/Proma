@@ -72,6 +72,12 @@ export interface StartWorkspaceRelocationInput {
   purpose: 'relocation'
 }
 
+/** 继续或放弃持久化项目迁移的精确身份。 */
+export interface WorkspaceRelocationRecoveryInput {
+  workspaceId: string
+  operationId: string
+}
+
 /** 项目目录选择器支持的两种互斥用途。 */
 export type WorkspaceTargetPurpose = 'relocation' | 'relink'
 
@@ -107,6 +113,8 @@ export interface WorkspaceRelocationProgress {
   stage: WorkspaceRelocationStage
   completedBytes: number
   totalBytes: number
+  /** 该迁移是否仍由当前主进程持有活动控制器。 */
+  active?: boolean
   currentRelativePath?: string
   error?: string
 }
@@ -318,6 +326,8 @@ export const PATH_MANAGEMENT_IPC_CHANNELS = {
   START_WORKSPACE_RELOCATION: 'path-management:start-workspace-relocation',
   GET_WORKSPACE_RELOCATION_STATUS: 'path-management:get-workspace-relocation-status',
   CANCEL_WORKSPACE_RELOCATION: 'path-management:cancel-workspace-relocation',
+  RESUME_WORKSPACE_RELOCATION: 'path-management:resume-workspace-relocation',
+  ABANDON_WORKSPACE_RELOCATION: 'path-management:abandon-workspace-relocation',
   RELINK_WORKSPACE: 'path-management:relink-workspace',
   WORKSPACE_RELOCATION_PROGRESS: 'path-management:workspace-relocation-progress',
   RECOVER_DATA_ROOT: 'path-management:recover-data-root',
