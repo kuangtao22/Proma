@@ -102,11 +102,11 @@ describe('工作区写 IPC 守卫合同', () => {
       { channel: 'DELETE_WORKSPACE', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, () =>', sideEffects: ['getAgentWorkspace(id)', 'listAgentWorkspaces()', 'removeBindingsForDeletedWorkspace(', 'deleteAgentSession(', 'deleteAgentWorkspace('] },
       { channel: 'ATTACH_DIRECTORY', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'watchAttachedDirectory('] },
       { channel: 'DETACH_DIRECTORY', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'releaseDirectoryWatcherIfUnreferenced('] },
-      { channel: 'ATTACH_FILE', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, async () =>', sideEffects: ['getAgentSessionMeta(', "await import('node:fs')", 'realpathSync(', 'updateAgentSessionMeta(', 'watchAttachedDirectory('] },
+      { channel: 'ATTACH_FILE', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'realpathSync(', 'updateAgentSessionMeta(', 'watchAttachedDirectory('] },
       { channel: 'DETACH_FILE', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'releaseDirectoryWatcherIfUnreferenced('] },
       { channel: 'ATTACH_WORKSPACE_DIRECTORY', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () =>', sideEffects: ['attachWorkspaceDirectory(', 'watchAttachedDirectory('] },
       { channel: 'DETACH_WORKSPACE_DIRECTORY', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () =>', sideEffects: ['detachWorkspaceDirectory(', 'releaseDirectoryWatcherIfUnreferenced('] },
-      { channel: 'ATTACH_WORKSPACE_FILE', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, async () =>', sideEffects: ["await import('node:fs')", 'realpathSync(', 'attachWorkspaceFile(', 'watchAttachedDirectory('] },
+      { channel: 'ATTACH_WORKSPACE_FILE', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () =>', sideEffects: ['realpathSync(', 'attachWorkspaceFile(', 'watchAttachedDirectory('] },
       { channel: 'DETACH_WORKSPACE_FILE', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () =>', sideEffects: ['detachWorkspaceFile(', 'releaseDirectoryWatcherIfUnreferenced('] },
     ]
 
@@ -124,6 +124,31 @@ describe('工作区写 IPC 守卫合同', () => {
         const sideEffectIndex = handler.indexOf(sideEffect)
         expect(sideEffectIndex).toBeGreaterThan(guardIndex)
       }
+    }
+  })
+
+  test('Given attach file 已通过迁移守卫 When 进入文件系统副作用 Then 中间不存在异步让出窗口', () => {
+    /** 读取实际 IPC 注册源码，防止 guard 后动态 import 重新引入 TOCTOU。 */
+    const source = readFileSync(join(import.meta.dir, '..', 'ipc.ts'), 'utf8')
+    /** 必须保持同步原子段的两个附加文件通道。 */
+    const channels = ['ATTACH_FILE', 'ATTACH_WORKSPACE_FILE']
+
+    for (const channel of channels) {
+      /** 当前通道 handler 源码。 */
+      const start = source.indexOf(`AGENT_IPC_CHANNELS.${channel}`)
+      const end = source.indexOf('ipcMain.handle(', start + 1)
+      const handler = source.slice(start, end === -1 ? source.length : end)
+      /** 迁移守卫 closure 起始位置。 */
+      const guardIndex = handler.indexOf('workspaceOperationGuard.run')
+      /** 路径解析是守卫后的首个文件系统副作用。 */
+      const fileSystemIndex = handler.indexOf('realpathSync(', guardIndex)
+      /** 守卫到副作用之间的同步临界段。 */
+      const guardedPrefix = handler.slice(guardIndex, fileSystemIndex)
+
+      expect(guardIndex).toBeGreaterThan(-1)
+      expect(fileSystemIndex).toBeGreaterThan(guardIndex)
+      expect(guardedPrefix).not.toContain('await ')
+      expect(guardedPrefix).not.toContain("import('node:")
     }
   })
 

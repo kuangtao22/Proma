@@ -3347,12 +3347,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_FILE,
     async (_, input: AgentAttachFileInput): Promise<string[]> => {
-      return workspaceOperationGuard.runSessionWrite(input.sessionId, async () => {
+      return workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
         const meta = getAgentSessionMeta(input.sessionId)
         if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
 
-        const { realpathSync, statSync } = await import('node:fs')
-        const { resolve } = await import('node:path')
         const safePath = realpathSync(resolve(input.filePath))
         const stats = statSync(safePath)
         if (!stats.isFile()) throw new Error('只能附加文件')
@@ -3413,9 +3411,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_WORKSPACE_FILE,
     async (_, input: WorkspaceAttachFileInput): Promise<string[]> => {
-      return workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, async () => {
-        const { realpathSync, statSync } = await import('node:fs')
-        const { resolve } = await import('node:path')
+      return workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () => {
         const safePath = realpathSync(resolve(input.filePath))
         const stats = statSync(safePath)
         if (!stats.isFile()) throw new Error('只能附加文件')

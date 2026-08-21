@@ -198,7 +198,8 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(source).toContain('private stoppedBySessions = new Map<string, Set<number>>()')
     expect(source).toContain('private latestRunGenerations = new Map<string, number>()')
     expect(sendBody).toContain('this.latestRunGenerations.set(sessionId, runGeneration)')
-    expect(sendBody.match(/isLatestRunGeneration\(this\.latestRunGenerations, sessionId, runGeneration\)/g)?.length).toBe(2)
+    expect(sendBody.match(/isLatestRunGeneration\(this\.latestRunGenerations, sessionId, runGeneration\)/g)?.length ?? 0)
+      .toBeGreaterThanOrEqual(2)
     expect(source).toContain('markStoppedGeneration(this.stoppedBySessions, sessionId, runGeneration)')
     expect(source).toContain('consumeStoppedGeneration(this.stoppedBySessions, sessionId, runGeneration)')
     expect(stopAllBody).toContain('this.stoppedBySessions.clear()')
@@ -233,5 +234,68 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(sendBody).toContain('onComplete: completeBeforeRun')
     expect(sendBody).not.toMatch(/callbacks\.on(?:Error|Complete)\(/)
     expect(sendBody).toContain('callbacks.onRunStarted?.({ startedAt: streamStartedAt })')
+  })
+
+  test('Given stop 后旧 adapter 尚未退出 When 检查生产接入 Then 独立跟踪 in-flight 并阻止旧代际副作用', () => {
+    /** 读取真实编排源码，约束迁移准入与前台 active 状态分离。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** sendMessage 函数体。 */
+    const sendStart = source.indexOf('  async sendMessage(')
+    const sendEnd = source.indexOf('\n  /**\n   * 中止指定会话', sendStart)
+    const sendBody = source.slice(sendStart, sendEnd)
+    /** stop 函数体。 */
+    const stopStart = source.indexOf('  stop(sessionId: string, stopBeforeRun = false): void {')
+    const stopEnd = source.indexOf('\n  /** 检查指定会话是否正在处理中 */', stopStart)
+    const stopBody = source.slice(stopStart, stopEnd)
+
+    expect(source).toContain('private inFlightRunGenerations = new Map<string, Set<number>>()')
+    expect(sendBody).toContain('markInFlightGeneration(this.inFlightRunGenerations, sessionId, runGeneration)')
+    expect(sendBody).toContain('releaseInFlightGeneration(')
+    expect(sendBody).toContain('if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration))')
+    expect(stopBody).not.toContain('this.inFlightRunGenerations.delete(sessionId)')
+    expect(source).toContain('return hasInFlightGeneration(this.inFlightRunGenerations, sessionId)')
+  })
+
+  test('Given 工具审批等待期间启动新代际 When 旧审批返回 Then 再次校验 latest 并拒绝迟到工具', () => {
+    /** 读取真实编排源码，约束异步审批返回后的第二道代际检查。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** 截取 canUseTool 权限函数。 */
+    const start = source.indexOf('const canUseTool = async')
+    const end = source.indexOf('// 13. 构建 Adapter 查询选项', start)
+    const body = source.slice(start, end)
+    /** stale tool 检查在初始入口与三个异步审批返回后都应执行。 */
+    const staleChecks = body.match(/denyStaleToolRun\(\)/g)?.length ?? 0
+
+    expect(body).toContain('await handleExitPlanMode(')
+    expect(body).toContain('await askUserService.handleAskUserQuestion(')
+    expect(body).toContain('await permissionService.requestSingleApproval(')
+    expect(staleChecks).toBeGreaterThanOrEqual(4)
+  })
+
+  test('Given 会话或同项目会话仍在 draining When 请求 rewind Then 以 in-flight 状态保持阻断', () => {
+    /** 读取真实编排源码，约束 rewind 不把 stop 后的 draining 误判为空闲。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** rewind 与同项目冲突检查之间的源码。 */
+    const start = source.indexOf('  private hasOtherActiveSessionForLocalProjectRoot(')
+    const end = source.indexOf('  /** 中止所有活跃的 Agent 会话', start)
+    const body = source.slice(start, end)
+
+    expect(body).toContain('for (const activeSessionId of this.inFlightRunGenerations.keys())')
+    expect(body).toContain('if (this.isInFlight(sessionId))')
+  })
+
+  test('Given generation1 自动标题请求迟到 When generation2 已启动 Then 不更新标题或发送标题事件', () => {
+    /** 读取真实编排源码，约束独立标题请求也遵守代际所有权。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** 自动标题方法与 sendMessage 内调用点。 */
+    const methodStart = source.indexOf('  private async autoGenerateTitle(')
+    const methodEnd = source.indexOf('\n  /**\n   * Session-not-found', methodStart)
+    const methodBody = source.slice(methodStart, methodEnd)
+    const sendStart = source.indexOf('  async sendMessage(')
+    const sendEnd = source.indexOf('\n  /**\n   * 中止指定会话', sendStart)
+    const sendBody = source.slice(sendStart, sendEnd)
+
+    expect(sendBody).toContain('isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration),')
+    expect(methodBody.match(/if \(!isCurrent\(\)\) return/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
   })
 })

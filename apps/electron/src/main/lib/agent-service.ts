@@ -46,6 +46,7 @@ import { AgentStreamForwarder } from './agent-stream-forwarder'
 import { AgentQueueCoordinator } from './agent-queue-coordinator'
 import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
+import { runAgentServiceTerminalEffects } from './agent-run-lifecycle'
 
 // ===== 实例创建 =====
 
@@ -156,6 +157,11 @@ function publishRunStopped(
   })
 }
 
+/** 记录被隔离的 Agent service 终态副作用异常。 */
+function reportAgentServiceTerminalEffectError(name: string, error: unknown): void {
+  console.error(`[Agent 服务] 终态副作用执行失败: ${name}`, error)
+}
+
 // ===== EventBus IPC 转发中间件 =====
 
 /**
@@ -222,33 +228,53 @@ export async function runAgent(
   try {
     await orchestrator.sendMessage(input, {
       onError: (error) => {
-        if (!webContents.isDestroyed()) {
-          webContents.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
-            sessionId: input.sessionId,
-            error,
-          })
-        }
+        runAgentServiceTerminalEffects([{
+          name: 'renderer-error',
+          run: () => {
+            if (!webContents.isDestroyed()) {
+              webContents.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
+                sessionId: input.sessionId,
+                error,
+              })
+            }
+          },
+        }], reportAgentServiceTerminalEffectError)
       },
       onComplete: (messages, opts) => {
-        publishRunStopped(input.sessionId, opts?.stoppedByUser, opts?.startedAt)
-        if (!webContents.isDestroyed()) {
-          sendAgentStreamComplete(webContents, input, {
-            messages,
-            stoppedByUser: opts?.stoppedByUser ?? false,
-            startedAt: opts?.startedAt,
-            resultSubtype: opts?.resultSubtype,
-            resultErrors: opts?.resultErrors,
-            backgroundTasksPending: opts?.backgroundTasksPending,
-            // 只读取刚完成的轻量 meta，renderer 可据此增量更新列表，避免再取 5,000+ 条全量会话。
-            session: getSessionMetaForRenderer(input.sessionId),
-          })
-        }
-        agentQueueCoordinator.onRunComplete(
-          input.sessionId,
-          queueMessageId,
-          opts?.backgroundTasksPending === true,
-          opts?.stoppedByUser === true,
-        )
+        runAgentServiceTerminalEffects([
+          {
+            name: 'publish-run-stopped',
+            run: () => { publishRunStopped(input.sessionId, opts?.stoppedByUser, opts?.startedAt) },
+          },
+          {
+            name: 'renderer-complete',
+            run: () => {
+              if (!webContents.isDestroyed()) {
+                sendAgentStreamComplete(webContents, input, {
+                  messages,
+                  stoppedByUser: opts?.stoppedByUser ?? false,
+                  startedAt: opts?.startedAt,
+                  resultSubtype: opts?.resultSubtype,
+                  resultErrors: opts?.resultErrors,
+                  backgroundTasksPending: opts?.backgroundTasksPending,
+                  // 只读取刚完成的轻量 meta，renderer 可据此增量更新列表，避免再取 5,000+ 条全量会话。
+                  session: getSessionMetaForRenderer(input.sessionId),
+                })
+              }
+            },
+          },
+          {
+            name: 'queue-cleanup',
+            run: () => {
+              agentQueueCoordinator.onRunComplete(
+                input.sessionId,
+                queueMessageId,
+                opts?.backgroundTasksPending === true,
+                opts?.stoppedByUser === true,
+              )
+            },
+          },
+        ], reportAgentServiceTerminalEffectError)
       },
       onRunStarted: ({ startedAt }) => {
         const sessionMeta = getAgentSessionMeta(input.sessionId)
@@ -297,17 +323,31 @@ export async function runAgent(
   } catch (err) {
     console.error('[Agent 服务] runAgent 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'
-    if (!webContents.isDestroyed()) {
-      webContents.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
-        sessionId: input.sessionId,
-        error: errorMessage,
-      })
-      sendAgentStreamComplete(webContents, input, {
-        messages: [],
-        stoppedByUser: false,
-      })
-    }
-    agentQueueCoordinator.onRunComplete(input.sessionId, queueMessageId, false, false)
+    runAgentServiceTerminalEffects([
+      {
+        name: 'renderer-error',
+        run: () => {
+          if (!webContents.isDestroyed()) {
+            webContents.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
+              sessionId: input.sessionId,
+              error: errorMessage,
+            })
+          }
+        },
+      },
+      {
+        name: 'renderer-complete',
+        run: () => {
+          if (!webContents.isDestroyed()) {
+            sendAgentStreamComplete(webContents, input, { messages: [], stoppedByUser: false })
+          }
+        },
+      },
+      {
+        name: 'queue-cleanup',
+        run: () => { agentQueueCoordinator.onRunComplete(input.sessionId, queueMessageId, false, false) },
+      },
+    ], reportAgentServiceTerminalEffectError)
   } finally {
     // 仅在 orchestrator 已完成此会话时清理映射
     // 避免被拒绝的请求误删仍在运行的会话映射
@@ -349,37 +389,57 @@ export async function runAgentHeadless(
   try {
     await orchestrator.sendMessage(runInput, {
       onError: (error) => {
-        callbacks.onError(error)
-        // 同步到渲染进程
-        if (wc && !wc.isDestroyed()) {
-          wc.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
-            sessionId: runInput.sessionId,
-            error,
-          })
-        }
+        runAgentServiceTerminalEffects([
+          { name: 'external-on-error', run: () => { callbacks.onError(error) } },
+          {
+            name: 'renderer-error',
+            run: () => {
+              if (wc && !wc.isDestroyed()) {
+                wc.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
+                  sessionId: runInput.sessionId,
+                  error,
+                })
+              }
+            },
+          },
+        ], reportAgentServiceTerminalEffectError)
       },
       onComplete: (messages, opts) => {
-        callbacks.onComplete(messages)
-        publishRunStopped(runInput.sessionId, opts?.stoppedByUser, opts?.startedAt)
-        // 同步到渲染进程
-        if (wc && !wc.isDestroyed()) {
-          sendAgentStreamComplete(wc, runInput, {
-            messages,
-            stoppedByUser: opts?.stoppedByUser ?? false,
-            startedAt: opts?.startedAt,
-            resultSubtype: opts?.resultSubtype,
-            resultErrors: opts?.resultErrors,
-            backgroundTasksPending: opts?.backgroundTasksPending,
-            // 只读取刚完成的轻量 meta，renderer 可据此增量更新列表，避免再取 5,000+ 条全量会话。
-            session: getSessionMetaForRenderer(runInput.sessionId),
-          })
-        }
-        agentQueueCoordinator.onRunComplete(
-          runInput.sessionId,
-          undefined,
-          opts?.backgroundTasksPending === true,
-          opts?.stoppedByUser === true,
-        )
+        runAgentServiceTerminalEffects([
+          { name: 'external-on-complete', run: () => { callbacks.onComplete(messages) } },
+          {
+            name: 'publish-run-stopped',
+            run: () => { publishRunStopped(runInput.sessionId, opts?.stoppedByUser, opts?.startedAt) },
+          },
+          {
+            name: 'renderer-complete',
+            run: () => {
+              if (wc && !wc.isDestroyed()) {
+                sendAgentStreamComplete(wc, runInput, {
+                  messages,
+                  stoppedByUser: opts?.stoppedByUser ?? false,
+                  startedAt: opts?.startedAt,
+                  resultSubtype: opts?.resultSubtype,
+                  resultErrors: opts?.resultErrors,
+                  backgroundTasksPending: opts?.backgroundTasksPending,
+                  // 只读取刚完成的轻量 meta，renderer 可据此增量更新列表，避免再取 5,000+ 条全量会话。
+                  session: getSessionMetaForRenderer(runInput.sessionId),
+                })
+              }
+            },
+          },
+          {
+            name: 'queue-cleanup',
+            run: () => {
+              agentQueueCoordinator.onRunComplete(
+                runInput.sessionId,
+                undefined,
+                opts?.backgroundTasksPending === true,
+                opts?.stoppedByUser === true,
+              )
+            },
+          },
+        ], reportAgentServiceTerminalEffectError)
       },
       onTitleUpdated: (title) => {
         callbacks.onTitleUpdated(title)
@@ -422,17 +482,30 @@ export async function runAgentHeadless(
   } catch (err) {
     console.error('[Agent 服务] runAgentHeadless 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'
-    callbacks.onError(errorMessage)
-    callbacks.onComplete()
-    if (wc && !wc.isDestroyed()) {
-      wc.send(AGENT_IPC_CHANNELS.STREAM_ERROR, { sessionId: runInput.sessionId, error: errorMessage })
-      sendAgentStreamComplete(wc, runInput, {
-        messages: [],
-        stoppedByUser: false,
-        startedAt,
-      })
-    }
-    agentQueueCoordinator.onRunComplete(runInput.sessionId, undefined, false, false)
+    runAgentServiceTerminalEffects([
+      { name: 'external-on-error', run: () => { callbacks.onError(errorMessage) } },
+      { name: 'external-on-complete', run: () => { callbacks.onComplete() } },
+      {
+        name: 'renderer-error',
+        run: () => {
+          if (wc && !wc.isDestroyed()) {
+            wc.send(AGENT_IPC_CHANNELS.STREAM_ERROR, { sessionId: runInput.sessionId, error: errorMessage })
+          }
+        },
+      },
+      {
+        name: 'renderer-complete',
+        run: () => {
+          if (wc && !wc.isDestroyed()) {
+            sendAgentStreamComplete(wc, runInput, { messages: [], stoppedByUser: false, startedAt })
+          }
+        },
+      },
+      {
+        name: 'queue-cleanup',
+        run: () => { agentQueueCoordinator.onRunComplete(runInput.sessionId, undefined, false, false) },
+      },
+    ], reportAgentServiceTerminalEffectError)
   } finally {
     if (runStarted && !orchestrator.isActive(runInput.sessionId)) {
       sessionWebContents.delete(runInput.sessionId)
@@ -472,7 +545,7 @@ export async function rewindAgentSession(
  * 检查指定会话是否正在运行
  */
 export function isAgentSessionActive(sessionId: string): boolean {
-  return orchestrator.isActive(sessionId)
+  return orchestrator.isInFlight(sessionId)
 }
 
 /** 是否存在任意运行中 Agent，供更新器等全局生命周期服务安全判断。 */

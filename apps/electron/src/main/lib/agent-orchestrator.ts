@@ -81,9 +81,12 @@ import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 import {
   consumeStoppedGeneration,
   createAgentRunTerminalNotifier,
+  hasInFlightGeneration,
   hasStoppedGeneration,
   isLatestRunGeneration,
+  markInFlightGeneration,
   markStoppedGeneration,
+  releaseInFlightGeneration,
   runAgentLifecycle,
 } from './agent-run-lifecycle'
 
@@ -266,7 +269,9 @@ export class AgentOrchestrator {
 
   /** 被用户手动中止的运行代际（在 stop 中标记，在对应运行的终态路径消费）。 */
   private stoppedBySessions = new Map<string, Set<number>>()
-  /** 每个会话最新启动的运行代际；完成后保留，用于拒绝迟到旧 run 写 session-wide 状态。 */
+  /** 尚未从 adapter 与生命周期 finally 完全退出的运行代际。 */
+  private inFlightRunGenerations = new Map<string, Set<number>>()
+  /** 每个会话最新启动的运行代际；最后一个 in-flight 退出前保留，用于拒绝迟到旧 run 写状态。 */
   private latestRunGenerations = new Map<string, number>()
   /** 队列启动投影已显示、但运行槽尚未占用时的停止请求。 */
   private stoppedBeforeRunSessions = new Set<string>()
@@ -435,19 +440,23 @@ export class AgentOrchestrator {
     channelId: string,
     modelId: string,
     callbacks: SessionCallbacks,
+    isCurrent: () => boolean,
     signal?: AbortSignal,
   ): Promise<void> {
+    if (!isCurrent()) return
     if (signal?.aborted) return
     try {
       const meta = getAgentSessionMeta(sessionId)
       if (!meta || meta.title !== DEFAULT_SESSION_TITLE) return
 
       const title = await this.generateTitle({ userMessage, channelId, modelId }, signal)
+      if (!isCurrent()) return
       if (!title || signal?.aborted) return
 
       // 标题请求是异步的；请求期间用户可能已手动重命名，不能用旧结果覆盖。
       const latestMeta = getAgentSessionMeta(sessionId)
       if (!latestMeta || latestMeta.title !== DEFAULT_SESSION_TITLE) return
+      if (!isCurrent()) return
 
       updateAgentSessionMeta(sessionId, { title })
       callbacks.onTitleUpdated(title)
@@ -713,6 +722,18 @@ export class AgentOrchestrator {
       }
     }
 
+    /** 生命周期完全退出后释放迁移准入，并在最后一个代际退出时清理 latest。 */
+    const releaseRun = (): void => {
+      releaseActiveRun()
+      if (runGeneration === 0) return
+      releaseInFlightGeneration(
+        this.inFlightRunGenerations,
+        this.latestRunGenerations,
+        sessionId,
+        runGeneration,
+      )
+    }
+
     const completeBeforeRun = (options: {
       stoppedByUser?: boolean
       startedAt?: number
@@ -768,11 +789,12 @@ export class AgentOrchestrator {
     runGeneration = ++this.nextRunGeneration
     this.activeSessions.set(sessionId, runGeneration)
     this.latestRunGenerations.set(sessionId, runGeneration)
+    markInFlightGeneration(this.inFlightRunGenerations, sessionId, runGeneration)
 
     await runAgentLifecycle({
       isCurrent: () => this.activeSessions.get(sessionId) === runGeneration,
       isStopped: () => hasStoppedGeneration(this.stoppedBySessions, sessionId, runGeneration),
-      release: releaseActiveRun,
+      release: releaseRun,
       onStopped: () => {
         this.consumeStoppedByUser(sessionId, runGeneration)
         // 旧 generation 只能完成自己的回调，不能消费后来 generation 的 stoppedBeforeRun 标记。
@@ -992,6 +1014,7 @@ export class AgentOrchestrator {
       activations: SkillActivation[],
       userMessageUuid: string,
     ): void => {
+      if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) return
       pendingSkillActivations = mergeSkillActivations(pendingSkillActivations, activations)
       this.recordUserSkillActivations(sessionId, userMessageUuid, activations)
     }
@@ -1185,6 +1208,7 @@ export class AgentOrchestrator {
           toolInput,
           signal,
           (request: ExitPlanModeRequest) => {
+            if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) return
             this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'exit_plan_mode_request', request } })
           },
         )
@@ -1248,6 +1272,13 @@ export class AgentOrchestrator {
       /** Plan 模式是否已被 Agent 进入（初始 plan 模式时天然为 true，其他模式需 EnterPlanMode 触发） */
       let planModeEntered = initialPermissionMode === 'plan'
 
+      /** 旧代际在异步审批返回后统一得到拒绝，防止迟到工具继续执行。 */
+      const denyStaleToolRun = (): PermissionResult | undefined => (
+        isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)
+          ? undefined
+          : { behavior: 'deny', message: '当前 Agent 运行已停止，拒绝执行迟到工具调用' }
+      )
+
       const syncPlanModeFromToolUse = (toolName: string): void => {
         if (toolName === 'EnterPlanMode') {
           planModeEntered = true
@@ -1265,6 +1296,9 @@ export class AgentOrchestrator {
 
       // 动态 canUseTool：每次调用读取当前权限模式，支持运行中切换
       const canUseTool = async (toolName: string, input: Record<string, unknown>, options: CanUseToolOptions): Promise<PermissionResult> => {
+        /** 工具调用进入权限边界时的代际检查。 */
+        const staleAtEntry = denyStaleToolRun()
+        if (staleAtEntry) return staleAtEntry
         const currentMode = getPermissionMode()
 
         // ── 参数校验守卫（所有模式、所有工具，优先于权限检查） ──
@@ -1304,6 +1338,9 @@ export class AgentOrchestrator {
         if (toolName === 'ExitPlanMode') {
           console.log(`[canUseTool] ExitPlanMode: signal.aborted=${options.signal.aborted}, planModeEntered=${planModeEntered}, mode=${currentMode}`)
           const result = await handleExitPlanMode(input, options.signal)
+          /** 审批等待期间可能已启动新代际。 */
+          const staleAfterExitPlan = denyStaleToolRun()
+          if (staleAfterExitPlan) return staleAfterExitPlan
           if (result.behavior === 'allow' && 'targetMode' in result && result.targetMode) {
             // 更新 Map，后续 canUseTool 调用使用新模式
             this.sessionPermissionModes.set(sessionId, result.targetMode)
@@ -1329,12 +1366,15 @@ export class AgentOrchestrator {
 
         // AskUserQuestion：始终走交互式问答流程，不受权限模式影响
         if (toolName === 'AskUserQuestion') {
-          return askUserService.handleAskUserQuestion(
+          /** 等待用户回答后的权限结果。 */
+          const result = await askUserService.handleAskUserQuestion(
             sessionId, input, options.signal,
             (request: AskUserRequest) => {
+              if (denyStaleToolRun()) return
               this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'ask_user_request', request } })
             },
           )
+          return denyStaleToolRun() ?? result
         }
 
         // 视觉助手由用户在全局设置中显式启用并选择外发渠道；在正常会话中直接放行，
@@ -1369,9 +1409,18 @@ export class AgentOrchestrator {
           return { behavior: 'allow' as const, updatedInput: input }
         }
         if (planningDeletionPermission === 'require-single-approval') {
-          return permissionService.requestSingleApproval(sessionId, toolName, input, options, (request) => {
-            this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
-          })
+          /** 等待单次审批后的权限结果。 */
+          const result = await permissionService.requestSingleApproval(
+            sessionId,
+            toolName,
+            input,
+            options,
+            (request) => {
+              if (denyStaleToolRun()) return
+              this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
+            },
+          )
+          return denyStaleToolRun() ?? result
         }
 
         // ── 普通工具的权限分派 ──
@@ -1497,10 +1546,18 @@ export class AgentOrchestrator {
 
         // 标题请求与前台 Agent run 使用独立的 Codex Responses 请求，可并发执行。
         // 自动标题只会写入仍为默认名称的会话，因此不会覆盖用户的手动重命名。
-        this.autoGenerateTitle(sessionId, userMessage, channelId, resolvedModel, callbacks)
+        this.autoGenerateTitle(
+          sessionId,
+          userMessage,
+          channelId,
+          resolvedModel,
+          callbacks,
+          () => isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration),
+        )
           .catch((err) => console.error('[Agent 编排] 标题生成未捕获异常:', err))
       }
       const handleSessionId = (sdkSessionId: string, piSessionFile?: string): void => {
+        if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) return
         // 仅在 session_id 真正变化时才持久化。Pi 在同一 artifact 的每条消息都可能回调，
         // capturedSdkSessionId 已初始化为 existingSdkSessionId，并在 recovery 时同步重置。
         const isNewSessionId = sdkSessionId !== capturedSdkSessionId
@@ -1529,12 +1586,14 @@ export class AgentOrchestrator {
         startAutoTitleGeneration()
       }
       const handleModelResolved = (model: string): void => {
+        if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) return
         // `[1m]` 是 SDK 内部上下文变体，不应泄漏到标题生成或用户可见的模型名。
         resolvedModel = model.replace(/\[1m\]$/i, '')
         console.log(`[Agent 编排] SDK 确认模型: ${resolvedModel}`)
         this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'model_resolved', model: resolvedModel } })
       }
       const handleContextWindow = (cw: number): void => {
+        if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) return
         const inferredWindow = inferContextWindow(modelId)
         const contextWindow = Math.max(cw, inferredWindow ?? 0) || cw
         console.log(`[Agent 编排] 缓存 contextWindow: ${contextWindow}`)
@@ -1611,6 +1670,7 @@ export class AgentOrchestrator {
         ...(piCustomTools.length > 0 && { customTools: piCustomTools as PiAgentQueryOptions['customTools'] }),
         onSessionId: handleSessionId,
         onPiEntryBindings: (bindings) => {
+          if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) return
           const latest = getAgentSessionMeta(sessionId)
           // 运行中切到其他内核后，保留旧 turn 展示但不再写入 Pi 专用恢复 artifact。
           if (latest?.legacyTranscript?.continuationRequired) return
@@ -1622,6 +1682,7 @@ export class AgentOrchestrator {
         onContextWindow: handleContextWindow,
         retryRunStartedAt: streamStartedAt,
         onRetry: (retry) => {
+          if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) return
           this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'retry', ...retry } })
         },
       }
@@ -1687,6 +1748,12 @@ export class AgentOrchestrator {
 
             const iterResult = raceResult.result
             if (!iterResult || iterResult.done) break
+
+            if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) {
+              pendingNext = null
+              queryIterator.return?.(undefined as never).catch(() => {})
+              break
+            }
 
             pendingNext = null
             let msg = iterResult.value
@@ -1981,6 +2048,12 @@ export class AgentOrchestrator {
             continue
           }
 
+          if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) {
+            const wasStoppedByUser = this.consumeStoppedByUser(sessionId, runGeneration)
+            completeRun([], { stoppedByUser: wasStoppedByUser, startedAt: streamStartedAt })
+            return
+          }
+
           const wasStoppedByUser = this.consumeStoppedByUser(sessionId, runGeneration)
 
           // 15. 持久化 assistant 消息
@@ -2017,11 +2090,11 @@ export class AgentOrchestrator {
         } catch (error) {
           if (this.activeSessions.get(sessionId) !== runGeneration) {
             const wasStoppedByUser = this.consumeStoppedByUser(sessionId, runGeneration)
-            this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
             if (isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) {
+              this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
               try { updateAgentSessionMeta(sessionId, { stoppedByUser: wasStoppedByUser }) } catch { /* 会话可能已删除 */ }
             }
-            completeRun(getAgentSessionMessages(sessionId), { stoppedByUser: wasStoppedByUser, startedAt: streamStartedAt })
+            completeRun([], { stoppedByUser: wasStoppedByUser, startedAt: streamStartedAt })
             return
           }
 
@@ -2216,14 +2289,19 @@ export class AgentOrchestrator {
     return this.activeSessions.has(sessionId)
   }
 
+  /** 检查指定会话是否仍有未完全退出的 Agent 生命周期。 */
+  isInFlight(sessionId: string): boolean {
+    return hasInFlightGeneration(this.inFlightRunGenerations, sessionId)
+  }
+
   /** 是否存在任意运行中 Agent（含后台运行与外部触发的会话）。 */
   hasActiveSessions(): boolean {
-    return this.activeSessions.size > 0
+    return this.inFlightRunGenerations.size > 0
   }
 
   /** 同一个真实本地项目根只能由一个运行中会话执行文件回退。 */
   private hasOtherActiveSessionForLocalProjectRoot(sessionId: string, localProjectRoot: string): boolean {
-    for (const activeSessionId of this.activeSessions.keys()) {
+    for (const activeSessionId of this.inFlightRunGenerations.keys()) {
       if (activeSessionId === sessionId) continue
 
       const activeSessionMeta = getAgentSessionMeta(activeSessionId)
@@ -2276,7 +2354,7 @@ export class AgentOrchestrator {
     sessionId: string,
     assistantMessageUuid: string,
   ): Promise<RewindSessionResult> {
-    if (this.activeSessions.has(sessionId)) {
+    if (this.isInFlight(sessionId)) {
       throw new Error('会话正在运行中，请停止后再回退')
     }
 
@@ -2309,6 +2387,7 @@ export class AgentOrchestrator {
     this.activeSessions.clear()
     this.sessionPermissionModes.clear()
     this.stoppedBySessions.clear()
+    this.inFlightRunGenerations.clear()
     this.latestRunGenerations.clear()
     this.stoppedBeforeRunSessions.clear()
     this.queuedMessageUuids.clear()

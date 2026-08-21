@@ -28,6 +28,14 @@ export interface AgentRunTerminalNotifier<TMessages, TOptions> {
   onComplete: (messages?: TMessages, options?: TOptions) => void
 }
 
+/** Agent service 单个终态副作用。 */
+export interface AgentServiceTerminalEffect {
+  /** 用于错误日志定位的副作用名称。 */
+  name: string
+  /** 需要独立隔离执行的副作用。 */
+  run: () => void
+}
+
 /** 内部停止信号，仅用于跨异步 preflight 快速退出。 */
 const AGENT_RUN_STOPPED = Symbol('agent-run-stopped')
 
@@ -77,6 +85,27 @@ export function createAgentRunTerminalNotifier<TMessages, TOptions>(
   }
 }
 
+/**
+ * 依次执行 Agent service 终态副作用，并隔离任一 callback、IPC 或发布异常。
+ * 每个 effect 最多尝试一次，前一个失败不会阻止后续内部状态推进。
+ */
+export function runAgentServiceTerminalEffects(
+  effects: AgentServiceTerminalEffect[],
+  onEffectError: (name: string, error: unknown) => void,
+): void {
+  for (const effect of effects) {
+    try {
+      effect.run()
+    } catch (error) {
+      try {
+        onEffectError(effect.name, error)
+      } catch {
+        // 错误记录器属于外部边界，不能反向中断后续内部收尾。
+      }
+    }
+  }
+}
+
 /** 为会话添加指定运行代际的停止标记。 */
 export function markStoppedGeneration(
   markers: Map<string, Set<number>>,
@@ -109,6 +138,44 @@ export function hasStoppedGeneration(
   generation: number,
 ): boolean {
   return markers.get(sessionId)?.has(generation) === true
+}
+
+/** 为会话登记尚未完全退出的运行代际。 */
+export function markInFlightGeneration(
+  generationsBySession: Map<string, Set<number>>,
+  sessionId: string,
+  generation: number,
+): void {
+  /** 当前会话尚未完全退出的运行代际。 */
+  const generations = generationsBySession.get(sessionId) ?? new Set<number>()
+  generations.add(generation)
+  generationsBySession.set(sessionId, generations)
+}
+
+/** 判断会话是否仍有 adapter 或生命周期收尾尚未退出。 */
+export function hasInFlightGeneration(
+  generationsBySession: Map<string, Set<number>>,
+  sessionId: string,
+): boolean {
+  return (generationsBySession.get(sessionId)?.size ?? 0) > 0
+}
+
+/**
+ * 释放已经完全退出的运行代际。
+ * 仅当会话最后一个 in-flight 代际退出时清理 latest，避免旧代际重新获得写权限。
+ */
+export function releaseInFlightGeneration(
+  generationsBySession: Map<string, Set<number>>,
+  latestGenerations: Map<string, number>,
+  sessionId: string,
+  generation: number,
+): void {
+  /** 当前会话尚未完全退出的运行代际。 */
+  const generations = generationsBySession.get(sessionId)
+  if (!generations?.delete(generation)) return
+  if (generations.size > 0) return
+  generationsBySession.delete(sessionId)
+  latestGenerations.delete(sessionId)
 }
 
 /** 判断指定运行代际是否仍是会话最新启动的代际。 */

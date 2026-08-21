@@ -84,4 +84,17 @@ describe('Agent service 迁移准入', () => {
     expect(queueBody.indexOf('registerWebContents(')).toBeGreaterThan(queueBody.indexOf('workspaceOperationGuard.runSessionWrite('))
     expect(queueBody.indexOf('agentQueueCoordinator.enqueue(')).toBeGreaterThan(queueBody.indexOf('workspaceOperationGuard.runSessionWrite('))
   })
+
+  test('Given service 正常完成或 catch When 检查终态路径 Then renderer 与 headless 都隔离外部通知后推进内部收尾', () => {
+    /** 读取真实 agent-service 源码约束四条终态路径。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    /** 终态 effect 安全边界的生产调用次数。 */
+    const boundaryCalls = source.match(/runAgentServiceTerminalEffects\(/g)?.length ?? 0
+
+    expect(source).toContain("from './agent-run-lifecycle'")
+    expect(boundaryCalls).toBeGreaterThanOrEqual(4)
+    expect(source).toContain("name: 'queue-cleanup'")
+    expect(source).toContain("name: 'external-on-complete'")
+    expect(source).toContain("name: 'renderer-complete'")
+  })
 })

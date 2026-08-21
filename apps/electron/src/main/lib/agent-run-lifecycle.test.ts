@@ -2,9 +2,13 @@ import { describe, expect, test } from 'bun:test'
 import {
   consumeStoppedGeneration,
   createAgentRunTerminalNotifier,
+  hasInFlightGeneration,
   hasStoppedGeneration,
   isLatestRunGeneration,
+  markInFlightGeneration,
   markStoppedGeneration,
+  releaseInFlightGeneration,
+  runAgentServiceTerminalEffects,
   runAgentLifecycle,
 } from './agent-run-lifecycle'
 import { createWorkspaceOperationRegistry } from './workspace-operation-lock'
@@ -216,6 +220,58 @@ describe('Agent 运行生命周期', () => {
     expect(isLatestRunGeneration(latestGenerations, 'session-1', 1)).toBe(false)
     expect(isLatestRunGeneration(latestGenerations, 'session-1', 2)).toBe(true)
   })
+
+  test('Given generation1 stop 后 adapter 延迟退出 When generation2 启动 Then 迁移保持阻断且旧代际不再写消息或发事件', async () => {
+    /** 模拟当前可接收前台操作的运行代际。 */
+    let activeGeneration: number | undefined = 1
+    /** 模拟尚未完全退出的 adapter 代际集合。 */
+    const inFlightGenerations = new Map<string, Set<number>>()
+    /** 模拟每个会话最新启动的运行代际。 */
+    const latestGenerations = new Map<string, number>([['session-1', 1]])
+    /** 模拟 stop 后仍未 settle 的 adapter iterator。 */
+    const adapter = createDeferred()
+    /** 记录旧代际在恢复执行后尝试写消息的次数。 */
+    let oldGenerationWrites = 0
+    /** 记录旧代际在恢复执行后尝试发送事件的次数。 */
+    let oldGenerationEvents = 0
+    markInFlightGeneration(inFlightGenerations, 'session-1', 1)
+    /** generation1 正在等待 adapter settle。 */
+    const running = runAgentLifecycle({
+      isCurrent: () => activeGeneration === 1,
+      isStopped: () => true,
+      release: () => {
+        if (activeGeneration === 1) activeGeneration = undefined
+        releaseInFlightGeneration(inFlightGenerations, latestGenerations, 'session-1', 1)
+      },
+      onStopped: () => undefined,
+    }, async () => {
+      await adapter.promise
+      if (isLatestRunGeneration(latestGenerations, 'session-1', 1)) {
+        oldGenerationWrites += 1
+        oldGenerationEvents += 1
+      }
+    })
+
+    // stop 只释放前台 active 槽；迁移必须继续看到尚未退出的 adapter。
+    activeGeneration = undefined
+    expect(hasInFlightGeneration(inFlightGenerations, 'session-1')).toBe(true)
+
+    // 新运行可立即接管前台 UI，但旧代际从此失去 session-wide 副作用权限。
+    activeGeneration = 2
+    markInFlightGeneration(inFlightGenerations, 'session-1', 2)
+    latestGenerations.set('session-1', 2)
+    adapter.resolve()
+    await running
+
+    expect(oldGenerationWrites).toBe(0)
+    expect(oldGenerationEvents).toBe(0)
+    expect(inFlightGenerations.get('session-1')).toEqual(new Set([2]))
+    expect(latestGenerations.get('session-1')).toBe(2)
+
+    releaseInFlightGeneration(inFlightGenerations, latestGenerations, 'session-1', 2)
+    expect(hasInFlightGeneration(inFlightGenerations, 'session-1')).toBe(false)
+    expect(latestGenerations.has('session-1')).toBe(false)
+  })
 })
 
 describe('Agent 终端通知边界', () => {
@@ -267,5 +323,47 @@ describe('Agent 终端通知边界', () => {
     }).not.toThrow()
     expect(calls).toEqual(['error', 'complete'])
     expect(callbackErrorKinds).toEqual(['error'])
+  })
+
+  test('Given 外部完成 callback 与 renderer send 抛错 When 执行 service 收尾 Then publish、Promise 与 queue cleanup 各完成一次', async () => {
+    /** 记录每个内部与外部 effect 的调用次数。 */
+    const calls = new Map<string, number>()
+    /** 记录被隔离的外部异常。 */
+    const errors: string[] = []
+    /** Automation 完成 Promise 的 resolve 函数。 */
+    let resolveAutomation = (): void => undefined
+    /** 模拟等待 headless onComplete 的 Automation Promise。 */
+    const automationCompleted = new Promise<void>((resolve) => {
+      resolveAutomation = resolve
+    })
+    /** 记录并可选择抛错的 effect。 */
+    const effect = (name: string, shouldThrow = false): (() => void) => () => {
+      calls.set(name, (calls.get(name) ?? 0) + 1)
+      if (shouldThrow) throw new Error(`${name} failed`)
+    }
+
+    runAgentServiceTerminalEffects([
+      { name: 'external-complete', run: effect('external-complete', true) },
+      { name: 'publish', run: effect('publish') },
+      { name: 'renderer-send', run: effect('renderer-send', true) },
+      {
+        name: 'automation-resolve',
+        run: () => {
+          calls.set('automation-resolve', (calls.get('automation-resolve') ?? 0) + 1)
+          resolveAutomation()
+        },
+      },
+      { name: 'queue-cleanup', run: effect('queue-cleanup') },
+    ], (name) => { errors.push(name) })
+
+    await automationCompleted
+    expect(calls).toEqual(new Map([
+      ['external-complete', 1],
+      ['publish', 1],
+      ['renderer-send', 1],
+      ['automation-resolve', 1],
+      ['queue-cleanup', 1],
+    ]))
+    expect(errors).toEqual(['external-complete', 'renderer-send'])
   })
 })
