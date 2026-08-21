@@ -51,6 +51,8 @@ interface DurabilitySyncOptions {
   syncDirectory?: (directoryPath: string) => void
   /** rename 后同步已提交文件；Windows 生产默认重新打开文件并 fsync。 */
   syncFile?: (filePath: string) => void
+  /** 以指定 flags 重新打开已提交文件；仅供默认文件同步合同测试。 */
+  openFile?: (filePath: string, flags: number) => number
   /** 目录 fsync 不受支持时的中文降级提示。 */
   warnReducedDurability?: (message: string) => void
 }
@@ -304,11 +306,11 @@ export function syncDirectoryDurable(directoryPath: string): void {
 }
 
 /** 重新打开并 fsync 已提交文件，供 Windows rename 后加强内容与 metadata 持久性。 */
-function syncFileDurable(filePath: string): void {
+function syncFileDurable(filePath: string, options: DurabilitySyncOptions): void {
   /** 文件 descriptor 只在本函数内拥有。 */
   let descriptor: number | null = null
   try {
-    descriptor = openSync(filePath, constants.O_RDONLY)
+    descriptor = (options.openFile ?? openSync)(filePath, constants.O_RDWR)
     fsyncSync(descriptor)
     closeSync(descriptor)
     descriptor = null
@@ -326,7 +328,10 @@ function syncCommittedFileDurability(
 ): DurabilityResult {
   /** Windows 必须先保证已提交文件内容和 metadata 完成 fsync。 */
   const platform = options.platform ?? process.platform
-  if (platform === 'win32') (options.syncFile ?? syncFileDurable)(filePath)
+  if (platform === 'win32') {
+    if (options.syncFile) options.syncFile(filePath)
+    else syncFileDurable(filePath, options)
+  }
   return syncDirectoryDurability(dirname(filePath), options)
 }
 

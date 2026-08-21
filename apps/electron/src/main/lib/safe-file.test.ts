@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
+  constants,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -51,6 +53,29 @@ function createFileSystemError(code: string, syscall: string): Error & { code: s
 }
 
 describe('Windows durability capability', () => {
+  test('Given Windows 使用默认文件同步 When rename 后重新打开目标 Then 请求 O_RDWR 可写句柄', () => {
+    /** 隔离默认 syncFileDurable 的真实文件 descriptor。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-json-win-open-flags-'))
+    const filePath = join(tempDir, 'state.json')
+    let openedFlags: number | undefined
+    try {
+      const result = writeJsonFileAtomic(filePath, { value: 'saved' }, false, {
+        platform: 'win32',
+        openFile: (currentPath, flags) => {
+          openedFlags = flags
+          return openSync(currentPath, flags)
+        },
+        syncDirectory: () => { throw createFileSystemError('EPERM', 'open') },
+      })
+
+      expect(result).toBe('file-only')
+      expect(openedFlags).toBe(constants.O_RDWR)
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ value: 'saved' })
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('Given 普通 JSON 原子写已 rename 且 Windows 不支持目录 open When 返回 Then 文件已 fsync 且报告 file-only', () => {
     /** 隔离 Windows capability 合同的目标文件。 */
     const tempDir = mkdtempSync(join(tmpdir(), 'proma-json-win-durability-'))
