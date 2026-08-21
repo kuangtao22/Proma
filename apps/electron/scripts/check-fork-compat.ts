@@ -106,6 +106,7 @@ const PATHS = {
   electronBuilder: 'apps/electron/electron-builder.yml',
   workflow: '.github/workflows/upstream-compat.yml',
   mergeHelper: 'apps/electron/scripts/verify-upstream-merge.ts',
+  dataRootContract: 'apps/electron/scripts/check-data-root-contract.ts',
 } as const
 
 /** AST 中发现的运行时模块依赖。 */
@@ -377,6 +378,42 @@ function collectImportedLocalBindings(
   return bindings
 }
 
+/** 收集 bootstrap 直接体中由精确动态 import 解构出的 local binding。 */
+function collectDeferredImportedLocalBindings(
+  context: TypeScriptBindingContext,
+  functionDeclaration: ts.FunctionDeclaration | undefined,
+  modulePath: string,
+  exportedName: string,
+): Map<string, ts.Symbol> {
+  /** 动态 import 解构本地名到 binder symbol 的映射。 */
+  const bindings = new Map<string, ts.Symbol>()
+  if (!functionDeclaration?.body) return bindings
+  for (const statement of functionDeclaration.body.statements) {
+    if (!ts.isVariableStatement(statement)) continue
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isObjectBindingPattern(declaration.name) || !declaration.initializer) continue
+      /** await 不改变动态 import 的模块来源。 */
+      const initializer = ts.isAwaitExpression(declaration.initializer)
+        ? declaration.initializer.expression
+        : declaration.initializer
+      if (
+        !ts.isCallExpression(initializer)
+        || initializer.expression.kind !== ts.SyntaxKind.ImportKeyword
+        || !ts.isStringLiteralLike(initializer.arguments[0])
+        || initializer.arguments[0].text !== modulePath
+      ) continue
+      for (const element of declaration.name.elements) {
+        if ((element.propertyName?.getText(context.sourceFile) ?? element.name.getText(context.sourceFile)) !== exportedName) continue
+        if (!ts.isIdentifier(element.name)) continue
+        /** binder 为 object binding element 建立的唯一 local symbol。 */
+        const symbol = context.checker.getSymbolAtLocation(element.name)
+        if (symbol) bindings.set(element.name.text, symbol)
+      }
+    }
+  }
+  return bindings
+}
+
 /** 判断使用位置是否实际绑定到目标 named import，而不是同名局部声明。 */
 function identifierUsesImportedBinding(
   identifier: ts.Identifier,
@@ -461,6 +498,88 @@ function countTopLevelLanBridgeRegistrations(
       true,
     )
   )).length
+}
+
+/** 判断 direct statement 是否声明了目标动态 import binding。 */
+function statementDeclaresDeferredBinding(
+  statement: ts.Statement | undefined,
+  bindings: ReadonlyMap<string, ts.Symbol>,
+  checker: ts.TypeChecker,
+): boolean {
+  if (!statement || !ts.isVariableStatement(statement)) return false
+  return statement.declarationList.declarations.some((declaration) => {
+    if (!ts.isObjectBindingPattern(declaration.name)) return false
+    return declaration.name.elements.some((element) => (
+      ts.isIdentifier(element.name)
+      && bindings.get(element.name.text) === checker.getSymbolAtLocation(element.name)
+    ))
+  })
+}
+
+/** 判断 bootstrap 在指定位置前建立了可直接返回的 normal 模式门。 */
+function hasNormalModeGuardBefore(statements: readonly ts.Statement[], beforeIndex: number): boolean {
+  /** dataRootMode 必须由固定 resolver 调用直接声明。 */
+  const modeDeclarationIndex = statements.findIndex((statement, index) => {
+    if (index >= beforeIndex || !ts.isVariableStatement(statement)) return false
+    return statement.declarationList.declarations.some((declaration) => (
+      ts.isIdentifier(declaration.name)
+      && declaration.name.text === 'dataRootMode'
+      && declaration.initializer !== undefined
+      && ts.isCallExpression(declaration.initializer)
+      && ts.isIdentifier(declaration.initializer.expression)
+      && declaration.initializer.expression.text === 'resolveDataRootStartupMode'
+    ))
+  })
+  if (modeDeclarationIndex < 0) return false
+  return statements.some((statement, index) => {
+    if (index <= modeDeclarationIndex || index >= beforeIndex || !ts.isIfStatement(statement)) return false
+    /** 只接受 dataRootMode !== 'normal' 的精确 fail-closed 判别。 */
+    const condition = statement.expression
+    if (
+      !ts.isBinaryExpression(condition)
+      || condition.operatorToken.kind !== ts.SyntaxKind.ExclamationEqualsEqualsToken
+      || !ts.isIdentifier(condition.left)
+      || condition.left.text !== 'dataRootMode'
+      || !ts.isStringLiteralLike(condition.right)
+      || condition.right.text !== 'normal'
+    ) return false
+    /** 非 normal 分支必须直接包含 return，阻断后续业务组合。 */
+    return ts.isBlock(statement.thenStatement)
+      && statement.thenStatement.statements.some(ts.isReturnStatement)
+  })
+}
+
+/** 统计 normal gate 后在 bootstrap 直接路径完成的延迟 LAN 注册。 */
+function countGatedBootstrapLanBridgeRegistrations(
+  bootstrap: ts.FunctionDeclaration | undefined,
+  registerBridgeBindings: ReadonlyMap<string, ts.Symbol>,
+  deferredFactoryBindings: ReadonlyMap<string, ts.Symbol>,
+  eventBusBindings: ReadonlyMap<string, ts.Symbol>,
+  checker: ts.TypeChecker,
+): number {
+  if (!bootstrap?.body || deferredFactoryBindings.size === 0) return 0
+  /** bootstrap 直接语句用于锁定 gate、import、registration 的可达顺序。 */
+  const statements = bootstrap.body.statements
+  let count = 0
+  for (const [index, statement] of statements.entries()) {
+    if (
+      !ts.isExpressionStatement(statement)
+      || !isLanBridgeRegistrationCall(
+        statement.expression,
+        registerBridgeBindings,
+        deferredFactoryBindings,
+        eventBusBindings,
+        checker,
+        true,
+      )
+    ) continue
+    /** 动态 import 必须紧邻注册且位于明确 normal gate 之后。 */
+    if (
+      statementDeclaresDeferredBinding(statements[index - 1], deferredFactoryBindings, checker)
+      && hasNormalModeGuardBefore(statements, index - 1)
+    ) count += 1
+  }
+  return count
 }
 
 /** 判断表达式是否直接调用 startLanBridge，并传入 factory 注入参数。 */
@@ -779,6 +898,7 @@ const APPROVED_UPSTREAM_WORKFLOW_SCHEMA = workflowRecord({
         }),
         simpleRunStepSchema('Install dependencies from merged tree'),
         simpleRunStepSchema('Check fork compatibility seams'),
+        simpleRunStepSchema('Check data root contract'),
         simpleRunStepSchema('Run LAN and mobile targeted tests'),
         simpleRunStepSchema('Build mobile app'),
         simpleRunStepSchema('Typecheck all workspaces'),
@@ -919,6 +1039,8 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
   const mainContext = createTypeScriptBindingContext(PATHS.main, main)
   const mainSource = mainContext.sourceFile
   const bridgeSource = parseTypeScript(PATHS.bridge, bridge)
+  /** 顶层挂接且顺序可达的 bootstrap。 */
+  const bootstrap = findNamedFunction(mainSource, 'bootstrap')
   /** Bridge registry、LAN factory 与官方 EventBus 的真实 import bindings。 */
   const registerBridgeBindings = collectImportedLocalBindings(
     mainContext,
@@ -935,6 +1057,15 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     './lib/lan-bridge/lan-bridge',
     'createLanBridgeRegistration',
   )
+  /** 数据根 normal gate 后允许使用精确动态 import 延迟求值 LAN 模块。 */
+  const deferredFactoryBindings = collectDeferredImportedLocalBindings(
+    mainContext,
+    bootstrap,
+    './lib/lan-bridge/lan-bridge',
+    'createLanBridgeRegistration',
+  )
+  /** 静态与受控延迟 factory 都以 symbol identity 参与重复注册统计。 */
+  const allFactoryBindings = new Map([...factoryBindings, ...deferredFactoryBindings])
   const eventBusBindings = collectImportedLocalBindings(
     mainContext,
     './lib/agent-service',
@@ -944,7 +1075,7 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
   const registrationCount = countLanBridgeRegistrations(
     mainSource,
     registerBridgeBindings,
-    factoryBindings,
+    allFactoryBindings,
     eventBusBindings,
     mainContext.checker,
   )
@@ -956,8 +1087,14 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     eventBusBindings,
     mainContext.checker,
   )
-  /** 顶层挂接且顺序可达的 bootstrap。 */
-  const bootstrap = findNamedFunction(mainSource, 'bootstrap')
+  /** normal gate 后 bootstrap 直接路径上的延迟注册次数。 */
+  const gatedRegistrationCount = countGatedBootstrapLanBridgeRegistrations(
+    bootstrap,
+    registerBridgeBindings,
+    deferredFactoryBindings,
+    eventBusBindings,
+    mainContext.checker,
+  )
   const hasReachableStart = hasReachableBootstrapRegistration(mainSource)
     && bootstrapStartsAllBridges(bootstrap, startAllBridgesBindings, mainContext.checker)
   /** 导出的显式注入 factory。 */
@@ -972,8 +1109,8 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     && returnedObjectStartUsesInjectedBus(registrationFactory, injectedName),
   )
 
-  if (registrationCount !== 1 || topLevelRegistrationCount !== 1) {
-    details.push('主进程必须且只能在 Program 顶层注册一次 createLanBridgeRegistration(agentEventBus)')
+  if (registrationCount !== 1 || topLevelRegistrationCount + gatedRegistrationCount !== 1) {
+    details.push('主进程必须且只能在 Program 顶层或数据根 normal gate 后注册一次 createLanBridgeRegistration(agentEventBus)')
   }
   if (!hasReachableStart) details.push('主进程 bootstrap 可达顶层路径未启动统一 Bridge 生命周期')
   if (!registrationFactory) details.push('LAN Bridge 未导出 createLanBridgeRegistration')
@@ -983,7 +1120,7 @@ function checkBridgeComposition(reader: RepositoryReader): ForkCompatCheckResult
     'bridge-composition',
     'Bridge 生命周期组合点',
     [PATHS.main, PATHS.bridge],
-    '在主进程组合根唯一调用 registerBridge(createLanBridgeRegistration(agentEventBus))，LAN 模块只消费注入的 EventBus。',
+    '在主进程组合根顶层或数据根 normal gate 后唯一注册 LAN Bridge，LAN 模块只消费注入的 EventBus。',
     details,
   )
 }
@@ -1349,6 +1486,8 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
   const workflow = readRequired(reader, PATHS.workflow, details)
   /** merge 状态 helper 必须随兼容检查保留。 */
   readRequired(reader, PATHS.mergeHelper, details)
+  /** 数据根合同脚本必须随兼容检查保留。 */
+  readRequired(reader, PATHS.dataRootContract, details)
   /** 结构化 workflow YAML 根映射。 */
   const document = parseYamlRecord(workflow, 'upstream workflow', details)
   if (document) {
@@ -1430,10 +1569,12 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
     const requiredCommands: Array<[string, readonly string[]]> = [
       ['Install dependencies from merged tree', ['bun', 'install', '--frozen-lockfile']],
       ['Check fork compatibility seams', ['bun', 'run', '--filter=@proma/electron', 'check:fork-compat']],
+      ['Check data root contract', ['bun', 'run', '--filter=@proma/electron', 'check:data-root']],
       ['Run LAN and mobile targeted tests', [
         'bun',
         'test',
         'apps/electron/scripts/check-fork-compat.test.ts',
+        'apps/electron/scripts/check-data-root-contract.test.ts',
         'apps/electron/scripts/verify-upstream-merge.test.ts',
         'apps/electron/src/main/lib/config-paths.test.ts',
         'apps/electron/src/main/lib/lan-bridge',
@@ -1507,7 +1648,7 @@ function checkWorkflowDefinition(reader: RepositoryReader): ForkCompatCheckResul
   return createResult(
     'workflow-definition',
     '上游兼容 workflow 失败传播',
-    [PATHS.workflow, PATHS.mergeHelper],
+    [PATHS.workflow, PATHS.mergeHelper, PATHS.dataRootContract],
     '保留 manual+weekly 触发、最小权限、完整 checkout、固定验证命令顺序与 always cleanup；关键 run 不得用 echo 伪装。',
     details,
   )

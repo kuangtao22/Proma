@@ -92,10 +92,14 @@ jobs:
       - name: Check fork compatibility seams
         run: bun run --filter='@proma/electron' check:fork-compat
 
+      - name: Check data root contract
+        run: bun run --filter='@proma/electron' check:data-root
+
       - name: Run LAN and mobile targeted tests
         run: >-
           bun test
           apps/electron/scripts/check-fork-compat.test.ts
+          apps/electron/scripts/check-data-root-contract.test.ts
           apps/electron/scripts/verify-upstream-merge.test.ts
           apps/electron/src/main/lib/config-paths.test.ts
           apps/electron/src/main/lib/lan-bridge

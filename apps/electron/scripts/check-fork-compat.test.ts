@@ -87,8 +87,10 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Check fork compatibility seams
         run: bun run --filter='@proma/electron' check:fork-compat
+      - name: Check data root contract
+        run: bun run --filter='@proma/electron' check:data-root
       - name: Run LAN and mobile targeted tests
-        run: bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/config-paths.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib
+        run: bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/check-data-root-contract.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/config-paths.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib
       - name: Build mobile app
         run: bun run --filter='@proma/mobile' build
       - name: Typecheck all workspaces
@@ -291,6 +293,7 @@ extraResources:
       - "**/*"
   `,
   '.github/workflows/upstream-compat.yml': validWorkflow,
+  'apps/electron/scripts/check-data-root-contract.ts': 'export function findHardcodedDataRoots() { return [] }',
   'apps/electron/scripts/verify-upstream-merge.ts': 'export function verifyUpstreamMerge() {}',
 }
 
@@ -306,6 +309,27 @@ function getCheck(files: Record<string, string>, id: string) {
   return result!
 }
 
+/** 创建经过数据根 normal gate 后延迟加载 LAN factory 的主进程 fixture。 */
+function createGatedBridgeMain(): string {
+  return `
+    import { registerBridge, startAllBridges } from './lib/bridge-registry'
+    import { agentEventBus } from './lib/agent-service'
+    app.whenReady().then(bootstrap).catch(handleBootstrapFailure)
+    async function bootstrap(): Promise<void> {
+      const dataRootMode = resolveDataRootStartupMode(locatorResult)
+      if (dataRootMode !== 'normal') {
+        showDataRootManagementWindow(dataRootMode)
+        return
+      }
+      const activeRoot = prepareNormalDataRoot(locator, locatorResult)
+      await dataRootInstanceLease.acquire(activeRoot)
+      const { createLanBridgeRegistration } = await import('./lib/lan-bridge/lan-bridge')
+      registerBridge(createLanBridgeRegistration(agentEventBus))
+      await safeAwait('startAllBridges', () => startAllBridges())
+    }
+  `
+}
+
 describe('fork 上游兼容检查器', () => {
   test('Given 全部稳定接缝存在 When 执行检查 Then 所有检查成功', () => {
     /** 完整 fixture 的检查结果。 */
@@ -314,6 +338,54 @@ describe('fork 上游兼容检查器', () => {
     expect(results.map((item) => item.id)).toEqual(FORK_COMPAT_CHECK_IDS)
     expect(results.every((item) => item.passed)).toBe(true)
   })
+
+  test('Given LAN factory 在数据根 normal gate 后延迟加载 When 检查 Bridge 组合点 Then 通过', () => {
+    /** 数据根隔离要求非 normal 模式不能提前求值 LAN 业务模块。 */
+    const files = {
+      ...validFiles,
+      'apps/electron/src/main/index.ts': createGatedBridgeMain(),
+    }
+
+    expect(getCheck(files, 'bridge-composition').passed).toBe(true)
+  })
+
+  /** 延迟加载只允许精确模块、直接 bootstrap 路径和 normal gate 后顺序。 */
+  const invalidGatedBridgeCases = [
+    {
+      name: '动态 import 指向相似模块',
+      mutate: (source: string) => source.replace(
+        "import('./lib/lan-bridge/lan-bridge')",
+        "import('./lib/lan-bridge/lan-bridge-copy')",
+      ),
+    },
+    {
+      name: '动态注册移动到 normal gate 前',
+      mutate: (source: string) => source
+        .replace("      const { createLanBridgeRegistration } = await import('./lib/lan-bridge/lan-bridge')\n      registerBridge(createLanBridgeRegistration(agentEventBus))\n", '')
+        .replace(
+          '      const dataRootMode = resolveDataRootStartupMode(locatorResult)',
+          "      const { createLanBridgeRegistration } = await import('./lib/lan-bridge/lan-bridge')\n      registerBridge(createLanBridgeRegistration(agentEventBus))\n      const dataRootMode = resolveDataRootStartupMode(locatorResult)",
+        ),
+    },
+    {
+      name: '动态注册藏在嵌套函数',
+      mutate: (source: string) => source.replace(
+        "      const { createLanBridgeRegistration } = await import('./lib/lan-bridge/lan-bridge')\n      registerBridge(createLanBridgeRegistration(agentEventBus))",
+        "      async function registerLater(): Promise<void> {\n        const { createLanBridgeRegistration } = await import('./lib/lan-bridge/lan-bridge')\n        registerBridge(createLanBridgeRegistration(agentEventBus))\n      }",
+      ),
+    },
+  ]
+
+  for (const bridgeCase of invalidGatedBridgeCases) {
+    test(`Given ${bridgeCase.name} When 检查数据根隔离后的 Bridge 组合点 Then 明确失败`, () => {
+      /** 每次只破坏延迟组合合同的一条边界。 */
+      const main = bridgeCase.mutate(createGatedBridgeMain())
+      const files = { ...validFiles, 'apps/electron/src/main/index.ts': main }
+
+      expect(main).not.toBe(createGatedBridgeMain())
+      expect(getCheck(files, 'bridge-composition').passed).toBe(false)
+    })
+  }
 
   /** 每个用例移除一种稳定接缝，锁定失败项及可执行修复提示。 */
   const missingSeamCases: Array<{
@@ -1742,6 +1814,7 @@ broken: [
   /** 三个核心验证 run step 均不得通过 if 或 continue-on-error 绕过失败传播。 */
   const guardedRunStepNames = [
     'Check fork compatibility seams',
+    'Check data root contract',
     'Run LAN and mobile targeted tests',
     'Typecheck all workspaces',
   ]
@@ -1806,6 +1879,11 @@ broken: [
 
   const invalidTargetedTestCases = [
     {
+      name: '缺少数据根合同 test',
+      target: ' apps/electron/scripts/check-data-root-contract.test.ts',
+      replacement: '',
+    },
+    {
       name: '缺少 helper test',
       target: ' apps/electron/scripts/verify-upstream-merge.test.ts',
       replacement: '',
@@ -1836,6 +1914,49 @@ broken: [
     test(`Given targeted tests ${targetedCase.name} When 检查 workflow Then 明确失败`, () => {
       /** 破坏自测文件参数或用 echo 文本伪装。 */
       const workflow = validWorkflow.replace(targetedCase.target, targetedCase.replacement)
+      const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
+
+      expect(workflow).not.toBe(validWorkflow)
+      expect(getCheck(files, 'workflow-definition').passed).toBe(false)
+    })
+  }
+
+  /** 数据根合同必须在 frozen install 后以独立真实命令执行。 */
+  const invalidDataRootContractCases = [
+    {
+      name: '缺少 step',
+      mutate: (source: string) => source.replace(
+        "      - name: Check data root contract\n        run: bun run --filter='@proma/electron' check:data-root\n",
+        '',
+      ),
+    },
+    {
+      name: 'echo 伪装命令',
+      mutate: (source: string) => source.replace(
+        "run: bun run --filter='@proma/electron' check:data-root",
+        "run: echo \"bun run --filter='@proma/electron' check:data-root\"",
+      ),
+    },
+    {
+      name: 'if 包裹命令',
+      mutate: (source: string) => source.replace(
+        "run: bun run --filter='@proma/electron' check:data-root",
+        "run: if true; then bun run --filter='@proma/electron' check:data-root; fi",
+      ),
+    },
+    {
+      name: '错误 workspace 过滤器',
+      mutate: (source: string) => source.replace(
+        "--filter='@proma/electron' check:data-root",
+        "--filter='@proma/shared' check:data-root",
+      ),
+    },
+  ]
+
+  for (const contractCase of invalidDataRootContractCases) {
+    test(`Given 数据根合同 ${contractCase.name} When 检查 workflow Then 明确失败`, () => {
+      /** 只破坏数据根合同 step，保留其它上游验证。 */
+      const workflow = contractCase.mutate(validWorkflow)
       const files = { ...validFiles, '.github/workflows/upstream-compat.yml': workflow }
 
       expect(workflow).not.toBe(validWorkflow)
@@ -1958,6 +2079,16 @@ broken: [
 
     expect(result.passed).toBe(false)
     expect(result.details.join('\n')).toContain('apps/electron/scripts/verify-upstream-merge.ts')
+  })
+
+  test('Given 数据根合同脚本缺失 When 检查 workflow Then 明确报告路径', () => {
+    /** workflow 文本仍保留命令时，checker 也必须验证实际脚本文件存在。 */
+    const files = { ...validFiles }
+    delete files['apps/electron/scripts/check-data-root-contract.ts']
+    const result = getCheck(files, 'workflow-definition')
+
+    expect(result.passed).toBe(false)
+    expect(result.details.join('\n')).toContain('apps/electron/scripts/check-data-root-contract.ts')
   })
 
   /** tag_ref 与 merge 必须沿已验证 LATEST_TAG 的固定 namespaced 数据流。 */
@@ -2089,8 +2220,8 @@ broken: [
     },
     {
       name: 'targeted tests',
-      target: 'run: bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/config-paths.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib',
-      replacement: 'run: echo "bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/config-paths.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib"',
+      target: 'run: bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/check-data-root-contract.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/config-paths.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib',
+      replacement: 'run: echo "bun test apps/electron/scripts/check-fork-compat.test.ts apps/electron/scripts/check-data-root-contract.test.ts apps/electron/scripts/verify-upstream-merge.test.ts apps/electron/src/main/lib/config-paths.test.ts apps/electron/src/main/lib/lan-bridge apps/electron/src/preload/lan-bridge-preload.test.ts apps/mobile/src/lib"',
     },
     {
       name: 'mobile build',
