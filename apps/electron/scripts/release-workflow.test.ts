@@ -110,7 +110,7 @@ test('Bone 应用版本与更新频道保持一致', () => {
     'utf8',
   )
 
-  expect(metadata.version).toBe('0.17.42-bone.5')
+  expect(metadata.version).toBe('0.17.42-bone.6')
   expect(config.detectUpdateChannel).toBe(false)
   expect(updaterSource).toContain('autoUpdater.allowPrerelease = true')
 })
