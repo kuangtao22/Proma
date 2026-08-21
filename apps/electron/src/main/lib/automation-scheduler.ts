@@ -35,6 +35,7 @@ import { createAgentSession, updateAgentSessionMeta, getAgentSessionMeta } from 
 import { getSessionContextUsageRatio } from './agent-session-usage'
 import { runAgentHeadless, isAgentSessionActive } from './agent-service'
 import { notifyAutomationRunFinished } from './automation-notification-service'
+import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 
 /** tick 周期：每 30s 检查一次到期任务（短轮询，抗休眠漂移） */
 const TICK_INTERVAL_MS = 30_000
@@ -95,12 +96,20 @@ function formatScheduleLabel(a: Automation): string {
 }
 
 let tickTimer: NodeJS.Timeout | undefined
-/** 正在执行中的 automation id 集合，防止同一任务重入 */
-const runningAutomations = new Set<string>()
+/** 正在执行的 Automation 与其启动时工作区归属，兼顾防重入和迁移预检。 */
+const runningAutomations = new Map<string, string | undefined>()
 
 /** 是否存在正在调度或执行的 Automation，供数据根迁移二次预检。 */
 export function hasRunningAutomations(): boolean {
   return runningAutomations.size > 0
+}
+
+/** 查询指定工作区是否存在真实运行中的 Automation。 */
+export function hasRunningAutomationForWorkspace(workspaceId: string): boolean {
+  for (const runningWorkspaceId of runningAutomations.values()) {
+    if (runningWorkspaceId === workspaceId) return true
+  }
+  return false
 }
 
 /** 向所有渲染窗口广播任务列表变更，触发前端刷新 */
@@ -131,7 +140,22 @@ export async function runAutomation(automation: Automation, manual = false): Pro
     return
   }
 
-  runningAutomations.add(automation.id)
+  /** 当前 Automation 工作区的迁移阻断原因。 */
+  const workspaceBlockReason = automation.workspaceId
+    ? getWorkspaceOperationBlockReason(automation.workspaceId)
+    : undefined
+  if (workspaceBlockReason) {
+    appendRun(automation.id, {
+      runAt: Date.now(),
+      sessionId: '',
+      status: 'skipped',
+      skipReason: workspaceBlockReason,
+    })
+    broadcastChanged()
+    return
+  }
+
+  runningAutomations.set(automation.id, automation.workspaceId)
   const runAt = Date.now()
 
   try {

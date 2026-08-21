@@ -312,6 +312,7 @@ import {
   getDefaultSkillSlugs,
   getWorkspaceCapabilities,
   getAgentWorkspace,
+  getAgentWorkspaceBySlug,
   getProjectFilesPath,
   deleteWorkspaceSkill,
   importSkillFromWorkspace,
@@ -344,6 +345,8 @@ import {
   removeWorktreeRepo,
   cleanupStaleWorkspaceAttachedPaths,
 } from './lib/agent-workspace-manager'
+import { getWorkspaceOperationBlockReason } from './lib/workspace-operation-lock'
+import { createWorkspaceOperationGuard } from './lib/workspace-operation-guard'
 import { movePathSafely } from './lib/file-move-service'
 import { subscribeWorkspaceMemoryChanges } from './lib/workspace-memory-change-watcher'
 import { confirmWorkspaceMemoryWindowClose, markWorkspaceMemoryWindowReady } from './lib/workspace-memory-window'
@@ -1027,6 +1030,15 @@ export function registerIpcHandlers(): void {
 
   /** normal 模式共享的实例 lease，用于迁移前排除 dev/prod 其他进程。 */
   const dataRootInstanceLease = getDefaultDataRootInstanceLeaseRegistry()
+  /** 写 IPC 统一按会话、slug 或 ID 解析工作区并检查迁移独占锁。 */
+  const workspaceOperationGuard = createWorkspaceOperationGuard({
+    getWorkspaceIdBySessionId: (sessionId) => {
+      const sessionMeta = getAgentSessionMeta(sessionId)
+      return sessionMeta ? sessionMeta.workspaceId ?? null : undefined
+    },
+    getWorkspaceIdBySlug: (slug) => getAgentWorkspaceBySlug(slug)?.id,
+    getWorkspaceOperationBlockReason,
+  })
   registerPathManagementIpcHandlers({
     mode: 'normal',
     ipc: ipcMain,
@@ -2473,6 +2485,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.RELINK_WORKSPACE_PROJECT_ROOT,
     async (_, id: string, projectRootPath: string): Promise<AgentWorkspace> => {
+      workspaceOperationGuard.assertWorkspaceWritable(id)
       const previousRoot = getAgentWorkspace(id)?.projectRootPath
       const updated = relinkAgentWorkspaceProjectRoot(id, projectRootPath)
       if (previousRoot && previousRoot !== updated.projectRootPath) {
@@ -2487,6 +2500,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.RESTORE_WORKSPACE_PROJECT_ROOT,
     async (_, id: string): Promise<AgentWorkspace> => {
+      workspaceOperationGuard.assertWorkspaceWritable(id)
       const updated = restoreAgentWorkspaceProjectRoot(id)
       if (updated.projectRootPath) watchAttachedDirectory(updated.projectRootPath)
       return updated
@@ -2497,6 +2511,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DELETE_WORKSPACE,
     async (_, id: string): Promise<void> => {
+      workspaceOperationGuard.assertWorkspaceWritable(id)
       const deletingWorkspace = getAgentWorkspace(id)
       if (!deletingWorkspace) {
         return deleteAgentWorkspace(id)
@@ -3292,6 +3307,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_DIRECTORY,
     async (_, input: AgentAttachDirectoryInput): Promise<string[]> => {
+      workspaceOperationGuard.assertSessionWritable(input.sessionId)
       const meta = getAgentSessionMeta(input.sessionId)
       if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
 
@@ -3310,6 +3326,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DETACH_DIRECTORY,
     async (_, input: AgentAttachDirectoryInput): Promise<string[]> => {
+      workspaceOperationGuard.assertSessionWritable(input.sessionId)
       const meta = getAgentSessionMeta(input.sessionId)
       if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
 
@@ -3325,6 +3342,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_FILE,
     async (_, input: AgentAttachFileInput): Promise<string[]> => {
+      workspaceOperationGuard.assertSessionWritable(input.sessionId)
       const meta = getAgentSessionMeta(input.sessionId)
       if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
 
@@ -3348,6 +3366,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DETACH_FILE,
     async (_, input: AgentAttachFileInput): Promise<string[]> => {
+      workspaceOperationGuard.assertSessionWritable(input.sessionId)
       const meta = getAgentSessionMeta(input.sessionId)
       if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
 
@@ -3363,6 +3382,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_WORKSPACE_DIRECTORY,
     async (_, input: WorkspaceAttachDirectoryInput): Promise<string[]> => {
+      workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)
       const updated = attachWorkspaceDirectory(input.workspaceSlug, input.directoryPath)
       watchAttachedDirectory(input.directoryPath)
       return updated
@@ -3373,6 +3393,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DETACH_WORKSPACE_DIRECTORY,
     async (_, input: WorkspaceAttachDirectoryInput): Promise<string[]> => {
+      workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)
       const updated = detachWorkspaceDirectory(input.workspaceSlug, input.directoryPath)
       releaseDirectoryWatcherIfUnreferenced(input.directoryPath)
       return updated
@@ -3383,6 +3404,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_WORKSPACE_FILE,
     async (_, input: WorkspaceAttachFileInput): Promise<string[]> => {
+      workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)
       const { realpathSync, statSync } = await import('node:fs')
       const { resolve } = await import('node:path')
       const safePath = realpathSync(resolve(input.filePath))
@@ -3399,6 +3421,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DETACH_WORKSPACE_FILE,
     async (_, input: WorkspaceAttachFileInput): Promise<string[]> => {
+      workspaceOperationGuard.assertWorkspaceSlugWritable(input.workspaceSlug)
       const updated = detachWorkspaceFile(input.workspaceSlug, input.filePath)
       releaseDirectoryWatcherIfUnreferenced(dirname(input.filePath))
       return updated

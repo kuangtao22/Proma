@@ -76,6 +76,15 @@ import { generateCodexTitle } from './adapters/pi-codex-title-generator'
 import { createFallbackTitle, sanitizeGeneratedTitle, TITLE_PROMPT } from './title-generation'
 import { claimWorkspaceMemoryRefreshOpportunity } from './agent-memory-refresh-service'
 import { browserController } from './browser-controller'
+import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
+import { createWorkspaceOperationGuard } from './workspace-operation-guard'
+
+/** Agent 入口使用会话元数据解析权威工作区，并共享进程级迁移锁。 */
+const workspaceOperationGuard = createWorkspaceOperationGuard({
+  getWorkspaceIdBySessionId: (sessionId) => getAgentSessionMeta(sessionId)?.workspaceId,
+  getWorkspaceIdBySlug: () => undefined,
+  getWorkspaceOperationBlockReason,
+})
 
 // ===== 类型定义 =====
 
@@ -662,11 +671,25 @@ export class AgentOrchestrator {
     let userMessagePersisted = false
     let initialUserMessageUuid: string | undefined
     let sessionMeta = getAgentSessionMeta(sessionId)
+    /** 当前请求同步占用的运行代际；0 表示尚未持有运行槽。 */
+    let runGeneration = 0
+
+    /** 仅释放当前请求实际持有的会话运行槽。 */
+    const releaseActiveRun = (): void => {
+      if (runGeneration === 0) return
+      const ownsActiveRun = this.activeSessions.get(sessionId) === runGeneration
+      if (ownsActiveRun) {
+        this.activeSessions.delete(sessionId)
+        this.sessionPermissionModes.delete(sessionId)
+        this.queuedMessageUuids.delete(sessionId)
+      }
+    }
 
     const completeBeforeRun = (options: {
       stoppedByUser?: boolean
       startedAt?: number
     } = {}): void => {
+      releaseActiveRun()
       const stoppedByUser = this.stoppedBeforeRunSessions.delete(sessionId)
       callbacks.onComplete([], {
         ...options,
@@ -688,7 +711,17 @@ export class AgentOrchestrator {
       userMessagePersisted = true
     }
 
-    // 0. 并发保护
+    // 0. 工作区迁移准入必须早于运行槽、重试错误删除、消息落盘与任何 await。
+    const admission = workspaceOperationGuard.admitAgentRun({
+      sessionWorkspaceId: sessionMeta?.workspaceId,
+      requestedWorkspaceId,
+      onError: callbacks.onError,
+      onComplete: completeBeforeRun,
+    })
+    if (!admission.admitted) return
+    const workspaceId = admission.workspaceId
+
+    // 0.1 并发保护
     const hasActiveRun = this.activeSessions.has(sessionId)
     const shouldPersistUserMessage = shouldPersistInitialUserMessage({ hasActiveRun, retryOfErrorUuid })
     if (hasActiveRun) {
@@ -700,6 +733,14 @@ export class AgentOrchestrator {
       callbacks.onComplete([], { startedAt: streamStartedAt })
       return
     }
+
+    // 0.2 在所有写副作用和首个 await 前同步抢占槽位，使迁移预检看到准确运行态。
+    if (this.stoppedBeforeRunSessions.has(sessionId)) {
+      completeBeforeRun({ stoppedByUser: true })
+      return
+    }
+    runGeneration = ++this.nextRunGeneration
+    this.activeSessions.set(sessionId, runGeneration)
 
     // 手动重试直接删除原错误，避免它在下一轮完成后仍被历史回放。
     // 删除失败不阻断重试（例如旧版本遗留的无 UUID 错误）。
@@ -766,7 +807,7 @@ export class AgentOrchestrator {
       })
       return
     }
-    const workspaceId = sessionWorkspaceId ?? requestedWorkspaceId
+    // workspaceId 已由迁移准入按同一权威规则解析。
 
     // 本地项目根由用户管理。根目录被删除、替换为文件或无法访问时，绝不能
     // 进入 SDK/Agent 初始化链路，以免后续文件工具通过 mkdir 间接重建该目录。
@@ -871,27 +912,8 @@ export class AgentOrchestrator {
       return
     }
 
-    // 2.1 立即抢占会话槽位（在所有同步检查通过后、第一个 await 之前）
-    // 防止 buildSdkEnv 等 await 期间并发调用绕过上方的检查，导致多条重复消息写入 JSONL
-    // finally 块会通过 generation 匹配来安全清理，不影响正常流程
-    if (this.stoppedBeforeRunSessions.has(sessionId)) {
-      completeBeforeRun({ stoppedByUser: true })
-      return
-    }
-    const runGeneration = ++this.nextRunGeneration
-    this.activeSessions.set(sessionId, runGeneration)
+    // 2.1 所有同步预检通过后，才通知外部本轮已进入可见运行态。
     callbacks.onRunStarted?.({ startedAt: streamStartedAt })
-
-    const releaseActiveRun = (): void => {
-      // 在发送 STREAM_COMPLETE 前释放 active slot，避免渲染进程已进入空闲态、
-      // 主进程仍在 finally 前短暂拒绝下一条消息。
-      const ownsActiveRun = this.activeSessions.get(sessionId) === runGeneration
-      if (ownsActiveRun) {
-        this.activeSessions.delete(sessionId)
-        this.sessionPermissionModes.delete(sessionId)
-        this.queuedMessageUuids.delete(sessionId)
-      }
-    }
     const completeRun = (
       messages?: AgentMessage[],
       opts?: { stoppedByUser?: boolean; startedAt?: number; resultSubtype?: string; resultErrors?: string[] },
