@@ -121,6 +121,19 @@ export function broadcastChanged(): void {
   }
 }
 
+/** 执行单个 Automation 收尾副作用，避免外部 I/O 异常阻断运行槽释放。 */
+function runFinishEffect(
+  automationName: string,
+  effectName: string,
+  effect: () => void,
+): void {
+  try {
+    effect()
+  } catch (error) {
+    console.error(`[定时任务] ${effectName}失败: ${automationName}`, error)
+  }
+}
+
 /**
  * 执行一次定时任务：新建子会话 + headless 运行
  *
@@ -214,23 +227,34 @@ export async function runAutomation(automation: Automation, manual = false): Pro
           durationMs: Date.now() - runAt,
           error,
         }
-        appendRun(automation.id, run)
-        broadcastChanged()
-        void notifyAutomationRunFinished({ automation, run }).catch((err) => {
-          console.error(`[定时任务] 发送完成通知失败: ${automation.name}`, err)
-        })
-        // 失败退避：连续失败达上限自动暂停
-        const latest = getAutomation(automation.id)
-        if (
-          latest &&
-          latest.active &&
-          (latest.consecutiveFailures ?? 0) >= AUTOMATION_MAX_CONSECUTIVE_FAILURES
-        ) {
-          updateAutomation({ id: automation.id, active: false })
-          console.warn(`[定时任务] ${automation.name} 连续失败 ${latest.consecutiveFailures} 次，已自动暂停`)
-          broadcastChanged()
+        try {
+          runFinishEffect(automation.name, '写入运行历史', () => appendRun(automation.id, run))
+          runFinishEffect(automation.name, '广播运行状态', broadcastChanged)
+          runFinishEffect(automation.name, '启动完成通知', () => {
+            void notifyAutomationRunFinished({ automation, run }).catch((notifyError) => {
+              console.error(`[定时任务] 发送完成通知失败: ${automation.name}`, notifyError)
+            })
+          })
+
+          /** 持久化完成后重新读取的失败退避状态。 */
+          let latest: Automation | undefined
+          runFinishEffect(automation.name, '读取失败退避状态', () => {
+            latest = getAutomation(automation.id)
+          })
+          if (
+            latest &&
+            latest.active &&
+            (latest.consecutiveFailures ?? 0) >= AUTOMATION_MAX_CONSECUTIVE_FAILURES
+          ) {
+            runFinishEffect(automation.name, '自动暂停失败任务', () => {
+              updateAutomation({ id: automation.id, active: false })
+              console.warn(`[定时任务] ${automation.name} 连续失败 ${latest?.consecutiveFailures} 次，已自动暂停`)
+            })
+            runFinishEffect(automation.name, '广播自动暂停状态', broadcastChanged)
+          }
+        } finally {
+          resolveRun()
         }
-        resolveRun()
       }
 
       // 超时保护：防止 runAgentHeadless 永远不回调导致 automation 永久卡死

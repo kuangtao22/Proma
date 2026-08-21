@@ -298,4 +298,19 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(sendBody).toContain('isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration),')
     expect(methodBody.match(/if \(!isCurrent\(\)\) return/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
   })
+
+  test('Given 标题请求与 iterator cleanup 仍未完成 When 检查生产接入 Then generation 引用与 cleanup await 覆盖全部退出分支', () => {
+    /** 读取真实编排源码，约束后台标题与 adapter cleanup 都属于 generation 生命周期。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** sendMessage 函数体。 */
+    const sendStart = source.indexOf('  async sendMessage(')
+    const sendEnd = source.indexOf('\n  /**\n   * 中止指定会话', sendStart)
+    const sendBody = source.slice(sendStart, sendEnd)
+
+    expect(source).toContain('private retainedGenerationTasks = new Map<string, Set<number>>()')
+    expect(sendBody).toContain('retainGenerationTask(this.retainedGenerationTasks, sessionId, runGeneration)')
+    expect(sendBody).toContain('.finally(() => {')
+    expect(sendBody).toContain('releaseGenerationTask(')
+    expect(sendBody.match(/await closeAgentQueryIterator\(/g)?.length ?? 0).toBe(2)
+  })
 })

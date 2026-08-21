@@ -160,6 +160,26 @@ export function hasInFlightGeneration(
   return (generationsBySession.get(sessionId)?.size ?? 0) > 0
 }
 
+/** 为会话保留指定 generation 的后台任务所有权。 */
+export function retainGenerationTask(
+  generationsBySession: Map<string, Set<number>>,
+  sessionId: string,
+  generation: number,
+): void {
+  /** 当前会话仍可能写入 generation 结果的后台任务。 */
+  const generations = generationsBySession.get(sessionId) ?? new Set<number>()
+  generations.add(generation)
+  generationsBySession.set(sessionId, generations)
+}
+
+/** 判断会话是否仍有 generation-owned 后台任务。 */
+export function hasRetainedGenerationTask(
+  generationsBySession: Map<string, Set<number>>,
+  sessionId: string,
+): boolean {
+  return (generationsBySession.get(sessionId)?.size ?? 0) > 0
+}
+
 /**
  * 释放已经完全退出的运行代际。
  * 仅当会话最后一个 in-flight 代际退出时清理 latest，避免旧代际重新获得写权限。
@@ -169,13 +189,54 @@ export function releaseInFlightGeneration(
   latestGenerations: Map<string, number>,
   sessionId: string,
   generation: number,
+  retainedTasksBySession?: Map<string, Set<number>>,
 ): void {
   /** 当前会话尚未完全退出的运行代际。 */
   const generations = generationsBySession.get(sessionId)
   if (!generations?.delete(generation)) return
   if (generations.size > 0) return
   generationsBySession.delete(sessionId)
+  if (retainedTasksBySession && hasRetainedGenerationTask(retainedTasksBySession, sessionId)) return
   latestGenerations.delete(sessionId)
+}
+
+/**
+ * 释放 generation-owned 后台任务。
+ * 仅当前台运行与全部后台任务都结束后清理 latest，保证正常迟到结果仍可提交。
+ */
+export function releaseGenerationTask(
+  retainedTasksBySession: Map<string, Set<number>>,
+  inFlightGenerationsBySession: Map<string, Set<number>>,
+  latestGenerations: Map<string, number>,
+  sessionId: string,
+  generation: number,
+): void {
+  /** 当前会话仍持有 generation 所有权的后台任务。 */
+  const retainedGenerations = retainedTasksBySession.get(sessionId)
+  if (!retainedGenerations?.delete(generation)) return
+  if (retainedGenerations.size > 0) return
+  retainedTasksBySession.delete(sessionId)
+  if (hasInFlightGeneration(inFlightGenerationsBySession, sessionId)) return
+  latestGenerations.delete(sessionId)
+}
+
+/**
+ * 等待 Agent iterator 完成底层 cleanup，并消费 cleanup 自身的拒绝。
+ * 调用方 await 后才可释放 in-flight 生命周期。
+ */
+export async function closeAgentQueryIterator<T>(
+  iterator: Pick<AsyncIterator<T>, 'return'>,
+  onCleanupError?: (error: unknown) => void,
+): Promise<void> {
+  try {
+    await iterator.return?.(undefined as never)
+  } catch (error) {
+    try {
+      onCleanupError?.(error)
+    } catch {
+      // 日志边界异常不能替代或重新抛出已消费的 iterator cleanup 异常。
+    }
+  }
 }
 
 /** 判断指定运行代际是否仍是会话最新启动的代际。 */

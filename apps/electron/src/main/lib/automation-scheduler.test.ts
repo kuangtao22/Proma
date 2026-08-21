@@ -8,16 +8,47 @@ const appendedRuns: Array<{ id: string; run: AutomationRun }> = []
 let createdSessionCount = 0
 /** 保存 headless Agent 回调，允许测试观察运行中状态。 */
 let activeHeadlessCallbacks: { onComplete: () => void } | undefined
+/** 注入运行历史持久化异常。 */
+let appendRunError: Error | undefined
+/** 记录运行历史持久化尝试次数。 */
+let appendRunAttempts = 0
+/** 注入 renderer 广播异常。 */
+let broadcastSendError: Error | undefined
+/** 记录 renderer 广播尝试次数。 */
+let broadcastSendAttempts = 0
+/** 注入失败退避更新异常。 */
+let updateAutomationError: Error | undefined
+/** 记录失败退避更新尝试次数。 */
+let updateAutomationAttempts = 0
+/** 返回给失败退避逻辑的最新 Automation。 */
+let latestAutomation: Automation | undefined
 
 mock.module('electron', () => ({
-  BrowserWindow: { getAllWindows: () => [] },
+  BrowserWindow: {
+    getAllWindows: () => [{
+      isDestroyed: () => false,
+      webContents: {
+        send: () => {
+          broadcastSendAttempts += 1
+          if (broadcastSendError) throw broadcastSendError
+        },
+      },
+    }],
+  },
 }))
 
 mock.module('./automation-manager', () => ({
   listAutomations: () => [],
-  getAutomation: () => undefined,
-  appendRun: (id: string, run: AutomationRun) => appendedRuns.push({ id, run }),
-  updateAutomation: () => undefined,
+  getAutomation: () => latestAutomation,
+  appendRun: (id: string, run: AutomationRun) => {
+    appendRunAttempts += 1
+    if (appendRunError) throw appendRunError
+    appendedRuns.push({ id, run })
+  },
+  updateAutomation: () => {
+    updateAutomationAttempts += 1
+    if (updateAutomationError) throw updateAutomationError
+  },
   setNextRunAt: () => undefined,
   setLastSessionId: () => undefined,
   computeNextRunAt: () => Date.now() + 60_000,
@@ -56,6 +87,13 @@ beforeEach(() => {
   appendedRuns.length = 0
   createdSessionCount = 0
   activeHeadlessCallbacks = undefined
+  appendRunError = undefined
+  appendRunAttempts = 0
+  broadcastSendError = undefined
+  broadcastSendAttempts = 0
+  updateAutomationError = undefined
+  updateAutomationAttempts = 0
+  latestAutomation = undefined
 })
 
 /** 创建指定工作区的最小 Automation。 */
@@ -119,5 +157,58 @@ describe('Automation 工作区迁移准入', () => {
     } finally {
       releaseOther()
     }
+  })
+
+  test('Given appendRun 抛错 When headless 完成 Then runAutomation 仍 settle 并释放工作区运行归属', async () => {
+    /** 当前被测 Automation。 */
+    const automation = createAutomation('automation-append-error', 'workspace-append-error')
+    appendRunError = new Error('append failed')
+    const running = scheduler.runAutomation(automation)
+    await Promise.resolve()
+
+    activeHeadlessCallbacks?.onComplete()
+    activeHeadlessCallbacks?.onComplete()
+    const result = await Promise.race([
+      running.then(() => 'settled' as const),
+      Bun.sleep(100).then(() => 'timeout' as const),
+    ])
+
+    expect(result).toBe('settled')
+    expect(appendRunAttempts).toBe(1)
+    expect(broadcastSendAttempts).toBe(1)
+    expect(scheduler.hasRunningAutomationForWorkspace('workspace-append-error')).toBe(false)
+  })
+
+  test('Given 广播抛错 When headless 完成 Then 后续暂停更新仍执行且运行归属释放', async () => {
+    /** 当前被测 Automation。 */
+    const automation = createAutomation('automation-broadcast-error', 'workspace-broadcast-error')
+    latestAutomation = { ...automation, consecutiveFailures: 5 }
+    broadcastSendError = new Error('broadcast failed')
+    const running = scheduler.runAutomation(automation)
+    await Promise.resolve()
+
+    activeHeadlessCallbacks?.onComplete()
+    await running
+
+    expect(appendedRuns).toHaveLength(1)
+    expect(updateAutomationAttempts).toBe(1)
+    expect(scheduler.hasRunningAutomationForWorkspace('workspace-broadcast-error')).toBe(false)
+  })
+
+  test('Given 自动暂停更新抛错 When headless 完成 Then runAutomation 仍 settle 且 finish 只尝试一次', async () => {
+    /** 当前被测 Automation。 */
+    const automation = createAutomation('automation-update-error', 'workspace-update-error')
+    latestAutomation = { ...automation, consecutiveFailures: 5 }
+    updateAutomationError = new Error('update failed')
+    const running = scheduler.runAutomation(automation)
+    await Promise.resolve()
+
+    activeHeadlessCallbacks?.onComplete()
+    activeHeadlessCallbacks?.onComplete()
+    await running
+
+    expect(appendedRuns).toHaveLength(1)
+    expect(updateAutomationAttempts).toBe(1)
+    expect(scheduler.hasRunningAutomationForWorkspace('workspace-update-error')).toBe(false)
   })
 })

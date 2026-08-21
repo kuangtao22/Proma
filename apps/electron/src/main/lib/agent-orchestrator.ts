@@ -79,6 +79,7 @@ import { browserController } from './browser-controller'
 import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 import {
+  closeAgentQueryIterator,
   consumeStoppedGeneration,
   createAgentRunTerminalNotifier,
   hasInFlightGeneration,
@@ -86,7 +87,9 @@ import {
   isLatestRunGeneration,
   markInFlightGeneration,
   markStoppedGeneration,
+  releaseGenerationTask,
   releaseInFlightGeneration,
+  retainGenerationTask,
   runAgentLifecycle,
 } from './agent-run-lifecycle'
 
@@ -271,6 +274,8 @@ export class AgentOrchestrator {
   private stoppedBySessions = new Map<string, Set<number>>()
   /** 尚未从 adapter 与生命周期 finally 完全退出的运行代际。 */
   private inFlightRunGenerations = new Map<string, Set<number>>()
+  /** 标题等后台任务仍持有写权限的运行代际。 */
+  private retainedGenerationTasks = new Map<string, Set<number>>()
   /** 每个会话最新启动的运行代际；最后一个 in-flight 退出前保留，用于拒绝迟到旧 run 写状态。 */
   private latestRunGenerations = new Map<string, number>()
   /** 队列启动投影已显示、但运行槽尚未占用时的停止请求。 */
@@ -731,6 +736,7 @@ export class AgentOrchestrator {
         this.latestRunGenerations,
         sessionId,
         runGeneration,
+        this.retainedGenerationTasks,
       )
     }
 
@@ -1543,6 +1549,7 @@ export class AgentOrchestrator {
       const startAutoTitleGeneration = (): void => {
         if (titleGenerationStarted) return
         titleGenerationStarted = true
+        retainGenerationTask(this.retainedGenerationTasks, sessionId, runGeneration)
 
         // 标题请求与前台 Agent run 使用独立的 Codex Responses 请求，可并发执行。
         // 自动标题只会写入仍为默认名称的会话，因此不会覆盖用户的手动重命名。
@@ -1555,6 +1562,15 @@ export class AgentOrchestrator {
           () => isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration),
         )
           .catch((err) => console.error('[Agent 编排] 标题生成未捕获异常:', err))
+          .finally(() => {
+            releaseGenerationTask(
+              this.retainedGenerationTasks,
+              this.inFlightRunGenerations,
+              this.latestRunGenerations,
+              sessionId,
+              runGeneration,
+            )
+          })
       }
       const handleSessionId = (sdkSessionId: string, piSessionFile?: string): void => {
         if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) return
@@ -1742,7 +1758,9 @@ export class AgentOrchestrator {
               console.warn(`[Agent 编排] drain timeout: SDK iterator 在 result 后 ${RESULT_DRAIN_TIMEOUT_MS}ms 内未关闭，强制退出`)
               pendingNext?.catch(() => {})
               pendingNext = null
-              queryIterator.return?.(undefined as never).catch(() => {})
+              await closeAgentQueryIterator(queryIterator, (error) => {
+                console.error('[Agent 编排] drain timeout 后关闭 SDK iterator 失败:', error)
+              })
               break
             }
 
@@ -1751,7 +1769,9 @@ export class AgentOrchestrator {
 
             if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) {
               pendingNext = null
-              queryIterator.return?.(undefined as never).catch(() => {})
+              await closeAgentQueryIterator(queryIterator, (error) => {
+                console.error('[Agent 编排] stale generation 关闭 SDK iterator 失败:', error)
+              })
               break
             }
 
@@ -2388,6 +2408,7 @@ export class AgentOrchestrator {
     this.sessionPermissionModes.clear()
     this.stoppedBySessions.clear()
     this.inFlightRunGenerations.clear()
+    this.retainedGenerationTasks.clear()
     this.latestRunGenerations.clear()
     this.stoppedBeforeRunSessions.clear()
     this.queuedMessageUuids.clear()

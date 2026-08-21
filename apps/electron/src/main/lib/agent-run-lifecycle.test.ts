@@ -1,13 +1,17 @@
 import { describe, expect, test } from 'bun:test'
 import {
   consumeStoppedGeneration,
+  closeAgentQueryIterator,
   createAgentRunTerminalNotifier,
   hasInFlightGeneration,
+  hasRetainedGenerationTask,
   hasStoppedGeneration,
   isLatestRunGeneration,
   markInFlightGeneration,
+  retainGenerationTask,
   markStoppedGeneration,
   releaseInFlightGeneration,
+  releaseGenerationTask,
   runAgentServiceTerminalEffects,
   runAgentLifecycle,
 } from './agent-run-lifecycle'
@@ -29,6 +33,56 @@ function createDeferred(): { promise: Promise<void>; resolve: () => void; reject
 }
 
 describe('Agent 运行生命周期', () => {
+  test.each(['stale generation', 'drain timeout'])('Given %s 触发 iterator cleanup When return 延迟完成 Then cleanup settle 前保持 in-flight', async () => {
+    /** 模拟仍由 adapter cleanup 持有的运行代际。 */
+    const inFlightGenerations = new Map<string, Set<number>>()
+    /** 模拟当前会话最新运行代际。 */
+    const latestGenerations = new Map<string, number>([['session-1', 1]])
+    /** 模拟最多需要数秒才结束底层进程的 iterator.return。 */
+    const iteratorReturn = createDeferred()
+    /** 记录生命周期是否已经释放迁移准入。 */
+    let released = false
+    markInFlightGeneration(inFlightGenerations, 'session-1', 1)
+
+    const running = runAgentLifecycle({
+      isCurrent: () => true,
+      isStopped: () => false,
+      release: () => {
+        released = true
+        releaseInFlightGeneration(inFlightGenerations, latestGenerations, 'session-1', 1)
+      },
+      onStopped: () => undefined,
+    }, async () => {
+      await closeAgentQueryIterator({
+        return: async () => {
+          await iteratorReturn.promise
+          return { done: true, value: undefined }
+        },
+      })
+    })
+
+    await Promise.resolve()
+    expect(released).toBe(false)
+    expect(hasInFlightGeneration(inFlightGenerations, 'session-1')).toBe(true)
+
+    iteratorReturn.resolve()
+    await running
+    expect(released).toBe(true)
+    expect(hasInFlightGeneration(inFlightGenerations, 'session-1')).toBe(false)
+  })
+
+  test('Given iterator.return 拒绝 When cleanup 执行 Then 拒绝被消费且生命周期仍正常释放', async () => {
+    /** 模拟 iterator cleanup 异常。 */
+    const cleanupError = new Error('iterator cleanup failed')
+    /** 记录被可靠消费的 cleanup 异常。 */
+    const cleanupErrors: unknown[] = []
+
+    await expect(closeAgentQueryIterator({
+      return: async () => { throw cleanupError },
+    }, (error) => cleanupErrors.push(error))).resolves.toBeUndefined()
+    expect(cleanupErrors).toEqual([cleanupError])
+  })
+
   test('Given OAuth 未决且当前 generation 被停止 When OAuth 返回 Then 不启动 adapter 且不删除后来 generation', async () => {
     /** 模拟 activeSessions 中当前会话的运行代际。 */
     let activeGeneration: number | undefined = 1
@@ -271,6 +325,45 @@ describe('Agent 运行生命周期', () => {
     releaseInFlightGeneration(inFlightGenerations, latestGenerations, 'session-1', 2)
     expect(hasInFlightGeneration(inFlightGenerations, 'session-1')).toBe(false)
     expect(latestGenerations.has('session-1')).toBe(false)
+  })
+
+  test('Given generation1 前台运行已完成但标题仍未返回 When 检查 latest Then 标题任务结束前仍保留写权限', () => {
+    /** 当前仍在执行前台流程的代际。 */
+    const inFlightGenerations = new Map<string, Set<number>>()
+    /** 当前仍持有 generation 所有权的后台任务。 */
+    const retainedTasks = new Map<string, Set<number>>()
+    /** 会话最新启动代际。 */
+    const latestGenerations = new Map<string, number>([['session-1', 1]])
+    markInFlightGeneration(inFlightGenerations, 'session-1', 1)
+    retainGenerationTask(retainedTasks, 'session-1', 1)
+
+    releaseInFlightGeneration(inFlightGenerations, latestGenerations, 'session-1', 1, retainedTasks)
+
+    expect(hasInFlightGeneration(inFlightGenerations, 'session-1')).toBe(false)
+    expect(hasRetainedGenerationTask(retainedTasks, 'session-1')).toBe(true)
+    expect(isLatestRunGeneration(latestGenerations, 'session-1', 1)).toBe(true)
+
+    releaseGenerationTask(retainedTasks, inFlightGenerations, latestGenerations, 'session-1', 1)
+    expect(latestGenerations.has('session-1')).toBe(false)
+  })
+
+  test('Given generation2 已启动 When generation1 标题迟到 Then 旧标题无写权限且释放不会清理新代际', () => {
+    /** 当前仍在执行前台流程的代际。 */
+    const inFlightGenerations = new Map<string, Set<number>>()
+    /** 当前仍持有 generation 所有权的后台任务。 */
+    const retainedTasks = new Map<string, Set<number>>()
+    /** 会话最新启动代际。 */
+    const latestGenerations = new Map<string, number>([['session-1', 1]])
+    markInFlightGeneration(inFlightGenerations, 'session-1', 1)
+    retainGenerationTask(retainedTasks, 'session-1', 1)
+    releaseInFlightGeneration(inFlightGenerations, latestGenerations, 'session-1', 1, retainedTasks)
+
+    markInFlightGeneration(inFlightGenerations, 'session-1', 2)
+    latestGenerations.set('session-1', 2)
+    expect(isLatestRunGeneration(latestGenerations, 'session-1', 1)).toBe(false)
+
+    releaseGenerationTask(retainedTasks, inFlightGenerations, latestGenerations, 'session-1', 1)
+    expect(latestGenerations.get('session-1')).toBe(2)
   })
 })
 
