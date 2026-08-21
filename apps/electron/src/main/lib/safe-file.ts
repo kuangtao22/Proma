@@ -22,7 +22,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import type { Stats } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 
 /** 安全 JSON 读取的可选 schema 校验配置。 */
 export interface ReadJsonFileSafeOptions<T> {
@@ -34,6 +34,12 @@ export interface ReadJsonFileSafeOptions<T> {
 export interface SecureAtomicJsonWriteOptions {
   /** 临时文件完成 fsync/close 后、最终身份复验前调用，仅供竞态回归测试。 */
   beforeRename?: (tempPath: string) => void
+}
+
+/** 原子删除普通文件时允许替换的窄测试依赖。 */
+export interface AtomicFileRemoveOptions {
+  /** rename 已提交后清理 tombstone；生产默认使用 unlinkSync。 */
+  unlinkTombstone?: (tombstonePath: string) => void
 }
 
 /** 需要跨检查保持不变的文件系统对象身份。 */
@@ -66,6 +72,39 @@ export function writeJsonFileAtomic(filePath: string, data: object, skipBackup =
 
   // 原子重命名（POSIX rename 是原子操作）
   renameSync(tmpPath, filePath)
+}
+
+/**
+ * 先把明确的普通文件原子移出原路径，再清理同目录唯一 tombstone。
+ * rename 成功即视为业务删除已提交；后续清理失败不会把旧文件恢复到原路径。
+ *
+ * @param filePath 需要删除的绝对普通文件路径。
+ * @param options 可替换的 tombstone 清理依赖，仅用于稳定故障测试。
+ */
+export function removeFileAtomic(filePath: string, options: AtomicFileRemoveOptions = {}): void {
+  if (!isAbsolute(filePath) || basename(filePath) === '.' || basename(filePath) === '..') {
+    throw new Error('原子删除必须使用明确的绝对文件路径')
+  }
+  /** 删除前 no-follow 读取的目标身份。 */
+  let targetStat: ReturnType<typeof lstatSync>
+  try {
+    targetStat = lstatSync(filePath)
+  } catch (error) {
+    if (isMissingPathError(error)) return
+    throw error
+  }
+  if (!targetStat.isFile()) throw new Error('原子删除目标不是普通文件')
+
+  /** 同目录随机 tombstone，避免与并发删除或历史残留冲突。 */
+  const tombstonePath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.deleted`)
+  renameSync(filePath, tombstonePath)
+  try {
+    /** 生产使用 unlinkSync，测试可稳定注入 rename 后清理失败。 */
+    const unlinkTombstone = options.unlinkTombstone ?? unlinkSync
+    unlinkTombstone(tombstonePath)
+  } catch (error) {
+    throw new Error(`原子删除已提交，但 tombstone 清理失败: ${tombstonePath}`, { cause: error })
+  }
 }
 
 /**

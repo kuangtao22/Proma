@@ -13,7 +13,7 @@ import { createInterface } from 'node:readline'
 import { writeJsonFileAtomic, writeTextFileAtomic, readJsonFileSafe } from './safe-file'
 import { randomUUID } from 'node:crypto'
 import { rmSyncWithRetry, renameWithRetry } from './fs-retry'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   getAgentSessionsIndexPath,
   getAgentSessionsDir,
@@ -308,6 +308,97 @@ export function listActiveAgentSessions(): AgentSessionMeta[] {
 export function listArchivedAgentSessions(): AgentSessionMeta[] {
   const index = readIndex()
   return sortSessionsByUpdatedAtDesc(index.sessions.filter((session) => session.archived))
+}
+
+/**
+ * 幂等重写指定工作区会话中属于旧项目根的路径引用。
+ *
+ * @param workspaceId 需要迁移引用的工作区 ID。
+ * @param sourceRoot 迁移前项目根绝对路径。
+ * @param targetRoot 迁移后项目根绝对路径。
+ */
+export function rebaseWorkspaceSessionPaths(
+  workspaceId: string,
+  sourceRoot: string,
+  targetRoot: string,
+): void {
+  assertRelocationRoots(sourceRoot, targetRoot)
+  /** 当前会话索引，仅在至少一个声明字段变化时写回。 */
+  const index = readIndex()
+  /** 是否存在需要原子持久化的路径变化。 */
+  let changed = false
+  for (const session of index.sessions) {
+    if (session.workspaceId !== workspaceId) continue
+    /** 分叉源目录属于项目 cwd 语义；Pi artifact 字段明确不在重写范围。 */
+    const rebasedForkSource = rebaseProjectPath(session.forkSourceDir, sourceRoot, targetRoot)
+    if (rebasedForkSource !== session.forkSourceDir) {
+      session.forkSourceDir = rebasedForkSource
+      changed = true
+    }
+    /** 保持附加目录顺序和外部路径不变。 */
+    const rebasedDirectories = rebaseProjectPathArray(session.attachedDirectories, sourceRoot, targetRoot)
+    if (rebasedDirectories !== session.attachedDirectories) {
+      session.attachedDirectories = rebasedDirectories
+      changed = true
+    }
+    /** 保持附加文件顺序和外部路径不变。 */
+    const rebasedFiles = rebaseProjectPathArray(session.attachedFiles, sourceRoot, targetRoot)
+    if (rebasedFiles !== session.attachedFiles) {
+      session.attachedFiles = rebasedFiles
+      changed = true
+    }
+  }
+  if (changed) writeIndex(index)
+}
+
+/** 校验项目迁移路径参数，阻止相同或嵌套根进入引用提交。 */
+function assertRelocationRoots(sourceRoot: string, targetRoot: string): void {
+  if (!isAbsolute(sourceRoot) || !isAbsolute(targetRoot)) throw new Error('项目迁移根必须是绝对路径')
+  /** 目标相对源的位置。 */
+  const targetRelative = relative(resolve(sourceRoot), resolve(targetRoot))
+  /** 源相对目标的位置。 */
+  const sourceRelative = relative(resolve(targetRoot), resolve(sourceRoot))
+  if (targetRelative.length === 0) throw new Error('项目迁移源和目标必须不同')
+  if (isDescendantRelative(targetRelative) || isDescendantRelative(sourceRelative)) {
+    throw new Error('项目迁移源和目标不能互相嵌套')
+  }
+}
+
+/** 将一个可选绝对路径从旧项目根映射到新项目根。 */
+function rebaseProjectPath(value: string | undefined, sourceRoot: string, targetRoot: string): string | undefined {
+  if (value === undefined || !isAbsolute(value)) return value
+  /** 当前值相对旧项目根的位置。 */
+  const relativePath = relative(resolve(sourceRoot), resolve(value))
+  if (relativePath.length === 0) return resolve(targetRoot)
+  if (!isDescendantRelative(relativePath)) return value
+  return join(resolve(targetRoot), relativePath)
+}
+
+/** 幂等映射路径数组；没有元素变化时保留原数组引用。 */
+function rebaseProjectPathArray(
+  values: string[] | undefined,
+  sourceRoot: string,
+  targetRoot: string,
+): string[] | undefined {
+  if (values === undefined) return undefined
+  /** 是否至少一个项目根内路径发生变化。 */
+  let changed = false
+  /** 保持原顺序与重复项的新数组。 */
+  const rebasedValues = values.map((value) => {
+    /** 当前数组元素映射后的路径。 */
+    const rebasedValue = rebaseProjectPath(value, sourceRoot, targetRoot) ?? value
+    if (rebasedValue !== value) changed = true
+    return rebasedValue
+  })
+  return changed ? rebasedValues : values
+}
+
+/** 判断 path.relative 结果是否表示严格后代。 */
+function isDescendantRelative(relativePath: string): boolean {
+  return relativePath.length > 0
+    && relativePath !== '..'
+    && !relativePath.startsWith(`..${sep}`)
+    && !isAbsolute(relativePath)
 }
 
 /** 获取归档数量，不把归档会话元数据传到 renderer。 */

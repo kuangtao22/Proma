@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -13,7 +14,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readJsonFileSafe, writeJsonFileAtomicSecure } from './safe-file'
+import { readJsonFileSafe, removeFileAtomic, writeJsonFileAtomicSecure } from './safe-file'
 
 /** safe-file validator 测试使用的最小 schema。 */
 interface VersionedValue {
@@ -255,3 +256,74 @@ describe('writeJsonFileAtomicSecure', () => {
     }
   })
 })
+
+describe('removeFileAtomic', () => {
+  test('Given 普通 journal 文件 When 原子删除 Then 原路径消失且同目录不残留 tombstone', () => {
+    /** 隔离原子删除行为的临时目录。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-'))
+    const filePath = join(tempDir, 'journal.json')
+    writeFileSync(filePath, '{}', 'utf8')
+
+    try {
+      removeFileAtomic(filePath)
+
+      expect(existsSync(filePath)).toBe(false)
+      expect(readFileNames(tempDir)).toEqual([])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given journal 已不存在 When 重复原子删除 Then 幂等成功', () => {
+    /** 不存在的明确文件路径。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-missing-'))
+    const filePath = join(tempDir, 'journal.json')
+
+    try {
+      expect(() => removeFileAtomic(filePath)).not.toThrow()
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 删除目标是目录或符号链接 When 原子删除 Then 拒绝误删', () => {
+    /** 同时放置目录、外部文件与指向外部文件的符号链接。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-unsafe-'))
+    const directoryPath = join(tempDir, 'journal-dir')
+    const outsidePath = join(tempDir, 'outside.json')
+    const symlinkPath = join(tempDir, 'journal-link.json')
+    mkdirSync(directoryPath)
+    writeFileSync(outsidePath, 'outside', 'utf8')
+    symlinkSync(outsidePath, symlinkPath)
+
+    try {
+      expect(() => removeFileAtomic(directoryPath)).toThrow('原子删除目标不是普通文件')
+      expect(() => removeFileAtomic(symlinkPath)).toThrow('原子删除目标不是普通文件')
+      expect(readFileSync(outsidePath, 'utf8')).toBe('outside')
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given rename 后 tombstone 清理失败 When 原子删除 Then 原 journal 不复活且抛出可诊断错误', () => {
+    /** 注入 unlink 失败，稳定覆盖 rename 成功后的故障窗口。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-failure-'))
+    const filePath = join(tempDir, 'journal.json')
+    writeFileSync(filePath, '{}', 'utf8')
+
+    try {
+      expect(() => removeFileAtomic(filePath, {
+        unlinkTombstone: () => { throw new Error('disk busy') },
+      })).toThrow('原子删除已提交，但 tombstone 清理失败')
+      expect(existsSync(filePath)).toBe(false)
+      expect(readFileNames(tempDir)).toHaveLength(1)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+})
+
+/** 返回目录当前条目名称，供 tombstone 清理断言使用。 */
+function readFileNames(directoryPath: string): string[] {
+  return readdirSync(directoryPath)
+}

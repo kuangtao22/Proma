@@ -1,14 +1,16 @@
 import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import * as os from 'node:os'
 import { join } from 'node:path'
 import { DataRootLocator } from './data-root-locator'
 
 type AgentSessionManager = typeof import('./agent-session-manager')
 type AgentSessionContextPrompt = typeof import('./agent-session-context-prompt')
+type AgentWorkspaceManager = typeof import('./agent-workspace-manager')
 
 let manager: AgentSessionManager
 let contextPrompt: AgentSessionContextPrompt
+let workspaceManager: AgentWorkspaceManager
 let tempHome: string
 const originalHome = process.env.HOME
 const originalPromaDev = process.env.PROMA_DEV
@@ -85,6 +87,9 @@ function writeAgentSessionsIndex(sessions: Array<{
   sdkSessionId?: string
   piSessionFile?: string
   piEntryBindings?: Record<string, string>
+  attachedDirectories?: string[]
+  attachedFiles?: string[]
+  forkSourceDir?: string
   forkSourceSdkSessionId?: string
   resumeAtMessageUuid?: string
 }>): void {
@@ -99,6 +104,7 @@ function writeAgentWorkspacesIndex(workspaces: Array<{
   slug: string
   createdAt: number
   updatedAt: number
+  projectRootPath?: string
 }>): void {
   const dir = join(tempHome, '.proma')
   mkdirSync(dir, { recursive: true })
@@ -121,6 +127,7 @@ beforeAll(async () => {
   process.env.PROMA_DEV = '0'
   manager = await import('./agent-session-manager')
   contextPrompt = await import('./agent-session-context-prompt')
+  workspaceManager = await import('./agent-workspace-manager')
 })
 
 afterAll(() => {
@@ -162,6 +169,82 @@ describe('Agent 会话 JSONL 读取', () => {
 })
 
 describe('Agent 会话 runtime 元数据', () => {
+  test('Given 项目迁移包含内外部会话引用 When 重写工作区会话路径 Then 仅根内路径变化且 Pi 三字段保持', () => {
+    /** 旧项目根、新项目根和不得改写的外部根。 */
+    const sourceRoot = join(tempHome, 'old-project')
+    const targetRoot = join(tempHome, 'new-project')
+    const outsideRoot = join(tempHome, 'outside')
+    writeAgentSessionsIndex([{
+      id: 'session-relocation',
+      title: '迁移会话',
+      workspaceId: 'workspace-a',
+      createdAt: 1,
+      updatedAt: 1,
+      agentRuntime: 'pi',
+      sdkSessionId: 'sdk-stable',
+      piSessionFile: join(tempHome, '.proma', 'sdk-config', 'session.jsonl'),
+      piEntryBindings: { 'assistant-1': 'entry-1' },
+      forkSourceDir: join(sourceRoot, 'fork'),
+      attachedDirectories: [sourceRoot, join(sourceRoot, 'docs'), outsideRoot],
+      attachedFiles: [join(sourceRoot, 'README.md'), join(outsideRoot, 'note.md')],
+    }])
+
+    manager.rebaseWorkspaceSessionPaths('workspace-a', sourceRoot, targetRoot)
+    manager.rebaseWorkspaceSessionPaths('workspace-a', sourceRoot, targetRoot)
+
+    const session = manager.getAgentSessionMeta('session-relocation')
+    expect(session?.forkSourceDir).toBe(join(targetRoot, 'fork'))
+    expect(session?.attachedDirectories).toEqual([targetRoot, join(targetRoot, 'docs'), outsideRoot])
+    expect(session?.attachedFiles).toEqual([join(targetRoot, 'README.md'), join(outsideRoot, 'note.md')])
+    expect(session?.sdkSessionId).toBe('sdk-stable')
+    expect(session?.piSessionFile).toBe(join(tempHome, '.proma', 'sdk-config', 'session.jsonl'))
+    expect(session?.piEntryBindings).toEqual({ 'assistant-1': 'entry-1' })
+  })
+
+  test('Given 工作区配置含项目内外附加路径 When 重写配置并切换索引 Then 仅根内变化且重复提交幂等', () => {
+    /** 真实源、目标和外部附加路径。 */
+    const sourceRoot = join(tempHome, 'workspace-source')
+    const targetRoot = join(tempHome, 'workspace-target')
+    const outsideRoot = join(tempHome, 'workspace-outside')
+    const workspaceSlug = 'workspace-relocation'
+    const workspaceId = 'workspace-relocation-id'
+    mkdirSync(sourceRoot, { recursive: true })
+    mkdirSync(targetRoot, { recursive: true })
+    mkdirSync(outsideRoot, { recursive: true })
+    writeAgentWorkspacesIndex([{
+      id: workspaceId,
+      name: '迁移工作区',
+      slug: workspaceSlug,
+      projectRootPath: realpathSync(sourceRoot),
+      createdAt: 1,
+      updatedAt: 1,
+    }])
+    /** 工作区配置文件所在目录。 */
+    const workspaceDirectory = join(tempHome, '.proma', 'agent-workspaces', workspaceSlug)
+    const configPath = join(workspaceDirectory, 'config.json')
+    mkdirSync(workspaceDirectory, { recursive: true })
+    writeFileSync(configPath, JSON.stringify({
+      attachedDirectories: [realpathSync(sourceRoot), join(realpathSync(sourceRoot), 'docs'), outsideRoot],
+      attachedFiles: [join(realpathSync(sourceRoot), 'README.md'), join(outsideRoot, 'note.md')],
+    }), 'utf8')
+
+    workspaceManager.rebaseWorkspaceConfigPaths(workspaceSlug, realpathSync(sourceRoot), realpathSync(targetRoot))
+    workspaceManager.rebaseWorkspaceConfigPaths(workspaceSlug, realpathSync(sourceRoot), realpathSync(targetRoot))
+    workspaceManager.updateAgentWorkspaceProjectRoot(workspaceId, targetRoot)
+    workspaceManager.updateAgentWorkspaceProjectRoot(workspaceId, targetRoot)
+
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
+      attachedDirectories: string[]
+      attachedFiles: string[]
+    }
+    const index = JSON.parse(readFileSync(join(tempHome, '.proma', 'agent-workspaces.json'), 'utf8')) as {
+      workspaces: Array<{ projectRootPath?: string }>
+    }
+    expect(config.attachedDirectories).toEqual([realpathSync(targetRoot), join(realpathSync(targetRoot), 'docs'), outsideRoot])
+    expect(config.attachedFiles).toEqual([join(realpathSync(targetRoot), 'README.md'), join(outsideRoot, 'note.md')])
+    expect(index.workspaces[0]?.projectRootPath).toBe(realpathSync(targetRoot))
+  })
+
   test('Given 已保存 OpenAI medium 默认值 When 新建会话 Then 始终创建并持久化 Pi 会话', () => {
     const settingsPath = join(tempHome, '.proma', 'settings.json')
     mkdirSync(join(tempHome, '.proma'), { recursive: true })

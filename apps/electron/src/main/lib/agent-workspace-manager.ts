@@ -12,7 +12,7 @@ import type { Dirent } from 'node:fs'
 import { rmSyncWithRetry, renameIfDestinationAbsentWithRetry, renameWithRetry } from './fs-retry'
 import { writeJsonFileAtomic, readJsonFileSafe, writeTextFileAtomic } from './safe-file'
 import { randomUUID } from 'node:crypto'
-import { join, resolve, relative, isAbsolute, dirname, basename } from 'node:path'
+import { join, resolve, relative, isAbsolute, dirname, basename, sep } from 'node:path'
 import {
   getAgentWorkspacesIndexPath,
   getAgentWorkspacesDir,
@@ -330,6 +330,37 @@ export function relinkAgentWorkspaceProjectRoot(id: string, projectRootPath: str
   index.workspaces[idx] = updated
   writeIndex(index)
   console.log(`[Agent 工作区] 已重新关联项目根: ${updated.name} → ${normalizedProjectRootPath}`)
+  return withProjectRootStatus(updated)
+}
+
+/**
+ * 迁移提交的最终一步：幂等切换工作区索引中的项目根。
+ *
+ * @param workspaceId 待切换的工作区 ID。
+ * @param targetRoot 已完成复制和引用重写的目标根。
+ * @returns 切换后的工作区记录。
+ */
+export function updateAgentWorkspaceProjectRoot(workspaceId: string, targetRoot: string): AgentWorkspace {
+  const index = readIndex()
+  /** 目标工作区在索引中的位置。 */
+  const workspaceIndex = index.workspaces.findIndex((workspace) => workspace.id === workspaceId)
+  if (workspaceIndex === -1) throw new Error(`项目不存在: ${workspaceId}`)
+  if (!isAbsolute(targetRoot)) throw new Error('项目迁移目标根必须是绝对路径')
+  /** 目标根必须保持可访问且解析为实际目录。 */
+  const normalizedTargetRoot = realpathSync(resolve(targetRoot))
+  if (!statSync(normalizedTargetRoot).isDirectory()) throw new Error('项目迁移目标根不是目录')
+  accessSync(normalizedTargetRoot, constants.R_OK | constants.W_OK | constants.X_OK)
+  /** 当前索引记录。 */
+  const current = index.workspaces[workspaceIndex]!
+  if (current.projectRootPath === normalizedTargetRoot) return withProjectRootStatus(current)
+  /** 仅改变项目根和更新时间，其余工作区身份保持不变。 */
+  const updated: AgentWorkspace = {
+    ...current,
+    projectRootPath: normalizedTargetRoot,
+    updatedAt: Date.now(),
+  }
+  index.workspaces[workspaceIndex] = updated
+  writeIndex(index)
   return withProjectRootStatus(updated)
 }
 
@@ -1823,6 +1854,54 @@ function readWorkspaceConfig(workspaceSlug: string): WorkspaceConfig {
 function writeWorkspaceConfig(workspaceSlug: string, config: WorkspaceConfig): void {
   const configPath = getWorkspaceConfigPath(workspaceSlug)
   writeJsonFileAtomic(configPath, config)
+}
+
+/**
+ * 幂等重写工作区配置中属于旧项目根的附加路径。
+ *
+ * @param workspaceSlug 工作区稳定 slug。
+ * @param sourceRoot 迁移前项目根绝对路径。
+ * @param targetRoot 迁移后项目根绝对路径。
+ */
+export function rebaseWorkspaceConfigPaths(
+  workspaceSlug: string,
+  sourceRoot: string,
+  targetRoot: string,
+): void {
+  if (!isAbsolute(sourceRoot) || !isAbsolute(targetRoot)) throw new Error('项目迁移根必须是绝对路径')
+  /** 当前工作区配置。 */
+  const config = readWorkspaceConfig(workspaceSlug)
+  /** 保持外部目录与原顺序不变的映射结果。 */
+  const attachedDirectories = rebaseWorkspacePathArray(config.attachedDirectories, sourceRoot, targetRoot)
+  /** 保持外部文件与原顺序不变的映射结果。 */
+  const attachedFiles = rebaseWorkspacePathArray(config.attachedFiles, sourceRoot, targetRoot)
+  if (attachedDirectories === config.attachedDirectories && attachedFiles === config.attachedFiles) return
+  writeWorkspaceConfig(workspaceSlug, { ...config, attachedDirectories, attachedFiles })
+}
+
+/** 幂等映射工作区配置路径数组。 */
+function rebaseWorkspacePathArray(
+  values: string[] | undefined,
+  sourceRoot: string,
+  targetRoot: string,
+): string[] | undefined {
+  if (values === undefined) return undefined
+  /** 是否至少一个旧项目根内路径发生变化。 */
+  let changed = false
+  /** 保持顺序和重复项的映射数组。 */
+  const rebasedValues = values.map((value) => {
+    if (!isAbsolute(value)) return value
+    /** 当前配置路径相对旧根的位置。 */
+    const relativePath = relative(resolve(sourceRoot), resolve(value))
+    if (relativePath.length === 0) {
+      changed = true
+      return resolve(targetRoot)
+    }
+    if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) return value
+    changed = true
+    return join(resolve(targetRoot), relativePath)
+  })
+  return changed ? rebasedValues : values
 }
 
 /** Whether the user explicitly enabled Agent-initiated maintenance of both AGENTS.md files. */
