@@ -1970,7 +1970,7 @@ export class AgentOrchestrator {
           }
 
           // Plan 模式：Agent 完成规划后注入"接受计划"建议
-          if (initialPermissionMode === 'plan' && planModeEntered && this.activeSessions.has(sessionId)) {
+          if (initialPermissionMode === 'plan' && planModeEntered && this.activeSessions.get(sessionId) === runGeneration) {
             this.eventBus.emit(sessionId, {
               kind: 'sdk_message',
               message: { type: 'prompt_suggestion', suggestion: '请执行该计划' } as unknown as SDKMessage,
@@ -1984,7 +1984,7 @@ export class AgentOrchestrator {
           return
 
         } catch (error) {
-          if (!this.activeSessions.has(sessionId)) {
+          if (this.activeSessions.get(sessionId) !== runGeneration) {
             const wasStoppedByUser = this.consumeStoppedByUser(sessionId, runGeneration)
             this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
             try { updateAgentSessionMeta(sessionId, { stoppedByUser: wasStoppedByUser }) } catch { /* 会话可能已删除 */ }
@@ -2135,12 +2135,18 @@ export class AgentOrchestrator {
       failRun(recoveryFailure, getAgentSessionMessages(sessionId), { startedAt: streamStartedAt })
 
     } finally {
+      /** 旧 run 收尾时若新 generation 已占槽，不得清理新运行的审批状态。 */
+      const activeGenerationAtCleanup = this.activeSessions.get(sessionId)
+      /** 当前槽为空或仍属于本 run 时，pending 状态才归本次收尾所有。 */
+      const canClearRunPending = activeGenerationAtCleanup === undefined || activeGenerationAtCleanup === runGeneration
       // 只在 generation 匹配时才清理，防止旧流的 finally 误删新流的注册
       releaseActiveRun()
-      permissionService.clearSessionPending(sessionId)
       // askUserService 不在 turn 结束时清理——AskUserQuestion 的生命周期由用户交互决定，
       // 仅在会话真正删除时（DELETE_SESSION IPC）才清理。
-      exitPlanService.clearSessionPending(sessionId)
+      if (canClearRunPending) {
+        permissionService.clearSessionPending(sessionId)
+        exitPlanService.clearSessionPending(sessionId)
+      }
     }
     })
     })
@@ -2165,6 +2171,9 @@ export class AgentOrchestrator {
       this.stoppedBeforeRunSessions.add(sessionId)
     }
     this.queuedMessageUuids.delete(sessionId)
+    // stop 同步拥有被停止代际的审批状态，必须在新 generation 可运行前清理。
+    permissionService.clearSessionPending(sessionId)
+    exitPlanService.clearSessionPending(sessionId)
     this.adapter.abort(sessionId)
     console.log(`[Agent 编排] 已中止会话: ${sessionId}`)
   }

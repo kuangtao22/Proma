@@ -126,4 +126,60 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(checkpointIndex).toBeGreaterThan(-1)
     expect(checkpointIndex).toBeLessThan(businessTryIndex)
   })
+
+  test('Given generation1 已停止且 generation2 已占槽 When 旧 adapter 完成或拒绝 Then 仅按 generation 所有权处理', () => {
+    /** 读取真实编排源码，精确约束 adapter 终态的两个 ABA 判断。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** 截取 Plan suggestion 条件。 */
+    const planStart = source.indexOf('// Plan 模式：Agent 完成规划后注入')
+    const planEnd = source.indexOf('// 发送完成信号', planStart)
+    const planBlock = source.slice(planStart, planEnd)
+    /** 截取 adapter reject 后的首个停止分支。 */
+    const catchStart = source.indexOf('} catch (error) {', planEnd)
+    const catchEnd = source.indexOf('const rawErrorMessage = errorMessageOf(error)', catchStart)
+    const catchBlock = source.slice(catchStart, catchEnd)
+
+    expect(planBlock).toContain('this.activeSessions.get(sessionId) === runGeneration')
+    expect(planBlock).not.toContain('this.activeSessions.has(sessionId)')
+    expect(catchBlock).toContain('this.activeSessions.get(sessionId) !== runGeneration')
+    expect(catchBlock).not.toContain('this.activeSessions.has(sessionId)')
+
+    /** 模拟 generation1 stop 后同 session 已被 generation2 占用的 ABA 状态。 */
+    const activeGenerations = new Map([['session-1', 2]])
+    /** 当前正在收尾的旧运行代际。 */
+    const oldRunGeneration = 1
+    expect(activeGenerations.get('session-1') === oldRunGeneration).toBe(false)
+    expect(activeGenerations.get('session-1') !== oldRunGeneration).toBe(true)
+  })
+
+  test('Given generation1 stop 后 generation2 已创建审批 When 旧 finally 执行 Then 不清理 generation2 pending', () => {
+    /** 读取真实编排源码，约束 stop 与旧 run finally 的 session pending 所有权。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** 截取 sendMessage 最外层 finally。 */
+    const finallyStart = source.indexOf('} finally {', source.indexOf('const recoveryFailure'))
+    const finallyEnd = source.indexOf('\n    })', finallyStart)
+    const finallyBlock = source.slice(finallyStart, finallyEnd)
+    /** 截取 stop 方法。 */
+    const stopStart = source.indexOf('  stop(sessionId: string, stopBeforeRun = false): void {')
+    const stopEnd = source.indexOf('\n  /** 检查指定会话是否正在处理中 */', stopStart)
+    const stopBlock = source.slice(stopStart, stopEnd)
+
+    expect(finallyBlock).toContain('activeGenerationAtCleanup')
+    expect(finallyBlock).toContain('activeGenerationAtCleanup === undefined || activeGenerationAtCleanup === runGeneration')
+    expect(finallyBlock).toContain('if (canClearRunPending) {')
+    expect(stopBlock).toContain('permissionService.clearSessionPending(sessionId)')
+    expect(stopBlock).toContain('exitPlanService.clearSessionPending(sessionId)')
+    expect(stopBlock.indexOf('permissionService.clearSessionPending(sessionId)'))
+      .toBeLessThan(stopBlock.indexOf('this.adapter.abort(sessionId)'))
+    expect(stopBlock.indexOf('exitPlanService.clearSessionPending(sessionId)'))
+      .toBeLessThan(stopBlock.indexOf('this.adapter.abort(sessionId)'))
+
+    /** 模拟旧 finally 看到 generation2、空槽和仍持有 generation1 的三种状态。 */
+    const canClearPending = (activeGeneration: number | undefined, runGeneration: number): boolean => (
+      activeGeneration === undefined || activeGeneration === runGeneration
+    )
+    expect(canClearPending(2, 1)).toBe(false)
+    expect(canClearPending(undefined, 1)).toBe(true)
+    expect(canClearPending(1, 1)).toBe(true)
+  })
 })
