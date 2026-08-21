@@ -10,11 +10,72 @@ export interface AgentRunLifecycleDependencies {
   onStopped: () => void
 }
 
+/** Agent 终端通知 callback。 */
+export interface AgentRunTerminalCallbacks<TMessages, TOptions> {
+  /** 外部错误 callback。 */
+  onError: (error: string) => void
+  /** 外部完成 callback。 */
+  onComplete: (messages?: TMessages, options?: TOptions) => void
+  /** callback 抛错后的日志边界。 */
+  onCallbackError?: (kind: 'error' | 'complete', error: unknown) => void
+}
+
+/** Agent 安全终端通知器。 */
+export interface AgentRunTerminalNotifier<TMessages, TOptions> {
+  /** 最多尝试一次错误通知，完成后调用无效。 */
+  onError: (error: string) => void
+  /** 最多尝试一次完成通知。 */
+  onComplete: (messages?: TMessages, options?: TOptions) => void
+}
+
 /** 内部停止信号，仅用于跨异步 preflight 快速退出。 */
 const AGENT_RUN_STOPPED = Symbol('agent-run-stopped')
 
 /** 生命周期执行期间用于验证当前运行代际的同步检查点。 */
 export type AgentRunCheckpoint = () => void
+
+/**
+ * 创建不会向 Agent 业务层抛出 callback 异常的终端通知器。
+ * complete 在调用外部 callback 前锁定，确保重入和异常路径都只尝试一次。
+ */
+export function createAgentRunTerminalNotifier<TMessages, TOptions>(
+  callbacks: AgentRunTerminalCallbacks<TMessages, TOptions>,
+): AgentRunTerminalNotifier<TMessages, TOptions> {
+  /** 是否已经尝试完成通知。 */
+  let completed = false
+  /** 是否已经尝试错误通知。 */
+  let errorAttempted = false
+
+  /** 记录外部 callback 异常，日志边界自身异常也不得回流业务层。 */
+  const reportCallbackError = (kind: 'error' | 'complete', error: unknown): void => {
+    try {
+      callbacks.onCallbackError?.(kind, error)
+    } catch (logError) {
+      console.error('[Agent 生命周期] 记录终端 callback 异常失败:', logError)
+    }
+  }
+
+  return {
+    onError: (error) => {
+      if (completed || errorAttempted) return
+      errorAttempted = true
+      try {
+        callbacks.onError(error)
+      } catch (callbackError) {
+        reportCallbackError('error', callbackError)
+      }
+    },
+    onComplete: (messages, options) => {
+      if (completed) return
+      completed = true
+      try {
+        callbacks.onComplete(messages, options)
+      } catch (callbackError) {
+        reportCallbackError('complete', callbackError)
+      }
+    },
+  }
+}
 
 /** 为会话添加指定运行代际的停止标记。 */
 export function markStoppedGeneration(

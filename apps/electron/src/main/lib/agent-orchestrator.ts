@@ -80,6 +80,7 @@ import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 import {
   consumeStoppedGeneration,
+  createAgentRunTerminalNotifier,
   hasStoppedGeneration,
   isLatestRunGeneration,
   markStoppedGeneration,
@@ -110,6 +111,18 @@ export interface SessionCallbacks {
   onTitleUpdated: (title: string) => void
   /** 用户消息已持久化，外部入口可据此通知前端切到实时会话 */
   onRunStarted?: (opts: { startedAt: number }) => void
+}
+
+/** 单次 Agent 运行完成时发送给外部入口的选项。 */
+interface AgentRunCompleteOptions {
+  /** 是否由用户主动停止。 */
+  stoppedByUser?: boolean
+  /** 本轮流式运行起始时间。 */
+  startedAt?: number
+  /** Adapter 终态 result subtype。 */
+  resultSubtype?: string
+  /** Adapter 终态错误详情。 */
+  resultErrors?: string[]
 }
 
 type RecoverableAgentQueryOptions = {
@@ -678,6 +691,14 @@ export class AgentOrchestrator {
     let userMessagePersisted = false
     let initialUserMessageUuid: string | undefined
     let sessionMeta = getAgentSessionMeta(sessionId)
+    /** 隔离外部 terminal callback 异常并保证完成通知 exactly-once。 */
+    const terminalNotifier = createAgentRunTerminalNotifier<AgentMessage[], AgentRunCompleteOptions>({
+      onError: callbacks.onError,
+      onComplete: callbacks.onComplete,
+      onCallbackError: (kind, error) => {
+        console.error(`[Agent 编排] terminal ${kind} callback 执行失败:`, error)
+      },
+    })
     /** 当前请求同步占用的运行代际；0 表示尚未持有运行槽。 */
     let runGeneration = 0
 
@@ -698,7 +719,7 @@ export class AgentOrchestrator {
     } = {}): void => {
       releaseActiveRun()
       const stoppedByUser = this.stoppedBeforeRunSessions.delete(sessionId)
-      callbacks.onComplete([], {
+      terminalNotifier.onComplete([], {
         ...options,
         startedAt: options.startedAt ?? streamStartedAt,
         stoppedByUser: options.stoppedByUser === true || stoppedByUser,
@@ -722,7 +743,7 @@ export class AgentOrchestrator {
     return workspaceOperationGuard.runAdmittedAgentRun({
       sessionWorkspaceId: sessionMeta?.workspaceId,
       requestedWorkspaceId,
-      onError: callbacks.onError,
+      onError: terminalNotifier.onError,
       onComplete: completeBeforeRun,
     }, async (workspaceId) => {
 
@@ -734,8 +755,8 @@ export class AgentOrchestrator {
       // 尤其在用户点击停止后、底层 query 尚未完全退出的短暂窗口内，否则同一条
       // 后续消息会随每次点击重复落盘。
       console.warn(`[Agent 编排] 会话 ${sessionId} 正在处理中，拒绝新请求且不保存用户消息`)
-      callbacks.onError(getActiveRunRejectionMessage())
-      callbacks.onComplete([], { startedAt: streamStartedAt })
+      terminalNotifier.onError(getActiveRunRejectionMessage())
+      terminalNotifier.onComplete([], { startedAt: streamStartedAt })
       return
     }
 
@@ -755,7 +776,7 @@ export class AgentOrchestrator {
       onStopped: () => {
         this.consumeStoppedByUser(sessionId, runGeneration)
         // 旧 generation 只能完成自己的回调，不能消费后来 generation 的 stoppedBeforeRun 标记。
-        callbacks.onComplete([], { startedAt: streamStartedAt, stoppedByUser: true })
+        terminalNotifier.onComplete([], { startedAt: streamStartedAt, stoppedByUser: true })
       },
     }, async (checkpoint) => {
 
@@ -775,7 +796,7 @@ export class AgentOrchestrator {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         console.error('[Agent 编排] 持久化用户消息失败:', error)
-        callbacks.onError(`消息保存失败：${message}`)
+        terminalNotifier.onError(`消息保存失败：${message}`)
         completeBeforeRun()
         return
       }
@@ -807,7 +828,7 @@ export class AgentOrchestrator {
       try { appendSDKMessages(sessionId, [errorSDKMsg]) } catch (e) {
         console.error('[Agent 编排] 持久化 preflight error 失败:', e)
       }
-      callbacks.onError(errorContent)
+      terminalNotifier.onError(errorContent)
       completeBeforeRun()
     }
 
@@ -935,19 +956,19 @@ export class AgentOrchestrator {
     callbacks.onRunStarted?.({ startedAt: streamStartedAt })
     const completeRun = (
       messages?: AgentMessage[],
-      opts?: { stoppedByUser?: boolean; startedAt?: number; resultSubtype?: string; resultErrors?: string[] },
+      opts?: AgentRunCompleteOptions,
     ): void => {
       releaseActiveRun()
-      callbacks.onComplete(messages, opts)
+      terminalNotifier.onComplete(messages, opts)
     }
     const failRun = (
       error: string,
       messages?: AgentMessage[],
-      opts?: { stoppedByUser?: boolean; startedAt?: number; resultSubtype?: string; resultErrors?: string[] },
+      opts?: AgentRunCompleteOptions,
     ): void => {
       releaseActiveRun()
-      callbacks.onError(error)
-      callbacks.onComplete(messages, opts)
+      terminalNotifier.onError(error)
+      terminalNotifier.onComplete(messages, opts)
     }
 
     // 3. 构建 Pi runtime 环境（代理与 Windows shell 配置）。

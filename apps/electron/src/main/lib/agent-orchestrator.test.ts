@@ -219,4 +219,19 @@ describe('Agent sendMessage 准入顺序合同', () => {
     )
     expect(lifecycleDependencies).not.toContain('isStopped: () => !')
   })
+
+  test('Given 外部 terminal callback 可能抛错 When 检查 sendMessage Then 终端通知全部走 safe notifier 且启动回调直传', () => {
+    /** 读取真实编排源码，防止 terminal callback 异常重新进入业务 catch。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** 仅截取 sendMessage 函数体。 */
+    const sendStart = source.indexOf('  async sendMessage(')
+    const sendEnd = source.indexOf('\n  /**\n   * 中止指定会话', sendStart)
+    const sendBody = source.slice(sendStart, sendEnd)
+
+    expect(sendBody).toContain('createAgentRunTerminalNotifier')
+    expect(sendBody).toContain('onError: terminalNotifier.onError')
+    expect(sendBody).toContain('onComplete: completeBeforeRun')
+    expect(sendBody).not.toMatch(/callbacks\.on(?:Error|Complete)\(/)
+    expect(sendBody).toContain('callbacks.onRunStarted?.({ startedAt: streamStartedAt })')
+  })
 })

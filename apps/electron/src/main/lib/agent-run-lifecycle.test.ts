@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   consumeStoppedGeneration,
+  createAgentRunTerminalNotifier,
   hasStoppedGeneration,
   isLatestRunGeneration,
   markStoppedGeneration,
@@ -214,5 +215,57 @@ describe('Agent 运行生命周期', () => {
     expect(activeGenerations.has('session-1')).toBe(false)
     expect(isLatestRunGeneration(latestGenerations, 'session-1', 1)).toBe(false)
     expect(isLatestRunGeneration(latestGenerations, 'session-1', 2)).toBe(true)
+  })
+})
+
+describe('Agent 终端通知边界', () => {
+  test('Given 正常完成 callback 抛错 When 后续再次完成或报错 Then 不外溢且 complete exactly-once', () => {
+    /** 记录外部完成 callback 调用次数。 */
+    let completeCalls = 0
+    /** 记录外部错误 callback 调用次数。 */
+    let errorCalls = 0
+    /** 记录 callback 异常日志。 */
+    const callbackErrors: Array<{ kind: 'error' | 'complete'; error: unknown }> = []
+    /** 使用生产 factory 创建终端通知器。 */
+    const notifier = createAgentRunTerminalNotifier<string[], { stoppedByUser?: boolean }>({
+      onError: () => { errorCalls += 1 },
+      onComplete: () => {
+        completeCalls += 1
+        throw new Error('complete callback failed')
+      },
+      onCallbackError: (kind, error) => { callbackErrors.push({ kind, error }) },
+    })
+
+    expect(() => notifier.onComplete(['done'])).not.toThrow()
+    notifier.onComplete(['duplicate'])
+    notifier.onError('late error')
+
+    expect(completeCalls).toBe(1)
+    expect(errorCalls).toBe(0)
+    expect(callbackErrors).toHaveLength(1)
+    expect(callbackErrors[0]?.kind).toBe('complete')
+  })
+
+  test('Given onError callback 抛错 When fail 路径继续完成 Then error 与 complete 各尝试一次', () => {
+    /** 记录终端通知的调用顺序。 */
+    const calls: string[] = []
+    /** 记录 callback 异常类型。 */
+    const callbackErrorKinds: string[] = []
+    /** 使用生产 factory 创建终端通知器。 */
+    const notifier = createAgentRunTerminalNotifier<string[], { stoppedByUser?: boolean }>({
+      onError: () => {
+        calls.push('error')
+        throw new Error('error callback failed')
+      },
+      onComplete: () => { calls.push('complete') },
+      onCallbackError: (kind) => { callbackErrorKinds.push(kind) },
+    })
+
+    expect(() => {
+      notifier.onError('failed')
+      notifier.onComplete([], { stoppedByUser: false })
+    }).not.toThrow()
+    expect(calls).toEqual(['error', 'complete'])
+    expect(callbackErrorKinds).toEqual(['error'])
   })
 })
