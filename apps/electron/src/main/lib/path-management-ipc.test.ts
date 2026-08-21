@@ -539,7 +539,7 @@ describe('路径管理 IPC', () => {
     await preview(expectedEvent, selection)
 
     const firstStart = Promise.resolve(start(expectedEvent, selection))
-    await expect(start(expectedEvent, selection)).rejects.toThrow('目标选择正在启动或已消费')
+    await expect(start(expectedEvent, selection)).rejects.toThrow('目标选择已失效')
     for (let attempt = 0; attempt < 10 && createPlanResolvers.length === 0; attempt += 1) await Promise.resolve()
     expect(createPlanCalls).toBe(1)
     createPlanResolvers[0]?.()
@@ -827,7 +827,10 @@ describe('路径管理 IPC', () => {
       },
       getExpectedWebContents: () => expectedWebContents,
       dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: ['/data/proma-new'] }) },
-      acquireMigrationGuard: () => ({ release: () => { calls.push('release-intent') } }),
+      acquireMigrationGuard: () => {
+        calls.push('acquire-intent')
+        return { release: () => { calls.push('release-intent') } }
+      },
       coordinator: {
         getStatus: () => createLocatorResult().state,
         previewTarget: createSafePreview,
@@ -845,7 +848,8 @@ describe('路径管理 IPC', () => {
     if (!handler) throw new Error('未注册创建迁移计划通道')
     const selection = await authorizeMigrationSelection(handlers)
     await expect(handler(expectedEvent, selection)).rejects.toThrow('模拟计划创建失败')
-    expect(calls).toEqual(['create-plan', 'release-intent'])
+    await expect(handler(expectedEvent, selection)).rejects.toThrow('目标选择已失效')
+    expect(calls).toEqual(['acquire-intent', 'create-plan', 'release-intent'])
   })
 
   test('Given createPlan 失败且 guard 无法释放 When 没有 pending Then 返回可操作错误且不静默继续', async () => {

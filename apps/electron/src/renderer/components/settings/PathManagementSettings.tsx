@@ -134,6 +134,7 @@ export type PathManagementUiAction =
   | { type: 'load-failed'; message: string }
   | { type: 'load-succeeded' }
   | { type: 'action-failed'; message: string }
+  | { type: 'migration-failed'; message: string }
   | { type: 'action-succeeded' }
   | { type: 'pick-started' }
   | { type: 'preview-started'; targetRoot: string }
@@ -156,6 +157,15 @@ export function reducePathManagementUiState(
     return rest
   }
   if (action.type === 'action-failed') return { ...state, actionError: action.message }
+  if (action.type === 'migration-failed') {
+    return {
+      ...state,
+      actionError: action.message,
+      selectedTarget: null,
+      preview: null,
+      previewLoading: false,
+    }
+  }
   if (action.type === 'action-succeeded' || action.type === 'pick-started') {
     const { actionError: _actionError, ...rest } = state
     return action.type === 'pick-started'
@@ -453,7 +463,7 @@ export function PathManagementSettings(): React.ReactElement {
         startDataRootMigration: window.electronAPI.startDataRootMigration,
       })
     } catch (migrationError) {
-      dispatchUi({ type: 'action-failed', message: toErrorMessage(migrationError, '无法创建迁移计划') })
+      dispatchUi({ type: 'migration-failed', message: toErrorMessage(migrationError, '无法创建迁移计划') })
       await loadState().catch(() => undefined)
     } finally {
       if (migrationFlowId.current === flowId) setIsBusy(false)

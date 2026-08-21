@@ -266,8 +266,9 @@ export function registerPathManagementIpcHandlers(
       if (selection.status === 'selected') throw new Error('目标选择尚未完成预检')
       if (selection.status === 'previewing') throw new Error('目标选择正在预检')
       if (selection.status === 'starting') throw new Error('目标选择正在启动或已消费')
-      /** 在第一个 await 前占用 selection，阻止并发双 start。 */
+      /** START 是一次性 capability；在第一个 await 前终态消费，任何失败都必须重新 pick 和 preview。 */
       selection.status = 'starting'
+      currentSelection = null
       try {
         await assertMigrationCanStart(options)
         /** intent guard 关闭其他 normal 实例的新入口，直到当前进程退出。 */
@@ -336,8 +337,6 @@ export function registerPathManagementIpcHandlers(
           }
         }
       } catch (error) {
-        /** plan 尚未创建时允许同一预览重试；已消费 selection 不会被恢复。 */
-        if (currentSelection === selection && selection.status === 'starting') selection.status = 'previewed'
         throw error
       }
     })

@@ -31,7 +31,12 @@ interface ExpectedPathManagementSettingsModule {
     state: PathManagementState,
     status: DataRootMigrationStatus,
   ) => PathManagementState
-  DataRootLocationSection: ComponentType<{ state: PathManagementState }>
+  DataRootLocationSection: ComponentType<{
+    state: PathManagementState
+    view?: ReturnType<ExpectedPathManagementSettingsModule['createPathManagementSettingsView']>
+    isBusy?: boolean
+    onMigrate?: () => void
+  }>
   CrossDeviceMigrationSection: ComponentType
   createPathManagementUiState: () => {
     loadError?: string
@@ -46,6 +51,7 @@ interface ExpectedPathManagementSettingsModule {
       | { type: 'load-failed'; message: string }
       | { type: 'load-succeeded' }
       | { type: 'action-failed'; message: string }
+      | { type: 'migration-failed'; message: string }
       | { type: 'action-succeeded' }
       | { type: 'pick-started' }
       | { type: 'preview-started'; targetRoot: string }
@@ -302,6 +308,44 @@ describe('PathManagementSettings', () => {
     expect(isDataRootMigrationConfirmDisabled({ preview: null, previewLoading: true, isBusy: false })).toBe(true)
     expect(blocked.selectedTarget).toBe('/Volumes/New/Proma')
     expect(isDataRootMigrationConfirmDisabled({ preview: blocked.preview, previewLoading: false, isBusy: false })).toBe(true)
+  })
+
+  test('Given 迁移启动失败 When 状态转换 Then 关闭旧预览并保留错误且允许重新选择', () => {
+    const {
+      createPathManagementUiState,
+      createPathManagementSettingsView,
+      DataRootLocationSection,
+      reducePathManagementUiState,
+      isDataRootMigrationConfirmDisabled,
+    } = getExpectedModule()
+    const previewed = reducePathManagementUiState(createPathManagementUiState(), {
+      type: 'preview-succeeded',
+      preview: createPreview(),
+    })
+
+    const failed = reducePathManagementUiState(previewed, {
+      type: 'migration-failed',
+      message: '无法创建迁移计划',
+    })
+
+    expect(failed).toMatchObject({
+      actionError: '无法创建迁移计划',
+      selectedTarget: null,
+      preview: null,
+      previewLoading: false,
+    })
+    const view = createPathManagementSettingsView(createState(), failed.loadError)
+    expect(view.migrationBlocked).toBe(false)
+    expect(isDataRootMigrationConfirmDisabled({
+      preview: failed.preview,
+      previewLoading: failed.previewLoading,
+      isBusy: false,
+    })).toBe(true)
+    const html = renderToStaticMarkup(
+      <DataRootLocationSection state={createState()} view={view} isBusy={false} onMigrate={() => undefined} />,
+    )
+    expect(html).toContain('迁移位置')
+    expect(html).not.toContain('disabled=""')
   })
 
   test('Given network 或 removable 数据根 When 生成风险 Then 显示断连或性能提醒', () => {
