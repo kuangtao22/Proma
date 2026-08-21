@@ -553,6 +553,16 @@ export function hasActiveAgentSessions(): boolean {
   return orchestrator.hasActiveSessions()
 }
 
+/** 是否仍有 Agent generation 可能写入数据根，供数据根迁移预检使用。 */
+export function hasActiveAgentDataWrites(): boolean {
+  return orchestrator.hasGenerationOwnedWrites()
+}
+
+/** 查询指定工作区是否仍有 Agent generation-owned 数据写。 */
+export function hasActiveAgentDataWritesForWorkspace(workspaceId: string): boolean {
+  return orchestrator.hasGenerationOwnedWritesForWorkspace(workspaceId)
+}
+
 /** 中止所有活跃的 Agent 会话（应用退出时调用） */
 export function stopAllAgents(): void {
   orchestrator.stopAll()

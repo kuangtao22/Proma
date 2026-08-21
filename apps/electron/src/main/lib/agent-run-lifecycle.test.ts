@@ -4,6 +4,7 @@ import {
   closeAgentQueryIterator,
   createAgentRunTerminalNotifier,
   hasInFlightGeneration,
+  hasGenerationOwnedWrites,
   hasRetainedGenerationTask,
   hasStoppedGeneration,
   isLatestRunGeneration,
@@ -327,23 +328,32 @@ describe('Agent 运行生命周期', () => {
     expect(latestGenerations.has('session-1')).toBe(false)
   })
 
-  test('Given generation1 前台运行已完成但标题仍未返回 When 检查 latest Then 标题任务结束前仍保留写权限', () => {
+  test('Given generation1 前台运行已完成但标题仍未返回 When 数据根迁移预检 Then 标题 settle 前保持数据写活跃', async () => {
     /** 当前仍在执行前台流程的代际。 */
     const inFlightGenerations = new Map<string, Set<number>>()
     /** 当前仍持有 generation 所有权的后台任务。 */
     const retainedTasks = new Map<string, Set<number>>()
     /** 会话最新启动代际。 */
     const latestGenerations = new Map<string, number>([['session-1', 1]])
+    /** 模拟前台 run 完成后仍未返回的标题请求。 */
+    const titleResult = createDeferred()
     markInFlightGeneration(inFlightGenerations, 'session-1', 1)
     retainGenerationTask(retainedTasks, 'session-1', 1)
+    /** 模拟生产标题 Promise 的 finally 所有权释放。 */
+    const titleTask = titleResult.promise.finally(() => {
+      releaseGenerationTask(retainedTasks, inFlightGenerations, latestGenerations, 'session-1', 1)
+    })
 
     releaseInFlightGeneration(inFlightGenerations, latestGenerations, 'session-1', 1, retainedTasks)
 
     expect(hasInFlightGeneration(inFlightGenerations, 'session-1')).toBe(false)
     expect(hasRetainedGenerationTask(retainedTasks, 'session-1')).toBe(true)
+    expect(hasGenerationOwnedWrites(inFlightGenerations, retainedTasks)).toBe(true)
     expect(isLatestRunGeneration(latestGenerations, 'session-1', 1)).toBe(true)
 
-    releaseGenerationTask(retainedTasks, inFlightGenerations, latestGenerations, 'session-1', 1)
+    titleResult.resolve()
+    await titleTask
+    expect(hasGenerationOwnedWrites(inFlightGenerations, retainedTasks)).toBe(false)
     expect(latestGenerations.has('session-1')).toBe(false)
   })
 
@@ -363,6 +373,7 @@ describe('Agent 运行生命周期', () => {
     expect(isLatestRunGeneration(latestGenerations, 'session-1', 1)).toBe(false)
 
     releaseGenerationTask(retainedTasks, inFlightGenerations, latestGenerations, 'session-1', 1)
+    expect(hasGenerationOwnedWrites(inFlightGenerations, retainedTasks)).toBe(true)
     expect(latestGenerations.get('session-1')).toBe(2)
   })
 })

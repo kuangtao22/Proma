@@ -57,6 +57,8 @@ export interface AgentProviderAdapter {
   query(input: AgentQueryInput): AsyncIterable<SDKMessage>
   /** 中止指定会话的执行 */
   abort(sessionId: string): void
+  /** 强制关闭指定查询，并在底层 runtime 与 iterator 上游队列完成收尾后 resolve。 */
+  forceCloseQuery(sessionId: string): Promise<void>
   /**
    * 软中断当前 turn，但保留活跃 Query/Channel 以便继续注入下一条用户消息。
    * 与 abort() 的区别：不杀子进程，允许立即续跑新消息。

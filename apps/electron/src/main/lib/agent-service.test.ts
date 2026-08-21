@@ -4,6 +4,20 @@ import { join } from 'node:path'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 
 describe('Agent service 迁移准入', () => {
+  test('Given 数据根迁移预检 When 检查 service 导出 Then 使用 generation-owned 写查询并提供 workspace 维度能力', () => {
+    /** 读取 service 源码约束迁移查询不退化为 UI 活跃状态。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    /** 读取 IPC 源码约束数据根迁移生产接线使用数据写查询。 */
+    const ipcSource = readFileSync(join(import.meta.dir, '../ipc.ts'), 'utf8')
+
+    expect(source).toContain('export function hasActiveAgentDataWrites(): boolean {')
+    expect(source).toContain('return orchestrator.hasGenerationOwnedWrites()')
+    expect(source).toContain('export function hasActiveAgentDataWritesForWorkspace(workspaceId: string): boolean {')
+    expect(source).toContain('return orchestrator.hasGenerationOwnedWritesForWorkspace(workspaceId)')
+    expect(ipcSource).toContain('hasActiveAgentDataWrites')
+    expect(ipcSource).toContain('hasActiveTasks: () => hasActiveAgentDataWrites() || hasRunningAutomations()')
+  })
+
   test('Given 会话权威工作区正在迁移 When 准备 service 运行副作用 Then 抛固定原因且不执行副作用', () => {
     /** 记录 service 在准入后才允许执行的副作用。 */
     const effects: string[] = []

@@ -174,6 +174,9 @@ interface ActivePiSession {
   ready: Promise<AgentSession>
   resolveReady: (session: AgentSession) => void
   rejectReady: (error: unknown) => void
+  closed: Promise<void>
+  resolveClosed: () => void
+  forceClosePromise?: Promise<void>
   abortRequested: boolean
   interrupting: boolean
   pendingInterruptPrompts: PendingInterruptPrompt[]
@@ -393,11 +396,19 @@ function createActivePiSession(): ActivePiSession {
     resolveReady = resolve
     rejectReady = reject
   })
+  /** session cleanup 完成时 resolve 的关闭 Promise。 */
+  let resolveClosed = (): void => undefined
+  /** adapter 强制关闭等待的 session cleanup 边界。 */
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve
+  })
   ready.catch(() => {})
   return {
     ready,
     resolveReady,
     rejectReady,
+    closed,
+    resolveClosed,
     abortRequested: false,
     interrupting: false,
     pendingInterruptPrompts: [],
@@ -1346,6 +1357,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
           this.activeSessions.delete(input.sessionId)
         }
       } finally {
+        active.resolveClosed()
         void closePiRequestProxyDispatcher(requestProxyDispatcher)
         requestProxyDispatcher = undefined
       }
@@ -1946,8 +1958,29 @@ export class PiAgentAdapter implements AgentProviderAdapter {
     active.abortRequested = true
     rejectPendingInterruptPrompts(active, createAbortError())
     if (!active.session) rejectActiveReady(active, createAbortError())
-    active.session?.abortCompaction()
-    active.session?.abort().catch(() => {})
+    try {
+      active.session?.abortCompaction()
+    } catch (error) {
+      console.warn(`[PiAgentAdapter] abort compaction failed: sessionId=${sessionId}`, error)
+    }
+    try {
+      active.session?.abort().catch((error) => {
+        console.warn(`[PiAgentAdapter] abort failed: sessionId=${sessionId}`, error)
+      })
+    } catch (error) {
+      console.warn(`[PiAgentAdapter] abort failed: sessionId=${sessionId}`, error)
+    }
+  }
+
+  /** 中止 in-process Pi session，并等待其 cleanupActiveSession 完成。 */
+  forceCloseQuery(sessionId: string): Promise<void> {
+    const active = this.activeSessions.get(sessionId)
+    if (!active) return Promise.resolve()
+    active.forceClosePromise ??= (async () => {
+      this.abort(sessionId)
+      await active.closed
+    })()
+    return active.forceClosePromise
   }
 
   async sendQueuedMessage(
@@ -2032,13 +2065,19 @@ export class PiAgentAdapter implements AgentProviderAdapter {
 
   dispose(): void {
     for (const active of this.activeSessions.values()) {
-      if (!active.disposed) {
-        active.disposed = true
-        rejectPendingInterruptPrompts(active, createAbortError())
-        active.pendingSkillActivations.clear()
-        active.session?.dispose()
+      try {
+        if (!active.disposed) {
+          active.disposed = true
+          rejectPendingInterruptPrompts(active, createAbortError())
+          active.pendingSkillActivations.clear()
+          active.session?.dispose()
+        }
+      } catch (error) {
+        console.warn('[PiAgentAdapter] dispose session failed:', error)
+      } finally {
+        rejectActiveReady(active, createAbortError())
+        active.resolveClosed()
       }
-      rejectActiveReady(active, createAbortError())
     }
     this.activeSessions.clear()
   }

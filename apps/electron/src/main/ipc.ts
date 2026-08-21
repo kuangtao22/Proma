@@ -284,7 +284,7 @@ import {
   searchAgentSessionMessages,
   searchAgentSessionReferences,
 } from './lib/agent-session-manager'
-import { agentEventBus, runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, hasActiveAgentSessions, queueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
+import { agentEventBus, runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import { getMainWindow as getStoredMainWindow } from './lib/main-window-store'
 import { getDefaultDataRootInstanceLeaseRegistry } from './lib/data-root-instance-lease'
@@ -1046,7 +1046,7 @@ export function registerIpcHandlers(): void {
     dialog,
     shell,
     getExpectedWebContents: () => getStoredMainWindow()?.webContents ?? null,
-    hasActiveTasks: () => hasActiveAgentSessions() || hasRunningAutomations(),
+    hasActiveTasks: () => hasActiveAgentDataWrites() || hasRunningAutomations(),
     hasOtherPromaInstance: () => dataRootInstanceLease.hasOtherActiveLease(),
     acquireMigrationGuard: () => dataRootInstanceLease.acquireMigrationGuard(),
   })

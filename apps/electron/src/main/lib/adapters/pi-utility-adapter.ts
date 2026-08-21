@@ -23,6 +23,8 @@ type PendingQuery = {
   accepted: boolean
   ended: boolean
   runtimeFailed: boolean
+  runtimeAbortPromise?: Promise<void>
+  forceClosePromise?: Promise<void>
 }
 
 type CapabilityRequest = {
@@ -83,29 +85,26 @@ export class PiUtilityAdapter {
       pending.ended = true
       unsubscribe()
       this.pendingQueries.delete(queryId)
-      if (pending.accepted && !pending.runtimeFailed) {
-        await client.call(
-          AGENT_RUNTIME_METHODS.QUERY_ABORT,
-          { queryId, sessionId: input.sessionId },
-          { queryId, timeoutMs: 5_000 },
-        ).catch(() => {})
+      if (pending.forceClosePromise) {
+        await pending.forceClosePromise
+      } else {
+        if (pending.accepted && !pending.runtimeFailed) await this.requestRuntimeAbort(pending)
+        await client.stop()
       }
-      await client.stop()
     }
   }
 
   abort(sessionId: string): void {
-    for (const pending of this.pendingQueries.values()) {
-      if (pending.sessionId !== sessionId) continue
-      void pending.client.call(
-        AGENT_RUNTIME_METHODS.QUERY_ABORT,
-        { queryId: pending.queryId, sessionId },
-        { queryId: pending.queryId, timeoutMs: 5_000 },
-      ).catch((error) => {
-        console.warn(`[PiUtilityAdapter] abort failed: sessionId=${sessionId}`, error)
-      })
-      return
-    }
+    const pending = this.findPending(sessionId)
+    if (!pending) return
+    void this.requestRuntimeAbort(pending)
+  }
+
+  /** 先结束 utility runtime 与事件队列，使调用方随后可等待 async generator cleanup。 */
+  forceCloseQuery(sessionId: string): Promise<void> {
+    const pending = this.findPending(sessionId)
+    if (!pending) return Promise.resolve()
+    return this.forceClosePendingQuery(pending)
   }
 
   async sendQueuedMessage(
@@ -136,11 +135,11 @@ export class PiUtilityAdapter {
 
   dispose(): void {
     for (const pending of this.pendingQueries.values()) {
-      pending.runtimeFailed = true
-      pending.queue.fail(new Error('Agent utility stopped'))
-      void pending.client.stop()
+      if (!pending.forceClosePromise) pending.runtimeFailed = true
+      void this.forceClosePendingQuery(pending).catch((error) => {
+        console.warn(`[PiUtilityAdapter] dispose failed: sessionId=${pending.sessionId}`, error)
+      })
     }
-    this.pendingQueries.clear()
     for (const { controller } of this.capabilityAbortControllers.values()) controller.abort()
     this.capabilityAbortControllers.clear()
   }
@@ -206,6 +205,35 @@ export class PiUtilityAdapter {
 
   private findPending(sessionId: string): PendingQuery | undefined {
     return Array.from(this.pendingQueries.values()).find((item) => item.sessionId === sessionId)
+  }
+
+  /** 复用单个 runtime abort 请求，避免 stop 与 drain timeout 重复终止同一 query。 */
+  private requestRuntimeAbort(pending: PendingQuery): Promise<void> {
+    if (pending.runtimeFailed) return Promise.resolve()
+    pending.runtimeAbortPromise ??= pending.client.call(
+      AGENT_RUNTIME_METHODS.QUERY_ABORT,
+      { queryId: pending.queryId, sessionId: pending.sessionId },
+      { queryId: pending.queryId, timeoutMs: 5_000 },
+    ).then(() => undefined).catch((error) => {
+      console.warn(`[PiUtilityAdapter] abort failed: sessionId=${pending.sessionId}`, error)
+    })
+    return pending.runtimeAbortPromise
+  }
+
+  /** 结束 pending next 的队列并等待 utility runtime 真正停止；并发调用共享同一 Promise。 */
+  private forceClosePendingQuery(pending: PendingQuery): Promise<void> {
+    if (pending.forceClosePromise) return pending.forceClosePromise
+    pending.forceClosePromise = (async () => {
+      try {
+        if (pending.accepted && !pending.runtimeFailed) await this.requestRuntimeAbort(pending)
+      } finally {
+        pending.queue.end()
+      }
+      await pending.client.stop()
+    })()
+    // dispose 是同步入口；为共享 Promise 预装拒绝消费者，调用方仍可 await 原 Promise 得到失败。
+    pending.forceClosePromise.catch(() => {})
+    return pending.forceClosePromise
   }
 
   private handleRuntimeEvent(event: AgentRuntimeEvent): void {

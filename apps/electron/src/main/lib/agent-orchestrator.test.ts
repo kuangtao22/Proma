@@ -312,5 +312,45 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(sendBody).toContain('.finally(() => {')
     expect(sendBody).toContain('releaseGenerationTask(')
     expect(sendBody.match(/await closeAgentQueryIterator\(/g)?.length ?? 0).toBe(2)
+    expect(sendBody).toContain('await this.adapter.forceCloseQuery(sessionId)')
+  })
+
+  test('Given 标题仍可能写入数据根 When 检查迁移查询 Then 数据写活跃与 UI 运行态保持独立', () => {
+    /** 读取真实编排源码，约束迁移查询覆盖前台运行和 retained 标题任务。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** UI 活跃查询函数体。 */
+    const activeStart = source.indexOf('  hasActiveSessions(): boolean {')
+    const activeEnd = source.indexOf('\n  /**', activeStart + 1)
+    const activeBody = source.slice(activeStart, activeEnd)
+    /** 数据写活跃查询函数体。 */
+    const writesStart = source.indexOf('  hasGenerationOwnedWrites(): boolean {')
+    const writesEnd = source.indexOf('\n  /**', writesStart + 1)
+    const writesBody = source.slice(writesStart, writesEnd)
+    /** 按工作区查询函数体。 */
+    const workspaceStart = source.indexOf('  hasGenerationOwnedWritesForWorkspace(workspaceId: string): boolean {')
+    const workspaceEnd = source.indexOf('\n  /**', workspaceStart + 1)
+    const workspaceBody = source.slice(workspaceStart, workspaceEnd)
+
+    expect(activeBody).toContain('this.inFlightRunGenerations.size > 0')
+    expect(activeBody).not.toContain('retainedGenerationTasks')
+    expect(writesBody).toContain('hasGenerationOwnedWrites(')
+    expect(workspaceBody).toContain('this.retainedGenerationTasks.keys()')
+    expect(workspaceBody).toContain('getAgentSessionMeta(sessionId)?.workspaceId === workspaceId')
+  })
+
+  test('Given adapter 强制关闭合同 When 检查两种 Pi runtime Then 都提供可等待且并发复用的关闭 Promise', () => {
+    /** 共享 provider 合同。 */
+    const providerSource = readFileSync(join(import.meta.dir, '../../../../../packages/shared/src/types/agent-provider.ts'), 'utf8')
+    /** in-process Pi adapter 实现。 */
+    const inProcessSource = readFileSync(join(import.meta.dir, 'adapters/pi-agent-adapter.ts'), 'utf8')
+    /** utility Pi adapter 实现。 */
+    const utilitySource = readFileSync(join(import.meta.dir, 'adapters/pi-utility-adapter.ts'), 'utf8')
+
+    expect(providerSource).toContain('forceCloseQuery(sessionId: string): Promise<void>')
+    expect(inProcessSource).toContain('active.forceClosePromise ??=')
+    expect(inProcessSource).toContain('await active.closed')
+    expect(utilitySource).toContain('if (pending.forceClosePromise) return pending.forceClosePromise')
+    expect(utilitySource).toContain('pending.queue.end()')
+    expect(utilitySource).toContain('await pending.client.stop()')
   })
 })

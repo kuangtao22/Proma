@@ -180,6 +180,14 @@ export function hasRetainedGenerationTask(
   return (generationsBySession.get(sessionId)?.size ?? 0) > 0
 }
 
+/** 判断是否仍有前台运行或后台 generation-owned 任务可能写入业务数据。 */
+export function hasGenerationOwnedWrites(
+  inFlightGenerationsBySession: Map<string, Set<number>>,
+  retainedTasksBySession: Map<string, Set<number>>,
+): boolean {
+  return inFlightGenerationsBySession.size > 0 || retainedTasksBySession.size > 0
+}
+
 /**
  * 释放已经完全退出的运行代际。
  * 仅当会话最后一个 in-flight 代际退出时清理 latest，避免旧代际重新获得写权限。

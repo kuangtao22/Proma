@@ -82,6 +82,7 @@ import {
   closeAgentQueryIterator,
   consumeStoppedGeneration,
   createAgentRunTerminalNotifier,
+  hasGenerationOwnedWrites,
   hasInFlightGeneration,
   hasStoppedGeneration,
   isLatestRunGeneration,
@@ -1758,6 +1759,9 @@ export class AgentOrchestrator {
               console.warn(`[Agent 编排] drain timeout: SDK iterator 在 result 后 ${RESULT_DRAIN_TIMEOUT_MS}ms 内未关闭，强制退出`)
               pendingNext?.catch(() => {})
               pendingNext = null
+              await this.adapter.forceCloseQuery(sessionId).catch((error) => {
+                console.error('[Agent 编排] drain timeout 强制关闭 Agent runtime 失败:', error)
+              })
               await closeAgentQueryIterator(queryIterator, (error) => {
                 console.error('[Agent 编排] drain timeout 后关闭 SDK iterator 失败:', error)
               })
@@ -1769,6 +1773,9 @@ export class AgentOrchestrator {
 
             if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) {
               pendingNext = null
+              await this.adapter.forceCloseQuery(sessionId).catch((error) => {
+                console.error('[Agent 编排] stale generation 强制关闭 Agent runtime 失败:', error)
+              })
               await closeAgentQueryIterator(queryIterator, (error) => {
                 console.error('[Agent 编排] stale generation 关闭 SDK iterator 失败:', error)
               })
@@ -2317,6 +2324,24 @@ export class AgentOrchestrator {
   /** 是否存在任意运行中 Agent（含后台运行与外部触发的会话）。 */
   hasActiveSessions(): boolean {
     return this.inFlightRunGenerations.size > 0
+  }
+
+  /** 是否仍有 Agent generation 可能写入数据根，供全局迁移预检使用。 */
+  hasGenerationOwnedWrites(): boolean {
+    return hasGenerationOwnedWrites(this.inFlightRunGenerations, this.retainedGenerationTasks)
+  }
+
+  /** 查询指定工作区是否仍有前台运行或标题等后台任务可能写入。 */
+  hasGenerationOwnedWritesForWorkspace(workspaceId: string): boolean {
+    /** 所有仍持有数据写权限的会话。 */
+    const sessionIds = new Set([
+      ...this.inFlightRunGenerations.keys(),
+      ...this.retainedGenerationTasks.keys(),
+    ])
+    for (const sessionId of sessionIds) {
+      if (getAgentSessionMeta(sessionId)?.workspaceId === workspaceId) return true
+    }
+    return false
   }
 
   /** 同一个真实本地项目根只能由一个运行中会话执行文件回退。 */
