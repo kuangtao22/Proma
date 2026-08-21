@@ -204,4 +204,19 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(stopAllBody).toContain('this.stoppedBySessions.clear()')
     expect(stopAllBody).toContain('this.latestRunGenerations.clear()')
   })
+
+  test('Given 异步 preflight 在 stop 后 reject When 检查 lifecycle 接入 Then 按 generation marker 判断 stopped', () => {
+    /** 读取真实编排源码，防止用 active 缺失冒充用户停止。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** 截取 lifecycle 依赖对象。 */
+    const lifecycleStart = source.indexOf('await runAgentLifecycle({')
+    const lifecycleEnd = source.indexOf('}, async (checkpoint) => {', lifecycleStart)
+    const lifecycleDependencies = source.slice(lifecycleStart, lifecycleEnd)
+
+    expect(source).toContain('hasStoppedGeneration')
+    expect(lifecycleDependencies).toContain(
+      'isStopped: () => hasStoppedGeneration(this.stoppedBySessions, sessionId, runGeneration)',
+    )
+    expect(lifecycleDependencies).not.toContain('isStopped: () => !')
+  })
 })

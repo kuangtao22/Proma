@@ -2,6 +2,8 @@
 export interface AgentRunLifecycleDependencies {
   /** 当前请求是否仍持有自己的运行代际。 */
   isCurrent: () => boolean
+  /** 当前请求的运行代际是否已被用户停止。 */
+  isStopped: () => boolean
   /** 仅释放当前请求仍持有的运行代际。 */
   release: () => void
   /** 当前代际已被停止时完成尚未启动 adapter 的请求。 */
@@ -39,6 +41,15 @@ export function consumeStoppedGeneration(
   return true
 }
 
+/** 判断会话中的指定运行代际是否已被用户停止。 */
+export function hasStoppedGeneration(
+  markers: Map<string, Set<number>>,
+  sessionId: string,
+  generation: number,
+): boolean {
+  return markers.get(sessionId)?.has(generation) === true
+}
+
 /** 判断指定运行代际是否仍是会话最新启动的代际。 */
 export function isLatestRunGeneration(
   latestGenerations: Map<string, number>,
@@ -64,7 +75,7 @@ export async function runAgentLifecycle(
   try {
     await execute(checkpoint)
   } catch (error) {
-    if (error === AGENT_RUN_STOPPED) {
+    if (error === AGENT_RUN_STOPPED || dependencies.isStopped()) {
       dependencies.onStopped()
       return
     }

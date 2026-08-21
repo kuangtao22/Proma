@@ -80,6 +80,7 @@ import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 import {
   consumeStoppedGeneration,
+  hasStoppedGeneration,
   isLatestRunGeneration,
   markStoppedGeneration,
   runAgentLifecycle,
@@ -749,6 +750,7 @@ export class AgentOrchestrator {
 
     await runAgentLifecycle({
       isCurrent: () => this.activeSessions.get(sessionId) === runGeneration,
+      isStopped: () => hasStoppedGeneration(this.stoppedBySessions, sessionId, runGeneration),
       release: releaseActiveRun,
       onStopped: () => {
         this.consumeStoppedByUser(sessionId, runGeneration)

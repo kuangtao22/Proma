@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   consumeStoppedGeneration,
+  hasStoppedGeneration,
   isLatestRunGeneration,
   markStoppedGeneration,
   runAgentLifecycle,
@@ -8,13 +9,18 @@ import {
 import { createWorkspaceOperationRegistry } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 
-/** 创建可控 Promise 及其完成函数。 */
-function createDeferred(): { promise: Promise<void>; resolve: () => void } {
+/** 创建可控 Promise 及其完成、拒绝函数。 */
+function createDeferred(): { promise: Promise<void>; resolve: () => void; reject: (error: Error) => void } {
   /** 完成当前异步边界的函数。 */
   let resolve = (): void => undefined
+  /** 拒绝当前异步边界的函数。 */
+  let reject = (_error: Error): void => undefined
   /** 保持未决直到测试显式完成的 Promise。 */
-  const promise = new Promise<void>((complete) => { resolve = complete })
-  return { promise, resolve }
+  const promise = new Promise<void>((complete, fail) => {
+    resolve = complete
+    reject = fail
+  })
+  return { promise, resolve, reject }
 }
 
 describe('Agent 运行生命周期', () => {
@@ -30,6 +36,7 @@ describe('Agent 运行生命周期', () => {
     /** 由 lifecycle 完整包裹 OAuth preflight 与 adapter 启动。 */
     const running = runAgentLifecycle({
       isCurrent: () => activeGeneration === 1,
+      isStopped: () => false,
       release: () => {
         if (activeGeneration === 1) activeGeneration = undefined
       },
@@ -67,6 +74,7 @@ describe('Agent 运行生命周期', () => {
     /** 运行会抛错的异步 preflight。 */
     const running = runAgentLifecycle({
       isCurrent: () => activeGeneration === 1,
+      isStopped: () => false,
       release: () => {
         if (activeGeneration === 1) activeGeneration = undefined
       },
@@ -77,6 +85,79 @@ describe('Agent 运行生命周期', () => {
 
     await expect(running).rejects.toBe(proxyError)
     expect(activeGeneration).toBeUndefined()
+  })
+
+  test('Given stop marker 已设置且异步 preflight reject When lifecycle 捕获 Then 完成 stopped 且不启动 adapter', async () => {
+    /** 模拟 activeSessions 中当前会话的运行代际。 */
+    let activeGeneration: number | undefined = 1
+    /** 模拟 stop 后才 reject 的异步 preflight。 */
+    const preflight = createDeferred()
+    /** 当前尚未被旧 run 消费的停止代际。 */
+    const stoppedGenerations = new Map<string, Set<number>>()
+    /** 记录 adapter 是否被错误启动。 */
+    let adapterStarts = 0
+    /** 记录 stopped 完成回调次数。 */
+    let stoppedCompletions = 0
+    /** 记录 lifecycle release 次数。 */
+    let releases = 0
+    /** 包含新 isStopped 查询的 lifecycle 依赖。 */
+    const dependencies = {
+      isCurrent: () => activeGeneration === 1,
+      isStopped: () => hasStoppedGeneration(stoppedGenerations, 'session-1', 1),
+      release: () => {
+        releases += 1
+        if (activeGeneration === 1) activeGeneration = undefined
+      },
+      onStopped: () => {
+        stoppedCompletions += 1
+        consumeStoppedGeneration(stoppedGenerations, 'session-1', 1)
+      },
+    }
+    /** lifecycle 正在等待异步 preflight。 */
+    const running = runAgentLifecycle(dependencies, async () => {
+      await preflight.promise
+      adapterStarts += 1
+    })
+
+    activeGeneration = undefined
+    markStoppedGeneration(stoppedGenerations, 'session-1', 1)
+    preflight.reject(new Error('proxy failed after stop'))
+
+    await expect(running).resolves.toBeUndefined()
+    expect(adapterStarts).toBe(0)
+    expect(stoppedCompletions).toBe(1)
+    expect(releases).toBe(1)
+    expect(stoppedGenerations.has('session-1')).toBe(false)
+  })
+
+  test('Given 正常 complete 已释放 active 且无 stop marker When callback 抛错 Then 不误判 stopped 或双回调', async () => {
+    /** 模拟 activeSessions 中当前会话的运行代际。 */
+    let activeGeneration: number | undefined = 1
+    /** 模拟正常 complete callback 抛出的异常。 */
+    const callbackError = new Error('complete callback failed')
+    /** 记录正常完成回调尝试次数。 */
+    let completionAttempts = 0
+    /** 记录 stopped 回调次数。 */
+    let stoppedCompletions = 0
+    /** 包含无 stop marker 查询的 lifecycle 依赖。 */
+    const dependencies = {
+      isCurrent: () => activeGeneration === 1,
+      isStopped: () => false,
+      release: () => {
+        if (activeGeneration === 1) activeGeneration = undefined
+      },
+      onStopped: () => { stoppedCompletions += 1 },
+    }
+    /** 模拟 completeRun 先释放 active，再执行可能抛错的 callback。 */
+    const running = runAgentLifecycle(dependencies, async () => {
+      activeGeneration = undefined
+      completionAttempts += 1
+      throw callbackError
+    })
+
+    await expect(running).rejects.toBe(callbackError)
+    expect(completionAttempts).toBe(1)
+    expect(stoppedCompletions).toBe(0)
   })
 
   test('Given onRunStarted 时项目进入迁移 When service guard 抛错 Then 不启动 adapter 且释放 active generation', async () => {
@@ -93,6 +174,7 @@ describe('Agent 运行生命周期', () => {
 
     const running = runAgentLifecycle({
       isCurrent: () => activeGeneration === 1,
+      isStopped: () => false,
       release: () => {
         if (activeGeneration === 1) activeGeneration = undefined
       },
