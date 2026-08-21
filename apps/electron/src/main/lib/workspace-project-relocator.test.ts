@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { AgentSessionMeta, AgentWorkspace, DataRootMigrationProgress, WorktreeInfo } from '@proma/shared'
@@ -475,12 +475,14 @@ describe('WorkspaceProjectRelocator', () => {
     const events: string[] = []
     const relocator = createRelocator({
       ensureJournalDirectory: (directoryPath) => {
-        ensureDirectoryDurable(directoryPath)
+        const durability = ensureDirectoryDurable(directoryPath)
         events.push('directory-durable')
+        return durability
       },
       writeJournalFile: (filePath, data) => {
-        writeJsonFileAtomicSecure(filePath, data)
+        const durability = writeJsonFileAtomicSecure(filePath, data)
         events.push('journal-durable')
+        return durability
       },
       copyDirectory: async () => {
         events.push('copier')
@@ -501,6 +503,35 @@ describe('WorkspaceProjectRelocator', () => {
 
     await expect(relocator.run({ workspaceId: workspace.id, targetRoot })).rejects.toThrow('journal fsync failed')
     expect(copyCalls).toBe(0)
+  })
+
+  test('Given Windows journal 边界只能达到 file-only When 迁移完成 Then 不因 capability 降级失败或重建 journal', async () => {
+    /** 记录 relocator 对目录、写入和删除 durability 结果的消费顺序。 */
+    const durabilityEvents: string[] = []
+    const relocator = createRelocator({
+      ensureJournalDirectory: (directoryPath) => {
+        mkdirSync(directoryPath, { recursive: true })
+        durabilityEvents.push('directory:file-only')
+        return 'file-only'
+      },
+      writeJournalFile: (filePath, data) => {
+        writeFileSync(filePath, JSON.stringify(data), 'utf8')
+        durabilityEvents.push('write:file-only')
+        return 'file-only'
+      },
+      removeJournalFile: (filePath) => {
+        if (existsSync(filePath)) unlinkSync(filePath)
+        durabilityEvents.push('remove:file-only')
+        return 'file-only'
+      },
+    })
+
+    await expect(relocator.run({ workspaceId: workspace.id, targetRoot }))
+      .resolves.toMatchObject({ stage: 'completed' })
+
+    expect(durabilityEvents.slice(0, 2)).toEqual(['directory:file-only', 'write:file-only'])
+    expect(durabilityEvents.filter((event) => event === 'remove:file-only')).toHaveLength(3)
+    expect(relocator.getStatus(workspace.id)).toBeNull()
   })
 
   test('Given 源目录只读但可读取和进入 When 运行迁移 Then 不要求源写权限', async () => {

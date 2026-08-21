@@ -11,6 +11,7 @@ import type {
 } from '@proma/shared'
 import { inspectDataRootVolume, scanDataRootBytes, type DataRootVolumeSnapshot } from './data-root-storage'
 import { ensureDirectoryDurable, removeFileAtomic, readJsonFileSafe, writeJsonFileAtomicSecure } from './safe-file'
+import type { DurabilityResult } from './safe-file'
 import {
   copyDirectoryVerified,
   finalizeDirectoryCopy,
@@ -126,9 +127,11 @@ export interface WorkspaceProjectRelocatorOptions {
   /** 生成不可预测迁移 ID。 */
   createOperationId?: () => string
   /** 持久创建 journal 目录的窄测试边界。 */
-  ensureJournalDirectory?: (directoryPath: string) => void
+  ensureJournalDirectory?: (directoryPath: string) => DurabilityResult
   /** 持久写入 journal 的窄测试边界。 */
-  writeJournalFile?: (filePath: string, data: object) => void
+  writeJournalFile?: (filePath: string, data: object) => DurabilityResult
+  /** 持久删除 journal 的窄测试边界。 */
+  removeJournalFile?: (filePath: string) => DurabilityResult
 }
 
 /** 单次预检内部允许的恢复上下文。 */
@@ -157,9 +160,11 @@ export class WorkspaceProjectRelocator {
   /** operationId 生成器。 */
   private readonly createOperationId: () => string
   /** 首次 journal 写入前持久创建目录。 */
-  private readonly ensureJournalDirectory: (directoryPath: string) => void
+  private readonly ensureJournalDirectory: (directoryPath: string) => DurabilityResult
   /** 每次阶段推进使用的 durable journal 写入。 */
-  private readonly writeJournalFile: (filePath: string, data: object) => void
+  private readonly writeJournalFile: (filePath: string, data: object) => DurabilityResult
+  /** 完成提交后使用的 durable journal 删除。 */
+  private readonly removeJournalFile: (filePath: string) => DurabilityResult
 
   constructor(private readonly options: WorkspaceProjectRelocatorOptions) {
     this.copyDirectory = options.copyDirectory ?? copyDirectoryVerified
@@ -173,6 +178,7 @@ export class WorkspaceProjectRelocator {
     this.createOperationId = options.createOperationId ?? randomUUID
     this.ensureJournalDirectory = options.ensureJournalDirectory ?? ensureDirectoryDurable
     this.writeJournalFile = options.writeJournalFile ?? writeJsonFileAtomicSecure
+    this.removeJournalFile = options.removeJournalFile ?? removeFileAtomic
   }
 
   /** 只读执行完整迁移预检，不创建 journal 或目标数据。 */
@@ -598,8 +604,8 @@ export class WorkspaceProjectRelocator {
     if (!isWorkspaceRelocationJournal(journal)) throw new Error('拒绝写入无效项目迁移 journal')
     /** 首次写入前只创建稳定容器目录。 */
     const journalDirectory = this.getJournalDirectory()
-    this.ensureJournalDirectory(journalDirectory)
-    this.writeJournalFile(join(journalDirectory, `${journal.operationId}.json`), journal)
+    acknowledgeJournalDurability(this.ensureJournalDirectory(journalDirectory))
+    acknowledgeJournalDurability(this.writeJournalFile(join(journalDirectory, `${journal.operationId}.json`), journal))
   }
 
   /** 安全删除 journal 主文件和原子恢复候选。 */
@@ -608,7 +614,7 @@ export class WorkspaceProjectRelocator {
     /** journal 主路径。 */
     const journalPath = join(this.getJournalDirectory(), `${operationId}.json`)
     for (const candidatePath of [journalPath, `${journalPath}.tmp`, `${journalPath}.bak`]) {
-      removeFileAtomic(candidatePath)
+      acknowledgeJournalDurability(this.removeJournalFile(candidatePath))
     }
   }
 
@@ -619,6 +625,12 @@ export class WorkspaceProjectRelocator {
     if (!isAbsolute(configDir) || resolve(configDir) !== configDir) throw new Error('活动数据根路径无效')
     return join(configDir, JOURNAL_DIRECTORY_NAME)
   }
+}
+
+/** 显式接受平台实际达到的 journal durability，拒绝未知注入结果。 */
+function acknowledgeJournalDurability(result: DurabilityResult): void {
+  if (result === 'directory' || result === 'file-only') return
+  throw new Error('项目迁移 journal durability 结果无效')
 }
 
 /** 将内部权威快照转换为 renderer 可见的稳定预检合同。 */

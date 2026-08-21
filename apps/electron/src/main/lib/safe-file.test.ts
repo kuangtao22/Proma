@@ -14,7 +14,14 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ensureDirectoryDurable, readJsonFileSafe, removeFileAtomic, writeJsonFileAtomicSecure } from './safe-file'
+import {
+  ensureDirectoryDurable,
+  readJsonFileSafe,
+  removeFileAtomic,
+  writeJsonFileAtomic,
+  writeJsonFileAtomicSecure,
+  writeTextFileAtomic,
+} from './safe-file'
 
 /** safe-file validator 测试使用的最小 schema。 */
 interface VersionedValue {
@@ -37,6 +44,68 @@ function isVersionedValue(value: unknown): value is VersionedValue {
     && 'value' in value
     && typeof value.value === 'string'
 }
+
+/** 构造带 Node 文件系统错误字段的稳定测试错误。 */
+function createFileSystemError(code: string, syscall: string): Error & { code: string; syscall: string } {
+  return Object.assign(new Error(`${syscall} ${code}`), { code, syscall })
+}
+
+describe('Windows durability capability', () => {
+  test('Given 普通 JSON 原子写已 rename 且 Windows 不支持目录 open When 返回 Then 文件已 fsync 且报告 file-only', () => {
+    /** 隔离 Windows capability 合同的目标文件。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-json-win-durability-'))
+    const filePath = join(tempDir, 'state.json')
+    let syncedFilePath = ''
+    try {
+      const result = writeJsonFileAtomic(filePath, { value: 'saved' }, false, {
+        platform: 'win32',
+        syncFile: (currentPath) => { syncedFilePath = currentPath },
+        syncDirectory: () => { throw createFileSystemError('EPERM', 'open') },
+      })
+
+      expect(result).toBe('file-only')
+      expect(syncedFilePath).toBe(filePath)
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ value: 'saved' })
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 普通文本原子写已 rename 且 Windows 不支持目录 open When 返回 Then 内容保留且报告 file-only', () => {
+    /** 隔离文本原子写的 Windows capability 合同。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-text-win-durability-'))
+    const filePath = join(tempDir, 'session.jsonl')
+    let fileSyncCalls = 0
+    try {
+      const result = writeTextFileAtomic(filePath, 'saved\n', {
+        platform: 'win32',
+        syncFile: () => { fileSyncCalls += 1 },
+        syncDirectory: () => { throw createFileSystemError('EPERM', 'open') },
+      })
+
+      expect(result).toBe('file-only')
+      expect(fileSyncCalls).toBe(1)
+      expect(readFileSync(filePath, 'utf8')).toBe('saved\n')
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given Windows 安全写遇到非 capability EPERM When 提交后同步 Then 仍向上传播真实 I/O 错误', () => {
+    /** 非目录 open 阶段的 EPERM 不得被泛化吞掉。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-win-io-error-'))
+    const filePath = join(tempDir, 'journal.json')
+    try {
+      expect(() => writeJsonFileAtomicSecure(filePath, { stage: 'copying' }, {
+        platform: 'win32',
+        syncFile: () => {},
+        syncDirectory: () => { throw createFileSystemError('EPERM', 'fsync') },
+      })).toThrow('fsync EPERM')
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('readJsonFileSafe validator', () => {
   /** 每个用例隔离使用的临时目录。 */
@@ -155,6 +224,24 @@ describe('readJsonFileSafe validator', () => {
     expect(caughtError).toBeInstanceOf(Error)
     expect(statSync(filePath).isDirectory()).toBe(true)
     expect(readFileSync(`${filePath}.tmp`, 'utf-8')).toBe(tmpContent)
+  })
+
+  test('Given Windows 有效 tmp 提升成功但不支持目录 open When 读取 Then 返回恢复值且不在 rename 后失败', () => {
+    /** 模拟上次崩溃留下的有效临时索引。 */
+    const tmpValue: VersionedValue = { version: 1, value: 'temporary' }
+    writeFileSync(`${filePath}.tmp`, JSON.stringify(tmpValue), 'utf8')
+    let fileSyncCalls = 0
+
+    const result = readJsonFileSafe(filePath, {
+      validate: isVersionedValue,
+      platform: 'win32',
+      syncFile: () => { fileSyncCalls += 1 },
+      syncDirectory: () => { throw createFileSystemError('EPERM', 'open') },
+    })
+
+    expect(result).toEqual(tmpValue)
+    expect(fileSyncCalls).toBe(1)
+    expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual(tmpValue)
   })
 
   test('Given valid backup JSON and a deterministic atomic restore failure When reading Then it throws', () => {
@@ -309,6 +396,23 @@ describe('ensureDirectoryDurable', () => {
       rmSync(tempDir, { recursive: true, force: true })
     }
   })
+
+  test('Given Windows 首次创建 journal 目录但不支持目录 open When 返回 Then 不回滚目录并报告 file-only', () => {
+    /** Windows 无目录 fsync 能力时仍需保留已创建目录。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-durable-directory-win-'))
+    const directoryPath = join(tempDir, 'workspace-relocations')
+    try {
+      const result = ensureDirectoryDurable(directoryPath, {
+        platform: 'win32',
+        syncDirectory: () => { throw createFileSystemError('EPERM', 'open') },
+      })
+
+      expect(result).toBe('file-only')
+      expect(statSync(directoryPath).isDirectory()).toBe(true)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('removeFileAtomic', () => {
@@ -408,6 +512,86 @@ describe('removeFileAtomic', () => {
       })
 
       expect(syncStates).toEqual(['renamed', 'unlinked'])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given Windows journal 删除已提交但不支持目录 open When 返回 Then 不重建文件并报告 file-only', () => {
+    /** Windows 删除边界必须把目录能力不足与真实删除失败区分。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-win-'))
+    const filePath = join(tempDir, 'journal.json')
+    let fileSyncCalls = 0
+    writeFileSync(filePath, '{}', 'utf8')
+    try {
+      const result = removeFileAtomic(filePath, {
+        platform: 'win32',
+        syncFile: () => { fileSyncCalls += 1 },
+        syncDirectory: () => { throw createFileSystemError('EPERM', 'open') },
+      })
+
+      expect(result).toBe('file-only')
+      expect(fileSyncCalls).toBe(1)
+      expect(existsSync(filePath)).toBe(false)
+      expect(readFileNames(tempDir)).toEqual([])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given A 删除已 rename 且仍 active When B 同目录删除 Then B 不回收 A tombstone', () => {
+    /** 两个同目录删除用于稳定制造同步交错。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-interleaved-'))
+    const firstPath = join(tempDir, 'first.json')
+    const secondPath = join(tempDir, 'second.json')
+    let activeTombstonePath = ''
+    writeFileSync(firstPath, 'first', 'utf8')
+    writeFileSync(secondPath, 'second', 'utf8')
+    try {
+      expect(() => removeFileAtomic(firstPath, {
+        afterRenameBeforeVerify: (tombstonePath) => {
+          activeTombstonePath = tombstonePath
+          removeFileAtomic(secondPath)
+          expect(readFileSync(activeTombstonePath, 'utf8')).toBe('first')
+        },
+      })).not.toThrow()
+
+      expect(existsSync(firstPath)).toBe(false)
+      expect(existsSync(secondPath)).toBe(false)
+      expect(readFileNames(tempDir)).toEqual([])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 其他进程 tombstone owner 仍存活 When 回收 Then 跳过；owner 明确消失后才删除', () => {
+    /** 人工构造另一个进程遗留的协议 tombstone。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-cross-process-'))
+    const sourcePath = join(tempDir, 'source.json')
+    const missingPath = join(tempDir, 'missing.json')
+    const ownerProcessId = 424242
+    writeFileSync(sourcePath, 'owned', 'utf8')
+    const sourceStat = statSync(sourcePath)
+    const tombstonePath = join(
+      tempDir,
+      `.proma-delete-${ownerProcessId}-${sourceStat.dev}-${sourceStat.ino}-00000000-0000-4000-8000-000000000001.tombstone`,
+    )
+    renameSync(sourcePath, tombstonePath)
+    let processChecks = 0
+    try {
+      removeFileAtomic(missingPath, {
+        isProcessAlive: (processId) => {
+          processChecks += 1
+          expect(processId).toBe(ownerProcessId)
+          return true
+        },
+      })
+
+      expect(processChecks).toBe(1)
+      expect(readFileSync(tombstonePath, 'utf8')).toBe('owned')
+
+      removeFileAtomic(missingPath, { isProcessAlive: () => false })
+      expect(existsSync(tombstonePath)).toBe(false)
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }

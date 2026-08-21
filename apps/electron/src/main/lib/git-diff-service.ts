@@ -1068,7 +1068,7 @@ function findGitCandidatesDownStrict(directoryPath: string, state: StrictGitDisc
 }
 
 /**
- * 严格发现项目自身及其三层子目录内的全部 Git 根。
+ * 在有限条目预算内严格发现项目自身及全部实际子目录中的 Git 根。
  * 普通非 Git 结果允许继续向下扫描；其他 Git 命令和文件系统错误全部 fail closed。
  */
 async function findAllGitRootsStrict(

@@ -27,7 +27,7 @@ import type { Stats } from 'node:fs'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 
 /** 安全 JSON 读取的可选 schema 校验配置。 */
-export interface ReadJsonFileSafeOptions<T> {
+export interface ReadJsonFileSafeOptions<T> extends DurabilitySyncOptions {
   /** 判断解析结果是否符合调用方要求的运行时 schema。 */
   validate?: (value: unknown) => value is T
 }
@@ -40,29 +40,44 @@ export interface ReadJsonFileStrictOptions<T> {
   description: string
 }
 
+/** 原子文件边界实际达到的持久化等级。 */
+export type DurabilityResult = 'directory' | 'file-only'
+
+/** 跨原子写、目录创建和删除复用的持久化依赖。 */
+interface DurabilitySyncOptions {
+  /** 目标运行平台；生产默认使用当前 Node 平台。 */
+  platform?: NodeJS.Platform
+  /** 同步目录项；测试可注入平台 capability 错误。 */
+  syncDirectory?: (directoryPath: string) => void
+  /** rename 后同步已提交文件；Windows 生产默认重新打开文件并 fsync。 */
+  syncFile?: (filePath: string) => void
+  /** 目录 fsync 不受支持时的中文降级提示。 */
+  warnReducedDurability?: (message: string) => void
+}
+
+/** 普通 JSON/text 原子写的可选持久化依赖。 */
+export interface AtomicWriteOptions extends DurabilitySyncOptions {}
+
 /** no-follow 原子 JSON 写入的故障注入配置。 */
-export interface SecureAtomicJsonWriteOptions {
+export interface SecureAtomicJsonWriteOptions extends DurabilitySyncOptions {
   /** 临时文件完成 fsync/close 后、最终身份复验前调用，仅供竞态回归测试。 */
   beforeRename?: (tempPath: string) => void
-  /** rename 后同步父目录；生产默认执行真实目录 fsync。 */
-  syncDirectory?: (directoryPath: string) => void
 }
 
 /** 原子删除普通文件时允许替换的窄测试依赖。 */
-export interface AtomicFileRemoveOptions {
+export interface AtomicFileRemoveOptions extends DurabilitySyncOptions {
   /** rename 完成后、身份复验前调用，仅供稳定覆盖置换竞态。 */
   afterRenameBeforeVerify?: (tombstonePath: string) => void
   /** rename 已提交后清理 tombstone；生产默认使用 unlinkSync。 */
   unlinkTombstone?: (tombstonePath: string) => void
-  /** 每次目录项变更后同步父目录；生产默认执行真实目录 fsync。 */
-  syncDirectory?: (directoryPath: string) => void
+  /** 判断其他进程 PID 是否仍存在；生产默认使用 signal 0。 */
+  isProcessAlive?: (processId: number) => boolean
+  /** 当前 tombstone owner PID；生产默认使用当前进程。 */
+  processId?: number
 }
 
 /** 持久创建目录时允许替换的窄测试依赖。 */
-export interface DurableDirectoryOptions {
-  /** 创建目录后同步父目录和新目录；生产默认执行真实目录 fsync。 */
-  syncDirectory?: (directoryPath: string) => void
-}
+export interface DurableDirectoryOptions extends DurabilitySyncOptions {}
 
 /** 需要跨检查保持不变的文件系统对象身份。 */
 interface FileSystemIdentity {
@@ -76,7 +91,12 @@ interface FileSystemIdentity {
  * 原子写入 JSON 文件：write-to-temp → rename
  * 写入前自动保留 .bak 备份
  */
-export function writeJsonFileAtomic(filePath: string, data: object, skipBackup = false): void {
+export function writeJsonFileAtomic(
+  filePath: string,
+  data: object,
+  skipBackup = false,
+  options: AtomicWriteOptions = {},
+): DurabilityResult {
   const tmpPath = filePath + '.tmp'
   const bakPath = filePath + '.bak'
 
@@ -94,11 +114,13 @@ export function writeJsonFileAtomic(filePath: string, data: object, skipBackup =
 
   // 原子重命名（POSIX rename 是原子操作）
   renameSync(tmpPath, filePath)
-  syncDirectoryDurable(dirname(filePath))
+  return syncCommittedFileDurability(filePath, options)
 }
 
-/** 原子删除保留的匿名 tombstone 名称，不包含原始业务路径。 */
-const ATOMIC_DELETE_TOMBSTONE_PATTERN = /^\.proma-delete-(\d+)-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tombstone$/i
+/** 原子删除保留的匿名 tombstone 名称，编码 owner PID 与原文件身份。 */
+const ATOMIC_DELETE_TOMBSTONE_PATTERN = /^\.proma-delete-(\d+)-(\d+)-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tombstone$/i
+/** 当前进程仍在执行清理协议的 tombstone，禁止同进程交错回收。 */
+const activeAtomicDeleteTombstones = new Set<string>()
 
 /**
  * 先把明确的普通文件原子移出原路径，再清理同目录唯一 tombstone。
@@ -107,7 +129,10 @@ const ATOMIC_DELETE_TOMBSTONE_PATTERN = /^\.proma-delete-(\d+)-(\d+)-[0-9a-f]{8}
  * @param filePath 需要删除的绝对普通文件路径。
  * @param options 可替换的 tombstone 清理依赖，仅用于稳定故障测试。
  */
-export function removeFileAtomic(filePath: string, options: AtomicFileRemoveOptions = {}): void {
+export function removeFileAtomic(
+  filePath: string,
+  options: AtomicFileRemoveOptions = {},
+): DurabilityResult {
   if (!isAbsolute(filePath) || basename(filePath) === '.' || basename(filePath) === '..') {
     throw new Error('原子删除必须使用明确的绝对文件路径')
   }
@@ -117,20 +142,20 @@ export function removeFileAtomic(filePath: string, options: AtomicFileRemoveOpti
   try {
     parentStat = lstatSync(parentPath)
   } catch (error) {
-    if (isMissingPathError(error)) return
+    if (isMissingPathError(error)) return 'directory'
     throw error
   }
   if (!parentStat.isDirectory()) throw new Error('原子删除父路径不是目录')
   const parentIdentity = toIdentity(parentStat)
-  const syncDirectory = options.syncDirectory ?? syncDirectoryDurable
-  recoverAtomicDeleteTombstones(parentPath, parentIdentity, options.unlinkTombstone ?? unlinkSync, syncDirectory)
+  /** 回收旧 tombstone 后已达到的最低持久化等级。 */
+  let durability = recoverAtomicDeleteTombstones(parentPath, parentIdentity, options)
 
   /** 删除前 no-follow 读取的目标身份。 */
   let targetStat: ReturnType<typeof lstatSync>
   try {
     targetStat = lstatSync(filePath)
   } catch (error) {
-    if (isMissingPathError(error)) return
+    if (isMissingPathError(error)) return durability
     throw error
   }
   if (!targetStat.isFile()) throw new Error('原子删除目标不是普通文件')
@@ -139,23 +164,29 @@ export function removeFileAtomic(filePath: string, options: AtomicFileRemoveOpti
   /** 同目录随机 tombstone，避免与并发删除或历史残留冲突。 */
   const tombstonePath = join(
     parentPath,
-    `.proma-delete-${targetIdentity.dev}-${targetIdentity.ino}-${randomUUID()}.tombstone`,
+    `.proma-delete-${options.processId ?? process.pid}-${targetIdentity.dev}-${targetIdentity.ino}-${randomUUID()}.tombstone`,
   )
   assertIdentityUnchanged(parentPath, parentIdentity, '原子删除父目录身份已变化', true)
   assertIdentityUnchanged(filePath, targetIdentity, '原子删除目标身份已变化', false)
-  renameSync(filePath, tombstonePath)
-  options.afterRenameBeforeVerify?.(tombstonePath)
-  /** rename 后任何置换都 fail closed：保留当前路径，不猜测哪个对象可以删除。 */
-  assertIdentityUnchanged(parentPath, parentIdentity, '原子删除父目录身份已变化', true)
-  assertIdentityUnchanged(tombstonePath, targetIdentity, '原子删除 tombstone 身份已变化', false)
-  syncDirectory(parentPath)
+  activeAtomicDeleteTombstones.add(tombstonePath)
   try {
-    /** 生产使用 unlinkSync，测试可稳定注入 rename 后清理失败。 */
-    const unlinkTombstone = options.unlinkTombstone ?? unlinkSync
-    unlinkTombstone(tombstonePath)
-    syncDirectory(parentPath)
-  } catch (error) {
-    throw new Error(`原子删除已提交，但 tombstone 清理失败: ${tombstonePath}`, { cause: error })
+    renameSync(filePath, tombstonePath)
+    options.afterRenameBeforeVerify?.(tombstonePath)
+    /** rename 后任何置换都 fail closed：保留当前路径，不猜测哪个对象可以删除。 */
+    assertIdentityUnchanged(parentPath, parentIdentity, '原子删除父目录身份已变化', true)
+    assertIdentityUnchanged(tombstonePath, targetIdentity, '原子删除 tombstone 身份已变化', false)
+    durability = mergeDurability(durability, syncCommittedFileDurability(tombstonePath, options))
+    try {
+      /** 生产使用 unlinkSync，测试可稳定注入 rename 后清理失败。 */
+      const unlinkTombstone = options.unlinkTombstone ?? unlinkSync
+      unlinkTombstone(tombstonePath)
+      durability = mergeDurability(durability, syncDirectoryDurability(parentPath, options))
+    } catch (error) {
+      throw new Error(`原子删除已提交，但 tombstone 清理失败: ${tombstonePath}`, { cause: error })
+    }
+    return durability
+  } finally {
+    activeAtomicDeleteTombstones.delete(tombstonePath)
   }
 }
 
@@ -164,25 +195,38 @@ export function removeFileAtomic(filePath: string, options: AtomicFileRemoveOpti
  *
  * @param parentPath 已确认存在的实际父目录。
  * @param parentIdentity 调用开始时固定的父目录身份。
- * @param unlinkTombstone 删除已验证 tombstone 的实现。
- * @param syncDirectory 每次 unlink 后持久同步父目录的实现。
+ * @param options PID 活性检查、unlink 与持久化依赖。
+ * @returns 回收操作达到的最低持久化等级。
  */
 function recoverAtomicDeleteTombstones(
   parentPath: string,
   parentIdentity: FileSystemIdentity,
-  unlinkTombstone: (tombstonePath: string) => void,
-  syncDirectory: (directoryPath: string) => void,
-): void {
+  options: AtomicFileRemoveOptions,
+): DurabilityResult {
+  /** 本轮全部回收操作达到的最低持久化等级。 */
+  let durability: DurabilityResult = 'directory'
+  /** tombstone owner 的当前进程 ID。 */
+  const currentProcessId = options.processId ?? process.pid
+  /** 跨进程 PID 存活检查实现。 */
+  const isProcessAlive = options.isProcessAlive ?? isProcessAliveStrict
   for (const entry of readdirSync(parentPath, { withFileTypes: true })) {
     const nameMatch = ATOMIC_DELETE_TOMBSTONE_PATTERN.exec(entry.name)
     if (!nameMatch) continue
+    /** 名称中编码的 owner PID，只有明确 stale 才允许回收。 */
+    const ownerProcessId = Number(nameMatch[1])
+    if (!Number.isSafeInteger(ownerProcessId) || ownerProcessId <= 0) {
+      throw new Error(`无法安全回收原子删除 tombstone: ${join(parentPath, entry.name)}`)
+    }
+    /** active 或其他仍存活进程的 tombstone 都不属于本轮回收。 */
+    const tombstonePath = join(parentPath, entry.name)
+    if (activeAtomicDeleteTombstones.has(tombstonePath)) continue
+    if (ownerProcessId !== currentProcessId && isProcessAlive(ownerProcessId)) continue
     /** 文件名中的原 inode 身份用于拒绝后续同名置换。 */
     const expectedIdentity: FileSystemIdentity = {
-      dev: Number(nameMatch[1]),
-      ino: Number(nameMatch[2]),
+      dev: Number(nameMatch[2]),
+      ino: Number(nameMatch[3]),
     }
     /** 候选必须保持为当前用户拥有的单链接普通文件。 */
-    const tombstonePath = join(parentPath, entry.name)
     const tombstoneStat = lstatSync(tombstonePath)
     if (entry.isSymbolicLink()
       || !entry.isFile()
@@ -196,12 +240,14 @@ function recoverAtomicDeleteTombstones(
     assertIdentityUnchanged(parentPath, parentIdentity, '原子删除父目录身份已变化', true)
     assertIdentityUnchanged(tombstonePath, tombstoneIdentity, '原子删除 tombstone 身份已变化', false)
     try {
+      const unlinkTombstone = options.unlinkTombstone ?? unlinkSync
       unlinkTombstone(tombstonePath)
-      syncDirectory(parentPath)
+      durability = mergeDurability(durability, syncDirectoryDurability(parentPath, options))
     } catch (error) {
       throw new Error(`原子删除 tombstone 回收失败: ${tombstonePath}`, { cause: error })
     }
   }
+  return durability
 }
 
 /**
@@ -213,12 +259,12 @@ function recoverAtomicDeleteTombstones(
 export function ensureDirectoryDurable(
   directoryPath: string,
   options: DurableDirectoryOptions = {},
-): void {
+): DurabilityResult {
   if (!isAbsolute(directoryPath)) throw new Error('持久目录路径必须是绝对路径')
   try {
     const existingStat = lstatSync(directoryPath)
     if (!existingStat.isDirectory()) throw new Error('持久目录路径不是实际目录')
-    return
+    return 'directory'
   } catch (error) {
     if (!isMissingPathError(error)) throw error
   }
@@ -227,9 +273,10 @@ export function ensureDirectoryDurable(
   const parentStat = lstatSync(parentPath)
   if (!parentStat.isDirectory()) throw new Error('持久目录父路径不是实际目录')
   mkdirSync(directoryPath)
-  const syncDirectory = options.syncDirectory ?? syncDirectoryDurable
-  syncDirectory(parentPath)
-  syncDirectory(directoryPath)
+  /** 父目录不支持 fsync 时已明确降级，无需重复触发同一平台能力错误。 */
+  const parentDurability = syncDirectoryDurability(parentPath, options)
+  if (parentDurability === 'file-only') return parentDurability
+  return syncDirectoryDurability(directoryPath, options)
 }
 
 /**
@@ -256,6 +303,95 @@ export function syncDirectoryDurable(directoryPath: string): void {
   }
 }
 
+/** 重新打开并 fsync 已提交文件，供 Windows rename 后加强内容与 metadata 持久性。 */
+function syncFileDurable(filePath: string): void {
+  /** 文件 descriptor 只在本函数内拥有。 */
+  let descriptor: number | null = null
+  try {
+    descriptor = openSync(filePath, constants.O_RDONLY)
+    fsyncSync(descriptor)
+    closeSync(descriptor)
+    descriptor = null
+  } finally {
+    if (descriptor !== null) {
+      try { closeSync(descriptor) } catch { /* 保留原始文件同步错误。 */ }
+    }
+  }
+}
+
+/** rename 后按平台执行最强可用持久化，并返回真实能力等级。 */
+function syncCommittedFileDurability(
+  filePath: string,
+  options: DurabilitySyncOptions,
+): DurabilityResult {
+  /** Windows 必须先保证已提交文件内容和 metadata 完成 fsync。 */
+  const platform = options.platform ?? process.platform
+  if (platform === 'win32') (options.syncFile ?? syncFileDurable)(filePath)
+  return syncDirectoryDurability(dirname(filePath), options)
+}
+
+/** 同步目录项；只把 Windows 明确不支持的目录 fsync 降级为 file-only。 */
+function syncDirectoryDurability(
+  directoryPath: string,
+  options: DurabilitySyncOptions,
+): DurabilityResult {
+  try {
+    (options.syncDirectory ?? syncDirectoryDurable)(directoryPath)
+    return 'directory'
+  } catch (error) {
+    if (!isWindowsDirectorySyncCapabilityError(error, options.platform ?? process.platform)) throw error
+    const message = `当前 Windows 文件系统不支持目录 fsync，已降级为 file-only durability: ${directoryPath}`
+    ;(options.warnReducedDurability ?? warnReducedDurabilityOnce)(message)
+    return 'file-only'
+  }
+}
+
+/** 合并多个阶段的 durability，任一阶段降级则整体为 file-only。 */
+function mergeDurability(left: DurabilityResult, right: DurabilityResult): DurabilityResult {
+  return left === 'file-only' || right === 'file-only' ? 'file-only' : 'directory'
+}
+
+/** 进程内只输出一次 Windows durability 降级提示。 */
+let hasWarnedReducedDurability = false
+function warnReducedDurabilityOnce(message: string): void {
+  if (hasWarnedReducedDurability) return
+  hasWarnedReducedDurability = true
+  console.warn(`[文件持久化] ${message}`)
+}
+
+/** 只识别 Windows 目录 open/fsync 的明确 capability 错误。 */
+function isWindowsDirectorySyncCapabilityError(error: unknown, platform: NodeJS.Platform): boolean {
+  if (platform !== 'win32') return false
+  /** syncDirectoryDurable 会用 cause 保留原始 Node 系统错误。 */
+  const systemError = getSystemError(error)
+  if (!systemError) return false
+  return (systemError.syscall === 'open' && (systemError.code === 'EPERM' || systemError.code === 'EISDIR'))
+    || (systemError.syscall === 'fsync' && (systemError.code === 'EINVAL' || systemError.code === 'ENOTSUP'))
+}
+
+/** 从包装错误或其 cause 中提取 Node 系统错误字段。 */
+function getSystemError(error: unknown): { code: string; syscall: string } | null {
+  if (!(error instanceof Error)) return null
+  if ('code' in error && typeof error.code === 'string'
+    && 'syscall' in error && typeof error.syscall === 'string') {
+    return { code: error.code, syscall: error.syscall }
+  }
+  return 'cause' in error ? getSystemError(error.cause) : null
+}
+
+/** 使用 signal 0 判断其他进程是否明确仍存在；未知错误继续 fail closed。 */
+function isProcessAliveStrict(processId: number): boolean {
+  try {
+    process.kill(processId, 0)
+    return true
+  } catch (error) {
+    const systemError = getSystemError(error)
+    if (systemError?.code === 'ESRCH') return false
+    if (systemError?.code === 'EPERM') return true
+    throw error
+  }
+}
+
 /**
  * 使用随机独占 temp 与 no-follow 复验原子写入安全敏感 JSON。
  *
@@ -267,7 +403,7 @@ export function writeJsonFileAtomicSecure(
   filePath: string,
   data: object,
   options: SecureAtomicJsonWriteOptions = {},
-): void {
+): DurabilityResult {
   /** 父目录在创建 temp 与 rename 之间必须保持同一文件系统身份。 */
   const parentPath = dirname(filePath)
   const parentStat = lstatSync(parentPath)
@@ -304,8 +440,7 @@ export function writeJsonFileAtomicSecure(
     assertIdentityUnchanged(tempPath, tempIdentity, '安全原子写入临时文件身份已变化', false)
     renameSync(tempPath, filePath)
     tempIdentity = null
-    const syncDirectory = options.syncDirectory ?? syncDirectoryDurable
-    syncDirectory(parentPath)
+    return syncCommittedFileDurability(filePath, options)
   } finally {
     if (descriptor !== null) {
       try { closeSync(descriptor) } catch { /* 原始写入错误优先向上传播。 */ }
@@ -390,11 +525,15 @@ function isMissingPathError(error: unknown): boolean {
 }
 
 /** 原子重写文本文件（用于 JSONL 会话等非单个 JSON 文档）。 */
-export function writeTextFileAtomic(filePath: string, content: string): void {
+export function writeTextFileAtomic(
+  filePath: string,
+  content: string,
+  options: AtomicWriteOptions = {},
+): DurabilityResult {
   const tmpPath = filePath + '.tmp'
   writeFileSync(tmpPath, content, 'utf-8')
   renameSync(tmpPath, filePath)
-  syncDirectoryDurable(dirname(filePath))
+  return syncCommittedFileDurability(filePath, options)
 }
 
 /**
@@ -449,7 +588,7 @@ export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeO
     if (parsedTmp && isAcceptedJsonValue(tmpValue, options.validate)) {
       // .tmp 有效 → 提升为主文件；提升失败必须保留 tmp 并向上传播。
       renameSync(tmpPath, filePath)
-      syncDirectoryDurable(dirname(filePath))
+      syncCommittedFileDurability(filePath, options)
       console.log(`[数据恢复] 从 .tmp 文件恢复: ${filePath}`)
       return tmpValue
     }
@@ -474,7 +613,7 @@ export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeO
     }
     if (parsedBackup && isAcceptedJsonValue(backupValue, options.validate)) {
       // 用 .bak 恢复主文件；恢复失败必须原样向上传播。
-      writeJsonFileAtomic(filePath, backupValue as object, true)
+      writeJsonFileAtomic(filePath, backupValue as object, true, options)
       console.log(`[数据恢复] 从 .bak 文件恢复: ${filePath}`)
       return backupValue
     }
