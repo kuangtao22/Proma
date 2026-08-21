@@ -29,6 +29,7 @@ import {
 } from '@/components/ui/dialog'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import { SettingsCard, SettingsRow, SettingsSection } from './primitives'
+import { WorkspacePathList } from './WorkspacePathList'
 
 const ARCHIVE_MIGRATION_PROMPT = `请帮我创建一个可迁移的 Proma 数据压缩包。
 
@@ -763,6 +764,13 @@ export function PathManagementSettings(): React.ReactElement {
           {uiState.actionError}
         </p>
       ) : null}
+
+      <WorkspacePathList
+        workspaces={state?.workspaces ?? []}
+        loading={state === null && uiState.loadError === undefined}
+        error={state === null ? uiState.loadError : undefined}
+        onChanged={loadState}
+      />
 
       <CrossDeviceMigrationSection />
 

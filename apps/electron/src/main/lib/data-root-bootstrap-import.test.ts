@@ -21,4 +21,14 @@ describe('数据根启动门模块隔离', () => {
     expect(source).not.toMatch(/^const lanBridgeAuthService = getLanBridgeAuthService\(\)$/m)
     expect(source).toContain('function ensureLanBridgeAuthService()')
   })
+
+  test('Given normal 数据根已取得 When 启动普通服务 Then 先恢复 committing 项目 journal', () => {
+    /** 静态顺序锁定恢复发生在 runtime、LAN 与 watcher 等业务服务之前。 */
+    const source = readFileSync(join(import.meta.dir, '..', 'index.ts'), 'utf8')
+    const resumeIndex = source.indexOf('resumeCommittingJournals')
+    expect(resumeIndex).toBeGreaterThan(source.indexOf('await dataRootInstanceLease.acquire(activeRoot)'))
+    expect(resumeIndex).toBeLessThan(source.indexOf("await import('./lib/lan-bridge/lan-bridge')"))
+    expect(resumeIndex).toBeLessThan(source.indexOf("await safeAwait('initializeRuntime'"))
+    expect(resumeIndex).toBeLessThan(source.indexOf("safeRun('startWorkspaceWatcher'"))
+  })
 })

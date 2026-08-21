@@ -19,6 +19,7 @@ import type { BrowserWindow } from 'electron'
 import { AGENT_IPC_CHANNELS } from '@proma/shared'
 import { getAgentWorkspacesDir } from './config-paths'
 import { listAgentSessions } from './agent-session-manager'
+import { listAgentWorkspaces } from './agent-workspace-manager'
 import { invalidateGitDiffCache } from './git-diff-service'
 import { isHighNoisePath, normalizeWatchFilename, shouldNotifyForWatchFilename } from './workspace-watcher-utils'
 
@@ -138,6 +139,13 @@ function restoreAgentSessionAttachedDirectoryWatchers(): void {
   }
 }
 
+/** 从最新索引恢复全部外部项目根监听，迁移恢复后不会继续监听旧根。 */
+function restoreAgentWorkspaceProjectRootWatchers(): void {
+  for (const workspace of listAgentWorkspaces()) {
+    if (workspace.projectRootPath) watchAttachedDirectory(workspace.projectRootPath)
+  }
+}
+
 function watchUnavailableDirectoryParent(dirPath: string): void {
   const parentPath = findNearestExistingDirectory(dirname(dirPath))
   if (!parentPath) {
@@ -212,6 +220,7 @@ export function startWorkspaceWatcher(win: BrowserWindow): void {
   // 会话附加目录只需在启动/监听器重启时恢复一次；LIST_SESSIONS 是高频读取路径，
   // 不能随每次列表 IPC 再遍历全部会话并触发同步 stat。
   restoreAgentSessionAttachedDirectoryWatchers()
+  restoreAgentWorkspaceProjectRootWatchers()
   const watchDir = getAgentWorkspacesDir()
 
   if (!existsSync(watchDir)) {
@@ -375,4 +384,13 @@ export function unwatchAttachedDirectory(dirPath: string): void {
     console.log('[附加目录监听] 已停止:', dirPath)
   }
   releaseUnavailableDirectoryWatcher(dirPath)
+}
+
+/** 原子业务顺序切换项目监听；新监听失败不恢复旧项目根监听。 */
+export function replaceAttachedDirectoryWatcher(sourceRoot: string, targetRoot: string): void {
+  unwatchAttachedDirectory(sourceRoot)
+  watchAttachedDirectory(targetRoot)
+  if (!attachedWatchers.has(targetRoot)) {
+    throw new Error('新项目目录监听未能启动')
+  }
 }

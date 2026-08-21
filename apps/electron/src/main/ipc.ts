@@ -286,6 +286,12 @@ import {
 } from './lib/agent-session-manager'
 import { agentEventBus, runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
+import {
+  getDefaultWorkspaceProjectRelocator,
+  listWorkspacePathStates,
+  relinkWorkspaceProjectRoot,
+} from './lib/workspace-project-relocator-production'
+import { replaceAttachedDirectoryWatcher } from './lib/workspace-watcher'
 import { getMainWindow as getStoredMainWindow } from './lib/main-window-store'
 import { getDefaultDataRootInstanceLeaseRegistry } from './lib/data-root-instance-lease'
 import { hasRunningAutomations } from './lib/automation-scheduler'
@@ -1049,6 +1055,13 @@ export function registerIpcHandlers(): void {
     hasActiveTasks: () => hasActiveAgentDataWrites() || hasRunningAutomations(),
     hasOtherPromaInstance: () => dataRootInstanceLease.hasOtherActiveLease(),
     acquireMigrationGuard: () => dataRootInstanceLease.acquireMigrationGuard(),
+    workspaceRelocator: getDefaultWorkspaceProjectRelocator(),
+    listWorkspacePathStates,
+    relinkWorkspace: relinkWorkspaceProjectRoot,
+    switchWorkspaceWatcher: replaceAttachedDirectoryWatcher,
+    refreshWorkspaceRenderer: () => {
+      getStoredMainWindow()?.webContents.send(AGENT_IPC_CHANNELS.WORKSPACE_FILES_CHANGED, [])
+    },
   })
 
   // ===== 运行时相关 =====

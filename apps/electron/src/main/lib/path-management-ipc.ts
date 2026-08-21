@@ -12,7 +12,13 @@ import type {
   DataRootStartupMode,
   OpenDataRootTarget,
   PathManagementState,
+  PickWorkspaceTargetInput,
   RecoverDataRootInput,
+  WorkspacePathState,
+  WorkspaceRelocationPreview,
+  WorkspaceRelocationProgress,
+  WorkspaceTargetPurpose,
+  WorkspaceTargetSelection,
 } from '@proma/shared'
 import { DataRootLocator } from './data-root-locator'
 import type { DataRootLocatorResult } from './data-root-locator'
@@ -25,6 +31,7 @@ import {
   invalidateDataRootStorage,
 } from './data-root-storage'
 import type { DataRootStorageSnapshot } from './data-root-storage'
+import type { WorkspaceProjectRelocator } from './workspace-project-relocator'
 
 /** 路径 IPC handler 接收 Electron event 和经过 preload 约束的参数。 */
 type PathManagementHandler = (event: unknown, ...args: unknown[]) => unknown
@@ -39,6 +46,12 @@ const PATH_MANAGEMENT_HANDLER_CHANNELS: readonly string[] = [
   PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS,
   PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION,
   PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_DATA_ROOT_MIGRATION,
+  PATH_MANAGEMENT_IPC_CHANNELS.PICK_WORKSPACE_TARGET,
+  PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_WORKSPACE_RELOCATION,
+  PATH_MANAGEMENT_IPC_CHANNELS.START_WORKSPACE_RELOCATION,
+  PATH_MANAGEMENT_IPC_CHANNELS.GET_WORKSPACE_RELOCATION_STATUS,
+  PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_WORKSPACE_RELOCATION,
+  PATH_MANAGEMENT_IPC_CHANNELS.RELINK_WORKSPACE,
   PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT,
   PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT,
   PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP,
@@ -63,7 +76,7 @@ export interface PathManagementWindow {
   /** 判断窗口是否已经销毁。 */
   isDestroyed(): boolean
   /** 向 renderer 推送 typed 迁移进度。 */
-  webContents: { send(channel: string, progress: DataRootMigrationProgress): void }
+  webContents: { send(channel: string, progress: DataRootMigrationProgress | WorkspaceRelocationProgress): void }
 }
 
 /** Electron 应用重启与退出的最小接口。 */
@@ -135,12 +148,30 @@ export interface RegisterPathManagementIpcOptions {
   inspectOccupiedStorage?: (rootPath: string) => Promise<DataRootOccupiedStorage>
   /** 注入服务端随机 selectionId，测试可稳定断言代次。 */
   createSelectionId?: () => string
+  /** 项目迁移器；normal production 由 IPC bootstrap 注入真实依赖。 */
+  workspaceRelocator?: Pick<WorkspaceProjectRelocator, 'preflight' | 'run' | 'getStatus' | 'cancel'>
+  /** 枚举设置页需要的 managed/external/offline 项目状态。 */
+  listWorkspacePathStates?: () => WorkspacePathState[]
+  /** 离线项目重新绑定现存目录，不触发复制器。 */
+  relinkWorkspace?: (workspaceId: string, targetRoot: string) => void
+  /** 已提交迁移后按旧根、新根顺序切换目录监听。 */
+  switchWorkspaceWatcher?: (sourceRoot: string, targetRoot: string) => void
+  /** 项目根或 watcher 状态变化后通知 renderer 刷新。 */
+  refreshWorkspaceRenderer?: () => void
 }
 
 /** normal 窗口内单次目标授权的服务端状态。 */
 interface DataRootSelectionState extends DataRootSelection {
   generation: number
   status: 'selected' | 'previewing' | 'previewed' | 'starting'
+}
+
+/** normal 窗口内单次项目目标授权的服务端状态。 */
+interface WorkspaceTargetSelectionState extends WorkspaceTargetSelection {
+  generation: number
+  owner: object
+  status: 'selected' | 'previewing' | 'previewed' | 'starting'
+  sourceRoot?: string
 }
 
 /** 进程级 locator 延迟创建，模块导入本身不读取文件系统。 */
@@ -182,6 +213,10 @@ export function registerPathManagementIpcHandlers(
   let currentSelection: DataRootSelectionState | null = null
   /** pick 调用代次，较早对话框晚返回时不得恢复旧授权。 */
   let selectionGeneration = 0
+  /** workspace 与 data-root 使用不同状态，禁止 token 跨 scope 复用。 */
+  let currentWorkspaceSelection: WorkspaceTargetSelectionState | null = null
+  /** 项目选择调用代次；新选择开始即使旧授权失效。 */
+  let workspaceSelectionGeneration = 0
   /** 生产使用密码学随机 UUID，renderer 无法猜测或自造授权。 */
   const createSelectionId = options.createSelectionId ?? randomUUID
   /** mode 可能在开发热重载中变化，先删除全部旧 handler 再建立最小 allowlist。 */
@@ -199,6 +234,10 @@ export function registerPathManagementIpcHandlers(
     invalidateDataRootStorage()
     options.getExpectedWebContents()?.send(PATH_MANAGEMENT_IPC_CHANNELS.PROGRESS, progress)
   }
+  /** 只向当前主窗口广播项目迁移进度。 */
+  const broadcastWorkspaceProgress = (progress: WorkspaceRelocationProgress): void => {
+    options.getExpectedWebContents()?.send(PATH_MANAGEMENT_IPC_CHANNELS.WORKSPACE_RELOCATION_PROGRESS, progress)
+  }
   /** 同一调用栈请求重启并退出，不留下 setImmediate 竞态窗口。 */
   const relaunchNow = (): void => {
     options.app.relaunch()
@@ -212,14 +251,19 @@ export function registerPathManagementIpcHandlers(
   if (options.mode === 'normal') {
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, async () => {
       const state = getCoordinator().getStatus()
-      if (state.activeRoot === null || state.availability !== 'available') return state
+      /** normal 状态才读取业务工作区，轻量 recovery/migration 模式保持隔离。 */
+      const stateWithWorkspaces: PathManagementState = {
+        ...state,
+        workspaces: options.listWorkspacePathStates?.() ?? [],
+      }
+      if (state.activeRoot === null || state.availability !== 'available') return stateWithWorkspaces
       try {
         const storage = await (options.inspectStorageFast ?? inspectDataRootStorageFast)(state.activeRoot)
-        return { ...state, ...storage }
+        return { ...stateWithWorkspaces, ...storage }
       } catch {
         /** 存储元数据异常不得抹掉 locator 与迁移状态。 */
         return {
-          ...state,
+          ...stateWithWorkspaces,
           deviceType: 'unknown' as const,
           occupiedStatus: 'loading' as const,
           capacityIssue: { code: 'CAPACITY_UNAVAILABLE' as const, message: '可用空间暂不可用' },
@@ -366,6 +410,118 @@ export function registerPathManagementIpcHandlers(
         ...(state.postCommitCleanup === undefined ? {} : { postCommitCleanup: state.postCommitCleanup }),
       }
     })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.PICK_WORKSPACE_TARGET, async (event, rawInput) => {
+      if (!options.dialog) throw new Error('当前环境不支持选择项目目标目录')
+      const input = assertPickWorkspaceTargetInput(rawInput)
+      const owner = getInvokeSender(event)
+      /** 新 pick 开始即撤销上一代项目授权，晚返回结果也不能恢复。 */
+      const generation = workspaceSelectionGeneration + 1
+      workspaceSelectionGeneration = generation
+      currentWorkspaceSelection = null
+      const result = await options.dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
+      if (
+        generation !== workspaceSelectionGeneration
+        || owner !== options.getExpectedWebContents()
+        || isWorkspaceOwnerDestroyed(owner)
+      ) return null
+      const targetRoot = result.canceled ? null : result.filePaths[0] ?? null
+      if (targetRoot === null) return null
+      if (!isAbsolute(targetRoot)) throw new Error('系统选择器返回的项目目标不是绝对路径')
+      /** selectionId 复用同一密码学随机生成器，但状态与数据根完全隔离。 */
+      const selection: WorkspaceTargetSelectionState = {
+        ...input,
+        selectionId: createSelectionId(),
+        targetRoot,
+        generation,
+        owner,
+        status: 'selected',
+      }
+      currentWorkspaceSelection = selection
+      return toPublicWorkspaceSelection(selection)
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_WORKSPACE_RELOCATION, async (event, rawInput) => {
+      const input = assertWorkspaceTargetSelection(rawInput)
+      const selection = requireCurrentWorkspaceSelection(
+        currentWorkspaceSelection,
+        input,
+        getInvokeSender(event),
+        'relocation',
+      )
+      if (!options.workspaceRelocator) throw new Error('当前环境不支持项目迁移')
+      if (selection.status === 'previewing') throw new Error('项目目标正在预检')
+      if (selection.status === 'starting') throw new Error('项目目标正在启动或已消费')
+      selection.status = 'previewing'
+      try {
+        const preview = await options.workspaceRelocator.preflight({
+          workspaceId: selection.workspaceId,
+          targetRoot: selection.targetRoot,
+        })
+        if (currentWorkspaceSelection !== selection || selection.generation !== workspaceSelectionGeneration) {
+          throw new Error('项目目标选择已失效')
+        }
+        if (preview.workspaceId !== selection.workspaceId || preview.targetRoot !== selection.targetRoot) {
+          throw new Error('项目迁移预检返回的目标不一致')
+        }
+        selection.sourceRoot = preview.sourceRoot
+        selection.status = 'previewed'
+        return preview satisfies WorkspaceRelocationPreview
+      } catch (error) {
+        if (currentWorkspaceSelection === selection && selection.status === 'previewing') selection.status = 'selected'
+        throw error
+      }
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.START_WORKSPACE_RELOCATION, async (event, rawInput) => {
+      const input = assertWorkspaceTargetSelection(rawInput)
+      const selection = requireCurrentWorkspaceSelection(
+        currentWorkspaceSelection,
+        input,
+        getInvokeSender(event),
+        'relocation',
+      )
+      if (!options.workspaceRelocator) throw new Error('当前环境不支持项目迁移')
+      if (selection.status !== 'previewed' || !selection.sourceRoot) throw new Error('项目目标尚未完成预检')
+      /** start 在首次 await 前终态消费，失败后必须重新选择。 */
+      selection.status = 'starting'
+      currentWorkspaceSelection = null
+      const progress = await options.workspaceRelocator.run({
+        workspaceId: selection.workspaceId,
+        targetRoot: selection.targetRoot,
+      }, broadcastWorkspaceProgress)
+      try {
+        options.switchWorkspaceWatcher?.(selection.sourceRoot, selection.targetRoot)
+      } catch (error) {
+        /** projectRoot 已提交后不得回滚，只广播可重试的 watcher 错误。 */
+        const message = `项目已迁移，但目录监听切换失败，可重试刷新：${errorMessage(error)}`
+        broadcastWorkspaceProgress({ ...progress, error: message })
+        throw new Error(message, { cause: error })
+      } finally {
+        options.refreshWorkspaceRenderer?.()
+      }
+      return progress
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.GET_WORKSPACE_RELOCATION_STATUS, (_event, rawWorkspaceId) => {
+      if (!options.workspaceRelocator) throw new Error('当前环境不支持项目迁移')
+      return options.workspaceRelocator.getStatus(assertNonEmptyString(rawWorkspaceId, '工作区 ID 无效'))
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_WORKSPACE_RELOCATION, (_event, rawOperationId) => {
+      if (!options.workspaceRelocator) throw new Error('当前环境不支持项目迁移')
+      return options.workspaceRelocator.cancel(assertNonEmptyString(rawOperationId, '项目迁移操作 ID 无效'))
+    })
+    register(PATH_MANAGEMENT_IPC_CHANNELS.RELINK_WORKSPACE, (event, rawInput) => {
+      const input = assertWorkspaceTargetSelection(rawInput)
+      const selection = requireCurrentWorkspaceSelection(
+        currentWorkspaceSelection,
+        input,
+        getInvokeSender(event),
+        'relink',
+      )
+      if (!options.relinkWorkspace) throw new Error('当前环境不支持项目重定位')
+      /** relink 同样是一次性 capability，且永不进入复制器。 */
+      selection.status = 'starting'
+      currentWorkspaceSelection = null
+      options.relinkWorkspace(selection.workspaceId, selection.targetRoot)
+      options.refreshWorkspaceRenderer?.()
+    })
   } else if (options.mode === 'data-root-migration') {
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, () => getCoordinator().getStatus())
     register(PATH_MANAGEMENT_IPC_CHANNELS.RESUME_DATA_ROOT_MIGRATION, async () => {
@@ -459,6 +615,102 @@ function requireCurrentSelection(
     || current.targetRoot !== input.targetRoot
   ) throw new Error('目标选择已失效')
   return current
+}
+
+/** 运行时校验项目选择请求，禁止空 ID 和未知 purpose。 */
+function assertPickWorkspaceTargetInput(value: unknown): PickWorkspaceTargetInput {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('项目目标选择请求无效')
+  }
+  const input = value as { workspaceId?: unknown; purpose?: unknown }
+  return {
+    workspaceId: assertNonEmptyString(input.workspaceId, '工作区 ID 无效'),
+    purpose: assertWorkspaceTargetPurpose(input.purpose),
+  }
+}
+
+/** 运行时校验 renderer 回传的完整项目 selection。 */
+function assertWorkspaceTargetSelection(value: unknown): WorkspaceTargetSelection {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('项目目标选择无效')
+  }
+  const input = value as {
+    workspaceId?: unknown
+    purpose?: unknown
+    selectionId?: unknown
+    targetRoot?: unknown
+  }
+  const targetRoot = assertNonEmptyString(input.targetRoot, '项目目标选择无效')
+  if (!isAbsolute(targetRoot)) throw new Error('项目目标选择无效')
+  return {
+    workspaceId: assertNonEmptyString(input.workspaceId, '项目目标选择无效'),
+    purpose: assertWorkspaceTargetPurpose(input.purpose),
+    selectionId: assertNonEmptyString(input.selectionId, '项目目标选择无效'),
+    targetRoot,
+  }
+}
+
+/** 校验项目 selection 用途，保持 relocation/relink scope 隔离。 */
+function assertWorkspaceTargetPurpose(value: unknown): WorkspaceTargetPurpose {
+  if (value === 'relocation' || value === 'relink') return value
+  throw new Error('项目目标选择用途无效')
+}
+
+/** 只接受当前窗口、当前代次、字段完全一致且用途匹配的 selection。 */
+function requireCurrentWorkspaceSelection(
+  current: WorkspaceTargetSelectionState | null,
+  input: WorkspaceTargetSelection,
+  owner: object,
+  purpose: WorkspaceTargetPurpose,
+): WorkspaceTargetSelectionState {
+  if (
+    current === null
+    || current.owner !== owner
+    || isWorkspaceOwnerDestroyed(current.owner)
+    || current.generation <= 0
+    || current.selectionId !== input.selectionId
+    || current.workspaceId !== input.workspaceId
+    || current.targetRoot !== input.targetRoot
+  ) throw new Error('项目目标选择已失效')
+  if (current.purpose !== purpose || input.purpose !== purpose) {
+    throw new Error('项目目标选择用途不匹配')
+  }
+  return current
+}
+
+/** Electron webContents 销毁后立即撤销尚未消费的项目 selection。 */
+function isWorkspaceOwnerDestroyed(owner: object): boolean {
+  if (!('isDestroyed' in owner) || typeof owner.isDestroyed !== 'function') return false
+  return owner.isDestroyed.call(owner) === true
+}
+
+/** 从已通过外层 sender 检查的 invoke event 取得 owner 身份。 */
+function getInvokeSender(event: unknown): object {
+  if (typeof event !== 'object' || event === null || !('sender' in event) || typeof event.sender !== 'object' || event.sender === null) {
+    throw new Error('当前窗口无权执行路径管理操作')
+  }
+  return event.sender
+}
+
+/** 移除服务端 generation、owner 和状态字段后返回公开 selection。 */
+function toPublicWorkspaceSelection(selection: WorkspaceTargetSelectionState): WorkspaceTargetSelection {
+  return {
+    workspaceId: selection.workspaceId,
+    purpose: selection.purpose,
+    selectionId: selection.selectionId,
+    targetRoot: selection.targetRoot,
+  }
+}
+
+/** 校验通用非空字符串参数并保留中文错误。 */
+function assertNonEmptyString(value: unknown, message: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) throw new Error(message)
+  return value
+}
+
+/** 把 unknown 错误转换为可向用户展示的稳定文本。 */
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /** 拒绝任何非当前模式预期窗口发起的路径 IPC。 */

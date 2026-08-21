@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { isDataRootLocatorFile } from './path-management'
+import { PATH_MANAGEMENT_IPC_CHANNELS, isDataRootLocatorFile } from './path-management'
 
 describe('isDataRootLocatorFile', () => {
   const sourceRoot = '/Users/test/.proma'
@@ -58,5 +58,19 @@ describe('isDataRootLocatorFile', () => {
       expect(isDataRootLocatorFile({ version: 1, activeRoot })).toBe(true)
     }
     expect(isDataRootLocatorFile({ version: 1, activeRoot: 'relative/root' })).toBe(false)
+  })
+})
+
+describe('workspace path management contract', () => {
+  test('Given 项目路径管理四层合同 When 读取通道 Then 包含选择、预检、执行、取消、重定位与进度', () => {
+    expect(PATH_MANAGEMENT_IPC_CHANNELS).toMatchObject({
+      PICK_WORKSPACE_TARGET: 'path-management:pick-workspace-target',
+      PREVIEW_WORKSPACE_RELOCATION: 'path-management:preview-workspace-relocation',
+      START_WORKSPACE_RELOCATION: 'path-management:start-workspace-relocation',
+      GET_WORKSPACE_RELOCATION_STATUS: 'path-management:get-workspace-relocation-status',
+      CANCEL_WORKSPACE_RELOCATION: 'path-management:cancel-workspace-relocation',
+      RELINK_WORKSPACE: 'path-management:relink-workspace',
+      WORKSPACE_RELOCATION_PROGRESS: 'path-management:workspace-relocation-progress',
+    })
   })
 })

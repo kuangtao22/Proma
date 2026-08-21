@@ -66,6 +66,38 @@ export interface StartWorkspaceRelocationInput {
    * 不得信任 renderer 直接传入的任意字符串。
    */
   targetRoot: string
+  /** 原生目录选择器签发、只能消费一次的服务端授权。 */
+  selectionId: string
+  /** 授权用途，迁移与离线重定位不可交叉复用。 */
+  purpose: 'relocation'
+}
+
+/** 项目目录选择器支持的两种互斥用途。 */
+export type WorkspaceTargetPurpose = 'relocation' | 'relink'
+
+/** 请求主进程打开项目目标目录选择器。 */
+export interface PickWorkspaceTargetInput {
+  workspaceId: string
+  purpose: WorkspaceTargetPurpose
+}
+
+/** 主进程针对当前窗口签发的单次项目目标授权。 */
+export interface WorkspaceTargetSelection extends PickWorkspaceTargetInput {
+  selectionId: string
+  targetRoot: string
+}
+
+/** 项目迁移预检返回给确认对话框的容量和路径信息。 */
+export interface WorkspaceRelocationPreview {
+  operationId: string
+  workspaceId: string
+  workspaceSlug: string
+  sourceRoot: string
+  targetRoot: string
+  totalBytes: number
+  remainingBytes: number
+  availableBytes: number
+  kind: 'managed' | 'external'
 }
 
 /** 提供给界面的项目路径迁移进度。 */
@@ -281,9 +313,12 @@ export const PATH_MANAGEMENT_IPC_CHANNELS = {
   GET_DATA_ROOT_MIGRATION_STATUS: 'path-management:get-data-root-migration-status',
   RESUME_DATA_ROOT_MIGRATION: 'path-management:resume-data-root-migration',
   CANCEL_DATA_ROOT_MIGRATION: 'path-management:cancel-data-root-migration',
+  PICK_WORKSPACE_TARGET: 'path-management:pick-workspace-target',
+  PREVIEW_WORKSPACE_RELOCATION: 'path-management:preview-workspace-relocation',
   START_WORKSPACE_RELOCATION: 'path-management:start-workspace-relocation',
   GET_WORKSPACE_RELOCATION_STATUS: 'path-management:get-workspace-relocation-status',
   CANCEL_WORKSPACE_RELOCATION: 'path-management:cancel-workspace-relocation',
+  RELINK_WORKSPACE: 'path-management:relink-workspace',
   WORKSPACE_RELOCATION_PROGRESS: 'path-management:workspace-relocation-progress',
   RECOVER_DATA_ROOT: 'path-management:recover-data-root',
   OPEN_DATA_ROOT: 'path-management:open-data-root',

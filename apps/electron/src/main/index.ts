@@ -140,6 +140,7 @@ import {
 import { prepareNormalDataRoot } from './lib/data-root-marker'
 import type { DataRootStartupMode } from '@proma/shared'
 import { createDataRootStartupRouter } from './lib/data-root-startup-routing'
+import { getDefaultWorkspaceProjectRelocator } from './lib/workspace-project-relocator-production'
 import { TRAY_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS } from '../types'
 
 /** normal 模式成功取得的共享数据根实例 lease；非 normal 始终为 null。 */
@@ -763,6 +764,8 @@ async function bootstrap(): Promise<void> {
     activeRoot = prepareNormalDataRoot(dataRootLocator, locatorResult)
     dataRootInstanceLease = getDefaultDataRootInstanceLeaseRegistry()
     await dataRootInstanceLease.acquire(activeRoot)
+    /** 只自动完成不可取消的 committing；其他 journal 留给设置页继续或取消。 */
+    await getDefaultWorkspaceProjectRelocator().resumeCommittingJournals()
   } catch (error) {
     dataRootBusinessStartupBlocked = true
     throw error

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
-import type { DataRootMigrationProgress, PathManagementState } from '@proma/shared'
+import type { DataRootMigrationProgress, PathManagementState, WorkspaceRelocationProgress } from '@proma/shared'
 import type { IpcRendererEvent } from 'electron'
 import * as pathManagementPreload from './path-management-preload'
 import type { PathManagementPreloadIpc } from './path-management-preload'
@@ -74,14 +74,21 @@ describe('路径管理 preload API', () => {
     const selection = { selectionId: 'selection-1', targetRoot: '/data/new' }
 
     expect(Object.keys(api).sort()).toEqual([
+      'cancelWorkspaceRelocation',
       'getDataRootMigrationStatus',
       'getDataRootOccupiedStorage',
       'getPathManagementState',
+      'getWorkspaceRelocationStatus',
       'onDataRootMigrationProgress',
+      'onWorkspaceRelocationProgress',
       'openDataRoot',
       'pickDataRoot',
+      'pickWorkspaceTarget',
       'previewDataRootMigration',
+      'previewWorkspaceRelocation',
+      'relinkWorkspace',
       'startDataRootMigration',
+      'startWorkspaceRelocation',
     ])
 
     await invokeApi(api, 'getPathManagementState')
@@ -91,6 +98,17 @@ describe('路径管理 preload API', () => {
     await invokeApi(api, 'startDataRootMigration', selection)
     await invokeApi(api, 'getDataRootMigrationStatus')
     await invokeApi(api, 'openDataRoot', 'previous')
+    const workspaceSelection = {
+      selectionId: 'workspace-selection-1',
+      workspaceId: 'workspace-1',
+      targetRoot: '/data/project-new',
+      purpose: 'relocation',
+    }
+    await invokeApi(api, 'pickWorkspaceTarget', { workspaceId: 'workspace-1', purpose: 'relocation' })
+    await invokeApi(api, 'previewWorkspaceRelocation', workspaceSelection)
+    await invokeApi(api, 'startWorkspaceRelocation', workspaceSelection)
+    await invokeApi(api, 'getWorkspaceRelocationStatus', 'workspace-1')
+    await invokeApi(api, 'cancelWorkspaceRelocation', 'operation-1')
     expect(recorded.invokes).toEqual([
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_OCCUPIED_STORAGE, args: [] },
@@ -99,7 +117,30 @@ describe('路径管理 preload API', () => {
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION, args: [selection] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_DATA_ROOT_MIGRATION_STATUS, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, args: ['previous'] },
+      { channel: PATH_MANAGEMENT_IPC_CHANNELS.PICK_WORKSPACE_TARGET, args: [{ workspaceId: 'workspace-1', purpose: 'relocation' }] },
+      { channel: PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_WORKSPACE_RELOCATION, args: [workspaceSelection] },
+      { channel: PATH_MANAGEMENT_IPC_CHANNELS.START_WORKSPACE_RELOCATION, args: [workspaceSelection] },
+      { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_WORKSPACE_RELOCATION_STATUS, args: ['workspace-1'] },
+      { channel: PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_WORKSPACE_RELOCATION, args: ['operation-1'] },
     ])
+  })
+
+  test('Given workspace 进度订阅 When 取消订阅 Then 移除同一 listener', () => {
+    const recorded = createRecordedIpc()
+    const api = getExpectedFactories().createNormalPathManagementPreloadApi(recorded.ipc)
+    const subscribe = api.onWorkspaceRelocationProgress
+    if (typeof subscribe !== 'function') throw new Error('缺少 workspace 进度订阅')
+    /** 保存收到的项目迁移事件。 */
+    const received: WorkspaceRelocationProgress[] = []
+    const unsubscribe = subscribe((progress: WorkspaceRelocationProgress) => { received.push(progress) }) as () => void
+    /** 测试用项目迁移进度。 */
+    const progress: WorkspaceRelocationProgress = {
+      operationId: 'operation-1', workspaceId: 'workspace-1', stage: 'copying', completedBytes: 1, totalBytes: 2,
+    }
+    recorded.added[0]?.({} as IpcRendererEvent, progress)
+    unsubscribe()
+    expect(received).toEqual([progress])
+    expect(recorded.removed[0]).toBe(recorded.added[0])
   })
 
   test('Given migration 专用窗口 When 创建真实 API 对象 Then 只暴露迁移 keys 并调用迁移通道', async () => {

@@ -7,8 +7,12 @@ import type {
   DataRootOccupiedStorage,
   DataRootSelection,
   OpenDataRootTarget,
+  PickWorkspaceTargetInput,
   PathManagementState,
   RecoverDataRootInput,
+  WorkspaceRelocationPreview,
+  WorkspaceRelocationProgress,
+  WorkspaceTargetSelection,
 } from '@proma/shared'
 import type { IpcRendererEvent } from 'electron'
 
@@ -40,6 +44,20 @@ export interface NormalPathManagementPreloadApi {
   openDataRoot: (target: OpenDataRootTarget) => Promise<void>
   /** 订阅数据根迁移进度。 */
   onDataRootMigrationProgress: (callback: (progress: DataRootMigrationProgress) => void) => () => void
+  /** 使用系统选择器签发当前窗口独占的项目目标授权。 */
+  pickWorkspaceTarget: (input: PickWorkspaceTargetInput) => Promise<WorkspaceTargetSelection | null>
+  /** 只读预检刚选择的迁移目标。 */
+  previewWorkspaceRelocation: (input: WorkspaceTargetSelection) => Promise<WorkspaceRelocationPreview>
+  /** 启动项目复制、校验与原子引用提交。 */
+  startWorkspaceRelocation: (input: WorkspaceTargetSelection) => Promise<WorkspaceRelocationProgress>
+  /** 读取指定项目当前的可恢复迁移状态。 */
+  getWorkspaceRelocationStatus: (workspaceId: string) => Promise<WorkspaceRelocationProgress | null>
+  /** 取消仍处于 copying 的项目迁移。 */
+  cancelWorkspaceRelocation: (operationId: string) => Promise<boolean>
+  /** 离线项目仅重新绑定已存在目录，不执行复制。 */
+  relinkWorkspace: (input: WorkspaceTargetSelection) => Promise<void>
+  /** 订阅项目迁移进度并返回 listener 清理函数。 */
+  onWorkspaceRelocationProgress: (callback: (progress: WorkspaceRelocationProgress) => void) => () => void
 }
 
 /** 迁移专用窗口可用的最小路径管理 API。 */
@@ -101,6 +119,31 @@ export function createNormalPathManagementPreloadApi(
     ) as Promise<DataRootMigrationStatus>,
     openDataRoot: (target) => invokeOpenDataRoot(ipc, target),
     onDataRootMigrationProgress: createProgressSubscriber(ipc),
+    pickWorkspaceTarget: (input) => ipc.invoke(
+      PATH_MANAGEMENT_IPC_CHANNELS.PICK_WORKSPACE_TARGET,
+      input,
+    ) as Promise<WorkspaceTargetSelection | null>,
+    previewWorkspaceRelocation: (input) => ipc.invoke(
+      PATH_MANAGEMENT_IPC_CHANNELS.PREVIEW_WORKSPACE_RELOCATION,
+      input,
+    ) as Promise<WorkspaceRelocationPreview>,
+    startWorkspaceRelocation: (input) => ipc.invoke(
+      PATH_MANAGEMENT_IPC_CHANNELS.START_WORKSPACE_RELOCATION,
+      input,
+    ) as Promise<WorkspaceRelocationProgress>,
+    getWorkspaceRelocationStatus: (workspaceId) => ipc.invoke(
+      PATH_MANAGEMENT_IPC_CHANNELS.GET_WORKSPACE_RELOCATION_STATUS,
+      workspaceId,
+    ) as Promise<WorkspaceRelocationProgress | null>,
+    cancelWorkspaceRelocation: (operationId) => ipc.invoke(
+      PATH_MANAGEMENT_IPC_CHANNELS.CANCEL_WORKSPACE_RELOCATION,
+      operationId,
+    ) as Promise<boolean>,
+    relinkWorkspace: (input) => ipc.invoke(
+      PATH_MANAGEMENT_IPC_CHANNELS.RELINK_WORKSPACE,
+      input,
+    ) as Promise<void>,
+    onWorkspaceRelocationProgress: createWorkspaceProgressSubscriber(ipc),
   }
 }
 
@@ -179,5 +222,19 @@ function createProgressSubscriber(
     }
     ipc.on(PATH_MANAGEMENT_IPC_CHANNELS.PROGRESS, listener)
     return () => { ipc.removeListener(PATH_MANAGEMENT_IPC_CHANNELS.PROGRESS, listener) }
+  }
+}
+
+/** 创建只传递项目 typed progress 并可移除原 listener 的订阅函数。 */
+function createWorkspaceProgressSubscriber(
+  ipc: PathManagementPreloadIpc,
+): (callback: (progress: WorkspaceRelocationProgress) => void) => () => void {
+  return (callback) => {
+    /** Electron event 不跨越 preload 安全边界。 */
+    const listener = (_event: IpcRendererEvent, ...args: unknown[]): void => {
+      callback(args[0] as WorkspaceRelocationProgress)
+    }
+    ipc.on(PATH_MANAGEMENT_IPC_CHANNELS.WORKSPACE_RELOCATION_PROGRESS, listener)
+    return () => { ipc.removeListener(PATH_MANAGEMENT_IPC_CHANNELS.WORKSPACE_RELOCATION_PROGRESS, listener) }
   }
 }
