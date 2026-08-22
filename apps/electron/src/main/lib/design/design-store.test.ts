@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { DesignCanvasNode } from '@proma/shared'
@@ -73,7 +80,10 @@ describe('Design revision 原子存储', () => {
     const store = createStore()
     /** 当前项目画布主文件路径。 */
     const canvasPath = join(projectRoot, '.proma/design/canvas.json')
-    store.mutate('project-1', 0, [])
+    store.mutate('project-1', 0, [{
+      type: 'set-viewport',
+      viewport: { x: 0, y: 0, zoom: 1 },
+    }])
     /** 第一次保存的合法文档，稍后作为恢复备份。 */
     const validDocument = JSON.parse(readFileSync(canvasPath, 'utf8')) as object
     writeFileSync(`${canvasPath}.bak`, JSON.stringify(validDocument), 'utf8')
@@ -117,6 +127,80 @@ describe('Design revision 原子存储', () => {
     }])).toThrow('DESIGN_REVISION_CONFLICT')
   })
 
+  test('Given stale revision 的移动目标已被删除 When 保存 Then 冲突且 revision 不递增', () => {
+    /** 用于模拟另一窗口删除节点的存储。 */
+    const store = createStore()
+    /** revision 1 中存在、revision 2 中已删除的节点。 */
+    const node = createNode()
+    store.mutate('project-1', 0, [{ type: 'upsert-nodes', nodes: [node] }])
+    store.mutate('project-1', 1, [{ type: 'remove-nodes', nodeIds: [node.id] }])
+
+    expect(() => store.mutate('project-1', 1, [{
+      type: 'move-nodes',
+      positions: [{ nodeId: node.id, position: { x: 90, y: 100 } }],
+    }])).toThrow('DESIGN_REVISION_CONFLICT')
+    expect(store.load('project-1').document.revision).toBe(2)
+  })
+
+  test('Given fresh revision 的移动目标不存在 When 保存 Then 拒绝非法 mutation 且不落盘', () => {
+    /** 尚无节点的全新项目存储。 */
+    const store = createStore()
+
+    expect(() => store.mutate('project-1', 0, [{
+      type: 'move-nodes',
+      positions: [{ nodeId: 'missing-node', position: { x: 10, y: 20 } }],
+    }])).toThrow('DESIGN_DOCUMENT_INVALID')
+    expect(existsSync(join(projectRoot, '.proma/design/canvas.json'))).toBe(false)
+  })
+
+  test('Given stale revision When 只更新视口 Then 仍在最新 revision 上重放', () => {
+    /** 支持非结构视口重放的存储。 */
+    const store = createStore()
+    /** 另一窗口先写入的结构 mutation。 */
+    const node = createNode()
+    store.mutate('project-1', 0, [{ type: 'upsert-nodes', nodes: [node] }])
+
+    /** 基于 revision 0 重放后的最新文档。 */
+    const rebased = store.mutate('project-1', 0, [{
+      type: 'set-viewport',
+      viewport: { x: 30, y: 40, zoom: 2 },
+    }])
+    expect(rebased.revision).toBe(2)
+    expect(rebased.viewport).toEqual({ x: 30, y: 40, zoom: 2 })
+    expect(rebased.nodes).toEqual([node])
+  })
+
+  test('Given expected revision 超前于磁盘 When 保存可重放 mutation Then 仍拒绝覆盖恢复状态', () => {
+    /** 当前磁盘仅有 revision 1 的存储。 */
+    const store = createStore()
+    /** 用于建立当前 revision 的合法节点。 */
+    const node = createNode()
+    store.mutate('project-1', 0, [{ type: 'upsert-nodes', nodes: [node] }])
+
+    expect(() => store.mutate('project-1', 5, [{
+      type: 'set-viewport',
+      viewport: { x: 1, y: 2, zoom: 1.5 },
+    }])).toThrow('DESIGN_REVISION_CONFLICT')
+    expect(store.load('project-1').document.revision).toBe(1)
+  })
+
+  test('Given 项目 .proma 指向根外目录 When 加载或保存 Then fail closed 且不写外部目录', () => {
+    /** 模拟攻击者控制的项目根外目录。 */
+    const outsideRoot = mkdtempSync(join(tmpdir(), 'proma-design-outside-'))
+    try {
+      symlinkSync(outsideRoot, join(projectRoot, '.proma'), 'dir')
+      /** 路径解析仍指向项目词法范围内的存储。 */
+      const store = createStore()
+
+      expect(() => store.load('project-1')).toThrow('DESIGN_PATH_UNSAFE')
+      expect(() => store.mutate('project-1', 0, [])).toThrow('DESIGN_PATH_UNSAFE')
+      expect(existsSync(join(outsideRoot, 'design'))).toBe(false)
+      expect(existsSync(join(outsideRoot, 'design/canvas.json'))).toBe(false)
+    } finally {
+      rmSync(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
   test('Given mutation 产生悬空素材引用 When 保存 Then schema 校验拒绝落盘', () => {
     /** 使用统一 schema 校验的存储。 */
     const store = createStore()
@@ -132,6 +216,16 @@ describe('Design revision 原子存储', () => {
       type: 'upsert-nodes',
       nodes: [invalidNode],
     }])).toThrow('DESIGN_DOCUMENT_INVALID')
+    expect(existsSync(join(projectRoot, '.proma/design/canvas.json'))).toBe(false)
+  })
+
+  test('Given 空 mutation When 保存 Then 返回当前文档且不创建文件或递增 revision', () => {
+    /** 尚无持久化画布的存储。 */
+    const store = createStore()
+    /** 空 mutation 返回的当前内存文档。 */
+    const unchanged = store.mutate('project-1', 0, [])
+
+    expect(unchanged.revision).toBe(0)
     expect(existsSync(join(projectRoot, '.proma/design/canvas.json'))).toBe(false)
   })
 })
@@ -210,6 +304,63 @@ describe('Design 画布 schema 校验', () => {
     expect(isDesignCanvasDocument(bothReferences, 'project-1')).toBe(false)
     expect(isDesignCanvasDocument(missingReference, 'project-1')).toBe(false)
   })
+
+  test('Given 分组成员关系不是双向一致 When 校验 Then 拒绝悬空归属', () => {
+    /** 分组引用节点、但节点没有 groupId 的文档。 */
+    const groupOnly = createGroupedDocument(undefined, ['node-1'])
+    /** 节点引用分组、但分组没有列出节点的文档。 */
+    const nodeOnly = createGroupedDocument('group-1', [])
+
+    expect(isDesignCanvasDocument(groupOnly, 'project-1')).toBe(false)
+    expect(isDesignCanvasDocument(nodeOnly, 'project-1')).toBe(false)
+  })
+
+  test('Given 素材路径不在固定子目录或使用 drive-relative When 校验 Then 拒绝', () => {
+    /** 用于生成路径变体的合法素材文档。 */
+    const valid = createAssetDocument('assets/image.png', 'thumbnails/image.webp')
+    /** 正式素材试图放到 Design 根其他位置的文档。 */
+    const wrongAssetPrefix = createAssetDocument('image.png', 'thumbnails/image.webp')
+    /** 缩略图试图放到缓存根其他位置的文档。 */
+    const wrongThumbnailPrefix = createAssetDocument('assets/image.png', 'image.webp')
+    /** Windows drive-relative 在非 Windows 主机也必须拒绝。 */
+    const driveRelative = createAssetDocument('C:image.png', 'thumbnails/image.webp')
+
+    expect(isDesignCanvasDocument(valid, 'project-1')).toBe(true)
+    expect(isDesignCanvasDocument(wrongAssetPrefix, 'project-1')).toBe(false)
+    expect(isDesignCanvasDocument(wrongThumbnailPrefix, 'project-1')).toBe(false)
+    expect(isDesignCanvasDocument(driveRelative, 'project-1')).toBe(false)
+  })
+
+  test('Given 素材父版本自环或任意环 When 校验 Then 拒绝循环版本关系', () => {
+    /** 单一素材引用自身的非法文档。 */
+    const selfCycle = createAssetVersions([
+      createAssetRecord('asset-1', 'assets/one.png', 'thumbnails/one.webp', 'asset-1'),
+    ])
+    /** 两个素材互相作为父版本的非法文档。 */
+    const twoNodeCycle = createAssetVersions([
+      createAssetRecord('asset-1', 'assets/one.png', 'thumbnails/one.webp', 'asset-2'),
+      createAssetRecord('asset-2', 'assets/two.png', 'thumbnails/two.webp', 'asset-1'),
+    ])
+
+    expect(isDesignCanvasDocument(selfCycle, 'project-1')).toBe(false)
+    expect(isDesignCanvasDocument(twoNodeCycle, 'project-1')).toBe(false)
+  })
+
+  test('Given 两条素材元数据共享正式路径或缩略图路径 When 校验 Then 拒绝路径别名', () => {
+    /** 两个素材指向同一正式文件的非法文档。 */
+    const duplicateAssetPath = createAssetVersions([
+      createAssetRecord('asset-1', 'assets/shared.png', 'thumbnails/one.webp'),
+      createAssetRecord('asset-2', 'assets/shared.png', 'thumbnails/two.webp'),
+    ])
+    /** 两个素材指向同一缩略图文件的非法文档。 */
+    const duplicateThumbnailPath = createAssetVersions([
+      createAssetRecord('asset-1', 'assets/one.png', 'thumbnails/shared.webp'),
+      createAssetRecord('asset-2', 'assets/two.png', 'thumbnails/shared.webp'),
+    ])
+
+    expect(isDesignCanvasDocument(duplicateAssetPath, 'project-1')).toBe(false)
+    expect(isDesignCanvasDocument(duplicateThumbnailPath, 'project-1')).toBe(false)
+  })
 })
 
 /** 创建不含业务引用的节点基础字段，用于 schema 负向测试。 */
@@ -220,5 +371,58 @@ function createStandaloneNode() {
     width: 100,
     height: 100,
     zIndex: 0,
+  }
+}
+
+/** 创建包含单节点和单分组的文档，用于双向归属校验。 */
+function createGroupedDocument(groupId: string | undefined, nodeIds: string[]) {
+  /** 合法空文档基础字段。 */
+  const document = createEmptyDesignDocument('project-1', 100)
+  return {
+    ...document,
+    nodes: [{
+      ...createStandaloneNode(),
+      id: 'node-1',
+      kind: 'job',
+      jobId: 'job-1',
+      ...(groupId ? { groupId } : {}),
+    }],
+    groups: [{ id: 'group-1', name: '分组', nodeIds }],
+  }
+}
+
+/** 创建单一合法素材文档，并允许替换两个受管相对路径。 */
+function createAssetDocument(relativePath: string, thumbnailRelativePath: string) {
+  return createAssetVersions([
+    createAssetRecord('asset-1', relativePath, thumbnailRelativePath),
+  ])
+}
+
+/** 创建包含给定素材版本记录的画布文档。 */
+function createAssetVersions(assets: object[]) {
+  /** 合法空文档基础字段。 */
+  const document = createEmptyDesignDocument('project-1', 100)
+  return { ...document, assets }
+}
+
+/** 创建一条可组合父版本关系和路径变体的素材记录。 */
+function createAssetRecord(
+  id: string,
+  relativePath: string,
+  thumbnailRelativePath: string,
+  parentAssetId?: string,
+) {
+  return {
+    id,
+    filename: `${id}.png`,
+    relativePath,
+    thumbnailRelativePath,
+    mediaType: 'image/png',
+    width: 10,
+    height: 10,
+    byteSize: 10,
+    sha256: 'abc',
+    createdAt: 100,
+    ...(parentAssetId ? { parentAssetId } : {}),
   }
 }
