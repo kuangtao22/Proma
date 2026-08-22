@@ -149,6 +149,54 @@ describe('Design 编辑 reducer', () => {
     expect(result.document.annotations[0]).toEqual(annotation)
     expect(applyDesignMutations(result.document, result.inverse)).toEqual(document)
   })
+
+  test('Given 删除非末尾批注 When 应用 inverse Then 精确恢复原绘制层级顺序', () => {
+    /** 三条批注的数组顺序即 SVG 绘制层级。 */
+    const document = createDocument()
+    document.annotations = ['a1', 'a2', 'a3'].map((id, index) => ({
+      id,
+      kind: 'arrow' as const,
+      from: { x: index, y: index },
+      to: { x: index + 10, y: index + 10 },
+      color: '#000000',
+      width: 12,
+      createdAt: 200 + index,
+    }))
+
+    const removed = reduceDesignEdit(document, { type: 'remove-annotation', annotationId: 'a2' })
+
+    expect(removed.document.annotations.map((annotation) => annotation.id)).toEqual(['a1', 'a3'])
+    expect(applyDesignMutations(removed.document, removed.inverse)).toEqual(document)
+  })
+
+  test('Given 千节点画布 When 删除分组与取消分组 Then 历史载荷只随选区和受影响分组增长', () => {
+    /** 大画布用于识别把完整节点数组塞入 history 的实现。 */
+    const document = createDocument()
+    document.nodes = Array.from({ length: 1_000 }, (_, index) => createNode(`n${index}`, index))
+    document.groups = [{ id: 'existing-group', name: '已有组', nodeIds: ['n10', 'n11'] }]
+    document.nodes[10] = createNode('n10', 10, 'existing-group')
+    document.nodes[11] = createNode('n11', 11, 'existing-group')
+
+    /** 三类结构编辑均只能携带局部实体。 */
+    const deleted = reduceDesignEdit(document, { type: 'delete-selection', nodeIds: ['n500'] })
+    const grouped = reduceDesignEdit(document, {
+      type: 'group-selection',
+      nodeIds: ['n20', 'n21'],
+      groupId: 'new-group',
+      name: '新组',
+    })
+    const ungrouped = reduceDesignEdit(document, {
+      type: 'ungroup-selection',
+      nodeIds: ['n10', 'n11'],
+    })
+
+    for (const result of [deleted, grouped, ungrouped]) {
+      expect(JSON.stringify({ forward: result.forward, inverse: result.inverse }).length).toBeLessThan(5_000)
+    }
+    expect(applyDesignMutations(deleted.document, deleted.inverse)).toEqual(document)
+    expect(applyDesignMutations(grouped.document, grouped.inverse)).toEqual(document)
+    expect(applyDesignMutations(ungrouped.document, ungrouped.inverse)).toEqual(document)
+  })
 })
 
 describe('Design 编辑历史 Jotai action', () => {

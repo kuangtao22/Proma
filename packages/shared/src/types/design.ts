@@ -88,18 +88,55 @@ export interface DesignCanvasDocument {
   updatedAt: number
 }
 
+/** 局部有序 patch 中待写入实体及其目标数组索引。 */
+export interface DesignIndexedEntity<T extends { id: string }> {
+  entity: T
+  index: number
+}
+
+/**
+ * 先移除受影响 ID，再按目标索引插入局部实体。
+ * @param current 当前有序实体数组。
+ * @param removeIds 本次显式删除或替换的实体 ID。
+ * @param upserts 携带目标绝对索引的新增或替换实体。
+ * @returns 保持未受影响实体相对顺序的新数组。
+ */
+export function applyDesignEntityPatch<T extends { id: string }>(
+  current: T[],
+  removeIds: string[],
+  upserts: Array<DesignIndexedEntity<T>>,
+): T[] {
+  /** upsert 同 ID 也先从基线移除，确保替换不会生成重复实体。 */
+  const replacedIds = new Set([...removeIds, ...upserts.map((item) => item.entity.id)])
+  /** 未受影响实体保持原始相对顺序。 */
+  const next = current.filter((item) => !replacedIds.has(item.id))
+  /** 同索引时保持 mutation 内顺序，确保应用结果确定。 */
+  const orderedUpserts = upserts
+    .map((item, order) => ({ ...item, order }))
+    .sort((left, right) => left.index - right.index || left.order - right.order)
+  for (const item of orderedUpserts) {
+    /** 越界索引收敛到当前数组边界，运行时校验仍拒绝负数。 */
+    const targetIndex = Math.min(item.index, next.length)
+    next.splice(targetIndex, 0, item.entity)
+  }
+  return next
+}
+
 /** Renderer 可提交的受控画布变更。 */
 export type DesignMutation =
   | { type: 'set-viewport'; viewport: DesignViewport }
   | { type: 'move-nodes'; positions: Array<{ nodeId: string; position: DesignPoint }> }
   | { type: 'upsert-nodes'; nodes: DesignCanvasNode[] }
   | { type: 'remove-nodes'; nodeIds: string[] }
+  | { type: 'patch-nodes'; removeIds: string[]; upserts: Array<DesignIndexedEntity<DesignCanvasNode>> }
   | { type: 'upsert-assets'; assets: DesignAsset[] }
   | { type: 'remove-assets'; assetIds: string[] }
   | { type: 'upsert-groups'; groups: DesignGroup[] }
   | { type: 'remove-groups'; groupIds: string[] }
+  | { type: 'patch-groups'; removeIds: string[]; upserts: Array<DesignIndexedEntity<DesignGroup>> }
   | { type: 'upsert-annotations'; annotations: DesignAnnotation[] }
   | { type: 'remove-annotations'; annotationIds: string[] }
+  | { type: 'patch-annotations'; removeIds: string[]; upserts: Array<DesignIndexedEntity<DesignAnnotation>> }
 
 /** 一次图片生成或编辑任务的可恢复记录。 */
 export interface DesignJobRecord {

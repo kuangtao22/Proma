@@ -222,6 +222,79 @@ describe('Design 工作区同步规则', () => {
     expect(harness.loadRequests).toHaveLength(2)
   })
 
+  test('Given 多窗口远端 revision 替换本地快照 When load 完成 Then 清空旧 history 和 future', async () => {
+    /** 初始稳定快照先完成 controller 启动。 */
+    const initialSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 10), revision: 1 },
+      writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: initialSnapshot,
+    })
+    harness.controller.start()
+    harness.loadRequests[0]!.resolve(initialSnapshot)
+    await flushPromises()
+    /** 模拟用户在远端事件到达前已有可撤销历史。 */
+    const historyEntry = {
+      forward: [{ type: 'set-viewport' as const, viewport: { x: 1, y: 1, zoom: 1 } }],
+      inverse: [{ type: 'set-viewport' as const, viewport: { x: 0, y: 0, zoom: 1 } }],
+    }
+    harness.setState({ history: [historyEntry], future: [historyEntry] })
+
+    harness.emitChange({ projectId: 'project-1', revision: 2, cause: 'canvas' })
+    /** 另一窗口提交后的权威 revision。 */
+    const remoteSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 20), revision: 2 },
+      writable: true,
+    }
+    harness.loadRequests[1]!.resolve(remoteSnapshot)
+    await flushPromises()
+
+    expect(harness.getState().snapshot).toBe(remoteSnapshot)
+    expect(harness.getState().history).toEqual([])
+    expect(harness.getState().future).toEqual([])
+  })
+
+  test('Given revision 冲突时仍有旧历史 When 远端 rebase 完成 Then undo 不再保留旧 inverse', async () => {
+    /** 旧 revision 上的 mutation 与历史不能跨 rebase 使用。 */
+    const mutation: DesignMutation = {
+      type: 'set-viewport',
+      viewport: { x: 30, y: 40, zoom: 1.2 },
+    }
+    const historyEntry = {
+      forward: [mutation],
+      inverse: [{ type: 'set-viewport' as const, viewport: { x: 0, y: 0, zoom: 1 } }],
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: {
+        document: { ...createEmptyDesignDocument('project-1', 10), revision: 1 },
+        writable: true,
+      },
+      history: [historyEntry],
+      future: [historyEntry],
+      pendingMutations: [mutation],
+      saveState: 'dirty',
+    })
+    harness.controller.sync()
+    harness.scheduler.runNext()
+    harness.saveRequests[0]!.deferred.reject(new Error('DESIGN_REVISION_CONFLICT: expected=1, current=2'))
+    await flushPromises()
+    /** 冲突恢复返回权威 revision 并重放 pending。 */
+    harness.loadRequests[0]!.resolve({
+      document: { ...createEmptyDesignDocument('project-1', 20), revision: 2 },
+      writable: true,
+    })
+    await flushPromises()
+
+    expect(harness.getState().snapshot?.document.revision).toBe(2)
+    expect(harness.getState().history).toEqual([])
+    expect(harness.getState().future).toEqual([])
+  })
+
   test('Given 已有 dirty 缓存 When 后台 load 失败 Then 保留画布与 pending 且不进入 error', async () => {
     /** 已乐观编辑且等待保存的缓存快照。 */
     const snapshot: DesignWorkspaceSnapshot = {

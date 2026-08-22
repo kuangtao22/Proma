@@ -10,6 +10,7 @@ import {
 } from 'node:fs'
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep, win32 } from 'node:path'
 import {
+  applyDesignEntityPatch,
   DESIGN_DOCUMENT_VERSION,
   createEmptyDesignDocument,
 } from '@proma/shared'
@@ -395,6 +396,9 @@ export function applyDesignMutations(
       case 'remove-nodes':
         next.nodes = next.nodes.filter((node) => !mutation.nodeIds.includes(node.id))
         break
+      case 'patch-nodes':
+        next.nodes = applyDesignEntityPatch(next.nodes, mutation.removeIds, mutation.upserts)
+        break
       case 'upsert-assets':
         next.assets = upsertById(next.assets, mutation.assets)
         break
@@ -407,11 +411,17 @@ export function applyDesignMutations(
       case 'remove-groups':
         next.groups = next.groups.filter((group) => !mutation.groupIds.includes(group.id))
         break
+      case 'patch-groups':
+        next.groups = applyDesignEntityPatch(next.groups, mutation.removeIds, mutation.upserts)
+        break
       case 'upsert-annotations':
         next.annotations = upsertById(next.annotations, mutation.annotations)
         break
       case 'remove-annotations':
         next.annotations = next.annotations.filter((item) => !mutation.annotationIds.includes(item.id))
+        break
+      case 'patch-annotations':
+        next.annotations = applyDesignEntityPatch(next.annotations, mutation.removeIds, mutation.upserts)
         break
       default:
         throw new Error('DESIGN_MUTATION_INVALID')

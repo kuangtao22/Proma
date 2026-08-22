@@ -25,10 +25,13 @@ const RENDERER_MUTATION_TYPES = new Set<DesignMutation['type']>([
   'move-nodes',
   'upsert-nodes',
   'remove-nodes',
+  'patch-nodes',
   'upsert-groups',
   'remove-groups',
+  'patch-groups',
   'upsert-annotations',
   'remove-annotations',
+  'patch-annotations',
 ])
 
 /** Design IPC handler 的最小签名。 */
@@ -99,6 +102,14 @@ function isFiniteNumber(value: unknown): value is number {
 /** 非负整数 revision 判定。 */
 function isRevision(value: unknown): value is number {
   return Number.isInteger(value) && isFiniteNumber(value) && value >= 0
+}
+
+/** 局部 patch 的实体必须携带非负目标数组索引。 */
+function isIndexedEntity(value: unknown, isEntity: (entity: unknown) => boolean): boolean {
+  return isRecord(value)
+    && hasOnlyKeys(value, ['entity', 'index'])
+    && isEntity(value.entity)
+    && isRevision(value.index)
 }
 
 /** 二维坐标结构判定。 */
@@ -179,18 +190,30 @@ function isRendererMutation(value: unknown): value is DesignMutation {
     case 'remove-nodes':
       return hasOnlyKeys(value, ['type', 'nodeIds'])
         && Array.isArray(value.nodeIds) && value.nodeIds.every(isNonEmptyString)
+    case 'patch-nodes':
+      return hasOnlyKeys(value, ['type', 'removeIds', 'upserts'])
+        && Array.isArray(value.removeIds) && value.removeIds.every(isNonEmptyString)
+        && Array.isArray(value.upserts) && value.upserts.every((item) => isIndexedEntity(item, isCanvasNode))
     case 'upsert-groups':
       return hasOnlyKeys(value, ['type', 'groups'])
         && Array.isArray(value.groups) && value.groups.every(isGroup)
     case 'remove-groups':
       return hasOnlyKeys(value, ['type', 'groupIds'])
         && Array.isArray(value.groupIds) && value.groupIds.every(isNonEmptyString)
+    case 'patch-groups':
+      return hasOnlyKeys(value, ['type', 'removeIds', 'upserts'])
+        && Array.isArray(value.removeIds) && value.removeIds.every(isNonEmptyString)
+        && Array.isArray(value.upserts) && value.upserts.every((item) => isIndexedEntity(item, isGroup))
     case 'upsert-annotations':
       return hasOnlyKeys(value, ['type', 'annotations'])
         && Array.isArray(value.annotations) && value.annotations.every(isAnnotation)
     case 'remove-annotations':
       return hasOnlyKeys(value, ['type', 'annotationIds'])
         && Array.isArray(value.annotationIds) && value.annotationIds.every(isNonEmptyString)
+    case 'patch-annotations':
+      return hasOnlyKeys(value, ['type', 'removeIds', 'upserts'])
+        && Array.isArray(value.removeIds) && value.removeIds.every(isNonEmptyString)
+        && Array.isArray(value.upserts) && value.upserts.every((item) => isIndexedEntity(item, isAnnotation))
     default:
       return false
   }
@@ -217,6 +240,10 @@ function parseSaveInput(value: unknown): SaveDesignMutationsInput {
     }
     if (!isRendererMutation(mutation)) throw new Error('Design 请求结构无效')
     if (mutation.type === 'upsert-nodes' && mutation.nodes.some((node) => node.kind === 'job')) {
+      throw new Error('不允许通过画布保存创建任务节点')
+    }
+    if (mutation.type === 'patch-nodes'
+      && mutation.upserts.some((item) => item.entity.kind === 'job')) {
       throw new Error('不允许通过画布保存创建任务节点')
     }
   }

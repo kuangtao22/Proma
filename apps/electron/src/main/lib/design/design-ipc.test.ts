@@ -273,6 +273,78 @@ describe('Design IPC', () => {
     expect(fixture.guardProjects).toEqual([])
   })
 
+  test('Given 局部有序 patch When IPC 校验 Then 接受合法索引并拒绝负索引和任务节点', async () => {
+    const fixture = createFixture()
+    registerDesignIpcHandlers(fixture.options)
+    /** 合法素材节点 patch 应进入写守卫。 */
+    await invoke(fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, fixture.senders[0]!, {
+      projectId: 'project-1',
+      expectedRevision: 0,
+      mutations: [{
+        type: 'patch-nodes',
+        removeIds: [],
+        upserts: [{
+          entity: {
+            id: 'asset-node-1',
+            kind: 'asset',
+            assetId: 'asset-1',
+            position: { x: 0, y: 0 },
+            width: 320,
+            height: 240,
+            zIndex: 1,
+          },
+          index: 0,
+        }],
+      }],
+    })
+    expect(fixture.guardProjects).toEqual(['project-1'])
+
+    /** 负索引必须在写守卫前被结构校验拒绝。 */
+    await expect(invoke(fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, fixture.senders[0]!, {
+      projectId: 'project-1',
+      expectedRevision: 1,
+      mutations: [{
+        type: 'patch-annotations',
+        removeIds: [],
+        upserts: [{
+          entity: {
+            id: 'annotation-1',
+            kind: 'arrow',
+            from: { x: 0, y: 0 },
+            to: { x: 10, y: 10 },
+            color: '#000000',
+            width: 12,
+            createdAt: 10,
+          },
+          index: -1,
+        }],
+      }],
+    })).rejects.toThrow('Design 请求结构无效')
+
+    /** patch 同样不能绕过任务节点所有权边界。 */
+    await expect(invoke(fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, fixture.senders[0]!, {
+      projectId: 'project-1',
+      expectedRevision: 1,
+      mutations: [{
+        type: 'patch-nodes',
+        removeIds: [],
+        upserts: [{
+          entity: {
+            id: 'job-node-1',
+            kind: 'job',
+            jobId: 'forged-job-1',
+            position: { x: 0, y: 0 },
+            width: 320,
+            height: 240,
+            zIndex: 1,
+          },
+          index: 0,
+        }],
+      }],
+    })).rejects.toThrow('不允许通过画布保存创建任务节点')
+    expect(fixture.guardProjects).toEqual(['project-1'])
+  })
+
   test('Given 项目离线或迁移中 When 加载 Then 返回空只读快照且不触碰项目目录', async () => {
     const fixture = createFixture()
     /** 记录生产 store 是否被错误调用。 */

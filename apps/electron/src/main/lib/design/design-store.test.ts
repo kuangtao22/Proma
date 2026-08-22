@@ -13,7 +13,7 @@ import { join } from 'node:path'
 import type { DesignCanvasNode } from '@proma/shared'
 import { createEmptyDesignDocument } from '@proma/shared'
 import { createDesignPathResolver } from './design-paths'
-import { createDesignStore, isDesignCanvasDocument } from './design-store'
+import { applyDesignMutations, createDesignStore, isDesignCanvasDocument } from './design-store'
 
 describe('Design revision 原子存储', () => {
   /** 每个用例使用的独立项目根。 */
@@ -290,6 +290,36 @@ describe('Design revision 原子存储', () => {
 
     expect(unchanged.revision).toBe(0)
     expect(existsSync(join(projectRoot, '.proma/design/canvas.json'))).toBe(false)
+  })
+})
+
+describe('Design 局部有序 patch', () => {
+  test('Given 中间实体被删除 When 主进程应用 inverse patch Then 精确恢复数组顺序', () => {
+    /** 批注数组顺序用于验证主进程与 renderer 使用同一有序语义。 */
+    const document = createEmptyDesignDocument('project-1', 100)
+    document.annotations = ['a1', 'a2', 'a3'].map((id, index) => ({
+      id,
+      kind: 'arrow' as const,
+      from: { x: index, y: index },
+      to: { x: index + 1, y: index + 1 },
+      color: '#000000',
+      width: 1,
+      createdAt: index,
+    }))
+    /** 删除中间批注的局部 patch。 */
+    const removed = applyDesignMutations(document, [{
+      type: 'patch-annotations',
+      removeIds: ['a2'],
+      upserts: [],
+    }])
+    /** 只携带原实体和索引的 inverse patch。 */
+    const restored = applyDesignMutations(removed, [{
+      type: 'patch-annotations',
+      removeIds: [],
+      upserts: [{ entity: document.annotations[1]!, index: 1 }],
+    }])
+
+    expect(restored).toEqual(document)
   })
 })
 

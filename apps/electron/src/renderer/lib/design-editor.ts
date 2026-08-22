@@ -5,6 +5,7 @@ import type {
   DesignGroup,
   DesignMutation,
 } from '@proma/shared'
+import { applyDesignEntityPatch } from '@proma/shared'
 
 /** 复制选区命令，副本 ID 必须由调用方按节点顺序提供。 */
 export interface DuplicateSelectionCommand {
@@ -122,6 +123,9 @@ export function applyDesignMutations(
         next.nodes = next.nodes.filter((node) => !removedIds.has(node.id))
         break
       }
+      case 'patch-nodes':
+        next.nodes = applyDesignEntityPatch(next.nodes, mutation.removeIds, mutation.upserts)
+        break
       case 'upsert-assets':
         next.assets = upsertById(next.assets, mutation.assets)
         break
@@ -140,6 +144,9 @@ export function applyDesignMutations(
         next.groups = next.groups.filter((group) => !removedIds.has(group.id))
         break
       }
+      case 'patch-groups':
+        next.groups = applyDesignEntityPatch(next.groups, mutation.removeIds, mutation.upserts)
+        break
       case 'upsert-annotations':
         next.annotations = upsertById(next.annotations, mutation.annotations)
         break
@@ -149,28 +156,17 @@ export function applyDesignMutations(
         next.annotations = next.annotations.filter((annotation) => !removedIds.has(annotation.id))
         break
       }
+      case 'patch-annotations':
+        next.annotations = applyDesignEntityPatch(next.annotations, mutation.removeIds, mutation.upserts)
+        break
     }
   }
   return next
 }
 
-/** 生成完整重建节点集合的 mutation，保证撤销后数组顺序与原文档一致。 */
-function replaceNodesMutations(
-  current: DesignCanvasNode[],
-  replacement: DesignCanvasNode[],
-): DesignMutation[] {
-  return [
-    ...(current.length > 0 ? [{ type: 'remove-nodes' as const, nodeIds: current.map((node) => node.id) }] : []),
-    ...(replacement.length > 0 ? [{ type: 'upsert-nodes' as const, nodes: replacement }] : []),
-  ]
-}
-
-/** 生成完整重建分组集合的 mutation，保证 inverse 恢复原始顺序。 */
-function replaceGroupsMutations(current: DesignGroup[], replacement: DesignGroup[]): DesignMutation[] {
-  return [
-    ...(current.length > 0 ? [{ type: 'remove-groups' as const, groupIds: current.map((group) => group.id) }] : []),
-    ...(replacement.length > 0 ? [{ type: 'upsert-groups' as const, groups: replacement }] : []),
-  ]
+/** 从完整数组中提取受影响实体及其绝对索引。 */
+function indexedEntities<T extends { id: string }>(entities: T[], entityIds: Set<string>) {
+  return entities.flatMap((entity, index) => entityIds.has(entity.id) ? [{ entity, index }] : [])
 }
 
 /** 返回没有持久化副作用的编辑结果。 */
@@ -233,14 +229,28 @@ export function reduceDesignEdit(
       const nextGroups = document.groups
         .map((group) => ({ ...group, nodeIds: group.nodeIds.filter((nodeId) => !removedIds.has(nodeId)) }))
         .filter((group) => group.nodeIds.length > 0)
-      const forward = [
-        { type: 'remove-nodes' as const, nodeIds: [...removedIds] },
-        ...(document.groups.length > 0 ? replaceGroupsMutations(document.groups, nextGroups) : []),
-      ]
-      const inverse = [
-        ...replaceNodesMutations(nextNodes, document.nodes),
-        ...(document.groups.length > 0 ? replaceGroupsMutations(nextGroups, document.groups) : []),
-      ]
+      /** 只有成员发生变化的分组进入局部 patch。 */
+      const affectedGroupIds = new Set(document.groups
+        .filter((group) => group.nodeIds.some((nodeId) => removedIds.has(nodeId)))
+        .map((group) => group.id))
+      const forward: DesignMutation[] = [{ type: 'patch-nodes', removeIds: [...removedIds], upserts: [] }]
+      const inverse: DesignMutation[] = [{
+        type: 'patch-nodes',
+        removeIds: [],
+        upserts: indexedEntities(document.nodes, removedIds),
+      }]
+      if (affectedGroupIds.size > 0) {
+        forward.push({
+          type: 'patch-groups',
+          removeIds: [...affectedGroupIds],
+          upserts: indexedEntities(nextGroups, affectedGroupIds),
+        })
+        inverse.push({
+          type: 'patch-groups',
+          removeIds: [...affectedGroupIds],
+          upserts: indexedEntities(document.groups, affectedGroupIds),
+        })
+      }
       return { document: applyDesignMutations(document, forward), forward, inverse, selection: [] }
     }
     case 'group-selection': {
@@ -262,17 +272,18 @@ export function reduceDesignEdit(
       const nextNodes = document.nodes.map((node) => selectedSet.has(node.id)
         ? { ...node, groupId: command.groupId }
         : node)
-      /** 正向仅发送选中节点，避免分组操作复制全画布节点。 */
-      const changedNodes = nextNodes.filter((node) => selectedSet.has(node.id))
-      /** inverse 仅恢复选中节点原值。 */
-      const originalNodes = document.nodes.filter((node) => selectedSet.has(node.id))
-      const forward = [
-        { type: 'upsert-nodes' as const, nodes: changedNodes },
-        ...replaceGroupsMutations(document.groups, nextGroups),
+      /** 旧分组和新分组共同构成唯一受影响集合。 */
+      const affectedGroupIds = new Set([
+        command.groupId,
+        ...document.nodes.flatMap((node) => selectedSet.has(node.id) && node.groupId ? [node.groupId] : []),
+      ])
+      const forward: DesignMutation[] = [
+        { type: 'patch-nodes', removeIds: selectedIds, upserts: indexedEntities(nextNodes, selectedSet) },
+        { type: 'patch-groups', removeIds: [...affectedGroupIds], upserts: indexedEntities(nextGroups, affectedGroupIds) },
       ]
-      const inverse = [
-        { type: 'upsert-nodes' as const, nodes: originalNodes },
-        ...replaceGroupsMutations(nextGroups, document.groups),
+      const inverse: DesignMutation[] = [
+        { type: 'patch-nodes', removeIds: selectedIds, upserts: indexedEntities(document.nodes, selectedSet) },
+        { type: 'patch-groups', removeIds: [...affectedGroupIds], upserts: indexedEntities(document.groups, affectedGroupIds) },
       ]
       return { document: applyDesignMutations(document, forward), forward, inverse, selection: selectedIds }
     }
@@ -290,35 +301,50 @@ export function reduceDesignEdit(
       const nextGroups = document.groups
         .map((group) => ({ ...group, nodeIds: group.nodeIds.filter((nodeId) => !selectedIds.has(nodeId)) }))
         .filter((group) => group.nodeIds.length > 0)
-      /** 正向仅发送解除分组的节点。 */
-      const changedNodes = nextNodes.filter((node) => selectedIds.has(node.id))
-      /** inverse 仅恢复这些节点原 groupId。 */
-      const originalNodes = document.nodes.filter((node) => selectedIds.has(node.id))
-      const forward = [
-        { type: 'upsert-nodes' as const, nodes: changedNodes },
-        ...replaceGroupsMutations(document.groups, nextGroups),
+      /** 仅选中节点原所属分组会变化。 */
+      const affectedGroupIds = new Set(document.nodes.flatMap((node) => (
+        selectedIds.has(node.id) && node.groupId ? [node.groupId] : []
+      )))
+      const forward: DesignMutation[] = [
+        { type: 'patch-nodes', removeIds: [...selectedIds], upserts: indexedEntities(nextNodes, selectedIds) },
+        { type: 'patch-groups', removeIds: [...affectedGroupIds], upserts: indexedEntities(nextGroups, affectedGroupIds) },
       ]
-      const inverse = [
-        { type: 'upsert-nodes' as const, nodes: originalNodes },
-        ...replaceGroupsMutations(nextGroups, document.groups),
+      const inverse: DesignMutation[] = [
+        { type: 'patch-nodes', removeIds: [...selectedIds], upserts: indexedEntities(document.nodes, selectedIds) },
+        { type: 'patch-groups', removeIds: [...affectedGroupIds], upserts: indexedEntities(document.groups, affectedGroupIds) },
       ]
       return { document: applyDesignMutations(document, forward), forward, inverse, selection: command.nodeIds }
     }
     case 'add-annotation': {
       /** 同 ID 批注存在时 inverse 恢复旧值，否则删除新增值。 */
-      const previous = document.annotations.find((annotation) => annotation.id === command.annotation.id)
-      const forward: DesignMutation[] = [{ type: 'upsert-annotations', annotations: [command.annotation] }]
+      const previousIndex = document.annotations.findIndex((annotation) => annotation.id === command.annotation.id)
+      const previous = previousIndex >= 0 ? document.annotations[previousIndex] : undefined
+      const targetIndex = previousIndex >= 0 ? previousIndex : document.annotations.length
+      const forward: DesignMutation[] = [{
+        type: 'patch-annotations',
+        removeIds: [command.annotation.id],
+        upserts: [{ entity: command.annotation, index: targetIndex }],
+      }]
       const inverse: DesignMutation[] = previous
-        ? [{ type: 'upsert-annotations', annotations: [previous] }]
-        : [{ type: 'remove-annotations', annotationIds: [command.annotation.id] }]
+        ? [{
+            type: 'patch-annotations',
+            removeIds: [command.annotation.id],
+            upserts: [{ entity: previous, index: previousIndex }],
+          }]
+        : [{ type: 'patch-annotations', removeIds: [command.annotation.id], upserts: [] }]
       return { document: applyDesignMutations(document, forward), forward, inverse, selection: [] }
     }
     case 'remove-annotation': {
       /** 不存在的批注不产生历史噪音。 */
-      const annotation = document.annotations.find((item) => item.id === command.annotationId)
+      const annotationIndex = document.annotations.findIndex((item) => item.id === command.annotationId)
+      const annotation = annotationIndex >= 0 ? document.annotations[annotationIndex] : undefined
       if (!annotation) return unchangedResult(document)
-      const forward: DesignMutation[] = [{ type: 'remove-annotations', annotationIds: [annotation.id] }]
-      const inverse: DesignMutation[] = [{ type: 'upsert-annotations', annotations: [annotation] }]
+      const forward: DesignMutation[] = [{ type: 'patch-annotations', removeIds: [annotation.id], upserts: [] }]
+      const inverse: DesignMutation[] = [{
+        type: 'patch-annotations',
+        removeIds: [],
+        upserts: [{ entity: annotation, index: annotationIndex }],
+      }]
       return { document: applyDesignMutations(document, forward), forward, inverse, selection: [] }
     }
   }

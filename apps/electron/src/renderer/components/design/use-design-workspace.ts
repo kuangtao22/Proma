@@ -5,6 +5,7 @@ import type {
   DesignMutation,
   DesignWorkspaceSnapshot,
 } from '@proma/shared'
+import { applyDesignEntityPatch } from '@proma/shared'
 import { useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
 import {
@@ -131,6 +132,9 @@ export function applyDesignMutationsToDocument(
         next.nodes = next.nodes.filter((node) => !removedIds.has(node.id))
         break
       }
+      case 'patch-nodes':
+        next.nodes = applyDesignEntityPatch(next.nodes, mutation.removeIds, mutation.upserts)
+        break
       case 'upsert-assets':
         next.assets = upsertDesignEntities(next.assets, mutation.assets)
         break
@@ -149,6 +153,9 @@ export function applyDesignMutationsToDocument(
         next.groups = next.groups.filter((group) => !removedIds.has(group.id))
         break
       }
+      case 'patch-groups':
+        next.groups = applyDesignEntityPatch(next.groups, mutation.removeIds, mutation.upserts)
+        break
       case 'upsert-annotations':
         next.annotations = upsertDesignEntities(next.annotations, mutation.annotations)
         break
@@ -158,6 +165,9 @@ export function applyDesignMutationsToDocument(
         next.annotations = next.annotations.filter((annotation) => !removedIds.has(annotation.id))
         break
       }
+      case 'patch-annotations':
+        next.annotations = applyDesignEntityPatch(next.annotations, mutation.removeIds, mutation.upserts)
+        break
     }
   }
   return next
@@ -286,6 +296,8 @@ export function createDesignWorkspaceController(
         dependencies.updateState({
           phase: 'ready',
           snapshot: { ...snapshot, document: rebasedDocument },
+          history: [],
+          future: [],
           saveState: 'failed',
           conflictRecoveryPending: false,
           error: DESIGN_REVISION_CONFLICT_MESSAGE,
@@ -308,7 +320,14 @@ export function createDesignWorkspaceController(
         scheduleSave()
         return
       }
-      dependencies.updateState({ phase: 'ready', snapshot, error: null, saveState: 'saved' })
+      dependencies.updateState({
+        phase: 'ready',
+        snapshot,
+        history: [],
+        future: [],
+        error: null,
+        saveState: 'saved',
+      })
       if (snapshot.recoveredFrom) dependencies.onRecovered?.(snapshot)
     } catch (error) {
       if (disposed || requestSequence !== latestLoadSequence) return
