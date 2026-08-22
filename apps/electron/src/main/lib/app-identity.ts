@@ -19,7 +19,7 @@ export function resolveAppIdentity(isPackaged: boolean, rawInstance?: string): A
   /** 去除会污染进程名称或目录名的开发实例字符。 */
   const instance = rawInstance?.replace(/[^a-zA-Z0-9_-]/g, '') || undefined
   return {
-    displayName: instance ? `Proma Dev - ${instance}` : 'Proma Dev',
+    displayName: instance ? `PromaDev - ${instance}` : 'PromaDev',
     appId: 'com.bone.proma.dev',
     userDataDirectoryName: instance ? `@proma/electron-dev-${instance}` : '@proma/electron-dev',
   }
