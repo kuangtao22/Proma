@@ -537,6 +537,7 @@ export function createDesignWorkspaceController(
       dependencies.updateState({
         phase: 'ready',
         selectedNodeIds: [],
+        inspectorAssetId: null,
         history: [],
         future: [],
         pendingMutations: [],

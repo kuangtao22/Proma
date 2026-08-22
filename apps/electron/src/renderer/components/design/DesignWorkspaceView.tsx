@@ -17,6 +17,7 @@ import {
 } from '@/lib/design-editor'
 import { DesignCanvas } from './DesignCanvas'
 import { DesignToolbar } from './DesignToolbar'
+import { useDesignInspectorActions } from './use-design-inspector-actions'
 import {
   isDesignStructuralConflictBlocked,
   useDesignWorkspace,
@@ -214,6 +215,8 @@ export function DesignWorkspaceStateView({
 /** 从当前项目读取隔离状态并渲染设计工作区。 */
 export function DesignWorkspaceView(): React.ReactElement {
   const projectId = useAtomValue(currentAgentWorkspaceIdAtom)
+  const updateProjectState = useSetAtom(updateDesignProjectStateAtom)
+  const assetActions = useDesignInspectorActions(projectId)
   const { state, retry, retrySave, acceptRemoteVersion } = useDesignWorkspace(projectId)
 
   if (!projectId) {
@@ -229,6 +232,8 @@ export function DesignWorkspaceView(): React.ReactElement {
       onRetry={retry}
       onRetrySave={retrySave}
       onAcceptRemoteVersion={acceptRemoteVersion}
+      onImportAssets={assetActions.importAssets}
+      onCreateJob={() => updateProjectState({ projectId, update: { inspectorTab: 'ai' } })}
     />
   )
 }

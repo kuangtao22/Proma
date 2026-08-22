@@ -25,6 +25,8 @@ export interface DesignProjectState {
   snapshot: DesignWorkspaceSnapshot | null
   jobs: DesignJobRecord[]
   selectedNodeIds: string[]
+  /** 右栏直接选中的素材；允许无画布节点素材进入详情与删除流程。 */
+  inspectorAssetId: string | null
   activeTool: 'select' | 'pan' | 'arrow' | 'mask'
   inspectorTab: 'assets' | 'ai' | 'versions'
   history: DesignHistoryEntry[]
@@ -50,6 +52,7 @@ export function createInitialDesignProjectState(): DesignProjectState {
     snapshot: null,
     jobs: [],
     selectedNodeIds: [],
+    inspectorAssetId: null,
     activeTool: 'select',
     inspectorTab: 'assets',
     history: [],
@@ -128,6 +131,7 @@ export const executeDesignEditAtom = atom(
       update: {
         snapshot: { ...current.snapshot, document: result.document },
         selectedNodeIds: result.selection,
+        inspectorAssetId: null,
         history: [...current.history, { forward: result.forward, inverse: result.inverse }],
         future: [],
         pendingMutations: [...current.pendingMutations, ...result.forward],
@@ -154,6 +158,7 @@ export const undoDesignEditAtom = atom(
           document: applyDesignMutations(current.snapshot.document, entry.inverse),
         },
         selectedNodeIds: [],
+        inspectorAssetId: null,
         history: current.history.slice(0, -1),
         future: [...current.future, entry],
         pendingMutations: [...current.pendingMutations, ...entry.inverse],
@@ -180,6 +185,7 @@ export const redoDesignEditAtom = atom(
           document: applyDesignMutations(current.snapshot.document, entry.forward),
         },
         selectedNodeIds: [],
+        inspectorAssetId: null,
         history: [...current.history, entry],
         future: current.future.slice(0, -1),
         pendingMutations: [...current.pendingMutations, ...entry.forward],

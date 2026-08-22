@@ -233,14 +233,15 @@ export function DesignCanvas({
     /** XYFlow 返回的当前选区稳定 ID。 */
     const nextSelectedNodeIds = nodes.map((node) => node.id)
     /** 回调触发时读取该项目 atom 最新选区，避免 prop 尚未重渲染时重复写入。 */
-    const currentSelectedNodeIds = store.get(designProjectStatesAtom)
-      .get(document.projectId)?.selectedNodeIds
-      ?? selectedNodeIdsRef.current
-    if (haveSameSelectedNodeIds(currentSelectedNodeIds, nextSelectedNodeIds)) return
+    /** 最新项目状态同时决定是否需要清除右栏独立素材选中态。 */
+    const currentState = store.get(designProjectStatesAtom).get(document.projectId)
+    const currentSelectedNodeIds = currentState?.selectedNodeIds ?? selectedNodeIdsRef.current
+    if (haveSameSelectedNodeIds(currentSelectedNodeIds, nextSelectedNodeIds)
+      && !currentState?.inspectorAssetId) return
     selectedNodeIdsRef.current = nextSelectedNodeIds
     updateProjectState({
       projectId: document.projectId,
-      update: { selectedNodeIds: nextSelectedNodeIds },
+      update: { selectedNodeIds: nextSelectedNodeIds, inspectorAssetId: null },
     })
   }, [document.projectId, store, updateProjectState])
 
