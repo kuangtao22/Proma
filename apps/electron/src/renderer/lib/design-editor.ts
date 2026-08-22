@@ -175,6 +175,75 @@ function unchangedResult(document: DesignCanvasDocument, selection: string[] = [
 }
 
 /**
+ * 判断节点选区是否包含由任务生命周期拥有的 job 节点。
+ * @param document 当前画布文档。
+ * @param nodeIds 当前选中节点 ID。
+ * @returns 任一真实选中节点为 job 时返回 true。
+ */
+export function selectionContainsDesignJobNode(
+  document: DesignCanvasDocument,
+  nodeIds: string[],
+): boolean {
+  /** 选区集合用于单次线性扫描文档节点。 */
+  const selectedIds = new Set(nodeIds)
+  return document.nodes.some((node) => selectedIds.has(node.id) && node.kind === 'job')
+}
+
+/**
+ * 判断 mutation 是否会结构性创建、删除或改写 job 节点及其分组。
+ * @param document mutation 应用前的当前画布文档。
+ * @param mutations 待乐观应用的正向或逆向 mutation。
+ * @returns 不触碰 job 结构，或仅移动节点/视口时返回 true。
+ */
+export function areDesignMutationsJobSafe(
+  document: DesignCanvasDocument,
+  mutations: DesignMutation[],
+): boolean {
+  /** 当前及待写入 job ID 共同构成受保护节点集合。 */
+  const jobNodeIds = new Set([
+    ...document.nodes.filter((node) => node.kind === 'job').map((node) => node.id),
+    ...mutations.flatMap((mutation) => {
+      if (mutation.type === 'upsert-nodes') {
+        return mutation.nodes.filter((node) => node.kind === 'job').map((node) => node.id)
+      }
+      if (mutation.type === 'patch-nodes') {
+        return mutation.upserts
+          .filter((item) => item.entity.kind === 'job')
+          .map((item) => item.entity.id)
+      }
+      return []
+    }),
+  ])
+  /** 当前分组索引用于识别删除或替换包含 job 的分组。 */
+  const groupsById = new Map(document.groups.map((group) => [group.id, group]))
+  /** 判断一个分组是否引用受保护 job 节点。 */
+  const containsJob = (nodeIds: string[]): boolean => nodeIds.some((nodeId) => jobNodeIds.has(nodeId))
+
+  return mutations.every((mutation) => {
+    switch (mutation.type) {
+      case 'upsert-nodes':
+        return mutation.nodes.every((node) => node.kind !== 'job' && !jobNodeIds.has(node.id))
+      case 'remove-nodes':
+        return mutation.nodeIds.every((nodeId) => !jobNodeIds.has(nodeId))
+      case 'patch-nodes':
+        return mutation.removeIds.every((nodeId) => !jobNodeIds.has(nodeId))
+          && mutation.upserts.every((item) => item.entity.kind !== 'job' && !jobNodeIds.has(item.entity.id))
+      case 'upsert-groups':
+        return mutation.groups.every((group) => (
+          !containsJob(group.nodeIds) && !containsJob(groupsById.get(group.id)?.nodeIds ?? [])
+        ))
+      case 'remove-groups':
+        return mutation.groupIds.every((groupId) => !containsJob(groupsById.get(groupId)?.nodeIds ?? []))
+      case 'patch-groups':
+        return mutation.removeIds.every((groupId) => !containsJob(groupsById.get(groupId)?.nodeIds ?? []))
+          && mutation.upserts.every((item) => !containsJob(item.entity.nodeIds))
+      default:
+        return true
+    }
+  })
+}
+
+/**
  * 把一个确定性编辑命令归约为文档和可持久化的正向/逆向 mutation。
  * @param document 当前项目画布文档。
  * @param command 调用方已补齐新 ID 与时间的编辑命令。
@@ -184,6 +253,10 @@ export function reduceDesignEdit(
   document: DesignCanvasDocument,
   command: DesignEditCommand,
 ): DesignEditResult {
+  if ('nodeIds' in command && selectionContainsDesignJobNode(document, command.nodeIds)) {
+    /** job 节点首版只允许选择与移动，全部结构命令保持无副作用。 */
+    return unchangedResult(document, command.nodeIds)
+  }
   switch (command.type) {
     case 'duplicate-selection': {
       /** 按调用方选区顺序查找可复制节点。 */
@@ -354,11 +427,17 @@ export function reduceDesignEdit(
  * 解析 Design 画布快捷键，输入控件和 contenteditable 始终保留原生行为。
  * @param event 键盘事件的可测试最小结构。
  * @param hasSelection 当前项目是否有节点选区。
+ * @param canEditSelection 当前选区是否允许结构编辑。
+ * @param canUndo 最近历史项是否允许安全撤销。
+ * @param canRedo 最近 future 项是否允许安全重做。
  * @returns 可执行编辑动作；不应拦截时返回 null。
  */
 export function resolveDesignKeyboardAction(
   event: DesignKeyboardEvent,
   hasSelection: boolean,
+  canEditSelection = hasSelection,
+  canUndo = true,
+  canRedo = true,
 ): DesignKeyboardAction | null {
   /** 输入类目标不接管复制、删除或分组键。 */
   const target = typeof event.target === 'object' && event.target !== null
@@ -373,8 +452,11 @@ export function resolveDesignKeyboardAction(
   /** 平台主修饰键同时兼容 macOS 与 Windows/Linux。 */
   const commandKey = event.metaKey === true || event.ctrlKey === true
   const key = event.key.toLowerCase()
-  if (commandKey && key === 'z') return event.shiftKey ? 'redo' : 'undo'
-  if (!hasSelection) return null
+  if (commandKey && key === 'z') {
+    if (event.shiftKey) return canRedo ? 'redo' : null
+    return canUndo ? 'undo' : null
+  }
+  if (!hasSelection || !canEditSelection) return null
   if (commandKey && key === 'c') return 'duplicate'
   if (key === 'backspace' || key === 'delete') return 'delete'
   if (commandKey && key === 'g') return event.shiftKey ? 'ungroup' : 'group'

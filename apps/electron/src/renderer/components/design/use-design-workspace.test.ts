@@ -377,6 +377,68 @@ describe('Design 工作区同步规则', () => {
     expect(harness.getState().future).toEqual([])
   })
 
+  test('Given 本地分组基于位置 0 且远端已移动到 100 When 结构保存冲突 Then 保留远端位置且不自动重放或重试保存', async () => {
+    /** 本地结构 patch 携带冲突前位置，不能覆盖远端已提交的新位置。 */
+    const localNode = {
+      id: 'node-1',
+      kind: 'asset' as const,
+      assetId: 'asset-1',
+      position: { x: 0, y: 0 },
+      width: 100,
+      height: 80,
+      zIndex: 0,
+      groupId: 'group-local',
+    }
+    /** 分组命令产生的两条结构 mutation。 */
+    const structuralMutations: DesignMutation[] = [
+      { type: 'patch-nodes', removeIds: ['node-1'], upserts: [{ entity: localNode, index: 0 }] },
+      {
+        type: 'patch-groups',
+        removeIds: ['group-local'],
+        upserts: [{ entity: { id: 'group-local', name: '本地组', nodeIds: ['node-1'] }, index: 0 }],
+      },
+    ]
+    /** 保存前的乐观文档已包含本地分组。 */
+    const localDocument = {
+      ...createEmptyDesignDocument('project-1', 10),
+      nodes: [localNode],
+      groups: [{ id: 'group-local', name: '本地组', nodeIds: ['node-1'] }],
+      revision: 1,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: { document: localDocument, writable: true },
+      pendingMutations: structuralMutations,
+      saveState: 'dirty',
+    })
+    harness.controller.sync()
+    harness.scheduler.runNext()
+    harness.saveRequests[0]!.deferred.reject(new Error('DESIGN_REVISION_CONFLICT: expected=1, current=2'))
+    await flushPromises()
+
+    /** 远端节点已由另一窗口移动，且没有本地尚未提交的分组。 */
+    const remoteDocument = {
+      ...createEmptyDesignDocument('project-1', 20),
+      nodes: [{ ...localNode, position: { x: 100, y: 100 }, groupId: undefined }],
+      groups: [],
+      revision: 2,
+    }
+    harness.loadRequests[0]!.resolve({ document: remoteDocument, writable: true })
+    await flushPromises()
+
+    expect(harness.getState().snapshot?.document).toEqual(remoteDocument)
+    expect(harness.getState().snapshot?.document.nodes[0]?.position).toEqual({ x: 100, y: 100 })
+    expect(harness.getState().snapshot?.document.groups).toEqual([])
+    expect(harness.getState().pendingMutations).toEqual(structuralMutations)
+    expect(harness.getState().conflictRecoveryPending).toBe(true)
+    expect(harness.getState().saveState).toBe('failed')
+
+    harness.controller.retrySave()
+    expect(harness.scheduler.getDelays()).toEqual([])
+    expect(harness.saveRequests).toHaveLength(1)
+  })
+
   test('Given 已有 dirty 缓存 When 后台 load 失败 Then 保留画布与 pending 且不进入 error', async () => {
     /** 已乐观编辑且等待保存的缓存快照。 */
     const snapshot: DesignWorkspaceSnapshot = {
@@ -569,13 +631,13 @@ describe('Design 工作区同步规则', () => {
     expect(harness.getState().pendingMutations).toEqual([])
   })
 
-  test('Given A 保存冲突且期间新增 B When reload 最新快照 Then 基于新 revision 重放 A+B 并等待手动重试', async () => {
+  test('Given 位置 A 保存冲突且期间新增结构 B When reload 最新快照 Then 保留远端基线并阻断整批重试', async () => {
     /** 冲突保存中已发出的 mutation A。 */
     const mutationA: DesignMutation = {
       type: 'set-viewport',
       viewport: { x: 21, y: 22, zoom: 1.1 },
     }
-    /** A 保存期间新增的 mutation B。 */
+    /** A 保存期间新增的结构 mutation B 使整批不再允许自动 rebase。 */
     const mutationB: DesignMutation = {
       type: 'upsert-nodes',
       nodes: [{ id: 'node-b', kind: 'asset', position: { x: 40, y: 50 }, width: 100, height: 80, zIndex: 2 }],
@@ -619,20 +681,17 @@ describe('Design 工作区同步规则', () => {
     await flushPromises()
 
     expect(harness.getState().snapshot?.document.revision).toBe(2)
-    expect(harness.getState().snapshot?.document.viewport).toEqual(mutationA.viewport)
-    expect(harness.getState().snapshot?.document.nodes.map((node) => node.id)).toEqual(['node-remote', 'node-b'])
+    expect(harness.getState().snapshot?.document.viewport).toEqual(remoteSnapshot.document.viewport)
+    expect(harness.getState().snapshot?.document.nodes.map((node) => node.id)).toEqual(['node-remote'])
     expect(harness.getState().snapshot?.assetBaseUrl).toBe('proma-file://new/assets/')
     expect(harness.getState().saveState).toBe('failed')
+    expect(harness.getState().conflictRecoveryPending).toBe(true)
+    expect(harness.getState().pendingMutations).toEqual([mutationA, mutationB])
     expect(harness.scheduler.getDelays()).toEqual([])
 
     harness.controller.retrySave()
-    expect(harness.scheduler.getDelays()).toEqual([400])
-    harness.scheduler.runNext()
-    expect(harness.saveRequests[1]!.input).toEqual({
-      projectId: 'project-1',
-      expectedRevision: 2,
-      mutations: [mutationA, mutationB],
-    })
+    expect(harness.scheduler.getDelays()).toEqual([])
+    expect(harness.saveRequests).toHaveLength(1)
   })
 
   test('Given 保存发出后 controller 已 dispose When 冲突返回并重新 mount Then 旧实例不加载且新实例恢复 pending', async () => {

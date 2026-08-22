@@ -29,7 +29,11 @@ import {
   undoDesignEditAtom,
   updateDesignProjectStateAtom,
 } from '@/atoms/design-atoms'
-import { resolveDesignKeyboardAction } from '@/lib/design-editor'
+import {
+  areDesignMutationsJobSafe,
+  resolveDesignKeyboardAction,
+  selectionContainsDesignJobNode,
+} from '@/lib/design-editor'
 import { applyDesignMutationsToDocument } from './use-design-workspace'
 import { DesignAnnotationLayer } from './DesignAnnotationLayer'
 import { DesignAssetNode } from './DesignAssetNode'
@@ -290,7 +294,17 @@ export function DesignCanvas({
       /** 每次键盘事件读取项目最新状态，避免 React prop 更新间隙操作旧选区。 */
       const state = store.get(designProjectStatesAtom).get(document.projectId)
       const selection = state?.selectedNodeIds ?? selectedNodeIdsRef.current
-      const action = resolveDesignKeyboardAction(event, selection.length > 0)
+      /** 最新文档用于同步判断 job 选区与历史项是否允许结构编辑。 */
+      const latestDocument = state?.snapshot?.document ?? document
+      const undoEntry = state?.history.at(-1)
+      const redoEntry = state?.future.at(-1)
+      const action = resolveDesignKeyboardAction(
+        event,
+        selection.length > 0,
+        !selectionContainsDesignJobNode(latestDocument, selection),
+        Boolean(undoEntry && areDesignMutationsJobSafe(latestDocument, undoEntry.inverse)),
+        Boolean(redoEntry && areDesignMutationsJobSafe(latestDocument, redoEntry.forward)),
+      )
       if (!action) return
       event.preventDefault()
       switch (action) {

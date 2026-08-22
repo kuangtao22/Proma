@@ -11,6 +11,10 @@ import {
 import type { DesignProjectState } from '@/atoms/design-atoms'
 import { currentAgentWorkspaceIdAtom } from '@/atoms/agent-atoms'
 import { Button } from '@/components/ui/button'
+import {
+  areDesignMutationsJobSafe,
+  selectionContainsDesignJobNode,
+} from '@/lib/design-editor'
 import { DesignCanvas } from './DesignCanvas'
 import { DesignToolbar } from './DesignToolbar'
 import { useDesignWorkspace } from './use-design-workspace'
@@ -64,6 +68,17 @@ export function DesignWorkspaceStateView({
   const writable = state.snapshot.writable
   /** 当前画布文档包含稳定项目 ID，可作为 Jotai 局部更新键。 */
   const projectId = state.snapshot.document.projectId
+  /** job 选区禁用所有结构编辑入口，仅保留选择和移动。 */
+  const selectionContainsJob = selectionContainsDesignJobNode(
+    state.snapshot.document,
+    state.selectedNodeIds,
+  )
+  /** 仅允许不会结构性改写 job 的最近历史项进入撤销。 */
+  const undoEntry = state.history.at(-1)
+  const canUndo = Boolean(undoEntry && areDesignMutationsJobSafe(state.snapshot.document, undoEntry.inverse))
+  /** 仅允许不会结构性改写 job 的最近 future 项进入重做。 */
+  const redoEntry = state.future.at(-1)
+  const canRedo = Boolean(redoEntry && areDesignMutationsJobSafe(state.snapshot.document, redoEntry.forward))
 
   /**
    * 将工具栏模式切换写入当前项目隔离状态。
@@ -108,10 +123,12 @@ export function DesignWorkspaceStateView({
             <p className="text-xs text-destructive">
               保存失败，内存修改已保留{state.error ? `：${state.error}` : ''}
             </p>
-            <Button type="button" variant="outline" size="sm" onClick={onRetrySave}>
-              <RefreshCw className="size-3.5" aria-hidden="true" />
-              重试保存
-            </Button>
+            {!state.conflictRecoveryPending && (
+              <Button type="button" variant="outline" size="sm" onClick={onRetrySave}>
+                <RefreshCw className="size-3.5" aria-hidden="true" />
+                重试保存
+              </Button>
+            )}
           </div>
         )}
       </div>
@@ -121,13 +138,13 @@ export function DesignWorkspaceStateView({
           <DesignToolbar
             activeTool={state.activeTool}
             writable={writable}
-            canUndo={state.history.length > 0}
-            canRedo={state.future.length > 0}
+            canUndo={canUndo}
+            canRedo={canRedo}
             onToolChange={handleToolChange}
             onUndo={() => { undoEdit({ projectId }) }}
             onRedo={() => { redoEdit({ projectId }) }}
-            onGroup={state.selectedNodeIds.length >= 2 ? handleGroup : undefined}
-            onUngroup={state.selectedNodeIds.length > 0 ? handleUngroup : undefined}
+            onGroup={state.selectedNodeIds.length >= 2 && !selectionContainsJob ? handleGroup : undefined}
+            onUngroup={state.selectedNodeIds.length > 0 && !selectionContainsJob ? handleUngroup : undefined}
             onArrowTool={() => { handleToolChange('arrow') }}
             onMaskTool={() => { handleToolChange('mask') }}
             onImportAssets={onImportAssets}

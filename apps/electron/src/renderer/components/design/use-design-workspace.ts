@@ -22,6 +22,8 @@ export const DESIGN_SAVE_DEBOUNCE_MS = 400
 const DESIGN_REVISION_CONFLICT_CODE = 'DESIGN_REVISION_CONFLICT'
 /** 用户可理解的保存冲突提示。 */
 const DESIGN_REVISION_CONFLICT_MESSAGE = '保存冲突：设计画布已在其他位置更新，请重试保存'
+/** 结构 mutation 无法安全自动重放时的阻断提示。 */
+const DESIGN_STRUCTURAL_CONFLICT_MESSAGE = '保存冲突：远端画布结构已更新，本地结构修改未自动应用，请基于远端版本重新编辑'
 /** 已向用户提示过的恢复快照，避免 React 重渲染重复 toast。 */
 const shownRecoveryNotices = new Set<string>()
 
@@ -221,6 +223,24 @@ export function restoreFailedMutationBatch(
   return [...failedBatch, ...currentPending]
 }
 
+/**
+ * 判断一批 mutation 是否只包含主进程允许自动 rebase 的位置类变更。
+ * @param mutations 冲突后待处理的完整本地 mutation 队列。
+ * @returns 仅全部为视口或节点移动时返回 true。
+ */
+export function canAutomaticallyRebaseDesignMutations(mutations: DesignMutation[]): boolean {
+  return mutations.every((mutation) => (
+    mutation.type === 'set-viewport' || mutation.type === 'move-nodes'
+  ))
+}
+
+/** 判断当前项目是否处于需要用户重新编辑的结构冲突阻断态。 */
+function isDesignStructuralConflictBlocked(state: DesignProjectState): boolean {
+  return state.conflictRecoveryPending
+    && state.saveState === 'failed'
+    && state.error === DESIGN_STRUCTURAL_CONFLICT_MESSAGE
+}
+
 /** Controller 可写入的项目局部状态或基于最新状态的更新函数。 */
 export type DesignProjectStateUpdate = Partial<DesignProjectState>
   | ((current: DesignProjectState) => Partial<DesignProjectState>)
@@ -307,6 +327,20 @@ export function createDesignWorkspaceController(
       const latest = dependencies.getState()
       if (requestSequence !== latestLoadSequence) return
       if (rebasePendingAfterConflict) {
+        if (!canAutomaticallyRebaseDesignMutations(latest.pendingMutations)) {
+          /** 结构 patch 携带旧实体快照，必须完整采用远端文档以免覆盖并发修改。 */
+          dependencies.updateState({
+            phase: 'ready',
+            snapshot,
+            history: [],
+            future: [],
+            saveState: 'failed',
+            conflictRecoveryPending: true,
+            error: DESIGN_STRUCTURAL_CONFLICT_MESSAGE,
+          })
+          if (snapshot.recoveredFrom) dependencies.onRecovered?.(snapshot)
+          return
+        }
         /** 远端最新 document 重放当前全部 pending 后的乐观文档。 */
         const rebasedDocument = mergeSavedDesignDocument(snapshot.document, latest.pendingMutations)
         dependencies.updateState({
@@ -434,13 +468,18 @@ export function createDesignWorkspaceController(
         if (shouldRefreshDesignSnapshot(dependencies.projectId, latest, change)) void loadSnapshot()
       })
       /** mount 时优先恢复上个 controller 留下的 revision 冲突。 */
-      const recoverConflict = dependencies.getState().conflictRecoveryPending
+      const current = dependencies.getState()
+      const recoverConflict = current.conflictRecoveryPending && !isDesignStructuralConflictBlocked(current)
       void loadSnapshot(recoverConflict)
     },
     sync: () => {
       if (disposed) return
       /** sync 时读取最新共享状态，接管其他 controller 异步留下的冲突恢复任务。 */
       const latest = dependencies.getState()
+      if (isDesignStructuralConflictBlocked(latest)) {
+        clearSaveTimer()
+        return
+      }
       if (latest.conflictRecoveryPending || conflictRecoveryInFlight) {
         void loadSnapshot(true)
         return
@@ -451,6 +490,7 @@ export function createDesignWorkspaceController(
       if (disposed) return
       /** 重试前读取的最新状态，用于缓存画布保持 ready。 */
       const latest = dependencies.getState()
+      if (isDesignStructuralConflictBlocked(latest)) return
       if (latest.conflictRecoveryPending || conflictRecoveryInFlight) {
         void loadSnapshot(true)
         return
@@ -465,6 +505,7 @@ export function createDesignWorkspaceController(
       if (disposed) return
       /** retry 时的最新状态用于优先完成冲突恢复。 */
       const latest = dependencies.getState()
+      if (isDesignStructuralConflictBlocked(latest)) return
       if (latest.conflictRecoveryPending || conflictRecoveryInFlight) {
         void loadSnapshot(true)
         return

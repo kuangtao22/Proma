@@ -91,3 +91,4 @@
 - 2026-08-22：用户确认 Proma「设计」采用方案 A：每个项目一个原生画布，通过顶部 `设计 · 项目名` 标签在会话与画布间切换，左侧继续只承载项目/会话；正式素材随项目保存到 `.proma/design/`，缓存放 `~/.proma/design-cache/`，首版聚焦画布、批注、Pi 图片任务、版本关系和会话传递。
 - 2026-08-22：项目级设计工作区实施计划确定使用 `@xyflow/react@12.11.3`、revision mutation、目录级 `proma-file` 媒体授权和可见 Pi Agent Design Job；Design Job 仅允许 Nano Banana 图片工具，实施按 12 个 TDD 任务推进。
 - 2026-08-23：设计工作区的撤销/重做历史按权威文档基线失效：普通 remount 加载相同 revision 与相同 document 时保留；revision 或内容变化、恢复快照及冲突 rebase 时清空。
+- 2026-08-23：设计保存冲突仅允许整批 `set-viewport`/`move-nodes` 自动 rebase；批次含任一结构 mutation 时采用远端基线、保留 pending 与失败阻断态，禁止自动或重试覆盖。job 节点首版只允许选择和移动，复制、删除、分组、取消分组及不安全历史在 reducer、Jotai action、键盘和工具栏统一拒绝，主进程 IPC 所有权边界保持不变。

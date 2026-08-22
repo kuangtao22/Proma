@@ -29,6 +29,20 @@ function createNode(id: string, x: number, groupId?: string): DesignCanvasNode {
   }
 }
 
+/** 创建只能移动和选择、不能由画布结构命令改写的任务节点。 */
+function createJobNode(id: string, x: number, groupId?: string): DesignCanvasNode {
+  return {
+    id,
+    kind: 'job',
+    jobId: `job-${id}`,
+    position: { x, y: x + 10 },
+    width: 320,
+    height: 240,
+    zIndex: 0,
+    ...(groupId ? { groupId } : {}),
+  }
+}
+
 /** 创建包含两个素材节点的确定性画布文档。 */
 function createDocument(): DesignCanvasDocument {
   /** 固定时间避免测试依赖系统时钟。 */
@@ -96,6 +110,35 @@ describe('Design 编辑 reducer', () => {
     expect(result.document.nodes.map((node) => node.id)).toEqual(['n2'])
     expect(result.document.assets.map((asset) => asset.id)).toEqual(['asset-n1', 'asset-n2'])
     expect(result.forward).not.toContainEqual({ type: 'remove-assets', assetIds: ['asset-n1'] })
+  })
+
+  test('Given 选区包含 job 节点 When 复制删除分组或取消分组 Then 全部结构命令保持 no-op', () => {
+    /** 混合选区用于确认不会只修改其中的素材节点。 */
+    const document = createDocument()
+    document.nodes.push(createJobNode('j1', 80, 'job-group'))
+    document.groups = [{ id: 'job-group', name: '任务组', nodeIds: ['j1'] }]
+
+    const results = [
+      reduceDesignEdit(document, {
+        type: 'duplicate-selection',
+        nodeIds: ['j1'],
+        duplicateNodeIds: ['j1-copy'],
+      }),
+      reduceDesignEdit(document, { type: 'delete-selection', nodeIds: ['n1', 'j1'] }),
+      reduceDesignEdit(document, {
+        type: 'group-selection',
+        nodeIds: ['n1', 'j1'],
+        groupId: 'mixed-group',
+        name: '混合组',
+      }),
+      reduceDesignEdit(document, { type: 'ungroup-selection', nodeIds: ['j1'] }),
+    ]
+
+    for (const result of results) {
+      expect(result.document).toEqual(document)
+      expect(result.forward).toEqual([])
+      expect(result.inverse).toEqual([])
+    }
   })
 
   test('Given 两个选中节点 When 分组并撤销 Then group 和 node groupId 可完整恢复', () => {
@@ -244,6 +287,48 @@ describe('Design 编辑历史 Jotai action', () => {
     const forwardLength = historyEntry.forward.length
     expect(redone.pendingMutations.slice(-forwardLength)).toEqual(historyEntry.forward)
   })
+
+  test('Given job 结构命令或 job 历史 When 执行与撤销 Then 不产生乐观 mutation 或保存状态', () => {
+    /** job 节点由任务生命周期拥有，Renderer 只允许移动。 */
+    const document = createDocument()
+    const jobNode = createJobNode('j1', 80)
+    document.nodes.push(jobNode)
+    const store = createStore()
+    const unsafeHistory = {
+      forward: [{ type: 'patch-nodes' as const, removeIds: ['j1'], upserts: [] }],
+      inverse: [{
+        type: 'patch-nodes' as const,
+        removeIds: [],
+        upserts: [{ entity: jobNode, index: document.nodes.length - 1 }],
+      }],
+    }
+    store.set(designProjectStatesAtom, new Map([['project-1', {
+      ...createInitialDesignProjectState(),
+      phase: 'ready' as const,
+      snapshot: { document, writable: true },
+    }]]))
+
+    store.set(executeDesignEditAtom, {
+      projectId: 'project-1',
+      command: { type: 'delete-selection', nodeIds: ['j1'] },
+    })
+    const afterDelete = store.get(designProjectStatesAtom).get('project-1')!
+    expect(afterDelete.snapshot?.document).toEqual(document)
+    expect(afterDelete.pendingMutations).toEqual([])
+    expect(afterDelete.history).toEqual([])
+    expect(afterDelete.saveState).toBe('saved')
+
+    store.set(designProjectStatesAtom, new Map([['project-1', {
+      ...afterDelete,
+      history: [unsafeHistory],
+    }]]))
+    store.set(undoDesignEditAtom, { projectId: 'project-1' })
+    const afterUndo = store.get(designProjectStatesAtom).get('project-1')!
+    expect(afterUndo.snapshot?.document).toEqual(document)
+    expect(afterUndo.pendingMutations).toEqual([])
+    expect(afterUndo.history).toEqual([unsafeHistory])
+    expect(afterUndo.saveState).toBe('saved')
+  })
 })
 
 describe('Design 编辑键盘路由', () => {
@@ -268,5 +353,15 @@ describe('Design 编辑键盘路由', () => {
       target: { tagName: 'DIV', isContentEditable: true },
     }, true)).toBeNull()
     expect(resolveDesignKeyboardAction({ key: 'c', metaKey: true }, false)).toBeNull()
+  })
+
+  test('Given 选区包含 job 节点 When 按结构编辑快捷键 Then 全部保持 no-op', () => {
+    expect(resolveDesignKeyboardAction({ key: 'c', metaKey: true }, true, false)).toBeNull()
+    expect(resolveDesignKeyboardAction({ key: 'Backspace' }, true, false)).toBeNull()
+    expect(resolveDesignKeyboardAction({ key: 'Delete' }, true, false)).toBeNull()
+    expect(resolveDesignKeyboardAction({ key: 'g', metaKey: true }, true, false)).toBeNull()
+    expect(resolveDesignKeyboardAction({ key: 'g', metaKey: true, shiftKey: true }, true, false)).toBeNull()
+    expect(resolveDesignKeyboardAction({ key: 'z', metaKey: true }, true, false, false)).toBeNull()
+    expect(resolveDesignKeyboardAction({ key: 'z', metaKey: true, shiftKey: true }, true, false, true, false)).toBeNull()
   })
 })

@@ -90,6 +90,67 @@ describe('Design 工作区页面状态', () => {
     expect(html).toContain('重试保存')
   })
 
+  test('Given 选中 job 且历史会结构修改 job When 渲染 Then 分组取消分组与历史命令均禁用', () => {
+    /** job 节点及其结构历史不能进入 Renderer 乐观编辑。 */
+    const document = createEmptyDesignDocument('project-1', 10)
+    const jobNode = {
+      id: 'job-node',
+      kind: 'job' as const,
+      jobId: 'job-1',
+      position: { x: 0, y: 0 },
+      width: 320,
+      height: 240,
+      zIndex: 0,
+    }
+    document.nodes = [jobNode]
+    const unsafeHistory = {
+      forward: [{ type: 'patch-nodes' as const, removeIds: ['job-node'], upserts: [] }],
+      inverse: [{
+        type: 'patch-nodes' as const,
+        removeIds: [],
+        upserts: [{ entity: jobNode, index: 0 }],
+      }],
+    }
+    const html = renderToStaticMarkup(
+      <DesignWorkspaceStateView
+        state={{
+          ...createInitialDesignProjectState(),
+          phase: 'ready',
+          snapshot: { document, writable: true },
+          selectedNodeIds: ['job-node'],
+          history: [unsafeHistory],
+          future: [unsafeHistory],
+        }}
+        onRetry={() => undefined}
+        onRetrySave={() => undefined}
+      />,
+    )
+
+    for (const label of ['撤销', '重做', '分组', '取消分组']) {
+      expect(html).toMatch(new RegExp(`aria-label="${label}"[^>]*disabled=""`))
+    }
+  })
+
+  test('Given 结构冲突采用远端基线 When 渲染 Then 显示重新编辑提示且不提供重试保存', () => {
+    const html = renderToStaticMarkup(
+      <DesignWorkspaceStateView
+        state={{
+          ...createInitialDesignProjectState(),
+          phase: 'ready',
+          snapshot: createSnapshot(),
+          saveState: 'failed',
+          conflictRecoveryPending: true,
+          error: '保存冲突：远端画布结构已更新，本地结构修改未自动应用，请基于远端版本重新编辑',
+        }}
+        onRetry={() => undefined}
+        onRetrySave={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('本地结构修改未自动应用')
+    expect(html).not.toContain('重试保存')
+  })
+
   test('Given 项目加载失败 When 渲染 Then 显示错误和重新加载入口', () => {
     const html = renderToStaticMarkup(
       <DesignWorkspaceStateView

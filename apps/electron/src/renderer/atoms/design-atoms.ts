@@ -7,7 +7,11 @@ import type {
 } from '@proma/shared'
 import { atom } from 'jotai'
 import type { DesignEditCommand } from '@/lib/design-editor'
-import { applyDesignMutations, reduceDesignEdit } from '@/lib/design-editor'
+import {
+  applyDesignMutations,
+  areDesignMutationsJobSafe,
+  reduceDesignEdit,
+} from '@/lib/design-editor'
 
 /** 单次可撤销编辑对应的正向与逆向 mutation。 */
 export interface DesignHistoryEntry {
@@ -139,6 +143,7 @@ export const undoDesignEditAtom = atom(
     const current = get(designProjectStatesAtom).get(input.projectId)
     const entry = current?.history.at(-1)
     if (!current?.snapshot?.writable || !entry) return
+    if (!areDesignMutationsJobSafe(current.snapshot.document, entry.inverse)) return
     set(updateDesignProjectStateAtom, {
       projectId: input.projectId,
       update: {
@@ -164,6 +169,7 @@ export const redoDesignEditAtom = atom(
     const current = get(designProjectStatesAtom).get(input.projectId)
     const entry = current?.future.at(-1)
     if (!current?.snapshot?.writable || !entry) return
+    if (!areDesignMutationsJobSafe(current.snapshot.document, entry.forward)) return
     set(updateDesignProjectStateAtom, {
       projectId: input.projectId,
       update: {
