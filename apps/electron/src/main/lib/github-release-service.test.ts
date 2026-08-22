@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import type { GitHubRelease } from '@proma/shared'
+import type { GitHubRelease, GitHubReleaseListOptions } from '@proma/shared'
 import {
   clearReleaseCache,
   getLatestRelease,
@@ -66,10 +66,12 @@ describe('GitHub Release 双来源历史', () => {
       createRelease(2, 'v00.17.55-bone.5'),
       createRelease(3, 'v0.017.55-bone.4'),
       createRelease(4, 'v0.17.055-bone.4'),
-      createRelease(5, 'v0.17.55-bone.3'),
-      createRelease(6, 'v0.17.55-bone.2', { draft: true }),
-      createRelease(7, 'v0.17.55-bone.1'),
-      createRelease(8, 'v0.17.55-bone.0-beta'),
+      createRelease(5, 'v0.17.55-bone.0'),
+      createRelease(6, 'v0.17.55-bone.01'),
+      createRelease(7, 'v0.17.55-bone.3'),
+      createRelease(8, 'v0.17.55-bone.2', { draft: true }),
+      createRelease(9, 'v0.17.55-bone.1'),
+      createRelease(10, 'v0.17.55-bone.0-beta'),
     ]
     installFetchMock(async input => {
       requestedUrls.push(String(input))
@@ -85,6 +87,74 @@ describe('GitHub Release 双来源历史', () => {
       'v0.17.55-bone.3',
       'v0.17.55-bone.1',
     ])
+  })
+
+  test('Given 首页恰好 100 条且有效版本不足，When 查询两条历史，Then 请求第二页补足并在短页停止', async () => {
+    const requestedPages: string[] = []
+    /** 第一页仅保留一条符合 official 合同的 Release。 */
+    const firstPage = Array.from({ length: 100 }, (_, index) =>
+      createRelease(
+        index + 1,
+        index === 0 ? 'v1.0.0' : `v1.0.${index}-bone.1`
+      )
+    )
+    installFetchMock(async input => {
+      /** 当前请求的 GitHub 原始页码。 */
+      const githubPage = new URL(String(input)).searchParams.get('page') ?? ''
+      requestedPages.push(githubPage)
+      return jsonResponse(
+        githubPage === '1' ? firstPage : [createRelease(101, 'v0.9.0')]
+      )
+    })
+
+    const result = await listReleases({ source: 'official', perPage: 2 })
+
+    expect(requestedPages).toEqual(['1', '2'])
+    expect(result.map(release => release.tag_name)).toEqual([
+      'v1.0.0',
+      'v0.9.0',
+    ])
+  })
+
+  test('Given 首页恰好 100 条且已足额，When 查询两条历史，Then 不请求第二页', async () => {
+    const requestedPages: string[] = []
+    /** 第一页前两条符合 official 合同，其余均为 Bone 标签。 */
+    const firstPage = Array.from({ length: 100 }, (_, index) =>
+      createRelease(
+        index + 1,
+        index < 2 ? `v1.0.${1 - index}` : `v1.0.${index}-bone.1`
+      )
+    )
+    installFetchMock(async input => {
+      requestedPages.push(
+        new URL(String(input)).searchParams.get('page') ?? ''
+      )
+      return jsonResponse(firstPage)
+    })
+
+    const result = await listReleases({ source: 'official', perPage: 2 })
+
+    expect(requestedPages).toEqual(['1'])
+    expect(result.map(release => release.tag_name)).toEqual([
+      'v1.0.1',
+      'v1.0.0',
+    ])
+  })
+
+  test('Given 包含预发布与草稿，When 允许预发布，Then 仍始终排除草稿', async () => {
+    installFetchMock(async () =>
+      jsonResponse([
+        createRelease(1, 'v1.0.1', { draft: true }),
+        createRelease(2, 'v1.0.0', { prerelease: true }),
+      ])
+    )
+
+    const result = await listReleases({
+      source: 'official',
+      includePrerelease: true,
+    })
+
+    expect(result.map(release => release.tag_name)).toEqual(['v1.0.0'])
   })
 
   test('Given official 来源，When 查询历史，Then 请求官方仓库并只返回普通正式标签', async () => {
@@ -165,6 +235,47 @@ describe('GitHub Release 双来源历史', () => {
   })
 })
 
+describe('GitHub Release 查询参数校验', () => {
+  test('Given IPC 传入未知来源，When 查询历史，Then 返回明确错误且不发起请求', async () => {
+    let requestCount = 0
+    installFetchMock(async () => {
+      requestCount += 1
+      return jsonResponse([])
+    })
+    /** 模拟越过 TypeScript 类型系统的 IPC 未知输入。 */
+    const options = {
+      source: 'community',
+    } as unknown as GitHubReleaseListOptions
+
+    await expect(listReleases(options)).rejects.toThrow(
+      'Release 历史来源必须是 bone 或 official'
+    )
+    expect(requestCount).toBe(0)
+  })
+
+  test.each([0, -1, 1.5, 101])(
+    'Given perPage=%s，When 查询历史，Then 拒绝非 1 到 100 的整数',
+    async perPage => {
+      installFetchMock(async () => jsonResponse([]))
+
+      await expect(listReleases({ perPage })).rejects.toThrow(
+        '每页数量必须是 1 到 100 的整数'
+      )
+    }
+  )
+
+  test.each([0, -1, 1.5])(
+    'Given page=%s，When 查询历史，Then 拒绝非正整数页码',
+    async page => {
+      installFetchMock(async () => jsonResponse([]))
+
+      await expect(listReleases({ page })).rejects.toThrow(
+        '页码必须是正整数'
+      )
+    }
+  )
+})
+
 describe('GitHub Release 自动更新仓库', () => {
   test('Given 自动更新查询，When 获取 latest 与指定 tag，Then 两次请求都固定使用 Bone 仓库', async () => {
     const requestedUrls: string[] = []
@@ -181,5 +292,31 @@ describe('GitHub Release 自动更新仓库', () => {
     expect(
       requestedUrls.every(url => url.includes('/repos/kuangtao22/Proma/'))
     ).toBe(true)
+  })
+
+  test('Given 列表与标签已有缓存，When 清除缓存后再次查询，Then 两类请求都会重新访问 GitHub', async () => {
+    const requestedUrls: string[] = []
+    installFetchMock(async input => {
+      const url = String(input)
+      requestedUrls.push(url)
+      return url.includes('/releases?')
+        ? jsonResponse([createRelease(1, 'v0.17.55-bone.1')])
+        : jsonResponse(createRelease(1, 'v0.17.55-bone.1'))
+    })
+
+    await listReleases()
+    await getReleaseByTag('v0.17.55-bone.1')
+    await listReleases()
+    await getReleaseByTag('v0.17.55-bone.1')
+    clearReleaseCache()
+    await listReleases()
+    await getReleaseByTag('v0.17.55-bone.1')
+
+    expect(
+      requestedUrls.filter(url => url.includes('/releases?'))
+    ).toHaveLength(2)
+    expect(
+      requestedUrls.filter(url => url.includes('/releases/tags/'))
+    ).toHaveLength(2)
   })
 })

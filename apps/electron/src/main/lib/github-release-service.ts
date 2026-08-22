@@ -13,6 +13,7 @@ import {
   PROMA_OFFICIAL_RELEASE_REPOSITORY,
   PROMA_RELEASE_REPOSITORY,
 } from '../../shared/release-config'
+import { parseBoneReleaseVersion } from '../../shared/release-version'
 
 /** GitHub API 基础 URL */
 const GITHUB_API_BASE = 'https://api.github.com'
@@ -34,10 +35,6 @@ const RELEASE_HISTORY_REPOSITORIES: Record<
 
 /** GitHub Release 列表单次请求允许的最大数量。 */
 const GITHUB_RELEASE_PAGE_SIZE = 100
-
-/** Bone Release 标签必须严格符合带构建号的版本格式。 */
-const BONE_RELEASE_TAG_PATTERN =
-  /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-bone\.\d+$/
 
 /** 官方 Release 标签必须严格符合普通正式版本格式。 */
 const OFFICIAL_RELEASE_TAG_PATTERN =
@@ -62,6 +59,18 @@ const CACHE_TTL = 30 * 60 * 1000
 
 /** Rate limit 冷却标记 */
 let rateLimitUntil = 0
+
+/**
+ * 判断未知输入是否为受支持的 Release 历史来源。
+ *
+ * @param source - IPC 传入的未知来源
+ * @returns 是否为受支持的固定来源
+ */
+function isReleaseHistorySource(
+  source: unknown
+): source is GitHubReleaseHistorySource {
+  return source === 'bone' || source === 'official'
+}
 
 /**
  * 从 GitHub API 获取 releases
@@ -142,10 +151,13 @@ function isReleaseVisible(
   }
 
   /** 当前来源要求的严格标签格式。 */
-  const tagPattern = source === 'bone'
-    ? BONE_RELEASE_TAG_PATTERN
-    : OFFICIAL_RELEASE_TAG_PATTERN
-  return tagPattern.test(release.tag_name)
+  if (source === 'bone') {
+    return (
+      release.tag_name.startsWith('v') &&
+      parseBoneReleaseVersion(release.tag_name.slice(1)) !== null
+    )
+  }
+  return OFFICIAL_RELEASE_TAG_PATTERN.test(release.tag_name)
 }
 
 /**
@@ -181,6 +193,20 @@ export async function listReleases(
     page = 1,
     includePrerelease = false,
   } = options
+
+  if (!isReleaseHistorySource(source)) {
+    throw new Error('Release 历史来源必须是 bone 或 official')
+  }
+  if (
+    !Number.isInteger(perPage) ||
+    perPage < 1 ||
+    perPage > GITHUB_RELEASE_PAGE_SIZE
+  ) {
+    throw new Error('每页数量必须是 1 到 100 的整数')
+  }
+  if (!Number.isInteger(page) || page < 1) {
+    throw new Error('页码必须是正整数')
+  }
 
   /** 当前筛选页之前需要跳过的有效 Release 数量。 */
   const resultOffset = (page - 1) * perPage
