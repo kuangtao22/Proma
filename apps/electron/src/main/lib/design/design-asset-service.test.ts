@@ -514,6 +514,64 @@ describe('Design 素材安全服务', () => {
     expect(existsSync(join(paths.thumbnailsDir, basename(asset!.thumbnailRelativePath)))).toBe(false)
   })
 
+  test('Given tmp 或 backup 恢复候选 When 首个素材操作是导出 Then 要求重载且不创建目标文件', async () => {
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = batch[0]!
+    store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+    batch.commit()
+
+    for (const recoverySource of ['tmp', 'backup'] as const) {
+      forceCanvasRecovery(recoverySource)
+      const targetPath = join(sourceRoot, `recovery-export-${recoverySource}.png`)
+
+      await expect(service.exportAsset('project-1', asset.id, targetPath))
+        .rejects.toThrow(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${recoverySource}`)
+      expect(existsSync(targetPath)).toBe(false)
+    }
+  })
+
+  test('Given tmp 或 backup 恢复候选 When 删除素材 Then 要求重载且不修改元数据或文件', async () => {
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = batch[0]!
+    const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+    batch.commit()
+    const assetPath = join(paths.assetsDir, basename(asset.relativePath))
+    const thumbnailPath = join(paths.thumbnailsDir, basename(asset.thumbnailRelativePath))
+
+    for (const recoverySource of ['tmp', 'backup'] as const) {
+      forceCanvasRecovery(recoverySource)
+
+      expect(() => service.deleteAsset('project-1', asset.id, withAsset.revision))
+        .toThrow(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${recoverySource}`)
+      expect(store.load('project-1').document.assets.map((item) => item.id)).toEqual([asset.id])
+      expect(existsSync(assetPath)).toBe(true)
+      expect(existsSync(thumbnailPath)).toBe(true)
+    }
+  })
+
+  test('Given tmp 或 backup 恢复候选 When 重新定位素材 Then 要求重载且不创建 staging 或新文件', async () => {
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = batch[0]!
+    const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+    batch.commit()
+    const replacementPath = join(sourceRoot, 'recovery-replacement.webp')
+    await sharp(fixturePath).webp().toFile(replacementPath)
+
+    for (const recoverySource of ['tmp', 'backup'] as const) {
+      forceCanvasRecovery(recoverySource)
+      const assetNames = readdirSync(paths.assetsDir)
+      const thumbnailNames = readdirSync(paths.thumbnailsDir)
+
+      await expect(service.relinkAsset('project-1', asset.id, replacementPath, withAsset.revision))
+        .rejects.toThrow(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${recoverySource}`)
+      expect(store.load('project-1').document.assets).toEqual([asset])
+      expect(readdirSync(paths.assetsDir)).toEqual(assetNames)
+      expect(readdirSync(paths.thumbnailsDir)).toEqual(thumbnailNames)
+      expect(readdirSync(paths.stagingDir)).toEqual([])
+      expect(listPromotionJournals()).toEqual([])
+    }
+  })
+
   test('Given 缺失素材 When 重新定位 Then 保留版本来源并替换文件元数据', async () => {
     const [parent] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
     const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], {
@@ -656,6 +714,9 @@ describe('Design 素材安全服务', () => {
     /** mutate 先真实提交新 revision，再模拟目录 durability 同步失败。 */
     const uncertainStore: DesignStore = {
       load: (projectId) => store.load(projectId),
+      requireStableAuthoritativeDocument: (projectId) => (
+        store.requireStableAuthoritativeDocument(projectId)
+      ),
       mutate: (projectId, expectedRevision, mutations) => {
         store.mutate(projectId, expectedRevision, mutations)
         throw new Error('目录持久化同步失败')
@@ -685,6 +746,11 @@ describe('Design 素材安全服务', () => {
       load: (projectId) => {
         loadCount += 1
         if (loadCount === 1) return store.load(projectId)
+        throw new Error('reload 失败')
+      },
+      requireStableAuthoritativeDocument: (projectId) => {
+        loadCount += 1
+        if (loadCount === 1) return store.requireStableAuthoritativeDocument(projectId)
         throw new Error('reload 失败')
       },
       mutate: () => { throw new Error('mutate 失败') },
@@ -809,6 +875,19 @@ describe('Design 素材安全服务', () => {
   function listPromotionJournals(): string[] {
     const directoryPath = join(paths.jobsDir, 'promotions')
     return existsSync(directoryPath) ? readdirSync(directoryPath) : []
+  }
+
+  /**
+   * 将当前主画布转换为指定恢复候选，模拟进程在原子替换窗口崩溃。
+   * @param recoverySource 要由下一次加载消费的恢复层。
+   */
+  function forceCanvasRecovery(recoverySource: 'tmp' | 'backup'): void {
+    if (recoverySource === 'tmp') {
+      renameSync(paths.canvasPath, `${paths.canvasPath}.tmp`)
+      return
+    }
+    writeFileSync(`${paths.canvasPath}.bak`, readFileSync(paths.canvasPath))
+    writeFileSync(paths.canvasPath, '{ broken', 'utf8')
   }
 })
 

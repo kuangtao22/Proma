@@ -117,6 +117,10 @@ function createFixture(): {
         storeReadCount += 1
         return { document, writable: true }
       },
+      requireStableAuthoritativeDocument: () => {
+        storeReadCount += 1
+        return document
+      },
       mutate: (_projectId, _revision, mutations, validateCurrent) => {
         storeReadCount += 1
         validateCurrent?.(document)
@@ -584,7 +588,7 @@ describe('Design IPC', () => {
     expect(fixture.guardProjects).toEqual([])
   })
 
-  test('Given tmp 或 backup 恢复候选 When 导入素材 Then 在选择和 staging 前要求先重载', async () => {
+  test('Given tmp 或 backup 恢复候选 When 导入、重新定位或导出 Then 在系统选择器前要求先重载', async () => {
     for (const recoverySource of ['tmp', 'backup'] as const) {
       const projectRoot = mkdtempSync(join(tmpdir(), `proma-design-import-${recoverySource}-`))
       const configRoot = mkdtempSync(join(tmpdir(), `proma-design-config-${recoverySource}-`))
@@ -611,11 +615,21 @@ describe('Design IPC', () => {
         const fixture = createFixture()
         /** 选择器和素材服务都不得在恢复提示前运行。 */
         let pickerCalls = 0
+        let relinkPickerCalls = 0
+        let exportPickerCalls = 0
         let stagingCalls = 0
         fixture.options.store = store
         fixture.options.pickImageFiles = async () => {
           pickerCalls += 1
           return ['/trusted/a.png']
+        }
+        fixture.options.pickRelinkImageFile = async () => {
+          relinkPickerCalls += 1
+          return '/trusted/relink.png'
+        }
+        fixture.options.pickExportPath = async () => {
+          exportPickerCalls += 1
+          return '/trusted/export.png'
         }
         fixture.options.assets.importAuthorizedFiles = async () => {
           stagingCalls += 1
@@ -634,6 +648,36 @@ describe('Design IPC', () => {
         expect(stagingCalls).toBe(0)
         expect(afterRecovery.assets).toEqual([])
         expect(afterRecovery.nodes).toEqual([])
+
+        /** 每个命令都重新制造首次恢复，证明对应选择器不会抢先消费用户交互。 */
+        if (recoverySource === 'tmp') {
+          renameSync(canvasPath, `${canvasPath}.tmp`)
+        } else {
+          writeFileSync(`${canvasPath}.bak`, readFileSync(canvasPath))
+          writeFileSync(canvasPath, '{ broken', 'utf8')
+        }
+        await expect(invoke(
+          fixture.handlers,
+          DESIGN_IPC_CHANNELS.RELINK_ASSET,
+          fixture.senders[0]!,
+          { projectId: 'project-1', assetId: 'asset-1', expectedRevision: persisted.revision },
+        )).rejects.toThrow(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${recoverySource}`)
+        store.load('project-1')
+
+        if (recoverySource === 'tmp') {
+          renameSync(canvasPath, `${canvasPath}.tmp`)
+        } else {
+          writeFileSync(`${canvasPath}.bak`, readFileSync(canvasPath))
+          writeFileSync(canvasPath, '{ broken', 'utf8')
+        }
+        await expect(invoke(
+          fixture.handlers,
+          DESIGN_IPC_CHANNELS.EXPORT_ASSET,
+          fixture.senders[0]!,
+          { projectId: 'project-1', assetId: 'asset-1' },
+        )).rejects.toThrow(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${recoverySource}`)
+        expect(relinkPickerCalls).toBe(0)
+        expect(exportPickerCalls).toBe(0)
       } finally {
         rmSync(projectRoot, { recursive: true, force: true })
         rmSync(configRoot, { recursive: true, force: true })
@@ -672,6 +716,9 @@ describe('Design IPC', () => {
       /** 真实提交新 revision 后模拟目录 durability 同步报错。 */
       const durabilityStore: DesignStore = {
         load: (projectId) => realStore.load(projectId),
+        requireStableAuthoritativeDocument: (projectId) => (
+          realStore.requireStableAuthoritativeDocument(projectId)
+        ),
         mutate: (projectId, expectedRevision, mutations) => {
           realStore.mutate(projectId, expectedRevision, mutations)
           throw new Error('目录 durability 同步失败')

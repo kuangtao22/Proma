@@ -55,6 +55,8 @@ export interface DesignStoreOptions {
 export interface DesignStore {
   /** 加载项目画布并标记是否发生安全恢复。 */
   load: (projectId: string) => DesignWorkspaceSnapshot
+  /** 加载未发生恢复的权威文档；恢复候选必须先由 Renderer 重载确认。 */
+  requireStableAuthoritativeDocument: (projectId: string) => DesignCanvasDocument
   /** 在磁盘最新 revision 上应用一组受控 mutation。 */
   mutate: (
     projectId: string,
@@ -750,6 +752,16 @@ export function createDesignStore(options: DesignStoreOptions = {}): DesignStore
     }
   }
 
+  /** 加载可安全用于业务副作用的权威文档，恢复提升与业务操作必须分成两次调用。 */
+  function requireStableAuthoritativeDocument(projectId: string): DesignCanvasDocument {
+    /** 本次唯一加载的快照决定调用方能否继续业务副作用。 */
+    const snapshot = load(projectId)
+    if (snapshot.recoveredFrom) {
+      throw new Error(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${snapshot.recoveredFrom}`)
+    }
+    return snapshot.document
+  }
+
   /** 在磁盘最新 revision 上应用并原子保存 mutation。 */
   function mutate(
     projectId: string,
@@ -757,13 +769,8 @@ export function createDesignStore(options: DesignStoreOptions = {}): DesignStore
     mutations: DesignMutation[],
     validateCurrent?: (document: DesignCanvasDocument) => void,
   ): DesignCanvasDocument {
-    /** mutation 开始时重新加载的磁盘最新快照。 */
-    const loaded = load(projectId)
-    if (loaded.recoveredFrom) {
-      throw new Error(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${loaded.recoveredFrom}`)
-    }
-    /** 未发生恢复时可继续 mutation 的磁盘最新文档。 */
-    const current = loaded.document
+    /** mutation 开始时重新加载且确认稳定的磁盘最新文档。 */
+    const current = requireStableAuthoritativeDocument(projectId)
     /** 调用方策略与后续 apply/write 共享本次唯一加载的权威文档。 */
     validateCurrent?.(current)
     assertCanApply(expectedRevision, current.revision, mutations)
@@ -789,7 +796,7 @@ export function createDesignStore(options: DesignStoreOptions = {}): DesignStore
     return next
   }
 
-  return { load, mutate }
+  return { load, requireStableAuthoritativeDocument, mutate }
 }
 
 /** 生产进程共享的 Design 存储实例。 */

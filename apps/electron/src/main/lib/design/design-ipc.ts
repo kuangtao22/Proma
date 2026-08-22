@@ -502,10 +502,7 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
       let importBatch: DesignAssetImportBatch | undefined
       try {
         /** 在打开选择器和创建 staging 前显式传播安全恢复，避免后续 load 消费标志。 */
-        const preflight = options.store.load(input.projectId)
-        if (preflight.recoveredFrom) {
-          throw new Error(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${preflight.recoveredFrom}`)
-        }
+        options.store.requireStableAuthoritativeDocument(input.projectId)
         const sourcePaths = await options.pickImageFiles(sender)
         if (sourcePaths.length === 0) {
           return attachMediaAccess(sender, input.projectId, options.store.load(input.projectId))
@@ -551,6 +548,8 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseAssetInput(value, true)
     return options.guard.runWorkspaceWrite(input.projectId, async () => {
+      /** 恢复提升必须在打开重新定位选择器前交回 Renderer 确认。 */
+      options.store.requireStableAuthoritativeDocument(input.projectId)
       const sourcePath = await options.pickRelinkImageFile(sender)
       if (!sourcePath) return options.store.load(input.projectId).document
       const document = await options.assets.relinkAsset(
@@ -568,7 +567,9 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   options.ipc.handle(DESIGN_IPC_CHANNELS.EXPORT_ASSET, async (event, value): Promise<void> => {
     const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseAssetInput(value, false)
-    const asset = options.store.load(input.projectId).document.assets.find((item) => item.id === input.assetId)
+    /** 导出路径选择前先确认素材来自稳定权威文档。 */
+    const document = options.store.requireStableAuthoritativeDocument(input.projectId)
+    const asset = document.assets.find((item) => item.id === input.assetId)
     if (!asset) throw new Error(`素材不存在: ${input.assetId}`)
     const targetPath = await options.pickExportPath(sender, asset.filename)
     if (targetPath) await options.assets.exportAsset(input.projectId, input.assetId, targetPath)

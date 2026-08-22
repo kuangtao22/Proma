@@ -667,14 +667,14 @@ export class DesignAssetService {
     source: DesignAssetImportSource,
   ): Promise<DesignAssetImportBatch> {
     return this.dependencies.runWorkspaceWrite(projectId, async () => {
+      /** 恢复提升与素材 staging 必须分成两次用户操作。 */
+      this.dependencies.store.requireStableAuthoritativeDocument(projectId)
       if (sourcePaths.length === 0) {
         return createDesignAssetImportBatch([], () => undefined, () => undefined)
       }
       /** stat 只读取大小，累计预算在任何 Buffer 或 Sharp 解码前拒绝。 */
       const byteSizes = sourcePaths.map((sourcePath) => lstatSync(sourcePath).size)
       return this.processingQueue.run(byteSizes, async () => {
-      /** store 负责安全创建并验证完整受管目录链，素材服务不得绕过。 */
-      this.dependencies.store.load(projectId)
       /** 每次导入使用独占批次目录，失败可整体清理。 */
       const paths = this.dependencies.pathResolver.resolve(projectId)
       const batchDirectory = join(paths.stagingDir, `import-${randomUUID()}`)
@@ -827,7 +827,7 @@ export class DesignAssetService {
   deleteAsset(projectId: string, assetId: string, expectedRevision: number): DesignCanvasDocument {
     return this.dependencies.runWorkspaceWrite(projectId, () => {
       /** 删除前从磁盘最新快照解析素材和引用，避免信任 renderer 状态。 */
-      const current = this.dependencies.store.load(projectId).document
+      const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
       const asset = current.assets.find((item) => item.id === assetId)
       if (!asset) throw new Error(`素材不存在: ${assetId}`)
       if (current.nodes.some((node) => node.assetId === assetId)) {
@@ -865,10 +865,11 @@ export class DesignAssetService {
     expectedRevision: number,
   ): Promise<DesignCanvasDocument> {
     return this.dependencies.runWorkspaceWrite(projectId, async () => {
+      /** 恢复提升必须在读取替换文件和创建 staging 前中止重新定位。 */
+      const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
       const byteSize = lstatSync(sourcePath).size
       return this.processingQueue.run([byteSize], async () => {
       /** 旧元数据先从磁盘加载，版本和来源字段从此对象完整保留。 */
-      const current = this.dependencies.store.load(projectId).document
       const existing = current.assets.find((item) => item.id === assetId)
       if (!existing) throw new Error(`素材不存在: ${assetId}`)
       const paths = this.dependencies.pathResolver.resolve(projectId)
@@ -1063,7 +1064,7 @@ export class DesignAssetService {
     /** 导出是用户选择位置的写操作，同样受项目迁移锁约束。 */
     await this.dependencies.runWorkspaceWrite(projectId, async () => {
       /** 素材记录只从当前磁盘画布读取，不信任 renderer 传入路径。 */
-      const document = this.dependencies.store.load(projectId).document
+      const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
       const asset = document.assets.find((item) => item.id === assetId)
       if (!asset) throw new Error(`素材不存在: ${assetId}`)
       const sourcePath = this.resolveStoredAssetFiles(projectId, asset)[0]

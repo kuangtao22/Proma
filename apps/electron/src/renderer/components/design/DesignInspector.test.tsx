@@ -418,6 +418,43 @@ describe('Design Inspector 纯业务契约', () => {
     expect(store.get(designProjectStatesAtom).get('project-1')?.snapshot?.document.nodes[0]?.id).toBe('node-retried')
   })
 
+  test('Given 任一素材命令要求恢复 When action 收到错误 Then 四种命令调用同一权威恢复入口', async () => {
+    const store = createStore()
+    const snapshot = createSnapshot()
+    snapshot.document.nodes = []
+    store.set(designProjectStatesAtom, new Map([['project-1', {
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot,
+    }]]))
+    const recoveryError = new Error('DESIGN_RECOVERY_REQUIRED: recoveredFrom=backup')
+    const adapter: Pick<DesignAdapter, 'importAssets' | 'deleteAsset' | 'relinkAsset' | 'exportAsset'> = {
+      importAssets: async () => { throw recoveryError },
+      deleteAsset: async () => { throw recoveryError },
+      relinkAsset: async () => { throw recoveryError },
+      exportAsset: async () => { throw recoveryError },
+    }
+    /** 记录四种素材命令是否统一交给同一个工作区 controller 入口。 */
+    let recoveryCount = 0
+    const reloadAuthoritativeSnapshot = (): void => { recoveryCount += 1 }
+    let actions: ReturnType<typeof useDesignInspectorActions> | null = null
+    const Probe = (): null => {
+      actions = useDesignInspectorActions('project-1', adapter, {
+        onRecoveryRequired: reloadAuthoritativeSnapshot,
+      })
+      return null
+    }
+    renderToStaticMarkup(<Provider store={store}><Probe /></Provider>)
+
+    actions!.importAssets()
+    actions!.deleteAsset('asset-1')
+    actions!.relinkAsset('asset-1')
+    actions!.exportAsset('asset-1')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(recoveryCount).toBe(4)
+  })
+
   test('Given 素材没有节点引用 When 删除或重新定位 Then 调用 adapter 并使用当前 revision', async () => {
     const store = createStore()
     const snapshot = createSnapshot()

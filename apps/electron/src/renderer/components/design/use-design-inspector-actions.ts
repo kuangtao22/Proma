@@ -79,6 +79,17 @@ export function useDesignInspectorActions(
     projectId ? store.get(designProjectStatesAtom).get(projectId) : undefined
   ), [projectId, store])
 
+  /** 四种素材命令共用恢复分流，确保全部交给工作区唯一 controller。 */
+  const handleAssetActionError = React.useCallback((error: unknown, fallbackMessage: string): void => {
+    if (isDesignRecoveryRequired(error) && onRecoveryRequired) {
+      void Promise.resolve(onRecoveryRequired()).catch((recoveryError) => {
+        toast.error(recoveryError instanceof Error ? recoveryError.message : '恢复设计工作区失败')
+      })
+      return
+    }
+    toast.error(error instanceof Error ? error.message : fallbackMessage)
+  }, [onRecoveryRequired])
+
   /** 导入素材时把当前 revision 与可见中心交给主进程原子提交。 */
   const importAssets = React.useCallback((): void => {
     const initial = getLatestState()
@@ -118,17 +129,8 @@ export function useDesignInspectorActions(
           error: null,
         },
       })
-    }).catch((error) => {
-      if (isDesignRecoveryRequired(error) && onRecoveryRequired) {
-        /** 恢复逻辑由工作区 controller 统一执行，Inspector 不直接改快照。 */
-        void Promise.resolve(onRecoveryRequired()).catch((recoveryError) => {
-          toast.error(recoveryError instanceof Error ? recoveryError.message : '恢复设计工作区失败')
-        })
-        return
-      }
-      toast.error(error instanceof Error ? error.message : '导入图片失败')
-    })
-  }, [adapter, getLatestState, onRecoveryRequired, projectId, updateState])
+    }).catch((error) => handleAssetActionError(error, '导入图片失败'))
+  }, [adapter, getLatestState, handleAssetActionError, projectId, updateState])
 
   /** 删除未被画布节点引用的素材。 */
   const deleteAsset = React.useCallback((assetId: string): void => {
@@ -153,8 +155,8 @@ export function useDesignInspectorActions(
         selectedNodeIds: [],
         inspectorAssetId: null,
       }) }))
-      .catch((error) => toast.error(error instanceof Error ? error.message : '删除素材失败'))
-  }, [adapter, getLatestState, projectId, updateState])
+      .catch((error) => handleAssetActionError(error, '删除素材失败'))
+  }, [adapter, getLatestState, handleAssetActionError, projectId, updateState])
 
   /** 调用主进程选择器原位更新缺失素材元数据。 */
   const relinkAsset = React.useCallback((assetId: string): void => {
@@ -171,15 +173,15 @@ export function useDesignInspectorActions(
           document: applyDesignMutationsToDocument(document, latest.pendingMutations),
         } : latest.snapshot,
       }) }))
-      .catch((error) => toast.error(error instanceof Error ? error.message : '重新定位素材失败'))
-  }, [adapter, getLatestState, projectId, updateState])
+      .catch((error) => handleAssetActionError(error, '重新定位素材失败'))
+  }, [adapter, getLatestState, handleAssetActionError, projectId, updateState])
 
   /** 导出只读取权威素材，不依赖项目 writable。 */
   const exportAsset = React.useCallback((assetId: string): void => {
     if (!projectId) return
     void adapter.exportAsset({ projectId, assetId })
-      .catch((error) => toast.error(error instanceof Error ? error.message : '导出素材失败'))
-  }, [adapter, projectId])
+      .catch((error) => handleAssetActionError(error, '导出素材失败'))
+  }, [adapter, handleAssetActionError, projectId])
 
   /** 选择素材时同步选中画布中第一个引用节点。 */
   const selectAsset = React.useCallback((assetId: string): void => {
