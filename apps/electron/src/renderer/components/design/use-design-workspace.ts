@@ -20,6 +20,8 @@ import { designAdapter, type DesignAdapter } from '@/lib/design-adapter'
 export const DESIGN_SAVE_DEBOUNCE_MS = 400
 /** 主进程 revision 冲突错误的稳定识别码。 */
 const DESIGN_REVISION_CONFLICT_CODE = 'DESIGN_REVISION_CONFLICT'
+/** 主进程发现磁盘恢复后要求 Renderer 重新加载的稳定识别码。 */
+const DESIGN_RECOVERY_REQUIRED_CODE = 'DESIGN_RECOVERY_REQUIRED'
 /** 用户可理解的保存冲突提示。 */
 const DESIGN_REVISION_CONFLICT_MESSAGE = '保存冲突：设计画布已在其他位置更新，请重试保存'
 /** 结构 mutation 无法安全自动重放时的阻断提示。 */
@@ -39,6 +41,15 @@ function getDesignErrorMessage(error: unknown): string {
  */
 function isDesignRevisionConflict(error: unknown): boolean {
   return error instanceof Error && error.message.includes(DESIGN_REVISION_CONFLICT_CODE)
+}
+
+/**
+ * 判断保存错误是否要求重新加载恢复后的权威画布。
+ * @param error adapter.save 拒绝的未知错误。
+ * @returns 错误文本包含稳定恢复码时返回 true。
+ */
+export function isDesignRecoveryRequired(error: unknown): boolean {
+  return error instanceof Error && error.message.includes(DESIGN_RECOVERY_REQUIRED_CODE)
 }
 
 /** 判断远端事件是否可安全替换当前快照。 */
@@ -442,12 +453,14 @@ export function createDesignWorkspaceController(
         }))
         scheduleSave()
       }).catch((error) => {
-        if (isDesignRevisionConflict(error)) {
+        /** revision 冲突与磁盘恢复都必须先基于新权威快照处理旧 batch。 */
+        const recoveryRequired = isDesignRecoveryRequired(error)
+        if (isDesignRevisionConflict(error) || recoveryRequired) {
           dependencies.updateState((latest) => ({
             pendingMutations: restoreFailedMutationBatch(batch, latest.pendingMutations),
             saveState: 'failed',
             conflictRecoveryPending: true,
-            error: DESIGN_REVISION_CONFLICT_MESSAGE,
+            error: recoveryRequired ? getDesignErrorMessage(error) : DESIGN_REVISION_CONFLICT_MESSAGE,
           }))
           void loadSnapshot(true)
           return

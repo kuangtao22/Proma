@@ -100,6 +100,8 @@ interface ControllerHarness {
   getUnsubscribeCount: () => number
   getReleaseCount: () => number
   setReleaseError: (error: Error) => void
+  /** controller 接管并提示过的恢复快照。 */
+  recoveredSnapshots: DesignWorkspaceSnapshot[]
   reportedReleaseErrors: unknown[]
 }
 
@@ -133,6 +135,8 @@ function createControllerHarness(
   let releaseError: Error | null = null
   /** controller 通过 onReleaseError 上报的错误。 */
   const reportedReleaseErrors: unknown[] = []
+  /** controller 通过 onRecovered 接管的恢复快照。 */
+  const recoveredSnapshots: DesignWorkspaceSnapshot[] = []
   /** 手动保存调度器。 */
   const scheduler = createManualScheduler()
   /** 同步应用局部状态，行为与项目 atom 更新入口一致。 */
@@ -174,6 +178,7 @@ function createControllerHarness(
     getState: () => sharedState.state,
     updateState: setState,
     scheduler,
+    onRecovered: (snapshot) => recoveredSnapshots.push(snapshot),
     onReleaseError: (error) => reportedReleaseErrors.push(error),
   })
   return {
@@ -189,6 +194,7 @@ function createControllerHarness(
     setReleaseError: (error) => {
       releaseError = error
     },
+    recoveredSnapshots,
     reportedReleaseErrors,
   }
 }
@@ -468,6 +474,132 @@ describe('Design 工作区同步规则', () => {
     harness.saveRequests[1]!.deferred.resolve({ ...movedDocument, revision: 3, updatedAt: 30 })
     await flushPromises()
     expect(harness.getState().snapshot?.document.nodes[0]?.position).toEqual({ x: 150, y: 150 })
+    expect(harness.getState().saveState).toBe('saved')
+  })
+
+  test('Given 位置保存遇到恢复要求 When 权威快照返回 Then 先加载恢复基线并清空旧历史且不直接重试保存', async () => {
+    /** 本地移动已经乐观应用，但仍基于恢复前 revision。 */
+    const move: DesignMutation = {
+      type: 'move-nodes',
+      positions: [{ nodeId: 'node-1', position: { x: 150, y: 150 } }],
+    }
+    /** 旧历史不得跨磁盘恢复后的权威基线继续使用。 */
+    const historyEntry = {
+      forward: [move],
+      inverse: [{
+        type: 'move-nodes' as const,
+        positions: [{ nodeId: 'node-1', position: { x: 0, y: 0 } }],
+      }],
+    }
+    /** 保存前的旧 revision 乐观文档。 */
+    const localDocument = {
+      ...createEmptyDesignDocument('project-1', 10),
+      nodes: [{
+        id: 'node-1', kind: 'asset' as const, assetId: 'asset-1',
+        position: { x: 150, y: 150 }, width: 100, height: 80, zIndex: 0,
+      }],
+      revision: 1,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: { document: localDocument, writable: true },
+      history: [historyEntry],
+      future: [historyEntry],
+      pendingMutations: [move],
+      saveState: 'dirty',
+    })
+    harness.controller.sync()
+    harness.scheduler.runNext()
+    harness.saveRequests[0]!.deferred.reject(new Error('DESIGN_RECOVERY_REQUIRED: recoveredFrom=backup'))
+    await flushPromises()
+
+    expect(harness.getState().pendingMutations).toEqual([move])
+    expect(harness.getState().conflictRecoveryPending).toBe(true)
+    expect(harness.getState().saveState).toBe('failed')
+    expect(harness.loadRequests).toHaveLength(1)
+    expect(harness.saveRequests).toHaveLength(1)
+    expect(harness.scheduler.getDelays()).toEqual([])
+
+    harness.controller.retrySave()
+    expect(harness.loadRequests).toHaveLength(1)
+    expect(harness.saveRequests).toHaveLength(1)
+    expect(harness.scheduler.getDelays()).toEqual([])
+
+    /** 恢复后的远端节点位置先成为基线，再安全重放本地移动。 */
+    const recoveredSnapshot: DesignWorkspaceSnapshot = {
+      document: {
+        ...localDocument,
+        nodes: [{ ...localDocument.nodes[0]!, position: { x: 100, y: 100 } }],
+        revision: 2,
+      },
+      writable: true,
+      recoveredFrom: 'backup',
+    }
+    harness.loadRequests[0]!.resolve(recoveredSnapshot)
+    await flushPromises()
+
+    expect(harness.getState().snapshot?.document.revision).toBe(2)
+    expect(harness.getState().snapshot?.document.nodes[0]?.position).toEqual({ x: 150, y: 150 })
+    expect(harness.getState().history).toEqual([])
+    expect(harness.getState().future).toEqual([])
+    expect(harness.getState().conflictRecoveryPending).toBe(false)
+    expect(harness.getState().saveState).toBe('failed')
+    expect(harness.recoveredSnapshots).toEqual([recoveredSnapshot])
+    expect(harness.saveRequests).toHaveLength(1)
+    expect(harness.scheduler.getDelays()).toEqual([])
+  })
+
+  test('Given 结构保存遇到恢复要求 When 权威快照返回 Then 进入远端阻断并等待采用远端版本', async () => {
+    /** 结构 mutation 不能在恢复后的远端文档上自动重放。 */
+    const structuralMutation: DesignMutation = {
+      type: 'remove-nodes',
+      nodeIds: ['node-1'],
+    }
+    const localDocument = {
+      ...createEmptyDesignDocument('project-1', 10),
+      revision: 1,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: { document: localDocument, writable: true },
+      pendingMutations: [structuralMutation],
+      saveState: 'dirty',
+    })
+    harness.controller.sync()
+    harness.scheduler.runNext()
+    harness.saveRequests[0]!.deferred.reject(new Error('DESIGN_RECOVERY_REQUIRED: recoveredFrom=tmp'))
+    await flushPromises()
+
+    expect(harness.loadRequests).toHaveLength(1)
+    /** 恢复后的权威文档仍含远端节点，结构删除留在阻断队列。 */
+    const recoveredSnapshot: DesignWorkspaceSnapshot = {
+      document: {
+        ...localDocument,
+        nodes: [{
+          id: 'node-1', kind: 'asset' as const, assetId: 'asset-1',
+          position: { x: 100, y: 100 }, width: 100, height: 80, zIndex: 0,
+        }],
+        revision: 2,
+      },
+      writable: true,
+      recoveredFrom: 'tmp',
+    }
+    harness.loadRequests[0]!.resolve(recoveredSnapshot)
+    await flushPromises()
+
+    expect(harness.getState().snapshot).toBe(recoveredSnapshot)
+    expect(harness.getState().pendingMutations).toEqual([structuralMutation])
+    expect(harness.getState().conflictRecoveryPending).toBe(true)
+    expect(harness.getState().saveState).toBe('failed')
+    expect(harness.recoveredSnapshots).toEqual([recoveredSnapshot])
+    expect(harness.saveRequests).toHaveLength(1)
+    expect(harness.scheduler.getDelays()).toEqual([])
+
+    harness.controller.acceptRemoteVersion()
+    expect(harness.getState().pendingMutations).toEqual([])
+    expect(harness.getState().conflictRecoveryPending).toBe(false)
     expect(harness.getState().saveState).toBe('saved')
   })
 
