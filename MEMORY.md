@@ -87,3 +87,5 @@
 - 2026-08-22：用户确认 macOS 缺少签名证书时仍需发布，并允许通过 `xattr` 命令解除隔离安装；发布说明必须明确未签名风险，工作流有证书时签名、无证书时显式生成未签名包。
 - 2026-08-22：修复 Windows 数据根迁移在计划创建后被退出流程更新 `.proma` 时无法继续的问题；零进度计划在隔离进程中安全刷新容量基线，旧版本已记录为 failed 的同类计划也可直接恢复。
 - 2026-08-22：发布 `v0.17.55-bone.4`，macOS arm64/x64、Windows x64、Linux AppImage/deb 与自动更新元数据共 15 个资产均由 GitHub Actions 成功生成；macOS 云端未配置签名证书，Release 正文已提供 `xattr` 解除隔离命令。
+- 2026-08-22：评估 `Xiangyu-CAS/codex-canvas` 后确认可将无限画布、JSON 状态模型和图片处理能力移植到 Proma；正式集成必须改用 React/Jotai、Proma 四层 IPC、`safe-file` 与 Pi Agent runtime，禁止原样引入其 Codex CLI/app-server、独立 MCP/HTTP 服务及 `~/.codex/generated_images` 扫描链路。
+- 2026-08-22：用户确认 Proma「设计」采用方案 A：每个项目一个原生画布，通过顶部 `设计 · 项目名` 标签在会话与画布间切换，左侧继续只承载项目/会话；正式素材随项目保存到 `.proma/design/`，缓存放 `~/.proma/design-cache/`，首版聚焦画布、批注、Pi 图片任务、版本关系和会话传递。
