@@ -44,6 +44,7 @@
 - Electron workspace 使用带 scope 的包名，Linux 必须显式配置不含 `/` 的 `artifactName`，否则 deb 默认输出路径会被拆成不存在的子目录。
 - 路径管理采用固定 `~/.proma-location.json` 定位文件与重启迁移模式：业务模块继续通过 `getConfigDir()` 解析当前数据根，复制、校验和 Proma-owned 绝对路径重写全部成功后才切换；项目文件迁移独立使用工作区锁，源目录始终保留。
 - Bone 发布说明以 `release-notes/bone/v<version>.md` 为唯一事实来源；发布前必须校验对应文件存在且非空，GitHub Release 正文与关于页“Proma 修改”历史共同使用该内容。
+- macOS 正式产物必须使用 Developer ID Application 完整签名并完成 Apple 公证，上传前以 `codesign --verify --deep --strict` 和公证票据校验 fail closed；GitHub Actions 不得在 step 自身的 `if` 中读取仅由该 step `env` 注入的证书变量，否则条件求值时变量不存在并会恒定跳过签名。
 - 项目文件迁移复用 verified copier，并以活动数据根内的可恢复 journal 驱动 `会话路径 -> 工作区配置 -> projectRootPath` 三步幂等提交；复制、校验和提交失败均不删除源目录。
 - 项目迁移准入同时覆盖 Agent in-flight generation、自动标题等 generation-owned 写入、Automation、active/linked worktree 与受守卫 IPC；旧 Agent 代际通过唯一 query token 精确关闭，不会误停同会话的新运行。
 - 项目目录选择使用按窗口、用途和代次隔离的一次性 `selectionId`；重启遗留的 copying/verifying/failed journal 只能按已持久化 operation 继续或显式放弃，renderer 不可直接指定任意目标路径。
@@ -76,6 +77,7 @@
 - 2026-08-22：完成项目文件路径管理与迁移：支持外部/托管/离线项目、复制校验、崩溃恢复、取消/继续/放弃、watcher 切换和桌面设置页；发布版本递增为 `0.17.42-bone.6`。
 - 2026-08-22：将直接启动的开发客户端名称从 `Proma Dev` 统一为 `PromaDev`；正式客户端仍为 `Proma`，开发/正式 App ID 与 Electron 内部数据隔离规则保持不变。
 - 2026-08-22：确认历史共享凭据由 `@proma/electron Safe Storage` 加密，`PromaDev` 与 `Proma Dev` 钥匙串均无法解密；开发客户端现于 `ready` 前使用历史加密身份，之后恢复显示名 `Proma Dev`。
+- 2026-08-22：Windows 用户目录可能在定位文件已原子提交后，对目录 `open` 返回 `EACCES`，或对目录 `fsync` 返回 `EPERM/EACCES`；`safe-file` 仅将这些目录能力错误降级为 `file-only` durability，`EIO` 等真实 I/O 故障继续向上传播。
 - 2026-08-22：合并官方最新正式版 `v0.17.55`，应用版本重置为 `0.17.55-bone.1`；保留 LAN、路径迁移守卫、Agent generation 隔离与历史 Safe Storage 身份，并将 Pi utility 的 abort/force-close/finally 统一到单一 runtime 关闭 Promise。
 - 2026-08-22：关于/更新页将版本历史拆为 `Proma 修改` 与 `官方版本` 两个懒加载标签；历史查询固定映射 Bone/官方仓库并按来源隔离缓存，Electron Updater、最新版本和按标签查询仍只使用 `kuangtao22/Proma`。
 - 2026-08-22：`v0.17.55-bone.1` GitHub Actions 全平台发布成功，并回填 `bone.1`、`bone.4`、`bone.5` 中文 Release 正文；若根目录类型检查异常解析到 `apps/electron/node_modules` 的旧 `@types/node`，说明是历史嵌套依赖遮蔽，`bun install --frozen-lockfile` 不会自动清理该目录。
