@@ -67,3 +67,6 @@ export * from './agent-island'
 
 // 数据根与路径管理相关类型
 export * from './path-management'
+
+// 项目级 Design 工作区相关类型
+export * from './design'
