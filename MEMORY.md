@@ -82,3 +82,4 @@
 - 2026-08-22：关于/更新页将版本历史拆为 `Proma 修改` 与 `官方版本` 两个懒加载标签；历史查询固定映射 Bone/官方仓库并按来源隔离缓存，Electron Updater、最新版本和按标签查询仍只使用 `kuangtao22/Proma`。
 - 2026-08-22：`v0.17.55-bone.1` GitHub Actions 全平台发布成功，并回填 `bone.1`、`bone.4`、`bone.5` 中文 Release 正文；若根目录类型检查异常解析到 `apps/electron/node_modules` 的旧 `@types/node`，说明是历史嵌套依赖遮蔽，`bun install --frozen-lockfile` 不会自动清理该目录。
 - 2026-08-22：整理 fork GitHub Releases，仅保留当前正式版 `v0.17.55-bone.1` 与上一稳定版 `v0.17.42-bone.5`；删除旧 `0.9.x`、重复草稿及已淘汰 Bone Release，但保留 Git 标签用于历史代码定位。
+- 2026-08-22：本机 `gh auth status` 中账号令牌失效时，Git HTTPS 仍可通过系统 Git 凭据直接推送 `kuangtao22/Proma`；排查推送权限时应分别验证 `gh` 与 Git 凭据，不把前者状态当作后者结论。
