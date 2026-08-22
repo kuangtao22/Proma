@@ -73,6 +73,22 @@ export function registerPromaDirectoryPath(path: string): string {
   return registerEntry(path, true)
 }
 
+/**
+ * 释放单个 opaque 本地文件授权，非法或非 proma-file URL 保持幂等忽略。
+ * @param url 之前由注册函数返回的 opaque URL。
+ */
+export function revokePromaPathUrl(url: string): void {
+  /** 仅解析合法 URL，释放动作不得因旧状态或重复调用打断切项目流程。 */
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return
+  }
+  if (parsed.protocol !== 'proma-file:') return
+  registeredEntries.delete(parsed.hostname)
+}
+
 export function handlePromaFileRequest(request: Request): Promise<Response> | Response {
   let url: URL
   try {
@@ -89,7 +105,13 @@ export function handlePromaFileRequest(request: Request): Promise<Response> | Re
 
   let target = entry.root
   if (entry.isDirectory) {
-    const relativePath = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
+    /** 非法百分号编码属于请求格式错误，不能让协议 handler 抛出。 */
+    let relativePath: string
+    try {
+      relativePath = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
+    } catch {
+      return new Response('Bad Request', { status: 400 })
+    }
     try {
       target = realpathSync(resolve(entry.root, relativePath))
     } catch {
