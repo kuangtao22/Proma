@@ -8,8 +8,9 @@ import { resolveAppIdentity } from './lib/app-identity'
 // 必须在任何会读取 userData 路径的模块加载之前执行
 /** 当前进程应使用的正式或开发身份。 */
 const appIdentity = resolveAppIdentity(app.isPackaged, process.env.PROMA_DEV_INSTANCE)
-if (!app.isPackaged && appIdentity.userDataDirectoryName) {
-  app.setName(appIdentity.displayName)
+if (!app.isPackaged && appIdentity.userDataDirectoryName && appIdentity.safeStorageName) {
+  // ready 前固定历史内部名称，继续复用共享配置对应的 macOS Safe Storage 密钥。
+  app.setName(appIdentity.safeStorageName)
   app.setPath('userData', join(app.getPath('appData'), appIdentity.userDataDirectoryName))
   if (process.platform === 'win32') app.setAppUserModelId(appIdentity.appId)
 }
@@ -729,7 +730,13 @@ function sendToMainWindow(channel: string, data?: unknown): void {
   }
 }
 
-app.whenReady().then(bootstrap).catch(handleBootstrapFailure)
+app.whenReady()
+  .then(() => {
+    // Safe Storage 初始化完成后再恢复开发客户端的用户可见名称。
+    if (!app.isPackaged) app.setName(appIdentity.displayName)
+    return bootstrap()
+  })
+  .catch(handleBootstrapFailure)
 
 /**
  * 启动主流程。所有非关键步骤用 safeRun / safeAwait 隔离，
