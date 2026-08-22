@@ -24,7 +24,7 @@ import type {
   DesignViewport,
   DesignWorkspaceSnapshot,
 } from '@proma/shared'
-import { writeJsonFileAtomicSecure } from '../safe-file'
+import { removeFileAtomic, writeJsonFileAtomicSecure } from '../safe-file'
 import { designPathResolver } from './design-paths'
 import type { DesignPathResolver, DesignPaths } from './design-paths'
 
@@ -132,13 +132,12 @@ function isSafeRelativePath(value: unknown): value is string {
   if (!isNonEmptyString(value)
     || isAbsolute(value)
     || win32.isAbsolute(value)
+    || value.includes('\\')
     || /^[A-Za-z]:/.test(value)) {
     return false
   }
-  /** 统一分隔符，确保 Windows 风格路径在所有平台都按段检查。 */
-  const normalizedSeparators = value.replaceAll('\\', '/')
   /** 路径中的任意上级段都会突破受管目录。 */
-  const segments = normalizedSeparators.split('/')
+  const segments = value.split('/')
   if (segments.some((segment) => segment === '..' || segment.length === 0)) return false
   /** 当前平台 normalize 后仍须保持相对且不回退。 */
   const normalizedPath = normalize(value)
@@ -150,10 +149,9 @@ function isSafeRelativePath(value: unknown): value is string {
 /** 判断素材相对路径位于指定受管一级目录。 */
 function isSafeManagedRelativePath(value: unknown, directoryName: string): value is string {
   if (!isSafeRelativePath(value)) return false
-  /** 统一平台分隔符后必须以固定目录前缀开头并包含叶子。 */
-  const normalizedSeparators = value.replaceAll('\\', '/')
-  return normalizedSeparators.startsWith(`${directoryName}/`)
-    && normalizedSeparators.length > directoryName.length + 1
+  /** 持久化路径必须以固定目录前缀开头并包含叶子。 */
+  return value.startsWith(`${directoryName}/`)
+    && value.length > directoryName.length + 1
 }
 
 /** 判断未知素材记录满足持久化 schema。 */
@@ -676,6 +674,20 @@ function writeDesignJsonSecure(paths: DesignPaths, filePath: string, document: D
   })
 }
 
+/** 使用身份绑定的原子删除安全消费已提升的固定 tmp。 */
+function consumeRecoveredTemporary(paths: DesignPaths): void {
+  /** 删除前绑定的项目内 Design 根身份。 */
+  const directoryIdentity = captureDesignRootIdentity(paths)
+  /** 仅允许消费画布恢复链约定的固定临时候选。 */
+  const temporaryPath = `${paths.canvasPath}.tmp`
+  if (dirname(temporaryPath) !== paths.designRoot) {
+    throw unsafeDesignPath(`临时画布不在 Design 根: ${temporaryPath}`)
+  }
+  removeFileAtomic(temporaryPath)
+  /** 删除完成后目录路径仍须指向同一实际目录。 */
+  assertDirectoryIdentity(directoryIdentity)
+}
+
 /** 安全保存 mutation 文档，并在覆盖主文件前保存当前 revision 备份。 */
 function writeMutatedDocument(
   paths: DesignPaths,
@@ -717,6 +729,7 @@ export function createDesignStore(options: DesignStoreOptions = {}): DesignStore
     if (readResult.document && readResult.recoveredFrom) {
       /** 恢复候选需安全提升为主文件，供下一次加载稳定使用。 */
       writeDesignJsonSecure(paths, paths.canvasPath, readResult.document)
+      if (readResult.recoveredFrom === 'tmp') consumeRecoveredTemporary(paths)
     }
     return {
       document: readResult.document ?? createEmptyDesignDocument(projectId, now()),
@@ -731,8 +744,13 @@ export function createDesignStore(options: DesignStoreOptions = {}): DesignStore
     expectedRevision: number,
     mutations: DesignMutation[],
   ): DesignCanvasDocument {
-    /** mutation 开始时重新加载的磁盘最新文档。 */
-    const current = load(projectId).document
+    /** mutation 开始时重新加载的磁盘最新快照。 */
+    const loaded = load(projectId)
+    if (loaded.recoveredFrom) {
+      throw new Error(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${loaded.recoveredFrom}`)
+    }
+    /** 未发生恢复时可继续 mutation 的磁盘最新文档。 */
+    const current = loaded.document
     assertCanApply(expectedRevision, current.revision, mutations)
     assertMoveTargetsExist(current, expectedRevision, mutations)
     if (mutations.length === 0) return current

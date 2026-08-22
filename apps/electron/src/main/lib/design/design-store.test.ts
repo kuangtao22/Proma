@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -96,6 +97,45 @@ describe('Design revision 原子存储', () => {
     expect(JSON.parse(readFileSync(canvasPath, 'utf8'))).toEqual(validDocument)
   })
 
+  test('Given 固定 tmp 恢复后继续保存 When 主文件再次损坏 Then 消费旧 tmp 并恢复最新备份', () => {
+    /** 使用真实安全恢复、备份和删除链的存储。 */
+    const store = createStore()
+    /** 当前项目画布主文件路径。 */
+    const canvasPath = join(projectRoot, '.proma/design/canvas.json')
+    /** revision 1 作为模拟崩溃遗留的固定 tmp。 */
+    const revisionOne = store.mutate('project-1', 0, [{
+      type: 'set-viewport',
+      viewport: { x: 10, y: 10, zoom: 1 },
+    }])
+    renameSync(canvasPath, `${canvasPath}.tmp`)
+
+    /** 首次从 tmp 恢复并安全提升的快照。 */
+    const recoveredTemporary = store.load('project-1')
+    /** 提升完成后立即记录固定 tmp 是否已被消费。 */
+    const temporaryStillExists = existsSync(`${canvasPath}.tmp`)
+    /** 正常保存 revision 2。 */
+    const revisionTwo = store.mutate('project-1', recoveredTemporary.document.revision, [{
+      type: 'set-viewport',
+      viewport: { x: 20, y: 20, zoom: 2 },
+    }])
+    /** 正常保存 revision 3，使安全备份固定为 revision 2。 */
+    const revisionThree = store.mutate('project-1', revisionTwo.revision, [{
+      type: 'set-viewport',
+      viewport: { x: 30, y: 30, zoom: 3 },
+    }])
+    writeFileSync(canvasPath, '{ broken again', 'utf8')
+
+    /** 主文件再次损坏后的恢复结果必须来自最新 backup。 */
+    const recoveredBackup = store.load('project-1')
+    expect(revisionOne.revision).toBe(1)
+    expect(recoveredTemporary.recoveredFrom).toBe('tmp')
+    expect(temporaryStillExists).toBe(false)
+    expect(revisionThree.revision).toBe(3)
+    expect(recoveredBackup.recoveredFrom).toBe('backup')
+    expect(recoveredBackup.document.revision).toBe(2)
+    expect(recoveredBackup.document.viewport).toEqual({ x: 20, y: 20, zoom: 2 })
+  })
+
   test('Given stale revision When 只移动节点 Then 在最新 revision 上重放', () => {
     /** 支持 revision 重放的存储。 */
     const store = createStore()
@@ -182,6 +222,29 @@ describe('Design revision 原子存储', () => {
       viewport: { x: 1, y: 2, zoom: 1.5 },
     }])).toThrow('DESIGN_REVISION_CONFLICT')
     expect(store.load('project-1').document.revision).toBe(1)
+  })
+
+  test('Given mutate 内部首次发现 tmp 恢复 When expected revision 恰好相等 Then 要求 reload 且不继续写', () => {
+    /** 用于验证恢复与 mutation 必须分成两次用户操作的存储。 */
+    const store = createStore()
+    /** 当前项目画布主文件路径。 */
+    const canvasPath = join(projectRoot, '.proma/design/canvas.json')
+    /** 建立 revision 1 后模拟主文件 rename 前后的崩溃残留。 */
+    store.mutate('project-1', 0, [{
+      type: 'set-viewport',
+      viewport: { x: 10, y: 10, zoom: 1 },
+    }])
+    renameSync(canvasPath, `${canvasPath}.tmp`)
+
+    expect(() => store.mutate('project-1', 1, [{
+      type: 'set-viewport',
+      viewport: { x: 99, y: 99, zoom: 4 },
+    }])).toThrow('DESIGN_RECOVERY_REQUIRED')
+    expect(existsSync(`${canvasPath}.tmp`)).toBe(false)
+    /** 恢复提交只保留 revision 1，不应用本次 mutation。 */
+    const restored = store.load('project-1').document
+    expect(restored.revision).toBe(1)
+    expect(restored.viewport).toEqual({ x: 10, y: 10, zoom: 1 })
   })
 
   test('Given 项目 .proma 指向根外目录 When 加载或保存 Then fail closed 且不写外部目录', () => {
@@ -324,11 +387,14 @@ describe('Design 画布 schema 校验', () => {
     const wrongThumbnailPrefix = createAssetDocument('assets/image.png', 'image.webp')
     /** Windows drive-relative 在非 Windows 主机也必须拒绝。 */
     const driveRelative = createAssetDocument('C:image.png', 'thumbnails/image.webp')
+    /** 持久化 JSON 中的 Windows 分隔符在所有平台都必须拒绝。 */
+    const backslashSeparated = createAssetDocument('assets\\image.png', 'thumbnails/image.webp')
 
     expect(isDesignCanvasDocument(valid, 'project-1')).toBe(true)
     expect(isDesignCanvasDocument(wrongAssetPrefix, 'project-1')).toBe(false)
     expect(isDesignCanvasDocument(wrongThumbnailPrefix, 'project-1')).toBe(false)
     expect(isDesignCanvasDocument(driveRelative, 'project-1')).toBe(false)
+    expect(isDesignCanvasDocument(backslashSeparated, 'project-1')).toBe(false)
   })
 
   test('Given 素材父版本自环或任意环 When 校验 Then 拒绝循环版本关系', () => {
