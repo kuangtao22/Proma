@@ -1,10 +1,12 @@
 import * as React from 'react'
 import { RefreshCw, Sparkles, Upload } from 'lucide-react'
-import { useAtomValue } from 'jotai'
-import { createInitialDesignProjectState } from '@/atoms/design-atoms'
+import { useAtomValue, useSetAtom } from 'jotai'
+import { createInitialDesignProjectState, updateDesignProjectStateAtom } from '@/atoms/design-atoms'
 import type { DesignProjectState } from '@/atoms/design-atoms'
 import { currentAgentWorkspaceIdAtom } from '@/atoms/agent-atoms'
 import { Button } from '@/components/ui/button'
+import { DesignCanvas } from './DesignCanvas'
+import { DesignToolbar } from './DesignToolbar'
 import { useDesignWorkspace } from './use-design-workspace'
 
 export interface DesignWorkspaceStateViewProps {
@@ -28,6 +30,8 @@ export function DesignWorkspaceStateView({
   onImportAssets,
   onCreateJob,
 }: DesignWorkspaceStateViewProps): React.ReactElement {
+  const updateProjectState = useSetAtom(updateDesignProjectStateAtom)
+
   if (state.phase === 'loading' || state.phase === 'idle') {
     return (
       <div className="flex h-full items-center justify-center bg-background" role="status">
@@ -49,10 +53,21 @@ export function DesignWorkspaceStateView({
   const isEmpty = state.snapshot.document.nodes.length === 0
   /** 只读项目仍显示画布内容，仅关闭写入口。 */
   const writable = state.snapshot.writable
+  /** 当前画布文档包含稳定项目 ID，可作为 Jotai 局部更新键。 */
+  const projectId = state.snapshot.document.projectId
+
+  /**
+   * 将工具栏模式切换写入当前项目隔离状态。
+   * @param activeTool 用户选择的画布工具。
+   * @returns 无返回值。
+   */
+  const handleToolChange = (activeTool: DesignProjectState['activeTool']): void => {
+    updateProjectState({ projectId, update: { activeTool } })
+  }
 
   return (
     <div className="relative flex h-full min-h-0 flex-col bg-background">
-      <div className="absolute left-3 top-3 z-10 flex max-w-[min(520px,calc(100%-24px))] flex-col gap-1">
+      <div className="absolute left-3 top-14 z-10 flex max-w-[min(520px,calc(100%-24px))] flex-col gap-1">
         {!writable && (
           <p className="rounded border border-border bg-background/95 px-2 py-1 text-xs text-muted-foreground">
             {state.snapshot.readOnlyReason ?? '设计工作区当前为只读'}
@@ -71,15 +86,46 @@ export function DesignWorkspaceStateView({
         )}
       </div>
 
+      <div className="pointer-events-none absolute left-1/2 top-3 z-20 max-w-[calc(100%-24px)] -translate-x-1/2 overflow-x-auto">
+        <div className="pointer-events-auto w-max">
+          <DesignToolbar
+            activeTool={state.activeTool}
+            writable={writable}
+            canUndo={state.history.length > 0}
+            canRedo={state.future.length > 0}
+            onToolChange={handleToolChange}
+            onImportAssets={onImportAssets}
+          />
+        </div>
+      </div>
+
       <div className="relative min-h-0 flex-1" data-design-canvas-slot>
+        <DesignCanvas
+          document={state.snapshot.document}
+          thumbnailBaseUrl={state.snapshot.thumbnailBaseUrl}
+          writable={writable}
+          activeTool={state.activeTool}
+          selectedNodeIds={state.selectedNodeIds}
+        />
         {isEmpty && (
-          <div className="absolute inset-0 flex items-center justify-center">
+          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
             <div className="flex flex-wrap items-center justify-center gap-2 px-4">
-              <Button type="button" variant="outline" disabled={!writable || !onImportAssets} onClick={onImportAssets}>
+              <Button
+                type="button"
+                variant="outline"
+                className="pointer-events-auto"
+                disabled={!writable || !onImportAssets}
+                onClick={onImportAssets}
+              >
                 <Upload className="size-4" aria-hidden="true" />
                 导入图片
               </Button>
-              <Button type="button" disabled={!writable || !onCreateJob} onClick={onCreateJob}>
+              <Button
+                type="button"
+                className="pointer-events-auto"
+                disabled={!writable || !onCreateJob}
+                onClick={onCreateJob}
+              >
                 <Sparkles className="size-4" aria-hidden="true" />
                 AI 生成
               </Button>
