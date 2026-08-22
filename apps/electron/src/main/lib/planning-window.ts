@@ -3,7 +3,12 @@ import type { BrowserWindowConstructorOptions } from 'electron'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { MainWindowState } from '../../types'
-import { getPersistableMainWindowState } from './main-window-lifecycle'
+import {
+  ensureWindowBoundsVisible,
+  getPersistableMainWindowState,
+  normalizeWindowBoundsToVisibleArea,
+  type WindowBounds,
+} from './main-window-lifecycle'
 import { getSettings, updateSettings } from './settings-service'
 
 const DEFAULT_WIDTH = 1180
@@ -26,9 +31,27 @@ function getIconPath(): string | undefined {
   return existsSync(iconPath) ? iconPath : undefined
 }
 
+function normalizePlanningWindowBounds(
+  bounds: WindowBounds,
+  minWidth = MIN_WIDTH,
+  minHeight = MIN_HEIGHT,
+): WindowBounds {
+  return normalizeWindowBoundsToVisibleArea(
+    bounds,
+    screen.getAllDisplays(),
+    screen.getPrimaryDisplay(),
+    {
+      minWidth,
+      minHeight,
+      fallbackWidth: DEFAULT_WIDTH,
+      fallbackHeight: DEFAULT_HEIGHT,
+    },
+  )
+}
+
 function getInitialBounds(savedState?: MainWindowState): Electron.Rectangle {
   if (savedState) {
-    return { x: savedState.x, y: savedState.y, width: savedState.width, height: savedState.height }
+    return normalizePlanningWindowBounds(savedState)
   }
 
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
@@ -44,19 +67,17 @@ function getInitialBounds(savedState?: MainWindowState): Electron.Rectangle {
 }
 
 function ensureWindowOnScreen(win: BrowserWindow): void {
-  const bounds = win.getBounds()
-  const centerX = bounds.x + bounds.width / 2
-  const centerY = bounds.y + bounds.height / 2
-  const visible = screen.getAllDisplays().some((display) => {
-    const area = display.workArea
-    return centerX >= area.x && centerX <= area.x + area.width && centerY >= area.y && centerY <= area.y + area.height
-  })
-  if (visible) return
-
-  const area = screen.getPrimaryDisplay().workArea
-  win.setPosition(
-    area.x + Math.round((area.width - bounds.width) / 2),
-    area.y + Math.round((area.height - bounds.height) / 2),
+  const [minWidth, minHeight] = win.getMinimumSize()
+  ensureWindowBoundsVisible(
+    win,
+    screen.getAllDisplays(),
+    screen.getPrimaryDisplay(),
+    {
+      minWidth,
+      minHeight,
+      fallbackWidth: DEFAULT_WIDTH,
+      fallbackHeight: DEFAULT_HEIGHT,
+    },
   )
 }
 

@@ -62,9 +62,8 @@ import GrokDarkLogo from '@/assets/models/grok_dark.png'
 // Kimi
 import KimiLogo from '@/assets/models/moonshot.png'
 
-// Doubao / 豆包
-import DoubaoLogo from '@/assets/models/doubao.png'
-import DoubaoDarkLogo from '@/assets/models/doubao_dark.png'
+// Volcengine / 火山引擎
+import VolcengineLogo from '@/assets/models/volcengine.svg'
 
 // Zhipu / 智谱
 import ZhipuLogo from '@/assets/models/zhipu.png'
@@ -177,10 +176,10 @@ const MODEL_LOGO_MAP: Record<string, string> = {
   // === Kimi ===
   kimi: KimiLogo,
 
-  // === Doubao / 豆包 ===
-  doubao: DoubaoLogo,
-  'ep-202': DoubaoLogo,
-  seed: DoubaoLogo,
+  // === Volcengine / 火山引擎 ===
+  doubao: VolcengineLogo,
+  'ep-202': VolcengineLogo,
+  seed: VolcengineLogo,
 
   // === Zhipu / 智谱 ===
   zhipu: ZhipuLogo,
@@ -247,9 +246,10 @@ const PROVIDER_LOGO_MAP: Record<ProviderType, string> = {
   zhipu: ZhipuLogo,
   'zhipu-coding': ZhipuLogo,
   'zhipu-coding-team': ZhipuLogo,
-  'ark-coding-plan': DoubaoLogo,
+  'ark-coding-plan': VolcengineLogo,
   minimax: MiniMaxLogo,
-  doubao: DoubaoLogo,
+  doubao: VolcengineLogo,
+  'doubao-api': VolcengineLogo,
   qwen: QwenLogo,
   'qwen-anthropic': QwenLogo,
   'qwen-token-plan': QwenLogo,
@@ -323,7 +323,7 @@ const URL_LOGO_MAP: Array<[RegExp, string]> = [
   [/bigmodel\.cn|zhipuai/i, ZhipuLogo],
   [/minimax/i, MiniMaxLogo],
   [/xiaomimimo|mimo/i, XiaomiLogo],
-  [/volces\.com|volcengine/i, DoubaoLogo],
+  [/volces\.com|volcengine/i, VolcengineLogo],
   [/dashscope|aliyuncs/i, QwenLogo],
   [/deepseek/i, DeepSeekLogo],
   [/openai\.com/i, OpenAILogo],

@@ -29,6 +29,8 @@ interface FakeRuntimeState {
   calls: string[]
   /** 底层 stop 实际调用次数。 */
   stopCalls: number
+  /** query abort 的协议响应。 */
+  abortResponse: { accepted: boolean; completed?: boolean }
   /** adapter 注册的 runtime 事件监听器。 */
   eventListener?: (event: AgentRuntimeEvent) => void
 }
@@ -41,7 +43,12 @@ mock.module('../agent-runtime-client', () => ({
     /** 当前 client 独占的 runtime 状态。 */
     private readonly state: FakeRuntimeState
     constructor() {
-      this.state = { stop: createDeferred(), calls: [], stopCalls: 0 }
+      this.state = {
+        stop: createDeferred(),
+        calls: [],
+        stopCalls: 0,
+        abortResponse: { accepted: true, completed: true },
+      }
       runtimeStates.push(this.state)
     }
     setRequestHandler(): void {}
@@ -51,6 +58,7 @@ mock.module('../agent-runtime-client', () => ({
     }
     async call(method: string): Promise<unknown> {
       this.state.calls.push(method)
+      if (method === AGENT_RUNTIME_METHODS.QUERY_ABORT) return this.state.abortResponse
       return undefined
     }
     stop(): Promise<void> {
@@ -81,6 +89,35 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
 }
 
 describe('Pi utility 强制关闭合同', () => {
+  test('Given runtime 停止超时 When 普通停止后强制关闭 Then 共享一次底层关闭', async () => {
+    /** 被测 utility adapter。 */
+    const adapter = new PiUtilityAdapter()
+    /** 真实 async generator iterator。 */
+    const iterator = adapter.query(createQueryInput('session-timeout'), 'query-timeout')[Symbol.asyncIterator]()
+    /** 等待停止错误的 pending next。 */
+    const pendingNext = iterator.next()
+    /** 提前消费异步拒绝，避免测试运行器将预期错误判为未处理 Promise。 */
+    const pendingOutcome = pendingNext.then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    await waitUntil(() => runtimeStates.length === 1)
+    const runtime = runtimeStates[0]!
+    runtime.abortResponse = { accepted: true, completed: false }
+
+    adapter.abort('session-timeout')
+    await waitUntil(() => runtime.stopCalls === 1)
+    const forcedClose = adapter.forceCloseQuery('query-timeout')
+
+    expect(runtime.stopCalls).toBe(1)
+    runtime.stop.resolve()
+    await expect(forcedClose).resolves.toBeUndefined()
+    await expect(pendingOutcome).resolves.toBeInstanceOf(Error)
+    expect((await pendingOutcome as Error).message).toContain('停止 Agent 超时')
+    await expect(iterator.return?.()).resolves.toMatchObject({ done: true })
+    expect(runtime.stopCalls).toBe(1)
+  })
+
   test('Given async generator 的 next 永久等待队列 When 强制关闭 Then runtime 真正停止后 iterator 才完成', async () => {
     /** 被测 utility adapter。 */
     const adapter = new PiUtilityAdapter()

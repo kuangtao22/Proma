@@ -352,6 +352,7 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(inProcessSource).toContain('await active.closed')
     expect(utilitySource).toContain('if (pending.forceClosePromise) return pending.forceClosePromise')
     expect(utilitySource).toContain('pending.queue.end()')
-    expect(utilitySource).toContain('await pending.client.stop()')
+    expect(utilitySource).toContain('runtimeStopPromise?: Promise<void>')
+    expect(utilitySource).toContain('await this.stopRuntime(pending)')
   })
 })

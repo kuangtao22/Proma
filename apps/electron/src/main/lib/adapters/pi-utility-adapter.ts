@@ -23,12 +23,18 @@ type PendingQuery = {
   ended: boolean
   runtimeFailed: boolean
   runtimeAbortPromise?: Promise<void>
+  runtimeStopPromise?: Promise<void>
   forceClosePromise?: Promise<void>
 }
 
 type CapabilityRequest = {
   controller: AbortController
   queryId: string
+}
+
+type QueryAbortResponse = {
+  accepted: boolean
+  completed?: boolean
 }
 
 type AsyncEventQueue<T> = {
@@ -96,7 +102,7 @@ export class PiUtilityAdapter {
         await pending.forceClosePromise
       } else {
         if (pending.accepted && !pending.runtimeFailed) await this.requestRuntimeAbort(pending)
-        await client.stop()
+        await this.stopRuntime(pending)
       }
     }
   }
@@ -112,6 +118,13 @@ export class PiUtilityAdapter {
     const pending = this.pendingQueries.get(queryToken)
     if (!pending) return Promise.resolve()
     return this.forceClosePendingQuery(pending)
+  }
+
+  private failStoppedQuery(pending: PendingQuery, error: unknown): void {
+    if (pending.ended || pending.runtimeFailed) return
+    pending.runtimeFailed = true
+    pending.queue.fail(error)
+    void this.stopRuntime(pending).catch(() => {})
   }
 
   async sendQueuedMessage(
@@ -219,12 +232,16 @@ export class PiUtilityAdapter {
   /** 复用单个 runtime abort 请求，避免 stop 与 drain timeout 重复终止同一 query。 */
   private requestRuntimeAbort(pending: PendingQuery): Promise<void> {
     if (pending.runtimeFailed) return Promise.resolve()
-    pending.runtimeAbortPromise ??= pending.client.call(
+    pending.runtimeAbortPromise ??= pending.client.call<QueryAbortResponse>(
       AGENT_RUNTIME_METHODS.QUERY_ABORT,
       { queryId: pending.queryId, sessionId: pending.sessionId },
       { queryId: pending.queryId, timeoutMs: 5_000 },
-    ).then(() => undefined).catch((error) => {
+    ).then((result: QueryAbortResponse) => {
+      if (result.completed !== false) return
+      this.failStoppedQuery(pending, new Error('停止 Agent 超时，已关闭卡住的运行时'))
+    }).catch((error) => {
       console.warn(`[PiUtilityAdapter] abort failed: sessionId=${pending.sessionId}`, error)
+      this.failStoppedQuery(pending, error)
     })
     return pending.runtimeAbortPromise
   }
@@ -238,11 +255,17 @@ export class PiUtilityAdapter {
       } finally {
         pending.queue.end()
       }
-      await pending.client.stop()
+      await this.stopRuntime(pending)
     })()
     // dispose 是同步入口；为共享 Promise 预装拒绝消费者，调用方仍可 await 原 Promise 得到失败。
     pending.forceClosePromise.catch(() => {})
     return pending.forceClosePromise
+  }
+
+  /** 复用底层 runtime 关闭过程，避免超时、强制关闭与 finally 重复调用 stop。 */
+  private stopRuntime(pending: PendingQuery): Promise<void> {
+    pending.runtimeStopPromise ??= pending.client.stop()
+    return pending.runtimeStopPromise
   }
 
   private handleRuntimeEvent(event: AgentRuntimeEvent, sourceQueryToken: string): void {

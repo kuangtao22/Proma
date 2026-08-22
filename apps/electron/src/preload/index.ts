@@ -238,6 +238,7 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   closeAgentBrowserTab: (input: import('@proma/shared').BrowserTabInput) => Promise<import('@proma/shared').BrowserViewState | null>
   getAgentBrowserState: (sessionId: string) => Promise<import('@proma/shared').BrowserViewState | null>
   setAgentBrowserLayout: (layout: import('@proma/shared').BrowserViewLayout) => Promise<void>
+  minimizeAgentBrowser: (sessionId: string) => Promise<void>
   navigateAgentBrowser: (input: import('@proma/shared').BrowserNavigateInput) => Promise<import('@proma/shared').BrowserViewState>
   goBackAgentBrowser: (sessionId: string) => Promise<import('@proma/shared').BrowserViewState>
   goForwardAgentBrowser: (sessionId: string) => Promise<import('@proma/shared').BrowserViewState>
@@ -1012,7 +1013,7 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   /** 保存飞书配置（appSecret 为明文） */
   saveFeishuConfig: (input: FeishuConfigInput) => Promise<FeishuConfig>
   /** 测试飞书连接 */
-  testFeishuConnection: (appId: string, appSecret: string) => Promise<FeishuTestResult>
+  testFeishuConnection: (appId: string, appSecret: string, domain?: import('@proma/shared').FeishuDomain) => Promise<FeishuTestResult>
   /** 启动飞书 Bridge */
   startFeishuBridge: () => Promise<void>
   /** 停止飞书 Bridge */
@@ -1350,6 +1351,7 @@ const electronAPI: ElectronAPI = {
   setAgentBrowserLayout: (layout: import('@proma/shared').BrowserViewLayout) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SET_BROWSER_LAYOUT, layout)
   },
+  minimizeAgentBrowser: (sessionId: string) => ipcRenderer.invoke(AGENT_IPC_CHANNELS.MINIMIZE_BROWSER, sessionId),
   navigateAgentBrowser: (input: import('@proma/shared').BrowserNavigateInput) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.NAVIGATE_BROWSER, input)
   },
@@ -2423,8 +2425,8 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.SAVE_CONFIG, input)
   },
 
-  testFeishuConnection: (appId: string, appSecret: string) => {
-    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.TEST_CONNECTION, appId, appSecret)
+  testFeishuConnection: (appId: string, appSecret: string, domain?: import('@proma/shared').FeishuDomain) => {
+    return ipcRenderer.invoke(FEISHU_IPC_CHANNELS.TEST_CONNECTION, appId, appSecret, domain)
   },
 
   startFeishuBridge: () => {

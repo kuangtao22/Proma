@@ -32,6 +32,7 @@ import { Input } from '@/components/ui/input'
 import {
   PROVIDER_DEFAULT_URLS,
   PROVIDER_LABELS,
+  VOLCENGINE_CODING_PLAN_MODELS,
   parseZhipuTeamCredentials,
   parseCodexCredentials,
   parseXaiCredentials,
@@ -79,14 +80,14 @@ interface ChannelFormProps {
   onCancel: () => void
 }
 
-/** 所有可选供应商 */
-const PROVIDER_OPTIONS: ProviderType[] = ['anthropic', 'anthropic-compatible', 'openai', 'openai-responses', 'openai-codex', 'xai', 'deepseek', 'google', 'kimi-api', 'kimi-coding', 'opencode-go-openai', 'zhipu', 'zhipu-coding', 'zhipu-coding-team', 'ark-coding-plan', 'minimax', 'doubao', 'qwen', 'qwen-anthropic', 'qwen-token-plan', 'xiaomi', 'xiaomi-token-plan', 'custom']
+/** 所有可选供应商（'qwen-anthropic' 仅为兼容存量 Anthropic 渠道保留，不再出现在新建下拉） */
+const PROVIDER_OPTIONS: ProviderType[] = ['anthropic', 'anthropic-compatible', 'openai', 'openai-responses', 'openai-codex', 'xai', 'deepseek', 'google', 'kimi-api', 'kimi-coding', 'opencode-go-openai', 'zhipu', 'zhipu-coding', 'zhipu-coding-team', 'ark-coding-plan', 'doubao', 'doubao-api', 'minimax', 'qwen', 'qwen-token-plan', 'xiaomi', 'xiaomi-token-plan', 'custom']
 
 /** 需要用 messages 端点测试的供应商预设模型 */
 const PROVIDER_TEST_MODEL_PRESETS: Partial<Record<ProviderType, string[]>> = {
-  deepseek: ['deepseek-v4-pro', 'deepseek-v4-flash'],
-  'kimi-api': ['k3', 'kimi-k2.6'],
-  'opencode-go-openai': ['grok-4.5', 'glm-5.2', 'kimi-k3'],
+  deepseek: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'],
+  'kimi-api': ['kimi-k3', 'kimi-k2.6'],
+  'opencode-go-openai': ['grok-4.5', 'kimi-k3'],
   xiaomi: ['mimo-v2.5-pro', 'mimo-v2-pro', 'mimo-v2.5', 'mimo-v2-omni', 'mimo-v2-flash'],
   'xiaomi-token-plan': ['mimo-v2.5-pro', 'mimo-v2-pro', 'mimo-v2.5', 'mimo-v2-omni', 'mimo-v2-flash'],
   'qwen-token-plan': ['qwen3.8-max-preview', 'qwen3.7-max', 'qwen3.7-flash', 'qwen3.6-flash'],
@@ -378,7 +379,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
     return () => { if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current) }
   }, [models, name, provider, baseUrl, effectiveApiKey, enabled, requiresBaseUrlRiskAcknowledgement, scheduleAutoSave])
 
-  // 切换供应商时自动更新 Base URL 与名称，Anthropic 兼容渠道自动添加预设模型
+  // 切换供应商时自动更新 Base URL 与名称，并为支持的渠道自动添加预设模型
   const handleProviderChange = (newProvider: string): void => {
     const p = newProvider as ProviderType
     // 若 name 为空或仍是上一个 provider 的默认名称，则用新 provider 的名称覆盖；用户手动改过的 name 不动
@@ -405,10 +406,11 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         setModels([
           { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', enabled: true },
           { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', enabled: true },
+          { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek V4 Flash Vision Exp', enabled: true },
         ])
       } else if (p === 'kimi-api') {
         setModels([
-          { id: 'k3', name: 'Kimi K3', enabled: true },
+          { id: 'kimi-k3', name: 'Kimi K3', enabled: true },
           { id: 'kimi-k2.6', name: 'Kimi K2.6', enabled: true },
         ])
       } else if (p === 'kimi-coding') {
@@ -420,7 +422,6 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         setModels([
           { id: 'grok-4.5', name: 'Grok 4.5', enabled: true },
           { id: 'glm-5.3', name: 'GLM-5.3', enabled: true },
-          { id: 'glm-5.2', name: 'GLM-5.2', enabled: true },
           { id: 'glm-5.1', name: 'GLM-5.1', enabled: true },
           { id: 'kimi-k3', name: 'Kimi K3', enabled: true },
           { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', enabled: true },
@@ -433,7 +434,6 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
       } else if (p === 'zhipu' || p === 'zhipu-coding' || p === 'zhipu-coding-team') {
         setModels([
           { id: 'glm-5.3', name: 'GLM-5.3', enabled: true },
-          { id: 'glm-5.2', name: 'GLM-5.2', enabled: true },
           { id: 'glm-5.1', name: 'GLM-5.1', enabled: false },
         ])
       } else if (p === 'ark-coding-plan') {
@@ -444,13 +444,14 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
           { id: 'doubao-seed-2.0-pro', name: 'Doubao Seed 2.0 Pro', enabled: true },
           { id: 'doubao-seed-2.0-lite', name: 'Doubao Seed 2.0 Lite', enabled: true },
           { id: 'glm-5.3', name: 'GLM-5.3', enabled: true },
-          { id: 'glm-5.2', name: 'GLM-5.2', enabled: true },
           { id: 'k3', name: 'Kimi K3', enabled: true },
           { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', enabled: true },
           { id: 'minimax-m3', name: 'MiniMax M3', enabled: true },
           { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', enabled: true },
           { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', enabled: true },
         ])
+      } else if (p === 'doubao') {
+        setModels(VOLCENGINE_CODING_PLAN_MODELS.map((model) => ({ ...model })))
       } else if (p === 'minimax') {
         setModels([
           { id: 'MiniMax-M3', name: 'MiniMax-M3', enabled: true },
@@ -807,6 +808,20 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
   const isDirty = !isEdit && (name.trim() !== '' || effectiveApiKey.trim() !== '' || models.length > 0)
   const hasNoModels = !isEdit && models.length === 0
 
+  /**
+   * 编辑模式下若当前 provider 已从新建下拉移除（如旧版 'qwen'），
+   * 动态追加对应选项，避免 SettingsSelect 因找不到 value 而显示占位符。
+   */
+  const providerSelectOptions = React.useMemo(() => {
+    if (isEdit && !PROVIDER_OPTIONS.includes(provider)) {
+      return [
+        ...PROVIDER_SELECT_OPTIONS,
+        { value: provider, label: PROVIDER_LABELS[provider], icon: getProviderLogo(provider) },
+      ]
+    }
+    return PROVIDER_SELECT_OPTIONS
+  }, [isEdit, provider])
+
   /** 返回按钮：创建模式下有未保存内容时拦截 */
   const handleBack = (): void => {
     if (!isEdit && isDirty) {
@@ -902,7 +917,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
             label="供应商类型"
             value={provider}
             onValueChange={handleProviderChange}
-            options={PROVIDER_SELECT_OPTIONS}
+            options={providerSelectOptions}
             placeholder="选择供应商"
           />
           {provider === 'custom' && (

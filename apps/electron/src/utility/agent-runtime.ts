@@ -12,6 +12,7 @@ import {
   type AgentRuntimeState,
 } from '@proma/shared'
 import { PiAgentAdapter, type PiAgentQueryOptions } from '../main/lib/adapters/pi-agent-adapter'
+import { getParentRequestTimeoutMs } from './agent-runtime-request-timeout'
 
 type MessagePortLike = {
   on(event: 'message', listener: (event: { data: unknown }) => void): void
@@ -256,12 +257,13 @@ async function handleQueryAbort(request: RuntimeRequest): Promise<void> {
     respond(request, { accepted: false, reason: 'stale_or_inactive_query' })
     return
   }
+  const query = activeQuery
   piAdapter.abort(sessionId)
-  await Promise.race([
-    activeQuery.done,
-    new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+  const completed = await Promise.race([
+    query.done.then(() => true),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5_000)),
   ])
-  respond(request, { accepted: true, queryId })
+  respond(request, { accepted: true, queryId, completed })
 }
 
 async function handleQueuedMessage(request: RuntimeRequest): Promise<void> {
@@ -317,6 +319,7 @@ function requestParent<Result = unknown>(
 ): Promise<Result> {
   const port = runtimePort
   if (!port) return Promise.reject(new Error('Agent runtime port is not connected'))
+  const timeoutMs = getParentRequestTimeoutMs(method, payload)
   const request = createAgentRuntimeRequest(method, payload, {
     sessionId: activeQuery?.sessionId,
     queryId: activeQuery?.queryId,
@@ -338,7 +341,7 @@ function requestParent<Result = unknown>(
         bootId,
       ))
       reject(new Error(`Main runtime request timed out: ${method}`))
-    }, 120_000)
+    }, timeoutMs)
     parentRequests.set(request.requestId, {
       resolve: (value) => resolve(value as Result),
       reject,
