@@ -5,157 +5,203 @@
  */
 
 import * as React from 'react'
-import type { GitHubRelease } from '@proma/shared'
+import type { GitHubReleaseHistorySource } from '@proma/shared'
 import { RefreshCw, Loader2, ChevronDown, ChevronUp } from 'lucide-react'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ReleaseNotesViewer } from './ReleaseNotesViewer'
 import { SettingsCard } from './primitives'
+import {
+  createInitialVersionHistoryState,
+  loadVersionHistory,
+  reduceVersionHistoryState,
+  sanitizeVersionHistoryError,
+  shouldLoadVersionHistory,
+} from './version-history-state'
+
+/** 版本历史来源的稳定渲染顺序。 */
+const VERSION_HISTORY_SOURCES: GitHubReleaseHistorySource[] = ['bone', 'official']
+
+/** 版本历史标签对应的用户可见名称。 */
+const VERSION_HISTORY_LABELS: Record<GitHubReleaseHistorySource, string> = {
+  bone: 'Proma 修改',
+  official: '官方版本',
+}
 
 /**
  * VersionHistory 组件
  */
 export function VersionHistory(): React.ReactElement {
-  const [releases, setReleases] = React.useState<GitHubRelease[]>([])
-  const [loading, setLoading] = React.useState(false)
-  const [error, setError] = React.useState<string | null>(null)
-  const [expandedIds, setExpandedIds] = React.useState<Set<number>>(new Set())
+  /** 当前显示的版本历史来源，默认只展示并加载 Bone。 */
+  const [activeSource, setActiveSource] = React.useState<GitHubReleaseHistorySource>('bone')
+  /** Bone 与官方版本历史各自独立的状态。 */
+  const [historyState, dispatch] = React.useReducer(
+    reduceVersionHistoryState,
+    undefined,
+    createInitialVersionHistoryState,
+  )
+  /** 为稳定加载回调提供最新状态，避免错误后因依赖变化自动循环重试。 */
+  const historyStateRef = React.useRef(historyState)
+  historyStateRef.current = historyState
+  /** 按来源记录真实进行中的 Promise，抵御 StrictMode 与快速交互重复请求。 */
+  const inFlightRef = React.useRef<Record<GitHubReleaseHistorySource, boolean>>({
+    bone: false,
+    official: false,
+  })
 
-  // 加载 releases
-  const loadReleases = React.useCallback(async () => {
-    setLoading(true)
-    setError(null)
+  /** 加载指定来源；手动刷新可强制重试，但同来源同时只允许一个请求。 */
+  const loadReleases = React.useCallback(async (
+    source: GitHubReleaseHistorySource,
+    force = false,
+  ): Promise<void> => {
+    /** 请求开始前该来源的最新状态。 */
+    const sourceState = historyStateRef.current[source]
+    if (inFlightRef.current[source] || !shouldLoadVersionHistory(sourceState, force)) {
+      return
+    }
+
+    inFlightRef.current[source] = true
+    dispatch({ type: 'load-start', source })
 
     try {
-      const data = await window.electronAPI.listReleases({
-        perPage: 3,
-        includePrerelease: false,
-      })
-      setReleases(data)
+      /** 当前来源最近三条稳定 Release。 */
+      const releases = await loadVersionHistory(source, window.electronAPI.listReleases)
+      dispatch({ type: 'load-success', source, releases })
     } catch (err) {
       console.error('[版本历史] 加载失败:', err)
-      let errorMessage = err instanceof Error ? err.message : '加载失败'
-      // 过滤掉 Electron IPC 的英文前缀，只保留中文错误信息
-      // IPC 错误格式: "Error invoking remote method 'xxx': Error: 中文错误信息"
-      const ipcPrefixMatch = errorMessage.match(/Error invoking remote method[^:]*:\s*Error:\s*(.+)/s)
-      if (ipcPrefixMatch && ipcPrefixMatch[1]) {
-        errorMessage = ipcPrefixMatch[1].trim()
-      }
-      setError(errorMessage)
+      dispatch({ type: 'load-error', source, error: sanitizeVersionHistoryError(err) })
     } finally {
-      setLoading(false)
+      inFlightRef.current[source] = false
     }
   }, [])
 
-  // 初始加载
+  /** 首次仅加载 Bone；切换到未成功加载或曾失败的来源时再请求。 */
   React.useEffect(() => {
-    loadReleases()
-  }, [loadReleases])
-
-  // 切换展开/折叠
-  const toggleExpand = (id: number): void => {
-    setExpandedIds(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) {
-        next.delete(id)
-      } else {
-        next.add(id)
-      }
-      return next
-    })
-  }
+    void loadReleases(activeSource)
+  }, [activeSource, loadReleases])
 
   return (
     <SettingsCard>
-      {/* 标题栏 */}
-      <div className="p-4 border-b">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-medium">版本历史</h3>
-          <button
-            onClick={loadReleases}
-            disabled={loading}
-            className="inline-flex items-center gap-1.5 rounded-md bg-secondary px-3 py-1.5 text-xs font-medium text-secondary-foreground hover:bg-secondary/80 transition-colors disabled:opacity-50"
-          >
-            {loading ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
-            )}
-            刷新
-          </button>
+      <Tabs
+        value={activeSource}
+        onValueChange={(value) => setActiveSource(value as GitHubReleaseHistorySource)}
+        className="w-full min-w-0"
+      >
+        {/* 标题与来源切换区 */}
+        <div className="space-y-3 border-b p-4">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-medium">版本历史</h3>
+            <button
+              type="button"
+              onClick={() => void loadReleases(activeSource, true)}
+              disabled={historyState[activeSource].loading}
+              aria-label={historyState[activeSource].loading ? '正在刷新当前版本历史' : '刷新当前版本历史'}
+              title={historyState[activeSource].loading ? '正在刷新' : '刷新当前版本历史'}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-secondary px-3 py-1.5 text-xs font-medium text-secondary-foreground transition-colors hover:bg-secondary/80 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {historyState[activeSource].loading ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+              ) : (
+                <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+              )}
+              刷新
+            </button>
+          </div>
+          <TabsList className="grid w-full grid-cols-2 sm:w-auto sm:min-w-64">
+            {VERSION_HISTORY_SOURCES.map((source) => (
+              <TabsTrigger key={source} value={source} className="min-w-0 px-2 text-xs sm:px-3">
+                {VERSION_HISTORY_LABELS[source]}
+              </TabsTrigger>
+            ))}
+          </TabsList>
         </div>
-      </div>
 
-      {/* 版本列表 */}
-      <div className="divide-y">
-        {loading && releases.length === 0 ? (
-          <div className="p-8 text-center">
-            <Loader2 className="h-6 w-6 animate-spin mx-auto text-muted-foreground" />
-            <p className="text-sm text-muted-foreground mt-2">加载中...</p>
-          </div>
-        ) : error ? (
-          <div className="p-8 text-center">
-            <p className="text-sm text-muted-foreground">加载失败</p>
-            <p className="text-xs text-muted-foreground mt-1">{error}</p>
-          </div>
-        ) : releases.length === 0 ? (
-          <div className="p-8 text-center">
-            <p className="text-sm text-muted-foreground">暂无版本历史</p>
-          </div>
-        ) : (
-          releases.map((release, index) => {
-            const isExpanded = expandedIds.has(release.id)
-            const isLatest = index === 0
-
-            return (
-              <div key={release.id} className="p-4">
-                {/* 版本标题（可点击展开） */}
-                <button
-                  onClick={() => toggleExpand(release.id)}
-                  className="w-full flex items-center justify-between text-left hover:bg-accent/50 -m-4 p-4 rounded-lg transition-colors"
-                >
-                  <div className="flex items-center gap-3 flex-1 min-w-0">
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-medium font-mono truncate">
-                          {release.tag_name}
-                        </span>
-                        {isLatest && (
-                          <span className="text-xs text-primary font-medium">
-                            最新
-                          </span>
-                        )}
+        {VERSION_HISTORY_SOURCES.map((source) => {
+          /** 当前标签独立保存的列表、加载、错误和展开状态。 */
+          const sourceState = historyState[source]
+          return (
+            <TabsContent key={source} value={source} className="mt-0">
+              {/* 版本列表 */}
+              <div className="divide-y">
+                {sourceState.loading && sourceState.releases.length === 0 ? (
+                  <div className="p-8 text-center">
+                    <Loader2 className="mx-auto h-6 w-6 animate-spin text-muted-foreground" aria-hidden="true" />
+                    <p className="mt-2 text-sm text-muted-foreground">加载中...</p>
+                  </div>
+                ) : sourceState.error && sourceState.releases.length === 0 ? (
+                  <div className="p-8 text-center">
+                    <p className="text-sm text-muted-foreground">加载失败</p>
+                    <p className="mt-1 text-xs text-muted-foreground">{sourceState.error}</p>
+                  </div>
+                ) : sourceState.releases.length === 0 ? (
+                  <div className="p-8 text-center">
+                    <p className="text-sm text-muted-foreground">暂无版本历史</p>
+                  </div>
+                ) : (
+                  <>
+                    {sourceState.error && (
+                      <div className="px-4 py-3 text-xs text-muted-foreground" role="status">
+                        刷新失败：{sourceState.error}
                       </div>
-                      {release.name && release.name !== release.tag_name && (
-                        <p className="text-xs text-muted-foreground mt-0.5 truncate">
-                          {release.name}
-                        </p>
-                      )}
-                    </div>
-                    <span className="text-xs text-muted-foreground shrink-0">
-                      {new Date(release.published_at).toLocaleDateString('zh-CN')}
-                    </span>
-                  </div>
-                  {isExpanded ? (
-                    <ChevronUp className="h-4 w-4 text-muted-foreground shrink-0 ml-2" />
-                  ) : (
-                    <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0 ml-2" />
-                  )}
-                </button>
+                    )}
+                    {sourceState.releases.map((release, index) => {
+                      /** 当前 Release 是否已经展开。 */
+                      const isExpanded = sourceState.expandedIds.has(release.id)
+                      /** 当前来源第一条 Release 是否标记为最新。 */
+                      const isLatest = index === 0
 
-                {/* Release Notes（展开时显示） */}
-                {isExpanded && (
-                  <div className="mt-4 pt-4 border-t">
-                    <ReleaseNotesViewer
-                      release={release}
-                      showHeader={false}
-                      compact
-                    />
-                  </div>
+                      return (
+                        <div key={release.id} className="p-4">
+                          {/* 版本标题（可点击展开） */}
+                          <button
+                            type="button"
+                            onClick={() => dispatch({ type: 'toggle-expanded', source, releaseId: release.id })}
+                            aria-expanded={isExpanded}
+                            title={isExpanded ? '收起版本说明' : '展开版本说明'}
+                            className="-m-4 flex w-full items-center justify-between rounded-lg p-4 text-left transition-colors hover:bg-accent/50"
+                          >
+                            <div className="flex min-w-0 flex-1 items-center gap-3">
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-2">
+                                  <span className="truncate font-mono text-sm font-medium">
+                                    {release.tag_name}
+                                  </span>
+                                  {isLatest && (
+                                    <span className="text-xs font-medium text-primary">最新</span>
+                                  )}
+                                </div>
+                                {release.name && release.name !== release.tag_name && (
+                                  <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                                    {release.name}
+                                  </p>
+                                )}
+                              </div>
+                              <span className="shrink-0 text-xs text-muted-foreground">
+                                {new Date(release.published_at).toLocaleDateString('zh-CN')}
+                              </span>
+                            </div>
+                            {isExpanded ? (
+                              <ChevronUp className="ml-2 h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+                            ) : (
+                              <ChevronDown className="ml-2 h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+                            )}
+                          </button>
+
+                          {/* Release Notes（展开时显示） */}
+                          {isExpanded && (
+                            <div className="mt-4 border-t pt-4">
+                              <ReleaseNotesViewer release={release} showHeader={false} compact />
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </>
                 )}
               </div>
-            )
-          })
-        )}
-      </div>
+            </TabsContent>
+          )
+        })}
+      </Tabs>
     </SettingsCard>
   )
 }
