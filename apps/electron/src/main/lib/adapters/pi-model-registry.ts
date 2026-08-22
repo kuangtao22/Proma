@@ -162,6 +162,15 @@ export interface XaiModelInput {
   onXaiOAuthCredentialsRefreshed?: (credentials: XaiOAuthCredentials) => void | Promise<void>
 }
 
+/** 构建任意 Proma 渠道 Pi 模型所需的最小输入。 */
+export interface PiModelBuildInput extends CodexModelInput, XaiModelInput {
+  sessionId: string
+  apiKey: string
+  baseUrl?: string
+  provider: ProviderType
+  channelName?: string
+}
+
 function createCodexRuntimeCredentialStore(
   initial: CodexOAuthCredentials,
   onRefreshed?: PiAgentQueryOptions['onCodexOAuthCredentialsRefreshed'],
@@ -582,7 +591,7 @@ export async function resolvePiReasoningCapability(
   })
 }
 
-async function resolvePiModelDefaults(input: PiAgentQueryOptions): Promise<PiModelDefaults> {
+async function resolvePiModelDefaults(input: Pick<PiModelBuildInput, 'provider' | 'model'>): Promise<PiModelDefaults> {
   const catalogModel = input.model ? await findPiCatalogModel(input.provider, input.model) : undefined
   const codexAlignedCapabilities = getCodexAlignedGPT5Capabilities(input.model)
   const api = resolvePiApi(input.provider, catalogModel?.api)
@@ -789,7 +798,7 @@ export async function listXaiModels(): Promise<{ id: string; name: string }[]> {
   return (await getXaiCatalogModels()).map((m) => ({ id: m.id, name: m.name }))
 }
 
-export async function buildModel(sdk: PiSdk, input: PiAgentQueryOptions) {
+export async function buildModel(sdk: PiSdk, input: PiModelBuildInput) {
   if (input.provider === 'openai-codex') {
     return buildCodexModel(sdk, input)
   }

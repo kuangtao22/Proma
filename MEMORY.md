@@ -15,11 +15,13 @@
 - 功能变化涉及文档时，修改 `AGENTS.md` 与 `README.md` 前需获得用户允许。
 - Electron 正式应用使用官方基线加 Bone 构建号的 SemVer；正式标签、应用版本和更新元数据必须一致，提交说明使用中文。
 - 凭据只记录存放位置，不记录具体值。
+- 全量测试使用 `bun test --isolate`，避免历史测试中的 `mock.module` 跨文件污染；定向测试仍可直接指定测试文件。
 
 ## 架构决策
 
 - Electron IPC 变更必须依次同步：共享类型与通道常量 -> 主进程处理 -> Preload 桥接 -> 渲染进程调用。
 - Agent 仅使用 Pi Agent Runtime；主进程通过独立 utility process 与 `agent-runtime-client.ts` 管理每个会话，禁止重新引入 Claude/Codex Agent SDK。
+- Agent 自动标题统一复用 Pi ModelRuntime 的模型、渠道、认证、协议和代理解析；标题使用独立无工具、且不主动启用推理的会话，任何非中止失败均回退为首条用户消息，Chat 对话自身仍保留 Provider Adapter 路线。
 - Pi runtime 与 `sharp` 等 external 依赖由 `sync-runtime-deps.ts` 在打包前同步，桌面构建同时包含自包含的 Proma CLI 与原生辅助模块。
 - fork 保留 LAN Bridge 与 `apps/mobile`；开发 Renderer 统一使用 `127.0.0.1:5174`，LAN Bridge 配置与打包版共享。
 - 所有桌面安装包入口统一通过 Electron workspace 的 `package:prepare` 构建 Electron、移动端并同步 runtime external 依赖，避免本地与 CI 打包步骤漂移。
@@ -77,3 +79,4 @@
 - 2026-08-22：合并官方最新正式版 `v0.17.55`，应用版本重置为 `0.17.55-bone.1`；保留 LAN、路径迁移守卫、Agent generation 隔离与历史 Safe Storage 身份，并将 Pi utility 的 abort/force-close/finally 统一到单一 runtime 关闭 Promise。
 - 2026-08-22：关于/更新页将版本历史拆为 `Proma 修改` 与 `官方版本` 两个懒加载标签；历史查询固定映射 Bone/官方仓库并按来源隔离缓存，Electron Updater、最新版本和按标签查询仍只使用 `kuangtao22/Proma`。
 - 2026-08-22：`v0.17.55-bone.1` GitHub Actions 全平台发布成功，并回填 `bone.1`、`bone.4`、`bone.5` 中文 Release 正文；若根目录类型检查异常解析到 `apps/electron/node_modules` 的旧 `@types/node`，说明是历史嵌套依赖遮蔽，`bun install --frozen-lockfile` 不会自动清理该目录。
+- 2026-08-22：整理 fork GitHub Releases，仅保留当前正式版 `v0.17.55-bone.1` 与上一稳定版 `v0.17.42-bone.5`；删除旧 `0.9.x`、重复草稿及已淘汰 Bone Release，但保留 Git 标签用于历史代码定位。

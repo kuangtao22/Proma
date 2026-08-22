@@ -45,9 +45,7 @@ import { getActiveRunRejectionMessage, shouldPersistInitialUserMessage } from '.
 import { isSessionNotFoundError } from './error-patterns'
 import { AgentEventBus } from './agent-event-bus'
 import { decryptApiKey, getChannelById, listChannels, persistCodexOAuthCredentials, persistXaiOAuthCredentials, resolveChannelRuntimeApiKey, resolveCodexOAuthCredentials, resolveXaiOAuthCredentials } from './channel-manager'
-import { getAdapter, fetchTitle } from '@proma/core'
 import pkg from '../../../package.json' with { type: 'json' }
-import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
 import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, removeSDKErrorMessage, updateSDKUserMessageSkillActivations, rewindPiAgentSession, resolveAgentCwd, getActiveWorktreePath, getAgentCwdMode, getSessionWorkbenchLayout } from './agent-session-manager'
 import { getAgentWorkspace, getLocalProjectRootStatus, getProjectFilesPath, getWorkspaceMcpConfig, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles, getWorkspaceAgentsMdPath, readWorkspaceAgentsMd, getWorkspaceMemoryGuidance, isWorkspaceProjectKnowledgeMaintenanceApproved } from './agent-workspace-manager'
@@ -72,8 +70,8 @@ import { buildAgentRuntimeEnv, type AgentRuntimeEnv } from './agent-runtime-env'
 import { isVisibleRunMessage } from './agent-run-message-visibility'
 import { resolvePiThinkingLevel } from './agent-thinking-level'
 import { resolvePiReasoningCapability } from './adapters/pi-model-registry'
-import { generateCodexTitle } from './adapters/pi-codex-title-generator'
-import { createFallbackTitle, sanitizeGeneratedTitle, TITLE_PROMPT } from './title-generation'
+import { generatePiTitle } from './adapters/pi-title-generator'
+import { createFallbackTitle, sanitizeGeneratedTitle, SHORT_MESSAGE_THRESHOLD, TITLE_PROMPT } from './title-generation'
 import { claimWorkspaceMemoryRefreshOpportunity } from './agent-memory-refresh-service'
 import { browserController } from './browser-controller'
 import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
@@ -347,91 +345,75 @@ export class AgentOrchestrator {
   /**
    * 生成 Agent 会话标题
    *
-   * 使用 Provider 适配器系统，支持所有渠道。任何错误返回 null。
+   * 复用当前 Agent 的 Pi 模型路由；非中止失败统一返回本地兜底标题。
    */
   async generateTitle(input: AgentGenerateTitleInput, signal?: AbortSignal): Promise<string | null> {
     const { userMessage, channelId, modelId } = input
     if (signal?.aborted) return null
     console.log('[Agent 标题生成] 开始生成标题:', { channelId, modelId, userMessage: userMessage.slice(0, 50) })
 
-    // 渠道信息在异常路径也要用于判断是否应用 OpenCode Go 本地兜底，因此提前解析；
-    // 同时保留 listChannels 自身的错误边界：解析失败时按“无渠道”处理并返回 null。
+    // 短消息无需额外消耗模型 Token，直接使用稳定的本地标题。
+    const fallbackTitle = createFallbackTitle(userMessage)
+    if (userMessage.trim().length <= SHORT_MESSAGE_THRESHOLD) return fallbackTitle
+
+    // 渠道读取失败不应让会话永久停在默认名称，统一使用本地兜底。
     let channel: import('@proma/shared').Channel | undefined
     try {
       channel = listChannels().find((c) => c.id === channelId)
     } catch (error) {
       console.warn('[Agent 标题生成] 渠道解析失败:', error)
-      return null
+      return fallbackTitle
     }
     if (!channel) {
       console.warn('[Agent 标题生成] 渠道不存在:', channelId)
-      return null
-    }
-
-    if (channel.provider === 'xai') {
-      // xAI subscription uses Pi's provider-specific OAuth transport; title generation's
-      // generic channel adapter only understands API keys, so retain a local deterministic title.
-      return createFallbackTitle(userMessage)
-    }
-
-    if (channel.provider === 'openai-codex') {
-      const fallbackTitle = createFallbackTitle(userMessage)
-      try {
-        const [credentials, proxyUrl] = await Promise.all([
-          resolveCodexOAuthCredentials(channelId),
-          getEffectiveProxyUrl(),
-        ])
-        if (signal?.aborted) return null
-        const generatedTitle = await generateCodexTitle({
-          modelId,
-          prompt: TITLE_PROMPT + userMessage,
-          credentials,
-          proxyUrl,
-          signal,
-          onCredentialsRefreshed: (refreshed) => persistCodexOAuthCredentials(channelId, refreshed),
-        })
-        if (signal?.aborted) return null
-        const title = generatedTitle ? sanitizeGeneratedTitle(generatedTitle) : null
-        if (title) {
-          console.log(`[Agent 标题生成] ChatGPT OAuth 语义标题生成成功: "${title}"`)
-          return title
-        }
-        console.warn('[Agent 标题生成] ChatGPT OAuth 返回空标题，使用本地兜底')
-      } catch (error) {
-        if (signal?.aborted) return null
-        console.warn('[Agent 标题生成] ChatGPT OAuth 语义标题生成失败，使用本地兜底:', error)
-      }
       return fallbackTitle
     }
 
     try {
-      const apiKey = await resolveChannelRuntimeApiKey(channelId)
-      const providerAdapter = getAdapter(channel.provider)
-      const request = providerAdapter.buildTitleRequest({
+      /** API Key 渠道的运行时密钥；OAuth 渠道保持为空。 */
+      let apiKey = ''
+      /** ChatGPT 订阅渠道的一次性 Pi OAuth 凭据。 */
+      let codexOAuthCredentials: CodexOAuthCredentials | undefined
+      /** xAI 订阅渠道的一次性 Pi OAuth 凭据。 */
+      let xaiOAuthCredentials: XaiOAuthCredentials | undefined
+      if (channel.provider === 'openai-codex') {
+        codexOAuthCredentials = await resolveCodexOAuthCredentials(channelId)
+      } else if (channel.provider === 'xai') {
+        xaiOAuthCredentials = await resolveXaiOAuthCredentials(channelId)
+      } else {
+        apiKey = await resolveChannelRuntimeApiKey(channelId)
+      }
+      /** 标题请求复用 Agent 当前生效的代理配置。 */
+      const proxyUrl = await getEffectiveProxyUrl()
+      if (signal?.aborted) return null
+
+      /** Pi 返回的原始可见标题文本。 */
+      const generatedTitle = await generatePiTitle({
+        channelId,
+        channelName: channel.name,
+        provider: channel.provider,
+        modelId,
         baseUrl: channel.baseUrl,
         apiKey,
-        modelId,
         prompt: TITLE_PROMPT + userMessage,
+        proxyUrl,
+        signal,
+        codexOAuthCredentials,
+        xaiOAuthCredentials,
+        onCodexOAuthCredentialsRefreshed: (credentials) => persistCodexOAuthCredentials(channelId, credentials),
+        onXaiOAuthCredentialsRefreshed: (credentials) => persistXaiOAuthCredentials(channelId, credentials),
       })
+      if (signal?.aborted) return null
+      /** 清理模型可能附带的引号、Markdown 和超长内容。 */
+      const title = generatedTitle ? sanitizeGeneratedTitle(generatedTitle) : null
+      if (!title) return fallbackTitle
 
-      const proxyUrl = await getEffectiveProxyUrl()
-      const fetchFn = getFetchFn(proxyUrl)
-      const title = await fetchTitle(request, providerAdapter, fetchFn)
-      const result = title ? sanitizeGeneratedTitle(title) : null
-      if (!result) {
-        console.warn('[Agent 标题生成] API 未返回可用标题')
-        // OpenCode Go 的推理模型可能把输出预算全花在推理上返回空正文，或
-        // 内容块为数组；自定义渠道（custom）也可能返回空/异常；任何取不到可用标题的情况
-        // 都回退到首行兜底，保证会话一定被重命名。
-        return (channel.provider === 'opencode-go-openai' || channel.provider === 'custom') ? createFallbackTitle(userMessage) : null
-      }
-
-      console.log(`[Agent 标题生成] 生成标题成功: "${result}"`)
-      return result
+      console.log(`[Agent 标题生成] Pi 生成标题成功: "${title}"`)
+      return title
     } catch (error) {
-      console.warn('[Agent 标题生成] 生成失败:', error)
-      // OpenCode Go / 自定义渠道的服务端偶发返回空标题/异常响应/超时，异常路径同样要完成重命名。
-      return (channel.provider === 'opencode-go-openai' || channel.provider === 'custom') ? createFallbackTitle(userMessage) : null
+      if (signal?.aborted) return null
+      console.warn('[Agent 标题生成] Pi 请求失败，使用本地兜底:', error)
+      return fallbackTitle
     }
   }
 

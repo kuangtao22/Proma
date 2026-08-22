@@ -188,6 +188,7 @@ function createSession(overrides: Record<string, unknown> = {}): Record<string, 
   return {
     id: 'session-1',
     title: '测试会话',
+    workspaceId: 'workspace-1',
     createdAt: 1,
     updatedAt: 2,
     ...overrides,

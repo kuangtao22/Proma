@@ -195,7 +195,7 @@ describe('DataRootMigrationCoordinator', () => {
     writeFileSync(join(sourceRoot, 'agent-sessions.json'), JSON.stringify({
       version: 4,
       sessions: [{
-        id: 'session-1', title: '测试会话', createdAt: 1, updatedAt: 2,
+        id: 'session-1', title: '测试会话', workspaceId: 'workspace-1', createdAt: 1, updatedAt: 2,
         piSessionFile: join(sourceRoot, 'sdk-config', 'sessions', 'a.jsonl'),
         attachedDirectories: [externalPath],
       }],

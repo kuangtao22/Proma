@@ -299,6 +299,20 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(methodBody.match(/if \(!isCurrent\(\)\) return/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
   })
 
+  test('Given Agent 使用自定义兼容渠道 When 生成自动标题 Then 复用 Pi 模型路由且失败统一本地兜底', () => {
+    /** 读取真实编排源码，防止标题请求退回与 Agent 不一致的 Chat Provider Adapter。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** 截取公开标题生成方法，避免其它消息请求路径影响断言。 */
+    const methodStart = source.indexOf('  async generateTitle(')
+    const methodEnd = source.indexOf('\n  /**\n   * 流完成后自动生成标题', methodStart)
+    const methodBody = source.slice(methodStart, methodEnd)
+
+    expect(methodBody).toContain('generatePiTitle({')
+    expect(methodBody).not.toContain('getAdapter(')
+    expect(methodBody).not.toContain('fetchTitle(')
+    expect(methodBody).toContain('return fallbackTitle')
+  })
+
   test('Given 标题请求与 iterator cleanup 仍未完成 When 检查生产接入 Then generation 引用与 cleanup await 覆盖全部退出分支', () => {
     /** 读取真实编排源码，约束后台标题与 adapter cleanup 都属于 generation 生命周期。 */
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
