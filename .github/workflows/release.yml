@@ -67,9 +67,22 @@ jobs:
       - name: 安装依赖
         run: bun install --frozen-lockfile
 
-      # macOS 代码签名准备（需要配置 MAC_CERTS / MAC_CERTS_PASSWORD secrets，未配置则跳过签名）
+      - name: 检测 macOS 签名配置
+        id: mac_signing
+        env:
+          MAC_CERTS: ${{ secrets.MAC_CERTS }}
+          MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
+        shell: bash
+        run: |
+          if [ -n "$MAC_CERTS" ] && [ -n "$MAC_CERTS_PASSWORD" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 macOS 签名证书，将发布需要用户解除隔离的未签名安装包"
+          fi
+
       - name: 导入 macOS 签名证书
-        if: ${{ env.MAC_CERTS != '' }}
+        if: ${{ steps.mac_signing.outputs.enabled == 'true' }}
         env:
           MAC_CERTS: ${{ secrets.MAC_CERTS }}
           MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
@@ -94,6 +107,7 @@ jobs:
       - name: 打包 (macOS arm64)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ steps.mac_signing.outputs.enabled }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -142,8 +156,22 @@ jobs:
       - name: 安装依赖
         run: bun install --frozen-lockfile
 
+      - name: 检测 macOS 签名配置
+        id: mac_signing
+        env:
+          MAC_CERTS: ${{ secrets.MAC_CERTS }}
+          MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
+        shell: bash
+        run: |
+          if [ -n "$MAC_CERTS" ] && [ -n "$MAC_CERTS_PASSWORD" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 macOS 签名证书，将发布需要用户解除隔离的未签名安装包"
+          fi
+
       - name: 导入 macOS 签名证书
-        if: ${{ env.MAC_CERTS != '' }}
+        if: ${{ steps.mac_signing.outputs.enabled == 'true' }}
         env:
           MAC_CERTS: ${{ secrets.MAC_CERTS }}
           MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
@@ -168,6 +196,7 @@ jobs:
       - name: 打包 (macOS x64)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ steps.mac_signing.outputs.enabled }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}

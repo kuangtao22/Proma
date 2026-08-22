@@ -6,7 +6,7 @@
 
 import * as React from 'react'
 import { useAtom, useSetAtom } from 'jotai'
-import { ExternalLink, Pencil, Plus, Trash2 } from 'lucide-react'
+import { AlertTriangle, ExternalLink, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { PROVIDER_LABELS } from '@proma/shared'
@@ -30,8 +30,40 @@ import { ChannelForm } from './ChannelForm'
 /** 组件视图模式 */
 type ViewMode = 'list' | 'create' | 'edit'
 
+/** 渠道设置页最近一次成功数据与当前加载错误。 */
+interface ChannelSettingsLoadState {
+  /** 最近一次成功加载的渠道，失败时必须保留。 */
+  channels: Channel[]
+  /** 当前加载错误；成功后清空。 */
+  error: string | null
+}
+
+/** 渠道设置页加载结果动作。 */
+type ChannelSettingsLoadAction =
+  | { type: 'load-succeeded'; channels: Channel[] }
+  | { type: 'load-failed'; message: string }
+
+/**
+ * 合并渠道加载结果，确保瞬时读取失败不会把已显示的存量渠道替换为空列表。
+ */
+export function reduceChannelSettingsLoadState(
+  state: ChannelSettingsLoadState,
+  action: ChannelSettingsLoadAction,
+): ChannelSettingsLoadState {
+  if (action.type === 'load-succeeded') {
+    return { channels: action.channels, error: null }
+  }
+  return { ...state, error: action.message }
+}
+
+/** 返回设置页可展示的渠道加载错误文本。 */
+function formatChannelLoadError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 export function ChannelSettings(): React.ReactElement {
-  const [channels, setChannels] = React.useState<Channel[]>([])
+  const [loadState, setLoadState] = React.useState<ChannelSettingsLoadState>({ channels: [], error: null })
+  const { channels, error: loadError } = loadState
   const [viewMode, setViewMode] = React.useState<ViewMode>('list')
   const [editingChannel, setEditingChannel] = React.useState<Channel | null>(null)
   const [loading, setLoading] = React.useState(true)
@@ -46,23 +78,31 @@ export function ChannelSettings(): React.ReactElement {
   }, [agentChannelId])
 
   /** 加载渠道列表 */
-  const loadChannels = React.useCallback(async (): Promise<Channel[]> => {
+  const loadChannels = React.useCallback(async (): Promise<void> => {
     try {
       const list = await window.electronAPI.listChannels()
-      setChannels(list)
+      setLoadState((state) => reduceChannelSettingsLoadState(state, { type: 'load-succeeded', channels: list }))
       setGlobalChannels(list) // 同步到全局缓存
-      return list
     } catch (error) {
       console.error('[渠道设置] 加载渠道列表失败:', error)
-      return []
+      setLoadState((state) => reduceChannelSettingsLoadState(state, {
+        type: 'load-failed',
+        message: formatChannelLoadError(error),
+      }))
     } finally {
       setLoading(false)
     }
   }, [])
 
   React.useEffect(() => {
-    loadChannels()
+    void loadChannels()
   }, [loadChannels])
+
+  /** 重新加载渠道列表，并恢复明确的加载状态。 */
+  const handleReload = (): void => {
+    setLoading(true)
+    void loadChannels()
+  }
 
   /** 删除渠道（通过弹窗确认） */
   const handleDeleteRequest = (channel: Channel): void => {
@@ -144,15 +184,35 @@ export function ChannelSettings(): React.ReactElement {
         <SettingsCard>
           <PromaProviderCard />
         </SettingsCard>
+        {loadError && (
+          <div
+            role="alert"
+            className="flex items-center gap-3 border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          >
+            <AlertTriangle className="size-4 shrink-0" aria-hidden="true" />
+            <span className="min-w-0 flex-1 break-words">{loadError}</span>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-8 shrink-0"
+              aria-label="重新加载渠道"
+              title="重新加载渠道"
+              onClick={handleReload}
+            >
+              <RefreshCw className="size-4" />
+            </Button>
+          </div>
+        )}
         {loading ? (
           <div className="text-sm text-muted-foreground py-8 text-center">加载中...</div>
-        ) : channels.length === 0 ? (
+        ) : channels.length === 0 && !loadError ? (
           <SettingsCard divided={false}>
             <div className="text-sm text-muted-foreground py-12 text-center">
               还没有配置任何模型，点击上方"添加配置"开始
             </div>
           </SettingsCard>
-        ) : (
+        ) : channels.length > 0 ? (
           <SettingsCard>
             {channels.map((channel) => (
               <ChannelRow
@@ -167,7 +227,7 @@ export function ChannelSettings(): React.ReactElement {
               />
             ))}
           </SettingsCard>
-        )}
+        ) : null}
       </SettingsSection>
 
       {/* 删除确认弹窗 */}

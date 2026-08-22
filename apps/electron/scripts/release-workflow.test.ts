@@ -118,7 +118,7 @@ test('Bone 应用版本与更新频道保持一致', () => {
     'utf8',
   )
 
-  expect(metadata.version).toBe('0.17.55-bone.2')
+  expect(metadata.version).toBe('0.17.55-bone.3')
   expect(config.detectUpdateChannel).toBe(false)
   expect(config.publish).toEqual({
     provider: 'github',
@@ -185,4 +185,39 @@ test('Release 工作流使用仓库内 Bone 说明并在重跑时更新正文', 
   expect(source).toContain('--notes-file "${RELEASE_NOTES_PATH}"')
   expect(source).toContain('gh release edit "${TAG}"')
   expect(source).not.toContain('--generate-notes')
+})
+
+test('macOS 签名可选但不能用 step 局部环境变量误判证书状态', () => {
+  /** Release 工作流原始文本，用于锁定可选签名的判断边界。 */
+  const source = readReleaseWorkflow()
+  /** Bun YAML 解析后的 Release 工作流。 */
+  const workflow = Bun.YAML.parse(source) as ReleaseWorkflow
+  /** 两个 macOS 架构构建任务。 */
+  const macJobs = [
+    workflow.jobs?.['build-mac-arm64'],
+    workflow.jobs?.['build-mac-x64'],
+  ]
+
+  expect(source).not.toContain("if: ${{ env.MAC_CERTS != '' }}")
+  for (const job of macJobs) {
+    expect(job?.steps).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'mac_signing',
+        env: expect.objectContaining({
+          MAC_CERTS: '${{ secrets.MAC_CERTS }}',
+          MAC_CERTS_PASSWORD: '${{ secrets.MAC_CERTS_PASSWORD }}',
+        }),
+      }),
+      expect.objectContaining({
+        name: '导入 macOS 签名证书',
+        if: "${{ steps.mac_signing.outputs.enabled == 'true' }}",
+      }),
+      expect.objectContaining({
+        name: expect.stringContaining('打包 (macOS'),
+        env: expect.objectContaining({
+          CSC_IDENTITY_AUTO_DISCOVERY: '${{ steps.mac_signing.outputs.enabled }}',
+        }),
+      }),
+    ]))
+  }
 })

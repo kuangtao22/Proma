@@ -44,7 +44,7 @@
 - Electron workspace 使用带 scope 的包名，Linux 必须显式配置不含 `/` 的 `artifactName`，否则 deb 默认输出路径会被拆成不存在的子目录。
 - 路径管理采用固定 `~/.proma-location.json` 定位文件与重启迁移模式：业务模块继续通过 `getConfigDir()` 解析当前数据根，复制、校验和 Proma-owned 绝对路径重写全部成功后才切换；项目文件迁移独立使用工作区锁，源目录始终保留。
 - Bone 发布说明以 `release-notes/bone/v<version>.md` 为唯一事实来源；发布前必须校验对应文件存在且非空，GitHub Release 正文与关于页“Proma 修改”历史共同使用该内容。
-- macOS 正式产物必须使用 Developer ID Application 完整签名并完成 Apple 公证，上传前以 `codesign --verify --deep --strict` 和公证票据校验 fail closed；GitHub Actions 不得在 step 自身的 `if` 中读取仅由该 step `env` 注入的证书变量，否则条件求值时变量不存在并会恒定跳过签名。
+- macOS 发布优先使用 Developer ID Application 签名与 Apple 公证；证书未配置时允许发布明确标注的未签名 Bone 产物，并在 Release 说明中提供 `xattr` 解除隔离命令。GitHub Actions 不得在 step 自身的 `if` 中读取仅由该 step `env` 注入的证书变量，须先以独立步骤输出签名能力状态。
 - 项目文件迁移复用 verified copier，并以活动数据根内的可恢复 journal 驱动 `会话路径 -> 工作区配置 -> projectRootPath` 三步幂等提交；复制、校验和提交失败均不删除源目录。
 - 项目迁移准入同时覆盖 Agent in-flight generation、自动标题等 generation-owned 写入、Automation、active/linked worktree 与受守卫 IPC；旧 Agent 代际通过唯一 query token 精确关闭，不会误停同会话的新运行。
 - 项目目录选择使用按窗口、用途和代次隔离的一次性 `selectionId`；重启遗留的 copying/verifying/failed journal 只能按已持久化 operation 继续或显式放弃，renderer 不可直接指定任意目标路径。
@@ -83,3 +83,4 @@
 - 2026-08-22：`v0.17.55-bone.1` GitHub Actions 全平台发布成功，并回填 `bone.1`、`bone.4`、`bone.5` 中文 Release 正文；若根目录类型检查异常解析到 `apps/electron/node_modules` 的旧 `@types/node`，说明是历史嵌套依赖遮蔽，`bun install --frozen-lockfile` 不会自动清理该目录。
 - 2026-08-22：整理 fork GitHub Releases，仅保留当前正式版 `v0.17.55-bone.1` 与上一稳定版 `v0.17.42-bone.5`；删除旧 `0.9.x`、重复草稿及已淘汰 Bone Release，但保留 Git 标签用于历史代码定位。
 - 2026-08-22：本机 `gh auth status` 中账号令牌失效时，Git HTTPS 仍可通过系统 Git 凭据直接推送 `kuangtao22/Proma`；排查推送权限时应分别验证 `gh` 与 Git 凭据，不把前者状态当作后者结论。
+- 2026-08-22：用户确认 macOS 缺少签名证书时仍需发布，并允许通过 `xattr` 命令解除隔离安装；发布说明必须明确未签名风险，工作流有证书时签名、无证书时显式生成未签名包。

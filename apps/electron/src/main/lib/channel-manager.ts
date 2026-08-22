@@ -322,21 +322,33 @@ function readConfig(): ChannelsConfig {
     return { version: CONFIG_VERSION, channels: [] }
   }
 
+  /** 已完成解析与内存迁移的渠道配置。 */
+  let config: ChannelsConfig
+  /** 标记当前配置是否需要把迁移结果回写到磁盘。 */
+  let shouldPersistMigration = false
   try {
     const raw = readFileSync(configPath, 'utf-8')
     const parsed = JSON.parse(raw) as ChannelsConfig
     const schemaMigration = migrateConfig(parsed)
     const presetModelUpdate = applyPresetModelCandidateUpdates(schemaMigration.config)
-    const config = presetModelUpdate.config
-    if (schemaMigration.changed || presetModelUpdate.changed) {
-      writeConfig(config)
-      console.log('[渠道管理] 渠道配置已迁移并持久化')
-    }
-    return config
+    config = presetModelUpdate.config
+    shouldPersistMigration = schemaMigration.changed || presetModelUpdate.changed
   } catch (error) {
     console.error('[渠道管理] 读取配置文件失败:', error)
-    return { version: CONFIG_VERSION, channels: [] }
+    throw new Error('读取渠道配置失败')
   }
+
+  if (shouldPersistMigration) {
+    try {
+      writeConfig(config)
+      console.log('[渠道管理] 渠道配置已迁移并持久化')
+    } catch (error) {
+      // 文件已经成功读取，迁移回写失败不能把存量渠道降级为空配置。
+      console.error('[渠道管理] 渠道配置迁移回写失败，继续使用内存中的存量配置:', error)
+    }
+  }
+
+  return config
 }
 
 /**
@@ -401,13 +413,15 @@ function decryptKey(encryptedKey: string): string {
  * 首次调用时，如果没有任何 DeepSeek 渠道，自动创建预设渠道。
  */
 export function listChannels(): Channel[] {
+  /** 只有配置文件真正不存在时才允许初始化默认渠道，避免覆盖损坏或暂时不可写的存量配置。 */
+  const shouldInitializePreset = !existsSync(getChannelsPath())
   const config = readConfig()
 
   // 首次使用：如果没有 DeepSeek 渠道，自动创建预设
   const hasDeepSeek = config.channels.some(
     (c) => c.provider === 'deepseek' || c.baseUrl.includes('api.deepseek.com'),
   )
-  if (!hasDeepSeek) {
+  if (shouldInitializePreset && !hasDeepSeek) {
     const now = Date.now()
     const presetChannel: Channel = {
       id: randomUUID(),
