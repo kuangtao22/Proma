@@ -30,6 +30,7 @@ jobs:
       upstream_version: ${{ steps.release.outputs.upstream_version }}
       bone_build: ${{ steps.release.outputs.bone_build }}
       release_title: ${{ steps.release.outputs.release_title }}
+      release_notes_path: ${{ steps.release.outputs.release_notes_path }}
 
     steps:
       - name: 检出代码
@@ -277,6 +278,9 @@ jobs:
       needs.build-linux-x64.result == 'success'
 
     steps:
+      - name: 检出版本说明
+        uses: actions/checkout@v4
+
       - name: 下载 Mac arm64 产物
         uses: actions/download-artifact@v4
         with:
@@ -336,14 +340,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TITLE: ${{ needs.validate-release.outputs.release_title }}
+          RELEASE_NOTES_PATH: ${{ needs.validate-release.outputs.release_notes_path }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          gh release create "${TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "${RELEASE_TITLE}" \
-            --generate-notes \
-            out/release-assets/* \
-            || gh release upload "${TAG}" \
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${RELEASE_TITLE}" \
+              --notes-file "${RELEASE_NOTES_PATH}"
+            gh release upload "${TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --clobber \
               out/release-assets/*
+          else
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${RELEASE_TITLE}" \
+              --notes-file "${RELEASE_NOTES_PATH}" \
+              out/release-assets/*
+          fi

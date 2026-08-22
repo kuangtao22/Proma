@@ -41,6 +41,7 @@
 - Linux deb 打包依赖 `apps/electron/package.json` 的 `homepage` 元数据；发布合同测试必须覆盖该字段，避免 AppImage 成功但 deb 在 FPM 阶段失败。
 - Electron workspace 使用带 scope 的包名，Linux 必须显式配置不含 `/` 的 `artifactName`，否则 deb 默认输出路径会被拆成不存在的子目录。
 - 路径管理采用固定 `~/.proma-location.json` 定位文件与重启迁移模式：业务模块继续通过 `getConfigDir()` 解析当前数据根，复制、校验和 Proma-owned 绝对路径重写全部成功后才切换；项目文件迁移独立使用工作区锁，源目录始终保留。
+- Bone 发布说明以 `release-notes/bone/v<version>.md` 为唯一事实来源；发布前必须校验对应文件存在且非空，GitHub Release 正文与关于页“Proma 修改”历史共同使用该内容。
 - 项目文件迁移复用 verified copier，并以活动数据根内的可恢复 journal 驱动 `会话路径 -> 工作区配置 -> projectRootPath` 三步幂等提交；复制、校验和提交失败均不删除源目录。
 - 项目迁移准入同时覆盖 Agent in-flight generation、自动标题等 generation-owned 写入、Automation、active/linked worktree 与受守卫 IPC；旧 Agent 代际通过唯一 query token 精确关闭，不会误停同会话的新运行。
 - 项目目录选择使用按窗口、用途和代次隔离的一次性 `selectionId`；重启遗留的 copying/verifying/failed journal 只能按已持久化 operation 继续或显式放弃，renderer 不可直接指定任意目标路径。
@@ -69,6 +70,7 @@
 - 2026-08-19：Bun 1.3.14 的 `bun install --lockfile-only` 不会自动刷新 workspace 自身的 `version` 字段；修改应用版本后必须显式检查 `bun.lock` 中 `apps/electron.version` 是否同步。
 - 2026-08-20：确认文件路径管理设计：全局数据根与单项目路径作为两个独立功能；采用复制、SHA-256 校验、原子切换和保留旧目录策略，移动盘/NAS 离线时禁止静默回退。
 - 2026-08-20：完成路径管理的两阶段实施计划；先交付数据根定位、迁移与离线恢复，再复用校验组件交付项目路径迁移、工作区锁和中断恢复。
+- 2026-08-22：补齐已发布 Bone 版本和 `0.17.55-bone.1` 的中文更新说明；Release 工作流改为读取仓库内说明文件，并在任务重跑时同步更新已有 Release 正文。
 - 2026-08-22：完成项目文件路径管理与迁移：支持外部/托管/离线项目、复制校验、崩溃恢复、取消/继续/放弃、watcher 切换和桌面设置页；发布版本递增为 `0.17.42-bone.6`。
 - 2026-08-22：将直接启动的开发客户端名称从 `Proma Dev` 统一为 `PromaDev`；正式客户端仍为 `Proma`，开发/正式 App ID 与 Electron 内部数据隔离规则保持不变。
 - 2026-08-22：确认历史共享凭据由 `@proma/electron Safe Storage` 加密，`PromaDev` 与 `Proma Dev` 钥匙串均无法解密；开发客户端现于 `ready` 前使用历史加密身份，之后恢复显示名 `Proma Dev`。

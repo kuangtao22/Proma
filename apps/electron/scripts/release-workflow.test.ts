@@ -9,6 +9,8 @@ interface WorkflowJob {
   needs?: string[]
   /** 当前任务的执行步骤。 */
   steps?: Array<Record<string, unknown>>
+  /** 当前任务提供给后续任务的输出。 */
+  outputs?: Record<string, string>
 }
 
 interface ReleaseWorkflow {
@@ -162,4 +164,25 @@ test('Release 工作流在全平台构建前校验 Bone 发布合同', () => {
   ]))
   expect(source).toContain("needs.build-linux-x64.result == 'success'")
   expect(source).toContain('--title "${RELEASE_TITLE}"')
+})
+
+test('Release 工作流使用仓库内 Bone 说明并在重跑时更新正文', () => {
+  /** Release 工作流原始文本，用于校验说明文件发布合同。 */
+  const source = readReleaseWorkflow()
+  /** Bun YAML 解析后的 Release 工作流。 */
+  const workflow = Bun.YAML.parse(source) as ReleaseWorkflow
+  /** 发布前版本校验任务。 */
+  const validateJob = workflow.jobs?.['validate-release']
+  /** 汇总并创建 GitHub Release 的任务。 */
+  const releaseJob = workflow.jobs?.release
+
+  expect(validateJob?.outputs?.release_notes_path)
+    .toBe('${{ steps.release.outputs.release_notes_path }}')
+  expect(releaseJob?.steps).toEqual(expect.arrayContaining([
+    expect.objectContaining({ uses: 'actions/checkout@v4' }),
+  ]))
+  expect(source).toContain('RELEASE_NOTES_PATH: ${{ needs.validate-release.outputs.release_notes_path }}')
+  expect(source).toContain('--notes-file "${RELEASE_NOTES_PATH}"')
+  expect(source).toContain('gh release edit "${TAG}"')
+  expect(source).not.toContain('--generate-notes')
 })
