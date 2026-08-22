@@ -4,7 +4,11 @@ import type { CreateDesignJobInput, DesignAsset, DesignWorkspaceSnapshot } from 
 import { createStore, Provider } from 'jotai'
 import * as React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createInitialDesignProjectState, designProjectStatesAtom } from '@/atoms/design-atoms'
+import {
+  createInitialDesignProjectState,
+  designProjectStatesAtom,
+  updateDesignProjectStateAtom,
+} from '@/atoms/design-atoms'
 import type { DesignAdapter } from '@/lib/design-adapter'
 import {
   createDesignEditJobInput,
@@ -18,6 +22,7 @@ import {
   getDesignAssetDeleteBlockReason,
   useDesignInspectorActions,
 } from './use-design-inspector-actions'
+import { createDesignWorkspaceController } from './use-design-workspace'
 
 /** 创建 Inspector 测试素材。 */
 function createAsset(overrides: Partial<DesignAsset> = {}): DesignAsset {
@@ -292,6 +297,92 @@ describe('Design Inspector 纯业务契约', () => {
     expect(state.selectedNodeIds).toEqual(['node-imported'])
     expect(state.pendingMutations).toEqual([])
     expect(state.history).toEqual([])
+  })
+
+  test('Given 首次导入要求恢复 When 权威重载完成后再次导入 Then 回调接管恢复且导入可以重试', async () => {
+    const store = createStore()
+    const staleSnapshot = createSnapshot()
+    /** 旧历史和选区用于证明 controller 完整替换恢复前基线。 */
+    const historyEntry = {
+      forward: [{ type: 'set-viewport' as const, viewport: { x: 1, y: 1, zoom: 1 } }],
+      inverse: [{ type: 'set-viewport' as const, viewport: { x: 0, y: 0, zoom: 1 } }],
+    }
+    store.set(designProjectStatesAtom, new Map([['project-1', {
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: staleSnapshot,
+      selectedNodeIds: ['node-1'],
+      inspectorAssetId: 'asset-1',
+      history: [historyEntry],
+      future: [historyEntry],
+    }]]))
+    /** 恢复后主进程重新签发的权威快照与媒体授权。 */
+    const authoritativeSnapshot = createSnapshot()
+    authoritativeSnapshot.document.revision = 1
+    authoritativeSnapshot.assetBaseUrl = 'proma-file://new/assets/'
+    authoritativeSnapshot.thumbnailBaseUrl = 'proma-file://new/thumbnails/'
+    /** 第二次导入返回的权威素材与节点。 */
+    const importedSnapshot = createSnapshot()
+    importedSnapshot.document.revision = 2
+    importedSnapshot.document.nodes[0] = { ...importedSnapshot.document.nodes[0]!, id: 'node-retried' }
+    /** 记录恢复回调和导入重试次数。 */
+    let importCount = 0
+    let loadCount = 0
+    const adapter: Pick<DesignAdapter, 'importAssets' | 'deleteAsset' | 'relinkAsset' | 'exportAsset'> = {
+      importAssets: async () => {
+        importCount += 1
+        if (importCount === 1) throw new Error('DESIGN_RECOVERY_REQUIRED: recoveredFrom=backup')
+        return importedSnapshot
+      },
+      deleteAsset: async () => importedSnapshot.document,
+      relinkAsset: async () => importedSnapshot.document,
+      exportAsset: async () => undefined,
+    }
+    /** 与页面一致的唯一工作区 controller，恢复回调不复制任何状态规则。 */
+    const controller = createDesignWorkspaceController({
+      projectId: 'project-1',
+      adapter: {
+        load: async () => { loadCount += 1; return authoritativeSnapshot },
+        save: async () => authoritativeSnapshot.document,
+        onChanged: () => () => undefined,
+        releaseMediaAccess: async () => undefined,
+      },
+      getState: () => store.get(designProjectStatesAtom).get('project-1')
+        ?? createInitialDesignProjectState(),
+      updateState: (update) => store.set(updateDesignProjectStateAtom, { projectId: 'project-1', update }),
+      scheduler: {
+        setTimeout: () => 1,
+        clearTimeout: () => undefined,
+      },
+      onReleaseError: () => undefined,
+    })
+    let actions: ReturnType<typeof useDesignInspectorActions> | null = null
+    const Probe = (): null => {
+      actions = useDesignInspectorActions('project-1', adapter, {
+        onRecoveryRequired: controller.reloadAuthoritativeSnapshot,
+      })
+      return null
+    }
+    renderToStaticMarkup(<Provider store={store}><Probe /></Provider>)
+
+    actions!.importAssets()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const recoveredState = store.get(designProjectStatesAtom).get('project-1')!
+    expect(loadCount).toBe(1)
+    expect(importCount).toBe(1)
+    expect(recoveredState.snapshot).toBe(authoritativeSnapshot)
+    expect(recoveredState.snapshot?.assetBaseUrl).toBe('proma-file://new/assets/')
+    expect(recoveredState.snapshot?.thumbnailBaseUrl).toBe('proma-file://new/thumbnails/')
+    expect(recoveredState.selectedNodeIds).toEqual([])
+    expect(recoveredState.inspectorAssetId).toBeNull()
+    expect(recoveredState.history).toEqual([])
+    expect(recoveredState.future).toEqual([])
+
+    actions!.importAssets()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(importCount).toBe(2)
+    expect(store.get(designProjectStatesAtom).get('project-1')?.snapshot?.document.nodes[0]?.id).toBe('node-retried')
   })
 
   test('Given 素材没有节点引用 When 删除或重新定位 Then 调用 adapter 并使用当前 revision', async () => {

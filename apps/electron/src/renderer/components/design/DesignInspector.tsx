@@ -9,6 +9,7 @@ import {
   createInitialDesignProjectState,
   designProjectStatesAtom,
   executeDesignEditAtom,
+  requestDesignRecoveryAtom,
   updateDesignProjectStateAtom,
 } from '@/atoms/design-atoms'
 import type { DesignProjectState } from '@/atoms/design-atoms'
@@ -17,6 +18,7 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
+import { designAdapter } from '@/lib/design-adapter'
 import { cn } from '@/lib/utils'
 import {
   buildDesignVersionTree,
@@ -414,7 +416,14 @@ export function DesignInspector({ projectId, width, onCreateJob }: DesignInspect
   const states = useAtomValue(designProjectStatesAtom)
   const updateState = useSetAtom(updateDesignProjectStateAtom)
   const executeEdit = useSetAtom(executeDesignEditAtom)
-  const actions = useDesignInspectorActions(projectId)
+  const requestRecovery = useSetAtom(requestDesignRecoveryAtom)
+  /** 右栏只投递项目级恢复信号，由画布子树持有的 controller 消费。 */
+  const handleRecoveryRequired = React.useCallback((): void => {
+    requestRecovery({ projectId })
+  }, [projectId, requestRecovery])
+  const actions = useDesignInspectorActions(projectId, designAdapter, {
+    onRecoveryRequired: handleRecoveryRequired,
+  })
   /** 未加载项目仍展示稳定检查器骨架。 */
   const state = states.get(projectId) ?? createInitialDesignProjectState()
   return (

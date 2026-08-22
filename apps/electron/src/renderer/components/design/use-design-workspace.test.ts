@@ -263,6 +263,56 @@ describe('Design 工作区同步规则', () => {
     expect(harness.getState().future).toEqual([])
   })
 
+  test('Given 导入遇到恢复要求 When 强制加载权威快照 Then 清空本地编辑状态并接管新媒体授权', async () => {
+    /** 强制恢复前的历史项与本地选区均绑定旧磁盘基线。 */
+    const historyEntry = {
+      forward: [{ type: 'set-viewport' as const, viewport: { x: 1, y: 1, zoom: 1 } }],
+      inverse: [{ type: 'set-viewport' as const, viewport: { x: 0, y: 0, zoom: 1 } }],
+    }
+    /** 导入错误发生时 Renderer 仍持有恢复前快照。 */
+    const staleSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 10), revision: 3 },
+      writable: true,
+      assetBaseUrl: 'proma-file://old/assets/',
+      thumbnailBaseUrl: 'proma-file://old/thumbnails/',
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: staleSnapshot,
+      selectedNodeIds: ['node-stale'],
+      inspectorAssetId: 'asset-stale',
+      history: [historyEntry],
+      future: [historyEntry],
+    })
+
+    harness.controller.reloadAuthoritativeSnapshot()
+    expect(harness.loadRequests).toHaveLength(1)
+
+    /** 主进程恢复完成后重新签发的权威文档与媒体访问 URL。 */
+    const authoritativeSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 20), revision: 4 },
+      writable: true,
+      assetBaseUrl: 'proma-file://new/assets/',
+      thumbnailBaseUrl: 'proma-file://new/thumbnails/',
+    }
+    harness.loadRequests[0]!.resolve(authoritativeSnapshot)
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      phase: 'ready',
+      snapshot: authoritativeSnapshot,
+      selectedNodeIds: [],
+      inspectorAssetId: null,
+      history: [],
+      future: [],
+      pendingMutations: [],
+      saveState: 'saved',
+      conflictRecoveryPending: false,
+      error: null,
+    })
+  })
+
   test('Given 已保存历史的项目重新 mount When 加载相同 revision 与相同文档 Then 保留 history 和 future', async () => {
     /** 两次 controller 生命周期共享同一项目 Jotai 状态。 */
     const snapshot: DesignWorkspaceSnapshot = {

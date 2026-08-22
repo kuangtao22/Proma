@@ -12,7 +12,10 @@ import {
 } from '@/atoms/design-atoms'
 import type { DesignProjectState } from '@/atoms/design-atoms'
 import { designAdapter, type DesignAdapter } from '@/lib/design-adapter'
-import { applyDesignMutationsToDocument } from './use-design-workspace'
+import {
+  applyDesignMutationsToDocument,
+  isDesignRecoveryRequired,
+} from './use-design-workspace'
 
 /** 将 XYFlow viewport 与容器尺寸转换为可见画布中心。 */
 function getViewportCenter(viewport: DesignViewport): DesignPoint {
@@ -39,6 +42,12 @@ export interface DesignInspectorActions {
   selectAsset: (assetId: string) => void
 }
 
+/** Inspector 素材命令的异常恢复入口。 */
+export interface DesignInspectorActionOptions {
+  /** 主进程要求恢复时交给工作区唯一 controller 重新加载。 */
+  onRecoveryRequired?: () => void | Promise<void>
+}
+
 /**
  * 检查素材删除是否会留下画布引用。
  * @param document 当前权威画布文档。
@@ -58,9 +67,12 @@ export function getDesignAssetDeleteBlockReason(
 export function useDesignInspectorActions(
   projectId: string | null,
   adapter: Pick<DesignAdapter, 'importAssets' | 'deleteAsset' | 'relinkAsset' | 'exportAsset'> = designAdapter,
+  options: DesignInspectorActionOptions = {},
 ): DesignInspectorActions {
   const store = useStore()
   const updateState = useSetAtom(updateDesignProjectStateAtom)
+  /** 稳定提取恢复回调，避免 options 对象引用进入 hook 依赖。 */
+  const onRecoveryRequired = options.onRecoveryRequired
 
   /** 读取当前项目最新状态，避免异步结果覆盖返回期间的新编辑。 */
   const getLatestState = React.useCallback((): DesignProjectState | undefined => (
@@ -102,8 +114,17 @@ export function useDesignInspectorActions(
           error: null,
         },
       })
-    }).catch((error) => toast.error(error instanceof Error ? error.message : '导入图片失败'))
-  }, [adapter, getLatestState, projectId, updateState])
+    }).catch((error) => {
+      if (isDesignRecoveryRequired(error) && onRecoveryRequired) {
+        /** 恢复逻辑由工作区 controller 统一执行，Inspector 不直接改快照。 */
+        void Promise.resolve(onRecoveryRequired()).catch((recoveryError) => {
+          toast.error(recoveryError instanceof Error ? recoveryError.message : '恢复设计工作区失败')
+        })
+        return
+      }
+      toast.error(error instanceof Error ? error.message : '导入图片失败')
+    })
+  }, [adapter, getLatestState, onRecoveryRequired, projectId, updateState])
 
   /** 删除未被画布节点引用的素材。 */
   const deleteAsset = React.useCallback((assetId: string): void => {

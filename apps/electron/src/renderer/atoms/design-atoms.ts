@@ -71,6 +71,40 @@ export function createInitialDesignProjectState(): DesignProjectState {
 /** 按稳定项目 ID 保存状态，项目切换不会销毁其他项目内存。 */
 export const designProjectStatesAtom = atom<Map<string, DesignProjectState>>(new Map())
 
+/** 等待由当前画布 controller 消费的项目恢复请求。 */
+export const designRecoveryRequestsAtom = atom<Set<string>>(new Set<string>())
+
+/** 项目恢复请求的稳定输入。 */
+export interface DesignRecoveryRequestInput {
+  /** 需要重新加载权威设计快照的项目 ID。 */
+  projectId: string
+}
+
+/** 由右栏发出一次性项目恢复请求，不在 Inspector 内复制重载逻辑。 */
+export const requestDesignRecoveryAtom = atom(
+  null,
+  (get, set, input: DesignRecoveryRequestInput): void => {
+    /** 复制集合以通知持有该项目 controller 的画布子树。 */
+    const requests = new Set(get(designRecoveryRequestsAtom))
+    requests.add(input.projectId)
+    set(designRecoveryRequestsAtom, requests)
+  },
+)
+
+/** 由画布在交给 controller 后消费对应的一次性恢复请求。 */
+export const consumeDesignRecoveryRequestAtom = atom(
+  null,
+  (get, set, input: DesignRecoveryRequestInput): void => {
+    /** 不存在的请求无需制造额外 Jotai 更新。 */
+    const current = get(designRecoveryRequestsAtom)
+    if (!current.has(input.projectId)) return
+    /** 保留其他项目尚未消费的恢复信号。 */
+    const requests = new Set(current)
+    requests.delete(input.projectId)
+    set(designRecoveryRequestsAtom, requests)
+  },
+)
+
 export interface UpdateDesignProjectStateInput {
   /** 待更新项目的稳定 ID。 */
   projectId: string

@@ -290,6 +290,8 @@ export interface DesignWorkspaceController {
   sync: () => void
   /** 重试首次加载。 */
   retryLoad: () => void
+  /** 强制采用磁盘权威快照并清理所有旧基线编辑状态。 */
+  reloadAuthoritativeSnapshot: () => void
   /** 重试失败保存。 */
   retrySave: () => void
   /** 放弃本地结构冲突修改并采用已加载的远端版本。 */
@@ -320,9 +322,13 @@ export function createDesignWorkspaceController(
   /**
    * 加载并按返回时最新状态决定是否提交快照。
    * @param rebasePendingAfterConflict 是否以远端 document 重放冲突后全部 pending。
+   * @param forceAuthoritative 是否无条件采用快照并清理全部旧基线编辑状态。
    * @returns 本次加载及状态提交完成后的 Promise。
    */
-  const loadSnapshot = async (rebasePendingAfterConflict = false): Promise<void> => {
+  const loadSnapshot = async (
+    rebasePendingAfterConflict = false,
+    forceAuthoritative = false,
+  ): Promise<void> => {
     if (disposed) return
     if (rebasePendingAfterConflict && conflictRecoveryInFlight) return
     if (rebasePendingAfterConflict) conflictRecoveryInFlight = true
@@ -339,6 +345,23 @@ export function createDesignWorkspaceController(
       /** Promise 返回时读取的最新项目状态。 */
       const latest = dependencies.getState()
       if (requestSequence !== latestLoadSequence) return
+      if (forceAuthoritative) {
+        /** 外部写恢复后的磁盘快照替换全部 Renderer 编辑基线与媒体授权。 */
+        dependencies.updateState({
+          phase: 'ready',
+          snapshot,
+          selectedNodeIds: [],
+          inspectorAssetId: null,
+          history: [],
+          future: [],
+          pendingMutations: [],
+          saveState: 'saved',
+          conflictRecoveryPending: false,
+          error: null,
+        })
+        if (snapshot.recoveredFrom) dependencies.onRecovered?.(snapshot)
+        return
+      }
       if (rebasePendingAfterConflict) {
         if (!canAutomaticallyRebaseDesignMutations(latest.pendingMutations)) {
           /** 结构 patch 携带旧实体快照，必须完整采用远端文档以免覆盖并发修改。 */
@@ -516,6 +539,12 @@ export function createDesignWorkspaceController(
       })
       void loadSnapshot()
     },
+    reloadAuthoritativeSnapshot: () => {
+      if (disposed) return
+      /** 导入前状态必须已保存；仍先取消定时器，避免异常边界上的旧任务提交。 */
+      clearSaveTimer()
+      void loadSnapshot(false, true)
+    },
     retrySave: () => {
       if (disposed) return
       /** retry 时的最新状态用于优先完成冲突恢复。 */
@@ -563,6 +592,8 @@ export interface UseDesignWorkspaceResult {
   state: DesignProjectState | null
   /** 重新加载当前项目，用于恢复加载错误。 */
   retry: () => void
+  /** 强制采用磁盘权威快照，用于外部写恢复后的状态重置。 */
+  reloadAuthoritativeSnapshot: () => void
   /** 将失败 mutation 恢复为 dirty，由 400ms 自动保存流程再次提交。 */
   retrySave: () => void
   /** 放弃本地结构冲突修改并采用已接管的远端版本。 */
@@ -638,6 +669,11 @@ export function useDesignWorkspace(
     controllerRef.current?.retryLoad()
   }, [])
 
+  /** 外部素材写入要求恢复时，由唯一 controller 接管权威快照。 */
+  const reloadAuthoritativeSnapshot = React.useCallback(() => {
+    controllerRef.current?.reloadAuthoritativeSnapshot()
+  }, [])
+
   /** 单独恢复失败保存，不触发快照重新加载。 */
   const retrySave = React.useCallback(() => {
     controllerRef.current?.retrySave()
@@ -648,5 +684,5 @@ export function useDesignWorkspace(
     controllerRef.current?.acceptRemoteVersion()
   }, [])
 
-  return { state, retry, retrySave, acceptRemoteVersion }
+  return { state, retry, reloadAuthoritativeSnapshot, retrySave, acceptRemoteVersion }
 }

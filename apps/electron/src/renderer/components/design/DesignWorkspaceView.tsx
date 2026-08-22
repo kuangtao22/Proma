@@ -2,7 +2,9 @@ import * as React from 'react'
 import { RefreshCw, Sparkles, Upload } from 'lucide-react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import {
+  consumeDesignRecoveryRequestAtom,
   createInitialDesignProjectState,
+  designRecoveryRequestsAtom,
   executeDesignEditAtom,
   redoDesignEditAtom,
   undoDesignEditAtom,
@@ -11,6 +13,7 @@ import {
 import type { DesignProjectState } from '@/atoms/design-atoms'
 import { currentAgentWorkspaceIdAtom } from '@/atoms/agent-atoms'
 import { Button } from '@/components/ui/button'
+import { designAdapter } from '@/lib/design-adapter'
 import {
   areDesignMutationsJobSafe,
   selectionContainsDesignJobNode,
@@ -215,9 +218,26 @@ export function DesignWorkspaceStateView({
 /** 从当前项目读取隔离状态并渲染设计工作区。 */
 export function DesignWorkspaceView(): React.ReactElement {
   const projectId = useAtomValue(currentAgentWorkspaceIdAtom)
+  const recoveryRequests = useAtomValue(designRecoveryRequestsAtom)
+  const consumeRecoveryRequest = useSetAtom(consumeDesignRecoveryRequestAtom)
   const updateProjectState = useSetAtom(updateDesignProjectStateAtom)
-  const assetActions = useDesignInspectorActions(projectId)
-  const { state, retry, retrySave, acceptRemoteVersion } = useDesignWorkspace(projectId)
+  const {
+    state,
+    retry,
+    reloadAuthoritativeSnapshot,
+    retrySave,
+    acceptRemoteVersion,
+  } = useDesignWorkspace(projectId)
+  const assetActions = useDesignInspectorActions(projectId, designAdapter, {
+    onRecoveryRequired: reloadAuthoritativeSnapshot,
+  })
+
+  React.useEffect(() => {
+    if (!projectId || !recoveryRequests.has(projectId)) return
+    /** 先消费一次性请求，再交给当前项目唯一 controller 执行权威重载。 */
+    consumeRecoveryRequest({ projectId })
+    reloadAuthoritativeSnapshot()
+  }, [consumeRecoveryRequest, projectId, recoveryRequests, reloadAuthoritativeSnapshot])
 
   if (!projectId) {
     return (

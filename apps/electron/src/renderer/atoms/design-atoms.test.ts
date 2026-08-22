@@ -3,8 +3,11 @@ import { createEmptyDesignDocument } from '@proma/shared'
 import type { DesignWorkspaceSnapshot } from '@proma/shared'
 import { createStore } from 'jotai'
 import {
+  consumeDesignRecoveryRequestAtom,
   createInitialDesignProjectState,
+  designRecoveryRequestsAtom,
   designProjectStatesAtom,
+  requestDesignRecoveryAtom,
   updateDesignProjectStateAtom,
 } from './design-atoms'
 
@@ -14,6 +17,17 @@ function createSnapshot(projectId: string): DesignWorkspaceSnapshot {
 }
 
 describe('Design 项目状态', () => {
+  test('Given 右栏请求项目恢复 When 画布消费请求 Then 仅清除目标项目的一次性信号', () => {
+    const store = createStore()
+
+    store.set(requestDesignRecoveryAtom, { projectId: 'project-1' })
+    store.set(requestDesignRecoveryAtom, { projectId: 'project-2' })
+    expect(store.get(designRecoveryRequestsAtom)).toEqual(new Set(['project-1', 'project-2']))
+
+    store.set(consumeDesignRecoveryRequestAtom, { projectId: 'project-1' })
+    expect(store.get(designRecoveryRequestsAtom)).toEqual(new Set(['project-2']))
+  })
+
   test('Given 新项目 When 创建初始状态 Then 不携带冲突恢复任务', () => {
     expect(createInitialDesignProjectState().conflictRecoveryPending).toBe(false)
   })
