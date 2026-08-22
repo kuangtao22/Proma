@@ -257,6 +257,88 @@ describe('Design 工作区同步规则', () => {
     expect(harness.getState().future).toEqual([])
   })
 
+  test('Given 已保存历史的项目重新 mount When 加载相同 revision 与相同文档 Then 保留 history 和 future', async () => {
+    /** 两次 controller 生命周期共享同一项目 Jotai 状态。 */
+    const snapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 10), revision: 3 },
+      writable: true,
+    }
+    const historyEntry = {
+      forward: [{ type: 'set-viewport' as const, viewport: { x: 1, y: 1, zoom: 1 } }],
+      inverse: [{ type: 'set-viewport' as const, viewport: { x: 0, y: 0, zoom: 1 } }],
+    }
+    const sharedState: SharedControllerState = {
+      state: {
+        ...createInitialDesignProjectState(),
+        phase: 'ready',
+        snapshot,
+        history: [historyEntry],
+        future: [historyEntry],
+      },
+    }
+    /** 旧项目视图卸载后释放 controller。 */
+    const oldHarness = createControllerHarness(sharedState.state, sharedState)
+    oldHarness.controller.dispose()
+    /** 重新进入项目后 adapter 返回内容相同的新对象。 */
+    const remountedHarness = createControllerHarness(sharedState.state, sharedState)
+    remountedHarness.controller.start()
+    remountedHarness.loadRequests[0]!.resolve(structuredClone(snapshot))
+    await flushPromises()
+
+    expect(sharedState.state.history).toEqual([historyEntry])
+    expect(sharedState.state.future).toEqual([historyEntry])
+  })
+
+  test('Given revision 相同但权威文档不同或来自恢复 When load 完成 Then 清空旧历史', async () => {
+    /** 旧 revision 上的历史项。 */
+    const historyEntry = {
+      forward: [{ type: 'set-viewport' as const, viewport: { x: 1, y: 1, zoom: 1 } }],
+      inverse: [{ type: 'set-viewport' as const, viewport: { x: 0, y: 0, zoom: 1 } }],
+    }
+    /** 相同 revision 但内容变化必须按权威替换处理。 */
+    const differentHarness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: {
+        document: { ...createEmptyDesignDocument('project-1', 10), revision: 3 },
+        writable: true,
+      },
+      history: [historyEntry],
+      future: [historyEntry],
+    })
+    differentHarness.controller.start()
+    differentHarness.loadRequests[0]!.resolve({
+      document: {
+        ...createEmptyDesignDocument('project-1', 10),
+        revision: 3,
+        viewport: { x: 99, y: 99, zoom: 2 },
+      },
+      writable: true,
+    })
+    await flushPromises()
+    expect(differentHarness.getState().history).toEqual([])
+    expect(differentHarness.getState().future).toEqual([])
+
+    /** recovery 标志即使文档内容相同也表示磁盘基线被恢复替换。 */
+    const recoveredDocument = { ...createEmptyDesignDocument('project-1', 20), revision: 4 }
+    const recoveredHarness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: { document: recoveredDocument, writable: true },
+      history: [historyEntry],
+      future: [historyEntry],
+    })
+    recoveredHarness.controller.start()
+    recoveredHarness.loadRequests[0]!.resolve({
+      document: structuredClone(recoveredDocument),
+      writable: true,
+      recoveredFrom: 'backup',
+    })
+    await flushPromises()
+    expect(recoveredHarness.getState().history).toEqual([])
+    expect(recoveredHarness.getState().future).toEqual([])
+  })
+
   test('Given revision 冲突时仍有旧历史 When 远端 rebase 完成 Then undo 不再保留旧 inverse', async () => {
     /** 旧 revision 上的 mutation 与历史不能跨 rebase 使用。 */
     const mutation: DesignMutation = {

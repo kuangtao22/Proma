@@ -73,6 +73,22 @@ export function shouldApplyLoadedDesignSnapshot(
 }
 
 /**
+ * 判断权威快照是否替换了当前编辑历史依赖的文档基线。
+ * @param state Promise 返回时读取到的最新项目状态。
+ * @param snapshot 本次加载返回的权威快照。
+ * @returns 首次加载、恢复快照或文档内容变化时返回 true。
+ */
+export function shouldResetDesignHistoryForSnapshot(
+  state: DesignProjectState,
+  snapshot: DesignWorkspaceSnapshot,
+): boolean {
+  const currentDocument = state.snapshot?.document
+  return !currentDocument
+    || Boolean(snapshot.recoveredFrom)
+    || JSON.stringify(currentDocument) !== JSON.stringify(snapshot.document)
+}
+
+/**
  * 接管新 load 的媒体与可写状态元数据，同时保留本地乐观 document。
  * @param localSnapshot 当前缓存及其不可覆盖的本地 document。
  * @param loadedSnapshot 新 load 返回的媒体授权与状态元数据。
@@ -320,11 +336,12 @@ export function createDesignWorkspaceController(
         scheduleSave()
         return
       }
+      /** 相同权威文档的普通 remount 保留该项目既有撤销与重做历史。 */
+      const resetHistory = shouldResetDesignHistoryForSnapshot(latest, snapshot)
       dependencies.updateState({
         phase: 'ready',
         snapshot,
-        history: [],
-        future: [],
+        ...(resetHistory ? { history: [], future: [] } : {}),
         error: null,
         saveState: 'saved',
       })
