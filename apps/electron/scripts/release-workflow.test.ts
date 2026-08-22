@@ -35,6 +35,12 @@ interface ElectronBuilderConfig {
   productName?: string
   /** 是否根据预发布后缀自动改变更新频道。 */
   detectUpdateChannel?: boolean
+  /** Electron Updater 使用的固定发布仓库。 */
+  publish?: {
+    provider?: string
+    owner?: string
+    repo?: string
+  }
   /** macOS 安装包配置。 */
   mac?: PlatformArtifactConfig
   /** Windows 安装包配置。 */
@@ -112,6 +118,12 @@ test('Bone 应用版本与更新频道保持一致', () => {
 
   expect(metadata.version).toBe('0.17.55-bone.1')
   expect(config.detectUpdateChannel).toBe(false)
+  expect(config.publish).toEqual({
+    provider: 'github',
+    owner: 'kuangtao22',
+    repo: 'Proma',
+  })
+  expect(JSON.stringify(config.publish)).not.toContain('ErlichLiu')
   expect(updaterSource).toContain('autoUpdater.allowPrerelease = true')
 })
 

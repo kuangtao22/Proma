@@ -8,6 +8,7 @@ describe('VersionHistory', () => {
 
     expect(html).toContain('Proma 修改')
     expect(html).toContain('官方版本')
+    expect(html).toContain('aria-label="版本历史来源"')
     expect(html).toMatch(/role="tab" aria-selected="true" aria-controls="[^"]*-content-bone"[^>]*>Proma 修改<\/button>/)
     expect(html).toContain('aria-selected="false"')
   })

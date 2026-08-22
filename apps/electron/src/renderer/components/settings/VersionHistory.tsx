@@ -106,7 +106,10 @@ export function VersionHistory(): React.ReactElement {
               刷新
             </button>
           </div>
-          <TabsList className="grid w-full grid-cols-2 sm:w-auto sm:min-w-64">
+          <TabsList
+            aria-label="版本历史来源"
+            className="grid w-full grid-cols-2 sm:w-auto sm:min-w-64"
+          >
             {VERSION_HISTORY_SOURCES.map((source) => (
               <TabsTrigger key={source} value={source} className="min-w-0 px-2 text-xs sm:px-3">
                 {VERSION_HISTORY_LABELS[source]}
