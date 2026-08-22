@@ -1,3 +1,5 @@
+import { acquireWorkspaceWriteLease } from './workspace-operation-lock'
+
 /** 工作区写操作守卫的可注入查询依赖。 */
 export interface WorkspaceOperationGuardDependencies {
   /** 按会话 ID 解析权威工作区 ID。 */
@@ -56,6 +58,20 @@ export interface WorkspaceOperationGuard {
   ) => void
 }
 
+/** 在同步 effect 返回或异步 Promise settled 后释放工作区写 lease。 */
+function runWithWorkspaceWriteLease<T>(workspaceId: string, effect: () => T): T {
+  const release = acquireWorkspaceWriteLease(workspaceId)
+  try {
+    const result = effect()
+    if (result instanceof Promise) return result.finally(release) as T
+    release()
+    return result
+  } catch (error) {
+    release()
+    throw error
+  }
+}
+
 /** 创建只负责解析工作区归属与检查独占操作锁的守卫。 */
 export function createWorkspaceOperationGuard(
   dependencies: WorkspaceOperationGuardDependencies,
@@ -98,7 +114,7 @@ export function createWorkspaceOperationGuard(
     },
     runWorkspaceWrite: (workspaceId, effect) => {
       assertWorkspaceWritable(workspaceId)
-      return effect()
+      return runWithWorkspaceWriteLease(workspaceId, effect)
     },
     runSessionWrite: (sessionId, effect) => {
       const workspaceId = dependencies.getWorkspaceIdBySessionId(sessionId)

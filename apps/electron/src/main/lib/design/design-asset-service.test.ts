@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   truncateSync,
@@ -16,7 +17,7 @@ import sharp from 'sharp'
 import { createDesignPathResolver } from './design-paths'
 import { createDesignStore } from './design-store'
 import type { DesignStore } from './design-store'
-import { DesignAssetService } from './design-asset-service'
+import { DesignAssetProcessingQueue, DesignAssetService, promoteStagedFile } from './design-asset-service'
 
 describe('Design 素材安全服务', () => {
   /** 每个测试隔离使用的项目正式根。 */
@@ -148,6 +149,125 @@ describe('Design 素材安全服务', () => {
     expect(readdirSync(paths.stagingDir)).toEqual([])
   })
 
+  test('Given staging 与项目素材目录跨卷 When 导入 Then 经目标卷临时文件原子提交整批素材', async () => {
+    /** 记录 staging 到正式目录触发的跨卷降级次数。 */
+    let crossVolumePromotions = 0
+    service = createService({
+      renameFile: (sourcePath, targetPath) => {
+        if (sourcePath.startsWith(paths.stagingDir)) {
+          crossVolumePromotions += 1
+          throw createFileSystemError('EXDEV')
+        }
+        renameSync(sourcePath, targetPath)
+      },
+    })
+
+    const result = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+
+    expect(result).toHaveLength(1)
+    expect(crossVolumePromotions).toBe(2)
+    expect(readdirSync(paths.assetsDir)).toEqual([basename(result[0]!.relativePath)])
+    expect(readdirSync(paths.thumbnailsDir)).toEqual([basename(result[0]!.thumbnailRelativePath)])
+    expect(readdirSync(paths.assetsDir).some((name) => name.includes('.proma-promote-'))).toBe(false)
+    expect(readdirSync(paths.stagingDir)).toEqual([])
+  })
+
+  test('Given 跨卷复制完成但目标卷 rename 失败 When 导入 Then 清理临时与整批正式文件', async () => {
+    service = createService({
+      renameFile: (sourcePath, targetPath) => {
+        if (sourcePath.startsWith(paths.stagingDir)) throw createFileSystemError('EXDEV')
+        if (basename(sourcePath).startsWith('.proma-promote-')) throw createFileSystemError('EIO')
+        renameSync(sourcePath, targetPath)
+      },
+    })
+
+    await expect(service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' }))
+      .rejects.toThrow()
+    expect(readdirSync(paths.assetsDir)).toEqual([])
+    expect(readdirSync(paths.thumbnailsDir)).toEqual([])
+    expect(readdirSync(paths.stagingDir)).toEqual([])
+  })
+
+  test('Given 跨卷提升成功后源路径被重新创建 When 完成清理 Then 保留已提交目标', () => {
+    const stagingPath = join(sourceRoot, 'staged.png')
+    const targetPath = join(paths.assetsDir, 'promoted.png')
+    writeFileSync(stagingPath, readFileSync(fixturePath))
+
+    promoteStagedFile(stagingPath, targetPath, {
+      renameFile: (sourcePath, destinationPath) => {
+        if (sourcePath === stagingPath) throw createFileSystemError('EXDEV')
+        renameSync(sourcePath, destinationPath)
+      },
+      removeFile: (filePath) => {
+        rmSync(filePath)
+        if (filePath === stagingPath) writeFileSync(stagingPath, 'recreated')
+      },
+    })
+
+    expect(existsSync(targetPath)).toBe(true)
+    expect(readFileSync(targetPath)).toEqual(readFileSync(fixturePath))
+  })
+
+  test('Given 两个并发图片请求 When 进入处理队列 Then 同时只运行一个 Sharp 任务', async () => {
+    const queue = new DesignAssetProcessingQueue({ maxBatchBytes: 128, maxFiles: 4 })
+    /** 第一项任务完成时机由测试控制。 */
+    let finishFirst: (() => void) | undefined
+    /** 当前进入执行区的任务数量。 */
+    let activeTasks = 0
+    /** 测试观察到的最大并发数。 */
+    let maximumActiveTasks = 0
+    const first = queue.run([64], async () => {
+      activeTasks += 1
+      maximumActiveTasks = Math.max(maximumActiveTasks, activeTasks)
+      await new Promise<void>((resolve) => { finishFirst = resolve })
+      activeTasks -= 1
+    })
+    const second = queue.run([64], async () => {
+      activeTasks += 1
+      maximumActiveTasks = Math.max(maximumActiveTasks, activeTasks)
+      activeTasks -= 1
+    })
+    await Promise.resolve()
+
+    expect(maximumActiveTasks).toBe(1)
+    finishFirst?.()
+    await Promise.all([first, second])
+    expect(maximumActiveTasks).toBe(1)
+  })
+
+  test('Given 批次累计字节或文件数超预算 When 排队 Then 在读取 Buffer 前拒绝', async () => {
+    const queue = new DesignAssetProcessingQueue({ maxBatchBytes: 100, maxFiles: 2 })
+
+    await expect(queue.run([60, 41], async () => {})).rejects.toThrow('批次图片累计大小超出限制')
+    await expect(queue.run([1, 1, 1], async () => {})).rejects.toThrow('批次图片数量超出限制')
+  })
+
+  test('Given 上一进程 promotion 未写入 canvas When 新实例恢复 Then 清理正式孤儿与 journal', async () => {
+    service = createService({ runtimeId: 'runtime-old' })
+    const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const orphanPath = join(paths.designRoot, asset!.relativePath)
+    expect(existsSync(orphanPath)).toBe(true)
+
+    service = createService({ runtimeId: 'runtime-new' })
+    service.recoverPromotionJournals('project-1')
+
+    expect(existsSync(orphanPath)).toBe(false)
+    expect(listPromotionJournals()).toEqual([])
+  })
+
+  test('Given promotion 已被 canvas 引用 When 新实例恢复 Then 保留正式文件并清理 journal', async () => {
+    service = createService({ runtimeId: 'runtime-old' })
+    const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])
+    const referencedPath = join(paths.designRoot, asset!.relativePath)
+
+    service = createService({ runtimeId: 'runtime-new' })
+    service.recoverPromotionJournals('project-1')
+
+    expect(existsSync(referencedPath)).toBe(true)
+    expect(listPromotionJournals()).toEqual([])
+  })
+
   test('Given 文件超过 64 MiB When 导入 Then 在解码前拒绝', async () => {
     const oversizedPath = join(sourceRoot, 'oversized.png')
     writeFileSync(oversizedPath, '')
@@ -246,6 +366,60 @@ describe('Design 素材安全服务', () => {
     expect(existsSync(service.resolveAssetPath('project-1', asset!.id))).toBe(true)
   })
 
+  test('Given staging 与项目素材目录跨卷 When 重新定位 Then 原位提交新素材并清理旧文件', async () => {
+    const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])
+    const oldAssetPath = service.resolveAssetPath('project-1', asset!.id)
+    const replacementPath = join(sourceRoot, 'cross-volume-replacement.webp')
+    await sharp(fixturePath).webp().toFile(replacementPath)
+    const journalCountBeforeRelink = listPromotionJournals().length
+    /** 记录重新定位原图与缩略图的跨卷提升次数。 */
+    let crossVolumePromotions = 0
+    service = createService({
+      renameFile: (sourcePath, targetPath) => {
+        if (sourcePath.startsWith(paths.stagingDir)) {
+          crossVolumePromotions += 1
+          throw createFileSystemError('EXDEV')
+        }
+        renameSync(sourcePath, targetPath)
+      },
+    })
+
+    const result = await service.relinkAsset('project-1', asset!.id, replacementPath, withAsset.revision)
+    const relinked = result.assets.find((item) => item.id === asset!.id)
+
+    expect(crossVolumePromotions).toBe(2)
+    expect(relinked?.mediaType).toBe('image/webp')
+    expect(existsSync(oldAssetPath)).toBe(false)
+    expect(existsSync(service.resolveAssetPath('project-1', asset!.id))).toBe(true)
+    expect(readdirSync(paths.assetsDir).some((name) => name.includes('.proma-promote-'))).toBe(false)
+    expect(listPromotionJournals()).toHaveLength(journalCountBeforeRelink)
+  })
+
+  test('Given canvas JSON 已 rename 但 durability 同步失败 When 重新定位 Then 保留新 revision 引用文件', async () => {
+    const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])
+    const replacementPath = join(sourceRoot, 'uncertain-replacement.webp')
+    await sharp(fixturePath).webp().toFile(replacementPath)
+    /** mutate 先真实提交新 revision，再模拟目录 durability 同步失败。 */
+    const uncertainStore: DesignStore = {
+      load: (projectId) => store.load(projectId),
+      mutate: (projectId, expectedRevision, mutations) => {
+        store.mutate(projectId, expectedRevision, mutations)
+        throw new Error('目录持久化同步失败')
+      },
+    }
+    service = createService({ store: uncertainStore })
+
+    await expect(service.relinkAsset('project-1', asset!.id, replacementPath, withAsset.revision))
+      .rejects.toThrow('目录持久化同步失败')
+    const persisted = store.load('project-1').document.assets.find((item) => item.id === asset!.id)
+
+    expect(persisted?.mediaType).toBe('image/webp')
+    expect(existsSync(join(paths.designRoot, persisted!.relativePath))).toBe(true)
+    expect(existsSync(join(paths.cacheRoot, persisted!.thumbnailRelativePath))).toBe(true)
+  })
+
   test('Given 主进程提供导出目标 When 导出 Then 原图字节保持一致', async () => {
     const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
     store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])
@@ -324,7 +498,39 @@ describe('Design 素材安全服务', () => {
     expect(() => service.createMediaAccess('project-1')).toThrow('注册失败')
     expect(revoked).toEqual(['proma-file://assets-token'])
   })
+
+  /** 使用当前测试基础依赖创建可窄注入文件提升行为的服务。 */
+  function createService(overrides: {
+    renameFile?: (sourcePath: string, targetPath: string) => void
+    store?: DesignStore
+    runtimeId?: string
+  }): DesignAssetService {
+    return new DesignAssetService({
+      pathResolver: { resolve: () => paths },
+      store: overrides.store ?? store,
+      now: () => 200,
+      runWorkspaceWrite: (_projectId, effect) => effect(),
+      registerDirectoryPath: (directoryPath) => `proma-file://${basename(directoryPath)}`,
+      revokePathUrl: () => {},
+      warn: () => {},
+      ...(overrides.renameFile ? { filePromotion: { renameFile: overrides.renameFile } } : {}),
+      ...(overrides.runtimeId ? { runtimeId: overrides.runtimeId } : {}),
+    })
+  }
+
+  /** 列出测试项目缓存中的 promotion journal。 */
+  function listPromotionJournals(): string[] {
+    const directoryPath = join(paths.jobsDir, 'promotions')
+    return existsSync(directoryPath) ? readdirSync(directoryPath) : []
+  }
 })
+
+/** 创建带稳定 code 的文件系统错误，模拟跨卷与目标提交失败。 */
+function createFileSystemError(code: string): NodeJS.ErrnoException {
+  const error = new Error(code) as NodeJS.ErrnoException
+  error.code = code
+  return error
+}
 
 /** 计算 PNG chunk 使用的 IEEE CRC-32。 */
 function calculateCrc32(bytes: Buffer): number {
