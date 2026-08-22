@@ -14,6 +14,7 @@ import {
   reduceDesignEdit,
   resolveDesignKeyboardAction,
 } from './design-editor'
+import type { DesignEditCommand } from './design-editor'
 
 /** 创建用于编辑器命令测试的固定节点。 */
 function createNode(id: string, x: number, groupId?: string): DesignCanvasNode {
@@ -328,6 +329,41 @@ describe('Design 编辑历史 Jotai action', () => {
     expect(afterUndo.pendingMutations).toEqual([])
     expect(afterUndo.history).toEqual([unsafeHistory])
     expect(afterUndo.saveState).toBe('saved')
+  })
+
+  test('Given 混合组只选素材 When 删除分组或取消分组 Then atom 最终防线拒绝间接改写 job 分组', () => {
+    /** 混合组内 job 未被选择，但任何成员变更都会间接改写其所属分组。 */
+    const document = createDocument()
+    document.nodes = [
+      createNode('n1', 10, 'mixed-group'),
+      createNode('n2', 40, 'mixed-group'),
+      createJobNode('j1', 80, 'mixed-group'),
+    ]
+    document.groups = [{ id: 'mixed-group', name: '混合组', nodeIds: ['n1', 'n2', 'j1'] }]
+    /** 三种命令均只选择素材节点，覆盖工具栏与键盘可能绕过的具体 command。 */
+    const commands: Array<Extract<DesignEditCommand, { nodeIds: string[] }>> = [
+      { type: 'delete-selection', nodeIds: ['n1'] },
+      { type: 'group-selection', nodeIds: ['n1', 'n2'], groupId: 'asset-group', name: '素材组' },
+      { type: 'ungroup-selection', nodeIds: ['n1'] },
+    ]
+
+    for (const command of commands) {
+      const store = createStore()
+      store.set(designProjectStatesAtom, new Map([['project-1', {
+        ...createInitialDesignProjectState(),
+        phase: 'ready' as const,
+        snapshot: { document, writable: true },
+        selectedNodeIds: command.nodeIds,
+      }]]))
+
+      store.set(executeDesignEditAtom, { projectId: 'project-1', command })
+
+      const blocked = store.get(designProjectStatesAtom).get('project-1')!
+      expect(blocked.snapshot?.document).toBe(document)
+      expect(blocked.pendingMutations).toEqual([])
+      expect(blocked.history).toEqual([])
+      expect(blocked.saveState).toBe('saved')
+    }
   })
 
   test('Given 结构冲突尚未采用远端版本 When 执行结构命令 Then 不追加乐观文档或 pending', () => {

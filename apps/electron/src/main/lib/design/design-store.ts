@@ -60,6 +60,8 @@ export interface DesignStore {
     projectId: string,
     expectedRevision: number,
     mutations: DesignMutation[],
+    /** 在同一次磁盘加载后、应用 mutation 前校验权威文档。 */
+    validateCurrent?: (document: DesignCanvasDocument) => void,
   ) => DesignCanvasDocument
 }
 
@@ -753,6 +755,7 @@ export function createDesignStore(options: DesignStoreOptions = {}): DesignStore
     projectId: string,
     expectedRevision: number,
     mutations: DesignMutation[],
+    validateCurrent?: (document: DesignCanvasDocument) => void,
   ): DesignCanvasDocument {
     /** mutation 开始时重新加载的磁盘最新快照。 */
     const loaded = load(projectId)
@@ -761,6 +764,8 @@ export function createDesignStore(options: DesignStoreOptions = {}): DesignStore
     }
     /** 未发生恢复时可继续 mutation 的磁盘最新文档。 */
     const current = loaded.document
+    /** 调用方策略与后续 apply/write 共享本次唯一加载的权威文档。 */
+    validateCurrent?.(current)
     assertCanApply(expectedRevision, current.revision, mutations)
     assertMoveTargetsExist(current, expectedRevision, mutations)
     if (mutations.length === 0) return current

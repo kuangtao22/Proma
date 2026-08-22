@@ -76,6 +76,23 @@ describe('Design revision 原子存储', () => {
     expect(existsSync(join(projectRoot, '.proma/design/canvas.json'))).toBe(false)
   })
 
+  test('Given mutation 带权威策略 When 策略拒绝 Then 单次加载后在应用和写入前停止', () => {
+    const store = createStore()
+    /** 校验次数用于证明同一权威文档只进入一次策略。 */
+    let validationCount = 0
+
+    expect(() => store.mutate('project-1', 0, [{
+      type: 'set-viewport',
+      viewport: { x: 9, y: 9, zoom: 1 },
+    }], (document) => {
+      validationCount += 1
+      expect(document.revision).toBe(0)
+      throw new Error('策略拒绝')
+    })).toThrow('策略拒绝')
+    expect(validationCount).toBe(1)
+    expect(existsSync(join(projectRoot, '.proma/design/canvas.json'))).toBe(false)
+  })
+
   test('Given 损坏主文件和有效备份 When 加载 Then 从备份恢复并标记来源', () => {
     /** 使用真实 safe-file 恢复链的存储。 */
     const store = createStore()

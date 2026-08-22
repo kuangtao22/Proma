@@ -32,6 +32,7 @@ function createFixture(): {
   importCommits: string[]
   importRollbacks: string[]
   document: DesignCanvasDocument
+  getStoreReadCount: () => number
 } {
   /** 已注册 handler 索引。 */
   const handlers = new Map<string, TestHandler>()
@@ -45,6 +46,8 @@ function createFixture(): {
   const importRollbacks: string[] = []
   /** 当前测试画布。 */
   let document = createEmptyDesignDocument('project-1', 10)
+  /** 模拟 store 每次公开加载或 mutation 内部加载权威文档的次数。 */
+  let storeReadCount = 0
   /** 创建可记录广播的授权窗口。 */
   const senders = [1, 2].map((id) => {
     /** 当前测试窗口登记的 destroyed 回调。 */
@@ -99,8 +102,13 @@ function createFixture(): {
       },
     },
     store: {
-      load: (): DesignWorkspaceSnapshot => ({ document, writable: true }),
-      mutate: (_projectId, _revision, mutations) => {
+      load: (): DesignWorkspaceSnapshot => {
+        storeReadCount += 1
+        return { document, writable: true }
+      },
+      mutate: (_projectId, _revision, mutations, validateCurrent) => {
+        storeReadCount += 1
+        validateCurrent?.(document)
         if (mutations[0]?.type === 'upsert-assets') document = { ...document, revision: document.revision + 1, assets: mutations[0].assets }
         else document = { ...document, revision: document.revision + 1 }
         return document
@@ -135,6 +143,7 @@ function createFixture(): {
     importCommits,
     importRollbacks,
     get document() { return document },
+    getStoreReadCount: () => storeReadCount,
   }
 }
 
@@ -198,6 +207,19 @@ describe('Design IPC', () => {
     expect(fixture.importRollbacks).toEqual([])
     expect(fixture.senders.every((sender) => sender.sent.length === 4)).toBe(true)
     expect(fixture.senders[0]?.sent[0]?.channel).toBe(DESIGN_IPC_CHANNELS.CHANGED)
+  })
+
+  test('Given 单次 Renderer 保存 When store 执行策略和 mutation Then 只读取一次权威文档', async () => {
+    const fixture = createFixture()
+    registerDesignIpcHandlers(fixture.options)
+
+    await invoke(fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, fixture.senders[0]!, {
+      projectId: 'project-1',
+      expectedRevision: 0,
+      mutations: [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
+    })
+
+    expect(fixture.getStoreReadCount()).toBe(1)
   })
 
   test('Given sender 重复加载和释放 When 切换授权 Then 只释放该 sender 且 relink 不接受路径', async () => {
@@ -288,10 +310,16 @@ describe('Design IPC', () => {
       zIndex: 1,
     }]
     authoritative.groups = [{ id: 'job-group', name: '任务组', nodeIds: ['job-node-1'] }]
+    /** 每次攻击只能进入一次 store 权威读取。 */
+    let authoritativeReadCount = 0
     /** mutate 调用次数用于证明拒绝发生在任何存储写副作用前。 */
     let mutateCount = 0
-    fixture.options.store.load = () => ({ document: authoritative, writable: true })
-    fixture.options.store.mutate = () => {
+    fixture.options.store.load = () => {
+      throw new Error('SAVE 不应在 IPC 预读权威文档')
+    }
+    fixture.options.store.mutate = (_projectId, _revision, _mutations, validateCurrent) => {
+      authoritativeReadCount += 1
+      validateCurrent?.(authoritative)
       mutateCount += 1
       return authoritative
     }
@@ -342,23 +370,22 @@ describe('Design IPC', () => {
       })).rejects.toThrow('任务节点')
     }
     expect(fixture.guardProjects).toEqual(Array.from({ length: attacks.length }, () => 'project-1'))
+    expect(authoritativeReadCount).toBe(attacks.length)
     expect(mutateCount).toBe(0)
     expect(authoritative.revision).toBe(0)
     expect(fixture.senders.every((sender) => sender.sent.length === 0)).toBe(true)
   })
 
-  test('Given 写锁内权威 load 发生恢复 When 保存 Then 要求 Renderer reload 且不调用 mutate', async () => {
+  test('Given store mutation 单次读取发生恢复 When 保存 Then 要求 Renderer reload 且不进入写入', async () => {
     const fixture = createFixture()
-    /** 恢复快照不能被预校验 load 消费后静默继续保存。 */
-    let mutateCount = 0
-    fixture.options.store.load = () => ({
-      document: fixture.document,
-      writable: true,
-      recoveredFrom: 'backup',
-    })
+    /** IPC 不得预读并消费恢复标志，恢复错误必须来自 store mutation 临界路径。 */
+    let mutationAttemptCount = 0
+    fixture.options.store.load = () => {
+      throw new Error('SAVE 不应在 IPC 预读权威文档')
+    }
     fixture.options.store.mutate = () => {
-      mutateCount += 1
-      return fixture.document
+      mutationAttemptCount += 1
+      throw new Error('DESIGN_RECOVERY_REQUIRED: recoveredFrom=backup')
     }
     registerDesignIpcHandlers(fixture.options)
 
@@ -368,7 +395,8 @@ describe('Design IPC', () => {
       mutations: [{ type: 'set-viewport', viewport: { x: 1, y: 1, zoom: 1 } }],
     })).rejects.toThrow('DESIGN_RECOVERY_REQUIRED')
     expect(fixture.guardProjects).toEqual(['project-1'])
-    expect(mutateCount).toBe(0)
+    expect(mutationAttemptCount).toBe(1)
+    expect(fixture.senders.every((sender) => sender.sent.length === 0)).toBe(true)
   })
 
   test('Given 局部有序 patch When IPC 校验 Then 接受合法索引并拒绝负索引和任务节点', async () => {

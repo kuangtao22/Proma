@@ -121,6 +121,8 @@ export const executeDesignEditAtom = atom(
     /** 纯 reducer 同时生成乐观文档和确定性 inverse。 */
     const result = reduceDesignEdit(current.snapshot.document, input.command)
     if (result.forward.length === 0) return
+    /** 最终写入口按当前文档复核完整 mutation，阻止间接改写含 job 的分组。 */
+    if (!areDesignMutationsJobSafe(current.snapshot.document, result.forward)) return
     set(updateDesignProjectStateAtom, {
       projectId: input.projectId,
       update: {

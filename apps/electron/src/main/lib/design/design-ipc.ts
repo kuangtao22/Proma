@@ -436,15 +436,14 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   options.ipc.handle(DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, async (event, value): Promise<DesignCanvasDocument> => {
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseSaveInput(value)
-    const document = await options.guard.runWorkspaceWrite(input.projectId, () => {
-      /** 所有权校验与 mutate 共处同一项目写锁，避免权威文档在检查后变化。 */
-      const current = options.store.load(input.projectId)
-      if (current.recoveredFrom) {
-        throw new Error(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${current.recoveredFrom}`)
-      }
-      assertRendererPreservesJobOwnership(current.document, input.mutations)
-      return options.store.mutate(input.projectId, input.expectedRevision, input.mutations)
-    })
+    const document = await options.guard.runWorkspaceWrite(input.projectId, () => (
+      options.store.mutate(
+        input.projectId,
+        input.expectedRevision,
+        input.mutations,
+        (currentDocument) => assertRendererPreservesJobOwnership(currentDocument, input.mutations),
+      )
+    ))
     rememberDocument(input.projectId, document)
     if (input.mutations.length > 0) {
       broadcastChange(options, { projectId: input.projectId, revision: document.revision, cause: 'canvas' })
