@@ -24,8 +24,13 @@ export interface GitHubRelease {
   html_url: string
 }
 
+/** GitHub Release 历史的固定来源。 */
+export type GitHubReleaseHistorySource = 'bone' | 'official'
+
 /** GitHub Release 列表查询选项 */
 export interface GitHubReleaseListOptions {
+  /** Release 历史来源（默认 Bone） */
+  source?: GitHubReleaseHistorySource
   /** 每页数量（默认 10） */
   perPage?: number
   /** 页码（默认 1） */
