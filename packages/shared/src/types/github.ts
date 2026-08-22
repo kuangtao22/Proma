@@ -35,7 +35,7 @@ export interface GitHubReleaseListOptions {
   perPage?: number
   /** 页码（默认 1） */
   page?: number
-  /** 是否包含草稿和预发布版本（默认 false） */
+  /** 是否包含预发布版本（草稿始终排除，默认 false） */
   includePrerelease?: boolean
 }
 

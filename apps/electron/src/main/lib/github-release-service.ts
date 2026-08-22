@@ -36,10 +36,12 @@ const RELEASE_HISTORY_REPOSITORIES: Record<
 const GITHUB_RELEASE_PAGE_SIZE = 100
 
 /** Bone Release 标签必须严格符合带构建号的版本格式。 */
-const BONE_RELEASE_TAG_PATTERN = /^v\d+\.\d+\.\d+-bone\.\d+$/
+const BONE_RELEASE_TAG_PATTERN =
+  /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-bone\.\d+$/
 
 /** 官方 Release 标签必须严格符合普通正式版本格式。 */
-const OFFICIAL_RELEASE_TAG_PATTERN = /^v\d+\.\d+\.\d+$/
+const OFFICIAL_RELEASE_TAG_PATTERN =
+  /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/
 
 /** Release 缓存 */
 interface ReleaseCache {

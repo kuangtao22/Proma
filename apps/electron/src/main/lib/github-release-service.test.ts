@@ -63,10 +63,13 @@ describe('GitHub Release 双来源历史', () => {
     const requestedUrls: string[] = []
     const releases = [
       createRelease(1, 'v0.17.55'),
-      createRelease(2, 'v0.17.55-bone.3'),
-      createRelease(3, 'v0.17.55-bone.2', { draft: true }),
-      createRelease(4, 'v0.17.55-bone.1'),
-      createRelease(5, 'v0.17.55-bone.0-beta'),
+      createRelease(2, 'v00.17.55-bone.5'),
+      createRelease(3, 'v0.017.55-bone.4'),
+      createRelease(4, 'v0.17.055-bone.4'),
+      createRelease(5, 'v0.17.55-bone.3'),
+      createRelease(6, 'v0.17.55-bone.2', { draft: true }),
+      createRelease(7, 'v0.17.55-bone.1'),
+      createRelease(8, 'v0.17.55-bone.0-beta'),
     ]
     installFetchMock(async input => {
       requestedUrls.push(String(input))
@@ -88,10 +91,13 @@ describe('GitHub Release 双来源历史', () => {
     const requestedUrls: string[] = []
     const releases = [
       createRelease(1, 'v0.17.56-bone.1'),
-      createRelease(2, 'v0.17.56'),
-      createRelease(3, 'v0.17.55', { prerelease: true }),
-      createRelease(4, 'v0.17.54'),
-      createRelease(5, '0.17.53'),
+      createRelease(2, 'v00.17.57'),
+      createRelease(3, 'v0.017.57'),
+      createRelease(4, 'v0.17.057'),
+      createRelease(5, 'v0.17.56'),
+      createRelease(6, 'v0.17.55', { prerelease: true }),
+      createRelease(7, 'v0.17.54'),
+      createRelease(8, '0.17.53'),
     ]
     installFetchMock(async input => {
       requestedUrls.push(String(input))
@@ -144,8 +150,8 @@ describe('GitHub Release 双来源历史', () => {
           ),
         ])
       )
-      await listReleases({ source: 'bone' })
       await listReleases({ source: 'official' })
+      await listReleases({ source: 'bone' })
 
       now += 31 * 60 * 1000
       installFetchMock(async () => new Response(null, { status: 500 }))
