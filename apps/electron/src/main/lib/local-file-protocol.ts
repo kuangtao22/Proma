@@ -7,7 +7,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, read, realpathSync, statSync } from 'node:fs'
 import { extname, resolve, sep } from 'node:path'
 
 interface RegisteredEntry {
@@ -26,6 +26,8 @@ export interface PromaFileProtocolRegistryDependencies {
   now?: () => number
   /** realpath 校验后、no-follow 打开前调用，仅供稳定竞态测试。 */
   afterResolveBeforeOpen?: (targetPath: string) => void
+  /** 稳定 fd 打开后调用，仅供验证流取消与 HEAD 及时关闭。 */
+  onDescriptorOpened?: (descriptor: number) => void
 }
 
 function realpathExisting(path: string): string {
@@ -44,7 +46,8 @@ function isInsideDirectory(target: string, root: string): boolean {
 export interface PromaFileProtocolRegistry {
   registerFilePath: (path: string) => string
   registerDirectoryPath: (path: string) => string
-  retainPathUrl: (url: string) => void
+  registerRetainedDirectoryPaths: (paths: string[]) => string[]
+  retainPathUrl: (url: string) => boolean
   revokePathUrl: (url: string) => void
   handleRequest: (request: Request) => Promise<Response> | Response
 }
@@ -56,37 +59,39 @@ export function createPromaFileProtocolRegistry(
   /** 当前 registry 独占的授权 token 集合。 */
   const registeredEntries = new Map<string, RegisteredEntry>()
 
-  /** 注册新 token 前清理闲置过期和超过容量的最久未访问条目。 */
-  function pruneEntries(currentTime: number): void {
+  /** 清理普通闲置 token；retained token 只能显式释放。 */
+  function pruneExpiredEntries(currentTime: number): void {
     for (const [token, entry] of registeredEntries) {
       if (!entry.retained && currentTime - entry.lastAccessedAt >= ENTRY_TTL_MS) registeredEntries.delete(token)
     }
-    while (registeredEntries.size >= MAX_ENTRIES) {
-      /** 容量淘汰按实际最后访问时间，而不是最初插入顺序。 */
-      let oldestToken: string | undefined
-      let oldestAccess = Number.POSITIVE_INFINITY
-      for (const [token, entry] of registeredEntries) {
-        if (!entry.retained && entry.lastAccessedAt < oldestAccess) {
-          oldestAccess = entry.lastAccessedAt
-          oldestToken = token
-        }
-      }
-      if (!oldestToken) throw new Error('本地文件授权数量已达上限')
-      registeredEntries.delete(oldestToken)
-    }
   }
 
-  /** 注册单个已授权实际文件或目录。 */
-  function registerEntry(path: string, isDirectory: boolean): string {
+  /** 批量校验路径并原子预留容量，失败时不插入任何新 token。 */
+  function registerEntries(
+    inputs: Array<{ path: string, isDirectory: boolean }>,
+    retained: boolean,
+  ): string[] {
     const currentTime = (dependencies.now ?? Date.now)()
-    pruneEntries(currentTime)
-    const root = realpathExisting(path)
-    const st = statSync(root)
-    if (isDirectory && !st.isDirectory()) throw new Error(`不是目录: ${path}`)
-    if (!isDirectory && !st.isFile()) throw new Error(`不是文件: ${path}`)
-    const token = randomUUID()
-    registeredEntries.set(token, { root, isDirectory, lastAccessedAt: currentTime, retained: false })
-    return `proma-file://${token}`
+    /** 全部路径先验证，第二项非法时不得污染 registry。 */
+    const validated = inputs.map(({ path, isDirectory }) => {
+      const root = realpathExisting(path)
+      const st = statSync(root)
+      if (isDirectory && !st.isDirectory()) throw new Error(`不是目录: ${path}`)
+      if (!isDirectory && !st.isFile()) throw new Error(`不是文件: ${path}`)
+      return { root, isDirectory }
+    })
+    pruneExpiredEntries(currentTime)
+    const evictionCount = Math.max(0, registeredEntries.size + validated.length - MAX_ENTRIES)
+    const evictable = [...registeredEntries.entries()]
+      .filter(([, entry]) => !entry.retained)
+      .sort((left, right) => left[1].lastAccessedAt - right[1].lastAccessedAt)
+    if (evictable.length < evictionCount) throw new Error('本地文件授权数量已达上限')
+    for (const [token] of evictable.slice(0, evictionCount)) registeredEntries.delete(token)
+    return validated.map(({ root, isDirectory }) => {
+      const token = randomUUID()
+      registeredEntries.set(token, { root, isDirectory, lastAccessedAt: currentTime, retained })
+      return `proma-file://${token}`
+    })
   }
 
   /** 显式释放单个 opaque URL。 */
@@ -102,16 +107,18 @@ export function createPromaFileProtocolRegistry(
   }
 
   /** 将普通滑动 TTL token 提升为显式 release 前持续有效的 lease。 */
-  function retainPathUrl(url: string): void {
+  function retainPathUrl(url: string): boolean {
     let parsed: URL
     try {
       parsed = new URL(url)
     } catch {
-      return
+      return false
     }
-    if (parsed.protocol !== 'proma-file:') return
+    if (parsed.protocol !== 'proma-file:') return false
     const entry = registeredEntries.get(parsed.hostname)
-    if (entry) entry.retained = true
+    if (!entry) return false
+    entry.retained = true
+    return true
   }
 
   /** 解析并读取单个已授权请求，在成功交给 fetch 前续期 token。 */
@@ -162,21 +169,41 @@ export function createPromaFileProtocolRegistry(
     let descriptor: number | null = null
     try {
       descriptor = openSync(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+      dependencies.onDescriptorOpened?.(descriptor)
       const openedStat = fstatSync(descriptor)
       if (!openedStat.isFile() || openedStat.dev !== pathStat.dev || openedStat.ino !== pathStat.ino) {
         return new Response('Forbidden', { status: 403 })
       }
-      const bytes = readFileSync(descriptor)
-      const finalStat = fstatSync(descriptor)
-      if (finalStat.dev !== openedStat.dev
-        || finalStat.ino !== openedStat.ino
-        || finalStat.size !== openedStat.size
-        || bytes.byteLength !== openedStat.size) {
-        return new Response('Forbidden', { status: 403 })
+      const range = parseByteRange(request.headers.get('range'), openedStat.size)
+      if (range === 'unsatisfiable') {
+        closeSync(descriptor)
+        descriptor = null
+        return new Response(null, {
+          status: 416,
+          headers: { 'accept-ranges': 'bytes', 'content-range': `bytes */${openedStat.size}` },
+        })
       }
-      /** 只有完整读取稳定 fd 的有效请求才刷新滑动 TTL。 */
+      const start = range?.start ?? 0
+      const end = range?.end ?? openedStat.size - 1
+      const contentLength = Math.max(0, end - start + 1)
+      const headers = new Headers({
+        'accept-ranges': 'bytes',
+        'content-length': String(contentLength),
+        'content-type': contentTypeForPath(target),
+      })
+      if (range) headers.set('content-range', `bytes ${start}-${end}/${openedStat.size}`)
+      const status = range ? 206 : 200
       entry.lastAccessedAt = currentTime
-      return new Response(bytes, { headers: { 'content-type': contentTypeForPath(target) } })
+      if (request.method === 'HEAD') {
+        closeSync(descriptor)
+        descriptor = null
+        return new Response(null, { status, headers })
+      }
+      /** Response 只消费已验证 fd，取消或读完时由 stream 精确关闭句柄。 */
+      const body = createDescriptorStream(descriptor, start, end)
+      const response = new Response(body, { status, headers })
+      descriptor = null
+      return response
     } catch {
       return new Response('Forbidden', { status: 403 })
     } finally {
@@ -185,12 +212,90 @@ export function createPromaFileProtocolRegistry(
   }
 
   return {
-    registerFilePath: (path) => registerEntry(path, false),
-    registerDirectoryPath: (path) => registerEntry(path, true),
+    registerFilePath: (path) => registerEntries([{ path, isDirectory: false }], false)[0]!,
+    registerDirectoryPath: (path) => registerEntries([{ path, isDirectory: true }], false)[0]!,
+    registerRetainedDirectoryPaths: (paths) => registerEntries(
+      paths.map((path) => ({ path, isDirectory: true })),
+      true,
+    ),
     retainPathUrl,
     revokePathUrl,
     handleRequest,
   }
+}
+
+interface ByteRange {
+  start: number
+  end: number
+}
+
+/** 解析单段 HTTP bytes Range；格式无效或无法满足时统一返回 416。 */
+function parseByteRange(header: string | null, size: number): ByteRange | 'unsatisfiable' | undefined {
+  if (!header) return undefined
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim())
+  if (!match || size === 0) return 'unsatisfiable'
+  const [, rawStart, rawEnd] = match
+  if (!rawStart && !rawEnd) return 'unsatisfiable'
+  if (!rawStart) {
+    const suffixLength = Number(rawEnd)
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return 'unsatisfiable'
+    return { start: Math.max(0, size - suffixLength), end: size - 1 }
+  }
+  const start = Number(rawStart)
+  const requestedEnd = rawEnd ? Number(rawEnd) : size - 1
+  if (!Number.isSafeInteger(start)
+    || !Number.isSafeInteger(requestedEnd)
+    || start < 0
+    || start >= size
+    || requestedEnd < start) return 'unsatisfiable'
+  return { start, end: Math.min(requestedEnd, size - 1) }
+}
+
+/** 从已验证 fd 分块创建 Web ReadableStream，完成、错误或取消均幂等关闭。 */
+function createDescriptorStream(descriptor: number, start: number, end: number): ReadableStream<Uint8Array> {
+  /** 下一次分块读取的绝对文件偏移。 */
+  let position = start
+  /** fd 只能由一个终止路径关闭一次。 */
+  let closed = false
+  const closeDescriptor = (): void => {
+    if (closed) return
+    closed = true
+    closeSync(descriptor)
+  }
+  return new ReadableStream<Uint8Array>({
+    pull: (controller) => new Promise<void>((resolvePull) => {
+      const remaining = end - position + 1
+      if (remaining <= 0) {
+        closeDescriptor()
+        controller.close()
+        resolvePull()
+        return
+      }
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, remaining))
+      read(descriptor, chunk, 0, chunk.byteLength, position, (error, bytesRead) => {
+        /** cancel 可能与异步 read 同时发生；关闭后不得再写入已取消 controller。 */
+        if (closed) {
+          resolvePull()
+          return
+        }
+        if (error || bytesRead === 0) {
+          closeDescriptor()
+          if (error) controller.error(error)
+          else controller.error(new Error('本地媒体文件读取期间被截断'))
+          resolvePull()
+          return
+        }
+        position += bytesRead
+        controller.enqueue(chunk.subarray(0, bytesRead))
+        if (position > end) {
+          closeDescriptor()
+          controller.close()
+        }
+        resolvePull()
+      })
+    }),
+    cancel: () => closeDescriptor(),
+  })
 }
 
 /** 生产进程共享的默认本地文件授权 registry。 */
@@ -218,9 +323,14 @@ export function registerPromaDirectoryPath(path: string): string {
   return defaultRegistry.registerDirectoryPath(path)
 }
 
+/** 原子注册并 retain 多个 Design 媒体目录，容量不足时一个 token 都不创建。 */
+export function registerRetainedPromaDirectoryPaths(paths: string[]): string[] {
+  return defaultRegistry.registerRetainedDirectoryPaths(paths)
+}
+
 /** 将默认 registry 中的 token 提升为显式 release 生命周期。 */
-export function retainPromaPathUrl(url: string): void {
-  defaultRegistry.retainPathUrl(url)
+export function retainPromaPathUrl(url: string): boolean {
+  return defaultRegistry.retainPathUrl(url)
 }
 
 /**

@@ -1,20 +1,14 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { fstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-mock.module('electron', () => ({
-  net: {
-    fetch: async (url: string) => new Response(url, { status: 200 }),
-  },
-}))
-
-const {
+import {
   createPromaFileProtocolRegistry,
   handlePromaFileRequest,
   registerPromaDirectoryPath,
   revokePromaPathUrl,
-} = await import('./local-file-protocol')
+} from './local-file-protocol'
 
 describe('proma-file 目录授权', () => {
   /** 授权目录的隔离根。 */
@@ -41,6 +35,74 @@ describe('proma-file 目录授权', () => {
 
     expect(response.status).toBe(200)
     expect(await response.text()).toBe('preview')
+  })
+
+  test('Given 单段 Range When 读取媒体 Then 从稳定 fd 流式返回 206 与精确区间', async () => {
+    writeFileSync(join(root, 'preview.webp'), '0123456789', 'utf8')
+    const registry = createPromaFileProtocolRegistry({ now: () => 0 })
+    const baseUrl = registry.registerDirectoryPath(root)
+
+    const response = await registry.handleRequest(new Request(`${baseUrl}/preview.webp`, {
+      headers: { Range: 'bytes=2-5' },
+    }))
+
+    expect(response.status).toBe(206)
+    expect(response.headers.get('content-range')).toBe('bytes 2-5/10')
+    expect(response.headers.get('content-length')).toBe('4')
+    expect(response.headers.get('accept-ranges')).toBe('bytes')
+    expect(await response.text()).toBe('2345')
+  })
+
+  test('Given Range 起点越过文件末尾 When 读取媒体 Then 返回 416 与完整大小', async () => {
+    writeFileSync(join(root, 'preview.webp'), 'preview', 'utf8')
+    const registry = createPromaFileProtocolRegistry({ now: () => 0 })
+    const baseUrl = registry.registerDirectoryPath(root)
+
+    const response = await registry.handleRequest(new Request(`${baseUrl}/preview.webp`, {
+      headers: { Range: 'bytes=99-' },
+    }))
+
+    expect(response.status).toBe(416)
+    expect(response.headers.get('content-range')).toBe('bytes */7')
+    expect(await response.text()).toBe('')
+  })
+
+  test('Given HEAD 请求 When 读取媒体 Then 只返回完整响应头并立即关闭 fd', async () => {
+    writeFileSync(join(root, 'preview.webp'), 'preview', 'utf8')
+    /** 捕获协议稳定打开的 descriptor，验证 HEAD 不把句柄留给空 body。 */
+    let openedDescriptor: number | undefined
+    const registry = createPromaFileProtocolRegistry({
+      now: () => 0,
+      onDescriptorOpened: (descriptor) => { openedDescriptor = descriptor },
+    })
+    const baseUrl = registry.registerDirectoryPath(root)
+
+    const response = await registry.handleRequest(new Request(`${baseUrl}/preview.webp`, { method: 'HEAD' }))
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-length')).toBe('7')
+    expect(response.body).toBeNull()
+    expect(() => fstatSync(openedDescriptor!)).toThrow()
+  })
+
+  test('Given 流式响应尚未读完 When 取消 body Then 立即关闭稳定 fd', async () => {
+    writeFileSync(join(root, 'large.webp'), Buffer.alloc(1024 * 1024, 1))
+    /** 捕获稳定 fd，取消后 EBADF 证明没有句柄泄漏。 */
+    let openedDescriptor: number | undefined
+    const registry = createPromaFileProtocolRegistry({
+      now: () => 0,
+      onDescriptorOpened: (descriptor) => { openedDescriptor = descriptor },
+    })
+    const baseUrl = registry.registerDirectoryPath(root)
+    const response = await registry.handleRequest(new Request(`${baseUrl}/large.webp`))
+    const reader = response.body!.getReader()
+
+    expect(() => fstatSync(openedDescriptor!)).not.toThrow()
+    const firstChunk = await reader.read()
+    expect(firstChunk.done).toBe(false)
+    await reader.cancel()
+
+    expect(() => fstatSync(openedDescriptor!)).toThrow()
   })
 
   test('Given 已释放目录授权 When 再次读取 Then 返回 404', async () => {
@@ -189,5 +251,24 @@ describe('proma-file 目录授权', () => {
     for (let index = 1; index <= 500; index += 1) registry.registerFilePath(join(root, 'preview.webp'))
 
     expect((await registry.handleRequest(new Request(firstUrl))).status).toBe(404)
+  })
+
+  test('Given 已有 499 个 retained token When 原子注册两个目录 Then 全部失败且不遗留半个 token', async () => {
+    const registry = createPromaFileProtocolRegistry({ now: () => 0 })
+    writeFileSync(join(root, 'preview.webp'), 'preview', 'utf8')
+    writeFileSync(join(outsideRoot, 'thumbnail.webp'), 'thumbnail', 'utf8')
+    const registerRetained = registry.registerRetainedDirectoryPaths
+    const retainedUrls: string[] = []
+    for (let index = 0; index < 499; index += 1) {
+      retainedUrls.push(registerRetained([root])[0]!)
+    }
+
+    expect(() => registerRetained([root, outsideRoot])).toThrow('本地文件授权数量已达上限')
+    registry.revokePathUrl(retainedUrls[0]!)
+    const [assetUrl, thumbnailUrl] = registerRetained([root, outsideRoot])
+
+    expect((await registry.handleRequest(new Request(`${assetUrl}/preview.webp`))).status).toBe(200)
+    expect((await registry.handleRequest(new Request(`${thumbnailUrl}/thumbnail.webp`))).status).toBe(200)
+    expect(registry.retainPathUrl('proma-file://missing-token')).toBe(false)
   })
 })

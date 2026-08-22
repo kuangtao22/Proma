@@ -72,10 +72,12 @@ export interface DesignAssetServiceDependencies {
   runWorkspaceWrite: <T>(projectId: string, effect: () => T) => T
   /** 为 renderer 注册单个受信任目录授权。 */
   registerDirectoryPath: (directoryPath: string) => string
+  /** 原子注册并 retain 一组 Design 媒体目录。 */
+  registerRetainedDirectoryPaths?: (directoryPaths: string[]) => string[]
   /** 显式释放之前注册的 opaque URL。 */
   revokePathUrl: (url: string) => void
   /** 将 Design 媒体 token 固定到显式 release 生命周期。 */
-  retainPathUrl?: (url: string) => void
+  retainPathUrl?: (url: string) => boolean
   /** 删除提交后文件清理失败时记录告警。 */
   warn?: (message: string) => void
   /** 跨卷提升的窄文件系统依赖，仅用于稳定故障测试。 */
@@ -132,6 +134,8 @@ export interface DesignFilePromotionDependencies {
   removeFile?: (filePath: string) => void
   /** 生成目标卷临时文件随机叶子。 */
   createRandomId?: () => string
+  /** 清理未提交文件或目录；测试可稳定注入删除失败。 */
+  cleanupPath?: (path: string) => void
 }
 
 /** 已完成验证、位于批次 staging 中的单个素材。 */
@@ -141,7 +145,18 @@ interface StagedAsset {
   stagedThumbnailPath: string
   finalAssetPath: string
   finalThumbnailPath: string
+  assetPromotionTemporaryPath: string
+  thumbnailPromotionTemporaryPath: string
 }
+
+/** promotion 回滚时需要逐项确认不存在的受管路径。 */
+interface PromotionCleanupTarget {
+  path: string
+  label: string
+}
+
+/** relink 元数据落盘后的可确认状态。 */
+type RelinkMetadataState = 'committed' | 'rolled-back' | 'unknown'
 
 /** 已验证图片的媒体类型、规范扩展名和尺寸。 */
 interface ValidatedImage {
@@ -168,11 +183,14 @@ function createDesignAssetImportBatch(
 
 /** 跨崩溃恢复正式文件 promotion 的最小 journal。 */
 interface PromotionJournal {
-  schemaVersion: 1
+  schemaVersion: 1 | 2
   projectId: string
   runtimeId: string
   assetNames: string[]
   thumbnailNames: string[]
+  stagingDirectoryName?: string
+  assetTemporaryNames?: string[]
+  thumbnailTemporaryNames?: string[]
   createdAt: number
 }
 
@@ -184,12 +202,70 @@ function isMissingPathError(error: unknown): boolean {
 }
 
 /** 清理尚未提交的 staging 或回滚文件，不覆盖原始业务错误。 */
-function removeUncommittedPath(path: string): void {
+function removeUncommittedPath(path: string, cleanupPath?: (path: string) => void): boolean {
   try {
-    rmSync(path, { recursive: true, force: true })
+    if (cleanupPath) cleanupPath(path)
+    else rmSync(path, { recursive: true, force: true })
+    return !existsSync(path)
   } catch {
     // 未提交缓存可由启动清理重建，不能掩盖实际导入错误。
+    return false
   }
+}
+
+/**
+ * 构建 promotion 的统一清理清单。
+ * @param stagedAssets 本批次已完成 staging 的素材。
+ * @param batchDirectory 本批次独占 staging 目录。
+ * @param includePromotedFiles 是否同时清理可能已暴露的正式文件。
+ * @returns 按正式文件、跨卷临时文件、staging 排列的清理目标。
+ */
+function createPromotionCleanupTargets(
+  stagedAssets: StagedAsset[],
+  batchDirectory: string,
+  includePromotedFiles: boolean,
+): PromotionCleanupTarget[] {
+  return [
+    ...stagedAssets.flatMap((staged) => [
+      ...(includePromotedFiles ? [
+        { path: staged.finalAssetPath, label: '正式原图' },
+        { path: staged.finalThumbnailPath, label: '正式缩略图' },
+      ] : []),
+      { path: staged.assetPromotionTemporaryPath, label: '跨卷临时原图' },
+      { path: staged.thumbnailPromotionTemporaryPath, label: '跨卷临时缩略图' },
+    ]),
+    { path: batchDirectory, label: 'staging' },
+  ]
+}
+
+/**
+ * 清理 promotion 路径并逐项确认磁盘事实，任何失败只告警。
+ * @param targets 需要清理并确认不存在的受管路径。
+ * @param cleanupPath 可注入的底层清理实现。
+ * @param warn 清理失败告警函数。
+ * @returns 所有目标均已确认不存在时返回 true。
+ */
+function cleanupPromotionTargets(
+  targets: PromotionCleanupTarget[],
+  cleanupPath: ((path: string) => void) | undefined,
+  warn: (message: string) => void,
+): boolean {
+  let cleanupComplete = true
+  for (const target of targets) {
+    if (removeUncommittedPath(target.path, cleanupPath)) continue
+    cleanupComplete = false
+    warn(`Design promotion ${target.label} 清理失败: ${target.path}`)
+  }
+  return cleanupComplete && targets.every((target) => !existsSync(target.path))
+}
+
+/**
+ * 判断 relink 元数据状态是否足以安全消费 journal。
+ * @param state mutate 及磁盘重载共同确认的元数据状态。
+ * @returns 已提交或已回滚时返回 true，未知状态返回 false。
+ */
+function isKnownRelinkMetadataState(state: RelinkMetadataState): boolean {
+  return state !== 'unknown'
 }
 
 /** 返回项目 promotion journal 的缓存目录。 */
@@ -202,18 +278,23 @@ function writePromotionJournal(
   paths: DesignPaths,
   projectId: string,
   runtimeId: string,
+  batchDirectory: string,
   stagedAssets: StagedAsset[],
   createdAt: number,
+  existingJournalPath?: string,
 ): string {
   const directoryPath = promotionJournalDirectory(paths)
   mkdirSync(directoryPath, { recursive: true })
-  const journalPath = join(directoryPath, `promotion-${randomUUID()}.json`)
+  const journalPath = existingJournalPath ?? join(directoryPath, `promotion-${randomUUID()}.json`)
   const journal: PromotionJournal = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     projectId,
     runtimeId,
     assetNames: stagedAssets.map((item) => basename(item.finalAssetPath)),
     thumbnailNames: stagedAssets.map((item) => basename(item.finalThumbnailPath)),
+    stagingDirectoryName: basename(batchDirectory),
+    assetTemporaryNames: stagedAssets.map((item) => basename(item.assetPromotionTemporaryPath)),
+    thumbnailTemporaryNames: stagedAssets.map((item) => basename(item.thumbnailPromotionTemporaryPath)),
     createdAt,
   }
   writeJsonFileAtomicSecure(journalPath, journal)
@@ -241,12 +322,24 @@ function parsePromotionJournal(raw: string, projectId: string): PromotionJournal
   const record = value as Partial<PromotionJournal>
   const isSafeNames = (names: unknown): names is string[] => Array.isArray(names)
     && names.every((name) => typeof name === 'string' && basename(name) === name && name.length > 0)
-  if (record.schemaVersion !== 1
+  if ((record.schemaVersion !== 1 && record.schemaVersion !== 2)
     || record.projectId !== projectId
     || typeof record.runtimeId !== 'string'
     || typeof record.createdAt !== 'number'
     || !isSafeNames(record.assetNames)
     || !isSafeNames(record.thumbnailNames)) return undefined
+  if (record.schemaVersion === 2) {
+    const safeStagingName = typeof record.stagingDirectoryName === 'string'
+      && basename(record.stagingDirectoryName) === record.stagingDirectoryName
+      && (record.stagingDirectoryName.startsWith('import-') || record.stagingDirectoryName.startsWith('relink-'))
+    const safeTemporaryNames = (names: unknown): names is string[] => isSafeNames(names)
+      && names.every((name) => name.startsWith('.proma-promote-') && name.endsWith('.tmp'))
+    if (!safeStagingName
+      || !safeTemporaryNames(record.assetTemporaryNames)
+      || !safeTemporaryNames(record.thumbnailTemporaryNames)
+      || record.assetTemporaryNames.length !== record.assetNames.length
+      || record.thumbnailTemporaryNames.length !== record.thumbnailNames.length) return undefined
+  }
   return record as PromotionJournal
 }
 
@@ -296,11 +389,13 @@ function readStableFileBytes(filePath: string): Buffer {
  * @param sourcePath 已完成生成和校验的 staging 普通文件。
  * @param targetPath 位于正式目录、尚不存在的随机目标路径。
  * @param dependencies 可替换的 rename、删除和随机 ID 依赖。
+ * @param preparedTemporaryTargetPath journal 已记录的目标卷临时路径。
  */
 export function promoteStagedFile(
   sourcePath: string,
   targetPath: string,
   dependencies: DesignFilePromotionDependencies = {},
+  preparedTemporaryTargetPath?: string,
 ): void {
   const renameFile = dependencies.renameFile ?? renameSync
   const removeFile = dependencies.removeFile ?? removeFileAtomic
@@ -314,7 +409,13 @@ export function promoteStagedFile(
   }
 
   /** 跨卷复制只写入目标父目录内不可预测且独占的临时叶子。 */
-  const temporaryTargetPath = join(dirname(targetPath), `.proma-promote-${createRandomId()}.tmp`)
+  const temporaryTargetPath = preparedTemporaryTargetPath
+    ?? join(dirname(targetPath), `.proma-promote-${createRandomId()}.tmp`)
+  if (dirname(temporaryTargetPath) !== dirname(targetPath)
+    || !basename(temporaryTargetPath).startsWith('.proma-promote-')
+    || !basename(temporaryTargetPath).endsWith('.tmp')) {
+    throw new Error('Design 跨卷临时路径不在正式目标目录')
+  }
   try {
     /** staging 源通过稳定句柄读取，复制期间不会跟随叶子符号链接。 */
     const sourceBytes = readStableFileBytes(sourcePath)
@@ -347,7 +448,9 @@ export function promoteStagedFile(
       throw error
     }
   } finally {
-    if (existsSync(temporaryTargetPath)) removeUncommittedPath(temporaryTargetPath)
+    if (existsSync(temporaryTargetPath)) {
+      removeUncommittedPath(temporaryTargetPath, dependencies.cleanupPath)
+    }
   }
 }
 
@@ -515,6 +618,8 @@ async function stageAsset(
     stagedThumbnailPath,
     finalAssetPath: join(paths.assetsDir, assetDiskName),
     finalThumbnailPath: join(paths.thumbnailsDir, thumbnailDiskName),
+    assetPromotionTemporaryPath: join(paths.assetsDir, `.proma-promote-${randomUUID()}.tmp`),
+    thumbnailPromotionTemporaryPath: join(paths.thumbnailsDir, `.proma-promote-${randomUUID()}.tmp`),
   }
 }
 
@@ -524,10 +629,12 @@ export class DesignAssetService {
   private readonly now: () => number
   /** 目录级媒体注册函数。 */
   private readonly registerDirectoryPath: (directoryPath: string) => string
+  /** 两目录原子注册函数，容量不足时不得返回部分 token。 */
+  private readonly registerRetainedDirectoryPaths: (directoryPaths: string[]) => string[]
   /** opaque 媒体授权释放函数。 */
   private readonly revokePathUrl: (url: string) => void
   /** Design 目录授权的显式 lease 保留函数。 */
-  private readonly retainPathUrl: (url: string) => void
+  private readonly retainPathUrl: (url: string) => boolean
   /** 删除文件失败后的告警函数。 */
   private readonly warn: (message: string) => void
   /** 进程级图片资源队列。 */
@@ -540,6 +647,8 @@ export class DesignAssetService {
     this.registerDirectoryPath = dependencies.registerDirectoryPath
     this.revokePathUrl = dependencies.revokePathUrl
     this.retainPathUrl = dependencies.retainPathUrl ?? retainPromaPathUrl
+    this.registerRetainedDirectoryPaths = dependencies.registerRetainedDirectoryPaths
+      ?? ((directoryPaths) => this.registerAndRetainDirectoryPaths(directoryPaths))
     this.warn = dependencies.warn ?? console.warn
     this.processingQueue = dependencies.processingQueue ?? defaultProcessingQueue
     this.runtimeId = dependencies.runtimeId ?? randomUUID()
@@ -569,28 +678,48 @@ export class DesignAssetService {
       /** 每次导入使用独占批次目录，失败可整体清理。 */
       const paths = this.dependencies.pathResolver.resolve(projectId)
       const batchDirectory = join(paths.stagingDir, `import-${randomUUID()}`)
-      /** 批次目录名不可预测，且父 staging 已由 store 安全验证。 */
-      mkdirSync(batchDirectory)
       /** 全部验证并完成缩略图的 staging 结果。 */
       const stagedAssets: StagedAsset[] = []
-      /** 已移动到正式目录的路径，用于罕见 rename 中途失败回滚。 */
-      const committedPaths: string[] = []
       /** staging 全部成功后、任何正式文件可见前写入恢复 journal。 */
       let journalPath: string | undefined
       try {
+        /** 先记录 staging 目录，进程在图片验证中崩溃也可由下一实例清理。 */
+        journalPath = writePromotionJournal(
+          paths,
+          projectId,
+          this.runtimeId,
+          batchDirectory,
+          [],
+          this.now(),
+        )
+        /** journal 先于目录可见，消除 mkdir 后、恢复记录前的崩溃窗口。 */
+        mkdirSync(batchDirectory)
         for (const sourcePath of sourcePaths) {
           stagedAssets.push(await stageAsset(paths, batchDirectory, sourcePath, source, this.now))
         }
-        journalPath = writePromotionJournal(paths, projectId, this.runtimeId, stagedAssets, this.now())
+        /** promotion 前补齐正式叶子和目标卷临时叶子。 */
+        journalPath = writePromotionJournal(
+          paths,
+          projectId,
+          this.runtimeId,
+          batchDirectory,
+          stagedAssets,
+          this.now(),
+          journalPath,
+        )
         for (const staged of stagedAssets) {
-          promoteStagedFile(staged.stagedAssetPath, staged.finalAssetPath, this.dependencies.filePromotion)
-          committedPaths.push(staged.finalAssetPath)
+          promoteStagedFile(
+            staged.stagedAssetPath,
+            staged.finalAssetPath,
+            this.dependencies.filePromotion,
+            staged.assetPromotionTemporaryPath,
+          )
           promoteStagedFile(
             staged.stagedThumbnailPath,
             staged.finalThumbnailPath,
             this.dependencies.filePromotion,
+            staged.thumbnailPromotionTemporaryPath,
           )
-          committedPaths.push(staged.finalThumbnailPath)
         }
         /** 返回给 IPC 的素材数组仍保持普通数组语义。 */
         const assets = stagedAssets.map((item) => item.asset)
@@ -598,6 +727,15 @@ export class DesignAssetService {
         let settled = false
         const commit = (): void => {
           if (settled || !journalPath) return
+          /** commit 只清理可重建的跨卷临时文件与 staging，不触碰已被元数据引用的正式文件。 */
+          const cleanupTargets = createPromotionCleanupTargets(stagedAssets, batchDirectory, false)
+          /** 任一瞬态路径未确认删除时保留 journal，供新 runtime 继续恢复。 */
+          const cleanupComplete = cleanupPromotionTargets(
+            cleanupTargets,
+            this.dependencies.filePromotion?.cleanupPath,
+            this.warn,
+          )
+          if (!cleanupComplete) return
           try {
             removePromotionJournal(journalPath)
             settled = true
@@ -616,24 +754,36 @@ export class DesignAssetService {
             return
           }
           /** 只有未被当前画布精确引用的文件才允许删除。 */
-          let rollbackComplete = true
+          const unreferencedStagedAssets: StagedAsset[] = []
+          /** 即时可读引用不证明目录 durability，存在引用时必须保留 journal 到下一进程。 */
+          let hasPersistedReference = false
           for (const staged of stagedAssets) {
             const referenced = persistedAssets.some((asset) => (
               asset.id === staged.asset.id
               && asset.relativePath === staged.asset.relativePath
               && asset.thumbnailRelativePath === staged.asset.thumbnailRelativePath
             ))
-            if (referenced) continue
-            for (const filePath of [staged.finalAssetPath, staged.finalThumbnailPath]) {
-              try {
-                rmSync(filePath, { force: true })
-              } catch (error) {
-                rollbackComplete = false
-                this.warn(`Design promotion 回滚文件失败: ${filePath}: ${String(error)}`)
-              }
+            if (referenced) {
+              hasPersistedReference = true
+              continue
             }
+            unreferencedStagedAssets.push(staged)
           }
-          if (!rollbackComplete) return
+          /** rollback 清理所有瞬态路径，并仅加入磁盘未引用素材的正式文件。 */
+          const cleanupTargets = [
+            ...unreferencedStagedAssets.flatMap((staged) => [
+              { path: staged.finalAssetPath, label: '正式原图' },
+              { path: staged.finalThumbnailPath, label: '正式缩略图' },
+            ]),
+            ...createPromotionCleanupTargets(stagedAssets, batchDirectory, false),
+          ]
+          /** 路径清理不完整或存在即时引用时都保留 journal，等待跨进程磁盘事实确认。 */
+          const cleanupComplete = cleanupPromotionTargets(
+            cleanupTargets,
+            this.dependencies.filePromotion?.cleanupPath,
+            this.warn,
+          )
+          if (!cleanupComplete || hasPersistedReference) return
           try {
             removePromotionJournal(journalPath)
             settled = true
@@ -643,13 +793,25 @@ export class DesignAssetService {
         }
         return createDesignAssetImportBatch(assets, commit, rollback)
       } catch (error) {
-        for (const committedPath of committedPaths) removeUncommittedPath(committedPath)
-        if (journalPath && committedPaths.every((filePath) => !existsSync(filePath))) {
-          removePromotionJournal(journalPath)
+        /** 异常回滚必须覆盖 journal 中所有 final/temp/staging，并逐项确认磁盘已不存在。 */
+        const cleanupTargets = createPromotionCleanupTargets(stagedAssets, batchDirectory, true)
+        /** 只有所有路径均确认不存在，才允许消费恢复 journal。 */
+        const cleanupComplete = cleanupPromotionTargets(
+          cleanupTargets,
+          this.dependencies.filePromotion?.cleanupPath,
+          this.warn,
+        )
+        if (journalPath && cleanupComplete) {
+          try {
+            removePromotionJournal(journalPath)
+          } catch (cleanupError) {
+            /** journal 删除失败也不能覆盖原始导入错误。 */
+            this.warn(`Design promotion journal 延迟清理: ${journalPath}: ${String(cleanupError)}`)
+          }
         }
         throw error
       } finally {
-        removeUncommittedPath(batchDirectory)
+        removeUncommittedPath(batchDirectory, this.dependencies.filePromotion?.cleanupPath)
       }
       })
     })
@@ -711,16 +873,33 @@ export class DesignAssetService {
       if (!existing) throw new Error(`素材不存在: ${assetId}`)
       const paths = this.dependencies.pathResolver.resolve(projectId)
       const batchDirectory = join(paths.stagingDir, `relink-${randomUUID()}`)
-      mkdirSync(batchDirectory)
       /** 新内容用普通 staging 流程验证，但最终仍保留旧业务 ID 和来源关系。 */
       let staged: StagedAsset | undefined
-      /** 只有画布元数据提交成功后，新正式文件才不应被失败回滚删除。 */
-      let metadataCommitted = false
+      /** 元数据磁盘结果三态；unknown 必须保留新文件与 journal 等待恢复。 */
+      let metadataState: RelinkMetadataState = 'rolled-back'
       /** 重新定位 promotion 的恢复 journal。 */
       let journalPath: string | undefined
       try {
+        journalPath = writePromotionJournal(
+          paths,
+          projectId,
+          this.runtimeId,
+          batchDirectory,
+          [],
+          this.now(),
+        )
+        /** journal 先于目录可见，确保 relink staging 也可跨进程恢复。 */
+        mkdirSync(batchDirectory)
         staged = await stageAsset(paths, batchDirectory, sourcePath, { kind: 'picker' }, this.now)
-        journalPath = writePromotionJournal(paths, projectId, this.runtimeId, [staged], this.now())
+        journalPath = writePromotionJournal(
+          paths,
+          projectId,
+          this.runtimeId,
+          batchDirectory,
+          [staged],
+          this.now(),
+          journalPath,
+        )
         const relinked: DesignAsset = {
           ...existing,
           filename: staged.asset.filename,
@@ -732,11 +911,17 @@ export class DesignAssetService {
           byteSize: staged.asset.byteSize,
           sha256: staged.asset.sha256,
         }
-        promoteStagedFile(staged.stagedAssetPath, staged.finalAssetPath, this.dependencies.filePromotion)
+        promoteStagedFile(
+          staged.stagedAssetPath,
+          staged.finalAssetPath,
+          this.dependencies.filePromotion,
+          staged.assetPromotionTemporaryPath,
+        )
         promoteStagedFile(
           staged.stagedThumbnailPath,
           staged.finalThumbnailPath,
           this.dependencies.filePromotion,
+          staged.thumbnailPromotionTemporaryPath,
         )
         /** 文件就位后提交引用；冲突时删除新文件，旧元数据保持不变。 */
         let document: DesignCanvasDocument
@@ -745,17 +930,19 @@ export class DesignAssetService {
             type: 'upsert-assets',
             assets: [relinked],
           }])
-          metadataCommitted = true
+          metadataState = 'committed'
         } catch (error) {
           /** mutate 可能已 rename JSON、仅在目录 durability 同步时失败；重载确认引用后保留新文件。 */
           try {
             const persisted = this.dependencies.store.load(projectId).document
             const persistedAsset = persisted.assets.find((item) => item.id === assetId)
-            metadataCommitted = persistedAsset?.relativePath === relinked.relativePath
+            metadataState = persistedAsset?.relativePath === relinked.relativePath
               && persistedAsset.thumbnailRelativePath === relinked.thumbnailRelativePath
+              ? 'committed'
+              : 'rolled-back'
           } catch {
-            /** 无法确认磁盘提交状态时 fail safe 保留文件，避免合法 revision 指向缺失素材。 */
-            metadataCommitted = true
+            /** 无法确认磁盘提交状态时保留文件与 journal，由下一进程按磁盘事实恢复。 */
+            metadataState = 'unknown'
           }
           throw error
         }
@@ -772,25 +959,27 @@ export class DesignAssetService {
         }
         return document
       } finally {
-        /** rename 或 revision 提交任一步失败，都不得在正式目录留下孤儿文件。 */
-        if (staged && !metadataCommitted) {
-          removeUncommittedPath(staged.finalAssetPath)
-          removeUncommittedPath(staged.finalThumbnailPath)
-        }
-        if (journalPath && metadataCommitted) {
+        /** rolled-back 必须清理正式文件；committed/unknown 仅清理可重建的瞬态路径。 */
+        const cleanupTargets = createPromotionCleanupTargets(
+          staged ? [staged] : [],
+          batchDirectory,
+          metadataState === 'rolled-back',
+        )
+        /** 清理失败不得覆盖 relink 的原始业务异常。 */
+        const cleanupComplete = cleanupPromotionTargets(
+          cleanupTargets,
+          this.dependencies.filePromotion?.cleanupPath,
+          this.warn,
+        )
+        /** unknown 状态始终保留 journal，由新 runtime 根据磁盘引用恢复。 */
+        if (journalPath && isKnownRelinkMetadataState(metadataState) && cleanupComplete) {
           try {
             removePromotionJournal(journalPath)
-            journalPath = undefined
           } catch (error) {
-            /** journal 可由下次恢复安全重试，不应覆盖已完成的素材元数据提交。 */
-            this.warn(`Design promotion journal 删除失败: ${journalPath}: ${String(error)}`)
+            /** journal 删除失败只告警，不反向改写元数据或原始 relink 结果。 */
+            this.warn(`Design promotion journal 延迟清理: ${journalPath}: ${String(error)}`)
           }
         }
-        if (journalPath
-          && (!staged || [staged.finalAssetPath, staged.finalThumbnailPath].every((path) => !existsSync(path)))) {
-          removePromotionJournal(journalPath)
-        }
-        removeUncommittedPath(batchDirectory)
       }
       })
     })
@@ -818,15 +1007,44 @@ export class DesignAssetService {
         for (const assetName of journal.assetNames) {
           if (referencedAssets.has(assetName)) continue
           try { removeFileAtomic(join(paths.assetsDir, assetName)) } catch (error) {
-            recovered = false
-            this.warn(`Design promotion 孤儿清理失败: ${assetName}: ${String(error)}`)
+            if (!isMissingPathError(error)) {
+              recovered = false
+              this.warn(`Design promotion 孤儿清理失败: ${assetName}: ${String(error)}`)
+            }
           }
         }
         for (const thumbnailName of journal.thumbnailNames) {
           if (referencedThumbnails.has(thumbnailName)) continue
           try { removeFileAtomic(join(paths.thumbnailsDir, thumbnailName)) } catch (error) {
+            if (!isMissingPathError(error)) {
+              recovered = false
+              this.warn(`Design promotion 缩略图清理失败: ${thumbnailName}: ${String(error)}`)
+            }
+          }
+        }
+        /** schema 2 还覆盖跨卷目标临时文件与任意阶段崩溃留下的 staging。 */
+        for (const temporaryName of journal.assetTemporaryNames ?? []) {
+          try { removeFileAtomic(join(paths.assetsDir, temporaryName)) } catch (error) {
+            if (!isMissingPathError(error)) {
+              recovered = false
+              this.warn(`Design promotion 临时原图清理失败: ${temporaryName}: ${String(error)}`)
+            }
+          }
+        }
+        for (const temporaryName of journal.thumbnailTemporaryNames ?? []) {
+          try { removeFileAtomic(join(paths.thumbnailsDir, temporaryName)) } catch (error) {
+            if (!isMissingPathError(error)) {
+              recovered = false
+              this.warn(`Design promotion 临时缩略图清理失败: ${temporaryName}: ${String(error)}`)
+            }
+          }
+        }
+        if (journal.stagingDirectoryName) {
+          try {
+            rmSync(join(paths.stagingDir, journal.stagingDirectoryName), { recursive: true, force: true })
+          } catch (error) {
             recovered = false
-            this.warn(`Design promotion 缩略图清理失败: ${thumbnailName}: ${String(error)}`)
+            this.warn(`Design promotion staging 清理失败: ${journal.stagingDirectoryName}: ${String(error)}`)
           }
         }
         if (recovered) removePromotionJournal(journalPath)
@@ -877,18 +1095,13 @@ export class DesignAssetService {
       /** store 先验证或创建受管目录链，再允许注册媒体目录。 */
       this.dependencies.store.load(projectId)
       const paths = this.dependencies.pathResolver.resolve(projectId)
-      /** 节点数量不影响授权条目数，项目始终只注册两个目录。 */
-      const assetBaseUrl = this.registerDirectoryPath(paths.assetsDir)
-      /** 第二个目录注册失败时立即回收第一个 token。 */
-      let thumbnailBaseUrl: string
-      try {
-        thumbnailBaseUrl = this.registerDirectoryPath(paths.thumbnailsDir)
-      } catch (error) {
-        this.revokePathUrl(assetBaseUrl)
-        throw error
+      /** 节点数量不影响授权条目数，两个目录必须共享同一容量事务。 */
+      const urls = this.registerRetainedDirectoryPaths([paths.assetsDir, paths.thumbnailsDir])
+      if (urls.length !== 2 || urls.some((url) => typeof url !== 'string' || !url.startsWith('proma-file://'))) {
+        for (const url of urls) this.revokePathUrl(url)
+        throw new Error('Design 媒体目录授权未完整注册')
       }
-      this.retainPathUrl(assetBaseUrl)
-      this.retainPathUrl(thumbnailBaseUrl)
+      const [assetBaseUrl, thumbnailBaseUrl] = urls as [string, string]
       /** release 可由视图卸载和项目切换重复调用。 */
       let released = false
       return {
@@ -902,6 +1115,21 @@ export class DesignAssetService {
         },
       }
     })
+  }
+
+  /** 兼容非 registry 注入：逐个注册后统一 retain，失败则回收本批全部 URL。 */
+  private registerAndRetainDirectoryPaths(directoryPaths: string[]): string[] {
+    const urls: string[] = []
+    try {
+      for (const directoryPath of directoryPaths) urls.push(this.registerDirectoryPath(directoryPath))
+      for (const url of urls) {
+        if (!this.retainPathUrl(url)) throw new Error('Design 媒体目录授权 retain 失败')
+      }
+      return urls
+    } catch (error) {
+      for (const url of urls) this.revokePathUrl(url)
+      throw error
+    }
   }
 
   /**

@@ -1,9 +1,17 @@
 import { describe, expect, test } from 'bun:test'
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
 import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
 import type { DesignAsset, DesignCanvasDocument, DesignWorkspaceSnapshot } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
+import sharp from 'sharp'
+import { DesignAssetService } from './design-asset-service'
 import type { DesignAssetImportBatch } from './design-asset-service'
 import { registerDesignIpcHandlers, type DesignIpcOptions } from './design-ipc'
+import { createDesignPathResolver } from './design-paths'
+import { createDesignStore } from './design-store'
+import type { DesignStore } from './design-store'
 
 /** 测试记录型 IPC handler。 */
 type TestHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
@@ -325,5 +333,86 @@ describe('Design IPC', () => {
     )).rejects.toThrow('metadata commit failed')
     expect(fixture.importCommits).toEqual([])
     expect(fixture.importRollbacks).toEqual(['asset-1'])
+  })
+
+  test('Given canvas 已落盘但 durability 报错 When 实际导入 handler 回滚 Then 重启按磁盘引用恢复', async () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'proma-design-ipc-project-'))
+    const configRoot = mkdtempSync(join(tmpdir(), 'proma-design-ipc-config-'))
+    const sourceRoot = mkdtempSync(join(tmpdir(), 'proma-design-ipc-source-'))
+    try {
+      const sourcePath = join(sourceRoot, 'import.png')
+      await sharp({
+        create: {
+          width: 2,
+          height: 2,
+          channels: 4,
+          background: { r: 255, g: 0, b: 0, alpha: 1 },
+        },
+      }).png().toFile(sourcePath)
+      const pathResolver = createDesignPathResolver({
+        getWorkspace: () => ({
+          id: 'project-1',
+          name: '项目',
+          slug: 'stable-slug',
+          projectRootPath: projectRoot,
+          createdAt: 1,
+          updatedAt: 1,
+        }),
+        getProjectFilesPath: () => projectRoot,
+        getConfigDir: () => configRoot,
+      })
+      const realStore = createDesignStore({ pathResolver, now: () => 100 })
+      realStore.load('project-1')
+      /** 真实提交新 revision 后模拟目录 durability 同步报错。 */
+      const durabilityStore: DesignStore = {
+        load: (projectId) => realStore.load(projectId),
+        mutate: (projectId, expectedRevision, mutations) => {
+          realStore.mutate(projectId, expectedRevision, mutations)
+          throw new Error('目录 durability 同步失败')
+        },
+      }
+      const createService = (runtimeId: string): DesignAssetService => new DesignAssetService({
+        pathResolver,
+        store: durabilityStore,
+        runtimeId,
+        runWorkspaceWrite: (_projectId, effect) => effect(),
+        registerDirectoryPath: (directoryPath) => `proma-file://${basename(directoryPath)}`,
+        registerRetainedDirectoryPaths: (directoryPaths) => directoryPaths
+          .map((directoryPath) => `proma-file://${basename(directoryPath)}`),
+        revokePathUrl: () => {},
+        warn: () => {},
+      })
+      const fixture = createFixture()
+      const oldRuntimeService = createService('runtime-before-crash')
+      fixture.options.store = durabilityStore
+      fixture.options.assets = oldRuntimeService
+      fixture.options.pickImageFiles = async () => [sourcePath]
+      registerDesignIpcHandlers(fixture.options)
+
+      await expect(invoke(
+        fixture.handlers,
+        DESIGN_IPC_CHANNELS.IMPORT_ASSETS,
+        fixture.senders[0]!,
+        { projectId: 'project-1' },
+      )).rejects.toThrow('目录 durability 同步失败')
+
+      const persistedAsset = realStore.load('project-1').document.assets[0]
+      expect(persistedAsset).toBeDefined()
+      const paths = pathResolver.resolve('project-1')
+      expect(existsSync(join(paths.designRoot, persistedAsset!.relativePath))).toBe(true)
+      expect(existsSync(join(paths.cacheRoot, persistedAsset!.thumbnailRelativePath))).toBe(true)
+      expect(readdirSync(join(paths.jobsDir, 'promotions'))).toHaveLength(1)
+
+      const restartedService = createService('runtime-after-crash')
+      restartedService.recoverPromotionJournals('project-1')
+
+      expect(existsSync(join(paths.designRoot, persistedAsset!.relativePath))).toBe(true)
+      expect(existsSync(join(paths.cacheRoot, persistedAsset!.thumbnailRelativePath))).toBe(true)
+      expect(readdirSync(join(paths.jobsDir, 'promotions'))).toEqual([])
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true })
+      rmSync(configRoot, { recursive: true, force: true })
+      rmSync(sourceRoot, { recursive: true, force: true })
+    }
   })
 })

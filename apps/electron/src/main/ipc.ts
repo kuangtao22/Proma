@@ -163,7 +163,12 @@ import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/r
 import { browserController } from './lib/browser-controller'
 import { resolveBrowserProfileKey } from './lib/browser-profile-policy'
 import { getUnstagedChanges, invalidateGitDiffCache, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges, getMainRepoRoot } from './lib/git-diff-service'
-import { registerPromaDirectoryPath, registerPromaFilePath, revokePromaPathUrl } from './lib/local-file-protocol'
+import {
+  registerPromaDirectoryPath,
+  registerPromaFilePath,
+  registerRetainedPromaDirectoryPaths,
+  revokePromaPathUrl,
+} from './lib/local-file-protocol'
 import { DesignAssetService } from './lib/design/design-asset-service'
 import { registerDesignIpcHandlers } from './lib/design/design-ipc'
 import { designPathResolver } from './lib/design/design-paths'
@@ -1057,6 +1062,7 @@ export function registerIpcHandlers(): void {
     store: designStore,
     runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
     registerDirectoryPath: registerPromaDirectoryPath,
+    registerRetainedDirectoryPaths: registerRetainedPromaDirectoryPaths,
     revokePathUrl: revokePromaPathUrl,
   })
   registerDesignIpcHandlers({

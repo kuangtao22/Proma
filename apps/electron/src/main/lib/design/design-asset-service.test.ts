@@ -122,7 +122,56 @@ describe('Design 素材安全服务', () => {
     expect(listPromotionJournals()).toEqual([])
   })
 
-  test('Given 元数据实际已落盘但调用方收到异常 When 回滚批次 Then 按磁盘引用保留文件', async () => {
+  test('Given 有效导入完成但 staging 清理失败 When 确认批次 Then 保留 journal 供重启恢复', async () => {
+    service = createService({
+      runtimeId: 'runtime-import-commit-staging-failed',
+      cleanupPath: (path) => {
+        if (path.startsWith(paths.stagingDir)) throw createFileSystemError('EPERM')
+        rmSync(path, { recursive: true, force: true })
+      },
+    })
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = batch[0]!
+    store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+
+    batch.commit()
+
+    expect(readdirSync(paths.stagingDir)).toHaveLength(1)
+    expect(listPromotionJournals()).toHaveLength(1)
+    service = createService({ runtimeId: 'runtime-import-commit-staging-retry' })
+    service.recoverPromotionJournals('project-1')
+
+    expect(readdirSync(paths.stagingDir)).toEqual([])
+    expect(existsSync(join(paths.designRoot, asset.relativePath))).toBe(true)
+    expect(existsSync(join(paths.cacheRoot, asset.thumbnailRelativePath))).toBe(true)
+    expect(listPromotionJournals()).toEqual([])
+  })
+
+  test('Given 有效导入完成但 staging 清理失败 When 回滚批次 Then 保留 journal 供重启恢复', async () => {
+    service = createService({
+      runtimeId: 'runtime-import-rollback-staging-failed',
+      cleanupPath: (path) => {
+        if (path.startsWith(paths.stagingDir)) throw createFileSystemError('EPERM')
+        rmSync(path, { recursive: true, force: true })
+      },
+    })
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = batch[0]!
+
+    batch.rollback()
+
+    expect(readdirSync(paths.stagingDir)).toHaveLength(1)
+    expect(listPromotionJournals()).toHaveLength(1)
+    service = createService({ runtimeId: 'runtime-import-rollback-staging-retry' })
+    service.recoverPromotionJournals('project-1')
+
+    expect(readdirSync(paths.stagingDir)).toEqual([])
+    expect(existsSync(join(paths.designRoot, asset.relativePath))).toBe(false)
+    expect(existsSync(join(paths.cacheRoot, asset.thumbnailRelativePath))).toBe(false)
+    expect(listPromotionJournals()).toEqual([])
+  })
+
+  test('Given 元数据即时可读但 durability 未确认 When 回滚批次 Then 保留文件与 journal 到下一进程', async () => {
     const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
     const asset = batch[0]!
     store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
@@ -131,6 +180,15 @@ describe('Design 素材安全服务', () => {
 
     expect(existsSync(join(paths.designRoot, asset.relativePath))).toBe(true)
     expect(existsSync(join(paths.cacheRoot, asset.thumbnailRelativePath))).toBe(true)
+    expect(listPromotionJournals()).toHaveLength(1)
+
+    /** 模拟崩溃后 canvas 回退到未引用状态，再由新 runtime 依据磁盘事实清理。 */
+    store.mutate('project-1', 1, [{ type: 'remove-assets', assetIds: [asset.id] }])
+    service = createService({ runtimeId: 'runtime-after-restart' })
+    service.recoverPromotionJournals('project-1')
+
+    expect(existsSync(join(paths.designRoot, asset.relativePath))).toBe(false)
+    expect(existsSync(join(paths.cacheRoot, asset.thumbnailRelativePath))).toBe(false)
     expect(listPromotionJournals()).toEqual([])
   })
 
@@ -225,6 +283,62 @@ describe('Design 素材安全服务', () => {
     expect(readdirSync(paths.stagingDir)).toEqual([])
   })
 
+  test('Given 导入失败且目标卷临时文件无法删除 When 回滚 Then 保留原错误与 journal 供重启恢复', async () => {
+    /** 清理故障必须产生可诊断 warning，但不得覆盖目标 rename 的 EIO。 */
+    const warnings: string[] = []
+    service = createService({
+      runtimeId: 'runtime-temp-cleanup-failed',
+      renameFile: (sourcePath, targetPath) => {
+        if (sourcePath.startsWith(paths.stagingDir)) throw createFileSystemError('EXDEV')
+        if (basename(sourcePath).startsWith('.proma-promote-')) throw createFileSystemError('EIO')
+        renameSync(sourcePath, targetPath)
+      },
+      cleanupPath: (path) => {
+        if (basename(path).startsWith('.proma-promote-')) throw createFileSystemError('EPERM')
+        rmSync(path, { recursive: true, force: true })
+      },
+      warn: (message) => warnings.push(message),
+    })
+
+    await expect(service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' }))
+      .rejects.toThrow('EIO')
+    expect(warnings.some((message) => message.includes('清理失败'))).toBe(true)
+    expect(listPromotionJournals()).toHaveLength(1)
+    expect(readdirSync(paths.assetsDir).some((name) => name.startsWith('.proma-promote-'))).toBe(true)
+
+    service = createService({ runtimeId: 'runtime-temp-cleanup-retry' })
+    service.recoverPromotionJournals('project-1')
+
+    expect(readdirSync(paths.assetsDir)).toEqual([])
+    expect(listPromotionJournals()).toEqual([])
+  })
+
+  test('Given 导入校验失败且 staging 无法删除 When 回滚 Then 保留原错误与 journal 供重启恢复', async () => {
+    const fakePngPath = join(sourceRoot, 'staging-cleanup-failure.png')
+    writeFileSync(fakePngPath, 'not an image', 'utf8')
+    const warnings: string[] = []
+    service = createService({
+      runtimeId: 'runtime-staging-cleanup-failed',
+      cleanupPath: (path) => {
+        if (path.startsWith(paths.stagingDir)) throw createFileSystemError('EPERM')
+        rmSync(path, { recursive: true, force: true })
+      },
+      warn: (message) => warnings.push(message),
+    })
+
+    await expect(service.importAuthorizedFiles('project-1', [fakePngPath], { kind: 'picker' }))
+      .rejects.toThrow('不支持或损坏的图片')
+    expect(warnings.some((message) => message.includes('staging 清理失败'))).toBe(true)
+    expect(readdirSync(paths.stagingDir)).toHaveLength(1)
+    expect(listPromotionJournals()).toHaveLength(1)
+
+    service = createService({ runtimeId: 'runtime-staging-cleanup-retry' })
+    service.recoverPromotionJournals('project-1')
+
+    expect(readdirSync(paths.stagingDir)).toEqual([])
+    expect(listPromotionJournals()).toEqual([])
+  })
+
   test('Given 跨卷提升成功后源路径被重新创建 When 完成清理 Then 保留已提交目标', () => {
     const stagingPath = join(sourceRoot, 'staged.png')
     const targetPath = join(paths.assetsDir, 'promoted.png')
@@ -302,6 +416,37 @@ describe('Design 素材安全服务', () => {
     service.recoverPromotionJournals('project-1')
 
     expect(existsSync(referencedPath)).toBe(true)
+    expect(listPromotionJournals()).toEqual([])
+  })
+
+  test('Given 旧进程留下跨卷临时文件与 staging When 新实例恢复 Then 按 journal 全部清理', async () => {
+    service = createService({ runtimeId: 'runtime-old' })
+    await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const journalName = listPromotionJournals()[0]!
+    /** 红灯阶段字段允许缺失，断言确保 journal 先具备完整崩溃恢复信息。 */
+    const journal = JSON.parse(readFileSync(join(paths.jobsDir, 'promotions', journalName), 'utf8')) as {
+      stagingDirectoryName?: string
+      assetTemporaryNames?: string[]
+      thumbnailTemporaryNames?: string[]
+    }
+
+    expect(journal.stagingDirectoryName).toBeString()
+    expect(journal.assetTemporaryNames).toHaveLength(1)
+    expect(journal.thumbnailTemporaryNames).toHaveLength(1)
+    const abandonedStaging = join(paths.stagingDir, journal.stagingDirectoryName!)
+    const abandonedAssetTemporary = join(paths.assetsDir, journal.assetTemporaryNames![0]!)
+    const abandonedThumbnailTemporary = join(paths.thumbnailsDir, journal.thumbnailTemporaryNames![0]!)
+    mkdirSync(abandonedStaging)
+    writeFileSync(join(abandonedStaging, 'partial'), 'partial')
+    writeFileSync(abandonedAssetTemporary, 'partial')
+    writeFileSync(abandonedThumbnailTemporary, 'partial')
+
+    service = createService({ runtimeId: 'runtime-new' })
+    service.recoverPromotionJournals('project-1')
+
+    expect(existsSync(abandonedStaging)).toBe(false)
+    expect(existsSync(abandonedAssetTemporary)).toBe(false)
+    expect(existsSync(abandonedThumbnailTemporary)).toBe(false)
     expect(listPromotionJournals()).toEqual([])
   })
 
@@ -433,6 +578,76 @@ describe('Design 素材安全服务', () => {
     expect(listPromotionJournals()).toHaveLength(journalCountBeforeRelink)
   })
 
+  test('Given relink 失败且目标卷临时文件无法删除 When 回滚 Then 保留原错误与 journal 供重启恢复', async () => {
+    const initialBatch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = initialBatch[0]!
+    const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+    initialBatch.commit()
+    const replacementPath = join(sourceRoot, 'relink-temp-cleanup.webp')
+    await sharp(fixturePath).webp().toFile(replacementPath)
+    const warnings: string[] = []
+    service = createService({
+      runtimeId: 'runtime-relink-temp-failed',
+      renameFile: (sourcePath, targetPath) => {
+        if (sourcePath.startsWith(paths.stagingDir)) throw createFileSystemError('EXDEV')
+        if (basename(sourcePath).startsWith('.proma-promote-')) throw createFileSystemError('EIO')
+        renameSync(sourcePath, targetPath)
+      },
+      cleanupPath: (path) => {
+        if (basename(path).startsWith('.proma-promote-')) throw createFileSystemError('EPERM')
+        rmSync(path, { recursive: true, force: true })
+      },
+      warn: (message) => warnings.push(message),
+    })
+
+    await expect(service.relinkAsset('project-1', asset.id, replacementPath, withAsset.revision))
+      .rejects.toThrow('EIO')
+    expect(warnings.some((message) => message.includes('清理失败'))).toBe(true)
+    expect(listPromotionJournals()).toHaveLength(1)
+    expect(readdirSync(paths.assetsDir).some((name) => name.startsWith('.proma-promote-'))).toBe(true)
+
+    service = createService({ runtimeId: 'runtime-relink-temp-retry' })
+    service.recoverPromotionJournals('project-1')
+
+    expect(readdirSync(paths.assetsDir)).toEqual([basename(asset.relativePath)])
+    expect(listPromotionJournals()).toEqual([])
+  })
+
+  test('Given relink 校验失败且 staging 无法删除 When 回滚 Then 保留原错误与 journal 供重启恢复', async () => {
+    const initialBatch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = initialBatch[0]!
+    const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+    initialBatch.commit()
+    const invalidReplacementPath = join(sourceRoot, 'relink-staging-cleanup.png')
+    writeFileSync(invalidReplacementPath, 'not an image', 'utf8')
+    const warnings: string[] = []
+    service = createService({
+      runtimeId: 'runtime-relink-staging-failed',
+      cleanupPath: (path) => {
+        if (path.startsWith(paths.stagingDir)) throw createFileSystemError('EPERM')
+        rmSync(path, { recursive: true, force: true })
+      },
+      warn: (message) => warnings.push(message),
+    })
+
+    await expect(service.relinkAsset(
+      'project-1',
+      asset.id,
+      invalidReplacementPath,
+      withAsset.revision,
+    )).rejects.toThrow('不支持或损坏的图片')
+    expect(warnings.some((message) => message.includes('staging 清理失败'))).toBe(true)
+    expect(readdirSync(paths.stagingDir)).toHaveLength(1)
+    expect(listPromotionJournals()).toHaveLength(1)
+
+    service = createService({ runtimeId: 'runtime-relink-staging-retry' })
+    service.recoverPromotionJournals('project-1')
+
+    expect(readdirSync(paths.stagingDir)).toEqual([])
+    expect(existsSync(join(paths.designRoot, asset.relativePath))).toBe(true)
+    expect(listPromotionJournals()).toEqual([])
+  })
+
   test('Given canvas JSON 已 rename 但 durability 同步失败 When 重新定位 Then 保留新 revision 引用文件', async () => {
     const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
     const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])
@@ -455,6 +670,33 @@ describe('Design 素材安全服务', () => {
     expect(persisted?.mediaType).toBe('image/webp')
     expect(existsSync(join(paths.designRoot, persisted!.relativePath))).toBe(true)
     expect(existsSync(join(paths.cacheRoot, persisted!.thumbnailRelativePath))).toBe(true)
+  })
+
+  test('Given relink mutate 与 reload 都失败 When 提交状态未知 Then 保留新文件与 journal', async () => {
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = batch[0]!
+    const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+    batch.commit()
+    const replacementPath = join(sourceRoot, 'unknown-replacement.webp')
+    await sharp(fixturePath).webp().toFile(replacementPath)
+    /** 第一次 load 用于读取旧元数据，mutate 失败后的 reload 模拟磁盘状态不可判定。 */
+    let loadCount = 0
+    const unknownStore: DesignStore = {
+      load: (projectId) => {
+        loadCount += 1
+        if (loadCount === 1) return store.load(projectId)
+        throw new Error('reload 失败')
+      },
+      mutate: () => { throw new Error('mutate 失败') },
+    }
+    service = createService({ store: unknownStore, runtimeId: 'runtime-unknown' })
+
+    await expect(service.relinkAsset('project-1', asset.id, replacementPath, withAsset.revision))
+      .rejects.toThrow('mutate 失败')
+
+    expect(readdirSync(paths.assetsDir)).toHaveLength(2)
+    expect(readdirSync(paths.thumbnailsDir)).toHaveLength(2)
+    expect(listPromotionJournals()).toHaveLength(1)
   })
 
   test('Given 主进程提供导出目标 When 导出 Then 原图字节保持一致', async () => {
@@ -489,8 +731,8 @@ describe('Design 素材安全服务', () => {
   })
 
   test('Given 项目有大量节点 When 创建媒体授权 Then 始终只注册两个目录且可释放', () => {
-    /** 记录目录级授权和释放次数，确保不会按节点注册。 */
-    const registered: string[] = []
+    /** 记录原子批量授权调用，确保两个目录共享一个容量事务。 */
+    const registeredBatches: string[][] = []
     /** 记录释放的 opaque URL。 */
     const revoked: string[] = []
     service = new DesignAssetService({
@@ -498,9 +740,10 @@ describe('Design 素材安全服务', () => {
       store,
       now: () => 200,
       runWorkspaceWrite: (_projectId, effect) => effect(),
-      registerDirectoryPath: (directoryPath) => {
-        registered.push(directoryPath)
-        return `proma-file://${basename(directoryPath)}`
+      registerDirectoryPath: () => { throw new Error('不应逐个注册 Design 媒体目录') },
+      registerRetainedDirectoryPaths: (directoryPaths) => {
+        registeredBatches.push(directoryPaths)
+        return directoryPaths.map((directoryPath) => `proma-file://${basename(directoryPath)}`)
       },
       revokePathUrl: (url) => revoked.push(url),
       warn: () => {},
@@ -510,7 +753,7 @@ describe('Design 素材安全服务', () => {
     access.release()
     access.release()
 
-    expect(registered).toEqual([paths.assetsDir, paths.thumbnailsDir])
+    expect(registeredBatches).toEqual([[paths.assetsDir, paths.thumbnailsDir]])
     expect(revoked).toEqual([access.assetBaseUrl, access.thumbnailBaseUrl])
   })
 
@@ -539,8 +782,10 @@ describe('Design 素材安全服务', () => {
   /** 使用当前测试基础依赖创建可窄注入文件提升行为的服务。 */
   function createService(overrides: {
     renameFile?: (sourcePath: string, targetPath: string) => void
+    cleanupPath?: (path: string) => void
     store?: DesignStore
     runtimeId?: string
+    warn?: (message: string) => void
   }): DesignAssetService {
     return new DesignAssetService({
       pathResolver: { resolve: () => paths },
@@ -549,8 +794,13 @@ describe('Design 素材安全服务', () => {
       runWorkspaceWrite: (_projectId, effect) => effect(),
       registerDirectoryPath: (directoryPath) => `proma-file://${basename(directoryPath)}`,
       revokePathUrl: () => {},
-      warn: () => {},
-      ...(overrides.renameFile ? { filePromotion: { renameFile: overrides.renameFile } } : {}),
+      warn: overrides.warn ?? (() => {}),
+      ...(overrides.renameFile || overrides.cleanupPath ? {
+        filePromotion: {
+          ...(overrides.renameFile ? { renameFile: overrides.renameFile } : {}),
+          ...(overrides.cleanupPath ? { cleanupPath: overrides.cleanupPath } : {}),
+        },
+      } : {}),
       ...(overrides.runtimeId ? { runtimeId: overrides.runtimeId } : {}),
     })
   }
