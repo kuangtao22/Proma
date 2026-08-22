@@ -6,6 +6,8 @@ import type {
   DesignWorkspaceSnapshot,
 } from '@proma/shared'
 import { atom } from 'jotai'
+import type { DesignEditCommand } from '@/lib/design-editor'
+import { applyDesignMutations, reduceDesignEdit } from '@/lib/design-editor'
 
 /** 单次可撤销编辑对应的正向与逆向 mutation。 */
 export interface DesignHistoryEntry {
@@ -86,5 +88,95 @@ export const updateDesignProjectStateAtom = atom(
     const nextStates = new Map(states)
     nextStates.set(input.projectId, next)
     set(designProjectStatesAtom, nextStates)
+  },
+)
+
+/** 对指定项目执行一次可撤销编辑。 */
+export interface ExecuteDesignEditInput {
+  projectId: string
+  command: DesignEditCommand
+}
+
+/** 指定项目的历史移动输入。 */
+export interface DesignHistoryActionInput {
+  projectId: string
+}
+
+/** 有未保存编辑时保留 failed 提示，否则进入 dirty 自动保存状态。 */
+function nextEditedSaveState(current: DesignProjectState): DesignProjectState['saveState'] {
+  return current.saveState === 'failed' ? 'failed' : 'dirty'
+}
+
+/** 应用 reducer 正向 mutation、压入历史并清空 redo future。 */
+export const executeDesignEditAtom = atom(
+  null,
+  (get, set, input: ExecuteDesignEditInput): void => {
+    /** 项目状态始终按稳定 projectId 读取，避免切项目后的迟到事件污染当前项目。 */
+    const current = get(designProjectStatesAtom).get(input.projectId)
+    if (!current?.snapshot?.writable) return
+    /** 纯 reducer 同时生成乐观文档和确定性 inverse。 */
+    const result = reduceDesignEdit(current.snapshot.document, input.command)
+    if (result.forward.length === 0) return
+    set(updateDesignProjectStateAtom, {
+      projectId: input.projectId,
+      update: {
+        snapshot: { ...current.snapshot, document: result.document },
+        selectedNodeIds: result.selection,
+        history: [...current.history, { forward: result.forward, inverse: result.inverse }],
+        future: [],
+        pendingMutations: [...current.pendingMutations, ...result.forward],
+        saveState: nextEditedSaveState(current),
+      },
+    })
+  },
+)
+
+/** 应用最近一次 inverse，并把历史项移入 future。 */
+export const undoDesignEditAtom = atom(
+  null,
+  (get, set, input: DesignHistoryActionInput): void => {
+    /** 撤销必须基于项目最新乐观文档。 */
+    const current = get(designProjectStatesAtom).get(input.projectId)
+    const entry = current?.history.at(-1)
+    if (!current?.snapshot?.writable || !entry) return
+    set(updateDesignProjectStateAtom, {
+      projectId: input.projectId,
+      update: {
+        snapshot: {
+          ...current.snapshot,
+          document: applyDesignMutations(current.snapshot.document, entry.inverse),
+        },
+        selectedNodeIds: [],
+        history: current.history.slice(0, -1),
+        future: [...current.future, entry],
+        pendingMutations: [...current.pendingMutations, ...entry.inverse],
+        saveState: nextEditedSaveState(current),
+      },
+    })
+  },
+)
+
+/** 应用 future 最近一次 forward，并把历史项恢复到 history。 */
+export const redoDesignEditAtom = atom(
+  null,
+  (get, set, input: DesignHistoryActionInput): void => {
+    /** 重做必须基于项目最新乐观文档。 */
+    const current = get(designProjectStatesAtom).get(input.projectId)
+    const entry = current?.future.at(-1)
+    if (!current?.snapshot?.writable || !entry) return
+    set(updateDesignProjectStateAtom, {
+      projectId: input.projectId,
+      update: {
+        snapshot: {
+          ...current.snapshot,
+          document: applyDesignMutations(current.snapshot.document, entry.forward),
+        },
+        selectedNodeIds: [],
+        history: [...current.history, entry],
+        future: current.future.slice(0, -1),
+        pendingMutations: [...current.pendingMutations, ...entry.forward],
+        saveState: nextEditedSaveState(current),
+      },
+    })
   },
 )

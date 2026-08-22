@@ -124,8 +124,20 @@ export function DesignToolbar({
         <span className="mx-0.5 h-5 w-px bg-border" aria-hidden="true" />
         <ToolbarIconButton icon={Group} label="分组" disabled={!writable || !onGroup} onClick={onGroup} />
         <ToolbarIconButton icon={Ungroup} label="取消分组" disabled={!writable || !onUngroup} onClick={onUngroup} />
-        <ToolbarIconButton icon={ArrowUpRight} label="箭头批注" disabled={!writable || !onArrowTool} onClick={onArrowTool} />
-        <ToolbarIconButton icon={Paintbrush} label="画笔蒙版" disabled={!writable || !onMaskTool} onClick={onMaskTool} />
+        <ToolbarIconButton
+          icon={ArrowUpRight}
+          label="箭头批注"
+          active={activeTool === 'arrow'}
+          disabled={!writable || !onArrowTool}
+          onClick={onArrowTool}
+        />
+        <ToolbarIconButton
+          icon={Paintbrush}
+          label="画笔蒙版"
+          active={activeTool === 'mask'}
+          disabled={!writable || !onMaskTool}
+          onClick={onMaskTool}
+        />
         <span className="mx-0.5 h-5 w-px bg-border" aria-hidden="true" />
         <ToolbarIconButton icon={Upload} label="导入图片" disabled={!writable || !onImportAssets} onClick={onImportAssets} />
       </div>

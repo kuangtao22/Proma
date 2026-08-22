@@ -1,5 +1,9 @@
 import * as React from 'react'
-import type { DesignCanvasDocument, DesignMutation } from '@proma/shared'
+import type {
+  DesignAnnotation,
+  DesignCanvasDocument,
+  DesignMutation,
+} from '@proma/shared'
 import {
   Background,
   Controls,
@@ -10,6 +14,7 @@ import type {
   Edge,
   NodeTypes,
   OnMoveEnd,
+  OnMove,
   OnNodeDrag,
   OnNodesChange,
   OnSelectionChangeFunc,
@@ -17,8 +22,16 @@ import type {
 } from '@xyflow/react'
 import { useSetAtom, useStore } from 'jotai'
 import type { DesignProjectState } from '@/atoms/design-atoms'
-import { designProjectStatesAtom, updateDesignProjectStateAtom } from '@/atoms/design-atoms'
+import {
+  designProjectStatesAtom,
+  executeDesignEditAtom,
+  redoDesignEditAtom,
+  undoDesignEditAtom,
+  updateDesignProjectStateAtom,
+} from '@/atoms/design-atoms'
+import { resolveDesignKeyboardAction } from '@/lib/design-editor'
 import { applyDesignMutationsToDocument } from './use-design-workspace'
+import { DesignAnnotationLayer } from './DesignAnnotationLayer'
 import { DesignAssetNode } from './DesignAssetNode'
 import type { DesignAssetFlowNode } from './DesignAssetNode'
 import {
@@ -68,6 +81,8 @@ export interface DesignCanvasProps {
   activeTool: DesignProjectState['activeTool']
   /** 当前项目选择的节点 ID。 */
   selectedNodeIds: string[]
+  /** 当前项目隔离保存的批注草稿。 */
+  annotationDraft?: DesignProjectState['maskDraft']
   /** 无 DOM 测试可注入的 Flow renderer；生产默认使用 XYFlow。 */
   flowRenderer?: DesignCanvasFlowRenderer
 }
@@ -124,9 +139,13 @@ export function DesignCanvas({
   writable,
   activeTool,
   selectedNodeIds,
+  annotationDraft = [],
   flowRenderer,
 }: DesignCanvasProps): React.ReactElement {
   const updateProjectState = useSetAtom(updateDesignProjectStateAtom)
+  const executeEdit = useSetAtom(executeDesignEditAtom)
+  const undoEdit = useSetAtom(undoDesignEditAtom)
+  const redoEdit = useSetAtom(redoDesignEditAtom)
   const store = useStore()
   /** 最新选择集合用于文档同步时恢复节点选择态。 */
   const selectedNodeIdsRef = React.useRef(selectedNodeIds)
@@ -146,6 +165,12 @@ export function DesignCanvas({
   const interaction = getDesignCanvasInteractionConfig(activeTool, writable)
   /** 当前项目 mount 时的视口恢复与首次取景策略。 */
   const viewportPolicy = getDesignCanvasViewportPolicy(document)
+  /** XYFlow 移动期间仅保存在组件内存，批注层逐帧跟随但不触发自动保存。 */
+  const [liveViewport, setLiveViewport] = React.useState(viewportPolicy.defaultViewport)
+
+  React.useEffect(() => {
+    setLiveViewport(document.viewport)
+  }, [document.viewport])
 
   React.useEffect(() => {
     /** 文档变更后同步展示字段，并保护活动拖动节点的本地坐标。 */
@@ -228,8 +253,91 @@ export function DesignCanvas({
 
   /** 视口交互结束后只提交一个 set-viewport mutation。 */
   const handleMoveEnd = React.useCallback<OnMoveEnd>((_event, viewport) => {
+    setLiveViewport(viewport)
     commitMutation(createViewportMutation(viewport))
   }, [commitMutation])
+
+  /** 视口逐帧变化仅用于批注层视觉同步。 */
+  const handleMove = React.useCallback<OnMove>((_event, viewport) => {
+    setLiveViewport(viewport)
+  }, [])
+
+  /** 把完成的箭头或蒙版作为单次可撤销编辑提交。 */
+  const handleCreateAnnotation = React.useCallback((annotation: DesignAnnotation): void => {
+    executeEdit({
+      projectId: document.projectId,
+      command: { type: 'add-annotation', annotation },
+    })
+  }, [document.projectId, executeEdit])
+
+  /** 批注草稿保存在当前项目状态，切换项目不会串用。 */
+  const handleAnnotationDraftChange = React.useCallback((maskDraft: DesignProjectState['maskDraft']): void => {
+    updateProjectState({ projectId: document.projectId, update: { maskDraft } })
+  }, [document.projectId, updateProjectState])
+
+  /** 调用浏览器安全随机源生成批注或编辑实体身份。 */
+  const createEntityId = React.useCallback((): string => globalThis.crypto.randomUUID(), [])
+  /** 为批注手势生成稳定身份；controller 通过 useCallback 避免渲染时反复重建。 */
+  const createAnnotationIdentity = React.useCallback(() => ({
+    id: createEntityId(),
+    createdAt: Date.now(),
+  }), [createEntityId])
+
+  React.useEffect(() => {
+    /** Design 页面活动期间接管有限编辑快捷键。 */
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (!writable) return
+      /** 每次键盘事件读取项目最新状态，避免 React prop 更新间隙操作旧选区。 */
+      const state = store.get(designProjectStatesAtom).get(document.projectId)
+      const selection = state?.selectedNodeIds ?? selectedNodeIdsRef.current
+      const action = resolveDesignKeyboardAction(event, selection.length > 0)
+      if (!action) return
+      event.preventDefault()
+      switch (action) {
+        case 'undo':
+          undoEdit({ projectId: document.projectId })
+          break
+        case 'redo':
+          redoEdit({ projectId: document.projectId })
+          break
+        case 'duplicate':
+          executeEdit({
+            projectId: document.projectId,
+            command: {
+              type: 'duplicate-selection',
+              nodeIds: selection,
+              duplicateNodeIds: selection.map(() => createEntityId()),
+            },
+          })
+          break
+        case 'delete':
+          executeEdit({
+            projectId: document.projectId,
+            command: { type: 'delete-selection', nodeIds: selection },
+          })
+          break
+        case 'group':
+          executeEdit({
+            projectId: document.projectId,
+            command: {
+              type: 'group-selection',
+              nodeIds: selection,
+              groupId: createEntityId(),
+              name: `组 ${document.groups.length + 1}`,
+            },
+          })
+          break
+        case 'ungroup':
+          executeEdit({
+            projectId: document.projectId,
+            command: { type: 'ungroup-selection', nodeIds: selection },
+          })
+          break
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => { window.removeEventListener('keydown', handleKeyDown) }
+  }, [createEntityId, document.groups.length, document.projectId, executeEdit, redoEdit, store, undoEdit, writable])
 
   /** 传给 XYFlow 的属性集中构造，测试可观察真实回调与启动策略。 */
   const flowProps: DesignCanvasFlowProps = {
@@ -250,18 +358,29 @@ export function DesignCanvas({
     onSelectionChange: handleSelectionChange,
     onNodeDragStart: handleNodeDragStart,
     onNodeDragStop: handleNodeDragStop,
+    onMove: handleMove,
     onMoveEnd: handleMoveEnd,
     fitView: viewportPolicy.fitView,
   }
 
   return (
-    <div className="design-canvas h-full w-full" aria-label="设计画布" data-project-id={document.projectId}>
+    <div className="design-canvas relative h-full w-full" aria-label="设计画布" data-project-id={document.projectId}>
       {flowRenderer ? flowRenderer(flowProps) : (
         <ReactFlow<DesignAssetFlowNode> {...flowProps}>
           <Background gap={24} size={1} />
           <Controls showInteractive={false} />
         </ReactFlow>
       )}
+      <DesignAnnotationLayer
+        annotations={document.annotations}
+        activeTool={activeTool}
+        writable={writable}
+        viewport={liveViewport}
+        draft={annotationDraft}
+        onDraftChange={handleAnnotationDraftChange}
+        onCreate={handleCreateAnnotation}
+        createIdentity={createAnnotationIdentity}
+      />
     </div>
   )
 }

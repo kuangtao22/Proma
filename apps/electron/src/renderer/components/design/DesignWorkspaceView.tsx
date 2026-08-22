@@ -1,7 +1,13 @@
 import * as React from 'react'
 import { RefreshCw, Sparkles, Upload } from 'lucide-react'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { createInitialDesignProjectState, updateDesignProjectStateAtom } from '@/atoms/design-atoms'
+import {
+  createInitialDesignProjectState,
+  executeDesignEditAtom,
+  redoDesignEditAtom,
+  undoDesignEditAtom,
+  updateDesignProjectStateAtom,
+} from '@/atoms/design-atoms'
 import type { DesignProjectState } from '@/atoms/design-atoms'
 import { currentAgentWorkspaceIdAtom } from '@/atoms/agent-atoms'
 import { Button } from '@/components/ui/button'
@@ -31,6 +37,9 @@ export function DesignWorkspaceStateView({
   onCreateJob,
 }: DesignWorkspaceStateViewProps): React.ReactElement {
   const updateProjectState = useSetAtom(updateDesignProjectStateAtom)
+  const executeEdit = useSetAtom(executeDesignEditAtom)
+  const undoEdit = useSetAtom(undoDesignEditAtom)
+  const redoEdit = useSetAtom(redoDesignEditAtom)
 
   if (state.phase === 'loading' || state.phase === 'idle') {
     return (
@@ -65,6 +74,27 @@ export function DesignWorkspaceStateView({
     updateProjectState({ projectId, update: { activeTool } })
   }
 
+  /** 将当前节点选区建立为新分组。 */
+  const handleGroup = (): void => {
+    executeEdit({
+      projectId,
+      command: {
+        type: 'group-selection',
+        nodeIds: state.selectedNodeIds,
+        groupId: globalThis.crypto.randomUUID(),
+        name: `组 ${state.snapshot!.document.groups.length + 1}`,
+      },
+    })
+  }
+
+  /** 清除当前选中节点的分组归属并清理空组。 */
+  const handleUngroup = (): void => {
+    executeEdit({
+      projectId,
+      command: { type: 'ungroup-selection', nodeIds: state.selectedNodeIds },
+    })
+  }
+
   return (
     <div className="relative flex h-full min-h-0 flex-col bg-background">
       <div className="absolute left-3 top-14 z-10 flex max-w-[min(520px,calc(100%-24px))] flex-col gap-1">
@@ -94,6 +124,12 @@ export function DesignWorkspaceStateView({
             canUndo={state.history.length > 0}
             canRedo={state.future.length > 0}
             onToolChange={handleToolChange}
+            onUndo={() => { undoEdit({ projectId }) }}
+            onRedo={() => { redoEdit({ projectId }) }}
+            onGroup={state.selectedNodeIds.length >= 2 ? handleGroup : undefined}
+            onUngroup={state.selectedNodeIds.length > 0 ? handleUngroup : undefined}
+            onArrowTool={() => { handleToolChange('arrow') }}
+            onMaskTool={() => { handleToolChange('mask') }}
             onImportAssets={onImportAssets}
           />
         </div>
@@ -107,6 +143,7 @@ export function DesignWorkspaceStateView({
           writable={writable}
           activeTool={state.activeTool}
           selectedNodeIds={state.selectedNodeIds}
+          annotationDraft={state.maskDraft}
         />
         {isEmpty && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
