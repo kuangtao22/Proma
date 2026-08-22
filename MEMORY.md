@@ -76,3 +76,4 @@
 - 2026-08-22：确认历史共享凭据由 `@proma/electron Safe Storage` 加密，`PromaDev` 与 `Proma Dev` 钥匙串均无法解密；开发客户端现于 `ready` 前使用历史加密身份，之后恢复显示名 `Proma Dev`。
 - 2026-08-22：合并官方最新正式版 `v0.17.55`，应用版本重置为 `0.17.55-bone.1`；保留 LAN、路径迁移守卫、Agent generation 隔离与历史 Safe Storage 身份，并将 Pi utility 的 abort/force-close/finally 统一到单一 runtime 关闭 Promise。
 - 2026-08-22：关于/更新页将版本历史拆为 `Proma 修改` 与 `官方版本` 两个懒加载标签；历史查询固定映射 Bone/官方仓库并按来源隔离缓存，Electron Updater、最新版本和按标签查询仍只使用 `kuangtao22/Proma`。
+- 2026-08-22：`v0.17.55-bone.1` GitHub Actions 全平台发布成功，并回填 `bone.1`、`bone.4`、`bone.5` 中文 Release 正文；若根目录类型检查异常解析到 `apps/electron/node_modules` 的旧 `@types/node`，说明是历史嵌套依赖遮蔽，`bun install --frozen-lockfile` 不会自动清理该目录。
