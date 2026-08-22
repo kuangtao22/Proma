@@ -7,7 +7,9 @@ import {
   createInitialDesignProjectState,
   designRecoveryRequestsAtom,
   designProjectStatesAtom,
+  executeDesignEditAtom,
   requestDesignRecoveryAtom,
+  undoDesignEditAtom,
   updateDesignProjectStateAtom,
 } from './design-atoms'
 
@@ -30,6 +32,51 @@ describe('Design 项目状态', () => {
 
   test('Given 新项目 When 创建初始状态 Then 不携带冲突恢复任务', () => {
     expect(createInitialDesignProjectState().conflictRecoveryPending).toBe(false)
+    expect(createInitialDesignProjectState().authoritativeRecoveryState).toBe('idle')
+  })
+
+  test('Given 权威恢复正在加载 When 执行编辑或撤销 Then 旧快照保持不变', () => {
+    const store = createStore()
+    const snapshot = createSnapshot('project-1')
+    snapshot.document.assets = [{
+      id: 'asset-1', filename: 'old.png', relativePath: 'assets/old.png',
+      thumbnailRelativePath: 'thumbnails/old.webp', mediaType: 'image/png',
+      width: 100, height: 100, byteSize: 10, sha256: 'hash', createdAt: 1,
+    }]
+    snapshot.document.nodes = [{
+      id: 'node-1', kind: 'asset', assetId: 'asset-1', position: { x: 0, y: 0 },
+      width: 100, height: 100, zIndex: 0,
+    }]
+    /** 旧基线历史用于验证恢复中撤销同样被阻断。 */
+    const history = [{
+      forward: [{ type: 'set-viewport' as const, viewport: { x: 1, y: 1, zoom: 1 } }],
+      inverse: [{ type: 'set-viewport' as const, viewport: { x: 0, y: 0, zoom: 1 } }],
+    }]
+    store.set(designProjectStatesAtom, new Map([['project-1', {
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot,
+      selectedNodeIds: ['node-1'],
+      history,
+      authoritativeRecoveryState: 'loading',
+      saveState: 'failed',
+    }]]))
+
+    store.set(executeDesignEditAtom, {
+      projectId: 'project-1',
+      command: {
+        type: 'duplicate-selection',
+        nodeIds: ['node-1'],
+        duplicateNodeIds: ['node-copy'],
+      },
+    })
+    store.set(undoDesignEditAtom, { projectId: 'project-1' })
+
+    const state = store.get(designProjectStatesAtom).get('project-1')!
+    expect(state.snapshot).toBe(snapshot)
+    expect(state.snapshot?.document.nodes.map((node) => node.id)).toEqual(['node-1'])
+    expect(state.history).toBe(history)
+    expect(state.pendingMutations).toEqual([])
   })
 
   test('Given 两个项目 When 更新其中一个 Then 另一个画布状态保持引用与内容', () => {

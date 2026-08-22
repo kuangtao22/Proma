@@ -82,7 +82,11 @@ export function useDesignInspectorActions(
   /** 导入素材时把当前 revision 与可见中心交给主进程原子提交。 */
   const importAssets = React.useCallback((): void => {
     const initial = getLatestState()
-    if (!projectId || !initial?.snapshot?.writable || initial.saveState !== 'saved' || initial.conflictRecoveryPending) return
+    if (!projectId
+      || !initial?.snapshot?.writable
+      || initial.saveState !== 'saved'
+      || initial.conflictRecoveryPending
+      || initial.authoritativeRecoveryState !== 'idle') return
     /** 调用前素材集合用于识别主进程本次新建的素材。 */
     const previousAssetIds = new Set(initial.snapshot.document.assets.map((asset) => asset.id))
     /** Renderer 只提供布局意图，不接触节点 ID、路径或素材元数据。 */
@@ -129,7 +133,11 @@ export function useDesignInspectorActions(
   /** 删除未被画布节点引用的素材。 */
   const deleteAsset = React.useCallback((assetId: string): void => {
     const current = getLatestState()
-    if (!projectId || !current?.snapshot?.writable || current.saveState !== 'saved' || current.conflictRecoveryPending) return
+    if (!projectId
+      || !current?.snapshot?.writable
+      || current.saveState !== 'saved'
+      || current.conflictRecoveryPending
+      || current.authoritativeRecoveryState !== 'idle') return
     /** 引用检查必须在调用主进程前完成。 */
     const blockReason = getDesignAssetDeleteBlockReason(current.snapshot.document, assetId)
     if (blockReason) {
@@ -151,7 +159,11 @@ export function useDesignInspectorActions(
   /** 调用主进程选择器原位更新缺失素材元数据。 */
   const relinkAsset = React.useCallback((assetId: string): void => {
     const current = getLatestState()
-    if (!projectId || !current?.snapshot?.writable || current.saveState !== 'saved' || current.conflictRecoveryPending) return
+    if (!projectId
+      || !current?.snapshot?.writable
+      || current.saveState !== 'saved'
+      || current.conflictRecoveryPending
+      || current.authoritativeRecoveryState !== 'idle') return
     void adapter.relinkAsset({ projectId, assetId, expectedRevision: current.snapshot.document.revision })
       .then((document) => updateState({ projectId, update: (latest) => ({
         snapshot: latest.snapshot ? {

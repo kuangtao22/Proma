@@ -75,7 +75,9 @@ export function DesignWorkspaceStateView({
   /** 空画布直接显示两个主操作，不增加说明型落地页。 */
   const isEmpty = state.snapshot.document.nodes.length === 0
   /** 冲突恢复期间关闭全部写入口，避免旧 pending 未解决时继续积累修改。 */
-  const writable = state.snapshot.writable && !state.conflictRecoveryPending
+  const writable = state.snapshot.writable
+    && !state.conflictRecoveryPending
+    && state.authoritativeRecoveryState === 'idle'
   /** 远端快照已接管后才允许用户明确放弃本地结构冲突队列。 */
   const structuralConflictBlocked = isDesignStructuralConflictBlocked(state)
   /** 当前画布文档包含稳定项目 ID，可作为 Jotai 局部更新键。 */
@@ -130,7 +132,18 @@ export function DesignWorkspaceStateView({
             {state.snapshot.readOnlyReason ?? '设计工作区当前为只读'}
           </p>
         )}
-        {state.saveState === 'failed' && (
+        {state.authoritativeRecoveryState !== 'idle' && (
+          <div className="flex items-center gap-2 rounded border border-destructive/40 bg-background/95 px-2 py-1">
+            <p className="text-xs text-destructive">{state.error ?? '设计工作区恢复失败'}</p>
+            {state.authoritativeRecoveryState === 'failed' && (
+              <Button type="button" variant="outline" size="sm" onClick={onRetry}>
+                <RefreshCw className="size-3.5" aria-hidden="true" />
+                重试恢复
+              </Button>
+            )}
+          </div>
+        )}
+        {state.authoritativeRecoveryState === 'idle' && state.saveState === 'failed' && (
           <div className="flex items-center gap-2 rounded border border-destructive/40 bg-background/95 px-2 py-1">
             <p className="text-xs text-destructive">
               保存失败，内存修改已保留{state.error ? `：${state.error}` : ''}

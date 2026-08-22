@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import {
   createInitialDesignProjectState,
   designProjectStatesAtom,
+  updateDesignProjectStateAtom,
 } from '@/atoms/design-atoms'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import {
@@ -293,6 +294,45 @@ describe('Design 工作区画布接入', () => {
     const states = store.get(designProjectStatesAtom)
     expect(states.get('project-a')?.selectedNodeIds).toEqual([])
     expect(states.get('project-b')?.selectedNodeIds).toEqual(['node-b'])
+  })
+
+  test('Given 画布 writable prop 尚未更新但权威恢复已开始 When 旧视口回调迟到 Then 不写旧快照 mutation', () => {
+    let flowProps: DesignCanvasFlowProps | null = null
+    const store = createStore()
+    const document = createDocumentWithNode('project-a', 'node-a')
+    store.set(designProjectStatesAtom, new Map([['project-a', {
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: { document, writable: true },
+    }]]))
+    renderToStaticMarkup(
+      <Provider store={store}>
+        <DesignCanvas
+          document={document}
+          writable
+          activeTool="select"
+          selectedNodeIds={[]}
+          flowRenderer={(props) => {
+            flowProps = props
+            return <div data-flow-observer />
+          }}
+        />
+      </Provider>,
+    )
+    /** controller 已同步阻断，但 React 还未用 writable=false 重渲染画布。 */
+    store.set(updateDesignProjectStateAtom, {
+      projectId: 'project-a',
+      update: {
+        authoritativeRecoveryState: 'loading',
+        saveState: 'failed',
+      },
+    })
+
+    requireFlowProps(flowProps).onMoveEnd(null, { x: 90, y: 80, zoom: 2 })
+
+    const state = store.get(designProjectStatesAtom).get('project-a')!
+    expect(state.snapshot?.document.viewport).toEqual({ x: 0, y: 0, zoom: 1 })
+    expect(state.pendingMutations).toEqual([])
   })
 })
 

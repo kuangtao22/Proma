@@ -383,7 +383,10 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
     missing: Boolean(assetId && (!selectedAsset || missingAssetIds.has(assetId))),
   }
   /** 素材写操作需等待当前 revision 保存稳定；导出由面板单独保持可用。 */
-  const writable = state.snapshot.writable && !state.conflictRecoveryPending && state.saveState === 'saved'
+  const writable = state.snapshot.writable
+    && !state.conflictRecoveryPending
+    && state.authoritativeRecoveryState === 'idle'
+    && state.saveState === 'saved'
   return (
     <aside className="flex h-full min-h-0 shrink-0 flex-col border-l border-border bg-background" style={{ width }} aria-label="设计检查器">
       <header className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">

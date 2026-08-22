@@ -299,6 +299,39 @@ describe('Design Inspector 纯业务契约', () => {
     expect(state.history).toEqual([])
   })
 
+  test('Given 权威恢复正在加载或失败 When 请求导入 Then 不读取旧 revision', async () => {
+    const store = createStore()
+    const snapshot = createSnapshot()
+    /** 记录恢复阻断期间是否错误调用主进程导入。 */
+    let importCount = 0
+    const adapter: Pick<DesignAdapter, 'importAssets' | 'deleteAsset' | 'relinkAsset' | 'exportAsset'> = {
+      importAssets: async () => { importCount += 1; return snapshot },
+      deleteAsset: async () => snapshot.document,
+      relinkAsset: async () => snapshot.document,
+      exportAsset: async () => undefined,
+    }
+    let actions: ReturnType<typeof useDesignInspectorActions> | null = null
+    const Probe = (): null => {
+      actions = useDesignInspectorActions('project-1', adapter)
+      return null
+    }
+    renderToStaticMarkup(<Provider store={store}><Probe /></Provider>)
+
+    for (const authoritativeRecoveryState of ['loading', 'failed'] as const) {
+      store.set(designProjectStatesAtom, new Map([['project-1', {
+        ...createInitialDesignProjectState(),
+        phase: 'ready',
+        snapshot,
+        authoritativeRecoveryState,
+        saveState: 'saved',
+      }]]))
+      actions!.importAssets()
+    }
+    await Promise.resolve()
+
+    expect(importCount).toBe(0)
+  })
+
   test('Given 首次导入要求恢复 When 权威重载完成后再次导入 Then 回调接管恢复且导入可以重试', async () => {
     const store = createStore()
     const staleSnapshot = createSnapshot()

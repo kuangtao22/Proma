@@ -288,6 +288,11 @@ describe('Design 工作区同步规则', () => {
 
     harness.controller.reloadAuthoritativeSnapshot()
     expect(harness.loadRequests).toHaveLength(1)
+    expect(harness.getState()).toMatchObject({
+      authoritativeRecoveryState: 'loading',
+      saveState: 'failed',
+      error: '正在恢复设计工作区，请稍候',
+    })
 
     /** 主进程恢复完成后重新签发的权威文档与媒体访问 URL。 */
     const authoritativeSnapshot: DesignWorkspaceSnapshot = {
@@ -309,6 +314,48 @@ describe('Design 工作区同步规则', () => {
       pendingMutations: [],
       saveState: 'saved',
       conflictRecoveryPending: false,
+      authoritativeRecoveryState: 'idle',
+      error: null,
+    })
+  })
+
+  test('Given 权威恢复加载失败 When 用户重试并成功 Then 保持阻断直到新快照接管后解锁', async () => {
+    const staleSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 10), revision: 3 },
+      writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: staleSnapshot,
+    })
+
+    harness.controller.reloadAuthoritativeSnapshot()
+    harness.loadRequests[0]!.reject(new Error('磁盘暂时不可读'))
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      snapshot: staleSnapshot,
+      authoritativeRecoveryState: 'failed',
+      saveState: 'failed',
+      error: '恢复设计工作区失败：磁盘暂时不可读',
+    })
+
+    harness.controller.retryLoad()
+    expect(harness.loadRequests).toHaveLength(2)
+    expect(harness.getState().authoritativeRecoveryState).toBe('loading')
+
+    const authoritativeSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 20), revision: 4 },
+      writable: true,
+    }
+    harness.loadRequests[1]!.resolve(authoritativeSnapshot)
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      snapshot: authoritativeSnapshot,
+      authoritativeRecoveryState: 'idle',
+      saveState: 'saved',
       error: null,
     })
   })

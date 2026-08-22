@@ -90,6 +90,44 @@ describe('Design 工作区页面状态', () => {
     expect(html).toContain('重试保存')
   })
 
+  test('Given 权威恢复加载中或失败 When 渲染 Then 显示独立恢复状态且失败可重试', () => {
+    const loadingHtml = renderToStaticMarkup(
+      <DesignWorkspaceStateView
+        state={{
+          ...createInitialDesignProjectState(),
+          phase: 'ready',
+          snapshot: createSnapshot(),
+          authoritativeRecoveryState: 'loading',
+          saveState: 'failed',
+          error: '正在恢复设计工作区，请稍候',
+        }}
+        onRetry={() => undefined}
+        onRetrySave={() => undefined}
+      />,
+    )
+    expect(loadingHtml).toContain('正在恢复设计工作区，请稍候')
+    expect(loadingHtml).not.toContain('重试恢复')
+    expect(loadingHtml).not.toContain('保存失败')
+
+    const failedHtml = renderToStaticMarkup(
+      <DesignWorkspaceStateView
+        state={{
+          ...createInitialDesignProjectState(),
+          phase: 'ready',
+          snapshot: createSnapshot(),
+          authoritativeRecoveryState: 'failed',
+          saveState: 'failed',
+          error: '恢复设计工作区失败：磁盘暂时不可读',
+        }}
+        onRetry={() => undefined}
+        onRetrySave={() => undefined}
+      />,
+    )
+    expect(failedHtml).toContain('恢复设计工作区失败：磁盘暂时不可读')
+    expect(failedHtml).toContain('重试恢复')
+    expect(failedHtml).not.toContain('重试保存')
+  })
+
   test('Given 选中 job 且历史会结构修改 job When 渲染 Then 分组取消分组与历史命令均禁用', () => {
     /** job 节点及其结构历史不能进入 Renderer 乐观编辑。 */
     const document = createEmptyDesignDocument('project-1', 10)

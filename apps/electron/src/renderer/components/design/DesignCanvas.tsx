@@ -209,7 +209,9 @@ export function DesignCanvas({
     updateProjectState({
       projectId: document.projectId,
       update: (current) => {
-        if (!current.snapshot) return {}
+        if (!current.snapshot?.writable
+          || current.conflictRecoveryPending
+          || current.authoritativeRecoveryState !== 'idle') return {}
         return {
           snapshot: {
             ...current.snapshot,

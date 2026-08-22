@@ -22,6 +22,8 @@ export const DESIGN_SAVE_DEBOUNCE_MS = 400
 const DESIGN_REVISION_CONFLICT_CODE = 'DESIGN_REVISION_CONFLICT'
 /** 主进程发现磁盘恢复后要求 Renderer 重新加载的稳定识别码。 */
 const DESIGN_RECOVERY_REQUIRED_CODE = 'DESIGN_RECOVERY_REQUIRED'
+/** 权威恢复开始后展示并用于阻断旧快照写入的稳定状态提示。 */
+const DESIGN_AUTHORITATIVE_RECOVERY_LOADING_MESSAGE = '正在恢复设计工作区，请稍候'
 /** 用户可理解的保存冲突提示。 */
 const DESIGN_REVISION_CONFLICT_MESSAGE = '保存冲突：设计画布已在其他位置更新，请重试保存'
 /** 结构 mutation 无法安全自动重放时的阻断提示。 */
@@ -318,6 +320,8 @@ export function createDesignWorkspaceController(
   let disposed = false
   /** 当前 controller 是否已有冲突恢复 load 在途，避免重复请求。 */
   let conflictRecoveryInFlight = false
+  /** 当前 controller 是否已有强制权威恢复 load 在途，避免重复请求。 */
+  let authoritativeRecoveryInFlight = false
 
   /**
    * 加载并按返回时最新状态决定是否提交快照。
@@ -331,7 +335,9 @@ export function createDesignWorkspaceController(
   ): Promise<void> => {
     if (disposed) return
     if (rebasePendingAfterConflict && conflictRecoveryInFlight) return
+    if (forceAuthoritative && authoritativeRecoveryInFlight) return
     if (rebasePendingAfterConflict) conflictRecoveryInFlight = true
+    if (forceAuthoritative) authoritativeRecoveryInFlight = true
     /** 本次 load 的稳定递增序号。 */
     const requestSequence = latestLoadSequence + 1
     latestLoadSequence = requestSequence
@@ -357,6 +363,7 @@ export function createDesignWorkspaceController(
           pendingMutations: [],
           saveState: 'saved',
           conflictRecoveryPending: false,
+          authoritativeRecoveryState: 'idle',
           error: null,
         })
         if (snapshot.recoveredFrom) dependencies.onRecovered?.(snapshot)
@@ -418,10 +425,21 @@ export function createDesignWorkspaceController(
       if (snapshot.recoveredFrom) dependencies.onRecovered?.(snapshot)
     } catch (error) {
       if (disposed || requestSequence !== latestLoadSequence) return
+      if (forceAuthoritative) {
+        /** 旧快照只保留为只读参考，直到用户重试并成功接管权威基线。 */
+        dependencies.updateState({
+          phase: 'ready',
+          saveState: 'failed',
+          authoritativeRecoveryState: 'failed',
+          error: `恢复设计工作区失败：${getDesignErrorMessage(error)}`,
+        })
+        return
+      }
       if (dependencies.getState().snapshot) return
       dependencies.updateState({ phase: 'error', error: getDesignErrorMessage(error) })
     } finally {
       if (rebasePendingAfterConflict) conflictRecoveryInFlight = false
+      if (forceAuthoritative) authoritativeRecoveryInFlight = false
     }
   }
 
@@ -440,8 +458,22 @@ export function createDesignWorkspaceController(
     && state.saveState !== 'saving'
     && state.saveState !== 'failed'
     && !state.conflictRecoveryPending
+    && state.authoritativeRecoveryState === 'idle'
     && !conflictRecoveryInFlight,
   )
+
+  /** 开始强制权威恢复并同步把旧快照切换为只读状态。 */
+  const startAuthoritativeRecovery = (): void => {
+    if (disposed || authoritativeRecoveryInFlight) return
+    clearSaveTimer()
+    dependencies.updateState({
+      phase: 'ready',
+      saveState: 'failed',
+      authoritativeRecoveryState: 'loading',
+      error: DESIGN_AUTHORITATIVE_RECOVERY_LOADING_MESSAGE,
+    })
+    void loadSnapshot(false, true)
+  }
 
   /** 按最新状态重新安排一次 400ms 自动保存。 */
   const scheduleSave = (): void => {
@@ -507,6 +539,10 @@ export function createDesignWorkspaceController(
       })
       /** mount 时优先恢复上个 controller 留下的 revision 冲突。 */
       const current = dependencies.getState()
+      if (current.authoritativeRecoveryState !== 'idle') {
+        startAuthoritativeRecovery()
+        return
+      }
       const recoverConflict = current.conflictRecoveryPending && !isDesignStructuralConflictBlocked(current)
       void loadSnapshot(recoverConflict)
     },
@@ -514,6 +550,10 @@ export function createDesignWorkspaceController(
       if (disposed) return
       /** sync 时读取最新共享状态，接管其他 controller 异步留下的冲突恢复任务。 */
       const latest = dependencies.getState()
+      if (latest.authoritativeRecoveryState !== 'idle' || authoritativeRecoveryInFlight) {
+        clearSaveTimer()
+        return
+      }
       if (isDesignStructuralConflictBlocked(latest)) {
         clearSaveTimer()
         return
@@ -528,6 +568,11 @@ export function createDesignWorkspaceController(
       if (disposed) return
       /** 重试前读取的最新状态，用于缓存画布保持 ready。 */
       const latest = dependencies.getState()
+      if (latest.authoritativeRecoveryState === 'loading' || authoritativeRecoveryInFlight) return
+      if (latest.authoritativeRecoveryState === 'failed') {
+        startAuthoritativeRecovery()
+        return
+      }
       if (isDesignStructuralConflictBlocked(latest)) return
       if (latest.conflictRecoveryPending || conflictRecoveryInFlight) {
         void loadSnapshot(true)
@@ -540,15 +585,13 @@ export function createDesignWorkspaceController(
       void loadSnapshot()
     },
     reloadAuthoritativeSnapshot: () => {
-      if (disposed) return
-      /** 导入前状态必须已保存；仍先取消定时器，避免异常边界上的旧任务提交。 */
-      clearSaveTimer()
-      void loadSnapshot(false, true)
+      startAuthoritativeRecovery()
     },
     retrySave: () => {
       if (disposed) return
       /** retry 时的最新状态用于优先完成冲突恢复。 */
       const latest = dependencies.getState()
+      if (latest.authoritativeRecoveryState !== 'idle' || authoritativeRecoveryInFlight) return
       if (isDesignStructuralConflictBlocked(latest)) return
       if (latest.conflictRecoveryPending || conflictRecoveryInFlight) {
         void loadSnapshot(true)
@@ -572,6 +615,7 @@ export function createDesignWorkspaceController(
         pendingMutations: [],
         saveState: 'saved',
         conflictRecoveryPending: false,
+        authoritativeRecoveryState: 'idle',
         error: null,
       })
     },
@@ -659,6 +703,7 @@ export function useDesignWorkspace(
   }, [
     projectId,
     state?.conflictRecoveryPending,
+    state?.authoritativeRecoveryState,
     state?.pendingMutations,
     state?.saveState,
     state?.snapshot,
