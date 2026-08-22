@@ -324,6 +324,7 @@ import {
   getWorkspaceCapabilities,
   getAgentWorkspace,
   getAgentWorkspaceBySlug,
+  getLocalProjectRootStatus,
   getProjectFilesPath,
   deleteWorkspaceSkill,
   importSkillFromWorkspace,
@@ -1067,6 +1068,21 @@ export function registerIpcHandlers(): void {
     guard: workspaceOperationGuard,
     store: designStore,
     assets: designAssetService,
+    getProjectReadOnlyReason: (projectId) => {
+      /** 未登记项目仍交给 store 抛出明确的项目不存在错误。 */
+      const workspace = getAgentWorkspace(projectId)
+      if (!workspace) return undefined
+      /** 外部项目不可访问时禁止创建同名替代目录。 */
+      const rootStatus = getLocalProjectRootStatus(workspace.projectRootPath)
+      if (rootStatus && rootStatus !== 'available') {
+        return '项目路径不可访问，设计工作区已切换为只读'
+      }
+      /** 项目迁移期间保留最后画布，只暂停媒体重绑和写入。 */
+      if (getWorkspaceOperationBlockReason(projectId)) {
+        return '项目路径不可访问，设计工作区已切换为只读'
+      }
+      return undefined
+    },
     pickImageFiles: async (sender) => {
       /** 图片路径只由主进程系统选择器产生，renderer 无法注入任意路径。 */
       const owner = BrowserWindow.fromWebContents(sender)

@@ -52,6 +52,14 @@ export interface DesignAssetImportSource {
   prompt?: string
 }
 
+/** 已 promotion 的导入批次；调用方必须在元数据结果明确后提交或回滚。 */
+export interface DesignAssetImportBatch extends Array<DesignAsset> {
+  /** 元数据已提交后消费 journal；清理失败只保留恢复证据，不反向报错。 */
+  commit: () => void
+  /** 元数据未提交时删除未引用文件；磁盘已引用时 fail safe 保留。 */
+  rollback: () => void
+}
+
 /** 素材服务仅依赖可信路径、revision store 与主进程能力。 */
 export interface DesignAssetServiceDependencies {
   /** 从稳定项目 ID 解析项目正式目录与可重建缓存目录。 */
@@ -143,6 +151,19 @@ interface ValidatedImage {
   width: number
   height: number
   sha256: string
+}
+
+/** 为普通数组附加不可枚举事务方法，保持既有数组读取语义。 */
+function createDesignAssetImportBatch(
+  assets: DesignAsset[],
+  commit: () => void,
+  rollback: () => void,
+): DesignAssetImportBatch {
+  Object.defineProperties(assets, {
+    commit: { value: commit, enumerable: false },
+    rollback: { value: rollback, enumerable: false },
+  })
+  return assets as DesignAssetImportBatch
 }
 
 /** 跨崩溃恢复正式文件 promotion 的最小 journal。 */
@@ -535,9 +556,11 @@ export class DesignAssetService {
     projectId: string,
     sourcePaths: string[],
     source: DesignAssetImportSource,
-  ): Promise<DesignAsset[]> {
+  ): Promise<DesignAssetImportBatch> {
     return this.dependencies.runWorkspaceWrite(projectId, async () => {
-      if (sourcePaths.length === 0) return []
+      if (sourcePaths.length === 0) {
+        return createDesignAssetImportBatch([], () => undefined, () => undefined)
+      }
       /** stat 只读取大小，累计预算在任何 Buffer 或 Sharp 解码前拒绝。 */
       const byteSizes = sourcePaths.map((sourcePath) => lstatSync(sourcePath).size)
       return this.processingQueue.run(byteSizes, async () => {
@@ -569,7 +592,56 @@ export class DesignAssetService {
           )
           committedPaths.push(staged.finalThumbnailPath)
         }
-        return stagedAssets.map((item) => item.asset)
+        /** 返回给 IPC 的素材数组仍保持普通数组语义。 */
+        const assets = stagedAssets.map((item) => item.asset)
+        /** 精确事务只管理本批次 journal，不扫描或接管其他进行中任务。 */
+        let settled = false
+        const commit = (): void => {
+          if (settled || !journalPath) return
+          try {
+            removePromotionJournal(journalPath)
+            settled = true
+          } catch (error) {
+            this.warn(`Design promotion journal 延迟清理: ${journalPath}: ${String(error)}`)
+          }
+        }
+        const rollback = (): void => {
+          if (settled || !journalPath) return
+          /** 先读取磁盘事实，处理 JSON 已 rename 但 durability 同步失败的模糊提交。 */
+          let persistedAssets: DesignAsset[]
+          try {
+            persistedAssets = this.dependencies.store.load(projectId).document.assets
+          } catch (error) {
+            this.warn(`Design promotion 回滚状态无法确认，已保留恢复证据: ${String(error)}`)
+            return
+          }
+          /** 只有未被当前画布精确引用的文件才允许删除。 */
+          let rollbackComplete = true
+          for (const staged of stagedAssets) {
+            const referenced = persistedAssets.some((asset) => (
+              asset.id === staged.asset.id
+              && asset.relativePath === staged.asset.relativePath
+              && asset.thumbnailRelativePath === staged.asset.thumbnailRelativePath
+            ))
+            if (referenced) continue
+            for (const filePath of [staged.finalAssetPath, staged.finalThumbnailPath]) {
+              try {
+                rmSync(filePath, { force: true })
+              } catch (error) {
+                rollbackComplete = false
+                this.warn(`Design promotion 回滚文件失败: ${filePath}: ${String(error)}`)
+              }
+            }
+          }
+          if (!rollbackComplete) return
+          try {
+            removePromotionJournal(journalPath)
+            settled = true
+          } catch (error) {
+            this.warn(`Design promotion journal 延迟清理: ${journalPath}: ${String(error)}`)
+          }
+        }
+        return createDesignAssetImportBatch(assets, commit, rollback)
       } catch (error) {
         for (const committedPath of committedPaths) removeUncommittedPath(committedPath)
         if (journalPath && committedPaths.every((filePath) => !existsSync(filePath))) {

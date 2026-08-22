@@ -97,6 +97,43 @@ describe('Design 素材安全服务', () => {
     expect((await sharp(thumbnailPath).metadata()).format).toBe('webp')
   })
 
+  test('Given 导入元数据已提交 When 确认批次 Then 保留正式文件并消费精确 journal', async () => {
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = batch[0]!
+    store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+    expect(listPromotionJournals()).toHaveLength(1)
+
+    batch.commit()
+
+    expect(existsSync(join(paths.designRoot, asset.relativePath))).toBe(true)
+    expect(existsSync(join(paths.cacheRoot, asset.thumbnailRelativePath))).toBe(true)
+    expect(listPromotionJournals()).toEqual([])
+  })
+
+  test('Given 导入元数据提交失败 When 回滚批次 Then 删除未引用正式文件和精确 journal', async () => {
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = batch[0]!
+    expect(listPromotionJournals()).toHaveLength(1)
+
+    batch.rollback()
+
+    expect(existsSync(join(paths.designRoot, asset.relativePath))).toBe(false)
+    expect(existsSync(join(paths.cacheRoot, asset.thumbnailRelativePath))).toBe(false)
+    expect(listPromotionJournals()).toEqual([])
+  })
+
+  test('Given 元数据实际已落盘但调用方收到异常 When 回滚批次 Then 按磁盘引用保留文件', async () => {
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    const asset = batch[0]!
+    store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+
+    batch.rollback()
+
+    expect(existsSync(join(paths.designRoot, asset.relativePath))).toBe(true)
+    expect(existsSync(join(paths.cacheRoot, asset.thumbnailRelativePath))).toBe(true)
+    expect(listPromotionJournals()).toEqual([])
+  })
+
   test('Given JPEG、GIF 与 WebP When 导入 Then 按真实签名记录规范媒体类型', async () => {
     /** 三种其余受支持格式及预期 MIME。 */
     const fixtures = [

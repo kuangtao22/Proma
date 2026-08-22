@@ -1,4 +1,4 @@
-import { DESIGN_IPC_CHANNELS } from '@proma/shared'
+import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
 import type {
   DeleteDesignAssetInput,
   DesignAnnotation,
@@ -16,7 +16,7 @@ import type {
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
-import type { DesignAssetService } from './design-asset-service'
+import type { DesignAssetImportBatch, DesignAssetService } from './design-asset-service'
 import type { DesignStore } from './design-store'
 
 /** Renderer 可提交的画布 mutation 白名单，素材元数据只能由主进程服务维护。 */
@@ -40,10 +40,25 @@ export interface DesignIpcRegistrar {
   removeHandler: (channel: string) => void
 }
 
+/** Design IPC 注册结果，允许应用退出或热重载时显式清理。 */
+export interface DesignIpcRegistration {
+  /** 本次注册的全部通道。 */
+  channels: string[]
+  /** 移除 handler、窗口监听器与媒体授权。 */
+  dispose: () => void
+}
+
+/** 同一 IPC registrar 的上一次注册，避免热重载遗留媒体授权。 */
+const activeRegistrations = new WeakMap<DesignIpcRegistrar, () => void>()
+
 /** IPC 层实际使用的素材服务窄接口。 */
 export interface DesignIpcAssetService extends Pick<
   DesignAssetService,
-  'importAuthorizedFiles' | 'deleteAsset' | 'relinkAsset' | 'exportAsset' | 'createMediaAccess'
+  | 'importAuthorizedFiles'
+  | 'deleteAsset'
+  | 'relinkAsset'
+  | 'exportAsset'
+  | 'createMediaAccess'
 > {}
 
 /** 注册 Design IPC 所需的可信主进程依赖。 */
@@ -56,6 +71,8 @@ export interface DesignIpcOptions {
   pickImageFiles: (sender: WebContents) => Promise<string[]>
   pickRelinkImageFile: (sender: WebContents) => Promise<string | null>
   pickExportPath: (sender: WebContents, filename: string) => Promise<string | null>
+  /** 项目路径离线或迁移时返回稳定只读原因，正常可读时返回 undefined。 */
+  getProjectReadOnlyReason: (projectId: string) => string | undefined
 }
 
 /** 普通对象运行时判定。 */
@@ -199,6 +216,9 @@ function parseSaveInput(value: unknown): SaveDesignMutationsInput {
       throw new Error('不允许通过画布保存修改素材')
     }
     if (!isRendererMutation(mutation)) throw new Error('Design 请求结构无效')
+    if (mutation.type === 'upsert-nodes' && mutation.nodes.some((node) => node.kind === 'job')) {
+      throw new Error('不允许通过画布保存创建任务节点')
+    }
   }
   return {
     projectId: value.projectId,
@@ -238,9 +258,20 @@ function broadcastChange(options: DesignIpcOptions, change: DesignChangeEvent): 
 }
 
 /** 注册 Task 4 已具备业务服务的七个 Design IPC handler。 */
-export function registerDesignIpcHandlers(options: DesignIpcOptions): string[] {
-  /** 每个窗口当前拥有的目录级媒体授权释放器。 */
-  const mediaReleases = new Map<number, () => void>()
+export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcRegistration {
+  activeRegistrations.get(options.ipc)?.()
+
+  /** 每个窗口当前拥有的目录级媒体授权。 */
+  const mediaAccessBySender = new Map<number, {
+    sender: WebContents
+    projectId: string
+    assetBaseUrl: string
+    thumbnailBaseUrl: string
+    release: () => void
+    onDestroyed: () => void
+  }>()
+  /** 进程内最后一次成功读取的快照，供项目临时离线时只读展示。 */
+  const lastReadableSnapshots = new Map<string, DesignWorkspaceSnapshot>()
   /** 本任务实际注册的通道，供测试和未来增量注册使用。 */
   const channels = [
     DESIGN_IPC_CHANNELS.LOAD,
@@ -253,15 +284,69 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): string[] {
   ]
   for (const channel of channels) options.ipc.removeHandler(channel)
 
+  /** 释放单个窗口的媒体授权与 destroyed 监听器。 */
+  const releaseMediaAccess = (senderId: number): void => {
+    const access = mediaAccessBySender.get(senderId)
+    if (!access) return
+    mediaAccessBySender.delete(senderId)
+    access.sender.removeListener('destroyed', access.onDestroyed)
+    access.release()
+  }
+
+  /** 为返回给指定窗口的快照补回当前项目媒体 URL。 */
+  const attachMediaAccess = (
+    sender: WebContents,
+    projectId: string,
+    snapshot: DesignWorkspaceSnapshot,
+  ): DesignWorkspaceSnapshot => {
+    const access = mediaAccessBySender.get(sender.id)
+    if (!access || access.projectId !== projectId) return snapshot
+    return {
+      ...snapshot,
+      assetBaseUrl: access.assetBaseUrl,
+      thumbnailBaseUrl: access.thumbnailBaseUrl,
+    }
+  }
+
+  /** 用最新 document 更新离线只读缓存，同时保留恢复来源等快照元数据。 */
+  const rememberDocument = (projectId: string, document: DesignCanvasDocument): void => {
+    const previous = lastReadableSnapshots.get(projectId)
+    lastReadableSnapshots.set(projectId, {
+      ...(previous ?? { writable: true }),
+      document,
+      writable: true,
+    })
+  }
+
   options.ipc.handle(DESIGN_IPC_CHANNELS.LOAD, async (event, value): Promise<DesignWorkspaceSnapshot> => {
     const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseProjectInput(value)
-    mediaReleases.get(sender.id)?.()
-    mediaReleases.delete(sender.id)
+    releaseMediaAccess(sender.id)
+    /** 离线或迁移状态必须在 store 解析路径、创建目录之前短路。 */
+    const readOnlyReason = options.getProjectReadOnlyReason(input.projectId)
+    if (readOnlyReason) {
+      const cached = lastReadableSnapshots.get(input.projectId)
+      return {
+        document: cached?.document ?? createEmptyDesignDocument(input.projectId),
+        writable: false,
+        readOnlyReason,
+      }
+    }
     const snapshot = options.store.load(input.projectId)
+    lastReadableSnapshots.set(input.projectId, snapshot)
     if (!snapshot.writable) return snapshot
     const access = options.assets.createMediaAccess(input.projectId)
-    mediaReleases.set(sender.id, access.release)
+    /** 窗口异常退出时沿用同一释放路径，避免 token 等待 TTL。 */
+    const onDestroyed = (): void => releaseMediaAccess(sender.id)
+    mediaAccessBySender.set(sender.id, {
+      sender,
+      projectId: input.projectId,
+      assetBaseUrl: access.assetBaseUrl,
+      thumbnailBaseUrl: access.thumbnailBaseUrl,
+      release: access.release,
+      onDestroyed,
+    })
+    sender.once('destroyed', onDestroyed)
     return { ...snapshot, assetBaseUrl: access.assetBaseUrl, thumbnailBaseUrl: access.thumbnailBaseUrl }
   })
 
@@ -271,6 +356,7 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): string[] {
     const document = await options.guard.runWorkspaceWrite(input.projectId, () => (
       options.store.mutate(input.projectId, input.expectedRevision, input.mutations)
     ))
+    rememberDocument(input.projectId, document)
     if (input.mutations.length > 0) {
       broadcastChange(options, { projectId: input.projectId, revision: document.revision, cause: 'canvas' })
     }
@@ -281,17 +367,34 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): string[] {
     const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseProjectInput(value)
     return options.guard.runWorkspaceWrite(input.projectId, async () => {
-      const sourcePaths = await options.pickImageFiles(sender)
-      if (sourcePaths.length === 0) return options.store.load(input.projectId)
-      const assets = await options.assets.importAuthorizedFiles(input.projectId, sourcePaths, { kind: 'picker' })
-      const current = options.store.load(input.projectId)
-      const document = assets.length === 0
-        ? current.document
-        : options.store.mutate(input.projectId, current.document.revision, [{ type: 'upsert-assets', assets }])
-      if (assets.length > 0) {
-        broadcastChange(options, { projectId: input.projectId, revision: document.revision, cause: 'asset' })
+      /** 只有本次调用创建的批次允许在错误路径回滚。 */
+      let importBatch: DesignAssetImportBatch | undefined
+      try {
+        const sourcePaths = await options.pickImageFiles(sender)
+        if (sourcePaths.length === 0) {
+          return attachMediaAccess(sender, input.projectId, options.store.load(input.projectId))
+        }
+        importBatch = await options.assets.importAuthorizedFiles(input.projectId, sourcePaths, { kind: 'picker' })
+        const current = options.store.load(input.projectId)
+        const document = importBatch.length === 0
+          ? current.document
+          : options.store.mutate(input.projectId, current.document.revision, [{
+              type: 'upsert-assets',
+              assets: importBatch,
+            }])
+        /** commit 内部仅清理本批次 journal，失败只告警，不把已提交 revision 反报失败。 */
+        importBatch.commit()
+        if (importBatch.length > 0) {
+          broadcastChange(options, { projectId: input.projectId, revision: document.revision, cause: 'asset' })
+        }
+        const snapshot = { ...current, document }
+        lastReadableSnapshots.set(input.projectId, snapshot)
+        return attachMediaAccess(sender, input.projectId, snapshot)
+      } catch (error) {
+        /** rollback 会重新读取 canvas；若 JSON 实际已提交则保留文件并消费 journal。 */
+        importBatch?.rollback()
+        throw error
       }
-      return { ...current, document }
     })
   })
 
@@ -301,6 +404,7 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): string[] {
     const document = await options.guard.runWorkspaceWrite(input.projectId, () => (
       options.assets.deleteAsset(input.projectId, input.assetId, input.expectedRevision)
     ))
+    rememberDocument(input.projectId, document)
     broadcastChange(options, { projectId: input.projectId, revision: document.revision, cause: 'asset' })
     return document
   })
@@ -317,6 +421,7 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): string[] {
         sourcePath,
         input.expectedRevision,
       )
+      rememberDocument(input.projectId, document)
       broadcastChange(options, { projectId: input.projectId, revision: document.revision, cause: 'asset' })
       return document
     })
@@ -334,9 +439,18 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): string[] {
   options.ipc.handle(DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS, async (event, value): Promise<void> => {
     const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
     if (value !== undefined) throw new Error('Design 请求结构无效')
-    mediaReleases.get(sender.id)?.()
-    mediaReleases.delete(sender.id)
+    releaseMediaAccess(sender.id)
   })
 
-  return channels
+  /** 幂等释放当前注册拥有的全部资源。 */
+  let disposed = false
+  const dispose = (): void => {
+    if (disposed) return
+    disposed = true
+    for (const senderId of [...mediaAccessBySender.keys()]) releaseMediaAccess(senderId)
+    for (const channel of channels) options.ipc.removeHandler(channel)
+    if (activeRegistrations.get(options.ipc) === dispose) activeRegistrations.delete(options.ipc)
+  }
+  activeRegistrations.set(options.ipc, dispose)
+  return { channels, dispose }
 }
