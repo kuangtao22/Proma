@@ -8,7 +8,6 @@
 
 import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { appModeAtom } from '@/atoms/app-mode'
 import {
   currentAgentSessionIdAtom,
   agentSessionPathMapAtom,
@@ -16,9 +15,20 @@ import {
 } from '@/atoms/agent-atoms'
 import type { AgentSidePanelTab } from '@/atoms/agent-atoms'
 import { SidePanel } from '@/components/agent/SidePanel'
+import { DesignInspector } from '@/components/design/DesignInspector'
+import type { RightPanelMode } from './design-layout'
 
-export function RightSidePanel({ width }: { width?: number }): React.ReactElement | null {
-  const appMode = useAtomValue(appModeAtom)
+export interface RightSidePanelProps {
+  /** 右栏内容类型，由 AppShell 统一计算。 */
+  mode: RightPanelMode
+  /** 设计模式绑定的当前项目。 */
+  projectId: string | null
+  /** 用户可拖拽调整的右栏宽度。 */
+  width?: number
+}
+
+/** 根据布局模式渲染会话文件面板或项目设计检查器。 */
+export function RightSidePanel({ mode, projectId, width }: RightSidePanelProps): React.ReactElement | null {
   const currentSessionId = useAtomValue(currentAgentSessionIdAtom)
   const sessionPathMap = useAtomValue(agentSessionPathMapAtom)
   const diffPanelTabMap = useAtomValue(agentDiffPanelTabAtom)
@@ -33,7 +43,11 @@ export function RightSidePanel({ width }: { width?: number }): React.ReactElemen
     })
   }, [currentSessionId, setDiffPanelTabMap])
 
-  if (appMode !== 'agent' || !currentSessionId) {
+  if (mode === 'design') {
+    return projectId ? <DesignInspector projectId={projectId} width={width} /> : null
+  }
+
+  if (mode !== 'agent' || !currentSessionId) {
     return null
   }
 
