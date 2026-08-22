@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
@@ -574,6 +582,63 @@ describe('Design IPC', () => {
     )).rejects.toThrow('Design 请求结构无效')
     expect(pickerCalled).toBe(false)
     expect(fixture.guardProjects).toEqual([])
+  })
+
+  test('Given tmp 或 backup 恢复候选 When 导入素材 Then 在选择和 staging 前要求先重载', async () => {
+    for (const recoverySource of ['tmp', 'backup'] as const) {
+      const projectRoot = mkdtempSync(join(tmpdir(), `proma-design-import-${recoverySource}-`))
+      const configRoot = mkdtempSync(join(tmpdir(), `proma-design-config-${recoverySource}-`))
+      try {
+        const pathResolver = createDesignPathResolver({
+          getWorkspace: () => ({
+            id: 'project-1', name: '项目', slug: 'stable-slug', projectRootPath: projectRoot,
+            createdAt: 1, updatedAt: 1,
+          }),
+          getProjectFilesPath: () => projectRoot,
+          getConfigDir: () => configRoot,
+        })
+        const store = createDesignStore({ pathResolver, now: () => 100 })
+        const persisted = store.mutate('project-1', 0, [{
+          type: 'set-viewport', viewport: { x: 10, y: 20, zoom: 1 },
+        }])
+        const canvasPath = pathResolver.resolve('project-1').canvasPath
+        if (recoverySource === 'tmp') {
+          renameSync(canvasPath, `${canvasPath}.tmp`)
+        } else {
+          writeFileSync(`${canvasPath}.bak`, readFileSync(canvasPath))
+          writeFileSync(canvasPath, '{ broken', 'utf8')
+        }
+        const fixture = createFixture()
+        /** 选择器和素材服务都不得在恢复提示前运行。 */
+        let pickerCalls = 0
+        let stagingCalls = 0
+        fixture.options.store = store
+        fixture.options.pickImageFiles = async () => {
+          pickerCalls += 1
+          return ['/trusted/a.png']
+        }
+        fixture.options.assets.importAuthorizedFiles = async () => {
+          stagingCalls += 1
+          throw new Error('恢复状态下不应创建 staging')
+        }
+        registerDesignIpcHandlers(fixture.options)
+
+        await expect(invoke(
+          fixture.handlers,
+          DESIGN_IPC_CHANNELS.IMPORT_ASSETS,
+          fixture.senders[0]!,
+          { projectId: 'project-1', expectedRevision: persisted.revision, viewportCenter: { x: 10, y: 20 } },
+        )).rejects.toThrow(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${recoverySource}`)
+        const afterRecovery = store.load('project-1').document
+        expect(pickerCalls).toBe(0)
+        expect(stagingCalls).toBe(0)
+        expect(afterRecovery.assets).toEqual([])
+        expect(afterRecovery.nodes).toEqual([])
+      } finally {
+        rmSync(projectRoot, { recursive: true, force: true })
+        rmSync(configRoot, { recursive: true, force: true })
+      }
+    }
   })
 
   test('Given canvas 已落盘但 durability 报错 When 实际导入 handler 回滚 Then 重启按磁盘引用恢复', async () => {

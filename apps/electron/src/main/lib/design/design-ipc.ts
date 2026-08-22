@@ -501,6 +501,11 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
       /** 只有本次调用创建的批次允许在错误路径回滚。 */
       let importBatch: DesignAssetImportBatch | undefined
       try {
+        /** 在打开选择器和创建 staging 前显式传播安全恢复，避免后续 load 消费标志。 */
+        const preflight = options.store.load(input.projectId)
+        if (preflight.recoveredFrom) {
+          throw new Error(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${preflight.recoveredFrom}`)
+        }
         const sourcePaths = await options.pickImageFiles(sender)
         if (sourcePaths.length === 0) {
           return attachMediaAccess(sender, input.projectId, options.store.load(input.projectId))

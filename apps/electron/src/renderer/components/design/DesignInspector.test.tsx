@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { createEmptyDesignDocument } from '@proma/shared'
 import type { CreateDesignJobInput, DesignAsset, DesignWorkspaceSnapshot } from '@proma/shared'
 import { createStore, Provider } from 'jotai'
+import * as React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createInitialDesignProjectState, designProjectStatesAtom } from '@/atoms/design-atoms'
 import type { DesignAdapter } from '@/lib/design-adapter'
@@ -10,7 +11,9 @@ import {
   createDesignGenerationJobInput,
   DesignInspectorStateView,
   serializeDesignGenerationPrompt,
+  useDesignVersionRows,
 } from './DesignInspector'
+import { buildDesignVersionTree } from './design-version-tree'
 import {
   getDesignAssetDeleteBlockReason,
   useDesignInspectorActions,
@@ -149,6 +152,18 @@ describe('Design Inspector 状态', () => {
     expect(html).toMatch(/创建分组[\s\S]*disabled=""|disabled=""[^>]*>创建分组/)
   })
 
+  test('Given 单选 job 节点 When 渲染 AI 标签 Then 显示不可编辑且不降级为生成表单', () => {
+    const snapshot = createSnapshot()
+    snapshot.document.nodes = [{
+      id: 'job-node', kind: 'job', jobId: 'job-1', position: { x: 30, y: 40 },
+      width: 320, height: 240, zIndex: 1,
+    }]
+    const html = renderInspector(['job-node'], snapshot)
+
+    expect(html).toContain('AI 编辑仅支持单个素材节点')
+    expect(html).not.toContain('生成图片')
+  })
+
   test('Given 仅右栏素材选中 When 渲染 Then 清除选择可用', () => {
     const snapshot = createSnapshot()
     snapshot.document.nodes = []
@@ -165,9 +180,42 @@ describe('Design Inspector 状态', () => {
     expect(html).toMatch(/id="design-edit-prompt" disabled=""/)
     expect(html).toMatch(/type="submit" disabled=""[^>]*>[\s\S]*开始编辑/)
   })
+
+  test('Given AI 编辑与生成选择器 When 渲染 Then Label 与 Trigger 通过 id 关联', () => {
+    const generationHtml = renderInspector([])
+    const editHtml = renderInspector(['node-1'])
+
+    expect(generationHtml).toContain('for="design-aspect-ratio"')
+    expect(generationHtml).toContain('id="design-aspect-ratio"')
+    expect(generationHtml).toContain('for="design-image-size"')
+    expect(generationHtml).toContain('id="design-image-size"')
+    expect(editHtml).toContain('for="design-mask-annotation"')
+    expect(editHtml).toContain('id="design-mask-annotation"')
+  })
 })
 
 describe('Design Inspector 纯业务契约', () => {
+  test('Given 版本输入未变化但 prompt 状态重渲染 When 读取版本行 Then 只构建一次版本树', () => {
+    const assets = [createAsset()]
+    /** 记录同一稳定输入实际执行建树的次数。 */
+    let buildCount = 0
+    const buildTree: typeof buildDesignVersionTree = (inputAssets, currentAssetId) => {
+      buildCount += 1
+      return buildDesignVersionTree(inputAssets, currentAssetId)
+    }
+    /** 组件自身更新无关 prompt，模拟 forceMount 隐藏版本页随表单输入重渲染。 */
+    const Probe = (): React.ReactElement => {
+      const [prompt, setPrompt] = React.useState('')
+      const rows = useDesignVersionRows(assets, null, buildTree)
+      if (!prompt) setPrompt('更新 prompt')
+      return <span>{rows.length}</span>
+    }
+
+    renderToStaticMarkup(<Probe />)
+
+    expect(buildCount).toBe(1)
+  })
+
   test('Given 生成约束 When 序列化 prompt Then 产出机器可读比例和尺寸', () => {
     expect(serializeDesignGenerationPrompt('生成海报', '16:9', '2K')).toBe(
       '生成海报\n\n[PROMA_DESIGN_CONSTRAINTS]\n{"aspectRatio":"16:9","imageSize":"2K"}',

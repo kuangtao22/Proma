@@ -18,7 +18,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
-import { buildDesignVersionTree, type DesignVersionTreeNode } from './design-version-tree'
+import {
+  buildDesignVersionTree,
+  flattenDesignVersionTree,
+  type DesignVersionTreeNode,
+  type DesignVersionTreeRow,
+} from './design-version-tree'
 import { useDesignInspectorActions } from './use-design-inspector-actions'
 
 /** 首版图片生成允许的画面比例。 */
@@ -262,7 +267,7 @@ function AiPanel({
     ))
   }
 
-  if (selection.selectedNodeCount > 1) return <p className="text-xs text-muted-foreground">AI 编辑仅支持单个素材节点</p>
+  if (selection.selectedNodeCount > 0 && !selection.canvasAssetNodeSelected) return <p className="text-xs text-muted-foreground">AI 编辑仅支持单个素材节点</p>
   if (selection.asset && !selection.canvasAssetNodeSelected) return <p className="text-xs text-muted-foreground">AI 编辑仅支持画布素材节点</p>
   if (selection.assetId && selection.missing) return <p className="text-xs text-muted-foreground">请先重新定位缺失素材</p>
   if (selection.asset) {
@@ -273,9 +278,9 @@ function AiPanel({
         <h3 className="break-words text-xs font-semibold">编辑 {selection.asset.filename}</h3>
         <Label htmlFor="design-edit-prompt" className="text-xs">编辑要求</Label>
         <Textarea id="design-edit-prompt" value={state.editPrompt} disabled={!enabled} onChange={(event) => onEditPromptChange?.(event.target.value)} />
-        <Label className="text-xs">蒙版批注（可选）</Label>
+        <Label htmlFor="design-mask-annotation" className="text-xs">蒙版批注（可选）</Label>
         <Select value={maskAnnotationId} onValueChange={setMaskAnnotationId} disabled={!enabled}>
-          <SelectTrigger><SelectValue /></SelectTrigger>
+          <SelectTrigger id="design-mask-annotation"><SelectValue /></SelectTrigger>
           <SelectContent><SelectItem value="none">不使用蒙版</SelectItem>{masks.map((mask, index) => <SelectItem key={mask.id} value={mask.id}>蒙版 {index + 1}</SelectItem>)}</SelectContent>
         </Select>
         <Button type="submit" size="sm" className="w-full" disabled={!enabled || !state.editPrompt.trim()}><Send aria-hidden="true" />开始编辑</Button>
@@ -287,14 +292,14 @@ function AiPanel({
       <h3 className="text-xs font-semibold">生成图片</h3>
       <Label htmlFor="design-generation-prompt" className="text-xs">描述</Label>
       <Textarea id="design-generation-prompt" value={state.generationPrompt} disabled={!enabled} onChange={(event) => onGenerationPromptChange?.(event.target.value)} />
-      <Label className="text-xs">画面比例</Label>
+      <Label htmlFor="design-aspect-ratio" className="text-xs">画面比例</Label>
       <Select value={aspectRatio} onValueChange={(value) => setAspectRatio(value as DesignAspectRatio)} disabled={!enabled}>
-        <SelectTrigger><SelectValue /></SelectTrigger>
+        <SelectTrigger id="design-aspect-ratio"><SelectValue /></SelectTrigger>
         <SelectContent>{(['1:1', '16:9', '4:3', '9:16', '3:4'] satisfies DesignAspectRatio[]).map((value) => <SelectItem key={value} value={value}>{value}</SelectItem>)}</SelectContent>
       </Select>
-      <Label className="text-xs">图片尺寸</Label>
+      <Label htmlFor="design-image-size" className="text-xs">图片尺寸</Label>
       <Select value={imageSize} onValueChange={(value) => setImageSize(value as DesignImageSize)} disabled={!enabled}>
-        <SelectTrigger><SelectValue /></SelectTrigger>
+        <SelectTrigger id="design-image-size"><SelectValue /></SelectTrigger>
         <SelectContent>{(['auto', '1K', '2K', '4K'] satisfies DesignImageSize[]).map((value) => <SelectItem key={value} value={value}>{value}</SelectItem>)}</SelectContent>
       </Select>
       <Button type="submit" size="sm" className="w-full" disabled={!enabled || !state.generationPrompt.trim()}><Send aria-hidden="true" />生成图片</Button>
@@ -302,24 +307,54 @@ function AiPanel({
   )
 }
 
-/** 递归渲染已由纯函数保证无环的版本树。 */
-function VersionBranch({ node, depth, onSelectAsset }: { node: DesignVersionTreeNode; depth: number; onSelectAsset: (assetId: string) => void }): React.ReactElement {
+/** 迭代版本行避免深版本链递归渲染。 */
+function VersionRow({ row, onSelectAsset }: { row: DesignVersionTreeRow; onSelectAsset: (assetId: string) => void }): React.ReactElement {
+  /** 扁平行直接携带节点和缩进深度。 */
+  const { node, depth } = row
   return (
     <li>
       <button type="button" className={cn('flex min-h-8 w-full items-center gap-2 rounded-sm px-2 py-1 text-left text-xs hover:bg-accent', node.current && 'bg-accent')} style={{ paddingLeft: 8 + depth * 16 }} aria-current={node.current ? 'true' : undefined} onClick={() => onSelectAsset(node.id)}>
         <span className="min-w-0 flex-1 break-words">{node.asset.filename}</span>{node.current && <span className="shrink-0 text-[11px] text-muted-foreground">当前</span>}
       </button>
-      {node.children.length > 0 && <ul>{node.children.map((child) => <VersionBranch key={child.id} node={child} depth={depth + 1} onSelectAsset={onSelectAsset} />)}</ul>}
     </li>
   )
 }
 
-/** 版本标签：按 parentAssetId 展示并同步画布选择。 */
-function VersionsPanel({ assets, currentAssetId, onSelectAsset }: { assets: DesignAsset[]; currentAssetId: string | null; onSelectAsset: (assetId: string) => void }): React.ReactElement {
-  /** 循环和缺失父项已在构建阶段提升为根。 */
-  const tree = buildDesignVersionTree(assets, currentAssetId)
-  return tree.length === 0 ? <p className="text-xs text-muted-foreground">暂无素材版本</p> : <ul>{tree.map((node) => <VersionBranch key={node.id} node={node} depth={0} onSelectAsset={onSelectAsset} />)}</ul>
+/** 版本树构建器签名，测试可记录无关状态更新时的构建次数。 */
+export type DesignVersionTreeBuilder = (
+  assets: DesignAsset[],
+  currentAssetId: string | null,
+) => DesignVersionTreeNode[]
+
+/** 将版本数据转换为可迭代渲染的扁平行。 */
+export function useDesignVersionRows(
+  assets: DesignAsset[],
+  currentAssetId: string | null,
+  buildTree: DesignVersionTreeBuilder = buildDesignVersionTree,
+): DesignVersionTreeRow[] {
+  return React.useMemo(
+    () => flattenDesignVersionTree(buildTree(assets, currentAssetId)),
+    [assets, buildTree, currentAssetId],
+  )
 }
+
+/** 版本面板稳定输入，供 React.memo 跳过 forceMount 隐藏页的无关重渲染。 */
+interface VersionsPanelProps {
+  assets: DesignAsset[]
+  currentAssetId: string | null
+  onSelectAsset: (assetId: string) => void
+}
+
+/** 版本标签：按 parentAssetId 展示并同步画布选择。 */
+const VersionsPanel = React.memo(function VersionsPanel({
+  assets,
+  currentAssetId,
+  onSelectAsset,
+}: VersionsPanelProps): React.ReactElement {
+  /** 循环和缺失父项已在构建阶段提升为根，深链按扁平行渲染。 */
+  const rows = useDesignVersionRows(assets, currentAssetId)
+  return rows.length === 0 ? <p className="text-xs text-muted-foreground">暂无素材版本</p> : <ul>{rows.map((row) => <VersionRow key={row.node.id} row={row} onSelectAsset={onSelectAsset} />)}</ul>
+})
 
 /** 纯 Inspector，组合三个职责单一的标签面板。 */
 export function DesignInspectorStateView(props: DesignInspectorStateViewProps): React.ReactElement {

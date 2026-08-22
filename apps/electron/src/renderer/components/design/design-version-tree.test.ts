@@ -62,4 +62,24 @@ describe('Design 素材版本树', () => {
     expect(tree.map((node) => node.id)).toEqual(['a', 'b', 'self'])
     expect(tree.every((node) => node.children.length === 0)).toBe(true)
   })
+
+  test('Given 5000 个深链素材 When 构建版本树 Then 在线性预算内完成且不丢节点', () => {
+    const assets = Array.from({ length: 5_000 }, (_, index) => createAsset({
+      id: `asset-${index}`,
+      parentAssetId: index === 0 ? undefined : `asset-${index - 1}`,
+    }))
+    const startedAt = performance.now()
+    const tree = buildDesignVersionTree(assets, null)
+    const elapsedMs = performance.now() - startedAt
+    /** 迭代遍历深链，避免测试自身递归溢出。 */
+    let nodeCount = 0
+    let cursor = tree[0]
+    while (cursor) {
+      nodeCount += 1
+      cursor = cursor.children[0]
+    }
+
+    expect(nodeCount).toBe(5_000)
+    expect(elapsedMs).toBeLessThan(250)
+  })
 })
