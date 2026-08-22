@@ -43,6 +43,7 @@
 - Linux deb 打包依赖 `apps/electron/package.json` 的 `homepage` 元数据；发布合同测试必须覆盖该字段，避免 AppImage 成功但 deb 在 FPM 阶段失败。
 - Electron workspace 使用带 scope 的包名，Linux 必须显式配置不含 `/` 的 `artifactName`，否则 deb 默认输出路径会被拆成不存在的子目录。
 - 路径管理采用固定 `~/.proma-location.json` 定位文件与重启迁移模式：业务模块继续通过 `getConfigDir()` 解析当前数据根，复制、校验和 Proma-owned 绝对路径重写全部成功后才切换；项目文件迁移独立使用工作区锁，源目录始终保留。
+- 数据根迁移计划在正常进程中记录的容量只作为预检值；隔离迁移进程可为 `pending/failed`、零进度且无复制 sidecar 的计划重建最终容量基线，兼容退出流程写入。已有复制进度或 sidecar 的断点继续严格拒绝源容量变化。
 - Bone 发布说明以 `release-notes/bone/v<version>.md` 为唯一事实来源；发布前必须校验对应文件存在且非空，GitHub Release 正文与关于页“Proma 修改”历史共同使用该内容。
 - macOS 发布优先使用 Developer ID Application 签名与 Apple 公证；证书未配置时允许发布明确标注的未签名 Bone 产物，并在 Release 说明中提供 `xattr` 解除隔离命令。GitHub Actions 不得在 step 自身的 `if` 中读取仅由该 step `env` 注入的证书变量，须先以独立步骤输出签名能力状态。
 - 项目文件迁移复用 verified copier，并以活动数据根内的可恢复 journal 驱动 `会话路径 -> 工作区配置 -> projectRootPath` 三步幂等提交；复制、校验和提交失败均不删除源目录。
@@ -84,3 +85,4 @@
 - 2026-08-22：整理 fork GitHub Releases，仅保留当前正式版 `v0.17.55-bone.1` 与上一稳定版 `v0.17.42-bone.5`；删除旧 `0.9.x`、重复草稿及已淘汰 Bone Release，但保留 Git 标签用于历史代码定位。
 - 2026-08-22：本机 `gh auth status` 中账号令牌失效时，Git HTTPS 仍可通过系统 Git 凭据直接推送 `kuangtao22/Proma`；排查推送权限时应分别验证 `gh` 与 Git 凭据，不把前者状态当作后者结论。
 - 2026-08-22：用户确认 macOS 缺少签名证书时仍需发布，并允许通过 `xattr` 命令解除隔离安装；发布说明必须明确未签名风险，工作流有证书时签名、无证书时显式生成未签名包。
+- 2026-08-22：修复 Windows 数据根迁移在计划创建后被退出流程更新 `.proma` 时无法继续的问题；零进度计划在隔离进程中安全刷新容量基线，旧版本已记录为 failed 的同类计划也可直接恢复。

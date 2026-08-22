@@ -247,6 +247,98 @@ describe('DataRootMigrationCoordinator', () => {
     expect(existsSync(getDirectoryCopySidecarPath(targetRoot))).toBe(false)
   })
 
+  test('Given 零进度计划创建后源配置被退出流程更新 When 隔离进程恢复 Then 以最终源容量完成迁移', async () => {
+    ensurePromaDataRootMarker(sourceRoot)
+    /** 模拟重启前后共享固定定位文件的 locator。 */
+    const locator = new DataRootLocator({ homeDir })
+    /** 使用真实复制器验证重新建立基线后的完整迁移链。 */
+    const coordinator = new DataRootMigrationCoordinator({
+      locator,
+      lockPath: join(homeDir, '.rebaseline-migration.lock'),
+      createMigrationId: () => 'rebaseline-migration',
+      getAvailableBytes: async () => 1_000_000,
+      isPidRunning: () => false,
+    })
+    /** 正常进程退出前创建的旧容量计划。 */
+    const plan = await coordinator.createPlan(targetRoot)
+    /** 模拟退出流程保存窗口状态后增长的设置文件。 */
+    const updatedSettings = '{"theme":"dark","planningWindowState":{"width":960}}'
+
+    writeFileSync(join(sourceRoot, 'settings.json'), updatedSettings)
+    await coordinator.runPending()
+
+    expect(plan.totalBytes).not.toBe(Buffer.byteLength(updatedSettings))
+    expect(readFileSync(join(targetRoot, 'settings.json'), 'utf8')).toBe(updatedSettings)
+    expect(locator.inspect().locatorFile).toMatchObject({
+      activeRoot: targetRoot,
+      previousRoot: sourceRoot,
+    })
+  })
+
+  test('Given 旧版本已把容量变化记录为零进度失败 When 新版本继续迁移 Then 重建基线并完成迁移', async () => {
+    ensurePromaDataRootMarker(sourceRoot)
+    /** 复用旧版本已经写入失败状态的固定定位文件。 */
+    const locator = new DataRootLocator({ homeDir })
+    /** 模拟旧版本失败记录与新版本恢复之间单调前进的时间。 */
+    let now = 1_000
+    /** 使用真实复制器验证旧失败计划能够跨版本恢复。 */
+    const coordinator = new DataRootMigrationCoordinator({
+      locator,
+      lockPath: join(homeDir, '.legacy-failed-migration.lock'),
+      createMigrationId: () => 'legacy-failed-migration',
+      now: () => now,
+      getAvailableBytes: async () => 1_000_000,
+      isPidRunning: () => false,
+    })
+    await coordinator.createPlan(targetRoot)
+    now = 1_001
+    locator.updateMigration('legacy-failed-migration', {
+      stage: 'failed',
+      updatedAt: now,
+      error: '源目录容量在计划创建后发生变化',
+    })
+    /** 模拟旧版本失败后源目录中的最终设置内容。 */
+    const updatedSettings = '{"theme":"light","mainWindowState":{"width":1200}}'
+    writeFileSync(join(sourceRoot, 'settings.json'), updatedSettings)
+    now = 1_002
+
+    await coordinator.resumePending()
+
+    expect(readFileSync(join(targetRoot, 'settings.json'), 'utf8')).toBe(updatedSettings)
+    expect(locator.requireActiveRoot()).toBe(targetRoot)
+  })
+
+  test('Given 复制断点已有已提交字节且源容量变化 When 继续迁移 Then 保留严格校验且不调用复制器', async () => {
+    /** 模拟复制开始后被外部追加一个字节的源文件。 */
+    const changedSettings = '{"theme":"dark"}x'
+    /** 供断点空间复检返回与当前源扫描一致的总量。 */
+    const changedBytes = Buffer.byteLength(changedSettings)
+    /** 构造已有可信 sidecar 和已提交字节的复制断点。 */
+    const harness = createHarness({
+      inspectCopyOwnership: async () => 'owned',
+      inspectCopySpace: async () => ({
+        totalBytes: changedBytes,
+        reusableBytes: 1,
+        remainingBytes: changedBytes - 1,
+      }),
+    })
+    await harness.coordinator.createPlan(targetRoot)
+    harness.locator.updateMigration('migration-1', {
+      stage: 'copying',
+      completedBytes: 1,
+      updatedAt: 1_001,
+    })
+    writeFileSync(join(sourceRoot, 'settings.json'), changedSettings)
+
+    await expect(harness.coordinator.resumePending()).rejects.toThrow('源目录容量在计划创建后发生变化')
+
+    expect(harness.copyCalls).toEqual([])
+    expect(harness.locator.inspect().locatorFile?.migration).toMatchObject({
+      stage: 'failed',
+      completedBytes: 1,
+    })
+  })
+
   test('Given 复制失败 When 运行 Then 保存 failed 且活动根不切换', async () => {
     const harness = createHarness({ copyDirectory: async () => { throw new Error('磁盘读取失败 /secret/path') } })
     await harness.coordinator.createPlan(targetRoot)

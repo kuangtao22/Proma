@@ -41,6 +41,14 @@ export interface DataRootMigrationUpdate {
   error?: string
 }
 
+/** 零进度迁移在隔离进程中重建容量基线所需字段。 */
+export interface DataRootMigrationBaselineUpdate {
+  /** 隔离进程最终扫描得到的普通文件总字节数。 */
+  totalBytes: number
+  /** 本次基线写入时间。 */
+  updatedAt: number
+}
+
 /**
  * 管理固定 `~/.proma-location.json`，让开发版与正式版解析同一个业务数据根。
  */
@@ -202,6 +210,41 @@ export class DataRootLocator {
       ...(update.error === undefined ? {} : { error: update.error }),
     }
     if (update.error === undefined && nextStage !== 'failed') delete migration.error
+    return this.write({ ...locatorFile, migration })
+  }
+
+  /**
+   * 在复制尚未开始且目标没有断点时，用隔离进程的最终扫描结果刷新容量基线。
+   *
+   * @param migrationId 当前迁移 ID。
+   * @param update 新容量与更新时间。
+   * @returns 写入后的定位状态。
+   */
+  rebaselineUnstartedMigration(
+    migrationId: string,
+    update: DataRootMigrationBaselineUpdate,
+  ): DataRootLocatorResult {
+    /** 当前定位文件的可信解析结果。 */
+    const result = this.inspect()
+    /** 包含迁移计划的固定定位文件。 */
+    const locatorFile = result.locatorFile
+    /** 待刷新容量基线的迁移记录。 */
+    const current = locatorFile?.migration
+    if (!locatorFile || !current) throw new Error('当前没有可更新的数据根迁移')
+    if (current.id !== migrationId) throw new Error('迁移 ID 不匹配')
+    if (!['pending', 'failed'].includes(current.stage) || current.completedBytes !== 0) {
+      throw new Error('仅未开始复制的数据根迁移可以刷新容量基线')
+    }
+    if (!Number.isSafeInteger(update.totalBytes) || update.totalBytes < 0) {
+      throw new Error('数据根迁移总字节数无效')
+    }
+    if (update.updatedAt < current.updatedAt) throw new Error('数据根迁移更新时间不能倒退')
+    /** 保留迁移身份与阶段，仅替换隔离扫描确认的容量和时间。 */
+    const migration: DataRootMigrationRecord = {
+      ...current,
+      totalBytes: update.totalBytes,
+      updatedAt: update.updatedAt,
+    }
     return this.write({ ...locatorFile, migration })
   }
 

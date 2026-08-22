@@ -132,6 +132,8 @@ interface MigrationPreflight {
   requiredBytes: number
   availableBytes?: number
   deviceType: DataRootDeviceType
+  /** 当前目标是否已有且归属于本次迁移的复制断点。 */
+  ownership: DirectoryCopyOwnership
 }
 
 /** plan 与 resume 共用的只读预检策略。 */
@@ -375,7 +377,22 @@ export class DataRootMigrationCoordinator {
         if (
           ['pending', 'failed', 'copying'].includes(migration.stage)
           && recheck.totalBytes !== migration.totalBytes
-        ) throw new DataRootMigrationError('COPY_FAILED', '源目录容量在计划创建后发生变化')
+        ) {
+          /** 未复制计划跨进程重启后，以隔离进程看到的稳定源目录为最终基线。 */
+          const canRebaseline = ['pending', 'failed'].includes(migration.stage)
+            && migration.completedBytes === 0
+            && recheck.ownership === 'absent'
+          if (!canRebaseline) {
+            throw new DataRootMigrationError('COPY_FAILED', '源目录容量在计划创建后发生变化')
+          }
+          /** 原子写入后回读的最新迁移记录，后续复制进度必须使用新总量。 */
+          const rebased = this.locator.rebaselineUnstartedMigration(migration.id, {
+            totalBytes: recheck.totalBytes,
+            updatedAt: Math.max(this.now(), migration.updatedAt),
+          }).locatorFile?.migration
+          if (!rebased) throw new Error('刷新迁移容量基线后记录缺失')
+          migration = rebased
+        }
         this.throwIfCancelled(token)
       } catch (error) {
         if (isAbortError(error)) throw error
@@ -755,6 +772,7 @@ export class DataRootMigrationCoordinator {
       requiredBytes,
       availableBytes,
       deviceType,
+      ownership,
     }
   }
 
