@@ -4,9 +4,13 @@ import type { DesignAsset, DesignCanvasNode } from '@proma/shared'
 import {
   createMoveNodesMutation,
   createViewportMutation,
+  mergeDocumentFlowNodes,
   toFlowNodes,
 } from './design-canvas-model'
-import { getDesignCanvasInteractionConfig } from './DesignCanvas'
+import {
+  getDesignCanvasInteractionConfig,
+  getDesignCanvasViewportPolicy,
+} from './DesignCanvas'
 
 /** 创建包含敏感原图路径的素材，验证 Renderer 节点不会携带该路径。 */
 function createAsset(): DesignAsset {
@@ -129,4 +133,63 @@ describe('Design 画布节点映射', () => {
       viewport: { x: 12, y: 18, zoom: 1.25 },
     })
   })
+
+  test('Given 节点仍在拖动 When 保存响应更新 document Then 保留活动节点本地位置并同步其他节点', () => {
+    /** 当前 XYFlow 内存包含尚未提交的拖动位置。 */
+    const currentNodes = [
+      { ...toFlowNodes(createDocumentWithNodes(), { thumbnailBaseUrl: 'proma-file://thumbs' })[0]!, position: { x: 90, y: 100 } },
+      { ...toFlowNodes(createDocumentWithNodes(), { thumbnailBaseUrl: 'proma-file://thumbs' })[1]!, position: { x: 30, y: 40 } },
+    ]
+    /** 保存响应带回的新权威 document，其中非拖动节点已由外部更新。 */
+    const updatedDocument = createDocumentWithNodes()
+    updatedDocument.nodes[0]!.position = { x: 5, y: 6 }
+    updatedDocument.nodes[1]!.position = { x: 70, y: 80 }
+    const documentNodes = toFlowNodes(updatedDocument, { thumbnailBaseUrl: 'proma-file://thumbs' })
+
+    const merged = mergeDocumentFlowNodes(currentNodes, documentNodes, new Set(['node-1']))
+
+    expect(merged[0]?.position).toEqual({ x: 90, y: 100 })
+    expect(merged[1]?.position).toEqual({ x: 70, y: 80 })
+  })
+
+  test('Given A 到 B 再回 A When 计算画布启动策略 Then 各项目恢复自己的持久视口', () => {
+    /** 已保存项目 A 的持久视口。 */
+    const projectA = createDocumentWithNodes('project-a')
+    projectA.revision = 3
+    projectA.viewport = { x: 11, y: 12, zoom: 1.1 }
+    /** 已保存项目 B 的独立持久视口。 */
+    const projectB = createDocumentWithNodes('project-b')
+    projectB.revision = 7
+    projectB.viewport = { x: 21, y: 22, zoom: 1.2 }
+
+    const sequence = [projectA, projectB, projectA].map(getDesignCanvasViewportPolicy)
+
+    expect(sequence).toEqual([
+      { defaultViewport: projectA.viewport, fitView: false },
+      { defaultViewport: projectB.viewport, fitView: false },
+      { defaultViewport: projectA.viewport, fitView: false },
+    ])
+  })
+
+  test('Given revision 为零且已有节点 When 计算画布启动策略 Then 首次 fitView 优先于默认视口', () => {
+    /** revision 0 表示尚无用户保存过的持久视口，允许首次自动取景。 */
+    const initialDocument = createDocumentWithNodes()
+    initialDocument.viewport = { x: 99, y: 88, zoom: 2 }
+
+    expect(getDesignCanvasViewportPolicy(initialDocument)).toEqual({
+      defaultViewport: initialDocument.viewport,
+      fitView: true,
+    })
+  })
 })
+
+/** 创建两个素材引用节点，供拖动合并和视口隔离测试复用。 */
+function createDocumentWithNodes(projectId = 'project-1') {
+  /** 固定时间的测试文档。 */
+  const document = createEmptyDesignDocument(projectId, 100)
+  document.nodes = [
+    createNode({ id: 'node-1', position: { x: 10, y: 20 } }),
+    createNode({ id: 'node-2', assetId: 'asset-2', position: { x: 30, y: 40 } }),
+  ]
+  return document
+}

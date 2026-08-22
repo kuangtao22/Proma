@@ -101,6 +101,7 @@ export function DesignWorkspaceStateView({
 
       <div className="relative min-h-0 flex-1" data-design-canvas-slot>
         <DesignCanvas
+          key={projectId}
           document={state.snapshot.document}
           thumbnailBaseUrl={state.snapshot.thumbnailBaseUrl}
           writable={writable}

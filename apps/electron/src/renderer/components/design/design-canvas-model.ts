@@ -42,6 +42,29 @@ export function createViewportMutation(viewport: DesignViewport): DesignMutation
 }
 
 /**
+ * 合并最新 document 节点，同时保护仍在拖动的节点本地坐标。
+ * @param currentNodes XYFlow 当前内存节点，包含尚未结束的拖动位置。
+ * @param documentNodes 最新 document 映射出的权威展示节点。
+ * @param activeDragNodeIds 当前仍处于拖动手势中的节点 ID。
+ * @returns 展示字段跟随 document、活动节点位置保留本地值的新数组。
+ */
+export function mergeDocumentFlowNodes(
+  currentNodes: DesignAssetFlowNode[],
+  documentNodes: DesignAssetFlowNode[],
+  activeDragNodeIds: ReadonlySet<string>,
+): DesignAssetFlowNode[] {
+  /** 当前节点索引用于常数时间读取活动拖动位置。 */
+  const currentById = new Map(currentNodes.map((node) => [node.id, node]))
+  return documentNodes.map((node) => {
+    /** 非活动节点直接采用最新 document 状态。 */
+    if (!activeDragNodeIds.has(node.id)) return node
+    /** 活动节点可能刚被远端删除；无当前节点时仍以 document 为准。 */
+    const current = currentById.get(node.id)
+    return current ? { ...node, position: current.position } : node
+  })
+}
+
+/**
  * 读取持久化相对路径的文件名。
  * @param relativePath 已校验为正斜杠分隔的项目相对路径。
  * @returns 不包含目录信息的文件名。

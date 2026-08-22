@@ -1,8 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import { createEmptyDesignDocument } from '@proma/shared'
 import type { NodeProps } from '@xyflow/react'
+import { createStore, Provider } from 'jotai'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { createInitialDesignProjectState } from '@/atoms/design-atoms'
+import {
+  createInitialDesignProjectState,
+  designProjectStatesAtom,
+} from '@/atoms/design-atoms'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import {
   DesignAssetNode,
@@ -11,6 +15,10 @@ import {
 } from './DesignAssetNode'
 import { DesignToolbar } from './DesignToolbar'
 import { DesignWorkspaceStateView } from './DesignWorkspaceView'
+import {
+  DesignCanvas,
+  type DesignCanvasFlowProps,
+} from './DesignCanvas'
 
 /** 创建 XYFlow 自定义节点静态渲染所需的完整属性。 */
 function createNodeProps(data: DesignAssetNodeData): NodeProps<DesignAssetFlowNode> {
@@ -35,6 +43,12 @@ function createNodeProps(data: DesignAssetNodeData): NodeProps<DesignAssetFlowNo
 /** 静态渲染一种节点状态，便于验证无浏览器环境下的稳定 HTML。 */
 function renderStatus(data: DesignAssetNodeData): string {
   return renderToStaticMarkup(<DesignAssetNode {...createNodeProps(data)} />)
+}
+
+/** 将 renderer 回调捕获值收窄为可调用 Flow 属性。 */
+function requireFlowProps(value: DesignCanvasFlowProps | null): DesignCanvasFlowProps {
+  if (!value) throw new Error('DesignCanvas 未调用可观察 Flow renderer')
+  return value
 }
 
 describe('Design 素材节点', () => {
@@ -175,4 +189,125 @@ describe('Design 工作区画布接入', () => {
     expect(html).toContain('导入图片')
     expect(html).toContain('AI 生成')
   })
+
+  test('Given prop 滞后但项目 atom 选区相同 When XYFlow 回报选区 Then 不重复写项目 atom', () => {
+    /** 记录组件传给可观察 Flow renderer 的真实回调。 */
+    let flowProps: DesignCanvasFlowProps | null = null
+    /** 使用独立 Jotai store 观察是否发生冗余 Map 写入。 */
+    const store = createStore()
+    const document = createDocumentWithNode('project-a', 'node-a')
+    store.set(designProjectStatesAtom, new Map([[
+      'project-a',
+      {
+        ...createInitialDesignProjectState(),
+        phase: 'ready',
+        snapshot: { document, writable: true },
+        selectedNodeIds: ['node-a'],
+      },
+    ]]))
+    /** atom 订阅写次数，用于区分内容相同的空操作。 */
+    let writes = 0
+    const unsubscribe = store.sub(designProjectStatesAtom, () => { writes += 1 })
+
+    renderToStaticMarkup(
+      <Provider store={store}>
+        <DesignCanvas
+          document={document}
+          writable
+          activeTool="select"
+          selectedNodeIds={[]}
+          flowRenderer={(props) => {
+            flowProps = props
+            return <div data-flow-observer />
+          }}
+        />
+      </Provider>,
+    )
+    expect(flowProps).not.toBeNull()
+    /** 已确认 renderer 被调用后的稳定 Flow 属性。 */
+    const capturedFlowProps = requireFlowProps(flowProps)
+    capturedFlowProps.onSelectionChange({
+      nodes: [capturedFlowProps.nodes[0]!],
+      edges: [],
+    })
+
+    expect(writes).toBe(0)
+    unsubscribe()
+  })
+
+  test('Given 已切换到项目 B When 项目 A 的旧回调迟到 Then 不污染项目 B 选区', () => {
+    /** 分别捕获两个项目实例的 selection 回调。 */
+    let projectAFlowProps: DesignCanvasFlowProps | null = null
+    let projectBFlowProps: DesignCanvasFlowProps | null = null
+    const store = createStore()
+    const projectADocument = createDocumentWithNode('project-a', 'node-a')
+    const projectBDocument = createDocumentWithNode('project-b', 'node-b')
+    store.set(designProjectStatesAtom, new Map([
+      ['project-a', {
+        ...createInitialDesignProjectState(),
+        phase: 'ready',
+        snapshot: { document: projectADocument, writable: true },
+        selectedNodeIds: ['node-a'],
+      }],
+      ['project-b', {
+        ...createInitialDesignProjectState(),
+        phase: 'ready',
+        snapshot: { document: projectBDocument, writable: true },
+        selectedNodeIds: ['node-b'],
+      }],
+    ]))
+
+    renderToStaticMarkup(
+      <Provider store={store}>
+        <DesignCanvas
+          document={projectADocument}
+          writable
+          activeTool="select"
+          selectedNodeIds={['node-a']}
+          flowRenderer={(props) => {
+            projectAFlowProps = props
+            return <div data-project="a" />
+          }}
+        />
+      </Provider>,
+    )
+    renderToStaticMarkup(
+      <Provider store={store}>
+        <DesignCanvas
+          document={projectBDocument}
+          writable
+          activeTool="select"
+          selectedNodeIds={['node-b']}
+          flowRenderer={(props) => {
+            projectBFlowProps = props
+            return <div data-project="b" />
+          }}
+        />
+      </Provider>,
+    )
+    expect(projectAFlowProps).not.toBeNull()
+    expect(projectBFlowProps).not.toBeNull()
+    /** 迟到的 A 回调清空 A，但不得写入当前项目 B。 */
+    requireFlowProps(projectAFlowProps).onSelectionChange({ nodes: [], edges: [] })
+
+    const states = store.get(designProjectStatesAtom)
+    expect(states.get('project-a')?.selectedNodeIds).toEqual([])
+    expect(states.get('project-b')?.selectedNodeIds).toEqual(['node-b'])
+  })
 })
+
+/** 创建含单节点的项目文档，供组件回调隔离测试使用。 */
+function createDocumentWithNode(projectId: string, nodeId: string) {
+  /** 固定时间的项目测试文档。 */
+  const document = createEmptyDesignDocument(projectId, 100)
+  document.nodes = [{
+    id: nodeId,
+    kind: 'asset',
+    assetId: `${nodeId}-asset`,
+    position: { x: 0, y: 0 },
+    width: 320,
+    height: 240,
+    zIndex: 0,
+  }]
+  return document
+}
