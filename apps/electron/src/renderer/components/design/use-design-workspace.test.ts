@@ -437,6 +437,38 @@ describe('Design 工作区同步规则', () => {
     harness.controller.retrySave()
     expect(harness.scheduler.getDelays()).toEqual([])
     expect(harness.saveRequests).toHaveLength(1)
+
+    harness.controller.acceptRemoteVersion()
+    expect(harness.getState().snapshot?.document).toEqual(remoteDocument)
+    expect(harness.getState().pendingMutations).toEqual([])
+    expect(harness.getState().history).toEqual([])
+    expect(harness.getState().future).toEqual([])
+    expect(harness.getState().conflictRecoveryPending).toBe(false)
+    expect(harness.getState().saveState).toBe('saved')
+    expect(harness.getState().error).toBeNull()
+
+    /** 采用远端后，新移动必须以远端 revision 正常进入保存链路。 */
+    const newMove: DesignMutation = {
+      type: 'move-nodes',
+      positions: [{ nodeId: 'node-1', position: { x: 150, y: 150 } }],
+    }
+    const movedDocument = applyDesignMutationsToDocument(remoteDocument, [newMove])
+    harness.setState({
+      snapshot: { document: movedDocument, writable: true },
+      pendingMutations: [newMove],
+      saveState: 'dirty',
+    })
+    harness.controller.sync()
+    harness.scheduler.runNext()
+    expect(harness.saveRequests[1]!.input).toEqual({
+      projectId: 'project-1',
+      expectedRevision: 2,
+      mutations: [newMove],
+    })
+    harness.saveRequests[1]!.deferred.resolve({ ...movedDocument, revision: 3, updatedAt: 30 })
+    await flushPromises()
+    expect(harness.getState().snapshot?.document.nodes[0]?.position).toEqual({ x: 150, y: 150 })
+    expect(harness.getState().saveState).toBe('saved')
   })
 
   test('Given 已有 dirty 缓存 When 后台 load 失败 Then 保留画布与 pending 且不进入 error', async () => {

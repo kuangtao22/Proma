@@ -329,6 +329,33 @@ describe('Design 编辑历史 Jotai action', () => {
     expect(afterUndo.history).toEqual([unsafeHistory])
     expect(afterUndo.saveState).toBe('saved')
   })
+
+  test('Given 结构冲突尚未采用远端版本 When 执行结构命令 Then 不追加乐观文档或 pending', () => {
+    /** 冲突已接管远端文档，但旧 pending 仍等待用户明确放弃。 */
+    const document = createDocument()
+    const oldPending = [{ type: 'remove-nodes' as const, nodeIds: ['n2'] }]
+    const store = createStore()
+    store.set(designProjectStatesAtom, new Map([['project-1', {
+      ...createInitialDesignProjectState(),
+      phase: 'ready' as const,
+      snapshot: { document, writable: true },
+      pendingMutations: oldPending,
+      conflictRecoveryPending: true,
+      saveState: 'failed' as const,
+      error: '结构冲突',
+    }]]))
+
+    store.set(executeDesignEditAtom, {
+      projectId: 'project-1',
+      command: { type: 'delete-selection', nodeIds: ['n1'] },
+    })
+
+    const blocked = store.get(designProjectStatesAtom).get('project-1')!
+    expect(blocked.snapshot?.document).toEqual(document)
+    expect(blocked.pendingMutations).toBe(oldPending)
+    expect(blocked.history).toEqual([])
+    expect(blocked.saveState).toBe('failed')
+  })
 })
 
 describe('Design 编辑键盘路由', () => {

@@ -236,7 +236,10 @@ export function areDesignMutationsJobSafe(
         return mutation.groupIds.every((groupId) => !containsJob(groupsById.get(groupId)?.nodeIds ?? []))
       case 'patch-groups':
         return mutation.removeIds.every((groupId) => !containsJob(groupsById.get(groupId)?.nodeIds ?? []))
-          && mutation.upserts.every((item) => !containsJob(item.entity.nodeIds))
+          && mutation.upserts.every((item) => (
+            !containsJob(item.entity.nodeIds)
+            && !containsJob(groupsById.get(item.entity.id)?.nodeIds ?? [])
+          ))
       default:
         return true
     }

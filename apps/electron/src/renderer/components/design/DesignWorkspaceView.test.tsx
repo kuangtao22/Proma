@@ -132,23 +132,47 @@ describe('Design 工作区页面状态', () => {
   })
 
   test('Given 结构冲突采用远端基线 When 渲染 Then 显示重新编辑提示且不提供重试保存', () => {
+    /** 这些命令在普通可写状态下均可用，确保 disabled 只来自冲突阻断。 */
+    const conflictDocument = createEmptyDesignDocument('project-1', 10)
+    conflictDocument.nodes = ['n1', 'n2'].map((id, index) => ({
+      id,
+      kind: 'asset' as const,
+      assetId: `asset-${id}`,
+      position: { x: index * 20, y: index * 20 },
+      width: 320,
+      height: 240,
+      zIndex: index,
+    }))
+    const safeHistory = {
+      forward: [{ type: 'set-viewport' as const, viewport: { x: 1, y: 1, zoom: 1 } }],
+      inverse: [{ type: 'set-viewport' as const, viewport: { x: 0, y: 0, zoom: 1 } }],
+    }
     const html = renderToStaticMarkup(
       <DesignWorkspaceStateView
         state={{
           ...createInitialDesignProjectState(),
           phase: 'ready',
-          snapshot: createSnapshot(),
+          snapshot: { document: conflictDocument, writable: true },
+          selectedNodeIds: ['n1', 'n2'],
+          history: [safeHistory],
+          future: [safeHistory],
           saveState: 'failed',
           conflictRecoveryPending: true,
           error: '保存冲突：远端画布结构已更新，本地结构修改未自动应用，请基于远端版本重新编辑',
         }}
         onRetry={() => undefined}
         onRetrySave={() => undefined}
+        onAcceptRemoteVersion={() => undefined}
+        onImportAssets={() => undefined}
       />,
     )
 
     expect(html).toContain('本地结构修改未自动应用')
     expect(html).not.toContain('重试保存')
+    expect(html).toContain('采用远端版本')
+    for (const label of ['撤销', '重做', '分组', '取消分组', '箭头批注', '画笔蒙版', '导入图片']) {
+      expect(html).toMatch(new RegExp(`aria-label="${label}"[^>]*disabled=""`))
+    }
   })
 
   test('Given 项目加载失败 When 渲染 Then 显示错误和重新加载入口', () => {

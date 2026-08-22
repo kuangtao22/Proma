@@ -254,6 +254,62 @@ function parseSaveInput(value: unknown): SaveDesignMutationsInput {
   }
 }
 
+/**
+ * 基于写锁内权威文档保护 job 节点及其分组所有权。
+ * @param document 当前磁盘权威画布文档。
+ * @param mutations Renderer 已通过形状校验的 mutation。
+ * @returns 校验通过时无返回值；越权时抛出稳定错误。
+ */
+function assertRendererPreservesJobOwnership(
+  document: DesignCanvasDocument,
+  mutations: DesignMutation[],
+): void {
+  /** 当前权威 job ID 是本次保存不可结构修改的受保护集合。 */
+  const jobNodeIds = new Set(document.nodes
+    .filter((node) => node.kind === 'job')
+    .map((node) => node.id))
+  /** 当前分组索引用于识别删除或替换含 job 的分组。 */
+  const groupsById = new Map(document.groups.map((group) => [group.id, group]))
+  /** 判断分组成员是否包含权威 job。 */
+  const containsJob = (nodeIds: string[]): boolean => nodeIds.some((nodeId) => jobNodeIds.has(nodeId))
+  /** 统一抛出任务节点所有权错误，避免暴露存储实现细节。 */
+  const reject = (): never => {
+    throw new Error('不允许通过画布保存修改任务节点结构')
+  }
+
+  for (const mutation of mutations) {
+    switch (mutation.type) {
+      case 'upsert-nodes':
+        if (mutation.nodes.some((node) => jobNodeIds.has(node.id))) reject()
+        break
+      case 'remove-nodes':
+        if (mutation.nodeIds.some((nodeId) => jobNodeIds.has(nodeId))) reject()
+        break
+      case 'patch-nodes':
+        if (mutation.removeIds.some((nodeId) => jobNodeIds.has(nodeId))
+          || mutation.upserts.some((item) => jobNodeIds.has(item.entity.id))) reject()
+        break
+      case 'upsert-groups':
+        if (mutation.groups.some((group) => (
+          containsJob(group.nodeIds) || containsJob(groupsById.get(group.id)?.nodeIds ?? [])
+        ))) reject()
+        break
+      case 'remove-groups':
+        if (mutation.groupIds.some((groupId) => containsJob(groupsById.get(groupId)?.nodeIds ?? []))) reject()
+        break
+      case 'patch-groups':
+        if (mutation.removeIds.some((groupId) => containsJob(groupsById.get(groupId)?.nodeIds ?? []))
+          || mutation.upserts.some((item) => (
+            containsJob(item.entity.nodeIds)
+            || containsJob(groupsById.get(item.entity.id)?.nodeIds ?? [])
+          ))) reject()
+        break
+      default:
+        break
+    }
+  }
+}
+
 /** 解析素材 ID 请求，可按命令要求 revision。 */
 function parseAssetInput(value: unknown, withRevision: true): DeleteDesignAssetInput | RelinkDesignAssetInput
 function parseAssetInput(value: unknown, withRevision: false): ExportDesignAssetInput
@@ -380,9 +436,15 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   options.ipc.handle(DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, async (event, value): Promise<DesignCanvasDocument> => {
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseSaveInput(value)
-    const document = await options.guard.runWorkspaceWrite(input.projectId, () => (
-      options.store.mutate(input.projectId, input.expectedRevision, input.mutations)
-    ))
+    const document = await options.guard.runWorkspaceWrite(input.projectId, () => {
+      /** 所有权校验与 mutate 共处同一项目写锁，避免权威文档在检查后变化。 */
+      const current = options.store.load(input.projectId)
+      if (current.recoveredFrom) {
+        throw new Error(`DESIGN_RECOVERY_REQUIRED: recoveredFrom=${current.recoveredFrom}`)
+      }
+      assertRendererPreservesJobOwnership(current.document, input.mutations)
+      return options.store.mutate(input.projectId, input.expectedRevision, input.mutations)
+    })
     rememberDocument(input.projectId, document)
     if (input.mutations.length > 0) {
       broadcastChange(options, { projectId: input.projectId, revision: document.revision, cause: 'canvas' })

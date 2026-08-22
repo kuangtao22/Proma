@@ -234,8 +234,8 @@ export function canAutomaticallyRebaseDesignMutations(mutations: DesignMutation[
   ))
 }
 
-/** 判断当前项目是否处于需要用户重新编辑的结构冲突阻断态。 */
-function isDesignStructuralConflictBlocked(state: DesignProjectState): boolean {
+/** 判断当前项目是否已接管远端基线并等待用户放弃本地结构冲突修改。 */
+export function isDesignStructuralConflictBlocked(state: DesignProjectState): boolean {
   return state.conflictRecoveryPending
     && state.saveState === 'failed'
     && state.error === DESIGN_STRUCTURAL_CONFLICT_MESSAGE
@@ -281,6 +281,8 @@ export interface DesignWorkspaceController {
   retryLoad: () => void
   /** 重试失败保存。 */
   retrySave: () => void
+  /** 放弃本地结构冲突修改并采用已加载的远端版本。 */
+  acceptRemoteVersion: () => void
   /** 释放订阅、定时器与媒体访问权限。 */
   dispose: () => void
 }
@@ -513,6 +515,23 @@ export function createDesignWorkspaceController(
       dependencies.updateState((latest) => prepareFailedSaveRetry(latest))
       scheduleSave()
     },
+    acceptRemoteVersion: () => {
+      if (disposed) return
+      /** 只有远端快照已接管后的明确结构冲突允许放弃本地队列。 */
+      const latest = dependencies.getState()
+      if (!isDesignStructuralConflictBlocked(latest)) return
+      clearSaveTimer()
+      dependencies.updateState({
+        phase: 'ready',
+        selectedNodeIds: [],
+        history: [],
+        future: [],
+        pendingMutations: [],
+        saveState: 'saved',
+        conflictRecoveryPending: false,
+        error: null,
+      })
+    },
     dispose: () => {
       if (disposed) return
       disposed = true
@@ -532,6 +551,8 @@ export interface UseDesignWorkspaceResult {
   retry: () => void
   /** 将失败 mutation 恢复为 dirty，由 400ms 自动保存流程再次提交。 */
   retrySave: () => void
+  /** 放弃本地结构冲突修改并采用已接管的远端版本。 */
+  acceptRemoteVersion: () => void
 }
 
 /** 管理项目切换、远端 revision 订阅和 400ms mutation 自动保存。 */
@@ -608,5 +629,10 @@ export function useDesignWorkspace(
     controllerRef.current?.retrySave()
   }, [])
 
-  return { state, retry, retrySave }
+  /** 明确采用远端基线，清理无法安全 rebase 的本地结构队列。 */
+  const acceptRemoteVersion = React.useCallback(() => {
+    controllerRef.current?.acceptRemoteVersion()
+  }, [])
+
+  return { state, retry, retrySave, acceptRemoteVersion }
 }

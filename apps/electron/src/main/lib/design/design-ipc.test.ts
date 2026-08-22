@@ -273,6 +273,104 @@ describe('Design IPC', () => {
     expect(fixture.guardProjects).toEqual([])
   })
 
+  test('Given 权威文档已有 job When Renderer 删除覆盖或改写分组 Then 写守卫内拒绝且 store 无副作用', async () => {
+    const fixture = createFixture()
+    /** 权威 job 节点及分组只能由任务生命周期维护。 */
+    const authoritative = createEmptyDesignDocument('project-1', 10)
+    authoritative.nodes = [{
+      id: 'job-node-1',
+      kind: 'job',
+      jobId: 'job-1',
+      groupId: 'job-group',
+      position: { x: 0, y: 0 },
+      width: 320,
+      height: 240,
+      zIndex: 1,
+    }]
+    authoritative.groups = [{ id: 'job-group', name: '任务组', nodeIds: ['job-node-1'] }]
+    /** mutate 调用次数用于证明拒绝发生在任何存储写副作用前。 */
+    let mutateCount = 0
+    fixture.options.store.load = () => ({ document: authoritative, writable: true })
+    fixture.options.store.mutate = () => {
+      mutateCount += 1
+      return authoritative
+    }
+    registerDesignIpcHandlers(fixture.options)
+    /** 每一项都通过形状校验，但违反当前权威 job 所有权。 */
+    const attacks = [
+      [{ type: 'remove-nodes', nodeIds: ['job-node-1'] }],
+      [{ type: 'patch-nodes', removeIds: ['job-node-1'], upserts: [] }],
+      [{
+        type: 'patch-nodes',
+        removeIds: [],
+        upserts: [{
+          entity: {
+            id: 'job-node-1', kind: 'asset', assetId: 'asset-1',
+            position: { x: 1, y: 1 }, width: 320, height: 240, zIndex: 1,
+          },
+          index: 0,
+        }],
+      }],
+      [{
+        type: 'upsert-nodes',
+        nodes: [{
+          id: 'job-node-1', kind: 'asset', assetId: 'asset-1',
+          position: { x: 1, y: 1 }, width: 320, height: 240, zIndex: 1,
+        }],
+      }],
+      [{
+        type: 'patch-groups',
+        removeIds: ['job-group'],
+        upserts: [],
+      }],
+      [{
+        type: 'patch-groups',
+        removeIds: [],
+        upserts: [{ entity: { id: 'job-group', name: '覆盖组', nodeIds: [] }, index: 0 }],
+      }],
+      [{
+        type: 'upsert-groups',
+        groups: [{ id: 'other-group', name: '越权组', nodeIds: ['job-node-1'] }],
+      }],
+    ]
+
+    for (const mutations of attacks) {
+      await expect(invoke(fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, fixture.senders[0]!, {
+        projectId: 'project-1',
+        expectedRevision: 0,
+        mutations,
+      })).rejects.toThrow('任务节点')
+    }
+    expect(fixture.guardProjects).toEqual(Array.from({ length: attacks.length }, () => 'project-1'))
+    expect(mutateCount).toBe(0)
+    expect(authoritative.revision).toBe(0)
+    expect(fixture.senders.every((sender) => sender.sent.length === 0)).toBe(true)
+  })
+
+  test('Given 写锁内权威 load 发生恢复 When 保存 Then 要求 Renderer reload 且不调用 mutate', async () => {
+    const fixture = createFixture()
+    /** 恢复快照不能被预校验 load 消费后静默继续保存。 */
+    let mutateCount = 0
+    fixture.options.store.load = () => ({
+      document: fixture.document,
+      writable: true,
+      recoveredFrom: 'backup',
+    })
+    fixture.options.store.mutate = () => {
+      mutateCount += 1
+      return fixture.document
+    }
+    registerDesignIpcHandlers(fixture.options)
+
+    await expect(invoke(fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, fixture.senders[0]!, {
+      projectId: 'project-1',
+      expectedRevision: 0,
+      mutations: [{ type: 'set-viewport', viewport: { x: 1, y: 1, zoom: 1 } }],
+    })).rejects.toThrow('DESIGN_RECOVERY_REQUIRED')
+    expect(fixture.guardProjects).toEqual(['project-1'])
+    expect(mutateCount).toBe(0)
+  })
+
   test('Given 局部有序 patch When IPC 校验 Then 接受合法索引并拒绝负索引和任务节点', async () => {
     const fixture = createFixture()
     registerDesignIpcHandlers(fixture.options)

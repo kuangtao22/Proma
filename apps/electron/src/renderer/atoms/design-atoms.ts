@@ -117,7 +117,7 @@ export const executeDesignEditAtom = atom(
   (get, set, input: ExecuteDesignEditInput): void => {
     /** 项目状态始终按稳定 projectId 读取，避免切项目后的迟到事件污染当前项目。 */
     const current = get(designProjectStatesAtom).get(input.projectId)
-    if (!current?.snapshot?.writable) return
+    if (!current?.snapshot?.writable || current.conflictRecoveryPending) return
     /** 纯 reducer 同时生成乐观文档和确定性 inverse。 */
     const result = reduceDesignEdit(current.snapshot.document, input.command)
     if (result.forward.length === 0) return
@@ -142,7 +142,7 @@ export const undoDesignEditAtom = atom(
     /** 撤销必须基于项目最新乐观文档。 */
     const current = get(designProjectStatesAtom).get(input.projectId)
     const entry = current?.history.at(-1)
-    if (!current?.snapshot?.writable || !entry) return
+    if (!current?.snapshot?.writable || current.conflictRecoveryPending || !entry) return
     if (!areDesignMutationsJobSafe(current.snapshot.document, entry.inverse)) return
     set(updateDesignProjectStateAtom, {
       projectId: input.projectId,
@@ -168,7 +168,7 @@ export const redoDesignEditAtom = atom(
     /** 重做必须基于项目最新乐观文档。 */
     const current = get(designProjectStatesAtom).get(input.projectId)
     const entry = current?.future.at(-1)
-    if (!current?.snapshot?.writable || !entry) return
+    if (!current?.snapshot?.writable || current.conflictRecoveryPending || !entry) return
     if (!areDesignMutationsJobSafe(current.snapshot.document, entry.forward)) return
     set(updateDesignProjectStateAtom, {
       projectId: input.projectId,

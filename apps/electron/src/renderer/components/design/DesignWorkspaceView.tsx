@@ -17,7 +17,10 @@ import {
 } from '@/lib/design-editor'
 import { DesignCanvas } from './DesignCanvas'
 import { DesignToolbar } from './DesignToolbar'
-import { useDesignWorkspace } from './use-design-workspace'
+import {
+  isDesignStructuralConflictBlocked,
+  useDesignWorkspace,
+} from './use-design-workspace'
 
 export interface DesignWorkspaceStateViewProps {
   /** 当前项目的完整设计状态。 */
@@ -26,6 +29,8 @@ export interface DesignWorkspaceStateViewProps {
   onRetry: () => void
   /** 重试提交保留在内存中的失败 mutation。 */
   onRetrySave: () => void
+  /** 放弃本地结构冲突修改并采用远端版本。 */
+  onAcceptRemoteVersion?: () => void
   /** 打开主进程图片选择器。 */
   onImportAssets?: () => void
   /** 打开空画布生成表单。 */
@@ -37,6 +42,7 @@ export function DesignWorkspaceStateView({
   state,
   onRetry,
   onRetrySave,
+  onAcceptRemoteVersion,
   onImportAssets,
   onCreateJob,
 }: DesignWorkspaceStateViewProps): React.ReactElement {
@@ -64,8 +70,10 @@ export function DesignWorkspaceStateView({
 
   /** 空画布直接显示两个主操作，不增加说明型落地页。 */
   const isEmpty = state.snapshot.document.nodes.length === 0
-  /** 只读项目仍显示画布内容，仅关闭写入口。 */
-  const writable = state.snapshot.writable
+  /** 冲突恢复期间关闭全部写入口，避免旧 pending 未解决时继续积累修改。 */
+  const writable = state.snapshot.writable && !state.conflictRecoveryPending
+  /** 远端快照已接管后才允许用户明确放弃本地结构冲突队列。 */
+  const structuralConflictBlocked = isDesignStructuralConflictBlocked(state)
   /** 当前画布文档包含稳定项目 ID，可作为 Jotai 局部更新键。 */
   const projectId = state.snapshot.document.projectId
   /** job 选区禁用所有结构编辑入口，仅保留选择和移动。 */
@@ -113,7 +121,7 @@ export function DesignWorkspaceStateView({
   return (
     <div className="relative flex h-full min-h-0 flex-col bg-background">
       <div className="absolute left-3 top-14 z-10 flex max-w-[min(520px,calc(100%-24px))] flex-col gap-1">
-        {!writable && (
+        {!state.snapshot.writable && (
           <p className="rounded border border-border bg-background/95 px-2 py-1 text-xs text-muted-foreground">
             {state.snapshot.readOnlyReason ?? '设计工作区当前为只读'}
           </p>
@@ -127,6 +135,17 @@ export function DesignWorkspaceStateView({
               <Button type="button" variant="outline" size="sm" onClick={onRetrySave}>
                 <RefreshCw className="size-3.5" aria-hidden="true" />
                 重试保存
+              </Button>
+            )}
+            {structuralConflictBlocked && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={!onAcceptRemoteVersion}
+                onClick={onAcceptRemoteVersion}
+              >
+                采用远端版本
               </Button>
             )}
           </div>
@@ -195,7 +214,7 @@ export function DesignWorkspaceStateView({
 /** 从当前项目读取隔离状态并渲染设计工作区。 */
 export function DesignWorkspaceView(): React.ReactElement {
   const projectId = useAtomValue(currentAgentWorkspaceIdAtom)
-  const { state, retry, retrySave } = useDesignWorkspace(projectId)
+  const { state, retry, retrySave, acceptRemoteVersion } = useDesignWorkspace(projectId)
 
   if (!projectId) {
     return (
@@ -209,6 +228,7 @@ export function DesignWorkspaceView(): React.ReactElement {
       state={state ?? createInitialDesignProjectState()}
       onRetry={retry}
       onRetrySave={retrySave}
+      onAcceptRemoteVersion={acceptRemoteVersion}
     />
   )
 }
