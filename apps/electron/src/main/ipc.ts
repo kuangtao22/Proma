@@ -5,6 +5,7 @@
  */
 
 import { ipcMain, nativeTheme, shell, dialog, BrowserWindow, app, clipboard, nativeImage } from 'electron'
+import type { OpenDialogOptions, SaveDialogOptions } from 'electron'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { existsSync, realpathSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
@@ -162,7 +163,11 @@ import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/r
 import { browserController } from './lib/browser-controller'
 import { resolveBrowserProfileKey } from './lib/browser-profile-policy'
 import { getUnstagedChanges, invalidateGitDiffCache, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges, getMainRepoRoot } from './lib/git-diff-service'
-import { registerPromaDirectoryPath, registerPromaFilePath } from './lib/local-file-protocol'
+import { registerPromaDirectoryPath, registerPromaFilePath, revokePromaPathUrl } from './lib/local-file-protocol'
+import { DesignAssetService } from './lib/design/design-asset-service'
+import { registerDesignIpcHandlers } from './lib/design/design-ipc'
+import { designPathResolver } from './lib/design/design-paths'
+import { designStore } from './lib/design/design-store'
 import { registerUpdaterIpc } from './lib/updater/updater-ipc'
 import { createLanBridgeIpcDependencies, registerLanBridgeIpcHandlers } from './lib/lan-bridge/lan-bridge-ipc'
 import {
@@ -1044,6 +1049,59 @@ export function registerIpcHandlers(): void {
     },
     getWorkspaceIdBySlug: (slug) => getAgentWorkspaceBySlug(slug)?.id,
     getWorkspaceOperationBlockReason,
+  })
+  /** Design 素材服务只接受可信项目路径、原子 store 和目录级媒体授权。 */
+  const designAssetService = new DesignAssetService({
+    pathResolver: designPathResolver,
+    store: designStore,
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+    registerDirectoryPath: registerPromaDirectoryPath,
+    revokePathUrl: revokePromaPathUrl,
+  })
+  registerDesignIpcHandlers({
+    ipc: ipcMain,
+    listAuthorizedWebContents: () => {
+      const contents = getStoredMainWindow()?.webContents
+      return contents && !contents.isDestroyed() ? [contents] : []
+    },
+    guard: workspaceOperationGuard,
+    store: designStore,
+    assets: designAssetService,
+    pickImageFiles: async (sender) => {
+      /** 图片路径只由主进程系统选择器产生，renderer 无法注入任意路径。 */
+      const owner = BrowserWindow.fromWebContents(sender)
+      const options: OpenDialogOptions = {
+        title: '导入设计素材',
+        properties: ['openFile', 'multiSelections'],
+        filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
+      }
+      const result = owner
+        ? await dialog.showOpenDialog(owner, options)
+        : await dialog.showOpenDialog(options)
+      return result.canceled ? [] : result.filePaths
+    },
+    pickRelinkImageFile: async (sender) => {
+      /** 重新定位严格选择单文件，旧素材关系由素材服务保留。 */
+      const owner = BrowserWindow.fromWebContents(sender)
+      const options: OpenDialogOptions = {
+        title: '重新定位设计素材',
+        properties: ['openFile'],
+        filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
+      }
+      const result = owner
+        ? await dialog.showOpenDialog(owner, options)
+        : await dialog.showOpenDialog(options)
+      return result.canceled ? null : result.filePaths[0] ?? null
+    },
+    pickExportPath: async (sender, filename) => {
+      /** 导出目标同样由主进程选择器决定。 */
+      const owner = BrowserWindow.fromWebContents(sender)
+      const options: SaveDialogOptions = { title: '导出设计素材', defaultPath: filename }
+      const result = owner
+        ? await dialog.showSaveDialog(owner, options)
+        : await dialog.showSaveDialog(options)
+      return result.canceled ? null : result.filePath ?? null
+    },
   })
   registerPathManagementIpcHandlers({
     mode: 'normal',
