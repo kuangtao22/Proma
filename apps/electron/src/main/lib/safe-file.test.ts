@@ -96,6 +96,44 @@ describe('Windows durability capability', () => {
     }
   })
 
+  test('Given Windows 定位文件已提交但目录 open 返回 EACCES When 返回 Then 保留文件并报告 file-only', () => {
+    /** 模拟用户目录允许写文件、但 Windows 不允许以目录句柄执行 fsync 的场景。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-locator-win-eacces-'))
+    const filePath = join(tempDir, '.proma-location.json')
+    let syncedFilePath = ''
+    try {
+      const result = writeJsonFileAtomic(filePath, { activeRoot: 'D:\\Proma' }, false, {
+        platform: 'win32',
+        syncFile: (currentPath) => { syncedFilePath = currentPath },
+        syncDirectory: () => { throw createFileSystemError('EACCES', 'open') },
+      })
+
+      expect(result).toBe('file-only')
+      expect(syncedFilePath).toBe(filePath)
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ activeRoot: 'D:\\Proma' })
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given Windows 定位文件已提交但目录 fsync 返回 EPERM When 返回 Then 保留文件并报告 file-only', () => {
+    /** 模拟目录句柄可打开、但 Windows 拒绝对目录执行 FlushFileBuffers 的场景。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-locator-win-fsync-eperm-'))
+    const filePath = join(tempDir, '.proma-location.json')
+    try {
+      const result = writeJsonFileAtomic(filePath, { activeRoot: 'D:\\Proma' }, false, {
+        platform: 'win32',
+        syncFile: () => {},
+        syncDirectory: () => { throw createFileSystemError('EPERM', 'fsync') },
+      })
+
+      expect(result).toBe('file-only')
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ activeRoot: 'D:\\Proma' })
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('Given 普通文本原子写已 rename 且 Windows 不支持目录 open When 返回 Then 内容保留且报告 file-only', () => {
     /** 隔离文本原子写的 Windows capability 合同。 */
     const tempDir = mkdtempSync(join(tmpdir(), 'proma-text-win-durability-'))
@@ -116,16 +154,16 @@ describe('Windows durability capability', () => {
     }
   })
 
-  test('Given Windows 安全写遇到非 capability EPERM When 提交后同步 Then 仍向上传播真实 I/O 错误', () => {
-    /** 非目录 open 阶段的 EPERM 不得被泛化吞掉。 */
+  test('Given Windows 安全写遇到 EIO When 提交后同步 Then 仍向上传播真实 I/O 错误', () => {
+    /** 真实设备 I/O 错误不得被 Windows capability 降级吞掉。 */
     const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-win-io-error-'))
     const filePath = join(tempDir, 'journal.json')
     try {
       expect(() => writeJsonFileAtomicSecure(filePath, { stage: 'copying' }, {
         platform: 'win32',
         syncFile: () => {},
-        syncDirectory: () => { throw createFileSystemError('EPERM', 'fsync') },
-      })).toThrow('fsync EPERM')
+        syncDirectory: () => { throw createFileSystemError('EIO', 'fsync') },
+      })).toThrow('fsync EIO')
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }

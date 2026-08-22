@@ -370,8 +370,10 @@ function isWindowsDirectorySyncCapabilityError(error: unknown, platform: NodeJS.
   /** syncDirectoryDurable 会用 cause 保留原始 Node 系统错误。 */
   const systemError = getSystemError(error)
   if (!systemError) return false
-  return (systemError.syscall === 'open' && (systemError.code === 'EPERM' || systemError.code === 'EISDIR'))
-    || (systemError.syscall === 'fsync' && (systemError.code === 'EINVAL' || systemError.code === 'ENOTSUP'))
+  return (systemError.syscall === 'open'
+    && (systemError.code === 'EPERM' || systemError.code === 'EACCES' || systemError.code === 'EISDIR'))
+    || (systemError.syscall === 'fsync'
+      && ['EINVAL', 'ENOTSUP', 'EPERM', 'EACCES'].includes(systemError.code))
 }
 
 /** 从包装错误或其 cause 中提取 Node 系统错误字段。 */
