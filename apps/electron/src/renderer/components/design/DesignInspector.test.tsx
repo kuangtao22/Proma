@@ -8,7 +8,6 @@ import type { DesignAdapter } from '@/lib/design-adapter'
 import {
   createDesignEditJobInput,
   createDesignGenerationJobInput,
-  createImportedDesignMutations,
   DesignInspectorStateView,
   serializeDesignGenerationPrompt,
 } from './DesignInspector'
@@ -72,6 +71,7 @@ function renderInspector(
       onExportAsset={() => undefined}
       onGroupSelection={() => undefined}
       onSelectAsset={() => undefined}
+      onClearSelection={() => undefined}
       onCreateJob={(_input: CreateDesignJobInput) => undefined}
     />,
   )
@@ -134,6 +134,27 @@ describe('Design Inspector 状态', () => {
 
     expect(html).toContain('poster.png')
     expect(html).toContain('aria-label="删除素材"')
+    expect(html).toContain('AI 编辑仅支持画布素材节点')
+    expect(html).not.toContain('编辑 poster.png')
+  })
+
+  test('Given 多选包含 job 节点 When 渲染 Then 分组入口禁用', () => {
+    const snapshot = createSnapshot()
+    snapshot.document.nodes.push({
+      id: 'job-node', kind: 'job', jobId: 'job-1', position: { x: 30, y: 40 },
+      width: 320, height: 240, zIndex: 1,
+    })
+    const html = renderInspector(['node-1', 'job-node'], snapshot)
+
+    expect(html).toMatch(/创建分组[\s\S]*disabled=""|disabled=""[^>]*>创建分组/)
+  })
+
+  test('Given 仅右栏素材选中 When 渲染 Then 清除选择可用', () => {
+    const snapshot = createSnapshot()
+    snapshot.document.nodes = []
+    const html = renderInspector([], snapshot, 'asset-1')
+
+    expect(html).toMatch(/aria-label="清除选择"(?![^>]*disabled)/)
   })
 
   test('Given 只读项目 When 渲染 Then 禁用写操作但允许导出', () => {
@@ -170,27 +191,6 @@ describe('Design Inspector 纯业务契约', () => {
     })
   })
 
-  test('Given 两个导入素材 When 创建 mutation Then 素材与节点同批且节点从中心按 24px 偏移', () => {
-    const document = createEmptyDesignDocument('project-1', 10)
-    const assets = [createAsset({ id: 'asset-1' }), createAsset({ id: 'asset-2' })]
-    let nextId = 0
-    const mutations = createImportedDesignMutations(
-      document,
-      assets,
-      { x: 100, y: 200 },
-      () => `node-${++nextId}`,
-    )
-
-    expect(mutations[0]).toEqual({ type: 'upsert-assets', assets })
-    expect(mutations[1]).toMatchObject({
-      type: 'upsert-nodes',
-      nodes: [
-        { id: 'node-1', assetId: 'asset-1', position: { x: 100, y: 200 } },
-        { id: 'node-2', assetId: 'asset-2', position: { x: 124, y: 224 } },
-      ],
-    })
-  })
-
   test('Given 素材仍被节点引用 When 请求删除 Then 返回稳定阻断原因', () => {
     const snapshot = createSnapshot()
     expect(getDesignAssetDeleteBlockReason(snapshot.document, 'asset-1')).toBe(
@@ -199,7 +199,7 @@ describe('Design Inspector 纯业务契约', () => {
     expect(getDesignAssetDeleteBlockReason(snapshot.document, 'unused')).toBeNull()
   })
 
-  test('Given 主进程导入返回新素材 When 执行导入 Then 只把节点 mutation 加入待保存队列', async () => {
+  test('Given 主进程原子返回新素材与节点 When 执行导入 Then 采用权威快照且不产生待保存 mutation', async () => {
     const store = createStore()
     const initialDocument = createEmptyDesignDocument('project-1', 10)
     store.set(designProjectStatesAtom, new Map([['project-1', {
@@ -211,8 +211,17 @@ describe('Design Inspector 纯业务契约', () => {
     const importedDocument = createEmptyDesignDocument('project-1', 20)
     importedDocument.revision = 1
     importedDocument.assets = [createAsset()]
+    importedDocument.nodes = [{
+      id: 'node-imported', kind: 'asset', assetId: 'asset-1', position: { x: 0, y: 0 },
+      width: 320, height: 240, zIndex: 0,
+    }]
+    /** 记录 Renderer 只提交受控 revision 和画布中心。 */
+    const importInputs: Array<{ projectId: string; expectedRevision: number; viewportCenter: { x: number; y: number } }> = []
     const adapter: Pick<DesignAdapter, 'importAssets' | 'deleteAsset' | 'relinkAsset' | 'exportAsset'> = {
-      importAssets: async () => ({ document: importedDocument, writable: true }),
+      importAssets: async (input) => {
+        importInputs.push(input)
+        return { document: importedDocument, writable: true }
+      },
       deleteAsset: async () => importedDocument,
       relinkAsset: async () => importedDocument,
       exportAsset: async () => undefined,
@@ -229,10 +238,12 @@ describe('Design Inspector 纯业务契约', () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
 
     const state = store.get(designProjectStatesAtom).get('project-1')!
+    expect(importInputs).toEqual([{ projectId: 'project-1', expectedRevision: 0, viewportCenter: { x: 0, y: 0 } }])
     expect(state.snapshot?.document.assets.map((asset) => asset.id)).toEqual(['asset-1'])
-    expect(state.snapshot?.document.nodes).toHaveLength(1)
-    expect(state.pendingMutations).toHaveLength(1)
-    expect(state.pendingMutations[0]?.type).toBe('upsert-nodes')
+    expect(state.snapshot?.document.nodes.map((node) => node.id)).toEqual(['node-imported'])
+    expect(state.selectedNodeIds).toEqual(['node-imported'])
+    expect(state.pendingMutations).toEqual([])
+    expect(state.history).toEqual([])
   })
 
   test('Given 素材没有节点引用 When 删除或重新定位 Then 调用 adapter 并使用当前 revision', async () => {

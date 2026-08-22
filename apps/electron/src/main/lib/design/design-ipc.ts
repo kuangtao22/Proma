@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
 import type {
   DeleteDesignAssetInput,
@@ -220,11 +221,53 @@ function isRendererMutation(value: unknown): value is DesignMutation {
 }
 
 /** 解析只含 projectId 的请求。 */
-function parseProjectInput(value: unknown): ImportDesignAssetsInput {
+function parseProjectInput(value: unknown): { projectId: string } {
   if (!isRecord(value) || !hasOnlyKeys(value, ['projectId']) || !isNonEmptyString(value.projectId)) {
     throw new Error('Design 请求结构无效')
   }
   return { projectId: value.projectId }
+}
+
+/** 解析原子素材导入请求，只接受 revision 与受控布局中心。 */
+function parseImportAssetsInput(value: unknown): ImportDesignAssetsInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'expectedRevision', 'viewportCenter'])
+    || !isNonEmptyString(value.projectId)
+    || !isRevision(value.expectedRevision)
+    || !isPoint(value.viewportCenter)) throw new Error('Design 请求结构无效')
+  return {
+    projectId: value.projectId,
+    expectedRevision: value.expectedRevision,
+    viewportCenter: value.viewportCenter,
+  }
+}
+
+/**
+ * 为主进程已验证的素材创建固定画布节点。
+ * @param document 导入前的权威画布文档。
+ * @param assets 本批次由素材服务生成的可信元数据。
+ * @param viewportCenter Renderer 提供且经过形状校验的可见中心。
+ * @returns 使用主进程随机 ID、按 24px 错位排列的素材节点。
+ */
+function createImportedAssetNodes(
+  document: DesignCanvasDocument,
+  assets: DesignAssetImportBatch,
+  viewportCenter: DesignPoint,
+): DesignCanvasNode[] {
+  /** 新节点从权威文档当前最大层级之后依次排列。 */
+  const firstZIndex = Math.max(-1, ...document.nodes.map((node) => node.zIndex)) + 1
+  return assets.map((asset, index) => ({
+    id: randomUUID(),
+    kind: 'asset',
+    assetId: asset.id,
+    position: {
+      x: viewportCenter.x + index * 24,
+      y: viewportCenter.y + index * 24,
+    },
+    width: 320,
+    height: 240,
+    zIndex: firstZIndex + index,
+  }))
 }
 
 /** 解析画布保存请求，并拒绝素材 mutation。 */
@@ -453,7 +496,7 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.IMPORT_ASSETS, async (event, value): Promise<DesignWorkspaceSnapshot> => {
     const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
-    const input = parseProjectInput(value)
+    const input = parseImportAssetsInput(value)
     return options.guard.runWorkspaceWrite(input.projectId, async () => {
       /** 只有本次调用创建的批次允许在错误路径回滚。 */
       let importBatch: DesignAssetImportBatch | undefined
@@ -464,12 +507,14 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
         }
         importBatch = await options.assets.importAuthorizedFiles(input.projectId, sourcePaths, { kind: 'picker' })
         const current = options.store.load(input.projectId)
+        /** 素材与引用节点必须进入同一个 revision，避免进程退出留下孤立素材。 */
+        const nodes = createImportedAssetNodes(current.document, importBatch, input.viewportCenter)
         const document = importBatch.length === 0
           ? current.document
-          : options.store.mutate(input.projectId, current.document.revision, [{
-              type: 'upsert-assets',
-              assets: importBatch,
-            }])
+          : options.store.mutate(input.projectId, input.expectedRevision, [
+              { type: 'upsert-assets', assets: importBatch },
+              { type: 'upsert-nodes', nodes },
+            ])
         /** commit 内部仅清理本批次 journal，失败只告警，不把已提交 revision 反报失败。 */
         importBatch.commit()
         if (importBatch.length > 0) {

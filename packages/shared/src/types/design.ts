@@ -173,6 +173,8 @@ export interface SaveDesignMutationsInput {
 
 export interface ImportDesignAssetsInput {
   projectId: string
+  expectedRevision: number
+  viewportCenter: DesignPoint
 }
 
 export interface DeleteDesignAssetInput {

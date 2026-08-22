@@ -6,6 +6,7 @@ import {
 } from './design'
 import type {
   DesignAsset,
+  ImportDesignAssetsInput,
   DesignJobRecord,
   SaveDesignMutationsInput,
 } from './design'
@@ -42,6 +43,13 @@ const saveContract = {
   mutations: [],
 } satisfies SaveDesignMutationsInput
 
+/** 编译期锁定原子导入的 revision 与布局输入。 */
+const importContract = {
+  projectId: 'project-1',
+  expectedRevision: 0,
+  viewportCenter: { x: 100, y: 200 },
+} satisfies ImportDesignAssetsInput
+
 describe('Design 共享契约', () => {
   test('Given 一个项目 When 创建空画布 Then 使用稳定项目 ID、版本和初始视口', () => {
     const document = createEmptyDesignDocument('project-1', 100)
@@ -75,5 +83,6 @@ describe('Design 共享契约', () => {
     expect(assetContract.id).toBe('asset-1')
     expect(jobContract.status).toBe('queued')
     expect(saveContract.expectedRevision).toBe(0)
+    expect(importContract.viewportCenter).toEqual({ x: 100, y: 200 })
   })
 })

@@ -27,7 +27,7 @@ describe('Design preload', () => {
     const calls: Array<[() => Promise<unknown>, string, unknown[]]> = [
       [() => api.loadDesignWorkspace('p1'), DESIGN_IPC_CHANNELS.LOAD, [{ projectId: 'p1' }]],
       [() => api.saveDesignMutations({ projectId: 'p1', expectedRevision: 0, mutations: [] }), DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, [{ projectId: 'p1', expectedRevision: 0, mutations: [] }]],
-      [() => api.importDesignAssets({ projectId: 'p1' }), DESIGN_IPC_CHANNELS.IMPORT_ASSETS, [{ projectId: 'p1' }]],
+      [() => api.importDesignAssets({ projectId: 'p1', expectedRevision: 3, viewportCenter: { x: 10, y: 20 } }), DESIGN_IPC_CHANNELS.IMPORT_ASSETS, [{ projectId: 'p1', expectedRevision: 3, viewportCenter: { x: 10, y: 20 } }]],
       [() => api.deleteDesignAsset({ projectId: 'p1', assetId: 'a1', expectedRevision: 0 }), DESIGN_IPC_CHANNELS.DELETE_ASSET, [{ projectId: 'p1', assetId: 'a1', expectedRevision: 0 }]],
       [() => api.relinkDesignAsset({ projectId: 'p1', assetId: 'a1', expectedRevision: 0 }), DESIGN_IPC_CHANNELS.RELINK_ASSET, [{ projectId: 'p1', assetId: 'a1', expectedRevision: 0 }]],
       [() => api.exportDesignAsset({ projectId: 'p1', assetId: 'a1' }), DESIGN_IPC_CHANNELS.EXPORT_ASSET, [{ projectId: 'p1', assetId: 'a1' }]],

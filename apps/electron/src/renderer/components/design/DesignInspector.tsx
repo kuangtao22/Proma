@@ -20,7 +20,6 @@ import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { buildDesignVersionTree, type DesignVersionTreeNode } from './design-version-tree'
 import { useDesignInspectorActions } from './use-design-inspector-actions'
-export { createImportedDesignMutations } from './use-design-inspector-actions'
 
 /** 首版图片生成允许的画面比例。 */
 export type DesignAspectRatio = '1:1' | '16:9' | '4:3' | '9:16' | '3:4'
@@ -114,6 +113,8 @@ export interface DesignInspectorStateViewProps {
 /** 素材标签所需的选择上下文。 */
 interface InspectorSelection {
   selectedNodeCount: number
+  containsJobNode: boolean
+  canvasAssetNodeSelected: boolean
   assetId?: string
   asset?: DesignAsset
   missing: boolean
@@ -154,7 +155,7 @@ function AssetsPanel({
         {selection.selectedNodeCount > 1 && (
           <div className="flex items-center justify-between gap-2">
             <p className="text-xs font-medium">已选择 {selection.selectedNodeCount} 项</p>
-            <Button type="button" variant="outline" size="sm" disabled={!writable} onClick={onGroupSelection}>创建分组</Button>
+            <Button type="button" variant="outline" size="sm" disabled={!writable || selection.containsJobNode} onClick={onGroupSelection}>创建分组</Button>
           </div>
         )}
         {selection.assetId && selection.missing && (
@@ -251,7 +252,7 @@ function AiPanel({
   /** 提交单素材编辑任务。 */
   const handleEdit = (event: React.FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
-    if (!enabled || !selection.asset || !state.editPrompt.trim()) return
+    if (!enabled || !selection.canvasAssetNodeSelected || !selection.asset || !state.editPrompt.trim()) return
     onCreateJob(createDesignEditJobInput(
       snapshot.document.projectId,
       state.editPrompt,
@@ -262,6 +263,7 @@ function AiPanel({
   }
 
   if (selection.selectedNodeCount > 1) return <p className="text-xs text-muted-foreground">AI 编辑仅支持单个素材节点</p>
+  if (selection.asset && !selection.canvasAssetNodeSelected) return <p className="text-xs text-muted-foreground">AI 编辑仅支持画布素材节点</p>
   if (selection.assetId && selection.missing) return <p className="text-xs text-muted-foreground">请先重新定位缺失素材</p>
   if (selection.asset) {
     /** 只有 mask 批注允许作为编辑输入。 */
@@ -337,6 +339,8 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
   const selectedAsset = assetId ? state.snapshot.document.assets.find((asset) => asset.id === assetId) : undefined
   const selection: InspectorSelection = {
     selectedNodeCount: selectedNodes.length,
+    containsJobNode: selectedNodes.some((node) => node.kind === 'job'),
+    canvasAssetNodeSelected: selectedNodes.length === 1 && selectedNodes[0]?.kind === 'asset',
     assetId,
     asset: selectedAsset,
     missing: Boolean(assetId && (!selectedAsset || missingAssetIds.has(assetId))),
@@ -347,7 +351,7 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
     <aside className="flex h-full min-h-0 shrink-0 flex-col border-l border-border bg-background" style={{ width }} aria-label="设计检查器">
       <header className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
         <h2 className="text-sm font-semibold">设计</h2>
-        <Button type="button" variant="ghost" size="icon-sm" aria-label="清除选择" disabled={state.selectedNodeIds.length === 0 || !props.onClearSelection} onClick={props.onClearSelection}><X aria-hidden="true" /></Button>
+        <Button type="button" variant="ghost" size="icon-sm" aria-label="清除选择" disabled={(state.selectedNodeIds.length === 0 && !state.inspectorAssetId) || !props.onClearSelection} onClick={props.onClearSelection}><X aria-hidden="true" /></Button>
       </header>
       <Tabs value={state.inspectorTab} onValueChange={(value) => props.onTabChange(value as DesignProjectState['inspectorTab'])} className="flex min-h-0 flex-1 flex-col">
         <TabsList className="mx-3 mt-3 grid h-8 shrink-0 grid-cols-3 rounded-md p-0.5">

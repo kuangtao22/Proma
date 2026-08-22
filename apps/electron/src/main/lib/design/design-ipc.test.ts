@@ -3,14 +3,14 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
-import type { DesignAsset, DesignCanvasDocument, DesignWorkspaceSnapshot } from '@proma/shared'
+import type { DesignAsset, DesignCanvasDocument, DesignMutation, DesignWorkspaceSnapshot } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import sharp from 'sharp'
 import { DesignAssetService } from './design-asset-service'
 import type { DesignAssetImportBatch } from './design-asset-service'
 import { registerDesignIpcHandlers, type DesignIpcOptions } from './design-ipc'
 import { createDesignPathResolver } from './design-paths'
-import { createDesignStore } from './design-store'
+import { applyDesignMutations, createDesignStore } from './design-store'
 import type { DesignStore } from './design-store'
 
 /** 测试记录型 IPC handler。 */
@@ -31,6 +31,7 @@ function createFixture(): {
   releases: number[]
   importCommits: string[]
   importRollbacks: string[]
+  mutationBatches: DesignMutation[][]
   document: DesignCanvasDocument
   getStoreReadCount: () => number
 } {
@@ -44,6 +45,8 @@ function createFixture(): {
   const importCommits: string[] = []
   /** 元数据失败后回滚的导入批次。 */
   const importRollbacks: string[] = []
+  /** store 收到的 mutation 批次，用于验证事务边界。 */
+  const mutationBatches: DesignMutation[][] = []
   /** 当前测试画布。 */
   let document = createEmptyDesignDocument('project-1', 10)
   /** 模拟 store 每次公开加载或 mutation 内部加载权威文档的次数。 */
@@ -109,8 +112,11 @@ function createFixture(): {
       mutate: (_projectId, _revision, mutations, validateCurrent) => {
         storeReadCount += 1
         validateCurrent?.(document)
-        if (mutations[0]?.type === 'upsert-assets') document = { ...document, revision: document.revision + 1, assets: mutations[0].assets }
-        else document = { ...document, revision: document.revision + 1 }
+        mutationBatches.push(mutations)
+        document = {
+          ...applyDesignMutations(document, mutations),
+          revision: document.revision + 1,
+        }
         return document
       },
     },
@@ -142,6 +148,7 @@ function createFixture(): {
     releases,
     importCommits,
     importRollbacks,
+    mutationBatches,
     get document() { return document },
     getStoreReadCount: () => storeReadCount,
   }
@@ -192,7 +199,9 @@ describe('Design IPC', () => {
       projectId: 'project-1', expectedRevision: 0,
       mutations: [{ type: 'set-viewport', viewport: { x: 10, y: 20, zoom: 1 } }],
     })
-    const imported = await invoke(fixture.handlers, DESIGN_IPC_CHANNELS.IMPORT_ASSETS, fixture.senders[0]!, { projectId: 'project-1' }) as DesignWorkspaceSnapshot
+    const imported = await invoke(fixture.handlers, DESIGN_IPC_CHANNELS.IMPORT_ASSETS, fixture.senders[0]!, {
+      projectId: 'project-1', expectedRevision: 1, viewportCenter: { x: 100, y: 200 },
+    }) as DesignWorkspaceSnapshot
 
     await invoke(fixture.handlers, DESIGN_IPC_CHANNELS.RELINK_ASSET, fixture.senders[0]!, {
       projectId: 'project-1', assetId: 'asset-1', expectedRevision: imported.document.revision,
@@ -203,6 +212,13 @@ describe('Design IPC', () => {
 
     expect(fixture.guardProjects).toEqual(['project-1', 'project-1', 'project-1', 'project-1'])
     expect(imported.document.assets.map((asset) => asset.id)).toEqual(['asset-1'])
+    expect(imported.document.nodes).toMatchObject([{
+      kind: 'asset', assetId: 'asset-1', position: { x: 100, y: 200 }, width: 320, height: 240,
+    }])
+    expect(fixture.mutationBatches[1]?.map((mutation) => mutation.type)).toEqual([
+      'upsert-assets',
+      'upsert-nodes',
+    ])
     expect(fixture.importCommits).toEqual(['asset-1'])
     expect(fixture.importRollbacks).toEqual([])
     expect(fixture.senders.every((sender) => sender.sent.length === 4)).toBe(true)
@@ -252,7 +268,7 @@ describe('Design IPC', () => {
       fixture.handlers,
       DESIGN_IPC_CHANNELS.IMPORT_ASSETS,
       fixture.senders[0]!,
-      { projectId: 'project-1' },
+      { projectId: 'project-1', expectedRevision: 0, viewportCenter: { x: 10, y: 20 } },
     ) as DesignWorkspaceSnapshot
 
     expect(imported.assetBaseUrl).toBe(loaded.assetBaseUrl)
@@ -527,10 +543,37 @@ describe('Design IPC', () => {
       fixture.handlers,
       DESIGN_IPC_CHANNELS.IMPORT_ASSETS,
       fixture.senders[0]!,
-      { projectId: 'project-1' },
+      { projectId: 'project-1', expectedRevision: 0, viewportCenter: { x: 10, y: 20 } },
     )).rejects.toThrow('metadata commit failed')
     expect(fixture.importCommits).toEqual([])
     expect(fixture.importRollbacks).toEqual(['asset-1'])
+    expect(fixture.document.assets).toEqual([])
+    expect(fixture.document.nodes).toEqual([])
+  })
+
+  test('Given Renderer 尝试夹带素材元数据 When 导入 Then 在文件选择前拒绝', async () => {
+    const fixture = createFixture()
+    /** 记录系统文件选择器是否被越权输入触发。 */
+    let pickerCalled = false
+    fixture.options.pickImageFiles = async () => {
+      pickerCalled = true
+      return []
+    }
+    registerDesignIpcHandlers(fixture.options)
+
+    await expect(invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.IMPORT_ASSETS,
+      fixture.senders[0]!,
+      {
+        projectId: 'project-1',
+        expectedRevision: 0,
+        viewportCenter: { x: 10, y: 20 },
+        assets: [{ relativePath: '/forged/path.png' }],
+      },
+    )).rejects.toThrow('Design 请求结构无效')
+    expect(pickerCalled).toBe(false)
+    expect(fixture.guardProjects).toEqual([])
   })
 
   test('Given canvas 已落盘但 durability 报错 When 实际导入 handler 回滚 Then 重启按磁盘引用恢复', async () => {
@@ -591,11 +634,13 @@ describe('Design IPC', () => {
         fixture.handlers,
         DESIGN_IPC_CHANNELS.IMPORT_ASSETS,
         fixture.senders[0]!,
-        { projectId: 'project-1' },
+        { projectId: 'project-1', expectedRevision: 0, viewportCenter: { x: 10, y: 20 } },
       )).rejects.toThrow('目录 durability 同步失败')
 
       const persistedAsset = realStore.load('project-1').document.assets[0]
+      const persistedNode = realStore.load('project-1').document.nodes[0]
       expect(persistedAsset).toBeDefined()
+      expect(persistedNode).toMatchObject({ kind: 'asset', assetId: persistedAsset!.id })
       const paths = pathResolver.resolve('project-1')
       expect(existsSync(join(paths.designRoot, persistedAsset!.relativePath))).toBe(true)
       expect(existsSync(join(paths.cacheRoot, persistedAsset!.thumbnailRelativePath))).toBe(true)
