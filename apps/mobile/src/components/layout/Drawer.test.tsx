@@ -55,7 +55,7 @@ describe('移动端会话抽屉', () => {
     expect(markup).toContain('断开')
   })
 
-  test('Given 置顶和工作中会话 When 渲染抽屉 Then 状态由图标语义表达而非 emoji', async () => {
+  test('Given 不同运行态会话 When 渲染抽屉 Then 使用统一四列会话行', async () => {
     const { activeTabAtom, conversationsAtom, tokenAtom } = await import('../../atoms')
     const { Drawer } = await import('./Drawer')
     /** 独立 store 提供两种会话状态。 */
@@ -63,16 +63,17 @@ describe('移动端会话抽屉', () => {
     store.set(tokenAtom, 'token')
     store.set(activeTabAtom, 'agent')
     store.set(conversationsAtom, [
-      { id: 'pinned', title: '置顶会话', type: 'agent', updatedAt: 2, pinned: true },
-      { id: 'working', title: '工作中会话', type: 'agent', updatedAt: 1, manualWorking: true },
+      { id: 'running', title: '运行会话', type: 'agent', updatedAt: 2, runtimeStatus: 'running', starred: true },
+      { id: 'blocked', title: '等待会话', type: 'agent', updatedAt: 1, runtimeStatus: 'blocked' },
     ])
-    /** 状态标记必须保留读屏名称，同时禁止旧 emoji。 */
+    /** 抽屉必须复用状态、标题、星标、时间四列契约。 */
     const markup = renderToStaticMarkup(
       <Provider store={store}><Drawer onClose={() => undefined} /></Provider>,
     )
 
-    expect(markup).toContain('aria-label="置顶"')
-    expect(markup).toContain('aria-label="工作中"')
-    expect(markup).not.toMatch(/[📌●]/u)
+    expect(markup.match(/data-agent-session-row="four-column"/g)).toHaveLength(2)
+    expect(markup).toContain('aria-label="运行中"')
+    expect(markup).toContain('aria-label="等待处理"')
+    expect(markup.indexOf('aria-label="取消星标"')).toBeLessThan(markup.indexOf('data-session-time'))
   })
 })

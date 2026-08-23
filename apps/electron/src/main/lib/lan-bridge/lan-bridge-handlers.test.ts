@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { WebSocket } from 'ws'
-import type { LanBridgeResponse } from '@proma/shared'
+import type { LanBridgePush, LanBridgeResponse } from '@proma/shared'
 import { createLanBridgeAuthService } from './lan-bridge-auth'
 import type { LanBridgeAuthService } from './lan-bridge-auth'
 import { LanBridgeDeviceStore } from './lan-bridge-device-store'
@@ -19,11 +19,11 @@ const temporaryDirectories: string[] = []
 /** 记录协议响应与关闭行为的测试 WebSocket。 */
 class FakeWebSocket {
   readyState = 1
-  readonly messages: LanBridgeResponse[] = []
+  readonly messages: Array<LanBridgeResponse | LanBridgePush> = []
   readonly closeCalls: Array<{ code: number; reason: string }> = []
 
   send(message: string): void {
-    this.messages.push(JSON.parse(message) as LanBridgeResponse)
+    this.messages.push(JSON.parse(message) as LanBridgeResponse | LanBridgePush)
   }
 
   close(code: number, reason: string): void {
@@ -57,6 +57,7 @@ async function request(
   /** 当前请求生成的最后一条响应。 */
   const response = socket.messages.at(-1)
   if (!response) throw new Error(`请求 ${type} 未生成响应`)
+  if (!('ok' in response)) throw new Error(`请求 ${type} 最后一条消息不是响应`)
   return response
 }
 

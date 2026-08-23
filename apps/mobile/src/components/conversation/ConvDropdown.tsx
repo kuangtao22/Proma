@@ -7,6 +7,13 @@ import {
 import { loadData } from '../../App'
 import { createAgentConversation, saveActiveConv } from '../../utils/session'
 import { formatRelativeTime } from '../../utils/format'
+import { wsReq } from '../../lib/ws-client'
+import {
+  readAgentStarUpdate,
+  updateActiveAgentStarred,
+  updateAgentStarred,
+} from '../../lib/session-runtime-state'
+import { AgentSessionRow } from './AgentSessionRow'
 
 interface Props {
   onClose: () => void
@@ -40,6 +47,21 @@ export function ConvDropdown({ onClose }: Props) {
     } catch { /* TODO: toast */ }
   }
 
+  /** 请求服务端切换星标，并把确认结果同步到两个会话状态入口。 */
+  const handleToggleStar = async (session: ConvItem): Promise<void> => {
+    if (!token || session.type !== 'agent') return
+    try {
+      /** 星标状态只采用服务端确认值，避免失败时产生假状态。 */
+      const update = readAgentStarUpdate(await wsReq('agent.sessions.toggle_star', {
+        token,
+        sessionId: session.id,
+      }))
+      if (!update) return
+      setConvs(current => updateAgentStarred(current, update.sessionId, update.starred))
+      setActive(current => updateActiveAgentStarred(current, update.sessionId, update.starred))
+    } catch { /* TODO: toast */ }
+  }
+
   const handleViewAll = () => {
     setOpen(false)
     setDrawerOpen(true)
@@ -58,18 +80,36 @@ export function ConvDropdown({ onClose }: Props) {
         style={{ maxHeight: '60vh' }}>
         <div className="overflow-y-auto" style={{ maxHeight: 'calc(60vh - 48px)' }}>
           {convs.map(c => (
-            <button key={c.id} onClick={() => handleSwitch(c)}
-              className={`flex min-h-10 w-full items-center gap-2 border-b border-border/60 px-3.5 py-2 text-left transition-colors hover:bg-accent ${active?.id === c.id ? 'bg-accent' : ''}`}>
-              <span className="text-sm text-foreground truncate flex-1">{c.title || '新对话'}</span>
-              {c.updatedAt ? (
-                <span className="text-[10px] text-muted-foreground flex-shrink-0">
-                  {formatRelativeTime(c.updatedAt)}
-                </span>
-              ) : null}
-              {active?.id === c.id && (
-                <Check aria-label="当前会话" className="h-3.5 w-3.5 flex-shrink-0 text-foreground" strokeWidth={2.2} />
-              )}
-            </button>
+            c.type === 'agent' ? (
+              <div key={c.id} className="border-b border-border/60">
+                <AgentSessionRow
+                  session={c}
+                  active={active?.type === 'agent' && active.id === c.id}
+                  onOpen={() => handleSwitch(c)}
+                  onToggleStar={() => { void handleToggleStar(c) }}
+                />
+              </div>
+            ) : (
+              <button
+                key={c.id}
+                onClick={() => handleSwitch(c)}
+                className={`flex min-h-10 w-full items-center gap-2 border-b border-border/60 px-3.5 py-2 text-left text-sm transition-colors hover:bg-accent ${active?.id === c.id ? 'bg-accent' : ''}`}
+              >
+                <span className="min-w-0 flex-1 truncate text-foreground">{c.title || '新对话'}</span>
+                {c.updatedAt ? (
+                  <span className="flex-shrink-0 text-[10px] text-muted-foreground">
+                    {formatRelativeTime(c.updatedAt)}
+                  </span>
+                ) : null}
+                {active?.id === c.id && (
+                  <Check
+                    aria-label="当前会话"
+                    className="h-3.5 w-3.5 flex-shrink-0 text-foreground"
+                    strokeWidth={2.2}
+                  />
+                )}
+              </button>
+            )
           ))}
           {convs.length === 0 && (
             <p className="text-center text-muted-foreground text-xs py-4">暂无对话</p>

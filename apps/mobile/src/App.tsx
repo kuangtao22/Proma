@@ -33,6 +33,12 @@ import {
   saveTrustedDeviceAuthentication,
 } from './lib/device-credentials'
 import { recoverTrustedDeviceAuth } from './lib/auth-recovery'
+import {
+  normalizeAgentSessionSnapshot,
+  readAgentRuntimeUpdate,
+  updateActiveAgentRuntimeStatus,
+  updateAgentRuntimeStatus,
+} from './lib/session-runtime-state'
 
 interface ConvListResponse { conversations: ConvItem[] }
 interface SessionListResponse { sessions: ConvItem[] }
@@ -334,11 +340,27 @@ export function App() {
         case 'agent.sessions.updated':
           void loadData(setConvs, setWorkspaces, token, setCurrentWsId)
           break
+        case 'agent.session.runtime_updated': {
+          /** 实时状态必须同时写入列表和当前会话，保持列表与输入栏一致。 */
+          const update = readAgentRuntimeUpdate(msg.data)
+          if (!update) break
+          setConvs(current => updateAgentRuntimeStatus(
+            current,
+            update.sessionId,
+            update.runtimeStatus,
+          ))
+          setActive(current => updateActiveAgentRuntimeStatus(
+            current,
+            update.sessionId,
+            update.runtimeStatus,
+          ))
+          break
+        }
         default: break
       }
     })
     return unsub
-  }, [token, setConvs, setWorkspaces])
+  }, [token, setActive, setConvs, setCurrentWsId, setWorkspaces])
 
   // 持久化 view 状态
   useEffect(() => {
@@ -416,7 +438,12 @@ async function executeLoadData(
     ? { status: 'fulfilled', value: ((results[0].value as ConvListResponse).conversations ?? []).map(c => ({ ...c, type: 'chat' })) }
     : results[0]
   const sessionResult: PromiseSettledResult<ConvItem[]> = results[1].status === 'fulfilled'
-    ? { status: 'fulfilled', value: ((results[1].value as SessionListResponse).sessions ?? []).map(s => ({ ...s, type: 'agent' })) }
+    ? {
+        status: 'fulfilled',
+        value: ((results[1].value as SessionListResponse).sessions ?? []).map(session => (
+          normalizeAgentSessionSnapshot({ ...session, type: 'agent' })
+        )),
+      }
     : results[1]
   const conversations = combineAuthoritativeLists(
     chatResult,

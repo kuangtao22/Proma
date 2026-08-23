@@ -1,15 +1,21 @@
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
-import { CircleDot, LogOut, Pin, Plus, RefreshCw, X } from 'lucide-react'
+import { LogOut, Plus, RefreshCw, X } from 'lucide-react'
 import {
   viewAtom, tokenAtom, connectedAtom, activeConvAtom,
   conversationsAtom, agentSessionGroupsAtom, chatConvsAtom,
   type ConvItem, activeTabAtom, type TabType, currentWorkspaceIdAtom,
 } from '../../atoms'
-import { close as closeWS } from '../../lib/ws-client'
+import { close as closeWS, wsReq } from '../../lib/ws-client'
 import { loadData } from '../../App'
 import { formatRelativeTime } from '../../utils/format'
 import { createAgentConversation, saveActiveConv } from '../../utils/session'
 import { STORAGE_KEYS, removeStorage } from '../../utils/storage'
+import {
+  readAgentStarUpdate,
+  updateActiveAgentStarred,
+  updateAgentStarred,
+} from '../../lib/session-runtime-state'
+import { AgentSessionRow } from '../conversation/AgentSessionRow'
 
 interface Props { onClose: () => void }
 
@@ -41,6 +47,21 @@ export function Drawer({ onClose }: Props) {
       setView('chat')
       onClose()
       loadData(setConvs, () => {}, token)
+    } catch { /* TODO: toast */ }
+  }
+
+  /** 请求服务端切换星标，并使用确认结果同步列表与当前会话。 */
+  const handleToggleStar = async (session: ConvItem): Promise<void> => {
+    if (!token) return
+    try {
+      /** 服务端响应是星标状态的唯一事实来源。 */
+      const update = readAgentStarUpdate(await wsReq('agent.sessions.toggle_star', {
+        token,
+        sessionId: session.id,
+      }))
+      if (!update) return
+      setConvs(current => updateAgentStarred(current, update.sessionId, update.starred))
+      setActive(current => updateActiveAgentStarred(current, update.sessionId, update.starred))
     } catch { /* TODO: toast */ }
   }
 
@@ -127,22 +148,13 @@ export function Drawer({ onClose }: Props) {
                   {g.label}
                 </div>
                 {g.convs.map(c => (
-                  <button
+                  <AgentSessionRow
                     key={c.id}
-                    onClick={() => handleOpen(c)}
-                    className={`flex min-h-10 w-full items-center gap-2 px-3.5 py-2 text-left text-sm transition-colors ${active?.id === c.id ? 'bg-sidebar-control text-foreground' : 'text-foreground hover:bg-sidebar-control/70'}`}
-                  >
-                    <span className="flex min-w-0 flex-1 items-center gap-1.5">
-                      {c.pinned && <Pin aria-label="置顶" className="h-3 w-3 shrink-0 text-muted-foreground" />}
-                      {c.manualWorking && <CircleDot aria-label="工作中" className="h-3 w-3 shrink-0 text-foreground" />}
-                      <span className="truncate">
-                      {c.title || '新对话'}
-                      </span>
-                    </span>
-                    {c.updatedAt ? (
-                      <span className="flex-shrink-0 text-[10px] text-muted-foreground">{formatRelativeTime(c.updatedAt)}</span>
-                    ) : null}
-                  </button>
+                    session={c}
+                    active={active?.type === 'agent' && active.id === c.id}
+                    onOpen={() => handleOpen(c)}
+                    onToggleStar={() => { void handleToggleStar(c) }}
+                  />
                 ))}
               </div>
             ))}

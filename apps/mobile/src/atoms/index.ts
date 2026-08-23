@@ -1,4 +1,5 @@
 import { atom } from 'jotai'
+import type { AgentRuntimeStatus } from '../lib/session-runtime-state'
 
 // ===== 消息类型 =====
 
@@ -35,7 +36,8 @@ export const viewAtom = atom<View>('auth')
 export interface ConvItem {
   id: string; title: string; updatedAt: number; createdAt?: number; type: 'chat' | 'agent'
   workspaceId?: string; workspaceName?: string
-  pinned?: boolean; manualWorking?: boolean; archived?: boolean
+  pinned?: boolean; manualWorking?: boolean; archived?: boolean; starred?: boolean
+  runtimeStatus?: AgentRuntimeStatus
 }
 export const conversationsAtom = atom<ConvItem[]>([])
 export const workspacesAtom = atom<Array<{ id: string; name: string; slug: string }>>([])

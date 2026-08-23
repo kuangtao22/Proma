@@ -46,6 +46,45 @@ describe('移动端输入区', () => {
     expect(markup).toContain('未找到模型')
   })
 
+  test('Given Agent 正在运行且本地流未恢复 When 渲染 Then 仍展示停止按钮', async () => {
+    const { activeConvAtom, channelsAtom, streamingAtom } = await import('../../atoms')
+    const { InputBar } = await import('./InputBar')
+    /** 重连后本地 streaming 可能为 false，权威 Agent 状态仍应驱动停止按钮。 */
+    const store = createStore()
+    store.set(activeConvAtom, {
+      id: 'agent-running',
+      title: '运行中',
+      type: 'agent',
+      updatedAt: 1,
+      runtimeStatus: 'running',
+    })
+    store.set(streamingAtom, false)
+    store.set(channelsAtom, [])
+
+    const markup = renderToStaticMarkup(
+      <Provider store={store}><InputBar /></Provider>,
+    )
+
+    expect(markup).toContain('aria-label="停止生成"')
+    expect(markup).not.toContain('aria-label="发送消息"')
+  })
+
+  test('Given Chat 正在生成 When 渲染 Then 继续使用本地流状态展示停止按钮', async () => {
+    const { activeConvAtom, channelsAtom, streamingAtom } = await import('../../atoms')
+    const { InputBar } = await import('./InputBar')
+    /** Chat 不具备 Agent 运行态，保持原 streamingAtom 行为。 */
+    const store = createStore()
+    store.set(activeConvAtom, { id: 'chat-running', title: 'Chat', type: 'chat', updatedAt: 1 })
+    store.set(streamingAtom, true)
+    store.set(channelsAtom, [])
+
+    const markup = renderToStaticMarkup(
+      <Provider store={store}><InputBar /></Provider>,
+    )
+
+    expect(markup).toContain('aria-label="停止生成"')
+  })
+
   test('Given 模型弹层打开 When 渲染 Then 提供模态语义和明确关闭动作', async () => {
     const { ModelPickerDialog } = await import('./InputBar')
     /** 空渠道足以验证原生模态容器和关闭入口。 */

@@ -22,6 +22,7 @@ import {
 } from '../../atoms'
 import { wsReq } from '../../lib/ws-client'
 import { formatModel } from '../../utils/format'
+import { isAgentRuntimeBusy } from '../../lib/session-runtime-state'
 
 export function InputBar({ disabled }: { disabled?: boolean }) {
   const [text, setText] = useState('')
@@ -125,6 +126,10 @@ export function InputBar({ disabled }: { disabled?: boolean }) {
 
   const modelName = formatModel(modelId)
   const permConfig = PERMISSION_MODE_CONFIG[permMode]
+  /** Agent 使用服务端权威四态，Chat 继续使用原有本地流状态。 */
+  const generationActive = active?.type === 'agent'
+    ? isAgentRuntimeBusy(active.runtimeStatus)
+    : streaming
 
   return (
     <div className="relative flex-shrink-0 bg-content px-2.5 pt-1" style={{ paddingBottom: 'calc(var(--safe-b, 0px) + 10px)' }}>
@@ -175,7 +180,7 @@ export function InputBar({ disabled }: { disabled?: boolean }) {
           </div>
 
           {/* 右侧发送/停止 */}
-          {streaming ? (
+          {generationActive ? (
             <button
               aria-label="停止生成"
               onClick={handleStop}
