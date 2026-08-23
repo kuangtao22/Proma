@@ -18,6 +18,8 @@ interface ImageGenerationModelSettingsViewProps {
   externalUpdatePending?: boolean
   /** 最近一次后台读取错误，不隐藏当前表单。 */
   loadError?: string | null
+  /** 用户触发的重载或重试是否仍在进行。 */
+  reloadInProgress?: boolean
   /** 用户明确放弃本地编辑并重新加载权威目录。 */
   onReload?: () => void
   /** 用户在保留表单的前提下重试后台读取。 */
@@ -38,6 +40,7 @@ export interface ImageGenerationModelSettingsState {
   dirty: boolean
   externalUpdatePending: boolean
   requestGeneration: number
+  requestEditGeneration: number
   editGeneration: number
 }
 
@@ -138,6 +141,7 @@ export function createImageGenerationModelSettingsState(
     dirty: false,
     externalUpdatePending: false,
     requestGeneration: 0,
+    requestEditGeneration: 0,
     editGeneration: 0,
   }
 }
@@ -159,23 +163,26 @@ export function reduceImageGenerationModelSettingsState(
       return {
         ...state,
         requestGeneration: action.requestGeneration,
+        requestEditGeneration: state.editGeneration,
         initialLoading: action.mode === 'initial' && state.baselineProfiles.length === 0,
         loadError: null,
       }
     case 'request-succeeded': {
       if (action.requestGeneration !== state.requestGeneration) return state
       /** dirty 后台刷新只更新凭据；目录变化留给用户明确重载。 */
-      const preserveEditing = action.mode === 'background' && state.dirty
+      const editedAfterRequest = state.editGeneration !== state.requestEditGeneration
+      const preserveEditing = (action.mode === 'background' && state.dirty)
+        || (action.mode === 'reload' && editedAfterRequest)
       if (preserveEditing) {
         return {
           ...state,
           credentialsConfigured: action.result.credentialsConfigured,
           initialLoading: false,
           loadError: null,
-          externalUpdatePending: !haveSameEditableProfiles(
-            action.result.profiles,
-            state.baselineProfiles,
-          ),
+          externalUpdatePending: action.mode === 'reload' || !haveSameEditableProfiles(
+              action.result.profiles,
+              state.baselineProfiles,
+            ),
         }
       }
       return {
@@ -206,6 +213,7 @@ export function reduceImageGenerationModelSettingsState(
         externalUpdatePending: false,
         loadError: null,
         requestGeneration: state.requestGeneration + 1,
+        requestEditGeneration: state.editGeneration,
       }
   }
 }
@@ -217,6 +225,7 @@ export function ImageGenerationModelSettingsView({
   saving,
   externalUpdatePending = false,
   loadError = null,
+  reloadInProgress = false,
   onReload,
   onRetry,
   onProfilesChange,
@@ -270,7 +279,14 @@ export function ImageGenerationModelSettingsView({
       {externalUpdatePending && (
         <div aria-live="polite" className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-xs text-muted-foreground">
           <span>外部配置已更新，本地未保存编辑仍保留。</span>
-          <Button type="button" size="sm" variant="outline" className="h-8 rounded text-xs" onClick={onReload}>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-8 rounded text-xs"
+            disabled={saving || reloadInProgress}
+            onClick={onReload}
+          >
             重新加载
           </Button>
         </div>
@@ -279,7 +295,14 @@ export function ImageGenerationModelSettingsView({
       {loadError && (
         <div role="alert" className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-xs text-destructive">
           <span>{loadError}</span>
-          <Button type="button" size="sm" variant="outline" className="h-8 rounded text-xs" onClick={onRetry}>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-8 rounded text-xs"
+            disabled={saving || reloadInProgress}
+            onClick={onRetry}
+          >
             重试
           </Button>
         </div>
@@ -394,8 +417,12 @@ export function ImageGenerationModelSettings(): React.ReactElement {
   )
   /** 当前目录是否正在保存。 */
   const [saving, setSaving] = React.useState(false)
+  /** 用户主动重载或重试是否仍在执行。 */
+  const [reloadInProgress, setReloadInProgress] = React.useState(false)
   /** 同步阻断连续点击在 React 提交前重复进入保存。 */
   const savingRef = React.useRef(false)
+  /** 同步阻断保存期间或 React 提交前的重复重载。 */
+  const reloadInProgressRef = React.useRef(false)
   /** 每次读取递增，旧响应由 reducer 拒绝。 */
   const requestGenerationRef = React.useRef(0)
   /** 卸载后拒绝迟到响应提交。 */
@@ -423,6 +450,21 @@ export function ImageGenerationModelSettings(): React.ReactElement {
     }
   }, [])
 
+  /** 串行执行用户主动的重载或重试，不影响表单继续编辑。 */
+  const runInteractiveLoad = React.useCallback(async (
+    mode: 'background' | 'reload',
+  ): Promise<void> => {
+    if (savingRef.current || reloadInProgressRef.current) return
+    reloadInProgressRef.current = true
+    setReloadInProgress(true)
+    try {
+      await loadProfiles(mode)
+    } finally {
+      reloadInProgressRef.current = false
+      if (mountedRef.current) setReloadInProgress(false)
+    }
+  }, [loadProfiles])
+
   React.useEffect(() => {
     mountedRef.current = true
     void loadProfiles('initial')
@@ -433,6 +475,7 @@ export function ImageGenerationModelSettings(): React.ReactElement {
     return () => {
       mountedRef.current = false
       requestGenerationRef.current += 1
+      reloadInProgressRef.current = false
       unsubscribe()
     }
   }, [loadProfiles])
@@ -493,7 +536,8 @@ export function ImageGenerationModelSettings(): React.ReactElement {
               size="sm"
               variant="outline"
               className="h-8 rounded text-xs"
-              onClick={() => { void loadProfiles('reload') }}
+              disabled={reloadInProgress}
+              onClick={() => { void runInteractiveLoad('reload') }}
             >
               重试
             </Button>
@@ -504,12 +548,13 @@ export function ImageGenerationModelSettings(): React.ReactElement {
           profiles={state.profiles}
           credentialsConfigured={state.credentialsConfigured}
           saving={saving}
+          reloadInProgress={reloadInProgress}
           externalUpdatePending={state.externalUpdatePending}
           loadError={state.loadError}
           onProfilesChange={(profiles) => dispatch({ type: 'profiles-edited', profiles })}
           onSave={() => { void handleSave() }}
-          onReload={() => { void loadProfiles('reload') }}
-          onRetry={() => { void loadProfiles('background') }}
+          onReload={() => { void runInteractiveLoad('reload') }}
+          onRetry={() => { void runInteractiveLoad('background') }}
         />
       )}
     </SettingsSection>

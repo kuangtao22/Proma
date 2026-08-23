@@ -268,6 +268,35 @@ describe('ImageGenerationModelSettings', () => {
     expect(state.profiles[0]?.id).toBe('profile-pro')
   })
 
+  test('Given 显式重载发出后用户继续编辑 When 重载响应迟到 Then 保留新编辑并标记外部更新', () => {
+    const {
+      createImageGenerationModelSettingsState,
+      reduceImageGenerationModelSettingsState,
+    } = imageModelSettingsModule
+    /** 重载前的权威目录。 */
+    const baseline = [createProfile('profile-flash', 'server-v1', 'gemini-flash')]
+    let state = createImageGenerationModelSettingsState(createCatalog(baseline))
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'profiles-edited',
+      profiles: [{ ...baseline[0]!, name: 'local-before' }],
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-started', requestGeneration: 1, mode: 'reload',
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'profiles-edited',
+      profiles: [{ ...baseline[0]!, name: 'local-after' }],
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-succeeded', requestGeneration: 1, mode: 'reload',
+      result: createCatalog([{ ...baseline[0]!, name: 'server-v2' }]),
+    })
+
+    expect(state.profiles[0]?.name).toBe('local-after')
+    expect(state.dirty).toBe(true)
+    expect(state.externalUpdatePending).toBe(true)
+  })
+
   test('Given dirty 表单发现外部更新 When 渲染 Then 提供明确重新加载入口', () => {
     const { ImageGenerationModelSettingsView } = imageModelSettingsModule
     const html = renderToStaticMarkup(
@@ -289,6 +318,27 @@ describe('ImageGenerationModelSettings', () => {
     expect(html).toContain('上次刷新失败')
     expect(html).toContain('重试')
     expect(html).toContain('value="本地编辑"')
+  })
+
+  test('Given 重载或重试正在进行 When 渲染提示 Then 两个请求入口禁用但表单仍可编辑', () => {
+    const { ImageGenerationModelSettingsView } = imageModelSettingsModule
+    const html = renderToStaticMarkup(
+      <ImageGenerationModelSettingsView
+        profiles={[createProfile('profile-flash', '本地编辑', 'gemini-flash')]}
+        credentialsConfigured
+        saving={false}
+        externalUpdatePending
+        loadError="上次刷新失败"
+        reloadInProgress
+        onProfilesChange={() => undefined}
+        onSave={() => undefined}
+        onReload={() => undefined}
+        onRetry={() => undefined}
+      />,
+    )
+
+    expect((html.match(/disabled=""/g) ?? []).length).toBe(2)
+    expect(html).not.toMatch(/<input[^>]*disabled=""/)
   })
 })
 
