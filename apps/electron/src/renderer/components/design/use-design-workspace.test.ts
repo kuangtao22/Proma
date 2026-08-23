@@ -1026,7 +1026,8 @@ describe('Design 工作区同步规则', () => {
     await flushPromises()
 
     expect(harness.getState().pendingMutations).toEqual([move])
-    expect(harness.getState().conflictRecoveryPending).toBe(true)
+    expect(harness.getState().conflictRecoveryPending).toBe(false)
+    expect(harness.getState().authoritativeRecoveryState).toBe('loading')
     expect(harness.getState().saveState).toBe('failed')
     expect(harness.loadRequests).toHaveLength(1)
     expect(harness.saveRequests).toHaveLength(1)
@@ -1279,6 +1280,179 @@ describe('Design 工作区同步规则', () => {
     })
   })
 
+  test('Given 当前 controller SAVE in-flight When 共享状态新增 dirty mutation Then 等首个请求完成后再安排保存', async () => {
+    /** 已被当前 controller 移入在途请求的视口修改。 */
+    const mutationA: DesignMutation = {
+      type: 'set-viewport',
+      viewport: { x: 10, y: 20, zoom: 1.1 },
+    }
+    /** 在首个请求期间由共享状态新增的位置修改。 */
+    const mutationB: DesignMutation = {
+      type: 'move-nodes',
+      positions: [{ nodeId: 'node-1', position: { x: 30, y: 40 } }],
+    }
+    /** 模拟多个生命周期共同持有的项目 Jotai 状态。 */
+    const sharedState: SharedControllerState = {
+      state: {
+        ...createInitialDesignProjectState(),
+        phase: 'ready',
+        snapshot: {
+          document: {
+            ...createEmptyDesignDocument('project-1', 10),
+            nodes: [{
+              id: 'node-1', kind: 'asset', assetId: 'asset-1',
+              position: { x: 0, y: 0 }, width: 100, height: 80, zIndex: 0,
+            }],
+            revision: 1,
+          },
+          writable: true,
+        },
+        pendingMutations: [mutationA],
+        saveState: 'dirty',
+      },
+    }
+    /** 持有首个在途 SAVE 所有权的 controller 环境。 */
+    const harness = createControllerHarness(sharedState.state, sharedState)
+    harness.controller.sync()
+    harness.scheduler.runNext()
+
+    sharedState.state = {
+      ...sharedState.state,
+      pendingMutations: [mutationB],
+      saveState: 'dirty',
+    }
+    harness.controller.sync()
+
+    expect(harness.saveRequests).toHaveLength(1)
+    expect(harness.scheduler.getDelays()).toEqual([])
+
+    /** 首个请求成功后返回的 revision 2 权威文档。 */
+    const savedDocument = {
+      ...sharedState.state.snapshot!.document,
+      viewport: mutationA.viewport,
+      revision: 2,
+      updatedAt: 20,
+    }
+    harness.saveRequests[0]!.deferred.resolve(savedDocument)
+    await flushPromises()
+
+    expect(harness.getState().pendingMutations).toEqual([mutationB])
+    expect(harness.getState().saveState).toBe('dirty')
+    expect(harness.scheduler.getDelays()).toEqual([400])
+  })
+
+  test('Given SAVE in-flight When recovery 接管 revision 4 后旧 success revision 6 晚到 Then 保留权威 revision 4 与单份 pending', async () => {
+    /** 恢复前已从共享队列移出的视口修改。 */
+    const mutation: DesignMutation = {
+      type: 'set-viewport',
+      viewport: { x: 50, y: 60, zoom: 1.4 },
+    }
+    /** 保存请求基于的旧 revision 5 乐观文档。 */
+    const cachedDocument = {
+      ...createEmptyDesignDocument('project-1', 10),
+      revision: 5,
+      viewport: mutation.viewport,
+    }
+    /** 恢复事件到达前的 Renderer 缓存快照。 */
+    const cachedSnapshot: DesignWorkspaceSnapshot = { document: cachedDocument, writable: true }
+    /** 可精确控制 LOAD 与 SAVE 返回顺序的 controller 环境。 */
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: cachedSnapshot,
+      pendingMutations: [mutation],
+      saveState: 'dirty',
+    })
+    harness.controller.start()
+    harness.loadRequests[0]!.resolve(cachedSnapshot)
+    await flushPromises()
+    harness.scheduler.runNext()
+    expect(harness.getState().pendingMutations).toEqual([])
+    expect(harness.getState().saveState).toBe('saving')
+
+    harness.emitChange({ projectId: 'project-1', revision: 4, cause: 'recovery' })
+    expect(harness.getState().pendingMutations).toEqual([mutation])
+    expect(harness.getState().authoritativeRecoveryState).toBe('loading')
+    /** 磁盘恢复后必须接管的低 revision 权威快照。 */
+    const recoveredSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 20), revision: 4 },
+      writable: true,
+    }
+    harness.loadRequests[1]!.resolve(recoveredSnapshot)
+    await flushPromises()
+    expect(harness.getState().snapshot?.document.revision).toBe(4)
+    expect(harness.getState().pendingMutations).toEqual([mutation])
+    expect(harness.getState().saveState).toBe('failed')
+
+    harness.saveRequests[0]!.deferred.resolve({
+      ...cachedDocument,
+      revision: 6,
+      updatedAt: 60,
+    })
+    await flushPromises()
+
+    expect(harness.getState().snapshot?.document.revision).toBe(4)
+    expect(harness.getState().pendingMutations).toEqual([mutation])
+    expect(harness.getState().saveState).toBe('failed')
+    expect(harness.scheduler.getDelays()).toEqual([])
+  })
+
+  test('Given SAVE in-flight When recovery 接管后旧 failure 晚到 Then 不重复 batch 或覆盖恢复状态', async () => {
+    /** 恢复后可安全重放、但只能归还一次的位置修改。 */
+    const mutation: DesignMutation = {
+      type: 'move-nodes',
+      positions: [{ nodeId: 'node-1', position: { x: 80, y: 90 } }],
+    }
+    /** 保存请求基于的旧 revision 5 乐观文档。 */
+    const cachedDocument = {
+      ...createEmptyDesignDocument('project-1', 10),
+      revision: 5,
+      nodes: [{
+        id: 'node-1', kind: 'asset' as const, assetId: 'asset-1',
+        position: { x: 80, y: 90 }, width: 100, height: 80, zIndex: 0,
+      }],
+    }
+    /** 恢复事件到达前的 Renderer 缓存快照。 */
+    const cachedSnapshot: DesignWorkspaceSnapshot = { document: cachedDocument, writable: true }
+    /** 可精确控制 LOAD 与 SAVE 返回顺序的 controller 环境。 */
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: cachedSnapshot,
+      pendingMutations: [mutation],
+      saveState: 'dirty',
+    })
+    harness.controller.start()
+    harness.loadRequests[0]!.resolve(cachedSnapshot)
+    await flushPromises()
+    harness.scheduler.runNext()
+
+    harness.emitChange({ projectId: 'project-1', revision: 4, cause: 'recovery' })
+    /** 恢复后的远端节点位置作为 mutation 重放基线。 */
+    const recoveredSnapshot: DesignWorkspaceSnapshot = {
+      document: {
+        ...createEmptyDesignDocument('project-1', 20),
+        revision: 4,
+        nodes: [{ ...cachedDocument.nodes[0]!, position: { x: 10, y: 20 } }],
+      },
+      writable: true,
+    }
+    harness.loadRequests[1]!.resolve(recoveredSnapshot)
+    await flushPromises()
+    /** 迟到失败前由权威恢复流程确定的错误状态。 */
+    const errorBeforeLateFailure = harness.getState().error
+
+    harness.saveRequests[0]!.deferred.reject(new Error('旧保存链路磁盘失败'))
+    await flushPromises()
+
+    expect(harness.getState().snapshot?.document.revision).toBe(4)
+    expect(harness.getState().snapshot?.document.nodes[0]?.position).toEqual({ x: 80, y: 90 })
+    expect(harness.getState().pendingMutations).toEqual([mutation])
+    expect(harness.getState().error).toBe(errorBeforeLateFailure)
+    expect(harness.loadRequests).toHaveLength(2)
+    expect(harness.scheduler.getDelays()).toEqual([])
+  })
+
   test('Given 保存失败且 pending 已恢复 When retrySave Then 转为 dirty 并在 400ms 后再次保存', async () => {
     /** 失败后等待用户重试的 mutation。 */
     const mutation: DesignMutation = {
@@ -1379,8 +1553,8 @@ describe('Design 工作区同步规则', () => {
     expect(harness.saveRequests).toHaveLength(1)
   })
 
-  test('Given 保存发出后 controller 已 dispose When 冲突返回并重新 mount Then 旧实例不加载且新实例恢复 pending', async () => {
-    /** dispose 后仍须恢复并跨 controller 保存的 mutation。 */
+  test('Given 保存发出后 controller dispose When 旧回调晚到 Then 主动归还 batch 且旧实例不再改写共享状态', async () => {
+    /** dispose 后仍须保留给后续 controller 的 mutation。 */
     const mutation: DesignMutation = {
       type: 'set-viewport',
       viewport: { x: 31, y: 32, zoom: 1.25 },
@@ -1399,40 +1573,21 @@ describe('Design 工作区同步规则', () => {
     firstHarness.controller.sync()
     firstHarness.scheduler.runNext()
     firstHarness.controller.dispose()
+
+    expect(firstHarness.getState().conflictRecoveryPending).toBe(false)
+    expect(firstHarness.getState().pendingMutations).toEqual([mutation])
+    expect(firstHarness.getState().saveState).toBe('dirty')
+
     firstHarness.saveRequests[0]!.deferred.reject(new Error('DESIGN_REVISION_CONFLICT: expected=1, current=2'))
     await flushPromises()
 
-    expect(firstHarness.getState().conflictRecoveryPending).toBe(true)
+    expect(firstHarness.getState().conflictRecoveryPending).toBe(false)
     expect(firstHarness.getState().pendingMutations).toEqual([mutation])
-    expect(firstHarness.getState().saveState).toBe('failed')
+    expect(firstHarness.getState().saveState).toBe('dirty')
     expect(firstHarness.loadRequests).toHaveLength(0)
-
-    /** 复用同一项目持久状态的新 controller。 */
-    const remountedHarness = createControllerHarness(firstHarness.getState())
-    remountedHarness.controller.start()
-    expect(remountedHarness.loadRequests).toHaveLength(1)
-    expect(remountedHarness.scheduler.getDelays()).toEqual([])
-
-    /** 新 controller 获取的 revision 2 远端基线。 */
-    const remoteSnapshot: DesignWorkspaceSnapshot = {
-      document: {
-        ...createEmptyDesignDocument('project-1', 20),
-        nodes: [{ id: 'node-remote', kind: 'asset', position: { x: 2, y: 3 }, width: 80, height: 60, zIndex: 1 }],
-        revision: 2,
-      },
-      writable: true,
-    }
-    remountedHarness.loadRequests[0]!.resolve(remoteSnapshot)
-    await flushPromises()
-
-    expect(remountedHarness.getState().conflictRecoveryPending).toBe(false)
-    expect(remountedHarness.getState().snapshot?.document.revision).toBe(2)
-    expect(remountedHarness.getState().snapshot?.document.viewport).toEqual(mutation.viewport)
-    expect(remountedHarness.getState().snapshot?.document.nodes.map((node) => node.id)).toEqual(['node-remote'])
-    expect(remountedHarness.getState().saveState).toBe('failed')
   })
 
-  test('Given 新 controller 普通 load 在途 When 旧 controller 写入冲突标记并触发 sync Then 自动冲突重载且旧 load 不覆盖', async () => {
+  test('Given 新 controller 普通 load 在途 When 接管旧 controller batch 后保存冲突 Then 冲突重载且旧 load 不覆盖', async () => {
     /** 冲突后需要基于最新服务端 revision 重放的本地修改。 */
     const mutation: DesignMutation = {
       type: 'set-viewport',
@@ -1456,7 +1611,7 @@ describe('Design 工作区同步规则', () => {
     oldHarness.controller.sync()
     oldHarness.scheduler.runNext()
 
-    /** 在冲突标记产生前已启动普通 load 的新 controller。 */
+    /** 在旧 controller 释放 batch 前已启动普通 load 的新 controller。 */
     const newHarness = createControllerHarness(sharedState.state, sharedState)
     newHarness.controller.start()
     expect(newHarness.loadRequests).toHaveLength(1)
@@ -1464,9 +1619,14 @@ describe('Design 工作区同步规则', () => {
     oldHarness.controller.dispose()
     oldHarness.saveRequests[0]!.deferred.reject(new Error('DESIGN_REVISION_CONFLICT: expected=1, current=2'))
     await flushPromises()
-    expect(sharedState.state.conflictRecoveryPending).toBe(true)
+    expect(sharedState.state.conflictRecoveryPending).toBe(false)
+    expect(sharedState.state.pendingMutations).toEqual([mutation])
+    expect(sharedState.state.saveState).toBe('dirty')
 
     newHarness.controller.sync()
+    newHarness.scheduler.runNext()
+    newHarness.saveRequests[0]!.deferred.reject(new Error('DESIGN_REVISION_CONFLICT: expected=1, current=2'))
+    await flushPromises()
     expect(newHarness.loadRequests).toHaveLength(2)
     expect(newHarness.scheduler.getDelays()).toEqual([])
 

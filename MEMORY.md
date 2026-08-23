@@ -54,6 +54,7 @@
 - Design 权威 `LOAD` 从 tmp/backup 提升恢复后必须广播 `cause: recovery`，让其它已打开窗口同步接管新 revision；启动清理只删除无当前 runtime promotion journal 引用的 `import-*`/`relink-*` staging，正式 assets 永不参与兜底清理。
 - Design 的 `cause: recovery` 表示原 revision 序列已失去磁盘依据，Renderer 必须立即阻断旧基线写入并强制 LOAD，且无条件接管可能更低的恢复 revision；位置类 pending 可在恢复基线上重放但保持手动重试阻断，结构 pending 只能保留为显式远端冲突，历史、选区和 Inspector 状态全部清理。普通 canvas/asset/job 事件继续遵守 revision 单调规则。
 - Design Renderer 在 400ms 自动保存边界压缩 viewport mutation，只保留最后一个 `set-viewport` 且保持其它 mutation 顺序；macOS 沙箱内执行 Electron 完整构建时，将 `CLANG_MODULE_CACHE_PATH` 与 `SWIFT_MODULE_CACHE_PATH` 指向 `/private/tmp` 可避免原生 helper 写入用户缓存失败。
+- Design Renderer 的 recovery/dispose 会递增独立 SAVE 基线代次并主动把在途 batch 归还 pending；旧代次 SAVE 的 success/failure 回调必须完全无副作用，禁止覆盖恢复后的低 revision 或重复归还 mutation。
 
 ## 会话记录
 

@@ -380,6 +380,14 @@ export interface DesignWorkspaceController {
   dispose: () => void
 }
 
+/** controller 当前持有的在途保存请求。 */
+interface ActiveDesignSaveRequest {
+  /** 请求发出时对应的权威基线代次。 */
+  epoch: number
+  /** 已从共享 pending 队列移出的 mutation 批次。 */
+  batch: DesignMutation[]
+}
+
 /**
  * 创建可独立测试的 Design 工作区生命周期控制器。
  * @param dependencies adapter、状态存取、调度器与提示回调。
@@ -396,6 +404,10 @@ export function createDesignWorkspaceController(
   let unsubscribe: (() => void) | null = null
   /** 当前尚未触发的保存防抖定时器 ID。 */
   let saveTimerId: number | null = null
+  /** 权威恢复或释放时递增，用于隔离旧基线上的迟到保存回调。 */
+  let saveBaselineEpoch = 0
+  /** 当前已从共享 pending 队列移出、等待保存结果的请求。 */
+  let activeSaveRequest: ActiveDesignSaveRequest | null = null
   /** 标记 controller 已释放，阻止后续 load 与 timer 副作用。 */
   let disposed = false
   /** 当前 controller 是否已有冲突恢复 load 在途，避免重复请求。 */
@@ -619,6 +631,7 @@ export function createDesignWorkspaceController(
     && state.pendingMutations.length > 0
     && state.saveState !== 'saving'
     && state.saveState !== 'failed'
+    && activeSaveRequest === null
     && !state.conflictRecoveryPending
     && state.authoritativeRecoveryState === 'idle'
     && !conflictRecoveryInFlight,
@@ -628,12 +641,19 @@ export function createDesignWorkspaceController(
   const startAuthoritativeRecovery = (): void => {
     if (disposed || authoritativeRecoveryInFlight) return
     clearSaveTimer()
-    dependencies.updateState({
+    saveBaselineEpoch += 1
+    /** 恢复必须先取回旧基线在途 batch，后续迟到回调不得再次归还。 */
+    const interruptedSaveRequest = activeSaveRequest
+    activeSaveRequest = null
+    dependencies.updateState((latest) => ({
       phase: 'ready',
+      pendingMutations: interruptedSaveRequest
+        ? restoreFailedMutationBatch(interruptedSaveRequest.batch, latest.pendingMutations)
+        : latest.pendingMutations,
       saveState: 'failed',
       authoritativeRecoveryState: 'loading',
       error: DESIGN_AUTHORITATIVE_RECOVERY_LOADING_MESSAGE,
-    })
+    }))
     void loadSnapshot(false, true)
   }
 
@@ -650,14 +670,21 @@ export function createDesignWorkspaceController(
       if (!current.snapshot || !canSave(current)) return
       /** 本次从 pending 队列移出的保存批次。 */
       const batch = coalesceDesignMutationsForSave(current.pendingMutations)
+      /** 本次请求绑定的基线代次与 batch 所有权。 */
+      const saveRequest: ActiveDesignSaveRequest = { epoch: saveBaselineEpoch, batch }
       /** 本批 mutation 基于的服务端 revision。 */
       const expectedRevision = current.snapshot.document.revision
+      activeSaveRequest = saveRequest
       dependencies.updateState({ pendingMutations: [], saveState: 'saving', error: null })
       void dependencies.adapter.save({
         projectId: dependencies.projectId,
         expectedRevision,
         mutations: batch,
       }).then((savedDocument) => {
+        if (disposed
+          || saveRequest.epoch !== saveBaselineEpoch
+          || activeSaveRequest !== saveRequest) return
+        activeSaveRequest = null
         dependencies.updateState((latest) => ({
           snapshot: latest.snapshot
             ? {
@@ -670,14 +697,22 @@ export function createDesignWorkspaceController(
         }))
         scheduleSave()
       }).catch((error) => {
+        if (disposed
+          || saveRequest.epoch !== saveBaselineEpoch
+          || activeSaveRequest !== saveRequest) return
         /** revision 冲突与磁盘恢复都必须先基于新权威快照处理旧 batch。 */
         const recoveryRequired = isDesignRecoveryRequired(error)
-        if (isDesignRevisionConflict(error) || recoveryRequired) {
+        if (recoveryRequired) {
+          startAuthoritativeRecovery()
+          return
+        }
+        activeSaveRequest = null
+        if (isDesignRevisionConflict(error)) {
           dependencies.updateState((latest) => ({
             pendingMutations: restoreFailedMutationBatch(batch, latest.pendingMutations),
             saveState: 'failed',
             conflictRecoveryPending: true,
-            error: recoveryRequired ? getDesignErrorMessage(error) : DESIGN_REVISION_CONFLICT_MESSAGE,
+            error: DESIGN_REVISION_CONFLICT_MESSAGE,
           }))
           void loadSnapshot(true)
           return
@@ -800,7 +835,20 @@ export function createDesignWorkspaceController(
       if (disposed) return
       disposed = true
       latestLoadSequence += 1
+      saveBaselineEpoch += 1
       clearSaveTimer()
+      /** 卸载时主动把在途 batch 归还共享状态，供下一个 controller 接管。 */
+      const interruptedSaveRequest = activeSaveRequest
+      activeSaveRequest = null
+      if (interruptedSaveRequest) {
+        dependencies.updateState((latest) => ({
+          pendingMutations: restoreFailedMutationBatch(
+            interruptedSaveRequest.batch,
+            latest.pendingMutations,
+          ),
+          saveState: 'dirty',
+        }))
+      }
       unsubscribe?.()
       unsubscribe = null
       void dependencies.adapter.releaseMediaAccess().catch((error) => dependencies.onReleaseError(error))
