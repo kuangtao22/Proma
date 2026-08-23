@@ -61,8 +61,10 @@ export function shouldRefreshDesignSnapshot(
   state: DesignProjectState,
   change: DesignChangeEvent,
 ): boolean {
-  return change.projectId === projectId
-    && state.pendingMutations.length === 0
+  if (change.projectId !== projectId) return false
+  /** recovery 表示 revision 序列的磁盘基线已失效，不能继续使用普通单调过滤。 */
+  if (change.cause === 'recovery') return true
+  return state.pendingMutations.length === 0
     && state.saveState === 'saved'
     && change.revision > (state.snapshot?.document.revision ?? -1)
 }
@@ -82,8 +84,10 @@ export function shouldApplyLoadedDesignSnapshot(
   latestRequestSequence: number,
 ): boolean {
   const currentRevision = state.snapshot?.document.revision ?? -1
-  return requestSequence === latestRequestSequence
-    && state.pendingMutations.length === 0
+  if (requestSequence !== latestRequestSequence) return false
+  /** tmp/backup 提升后的 revision 可以回退，恢复标志优先于本地缓存的单调序列。 */
+  if (snapshot.recoveredFrom) return true
+  return state.pendingMutations.length === 0
     && state.saveState === 'saved'
     && snapshot.document.revision >= currentRevision
 }
@@ -267,6 +271,58 @@ export function canAutomaticallyRebaseDesignMutations(mutations: DesignMutation[
   return mutations.every((mutation) => (
     mutation.type === 'set-viewport' || mutation.type === 'move-nodes'
   ))
+}
+
+/**
+ * 在恢复后的权威文档上收敛 Renderer 旧基线状态。
+ * @param state LOAD 返回时的最新项目状态。
+ * @param snapshot tmp/backup 提升后或 recovery 事件强制读取的权威快照。
+ * @returns 清理旧历史、选区和冲突，并按 mutation 安全性决定重放或阻断的状态更新。
+ */
+function createAuthoritativeRecoveryUpdate(
+  state: DesignProjectState,
+  snapshot: DesignWorkspaceSnapshot,
+): Partial<DesignProjectState> {
+  /** 所有恢复分支都先移除依赖旧磁盘基线的交互状态。 */
+  const resetState: Partial<DesignProjectState> = {
+    phase: 'ready',
+    selectedNodeIds: [],
+    inspectorAssetId: null,
+    history: [],
+    future: [],
+    authoritativeRecoveryState: 'idle',
+  }
+  if (state.pendingMutations.length === 0) {
+    return {
+      ...resetState,
+      snapshot,
+      pendingMutations: [],
+      saveState: 'saved',
+      conflictRecoveryPending: false,
+      error: null,
+    }
+  }
+  if (!canAutomaticallyRebaseDesignMutations(state.pendingMutations)) {
+    /** 结构 mutation 携带旧实体事实，只保留队列等待用户基于恢复版本重新编辑。 */
+    return {
+      ...resetState,
+      snapshot,
+      saveState: 'failed',
+      conflictRecoveryPending: true,
+      error: DESIGN_STRUCTURAL_CONFLICT_MESSAGE,
+    }
+  }
+  /** 位置类 mutation 可在恢复文档上安全重放，但不得自动提交旧 revision。 */
+  return {
+    ...resetState,
+    snapshot: {
+      ...snapshot,
+      document: mergeSavedDesignDocument(snapshot.document, state.pendingMutations),
+    },
+    saveState: 'failed',
+    conflictRecoveryPending: false,
+    error: DESIGN_REVISION_CONFLICT_MESSAGE,
+  }
 }
 
 /** 判断当前项目是否已接管远端基线并等待用户放弃本地结构冲突修改。 */
@@ -458,24 +514,18 @@ export function createDesignWorkspaceController(
       const latest = dependencies.getState()
       if (requestSequence !== latestLoadSequence) return
       if (forceAuthoritative) {
-        /** 外部写恢复后的磁盘快照替换全部 Renderer 编辑基线与媒体授权。 */
-        dependencies.updateState({
-          phase: 'ready',
-          snapshot,
-          selectedNodeIds: [],
-          inspectorAssetId: null,
-          history: [],
-          future: [],
-          pendingMutations: [],
-          saveState: 'saved',
-          conflictRecoveryPending: false,
-          authoritativeRecoveryState: 'idle',
-          error: null,
-        })
+        /** recovery 事件的后续 LOAD 即使未重复携带 recoveredFrom 也必须接管。 */
+        dependencies.updateState(createAuthoritativeRecoveryUpdate(latest, snapshot))
         if (snapshot.recoveredFrom) dependencies.onRecovered?.(snapshot)
         return
       }
       if (rebasePendingAfterConflict) {
+        if (snapshot.recoveredFrom) {
+          /** 保存发现恢复提升时，使用同一恢复策略清除选区并审慎处理 pending。 */
+          dependencies.updateState(createAuthoritativeRecoveryUpdate(latest, snapshot))
+          dependencies.onRecovered?.(snapshot)
+          return
+        }
         if (!canAutomaticallyRebaseDesignMutations(latest.pendingMutations)) {
           /** 结构 patch 携带旧实体快照，必须完整采用远端文档以免覆盖并发修改。 */
           dependencies.updateState({
@@ -502,6 +552,12 @@ export function createDesignWorkspaceController(
           error: DESIGN_REVISION_CONFLICT_MESSAGE,
         })
         if (snapshot.recoveredFrom) dependencies.onRecovered?.(snapshot)
+        return
+      }
+      if (snapshot.recoveredFrom) {
+        /** 普通 mount LOAD 发现恢复提升时，同样无条件替换可能更高的缓存 revision。 */
+        dependencies.updateState(createAuthoritativeRecoveryUpdate(latest, snapshot))
+        dependencies.onRecovered?.(snapshot)
         return
       }
       if (!shouldApplyLoadedDesignSnapshot(
@@ -640,6 +696,11 @@ export function createDesignWorkspaceController(
       if (disposed || unsubscribe) return
       unsubscribe = dependencies.adapter.onChanged((change) => {
         if (change.projectId !== dependencies.projectId) return
+        if (change.cause === 'recovery') {
+          /** 恢复事件先同步阻断旧快照写入，再以单飞 LOAD 接管新的磁盘基线。 */
+          startAuthoritativeRecovery()
+          return
+        }
         if (change.cause === 'job') {
           void refreshJobs(change.revision)
           return

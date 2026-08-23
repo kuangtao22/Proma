@@ -586,6 +586,95 @@ describe('Design 工作区同步规则', () => {
     expect(harness.getState().future).toEqual([])
   })
 
+  test('Given 缓存 revision 5 When 收到 recovery revision 4 Then 立即阻断旧基线并接管权威 revision 4', async () => {
+    const historyEntry = {
+      forward: [{ type: 'set-viewport' as const, viewport: { x: 1, y: 1, zoom: 1 } }],
+      inverse: [{ type: 'set-viewport' as const, viewport: { x: 0, y: 0, zoom: 1 } }],
+    }
+    const cachedSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 10), revision: 5 },
+      writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: cachedSnapshot,
+      selectedNodeIds: ['node-stale'],
+      inspectorAssetId: 'asset-stale',
+      history: [historyEntry],
+      future: [historyEntry],
+    })
+    harness.controller.start()
+    harness.loadRequests[0]!.resolve(cachedSnapshot)
+    await flushPromises()
+
+    harness.emitChange({ projectId: 'project-1', revision: 4, cause: 'recovery' })
+    harness.emitChange({ projectId: 'project-1', revision: 4, cause: 'recovery' })
+
+    expect(harness.loadRequests).toHaveLength(2)
+    expect(harness.getState()).toMatchObject({
+      snapshot: cachedSnapshot,
+      authoritativeRecoveryState: 'loading',
+      saveState: 'failed',
+      error: '正在恢复设计工作区，请稍候',
+    })
+
+    const recoveredSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 20), revision: 4 },
+      writable: true,
+    }
+    harness.loadRequests[1]!.resolve(recoveredSnapshot)
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      snapshot: recoveredSnapshot,
+      selectedNodeIds: [],
+      inspectorAssetId: null,
+      history: [],
+      future: [],
+      pendingMutations: [],
+      authoritativeRecoveryState: 'idle',
+      saveState: 'saved',
+      conflictRecoveryPending: false,
+      error: null,
+    })
+  })
+
+  test('Given remount 缓存 revision 5 When LOAD 恢复 backup revision 4 Then 无条件采用恢复基线', async () => {
+    const cachedSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 10), revision: 5 },
+      writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: cachedSnapshot,
+      selectedNodeIds: ['node-stale'],
+      inspectorAssetId: 'asset-stale',
+    })
+    harness.controller.start()
+    const recoveredSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 20), revision: 4 },
+      writable: true,
+      recoveredFrom: 'backup',
+    }
+    harness.loadRequests[0]!.resolve(recoveredSnapshot)
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      snapshot: recoveredSnapshot,
+      selectedNodeIds: [],
+      inspectorAssetId: null,
+      history: [],
+      future: [],
+      pendingMutations: [],
+      authoritativeRecoveryState: 'idle',
+      saveState: 'saved',
+      conflictRecoveryPending: false,
+      error: null,
+    })
+  })
+
   test('Given 导入遇到恢复要求 When 强制加载权威快照 Then 清空本地编辑状态并接管新媒体授权', async () => {
     /** 强制恢复前的历史项与本地选区均绑定旧磁盘基线。 */
     const historyEntry = {
@@ -924,6 +1013,8 @@ describe('Design 工作区同步规则', () => {
       ...createInitialDesignProjectState(),
       phase: 'ready',
       snapshot: { document: localDocument, writable: true },
+      selectedNodeIds: ['node-1'],
+      inspectorAssetId: 'asset-1',
       history: [historyEntry],
       future: [historyEntry],
       pendingMutations: [move],
@@ -963,6 +1054,8 @@ describe('Design 工作区同步规则', () => {
     expect(harness.getState().snapshot?.document.nodes[0]?.position).toEqual({ x: 150, y: 150 })
     expect(harness.getState().history).toEqual([])
     expect(harness.getState().future).toEqual([])
+    expect(harness.getState().selectedNodeIds).toEqual([])
+    expect(harness.getState().inspectorAssetId).toBeNull()
     expect(harness.getState().conflictRecoveryPending).toBe(false)
     expect(harness.getState().saveState).toBe('failed')
     expect(harness.recoveredSnapshots).toEqual([recoveredSnapshot])
@@ -984,6 +1077,8 @@ describe('Design 工作区同步规则', () => {
       ...createInitialDesignProjectState(),
       phase: 'ready',
       snapshot: { document: localDocument, writable: true },
+      selectedNodeIds: ['node-1'],
+      inspectorAssetId: 'asset-1',
       pendingMutations: [structuralMutation],
       saveState: 'dirty',
     })
@@ -1011,6 +1106,8 @@ describe('Design 工作区同步规则', () => {
 
     expect(harness.getState().snapshot).toBe(recoveredSnapshot)
     expect(harness.getState().pendingMutations).toEqual([structuralMutation])
+    expect(harness.getState().selectedNodeIds).toEqual([])
+    expect(harness.getState().inspectorAssetId).toBeNull()
     expect(harness.getState().conflictRecoveryPending).toBe(true)
     expect(harness.getState().saveState).toBe('failed')
     expect(harness.recoveredSnapshots).toEqual([recoveredSnapshot])
@@ -1052,8 +1149,8 @@ describe('Design 工作区同步规则', () => {
     expect(harness.getState().saveState).toBe('dirty')
   })
 
-  test('Given dirty 缓存使用旧媒体 URL When mount load 成功 Then 只接管新 snapshot 元数据', async () => {
-    /** 必须保留 document 与 revision 的本地乐观快照。 */
+  test('Given dirty 缓存 revision 5 When LOAD 恢复 backup revision 4 Then 在恢复基线上安全重放位置 mutation 并保持阻断', async () => {
+    /** 本地位置 mutation 可以在恢复后的权威节点上安全重放。 */
     const localDocument = {
       ...createEmptyDesignDocument('project-1', 10),
       viewport: { x: 15, y: 16, zoom: 1.2 },
@@ -1079,12 +1176,12 @@ describe('Design 工作区同步规则', () => {
     })
     harness.controller.start()
 
-    /** load 返回的 document 更新，但本轮只允许接管媒体与只读元数据。 */
+    /** LOAD 返回更低 revision 的恢复文档，仍必须替换失去磁盘依据的 revision 5。 */
     const loadedSnapshot: DesignWorkspaceSnapshot = {
       document: {
         ...createEmptyDesignDocument('project-1', 20),
         nodes: [{ id: 'node-remote', kind: 'asset', position: { x: 1, y: 2 }, width: 80, height: 60, zIndex: 1 }],
-        revision: 9,
+        revision: 4,
       },
       writable: false,
       readOnlyReason: '项目目录当前只读',
@@ -1095,15 +1192,19 @@ describe('Design 工作区同步规则', () => {
     harness.loadRequests[0]!.resolve(loadedSnapshot)
     await flushPromises()
 
-    expect(harness.getState().snapshot?.document).toBe(localDocument)
-    expect(harness.getState().snapshot?.document.revision).toBe(5)
+    expect(harness.getState().snapshot?.document).not.toBe(localDocument)
+    expect(harness.getState().snapshot?.document.revision).toBe(4)
+    expect(harness.getState().snapshot?.document.viewport).toEqual(localDocument.viewport)
+    expect(harness.getState().snapshot?.document.nodes.map((node) => node.id)).toEqual(['node-remote'])
     expect(harness.getState().snapshot?.assetBaseUrl).toBe('proma-file://new/assets/')
     expect(harness.getState().snapshot?.thumbnailBaseUrl).toBe('proma-file://new/thumbnails/')
     expect(harness.getState().snapshot?.writable).toBe(false)
     expect(harness.getState().snapshot?.readOnlyReason).toBe('项目目录当前只读')
     expect(harness.getState().snapshot?.recoveredFrom).toBe('backup')
     expect(harness.getState().pendingMutations).toBe(pendingMutations)
-    expect(harness.getState().saveState).toBe('dirty')
+    expect(harness.getState().saveState).toBe('failed')
+    expect(harness.getState().conflictRecoveryPending).toBe(false)
+    expect(harness.scheduler.getDelays()).toEqual([])
   })
 
   test('Given A 等待保存且提交期间新增 B When A 成功 Then 400ms 提交 A 并基于远端结果重放再提交 B', async () => {
@@ -1609,6 +1710,11 @@ describe('Design 工作区同步规则', () => {
     expect(shouldRefreshDesignSnapshot('project-1', state, change)).toBe(true)
     expect(shouldRefreshDesignSnapshot('project-2', state, change)).toBe(false)
     expect(shouldRefreshDesignSnapshot('project-1', state, { ...change, revision: 2 })).toBe(false)
+    expect(shouldRefreshDesignSnapshot('project-1', {
+      ...state,
+      pendingMutations: [{ type: 'set-viewport', viewport: { x: 1, y: 1, zoom: 1 } }],
+      saveState: 'dirty',
+    }, { projectId: 'project-1', revision: 1, cause: 'recovery' })).toBe(true)
   })
 
   test('Given 本地 mutation 尚未保存 When 收到远端事件 Then 不覆盖本地内存文档', () => {
