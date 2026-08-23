@@ -119,6 +119,54 @@ describe('Design 素材节点', () => {
     expect(interrupted).toMatch(/type="button"(?![^>]*disabled)[^>]*>[\s\S]*重试生成/)
   })
 
+  test('Given 任务使用超长模型标签 When 渲染 Then footer 可访问地截断文本且节点尺寸稳定', () => {
+    /** 超长名称和模型 ID 用于证明 footer 文本不会撑大持久化节点。 */
+    const imageModelLabel = '超长高质量模型配置名称 · gemini-3-pro-image-preview-with-an-extra-long-model-id'
+    /** 使用非默认尺寸渲染，锁定 footer 文案不会覆盖节点布局。 */
+    const html = renderToStaticMarkup(
+      <TooltipProvider>
+        <DesignAssetNode
+          {...createNodeProps({
+            kind: 'job',
+            status: 'running',
+            projectId: 'project-1',
+            jobId: 'job-1',
+            title: '图片任务',
+            imageModelLabel,
+            writable: true,
+            authoritativeRecoveryState: 'idle',
+          })}
+          width={284}
+          height={196}
+        />
+      </TooltipProvider>,
+    )
+
+    expect(html).toContain('style="width:284px;height:196px"')
+    expect(html).toContain('class="truncate text-[11px] text-muted-foreground"')
+    expect(html).toContain(`title="${imageModelLabel}"`)
+    expect(html).toContain('tabindex="0"')
+    expect(html).toContain(imageModelLabel)
+    expect(html).toContain('正在生成')
+    expect(html).toContain('取消生成')
+  })
+
+  test('Given 旧任务没有模型标签 When 渲染 Then footer 继续回退真实状态', () => {
+    /** 旧任务静态 HTML 用于验证兼容回退且不会新增无意义焦点。 */
+    const html = renderStatus({
+      kind: 'job',
+      status: 'interrupted',
+      projectId: 'project-1',
+      jobId: 'legacy-job',
+      title: '图片任务',
+      writable: true,
+      authoritativeRecoveryState: 'idle',
+    })
+
+    expect(html).toContain('已中断')
+    expect(html).not.toContain('tabindex="0"')
+  })
+
   test('Given 任务节点只读或权威恢复未完成 When 渲染 Then 重试和取消命令保持禁用', () => {
     const readOnlyRetry = renderStatus({
       kind: 'job', status: 'failed', projectId: 'project-1', jobId: 'job-1', title: '图片任务',

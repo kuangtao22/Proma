@@ -171,6 +171,9 @@ export function toFlowNodes(
           authoritativeRecoveryState: options.authoritativeRecoveryState ?? 'idle',
           title: '图片任务',
           ...(job?.error ? { error: job.error } : {}),
+          ...(job?.imageModelSnapshot
+            ? { imageModelLabel: `${job.imageModelSnapshot.name} · ${job.imageModelSnapshot.modelId}` }
+            : {}),
         }
       : createAssetNodeData(node, node.assetId ? assetsById.get(node.assetId) : undefined, options.thumbnailBaseUrl)
     return {

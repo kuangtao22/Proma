@@ -141,6 +141,68 @@ describe('Design 画布节点映射', () => {
     })
   })
 
+  test('Given 任务固化模型快照 When 映射任务节点 Then 展示实际配置名和模型 ID 且尺寸不变', () => {
+    /** 保留非默认持久化尺寸的任务节点文档。 */
+    const document = createEmptyDesignDocument('project-1', 100)
+    document.nodes = [
+      createNode({
+        id: 'job-node',
+        kind: 'job',
+        assetId: undefined,
+        jobId: 'job-1',
+        width: 456,
+        height: 321,
+      }),
+    ]
+    /** 带固化模型快照的新格式任务记录。 */
+    const jobs: DesignJobRecord[] = [{
+      id: 'job-1',
+      projectId: 'project-1',
+      action: 'generate',
+      status: 'running',
+      prompt: '生成海报',
+      imageModelSnapshot: {
+        profileId: 'profile-b',
+        name: '高质量模型',
+        executor: 'nano-banana',
+        modelId: 'gemini-pro-image',
+      },
+      createdAt: 1,
+      updatedAt: 2,
+    }]
+
+    /** 映射后的 XYFlow 节点应只增加展示字段，不改持久化布局。 */
+    const node = toFlowNodes(document, { jobs })[0]
+
+    expect(node?.data.imageModelLabel).toBe('高质量模型 · gemini-pro-image')
+    expect(node?.width).toBe(456)
+    expect(node?.height).toBe(321)
+  })
+
+  test('Given 旧任务没有模型快照 When 映射任务节点 Then 保留旧状态展示且不伪造模型标签', () => {
+    /** 模拟升级前已经存在的任务节点文档。 */
+    const document = createEmptyDesignDocument('project-1', 100)
+    document.nodes = [
+      createNode({ id: 'legacy-job-node', kind: 'job', assetId: undefined, jobId: 'legacy-job' }),
+    ]
+    /** 旧 journal 合法缺少 imageModelSnapshot。 */
+    const jobs: DesignJobRecord[] = [{
+      id: 'legacy-job',
+      projectId: 'project-1',
+      action: 'generate',
+      status: 'interrupted',
+      prompt: '旧任务',
+      createdAt: 1,
+      updatedAt: 2,
+    }]
+
+    /** 旧任务映射结果只能回退状态，不能猜测实际模型。 */
+    const node = toFlowNodes(document, { jobs })[0]
+
+    expect(node?.data.status).toBe('interrupted')
+    expect(node?.data.imageModelLabel).toBeUndefined()
+  })
+
   test('Given 选择或平移工具 When 读取画布配置 Then 只允许选择模式拖动节点', () => {
     expect(getDesignCanvasInteractionConfig('select', true)).toEqual({
       selectionOnDrag: true,

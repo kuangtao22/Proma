@@ -8,6 +8,7 @@ import {
   updateDesignProjectStateAtom,
 } from '@/atoms/design-atoms'
 import { Button } from '@/components/ui/button'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { designAdapter } from '@/lib/design-adapter'
 import { cn } from '@/lib/utils'
 
@@ -39,6 +40,8 @@ export interface DesignAssetNodeData extends Record<string, unknown> {
   pixelHeight?: number
   /** 任务失败的用户可见原因。 */
   error?: string
+  /** 任务创建时固化的生图配置名称和真实模型 ID。 */
+  imageModelLabel?: string
 }
 
 /** Design 自定义 XYFlow 节点类型。 */
@@ -91,6 +94,9 @@ export function DesignAssetNode({
     && Boolean(data.projectId && data.jobId)
   /** 已完成且持有授权 URL 的素材才渲染图片。 */
   const showsPreview = data.status === 'success' && Boolean(data.previewUrl)
+  /** 素材沿用状态与像素尺寸，任务有快照时改为展示实际生图模型。 */
+  const footerLabel = data.imageModelLabel
+    ?? `${STATUS_LABELS[data.status]}${data.pixelWidth && data.pixelHeight ? ` · ${data.pixelWidth} × ${data.pixelHeight}` : ''}`
 
   /** 通过主进程创建新的可追踪任务，旧 journal 继续保留审计。 */
   const handleRetry = (): void => {
@@ -168,12 +174,26 @@ export function DesignAssetNode({
           )}
         </div>
         <footer className="flex h-12 shrink-0 items-center justify-between gap-2 border-t border-border bg-card px-3">
-          <div className="min-w-0">
+          <div className="min-w-0 flex-1">
             <p className="truncate text-xs font-medium">{data.title}</p>
-            <p className="text-[11px] text-muted-foreground">
-              {STATUS_LABELS[data.status]}
-              {data.pixelWidth && data.pixelHeight ? ` · ${data.pixelWidth} × ${data.pixelHeight}` : ''}
-            </p>
+            {data.imageModelLabel ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <p
+                    className="truncate text-[11px] text-muted-foreground"
+                    title={data.imageModelLabel}
+                    tabIndex={0}
+                  >
+                    {footerLabel}
+                  </p>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="max-w-64 break-all">
+                  {data.imageModelLabel}
+                </TooltipContent>
+              </Tooltip>
+            ) : (
+              <p className="truncate text-[11px] text-muted-foreground">{footerLabel}</p>
+            )}
           </div>
           {canRetry && (
             <Button
