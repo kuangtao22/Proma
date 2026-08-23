@@ -320,7 +320,7 @@ describe('ImageGenerationModelSettings', () => {
     expect(html).toContain('value="本地编辑"')
   })
 
-  test('Given 重载或重试正在进行 When 渲染提示 Then 两个请求入口禁用但表单仍可编辑', () => {
+  test('Given 重载或重试正在进行 When 渲染设置 Then 保存重载重试禁用但表单仍可编辑', () => {
     const { ImageGenerationModelSettingsView } = imageModelSettingsModule
     const html = renderToStaticMarkup(
       <ImageGenerationModelSettingsView
@@ -337,8 +337,22 @@ describe('ImageGenerationModelSettings', () => {
       />,
     )
 
-    expect((html.match(/disabled=""/g) ?? []).length).toBe(2)
+    expect((html.match(/disabled=""/g) ?? []).length).toBe(3)
     expect(html).not.toMatch(/<input[^>]*disabled=""/)
+  })
+
+  test('Given 重载请求已同步进入 When 尝试保存 Then 不调用保存 API', async () => {
+    const { canStartImageGenerationModelSave } = imageModelSettingsModule
+    /** 记录模拟保存 API 的调用次数。 */
+    let saveCalls = 0
+    /** 模拟主进程保存 API，只有 gate 放行后才能调用。 */
+    const saveImageModelProfiles = async (): Promise<void> => { saveCalls += 1 }
+
+    if (canStartImageGenerationModelSave(false, true)) {
+      await saveImageModelProfiles()
+    }
+
+    expect(saveCalls).toBe(0)
   })
 })
 

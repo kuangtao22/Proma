@@ -51,6 +51,14 @@ type ImageGenerationModelSettingsAction =
   | { type: 'request-failed'; requestGeneration: number; message: string }
   | { type: 'save-succeeded'; result: ImageGenerationModelCatalogResult }
 
+/** 判断保存命令能否在当前同步互斥状态下执行。 */
+export function canStartImageGenerationModelSave(
+  savingInProgress: boolean,
+  reloadInProgress: boolean,
+): boolean {
+  return !savingInProgress && !reloadInProgress
+}
+
 /** 创建一条尚待填写的新生图模型配置。 */
 export function createImageGenerationModelProfile(
   id: string,
@@ -239,6 +247,7 @@ export function ImageGenerationModelSettingsView({
   ))
   /** 保存动作是否应被阻断。 */
   const saveDisabled = saving
+    || reloadInProgress
     || profiles.length === 0
     || !credentialsConfigured
     || validationError !== null
@@ -488,7 +497,14 @@ export function ImageGenerationModelSettings(): React.ReactElement {
       toast.error(validationError)
       return
     }
-    if (!state.credentialsConfigured || state.profiles.length === 0 || savingRef.current) return
+    if (
+      !state.credentialsConfigured
+      || state.profiles.length === 0
+      || !canStartImageGenerationModelSave(
+        savingRef.current,
+        reloadInProgressRef.current,
+      )
+    ) return
 
     savingRef.current = true
     setSaving(true)
