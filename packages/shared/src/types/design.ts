@@ -1,6 +1,12 @@
 /** Design 画布文档的当前 schema 版本。 */
 export const DESIGN_DOCUMENT_VERSION = 1
 
+/** 生图配置名称保留充足展示空间，同时阻断无界粘贴放大配置、IPC 与任务 journal。 */
+export const IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH = 128
+
+/** 模型 ID 兼容供应商长路径格式，同时限制进入执行与历史记录的字符串规模。 */
+export const IMAGE_GENERATION_MODEL_ID_MAX_LENGTH = 256
+
 /** 画布上的二维坐标。 */
 export interface DesignPoint {
   x: number

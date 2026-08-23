@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
+  IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
   createEmptyDesignDocument,
 } from '@proma/shared'
 import type {
@@ -617,6 +619,42 @@ describe('Design Job Manager', () => {
     expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: 'job-legacy' })
     expect(harness.createdSessions).toEqual([])
     expect(harness.warnings[0]).toContain('旧任务未记录生图模型，请重新提交')
+  })
+
+  test.each([
+    ['名称', { name: '名'.repeat(IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH + 1) }],
+    ['模型 ID', { modelId: 'm'.repeat(IMAGE_GENERATION_MODEL_ID_MAX_LENGTH + 1) }],
+  ])('Given journal 模型快照%s超限 When 恢复项目 Then 忽略损坏任务且不产生 Store 或文件副作用', (_field, snapshotOverrides) => {
+    /** 损坏 journal 所在目录。 */
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    /** 超限快照 journal 的原始字节，恢复后必须保持完全不变。 */
+    const rawJournal = JSON.stringify({
+      id: 'job-oversized', projectId: 'project-1', action: 'generate', status: 'running',
+      prompt: '损坏任务', nodeId: 'node-oversized', position: { x: 0, y: 0 },
+      placementState: 'ready', createdAt: 1, updatedAt: 1,
+      imageModelSnapshot: {
+        profileId: 'profile-test',
+        name: '测试生图模型',
+        executor: 'nano-banana',
+        modelId: 'image-model-test',
+        ...snapshotOverrides,
+      },
+    })
+    /** 严格解析失败后仍应保留供诊断的原始 journal。 */
+    const journalPath = join(jobsDirectory, 'job-oversized.json')
+    writeFileSync(journalPath, rawJournal)
+
+    /** 恢复结果不得包含被严格 parser 拒绝的任务。 */
+    const recovered = harness.manager.recover('project-1')
+
+    expect(recovered).toEqual([])
+    expect(readFileSync(journalPath, 'utf8')).toBe(rawJournal)
+    expect(document.revision).toBe(0)
+    expect(document.nodes).toEqual([])
+    expect(harness.changedEvents).toEqual([])
+    expect(harness.createdSessions).toEqual([])
+    expect(harness.runInputs).toEqual([])
   })
 
   test('Given 同一失败任务被重复重试 When 请求到达 Then 幂等返回唯一 replacement 且只运行一个会话', async () => {

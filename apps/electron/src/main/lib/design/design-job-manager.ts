@@ -12,6 +12,10 @@ import type {
   DesignPoint,
   ImageGenerationModelSnapshot,
 } from '@proma/shared'
+import {
+  IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
+  IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
+} from '@proma/shared'
 import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
 import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-paths'
 import type { AgentRunExtensions } from '../agent-service'
@@ -872,9 +876,11 @@ function isImageModelSnapshot(value: unknown): value is ImageGenerationModelSnap
     && value.profileId === value.profileId.trim()
     && typeof value.name === 'string'
     && value.name.trim().length > 0
+    && value.name.length <= IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH
     && value.executor === 'nano-banana'
     && typeof value.modelId === 'string'
     && value.modelId.length > 0
+    && value.modelId.length <= IMAGE_GENERATION_MODEL_ID_MAX_LENGTH
     && value.modelId === value.modelId.trim()
 }
 

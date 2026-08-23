@@ -6,6 +6,10 @@ import type {
   ImageGenerationModelProfile,
   ImageGenerationModelSnapshot,
 } from '@proma/shared'
+import {
+  IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
+  IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
+} from '@proma/shared'
 import { writeJsonFileAtomic } from './safe-file'
 
 /** 目录文件当前唯一受支持的 schema 版本。 */
@@ -194,7 +198,7 @@ function createLegacyProfile(
   credentials: Record<string, string>,
   now: number,
 ): ImageGenerationModelProfile {
-  return {
+  return validateProfile({
     id: LEGACY_PROFILE_ID,
     name: 'Nano Banana 默认模型',
     executor: SUPPORTED_EXECUTOR,
@@ -202,7 +206,7 @@ function createLegacyProfile(
     enabled: true,
     createdAt: now,
     updatedAt: now,
-  }
+  }, 0)
 }
 
 /** 严格解析目录根结构和 profile 数组，拒绝未知版本或额外字段。 */
@@ -260,11 +264,17 @@ function validateProfile(value: unknown, index: number): ImageGenerationModelPro
   if (typeof value.name !== 'string' || value.name.trim().length === 0) {
     throw new Error(`${description} name 必须是非空字符串`)
   }
+  if (value.name.length > IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH) {
+    throw new Error(`${description} name 长度不能超过 ${IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH} 个字符`)
+  }
   if (value.executor !== SUPPORTED_EXECUTOR) {
     throw new Error(`${description} executor 不受支持`)
   }
   if (typeof value.modelId !== 'string' || value.modelId.trim().length === 0) {
     throw new Error(`${description} modelId 必须是非空字符串`)
+  }
+  if (value.modelId.length > IMAGE_GENERATION_MODEL_ID_MAX_LENGTH) {
+    throw new Error(`${description} modelId 长度不能超过 ${IMAGE_GENERATION_MODEL_ID_MAX_LENGTH} 个字符`)
   }
   if (typeof value.enabled !== 'boolean') {
     throw new Error(`${description} enabled 必须是 boolean`)

@@ -1,5 +1,9 @@
 import * as React from 'react'
 import type { ImageGenerationModelCatalogResult, ImageGenerationModelProfile } from '@proma/shared'
+import {
+  IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
+  IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
+} from '@proma/shared'
 import { Loader2, Plus, Save, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -84,7 +88,13 @@ export function validateImageGenerationModelProfiles(
 
   for (const [index, profile] of profiles.entries()) {
     if (!profile.name.trim()) return `第 ${index + 1} 个生图模型缺少名称`
+    if (profile.name.length > IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH) {
+      return `生图模型名称不能超过 ${IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH} 个字符`
+    }
     if (!profile.modelId.trim()) return `生图模型「${profile.name.trim()}」缺少模型 ID`
+    if (profile.modelId.length > IMAGE_GENERATION_MODEL_ID_MAX_LENGTH) {
+      return `生图模型「${profile.name.trim()}」的模型 ID 不能超过 ${IMAGE_GENERATION_MODEL_ID_MAX_LENGTH} 个字符`
+    }
     if (!profile.id.trim()) return `第 ${index + 1} 个生图模型缺少配置 ID`
     if (seenIds.has(profile.id)) return '生图模型配置 ID 重复，请删除重复项后重试'
     seenIds.add(profile.id)
@@ -243,7 +253,10 @@ export function ImageGenerationModelSettingsView({
   const validationError = validateImageGenerationModelProfiles(profiles)
   /** 名称或模型 ID 错误已经在字段旁显示，无需重复卡片级摘要。 */
   const hasFieldValidationError = profiles.some((profile) => (
-    !profile.name.trim() || !profile.modelId.trim()
+    !profile.name.trim()
+      || profile.name.length > IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH
+      || !profile.modelId.trim()
+      || profile.modelId.length > IMAGE_GENERATION_MODEL_ID_MAX_LENGTH
   ))
   /** 保存动作是否应被阻断。 */
   const saveDisabled = saving
@@ -326,10 +339,20 @@ export function ImageGenerationModelSettingsView({
         const nameErrorId = `image-model-${index}-name-error`
         /** 模型 ID 输入的稳定错误说明 ID。 */
         const modelIdErrorId = `image-model-${index}-model-id-error`
-        /** 当前名称是否为空。 */
+        /** 当前名称是否为空或超过共享持久化上限。 */
         const nameInvalid = !profile.name.trim()
-        /** 当前真实模型 ID 是否为空。 */
+          || profile.name.length > IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH
+        /** 当前真实模型 ID 是否为空或超过共享持久化上限。 */
         const modelIdInvalid = !profile.modelId.trim()
+          || profile.modelId.length > IMAGE_GENERATION_MODEL_ID_MAX_LENGTH
+        /** 名称字段旁的可操作错误。 */
+        const nameError = !profile.name.trim()
+          ? '请输入名称'
+          : `名称不能超过 ${IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH} 个字符`
+        /** 模型 ID 字段旁的可操作错误。 */
+        const modelIdError = !profile.modelId.trim()
+          ? '请输入模型 ID'
+          : `模型 ID 不能超过 ${IMAGE_GENERATION_MODEL_ID_MAX_LENGTH} 个字符`
         return (
         <div key={profile.id} className="flex flex-wrap items-end gap-3 px-4 py-3">
           <label className="min-w-40 flex-1 space-y-1">
@@ -340,11 +363,12 @@ export function ImageGenerationModelSettingsView({
               aria-describedby={nameInvalid ? nameErrorId : undefined}
               className="h-8 rounded px-2.5 text-xs"
               disabled={saving}
+              maxLength={IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH}
               value={profile.name}
               placeholder="例如：快速出图"
               onChange={(event) => updateProfile(profile.id, { name: event.target.value })}
             />
-            {nameInvalid && <span id={nameErrorId} role="alert" className="block text-xs text-destructive">请输入名称</span>}
+            {nameInvalid && <span id={nameErrorId} role="alert" className="block text-xs text-destructive">{nameError}</span>}
           </label>
           <label className="min-w-52 flex-[1.4] space-y-1">
             <span className="block text-xs font-medium text-foreground">模型 ID</span>
@@ -354,11 +378,12 @@ export function ImageGenerationModelSettingsView({
               aria-describedby={modelIdInvalid ? modelIdErrorId : undefined}
               className="h-8 rounded px-2.5 font-mono text-xs"
               disabled={saving}
+              maxLength={IMAGE_GENERATION_MODEL_ID_MAX_LENGTH}
               value={profile.modelId}
               placeholder="gemini-3.1-flash-image-preview"
               onChange={(event) => updateProfile(profile.id, { modelId: event.target.value })}
             />
-            {modelIdInvalid && <span id={modelIdErrorId} role="alert" className="block text-xs text-destructive">请输入模型 ID</span>}
+            {modelIdInvalid && <span id={modelIdErrorId} role="alert" className="block text-xs text-destructive">{modelIdError}</span>}
           </label>
           <div className="flex h-8 items-center gap-2">
             <span className="text-xs text-muted-foreground">启用</span>

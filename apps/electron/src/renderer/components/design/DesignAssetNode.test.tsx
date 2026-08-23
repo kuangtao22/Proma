@@ -143,8 +143,10 @@ describe('Design 素材节点', () => {
     )
 
     expect(html).toContain('style="width:284px;height:196px"')
-    expect(html).toContain('class="truncate text-[11px] text-muted-foreground"')
-    expect(html).toContain(`title="${imageModelLabel}"`)
+    expect(html).toContain('class="nodrag nokey truncate text-[11px] text-muted-foreground')
+    expect(html).toContain('focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40')
+    expect(html).toContain(`aria-label="实际生图模型：${imageModelLabel}"`)
+    expect(html).not.toContain('title=')
     expect(html).toContain('tabindex="0"')
     expect(html).toContain(imageModelLabel)
     expect(html).toContain('正在生成')

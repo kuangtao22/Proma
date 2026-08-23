@@ -3,6 +3,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ImageGenerationModelProfile, ImageGenerationModelSnapshot } from '@proma/shared'
+import {
+  IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
+  IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
+} from '@proma/shared'
 import { ImageGenerationModelCatalog } from './image-generation-model-catalog'
 
 /** 测试使用的临时目录，避免模型配置污染真实用户目录。 */
@@ -144,6 +148,40 @@ describe('ImageGenerationModelCatalog', () => {
     })
     expect(JSON.parse(readFileSync(`${configPath}.bak`, 'utf8'))).toEqual(previousFile)
     expect(existsSync(`${configPath}.tmp`)).toBe(false)
+  })
+
+  test('Given 名称和模型 ID 达到共享上限 When 替换并读取目录 Then 完整保留不截断', () => {
+    /** 最大合法名称必须在目录和公开结果中保持逐字一致。 */
+    const name = '名'.repeat(IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH)
+    /** 最大合法模型 ID 必须保持真实执行标识，不能在任何层截断。 */
+    const modelId = 'm'.repeat(IMAGE_GENERATION_MODEL_ID_MAX_LENGTH)
+
+    const saved = createCatalog().replaceProfiles([createProfile('maximum', { name, modelId })])
+
+    expect(saved.profiles[0]?.name).toBe(name)
+    expect(saved.profiles[0]?.modelId).toBe(modelId)
+    expect(createCatalog().listOptions()[0]).toMatchObject({ name, modelId })
+  })
+
+  test.each([
+    ['name', { name: '名'.repeat(IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH + 1) }],
+    ['modelId', { modelId: 'm'.repeat(IMAGE_GENERATION_MODEL_ID_MAX_LENGTH + 1) }],
+  ])('Given 已有合法目录 When 替换 profile 的 %s 超限 Then 原子写前拒绝且候选文件不变', (_field, overrides) => {
+    /** 写前校验使用的合法主文件原始字节。 */
+    const validMain = JSON.stringify({ schemaVersion: 1, profiles: [createProfile('current')] })
+    /** 已存在临时候选用于证明失败不会触发 safe-file 轮换。 */
+    const validTemp = JSON.stringify({ schemaVersion: 1, profiles: [createProfile('temp')] })
+    /** 已存在备份候选用于证明失败不会触发 safe-file 轮换。 */
+    const validBackup = JSON.stringify({ schemaVersion: 1, profiles: [createProfile('backup')] })
+    writeFileSync(configPath, validMain, 'utf8')
+    writeFileSync(`${configPath}.tmp`, validTemp, 'utf8')
+    writeFileSync(`${configPath}.bak`, validBackup, 'utf8')
+
+    expect(() => createCatalog().replaceProfiles([createProfile('oversized', overrides)]))
+      .toThrow('长度不能超过')
+    expect(readFileSync(configPath, 'utf8')).toBe(validMain)
+    expect(readFileSync(`${configPath}.tmp`, 'utf8')).toBe(validTemp)
+    expect(readFileSync(`${configPath}.bak`, 'utf8')).toBe(validBackup)
   })
 
   test('Given 主文件损坏且恢复候选合法 When 完整替换 Then 拒绝写入且三份文件逐字节不变', () => {
@@ -315,6 +353,8 @@ describe('ImageGenerationModelCatalog', () => {
     ['重复 ID', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('dup'), createProfile('dup')] }), 'ID 重复'],
     ['空 name', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('empty-name', { name: '  ' })] }), 'name'],
     ['空 modelId', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('empty-model', { modelId: '' })] }), 'modelId'],
+    ['name 超限', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('long-name', { name: '名'.repeat(IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH + 1) })] }), 'name 长度不能超过'],
+    ['modelId 超限', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('long-model', { modelId: 'm'.repeat(IMAGE_GENERATION_MODEL_ID_MAX_LENGTH + 1) })] }), 'modelId 长度不能超过'],
     ['未知 executor', JSON.stringify({ schemaVersion: 1, profiles: [{ ...createProfile('unknown'), executor: 'other' }] }), 'executor'],
   ])('Given %s When 读取目录 Then 明确失败且不覆盖原文件', (_caseName, raw, message) => {
     writeRawConfig(raw)
@@ -322,6 +362,16 @@ describe('ImageGenerationModelCatalog', () => {
     expect(() => createCatalog().listCatalog()).toThrow(message)
     expect(readFileSync(configPath, 'utf8')).toBe(raw)
     expect(existsSync(`${configPath}.bak`)).toBe(false)
+  })
+
+  test('Given 旧 Nano Banana 模型 ID 超限 When 合成兼容目录 Then 明确拒绝且不生成配置文件', () => {
+    credentials = {
+      apiKey: 'key',
+      model: 'm'.repeat(IMAGE_GENERATION_MODEL_ID_MAX_LENGTH + 1),
+    }
+
+    expect(() => createCatalog().listCatalog()).toThrow('modelId 长度不能超过')
+    expect(existsSync(configPath)).toBe(false)
   })
 
   test.each([

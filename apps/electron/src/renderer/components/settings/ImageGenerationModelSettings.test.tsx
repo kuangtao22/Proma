@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ImageGenerationModelCatalogResult, ImageGenerationModelProfile } from '@proma/shared'
+import {
+  IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
+  IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
+} from '@proma/shared'
 import * as imageModelSettingsModule from './ImageGenerationModelSettings'
 import * as toolSettingsModule from './ToolSettings'
 
@@ -118,6 +122,41 @@ describe('ImageGenerationModelSettings', () => {
       createProfile('profile-flash', 'Flash', 'gemini-flash'),
       createProfile('profile-flash', 'Pro', 'gemini-pro'),
     ])).toBe('生图模型配置 ID 重复，请删除重复项后重试')
+  })
+
+  test('Given 名称和模型 ID 达到或超过共享上限 When 本地校验 Then 最大值保留且超限明确阻断', () => {
+    const { validateImageGenerationModelProfiles } = imageModelSettingsModule
+    /** 最大合法名称用于证明 Renderer 与主进程采用同一闭区间边界。 */
+    const maximumName = '名'.repeat(IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH)
+    /** 最大合法模型 ID 不应被 Renderer 截断或拒绝。 */
+    const maximumModelId = 'm'.repeat(IMAGE_GENERATION_MODEL_ID_MAX_LENGTH)
+
+    expect(validateImageGenerationModelProfiles([
+      createProfile('maximum', maximumName, maximumModelId),
+    ])).toBeNull()
+    expect(validateImageGenerationModelProfiles([
+      createProfile('long-name', `${maximumName}名`, maximumModelId),
+    ])).toBe(`生图模型名称不能超过 ${IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH} 个字符`)
+    expect(validateImageGenerationModelProfiles([
+      createProfile('long-model', maximumName, `${maximumModelId}m`),
+    ])).toBe(`生图模型「${maximumName}」的模型 ID 不能超过 ${IMAGE_GENERATION_MODEL_ID_MAX_LENGTH} 个字符`)
+  })
+
+  test('Given 生图模型设置输入 When 渲染 Then 名称和模型 ID 使用共享 maxLength', () => {
+    const { ImageGenerationModelSettingsView } = imageModelSettingsModule
+    /** 静态 HTML 锁定两个输入分别使用对应共享边界。 */
+    const html = renderToStaticMarkup(
+      <ImageGenerationModelSettingsView
+        profiles={[createProfile('profile-flash', 'Flash', 'gemini-flash')]}
+        credentialsConfigured
+        saving={false}
+        onProfilesChange={() => undefined}
+        onSave={() => undefined}
+      />,
+    )
+
+    expect(html).toMatch(new RegExp(`aria-label="生图模型名称 [^"]+"[^>]*maxLength="${IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH}"`))
+    expect(html).toMatch(new RegExp(`aria-label="生图模型 ID [^"]+"[^>]*maxLength="${IMAGE_GENERATION_MODEL_ID_MAX_LENGTH}"`))
   })
 
   test('Given 字段校验失败 When 渲染设置 Then 具体输入关联错误并通过 alert 宣告', () => {

@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test'
 import {
   DESIGN_DOCUMENT_VERSION,
   DESIGN_IPC_CHANNELS,
+  IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
+  IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
   createEmptyDesignDocument,
 } from './design'
 import type {
@@ -153,5 +155,10 @@ describe('Design 共享契约', () => {
     expect(updateImageModelSelectionContract.imageModelProfileId).toBe('profile-flash')
     expect(saveContract.expectedRevision).toBe(0)
     expect(importContract.viewportCenter).toEqual({ x: 100, y: 200 })
+  })
+
+  test('Given 生图模型展示字段 When 读取共享限制 Then 名称和模型 ID 使用独立保守上限', () => {
+    expect(IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH).toBe(128)
+    expect(IMAGE_GENERATION_MODEL_ID_MAX_LENGTH).toBe(256)
   })
 })

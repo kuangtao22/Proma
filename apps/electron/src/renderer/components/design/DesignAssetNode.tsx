@@ -180,8 +180,11 @@ export function DesignAssetNode({
               <Tooltip>
                 <TooltipTrigger asChild>
                   <p
-                    className="truncate text-[11px] text-muted-foreground"
-                    title={data.imageModelLabel}
+                    className={cn(
+                      'nodrag nokey truncate text-[11px] text-muted-foreground',
+                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
+                    )}
+                    aria-label={`实际生图模型：${data.imageModelLabel}`}
                     tabIndex={0}
                   >
                     {footerLabel}
