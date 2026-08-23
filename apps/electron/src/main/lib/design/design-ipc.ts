@@ -8,6 +8,8 @@ import type {
   DesignCanvasNode,
   DesignChangeEvent,
   DesignGroup,
+  DesignImageModelSelection,
+  DesignImageModelSelectionChangeEvent,
   DesignJobControlInput,
   DesignJobRecord,
   DesignMutation,
@@ -16,17 +18,22 @@ import type {
   ExportDesignAssetInput,
   ImportAgentImageInput,
   ImportDesignAssetsInput,
+  ImageGenerationModelCatalogResult,
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
   RelinkDesignAssetInput,
   SaveDesignMutationsInput,
+  SaveImageGenerationModelProfilesInput,
+  UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
+import type { ImageGenerationModelCatalog } from '../image-generation-model-catalog'
 import type { DesignAssetImportBatch, DesignAssetService } from './design-asset-service'
 import type { DesignStore } from './design-store'
 import type { DesignJobManager } from './design-job-manager'
 import type { DesignSessionBridge } from './design-session-bridge'
+import type { DesignImageModelPreferences } from './design-image-model-preferences'
 
 /** Renderer 可提交的画布 mutation 白名单，素材元数据只能由主进程服务维护。 */
 const RENDERER_MUTATION_TYPES = new Set<DesignMutation['type']>([
@@ -93,6 +100,14 @@ export interface DesignIpcOptions {
   store: DesignStore
   assets: DesignIpcAssetService
   jobs: DesignIpcJobManager
+  imageModels: Pick<
+    ImageGenerationModelCatalog,
+    'listCatalog' | 'replaceProfiles' | 'resolveAvailableSnapshot'
+  >
+  imagePreferences: Pick<
+    DesignImageModelPreferences,
+    'getSelection' | 'setSelection' | 'onChanged'
+  >
   sessionBridge: DesignIpcSessionBridge
   pickImageFiles: (sender: WebContents) => Promise<string[]>
   pickRelinkImageFile: (sender: WebContents) => Promise<string | null>
@@ -248,6 +263,23 @@ function parseProjectInput(value: unknown): { projectId: string } {
     throw new Error('Design 请求结构无效')
   }
   return { projectId: value.projectId }
+}
+
+/** 解析完整替换模型目录的请求根，只允许 profiles 数组。 */
+function parseSaveImageModelProfilesInput(value: unknown): SaveImageGenerationModelProfilesInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['profiles'])
+    || !Array.isArray(value.profiles)) throw new Error('Design 请求结构无效')
+  return { profiles: value.profiles as SaveImageGenerationModelProfilesInput['profiles'] }
+}
+
+/** 解析项目生图模型选择更新，不接受模型详情或额外字段。 */
+function parseUpdateImageModelSelectionInput(value: unknown): UpdateDesignImageModelSelectionInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'imageModelProfileId'])
+    || !isNonEmptyString(value.projectId)
+    || !isNonEmptyString(value.imageModelProfileId)) throw new Error('Design 请求结构无效')
+  return { projectId: value.projectId, imageModelProfileId: value.imageModelProfileId }
 }
 
 /** 解析原子素材导入请求，只接受 revision 与受控布局中心。 */
@@ -424,11 +456,13 @@ function parseAssetInput(value: unknown, withRevision: boolean): DeleteDesignAss
 function parseCreateJobInput(value: unknown): CreateDesignJobInput {
   if (!isRecord(value)
     || !hasOnlyKeys(value, [
-      'projectId', 'action', 'prompt', 'sourceSessionId', 'sourceAssetId', 'maskAnnotationId', 'position',
+      'projectId', 'action', 'prompt', 'imageModelProfileId', 'sourceSessionId', 'sourceAssetId',
+      'maskAnnotationId', 'position',
     ])
     || !isNonEmptyString(value.projectId)
     || (value.action !== 'generate' && value.action !== 'edit')
     || !isNonEmptyString(value.prompt)
+    || !isNonEmptyString(value.imageModelProfileId)
     || (value.sourceSessionId !== undefined && !isNonEmptyString(value.sourceSessionId))
     || (value.sourceAssetId !== undefined && !isNonEmptyString(value.sourceAssetId))
     || (value.maskAnnotationId !== undefined && !isNonEmptyString(value.maskAnnotationId))
@@ -437,6 +471,7 @@ function parseCreateJobInput(value: unknown): CreateDesignJobInput {
     projectId: value.projectId,
     action: value.action,
     prompt: value.prompt,
+    imageModelProfileId: value.imageModelProfileId,
     ...(value.sourceSessionId ? { sourceSessionId: value.sourceSessionId } : {}),
     ...(value.sourceAssetId ? { sourceAssetId: value.sourceAssetId } : {}),
     ...(value.maskAnnotationId ? { maskAnnotationId: value.maskAnnotationId } : {}),
@@ -468,7 +503,24 @@ function broadcastChange(options: DesignIpcOptions, change: DesignChangeEvent): 
   }
 }
 
-/** 注册 Task 4 已具备业务服务的七个 Design IPC handler。 */
+/** 向全部仍存活授权窗口广播模型目录变化，不携带目录或凭据 payload。 */
+function broadcastImageModelProfilesChanged(options: DesignIpcOptions): void {
+  for (const contents of options.listAuthorizedWebContents()) {
+    if (!contents.isDestroyed()) contents.send(DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED)
+  }
+}
+
+/** 向全部仍存活授权窗口广播项目选择变化，只携带项目 ID。 */
+function broadcastImageModelSelectionChanged(
+  options: DesignIpcOptions,
+  event: DesignImageModelSelectionChangeEvent,
+): void {
+  for (const contents of options.listAuthorizedWebContents()) {
+    if (!contents.isDestroyed()) contents.send(DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED, event)
+  }
+}
+
+/** 注册 Design 工作区、模型目录与项目模型偏好的全部 IPC handler。 */
 export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcRegistration {
   activeRegistrations.get(options.ipc)?.()
 
@@ -485,6 +537,10 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   const lastReadableSnapshots = new Map<string, DesignWorkspaceSnapshot>()
   /** 本任务实际注册的通道，供测试和未来增量注册使用。 */
   const channels = [
+    DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES,
+    DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES,
+    DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION,
+    DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION,
     DESIGN_IPC_CHANNELS.LOAD,
     DESIGN_IPC_CHANNELS.SAVE_MUTATIONS,
     DESIGN_IPC_CHANNELS.IMPORT_ASSETS,
@@ -570,6 +626,36 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   /** Manager 后台状态变化也通知 Renderer 刷新任务列表。 */
   const unsubscribeJobs = options.jobs.onChanged(({ job, revision }) => {
     broadcastChange(options, { projectId: job.projectId, revision, cause: 'job' })
+  })
+  /** 项目偏好服务是选择广播的唯一来源，避免 handler 重复发送。 */
+  const unsubscribeImagePreferences = options.imagePreferences.onChanged((event) => {
+    broadcastImageModelSelectionChanged(options, event)
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, async (event, value): Promise<ImageGenerationModelCatalogResult> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    if (value !== undefined) throw new Error('Design 请求结构无效')
+    return options.imageModels.listCatalog()
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, async (event, value): Promise<ImageGenerationModelCatalogResult> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseSaveImageModelProfilesInput(value)
+    const result = options.imageModels.replaceProfiles(input.profiles)
+    broadcastImageModelProfilesChanged(options)
+    return result
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, async (event, value): Promise<DesignImageModelSelection> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseProjectInput(value)
+    return options.imagePreferences.getSelection(input.projectId)
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, async (event, value): Promise<DesignImageModelSelection> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseUpdateImageModelSelectionInput(value)
+    return options.imagePreferences.setSelection(input)
   })
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.LOAD, async (event, value): Promise<DesignWorkspaceSnapshot> => {
@@ -712,7 +798,11 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   options.ipc.handle(DESIGN_IPC_CHANNELS.CREATE_JOB, async (event, value): Promise<DesignJobRecord> => {
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseCreateJobInput(value)
-    const job = await options.guard.runWorkspaceWrite(input.projectId, () => options.jobs.create(input))
+    const job = await options.guard.runWorkspaceWrite(input.projectId, () => {
+      /** 在 Manager、Store 与 journal 副作用前拒绝伪造或当前不可用的模型 ID。 */
+      options.imageModels.resolveAvailableSnapshot(input.imageModelProfileId)
+      return options.jobs.create(input)
+    })
     /** invoke 只返回 queued；后台运行错误由 journal 终态承接。 */
     void options.jobs.run(job.id).catch((error) => console.error('[Design Job] 后台运行失败:', error))
     return job
@@ -775,6 +865,7 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     if (disposed) return
     disposed = true
     unsubscribeJobs()
+    unsubscribeImagePreferences()
     for (const senderId of [...mediaAccessBySender.keys()]) releaseMediaAccess(senderId)
     for (const channel of channels) options.ipc.removeHandler(channel)
     if (activeRegistrations.get(options.ipc) === dispose) activeRegistrations.delete(options.ipc)

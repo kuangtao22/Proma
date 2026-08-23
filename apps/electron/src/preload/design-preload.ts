@@ -4,21 +4,32 @@ import type {
   DeleteDesignAssetInput,
   DesignCanvasDocument,
   DesignChangeEvent,
+  DesignImageModelSelection,
+  DesignImageModelSelectionChangeEvent,
   DesignJobControlInput,
   DesignJobRecord,
   DesignWorkspaceSnapshot,
   ExportDesignAssetInput,
   ImportAgentImageInput,
   ImportDesignAssetsInput,
+  ImageGenerationModelCatalogResult,
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
   RelinkDesignAssetInput,
   SaveDesignMutationsInput,
+  SaveImageGenerationModelProfilesInput,
+  UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
 import type { IpcRendererEvent } from 'electron'
 
 /** Renderer 获得的稳定 Design API。 */
 export interface DesignPreloadApi {
+  listImageModelProfiles: () => Promise<ImageGenerationModelCatalogResult>
+  saveImageModelProfiles: (input: SaveImageGenerationModelProfilesInput) => Promise<ImageGenerationModelCatalogResult>
+  getImageModelSelection: (projectId: string) => Promise<DesignImageModelSelection>
+  setImageModelSelection: (input: UpdateDesignImageModelSelectionInput) => Promise<DesignImageModelSelection>
+  onImageModelProfilesChanged: (listener: () => void) => () => void
+  onImageModelSelectionChanged: (listener: (event: DesignImageModelSelectionChangeEvent) => void) => () => void
   loadDesignWorkspace: (projectId: string) => Promise<DesignWorkspaceSnapshot>
   saveDesignMutations: (input: SaveDesignMutationsInput) => Promise<DesignCanvasDocument>
   importDesignAssets: (input: ImportDesignAssetsInput) => Promise<DesignWorkspaceSnapshot>
@@ -45,6 +56,24 @@ export interface DesignPreloadIpc {
 /** 创建不暴露 ipcRenderer 本体的 Design preload API。 */
 export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi {
   return {
+    listImageModelProfiles: () => ipc.invoke(DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES) as Promise<ImageGenerationModelCatalogResult>,
+    saveImageModelProfiles: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, input) as Promise<ImageGenerationModelCatalogResult>,
+    getImageModelSelection: (projectId) => ipc.invoke(DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, { projectId }) as Promise<DesignImageModelSelection>,
+    setImageModelSelection: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, input) as Promise<DesignImageModelSelection>,
+    onImageModelProfilesChanged: (listener) => {
+      /** Electron event 和空 payload 都不向 Renderer 业务监听器暴露。 */
+      const handler = (_event: IpcRendererEvent): void => listener()
+      ipc.on(DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED, handler)
+      return () => ipc.removeListener(DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED, handler)
+    },
+    onImageModelSelectionChanged: (listener) => {
+      /** Electron event 对 Renderer 隐藏，只传项目选择变化。 */
+      const handler = (_event: IpcRendererEvent, value: unknown): void => (
+        listener(value as DesignImageModelSelectionChangeEvent)
+      )
+      ipc.on(DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED, handler)
+      return () => ipc.removeListener(DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED, handler)
+    },
     loadDesignWorkspace: (projectId) => ipc.invoke(DESIGN_IPC_CHANNELS.LOAD, { projectId }) as Promise<DesignWorkspaceSnapshot>,
     saveDesignMutations: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, input) as Promise<DesignCanvasDocument>,
     importDesignAssets: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.IMPORT_ASSETS, input) as Promise<DesignWorkspaceSnapshot>,

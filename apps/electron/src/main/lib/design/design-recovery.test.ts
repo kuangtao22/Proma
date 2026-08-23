@@ -107,7 +107,10 @@ describe('Design 跨模块恢复与资源边界', () => {
       },
       {
         channel: DESIGN_IPC_CHANNELS.CREATE_JOB,
-        input: { projectId: 'project-1', action: 'generate', prompt: '生成海报', position: { x: 0, y: 0 } },
+        input: {
+          projectId: 'project-1', action: 'generate', prompt: '生成海报',
+          imageModelProfileId: 'profile-test', position: { x: 0, y: 0 },
+        },
       },
       {
         channel: DESIGN_IPC_CHANNELS.RETRY_JOB,
@@ -197,6 +200,20 @@ function createIpcFixture(store: DesignStore, readOnlyReason?: string): {
       retry: () => { effects.push('retry'); return createJobRecord('job-retry') },
       list: () => [],
       reconcilePendingTerminals: () => [],
+      onChanged: () => () => undefined,
+    },
+    imageModels: {
+      listCatalog: () => ({ profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: false }),
+      replaceProfiles: (profiles) => ({ profiles, inheritedFromLegacyConfig: false, credentialsConfigured: false }),
+      resolveAvailableSnapshot: (profileId) => ({
+        profileId, name: '测试模型', executor: 'nano-banana', modelId: 'test-model',
+      }),
+    },
+    imagePreferences: {
+      getSelection: (projectId) => ({ projectId, options: [] }),
+      setSelection: ({ projectId, imageModelProfileId }) => ({
+        projectId, options: [], selectedProfileId: imageModelProfileId,
+      }),
       onChanged: () => () => undefined,
     },
     sessionBridge: {

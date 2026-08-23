@@ -25,6 +25,7 @@ describe('Design 路径解析', () => {
       assetsDir: '/projects/demo/.proma/design/assets',
       annotationsDir: '/projects/demo/.proma/design/annotations',
       cacheRoot: '/home/test/.proma/design-cache/project-1',
+      preferencesPath: '/home/test/.proma/design-cache/project-1/preferences.json',
       thumbnailsDir: '/home/test/.proma/design-cache/project-1/thumbnails',
       jobsDir: '/home/test/.proma/design-cache/project-1/jobs',
       stagingDir: '/home/test/.proma/design-cache/project-1/staging',

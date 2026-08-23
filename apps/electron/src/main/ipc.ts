@@ -170,6 +170,7 @@ import {
   revokePromaPathUrl,
 } from './lib/local-file-protocol'
 import { DesignAssetService } from './lib/design/design-asset-service'
+import { DesignImageModelPreferences } from './lib/design/design-image-model-preferences'
 import { registerDesignIpcHandlers } from './lib/design/design-ipc'
 import { DesignSessionBridge } from './lib/design/design-session-bridge'
 import {
@@ -179,6 +180,7 @@ import {
 } from './lib/design/design-job-manager'
 import { designPathResolver } from './lib/design/design-paths'
 import { designStore } from './lib/design/design-store'
+import { ImageGenerationModelCatalog } from './lib/image-generation-model-catalog'
 import { registerUpdaterIpc } from './lib/updater/updater-ipc'
 import { createLanBridgeIpcDependencies, registerLanBridgeIpcHandlers } from './lib/lan-bridge/lan-bridge-ipc'
 import {
@@ -316,7 +318,7 @@ import { hasRunningAutomations } from './lib/automation-scheduler'
 import { permissionService } from './lib/agent-permission-service'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
-import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getConversationAttachmentsDir, getWorkspaceSkillsDir, getScratchPadPath, resolveAttachmentPath } from './lib/config-paths'
+import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getConversationAttachmentsDir, getWorkspaceSkillsDir, getScratchPadPath, getImageGenerationModelsPath, resolveAttachmentPath } from './lib/config-paths'
 import { getCachedDefaultAppInfo, saveCachedDefaultAppInfo } from './lib/default-app-cache'
 import { calculateStorageStats, cleanupStorage, cleanupTempFiles } from './lib/storage-service'
 import type { CleanupOptions } from './lib/storage-service'
@@ -408,6 +410,32 @@ import { listShallowDirectory } from './lib/directory-listing'
 import { dingtalkBridgeManager } from './lib/dingtalk-bridge-manager'
 import { getWeChatConfig } from './lib/wechat-config'
 import { wechatBridge } from './lib/wechat-bridge'
+
+/** 进程级唯一的生图模型目录与项目偏好服务。 */
+interface DesignImageModelServices {
+  imageModels: ImageGenerationModelCatalog
+  imagePreferences: DesignImageModelPreferences
+}
+
+/** 延迟创建的进程级唯一实例，避免模块加载阶段提前解析活动配置根。 */
+let designImageModelServices: DesignImageModelServices | undefined
+
+/** 获取 Design IPC 与后续任务流程共享的生图模型服务实例。 */
+function getDesignImageModelServices(): DesignImageModelServices {
+  if (designImageModelServices) return designImageModelServices
+  /** 系统目录只保存公开 profile，凭据继续按需从 Nano Banana 工具配置读取。 */
+  const imageModels = new ImageGenerationModelCatalog({
+    configPath: getImageGenerationModelsPath(),
+    getNanoBananaCredentials: () => getToolCredentials('nano-banana'),
+  })
+  /** 项目偏好与系统目录共享同一 Catalog，保证选择和任务预检口径一致。 */
+  const imagePreferences = new DesignImageModelPreferences({
+    pathResolver: designPathResolver,
+    imageModels,
+  })
+  designImageModelServices = { imageModels, imagePreferences }
+  return designImageModelServices
+}
 
 /** 按渲染进程隔离工作区记忆订阅，并在显式清理或渲染进程销毁时释放。 */
 const workspaceMemoryWatchSubscriptions = new Map<number, Map<string, () => void>>()
@@ -1064,6 +1092,8 @@ export function registerIpcHandlers(): void {
     getWorkspaceIdBySlug: (slug) => getAgentWorkspaceBySlug(slug)?.id,
     getWorkspaceOperationBlockReason,
   })
+  /** Design IPC 的模型目录和项目偏好在进程内只创建一次。 */
+  const { imageModels, imagePreferences } = getDesignImageModelServices()
   /** Design 素材服务只接受可信项目路径、原子 store 和目录级媒体授权。 */
   const designAssetService = new DesignAssetService({
     pathResolver: designPathResolver,
@@ -1116,6 +1146,8 @@ export function registerIpcHandlers(): void {
     store: designStore,
     assets: designAssetService,
     jobs: designJobManager,
+    imageModels,
+    imagePreferences,
     sessionBridge: designSessionBridge,
     getProjectReadOnlyReason: (projectId) => {
       /** 未登记项目仍交给 store 抛出明确的项目不存在错误。 */

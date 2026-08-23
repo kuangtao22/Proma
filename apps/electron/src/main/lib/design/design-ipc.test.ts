@@ -14,6 +14,7 @@ import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
 import type {
   DesignAsset,
   DesignCanvasDocument,
+  DesignImageModelSelectionChangeEvent,
   DesignJobRecord,
   DesignMutation,
   DesignWorkspaceSnapshot,
@@ -166,6 +167,24 @@ function createFixture(): {
       reconcilePendingTerminals: () => [],
       onChanged: () => () => undefined,
     },
+    imageModels: {
+      listCatalog: () => ({
+        profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
+      }),
+      replaceProfiles: (profiles) => ({
+        profiles, inheritedFromLegacyConfig: false, credentialsConfigured: true,
+      }),
+      resolveAvailableSnapshot: (profileId) => ({
+        profileId, name: '测试模型', executor: 'nano-banana', modelId: 'test-model',
+      }),
+    },
+    imagePreferences: {
+      getSelection: (projectId) => ({ projectId, options: [] }),
+      setSelection: ({ projectId, imageModelProfileId }) => ({
+        projectId, options: [], selectedProfileId: imageModelProfileId,
+      }),
+      onChanged: () => () => undefined,
+    },
     sessionBridge: {
       prepareAssetForSession: () => {
         throw new Error('测试未配置 Design 会话素材准备')
@@ -201,6 +220,131 @@ function invoke(handlers: Map<string, TestHandler>, channel: string, sender: Web
 }
 
 describe('Design IPC', () => {
+  test('Given 模型目录与项目偏好 When 调用四个 invoke Then 严格校验并向所有授权窗口广播无敏感事件', async () => {
+    const fixture = createFixture()
+    /** 捕获偏好服务监听器，模拟成功 set 后的业务事件。 */
+    let preferenceChanged: ((event: DesignImageModelSelectionChangeEvent) => void) | undefined
+    /** 记录 dispose 是否解除偏好订阅。 */
+    let preferenceUnsubscribed = 0
+    /** 模拟允许保存的完整公开 profile。 */
+    const profile = {
+      id: 'profile-flash', name: 'Flash', executor: 'nano-banana' as const,
+      modelId: 'gemini-image', enabled: true, createdAt: 1, updatedAt: 2,
+    }
+    fixture.options.imageModels = {
+      listCatalog: () => ({
+        profiles: [profile], inheritedFromLegacyConfig: false, credentialsConfigured: true,
+      }),
+      replaceProfiles: (profiles) => ({
+        profiles, inheritedFromLegacyConfig: false, credentialsConfigured: true,
+      }),
+      resolveAvailableSnapshot: (profileId) => ({
+        profileId, name: 'Flash', executor: 'nano-banana', modelId: 'gemini-image',
+      }),
+    }
+    fixture.options.imagePreferences = {
+      getSelection: (projectId) => ({ projectId, options: [], selectedProfileId: 'profile-flash' }),
+      setSelection: ({ projectId, imageModelProfileId }) => {
+        preferenceChanged?.({ projectId })
+        return { projectId, options: [], selectedProfileId: imageModelProfileId }
+      },
+      onChanged: (listener) => {
+        preferenceChanged = listener
+        return () => { preferenceUnsubscribed += 1; preferenceChanged = undefined }
+      },
+    }
+    const registration = registerDesignIpcHandlers(fixture.options)
+
+    expect(registration.channels).toEqual(expect.arrayContaining([
+      DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES,
+      DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES,
+      DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION,
+      DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION,
+    ]))
+    expect(await invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, fixture.senders[0]!,
+    )).toMatchObject({ profiles: [profile] })
+    expect(await invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, fixture.senders[0]!, { profiles: [profile] },
+    )).toMatchObject({ profiles: [profile] })
+    expect(await invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, fixture.senders[0]!, { projectId: 'project-1' },
+    )).toMatchObject({ projectId: 'project-1', selectedProfileId: 'profile-flash' })
+    expect(await invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, fixture.senders[0]!, {
+        projectId: 'project-1', imageModelProfileId: 'profile-flash',
+      },
+    )).toMatchObject({ projectId: 'project-1', selectedProfileId: 'profile-flash' })
+
+    for (const sender of fixture.senders) {
+      expect(sender.sent).toContainEqual({
+        channel: DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED,
+        value: undefined,
+      })
+      expect(sender.sent).toContainEqual({
+        channel: DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED,
+        value: { projectId: 'project-1' },
+      })
+      expect(JSON.stringify(sender.sent)).not.toContain('credentials')
+    }
+    registration.dispose()
+    preferenceChanged?.({ projectId: 'project-1' })
+    expect(preferenceUnsubscribed).toBe(1)
+    expect(fixture.senders[0]?.sent.filter(
+      (event) => event.channel === DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED,
+    )).toHaveLength(1)
+  })
+
+  test('Given 未授权或夹带字段的模型请求 When 调用 Then 在目录和偏好服务前拒绝', async () => {
+    const fixture = createFixture()
+    /** 记录任何越过 IPC 边界的模型服务调用。 */
+    const calls: string[] = []
+    fixture.options.imageModels.listCatalog = () => { calls.push('list'); return { profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: false } }
+    fixture.options.imageModels.replaceProfiles = () => { calls.push('save'); return { profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: false } }
+    fixture.options.imagePreferences.getSelection = (projectId) => { calls.push('get'); return { projectId, options: [] } }
+    fixture.options.imagePreferences.setSelection = ({ projectId }) => { calls.push('set'); return { projectId, options: [] } }
+    registerDesignIpcHandlers(fixture.options)
+    const unauthorized = { id: 99 } as WebContents
+
+    for (const [channel, input] of [
+      [DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, undefined],
+      [DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, { profiles: [] }],
+      [DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, { projectId: 'project-1' }],
+      [DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, { projectId: 'project-1', imageModelProfileId: 'profile-flash' }],
+    ] as const) {
+      await expect(invoke(fixture.handlers, channel, unauthorized, input)).rejects.toThrow('未授权窗口')
+    }
+    await expect(invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, fixture.senders[0]!,
+      { profiles: [], credentials: 'forged-secret' },
+    )).rejects.toThrow('Design 请求结构无效')
+    await expect(invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, fixture.senders[0]!,
+      { projectId: 'project-1', imageModelProfileId: 'profile-flash', modelId: 'forged-model' },
+    )).rejects.toThrow('Design 请求结构无效')
+    expect(calls).toEqual([])
+  })
+
+  test('Given forged 生图模型 ID When 创建任务 Then 写锁内在 Manager 与 Store 前拒绝', async () => {
+    const fixture = createFixture()
+    /** 记录任务 Manager 是否产生任何 create/run 副作用。 */
+    const jobCalls: string[] = []
+    fixture.options.imageModels.resolveAvailableSnapshot = () => { throw new Error('生图模型不存在: forged') }
+    fixture.options.jobs.create = () => { jobCalls.push('create'); return createJobRecord('job-forged') }
+    fixture.options.jobs.run = async () => { jobCalls.push('run') }
+    registerDesignIpcHandlers(fixture.options)
+
+    await expect(invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.CREATE_JOB, fixture.senders[0]!, {
+        projectId: 'project-1', action: 'generate', prompt: '生成',
+        imageModelProfileId: 'forged', position: { x: 1, y: 2 },
+      },
+    )).rejects.toThrow('生图模型不存在: forged')
+    expect(fixture.guardProjects).toEqual(['project-1'])
+    expect(jobCalls).toEqual([])
+    expect(fixture.getStoreReadCount()).toBe(0)
+  })
+
   test('Given 授权窗口 When 创建、取消、重试和列出任务 Then 写操作受 guard 保护且运行不阻塞 invoke', async () => {
     const fixture = createFixture()
     const job = createJobRecord('job-1')
@@ -228,7 +372,10 @@ describe('Design IPC', () => {
       fixture.handlers,
       DESIGN_IPC_CHANNELS.CREATE_JOB,
       fixture.senders[0]!,
-      { projectId: 'project-1', action: 'generate', prompt: '生成', position: { x: 1, y: 2 } },
+      {
+        projectId: 'project-1', action: 'generate', prompt: '生成',
+        imageModelProfileId: 'profile-flash', position: { x: 1, y: 2 },
+      },
     )
     const cancelled = await invoke(
       fixture.handlers,

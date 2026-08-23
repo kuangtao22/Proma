@@ -16,7 +16,22 @@ describe('Design renderer adapter', () => {
     const snapshot = { document, writable: true }
     /** preload 实际收到的保存参数。 */
     let receivedInput: SaveDesignMutationsInput | undefined
+    /** 模型 API 收到的原始参数，验证 adapter 不做业务改写。 */
+    const modelInputs: unknown[] = []
+    /** 公开模型目录返回对象。 */
+    const catalog = { profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: true }
+    /** 项目模型选择返回对象。 */
+    const selection = { projectId: 'project-1', options: [], selectedProfileId: 'profile-flash' }
+    /** 两类订阅释放函数必须原样返回。 */
+    const releaseProfiles = (): void => undefined
+    const releaseSelection = (): void => undefined
     const api: PartialDesignApi = {
+      listImageModelProfiles: async () => catalog,
+      saveImageModelProfiles: async (input) => { modelInputs.push(input); return catalog },
+      getImageModelSelection: async (projectId) => { modelInputs.push(projectId); return selection },
+      setImageModelSelection: async (input) => { modelInputs.push(input); return selection },
+      onImageModelProfilesChanged: () => releaseProfiles,
+      onImageModelSelectionChanged: () => releaseSelection,
       loadDesignWorkspace: async () => snapshot,
       saveDesignMutations: async (input) => { receivedInput = input; return document },
       releaseDesignMediaAccess: async () => undefined,
@@ -27,6 +42,16 @@ describe('Design renderer adapter', () => {
     const input = { projectId: 'project-1', expectedRevision: 1, mutations: [] }
     expect(await adapter.save(input)).toBe(document)
     expect(receivedInput).toBe(input)
+    /** 保存输入与选择输入使用同一对象引用透传。 */
+    const saveProfilesInput = { profiles: [] }
+    const setSelectionInput = { projectId: 'project-1', imageModelProfileId: 'profile-flash' }
+    expect(await adapter.listImageModelProfiles()).toBe(catalog)
+    expect(await adapter.saveImageModelProfiles(saveProfilesInput)).toBe(catalog)
+    expect(await adapter.getImageModelSelection('project-1')).toBe(selection)
+    expect(await adapter.setImageModelSelection(setSelectionInput)).toBe(selection)
+    expect(modelInputs).toEqual([saveProfilesInput, 'project-1', setSelectionInput])
+    expect(adapter.onImageModelProfilesChanged(() => undefined)).toBe(releaseProfiles)
+    expect(adapter.onImageModelSelectionChanged(() => undefined)).toBe(releaseSelection)
     await expect(adapter.releaseMediaAccess()).resolves.toBeUndefined()
   })
 })

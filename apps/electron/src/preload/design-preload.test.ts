@@ -25,6 +25,10 @@ describe('Design preload', () => {
     const recorded = createRecordingIpc()
     const api = createDesignPreloadApi(recorded.ipc)
     const calls: Array<[() => Promise<unknown>, string, unknown[]]> = [
+      [() => api.listImageModelProfiles(), DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, []],
+      [() => api.saveImageModelProfiles({ profiles: [] }), DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, [{ profiles: [] }]],
+      [() => api.getImageModelSelection('p1'), DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, [{ projectId: 'p1' }]],
+      [() => api.setImageModelSelection({ projectId: 'p1', imageModelProfileId: 'profile-flash' }), DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, [{ projectId: 'p1', imageModelProfileId: 'profile-flash' }]],
       [() => api.loadDesignWorkspace('p1'), DESIGN_IPC_CHANNELS.LOAD, [{ projectId: 'p1' }]],
       [() => api.saveDesignMutations({ projectId: 'p1', expectedRevision: 0, mutations: [] }), DESIGN_IPC_CHANNELS.SAVE_MUTATIONS, [{ projectId: 'p1', expectedRevision: 0, mutations: [] }]],
       [() => api.importDesignAssets({ projectId: 'p1', expectedRevision: 3, viewportCenter: { x: 10, y: 20 } }), DESIGN_IPC_CHANNELS.IMPORT_ASSETS, [{ projectId: 'p1', expectedRevision: 3, viewportCenter: { x: 10, y: 20 } }]],
@@ -53,5 +57,25 @@ describe('Design preload', () => {
     release()
     expect(received).toEqual([change])
     expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
+  })
+
+  test('Given 两类模型变化订阅 When 推送并取消 Then 隐藏 Electron event 且同引用解绑', () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    /** 收集 profile 无 payload 通知次数。 */
+    let profileChanges = 0
+    /** 收集项目选择业务事件。 */
+    const selectionChanges: unknown[] = []
+    const releaseProfiles = api.onImageModelProfilesChanged(() => { profileChanges += 1 })
+    const releaseSelection = api.onImageModelSelectionChanged((event) => selectionChanges.push(event))
+    recorded.added[0]?.listener({} as IpcRendererEvent, undefined)
+    recorded.added[1]?.listener({} as IpcRendererEvent, { projectId: 'p1' })
+    releaseProfiles()
+    releaseSelection()
+
+    expect(profileChanges).toBe(1)
+    expect(selectionChanges).toEqual([{ projectId: 'p1' }])
+    expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
+    expect(recorded.removed[1]?.listener).toBe(recorded.added[1]?.listener)
   })
 })

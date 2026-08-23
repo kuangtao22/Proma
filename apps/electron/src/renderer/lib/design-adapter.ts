@@ -2,12 +2,15 @@ import type {
   CreateDesignJobInput,
   DeleteDesignAssetInput,
   DesignChangeEvent,
+  DesignImageModelSelectionChangeEvent,
   ExportDesignAssetInput,
   ImportAgentImageInput,
   ImportDesignAssetsInput,
   PrepareDesignAssetForSessionInput,
   RelinkDesignAssetInput,
   SaveDesignMutationsInput,
+  SaveImageGenerationModelProfilesInput,
+  UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
 import type { DesignPreloadApi } from '../../preload/design-preload'
 
@@ -16,6 +19,12 @@ export type PartialDesignApi = Partial<DesignPreloadApi>
 
 /** Renderer 组件唯一使用的 Design 适配器。 */
 export interface DesignAdapter {
+  listImageModelProfiles: () => ReturnType<DesignPreloadApi['listImageModelProfiles']>
+  saveImageModelProfiles: (input: SaveImageGenerationModelProfilesInput) => ReturnType<DesignPreloadApi['saveImageModelProfiles']>
+  getImageModelSelection: (projectId: string) => ReturnType<DesignPreloadApi['getImageModelSelection']>
+  setImageModelSelection: (input: UpdateDesignImageModelSelectionInput) => ReturnType<DesignPreloadApi['setImageModelSelection']>
+  onImageModelProfilesChanged: (listener: () => void) => ReturnType<DesignPreloadApi['onImageModelProfilesChanged']>
+  onImageModelSelectionChanged: (listener: (event: DesignImageModelSelectionChangeEvent) => void) => ReturnType<DesignPreloadApi['onImageModelSelectionChanged']>
   load: (projectId: string) => ReturnType<DesignPreloadApi['loadDesignWorkspace']>
   save: (input: SaveDesignMutationsInput) => ReturnType<DesignPreloadApi['saveDesignMutations']>
   importAssets: (input: ImportDesignAssetsInput) => ReturnType<DesignPreloadApi['importDesignAssets']>
@@ -42,6 +51,12 @@ function requireMethod<K extends keyof DesignPreloadApi>(api: PartialDesignApi, 
 /** 创建只做类型收口和原样错误传播的 renderer adapter。 */
 export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
   return {
+    listImageModelProfiles: () => requireMethod(api, 'listImageModelProfiles')(),
+    saveImageModelProfiles: (input) => requireMethod(api, 'saveImageModelProfiles')(input),
+    getImageModelSelection: (projectId) => requireMethod(api, 'getImageModelSelection')(projectId),
+    setImageModelSelection: (input) => requireMethod(api, 'setImageModelSelection')(input),
+    onImageModelProfilesChanged: (listener) => requireMethod(api, 'onImageModelProfilesChanged')(listener),
+    onImageModelSelectionChanged: (listener) => requireMethod(api, 'onImageModelSelectionChanged')(listener),
     load: (projectId) => requireMethod(api, 'loadDesignWorkspace')(projectId),
     save: (input) => requireMethod(api, 'saveDesignMutations')(input),
     importAssets: (input) => requireMethod(api, 'importDesignAssets')(input),
