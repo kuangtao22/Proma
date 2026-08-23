@@ -3,6 +3,7 @@ import type {
   AgentSendInput,
   ChatSendInput,
   LanBridgeAgentSessionDto,
+  LanBridgeAgentSessionRuntimeStatus,
   LanBridgeConversationDto,
 } from '@proma/shared'
 
@@ -110,6 +111,7 @@ interface UpstreamConversation {
 interface UpstreamAgentSession extends UpstreamConversation {
   workspaceId?: string
   manualWorking?: boolean
+  starred?: boolean
 }
 
 /** 官方工作区对象的最小可读形状。 */
@@ -181,6 +183,9 @@ export interface LanBridgePromaDependencies {
   listAgentWorkspaces: () => UpstreamWorkspace[]
   createAgentSession: (title?: string, channelId?: string, workspaceId?: string) => UpstreamAgentSession
   isAgentSessionActive: (sessionId: string) => boolean
+  getAgentSessionRuntimeStatus: (sessionId: string) => LanBridgeAgentSessionRuntimeStatus
+  updateAgentSessionStarred: (sessionId: string) => UpstreamAgentSession
+  markAgentSessionViewed: (sessionId: string) => boolean
   runAgentHeadless: (input: AgentSendInput, callbacks: UpstreamAgentCallbacks) => Promise<void>
   stopAgent: (sessionId: string) => void
   getSettings: () => UpstreamSettings
@@ -208,6 +213,12 @@ export interface LanBridgePromaAdapter {
   listWorkspaces: () => LanBridgeWorkspaceDto[]
   createAgentSession: (title?: string, workspaceId?: string) => LanBridgeAgentSessionDto
   isAgentSessionActive: (sessionId: string) => boolean
+  getAgentSessionRuntimeStatus: (sessionId: string) => LanBridgeAgentSessionRuntimeStatus
+  toggleAgentSessionStar: (sessionId: string) => LanBridgeAgentSessionDto
+  markAgentSessionViewed: (sessionId: string) => {
+    changed: boolean
+    runtimeStatus: LanBridgeAgentSessionRuntimeStatus
+  }
   sendAgent: (command: LanBridgeAgentSendCommand, callbacks: LanBridgeStreamCallbacks) => Promise<void>
   stopAgent: (sessionId: string) => void
   sendConversation: (command: LanBridgeConversationSendCommand, callbacks: LanBridgeStreamCallbacks) => Promise<void>
@@ -263,7 +274,10 @@ function mapConversation(conversation: UpstreamConversation): LanBridgeConversat
 }
 
 /** 将官方 Agent 会话对象映射为 shared 定义的 LAN 稳定字段。 */
-function mapAgentSession(session: UpstreamAgentSession): LanBridgeAgentSessionDto {
+function mapAgentSession(
+  session: UpstreamAgentSession,
+  runtimeStatus: LanBridgeAgentSessionRuntimeStatus,
+): LanBridgeAgentSessionDto {
   return {
     id: session.id,
     title: session.title,
@@ -271,6 +285,8 @@ function mapAgentSession(session: UpstreamAgentSession): LanBridgeAgentSessionDt
     ...(session.pinned === undefined ? {} : { pinned: session.pinned }),
     ...(session.archived === undefined ? {} : { archived: session.archived }),
     ...(session.manualWorking === undefined ? {} : { manualWorking: session.manualWorking }),
+    ...(session.starred === undefined ? {} : { starred: session.starred }),
+    runtimeStatus,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
   }
@@ -299,7 +315,9 @@ export function createLanBridgePromaAdapter(
         matchedAt,
       }))
     },
-    listAgentSessions: () => dependencies.listAgentSessions().map(mapAgentSession),
+    listAgentSessions: () => dependencies.listAgentSessions().map((session) => (
+      mapAgentSession(session, dependencies.getAgentSessionRuntimeStatus(session.id))
+    )),
     hasAgentSession: (sessionId) => isValidLanBridgeSessionId(sessionId)
       && dependencies.listAgentSessions().some(session => session.id === sessionId),
     getAgentMessages: (sessionId) => {
@@ -325,13 +343,34 @@ export function createLanBridgePromaAdapter(
     })),
     createAgentSession: (title, workspaceId) => {
       /** 新会话先映射为稳定 DTO，再用于 LAN 返回和桌面标题通知。 */
-      const session = mapAgentSession(dependencies.createAgentSession(title, undefined, workspaceId))
+      const created = dependencies.createAgentSession(title, undefined, workspaceId)
+      const session = mapAgentSession(
+        created,
+        dependencies.getAgentSessionRuntimeStatus(created.id),
+      )
       dependencies.notifyAgentTitleUpdated(session)
       return session
     },
     isAgentSessionActive: (sessionId) => {
       assertExistingAgentSession(dependencies, sessionId)
       return dependencies.isAgentSessionActive(sessionId)
+    },
+    getAgentSessionRuntimeStatus: (sessionId) => {
+      assertExistingAgentSession(dependencies, sessionId)
+      return dependencies.getAgentSessionRuntimeStatus(sessionId)
+    },
+    toggleAgentSessionStar: (sessionId) => {
+      assertExistingAgentSession(dependencies, sessionId)
+      const session = dependencies.updateAgentSessionStarred(sessionId)
+      return mapAgentSession(session, dependencies.getAgentSessionRuntimeStatus(sessionId))
+    },
+    markAgentSessionViewed: (sessionId) => {
+      assertExistingAgentSession(dependencies, sessionId)
+      const changed = dependencies.markAgentSessionViewed(sessionId)
+      return {
+        changed,
+        runtimeStatus: dependencies.getAgentSessionRuntimeStatus(sessionId),
+      }
     },
     sendAgent: async (command, callbacks) => {
       assertExistingAgentSession(dependencies, command.sessionId)

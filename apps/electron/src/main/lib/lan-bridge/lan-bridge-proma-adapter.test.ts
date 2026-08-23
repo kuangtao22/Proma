@@ -40,6 +40,7 @@ function createDependencies(): LanBridgePromaDependencies {
         pinned: true,
         archived: true,
         manualWorking: true,
+        starred: true,
         createdAt: 3,
         updatedAt: 4,
         internalPath: '/private/agents/1.jsonl',
@@ -74,6 +75,16 @@ function createDependencies(): LanBridgePromaDependencies {
       updatedAt: 8,
     }),
     isAgentSessionActive: () => false,
+    getAgentSessionRuntimeStatus: (sessionId) => sessionId === 'agent-1' ? 'blocked' : 'idle',
+    updateAgentSessionStarred: (sessionId) => ({
+      id: sessionId,
+      title: 'Agent',
+      workspaceId: 'workspace-1',
+      starred: false,
+      createdAt: 3,
+      updatedAt: 9,
+    }),
+    markAgentSessionViewed: () => true,
     runAgentHeadless: async () => {},
     stopAgent: () => {},
     getSettings: () => ({
@@ -204,12 +215,15 @@ describe('LAN Bridge Proma Adapter', () => {
         pinned: true,
         archived: true,
         manualWorking: true,
+        starred: true,
+        runtimeStatus: 'blocked',
         createdAt: 3,
         updatedAt: 4,
       },
       {
         id: 'agent-2',
         title: '无工作区 Agent',
+        runtimeStatus: 'idle',
         createdAt: 5,
         updatedAt: 6,
       },
@@ -220,6 +234,25 @@ describe('LAN Bridge Proma Adapter', () => {
       slug: 'project',
       createdAt: 7,
     }])
+  })
+
+  test('星标切换与完成状态确认均通过稳定 Adapter 返回', () => {
+    /** 被测 Adapter 使用可观察依赖，验证 handler 无需接触上游会话结构。 */
+    const adapter = createLanBridgePromaAdapter(createDependencies())
+
+    expect(adapter.toggleAgentSessionStar('agent-1')).toEqual({
+      id: 'agent-1',
+      title: 'Agent',
+      workspaceId: 'workspace-1',
+      starred: false,
+      runtimeStatus: 'blocked',
+      createdAt: 3,
+      updatedAt: 9,
+    })
+    expect(adapter.markAgentSessionViewed('agent-1')).toEqual({
+      changed: true,
+      runtimeStatus: 'blocked',
+    })
   })
 
   test('搜索、设置和渠道逐字段映射且不泄漏内部配置', async () => {

@@ -187,6 +187,9 @@ export interface LanBridgeConversationDto {
 }
 
 /** LAN Bridge 对外暴露的稳定 Agent 会话摘要。 */
+export type LanBridgeAgentSessionRuntimeStatus = 'idle' | 'running' | 'blocked' | 'completed'
+
+/** LAN Bridge 对外暴露的稳定 Agent 会话摘要。 */
 export interface LanBridgeAgentSessionDto {
   id: string
   title: string
@@ -197,6 +200,10 @@ export interface LanBridgeAgentSessionDto {
   archived?: boolean
   /** 是否标记为手动工作中。 */
   manualWorking?: boolean
+  /** 是否已星标。 */
+  starred?: boolean
+  /** 主进程内存中的实时运行状态。 */
+  runtimeStatus?: LanBridgeAgentSessionRuntimeStatus
   createdAt: number
   updatedAt: number
 }
