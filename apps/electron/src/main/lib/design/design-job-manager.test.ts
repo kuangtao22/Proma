@@ -384,6 +384,39 @@ describe('Design Job Manager', () => {
     expect(harness.manager.retry('project-1', original.id).id).toBe('job-2')
   })
 
+  test('Given 重启时只有旧 retry intent When 新 Manager 恢复 Then 新 replacement 立即 interrupted 且可由用户重试', () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    document.nodes = [{
+      id: 'node-old', kind: 'job', jobId: 'job-old', position: { x: 0, y: 0 },
+      width: 320, height: 240, zIndex: 0,
+    }]
+    writeFileSync(join(jobsDirectory, 'job-old.json'), JSON.stringify({
+      id: 'job-old', projectId: 'project-1', sessionId: 'session-old',
+      action: 'generate', status: 'failed', prompt: '崩溃前重试', nodeId: 'node-old',
+      position: { x: 0, y: 0 }, placementState: 'ready', replacedByJobId: 'job-2',
+      retryState: { status: 'pending' }, error: '旧任务失败', createdAt: 1, updatedAt: 2,
+    }))
+    /** 丢弃旧进程内存索引，使用同一磁盘与 Store 创建真正的新 Manager。 */
+    harness = createHarness()
+
+    const recovered = harness.manager.recover('project-1')
+    const replacement = recovered.find((job) => job.id === 'job-2')
+
+    expect(replacement).toMatchObject({
+      status: 'interrupted',
+      error: '应用退出，排队任务已中断',
+    })
+    expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: 'job-2' })
+    expect(harness.createdSessions).toEqual([])
+
+    harness.createId = () => 'job-3'
+    expect(harness.manager.retry('project-1', 'job-2')).toMatchObject({
+      id: 'job-3', status: 'queued',
+    })
+    expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: 'job-3' })
+  })
+
   test('Given Store 节点已不再绑定旧任务 When 重试 Then 拒绝创建新 journal 或会话', async () => {
     harness.messages = []
     const original = harness.manager.create(createGenerateInput())

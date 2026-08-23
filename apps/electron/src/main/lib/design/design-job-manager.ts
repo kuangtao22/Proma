@@ -317,7 +317,15 @@ export class DesignJobManager {
       }
       if (job.retryState?.status === 'pending') {
         try {
-          this.dependencies.runWorkspaceWrite(projectId, () => this.completeRetryIntent(job))
+          this.dependencies.runWorkspaceWrite(projectId, () => {
+            /** 本次恢复补建的替代任务，必须在返回用户前收敛为可显式重试的终态。 */
+            const replacement = this.completeRetryIntent(job)
+            if (replacement.status === 'queued' || replacement.status === 'running') {
+              this.updateStatus(replacement, 'interrupted', {
+                error: replacement.status === 'queued' ? '应用退出，排队任务已中断' : '应用退出，任务已中断',
+              })
+            }
+          })
         } catch {
           /** retry intent 保留到下次显式重试或恢复继续完成。 */
         }
