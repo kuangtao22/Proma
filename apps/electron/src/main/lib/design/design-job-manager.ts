@@ -10,6 +10,7 @@ import type {
   DesignCanvasNode,
   DesignJobRecord,
   DesignPoint,
+  ImageGenerationModelSnapshot,
 } from '@proma/shared'
 import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
 import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-paths'
@@ -43,10 +44,14 @@ interface StoredDesignJob extends DesignJobRecord {
   retryState?: { status: 'pending' }
 }
 
+/** Manager 内部创建已使用独立可信 snapshot，不再依赖 Renderer profile ID。 */
+type InternalCreateDesignJobInput = Omit<CreateDesignJobInput, 'imageModelProfileId'>
+
 /** journal 允许出现的完整字段集合，未知字段一律拒绝。 */
 const STORED_JOB_FIELDS = new Set([
   'id', 'projectId', 'sessionId', 'action', 'status', 'prompt', 'sourceSessionId',
   'sourceAssetId', 'parentAssetId', 'outputAssetId', 'error', 'createdAt', 'updatedAt',
+  'imageModelSnapshot',
   'nodeId', 'position', 'maskAnnotationId', 'placementState', 'terminalState',
   'replacedByJobId', 'retryState',
 ])
@@ -68,6 +73,8 @@ export interface DesignJobManagerDependencies {
   pathResolver: { resolve: (projectId: string) => { jobsDir: string } }
   store: DesignStore
   assetService: Pick<DesignAssetService, 'resolveAssetPath' | 'importAuthorizedFiles'>
+  /** 按当前系统目录解析可用 profile，并返回不含凭据的任务快照。 */
+  resolveAvailableSnapshot: (profileId: string) => ImageGenerationModelSnapshot
   getSettings: () => DesignJobSettings
   getSession: (sessionId: string) => AgentSessionMeta | undefined
   createSession: (
@@ -164,7 +171,9 @@ export class DesignJobManager {
 
   /** 创建 queued journal 和占位节点，不等待 Agent 运行。 */
   create(input: CreateDesignJobInput): DesignJobRecord {
-    return this.createInternal(input)
+    /** 可信模型校验必须早于 Store 读取、ID 生成、journal 和占位节点写入。 */
+    const imageModelSnapshot = this.dependencies.resolveAvailableSnapshot(input.imageModelProfileId)
+    return this.createInternal(input, imageModelSnapshot)
   }
 
   /** 查询已加载或磁盘可发现的任务。 */
@@ -373,7 +382,8 @@ export class DesignJobManager {
 
   /** 创建新任务；retry 时复用原节点位置和 ID。 */
   private createInternal(
-    input: CreateDesignJobInput,
+    input: InternalCreateDesignJobInput,
+    imageModelSnapshot?: ImageGenerationModelSnapshot,
     replaced?: StoredDesignJob,
     reservedId?: string,
   ): StoredDesignJob {
@@ -397,6 +407,7 @@ export class DesignJobManager {
       action: input.action,
       status: 'queued',
       prompt,
+      ...(imageModelSnapshot ? { imageModelSnapshot: { ...imageModelSnapshot } } : {}),
       ...(input.sourceSessionId ? { sourceSessionId: input.sourceSessionId } : {}),
       ...(input.sourceAssetId ? { sourceAssetId: input.sourceAssetId, parentAssetId: input.sourceAssetId } : {}),
       ...(input.maskAnnotationId ? { maskAnnotationId: input.maskAnnotationId } : {}),
@@ -656,7 +667,7 @@ export class DesignJobManager {
       ...(previous.sourceAssetId ? { sourceAssetId: previous.sourceAssetId } : {}),
       ...(previous.maskAnnotationId ? { maskAnnotationId: previous.maskAnnotationId } : {}),
       position: previous.position,
-    }, previous, replacementId)
+    }, previous.imageModelSnapshot, previous, replacementId)
     this.finalizeRetryIntent(previous)
     return replacement
   }
@@ -804,6 +815,24 @@ function isOptionalStableId(value: unknown): value is string | undefined {
   return value === undefined || isSafeDesignStableId(value)
 }
 
+/** 严格校验 journal 中不含凭据的生图模型快照。 */
+function isImageModelSnapshot(value: unknown): value is ImageGenerationModelSnapshot {
+  if (!isRecord(value)) return false
+  /** snapshot 只能包含任务执行所需的四个公开字段。 */
+  const keys = Object.keys(value)
+  if (keys.length !== 4
+    || !['profileId', 'name', 'executor', 'modelId'].every((key) => keys.includes(key))) return false
+  return typeof value.profileId === 'string'
+    && value.profileId.length > 0
+    && value.profileId === value.profileId.trim()
+    && typeof value.name === 'string'
+    && value.name.trim().length > 0
+    && value.executor === 'nano-banana'
+    && typeof value.modelId === 'string'
+    && value.modelId.length > 0
+    && value.modelId === value.modelId.trim()
+}
+
 /** 严格解析完整 Design Job journal schema。 */
 function isStoredDesignJob(value: unknown): value is StoredDesignJob {
   if (!isRecord(value)) return false
@@ -823,6 +852,7 @@ function isStoredDesignJob(value: unknown): value is StoredDesignJob {
     if (!isOptionalStableId(value[field])) return false
   }
   if (value.error !== undefined && typeof value.error !== 'string') return false
+  if (value.imageModelSnapshot !== undefined && !isImageModelSnapshot(value.imageModelSnapshot)) return false
   if (value.placementState !== undefined && value.placementState !== 'pending' && value.placementState !== 'ready') return false
   if (value.terminalState !== undefined) {
     if (!isRecord(value.terminalState)

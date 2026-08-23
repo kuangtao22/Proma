@@ -205,9 +205,6 @@ function createIpcFixture(store: DesignStore, readOnlyReason?: string): {
     imageModels: {
       listCatalog: () => ({ profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: false }),
       replaceProfiles: (profiles) => ({ profiles, inheritedFromLegacyConfig: false, credentialsConfigured: false }),
-      resolveAvailableSnapshot: (profileId) => ({
-        profileId, name: '测试模型', executor: 'nano-banana', modelId: 'test-model',
-      }),
     },
     imagePreferences: {
       getSelection: (projectId) => ({ projectId, options: [] }),
@@ -283,6 +280,9 @@ function createRecoveryJobManager(
       resolveAssetPath: () => '/unused',
       importAuthorizedFiles: async () => createEmptyBatch(),
     },
+    resolveAvailableSnapshot: (profileId) => ({
+      profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
+    }),
     getSettings: () => ({}),
     getSession: () => undefined,
     createSession: () => { throw new Error('恢复不应创建会话') },

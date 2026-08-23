@@ -12,6 +12,7 @@ import type {
   DesignAsset,
   DesignCanvasDocument,
   DesignJobRecord,
+  ImageGenerationModelSnapshot,
 } from '@proma/shared'
 import type { DesignAssetImportBatch, DesignAssetImportSource } from './design-asset-service'
 import { DesignJobManager } from './design-job-manager'
@@ -152,6 +153,35 @@ describe('Design Job Manager', () => {
     expect(existsSync(join(cacheRoot, 'escape.json'))).toBe(false)
     expect(existsSync(join(cacheRoot, 'jobs'))).toBe(false)
     expect(document.nodes).toEqual([])
+  })
+
+  test('Given Manager 直接收到伪造模型 ID When 创建任务 Then 在 Store、journal 和 Agent 副作用前拒绝', () => {
+    harness.resolveAvailableSnapshot = () => { throw new Error('生图模型不存在: forged') }
+    /** 绕过 IPC 直接调用 Manager，验证可信校验属于 Manager 自身。 */
+    const input = { ...createGenerateInput(), imageModelProfileId: 'forged' }
+
+    expect(() => harness.manager.create(input)).toThrow('生图模型不存在: forged')
+
+    expect(document.revision).toBe(0)
+    expect(document.nodes).toEqual([])
+    expect(existsSync(join(cacheRoot, 'jobs'))).toBe(false)
+    expect(harness.createdSessions).toEqual([])
+    expect(harness.runInputs).toEqual([])
+  })
+
+  test('Given Manager 解析到可用模型 When 创建任务 Then 返回并持久化公开模型快照', () => {
+    const job = harness.manager.create(createGenerateInput())
+
+    expect(job.imageModelSnapshot).toEqual({
+      profileId: 'profile-test',
+      name: '测试生图模型',
+      executor: 'nano-banana',
+      modelId: 'image-model-test',
+    })
+    /** journal 只持久化公开 snapshot，不包含模型目录或凭据。 */
+    const persisted = JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${job.id}.json`), 'utf8'))
+    expect(persisted.imageModelSnapshot).toEqual(job.imageModelSnapshot)
+    expect(JSON.stringify(persisted)).not.toContain('apiKey')
   })
 
   test('Given journal 含越界 ID、错名 payload 和损坏 schema When 恢复 Then 全部忽略且无文件或 Store 副作用', () => {
@@ -553,6 +583,7 @@ describe('Design Job Manager', () => {
       throwAfterRetryIntentWrite: boolean
       throwOnRetryFinalizeWrite: boolean
       throwAfterReplacementJournalWrite: boolean
+      resolveAvailableSnapshot: (profileId: string) => ImageGenerationModelSnapshot
     } = {
       settings: { agentChannelId: 'channel-default', agentModelId: 'model-default' },
       messages: [] as AgentMessage[],
@@ -565,6 +596,9 @@ describe('Design Job Manager', () => {
       throwAfterRetryIntentWrite: false,
       throwOnRetryFinalizeWrite: false,
       throwAfterReplacementJournalWrite: false,
+      resolveAvailableSnapshot: (profileId) => ({
+        profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
+      }),
     }
     const createdSessions: AgentSessionMeta[] = []
     const sessionUpdates: Array<{ sessionId: string; updates: Record<string, unknown> }> = []
@@ -633,6 +667,7 @@ describe('Design Job Manager', () => {
           return batch
         },
       },
+      resolveAvailableSnapshot: (profileId) => state.resolveAvailableSnapshot(profileId),
       getSettings: () => state.settings,
       getSession: (sessionId) => createdSessions.find((session) => session.id === sessionId),
       createSession: (title, channelId, projectId, modelId) => {
@@ -747,6 +782,9 @@ describe('Design Job Manager', () => {
       set throwAfterRetryIntentWrite(value: boolean) { state.throwAfterRetryIntentWrite = value },
       set throwOnRetryFinalizeWrite(value: boolean) { state.throwOnRetryFinalizeWrite = value },
       set throwAfterReplacementJournalWrite(value: boolean) { state.throwAfterReplacementJournalWrite = value },
+      set resolveAvailableSnapshot(value: typeof state.resolveAvailableSnapshot) {
+        state.resolveAvailableSnapshot = value
+      },
     }
   }
 })
@@ -773,6 +811,9 @@ function createMultiProjectRecoveryManager(projectBJobs: string, warnings: strin
       resolveAssetPath: () => '/unused.png',
       importAuthorizedFiles: async () => emptyBatch,
     },
+    resolveAvailableSnapshot: (profileId) => ({
+      profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
+    }),
     getSettings: () => ({}),
     getSession: () => undefined,
     createSession: () => { throw new Error('测试不应创建会话') },
@@ -806,14 +847,17 @@ function createStoredRunningJob(projectId: string, id: string): object {
 
 /** 创建生成任务输入。 */
 function createGenerateInput(): CreateDesignJobInput {
-  return { projectId: 'project-1', action: 'generate', prompt: '生成海报', position: { x: 10, y: 20 } }
+  return {
+    projectId: 'project-1', action: 'generate', prompt: '生成海报',
+    imageModelProfileId: 'profile-test', position: { x: 10, y: 20 },
+  }
 }
 
 /** 创建带主进程解析蒙版的编辑任务输入。 */
 function createEditInput(): CreateDesignJobInput {
   return {
     projectId: 'project-1', action: 'edit', prompt: '移除文字', sourceAssetId: 'asset-source',
-    maskAnnotationId: 'mask-1', position: { x: 10, y: 20 },
+    imageModelProfileId: 'profile-test', maskAnnotationId: 'mask-1', position: { x: 10, y: 20 },
   }
 }
 

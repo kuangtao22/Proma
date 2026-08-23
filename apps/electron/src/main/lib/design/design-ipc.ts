@@ -102,7 +102,7 @@ export interface DesignIpcOptions {
   jobs: DesignIpcJobManager
   imageModels: Pick<
     ImageGenerationModelCatalog,
-    'listCatalog' | 'replaceProfiles' | 'resolveAvailableSnapshot'
+    'listCatalog' | 'replaceProfiles'
   >
   imagePreferences: Pick<
     DesignImageModelPreferences,
@@ -798,11 +798,8 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   options.ipc.handle(DESIGN_IPC_CHANNELS.CREATE_JOB, async (event, value): Promise<DesignJobRecord> => {
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseCreateJobInput(value)
-    const job = await options.guard.runWorkspaceWrite(input.projectId, () => {
-      /** 在 Manager、Store 与 journal 副作用前拒绝伪造或当前不可用的模型 ID。 */
-      options.imageModels.resolveAvailableSnapshot(input.imageModelProfileId)
-      return options.jobs.create(input)
-    })
+    /** Manager 是可信模型解析边界，IPC 只负责授权、字段白名单与写锁。 */
+    const job = await options.guard.runWorkspaceWrite(input.projectId, () => options.jobs.create(input))
     /** invoke 只返回 queued；后台运行错误由 journal 终态承接。 */
     void options.jobs.run(job.id).catch((error) => console.error('[Design Job] 后台运行失败:', error))
     return job

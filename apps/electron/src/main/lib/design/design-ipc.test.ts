@@ -174,9 +174,6 @@ function createFixture(): {
       replaceProfiles: (profiles) => ({
         profiles, inheritedFromLegacyConfig: false, credentialsConfigured: true,
       }),
-      resolveAvailableSnapshot: (profileId) => ({
-        profileId, name: '测试模型', executor: 'nano-banana', modelId: 'test-model',
-      }),
     },
     imagePreferences: {
       getSelection: (projectId) => ({ projectId, options: [] }),
@@ -237,9 +234,6 @@ describe('Design IPC', () => {
       }),
       replaceProfiles: (profiles) => ({
         profiles, inheritedFromLegacyConfig: false, credentialsConfigured: true,
-      }),
-      resolveAvailableSnapshot: (profileId) => ({
-        profileId, name: 'Flash', executor: 'nano-banana', modelId: 'gemini-image',
       }),
     }
     fixture.options.imagePreferences = {
@@ -325,12 +319,11 @@ describe('Design IPC', () => {
     expect(calls).toEqual([])
   })
 
-  test('Given forged 生图模型 ID When 创建任务 Then 写锁内在 Manager 与 Store 前拒绝', async () => {
+  test('Given forged 生图模型 ID When 创建任务 Then 写锁内由 Manager 拒绝且不启动任务', async () => {
     const fixture = createFixture()
-    /** 记录任务 Manager 是否产生任何 create/run 副作用。 */
+    /** 记录请求是否到达 Manager 以及拒绝后是否错误启动任务。 */
     const jobCalls: string[] = []
-    fixture.options.imageModels.resolveAvailableSnapshot = () => { throw new Error('生图模型不存在: forged') }
-    fixture.options.jobs.create = () => { jobCalls.push('create'); return createJobRecord('job-forged') }
+    fixture.options.jobs.create = () => { jobCalls.push('create'); throw new Error('生图模型不存在: forged') }
     fixture.options.jobs.run = async () => { jobCalls.push('run') }
     registerDesignIpcHandlers(fixture.options)
 
@@ -341,7 +334,7 @@ describe('Design IPC', () => {
       },
     )).rejects.toThrow('生图模型不存在: forged')
     expect(fixture.guardProjects).toEqual(['project-1'])
-    expect(jobCalls).toEqual([])
+    expect(jobCalls).toEqual(['create'])
     expect(fixture.getStoreReadCount()).toBe(0)
   })
 
