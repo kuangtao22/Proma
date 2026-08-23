@@ -169,6 +169,24 @@ describe('Design Job Manager', () => {
     expect(harness.runInputs).toEqual([])
   })
 
+  test('Given 创建任务解析模型时发生含绝对路径的底层错误 When 调用 Manager Then 只返回稳定中文且无副作用', () => {
+    /** 模拟底层文件系统把用户目录写入错误消息。 */
+    const rawError = new Error(
+      'EACCES: permission denied, open /Users/private-user/.proma/image-generation-models.json',
+    )
+    harness.resolveAvailableSnapshot = () => { throw rawError }
+
+    expect(() => harness.manager.create(createGenerateInput()))
+      .toThrow('校验生图模型配置失败，请刷新后重试')
+
+    expect(document.revision).toBe(0)
+    expect(document.nodes).toEqual([])
+    expect(existsSync(join(cacheRoot, 'jobs'))).toBe(false)
+    expect(harness.createdSessions).toEqual([])
+    expect(harness.runInputs).toEqual([])
+    expect(harness.warnings[0]).toContain(rawError.message)
+  })
+
   test('Given Manager 解析到可用模型 When 创建任务 Then 返回并持久化公开模型快照', () => {
     const job = harness.manager.create(createGenerateInput())
 
@@ -186,18 +204,47 @@ describe('Design Job Manager', () => {
 
   test('Given queued 任务的模型配置已失效 When 执行任务 Then 明确失败且不创建 Agent 会话', async () => {
     const job = harness.manager.create(createGenerateInput())
-    harness.assertSnapshotAvailable = () => { throw new Error('生图模型已停用，请重新选择') }
+    harness.assertSnapshotAvailable = () => { throw new Error('生图模型已停用: profile-test') }
 
     await harness.manager.run(job.id)
 
     expect(harness.manager.get(job.id)).toMatchObject({
       status: 'failed',
-      error: '生图模型已停用，请重新选择',
+      error: '生图模型已停用: profile-test',
       imageModelSnapshot: job.imageModelSnapshot,
     })
     expect(harness.createdSessions).toEqual([])
     expect(harness.sessionUpdates).toEqual([])
     expect(harness.runInputs).toEqual([])
+  })
+
+  test('Given 执行前复核模型时发生含绝对路径的底层错误 When 运行 Then journal 与广播只保留稳定中文', async () => {
+    const job = harness.manager.create(createGenerateInput())
+    /** 模拟排队期间目录文件消失并暴露用户目录。 */
+    const rawError = new Error(
+      'ENOENT: no such file or directory, open /Users/private-user/.proma/image-generation-models.json',
+    )
+    harness.assertSnapshotAvailable = () => { throw rawError }
+
+    await harness.manager.run(job.id)
+
+    /** 任务公开终态不得包含底层文件系统诊断。 */
+    const failed = harness.manager.get(job.id)
+    if (!failed) throw new Error('测试预期任务仍可读取')
+    expect(failed).toMatchObject({
+      status: 'failed',
+      error: '校验生图模型配置失败，请刷新后重试',
+    })
+    expect(harness.manager.list('project-1')).toContainEqual(failed)
+    expect(harness.changedEvents.at(-1)?.job.error).toBe('校验生图模型配置失败，请刷新后重试')
+    /** 模拟 Renderer 可从列表与广播观察到的完整公开数据。 */
+    const publicResult = JSON.stringify({ failed, events: harness.changedEvents })
+    expect(publicResult).not.toContain('/Users')
+    expect(publicResult).not.toContain('private-user')
+    expect(publicResult).not.toContain('.proma')
+    expect(harness.createdSessions).toEqual([])
+    expect(harness.runInputs).toEqual([])
+    expect(harness.warnings[0]).toContain(rawError.message)
   })
 
   test('Given 旧 queued journal 没有模型快照 When 执行任务 Then 明确失败且不创建 Agent 会话', async () => {
@@ -841,6 +888,7 @@ describe('Design Job Manager', () => {
       ),
       listProjectIds: () => ['project-1'],
       warn: (message) => { warnings.push(message) },
+      logImageModelError: (message, error) => { warnings.push(`${message} ${String(error)}`) },
       runWorkspaceWrite: <T>(projectId: string, effect: () => T): T => {
         const release = workspaceRegistry.acquireWorkspaceWriteLease(projectId)
         workspaceWriteDepth += 1

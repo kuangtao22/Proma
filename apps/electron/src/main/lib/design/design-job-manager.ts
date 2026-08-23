@@ -16,6 +16,7 @@ import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
 import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-paths'
 import type { AgentRunExtensions } from '../agent-service'
 import type { ImageGenerationModelCatalog } from '../image-generation-model-catalog'
+import { runSafeImageModelOperation } from '../image-generation-model-error'
 import type { DesignAssetImportSource, DesignAssetService } from './design-asset-service'
 import { isSafeDesignStableId } from './design-paths'
 import type { DesignStore } from './design-store'
@@ -23,6 +24,7 @@ import type { DesignStore } from './design-store'
 const DESIGN_IMAGE_TOOL = 'mcp__nano_banana__generate_image'
 const DESIGN_JOB_MODEL_ERROR = '未配置可用的 Agent 渠道和模型'
 const DESIGN_JOB_OUTPUT_ERROR = '任务完成但没有产生可验证图片'
+const DESIGN_IMAGE_MODEL_VALIDATION_ERROR = '校验生图模型配置失败，请刷新后重试'
 
 /** Design Job 使用的最小设置字段。 */
 interface DesignJobSettings {
@@ -103,6 +105,8 @@ export interface DesignJobManagerDependencies {
   writeJobJournal?: (path: string, value: object) => void
   /** 单项目恢复失败时记录中文错误，默认输出到主进程错误日志。 */
   warn?: (message: string) => void
+  /** 生图模型未知底层错误记录器，必须保留原始 Error 供主进程诊断。 */
+  logImageModelError?: (message: string, error: unknown) => void
   createId?: () => string
   now?: () => number
 }
@@ -163,17 +167,22 @@ export class DesignJobManager {
   private readonly createId: () => string
   private readonly now: () => number
   private readonly warn: (message: string) => void
+  private readonly logImageModelError: (message: string, error: unknown) => void
 
   constructor(private readonly dependencies: DesignJobManagerDependencies) {
     this.createId = dependencies.createId ?? randomUUID
     this.now = dependencies.now ?? Date.now
     this.warn = dependencies.warn ?? ((message) => { console.error(message) })
+    this.logImageModelError = dependencies.logImageModelError
+      ?? ((message, error) => { console.error(message, error) })
   }
 
   /** 创建 queued journal 和占位节点，不等待 Agent 运行。 */
   create(input: CreateDesignJobInput): DesignJobRecord {
     /** 可信模型校验必须早于 Store 读取、ID 生成、journal 和占位节点写入。 */
-    const imageModelSnapshot = this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId)
+    const imageModelSnapshot = this.runImageModelValidation(
+      () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
+    )
     return this.createInternal(input, imageModelSnapshot)
   }
 
@@ -199,12 +208,16 @@ export class DesignJobManager {
     const queued = this.requireJob(jobId)
     if (queued.status !== 'queued') return
     try {
-      if (!queued.imageModelSnapshot) {
+      /** journal 固化的公开模型快照，也是本轮复核的唯一输入。 */
+      const imageModelSnapshot = queued.imageModelSnapshot
+      if (!imageModelSnapshot) {
         this.updateStatus(queued, 'failed', { error: '旧任务未记录生图模型，请重新提交新任务' })
         return
       }
       /** 排队期间配置可能被删除、停用或修改，付费会话创建前必须再次复核。 */
-      this.dependencies.imageModels.assertSnapshotAvailable(queued.imageModelSnapshot)
+      this.runImageModelValidation(
+        () => this.dependencies.imageModels.assertSnapshotAvailable(imageModelSnapshot),
+      )
       const model = this.resolveModel(queued)
       if (!model) {
         this.updateStatus(queued, 'failed', { error: DESIGN_JOB_MODEL_ERROR })
@@ -474,6 +487,17 @@ export class DesignJobManager {
     return settings.agentChannelId && settings.agentModelId
       ? { channelId: settings.agentChannelId, modelId: settings.agentModelId }
       : undefined
+  }
+
+  /** 执行可信模型校验，并阻止未知底层路径进入公开错误或 journal。 */
+  private runImageModelValidation<Result>(operation: () => Result): Result {
+    return runSafeImageModelOperation(
+      operation,
+      DESIGN_IMAGE_MODEL_VALIDATION_ERROR,
+      (error) => {
+        this.logImageModelError('[Design Job 生图模型] 校验失败:', error)
+      },
+    )
   }
 
   /** 构建只允许单次 Nano Banana 调用的生成或编辑提示。 */

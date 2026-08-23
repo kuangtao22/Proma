@@ -29,6 +29,7 @@ import type {
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
 import type { ImageGenerationModelCatalog } from '../image-generation-model-catalog'
+import { runSafeImageModelOperation } from '../image-generation-model-error'
 import type { DesignAssetImportBatch, DesignAssetService } from './design-asset-service'
 import type { DesignStore } from './design-store'
 import type { DesignJobManager } from './design-job-manager'
@@ -497,41 +498,13 @@ function assertAuthorizedSender(event: IpcMainInvokeEvent, authorized: WebConten
   return event.sender
 }
 
-/** Renderer 可安全处理的模型目录与偏好业务错误前缀。 */
-const SAFE_IMAGE_MODEL_ERROR_PREFIXES = [
-  '生图模型 profiles ',
-  '生图模型 profile',
-  '生图模型不存在:',
-  '生图模型已停用:',
-  '生图模型执行器不受支持:',
-  'Nano Banana API Key 未配置:',
-  '生图模型目录 JSON 损坏',
-  '生图模型目录格式无效',
-  '生图模型目录 profiles ',
-  '不支持的生图模型目录 schemaVersion:',
-  'Design 项目生图模型偏好 JSON 损坏',
-  'Design 项目生图模型偏好格式无效',
-  'Design 项目生图模型偏好字段',
-  'Design 项目生图模型偏好 imageModelProfileId ',
-  'Design 项目生图模型偏好 updatedAt ',
-  '不支持的 Design 项目生图模型偏好 schemaVersion:',
-] as const
-
-/** 判断错误是否是无主进程路径和凭据的稳定模型业务错误。 */
-function isSafeImageModelBusinessError(error: unknown): error is Error {
-  return error instanceof Error
-    && SAFE_IMAGE_MODEL_ERROR_PREFIXES.some((prefix) => error.message.startsWith(prefix))
-}
-
 /** 隔离模型服务的底层诊断，只向 Renderer 返回稳定业务消息。 */
 function runImageModelOperation<Result>(operation: () => Result, failureMessage: string): Result {
-  try {
-    return operation()
-  } catch (error) {
-    if (isSafeImageModelBusinessError(error)) throw error
-    console.error(`[DesignIPC] ${failureMessage}:`, error)
-    throw new Error(failureMessage)
-  }
+  return runSafeImageModelOperation(
+    operation,
+    failureMessage,
+    (error) => { console.error(`[DesignIPC] ${failureMessage}:`, error) },
+  )
 }
 
 /** 向所有仍存活的授权窗口广播 revision 变化，包括发起窗口。 */
