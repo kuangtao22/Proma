@@ -274,16 +274,29 @@ describe('Design Inspector 纯业务契约', () => {
   })
 
   test('Given 生成与编辑表单 When 输出任务 Then 只使用现有共享字段并保留可选蒙版', () => {
-    expect(createDesignGenerationJobInput('project-1', ' 生成海报 ', '3:4', '4K', { x: 5, y: 6 })).toEqual({
+    /** 模拟项目模型选择层补齐后的生成任务 fixture。 */
+    const generationInput = {
+      ...createDesignGenerationJobInput('project-1', ' 生成海报 ', '3:4', '4K', { x: 5, y: 6 }),
+      imageModelProfileId: 'profile-flash',
+    } satisfies CreateDesignJobInput
+    /** 模拟项目模型选择层补齐后的编辑任务 fixture。 */
+    const editInput = {
+      ...createDesignEditJobInput('project-1', ' 去掉文字 ', 'asset-1', 'mask-1', { x: 7, y: 8 }),
+      imageModelProfileId: 'profile-flash',
+    } satisfies CreateDesignJobInput
+
+    expect(generationInput).toEqual({
       projectId: 'project-1',
       action: 'generate',
       prompt: '生成海报\n\n[PROMA_DESIGN_CONSTRAINTS]\n{"aspectRatio":"3:4","imageSize":"4K"}',
+      imageModelProfileId: 'profile-flash',
       position: { x: 5, y: 6 },
     })
-    expect(createDesignEditJobInput('project-1', ' 去掉文字 ', 'asset-1', 'mask-1', { x: 7, y: 8 })).toEqual({
+    expect(editInput).toEqual({
       projectId: 'project-1',
       action: 'edit',
       prompt: '去掉文字',
+      imageModelProfileId: 'profile-flash',
       sourceAssetId: 'asset-1',
       maskAnnotationId: 'mask-1',
       position: { x: 7, y: 8 },

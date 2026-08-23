@@ -15,6 +15,63 @@ export interface DesignViewport extends DesignPoint {
 export type DesignNodeKind = 'asset' | 'job'
 export type DesignJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export type DesignJobAction = 'generate' | 'edit'
+export type ImageGenerationExecutor = 'nano-banana'
+
+/** 用户可配置的生图模型 profile。 */
+export interface ImageGenerationModelProfile {
+  id: string
+  name: string
+  executor: ImageGenerationExecutor
+  modelId: string
+  enabled: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+/** Design 任务创建时固化的生图模型信息。 */
+export interface ImageGenerationModelSnapshot {
+  profileId: string
+  name: string
+  executor: ImageGenerationExecutor
+  modelId: string
+}
+
+/** 项目选择器展示的生图模型及其当前可用性。 */
+export interface ImageGenerationModelOption extends ImageGenerationModelSnapshot {
+  available: boolean
+  unavailableReason?: string
+}
+
+/** 生图模型配置目录及旧配置继承状态。 */
+export interface ImageGenerationModelCatalogResult {
+  profiles: ImageGenerationModelProfile[]
+  inheritedFromLegacyConfig: boolean
+  credentialsConfigured: boolean
+}
+
+/** 保存完整生图模型 profile 列表的输入。 */
+export interface SaveImageGenerationModelProfilesInput {
+  profiles: ImageGenerationModelProfile[]
+}
+
+/** 项目可选择的生图模型及当前选择状态。 */
+export interface DesignImageModelSelection {
+  projectId: string
+  options: ImageGenerationModelOption[]
+  selectedProfileId?: string
+  invalidSelectedProfileId?: string
+}
+
+/** 更新项目生图模型选择的输入。 */
+export interface UpdateDesignImageModelSelectionInput {
+  projectId: string
+  imageModelProfileId: string
+}
+
+/** 项目生图模型选择变化事件。 */
+export interface DesignImageModelSelectionChangeEvent {
+  projectId: string
+}
 
 /** 画布节点的持久化布局信息。 */
 export interface DesignCanvasNode {
@@ -146,6 +203,7 @@ export interface DesignJobRecord {
   action: DesignJobAction
   status: DesignJobStatus
   prompt: string
+  imageModelSnapshot?: ImageGenerationModelSnapshot
   sourceSessionId?: string
   sourceAssetId?: string
   parentAssetId?: string
@@ -198,6 +256,7 @@ export interface CreateDesignJobInput {
   projectId: string
   action: DesignJobAction
   prompt: string
+  imageModelProfileId: string
   sourceSessionId?: string
   sourceAssetId?: string
   maskAnnotationId?: string
@@ -238,6 +297,12 @@ export type DesignChangeEvent = {
 
 /** Design 专用 IPC 通道，避免与会话和文件预览通道混用。 */
 export const DESIGN_IPC_CHANNELS = {
+  LIST_IMAGE_MODEL_PROFILES: 'design:list-image-model-profiles',
+  SAVE_IMAGE_MODEL_PROFILES: 'design:save-image-model-profiles',
+  GET_IMAGE_MODEL_SELECTION: 'design:get-image-model-selection',
+  SET_IMAGE_MODEL_SELECTION: 'design:set-image-model-selection',
+  IMAGE_MODEL_PROFILES_CHANGED: 'design:image-model-profiles-changed',
+  IMAGE_MODEL_SELECTION_CHANGED: 'design:image-model-selection-changed',
   LOAD: 'design:load',
   SAVE_MUTATIONS: 'design:save-mutations',
   IMPORT_ASSETS: 'design:import-assets',
