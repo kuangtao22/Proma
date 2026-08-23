@@ -385,4 +385,115 @@ describe('LAN Bridge 真实认证 handler 链路', () => {
     expect(await request(client, socket, 'subscribe', { token: 'invalid', sessionId: 'session-3' }))
       .toMatchObject({ ok: false, errorCode: 'TOKEN_INVALID' })
   })
+
+  test('星标命令返回更新会话并通知所有认证客户端刷新列表', async () => {
+    /** 隔离的认证与连接用于观察 handler 响应和主动广播。 */
+    const authService = createAuthService()
+    /** 真实 SessionManager 负责兑现只广播认证客户端的边界。 */
+    const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-star' })
+    /** Adapter 仅暴露本用例需要的稳定能力。 */
+    const promaAdapter = {
+      hasAgentSession: (sessionId: string) => sessionId === 'agent-1',
+      toggleAgentSessionStar: () => ({
+        id: 'agent-1',
+        title: 'Agent',
+        starred: true,
+        runtimeStatus: 'idle' as const,
+        createdAt: 1,
+        updatedAt: 2,
+      }),
+    } as unknown as LanBridgePromaAdapter
+    registerLanBridgeHandlers({ authService, promaAdapter, getSessionManager: () => manager })
+    /** 当前连接接收命令响应和会话列表失效广播。 */
+    const socket = new FakeWebSocket()
+    /** 命令发起客户端。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.8')!
+    /** 有效访问令牌用于通过真实认证边界。 */
+    const issued = authService.generateToken(client.ip, 'iPhone')
+
+    const response = await request(client, socket, 'agent.sessions.toggle_star', {
+      token: issued.token,
+      sessionId: 'agent-1',
+    })
+
+    expect(response).toMatchObject({
+      ok: true,
+      data: { session: { id: 'agent-1', starred: true } },
+    })
+    expect(socket.messages).toContainEqual({
+      type: 'agent.sessions.updated',
+      data: { sessionId: 'agent-1' },
+    })
+  })
+
+  test('完成会话读取后广播空闲但运行会话读取不误清状态', async () => {
+    /** 两次读取依次模拟完成未查看和没有状态变化。 */
+    let readCount = 0
+    /** 隔离的认证服务。 */
+    const authService = createAuthService()
+    /** 真实广播管理器用于检查 changed 门槛。 */
+    const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-viewed' })
+    /** Adapter 返回同一会话的消息和两种确认结果。 */
+    const promaAdapter = {
+      hasAgentSession: () => true,
+      getAgentMessages: () => [],
+      markAgentSessionViewed: () => ({
+        changed: ++readCount === 1,
+        runtimeStatus: 'idle' as const,
+      }),
+    } as unknown as LanBridgePromaAdapter
+    registerLanBridgeHandlers({ authService, promaAdapter, getSessionManager: () => manager })
+    /** 观察广播数量的客户端。 */
+    const socket = new FakeWebSocket()
+    /** 已连接手机。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.8')!
+    /** 有效访问令牌。 */
+    const issued = authService.generateToken(client.ip, 'iPhone')
+
+    await request(client, socket, 'agent.sessions.messages', {
+      token: issued.token,
+      sessionId: 'agent-1',
+    })
+    await request(client, socket, 'agent.sessions.messages', {
+      token: issued.token,
+      sessionId: 'agent-1',
+    })
+
+    expect(socket.messages.filter(message => message.type === 'agent.session.runtime_updated')).toEqual([{
+      type: 'agent.session.runtime_updated',
+      data: { sessionId: 'agent-1', runtimeStatus: 'idle' },
+    }])
+  })
+
+  test('星标命令拒绝不存在的会话且不调用更新依赖', async () => {
+    /** 更新调用计数用于证明 NOT_FOUND 在 Adapter 前拦截。 */
+    let toggleCount = 0
+    /** 隔离认证与路由环境。 */
+    const authService = createAuthService()
+    /** 本用例无需观察广播。 */
+    const manager = new LanBridgeSessionManager(10, { uuid: () => 'client-missing-star' })
+    /** 不存在会话的 Adapter。 */
+    const promaAdapter = {
+      hasAgentSession: () => false,
+      toggleAgentSessionStar: () => {
+        toggleCount += 1
+        throw new Error('不应调用')
+      },
+    } as unknown as LanBridgePromaAdapter
+    registerLanBridgeHandlers({ authService, promaAdapter, getSessionManager: () => manager })
+    /** 发起非法命令的客户端。 */
+    const socket = new FakeWebSocket()
+    /** 已连接手机。 */
+    const client = manager.addClient(socket as unknown as WebSocket, '192.168.1.8')!
+    /** 有效访问令牌。 */
+    const issued = authService.generateToken(client.ip, 'iPhone')
+
+    const response = await request(client, socket, 'agent.sessions.toggle_star', {
+      token: issued.token,
+      sessionId: 'missing-agent',
+    })
+
+    expect(response).toMatchObject({ ok: false, errorCode: 'NOT_FOUND' })
+    expect(toggleCount).toBe(0)
+  })
 })

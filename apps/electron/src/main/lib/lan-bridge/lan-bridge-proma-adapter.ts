@@ -7,9 +7,11 @@ import {
 } from '../conversation-manager'
 import {
   createAgentSession,
+  getAgentSessionMeta,
   getAgentSessionMessages,
   listAgentSessions,
   searchAgentSessionMessages,
+  updateAgentSessionMeta,
 } from '../agent-session-manager'
 import { listAgentWorkspaces } from '../agent-workspace-manager'
 import { isAgentSessionActive, runAgentHeadless, stopAgent } from '../agent-service'
@@ -23,6 +25,10 @@ import {
   createLanBridgePromaAdapter,
   type LanBridgePromaDependencies,
 } from './lan-bridge-proma-adapter-core'
+import {
+  getAgentIslandSessionRuntimeStatus,
+  markAgentIslandSessionViewed,
+} from '../agent-island-service'
 
 /** 默认依赖只在组合根绑定官方模块，handlers 不再承受上游签名变化。 */
 const defaultDependencies: LanBridgePromaDependencies = {
@@ -35,6 +41,14 @@ const defaultDependencies: LanBridgePromaDependencies = {
   listAgentWorkspaces: () => listAgentWorkspaces(),
   createAgentSession: (title, channelId, workspaceId) => createAgentSession(title, channelId, workspaceId),
   isAgentSessionActive: (sessionId) => isAgentSessionActive(sessionId),
+  getAgentSessionRuntimeStatus: (sessionId) => getAgentIslandSessionRuntimeStatus(sessionId),
+  updateAgentSessionStarred: (sessionId) => {
+    /** 星标沿用官方会话元数据原子更新路径。 */
+    const current = getAgentSessionMeta(sessionId)
+    if (!current) throw new Error('会话不存在')
+    return updateAgentSessionMeta(sessionId, { starred: !current.starred })
+  },
+  markAgentSessionViewed: (sessionId) => markAgentIslandSessionViewed(sessionId),
   runAgentHeadless: (input, callbacks) => runAgentHeadless(input, callbacks),
   stopAgent: (sessionId) => stopAgent(sessionId),
   getSettings: () => getSettings(),

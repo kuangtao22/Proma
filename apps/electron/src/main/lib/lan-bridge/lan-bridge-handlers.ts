@@ -63,6 +63,7 @@ export function registerLanBridgeHandlers(dependencies: LanBridgeHandlerDependen
   registerRoute('agent.sessions', bind(handleAgentSessions))
   registerRoute('agent.sessions.messages', bind(handleAgentSessionMessages))
   registerRoute('agent.sessions.search', bind(handleAgentSearch))
+  registerRoute('agent.sessions.toggle_star', bind(handleAgentSessionToggleStar))
   registerRoute('workspaces.list', bind(handleWorkspaces))
   registerRoute('subscribe', bind(handleSubscribe))
   registerRoute('unsubscribe', bind(handleUnsubscribe))
@@ -241,9 +242,36 @@ function handleAgentSessionMessages(context: LanBridgeHandlerDependencies, clien
   }
   requireExistingAgentSession(context.promaAdapter, sessionId)
   const allMessages = context.promaAdapter.getAgentMessages(sessionId)
+  /** 读取完成会话即确认已查看；运行中会话返回 changed=false。 */
+  const viewed = context.promaAdapter.markAgentSessionViewed(sessionId)
+  if (viewed.changed) {
+    context.getSessionManager()?.broadcast({
+      type: 'agent.session.runtime_updated',
+      data: { sessionId, runtimeStatus: viewed.runtimeStatus },
+    })
+  }
   const limit = typeof data.limit === 'number' ? data.limit : 100
   const messages = limit > 0 ? allMessages.slice(-limit) : allMessages
   return { messages, total: allMessages.length }
+}
+
+/** 切换 Agent 会话星标并通知其他移动端刷新权威列表。 */
+function handleAgentSessionToggleStar(
+  context: LanBridgeHandlerDependencies,
+  client: ClientConnection,
+  data: Record<string, unknown>,
+) {
+  requireAuth(context.authService, client, data)
+  /** 外部会话 ID 必须先通过统一路径和实体校验。 */
+  const sessionId = data.sessionId as string | undefined
+  requireExistingAgentSession(context.promaAdapter, sessionId)
+  /** Adapter 返回过滤后的稳定会话摘要。 */
+  const session = context.promaAdapter.toggleAgentSessionStar(sessionId)
+  context.getSessionManager()?.broadcast({
+    type: 'agent.sessions.updated',
+    data: { sessionId },
+  })
+  return { session }
 }
 
 async function handleAgentSearch(context: LanBridgeHandlerDependencies, client: ClientConnection, data: Record<string, unknown>) {
