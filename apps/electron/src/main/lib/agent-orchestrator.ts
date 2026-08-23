@@ -18,7 +18,6 @@ import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { accessSync, constants, existsSync, mkdirSync, realpathSync } from 'node:fs'
-import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { app } from 'electron'
 import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
 import {
@@ -77,6 +76,7 @@ import { claimWorkspaceMemoryRefreshOpportunity } from './agent-memory-refresh-s
 import { browserController } from './browser-controller'
 import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
+import type { AgentRunExtensions } from './agent-run-extensions'
 import {
   closeAgentQueryIterator,
   consumeStoppedGeneration,
@@ -682,7 +682,7 @@ export class AgentOrchestrator {
   async sendMessage(
     input: AgentSendInput,
     callbacks: SessionCallbacks,
-    extensions: { piCustomTools?: ToolDefinition[]; allowedToolNames?: readonly string[] } = {},
+    extensions: AgentRunExtensions = {},
   ): Promise<void> {
     const { sessionId, userMessage, rawUserMessage, userMessageUuid, channelId, modelId, workspaceId: requestedWorkspaceId, additionalDirectories, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid } = input
     const streamStartedAt = input.startedAt ?? Date.now()
@@ -1083,6 +1083,8 @@ export class AgentOrchestrator {
         permissionMode: permissionModeOverride ?? sessionMeta?.permissionMode ?? PROMA_DEFAULT_PERMISSION_MODE,
         triggeredBy: input.triggeredBy,
         windowsShellAvailable: process.platform !== 'win32' || runtimeEnv.shellKind != null,
+        trustedImageRoute: extensions.trustedImageRoute,
+        assertTrustedImageRouteAvailable: extensions.assertTrustedImageRouteAvailable,
       })
       checkpoint()
       piBuiltinTools = builtinMcpResult.tools

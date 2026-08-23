@@ -62,6 +62,13 @@ describe('Design Job Manager', () => {
       triggeredBy: 'user',
       permissionModeOverride: 'bypassPermissions',
       allowedToolNames: [NANO_BANANA_TOOL],
+      trustedImageRoute: {
+        profileId: 'profile-test',
+        name: '测试生图模型',
+        executor: 'nano-banana',
+        modelId: 'image-model-test',
+      },
+      hasTrustedImageRouteAssertion: true,
     })
     expect(harness.runInputs[0]?.userMessage).toContain('/trusted/source.png')
     expect(harness.runInputs[0]?.userMessage).toContain('mask-1')
@@ -878,6 +885,8 @@ describe('Design Job Manager', () => {
           ...input,
           source: callbacks.source,
           allowedToolNames: extensions.allowedToolNames,
+          trustedImageRoute: extensions.trustedImageRoute,
+          hasTrustedImageRouteAssertion: typeof extensions.assertTrustedImageRouteAvailable === 'function',
         })
         if (state.runHeadless) return state.runHeadless(callbacks)
         callbacks.onComplete(state.messages)

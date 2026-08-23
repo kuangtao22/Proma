@@ -14,6 +14,7 @@ import type {
   CreateAutomationInput,
   PromaPermissionMode,
   UpdateAutomationInput,
+  ImageGenerationModelSnapshot,
 } from '@proma/shared'
 import {
   createAutomation,
@@ -96,6 +97,10 @@ export interface PiBuiltinToolsContext {
   triggeredBy?: 'user' | 'automation' | 'delegation'
   /** Windows 设备是否已有可供 Pi Bash 使用的 Git Bash 或 WSL。 */
   windowsShellAvailable?: boolean
+  /** Design Job 固化的可信生图模型，仅作用于本次 Agent 运行。 */
+  trustedImageRoute?: ImageGenerationModelSnapshot
+  /** 生图请求发生任何文件或网络副作用前执行的实时复核。 */
+  assertTrustedImageRouteAvailable?: (route: ImageGenerationModelSnapshot) => void
 }
 
 function jsonToolResult(payload: unknown): AgentToolResult<unknown> {
@@ -1171,12 +1176,14 @@ export async function buildPiBuiltinTools(
     console.error('[Pi 桥接] 注入视觉助手失败:', error)
   }
 
-  if (isBuiltinMcpUserEnabled('nano-banana')) {
+  if (ctx.trustedImageRoute || isBuiltinMcpUserEnabled('nano-banana')) {
     try {
       tools.push(...buildPiNanoBananaTools(sdk, {
         sessionId: ctx.sessionId,
         agentCwd: ctx.agentCwd,
         allowedRoots: ctx.allowedRoots,
+        trustedImageRoute: ctx.trustedImageRoute,
+        assertTrustedImageRouteAvailable: ctx.assertTrustedImageRouteAvailable,
       }))
     } catch (error) {
       console.error('[Pi 桥接] 注入 nano-banana 工具失败:', error)

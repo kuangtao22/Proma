@@ -252,6 +252,10 @@ export class DesignJobManager {
         onTitleUpdated: () => undefined,
       }, {
         allowedToolNames: [DESIGN_IMAGE_TOOL],
+        trustedImageRoute: running.imageModelSnapshot,
+        assertTrustedImageRouteAvailable: (route) => {
+          this.dependencies.imageModels.assertSnapshotAvailable(route)
+        },
       })
       const latest = this.requireJob(jobId)
       if (latest.status === 'cancelled' || latest.status === 'interrupted') return

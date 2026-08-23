@@ -13,7 +13,7 @@ import { getToolState, getToolCredentials } from '../chat-tool-config'
 import { Type } from 'typebox'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
-import type { AgentToolResultImage } from '@proma/shared'
+import type { AgentToolResultImage, ImageGenerationModelSnapshot } from '@proma/shared'
 import { saveAttachment, isImageAttachment } from '../attachment-service'
 
 // ===== Gemini API 类型（REST API 使用 camelCase） =====
@@ -216,11 +216,25 @@ function buildGeminiRequest(
 async function callGeminiAndBuildResult(
   prompt: string,
   sessionId: string,
-  options: { aspectRatio?: string; imageSize?: string; referenceImagePaths?: string[]; cwd?: string; allowedRoots?: string[]; numberOfImages?: number },
+  options: {
+    aspectRatio?: string
+    imageSize?: string
+    referenceImagePaths?: string[]
+    cwd?: string
+    allowedRoots?: string[]
+    numberOfImages?: number
+    trustedImageRoute?: ImageGenerationModelSnapshot
+    assertTrustedImageRouteAvailable?: (route: ImageGenerationModelSnapshot) => void
+  },
 ): Promise<McpToolResult> {
+  // 复核必须早于历史读取、参考图读取和 fetch，避免失效任务产生任何可计费或本地输入副作用。
+  if (options.trustedImageRoute) {
+    options.assertTrustedImageRouteAvailable?.(options.trustedImageRoute)
+  }
   const credentials = getToolCredentials('nano-banana')
   const baseUrl = credentials.baseUrl?.trim() || DEFAULT_BASE_URL
-  const model = credentials.model?.trim() || DEFAULT_MODEL
+  const model = options.trustedImageRoute?.modelId
+    ?? (credentials.model?.trim() || DEFAULT_MODEL)
 
   // 获取会话历史
   const history = sessionHistory.get(sessionId) ?? []
@@ -354,6 +368,10 @@ export interface PiNanoBananaToolsContext {
   sessionId: string
   agentCwd?: string
   allowedRoots?: string[]
+  /** Design Job 固化的可信模型，优先级高于全局凭据模型。 */
+  trustedImageRoute?: ImageGenerationModelSnapshot
+  /** 每次图片工具执行前实时复核可信模型。 */
+  assertTrustedImageRouteAvailable?: (route: ImageGenerationModelSnapshot) => void
 }
 
 function toPiToolResult(result: McpToolResult, toolUseId: string): AgentToolResult<NanoBananaToolResultDetails> {
@@ -384,7 +402,7 @@ export function buildPiNanoBananaTools(
 ): ToolDefinition[] {
   const toolState = getToolState('nano-banana')
   const credentials = getToolCredentials('nano-banana')
-  if (!toolState.enabled || !credentials.apiKey) return []
+  if ((!toolState.enabled && !ctx.trustedImageRoute) || !credentials.apiKey) return []
 
   return [sdk.defineTool({
     name: 'mcp__nano_banana__generate_image',
@@ -409,6 +427,8 @@ export function buildPiNanoBananaTools(
           cwd: ctx.agentCwd,
           allowedRoots: ctx.allowedRoots,
           numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
+          trustedImageRoute: ctx.trustedImageRoute,
+          assertTrustedImageRouteAvailable: ctx.assertTrustedImageRouteAvailable,
         })
         return toPiToolResult(result, toolCallId)
       } catch (error) {
