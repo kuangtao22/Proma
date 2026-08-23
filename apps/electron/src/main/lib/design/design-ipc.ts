@@ -496,6 +496,43 @@ function assertAuthorizedSender(event: IpcMainInvokeEvent, authorized: WebConten
   return event.sender
 }
 
+/** Renderer 可安全处理的模型目录与偏好业务错误前缀。 */
+const SAFE_IMAGE_MODEL_ERROR_PREFIXES = [
+  '生图模型 profiles ',
+  '生图模型 profile',
+  '生图模型不存在:',
+  '生图模型已停用:',
+  '生图模型执行器不受支持:',
+  'Nano Banana API Key 未配置:',
+  '生图模型目录 JSON 损坏',
+  '生图模型目录格式无效',
+  '生图模型目录 profiles ',
+  '不支持的生图模型目录 schemaVersion:',
+  'Design 项目生图模型偏好 JSON 损坏',
+  'Design 项目生图模型偏好格式无效',
+  'Design 项目生图模型偏好字段',
+  'Design 项目生图模型偏好 imageModelProfileId ',
+  'Design 项目生图模型偏好 updatedAt ',
+  '不支持的 Design 项目生图模型偏好 schemaVersion:',
+] as const
+
+/** 判断错误是否是无主进程路径和凭据的稳定模型业务错误。 */
+function isSafeImageModelBusinessError(error: unknown): error is Error {
+  return error instanceof Error
+    && SAFE_IMAGE_MODEL_ERROR_PREFIXES.some((prefix) => error.message.startsWith(prefix))
+}
+
+/** 隔离模型服务的底层诊断，只向 Renderer 返回稳定业务消息。 */
+function runImageModelOperation<Result>(operation: () => Result, failureMessage: string): Result {
+  try {
+    return operation()
+  } catch (error) {
+    if (isSafeImageModelBusinessError(error)) throw error
+    console.error(`[DesignIPC] ${failureMessage}:`, error)
+    throw new Error(failureMessage)
+  }
+}
+
 /** 向所有仍存活的授权窗口广播 revision 变化，包括发起窗口。 */
 function broadcastChange(options: DesignIpcOptions, change: DesignChangeEvent): void {
   for (const contents of options.listAuthorizedWebContents()) {
@@ -506,7 +543,12 @@ function broadcastChange(options: DesignIpcOptions, change: DesignChangeEvent): 
 /** 向全部仍存活授权窗口广播模型目录变化，不携带目录或凭据 payload。 */
 function broadcastImageModelProfilesChanged(options: DesignIpcOptions): void {
   for (const contents of options.listAuthorizedWebContents()) {
-    if (!contents.isDestroyed()) contents.send(DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED)
+    if (contents.isDestroyed()) continue
+    try {
+      contents.send(DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED)
+    } catch (error) {
+      console.error('[DesignIPC] 生图模型目录变化广播失败:', error)
+    }
   }
 }
 
@@ -516,7 +558,12 @@ function broadcastImageModelSelectionChanged(
   event: DesignImageModelSelectionChangeEvent,
 ): void {
   for (const contents of options.listAuthorizedWebContents()) {
-    if (!contents.isDestroyed()) contents.send(DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED, event)
+    if (contents.isDestroyed()) continue
+    try {
+      contents.send(DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED, event)
+    } catch (error) {
+      console.error('[DesignIPC] 项目生图模型选择变化广播失败:', error)
+    }
   }
 }
 
@@ -635,13 +682,20 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   options.ipc.handle(DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, async (event, value): Promise<ImageGenerationModelCatalogResult> => {
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     if (value !== undefined) throw new Error('Design 请求结构无效')
-    return options.imageModels.listCatalog()
+    return runImageModelOperation(
+      () => options.imageModels.listCatalog(),
+      '读取生图模型配置失败',
+    )
   })
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, async (event, value): Promise<ImageGenerationModelCatalogResult> => {
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseSaveImageModelProfilesInput(value)
-    const result = options.imageModels.replaceProfiles(input.profiles)
+    /** 保存结果先与广播解耦，窗口通知失败不得反向污染已提交目录。 */
+    const result = runImageModelOperation(
+      () => options.imageModels.replaceProfiles(input.profiles),
+      '保存生图模型配置失败',
+    )
     broadcastImageModelProfilesChanged(options)
     return result
   })
@@ -649,13 +703,19 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   options.ipc.handle(DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, async (event, value): Promise<DesignImageModelSelection> => {
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseProjectInput(value)
-    return options.imagePreferences.getSelection(input.projectId)
+    return runImageModelOperation(
+      () => options.imagePreferences.getSelection(input.projectId),
+      '读取项目生图模型选择失败',
+    )
   })
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, async (event, value): Promise<DesignImageModelSelection> => {
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseUpdateImageModelSelectionInput(value)
-    return options.imagePreferences.setSelection(input)
+    return runImageModelOperation(
+      () => options.imagePreferences.setSelection(input),
+      '保存项目生图模型选择失败',
+    )
   })
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.LOAD, async (event, value): Promise<DesignWorkspaceSnapshot> => {

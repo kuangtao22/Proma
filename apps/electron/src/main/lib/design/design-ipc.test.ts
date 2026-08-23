@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import {
   existsSync,
   mkdtempSync,
@@ -37,6 +37,10 @@ interface TestSender extends WebContents {
   sent: Array<{ channel: string; value: unknown }>
   destroyForTest: () => void
 }
+
+afterEach(() => {
+  mock.restore()
+})
 
 /** 创建最小可观察的 Design IPC 依赖。 */
 function createFixture(): {
@@ -287,6 +291,175 @@ describe('Design IPC', () => {
     expect(fixture.senders[0]?.sent.filter(
       (event) => event.channel === DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED,
     )).toHaveLength(1)
+  })
+
+  test('Given 一个授权窗口广播失败 When 保存模型目录 Then 保存成功且其它窗口仍收到事件', async () => {
+    const fixture = createFixture()
+    /** 模拟目录保存成功后的公开返回值。 */
+    const catalogResult = {
+      profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
+    }
+    fixture.options.imageModels.replaceProfiles = () => catalogResult
+    /** 首个窗口只在模型目录广播时模拟 Electron send 异常。 */
+    fixture.senders[0]!.send = (channel: string, value: unknown): void => {
+      if (channel === DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED) {
+        throw new Error('窗口发送失败')
+      }
+      fixture.senders[0]!.sent.push({ channel, value })
+    }
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+    registerDesignIpcHandlers(fixture.options)
+
+    const result = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES,
+      fixture.senders[0]!,
+      { profiles: [] },
+    )
+
+    expect(result).toEqual(catalogResult)
+    expect(fixture.senders[1]!.sent).toContainEqual({
+      channel: DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED,
+      value: undefined,
+    })
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[DesignIPC] 生图模型目录变化广播失败:',
+      expect.objectContaining({ message: '窗口发送失败' }),
+    )
+  })
+
+  test('Given 一个授权窗口的选择广播失败 When 偏好变化 Then 其它窗口仍收到项目事件', () => {
+    const fixture = createFixture()
+    /** 捕获偏好服务注册的唯一 IPC 广播监听器。 */
+    let preferenceChanged: ((event: DesignImageModelSelectionChangeEvent) => void) | undefined
+    fixture.options.imagePreferences.onChanged = (listener) => {
+      preferenceChanged = listener
+      return () => { preferenceChanged = undefined }
+    }
+    /** 首个窗口仅拒绝项目选择事件，模拟窗口销毁竞态中的 send 异常。 */
+    fixture.senders[0]!.send = (channel: string, value: unknown): void => {
+      if (channel === DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED) {
+        throw new Error('选择广播发送失败')
+      }
+      fixture.senders[0]!.sent.push({ channel, value })
+    }
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+    registerDesignIpcHandlers(fixture.options)
+
+    preferenceChanged?.({ projectId: 'project-1' })
+
+    expect(fixture.senders[1]!.sent).toContainEqual({
+      channel: DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED,
+      value: { projectId: 'project-1' },
+    })
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[DesignIPC] 项目生图模型选择变化广播失败:',
+      expect.objectContaining({ message: '选择广播发送失败' }),
+    )
+  })
+
+  test('Given 模型 handler 遇到低层文件错误 When 调用 Then 记录原始诊断且仅返回稳定中文错误', async () => {
+    const fixture = createFixture()
+    /** 四类底层异常分别覆盖目录读取、目录保存、偏好读取和原子写失败。 */
+    const rawErrors = [
+      Object.assign(new Error('EISDIR: illegal operation on a directory, read /Users/xutaoyu/.proma/image-generation-models.json'), { code: 'EISDIR' }),
+      Object.assign(new Error('EACCES: permission denied, open /Users/xutaoyu/.proma/image-generation-models.json'), { code: 'EACCES' }),
+      Object.assign(new Error('EISDIR: illegal operation on a directory, read /Users/xutaoyu/.proma/design-cache/project-1/preferences.json'), { code: 'EISDIR' }),
+      Object.assign(new Error('EIO: atomic rename failed /Users/xutaoyu/.proma/design-cache/project-1/preferences.json.tmp'), { code: 'EIO' }),
+    ]
+    fixture.options.imageModels.listCatalog = () => { throw rawErrors[0] }
+    fixture.options.imageModels.replaceProfiles = () => { throw rawErrors[1] }
+    fixture.options.imagePreferences.getSelection = () => { throw rawErrors[2] }
+    fixture.options.imagePreferences.setSelection = () => { throw rawErrors[3] }
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+    registerDesignIpcHandlers(fixture.options)
+    /** 每个公开操作固定映射自己的业务错误，不共享含路径的底层消息。 */
+    const cases: Array<{
+      invokeOperation: () => Promise<unknown>
+      expectedMessage: string
+      rawError: Error
+    }> = [
+      {
+        invokeOperation: () => invoke(fixture.handlers, DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, fixture.senders[0]!),
+        expectedMessage: '读取生图模型配置失败',
+        rawError: rawErrors[0]!,
+      },
+      {
+        invokeOperation: () => invoke(fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, fixture.senders[0]!, { profiles: [] }),
+        expectedMessage: '保存生图模型配置失败',
+        rawError: rawErrors[1]!,
+      },
+      {
+        invokeOperation: () => invoke(fixture.handlers, DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, fixture.senders[0]!, { projectId: 'project-1' }),
+        expectedMessage: '读取项目生图模型选择失败',
+        rawError: rawErrors[2]!,
+      },
+      {
+        invokeOperation: () => invoke(fixture.handlers, DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, fixture.senders[0]!, {
+          projectId: 'project-1', imageModelProfileId: 'profile-flash',
+        }),
+        expectedMessage: '保存项目生图模型选择失败',
+        rawError: rawErrors[3]!,
+      },
+    ]
+
+    for (const testCase of cases) {
+      /** 捕获实际 IPC rejection，直接检查消息没有泄露配置根。 */
+      const rejection = await testCase.invokeOperation().then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      expect(rejection).toBeInstanceOf(Error)
+      if (!(rejection instanceof Error)) throw new Error('测试预期 IPC 返回 Error')
+      expect(rejection.message).toBe(testCase.expectedMessage)
+      expect(rejection.message).not.toContain('/Users')
+      expect(rejection.message).not.toContain('xutaoyu')
+      expect(rejection.message).not.toContain('.proma')
+      expect(errorSpy).toHaveBeenCalledWith(
+        `[DesignIPC] ${testCase.expectedMessage}:`,
+        testCase.rawError,
+      )
+    }
+  })
+
+  test('Given 模型目录或偏好的安全业务错误 When 调用 Then 保持原错误供 Renderer 处理', async () => {
+    const fixture = createFixture()
+    /** 业务错误均来自严格 schema 或模型可用性校验，不包含主进程路径。 */
+    const businessErrors = {
+      list: new Error('不支持的生图模型目录 schemaVersion: 2'),
+      save: new Error('生图模型 profile[0] 字段不完整或包含未知字段'),
+      get: new Error('Design 项目生图模型偏好 JSON 损坏'),
+      missing: new Error('生图模型不存在: missing'),
+      disabled: new Error('生图模型已停用: disabled'),
+    }
+    fixture.options.imageModels.listCatalog = () => { throw businessErrors.list }
+    fixture.options.imageModels.replaceProfiles = () => { throw businessErrors.save }
+    fixture.options.imagePreferences.getSelection = () => { throw businessErrors.get }
+    fixture.options.imagePreferences.setSelection = () => { throw businessErrors.missing }
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+    registerDesignIpcHandlers(fixture.options)
+
+    await expect(invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, fixture.senders[0]!,
+    )).rejects.toThrow(businessErrors.list.message)
+    await expect(invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, fixture.senders[0]!, { profiles: [] },
+    )).rejects.toThrow(businessErrors.save.message)
+    await expect(invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, fixture.senders[0]!, { projectId: 'project-1' },
+    )).rejects.toThrow(businessErrors.get.message)
+    await expect(invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, fixture.senders[0]!, {
+        projectId: 'project-1', imageModelProfileId: 'missing',
+      },
+    )).rejects.toThrow(businessErrors.missing.message)
+    fixture.options.imagePreferences.setSelection = () => { throw businessErrors.disabled }
+    await expect(invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, fixture.senders[0]!, {
+        projectId: 'project-1', imageModelProfileId: 'disabled',
+      },
+    )).rejects.toThrow(businessErrors.disabled.message)
+    expect(errorSpy).not.toHaveBeenCalled()
   })
 
   test('Given 未授权或夹带字段的模型请求 When 调用 Then 在目录和偏好服务前拒绝', async () => {

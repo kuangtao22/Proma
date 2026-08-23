@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { ImageGenerationModelOption, ImageGenerationModelSnapshot } from '@proma/shared'
+import type { ImageGenerationModelOption } from '@proma/shared'
 import { DesignImageModelPreferences } from './design-image-model-preferences'
 import type { DesignPaths } from './design-paths'
 
@@ -10,6 +10,7 @@ import type { DesignPaths } from './design-paths'
 const temporaryRoots: string[] = []
 
 afterEach(() => {
+  mock.restore()
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
@@ -44,16 +45,6 @@ function createOption(profileId: string, available = true): ImageGenerationModel
   }
 }
 
-/** 创建只暴露公开模型字段的任务快照。 */
-function createSnapshot(profileId: string): ImageGenerationModelSnapshot {
-  return {
-    profileId,
-    name: `模型 ${profileId}`,
-    executor: 'nano-banana',
-    modelId: `model-${profileId}`,
-  }
-}
-
 /** 创建带项目隔离路径和可变 Catalog 的偏好服务 fixture。 */
 function createFixture(options: ImageGenerationModelOption[]) {
   /** 本用例独立的配置根。 */
@@ -66,12 +57,6 @@ function createFixture(options: ImageGenerationModelOption[]) {
     pathResolver: { resolve: (projectId) => createPaths(root, projectId) },
     imageModels: {
       listOptions: () => currentOptions.map((option) => ({ ...option })),
-      resolveAvailableSnapshot: (profileId) => {
-        /** 只有当前 available 选项可解析为快照。 */
-        const option = currentOptions.find((candidate) => candidate.profileId === profileId)
-        if (!option?.available) throw new Error(`生图模型不可用: ${profileId}`)
-        return createSnapshot(profileId)
-      },
     },
     now: () => 123,
   })
@@ -202,7 +187,6 @@ describe('Design 项目生图模型偏好', () => {
       pathResolver: { resolve: (projectId) => createPaths(fixture.root, projectId) },
       imageModels: {
         listOptions: () => [createOption('profile-a')],
-        resolveAvailableSnapshot: () => createSnapshot('profile-a'),
       },
       now: () => Number.NaN,
     })
@@ -215,5 +199,64 @@ describe('Design 项目生图模型偏好', () => {
     })).toThrow('updatedAt')
     expect(existsSync(createPaths(fixture.root, 'project-a').preferencesPath)).toBe(false)
     expect(events).toEqual([])
+  })
+
+  test('Given 首个变化监听器抛错 When 设置 Then 提交仍成功且继续通知后续监听器', () => {
+    const fixture = createFixture([createOption('profile-a')])
+    const service = fixture.createService()
+    /** 隔离主进程预期日志，避免失败监听器污染测试输出。 */
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+    /** 后续监听器收到的项目事件，用于证明单个订阅者不会中断广播。 */
+    const receivedEvents: Array<{ projectId: string }> = []
+    service.onChanged(() => { throw new Error('监听器测试失败') })
+    service.onChanged((event) => receivedEvents.push(event))
+
+    const selection = service.setSelection({
+      projectId: 'project-a',
+      imageModelProfileId: 'profile-a',
+    })
+
+    expect(selection).toEqual({
+      projectId: 'project-a',
+      options: [createOption('profile-a')],
+      selectedProfileId: 'profile-a',
+    })
+    expect(receivedEvents).toEqual([{ projectId: 'project-a' }])
+    expect(JSON.parse(readFileSync(createPaths(fixture.root, 'project-a').preferencesPath, 'utf8')))
+      .toMatchObject({ imageModelProfileId: 'profile-a' })
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[DesignImageModelPreferences] 生图模型选择变化监听器执行失败:',
+      expect.objectContaining({ message: '监听器测试失败' }),
+    )
+    errorSpy.mockRestore()
+  })
+
+  test('Given Catalog 后续读取会失败 When 设置 Then 只读一次选项并返回提交前构造的选择', () => {
+    const fixture = createFixture([createOption('profile-a'), createOption('profile-b')])
+    /** 记录公开选项读取次数，第二次读取代表提交后发生了不安全回读。 */
+    let listOptionsCalls = 0
+    const service = new DesignImageModelPreferences({
+      pathResolver: { resolve: (projectId) => createPaths(fixture.root, projectId) },
+      imageModels: {
+        listOptions: () => {
+          listOptionsCalls += 1
+          if (listOptionsCalls > 1) throw new Error('提交后不应重新读取 Catalog')
+          return [createOption('profile-a'), createOption('profile-b')]
+        },
+      },
+      now: () => 123,
+    })
+
+    const selection = service.setSelection({
+      projectId: 'project-a',
+      imageModelProfileId: 'profile-b',
+    })
+
+    expect(selection).toEqual({
+      projectId: 'project-a',
+      options: [createOption('profile-a'), createOption('profile-b')],
+      selectedProfileId: 'profile-b',
+    })
+    expect(listOptionsCalls).toBe(1)
   })
 })

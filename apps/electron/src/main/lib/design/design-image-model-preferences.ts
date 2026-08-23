@@ -21,7 +21,7 @@ interface DesignProjectPreferencesFile {
 /** 项目生图模型偏好服务所需的窄依赖。 */
 export interface DesignImageModelPreferencesDependencies {
   pathResolver: Pick<DesignPathResolver, 'resolve'>
-  imageModels: Pick<ImageGenerationModelCatalog, 'listOptions' | 'resolveAvailableSnapshot'>
+  imageModels: Pick<ImageGenerationModelCatalog, 'listOptions'>
   now?: () => number
 }
 
@@ -70,13 +70,28 @@ export class DesignImageModelPreferences {
    * @returns 保存后的公开选择状态。
    */
   setSelection(input: UpdateDesignImageModelSelectionInput): DesignImageModelSelection {
-    /** 解析可用快照确保 Renderer 不能持久化伪造、停用或失效 profile。 */
-    this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId)
     /** 项目偏好只写入该项目受信任的缓存路径。 */
     const paths = this.dependencies.pathResolver.resolve(input.projectId)
     if (existsSync(paths.preferencesPath)) {
       /** 覆盖前先验证当前主文件，损坏事实必须由用户显式处理。 */
       readPreferencesFile(paths.preferencesPath)
+    }
+    /** 单次 Catalog 快照同时用于可用性校验和成功返回，避免提交后再次读取配置或凭据。 */
+    const options = this.dependencies.imageModels.listOptions().map((option) => ({ ...option }))
+    /** Renderer 只能选择当前目录中存在且可用的公开 profile。 */
+    const selectedOption = options.find((option) => option.profileId === input.imageModelProfileId)
+    if (!selectedOption) throw new Error(`生图模型不存在: ${input.imageModelProfileId}`)
+    if (!selectedOption.available) {
+      /** 保持目录服务既有的稳定业务错误，供 IPC 安全透传。 */
+      const reason = selectedOption.unavailableReason ?? '生图模型不可用'
+      if (reason === '模型已停用') throw new Error(`生图模型已停用: ${input.imageModelProfileId}`)
+      throw new Error(`${reason}: ${input.imageModelProfileId}`)
+    }
+    /** 返回值在持久化前完整构造，提交后不再执行可能失败的配置读取。 */
+    const selection: DesignImageModelSelection = {
+      projectId: input.projectId,
+      options,
+      selectedProfileId: selectedOption.profileId,
     }
     /** 写入前确认时间戳满足持久化 schema，避免先落盘再在回读时报错。 */
     const updatedAt = (this.dependencies.now ?? Date.now)()
@@ -93,8 +108,14 @@ export class DesignImageModelPreferences {
     writeJsonFileAtomic(paths.preferencesPath, preferences)
     /** 写入成功后才通知窗口，失败路径不会产生伪变化事件。 */
     const event: DesignImageModelSelectionChangeEvent = { projectId: input.projectId }
-    for (const listener of this.listeners) listener(event)
-    return this.getSelection(input.projectId)
+    for (const listener of this.listeners) {
+      try {
+        listener(event)
+      } catch (error) {
+        console.error('[DesignImageModelPreferences] 生图模型选择变化监听器执行失败:', error)
+      }
+    }
+    return selection
   }
 
   /**
