@@ -24,6 +24,7 @@ import {
   type AgentIslandPlanQuotaSnapshot,
   type NativeAgentIslandEvent,
   type NativeAgentIslandSnapshot,
+  type LanBridgeAgentSessionRuntimeStatus,
 } from '@proma/shared'
 import type { AgentStreamPayload } from '@proma/shared'
 import { agentEventBus } from './agent-service'
@@ -38,6 +39,10 @@ import { getWindowsAgentIslandSurface } from './windows-agent-island-surface'
 import { listCalendarEvents, listTodos } from './planning-manager'
 import { onPlanningChanged } from './planning-events'
 import { getChannelPlanQuota, listChannels } from './channel-manager'
+import {
+  markAgentIslandRuntimeViewed,
+  projectAgentIslandRuntimeStatus,
+} from './agent-island-runtime-status'
 
 /** 会话快照保留的最大活动行数 */
 const MAX_ACTIVITY_LINES = 6
@@ -820,14 +825,18 @@ export function initAgentIslandService(deps: AgentIslandServiceDeps): void {
  * 完成和异常态的未读由主进程管理；主应用确认用户已经看过后，在此统一清除。
  * 待接手会话仍保持 attention，直到用户实际完成权限确认、回答或计划审批。
  */
-export function markAgentIslandSessionViewed(sessionId: string): void {
+export function markAgentIslandSessionViewed(sessionId: string): boolean {
   const session = sessions.get(sessionId)
-  if (!session || (session.phase !== 'completed' && session.phase !== 'error')) return
-  if (session.phase === 'completed' && !session.unread) return
-  if (!session.attention && !session.unread) return
-  session.unread = false
-  session.attention = false
+  if (!markAgentIslandRuntimeViewed(session)) return false
   schedulePush()
+  return true
+}
+
+/** 查询指定会话供 LAN Bridge 使用的实时四态。 */
+export function getAgentIslandSessionRuntimeStatus(
+  sessionId: string,
+): LanBridgeAgentSessionRuntimeStatus {
+  return projectAgentIslandRuntimeStatus(sessions.get(sessionId))
 }
 
 function openAgentIslandSession(sessionId: string): void {

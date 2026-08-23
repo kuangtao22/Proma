@@ -13,6 +13,7 @@
 ## 文件结构
 
 - `packages/shared/src/types/lan-bridge.ts`：增加 LAN Agent 四态类型和 DTO 字段。
+- `apps/electron/src/main/lib/agent-island-runtime-status.ts`：将 Agent Island 内部快照纯投影为 LAN 四态，并清除完成未读。
 - `apps/electron/src/main/lib/agent-island-service.ts`：提供四态只读查询和可观察的“已查看”结果。
 - `apps/electron/src/main/lib/lan-bridge/lan-bridge-proma-adapter-core.ts`：映射星标/状态并封装星标切换与已查看操作。
 - `apps/electron/src/main/lib/lan-bridge/lan-bridge-proma-adapter.ts`：将会话元数据更新和 Agent Island 状态绑定到 Adapter。
@@ -116,59 +117,57 @@ git commit -m "功能：扩展手机端会话状态快照"
 ### Task 2: 暴露主进程四态并广播生命周期
 
 **Files:**
+- Create: `apps/electron/src/main/lib/agent-island-runtime-status.ts`
+- Create: `apps/electron/src/main/lib/agent-island-runtime-status.test.ts`
 - Modify: `apps/electron/src/main/lib/agent-island-service.ts`
-- Create: `apps/electron/src/main/lib/agent-island-service.test.ts`
 - Modify: `apps/electron/src/main/lib/lan-bridge/lan-bridge-subscription.ts`
 - Modify: `apps/electron/src/main/lib/lan-bridge/lan-bridge-subscription.test.ts`
 - Modify: `apps/electron/src/main/lib/lan-bridge/lan-bridge.ts`
 
-- [ ] **Step 1: 写 Agent Island 四态查询失败测试**
+- [ ] **Step 1: 写 Agent Island 四态投影失败测试**
 
-通过现有测试事件入口依次发送 `run_started`、`permission_request`、`permission_resolved`、成功 `result` 和 `markAgentIslandSessionViewed`，断言：
+对纯状态快照断言四态和清除完成未读行为：
 
 ```ts
-expect(getAgentIslandSessionRuntimeStatus('session-1')).toBe('running')
-expect(getAgentIslandSessionRuntimeStatus('session-1')).toBe('blocked')
-expect(getAgentIslandSessionRuntimeStatus('session-1')).toBe('running')
-expect(getAgentIslandSessionRuntimeStatus('session-1')).toBe('completed')
-expect(markAgentIslandSessionViewed('session-1')).toBe(true)
-expect(getAgentIslandSessionRuntimeStatus('session-1')).toBe('idle')
-expect(markAgentIslandSessionViewed('session-1')).toBe(false)
+expect(projectAgentIslandRuntimeStatus({ phase: 'running', unread: false })).toBe('running')
+expect(projectAgentIslandRuntimeStatus({ phase: 'needs-interaction', unread: false })).toBe('blocked')
+expect(projectAgentIslandRuntimeStatus({ phase: 'completed', unread: true })).toBe('completed')
+expect(projectAgentIslandRuntimeStatus({ phase: 'error', unread: true })).toBe('completed')
+expect(projectAgentIslandRuntimeStatus({ phase: 'completed', unread: false })).toBe('idle')
+
+const completed = { phase: 'completed' as const, unread: true, attention: true }
+expect(markAgentIslandRuntimeViewed(completed)).toBe(true)
+expect(completed).toEqual({ phase: 'completed', unread: false, attention: false })
+expect(markAgentIslandRuntimeViewed(completed)).toBe(false)
 ```
 
 - [ ] **Step 2: 运行测试并确认缺少查询 API**
 
-Run: `bun test apps/electron/src/main/lib/agent-island-service.test.ts`
+Run: `bun test apps/electron/src/main/lib/agent-island-runtime-status.test.ts`
 
-Expected: FAIL，提示 `getAgentIslandSessionRuntimeStatus` 不存在或 `markAgentIslandSessionViewed` 没有布尔返回值。
+Expected: FAIL，提示纯投影模块不存在。
 
 - [ ] **Step 3: 实现四态查询与已查看返回值**
 
 ```ts
-export function getAgentIslandSessionRuntimeStatus(
-  sessionId: string,
+export function projectAgentIslandRuntimeStatus(
+  session: AgentIslandRuntimeState | undefined,
 ): LanBridgeAgentSessionRuntimeStatus {
-  const session = sessions.get(sessionId)
-  if (!session) return 'idle'
-  if (session.phase === 'needs-interaction') return 'blocked'
-  if (session.phase === 'running') return 'running'
-  if ((session.phase === 'completed' || session.phase === 'error') && session.unread) {
-    return 'completed'
-  }
+  if (session?.phase === 'needs-interaction') return 'blocked'
+  if (session?.phase === 'running') return 'running'
+  if ((session?.phase === 'completed' || session?.phase === 'error') && session.unread) return 'completed'
   return 'idle'
 }
 
-export function markAgentIslandSessionViewed(sessionId: string): boolean {
-  const session = sessions.get(sessionId)
-  if (!session || (session.phase !== 'completed' && session.phase !== 'error') || !session.unread) {
-    return false
-  }
+export function markAgentIslandRuntimeViewed(session: AgentIslandRuntimeState | undefined): boolean {
+  if (!session || (session.phase !== 'completed' && session.phase !== 'error') || !session.unread) return false
   session.unread = false
   session.attention = false
-  schedulePush()
   return true
 }
 ```
+
+`agent-island-service.ts` 的公开查询把内部 Map 项交给 `projectAgentIslandRuntimeStatus`；现有 `markAgentIslandSessionViewed` 委托 `markAgentIslandRuntimeViewed`，仅在返回 `true` 时调度推送。
 
 - [ ] **Step 4: 写 LAN 全局状态广播失败测试**
 
@@ -216,14 +215,14 @@ function affectsAgentRuntimeStatus(payload: AgentStreamPayload): boolean {
 
 - [ ] **Step 7: 绑定 Adapter 状态读取器并运行两组测试**
 
-Run: `bun test apps/electron/src/main/lib/agent-island-service.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-subscription.test.ts`
+Run: `bun test apps/electron/src/main/lib/agent-island-runtime-status.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-subscription.test.ts`
 
 Expected: PASS。
 
 - [ ] **Step 8: 提交主进程状态广播**
 
 ```bash
-git add apps/electron/src/main/lib/agent-island-service.ts apps/electron/src/main/lib/agent-island-service.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-subscription.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-subscription.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge.ts
+git add apps/electron/src/main/lib/agent-island-runtime-status.ts apps/electron/src/main/lib/agent-island-runtime-status.test.ts apps/electron/src/main/lib/agent-island-service.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-subscription.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-subscription.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge.ts
 git commit -m "功能：广播 Agent 会话实时状态"
 ```
 
@@ -410,7 +409,7 @@ git commit -m "功能：展示手机端会话状态与星标"
 
 - [ ] **Step 1: 运行全部相关 LAN 与移动端测试**
 
-Run: `bun test apps/electron/src/main/lib/agent-island-service.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-proma-adapter.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-handlers.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-subscription.test.ts apps/mobile/src/lib/session-runtime-state.test.ts apps/mobile/src/components/conversation/AgentSessionRow.test.tsx apps/mobile/src/components/layout/Drawer.test.tsx apps/mobile/src/components/conversation/ChatView.test.tsx apps/mobile/src/components/conversation/InputBar.test.tsx`
+Run: `bun test apps/electron/src/main/lib/agent-island-runtime-status.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-proma-adapter.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-handlers.test.ts apps/electron/src/main/lib/lan-bridge/lan-bridge-subscription.test.ts apps/mobile/src/lib/session-runtime-state.test.ts apps/mobile/src/components/conversation/AgentSessionRow.test.tsx apps/mobile/src/components/layout/Drawer.test.tsx apps/mobile/src/components/conversation/ChatView.test.tsx apps/mobile/src/components/conversation/InputBar.test.tsx`
 
 Expected: PASS，零失败。
 

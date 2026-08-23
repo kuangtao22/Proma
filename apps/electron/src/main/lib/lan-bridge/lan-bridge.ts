@@ -216,7 +216,7 @@ async function performStartLanBridge(
     // 启动 EventBus 订阅
     if (bus) {
       eventBus = bus
-      startSubscription(bus)
+      startSubscription(bus, sessionId => lanBridgePromaAdapter.getAgentSessionRuntimeStatus(sessionId))
     }
 
     status = 'running'
