@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -182,6 +182,45 @@ describe('Design Job Manager', () => {
     const persisted = JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${job.id}.json`), 'utf8'))
     expect(persisted.imageModelSnapshot).toEqual(job.imageModelSnapshot)
     expect(JSON.stringify(persisted)).not.toContain('apiKey')
+  })
+
+  test('Given queued 任务的模型配置已失效 When 执行任务 Then 明确失败且不创建 Agent 会话', async () => {
+    const job = harness.manager.create(createGenerateInput())
+    harness.assertSnapshotAvailable = () => { throw new Error('生图模型已停用，请重新选择') }
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'failed',
+      error: '生图模型已停用，请重新选择',
+      imageModelSnapshot: job.imageModelSnapshot,
+    })
+    expect(harness.createdSessions).toEqual([])
+    expect(harness.sessionUpdates).toEqual([])
+    expect(harness.runInputs).toEqual([])
+  })
+
+  test('Given 旧 queued journal 没有模型快照 When 执行任务 Then 明确失败且不创建 Agent 会话', async () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    document.nodes = [{
+      id: 'node-legacy', kind: 'job', jobId: 'job-legacy', position: { x: 0, y: 0 },
+      width: 320, height: 240, zIndex: 0,
+    }]
+    writeFileSync(join(jobsDirectory, 'job-legacy.json'), JSON.stringify({
+      id: 'job-legacy', projectId: 'project-1', action: 'generate', status: 'queued',
+      prompt: '旧任务', nodeId: 'node-legacy', position: { x: 0, y: 0 },
+      placementState: 'ready', createdAt: 1, updatedAt: 1,
+    }))
+
+    await harness.manager.run('job-legacy')
+
+    expect(harness.manager.get('job-legacy')).toMatchObject({
+      status: 'failed',
+      error: '旧任务未记录生图模型，请重新提交新任务',
+    })
+    expect(harness.createdSessions).toEqual([])
+    expect(harness.runInputs).toEqual([])
   })
 
   test('Given journal 含越界 ID、错名 payload 和损坏 schema When 恢复 Then 全部忽略且无文件或 Store 副作用', () => {
@@ -378,6 +417,96 @@ describe('Design Job Manager', () => {
     ))).toBe(true)
   })
 
+  test('Given 失败任务固化模型 B When 当前目录改为模型 A 后重试 Then replacement 继续复制模型 B', async () => {
+    harness.resolveAvailableSnapshot = (profileId) => ({
+      profileId, name: '高质量模型', executor: 'nano-banana', modelId: 'gemini-pro-image',
+    })
+    harness.messages = []
+    const original = harness.manager.create({ ...createGenerateInput(), imageModelProfileId: 'profile-b' })
+    await harness.manager.run(original.id)
+    harness.resolveAvailableSnapshot = () => {
+      throw new Error('重试不应重新读取当前模型目录')
+    }
+
+    const replacement = harness.manager.retry('project-1', original.id)
+
+    expect(replacement.imageModelSnapshot).toEqual(original.imageModelSnapshot)
+    expect(replacement.imageModelSnapshot?.profileId).toBe('profile-b')
+  })
+
+  test('Given replacement 已复制原模型但配置随后失效 When 执行 Then replacement 失败且不创建新会话', async () => {
+    harness.messages = []
+    const original = harness.manager.create(createGenerateInput())
+    await harness.manager.run(original.id)
+    const replacement = harness.manager.retry('project-1', original.id)
+    const originalSnapshot = original.imageModelSnapshot
+    if (!originalSnapshot) throw new Error('新任务必须固化生图模型快照')
+    harness.assertSnapshotAvailable = (snapshot) => {
+      expect(snapshot).toEqual(originalSnapshot)
+      throw new Error('生图模型快照与当前配置不一致: profile-test')
+    }
+
+    await harness.manager.run(replacement.id)
+
+    expect(harness.manager.get(replacement.id)).toMatchObject({
+      status: 'failed',
+      error: '生图模型快照与当前配置不一致: profile-test',
+      imageModelSnapshot: originalSnapshot,
+    })
+    expect(harness.createdSessions).toHaveLength(1)
+    expect(harness.runInputs).toHaveLength(1)
+  })
+
+  test('Given 旧 failed journal 没有模型快照 When 请求重试 Then 不创建 replacement 或其它副作用', () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    document.nodes = [{
+      id: 'node-legacy', kind: 'job', jobId: 'job-legacy', position: { x: 0, y: 0 },
+      width: 320, height: 240, zIndex: 0,
+    }]
+    writeFileSync(join(jobsDirectory, 'job-legacy.json'), JSON.stringify({
+      id: 'job-legacy', projectId: 'project-1', action: 'generate', status: 'failed',
+      prompt: '旧任务', nodeId: 'node-legacy', position: { x: 0, y: 0 },
+      placementState: 'ready', error: '旧失败', createdAt: 1, updatedAt: 2,
+    }))
+
+    expect(() => harness.manager.retry('project-1', 'job-legacy'))
+      .toThrow('旧任务未记录生图模型，请重新提交')
+
+    expect(harness.manager.list('project-1')).toHaveLength(1)
+    expect(readdirSync(jobsDirectory)).toEqual(['job-legacy.json'])
+    expect(JSON.parse(readFileSync(join(jobsDirectory, 'job-legacy.json'), 'utf8'))).not.toHaveProperty('retryState')
+    expect(document.revision).toBe(0)
+    expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: 'job-legacy' })
+    expect(harness.createdSessions).toEqual([])
+    expect(harness.runInputs).toEqual([])
+  })
+
+  test('Given 旧 journal 留下 retry intent 但没有模型快照 When 自动恢复 Then 不补建 replacement', () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    document.nodes = [{
+      id: 'node-legacy', kind: 'job', jobId: 'job-legacy', position: { x: 0, y: 0 },
+      width: 320, height: 240, zIndex: 0,
+    }]
+    writeFileSync(join(jobsDirectory, 'job-legacy.json'), JSON.stringify({
+      id: 'job-legacy', projectId: 'project-1', action: 'generate', status: 'failed',
+      prompt: '旧任务', nodeId: 'node-legacy', position: { x: 0, y: 0 },
+      placementState: 'ready', replacedByJobId: 'job-replacement',
+      retryState: { status: 'pending' }, error: '旧失败', createdAt: 1, updatedAt: 2,
+    }))
+
+    const recovered = harness.manager.recover('project-1')
+
+    expect(recovered).toHaveLength(1)
+    expect(recovered[0]).toMatchObject({ id: 'job-legacy', status: 'failed' })
+    expect(readdirSync(jobsDirectory)).toEqual(['job-legacy.json'])
+    expect(document.revision).toBe(0)
+    expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: 'job-legacy' })
+    expect(harness.createdSessions).toEqual([])
+    expect(harness.warnings[0]).toContain('旧任务未记录生图模型，请重新提交')
+  })
+
   test('Given 同一失败任务被重复重试 When 请求到达 Then 幂等返回唯一 replacement 且只运行一个会话', async () => {
     harness.messages = []
     const original = harness.manager.create(createGenerateInput())
@@ -458,6 +587,10 @@ describe('Design Job Manager', () => {
       action: 'generate', status: 'failed', prompt: '崩溃前重试', nodeId: 'node-old',
       position: { x: 0, y: 0 }, placementState: 'ready', replacedByJobId: 'job-2',
       retryState: { status: 'pending' }, error: '旧任务失败', createdAt: 1, updatedAt: 2,
+      imageModelSnapshot: {
+        profileId: 'profile-test', name: '测试生图模型',
+        executor: 'nano-banana', modelId: 'image-model-test',
+      },
     }))
     /** 丢弃旧进程内存索引，使用同一磁盘与 Store 创建真正的新 Manager。 */
     harness = createHarness()
@@ -508,7 +641,7 @@ describe('Design Job Manager', () => {
     expect(harness.importSources).toEqual([])
   })
 
-  test('Given 上次进程留下 running job When 恢复 Then 标记 interrupted 且允许重试', () => {
+  test('Given 上次进程留下无模型快照的 running job When 恢复 Then 标记 interrupted 但禁止重试', () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
     document.nodes = [{
@@ -524,10 +657,9 @@ describe('Design Job Manager', () => {
     const recovered = harness.manager.recover('project-1')
 
     expect(recovered[0]?.status).toBe('interrupted')
-    expect(harness.manager.retry('project-1', 'job-running')).toMatchObject({
-      status: 'queued',
-      prompt: '旧任务',
-    })
+    expect(() => harness.manager.retry('project-1', 'job-running'))
+      .toThrow('旧任务未记录生图模型，请重新提交')
+    expect(harness.createdSessions).toEqual([])
   })
 
   test('Given 上次进程留下 queued 和未落占位的 pending journal When 恢复 Then queued 标记 interrupted 且孤立 pending 被删除', () => {
@@ -584,6 +716,7 @@ describe('Design Job Manager', () => {
       throwOnRetryFinalizeWrite: boolean
       throwAfterReplacementJournalWrite: boolean
       resolveAvailableSnapshot: (profileId: string) => ImageGenerationModelSnapshot
+      assertSnapshotAvailable: (snapshot: ImageGenerationModelSnapshot) => void
     } = {
       settings: { agentChannelId: 'channel-default', agentModelId: 'model-default' },
       messages: [] as AgentMessage[],
@@ -599,12 +732,14 @@ describe('Design Job Manager', () => {
       resolveAvailableSnapshot: (profileId) => ({
         profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
       }),
+      assertSnapshotAvailable: () => undefined,
     }
     const createdSessions: AgentSessionMeta[] = []
     const sessionUpdates: Array<{ sessionId: string; updates: Record<string, unknown> }> = []
     const stoppedSessions: string[] = []
     const importSources: DesignAssetImportSource[] = []
     const runInputs: Array<Record<string, unknown>> = []
+    const warnings: string[] = []
     /** 真实 lease registry 用于验证迁移无法插入 output 提交窗口。 */
     const workspaceRegistry = createWorkspaceOperationRegistry()
     let workspaceWriteDepth = 0
@@ -667,7 +802,10 @@ describe('Design Job Manager', () => {
           return batch
         },
       },
-      resolveAvailableSnapshot: (profileId) => state.resolveAvailableSnapshot(profileId),
+      imageModels: {
+        resolveAvailableSnapshot: (profileId) => state.resolveAvailableSnapshot(profileId),
+        assertSnapshotAvailable: (snapshot) => state.assertSnapshotAvailable(snapshot),
+      },
       getSettings: () => state.settings,
       getSession: (sessionId) => createdSessions.find((session) => session.id === sessionId),
       createSession: (title, channelId, projectId, modelId) => {
@@ -702,6 +840,7 @@ describe('Design Job Manager', () => {
         localPath.startsWith(`${sessionId}/`) ? `/trusted/${localPath}` : undefined
       ),
       listProjectIds: () => ['project-1'],
+      warn: (message) => { warnings.push(message) },
       runWorkspaceWrite: <T>(projectId: string, effect: () => T): T => {
         const release = workspaceRegistry.acquireWorkspaceWriteLease(projectId)
         workspaceWriteDepth += 1
@@ -757,6 +896,7 @@ describe('Design Job Manager', () => {
       stoppedSessions,
       importSources,
       runInputs,
+      warnings,
       changedEvents,
       outputEffects,
       unguardedOutputEffects,
@@ -785,6 +925,9 @@ describe('Design Job Manager', () => {
       set resolveAvailableSnapshot(value: typeof state.resolveAvailableSnapshot) {
         state.resolveAvailableSnapshot = value
       },
+      set assertSnapshotAvailable(value: typeof state.assertSnapshotAvailable) {
+        state.assertSnapshotAvailable = value
+      },
     }
   }
 })
@@ -811,9 +954,12 @@ function createMultiProjectRecoveryManager(projectBJobs: string, warnings: strin
       resolveAssetPath: () => '/unused.png',
       importAuthorizedFiles: async () => emptyBatch,
     },
-    resolveAvailableSnapshot: (profileId) => ({
-      profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
-    }),
+    imageModels: {
+      resolveAvailableSnapshot: (profileId) => ({
+        profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
+      }),
+      assertSnapshotAvailable: () => undefined,
+    },
     getSettings: () => ({}),
     getSession: () => undefined,
     createSession: () => { throw new Error('测试不应创建会话') },

@@ -1109,7 +1109,7 @@ export function registerIpcHandlers(): void {
     pathResolver: designPathResolver,
     store: designStore,
     assetService: designAssetService,
-    resolveAvailableSnapshot: (profileId) => imageModels.resolveAvailableSnapshot(profileId),
+    imageModels,
     getSettings,
     getSession: getAgentSessionMeta,
     createSession: createAgentSession,

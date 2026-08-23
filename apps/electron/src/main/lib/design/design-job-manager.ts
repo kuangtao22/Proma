@@ -15,6 +15,7 @@ import type {
 import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
 import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-paths'
 import type { AgentRunExtensions } from '../agent-service'
+import type { ImageGenerationModelCatalog } from '../image-generation-model-catalog'
 import type { DesignAssetImportSource, DesignAssetService } from './design-asset-service'
 import { isSafeDesignStableId } from './design-paths'
 import type { DesignStore } from './design-store'
@@ -73,8 +74,8 @@ export interface DesignJobManagerDependencies {
   pathResolver: { resolve: (projectId: string) => { jobsDir: string } }
   store: DesignStore
   assetService: Pick<DesignAssetService, 'resolveAssetPath' | 'importAuthorizedFiles'>
-  /** 按当前系统目录解析可用 profile，并返回不含凭据的任务快照。 */
-  resolveAvailableSnapshot: (profileId: string) => ImageGenerationModelSnapshot
+  /** 只暴露任务创建与执行所需的公开模型校验，不允许 Job Manager 接触凭据。 */
+  imageModels: Pick<ImageGenerationModelCatalog, 'resolveAvailableSnapshot' | 'assertSnapshotAvailable'>
   getSettings: () => DesignJobSettings
   getSession: (sessionId: string) => AgentSessionMeta | undefined
   createSession: (
@@ -172,7 +173,7 @@ export class DesignJobManager {
   /** 创建 queued journal 和占位节点，不等待 Agent 运行。 */
   create(input: CreateDesignJobInput): DesignJobRecord {
     /** 可信模型校验必须早于 Store 读取、ID 生成、journal 和占位节点写入。 */
-    const imageModelSnapshot = this.dependencies.resolveAvailableSnapshot(input.imageModelProfileId)
+    const imageModelSnapshot = this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId)
     return this.createInternal(input, imageModelSnapshot)
   }
 
@@ -198,6 +199,12 @@ export class DesignJobManager {
     const queued = this.requireJob(jobId)
     if (queued.status !== 'queued') return
     try {
+      if (!queued.imageModelSnapshot) {
+        this.updateStatus(queued, 'failed', { error: '旧任务未记录生图模型，请重新提交新任务' })
+        return
+      }
+      /** 排队期间配置可能被删除、停用或修改，付费会话创建前必须再次复核。 */
+      this.dependencies.imageModels.assertSnapshotAvailable(queued.imageModelSnapshot)
       const model = this.resolveModel(queued)
       if (!model) {
         this.updateStatus(queued, 'failed', { error: DESIGN_JOB_MODEL_ERROR })
@@ -264,6 +271,7 @@ export class DesignJobManager {
   retry(projectId: string, jobId: string): DesignJobRecord {
     return this.dependencies.runWorkspaceWrite(projectId, () => {
       let previous = this.requireProjectJob(projectId, jobId)
+      if (!previous.imageModelSnapshot) throw new Error('旧任务未记录生图模型，请重新提交')
       if (previous.replacedByJobId) {
         return this.completeRetryIntent(previous)
       }
@@ -625,6 +633,7 @@ export class DesignJobManager {
 
   /** 按已持久化 replacement ID 幂等创建或返回替代任务。 */
   private completeRetryIntent(previous: StoredDesignJob): StoredDesignJob {
+    if (!previous.imageModelSnapshot) throw new Error('旧任务未记录生图模型，请重新提交')
     const replacementId = previous.replacedByJobId
     if (!replacementId || previous.retryState?.status !== 'pending') {
       if (replacementId) return this.requireProjectJob(previous.projectId, replacementId)

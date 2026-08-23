@@ -280,9 +280,12 @@ function createRecoveryJobManager(
       resolveAssetPath: () => '/unused',
       importAuthorizedFiles: async () => createEmptyBatch(),
     },
-    resolveAvailableSnapshot: (profileId) => ({
-      profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
-    }),
+    imageModels: {
+      resolveAvailableSnapshot: (profileId) => ({
+        profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
+      }),
+      assertSnapshotAvailable: () => undefined,
+    },
     getSettings: () => ({}),
     getSession: () => undefined,
     createSession: () => { throw new Error('恢复不应创建会话') },
