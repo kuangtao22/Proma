@@ -291,6 +291,7 @@ import {
   getAgentSessionMeta,
   getAgentSessionMessages,
   getAgentSessionSDKMessages,
+  resolveAgentCwd,
   updateAgentSessionMeta,
   deleteAgentSession,
   migrateChatToAgentSession,
@@ -1092,10 +1093,15 @@ export function registerIpcHandlers(): void {
     getSession: getAgentSessionMeta,
     getMessages: getAgentSessionMessages,
     resolveAgentImagePath: (localPath) => isAbsolute(localPath) ? localPath : resolveAttachmentPath(localPath),
-    getAllowedRoots: (session) => [
-      getConversationAttachmentsDir(session.id),
-      ...getAuthorizedRoots({ sessionId: session.id }),
-    ],
+    getAllowedRoots: (session) => {
+      /** 只允许当前会话附件和该会话实际 Agent cwd 的生成目录。 */
+      const workspace = session.workspaceId ? getAgentWorkspace(session.workspaceId) : undefined
+      const agentCwd = resolveAgentCwd(workspace, session.id, session.agentCwdMode, session.activeWorktree)
+      return [
+        getConversationAttachmentsDir(session.id),
+        ...(agentCwd ? [join(agentCwd, 'generated-images')] : []),
+      ]
+    },
     store: designStore,
     assets: designAssetService,
   })

@@ -97,6 +97,8 @@ export interface SDKMessageRendererProps {
   message: SDKMessage
   /** 所有消息（用于 ContentBlock 内查找工具结果） */
   allMessages: SDKMessage[]
+  /** 当前消息实际所属的 Agent 会话。 */
+  sessionId: string
   /** 相对路径解析基准 */
   basePath?: string
   /** 是否显示消息头部（模型 icon + 名称），默认 true */
@@ -368,6 +370,8 @@ export function buildTaskProgressDataForTurn(turn: AssistantTurn): { taskActivit
 
 export interface AssistantTurnRendererProps {
   turn: AssistantTurn
+  /** 当前 turn 实际所属的 Agent 会话。 */
+  sessionId: string
   /** 所有消息（全局，供工具结果查找跨 turn 的结果） */
   allMessages: SDKMessage[]
   basePath?: string
@@ -393,7 +397,7 @@ export interface AssistantTurnRendererProps {
   sessionModelId?: string
 }
 
-export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onRewind, onCreateTodo, onRetry, onRetryInNewSession, onCompact, onRelinkProjectRoot, onRestoreProjectRoot, isStreaming, stoppedByUser, sessionModelId }: AssistantTurnRendererProps): React.ReactElement | null {
+export function AssistantTurnRenderer({ turn, sessionId, allMessages, basePath, onFork, onRewind, onCreateTodo, onRetry, onRetryInNewSession, onCompact, onRelinkProjectRoot, onRestoreProjectRoot, isStreaming, stoppedByUser, sessionModelId }: AssistantTurnRendererProps): React.ReactElement | null {
   const channels = useAtomValue(channelsAtom)
   // 收集所有 assistant 消息的内容块，保留 parent_tool_use_id 关联
   interface EnrichedBlock {
@@ -510,6 +514,7 @@ export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onR
         key={i}
         block={block}
         allMessages={allMessages}
+        sessionId={sessionId}
         basePath={basePath}
         animate={!!isStreaming}
         index={i}
@@ -632,6 +637,7 @@ export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onR
 export function SDKMessageRenderer({
   message,
   allMessages,
+  sessionId,
   basePath,
   showHeader = true,
   sessionModelId,
@@ -695,6 +701,7 @@ export function SDKMessageRenderer({
                 key={i}
                 block={block}
                 allMessages={allMessages}
+                sessionId={sessionId}
                 basePath={basePath}
                 index={i}
                 dimmed={hasTextContent && block.type !== 'text'}
@@ -1380,6 +1387,8 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact, onReli
 
 export interface MessageGroupRendererProps {
   group: MessageGroup
+  /** 当前消息组实际所属的 Agent 会话。 */
+  sessionId: string
   allMessages: SDKMessage[]
   /** 仅跨 turn 工具元数据变化时更新历史 assistant；普通 live 数组新引用不触发重渲染。 */
   externalMetadataSignature?: string
@@ -1454,7 +1463,7 @@ export function getGroupId(group: MessageGroup): string {
 
 // getGroupPreview 已迁移至 @proma/session-core（本文件从该包 import 并 re-export）
 
-export const MessageGroupRenderer = React.memo(function MessageGroupRenderer({ group, allMessages, basePath, onFork, onRewind, onAgentHistoryQuoteClick, onCreateTodo, onRetry, onRetryInNewSession, onCompact, onRelinkProjectRoot, onRestoreProjectRoot, historyTurn, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
+export const MessageGroupRenderer = React.memo(function MessageGroupRenderer({ group, sessionId, allMessages, basePath, onFork, onRewind, onAgentHistoryQuoteClick, onCreateTodo, onRetry, onRetryInNewSession, onCompact, onRelinkProjectRoot, onRestoreProjectRoot, historyTurn, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
   const groupId = getGroupId(group)
 
   if (group.type === 'user') {
@@ -1488,6 +1497,7 @@ export const MessageGroupRenderer = React.memo(function MessageGroupRenderer({ g
     >
       <AssistantTurnRenderer
         turn={group}
+        sessionId={sessionId}
         allMessages={allMessages}
         basePath={basePath}
         onFork={onFork}
@@ -1506,6 +1516,7 @@ export const MessageGroupRenderer = React.memo(function MessageGroupRenderer({ g
   )
 }, (previous, next) => (
   previous.group === next.group
+  && previous.sessionId === next.sessionId
   && previous.basePath === next.basePath
   && previous.onFork === next.onFork
   && previous.onRewind === next.onRewind

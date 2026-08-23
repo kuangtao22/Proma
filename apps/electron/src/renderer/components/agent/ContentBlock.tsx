@@ -29,7 +29,6 @@ import { PreviewOpenButton } from './tool-result-renderers/preview-open-button'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { agentSessionsAtom } from '@/atoms/agent-atoms'
-import { activeSessionIdAtom } from '@/atoms/tab-atoms'
 import { designAdapter } from '@/lib/design-adapter'
 import { importAgentToolResultImagesToDesign } from '@/lib/agent-design-actions'
 import { getTaskGetStatusLabel, parseTaskGetResult, type ParsedTaskGetResult } from './tool-result-renderers/task-get-result'
@@ -211,6 +210,8 @@ export interface ContentBlockProps {
   block: SDKContentBlock
   /** 所有消息（用于查找工具结果） */
   allMessages: SDKMessage[]
+  /** 当前内容块实际所属的 Agent 会话。 */
+  sessionId: string
   /** 相对路径解析基准（文件链接用） */
   basePath?: string
   /** 多个可解析相对路径的基准目录 */
@@ -339,6 +340,7 @@ function TaskListCollapsedSummary({ tasks }: { tasks: ParsedTaskListItem[] }): R
 interface ToolUseBlockProps {
   block: SDKToolUseBlock
   allMessages: SDKMessage[]
+  sessionId: string
   animate?: boolean
   index?: number
   dimmed?: boolean
@@ -349,48 +351,55 @@ interface ToolUseBlockProps {
 }
 
 /** 仅 Nano Banana 图片结果挂载该组件，避免普通工具行订阅会话列表。 */
-function AddToolImagesToDesignButton({ images }: { images: AgentToolResultImage[] }): React.ReactElement {
-  const activeSessionId = useAtomValue(activeSessionIdAtom)
+function AddToolImagesToDesignButton({ images, sessionId }: { images: AgentToolResultImage[]; sessionId: string }): React.ReactElement {
   const sessions = useAtomValue(agentSessionsAtom)
   /** 当前消息所属会话的项目 ID 决定“加入设计”是否可用。 */
-  const projectId = sessions.find((session) => session.id === activeSessionId)?.workspaceId
-  const canImportToDesign = Boolean(activeSessionId && projectId)
+  const projectId = sessions.find((session) => session.id === sessionId)?.workspaceId
+  const canImportToDesign = Boolean(projectId)
 
   /** 导入当前 Nano Banana 工具结果的全部图片，不改变当前页面。 */
   const handleImportToDesign = React.useCallback(async (): Promise<void> => {
-    if (!activeSessionId || !projectId) return
+    if (!projectId) return
     try {
       await importAgentToolResultImagesToDesign({
         projectId,
-        sessionId: activeSessionId,
+        sessionId,
         images,
       }, { importImage: designAdapter.importAgentImage })
       toast.success('已加入设计')
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '加入设计失败')
     }
-  }, [activeSessionId, images, projectId])
+  }, [images, projectId, sessionId])
 
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          aria-label="加入设计"
-          disabled={!canImportToDesign}
-          onClick={() => { void handleImportToDesign() }}
+        <span
+          className="inline-flex"
+          data-design-import-tooltip-trigger="true"
+          data-design-import-session-id={sessionId}
+          tabIndex={canImportToDesign ? undefined : 0}
+          aria-description={canImportToDesign ? undefined : '该会话不属于项目'}
         >
-          <ImagePlus aria-hidden="true" />
-        </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="加入设计"
+            disabled={!canImportToDesign}
+            onClick={() => { void handleImportToDesign() }}
+          >
+            <ImagePlus aria-hidden="true" />
+          </Button>
+        </span>
       </TooltipTrigger>
       <TooltipContent side="top">{projectId ? '加入设计' : '该会话不属于项目'}</TooltipContent>
     </Tooltip>
   )
 }
 
-function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed = false, childBlocks, basePath, isStreaming }: ToolUseBlockProps): React.ReactElement {
+function ToolUseBlock({ block, allMessages, sessionId, animate = false, index = 0, dimmed = false, childBlocks, basePath, isStreaming }: ToolUseBlockProps): React.ReactElement {
   const [expanded, setExpanded] = React.useState(false)
   const toolResult = useToolResult(block.id, allMessages)
   const resultText = toolResult?.result
@@ -497,6 +506,7 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
                 key={ci}
                 block={childBlock}
                 allMessages={allMessages}
+                sessionId={sessionId}
                 basePath={basePath}
                 animate={animate}
                 index={ci}
@@ -605,7 +615,7 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
           )}
         </button>
         {block.name === 'mcp__nano_banana__generate_image' && imageAttachments.length > 0 && (
-          <AddToolImagesToDesignButton images={imageAttachments} />
+          <AddToolImagesToDesignButton images={imageAttachments} sessionId={sessionId} />
         )}
       </div>
 
@@ -740,7 +750,7 @@ function StreamingTextBlock({
 
 // ===== ContentBlock 主组件 =====
 
-export function ContentBlock({ block, allMessages, basePath, basePaths, animate = false, index = 0, dimmed = false, childBlocks, isStreaming }: ContentBlockProps): React.ReactElement | null {
+export function ContentBlock({ block, allMessages, sessionId, basePath, basePaths, animate = false, index = 0, dimmed = false, childBlocks, isStreaming }: ContentBlockProps): React.ReactElement | null {
   // text 块 — 主要内容，不受 dimmed 影响
   if (block.type === 'text') {
     const textBlock = block as SDKTextBlock
@@ -762,6 +772,7 @@ export function ContentBlock({ block, allMessages, basePath, basePaths, animate 
       <ToolUseBlock
         block={toolBlock}
         allMessages={allMessages}
+        sessionId={sessionId}
         animate={animate}
         index={index}
         dimmed={dimmed}

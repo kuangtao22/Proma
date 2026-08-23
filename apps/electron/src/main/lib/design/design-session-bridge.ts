@@ -1,10 +1,12 @@
-import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { lstatSync, realpathSync } from 'node:fs'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import type {
   AgentMessage,
   AgentSessionMeta,
   SDKMessage,
+  SDKAssistantMessage,
   SDKToolResultBlock,
+  SDKToolUseBlock,
   SDKUserMessage,
   DesignAsset,
   DesignCanvasNode,
@@ -13,7 +15,6 @@ import type {
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
 } from '@proma/shared'
-import { isValidImageBytes } from '../image-content-validation'
 import type { DesignAssetImportBatch, DesignAssetService } from './design-asset-service'
 import type { DesignStore } from './design-store'
 
@@ -28,6 +29,9 @@ interface DesignSessionBridgeStore extends Pick<
   DesignStore,
   'requireStableAuthoritativeDocument' | 'mutate'
 > {}
+
+/** 与 Design Asset Service 保持一致的单图片读取上限。 */
+const MAX_AGENT_IMAGE_BYTES = 64 * 1024 * 1024
 
 /** Design 与 Agent 会话双向传递所需的可信主进程依赖。 */
 export interface DesignSessionBridgeDependencies {
@@ -52,13 +56,27 @@ function isPathWithinRoot(candidate: string, root: string): boolean {
 
 /** 从指定会话持久化消息中寻找精确 localPath 的图片归属证据。 */
 function findOwnedImage(messages: Array<AgentMessage | SDKMessage>, localPath: string): { mediaType: string } | undefined {
+  /** 新 SDK JSONL 仍需以同一序列中的 Nano tool_use 复核附件字段。 */
+  const sdkToolNames = new Map<string, string>()
   for (const message of messages) {
     if (!('type' in message)) {
       for (const event of message.events ?? []) {
-        if (event.type !== 'tool_result') continue
+        if (event.type !== 'tool_result' || event.toolName !== 'mcp__nano_banana__generate_image') continue
         /** 同字符串只在当前 session 的持久化事件中出现才构成所有权。 */
         const image = event.imageAttachments?.find((candidate) => candidate.localPath === localPath)
         if (image) return { mediaType: image.mediaType }
+      }
+      continue
+    }
+    if (message.type === 'assistant') {
+      const content = (message as SDKAssistantMessage).message?.content
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'tool_use') {
+            const toolUse = block as SDKToolUseBlock
+            sdkToolNames.set(toolUse.id, toolUse.name)
+          }
+        }
       }
       continue
     }
@@ -69,6 +87,7 @@ function findOwnedImage(messages: Array<AgentMessage | SDKMessage>, localPath: s
     for (const block of content) {
       if (block.type !== 'tool_result') continue
       const result = block as SDKToolResultBlock
+      if (sdkToolNames.get(result.tool_use_id) !== 'mcp__nano_banana__generate_image') continue
       const image = result.imageAttachments?.find((candidate) => candidate.localPath === localPath)
       if (image) return { mediaType: image.mediaType }
     }
@@ -132,7 +151,9 @@ export class DesignSessionBridge {
     const requestedPath = this.dependencies.resolveAgentImagePath(input.localPath)
     const imagePath = realpathSync(resolve(requestedPath))
     /** 真实叶子必须是普通文件，拒绝目录和其它特殊文件。 */
-    if (!lstatSync(imagePath).isFile()) throw new Error('Agent 图片不是普通文件')
+    const imageStat = lstatSync(imagePath)
+    if (!imageStat.isFile()) throw new Error('Agent 图片不是普通文件')
+    if (imageStat.size > MAX_AGENT_IMAGE_BYTES) throw new Error('图片不能超过 64 MiB')
     /** 每个允许根都先 canonicalize，符号链接不能越过会话授权边界。 */
     const allowed = this.dependencies.getAllowedRoots(session, input.projectId).some((root) => {
       try {
@@ -142,10 +163,6 @@ export class DesignSessionBridge {
       }
     })
     if (!allowed) throw new Error('图片不在指定 Agent 会话的授权目录内')
-    if (!isValidImageBytes(ownedImage.mediaType, readFileSync(imagePath))) {
-      throw new Error('Agent 图片内容无效')
-    }
-
     /** 只有本次调用创建的 promotion 批次允许在失败路径回滚。 */
     let importBatch: DesignAssetImportBatch | undefined
     try {

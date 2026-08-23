@@ -101,3 +101,5 @@
 - 2026-08-23：Design IPC 的权威 `LOAD` 完成后必须在同进程触发 terminal pending 二次对账，不能只依赖重启恢复。retry 在创建 replacement 前先持久化包含预分配 ID 的 pending intent；重复 retry 或启动恢复必须同时核对旧 journal、replacement journal 与 Store 节点绑定，续建同一 replacement 或拒绝第三方接管。Renderer 任务结构快照 revision 低于任务事件 revision 时保持同步失败并按原目标 revision 重试，禁止把陈旧快照当作 idle 成功。
 - 2026-08-23：重启恢复在补完 pending retry intent 并新建 replacement 后，必须在同一次恢复中把新任务立即收敛为 interrupted；恢复只重建可重试状态，不自动调用付费 Agent run，后续运行必须由用户显式 retry。
 - 2026-08-23：完成项目设计素材与 Agent 会话双向传递：Inspector 仅列同项目未归档会话并优先当前会话，素材引用只进入输入框；Nano Banana 图片结果可原地加入所属项目设计，无项目会话禁用入口，成功不切页。
+- 2026-08-23：Agent 图片附件提升必须由同批、顺序 SDK 消息中的 Nano Banana `tool_use_id` 精确关联证明，禁止非 Nano 工具或独立结果字段伪造授权；设计导入根仅限该 session 附件目录与其实际 Agent cwd 下的 `generated-images`，并在读取前执行大小边界检查。
+- 2026-08-23：Renderer 的 Agent 图片“加入设计”操作必须显式使用消息所属 `sessionId` 贯穿渲染链，禁止以当前激活标签身份代替消息身份；无项目会话的禁用按钮由可聚焦包装元素承载提示。

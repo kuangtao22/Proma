@@ -587,6 +587,7 @@ interface AgentTranscriptHistoryHandle {
 }
 
 interface AgentTranscriptHistoryProps {
+  sessionId: string
   groups: MessageGroup[]
   liveGroupSet: ReadonlySet<MessageGroup>
   allMessages: SDKMessage[]
@@ -635,6 +636,7 @@ function areTranscriptRowsEqual(
 ): boolean {
   if (
     previous.groups.length !== next.groups.length
+    || previous.sessionId !== next.sessionId
     || previous.liveGroupSet !== next.liveGroupSet
     || previous.taskNotificationSignature !== next.taskNotificationSignature
     || previous.sessionPath !== next.sessionPath
@@ -657,6 +659,7 @@ function areTranscriptRowsEqual(
 }
 
 const AgentTranscriptRows = React.memo(function AgentTranscriptRows({
+  sessionId,
   groups,
   liveGroupSet,
   allMessages,
@@ -697,6 +700,7 @@ const AgentTranscriptRows = React.memo(function AgentTranscriptRows({
           <div key={groupId} className="w-full pb-1">
             <MessageGroupRenderer
               group={group}
+              sessionId={sessionId}
               allMessages={group.type === 'assistant-turn' ? allMessages : EMPTY_SDK_MESSAGES}
               externalMetadataSignature={group.type === 'assistant-turn' ? taskNotificationSignature : ''}
               basePath={sessionPath || undefined}
@@ -726,6 +730,7 @@ const AgentTranscriptRows = React.memo(function AgentTranscriptRows({
  * 稳定历史前缀与实时 tail 分开 memo，token 更新时不重新协调整个历史 DOM。
  */
 const AgentTranscriptHistory = React.forwardRef<AgentTranscriptHistoryHandle, AgentTranscriptHistoryProps>(function AgentTranscriptHistory({
+  sessionId,
   groups,
   liveGroupSet,
   allMessages,
@@ -815,6 +820,7 @@ const AgentTranscriptHistory = React.forwardRef<AgentTranscriptHistoryHandle, Ag
   return (
     <div className="w-full shrink-0">
       <AgentTranscriptRows
+        sessionId={sessionId}
         groups={historyGroups}
         liveGroupSet={EMPTY_LIVE_GROUP_SET}
         allMessages={allMessages}
@@ -836,6 +842,7 @@ const AgentTranscriptHistory = React.forwardRef<AgentTranscriptHistoryHandle, Ag
       />
       {liveGroups.length > 0 && (
         <AgentTranscriptRows
+          sessionId={sessionId}
           groups={liveGroups}
           liveGroupSet={liveGroupSet}
           allMessages={allMessages}
@@ -1186,6 +1193,7 @@ export const AgentMessages = React.memo(function AgentMessages({
               {/* 统一消息渲染（持久化 + 实时合并为一个列表，确保 system 消息位置正确） */}
               <AgentTranscriptHistory
                 ref={historyRef}
+                sessionId={sessionId}
                 groups={visibleGroups}
                 liveGroupSet={liveGroupSet}
                 allMessages={allSDKMessages}

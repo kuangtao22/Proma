@@ -33,8 +33,10 @@ import type {
   AgentSessionMeta,
   AgentMessage,
   SDKMessage,
+  SDKAssistantMessage,
   SDKUserMessage,
   SDKToolResultBlock,
+  SDKToolUseBlock,
   AgentToolResultImage,
   SkillActivation,
   AgentWorkspace,
@@ -612,7 +614,9 @@ export function appendSDKMessages(id: string, messages: SDKMessage[]): void {
     // 一轮输出常见几十条消息，在多 Agent 并发下会持续阶段性阻塞主进程，
     // 进而延迟键盘事件的 IPC 转发（表现为 renderer 内无长任务但输入延迟高）。
     let payload = ''
-    for (const message of messages) {
+    /** 先在本批 SDK 序列内验证 tool_use 身份，再允许提升图片附件标记。 */
+    const messagesWithVerifiedImages = attachToolResultImages(messages)
+    for (const message of messagesWithVerifiedImages) {
       payload += serializeSDKMessageForStorage(message) + '\n'
     }
     appendFileSync(filePath, payload, 'utf-8')
@@ -1156,15 +1160,13 @@ function serializeSDKMessageForStorage(
   sourceDir?: string,
   destDir?: string,
 ): string {
-  /** Nano Banana 的文本标记在落盘时提升为结构化附件，供重启后的 UI 与授权桥共同使用。 */
-  const messageWithImages = attachToolResultImages(msg)
-  let serialized = JSON.stringify(messageWithImages)
+  let serialized = JSON.stringify(msg)
   if (sourceDir && destDir) {
     serialized = rewriteSourceToDest(serialized, sourceDir, destDir)
   }
   if (serialized.length <= MAX_SDK_MESSAGE_LENGTH) return serialized
 
-  let sanitized = JSON.stringify(sanitizeOversizedMessage(messageWithImages, serialized.length))
+  let sanitized = JSON.stringify(sanitizeOversizedMessage(msg, serialized.length))
   if (sourceDir && destDir) {
     sanitized = rewriteSourceToDest(sanitized, sourceDir, destDir)
   }
@@ -1215,28 +1217,52 @@ export function parseToolResultImageAttachments(content: unknown): AgentToolResu
   return images
 }
 
-/** 为 user/tool_result SDK 消息补充结构化图片附件，不改变其它消息。 */
-function attachToolResultImages(message: SDKMessage): SDKMessage {
-  if (message.type !== 'user') return message
-  /** SDK user content 之外的消息结构保持原引用，减少正常消息落盘开销。 */
-  const content = (message as SDKUserMessage).message?.content
-  if (!Array.isArray(content)) return message
-  let changed = false
-  const nextContent = content.map((block) => {
-    if (block.type !== 'tool_result') return block
-    const result = block as SDKToolResultBlock
-    if (result.imageAttachments?.length) return block
-    /** 只有存在有效本地附件标记时才复制块。 */
-    const imageAttachments = parseToolResultImageAttachments(result.content)
-    if (imageAttachments.length === 0) return block
-    changed = true
-    return { ...result, imageAttachments }
+/** 仅把同批序列中已由 Nano Banana tool_use 证明的结果标记提升为附件。 */
+function attachToolResultImages(messages: SDKMessage[]): SDKMessage[] {
+  /** 只记录已经出现在当前结果之前的工具调用，拒绝跨批或逆序伪造关联。 */
+  const toolNames = new Map<string, string>()
+  return messages.map((message) => {
+    if (message.type === 'assistant') {
+      const content = (message as SDKAssistantMessage).message?.content
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'tool_use') {
+            const toolUse = block as SDKToolUseBlock
+            toolNames.set(toolUse.id, toolUse.name)
+          }
+        }
+      }
+      return message
+    }
+    if (message.type !== 'user') return message
+    /** SDK user content 之外的消息结构保持原引用，减少正常消息落盘开销。 */
+    const content = (message as SDKUserMessage).message?.content
+    if (!Array.isArray(content)) return message
+    let changed = false
+    const nextContent = content.map((block) => {
+      if (block.type !== 'tool_result') return block
+      const result = block as SDKToolResultBlock
+      /** 非 Nano 结果即使自带字段或文本标记，也不能成为本地文件授权证据。 */
+      const verifiedNanoTool = toolNames.get(result.tool_use_id) === 'mcp__nano_banana__generate_image'
+      const imageAttachments = verifiedNanoTool
+        ? parseToolResultImageAttachments(result.content)
+        : []
+      if (imageAttachments.length > 0) {
+        changed = true
+        return { ...result, imageAttachments }
+      }
+      if (!result.imageAttachments) return block
+      const sanitizedResult = { ...result }
+      delete sanitizedResult.imageAttachments
+      changed = true
+      return sanitizedResult
+    })
+    if (!changed) return message
+    return {
+      ...message,
+      message: { ...(message as SDKUserMessage).message, content: nextContent },
+    } as SDKMessage
   })
-  if (!changed) return message
-  return {
-    ...message,
-    message: { ...(message as SDKUserMessage).message, content: nextContent },
-  } as SDKMessage
 }
 
 async function writeJsonlLine(stream: WriteStream, line: string): Promise<void> {

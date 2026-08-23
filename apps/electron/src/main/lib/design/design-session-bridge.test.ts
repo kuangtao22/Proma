@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createEmptyDesignDocument } from '@proma/shared'
@@ -127,7 +127,7 @@ describe('Design Session Bridge', () => {
   test('Given SDK 工具结果持久化图片归属 When 导入设计 Then 接受当前会话的精确附件字段', async () => {
     const imagePath = join(root, 'sdk-owned.png')
     writeFileSync(imagePath, pngBytes)
-    messages.set('session-1', [createSdkToolResultMessage(imagePath) as unknown as AgentMessage])
+    messages.set('session-1', createSdkToolResultMessages(imagePath) as unknown as AgentMessage[])
     const bridge = createBridge()
 
     await bridge.importAgentImage({
@@ -172,6 +172,37 @@ describe('Design Session Bridge', () => {
       rmSync(outside, { recursive: true, force: true })
     }
   })
+
+  test('Given 图片位于另一工作区生成目录 When 当前会话导入 Then 即使消息路径匹配也拒绝跨工作区', async () => {
+    const otherWorkspace = mkdtempSync(join(tmpdir(), 'proma-design-other-workspace-'))
+    try {
+      const imagePath = join(otherWorkspace, 'generated-images', 'other.png')
+      mkdirSync(join(otherWorkspace, 'generated-images'), { recursive: true })
+      writeFileSync(imagePath, pngBytes)
+      messages.set('session-1', [createToolResultMessage(imagePath)])
+
+      await expect(createBridge().importAgentImage({
+        projectId: 'project-1', sessionId: 'session-1', localPath: imagePath,
+        position: { x: 0, y: 0 },
+      })).rejects.toThrow('图片不在指定 Agent 会话的授权目录内')
+      expect(importedPaths).toEqual([])
+    } finally {
+      rmSync(otherWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 持久化图片超过 64 MiB When 导入设计 Then 在素材服务读取前拒绝', async () => {
+    const imagePath = join(root, 'oversized.png')
+    writeFileSync(imagePath, '')
+    truncateSync(imagePath, 64 * 1024 * 1024 + 1)
+    messages.set('session-1', [createToolResultMessage(imagePath)])
+
+    await expect(createBridge().importAgentImage({
+      projectId: 'project-1', sessionId: 'session-1', localPath: imagePath,
+      position: { x: 0, y: 0 },
+    })).rejects.toThrow('图片不能超过 64 MiB')
+    expect(importedPaths).toEqual([])
+  })
 })
 
 /** 创建最小项目会话元数据。 */
@@ -201,8 +232,15 @@ function createToolResultMessage(localPath: string): AgentMessage {
 }
 
 /** 创建当前 SDK JSONL 格式的工具结果归属证据。 */
-function createSdkToolResultMessage(localPath: string): object {
-  return {
+function createSdkToolResultMessages(localPath: string): object[] {
+  return [{
+    type: 'assistant',
+    message: {
+      content: [{
+        type: 'tool_use', id: 'tool-sdk-1', name: 'mcp__nano_banana__generate_image', input: {},
+      }],
+    },
+  }, {
     type: 'user',
     message: {
       content: [{
@@ -212,5 +250,5 @@ function createSdkToolResultMessage(localPath: string): object {
         imageAttachments: [{ localPath, filename: 'sdk-owned.png', mediaType: 'image/png' }],
       }],
     },
-  }
+  }]
 }
