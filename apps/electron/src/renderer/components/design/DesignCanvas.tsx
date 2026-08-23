@@ -2,6 +2,7 @@ import * as React from 'react'
 import type {
   DesignAnnotation,
   DesignCanvasDocument,
+  DesignJobRecord,
   DesignMutation,
 } from '@proma/shared'
 import {
@@ -47,6 +48,8 @@ import {
 
 /** XYFlow 自定义节点表保持模块级稳定，避免重渲染重复注册。 */
 const DESIGN_NODE_TYPES = { designAsset: DesignAssetNode } satisfies NodeTypes
+/** 未加载任务列表时复用稳定空数组，避免 effect 因默认参数新引用重复同步节点。 */
+const EMPTY_DESIGN_JOBS: DesignJobRecord[] = []
 
 export interface DesignCanvasInteractionConfig {
   /** 选择模式允许拖出框选区域。 */
@@ -79,6 +82,8 @@ export interface DesignCanvasProps {
   document: DesignCanvasDocument
   /** 当前窗口持有的缩略图媒体授权根。 */
   thumbnailBaseUrl?: string
+  /** 当前项目任务 journal。 */
+  jobs?: DesignJobRecord[]
   /** 当前项目是否允许写入。 */
   writable: boolean
   /** 当前项目画布工具。 */
@@ -140,6 +145,7 @@ function haveSameSelectedNodeIds(current: string[], next: string[]): boolean {
 export function DesignCanvas({
   document,
   thumbnailBaseUrl,
+  jobs = EMPTY_DESIGN_JOBS,
   writable,
   activeTool,
   selectedNodeIds,
@@ -160,7 +166,7 @@ export function DesignCanvas({
   const [flowNodes, setFlowNodes] = React.useState<DesignAssetFlowNode[]>(() => {
     /** 首帧选择集合用于恢复项目切换前的选区。 */
     const selectedIds = new Set(selectedNodeIds)
-    return toFlowNodes(document, { thumbnailBaseUrl }).map((node) => ({
+    return toFlowNodes(document, { thumbnailBaseUrl, jobs }).map((node) => ({
       ...node,
       selected: selectedIds.has(node.id),
     }))
@@ -179,7 +185,7 @@ export function DesignCanvas({
   React.useEffect(() => {
     /** 文档变更后同步展示字段，并保护活动拖动节点的本地坐标。 */
     const selectedIds = new Set(selectedNodeIdsRef.current)
-    const documentNodes = toFlowNodes(document, { thumbnailBaseUrl }).map((node) => ({
+    const documentNodes = toFlowNodes(document, { thumbnailBaseUrl, jobs }).map((node) => ({
       ...node,
       selected: selectedIds.has(node.id),
     }))
@@ -188,7 +194,7 @@ export function DesignCanvas({
       documentNodes,
       activeDragNodeIdsRef.current,
     ))
-  }, [document, thumbnailBaseUrl])
+  }, [document, jobs, thumbnailBaseUrl])
 
   React.useEffect(() => {
     /** 仅同步选择位，不覆盖拖动中的局部位置。 */

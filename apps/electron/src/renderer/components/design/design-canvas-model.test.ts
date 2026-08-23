@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createEmptyDesignDocument } from '@proma/shared'
-import type { DesignAsset, DesignCanvasNode } from '@proma/shared'
+import type { DesignAsset, DesignCanvasNode, DesignJobRecord } from '@proma/shared'
 import {
   createMoveNodesMutation,
   createViewportMutation,
@@ -95,8 +95,43 @@ describe('Design 画布节点映射', () => {
     expect(nodes[1]?.data).toEqual({
       kind: 'job',
       status: 'queued',
+      projectId: 'project-1',
       jobId: 'job-1',
       title: '图片任务',
+    })
+  })
+
+  test('Given 任务 journal 已失败或中断 When 映射任务节点 Then 展示真实状态与错误', () => {
+    const document = createEmptyDesignDocument('project-1', 100)
+    document.nodes = [
+      createNode({ id: 'failed-node', kind: 'job', assetId: undefined, jobId: 'job-failed' }),
+      createNode({ id: 'interrupted-node', kind: 'job', assetId: undefined, jobId: 'job-interrupted' }),
+    ]
+    /** 与节点 jobId 对应的主进程 journal 记录。 */
+    const jobs: DesignJobRecord[] = [
+      {
+        id: 'job-failed', projectId: 'project-1', action: 'generate', status: 'failed',
+        prompt: '生成海报', error: '模型失败', createdAt: 1, updatedAt: 2,
+      },
+      {
+        id: 'job-interrupted', projectId: 'project-1', action: 'edit', status: 'interrupted',
+        prompt: '移除文字', error: '应用退出，任务已中断', createdAt: 3, updatedAt: 4,
+      },
+    ]
+
+    const nodes = toFlowNodes(document, { jobs })
+
+    expect(nodes[0]?.data).toMatchObject({
+      status: 'failed',
+      error: '模型失败',
+      projectId: 'project-1',
+      jobId: 'job-failed',
+    })
+    expect(nodes[1]?.data).toMatchObject({
+      status: 'interrupted',
+      error: '应用退出，任务已中断',
+      projectId: 'project-1',
+      jobId: 'job-interrupted',
     })
   })
 

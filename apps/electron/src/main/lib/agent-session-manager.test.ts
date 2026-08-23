@@ -559,6 +559,33 @@ describe('Agent 会话 runtime 元数据', () => {
     expect(manager.getAgentSessionMeta(session.id)).toMatchObject({ reasoningLevel: 'xhigh' })
   })
 
+  test('Given Design Job 可见会话 When 写入来源元数据 Then get 与索引文件都保留项目和任务追踪 ID', () => {
+    const session = manager.createAgentSession(
+      '设计任务：生成海报',
+      'channel-design',
+      'workspace-design',
+      'model-design',
+    )
+
+    manager.updateAgentSessionMeta(session.id, {
+      sourceDesignProjectId: 'workspace-design',
+      sourceDesignJobId: 'job-design-1',
+    })
+
+    expect(manager.getAgentSessionMeta(session.id)).toMatchObject({
+      workspaceId: 'workspace-design',
+      sourceDesignProjectId: 'workspace-design',
+      sourceDesignJobId: 'job-design-1',
+    })
+    const persisted = JSON.parse(
+      readFileSync(join(tempHome, '.proma', 'agent-sessions.json'), 'utf8'),
+    ) as { sessions: Array<Record<string, unknown>> }
+    expect(persisted.sessions.find((candidate) => candidate.id === session.id)).toMatchObject({
+      sourceDesignProjectId: 'workspace-design',
+      sourceDesignJobId: 'job-design-1',
+    })
+  })
+
   test('Given a session When star state is updated Then it persists without changing freshness or archive state', () => {
     const session = manager.createAgentSession('星标会话')
     const archived = manager.updateAgentSessionMeta(session.id, { archived: true })

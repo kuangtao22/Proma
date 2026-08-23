@@ -11,7 +11,13 @@ import {
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
-import type { DesignAsset, DesignCanvasDocument, DesignMutation, DesignWorkspaceSnapshot } from '@proma/shared'
+import type {
+  DesignAsset,
+  DesignCanvasDocument,
+  DesignJobRecord,
+  DesignMutation,
+  DesignWorkspaceSnapshot,
+} from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import sharp from 'sharp'
 import { DesignAssetService } from './design-asset-service'
@@ -147,6 +153,14 @@ function createFixture(): {
         }
       },
     },
+    jobs: {
+      create: () => createJobRecord('job-default'),
+      run: async () => undefined,
+      cancel: async () => createJobRecord('job-default'),
+      retry: () => createJobRecord('job-retry'),
+      list: () => [],
+      onChanged: () => () => undefined,
+    },
     pickImageFiles: async () => ['/trusted/a.png'],
     pickRelinkImageFile: async () => '/trusted/relinked.png',
     pickExportPath: async () => '/trusted/export.png',
@@ -174,6 +188,69 @@ function invoke(handlers: Map<string, TestHandler>, channel: string, sender: Web
 }
 
 describe('Design IPC', () => {
+  test('Given 授权窗口 When 创建、取消、重试和列出任务 Then 写操作受 guard 保护且运行不阻塞 invoke', async () => {
+    const fixture = createFixture()
+    const job = createJobRecord('job-1')
+    const retried = createJobRecord('job-2')
+    /** 记录 handler 对 Manager 的调用顺序。 */
+    const calls: string[] = []
+    /** 捕获 manager 状态变化监听器以验证 job 广播。 */
+    let onChanged: ((changed: DesignJobRecord) => void) | undefined
+    Object.assign(fixture.options, {
+      jobs: {
+        create: () => { calls.push('create'); return job },
+        run: async (jobId: string) => { calls.push(`run:${jobId}`) },
+        cancel: async (_projectId: string, jobId: string) => { calls.push(`cancel:${jobId}`); return job },
+        retry: (_projectId: string, jobId: string) => { calls.push(`retry:${jobId}`); return retried },
+        list: () => { calls.push('list'); return [job, retried] },
+        onChanged: (listener: (changed: DesignJobRecord) => void) => {
+          onChanged = listener
+          return () => undefined
+        },
+      },
+    })
+    registerDesignIpcHandlers(fixture.options)
+
+    const created = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.CREATE_JOB,
+      fixture.senders[0]!,
+      { projectId: 'project-1', action: 'generate', prompt: '生成', position: { x: 1, y: 2 } },
+    )
+    const cancelled = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.CANCEL_JOB,
+      fixture.senders[0]!,
+      { projectId: 'project-1', jobId: 'job-1' },
+    )
+    const retryResult = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.RETRY_JOB,
+      fixture.senders[0]!,
+      { projectId: 'project-1', jobId: 'job-1' },
+    )
+    const listed = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.LIST_JOBS,
+      fixture.senders[0]!,
+      { projectId: 'project-1' },
+    )
+    await Promise.resolve()
+    onChanged?.(retried)
+
+    expect(created).toBe(job)
+    expect(cancelled).toBe(job)
+    expect(retryResult).toBe(retried)
+    expect(listed).toEqual([job, retried])
+    expect(fixture.guardProjects).toEqual(['project-1', 'project-1', 'project-1'])
+    expect(calls).toEqual([
+      'create', 'run:job-1', 'cancel:job-1', 'retry:job-1', 'run:job-2', 'list',
+    ])
+    expect(fixture.senders[0]?.sent.at(-1)?.value).toMatchObject({
+      projectId: 'project-1', cause: 'job', revision: fixture.document.revision,
+    })
+  })
+
   test('Given 未授权窗口和恶意 mutation When 调用 Then 在任何业务副作用前拒绝', async () => {
     const fixture = createFixture()
     registerDesignIpcHandlers(fixture.options)
@@ -771,3 +848,16 @@ describe('Design IPC', () => {
     }
   })
 })
+
+/** 创建 IPC 任务替身。 */
+function createJobRecord(id: string): DesignJobRecord {
+  return {
+    id,
+    projectId: 'project-1',
+    action: 'generate',
+    status: 'queued',
+    prompt: '生成',
+    createdAt: 1,
+    updatedAt: 1,
+  }
+}

@@ -2,6 +2,8 @@ import type {
   DesignAsset,
   DesignCanvasDocument,
   DesignCanvasNode,
+  DesignJobRecord,
+  DesignJobStatus,
   DesignMutation,
   DesignPoint,
   DesignViewport,
@@ -11,6 +13,18 @@ import type { DesignAssetFlowNode, DesignAssetNodeData } from './DesignAssetNode
 export interface ToFlowNodesOptions {
   /** 当前窗口持有的缩略图媒体授权根 URL。 */
   thumbnailBaseUrl?: string
+  /** 当前项目任务 journal，用于投影任务节点真实状态。 */
+  jobs?: DesignJobRecord[]
+}
+
+/** Design journal 状态到节点展示状态的完整映射。 */
+const JOB_NODE_STATUS: Record<DesignJobStatus, DesignAssetNodeData['status']> = {
+  queued: 'queued',
+  running: 'running',
+  succeeded: 'success',
+  failed: 'failed',
+  cancelled: 'cancelled',
+  interrupted: 'interrupted',
 }
 
 export interface PositionedFlowNode {
@@ -137,14 +151,19 @@ export function toFlowNodes(
 ): DesignAssetFlowNode[] {
   /** 素材索引避免每个素材节点重复线性扫描文档。 */
   const assetsById = new Map(document.assets.map((asset) => [asset.id, asset]))
+  /** 任务索引避免每个任务节点重复线性扫描 journal。 */
+  const jobsById = new Map((options.jobs ?? []).map((job) => [job.id, job]))
   return document.nodes.map((node): DesignAssetFlowNode => {
-    /** 任务详情由后续任务生命周期接入；当前画布仅安全展示稳定任务引用。 */
+    /** journal 暂未加载时保持 queued，占位节点随后由 job 事件刷新。 */
+    const job = node.jobId ? jobsById.get(node.jobId) : undefined
     const data: DesignAssetNodeData = node.kind === 'job'
       ? {
           kind: 'job',
-          status: 'queued',
+          status: job ? JOB_NODE_STATUS[job.status] : 'queued',
+          projectId: document.projectId,
           jobId: node.jobId ?? '',
           title: '图片任务',
+          ...(job?.error ? { error: job.error } : {}),
         }
       : createAssetNodeData(node, node.assetId ? assetsById.get(node.assetId) : undefined, options.thumbnailBaseUrl)
     return {

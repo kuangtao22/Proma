@@ -5,6 +5,7 @@ import type {
 } from '@proma/shared'
 import { Download, ImageOff, RefreshCw, Send, Trash2, Upload, X } from 'lucide-react'
 import { useAtomValue, useSetAtom } from 'jotai'
+import { toast } from 'sonner'
 import {
   createInitialDesignProjectState,
   designProjectStatesAtom,
@@ -27,6 +28,7 @@ import {
   type DesignVersionTreeRow,
 } from './design-version-tree'
 import { useDesignInspectorActions } from './use-design-inspector-actions'
+import { isDesignRecoveryRequired } from './use-design-workspace'
 
 /** 首版图片生成允许的画面比例。 */
 export type DesignAspectRatio = '1:1' | '16:9' | '4:3' | '9:16' | '3:4'
@@ -410,12 +412,10 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
 export interface DesignInspectorProps {
   projectId: string
   width?: number
-  /** Task 10 注入真实 Design Job handler；缺失时表单保持禁用。 */
-  onCreateJob?: (input: CreateDesignJobInput) => void
 }
 
-/** 从项目 Jotai 状态连接右栏素材操作；Job handler 留给 Task 10。 */
-export function DesignInspector({ projectId, width, onCreateJob }: DesignInspectorProps): React.ReactElement {
+/** 从项目 Jotai 状态连接右栏素材操作与真实 Design Job。 */
+export function DesignInspector({ projectId, width }: DesignInspectorProps): React.ReactElement {
   const states = useAtomValue(designProjectStatesAtom)
   const updateState = useSetAtom(updateDesignProjectStateAtom)
   const executeEdit = useSetAtom(executeDesignEditAtom)
@@ -429,11 +429,26 @@ export function DesignInspector({ projectId, width, onCreateJob }: DesignInspect
   })
   /** 未加载项目仍展示稳定检查器骨架。 */
   const state = states.get(projectId) ?? createInitialDesignProjectState()
+  /** 创建任务后立即展示 queued，随后由 job change 事件用完整 journal 校准。 */
+  const handleCreateJob = React.useCallback((input: CreateDesignJobInput): void => {
+    void designAdapter.createJob(input).then((job) => {
+      updateState({
+        projectId,
+        update: (current) => ({
+          jobs: [...current.jobs.filter((candidate) => candidate.id !== job.id), job],
+          ...(input.action === 'generate' ? { generationPrompt: '' } : { editPrompt: '' }),
+        }),
+      })
+    }).catch((error: unknown) => {
+      if (isDesignRecoveryRequired(error)) handleRecoveryRequired()
+      toast.error(error instanceof Error ? error.message : '创建设计任务失败')
+    })
+  }, [handleRecoveryRequired, projectId, updateState])
   return (
     <DesignInspectorStateView
       state={state}
       width={width}
-      createJobEnabled={Boolean(onCreateJob)}
+      createJobEnabled
       onTabChange={(inspectorTab) => updateState({ projectId, update: { inspectorTab } })}
       onGenerationPromptChange={(generationPrompt) => updateState({ projectId, update: { generationPrompt } })}
       onEditPromptChange={(editPrompt) => updateState({ projectId, update: { editPrompt } })}
@@ -444,7 +459,7 @@ export function DesignInspector({ projectId, width, onCreateJob }: DesignInspect
       onSelectAsset={actions.selectAsset}
       onClearSelection={() => updateState({ projectId, update: { selectedNodeIds: [], inspectorAssetId: null } })}
       onGroupSelection={() => executeEdit({ projectId, command: { type: 'group-selection', nodeIds: state.selectedNodeIds, groupId: globalThis.crypto.randomUUID(), name: `组 ${(state.snapshot?.document.groups.length ?? 0) + 1}` } })}
-      onCreateJob={(input) => onCreateJob?.(input)}
+      onCreateJob={handleCreateJob}
     />
   )
 }

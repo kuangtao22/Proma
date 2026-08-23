@@ -3,6 +3,7 @@ import { createEmptyDesignDocument } from '@proma/shared'
 import type {
   DesignCanvasDocument,
   DesignChangeEvent,
+  DesignJobRecord,
   DesignMutation,
   DesignWorkspaceSnapshot,
   SaveDesignMutationsInput,
@@ -93,6 +94,8 @@ interface ControllerHarness {
   controller: ReturnType<typeof createDesignWorkspaceController>
   scheduler: ManualScheduler
   loadRequests: Deferred<DesignWorkspaceSnapshot>[]
+  /** adapter.listJobs 产生的待完成请求。 */
+  jobRequests: Deferred<DesignJobRecord[]>[]
   saveRequests: Array<{ input: SaveDesignMutationsInput; deferred: Deferred<DesignCanvasDocument> }>
   getState: () => DesignProjectState
   setState: (update: DesignProjectStateUpdate) => void
@@ -123,6 +126,8 @@ function createControllerHarness(
 ): ControllerHarness {
   /** adapter.load 产生的待完成请求。 */
   const loadRequests: Deferred<DesignWorkspaceSnapshot>[] = []
+  /** adapter.listJobs 产生的待完成请求。 */
+  const jobRequests: Deferred<DesignJobRecord[]>[] = []
   /** adapter.save 产生的待完成请求及其入参。 */
   const saveRequests: Array<{ input: SaveDesignMutationsInput; deferred: Deferred<DesignCanvasDocument> }> = []
   /** 当前订阅的远端变化回调。 */
@@ -151,6 +156,12 @@ function createControllerHarness(
       /** 当前 load 的 deferred 结果。 */
       const deferred = createDeferred<DesignWorkspaceSnapshot>()
       loadRequests.push(deferred)
+      return deferred.promise
+    },
+    listJobs: () => {
+      /** 当前任务列表请求的 deferred 结果。 */
+      const deferred = createDeferred<DesignJobRecord[]>()
+      jobRequests.push(deferred)
       return deferred.promise
     },
     save: (input) => {
@@ -185,6 +196,7 @@ function createControllerHarness(
     controller,
     scheduler,
     loadRequests,
+    jobRequests,
     saveRequests,
     getState: () => sharedState.state,
     setState,
@@ -206,6 +218,65 @@ async function flushPromises(): Promise<void> {
 }
 
 describe('Design 工作区同步规则', () => {
+  test('Given 项目首次加载 When controller 启动 Then 同时请求画布快照与任务列表', async () => {
+    const harness = createControllerHarness(createInitialDesignProjectState())
+    harness.controller.start()
+
+    expect(harness.loadRequests).toHaveLength(1)
+    expect(harness.jobRequests).toHaveLength(1)
+
+    const job: DesignJobRecord = {
+      id: 'job-1',
+      projectId: 'project-1',
+      action: 'generate',
+      status: 'running',
+      prompt: '生成海报',
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    harness.jobRequests[0]!.resolve([job])
+    await flushPromises()
+
+    expect(harness.getState().jobs).toEqual([job])
+  })
+
+  test('Given 画布有未保存编辑 When 同 revision job 事件到达 Then 只刷新任务且不替换画布快照', async () => {
+    const snapshot: DesignWorkspaceSnapshot = {
+      document: createEmptyDesignDocument('project-1', 10),
+      writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot,
+      saveState: 'dirty',
+      pendingMutations: [{ type: 'set-viewport', viewport: { x: 8, y: 9, zoom: 1 } }],
+    })
+    harness.controller.start()
+    expect(harness.jobRequests).toHaveLength(1)
+
+    harness.emitChange({ projectId: 'project-1', revision: 0, cause: 'job' })
+    expect(harness.jobRequests).toHaveLength(2)
+    expect(harness.loadRequests).toHaveLength(1)
+
+    const job: DesignJobRecord = {
+      id: 'job-1',
+      projectId: 'project-1',
+      action: 'generate',
+      status: 'failed',
+      prompt: '生成海报',
+      error: '模型失败',
+      createdAt: 1,
+      updatedAt: 3,
+    }
+    harness.jobRequests[1]!.resolve([job])
+    await flushPromises()
+
+    expect(harness.getState().jobs).toEqual([job])
+    expect(harness.getState().snapshot).toBe(snapshot)
+    expect(harness.getState().pendingMutations).toHaveLength(1)
+  })
+
   test('Given 无缓存项目 When controller 启动并完成 load Then 进入 ready 且订阅后续 revision', async () => {
     /** 从 idle 开始的项目生命周期环境。 */
     const harness = createControllerHarness(createInitialDesignProjectState())

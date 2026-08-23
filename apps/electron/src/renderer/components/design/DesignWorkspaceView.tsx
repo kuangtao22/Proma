@@ -193,6 +193,7 @@ export function DesignWorkspaceStateView({
           key={projectId}
           document={state.snapshot.document}
           thumbnailBaseUrl={state.snapshot.thumbnailBaseUrl}
+          jobs={state.jobs}
           writable={writable}
           activeTool={state.activeTool}
           selectedNodeIds={state.selectedNodeIds}

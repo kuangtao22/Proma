@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto'
 import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
 import type {
+  CreateDesignJobInput,
   DeleteDesignAssetInput,
   DesignAnnotation,
   DesignCanvasDocument,
   DesignCanvasNode,
   DesignChangeEvent,
   DesignGroup,
+  DesignJobControlInput,
+  DesignJobRecord,
   DesignMutation,
   DesignPoint,
   DesignWorkspaceSnapshot,
@@ -19,6 +22,7 @@ import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
 import type { DesignAssetImportBatch, DesignAssetService } from './design-asset-service'
 import type { DesignStore } from './design-store'
+import type { DesignJobManager } from './design-job-manager'
 
 /** Renderer 可提交的画布 mutation 白名单，素材元数据只能由主进程服务维护。 */
 const RENDERER_MUTATION_TYPES = new Set<DesignMutation['type']>([
@@ -65,6 +69,12 @@ export interface DesignIpcAssetService extends Pick<
   | 'createMediaAccess'
 > {}
 
+/** IPC 层实际使用的任务服务窄接口。 */
+export interface DesignIpcJobManager extends Pick<
+  DesignJobManager,
+  'create' | 'run' | 'cancel' | 'retry' | 'list' | 'onChanged'
+> {}
+
 /** 注册 Design IPC 所需的可信主进程依赖。 */
 export interface DesignIpcOptions {
   ipc: DesignIpcRegistrar
@@ -72,6 +82,7 @@ export interface DesignIpcOptions {
   guard: Pick<WorkspaceOperationGuard, 'runWorkspaceWrite'>
   store: DesignStore
   assets: DesignIpcAssetService
+  jobs: DesignIpcJobManager
   pickImageFiles: (sender: WebContents) => Promise<string[]>
   pickRelinkImageFile: (sender: WebContents) => Promise<string | null>
   pickExportPath: (sender: WebContents, filename: string) => Promise<string | null>
@@ -368,6 +379,39 @@ function parseAssetInput(value: unknown, withRevision: boolean): DeleteDesignAss
     : { projectId: value.projectId, assetId: value.assetId }
 }
 
+/** 校验 Renderer 创建任务输入，不接受绝对路径或额外字段。 */
+function parseCreateJobInput(value: unknown): CreateDesignJobInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, [
+      'projectId', 'action', 'prompt', 'sourceSessionId', 'sourceAssetId', 'maskAnnotationId', 'position',
+    ])
+    || !isNonEmptyString(value.projectId)
+    || (value.action !== 'generate' && value.action !== 'edit')
+    || !isNonEmptyString(value.prompt)
+    || (value.sourceSessionId !== undefined && !isNonEmptyString(value.sourceSessionId))
+    || (value.sourceAssetId !== undefined && !isNonEmptyString(value.sourceAssetId))
+    || (value.maskAnnotationId !== undefined && !isNonEmptyString(value.maskAnnotationId))
+    || !isPoint(value.position)) throw new Error('Design 请求结构无效')
+  return {
+    projectId: value.projectId,
+    action: value.action,
+    prompt: value.prompt,
+    ...(value.sourceSessionId ? { sourceSessionId: value.sourceSessionId } : {}),
+    ...(value.sourceAssetId ? { sourceAssetId: value.sourceAssetId } : {}),
+    ...(value.maskAnnotationId ? { maskAnnotationId: value.maskAnnotationId } : {}),
+    position: value.position,
+  }
+}
+
+/** 校验取消和重试使用的项目任务 ID。 */
+function parseJobControlInput(value: unknown): DesignJobControlInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'jobId'])
+    || !isNonEmptyString(value.projectId)
+    || !isNonEmptyString(value.jobId)) throw new Error('Design 请求结构无效')
+  return { projectId: value.projectId, jobId: value.jobId }
+}
+
 /** 确认调用者属于当前主应用授权窗口集合。 */
 function assertAuthorizedSender(event: IpcMainInvokeEvent, authorized: WebContents[]): WebContents {
   if (!authorized.some((candidate) => candidate === event.sender || candidate.id === event.sender.id)) {
@@ -406,6 +450,10 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     DESIGN_IPC_CHANNELS.DELETE_ASSET,
     DESIGN_IPC_CHANNELS.RELINK_ASSET,
     DESIGN_IPC_CHANNELS.EXPORT_ASSET,
+    DESIGN_IPC_CHANNELS.CREATE_JOB,
+    DESIGN_IPC_CHANNELS.CANCEL_JOB,
+    DESIGN_IPC_CHANNELS.RETRY_JOB,
+    DESIGN_IPC_CHANNELS.LIST_JOBS,
     DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS,
   ]
   for (const channel of channels) options.ipc.removeHandler(channel)
@@ -443,6 +491,12 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
       writable: true,
     })
   }
+
+  /** Manager 后台状态变化也通知 Renderer 刷新任务列表。 */
+  const unsubscribeJobs = options.jobs.onChanged((job) => {
+    const revision = lastReadableSnapshots.get(job.projectId)?.document.revision ?? 0
+    broadcastChange(options, { projectId: job.projectId, revision, cause: 'job' })
+  })
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.LOAD, async (event, value): Promise<DesignWorkspaceSnapshot> => {
     const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
@@ -575,6 +629,38 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     if (targetPath) await options.assets.exportAsset(input.projectId, input.assetId, targetPath)
   })
 
+  options.ipc.handle(DESIGN_IPC_CHANNELS.CREATE_JOB, async (event, value): Promise<DesignJobRecord> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseCreateJobInput(value)
+    const job = await options.guard.runWorkspaceWrite(input.projectId, () => options.jobs.create(input))
+    /** invoke 只返回 queued；后台运行错误由 journal 终态承接。 */
+    void options.jobs.run(job.id).catch((error) => console.error('[Design Job] 后台运行失败:', error))
+    return job
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.CANCEL_JOB, async (event, value): Promise<DesignJobRecord> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseJobControlInput(value)
+    return options.guard.runWorkspaceWrite(input.projectId, () => options.jobs.cancel(input.projectId, input.jobId))
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.RETRY_JOB, async (event, value): Promise<DesignJobRecord> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseJobControlInput(value)
+    const job = await options.guard.runWorkspaceWrite(
+      input.projectId,
+      () => options.jobs.retry(input.projectId, input.jobId),
+    )
+    void options.jobs.run(job.id).catch((error) => console.error('[Design Job] 后台重试失败:', error))
+    return job
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.LIST_JOBS, async (event, value): Promise<DesignJobRecord[]> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseProjectInput(value)
+    return options.jobs.list(input.projectId)
+  })
+
   options.ipc.handle(DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS, async (event, value): Promise<void> => {
     const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
     if (value !== undefined) throw new Error('Design 请求结构无效')
@@ -586,6 +672,7 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   const dispose = (): void => {
     if (disposed) return
     disposed = true
+    unsubscribeJobs()
     for (const senderId of [...mediaAccessBySender.keys()]) releaseMediaAccess(senderId)
     for (const channel of channels) options.ipc.removeHandler(channel)
     if (activeRegistrations.get(options.ipc) === dispose) activeRegistrations.delete(options.ipc)

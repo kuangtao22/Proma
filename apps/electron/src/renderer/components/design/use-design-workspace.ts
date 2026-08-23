@@ -2,6 +2,7 @@ import * as React from 'react'
 import type {
   DesignCanvasDocument,
   DesignChangeEvent,
+  DesignJobRecord,
   DesignMutation,
   DesignWorkspaceSnapshot,
 } from '@proma/shared'
@@ -271,7 +272,7 @@ export interface DesignWorkspaceControllerDependencies {
   /** 当前项目稳定 ID。 */
   projectId: string
   /** Renderer Design adapter。 */
-  adapter: Pick<DesignAdapter, 'load' | 'save' | 'onChanged' | 'releaseMediaAccess'>
+  adapter: Pick<DesignAdapter, 'load' | 'save' | 'listJobs' | 'onChanged' | 'releaseMediaAccess'>
   /** 读取当前项目最新状态。 */
   getState: () => DesignProjectState
   /** 原子应用项目局部状态更新。 */
@@ -312,6 +313,8 @@ export function createDesignWorkspaceController(
 ): DesignWorkspaceController {
   /** 最后发起的 load 序号，用于丢弃乱序返回。 */
   let latestLoadSequence = 0
+  /** 最后发起的任务列表请求序号，用于丢弃乱序返回。 */
+  let latestJobLoadSequence = 0
   /** 当前远端变化订阅的释放函数。 */
   let unsubscribe: (() => void) | null = null
   /** 当前尚未触发的保存防抖定时器 ID。 */
@@ -322,6 +325,25 @@ export function createDesignWorkspaceController(
   let conflictRecoveryInFlight = false
   /** 当前 controller 是否已有强制权威恢复 load 在途，避免重复请求。 */
   let authoritativeRecoveryInFlight = false
+
+  /**
+   * 独立刷新任务 journal，不读取或替换画布快照。
+   * @returns 本次任务列表状态提交完成后的 Promise。
+   */
+  const refreshJobs = async (): Promise<void> => {
+    if (disposed) return
+    /** 任务刷新与画布 revision 无关，仅保留最后一次请求结果。 */
+    const requestSequence = latestJobLoadSequence + 1
+    latestJobLoadSequence = requestSequence
+    try {
+      /** 主进程返回当前项目的完整任务 journal 列表。 */
+      const jobs: DesignJobRecord[] = await dependencies.adapter.listJobs(dependencies.projectId)
+      if (disposed || requestSequence !== latestJobLoadSequence) return
+      dependencies.updateState({ jobs })
+    } catch {
+      /** journal 短暂不可读时保留现有任务，不影响用户继续使用已加载画布。 */
+    }
+  }
 
   /**
    * 加载并按返回时最新状态决定是否提交快照。
@@ -533,10 +555,16 @@ export function createDesignWorkspaceController(
     start: () => {
       if (disposed || unsubscribe) return
       unsubscribe = dependencies.adapter.onChanged((change) => {
+        if (change.projectId !== dependencies.projectId) return
+        if (change.cause === 'job') {
+          void refreshJobs()
+          return
+        }
         /** 事件到达时的最新项目状态。 */
         const latest = dependencies.getState()
         if (shouldRefreshDesignSnapshot(dependencies.projectId, latest, change)) void loadSnapshot()
       })
+      void refreshJobs()
       /** mount 时优先恢复上个 controller 留下的 revision 冲突。 */
       const current = dependencies.getState()
       if (current.authoritativeRecoveryState !== 'idle') {

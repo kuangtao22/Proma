@@ -1,10 +1,17 @@
 import * as React from 'react'
 import type { Node, NodeProps } from '@xyflow/react'
-import { ImageOff, LoaderCircle, RotateCcw } from 'lucide-react'
+import { ImageOff, LoaderCircle, RotateCcw, Square } from 'lucide-react'
+import { useSetAtom } from 'jotai'
+import { toast } from 'sonner'
+import {
+  requestDesignRecoveryAtom,
+  updateDesignProjectStateAtom,
+} from '@/atoms/design-atoms'
 import { Button } from '@/components/ui/button'
+import { designAdapter } from '@/lib/design-adapter'
 import { cn } from '@/lib/utils'
 
-export type DesignAssetNodeStatus = 'success' | 'queued' | 'running' | 'failed' | 'cancelled' | 'missing'
+export type DesignAssetNodeStatus = 'success' | 'queued' | 'running' | 'failed' | 'cancelled' | 'interrupted' | 'missing'
 
 /** XYFlow 节点允许公开的安全展示数据。 */
 export interface DesignAssetNodeData extends Record<string, unknown> {
@@ -16,6 +23,8 @@ export interface DesignAssetNodeData extends Record<string, unknown> {
   assetId?: string
   /** 任务稳定 ID，仅任务节点存在。 */
   jobId?: string
+  /** 任务所属项目 ID，仅任务节点存在。 */
+  projectId?: string
   /** 节点主标题，不包含本地路径。 */
   title: string
   /** 经过媒体授权协议保护的缩略图 URL。 */
@@ -43,6 +52,7 @@ const STATUS_LABELS: Record<DesignAssetNodeStatus, string> = {
   running: '正在生成',
   failed: '生成失败',
   cancelled: '已取消',
+  interrupted: '已中断',
   missing: '素材缺失',
 }
 
@@ -58,15 +68,69 @@ export function DesignAssetNode({
   selected,
   onRetry,
 }: DesignAssetNodeProps): React.ReactElement {
+  const updateProjectState = useSetAtom(updateDesignProjectStateAtom)
+  const requestRecovery = useSetAtom(requestDesignRecoveryAtom)
   /** 持久化节点宽度缺失时使用首版标准宽度。 */
   const stableWidth = width ?? 320
   /** 持久化节点高度缺失时使用首版标准高度。 */
   const stableHeight = height ?? 240
-  /** 只有失败和取消的任务允许出现重试入口。 */
+  /** 失败、取消和进程中断的任务允许出现重试入口。 */
   const canRetry = data.kind === 'job'
-    && (data.status === 'failed' || data.status === 'cancelled')
+    && (data.status === 'failed' || data.status === 'cancelled' || data.status === 'interrupted')
+  /** 外部测试回调优先；生产节点可凭完整项目和任务 ID 直接重试。 */
+  const retryEnabled = Boolean(onRetry || (data.projectId && data.jobId))
+  /** 只有等待或运行中的真实任务允许取消。 */
+  const canCancel = data.kind === 'job'
+    && (data.status === 'queued' || data.status === 'running')
+    && Boolean(data.projectId && data.jobId)
   /** 已完成且持有授权 URL 的素材才渲染图片。 */
   const showsPreview = data.status === 'success' && Boolean(data.previewUrl)
+
+  /** 通过主进程创建新的可追踪任务，旧 journal 继续保留审计。 */
+  const handleRetry = (): void => {
+    if (!data.jobId) return
+    if (onRetry) {
+      onRetry(data.jobId)
+      return
+    }
+    if (!data.projectId) return
+    /** 闭包内收窄后的稳定项目 ID，供异步回调按项目更新 Jotai。 */
+    const projectId = data.projectId
+    void designAdapter.retryJob({ projectId, jobId: data.jobId }).then((job) => {
+      updateProjectState({
+        projectId,
+        update: (current) => ({
+          jobs: [...current.jobs.filter((candidate) => candidate.id !== job.id), job],
+        }),
+      })
+    }).catch((error: unknown) => {
+      if (error instanceof Error && error.message.includes('DESIGN_RECOVERY_REQUIRED')) {
+        requestRecovery({ projectId })
+      }
+      toast.error(error instanceof Error ? error.message : '重试设计任务失败')
+    })
+  }
+
+  /** 请求主进程停止对应 Pi generation，并采用其竞态判定后的 journal 终态。 */
+  const handleCancel = (): void => {
+    if (!data.projectId || !data.jobId) return
+    /** 闭包内收窄后的稳定项目和任务 ID。 */
+    const projectId = data.projectId
+    const jobId = data.jobId
+    void designAdapter.cancelJob({ projectId, jobId }).then((job) => {
+      updateProjectState({
+        projectId,
+        update: (current) => ({
+          jobs: [...current.jobs.filter((candidate) => candidate.id !== job.id), job],
+        }),
+      })
+    }).catch((error: unknown) => {
+      if (error instanceof Error && error.message.includes('DESIGN_RECOVERY_REQUIRED')) {
+        requestRecovery({ projectId })
+      }
+      toast.error(error instanceof Error ? error.message : '取消设计任务失败')
+    })
+  }
 
   return (
     <article
@@ -111,11 +175,23 @@ export function DesignAssetNode({
               variant="ghost"
               size="sm"
               className="nodrag shrink-0"
-              disabled={!onRetry || !data.jobId}
-              onClick={() => data.jobId && onRetry?.(data.jobId)}
+              disabled={!retryEnabled || !data.jobId}
+              onClick={handleRetry}
             >
               <RotateCcw className="size-3.5" aria-hidden="true" />
               重试生成
+            </Button>
+          )}
+          {canCancel && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="nodrag shrink-0"
+              onClick={handleCancel}
+            >
+              <Square className="size-3.5" aria-hidden="true" />
+              取消生成
             </Button>
           )}
         </footer>

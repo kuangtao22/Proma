@@ -79,6 +79,7 @@ for (const key of Object.keys(process.env)) {
 
 import { createApplicationMenu } from './menu'
 import { registerIpcHandlers } from './ipc'
+import { getDefaultDesignJobManager } from './lib/design/design-job-manager'
 import { createTray, destroyTray, getTray, setTrayFlash } from './tray'
 import { initializeRuntime } from './lib/runtime-init'
 import { seedDefaultSkills } from './lib/config-paths'
@@ -831,6 +832,9 @@ async function bootstrap(): Promise<void> {
   // Register IPC handlers
   registerIpcHandlers()
 
+  // IPC 初始化默认 Manager 后，收敛上次进程遗留的运行中 Design Job。
+  safeRun('recoverDesignJobs', () => { getDefaultDesignJobManager()?.recoverAll() })
+
   // 收敛上次退出时遗留的运行中委派子会话（内存态丢失，无法续跑）
   safeRun('markRunningDelegationsAsInterrupted', markRunningDelegationsAsInterrupted)
 
@@ -1049,6 +1053,9 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   // 标记正在退出，让 close 事件不再阻止关闭
   setQuitting()
+
+  // Agent 关闭前先持久标记 Design Job，迟到完成回调不得继续导入图片。
+  getDefaultDesignJobManager()?.markRunningInterrupted()
 
   // 中止所有活跃的 Agent 和 Chat 子进程
   stopAllAgents()

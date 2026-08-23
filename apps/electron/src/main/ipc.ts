@@ -171,6 +171,11 @@ import {
 } from './lib/local-file-protocol'
 import { DesignAssetService } from './lib/design/design-asset-service'
 import { registerDesignIpcHandlers } from './lib/design/design-ipc'
+import {
+  DesignJobManager,
+  resolveOwnedDesignJobOutputPath,
+  setDefaultDesignJobManager,
+} from './lib/design/design-job-manager'
 import { designPathResolver } from './lib/design/design-paths'
 import { designStore } from './lib/design/design-store'
 import { registerUpdaterIpc } from './lib/updater/updater-ipc'
@@ -294,7 +299,7 @@ import {
   searchAgentSessionMessages,
   searchAgentSessionReferences,
 } from './lib/agent-session-manager'
-import { agentEventBus, runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, reserveAgentSessionStart, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
+import { agentEventBus, runAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, reserveAgentSessionStart, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import {
   getDefaultWorkspaceProjectRelocator,
@@ -1065,6 +1070,21 @@ export function registerIpcHandlers(): void {
     registerRetainedDirectoryPaths: registerRetainedPromaDirectoryPaths,
     revokePathUrl: revokePromaPathUrl,
   })
+  /** Design Job 复用可见 Pi 会话和同一素材/Store 边界，不创建第二套 runtime。 */
+  const designJobManager = new DesignJobManager({
+    pathResolver: designPathResolver,
+    store: designStore,
+    assetService: designAssetService,
+    getSettings,
+    getSession: getAgentSessionMeta,
+    createSession: createAgentSession,
+    updateSession: (sessionId, updates) => { updateAgentSessionMeta(sessionId, updates) },
+    runHeadless: runAgentHeadless,
+    stopAgent,
+    resolveOwnedOutputPath: resolveOwnedDesignJobOutputPath,
+    listProjectIds: () => listAgentWorkspaces().map((workspace) => workspace.id),
+  })
+  setDefaultDesignJobManager(designJobManager)
   registerDesignIpcHandlers({
     ipc: ipcMain,
     listAuthorizedWebContents: () => {
@@ -1074,6 +1094,7 @@ export function registerIpcHandlers(): void {
     guard: workspaceOperationGuard,
     store: designStore,
     assets: designAssetService,
+    jobs: designJobManager,
     getProjectReadOnlyReason: (projectId) => {
       /** 未登记项目仍交给 store 抛出明确的项目不存在错误。 */
       const workspace = getAgentWorkspace(projectId)

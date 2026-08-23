@@ -62,6 +62,7 @@ import type { PermissionResult, CanUseToolOptions } from './agent-permission-ser
 import { resolvePlanningDeletionPermission } from './planning-permission-policy'
 import { askUserService } from './agent-ask-user-service'
 import { exitPlanService, type ExitPlanPermissionResult } from './agent-exit-plan-service'
+import { denyToolOutsideRunAllowlist } from './agent-run-tool-policy'
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
@@ -681,7 +682,7 @@ export class AgentOrchestrator {
   async sendMessage(
     input: AgentSendInput,
     callbacks: SessionCallbacks,
-    extensions: { piCustomTools?: ToolDefinition[] } = {},
+    extensions: { piCustomTools?: ToolDefinition[]; allowedToolNames?: readonly string[] } = {},
   ): Promise<void> {
     const { sessionId, userMessage, rawUserMessage, userMessageUuid, channelId, modelId, workspaceId: requestedWorkspaceId, additionalDirectories, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid } = input
     const streamStartedAt = input.startedAt ?? Date.now()
@@ -1275,6 +1276,9 @@ export class AgentOrchestrator {
         /** 工具调用进入权限边界时的代际检查。 */
         const staleAtEntry = denyStaleToolRun()
         if (staleAtEntry) return staleAtEntry
+        /** 单次运行白名单先于参数解析生效，bypassPermissions 也不能绕过。 */
+        const runPolicyDenial = denyToolOutsideRunAllowlist(toolName, extensions.allowedToolNames)
+        if (runPolicyDenial) return runPolicyDenial
         const currentMode = getPermissionMode()
 
         // ── 参数校验守卫（所有模式、所有工具，优先于权限检查） ──

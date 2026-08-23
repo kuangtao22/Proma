@@ -13,6 +13,7 @@ import type { DesignAdapter } from '@/lib/design-adapter'
 import {
   createDesignEditJobInput,
   createDesignGenerationJobInput,
+  DesignInspector,
   DesignInspectorStateView,
   serializeDesignGenerationPrompt,
   useDesignVersionRows,
@@ -86,6 +87,26 @@ function renderInspector(
 }
 
 describe('Design Inspector 状态', () => {
+  test('Given connected 可写项目 When 未注入外部任务回调 Then 生成表单仍由内置 adapter 启用', () => {
+    const store = createStore()
+    store.set(designProjectStatesAtom, new Map([['project-1', {
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: createSnapshot(),
+      generationPrompt: '生成活动海报',
+      inspectorTab: 'ai',
+    }]]))
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <DesignInspector projectId="project-1" />
+      </Provider>,
+    )
+
+    expect(html).toMatch(/id="design-generation-prompt"(?![^>]*disabled)/)
+    expect(html).toMatch(/type="submit"(?![^>]*disabled)[^>]*>[\s\S]*生成图片/)
+  })
+
   test('Given 空选区 When 渲染素材与 AI 标签 Then 显示项目素材和生成表单', () => {
     const html = renderInspector([])
 
@@ -377,6 +398,7 @@ describe('Design Inspector 纯业务契约', () => {
       adapter: {
         load: async () => { loadCount += 1; return authoritativeSnapshot },
         save: async () => authoritativeSnapshot.document,
+        listJobs: async () => [],
         onChanged: () => () => undefined,
         releaseMediaAccess: async () => undefined,
       },

@@ -230,6 +230,8 @@ export function setVisibleAgentSession(webContents: WebContents, sessionId: stri
 /** 仅主进程内部使用的单次运行扩展，绝不经 IPC 序列化。 */
 export interface AgentRunExtensions {
   piCustomTools?: ToolDefinition[]
+  /** 本次运行允许的完整工具名；缺失时保持普通 Agent 权限行为。 */
+  allowedToolNames?: readonly string[]
 }
 
 /**

@@ -73,16 +73,22 @@ describe('Design 素材节点', () => {
   })
 
   test('Given 排队和运行任务 When 渲染 Then 显示明确进度状态且不提供重试', () => {
-    const queued = renderStatus({ kind: 'job', status: 'queued', jobId: 'job-1', title: '图片任务' })
-    const running = renderStatus({ kind: 'job', status: 'running', jobId: 'job-2', title: '图片任务' })
+    const queued = renderStatus({
+      kind: 'job', status: 'queued', projectId: 'project-1', jobId: 'job-1', title: '图片任务',
+    })
+    const running = renderStatus({
+      kind: 'job', status: 'running', projectId: 'project-1', jobId: 'job-2', title: '图片任务',
+    })
 
     expect(queued).toContain('等待生成')
     expect(running).toContain('正在生成')
     expect(queued).not.toContain('重试生成')
     expect(running).not.toContain('重试生成')
+    expect(queued).toMatch(/type="button"(?![^>]*disabled)[^>]*>[\s\S]*取消生成/)
+    expect(running).toMatch(/type="button"(?![^>]*disabled)[^>]*>[\s\S]*取消生成/)
   })
 
-  test('Given 失败或取消任务 When 渲染 Then 仅这两态提供重试入口', () => {
+  test('Given 失败、取消或中断任务 When 渲染 Then 这些终态提供重试入口', () => {
     const failed = renderStatus({
       kind: 'job',
       status: 'failed',
@@ -91,12 +97,22 @@ describe('Design 素材节点', () => {
       error: '模型返回失败',
     })
     const cancelled = renderStatus({ kind: 'job', status: 'cancelled', jobId: 'job-2', title: '图片任务' })
+    const interrupted = renderStatus({
+      kind: 'job',
+      status: 'interrupted',
+      projectId: 'project-1',
+      jobId: 'job-3',
+      title: '图片任务',
+    })
 
     expect(failed).toContain('生成失败')
     expect(failed).toContain('模型返回失败')
     expect(failed).toContain('重试生成')
     expect(cancelled).toContain('已取消')
     expect(cancelled).toContain('重试生成')
+    expect(interrupted).toContain('已中断')
+    expect(interrupted).toContain('重试生成')
+    expect(interrupted).toMatch(/type="button"(?![^>]*disabled)[^>]*>[\s\S]*重试生成/)
   })
 
   test('Given 素材记录缺失 When 渲染 Then 明确提示素材缺失且不提供任务重试', () => {
