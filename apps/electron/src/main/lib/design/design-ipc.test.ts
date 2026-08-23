@@ -163,6 +163,14 @@ function createFixture(): {
       reconcilePendingTerminals: () => [],
       onChanged: () => () => undefined,
     },
+    sessionBridge: {
+      prepareAssetForSession: () => {
+        throw new Error('测试未配置 Design 会话素材准备')
+      },
+      importAgentImage: async () => {
+        throw new Error('测试未配置 Agent 图片导入')
+      },
+    },
     pickImageFiles: async () => ['/trusted/a.png'],
     pickRelinkImageFile: async () => '/trusted/relinked.png',
     pickExportPath: async () => '/trusted/export.png',
@@ -250,6 +258,57 @@ describe('Design IPC', () => {
     ])
     expect(fixture.senders[0]?.sent.at(-1)?.value).toMatchObject({
       projectId: 'project-1', cause: 'job', revision: 42,
+    })
+  })
+
+  test('Given Design 与会话双向传递 When 调用 IPC Then prepare 只读且 import 受写守卫并广播素材 revision', async () => {
+    const fixture = createFixture()
+    /** 记录桥方法调用，确认 IPC 不绕过主进程归属服务。 */
+    const bridgeCalls: string[] = []
+    Object.assign(fixture.options, {
+      sessionBridge: {
+        prepareAssetForSession: (input: { sessionId: string }) => {
+          bridgeCalls.push(`prepare:${input.sessionId}`)
+          return {
+            sessionId: input.sessionId,
+            path: '/project/.proma/design/assets/a.png',
+            name: 'a.png',
+            isDirectory: false as const,
+            scope: 'project' as const,
+          }
+        },
+        importAgentImage: async (input: { sessionId: string }) => {
+          bridgeCalls.push(`import:${input.sessionId}`)
+          /** 模拟 bridge 已提交的新权威 revision。 */
+          const importedDocument = { ...fixture.document, revision: 7 }
+          return { document: importedDocument, writable: true }
+        },
+      },
+    })
+    registerDesignIpcHandlers(fixture.options)
+
+    const prepared = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.PREPARE_ASSET_FOR_SESSION,
+      fixture.senders[0]!,
+      { projectId: 'project-1', assetId: 'asset-1', sessionId: 'session-1' },
+    )
+    const imported = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.IMPORT_AGENT_IMAGE,
+      fixture.senders[0]!,
+      {
+        projectId: 'project-1', sessionId: 'session-1', localPath: 'session-1/a.png',
+        position: { x: 10, y: 20 },
+      },
+    ) as DesignWorkspaceSnapshot
+
+    expect(prepared).toMatchObject({ sessionId: 'session-1', scope: 'project' })
+    expect(imported.document.revision).toBe(7)
+    expect(bridgeCalls).toEqual(['prepare:session-1', 'import:session-1'])
+    expect(fixture.guardProjects).toEqual(['project-1'])
+    expect(fixture.senders[0]?.sent.at(-1)?.value).toEqual({
+      projectId: 'project-1', revision: 7, cause: 'asset',
     })
   })
 

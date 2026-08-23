@@ -197,6 +197,8 @@ export interface SDKToolResultBlock {
   tool_use_id: string
   content?: unknown
   is_error?: boolean
+  /** MCP 工具结果落盘后的本地图片引用，不包含图片二进制。 */
+  imageAttachments?: AgentToolResultImage[]
 }
 
 /** SDK user 消息内容块联合类型 */

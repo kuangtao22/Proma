@@ -49,6 +49,7 @@
 - 项目文件迁移复用 verified copier，并以活动数据根内的可恢复 journal 驱动 `会话路径 -> 工作区配置 -> projectRootPath` 三步幂等提交；复制、校验和提交失败均不删除源目录。
 - 项目迁移准入同时覆盖 Agent in-flight generation、自动标题等 generation-owned 写入、Automation、active/linked worktree 与受守卫 IPC；旧 Agent 代际通过唯一 query token 精确关闭，不会误停同会话的新运行。
 - 项目目录选择使用按窗口、用途和代次隔离的一次性 `selectionId`；重启遗留的 copying/verifying/failed journal 只能按已持久化 operation 继续或显式放弃，renderer 不可直接指定任意目标路径。
+- 设计素材与 Agent 会话双向传递以项目归属和当前会话持久化消息为唯一授权事实：设计素材只填入目标会话 composer、不自动发送；Agent 图片只接受该 session 的 `tool_result.imageAttachments.localPath` 精确匹配，并继续执行 realpath、允许根和图片签名校验，禁止扫描目录。新版 SDK JSONL 在主进程落盘时从 Nano Banana 本地标记结构化附件字段，旧 `AgentMessage.events` 保持兼容。
 
 ## 会话记录
 
@@ -99,3 +100,4 @@
 - 2026-08-23：Design Job output 在完整 workspace write lease 内采用 terminal pending journal 与 Store 素材/节点双事实对账，durability 不确定时不得提前 commit、rollback 或标 failed；retry 以 Store 当前 job 节点绑定为所有权事实，并通过旧 journal 的唯一 replacement ID 保证重复请求幂等。Renderer 将任务 journal/结构同步错误与画布保存错误分离，普通失败保留快照和 pending 并提供精确 revision 重试，`DESIGN_RECOVERY_REQUIRED` 统一转入权威恢复。
 - 2026-08-23：Design IPC 的权威 `LOAD` 完成后必须在同进程触发 terminal pending 二次对账，不能只依赖重启恢复。retry 在创建 replacement 前先持久化包含预分配 ID 的 pending intent；重复 retry 或启动恢复必须同时核对旧 journal、replacement journal 与 Store 节点绑定，续建同一 replacement 或拒绝第三方接管。Renderer 任务结构快照 revision 低于任务事件 revision 时保持同步失败并按原目标 revision 重试，禁止把陈旧快照当作 idle 成功。
 - 2026-08-23：重启恢复在补完 pending retry intent 并新建 replacement 后，必须在同一次恢复中把新任务立即收敛为 interrupted；恢复只重建可重试状态，不自动调用付费 Agent run，后续运行必须由用户显式 retry。
+- 2026-08-23：完成项目设计素材与 Agent 会话双向传递：Inspector 仅列同项目未归档会话并优先当前会话，素材引用只进入输入框；Nano Banana 图片结果可原地加入所属项目设计，无项目会话禁用入口，成功不切页。

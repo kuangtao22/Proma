@@ -14,7 +14,10 @@ import type {
   DesignPoint,
   DesignWorkspaceSnapshot,
   ExportDesignAssetInput,
+  ImportAgentImageInput,
   ImportDesignAssetsInput,
+  PrepareDesignAssetForSessionInput,
+  PreparedDesignAssetMention,
   RelinkDesignAssetInput,
   SaveDesignMutationsInput,
 } from '@proma/shared'
@@ -23,6 +26,7 @@ import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
 import type { DesignAssetImportBatch, DesignAssetService } from './design-asset-service'
 import type { DesignStore } from './design-store'
 import type { DesignJobManager } from './design-job-manager'
+import type { DesignSessionBridge } from './design-session-bridge'
 
 /** Renderer 可提交的画布 mutation 白名单，素材元数据只能由主进程服务维护。 */
 const RENDERER_MUTATION_TYPES = new Set<DesignMutation['type']>([
@@ -75,6 +79,12 @@ export interface DesignIpcJobManager extends Pick<
   'create' | 'run' | 'cancel' | 'retry' | 'list' | 'reconcilePendingTerminals' | 'onChanged'
 > {}
 
+/** IPC 层实际使用的 Design/Agent 会话桥窄接口。 */
+export interface DesignIpcSessionBridge extends Pick<
+  DesignSessionBridge,
+  'prepareAssetForSession' | 'importAgentImage'
+> {}
+
 /** 注册 Design IPC 所需的可信主进程依赖。 */
 export interface DesignIpcOptions {
   ipc: DesignIpcRegistrar
@@ -83,6 +93,7 @@ export interface DesignIpcOptions {
   store: DesignStore
   assets: DesignIpcAssetService
   jobs: DesignIpcJobManager
+  sessionBridge: DesignIpcSessionBridge
   pickImageFiles: (sender: WebContents) => Promise<string[]>
   pickRelinkImageFile: (sender: WebContents) => Promise<string | null>
   pickExportPath: (sender: WebContents, filename: string) => Promise<string | null>
@@ -250,6 +261,36 @@ function parseImportAssetsInput(value: unknown): ImportDesignAssetsInput {
     projectId: value.projectId,
     expectedRevision: value.expectedRevision,
     viewportCenter: value.viewportCenter,
+  }
+}
+
+/** 解析设计素材发送到项目会话的只读请求。 */
+function parsePrepareAssetForSessionInput(value: unknown): PrepareDesignAssetForSessionInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'assetId', 'sessionId'])
+    || !isNonEmptyString(value.projectId)
+    || !isNonEmptyString(value.assetId)
+    || !isNonEmptyString(value.sessionId)) throw new Error('Design 请求结构无效')
+  return {
+    projectId: value.projectId,
+    assetId: value.assetId,
+    sessionId: value.sessionId,
+  }
+}
+
+/** 解析 Agent 图片加入画布的受控请求。 */
+function parseImportAgentImageInput(value: unknown): ImportAgentImageInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'sessionId', 'localPath', 'position'])
+    || !isNonEmptyString(value.projectId)
+    || !isNonEmptyString(value.sessionId)
+    || !isNonEmptyString(value.localPath)
+    || !isPoint(value.position)) throw new Error('Design 请求结构无效')
+  return {
+    projectId: value.projectId,
+    sessionId: value.sessionId,
+    localPath: value.localPath,
+    position: value.position,
   }
 }
 
@@ -454,6 +495,8 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     DESIGN_IPC_CHANNELS.CANCEL_JOB,
     DESIGN_IPC_CHANNELS.RETRY_JOB,
     DESIGN_IPC_CHANNELS.LIST_JOBS,
+    DESIGN_IPC_CHANNELS.PREPARE_ASSET_FOR_SESSION,
+    DESIGN_IPC_CHANNELS.IMPORT_AGENT_IMAGE,
     DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS,
   ]
   for (const channel of channels) options.ipc.removeHandler(channel)
@@ -660,6 +703,28 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseProjectInput(value)
     return options.jobs.list(input.projectId)
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.PREPARE_ASSET_FOR_SESSION, async (event, value): Promise<PreparedDesignAssetMention> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parsePrepareAssetForSessionInput(value)
+    return options.sessionBridge.prepareAssetForSession(input)
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.IMPORT_AGENT_IMAGE, async (event, value): Promise<DesignWorkspaceSnapshot> => {
+    const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseImportAgentImageInput(value)
+    const snapshot = await options.guard.runWorkspaceWrite(
+      input.projectId,
+      () => options.sessionBridge.importAgentImage(input),
+    )
+    rememberDocument(input.projectId, snapshot.document)
+    broadcastChange(options, {
+      projectId: input.projectId,
+      revision: snapshot.document.revision,
+      cause: 'asset',
+    })
+    return attachMediaAccess(sender, input.projectId, snapshot)
   })
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS, async (event, value): Promise<void> => {

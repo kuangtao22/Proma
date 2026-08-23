@@ -16,13 +16,22 @@ import {
   Loader2,
   Brain,
   MessageSquareText,
+  ImagePlus,
 } from 'lucide-react'
+import { useAtomValue } from 'jotai'
+import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { MessageResponse } from '@/components/ai-elements/message'
 import { getToolIcon, extractFilePath } from './tool-utils'
 import { getToolPhrase, getToolResultSummary, shouldShowToolKindLabel } from './tool-phrase'
 import { ToolResultRenderer } from './tool-result-renderers'
 import { PreviewOpenButton } from './tool-result-renderers/preview-open-button'
+import { Button } from '@/components/ui/button'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { agentSessionsAtom } from '@/atoms/agent-atoms'
+import { activeSessionIdAtom } from '@/atoms/tab-atoms'
+import { designAdapter } from '@/lib/design-adapter'
+import { importAgentToolResultImagesToDesign } from '@/lib/agent-design-actions'
 import { getTaskGetStatusLabel, parseTaskGetResult, type ParsedTaskGetResult } from './tool-result-renderers/task-get-result'
 import { parseTaskListResult, type ParsedTaskListItem } from './tool-result-renderers/task-list-result'
 import { formatDuration } from './AgentMessages'
@@ -36,6 +45,7 @@ import type {
   SDKUserMessage,
   SDKToolResultBlock,
   SDKSystemMessage,
+  AgentToolResultImage,
 } from '@proma/shared'
 
 // ===== useToolResult Hook =====
@@ -43,6 +53,7 @@ import type {
 interface ToolResultData {
   result?: string
   isError?: boolean
+  imageAttachments?: AgentToolResultImage[]
 }
 
 /** 在 allMessages 中查找匹配 toolUseId 的工具结果 */
@@ -67,7 +78,11 @@ function useToolResult(toolUseId: string, allMessages: SDKMessage[]): ToolResult
                 .map((c) => c.text)
                 .join('\n')
             }
-            return { result, isError: resultBlock.is_error }
+            return {
+              result,
+              isError: resultBlock.is_error,
+              imageAttachments: resultBlock.imageAttachments,
+            }
           }
         }
       }
@@ -333,11 +348,54 @@ interface ToolUseBlockProps {
   isStreaming?: boolean
 }
 
+/** 仅 Nano Banana 图片结果挂载该组件，避免普通工具行订阅会话列表。 */
+function AddToolImagesToDesignButton({ images }: { images: AgentToolResultImage[] }): React.ReactElement {
+  const activeSessionId = useAtomValue(activeSessionIdAtom)
+  const sessions = useAtomValue(agentSessionsAtom)
+  /** 当前消息所属会话的项目 ID 决定“加入设计”是否可用。 */
+  const projectId = sessions.find((session) => session.id === activeSessionId)?.workspaceId
+  const canImportToDesign = Boolean(activeSessionId && projectId)
+
+  /** 导入当前 Nano Banana 工具结果的全部图片，不改变当前页面。 */
+  const handleImportToDesign = React.useCallback(async (): Promise<void> => {
+    if (!activeSessionId || !projectId) return
+    try {
+      await importAgentToolResultImagesToDesign({
+        projectId,
+        sessionId: activeSessionId,
+        images,
+      }, { importImage: designAdapter.importAgentImage })
+      toast.success('已加入设计')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '加入设计失败')
+    }
+  }, [activeSessionId, images, projectId])
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label="加入设计"
+          disabled={!canImportToDesign}
+          onClick={() => { void handleImportToDesign() }}
+        >
+          <ImagePlus aria-hidden="true" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top">{projectId ? '加入设计' : '该会话不属于项目'}</TooltipContent>
+    </Tooltip>
+  )
+}
+
 function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed = false, childBlocks, basePath, isStreaming }: ToolUseBlockProps): React.ReactElement {
   const [expanded, setExpanded] = React.useState(false)
   const toolResult = useToolResult(block.id, allMessages)
   const resultText = toolResult?.result
   const isError = toolResult?.isError === true
+  const imageAttachments = toolResult?.imageAttachments ?? []
   const shouldShowResult = !!resultText
   const taskGetSummary = React.useMemo(() => {
     if (block.name !== 'TaskGet' || !resultText || isError) return null
@@ -478,6 +536,7 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
       )}
       style={animate ? { animationDelay: delay } : undefined}
     >
+      <div className="flex min-w-0 items-center gap-1">
         <button
           type="button"
           className="group inline-flex max-w-full min-w-0 items-center gap-2 rounded-md py-1 text-left transition-[background-color,opacity] hover:bg-muted/40 hover:opacity-90"
@@ -545,6 +604,10 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
             <PreviewOpenButton filePath={filePath} />
           )}
         </button>
+        {block.name === 'mcp__nano_banana__generate_image' && imageAttachments.length > 0 && (
+          <AddToolImagesToDesignButton images={imageAttachments} />
+        )}
+      </div>
 
       {shouldShowResult && resultText && expanded && (
         <div className={cn(

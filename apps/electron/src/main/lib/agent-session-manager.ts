@@ -34,6 +34,8 @@ import type {
   AgentMessage,
   SDKMessage,
   SDKUserMessage,
+  SDKToolResultBlock,
+  AgentToolResultImage,
   SkillActivation,
   AgentWorkspace,
   ForkSessionInput,
@@ -1154,13 +1156,15 @@ function serializeSDKMessageForStorage(
   sourceDir?: string,
   destDir?: string,
 ): string {
-  let serialized = JSON.stringify(msg)
+  /** Nano Banana 的文本标记在落盘时提升为结构化附件，供重启后的 UI 与授权桥共同使用。 */
+  const messageWithImages = attachToolResultImages(msg)
+  let serialized = JSON.stringify(messageWithImages)
   if (sourceDir && destDir) {
     serialized = rewriteSourceToDest(serialized, sourceDir, destDir)
   }
   if (serialized.length <= MAX_SDK_MESSAGE_LENGTH) return serialized
 
-  let sanitized = JSON.stringify(sanitizeOversizedMessage(msg, serialized.length))
+  let sanitized = JSON.stringify(sanitizeOversizedMessage(messageWithImages, serialized.length))
   if (sourceDir && destDir) {
     sanitized = rewriteSourceToDest(sanitized, sourceDir, destDir)
   }
@@ -1168,6 +1172,71 @@ function serializeSDKMessageForStorage(
     console.warn(`[Agent 会话] 消息截断后仍超限 (${(sanitized.length / 1024).toFixed(0)}K chars)`)
   }
   return sanitized
+}
+
+/** Nano Banana MCP 在工具文本中写入的稳定图片附件标记。 */
+const AGENT_IMAGE_ATTACHMENT_PATTERN = /\[PROMA_IMAGE_ATTACHMENT:(\{[^\r\n]*?\})\]/g
+
+/** 从工具结果文本中解析经过基本字段验证的图片附件。 */
+export function parseToolResultImageAttachments(content: unknown): AgentToolResultImage[] {
+  /** 工具结果可能是字符串，也可能是 SDK 文本块数组。 */
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.map((item) => (
+          item && typeof item === 'object' && 'text' in item && typeof item.text === 'string'
+            ? item.text
+            : ''
+        )).join('\n')
+      : ''
+  /** 每次调用创建独立正则，避免全局 lastIndex 污染后续消息。 */
+  const pattern = new RegExp(AGENT_IMAGE_ATTACHMENT_PATTERN.source, 'g')
+  const images: AgentToolResultImage[] = []
+  for (const match of text.matchAll(pattern)) {
+    try {
+      /** JSON 字段由本地主进程 MCP 生成，仍需在进入授权证据前逐字段验证。 */
+      const value = JSON.parse(match[1]!) as Record<string, unknown>
+      if (
+        typeof value.localPath === 'string'
+        && typeof value.filename === 'string'
+        && typeof value.mediaType === 'string'
+        && value.mediaType.startsWith('image/')
+      ) {
+        images.push({
+          localPath: value.localPath,
+          filename: value.filename,
+          mediaType: value.mediaType,
+        })
+      }
+    } catch {
+      // 损坏标记保留在原始结果文本中，但不能成为文件授权证据。
+    }
+  }
+  return images
+}
+
+/** 为 user/tool_result SDK 消息补充结构化图片附件，不改变其它消息。 */
+function attachToolResultImages(message: SDKMessage): SDKMessage {
+  if (message.type !== 'user') return message
+  /** SDK user content 之外的消息结构保持原引用，减少正常消息落盘开销。 */
+  const content = (message as SDKUserMessage).message?.content
+  if (!Array.isArray(content)) return message
+  let changed = false
+  const nextContent = content.map((block) => {
+    if (block.type !== 'tool_result') return block
+    const result = block as SDKToolResultBlock
+    if (result.imageAttachments?.length) return block
+    /** 只有存在有效本地附件标记时才复制块。 */
+    const imageAttachments = parseToolResultImageAttachments(result.content)
+    if (imageAttachments.length === 0) return block
+    changed = true
+    return { ...result, imageAttachments }
+  })
+  if (!changed) return message
+  return {
+    ...message,
+    message: { ...(message as SDKUserMessage).message, content: nextContent },
+  } as SDKMessage
 }
 
 async function writeJsonlLine(stream: WriteStream, line: string): Promise<void> {

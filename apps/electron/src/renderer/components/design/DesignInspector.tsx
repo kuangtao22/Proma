@@ -1,5 +1,6 @@
 import * as React from 'react'
 import type {
+  AgentSessionMeta,
   CreateDesignJobInput,
   DesignAsset,
 } from '@proma/shared'
@@ -13,13 +14,21 @@ import {
   requestDesignRecoveryAtom,
   updateDesignProjectStateAtom,
 } from '@/atoms/design-atoms'
+import { agentSessionsAtom } from '@/atoms/agent-atoms'
+import { activeSessionIdAtom } from '@/atoms/tab-atoms'
+import { activeViewAtom } from '@/atoms/active-view'
 import type { DesignProjectState } from '@/atoms/design-atoms'
 import { Button } from '@/components/ui/button'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { designAdapter } from '@/lib/design-adapter'
+import { sendPreparedDesignAssetToSession } from '@/lib/design-session-actions'
+import { dispatchInsertFileMention } from '@/lib/file-panel-drag'
+import { useOpenSession } from '@/hooks/useOpenSession'
 import { cn } from '@/lib/utils'
 import {
   buildDesignVersionTree,
@@ -113,6 +122,8 @@ export interface DesignInspectorStateViewProps {
   onDeleteAsset: (assetId: string) => void
   onRelinkAsset: (assetId: string) => void
   onExportAsset: (assetId: string) => void
+  targetSessions?: AgentSessionMeta[]
+  onSendAssetToSession?: (assetId: string, sessionId: string) => void
   onGroupSelection: () => void
   onSelectAsset: (assetId: string) => void
   onClearSelection?: () => void
@@ -138,6 +149,8 @@ function AssetsPanel({
   onDeleteAsset,
   onRelinkAsset,
   onExportAsset,
+  targetSessions,
+  onSendAssetToSession,
   onGroupSelection,
   onSelectAsset,
   onPreviewError,
@@ -150,6 +163,8 @@ function AssetsPanel({
   onDeleteAsset: (assetId: string) => void
   onRelinkAsset: (assetId: string) => void
   onExportAsset: (assetId: string) => void
+  targetSessions: AgentSessionMeta[]
+  onSendAssetToSession?: (assetId: string, sessionId: string) => void
   onGroupSelection: () => void
   onSelectAsset: (assetId: string) => void
   onPreviewError: (assetId: string) => void
@@ -182,6 +197,25 @@ function AssetsPanel({
             </div>
             <div className="flex gap-1">
               <Button type="button" variant="outline" size="icon-sm" aria-label="导出素材" onClick={() => onExportAsset(selection.asset!.id)}><Download aria-hidden="true" /></Button>
+              <DropdownMenu>
+                <TooltipProvider delayDuration={200} disableHoverableContent>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <DropdownMenuTrigger asChild>
+                        <Button type="button" variant="outline" size="icon-sm" aria-label="发送素材到项目会话" disabled={targetSessions.length === 0 || !onSendAssetToSession}><Send aria-hidden="true" /></Button>
+                      </DropdownMenuTrigger>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">{targetSessions.length > 0 ? '发送到项目会话' : '暂无项目会话'}</TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+                <DropdownMenuContent align="start" className="min-w-44">
+                  {targetSessions.map((session) => (
+                    <DropdownMenuItem key={session.id} onSelect={() => onSendAssetToSession?.(selection.asset!.id, session.id)}>
+                      <span className="max-w-56 truncate">{session.title}</span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
               <Button type="button" variant="ghost" size="icon-sm" aria-label="删除素材" disabled={!writable} onClick={() => onDeleteAsset(selection.asset!.id)}><Trash2 aria-hidden="true" /></Button>
             </div>
           </div>
@@ -401,7 +435,7 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
           <TabsTrigger value="ai" className="min-w-0 px-1 text-xs">AI 编辑</TabsTrigger>
           <TabsTrigger value="versions" className="min-w-0 px-1 text-xs">版本</TabsTrigger>
         </TabsList>
-        <TabsContent value="assets" forceMount className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden"><AssetsPanel state={state} selection={selection} writable={writable} onImportAssets={props.onImportAssets} onDeleteAsset={props.onDeleteAsset} onRelinkAsset={props.onRelinkAsset} onExportAsset={props.onExportAsset} onGroupSelection={props.onGroupSelection} onSelectAsset={props.onSelectAsset} onPreviewError={(failedAssetId) => setMissingAssetIds((current) => new Set(current).add(failedAssetId))} onPreviewLoad={(loadedAssetId) => setMissingAssetIds((current) => { if (!current.has(loadedAssetId)) return current; const next = new Set(current); next.delete(loadedAssetId); return next })} /></TabsContent>
+        <TabsContent value="assets" forceMount className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden"><AssetsPanel state={state} selection={selection} writable={writable} onImportAssets={props.onImportAssets} onDeleteAsset={props.onDeleteAsset} onRelinkAsset={props.onRelinkAsset} onExportAsset={props.onExportAsset} targetSessions={props.targetSessions ?? []} onSendAssetToSession={props.onSendAssetToSession} onGroupSelection={props.onGroupSelection} onSelectAsset={props.onSelectAsset} onPreviewError={(failedAssetId) => setMissingAssetIds((current) => new Set(current).add(failedAssetId))} onPreviewLoad={(loadedAssetId) => setMissingAssetIds((current) => { if (!current.has(loadedAssetId)) return current; const next = new Set(current); next.delete(loadedAssetId); return next })} /></TabsContent>
         <TabsContent value="ai" forceMount className="mt-0 min-h-0 flex-1 overflow-y-auto px-3 py-3 data-[state=inactive]:hidden"><AiPanel state={state} selection={selection} writable={writable} createJobEnabled={props.createJobEnabled ?? true} onGenerationPromptChange={props.onGenerationPromptChange} onEditPromptChange={props.onEditPromptChange} onCreateJob={props.onCreateJob} /></TabsContent>
         <TabsContent value="versions" forceMount className="mt-0 min-h-0 flex-1 overflow-y-auto px-3 py-3 data-[state=inactive]:hidden"><h3 className="mb-2 text-xs font-semibold">素材版本</h3><VersionsPanel assets={state.snapshot.document.assets} currentAssetId={selection.asset?.id ?? null} onSelectAsset={props.onSelectAsset} /></TabsContent>
       </Tabs>
@@ -414,12 +448,35 @@ export interface DesignInspectorProps {
   width?: number
 }
 
+/** 只保留当前项目未归档会话，并把当前会话放在默认菜单首项。 */
+export function getDesignTargetSessions(
+  sessions: AgentSessionMeta[],
+  projectId: string,
+  activeSessionId: string | null,
+): AgentSessionMeta[] {
+  /** 筛选发生在菜单构建前，跨项目和归档会话不会进入可交互 DOM。 */
+  const candidates = sessions.filter((session) => session.workspaceId === projectId && !session.archived)
+  if (!activeSessionId) return candidates
+  return [...candidates].sort((left, right) => (
+    Number(right.id === activeSessionId) - Number(left.id === activeSessionId)
+  ))
+}
+
 /** 从项目 Jotai 状态连接右栏素材操作与真实 Design Job。 */
 export function DesignInspector({ projectId, width }: DesignInspectorProps): React.ReactElement {
   const states = useAtomValue(designProjectStatesAtom)
   const updateState = useSetAtom(updateDesignProjectStateAtom)
   const executeEdit = useSetAtom(executeDesignEditAtom)
   const requestRecovery = useSetAtom(requestDesignRecoveryAtom)
+  const sessions = useAtomValue(agentSessionsAtom)
+  const activeSessionId = useAtomValue(activeSessionIdAtom)
+  const setActiveView = useSetAtom(activeViewAtom)
+  const openSession = useOpenSession()
+  /** 当前项目内可接收素材的未归档会话，首项即默认目标。 */
+  const targetSessions = React.useMemo(
+    () => getDesignTargetSessions(sessions, projectId, activeSessionId),
+    [activeSessionId, projectId, sessions],
+  )
   /** 右栏只投递项目级恢复信号，由画布子树持有的 controller 消费。 */
   const handleRecoveryRequired = React.useCallback((): void => {
     requestRecovery({ projectId })
@@ -444,6 +501,20 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
       toast.error(error instanceof Error ? error.message : '创建设计任务失败')
     })
   }, [handleRecoveryRequired, projectId, updateState])
+  /** 准备受控素材引用并填入目标会话 composer，不触发 Agent 发送。 */
+  const handleSendAssetToSession = React.useCallback((assetId: string, sessionId: string): void => {
+    const session = targetSessions.find((candidate) => candidate.id === sessionId)
+    if (!session) return
+    void designAdapter.prepareAssetForSession({ projectId, assetId, sessionId }).then((prepared) => (
+      sendPreparedDesignAssetToSession(prepared, {
+        openSession: () => openSession('agent', session.id, session.title),
+        dispatchMention: dispatchInsertFileMention,
+        setActiveView,
+      })
+    )).then(() => toast.success('已添加到会话输入框')).catch((error: unknown) => {
+      toast.error(error instanceof Error ? error.message : '发送素材到会话失败')
+    })
+  }, [openSession, projectId, setActiveView, targetSessions])
   return (
     <DesignInspectorStateView
       state={state}
@@ -456,6 +527,8 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
       onDeleteAsset={actions.deleteAsset}
       onRelinkAsset={actions.relinkAsset}
       onExportAsset={actions.exportAsset}
+      targetSessions={targetSessions}
+      onSendAssetToSession={handleSendAssetToSession}
       onSelectAsset={actions.selectAsset}
       onClearSelection={() => updateState({ projectId, update: { selectedNodeIds: [], inspectorAssetId: null } })}
       onGroupSelection={() => executeEdit({ projectId, command: { type: 'group-selection', nodeIds: state.selectedNodeIds, groupId: globalThis.crypto.randomUUID(), name: `组 ${(state.snapshot?.document.groups.length ?? 0) + 1}` } })}

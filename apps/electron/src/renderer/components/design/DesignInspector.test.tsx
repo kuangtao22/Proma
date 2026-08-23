@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createEmptyDesignDocument } from '@proma/shared'
-import type { CreateDesignJobInput, DesignAsset, DesignWorkspaceSnapshot } from '@proma/shared'
+import type { AgentSessionMeta, CreateDesignJobInput, DesignAsset, DesignWorkspaceSnapshot } from '@proma/shared'
 import { createStore, Provider } from 'jotai'
 import * as React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -15,6 +15,7 @@ import {
   createDesignGenerationJobInput,
   DesignInspector,
   DesignInspectorStateView,
+  getDesignTargetSessions,
   serializeDesignGenerationPrompt,
   useDesignVersionRows,
 } from './DesignInspector'
@@ -87,6 +88,17 @@ function renderInspector(
 }
 
 describe('Design Inspector 状态', () => {
+  test('Given 多项目与归档会话 When 构建素材发送菜单 Then 只保留当前项目未归档 Agent 会话并优先当前会话', () => {
+    const sessions: AgentSessionMeta[] = [
+      { id: 'same-1', title: '项目会话 1', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
+      { id: 'other', title: '其它项目', workspaceId: 'project-2', createdAt: 1, updatedAt: 1 },
+      { id: 'archived', title: '已归档', workspaceId: 'project-1', archived: true, createdAt: 1, updatedAt: 1 },
+      { id: 'same-2', title: '项目会话 2', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
+    ]
+
+    expect(getDesignTargetSessions(sessions, 'project-1', 'same-2').map((session) => session.id))
+      .toEqual(['same-2', 'same-1'])
+  })
   test('Given connected 可写项目 When 未注入外部任务回调 Then 生成表单仍由内置 adapter 启用', () => {
     const store = createStore()
     store.set(designProjectStatesAtom, new Map([['project-1', {

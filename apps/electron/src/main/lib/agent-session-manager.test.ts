@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import * as os from 'node:os'
 import { join } from 'node:path'
+import type { SDKMessage } from '@proma/shared'
 import { DataRootLocator } from './data-root-locator'
 import { listWorktreesStrict } from './git-diff-service'
 import { WorkspaceProjectRelocator } from './workspace-project-relocator'
@@ -147,6 +148,35 @@ afterAll(() => {
 })
 
 describe('Agent 会话 JSONL 读取', () => {
+  test('Given Nano Banana 工具结果标记 When 解析落盘附件 Then 只接受完整图片字段', () => {
+    const content = [
+      '完成',
+      '[PROMA_IMAGE_ATTACHMENT:{"localPath":"session/a.png","filename":"a.png","mediaType":"image/png"}]',
+      '[PROMA_IMAGE_ATTACHMENT:{"localPath":"session/b.txt","filename":"b.txt","mediaType":"text/plain"}]',
+    ].join('\n')
+
+    expect(manager.parseToolResultImageAttachments(content)).toEqual([{
+      localPath: 'session/a.png', filename: 'a.png', mediaType: 'image/png',
+    }])
+  })
+
+  test('Given Nano Banana SDK 工具结果 When 写入 JSONL Then 持久化结构化图片归属', () => {
+    writeAgentSessionJsonl('session-image-persistence', [])
+    manager.appendSDKMessages('session-image-persistence', [{
+      type: 'user',
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'tool-1',
+        content: '[PROMA_IMAGE_ATTACHMENT:{"localPath":"session/a.png","filename":"a.png","mediaType":"image/png"}]',
+      }] },
+    } as unknown as SDKMessage])
+
+    const message = manager.getAgentSessionSDKMessages('session-image-persistence')[0] as {
+      message: { content: Array<{ imageAttachments?: Array<{ localPath: string }> }> }
+    }
+    expect(message.message.content[0]?.imageAttachments?.[0]?.localPath).toBe('session/a.png')
+  })
+
   test('Given 会话 JSONL 混入损坏行 When 读取 SDKMessage Then 跳过坏行并保留其它消息', () => {
     writeAgentSessionJsonl('session-with-bad-line', [
       JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: '你好' }] }, parent_tool_use_id: null }),

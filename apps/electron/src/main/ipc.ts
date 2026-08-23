@@ -171,6 +171,7 @@ import {
 } from './lib/local-file-protocol'
 import { DesignAssetService } from './lib/design/design-asset-service'
 import { registerDesignIpcHandlers } from './lib/design/design-ipc'
+import { DesignSessionBridge } from './lib/design/design-session-bridge'
 import {
   DesignJobManager,
   resolveOwnedDesignJobOutputPath,
@@ -288,6 +289,7 @@ import {
   countArchivedAgentSessions,
   createAgentSession,
   getAgentSessionMeta,
+  getAgentSessionMessages,
   getAgentSessionSDKMessages,
   updateAgentSessionMeta,
   deleteAgentSession,
@@ -313,7 +315,7 @@ import { hasRunningAutomations } from './lib/automation-scheduler'
 import { permissionService } from './lib/agent-permission-service'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
-import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getWorkspaceSkillsDir, getScratchPadPath } from './lib/config-paths'
+import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getConversationAttachmentsDir, getWorkspaceSkillsDir, getScratchPadPath, resolveAttachmentPath } from './lib/config-paths'
 import { getCachedDefaultAppInfo, saveCachedDefaultAppInfo } from './lib/default-app-cache'
 import { calculateStorageStats, cleanupStorage, cleanupTempFiles } from './lib/storage-service'
 import type { CleanupOptions } from './lib/storage-service'
@@ -1085,6 +1087,18 @@ export function registerIpcHandlers(): void {
     listProjectIds: () => listAgentWorkspaces().map((workspace) => workspace.id),
     runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
   })
+  /** Design 与 Agent 会话共用主进程持久化事实，不向 Renderer 暴露路径推断能力。 */
+  const designSessionBridge = new DesignSessionBridge({
+    getSession: getAgentSessionMeta,
+    getMessages: getAgentSessionMessages,
+    resolveAgentImagePath: (localPath) => isAbsolute(localPath) ? localPath : resolveAttachmentPath(localPath),
+    getAllowedRoots: (session) => [
+      getConversationAttachmentsDir(session.id),
+      ...getAuthorizedRoots({ sessionId: session.id }),
+    ],
+    store: designStore,
+    assets: designAssetService,
+  })
   setDefaultDesignJobManager(designJobManager)
   registerDesignIpcHandlers({
     ipc: ipcMain,
@@ -1096,6 +1110,7 @@ export function registerIpcHandlers(): void {
     store: designStore,
     assets: designAssetService,
     jobs: designJobManager,
+    sessionBridge: designSessionBridge,
     getProjectReadOnlyReason: (projectId) => {
       /** 未登记项目仍交给 store 抛出明确的项目不存在错误。 */
       const workspace = getAgentWorkspace(projectId)
