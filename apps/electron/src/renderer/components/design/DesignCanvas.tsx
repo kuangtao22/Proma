@@ -86,6 +86,8 @@ export interface DesignCanvasProps {
   jobs?: DesignJobRecord[]
   /** 当前项目是否允许写入。 */
   writable: boolean
+  /** 当前项目权威快照恢复状态。 */
+  authoritativeRecoveryState: DesignProjectState['authoritativeRecoveryState']
   /** 当前项目画布工具。 */
   activeTool: DesignProjectState['activeTool']
   /** 当前项目选择的节点 ID。 */
@@ -147,6 +149,7 @@ export function DesignCanvas({
   thumbnailBaseUrl,
   jobs = EMPTY_DESIGN_JOBS,
   writable,
+  authoritativeRecoveryState,
   activeTool,
   selectedNodeIds,
   annotationDraft = [],
@@ -166,7 +169,12 @@ export function DesignCanvas({
   const [flowNodes, setFlowNodes] = React.useState<DesignAssetFlowNode[]>(() => {
     /** 首帧选择集合用于恢复项目切换前的选区。 */
     const selectedIds = new Set(selectedNodeIds)
-    return toFlowNodes(document, { thumbnailBaseUrl, jobs }).map((node) => ({
+    return toFlowNodes(document, {
+      thumbnailBaseUrl,
+      jobs,
+      writable,
+      authoritativeRecoveryState,
+    }).map((node) => ({
       ...node,
       selected: selectedIds.has(node.id),
     }))
@@ -185,7 +193,12 @@ export function DesignCanvas({
   React.useEffect(() => {
     /** 文档变更后同步展示字段，并保护活动拖动节点的本地坐标。 */
     const selectedIds = new Set(selectedNodeIdsRef.current)
-    const documentNodes = toFlowNodes(document, { thumbnailBaseUrl, jobs }).map((node) => ({
+    const documentNodes = toFlowNodes(document, {
+      thumbnailBaseUrl,
+      jobs,
+      writable,
+      authoritativeRecoveryState,
+    }).map((node) => ({
       ...node,
       selected: selectedIds.has(node.id),
     }))
@@ -194,7 +207,7 @@ export function DesignCanvas({
       documentNodes,
       activeDragNodeIdsRef.current,
     ))
-  }, [document, jobs, thumbnailBaseUrl])
+  }, [authoritativeRecoveryState, document, jobs, thumbnailBaseUrl, writable])
 
   React.useEffect(() => {
     /** 仅同步选择位，不覆盖拖动中的局部位置。 */

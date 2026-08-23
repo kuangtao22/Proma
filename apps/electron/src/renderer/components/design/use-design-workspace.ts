@@ -327,22 +327,48 @@ export function createDesignWorkspaceController(
   let authoritativeRecoveryInFlight = false
 
   /**
-   * 独立刷新任务 journal，不读取或替换画布快照。
-   * @returns 本次任务列表状态提交完成后的 Promise。
+   * 刷新任务 journal；事件 revision 前进时同步接管任务产生的权威画布结构。
+   * @param authoritativeRevision 本次任务事件对应的 Store 权威 revision。
+   * @returns 本次任务与可选结构快照提交完成后的 Promise。
    */
-  const refreshJobs = async (): Promise<void> => {
+  const refreshJobs = async (authoritativeRevision?: number): Promise<void> => {
     if (disposed) return
-    /** 任务刷新与画布 revision 无关，仅保留最后一次请求结果。 */
+    /** 任务刷新仅保留最后一次请求结果。 */
     const requestSequence = latestJobLoadSequence + 1
     latestJobLoadSequence = requestSequence
-    try {
-      /** 主进程返回当前项目的完整任务 journal 列表。 */
-      const jobs: DesignJobRecord[] = await dependencies.adapter.listJobs(dependencies.projectId)
-      if (disposed || requestSequence !== latestJobLoadSequence) return
-      dependencies.updateState({ jobs })
-    } catch {
-      /** journal 短暂不可读时保留现有任务，不影响用户继续使用已加载画布。 */
-    }
+    /** 仅更高 revision 表示任务创建、重试或完成改变了节点结构。 */
+    const currentRevision = dependencies.getState().snapshot?.document.revision ?? -1
+    const shouldLoadStructure = authoritativeRevision !== undefined
+      && authoritativeRevision > currentRevision
+    /** 结构 load 参与全局 load 序号，阻止更早的普通加载稍后覆盖它。 */
+    const structureLoadSequence = shouldLoadStructure ? latestLoadSequence + 1 : undefined
+    if (structureLoadSequence !== undefined) latestLoadSequence = structureLoadSequence
+    /** journal 与结构读取互不依赖，并行完成以缩短任务变化可见延迟。 */
+    const [jobs, snapshot] = await Promise.all([
+      dependencies.adapter.listJobs(dependencies.projectId).catch(() => undefined),
+      shouldLoadStructure
+        ? dependencies.adapter.load(dependencies.projectId).catch(() => undefined)
+        : Promise.resolve(undefined),
+    ])
+    if (disposed || requestSequence !== latestJobLoadSequence) return
+    dependencies.updateState((latest) => {
+      /** journal 短暂不可读时保留现有任务。 */
+      const update: Partial<DesignProjectState> = jobs ? { jobs } : {}
+      if (!snapshot
+        || structureLoadSequence !== latestLoadSequence
+        || authoritativeRevision === undefined
+        || snapshot.document.revision < authoritativeRevision) return update
+      /** 权威任务节点作为新基线，本地尚未保存的 mutation 必须完整重放。 */
+      const rebasedDocument = mergeSavedDesignDocument(snapshot.document, latest.pendingMutations)
+      return {
+        ...update,
+        phase: 'ready',
+        snapshot: { ...snapshot, document: rebasedDocument },
+        history: [],
+        future: [],
+      }
+    })
+    if (snapshot) scheduleSave()
   }
 
   /**
@@ -557,7 +583,7 @@ export function createDesignWorkspaceController(
       unsubscribe = dependencies.adapter.onChanged((change) => {
         if (change.projectId !== dependencies.projectId) return
         if (change.cause === 'job') {
-          void refreshJobs()
+          void refreshJobs(change.revision)
           return
         }
         /** 事件到达时的最新项目状态。 */

@@ -23,6 +23,7 @@ import sharp from 'sharp'
 import { DesignAssetService } from './design-asset-service'
 import type { DesignAssetImportBatch } from './design-asset-service'
 import { registerDesignIpcHandlers, type DesignIpcOptions } from './design-ipc'
+import type { DesignJobChangedEvent } from './design-job-manager'
 import { createDesignPathResolver } from './design-paths'
 import { applyDesignMutations, createDesignStore } from './design-store'
 import type { DesignStore } from './design-store'
@@ -195,7 +196,7 @@ describe('Design IPC', () => {
     /** 记录 handler 对 Manager 的调用顺序。 */
     const calls: string[] = []
     /** 捕获 manager 状态变化监听器以验证 job 广播。 */
-    let onChanged: ((changed: DesignJobRecord) => void) | undefined
+    let onChanged: ((event: DesignJobChangedEvent) => void) | undefined
     Object.assign(fixture.options, {
       jobs: {
         create: () => { calls.push('create'); return job },
@@ -203,7 +204,7 @@ describe('Design IPC', () => {
         cancel: async (_projectId: string, jobId: string) => { calls.push(`cancel:${jobId}`); return job },
         retry: (_projectId: string, jobId: string) => { calls.push(`retry:${jobId}`); return retried },
         list: () => { calls.push('list'); return [job, retried] },
-        onChanged: (listener: (changed: DesignJobRecord) => void) => {
+        onChanged: (listener: (event: DesignJobChangedEvent) => void) => {
           onChanged = listener
           return () => undefined
         },
@@ -236,7 +237,7 @@ describe('Design IPC', () => {
       { projectId: 'project-1' },
     )
     await Promise.resolve()
-    onChanged?.(retried)
+    onChanged?.({ job: retried, revision: 42 })
 
     expect(created).toBe(job)
     expect(cancelled).toBe(job)
@@ -247,7 +248,7 @@ describe('Design IPC', () => {
       'create', 'run:job-1', 'cancel:job-1', 'retry:job-1', 'run:job-2', 'list',
     ])
     expect(fixture.senders[0]?.sent.at(-1)?.value).toMatchObject({
-      projectId: 'project-1', cause: 'job', revision: fixture.document.revision,
+      projectId: 'project-1', cause: 'job', revision: 42,
     })
   })
 

@@ -277,6 +277,136 @@ describe('Design 工作区同步规则', () => {
     expect(harness.getState().pendingMutations).toHaveLength(1)
   })
 
+  test('Given 本地有未保存编辑 When 创建任务事件推进 revision Then 加载占位节点并在权威结构上重放本地编辑', async () => {
+    const pendingMutation: DesignMutation = {
+      type: 'set-viewport',
+      viewport: { x: 18, y: 24, zoom: 1.2 },
+    }
+    const initialSnapshot: DesignWorkspaceSnapshot = {
+      document: createEmptyDesignDocument('project-1', 10),
+      writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: initialSnapshot,
+      saveState: 'dirty',
+      pendingMutations: [pendingMutation],
+    })
+    harness.controller.start()
+
+    harness.emitChange({ projectId: 'project-1', revision: 1, cause: 'job' })
+
+    expect(harness.loadRequests).toHaveLength(2)
+    expect(harness.jobRequests).toHaveLength(2)
+    const queuedJob: DesignJobRecord = {
+      id: 'job-1', projectId: 'project-1', action: 'generate', status: 'queued',
+      prompt: '生成海报', createdAt: 1, updatedAt: 1,
+    }
+    harness.loadRequests[1]!.resolve({
+      document: {
+        ...createEmptyDesignDocument('project-1', 20),
+        revision: 1,
+        nodes: [{
+          id: 'node-1', kind: 'job', jobId: 'job-1', position: { x: 0, y: 0 },
+          width: 320, height: 240, zIndex: 0,
+        }],
+      },
+      writable: true,
+    })
+    harness.jobRequests[1]!.resolve([queuedJob])
+    await flushPromises()
+
+    expect(harness.getState().snapshot?.document.nodes[0]).toMatchObject({ kind: 'job', jobId: 'job-1' })
+    expect(harness.getState().snapshot?.document.viewport).toEqual(pendingMutation.viewport)
+    expect(harness.getState().pendingMutations).toEqual([pendingMutation])
+    expect(harness.getState().saveState).toBe('dirty')
+    expect(harness.getState().jobs).toEqual([queuedJob])
+  })
+
+  test('Given 失败任务节点 When 重试事件推进 revision Then 同一节点实时绑定新任务', async () => {
+    const initialSnapshot: DesignWorkspaceSnapshot = {
+      document: {
+        ...createEmptyDesignDocument('project-1', 10),
+        revision: 1,
+        nodes: [{
+          id: 'node-1', kind: 'job', jobId: 'job-old', position: { x: 0, y: 0 },
+          width: 320, height: 240, zIndex: 0,
+        }],
+      },
+      writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(), phase: 'ready', snapshot: initialSnapshot,
+    })
+    harness.controller.start()
+
+    harness.emitChange({ projectId: 'project-1', revision: 2, cause: 'job' })
+    harness.loadRequests[1]!.resolve({
+      ...initialSnapshot,
+      document: {
+        ...initialSnapshot.document,
+        revision: 2,
+        nodes: [{ ...initialSnapshot.document.nodes[0]!, jobId: 'job-new' }],
+      },
+    })
+    const retriedJob: DesignJobRecord = {
+      id: 'job-new', projectId: 'project-1', action: 'generate', status: 'queued',
+      prompt: '重新生成', createdAt: 2, updatedAt: 2,
+    }
+    harness.jobRequests[1]!.resolve([retriedJob])
+    await flushPromises()
+
+    expect(harness.getState().snapshot?.document.nodes[0]).toMatchObject({ id: 'node-1', jobId: 'job-new' })
+    expect(harness.getState().jobs).toEqual([retriedJob])
+  })
+
+  test('Given 运行中任务节点 When 成功事件推进 revision Then 占位节点实时替换为素材', async () => {
+    const initialSnapshot: DesignWorkspaceSnapshot = {
+      document: {
+        ...createEmptyDesignDocument('project-1', 10),
+        revision: 2,
+        nodes: [{
+          id: 'node-1', kind: 'job', jobId: 'job-1', position: { x: 0, y: 0 },
+          width: 320, height: 240, zIndex: 0,
+        }],
+      },
+      writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(), phase: 'ready', snapshot: initialSnapshot,
+    })
+    harness.controller.start()
+
+    harness.emitChange({ projectId: 'project-1', revision: 3, cause: 'job' })
+    harness.loadRequests[1]!.resolve({
+      ...initialSnapshot,
+      document: {
+        ...initialSnapshot.document,
+        revision: 3,
+        nodes: [{
+          id: 'node-1', kind: 'asset', assetId: 'asset-1', position: { x: 0, y: 0 },
+          width: 320, height: 240, zIndex: 0,
+        }],
+        assets: [{
+          id: 'asset-1', filename: 'result.png', relativePath: 'assets/result.png',
+          thumbnailRelativePath: 'thumbnails/result.webp', mediaType: 'image/png',
+          width: 1024, height: 768, byteSize: 1024, sha256: 'a'.repeat(64), createdAt: 3,
+        }],
+      },
+    })
+    const succeededJob: DesignJobRecord = {
+      id: 'job-1', projectId: 'project-1', action: 'generate', status: 'succeeded',
+      prompt: '生成海报', outputAssetId: 'asset-1', createdAt: 1, updatedAt: 3,
+    }
+    harness.jobRequests[1]!.resolve([succeededJob])
+    await flushPromises()
+
+    expect(harness.getState().snapshot?.document.nodes[0]).toMatchObject({ kind: 'asset', assetId: 'asset-1' })
+    expect(harness.getState().snapshot?.document.assets[0]?.id).toBe('asset-1')
+    expect(harness.getState().jobs).toEqual([succeededJob])
+  })
+
   test('Given 无缓存项目 When controller 启动并完成 load Then 进入 ready 且订阅后续 revision', async () => {
     /** 从 idle 开始的项目生命周期环境。 */
     const harness = createControllerHarness(createInitialDesignProjectState())

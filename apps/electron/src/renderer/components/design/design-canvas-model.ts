@@ -8,6 +8,7 @@ import type {
   DesignPoint,
   DesignViewport,
 } from '@proma/shared'
+import type { DesignProjectState } from '@/atoms/design-atoms'
 import type { DesignAssetFlowNode, DesignAssetNodeData } from './DesignAssetNode'
 
 export interface ToFlowNodesOptions {
@@ -15,6 +16,10 @@ export interface ToFlowNodesOptions {
   thumbnailBaseUrl?: string
   /** 当前项目任务 journal，用于投影任务节点真实状态。 */
   jobs?: DesignJobRecord[]
+  /** 当前项目是否允许任务控制命令。 */
+  writable?: boolean
+  /** 当前项目权威快照恢复状态。 */
+  authoritativeRecoveryState?: DesignProjectState['authoritativeRecoveryState']
 }
 
 /** Design journal 状态到节点展示状态的完整映射。 */
@@ -162,6 +167,8 @@ export function toFlowNodes(
           status: job ? JOB_NODE_STATUS[job.status] : 'queued',
           projectId: document.projectId,
           jobId: node.jobId ?? '',
+          writable: options.writable ?? false,
+          authoritativeRecoveryState: options.authoritativeRecoveryState ?? 'idle',
           title: '图片任务',
           ...(job?.error ? { error: job.error } : {}),
         }

@@ -10,7 +10,7 @@ import type {
   DesignJobRecord,
   DesignPoint,
 } from '@proma/shared'
-import { writeJsonFileAtomic } from '../safe-file'
+import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
 import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-paths'
 import type { AgentRunExtensions } from '../agent-service'
 import type { DesignAssetImportSource, DesignAssetService } from './design-asset-service'
@@ -31,6 +31,8 @@ interface StoredDesignJob extends DesignJobRecord {
   nodeId: string
   position: DesignPoint
   maskAnnotationId?: string
+  /** queued journal 与占位节点两步提交的恢复标记。 */
+  placementState?: 'pending' | 'ready'
 }
 
 /** Headless Agent 回调的窄接口。 */
@@ -71,8 +73,14 @@ export interface DesignJobManagerDependencies {
   now?: () => number
 }
 
+/** Design Job 状态变化事件，同时携带画布权威 revision。 */
+export interface DesignJobChangedEvent {
+  job: DesignJobRecord
+  revision: number
+}
+
 /** Design Job 状态变化监听器。 */
-export type DesignJobChangedListener = (job: DesignJobRecord) => void
+export type DesignJobChangedListener = (event: DesignJobChangedEvent) => void
 
 /** 当前进程由 IPC 初始化的默认 Design Job Manager。 */
 let defaultDesignJobManager: DesignJobManager | undefined
@@ -116,6 +124,7 @@ export function resolveOwnedDesignJobOutputPath(sessionId: string, localPath: st
 /** 可恢复的项目级图片生成与编辑任务协调器。 */
 export class DesignJobManager {
   private readonly jobs = new Map<string, StoredDesignJob>()
+  private readonly projectRevisions = new Map<string, number>()
   private readonly listeners = new Set<DesignJobChangedListener>()
   private readonly createId: () => string
   private readonly now: () => number
@@ -151,25 +160,25 @@ export class DesignJobManager {
   async run(jobId: string): Promise<void> {
     const queued = this.requireJob(jobId)
     if (queued.status !== 'queued') return
-    const model = this.resolveModel(queued)
-    if (!model) {
-      this.updateStatus(queued, 'failed', { error: DESIGN_JOB_MODEL_ERROR })
-      return
-    }
-    const session = this.dependencies.createSession(
-      `设计任务：${queued.prompt.trim().slice(0, 24)}`,
-      model.channelId,
-      queued.projectId,
-      model.modelId,
-    )
-    this.dependencies.updateSession(session.id, {
-      sourceDesignProjectId: queued.projectId,
-      sourceDesignJobId: queued.id,
-    })
-    const running = this.updateStatus(queued, 'running', { sessionId: session.id, error: undefined })
-    let runError: string | undefined
-    let messages: AgentMessage[] = []
     try {
+      const model = this.resolveModel(queued)
+      if (!model) {
+        this.updateStatus(queued, 'failed', { error: DESIGN_JOB_MODEL_ERROR })
+        return
+      }
+      const session = this.dependencies.createSession(
+        `设计任务：${queued.prompt.trim().slice(0, 24)}`,
+        model.channelId,
+        queued.projectId,
+        model.modelId,
+      )
+      this.dependencies.updateSession(session.id, {
+        sourceDesignProjectId: queued.projectId,
+        sourceDesignJobId: queued.id,
+      })
+      const running = this.updateStatus(queued, 'running', { sessionId: session.id, error: undefined })
+      let runError: string | undefined
+      let messages: AgentMessage[] = []
       await this.dependencies.runHeadless({
         sessionId: session.id,
         userMessage: this.buildPrompt(running),
@@ -187,21 +196,21 @@ export class DesignJobManager {
       }, {
         allowedToolNames: [DESIGN_IMAGE_TOOL],
       })
+      const latest = this.requireJob(jobId)
+      if (latest.status === 'cancelled' || latest.status === 'interrupted') return
+      if (runError) {
+        this.updateStatus(latest, 'failed', { error: runError })
+        return
+      }
+      const outputPath = this.findOwnedOutputPath(messages, session.id)
+      if (!outputPath) {
+        this.updateStatus(latest, 'failed', { error: DESIGN_JOB_OUTPUT_ERROR })
+        return
+      }
+      await this.commitOutput(latest, session.id, outputPath)
     } catch (error) {
-      runError = error instanceof Error ? error.message : String(error)
+      this.failUnlessStopped(jobId, error)
     }
-    const latest = this.requireJob(jobId)
-    if (latest.status === 'cancelled' || latest.status === 'interrupted') return
-    if (runError) {
-      this.updateStatus(latest, 'failed', { error: runError })
-      return
-    }
-    const outputPath = this.findOwnedOutputPath(messages, session.id)
-    if (!outputPath) {
-      this.updateStatus(latest, 'failed', { error: DESIGN_JOB_OUTPUT_ERROR })
-      return
-    }
-    await this.commitOutput(latest, session.id, outputPath)
   }
 
   /** 取消 queued/running 任务；终态任务保持不变。 */
@@ -234,8 +243,25 @@ export class DesignJobManager {
   /** 恢复单项目 journal，把无法续跑的 running 任务标记为 interrupted。 */
   recover(projectId: string): DesignJobRecord[] {
     const jobs = this.readProjectJobs(projectId)
-    for (const job of jobs) {
-      if (job.status === 'running') this.updateStatus(job, 'interrupted', { error: '应用退出，任务已中断' })
+    for (const stored of jobs) {
+      let job = stored
+      if (job.placementState === 'pending') {
+        const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
+        const placeholderExists = document.nodes.some((node) => (
+          node.id === job.nodeId && node.kind === 'job' && node.jobId === job.id
+        ))
+        if (!placeholderExists) {
+          this.deleteJobJournal(job)
+          continue
+        }
+        job = { ...job, placementState: 'ready' }
+        this.writeJob(job)
+      }
+      if (job.status === 'queued' || job.status === 'running') {
+        this.updateStatus(job, 'interrupted', {
+          error: job.status === 'queued' ? '应用退出，排队任务已中断' : '应用退出，任务已中断',
+        })
+      }
     }
     return this.list(projectId)
   }
@@ -260,6 +286,7 @@ export class DesignJobManager {
     if (!prompt) throw new Error('设计任务提示词不能为空')
     if (input.action === 'edit' && !input.sourceAssetId) throw new Error('编辑任务缺少来源素材')
     const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
+    this.projectRevisions.set(input.projectId, current.revision)
     if (input.sourceAssetId && !current.assets.some((asset) => asset.id === input.sourceAssetId)) {
       throw new Error(`素材不存在: ${input.sourceAssetId}`)
     }
@@ -277,6 +304,7 @@ export class DesignJobManager {
       ...(input.sourceSessionId ? { sourceSessionId: input.sourceSessionId } : {}),
       ...(input.sourceAssetId ? { sourceAssetId: input.sourceAssetId, parentAssetId: input.sourceAssetId } : {}),
       ...(input.maskAnnotationId ? { maskAnnotationId: input.maskAnnotationId } : {}),
+      placementState: 'pending',
       nodeId: replaced?.nodeId ?? `design-job-${id}`,
       position: replaced?.position ?? input.position,
       createdAt: now,
@@ -294,9 +322,31 @@ export class DesignJobManager {
         ? current.nodes.find((item) => item.id === replaced.nodeId)?.zIndex ?? current.nodes.length
         : current.nodes.length,
     }
-    this.dependencies.store.mutate(input.projectId, current.revision, [{ type: 'upsert-nodes', nodes: [node] }])
-    this.emit(job)
-    return job
+    let authoritativeRevision: number
+    try {
+      const updated = this.dependencies.store.mutate(
+        input.projectId,
+        current.revision,
+        [{ type: 'upsert-nodes', nodes: [node] }],
+      )
+      authoritativeRevision = updated.revision
+    } catch (error) {
+      /** durability 报错后先读权威文档；若节点已落盘，则完成 journal 而不是制造孤立节点。 */
+      const authoritative = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
+      const placeholderExists = authoritative.nodes.some((candidate) => (
+        candidate.id === node.id && candidate.kind === 'job' && candidate.jobId === job.id
+      ))
+      if (!placeholderExists) {
+        this.deleteJobJournal(job)
+        throw error
+      }
+      authoritativeRevision = authoritative.revision
+    }
+    this.projectRevisions.set(input.projectId, authoritativeRevision)
+    const ready = { ...job, placementState: 'ready' as const }
+    this.writeJob(ready)
+    this.emit(ready, authoritativeRevision)
+    return ready
   }
 
   /** 按来源会话优先、全局设置兜底解析完整渠道和模型。 */
@@ -380,16 +430,17 @@ export class DesignJobManager {
         assetId: asset.id,
         jobId: undefined,
       }
-      this.dependencies.store.mutate(job.projectId, current.revision, [
+      const updatedDocument = this.dependencies.store.mutate(job.projectId, current.revision, [
         { type: 'upsert-assets', assets: [asset] },
         { type: 'upsert-nodes', nodes: [assetNode] },
       ])
+      this.projectRevisions.set(job.projectId, updatedDocument.revision)
       batch.commit()
       this.updateStatus(latest, 'succeeded', {
         outputAssetId: asset.id,
         parentAssetId: job.sourceAssetId,
         error: undefined,
-      })
+      }, updatedDocument.revision)
     } catch (error) {
       batch.rollback()
       const latest = this.requireJob(job.id)
@@ -406,11 +457,21 @@ export class DesignJobManager {
     job: StoredDesignJob,
     status: StoredDesignJob['status'],
     updates: Partial<StoredDesignJob>,
+    revision?: number,
   ): StoredDesignJob {
     const next: StoredDesignJob = { ...job, ...updates, status, updatedAt: this.now() }
     this.writeJob(next)
-    this.emit(next)
+    this.emit(next, revision)
     return next
+  }
+
+  /** 任意运行阶段异常都收敛到 failed；用户取消和退出中断保持已有终态。 */
+  private failUnlessStopped(jobId: string, error: unknown): void {
+    const latest = this.requireJob(jobId)
+    if (latest.status === 'cancelled' || latest.status === 'interrupted' || latest.status === 'failed') return
+    this.updateStatus(latest, 'failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
   }
 
   /** 原子持久化单个任务 journal。 */
@@ -419,6 +480,13 @@ export class DesignJobManager {
     mkdirSync(directoryPath, { recursive: true })
     writeJsonFileAtomic(join(directoryPath, `${job.id}.json`), job, true)
     this.jobs.set(job.id, job)
+  }
+
+  /** 删除未建立占位节点的 pending journal 与内存索引。 */
+  private deleteJobJournal(job: StoredDesignJob): void {
+    const path = join(this.dependencies.pathResolver.resolve(job.projectId).jobsDir, `${job.id}.json`)
+    removeFileAtomic(path)
+    this.jobs.delete(job.id)
   }
 
   /** 读取项目全部合法 journal。 */
@@ -467,7 +535,12 @@ export class DesignJobManager {
   }
 
   /** 通知全部状态监听器。 */
-  private emit(job: StoredDesignJob): void {
-    for (const listener of this.listeners) listener(job)
+  private emit(job: StoredDesignJob, revision?: number): void {
+    /** 结构 mutation 直接传入返回 revision；纯状态事件复用最近权威值。 */
+    const authoritativeRevision = revision
+      ?? this.projectRevisions.get(job.projectId)
+      ?? this.dependencies.store.requireStableAuthoritativeDocument(job.projectId).revision
+    this.projectRevisions.set(job.projectId, authoritativeRevision)
+    for (const listener of this.listeners) listener({ job, revision: authoritativeRevision })
   }
 }

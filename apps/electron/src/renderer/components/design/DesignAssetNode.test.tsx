@@ -75,9 +75,11 @@ describe('Design 素材节点', () => {
   test('Given 排队和运行任务 When 渲染 Then 显示明确进度状态且不提供重试', () => {
     const queued = renderStatus({
       kind: 'job', status: 'queued', projectId: 'project-1', jobId: 'job-1', title: '图片任务',
+      writable: true, authoritativeRecoveryState: 'idle',
     })
     const running = renderStatus({
       kind: 'job', status: 'running', projectId: 'project-1', jobId: 'job-2', title: '图片任务',
+      writable: true, authoritativeRecoveryState: 'idle',
     })
 
     expect(queued).toContain('等待生成')
@@ -103,6 +105,8 @@ describe('Design 素材节点', () => {
       projectId: 'project-1',
       jobId: 'job-3',
       title: '图片任务',
+      writable: true,
+      authoritativeRecoveryState: 'idle',
     })
 
     expect(failed).toContain('生成失败')
@@ -113,6 +117,25 @@ describe('Design 素材节点', () => {
     expect(interrupted).toContain('已中断')
     expect(interrupted).toContain('重试生成')
     expect(interrupted).toMatch(/type="button"(?![^>]*disabled)[^>]*>[\s\S]*重试生成/)
+  })
+
+  test('Given 任务节点只读或权威恢复未完成 When 渲染 Then 重试和取消命令保持禁用', () => {
+    const readOnlyRetry = renderStatus({
+      kind: 'job', status: 'failed', projectId: 'project-1', jobId: 'job-1', title: '图片任务',
+      writable: false, authoritativeRecoveryState: 'idle',
+    })
+    const loadingCancel = renderStatus({
+      kind: 'job', status: 'running', projectId: 'project-1', jobId: 'job-2', title: '图片任务',
+      writable: true, authoritativeRecoveryState: 'loading',
+    })
+    const failedRetry = renderStatus({
+      kind: 'job', status: 'interrupted', projectId: 'project-1', jobId: 'job-3', title: '图片任务',
+      writable: true, authoritativeRecoveryState: 'failed',
+    })
+
+    expect(readOnlyRetry).toMatch(/type="button"[^>]*disabled=""[^>]*>[\s\S]*重试生成/)
+    expect(loadingCancel).toMatch(/type="button"[^>]*disabled=""[^>]*>[\s\S]*取消生成/)
+    expect(failedRetry).toMatch(/type="button"[^>]*disabled=""[^>]*>[\s\S]*重试生成/)
   })
 
   test('Given 素材记录缺失 When 渲染 Then 明确提示素材缺失且不提供任务重试', () => {
@@ -231,6 +254,7 @@ describe('Design 工作区画布接入', () => {
         <DesignCanvas
           document={document}
           writable
+          authoritativeRecoveryState="idle"
           activeTool="select"
           selectedNodeIds={[]}
           flowRenderer={(props) => {
@@ -279,6 +303,7 @@ describe('Design 工作区画布接入', () => {
         <DesignCanvas
           document={projectADocument}
           writable
+          authoritativeRecoveryState="idle"
           activeTool="select"
           selectedNodeIds={['node-a']}
           flowRenderer={(props) => {
@@ -293,6 +318,7 @@ describe('Design 工作区画布接入', () => {
         <DesignCanvas
           document={projectBDocument}
           writable
+          authoritativeRecoveryState="idle"
           activeTool="select"
           selectedNodeIds={['node-b']}
           flowRenderer={(props) => {
@@ -326,6 +352,7 @@ describe('Design 工作区画布接入', () => {
         <DesignCanvas
           document={document}
           writable
+          authoritativeRecoveryState="idle"
           activeTool="select"
           selectedNodeIds={[]}
           flowRenderer={(props) => {

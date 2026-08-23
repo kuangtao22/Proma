@@ -195,6 +195,7 @@ export function DesignWorkspaceStateView({
           thumbnailBaseUrl={state.snapshot.thumbnailBaseUrl}
           jobs={state.jobs}
           writable={writable}
+          authoritativeRecoveryState={state.authoritativeRecoveryState}
           activeTool={state.activeTool}
           selectedNodeIds={state.selectedNodeIds}
           annotationDraft={state.maskDraft}

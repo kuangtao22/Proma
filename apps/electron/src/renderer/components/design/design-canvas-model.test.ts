@@ -84,7 +84,11 @@ describe('Design 画布节点映射', () => {
       createNode({ id: 'job-node', kind: 'job', assetId: undefined, jobId: 'job-1' }),
     ]
 
-    const nodes = toFlowNodes(document, { thumbnailBaseUrl: 'proma-file://thumbs' })
+    const nodes = toFlowNodes(document, {
+      thumbnailBaseUrl: 'proma-file://thumbs',
+      writable: true,
+      authoritativeRecoveryState: 'idle',
+    })
 
     expect(nodes[0]?.data).toEqual({
       kind: 'asset',
@@ -97,6 +101,8 @@ describe('Design 画布节点映射', () => {
       status: 'queued',
       projectId: 'project-1',
       jobId: 'job-1',
+      writable: true,
+      authoritativeRecoveryState: 'idle',
       title: '图片任务',
     })
   })

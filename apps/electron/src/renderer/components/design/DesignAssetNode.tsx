@@ -25,6 +25,10 @@ export interface DesignAssetNodeData extends Record<string, unknown> {
   jobId?: string
   /** 任务所属项目 ID，仅任务节点存在。 */
   projectId?: string
+  /** 当前项目是否允许提交任务控制命令。 */
+  writable?: boolean
+  /** 当前项目权威快照恢复状态。 */
+  authoritativeRecoveryState?: 'idle' | 'loading' | 'failed'
   /** 节点主标题，不包含本地路径。 */
   title: string
   /** 经过媒体授权协议保护的缩略图 URL。 */
@@ -77,8 +81,10 @@ export function DesignAssetNode({
   /** 失败、取消和进程中断的任务允许出现重试入口。 */
   const canRetry = data.kind === 'job'
     && (data.status === 'failed' || data.status === 'cancelled' || data.status === 'interrupted')
+  /** 任务命令仅在权威可写基线稳定时开放。 */
+  const commandsEnabled = data.writable === true && data.authoritativeRecoveryState === 'idle'
   /** 外部测试回调优先；生产节点可凭完整项目和任务 ID 直接重试。 */
-  const retryEnabled = Boolean(onRetry || (data.projectId && data.jobId))
+  const retryEnabled = commandsEnabled && Boolean(onRetry || (data.projectId && data.jobId))
   /** 只有等待或运行中的真实任务允许取消。 */
   const canCancel = data.kind === 'job'
     && (data.status === 'queued' || data.status === 'running')
@@ -88,7 +94,7 @@ export function DesignAssetNode({
 
   /** 通过主进程创建新的可追踪任务，旧 journal 继续保留审计。 */
   const handleRetry = (): void => {
-    if (!data.jobId) return
+    if (!commandsEnabled || !data.jobId) return
     if (onRetry) {
       onRetry(data.jobId)
       return
@@ -113,7 +119,7 @@ export function DesignAssetNode({
 
   /** 请求主进程停止对应 Pi generation，并采用其竞态判定后的 journal 终态。 */
   const handleCancel = (): void => {
-    if (!data.projectId || !data.jobId) return
+    if (!commandsEnabled || !data.projectId || !data.jobId) return
     /** 闭包内收窄后的稳定项目和任务 ID。 */
     const projectId = data.projectId
     const jobId = data.jobId
@@ -188,6 +194,7 @@ export function DesignAssetNode({
               variant="ghost"
               size="sm"
               className="nodrag shrink-0"
+              disabled={!commandsEnabled}
               onClick={handleCancel}
             >
               <Square className="size-3.5" aria-hidden="true" />

@@ -493,8 +493,7 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   }
 
   /** Manager 后台状态变化也通知 Renderer 刷新任务列表。 */
-  const unsubscribeJobs = options.jobs.onChanged((job) => {
-    const revision = lastReadableSnapshots.get(job.projectId)?.document.revision ?? 0
+  const unsubscribeJobs = options.jobs.onChanged(({ job, revision }) => {
     broadcastChange(options, { projectId: job.projectId, revision, cause: 'job' })
   })
 
