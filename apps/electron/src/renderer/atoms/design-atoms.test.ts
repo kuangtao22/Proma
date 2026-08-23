@@ -35,6 +35,18 @@ describe('Design 项目状态', () => {
     expect(createInitialDesignProjectState().authoritativeRecoveryState).toBe('idle')
   })
 
+  test('Given 两个新项目 When 创建初始状态 Then 生图模型状态独立且不共享空数组', () => {
+    const first = createInitialDesignProjectState()
+    const second = createInitialDesignProjectState()
+
+    expect(first.imageModelLoadState).toBe('idle')
+    expect(first.imageModelProfileId).toBeNull()
+    expect(first.invalidImageModelProfileId).toBeNull()
+    expect(first.imageModelError).toBeNull()
+    expect(first.imageModelOptions).toEqual([])
+    expect(first.imageModelOptions).not.toBe(second.imageModelOptions)
+  })
+
   test('Given 权威恢复正在加载 When 执行编辑或撤销 Then 旧快照保持不变', () => {
     const store = createStore()
     const snapshot = createSnapshot('project-1')

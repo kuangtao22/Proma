@@ -29,6 +29,9 @@ function renderInspector(): string {
       onSelectAsset={() => undefined}
       onClearSelection={() => undefined}
       onCreateJob={() => undefined}
+      onImageModelChange={() => undefined}
+      onConfigureImageModels={() => undefined}
+      onRetryImageModels={() => undefined}
     />,
   )
 }
@@ -86,6 +89,18 @@ describe('Design 无障碍、窄窗口与主题合同', () => {
     expect(html).toContain('role="tablist"')
     expect(html).toContain('aria-label="导入图片"')
     expect(html).not.toContain('data-design-inspector-card')
+  })
+
+  test('Given 生图模型字段 When 检查源码 Then 复用 Select、固定 32px 与 4px 圆角且保留焦点样式', () => {
+    const inspectorSource = readFileSync(join(import.meta.dir, 'DesignInspector.tsx'), 'utf8')
+
+    expect(inspectorSource).toContain('id="design-image-model"')
+    expect(inspectorSource).toContain('className="h-8 w-full rounded px-2 text-xs disabled:opacity-100"')
+    expect(inspectorSource).toContain('<Tooltip>')
+    expect(inspectorSource).not.toContain('onKeyDown=')
+    expect(inspectorSource).toContain("setSettingsTab('tools')")
+    expect(inspectorSource).toContain("setToolSettingsFocus('nano-banana')")
+    expect(inspectorSource).toContain('setSettingsOpen(true)')
   })
 
   test('Given 失败与运行任务 When 渲染 Then 状态、retry 和 cancel 同时提供文字与 accessible name', () => {

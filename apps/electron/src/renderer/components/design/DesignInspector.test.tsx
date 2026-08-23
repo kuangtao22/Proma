@@ -11,6 +11,7 @@ import {
 } from '@/atoms/design-atoms'
 import type { DesignAdapter } from '@/lib/design-adapter'
 import {
+  canCreateDesignJobWithSelectedModel,
   createDesignEditJobInput,
   createDesignGenerationJobInput,
   DesignInspector,
@@ -75,6 +76,12 @@ function renderInspector(
         snapshot,
         selectedNodeIds,
         inspectorAssetId,
+        imageModelLoadState: 'ready',
+        imageModelOptions: [{
+          profileId: 'profile-flash', name: '快速模型', executor: 'nano-banana',
+          modelId: 'gemini-flash-image', available: true,
+        }],
+        imageModelProfileId: 'profile-flash',
       }}
       onTabChange={() => undefined}
       onImportAssets={() => undefined}
@@ -87,6 +94,9 @@ function renderInspector(
       onSelectAsset={() => undefined}
       onClearSelection={() => undefined}
       onCreateJob={(_input: CreateDesignJobInput) => undefined}
+      onImageModelChange={() => undefined}
+      onConfigureImageModels={() => undefined}
+      onRetryImageModels={() => undefined}
     />,
   )
 }
@@ -111,6 +121,12 @@ describe('Design Inspector 状态', () => {
       snapshot: createSnapshot(),
       generationPrompt: '生成活动海报',
       inspectorTab: 'ai',
+      imageModelLoadState: 'ready',
+      imageModelOptions: [{
+        profileId: 'profile-flash', name: '快速模型', executor: 'nano-banana',
+        modelId: 'gemini-flash-image', available: true,
+      }],
+      imageModelProfileId: 'profile-flash',
     }]]))
 
     const html = renderToStaticMarkup(
@@ -242,10 +258,106 @@ describe('Design Inspector 状态', () => {
     expect(generationHtml).toContain('id="design-image-size"')
     expect(editHtml).toContain('for="design-mask-annotation"')
     expect(editHtml).toContain('id="design-mask-annotation"')
+    expect(generationHtml).toContain('for="design-image-model"')
+    expect(generationHtml).toContain('id="design-image-model"')
+    expect(generationHtml).toContain('快速模型 · gemini-flash-image')
+  })
+
+  test('Given 模型正在加载或目录失败 When 渲染 Then 布局稳定并提供对应恢复动作', () => {
+    const baseState = {
+      ...createInitialDesignProjectState(), phase: 'ready' as const,
+      snapshot: createSnapshot(), inspectorTab: 'ai' as const,
+    }
+    const loading = renderToStaticMarkup(
+      <DesignInspectorStateView state={{ ...baseState, imageModelLoadState: 'loading' }}
+        onTabChange={() => undefined} onImportAssets={() => undefined} onDeleteAsset={() => undefined}
+        onRelinkAsset={() => undefined} onExportAsset={() => undefined} onGroupSelection={() => undefined}
+        onSelectAsset={() => undefined} onCreateJob={() => undefined} onImageModelChange={() => undefined}
+        onConfigureImageModels={() => undefined} onRetryImageModels={() => undefined} />,
+    )
+    const failed = renderToStaticMarkup(
+      <DesignInspectorStateView state={{ ...baseState, imageModelLoadState: 'failed', imageModelError: '目录损坏' }}
+        onTabChange={() => undefined} onImportAssets={() => undefined} onDeleteAsset={() => undefined}
+        onRelinkAsset={() => undefined} onExportAsset={() => undefined} onGroupSelection={() => undefined}
+        onSelectAsset={() => undefined} onCreateJob={() => undefined} onImageModelChange={() => undefined}
+        onConfigureImageModels={() => undefined} onRetryImageModels={() => undefined} />,
+    )
+
+    expect(loading).toContain('h-8 rounded bg-muted animate-pulse')
+    expect(failed).toContain('目录损坏')
+    expect(failed).toContain('重试加载')
+    expect(failed).toMatch(/type="submit" disabled=""[^>]*>[\s\S]*生成图片/)
+  })
+
+  test('Given 模型选择正在写入 When Select 暂时禁用 Then 仍显示乐观模型名称和真实 modelId', () => {
+    const html = renderToStaticMarkup(
+      <DesignInspectorStateView
+        state={{
+          ...createInitialDesignProjectState(), phase: 'ready', snapshot: createSnapshot(), inspectorTab: 'ai',
+          imageModelLoadState: 'loading', imageModelProfileId: 'profile-pro',
+          imageModelOptions: [{
+            profileId: 'profile-pro', name: '高质量模型', executor: 'nano-banana',
+            modelId: 'gemini-pro-image', available: true,
+          }],
+        }}
+        onTabChange={() => undefined} onImportAssets={() => undefined} onDeleteAsset={() => undefined}
+        onRelinkAsset={() => undefined} onExportAsset={() => undefined} onGroupSelection={() => undefined}
+        onSelectAsset={() => undefined} onCreateJob={() => undefined} onImageModelChange={() => undefined}
+        onConfigureImageModels={() => undefined} onRetryImageModels={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('高质量模型 · gemini-pro-image')
+    expect(html).toMatch(/<button(?=[^>]*id="design-image-model")(?=[^>]*disabled="")[^>]*>/)
+    expect(html).not.toContain('aria-label="正在加载生图模型"')
+  })
+
+  test('Given 没有可用模型或当前选择失效 When 渲染 Then 保留提示词并阻断任务且提供配置入口', () => {
+    const baseState = {
+      ...createInitialDesignProjectState(), phase: 'ready' as const, snapshot: createSnapshot(),
+      inspectorTab: 'ai' as const, generationPrompt: '不能清空的描述', imageModelLoadState: 'ready' as const,
+    }
+    const emptyHtml = renderToStaticMarkup(
+      <DesignInspectorStateView state={baseState} onTabChange={() => undefined} onImportAssets={() => undefined}
+        onDeleteAsset={() => undefined} onRelinkAsset={() => undefined} onExportAsset={() => undefined}
+        onGroupSelection={() => undefined} onSelectAsset={() => undefined} onCreateJob={() => undefined}
+        onImageModelChange={() => undefined} onConfigureImageModels={() => undefined} onRetryImageModels={() => undefined} />,
+    )
+    const invalidHtml = renderToStaticMarkup(
+      <DesignInspectorStateView state={{ ...baseState, invalidImageModelProfileId: 'removed-profile' }}
+        onTabChange={() => undefined} onImportAssets={() => undefined} onDeleteAsset={() => undefined}
+        onRelinkAsset={() => undefined} onExportAsset={() => undefined} onGroupSelection={() => undefined}
+        onSelectAsset={() => undefined} onCreateJob={() => undefined} onImageModelChange={() => undefined}
+        onConfigureImageModels={() => undefined} onRetryImageModels={() => undefined} />,
+    )
+
+    expect(emptyHtml).toContain('不能清空的描述')
+    expect(emptyHtml).toContain('配置生图模型')
+    expect(emptyHtml).toMatch(/type="submit" disabled=""[^>]*>[\s\S]*生成图片/)
+    expect(invalidHtml).toContain('removed-profile')
+    expect(invalidHtml).toContain('配置生图模型')
   })
 })
 
 describe('Design Inspector 纯业务契约', () => {
+  test('Given 选择了项目生图模型 When 创建生成和编辑输入 Then 两类任务都携带稳定 profile ID', () => {
+    expect(createDesignGenerationJobInput(
+      'project-1', '海报', '1:1', '1K', 'profile-flash', { x: 0, y: 0 },
+    ).imageModelProfileId).toBe('profile-flash')
+    expect(createDesignEditJobInput(
+      'project-1', '换成蓝色', 'asset-1', undefined, 'profile-pro', { x: 0, y: 0 },
+    ).imageModelProfileId).toBe('profile-pro')
+  })
+
+  test('Given 当前项目缺少模型或任务携带旧模型 When 提交 Then 在主进程调用前阻断', () => {
+    const input = createDesignGenerationJobInput(
+      'project-1', '海报', '1:1', '1K', 'profile-flash', { x: 0, y: 0 },
+    )
+
+    expect(canCreateDesignJobWithSelectedModel(input, null)).toBe(false)
+    expect(canCreateDesignJobWithSelectedModel(input, 'profile-pro')).toBe(false)
+    expect(canCreateDesignJobWithSelectedModel(input, 'profile-flash')).toBe(true)
+  })
   test('Given 版本输入未变化但 prompt 状态重渲染 When 读取版本行 Then 只构建一次版本树', () => {
     const assets = [createAsset()]
     /** 记录同一稳定输入实际执行建树的次数。 */
@@ -276,12 +388,12 @@ describe('Design Inspector 纯业务契约', () => {
   test('Given 生成与编辑表单 When 输出任务 Then 只使用现有共享字段并保留可选蒙版', () => {
     /** 模拟项目模型选择层补齐后的生成任务 fixture。 */
     const generationInput = {
-      ...createDesignGenerationJobInput('project-1', ' 生成海报 ', '3:4', '4K', { x: 5, y: 6 }),
+      ...createDesignGenerationJobInput('project-1', ' 生成海报 ', '3:4', '4K', 'profile-flash', { x: 5, y: 6 }),
       imageModelProfileId: 'profile-flash',
     } satisfies CreateDesignJobInput
     /** 模拟项目模型选择层补齐后的编辑任务 fixture。 */
     const editInput = {
-      ...createDesignEditJobInput('project-1', ' 去掉文字 ', 'asset-1', 'mask-1', { x: 7, y: 8 }),
+      ...createDesignEditJobInput('project-1', ' 去掉文字 ', 'asset-1', 'mask-1', 'profile-flash', { x: 7, y: 8 }),
       imageModelProfileId: 'profile-flash',
     } satisfies CreateDesignJobInput
 

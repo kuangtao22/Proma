@@ -4,7 +4,7 @@ import type {
   CreateDesignJobInput,
   DesignAsset,
 } from '@proma/shared'
-import { Download, ImageOff, RefreshCw, Send, Trash2, Upload, X } from 'lucide-react'
+import { Download, ImageOff, RefreshCw, Send, Settings2, Trash2, Upload, X } from 'lucide-react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { toast } from 'sonner'
 import {
@@ -17,6 +17,7 @@ import {
 import { agentEnqueuePendingMentionsAtom, agentSessionsAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
+import { settingsOpenAtom, settingsTabAtom, toolSettingsFocusAtom } from '@/atoms/settings-tab'
 import type { DesignProjectState } from '@/atoms/design-atoms'
 import { Button } from '@/components/ui/button'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
@@ -36,6 +37,7 @@ import {
   type DesignVersionTreeRow,
 } from './design-version-tree'
 import { useDesignInspectorActions } from './use-design-inspector-actions'
+import { useDesignImageModelSelection } from './use-design-image-model-selection'
 import { isDesignRecoveryRequired } from './use-design-workspace'
 
 /** 首版图片生成允许的画面比例。 */
@@ -66,12 +68,14 @@ export function createDesignGenerationJobInput(
   prompt: string,
   aspectRatio: DesignAspectRatio,
   imageSize: DesignImageSize,
+  imageModelProfileId: string,
   position: { x: number; y: number },
 ): CreateDesignJobInput {
   return {
     projectId,
     action: 'generate',
     prompt: serializeDesignGenerationPrompt(prompt, aspectRatio, imageSize),
+    imageModelProfileId,
     position,
   }
 }
@@ -82,16 +86,31 @@ export function createDesignEditJobInput(
   prompt: string,
   sourceAssetId: string,
   maskAnnotationId: string | undefined,
+  imageModelProfileId: string,
   position: { x: number; y: number },
 ): CreateDesignJobInput {
   return {
     projectId,
     action: 'edit',
     prompt: prompt.trim(),
+    imageModelProfileId,
     sourceAssetId,
     ...(maskAnnotationId ? { maskAnnotationId } : {}),
     position,
   }
+}
+
+/**
+ * 判断 Renderer 任务输入是否仍匹配当前项目权威模型选择。
+ * @param input 即将交给主进程的任务输入。
+ * @param selectedProfileId 当前项目已验证的 profile；缺失时必须阻断。
+ * @returns 只有稳定 ID 存在且与任务输入一致时返回 true。
+ */
+export function canCreateDesignJobWithSelectedModel(
+  input: Pick<CreateDesignJobInput, 'imageModelProfileId'>,
+  selectedProfileId: string | null,
+): boolean {
+  return selectedProfileId !== null && input.imageModelProfileId === selectedProfileId
 }
 
 /** 将素材来源字段转换为面向用户的简短来源。 */
@@ -127,6 +146,9 @@ export interface DesignInspectorStateViewProps {
   onSelectAsset: (assetId: string) => void
   onClearSelection?: () => void
   onCreateJob: (input: CreateDesignJobInput) => void
+  onImageModelChange?: (profileId: string) => void
+  onConfigureImageModels?: () => void
+  onRetryImageModels?: () => void
 }
 
 /** 素材标签所需的选择上下文。 */
@@ -268,6 +290,9 @@ function AiPanel({
   onGenerationPromptChange,
   onEditPromptChange,
   onCreateJob,
+  onImageModelChange,
+  onConfigureImageModels,
+  onRetryImageModels,
 }: {
   state: DesignProjectState
   selection: InspectorSelection
@@ -276,6 +301,9 @@ function AiPanel({
   onGenerationPromptChange?: (prompt: string) => void
   onEditPromptChange?: (prompt: string) => void
   onCreateJob: (input: CreateDesignJobInput) => void
+  onImageModelChange?: (profileId: string) => void
+  onConfigureImageModels?: () => void
+  onRetryImageModels?: () => void
 }): React.ReactElement {
   /** 生成表单的非持久化约束选项。 */
   const [aspectRatio, setAspectRatio] = React.useState<DesignAspectRatio>('1:1')
@@ -286,40 +314,129 @@ function AiPanel({
   /** 当前素材节点位置作为任务占位位置。 */
   const selectedNode = selection.assetId ? snapshot.document.nodes.find((node) => node.assetId === selection.assetId) : undefined
   const position = selectedNode?.position ?? { x: -snapshot.document.viewport.x / snapshot.document.viewport.zoom, y: -snapshot.document.viewport.y / snapshot.document.viewport.zoom }
-  const enabled = writable && createJobEnabled
+  /** 仅可用选项进入 Radix 菜单，不可用项通过字段附近错误说明。 */
+  const availableOptions = state.imageModelOptions.filter((option) => option.available)
+  /** 当前选择的公开模型文本显式渲染，disabled 与服务端渲染时仍保持可见。 */
+  const selectedModelOption = availableOptions.find((option) => (
+    option.profileId === state.imageModelProfileId
+  ))
+  /** 任务只在权威选择已 ready 且仍属于可用目录时开放。 */
+  const selectedModelAvailable = state.imageModelLoadState === 'ready'
+    && state.imageModelProfileId !== null
+    && availableOptions.some((option) => option.profileId === state.imageModelProfileId)
+  /** 模型状态与原画布写守卫共同决定任务可提交性。 */
+  const enabled = writable && createJobEnabled && selectedModelAvailable
 
   /** 提交空选区生成任务。 */
   const handleGenerate = (event: React.FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
-    if (!enabled || !state.generationPrompt.trim()) return
+    if (!enabled || !state.imageModelProfileId || !state.generationPrompt.trim()) return
     onCreateJob(createDesignGenerationJobInput(
       snapshot.document.projectId,
       state.generationPrompt,
       aspectRatio,
       imageSize,
+      state.imageModelProfileId,
       position,
     ))
   }
   /** 提交单素材编辑任务。 */
   const handleEdit = (event: React.FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
-    if (!enabled || !selection.canvasAssetNodeSelected || !selection.asset || !state.editPrompt.trim()) return
+    if (!enabled || !state.imageModelProfileId || !selection.canvasAssetNodeSelected || !selection.asset || !state.editPrompt.trim()) return
     onCreateJob(createDesignEditJobInput(
       snapshot.document.projectId,
       state.editPrompt,
       selection.asset.id,
       maskAnnotationId === 'none' ? undefined : maskAnnotationId,
+      state.imageModelProfileId,
       position,
     ))
   }
 
-  if (selection.selectedNodeCount > 0 && !selection.canvasAssetNodeSelected) return <p className="text-xs text-muted-foreground">AI 编辑仅支持单个素材节点</p>
-  if (selection.asset && !selection.canvasAssetNodeSelected) return <p className="text-xs text-muted-foreground">AI 编辑仅支持画布素材节点</p>
-  if (selection.assetId && selection.missing) return <p className="text-xs text-muted-foreground">请先重新定位缺失素材</p>
-  if (selection.asset) {
+  /** 无可用模型时优先展示目录返回的明确原因。 */
+  const unavailableReason = state.invalidImageModelProfileId
+    ? `当前生图模型不可用：${state.invalidImageModelProfileId}`
+    : availableOptions.length === 0
+      ? state.imageModelOptions.find((option) => option.unavailableReason)?.unavailableReason
+        ?? '未配置可用的生图模型'
+      : state.imageModelProfileId === null && state.imageModelLoadState === 'ready'
+        ? '请选择生图模型'
+        : null
+  /** 初次进入且没有缓存选项时使用骨架；乐观切换继续显示新选择文本。 */
+  const showInitialModelSkeleton = state.imageModelLoadState === 'idle'
+    || (state.imageModelLoadState === 'loading' && state.imageModelOptions.length === 0)
+  /** 模型字段固定在所有生成、编辑和选区提示之前。 */
+  const imageModelField = (
+    <div className="space-y-1.5">
+      <Label htmlFor="design-image-model" className="text-xs">生图模型</Label>
+      {showInitialModelSkeleton ? (
+        <div className="h-8 rounded bg-muted animate-pulse" aria-label="正在加载生图模型" />
+      ) : (
+        <Select
+          value={state.imageModelProfileId ?? undefined}
+          onValueChange={(profileId) => onImageModelChange?.(profileId)}
+          disabled={state.imageModelLoadState !== 'ready' || availableOptions.length === 0}
+        >
+          <SelectTrigger id="design-image-model" className="h-8 w-full rounded px-2 text-xs disabled:opacity-100">
+            <SelectValue placeholder="未配置生图模型">
+              {selectedModelOption ? `${selectedModelOption.name} · ${selectedModelOption.modelId}` : undefined}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {availableOptions.map((option) => (
+              <SelectItem key={option.profileId} value={option.profileId}>
+                {option.name} · {option.modelId}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
+      {state.imageModelLoadState === 'failed' && (
+        <div className="space-y-1.5">
+          <p className="break-words text-xs text-destructive">{state.imageModelError ?? '加载生图模型失败'}</p>
+          <TooltipProvider delayDuration={200} disableHoverableContent>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button type="button" variant="outline" size="sm" className="w-full" onClick={onRetryImageModels}>
+                  <RefreshCw aria-hidden="true" />重试加载
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top">重新读取模型目录和当前项目选择</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        </div>
+      )}
+      {state.imageModelLoadState === 'ready' && unavailableReason && (
+        <div className="space-y-1.5">
+          <p className="break-words text-xs text-destructive">{unavailableReason}</p>
+          <TooltipProvider delayDuration={200} disableHoverableContent>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button type="button" variant="outline" size="sm" className="w-full" onClick={onConfigureImageModels}>
+                  <Settings2 aria-hidden="true" />配置生图模型
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top">打开工具设置中的生图模型配置</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        </div>
+      )}
+    </div>
+  )
+
+  /** 根据选区生成模型字段之后的任务表单或限制说明。 */
+  let taskContent: React.ReactElement
+  if (selection.selectedNodeCount > 0 && !selection.canvasAssetNodeSelected) {
+    taskContent = <p className="text-xs text-muted-foreground">AI 编辑仅支持单个素材节点</p>
+  } else if (selection.asset && !selection.canvasAssetNodeSelected) {
+    taskContent = <p className="text-xs text-muted-foreground">AI 编辑仅支持画布素材节点</p>
+  } else if (selection.assetId && selection.missing) {
+    taskContent = <p className="text-xs text-muted-foreground">请先重新定位缺失素材</p>
+  } else if (selection.asset) {
     /** 只有 mask 批注允许作为编辑输入。 */
     const masks = snapshot.document.annotations.filter((annotation) => annotation.kind === 'mask')
-    return (
+    taskContent = (
       <form className="space-y-3" onSubmit={handleEdit}>
         <h3 className="break-words text-xs font-semibold">编辑 {selection.asset.filename}</h3>
         <Label htmlFor="design-edit-prompt" className="text-xs">编辑要求</Label>
@@ -332,9 +449,8 @@ function AiPanel({
         <Button type="submit" size="sm" className="w-full" disabled={!enabled || !state.editPrompt.trim()}><Send aria-hidden="true" />开始编辑</Button>
       </form>
     )
-  }
-  return (
-    <form className="space-y-3" onSubmit={handleGenerate}>
+  } else {
+    taskContent = <form className="space-y-3" onSubmit={handleGenerate}>
       <h3 className="text-xs font-semibold">生成图片</h3>
       <Label htmlFor="design-generation-prompt" className="text-xs">描述</Label>
       <Textarea id="design-generation-prompt" value={state.generationPrompt} disabled={!enabled} onChange={(event) => onGenerationPromptChange?.(event.target.value)} />
@@ -350,7 +466,8 @@ function AiPanel({
       </Select>
       <Button type="submit" size="sm" className="w-full" disabled={!enabled || !state.generationPrompt.trim()}><Send aria-hidden="true" />生成图片</Button>
     </form>
-  )
+  }
+  return <div className="space-y-3">{imageModelField}{taskContent}</div>
 }
 
 /** 迭代版本行避免深版本链递归渲染。 */
@@ -444,7 +561,7 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
           <TabsTrigger value="versions" className="min-w-0 px-1 text-xs">版本</TabsTrigger>
         </TabsList>
         <TabsContent value="assets" forceMount className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden"><AssetsPanel state={state} selection={selection} writable={writable} onImportAssets={props.onImportAssets} onDeleteAsset={props.onDeleteAsset} onRelinkAsset={props.onRelinkAsset} onExportAsset={props.onExportAsset} targetSessions={props.targetSessions ?? []} onSendAssetToSession={props.onSendAssetToSession} onGroupSelection={props.onGroupSelection} onSelectAsset={props.onSelectAsset} onPreviewError={(failedAssetId) => setMissingAssetIds((current) => new Set(current).add(failedAssetId))} onPreviewLoad={(loadedAssetId) => setMissingAssetIds((current) => { if (!current.has(loadedAssetId)) return current; const next = new Set(current); next.delete(loadedAssetId); return next })} /></TabsContent>
-        <TabsContent value="ai" forceMount className="mt-0 min-h-0 flex-1 overflow-y-auto px-3 py-3 data-[state=inactive]:hidden"><AiPanel state={state} selection={selection} writable={writable} createJobEnabled={props.createJobEnabled ?? true} onGenerationPromptChange={props.onGenerationPromptChange} onEditPromptChange={props.onEditPromptChange} onCreateJob={props.onCreateJob} /></TabsContent>
+        <TabsContent value="ai" forceMount className="mt-0 min-h-0 flex-1 overflow-y-auto px-3 py-3 data-[state=inactive]:hidden"><AiPanel state={state} selection={selection} writable={writable} createJobEnabled={props.createJobEnabled ?? true} onGenerationPromptChange={props.onGenerationPromptChange} onEditPromptChange={props.onEditPromptChange} onCreateJob={props.onCreateJob} onImageModelChange={props.onImageModelChange} onConfigureImageModels={props.onConfigureImageModels} onRetryImageModels={props.onRetryImageModels} /></TabsContent>
         <TabsContent value="versions" forceMount className="mt-0 min-h-0 flex-1 overflow-y-auto px-3 py-3 data-[state=inactive]:hidden"><h3 className="mb-2 text-xs font-semibold">素材版本</h3><VersionsPanel assets={state.snapshot.document.assets} currentAssetId={selection.asset?.id ?? null} onSelectAsset={props.onSelectAsset} /></TabsContent>
       </Tabs>
     </aside>
@@ -480,7 +597,12 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
   const activeSessionId = useAtomValue(activeSessionIdAtom)
   const setActiveView = useSetAtom(activeViewAtom)
   const enqueuePendingMentions = useSetAtom(agentEnqueuePendingMentionsAtom)
+  const setSettingsTab = useSetAtom(settingsTabAtom)
+  const setToolSettingsFocus = useSetAtom(toolSettingsFocusAtom)
+  const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const openSession = useOpenSession()
+  /** 模型 controller 只在进入项目、模型广播和手动重试时访问主进程。 */
+  const imageModelSelection = useDesignImageModelSelection(projectId)
   /** 当前项目内可接收素材的未归档会话，首项即默认目标。 */
   const targetSessions = React.useMemo(
     () => getDesignTargetSessions(sessions, projectId, activeSessionId),
@@ -497,6 +619,8 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
   const state = states.get(projectId) ?? createInitialDesignProjectState()
   /** 创建任务后立即展示 queued，随后由 job change 事件用完整 journal 校准。 */
   const handleCreateJob = React.useCallback((input: CreateDesignJobInput): void => {
+    /** 缺少当前权威 profile 时不创建主进程任务或任何占位。 */
+    if (!canCreateDesignJobWithSelectedModel(input, state.imageModelProfileId)) return
     void designAdapter.createJob(input).then((job) => {
       updateState({
         projectId,
@@ -509,7 +633,13 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
       if (isDesignRecoveryRequired(error)) handleRecoveryRequired()
       toast.error(error instanceof Error ? error.message : '创建设计任务失败')
     })
-  }, [handleRecoveryRequired, projectId, updateState])
+  }, [handleRecoveryRequired, projectId, state.imageModelProfileId, updateState])
+  /** 从 Inspector 直达工具设置中的 Nano Banana 生图配置。 */
+  const handleConfigureImageModels = React.useCallback((): void => {
+    setSettingsTab('tools')
+    setToolSettingsFocus('nano-banana')
+    setSettingsOpen(true)
+  }, [setSettingsOpen, setSettingsTab, setToolSettingsFocus])
   /** 准备受控素材引用并填入目标会话 composer，不触发 Agent 发送。 */
   const handleSendAssetToSession = React.useCallback((assetId: string, sessionId: string): void => {
     const session = targetSessions.find((candidate) => candidate.id === sessionId)
@@ -542,6 +672,9 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
       onClearSelection={() => updateState({ projectId, update: { selectedNodeIds: [], inspectorAssetId: null } })}
       onGroupSelection={() => executeEdit({ projectId, command: { type: 'group-selection', nodeIds: state.selectedNodeIds, groupId: globalThis.crypto.randomUUID(), name: `组 ${(state.snapshot?.document.groups.length ?? 0) + 1}` } })}
       onCreateJob={handleCreateJob}
+      onImageModelChange={imageModelSelection.selectProfile}
+      onConfigureImageModels={handleConfigureImageModels}
+      onRetryImageModels={imageModelSelection.retryLoad}
     />
   )
 }

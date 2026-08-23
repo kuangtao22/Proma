@@ -1,5 +1,6 @@
 import type {
   DesignJobRecord,
+  ImageGenerationModelOption,
   DesignMutation,
   DesignPoint,
   DesignViewport,
@@ -28,6 +29,16 @@ export interface DesignProjectState {
   jobLoadState: 'idle' | 'loading' | 'failed'
   /** 任务同步失败的独立用户提示，不与画布保存错误混用。 */
   jobError: string | null
+  /** 当前项目生图模型目录与偏好的加载阶段。 */
+  imageModelLoadState: 'idle' | 'loading' | 'ready' | 'failed'
+  /** 当前项目可见的清洗生图模型选项，不包含凭据。 */
+  imageModelOptions: ImageGenerationModelOption[]
+  /** 当前项目已验证可用的生图模型 profile。 */
+  imageModelProfileId: string | null
+  /** 偏好仍指向已删除、停用或凭据失效的 profile。 */
+  invalidImageModelProfileId: string | null
+  /** 模型目录或项目偏好加载失败的独立错误。 */
+  imageModelError: string | null
   selectedNodeIds: string[]
   /** 右栏直接选中的素材；允许无画布节点素材进入详情与删除流程。 */
   inspectorAssetId: string | null
@@ -59,6 +70,11 @@ export function createInitialDesignProjectState(): DesignProjectState {
     jobs: [],
     jobLoadState: 'idle',
     jobError: null,
+    imageModelLoadState: 'idle',
+    imageModelOptions: [],
+    imageModelProfileId: null,
+    invalidImageModelProfileId: null,
+    imageModelError: null,
     selectedNodeIds: [],
     inspectorAssetId: null,
     activeTool: 'select',
