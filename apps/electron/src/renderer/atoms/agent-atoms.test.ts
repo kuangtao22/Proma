@@ -1,14 +1,54 @@
 import { describe, expect, test } from 'bun:test'
 import { createStore } from 'jotai/vanilla'
+import type { FilePanelDragItem } from '@/lib/file-panel-drag'
 import {
+  agentPendingMentionsAtomFamily,
   agentSessionInputStreamStateAtomFamily,
+  agentSessionPendingMentionsAtom,
   agentSessionStreamingStateAtomFamily,
   agentStreamingStatesAtom,
+  agentTakePendingMentionsAtom,
   applyAgentEvent,
   clearAgentStreamError,
   isRetryEventForCurrentStream,
   type AgentStreamState,
 } from './agent-atoms'
+
+describe('Agent 会话待插入引用队列', () => {
+  test('Given 两个会话各有待插入引用 When 原子取走其中一个 Then 不串线且同一引用只消费一次', () => {
+    const store = createStore()
+    /** 会话 A 等待插入的项目素材引用。 */
+    const sessionAMention = {
+      path: '/project-a/.proma/design/assets/a.png',
+      name: 'a.png',
+      isDirectory: false,
+      scope: 'project' as const,
+    }
+    /** 会话 B 等待插入的项目素材引用。 */
+    const sessionBMention = {
+      path: '/project-b/.proma/design/assets/b.png',
+      name: 'b.png',
+      isDirectory: false,
+      scope: 'project' as const,
+    }
+
+    store.set(agentPendingMentionsAtomFamily('session-a'), [sessionAMention])
+    store.set(agentPendingMentionsAtomFamily('session-b'), [sessionBMention])
+
+    /** 模拟 AgentView 在输入框挂载后执行的 composer 命令。 */
+    const insertedMentions: FilePanelDragItem[] = []
+    /** 记录该路径不会调用消息发送。 */
+    let sendCount = 0
+    insertedMentions.push(...store.set(agentTakePendingMentionsAtom, 'session-a'))
+
+    expect(insertedMentions).toEqual([sessionAMention])
+    expect(sendCount).toBe(0)
+    expect(store.set(agentTakePendingMentionsAtom, 'session-a')).toEqual([])
+    expect(store.get(agentSessionPendingMentionsAtom)).toEqual(new Map([
+      ['session-b', [sessionBMention]],
+    ]))
+  })
+})
 
 function createStreamState(overrides: Partial<AgentStreamState> = {}): AgentStreamState {
   return {

@@ -50,6 +50,7 @@
 - 项目迁移准入同时覆盖 Agent in-flight generation、自动标题等 generation-owned 写入、Automation、active/linked worktree 与受守卫 IPC；旧 Agent 代际通过唯一 query token 精确关闭，不会误停同会话的新运行。
 - 项目目录选择使用按窗口、用途和代次隔离的一次性 `selectionId`；重启遗留的 copying/verifying/failed journal 只能按已持久化 operation 继续或显式放弃，renderer 不可直接指定任意目标路径。
 - 设计素材与 Agent 会话双向传递以项目归属和当前会话持久化消息为唯一授权事实：设计素材只填入目标会话 composer、不自动发送；Agent 图片只接受该 session 的 `tool_result.imageAttachments.localPath` 精确匹配，并继续执行 realpath、允许根和图片签名校验，禁止扫描目录。新版 SDK JSONL 在主进程落盘时从 Nano Banana 本地标记结构化附件字段，旧 `AgentMessage.events` 保持兼容。
+- Design 到 Agent composer 的跨视图文件引用使用按 `sessionId` 隔离的 Renderer 内存 Jotai 一次性队列：生产者先入队再导航，AgentView 挂载后原子取走，消费、归档或删除时清理；禁止用可能早于监听器挂载的 window 事件传递。禁用的会话菜单按钮保持原生 disabled，并由可聚焦包装元素提供原因提示。
 
 ## 会话记录
 

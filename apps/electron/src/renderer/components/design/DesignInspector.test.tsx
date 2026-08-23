@@ -64,6 +64,8 @@ function renderInspector(
   selectedNodeIds: string[],
   snapshot = createSnapshot(),
   inspectorAssetId: string | null = null,
+  targetSessions: AgentSessionMeta[] = [],
+  onSendAssetToSession?: (assetId: string, sessionId: string) => void,
 ): string {
   return renderToStaticMarkup(
     <DesignInspectorStateView
@@ -79,6 +81,8 @@ function renderInspector(
       onDeleteAsset={() => undefined}
       onRelinkAsset={() => undefined}
       onExportAsset={() => undefined}
+      targetSessions={targetSessions}
+      onSendAssetToSession={onSendAssetToSession}
       onGroupSelection={() => undefined}
       onSelectAsset={() => undefined}
       onClearSelection={() => undefined}
@@ -139,6 +143,15 @@ describe('Design Inspector 状态', () => {
     expect(html).toContain('本地导入')
     expect(html).toContain('aria-label="导出素材"')
     expect(html).toContain('aria-label="删除素材"')
+  })
+
+  test('Given 当前项目没有目标会话 When 渲染发送菜单 Then 提示触发器可聚焦且按钮保持禁用', () => {
+    const html = renderInspector(['node-1'])
+
+    expect(html).toContain('data-design-session-menu-tooltip-trigger="true"')
+    expect(html).toContain('tabindex="0"')
+    expect(html).toContain('aria-description="暂无项目会话"')
+    expect(html).toMatch(/aria-label="发送素材到项目会话"[^>]*disabled=""/)
   })
 
   test('Given 多选素材节点 When 渲染 Then 显示数量和分组入口', () => {

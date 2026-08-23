@@ -14,7 +14,7 @@ import {
   requestDesignRecoveryAtom,
   updateDesignProjectStateAtom,
 } from '@/atoms/design-atoms'
-import { agentSessionsAtom } from '@/atoms/agent-atoms'
+import { agentEnqueuePendingMentionsAtom, agentSessionsAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
 import type { DesignProjectState } from '@/atoms/design-atoms'
@@ -27,7 +27,6 @@ import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { designAdapter } from '@/lib/design-adapter'
 import { sendPreparedDesignAssetToSession } from '@/lib/design-session-actions'
-import { dispatchInsertFileMention } from '@/lib/file-panel-drag'
 import { useOpenSession } from '@/hooks/useOpenSession'
 import { cn } from '@/lib/utils'
 import {
@@ -172,6 +171,8 @@ function AssetsPanel({
 }): React.ReactElement {
   /** 父组件已保证 snapshot 存在。 */
   const snapshot = state.snapshot!
+  /** 无可用目标时保留按钮 disabled 语义，由外层可聚焦元素承载原因提示。 */
+  const sessionMenuDisabled = targetSessions.length === 0 || !onSendAssetToSession
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <section className="border-b border-border px-3 py-3">
@@ -201,9 +202,16 @@ function AssetsPanel({
                 <TooltipProvider delayDuration={200} disableHoverableContent>
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <DropdownMenuTrigger asChild>
-                        <Button type="button" variant="outline" size="icon-sm" aria-label="发送素材到项目会话" disabled={targetSessions.length === 0 || !onSendAssetToSession}><Send aria-hidden="true" /></Button>
-                      </DropdownMenuTrigger>
+                      <span
+                        className="inline-flex"
+                        tabIndex={sessionMenuDisabled ? 0 : undefined}
+                        aria-description={sessionMenuDisabled ? '暂无项目会话' : undefined}
+                        data-design-session-menu-tooltip-trigger="true"
+                      >
+                        <DropdownMenuTrigger asChild>
+                          <Button type="button" variant="outline" size="icon-sm" aria-label="发送素材到项目会话" disabled={sessionMenuDisabled}><Send aria-hidden="true" /></Button>
+                        </DropdownMenuTrigger>
+                      </span>
                     </TooltipTrigger>
                     <TooltipContent side="top">{targetSessions.length > 0 ? '发送到项目会话' : '暂无项目会话'}</TooltipContent>
                   </Tooltip>
@@ -471,6 +479,7 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
   const sessions = useAtomValue(agentSessionsAtom)
   const activeSessionId = useAtomValue(activeSessionIdAtom)
   const setActiveView = useSetAtom(activeViewAtom)
+  const enqueuePendingMentions = useSetAtom(agentEnqueuePendingMentionsAtom)
   const openSession = useOpenSession()
   /** 当前项目内可接收素材的未归档会话，首项即默认目标。 */
   const targetSessions = React.useMemo(
@@ -508,13 +517,13 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
     void designAdapter.prepareAssetForSession({ projectId, assetId, sessionId }).then((prepared) => (
       sendPreparedDesignAssetToSession(prepared, {
         openSession: () => openSession('agent', session.id, session.title),
-        dispatchMention: dispatchInsertFileMention,
+        enqueueMention: (targetSessionId, items) => enqueuePendingMentions({ sessionId: targetSessionId, items }),
         setActiveView,
       })
     )).then(() => toast.success('已添加到会话输入框')).catch((error: unknown) => {
       toast.error(error instanceof Error ? error.message : '发送素材到会话失败')
     })
-  }, [openSession, projectId, setActiveView, targetSessions])
+  }, [enqueuePendingMentions, openSession, projectId, setActiveView, targetSessions])
   return (
     <DesignInspectorStateView
       state={state}

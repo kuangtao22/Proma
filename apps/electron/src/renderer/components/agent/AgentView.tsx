@@ -74,6 +74,8 @@ import {
   currentAgentWorkspaceIdAtom,
   agentPendingPromptAtom,
   agentPendingFilesAtomFamily,
+  agentPendingMentionsAtomFamily,
+  agentTakePendingMentionsAtom,
   agentMessageQueueAtomFamily,
   agentWorkspacesAtom,
   agentStreamErrorsAtom,
@@ -680,6 +682,10 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const pendingFilesRef = React.useRef(pendingFiles)
   // RichTextInput 命令接口 ref（右侧文件面板拖入时插入 @file 引用）
   const richTextInputRef = React.useRef<RichTextInputHandle>(null)
+  /** 当前会话跨视图等待插入的文件引用。 */
+  const pendingMentions = useAtomValue(agentPendingMentionsAtomFamily(sessionId))
+  /** 原子取走引用，避免 StrictMode effect 重复消费。 */
+  const takePendingMentions = useSetAtom(agentTakePendingMentionsAtom)
   const historyQuoteNavigationRequestIdRef = React.useRef(0)
   const [historyQuoteNavigation, setHistoryQuoteNavigation] = React.useState<AgentHistoryQuoteNavigationRequest | null>(null)
   const handleAddHistoryQuote = React.useCallback((quote: QuotedSelection): boolean => {
@@ -2696,6 +2702,15 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     window.addEventListener('proma:focus-input', handler)
     return () => window.removeEventListener('proma:focus-input', handler)
   }, [])
+
+  // Design 等跨视图入口先按会话入队；输入框挂载后再原子取走并插入。
+  React.useEffect(() => {
+    if (pendingMentions.length === 0 || !richTextInputRef.current) return
+    /** 本次只属于当前会话、且已从队列移除的引用。 */
+    const mentions = takePendingMentions(sessionId)
+    if (mentions.length === 0) return
+    richTextInputRef.current.insertFileMentions(mentions)
+  }, [pendingMentions, sessionId, takePendingMentions])
 
   // 监听文件面板三点菜单「引用到 Agent」事件：在输入框插入 @file 引用
   React.useEffect(() => {

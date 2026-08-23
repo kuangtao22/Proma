@@ -13,6 +13,7 @@ import { PROMA_DEFAULT_PERMISSION_MODE } from '@proma/shared'
 import { calculateDockBadgeCount, countPendingRequests } from '@/lib/dock-badge-count'
 import type { AgentQueuedMessage } from '@/lib/agent-message-queue'
 import type { SessionFileChange } from '@/lib/session-file-changes'
+import type { FilePanelDragItem } from '@/lib/file-panel-drag'
 
 /** 活动状态 */
 export type ActivityStatus = 'pending' | 'running' | 'completed' | 'error' | 'backgrounded'
@@ -452,6 +453,59 @@ export const agentPendingFilesAtomFamily = atomFamily((sessionId: string) =>
       })
     },
   ),
+)
+
+/**
+ * 跨视图等待插入 Agent composer 的文件引用，以 sessionId 隔离。
+ * 仅保存在 Renderer 内存中，避免应用重启后恢复已经过期的用户操作。
+ */
+export const agentSessionPendingMentionsAtom = atom<Map<string, FilePanelDragItem[]>>(new Map())
+
+/** 单个会话的待插入引用切片；空数组写回时删除 Map entry。 */
+export const agentPendingMentionsAtomFamily = atomFamily((sessionId: string) =>
+  atom(
+    (get) => get(agentSessionPendingMentionsAtom).get(sessionId) ?? [],
+    (_get, set, update: FilePanelDragItem[] | ((prev: FilePanelDragItem[]) => FilePanelDragItem[])) => {
+      set(agentSessionPendingMentionsAtom, (prev) => {
+        /** 当前会话尚未消费的引用。 */
+        const current = prev.get(sessionId) ?? []
+        /** 本次写入后的引用队列。 */
+        const next = typeof update === 'function' ? update(current) : update
+        /** 保持其它会话引用不变的新 Map。 */
+        const map = new Map(prev)
+        if (next.length === 0) {
+          map.delete(sessionId)
+        } else {
+          map.set(sessionId, next)
+        }
+        return map
+      })
+    },
+  ),
+)
+
+/** 将文件引用追加到指定会话，供导航完成后的 AgentView 消费。 */
+export const agentEnqueuePendingMentionsAtom = atom(
+  null,
+  (_get, set, input: { sessionId: string; items: FilePanelDragItem[] }): void => {
+    if (input.items.length === 0) return
+    set(agentPendingMentionsAtomFamily(input.sessionId), (current) => [...current, ...input.items])
+  },
+)
+
+/**
+ * 原子取走指定会话的全部待插入引用。
+ * 先从 Map 删除再返回，确保 React StrictMode 重复执行 effect 时不会二次插入。
+ */
+export const agentTakePendingMentionsAtom = atom(
+  null,
+  (get, set, sessionId: string): FilePanelDragItem[] => {
+    /** 本次消费的稳定引用数组。 */
+    const items = get(agentSessionPendingMentionsAtom).get(sessionId) ?? []
+    if (items.length === 0) return []
+    set(agentPendingMentionsAtomFamily(sessionId), [])
+    return items
+  },
 )
 
 /**
