@@ -61,10 +61,10 @@ export class ImageGenerationModelCatalog {
 
   /** 列出严格解析后的目录；文件缺失时只读合成旧配置兼容项。 */
   listCatalog(): ImageGenerationModelCatalogResult {
-    /** 当前磁盘目录或旧配置合成结果。 */
-    const loaded = this.loadProfiles()
-    /** 当前凭据只用于计算可用状态，不进入公开 profile。 */
+    /** 单次公开调用固定使用同一凭据快照，避免目录与状态漂移。 */
     const credentials = this.dependencies.getNanoBananaCredentials()
+    /** 当前磁盘目录或旧配置合成结果。 */
+    const loaded = this.loadProfiles(credentials)
     return {
       profiles: loaded.profiles.map(copyProfile),
       inheritedFromLegacyConfig: loaded.inheritedFromLegacyConfig,
@@ -77,7 +77,7 @@ export class ImageGenerationModelCatalog {
     /** 凭据在本次列表计算中只读取一次，避免同次结果漂移。 */
     const credentials = this.dependencies.getNanoBananaCredentials()
     /** 当前磁盘目录或旧配置合成结果。 */
-    const loaded = this.loadProfiles()
+    const loaded = this.loadProfiles(credentials)
     return loaded.profiles.map((profile) => {
       /** profile 当前启用、执行器与凭据的综合可用性。 */
       const availability = getAvailability(profile, credentials)
@@ -101,6 +101,12 @@ export class ImageGenerationModelCatalog {
     }
     /** 经严格字段校验并清洗可展示文本后的完整 profile。 */
     const validatedProfiles = validateProfiles(profiles)
+    /** 单次替换固定使用同一凭据快照，并供旧目录兼容读取复用。 */
+    const credentials = this.dependencies.getNanoBananaCredentials()
+    if (existsSync(this.dependencies.configPath)) {
+      /** 写前确认当前主文件有效，避免覆盖唯一损坏事实或污染恢复候选。 */
+      this.readModelsFile()
+    }
     /** 写入值只包含固定 schema 与 profile 字段。 */
     const file: ImageGenerationModelsFile = {
       schemaVersion: IMAGE_GENERATION_MODELS_SCHEMA_VERSION,
@@ -110,34 +116,41 @@ export class ImageGenerationModelCatalog {
     return {
       profiles: validatedProfiles.map(copyProfile),
       inheritedFromLegacyConfig: false,
-      credentialsConfigured: hasNanoBananaApiKey(
-        this.dependencies.getNanoBananaCredentials(),
-      ),
+      credentialsConfigured: hasNanoBananaApiKey(credentials),
     }
   }
 
   /** 解析当前可执行的 profile，并固化任务所需公开字段。 */
   resolveAvailableSnapshot(profileId: string): ImageGenerationModelSnapshot {
+    /** 单次解析固定使用同一凭据快照，兼顾 legacy model 与可用性。 */
+    const credentials = this.dependencies.getNanoBananaCredentials()
     /** 当前 ID 对应的严格解析 profile。 */
-    const profile = this.findProfile(profileId)
-    assertProfileAvailable(profile, this.dependencies.getNanoBananaCredentials())
+    const profile = this.findProfile(profileId, credentials)
+    assertProfileAvailable(profile, credentials)
     return toSnapshot(profile)
   }
 
   /** 确认历史快照仍可由当前同一执行配置运行；profile 改名不影响快照。 */
   assertSnapshotAvailable(snapshot: ImageGenerationModelSnapshot): void {
+    /** 单次校验固定使用同一凭据快照，兼顾 legacy model 与可用性。 */
+    const credentials = this.dependencies.getNanoBananaCredentials()
     /** 当前 ID 对应的严格解析 profile。 */
-    const profile = this.findProfile(snapshot.profileId)
-    assertProfileAvailable(profile, this.dependencies.getNanoBananaCredentials())
+    const profile = this.findProfile(snapshot.profileId, credentials)
+    assertProfileAvailable(profile, credentials)
     if (profile.executor !== snapshot.executor || profile.modelId !== snapshot.modelId) {
       throw new Error(`生图模型快照与当前配置不一致: ${snapshot.profileId}`)
     }
   }
 
   /** 按稳定 ID 查找当前 profile，不存在时明确拒绝。 */
-  private findProfile(profileId: string): ImageGenerationModelProfile {
+  private findProfile(
+    profileId: string,
+    credentials: Record<string, string>,
+  ): ImageGenerationModelProfile {
     /** 当前目录中与任务快照关联的 profile。 */
-    const profile = this.loadProfiles().profiles.find((candidate) => candidate.id === profileId)
+    const profile = this.loadProfiles(credentials).profiles.find(
+      (candidate) => candidate.id === profileId,
+    )
     if (profile === undefined) {
       throw new Error(`生图模型不存在: ${profileId}`)
     }
@@ -145,10 +158,8 @@ export class ImageGenerationModelCatalog {
   }
 
   /** 只在主文件不存在时合成旧 profile；任何已存在文件都必须严格读取。 */
-  private loadProfiles(): LoadedProfiles {
+  private loadProfiles(credentials: Record<string, string>): LoadedProfiles {
     if (!existsSync(this.dependencies.configPath)) {
-      /** 旧凭据只为兼容 profile 提供模型名，不会持久化或向外返回。 */
-      const credentials = this.dependencies.getNanoBananaCredentials()
       /** 合成时间在单次调用中固定，确保 createdAt 与 updatedAt 一致。 */
       const now = (this.dependencies.now ?? Date.now)()
       return {
@@ -157,6 +168,14 @@ export class ImageGenerationModelCatalog {
       }
     }
 
+    return {
+      profiles: this.readModelsFile().profiles,
+      inheritedFromLegacyConfig: false,
+    }
+  }
+
+  /** 直接严格读取已确认存在的主文件，不从 tmp 或 bak 隐式恢复。 */
+  private readModelsFile(): ImageGenerationModelsFile {
     /** 已存在目录的原始 JSON 文本；读取错误必须原样向上传递。 */
     const raw = readFileSync(this.dependencies.configPath, 'utf8')
     /** JSON 解析后的未知值，随后进入严格 schema 校验。 */
@@ -166,10 +185,7 @@ export class ImageGenerationModelCatalog {
     } catch (error) {
       throw new Error('生图模型目录 JSON 损坏', { cause: error })
     }
-    return {
-      profiles: parseModelsFile(parsed).profiles,
-      inheritedFromLegacyConfig: false,
-    }
+    return parseModelsFile(parsed)
   }
 }
 

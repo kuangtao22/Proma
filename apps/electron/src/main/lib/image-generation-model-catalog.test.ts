@@ -12,6 +12,12 @@ let configPath = ''
 /** 可在测试过程中替换的旧 Nano Banana 凭据。 */
 let credentials: Record<string, string> = {}
 
+/** 记录凭据快照读取次数的测试目录实例。 */
+interface ChangingCredentialsCatalogHarness {
+  catalog: ImageGenerationModelCatalog
+  getCallCount: () => number
+}
+
 /** 创建使用当前测试凭据的模型目录实例。 */
 function createCatalog(now = 100): ImageGenerationModelCatalog {
   return new ImageGenerationModelCatalog({
@@ -19,6 +25,25 @@ function createCatalog(now = 100): ImageGenerationModelCatalog {
     getNanoBananaCredentials: () => credentials,
     now: () => now,
   })
+}
+
+/** 创建每次读取都返回不同值的凭据源，用于验证单次调用快照一致性。 */
+function createChangingCredentialsCatalog(): ChangingCredentialsCatalogHarness {
+  /** 当前实例累计读取旧凭据的次数。 */
+  let callCount = 0
+  return {
+    catalog: new ImageGenerationModelCatalog({
+      configPath,
+      getNanoBananaCredentials: () => {
+        callCount += 1
+        return callCount === 1
+          ? { apiKey: 'first-key', model: 'gemini-first' }
+          : { apiKey: '   ', model: 'gemini-later' }
+      },
+      now: () => 100,
+    }),
+    getCallCount: () => callCount,
+  }
 }
 
 /** 创建完整且可持久化的模型 profile。 */
@@ -119,6 +144,89 @@ describe('ImageGenerationModelCatalog', () => {
     })
     expect(JSON.parse(readFileSync(`${configPath}.bak`, 'utf8'))).toEqual(previousFile)
     expect(existsSync(`${configPath}.tmp`)).toBe(false)
+  })
+
+  test('Given 主文件损坏且恢复候选合法 When 完整替换 Then 拒绝写入且三份文件逐字节不变', () => {
+    /** 故意损坏的主文件原始字节。 */
+    const damagedMain = '{"schemaVersion":1,"profiles":['
+    /** 已存在的合法临时候选原始字节。 */
+    const validTemp = JSON.stringify({ schemaVersion: 1, profiles: [createProfile('temp')] }, null, 2)
+    /** 已存在的合法备份候选原始字节。 */
+    const validBackup = JSON.stringify({ schemaVersion: 1, profiles: [createProfile('backup')] })
+    writeFileSync(configPath, damagedMain, 'utf8')
+    writeFileSync(`${configPath}.tmp`, validTemp, 'utf8')
+    writeFileSync(`${configPath}.bak`, validBackup, 'utf8')
+
+    expect(() => createCatalog().replaceProfiles([createProfile('replacement')])).toThrow(
+      '生图模型目录 JSON 损坏',
+    )
+    expect(readFileSync(configPath, 'utf8')).toBe(damagedMain)
+    expect(readFileSync(`${configPath}.tmp`, 'utf8')).toBe(validTemp)
+    expect(readFileSync(`${configPath}.bak`, 'utf8')).toBe(validBackup)
+  })
+
+  test('Given legacy 凭据读取时变化 When listCatalog Then 单次快照同时决定 model 与配置状态', () => {
+    /** 使用变化凭据源的目录测试实例。 */
+    const harness = createChangingCredentialsCatalog()
+
+    /** 单次公开调用返回的目录结果。 */
+    const result = harness.catalog.listCatalog()
+
+    expect(harness.getCallCount()).toBe(1)
+    expect(result.profiles[0]?.modelId).toBe('gemini-first')
+    expect(result.credentialsConfigured).toBe(true)
+  })
+
+  test('Given legacy 凭据读取时变化 When listOptions Then 单次快照同时决定 model 与可用性', () => {
+    /** 使用变化凭据源的目录测试实例。 */
+    const harness = createChangingCredentialsCatalog()
+
+    /** 单次公开调用返回的模型选项。 */
+    const options = harness.catalog.listOptions()
+
+    expect(harness.getCallCount()).toBe(1)
+    expect(options[0]?.modelId).toBe('gemini-first')
+    expect(options[0]?.available).toBe(true)
+  })
+
+  test('Given legacy 凭据读取时变化 When resolveAvailableSnapshot Then 使用同一可用凭据快照', () => {
+    /** 使用变化凭据源的目录测试实例。 */
+    const harness = createChangingCredentialsCatalog()
+
+    /** 单次解析得到的任务模型快照。 */
+    const snapshot = harness.catalog.resolveAvailableSnapshot('legacy-nano-banana-default')
+
+    expect(harness.getCallCount()).toBe(1)
+    expect(snapshot.modelId).toBe('gemini-first')
+  })
+
+  test('Given legacy 凭据读取时变化 When assertSnapshotAvailable Then 使用同一可用凭据快照', () => {
+    /** 使用变化凭据源的目录测试实例。 */
+    const harness = createChangingCredentialsCatalog()
+    /** 与首次凭据快照相符的历史任务快照。 */
+    const snapshot: ImageGenerationModelSnapshot = {
+      profileId: 'legacy-nano-banana-default',
+      name: '历史名称',
+      executor: 'nano-banana',
+      modelId: 'gemini-first',
+    }
+
+    expect(() => harness.catalog.assertSnapshotAvailable(snapshot)).not.toThrow()
+    expect(harness.getCallCount()).toBe(1)
+  })
+
+  test('Given 已有合法目录且凭据读取时变化 When replaceProfiles Then 只读取一次凭据快照', () => {
+    /** 写前必须通过严格校验的当前合法目录。 */
+    const currentFile = { schemaVersion: 1, profiles: [createProfile('current')] }
+    writeRawConfig(JSON.stringify(currentFile))
+    /** 使用变化凭据源的目录测试实例。 */
+    const harness = createChangingCredentialsCatalog()
+
+    /** 完整替换后的公开目录结果。 */
+    const result = harness.catalog.replaceProfiles([createProfile('replacement')])
+
+    expect(harness.getCallCount()).toBe(1)
+    expect(result.credentialsConfigured).toBe(true)
   })
 
   test('Given API Key 缺失或 profile 停用 When 列出选项 Then 返回明确不可用原因', () => {
