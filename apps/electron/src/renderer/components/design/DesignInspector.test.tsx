@@ -1,4 +1,6 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { createEmptyDesignDocument } from '@proma/shared'
 import type { AgentSessionMeta, CreateDesignJobInput, DesignAsset, DesignWorkspaceSnapshot } from '@proma/shared'
 import { createStore, Provider } from 'jotai'
@@ -263,6 +265,38 @@ describe('Design Inspector 状态', () => {
     expect(generationHtml).toContain('快速模型 · gemini-flash-image')
   })
 
+  test('Given 无选择到有效再到广播失效 When 连续渲染 Select Then 始终受控且回到 placeholder', () => {
+    const source = readFileSync(join(import.meta.dir, 'DesignInspector.tsx'), 'utf8')
+    const consoleError = spyOn(console, 'error').mockImplementation(() => undefined)
+    /** 三个连续权威状态模拟同一项目从空值、有效选择到配置失效。 */
+    const baseState = {
+      ...createInitialDesignProjectState(), phase: 'ready' as const, snapshot: createSnapshot(),
+      inspectorTab: 'ai' as const, imageModelLoadState: 'ready' as const,
+      imageModelOptions: [{
+        profileId: 'profile-flash', name: '快速模型', executor: 'nano-banana' as const,
+        modelId: 'gemini-flash-image', available: true,
+      }],
+    }
+    const renderState = (state: typeof baseState): string => renderToStaticMarkup(
+      <DesignInspectorStateView state={state} onTabChange={() => undefined} onImportAssets={() => undefined}
+        onDeleteAsset={() => undefined} onRelinkAsset={() => undefined} onExportAsset={() => undefined}
+        onGroupSelection={() => undefined} onSelectAsset={() => undefined} onCreateJob={() => undefined}
+        onImageModelChange={() => undefined} onConfigureImageModels={() => undefined} onRetryImageModels={() => undefined} />,
+    )
+
+    const empty = renderState(baseState)
+    const selected = renderState({ ...baseState, imageModelProfileId: 'profile-flash' })
+    const invalid = renderState({ ...baseState, invalidImageModelProfileId: 'removed-profile' })
+
+    expect(source).toContain("value={state.imageModelProfileId ?? ''}")
+    expect(empty).toContain('未配置生图模型')
+    expect(selected).toContain('快速模型 · gemini-flash-image')
+    expect(invalid).toContain('未配置生图模型')
+    expect(invalid).toContain('removed-profile')
+    expect(consoleError.mock.calls.flat().join('\n')).not.toMatch(/controlled|uncontrolled/i)
+    consoleError.mockRestore()
+  })
+
   test('Given 模型正在加载或目录失败 When 渲染 Then 布局稳定并提供对应恢复动作', () => {
     const baseState = {
       ...createInitialDesignProjectState(), phase: 'ready' as const,
@@ -310,6 +344,35 @@ describe('Design Inspector 状态', () => {
     expect(html).toContain('高质量模型 · gemini-pro-image')
     expect(html).toMatch(/<button(?=[^>]*id="design-image-model")(?=[^>]*disabled="")[^>]*>/)
     expect(html).not.toContain('aria-label="正在加载生图模型"')
+  })
+
+  test('Given 超长同名配置 When 检查模型菜单 Then 宽度受 Inspector 约束且完整值仍可访问', () => {
+    const source = readFileSync(join(import.meta.dir, 'DesignInspector.tsx'), 'utf8')
+    const longName = '高质量模型'.repeat(20)
+    const longModelId = `gemini-${'very-long-model-id-'.repeat(20)}`
+    const html = renderToStaticMarkup(
+      <DesignInspectorStateView
+        state={{
+          ...createInitialDesignProjectState(), phase: 'ready', snapshot: createSnapshot(), inspectorTab: 'ai',
+          imageModelLoadState: 'ready', imageModelProfileId: 'profile-long',
+          imageModelOptions: [{
+            profileId: 'profile-long', name: longName, executor: 'nano-banana',
+            modelId: longModelId, available: true,
+          }],
+        }}
+        onTabChange={() => undefined} onImportAssets={() => undefined} onDeleteAsset={() => undefined}
+        onRelinkAsset={() => undefined} onExportAsset={() => undefined} onGroupSelection={() => undefined}
+        onSelectAsset={() => undefined} onCreateJob={() => undefined} onImageModelChange={() => undefined}
+        onConfigureImageModels={() => undefined} onRetryImageModels={() => undefined}
+      />,
+    )
+    const fullLabel = `${longName} · ${longModelId}`
+
+    expect(source).toContain('w-[var(--radix-select-trigger-width)]')
+    expect(source).toContain('max-w-[var(--radix-select-content-available-width)]')
+    expect(source).toContain('className="min-w-0"')
+    expect(source).toContain('className="block min-w-0 truncate"')
+    expect(html).toContain(`title="${fullLabel}"`)
   })
 
   test('Given 没有可用模型或当前选择失效 When 渲染 Then 保留提示词并阻断任务且提供配置入口', () => {

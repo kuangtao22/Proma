@@ -34,12 +34,14 @@ function createFixture(initialSelections: Record<string, DesignImageModelSelecti
   /** 失败后展示给用户的错误文本。 */
   const errors: string[] = []
   let setError: Error | null = null
+  let getError: Error | null = null
   let getCalls = 0
   const adapter: Pick<DesignAdapter,
     'getImageModelSelection' | 'setImageModelSelection'
     | 'onImageModelProfilesChanged' | 'onImageModelSelectionChanged'> = {
     getImageModelSelection: async (projectId) => {
       getCalls += 1
+      if (getError) throw getError
       const result = authoritative.get(projectId)
       if (!result) throw new Error(`缺少项目选择: ${projectId}`)
       return structuredClone(result)
@@ -80,6 +82,7 @@ function createFixture(initialSelections: Record<string, DesignImageModelSelecti
     controller,
     errors,
     getCalls: () => getCalls,
+    setGetError: (error: Error | null) => { getError = error },
     setError: (error: Error | null) => { setError = error },
     setAuthoritative: (projectId: string, value: DesignImageModelSelection) => authoritative.set(projectId, value),
     emitProfilesChanged: () => { for (const listener of profileListeners) listener() },
@@ -139,6 +142,66 @@ describe('Design 项目生图模型选择 controller', () => {
     controller.dispose()
   })
 
+  test('Given 当前项目已加载 When 选择新模型成功 Then 乐观值收敛为主进程权威 ready 状态', async () => {
+    const fixture = createFixture({ 'project-a': selection('project-a', 'profile-a') })
+    const controller = fixture.controller('project-a')
+    controller.start()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    controller.selectProfile('profile-b')
+    expect(fixture.state('project-a').imageModelProfileId).toBe('profile-b')
+    expect(fixture.state('project-a').imageModelLoadState).toBe('loading')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(fixture.state('project-a').imageModelLoadState).toBe('ready')
+    expect(fixture.state('project-a').imageModelProfileId).toBe('profile-b')
+    expect(fixture.state('project-a').imageModelError).toBeNull()
+    expect(fixture.errors).toEqual([])
+    controller.dispose()
+  })
+
+  test('Given 连续选择两个模型 When 旧选择最后失败 Then 不得回滚后续成功选择', async () => {
+    /** 收集写入 resolver 与 rejecter，精确制造旧失败晚于新成功。 */
+    const writes: Array<{
+      resolve: (value: DesignImageModelSelection) => void
+      reject: (error: Error) => void
+    }> = []
+    const adapter = {
+      getImageModelSelection: async () => selection('project-a', 'profile-a'),
+      setImageModelSelection: () => new Promise<DesignImageModelSelection>((resolve, reject) => {
+        writes.push({ resolve, reject })
+      }),
+      onImageModelProfilesChanged: () => () => undefined,
+      onImageModelSelectionChanged: () => () => undefined,
+    }
+    let state = createInitialDesignProjectState()
+    const errors: string[] = []
+    const controller = createDesignImageModelSelectionController({
+      projectId: 'project-a', adapter,
+      updateState: (update) => { state = { ...state, ...(typeof update === 'function' ? update(state) : update) } },
+      onError: (message) => errors.push(message),
+    })
+    controller.start()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    controller.selectProfile('profile-a')
+    controller.selectProfile('profile-b')
+    writes[1]?.resolve(selection('project-a', 'profile-b'))
+    await Promise.resolve()
+    await Promise.resolve()
+    writes[0]?.reject(new Error('旧选择失败'))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(state.imageModelProfileId).toBe('profile-b')
+    expect(state.imageModelLoadState).toBe('ready')
+    expect(errors).toEqual([])
+    controller.dispose()
+  })
+
   test('Given 目录和其它项目选择广播 When 当前项目已进入 Then 只刷新应收敛的事件', async () => {
     const fixture = createFixture({
       'project-a': selection('project-a', 'profile-a'),
@@ -160,6 +223,34 @@ describe('Design 项目生图模型选择 controller', () => {
     await Promise.resolve()
     expect(fixture.getCalls()).toBe(2)
     expect(fixture.state('project-a').imageModelProfileId).toBe('profile-b')
+    controller.dispose()
+  })
+
+  test('Given 广播刷新 GET 失败 When 当前项目已有选择 Then 保留现有值并可在重试后恢复', async () => {
+    const fixture = createFixture({ 'project-a': selection('project-a', 'profile-a') })
+    const controller = fixture.controller('project-a')
+    controller.start()
+    await Promise.resolve()
+    await Promise.resolve()
+    const options = fixture.state('project-a').imageModelOptions
+    fixture.setGetError(new Error('模型目录暂时不可用'))
+
+    fixture.emitSelectionChanged('project-a')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(fixture.state('project-a').imageModelLoadState).toBe('failed')
+    expect(fixture.state('project-a').imageModelProfileId).toBe('profile-a')
+    expect(fixture.state('project-a').imageModelOptions).toBe(options)
+    expect(fixture.state('project-a').imageModelError).toBe('模型目录暂时不可用')
+
+    fixture.setGetError(null)
+    controller.retryLoad()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fixture.state('project-a').imageModelLoadState).toBe('ready')
+    expect(fixture.state('project-a').imageModelProfileId).toBe('profile-a')
+    expect(fixture.state('project-a').imageModelError).toBeNull()
     controller.dispose()
   })
 

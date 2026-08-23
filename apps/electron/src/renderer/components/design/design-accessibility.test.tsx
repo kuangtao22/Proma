@@ -95,7 +95,10 @@ describe('Design 无障碍、窄窗口与主题合同', () => {
     const inspectorSource = readFileSync(join(import.meta.dir, 'DesignInspector.tsx'), 'utf8')
 
     expect(inspectorSource).toContain('id="design-image-model"')
-    expect(inspectorSource).toContain('className="h-8 w-full rounded px-2 text-xs disabled:opacity-100"')
+    expect(inspectorSource).toContain('disabled:opacity-100')
+    expect(inspectorSource).toContain('disabled:bg-muted/40')
+    expect(inspectorSource).toContain('disabled:text-muted-foreground')
+    expect(inspectorSource).toContain('disabled:border-border/60')
     expect(inspectorSource).toContain('<Tooltip>')
     expect(inspectorSource).not.toContain('onKeyDown=')
     expect(inspectorSource).toContain("setSettingsTab('tools')")

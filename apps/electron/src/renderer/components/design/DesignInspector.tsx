@@ -320,6 +320,10 @@ function AiPanel({
   const selectedModelOption = availableOptions.find((option) => (
     option.profileId === state.imageModelProfileId
   ))
+  /** 当前选项的完整可访问文本，视觉上允许在窄 Inspector 内截断。 */
+  const selectedModelLabel = selectedModelOption
+    ? `${selectedModelOption.name} · ${selectedModelOption.modelId}`
+    : undefined
   /** 任务只在权威选择已 ready 且仍属于可用目录时开放。 */
   const selectedModelAvailable = state.imageModelLoadState === 'ready'
     && state.imageModelProfileId !== null
@@ -374,21 +378,29 @@ function AiPanel({
         <div className="h-8 rounded bg-muted animate-pulse" aria-label="正在加载生图模型" />
       ) : (
         <Select
-          value={state.imageModelProfileId ?? undefined}
+          value={state.imageModelProfileId ?? ''}
           onValueChange={(profileId) => onImageModelChange?.(profileId)}
           disabled={state.imageModelLoadState !== 'ready' || availableOptions.length === 0}
         >
-          <SelectTrigger id="design-image-model" className="h-8 w-full rounded px-2 text-xs disabled:opacity-100">
+          <SelectTrigger
+            id="design-image-model"
+            title={selectedModelLabel}
+            className="h-8 min-w-0 w-full rounded px-2 text-xs disabled:border-border/60 disabled:bg-muted/40 disabled:text-muted-foreground disabled:opacity-100"
+          >
             <SelectValue placeholder="未配置生图模型">
-              {selectedModelOption ? `${selectedModelOption.name} · ${selectedModelOption.modelId}` : undefined}
+              {selectedModelLabel}
             </SelectValue>
           </SelectTrigger>
-          <SelectContent>
-            {availableOptions.map((option) => (
-              <SelectItem key={option.profileId} value={option.profileId}>
-                {option.name} · {option.modelId}
-              </SelectItem>
-            ))}
+          <SelectContent className="w-[var(--radix-select-trigger-width)] max-w-[var(--radix-select-content-available-width)]">
+            {availableOptions.map((option) => {
+              /** 菜单视觉文本截断，title 保留同名配置的完整真实模型 ID。 */
+              const optionLabel = `${option.name} · ${option.modelId}`
+              return (
+                <SelectItem key={option.profileId} value={option.profileId} className="min-w-0">
+                  <span className="block min-w-0 truncate" title={optionLabel}>{optionLabel}</span>
+                </SelectItem>
+              )
+            })}
           </SelectContent>
         </Select>
       )}
