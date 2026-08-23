@@ -14,4 +14,6 @@ export interface AgentRunExtensions {
   trustedImageRoute?: ImageGenerationModelSnapshot
   /** 图片工具执行前实时复核固化路由与凭据。 */
   assertTrustedImageRouteAvailable?: (route: ImageGenerationModelSnapshot) => void
+  /** 本次运行按完整工具名设置的最大准入次数；缺失时不限制普通 Agent。 */
+  toolCallLimits?: Readonly<Record<string, number>>
 }

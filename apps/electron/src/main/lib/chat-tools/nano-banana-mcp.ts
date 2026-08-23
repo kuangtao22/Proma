@@ -59,6 +59,8 @@ const sessionHistory = new Map<string, GeminiContent[]>()
 
 const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com'
 const DEFAULT_MODEL = 'gemini-3.1-flash-image-preview'
+/** Design 可信路由缺少主进程实时复核时使用的稳定拒绝原因。 */
+const MISSING_TRUSTED_ROUTE_ASSERTION_ERROR = '设计任务缺少可信生图模型实时复核，已拒绝执行'
 
 // ===== MCP 内容块类型 =====
 
@@ -226,12 +228,16 @@ async function callGeminiAndBuildResult(
     trustedImageRoute?: ImageGenerationModelSnapshot
     assertTrustedImageRouteAvailable?: (route: ImageGenerationModelSnapshot) => void
   },
+  signal?: AbortSignal,
 ): Promise<McpToolResult> {
+  signal?.throwIfAborted()
   // 复核必须早于历史读取、参考图读取和 fetch，避免失效任务产生任何可计费或本地输入副作用。
   if (options.trustedImageRoute) {
-    options.assertTrustedImageRouteAvailable?.(options.trustedImageRoute)
+    if (!options.assertTrustedImageRouteAvailable) throw new Error(MISSING_TRUSTED_ROUTE_ASSERTION_ERROR)
+    options.assertTrustedImageRouteAvailable(options.trustedImageRoute)
   }
   const credentials = getToolCredentials('nano-banana')
+  if (!credentials.apiKey?.trim()) throw new Error('Nano Banana API Key 未配置: nano-banana')
   const baseUrl = credentials.baseUrl?.trim() || DEFAULT_BASE_URL
   const model = options.trustedImageRoute?.modelId
     ?? (credentials.model?.trim() || DEFAULT_MODEL)
@@ -243,6 +249,7 @@ async function callGeminiAndBuildResult(
   const referenceImageParts = options.referenceImagePaths?.length
     ? readReferenceImages(options.referenceImagePaths, options.cwd, options.allowedRoots)
     : []
+  signal?.throwIfAborted()
   if (referenceImageParts.length > 0) {
     console.log(`[Nano Banana MCP] 加载了 ${referenceImageParts.length} 张参考图`)
   }
@@ -261,7 +268,9 @@ async function callGeminiAndBuildResult(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(requestBody),
+    signal,
   })
+  signal?.throwIfAborted()
 
   if (!response.ok) {
     const errorText = await response.text()
@@ -272,6 +281,7 @@ async function callGeminiAndBuildResult(
   }
 
   const data = (await response.json()) as GeminiResponse
+  signal?.throwIfAborted()
 
   if (data.error) {
     return {
@@ -297,6 +307,7 @@ async function callGeminiAndBuildResult(
 
   // 解析响应：提取图片和文本（跳过 thought parts，它们是推理过程图，不作为输出）
   for (const part of parts) {
+    signal?.throwIfAborted()
     if (part.thought) continue
     if (part.inlineData) {
       // 保存图片到附件目录（供 UI 渲染）
@@ -344,6 +355,7 @@ async function callGeminiAndBuildResult(
   const userContent: GeminiContent = { role: 'user', parts: [...referenceImageParts, { text: prompt }] }
   const modelContent: GeminiContent = { role: 'model', parts }
   const updatedHistory = [...history, userContent, modelContent]
+  signal?.throwIfAborted()
   sessionHistory.set(sessionId, updatedHistory)
 
   // 在图片内容块之后追加文本摘要
@@ -402,7 +414,7 @@ export function buildPiNanoBananaTools(
 ): ToolDefinition[] {
   const toolState = getToolState('nano-banana')
   const credentials = getToolCredentials('nano-banana')
-  if ((!toolState.enabled && !ctx.trustedImageRoute) || !credentials.apiKey) return []
+  if (!ctx.trustedImageRoute && (!toolState.enabled || !credentials.apiKey)) return []
 
   return [sdk.defineTool({
     name: 'mcp__nano_banana__generate_image',
@@ -416,7 +428,7 @@ export function buildPiNanoBananaTools(
       imageSize: Type.Optional(Type.Union([Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K')])),
       numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
     }),
-    async execute(toolCallId, args) {
+    async execute(toolCallId, args, signal) {
       try {
         const result = await callGeminiAndBuildResult(String(args.prompt), ctx.sessionId, {
           aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
@@ -429,9 +441,11 @@ export function buildPiNanoBananaTools(
           numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
           trustedImageRoute: ctx.trustedImageRoute,
           assertTrustedImageRouteAvailable: ctx.assertTrustedImageRouteAvailable,
-        })
+        }, signal)
         return toPiToolResult(result, toolCallId)
       } catch (error) {
+        if (signal?.aborted) signal.throwIfAborted()
+        if (error instanceof Error && error.name === 'AbortError') throw error
         const message = error instanceof Error ? error.message : String(error)
         console.error('[Nano Banana Pi 工具] 执行失败:', error)
         return {

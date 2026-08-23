@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test'
-import { AGENT_RUNTIME_METHODS } from '@proma/shared'
+import { AGENT_RUNTIME_METHODS, createAgentRuntimeRequest } from '@proma/shared'
 import type { AgentRuntimeEvent } from '@proma/shared'
 import type { PiAgentQueryOptions } from './pi-agent-adapter'
+import { createRunToolCallLimiter } from '../agent-run-tool-policy'
 
 /** 创建可控 Promise，用于模拟 utility runtime 的真实关闭耗时。 */
 function createDeferred(): {
@@ -89,6 +90,53 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
 }
 
 describe('Pi utility 强制关闭合同', () => {
+  test('Given utility run 的付费工具上限为一 When runtime 连续请求两次准入 Then 主进程共享同一本轮计数器', async () => {
+    /** 被测 utility adapter。 */
+    const adapter = new PiUtilityAdapter()
+    /** 单次主进程 run 独享的工具调用计数器。 */
+    const consumeLimit = createRunToolCallLimiter({ mcp__nano_banana__generate_image: 1 })
+    /** 带主进程权限回调的 query 输入。 */
+    const input = {
+      ...createQueryInput('session-tool-limit'),
+      canUseTool: async (toolName: string, toolInput: Record<string, unknown>) => (
+        consumeLimit(toolName) ?? { behavior: 'allow' as const, updatedInput: toolInput }
+      ),
+    } as PiAgentQueryOptions
+    /** 启动 query 以注册 pending capability 上下文。 */
+    const iterator = adapter.query(input, 'query-tool-limit')[Symbol.asyncIterator]()
+    const pendingNext = iterator.next()
+    await waitUntil(() => runtimeStates.length === 1)
+
+    /** 构造来自 utility runtime 的两次同工具权限请求。 */
+    const request = (requestId: string) => createAgentRuntimeRequest(
+      AGENT_RUNTIME_METHODS.CAPABILITY_CAN_USE_TOOL,
+      {
+        queryId: 'query-tool-limit',
+        sessionId: 'session-tool-limit',
+        toolName: 'mcp__nano_banana__generate_image',
+        input: { prompt: 'draw' },
+        options: { toolUseID: requestId },
+      },
+      { queryId: 'query-tool-limit', sessionId: 'session-tool-limit' },
+    )
+
+    await expect(adapter.handleRuntimeRequest(request('tool-1'))).resolves.toMatchObject({ behavior: 'allow' })
+    await expect(adapter.handleRuntimeRequest(request('tool-2'))).resolves.toEqual({
+      behavior: 'deny',
+      message: '当前任务工具调用次数已达上限: mcp__nano_banana__generate_image',
+    })
+
+    runtimeStates[0]!.stop.resolve()
+    runtimeStates[0]!.eventListener?.({
+      kind: 'event',
+      method: AGENT_RUNTIME_METHODS.EVENT_QUERY_END,
+      queryId: 'query-tool-limit',
+      sessionId: 'session-tool-limit',
+      payload: { queryId: 'query-tool-limit' },
+    } as AgentRuntimeEvent)
+    await expect(pendingNext).resolves.toMatchObject({ done: true })
+  })
+
   test('Given runtime 停止超时 When 普通停止后强制关闭 Then 共享一次底层关闭', async () => {
     /** 被测 utility adapter。 */
     const adapter = new PiUtilityAdapter()

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 import type { AgentToolResultImage, ImageGenerationModelSnapshot } from '@proma/shared'
+import { createRunToolCallLimiter } from '../agent-run-tool-policy'
 
 const originalFetch = globalThis.fetch
 /** 测试可切换的普通工具开关，验证 Design 可信路由不依赖全局配置。 */
@@ -34,19 +35,22 @@ interface TestToolResultDetails {
 }
 
 interface TestToolDefinition {
-  execute: (toolUseId: string, input: Record<string, unknown>) => Promise<{
+  execute: (toolUseId: string, input: Record<string, unknown>, signal?: AbortSignal) => Promise<{
     content: Array<{ type: string; text?: string }>
     details: TestToolResultDetails
   }>
 }
 
 type NanoBananaModule = typeof import('./nano-banana-mcp')
+type FetchImplementation = (
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+) => Promise<Response>
 let nanoBanana: NanoBananaModule
-/** 记录实际 Gemini 请求，断言可信模型覆盖不会被工具输入篡改。 */
-const fetchMock = mock(async (
-  _input: Parameters<typeof fetch>[0],
-  _init?: Parameters<typeof fetch>[1],
-) => new Response(JSON.stringify({
+/** 测试 fetch 的可替换实现，用于模拟取消中的网络请求。 */
+let fetchImplementation: FetchImplementation
+/** 构造每次请求使用的新响应，避免 Response body 被不同测试复用。 */
+const createFetchResponse = (): Response => new Response(JSON.stringify({
   candidates: [{
     content: {
       role: 'model',
@@ -57,7 +61,12 @@ const fetchMock = mock(async (
       }],
     },
   }],
-}), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+/** 记录实际 Gemini 请求，断言可信模型覆盖不会被工具输入篡改。 */
+const fetchMock = mock(async (
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+) => fetchImplementation(input, init))
 
 beforeAll(async () => {
   /** 保留 Bun fetch 的静态 preconnect 能力，测试仅替换请求实现。 */
@@ -68,6 +77,7 @@ beforeAll(async () => {
 beforeEach(() => {
   toolEnabled = true
   toolCredentials = { apiKey: 'test-key', model: 'global-image-model' }
+  fetchImplementation = async () => createFetchResponse()
   fetchMock.mockClear()
   saveAttachmentMock.mockClear()
 })
@@ -201,5 +211,81 @@ describe('Nano Banana Pi 工具附件来源', () => {
       trustedImageRoute,
       assertTrustedImageRouteAvailable: () => undefined,
     })).toHaveLength(1)
+  })
+
+  test('Given Design route 存在但 Key 在运行期间删除 When 构建并执行工具 Then 仍注册工具且明确返回凭据失效', async () => {
+    toolEnabled = false
+    toolCredentials = { apiKey: '', model: 'global-image-model' }
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const trustedImageRoute: ImageGenerationModelSnapshot = {
+      profileId: 'profile-no-key', name: '无凭据模型', executor: 'nano-banana', modelId: 'gemini-no-key',
+    }
+    const tools = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'design-key-deleted',
+      trustedImageRoute,
+      assertTrustedImageRouteAvailable: () => { throw new Error('Nano Banana API Key 未配置: nano-banana') },
+    }) as unknown as TestToolDefinition[]
+
+    expect(tools).toHaveLength(1)
+    const result = await tools[0]!.execute('tool-no-key', { prompt: 'draw' })
+    expect(result.content[0]?.text).toContain('Nano Banana API Key 未配置')
+    expect(fetchMock).toHaveBeenCalledTimes(0)
+  })
+
+  test('Given Design route 缺少实时复核函数 When 执行工具 Then fail closed 且不调用接口', async () => {
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'design-missing-assertion',
+      trustedImageRoute: {
+        profileId: 'profile-route', name: '可信模型', executor: 'nano-banana', modelId: 'gemini-route',
+      },
+    }) as unknown as TestToolDefinition[]
+
+    const result = await tool!.execute('tool-missing-assertion', { prompt: 'draw' })
+    expect(result.content[0]?.text).toContain('缺少可信生图模型实时复核')
+    expect(fetchMock).toHaveBeenCalledTimes(0)
+  })
+
+  test('Given 图片请求仍在等待 When Agent 取消 Then 抛 AbortError 且不保存附件或历史', async () => {
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    fetchImplementation = (_input, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+    })
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, { sessionId: 'session-aborted' }) as unknown as TestToolDefinition[]
+    const controller = new AbortController()
+
+    const pending = tool!.execute('tool-aborted', { prompt: 'draw' }, controller.signal)
+    controller.abort()
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(saveAttachmentMock).toHaveBeenCalledTimes(0)
+
+    fetchImplementation = async () => createFetchResponse()
+    await tool!.execute('tool-after-abort', { prompt: 'clean history' })
+    const request = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as { contents: unknown[] }
+    expect(request.contents).toHaveLength(1)
+  })
+
+  test('Given Design 单轮工具调用上限为一 When Agent 连续调用两次 Then 第二次拒绝且只发起一次请求', async () => {
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const toolName = 'mcp__nano_banana__generate_image'
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, { sessionId: 'session-limit' }) as unknown as TestToolDefinition[]
+    const consumeLimit = createRunToolCallLimiter({ [toolName]: 1 })
+
+    expect(consumeLimit(toolName)).toBeUndefined()
+    await tool!.execute('tool-first', { prompt: 'first' })
+    expect(consumeLimit(toolName)).toEqual({
+      behavior: 'deny',
+      message: `当前任务工具调用次数已达上限: ${toolName}`,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })

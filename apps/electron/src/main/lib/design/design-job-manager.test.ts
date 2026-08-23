@@ -19,6 +19,7 @@ import { DesignJobManager } from './design-job-manager'
 import { applyDesignMutations } from './design-store'
 import type { DesignStore } from './design-store'
 import { createWorkspaceOperationRegistry } from '../workspace-operation-lock'
+import type { AgentRunExtensions } from '../agent-run-extensions'
 
 const NANO_BANANA_TOOL = 'mcp__nano_banana__generate_image'
 
@@ -62,6 +63,7 @@ describe('Design Job Manager', () => {
       triggeredBy: 'user',
       permissionModeOverride: 'bypassPermissions',
       allowedToolNames: [NANO_BANANA_TOOL],
+      toolCallLimits: { [NANO_BANANA_TOOL]: 1 },
       trustedImageRoute: {
         profileId: 'profile-test',
         name: '测试生图模型',
@@ -223,6 +225,62 @@ describe('Design Job Manager', () => {
     expect(harness.createdSessions).toEqual([])
     expect(harness.sessionUpdates).toEqual([])
     expect(harness.runInputs).toEqual([])
+  })
+
+  test('Given Agent 启动后模型被停用 When 图片工具实时复核 Then journal 保留真实业务原因', async () => {
+    /** 区分运行前复核与工具执行时复核。 */
+    let assertionCount = 0
+    harness.assertSnapshotAvailable = () => {
+      assertionCount += 1
+      if (assertionCount === 2) throw new Error('生图模型已停用: profile-test')
+    }
+    harness.runHeadless = async (callbacks, extensions) => {
+      try { extensions.assertTrustedImageRouteAvailable?.(extensions.trustedImageRoute!) } catch { /* 模拟 Pi 工具错误结果 */ }
+      callbacks.onComplete([])
+    }
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({ status: 'failed', error: '生图模型已停用: profile-test' })
+  })
+
+  test('Given Agent 启动后凭据被删除 When 图片工具实时复核 Then journal 明确提示 Key 未配置', async () => {
+    /** 区分运行前复核与工具执行时复核。 */
+    let assertionCount = 0
+    harness.assertSnapshotAvailable = () => {
+      assertionCount += 1
+      if (assertionCount === 2) throw new Error('Nano Banana API Key 未配置: nano-banana')
+    }
+    harness.runHeadless = async (callbacks, extensions) => {
+      try { extensions.assertTrustedImageRouteAvailable?.(extensions.trustedImageRoute!) } catch { /* 模拟 Pi 工具错误结果 */ }
+      callbacks.onComplete([])
+    }
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({ status: 'failed', error: 'Nano Banana API Key 未配置: nano-banana' })
+  })
+
+  test('Given 工具实时复核发生含绝对路径的底层错误 When Agent 完成 Then journal 只保留稳定中文', async () => {
+    /** 区分运行前复核与工具执行时复核。 */
+    let assertionCount = 0
+    harness.assertSnapshotAvailable = () => {
+      assertionCount += 1
+      if (assertionCount === 2) throw new Error('EACCES /Users/secret/image-generation-models.json')
+    }
+    harness.runHeadless = async (callbacks, extensions) => {
+      try { extensions.assertTrustedImageRouteAvailable?.(extensions.trustedImageRoute!) } catch { /* 模拟 Pi 工具错误结果 */ }
+      callbacks.onComplete([])
+    }
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({ status: 'failed', error: '校验生图模型配置失败，请刷新后重试' })
+    expect(harness.warnings.join('\n')).toContain('/Users/secret/image-generation-models.json')
+    expect(JSON.stringify(harness.manager.get(job.id))).not.toContain('/Users/secret')
   })
 
   test('Given 执行前复核模型时发生含绝对路径的底层错误 When 运行 Then journal 与广播只保留稳定中文', async () => {
@@ -752,7 +810,7 @@ describe('Design Job Manager', () => {
       runHeadless: undefined | ((callbacks: {
         onError: (error: string) => void
         onComplete: (messages?: AgentMessage[]) => void
-      }) => Promise<void>)
+      }, extensions: AgentRunExtensions) => Promise<void>)
       createSessionError?: Error
       updateSessionError?: Error
       importError?: Error
@@ -885,10 +943,11 @@ describe('Design Job Manager', () => {
           ...input,
           source: callbacks.source,
           allowedToolNames: extensions.allowedToolNames,
+          toolCallLimits: extensions.toolCallLimits,
           trustedImageRoute: extensions.trustedImageRoute,
           hasTrustedImageRouteAssertion: typeof extensions.assertTrustedImageRouteAvailable === 'function',
         })
-        if (state.runHeadless) return state.runHeadless(callbacks)
+        if (state.runHeadless) return state.runHeadless(callbacks, extensions)
         callbacks.onComplete(state.messages)
       },
       stopAgent: async (sessionId) => { stoppedSessions.push(sessionId) },

@@ -61,7 +61,7 @@ import type { PermissionResult, CanUseToolOptions } from './agent-permission-ser
 import { resolvePlanningDeletionPermission } from './planning-permission-policy'
 import { askUserService } from './agent-ask-user-service'
 import { exitPlanService, type ExitPlanPermissionResult } from './agent-exit-plan-service'
-import { denyToolOutsideRunAllowlist } from './agent-run-tool-policy'
+import { createRunToolCallLimiter, denyToolOutsideRunAllowlist } from './agent-run-tool-policy'
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
@@ -1250,6 +1250,8 @@ export class AgentOrchestrator {
 
       /** Plan 模式是否已被 Agent 进入（初始 plan 模式时天然为 true，其他模式需 EnterPlanMode 触发） */
       let planModeEntered = initialPermissionMode === 'plan'
+      /** 每次 sendMessage 独享计数器，避免并发会话和后续 run 共享付费工具配额。 */
+      const consumeRunToolCallLimit = createRunToolCallLimiter(extensions.toolCallLimits)
 
       /** 旧代际在异步审批返回后统一得到拒绝，防止迟到工具继续执行。 */
       const denyStaleToolRun = (): PermissionResult | undefined => (
@@ -1289,6 +1291,9 @@ export class AgentOrchestrator {
           console.warn(`[Agent 工具验证] 参数缺失: tool=${toolName}, mode=${currentMode}`)
           return validationFailure
         }
+        /** 参数有效后、任何异步权限等待前同步占位，防止并发工具调用同时穿透上限。 */
+        const toolLimitDenial = consumeRunToolCallLimit(toolName)
+        if (toolLimitDenial) return toolLimitDenial
 
         // ── Write 大文件 token 截断防护 ──
         if (toolName === 'Write' && typeof input.content === 'string') {

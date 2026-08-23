@@ -247,14 +247,22 @@ export class DesignJobManager {
         permissionModeOverride: 'bypassPermissions',
       }, {
         source: 'design',
-        onError: (error) => { runError = error },
+        onError: (error) => { runError ??= error },
         onComplete: (completedMessages) => { messages = completedMessages ?? [] },
         onTitleUpdated: () => undefined,
       }, {
         allowedToolNames: [DESIGN_IMAGE_TOOL],
+        toolCallLimits: { [DESIGN_IMAGE_TOOL]: 1 },
         trustedImageRoute: running.imageModelSnapshot,
         assertTrustedImageRouteAvailable: (route) => {
-          this.dependencies.imageModels.assertSnapshotAvailable(route)
+          try {
+            this.runImageModelValidation(
+              () => this.dependencies.imageModels.assertSnapshotAvailable(route),
+            )
+          } catch (error) {
+            runError ??= error instanceof Error ? error.message : DESIGN_IMAGE_MODEL_VALIDATION_ERROR
+            throw error
+          }
         },
       })
       const latest = this.requireJob(jobId)
