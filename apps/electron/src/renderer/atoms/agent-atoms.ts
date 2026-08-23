@@ -494,17 +494,17 @@ export const agentEnqueuePendingMentionsAtom = atom(
 )
 
 /**
- * 原子取走指定会话的全部待插入引用。
- * 先从 Map 删除再返回，确保 React StrictMode 重复执行 effect 时不会二次插入。
+ * 在 composer 明确插入成功后确认指定队列。
+ * 仅接受同一数组身份，避免迟到 effect 清掉其后追加的新引用。
  */
-export const agentTakePendingMentionsAtom = atom(
+export const agentAckPendingMentionsAtom = atom(
   null,
-  (get, set, sessionId: string): FilePanelDragItem[] => {
-    /** 本次消费的稳定引用数组。 */
-    const items = get(agentSessionPendingMentionsAtom).get(sessionId) ?? []
-    if (items.length === 0) return []
-    set(agentPendingMentionsAtomFamily(sessionId), [])
-    return items
+  (get, set, input: { sessionId: string; items: FilePanelDragItem[] }): boolean => {
+    /** 确认时仍在等待消费的当前队列。 */
+    const current = get(agentSessionPendingMentionsAtom).get(input.sessionId)
+    if (!current || current !== input.items) return false
+    set(agentPendingMentionsAtomFamily(input.sessionId), [])
+    return true
   },
 )
 

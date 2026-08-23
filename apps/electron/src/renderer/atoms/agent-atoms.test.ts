@@ -2,12 +2,12 @@ import { describe, expect, test } from 'bun:test'
 import { createStore } from 'jotai/vanilla'
 import type { FilePanelDragItem } from '@/lib/file-panel-drag'
 import {
+  agentAckPendingMentionsAtom,
   agentPendingMentionsAtomFamily,
   agentSessionInputStreamStateAtomFamily,
   agentSessionPendingMentionsAtom,
   agentSessionStreamingStateAtomFamily,
   agentStreamingStatesAtom,
-  agentTakePendingMentionsAtom,
   applyAgentEvent,
   clearAgentStreamError,
   isRetryEventForCurrentStream,
@@ -15,7 +15,7 @@ import {
 } from './agent-atoms'
 
 describe('Agent 会话待插入引用队列', () => {
-  test('Given 两个会话各有待插入引用 When 原子取走其中一个 Then 不串线且同一引用只消费一次', () => {
+  test('Given 两个会话各有待插入引用 When 成功后确认其中一个 Then 不串线且同一引用只确认一次', () => {
     const store = createStore()
     /** 会话 A 等待插入的项目素材引用。 */
     const sessionAMention = {
@@ -35,18 +35,26 @@ describe('Agent 会话待插入引用队列', () => {
     store.set(agentPendingMentionsAtomFamily('session-a'), [sessionAMention])
     store.set(agentPendingMentionsAtomFamily('session-b'), [sessionBMention])
 
-    /** 模拟 AgentView 在输入框挂载后执行的 composer 命令。 */
-    const insertedMentions: FilePanelDragItem[] = []
-    /** 记录该路径不会调用消息发送。 */
-    let sendCount = 0
-    insertedMentions.push(...store.set(agentTakePendingMentionsAtom, 'session-a'))
+    /** AgentView 本次尝试插入的稳定队列引用。 */
+    const pendingSessionA = store.get(agentPendingMentionsAtomFamily('session-a'))
 
-    expect(insertedMentions).toEqual([sessionAMention])
-    expect(sendCount).toBe(0)
-    expect(store.set(agentTakePendingMentionsAtom, 'session-a')).toEqual([])
+    expect(store.set(agentAckPendingMentionsAtom, { sessionId: 'session-a', items: pendingSessionA })).toBe(true)
+    expect(store.set(agentAckPendingMentionsAtom, { sessionId: 'session-a', items: pendingSessionA })).toBe(false)
     expect(store.get(agentSessionPendingMentionsAtom)).toEqual(new Map([
       ['session-b', [sessionBMention]],
     ]))
+  })
+
+  test('Given 插入使用的不是当前队列引用 When 请求确认 Then 保留队列', () => {
+    const store = createStore()
+    /** 当前会话真实等待插入的引用。 */
+    const pending: FilePanelDragItem[] = [{
+      path: '/project/a.png', name: 'a.png', isDirectory: false, scope: 'project',
+    }]
+    store.set(agentPendingMentionsAtomFamily('session-a'), pending)
+
+    expect(store.set(agentAckPendingMentionsAtom, { sessionId: 'session-a', items: [...pending] })).toBe(false)
+    expect(store.get(agentPendingMentionsAtomFamily('session-a'))).toBe(pending)
   })
 })
 

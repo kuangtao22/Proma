@@ -42,6 +42,7 @@ import { resolveMentionSuggestionChar } from './mention-utils'
 import { richTextRenderingEnabledAtom } from '@/atoms/ui-preferences'
 import { createFileMentionSuggestion } from '@/components/file-browser/file-mention-suggestion'
 import { getFilePanelDragData, type FilePanelDragItem } from '@/lib/file-panel-drag'
+import { insertFileMentionsWithFallback } from '@/lib/file-mention-insertion'
 import {
   createMcpMentionSuggestion,
   createPlanningMentionSuggestion,
@@ -182,7 +183,7 @@ export interface RichTextInputHandle {
   /** 返回最新 Markdown 草稿，并同步尚未提交的编辑。 */
   getMarkdown: () => string
   /** 在光标处插入文件引用（右侧文件面板拖入时调用） */
-  insertFileMentions: (items: FilePanelDragItem[]) => void
+  insertFileMentions: (items: FilePanelDragItem[]) => boolean
   /** 在光标处插入可定位的 Agent 历史引用 chip。 */
   insertAgentHistoryQuoteMention: (quote: QuotedSelection) => boolean
 }
@@ -1027,30 +1028,18 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
     return () => clearTimeout(timer)
   }, [editor, disabled, autoFocusTrigger])
 
-  // 对外暴露命令接口：右侧文件面板拖入时，在光标处插入 @file 引用 mention。
-  // mention 节点沿用 TipTap Mention 扩展的 attrs（id=路径，label=文件名），
-  // 发送时由 htmlToMarkdown 序列化为 @file:{path}，与键盘 @ 引用行为完全一致。
+  // 对外暴露命令接口：富文本模式插入 mention 节点并由 htmlToMarkdown 序列化；
+  // 默认纯文本或扩展缺失时直接插入同一 @file: 协议，保证引用始终可见、可发送。
   useImperativeHandle(ref, () => ({
     getMarkdown(): string {
       return flushPendingDraftSync(editor ?? undefined)
     },
-    insertFileMentions(items: FilePanelDragItem[]): void {
-      if (!editor || items.length === 0) return
-      let chain = editor.chain().focus()
-      for (const item of items) {
-        chain = chain
-          .insertContent({
-            type: 'mention',
-            attrs: {
-              id: item.path,
-              label: item.name,
-              mentionSuggestionChar: '@',
-              isDirectory: item.isDirectory ?? false,
-            },
-          })
-          .insertContent(' ')
-      }
-      chain.run()
+    insertFileMentions(items: FilePanelDragItem[]): boolean {
+      if (!editor) return false
+      return insertFileMentionsWithFallback(items, richTextEnabledRef.current, {
+        hasMentionNode: Boolean(editor.schema.nodes.mention),
+        insertContent: (content) => editor.chain().focus().insertContent(content).run(),
+      })
     },
     insertAgentHistoryQuoteMention(quote: QuotedSelection): boolean {
       if (!editor) return false

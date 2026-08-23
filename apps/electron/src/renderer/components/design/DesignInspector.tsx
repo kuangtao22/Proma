@@ -520,7 +520,7 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
         enqueueMention: (targetSessionId, items) => enqueuePendingMentions({ sessionId: targetSessionId, items }),
         setActiveView,
       })
-    )).then(() => toast.success('已添加到会话输入框')).catch((error: unknown) => {
+    )).catch((error: unknown) => {
       toast.error(error instanceof Error ? error.message : '发送素材到会话失败')
     })
   }, [enqueuePendingMentions, openSession, projectId, setActiveView, targetSessions])
