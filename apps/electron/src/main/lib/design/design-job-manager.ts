@@ -39,6 +39,8 @@ interface StoredDesignJob extends DesignJobRecord {
   terminalState?: { status: 'pending'; outputAssetId: string }
   /** retry 已创建的唯一替代任务，用于重复请求幂等返回。 */
   replacedByJobId?: string
+  /** replacement 创建完成前持久化的 retry intent。 */
+  retryState?: { status: 'pending' }
 }
 
 /** journal 允许出现的完整字段集合，未知字段一律拒绝。 */
@@ -46,7 +48,7 @@ const STORED_JOB_FIELDS = new Set([
   'id', 'projectId', 'sessionId', 'action', 'status', 'prompt', 'sourceSessionId',
   'sourceAssetId', 'parentAssetId', 'outputAssetId', 'error', 'createdAt', 'updatedAt',
   'nodeId', 'position', 'maskAnnotationId', 'placementState', 'terminalState',
-  'replacedByJobId',
+  'replacedByJobId', 'retryState',
 ])
 /** journal 中必须始终存在的基础字段。 */
 const REQUIRED_STORED_JOB_FIELDS = [
@@ -89,6 +91,8 @@ export interface DesignJobManagerDependencies {
   listProjectIds: () => string[]
   /** 在项目迁移互斥边界内执行完整设计任务写入。 */
   runWorkspaceWrite: <T>(projectId: string, effect: () => T) => T
+  /** 原子写入单个任务 journal；生产默认使用 safe-file，测试可注入 durability 故障。 */
+  writeJobJournal?: (path: string, value: object) => void
   createId?: () => string
   now?: () => number
 }
@@ -246,9 +250,9 @@ export class DesignJobManager {
   /** 为失败、取消或中断任务创建新 journal，并让原占位节点指向新任务。 */
   retry(projectId: string, jobId: string): DesignJobRecord {
     return this.dependencies.runWorkspaceWrite(projectId, () => {
-      const previous = this.requireProjectJob(projectId, jobId)
+      let previous = this.requireProjectJob(projectId, jobId)
       if (previous.replacedByJobId) {
-        return this.requireProjectJob(projectId, previous.replacedByJobId)
+        return this.completeRetryIntent(previous)
       }
       if (!['failed', 'cancelled', 'interrupted'].includes(previous.status)) {
         throw new Error('当前设计任务不可重试')
@@ -258,17 +262,35 @@ export class DesignJobManager {
         node.id === previous.nodeId && node.kind === 'job' && node.jobId === previous.id
       ))
       if (!ownsNode) throw new Error('设计任务节点已被其他任务接管')
-      const replacement = this.createInternal({
-        projectId,
-        action: previous.action,
-        prompt: previous.prompt,
-        ...(previous.sourceSessionId ? { sourceSessionId: previous.sourceSessionId } : {}),
-        ...(previous.sourceAssetId ? { sourceAssetId: previous.sourceAssetId } : {}),
-        ...(previous.maskAnnotationId ? { maskAnnotationId: previous.maskAnnotationId } : {}),
-        position: previous.position,
-      }, previous)
-      this.writeJob({ ...previous, replacedByJobId: replacement.id, updatedAt: this.now() })
-      return replacement
+      const replacementId = this.createId()
+      if (!isSafeDesignStableId(replacementId)) throw new Error('设计任务 ID 非法')
+      const intent: StoredDesignJob = {
+        ...previous,
+        replacedByJobId: replacementId,
+        retryState: { status: 'pending' },
+        updatedAt: this.now(),
+      }
+      try {
+        this.writeJob(intent)
+        previous = intent
+      } catch (error) {
+        /** rename 后 durability 报错时以磁盘内容确认 intent 是否已经提交。 */
+        const durableIntent = this.readJobJournal(projectId, previous.id)
+        if (durableIntent?.replacedByJobId !== replacementId
+          || durableIntent.retryState?.status !== 'pending') throw error
+        previous = durableIntent
+      }
+      return this.completeRetryIntent(previous)
+    })
+  }
+
+  /** 在权威画布恢复后，仅二次对账 terminal pending，不中断其它活动任务。 */
+  reconcilePendingTerminals(projectId: string): DesignJobRecord[] {
+    return this.dependencies.runWorkspaceWrite(projectId, () => {
+      for (const job of this.readProjectJobs(projectId)) {
+        if (job.terminalState?.status === 'pending') this.reconcileTerminalJob(job)
+      }
+      return this.list(projectId)
     })
   }
 
@@ -290,24 +312,14 @@ export class DesignJobManager {
         this.writeJob(job)
       }
       if (job.terminalState?.status === 'pending') {
+        this.reconcileTerminalJob(job)
+        continue
+      }
+      if (job.retryState?.status === 'pending') {
         try {
-          const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
-          const outputAssetId = job.terminalState.outputAssetId
-          if (this.isTerminalCommitPresent(document, job, outputAssetId)) {
-            this.updateStatus(job, 'succeeded', {
-              terminalState: undefined,
-              outputAssetId,
-              parentAssetId: job.sourceAssetId,
-              error: undefined,
-            }, document.revision)
-          } else {
-            this.updateStatus(job, 'failed', {
-              terminalState: undefined,
-              error: '设计任务终态提交未完成',
-            }, document.revision)
-          }
+          this.dependencies.runWorkspaceWrite(projectId, () => this.completeRetryIntent(job))
         } catch {
-          /** 权威 Store 暂不可读时保留 pending，等待下次恢复继续对账。 */
+          /** retry intent 保留到下次显式重试或恢复继续完成。 */
         }
         continue
       }
@@ -335,7 +347,11 @@ export class DesignJobManager {
   }
 
   /** 创建新任务；retry 时复用原节点位置和 ID。 */
-  private createInternal(input: CreateDesignJobInput, replaced?: StoredDesignJob): StoredDesignJob {
+  private createInternal(
+    input: CreateDesignJobInput,
+    replaced?: StoredDesignJob,
+    reservedId?: string,
+  ): StoredDesignJob {
     const prompt = input.prompt.trim()
     if (!prompt) throw new Error('设计任务提示词不能为空')
     if (input.action === 'edit' && !input.sourceAssetId) throw new Error('编辑任务缺少来源素材')
@@ -347,7 +363,7 @@ export class DesignJobManager {
     if (input.maskAnnotationId && !current.annotations.some((item) => (
       item.id === input.maskAnnotationId && item.kind === 'mask'
     ))) throw new Error(`蒙版批注不存在: ${input.maskAnnotationId}`)
-    const id = this.createId()
+    const id = reservedId ?? this.createId()
     if (!isSafeDesignStableId(id)) throw new Error('设计任务 ID 非法')
     const now = this.now()
     const job: StoredDesignJob = {
@@ -547,6 +563,88 @@ export class DesignJobManager {
     return assetExists && nodeExists
   }
 
+  /** 按 Store 当前事实完成一次 terminal pending 对账。 */
+  private reconcileTerminalJob(job: StoredDesignJob): void {
+    try {
+      const document = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
+      const outputAssetId = job.terminalState?.outputAssetId
+      if (!outputAssetId) return
+      if (this.isTerminalCommitPresent(document, job, outputAssetId)) {
+        this.updateStatus(job, 'succeeded', {
+          terminalState: undefined,
+          outputAssetId,
+          parentAssetId: job.sourceAssetId,
+          error: undefined,
+        }, document.revision)
+      } else {
+        this.updateStatus(job, 'failed', {
+          terminalState: undefined,
+          error: '设计任务终态提交未完成',
+        }, document.revision)
+      }
+    } catch {
+      /** 权威 Store 暂不可读时保留 pending，等待显式加载或下次恢复继续对账。 */
+    }
+  }
+
+  /** 按已持久化 replacement ID 幂等创建或返回替代任务。 */
+  private completeRetryIntent(previous: StoredDesignJob): StoredDesignJob {
+    const replacementId = previous.replacedByJobId
+    if (!replacementId || previous.retryState?.status !== 'pending') {
+      if (replacementId) return this.requireProjectJob(previous.projectId, replacementId)
+      throw new Error('设计任务重试 intent 无效')
+    }
+    const existing = this.findStoredJob(replacementId)
+    if (existing) {
+      if (existing.projectId !== previous.projectId) throw new Error('替代设计任务不属于当前项目')
+      const current = this.dependencies.store.requireStableAuthoritativeDocument(previous.projectId)
+      const replacementOwnsNode = current.nodes.some((node) => (
+        node.id === previous.nodeId && node.kind === 'job' && node.jobId === replacementId
+      ))
+      if (replacementOwnsNode) {
+        const ready = existing.placementState === 'ready'
+          ? existing
+          : { ...existing, placementState: 'ready' as const, updatedAt: this.now() }
+        if (ready !== existing) this.writeJob(ready)
+        this.finalizeRetryIntent(previous)
+        return ready
+      }
+      const previousOwnsNode = current.nodes.some((node) => (
+        node.id === previous.nodeId && node.kind === 'job' && node.jobId === previous.id
+      ))
+      if (!previousOwnsNode || existing.placementState !== 'pending') {
+        throw new Error('设计任务节点已被其他任务接管')
+      }
+      /** replacement journal 已提交但 Store 尚未接管，删除孤立 pending 后用同一 ID 续建。 */
+      this.deleteJobJournal(existing)
+    }
+    const current = this.dependencies.store.requireStableAuthoritativeDocument(previous.projectId)
+    const ownsNode = current.nodes.some((node) => (
+      node.id === previous.nodeId && node.kind === 'job' && node.jobId === previous.id
+    ))
+    if (!ownsNode) throw new Error('设计任务节点已被其他任务接管')
+    const replacement = this.createInternal({
+      projectId: previous.projectId,
+      action: previous.action,
+      prompt: previous.prompt,
+      ...(previous.sourceSessionId ? { sourceSessionId: previous.sourceSessionId } : {}),
+      ...(previous.sourceAssetId ? { sourceAssetId: previous.sourceAssetId } : {}),
+      ...(previous.maskAnnotationId ? { maskAnnotationId: previous.maskAnnotationId } : {}),
+      position: previous.position,
+    }, previous, replacementId)
+    this.finalizeRetryIntent(previous)
+    return replacement
+  }
+
+  /** 尝试清除已完成 retry intent；失败时 pending intent 仍可幂等返回 replacement。 */
+  private finalizeRetryIntent(previous: StoredDesignJob): void {
+    try {
+      this.writeJob({ ...previous, retryState: undefined, updatedAt: this.now() })
+    } catch {
+      /** replacement 与 pending intent 已持久化，清理失败不反报任务创建失败。 */
+    }
+  }
+
   /** 写入新状态并通知订阅者。 */
   private updateStatus(
     job: StoredDesignJob,
@@ -575,7 +673,9 @@ export class DesignJobManager {
     const path = this.resolveJobJournalPath(job.projectId, job.id)
     const directoryPath = this.dependencies.pathResolver.resolve(job.projectId).jobsDir
     mkdirSync(directoryPath, { recursive: true })
-    writeJsonFileAtomic(path, job, true)
+    const writeJournal = this.dependencies.writeJobJournal
+      ?? ((journalPath: string, value: object): void => { writeJsonFileAtomic(journalPath, value, true) })
+    writeJournal(path, job)
     this.jobs.set(job.id, job)
   }
 
@@ -596,17 +696,23 @@ export class DesignJobManager {
       /** 文件 basename 是 journal ID 的第一份所有权事实。 */
       const fileJobId = name.slice(0, -'.json'.length)
       if (!isSafeDesignStableId(fileJobId)) continue
-      try {
-        const path = this.resolveJobJournalPath(projectId, fileJobId)
-        const value: unknown = JSON.parse(readFileSync(path, 'utf8'))
-        if (!isStoredDesignJob(value) || value.projectId !== projectId || value.id !== fileJobId) continue
-        this.jobs.set(value.id, value)
-        jobs.push(value)
-      } catch {
-        // 单个损坏 journal 不阻断其它任务恢复。
-      }
+      const value = this.readJobJournal(projectId, fileJobId)
+      if (value) jobs.push(value)
     }
     return jobs
+  }
+
+  /** 从确定路径严格读取单个 journal，并同步内存索引。 */
+  private readJobJournal(projectId: string, jobId: string): StoredDesignJob | undefined {
+    try {
+      const path = this.resolveJobJournalPath(projectId, jobId)
+      const value: unknown = JSON.parse(readFileSync(path, 'utf8'))
+      if (!isStoredDesignJob(value) || value.projectId !== projectId || value.id !== jobId) return undefined
+      this.jobs.set(value.id, value)
+      return value
+    } catch {
+      return undefined
+    }
   }
 
   /** 从内存或已登记项目磁盘中查找任务。 */
@@ -698,6 +804,12 @@ function isStoredDesignJob(value: unknown): value is StoredDesignJob {
       || Object.keys(value.terminalState).length !== 2
       || value.terminalState.status !== 'pending'
       || !isSafeDesignStableId(value.terminalState.outputAssetId)) return false
+  }
+  if (value.retryState !== undefined) {
+    if (!isRecord(value.retryState)
+      || Object.keys(value.retryState).length !== 1
+      || value.retryState.status !== 'pending'
+      || !isSafeDesignStableId(value.replacedByJobId)) return false
   }
   if (value.action === 'edit' && !isSafeDesignStableId(value.sourceAssetId)) return false
   if (value.status === 'succeeded' && !isSafeDesignStableId(value.outputAssetId)) return false

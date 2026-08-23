@@ -160,6 +160,7 @@ function createFixture(): {
       cancel: async () => createJobRecord('job-default'),
       retry: () => createJobRecord('job-retry'),
       list: () => [],
+      reconcilePendingTerminals: () => [],
       onChanged: () => () => undefined,
     },
     pickImageFiles: async () => ['/trusted/a.png'],
@@ -620,6 +621,25 @@ describe('Design IPC', () => {
     ) as DesignWorkspaceSnapshot
 
     expect(snapshot.document.revision).toBe(1)
+  })
+
+  test('Given terminal pending 首次恢复未完成 When Renderer 显式加载权威画布 Then 同进程触发任务二次对账', async () => {
+    const fixture = createFixture()
+    const reconciledProjects: string[] = []
+    fixture.options.jobs.reconcilePendingTerminals = (projectId) => {
+      reconciledProjects.push(projectId)
+      return []
+    }
+    registerDesignIpcHandlers(fixture.options)
+
+    await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.LOAD,
+      fixture.senders[0]!,
+      { projectId: 'project-1' },
+    )
+
+    expect(reconciledProjects).toEqual(['project-1'])
   })
 
   test('Given 素材已 promotion 但元数据提交失败 When 导入结束 Then 精确回滚本批次', async () => {

@@ -72,7 +72,7 @@ export interface DesignIpcAssetService extends Pick<
 /** IPC 层实际使用的任务服务窄接口。 */
 export interface DesignIpcJobManager extends Pick<
   DesignJobManager,
-  'create' | 'run' | 'cancel' | 'retry' | 'list' | 'onChanged'
+  'create' | 'run' | 'cancel' | 'retry' | 'list' | 'reconcilePendingTerminals' | 'onChanged'
 > {}
 
 /** 注册 Design IPC 所需的可信主进程依赖。 */
@@ -512,6 +512,8 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
       }
     }
     const snapshot = options.store.load(input.projectId)
+    /** Store 已完成 tmp/backup 恢复后，同进程立即重试 terminal pending 对账。 */
+    options.jobs.reconcilePendingTerminals(input.projectId)
     lastReadableSnapshots.set(input.projectId, snapshot)
     if (!snapshot.writable) return snapshot
     const access = options.assets.createMediaAccess(input.projectId)

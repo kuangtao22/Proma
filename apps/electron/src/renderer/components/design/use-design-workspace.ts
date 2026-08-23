@@ -383,10 +383,17 @@ export function createDesignWorkspaceController(
           jobError: `同步设计任务结构失败：${getDesignErrorMessage(snapshotResult.reason)}`,
         }
       }
-      if (!snapshot
-        || structureLoadSequence !== latestLoadSequence
-        || authoritativeRevision === undefined
-        || snapshot.document.revision < authoritativeRevision) return update
+      if (!snapshot || structureLoadSequence !== latestLoadSequence) return update
+      if (snapshot && authoritativeRevision !== undefined
+        && snapshot.document.revision < authoritativeRevision) {
+        pendingJobStructureRevision = authoritativeRevision
+        return {
+          ...update,
+          jobLoadState: 'failed',
+          jobError: `同步设计任务结构失败：权威画布尚未达到任务事件 revision ${authoritativeRevision}`,
+        }
+      }
+      if (authoritativeRevision === undefined) return update
       pendingJobStructureRevision = undefined
       /** 权威任务节点作为新基线，本地尚未保存的 mutation 必须完整重放。 */
       const rebasedDocument = mergeSavedDesignDocument(snapshot.document, latest.pendingMutations)

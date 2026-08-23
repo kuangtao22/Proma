@@ -327,6 +327,41 @@ describe('Design 工作区同步规则', () => {
     expect(harness.loadRequests).toHaveLength(3)
   })
 
+  test('Given 任务结构快照低于事件 revision When 用户重试 Then 保持失败直到达到目标 revision', async () => {
+    const snapshot: DesignWorkspaceSnapshot = {
+      document: createEmptyDesignDocument('project-1', 10), writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(), phase: 'ready', snapshot,
+    })
+    harness.controller.start()
+
+    harness.emitChange({ projectId: 'project-1', revision: 2, cause: 'job' })
+    harness.jobRequests[1]!.resolve([])
+    harness.loadRequests[1]!.resolve({
+      document: { ...createEmptyDesignDocument('project-1', 20), revision: 1 },
+      writable: true,
+    })
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      snapshot,
+      jobLoadState: 'failed',
+      jobError: '同步设计任务结构失败：权威画布尚未达到任务事件 revision 2',
+    })
+
+    harness.controller.retryLoad()
+    harness.jobRequests[2]!.resolve([])
+    harness.loadRequests[2]!.resolve({
+      document: { ...createEmptyDesignDocument('project-1', 30), revision: 2 },
+      writable: true,
+    })
+    await flushPromises()
+
+    expect(harness.getState().jobLoadState).toBe('idle')
+    expect(harness.getState().snapshot?.document.revision).toBe(2)
+  })
+
   test('Given 画布有未保存编辑 When 同 revision job 事件到达 Then 只刷新任务且不替换画布快照', async () => {
     const snapshot: DesignWorkspaceSnapshot = {
       document: createEmptyDesignDocument('project-1', 10),

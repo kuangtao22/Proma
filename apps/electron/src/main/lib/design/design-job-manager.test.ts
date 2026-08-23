@@ -266,6 +266,35 @@ describe('Design Job Manager', () => {
     expect(recovered[0]).toMatchObject({ status: 'failed', error: '设计任务终态提交未完成' })
   })
 
+  test('Given pending terminal 首次对账要求恢复 When 同进程权威加载完成 Then 可二次对账为 succeeded', () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    document.assets.push(createAsset('asset-pending', {
+      kind: 'job', sourceJobId: 'job-pending', sourceSessionId: 'session-pending', prompt: '恢复任务',
+    }))
+    document.nodes = [{
+      id: 'node-pending', kind: 'asset', assetId: 'asset-pending', position: { x: 0, y: 0 },
+      width: 320, height: 240, zIndex: 0,
+    }]
+    writeFileSync(join(jobsDirectory, 'job-pending.json'), JSON.stringify({
+      id: 'job-pending', projectId: 'project-1', action: 'generate', status: 'running',
+      prompt: '恢复任务', nodeId: 'node-pending', position: { x: 0, y: 0 },
+      placementState: 'ready', terminalState: { status: 'pending', outputAssetId: 'asset-pending' },
+      sessionId: 'session-pending', createdAt: 1, updatedAt: 1,
+    }))
+    harness.outputReloadError = new Error('DESIGN_RECOVERY_REQUIRED: backup 已恢复')
+    harness.forceOutputReloadError = true
+
+    expect(harness.manager.recover('project-1')[0]).toMatchObject({
+      status: 'running', terminalState: { status: 'pending' },
+    })
+
+    harness.forceOutputReloadError = false
+    expect(harness.manager.reconcilePendingTerminals('project-1')[0]).toMatchObject({
+      status: 'succeeded', outputAssetId: 'asset-pending',
+    })
+  })
+
   test('Given 失败任务 When 重试 Then 保留旧 journal 并用新任务和新会话接管原节点', async () => {
     harness.messages = []
     const original = harness.manager.create(createGenerateInput())
@@ -302,6 +331,57 @@ describe('Design Job Manager', () => {
     expect(JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${original.id}.json`), 'utf8'))).toMatchObject({
       replacedByJobId: first.id,
     })
+  })
+
+  test('Given retry intent 已落盘但 durability 报错 When 重试 Then 复核 intent 并只启动唯一 replacement', async () => {
+    harness.messages = []
+    const original = harness.manager.create(createGenerateInput())
+    await harness.manager.run(original.id)
+    harness.throwAfterRetryIntentWrite = true
+
+    const replacement = harness.manager.retry('project-1', original.id)
+    const duplicate = harness.manager.retry('project-1', original.id)
+    await Promise.all([harness.manager.run(replacement.id), harness.manager.run(duplicate.id)])
+
+    expect(duplicate.id).toBe(replacement.id)
+    expect(harness.createdSessions).toHaveLength(2)
+    expect(harness.manager.list('project-1')).toHaveLength(2)
+    expect(harness.retryIntentWrites).toBe(1)
+  })
+
+  test('Given replacement 已创建但旧 journal 最终写失败 When 重试 Then 返回同一任务且仍只启动一次', async () => {
+    harness.messages = []
+    const original = harness.manager.create(createGenerateInput())
+    await harness.manager.run(original.id)
+    harness.throwOnRetryFinalizeWrite = true
+
+    const replacement = harness.manager.retry('project-1', original.id)
+    const duplicate = harness.manager.retry('project-1', original.id)
+    await Promise.all([harness.manager.run(replacement.id), harness.manager.run(duplicate.id)])
+
+    expect(duplicate.id).toBe(replacement.id)
+    expect(harness.createdSessions).toHaveLength(2)
+    expect(JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${original.id}.json`), 'utf8'))).toMatchObject({
+      replacedByJobId: replacement.id,
+      retryState: { status: 'pending' },
+    })
+  })
+
+  test('Given replacement pending journal 已写但 Store 尚未接管时崩溃 When 恢复 Then 续建同一 replacement', async () => {
+    harness.messages = []
+    const original = harness.manager.create(createGenerateInput())
+    await harness.manager.run(original.id)
+    harness.throwAfterReplacementJournalWrite = true
+
+    expect(() => harness.manager.retry('project-1', original.id)).toThrow('replacement journal committed before crash')
+    expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: original.id })
+
+    harness.throwAfterReplacementJournalWrite = false
+    const replacement = harness.manager.retry('project-1', original.id)
+
+    expect(replacement).toMatchObject({ id: 'job-2', status: 'queued' })
+    expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: 'job-2' })
+    expect(harness.manager.retry('project-1', original.id).id).toBe('job-2')
   })
 
   test('Given Store 节点已不再绑定旧任务 When 重试 Then 拒绝创建新 journal 或会话', async () => {
@@ -404,6 +484,10 @@ describe('Design Job Manager', () => {
       outputMutationAttempted: boolean
       attemptRelocationDuringImport: boolean
       relocationAttemptError?: string
+      forceOutputReloadError: boolean
+      throwAfterRetryIntentWrite: boolean
+      throwOnRetryFinalizeWrite: boolean
+      throwAfterReplacementJournalWrite: boolean
     } = {
       settings: { agentChannelId: 'channel-default', agentModelId: 'model-default' },
       messages: [] as AgentMessage[],
@@ -412,6 +496,10 @@ describe('Design Job Manager', () => {
       outputPhase: false,
       outputMutationAttempted: false,
       attemptRelocationDuringImport: false,
+      forceOutputReloadError: false,
+      throwAfterRetryIntentWrite: false,
+      throwOnRetryFinalizeWrite: false,
+      throwAfterReplacementJournalWrite: false,
     }
     const createdSessions: AgentSessionMeta[] = []
     const sessionUpdates: Array<{ sessionId: string; updates: Record<string, unknown> }> = []
@@ -425,6 +513,7 @@ describe('Design Job Manager', () => {
     const unguardedOutputEffects: string[] = []
     let batchCommits = 0
     let batchRollbacks = 0
+    let retryIntentWrites = 0
     /** 记录 output 阶段副作用并验证 Manager 外层 lease。 */
     const recordOutputEffect = (effect: string): void => {
       outputEffects.push(effect)
@@ -434,7 +523,9 @@ describe('Design Job Manager', () => {
       load: () => ({ document, writable: true }),
       requireStableAuthoritativeDocument: () => {
         if (state.outputPhase) recordOutputEffect('authoritative-read')
-        if (state.outputMutationAttempted && state.outputReloadError) throw state.outputReloadError
+        if ((state.outputMutationAttempted || state.forceOutputReloadError) && state.outputReloadError) {
+          throw state.outputReloadError
+        }
         return document
       },
       mutate: (_projectId, _expectedRevision, mutations) => {
@@ -531,6 +622,25 @@ describe('Design Job Manager', () => {
           throw error
         }
       },
+      writeJobJournal: (path, value) => {
+        const job = value as { id?: string; replacedByJobId?: string; retryState?: { status?: string } }
+        if (job.id === 'job-1' && job.replacedByJobId && job.retryState === undefined
+          && state.throwOnRetryFinalizeWrite) {
+          throw new Error('retry finalize directory fsync failed')
+        }
+        writeFileSync(path, JSON.stringify(value), 'utf8')
+        if (job.id === 'job-2' && !job.replacedByJobId && job.retryState === undefined
+          && state.throwAfterReplacementJournalWrite) {
+          throw new Error('replacement journal committed before crash')
+        }
+        if (job.id === 'job-1' && job.replacedByJobId && job.retryState?.status === 'pending'
+          && state.throwAfterRetryIntentWrite) {
+          retryIntentWrites += 1
+          state.throwAfterRetryIntentWrite = false
+          throw new Error('retry intent directory fsync failed')
+        }
+        if (job.id === 'job-1' && job.replacedByJobId && job.retryState?.status === 'pending') retryIntentWrites += 1
+      },
       createId: () => {
         identity += 1
         return state.createId()
@@ -552,6 +662,7 @@ describe('Design Job Manager', () => {
       unguardedOutputEffects,
       get batchCommits() { return batchCommits },
       get batchRollbacks() { return batchRollbacks },
+      get retryIntentWrites() { return retryIntentWrites },
       get relocationAttemptError() { return state.relocationAttemptError },
       get settings() { return state.settings },
       set settings(value: typeof state.settings) { state.settings = value },
@@ -567,6 +678,10 @@ describe('Design Job Manager', () => {
       set outputMutateAfterApplyError(value: Error | undefined) { state.outputMutateAfterApplyError = value },
       set outputReloadError(value: Error | undefined) { state.outputReloadError = value },
       set attemptRelocationDuringImport(value: boolean) { state.attemptRelocationDuringImport = value },
+      set forceOutputReloadError(value: boolean) { state.forceOutputReloadError = value },
+      set throwAfterRetryIntentWrite(value: boolean) { state.throwAfterRetryIntentWrite = value },
+      set throwOnRetryFinalizeWrite(value: boolean) { state.throwOnRetryFinalizeWrite = value },
+      set throwAfterReplacementJournalWrite(value: boolean) { state.throwAfterReplacementJournalWrite = value },
     }
   }
 })
