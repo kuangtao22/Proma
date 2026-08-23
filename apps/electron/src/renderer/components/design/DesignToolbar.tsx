@@ -66,7 +66,11 @@ function ToolbarIconButton({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className="inline-flex">
+        <span
+          className="inline-flex"
+          tabIndex={disabled ? 0 : undefined}
+          aria-description={disabled ? `${label}不可用` : undefined}
+        >
           <Button
             type="button"
             variant="ghost"

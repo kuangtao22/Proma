@@ -183,6 +183,8 @@ export function toFlowNodes(
       selectable: true,
       draggable: true,
       connectable: false,
+      /** 节点尺寸已持久化且不支持连线，显式空 handles 允许 XYFlow 首帧裁剪不可见节点。 */
+      handles: [],
       deletable: false,
       data,
     }

@@ -62,6 +62,23 @@ describe('Design 无障碍、窄窗口与主题合同', () => {
     expect(html).toContain('flex-wrap')
   })
 
+  test('Given 工具栏命令不可用 When 键盘导航 Then Tooltip 包装元素可聚焦且按钮保持原生禁用', () => {
+    const html = renderToStaticMarkup(
+      <DesignToolbar
+        activeTool="select"
+        writable
+        canUndo={false}
+        canRedo={false}
+        onToolChange={() => undefined}
+        onUndo={() => undefined}
+      />,
+    )
+
+    expect(html).toMatch(
+      /<span(?=[^>]*tabindex="0")(?=[^>]*aria-description="撤销不可用")[^>]*><button(?=[^>]*aria-label="撤销")(?=[^>]*disabled)[^>]*>/,
+    )
+  })
+
   test('Given 检查器 When 渲染 Then tabs 与导入按钮具有稳定 accessible name 且不嵌套 card', () => {
     const html = renderInspector()
 

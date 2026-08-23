@@ -48,6 +48,7 @@ describe('Design 大画布性能预算', () => {
     const serialized = JSON.stringify(nodes)
 
     expect(nodes).toHaveLength(1_000)
+    expect(nodes.every((node) => node.handles?.length === 0)).toBe(true)
     expect(nodes.every((node) => node.data.previewUrl?.startsWith('proma-file://thumbnail-token/preview-'))).toBe(true)
     expect(serialized).not.toContain('data:image')
     expect(serialized).not.toContain('assets/original-')

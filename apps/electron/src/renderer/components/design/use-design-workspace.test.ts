@@ -640,6 +640,115 @@ describe('Design 工作区同步规则', () => {
     })
   })
 
+  test('Given recovery LOAD 在途 When 连续收到更高 job revision Then 先完成权威恢复再按最高 revision 刷新一次任务', async () => {
+    /** recovery 前仍指向旧磁盘序列的 revision 5 缓存。 */
+    const cachedSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 10), revision: 5 },
+      writable: true,
+    }
+    /** 可精确控制 recovery 与 job LOAD 返回顺序的 controller 环境。 */
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: cachedSnapshot,
+    })
+    harness.controller.start()
+
+    harness.emitChange({ projectId: 'project-1', revision: 4, cause: 'recovery' })
+    harness.emitChange({ projectId: 'project-1', revision: 6, cause: 'job' })
+    harness.emitChange({ projectId: 'project-1', revision: 7, cause: 'job' })
+
+    expect(harness.loadRequests).toHaveLength(2)
+    expect(harness.jobRequests).toHaveLength(1)
+
+    /** 必须先接管的低 revision 4 恢复快照。 */
+    const recoveredSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 20), revision: 4 },
+      writable: true,
+    }
+    harness.loadRequests[1]!.resolve(recoveredSnapshot)
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      snapshot: recoveredSnapshot,
+      authoritativeRecoveryState: 'idle',
+      saveState: 'saved',
+    })
+    expect(harness.loadRequests).toHaveLength(3)
+    expect(harness.jobRequests).toHaveLength(2)
+
+    /** recovery 后唯一一次任务对账返回的最新 journal。 */
+    const refreshedJob: DesignJobRecord = {
+      id: 'job-refreshed', projectId: 'project-1', action: 'generate', status: 'succeeded',
+      prompt: '恢复后任务', createdAt: 1, updatedAt: 7,
+    }
+    /** 最高 job revision 7 对应的权威任务结构。 */
+    const jobSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 30), revision: 7 },
+      writable: true,
+    }
+    harness.jobRequests[1]!.resolve([refreshedJob])
+    harness.loadRequests[2]!.resolve(jobSnapshot)
+    await flushPromises()
+
+    expect(harness.getState().jobs).toEqual([refreshedJob])
+    expect(harness.getState().snapshot?.document.revision).toBe(7)
+    expect(harness.getState().authoritativeRecoveryState).toBe('idle')
+    expect(harness.loadRequests).toHaveLength(3)
+    expect(harness.jobRequests).toHaveLength(2)
+  })
+
+  test('Given recovery LOAD 失败且期间收到 job 事件 When 用户重试 Then 可重新恢复并只对账一次最高 job revision', async () => {
+    /** recovery 前仍指向旧磁盘序列的 revision 5 缓存。 */
+    const cachedSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 10), revision: 5 },
+      writable: true,
+    }
+    /** 可精确控制失败、重试与 job 对账顺序的 controller 环境。 */
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: cachedSnapshot,
+    })
+    harness.controller.start()
+
+    harness.emitChange({ projectId: 'project-1', revision: 4, cause: 'recovery' })
+    harness.emitChange({ projectId: 'project-1', revision: 6, cause: 'job' })
+    harness.emitChange({ projectId: 'project-1', revision: 8, cause: 'job' })
+    expect(harness.loadRequests).toHaveLength(2)
+    expect(harness.jobRequests).toHaveLength(1)
+
+    harness.loadRequests[1]!.reject(new Error('恢复磁盘暂时不可读'))
+    await flushPromises()
+    expect(harness.getState().authoritativeRecoveryState).toBe('failed')
+
+    harness.controller.retryLoad()
+    expect(harness.loadRequests).toHaveLength(3)
+    /** 用户重试成功接管的低 revision 4 恢复快照。 */
+    const recoveredSnapshot: DesignWorkspaceSnapshot = {
+      document: { ...createEmptyDesignDocument('project-1', 20), revision: 4 },
+      writable: true,
+    }
+    harness.loadRequests[2]!.resolve(recoveredSnapshot)
+    await flushPromises()
+
+    expect(harness.getState().authoritativeRecoveryState).toBe('idle')
+    expect(harness.loadRequests).toHaveLength(4)
+    expect(harness.jobRequests).toHaveLength(2)
+
+    harness.jobRequests[1]!.resolve([])
+    harness.loadRequests[3]!.resolve({
+      document: { ...createEmptyDesignDocument('project-1', 30), revision: 8 },
+      writable: true,
+    })
+    await flushPromises()
+
+    expect(harness.getState().snapshot?.document.revision).toBe(8)
+    expect(harness.getState().authoritativeRecoveryState).toBe('idle')
+    expect(harness.loadRequests).toHaveLength(4)
+    expect(harness.jobRequests).toHaveLength(2)
+  })
+
   test('Given remount 缓存 revision 5 When LOAD 恢复 backup revision 4 Then 无条件采用恢复基线', async () => {
     const cachedSnapshot: DesignWorkspaceSnapshot = {
       document: { ...createEmptyDesignDocument('project-1', 10), revision: 5 },

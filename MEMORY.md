@@ -55,6 +55,8 @@
 - Design 的 `cause: recovery` 表示原 revision 序列已失去磁盘依据，Renderer 必须立即阻断旧基线写入并强制 LOAD，且无条件接管可能更低的恢复 revision；位置类 pending 可在恢复基线上重放但保持手动重试阻断，结构 pending 只能保留为显式远端冲突，历史、选区和 Inspector 状态全部清理。普通 canvas/asset/job 事件继续遵守 revision 单调规则。
 - Design Renderer 在 400ms 自动保存边界压缩 viewport mutation，只保留最后一个 `set-viewport` 且保持其它 mutation 顺序；macOS 沙箱内执行 Electron 完整构建时，将 `CLANG_MODULE_CACHE_PATH` 与 `SWIFT_MODULE_CACHE_PATH` 指向 `/private/tmp` 可避免原生 helper 写入用户缓存失败。
 - Design Renderer 的 recovery/dispose 会递增独立 SAVE 基线代次并主动把在途 batch 归还 pending；旧代次 SAVE 的 success/failure 回调必须完全无副作用，禁止覆盖恢复后的低 revision 或重复归还 mutation。
+- Design Renderer 的权威 recovery LOAD 使用独立于普通/job LOAD 的请求代次；普通/job 刷新不得取消恢复。恢复期间收到的 job revision 只合并最高目标，恢复成功后单次对账；恢复失败时保留目标，待用户 retry 成功后再对账。
+- Design 大画布节点已有持久化尺寸且禁止连线时，必须向 XYFlow 显式提供 `handles: []`，否则未测量 handle 会迫使所有节点首帧挂载。浏览器 QA 基线使用 1000 节点在 1200px 验证可见 DOM 显著低于总量及拖动、平移、缩放，在 620px 验证 Inspector/Toolbar/禁用 Tooltip 与 light/dark 主题。
 
 ## 会话记录
 
@@ -111,3 +113,4 @@
 - 2026-08-23：Nano Banana 新图片附件只允许由本地主进程 `saveAttachment` 结果经 Pi `tool_use_result` 结构化详情传递，并以来源标识和 `toolUseId` 双重匹配提升；Gemini/工具普通文本中的附件标记永不构成新授权事实，旧 JSONL 已有的结构化 `imageAttachments` 与 legacy 事件继续只读兼容。
 - 2026-08-23：完成设计工作区恢复、staging 清理、viewport 保存压缩、窄窗口与无障碍收口，并通过 Design/关联回归、全仓类型检查、Electron 完整构建及开发启动冒烟。
 - 2026-08-23：修复 Renderer 忽略低 revision backup 恢复的问题；recovery 事件与 recoveredFrom LOAD 统一失效旧缓存基线，并按位置/结构 mutation 安全边界处理未保存编辑。
+- 2026-08-23：质量复核确认 recovery 不再被 job 结构刷新取消；真实 Chrome 下 1000 节点首帧仅挂载 16 个可见节点，并完成宽窄窗口交互、无障碍与明暗主题验证。

@@ -398,6 +398,8 @@ export function createDesignWorkspaceController(
 ): DesignWorkspaceController {
   /** 最后发起的 load 序号，用于丢弃乱序返回。 */
   let latestLoadSequence = 0
+  /** 最后发起的权威恢复序号，不允许普通或 job LOAD 取消。 */
+  let latestAuthoritativeRecoverySequence = 0
   /** 最后发起的任务列表请求序号，用于丢弃乱序返回。 */
   let latestJobLoadSequence = 0
   /** 当前远端变化订阅的释放函数。 */
@@ -416,6 +418,24 @@ export function createDesignWorkspaceController(
   let authoritativeRecoveryInFlight = false
   /** 普通任务结构同步失败后保留的目标 revision，供用户精确重试。 */
   let pendingJobStructureRevision: number | undefined
+  /** 权威恢复结束后是否需要执行一次任务对账。 */
+  let deferredJobRefreshRequested = false
+  /** recovery 期间收到的最高任务结构 revision。 */
+  let deferredJobStructureRevision: number | undefined
+
+  /**
+   * 合并 recovery 期间的任务刷新请求，不在旧磁盘基线上发起 LOAD。
+   * @param authoritativeRevision 可选的 Store 权威任务 revision。
+   * @returns 无返回值。
+   */
+  const deferJobRefresh = (authoritativeRevision?: number): void => {
+    deferredJobRefreshRequested = true
+    if (authoritativeRevision === undefined) return
+    deferredJobStructureRevision = Math.max(
+      deferredJobStructureRevision ?? authoritativeRevision,
+      authoritativeRevision,
+    )
+  }
 
   /**
    * 刷新任务 journal；事件 revision 前进时同步接管任务产生的权威画布结构。
@@ -424,6 +444,12 @@ export function createDesignWorkspaceController(
    */
   const refreshJobs = async (authoritativeRevision?: number): Promise<void> => {
     if (disposed) return
+    /** recovery 必须先确定磁盘基线，任务事件只保留最高 revision。 */
+    const currentState = dependencies.getState()
+    if (authoritativeRecoveryInFlight || currentState.authoritativeRecoveryState !== 'idle') {
+      deferJobRefresh(authoritativeRevision)
+      return
+    }
     dependencies.updateState({ jobLoadState: 'loading', jobError: null })
     /** 任务刷新仅保留最后一次请求结果。 */
     const requestSequence = latestJobLoadSequence + 1
@@ -497,6 +523,16 @@ export function createDesignWorkspaceController(
     if (snapshot) scheduleSave()
   }
 
+  /** recovery 成功后消费一次合并后的任务刷新请求。 */
+  const flushDeferredJobRefresh = (): void => {
+    if (disposed || !deferredJobRefreshRequested) return
+    /** 本次对账只消费 recovery 期间观测到的最高结构 revision。 */
+    const authoritativeRevision = deferredJobStructureRevision
+    deferredJobRefreshRequested = false
+    deferredJobStructureRevision = undefined
+    void refreshJobs(authoritativeRevision)
+  }
+
   /**
    * 加载并按返回时最新状态决定是否提交快照。
    * @param rebasePendingAfterConflict 是否以远端 document 重放冲突后全部 pending。
@@ -512,9 +548,21 @@ export function createDesignWorkspaceController(
     if (forceAuthoritative && authoritativeRecoveryInFlight) return
     if (rebasePendingAfterConflict) conflictRecoveryInFlight = true
     if (forceAuthoritative) authoritativeRecoveryInFlight = true
-    /** 本次 load 的稳定递增序号。 */
-    const requestSequence = latestLoadSequence + 1
-    latestLoadSequence = requestSequence
+    /** recovery 与普通 LOAD 使用独立序号，job LOAD 只能取消普通请求。 */
+    const requestSequence = forceAuthoritative
+      ? latestAuthoritativeRecoverySequence + 1
+      : latestLoadSequence + 1
+    if (forceAuthoritative) {
+      latestAuthoritativeRecoverySequence = requestSequence
+      /** recovery 开始时失效此前普通/job 结构 LOAD，禁止旧基线稍后覆盖。 */
+      latestLoadSequence += 1
+    } else {
+      latestLoadSequence = requestSequence
+    }
+    /** 判断本次请求是否仍持有对应 LOAD 生命周期。 */
+    const isCurrentRequest = (): boolean => forceAuthoritative
+      ? requestSequence === latestAuthoritativeRecoverySequence
+      : requestSequence === latestLoadSequence
     if (!dependencies.getState().snapshot) {
       dependencies.updateState({ phase: 'loading', error: null })
     }
@@ -524,7 +572,7 @@ export function createDesignWorkspaceController(
       if (disposed) return
       /** Promise 返回时读取的最新项目状态。 */
       const latest = dependencies.getState()
-      if (requestSequence !== latestLoadSequence) return
+      if (!isCurrentRequest()) return
       if (forceAuthoritative) {
         /** recovery 事件的后续 LOAD 即使未重复携带 recoveredFrom 也必须接管。 */
         dependencies.updateState(createAuthoritativeRecoveryUpdate(latest, snapshot))
@@ -598,7 +646,7 @@ export function createDesignWorkspaceController(
       })
       if (snapshot.recoveredFrom) dependencies.onRecovered?.(snapshot)
     } catch (error) {
-      if (disposed || requestSequence !== latestLoadSequence) return
+      if (disposed || !isCurrentRequest()) return
       if (forceAuthoritative) {
         /** 旧快照只保留为只读参考，直到用户重试并成功接管权威基线。 */
         dependencies.updateState({
@@ -613,7 +661,12 @@ export function createDesignWorkspaceController(
       dependencies.updateState({ phase: 'error', error: getDesignErrorMessage(error) })
     } finally {
       if (rebasePendingAfterConflict) conflictRecoveryInFlight = false
-      if (forceAuthoritative) authoritativeRecoveryInFlight = false
+      if (forceAuthoritative) {
+        authoritativeRecoveryInFlight = false
+        if (dependencies.getState().authoritativeRecoveryState === 'idle') {
+          flushDeferredJobRefresh()
+        }
+      }
     }
   }
 
@@ -641,6 +694,9 @@ export function createDesignWorkspaceController(
   const startAuthoritativeRecovery = (): void => {
     if (disposed || authoritativeRecoveryInFlight) return
     clearSaveTimer()
+    /** 恢复完成后至少重读一次 journal，并失效恢复前已发出的任务请求。 */
+    deferJobRefresh()
+    latestJobLoadSequence += 1
     saveBaselineEpoch += 1
     /** 恢复必须先取回旧基线在途 batch，后续迟到回调不得再次归还。 */
     const interruptedSaveRequest = activeSaveRequest
@@ -835,7 +891,11 @@ export function createDesignWorkspaceController(
       if (disposed) return
       disposed = true
       latestLoadSequence += 1
+      latestAuthoritativeRecoverySequence += 1
+      latestJobLoadSequence += 1
       saveBaselineEpoch += 1
+      deferredJobRefreshRequested = false
+      deferredJobStructureRevision = undefined
       clearSaveTimer()
       /** 卸载时主动把在途 batch 归还共享状态，供下一个 controller 接管。 */
       const interruptedSaveRequest = activeSaveRequest
