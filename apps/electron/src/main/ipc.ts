@@ -172,6 +172,7 @@ import {
 import { DesignAssetService } from './lib/design/design-asset-service'
 import { DesignImageModelPreferences } from './lib/design/design-image-model-preferences'
 import { registerDesignIpcHandlers } from './lib/design/design-ipc'
+import { updateToolCredentialsWithImageModelBroadcast } from './lib/image-model-profile-broadcast'
 import { DesignSessionBridge } from './lib/design/design-session-bridge'
 import {
   DesignJobManager,
@@ -3273,7 +3274,14 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     CHAT_TOOL_IPC_CHANNELS.UPDATE_TOOL_CREDENTIALS,
     async (_, toolId: string, credentials: Record<string, string>): Promise<void> => {
-      updateToolCredentials(toolId, credentials)
+      await updateToolCredentialsWithImageModelBroadcast({
+        toolId,
+        credentials,
+        updateCredentials: (currentToolId, currentCredentials) => {
+          updateToolCredentials(currentToolId, currentCredentials)
+        },
+        listTargets: () => BrowserWindow.getAllWindows().map((window) => window.webContents),
+      })
     }
   )
 

@@ -1,5 +1,5 @@
 import * as React from 'react'
-import type { ImageGenerationModelProfile } from '@proma/shared'
+import type { ImageGenerationModelCatalogResult, ImageGenerationModelProfile } from '@proma/shared'
 import { Loader2, Plus, Save, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -14,16 +14,39 @@ interface ImageGenerationModelSettingsViewProps {
   credentialsConfigured: boolean
   /** 当前是否正在保存完整模型目录。 */
   saving: boolean
+  /** 后台发现权威目录已变化，等待用户决定是否重载。 */
+  externalUpdatePending?: boolean
+  /** 最近一次后台读取错误，不隐藏当前表单。 */
+  loadError?: string | null
+  /** 用户明确放弃本地编辑并重新加载权威目录。 */
+  onReload?: () => void
+  /** 用户在保留表单的前提下重试后台读取。 */
+  onRetry?: () => void
   /** 模型列表发生编辑时回传完整列表。 */
   onProfilesChange: (profiles: ImageGenerationModelProfile[]) => void
   /** 用户请求保存完整模型目录。 */
   onSave: () => void
 }
 
-interface ImageGenerationModelSettingsProps {
-  /** Nano Banana 凭据变化后触发重新读取的代次。 */
-  refreshVersion?: number
+/** 生图模型设置的可预测加载与编辑状态。 */
+export interface ImageGenerationModelSettingsState {
+  profiles: ImageGenerationModelProfile[]
+  baselineProfiles: ImageGenerationModelProfile[]
+  credentialsConfigured: boolean
+  initialLoading: boolean
+  loadError: string | null
+  dirty: boolean
+  externalUpdatePending: boolean
+  requestGeneration: number
+  editGeneration: number
 }
+
+type ImageGenerationModelSettingsAction =
+  | { type: 'profiles-edited'; profiles: ImageGenerationModelProfile[] }
+  | { type: 'request-started'; requestGeneration: number; mode: 'initial' | 'background' | 'reload' }
+  | { type: 'request-succeeded'; requestGeneration: number; mode: 'initial' | 'background' | 'reload'; result: ImageGenerationModelCatalogResult }
+  | { type: 'request-failed'; requestGeneration: number; message: string }
+  | { type: 'save-succeeded'; result: ImageGenerationModelCatalogResult }
 
 /** 创建一条尚待填写的新生图模型配置。 */
 export function createImageGenerationModelProfile(
@@ -62,14 +85,129 @@ export function validateImageGenerationModelProfiles(
 /** 把编辑态整理为可持久化的完整 profile 列表。 */
 function prepareProfilesForSave(
   profiles: readonly ImageGenerationModelProfile[],
+  baselineProfiles: readonly ImageGenerationModelProfile[],
   now: number,
 ): ImageGenerationModelProfile[] {
-  return profiles.map((profile) => ({
-    ...profile,
-    name: profile.name.trim(),
-    modelId: profile.modelId.trim(),
-    updatedAt: now,
-  }))
+  /** 按稳定 ID 索引的权威 profile。 */
+  const baselineById = new Map(baselineProfiles.map((profile) => [profile.id, profile]))
+  return profiles.map((profile) => {
+    /** 去除用户输入两端空白后的编辑值。 */
+    const normalized = { ...profile, name: profile.name.trim(), modelId: profile.modelId.trim() }
+    /** 当前行对应的权威 baseline。 */
+    const baseline = baselineById.get(profile.id)
+    if (!baseline) return { ...normalized, updatedAt: now }
+    /** 只有用户可编辑字段变化时才推进更新时间。 */
+    const changed = normalized.name !== baseline.name
+      || normalized.modelId !== baseline.modelId
+      || normalized.enabled !== baseline.enabled
+    return changed
+      ? { ...normalized, executor: baseline.executor, createdAt: baseline.createdAt, updatedAt: now }
+      : baseline
+  })
+}
+
+/** 导出保存整理函数，锁定时间戳与权威 baseline 语义。 */
+export const prepareImageGenerationModelProfilesForSave = prepareProfilesForSave
+
+/** 比较两份目录的稳定身份和用户可编辑字段。 */
+function haveSameEditableProfiles(
+  left: readonly ImageGenerationModelProfile[],
+  right: readonly ImageGenerationModelProfile[],
+): boolean {
+  return left.length === right.length && left.every((profile, index) => {
+    /** 同一顺序位置的对照 profile。 */
+    const other = right[index]
+    return other !== undefined
+      && profile.id === other.id
+      && profile.name.trim() === other.name
+      && profile.modelId.trim() === other.modelId
+      && profile.enabled === other.enabled
+  })
+}
+
+/** 创建初始或已加载的生图模型设置状态。 */
+export function createImageGenerationModelSettingsState(
+  catalog?: ImageGenerationModelCatalogResult,
+): ImageGenerationModelSettingsState {
+  return {
+    profiles: catalog?.profiles ?? [],
+    baselineProfiles: catalog?.profiles ?? [],
+    credentialsConfigured: catalog?.credentialsConfigured ?? false,
+    initialLoading: catalog === undefined,
+    loadError: null,
+    dirty: false,
+    externalUpdatePending: false,
+    requestGeneration: 0,
+    editGeneration: 0,
+  }
+}
+
+/** 归约加载、乱序响应、外部变化和本地编辑，避免后台刷新覆盖 dirty 表单。 */
+export function reduceImageGenerationModelSettingsState(
+  state: ImageGenerationModelSettingsState,
+  action: ImageGenerationModelSettingsAction,
+): ImageGenerationModelSettingsState {
+  switch (action.type) {
+    case 'profiles-edited':
+      return {
+        ...state,
+        profiles: action.profiles,
+        dirty: !haveSameEditableProfiles(action.profiles, state.baselineProfiles),
+        editGeneration: state.editGeneration + 1,
+      }
+    case 'request-started':
+      return {
+        ...state,
+        requestGeneration: action.requestGeneration,
+        initialLoading: action.mode === 'initial' && state.baselineProfiles.length === 0,
+        loadError: null,
+      }
+    case 'request-succeeded': {
+      if (action.requestGeneration !== state.requestGeneration) return state
+      /** dirty 后台刷新只更新凭据；目录变化留给用户明确重载。 */
+      const preserveEditing = action.mode === 'background' && state.dirty
+      if (preserveEditing) {
+        return {
+          ...state,
+          credentialsConfigured: action.result.credentialsConfigured,
+          initialLoading: false,
+          loadError: null,
+          externalUpdatePending: !haveSameEditableProfiles(
+            action.result.profiles,
+            state.baselineProfiles,
+          ),
+        }
+      }
+      return {
+        ...state,
+        profiles: action.result.profiles,
+        baselineProfiles: action.result.profiles,
+        credentialsConfigured: action.result.credentialsConfigured,
+        initialLoading: false,
+        loadError: null,
+        dirty: false,
+        externalUpdatePending: false,
+      }
+    }
+    case 'request-failed':
+      if (action.requestGeneration !== state.requestGeneration) return state
+      return {
+        ...state,
+        initialLoading: false,
+        loadError: action.message,
+      }
+    case 'save-succeeded':
+      return {
+        ...state,
+        profiles: action.result.profiles,
+        baselineProfiles: action.result.profiles,
+        credentialsConfigured: action.result.credentialsConfigured,
+        dirty: false,
+        externalUpdatePending: false,
+        loadError: null,
+        requestGeneration: state.requestGeneration + 1,
+      }
+  }
 }
 
 /** 渲染无嵌套卡片的生图模型配置列表。 */
@@ -77,11 +215,19 @@ export function ImageGenerationModelSettingsView({
   profiles,
   credentialsConfigured,
   saving,
+  externalUpdatePending = false,
+  loadError = null,
+  onReload,
+  onRetry,
   onProfilesChange,
   onSave,
 }: ImageGenerationModelSettingsViewProps): React.ReactElement {
   /** 当前列表的本地校验结果。 */
   const validationError = validateImageGenerationModelProfiles(profiles)
+  /** 名称或模型 ID 错误已经在字段旁显示，无需重复卡片级摘要。 */
+  const hasFieldValidationError = profiles.some((profile) => (
+    !profile.name.trim() || !profile.modelId.trim()
+  ))
   /** 保存动作是否应被阻断。 */
   const saveDisabled = saving
     || profiles.length === 0
@@ -116,8 +262,26 @@ export function ImageGenerationModelSettingsView({
   return (
     <SettingsCard divided className="rounded">
       {!credentialsConfigured && (
-        <div className="px-4 py-3 text-xs text-destructive">
+        <div role="alert" className="px-4 py-3 text-xs text-destructive">
           请先配置 Nano Banana API Key，配置完成后才能保存和使用生图模型。
+        </div>
+      )}
+
+      {externalUpdatePending && (
+        <div aria-live="polite" className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-xs text-muted-foreground">
+          <span>外部配置已更新，本地未保存编辑仍保留。</span>
+          <Button type="button" size="sm" variant="outline" className="h-8 rounded text-xs" onClick={onReload}>
+            重新加载
+          </Button>
+        </div>
+      )}
+
+      {loadError && (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-xs text-destructive">
+          <span>{loadError}</span>
+          <Button type="button" size="sm" variant="outline" className="h-8 rounded text-xs" onClick={onRetry}>
+            重试
+          </Button>
         </div>
       )}
 
@@ -125,29 +289,44 @@ export function ImageGenerationModelSettingsView({
         <div className="px-4 py-6 text-center">
           <p className="text-xs text-muted-foreground">尚未配置生图模型</p>
         </div>
-      ) : profiles.map((profile) => (
+      ) : profiles.map((profile, index) => {
+        /** 名称输入的稳定错误说明 ID。 */
+        const nameErrorId = `image-model-${index}-name-error`
+        /** 模型 ID 输入的稳定错误说明 ID。 */
+        const modelIdErrorId = `image-model-${index}-model-id-error`
+        /** 当前名称是否为空。 */
+        const nameInvalid = !profile.name.trim()
+        /** 当前真实模型 ID 是否为空。 */
+        const modelIdInvalid = !profile.modelId.trim()
+        return (
         <div key={profile.id} className="flex flex-wrap items-end gap-3 px-4 py-3">
           <label className="min-w-40 flex-1 space-y-1">
             <span className="block text-xs font-medium text-foreground">名称</span>
             <Input
               aria-label={`生图模型名称 ${profile.name || profile.id}`}
+              aria-invalid={nameInvalid}
+              aria-describedby={nameInvalid ? nameErrorId : undefined}
               className="h-8 rounded px-2.5 text-xs"
               disabled={saving}
               value={profile.name}
               placeholder="例如：快速出图"
               onChange={(event) => updateProfile(profile.id, { name: event.target.value })}
             />
+            {nameInvalid && <span id={nameErrorId} role="alert" className="block text-xs text-destructive">请输入名称</span>}
           </label>
           <label className="min-w-52 flex-[1.4] space-y-1">
             <span className="block text-xs font-medium text-foreground">模型 ID</span>
             <Input
               aria-label={`生图模型 ID ${profile.name || profile.id}`}
+              aria-invalid={modelIdInvalid}
+              aria-describedby={modelIdInvalid ? modelIdErrorId : undefined}
               className="h-8 rounded px-2.5 font-mono text-xs"
               disabled={saving}
               value={profile.modelId}
               placeholder="gemini-3.1-flash-image-preview"
               onChange={(event) => updateProfile(profile.id, { modelId: event.target.value })}
             />
+            {modelIdInvalid && <span id={modelIdErrorId} role="alert" className="block text-xs text-destructive">请输入模型 ID</span>}
           </label>
           <div className="flex h-8 items-center gap-2">
             <span className="text-xs text-muted-foreground">启用</span>
@@ -171,10 +350,11 @@ export function ImageGenerationModelSettingsView({
             <Trash2 />
           </Button>
         </div>
-      ))}
+        )
+      })}
 
-      {validationError && profiles.length > 0 && (
-        <div className="px-4 py-2 text-xs text-destructive">{validationError}</div>
+      {validationError && !hasFieldValidationError && profiles.length > 0 && (
+        <div role="alert" aria-live="polite" className="px-4 py-2 text-xs text-destructive">{validationError}</div>
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
@@ -205,96 +385,115 @@ export function ImageGenerationModelSettingsView({
 }
 
 /** 连接系统生图模型 IPC，并管理设置页加载与保存状态。 */
-export function ImageGenerationModelSettings({
-  refreshVersion = 0,
-}: ImageGenerationModelSettingsProps): React.ReactElement {
-  /** 当前编辑中的模型列表。 */
-  const [profiles, setProfiles] = React.useState<ImageGenerationModelProfile[]>([])
-  /** Nano Banana 公共凭据是否可供模型使用。 */
-  const [credentialsConfigured, setCredentialsConfigured] = React.useState(false)
-  /** 首次加载是否仍在进行。 */
-  const [loading, setLoading] = React.useState(true)
+export function ImageGenerationModelSettings(): React.ReactElement {
+  /** 设置页权威 baseline、编辑态与加载代次。 */
+  const [state, dispatch] = React.useReducer(
+    reduceImageGenerationModelSettingsState,
+    undefined,
+    () => createImageGenerationModelSettingsState(),
+  )
   /** 当前目录是否正在保存。 */
   const [saving, setSaving] = React.useState(false)
-  /** 最近一次目录加载错误。 */
-  const [loadError, setLoadError] = React.useState<string | null>(null)
+  /** 同步阻断连续点击在 React 提交前重复进入保存。 */
+  const savingRef = React.useRef(false)
+  /** 每次读取递增，旧响应由 reducer 拒绝。 */
+  const requestGenerationRef = React.useRef(0)
+  /** 卸载后拒绝迟到响应提交。 */
+  const mountedRef = React.useRef(false)
 
   /** 从主进程刷新清洗后的非敏感模型目录。 */
-  const loadProfiles = React.useCallback(async (): Promise<void> => {
-    setLoading(true)
+  const loadProfiles = React.useCallback(async (
+    mode: 'initial' | 'background' | 'reload',
+  ): Promise<void> => {
+    /** 本次读取的唯一请求代次。 */
+    const requestGeneration = ++requestGenerationRef.current
+    dispatch({ type: 'request-started', requestGeneration, mode })
     try {
       /** 主进程返回的模型目录及凭据可用状态。 */
       const result = await window.electronAPI.listImageModelProfiles()
-      setProfiles(result.profiles)
-      setCredentialsConfigured(result.credentialsConfigured)
-      setLoadError(null)
+      if (!mountedRef.current) return
+      dispatch({ type: 'request-succeeded', requestGeneration, mode, result })
     } catch (error) {
-      setLoadError(error instanceof Error ? error.message : String(error))
-    } finally {
-      setLoading(false)
+      if (!mountedRef.current) return
+      dispatch({
+        type: 'request-failed',
+        requestGeneration,
+        message: error instanceof Error ? error.message : String(error),
+      })
     }
   }, [])
 
   React.useEffect(() => {
-    void loadProfiles()
-  }, [loadProfiles, refreshVersion])
-
-  React.useEffect(() => {
+    mountedRef.current = true
+    void loadProfiles('initial')
     /** 其它窗口保存目录后的刷新订阅。 */
     const unsubscribe = window.electronAPI.onImageModelProfilesChanged(() => {
-      void loadProfiles()
+      void loadProfiles('background')
     })
-    return unsubscribe
+    return () => {
+      mountedRef.current = false
+      requestGenerationRef.current += 1
+      unsubscribe()
+    }
   }, [loadProfiles])
 
   /** 本地校验通过后完整替换系统模型目录。 */
   const handleSave = React.useCallback(async (): Promise<void> => {
     /** 当前编辑态的本地校验错误。 */
-    const validationError = validateImageGenerationModelProfiles(profiles)
+    const validationError = validateImageGenerationModelProfiles(state.profiles)
     if (validationError) {
       toast.error(validationError)
       return
     }
-    if (!credentialsConfigured || profiles.length === 0) return
+    if (!state.credentialsConfigured || state.profiles.length === 0 || savingRef.current) return
 
+    savingRef.current = true
     setSaving(true)
     try {
       /** 提交前去除用户输入两端空白，并统一更新时间。 */
-      const normalizedProfiles = prepareProfilesForSave(profiles, Date.now())
+      const normalizedProfiles = prepareProfilesForSave(
+        state.profiles,
+        state.baselineProfiles,
+        Date.now(),
+      )
       /** 主进程原子保存后返回的权威目录。 */
       const result = await window.electronAPI.saveImageModelProfiles({ profiles: normalizedProfiles })
-      setProfiles(result.profiles)
-      setCredentialsConfigured(result.credentialsConfigured)
+      if (!mountedRef.current) return
+      requestGenerationRef.current += 1
+      dispatch({ type: 'save-succeeded', result })
       toast.success('生图模型配置已保存')
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : '生图模型配置保存失败')
+      if (mountedRef.current) {
+        toast.error(error instanceof Error ? error.message : '生图模型配置保存失败')
+      }
     } finally {
-      setSaving(false)
+      savingRef.current = false
+      if (mountedRef.current) setSaving(false)
     }
-  }, [credentialsConfigured, profiles])
+  }, [state.baselineProfiles, state.credentialsConfigured, state.profiles])
 
   return (
     <SettingsSection
       title="生图模型"
       description="Design 项目可独立选择这里启用的模型；名称用于识别，模型 ID 决定实际出图模型。"
     >
-      {loading ? (
+      {state.initialLoading ? (
         <SettingsCard divided={false} className="rounded">
           <div className="flex h-20 items-center justify-center text-xs text-muted-foreground">
             <Loader2 className="mr-2 size-4 animate-spin" />
             正在读取生图模型...
           </div>
         </SettingsCard>
-      ) : loadError ? (
+      ) : state.loadError && state.profiles.length === 0 ? (
         <SettingsCard divided={false} className="rounded">
           <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-            <p className="text-xs text-destructive">生图模型加载失败：{loadError}</p>
+            <p role="alert" className="text-xs text-destructive">生图模型加载失败：{state.loadError}</p>
             <Button
               type="button"
               size="sm"
               variant="outline"
               className="h-8 rounded text-xs"
-              onClick={() => { void loadProfiles() }}
+              onClick={() => { void loadProfiles('reload') }}
             >
               重试
             </Button>
@@ -302,11 +501,15 @@ export function ImageGenerationModelSettings({
         </SettingsCard>
       ) : (
         <ImageGenerationModelSettingsView
-          profiles={profiles}
-          credentialsConfigured={credentialsConfigured}
+          profiles={state.profiles}
+          credentialsConfigured={state.credentialsConfigured}
           saving={saving}
-          onProfilesChange={setProfiles}
+          externalUpdatePending={state.externalUpdatePending}
+          loadError={state.loadError}
+          onProfilesChange={(profiles) => dispatch({ type: 'profiles-edited', profiles })}
           onSave={() => { void handleSave() }}
+          onReload={() => { void loadProfiles('reload') }}
+          onRetry={() => { void loadProfiles('background') }}
         />
       )}
     </SettingsSection>

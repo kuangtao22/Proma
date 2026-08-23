@@ -34,6 +34,7 @@ import type { DesignStore } from './design-store'
 import type { DesignJobManager } from './design-job-manager'
 import type { DesignSessionBridge } from './design-session-bridge'
 import type { DesignImageModelPreferences } from './design-image-model-preferences'
+import { broadcastImageModelProfilesChanged } from '../image-model-profile-broadcast'
 
 /** Renderer 可提交的画布 mutation 白名单，素材元数据只能由主进程服务维护。 */
 const RENDERER_MUTATION_TYPES = new Set<DesignMutation['type']>([
@@ -540,18 +541,6 @@ function broadcastChange(options: DesignIpcOptions, change: DesignChangeEvent): 
   }
 }
 
-/** 向全部仍存活授权窗口广播模型目录变化，不携带目录或凭据 payload。 */
-function broadcastImageModelProfilesChanged(options: DesignIpcOptions): void {
-  for (const contents of options.listAuthorizedWebContents()) {
-    if (contents.isDestroyed()) continue
-    try {
-      contents.send(DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED)
-    } catch (error) {
-      console.error('[DesignIPC] 生图模型目录变化广播失败:', error)
-    }
-  }
-}
-
 /** 向全部仍存活授权窗口广播项目选择变化，只携带项目 ID。 */
 function broadcastImageModelSelectionChanged(
   options: DesignIpcOptions,
@@ -696,7 +685,7 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
       () => options.imageModels.replaceProfiles(input.profiles),
       '保存生图模型配置失败',
     )
-    broadcastImageModelProfilesChanged(options)
+    broadcastImageModelProfilesChanged(options.listAuthorizedWebContents())
     return result
   })
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
-import type { ImageGenerationModelProfile } from '@proma/shared'
+import type { ImageGenerationModelCatalogResult, ImageGenerationModelProfile } from '@proma/shared'
 import * as imageModelSettingsModule from './ImageGenerationModelSettings'
 import * as toolSettingsModule from './ToolSettings'
 
@@ -20,6 +20,14 @@ function createProfile(
     createdAt: 1,
     updatedAt: 1,
   }
+}
+
+/** 创建状态机测试使用的公开模型目录结果。 */
+function createCatalog(
+  profiles: ImageGenerationModelProfile[],
+  credentialsConfigured = true,
+): ImageGenerationModelCatalogResult {
+  return { profiles, credentialsConfigured, inheritedFromLegacyConfig: false }
 }
 
 describe('ImageGenerationModelSettings', () => {
@@ -112,6 +120,25 @@ describe('ImageGenerationModelSettings', () => {
     ])).toBe('生图模型配置 ID 重复，请删除重复项后重试')
   })
 
+  test('Given 字段校验失败 When 渲染设置 Then 具体输入关联错误并通过 alert 宣告', () => {
+    const { ImageGenerationModelSettingsView } = imageModelSettingsModule
+    const html = renderToStaticMarkup(
+      <ImageGenerationModelSettingsView
+        profiles={[createProfile('profile-flash', '', '')]}
+        credentialsConfigured
+        saving={false}
+        onProfilesChange={() => undefined}
+        onSave={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('aria-invalid="true"')
+    expect(html).toContain('aria-describedby="image-model-0-name-error"')
+    expect(html).toContain('aria-describedby="image-model-0-model-id-error"')
+    expect(html).toContain('id="image-model-0-name-error" role="alert"')
+    expect(html).toContain('id="image-model-0-model-id-error" role="alert"')
+  })
+
   test('Given 新增模型 When 创建 profile Then 使用稳定 ID 和同一时间戳', () => {
     const { createImageGenerationModelProfile } = imageModelSettingsModule
 
@@ -124,6 +151,144 @@ describe('ImageGenerationModelSettings', () => {
       createdAt: 1234,
       updatedAt: 1234,
     })
+  })
+
+  test('Given 权威 baseline When 保存 Then 仅新行或实际变化行更新 updatedAt', () => {
+    const { prepareImageGenerationModelProfilesForSave } = imageModelSettingsModule
+    /** 服务端上次返回的权威模型目录。 */
+    const baseline = [
+      { ...createProfile('unchanged', 'Flash', 'gemini-flash'), createdAt: 10, updatedAt: 20 },
+      { ...createProfile('changed', 'Pro', 'gemini-pro'), createdAt: 11, updatedAt: 21 },
+    ]
+    /** 当前编辑态包含未改行、改名行和新增行。 */
+    const editing = [
+      { ...baseline[0]!, name: ' Flash ' },
+      { ...baseline[1]!, name: 'Pro 2', createdAt: 999, updatedAt: 999 },
+      { ...createProfile('new', 'New', 'gemini-new'), createdAt: 30, updatedAt: 30 },
+    ]
+
+    expect(prepareImageGenerationModelProfilesForSave(editing, baseline, 100)).toEqual([
+      baseline[0]!,
+      { ...baseline[1]!, name: 'Pro 2', updatedAt: 100 },
+      { ...editing[2]!, updatedAt: 100 },
+    ])
+  })
+
+  test('Given dirty 编辑 When 凭据或外部目录后台刷新 Then 保留表单并只标记真实目录变化', () => {
+    const {
+      createImageGenerationModelSettingsState,
+      reduceImageGenerationModelSettingsState,
+    } = imageModelSettingsModule
+    /** 初始加载后的权威目录。 */
+    const baseline = [createProfile('profile-flash', 'Flash', 'gemini-flash')]
+    let state = createImageGenerationModelSettingsState(createCatalog(baseline, false))
+    /** 用户尚未保存的本地名称。 */
+    const editing = [{ ...baseline[0]!, name: '本地编辑' }]
+    state = reduceImageGenerationModelSettingsState(state, { type: 'profiles-edited', profiles: editing })
+
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-started', requestGeneration: 1, mode: 'background',
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-succeeded', requestGeneration: 1, mode: 'background',
+      result: createCatalog(baseline, true),
+    })
+    expect(state.profiles).toEqual(editing)
+    expect(state.credentialsConfigured).toBe(true)
+    expect(state.externalUpdatePending).toBe(false)
+
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-started', requestGeneration: 2, mode: 'background',
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-succeeded', requestGeneration: 2, mode: 'background',
+      result: createCatalog([createProfile('profile-pro', '外部配置', 'gemini-pro')]),
+    })
+    expect(state.profiles).toEqual(editing)
+    expect(state.externalUpdatePending).toBe(true)
+    expect(state.editGeneration).toBe(1)
+  })
+
+  test('Given 后台刷新失败或请求乱序 When 归约结果 Then 保留表单且旧请求不能覆盖新请求', () => {
+    const {
+      createImageGenerationModelSettingsState,
+      reduceImageGenerationModelSettingsState,
+    } = imageModelSettingsModule
+    /** 初始权威目录。 */
+    const baseline = [createProfile('profile-flash', 'Flash', 'gemini-flash')]
+    let state = createImageGenerationModelSettingsState(createCatalog(baseline))
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-started', requestGeneration: 1, mode: 'background',
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-started', requestGeneration: 2, mode: 'background',
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-succeeded', requestGeneration: 2, mode: 'background',
+      result: createCatalog([createProfile('profile-pro', 'Pro', 'gemini-pro')]),
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-succeeded', requestGeneration: 1, mode: 'background',
+      result: createCatalog([createProfile('stale', '旧请求', 'gemini-stale')], false),
+    })
+    expect(state.profiles[0]?.id).toBe('profile-pro')
+    expect(state.credentialsConfigured).toBe(true)
+
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-started', requestGeneration: 3, mode: 'background',
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-failed', requestGeneration: 3, message: '读取失败',
+    })
+    expect(state.profiles[0]?.id).toBe('profile-pro')
+    expect(state.loadError).toBe('读取失败')
+    expect(state.initialLoading).toBe(false)
+  })
+
+  test('Given 保存前后台读取仍在途 When 保存先成功 Then 迟到读取不得覆盖保存结果', () => {
+    const {
+      createImageGenerationModelSettingsState,
+      reduceImageGenerationModelSettingsState,
+    } = imageModelSettingsModule
+    /** 保存前的旧权威目录。 */
+    const baseline = [createProfile('profile-flash', 'Flash', 'gemini-flash')]
+    let state = createImageGenerationModelSettingsState(createCatalog(baseline))
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-started', requestGeneration: 1, mode: 'background',
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'save-succeeded',
+      result: createCatalog([createProfile('profile-pro', '保存结果', 'gemini-pro')]),
+    })
+    state = reduceImageGenerationModelSettingsState(state, {
+      type: 'request-succeeded', requestGeneration: 1, mode: 'background',
+      result: createCatalog(baseline),
+    })
+
+    expect(state.profiles[0]?.id).toBe('profile-pro')
+  })
+
+  test('Given dirty 表单发现外部更新 When 渲染 Then 提供明确重新加载入口', () => {
+    const { ImageGenerationModelSettingsView } = imageModelSettingsModule
+    const html = renderToStaticMarkup(
+      <ImageGenerationModelSettingsView
+        profiles={[createProfile('profile-flash', '本地编辑', 'gemini-flash')]}
+        credentialsConfigured
+        saving={false}
+        externalUpdatePending
+        loadError="上次刷新失败"
+        onProfilesChange={() => undefined}
+        onSave={() => undefined}
+        onReload={() => undefined}
+        onRetry={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('外部配置已更新')
+    expect(html).toContain('重新加载')
+    expect(html).toContain('上次刷新失败')
+    expect(html).toContain('重试')
+    expect(html).toContain('value="本地编辑"')
   })
 })
 
@@ -141,7 +306,7 @@ test('Given 普通会话已保存旧模型 When 更新 Nano Banana 连接信息 
   })
 })
 
-test('Given Nano Banana 凭据保存成功 When 完成工具刷新 Then 通知生图模型目录重新读取', async () => {
+test('Given Nano Banana 凭据保存成功 When 完成工具刷新 Then Renderer 不自行模拟模型目录广播', async () => {
   const { persistNanoBananaCredentialsUpdate } = toolSettingsModule
   /** 记录凭据保存后的顺序，目录只能在持久化完成后刷新。 */
   const calls: string[] = []
@@ -155,12 +320,10 @@ test('Given Nano Banana 凭据保存成功 When 完成工具刷新 Then 通知�
   await persistNanoBananaCredentialsUpdate(credentials, {
     updateCredentials: async (input) => { calls.push(`save:${input.model}`) },
     refreshChatTools: async () => { calls.push('refresh-tools') },
-    notifyImageModelCatalog: () => { calls.push('refresh-models') },
   })
 
   expect(calls).toEqual([
     'save:legacy-chat-model',
     'refresh-tools',
-    'refresh-models',
   ])
 })

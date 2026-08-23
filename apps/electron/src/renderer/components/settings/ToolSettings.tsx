@@ -213,27 +213,19 @@ interface PersistNanoBananaCredentialsDependencies {
   updateCredentials: (credentials: { apiKey: string; baseUrl: string; model: string }) => Promise<void>
   /** 凭据变化后刷新全局工具可用状态。 */
   refreshChatTools: () => Promise<void>
-  /** 通知生图模型设置重新读取凭据可用性。 */
-  notifyImageModelCatalog: () => void
 }
 
-/** 按持久化、工具刷新、模型目录刷新的顺序提交 Nano Banana 凭据。 */
+/** 按持久化、工具刷新的顺序提交凭据；模型目录由主进程统一广播。 */
 export async function persistNanoBananaCredentialsUpdate(
   credentials: { apiKey: string; baseUrl: string; model: string },
   dependencies: PersistNanoBananaCredentialsDependencies,
 ): Promise<void> {
   await dependencies.updateCredentials(credentials)
   await dependencies.refreshChatTools()
-  dependencies.notifyImageModelCatalog()
 }
 
 /** Nano Banana 生图工具设置区域 */
-function NanoBananaSettings({
-  onCredentialsSaved,
-}: {
-  /** 凭据成功保存后通知同页生图模型目录刷新。 */
-  onCredentialsSaved: () => void
-}): React.ReactElement {
+function NanoBananaSettings(): React.ReactElement {
   const [apiKey, setApiKey] = React.useState('')
   const [baseUrl, setBaseUrl] = React.useState('')
   const [showApiKey, setShowApiKey] = React.useState(false)
@@ -275,14 +267,13 @@ function NanoBananaSettings({
       await persistNanoBananaCredentialsUpdate(current, {
         updateCredentials: (credentials) => window.electronAPI.updateChatToolCredentials('nano-banana', credentials),
         refreshChatTools: () => refreshChatTools(setChatTools),
-        notifyImageModelCatalog: onCredentialsSaved,
       })
       savedCredentialsRef.current = current
       toast.success('Nano Banana 设置已保存')
     } catch (error) {
       console.error('[Nano Banana 设置] 保存失败:', error)
     }
-  }, [apiKey, baseUrl, onCredentialsSaved, setChatTools])
+  }, [apiKey, baseUrl, setChatTools])
 
   const handleToggle = async (checked: boolean): Promise<void> => {
     try {
@@ -303,7 +294,6 @@ function NanoBananaSettings({
         await persistNanoBananaCredentialsUpdate(current, {
           updateCredentials: (credentials) => window.electronAPI.updateChatToolCredentials('nano-banana', credentials),
           refreshChatTools: () => refreshChatTools(setChatTools),
-          notifyImageModelCatalog: onCredentialsSaved,
         })
         savedCredentialsRef.current = current
       } catch (error) {
@@ -500,8 +490,6 @@ export function ToolSettings(): React.ReactElement {
   const webSearchRef = React.useRef<HTMLDivElement>(null)
   const nanoBananaRef = React.useRef<HTMLDivElement>(null)
   const customToolsRef = React.useRef<HTMLDivElement>(null)
-  /** Nano Banana 凭据保存后驱动生图模型目录重新读取的代次。 */
-  const [imageModelCatalogRefreshVersion, setImageModelCatalogRefreshVersion] = React.useState(0)
 
   React.useEffect(() => {
     if (!focusedTool) return
@@ -525,10 +513,8 @@ export function ToolSettings(): React.ReactElement {
 
       {/* Nano Banana 生图工具 */}
       <div ref={nanoBananaRef} className="space-y-8">
-        <NanoBananaSettings
-          onCredentialsSaved={() => setImageModelCatalogRefreshVersion((version) => version + 1)}
-        />
-        <ImageGenerationModelSettings refreshVersion={imageModelCatalogRefreshVersion} />
+        <NanoBananaSettings />
+        <ImageGenerationModelSettings />
       </div>
 
       {/* 自定义工具 */}
