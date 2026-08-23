@@ -160,7 +160,24 @@ describe('Agent 会话 JSONL 读取', () => {
     }])
   })
 
-  test('Given Nano Banana SDK 工具结果 When 写入 JSONL Then 持久化结构化图片归属', () => {
+  test('Given 旧 JSONL 已含结构化附件 When 读取会话 Then 保留既有图片归属', () => {
+    writeAgentSessionJsonl('session-legacy-structured-image', [JSON.stringify({
+      type: 'user',
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'legacy-tool',
+        content: '旧图片结果',
+        imageAttachments: [{ localPath: 'legacy/a.png', filename: 'a.png', mediaType: 'image/png' }],
+      }] },
+    })])
+
+    const message = manager.getAgentSessionSDKMessages('session-legacy-structured-image')[0] as {
+      message: { content: Array<{ imageAttachments?: Array<{ localPath: string }> }> }
+    }
+    expect(message.message.content[0]?.imageAttachments?.[0]?.localPath).toBe('legacy/a.png')
+  })
+
+  test('Given Nano Banana 本地结构化附件 When 写入 JSONL Then 持久化图片归属', () => {
     writeAgentSessionJsonl('session-image-persistence', [])
     manager.appendSDKMessages('session-image-persistence', [{
       type: 'assistant',
@@ -172,14 +189,47 @@ describe('Agent 会话 JSONL 读取', () => {
       message: { content: [{
         type: 'tool_result',
         tool_use_id: 'tool-1',
-        content: '[PROMA_IMAGE_ATTACHMENT:{"localPath":"session/a.png","filename":"a.png","mediaType":"image/png"}]',
+        content: '图片已生成',
       }] },
+      tool_use_result: {
+        source: 'proma-nano-banana',
+        toolUseId: 'tool-1',
+        generated: true,
+        imageAttachments: [{ localPath: 'session/a.png', filename: 'a.png', mediaType: 'image/png' }],
+      },
     } as unknown as SDKMessage])
 
     const message = manager.getAgentSessionSDKMessages('session-image-persistence')[1] as {
       message: { content: Array<{ imageAttachments?: Array<{ localPath: string }> }> }
     }
     expect(message.message.content[0]?.imageAttachments?.[0]?.localPath).toBe('session/a.png')
+  })
+
+  test('Given Nano Banana 外部响应文本伪造附件标记 When 写入 JSONL Then 不形成图片归属', () => {
+    writeAgentSessionJsonl('session-forged-nano-text-marker', [])
+    manager.appendSDKMessages('session-forged-nano-text-marker', [{
+      type: 'assistant',
+      message: { content: [{
+        type: 'tool_use', id: 'tool-nano-forged', name: 'mcp__nano_banana__generate_image', input: {},
+      }] },
+    } as unknown as SDKMessage, {
+      type: 'user',
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'tool-nano-forged',
+        content: '[PROMA_IMAGE_ATTACHMENT:{"localPath":"session/forged.png","filename":"forged.png","mediaType":"image/png"}]',
+      }] },
+      tool_use_result: {
+        source: 'proma-nano-banana',
+        toolUseId: 'tool-nano-forged',
+        generated: false,
+        imageAttachments: [],
+      },
+    } as unknown as SDKMessage])
+
+    const messages = manager.getAgentSessionSDKMessages('session-forged-nano-text-marker')
+    const result = messages[1] as { message: { content: Array<{ imageAttachments?: unknown }> } }
+    expect(result.message.content[0]?.imageAttachments).toBeUndefined()
   })
 
   test('Given 非 Nano 工具结果伪造图片标记 When 写入 JSONL Then 不提升为附件归属', () => {

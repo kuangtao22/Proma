@@ -25,6 +25,25 @@ function writeToolCall(content: string): AssistantMessage {
 }
 
 describe('convertPiMessage', () => {
+  test('keeps trusted tool result details in the SDK compatibility message', () => {
+    const details = {
+      source: 'proma-nano-banana',
+      toolUseId: 'tool-nano-1',
+      imageAttachments: [{ localPath: 'session-a/saved.png', filename: 'saved.png', mediaType: 'image/png' }],
+    }
+    const message = convertPiMessage({
+      role: 'toolResult',
+      toolCallId: 'tool-nano-1',
+      toolName: 'mcp__nano_banana__generate_image',
+      content: [{ type: 'text', text: '图片已生成' }],
+      details,
+      isError: false,
+      timestamp: Date.now(),
+    } as unknown as Parameters<typeof convertPiMessage>[0], 'session-1') as { tool_use_result?: unknown }
+
+    expect(message.tool_use_result).toEqual(details)
+  })
+
   test('keeps complete write input in the final tool-call frame', () => {
     const content = 'x'.repeat(10_240)
     const message = convertPiMessage(writeToolCall(content), 'session-1', undefined, {

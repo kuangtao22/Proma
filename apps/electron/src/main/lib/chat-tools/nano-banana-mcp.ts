@@ -13,6 +13,7 @@ import { getToolState, getToolCredentials } from '../chat-tool-config'
 import { Type } from 'typebox'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
+import type { AgentToolResultImage } from '@proma/shared'
 import { saveAttachment, isImageAttachment } from '../attachment-service'
 
 // ===== Gemini API 类型（REST API 使用 camelCase） =====
@@ -78,7 +79,17 @@ type McpContent = McpTextContent | McpImageContent
 
 interface McpToolResult {
   content: McpContent[]
+  /** 仅由本地主进程保存流程产生，不从 Gemini 文本反解析。 */
+  imageAttachments?: AgentToolResultImage[]
   [key: string]: unknown
+}
+
+/** Pi transcript 中用于证明 Nano Banana 本地附件来源的结构化详情。 */
+interface NanoBananaToolResultDetails {
+  source: 'proma-nano-banana'
+  toolUseId: string
+  generated: boolean
+  imageAttachments: AgentToolResultImage[]
 }
 
 // ===== Gemini API 调用 =====
@@ -268,6 +279,7 @@ async function callGeminiAndBuildResult(
   const mcpContent: McpContent[] = []
   const textParts: string[] = []
   const savedWorkspacePaths: string[] = []
+  const imageAttachments: AgentToolResultImage[] = []
 
   // 解析响应：提取图片和文本（跳过 thought parts，它们是推理过程图，不作为输出）
   for (const part of parts) {
@@ -303,13 +315,12 @@ async function callGeminiAndBuildResult(
         mimeType: part.inlineData.mimeType,
       })
 
-      // 嵌入附件标记（供前端 UI 解析渲染）
-      const attachmentMeta = JSON.stringify({
+      /** 本地保存结果走结构化通道，Gemini 返回文本无法伪造该字段。 */
+      imageAttachments.push({
         localPath: result.attachment.localPath,
         filename: result.attachment.filename,
         mediaType: result.attachment.mediaType,
       })
-      textParts.push(`[PROMA_IMAGE_ATTACHMENT:${attachmentMeta}]`)
     } else if (part.text) {
       textParts.push(part.text)
     }
@@ -332,7 +343,7 @@ async function callGeminiAndBuildResult(
 
   mcpContent.push({ type: 'text' as const, text: summaryText })
 
-  return { content: mcpContent }
+  return { content: mcpContent, imageAttachments }
 }
 
 // ===== Pi 工具注入 =====
@@ -345,17 +356,22 @@ export interface PiNanoBananaToolsContext {
   allowedRoots?: string[]
 }
 
-function toPiToolResult(result: McpToolResult): AgentToolResult<unknown> {
-  // 图片已在生成时保存为 Proma attachment，并在文本里携带渲染标记。Pi 的普通 tool
-  // result 保持文本形态即可：避免把 Gemini base64 图片重复写入 Pi transcript。
+function toPiToolResult(result: McpToolResult, toolUseId: string): AgentToolResult<NanoBananaToolResultDetails> {
+  // 图片已在生成时保存为 Proma attachment。Pi 的普通 tool result 保持文本形态，
+  // 本地附件通过 details 单独传递，避免把 Gemini base64 图片重复写入 transcript。
   const text = result.content
     .filter((item): item is McpTextContent => item.type === 'text')
     .map((item) => item.text)
     .join('\n')
   return {
     content: [{ type: 'text', text: text || '图片已生成。' }],
-    details: { generated: result.content.some((item) => item.type === 'image') },
-  } as AgentToolResult<unknown>
+    details: {
+      source: 'proma-nano-banana',
+      toolUseId,
+      generated: result.content.some((item) => item.type === 'image'),
+      imageAttachments: result.imageAttachments ?? [],
+    },
+  }
 }
 
 /**
@@ -382,7 +398,7 @@ export function buildPiNanoBananaTools(
       imageSize: Type.Optional(Type.Union([Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K')])),
       numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
     }),
-    async execute(_toolCallId, args) {
+    async execute(toolCallId, args) {
       try {
         const result = await callGeminiAndBuildResult(String(args.prompt), ctx.sessionId, {
           aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
@@ -394,7 +410,7 @@ export function buildPiNanoBananaTools(
           allowedRoots: ctx.allowedRoots,
           numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
         })
-        return toPiToolResult(result)
+        return toPiToolResult(result, toolCallId)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         console.error('[Nano Banana Pi 工具] 执行失败:', error)

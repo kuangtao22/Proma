@@ -1176,10 +1176,10 @@ function serializeSDKMessageForStorage(
   return sanitized
 }
 
-/** Nano Banana MCP 在工具文本中写入的稳定图片附件标记。 */
+/** 旧版 Nano Banana MCP 写入工具文本的附件标记，仅供显式 legacy 兼容解析。 */
 const AGENT_IMAGE_ATTACHMENT_PATTERN = /\[PROMA_IMAGE_ATTACHMENT:(\{[^\r\n]*?\})\]/g
 
-/** 从工具结果文本中解析经过基本字段验证的图片附件。 */
+/** 解析旧文本标记；新消息授权禁止调用该函数，必须使用本地结构化详情。 */
 export function parseToolResultImageAttachments(content: unknown): AgentToolResultImage[] {
   /** 工具结果可能是字符串，也可能是 SDK 文本块数组。 */
   const text = typeof content === 'string'
@@ -1217,6 +1217,36 @@ export function parseToolResultImageAttachments(content: unknown): AgentToolResu
   return images
 }
 
+/** 从 Nano Banana 本地工具详情读取与当前 tool_use 精确绑定的图片附件。 */
+function parseNanoBananaResultAttachments(details: unknown, toolUseId: string): AgentToolResultImage[] {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return []
+  const value = details as Record<string, unknown>
+  if (
+    value.source !== 'proma-nano-banana'
+    || value.toolUseId !== toolUseId
+    || !Array.isArray(value.imageAttachments)
+  ) return []
+
+  const images: AgentToolResultImage[] = []
+  for (const candidate of value.imageAttachments) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+    const image = candidate as Record<string, unknown>
+    if (
+      typeof image.localPath === 'string'
+      && typeof image.filename === 'string'
+      && typeof image.mediaType === 'string'
+      && image.mediaType.startsWith('image/')
+    ) {
+      images.push({
+        localPath: image.localPath,
+        filename: image.filename,
+        mediaType: image.mediaType,
+      })
+    }
+  }
+  return images
+}
+
 /** 仅把同批序列中已由 Nano Banana tool_use 证明的结果标记提升为附件。 */
 function attachToolResultImages(messages: SDKMessage[]): SDKMessage[] {
   /** 只记录已经出现在当前结果之前的工具调用，拒绝跨批或逆序伪造关联。 */
@@ -1236,7 +1266,8 @@ function attachToolResultImages(messages: SDKMessage[]): SDKMessage[] {
     }
     if (message.type !== 'user') return message
     /** SDK user content 之外的消息结构保持原引用，减少正常消息落盘开销。 */
-    const content = (message as SDKUserMessage).message?.content
+    const userMessage = message as SDKUserMessage
+    const content = userMessage.message?.content
     if (!Array.isArray(content)) return message
     let changed = false
     const nextContent = content.map((block) => {
@@ -1245,7 +1276,7 @@ function attachToolResultImages(messages: SDKMessage[]): SDKMessage[] {
       /** 非 Nano 结果即使自带字段或文本标记，也不能成为本地文件授权证据。 */
       const verifiedNanoTool = toolNames.get(result.tool_use_id) === 'mcp__nano_banana__generate_image'
       const imageAttachments = verifiedNanoTool
-        ? parseToolResultImageAttachments(result.content)
+        ? parseNanoBananaResultAttachments(userMessage.tool_use_result, result.tool_use_id)
         : []
       if (imageAttachments.length > 0) {
         changed = true
