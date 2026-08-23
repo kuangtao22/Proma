@@ -39,6 +39,7 @@
 - 客户端必须先完成 `protocol.hello` 协商，业务层只信任 hello 返回的版本和能力；服务端升级主版本但保留旧协议范围时，旧移动端仍可配对。
 - Bridge 启动按生命周期代次串行化；未认证连接从建立起严格 15 秒截止、单 IP 最多 3 个、入站消息最多 64 KiB，超限连接立即释放；外部会话 ID 在 Handler、Adapter 和配置路径三层校验。
 - 手机端视觉与桌面端共享语义设计语言，但主题映射保留在 `apps/mobile` 内；默认通过 `prefers-color-scheme` 跟随系统明暗，不导入桌面 Renderer CSS，也不扩展 LAN 协议或持久化字段。
+- 手机端 Agent 会话运行态由主进程四态快照与全局 LAN 推送共同驱动；实时事件必须同时更新会话列表和当前会话，重连时以列表快照恢复，星标只采用服务端确认值。
 - fork 的标签发布工作流覆盖 macOS arm64/x64、Windows x64 与 Linux x64；Linux 同时提供 AppImage 和 deb，并与其他平台产物汇总到同一个 GitHub Release。
 - Linux deb 打包依赖 `apps/electron/package.json` 的 `homepage` 元数据；发布合同测试必须覆盖该字段，避免 AppImage 成功但 deb 在 FPM 阶段失败。
 - Electron workspace 使用带 scope 的包名，Linux 必须显式配置不含 `/` 的 `artifactName`，否则 deb 默认输出路径会被拆成不存在的子目录。
@@ -90,3 +91,4 @@
 - 2026-08-22：评估 `Xiangyu-CAS/codex-canvas` 后确认可将无限画布、JSON 状态模型和图片处理能力移植到 Proma；正式集成必须改用 React/Jotai、Proma 四层 IPC、`safe-file` 与 Pi Agent runtime，禁止原样引入其 Codex CLI/app-server、独立 MCP/HTTP 服务及 `~/.codex/generated_images` 扫描链路。
 - 2026-08-22：用户确认 Proma「设计」采用方案 A：每个项目一个原生画布，通过顶部 `设计 · 项目名` 标签在会话与画布间切换，左侧继续只承载项目/会话；正式素材随项目保存到 `.proma/design/`，缓存放 `~/.proma/design-cache/`，首版聚焦画布、批注、Pi 图片任务、版本关系和会话传递。
 - 2026-08-22：项目级设计工作区实施计划确定使用 `@xyflow/react@12.11.3`、revision mutation、目录级 `proma-file` 媒体授权和可见 Pi Agent Design Job；Design Job 仅允许 Nano Banana 图片工具，实施按 12 个 TDD 任务推进。
+- 2026-08-23：完成手机端 Agent 会话四态、星标与相对时间展示；抽屉和顶部下拉统一为“色块、标题、星标、时间”四列，Automation、Bridge 与协作入口启动的会话均通过主进程事件实时同步，重连后从权威快照恢复。
