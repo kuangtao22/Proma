@@ -132,6 +132,15 @@ export function DesignWorkspaceStateView({
             {state.snapshot.readOnlyReason ?? '设计工作区当前为只读'}
           </p>
         )}
+        {state.jobLoadState === 'failed' && (
+          <div className="flex items-center gap-2 rounded border border-destructive/40 bg-background/95 px-2 py-1">
+            <p className="text-xs text-destructive">{state.jobError ?? '设计任务同步失败'}</p>
+            <Button type="button" variant="outline" size="sm" onClick={onRetry}>
+              <RefreshCw className="size-3.5" aria-hidden="true" />
+              重试同步
+            </Button>
+          </div>
+        )}
         {state.authoritativeRecoveryState !== 'idle' && (
           <div className="flex items-center gap-2 rounded border border-destructive/40 bg-background/95 px-2 py-1">
             <p className="text-xs text-destructive">{state.error ?? '设计工作区恢复失败'}</p>

@@ -33,8 +33,17 @@ export interface DesignPathResolverDependencies {
   getConfigDir: () => string
 }
 
-/** 可安全用作单级缓存目录名的项目 ID 规则。 */
-const SAFE_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]+$/
+/** 可安全用作单级文件或目录名的 Design 稳定 ID 规则。 */
+const SAFE_DESIGN_STABLE_ID_PATTERN = /^[A-Za-z0-9_-]+$/
+
+/**
+ * 判断未知值是否为可安全用作单级路径片段的 Design 稳定 ID。
+ * @param value 待校验的项目、任务或实体 ID。
+ * @returns 仅非空 ASCII 字母数字、下划线和连字符组成时返回 true。
+ */
+export function isSafeDesignStableId(value: unknown): value is string {
+  return typeof value === 'string' && SAFE_DESIGN_STABLE_ID_PATTERN.test(value)
+}
 
 /**
  * 创建仅依赖可信工作区索引的 Design 路径解析器。
@@ -46,7 +55,7 @@ export function createDesignPathResolver(
 ): DesignPathResolver {
   return {
     resolve(projectId: string): DesignPaths {
-      if (!SAFE_PROJECT_ID_PATTERN.test(projectId)) {
+      if (!isSafeDesignStableId(projectId)) {
         throw new Error(`项目 ID 非法: ${projectId}`)
       }
       /** 只有已登记工作区才拥有正式项目根。 */

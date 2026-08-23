@@ -1083,6 +1083,7 @@ export function registerIpcHandlers(): void {
     stopAgent,
     resolveOwnedOutputPath: resolveOwnedDesignJobOutputPath,
     listProjectIds: () => listAgentWorkspaces().map((workspace) => workspace.id),
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
   })
   setDefaultDesignJobManager(designJobManager)
   registerDesignIpcHandlers({

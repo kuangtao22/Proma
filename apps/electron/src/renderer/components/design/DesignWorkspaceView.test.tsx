@@ -90,6 +90,27 @@ describe('Design 工作区页面状态', () => {
     expect(html).toContain('重试保存')
   })
 
+  test('Given 设计任务同步失败 When 渲染 Then 保留画布并显示独立重试入口', () => {
+    const html = renderToStaticMarkup(
+      <DesignWorkspaceStateView
+        state={{
+          ...createInitialDesignProjectState(),
+          phase: 'ready',
+          snapshot: createSnapshot(),
+          jobLoadState: 'failed',
+          jobError: '加载设计任务失败：journal 暂时不可读',
+        }}
+        onRetry={() => undefined}
+        onRetrySave={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('加载设计任务失败：journal 暂时不可读')
+    expect(html).toContain('重试同步')
+    expect(html).toContain('data-design-canvas-slot')
+    expect(html).not.toContain('保存失败')
+  })
+
   test('Given 权威恢复加载中或失败 When 渲染 Then 显示独立恢复状态且失败可重试', () => {
     const loadingHtml = renderToStaticMarkup(
       <DesignWorkspaceStateView

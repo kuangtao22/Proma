@@ -240,6 +240,93 @@ describe('Design 工作区同步规则', () => {
     expect(harness.getState().jobs).toEqual([job])
   })
 
+  test('Given 任务列表加载失败 When 用户重试 Then 保留现有任务并恢复任务同步状态', async () => {
+    const existingJob: DesignJobRecord = {
+      id: 'job-existing', projectId: 'project-1', action: 'generate', status: 'running',
+      prompt: '现有任务', createdAt: 1, updatedAt: 1,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot: { document: createEmptyDesignDocument('project-1', 10), writable: true },
+      jobs: [existingJob],
+    })
+    harness.controller.start()
+
+    harness.jobRequests[0]!.reject(new Error('journal 暂时不可读'))
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      jobs: [existingJob],
+      jobLoadState: 'failed',
+      jobError: '加载设计任务失败：journal 暂时不可读',
+    })
+
+    harness.controller.retryLoad()
+    expect(harness.jobRequests).toHaveLength(2)
+    harness.jobRequests[1]!.resolve([])
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({ jobs: [], jobLoadState: 'idle', jobError: null })
+  })
+
+  test('Given 任务结构加载要求磁盘恢复 When 事件到达 Then 立即进入权威恢复并保留本地 pending', async () => {
+    const pendingMutation: DesignMutation = {
+      type: 'set-viewport', viewport: { x: 4, y: 5, zoom: 1.1 },
+    }
+    const snapshot: DesignWorkspaceSnapshot = {
+      document: createEmptyDesignDocument('project-1', 10), writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(), phase: 'ready', snapshot,
+      saveState: 'dirty', pendingMutations: [pendingMutation],
+    })
+    harness.controller.start()
+
+    harness.emitChange({ projectId: 'project-1', revision: 1, cause: 'job' })
+    harness.jobRequests[1]!.resolve([])
+    harness.loadRequests[1]!.reject(new Error('DESIGN_RECOVERY_REQUIRED: tmp 已恢复'))
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      authoritativeRecoveryState: 'loading',
+      saveState: 'failed',
+      pendingMutations: [pendingMutation],
+    })
+    expect(harness.loadRequests).toHaveLength(3)
+  })
+
+  test('Given 任务结构普通加载失败 When 用户重试 Then 保留画布与 pending 并重新加载目标 revision', async () => {
+    const pendingMutation: DesignMutation = {
+      type: 'set-viewport', viewport: { x: 7, y: 8, zoom: 1.2 },
+    }
+    const snapshot: DesignWorkspaceSnapshot = {
+      document: createEmptyDesignDocument('project-1', 10), writable: true,
+    }
+    const harness = createControllerHarness({
+      ...createInitialDesignProjectState(), phase: 'ready', snapshot,
+      saveState: 'dirty', pendingMutations: [pendingMutation],
+    })
+    harness.controller.start()
+
+    harness.emitChange({ projectId: 'project-1', revision: 1, cause: 'job' })
+    harness.jobRequests[1]!.resolve([])
+    harness.loadRequests[1]!.reject(new Error('画布暂时不可读'))
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      snapshot,
+      pendingMutations: [pendingMutation],
+      saveState: 'dirty',
+      jobLoadState: 'failed',
+      jobError: '同步设计任务结构失败：画布暂时不可读',
+    })
+
+    harness.controller.retryLoad()
+    expect(harness.jobRequests).toHaveLength(3)
+    expect(harness.loadRequests).toHaveLength(3)
+  })
+
   test('Given 画布有未保存编辑 When 同 revision job 事件到达 Then 只刷新任务且不替换画布快照', async () => {
     const snapshot: DesignWorkspaceSnapshot = {
       document: createEmptyDesignDocument('project-1', 10),

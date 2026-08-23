@@ -17,6 +17,7 @@ import type { DesignAssetImportBatch, DesignAssetImportSource } from './design-a
 import { DesignJobManager } from './design-job-manager'
 import { applyDesignMutations } from './design-store'
 import type { DesignStore } from './design-store'
+import { createWorkspaceOperationRegistry } from '../workspace-operation-lock'
 
 const NANO_BANANA_TOOL = 'mcp__nano_banana__generate_image'
 
@@ -143,6 +144,47 @@ describe('Design Job Manager', () => {
     expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: job.id })
   })
 
+  test('Given ID 生成器返回路径片段 When 创建任务 Then 在 journal 或 Store 副作用前拒绝', () => {
+    harness.createId = () => '../escape'
+
+    expect(() => harness.manager.create(createGenerateInput())).toThrow('设计任务 ID 非法')
+
+    expect(existsSync(join(cacheRoot, 'escape.json'))).toBe(false)
+    expect(existsSync(join(cacheRoot, 'jobs'))).toBe(false)
+    expect(document.nodes).toEqual([])
+  })
+
+  test('Given journal 含越界 ID、错名 payload 和损坏 schema When 恢复 Then 全部忽略且无文件或 Store 副作用', () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    /** 越界删除目标哨兵，恶意 pending journal 不得触碰。 */
+    const sentinelPath = join(cacheRoot, 'victim.json')
+    writeFileSync(sentinelPath, 'sentinel', 'utf8')
+    writeFileSync(join(jobsDirectory, 'evil.json'), JSON.stringify({
+      id: '../victim', projectId: 'project-1', action: 'generate', status: 'queued',
+      prompt: '恶意任务', nodeId: 'node-evil', position: { x: 0, y: 0 },
+      placementState: 'pending', createdAt: 1, updatedAt: 1,
+    }))
+    writeFileSync(join(jobsDirectory, 'wrong-name.json'), JSON.stringify({
+      id: 'job-other', projectId: 'project-1', action: 'generate', status: 'running',
+      prompt: '错名任务', nodeId: 'node-other', position: { x: 0, y: 0 },
+      sessionId: 'session-other', createdAt: 1, updatedAt: 1,
+    }))
+    writeFileSync(join(jobsDirectory, 'broken.json'), JSON.stringify({
+      id: 'broken', projectId: 'project-1', action: 'generate', status: 'running',
+      prompt: '损坏任务', nodeId: 'node-broken', position: 'not-a-point',
+      sessionId: 'session-broken', createdAt: 1, updatedAt: 1, unexpected: true,
+    }))
+
+    const recovered = harness.manager.recover('project-1')
+
+    expect(recovered).toEqual([])
+    expect(readFileSync(sentinelPath, 'utf8')).toBe('sentinel')
+    expect(existsSync(join(jobsDirectory, 'job-other.json'))).toBe(false)
+    expect(document.revision).toBe(0)
+    expect(document.nodes).toEqual([])
+  })
+
   test('Given running 任务取消后 Pi 迟到成功 When 完成回调到达 Then 保持 cancelled 且不导入', async () => {
     let completeRun: (() => void) | undefined
     harness.runHeadless = async (callbacks) => new Promise<void>((resolve) => {
@@ -163,6 +205,65 @@ describe('Design Job Manager', () => {
     expect(harness.stoppedSessions).toEqual(['session-1'])
     expect(harness.importSources).toEqual([])
     expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: job.id })
+  })
+
+  test('Given output 正在提交 When 迁移尝试插入 Then import、复核、Store 与 batch 全程持有 workspace write lease', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    harness.attemptRelocationDuringImport = true
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.relocationAttemptError).toContain('Design 写入正在进行')
+    expect(harness.unguardedOutputEffects).toEqual([])
+    expect(harness.outputEffects).toEqual(['import', 'authoritative-read', 'store-mutate', 'commit'])
+  })
+
+  test('Given Store 终态已应用但 durability 与权威重读连续失败 When 任务完成 Then 保留 pending 证据且恢复后对账 succeeded', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    harness.outputMutateAfterApplyError = new Error('canvas directory fsync failed')
+    harness.outputReloadError = new Error('canvas reload failed')
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'running',
+      terminalState: { status: 'pending', outputAssetId: 'asset-output' },
+    })
+    expect(harness.batchCommits).toBe(0)
+    expect(harness.batchRollbacks).toBe(0)
+    expect(JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${job.id}.json`), 'utf8'))).toMatchObject({
+      status: 'running',
+      terminalState: { status: 'pending', outputAssetId: 'asset-output' },
+    })
+
+    harness.outputReloadError = undefined
+    const recovered = harness.manager.recover('project-1')
+
+    expect(recovered.find((candidate) => candidate.id === job.id)).toMatchObject({
+      status: 'succeeded',
+      outputAssetId: 'asset-output',
+    })
+  })
+
+  test('Given pending terminal journal 在 Store 中没有对应素材和节点 When 恢复 Then 对账为 failed 而非 interrupted', () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    document.nodes = [{
+      id: 'node-pending', kind: 'job', jobId: 'job-pending', position: { x: 0, y: 0 },
+      width: 320, height: 240, zIndex: 0,
+    }]
+    writeFileSync(join(jobsDirectory, 'job-pending.json'), JSON.stringify({
+      id: 'job-pending', projectId: 'project-1', action: 'generate', status: 'running',
+      prompt: '待对账任务', nodeId: 'node-pending', position: { x: 0, y: 0 },
+      placementState: 'ready', terminalState: { status: 'pending', outputAssetId: 'asset-missing' },
+      sessionId: 'session-pending', createdAt: 1, updatedAt: 1,
+    }))
+
+    const recovered = harness.manager.recover('project-1')
+
+    expect(recovered[0]).toMatchObject({ status: 'failed', error: '设计任务终态提交未完成' })
   })
 
   test('Given 失败任务 When 重试 Then 保留旧 journal 并用新任务和新会话接管原节点', async () => {
@@ -186,6 +287,39 @@ describe('Design Job Manager', () => {
     ))).toBe(true)
   })
 
+  test('Given 同一失败任务被重复重试 When 请求到达 Then 幂等返回唯一 replacement 且只运行一个会话', async () => {
+    harness.messages = []
+    const original = harness.manager.create(createGenerateInput())
+    await harness.manager.run(original.id)
+
+    const first = harness.manager.retry('project-1', original.id)
+    const second = harness.manager.retry('project-1', original.id)
+    await Promise.all([harness.manager.run(first.id), harness.manager.run(second.id)])
+
+    expect(second.id).toBe(first.id)
+    expect(harness.manager.list('project-1')).toHaveLength(2)
+    expect(harness.createdSessions).toHaveLength(2)
+    expect(JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${original.id}.json`), 'utf8'))).toMatchObject({
+      replacedByJobId: first.id,
+    })
+  })
+
+  test('Given Store 节点已不再绑定旧任务 When 重试 Then 拒绝创建新 journal 或会话', async () => {
+    harness.messages = []
+    const original = harness.manager.create(createGenerateInput())
+    await harness.manager.run(original.id)
+    document.nodes = document.nodes.map((node) => (
+      node.id === `design-job-${original.id}` && node.kind === 'job'
+        ? { ...node, jobId: 'job-other' }
+        : node
+    ))
+
+    expect(() => harness.manager.retry('project-1', original.id)).toThrow('设计任务节点已被其他任务接管')
+
+    expect(harness.manager.list('project-1')).toHaveLength(1)
+    expect(harness.createdSessions).toHaveLength(1)
+  })
+
   test('Given 其它任务伪造相同工具图片 When 收集输出 Then 拒绝非当前 session 归属路径', async () => {
     harness.messages = [createToolMessage('other-session/output.png')]
     const job = harness.manager.create(createGenerateInput())
@@ -202,6 +336,10 @@ describe('Design Job Manager', () => {
   test('Given 上次进程留下 running job When 恢复 Then 标记 interrupted 且允许重试', () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
+    document.nodes = [{
+      id: 'node-old', kind: 'job', jobId: 'job-running', position: { x: 0, y: 0 },
+      width: 320, height: 240, zIndex: 0,
+    }]
     writeFileSync(join(jobsDirectory, 'job-running.json'), JSON.stringify({
       id: 'job-running', projectId: 'project-1', sessionId: 'session-old',
       action: 'generate', status: 'running', prompt: '旧任务', nodeId: 'node-old',
@@ -259,24 +397,57 @@ describe('Design Job Manager', () => {
       importError?: Error
       mutateError?: Error
       mutateAfterApplyError?: Error
+      createId: () => string
+      outputMutateAfterApplyError?: Error
+      outputReloadError?: Error
+      outputPhase: boolean
+      outputMutationAttempted: boolean
+      attemptRelocationDuringImport: boolean
+      relocationAttemptError?: string
     } = {
       settings: { agentChannelId: 'channel-default', agentModelId: 'model-default' },
       messages: [] as AgentMessage[],
       runHeadless: undefined,
+      createId: () => `job-${identity}`,
+      outputPhase: false,
+      outputMutationAttempted: false,
+      attemptRelocationDuringImport: false,
     }
     const createdSessions: AgentSessionMeta[] = []
     const sessionUpdates: Array<{ sessionId: string; updates: Record<string, unknown> }> = []
     const stoppedSessions: string[] = []
     const importSources: DesignAssetImportSource[] = []
     const runInputs: Array<Record<string, unknown>> = []
+    /** 真实 lease registry 用于验证迁移无法插入 output 提交窗口。 */
+    const workspaceRegistry = createWorkspaceOperationRegistry()
+    let workspaceWriteDepth = 0
+    const outputEffects: string[] = []
+    const unguardedOutputEffects: string[] = []
+    let batchCommits = 0
+    let batchRollbacks = 0
+    /** 记录 output 阶段副作用并验证 Manager 外层 lease。 */
+    const recordOutputEffect = (effect: string): void => {
+      outputEffects.push(effect)
+      if (workspaceWriteDepth === 0) unguardedOutputEffects.push(effect)
+    }
     const store: DesignStore = {
       load: () => ({ document, writable: true }),
-      requireStableAuthoritativeDocument: () => document,
+      requireStableAuthoritativeDocument: () => {
+        if (state.outputPhase) recordOutputEffect('authoritative-read')
+        if (state.outputMutationAttempted && state.outputReloadError) throw state.outputReloadError
+        return document
+      },
       mutate: (_projectId, _expectedRevision, mutations) => {
+        const isOutputMutation = mutations.some((mutation) => mutation.type === 'upsert-assets')
+        if (isOutputMutation) recordOutputEffect('store-mutate')
         if (state.mutateError) throw state.mutateError
         document = {
           ...applyDesignMutations(document, mutations),
           revision: document.revision + 1,
+        }
+        if (isOutputMutation) {
+          state.outputMutationAttempted = true
+          if (state.outputMutateAfterApplyError) throw state.outputMutateAfterApplyError
         }
         if (state.mutateAfterApplyError) throw state.mutateAfterApplyError
         return document
@@ -288,11 +459,21 @@ describe('Design Job Manager', () => {
       assetService: {
         resolveAssetPath: () => '/trusted/source.png',
         importAuthorizedFiles: async (_projectId, _paths, source) => {
+          state.outputPhase = true
+          recordOutputEffect('import')
+          if (state.attemptRelocationDuringImport) {
+            try {
+              const release = workspaceRegistry.acquireWorkspaceOperation('project-1', 'relocation')
+              release()
+            } catch (error) {
+              state.relocationAttemptError = error instanceof Error ? error.message : String(error)
+            }
+          }
           if (state.importError) throw state.importError
           importSources.push(source)
           const batch = [createAsset('asset-output', source)] as DesignAssetImportBatch
-          batch.commit = () => undefined
-          batch.rollback = () => undefined
+          batch.commit = () => { recordOutputEffect('commit'); batchCommits += 1 }
+          batch.rollback = () => { recordOutputEffect('rollback'); batchRollbacks += 1 }
           return batch
         },
       },
@@ -330,7 +511,30 @@ describe('Design Job Manager', () => {
         localPath.startsWith(`${sessionId}/`) ? `/trusted/${localPath}` : undefined
       ),
       listProjectIds: () => ['project-1'],
-      createId: () => `job-${++identity}`,
+      runWorkspaceWrite: <T>(projectId: string, effect: () => T): T => {
+        const release = workspaceRegistry.acquireWorkspaceWriteLease(projectId)
+        workspaceWriteDepth += 1
+        try {
+          const result = effect()
+          if (result instanceof Promise) {
+            return result.finally(() => {
+              workspaceWriteDepth -= 1
+              release()
+            }) as T
+          }
+          workspaceWriteDepth -= 1
+          release()
+          return result
+        } catch (error) {
+          workspaceWriteDepth -= 1
+          release()
+          throw error
+        }
+      },
+      createId: () => {
+        identity += 1
+        return state.createId()
+      },
       now: () => 10 + identity,
     })
     /** Manager 对外事件必须携带 Store 权威 revision。 */
@@ -344,6 +548,11 @@ describe('Design Job Manager', () => {
       importSources,
       runInputs,
       changedEvents,
+      outputEffects,
+      unguardedOutputEffects,
+      get batchCommits() { return batchCommits },
+      get batchRollbacks() { return batchRollbacks },
+      get relocationAttemptError() { return state.relocationAttemptError },
       get settings() { return state.settings },
       set settings(value: typeof state.settings) { state.settings = value },
       get messages() { return state.messages },
@@ -354,6 +563,10 @@ describe('Design Job Manager', () => {
       set importError(value: Error | undefined) { state.importError = value },
       set mutateError(value: Error | undefined) { state.mutateError = value },
       set mutateAfterApplyError(value: Error | undefined) { state.mutateAfterApplyError = value },
+      set createId(value: () => string) { state.createId = value },
+      set outputMutateAfterApplyError(value: Error | undefined) { state.outputMutateAfterApplyError = value },
+      set outputReloadError(value: Error | undefined) { state.outputReloadError = value },
+      set attemptRelocationDuringImport(value: boolean) { state.attemptRelocationDuringImport = value },
     }
   }
 })

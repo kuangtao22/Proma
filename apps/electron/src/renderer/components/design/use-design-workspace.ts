@@ -325,6 +325,8 @@ export function createDesignWorkspaceController(
   let conflictRecoveryInFlight = false
   /** 当前 controller 是否已有强制权威恢复 load 在途，避免重复请求。 */
   let authoritativeRecoveryInFlight = false
+  /** 普通任务结构同步失败后保留的目标 revision，供用户精确重试。 */
+  let pendingJobStructureRevision: number | undefined
 
   /**
    * 刷新任务 journal；事件 revision 前进时同步接管任务产生的权威画布结构。
@@ -333,6 +335,7 @@ export function createDesignWorkspaceController(
    */
   const refreshJobs = async (authoritativeRevision?: number): Promise<void> => {
     if (disposed) return
+    dependencies.updateState({ jobLoadState: 'loading', jobError: null })
     /** 任务刷新仅保留最后一次请求结果。 */
     const requestSequence = latestJobLoadSequence + 1
     latestJobLoadSequence = requestSequence
@@ -344,20 +347,47 @@ export function createDesignWorkspaceController(
     const structureLoadSequence = shouldLoadStructure ? latestLoadSequence + 1 : undefined
     if (structureLoadSequence !== undefined) latestLoadSequence = structureLoadSequence
     /** journal 与结构读取互不依赖，并行完成以缩短任务变化可见延迟。 */
-    const [jobs, snapshot] = await Promise.all([
-      dependencies.adapter.listJobs(dependencies.projectId).catch(() => undefined),
+    const [jobsResult, snapshotResult] = await Promise.allSettled([
+      dependencies.adapter.listJobs(dependencies.projectId),
       shouldLoadStructure
-        ? dependencies.adapter.load(dependencies.projectId).catch(() => undefined)
+        ? dependencies.adapter.load(dependencies.projectId)
         : Promise.resolve(undefined),
     ])
     if (disposed || requestSequence !== latestJobLoadSequence) return
+    const jobs = jobsResult.status === 'fulfilled' ? jobsResult.value : undefined
+    const snapshot = snapshotResult.status === 'fulfilled' ? snapshotResult.value : undefined
+    if (snapshotResult.status === 'rejected' && isDesignRecoveryRequired(snapshotResult.reason)) {
+      pendingJobStructureRevision = undefined
+      dependencies.updateState(jobs
+        ? { jobs, jobLoadState: 'idle', jobError: null }
+        : {
+            jobLoadState: 'failed',
+            jobError: `加载设计任务失败：${getDesignErrorMessage(jobsResult.status === 'rejected' ? jobsResult.reason : undefined)}`,
+          })
+      startAuthoritativeRecovery()
+      return
+    }
     dependencies.updateState((latest) => {
-      /** journal 短暂不可读时保留现有任务。 */
-      const update: Partial<DesignProjectState> = jobs ? { jobs } : {}
+      /** journal 读取失败时保留现有任务并显示独立重试状态。 */
+      const update: Partial<DesignProjectState> = jobs
+        ? { jobs, jobLoadState: 'idle', jobError: null }
+        : {
+            jobLoadState: 'failed',
+            jobError: `加载设计任务失败：${getDesignErrorMessage(jobsResult.status === 'rejected' ? jobsResult.reason : undefined)}`,
+          }
+      if (snapshotResult.status === 'rejected') {
+        pendingJobStructureRevision = authoritativeRevision
+        return {
+          ...update,
+          jobLoadState: 'failed',
+          jobError: `同步设计任务结构失败：${getDesignErrorMessage(snapshotResult.reason)}`,
+        }
+      }
       if (!snapshot
         || structureLoadSequence !== latestLoadSequence
         || authoritativeRevision === undefined
         || snapshot.document.revision < authoritativeRevision) return update
+      pendingJobStructureRevision = undefined
       /** 权威任务节点作为新基线，本地尚未保存的 mutation 必须完整重放。 */
       const rebasedDocument = mergeSavedDesignDocument(snapshot.document, latest.pendingMutations)
       return {
@@ -631,6 +661,10 @@ export function createDesignWorkspaceController(
       if (latest.conflictRecoveryPending || conflictRecoveryInFlight) {
         void loadSnapshot(true)
         return
+      }
+      if (latest.jobLoadState === 'failed') {
+        void refreshJobs(pendingJobStructureRevision)
+        if (latest.snapshot) return
       }
       dependencies.updateState({
         phase: latest.snapshot ? 'ready' : 'loading',

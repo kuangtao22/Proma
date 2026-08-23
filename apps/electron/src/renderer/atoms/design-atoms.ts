@@ -24,6 +24,10 @@ export interface DesignProjectState {
   phase: 'idle' | 'loading' | 'ready' | 'error'
   snapshot: DesignWorkspaceSnapshot | null
   jobs: DesignJobRecord[]
+  /** 任务 journal 与任务结构的最近同步状态。 */
+  jobLoadState: 'idle' | 'loading' | 'failed'
+  /** 任务同步失败的独立用户提示，不与画布保存错误混用。 */
+  jobError: string | null
   selectedNodeIds: string[]
   /** 右栏直接选中的素材；允许无画布节点素材进入详情与删除流程。 */
   inspectorAssetId: string | null
@@ -53,6 +57,8 @@ export function createInitialDesignProjectState(): DesignProjectState {
     phase: 'idle',
     snapshot: null,
     jobs: [],
+    jobLoadState: 'idle',
+    jobError: null,
     selectedNodeIds: [],
     inspectorAssetId: null,
     activeTool: 'select',

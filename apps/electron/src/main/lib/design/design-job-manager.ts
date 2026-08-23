@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
-import { isAbsolute, join, relative } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import type {
   AgentMessage,
   AgentSendInput,
   AgentSessionMeta,
   CreateDesignJobInput,
+  DesignCanvasDocument,
   DesignCanvasNode,
   DesignJobRecord,
   DesignPoint,
@@ -14,6 +15,7 @@ import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
 import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-paths'
 import type { AgentRunExtensions } from '../agent-service'
 import type { DesignAssetImportSource, DesignAssetService } from './design-asset-service'
+import { isSafeDesignStableId } from './design-paths'
 import type { DesignStore } from './design-store'
 
 const DESIGN_IMAGE_TOOL = 'mcp__nano_banana__generate_image'
@@ -33,7 +35,23 @@ interface StoredDesignJob extends DesignJobRecord {
   maskAnnotationId?: string
   /** queued journal 与占位节点两步提交的恢复标记。 */
   placementState?: 'pending' | 'ready'
+  /** Store 终态提交结果不确定时保留的跨进程对账证据。 */
+  terminalState?: { status: 'pending'; outputAssetId: string }
+  /** retry 已创建的唯一替代任务，用于重复请求幂等返回。 */
+  replacedByJobId?: string
 }
+
+/** journal 允许出现的完整字段集合，未知字段一律拒绝。 */
+const STORED_JOB_FIELDS = new Set([
+  'id', 'projectId', 'sessionId', 'action', 'status', 'prompt', 'sourceSessionId',
+  'sourceAssetId', 'parentAssetId', 'outputAssetId', 'error', 'createdAt', 'updatedAt',
+  'nodeId', 'position', 'maskAnnotationId', 'placementState', 'terminalState',
+  'replacedByJobId',
+])
+/** journal 中必须始终存在的基础字段。 */
+const REQUIRED_STORED_JOB_FIELDS = [
+  'id', 'projectId', 'action', 'status', 'prompt', 'createdAt', 'updatedAt', 'nodeId', 'position',
+] as const
 
 /** Headless Agent 回调的窄接口。 */
 interface DesignHeadlessCallbacks {
@@ -69,6 +87,8 @@ export interface DesignJobManagerDependencies {
   /** 验证附件属于当前会话并返回可供素材服务读取的绝对路径。 */
   resolveOwnedOutputPath: (sessionId: string, localPath: string) => string | undefined
   listProjectIds: () => string[]
+  /** 在项目迁移互斥边界内执行完整设计任务写入。 */
+  runWorkspaceWrite: <T>(projectId: string, effect: () => T) => T
   createId?: () => string
   now?: () => number
 }
@@ -225,19 +245,31 @@ export class DesignJobManager {
 
   /** 为失败、取消或中断任务创建新 journal，并让原占位节点指向新任务。 */
   retry(projectId: string, jobId: string): DesignJobRecord {
-    const previous = this.requireProjectJob(projectId, jobId)
-    if (!['failed', 'cancelled', 'interrupted'].includes(previous.status)) {
-      throw new Error('当前设计任务不可重试')
-    }
-    return this.createInternal({
-      projectId,
-      action: previous.action,
-      prompt: previous.prompt,
-      ...(previous.sourceSessionId ? { sourceSessionId: previous.sourceSessionId } : {}),
-      ...(previous.sourceAssetId ? { sourceAssetId: previous.sourceAssetId } : {}),
-      ...(previous.maskAnnotationId ? { maskAnnotationId: previous.maskAnnotationId } : {}),
-      position: previous.position,
-    }, previous)
+    return this.dependencies.runWorkspaceWrite(projectId, () => {
+      const previous = this.requireProjectJob(projectId, jobId)
+      if (previous.replacedByJobId) {
+        return this.requireProjectJob(projectId, previous.replacedByJobId)
+      }
+      if (!['failed', 'cancelled', 'interrupted'].includes(previous.status)) {
+        throw new Error('当前设计任务不可重试')
+      }
+      const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
+      const ownsNode = current.nodes.some((node) => (
+        node.id === previous.nodeId && node.kind === 'job' && node.jobId === previous.id
+      ))
+      if (!ownsNode) throw new Error('设计任务节点已被其他任务接管')
+      const replacement = this.createInternal({
+        projectId,
+        action: previous.action,
+        prompt: previous.prompt,
+        ...(previous.sourceSessionId ? { sourceSessionId: previous.sourceSessionId } : {}),
+        ...(previous.sourceAssetId ? { sourceAssetId: previous.sourceAssetId } : {}),
+        ...(previous.maskAnnotationId ? { maskAnnotationId: previous.maskAnnotationId } : {}),
+        position: previous.position,
+      }, previous)
+      this.writeJob({ ...previous, replacedByJobId: replacement.id, updatedAt: this.now() })
+      return replacement
+    })
   }
 
   /** 恢复单项目 journal，把无法续跑的 running 任务标记为 interrupted。 */
@@ -256,6 +288,28 @@ export class DesignJobManager {
         }
         job = { ...job, placementState: 'ready' }
         this.writeJob(job)
+      }
+      if (job.terminalState?.status === 'pending') {
+        try {
+          const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
+          const outputAssetId = job.terminalState.outputAssetId
+          if (this.isTerminalCommitPresent(document, job, outputAssetId)) {
+            this.updateStatus(job, 'succeeded', {
+              terminalState: undefined,
+              outputAssetId,
+              parentAssetId: job.sourceAssetId,
+              error: undefined,
+            }, document.revision)
+          } else {
+            this.updateStatus(job, 'failed', {
+              terminalState: undefined,
+              error: '设计任务终态提交未完成',
+            }, document.revision)
+          }
+        } catch {
+          /** 权威 Store 暂不可读时保留 pending，等待下次恢复继续对账。 */
+        }
+        continue
       }
       if (job.status === 'queued' || job.status === 'running') {
         this.updateStatus(job, 'interrupted', {
@@ -294,6 +348,7 @@ export class DesignJobManager {
       item.id === input.maskAnnotationId && item.kind === 'mask'
     ))) throw new Error(`蒙版批注不存在: ${input.maskAnnotationId}`)
     const id = this.createId()
+    if (!isSafeDesignStableId(id)) throw new Error('设计任务 ID 非法')
     const now = this.now()
     const job: StoredDesignJob = {
       id,
@@ -401,15 +456,15 @@ export class DesignJobManager {
 
   /** 导入已验证归属图片，并在同一 Store mutation 中替换占位节点。 */
   private async commitOutput(job: StoredDesignJob, sessionId: string, outputPath: string): Promise<void> {
-    const source: DesignAssetImportSource = {
-      kind: 'job',
-      sourceJobId: job.id,
-      sourceSessionId: sessionId,
-      ...(job.sourceAssetId ? { parentAssetId: job.sourceAssetId } : {}),
-      prompt: job.prompt,
-    }
-    const batch = await this.dependencies.assetService.importAuthorizedFiles(job.projectId, [outputPath], source)
-    try {
+    await this.dependencies.runWorkspaceWrite(job.projectId, async () => {
+      const source: DesignAssetImportSource = {
+        kind: 'job',
+        sourceJobId: job.id,
+        sourceSessionId: sessionId,
+        ...(job.sourceAssetId ? { parentAssetId: job.sourceAssetId } : {}),
+        prompt: job.prompt,
+      }
+      const batch = await this.dependencies.assetService.importAuthorizedFiles(job.projectId, [outputPath], source)
       const latest = this.requireJob(job.id)
       if (latest.status === 'cancelled' || latest.status === 'interrupted') {
         batch.rollback()
@@ -423,33 +478,73 @@ export class DesignJobManager {
       }
       const current = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
       const placeholder = current.nodes.find((node) => node.id === job.nodeId && node.jobId === job.id)
-      if (!placeholder) throw new Error('设计任务占位节点不存在')
+      if (!placeholder) {
+        batch.rollback()
+        this.updateStatus(latest, 'failed', { error: '设计任务占位节点不存在' })
+        return
+      }
       const assetNode: DesignCanvasNode = {
         ...placeholder,
         kind: 'asset',
         assetId: asset.id,
         jobId: undefined,
       }
-      const updatedDocument = this.dependencies.store.mutate(job.projectId, current.revision, [
-        { type: 'upsert-assets', assets: [asset] },
-        { type: 'upsert-nodes', nodes: [assetNode] },
-      ])
-      this.projectRevisions.set(job.projectId, updatedDocument.revision)
-      batch.commit()
-      this.updateStatus(latest, 'succeeded', {
-        outputAssetId: asset.id,
-        parentAssetId: job.sourceAssetId,
-        error: undefined,
-      }, updatedDocument.revision)
-    } catch (error) {
-      batch.rollback()
-      const latest = this.requireJob(job.id)
-      if (latest.status !== 'cancelled' && latest.status !== 'interrupted') {
-        this.updateStatus(latest, 'failed', {
+      const pending = this.updateStatus(latest, latest.status, {
+        terminalState: { status: 'pending', outputAssetId: asset.id },
+      }, current.revision)
+      try {
+        const updatedDocument = this.dependencies.store.mutate(job.projectId, current.revision, [
+          { type: 'upsert-assets', assets: [asset] },
+          { type: 'upsert-nodes', nodes: [assetNode] },
+        ])
+        this.projectRevisions.set(job.projectId, updatedDocument.revision)
+        batch.commit()
+        this.updateStatus(pending, 'succeeded', {
+          terminalState: undefined,
+          outputAssetId: asset.id,
+          parentAssetId: job.sourceAssetId,
+          error: undefined,
+        }, updatedDocument.revision)
+      } catch (error) {
+        let authoritative: DesignCanvasDocument
+        try {
+          authoritative = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
+        } catch {
+          /** Store 是否已提交无法确认；保留 journal 与 batch，交给恢复流程按事实对账。 */
+          return
+        }
+        if (this.isTerminalCommitPresent(authoritative, pending, asset.id)) {
+          batch.commit()
+          this.updateStatus(pending, 'succeeded', {
+            terminalState: undefined,
+            outputAssetId: asset.id,
+            parentAssetId: job.sourceAssetId,
+            error: undefined,
+          }, authoritative.revision)
+          return
+        }
+        batch.rollback()
+        this.updateStatus(pending, 'failed', {
+          terminalState: undefined,
           error: error instanceof Error ? error.message : String(error),
-        })
+        }, authoritative.revision)
       }
-    }
+    })
+  }
+
+  /** 判断 Store 是否同时持有当前任务输出素材及其替换后的画布节点。 */
+  private isTerminalCommitPresent(
+    document: DesignCanvasDocument,
+    job: StoredDesignJob,
+    outputAssetId: string,
+  ): boolean {
+    const assetExists = document.assets.some((asset) => (
+      asset.id === outputAssetId && asset.sourceJobId === job.id
+    ))
+    const nodeExists = document.nodes.some((node) => (
+      node.id === job.nodeId && node.kind === 'asset' && node.assetId === outputAssetId
+    ))
+    return assetExists && nodeExists
   }
 
   /** 写入新状态并通知订阅者。 */
@@ -476,15 +571,17 @@ export class DesignJobManager {
 
   /** 原子持久化单个任务 journal。 */
   private writeJob(job: StoredDesignJob): void {
+    if (!isStoredDesignJob(job)) throw new Error('拒绝写入无效设计任务 journal')
+    const path = this.resolveJobJournalPath(job.projectId, job.id)
     const directoryPath = this.dependencies.pathResolver.resolve(job.projectId).jobsDir
     mkdirSync(directoryPath, { recursive: true })
-    writeJsonFileAtomic(join(directoryPath, `${job.id}.json`), job, true)
+    writeJsonFileAtomic(path, job, true)
     this.jobs.set(job.id, job)
   }
 
   /** 删除未建立占位节点的 pending journal 与内存索引。 */
   private deleteJobJournal(job: StoredDesignJob): void {
-    const path = join(this.dependencies.pathResolver.resolve(job.projectId).jobsDir, `${job.id}.json`)
+    const path = this.resolveJobJournalPath(job.projectId, job.id)
     removeFileAtomic(path)
     this.jobs.delete(job.id)
   }
@@ -496,10 +593,13 @@ export class DesignJobManager {
     const jobs: StoredDesignJob[] = []
     for (const name of readdirSync(directoryPath)) {
       if (!name.endsWith('.json')) continue
+      /** 文件 basename 是 journal ID 的第一份所有权事实。 */
+      const fileJobId = name.slice(0, -'.json'.length)
+      if (!isSafeDesignStableId(fileJobId)) continue
       try {
-        const value = JSON.parse(readFileSync(join(directoryPath, name), 'utf8')) as StoredDesignJob
-        if (!value || value.projectId !== projectId || typeof value.id !== 'string'
-          || typeof value.nodeId !== 'string' || typeof value.status !== 'string') continue
+        const path = this.resolveJobJournalPath(projectId, fileJobId)
+        const value: unknown = JSON.parse(readFileSync(path, 'utf8'))
+        if (!isStoredDesignJob(value) || value.projectId !== projectId || value.id !== fileJobId) continue
         this.jobs.set(value.id, value)
         jobs.push(value)
       } catch {
@@ -511,6 +611,7 @@ export class DesignJobManager {
 
   /** 从内存或已登记项目磁盘中查找任务。 */
   private findStoredJob(jobId: string): StoredDesignJob | undefined {
+    if (!isSafeDesignStableId(jobId)) return undefined
     const cached = this.jobs.get(jobId)
     if (cached) return cached
     for (const projectId of this.dependencies.listProjectIds()) {
@@ -543,4 +644,67 @@ export class DesignJobManager {
     this.projectRevisions.set(job.projectId, authoritativeRevision)
     for (const listener of this.listeners) listener({ job, revision: authoritativeRevision })
   }
+
+  /** 解析并复核 journal 最终路径始终位于当前项目 jobsDir 单层内。 */
+  private resolveJobJournalPath(projectId: string, jobId: string): string {
+    if (!isSafeDesignStableId(jobId)) throw new Error('设计任务 ID 非法')
+    const directoryPath = this.dependencies.pathResolver.resolve(projectId).jobsDir
+    if (!isAbsolute(directoryPath) || resolve(directoryPath) !== directoryPath) {
+      throw new Error('设计任务 journal 目录无效')
+    }
+    const path = resolve(directoryPath, `${jobId}.json`)
+    const contained = relative(directoryPath, path)
+    if (!contained || contained === '..' || contained.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
+      || isAbsolute(contained)) throw new Error('设计任务 journal 路径越界')
+    return path
+  }
+}
+
+/** 判断未知值是否为有限二维坐标。 */
+function isStoredPoint(value: unknown): value is DesignPoint {
+  if (!isRecord(value)) return false
+  return Object.keys(value).length === 2
+    && typeof value.x === 'number' && Number.isFinite(value.x)
+    && typeof value.y === 'number' && Number.isFinite(value.y)
+}
+
+/** 判断可选 journal ID 字段是否缺失或为安全稳定 ID。 */
+function isOptionalStableId(value: unknown): value is string | undefined {
+  return value === undefined || isSafeDesignStableId(value)
+}
+
+/** 严格解析完整 Design Job journal schema。 */
+function isStoredDesignJob(value: unknown): value is StoredDesignJob {
+  if (!isRecord(value)) return false
+  if (Object.keys(value).some((field) => !STORED_JOB_FIELDS.has(field))) return false
+  if (REQUIRED_STORED_JOB_FIELDS.some((field) => !Object.hasOwn(value, field))) return false
+  if (!isSafeDesignStableId(value.id) || !isSafeDesignStableId(value.projectId)) return false
+  if (!['generate', 'edit'].includes(String(value.action))) return false
+  if (!['queued', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(value.status))) return false
+  if (typeof value.prompt !== 'string' || value.prompt.trim().length === 0) return false
+  if (!isSafeDesignStableId(value.nodeId) || !isStoredPoint(value.position)) return false
+  if (typeof value.createdAt !== 'number' || !Number.isFinite(value.createdAt)
+    || typeof value.updatedAt !== 'number' || !Number.isFinite(value.updatedAt)) return false
+  for (const field of [
+    'sessionId', 'sourceSessionId', 'sourceAssetId', 'parentAssetId', 'outputAssetId',
+    'maskAnnotationId', 'replacedByJobId',
+  ] as const) {
+    if (!isOptionalStableId(value[field])) return false
+  }
+  if (value.error !== undefined && typeof value.error !== 'string') return false
+  if (value.placementState !== undefined && value.placementState !== 'pending' && value.placementState !== 'ready') return false
+  if (value.terminalState !== undefined) {
+    if (!isRecord(value.terminalState)
+      || Object.keys(value.terminalState).length !== 2
+      || value.terminalState.status !== 'pending'
+      || !isSafeDesignStableId(value.terminalState.outputAssetId)) return false
+  }
+  if (value.action === 'edit' && !isSafeDesignStableId(value.sourceAssetId)) return false
+  if (value.status === 'succeeded' && !isSafeDesignStableId(value.outputAssetId)) return false
+  return true
+}
+
+/** 判断未知值是否为普通对象。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
