@@ -393,6 +393,21 @@ describe('Design 素材安全服务', () => {
     await expect(queue.run([1, 1, 1], async () => {})).rejects.toThrow('批次图片数量超出限制')
   })
 
+  test('Given 稳定图片来源超过单图上限 When 导入 Then 不读取 Buffer 且仍关闭句柄', async () => {
+    let readCount = 0
+    let closeCount = 0
+
+    await expect(service.importAuthorizedImageSources('project-1', [{
+      sourcePath: fixturePath,
+      byteSize: 64 * 1024 * 1024 + 1,
+      readBytes: () => { readCount += 1; return Buffer.alloc(0) },
+      close: () => { closeCount += 1 },
+    }], { kind: 'agent', sourceSessionId: 'session-1' })).rejects.toThrow('图片不能超过 64 MiB')
+
+    expect(readCount).toBe(0)
+    expect(closeCount).toBe(1)
+  })
+
   test('Given 上一进程 promotion 未写入 canvas When 新实例恢复 Then 清理正式孤儿与 journal', async () => {
     service = createService({ runtimeId: 'runtime-old' })
     const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })

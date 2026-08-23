@@ -510,6 +510,38 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     access.release()
   }
 
+  /** 成功创建候选授权后原子替换 sender 所有权，再撤销旧 token。 */
+  const commitMediaAccess = (
+    sender: WebContents,
+    projectId: string,
+    access: ReturnType<DesignIpcAssetService['createMediaAccess']>,
+  ): void => {
+    const previous = mediaAccessBySender.get(sender.id)
+    /** destroyed 回调始终按 sender 当前 map 所有权释放，不捕获过期 token。 */
+    const onDestroyed = (): void => releaseMediaAccess(sender.id)
+    try {
+      mediaAccessBySender.set(sender.id, {
+        sender,
+        projectId,
+        assetBaseUrl: access.assetBaseUrl,
+        thumbnailBaseUrl: access.thumbnailBaseUrl,
+        release: access.release,
+        onDestroyed,
+      })
+      sender.once('destroyed', onDestroyed)
+    } catch (error) {
+      /** 候选授权未提交时只回收本次 token，旧授权保持可用。 */
+      sender.removeListener('destroyed', onDestroyed)
+      if (previous) mediaAccessBySender.set(sender.id, previous)
+      else mediaAccessBySender.delete(sender.id)
+      access.release()
+      throw error
+    }
+    if (!previous) return
+    previous.sender.removeListener('destroyed', previous.onDestroyed)
+    previous.release()
+  }
+
   /** 为返回给指定窗口的快照补回当前项目媒体 URL。 */
   const attachMediaAccess = (
     sender: WebContents,
@@ -543,16 +575,18 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   options.ipc.handle(DESIGN_IPC_CHANNELS.LOAD, async (event, value): Promise<DesignWorkspaceSnapshot> => {
     const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseProjectInput(value)
-    releaseMediaAccess(sender.id)
     /** 离线或迁移状态必须在 store 解析路径、创建目录之前短路。 */
     const readOnlyReason = options.getProjectReadOnlyReason(input.projectId)
     if (readOnlyReason) {
       const cached = lastReadableSnapshots.get(input.projectId)
-      return {
+      const snapshot: DesignWorkspaceSnapshot = {
         document: cached?.document ?? createEmptyDesignDocument(input.projectId),
         writable: false,
         readOnlyReason,
       }
+      /** 只读切换成功后 Renderer 不再使用媒体 URL，此时才撤销旧授权。 */
+      releaseMediaAccess(sender.id)
+      return snapshot
     }
     const snapshot = options.store.load(input.projectId)
     /** Store 已完成 tmp/backup 恢复后，同进程立即重试 terminal pending 对账。 */
@@ -566,19 +600,13 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
         cause: 'recovery',
       })
     }
-    if (!snapshot.writable) return snapshot
+    if (!snapshot.writable) {
+      releaseMediaAccess(sender.id)
+      return snapshot
+    }
+    /** createMediaAccess 只创建候选 token；失败不得影响 sender 的现有授权。 */
     const access = options.assets.createMediaAccess(input.projectId)
-    /** 窗口异常退出时沿用同一释放路径，避免 token 等待 TTL。 */
-    const onDestroyed = (): void => releaseMediaAccess(sender.id)
-    mediaAccessBySender.set(sender.id, {
-      sender,
-      projectId: input.projectId,
-      assetBaseUrl: access.assetBaseUrl,
-      thumbnailBaseUrl: access.thumbnailBaseUrl,
-      release: access.release,
-      onDestroyed,
-    })
-    sender.once('destroyed', onDestroyed)
+    commitMediaAccess(sender, input.projectId, access)
     return { ...snapshot, assetBaseUrl: access.assetBaseUrl, thumbnailBaseUrl: access.thumbnailBaseUrl }
   })
 

@@ -1,4 +1,12 @@
-import { lstatSync, realpathSync } from 'node:fs'
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+} from 'node:fs'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import type {
   AgentMessage,
@@ -15,13 +23,17 @@ import type {
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
 } from '@proma/shared'
-import type { DesignAssetImportBatch, DesignAssetService } from './design-asset-service'
+import type {
+  DesignAssetImportBatch,
+  DesignAssetService,
+  DesignAuthorizedImageSource,
+} from './design-asset-service'
 import type { DesignStore } from './design-store'
 
 /** 会话桥只使用素材服务的受控导入与路径解析能力。 */
 interface DesignSessionBridgeAssetService extends Pick<
   DesignAssetService,
-  'resolveAssetPath' | 'importAuthorizedFiles'
+  'resolveAssetPath' | 'importAuthorizedImageSources'
 > {}
 
 /** 会话桥只使用权威文档读取与 revision mutation。 */
@@ -52,6 +64,27 @@ function isPathWithinRoot(candidate: string, root: string): boolean {
   const relativePath = relative(root, candidate)
   return relativePath === ''
     || (relativePath !== '..' && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath))
+}
+
+/** 从已打开的稳定 fd 读取，并复核读取前后文件身份与大小未变化。 */
+function readStableAgentImage(descriptor: number, expected: { dev: number; ino: number; size: number }): Buffer {
+  const before = fstatSync(descriptor)
+  if (!before.isFile()
+    || before.dev !== expected.dev
+    || before.ino !== expected.ino
+    || before.size !== expected.size
+    || before.size > MAX_AGENT_IMAGE_BYTES) {
+    throw new Error('Agent 图片文件身份已变化')
+  }
+  const bytes = readFileSync(descriptor)
+  const after = fstatSync(descriptor)
+  if (after.dev !== before.dev
+    || after.ino !== before.ino
+    || after.size !== before.size
+    || bytes.byteLength !== before.size) {
+    throw new Error('Agent 图片读取期间已变化')
+  }
+  return bytes
 }
 
 /** 从指定会话持久化消息中寻找精确 localPath 的图片归属证据。 */
@@ -148,27 +181,56 @@ export class DesignSessionBridge {
     if (!ownedImage) throw new Error('图片不属于指定 Agent 会话')
     /** 项目必须在任何素材 staging 前处于稳定权威状态。 */
     const currentDocument = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
-    const requestedPath = this.dependencies.resolveAgentImagePath(input.localPath)
-    const imagePath = realpathSync(resolve(requestedPath))
-    /** 真实叶子必须是普通文件，拒绝目录和其它特殊文件。 */
-    const imageStat = lstatSync(imagePath)
-    if (!imageStat.isFile()) throw new Error('Agent 图片不是普通文件')
-    if (imageStat.size > MAX_AGENT_IMAGE_BYTES) throw new Error('图片不能超过 64 MiB')
-    /** 每个允许根都先 canonicalize，符号链接不能越过会话授权边界。 */
-    const allowed = this.dependencies.getAllowedRoots(session, input.projectId).some((root) => {
+    const requestedPath = resolve(this.dependencies.resolveAgentImagePath(input.localPath))
+    /** 先 canonicalize 授权根；之后用稳定 fd 的身份反向证明打开对象属于其中。 */
+    const allowedRoots = this.dependencies.getAllowedRoots(session, input.projectId).flatMap((root) => {
       try {
-        return isPathWithinRoot(imagePath, realpathSync(resolve(root)))
+        return [realpathSync(resolve(root))]
       } catch {
-        return false
+        return []
       }
     })
-    if (!allowed) throw new Error('图片不在指定 Agent 会话的授权目录内')
+    let descriptor: number | undefined
+    let descriptorHandedOff = false
     /** 只有本次调用创建的 promotion 批次允许在失败路径回滚。 */
     let importBatch: DesignAssetImportBatch | undefined
     try {
-      importBatch = await this.dependencies.assets.importAuthorizedFiles(
+      /** O_NOFOLLOW 拒绝叶子链接；fd 一旦建立，后续祖先或叶子置换不会改变读取对象。 */
+      descriptor = openSync(requestedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+      const openedStat = fstatSync(descriptor)
+      if (!openedStat.isFile()) throw new Error('Agent 图片不是普通文件')
+      if (openedStat.size > MAX_AGENT_IMAGE_BYTES) throw new Error('图片不能超过 64 MiB')
+      /** 打开后重新解析当前路径，并以 dev/ino 证明 canonical 路径与稳定 fd 是同一文件。 */
+      const imagePath = realpathSync(requestedPath)
+      const pathStat = lstatSync(imagePath)
+      if (!pathStat.isFile()
+        || pathStat.isSymbolicLink()
+        || pathStat.dev !== openedStat.dev
+        || pathStat.ino !== openedStat.ino
+        || pathStat.size !== openedStat.size) {
+        throw new Error('Agent 图片授权校验期间已变化')
+      }
+      if (!allowedRoots.some((root) => isPathWithinRoot(imagePath, root))) {
+        throw new Error('图片不在指定 Agent 会话的授权目录内')
+      }
+      let closed = false
+      const authorizedSource: DesignAuthorizedImageSource = {
+        sourcePath: imagePath,
+        byteSize: openedStat.size,
+        readBytes: () => {
+          if (closed || descriptor === undefined) throw new Error('Agent 图片稳定句柄已关闭')
+          return readStableAgentImage(descriptor, openedStat)
+        },
+        close: () => {
+          if (closed || descriptor === undefined) return
+          closed = true
+          closeSync(descriptor)
+        },
+      }
+      descriptorHandedOff = true
+      importBatch = await this.dependencies.assets.importAuthorizedImageSources(
         input.projectId,
-        [imagePath],
+        [authorizedSource],
         { kind: 'agent', sourceSessionId: input.sessionId },
       )
       /** 新节点从权威文档当前最大层级之后开始。 */
@@ -190,6 +252,8 @@ export class DesignSessionBridge {
     } catch (error) {
       importBatch?.rollback()
       throw error
+    } finally {
+      if (!descriptorHandedOff && descriptor !== undefined) closeSync(descriptor)
     }
   }
 

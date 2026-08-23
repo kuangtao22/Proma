@@ -66,6 +66,8 @@ function createFixture(): {
   let document = createEmptyDesignDocument('project-1', 10)
   /** 模拟 store 每次公开加载或 mutation 内部加载权威文档的次数。 */
   let storeReadCount = 0
+  /** 媒体候选授权按创建顺序分配，不能依赖旧授权是否已撤销。 */
+  let mediaAccessCount = 0
   /** 创建可记录广播的授权窗口。 */
   const senders = [1, 2].map((id) => {
     /** 当前测试窗口登记的 destroyed 回调。 */
@@ -146,7 +148,8 @@ function createFixture(): {
       exportAsset: async () => undefined,
       createMediaAccess: () => {
         /** 本次授权归属按创建顺序对应窗口。 */
-        const index = releases[0] === 0 ? 0 : 1
+        const index = mediaAccessCount
+        mediaAccessCount += 1
         return {
           assetBaseUrl: `proma-file://assets-${index}`,
           thumbnailBaseUrl: `proma-file://thumbs-${index}`,
@@ -402,6 +405,95 @@ describe('Design IPC', () => {
       .rejects.toThrow('请求结构无效')
     await invoke(fixture.handlers, DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS, fixture.senders[0]!)
     expect(fixture.releases).toEqual([1, 1])
+  })
+
+  test('Given 窗口已有媒体授权 When 重复 LOAD 的 Store 读取失败 Then 保留旧 URL 授权', async () => {
+    const fixture = createFixture()
+    let loadCount = 0
+    const originalLoad = fixture.options.store.load.bind(fixture.options.store)
+    fixture.options.store.load = (projectId) => {
+      loadCount += 1
+      if (loadCount === 2) throw new Error('Store 读取失败')
+      return originalLoad(projectId)
+    }
+    registerDesignIpcHandlers(fixture.options)
+    const first = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.LOAD,
+      fixture.senders[0]!,
+      { projectId: 'project-1' },
+    ) as DesignWorkspaceSnapshot
+
+    await expect(invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.LOAD,
+      fixture.senders[0]!,
+      { projectId: 'project-1' },
+    )).rejects.toThrow('Store 读取失败')
+
+    expect(first.assetBaseUrl).toBe('proma-file://assets-0')
+    expect(fixture.releases[0]).toBe(0)
+  })
+
+  test('Given 窗口已有媒体授权 When 新媒体授权创建失败 Then 保留旧 URL 授权', async () => {
+    const fixture = createFixture()
+    let accessCount = 0
+    const releaseCounts = [0, 0]
+    fixture.options.assets.createMediaAccess = () => {
+      const index = accessCount
+      accessCount += 1
+      if (index === 1) throw new Error('媒体授权创建失败')
+      return {
+        assetBaseUrl: `proma-file://candidate-assets-${index}`,
+        thumbnailBaseUrl: `proma-file://candidate-thumbs-${index}`,
+        release: () => { releaseCounts[index] = (releaseCounts[index] ?? 0) + 1 },
+      }
+    }
+    registerDesignIpcHandlers(fixture.options)
+    await invoke(fixture.handlers, DESIGN_IPC_CHANNELS.LOAD, fixture.senders[0]!, { projectId: 'project-1' })
+
+    await expect(invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.LOAD,
+      fixture.senders[0]!,
+      { projectId: 'project-1' },
+    )).rejects.toThrow('媒体授权创建失败')
+
+    expect(releaseCounts).toEqual([0, 0])
+  })
+
+  test('Given 窗口已有媒体授权 When 重复 LOAD 成功 Then 原子切换到新 URL 并撤销旧授权', async () => {
+    const fixture = createFixture()
+    let accessCount = 0
+    const releaseCounts = [0, 0]
+    fixture.options.assets.createMediaAccess = () => {
+      const index = accessCount
+      accessCount += 1
+      return {
+        assetBaseUrl: `proma-file://candidate-assets-${index}`,
+        thumbnailBaseUrl: `proma-file://candidate-thumbs-${index}`,
+        release: () => { releaseCounts[index] = (releaseCounts[index] ?? 0) + 1 },
+      }
+    }
+    registerDesignIpcHandlers(fixture.options)
+    const first = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.LOAD,
+      fixture.senders[0]!,
+      { projectId: 'project-1' },
+    ) as DesignWorkspaceSnapshot
+    const second = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.LOAD,
+      fixture.senders[0]!,
+      { projectId: 'project-1' },
+    ) as DesignWorkspaceSnapshot
+
+    expect(first.assetBaseUrl).toBe('proma-file://candidate-assets-0')
+    expect(second.assetBaseUrl).toBe('proma-file://candidate-assets-1')
+    expect(releaseCounts).toEqual([1, 0])
+    await invoke(fixture.handlers, DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS, fixture.senders[0]!)
+    expect(releaseCounts).toEqual([1, 1])
   })
 
   test('Given 已加载媒体授权 When 导入素材 Then 返回快照保留同一组媒体 URL', async () => {

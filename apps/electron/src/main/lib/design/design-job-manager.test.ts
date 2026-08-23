@@ -185,6 +185,38 @@ describe('Design Job Manager', () => {
     expect(document.nodes).toEqual([])
   })
 
+  test('Given 项目 A 路径解析失败且项目 B 有 running 任务 When recoverAll Then 记录 A 错误并继续中断 B', () => {
+    const projectBJobs = join(cacheRoot, 'project-b-jobs')
+    mkdirSync(projectBJobs, { recursive: true })
+    writeFileSync(join(projectBJobs, 'job-b.json'), JSON.stringify(createStoredRunningJob('project-b', 'job-b')))
+    const warnings: string[] = []
+    const manager = createMultiProjectRecoveryManager(projectBJobs, warnings)
+
+    const recovered = manager.recoverAll()
+
+    expect(recovered).toHaveLength(1)
+    expect(recovered[0]).toMatchObject({ id: 'job-b', projectId: 'project-b', status: 'interrupted' })
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('project-a')
+    expect(warnings[0]).toContain('路径解析失败')
+  })
+
+  test('Given 项目 A journal 读取失败且项目 B 有 running 任务 When 退出中断 Then 记录 A 错误并继续中断 B', () => {
+    const projectBJobs = join(cacheRoot, 'project-b-jobs')
+    mkdirSync(projectBJobs, { recursive: true })
+    writeFileSync(join(projectBJobs, 'job-b.json'), JSON.stringify(createStoredRunningJob('project-b', 'job-b')))
+    const warnings: string[] = []
+    const manager = createMultiProjectRecoveryManager(projectBJobs, warnings)
+
+    manager.markRunningInterrupted()
+
+    expect(manager.list('project-b')).toEqual([
+      expect.objectContaining({ id: 'job-b', projectId: 'project-b', status: 'interrupted' }),
+    ])
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('project-a')
+  })
+
   test('Given running 任务取消后 Pi 迟到成功 When 完成回调到达 Then 保持 cancelled 且不导入', async () => {
     let completeRun: (() => void) | undefined
     harness.runHeadless = async (callbacks) => new Promise<void>((resolve) => {
@@ -718,6 +750,59 @@ describe('Design Job Manager', () => {
     }
   }
 })
+
+/** 创建只覆盖多项目恢复隔离所需边界的 Manager。 */
+function createMultiProjectRecoveryManager(projectBJobs: string, warnings: string[]): DesignJobManager {
+  const emptyBatch: DesignAssetImportBatch = Object.assign([], {
+    commit: () => undefined,
+    rollback: () => undefined,
+  })
+  return new DesignJobManager({
+    pathResolver: {
+      resolve: (projectId) => {
+        if (projectId === 'project-a') throw new Error('路径解析失败')
+        return { jobsDir: projectBJobs }
+      },
+    },
+    store: {
+      load: (projectId) => ({ document: createEmptyDesignDocument(projectId), writable: true }),
+      requireStableAuthoritativeDocument: (projectId) => createEmptyDesignDocument(projectId),
+      mutate: (projectId) => createEmptyDesignDocument(projectId),
+    },
+    assetService: {
+      resolveAssetPath: () => '/unused.png',
+      importAuthorizedFiles: async () => emptyBatch,
+    },
+    getSettings: () => ({}),
+    getSession: () => undefined,
+    createSession: () => { throw new Error('测试不应创建会话') },
+    updateSession: () => undefined,
+    runHeadless: async () => undefined,
+    stopAgent: () => undefined,
+    resolveOwnedOutputPath: () => undefined,
+    listProjectIds: () => ['project-a', 'project-b'],
+    runWorkspaceWrite: (_projectId, effect) => effect(),
+    warn: (message) => { warnings.push(message) },
+    now: () => 20,
+  })
+}
+
+/** 创建可由重启/退出流程收敛的最小 running journal。 */
+function createStoredRunningJob(projectId: string, id: string): object {
+  return {
+    id,
+    projectId,
+    action: 'generate',
+    status: 'running',
+    prompt: '生成海报',
+    nodeId: `node-${id}`,
+    position: { x: 0, y: 0 },
+    placementState: 'ready',
+    sessionId: `session-${id}`,
+    createdAt: 1,
+    updatedAt: 1,
+  }
+}
 
 /** 创建生成任务输入。 */
 function createGenerateInput(): CreateDesignJobInput {

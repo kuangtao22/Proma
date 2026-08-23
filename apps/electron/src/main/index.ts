@@ -92,6 +92,7 @@ import { stopAllGenerations } from './lib/chat-service'
 import { configureUpdater, initAutoUpdater, cleanupUpdater } from './lib/updater/auto-updater'
 import { startWorkspaceWatcher, stopWorkspaceWatcher } from './lib/workspace-watcher'
 import { startChatToolsWatcher, stopChatToolsWatcher } from './lib/chat-tools-watcher'
+import { runShutdownCleanupSteps } from './lib/shutdown-cleanup'
 import { getIsQuitting, setQuitting } from './lib/app-lifecycle'
 import { getMainWindow as getStoredMainWindow, setMainWindow as setStoredMainWindow } from './lib/main-window-store'
 import {
@@ -1051,45 +1052,32 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
-  // 标记正在退出，让 close 事件不再阻止关闭
-  setQuitting()
-
-  // Agent 关闭前先持久标记 Design Job，迟到完成回调不得继续导入图片。
-  getDefaultDesignJobManager()?.markRunningInterrupted()
-
-  // 中止所有活跃的 Agent 和 Chat 子进程
-  stopAllAgents()
-  browserController.dispose()
-  stopAllGenerations()
-  // 清理更新器定时器
-  cleanupUpdater()
-  // 停止工作区文件监听
-  stopWorkspaceWatcher()
-  // 停止 Chat 工具配置文件监听
-  stopChatToolsWatcher()
-  // 停止所有 Bridge
-  stopBridgeSelfHealing()
-  stopAllBridges()
-  // 停止定时任务调度器
-  stopScheduler()
-  stopPlanningReminderScheduler()
-  stopPlanningNativeSyncCoordinator()
-  // 释放飞书同步防休眠
-  stopFeishuSyncSleepBlocker()
-  // 注销全局快捷键
-  unregisterAllGlobalShortcuts()
-  // 销毁辅助窗口
-  destroyQuickTaskWindow()
-  destroyPlanningWindow()
-  destroyVoiceDictationWindow()
-  destroyAgentStatusHoverWindow()
-  // 销毁原生 macOS 灵动岛服务（其他平台从未创建 surface）
-  disposeMacAgentIslandNativeHost()
-  disposeAgentIslandService()
-  // 关闭 Pi MCP 桥接连接（释放 stdio 子进程）
-  disposePiMcpConnections().catch(() => {})
-  // Clean up system tray before quitting
-  destroyTray()
+  /** 每项独立隔离，Design journal 故障不能跳过 Agent、浏览器或 watcher 释放。 */
+  runShutdownCleanupSteps([
+    { name: '退出状态', run: setQuitting },
+    { name: 'Design Job 中断', run: () => { getDefaultDesignJobManager()?.markRunningInterrupted() } },
+    { name: 'Agent 进程', run: stopAllAgents },
+    { name: '浏览器控制器', run: () => { browserController.dispose() } },
+    { name: '生成任务', run: stopAllGenerations },
+    { name: '更新器', run: cleanupUpdater },
+    { name: '工作区监听', run: stopWorkspaceWatcher },
+    { name: 'Chat 工具监听', run: stopChatToolsWatcher },
+    { name: 'Bridge 自愈', run: stopBridgeSelfHealing },
+    { name: 'Bridge', run: stopAllBridges },
+    { name: '自动任务调度', run: stopScheduler },
+    { name: '规划提醒调度', run: stopPlanningReminderScheduler },
+    { name: '规划原生同步', run: stopPlanningNativeSyncCoordinator },
+    { name: '飞书同步防休眠', run: stopFeishuSyncSleepBlocker },
+    { name: '全局快捷键', run: unregisterAllGlobalShortcuts },
+    { name: '快速任务窗口', run: destroyQuickTaskWindow },
+    { name: '规划窗口', run: destroyPlanningWindow },
+    { name: '语音听写窗口', run: destroyVoiceDictationWindow },
+    { name: 'Agent 状态窗口', run: destroyAgentStatusHoverWindow },
+    { name: 'macOS 灵动岛原生服务', run: disposeMacAgentIslandNativeHost },
+    { name: 'Agent Island 服务', run: disposeAgentIslandService },
+    { name: 'Pi MCP 连接', run: () => { disposePiMcpConnections().catch(() => {}) } },
+    { name: '系统托盘', run: destroyTray },
+  ])
 })
 
 app.on('will-quit', () => {

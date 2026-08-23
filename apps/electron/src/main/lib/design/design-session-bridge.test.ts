@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, truncateSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createEmptyDesignDocument } from '@proma/shared'
@@ -11,7 +20,7 @@ import type {
   DesignMutation,
 } from '@proma/shared'
 import sharp from 'sharp'
-import type { DesignAssetImportBatch } from './design-asset-service'
+import type { DesignAssetImportBatch, DesignAuthorizedImageSource } from './design-asset-service'
 import { DesignSessionBridge } from './design-session-bridge'
 import { applyDesignMutations } from './design-store'
 
@@ -28,6 +37,10 @@ describe('Design Session Bridge', () => {
   let importedPaths: string[]
   /** 素材事务提交次数。 */
   let commitCount: number
+  /** 模拟图片处理队列真正消费稳定来源前发生的文件系统置换。 */
+  let beforeAuthorizedRead: (() => void) | undefined
+  /** 素材服务从稳定来源实际读取到的字节。 */
+  let importedBytes: Buffer[]
   /** Sharp 生成的完整一像素 PNG，确保桥执行真实图片签名校验。 */
   let pngBytes: Buffer
 
@@ -46,6 +59,8 @@ describe('Design Session Bridge', () => {
     messages = new Map()
     importedPaths = []
     commitCount = 0
+    beforeAuthorizedRead = undefined
+    importedBytes = []
   })
 
   afterEach(() => rmSync(root, { recursive: true, force: true }))
@@ -69,12 +84,18 @@ describe('Design Session Bridge', () => {
     },
     assets: {
       resolveAssetPath: (_projectId, assetId) => join(root, `${assetId}.png`),
-      importAuthorizedFiles: async (_projectId, sourcePaths) => {
-        importedPaths.push(...sourcePaths)
-        const batch = [createAsset('asset-imported', 'agent.png')] as DesignAssetImportBatch
-        batch.commit = () => { commitCount += 1 }
-        batch.rollback = () => undefined
-        return batch
+      importAuthorizedImageSources: async (_projectId, sources: DesignAuthorizedImageSource[]) => {
+        importedPaths.push(...sources.map((source) => source.sourcePath))
+        try {
+          beforeAuthorizedRead?.()
+          importedBytes.push(...sources.map((source) => source.readBytes()))
+          const batch = [createAsset('asset-imported', 'agent.png')] as DesignAssetImportBatch
+          batch.commit = () => { commitCount += 1 }
+          batch.rollback = () => undefined
+          return batch
+        } finally {
+          for (const source of sources) source.close()
+        }
       },
     },
     createId: () => 'node-imported',
@@ -122,6 +143,58 @@ describe('Design Session Bridge', () => {
       id: 'node-imported', kind: 'asset', assetId: 'asset-imported',
       position: { x: 40, y: 60 }, width: 320, height: 240,
     })
+  })
+
+  test('Given 排队期间授权根内祖先被替换为根外符号链接 When 消费图片 Then 仍读取已授权文件而不读取根外文件', async () => {
+    const allowedDirectory = join(root, 'generated-images')
+    const movedDirectory = join(root, 'generated-images-original')
+    const outside = mkdtempSync(join(tmpdir(), 'proma-design-ancestor-outside-'))
+    const imagePath = join(allowedDirectory, 'owned.png')
+    const outsideBytes = await sharp({
+      create: { width: 2, height: 2, channels: 4, background: '#000000' },
+    }).png().toBuffer()
+    try {
+      mkdirSync(allowedDirectory)
+      writeFileSync(imagePath, pngBytes)
+      writeFileSync(join(outside, 'owned.png'), outsideBytes)
+      messages.set('session-1', [createToolResultMessage(imagePath)])
+      beforeAuthorizedRead = () => {
+        renameSync(allowedDirectory, movedDirectory)
+        symlinkSync(outside, allowedDirectory, 'dir')
+      }
+
+      await createBridge().importAgentImage({
+        projectId: 'project-1', sessionId: 'session-1', localPath: imagePath,
+        position: { x: 0, y: 0 },
+      })
+
+      expect(importedBytes).toEqual([pngBytes])
+      expect(importedBytes[0]).not.toEqual(outsideBytes)
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 排队期间授权图片叶子被替换 When 消费图片 Then 仍读取已授权 inode', async () => {
+    const imagePath = join(root, 'owned-leaf.png')
+    const movedPath = join(root, 'owned-leaf-original.png')
+    const replacementBytes = await sharp({
+      create: { width: 2, height: 2, channels: 4, background: '#000000' },
+    }).png().toBuffer()
+    writeFileSync(imagePath, pngBytes)
+    messages.set('session-1', [createToolResultMessage(imagePath)])
+    beforeAuthorizedRead = () => {
+      renameSync(imagePath, movedPath)
+      writeFileSync(imagePath, replacementBytes)
+    }
+
+    await createBridge().importAgentImage({
+      projectId: 'project-1', sessionId: 'session-1', localPath: imagePath,
+      position: { x: 0, y: 0 },
+    })
+
+    expect(importedBytes).toEqual([pngBytes])
+    expect(importedBytes[0]).not.toEqual(replacementBytes)
   })
 
   test('Given SDK 工具结果持久化图片归属 When 导入设计 Then 接受当前会话的精确附件字段', async () => {

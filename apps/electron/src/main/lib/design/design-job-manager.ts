@@ -93,6 +93,8 @@ export interface DesignJobManagerDependencies {
   runWorkspaceWrite: <T>(projectId: string, effect: () => T) => T
   /** 原子写入单个任务 journal；生产默认使用 safe-file，测试可注入 durability 故障。 */
   writeJobJournal?: (path: string, value: object) => void
+  /** 单项目恢复失败时记录中文错误，默认输出到主进程错误日志。 */
+  warn?: (message: string) => void
   createId?: () => string
   now?: () => number
 }
@@ -152,10 +154,12 @@ export class DesignJobManager {
   private readonly listeners = new Set<DesignJobChangedListener>()
   private readonly createId: () => string
   private readonly now: () => number
+  private readonly warn: (message: string) => void
 
   constructor(private readonly dependencies: DesignJobManagerDependencies) {
     this.createId = dependencies.createId ?? randomUUID
     this.now = dependencies.now ?? Date.now
+    this.warn = dependencies.warn ?? ((message) => { console.error(message) })
   }
 
   /** 创建 queued journal 和占位节点，不等待 Agent 运行。 */
@@ -326,8 +330,9 @@ export class DesignJobManager {
               })
             }
           })
-        } catch {
-          /** retry intent 保留到下次显式重试或恢复继续完成。 */
+        } catch (error) {
+          /** retry intent 保留到下次显式重试或恢复继续完成，同时留下项目级诊断。 */
+          this.warn(`[Design Job 恢复] 项目 ${projectId} 的重试任务 ${job.id} 恢复失败: ${String(error)}`)
         }
         continue
       }
@@ -342,14 +347,26 @@ export class DesignJobManager {
 
   /** 启动时恢复全部已登记项目任务。 */
   recoverAll(): DesignJobRecord[] {
-    return this.dependencies.listProjectIds().flatMap((projectId) => this.recover(projectId))
+    const recovered: DesignJobRecord[] = []
+    for (const projectId of this.dependencies.listProjectIds()) {
+      try {
+        recovered.push(...this.recover(projectId))
+      } catch (error) {
+        this.warn(`[Design Job 恢复] 项目 ${projectId} 恢复失败，已继续处理其它项目: ${String(error)}`)
+      }
+    }
+    return recovered
   }
 
   /** 退出前同步把 running journal 标记为 interrupted。 */
   markRunningInterrupted(): void {
     for (const projectId of this.dependencies.listProjectIds()) {
-      for (const job of this.readProjectJobs(projectId)) {
-        if (job.status === 'running') this.updateStatus(job, 'interrupted', { error: '应用退出，任务已中断' })
+      try {
+        for (const job of this.readProjectJobs(projectId)) {
+          if (job.status === 'running') this.updateStatus(job, 'interrupted', { error: '应用退出，任务已中断' })
+        }
+      } catch (error) {
+        this.warn(`[Design Job 退出] 项目 ${projectId} 中断写入失败，已继续处理其它项目: ${String(error)}`)
       }
     }
   }

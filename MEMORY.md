@@ -57,6 +57,9 @@
 - Design Renderer 的 recovery/dispose 会递增独立 SAVE 基线代次并主动把在途 batch 归还 pending；旧代次 SAVE 的 success/failure 回调必须完全无副作用，禁止覆盖恢复后的低 revision 或重复归还 mutation。
 - Design Renderer 的权威 recovery LOAD 使用独立于普通/job LOAD 的请求代次；普通/job 刷新不得取消恢复。恢复期间收到的 job revision 只合并最高目标，恢复成功后单次对账；恢复失败时保留目标，待用户 retry 成功后再对账。
 - Design 大画布节点已有持久化尺寸且禁止连线时，必须向 XYFlow 显式提供 `handles: []`，否则未测量 handle 会迫使所有节点首帧挂载。浏览器 QA 基线使用 1000 节点在 1200px 验证可见 DOM 显著低于总量及拖动、平移、缩放，在 620px 验证 Inspector/Toolbar/禁用 Tooltip 与 light/dark 主题。
+- Agent 图片导入必须把授权校验与实际消费绑定到同一稳定文件身份：Bridge 以 `O_NOFOLLOW` 打开 fd，并用打开后的 canonical 路径和 `dev/ino/size` 证明归属；Asset Service 只在图片处理队列内从该 fd 读取、复核读取前后身份并统一关闭。祖先目录或叶子在排队期间被替换时只能读取原授权 inode 或 fail closed，禁止再次按路径打开。
+- Design `LOAD` 的媒体授权采用候选 lease 事务替换：先取得权威 snapshot 和新 token，成功后切换 sender/project 所有权再撤销旧 token；Store 或候选授权失败必须保留旧 URL，窗口销毁、显式 RELEASE 与注册 dispose 继续按当前所有权幂等清理。
+- Design Job 启动恢复与退出中断按项目隔离，单项目路径、Store 或 journal 故障必须记录中文日志并继续其它项目；应用 `before-quit` 的 Design、Agent、浏览器、watcher 等清理步骤逐项隔离，任何单点失败不得跳过后续全局资源释放。
 
 ## 会话记录
 

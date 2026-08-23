@@ -52,6 +52,18 @@ export interface DesignAssetImportSource {
   prompt?: string
 }
 
+/** 已由可信调用方绑定到稳定文件身份的图片来源。 */
+export interface DesignAuthorizedImageSource {
+  /** 仅用于素材显示名与审计，不会再次按该路径读取。 */
+  sourcePath: string
+  /** 打开稳定句柄时确认的文件大小，用于排队前预算。 */
+  byteSize: number
+  /** 在图片处理队列内从稳定身份读取完整字节。 */
+  readBytes: () => Buffer
+  /** 无论导入成功或失败都释放稳定句柄。 */
+  close: () => void
+}
+
 /** 已 promotion 的导入批次；调用方必须在元数据结果明确后提交或回滚。 */
 export interface DesignAssetImportBatch extends Array<DesignAsset> {
   /** 元数据已提交后消费 journal；清理失败只保留恢复证据，不反向报错。 */
@@ -571,6 +583,34 @@ async function validateImage(sourcePath: string): Promise<ValidatedImage> {
   }
 }
 
+/** 校验可信稳定来源读取到的字节、大小、签名与像素边界。 */
+async function validateAuthorizedImageSource(source: DesignAuthorizedImageSource): Promise<ValidatedImage> {
+  if (!isAbsolute(source.sourcePath)) throw new Error('图片来源必须是绝对路径')
+  if (!Number.isSafeInteger(source.byteSize) || source.byteSize < 0 || source.byteSize > MAX_IMAGE_BYTES) {
+    throw new Error('图片不能超过 64 MiB')
+  }
+  /** 大 Buffer 只允许在队列获得执行权后由稳定句柄创建。 */
+  const bytes = source.readBytes()
+  if (bytes.byteLength !== source.byteSize) throw new Error('图片文件读取期间已变化')
+  const format = detectImageFormat(bytes)
+  let metadata: Awaited<ReturnType<ReturnType<typeof sharp>['metadata']>>
+  try {
+    metadata = await sharp(bytes, { limitInputPixels: MAX_IMAGE_PIXELS }).metadata()
+  } catch {
+    throw new Error('不支持或损坏的图片')
+  }
+  if (!metadata.width || !metadata.height || metadata.width * metadata.height > MAX_IMAGE_PIXELS) {
+    throw new Error('图片像素不能超过 64000000')
+  }
+  return {
+    bytes,
+    ...format,
+    width: metadata.width,
+    height: metadata.height,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+  }
+}
+
 /** 将单个已验证图片及缩略图写入本批次独占 staging。 */
 async function stageAsset(
   paths: DesignPaths,
@@ -578,9 +618,12 @@ async function stageAsset(
   sourcePath: string,
   source: DesignAssetImportSource,
   now: () => number,
+  authorizedSource?: DesignAuthorizedImageSource,
 ): Promise<StagedAsset> {
   /** 图片格式和尺寸均在任何 staging 写入前完成验证。 */
-  const image = await validateImage(sourcePath)
+  const image = authorizedSource
+    ? await validateAuthorizedImageSource(authorizedSource)
+    : await validateImage(sourcePath)
   /** 素材业务 ID 与不可预测磁盘叶子分别独立生成。 */
   const assetId = randomUUID()
   /** 原图正式磁盘名只由随机值和规范扩展组成。 */
@@ -666,155 +709,188 @@ export class DesignAssetService {
     sourcePaths: string[],
     source: DesignAssetImportSource,
   ): Promise<DesignAssetImportBatch> {
-    return this.dependencies.runWorkspaceWrite(projectId, async () => {
-      /** 恢复提升与素材 staging 必须分成两次用户操作。 */
-      this.dependencies.store.requireStableAuthoritativeDocument(projectId)
-      if (sourcePaths.length === 0) {
-        return createDesignAssetImportBatch([], () => undefined, () => undefined)
-      }
-      /** stat 只读取大小，累计预算在任何 Buffer 或 Sharp 解码前拒绝。 */
-      const byteSizes = sourcePaths.map((sourcePath) => lstatSync(sourcePath).size)
-      return this.processingQueue.run(byteSizes, async () => {
-      /** 每次导入使用独占批次目录，失败可整体清理。 */
-      const paths = this.dependencies.pathResolver.resolve(projectId)
-      const batchDirectory = join(paths.stagingDir, `import-${randomUUID()}`)
-      /** 全部验证并完成缩略图的 staging 结果。 */
-      const stagedAssets: StagedAsset[] = []
-      /** staging 全部成功后、任何正式文件可见前写入恢复 journal。 */
-      let journalPath: string | undefined
-      try {
-        /** 先记录 staging 目录，进程在图片验证中崩溃也可由下一实例清理。 */
-        journalPath = writePromotionJournal(
-          paths,
-          projectId,
-          this.runtimeId,
-          batchDirectory,
-          [],
-          this.now(),
-        )
-        /** journal 先于目录可见，消除 mkdir 后、恢复记录前的崩溃窗口。 */
-        mkdirSync(batchDirectory)
-        for (const sourcePath of sourcePaths) {
-          stagedAssets.push(await stageAsset(paths, batchDirectory, sourcePath, source, this.now))
+    /** 普通 picker/job 路径仍在队列内 no-follow 打开，不在队列前持有 Buffer。 */
+    const authorizedSources = sourcePaths.map((sourcePath): DesignAuthorizedImageSource => ({
+      sourcePath,
+      byteSize: lstatSync(sourcePath).size,
+      readBytes: () => readAuthorizedImage(sourcePath),
+      close: () => undefined,
+    }))
+    return this.importAuthorizedImageSources(projectId, authorizedSources, source)
+  }
+
+  /**
+   * 导入已绑定稳定文件身份的图片；稳定句柄由本方法在所有成功/失败路径释放。
+   * @param projectId 已登记项目稳定 ID。
+   * @param authorizedSources 可信调用方建立的稳定文件来源。
+   * @param source 素材来源和版本关系。
+   * @returns 已落入正式目录、尚未写入画布的素材元数据。
+   */
+  async importAuthorizedImageSources(
+    projectId: string,
+    authorizedSources: DesignAuthorizedImageSource[],
+    source: DesignAssetImportSource,
+  ): Promise<DesignAssetImportBatch> {
+    try {
+      return await this.dependencies.runWorkspaceWrite(projectId, async () => {
+        /** 恢复提升与素材 staging 必须分成两次用户操作。 */
+        this.dependencies.store.requireStableAuthoritativeDocument(projectId)
+        if (authorizedSources.length === 0) {
+          return createDesignAssetImportBatch([], () => undefined, () => undefined)
         }
-        /** promotion 前补齐正式叶子和目标卷临时叶子。 */
-        journalPath = writePromotionJournal(
-          paths,
-          projectId,
-          this.runtimeId,
-          batchDirectory,
-          stagedAssets,
-          this.now(),
-          journalPath,
-        )
-        for (const staged of stagedAssets) {
-          promoteStagedFile(
-            staged.stagedAssetPath,
-            staged.finalAssetPath,
-            this.dependencies.filePromotion,
-            staged.assetPromotionTemporaryPath,
-          )
-          promoteStagedFile(
-            staged.stagedThumbnailPath,
-            staged.finalThumbnailPath,
-            this.dependencies.filePromotion,
-            staged.thumbnailPromotionTemporaryPath,
-          )
-        }
-        /** 返回给 IPC 的素材数组仍保持普通数组语义。 */
-        const assets = stagedAssets.map((item) => item.asset)
-        /** 精确事务只管理本批次 journal，不扫描或接管其他进行中任务。 */
-        let settled = false
-        const commit = (): void => {
-          if (settled || !journalPath) return
-          /** commit 只清理可重建的跨卷临时文件与 staging，不触碰已被元数据引用的正式文件。 */
-          const cleanupTargets = createPromotionCleanupTargets(stagedAssets, batchDirectory, false)
-          /** 任一瞬态路径未确认删除时保留 journal，供新 runtime 继续恢复。 */
-          const cleanupComplete = cleanupPromotionTargets(
-            cleanupTargets,
-            this.dependencies.filePromotion?.cleanupPath,
-            this.warn,
-          )
-          if (!cleanupComplete) return
+        /** stat 只读取大小，累计预算在任何 Buffer 或 Sharp 解码前拒绝。 */
+        const byteSizes = authorizedSources.map((authorizedSource) => authorizedSource.byteSize)
+        return this.processingQueue.run(byteSizes, async () => {
+          /** 每次导入使用独占批次目录，失败可整体清理。 */
+          const paths = this.dependencies.pathResolver.resolve(projectId)
+          const batchDirectory = join(paths.stagingDir, `import-${randomUUID()}`)
+          /** 全部验证并完成缩略图的 staging 结果。 */
+          const stagedAssets: StagedAsset[] = []
+          /** staging 全部成功后、任何正式文件可见前写入恢复 journal。 */
+          let journalPath: string | undefined
           try {
-            removePromotionJournal(journalPath)
-            settled = true
-          } catch (error) {
-            this.warn(`Design promotion journal 延迟清理: ${journalPath}: ${String(error)}`)
-          }
-        }
-        const rollback = (): void => {
-          if (settled || !journalPath) return
-          /** 先读取磁盘事实，处理 JSON 已 rename 但 durability 同步失败的模糊提交。 */
-          let persistedAssets: DesignAsset[]
-          try {
-            persistedAssets = this.dependencies.store.load(projectId).document.assets
-          } catch (error) {
-            this.warn(`Design promotion 回滚状态无法确认，已保留恢复证据: ${String(error)}`)
-            return
-          }
-          /** 只有未被当前画布精确引用的文件才允许删除。 */
-          const unreferencedStagedAssets: StagedAsset[] = []
-          /** 即时可读引用不证明目录 durability，存在引用时必须保留 journal 到下一进程。 */
-          let hasPersistedReference = false
-          for (const staged of stagedAssets) {
-            const referenced = persistedAssets.some((asset) => (
-              asset.id === staged.asset.id
-              && asset.relativePath === staged.asset.relativePath
-              && asset.thumbnailRelativePath === staged.asset.thumbnailRelativePath
-            ))
-            if (referenced) {
-              hasPersistedReference = true
-              continue
+            /** 先记录 staging 目录，进程在图片验证中崩溃也可由下一实例清理。 */
+            journalPath = writePromotionJournal(
+              paths,
+              projectId,
+              this.runtimeId,
+              batchDirectory,
+              [],
+              this.now(),
+            )
+            /** journal 先于目录可见，消除 mkdir 后、恢复记录前的崩溃窗口。 */
+            mkdirSync(batchDirectory)
+            for (const authorizedSource of authorizedSources) {
+              stagedAssets.push(await stageAsset(
+                paths,
+                batchDirectory,
+                authorizedSource.sourcePath,
+                source,
+                this.now,
+                authorizedSource,
+              ))
             }
-            unreferencedStagedAssets.push(staged)
-          }
-          /** rollback 清理所有瞬态路径，并仅加入磁盘未引用素材的正式文件。 */
-          const cleanupTargets = [
-            ...unreferencedStagedAssets.flatMap((staged) => [
-              { path: staged.finalAssetPath, label: '正式原图' },
-              { path: staged.finalThumbnailPath, label: '正式缩略图' },
-            ]),
-            ...createPromotionCleanupTargets(stagedAssets, batchDirectory, false),
-          ]
-          /** 路径清理不完整或存在即时引用时都保留 journal，等待跨进程磁盘事实确认。 */
-          const cleanupComplete = cleanupPromotionTargets(
-            cleanupTargets,
-            this.dependencies.filePromotion?.cleanupPath,
-            this.warn,
-          )
-          if (!cleanupComplete || hasPersistedReference) return
-          try {
-            removePromotionJournal(journalPath)
-            settled = true
+            /** promotion 前补齐正式叶子和目标卷临时叶子。 */
+            journalPath = writePromotionJournal(
+              paths,
+              projectId,
+              this.runtimeId,
+              batchDirectory,
+              stagedAssets,
+              this.now(),
+              journalPath,
+            )
+            for (const staged of stagedAssets) {
+              promoteStagedFile(
+                staged.stagedAssetPath,
+                staged.finalAssetPath,
+                this.dependencies.filePromotion,
+                staged.assetPromotionTemporaryPath,
+              )
+              promoteStagedFile(
+                staged.stagedThumbnailPath,
+                staged.finalThumbnailPath,
+                this.dependencies.filePromotion,
+                staged.thumbnailPromotionTemporaryPath,
+              )
+            }
+            /** 返回给 IPC 的素材数组仍保持普通数组语义。 */
+            const assets = stagedAssets.map((item) => item.asset)
+            /** 精确事务只管理本批次 journal，不扫描或接管其他进行中任务。 */
+            let settled = false
+            const commit = (): void => {
+              if (settled || !journalPath) return
+              /** commit 只清理可重建的跨卷临时文件与 staging，不触碰已被元数据引用的正式文件。 */
+              const cleanupTargets = createPromotionCleanupTargets(stagedAssets, batchDirectory, false)
+              /** 任一瞬态路径未确认删除时保留 journal，供新 runtime 继续恢复。 */
+              const cleanupComplete = cleanupPromotionTargets(
+                cleanupTargets,
+                this.dependencies.filePromotion?.cleanupPath,
+                this.warn,
+              )
+              if (!cleanupComplete) return
+              try {
+                removePromotionJournal(journalPath)
+                settled = true
+              } catch (error) {
+                this.warn(`Design promotion journal 延迟清理: ${journalPath}: ${String(error)}`)
+              }
+            }
+            const rollback = (): void => {
+              if (settled || !journalPath) return
+              /** 先读取磁盘事实，处理 JSON 已 rename 但 durability 同步失败的模糊提交。 */
+              let persistedAssets: DesignAsset[]
+              try {
+                persistedAssets = this.dependencies.store.load(projectId).document.assets
+              } catch (error) {
+                this.warn(`Design promotion 回滚状态无法确认，已保留恢复证据: ${String(error)}`)
+                return
+              }
+              /** 只有未被当前画布精确引用的文件才允许删除。 */
+              const unreferencedStagedAssets: StagedAsset[] = []
+              /** 即时可读引用不证明目录 durability，存在引用时必须保留 journal 到下一进程。 */
+              let hasPersistedReference = false
+              for (const staged of stagedAssets) {
+                const referenced = persistedAssets.some((asset) => (
+                  asset.id === staged.asset.id
+                  && asset.relativePath === staged.asset.relativePath
+                  && asset.thumbnailRelativePath === staged.asset.thumbnailRelativePath
+                ))
+                if (referenced) {
+                  hasPersistedReference = true
+                  continue
+                }
+                unreferencedStagedAssets.push(staged)
+              }
+              /** rollback 清理所有瞬态路径，并仅加入磁盘未引用素材的正式文件。 */
+              const cleanupTargets = [
+                ...unreferencedStagedAssets.flatMap((staged) => [
+                  { path: staged.finalAssetPath, label: '正式原图' },
+                  { path: staged.finalThumbnailPath, label: '正式缩略图' },
+                ]),
+                ...createPromotionCleanupTargets(stagedAssets, batchDirectory, false),
+              ]
+              /** 路径清理不完整或存在即时引用时都保留 journal，等待跨进程磁盘事实确认。 */
+              const cleanupComplete = cleanupPromotionTargets(
+                cleanupTargets,
+                this.dependencies.filePromotion?.cleanupPath,
+                this.warn,
+              )
+              if (!cleanupComplete || hasPersistedReference) return
+              try {
+                removePromotionJournal(journalPath)
+                settled = true
+              } catch (error) {
+                this.warn(`Design promotion journal 延迟清理: ${journalPath}: ${String(error)}`)
+              }
+            }
+            return createDesignAssetImportBatch(assets, commit, rollback)
           } catch (error) {
-            this.warn(`Design promotion journal 延迟清理: ${journalPath}: ${String(error)}`)
+            /** 异常回滚必须覆盖 journal 中所有 final/temp/staging，并逐项确认磁盘已不存在。 */
+            const cleanupTargets = createPromotionCleanupTargets(stagedAssets, batchDirectory, true)
+            /** 只有所有路径均确认不存在，才允许消费恢复 journal。 */
+            const cleanupComplete = cleanupPromotionTargets(
+              cleanupTargets,
+              this.dependencies.filePromotion?.cleanupPath,
+              this.warn,
+            )
+            if (journalPath && cleanupComplete) {
+              try {
+                removePromotionJournal(journalPath)
+              } catch (cleanupError) {
+                /** journal 删除失败也不能覆盖原始导入错误。 */
+                this.warn(`Design promotion journal 延迟清理: ${journalPath}: ${String(cleanupError)}`)
+              }
+            }
+            throw error
+          } finally {
+            removeUncommittedPath(batchDirectory, this.dependencies.filePromotion?.cleanupPath)
           }
-        }
-        return createDesignAssetImportBatch(assets, commit, rollback)
-      } catch (error) {
-        /** 异常回滚必须覆盖 journal 中所有 final/temp/staging，并逐项确认磁盘已不存在。 */
-        const cleanupTargets = createPromotionCleanupTargets(stagedAssets, batchDirectory, true)
-        /** 只有所有路径均确认不存在，才允许消费恢复 journal。 */
-        const cleanupComplete = cleanupPromotionTargets(
-          cleanupTargets,
-          this.dependencies.filePromotion?.cleanupPath,
-          this.warn,
-        )
-        if (journalPath && cleanupComplete) {
-          try {
-            removePromotionJournal(journalPath)
-          } catch (cleanupError) {
-            /** journal 删除失败也不能覆盖原始导入错误。 */
-            this.warn(`Design promotion journal 延迟清理: ${journalPath}: ${String(cleanupError)}`)
-          }
-        }
-        throw error
-      } finally {
-        removeUncommittedPath(batchDirectory, this.dependencies.filePromotion?.cleanupPath)
-      }
+        })
       })
-    })
+    } finally {
+      for (const authorizedSource of authorizedSources) authorizedSource.close()
+    }
   }
 
   /**
