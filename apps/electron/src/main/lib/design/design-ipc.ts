@@ -558,6 +558,14 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     /** Store 已完成 tmp/backup 恢复后，同进程立即重试 terminal pending 对账。 */
     options.jobs.reconcilePendingTerminals(input.projectId)
     lastReadableSnapshots.set(input.projectId, snapshot)
+    if (snapshot.recoveredFrom) {
+      /** 恢复提升已经改变权威磁盘基线，通知其它已打开窗口同步接管该 revision。 */
+      broadcastChange(options, {
+        projectId: input.projectId,
+        revision: snapshot.document.revision,
+        cause: 'recovery',
+      })
+    }
     if (!snapshot.writable) return snapshot
     const access = options.assets.createMediaAccess(input.projectId)
     /** 窗口异常退出时沿用同一释放路径，避免 token 等待 TTL。 */

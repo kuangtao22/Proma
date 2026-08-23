@@ -103,7 +103,7 @@ export function DesignToolbar({
 }: DesignToolbarProps): React.ReactElement {
   return (
     <TooltipProvider delayDuration={200} disableHoverableContent>
-      <div className="flex h-10 items-center gap-1 rounded-md border border-border bg-background/95 p-1 shadow-sm backdrop-blur-sm">
+      <div className="flex min-h-10 max-w-[calc(100vw-24px)] flex-wrap items-center gap-1 rounded-md border border-border bg-background/95 p-1 shadow-sm backdrop-blur-sm">
         <div className="flex items-center rounded-sm bg-muted p-0.5" role="group" aria-label="画布模式">
           <ToolbarIconButton
             icon={MousePointer2}

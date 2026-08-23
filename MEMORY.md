@@ -51,6 +51,8 @@
 - 项目目录选择使用按窗口、用途和代次隔离的一次性 `selectionId`；重启遗留的 copying/verifying/failed journal 只能按已持久化 operation 继续或显式放弃，renderer 不可直接指定任意目标路径。
 - 设计素材与 Agent 会话双向传递以项目归属和当前会话持久化消息为唯一授权事实：设计素材只填入目标会话 composer、不自动发送；Agent 图片只接受该 session 的 `tool_result.imageAttachments.localPath` 精确匹配，并继续执行 realpath、允许根和图片签名校验，禁止扫描目录。新版 SDK JSONL 在主进程落盘时从 Nano Banana 本地标记结构化附件字段，旧 `AgentMessage.events` 保持兼容。
 - Design 到 Agent composer 的跨视图文件引用使用按 `sessionId` 隔离的 Renderer 内存 Jotai 一次性队列：生产者先入队再导航，AgentView 仅在 editor 明确插入成功后确认清理并提示，失败时保留队列；富文本模式插入 mention 节点，默认纯文本或 mention 扩展缺失时复用可发送的 `@file:` 协议。归档或删除时清理队列，禁止用可能早于监听器挂载的 window 事件传递。禁用的会话菜单按钮保持原生 disabled，并由可聚焦包装元素提供原因提示。
+- Design 权威 `LOAD` 从 tmp/backup 提升恢复后必须广播 `cause: recovery`，让其它已打开窗口同步接管新 revision；启动清理只删除无当前 runtime promotion journal 引用的 `import-*`/`relink-*` staging，正式 assets 永不参与兜底清理。
+- Design Renderer 在 400ms 自动保存边界压缩 viewport mutation，只保留最后一个 `set-viewport` 且保持其它 mutation 顺序；macOS 沙箱内执行 Electron 完整构建时，将 `CLANG_MODULE_CACHE_PATH` 与 `SWIFT_MODULE_CACHE_PATH` 指向 `/private/tmp` 可避免原生 helper 写入用户缓存失败。
 
 ## 会话记录
 
@@ -105,3 +107,4 @@
 - 2026-08-23：Agent 图片附件提升必须由同批、顺序 SDK 消息中的 Nano Banana `tool_use_id` 精确关联证明，禁止非 Nano 工具或独立结果字段伪造授权；设计导入根仅限该 session 附件目录与其实际 Agent cwd 下的 `generated-images`，并在读取前执行大小边界检查。
 - 2026-08-23：Renderer 的 Agent 图片“加入设计”操作必须显式使用消息所属 `sessionId` 贯穿渲染链，禁止以当前激活标签身份代替消息身份；无项目会话的禁用按钮由可聚焦包装元素承载提示。
 - 2026-08-23：Nano Banana 新图片附件只允许由本地主进程 `saveAttachment` 结果经 Pi `tool_use_result` 结构化详情传递，并以来源标识和 `toolUseId` 双重匹配提升；Gemini/工具普通文本中的附件标记永不构成新授权事实，旧 JSONL 已有的结构化 `imageAttachments` 与 legacy 事件继续只读兼容。
+- 2026-08-23：完成设计工作区恢复、staging 清理、viewport 保存压缩、窄窗口与无障碍收口，并通过 Design/关联回归、全仓类型检查、Electron 完整构建及开发启动冒烟。

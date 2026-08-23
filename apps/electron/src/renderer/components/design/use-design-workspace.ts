@@ -238,6 +238,27 @@ export function restoreFailedMutationBatch(
 }
 
 /**
+ * 压缩一次自动保存批次中的视口事件，保留最后一次视口和全部其它业务 mutation。
+ * @param mutations 400ms 防抖窗口内累积的本地 mutation。
+ * @returns 保持其它 mutation 顺序、并把最终视口放在批次末尾的最小保存批次。
+ */
+export function coalesceDesignMutationsForSave(mutations: DesignMutation[]): DesignMutation[] {
+  /** 最终视口独立保存，连续缩放和平移不会线性放大 IPC 与磁盘 apply 成本。 */
+  let latestViewportMutation: Extract<DesignMutation, { type: 'set-viewport' }> | undefined
+  /** 非视口 mutation 必须完整保留原始顺序。 */
+  const coalesced: DesignMutation[] = []
+  for (const mutation of mutations) {
+    if (mutation.type === 'set-viewport') {
+      latestViewportMutation = mutation
+      continue
+    }
+    coalesced.push(mutation)
+  }
+  if (latestViewportMutation) coalesced.push(latestViewportMutation)
+  return coalesced
+}
+
+/**
  * 判断一批 mutation 是否只包含主进程允许自动 rebase 的位置类变更。
  * @param mutations 冲突后待处理的完整本地 mutation 队列。
  * @returns 仅全部为视口或节点移动时返回 true。
@@ -572,7 +593,7 @@ export function createDesignWorkspaceController(
       const current = dependencies.getState()
       if (!current.snapshot || !canSave(current)) return
       /** 本次从 pending 队列移出的保存批次。 */
-      const batch = current.pendingMutations
+      const batch = coalesceDesignMutationsForSave(current.pendingMutations)
       /** 本批 mutation 基于的服务端 revision。 */
       const expectedRevision = current.snapshot.document.revision
       dependencies.updateState({ pendingMutations: [], saveState: 'saving', error: null })

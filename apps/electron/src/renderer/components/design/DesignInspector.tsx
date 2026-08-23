@@ -192,9 +192,9 @@ function AssetsPanel({
         {selection.asset && !selection.missing && (
           <div className="space-y-3">
             <div className="space-y-1">
-              <p className="break-words text-xs font-medium">{selection.asset.filename}</p>
-              <p className="text-[11px] text-muted-foreground">{selection.asset.width} × {selection.asset.height}</p>
-              <p className="text-[11px] text-muted-foreground">{getAssetSourceLabel(selection.asset)}</p>
+              <p className="min-w-0 break-words text-xs font-medium">{selection.asset.filename}</p>
+              <p className="min-w-0 break-words text-[11px] text-muted-foreground">{selection.asset.width} × {selection.asset.height}</p>
+              <p className="min-w-0 break-words text-[11px] text-muted-foreground">{getAssetSourceLabel(selection.asset)}</p>
             </div>
             <div className="flex gap-1">
               <Button type="button" variant="outline" size="icon-sm" aria-label="导出素材" onClick={() => onExportAsset(selection.asset!.id)}><Download aria-hidden="true" /></Button>
@@ -407,7 +407,7 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
   const { state, width } = props
   /** 浏览器图片加载失败时记录物理缺失素材，不修改持久化元数据。 */
   const [missingAssetIds, setMissingAssetIds] = React.useState<ReadonlySet<string>>(new Set())
-  if (!state.snapshot) return <aside className="flex h-full items-center justify-center border-l border-border text-xs text-muted-foreground" style={{ width }}>正在加载检查器</aside>
+  if (!state.snapshot) return <aside className="flex h-full max-[960px]:max-w-[300px] items-center justify-center border-l border-border text-xs text-muted-foreground" style={{ width }}>正在加载检查器</aside>
   /** 按选区顺序解析仍存在的画布节点。 */
   const selectedNodes = state.selectedNodeIds.map((id) => state.snapshot!.document.nodes.find((node) => node.id === id)).filter((node) => node !== undefined)
   /** 只有单个素材节点进入详情和编辑态。 */
@@ -432,7 +432,7 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
     && state.authoritativeRecoveryState === 'idle'
     && state.saveState === 'saved'
   return (
-    <aside className="flex h-full min-h-0 shrink-0 flex-col border-l border-border bg-background" style={{ width }} aria-label="设计检查器">
+    <aside className="flex h-full min-h-0 min-w-0 shrink-0 flex-col border-l border-border bg-background max-[960px]:max-w-[300px]" style={{ width }} aria-label="设计检查器">
       <header className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
         <h2 className="text-sm font-semibold">设计</h2>
         <Button type="button" variant="ghost" size="icon-sm" aria-label="清除选择" disabled={(state.selectedNodeIds.length === 0 && !state.inspectorAssetId) || !props.onClearSelection} onClick={props.onClearSelection}><X aria-hidden="true" /></Button>

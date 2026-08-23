@@ -179,7 +179,7 @@ export function DesignWorkspaceStateView({
       </div>
 
       <div className="pointer-events-none absolute left-1/2 top-3 z-20 max-w-[calc(100%-24px)] -translate-x-1/2 overflow-x-auto">
-        <div className="pointer-events-auto w-max">
+        <div className="pointer-events-auto max-w-full">
           <DesignToolbar
             activeTool={state.activeTool}
             writable={writable}

@@ -998,11 +998,17 @@ export class DesignAssetService {
       mkdirSync(directoryPath, { recursive: true })
       const referencedAssets = new Set(document.assets.map((asset) => basename(asset.relativePath)))
       const referencedThumbnails = new Set(document.assets.map((asset) => basename(asset.thumbnailRelativePath)))
+      /** 当前进程 journal 引用的 staging 批次仍可能在运行，启动清理必须保留。 */
+      const retainedStagingNames = new Set<string>()
       for (const name of readdirSync(directoryPath)) {
         if (!name.startsWith('promotion-') || !name.endsWith('.json')) continue
         const journalPath = join(directoryPath, name)
         const journal = parsePromotionJournal(readFileSync(journalPath, 'utf8'), projectId)
-        if (!journal || journal.runtimeId === this.runtimeId) continue
+        if (!journal) continue
+        if (journal.runtimeId === this.runtimeId) {
+          if (journal.stagingDirectoryName) retainedStagingNames.add(journal.stagingDirectoryName)
+          continue
+        }
         /** 任何清理失败都保留 journal，供下次启动继续恢复。 */
         let recovered = true
         for (const assetName of journal.assetNames) {
@@ -1049,6 +1055,16 @@ export class DesignAssetService {
           }
         }
         if (recovered) removePromotionJournal(journalPath)
+      }
+      for (const stagingName of readdirSync(paths.stagingDir)) {
+        /** 只清理素材服务声明的单层批次目录，未知叶子与当前 journal 引用均不触碰。 */
+        const isManagedBatch = stagingName.startsWith('import-') || stagingName.startsWith('relink-')
+        if (!isManagedBatch || basename(stagingName) !== stagingName || retainedStagingNames.has(stagingName)) continue
+        try {
+          rmSync(join(paths.stagingDir, stagingName), { recursive: true, force: true })
+        } catch (error) {
+          this.warn(`Design 遗留 staging 清理失败: ${stagingName}: ${String(error)}`)
+        }
       }
     })
   }
