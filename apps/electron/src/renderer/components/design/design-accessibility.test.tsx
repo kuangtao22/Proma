@@ -101,8 +101,9 @@ describe('Design 无障碍、窄窗口与主题合同', () => {
     expect(inspectorSource).toContain('disabled:border-border/60')
     expect(inspectorSource).toContain('<Tooltip>')
     expect(inspectorSource).not.toContain('onKeyDown=')
-    expect(inspectorSource).toContain("setSettingsTab('tools')")
-    expect(inspectorSource).toContain("setToolSettingsFocus('nano-banana')")
+    expect(inspectorSource).toContain("setSettingsTab('channels')")
+    expect(inspectorSource).toContain("setChannelSettingsFocus('image-models')")
+    expect(inspectorSource).not.toContain("setToolSettingsFocus('nano-banana')")
     expect(inspectorSource).toContain('setSettingsOpen(true)')
   })
 

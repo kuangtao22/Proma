@@ -13,7 +13,6 @@ import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { SettingsSection, SettingsCard } from './primitives'
-import { ImageGenerationModelSettings } from './ImageGenerationModelSettings'
 import { chatToolsAtom } from '@/atoms/chat-tool-atoms'
 import { toolSettingsFocusAtom, type ToolSettingsFocus } from '@/atoms/settings-tab'
 
@@ -512,9 +511,8 @@ export function ToolSettings(): React.ReactElement {
       </div>
 
       {/* Nano Banana 生图工具 */}
-      <div ref={nanoBananaRef} className="space-y-8">
+      <div ref={nanoBananaRef}>
         <NanoBananaSettings />
-        <ImageGenerationModelSettings />
       </div>
 
       {/* 自定义工具 */}

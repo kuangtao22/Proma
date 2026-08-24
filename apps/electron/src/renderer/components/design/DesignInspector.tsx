@@ -17,7 +17,7 @@ import {
 import { agentEnqueuePendingMentionsAtom, agentSessionsAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
-import { settingsOpenAtom, settingsTabAtom, toolSettingsFocusAtom } from '@/atoms/settings-tab'
+import { channelSettingsFocusAtom, settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
 import type { DesignProjectState } from '@/atoms/design-atoms'
 import { Button } from '@/components/ui/button'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
@@ -610,7 +610,7 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
   const setActiveView = useSetAtom(activeViewAtom)
   const enqueuePendingMentions = useSetAtom(agentEnqueuePendingMentionsAtom)
   const setSettingsTab = useSetAtom(settingsTabAtom)
-  const setToolSettingsFocus = useSetAtom(toolSettingsFocusAtom)
+  const setChannelSettingsFocus = useSetAtom(channelSettingsFocusAtom)
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const openSession = useOpenSession()
   /** 模型 controller 只在进入项目、模型广播和手动重试时访问主进程。 */
@@ -646,12 +646,12 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
       toast.error(error instanceof Error ? error.message : '创建设计任务失败')
     })
   }, [handleRecoveryRequired, projectId, state.imageModelProfileId, updateState])
-  /** 从 Inspector 直达工具设置中的 Nano Banana 生图配置。 */
+  /** 从 Inspector 直达模型配置中的生图设置。 */
   const handleConfigureImageModels = React.useCallback((): void => {
-    setSettingsTab('tools')
-    setToolSettingsFocus('nano-banana')
+    setSettingsTab('channels')
+    setChannelSettingsFocus('image-models')
     setSettingsOpen(true)
-  }, [setSettingsOpen, setSettingsTab, setToolSettingsFocus])
+  }, [setChannelSettingsFocus, setSettingsOpen, setSettingsTab])
   /** 准备受控素材引用并填入目标会话 composer，不触发 Agent 发送。 */
   const handleSendAssetToSession = React.useCallback((assetId: string, sessionId: string): void => {
     const session = targetSessions.find((candidate) => candidate.id === sessionId)

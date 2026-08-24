@@ -1,5 +1,9 @@
 import * as React from 'react'
-import type { ImageGenerationModelCatalogResult, ImageGenerationModelProfile } from '@proma/shared'
+import type {
+  ImageGenerationChannelOption,
+  ImageGenerationModelCatalogResult,
+  ImageGenerationModelProfile,
+} from '@proma/shared'
 import {
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
   IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
@@ -9,11 +13,14 @@ import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { SettingsCard, SettingsSection } from './primitives'
 
 interface ImageGenerationModelSettingsViewProps {
   /** 当前可编辑的生图模型列表。 */
   profiles: ImageGenerationModelProfile[]
+  /** 模型配置页提供的清洗渠道与启用模型。 */
+  channelOptions?: ImageGenerationChannelOption[]
   /** Nano Banana 公共凭据是否已配置。 */
   credentialsConfigured: boolean
   /** 当前是否正在保存完整模型目录。 */
@@ -38,6 +45,7 @@ interface ImageGenerationModelSettingsViewProps {
 export interface ImageGenerationModelSettingsState {
   profiles: ImageGenerationModelProfile[]
   baselineProfiles: ImageGenerationModelProfile[]
+  channelOptions: ImageGenerationChannelOption[]
   credentialsConfigured: boolean
   initialLoading: boolean
   loadError: string | null
@@ -70,8 +78,9 @@ export function createImageGenerationModelProfile(
 ): ImageGenerationModelProfile {
   return {
     id,
-    name: '',
-    executor: 'nano-banana',
+    name: 'GPT Image 2',
+    executor: 'openai-images',
+    channelId: '',
     modelId: '',
     enabled: true,
     createdAt: now,
@@ -82,6 +91,7 @@ export function createImageGenerationModelProfile(
 /** 在提交 IPC 前检查 Renderer 可直接修正的模型目录问题。 */
 export function validateImageGenerationModelProfiles(
   profiles: readonly ImageGenerationModelProfile[],
+  channelOptions?: readonly ImageGenerationChannelOption[],
 ): string | null {
   /** 已出现的稳定 profile ID。 */
   const seenIds = new Set<string>()
@@ -91,16 +101,33 @@ export function validateImageGenerationModelProfiles(
     if (profile.name.length > IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH) {
       return `生图模型名称不能超过 ${IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH} 个字符`
     }
-    if (!profile.modelId.trim()) return `生图模型「${profile.name.trim()}」缺少模型 ID`
+    if (profile.executor === 'openai-images' && !profile.channelId.trim()) return '请选择模型配置'
+    if (!profile.modelId.trim()) return profile.executor === 'openai-images'
+      ? '请选择生图模型'
+      : `生图模型「${profile.name.trim()}」缺少模型 ID`
     if (profile.modelId.length > IMAGE_GENERATION_MODEL_ID_MAX_LENGTH) {
       return `生图模型「${profile.name.trim()}」的模型 ID 不能超过 ${IMAGE_GENERATION_MODEL_ID_MAX_LENGTH} 个字符`
     }
     if (!profile.id.trim()) return `第 ${index + 1} 个生图模型缺少配置 ID`
     if (seenIds.has(profile.id)) return '生图模型配置 ID 重复，请删除重复项后重试'
     seenIds.add(profile.id)
+    if (profile.executor === 'openai-images' && channelOptions) {
+      const channel = channelOptions.find((candidate) => candidate.channelId === profile.channelId)
+      if (!channel) return '所选模型配置已不存在'
+      if (!channel.models.some((model) => model.id === profile.modelId)) return '所选生图模型已不存在'
+    }
   }
 
   return null
+}
+
+/** 返回渠道引用 profile 当前可选的启用模型。 */
+export function getImageGenerationProfileModels(
+  profile: ImageGenerationModelProfile,
+  channelOptions: readonly ImageGenerationChannelOption[],
+): ImageGenerationChannelOption['models'] {
+  if (profile.executor !== 'openai-images') return []
+  return channelOptions.find((channel) => channel.channelId === profile.channelId)?.models ?? []
 }
 
 /** 把编辑态整理为可持久化的完整 profile 列表。 */
@@ -149,10 +176,13 @@ function haveSameEditableProfiles(
     /** 同一顺序位置的对照 profile。 */
     const other = right[index]
     return other !== undefined
+      && profile.executor === other.executor
       && profile.id === other.id
       && profile.name.trim() === other.name
       && profile.modelId.trim() === other.modelId
       && profile.enabled === other.enabled
+      && (profile.executor !== 'openai-images'
+        || (other.executor === 'openai-images' && profile.channelId.trim() === other.channelId))
   })
 }
 
@@ -163,6 +193,7 @@ export function createImageGenerationModelSettingsState(
   return {
     profiles: catalog?.profiles ?? [],
     baselineProfiles: catalog?.profiles ?? [],
+    channelOptions: catalog?.channelOptions ?? [],
     credentialsConfigured: catalog?.credentialsConfigured ?? false,
     initialLoading: catalog === undefined,
     loadError: null,
@@ -205,6 +236,7 @@ export function reduceImageGenerationModelSettingsState(
         return {
           ...state,
           credentialsConfigured: action.result.credentialsConfigured,
+          channelOptions: action.result.channelOptions,
           initialLoading: false,
           loadError: null,
           externalUpdatePending: action.mode === 'reload' || !haveSameEditableProfiles(
@@ -218,6 +250,7 @@ export function reduceImageGenerationModelSettingsState(
         profiles: action.result.profiles,
         baselineProfiles: action.result.profiles,
         credentialsConfigured: action.result.credentialsConfigured,
+        channelOptions: action.result.channelOptions,
         initialLoading: false,
         loadError: null,
         dirty: false,
@@ -237,6 +270,7 @@ export function reduceImageGenerationModelSettingsState(
         profiles: action.result.profiles,
         baselineProfiles: action.result.profiles,
         credentialsConfigured: action.result.credentialsConfigured,
+        channelOptions: action.result.channelOptions,
         dirty: false,
         externalUpdatePending: false,
         loadError: null,
@@ -249,6 +283,7 @@ export function reduceImageGenerationModelSettingsState(
 /** 渲染无嵌套卡片的生图模型配置列表。 */
 export function ImageGenerationModelSettingsView({
   profiles,
+  channelOptions = [],
   credentialsConfigured,
   saving,
   externalUpdatePending = false,
@@ -260,7 +295,7 @@ export function ImageGenerationModelSettingsView({
   onSave,
 }: ImageGenerationModelSettingsViewProps): React.ReactElement {
   /** 当前列表的本地校验结果。 */
-  const validationError = validateImageGenerationModelProfiles(profiles)
+  const validationError = validateImageGenerationModelProfiles(profiles, channelOptions)
   /** 名称或模型 ID 错误已经在字段旁显示，无需重复卡片级摘要。 */
   const hasFieldValidationError = profiles.some((profile) => (
     !profile.name.trim()
@@ -269,20 +304,30 @@ export function ImageGenerationModelSettingsView({
       || profile.modelId.length > IMAGE_GENERATION_MODEL_ID_MAX_LENGTH
   ))
   /** 保存动作是否应被阻断。 */
+  const nanoCredentialsMissing = profiles.some((profile) => profile.executor === 'nano-banana')
+    && !credentialsConfigured
   const saveDisabled = saving
     || reloadInProgress
     || profiles.length === 0
-    || !credentialsConfigured
+    || nanoCredentialsMissing
     || validationError !== null
 
   /** 更新指定 profile，同时保留其它行顺序。 */
   const updateProfile = (
     profileId: string,
-    patch: Partial<Pick<ImageGenerationModelProfile, 'name' | 'modelId' | 'enabled'>>,
+    update: (profile: ImageGenerationModelProfile) => ImageGenerationModelProfile,
   ): void => {
     onProfilesChange(profiles.map((profile) => (
-      profile.id === profileId ? { ...profile, ...patch } : profile
+      profile.id === profileId ? update(profile) : profile
     )))
+  }
+
+  /** 切换渠道后自动选择该渠道首个启用模型。 */
+  const updateChannel = (profileId: string, channelId: string): void => {
+    const channel = channelOptions.find((candidate) => candidate.channelId === channelId)
+    updateProfile(profileId, (profile) => profile.executor === 'openai-images'
+      ? { ...profile, channelId, modelId: channel?.models[0]?.id ?? '' }
+      : profile)
   }
 
   /** 删除指定 profile。 */
@@ -302,7 +347,7 @@ export function ImageGenerationModelSettingsView({
 
   return (
     <SettingsCard divided className="rounded">
-      {!credentialsConfigured && (
+      {nanoCredentialsMissing && (
         <div role="alert" className="px-4 py-3 text-xs text-destructive">
           请先配置 Nano Banana API Key，配置完成后才能保存和使用生图模型。
         </div>
@@ -376,11 +421,28 @@ export function ImageGenerationModelSettingsView({
               maxLength={IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH}
               value={profile.name}
               placeholder="例如：快速出图"
-              onChange={(event) => updateProfile(profile.id, { name: event.target.value })}
+              onChange={(event) => updateProfile(profile.id, (current) => ({ ...current, name: event.target.value }))}
             />
             {nameInvalid && <span id={nameErrorId} role="alert" className="block text-xs text-destructive">{nameError}</span>}
           </label>
-          <label className="min-w-52 flex-[1.4] space-y-1">
+          {profile.executor === 'openai-images' && (
+            <div className="min-w-48 flex-1 space-y-1">
+              <span className="block text-xs font-medium text-foreground">模型配置</span>
+              <Select value={profile.channelId || undefined} disabled={saving} onValueChange={(value) => updateChannel(profile.id, value)}>
+                <SelectTrigger className="h-8 min-w-0 rounded text-xs" aria-label={`模型配置 ${profile.name || profile.id}`}>
+                  <SelectValue placeholder="选择模型配置" />
+                </SelectTrigger>
+                <SelectContent>
+                  {channelOptions.map((channel) => (
+                    <SelectItem key={channel.channelId} value={channel.channelId} disabled={!channel.available}>
+                      {channel.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+          {profile.executor === 'nano-banana' ? <label className="min-w-52 flex-[1.4] space-y-1">
             <span className="block text-xs font-medium text-foreground">模型 ID</span>
             <Input
               aria-label={`生图模型 ID ${profile.name || profile.id}`}
@@ -391,17 +453,44 @@ export function ImageGenerationModelSettingsView({
               maxLength={IMAGE_GENERATION_MODEL_ID_MAX_LENGTH}
               value={profile.modelId}
               placeholder="gemini-3.1-flash-image-preview"
-              onChange={(event) => updateProfile(profile.id, { modelId: event.target.value })}
+              onChange={(event) => updateProfile(profile.id, (current) => ({ ...current, modelId: event.target.value }))}
             />
             {modelIdInvalid && <span id={modelIdErrorId} role="alert" className="block text-xs text-destructive">{modelIdError}</span>}
-          </label>
+          </label> : (
+            <div className="min-w-48 flex-1 space-y-1">
+              <span className="block text-xs font-medium text-foreground">模型</span>
+              <Select
+                value={profile.modelId || undefined}
+                disabled={saving || !profile.channelId}
+                onValueChange={(modelId) => updateProfile(profile.id, (current) => current.executor === 'openai-images'
+                  ? { ...current, modelId }
+                  : current)}
+              >
+                <SelectTrigger className="h-8 min-w-0 rounded text-xs" aria-label={`生图模型 ${profile.name || profile.id}`}>
+                  <SelectValue placeholder="选择生图模型" />
+                </SelectTrigger>
+                <SelectContent>
+                  {getImageGenerationProfileModels(profile, channelOptions).map((model) => (
+                    <SelectItem key={model.id} value={model.id}>{model.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {modelIdInvalid && <span id={modelIdErrorId} role="alert" className="block text-xs text-destructive">{modelIdError}</span>}
+            </div>
+          )}
+          <div className="min-w-32 space-y-1">
+            <span className="block text-xs font-medium text-foreground">调用协议</span>
+            <div className="flex h-8 items-center rounded border border-border bg-muted/30 px-2.5 text-xs text-muted-foreground">
+              {profile.executor === 'openai-images' ? 'OpenAI Images' : 'Nano Banana'}
+            </div>
+          </div>
           <div className="flex h-8 items-center gap-2">
             <span className="text-xs text-muted-foreground">启用</span>
             <Switch
               aria-label={`启用生图模型 ${profile.name || profile.id}`}
               checked={profile.enabled}
               disabled={saving}
-              onCheckedChange={(enabled) => updateProfile(profile.id, { enabled })}
+              onCheckedChange={(enabled) => updateProfile(profile.id, (current) => ({ ...current, enabled }))}
             />
           </div>
           <Button
@@ -527,13 +616,13 @@ export function ImageGenerationModelSettings(): React.ReactElement {
   /** 本地校验通过后完整替换系统模型目录。 */
   const handleSave = React.useCallback(async (): Promise<void> => {
     /** 当前编辑态的本地校验错误。 */
-    const validationError = validateImageGenerationModelProfiles(state.profiles)
+    const validationError = validateImageGenerationModelProfiles(state.profiles, state.channelOptions)
     if (validationError) {
       toast.error(validationError)
       return
     }
     if (
-      !state.credentialsConfigured
+      (state.profiles.some((profile) => profile.executor === 'nano-banana') && !state.credentialsConfigured)
       || state.profiles.length === 0
       || !canStartImageGenerationModelSave(
         savingRef.current,
@@ -564,7 +653,7 @@ export function ImageGenerationModelSettings(): React.ReactElement {
       savingRef.current = false
       if (mountedRef.current) setSaving(false)
     }
-  }, [state.baselineProfiles, state.credentialsConfigured, state.profiles])
+  }, [state.baselineProfiles, state.channelOptions, state.credentialsConfigured, state.profiles])
 
   return (
     <SettingsSection
@@ -597,6 +686,7 @@ export function ImageGenerationModelSettings(): React.ReactElement {
       ) : (
         <ImageGenerationModelSettingsView
           profiles={state.profiles}
+          channelOptions={state.channelOptions}
           credentialsConfigured={state.credentialsConfigured}
           saving={saving}
           reloadInProgress={reloadInProgress}

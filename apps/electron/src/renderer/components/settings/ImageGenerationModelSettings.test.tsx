@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { readFileSync } from 'node:fs'
 import type { ImageGenerationModelCatalogResult, ImageGenerationModelProfile } from '@proma/shared'
 import {
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
@@ -34,7 +35,48 @@ function createCatalog(
   return { profiles, channelOptions: [], credentialsConfigured, inheritedFromLegacyConfig: false }
 }
 
+/** 创建渠道引用型 GPT Image 2 profile。 */
+function createOpenAIProfile(
+  overrides: Partial<Extract<ImageGenerationModelProfile, { executor: 'openai-images' }>> = {},
+): Extract<ImageGenerationModelProfile, { executor: 'openai-images' }> {
+  return {
+    id: 'profile-gpt',
+    name: 'GPT Image 2',
+    executor: 'openai-images',
+    channelId: 'channel-gpt',
+    modelId: 'gpt-image-2',
+    enabled: true,
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  }
+}
+
 describe('ImageGenerationModelSettings', () => {
+  test('Given GPT Image profile When 选择渠道 Then 模型下拉只显示该渠道启用模型', () => {
+    const { getImageGenerationProfileModels } = imageModelSettingsModule
+    const profile = createOpenAIProfile({ channelId: 'channel-gpt', modelId: 'gpt-image-2' })
+    const models = getImageGenerationProfileModels(profile, [{
+      channelId: 'channel-gpt',
+      name: 'GPT Image 服务',
+      available: true,
+      models: [{ id: 'gpt-image-2', name: 'GPT Image 2' }],
+    }, {
+      channelId: 'channel-other',
+      name: '其它服务',
+      available: true,
+      models: [{ id: 'other-image', name: '其它图片模型' }],
+    }])
+    expect(models).toEqual([{ id: 'gpt-image-2', name: 'GPT Image 2' }])
+  })
+
+  test('Given 新建 OpenAI Images profile 未选渠道 When 保存 Then 本地校验阻断', () => {
+    const { validateImageGenerationModelProfiles } = imageModelSettingsModule
+    expect(validateImageGenerationModelProfiles([
+      createOpenAIProfile({ channelId: '', modelId: '' }),
+    ])).toBe('请选择模型配置')
+  })
+
   test('Given 两个生图 profile When 渲染设置 Then 显示名称、真实模型 ID、启停和删除命令', () => {
     const { ImageGenerationModelSettingsView } = imageModelSettingsModule
     const html = renderToStaticMarkup(
@@ -183,8 +225,9 @@ describe('ImageGenerationModelSettings', () => {
 
     expect(createImageGenerationModelProfile('profile-new', 1234)).toEqual({
       id: 'profile-new',
-      name: '',
-      executor: 'nano-banana',
+      name: 'GPT Image 2',
+      executor: 'openai-images',
+      channelId: '',
       modelId: '',
       enabled: true,
       createdAt: 1234,
@@ -393,6 +436,12 @@ describe('ImageGenerationModelSettings', () => {
 
     expect(saveCalls).toBe(0)
   })
+})
+
+test('Given Chat 工具设置 When 渲染 Then 不再重复展示 Design 生图目录', () => {
+  const source = readFileSync(new URL('./ToolSettings.tsx', import.meta.url), 'utf8')
+  expect(source).not.toContain('<ImageGenerationModelSettings />')
+  expect(source).toContain('<NanoBananaSettings />')
 })
 
 test('Given 普通会话已保存旧模型 When 更新 Nano Banana 连接信息 Then 原样保留旧模型', () => {

@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import type { Channel } from '@proma/shared'
 import * as channelSettingsModule from './ChannelSettings'
 
@@ -62,4 +63,11 @@ test('Given 上次加载失败 When 重试成功 Then 替换渠道并清除错�
 
   expect(state.channels).toEqual([nextChannel])
   expect(state.error).toBeNull()
+})
+
+test('Given 设置列表 When 渲染模型配置 Then 生图设置位于渠道区块之后', () => {
+  const source = readFileSync(new URL('./ChannelSettings.tsx', import.meta.url), 'utf8')
+  expect(source.indexOf('title="模型配置"'))
+    .toBeLessThan(source.indexOf('<ImageGenerationModelSettings />'))
+  expect(source).toContain('<ImageGenerationModelSettings />')
 })
