@@ -73,6 +73,9 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(body).toContain('resolveTrustedImageRoute: extensions.resolveTrustedImageRoute')
     expect(body).toContain('createRunToolCallLimiter(extensions.toolCallLimits)')
     expect(body).toContain('consumeRunToolCallLimit(toolName)')
+    expect(body).toContain('extensions.beforeToolCall?.(toolName, input)')
+    expect(body.indexOf('extensions.beforeToolCall?.(toolName, input)'))
+      .toBeGreaterThan(body.indexOf('consumeRunToolCallLimit(toolName)'))
   })
 
   test('Given sendMessage 实现 When 检查迁移拒绝分支 Then 它早于 active、retry 删除、消息落盘和首次 await', () => {

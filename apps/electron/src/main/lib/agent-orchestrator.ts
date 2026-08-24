@@ -1288,6 +1288,14 @@ export class AgentOrchestrator {
         /** 参数有效后、任何异步权限等待前同步占位，防止并发工具调用同时穿透上限。 */
         const toolLimitDenial = consumeRunToolCallLimit(toolName)
         if (toolLimitDenial) return toolLimitDenial
+        try {
+          /** 单次运行守卫在次数占位后、任何真实工具副作用前执行。 */
+          extensions.beforeToolCall?.(toolName, input)
+        } catch (error) {
+          /** Design 上下文预检失败转为稳定 deny，禁止进入付费图片执行器。 */
+          const message = error instanceof Error ? error.message : String(error)
+          return { behavior: 'deny', message }
+        }
 
         // ── Write 大文件 token 截断防护 ──
         if (toolName === 'Write' && typeof input.content === 'string') {
