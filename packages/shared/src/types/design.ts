@@ -438,6 +438,7 @@ export const DESIGN_IPC_CHANNELS = {
   CREATE_JOB: 'design:create-job',
   CANCEL_JOB: 'design:cancel-job',
   RETRY_JOB: 'design:retry-job',
+  DELETE_JOB: 'design:delete-job',
   LIST_JOBS: 'design:list-jobs',
   GET_TASK_DETAILS: 'design:get-task-details',
   GET_TASK_TRACE: 'design:get-task-trace',

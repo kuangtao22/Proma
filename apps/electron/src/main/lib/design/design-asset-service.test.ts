@@ -529,6 +529,26 @@ describe('Design 素材安全服务', () => {
     expect(existsSync(join(paths.thumbnailsDir, basename(asset!.thumbnailRelativePath)))).toBe(false)
   })
 
+  test('Given 成功任务素材完成删除 When 来源 Job 存在 Then 元数据提交后通知任务清理', async () => {
+    /** 记录素材删除提交后收到的来源任务身份。 */
+    const deletedJobs: Array<{ projectId: string; sourceJobId: string }> = []
+    service = createService({
+      onSuccessfulJobAssetDeleted: (projectId, sourceJobId) => {
+        deletedJobs.push({ projectId, sourceJobId })
+      },
+    })
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], {
+      kind: 'job', sourceJobId: 'job-1', sourceSessionId: 'session-1', prompt: '生成海报',
+    })
+    const asset = batch[0]!
+    const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+    batch.commit()
+
+    service.deleteAsset('project-1', asset.id, withAsset.revision)
+
+    expect(deletedJobs).toEqual([{ projectId: 'project-1', sourceJobId: 'job-1' }])
+  })
+
   test('Given tmp 或 backup 恢复候选 When 首个素材操作是导出 Then 要求重载且不创建目标文件', async () => {
     const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
     const asset = batch[0]!
@@ -867,6 +887,7 @@ describe('Design 素材安全服务', () => {
     store?: DesignStore
     runtimeId?: string
     warn?: (message: string) => void
+    onSuccessfulJobAssetDeleted?: (projectId: string, sourceJobId: string) => void
   }): DesignAssetService {
     return new DesignAssetService({
       pathResolver: { resolve: () => paths },
@@ -876,6 +897,7 @@ describe('Design 素材安全服务', () => {
       registerDirectoryPath: (directoryPath) => `proma-file://${basename(directoryPath)}`,
       revokePathUrl: () => {},
       warn: overrides.warn ?? (() => {}),
+      onSuccessfulJobAssetDeleted: overrides.onSuccessfulJobAssetDeleted,
       ...(overrides.renameFile || overrides.cleanupPath ? {
         filePromotion: {
           ...(overrides.renameFile ? { renameFile: overrides.renameFile } : {}),

@@ -9,12 +9,15 @@ import {
 } from '@proma/shared'
 import type {
   AgentMessage,
+  SDKAssistantMessage,
   AgentSessionMeta,
   CreateDesignJobInput,
   DesignAsset,
   DesignCanvasDocument,
   DesignJobRecord,
+  DesignTraceEntry,
   ImageGenerationModelSnapshot,
+  SDKMessage,
 } from '@proma/shared'
 import type { DesignAssetImportBatch, DesignAssetImportSource } from './design-asset-service'
 import { DesignJobManager } from './design-job-manager'
@@ -64,6 +67,133 @@ describe('Design Job Manager', () => {
   })
 
   afterEach(() => rmSync(cacheRoot, { recursive: true, force: true }))
+
+  test('Given Design 直接提交 When 创建首个 job Then 分配独立创作任务 ID 与 attempt 1', () => {
+    const input = createGenerateInput()
+
+    const job = harness.manager.create(input)
+
+    expect(job).toMatchObject({
+      creativeTaskId: 'creative-1',
+      attemptNumber: 1,
+      originalRequest: input.prompt,
+      contextMode: 'none',
+      traceState: 'pending',
+      executionSessionCleanupState: 'pending',
+    })
+    expect(job.creativeTaskId).not.toBe(job.id)
+  })
+
+  test('Given failed attempt When 显式重试 Then 沿用任务 ID 并递增 attempt', async () => {
+    const failed = harness.manager.create(createGenerateInput())
+    await harness.manager.run(failed.id)
+
+    const replacement = harness.manager.retry('project-1', failed.id)
+
+    expect(replacement.creativeTaskId).toBe(failed.creativeTaskId)
+    expect(replacement.attemptNumber).toBe(failed.attemptNumber + 1)
+    expect(harness.manager.list('project-1')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: failed.id, status: 'failed' }),
+      expect.objectContaining({ id: replacement.id, status: 'queued' }),
+    ]))
+  })
+
+  test('Given 图片已提交但 trace 写入失败 When 收敛 Then 保持 succeeded 并等待恢复', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    harness.traceWriteError = new Error('trace rename failed')
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'succeeded',
+      traceState: 'pending',
+      executionSessionCleanupState: 'pending',
+    })
+    expect(harness.cleanedSessionIds).toEqual([])
+    expect(harness.warnings.some((message) => message.includes('trace rename failed'))).toBe(true)
+  })
+
+  test('Given 终态 trace 可读 When 收敛 Then 保存真实摘要并回收内部会话', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    harness.sdkMessages = [{
+      type: 'assistant', parent_tool_use_id: null,
+      message: { content: [{
+        type: 'tool_use', id: 'tool-1', name: NANO_BANANA_TOOL,
+        input: { prompt: 'exact image prompt', designSummary: 'quiet hierarchy' },
+      }] },
+    }]
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'succeeded',
+      traceState: 'ready',
+      executionSessionCleanupState: 'completed',
+      finalImagePrompt: 'exact image prompt',
+      designSummary: 'quiet hierarchy',
+      completedAt: expect.any(Number),
+    })
+    expect(harness.cleanedSessionIds).toEqual(['session-1'])
+  })
+
+  test('Given 用户先打开任务详情 When 未展开 trace Then 不读取大 trace', async () => {
+    const failed = harness.manager.create(createGenerateInput())
+    await harness.manager.run(failed.id)
+
+    const light = harness.manager.getTaskDetails('project-1', failed.id, false)
+    expect(light.trace).toBeUndefined()
+    expect(harness.traceReadCount).toBe(0)
+
+    const expanded = harness.manager.getTaskDetails('project-1', failed.id, true)
+    expect(expanded.trace).toEqual(harness.traceEntries)
+    expect(harness.traceReadCount).toBe(1)
+  })
+
+  test('Given 旧 journal 缺少创作任务字段 When 读取 Then 只在内存补兼容值', () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    const legacyPath = join(jobsDirectory, 'job-legacy.json')
+    const legacy = {
+      id: 'job-legacy', projectId: 'project-1', action: 'generate', status: 'failed',
+      prompt: '旧任务', nodeId: 'node-legacy', position: { x: 0, y: 0 },
+      createdAt: 1, updatedAt: 2,
+    }
+    writeFileSync(legacyPath, JSON.stringify(legacy), 'utf8')
+
+    expect(harness.manager.list('project-1')).toContainEqual(expect.objectContaining({
+      id: 'job-legacy', creativeTaskId: 'job-legacy', attemptNumber: 1,
+      originalRequest: '旧任务', contextMode: 'none',
+    }))
+    expect(JSON.parse(readFileSync(legacyPath, 'utf8'))).toEqual(legacy)
+  })
+
+  test('Given 重启留下 running 内部会话 When 恢复 Then 中断后继续 trace 与会话清理', async () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    document.nodes = [{
+      id: 'node-running', kind: 'job', jobId: 'job-running', position: { x: 0, y: 0 },
+      width: 320, height: 240, zIndex: 0,
+    }]
+    writeFileSync(join(jobsDirectory, 'job-running.json'), JSON.stringify({
+      id: 'job-running', creativeTaskId: 'creative-running', attemptNumber: 1,
+      projectId: 'project-1', sessionId: 'session-running', action: 'generate', status: 'running',
+      prompt: '恢复任务', originalRequest: '恢复任务', contextMode: 'none',
+      traceState: 'pending', executionSessionCleanupState: 'pending',
+      nodeId: 'node-running', position: { x: 0, y: 0 }, placementState: 'ready',
+      createdAt: 1, updatedAt: 2,
+    }), 'utf8')
+    harness.sdkMessages = []
+
+    harness.manager.recover('project-1')
+    await Promise.resolve()
+
+    expect(harness.manager.get('job-running')).toMatchObject({
+      status: 'interrupted', traceState: 'ready', executionSessionCleanupState: 'completed',
+    })
+    expect(harness.cleanedSessionIds).toEqual(['session-running'])
+  })
 
   test('Given 图片编辑成功 When Pi 完成 Then 只导入当前任务图片并建立父子版本', async () => {
     harness.messages = [createToolMessage('session-1/output.png')]
@@ -139,6 +269,85 @@ describe('Design Job Manager', () => {
       error: '任务完成但没有产生可验证图片',
     })
     expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: job.id })
+  })
+
+  test('Given Pi 以 user tool_result 返回已验证图片 When 完成 Then 导入图片而不是误报无输出', async () => {
+    harness.messages = [createToolMessage('session-1/output.png', 'user')]
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'succeeded',
+      outputAssetId: 'asset-output',
+      sessionId: 'session-1',
+    })
+    expect(document.nodes[0]).toMatchObject({ kind: 'asset', assetId: 'asset-output' })
+  })
+
+  test('Given 失败任务仍拥有占位节点 When 删除 Then 同一写锁内移除节点和 journal', async () => {
+    const job = harness.manager.create(createGenerateInput())
+    await harness.manager.run(job.id)
+
+    const updated = harness.manager.delete('project-1', job.id)
+
+    expect(updated.nodes).toEqual([])
+    expect(harness.manager.get(job.id)).toBeUndefined()
+    expect(existsSync(join(cacheRoot, 'jobs', `${job.id}.json`))).toBe(false)
+  })
+
+  test('Given 同一创作任务经历两次失败 When 删除当前任务 Then 聚合清理全部 attempt 与 trace', async () => {
+    const original = harness.manager.create(createGenerateInput())
+    await harness.manager.run(original.id)
+    const replacement = harness.manager.retry('project-1', original.id)
+    await harness.manager.run(replacement.id)
+
+    harness.manager.delete('project-1', replacement.id)
+
+    expect(harness.manager.list('project-1')).toEqual([])
+    expect(harness.deletedTraceJobIds.sort()).toEqual([original.id, replacement.id].sort())
+  })
+
+  test('Given 成功素材已从画布删除 When 回收来源任务 Then 删除同任务 journal 与 trace', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    const job = harness.manager.create(createGenerateInput())
+    await harness.manager.run(job.id)
+    document = { ...document, nodes: [], assets: [] }
+
+    harness.manager.cleanupTaskAfterSuccessfulAssetDeletion('project-1', job.id)
+
+    expect(harness.manager.list('project-1')).toEqual([])
+    expect(harness.deletedTraceJobIds).toContain(job.id)
+  })
+
+  test('Given 运行中任务 When 删除 Then 拒绝且保留节点和 journal', () => {
+    const job = harness.manager.create(createGenerateInput())
+    const journalPath = join(cacheRoot, 'jobs', `${job.id}.json`)
+
+    expect(() => harness.manager.delete('project-1', job.id)).toThrow('当前设计任务不可删除')
+
+    expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: job.id })
+    expect(existsSync(journalPath)).toBe(true)
+  })
+
+  test('Given 删除意图已持久化但应用退出 When 恢复 Then 完成节点和 journal 清理', () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    document.nodes = [{
+      id: 'node-failed', kind: 'job', jobId: 'job-failed', position: { x: 0, y: 0 },
+      width: 320, height: 240, zIndex: 0,
+    }]
+    writeFileSync(join(jobsDirectory, 'job-failed.json'), JSON.stringify({
+      id: 'job-failed', projectId: 'project-1', action: 'generate', status: 'failed',
+      prompt: '失败任务', nodeId: 'node-failed', position: { x: 0, y: 0 },
+      placementState: 'ready', deletionState: { status: 'pending' }, createdAt: 1, updatedAt: 2,
+    }))
+
+    const recovered = harness.manager.recover('project-1')
+
+    expect(recovered).toEqual([])
+    expect(document.nodes).toEqual([])
+    expect(existsSync(join(jobsDirectory, 'job-failed.json'))).toBe(false)
   })
 
   test.each([
@@ -944,6 +1153,9 @@ describe('Design Job Manager', () => {
       resolveAvailableSnapshot: (profileId: string) => ImageGenerationModelSnapshot
       assertSnapshotAvailable: (snapshot: ImageGenerationModelSnapshot) => void
       resolveExecutionRoute: (snapshot: ImageGenerationModelSnapshot) => ResolvedImageGenerationRoute
+      sdkMessages: SDKMessage[]
+      traceWriteError?: Error
+      cleanupError?: Error
     } = {
       settings: { agentChannelId: 'channel-default', agentModelId: 'model-default' },
       messages: [] as AgentMessage[],
@@ -964,6 +1176,7 @@ describe('Design Job Manager', () => {
         executor: 'nano-banana',
         snapshot: snapshot as Extract<ImageGenerationModelSnapshot, { executor: 'nano-banana' }>,
       }),
+      sdkMessages: [],
     }
     const createdSessions: AgentSessionMeta[] = []
     const stoppedSessions: string[] = []
@@ -978,6 +1191,16 @@ describe('Design Job Manager', () => {
     let batchCommits = 0
     let batchRollbacks = 0
     let retryIntentWrites = 0
+    /** 记录 trace 读取次数，证明详情首屏不会加载大日志。 */
+    let traceReadCount = 0
+    /** 测试详情展开时返回的固定 trace。 */
+    const traceEntries: DesignTraceEntry[] = [{
+      timestamp: 1, type: 'thinking', title: '模型原始 Thinking', content: '真实思考',
+    }]
+    /** 已完成会话清理的内部 session ID。 */
+    const cleanedSessionIds: string[] = []
+    /** 用户删除创作任务时清理的单次 trace ID。 */
+    const deletedTraceJobIds: string[] = []
     /** 记录 output 阶段副作用并验证 Manager 外层 lease。 */
     const recordOutputEffect = (effect: string): void => {
       outputEffects.push(effect)
@@ -1039,6 +1262,7 @@ describe('Design Job Manager', () => {
       },
       getSettings: () => state.settings,
       getSession: (sessionId) => createdSessions.find((session) => session.id === sessionId),
+      getSessionMessages: () => state.sdkMessages,
       createSession: (input) => {
         if (state.createSessionError) throw state.createSessionError
         const session: AgentSessionMeta = {
@@ -1068,6 +1292,31 @@ describe('Design Job Manager', () => {
         callbacks.onComplete(state.messages)
       },
       stopAgent: async (sessionId) => { stoppedSessions.push(sessionId) },
+      traceStore: {
+        writeFromMessages: () => {
+          if (state.traceWriteError) throw state.traceWriteError
+          return {
+            summary: {
+              designSummary: 'quiet hierarchy',
+              finalImagePrompt: 'exact image prompt',
+              rawThinkingAvailable: state.sdkMessages.some((message) => {
+                if (message.type !== 'assistant' || !('message' in message)) return false
+                return (message as SDKAssistantMessage).message.content
+                  .some((block) => block.type === 'thinking')
+              }),
+            },
+            entryCount: traceEntries.length,
+          }
+        },
+        read: () => { traceReadCount += 1; return traceEntries },
+        delete: (_projectId, jobId) => { deletedTraceJobIds.push(jobId) },
+      },
+      sessionLifecycle: {
+        cleanup: async ({ sessionId }) => {
+          if (state.cleanupError) throw state.cleanupError
+          cleanedSessionIds.push(sessionId)
+        },
+      },
       resolveOwnedOutputPath: (sessionId, localPath) => (
         localPath.startsWith(`${sessionId}/`) ? `/trusted/${localPath}` : undefined
       ),
@@ -1117,6 +1366,7 @@ describe('Design Job Manager', () => {
         identity += 1
         return state.createId()
       },
+      createCreativeTaskId: () => `creative-${identity}`,
       now: () => 10 + identity,
     })
     /** Manager 对外事件必须携带 Store 权威 revision。 */
@@ -1129,17 +1379,24 @@ describe('Design Job Manager', () => {
       importSources,
       runInputs,
       warnings,
+      cleanedSessionIds,
+      deletedTraceJobIds,
+      traceEntries,
       changedEvents,
       outputEffects,
       unguardedOutputEffects,
       get batchCommits() { return batchCommits },
       get batchRollbacks() { return batchRollbacks },
       get retryIntentWrites() { return retryIntentWrites },
+      get traceReadCount() { return traceReadCount },
       get relocationAttemptError() { return state.relocationAttemptError },
       get settings() { return state.settings },
       set settings(value: typeof state.settings) { state.settings = value },
       get messages() { return state.messages },
       set messages(value: AgentMessage[]) { state.messages = value },
+      set sdkMessages(value: SDKMessage[]) { state.sdkMessages = value },
+      set traceWriteError(value: Error | undefined) { state.traceWriteError = value },
+      set cleanupError(value: Error | undefined) { state.cleanupError = value },
       set runHeadless(value: typeof state.runHeadless) { state.runHeadless = value },
       set createSessionError(value: Error | undefined) { state.createSessionError = value },
       set importError(value: Error | undefined) { state.importError = value },
@@ -1200,10 +1457,16 @@ function createMultiProjectRecoveryManager(projectBJobs: string, warnings: strin
     },
     getSettings: () => ({}),
     getSession: () => undefined,
+    getSessionMessages: () => [],
     createSession: () => { throw new Error('测试不应创建会话') },
-    updateSession: () => undefined,
     runHeadless: async () => undefined,
     stopAgent: () => undefined,
+    traceStore: {
+      writeFromMessages: () => ({ summary: { rawThinkingAvailable: false }, entryCount: 0 }),
+      read: () => [],
+      delete: () => undefined,
+    },
+    sessionLifecycle: { cleanup: async () => undefined },
     resolveOwnedOutputPath: () => undefined,
     listProjectIds: () => ['project-a', 'project-b'],
     runWorkspaceWrite: (_projectId, effect) => effect(),
@@ -1266,10 +1529,10 @@ function createAsset(id: string, source: DesignAssetImportSource = { kind: 'pick
 }
 
 /** 创建本轮 Nano Banana 成功工具消息。 */
-function createToolMessage(localPath: string): AgentMessage {
+function createToolMessage(localPath: string, role: AgentMessage['role'] = 'tool'): AgentMessage {
   return {
     id: 'tool-message',
-    role: 'tool',
+    role,
     content: '完成',
     createdAt: 1,
     events: [{

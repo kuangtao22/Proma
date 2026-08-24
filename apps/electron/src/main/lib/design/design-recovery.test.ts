@@ -198,7 +198,15 @@ function createIpcFixture(store: DesignStore, readOnlyReason?: string): {
       run: async () => { effects.push('run') },
       cancel: async () => createJobRecord('job-cancelled'),
       retry: () => { effects.push('retry'); return createJobRecord('job-retry') },
+      delete: () => { effects.push('delete-job'); return createEmptyDesignDocument('project-1') },
       list: () => [],
+      getTaskDetails: (_projectId, jobId, includeTrace) => ({
+        creativeTaskId: `creative-${jobId}`,
+        currentJobId: jobId,
+        attempts: [],
+        traceState: 'unavailable',
+        ...(includeTrace ? { trace: [] } : {}),
+      }),
       reconcilePendingTerminals: () => [],
       onChanged: () => () => undefined,
     },
@@ -247,8 +255,10 @@ function createEmptyBatch() {
 /** 创建最小任务记录供被 guard 阻止的 handler 满足类型。 */
 function createJobRecord(id: string) {
   return {
-    id, projectId: 'project-1', action: 'generate' as const, status: 'queued' as const,
-    prompt: '生成海报', createdAt: 1, updatedAt: 1,
+    id, creativeTaskId: `creative-${id}`, attemptNumber: 1,
+    projectId: 'project-1', action: 'generate' as const, status: 'queued' as const,
+    prompt: '生成海报', originalRequest: '生成海报', contextMode: 'none' as const,
+    createdAt: 1, updatedAt: 1,
   }
 }
 
@@ -293,10 +303,16 @@ function createRecoveryJobManager(
     },
     getSettings: () => ({}),
     getSession: () => undefined,
+    getSessionMessages: () => [],
     createSession: () => { throw new Error('恢复不应创建会话') },
-    updateSession: () => undefined,
     runHeadless: async () => undefined,
     stopAgent: () => undefined,
+    traceStore: {
+      writeFromMessages: () => ({ summary: { rawThinkingAvailable: false }, entryCount: 0 }),
+      read: () => [],
+      delete: () => undefined,
+    },
+    sessionLifecycle: { cleanup: async () => undefined },
     resolveOwnedOutputPath: () => undefined,
     listProjectIds: () => ['project-1'],
     runWorkspaceWrite: (_projectId, effect) => effect(),

@@ -9,8 +9,11 @@ import type {
   DesignCanvasDocument,
   DesignCanvasNode,
   DesignJobRecord,
+  DesignMutation,
   DesignPoint,
+  DesignTaskDetails,
   ImageGenerationModelSnapshot,
+  SDKMessage,
 } from '@proma/shared'
 import {
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
@@ -24,11 +27,16 @@ import { runSafeImageModelOperation } from '../image-generation-model-error'
 import type { DesignAssetImportSource, DesignAssetService } from './design-asset-service'
 import { isSafeDesignStableId } from './design-paths'
 import type { DesignStore } from './design-store'
+import type { DesignTraceWriteResult } from './design-trace-store'
 
 const DESIGN_IMAGE_TOOL = 'mcp__nano_banana__generate_image'
 const DESIGN_JOB_MODEL_ERROR = '未配置可用的 Agent 渠道和模型'
 const DESIGN_JOB_OUTPUT_ERROR = '任务完成但没有产生可验证图片'
 const DESIGN_IMAGE_MODEL_VALIDATION_ERROR = '校验生图模型配置失败，请刷新后重试'
+/** 已完成业务执行、可以进入 trace 与会话回收阶段的状态。 */
+const TERMINAL_JOB_STATUSES = new Set<DesignJobRecord['status']>([
+  'succeeded', 'failed', 'cancelled', 'interrupted',
+])
 
 /** Design Job 使用的最小设置字段。 */
 interface DesignJobSettings {
@@ -49,6 +57,8 @@ interface StoredDesignJob extends DesignJobRecord {
   replacedByJobId?: string
   /** replacement 创建完成前持久化的 retry intent。 */
   retryState?: { status: 'pending' }
+  /** 终态任务删除在画布与 journal 之间的可恢复意图。 */
+  deletionState?: { status: 'pending' }
 }
 
 /** Manager 内部创建已使用独立可信 snapshot，不再依赖 Renderer profile ID。 */
@@ -56,16 +66,27 @@ type InternalCreateDesignJobInput = Omit<CreateDesignJobInput, 'imageModelProfil
 
 /** journal 允许出现的完整字段集合，未知字段一律拒绝。 */
 const STORED_JOB_FIELDS = new Set([
-  'id', 'projectId', 'sessionId', 'action', 'status', 'prompt', 'sourceSessionId',
+  'id', 'creativeTaskId', 'attemptNumber', 'projectId', 'sessionId', 'action', 'status',
+  'prompt', 'originalRequest', 'contextMode', 'sourceAgentMessageId', 'sourceSessionId',
   'sourceAssetId', 'parentAssetId', 'outputAssetId', 'error', 'createdAt', 'updatedAt',
+  'traceState', 'executionSessionCleanupState', 'contextReferences', 'designSummary',
+  'finalImagePrompt', 'rawThinkingAvailable', 'contextWarning', 'startedAt', 'completedAt',
   'imageModelSnapshot',
   'nodeId', 'position', 'maskAnnotationId', 'placementState', 'terminalState',
-  'replacedByJobId', 'retryState',
+  'replacedByJobId', 'retryState', 'deletionState',
 ])
 /** journal 中必须始终存在的基础字段。 */
 const REQUIRED_STORED_JOB_FIELDS = [
-  'id', 'projectId', 'action', 'status', 'prompt', 'createdAt', 'updatedAt', 'nodeId', 'position',
+  'id', 'creativeTaskId', 'attemptNumber', 'projectId', 'action', 'status', 'prompt',
+  'originalRequest', 'contextMode', 'createdAt', 'updatedAt', 'nodeId', 'position',
 ] as const
+/** 旧 journal 只允许历史字段，半升级记录不会被当作兼容输入。 */
+const LEGACY_STORED_JOB_FIELDS = new Set([
+  'id', 'projectId', 'sessionId', 'action', 'status', 'prompt', 'sourceSessionId',
+  'sourceAssetId', 'parentAssetId', 'outputAssetId', 'error', 'createdAt', 'updatedAt',
+  'imageModelSnapshot', 'nodeId', 'position', 'maskAnnotationId', 'placementState',
+  'terminalState', 'replacedByJobId', 'retryState', 'deletionState',
+])
 
 /** Headless Agent 回调的窄接口。 */
 interface DesignHeadlessCallbacks {
@@ -87,6 +108,8 @@ export interface DesignJobManagerDependencies {
   >
   getSettings: () => DesignJobSettings
   getSession: (sessionId: string) => AgentSessionMeta | undefined
+  /** 从内部会话 JSONL 读取完整 SDK 事实，用于终态 trace 转存。 */
+  getSessionMessages: (sessionId: string) => SDKMessage[]
   createSession: (input: {
     title: string
     channelId: string
@@ -100,6 +123,16 @@ export interface DesignJobManagerDependencies {
     extensions: AgentRunExtensions,
   ) => Promise<void>
   stopAgent: (sessionId: string) => void | Promise<void>
+  /** 保存并按需读取 Design trace，不向 Manager 暴露实际文件路径。 */
+  traceStore: {
+    writeFromMessages: (projectId: string, jobId: string, messages: SDKMessage[]) => DesignTraceWriteResult
+    read: (projectId: string, jobId: string) => NonNullable<DesignTaskDetails['trace']>
+    delete: (projectId: string, jobId: string) => void
+  }
+  /** trace ready 后回收内部执行会话。 */
+  sessionLifecycle: {
+    cleanup: (input: { sessionId: string; traceState: 'ready' }) => Promise<void>
+  }
   /** 验证附件属于当前会话并返回可供素材服务读取的绝对路径。 */
   resolveOwnedOutputPath: (sessionId: string, localPath: string) => string | undefined
   listProjectIds: () => string[]
@@ -112,6 +145,8 @@ export interface DesignJobManagerDependencies {
   /** 生图模型未知底层错误记录器，必须保留原始 Error 供主进程诊断。 */
   logImageModelError?: (message: string, error: unknown) => void
   createId?: () => string
+  /** 为跨尝试创作任务生成独立稳定 ID。 */
+  createCreativeTaskId?: () => string
   now?: () => number
 }
 
@@ -169,12 +204,14 @@ export class DesignJobManager {
   private readonly projectRevisions = new Map<string, number>()
   private readonly listeners = new Set<DesignJobChangedListener>()
   private readonly createId: () => string
+  private readonly createCreativeTaskId: () => string
   private readonly now: () => number
   private readonly warn: (message: string) => void
   private readonly logImageModelError: (message: string, error: unknown) => void
 
   constructor(private readonly dependencies: DesignJobManagerDependencies) {
     this.createId = dependencies.createId ?? randomUUID
+    this.createCreativeTaskId = dependencies.createCreativeTaskId ?? randomUUID
     this.now = dependencies.now ?? Date.now
     this.warn = dependencies.warn ?? ((message) => { console.error(message) })
     this.logImageModelError = dependencies.logImageModelError
@@ -199,6 +236,42 @@ export class DesignJobManager {
   list(projectId: string): DesignJobRecord[] {
     return this.readProjectJobs(projectId)
       .sort((left, right) => left.createdAt - right.createdAt)
+  }
+
+  /**
+   * 查询同一创作任务的尝试历史，并仅在显式请求时读取当前 trace。
+   * @param projectId 当前 Design 项目 ID。
+   * @param jobId 任一所属尝试 ID。
+   * @param includeTrace 是否读取大体积 JSONL trace。
+   * @returns 以 creativeTaskId 聚合的公开任务详情。
+   */
+  getTaskDetails(projectId: string, jobId: string, includeTrace = false): DesignTaskDetails {
+    const current = this.requireProjectJob(projectId, jobId)
+    const attempts = this.list(projectId)
+      .filter((job) => job.creativeTaskId === current.creativeTaskId)
+      .sort((left, right) => left.attemptNumber - right.attemptNumber)
+      .map((job) => ({
+        jobId: job.id,
+        attemptNumber: job.attemptNumber,
+        status: job.status,
+        startedAt: job.startedAt,
+        completedAt: job.completedAt,
+        error: job.error,
+        traceState: job.traceState,
+        designSummary: job.designSummary,
+        finalImagePrompt: job.finalImagePrompt,
+        rawThinkingAvailable: job.rawThinkingAvailable,
+      }))
+    const traceState = current.traceState ?? 'unavailable'
+    return {
+      creativeTaskId: current.creativeTaskId,
+      currentJobId: current.id,
+      attempts,
+      traceState,
+      ...(includeTrace && traceState === 'ready'
+        ? { trace: this.dependencies.traceStore.read(projectId, current.id) }
+        : {}),
+    }
   }
 
   /** 订阅任意任务状态变化。 */
@@ -280,6 +353,8 @@ export class DesignJobManager {
       await this.commitOutput(latest, session.id, outputPath)
     } catch (error) {
       this.failUnlessStopped(jobId, error)
+    } finally {
+      await this.finalizeExecution(jobId)
     }
   }
 
@@ -290,7 +365,9 @@ export class DesignJobManager {
     if (job.sessionId) await this.dependencies.stopAgent(job.sessionId)
     const latest = this.requireProjectJob(projectId, jobId)
     if (latest.status !== 'queued' && latest.status !== 'running') return latest
-    return this.updateStatus(latest, 'cancelled', { error: undefined })
+    const cancelled = this.updateStatus(latest, 'cancelled', { error: undefined })
+    await this.finalizeExecution(cancelled.id)
+    return this.requireProjectJob(projectId, cancelled.id)
   }
 
   /** 为失败、取消或中断任务创建新 journal，并让原占位节点指向新任务。 */
@@ -331,13 +408,72 @@ export class DesignJobManager {
     })
   }
 
+  /** 删除失败、取消或中断任务，并可恢复地同步移除占位节点与 journal。 */
+  delete(projectId: string, jobId: string): DesignCanvasDocument {
+    return this.dependencies.runWorkspaceWrite(projectId, () => {
+      let job = this.requireProjectJob(projectId, jobId)
+      if (!['failed', 'cancelled', 'interrupted'].includes(job.status)) {
+        throw new Error('当前设计任务不可删除')
+      }
+      const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
+      const ownedNode = current.nodes.find((node) => node.id === job.nodeId)
+      if (!ownedNode || ownedNode.kind !== 'job' || ownedNode.jobId !== job.id) {
+        throw new Error('设计任务节点已被其他任务接管')
+      }
+      const pending: StoredDesignJob = {
+        ...job,
+        deletionState: { status: 'pending' },
+        updatedAt: this.now(),
+      }
+      try {
+        this.writeJob(pending)
+        job = pending
+      } catch (error) {
+        /** rename 已完成但目录 durability 报错时，以磁盘内容决定是否继续事务。 */
+        const durableIntent = this.readJobJournal(projectId, job.id)
+        if (durableIntent?.deletionState?.status !== 'pending') throw error
+        job = durableIntent
+      }
+      return this.completeDeletion(job)
+    })
+  }
+
+  /**
+   * 成功素材删除提交后，以来源 Job 为锚点回收整个创作任务的本地执行记录。
+   * @param projectId 已提交素材删除的 Design 项目。
+   * @param sourceJobId 被删除素材记录的可信来源 Job ID。
+   */
+  cleanupTaskAfterSuccessfulAssetDeletion(projectId: string, sourceJobId: string): void {
+    this.dependencies.runWorkspaceWrite(projectId, () => {
+      let source = this.requireProjectJob(projectId, sourceJobId)
+      if (source.status !== 'succeeded') throw new Error('来源 Design Job 不是成功任务')
+      const pending: StoredDesignJob = {
+        ...source,
+        deletionState: { status: 'pending' },
+        updatedAt: this.now(),
+      }
+      try {
+        this.writeJob(pending)
+        source = pending
+      } catch (error) {
+        /** rename 已提交时以磁盘 pending 事实继续，避免素材已删但任务无法恢复。 */
+        const durableIntent = this.readJobJournal(projectId, source.id)
+        if (durableIntent?.deletionState?.status !== 'pending') throw error
+        source = durableIntent
+      }
+      this.deleteTaskPersistence(source)
+    })
+  }
+
   /** 在权威画布恢复后，仅二次对账 terminal pending，不中断其它活动任务。 */
   reconcilePendingTerminals(projectId: string): DesignJobRecord[] {
     return this.dependencies.runWorkspaceWrite(projectId, () => {
       for (const job of this.readProjectJobs(projectId)) {
         if (job.terminalState?.status === 'pending') this.reconcileTerminalJob(job)
       }
-      return this.list(projectId)
+      const reconciled = this.list(projectId)
+      this.finalizeRecoveredTerminals(reconciled)
+      return reconciled
     })
   }
 
@@ -346,6 +482,14 @@ export class DesignJobManager {
     const jobs = this.readProjectJobs(projectId)
     for (const stored of jobs) {
       let job = stored
+      if (job.deletionState?.status === 'pending') {
+        try {
+          this.dependencies.runWorkspaceWrite(projectId, () => this.completeDeletion(job))
+        } catch (error) {
+          this.warn(`[Design Job 恢复] 项目 ${projectId} 的删除任务 ${job.id} 恢复失败: ${String(error)}`)
+        }
+        continue
+      }
       if (job.placementState === 'pending') {
         const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
         const placeholderExists = document.nodes.some((node) => (
@@ -385,7 +529,9 @@ export class DesignJobManager {
         })
       }
     }
-    return this.list(projectId)
+    const recovered = this.list(projectId)
+    this.finalizeRecoveredTerminals(recovered)
+    return recovered
   }
 
   /** 启动时恢复全部已登记项目任务。 */
@@ -406,7 +552,10 @@ export class DesignJobManager {
     for (const projectId of this.dependencies.listProjectIds()) {
       try {
         for (const job of this.readProjectJobs(projectId)) {
-          if (job.status === 'running') this.updateStatus(job, 'interrupted', { error: '应用退出，任务已中断' })
+          if (job.status === 'running') {
+            const interrupted = this.updateStatus(job, 'interrupted', { error: '应用退出，任务已中断' })
+            void this.finalizeExecution(interrupted.id)
+          }
         }
       } catch (error) {
         this.warn(`[Design Job 退出] 项目 ${projectId} 中断写入失败，已继续处理其它项目: ${String(error)}`)
@@ -434,13 +583,24 @@ export class DesignJobManager {
     ))) throw new Error(`蒙版批注不存在: ${input.maskAnnotationId}`)
     const id = reservedId ?? this.createId()
     if (!isSafeDesignStableId(id)) throw new Error('设计任务 ID 非法')
+    /** retry 沿用创作任务身份，首次尝试单独生成跨尝试 ID。 */
+    const creativeTaskId = replaced?.creativeTaskId ?? this.createCreativeTaskId()
+    if (!isSafeDesignStableId(creativeTaskId) || creativeTaskId === id) {
+      throw new Error('Design 创作任务 ID 非法')
+    }
     const now = this.now()
     const job: StoredDesignJob = {
       id,
+      creativeTaskId,
+      attemptNumber: replaced ? replaced.attemptNumber + 1 : 1,
       projectId: input.projectId,
       action: input.action,
       status: 'queued',
       prompt,
+      originalRequest: replaced?.originalRequest ?? prompt,
+      contextMode: replaced?.contextMode ?? 'none',
+      traceState: 'pending',
+      executionSessionCleanupState: 'pending',
       ...(imageModelSnapshot ? { imageModelSnapshot: { ...imageModelSnapshot } } : {}),
       ...(input.sourceSessionId ? { sourceSessionId: input.sourceSessionId } : {}),
       ...(input.sourceAssetId ? { sourceAssetId: input.sourceAssetId, parentAssetId: input.sourceAssetId } : {}),
@@ -536,7 +696,8 @@ export class DesignJobManager {
   /** 从本轮消息中选择第一张成功且属于当前会话的 Nano Banana 图片。 */
   private findOwnedOutputPath(messages: AgentMessage[], sessionId: string): string | undefined {
     for (const message of messages) {
-      if (message.role !== 'assistant' && message.role !== 'tool') continue
+      /** Pi 把工具结果建模为 user/tool_result；旧适配器也可能返回 tool 或 assistant 事件。 */
+      if (message.role !== 'assistant' && message.role !== 'tool' && message.role !== 'user') continue
       for (const event of message.events ?? []) {
         if (event.type !== 'tool_result'
           || event.toolName !== DESIGN_IMAGE_TOOL
@@ -549,6 +710,121 @@ export class DesignJobManager {
       }
     }
     return undefined
+  }
+
+  /**
+   * 在业务终态不变的前提下转存 trace，并在 trace ready 后回收内部会话。
+   * 任一附属步骤失败只保留 pending 和诊断，绝不把 succeeded 反写为 failed。
+   */
+  private async finalizeExecution(jobId: string): Promise<void> {
+    let job = this.findStoredJob(jobId)
+    if (!job || !TERMINAL_JOB_STATUSES.has(job.status)) return
+    if (!job.sessionId) {
+      if (job.traceState !== 'unavailable' || job.executionSessionCleanupState !== 'completed') {
+        this.updateStatus(job, job.status, {
+          traceState: 'unavailable',
+          executionSessionCleanupState: 'completed',
+        })
+      }
+      return
+    }
+    /** 会话 ID 在后续异步 journal 更新期间保持为本次执行的固定身份。 */
+    const sessionId = job.sessionId
+    if (job.traceState !== 'ready') {
+      try {
+        const messages = this.dependencies.getSessionMessages(sessionId)
+        const written = this.dependencies.traceStore.writeFromMessages(job.projectId, job.id, messages)
+        job = this.updateStatus(job, job.status, {
+          ...written.summary,
+          traceState: 'ready',
+          executionSessionCleanupState: 'pending',
+        })
+      } catch (error) {
+        this.warn(`[Design Job trace] 任务 ${job.id} 转存失败，已保留内部会话: ${String(error)}`)
+        return
+      }
+    }
+    if (job.executionSessionCleanupState === 'completed') return
+    try {
+      await this.dependencies.sessionLifecycle.cleanup({
+        sessionId,
+        traceState: 'ready',
+      })
+      this.updateStatus(this.requireJob(job.id), job.status, {
+        executionSessionCleanupState: 'completed',
+      })
+    } catch (error) {
+      this.warn(`[Design Job 会话] 任务 ${job.id} 回收失败，已保留待恢复状态: ${String(error)}`)
+    }
+  }
+
+  /** 对同步恢复结果启动终态附属收束；trace 写入在首个 await 前同步提交。 */
+  private finalizeRecoveredTerminals(jobs: DesignJobRecord[]): void {
+    for (const job of jobs) {
+      if (TERMINAL_JOB_STATUSES.has(job.status)) void this.finalizeExecution(job.id)
+    }
+  }
+
+  /** 完成已持久化的任务删除意图，允许重启后幂等续作。 */
+  private completeDeletion(job: StoredDesignJob): DesignCanvasDocument {
+    const current = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
+    const node = current.nodes.find((candidate) => candidate.id === job.nodeId)
+    if (!node) {
+      this.deleteTaskPersistence(job)
+      return current
+    }
+    if (node.kind !== 'job' || node.jobId !== job.id) {
+      throw new Error('设计任务节点已被其他任务接管')
+    }
+    /** 历史异常分组也随任务节点一起清理，避免留下悬空成员引用。 */
+    const affectedGroups = current.groups
+      .map((group, index) => ({ group, index }))
+      .filter(({ group }) => group.nodeIds.includes(node.id))
+    const mutations: DesignMutation[] = [{ type: 'remove-nodes', nodeIds: [node.id] }]
+    if (affectedGroups.length > 0) {
+      mutations.push({
+        type: 'patch-groups',
+        removeIds: affectedGroups.map(({ group }) => group.id),
+        upserts: affectedGroups.flatMap(({ group, index }) => {
+          /** 删除后仍有成员的分组保留原索引；空分组直接移除。 */
+          const remainingNodeIds = group.nodeIds.filter((nodeId) => nodeId !== node.id)
+          return remainingNodeIds.length > 0
+            ? [{ entity: { ...group, nodeIds: remainingNodeIds }, index }]
+            : []
+        }),
+      })
+    }
+    let updated: DesignCanvasDocument
+    try {
+      updated = this.dependencies.store.mutate(job.projectId, current.revision, mutations)
+    } catch (error) {
+      /** Store 已提交但 durability 不确定时，按权威节点事实决定是否完成 journal 删除。 */
+      const authoritative = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
+      if (authoritative.nodes.some((candidate) => candidate.id === node.id)) throw error
+      updated = authoritative
+    }
+    this.projectRevisions.set(job.projectId, updated.revision)
+    this.deleteTaskPersistence(job)
+    return updated
+  }
+
+  /**
+   * 按 creativeTaskId 幂等删除全部 attempt trace 与 journal。
+   * 发起删除的 journal 最后移除，使中途失败仍保留可恢复意图。
+   */
+  private deleteTaskPersistence(anchor: StoredDesignJob): void {
+    const attempts = this.readProjectJobs(anchor.projectId)
+      .filter((candidate) => candidate.creativeTaskId === anchor.creativeTaskId)
+    /** trace 先于 journal 删除，避免 journal 消失后失去 trace 定位事实。 */
+    for (const attempt of attempts) {
+      this.dependencies.traceStore.delete(anchor.projectId, attempt.id)
+    }
+    /** 删除锚点最后执行，任何前序失败都能由 deletionState 继续恢复。 */
+    const ordered = [
+      ...attempts.filter((attempt) => attempt.id !== anchor.id),
+      ...attempts.filter((attempt) => attempt.id === anchor.id),
+    ]
+    for (const attempt of ordered) this.deleteJobJournal(attempt)
   }
 
   /** 导入已验证归属图片，并在同一 Store mutation 中替换占位节点。 */
@@ -734,7 +1010,16 @@ export class DesignJobManager {
     updates: Partial<StoredDesignJob>,
     revision?: number,
   ): StoredDesignJob {
-    const next: StoredDesignJob = { ...job, ...updates, status, updatedAt: this.now() }
+    /** 同一次状态写复用同一时间，避免 startedAt/completedAt 与 updatedAt 漂移。 */
+    const now = this.now()
+    const next: StoredDesignJob = {
+      ...job,
+      ...updates,
+      status,
+      ...(status === 'running' && job.startedAt === undefined ? { startedAt: now } : {}),
+      ...(TERMINAL_JOB_STATUSES.has(status) && job.completedAt === undefined ? { completedAt: now } : {}),
+      updatedAt: now,
+    }
     this.writeJob(next)
     this.emit(next, revision)
     return next
@@ -789,9 +1074,10 @@ export class DesignJobManager {
     try {
       const path = this.resolveJobJournalPath(projectId, jobId)
       const value: unknown = JSON.parse(readFileSync(path, 'utf8'))
-      if (!isStoredDesignJob(value) || value.projectId !== projectId || value.id !== jobId) return undefined
-      this.jobs.set(value.id, value)
-      return value
+      const normalized = normalizeStoredDesignJob(value)
+      if (!normalized || normalized.projectId !== projectId || normalized.id !== jobId) return undefined
+      this.jobs.set(normalized.id, normalized)
+      return normalized
     } catch {
       return undefined
     }
@@ -889,6 +1175,26 @@ function isStoredDesignJob(value: unknown): value is StoredDesignJob {
   if (!isRecord(value)) return false
   if (Object.keys(value).some((field) => !STORED_JOB_FIELDS.has(field))) return false
   if (REQUIRED_STORED_JOB_FIELDS.some((field) => !Object.hasOwn(value, field))) return false
+  if (!isSafeDesignStableId(value.creativeTaskId)
+    || typeof value.attemptNumber !== 'number'
+    || !Number.isSafeInteger(value.attemptNumber)
+    || value.attemptNumber < 1
+    || typeof value.originalRequest !== 'string'
+    || value.originalRequest.trim().length === 0
+    || !['auto', 'project', 'none'].includes(String(value.contextMode))) return false
+  if (value.traceState !== undefined && !['pending', 'ready', 'unavailable'].includes(String(value.traceState))) {
+    return false
+  }
+  if (value.executionSessionCleanupState !== undefined
+    && value.executionSessionCleanupState !== 'pending'
+    && value.executionSessionCleanupState !== 'completed') return false
+  for (const field of ['designSummary', 'finalImagePrompt', 'contextWarning'] as const) {
+    if (value[field] !== undefined && typeof value[field] !== 'string') return false
+  }
+  if (value.rawThinkingAvailable !== undefined && typeof value.rawThinkingAvailable !== 'boolean') return false
+  if (value.startedAt !== undefined && (typeof value.startedAt !== 'number' || !Number.isFinite(value.startedAt))) return false
+  if (value.completedAt !== undefined && (typeof value.completedAt !== 'number' || !Number.isFinite(value.completedAt))) return false
+  if (value.contextReferences !== undefined && !Array.isArray(value.contextReferences)) return false
   if (!isSafeDesignStableId(value.id) || !isSafeDesignStableId(value.projectId)) return false
   if (!['generate', 'edit'].includes(String(value.action))) return false
   if (!['queued', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(value.status))) return false
@@ -917,9 +1223,88 @@ function isStoredDesignJob(value: unknown): value is StoredDesignJob {
       || value.retryState.status !== 'pending'
       || !isSafeDesignStableId(value.replacedByJobId)) return false
   }
+  if (value.deletionState !== undefined) {
+    if (!isRecord(value.deletionState)
+      || Object.keys(value.deletionState).length !== 1
+      || value.deletionState.status !== 'pending'
+      || !TERMINAL_JOB_STATUSES.has(value.status as DesignJobRecord['status'])) return false
+  }
   if (value.action === 'edit' && !isSafeDesignStableId(value.sourceAssetId)) return false
   if (value.status === 'succeeded' && !isSafeDesignStableId(value.outputAssetId)) return false
   return true
+}
+
+/** 严格校验升级前的历史 journal，不接受任何半升级新字段。 */
+function isLegacyStoredDesignJob(value: unknown): value is Omit<
+  StoredDesignJob,
+  | 'creativeTaskId'
+  | 'attemptNumber'
+  | 'originalRequest'
+  | 'contextMode'
+  | 'traceState'
+  | 'executionSessionCleanupState'
+> {
+  if (!isRecord(value)) return false
+  if (Object.keys(value).some((field) => !LEGACY_STORED_JOB_FIELDS.has(field))) return false
+  if (REQUIRED_STORED_JOB_FIELDS
+    .filter((field) => !['creativeTaskId', 'attemptNumber', 'originalRequest', 'contextMode'].includes(field))
+    .some((field) => !Object.hasOwn(value, field))) return false
+  if (!isSafeDesignStableId(value.id) || !isSafeDesignStableId(value.projectId)) return false
+  if (!['generate', 'edit'].includes(String(value.action))) return false
+  if (!['queued', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(value.status))) return false
+  if (typeof value.prompt !== 'string' || value.prompt.trim().length === 0) return false
+  if (!isSafeDesignStableId(value.nodeId) || !isStoredPoint(value.position)) return false
+  if (typeof value.createdAt !== 'number' || !Number.isFinite(value.createdAt)
+    || typeof value.updatedAt !== 'number' || !Number.isFinite(value.updatedAt)) return false
+  for (const field of [
+    'sessionId', 'sourceSessionId', 'sourceAssetId', 'parentAssetId', 'outputAssetId',
+    'maskAnnotationId', 'replacedByJobId',
+  ] as const) {
+    if (!isOptionalStableId(value[field])) return false
+  }
+  if (value.error !== undefined && typeof value.error !== 'string') return false
+  if (value.imageModelSnapshot !== undefined && !isImageModelSnapshot(value.imageModelSnapshot)) return false
+  if (value.placementState !== undefined && value.placementState !== 'pending' && value.placementState !== 'ready') return false
+  if (value.terminalState !== undefined) {
+    if (!isRecord(value.terminalState)
+      || Object.keys(value.terminalState).length !== 2
+      || value.terminalState.status !== 'pending'
+      || !isSafeDesignStableId(value.terminalState.outputAssetId)) return false
+  }
+  if (value.retryState !== undefined) {
+    if (!isRecord(value.retryState)
+      || Object.keys(value.retryState).length !== 1
+      || value.retryState.status !== 'pending'
+      || !isSafeDesignStableId(value.replacedByJobId)) return false
+  }
+  if (value.deletionState !== undefined) {
+    if (!isRecord(value.deletionState)
+      || Object.keys(value.deletionState).length !== 1
+      || value.deletionState.status !== 'pending'
+      || !TERMINAL_JOB_STATUSES.has(value.status as DesignJobRecord['status'])) return false
+  }
+  if (value.action === 'edit' && !isSafeDesignStableId(value.sourceAssetId)) return false
+  if (value.status === 'succeeded' && !isSafeDesignStableId(value.outputAssetId)) return false
+  return true
+}
+
+/**
+ * 把严格合法的旧 journal 投影为新内存合同；读取本身不回写磁盘。
+ * @param value 从单个任务 journal 解析出的未知值。
+ * @returns 新 schema 记录、兼容投影，或 undefined。
+ */
+function normalizeStoredDesignJob(value: unknown): StoredDesignJob | undefined {
+  if (isStoredDesignJob(value)) return value
+  if (!isLegacyStoredDesignJob(value)) return undefined
+  return {
+    ...value,
+    creativeTaskId: value.id,
+    attemptNumber: 1,
+    originalRequest: value.prompt,
+    contextMode: 'none',
+    traceState: value.sessionId ? 'unavailable' : undefined,
+    executionSessionCleanupState: value.sessionId ? 'completed' : undefined,
+  }
 }
 
 /** 判断未知值是否为普通对象。 */

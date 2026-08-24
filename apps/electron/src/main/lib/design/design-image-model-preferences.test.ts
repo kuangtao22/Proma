@@ -29,6 +29,7 @@ function createPaths(root: string, projectId: string): DesignPaths {
     preferencesPath: join(cacheRoot, 'preferences.json'),
     thumbnailsDir: join(cacheRoot, 'thumbnails'),
     jobsDir: join(cacheRoot, 'jobs'),
+    tracesDir: join(cacheRoot, 'traces'),
     stagingDir: join(cacheRoot, 'staging'),
   }
 }

@@ -174,6 +174,7 @@ import {
   updateToolCredentialsWithImageModelBroadcast,
 } from './lib/image-model-profile-broadcast'
 import { DesignSessionBridge } from './lib/design/design-session-bridge'
+import { DesignExecutionSessionLifecycle } from './lib/design/design-execution-session-lifecycle'
 import {
   DesignJobManager,
   resolveOwnedDesignJobOutputPath,
@@ -181,6 +182,7 @@ import {
 } from './lib/design/design-job-manager'
 import { designPathResolver } from './lib/design/design-paths'
 import { designStore } from './lib/design/design-store'
+import { DesignTraceStore } from './lib/design/design-trace-store'
 import { ImageGenerationModelCatalog } from './lib/image-generation-model-catalog'
 import { registerUpdaterIpc } from './lib/updater/updater-ipc'
 import { createLanBridgeIpcDependencies, registerLanBridgeIpcHandlers } from './lib/lan-bridge/lan-bridge-ipc'
@@ -1101,6 +1103,7 @@ export function registerIpcHandlers(): void {
   /** Design IPC 的模型目录和项目偏好在进程内只创建一次。 */
   const { imageModels, imagePreferences } = getDesignImageModelServices()
   /** Design 素材服务只接受可信项目路径、原子 store 和目录级媒体授权。 */
+  let cleanupSuccessfulDesignTask: ((projectId: string, sourceJobId: string) => void) | undefined
   const designAssetService = new DesignAssetService({
     pathResolver: designPathResolver,
     store: designStore,
@@ -1108,6 +1111,24 @@ export function registerIpcHandlers(): void {
     registerDirectoryPath: registerPromaDirectoryPath,
     registerRetainedDirectoryPaths: registerRetainedPromaDirectoryPaths,
     revokePathUrl: revokePromaPathUrl,
+    onSuccessfulJobAssetDeleted: (projectId, sourceJobId) => {
+      cleanupSuccessfulDesignTask?.(projectId, sourceJobId)
+    },
+  })
+  /** Design trace 独立落在本机 cache，列表和普通 Agent 投影不直接读取。 */
+  const designTraceStore = new DesignTraceStore({ pathResolver: designPathResolver })
+  /** trace 提交后统一清理内部会话关联的全部交互资源。 */
+  const designExecutionSessionLifecycle = new DesignExecutionSessionLifecycle({
+    getSession: getAgentSessionMeta,
+    clearPermission: (sessionId) => {
+      permissionService.clearSessionWhitelist(sessionId)
+      permissionService.clearSessionPending(sessionId)
+    },
+    clearAskUser: (sessionId) => { askUserService.clearSessionPending(sessionId) },
+    clearExitPlan: (sessionId) => { exitPlanService.clearSessionPending(sessionId) },
+    clearQueue: clearAgentQueuedMessages,
+    closeBrowser: (sessionId) => browserController.close(sessionId),
+    deleteSession: deleteAgentSession,
   })
   /** Design Job 复用可见 Pi 会话和同一素材/Store 边界，不创建第二套 runtime。 */
   const designJobManager = new DesignJobManager({
@@ -1117,6 +1138,7 @@ export function registerIpcHandlers(): void {
     imageModels,
     getSettings,
     getSession: getAgentSessionMeta,
+    getSessionMessages: getAgentSessionSDKMessages,
     createSession: (input) => createAgentSessionWithMetadata({
       title: input.title,
       channelId: input.channelId,
@@ -1127,10 +1149,15 @@ export function registerIpcHandlers(): void {
     }),
     runHeadless: runAgentHeadless,
     stopAgent,
+    traceStore: designTraceStore,
+    sessionLifecycle: designExecutionSessionLifecycle,
     resolveOwnedOutputPath: resolveOwnedDesignJobOutputPath,
     listProjectIds: () => listAgentWorkspaces().map((workspace) => workspace.id),
     runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
   })
+  cleanupSuccessfulDesignTask = (projectId, sourceJobId) => {
+    designJobManager.cleanupTaskAfterSuccessfulAssetDeletion(projectId, sourceJobId)
+  }
   /** Design 与 Agent 会话共用主进程持久化事实，不向 Renderer 暴露路径推断能力。 */
   const designSessionBridge = new DesignSessionBridge({
     getSession: getAgentSessionMeta,

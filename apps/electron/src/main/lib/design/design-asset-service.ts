@@ -92,6 +92,8 @@ export interface DesignAssetServiceDependencies {
   retainPathUrl?: (url: string) => boolean
   /** 删除提交后文件清理失败时记录告警。 */
   warn?: (message: string) => void
+  /** 成功任务素材删除提交后，按来源 Job 回收对应创作任务。 */
+  onSuccessfulJobAssetDeleted?: (projectId: string, sourceJobId: string) => void
   /** 跨卷提升的窄文件系统依赖，仅用于稳定故障测试。 */
   filePromotion?: DesignFilePromotionDependencies
   /** 图片解码队列；生产默认进程级串行队列。 */
@@ -901,7 +903,8 @@ export class DesignAssetService {
    * @returns 删除提交后的最新画布文档。
    */
   deleteAsset(projectId: string, assetId: string, expectedRevision: number): DesignCanvasDocument {
-    return this.dependencies.runWorkspaceWrite(projectId, () => {
+    /** 锁内只提交素材事实；来源任务通知必须在释放同一项目写锁后执行。 */
+    const deleted = this.dependencies.runWorkspaceWrite(projectId, () => {
       /** 删除前从磁盘最新快照解析素材和引用，避免信任 renderer 状态。 */
       const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
       const asset = current.assets.find((item) => item.id === assetId)
@@ -922,8 +925,17 @@ export class DesignAssetService {
           this.warn(`Design 素材文件删除失败: ${filePath}: ${String(error)}`)
         }
       }
-      return document
+      return { document, sourceJobId: asset.sourceJobId }
     })
+    if (deleted.sourceJobId) {
+      try {
+        this.dependencies.onSuccessfulJobAssetDeleted?.(projectId, deleted.sourceJobId)
+      } catch (error) {
+        /** 素材删除已提交，任务清理失败只能保留 journal 并由恢复继续。 */
+        this.warn(`Design 创作任务清理失败: ${deleted.sourceJobId}: ${String(error)}`)
+      }
+    }
+    return deleted.document
   }
 
   /**
