@@ -56,6 +56,7 @@ import { clearNanoBananaAgentHistory } from './chat-tools/nano-banana-mcp'
 import { assertEnabledModelForChannel } from './agent-model-selection'
 import { copyForkWorkspaceFiles } from './agent-fork-workspace-copy'
 import { isAgentSessionsIndex } from './owned-path-rebaser-schema'
+import { isAgentSessionUserVisible } from './agent-session-visibility'
 
 /**
  * 会话索引文件格式
@@ -321,16 +322,25 @@ export function listAgentSessions(): AgentSessionMeta[] {
   return sortSessionsByUpdatedAtDesc(index.sessions)
 }
 
+/** 获取普通用户入口可见的会话，内部执行记录仍保留在全量索引。 */
+export function listVisibleAgentSessions(): AgentSessionMeta[] {
+  return listAgentSessions().filter(isAgentSessionUserVisible)
+}
+
 /** 获取未归档会话，供侧栏 active 视图按需读取。 */
 export function listActiveAgentSessions(): AgentSessionMeta[] {
   const index = readIndex()
-  return sortSessionsByUpdatedAtDesc(index.sessions.filter((session) => !session.archived))
+  return sortSessionsByUpdatedAtDesc(index.sessions.filter((session) => (
+    isAgentSessionUserVisible(session) && !session.archived
+  )))
 }
 
 /** 获取归档会话，只有用户进入归档视图时才调用。 */
 export function listArchivedAgentSessions(): AgentSessionMeta[] {
   const index = readIndex()
-  return sortSessionsByUpdatedAtDesc(index.sessions.filter((session) => session.archived))
+  return sortSessionsByUpdatedAtDesc(index.sessions.filter((session) => (
+    isAgentSessionUserVisible(session) && session.archived
+  )))
 }
 
 /**
@@ -427,7 +437,9 @@ function isDescendantRelative(relativePath: string): boolean {
 /** 获取归档数量，不把归档会话元数据传到 renderer。 */
 export function countArchivedAgentSessions(): number {
   const index = readIndex()
-  return index.sessions.reduce((count, session) => count + (session.archived ? 1 : 0), 0)
+  return index.sessions.reduce((count, session) => (
+    count + (isAgentSessionUserVisible(session) && session.archived ? 1 : 0)
+  ), 0)
 }
 
 /**
@@ -497,8 +509,81 @@ export function resolveAgentWorkbenchDir(
   return getAgentSessionWorkspacePath(workspace.slug, sessionId)
 }
 
+/** 原子创建 Agent 会话时允许一并写入的元数据。 */
+export interface CreateAgentSessionWithMetadataInput {
+  title?: string
+  channelId?: string
+  workspaceId?: string
+  modelId?: string
+  agentCwdMode?: AgentCwdMode
+  sessionWorkbenchLayout?: SessionWorkbenchLayout
+  sourceDesignProjectId?: string
+  sourceDesignJobId?: string
+}
+
 /**
- * 创建新会话
+ * 初始化已写入索引的会话目录。
+ * @param meta 已完成原子索引写入的会话元数据。
+ */
+function initializeAgentSessionDirectories(meta: AgentSessionMeta): void {
+  getAgentSessionsDir()
+  if (!meta.workspaceId) return
+  /** 已登记工作区决定私有工作台目录位置。 */
+  const workspace = getAgentWorkspace(meta.workspaceId)
+  if (workspace) getAgentSessionWorkspacePath(workspace.slug, meta.id)
+}
+
+/**
+ * 单次原子索引写入创建 Agent 会话及其来源元数据。
+ * @param input 会话展示、模型、工作区及可选 Design 所有权字段。
+ * @returns 已持久化的新会话元数据。
+ */
+export function createAgentSessionWithMetadata(
+  input: CreateAgentSessionWithMetadataInput,
+): AgentSessionMeta {
+  /** 保留规范化后的 Design 项目来源。 */
+  const sourceDesignProjectId = input.sourceDesignProjectId?.trim()
+  /** 保留规范化后的 Design 任务来源。 */
+  const sourceDesignJobId = input.sourceDesignJobId?.trim()
+  /** 任一调用字段出现时都必须提供完整非空归属。 */
+  const hasDesignMetadata = input.sourceDesignProjectId !== undefined
+    || input.sourceDesignJobId !== undefined
+  if (hasDesignMetadata && (!sourceDesignProjectId || !sourceDesignJobId)) {
+    throw new Error('Design 内部会话来源字段必须成对提供')
+  }
+
+  const index = readIndex()
+  const now = Date.now()
+
+  const settings = getSettings()
+  const defaultThinkingLevel = settings.defaultOpenAIThinkingLevel
+    ?? resolvePiThinkingLevel(settings, undefined, 'openai-codex')
+  const meta: AgentSessionMeta = {
+    id: randomUUID(),
+    title: input.title || '新 Agent 会话',
+    channelId: input.channelId,
+    modelId: input.modelId,
+    workspaceId: input.workspaceId,
+    agentCwdMode: input.workspaceId ? input.agentCwdMode ?? 'project' : undefined,
+    sessionWorkbenchLayout: input.workspaceId ? input.sessionWorkbenchLayout ?? 'root' : undefined,
+    // 新会话继承已持久化的全局思考偏好，之后仍可按会话单独调整。
+    reasoningLevel: defaultThinkingLevel,
+    ...(hasDesignMetadata ? { sourceDesignProjectId, sourceDesignJobId } : {}),
+    createdAt: now,
+    updatedAt: now,
+  }
+
+  index.sessions.push(meta)
+  writeIndex(index)
+  initializeAgentSessionDirectories(meta)
+
+  console.log(`[Agent 会话] 已创建会话: ${meta.title} (${meta.id})`)
+  return meta
+}
+
+/**
+ * 兼容既有位置参数的新会话创建入口。
+ * @returns 已持久化的新会话元数据。
  */
 export function createAgentSession(
   title?: string,
@@ -508,44 +593,14 @@ export function createAgentSession(
   agentCwdMode?: AgentCwdMode,
   sessionWorkbenchLayout?: SessionWorkbenchLayout,
 ): AgentSessionMeta {
-  const index = readIndex()
-  const now = Date.now()
-
-  const settings = getSettings()
-  const defaultThinkingLevel = settings.defaultOpenAIThinkingLevel
-    ?? resolvePiThinkingLevel(settings, undefined, 'openai-codex')
-  const meta: AgentSessionMeta = {
-    id: randomUUID(),
-    title: title || '新 Agent 会话',
+  return createAgentSessionWithMetadata({
+    title,
     channelId,
-    modelId,
     workspaceId,
-    agentCwdMode: workspaceId ? agentCwdMode ?? 'project' : undefined,
-    sessionWorkbenchLayout: workspaceId ? sessionWorkbenchLayout ?? 'root' : undefined,
-    // 新会话继承已持久化的全局思考偏好，之后仍可按会话单独调整。
-    reasoningLevel: defaultThinkingLevel,
-    createdAt: now,
-    updatedAt: now,
-  }
-
-  index.sessions.push(meta)
-  writeIndex(index)
-
-  // 确保消息目录存在
-  getAgentSessionsDir()
-
-  // 若有工作区，创建 session 级别子文件夹和 Proma 工作台目录。
-  if (workspaceId) {
-    const ws = getAgentWorkspace(workspaceId)
-    if (ws) {
-      // sessionDir 已由 getAgentSessionWorkspacePath 创建。新会话将私有资料直接
-      // 放在 workbench 根；计划和附件目录按需创建，避免每个会话都有空 `.context/`。
-      getAgentSessionWorkspacePath(ws.slug, meta.id)
-    }
-  }
-
-  console.log(`[Agent 会话] 已创建会话: ${meta.title} (${meta.id})`)
-  return meta
+    modelId,
+    agentCwdMode,
+    sessionWorkbenchLayout,
+  })
 }
 
 /**
@@ -1542,6 +1597,7 @@ export async function searchAgentSessionMessages(query: string): Promise<AgentMe
   const sortedSessions = [...index.sessions].sort((a, b) => b.updatedAt - a.updatedAt)
   for (const session of sortedSessions) {
     if (matchedSessionCount >= MAX_SEARCH_SESSIONS) break
+    if (!isAgentSessionUserVisible(session)) continue
 
     const filePath = getAgentSessionMessagesPath(session.id)
     if (!existsSync(filePath)) continue
@@ -1790,7 +1846,7 @@ export async function searchAgentSessionReferences(input: AgentSessionReferenceS
     listAgentWorkspaces().map((workspace) => [workspace.id, workspace]),
   )
 
-  const candidates = listAgentSessions()
+  const candidates = listVisibleAgentSessions()
     .filter((session) => !workspaceId || session.workspaceId === workspaceId)
     .filter((session) => !session.archived)
     .filter((session) => session.id !== input?.excludeSessionId)

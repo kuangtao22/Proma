@@ -95,6 +95,9 @@ function writeAgentSessionsIndex(sessions: Array<{
   forkSourceDir?: string
   forkSourceSdkSessionId?: string
   resumeAtMessageUuid?: string
+  archived?: boolean
+  sourceDesignProjectId?: string
+  sourceDesignJobId?: string
 }>): void {
   const dir = join(tempHome, '.proma')
   mkdirSync(dir, { recursive: true })
@@ -662,24 +665,24 @@ describe('Agent 会话 runtime 元数据', () => {
     expect(manager.getAgentSessionMeta(session.id)).toMatchObject({ reasoningLevel: 'xhigh' })
   })
 
-  test('Given Design Job 可见会话 When 写入来源元数据 Then get 与索引文件都保留项目和任务追踪 ID', () => {
-    const session = manager.createAgentSession(
-      '设计任务：生成海报',
-      'channel-design',
-      'workspace-design',
-      'model-design',
-    )
-
-    manager.updateAgentSessionMeta(session.id, {
+  test('Given Design 创建内部会话 When 索引首次写入 Then 来源字段同时存在且普通列表不可见', () => {
+    writeAgentSessionsIndex([])
+    const session = manager.createAgentSessionWithMetadata({
+      title: '设计任务：生成海报',
+      channelId: 'channel-design',
+      workspaceId: 'workspace-design',
+      modelId: 'model-design',
       sourceDesignProjectId: 'workspace-design',
       sourceDesignJobId: 'job-design-1',
     })
 
-    expect(manager.getAgentSessionMeta(session.id)).toMatchObject({
+    expect(manager.listAgentSessions()).toContainEqual(expect.objectContaining({
+      id: session.id,
       workspaceId: 'workspace-design',
       sourceDesignProjectId: 'workspace-design',
       sourceDesignJobId: 'job-design-1',
-    })
+    }))
+    expect(manager.listVisibleAgentSessions()).not.toContainEqual(expect.objectContaining({ id: session.id }))
     const persisted = JSON.parse(
       readFileSync(join(tempHome, '.proma', 'agent-sessions.json'), 'utf8'),
     ) as { sessions: Array<Record<string, unknown>> }
@@ -687,6 +690,29 @@ describe('Agent 会话 runtime 元数据', () => {
       sourceDesignProjectId: 'workspace-design',
       sourceDesignJobId: 'job-design-1',
     })
+  })
+
+  test('Given 普通与内部会话混合 When 查询列表和归档计数 Then 只投影用户会话', () => {
+    writeAgentSessionsIndex([
+      { id: 'visible-active', title: '普通会话', workspaceId: 'workspace-a', createdAt: 1, updatedAt: 4 },
+      { id: 'visible-archived', title: '普通归档', workspaceId: 'workspace-a', archived: true, createdAt: 1, updatedAt: 3 },
+      {
+        id: 'internal-active', title: '内部会话', workspaceId: 'workspace-a',
+        sourceDesignProjectId: 'workspace-a', sourceDesignJobId: 'job-1', createdAt: 1, updatedAt: 2,
+      },
+      {
+        id: 'internal-archived', title: '内部归档', workspaceId: 'workspace-a', archived: true,
+        sourceDesignProjectId: 'workspace-a', sourceDesignJobId: 'job-2', createdAt: 1, updatedAt: 1,
+      },
+    ])
+
+    expect(manager.listVisibleAgentSessions().map((session) => session.id)).toEqual([
+      'visible-active',
+      'visible-archived',
+    ])
+    expect(manager.listActiveAgentSessions().map((session) => session.id)).toEqual(['visible-active'])
+    expect(manager.listArchivedAgentSessions().map((session) => session.id)).toEqual(['visible-archived'])
+    expect(manager.countArchivedAgentSessions()).toBe(1)
   })
 
   test('Given a session When star state is updated Then it persists without changing freshness or archive state', () => {
@@ -702,6 +728,23 @@ describe('Agent 会话 runtime 元数据', () => {
 })
 
 describe('Agent 会话正文搜索', () => {
+  test('Given 内部 Design 会话正文命中 When 搜索 Then 不读取或返回内部记录', async () => {
+    writeAgentSessionsIndex([{
+      id: 'internal-search-session',
+      title: '内部任务',
+      workspaceId: 'workspace-a',
+      sourceDesignProjectId: 'workspace-a',
+      sourceDesignJobId: 'job-1',
+      createdAt: 1,
+      updatedAt: 2,
+    }])
+    writeAgentSessionJsonl('internal-search-session', [
+      JSON.stringify({ type: 'user', uuid: 'internal-user', message: { content: [{ type: 'text', text: '隐藏命中词' }] } }),
+    ])
+
+    expect(await manager.searchAgentSessionMessages('隐藏命中词')).toEqual([])
+  })
+
   test('Given 用户/助手正文和内部块 When 搜索 Then 只返回最多两个不同正文消息命中', async () => {
     writeAgentSessionsIndex([{
       id: 'search-content-session',
@@ -808,6 +851,23 @@ describe('Agent 会话正文搜索', () => {
 })
 
 describe('Agent 会话引用搜索', () => {
+  test('Given 内部 Design 会话标题与正文命中 When 搜索引用 Then 不返回内部记录', async () => {
+    writeAgentSessionsIndex([{
+      id: 'internal-reference-session',
+      title: '隐藏设计任务',
+      workspaceId: 'workspace-a',
+      sourceDesignProjectId: 'workspace-a',
+      sourceDesignJobId: 'job-1',
+      createdAt: 1,
+      updatedAt: 2,
+    }])
+    writeAgentSessionJsonl('internal-reference-session', [
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: '隐藏设计任务正文' }] } }),
+    ])
+
+    expect(await manager.searchAgentSessionReferences({ query: '隐藏设计任务' })).toEqual([])
+  })
+
   test('Given 工作区有超过 20 个会话 When 请求最近 200 条 Then 按更新时间返回 200 条', async () => {
     writeAgentSessionsIndex(createIndexedSessions(220))
 

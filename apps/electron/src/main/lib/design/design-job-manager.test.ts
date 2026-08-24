@@ -78,10 +78,10 @@ describe('Design Job Manager', () => {
       outputAssetId: 'asset-output',
       sessionId: 'session-1',
     })
-    expect(harness.sessionUpdates).toEqual([{
-      sessionId: 'session-1',
-      updates: { sourceDesignProjectId: 'project-1', sourceDesignJobId: job.id },
-    }])
+    expect(harness.createdSessions[0]).toMatchObject({
+      sourceDesignProjectId: 'project-1',
+      sourceDesignJobId: job.id,
+    })
     expect(harness.runInputs[0]).toMatchObject({
       source: 'design',
       triggeredBy: 'user',
@@ -143,12 +143,10 @@ describe('Design Job Manager', () => {
 
   test.each([
     ['createSession', '会话创建失败'],
-    ['updateSession', '元数据写入失败'],
     ['importAuthorizedFiles', '素材导入失败'],
   ] as const)('Given %s 抛出异常 When 运行任务 Then 收敛为 failed journal', async (stage, message) => {
     harness.messages = [createToolMessage('session-1/output.png')]
     if (stage === 'createSession') harness.createSessionError = new Error(message)
-    if (stage === 'updateSession') harness.updateSessionError = new Error(message)
     if (stage === 'importAuthorizedFiles') harness.importError = new Error(message)
     const job = harness.manager.create(createGenerateInput())
 
@@ -320,7 +318,6 @@ describe('Design Job Manager', () => {
       imageModelSnapshot: job.imageModelSnapshot,
     })
     expect(harness.createdSessions).toEqual([])
-    expect(harness.sessionUpdates).toEqual([])
     expect(harness.runInputs).toEqual([])
   })
 
@@ -930,7 +927,6 @@ describe('Design Job Manager', () => {
         onComplete: (messages?: AgentMessage[]) => void
       }, extensions: AgentRunExtensions) => Promise<void>)
       createSessionError?: Error
-      updateSessionError?: Error
       importError?: Error
       mutateError?: Error
       mutateAfterApplyError?: Error
@@ -970,7 +966,6 @@ describe('Design Job Manager', () => {
       }),
     }
     const createdSessions: AgentSessionMeta[] = []
-    const sessionUpdates: Array<{ sessionId: string; updates: Record<string, unknown> }> = []
     const stoppedSessions: string[] = []
     const importSources: DesignAssetImportSource[] = []
     const runInputs: Array<Record<string, unknown>> = []
@@ -1044,23 +1039,21 @@ describe('Design Job Manager', () => {
       },
       getSettings: () => state.settings,
       getSession: (sessionId) => createdSessions.find((session) => session.id === sessionId),
-      createSession: (title, channelId, projectId, modelId) => {
+      createSession: (input) => {
         if (state.createSessionError) throw state.createSessionError
         const session: AgentSessionMeta = {
           id: `session-${createdSessions.length + 1}`,
-          title,
-          channelId,
-          modelId,
-          workspaceId: projectId,
+          title: input.title,
+          channelId: input.channelId,
+          modelId: input.modelId,
+          workspaceId: input.projectId,
+          sourceDesignProjectId: input.projectId,
+          sourceDesignJobId: input.sourceDesignJobId,
           createdAt: 1,
           updatedAt: 1,
         }
         createdSessions.push(session)
         return session
-      },
-      updateSession: (sessionId, updates) => {
-        if (state.updateSessionError) throw state.updateSessionError
-        sessionUpdates.push({ sessionId, updates })
       },
       runHeadless: async (input, callbacks, extensions) => {
         runInputs.push({
@@ -1132,7 +1125,6 @@ describe('Design Job Manager', () => {
     return {
       manager,
       createdSessions,
-      sessionUpdates,
       stoppedSessions,
       importSources,
       runInputs,
@@ -1150,7 +1142,6 @@ describe('Design Job Manager', () => {
       set messages(value: AgentMessage[]) { state.messages = value },
       set runHeadless(value: typeof state.runHeadless) { state.runHeadless = value },
       set createSessionError(value: Error | undefined) { state.createSessionError = value },
-      set updateSessionError(value: Error | undefined) { state.updateSessionError = value },
       set importError(value: Error | undefined) { state.importError = value },
       set mutateError(value: Error | undefined) { state.mutateError = value },
       set mutateAfterApplyError(value: Error | undefined) { state.mutateAfterApplyError = value },

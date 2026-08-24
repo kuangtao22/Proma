@@ -87,16 +87,13 @@ export interface DesignJobManagerDependencies {
   >
   getSettings: () => DesignJobSettings
   getSession: (sessionId: string) => AgentSessionMeta | undefined
-  createSession: (
-    title: string,
-    channelId: string,
-    projectId: string,
-    modelId: string,
-  ) => AgentSessionMeta
-  updateSession: (
-    sessionId: string,
-    updates: { sourceDesignProjectId: string; sourceDesignJobId: string },
-  ) => void
+  createSession: (input: {
+    title: string
+    channelId: string
+    projectId: string
+    modelId: string
+    sourceDesignJobId: string
+  }) => AgentSessionMeta
   runHeadless: (
     input: AgentSendInput,
     callbacks: DesignHeadlessCallbacks,
@@ -230,14 +227,11 @@ export class DesignJobManager {
         this.updateStatus(queued, 'failed', { error: DESIGN_JOB_MODEL_ERROR })
         return
       }
-      const session = this.dependencies.createSession(
-        `设计任务：${queued.prompt.trim().slice(0, 24)}`,
-        model.channelId,
-        queued.projectId,
-        model.modelId,
-      )
-      this.dependencies.updateSession(session.id, {
-        sourceDesignProjectId: queued.projectId,
+      const session = this.dependencies.createSession({
+        title: `设计任务：${queued.prompt.trim().slice(0, 24)}`,
+        channelId: model.channelId,
+        projectId: queued.projectId,
+        modelId: model.modelId,
         sourceDesignJobId: queued.id,
       })
       const running = this.updateStatus(queued, 'running', { sessionId: session.id, error: undefined })
