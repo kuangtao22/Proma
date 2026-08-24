@@ -31,7 +31,7 @@ function createCatalog(
   profiles: ImageGenerationModelProfile[],
   credentialsConfigured = true,
 ): ImageGenerationModelCatalogResult {
-  return { profiles, credentialsConfigured, inheritedFromLegacyConfig: false }
+  return { profiles, channelOptions: [], credentialsConfigured, inheritedFromLegacyConfig: false }
 }
 
 describe('ImageGenerationModelSettings', () => {

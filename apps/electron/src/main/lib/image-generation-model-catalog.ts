@@ -71,6 +71,7 @@ export class ImageGenerationModelCatalog {
     const loaded = this.loadProfiles(credentials)
     return {
       profiles: loaded.profiles.map(copyProfile),
+      channelOptions: [],
       inheritedFromLegacyConfig: loaded.inheritedFromLegacyConfig,
       credentialsConfigured: hasNanoBananaApiKey(credentials),
     }
@@ -119,6 +120,7 @@ export class ImageGenerationModelCatalog {
     writeJsonFileAtomic(this.dependencies.configPath, file)
     return {
       profiles: validatedProfiles.map(copyProfile),
+      channelOptions: [],
       inheritedFromLegacyConfig: false,
       credentialsConfigured: hasNanoBananaApiKey(credentials),
     }

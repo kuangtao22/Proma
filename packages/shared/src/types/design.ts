@@ -21,36 +21,75 @@ export interface DesignViewport extends DesignPoint {
 export type DesignNodeKind = 'asset' | 'job'
 export type DesignJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export type DesignJobAction = 'generate' | 'edit'
-export type ImageGenerationExecutor = 'nano-banana'
+export type ImageGenerationExecutor = 'nano-banana' | 'openai-images'
 
-/** 用户可配置的生图模型 profile。 */
-export interface ImageGenerationModelProfile {
+/** 生图模型 profile 共享的非敏感字段。 */
+interface ImageGenerationModelProfileBase {
   id: string
   name: string
-  executor: ImageGenerationExecutor
   modelId: string
   enabled: boolean
   createdAt: number
   updatedAt: number
 }
 
+/** 继续读取 Chat 工具凭据的 Nano Banana 兼容 profile。 */
+export interface NanoBananaImageGenerationModelProfile extends ImageGenerationModelProfileBase {
+  executor: 'nano-banana'
+}
+
+/** 引用现有渠道凭据的 OpenAI Images profile。 */
+export interface OpenAIImagesGenerationModelProfile extends ImageGenerationModelProfileBase {
+  executor: 'openai-images'
+  channelId: string
+}
+
+/** 用户可配置的生图模型 profile。 */
+export type ImageGenerationModelProfile =
+  | NanoBananaImageGenerationModelProfile
+  | OpenAIImagesGenerationModelProfile
+
 /** Design 任务创建时固化的生图模型信息。 */
-export interface ImageGenerationModelSnapshot {
+interface ImageGenerationModelSnapshotBase {
   profileId: string
   name: string
-  executor: ImageGenerationExecutor
   modelId: string
 }
 
+/** Design 任务创建时固化的非敏感生图路由。 */
+export type ImageGenerationModelSnapshot =
+  | ImageGenerationModelSnapshotBase & {
+      executor: 'nano-banana'
+    }
+  | ImageGenerationModelSnapshotBase & {
+      executor: 'openai-images'
+      channelId: string
+    }
+
 /** 项目选择器展示的生图模型及其当前可用性。 */
-export interface ImageGenerationModelOption extends ImageGenerationModelSnapshot {
+export type ImageGenerationModelOption =
+  | Extract<ImageGenerationModelSnapshot, { executor: 'nano-banana' }> & {
+      available: boolean
+      unavailableReason?: string
+    }
+  | Extract<ImageGenerationModelSnapshot, { executor: 'openai-images' }> & {
+      available: boolean
+      unavailableReason?: string
+    }
+
+/** Renderer 可使用的清洗渠道选项，不包含 Base URL 或加密凭据。 */
+export interface ImageGenerationChannelOption {
+  channelId: string
+  name: string
   available: boolean
   unavailableReason?: string
+  models: Array<{ id: string; name: string }>
 }
 
 /** 生图模型配置目录及旧配置继承状态。 */
 export interface ImageGenerationModelCatalogResult {
   profiles: ImageGenerationModelProfile[]
+  channelOptions: ImageGenerationChannelOption[]
   inheritedFromLegacyConfig: boolean
   credentialsConfigured: boolean
 }

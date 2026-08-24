@@ -10,7 +10,9 @@ import type {
   CreateDesignJobInput,
   DesignAsset,
   DesignImageModelSelection,
+  ImageGenerationChannelOption,
   ImageGenerationModelCatalogResult,
+  ImageGenerationModelProfile,
   ImageGenerationModelSnapshot,
   SaveImageGenerationModelProfilesInput,
   ImportDesignAssetsInput,
@@ -61,6 +63,35 @@ const imageModelSnapshotContract = {
   modelId: 'gemini-2.5-flash-image',
 } satisfies ImageGenerationModelSnapshot
 
+/** 编译期锁定渠道引用型 GPT Image 2 profile 与任务快照。 */
+const openAIImageModelProfileContract = {
+  id: 'profile-gpt-image-2',
+  name: 'GPT Image 2',
+  executor: 'openai-images',
+  channelId: 'channel-openai-images',
+  modelId: 'gpt-image-2',
+  enabled: true,
+  createdAt: 100,
+  updatedAt: 100,
+} satisfies ImageGenerationModelProfile
+
+/** 编译期锁定 GPT Image 2 快照只保存渠道引用，不保存连接与凭据。 */
+const openAIImageModelSnapshotContract = {
+  profileId: openAIImageModelProfileContract.id,
+  name: openAIImageModelProfileContract.name,
+  executor: openAIImageModelProfileContract.executor,
+  channelId: openAIImageModelProfileContract.channelId,
+  modelId: openAIImageModelProfileContract.modelId,
+} satisfies ImageGenerationModelSnapshot
+
+/** 编译期锁定 Renderer 只能读取清洗后的渠道与启用模型。 */
+const imageGenerationChannelContract = {
+  channelId: 'channel-openai-images',
+  name: 'GPT Image 服务',
+  available: true,
+  models: [{ id: 'gpt-image-2', name: 'GPT Image 2' }],
+} satisfies ImageGenerationChannelOption
+
 /** 编译期锁定模型目录与保存输入的公开形状。 */
 const imageModelCatalogContract = {
   profiles: [{
@@ -72,6 +103,7 @@ const imageModelCatalogContract = {
     createdAt: 100,
     updatedAt: 100,
   }],
+  channelOptions: [],
   inheritedFromLegacyConfig: false,
   credentialsConfigured: true,
 } satisfies ImageGenerationModelCatalogResult
@@ -150,6 +182,12 @@ describe('Design 共享契约', () => {
     expect(jobContract).not.toHaveProperty('imageModelSnapshot')
     expect(createJobContract.imageModelProfileId).toBe('profile-flash')
     expect(imageModelSnapshotContract.executor).toBe('nano-banana')
+    expect(openAIImageModelSnapshotContract.executor).toBe('openai-images')
+    expect(imageGenerationChannelContract.models).toEqual([
+      { id: 'gpt-image-2', name: 'GPT Image 2' },
+    ])
+    expect(JSON.stringify(imageGenerationChannelContract)).not.toContain('apiKey')
+    expect(JSON.stringify(imageGenerationChannelContract)).not.toContain('baseUrl')
     expect(saveImageModelProfilesContract.profiles).toHaveLength(1)
     expect(imageModelSelectionContract.options[0]?.available).toBe(true)
     expect(updateImageModelSelectionContract.imageModelProfileId).toBe('profile-flash')
