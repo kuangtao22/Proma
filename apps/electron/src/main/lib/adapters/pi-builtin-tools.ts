@@ -16,6 +16,7 @@ import type {
   UpdateAutomationInput,
   ImageGenerationModelSnapshot,
 } from '@proma/shared'
+import type { ResolveImageGenerationRoute } from '../image-generation-runtime'
 import {
   createAutomation,
   deleteAutomation,
@@ -99,8 +100,8 @@ export interface PiBuiltinToolsContext {
   windowsShellAvailable?: boolean
   /** Design Job 固化的可信生图模型，仅作用于本次 Agent 运行。 */
   trustedImageRoute?: ImageGenerationModelSnapshot
-  /** 生图请求发生任何文件或网络副作用前执行的实时复核。 */
-  assertTrustedImageRouteAvailable?: (route: ImageGenerationModelSnapshot) => void
+  /** 生图请求发生任何文件或网络副作用前解析可信运行路由。 */
+  resolveTrustedImageRoute?: ResolveImageGenerationRoute
 }
 
 function jsonToolResult(payload: unknown): AgentToolResult<unknown> {
@@ -1183,7 +1184,9 @@ export async function buildPiBuiltinTools(
         agentCwd: ctx.agentCwd,
         allowedRoots: ctx.allowedRoots,
         trustedImageRoute: ctx.trustedImageRoute,
-        assertTrustedImageRouteAvailable: ctx.assertTrustedImageRouteAvailable,
+        assertTrustedImageRouteAvailable: ctx.resolveTrustedImageRoute
+          ? (route) => { ctx.resolveTrustedImageRoute?.(route) }
+          : undefined,
       }))
     } catch (error) {
       console.error('[Pi 桥接] 注入 nano-banana 工具失败:', error)

@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { ImageGenerationModelSnapshot } from '@proma/shared'
+import type { ResolveImageGenerationRoute } from './image-generation-runtime'
 
 /**
  * 仅主进程内部传递的单次 Agent 运行扩展。
@@ -12,8 +13,8 @@ export interface AgentRunExtensions {
   allowedToolNames?: readonly string[]
   /** Design Job 固化的可信生图模型，只对本次运行有效。 */
   trustedImageRoute?: ImageGenerationModelSnapshot
-  /** 图片工具执行前实时复核固化路由与凭据。 */
-  assertTrustedImageRouteAvailable?: (route: ImageGenerationModelSnapshot) => void
+  /** 工具执行前同时复核配置并解析只在内存存在的凭据。 */
+  resolveTrustedImageRoute?: ResolveImageGenerationRoute
   /** 本次运行按完整工具名设置的最大准入次数；缺失时不限制普通 Agent。 */
   toolCallLimits?: Readonly<Record<string, number>>
 }

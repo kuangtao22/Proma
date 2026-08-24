@@ -285,6 +285,11 @@ function createRecoveryJobManager(
         profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
       }),
       assertSnapshotAvailable: () => undefined,
+      resolveExecutionRoute: (snapshot) => {
+        /** 恢复测试不会运行图片工具，仅补齐 Nano Banana 路由契约。 */
+        if (snapshot.executor !== 'nano-banana') throw new Error('恢复测试不支持 OpenAI Images 路由')
+        return { executor: 'nano-banana', snapshot }
+      },
     },
     getSettings: () => ({}),
     getSession: () => undefined,

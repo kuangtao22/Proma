@@ -80,8 +80,11 @@ export interface DesignJobManagerDependencies {
   pathResolver: { resolve: (projectId: string) => { jobsDir: string } }
   store: DesignStore
   assetService: Pick<DesignAssetService, 'resolveAssetPath' | 'importAuthorizedFiles'>
-  /** 只暴露任务创建与执行所需的公开模型校验，不允许 Job Manager 接触凭据。 */
-  imageModels: Pick<ImageGenerationModelCatalog, 'resolveAvailableSnapshot' | 'assertSnapshotAvailable'>
+  /** 只暴露任务创建、预检和单次工具运行所需的模型路由能力。 */
+  imageModels: Pick<
+    ImageGenerationModelCatalog,
+    'resolveAvailableSnapshot' | 'assertSnapshotAvailable' | 'resolveExecutionRoute'
+  >
   getSettings: () => DesignJobSettings
   getSession: (sessionId: string) => AgentSessionMeta | undefined
   createSession: (
@@ -258,10 +261,10 @@ export class DesignJobManager {
         allowedToolNames: [DESIGN_IMAGE_TOOL],
         toolCallLimits: { [DESIGN_IMAGE_TOOL]: 1 },
         trustedImageRoute: running.imageModelSnapshot,
-        assertTrustedImageRouteAvailable: (route) => {
+        resolveTrustedImageRoute: (route) => {
           try {
-            this.runImageModelValidation(
-              () => this.dependencies.imageModels.assertSnapshotAvailable(route),
+            return this.runImageModelValidation(
+              () => this.dependencies.imageModels.resolveExecutionRoute(route),
             )
           } catch (error) {
             runError ??= error instanceof Error ? error.message : DESIGN_IMAGE_MODEL_VALIDATION_ERROR
@@ -867,21 +870,24 @@ function isOptionalStableId(value: unknown): value is string | undefined {
 /** 严格校验 journal 中不含凭据的生图模型快照。 */
 function isImageModelSnapshot(value: unknown): value is ImageGenerationModelSnapshot {
   if (!isRecord(value)) return false
-  /** snapshot 只能包含任务执行所需的四个公开字段。 */
-  const keys = Object.keys(value)
-  if (keys.length !== 4
-    || !['profileId', 'name', 'executor', 'modelId'].every((key) => keys.includes(key))) return false
-  return typeof value.profileId === 'string'
+  /** 两种 snapshot 共享的公开字段必须严格有效。 */
+  const baseValid = typeof value.profileId === 'string'
     && value.profileId.length > 0
     && value.profileId === value.profileId.trim()
     && typeof value.name === 'string'
     && value.name.trim().length > 0
     && value.name.length <= IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH
-    && value.executor === 'nano-banana'
     && typeof value.modelId === 'string'
     && value.modelId.length > 0
     && value.modelId.length <= IMAGE_GENERATION_MODEL_ID_MAX_LENGTH
     && value.modelId === value.modelId.trim()
+  if (!baseValid) return false
+  if (value.executor === 'nano-banana') return Object.keys(value).length === 4
+  return value.executor === 'openai-images'
+    && typeof value.channelId === 'string'
+    && value.channelId.length > 0
+    && value.channelId === value.channelId.trim()
+    && Object.keys(value).length === 5
 }
 
 /** 严格解析完整 Design Job journal schema。 */

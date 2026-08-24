@@ -22,8 +22,30 @@ import { applyDesignMutations } from './design-store'
 import type { DesignStore } from './design-store'
 import { createWorkspaceOperationRegistry } from '../workspace-operation-lock'
 import type { AgentRunExtensions } from '../agent-run-extensions'
+import type { ResolvedImageGenerationRoute } from '../image-generation-runtime'
 
 const NANO_BANANA_TOOL = 'mcp__nano_banana__generate_image'
+
+/** 创建旧 Nano Banana 任务使用的公开模型快照。 */
+function createNanoSnapshot(): ImageGenerationModelSnapshot {
+  return {
+    profileId: 'profile-nano',
+    name: 'Nano Banana',
+    executor: 'nano-banana',
+    modelId: 'gemini-image',
+  }
+}
+
+/** 创建 GPT Image 2 任务使用的公开渠道模型快照。 */
+function createOpenAISnapshot(): ImageGenerationModelSnapshot {
+  return {
+    profileId: 'profile-gpt',
+    name: 'GPT Image 2',
+    executor: 'openai-images',
+    channelId: 'channel-gpt',
+    modelId: 'gpt-image-2',
+  }
+}
 
 describe('Design Job Manager', () => {
   let cacheRoot: string
@@ -72,7 +94,7 @@ describe('Design Job Manager', () => {
         executor: 'nano-banana',
         modelId: 'image-model-test',
       },
-      hasTrustedImageRouteAssertion: true,
+      hasTrustedImageRouteResolver: true,
     })
     expect(harness.runInputs[0]?.userMessage).toContain('/trusted/source.png')
     expect(harness.runInputs[0]?.userMessage).toContain('mask-1')
@@ -213,6 +235,79 @@ describe('Design Job Manager', () => {
     expect(JSON.stringify(persisted)).not.toContain('apiKey')
   })
 
+  test('Given 项目选择 GPT Image 2 When 创建任务 Then journal 固化渠道快照且运行时解析一次', async () => {
+    harness.resolveAvailableSnapshot = () => createOpenAISnapshot()
+    /** 记录工具执行时拿到的主进程运行路由。 */
+    let resolved: ResolvedImageGenerationRoute | undefined
+    harness.resolveExecutionRoute = (snapshot) => ({
+      executor: 'openai-images',
+      snapshot: snapshot as Extract<ImageGenerationModelSnapshot, { executor: 'openai-images' }>,
+      baseUrl: 'http://100.124.186.117:8030/v1',
+      apiKey: 'secret-key',
+    })
+    harness.runHeadless = async (callbacks, extensions) => {
+      resolved = extensions.resolveTrustedImageRoute?.(extensions.trustedImageRoute!)
+      callbacks.onComplete([])
+    }
+
+    const job = harness.manager.create({
+      ...createGenerateInput(),
+      imageModelProfileId: 'profile-gpt',
+    })
+    await harness.manager.run(job.id)
+
+    expect(job.imageModelSnapshot).toEqual(expect.objectContaining({
+      executor: 'openai-images',
+      channelId: 'channel-gpt',
+      modelId: 'gpt-image-2',
+    }))
+    expect(resolved).toEqual(expect.objectContaining({
+      executor: 'openai-images',
+      apiKey: 'secret-key',
+    }))
+  })
+
+  test('Given GPT Image 2 失败任务 When 重试 Then replacement 复制原渠道快照', async () => {
+    harness.resolveAvailableSnapshot = () => createOpenAISnapshot()
+    harness.messages = []
+    const failed = harness.manager.create({
+      ...createGenerateInput(),
+      imageModelProfileId: 'profile-gpt',
+    })
+    await harness.manager.run(failed.id)
+    harness.resolveAvailableSnapshot = () => {
+      throw new Error('重试不应重新读取当前模型目录')
+    }
+
+    const replacement = harness.manager.retry('project-1', failed.id)
+
+    expect(replacement.imageModelSnapshot).toEqual(createOpenAISnapshot())
+  })
+
+  test('Given openai-images journal 缺少 channelId When 恢复 Then 拒绝损坏记录', () => {
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    mkdirSync(jobsDirectory, { recursive: true })
+    writeFileSync(join(jobsDirectory, 'job-gpt.json'), JSON.stringify({
+      id: 'job-gpt',
+      projectId: 'project-1',
+      action: 'generate',
+      status: 'interrupted',
+      prompt: '损坏任务',
+      nodeId: 'node-gpt',
+      position: { x: 0, y: 0 },
+      createdAt: 1,
+      updatedAt: 1,
+      imageModelSnapshot: {
+        profileId: 'profile-gpt',
+        name: 'GPT Image 2',
+        executor: 'openai-images',
+        modelId: 'gpt-image-2',
+      },
+    }))
+
+    expect(harness.manager.list('project-1')).toEqual([])
+  })
+
   test('Given queued 任务的模型配置已失效 When 执行任务 Then 明确失败且不创建 Agent 会话', async () => {
     const job = harness.manager.create(createGenerateInput())
     harness.assertSnapshotAvailable = () => { throw new Error('生图模型已停用: profile-test') }
@@ -230,14 +325,9 @@ describe('Design Job Manager', () => {
   })
 
   test('Given Agent 启动后模型被停用 When 图片工具实时复核 Then journal 保留真实业务原因', async () => {
-    /** 区分运行前复核与工具执行时复核。 */
-    let assertionCount = 0
-    harness.assertSnapshotAvailable = () => {
-      assertionCount += 1
-      if (assertionCount === 2) throw new Error('生图模型已停用: profile-test')
-    }
+    harness.resolveExecutionRoute = () => { throw new Error('生图模型已停用: profile-test') }
     harness.runHeadless = async (callbacks, extensions) => {
-      try { extensions.assertTrustedImageRouteAvailable?.(extensions.trustedImageRoute!) } catch { /* 模拟 Pi 工具错误结果 */ }
+      try { extensions.resolveTrustedImageRoute?.(extensions.trustedImageRoute!) } catch { /* 模拟 Pi 工具错误结果 */ }
       callbacks.onComplete([])
     }
     const job = harness.manager.create(createGenerateInput())
@@ -248,14 +338,9 @@ describe('Design Job Manager', () => {
   })
 
   test('Given Agent 启动后凭据被删除 When 图片工具实时复核 Then journal 明确提示 Key 未配置', async () => {
-    /** 区分运行前复核与工具执行时复核。 */
-    let assertionCount = 0
-    harness.assertSnapshotAvailable = () => {
-      assertionCount += 1
-      if (assertionCount === 2) throw new Error('Nano Banana API Key 未配置: nano-banana')
-    }
+    harness.resolveExecutionRoute = () => { throw new Error('Nano Banana API Key 未配置: nano-banana') }
     harness.runHeadless = async (callbacks, extensions) => {
-      try { extensions.assertTrustedImageRouteAvailable?.(extensions.trustedImageRoute!) } catch { /* 模拟 Pi 工具错误结果 */ }
+      try { extensions.resolveTrustedImageRoute?.(extensions.trustedImageRoute!) } catch { /* 模拟 Pi 工具错误结果 */ }
       callbacks.onComplete([])
     }
     const job = harness.manager.create(createGenerateInput())
@@ -266,14 +351,9 @@ describe('Design Job Manager', () => {
   })
 
   test('Given 工具实时复核发生含绝对路径的底层错误 When Agent 完成 Then journal 只保留稳定中文', async () => {
-    /** 区分运行前复核与工具执行时复核。 */
-    let assertionCount = 0
-    harness.assertSnapshotAvailable = () => {
-      assertionCount += 1
-      if (assertionCount === 2) throw new Error('EACCES /Users/secret/image-generation-models.json')
-    }
+    harness.resolveExecutionRoute = () => { throw new Error('EACCES /Users/secret/image-generation-models.json') }
     harness.runHeadless = async (callbacks, extensions) => {
-      try { extensions.assertTrustedImageRouteAvailable?.(extensions.trustedImageRoute!) } catch { /* 模拟 Pi 工具错误结果 */ }
+      try { extensions.resolveTrustedImageRoute?.(extensions.trustedImageRoute!) } catch { /* 模拟 Pi 工具错误结果 */ }
       callbacks.onComplete([])
     }
     const job = harness.manager.create(createGenerateInput())
@@ -867,6 +947,7 @@ describe('Design Job Manager', () => {
       throwAfterReplacementJournalWrite: boolean
       resolveAvailableSnapshot: (profileId: string) => ImageGenerationModelSnapshot
       assertSnapshotAvailable: (snapshot: ImageGenerationModelSnapshot) => void
+      resolveExecutionRoute: (snapshot: ImageGenerationModelSnapshot) => ResolvedImageGenerationRoute
     } = {
       settings: { agentChannelId: 'channel-default', agentModelId: 'model-default' },
       messages: [] as AgentMessage[],
@@ -883,6 +964,10 @@ describe('Design Job Manager', () => {
         profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
       }),
       assertSnapshotAvailable: () => undefined,
+      resolveExecutionRoute: (snapshot) => ({
+        executor: 'nano-banana',
+        snapshot: snapshot as Extract<ImageGenerationModelSnapshot, { executor: 'nano-banana' }>,
+      }),
     }
     const createdSessions: AgentSessionMeta[] = []
     const sessionUpdates: Array<{ sessionId: string; updates: Record<string, unknown> }> = []
@@ -955,6 +1040,7 @@ describe('Design Job Manager', () => {
       imageModels: {
         resolveAvailableSnapshot: (profileId) => state.resolveAvailableSnapshot(profileId),
         assertSnapshotAvailable: (snapshot) => state.assertSnapshotAvailable(snapshot),
+        resolveExecutionRoute: (snapshot) => state.resolveExecutionRoute(snapshot),
       },
       getSettings: () => state.settings,
       getSession: (sessionId) => createdSessions.find((session) => session.id === sessionId),
@@ -983,7 +1069,7 @@ describe('Design Job Manager', () => {
           allowedToolNames: extensions.allowedToolNames,
           toolCallLimits: extensions.toolCallLimits,
           trustedImageRoute: extensions.trustedImageRoute,
-          hasTrustedImageRouteAssertion: typeof extensions.assertTrustedImageRouteAvailable === 'function',
+          hasTrustedImageRouteResolver: typeof extensions.resolveTrustedImageRoute === 'function',
         })
         if (state.runHeadless) return state.runHeadless(callbacks, extensions)
         callbacks.onComplete(state.messages)
@@ -1082,6 +1168,9 @@ describe('Design Job Manager', () => {
       set assertSnapshotAvailable(value: typeof state.assertSnapshotAvailable) {
         state.assertSnapshotAvailable = value
       },
+      set resolveExecutionRoute(value: typeof state.resolveExecutionRoute) {
+        state.resolveExecutionRoute = value
+      },
     }
   }
 })
@@ -1113,6 +1202,10 @@ function createMultiProjectRecoveryManager(projectBJobs: string, warnings: strin
         profileId, name: '测试生图模型', executor: 'nano-banana', modelId: 'image-model-test',
       }),
       assertSnapshotAvailable: () => undefined,
+      resolveExecutionRoute: (snapshot) => ({
+        executor: 'nano-banana',
+        snapshot: snapshot as Extract<ImageGenerationModelSnapshot, { executor: 'nano-banana' }>,
+      }),
     },
     getSettings: () => ({}),
     getSession: () => undefined,
