@@ -8,8 +8,10 @@ import type {
   DesignImageModelSelectionChangeEvent,
   DesignJobControlInput,
   DesignJobRecord,
+  DesignTaskDetails,
   DesignWorkspaceSnapshot,
   ExportDesignAssetInput,
+  GetDesignTaskDetailsInput,
   ImportAgentImageInput,
   ImportDesignAssetsInput,
   ImageGenerationModelCatalogResult,
@@ -39,7 +41,10 @@ export interface DesignPreloadApi {
   createDesignJob: (input: CreateDesignJobInput) => Promise<DesignJobRecord>
   cancelDesignJob: (input: DesignJobControlInput) => Promise<DesignJobRecord>
   retryDesignJob: (input: DesignJobControlInput) => Promise<DesignJobRecord>
+  deleteDesignJob: (input: DesignJobControlInput) => Promise<DesignCanvasDocument>
   listDesignJobs: (projectId: string) => Promise<DesignJobRecord[]>
+  getDesignTaskDetails: (input: GetDesignTaskDetailsInput) => Promise<DesignTaskDetails>
+  getDesignTaskTrace: (input: GetDesignTaskDetailsInput) => Promise<DesignTaskDetails>
   prepareDesignAssetForSession: (input: PrepareDesignAssetForSessionInput) => Promise<PreparedDesignAssetMention>
   importAgentImageToDesign: (input: ImportAgentImageInput) => Promise<DesignWorkspaceSnapshot>
   releaseDesignMediaAccess: () => Promise<void>
@@ -83,7 +88,10 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
     createDesignJob: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.CREATE_JOB, input) as Promise<DesignJobRecord>,
     cancelDesignJob: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.CANCEL_JOB, input) as Promise<DesignJobRecord>,
     retryDesignJob: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.RETRY_JOB, input) as Promise<DesignJobRecord>,
+    deleteDesignJob: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.DELETE_JOB, input) as Promise<DesignCanvasDocument>,
     listDesignJobs: (projectId) => ipc.invoke(DESIGN_IPC_CHANNELS.LIST_JOBS, { projectId }) as Promise<DesignJobRecord[]>,
+    getDesignTaskDetails: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.GET_TASK_DETAILS, input) as Promise<DesignTaskDetails>,
+    getDesignTaskTrace: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.GET_TASK_TRACE, input) as Promise<DesignTaskDetails>,
     prepareDesignAssetForSession: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.PREPARE_ASSET_FOR_SESSION, input) as Promise<PreparedDesignAssetMention>,
     importAgentImageToDesign: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.IMPORT_AGENT_IMAGE, input) as Promise<DesignWorkspaceSnapshot>,
     releaseDesignMediaAccess: () => ipc.invoke(DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS) as Promise<void>,

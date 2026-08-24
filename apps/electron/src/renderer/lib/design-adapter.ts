@@ -4,6 +4,7 @@ import type {
   DesignChangeEvent,
   DesignImageModelSelectionChangeEvent,
   ExportDesignAssetInput,
+  GetDesignTaskDetailsInput,
   ImportAgentImageInput,
   ImportDesignAssetsInput,
   PrepareDesignAssetForSessionInput,
@@ -34,7 +35,10 @@ export interface DesignAdapter {
   createJob: (input: CreateDesignJobInput) => ReturnType<DesignPreloadApi['createDesignJob']>
   cancelJob: (input: Parameters<DesignPreloadApi['cancelDesignJob']>[0]) => ReturnType<DesignPreloadApi['cancelDesignJob']>
   retryJob: (input: Parameters<DesignPreloadApi['retryDesignJob']>[0]) => ReturnType<DesignPreloadApi['retryDesignJob']>
+  deleteJob: (input: Parameters<DesignPreloadApi['deleteDesignJob']>[0]) => ReturnType<DesignPreloadApi['deleteDesignJob']>
   listJobs: (projectId: string) => ReturnType<DesignPreloadApi['listDesignJobs']>
+  getTaskDetails: (input: GetDesignTaskDetailsInput) => ReturnType<DesignPreloadApi['getDesignTaskDetails']>
+  getTaskTrace: (input: GetDesignTaskDetailsInput) => ReturnType<DesignPreloadApi['getDesignTaskTrace']>
   prepareAssetForSession: (input: PrepareDesignAssetForSessionInput) => ReturnType<DesignPreloadApi['prepareDesignAssetForSession']>
   importAgentImage: (input: ImportAgentImageInput) => ReturnType<DesignPreloadApi['importAgentImageToDesign']>
   releaseMediaAccess: () => ReturnType<DesignPreloadApi['releaseDesignMediaAccess']>
@@ -66,7 +70,10 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
     createJob: (input) => requireMethod(api, 'createDesignJob')(input),
     cancelJob: (input) => requireMethod(api, 'cancelDesignJob')(input),
     retryJob: (input) => requireMethod(api, 'retryDesignJob')(input),
+    deleteJob: (input) => requireMethod(api, 'deleteDesignJob')(input),
     listJobs: (projectId) => requireMethod(api, 'listDesignJobs')(projectId),
+    getTaskDetails: (input) => requireMethod(api, 'getDesignTaskDetails')(input),
+    getTaskTrace: (input) => requireMethod(api, 'getDesignTaskTrace')(input),
     prepareAssetForSession: (input) => requireMethod(api, 'prepareDesignAssetForSession')(input),
     importAgentImage: (input) => requireMethod(api, 'importAgentImageToDesign')(input),
     releaseMediaAccess: () => requireMethod(api, 'releaseDesignMediaAccess')(),

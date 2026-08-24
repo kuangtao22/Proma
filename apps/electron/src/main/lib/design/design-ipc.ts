@@ -12,10 +12,12 @@ import type {
   DesignImageModelSelectionChangeEvent,
   DesignJobControlInput,
   DesignJobRecord,
+  DesignTaskDetails,
   DesignMutation,
   DesignPoint,
   DesignWorkspaceSnapshot,
   ExportDesignAssetInput,
+  GetDesignTaskDetailsInput,
   ImportAgentImageInput,
   ImportDesignAssetsInput,
   ImageGenerationModelCatalogResult,
@@ -85,7 +87,15 @@ export interface DesignIpcAssetService extends Pick<
 /** IPC 层实际使用的任务服务窄接口。 */
 export interface DesignIpcJobManager extends Pick<
   DesignJobManager,
-  'create' | 'run' | 'cancel' | 'retry' | 'list' | 'reconcilePendingTerminals' | 'onChanged'
+  | 'create'
+  | 'run'
+  | 'cancel'
+  | 'retry'
+  | 'delete'
+  | 'list'
+  | 'getTaskDetails'
+  | 'reconcilePendingTerminals'
+  | 'onChanged'
 > {}
 
 /** IPC 层实际使用的 Design/Agent 会话桥窄接口。 */
@@ -490,6 +500,15 @@ function parseJobControlInput(value: unknown): DesignJobControlInput {
   return { projectId: value.projectId, jobId: value.jobId }
 }
 
+/** 解析任务详情与 trace 的只读项目归属输入。 */
+function parseTaskDetailsInput(value: unknown): GetDesignTaskDetailsInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'jobId'])
+    || !isNonEmptyString(value.projectId)
+    || !isNonEmptyString(value.jobId)) throw new Error('Design 请求结构无效')
+  return { projectId: value.projectId, jobId: value.jobId }
+}
+
 /** 确认调用者属于当前主应用授权窗口集合。 */
 function assertAuthorizedSender(event: IpcMainInvokeEvent, authorized: WebContents[]): WebContents {
   if (!authorized.some((candidate) => candidate === event.sender || candidate.id === event.sender.id)) {
@@ -559,7 +578,10 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     DESIGN_IPC_CHANNELS.CREATE_JOB,
     DESIGN_IPC_CHANNELS.CANCEL_JOB,
     DESIGN_IPC_CHANNELS.RETRY_JOB,
+    DESIGN_IPC_CHANNELS.DELETE_JOB,
     DESIGN_IPC_CHANNELS.LIST_JOBS,
+    DESIGN_IPC_CHANNELS.GET_TASK_DETAILS,
+    DESIGN_IPC_CHANNELS.GET_TASK_TRACE,
     DESIGN_IPC_CHANNELS.PREPARE_ASSET_FOR_SESSION,
     DESIGN_IPC_CHANNELS.IMPORT_AGENT_IMAGE,
     DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS,
@@ -844,10 +866,38 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     return job
   })
 
+  options.ipc.handle(DESIGN_IPC_CHANNELS.DELETE_JOB, async (event, value): Promise<DesignCanvasDocument> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseJobControlInput(value)
+    const document = await options.guard.runWorkspaceWrite(
+      input.projectId,
+      () => options.jobs.delete(input.projectId, input.jobId),
+    )
+    rememberDocument(input.projectId, document)
+    broadcastChange(options, {
+      projectId: input.projectId,
+      revision: document.revision,
+      cause: 'job',
+    })
+    return document
+  })
+
   options.ipc.handle(DESIGN_IPC_CHANNELS.LIST_JOBS, async (event, value): Promise<DesignJobRecord[]> => {
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseProjectInput(value)
     return options.jobs.list(input.projectId)
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.GET_TASK_DETAILS, async (event, value): Promise<DesignTaskDetails> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseTaskDetailsInput(value)
+    return options.jobs.getTaskDetails(input.projectId, input.jobId, false)
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.GET_TASK_TRACE, async (event, value): Promise<DesignTaskDetails> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseTaskDetailsInput(value)
+    return options.jobs.getTaskDetails(input.projectId, input.jobId, true)
   })
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.PREPARE_ASSET_FOR_SESSION, async (event, value): Promise<PreparedDesignAssetMention> => {

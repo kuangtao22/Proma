@@ -167,7 +167,15 @@ function createFixture(): {
       run: async () => undefined,
       cancel: async () => createJobRecord('job-default'),
       retry: () => createJobRecord('job-retry'),
+      delete: () => document,
       list: () => [],
+      getTaskDetails: (_projectId, jobId, includeTrace) => ({
+        creativeTaskId: `creative-${jobId}`,
+        currentJobId: jobId,
+        attempts: [],
+        traceState: 'unavailable',
+        ...(includeTrace ? { trace: [] } : {}),
+      }),
       reconcilePendingTerminals: () => [],
       onChanged: () => () => undefined,
     },
@@ -511,7 +519,7 @@ describe('Design IPC', () => {
     expect(fixture.getStoreReadCount()).toBe(0)
   })
 
-  test('Given 授权窗口 When 创建、取消、重试和列出任务 Then 写操作受 guard 保护且运行不阻塞 invoke', async () => {
+  test('Given 授权窗口 When 创建、取消、重试、删除和列出任务 Then 写操作受 guard 保护且运行不阻塞 invoke', async () => {
     const fixture = createFixture()
     const job = createJobRecord('job-1')
     const retried = createJobRecord('job-2')
@@ -525,7 +533,18 @@ describe('Design IPC', () => {
         run: async (jobId: string) => { calls.push(`run:${jobId}`) },
         cancel: async (_projectId: string, jobId: string) => { calls.push(`cancel:${jobId}`); return job },
         retry: (_projectId: string, jobId: string) => { calls.push(`retry:${jobId}`); return retried },
+        delete: (_projectId: string, jobId: string) => { calls.push(`delete:${jobId}`); return fixture.document },
         list: () => { calls.push('list'); return [job, retried] },
+        getTaskDetails: (_projectId: string, jobId: string, includeTrace: boolean) => {
+          calls.push(`details:${jobId}:${includeTrace}`)
+          return {
+            creativeTaskId: `creative-${jobId}`,
+            currentJobId: jobId,
+            attempts: [],
+            traceState: 'ready' as const,
+            ...(includeTrace ? { trace: [] } : {}),
+          }
+        },
         onChanged: (listener: (event: DesignJobChangedEvent) => void) => {
           onChanged = listener
           return () => undefined
@@ -555,11 +574,29 @@ describe('Design IPC', () => {
       fixture.senders[0]!,
       { projectId: 'project-1', jobId: 'job-1' },
     )
+    const deleted = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.DELETE_JOB,
+      fixture.senders[0]!,
+      { projectId: 'project-1', jobId: 'job-1' },
+    )
     const listed = await invoke(
       fixture.handlers,
       DESIGN_IPC_CHANNELS.LIST_JOBS,
       fixture.senders[0]!,
       { projectId: 'project-1' },
+    )
+    const details = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.GET_TASK_DETAILS,
+      fixture.senders[0]!,
+      { projectId: 'project-1', jobId: 'job-1' },
+    )
+    const trace = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.GET_TASK_TRACE,
+      fixture.senders[0]!,
+      { projectId: 'project-1', jobId: 'job-1' },
     )
     await Promise.resolve()
     onChanged?.({ job: retried, revision: 42 })
@@ -567,10 +604,14 @@ describe('Design IPC', () => {
     expect(created).toBe(job)
     expect(cancelled).toBe(job)
     expect(retryResult).toBe(retried)
+    expect(deleted).toBe(fixture.document)
     expect(listed).toEqual([job, retried])
-    expect(fixture.guardProjects).toEqual(['project-1', 'project-1', 'project-1'])
+    expect(details).toEqual({ creativeTaskId: 'creative-job-1', currentJobId: 'job-1', attempts: [], traceState: 'ready' })
+    expect(trace).toEqual({ creativeTaskId: 'creative-job-1', currentJobId: 'job-1', attempts: [], traceState: 'ready', trace: [] })
+    expect(fixture.guardProjects).toEqual(['project-1', 'project-1', 'project-1', 'project-1'])
     expect(calls).toEqual([
-      'create', 'run:job-1', 'cancel:job-1', 'retry:job-1', 'run:job-2', 'list',
+      'create', 'run:job-1', 'cancel:job-1', 'retry:job-1', 'run:job-2', 'delete:job-1', 'list',
+      'details:job-1:false', 'details:job-1:true',
     ])
     expect(fixture.senders[0]?.sent.at(-1)?.value).toMatchObject({
       projectId: 'project-1', cause: 'job', revision: 42,
@@ -1338,10 +1379,14 @@ describe('Design IPC', () => {
 function createJobRecord(id: string): DesignJobRecord {
   return {
     id,
+    creativeTaskId: `creative-${id}`,
+    attemptNumber: 1,
     projectId: 'project-1',
     action: 'generate',
     status: 'queued',
     prompt: '生成',
+    originalRequest: '生成',
+    contextMode: 'none',
     createdAt: 1,
     updatedAt: 1,
   }
