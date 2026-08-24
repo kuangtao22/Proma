@@ -9,6 +9,7 @@ import {
 import type {
   CreateDesignJobInput,
   DesignAsset,
+  DesignContextEntry,
   DesignImageModelSelection,
   ImageGenerationChannelOption,
   ImageGenerationModelCatalogResult,
@@ -58,9 +59,23 @@ const createJobContract = {
   projectId: 'project-1',
   action: 'generate',
   prompt: '生成图片',
+  contextMode: 'auto',
   imageModelProfileId: 'profile-flash',
   position: { x: 10, y: 20 },
 } satisfies CreateDesignJobInput
+
+/** 编译期锁定创作上下文只保存可移植引用，不暴露来源绝对路径。 */
+const contextEntryContract = {
+  id: 'context-brand',
+  projectId: 'project-1',
+  category: 'brand',
+  kind: 'document',
+  title: '品牌视觉规范',
+  relativePath: 'documents/context-brand.md',
+  tags: ['首页'],
+  source: 'user',
+  updatedAt: 10,
+} satisfies DesignContextEntry
 
 /** 编译期锁定任务 journal 可固化的生图模型快照。 */
 const imageModelSnapshotContract = {
@@ -182,7 +197,22 @@ describe('Design 共享契约', () => {
     expect(DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED).toBe('design:image-model-selection-changed')
     expect(DESIGN_IPC_CHANNELS.GET_TASK_DETAILS).toBe('design:get-task-details')
     expect(DESIGN_IPC_CHANNELS.GET_TASK_TRACE).toBe('design:get-task-trace')
+    expect(DESIGN_IPC_CHANNELS.LIST_CONTEXT).toBe('design:list-context')
+    expect(DESIGN_IPC_CHANNELS.UPSERT_CONTEXT_DOCUMENT).toBe('design:upsert-context-document')
+    expect(DESIGN_IPC_CHANNELS.IMPORT_CONTEXT_DOCUMENT).toBe('design:import-context-document')
+    expect(DESIGN_IPC_CHANNELS.UPDATE_CONTEXT).toBe('design:update-context')
+    expect(DESIGN_IPC_CHANNELS.REGISTER_CONTEXT_ASSET).toBe('design:register-context-asset')
+    expect(DESIGN_IPC_CHANNELS.DELETE_CONTEXT).toBe('design:delete-context')
     expect(DESIGN_IPC_CHANNELS.CHANGED).toBe('design:changed')
+  })
+
+  test('Given Design 上下文条目 When 序列化 Then 只包含稳定 ID、相对路径或 assetId', () => {
+    /** 公开序列化结果不得泄露用户选择文件的来源绝对路径。 */
+    const encoded = JSON.stringify(contextEntryContract)
+
+    expect(contextEntryContract.relativePath.startsWith('/')).toBe(false)
+    expect('absolutePath' in contextEntryContract).toBe(false)
+    expect(encoded).not.toContain('/Users/')
   })
 
   test('Given Design 首次尝试 When 构造公开记录 Then 创作任务与执行尝试拥有独立身份', () => {
@@ -211,6 +241,7 @@ describe('Design 共享契约', () => {
     expect(jobContract.status).toBe('queued')
     expect(jobContract).not.toHaveProperty('imageModelSnapshot')
     expect(createJobContract.imageModelProfileId).toBe('profile-flash')
+    expect(createJobContract.contextMode).toBe('auto')
     expect(imageModelSnapshotContract.executor).toBe('nano-banana')
     expect(openAIImageModelSnapshotContract.executor).toBe('openai-images')
     expect(imageGenerationChannelContract.models).toEqual([

@@ -11,6 +11,10 @@ export interface DesignPaths {
   canvasPath: string
   assetsDir: string
   annotationsDir: string
+  contextRoot: string
+  contextManifestPath: string
+  contextDocumentsDir: string
+  contextReferencesDir: string
   cacheRoot: string
   preferencesPath: string
   thumbnailsDir: string
@@ -76,6 +80,8 @@ export function createDesignPathResolver(
 
       /** 项目内可移植的 Design 正式数据根。 */
       const designRoot = join(projectRoot, '.proma', 'design')
+      /** 项目内可移植的长期创作上下文根。 */
+      const contextRoot = join(designRoot, 'context')
       /** 全局可重建的项目 Design 缓存根。 */
       const cacheRoot = join(configRoot, 'design-cache', projectId)
       return {
@@ -85,6 +91,10 @@ export function createDesignPathResolver(
         canvasPath: join(designRoot, 'canvas.json'),
         assetsDir: join(designRoot, 'assets'),
         annotationsDir: join(designRoot, 'annotations'),
+        contextRoot,
+        contextManifestPath: join(contextRoot, 'manifest.json'),
+        contextDocumentsDir: join(contextRoot, 'documents'),
+        contextReferencesDir: join(contextRoot, 'references'),
         cacheRoot,
         preferencesPath: join(cacheRoot, 'preferences.json'),
         thumbnailsDir: join(cacheRoot, 'thumbnails'),

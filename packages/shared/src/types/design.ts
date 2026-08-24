@@ -35,6 +35,28 @@ export type DesignContextCategory =
 export type DesignTraceState = 'pending' | 'ready' | 'unavailable'
 export type DesignExecutionSessionCleanupState = 'pending' | 'completed'
 
+/** 项目创作上下文中的可移植条目，只引用受管相对路径或 Design 素材 ID。 */
+export interface DesignContextEntry {
+  id: string
+  projectId: string
+  category: DesignContextCategory
+  kind: 'document' | 'asset'
+  title: string
+  relativePath?: string
+  assetId?: string
+  tags: string[]
+  source: 'user' | 'design-asset'
+  updatedAt: number
+}
+
+/** 项目创作上下文目录的权威清单。 */
+export interface DesignContextManifest {
+  schemaVersion: 1
+  projectId: string
+  entries: DesignContextEntry[]
+  updatedAt: number
+}
+
 /** 生图模型 profile 共享的非敏感字段。 */
 interface ImageGenerationModelProfileBase {
   id: string
@@ -376,11 +398,59 @@ export interface CreateDesignJobInput {
   projectId: string
   action: DesignJobAction
   prompt: string
+  contextMode: DesignContextMode
   imageModelProfileId: string
   sourceSessionId?: string
   sourceAssetId?: string
   maskAnnotationId?: string
   position: DesignPoint
+}
+
+/** 查询项目创作上下文的输入。 */
+export interface ListDesignContextInput {
+  projectId: string
+  query?: string
+}
+
+/** 新建或更新受管 Markdown 创作资料的输入。 */
+export interface UpsertDesignContextDocumentInput {
+  projectId: string
+  entryId?: string
+  category: DesignContextCategory
+  title: string
+  tags: string[]
+  markdown: string
+}
+
+/** 通过主进程文件选择器导入 Markdown 创作资料的输入。 */
+export interface ImportDesignContextDocumentInput {
+  projectId: string
+  category: DesignContextCategory
+  tags: string[]
+}
+
+/** 更新创作上下文条目元数据的输入。 */
+export interface UpdateDesignContextEntryInput {
+  projectId: string
+  entryId: string
+  category: DesignContextCategory
+  title: string
+  tags: string[]
+}
+
+/** 把现有 Design 素材登记为长期视觉标准的输入。 */
+export interface RegisterDesignContextAssetInput {
+  projectId: string
+  assetId: string
+  category: DesignContextCategory
+  title: string
+  tags: string[]
+}
+
+/** 删除项目创作上下文条目的输入。 */
+export interface DeleteDesignContextInput {
+  projectId: string
+  entryId: string
 }
 
 export interface DesignJobControlInput {
@@ -442,6 +512,12 @@ export const DESIGN_IPC_CHANNELS = {
   LIST_JOBS: 'design:list-jobs',
   GET_TASK_DETAILS: 'design:get-task-details',
   GET_TASK_TRACE: 'design:get-task-trace',
+  LIST_CONTEXT: 'design:list-context',
+  UPSERT_CONTEXT_DOCUMENT: 'design:upsert-context-document',
+  IMPORT_CONTEXT_DOCUMENT: 'design:import-context-document',
+  UPDATE_CONTEXT: 'design:update-context',
+  REGISTER_CONTEXT_ASSET: 'design:register-context-asset',
+  DELETE_CONTEXT: 'design:delete-context',
   PREPARE_ASSET_FOR_SESSION: 'design:prepare-asset-for-session',
   IMPORT_AGENT_IMAGE: 'design:import-agent-image',
   RELEASE_MEDIA_ACCESS: 'design:release-media-access',
