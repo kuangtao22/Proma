@@ -139,10 +139,65 @@ describe('Nano Banana Pi 工具附件来源', () => {
       resolveTrustedImageRoute: resolveNanoRoute,
     }) as unknown as TestToolDefinition[]
 
-    await tool!.execute('tool-design-1', { prompt: 'draw', model: 'gemini-model-a' })
+    await tool!.execute('tool-design-1', {
+      designSummary: '验证可信模型路由不接受 Agent 伪造的模型参数。',
+      prompt: 'draw',
+      model: 'gemini-model-a',
+    })
 
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/models/gemini-model-b:generateContent')
     expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain('gemini-model-a')
+  })
+
+  test('Given Design 可信工具参数完整 When 执行图片调用 Then 在网络前捕获真实摘要和提示词', async () => {
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    /** 图片执行前捕获的结构化 Design 参数。 */
+    const captured: Array<{ designSummary: string; prompt: string }> = []
+    const trustedImageRoute: ImageGenerationModelSnapshot = {
+      profileId: 'profile-design', name: '设计模型', executor: 'nano-banana', modelId: 'gemini-design',
+    }
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'session-design-capture',
+      trustedImageRoute,
+      resolveTrustedImageRoute: resolveNanoRoute,
+      captureDesignImageCall: (input) => { captured.push(input) },
+    }) as unknown as TestToolDefinition[]
+
+    await tool!.execute('tool-design-capture', {
+      designSummary: '保留导航并突出首屏主任务。',
+      prompt: 'A precise desktop workspace homepage...',
+    })
+
+    expect(captured).toEqual([{
+      designSummary: '保留导航并突出首屏主任务。',
+      prompt: 'A precise desktop workspace homepage...',
+    }])
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('Given Design 可信工具缺少摘要 When 执行 Then 在网络和捕获前拒绝', async () => {
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    /** 不合法调用不得触达捕获钩子。 */
+    const captured: Array<{ designSummary: string; prompt: string }> = []
+    const trustedImageRoute: ImageGenerationModelSnapshot = {
+      profileId: 'profile-design', name: '设计模型', executor: 'nano-banana', modelId: 'gemini-design',
+    }
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'session-design-invalid',
+      trustedImageRoute,
+      resolveTrustedImageRoute: resolveNanoRoute,
+      captureDesignImageCall: (input) => { captured.push(input) },
+    }) as unknown as TestToolDefinition[]
+
+    const result = await tool!.execute('tool-design-invalid', { prompt: 'draw' })
+
+    expect(result.content[0]?.text).toContain('designSummary')
+    expect(captured).toEqual([])
+    expect(fetchMock).toHaveBeenCalledTimes(0)
   })
 
   test('Given 普通 Agent 没有可信路由 When 执行工具 Then 继续使用全局凭据模型', async () => {
@@ -294,7 +349,10 @@ describe('Nano Banana Pi 工具附件来源', () => {
       },
     }) as unknown as TestToolDefinition[]
 
-    const result = await tool!.execute('tool-gpt-image', { prompt: 'draw' })
+    const result = await tool!.execute('tool-gpt-image', {
+      designSummary: '验证 GPT Image 2 可信路由。',
+      prompt: 'draw',
+    })
 
     expect(credentialReads).toBe(0)
     expect(String(fetchMock.mock.calls[0]?.[0])).toEndWith('/images/generations')

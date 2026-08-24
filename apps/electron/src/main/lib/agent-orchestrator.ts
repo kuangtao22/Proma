@@ -1086,6 +1086,7 @@ export class AgentOrchestrator {
         windowsShellAvailable: process.platform !== 'win32' || runtimeEnv.shellKind != null,
         trustedImageRoute: extensions.trustedImageRoute,
         resolveTrustedImageRoute: extensions.resolveTrustedImageRoute,
+        captureDesignImageCall: extensions.captureDesignImageCall,
       })
       checkpoint()
       piBuiltinTools = builtinMcpResult.tools

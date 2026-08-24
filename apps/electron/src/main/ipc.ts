@@ -167,6 +167,8 @@ import {
   revokePromaPathUrl,
 } from './lib/local-file-protocol'
 import { DesignAssetService } from './lib/design/design-asset-service'
+import { DesignContextCatalog } from './lib/design/design-context-catalog'
+import { DesignContextOrchestrator } from './lib/design/design-context-orchestrator'
 import { DesignImageModelPreferences } from './lib/design/design-image-model-preferences'
 import { registerDesignIpcHandlers } from './lib/design/design-ipc'
 import {
@@ -181,6 +183,7 @@ import {
   setDefaultDesignJobManager,
 } from './lib/design/design-job-manager'
 import { designPathResolver } from './lib/design/design-paths'
+import { DesignProjectTextIndex } from './lib/design/design-project-text-index'
 import { designStore } from './lib/design/design-store'
 import { DesignTraceStore } from './lib/design/design-trace-store'
 import { ImageGenerationModelCatalog } from './lib/image-generation-model-catalog'
@@ -1117,6 +1120,13 @@ export function registerIpcHandlers(): void {
   })
   /** Design trace 独立落在本机 cache，列表和普通 Agent 投影不直接读取。 */
   const designTraceStore = new DesignTraceStore({ pathResolver: designPathResolver })
+  /** 长期创作资料和项目文本索引只在 Design 任务按需调用时读取。 */
+  const designContextCatalog = new DesignContextCatalog({ pathResolver: designPathResolver })
+  const designProjectTextIndex = new DesignProjectTextIndex({ pathResolver: designPathResolver })
+  const designContextOrchestrator = new DesignContextOrchestrator({
+    catalog: designContextCatalog,
+    textIndex: designProjectTextIndex,
+  })
   /** trace 提交后统一清理内部会话关联的全部交互资源。 */
   const designExecutionSessionLifecycle = new DesignExecutionSessionLifecycle({
     getSession: getAgentSessionMeta,
@@ -1136,6 +1146,7 @@ export function registerIpcHandlers(): void {
     store: designStore,
     assetService: designAssetService,
     imageModels,
+    contextOrchestrator: designContextOrchestrator,
     getSettings,
     getSession: getAgentSessionMeta,
     getSessionMessages: getAgentSessionSDKMessages,

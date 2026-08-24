@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
   IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
@@ -26,8 +26,23 @@ import type { DesignStore } from './design-store'
 import { createWorkspaceOperationRegistry } from '../workspace-operation-lock'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import type { ResolvedImageGenerationRoute } from '../image-generation-runtime'
+import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
+import type { AgentToolResult } from '@earendil-works/pi-agent-core'
+import { DesignContextOrchestrator } from './design-context-orchestrator'
 
 const NANO_BANANA_TOOL = 'mcp__nano_banana__generate_image'
+
+/** 执行 Job 注入的 Pi 上下文工具。 */
+async function executeInjectedTool(
+  tools: ToolDefinition[] | undefined,
+  name: string,
+  input: Record<string, unknown>,
+): Promise<AgentToolResult<unknown>> {
+  /** 测试只调用工具执行入口，不依赖 Pi UI 渲染上下文。 */
+  const tool = tools?.find((candidate) => candidate.name === name)
+  if (!tool) throw new Error(`注入工具不存在: ${name}`)
+  return tool.execute('tool-context', input, undefined, undefined, {} as never)
+}
 
 /** 创建旧 Nano Banana 任务使用的公开模型快照。 */
 function createNanoSnapshot(): ImageGenerationModelSnapshot {
@@ -77,7 +92,7 @@ describe('Design Job Manager', () => {
       creativeTaskId: 'creative-1',
       attemptNumber: 1,
       originalRequest: input.prompt,
-      contextMode: 'none',
+      contextMode: 'auto',
       traceState: 'pending',
       executionSessionCleanupState: 'pending',
     })
@@ -216,7 +231,13 @@ describe('Design Job Manager', () => {
       source: 'design',
       triggeredBy: 'user',
       permissionModeOverride: 'bypassPermissions',
-      allowedToolNames: [NANO_BANANA_TOOL],
+      allowedToolNames: [
+        'design_list_project_files',
+        'design_search_project_text',
+        'design_read_project_file',
+        'design_read_context_entry',
+        NANO_BANANA_TOOL,
+      ],
       toolCallLimits: { [NANO_BANANA_TOOL]: 1 },
       trustedImageRoute: {
         profileId: 'profile-test',
@@ -242,6 +263,68 @@ describe('Design Job Manager', () => {
       job: { id: job.id, status: 'succeeded' },
       revision: document.revision,
     })
+  })
+
+  test('Given auto 模式生成当前项目首页 When Agent 读取源码并调用图片工具 Then journal 保存真实引用和工具入参', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    harness.runHeadless = async (callbacks, extensions) => {
+      await executeInjectedTool(extensions.piCustomTools, 'design_search_project_text', { query: '首页' })
+      await executeInjectedTool(extensions.piCustomTools, 'design_read_project_file', {
+        relativePath: 'src/App.tsx',
+        purpose: '确认当前首页业务结构',
+      })
+      extensions.beforeToolCall?.(NANO_BANANA_TOOL, {
+        designSummary: '保留现有导航和主要业务入口，重组首屏视觉层级。',
+        prompt: 'Desktop SaaS homepage showing the real Proma workspace...',
+      })
+      extensions.captureDesignImageCall?.({
+        designSummary: '保留现有导航和主要业务入口，重组首屏视觉层级。',
+        prompt: 'Desktop SaaS homepage showing the real Proma workspace...',
+      })
+      callbacks.onComplete(harness.messages)
+    }
+    const job = harness.manager.create({
+      ...createGenerateInput(),
+      prompt: '生成当前项目的首页效果图',
+      contextMode: 'auto',
+    })
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'succeeded',
+      contextReferences: [expect.objectContaining({
+        sourceKind: 'project-file',
+        relativePath: 'src/App.tsx',
+        purpose: '确认当前首页业务结构',
+      })],
+      designSummary: '保留现有导航和主要业务入口，重组首屏视觉层级。',
+      finalImagePrompt: 'Desktop SaaS homepage showing the real Proma workspace...',
+    })
+  })
+
+  test('Given project 模式没有可用资料 When 运行 Then 在创建内部会话前失败', async () => {
+    harness.projectFiles = {}
+    const job = harness.manager.create({ ...createGenerateInput(), contextMode: 'project' })
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'failed',
+      error: '当前项目没有可用的创作上下文',
+    })
+    expect(harness.createdSessions).toEqual([])
+    expect(harness.runInputs).toEqual([])
+  })
+
+  test('Given 项目根有 AGENTS 指令 When 构建 Design prompt Then 只注入显式项目根来源', async () => {
+    writeFileSync(join(harness.projectRoot, 'AGENTS.md'), '视觉要求：保持工作台高信息密度。', 'utf8')
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.runInputs[0]?.userMessage).toContain('AGENTS.md')
+    expect(harness.runInputs[0]?.userMessage).toContain('保持工作台高信息密度')
   })
 
   test('Given 没有可用渠道或模型 When 运行 Then 直接失败且不创建空会话', async () => {
@@ -1125,6 +1208,9 @@ describe('Design Job Manager', () => {
 
   /** 创建覆盖真实状态机边界的可注入 Manager。 */
   function createHarness() {
+    /** Design 上下文与项目指令测试使用的显式项目根。 */
+    const projectRoot = join(cacheRoot, 'project')
+    mkdirSync(projectRoot, { recursive: true })
     /** 状态机产生的单调 ID，测试可精确断言任务与会话关系。 */
     let identity = 0
     /** 当前模拟默认模型设置。 */
@@ -1156,6 +1242,7 @@ describe('Design Job Manager', () => {
       sdkMessages: SDKMessage[]
       traceWriteError?: Error
       cleanupError?: Error
+      projectFiles: Record<string, string>
     } = {
       settings: { agentChannelId: 'channel-default', agentModelId: 'model-default' },
       messages: [] as AgentMessage[],
@@ -1177,6 +1264,7 @@ describe('Design Job Manager', () => {
         snapshot: snapshot as Extract<ImageGenerationModelSnapshot, { executor: 'nano-banana' }>,
       }),
       sdkMessages: [],
+      projectFiles: { 'src/App.tsx': 'export function App() { return "首页" }' },
     }
     const createdSessions: AgentSessionMeta[] = []
     const stoppedSessions: string[] = []
@@ -1232,7 +1320,7 @@ describe('Design Job Manager', () => {
       },
     }
     const manager = new DesignJobManager({
-      pathResolver: { resolve: () => ({ jobsDir: join(cacheRoot, 'jobs') }) },
+      pathResolver: { resolve: () => ({ jobsDir: join(cacheRoot, 'jobs'), projectRoot }) },
       store,
       assetService: {
         resolveAssetPath: () => '/trusted/source.png',
@@ -1260,6 +1348,41 @@ describe('Design Job Manager', () => {
         assertSnapshotAvailable: (snapshot) => state.assertSnapshotAvailable(snapshot),
         resolveExecutionRoute: (snapshot) => state.resolveExecutionRoute(snapshot),
       },
+      contextOrchestrator: new DesignContextOrchestrator({
+        textIndex: {
+          list: () => Object.entries(state.projectFiles).map(([relativePath, content]) => ({
+            relativePath,
+            byteSize: Buffer.byteLength(content),
+            modifiedAt: 1,
+            identity: `identity:${relativePath}`,
+          })),
+          search: (_projectId, query, limit = 20) => Object.entries(state.projectFiles)
+            .filter(([relativePath, content]) => relativePath.includes(query) || content.includes(query))
+            .slice(0, limit)
+            .map(([relativePath, content]) => ({
+              relativePath,
+              byteSize: Buffer.byteLength(content),
+              modifiedAt: 1,
+              identity: `identity:${relativePath}`,
+            })),
+          read: (_projectId, relativePath, maxBytes) => Buffer.from(state.projectFiles[relativePath] ?? '')
+            .subarray(0, maxBytes)
+            .toString('utf8'),
+          invalidate: () => undefined,
+        },
+        catalog: {
+          list: () => [],
+          readDocument: () => { throw new Error('测试没有上下文文档') },
+          upsertDocument: () => { throw new Error('测试不写上下文') },
+          importDocument: () => { throw new Error('测试不导入上下文') },
+          updateMetadata: () => { throw new Error('测试不更新上下文') },
+          registerAsset: () => { throw new Error('测试不登记素材') },
+          delete: () => undefined,
+          isAssetReferenced: () => false,
+        },
+        now: () => 100,
+        createReferenceId: (key) => `reference:${key}`,
+      }),
       getSettings: () => state.settings,
       getSession: (sessionId) => createdSessions.find((session) => session.id === sessionId),
       getSessionMessages: () => state.sdkMessages,
@@ -1397,6 +1520,8 @@ describe('Design Job Manager', () => {
       set sdkMessages(value: SDKMessage[]) { state.sdkMessages = value },
       set traceWriteError(value: Error | undefined) { state.traceWriteError = value },
       set cleanupError(value: Error | undefined) { state.cleanupError = value },
+      get projectRoot() { return projectRoot },
+      set projectFiles(value: Record<string, string>) { state.projectFiles = value },
       set runHeadless(value: typeof state.runHeadless) { state.runHeadless = value },
       set createSessionError(value: Error | undefined) { state.createSessionError = value },
       set importError(value: Error | undefined) { state.importError = value },
@@ -1433,7 +1558,7 @@ function createMultiProjectRecoveryManager(projectBJobs: string, warnings: strin
     pathResolver: {
       resolve: (projectId) => {
         if (projectId === 'project-a') throw new Error('路径解析失败')
-        return { jobsDir: projectBJobs }
+        return { jobsDir: projectBJobs, projectRoot: dirname(projectBJobs) }
       },
     },
     store: {
@@ -1453,6 +1578,12 @@ function createMultiProjectRecoveryManager(projectBJobs: string, warnings: strin
       resolveExecutionRoute: (snapshot) => ({
         executor: 'nano-banana',
         snapshot: snapshot as Extract<ImageGenerationModelSnapshot, { executor: 'nano-banana' }>,
+      }),
+    },
+    contextOrchestrator: {
+      createRun: () => ({
+        tools: [], allowedToolNames: [], getReferences: () => [], getWarnings: () => [],
+        assertReadyForImageCall: () => undefined,
       }),
     },
     getSettings: () => ({}),
@@ -1496,6 +1627,7 @@ function createStoredRunningJob(projectId: string, id: string): object {
 function createGenerateInput(): CreateDesignJobInput {
   return {
     projectId: 'project-1', action: 'generate', prompt: '生成海报',
+    contextMode: 'auto',
     imageModelProfileId: 'profile-test', position: { x: 10, y: 20 },
   }
 }
@@ -1504,6 +1636,7 @@ function createGenerateInput(): CreateDesignJobInput {
 function createEditInput(): CreateDesignJobInput {
   return {
     projectId: 'project-1', action: 'edit', prompt: '移除文字', sourceAssetId: 'asset-source',
+    contextMode: 'auto',
     imageModelProfileId: 'profile-test', maskAnnotationId: 'mask-1', position: { x: 10, y: 20 },
   }
 }

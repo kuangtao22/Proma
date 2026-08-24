@@ -380,6 +380,8 @@ export interface PiNanoBananaToolsContext {
   trustedImageRoute?: ImageGenerationModelSnapshot
   /** 每次图片工具执行前实时解析可信模型与主进程凭据。 */
   resolveTrustedImageRoute?: ResolveImageGenerationRoute
+  /** Design 可信图片工具在任何文件或网络副作用前回传真实结构化参数。 */
+  captureDesignImageCall?: (input: { designSummary: string; prompt: string }) => void
 }
 
 function toPiToolResult(result: McpToolResult, toolUseId: string): AgentToolResult<NanoBananaToolResultDetails> {
@@ -414,18 +416,30 @@ export function buildPiNanoBananaTools(
     if (!toolState.enabled || !credentials.apiKey) return []
   }
 
+  /** 可信 Design 路由额外要求中文设计摘要；普通 Agent 继续沿用原参数合同。 */
+  const parameters = ctx.trustedImageRoute
+    ? Type.Object({
+        designSummary: Type.String({ minLength: 1, maxLength: 4000, description: '用中文概括本次视觉判断和关键设计决策。' }),
+        prompt: Type.String({ minLength: 1, maxLength: 16000, description: '图片模型可直接执行的精确提示词。' }),
+        referenceImagePaths: Type.Optional(Type.Array(Type.String({ description: 'Absolute or cwd-relative reference image path.' }))),
+        aspectRatio: Type.Optional(Type.Union([Type.Literal('1:1'), Type.Literal('16:9'), Type.Literal('4:3'), Type.Literal('9:16'), Type.Literal('3:4')])),
+        imageSize: Type.Optional(Type.Union([Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K')])),
+        numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
+      })
+    : Type.Object({
+        prompt: Type.String({ description: 'Detailed description of the image to generate or edit. English descriptions work best.' }),
+        referenceImagePaths: Type.Optional(Type.Array(Type.String({ description: 'Absolute or cwd-relative reference image path.' }))),
+        aspectRatio: Type.Optional(Type.Union([Type.Literal('1:1'), Type.Literal('16:9'), Type.Literal('4:3'), Type.Literal('9:16'), Type.Literal('3:4')])),
+        imageSize: Type.Optional(Type.Union([Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K')])),
+        numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
+      })
+
   return [sdk.defineTool({
     name: 'mcp__nano_banana__generate_image',
     label: '生成或编辑图片',
     description: 'Generate or edit images using Gemini Image Generation. Supports text-to-image, reference image editing, and iterative multi-turn editing. Use English prompts for best results. Previous generations are automatically used as context. When the user uploads images (listed in <attached_files>) or mentions image files via @file:{path}, pass their paths through referenceImagePaths.',
     promptSnippet: 'Nano Banana: generate or edit images. Pass user-authorized reference image paths when editing an existing image.',
-    parameters: Type.Object({
-      prompt: Type.String({ description: 'Detailed description of the image to generate or edit. English descriptions work best.' }),
-      referenceImagePaths: Type.Optional(Type.Array(Type.String({ description: 'Absolute or cwd-relative reference image path.' }))),
-      aspectRatio: Type.Optional(Type.Union([Type.Literal('1:1'), Type.Literal('16:9'), Type.Literal('4:3'), Type.Literal('9:16'), Type.Literal('3:4')])),
-      imageSize: Type.Optional(Type.Union([Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K')])),
-      numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
-    }),
+    parameters,
     async execute(toolCallId, args, signal) {
       try {
         /** 可信路由解析必须早于历史、文件或网络副作用。 */
@@ -433,6 +447,20 @@ export function buildPiNanoBananaTools(
           ? ctx.resolveTrustedImageRoute?.(ctx.trustedImageRoute)
           : undefined
         if (ctx.trustedImageRoute && !resolvedRoute) throw new Error(MISSING_TRUSTED_ROUTE_RESOLVER_ERROR)
+        /** 直调 execute 的测试和适配层也必须经过可信参数运行时校验。 */
+        const prompt = typeof args.prompt === 'string' ? args.prompt : ''
+        if (ctx.trustedImageRoute) {
+          const designSummary = 'designSummary' in args && typeof args.designSummary === 'string'
+            ? args.designSummary
+            : ''
+          if (!designSummary.trim() || designSummary.length > 4000) {
+            throw new Error('Design 图片工具参数 designSummary 必须为 1-4000 字符')
+          }
+          if (!prompt.trim() || prompt.length > 16000) {
+            throw new Error('Design 图片工具参数 prompt 必须为 1-16000 字符')
+          }
+          ctx.captureDesignImageCall?.({ designSummary, prompt })
+        }
         const referenceImagePaths = Array.isArray(args.referenceImagePaths)
           ? args.referenceImagePaths.filter((path): path is string => typeof path === 'string')
           : undefined
@@ -444,7 +472,7 @@ export function buildPiNanoBananaTools(
               imageAttachments: (await executeOpenAIImages({
                 route: resolvedRoute,
                 sessionId: ctx.sessionId,
-                prompt: String(args.prompt),
+                prompt,
                 referenceImagePaths,
                 cwd: ctx.agentCwd,
                 allowedRoots: ctx.allowedRoots,
@@ -454,7 +482,7 @@ export function buildPiNanoBananaTools(
                 signal,
               })).imageAttachments,
             }
-          : await callGeminiAndBuildResult(String(args.prompt), ctx.sessionId, {
+          : await callGeminiAndBuildResult(prompt, ctx.sessionId, {
               aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
               imageSize: typeof args.imageSize === 'string' ? args.imageSize : undefined,
               referenceImagePaths,

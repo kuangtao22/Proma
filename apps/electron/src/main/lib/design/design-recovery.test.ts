@@ -284,7 +284,10 @@ function createRecoveryJobManager(
   pathResolver: ReturnType<typeof createDesignPathResolver>,
 ): DesignJobManager {
   return new DesignJobManager({
-    pathResolver: { resolve: (projectId) => ({ jobsDir: pathResolver.resolve(projectId).jobsDir }) },
+    pathResolver: { resolve: (projectId) => {
+      const paths = pathResolver.resolve(projectId)
+      return { jobsDir: paths.jobsDir, projectRoot: paths.projectRoot }
+    } },
     store,
     assetService: {
       resolveAssetPath: () => '/unused',
@@ -300,6 +303,12 @@ function createRecoveryJobManager(
         if (snapshot.executor !== 'nano-banana') throw new Error('恢复测试不支持 OpenAI Images 路由')
         return { executor: 'nano-banana', snapshot }
       },
+    },
+    contextOrchestrator: {
+      createRun: () => ({
+        tools: [], allowedToolNames: [], getReferences: () => [], getWarnings: () => [],
+        assertReadyForImageCall: () => undefined,
+      }),
     },
     getSettings: () => ({}),
     getSession: () => undefined,

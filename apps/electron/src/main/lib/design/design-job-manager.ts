@@ -24,7 +24,9 @@ import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-
 import type { AgentRunExtensions } from '../agent-service'
 import type { ImageGenerationModelCatalog } from '../image-generation-model-catalog'
 import { runSafeImageModelOperation } from '../image-generation-model-error'
+import { resolveProjectInstructions } from '../project-instruction-resolver'
 import type { DesignAssetImportSource, DesignAssetService } from './design-asset-service'
+import type { DesignContextOrchestrator } from './design-context-orchestrator'
 import { isSafeDesignStableId } from './design-paths'
 import type { DesignStore } from './design-store'
 import type { DesignTraceWriteResult } from './design-trace-store'
@@ -98,7 +100,7 @@ interface DesignHeadlessCallbacks {
 
 /** Design Job Manager 的可注入依赖。 */
 export interface DesignJobManagerDependencies {
-  pathResolver: { resolve: (projectId: string) => { jobsDir: string } }
+  pathResolver: { resolve: (projectId: string) => { jobsDir: string; projectRoot: string } }
   store: DesignStore
   assetService: Pick<DesignAssetService, 'resolveAssetPath' | 'importAuthorizedFiles'>
   /** 只暴露任务创建、预检和单次工具运行所需的模型路由能力。 */
@@ -106,6 +108,8 @@ export interface DesignJobManagerDependencies {
     ImageGenerationModelCatalog,
     'resolveAvailableSnapshot' | 'assertSnapshotAvailable' | 'resolveExecutionRoute'
   >
+  /** 为每次 Design 运行创建隔离的只读上下文工具、预算与审计状态。 */
+  contextOrchestrator: Pick<DesignContextOrchestrator, 'createRun'>
   getSettings: () => DesignJobSettings
   getSession: (sessionId: string) => AgentSessionMeta | undefined
   /** 从内部会话 JSONL 读取完整 SDK 事实，用于终态 trace 转存。 */
@@ -300,6 +304,15 @@ export class DesignJobManager {
         this.updateStatus(queued, 'failed', { error: DESIGN_JOB_MODEL_ERROR })
         return
       }
+      /** 上下文预检和项目指令解析必须早于内部会话创建，避免失败时留下空会话。 */
+      const contextRun = this.dependencies.contextOrchestrator.createRun({
+        projectId: queued.projectId,
+        mode: queued.contextMode,
+        originalRequest: queued.originalRequest,
+      })
+      const userMessage = this.buildPrompt(queued)
+      /** 图片工具执行前捕获的真实结构化参数，不从自然语言或 trace 反推。 */
+      let imageCall: { designSummary: string; prompt: string } | undefined
       const session = this.dependencies.createSession({
         title: `设计任务：${queued.prompt.trim().slice(0, 24)}`,
         channelId: model.channelId,
@@ -310,35 +323,51 @@ export class DesignJobManager {
       const running = this.updateStatus(queued, 'running', { sessionId: session.id, error: undefined })
       let runError: string | undefined
       let messages: AgentMessage[] = []
-      await this.dependencies.runHeadless({
-        sessionId: session.id,
-        userMessage: this.buildPrompt(running),
-        rawUserMessage: running.prompt,
-        channelId: model.channelId,
-        modelId: model.modelId,
-        workspaceId: running.projectId,
-        triggeredBy: 'user',
-        permissionModeOverride: 'bypassPermissions',
-      }, {
-        source: 'design',
-        onError: (error) => { runError ??= error },
-        onComplete: (completedMessages) => { messages = completedMessages ?? [] },
-        onTitleUpdated: () => undefined,
-      }, {
-        allowedToolNames: [DESIGN_IMAGE_TOOL],
-        toolCallLimits: { [DESIGN_IMAGE_TOOL]: 1 },
-        trustedImageRoute: running.imageModelSnapshot,
-        resolveTrustedImageRoute: (route) => {
-          try {
-            return this.runImageModelValidation(
-              () => this.dependencies.imageModels.resolveExecutionRoute(route),
-            )
-          } catch (error) {
-            runError ??= error instanceof Error ? error.message : DESIGN_IMAGE_MODEL_VALIDATION_ERROR
-            throw error
-          }
-        },
-      })
+      try {
+        await this.dependencies.runHeadless({
+          sessionId: session.id,
+          userMessage,
+          rawUserMessage: running.prompt,
+          channelId: model.channelId,
+          modelId: model.modelId,
+          workspaceId: running.projectId,
+          triggeredBy: 'user',
+          permissionModeOverride: 'bypassPermissions',
+        }, {
+          source: 'design',
+          onError: (error) => { runError ??= error },
+          onComplete: (completedMessages) => { messages = completedMessages ?? [] },
+          onTitleUpdated: () => undefined,
+        }, {
+          piCustomTools: contextRun.tools,
+          allowedToolNames: [...contextRun.allowedToolNames, DESIGN_IMAGE_TOOL],
+          toolCallLimits: { [DESIGN_IMAGE_TOOL]: 1 },
+          beforeToolCall: (toolName) => {
+            if (toolName === DESIGN_IMAGE_TOOL) contextRun.assertReadyForImageCall()
+          },
+          captureDesignImageCall: (value) => { imageCall = { ...value } },
+          trustedImageRoute: running.imageModelSnapshot,
+          resolveTrustedImageRoute: (route) => {
+            try {
+              return this.runImageModelValidation(
+                () => this.dependencies.imageModels.resolveExecutionRoute(route),
+              )
+            } catch (error) {
+              runError ??= error instanceof Error ? error.message : DESIGN_IMAGE_MODEL_VALIDATION_ERROR
+              throw error
+            }
+          },
+        })
+      } finally {
+        /** 即使 Agent 抛错或被取消，也保存本轮已经发生的上下文与图片调用事实。 */
+        const latest = this.requireJob(jobId)
+        this.updateStatus(latest, latest.status, {
+          contextReferences: contextRun.getReferences(),
+          contextWarning: contextRun.getWarnings().join('\n') || undefined,
+          designSummary: imageCall?.designSummary,
+          finalImagePrompt: imageCall?.prompt,
+        })
+      }
       const latest = this.requireJob(jobId)
       if (latest.status === 'cancelled' || latest.status === 'interrupted') return
       if (runError) {
@@ -598,7 +627,7 @@ export class DesignJobManager {
       status: 'queued',
       prompt,
       originalRequest: replaced?.originalRequest ?? prompt,
-      contextMode: replaced?.contextMode ?? 'none',
+      contextMode: replaced?.contextMode ?? input.contextMode,
       traceState: 'pending',
       executionSessionCleanupState: 'pending',
       ...(imageModelSnapshot ? { imageModelSnapshot: { ...imageModelSnapshot } } : {}),
@@ -673,10 +702,28 @@ export class DesignJobManager {
     )
   }
 
-  /** 构建只允许单次 Nano Banana 调用的生成或编辑提示。 */
+  /** 构建按任务选择上下文、且只允许单次可信图片调用的通用视觉提示。 */
   private buildPrompt(job: StoredDesignJob): string {
+    /** 项目指令只从当前任务显式授权的项目根解析，不使用 Agent cwd 或祖先目录。 */
+    const projectRoot = this.dependencies.pathResolver.resolve(job.projectId).projectRoot
+    const instructionManifest = resolveProjectInstructions({ projectRoot })
+    const projectInstructions = instructionManifest.sources.length > 0
+      ? instructionManifest.sources.map((source) => [
+          `--- ${source.relativePath} ---`,
+          source.content,
+        ].join('\n')).join('\n\n')
+      : '（当前项目根没有可用的项目指令）'
+    /** 所有视觉任务共享同一推理要求，避免按开发、平面或漫剧写死固定流程。 */
+    const commonInstructions = [
+      '你正在执行一个 Design 视觉任务。先理解视觉目标，再决定需要哪些信息。',
+      '按当前任务从品牌、产品、代码、角色、故事、场景、连续性或参考资料中选择必要上下文；只读取完成任务所需的最少内容。',
+      '调用图片工具时，designSummary 必须使用中文说明视觉判断，prompt 必须是图片模型可直接执行的精确提示词。',
+      `只调用一次 ${DESIGN_IMAGE_TOOL}，并返回图片工具结果。`,
+      `上下文模式：${job.contextMode}`,
+      `项目指令（仅来自显式项目根）：\n${projectInstructions}`,
+    ]
     if (job.action === 'generate') {
-      return `只调用一次 ${DESIGN_IMAGE_TOOL} 生成图片并返回结果。\n用户要求：${job.prompt}`
+      return [...commonInstructions, `用户要求：${job.prompt}`].join('\n')
     }
     const sourcePath = this.dependencies.assetService.resolveAssetPath(job.projectId, job.sourceAssetId!)
     const document = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
@@ -686,8 +733,7 @@ export class DesignJobManager {
     const maskText = annotation?.kind === 'mask'
       ? `\n蒙版 ${annotation.id} 点位：${JSON.stringify(annotation.points)}`
       : ''
-    return [
-      `只调用一次 ${DESIGN_IMAGE_TOOL} 编辑参考图片并返回结果。`,
+    return [...commonInstructions,
       `referenceImagePaths: ${JSON.stringify([sourcePath])}`,
       `编辑要求：${job.prompt}${maskText}`,
     ].join('\n')
@@ -736,6 +782,10 @@ export class DesignJobManager {
         const written = this.dependencies.traceStore.writeFromMessages(job.projectId, job.id, messages)
         job = this.updateStatus(job, job.status, {
           ...written.summary,
+          contextReferences: job.contextReferences ?? written.summary.contextReferences,
+          designSummary: job.designSummary ?? written.summary.designSummary,
+          finalImagePrompt: job.finalImagePrompt ?? written.summary.finalImagePrompt,
+          contextWarning: job.contextWarning ?? written.summary.contextWarning,
           traceState: 'ready',
           executionSessionCleanupState: 'pending',
         })
@@ -985,6 +1035,7 @@ export class DesignJobManager {
       projectId: previous.projectId,
       action: previous.action,
       prompt: previous.prompt,
+      contextMode: previous.contextMode,
       ...(previous.sourceSessionId ? { sourceSessionId: previous.sourceSessionId } : {}),
       ...(previous.sourceAssetId ? { sourceAssetId: previous.sourceAssetId } : {}),
       ...(previous.maskAnnotationId ? { maskAnnotationId: previous.maskAnnotationId } : {}),

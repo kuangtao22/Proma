@@ -102,6 +102,8 @@ export interface PiBuiltinToolsContext {
   trustedImageRoute?: ImageGenerationModelSnapshot
   /** 生图请求发生任何文件或网络副作用前解析可信运行路由。 */
   resolveTrustedImageRoute?: ResolveImageGenerationRoute
+  /** Design 可信图片工具执行前捕获真实设计摘要和精确提示词。 */
+  captureDesignImageCall?: (input: { designSummary: string; prompt: string }) => void
 }
 
 function jsonToolResult(payload: unknown): AgentToolResult<unknown> {
@@ -1185,6 +1187,7 @@ export async function buildPiBuiltinTools(
         allowedRoots: ctx.allowedRoots,
         trustedImageRoute: ctx.trustedImageRoute,
         resolveTrustedImageRoute: ctx.resolveTrustedImageRoute,
+        captureDesignImageCall: ctx.captureDesignImageCall,
       }))
     } catch (error) {
       console.error('[Pi 桥接] 注入 nano-banana 工具失败:', error)

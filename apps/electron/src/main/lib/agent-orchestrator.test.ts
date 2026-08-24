@@ -71,6 +71,7 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(body).toContain('extensions: AgentRunExtensions = {}')
     expect(body).toContain('trustedImageRoute: extensions.trustedImageRoute')
     expect(body).toContain('resolveTrustedImageRoute: extensions.resolveTrustedImageRoute')
+    expect(body).toContain('captureDesignImageCall: extensions.captureDesignImageCall')
     expect(body).toContain('createRunToolCallLimiter(extensions.toolCallLimits)')
     expect(body).toContain('consumeRunToolCallLimit(toolName)')
     expect(body).toContain('extensions.beforeToolCall?.(toolName, input)')
