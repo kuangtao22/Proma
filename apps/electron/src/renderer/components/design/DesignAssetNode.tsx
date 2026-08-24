@@ -1,6 +1,6 @@
 import * as React from 'react'
 import type { Node, NodeProps } from '@xyflow/react'
-import { ImageOff, LoaderCircle, RotateCcw, Square } from 'lucide-react'
+import { ImageOff, LoaderCircle, RotateCcw, Square, Trash2 } from 'lucide-react'
 import { useSetAtom } from 'jotai'
 import { toast } from 'sonner'
 import {
@@ -8,7 +8,7 @@ import {
   updateDesignProjectStateAtom,
 } from '@/atoms/design-atoms'
 import { Button } from '@/components/ui/button'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { designAdapter } from '@/lib/design-adapter'
 import { cn } from '@/lib/utils'
 
@@ -50,6 +50,8 @@ export type DesignAssetFlowNode = Node<DesignAssetNodeData, 'designAsset'>
 export interface DesignAssetNodeProps extends NodeProps<DesignAssetFlowNode> {
   /** Task 8/10 接入的任务重试处理器；缺失时按钮保持禁用。 */
   onRetry?: (jobId: string) => void
+  /** 测试或外部宿主注入的删除确认请求；生产默认写入项目确认意图。 */
+  onDelete?: (jobId: string) => void
 }
 
 /** 每种节点状态对应的明确中文文本。 */
@@ -74,9 +76,12 @@ export function DesignAssetNode({
   height,
   selected,
   onRetry,
+  onDelete,
 }: DesignAssetNodeProps): React.ReactElement {
   const updateProjectState = useSetAtom(updateDesignProjectStateAtom)
   const requestRecovery = useSetAtom(requestDesignRecoveryAtom)
+  /** 取消请求提交后保持稳定反馈，直到主进程返回权威终态。 */
+  const [cancelling, setCancelling] = React.useState(false)
   /** 持久化节点宽度缺失时使用首版标准宽度。 */
   const stableWidth = width ?? 320
   /** 持久化节点高度缺失时使用首版标准高度。 */
@@ -88,6 +93,8 @@ export function DesignAssetNode({
   const commandsEnabled = data.writable === true && data.authoritativeRecoveryState === 'idle'
   /** 外部测试回调优先；生产节点可凭完整项目和任务 ID 直接重试。 */
   const retryEnabled = commandsEnabled && Boolean(onRetry || (data.projectId && data.jobId))
+  /** 删除与重试共享终态范围，但通过独立 IPC 清理节点和 journal。 */
+  const deleteEnabled = commandsEnabled && Boolean(onDelete || (data.projectId && data.jobId))
   /** 只有等待或运行中的真实任务允许取消。 */
   const canCancel = data.kind === 'job'
     && (data.status === 'queued' || data.status === 'running')
@@ -125,10 +132,11 @@ export function DesignAssetNode({
 
   /** 请求主进程停止对应 Pi generation，并采用其竞态判定后的 journal 终态。 */
   const handleCancel = (): void => {
-    if (!commandsEnabled || !data.projectId || !data.jobId) return
+    if (!commandsEnabled || cancelling || !data.projectId || !data.jobId) return
     /** 闭包内收窄后的稳定项目和任务 ID。 */
     const projectId = data.projectId
     const jobId = data.jobId
+    setCancelling(true)
     void designAdapter.cancelJob({ projectId, jobId }).then((job) => {
       updateProjectState({
         projectId,
@@ -141,6 +149,22 @@ export function DesignAssetNode({
         requestRecovery({ projectId })
       }
       toast.error(error instanceof Error ? error.message : '取消设计任务失败')
+    }).finally(() => {
+      setCancelling(false)
+    })
+  }
+
+  /** 删除按钮只登记确认意图，持久化删除由工作区唯一对话框执行。 */
+  const handleDelete = (): void => {
+    if (!commandsEnabled || !data.jobId) return
+    if (onDelete) {
+      onDelete(data.jobId)
+      return
+    }
+    if (!data.projectId) return
+    updateProjectState({
+      projectId: data.projectId,
+      update: { deleteJobIntentId: data.jobId },
     })
   }
 
@@ -199,30 +223,52 @@ export function DesignAssetNode({
             )}
           </div>
           {canRetry && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="nodrag shrink-0"
-              disabled={!retryEnabled || !data.jobId}
-              onClick={handleRetry}
-            >
-              <RotateCcw className="size-3.5" aria-hidden="true" />
-              重试生成
-            </Button>
+            <div className="nodrag flex shrink-0 items-center gap-1">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="删除任务"
+                disabled={!deleteEnabled || !data.jobId}
+                onClick={handleDelete}
+              >
+                <Trash2 className="size-3.5" aria-hidden="true" />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="shrink-0"
+                disabled={!retryEnabled || !data.jobId}
+                onClick={handleRetry}
+              >
+                <RotateCcw className="size-3.5" aria-hidden="true" />
+                重试生成
+              </Button>
+            </div>
           )}
           {canCancel && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="nodrag shrink-0"
-              disabled={!commandsEnabled}
-              onClick={handleCancel}
-            >
-              <Square className="size-3.5" aria-hidden="true" />
-              取消生成
-            </Button>
+            <TooltipProvider delayDuration={200} disableHoverableContent>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="nodrag shrink-0"
+                    aria-description="供应商已收到请求时，费用不一定撤销"
+                    disabled={!commandsEnabled || cancelling}
+                    onClick={handleCancel}
+                  >
+                    {cancelling
+                      ? <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />
+                      : <Square className="size-3.5" aria-hidden="true" />}
+                    {cancelling ? '取消中' : '取消生成'}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">供应商已收到请求时，费用不一定撤销</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           )}
         </footer>
       </div>

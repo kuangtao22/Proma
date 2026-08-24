@@ -1,11 +1,15 @@
 import { describe, expect, test } from 'bun:test'
 import { createEmptyDesignDocument } from '@proma/shared'
-import type { DesignWorkspaceSnapshot } from '@proma/shared'
+import type { DesignJobRecord, DesignWorkspaceSnapshot } from '@proma/shared'
 import { createStore, Provider } from 'jotai'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createInitialDesignProjectState } from '@/atoms/design-atoms'
 import { currentAgentWorkspaceIdAtom } from '@/atoms/agent-atoms'
-import { DesignWorkspaceStateView, DesignWorkspaceView } from './DesignWorkspaceView'
+import {
+  createDeletedDesignTaskStateUpdate,
+  DesignWorkspaceStateView,
+  DesignWorkspaceView,
+} from './DesignWorkspaceView'
 
 /** 创建可覆盖状态的测试快照。 */
 function createSnapshot(overrides: Partial<DesignWorkspaceSnapshot> = {}): DesignWorkspaceSnapshot {
@@ -17,6 +21,47 @@ function createSnapshot(overrides: Partial<DesignWorkspaceSnapshot> = {}): Desig
 }
 
 describe('Design 工作区页面状态', () => {
+  test('Given 同一创作任务有多次尝试 When 删除其中一次 Then 同步清理全部尝试和详情缓存', () => {
+    /** 两次尝试共享 creativeTaskId，另一任务必须完整保留。 */
+    const createJob = (id: string, creativeTaskId: string): DesignJobRecord => ({
+      id,
+      creativeTaskId,
+      attemptNumber: id === 'job-2' ? 2 : 1,
+      projectId: 'project-1',
+      action: 'generate',
+      status: 'failed',
+      prompt: '生成首页',
+      originalRequest: '生成首页',
+      contextMode: 'none',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const state = {
+      ...createInitialDesignProjectState(),
+      jobs: [createJob('job-1', 'creative-1'), createJob('job-2', 'creative-1'), createJob('job-3', 'creative-2')],
+      taskDetailsByJobId: new Map([
+        ['job-1', { phase: 'ready' as const, traceLoaded: true, traceLoading: false, details: {
+          creativeTaskId: 'creative-1', currentJobId: 'job-1', attempts: [], traceState: 'ready' as const,
+        } }],
+        ['job-3', { phase: 'ready' as const, traceLoaded: false, traceLoading: false, details: {
+          creativeTaskId: 'creative-2', currentJobId: 'job-3', attempts: [], traceState: 'pending' as const,
+        } }],
+      ]),
+      selectedNodeIds: ['deleted-node'],
+      deleteJobIntentId: 'job-1',
+      deletingJobId: 'job-1',
+    }
+    const document = createEmptyDesignDocument('project-1', 10)
+
+    const update = createDeletedDesignTaskStateUpdate(state, 'job-1', document)
+
+    expect(update.jobs?.map((job) => job.id)).toEqual(['job-3'])
+    expect([...update.taskDetailsByJobId!.keys()]).toEqual(['job-3'])
+    expect(update.selectedNodeIds).toEqual([])
+    expect(update.deleteJobIntentId).toBeNull()
+    expect(update.deletingJobId).toBeNull()
+  })
+
   test('Given 正在加载 When 渲染 Then 显示稳定骨架状态', () => {
     const html = renderToStaticMarkup(
       <DesignWorkspaceStateView

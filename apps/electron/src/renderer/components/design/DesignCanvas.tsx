@@ -309,6 +309,14 @@ export function DesignCanvas({
     createdAt: Date.now(),
   }), [createEntityId])
 
+  /** Delete/Backspace 与节点垃圾桶共用同一个项目级删除确认意图。 */
+  const requestTerminalJobDeletion = React.useCallback((jobId: string): void => {
+    updateProjectState({
+      projectId: document.projectId,
+      update: { deleteJobIntentId: jobId },
+    })
+  }, [document.projectId, updateProjectState])
+
   React.useEffect(() => {
     /** Design 页面活动期间接管有限编辑快捷键。 */
     const handleKeyDown = (event: KeyboardEvent): void => {
@@ -318,14 +326,27 @@ export function DesignCanvas({
       const selection = state?.selectedNodeIds ?? selectedNodeIdsRef.current
       /** 最新文档用于同步判断 job 选区与历史项是否允许结构编辑。 */
       const latestDocument = state?.snapshot?.document ?? document
+      /** 单选终态任务才允许走任务专用删除，混合选区继续保持结构保护。 */
+      const selectedJobNode = selection.length === 1
+        ? latestDocument.nodes.find((node) => node.id === selection[0] && node.kind === 'job')
+        : undefined
+      const deletableJob = selectedJobNode?.jobId
+        ? (state?.jobs ?? jobs).find((job) => (
+            job.id === selectedJobNode.jobId
+            && (job.status === 'failed' || job.status === 'cancelled' || job.status === 'interrupted')
+          ))
+        : undefined
+      /** 普通素材选区沿用编辑删除，终态任务单选只额外开放删除键。 */
+      const canEditSelection = !selectionContainsDesignJobNode(latestDocument, selection)
       const undoEntry = state?.history.at(-1)
       const redoEntry = state?.future.at(-1)
       const action = resolveDesignKeyboardAction(
         event,
         selection.length > 0,
-        !selectionContainsDesignJobNode(latestDocument, selection),
+        canEditSelection,
         Boolean(undoEntry && areDesignMutationsJobSafe(latestDocument, undoEntry.inverse)),
         Boolean(redoEntry && areDesignMutationsJobSafe(latestDocument, redoEntry.forward)),
+        canEditSelection || Boolean(deletableJob),
       )
       if (!action) return
       event.preventDefault()
@@ -347,10 +368,14 @@ export function DesignCanvas({
           })
           break
         case 'delete':
-          executeEdit({
-            projectId: document.projectId,
-            command: { type: 'delete-selection', nodeIds: selection },
-          })
+          if (deletableJob) {
+            requestTerminalJobDeletion(deletableJob.id)
+          } else {
+            executeEdit({
+              projectId: document.projectId,
+              command: { type: 'delete-selection', nodeIds: selection },
+            })
+          }
           break
         case 'group':
           executeEdit({
@@ -373,7 +398,7 @@ export function DesignCanvas({
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => { window.removeEventListener('keydown', handleKeyDown) }
-  }, [createEntityId, document.groups.length, document.projectId, executeEdit, redoEdit, store, undoEdit, writable])
+  }, [createEntityId, document, executeEdit, jobs, redoEdit, requestTerminalJobDeletion, store, undoEdit, writable])
 
   /** 传给 XYFlow 的属性集中构造，测试可观察真实回调与启动策略。 */
   const flowProps: DesignCanvasFlowProps = {

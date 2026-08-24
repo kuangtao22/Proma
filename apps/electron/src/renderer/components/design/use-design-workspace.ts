@@ -288,6 +288,9 @@ function createAuthoritativeRecoveryUpdate(
     phase: 'ready',
     selectedNodeIds: [],
     inspectorAssetId: null,
+    taskDetailsByJobId: new Map(),
+    deleteJobIntentId: null,
+    deletingJobId: null,
     history: [],
     future: [],
     authoritativeRecoveryState: 'idle',
@@ -485,7 +488,20 @@ export function createDesignWorkspaceController(
     dependencies.updateState((latest) => {
       /** journal 读取失败时保留现有任务并显示独立重试状态。 */
       const update: Partial<DesignProjectState> = jobs
-        ? { jobs, jobLoadState: 'idle', jobError: null }
+        ? {
+            jobs,
+            jobLoadState: 'idle',
+            jobError: null,
+            /** 已被主进程回收的任务同步移除轻量详情与已加载 trace。 */
+            taskDetailsByJobId: new Map([...latest.taskDetailsByJobId]
+              .filter(([jobId]) => jobs.some((job) => job.id === jobId))
+              .map(([jobId, entry]) => [jobId, {
+                ...entry,
+                /** journal 变化后由当前可见详情重新读取尝试历史。 */
+                phase: 'idle' as const,
+                error: undefined,
+              }])),
+          }
         : {
             jobLoadState: 'failed',
             jobError: `加载设计任务失败：${getDesignErrorMessage(jobsResult.status === 'rejected' ? jobsResult.reason : undefined)}`,
@@ -708,6 +724,9 @@ export function createDesignWorkspaceController(
         : latest.pendingMutations,
       saveState: 'failed',
       authoritativeRecoveryState: 'loading',
+      taskDetailsByJobId: new Map(),
+      deleteJobIntentId: null,
+      deletingJobId: null,
       error: DESIGN_AUTHORITATIVE_RECOVERY_LOADING_MESSAGE,
     }))
     void loadSnapshot(false, true)
@@ -907,7 +926,16 @@ export function createDesignWorkspaceController(
             latest.pendingMutations,
           ),
           saveState: 'dirty',
+          taskDetailsByJobId: new Map(),
+          deleteJobIntentId: null,
+          deletingJobId: null,
         }))
+      } else {
+        dependencies.updateState({
+          taskDetailsByJobId: new Map(),
+          deleteJobIntentId: null,
+          deletingJobId: null,
+        })
       }
       unsubscribe?.()
       unsubscribe = null

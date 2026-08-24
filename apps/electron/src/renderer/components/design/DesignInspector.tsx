@@ -3,9 +3,10 @@ import type {
   AgentSessionMeta,
   CreateDesignJobInput,
   DesignAsset,
+  DesignCanvasDocument,
 } from '@proma/shared'
 import { Download, ImageOff, RefreshCw, Send, Settings2, Trash2, Upload, X } from 'lucide-react'
-import { useAtomValue, useSetAtom } from 'jotai'
+import { useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
 import {
   createInitialDesignProjectState,
@@ -27,6 +28,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { designAdapter } from '@/lib/design-adapter'
+import { copyTextToClipboard } from '@/lib/clipboard'
 import { sendPreparedDesignAssetToSession } from '@/lib/design-session-actions'
 import { useOpenSession } from '@/hooks/useOpenSession'
 import { cn } from '@/lib/utils'
@@ -39,6 +41,10 @@ import {
 import { useDesignInspectorActions } from './use-design-inspector-actions'
 import { useDesignImageModelSelection } from './use-design-image-model-selection'
 import { isDesignRecoveryRequired } from './use-design-workspace'
+import {
+  createDesignTaskDetailsController,
+  DesignTaskDetails,
+} from './DesignTaskDetails'
 
 /** 首版图片生成允许的画面比例。 */
 export type DesignAspectRatio = '1:1' | '16:9' | '4:3' | '9:16' | '3:4'
@@ -149,6 +155,11 @@ export interface DesignInspectorStateViewProps {
   onImageModelChange?: (profileId: string) => void
   onConfigureImageModels?: () => void
   onRetryImageModels?: () => void
+  onLoadTaskDetails?: (jobId: string) => void
+  onLoadTaskTrace?: (jobId: string) => void
+  onCopyTaskPrompt?: (prompt: string) => void
+  onRetryJob?: (jobId: string) => void
+  onContinueFromVersion?: (assetId: string) => void
 }
 
 /** 素材标签所需的选择上下文。 */
@@ -159,6 +170,45 @@ interface InspectorSelection {
   assetId?: string
   asset?: DesignAsset
   missing: boolean
+}
+
+/**
+ * 从当前选区解析任务详情来源。
+ * 任务节点使用自身 jobId，成功素材使用素材保存的 sourceJobId。
+ */
+export function getSelectedDesignTaskJobId(
+  document: DesignCanvasDocument,
+  selectedNodeIds: string[],
+  inspectorAssetId: string | null,
+): string | null {
+  if (selectedNodeIds.length > 1) return null
+  const selectedNode = selectedNodeIds.length === 1
+    ? document.nodes.find((node) => node.id === selectedNodeIds[0])
+    : undefined
+  if (selectedNode?.kind === 'job') return selectedNode.jobId ?? null
+  const assetId = selectedNode?.kind === 'asset'
+    ? selectedNode.assetId
+    : inspectorAssetId ?? undefined
+  return assetId
+    ? document.assets.find((asset) => asset.id === assetId)?.sourceJobId ?? null
+    : null
+}
+
+/**
+ * 把成功素材准备成新的编辑草稿。
+ * 该更新只切换 Inspector 与来源选择，不创建 Job 或触发付费调用。
+ */
+export function createContinueFromVersionUpdate(
+  document: DesignCanvasDocument,
+  assetId: string,
+): Pick<DesignProjectState, 'inspectorTab' | 'editPrompt' | 'selectedNodeIds' | 'inspectorAssetId'> {
+  const sourceNode = document.nodes.find((node) => node.assetId === assetId)
+  return {
+    inspectorTab: 'ai',
+    editPrompt: '',
+    selectedNodeIds: sourceNode ? [sourceNode.id] : [],
+    inspectorAssetId: assetId,
+  }
 }
 
 /** 素材标签：选择详情、导入入口与 48px 项目素材列表。 */
@@ -555,6 +605,18 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
     asset: selectedAsset,
     missing: Boolean(assetId && (!selectedAsset || missingAssetIds.has(assetId))),
   }
+  /** 任务节点和成功素材共享同一个创作任务详情入口。 */
+  const selectedTaskJobId = getSelectedDesignTaskJobId(
+    state.snapshot.document,
+    state.selectedNodeIds,
+    state.inspectorAssetId,
+  )
+  const selectedTaskJob = selectedTaskJobId
+    ? state.jobs.find((job) => job.id === selectedTaskJobId)
+    : undefined
+  const selectedTaskDetailsState = selectedTaskJobId
+    ? state.taskDetailsByJobId.get(selectedTaskJobId)
+    : undefined
   /** 素材写操作需等待当前 revision 保存稳定；导出由面板单独保持可用。 */
   const writable = state.snapshot.writable
     && !state.conflictRecoveryPending
@@ -566,6 +628,24 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
         <h2 className="text-sm font-semibold">设计</h2>
         <Button type="button" variant="ghost" size="icon-sm" aria-label="清除选择" disabled={(state.selectedNodeIds.length === 0 && !state.inspectorAssetId) || !props.onClearSelection} onClick={props.onClearSelection}><X aria-hidden="true" /></Button>
       </header>
+      {selectedTaskJob && (
+        <div className="max-h-[46%] shrink-0 overflow-y-auto border-b border-border">
+          <DesignTaskDetails
+            key={selectedTaskJob.id}
+            job={selectedTaskJob}
+            detailsState={selectedTaskDetailsState ?? {
+              phase: 'idle',
+              traceLoaded: false,
+              traceLoading: false,
+            }}
+            onLoadDetails={() => props.onLoadTaskDetails?.(selectedTaskJob.id)}
+            onLoadTrace={() => props.onLoadTaskTrace?.(selectedTaskJob.id)}
+            onCopyPrompt={(prompt) => props.onCopyTaskPrompt?.(prompt)}
+            onRetry={(jobId) => props.onRetryJob?.(jobId)}
+            onContinueFromVersion={(assetId) => props.onContinueFromVersion?.(assetId)}
+          />
+        </div>
+      )}
       <Tabs value={state.inspectorTab} onValueChange={(value) => props.onTabChange(value as DesignProjectState['inspectorTab'])} className="flex min-h-0 flex-1 flex-col">
         <TabsList className="mx-3 mt-3 grid h-8 shrink-0 grid-cols-3 rounded-md p-0.5">
           <TabsTrigger value="assets" className="min-w-0 px-1 text-xs">素材</TabsTrigger>
@@ -602,6 +682,7 @@ export function getDesignTargetSessions(
 /** 从项目 Jotai 状态连接右栏素材操作与真实 Design Job。 */
 export function DesignInspector({ projectId, width }: DesignInspectorProps): React.ReactElement {
   const states = useAtomValue(designProjectStatesAtom)
+  const store = useStore()
   const updateState = useSetAtom(updateDesignProjectStateAtom)
   const executeEdit = useSetAtom(executeDesignEditAtom)
   const requestRecovery = useSetAtom(requestDesignRecoveryAtom)
@@ -629,6 +710,14 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
   })
   /** 未加载项目仍展示稳定检查器骨架。 */
   const state = states.get(projectId) ?? createInitialDesignProjectState()
+  /** 详情控制器通过当前项目 Map 做迟到请求失效，不把 trace 放入任务列表。 */
+  const taskDetailsController = React.useMemo(() => createDesignTaskDetailsController({
+    projectId,
+    adapter: designAdapter,
+    getState: () => store.get(designProjectStatesAtom).get(projectId)
+      ?? createInitialDesignProjectState(),
+    updateState: (update) => updateState({ projectId, update }),
+  }), [projectId, store, updateState])
   /** 创建任务后立即展示 queued，随后由 job change 事件用完整 journal 校准。 */
   const handleCreateJob = React.useCallback((input: CreateDesignJobInput): void => {
     /** 缺少当前权威 profile 时不创建主进程任务或任何占位。 */
@@ -646,6 +735,33 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
       toast.error(error instanceof Error ? error.message : '创建设计任务失败')
     })
   }, [handleRecoveryRequired, projectId, state.imageModelProfileId, updateState])
+  /** 失败任务重试沿用 creativeTaskId，新的执行尝试由主进程分配 jobId。 */
+  const handleRetryJob = React.useCallback((jobId: string): void => {
+    void designAdapter.retryJob({ projectId, jobId }).then((job) => {
+      updateState({
+        projectId,
+        update: (current) => ({
+          jobs: [...current.jobs.filter((candidate) => candidate.id !== job.id), job],
+        }),
+      })
+    }).catch((error: unknown) => {
+      if (isDesignRecoveryRequired(error)) handleRecoveryRequired()
+      toast.error(error instanceof Error ? error.message : '重试设计任务失败')
+    })
+  }, [handleRecoveryRequired, projectId, updateState])
+  /** 成功素材只进入编辑草稿，用户提交前不创建任何任务。 */
+  const handleContinueFromVersion = React.useCallback((assetId: string): void => {
+    const document = store.get(designProjectStatesAtom).get(projectId)?.snapshot?.document
+    if (!document?.assets.some((asset) => asset.id === assetId)) return
+    updateState({ projectId, update: createContinueFromVersionUpdate(document, assetId) })
+  }, [projectId, store, updateState])
+  /** 复制精确工具提示词，失败时保留原文并给出明确反馈。 */
+  const handleCopyTaskPrompt = React.useCallback((prompt: string): void => {
+    void copyTextToClipboard(prompt).then(
+      () => toast.success('已复制生图提示词'),
+      (error: unknown) => toast.error(error instanceof Error ? error.message : '复制生图提示词失败'),
+    )
+  }, [])
   /** 从 Inspector 直达模型配置中的生图设置。 */
   const handleConfigureImageModels = React.useCallback((): void => {
     setSettingsTab('channels')
@@ -687,6 +803,11 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
       onImageModelChange={imageModelSelection.selectProfile}
       onConfigureImageModels={handleConfigureImageModels}
       onRetryImageModels={imageModelSelection.retryLoad}
+      onLoadTaskDetails={(jobId) => { void taskDetailsController.loadDetails(jobId) }}
+      onLoadTaskTrace={(jobId) => { void taskDetailsController.loadTrace(jobId) }}
+      onCopyTaskPrompt={handleCopyTaskPrompt}
+      onRetryJob={handleRetryJob}
+      onContinueFromVersion={handleContinueFromVersion}
     />
   )
 }

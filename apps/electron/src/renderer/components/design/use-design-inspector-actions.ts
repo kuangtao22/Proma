@@ -146,15 +146,40 @@ export function useDesignInspectorActions(
       toast.error(blockReason)
       return
     }
+    /** 成功素材删除会由主进程同步回收来源创作任务，Renderer 预先保留其聚合身份。 */
+    const sourceJobId = current.snapshot.document.assets.find((asset) => asset.id === assetId)?.sourceJobId
+    const sourceCreativeTaskId = sourceJobId
+      ? current.jobs.find((job) => job.id === sourceJobId)?.creativeTaskId
+      : undefined
     void adapter.deleteAsset({ projectId, assetId, expectedRevision: current.snapshot.document.revision })
-      .then((document) => updateState({ projectId, update: (latest) => ({
-        snapshot: latest.snapshot ? {
-          ...latest.snapshot,
-          document: applyDesignMutationsToDocument(document, latest.pendingMutations),
-        } : latest.snapshot,
-        selectedNodeIds: [],
-        inspectorAssetId: null,
-      }) }))
+      .then((document) => updateState({ projectId, update: (latest) => {
+        /** 同步清理已由主进程删除的 attempts 和 trace，避免短暂显示幽灵详情。 */
+        const taskDetailsByJobId = new Map(latest.taskDetailsByJobId)
+        if (sourceJobId) {
+          for (const [jobId, entry] of taskDetailsByJobId) {
+            if (jobId === sourceJobId
+              || (sourceCreativeTaskId && entry.details?.creativeTaskId === sourceCreativeTaskId)) {
+              taskDetailsByJobId.delete(jobId)
+            }
+          }
+        }
+        return {
+          snapshot: latest.snapshot ? {
+            ...latest.snapshot,
+            document: applyDesignMutationsToDocument(document, latest.pendingMutations),
+          } : latest.snapshot,
+          jobs: sourceJobId
+            ? latest.jobs.filter((job) => (
+                sourceCreativeTaskId
+                  ? job.creativeTaskId !== sourceCreativeTaskId
+                  : job.id !== sourceJobId
+              ))
+            : latest.jobs,
+          taskDetailsByJobId,
+          selectedNodeIds: [],
+          inspectorAssetId: null,
+        }
+      } }))
       .catch((error) => handleAssetActionError(error, '删除素材失败'))
   }, [adapter, getLatestState, handleAssetActionError, projectId, updateState])
 

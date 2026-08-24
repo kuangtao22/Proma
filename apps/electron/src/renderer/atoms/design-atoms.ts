@@ -1,5 +1,6 @@
 import type {
   DesignJobRecord,
+  DesignTaskDetails,
   ImageGenerationModelOption,
   DesignMutation,
   DesignPoint,
@@ -20,11 +21,28 @@ export interface DesignHistoryEntry {
   inverse: DesignMutation[]
 }
 
+/** 单个任务详情的轻量加载与延迟 trace 状态。 */
+export interface DesignTaskDetailsState {
+  phase: 'idle' | 'loading' | 'ready' | 'failed'
+  details?: DesignTaskDetails
+  /** trace 已完成一次读取，包括服务端明确返回不可用。 */
+  traceLoaded: boolean
+  /** trace 请求进行中，避免重复展开产生并发读取。 */
+  traceLoading: boolean
+  error?: string
+}
+
 /** 单个项目完整的设计工作区内存状态。 */
 export interface DesignProjectState {
   phase: 'idle' | 'loading' | 'ready' | 'error'
   snapshot: DesignWorkspaceSnapshot | null
   jobs: DesignJobRecord[]
+  /** 按执行尝试隔离的任务详情；大体积 trace 只在用户展开后进入。 */
+  taskDetailsByJobId: Map<string, DesignTaskDetailsState>
+  /** 等待用户确认删除的终态任务 ID。 */
+  deleteJobIntentId: string | null
+  /** 正在执行持久化删除的任务 ID，用于阻止重复命令。 */
+  deletingJobId: string | null
   /** 任务 journal 与任务结构的最近同步状态。 */
   jobLoadState: 'idle' | 'loading' | 'failed'
   /** 任务同步失败的独立用户提示，不与画布保存错误混用。 */
@@ -68,6 +86,9 @@ export function createInitialDesignProjectState(): DesignProjectState {
     phase: 'idle',
     snapshot: null,
     jobs: [],
+    taskDetailsByJobId: new Map(),
+    deleteJobIntentId: null,
+    deletingJobId: null,
     jobLoadState: 'idle',
     jobError: null,
     imageModelLoadState: 'idle',

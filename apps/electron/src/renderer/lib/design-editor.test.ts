@@ -427,4 +427,10 @@ describe('Design 编辑键盘路由', () => {
     expect(resolveDesignKeyboardAction({ key: 'z', metaKey: true }, true, false, false)).toBeNull()
     expect(resolveDesignKeyboardAction({ key: 'z', metaKey: true, shiftKey: true }, true, false, true, false)).toBeNull()
   })
+
+  test('Given 单个终态 job 节点允许专用删除 When 按 Delete Then 仅放行删除而不放行其它结构命令', () => {
+    expect(resolveDesignKeyboardAction({ key: 'Delete' }, true, false, true, true, true)).toBe('delete')
+    expect(resolveDesignKeyboardAction({ key: 'c', metaKey: true }, true, false, true, true, true)).toBeNull()
+    expect(resolveDesignKeyboardAction({ key: 'g', metaKey: true }, true, false, true, true, true)).toBeNull()
+  })
 })

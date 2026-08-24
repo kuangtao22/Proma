@@ -18,6 +18,8 @@ import {
   createDesignGenerationJobInput,
   DesignInspector,
   DesignInspectorStateView,
+  createContinueFromVersionUpdate,
+  getSelectedDesignTaskJobId,
   getDesignTargetSessions,
   serializeDesignGenerationPrompt,
   useDesignVersionRows,
@@ -104,6 +106,34 @@ function renderInspector(
 }
 
 describe('Design Inspector 状态', () => {
+  test('Given 选中任务节点或成功素材 When 解析详情来源 Then 都使用稳定 sourceJobId', () => {
+    const snapshot = createSnapshot()
+    snapshot.document.assets[0] = createAsset({ sourceJobId: 'job-from-asset' })
+    snapshot.document.nodes.push({
+      id: 'job-node',
+      kind: 'job',
+      jobId: 'job-from-node',
+      position: { x: 0, y: 0 },
+      width: 320,
+      height: 240,
+      zIndex: 2,
+    })
+
+    expect(getSelectedDesignTaskJobId(snapshot.document, ['job-node'], null)).toBe('job-from-node')
+    expect(getSelectedDesignTaskJobId(snapshot.document, ['node-1'], null)).toBe('job-from-asset')
+  })
+
+  test('Given 成功素材 When 基于此版本继续 Then 只切换编辑草稿且不创建任务', () => {
+    const snapshot = createSnapshot()
+
+    expect(createContinueFromVersionUpdate(snapshot.document, 'asset-1')).toEqual({
+      inspectorTab: 'ai',
+      editPrompt: '',
+      selectedNodeIds: ['node-1'],
+      inspectorAssetId: 'asset-1',
+    })
+  })
+
   test('Given 多项目与归档会话 When 构建素材发送菜单 Then 只保留当前项目未归档 Agent 会话并优先当前会话', () => {
     const sessions: AgentSessionMeta[] = [
       { id: 'same-1', title: '项目会话 1', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
@@ -724,6 +754,62 @@ describe('Design Inspector 纯业务契约', () => {
       { command: 'delete', expectedRevision: 0 },
       { command: 'relink', expectedRevision: 0 },
     ])
+  })
+
+  test('Given 成功素材来自创作任务 When 删除素材 Then 同步清理来源任务的尝试与详情缓存', async () => {
+    const store = createStore()
+    const snapshot = createSnapshot()
+    snapshot.document.nodes = []
+    snapshot.document.assets[0] = createAsset({ sourceJobId: 'job-1' })
+    const baseJob = {
+      creativeTaskId: 'creative-1',
+      projectId: 'project-1',
+      action: 'generate' as const,
+      status: 'succeeded' as const,
+      prompt: '生成首页',
+      originalRequest: '生成首页',
+      contextMode: 'none' as const,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    store.set(designProjectStatesAtom, new Map([['project-1', {
+      ...createInitialDesignProjectState(),
+      phase: 'ready',
+      snapshot,
+      jobs: [
+        { ...baseJob, id: 'job-1', attemptNumber: 1 },
+        { ...baseJob, id: 'job-2', attemptNumber: 2 },
+      ],
+      taskDetailsByJobId: new Map([['job-1', {
+        phase: 'ready',
+        traceLoaded: true,
+        traceLoading: false,
+        details: {
+          creativeTaskId: 'creative-1', currentJobId: 'job-1', attempts: [], traceState: 'ready',
+        },
+      }]]),
+    }]]))
+    const deletedDocument = createEmptyDesignDocument('project-1', 20)
+    deletedDocument.revision = 1
+    const adapter: Pick<DesignAdapter, 'importAssets' | 'deleteAsset' | 'relinkAsset' | 'exportAsset'> = {
+      importAssets: async () => snapshot,
+      deleteAsset: async () => deletedDocument,
+      relinkAsset: async () => deletedDocument,
+      exportAsset: async () => undefined,
+    }
+    let actions: ReturnType<typeof useDesignInspectorActions> | null = null
+    const Probe = (): null => {
+      actions = useDesignInspectorActions('project-1', adapter)
+      return null
+    }
+    renderToStaticMarkup(<Provider store={store}><Probe /></Provider>)
+
+    actions!.deleteAsset('asset-1')
+    await Promise.resolve()
+
+    const state = store.get(designProjectStatesAtom).get('project-1')!
+    expect(state.jobs).toEqual([])
+    expect(state.taskDetailsByJobId.size).toBe(0)
   })
 
   test('Given 只读项目 When 请求导出 Then 仍调用 adapter 且不调用写命令', async () => {

@@ -31,8 +31,20 @@ describe('Design 项目状态', () => {
   })
 
   test('Given 新项目 When 创建初始状态 Then 不携带冲突恢复任务', () => {
-    expect(createInitialDesignProjectState().conflictRecoveryPending).toBe(false)
-    expect(createInitialDesignProjectState().authoritativeRecoveryState).toBe('idle')
+    const state = createInitialDesignProjectState()
+
+    expect(state.conflictRecoveryPending).toBe(false)
+    expect(state.authoritativeRecoveryState).toBe('idle')
+    expect(state.taskDetailsByJobId).toEqual(new Map())
+    expect(state.deleteJobIntentId).toBeNull()
+    expect(state.deletingJobId).toBeNull()
+  })
+
+  test('Given 两个新项目 When 创建任务详情缓存 Then Map 不共享引用', () => {
+    const first = createInitialDesignProjectState()
+    const second = createInitialDesignProjectState()
+
+    expect(first.taskDetailsByJobId).not.toBe(second.taskDetailsByJobId)
   })
 
   test('Given 两个新项目 When 创建初始状态 Then 生图模型状态独立且不共享空数组', () => {

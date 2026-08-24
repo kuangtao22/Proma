@@ -227,10 +227,12 @@ describe('Design 工作区同步规则', () => {
 
     const job: DesignJobRecord = {
       id: 'job-1',
+      creativeTaskId: 'creative-1', attemptNumber: 1,
       projectId: 'project-1',
       action: 'generate',
       status: 'running',
       prompt: '生成海报',
+      originalRequest: '生成海报', contextMode: 'none',
       createdAt: 1,
       updatedAt: 2,
     }
@@ -242,8 +244,9 @@ describe('Design 工作区同步规则', () => {
 
   test('Given 任务列表加载失败 When 用户重试 Then 保留现有任务并恢复任务同步状态', async () => {
     const existingJob: DesignJobRecord = {
-      id: 'job-existing', projectId: 'project-1', action: 'generate', status: 'running',
-      prompt: '现有任务', createdAt: 1, updatedAt: 1,
+      id: 'job-existing', creativeTaskId: 'creative-existing', attemptNumber: 1,
+      projectId: 'project-1', action: 'generate', status: 'running',
+      prompt: '现有任务', originalRequest: '现有任务', contextMode: 'none', createdAt: 1, updatedAt: 1,
     }
     const harness = createControllerHarness({
       ...createInitialDesignProjectState(),
@@ -383,10 +386,12 @@ describe('Design 工作区同步规则', () => {
 
     const job: DesignJobRecord = {
       id: 'job-1',
+      creativeTaskId: 'creative-1', attemptNumber: 1,
       projectId: 'project-1',
       action: 'generate',
       status: 'failed',
       prompt: '生成海报',
+      originalRequest: '生成海报', contextMode: 'none',
       error: '模型失败',
       createdAt: 1,
       updatedAt: 3,
@@ -422,8 +427,9 @@ describe('Design 工作区同步规则', () => {
     expect(harness.loadRequests).toHaveLength(2)
     expect(harness.jobRequests).toHaveLength(2)
     const queuedJob: DesignJobRecord = {
-      id: 'job-1', projectId: 'project-1', action: 'generate', status: 'queued',
-      prompt: '生成海报', createdAt: 1, updatedAt: 1,
+      id: 'job-1', creativeTaskId: 'creative-1', attemptNumber: 1,
+      projectId: 'project-1', action: 'generate', status: 'queued',
+      prompt: '生成海报', originalRequest: '生成海报', contextMode: 'none', createdAt: 1, updatedAt: 1,
     }
     harness.loadRequests[1]!.resolve({
       document: {
@@ -473,8 +479,9 @@ describe('Design 工作区同步规则', () => {
       },
     })
     const retriedJob: DesignJobRecord = {
-      id: 'job-new', projectId: 'project-1', action: 'generate', status: 'queued',
-      prompt: '重新生成', createdAt: 2, updatedAt: 2,
+      id: 'job-new', creativeTaskId: 'creative-1', attemptNumber: 2,
+      projectId: 'project-1', action: 'generate', status: 'queued',
+      prompt: '重新生成', originalRequest: '生成海报', contextMode: 'none', createdAt: 2, updatedAt: 2,
     }
     harness.jobRequests[1]!.resolve([retriedJob])
     await flushPromises()
@@ -518,8 +525,10 @@ describe('Design 工作区同步规则', () => {
       },
     })
     const succeededJob: DesignJobRecord = {
-      id: 'job-1', projectId: 'project-1', action: 'generate', status: 'succeeded',
-      prompt: '生成海报', outputAssetId: 'asset-1', createdAt: 1, updatedAt: 3,
+      id: 'job-1', creativeTaskId: 'creative-1', attemptNumber: 1,
+      projectId: 'project-1', action: 'generate', status: 'succeeded',
+      prompt: '生成海报', originalRequest: '生成海报', contextMode: 'none',
+      outputAssetId: 'asset-1', createdAt: 1, updatedAt: 3,
     }
     harness.jobRequests[1]!.resolve([succeededJob])
     await flushPromises()
@@ -679,8 +688,9 @@ describe('Design 工作区同步规则', () => {
 
     /** recovery 后唯一一次任务对账返回的最新 journal。 */
     const refreshedJob: DesignJobRecord = {
-      id: 'job-refreshed', projectId: 'project-1', action: 'generate', status: 'succeeded',
-      prompt: '恢复后任务', createdAt: 1, updatedAt: 7,
+      id: 'job-refreshed', creativeTaskId: 'creative-refreshed', attemptNumber: 1,
+      projectId: 'project-1', action: 'generate', status: 'succeeded',
+      prompt: '恢复后任务', originalRequest: '恢复后任务', contextMode: 'none', createdAt: 1, updatedAt: 7,
     }
     /** 最高 job revision 7 对应的权威任务结构。 */
     const jobSnapshot: DesignWorkspaceSnapshot = {

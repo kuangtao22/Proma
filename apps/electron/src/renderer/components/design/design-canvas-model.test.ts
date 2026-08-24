@@ -116,12 +116,16 @@ describe('Design 画布节点映射', () => {
     /** 与节点 jobId 对应的主进程 journal 记录。 */
     const jobs: DesignJobRecord[] = [
       {
-        id: 'job-failed', projectId: 'project-1', action: 'generate', status: 'failed',
-        prompt: '生成海报', error: '模型失败', createdAt: 1, updatedAt: 2,
+        id: 'job-failed', creativeTaskId: 'creative-failed', attemptNumber: 1,
+        projectId: 'project-1', action: 'generate', status: 'failed',
+        prompt: '生成海报', originalRequest: '生成海报', contextMode: 'none',
+        error: '模型失败', createdAt: 1, updatedAt: 2,
       },
       {
-        id: 'job-interrupted', projectId: 'project-1', action: 'edit', status: 'interrupted',
-        prompt: '移除文字', error: '应用退出，任务已中断', createdAt: 3, updatedAt: 4,
+        id: 'job-interrupted', creativeTaskId: 'creative-interrupted', attemptNumber: 1,
+        projectId: 'project-1', action: 'edit', status: 'interrupted',
+        prompt: '移除文字', originalRequest: '移除文字', contextMode: 'none',
+        error: '应用退出，任务已中断', createdAt: 3, updatedAt: 4,
       },
     ]
 
@@ -157,10 +161,14 @@ describe('Design 画布节点映射', () => {
     /** 带固化模型快照的新格式任务记录。 */
     const jobs: DesignJobRecord[] = [{
       id: 'job-1',
+      creativeTaskId: 'creative-1',
+      attemptNumber: 1,
       projectId: 'project-1',
       action: 'generate',
       status: 'running',
       prompt: '生成海报',
+      originalRequest: '生成海报',
+      contextMode: 'none',
       imageModelSnapshot: {
         profileId: 'profile-b',
         name: '高质量模型',
@@ -188,10 +196,14 @@ describe('Design 画布节点映射', () => {
     /** 旧 journal 合法缺少 imageModelSnapshot。 */
     const jobs: DesignJobRecord[] = [{
       id: 'legacy-job',
+      creativeTaskId: 'legacy-job',
+      attemptNumber: 1,
       projectId: 'project-1',
       action: 'generate',
       status: 'interrupted',
       prompt: '旧任务',
+      originalRequest: '旧任务',
+      contextMode: 'none',
       createdAt: 1,
       updatedAt: 2,
     }]

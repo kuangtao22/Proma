@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { createEmptyDesignDocument } from '@proma/shared'
 import type { NodeProps } from '@xyflow/react'
 import { createStore, Provider } from 'jotai'
@@ -90,7 +92,7 @@ describe('Design 素材节点', () => {
     expect(running).toMatch(/type="button"(?![^>]*disabled)[^>]*>[\s\S]*取消生成/)
   })
 
-  test('Given 失败、取消或中断任务 When 渲染 Then 这些终态提供重试入口', () => {
+  test('Given 失败、取消或中断任务 When 渲染 Then 这些终态提供重试和删除入口', () => {
     const failed = renderStatus({
       kind: 'job',
       status: 'failed',
@@ -112,11 +114,24 @@ describe('Design 素材节点', () => {
     expect(failed).toContain('生成失败')
     expect(failed).toContain('模型返回失败')
     expect(failed).toContain('重试生成')
+    expect(failed).toContain('aria-label="删除任务"')
     expect(cancelled).toContain('已取消')
     expect(cancelled).toContain('重试生成')
+    expect(cancelled).toContain('aria-label="删除任务"')
     expect(interrupted).toContain('已中断')
     expect(interrupted).toContain('重试生成')
+    expect(interrupted).toContain('aria-label="删除任务"')
     expect(interrupted).toMatch(/type="button"(?![^>]*disabled)[^>]*>[\s\S]*重试生成/)
+  })
+
+  test('Given 终态任务 When 请求删除 Then 节点只写确认意图且工作区提供确认对话框', () => {
+    const nodeSource = readFileSync(join(import.meta.dir, 'DesignAssetNode.tsx'), 'utf8')
+    const workspaceSource = readFileSync(join(import.meta.dir, 'DesignWorkspaceView.tsx'), 'utf8')
+
+    expect(nodeSource).toContain('deleteJobIntentId: data.jobId')
+    expect(nodeSource).not.toContain('designAdapter.deleteJob({ projectId, jobId })')
+    expect(workspaceSource).toContain('确认删除任务')
+    expect(workspaceSource).toContain('将删除任务节点、提示词、尝试历史和执行记录')
   })
 
   test('Given 任务使用超长模型标签 When 渲染 Then footer 可访问地截断文本且节点尺寸稳定', () => {
@@ -184,6 +199,7 @@ describe('Design 素材节点', () => {
     })
 
     expect(readOnlyRetry).toMatch(/type="button"[^>]*disabled=""[^>]*>[\s\S]*重试生成/)
+    expect(readOnlyRetry).toMatch(/aria-label="删除任务"[^>]*disabled=""/)
     expect(loadingCancel).toMatch(/type="button"[^>]*disabled=""[^>]*>[\s\S]*取消生成/)
     expect(failedRetry).toMatch(/type="button"[^>]*disabled=""[^>]*>[\s\S]*重试生成/)
   })

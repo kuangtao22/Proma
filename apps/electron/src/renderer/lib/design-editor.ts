@@ -433,6 +433,7 @@ export function reduceDesignEdit(
  * @param canEditSelection 当前选区是否允许结构编辑。
  * @param canUndo 最近历史项是否允许安全撤销。
  * @param canRedo 最近 future 项是否允许安全重做。
+ * @param canDeleteSelection 当前选区是否允许普通删除或终态任务专用删除。
  * @returns 可执行编辑动作；不应拦截时返回 null。
  */
 export function resolveDesignKeyboardAction(
@@ -441,6 +442,7 @@ export function resolveDesignKeyboardAction(
   canEditSelection = hasSelection,
   canUndo = true,
   canRedo = true,
+  canDeleteSelection = canEditSelection,
 ): DesignKeyboardAction | null {
   /** 输入类目标不接管复制、删除或分组键。 */
   const target = typeof event.target === 'object' && event.target !== null
@@ -459,9 +461,10 @@ export function resolveDesignKeyboardAction(
     if (event.shiftKey) return canRedo ? 'redo' : null
     return canUndo ? 'undo' : null
   }
-  if (!hasSelection || !canEditSelection) return null
+  if (!hasSelection) return null
+  if (key === 'backspace' || key === 'delete') return canDeleteSelection ? 'delete' : null
+  if (!canEditSelection) return null
   if (commandKey && key === 'c') return 'duplicate'
-  if (key === 'backspace' || key === 'delete') return 'delete'
   if (commandKey && key === 'g') return event.shiftKey ? 'ungroup' : 'group'
   return null
 }

@@ -1,6 +1,8 @@
 import * as React from 'react'
+import type { DesignCanvasDocument } from '@proma/shared'
 import { RefreshCw, Sparkles, Upload } from 'lucide-react'
 import { useAtomValue, useSetAtom } from 'jotai'
+import { toast } from 'sonner'
 import {
   consumeDesignRecoveryRequestAtom,
   createInitialDesignProjectState,
@@ -13,6 +15,16 @@ import {
 import type { DesignProjectState } from '@/atoms/design-atoms'
 import { currentAgentWorkspaceIdAtom } from '@/atoms/agent-atoms'
 import { Button } from '@/components/ui/button'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { designAdapter } from '@/lib/design-adapter'
 import {
   areDesignMutationsJobSafe,
@@ -22,6 +34,7 @@ import { DesignCanvas } from './DesignCanvas'
 import { DesignToolbar } from './DesignToolbar'
 import { useDesignInspectorActions } from './use-design-inspector-actions'
 import {
+  isDesignRecoveryRequired,
   isDesignStructuralConflictBlocked,
   useDesignWorkspace,
 } from './use-design-workspace'
@@ -39,6 +52,92 @@ export interface DesignWorkspaceStateViewProps {
   onImportAssets?: () => void
   /** 打开空画布生成表单。 */
   onCreateJob?: () => void
+  /** 关闭终态任务删除确认。 */
+  onDismissDeleteJob?: () => void
+  /** 确认删除终态任务及其完整创作记录。 */
+  onConfirmDeleteJob?: (jobId: string) => void
+}
+
+/** 任务删除确认只渲染一份，节点按钮和键盘删除共享同一意图。 */
+function DesignJobDeleteDialog({
+  jobId,
+  deleting,
+  onDismiss,
+  onConfirm,
+}: {
+  jobId: string | null
+  deleting: boolean
+  onDismiss?: () => void
+  onConfirm?: (jobId: string) => void
+}): React.ReactElement {
+  return (
+    <AlertDialog
+      open={jobId !== null}
+      onOpenChange={(open) => {
+        if (!open && !deleting) onDismiss?.()
+      }}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>确认删除任务</AlertDialogTitle>
+          <AlertDialogDescription>
+            将删除任务节点、提示词、尝试历史和执行记录。此操作无法恢复。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+          <AlertDialogAction
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            disabled={deleting || !jobId || !onConfirm}
+            onClick={() => {
+              if (jobId) onConfirm?.(jobId)
+            }}
+          >
+            {deleting ? '删除中' : '确认删除任务'}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+
+/**
+ * 使用主进程删除后的权威文档收敛同一创作任务的全部 Renderer 状态。
+ * @param current 删除响应到达时的最新项目状态。
+ * @param jobId 用户确认删除的任一执行尝试 ID。
+ * @param document 主进程已提交删除后的权威画布文档。
+ * @param creativeTaskIdHint 调用前读取的创作任务 ID，用于抵御并发列表刷新。
+ */
+export function createDeletedDesignTaskStateUpdate(
+  current: DesignProjectState,
+  jobId: string,
+  document: DesignCanvasDocument,
+  creativeTaskIdHint?: string,
+): Partial<DesignProjectState> {
+  const creativeTaskId = creativeTaskIdHint
+    ?? current.jobs.find((job) => job.id === jobId)?.creativeTaskId
+  const removedJobIds = new Set(current.jobs
+    .filter((job) => creativeTaskId ? job.creativeTaskId === creativeTaskId : job.id === jobId)
+    .map((job) => job.id))
+  removedJobIds.add(jobId)
+  const taskDetailsByJobId = new Map(current.taskDetailsByJobId)
+  for (const [candidateJobId, entry] of taskDetailsByJobId) {
+    if (removedJobIds.has(candidateJobId)
+      || (creativeTaskId && entry.details?.creativeTaskId === creativeTaskId)) {
+      taskDetailsByJobId.delete(candidateJobId)
+    }
+  }
+  const existingNodeIds = new Set(document.nodes.map((node) => node.id))
+  return {
+    snapshot: current.snapshot ? { ...current.snapshot, document } : current.snapshot,
+    jobs: current.jobs.filter((job) => (
+      creativeTaskId ? job.creativeTaskId !== creativeTaskId : job.id !== jobId
+    )),
+    taskDetailsByJobId,
+    selectedNodeIds: current.selectedNodeIds.filter((nodeId) => existingNodeIds.has(nodeId)),
+    deleteJobIntentId: null,
+    deletingJobId: null,
+  }
 }
 
 /** 纯页面状态组件，保持加载、错误、只读和未保存反馈稳定。 */
@@ -49,6 +148,8 @@ export function DesignWorkspaceStateView({
   onAcceptRemoteVersion,
   onImportAssets,
   onCreateJob,
+  onDismissDeleteJob,
+  onConfirmDeleteJob,
 }: DesignWorkspaceStateViewProps): React.ReactElement {
   const updateProjectState = useSetAtom(updateDesignProjectStateAtom)
   const executeEdit = useSetAtom(executeDesignEditAtom)
@@ -235,6 +336,12 @@ export function DesignWorkspaceStateView({
           </div>
         )}
       </div>
+      <DesignJobDeleteDialog
+        jobId={state.deleteJobIntentId}
+        deleting={state.deletingJobId === state.deleteJobIntentId && state.deletingJobId !== null}
+        onDismiss={onDismissDeleteJob}
+        onConfirm={onConfirmDeleteJob}
+      />
     </div>
   )
 }
@@ -255,6 +362,30 @@ export function DesignWorkspaceView(): React.ReactElement {
   const assetActions = useDesignInspectorActions(projectId, designAdapter, {
     onRecoveryRequired: reloadAuthoritativeSnapshot,
   })
+
+  /** 删除确认后由工作区唯一入口接管权威文档、任务列表与详情缓存。 */
+  const handleConfirmDeleteJob = React.useCallback((jobId: string): void => {
+    if (!projectId) return
+    /** 删除前任务身份用于一次移除同一 creativeTask 的全部尝试。 */
+    const current = state ?? createInitialDesignProjectState()
+    const creativeTaskId = current.jobs.find((job) => job.id === jobId)?.creativeTaskId
+    updateProjectState({ projectId, update: { deletingJobId: jobId } })
+    void designAdapter.deleteJob({ projectId, jobId }).then((document) => {
+      updateProjectState({
+        projectId,
+        update: (latest) => createDeletedDesignTaskStateUpdate(
+          latest,
+          jobId,
+          document,
+          creativeTaskId,
+        ),
+      })
+    }).catch((error: unknown) => {
+      updateProjectState({ projectId, update: { deletingJobId: null } })
+      if (isDesignRecoveryRequired(error)) reloadAuthoritativeSnapshot()
+      toast.error(error instanceof Error ? error.message : '删除设计任务失败')
+    })
+  }, [projectId, reloadAuthoritativeSnapshot, state, updateProjectState])
 
   React.useEffect(() => {
     if (!projectId || !recoveryRequests.has(projectId)) return
@@ -278,6 +409,8 @@ export function DesignWorkspaceView(): React.ReactElement {
       onAcceptRemoteVersion={acceptRemoteVersion}
       onImportAssets={assetActions.importAssets}
       onCreateJob={() => updateProjectState({ projectId, update: { inspectorTab: 'ai' } })}
+      onDismissDeleteJob={() => updateProjectState({ projectId, update: { deleteJobIntentId: null } })}
+      onConfirmDeleteJob={handleConfirmDeleteJob}
     />
   )
 }
