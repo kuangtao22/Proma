@@ -61,6 +61,7 @@
 - Design `LOAD` 的媒体授权采用候选 lease 事务替换：先取得权威 snapshot 和新 token，成功后切换 sender/project 所有权再撤销旧 token；Store 或候选授权失败必须保留旧 URL，窗口销毁、显式 RELEASE 与注册 dispose 继续按当前所有权幂等清理。
 - Design Job 启动恢复与退出中断按项目隔离，单项目路径、Store 或 journal 故障必须记录中文日志并继续其它项目；应用 `before-quit` 的 Design、Agent、浏览器、watcher 等清理步骤逐项隔离，任何单点失败不得跳过后续全局资源释放。
 - Design 生图模型按项目保存在本机 `design-cache` 偏好中；新任务在主进程固化 profile 快照，并通过单次 Pi 运行扩展强制 Nano Banana 使用该模型。重试复制原快照，配置删除、停用、执行器或模型 ID 变化、凭据失效时明确阻断，普通 Chat/Agent 的全局 Nano Banana 模型不受影响。
+- Design 生图模型的用户入口统一放在“模型配置”，但能力声明、执行协议与任务路由继续由 fork 自有 `image-generation-models.json` 和 executor 管理；GPT Image 2 profile 只引用现有渠道的 `channelId`/`modelId`，执行时通过 `channel-manager` 读取 Base URL 并解密 API Key，禁止扩展官方高频变化的 `ChannelModel` 或复制凭据。Nano Banana 暂留 legacy 工具凭据兼容。
 
 ## 会话记录
 
@@ -120,3 +121,4 @@
 - 2026-08-23：质量复核确认 recovery 不再被 job 结构刷新取消；真实 Chrome 下 1000 节点首帧仅挂载 16 个可见节点，并完成宽窄窗口交互、无障碍与明暗主题验证。
 - 2026-08-23：用户确认 Design Job 采用可信双模型链路：设计页按项目选择系统生图模型，现有 Agent LLM 先理解任务，再由主进程运行级上下文强制图片工具使用任务固化的模型；模型不能仅靠提示词传递，重试保留原模型，普通 Chat/Agent 不受项目选择影响。
 - 2026-08-23：完成 Design 项目级生图模型选择与可信双阶段调用：设置页支持多 profile，Inspector 展示项目选择，任务节点展示固化的名称与真实模型 ID；两批共 261 个相关回归测试、全仓类型检查和 Electron 完整构建通过。真实 Electron 窗口完成宽窄布局、明暗主题、禁用/错误状态、设置定位、长名称与模型 ID、焦点可见性验收；本机 Nano Banana API Key 未配置，因此未执行会产生外部计费的真实出图链路，自动化测试已覆盖 Agent LLM 后的可信模型路由、取消、重试与单次图片调用上限。
+- 2026-08-24：用户确认 GPT Image 2 采用低冲突统一模型配置方案：渠道继续管理连接、加密凭据和模型列表，生图目录只声明 `openai-images` 路由；设置入口从 Chat 工具迁到模型配置，Design 仍按项目固化可信快照并保持 Agent LLM -> 生图执行器的两阶段调用。
