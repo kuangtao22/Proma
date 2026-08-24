@@ -9,7 +9,7 @@ import {
   createAgentSession,
   getAgentSessionMeta,
   getAgentSessionMessages,
-  listAgentSessions,
+  listVisibleAgentSessions,
   searchAgentSessionMessages,
   updateAgentSessionMeta,
 } from '../agent-session-manager'
@@ -35,7 +35,7 @@ const defaultDependencies: LanBridgePromaDependencies = {
   listConversations: () => listConversations(),
   getConversationMessages: (conversationId) => getConversationMessages(conversationId),
   searchConversationMessages: (query) => searchConversationMessages(query),
-  listAgentSessions: () => listAgentSessions(),
+  listAgentSessions: () => listVisibleAgentSessions(),
   getAgentSessionMessages: (sessionId) => getAgentSessionMessages(sessionId),
   searchAgentSessionMessages: (query) => searchAgentSessionMessages(query),
   listAgentWorkspaces: () => listAgentWorkspaces(),

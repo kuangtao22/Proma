@@ -287,6 +287,7 @@ import {
 import { runPlanningNativeSync } from './lib/planning-native-sync-coordinator'
 import {
   listAgentSessions,
+  listVisibleAgentSessions,
   listActiveAgentSessions,
   listArchivedAgentSessions,
   countArchivedAgentSessions,
@@ -306,6 +307,7 @@ import {
   searchAgentSessionMessages,
   searchAgentSessionReferences,
 } from './lib/agent-session-manager'
+import { requireUserVisibleAgentSession } from './lib/agent-session-visibility'
 import { agentEventBus, runAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, reserveAgentSessionStart, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import {
@@ -2273,10 +2275,15 @@ export function registerIpcHandlers(): void {
 
   // ===== Agent 会话管理相关 =====
 
+  /** 普通 Renderer IPC 只能访问用户可见的 Agent 会话。 */
+  const requireVisibleSession = (sessionId: string): AgentSessionMeta => (
+    requireUserVisibleAgentSession(getAgentSessionMeta(sessionId))
+  )
+
   // 获取 Agent 会话列表
   ipcMain.handle(
     AGENT_IPC_CHANNELS.LIST_SESSIONS,
-    async (): Promise<AgentSessionMeta[]> => listAgentSessions()
+    async (): Promise<AgentSessionMeta[]> => listVisibleAgentSessions()
   )
 
   // 获取未归档会话列表（侧栏 active 视图）
@@ -2319,8 +2326,7 @@ export function registerIpcHandlers(): void {
   }
   const assertBrowserSessionAccess = async (senderId: number, sessionId: string): Promise<void> => {
     await assertMainRenderer(senderId)
-    const session = getAgentSessionMeta(sessionId)
-    if (!session) throw new Error('Agent 会话不存在。')
+    const session = requireVisibleSession(sessionId)
     // 自动任务与协作子会话同样可以使用受管浏览器；仅校验会话仍存在。
     browserController.configureSession(sessionId, {
       profileKey: resolveBrowserProfileKey(session.workspaceId, sessionId),
@@ -2404,6 +2410,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.GET_SDK_MESSAGES,
     async (_, id: string): Promise<SDKMessage[]> => {
+      requireVisibleSession(id)
       return getAgentSessionSDKMessages(id)
     }
   )
@@ -2412,6 +2419,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.UPDATE_TITLE,
     async (_, id: string, title: string): Promise<AgentSessionMeta> => {
+      requireVisibleSession(id)
       return updateAgentSessionMeta(id, { title })
     }
   )
@@ -2420,6 +2428,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.UPDATE_SESSION_MODEL,
     async (_, id: string, channelId?: string, modelId?: string): Promise<AgentSessionMeta> => {
+      requireVisibleSession(id)
       // 模型切换允许在运行中提交；当前 query 继续使用启动时的模型，下一轮读取新配置。
       return updateAgentSessionMeta(id, { channelId, modelId })
     }
@@ -2432,8 +2441,7 @@ export function registerIpcHandlers(): void {
       if (!input || typeof input.sessionId !== 'string' || (input.worktreePath !== null && typeof input.worktreePath !== 'string')) {
         throw new Error('活动 worktree 参数无效')
       }
-      const session = getAgentSessionMeta(input.sessionId)
-      if (!session) throw new Error(`Agent 会话不存在: ${input.sessionId}`)
+      const session = requireVisibleSession(input.sessionId)
       if (input.worktreePath === null) {
         return updateAgentSessionMeta(input.sessionId, { activeWorktree: undefined })
       }
@@ -2474,7 +2482,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DELETE_SESSION,
     async (_, id: string): Promise<void> => {
-      const attachedFiles = getAgentSessionMeta(id)?.attachedFiles
+      const attachedFiles = requireVisibleSession(id).attachedFiles
       // 清理权限服务中该会话的白名单
       permissionService.clearSessionWhitelist(id)
       permissionService.clearSessionPending(id)
@@ -2493,6 +2501,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.MIGRATE_CHAT_TO_AGENT,
     async (_, conversationId: string, agentSessionId: string): Promise<void> => {
+      requireVisibleSession(agentSessionId)
       migrateChatToAgentSession(conversationId, agentSessionId)
     }
   )
@@ -2501,9 +2510,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.TOGGLE_PIN,
     async (_, id: string): Promise<AgentSessionMeta> => {
-      const sessions = listAgentSessions()
-      const current = sessions.find((s) => s.id === id)
-      if (!current) throw new Error(`Agent session not found: ${id}`)
+      const current = requireVisibleSession(id)
       const newPinned = !current.pinned
       // 置顶时自动取消归档
       const updates: Partial<AgentSessionMeta> = { pinned: newPinned }
@@ -2518,9 +2525,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.TOGGLE_STAR,
     async (_, id: string): Promise<AgentSessionMeta> => {
-      const sessions = listAgentSessions()
-      const current = sessions.find((s) => s.id === id)
-      if (!current) throw new Error(`Agent session not found: ${id}`)
+      const current = requireVisibleSession(id)
       return updateAgentSessionMeta(id, { starred: !current.starred })
     }
   )
@@ -2529,9 +2534,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.CLEAR_COMPLETION_STATE,
     async (_, id: string): Promise<AgentSessionMeta> => {
-      const sessions = listAgentSessions()
-      const current = sessions.find((s) => s.id === id)
-      if (!current) throw new Error(`Agent session not found: ${id}`)
+      const current = requireVisibleSession(id)
       const updates: Partial<AgentSessionMeta> = {}
       if (current.manualWorking) updates.manualWorking = false
       if (current.completedButUnconfirmed) updates.completedButUnconfirmed = false
@@ -2544,9 +2547,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.TOGGLE_ARCHIVE,
     async (_, id: string): Promise<AgentSessionMeta> => {
-      const sessions = listAgentSessions()
-      const current = sessions.find((s) => s.id === id)
-      if (!current) throw new Error(`Agent session not found: ${id}`)
+      const current = requireVisibleSession(id)
       const newArchived = !current.archived
       // 归档时自动取消置顶
       const updates: Partial<AgentSessionMeta> = { archived: newArchived }
@@ -2577,6 +2578,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.MOVE_SESSION_TO_WORKSPACE,
     async (_, input: MoveSessionToWorkspaceInput): Promise<AgentSessionMeta> => {
+      requireVisibleSession(input.sessionId)
       if (isAgentSessionBusy(input.sessionId)) {
         throw new Error('会话正在启动、运行或仍有排队消息，请停止或清空队列后再迁移')
       }
@@ -2590,6 +2592,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.FORK_SESSION,
     async (_, input: ForkSessionInput): Promise<AgentSessionMeta> => {
+      requireVisibleSession(input.sessionId)
       const session = await forkAgentSession(input)
       // Fork 直接在 session manager 内创建元数据，绕过 CREATE_SESSION 的镜像生命周期。
       // 将它作为新的桌面会话处理，确保 Pi fork 也会立即获得可双向续聊的飞书群。
@@ -2604,6 +2607,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.REWIND_SESSION,
     async (_, input: RewindSessionInput): Promise<RewindSessionResult> => {
+      requireVisibleSession(input.sessionId)
       return rewindAgentSession(
         input.sessionId,
         input.assistantMessageUuid,
@@ -3069,14 +3073,12 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.SEND_MESSAGE,
     async (event, input: AgentSendInput): Promise<void> => {
+      const session = requireVisibleSession(input.sessionId)
       const releaseStart = reserveAgentSessionStart(input.sessionId)
       try {
-        const session = getAgentSessionMeta(input.sessionId)
-        if (session) {
-          await feishuBridgeManager.startSessionMirrorRun(session).catch((error) => {
-            console.error('[飞书 Session 镜像] 流式卡片初始化失败:', error)
-          })
-        }
+        await feishuBridgeManager.startSessionMirrorRun(session).catch((error) => {
+          console.error('[飞书 Session 镜像] 流式卡片初始化失败:', error)
+        })
         await runAgent(input, event.sender)
       } finally {
         releaseStart()
@@ -3091,6 +3093,7 @@ export function registerIpcHandlers(): void {
       if (sessionId !== null && (typeof sessionId !== 'string' || sessionId.length === 0)) {
         throw new Error('可见 Agent 会话 ID 非法')
       }
+      if (sessionId !== null) requireVisibleSession(sessionId)
       setVisibleAgentSession(event.sender, sessionId)
     },
   )
@@ -3099,6 +3102,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.STOP_AGENT,
     async (_, sessionId: string): Promise<void> => {
+      requireVisibleSession(sessionId)
       feishuBridgeManager.stopSessionMirrorRun(sessionId)
       stopAgent(sessionId)
     }
@@ -3110,6 +3114,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.QUEUE_MESSAGE,
     async (event, input: import('@proma/shared').AgentQueueMessageInput): Promise<string> => {
+      requireVisibleSession(input.sessionId)
       return queueAgentMessage(input, event.sender)
     }
   )
@@ -3118,6 +3123,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.SUBMIT_OR_ENQUEUE_MESSAGE,
     async (event, input: import('@proma/shared').AgentSubmitOrEnqueueInput): Promise<import('@proma/shared').AgentSubmitOrEnqueueResult> => {
+      requireVisibleSession(input.sessionId)
       return submitOrEnqueueAgentMessage(input, event.sender)
     },
   )
@@ -3126,6 +3132,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ENQUEUE_QUEUED_MESSAGE,
     async (event, input: import('@proma/shared').AgentDeferredQueueMessageInput): Promise<void> => {
+      requireVisibleSession(input.sessionId)
       enqueueAgentQueuedMessage(input, event.sender)
     },
   )
@@ -3133,6 +3140,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.CANCEL_QUEUED_MESSAGE,
     async (_, input: import('@proma/shared').AgentQueuedMessageControlInput): Promise<boolean> => {
+      requireVisibleSession(input.sessionId)
       return cancelAgentQueuedMessage(input)
     },
   )
@@ -3140,6 +3148,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.MOVE_QUEUED_MESSAGE,
     async (_, input: import('@proma/shared').AgentMoveQueuedMessageInput): Promise<boolean> => {
+      requireVisibleSession(input.sessionId)
       return moveAgentQueuedMessage(input)
     },
   )
@@ -3171,9 +3180,7 @@ export function registerIpcHandlers(): void {
         throw new Error(`无效的权限模式: ${mode}`)
       }
       // 会话不存在时直接抛错（避免 updateAgentSessionMeta 的通用异常被降级为 warn）
-      if (!getAgentSessionMeta(sessionId)) {
-        throw new Error(`Agent 会话不存在: ${sessionId}`)
-      }
+      requireVisibleSession(sessionId)
       // 持久化到 session meta（重启后可恢复，即使 session 未运行也要写）。
       // 这里的 catch 仅用于兜底磁盘 I/O 类异常，不影响后续热切换。
       try {
@@ -3198,9 +3205,7 @@ export function registerIpcHandlers(): void {
       if (typeof enabled !== 'boolean') {
         throw new Error(`无效的 Codex Fast Mode 状态: ${String(enabled)}`)
       }
-      if (!getAgentSessionMeta(sessionId)) {
-        throw new Error(`Agent 会话不存在: ${sessionId}`)
-      }
+      requireVisibleSession(sessionId)
       if (isAgentSessionActive(sessionId)) {
         throw new Error('Agent 正在运行，完成后再切换快速模式')
       }
@@ -3225,9 +3230,7 @@ export function registerIpcHandlers(): void {
       if (!validThinkingLevels.includes(thinkingLevel)) {
         throw new Error(`无效的 Codex 思考深度: ${String(thinkingLevel)}`)
       }
-      if (!getAgentSessionMeta(sessionId)) {
-        throw new Error(`Agent 会话不存在: ${sessionId}`)
-      }
+      requireVisibleSession(sessionId)
       // 当前运行已在启动时读取推理深度；此处只更新会话的下一轮配置。
       return updateAgentSessionMeta(sessionId, { reasoningLevel: thinkingLevel })
     }

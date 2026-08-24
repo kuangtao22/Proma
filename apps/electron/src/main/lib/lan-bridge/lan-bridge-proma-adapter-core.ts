@@ -6,6 +6,7 @@ import type {
   LanBridgeAgentSessionRuntimeStatus,
   LanBridgeConversationDto,
 } from '@proma/shared'
+import { isAgentSessionUserVisible } from '../agent-session-visibility'
 
 /** LAN Bridge 对外暴露的稳定工作区摘要。 */
 export interface LanBridgeWorkspaceDto {
@@ -112,6 +113,8 @@ interface UpstreamAgentSession extends UpstreamConversation {
   workspaceId?: string
   manualWorking?: boolean
   starred?: boolean
+  sourceDesignProjectId?: string
+  sourceDesignJobId?: string
 }
 
 /** 官方工作区对象的最小可读形状。 */
@@ -246,7 +249,9 @@ function assertExistingAgentSession(dependencies: LanBridgePromaDependencies, se
   if (!isValidLanBridgeSessionId(sessionId)) {
     throw Object.assign(new Error('无效的会话 ID'), { errorCode: 'VALIDATION_ERROR' })
   }
-  if (!dependencies.listAgentSessions().some(session => session.id === sessionId)) {
+  if (!dependencies.listAgentSessions().some(session => (
+    session.id === sessionId && isAgentSessionUserVisible(session)
+  ))) {
     throw Object.assign(new Error('会话不存在'), { errorCode: 'NOT_FOUND' })
   }
 }
@@ -315,11 +320,16 @@ export function createLanBridgePromaAdapter(
         matchedAt,
       }))
     },
-    listAgentSessions: () => dependencies.listAgentSessions().map((session) => (
-      mapAgentSession(session, dependencies.getAgentSessionRuntimeStatus(session.id))
-    )),
+    listAgentSessions: () => dependencies.listAgentSessions()
+      .filter(isAgentSessionUserVisible)
+      .map((session) => mapAgentSession(
+        session,
+        dependencies.getAgentSessionRuntimeStatus(session.id),
+      )),
     hasAgentSession: (sessionId) => isValidLanBridgeSessionId(sessionId)
-      && dependencies.listAgentSessions().some(session => session.id === sessionId),
+      && dependencies.listAgentSessions().some(session => (
+        session.id === sessionId && isAgentSessionUserVisible(session)
+      )),
     getAgentMessages: (sessionId) => {
       assertExistingAgentSession(dependencies, sessionId)
       return dependencies.getAgentSessionMessages(sessionId)

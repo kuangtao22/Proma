@@ -52,6 +52,15 @@ function createDependencies(): LanBridgePromaDependencies {
         updatedAt: 6,
         providerOptions: { reasoning: 'high' },
       },
+      {
+        id: 'design-agent',
+        title: '内部设计任务',
+        workspaceId: 'workspace-1',
+        sourceDesignProjectId: 'workspace-1',
+        sourceDesignJobId: 'job-1',
+        createdAt: 7,
+        updatedAt: 8,
+      },
     ],
     getAgentSessionMessages: () => [],
     searchAgentSessionMessages: async () => [{
@@ -145,6 +154,7 @@ describe('LAN Bridge Proma Adapter', () => {
 
     expect(() => adapter.getAgentMessages('../agent-1')).toThrow('无效的会话 ID')
     expect(() => adapter.getAgentMessages('missing-agent')).toThrow('会话不存在')
+    expect(() => adapter.getAgentMessages('design-agent')).toThrow('会话不存在')
     expect(readCount).toBe(0)
   })
 

@@ -1,4 +1,5 @@
 import type { AgentSessionMeta, AgentWorkspace } from '@proma/shared'
+import { isAgentSessionUserVisible } from './agent-session-visibility'
 
 export const TRAY_RECENT_LIMIT = 3
 export const TRAY_MORE_LIMIT = 10
@@ -39,6 +40,7 @@ export function createTrayMenuModel(
 ): TrayMenuModel {
   const workspacesById = new Map(workspaces.map((workspace) => [workspace.id, workspace]))
   const visibleSessions = sessions
+    .filter(isAgentSessionUserVisible)
     .filter((session) => !session.archived || runningSessionIds.has(session.id))
     .slice()
     .sort((a, b) => b.updatedAt - a.updatedAt)

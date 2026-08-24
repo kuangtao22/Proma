@@ -23,6 +23,7 @@ import { writeJsonFileAtomic } from './safe-file'
 import { isBindingForDeletedWorkspace } from './bridge-binding-store'
 import { getSettings } from './settings-service'
 import { resolveSessionMirrorBot, normalizeSessionMirrorUserOpenId } from './feishu/session-mirror'
+import { isAgentSessionUserVisible } from './agent-session-visibility'
 
 class FeishuBridgeManager {
   /** botId → Bridge 实例 */
@@ -151,6 +152,7 @@ class FeishuBridgeManager {
 
   /** 为桌面端 Proma Session 创建或恢复飞书镜像群。 */
   async ensureSessionMirror(session: AgentSessionMeta): Promise<void> {
+    if (!isAgentSessionUserVisible(session)) return
     const config = getFeishuMultiBotConfig()
     const bot = resolveSessionMirrorBot(getSettings().feishuSessionMirror, config.bots)
     if (!bot) return
@@ -166,6 +168,7 @@ class FeishuBridgeManager {
 
   /** 在 Agent 运行前创建 Session 镜像群里的流式卡片。 */
   async startSessionMirrorRun(session: AgentSessionMeta): Promise<void> {
+    if (!isAgentSessionUserVisible(session)) return
     const mirrorSettings = getSettings().feishuSessionMirror
     if (mirrorSettings?.mode !== 'stream') return
 

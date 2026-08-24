@@ -1,4 +1,5 @@
 import { listAgentSessions } from './agent-session-manager'
+import { isAgentSessionUserVisible } from './agent-session-visibility'
 import {
   getWorkspaceMemoryReviewLastPromptAt,
   getWorkspaceMemorySummary,
@@ -29,7 +30,9 @@ export function claimWorkspaceMemoryRefreshOpportunity(
 
   const summary = getWorkspaceMemorySummary(workspaceSlug)
   const memoryUpdatedAt = summary.autoMemory.updatedAt
-  const sessions = listAgentSessions().filter((session) => session.workspaceId === workspaceSlug)
+  const sessions = listAgentSessions()
+    .filter(isAgentSessionUserVisible)
+    .filter((session) => session.workspaceId === workspaceSlug)
   const newerSessions = sessions.filter((session) => session.updatedAt > (memoryUpdatedAt ?? 0))
   const newestSessionAt = newerSessions[0]?.updatedAt
   if (!newestSessionAt) return undefined

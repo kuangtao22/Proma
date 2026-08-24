@@ -29,6 +29,7 @@ import {
 import type { AgentStreamPayload } from '@proma/shared'
 import { agentEventBus } from './agent-service'
 import { getAgentSessionMeta, listAgentSessions } from './agent-session-manager'
+import { isAgentSessionUserVisible } from './agent-session-visibility'
 import { isMacAgentIslandNativeHostReady, publishMacAgentIslandSnapshot } from './mac-agent-island-native-host'
 import { getAgentIslandTodoAttentionKeys, selectAgentIslandTodos } from './agent-island-planning'
 import { selectAgentIslandCompactPlanQuota } from './agent-island-plan-quota'
@@ -168,6 +169,10 @@ function setToolDetail(session: InternalSessionSnapshot, toolName: string): void
 // ===== 事件映射（AgentStreamPayload → 灵动岛语义） =====
 
 function handleAgentEvent(sessionId: string, payload: AgentStreamPayload): void {
+  if (!isAgentSessionUserVisible(getAgentSessionMeta(sessionId) ?? {})) {
+    sessions.delete(sessionId)
+    return
+  }
   if (payload.kind === 'proma_event') {
     handlePromaEvent(sessionId, payload.event)
   } else if (payload.kind === 'sdk_message') {
@@ -496,6 +501,7 @@ function buildState(now: number): AgentIslandState {
   // counts or Agent priority semantics.
   const recentSessions = sessionsOut.length === 0
     ? listAgentSessions()
+      .filter(isAgentSessionUserVisible)
       .filter((session) => !session.archived)
       .slice(0, 3)
       .map((session): AgentIslandSessionSnapshot => ({
