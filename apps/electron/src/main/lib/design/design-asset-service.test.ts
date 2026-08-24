@@ -518,6 +518,69 @@ describe('Design 素材安全服务', () => {
     expect(existsSync(service.resolveAssetPath('project-1', asset!.id))).toBe(true)
   })
 
+  test('Given 素材是视觉标准 When 删除素材 Then 在 revision 变更前拒绝', async () => {
+    /** 记录拒绝删除时是否错误清理了来源创作任务。 */
+    const deletedJobs: string[] = []
+    service = createService({
+      isContextAssetReferenced: (_projectId, assetId) => assetId.length > 0,
+      onSuccessfulJobAssetDeleted: (_projectId, sourceJobId) => deletedJobs.push(sourceJobId),
+    })
+    const batch = await service.importAuthorizedFiles('project-1', [fixturePath], {
+      kind: 'job', sourceJobId: 'job-standard', sourceSessionId: 'session-standard', prompt: '生成品牌主视觉',
+    })
+    const asset = batch[0]!
+    const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset] }])
+    batch.commit()
+    /** 删除前的权威 revision 与素材文件路径。 */
+    const revisionBeforeDelete = withAsset.revision
+    const assetPath = join(paths.assetsDir, basename(asset.relativePath))
+    const thumbnailPath = join(paths.thumbnailsDir, basename(asset.thumbnailRelativePath))
+
+    expect(() => service.deleteAsset('project-1', asset.id, revisionBeforeDelete))
+      .toThrow('素材仍被视觉标准引用')
+    expect(store.load('project-1').document.revision).toBe(revisionBeforeDelete)
+    expect(existsSync(assetPath)).toBe(true)
+    expect(existsSync(thumbnailPath)).toBe(true)
+    expect(deletedJobs).toEqual([])
+  })
+
+  test('Given 素材存在子版本 When 删除父素材 Then 在 revision 变更前拒绝', async () => {
+    /** 记录拒绝删除时是否错误清理了来源创作任务。 */
+    const deletedJobs: string[] = []
+    service = createService({
+      onSuccessfulJobAssetDeleted: (_projectId, sourceJobId) => deletedJobs.push(sourceJobId),
+    })
+    const parentBatch = await service.importAuthorizedFiles('project-1', [fixturePath], {
+      kind: 'job', sourceJobId: 'job-parent', sourceSessionId: 'session-parent', prompt: '生成第一版',
+    })
+    const parent = parentBatch[0]!
+    const childBatch = await service.importAuthorizedFiles('project-1', [fixturePath], {
+      kind: 'agent',
+      sourceSessionId: 'session-child',
+      parentAssetId: parent.id,
+      prompt: '生成第二版',
+    })
+    /** 子版本由素材导入边界写入 parentAssetId。 */
+    const child = childBatch[0]!
+    const withAssets = store.mutate('project-1', 0, [{
+      type: 'upsert-assets',
+      assets: [parent, child],
+    }])
+    parentBatch.commit()
+    childBatch.commit()
+    /** 删除前的权威 revision 与父素材文件路径。 */
+    const revisionBeforeDelete = withAssets.revision
+    const parentPath = join(paths.assetsDir, basename(parent.relativePath))
+    const parentThumbnailPath = join(paths.thumbnailsDir, basename(parent.thumbnailRelativePath))
+
+    expect(() => service.deleteAsset('project-1', parent.id, revisionBeforeDelete))
+      .toThrow('素材仍被后续版本引用')
+    expect(store.load('project-1').document.revision).toBe(revisionBeforeDelete)
+    expect(existsSync(parentPath)).toBe(true)
+    expect(existsSync(parentThumbnailPath)).toBe(true)
+    expect(deletedJobs).toEqual([])
+  })
+
   test('Given 素材未被引用 When 删除 Then 先提交元数据再原子删除文件', async () => {
     const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
     const withAsset = store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])
@@ -887,6 +950,7 @@ describe('Design 素材安全服务', () => {
     store?: DesignStore
     runtimeId?: string
     warn?: (message: string) => void
+    isContextAssetReferenced?: (projectId: string, assetId: string) => boolean
     onSuccessfulJobAssetDeleted?: (projectId: string, sourceJobId: string) => void
   }): DesignAssetService {
     return new DesignAssetService({
@@ -897,6 +961,7 @@ describe('Design 素材安全服务', () => {
       registerDirectoryPath: (directoryPath) => `proma-file://${basename(directoryPath)}`,
       revokePathUrl: () => {},
       warn: overrides.warn ?? (() => {}),
+      isContextAssetReferenced: overrides.isContextAssetReferenced,
       onSuccessfulJobAssetDeleted: overrides.onSuccessfulJobAssetDeleted,
       ...(overrides.renameFile || overrides.cleanupPath ? {
         filePromotion: {

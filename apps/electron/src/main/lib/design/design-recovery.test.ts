@@ -14,10 +14,13 @@ import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
 import type { DesignCanvasDocument, DesignMutation, DesignWorkspaceSnapshot } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { DesignAssetService } from './design-asset-service'
+import { DesignContextCatalog } from './design-context-catalog'
+import { DesignContextOrchestrator } from './design-context-orchestrator'
 import { registerDesignIpcHandlers } from './design-ipc'
 import type { DesignIpcOptions } from './design-ipc'
 import { DesignJobManager } from './design-job-manager'
 import { createDesignPathResolver } from './design-paths'
+import { DesignProjectTextIndex } from './design-project-text-index'
 import { createDesignStore } from './design-store'
 import type { DesignStore } from './design-store'
 
@@ -149,11 +152,66 @@ describe('Design 跨模块恢复与资源边界', () => {
       status: 'running', prompt: '生成海报', nodeId: 'node-running', position: { x: 0, y: 0 },
       createdAt: 1, updatedAt: 2,
     }))
-    const manager = createRecoveryJobManager(store, pathResolver)
+    /** 恢复过程启动 Agent 的次数，必须保持为零。 */
+    let agentRunCount = 0
+    const manager = createRecoveryJobManager(store, pathResolver, {
+      onRunHeadless: () => { agentRunCount += 1 },
+    })
 
     expect(manager.recover('project-1')).toContainEqual(expect.objectContaining({
-      id: 'job-running', status: 'interrupted', error: '应用退出，任务已中断',
+      id: 'job-running', status: 'interrupted', error: '应用退出，任务已中断', contextMode: 'none',
     }))
+    expect(agentRunCount).toBe(0)
+  })
+
+  test('Given 上下文清单损坏 When 普通加载并以 project 模式生成 Then 画布可用且图片调用前失败', async () => {
+    store.load('project-1')
+    const paths = pathResolver.resolve('project-1')
+    mkdirSync(paths.contextRoot, { recursive: true })
+    writeFileSync(paths.contextManifestPath, '{broken', 'utf8')
+    /** 使用真实 Catalog 证明普通 LOAD 不读取损坏的创作上下文清单。 */
+    const catalog = new DesignContextCatalog({ pathResolver })
+    const fixture = createIpcFixture(store)
+    fixture.options.context = catalog
+    registerDesignIpcHandlers(fixture.options)
+
+    const snapshot = await invoke(
+      fixture,
+      DESIGN_IPC_CHANNELS.LOAD,
+      { projectId: 'project-1' },
+    ) as DesignWorkspaceSnapshot
+    expect(snapshot.document).toMatchObject({ projectId: 'project-1', revision: 0 })
+
+    /** 真实上下文编排器在 project 预检阶段读取损坏 Catalog。 */
+    const contextOrchestrator = new DesignContextOrchestrator({
+      catalog,
+      textIndex: new DesignProjectTextIndex({ pathResolver }),
+    })
+    /** 会话创建和 Agent 运行次数共同证明不会到达付费图片工具。 */
+    let createdSessionCount = 0
+    let agentRunCount = 0
+    const manager = createRecoveryJobManager(store, pathResolver, {
+      contextOrchestrator,
+      onCreateSession: () => { createdSessionCount += 1 },
+      onRunHeadless: () => { agentRunCount += 1 },
+    })
+    const job = manager.create({
+      projectId: 'project-1',
+      action: 'generate',
+      prompt: '根据项目资料生成首页效果图',
+      contextMode: 'project',
+      imageModelProfileId: 'profile-test',
+      position: { x: 0, y: 0 },
+    })
+
+    await manager.run(job.id)
+
+    expect(manager.get(job.id)).toMatchObject({
+      status: 'failed',
+      error: '创作上下文清单无效: project-1',
+    })
+    expect(createdSessionCount).toBe(0)
+    expect(agentRunCount).toBe(0)
   })
 })
 
@@ -291,6 +349,14 @@ function createAssetService(
 function createRecoveryJobManager(
   store: DesignStore,
   pathResolver: ReturnType<typeof createDesignPathResolver>,
+  overrides: {
+    /** 可替换真实上下文编排器以覆盖预检失败。 */
+    contextOrchestrator?: Pick<DesignContextOrchestrator, 'createRun'>
+    /** 记录意外的内部会话创建。 */
+    onCreateSession?: () => void
+    /** 记录意外的 Agent 执行。 */
+    onRunHeadless?: () => void
+  } = {},
 ): DesignJobManager {
   return new DesignJobManager({
     pathResolver: { resolve: (projectId) => {
@@ -313,17 +379,20 @@ function createRecoveryJobManager(
         return { executor: 'nano-banana', snapshot }
       },
     },
-    contextOrchestrator: {
+    contextOrchestrator: overrides.contextOrchestrator ?? {
       createRun: () => ({
         tools: [], allowedToolNames: [], getReferences: () => [], getWarnings: () => [],
         assertReadyForImageCall: () => undefined,
       }),
     },
-    getSettings: () => ({}),
+    getSettings: () => ({ agentChannelId: 'channel-test', agentModelId: 'model-test' }),
     getSession: () => undefined,
     getSessionMessages: () => [],
-    createSession: () => { throw new Error('恢复不应创建会话') },
-    runHeadless: async () => undefined,
+    createSession: () => {
+      overrides.onCreateSession?.()
+      throw new Error('恢复或上下文预检失败时不应创建会话')
+    },
+    runHeadless: async () => { overrides.onRunHeadless?.() },
     stopAgent: () => undefined,
     traceStore: {
       writeFromMessages: () => ({ summary: { rawThinkingAvailable: false }, entryCount: 0 }),

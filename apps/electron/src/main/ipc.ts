@@ -1105,6 +1105,9 @@ export function registerIpcHandlers(): void {
   })
   /** Design IPC 的模型目录和项目偏好在进程内只创建一次。 */
   const { imageModels, imagePreferences } = getDesignImageModelServices()
+  /** 长期创作资料和项目文本索引只在 Design 任务按需调用时读取。 */
+  const designContextCatalog = new DesignContextCatalog({ pathResolver: designPathResolver })
+  const designProjectTextIndex = new DesignProjectTextIndex({ pathResolver: designPathResolver })
   /** Design 素材服务只接受可信项目路径、原子 store 和目录级媒体授权。 */
   let cleanupSuccessfulDesignTask: ((projectId: string, sourceJobId: string) => void) | undefined
   const designAssetService = new DesignAssetService({
@@ -1114,15 +1117,13 @@ export function registerIpcHandlers(): void {
     registerDirectoryPath: registerPromaDirectoryPath,
     registerRetainedDirectoryPaths: registerRetainedPromaDirectoryPaths,
     revokePathUrl: revokePromaPathUrl,
+    isContextAssetReferenced: (projectId, assetId) => designContextCatalog.isAssetReferenced(projectId, assetId),
     onSuccessfulJobAssetDeleted: (projectId, sourceJobId) => {
       cleanupSuccessfulDesignTask?.(projectId, sourceJobId)
     },
   })
   /** Design trace 独立落在本机 cache，列表和普通 Agent 投影不直接读取。 */
   const designTraceStore = new DesignTraceStore({ pathResolver: designPathResolver })
-  /** 长期创作资料和项目文本索引只在 Design 任务按需调用时读取。 */
-  const designContextCatalog = new DesignContextCatalog({ pathResolver: designPathResolver })
-  const designProjectTextIndex = new DesignProjectTextIndex({ pathResolver: designPathResolver })
   const designContextOrchestrator = new DesignContextOrchestrator({
     catalog: designContextCatalog,
     textIndex: designProjectTextIndex,

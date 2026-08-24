@@ -92,6 +92,8 @@ export interface DesignAssetServiceDependencies {
   retainPathUrl?: (url: string) => boolean
   /** 删除提交后文件清理失败时记录告警。 */
   warn?: (message: string) => void
+  /** 判断素材是否仍被项目视觉标准引用。 */
+  isContextAssetReferenced?: (projectId: string, assetId: string) => boolean
   /** 成功任务素材删除提交后，按来源 Job 回收对应创作任务。 */
   onSuccessfulJobAssetDeleted?: (projectId: string, sourceJobId: string) => void
   /** 跨卷提升的窄文件系统依赖，仅用于稳定故障测试。 */
@@ -911,6 +913,12 @@ export class DesignAssetService {
       if (!asset) throw new Error(`素材不存在: ${assetId}`)
       if (current.nodes.some((node) => node.assetId === assetId)) {
         throw new Error('素材仍被画布节点引用')
+      }
+      if (current.assets.some((item) => item.parentAssetId === assetId)) {
+        throw new Error('素材仍被后续版本引用')
+      }
+      if (this.dependencies.isContextAssetReferenced?.(projectId, assetId)) {
+        throw new Error('素材仍被视觉标准引用')
       }
       /** 结构性删除先经过 revision 冲突检查并原子提交 JSON。 */
       const document = this.dependencies.store.mutate(projectId, expectedRevision, [{
