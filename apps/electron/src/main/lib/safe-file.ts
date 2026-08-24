@@ -544,6 +544,38 @@ export function writeTextFileAtomic(
 }
 
 /**
+ * 迭代写入 JSONL 文件，并在所有记录完成落盘后原子替换主文件。
+ * @param filePath 目标 JSONL 文件路径。
+ * @param values 逐条序列化的纯对象迭代器，避免先构造整份大字符串。
+ * @param options 原子提交后的持久化配置。
+ * @returns 当前平台实际达到的持久化等级。
+ */
+export function writeJsonLinesFileAtomic(
+  filePath: string,
+  values: Iterable<object>,
+  options: AtomicWriteOptions = {},
+): DurabilityResult {
+  /** 同目录临时文件保证最终 rename 不跨文件系统。 */
+  const temporaryPath = `${filePath}.tmp`
+  /** 临时文件 descriptor 只在本次完整写入期间持有。 */
+  const descriptor = openSync(
+    temporaryPath,
+    constants.O_CREAT | constants.O_TRUNC | constants.O_WRONLY,
+    0o600,
+  )
+  try {
+    for (const value of values) {
+      writeFileSync(descriptor, `${JSON.stringify(value)}\n`, 'utf8')
+    }
+    fsyncSync(descriptor)
+  } finally {
+    closeSync(descriptor)
+  }
+  renameSync(temporaryPath, filePath)
+  return syncCommittedFileDurability(filePath, options)
+}
+
+/**
  * 安全读取 JSON 索引文件
  * 优先读主文件，语法或 schema 无效时尝试 .tmp / .bak，都失败返回 null。
  *

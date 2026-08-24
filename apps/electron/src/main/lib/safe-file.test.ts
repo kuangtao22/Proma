@@ -21,6 +21,7 @@ import {
   readJsonFileSafe,
   removeFileAtomic,
   writeJsonFileAtomic,
+  writeJsonLinesFileAtomic,
   writeJsonFileAtomicSecure,
   writeTextFileAtomic,
 } from './safe-file'
@@ -30,6 +31,48 @@ interface VersionedValue {
   version: 1
   value: string
 }
+
+describe('writeJsonLinesFileAtomic', () => {
+  test('Given 多条追踪记录 When 原子写入 Then 每行都是独立 JSON 且文件以换行结尾', () => {
+    /** 隔离 JSONL 追踪文件的临时目录。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-json-lines-'))
+    const filePath = join(tempDir, 'trace.jsonl')
+    try {
+      writeJsonLinesFileAtomic(filePath, [
+        { type: 'thinking', content: '先整理信息层级' },
+        { type: 'tool', toolName: 'generate_image' },
+      ])
+
+      expect(readFileSync(filePath, 'utf8')).toBe([
+        '{"type":"thinking","content":"先整理信息层级"}',
+        '{"type":"tool","toolName":"generate_image"}',
+        '',
+      ].join('\n'))
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 已有可读 trace When 新一轮迭代中途失败 Then 旧文件不被替换', () => {
+    /** 隔离生成器失败前后的主文件与临时文件。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-json-lines-failure-'))
+    const filePath = join(tempDir, 'trace.jsonl')
+    writeFileSync(filePath, '{"type":"status","content":"old"}\n', 'utf8')
+    /** 第二次迭代时抛错，用于证明 rename 尚未发生。 */
+    function* createFailingValues(): Generator<object> {
+      yield { type: 'status', content: 'new' }
+      throw new Error('trace serialization failed')
+    }
+
+    try {
+      expect(() => writeJsonLinesFileAtomic(filePath, createFailingValues()))
+        .toThrow('trace serialization failed')
+      expect(readFileSync(filePath, 'utf8')).toBe('{"type":"status","content":"old"}\n')
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+})
 
 /**
  * 校验测试数据是否符合 VersionedValue。
