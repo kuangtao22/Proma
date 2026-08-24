@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { join } from 'node:path'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import type { DesignContextEntry } from '@proma/shared'
@@ -91,6 +92,25 @@ function createFixture(options: {
 }
 
 describe('DesignContextOrchestrator', () => {
+  test('Given Electron 主进程使用 CJS 并 external Pi SDK When 编译上下文工具 Then 不生成同步 require', async () => {
+    /** 使用与主进程一致的模块格式复现 Electron 启动加载边界。 */
+    const build = await Bun.build({
+      entrypoints: [join(import.meta.dir, 'design-context-orchestrator.ts')],
+      target: 'node',
+      format: 'cjs',
+      external: [
+        '@earendil-works/pi-coding-agent',
+        '@earendil-works/pi-agent-core',
+        '@earendil-works/pi-ai',
+      ],
+    })
+    expect(build.success, build.logs.map((log) => log.message).join('\n')).toBe(true)
+    /** 编译文本用于确认启动阶段不会 require 仅提供 ESM import 的 Pi 包。 */
+    const compiled = await build.outputs[0]?.text()
+
+    expect(compiled).not.toContain('require("@earendil-works/pi-coding-agent")')
+  })
+
   test('Given none 模式 When 创建运行 Then 不提供项目工具且不产生审计引用', () => {
     const { orchestrator } = createFixture({ projectFiles: { 'src/App.tsx': 'content' } })
 

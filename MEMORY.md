@@ -71,6 +71,7 @@
 - Design 内部执行会话必须从普通会话、搜索、归档、最近记录、托盘、状态岛、会话引用、项目记忆及 LAN/mobile 中排除；终态先把摘要、精确提示词、实际上下文引用、Thinking 和日志转存为 Design trace，再可恢复地回收会话。
 - Design 任务详情按 `projectId + jobId` 缓存轻量历史，只有用户展开 Thinking 或执行日志时才读取 trace；删除按 `creativeTaskId` 聚合清理全部尝试和详情缓存，成功素材删除后同步回收来源任务。旧项目缺少 `traces` 子目录时，由 trace 写入边界幂等补齐后再原子提交。
 - Design 素材删除必须在画布 revision 变化前依次检查节点引用、`parentAssetId` 子版本引用和创作上下文 Catalog 的视觉标准引用；任一引用存在时保留元数据、原图、缩略图与来源任务，Catalog 通过主进程显式依赖注入，不在素材服务内隐式创建。
+- Electron 主进程输出为 CJS 且把 Pi SDK 标记为 external；`@earendil-works/pi-coding-agent` 仅提供 ESM import，因此主进程模块禁止顶层值导入该包。只需要类型时使用 `import type`，真实运行能力沿用动态 `import()`，纯 identity helper 应留在本地并用 CJS bundle 回归测试锁定不产生同步 `require()`。
 
 ## 会话记录
 
@@ -140,3 +141,4 @@
 - 2026-08-24：完成 Agent 与 Design 统一创作任务的设计确认：结构化语义转交只预填不生图，所有 Design 提交走内部 Agent，上下文库支持品牌、产品、代码、角色、故事、场景、连续性和参考素材，任务详情展示摘要、精确提示词与可用 Thinking，内部会话转存 trace 后回收；完整 AI 漫剧生产另立规格。
 - 2026-08-24：完成 Design 任务透明度第一阶段：真实失败任务可查看原始要求、精确提示词、模型、尝试历史、Thinking 和执行日志，任务节点与快捷键共用不可恢复删除确认；修复旧项目 trace 目录缺失导致转存失败的问题，并通过阶段回归、类型检查、Electron 构建及真实窗口验收。
 - 2026-08-24：完成 Design 项目创作上下文第二阶段安全验收：视觉标准和子版本引用在删除事务前阻断；损坏 Catalog 不影响普通画布加载，`project` 模式在创建内部会话前失败，旧 Job 恢复为 `contextMode: none` 且不自动生图；231 个定向测试、全仓类型检查和 Electron 完整构建通过。
+- 2026-08-24：真实启动发现 Design 上下文工具顶层导入 ESM-only Pi SDK 会使 Electron CJS 主进程报 `ERR_PACKAGE_PATH_NOT_EXPORTED`；已改为本地纯类型推断 helper，并增加按主进程构建条件检查同步 `require()` 的回归测试，开发窗口启动、IPC 注册和 Agent runtime 初始化通过。

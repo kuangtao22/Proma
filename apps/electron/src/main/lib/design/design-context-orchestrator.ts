@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { defineTool } from '@earendil-works/pi-coding-agent'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import type {
@@ -7,6 +6,7 @@ import type {
   DesignContextReference,
 } from '@proma/shared'
 import { Type } from 'typebox'
+import type { TSchema } from 'typebox'
 import type { DesignContextCatalogContract } from './design-context-catalog'
 import type { DesignProjectTextIndexContract } from './design-project-text-index'
 
@@ -60,6 +60,13 @@ type DesignContextTruncationReason = 'file-bytes' | 'total-bytes' | 'file-count'
 interface TextReadBudget {
   allowedBytes: number
   blockedReason?: DesignContextTruncationReason
+}
+
+/** 保留工具参数推断且不在 Electron CJS 主进程同步加载 ESM-only Pi SDK。 */
+function defineDesignTool<TParams extends TSchema, TDetails = unknown>(
+  tool: ToolDefinition<TParams, TDetails>,
+): ToolDefinition<TParams, TDetails> {
+  return tool
 }
 
 /** 单次 Design 内部 Agent 的上下文访问策略、预算和审计编排器。 */
@@ -147,7 +154,7 @@ export class DesignContextOrchestrator {
     })
 
     /** 只返回相对路径和元数据的项目文件列表工具。 */
-    const listProjectFiles = defineTool({
+    const listProjectFiles = defineDesignTool({
       name: DESIGN_CONTEXT_TOOL_NAMES[0],
       label: '列出项目文本文件',
       description: '列出当前 Design 项目中允许读取的普通文本文件。不会返回绝对路径、敏感文件、依赖或构建产物。',
@@ -166,7 +173,7 @@ export class DesignContextOrchestrator {
     })
 
     /** 搜索项目文件名和受限文本首段的工具。 */
-    const searchProjectText = defineTool({
+    const searchProjectText = defineDesignTool({
       name: DESIGN_CONTEXT_TOOL_NAMES[1],
       label: '搜索项目文本',
       description: '在当前 Design 项目的安全文本索引中搜索文件名和文本首段，只返回相对路径元数据。',
@@ -183,7 +190,7 @@ export class DesignContextOrchestrator {
     })
 
     /** 按预算读取单个项目文本文件并留下真实引用。 */
-    const readProjectFile = defineTool({
+    const readProjectFile = defineDesignTool({
       name: DESIGN_CONTEXT_TOOL_NAMES[2],
       label: '读取项目文本文件',
       description: '按已建立索引的项目相对路径读取最多 64 KiB 文本，并记录本次 Design 任务的实际引用。',
@@ -235,7 +242,7 @@ export class DesignContextOrchestrator {
     })
 
     /** 读取长期 Markdown 资料或 Design 素材标准元数据并审计。 */
-    const readContextEntry = defineTool({
+    const readContextEntry = defineDesignTool({
       name: DESIGN_CONTEXT_TOOL_NAMES[3],
       label: '读取创作上下文条目',
       description: '读取当前项目上下文库中的 Markdown 资料或视觉标准元数据，并记录真实引用。',
