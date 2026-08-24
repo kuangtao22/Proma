@@ -1,16 +1,22 @@
 import type {
   CreateDesignJobInput,
   DeleteDesignAssetInput,
+  DeleteDesignContextInput,
   DesignChangeEvent,
   DesignImageModelSelectionChangeEvent,
   ExportDesignAssetInput,
   GetDesignTaskDetailsInput,
   ImportAgentImageInput,
+  ImportDesignContextDocumentInput,
   ImportDesignAssetsInput,
   PrepareDesignAssetForSessionInput,
   RelinkDesignAssetInput,
+  RegisterDesignContextAssetInput,
   SaveDesignMutationsInput,
   SaveImageGenerationModelProfilesInput,
+  ListDesignContextInput,
+  UpsertDesignContextDocumentInput,
+  UpdateDesignContextEntryInput,
   UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
 import type { DesignPreloadApi } from '../../preload/design-preload'
@@ -39,6 +45,12 @@ export interface DesignAdapter {
   listJobs: (projectId: string) => ReturnType<DesignPreloadApi['listDesignJobs']>
   getTaskDetails: (input: GetDesignTaskDetailsInput) => ReturnType<DesignPreloadApi['getDesignTaskDetails']>
   getTaskTrace: (input: GetDesignTaskDetailsInput) => ReturnType<DesignPreloadApi['getDesignTaskTrace']>
+  listContext: (input: ListDesignContextInput) => ReturnType<DesignPreloadApi['listDesignContext']>
+  upsertContextDocument: (input: UpsertDesignContextDocumentInput) => ReturnType<DesignPreloadApi['upsertDesignContextDocument']>
+  importContextDocument: (input: ImportDesignContextDocumentInput) => ReturnType<DesignPreloadApi['importDesignContextDocument']>
+  updateContext: (input: UpdateDesignContextEntryInput) => ReturnType<DesignPreloadApi['updateDesignContext']>
+  registerContextAsset: (input: RegisterDesignContextAssetInput) => ReturnType<DesignPreloadApi['registerDesignContextAsset']>
+  deleteContext: (input: DeleteDesignContextInput) => ReturnType<DesignPreloadApi['deleteDesignContext']>
   prepareAssetForSession: (input: PrepareDesignAssetForSessionInput) => ReturnType<DesignPreloadApi['prepareDesignAssetForSession']>
   importAgentImage: (input: ImportAgentImageInput) => ReturnType<DesignPreloadApi['importAgentImageToDesign']>
   releaseMediaAccess: () => ReturnType<DesignPreloadApi['releaseDesignMediaAccess']>
@@ -74,6 +86,12 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
     listJobs: (projectId) => requireMethod(api, 'listDesignJobs')(projectId),
     getTaskDetails: (input) => requireMethod(api, 'getDesignTaskDetails')(input),
     getTaskTrace: (input) => requireMethod(api, 'getDesignTaskTrace')(input),
+    listContext: (input) => requireMethod(api, 'listDesignContext')(input),
+    upsertContextDocument: (input) => requireMethod(api, 'upsertDesignContextDocument')(input),
+    importContextDocument: (input) => requireMethod(api, 'importDesignContextDocument')(input),
+    updateContext: (input) => requireMethod(api, 'updateDesignContext')(input),
+    registerContextAsset: (input) => requireMethod(api, 'registerDesignContextAsset')(input),
+    deleteContext: (input) => requireMethod(api, 'deleteDesignContext')(input),
     prepareAssetForSession: (input) => requireMethod(api, 'prepareDesignAssetForSession')(input),
     importAgentImage: (input) => requireMethod(api, 'importAgentImageToDesign')(input),
     releaseMediaAccess: () => requireMethod(api, 'releaseDesignMediaAccess')(),

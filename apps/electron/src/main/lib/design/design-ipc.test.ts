@@ -14,6 +14,7 @@ import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
 import type {
   DesignAsset,
   DesignCanvasDocument,
+  DesignContextEntry,
   DesignImageModelSelectionChangeEvent,
   DesignJobRecord,
   DesignMutation,
@@ -162,6 +163,19 @@ function createFixture(): {
         }
       },
     },
+    context: {
+      list: () => [],
+      upsertDocument: (input) => createContextEntry(input.projectId, input.entryId ?? 'context-upsert'),
+      importDocument: (input) => createContextEntry(input.projectId, 'context-import'),
+      updateMetadata: (input) => createContextEntry(input.projectId, input.entryId),
+      registerAsset: (input) => ({
+        ...createContextEntry(input.projectId, 'context-asset'),
+        kind: 'asset',
+        assetId: input.assetId,
+        relativePath: undefined,
+      }),
+      delete: () => undefined,
+    },
     jobs: {
       create: () => createJobRecord('job-default'),
       run: async () => undefined,
@@ -203,6 +217,7 @@ function createFixture(): {
       },
     },
     pickImageFiles: async () => ['/trusted/a.png'],
+    pickMarkdownFile: async () => '/trusted/context.md',
     pickRelinkImageFile: async () => '/trusted/relinked.png',
     pickExportPath: async () => '/trusted/export.png',
     getProjectReadOnlyReason: () => undefined,
@@ -511,12 +526,68 @@ describe('Design IPC', () => {
     await expect(invoke(
       fixture.handlers, DESIGN_IPC_CHANNELS.CREATE_JOB, fixture.senders[0]!, {
         projectId: 'project-1', action: 'generate', prompt: '生成',
-        imageModelProfileId: 'forged', position: { x: 1, y: 2 },
+        contextMode: 'auto', imageModelProfileId: 'forged', position: { x: 1, y: 2 },
       },
     )).rejects.toThrow('生图模型不存在: forged')
     expect(fixture.guardProjects).toEqual(['project-1'])
     expect(jobCalls).toEqual(['create'])
     expect(fixture.getStoreReadCount()).toBe(0)
+  })
+
+  test('Given 上下文写请求 When 调用 IPC Then 严格校验并在项目写锁内广播变化', async () => {
+    const fixture = createFixture()
+    /** 捕获传给 Catalog 的结构化输入，证明绝对路径不由 Renderer 提供。 */
+    const contextInputs: unknown[] = []
+    fixture.options.context.upsertDocument = (input) => {
+      contextInputs.push(input)
+      return createContextEntry(input.projectId, 'context-brand')
+    }
+    registerDesignIpcHandlers(fixture.options)
+
+    const entry = await invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.UPSERT_CONTEXT_DOCUMENT,
+      fixture.senders[0]!,
+      {
+        projectId: 'project-1', category: 'brand', title: '品牌', tags: ['主品牌'], markdown: '# Brand',
+      },
+    )
+
+    expect(entry).toMatchObject({ id: 'context-brand', category: 'brand' })
+    expect(fixture.guardProjects).toEqual(['project-1'])
+    expect(contextInputs).toEqual([{
+      projectId: 'project-1', category: 'brand', title: '品牌', tags: ['主品牌'], markdown: '# Brand',
+    }])
+    expect(fixture.senders[0]!.sent).toContainEqual({
+      channel: DESIGN_IPC_CHANNELS.CHANGED,
+      value: { projectId: 'project-1', revision: 0, cause: 'context' },
+    })
+  })
+
+  test('Given Markdown 导入取消或 Renderer 夹带路径 When 调用 IPC Then 不修改上下文目录', async () => {
+    const fixture = createFixture()
+    /** 记录导入是否越过主进程选择器边界。 */
+    const importedPaths: string[] = []
+    fixture.options.pickMarkdownFile = async () => null
+    fixture.options.context.importDocument = (input) => {
+      importedPaths.push(input.sourcePath)
+      return createContextEntry(input.projectId, 'context-import')
+    }
+    registerDesignIpcHandlers(fixture.options)
+
+    await expect(invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.IMPORT_CONTEXT_DOCUMENT,
+      fixture.senders[0]!,
+      { projectId: 'project-1', category: 'brand', tags: [] },
+    )).resolves.toBeUndefined()
+    await expect(invoke(
+      fixture.handlers,
+      DESIGN_IPC_CHANNELS.IMPORT_CONTEXT_DOCUMENT,
+      fixture.senders[0]!,
+      { projectId: 'project-1', category: 'brand', tags: [], sourcePath: '/forged.md' },
+    )).rejects.toThrow('Design 请求结构无效')
+    expect(importedPaths).toEqual([])
   })
 
   test('Given 授权窗口 When 创建、取消、重试、删除和列出任务 Then 写操作受 guard 保护且运行不阻塞 invoke', async () => {
@@ -559,7 +630,7 @@ describe('Design IPC', () => {
       fixture.senders[0]!,
       {
         projectId: 'project-1', action: 'generate', prompt: '生成',
-        imageModelProfileId: 'profile-flash', position: { x: 1, y: 2 },
+        contextMode: 'auto', imageModelProfileId: 'profile-flash', position: { x: 1, y: 2 },
       },
     )
     const cancelled = await invoke(
@@ -1389,5 +1460,20 @@ function createJobRecord(id: string): DesignJobRecord {
     contextMode: 'none',
     createdAt: 1,
     updatedAt: 1,
+  }
+}
+
+/** 创建 IPC 上下文测试使用的最小文档条目。 */
+function createContextEntry(projectId: string, id: string): DesignContextEntry {
+  return {
+    id,
+    projectId,
+    category: 'brand',
+    kind: 'document',
+    title: '品牌资料',
+    relativePath: `documents/${id}.md`,
+    tags: [],
+    source: 'user',
+    updatedAt: 10,
   }
 }

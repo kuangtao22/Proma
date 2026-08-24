@@ -2,8 +2,10 @@ import { DESIGN_IPC_CHANNELS } from '@proma/shared'
 import type {
   CreateDesignJobInput,
   DeleteDesignAssetInput,
+  DeleteDesignContextInput,
   DesignCanvasDocument,
   DesignChangeEvent,
+  DesignContextEntry,
   DesignImageModelSelection,
   DesignImageModelSelectionChangeEvent,
   DesignJobControlInput,
@@ -13,13 +15,18 @@ import type {
   ExportDesignAssetInput,
   GetDesignTaskDetailsInput,
   ImportAgentImageInput,
+  ImportDesignContextDocumentInput,
   ImportDesignAssetsInput,
   ImageGenerationModelCatalogResult,
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
   RelinkDesignAssetInput,
+  RegisterDesignContextAssetInput,
   SaveDesignMutationsInput,
   SaveImageGenerationModelProfilesInput,
+  ListDesignContextInput,
+  UpsertDesignContextDocumentInput,
+  UpdateDesignContextEntryInput,
   UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
 import type { IpcRendererEvent } from 'electron'
@@ -45,6 +52,12 @@ export interface DesignPreloadApi {
   listDesignJobs: (projectId: string) => Promise<DesignJobRecord[]>
   getDesignTaskDetails: (input: GetDesignTaskDetailsInput) => Promise<DesignTaskDetails>
   getDesignTaskTrace: (input: GetDesignTaskDetailsInput) => Promise<DesignTaskDetails>
+  listDesignContext: (input: ListDesignContextInput) => Promise<DesignContextEntry[]>
+  upsertDesignContextDocument: (input: UpsertDesignContextDocumentInput) => Promise<DesignContextEntry>
+  importDesignContextDocument: (input: ImportDesignContextDocumentInput) => Promise<DesignContextEntry | undefined>
+  updateDesignContext: (input: UpdateDesignContextEntryInput) => Promise<DesignContextEntry>
+  registerDesignContextAsset: (input: RegisterDesignContextAssetInput) => Promise<DesignContextEntry>
+  deleteDesignContext: (input: DeleteDesignContextInput) => Promise<void>
   prepareDesignAssetForSession: (input: PrepareDesignAssetForSessionInput) => Promise<PreparedDesignAssetMention>
   importAgentImageToDesign: (input: ImportAgentImageInput) => Promise<DesignWorkspaceSnapshot>
   releaseDesignMediaAccess: () => Promise<void>
@@ -92,6 +105,12 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
     listDesignJobs: (projectId) => ipc.invoke(DESIGN_IPC_CHANNELS.LIST_JOBS, { projectId }) as Promise<DesignJobRecord[]>,
     getDesignTaskDetails: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.GET_TASK_DETAILS, input) as Promise<DesignTaskDetails>,
     getDesignTaskTrace: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.GET_TASK_TRACE, input) as Promise<DesignTaskDetails>,
+    listDesignContext: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.LIST_CONTEXT, input) as Promise<DesignContextEntry[]>,
+    upsertDesignContextDocument: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.UPSERT_CONTEXT_DOCUMENT, input) as Promise<DesignContextEntry>,
+    importDesignContextDocument: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.IMPORT_CONTEXT_DOCUMENT, input) as Promise<DesignContextEntry | undefined>,
+    updateDesignContext: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.UPDATE_CONTEXT, input) as Promise<DesignContextEntry>,
+    registerDesignContextAsset: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.REGISTER_CONTEXT_ASSET, input) as Promise<DesignContextEntry>,
+    deleteDesignContext: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.DELETE_CONTEXT, input) as Promise<void>,
     prepareDesignAssetForSession: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.PREPARE_ASSET_FOR_SESSION, input) as Promise<PreparedDesignAssetMention>,
     importAgentImageToDesign: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.IMPORT_AGENT_IMAGE, input) as Promise<DesignWorkspaceSnapshot>,
     releaseDesignMediaAccess: () => ipc.invoke(DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS) as Promise<void>,

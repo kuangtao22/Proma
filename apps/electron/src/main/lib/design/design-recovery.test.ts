@@ -109,7 +109,7 @@ describe('Design 跨模块恢复与资源边界', () => {
         channel: DESIGN_IPC_CHANNELS.CREATE_JOB,
         input: {
           projectId: 'project-1', action: 'generate', prompt: '生成海报',
-          imageModelProfileId: 'profile-test', position: { x: 0, y: 0 },
+          contextMode: 'auto', imageModelProfileId: 'profile-test', position: { x: 0, y: 0 },
         },
       },
       {
@@ -193,6 +193,14 @@ function createIpcFixture(store: DesignStore, readOnlyReason?: string): {
         release: () => undefined,
       }),
     },
+    context: {
+      list: () => [],
+      upsertDocument: () => { throw new Error('恢复测试不写上下文') },
+      importDocument: () => { throw new Error('恢复测试不导入上下文') },
+      updateMetadata: () => { throw new Error('恢复测试不更新上下文') },
+      registerAsset: () => { throw new Error('恢复测试不登记上下文素材') },
+      delete: () => undefined,
+    },
     jobs: {
       create: () => { effects.push('create'); return createJobRecord('job-created') },
       run: async () => { effects.push('run') },
@@ -226,6 +234,7 @@ function createIpcFixture(store: DesignStore, readOnlyReason?: string): {
       importAgentImage: async () => { throw new Error('未配置') },
     },
     pickImageFiles: async () => { effects.push('picker'); return [] },
+    pickMarkdownFile: async () => null,
     pickRelinkImageFile: async () => null,
     pickExportPath: async () => null,
     getProjectReadOnlyReason: () => readOnlyReason,

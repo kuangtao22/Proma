@@ -488,7 +488,7 @@ export interface ImportAgentImageInput {
 export type DesignChangeEvent = {
   projectId: string
   revision: number
-  cause: 'canvas' | 'asset' | 'job' | 'recovery'
+  cause: 'canvas' | 'asset' | 'job' | 'context' | 'recovery'
 }
 
 /** Design 专用 IPC 通道，避免与会话和文件预览通道混用。 */

@@ -18,6 +18,8 @@ describe('Design renderer adapter', () => {
     let receivedInput: SaveDesignMutationsInput | undefined
     /** 模型 API 收到的原始参数，验证 adapter 不做业务改写。 */
     const modelInputs: unknown[] = []
+    /** 上下文 API 收到的原始参数，验证 adapter 不做路径或元数据改写。 */
+    const contextInputs: unknown[] = []
     /** 公开模型目录返回对象。 */
     const catalog = { profiles: [], channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: true }
     /** 项目模型选择返回对象。 */
@@ -41,6 +43,12 @@ describe('Design renderer adapter', () => {
       onDesignChanged: () => () => undefined,
       getDesignTaskDetails: async () => taskDetails,
       getDesignTaskTrace: async () => taskTrace,
+      listDesignContext: async (input) => { contextInputs.push(input); return [] },
+      upsertDesignContextDocument: async (input) => { contextInputs.push(input); return {} as never },
+      importDesignContextDocument: async (input) => { contextInputs.push(input); return undefined },
+      updateDesignContext: async (input) => { contextInputs.push(input); return {} as never },
+      registerDesignContextAsset: async (input) => { contextInputs.push(input); return {} as never },
+      deleteDesignContext: async (input) => { contextInputs.push(input) },
     }
     const adapter = createDesignAdapter(api)
     expect(await adapter.load('project-1')).toBe(snapshot)
@@ -58,6 +66,23 @@ describe('Design renderer adapter', () => {
     expect(await adapter.getTaskDetails(taskInput)).toBe(taskDetails)
     expect(await adapter.getTaskTrace(taskInput)).toBe(taskTrace)
     expect(modelInputs).toEqual([saveProfilesInput, 'project-1', setSelectionInput])
+    /** 六个上下文方法必须保留调用方对象身份。 */
+    const listContextInput = { projectId: 'project-1', query: 'brand' }
+    const upsertContextInput = { projectId: 'project-1', category: 'brand' as const, title: '品牌', tags: [], markdown: '# Brand' }
+    const importContextInput = { projectId: 'project-1', category: 'brand' as const, tags: [] }
+    const updateContextInput = { projectId: 'project-1', entryId: 'context-1', category: 'brand' as const, title: '品牌', tags: [] }
+    const registerContextInput = { projectId: 'project-1', assetId: 'asset-1', category: 'reference' as const, title: '参考', tags: [] }
+    const deleteContextInput = { projectId: 'project-1', entryId: 'context-1' }
+    await adapter.listContext(listContextInput)
+    await adapter.upsertContextDocument(upsertContextInput)
+    await adapter.importContextDocument(importContextInput)
+    await adapter.updateContext(updateContextInput)
+    await adapter.registerContextAsset(registerContextInput)
+    await adapter.deleteContext(deleteContextInput)
+    expect(contextInputs).toEqual([
+      listContextInput, upsertContextInput, importContextInput,
+      updateContextInput, registerContextInput, deleteContextInput,
+    ])
     expect(adapter.onImageModelProfilesChanged(() => undefined)).toBe(releaseProfiles)
     expect(adapter.onImageModelSelectionChanged(() => undefined)).toBe(releaseSelection)
     await expect(adapter.releaseMediaAccess()).resolves.toBeUndefined()

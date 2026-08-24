@@ -3,10 +3,13 @@ import { DESIGN_IPC_CHANNELS, createEmptyDesignDocument } from '@proma/shared'
 import type {
   CreateDesignJobInput,
   DeleteDesignAssetInput,
+  DeleteDesignContextInput,
   DesignAnnotation,
   DesignCanvasDocument,
   DesignCanvasNode,
   DesignChangeEvent,
+  DesignContextCategory,
+  DesignContextEntry,
   DesignGroup,
   DesignImageModelSelection,
   DesignImageModelSelectionChangeEvent,
@@ -19,13 +22,18 @@ import type {
   ExportDesignAssetInput,
   GetDesignTaskDetailsInput,
   ImportAgentImageInput,
+  ImportDesignContextDocumentInput,
   ImportDesignAssetsInput,
   ImageGenerationModelCatalogResult,
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
   RelinkDesignAssetInput,
+  RegisterDesignContextAssetInput,
   SaveDesignMutationsInput,
   SaveImageGenerationModelProfilesInput,
+  ListDesignContextInput,
+  UpsertDesignContextDocumentInput,
+  UpdateDesignContextEntryInput,
   UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
@@ -33,6 +41,7 @@ import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
 import type { ImageGenerationModelCatalog } from '../image-generation-model-catalog'
 import { runSafeImageModelOperation } from '../image-generation-model-error'
 import type { DesignAssetImportBatch, DesignAssetService } from './design-asset-service'
+import type { DesignContextCatalogContract } from './design-context-catalog'
 import type { DesignStore } from './design-store'
 import type { DesignJobManager } from './design-job-manager'
 import type { DesignSessionBridge } from './design-session-bridge'
@@ -104,6 +113,12 @@ export interface DesignIpcSessionBridge extends Pick<
   'prepareAssetForSession' | 'importAgentImage'
 > {}
 
+/** IPC 层实际使用的创作上下文目录窄接口。 */
+export interface DesignIpcContextCatalog extends Pick<
+  DesignContextCatalogContract,
+  'list' | 'upsertDocument' | 'importDocument' | 'updateMetadata' | 'registerAsset' | 'delete'
+> {}
+
 /** 注册 Design IPC 所需的可信主进程依赖。 */
 export interface DesignIpcOptions {
   ipc: DesignIpcRegistrar
@@ -112,6 +127,7 @@ export interface DesignIpcOptions {
   store: DesignStore
   assets: DesignIpcAssetService
   jobs: DesignIpcJobManager
+  context: DesignIpcContextCatalog
   imageModels: Pick<
     ImageGenerationModelCatalog,
     'listCatalog' | 'replaceProfiles'
@@ -122,6 +138,8 @@ export interface DesignIpcOptions {
   >
   sessionBridge: DesignIpcSessionBridge
   pickImageFiles: (sender: WebContents) => Promise<string[]>
+  /** Markdown 来源路径只能由主进程文件选择器返回。 */
+  pickMarkdownFile: (sender: WebContents) => Promise<string | null>
   pickRelinkImageFile: (sender: WebContents) => Promise<string | null>
   pickExportPath: (sender: WebContents, filename: string) => Promise<string | null>
   /** 项目路径离线或迁移时返回稳定只读原因，正常可读时返回 undefined。 */
@@ -142,6 +160,21 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): b
 /** 非空字符串判定。 */
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
+}
+
+/** 创作上下文类别固定白名单。 */
+const DESIGN_CONTEXT_CATEGORIES = new Set<DesignContextCategory>([
+  'brand', 'product', 'code', 'character', 'story', 'scene', 'continuity', 'reference',
+])
+
+/** 判断未知值是否为固定创作上下文类别。 */
+function isDesignContextCategory(value: unknown): value is DesignContextCategory {
+  return typeof value === 'string' && DESIGN_CONTEXT_CATEGORIES.has(value as DesignContextCategory)
+}
+
+/** 标签输入必须是纯字符串数组，具体去重和数量上限由 Catalog 统一执行。 */
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string')
 }
 
 /** 有限数字判定。 */
@@ -275,6 +308,92 @@ function parseProjectInput(value: unknown): { projectId: string } {
     throw new Error('Design 请求结构无效')
   }
   return { projectId: value.projectId }
+}
+
+/** 解析可选搜索词的上下文列表请求。 */
+function parseListDesignContextInput(value: unknown): ListDesignContextInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'query'])
+    || !isNonEmptyString(value.projectId)
+    || (value.query !== undefined && typeof value.query !== 'string')) {
+    throw new Error('Design 请求结构无效')
+  }
+  return { projectId: value.projectId, ...(value.query !== undefined ? { query: value.query } : {}) }
+}
+
+/** 解析新建或更新受管 Markdown 文档请求。 */
+function parseUpsertDesignContextDocumentInput(value: unknown): UpsertDesignContextDocumentInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'entryId', 'category', 'title', 'tags', 'markdown'])
+    || !isNonEmptyString(value.projectId)
+    || (value.entryId !== undefined && !isNonEmptyString(value.entryId))
+    || !isDesignContextCategory(value.category)
+    || !isNonEmptyString(value.title)
+    || !isStringArray(value.tags)
+    || typeof value.markdown !== 'string') throw new Error('Design 请求结构无效')
+  return {
+    projectId: value.projectId,
+    ...(value.entryId ? { entryId: value.entryId } : {}),
+    category: value.category,
+    title: value.title,
+    tags: value.tags,
+    markdown: value.markdown,
+  }
+}
+
+/** 解析只含导入元数据、不含来源路径的 Markdown 导入请求。 */
+function parseImportDesignContextDocumentInput(value: unknown): ImportDesignContextDocumentInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'category', 'tags'])
+    || !isNonEmptyString(value.projectId)
+    || !isDesignContextCategory(value.category)
+    || !isStringArray(value.tags)) throw new Error('Design 请求结构无效')
+  return { projectId: value.projectId, category: value.category, tags: value.tags }
+}
+
+/** 解析只允许修改展示元数据的上下文更新请求。 */
+function parseUpdateDesignContextEntryInput(value: unknown): UpdateDesignContextEntryInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'entryId', 'category', 'title', 'tags'])
+    || !isNonEmptyString(value.projectId)
+    || !isNonEmptyString(value.entryId)
+    || !isDesignContextCategory(value.category)
+    || !isNonEmptyString(value.title)
+    || !isStringArray(value.tags)) throw new Error('Design 请求结构无效')
+  return {
+    projectId: value.projectId,
+    entryId: value.entryId,
+    category: value.category,
+    title: value.title,
+    tags: value.tags,
+  }
+}
+
+/** 解析把现有 Design 素材登记为视觉标准的请求。 */
+function parseRegisterDesignContextAssetInput(value: unknown): RegisterDesignContextAssetInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'assetId', 'category', 'title', 'tags'])
+    || !isNonEmptyString(value.projectId)
+    || !isNonEmptyString(value.assetId)
+    || !isDesignContextCategory(value.category)
+    || !isNonEmptyString(value.title)
+    || !isStringArray(value.tags)) throw new Error('Design 请求结构无效')
+  return {
+    projectId: value.projectId,
+    assetId: value.assetId,
+    category: value.category,
+    title: value.title,
+    tags: value.tags,
+  }
+}
+
+/** 解析删除上下文条目的项目归属输入。 */
+function parseDeleteDesignContextInput(value: unknown): DeleteDesignContextInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['projectId', 'entryId'])
+    || !isNonEmptyString(value.projectId)
+    || !isNonEmptyString(value.entryId)) throw new Error('Design 请求结构无效')
+  return { projectId: value.projectId, entryId: value.entryId }
 }
 
 /** 解析完整替换模型目录的请求根，只允许 profiles 数组。 */
@@ -468,12 +587,13 @@ function parseAssetInput(value: unknown, withRevision: boolean): DeleteDesignAss
 function parseCreateJobInput(value: unknown): CreateDesignJobInput {
   if (!isRecord(value)
     || !hasOnlyKeys(value, [
-      'projectId', 'action', 'prompt', 'imageModelProfileId', 'sourceSessionId', 'sourceAssetId',
+      'projectId', 'action', 'prompt', 'contextMode', 'imageModelProfileId', 'sourceSessionId', 'sourceAssetId',
       'maskAnnotationId', 'position',
     ])
     || !isNonEmptyString(value.projectId)
     || (value.action !== 'generate' && value.action !== 'edit')
     || !isNonEmptyString(value.prompt)
+    || (value.contextMode !== 'auto' && value.contextMode !== 'project' && value.contextMode !== 'none')
     || !isNonEmptyString(value.imageModelProfileId)
     || (value.sourceSessionId !== undefined && !isNonEmptyString(value.sourceSessionId))
     || (value.sourceAssetId !== undefined && !isNonEmptyString(value.sourceAssetId))
@@ -483,6 +603,7 @@ function parseCreateJobInput(value: unknown): CreateDesignJobInput {
     projectId: value.projectId,
     action: value.action,
     prompt: value.prompt,
+    contextMode: value.contextMode,
     imageModelProfileId: value.imageModelProfileId,
     ...(value.sourceSessionId ? { sourceSessionId: value.sourceSessionId } : {}),
     ...(value.sourceAssetId ? { sourceAssetId: value.sourceAssetId } : {}),
@@ -582,6 +703,12 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     DESIGN_IPC_CHANNELS.LIST_JOBS,
     DESIGN_IPC_CHANNELS.GET_TASK_DETAILS,
     DESIGN_IPC_CHANNELS.GET_TASK_TRACE,
+    DESIGN_IPC_CHANNELS.LIST_CONTEXT,
+    DESIGN_IPC_CHANNELS.UPSERT_CONTEXT_DOCUMENT,
+    DESIGN_IPC_CHANNELS.IMPORT_CONTEXT_DOCUMENT,
+    DESIGN_IPC_CHANNELS.UPDATE_CONTEXT,
+    DESIGN_IPC_CHANNELS.REGISTER_CONTEXT_ASSET,
+    DESIGN_IPC_CHANNELS.DELETE_CONTEXT,
     DESIGN_IPC_CHANNELS.PREPARE_ASSET_FOR_SESSION,
     DESIGN_IPC_CHANNELS.IMPORT_AGENT_IMAGE,
     DESIGN_IPC_CHANNELS.RELEASE_MEDIA_ACCESS,
@@ -662,6 +789,21 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   const unsubscribeImagePreferences = options.imagePreferences.onChanged((event) => {
     broadcastImageModelSelectionChanged(options, event)
   })
+
+  /** 在同一项目写锁内固定画布 revision、提交上下文，再广播独立 context 变化。 */
+  const runContextWrite = async <Result>(
+    projectId: string,
+    effect: (document: DesignCanvasDocument) => Result | Promise<Result>,
+  ): Promise<Result> => {
+    /** 上下文不修改画布 revision，广播携带写入时观察到的权威 revision。 */
+    const committed = await options.guard.runWorkspaceWrite(projectId, async () => {
+      const document = options.store.requireStableAuthoritativeDocument(projectId)
+      const value = await effect(document)
+      return { value, revision: document.revision }
+    })
+    broadcastChange(options, { projectId, revision: committed.revision, cause: 'context' })
+    return committed.value
+  }
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, async (event, value): Promise<ImageGenerationModelCatalogResult> => {
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
@@ -898,6 +1040,74 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     assertAuthorizedSender(event, options.listAuthorizedWebContents())
     const input = parseTaskDetailsInput(value)
     return options.jobs.getTaskDetails(input.projectId, input.jobId, true)
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.LIST_CONTEXT, async (event, value): Promise<DesignContextEntry[]> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseListDesignContextInput(value)
+    return options.context.list(input.projectId, input.query)
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.UPSERT_CONTEXT_DOCUMENT, async (event, value): Promise<DesignContextEntry> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseUpsertDesignContextDocumentInput(value)
+    return runContextWrite(input.projectId, () => options.context.upsertDocument(input))
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.IMPORT_CONTEXT_DOCUMENT, async (event, value): Promise<DesignContextEntry | undefined> => {
+    const sender = assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseImportDesignContextDocumentInput(value)
+    /** 取消选择不产生目录写入或变化广播。 */
+    const committed = await options.guard.runWorkspaceWrite(input.projectId, async () => {
+      const document = options.store.requireStableAuthoritativeDocument(input.projectId)
+      const sourcePath = await options.pickMarkdownFile(sender)
+      if (!sourcePath) return { entry: undefined, revision: document.revision }
+      const entry = options.context.importDocument({ ...input, sourcePath })
+      return { entry, revision: document.revision }
+    })
+    if (committed.entry) {
+      broadcastChange(options, {
+        projectId: input.projectId,
+        revision: committed.revision,
+        cause: 'context',
+      })
+    }
+    return committed.entry
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.UPDATE_CONTEXT, async (event, value): Promise<DesignContextEntry> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseUpdateDesignContextEntryInput(value)
+    return runContextWrite(input.projectId, () => options.context.updateMetadata(input))
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.REGISTER_CONTEXT_ASSET, async (event, value): Promise<DesignContextEntry> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseRegisterDesignContextAssetInput(value)
+    return runContextWrite(input.projectId, (document) => {
+      if (!document.assets.some((asset) => asset.id === input.assetId)) {
+        throw new Error(`素材不存在: ${input.assetId}`)
+      }
+      return options.context.registerAsset(input)
+    })
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.DELETE_CONTEXT, async (event, value): Promise<void> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseDeleteDesignContextInput(value)
+    await runContextWrite(input.projectId, () => {
+      /** Catalog 条目的相对路径或素材 ID 是任务审计引用的唯一匹配事实。 */
+      const entry = options.context.list(input.projectId).find((candidate) => candidate.id === input.entryId)
+      const referencedByJobIds = entry
+        ? options.jobs.list(input.projectId)
+            .filter((job) => job.contextReferences?.some((reference) => (
+              (entry.kind === 'document' && reference.relativePath === entry.relativePath)
+              || (entry.kind === 'asset' && reference.assetId === entry.assetId)
+            )))
+            .map((job) => job.id)
+        : []
+      options.context.delete(input.projectId, input.entryId, referencedByJobIds)
+    })
   })
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.PREPARE_ASSET_FOR_SESSION, async (event, value): Promise<PreparedDesignAssetMention> => {

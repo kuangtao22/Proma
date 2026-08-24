@@ -1197,6 +1197,7 @@ export function registerIpcHandlers(): void {
     store: designStore,
     assets: designAssetService,
     jobs: designJobManager,
+    context: designContextCatalog,
     imageModels,
     imagePreferences,
     sessionBridge: designSessionBridge,
@@ -1227,6 +1228,19 @@ export function registerIpcHandlers(): void {
         ? await dialog.showOpenDialog(owner, options)
         : await dialog.showOpenDialog(options)
       return result.canceled ? [] : result.filePaths
+    },
+    pickMarkdownFile: async (sender) => {
+      /** Markdown 导入路径只存在于本次主进程调用，不进入 Renderer 或 manifest。 */
+      const owner = BrowserWindow.fromWebContents(sender)
+      const options: OpenDialogOptions = {
+        title: '导入创作资料',
+        properties: ['openFile'],
+        filters: [{ name: 'Markdown', extensions: ['md'] }],
+      }
+      const result = owner
+        ? await dialog.showOpenDialog(owner, options)
+        : await dialog.showOpenDialog(options)
+      return result.canceled ? null : result.filePaths[0] ?? null
     },
     pickRelinkImageFile: async (sender) => {
       /** 重新定位严格选择单文件，旧素材关系由素材服务保留。 */
