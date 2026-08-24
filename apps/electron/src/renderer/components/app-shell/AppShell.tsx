@@ -26,6 +26,7 @@ import { WindowControls } from '@/components/WindowControls'
 import { SettingsPanel } from '@/components/settings/SettingsPanel'
 import { detectIsWindows, WINDOW_CONTROLS_INSET_RIGHT } from '@/lib/platform'
 import { cn } from '@/lib/utils'
+import { getRightPanelMode } from './design-layout'
 
 const MIN_RIGHT_PANEL_WIDTH = 300
 const MAX_RIGHT_PANEL_WIDTH = 560
@@ -57,9 +58,20 @@ export function AppShell({ contextValue }: AppShellProps): React.ReactElement {
   const settingsOpen = useAtomValue(settingsOpenAtom)
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const isClassic = interfaceVariant === 'classic'
-  // 定时任务表单打开时隐藏右侧文件面板，让中间区域扩展到全宽（表单内含自己的右栏配置）
+  // 右栏模式同时覆盖会话文件和项目设计，设计视图不依赖当前会话。
   const activeView = useAtomValue(activeViewAtom)
-  const showRightPanel = appMode === 'agent' && !!currentSessionId && !automationForm.open && activeView !== 'planning' && activeView !== 'agent-skills'
+  /** 当前视图需要挂载的右栏类型。 */
+  const rightPanelMode = getRightPanelMode({
+    activeView,
+    appMode,
+    projectId: currentWorkspace?.id ?? null,
+    sessionId: currentSessionId,
+    automationOpen: automationForm.open,
+  })
+  /** 设计右栏默认展开，会话右栏继续尊重用户的开关。 */
+  const isRightPanelExpanded = rightPanelMode === 'design' || isPanelOpen
+  /** hidden 模式不挂载右栏，避免无效订阅和布局占位。 */
+  const showRightPanel = rightPanelMode !== 'hidden'
   const isWindows = React.useMemo(() => detectIsWindows(), [])
 
   // 左侧边栏可拖拽宽度
@@ -217,14 +229,14 @@ export function AppShell({ contextValue }: AppShellProps): React.ReactElement {
                   isClassic
                     ? 'transition-[padding] duration-300 ease-in-out'
                     : '',
-                  isClassic && (isPanelOpen ? 'p-2 pl-0' : 'p-0')
+                  isClassic && (isRightPanelExpanded ? 'p-2 pl-0' : 'p-0')
                 )}
               >
                 {!isClassic && (
                   <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 z-10 w-px bg-border/80 dark:bg-border/70" />
                 )}
                 {/* 拖拽手柄 */}
-                {isPanelOpen && (
+                {isRightPanelExpanded && (
                   <div
                     className={cn(
                       'absolute left-0 top-0 bottom-0 w-[8px] -translate-x-1/2 cursor-col-resize active:bg-primary/50 transition-colors',
@@ -233,7 +245,11 @@ export function AppShell({ contextValue }: AppShellProps): React.ReactElement {
                     onMouseDown={handleMouseDown}
                   />
                 )}
-                <RightSidePanel width={clampedRightPanelWidth} />
+                <RightSidePanel
+                  mode={rightPanelMode}
+                  projectId={currentWorkspace?.id ?? null}
+                  width={clampedRightPanelWidth}
+                />
               </div>
             )}
         </div>

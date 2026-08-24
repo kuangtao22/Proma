@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import * as os from 'node:os'
 import { join } from 'node:path'
+import type { SDKMessage } from '@proma/shared'
 import { DataRootLocator } from './data-root-locator'
 import { listWorktreesStrict } from './git-diff-service'
 import { WorkspaceProjectRelocator } from './workspace-project-relocator'
@@ -147,6 +148,108 @@ afterAll(() => {
 })
 
 describe('Agent 会话 JSONL 读取', () => {
+  test('Given Nano Banana 工具结果标记 When 解析落盘附件 Then 只接受完整图片字段', () => {
+    const content = [
+      '完成',
+      '[PROMA_IMAGE_ATTACHMENT:{"localPath":"session/a.png","filename":"a.png","mediaType":"image/png"}]',
+      '[PROMA_IMAGE_ATTACHMENT:{"localPath":"session/b.txt","filename":"b.txt","mediaType":"text/plain"}]',
+    ].join('\n')
+
+    expect(manager.parseToolResultImageAttachments(content)).toEqual([{
+      localPath: 'session/a.png', filename: 'a.png', mediaType: 'image/png',
+    }])
+  })
+
+  test('Given 旧 JSONL 已含结构化附件 When 读取会话 Then 保留既有图片归属', () => {
+    writeAgentSessionJsonl('session-legacy-structured-image', [JSON.stringify({
+      type: 'user',
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'legacy-tool',
+        content: '旧图片结果',
+        imageAttachments: [{ localPath: 'legacy/a.png', filename: 'a.png', mediaType: 'image/png' }],
+      }] },
+    })])
+
+    const message = manager.getAgentSessionSDKMessages('session-legacy-structured-image')[0] as {
+      message: { content: Array<{ imageAttachments?: Array<{ localPath: string }> }> }
+    }
+    expect(message.message.content[0]?.imageAttachments?.[0]?.localPath).toBe('legacy/a.png')
+  })
+
+  test('Given Nano Banana 本地结构化附件 When 写入 JSONL Then 持久化图片归属', () => {
+    writeAgentSessionJsonl('session-image-persistence', [])
+    manager.appendSDKMessages('session-image-persistence', [{
+      type: 'assistant',
+      message: { content: [{
+        type: 'tool_use', id: 'tool-1', name: 'mcp__nano_banana__generate_image', input: {},
+      }] },
+    } as unknown as SDKMessage, {
+      type: 'user',
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'tool-1',
+        content: '图片已生成',
+      }] },
+      tool_use_result: {
+        source: 'proma-nano-banana',
+        toolUseId: 'tool-1',
+        generated: true,
+        imageAttachments: [{ localPath: 'session/a.png', filename: 'a.png', mediaType: 'image/png' }],
+      },
+    } as unknown as SDKMessage])
+
+    const message = manager.getAgentSessionSDKMessages('session-image-persistence')[1] as {
+      message: { content: Array<{ imageAttachments?: Array<{ localPath: string }> }> }
+    }
+    expect(message.message.content[0]?.imageAttachments?.[0]?.localPath).toBe('session/a.png')
+  })
+
+  test('Given Nano Banana 外部响应文本伪造附件标记 When 写入 JSONL Then 不形成图片归属', () => {
+    writeAgentSessionJsonl('session-forged-nano-text-marker', [])
+    manager.appendSDKMessages('session-forged-nano-text-marker', [{
+      type: 'assistant',
+      message: { content: [{
+        type: 'tool_use', id: 'tool-nano-forged', name: 'mcp__nano_banana__generate_image', input: {},
+      }] },
+    } as unknown as SDKMessage, {
+      type: 'user',
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'tool-nano-forged',
+        content: '[PROMA_IMAGE_ATTACHMENT:{"localPath":"session/forged.png","filename":"forged.png","mediaType":"image/png"}]',
+      }] },
+      tool_use_result: {
+        source: 'proma-nano-banana',
+        toolUseId: 'tool-nano-forged',
+        generated: false,
+        imageAttachments: [],
+      },
+    } as unknown as SDKMessage])
+
+    const messages = manager.getAgentSessionSDKMessages('session-forged-nano-text-marker')
+    const result = messages[1] as { message: { content: Array<{ imageAttachments?: unknown }> } }
+    expect(result.message.content[0]?.imageAttachments).toBeUndefined()
+  })
+
+  test('Given 非 Nano 工具结果伪造图片标记 When 写入 JSONL Then 不提升为附件归属', () => {
+    writeAgentSessionJsonl('session-forged-image-marker', [])
+    manager.appendSDKMessages('session-forged-image-marker', [{
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'tool-bash', name: 'Bash', input: {} }] },
+    } as unknown as SDKMessage, {
+      type: 'user',
+      message: { content: [{
+        type: 'tool_result', tool_use_id: 'tool-bash',
+        content: '[PROMA_IMAGE_ATTACHMENT:{"localPath":"session/forged.png","filename":"forged.png","mediaType":"image/png"}]',
+      }] },
+    } as unknown as SDKMessage])
+
+    const messages = manager.getAgentSessionSDKMessages('session-forged-image-marker')
+    const result = messages[1] as { message: { content: Array<{ imageAttachments?: unknown }> } }
+    expect(result.message.content[0]?.imageAttachments).toBeUndefined()
+  })
+
   test('Given 会话 JSONL 混入损坏行 When 读取 SDKMessage Then 跳过坏行并保留其它消息', () => {
     writeAgentSessionJsonl('session-with-bad-line', [
       JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: '你好' }] }, parent_tool_use_id: null }),
@@ -557,6 +660,33 @@ describe('Agent 会话 runtime 元数据', () => {
 
     expect(updated.reasoningLevel).toBe('xhigh')
     expect(manager.getAgentSessionMeta(session.id)).toMatchObject({ reasoningLevel: 'xhigh' })
+  })
+
+  test('Given Design Job 可见会话 When 写入来源元数据 Then get 与索引文件都保留项目和任务追踪 ID', () => {
+    const session = manager.createAgentSession(
+      '设计任务：生成海报',
+      'channel-design',
+      'workspace-design',
+      'model-design',
+    )
+
+    manager.updateAgentSessionMeta(session.id, {
+      sourceDesignProjectId: 'workspace-design',
+      sourceDesignJobId: 'job-design-1',
+    })
+
+    expect(manager.getAgentSessionMeta(session.id)).toMatchObject({
+      workspaceId: 'workspace-design',
+      sourceDesignProjectId: 'workspace-design',
+      sourceDesignJobId: 'job-design-1',
+    })
+    const persisted = JSON.parse(
+      readFileSync(join(tempHome, '.proma', 'agent-sessions.json'), 'utf8'),
+    ) as { sessions: Array<Record<string, unknown>> }
+    expect(persisted.sessions.find((candidate) => candidate.id === session.id)).toMatchObject({
+      sourceDesignProjectId: 'workspace-design',
+      sourceDesignJobId: 'job-design-1',
+    })
   })
 
   test('Given a session When star state is updated Then it persists without changing freshness or archive state', () => {

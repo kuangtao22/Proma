@@ -8,6 +8,8 @@ export interface WorkspaceOperationRegistry {
   getWorkspaceOperationBlockReason: (workspaceId: string) => string | undefined
   /** 查询指定工作区当前持有的操作类型。 */
   getWorkspaceOperationKind: (workspaceId: string) => WorkspaceOperationKind | undefined
+  /** 获取工作区异步写 lease，迁移只能在全部 lease 释放后开始。 */
+  acquireWorkspaceWriteLease: (workspaceId: string) => () => void
 }
 
 /** 工作区锁在注册表中的内部持有记录。 */
@@ -37,11 +39,16 @@ function assertWorkspaceOperationKind(kind: WorkspaceOperationKind): void {
 export function createWorkspaceOperationRegistry(): WorkspaceOperationRegistry {
   /** 仅保存当前进程中正在执行的工作区操作。 */
   const entries = new Map<string, WorkspaceOperationEntry>()
+  /** 每个工作区尚未 settled 的异步写引用计数。 */
+  const writeLeaseCounts = new Map<string, number>()
 
   return {
     acquireWorkspaceOperation: (workspaceId, kind) => {
       assertWorkspaceId(workspaceId)
       assertWorkspaceOperationKind(kind)
+      if ((writeLeaseCounts.get(workspaceId) ?? 0) > 0) {
+        throw new Error('项目仍有 Design 写入正在进行，无法迁移')
+      }
       if (entries.has(workspaceId)) {
         throw new Error(WORKSPACE_RELOCATION_BLOCK_REASON)
       }
@@ -67,6 +74,19 @@ export function createWorkspaceOperationRegistry(): WorkspaceOperationRegistry {
       assertWorkspaceId(workspaceId)
       return entries.get(workspaceId)?.kind
     },
+    acquireWorkspaceWriteLease: (workspaceId) => {
+      assertWorkspaceId(workspaceId)
+      if (entries.has(workspaceId)) throw new Error(WORKSPACE_RELOCATION_BLOCK_REASON)
+      writeLeaseCounts.set(workspaceId, (writeLeaseCounts.get(workspaceId) ?? 0) + 1)
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        const remaining = (writeLeaseCounts.get(workspaceId) ?? 1) - 1
+        if (remaining <= 0) writeLeaseCounts.delete(workspaceId)
+        else writeLeaseCounts.set(workspaceId, remaining)
+      }
+    },
   }
 }
 
@@ -81,3 +101,6 @@ export const getWorkspaceOperationBlockReason = defaultRegistry.getWorkspaceOper
 
 /** 查询默认注册表中的当前操作类型。 */
 export const getWorkspaceOperationKind = defaultRegistry.getWorkspaceOperationKind
+
+/** 获取默认注册表的异步写 lease。 */
+export const acquireWorkspaceWriteLease = defaultRegistry.acquireWorkspaceWriteLease

@@ -58,6 +58,7 @@ import {
   agentStreamingStatesAtom,
   liveMessagesMapAtom,
   agentSessionPendingFilesAtom,
+  agentSessionPendingMentionsAtom,
   agentSessionStreamingStateAtomFamily,
   agentSessionViewStreamStateAtomFamily,
   agentSessionInputStreamStateAtomFamily,
@@ -65,6 +66,7 @@ import {
   agentSessionDraftAtomFamily,
   agentSessionDraftHtmlAtomFamily,
   agentPendingFilesAtomFamily,
+  agentPendingMentionsAtomFamily,
   backgroundTasksAtomFamily,
   sessionPersistedPermissionModeAtom,
   sessionExistsAtom,
@@ -886,6 +888,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
   const setStreamingStates = useSetAtom(agentStreamingStatesAtom)
   const setLiveMessagesMap = useSetAtom(liveMessagesMapAtom)
   const setSessionPendingFiles = useSetAtom(agentSessionPendingFilesAtom)
+  const setSessionPendingMentions = useSetAtom(agentSessionPendingMentionsAtom)
   const setSessionViewStateMap = useSetAtom(sessionViewStateMapAtom)
 
   /** 清理 per-conversation/session Map atoms 条目 */
@@ -938,6 +941,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     // 重型流式数据：streamingStates（累积 content + toolActivities）与 liveMessages（SDK 消息数组）
     setStreamingStates(deleteKey)
     setLiveMessagesMap(deleteKey)
+    setSessionPendingMentions(deleteKey)
 
     // 待发送附件：先释放 blob URL 和 window 缓存中的 base64，再删 base map entry。
     // 与文字草稿不同，附件涉及 ObjectURL 和大体积二进制数据，删除/归档时不保留。
@@ -959,13 +963,14 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     agentSessionDraftAtomFamily.remove(id)
     agentSessionDraftHtmlAtomFamily.remove(id)
     agentPendingFilesAtomFamily.remove(id)
+    agentPendingMentionsAtomFamily.remove(id)
     backgroundTasksAtomFamily.remove(id)
     agentSidePanelOpenAtomFamily.remove(id)
     sessionPersistedPermissionModeAtom.remove(id)
     sessionExistsAtom.remove(id)
 
     clearPreviewCacheForSession(id)
-  }, [setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles, setNonGitFileChanges, setFileChangesCurrentRun, setDiffData, setAgentSidePanelOpenMap, setSessionChannelMap, setSessionModelMap, setSessionPathMap, setSessionViewStateMap, setStreamingStates, setLiveMessagesMap, setSessionPendingFiles, store])
+  }, [setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles, setNonGitFileChanges, setFileChangesCurrentRun, setDiffData, setAgentSidePanelOpenMap, setSessionChannelMap, setSessionModelMap, setSessionPathMap, setSessionViewStateMap, setStreamingStates, setLiveMessagesMap, setSessionPendingFiles, setSessionPendingMentions, store])
 
   const currentWorkspaceSlug = React.useMemo(() => {
     if (!currentWorkspaceId) return null
@@ -1245,6 +1250,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
           for (const childId of childIds) {
             try {
               await window.electronAPI.deleteAgentSession(childId)
+              cleanupMapAtoms(childId)
             } catch (error) {
               console.error(`[侧边栏] 级联删除子会话失败 (${childId}):`, error)
               failedChildIds.push(childId)

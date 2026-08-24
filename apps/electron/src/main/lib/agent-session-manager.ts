@@ -33,7 +33,11 @@ import type {
   AgentSessionMeta,
   AgentMessage,
   SDKMessage,
+  SDKAssistantMessage,
   SDKUserMessage,
+  SDKToolResultBlock,
+  SDKToolUseBlock,
+  AgentToolResultImage,
   SkillActivation,
   AgentWorkspace,
   ForkSessionInput,
@@ -610,7 +614,9 @@ export function appendSDKMessages(id: string, messages: SDKMessage[]): void {
     // 一轮输出常见几十条消息，在多 Agent 并发下会持续阶段性阻塞主进程，
     // 进而延迟键盘事件的 IPC 转发（表现为 renderer 内无长任务但输入延迟高）。
     let payload = ''
-    for (const message of messages) {
+    /** 先在本批 SDK 序列内验证 tool_use 身份，再允许提升图片附件标记。 */
+    const messagesWithVerifiedImages = attachToolResultImages(messages)
+    for (const message of messagesWithVerifiedImages) {
       payload += serializeSDKMessageForStorage(message) + '\n'
     }
     appendFileSync(filePath, payload, 'utf-8')
@@ -700,7 +706,7 @@ export function getAgentSessionSDKMessages(id: string): SDKMessage[] {
  */
 export function updateAgentSessionMeta(
   id: string,
-  updates: Partial<Pick<AgentSessionMeta, 'title' | 'channelId' | 'modelId' | 'sdkSessionId' | 'piSessionFile' | 'piEntryBindings' | 'codexFastMode' | 'reasoningLevel' | 'openAIThinkingLevel' | 'workspaceId' | 'activeWorktree' | 'pinned' | 'starred' | 'archived' | 'attachedDirectories' | 'attachedFiles' | 'forkSourceDir' | 'stoppedByUser' | 'permissionMode' | 'completedButUnconfirmed' | 'sourceAutomationId' | 'automationGraduated' | 'parentSessionId' | 'rootSessionId' | 'sourceDelegationId' | 'delegationRole' | 'delegationStatus' | 'delegationDepth' | 'delegationGoal'>>,
+  updates: Partial<Pick<AgentSessionMeta, 'title' | 'channelId' | 'modelId' | 'sdkSessionId' | 'piSessionFile' | 'piEntryBindings' | 'codexFastMode' | 'reasoningLevel' | 'openAIThinkingLevel' | 'workspaceId' | 'activeWorktree' | 'pinned' | 'starred' | 'archived' | 'attachedDirectories' | 'attachedFiles' | 'forkSourceDir' | 'stoppedByUser' | 'permissionMode' | 'completedButUnconfirmed' | 'sourceAutomationId' | 'sourceDesignProjectId' | 'sourceDesignJobId' | 'automationGraduated' | 'parentSessionId' | 'rootSessionId' | 'sourceDelegationId' | 'delegationRole' | 'delegationStatus' | 'delegationDepth' | 'delegationGoal'>>,
 ): AgentSessionMeta {
   const index = readIndex()
   const idx = index.sessions.findIndex((s) => s.id === id)
@@ -1168,6 +1174,126 @@ function serializeSDKMessageForStorage(
     console.warn(`[Agent 会话] 消息截断后仍超限 (${(sanitized.length / 1024).toFixed(0)}K chars)`)
   }
   return sanitized
+}
+
+/** 旧版 Nano Banana MCP 写入工具文本的附件标记，仅供显式 legacy 兼容解析。 */
+const AGENT_IMAGE_ATTACHMENT_PATTERN = /\[PROMA_IMAGE_ATTACHMENT:(\{[^\r\n]*?\})\]/g
+
+/** 解析旧文本标记；新消息授权禁止调用该函数，必须使用本地结构化详情。 */
+export function parseToolResultImageAttachments(content: unknown): AgentToolResultImage[] {
+  /** 工具结果可能是字符串，也可能是 SDK 文本块数组。 */
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.map((item) => (
+          item && typeof item === 'object' && 'text' in item && typeof item.text === 'string'
+            ? item.text
+            : ''
+        )).join('\n')
+      : ''
+  /** 每次调用创建独立正则，避免全局 lastIndex 污染后续消息。 */
+  const pattern = new RegExp(AGENT_IMAGE_ATTACHMENT_PATTERN.source, 'g')
+  const images: AgentToolResultImage[] = []
+  for (const match of text.matchAll(pattern)) {
+    try {
+      /** JSON 字段由本地主进程 MCP 生成，仍需在进入授权证据前逐字段验证。 */
+      const value = JSON.parse(match[1]!) as Record<string, unknown>
+      if (
+        typeof value.localPath === 'string'
+        && typeof value.filename === 'string'
+        && typeof value.mediaType === 'string'
+        && value.mediaType.startsWith('image/')
+      ) {
+        images.push({
+          localPath: value.localPath,
+          filename: value.filename,
+          mediaType: value.mediaType,
+        })
+      }
+    } catch {
+      // 损坏标记保留在原始结果文本中，但不能成为文件授权证据。
+    }
+  }
+  return images
+}
+
+/** 从 Nano Banana 本地工具详情读取与当前 tool_use 精确绑定的图片附件。 */
+function parseNanoBananaResultAttachments(details: unknown, toolUseId: string): AgentToolResultImage[] {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return []
+  const value = details as Record<string, unknown>
+  if (
+    value.source !== 'proma-nano-banana'
+    || value.toolUseId !== toolUseId
+    || !Array.isArray(value.imageAttachments)
+  ) return []
+
+  const images: AgentToolResultImage[] = []
+  for (const candidate of value.imageAttachments) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+    const image = candidate as Record<string, unknown>
+    if (
+      typeof image.localPath === 'string'
+      && typeof image.filename === 'string'
+      && typeof image.mediaType === 'string'
+      && image.mediaType.startsWith('image/')
+    ) {
+      images.push({
+        localPath: image.localPath,
+        filename: image.filename,
+        mediaType: image.mediaType,
+      })
+    }
+  }
+  return images
+}
+
+/** 仅把同批序列中已由 Nano Banana tool_use 证明的结果标记提升为附件。 */
+function attachToolResultImages(messages: SDKMessage[]): SDKMessage[] {
+  /** 只记录已经出现在当前结果之前的工具调用，拒绝跨批或逆序伪造关联。 */
+  const toolNames = new Map<string, string>()
+  return messages.map((message) => {
+    if (message.type === 'assistant') {
+      const content = (message as SDKAssistantMessage).message?.content
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'tool_use') {
+            const toolUse = block as SDKToolUseBlock
+            toolNames.set(toolUse.id, toolUse.name)
+          }
+        }
+      }
+      return message
+    }
+    if (message.type !== 'user') return message
+    /** SDK user content 之外的消息结构保持原引用，减少正常消息落盘开销。 */
+    const userMessage = message as SDKUserMessage
+    const content = userMessage.message?.content
+    if (!Array.isArray(content)) return message
+    let changed = false
+    const nextContent = content.map((block) => {
+      if (block.type !== 'tool_result') return block
+      const result = block as SDKToolResultBlock
+      /** 非 Nano 结果即使自带字段或文本标记，也不能成为本地文件授权证据。 */
+      const verifiedNanoTool = toolNames.get(result.tool_use_id) === 'mcp__nano_banana__generate_image'
+      const imageAttachments = verifiedNanoTool
+        ? parseNanoBananaResultAttachments(userMessage.tool_use_result, result.tool_use_id)
+        : []
+      if (imageAttachments.length > 0) {
+        changed = true
+        return { ...result, imageAttachments }
+      }
+      if (!result.imageAttachments) return block
+      const sanitizedResult = { ...result }
+      delete sanitizedResult.imageAttachments
+      changed = true
+      return sanitizedResult
+    })
+    if (!changed) return message
+    return {
+      ...message,
+      message: { ...(message as SDKUserMessage).message, content: nextContent },
+    } as SDKMessage
+  })
 }
 
 async function writeJsonlLine(stream: WriteStream, line: string): Promise<void> {

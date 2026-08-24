@@ -2,8 +2,28 @@ import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
+import { acquireWorkspaceOperation, getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 
 describe('工作区写操作守卫', () => {
+  test('Given 异步 Design 写尚未 settled When 获取迁移锁 Then 完成前拒绝且完成后释放 lease', async () => {
+    /** 控制异步写完成时机的 deferred Promise。 */
+    let finishWrite: (() => void) | undefined
+    const guard = createWorkspaceOperationGuard({
+      getWorkspaceIdBySessionId: () => undefined,
+      getWorkspaceIdBySlug: () => undefined,
+      getWorkspaceOperationBlockReason,
+    })
+    const running = guard.runWorkspaceWrite('workspace-design-async', async () => {
+      await new Promise<void>((resolve) => { finishWrite = resolve })
+    })
+
+    expect(() => acquireWorkspaceOperation('workspace-design-async', 'relocation'))
+      .toThrow('项目仍有 Design 写入正在进行，无法迁移')
+    finishWrite?.()
+    await running
+    const releaseRelocation = acquireWorkspaceOperation('workspace-design-async', 'relocation')
+    releaseRelocation()
+  })
   test('Given 会话或 slug 指向迁移中的项目 When 检查写操作 Then 在后续副作用前返回固定错误', () => {
     /** 记录守卫依赖与后续副作用的调用顺序。 */
     const calls: string[] = []

@@ -197,6 +197,8 @@ export interface SDKToolResultBlock {
   tool_use_id: string
   content?: unknown
   is_error?: boolean
+  /** MCP 工具结果落盘后的本地图片引用，不包含图片二进制。 */
+  imageAttachments?: AgentToolResultImage[]
 }
 
 /** SDK user 消息内容块联合类型 */
@@ -641,7 +643,7 @@ export type PromaEvent =
   | { type: 'automation_graduated' }
 
 /** 外部入口触发 Agent 运行的来源 */
-export type AgentExternalRunSource = 'feishu' | 'dingtalk' | 'wechat' | 'bridge' | 'delegation'
+export type AgentExternalRunSource = 'feishu' | 'dingtalk' | 'wechat' | 'bridge' | 'delegation' | 'design'
 
 /** Pi AssistantMessageEvent 的可序列化增量；不携带累计 partial，避免跨进程复制整段输出。 */
 export type AgentAssistantDelta =
@@ -779,6 +781,10 @@ export interface AgentSessionMeta {
   permissionMode?: PromaPermissionMode
   /** 来源定时任务 ID（该会话由定时任务自动创建/复用时标记，用于侧栏显示钟表图标 + 跳转设置） */
   sourceAutomationId?: string
+  /** 来源设计项目 ID；仅 Design Job 可见会话设置。 */
+  sourceDesignProjectId?: string
+  /** 来源设计任务 ID；用于从会话追溯画布占位节点。 */
+  sourceDesignJobId?: string
   /**
    * 自动任务会话是否已被用户手动接管而"毕业"：true 时该会话回到普通项目会话列表，
    * 且调度器不再复用它注入新的定时运行（避免污染用户已接管的会话）。默认 undefined/false。

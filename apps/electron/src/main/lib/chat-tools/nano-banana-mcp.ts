@@ -13,7 +13,10 @@ import { getToolState, getToolCredentials } from '../chat-tool-config'
 import { Type } from 'typebox'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
+import type { AgentToolResultImage, ImageGenerationModelSnapshot } from '@proma/shared'
 import { saveAttachment, isImageAttachment } from '../attachment-service'
+import type { ResolveImageGenerationRoute } from '../image-generation-runtime'
+import { executeOpenAIImages } from './openai-images-executor'
 
 // ===== Gemini API 类型（REST API 使用 camelCase） =====
 
@@ -58,6 +61,8 @@ const sessionHistory = new Map<string, GeminiContent[]>()
 
 const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com'
 const DEFAULT_MODEL = 'gemini-3.1-flash-image-preview'
+/** Design 可信路由缺少主进程实时解析时使用的稳定拒绝原因。 */
+const MISSING_TRUSTED_ROUTE_RESOLVER_ERROR = '设计任务缺少可信生图模型实时解析，已拒绝执行'
 
 // ===== MCP 内容块类型 =====
 
@@ -78,7 +83,17 @@ type McpContent = McpTextContent | McpImageContent
 
 interface McpToolResult {
   content: McpContent[]
+  /** 仅由本地主进程保存流程产生，不从 Gemini 文本反解析。 */
+  imageAttachments?: AgentToolResultImage[]
   [key: string]: unknown
+}
+
+/** Pi transcript 中用于证明 Nano Banana 本地附件来源的结构化详情。 */
+interface NanoBananaToolResultDetails {
+  source: 'proma-nano-banana'
+  toolUseId: string
+  generated: boolean
+  imageAttachments: AgentToolResultImage[]
 }
 
 // ===== Gemini API 调用 =====
@@ -205,11 +220,23 @@ function buildGeminiRequest(
 async function callGeminiAndBuildResult(
   prompt: string,
   sessionId: string,
-  options: { aspectRatio?: string; imageSize?: string; referenceImagePaths?: string[]; cwd?: string; allowedRoots?: string[]; numberOfImages?: number },
+  options: {
+    aspectRatio?: string
+    imageSize?: string
+    referenceImagePaths?: string[]
+    cwd?: string
+    allowedRoots?: string[]
+    numberOfImages?: number
+    trustedImageRoute?: ImageGenerationModelSnapshot
+  },
+  signal?: AbortSignal,
 ): Promise<McpToolResult> {
+  signal?.throwIfAborted()
   const credentials = getToolCredentials('nano-banana')
+  if (!credentials.apiKey?.trim()) throw new Error('Nano Banana API Key 未配置: nano-banana')
   const baseUrl = credentials.baseUrl?.trim() || DEFAULT_BASE_URL
-  const model = credentials.model?.trim() || DEFAULT_MODEL
+  const model = options.trustedImageRoute?.modelId
+    ?? (credentials.model?.trim() || DEFAULT_MODEL)
 
   // 获取会话历史
   const history = sessionHistory.get(sessionId) ?? []
@@ -218,6 +245,7 @@ async function callGeminiAndBuildResult(
   const referenceImageParts = options.referenceImagePaths?.length
     ? readReferenceImages(options.referenceImagePaths, options.cwd, options.allowedRoots)
     : []
+  signal?.throwIfAborted()
   if (referenceImageParts.length > 0) {
     console.log(`[Nano Banana MCP] 加载了 ${referenceImageParts.length} 张参考图`)
   }
@@ -236,7 +264,9 @@ async function callGeminiAndBuildResult(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(requestBody),
+    signal,
   })
+  signal?.throwIfAborted()
 
   if (!response.ok) {
     const errorText = await response.text()
@@ -247,6 +277,7 @@ async function callGeminiAndBuildResult(
   }
 
   const data = (await response.json()) as GeminiResponse
+  signal?.throwIfAborted()
 
   if (data.error) {
     return {
@@ -268,9 +299,11 @@ async function callGeminiAndBuildResult(
   const mcpContent: McpContent[] = []
   const textParts: string[] = []
   const savedWorkspacePaths: string[] = []
+  const imageAttachments: AgentToolResultImage[] = []
 
   // 解析响应：提取图片和文本（跳过 thought parts，它们是推理过程图，不作为输出）
   for (const part of parts) {
+    signal?.throwIfAborted()
     if (part.thought) continue
     if (part.inlineData) {
       // 保存图片到附件目录（供 UI 渲染）
@@ -303,13 +336,12 @@ async function callGeminiAndBuildResult(
         mimeType: part.inlineData.mimeType,
       })
 
-      // 嵌入附件标记（供前端 UI 解析渲染）
-      const attachmentMeta = JSON.stringify({
+      /** 本地保存结果走结构化通道，Gemini 返回文本无法伪造该字段。 */
+      imageAttachments.push({
         localPath: result.attachment.localPath,
         filename: result.attachment.filename,
         mediaType: result.attachment.mediaType,
       })
-      textParts.push(`[PROMA_IMAGE_ATTACHMENT:${attachmentMeta}]`)
     } else if (part.text) {
       textParts.push(part.text)
     }
@@ -319,6 +351,7 @@ async function callGeminiAndBuildResult(
   const userContent: GeminiContent = { role: 'user', parts: [...referenceImageParts, { text: prompt }] }
   const modelContent: GeminiContent = { role: 'model', parts }
   const updatedHistory = [...history, userContent, modelContent]
+  signal?.throwIfAborted()
   sessionHistory.set(sessionId, updatedHistory)
 
   // 在图片内容块之后追加文本摘要
@@ -332,7 +365,7 @@ async function callGeminiAndBuildResult(
 
   mcpContent.push({ type: 'text' as const, text: summaryText })
 
-  return { content: mcpContent }
+  return { content: mcpContent, imageAttachments }
 }
 
 // ===== Pi 工具注入 =====
@@ -343,19 +376,28 @@ export interface PiNanoBananaToolsContext {
   sessionId: string
   agentCwd?: string
   allowedRoots?: string[]
+  /** Design Job 固化的可信模型，优先级高于全局凭据模型。 */
+  trustedImageRoute?: ImageGenerationModelSnapshot
+  /** 每次图片工具执行前实时解析可信模型与主进程凭据。 */
+  resolveTrustedImageRoute?: ResolveImageGenerationRoute
 }
 
-function toPiToolResult(result: McpToolResult): AgentToolResult<unknown> {
-  // 图片已在生成时保存为 Proma attachment，并在文本里携带渲染标记。Pi 的普通 tool
-  // result 保持文本形态即可：避免把 Gemini base64 图片重复写入 Pi transcript。
+function toPiToolResult(result: McpToolResult, toolUseId: string): AgentToolResult<NanoBananaToolResultDetails> {
+  // 图片已在生成时保存为 Proma attachment。Pi 的普通 tool result 保持文本形态，
+  // 本地附件通过 details 单独传递，避免把 Gemini base64 图片重复写入 transcript。
   const text = result.content
     .filter((item): item is McpTextContent => item.type === 'text')
     .map((item) => item.text)
     .join('\n')
   return {
     content: [{ type: 'text', text: text || '图片已生成。' }],
-    details: { generated: result.content.some((item) => item.type === 'image') },
-  } as AgentToolResult<unknown>
+    details: {
+      source: 'proma-nano-banana',
+      toolUseId,
+      generated: (result.imageAttachments?.length ?? 0) > 0,
+      imageAttachments: result.imageAttachments ?? [],
+    },
+  }
 }
 
 /**
@@ -366,9 +408,11 @@ export function buildPiNanoBananaTools(
   sdk: PiSdk,
   ctx: PiNanoBananaToolsContext,
 ): ToolDefinition[] {
-  const toolState = getToolState('nano-banana')
-  const credentials = getToolCredentials('nano-banana')
-  if (!toolState.enabled || !credentials.apiKey) return []
+  if (!ctx.trustedImageRoute) {
+    const toolState = getToolState('nano-banana')
+    const credentials = getToolCredentials('nano-banana')
+    if (!toolState.enabled || !credentials.apiKey) return []
+  }
 
   return [sdk.defineTool({
     name: 'mcp__nano_banana__generate_image',
@@ -382,20 +426,47 @@ export function buildPiNanoBananaTools(
       imageSize: Type.Optional(Type.Union([Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K')])),
       numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
     }),
-    async execute(_toolCallId, args) {
+    async execute(toolCallId, args, signal) {
       try {
-        const result = await callGeminiAndBuildResult(String(args.prompt), ctx.sessionId, {
-          aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
-          imageSize: typeof args.imageSize === 'string' ? args.imageSize : undefined,
-          referenceImagePaths: Array.isArray(args.referenceImagePaths)
-            ? args.referenceImagePaths.filter((path): path is string => typeof path === 'string')
-            : undefined,
-          cwd: ctx.agentCwd,
-          allowedRoots: ctx.allowedRoots,
-          numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
-        })
-        return toPiToolResult(result)
+        /** 可信路由解析必须早于历史、文件或网络副作用。 */
+        const resolvedRoute = ctx.trustedImageRoute
+          ? ctx.resolveTrustedImageRoute?.(ctx.trustedImageRoute)
+          : undefined
+        if (ctx.trustedImageRoute && !resolvedRoute) throw new Error(MISSING_TRUSTED_ROUTE_RESOLVER_ERROR)
+        const referenceImagePaths = Array.isArray(args.referenceImagePaths)
+          ? args.referenceImagePaths.filter((path): path is string => typeof path === 'string')
+          : undefined
+        const result: McpToolResult = resolvedRoute?.executor === 'openai-images'
+          ? {
+              content: [{ type: 'text', text: referenceImagePaths && referenceImagePaths.length > 1
+                ? '图片已生成。当前协议使用第一张参考图。'
+                : '图片已生成。' }],
+              imageAttachments: (await executeOpenAIImages({
+                route: resolvedRoute,
+                sessionId: ctx.sessionId,
+                prompt: String(args.prompt),
+                referenceImagePaths,
+                cwd: ctx.agentCwd,
+                allowedRoots: ctx.allowedRoots,
+                aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
+                imageSize: typeof args.imageSize === 'string' ? args.imageSize : undefined,
+                numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
+                signal,
+              })).imageAttachments,
+            }
+          : await callGeminiAndBuildResult(String(args.prompt), ctx.sessionId, {
+              aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
+              imageSize: typeof args.imageSize === 'string' ? args.imageSize : undefined,
+              referenceImagePaths,
+              cwd: ctx.agentCwd,
+              allowedRoots: ctx.allowedRoots,
+              numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
+              trustedImageRoute: ctx.trustedImageRoute,
+            }, signal)
+        return toPiToolResult(result, toolCallId)
       } catch (error) {
+        if (signal?.aborted) signal.throwIfAborted()
+        if (error instanceof Error && error.name === 'AbortError') throw error
         const message = error instanceof Error ? error.message : String(error)
         console.error('[Nano Banana Pi 工具] 执行失败:', error)
         return {

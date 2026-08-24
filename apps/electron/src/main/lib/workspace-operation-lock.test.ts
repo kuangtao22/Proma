@@ -164,4 +164,19 @@ describe('工作区进程内独占锁', () => {
     const release = registry.acquireWorkspaceOperation('workspace-unknown', 'relocation')
     release()
   })
+
+  test('Given 工作区有两个异步写 lease When 获取迁移锁 Then 直到全部释放前拒绝迁移', () => {
+    const registry = createWorkspaceOperationRegistry()
+    const releaseFirst = registry.acquireWorkspaceWriteLease('workspace-design')
+    const releaseSecond = registry.acquireWorkspaceWriteLease('workspace-design')
+
+    expect(() => registry.acquireWorkspaceOperation('workspace-design', 'relocation'))
+      .toThrow('项目仍有 Design 写入正在进行，无法迁移')
+    releaseFirst()
+    expect(() => registry.acquireWorkspaceOperation('workspace-design', 'relocation'))
+      .toThrow('项目仍有 Design 写入正在进行，无法迁移')
+    releaseSecond()
+    const releaseRelocation = registry.acquireWorkspaceOperation('workspace-design', 'relocation')
+    releaseRelocation()
+  })
 })

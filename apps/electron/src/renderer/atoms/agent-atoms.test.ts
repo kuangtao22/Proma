@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import { createStore } from 'jotai/vanilla'
+import type { FilePanelDragItem } from '@/lib/file-panel-drag'
 import {
+  agentAckPendingMentionsAtom,
+  agentPendingMentionsAtomFamily,
   agentSessionInputStreamStateAtomFamily,
+  agentSessionPendingMentionsAtom,
   agentSessionStreamingStateAtomFamily,
   agentStreamingStatesAtom,
   applyAgentEvent,
@@ -9,6 +13,50 @@ import {
   isRetryEventForCurrentStream,
   type AgentStreamState,
 } from './agent-atoms'
+
+describe('Agent 会话待插入引用队列', () => {
+  test('Given 两个会话各有待插入引用 When 成功后确认其中一个 Then 不串线且同一引用只确认一次', () => {
+    const store = createStore()
+    /** 会话 A 等待插入的项目素材引用。 */
+    const sessionAMention = {
+      path: '/project-a/.proma/design/assets/a.png',
+      name: 'a.png',
+      isDirectory: false,
+      scope: 'project' as const,
+    }
+    /** 会话 B 等待插入的项目素材引用。 */
+    const sessionBMention = {
+      path: '/project-b/.proma/design/assets/b.png',
+      name: 'b.png',
+      isDirectory: false,
+      scope: 'project' as const,
+    }
+
+    store.set(agentPendingMentionsAtomFamily('session-a'), [sessionAMention])
+    store.set(agentPendingMentionsAtomFamily('session-b'), [sessionBMention])
+
+    /** AgentView 本次尝试插入的稳定队列引用。 */
+    const pendingSessionA = store.get(agentPendingMentionsAtomFamily('session-a'))
+
+    expect(store.set(agentAckPendingMentionsAtom, { sessionId: 'session-a', items: pendingSessionA })).toBe(true)
+    expect(store.set(agentAckPendingMentionsAtom, { sessionId: 'session-a', items: pendingSessionA })).toBe(false)
+    expect(store.get(agentSessionPendingMentionsAtom)).toEqual(new Map([
+      ['session-b', [sessionBMention]],
+    ]))
+  })
+
+  test('Given 插入使用的不是当前队列引用 When 请求确认 Then 保留队列', () => {
+    const store = createStore()
+    /** 当前会话真实等待插入的引用。 */
+    const pending: FilePanelDragItem[] = [{
+      path: '/project/a.png', name: 'a.png', isDirectory: false, scope: 'project',
+    }]
+    store.set(agentPendingMentionsAtomFamily('session-a'), pending)
+
+    expect(store.set(agentAckPendingMentionsAtom, { sessionId: 'session-a', items: [...pending] })).toBe(false)
+    expect(store.get(agentPendingMentionsAtomFamily('session-a'))).toBe(pending)
+  })
+})
 
 function createStreamState(overrides: Partial<AgentStreamState> = {}): AgentStreamState {
   return {

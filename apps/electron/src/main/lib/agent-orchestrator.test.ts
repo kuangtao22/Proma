@@ -62,6 +62,19 @@ describe('Agent 工作区迁移准入', () => {
 })
 
 describe('Agent sendMessage 准入顺序合同', () => {
+  test('Given 单次运行注入可信生图路由 When 构建 Pi 工具 Then 仅经运行扩展传入内置工具上下文', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    const sendStart = source.indexOf('  async sendMessage(')
+    const sendEnd = source.indexOf('\n  /**\n   * 中止指定会话', sendStart)
+    const body = source.slice(sendStart, sendEnd)
+
+    expect(body).toContain('extensions: AgentRunExtensions = {}')
+    expect(body).toContain('trustedImageRoute: extensions.trustedImageRoute')
+    expect(body).toContain('resolveTrustedImageRoute: extensions.resolveTrustedImageRoute')
+    expect(body).toContain('createRunToolCallLimiter(extensions.toolCallLimits)')
+    expect(body).toContain('consumeRunToolCallLimit(toolName)')
+  })
+
   test('Given sendMessage 实现 When 检查迁移拒绝分支 Then 它早于 active、retry 删除、消息落盘和首次 await', () => {
     /** 读取实际 orchestrator 源码以约束不可注入的副作用顺序。 */
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')

@@ -1,3 +1,5 @@
+@import '@xyflow/react/dist/style.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -2443,4 +2445,31 @@
   0% { opacity: 1; transform: translateY(0); }
   55% { opacity: 0.72; transform: translateY(2px); }
   100% { opacity: 0; transform: translateY(5px); }
+}
+
+/* ===== Design XYFlow 画布 =====
+ * 全部颜色复用 Proma 主题语义变量，确保内置主题和用户主题都能自然适配。
+ */
+.design-canvas .react-flow {
+  --xy-background-color: hsl(var(--content-area));
+  --xy-background-pattern-dots-color: hsl(var(--border));
+  --xy-selection-background-color: hsl(var(--primary) / 0.08);
+  --xy-selection-border: 1px dotted hsl(var(--primary) / 0.75);
+  --xy-controls-button-background-color: hsl(var(--background) / 0.96);
+  --xy-controls-button-background-color-hover: hsl(var(--accent));
+  --xy-controls-button-color: hsl(var(--foreground));
+  --xy-controls-button-color-hover: hsl(var(--accent-foreground));
+  --xy-controls-button-border-color: hsl(var(--border));
+  --xy-controls-box-shadow: var(--shadow-sm);
+}
+
+.design-canvas .react-flow__controls {
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+}
+
+.design-canvas .react-flow__controls-button:focus-visible {
+  outline: 2px solid hsl(var(--ring) / 0.45);
+  outline-offset: -2px;
 }

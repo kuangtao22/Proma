@@ -194,11 +194,39 @@ function WebSearchSettings(): React.ReactElement {
   )
 }
 
+/** 生成 Nano Banana 凭据更新，并保留普通会话使用的旧模型。 */
+export function createNanoBananaCredentialsUpdate(
+  apiKey: string,
+  baseUrl: string,
+  savedCredentials: { apiKey: string; baseUrl: string; model: string },
+): { apiKey: string; baseUrl: string; model: string } {
+  return {
+    apiKey: apiKey.trim(),
+    baseUrl: baseUrl.trim(),
+    model: savedCredentials.model,
+  }
+}
+
+interface PersistNanoBananaCredentialsDependencies {
+  /** 把完整凭据交给主进程持久化。 */
+  updateCredentials: (credentials: { apiKey: string; baseUrl: string; model: string }) => Promise<void>
+  /** 凭据变化后刷新全局工具可用状态。 */
+  refreshChatTools: () => Promise<void>
+}
+
+/** 按持久化、工具刷新的顺序提交凭据；模型目录由主进程统一广播。 */
+export async function persistNanoBananaCredentialsUpdate(
+  credentials: { apiKey: string; baseUrl: string; model: string },
+  dependencies: PersistNanoBananaCredentialsDependencies,
+): Promise<void> {
+  await dependencies.updateCredentials(credentials)
+  await dependencies.refreshChatTools()
+}
+
 /** Nano Banana 生图工具设置区域 */
 function NanoBananaSettings(): React.ReactElement {
   const [apiKey, setApiKey] = React.useState('')
   const [baseUrl, setBaseUrl] = React.useState('')
-  const [model, setModel] = React.useState('')
   const [showApiKey, setShowApiKey] = React.useState(false)
   const [enabled, setEnabled] = React.useState(false)
   const [loading, setLoading] = React.useState(true)
@@ -217,7 +245,6 @@ function NanoBananaSettings(): React.ReactElement {
       if (tool) setEnabled(tool.enabled)
       if (credentials.apiKey) setApiKey(credentials.apiKey)
       if (credentials.baseUrl) setBaseUrl(credentials.baseUrl)
-      if (credentials.model) setModel(credentials.model)
       savedCredentialsRef.current = {
         apiKey: credentials.apiKey || '',
         baseUrl: credentials.baseUrl || '',
@@ -232,18 +259,20 @@ function NanoBananaSettings(): React.ReactElement {
 
   /** 静默保存凭据（blur 时触发） */
   const handleBlurSave = React.useCallback(async (): Promise<void> => {
-    const current = { apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim() }
+    const current = createNanoBananaCredentialsUpdate(apiKey, baseUrl, savedCredentialsRef.current)
     const saved = savedCredentialsRef.current
     if (current.apiKey === saved.apiKey && current.baseUrl === saved.baseUrl && current.model === saved.model) return
     try {
-      await window.electronAPI.updateChatToolCredentials('nano-banana', current)
+      await persistNanoBananaCredentialsUpdate(current, {
+        updateCredentials: (credentials) => window.electronAPI.updateChatToolCredentials('nano-banana', credentials),
+        refreshChatTools: () => refreshChatTools(setChatTools),
+      })
       savedCredentialsRef.current = current
-      await refreshChatTools(setChatTools)
       toast.success('Nano Banana 设置已保存')
     } catch (error) {
       console.error('[Nano Banana 设置] 保存失败:', error)
     }
-  }, [apiKey, baseUrl, model, setChatTools])
+  }, [apiKey, baseUrl, setChatTools])
 
   const handleToggle = async (checked: boolean): Promise<void> => {
     try {
@@ -257,13 +286,15 @@ function NanoBananaSettings(): React.ReactElement {
 
   const handleTest = async (): Promise<void> => {
     // 先保存可能的变更
-    const current = { apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim() }
+    const current = createNanoBananaCredentialsUpdate(apiKey, baseUrl, savedCredentialsRef.current)
     const saved = savedCredentialsRef.current
     if (current.apiKey !== saved.apiKey || current.baseUrl !== saved.baseUrl || current.model !== saved.model) {
       try {
-        await window.electronAPI.updateChatToolCredentials('nano-banana', current)
+        await persistNanoBananaCredentialsUpdate(current, {
+          updateCredentials: (credentials) => window.electronAPI.updateChatToolCredentials('nano-banana', credentials),
+          refreshChatTools: () => refreshChatTools(setChatTools),
+        })
         savedCredentialsRef.current = current
-        await refreshChatTools(setChatTools)
       } catch (error) {
         console.error('[Nano Banana 设置] 保存失败:', error)
       }
@@ -316,7 +347,8 @@ function NanoBananaSettings(): React.ReactElement {
                 </a>
                 {' '}获取 Gemini API Key
               </li>
-              <li>将 API Key 填入下方，可选修改 API 地址和模型</li>
+              <li>将 API Key 填入下方，可选修改 API 地址</li>
+              <li>在下方生图模型列表中配置 Design 使用的模型</li>
               <li>开启开关即可在对话中使用生图能力</li>
             </ol>
           </div>
@@ -363,18 +395,6 @@ function NanoBananaSettings(): React.ReactElement {
               onBlur={handleBlurSave}
             />
             <p className="text-xs text-muted-foreground">留空则使用 Gemini 官方地址</p>
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">模型</label>
-            <Input
-              type="text"
-              placeholder="gemini-3.1-flash-image-preview"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              onBlur={handleBlurSave}
-            />
-            <p className="text-xs text-muted-foreground">留空则使用默认模型 gemini-3.1-flash-image-preview</p>
           </div>
 
           {testResult && (

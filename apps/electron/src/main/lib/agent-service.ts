@@ -14,7 +14,6 @@ import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:p
 import { accessSync, constants, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { BrowserWindow } from 'electron'
 import type { WebContents } from 'electron'
-import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { AGENT_IPC_CHANNELS, MAX_ATTACHMENT_SIZE } from '@proma/shared'
 import type {
   AgentSendInput,
@@ -47,6 +46,10 @@ import { AgentQueueCoordinator } from './agent-queue-coordinator'
 import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 import { runAgentServiceTerminalEffects } from './agent-run-lifecycle'
+import type { AgentRunExtensions } from './agent-run-extensions'
+
+/** 保持现有主进程调用方从 agent-service 导入运行扩展类型的兼容性。 */
+export type { AgentRunExtensions } from './agent-run-extensions'
 
 // ===== 实例创建 =====
 
@@ -226,11 +229,6 @@ export function setVisibleAgentSession(webContents: WebContents, sessionId: stri
 }
 
 // ===== IPC 薄包装函数 =====
-
-/** 仅主进程内部使用的单次运行扩展，绝不经 IPC 序列化。 */
-export interface AgentRunExtensions {
-  piCustomTools?: ToolDefinition[]
-}
 
 /**
  * 运行 Agent 并流式推送事件到渲染进程

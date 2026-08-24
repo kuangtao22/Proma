@@ -50,6 +50,20 @@
 - 项目文件迁移复用 verified copier，并以活动数据根内的可恢复 journal 驱动 `会话路径 -> 工作区配置 -> projectRootPath` 三步幂等提交；复制、校验和提交失败均不删除源目录。
 - 项目迁移准入同时覆盖 Agent in-flight generation、自动标题等 generation-owned 写入、Automation、active/linked worktree 与受守卫 IPC；旧 Agent 代际通过唯一 query token 精确关闭，不会误停同会话的新运行。
 - 项目目录选择使用按窗口、用途和代次隔离的一次性 `selectionId`；重启遗留的 copying/verifying/failed journal 只能按已持久化 operation 继续或显式放弃，renderer 不可直接指定任意目标路径。
+- 设计素材与 Agent 会话双向传递以项目归属和当前会话持久化消息为唯一授权事实：设计素材只填入目标会话 composer、不自动发送；Agent 图片只接受该 session 的 `tool_result.imageAttachments.localPath` 精确匹配，并继续执行 realpath、允许根和图片签名校验，禁止扫描目录。新版 SDK JSONL 在主进程落盘时从 Nano Banana 本地标记结构化附件字段，旧 `AgentMessage.events` 保持兼容。
+- Design 到 Agent composer 的跨视图文件引用使用按 `sessionId` 隔离的 Renderer 内存 Jotai 一次性队列：生产者先入队再导航，AgentView 仅在 editor 明确插入成功后确认清理并提示，失败时保留队列；富文本模式插入 mention 节点，默认纯文本或 mention 扩展缺失时复用可发送的 `@file:` 协议。归档或删除时清理队列，禁止用可能早于监听器挂载的 window 事件传递。禁用的会话菜单按钮保持原生 disabled，并由可聚焦包装元素提供原因提示。
+- Design 权威 `LOAD` 从 tmp/backup 提升恢复后必须广播 `cause: recovery`，让其它已打开窗口同步接管新 revision；启动清理只删除无当前 runtime promotion journal 引用的 `import-*`/`relink-*` staging，正式 assets 永不参与兜底清理。
+- Design 的 `cause: recovery` 表示原 revision 序列已失去磁盘依据，Renderer 必须立即阻断旧基线写入并强制 LOAD，且无条件接管可能更低的恢复 revision；位置类 pending 可在恢复基线上重放但保持手动重试阻断，结构 pending 只能保留为显式远端冲突，历史、选区和 Inspector 状态全部清理。普通 canvas/asset/job 事件继续遵守 revision 单调规则。
+- Design Renderer 在 400ms 自动保存边界压缩 viewport mutation，只保留最后一个 `set-viewport` 且保持其它 mutation 顺序；macOS 沙箱内执行 Electron 完整构建时，将 `CLANG_MODULE_CACHE_PATH` 与 `SWIFT_MODULE_CACHE_PATH` 指向 `/private/tmp` 可避免原生 helper 写入用户缓存失败。
+- Design Renderer 的 recovery/dispose 会递增独立 SAVE 基线代次并主动把在途 batch 归还 pending；旧代次 SAVE 的 success/failure 回调必须完全无副作用，禁止覆盖恢复后的低 revision 或重复归还 mutation。
+- Design Renderer 的权威 recovery LOAD 使用独立于普通/job LOAD 的请求代次；普通/job 刷新不得取消恢复。恢复期间收到的 job revision 只合并最高目标，恢复成功后单次对账；恢复失败时保留目标，待用户 retry 成功后再对账。
+- Design 大画布节点已有持久化尺寸且禁止连线时，必须向 XYFlow 显式提供 `handles: []`，否则未测量 handle 会迫使所有节点首帧挂载。浏览器 QA 基线使用 1000 节点在 1200px 验证可见 DOM 显著低于总量及拖动、平移、缩放，在 620px 验证 Inspector/Toolbar/禁用 Tooltip 与 light/dark 主题。
+- Agent 图片导入必须把授权校验与实际消费绑定到同一稳定文件身份：Bridge 以 `O_NOFOLLOW` 打开 fd，并用打开后的 canonical 路径和 `dev/ino/size` 证明归属；Asset Service 只在图片处理队列内从该 fd 读取、复核读取前后身份并统一关闭。祖先目录或叶子在排队期间被替换时只能读取原授权 inode 或 fail closed，禁止再次按路径打开。
+- Design `LOAD` 的媒体授权采用候选 lease 事务替换：先取得权威 snapshot 和新 token，成功后切换 sender/project 所有权再撤销旧 token；Store 或候选授权失败必须保留旧 URL，窗口销毁、显式 RELEASE 与注册 dispose 继续按当前所有权幂等清理。
+- Design Job 启动恢复与退出中断按项目隔离，单项目路径、Store 或 journal 故障必须记录中文日志并继续其它项目；应用 `before-quit` 的 Design、Agent、浏览器、watcher 等清理步骤逐项隔离，任何单点失败不得跳过后续全局资源释放。
+- Design 生图模型按项目保存在本机 `design-cache` 偏好中；新任务在主进程固化 profile 快照，并通过单次 Pi 运行扩展强制 Nano Banana 使用该模型。重试复制原快照，配置删除、停用、执行器或模型 ID 变化、凭据失效时明确阻断，普通 Chat/Agent 的全局 Nano Banana 模型不受影响。
+- Design 生图模型的用户入口统一放在“模型配置”，但能力声明、执行协议与任务路由继续由 fork 自有 `image-generation-models.json` 和 executor 管理；GPT Image 2 profile 只引用现有渠道的 `channelId`/`modelId`，执行时通过 `channel-manager` 读取 Base URL 并解密 API Key，禁止扩展官方高频变化的 `ChannelModel` 或复制凭据。Nano Banana 暂留 legacy 工具凭据兼容。
+- 生图目录已升级为 schema v2；GPT Image 2 通过稳定 Pi 图片工具 ID 分派到 OpenAI Images generations/edits，渠道 Base URL 与 API Key 仅存在于主进程单次运行路由，Renderer、IPC 和 Design journal 不暴露凭据。远程图片响应必须逐跳执行 HTTPS、DNS/IP、重定向、MIME 与大小校验后才能保存，禁止直接下载供应商返回 URL。
 
 ## 会话记录
 
@@ -92,3 +106,23 @@
 - 2026-08-22：用户确认 Proma「设计」采用方案 A：每个项目一个原生画布，通过顶部 `设计 · 项目名` 标签在会话与画布间切换，左侧继续只承载项目/会话；正式素材随项目保存到 `.proma/design/`，缓存放 `~/.proma/design-cache/`，首版聚焦画布、批注、Pi 图片任务、版本关系和会话传递。
 - 2026-08-22：项目级设计工作区实施计划确定使用 `@xyflow/react@12.11.3`、revision mutation、目录级 `proma-file` 媒体授权和可见 Pi Agent Design Job；Design Job 仅允许 Nano Banana 图片工具，实施按 12 个 TDD 任务推进。
 - 2026-08-23：完成手机端 Agent 会话四态、星标与相对时间展示；抽屉和顶部下拉统一为“色块、标题、星标、时间”四列，Automation、Bridge 与协作入口启动的会话均通过主进程事件实时同步，重连后从权威快照恢复。
+- 2026-08-23：设计工作区的撤销/重做历史按权威文档基线失效：普通 remount 加载相同 revision 与相同 document 时保留；revision 或内容变化、恢复快照及冲突 rebase 时清空。
+- 2026-08-23：设计保存冲突仅允许整批 `set-viewport`/`move-nodes` 自动 rebase；批次含任一结构 mutation 时采用远端基线、保留 pending 与失败阻断态，禁止自动或重试覆盖。job 节点首版只允许选择和移动，复制、删除、分组、取消分组及不安全历史在 reducer、Jotai action、键盘和工具栏统一拒绝；`executeDesignEditAtom` 在应用 reducer 结果前按当前文档复核完整 mutation，是 Renderer 防止间接改写 job 分组的最终防线。主进程 `SAVE_MUTATIONS` 在 workspace write guard 内基于权威文档保护 job 所有权并保留 recovery-required 语义；Renderer 所有权策略由 store 在单次权威加载后、apply/write 前执行，IPC 禁止额外预读。Renderer 保存遇到 recovery-required 时必须恢复 mutation 队列并先加载权威快照，位置 mutation 可在新基线上安全 rebase，结构 mutation 进入远端阻断；两者均不得直接重试旧 revision。结构冲突可通过“采用远端版本”清理本地冲突队列，后续编辑按远端 revision 保存。
+- 2026-08-23：设计右栏完成素材、AI 编辑和版本三标签；导入素材由主进程先提交 `upsert-assets` 并返回新 revision，Renderer 同批乐观展示素材与节点但只将 `upsert-nodes` 放入保存队列，避免素材重复提交。Task 9 仅通过必填回调验证生成/编辑任务输入，connected 右栏在 Task 10 注入真实 handler 前保持 AI 提交禁用。
+- 2026-08-23：设计素材导入遇到 `DESIGN_RECOVERY_REQUIRED` 时，Inspector 仅通过项目级一次性 Jotai 请求通知画布，唯一工作区 controller 在发起强制加载前同步把旧快照设为只读，成功后清空历史、选区、待保存队列与冲突状态并接管新媒体授权 URL；失败保持阻断并提供恢复重试。画布 mutation updater 必须基于最新 Jotai 状态二次校验，不能只信任 React 闭包中的 writable。
+- 2026-08-23：Design Store 通过 `requireStableAuthoritativeDocument` 统一约束恢复边界；import/delete/relink/export 在选择器、staging、文件写删等业务副作用前遇到 tmp/backup 恢复必须抛 `DESIGN_RECOVERY_REQUIRED`。Renderer 四种素材 action 共用同一恢复错误分流，并交给唯一工作区 controller 重载和重置本地状态。
+- 2026-08-23：Design Job 以项目缓存 journal 作为任务状态事实、Design Store 作为画布事实，并复用可见 Pi Agent 会话执行；单次运行级工具白名单只允许 Nano Banana，任务会话携带项目/job 追踪元数据并自动受既有 generation-owned 项目迁移守卫保护。任务事件携带 Store 权威 revision：同 revision 只刷新 jobs，revision 前进时同步加载创建/重试/成功产生的节点结构，并在权威文档上重放 Renderer 本地 pending。queued journal 与占位节点采用 `pending -> ready` 两阶段恢复：无占位的 pending 原子删除，有占位的 pending 补 ready，重启遗留 queued/running 统一转 interrupted。
+- 2026-08-23：Design Job output 在完整 workspace write lease 内采用 terminal pending journal 与 Store 素材/节点双事实对账，durability 不确定时不得提前 commit、rollback 或标 failed；retry 以 Store 当前 job 节点绑定为所有权事实，并通过旧 journal 的唯一 replacement ID 保证重复请求幂等。Renderer 将任务 journal/结构同步错误与画布保存错误分离，普通失败保留快照和 pending 并提供精确 revision 重试，`DESIGN_RECOVERY_REQUIRED` 统一转入权威恢复。
+- 2026-08-23：Design IPC 的权威 `LOAD` 完成后必须在同进程触发 terminal pending 二次对账，不能只依赖重启恢复。retry 在创建 replacement 前先持久化包含预分配 ID 的 pending intent；重复 retry 或启动恢复必须同时核对旧 journal、replacement journal 与 Store 节点绑定，续建同一 replacement 或拒绝第三方接管。Renderer 任务结构快照 revision 低于任务事件 revision 时保持同步失败并按原目标 revision 重试，禁止把陈旧快照当作 idle 成功。
+- 2026-08-23：重启恢复在补完 pending retry intent 并新建 replacement 后，必须在同一次恢复中把新任务立即收敛为 interrupted；恢复只重建可重试状态，不自动调用付费 Agent run，后续运行必须由用户显式 retry。
+- 2026-08-23：完成项目设计素材与 Agent 会话双向传递：Inspector 仅列同项目未归档会话并优先当前会话，素材引用只进入输入框；Nano Banana 图片结果可原地加入所属项目设计，无项目会话禁用入口，成功不切页。
+- 2026-08-23：Agent 图片附件提升必须由同批、顺序 SDK 消息中的 Nano Banana `tool_use_id` 精确关联证明，禁止非 Nano 工具或独立结果字段伪造授权；设计导入根仅限该 session 附件目录与其实际 Agent cwd 下的 `generated-images`，并在读取前执行大小边界检查。
+- 2026-08-23：Renderer 的 Agent 图片“加入设计”操作必须显式使用消息所属 `sessionId` 贯穿渲染链，禁止以当前激活标签身份代替消息身份；无项目会话的禁用按钮由可聚焦包装元素承载提示。
+- 2026-08-23：Nano Banana 新图片附件只允许由本地主进程 `saveAttachment` 结果经 Pi `tool_use_result` 结构化详情传递，并以来源标识和 `toolUseId` 双重匹配提升；Gemini/工具普通文本中的附件标记永不构成新授权事实，旧 JSONL 已有的结构化 `imageAttachments` 与 legacy 事件继续只读兼容。
+- 2026-08-23：完成设计工作区恢复、staging 清理、viewport 保存压缩、窄窗口与无障碍收口，并通过 Design/关联回归、全仓类型检查、Electron 完整构建及开发启动冒烟。
+- 2026-08-23：修复 Renderer 忽略低 revision backup 恢复的问题；recovery 事件与 recoveredFrom LOAD 统一失效旧缓存基线，并按位置/结构 mutation 安全边界处理未保存编辑。
+- 2026-08-23：质量复核确认 recovery 不再被 job 结构刷新取消；真实 Chrome 下 1000 节点首帧仅挂载 16 个可见节点，并完成宽窄窗口交互、无障碍与明暗主题验证。
+- 2026-08-23：用户确认 Design Job 采用可信双模型链路：设计页按项目选择系统生图模型，现有 Agent LLM 先理解任务，再由主进程运行级上下文强制图片工具使用任务固化的模型；模型不能仅靠提示词传递，重试保留原模型，普通 Chat/Agent 不受项目选择影响。
+- 2026-08-23：完成 Design 项目级生图模型选择与可信双阶段调用：设置页支持多 profile，Inspector 展示项目选择，任务节点展示固化的名称与真实模型 ID；两批共 261 个相关回归测试、全仓类型检查和 Electron 完整构建通过。真实 Electron 窗口完成宽窄布局、明暗主题、禁用/错误状态、设置定位、长名称与模型 ID、焦点可见性验收；本机 Nano Banana API Key 未配置，因此未执行会产生外部计费的真实出图链路，自动化测试已覆盖 Agent LLM 后的可信模型路由、取消、重试与单次图片调用上限。
+- 2026-08-24：用户确认 GPT Image 2 采用低冲突统一模型配置方案：渠道继续管理连接、加密凭据和模型列表，生图目录只声明 `openai-images` 路由；设置入口从 Chat 工具迁到模型配置，Design 仍按项目固化可信快照并保持 Agent LLM -> 生图执行器的两阶段调用。
+- 2026-08-24：完成 GPT Image 2 统一模型配置接入：模型配置页在渠道区块后管理生图 profile，Design 的配置入口跳转并聚焦该区块，Chat 工具页仅保留 Nano Banana 连接凭据；GPT Image 2 generations/edits、参考图边界、URL 安全下载、渠道刷新、可信快照与 Nano Banana 向后兼容均有 BDD 回归覆盖。

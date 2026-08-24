@@ -260,6 +260,38 @@ describe('WorkspaceProjectRelocator', () => {
     expect(copyCalls).toBe(0)
   })
 
+  test('Given Design Job 可见 session 仍持有 generation-owned 写 When 迁移项目 Then 复用现有 Agent 守卫阻断复制', async () => {
+    /** Design Job 会话仍是普通 Pi session，仅额外保留画布追踪来源。 */
+    const designSession: AgentSessionMeta = {
+      id: 'session-design-1',
+      title: '设计任务：生成海报',
+      workspaceId: workspace.id,
+      sourceDesignProjectId: workspace.id,
+      sourceDesignJobId: 'job-design-1',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    /** 记录迁移器实际查询的 workspace，证明没有引入 Design 专属旁路。 */
+    const checkedWorkspaceIds: string[] = []
+    const relocator = createRelocator({
+      listWorkspaceSessions: () => [designSession],
+      hasActiveAgentDataWritesForWorkspace: (workspaceId) => {
+        checkedWorkspaceIds.push(workspaceId)
+        return designSession.workspaceId === workspaceId
+      },
+    })
+
+    await expect(relocator.run({ workspaceId: workspace.id, targetRoot }))
+      .rejects.toThrow('项目仍有 Agent 正在运行，无法迁移')
+
+    expect(designSession).toMatchObject({
+      sourceDesignProjectId: workspace.id,
+      sourceDesignJobId: 'job-design-1',
+    })
+    expect(checkedWorkspaceIds).toEqual([workspace.id])
+    expect(copyCalls).toBe(0)
+  })
+
   test('Given 相同、嵌套、非空、空间不足或物理别名目标 When 预检 Then 全部拒绝', async () => {
     /** 源内嵌套目标。 */
     const nestedTarget = join(sourceRoot, 'nested')

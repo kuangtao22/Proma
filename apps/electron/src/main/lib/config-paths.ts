@@ -155,6 +155,11 @@ export function getSettingsPath(): string {
   return join(getConfigDir(), 'settings.json')
 }
 
+/** 返回系统生图模型目录文件，不创建目录或读取凭据。 */
+export function getImageGenerationModelsPath(): string {
+  return join(getConfigDir(), 'image-generation-models.json')
+}
+
 /**
  * 获取系统默认 App 探测缓存路径
  *

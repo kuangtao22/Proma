@@ -18,7 +18,6 @@ import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { accessSync, constants, existsSync, mkdirSync, realpathSync } from 'node:fs'
-import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { app } from 'electron'
 import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
 import {
@@ -62,6 +61,7 @@ import type { PermissionResult, CanUseToolOptions } from './agent-permission-ser
 import { resolvePlanningDeletionPermission } from './planning-permission-policy'
 import { askUserService } from './agent-ask-user-service'
 import { exitPlanService, type ExitPlanPermissionResult } from './agent-exit-plan-service'
+import { createRunToolCallLimiter, denyToolOutsideRunAllowlist } from './agent-run-tool-policy'
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
@@ -76,6 +76,7 @@ import { claimWorkspaceMemoryRefreshOpportunity } from './agent-memory-refresh-s
 import { browserController } from './browser-controller'
 import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
+import type { AgentRunExtensions } from './agent-run-extensions'
 import {
   closeAgentQueryIterator,
   consumeStoppedGeneration,
@@ -681,7 +682,7 @@ export class AgentOrchestrator {
   async sendMessage(
     input: AgentSendInput,
     callbacks: SessionCallbacks,
-    extensions: { piCustomTools?: ToolDefinition[] } = {},
+    extensions: AgentRunExtensions = {},
   ): Promise<void> {
     const { sessionId, userMessage, rawUserMessage, userMessageUuid, channelId, modelId, workspaceId: requestedWorkspaceId, additionalDirectories, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid } = input
     const streamStartedAt = input.startedAt ?? Date.now()
@@ -1082,6 +1083,8 @@ export class AgentOrchestrator {
         permissionMode: permissionModeOverride ?? sessionMeta?.permissionMode ?? PROMA_DEFAULT_PERMISSION_MODE,
         triggeredBy: input.triggeredBy,
         windowsShellAvailable: process.platform !== 'win32' || runtimeEnv.shellKind != null,
+        trustedImageRoute: extensions.trustedImageRoute,
+        resolveTrustedImageRoute: extensions.resolveTrustedImageRoute,
       })
       checkpoint()
       piBuiltinTools = builtinMcpResult.tools
@@ -1247,6 +1250,8 @@ export class AgentOrchestrator {
 
       /** Plan 模式是否已被 Agent 进入（初始 plan 模式时天然为 true，其他模式需 EnterPlanMode 触发） */
       let planModeEntered = initialPermissionMode === 'plan'
+      /** 每次 sendMessage 独享计数器，避免并发会话和后续 run 共享付费工具配额。 */
+      const consumeRunToolCallLimit = createRunToolCallLimiter(extensions.toolCallLimits)
 
       /** 旧代际在异步审批返回后统一得到拒绝，防止迟到工具继续执行。 */
       const denyStaleToolRun = (): PermissionResult | undefined => (
@@ -1275,6 +1280,9 @@ export class AgentOrchestrator {
         /** 工具调用进入权限边界时的代际检查。 */
         const staleAtEntry = denyStaleToolRun()
         if (staleAtEntry) return staleAtEntry
+        /** 单次运行白名单先于参数解析生效，bypassPermissions 也不能绕过。 */
+        const runPolicyDenial = denyToolOutsideRunAllowlist(toolName, extensions.allowedToolNames)
+        if (runPolicyDenial) return runPolicyDenial
         const currentMode = getPermissionMode()
 
         // ── 参数校验守卫（所有模式、所有工具，优先于权限检查） ──
@@ -1283,6 +1291,9 @@ export class AgentOrchestrator {
           console.warn(`[Agent 工具验证] 参数缺失: tool=${toolName}, mode=${currentMode}`)
           return validationFailure
         }
+        /** 参数有效后、任何异步权限等待前同步占位，防止并发工具调用同时穿透上限。 */
+        const toolLimitDenial = consumeRunToolCallLimit(toolName)
+        if (toolLimitDenial) return toolLimitDenial
 
         // ── Write 大文件 token 截断防护 ──
         if (toolName === 'Write' && typeof input.content === 'string') {

@@ -5,6 +5,7 @@
  */
 
 import { ipcMain, nativeTheme, shell, dialog, BrowserWindow, app, clipboard, nativeImage } from 'electron'
+import type { OpenDialogOptions, SaveDialogOptions } from 'electron'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { existsSync, realpathSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
@@ -162,7 +163,28 @@ import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/r
 import { browserController } from './lib/browser-controller'
 import { resolveBrowserProfileKey } from './lib/browser-profile-policy'
 import { getUnstagedChanges, invalidateGitDiffCache, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges, getMainRepoRoot } from './lib/git-diff-service'
-import { registerPromaDirectoryPath, registerPromaFilePath } from './lib/local-file-protocol'
+import {
+  registerPromaDirectoryPath,
+  registerPromaFilePath,
+  registerRetainedPromaDirectoryPaths,
+  revokePromaPathUrl,
+} from './lib/local-file-protocol'
+import { DesignAssetService } from './lib/design/design-asset-service'
+import { DesignImageModelPreferences } from './lib/design/design-image-model-preferences'
+import { registerDesignIpcHandlers } from './lib/design/design-ipc'
+import {
+  runChannelMutationWithImageModelBroadcast,
+  updateToolCredentialsWithImageModelBroadcast,
+} from './lib/image-model-profile-broadcast'
+import { DesignSessionBridge } from './lib/design/design-session-bridge'
+import {
+  DesignJobManager,
+  resolveOwnedDesignJobOutputPath,
+  setDefaultDesignJobManager,
+} from './lib/design/design-job-manager'
+import { designPathResolver } from './lib/design/design-paths'
+import { designStore } from './lib/design/design-store'
+import { ImageGenerationModelCatalog } from './lib/image-generation-model-catalog'
 import { registerUpdaterIpc } from './lib/updater/updater-ipc'
 import { createLanBridgeIpcDependencies, registerLanBridgeIpcHandlers } from './lib/lan-bridge/lan-bridge-ipc'
 import {
@@ -273,7 +295,9 @@ import {
   countArchivedAgentSessions,
   createAgentSession,
   getAgentSessionMeta,
+  getAgentSessionMessages,
   getAgentSessionSDKMessages,
+  resolveAgentCwd,
   updateAgentSessionMeta,
   deleteAgentSession,
   migrateChatToAgentSession,
@@ -284,7 +308,7 @@ import {
   searchAgentSessionMessages,
   searchAgentSessionReferences,
 } from './lib/agent-session-manager'
-import { agentEventBus, runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, reserveAgentSessionStart, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
+import { agentEventBus, runAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, reserveAgentSessionStart, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import {
   getDefaultWorkspaceProjectRelocator,
@@ -298,7 +322,7 @@ import { hasRunningAutomations } from './lib/automation-scheduler'
 import { permissionService } from './lib/agent-permission-service'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
-import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getWorkspaceSkillsDir, getScratchPadPath } from './lib/config-paths'
+import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getConversationAttachmentsDir, getWorkspaceSkillsDir, getScratchPadPath, getImageGenerationModelsPath, resolveAttachmentPath } from './lib/config-paths'
 import { getCachedDefaultAppInfo, saveCachedDefaultAppInfo } from './lib/default-app-cache'
 import { calculateStorageStats, cleanupStorage, cleanupTempFiles } from './lib/storage-service'
 import type { CleanupOptions } from './lib/storage-service'
@@ -319,6 +343,7 @@ import {
   getWorkspaceCapabilities,
   getAgentWorkspace,
   getAgentWorkspaceBySlug,
+  getLocalProjectRootStatus,
   getProjectFilesPath,
   deleteWorkspaceSkill,
   importSkillFromWorkspace,
@@ -389,6 +414,34 @@ import { listShallowDirectory } from './lib/directory-listing'
 import { dingtalkBridgeManager } from './lib/dingtalk-bridge-manager'
 import { getWeChatConfig } from './lib/wechat-config'
 import { wechatBridge } from './lib/wechat-bridge'
+
+/** 进程级唯一的生图模型目录与项目偏好服务。 */
+interface DesignImageModelServices {
+  imageModels: ImageGenerationModelCatalog
+  imagePreferences: DesignImageModelPreferences
+}
+
+/** 延迟创建的进程级唯一实例，避免模块加载阶段提前解析活动配置根。 */
+let designImageModelServices: DesignImageModelServices | undefined
+
+/** 获取 Design IPC 与后续任务流程共享的生图模型服务实例。 */
+function getDesignImageModelServices(): DesignImageModelServices {
+  if (designImageModelServices) return designImageModelServices
+  /** 系统目录只保存公开 profile，凭据继续按需从 Nano Banana 工具配置读取。 */
+  const imageModels = new ImageGenerationModelCatalog({
+    configPath: getImageGenerationModelsPath(),
+    getNanoBananaCredentials: () => getToolCredentials('nano-banana'),
+    listChannels,
+    decryptChannelApiKey: decryptApiKey,
+  })
+  /** 项目偏好与系统目录共享同一 Catalog，保证选择和任务预检口径一致。 */
+  const imagePreferences = new DesignImageModelPreferences({
+    pathResolver: designPathResolver,
+    imageModels,
+  })
+  designImageModelServices = { imageModels, imagePreferences }
+  return designImageModelServices
+}
 
 /** 按渲染进程隔离工作区记忆订阅，并在显式清理或渲染进程销毁时释放。 */
 const workspaceMemoryWatchSubscriptions = new Map<number, Map<string, () => void>>()
@@ -1045,6 +1098,115 @@ export function registerIpcHandlers(): void {
     getWorkspaceIdBySlug: (slug) => getAgentWorkspaceBySlug(slug)?.id,
     getWorkspaceOperationBlockReason,
   })
+  /** Design IPC 的模型目录和项目偏好在进程内只创建一次。 */
+  const { imageModels, imagePreferences } = getDesignImageModelServices()
+  /** Design 素材服务只接受可信项目路径、原子 store 和目录级媒体授权。 */
+  const designAssetService = new DesignAssetService({
+    pathResolver: designPathResolver,
+    store: designStore,
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+    registerDirectoryPath: registerPromaDirectoryPath,
+    registerRetainedDirectoryPaths: registerRetainedPromaDirectoryPaths,
+    revokePathUrl: revokePromaPathUrl,
+  })
+  /** Design Job 复用可见 Pi 会话和同一素材/Store 边界，不创建第二套 runtime。 */
+  const designJobManager = new DesignJobManager({
+    pathResolver: designPathResolver,
+    store: designStore,
+    assetService: designAssetService,
+    imageModels,
+    getSettings,
+    getSession: getAgentSessionMeta,
+    createSession: createAgentSession,
+    updateSession: (sessionId, updates) => { updateAgentSessionMeta(sessionId, updates) },
+    runHeadless: runAgentHeadless,
+    stopAgent,
+    resolveOwnedOutputPath: resolveOwnedDesignJobOutputPath,
+    listProjectIds: () => listAgentWorkspaces().map((workspace) => workspace.id),
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+  })
+  /** Design 与 Agent 会话共用主进程持久化事实，不向 Renderer 暴露路径推断能力。 */
+  const designSessionBridge = new DesignSessionBridge({
+    getSession: getAgentSessionMeta,
+    getMessages: getAgentSessionMessages,
+    resolveAgentImagePath: (localPath) => isAbsolute(localPath) ? localPath : resolveAttachmentPath(localPath),
+    getAllowedRoots: (session) => {
+      /** 只允许当前会话附件和该会话实际 Agent cwd 的生成目录。 */
+      const workspace = session.workspaceId ? getAgentWorkspace(session.workspaceId) : undefined
+      const agentCwd = resolveAgentCwd(workspace, session.id, session.agentCwdMode, session.activeWorktree)
+      return [
+        getConversationAttachmentsDir(session.id),
+        ...(agentCwd ? [join(agentCwd, 'generated-images')] : []),
+      ]
+    },
+    store: designStore,
+    assets: designAssetService,
+  })
+  setDefaultDesignJobManager(designJobManager)
+  registerDesignIpcHandlers({
+    ipc: ipcMain,
+    listAuthorizedWebContents: () => {
+      const contents = getStoredMainWindow()?.webContents
+      return contents && !contents.isDestroyed() ? [contents] : []
+    },
+    guard: workspaceOperationGuard,
+    store: designStore,
+    assets: designAssetService,
+    jobs: designJobManager,
+    imageModels,
+    imagePreferences,
+    sessionBridge: designSessionBridge,
+    getProjectReadOnlyReason: (projectId) => {
+      /** 未登记项目仍交给 store 抛出明确的项目不存在错误。 */
+      const workspace = getAgentWorkspace(projectId)
+      if (!workspace) return undefined
+      /** 外部项目不可访问时禁止创建同名替代目录。 */
+      const rootStatus = getLocalProjectRootStatus(workspace.projectRootPath)
+      if (rootStatus && rootStatus !== 'available') {
+        return '项目路径不可访问，设计工作区已切换为只读'
+      }
+      /** 项目迁移期间保留最后画布，只暂停媒体重绑和写入。 */
+      if (getWorkspaceOperationBlockReason(projectId)) {
+        return '项目路径不可访问，设计工作区已切换为只读'
+      }
+      return undefined
+    },
+    pickImageFiles: async (sender) => {
+      /** 图片路径只由主进程系统选择器产生，renderer 无法注入任意路径。 */
+      const owner = BrowserWindow.fromWebContents(sender)
+      const options: OpenDialogOptions = {
+        title: '导入设计素材',
+        properties: ['openFile', 'multiSelections'],
+        filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
+      }
+      const result = owner
+        ? await dialog.showOpenDialog(owner, options)
+        : await dialog.showOpenDialog(options)
+      return result.canceled ? [] : result.filePaths
+    },
+    pickRelinkImageFile: async (sender) => {
+      /** 重新定位严格选择单文件，旧素材关系由素材服务保留。 */
+      const owner = BrowserWindow.fromWebContents(sender)
+      const options: OpenDialogOptions = {
+        title: '重新定位设计素材',
+        properties: ['openFile'],
+        filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
+      }
+      const result = owner
+        ? await dialog.showOpenDialog(owner, options)
+        : await dialog.showOpenDialog(options)
+      return result.canceled ? null : result.filePaths[0] ?? null
+    },
+    pickExportPath: async (sender, filename) => {
+      /** 导出目标同样由主进程选择器决定。 */
+      const owner = BrowserWindow.fromWebContents(sender)
+      const options: SaveDialogOptions = { title: '导出设计素材', defaultPath: filename }
+      const result = owner
+        ? await dialog.showSaveDialog(owner, options)
+        : await dialog.showSaveDialog(options)
+      return result.canceled ? null : result.filePath ?? null
+    },
+  })
   registerPathManagementIpcHandlers({
     mode: 'normal',
     ipc: ipcMain,
@@ -1358,7 +1520,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     CHANNEL_IPC_CHANNELS.CREATE,
     async (_, input: ChannelCreateInput): Promise<Channel> => {
-      return createChannel(input)
+      return runChannelMutationWithImageModelBroadcast({
+        mutate: () => createChannel(input),
+        listTargets: () => BrowserWindow.getAllWindows().map((window) => window.webContents),
+      })
     }
   )
 
@@ -1366,7 +1531,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     CHANNEL_IPC_CHANNELS.UPDATE,
     async (_, id: string, input: ChannelUpdateInput): Promise<Channel> => {
-      return updateChannel(id, input)
+      return runChannelMutationWithImageModelBroadcast({
+        mutate: () => updateChannel(id, input),
+        listTargets: () => BrowserWindow.getAllWindows().map((window) => window.webContents),
+      })
     }
   )
 
@@ -1374,7 +1542,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     CHANNEL_IPC_CHANNELS.DELETE,
     async (_, id: string): Promise<void> => {
-      return deleteChannel(id)
+      return runChannelMutationWithImageModelBroadcast({
+        mutate: () => deleteChannel(id),
+        listTargets: () => BrowserWindow.getAllWindows().map((window) => window.webContents),
+      })
     }
   )
 
@@ -3117,7 +3288,14 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     CHAT_TOOL_IPC_CHANNELS.UPDATE_TOOL_CREDENTIALS,
     async (_, toolId: string, credentials: Record<string, string>): Promise<void> => {
-      updateToolCredentials(toolId, credentials)
+      await updateToolCredentialsWithImageModelBroadcast({
+        toolId,
+        credentials,
+        updateCredentials: (currentToolId, currentCredentials) => {
+          updateToolCredentials(currentToolId, currentCredentials)
+        },
+        listTargets: () => BrowserWindow.getAllWindows().map((window) => window.webContents),
+      })
     }
   )
 

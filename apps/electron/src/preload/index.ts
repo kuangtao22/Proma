@@ -9,6 +9,8 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import { createLanBridgePreloadApi } from './lan-bridge-preload'
 import type { LanBridgePreloadApi } from './lan-bridge-preload'
+import { createDesignPreloadApi } from './design-preload'
+import type { DesignPreloadApi } from './design-preload'
 import { createNormalPathManagementPreloadApi } from './path-management-preload'
 import type { NormalPathManagementPreloadApi } from './path-management-preload'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS } from '../types'
@@ -187,7 +189,7 @@ import { QUICK_TASK_IPC_CHANNELS, TRAY_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNEL
 /**
  * 暴露给渲染进程的 API 接口定义
  */
-export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPreloadApi {
+export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPreloadApi, DesignPreloadApi {
   // ===== 运行时相关 =====
 
   /**
@@ -1279,11 +1281,14 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
  */
 /** 根 preload 唯一创建的 LAN API 组合对象。 */
 const lanBridgePreloadApi = createLanBridgePreloadApi(ipcRenderer)
+/** 根 preload 唯一创建的 Design API 组合对象。 */
+const designPreloadApi = createDesignPreloadApi(ipcRenderer)
 /** 根 preload 唯一创建的路径管理 API 组合对象。 */
 const pathManagementPreloadApi = createNormalPathManagementPreloadApi(ipcRenderer)
 
 const electronAPI: ElectronAPI = {
   ...pathManagementPreloadApi,
+  ...designPreloadApi,
 
   // 运行时
   getRuntimeStatus: () => {

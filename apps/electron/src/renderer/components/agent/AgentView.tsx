@@ -74,6 +74,8 @@ import {
   currentAgentWorkspaceIdAtom,
   agentPendingPromptAtom,
   agentPendingFilesAtomFamily,
+  agentPendingMentionsAtomFamily,
+  agentAckPendingMentionsAtom,
   agentMessageQueueAtomFamily,
   agentWorkspacesAtom,
   agentStreamErrorsAtom,
@@ -107,6 +109,7 @@ import {
   allPendingExitPlanRequestsAtom,
 } from '@/atoms/agent-atoms'
 import { settingsOpenAtom } from '@/atoms/settings-tab'
+import { deliverPendingMentionsToComposer } from '@/lib/design-session-actions'
 import { longTextPasteAsAttachmentEnabledAtom } from '@/atoms/ui-preferences'
 import { channelsAtom } from '@/atoms/chat-atoms'
 import { todoPlanningGroupsAtom } from '@/atoms/planning-atoms'
@@ -680,6 +683,10 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const pendingFilesRef = React.useRef(pendingFiles)
   // RichTextInput 命令接口 ref（右侧文件面板拖入时插入 @file 引用）
   const richTextInputRef = React.useRef<RichTextInputHandle>(null)
+  /** 当前会话跨视图等待插入的文件引用。 */
+  const pendingMentions = useAtomValue(agentPendingMentionsAtomFamily(sessionId))
+  /** composer 插入成功后确认并清理同一队列。 */
+  const acknowledgePendingMentions = useSetAtom(agentAckPendingMentionsAtom)
   const historyQuoteNavigationRequestIdRef = React.useRef(0)
   const [historyQuoteNavigation, setHistoryQuoteNavigation] = React.useState<AgentHistoryQuoteNavigationRequest | null>(null)
   const handleAddHistoryQuote = React.useCallback((quote: QuotedSelection): boolean => {
@@ -2696,6 +2703,18 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     window.addEventListener('proma:focus-input', handler)
     return () => window.removeEventListener('proma:focus-input', handler)
   }, [])
+
+  // Design 等跨视图入口先按会话入队；输入框真实插入成功后才确认队列。
+  React.useEffect(() => {
+    if (pendingMentions.length === 0 || !richTextInputRef.current) return
+    // StrictMode 可能用旧闭包重复执行 effect；插入前确认该数组仍是当前队列。
+    if (store.get(agentPendingMentionsAtomFamily(sessionId)) !== pendingMentions) return
+    deliverPendingMentionsToComposer(pendingMentions, {
+      insertMentions: (items) => richTextInputRef.current?.insertFileMentions(items) ?? false,
+      acknowledge: () => acknowledgePendingMentions({ sessionId, items: pendingMentions }),
+      notifySuccess: () => toast.success('已添加到会话输入框'),
+    })
+  }, [acknowledgePendingMentions, pendingMentions, sessionId, store])
 
   // 监听文件面板三点菜单「引用到 Agent」事件：在输入框插入 @file 引用
   React.useEffect(() => {
