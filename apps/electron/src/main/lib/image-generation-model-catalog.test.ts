@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { ImageGenerationModelProfile, ImageGenerationModelSnapshot } from '@proma/shared'
+import type { Channel, ImageGenerationModelProfile, ImageGenerationModelSnapshot } from '@proma/shared'
 import {
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
   IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
@@ -15,6 +15,10 @@ let tempDir = ''
 let configPath = ''
 /** 可在测试过程中替换的旧 Nano Banana 凭据。 */
 let credentials: Record<string, string> = {}
+/** 可在测试过程中模拟新增、停用或删除的现有渠道。 */
+let channels: Channel[] = []
+/** 按渠道 ID 提供的测试明文凭据，只在主进程 fixture 内存在。 */
+let decryptedKeys: Record<string, string> = {}
 
 /** 记录凭据快照读取次数的测试目录实例。 */
 interface ChangingCredentialsCatalogHarness {
@@ -27,6 +31,8 @@ function createCatalog(now = 100): ImageGenerationModelCatalog {
   return new ImageGenerationModelCatalog({
     configPath,
     getNanoBananaCredentials: () => credentials,
+    listChannels: () => channels,
+    decryptChannelApiKey: (channelId) => decryptedKeys[channelId] ?? '',
     now: () => now,
   })
 }
@@ -44,6 +50,8 @@ function createChangingCredentialsCatalog(): ChangingCredentialsCatalogHarness {
           ? { apiKey: 'first-key', model: 'gemini-first' }
           : { apiKey: '   ', model: 'gemini-later' }
       },
+      listChannels: () => channels,
+      decryptChannelApiKey: (channelId) => decryptedKeys[channelId] ?? '',
       now: () => 100,
     }),
     getCallCount: () => callCount,
@@ -53,13 +61,48 @@ function createChangingCredentialsCatalog(): ChangingCredentialsCatalogHarness {
 /** 创建完整且可持久化的模型 profile。 */
 function createProfile(
   id: string,
-  overrides: Partial<ImageGenerationModelProfile> = {},
-): ImageGenerationModelProfile {
+  overrides: Partial<Extract<ImageGenerationModelProfile, { executor: 'nano-banana' }>> = {},
+): Extract<ImageGenerationModelProfile, { executor: 'nano-banana' }> {
   return {
     id,
     name: `模型 ${id}`,
     executor: 'nano-banana',
     modelId: `gemini-${id}`,
+    enabled: true,
+    createdAt: 10,
+    updatedAt: 20,
+    ...overrides,
+  }
+}
+
+/** 创建测试使用的可用 GPT Image 渠道。 */
+function createGPTImageChannel(
+  overrides: Partial<Channel> = {},
+): Channel {
+  return {
+    id: 'channel-gpt',
+    name: 'GPT Image 服务',
+    provider: 'openai',
+    baseUrl: 'http://100.124.186.117:8030/v1',
+    apiKey: 'encrypted-key',
+    models: [{ id: 'gpt-image-2', name: 'GPT Image 2', enabled: true }],
+    enabled: true,
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  }
+}
+
+/** 创建只引用现有渠道、不保存凭据的 GPT Image profile。 */
+function createOpenAIProfile(
+  overrides: Partial<Extract<ImageGenerationModelProfile, { executor: 'openai-images' }>> = {},
+): Extract<ImageGenerationModelProfile, { executor: 'openai-images' }> {
+  return {
+    id: 'profile-gpt',
+    name: 'GPT Image 2',
+    executor: 'openai-images',
+    channelId: 'channel-gpt',
+    modelId: 'gpt-image-2',
     enabled: true,
     createdAt: 10,
     updatedAt: 20,
@@ -76,6 +119,8 @@ beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'proma-image-model-catalog-'))
   configPath = join(tempDir, 'image-generation-models.json')
   credentials = {}
+  channels = []
+  decryptedKeys = {}
 })
 
 afterEach(() => {
@@ -103,6 +148,7 @@ describe('ImageGenerationModelCatalog', () => {
         createdAt: 123,
         updatedAt: 123,
       }],
+      channelOptions: [],
       inheritedFromLegacyConfig: true,
       credentialsConfigured: true,
     })
@@ -138,12 +184,13 @@ describe('ImageGenerationModelCatalog', () => {
         createProfile('fast', { name: '快速模型', modelId: 'gemini-fast' }),
         createProfile('quality', { enabled: false }),
       ],
+      channelOptions: [],
       inheritedFromLegacyConfig: false,
       credentialsConfigured: true,
     })
     expect(restored).toEqual(saved)
     expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       profiles: saved.profiles,
     })
     expect(JSON.parse(readFileSync(`${configPath}.bak`, 'utf8'))).toEqual(previousFile)
@@ -213,6 +260,75 @@ describe('ImageGenerationModelCatalog', () => {
     expect(harness.getCallCount()).toBe(1)
     expect(result.profiles[0]?.modelId).toBe('gemini-first')
     expect(result.credentialsConfigured).toBe(true)
+  })
+
+  test('Given schema v1 Nano Banana 目录 When 读取后保存 Then 原 ID 以 schema v2 原子写回', () => {
+    writeRawConfig(JSON.stringify({
+      schemaVersion: 1,
+      profiles: [createProfile('profile-old')],
+    }))
+    const catalog = createCatalog()
+
+    const loaded = catalog.listCatalog()
+
+    expect(loaded.profiles[0]?.id).toBe('profile-old')
+    expect(JSON.parse(readFileSync(configPath, 'utf8')).schemaVersion).toBe(1)
+    catalog.replaceProfiles(loaded.profiles)
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({
+      schemaVersion: 2,
+      profiles: loaded.profiles,
+    })
+  })
+
+  test('Given 可用渠道模型 When 解析 GPT Image profile Then 只在主进程返回含凭据运行路由', () => {
+    channels = [createGPTImageChannel()]
+    decryptedKeys = { 'channel-gpt': 'secret-key' }
+    const catalog = createCatalog()
+    catalog.replaceProfiles([createOpenAIProfile()])
+
+    const snapshot = catalog.resolveAvailableSnapshot('profile-gpt')
+    if (snapshot.executor !== 'openai-images') throw new Error('测试快照执行器错误')
+    const route = catalog.resolveExecutionRoute(snapshot)
+
+    expect(snapshot).toEqual({
+      profileId: 'profile-gpt',
+      name: 'GPT Image 2',
+      executor: 'openai-images',
+      channelId: 'channel-gpt',
+      modelId: 'gpt-image-2',
+    })
+    expect(route).toEqual({
+      executor: 'openai-images',
+      snapshot,
+      baseUrl: 'http://100.124.186.117:8030/v1',
+      apiKey: 'secret-key',
+    })
+    expect(JSON.stringify(catalog.listCatalog())).not.toContain('secret-key')
+    expect(JSON.stringify(catalog.listCatalog())).not.toContain('encrypted-key')
+  })
+
+  test('Given 已保存 GPT profile 的渠道被删除 When 列出选项 Then 保留 profile 并说明不可用', () => {
+    channels = [createGPTImageChannel()]
+    decryptedKeys = { 'channel-gpt': 'secret-key' }
+    const catalog = createCatalog()
+    catalog.replaceProfiles([createOpenAIProfile()])
+    channels = []
+
+    expect(catalog.listOptions()).toEqual([{
+      profileId: 'profile-gpt',
+      name: 'GPT Image 2',
+      executor: 'openai-images',
+      channelId: 'channel-gpt',
+      modelId: 'gpt-image-2',
+      available: false,
+      unavailableReason: '关联的模型配置已不存在',
+    }])
+  })
+
+  test('Given GPT profile 引用未知渠道 When 保存 Then 原子写入前拒绝', () => {
+    expect(() => createCatalog().replaceProfiles([createOpenAIProfile()]))
+      .toThrow('关联的模型配置已不存在')
+    expect(existsSync(configPath)).toBe(false)
   })
 
   test('Given legacy 凭据读取时变化 When listOptions Then 单次快照同时决定 model 与可用性', () => {
@@ -349,7 +465,7 @@ describe('ImageGenerationModelCatalog', () => {
 
   test.each([
     ['损坏 JSON', '{', '生图模型目录 JSON 损坏'],
-    ['未知 schemaVersion', JSON.stringify({ schemaVersion: 2, profiles: [] }), 'schemaVersion'],
+    ['未知 schemaVersion', JSON.stringify({ schemaVersion: 3, profiles: [] }), 'schemaVersion'],
     ['重复 ID', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('dup'), createProfile('dup')] }), 'ID 重复'],
     ['空 name', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('empty-name', { name: '  ' })] }), 'name'],
     ['空 modelId', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('empty-model', { modelId: '' })] }), 'modelId'],

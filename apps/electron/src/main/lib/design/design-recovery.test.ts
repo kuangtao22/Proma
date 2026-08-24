@@ -203,8 +203,8 @@ function createIpcFixture(store: DesignStore, readOnlyReason?: string): {
       onChanged: () => () => undefined,
     },
     imageModels: {
-      listCatalog: () => ({ profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: false }),
-      replaceProfiles: (profiles) => ({ profiles, inheritedFromLegacyConfig: false, credentialsConfigured: false }),
+      listCatalog: () => ({ profiles: [], channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: false }),
+      replaceProfiles: (profiles) => ({ profiles, channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: false }),
     },
     imagePreferences: {
       getSelection: (projectId) => ({ projectId, options: [] }),

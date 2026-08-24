@@ -173,10 +173,10 @@ function createFixture(): {
     },
     imageModels: {
       listCatalog: () => ({
-        profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
+        profiles: [], channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
       }),
       replaceProfiles: (profiles) => ({
-        profiles, inheritedFromLegacyConfig: false, credentialsConfigured: true,
+        profiles, channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
       }),
     },
     imagePreferences: {
@@ -234,10 +234,10 @@ describe('Design IPC', () => {
     }
     fixture.options.imageModels = {
       listCatalog: () => ({
-        profiles: [profile], inheritedFromLegacyConfig: false, credentialsConfigured: true,
+        profiles: [profile], channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
       }),
       replaceProfiles: (profiles) => ({
-        profiles, inheritedFromLegacyConfig: false, credentialsConfigured: true,
+        profiles, channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
       }),
     }
     fixture.options.imagePreferences = {
@@ -297,7 +297,7 @@ describe('Design IPC', () => {
     const fixture = createFixture()
     /** 模拟目录保存成功后的公开返回值。 */
     const catalogResult = {
-      profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
+      profiles: [], channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
     }
     fixture.options.imageModels.replaceProfiles = () => catalogResult
     /** 首个窗口只在模型目录广播时模拟 Electron send 异常。 */
@@ -466,8 +466,8 @@ describe('Design IPC', () => {
     const fixture = createFixture()
     /** 记录任何越过 IPC 边界的模型服务调用。 */
     const calls: string[] = []
-    fixture.options.imageModels.listCatalog = () => { calls.push('list'); return { profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: false } }
-    fixture.options.imageModels.replaceProfiles = () => { calls.push('save'); return { profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: false } }
+    fixture.options.imageModels.listCatalog = () => { calls.push('list'); return { profiles: [], channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: false } }
+    fixture.options.imageModels.replaceProfiles = () => { calls.push('save'); return { profiles: [], channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: false } }
     fixture.options.imagePreferences.getSelection = (projectId) => { calls.push('get'); return { projectId, options: [] } }
     fixture.options.imagePreferences.setSelection = ({ projectId }) => { calls.push('set'); return { projectId, options: [] } }
     registerDesignIpcHandlers(fixture.options)

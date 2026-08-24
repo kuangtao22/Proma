@@ -19,7 +19,7 @@ describe('Design renderer adapter', () => {
     /** 模型 API 收到的原始参数，验证 adapter 不做业务改写。 */
     const modelInputs: unknown[] = []
     /** 公开模型目录返回对象。 */
-    const catalog = { profiles: [], inheritedFromLegacyConfig: false, credentialsConfigured: true }
+    const catalog = { profiles: [], channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: true }
     /** 项目模型选择返回对象。 */
     const selection = { projectId: 'project-1', options: [], selectedProfileId: 'profile-flash' }
     /** 两类订阅释放函数必须原样返回。 */

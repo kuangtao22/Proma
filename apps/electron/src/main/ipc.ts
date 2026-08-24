@@ -428,6 +428,8 @@ function getDesignImageModelServices(): DesignImageModelServices {
   const imageModels = new ImageGenerationModelCatalog({
     configPath: getImageGenerationModelsPath(),
     getNanoBananaCredentials: () => getToolCredentials('nano-banana'),
+    listChannels,
+    decryptChannelApiKey: decryptApiKey,
   })
   /** 项目偏好与系统目录共享同一 Catalog，保证选择和任务预检口径一致。 */
   const imagePreferences = new DesignImageModelPreferences({

@@ -113,7 +113,14 @@ function prepareProfilesForSave(
   const baselineById = new Map(baselineProfiles.map((profile) => [profile.id, profile]))
   return profiles.map((profile) => {
     /** 去除用户输入两端空白后的编辑值。 */
-    const normalized = { ...profile, name: profile.name.trim(), modelId: profile.modelId.trim() }
+    const normalized: ImageGenerationModelProfile = profile.executor === 'openai-images'
+      ? {
+          ...profile,
+          channelId: profile.channelId.trim(),
+          name: profile.name.trim(),
+          modelId: profile.modelId.trim(),
+        }
+      : { ...profile, name: profile.name.trim(), modelId: profile.modelId.trim() }
     /** 当前行对应的权威 baseline。 */
     const baseline = baselineById.get(profile.id)
     if (!baseline) return { ...normalized, updatedAt: now }
@@ -121,8 +128,11 @@ function prepareProfilesForSave(
     const changed = normalized.name !== baseline.name
       || normalized.modelId !== baseline.modelId
       || normalized.enabled !== baseline.enabled
+      || normalized.executor !== baseline.executor
+      || (normalized.executor === 'openai-images'
+        && (baseline.executor !== 'openai-images' || normalized.channelId !== baseline.channelId))
     return changed
-      ? { ...normalized, executor: baseline.executor, createdAt: baseline.createdAt, updatedAt: now }
+      ? { ...normalized, createdAt: baseline.createdAt, updatedAt: now }
       : baseline
   })
 }
