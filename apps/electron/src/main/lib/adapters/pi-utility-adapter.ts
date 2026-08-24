@@ -108,9 +108,12 @@ export class PiUtilityAdapter {
   }
 
   abort(sessionId: string): void {
-    const pending = this.findCurrentPending(sessionId)
-    if (!pending) return
-    void this.requestRuntimeAbort(pending)
+    // 恢复阶段可能暂时存在同会话的旧代际运行；全部中止，避免遗留 runtime 继续占用资源。
+    for (const pending of this.pendingQueries.values()) {
+      if (pending.sessionId !== sessionId) continue
+      this.abortCapabilitiesForQuery(pending.queryId)
+      void this.requestRuntimeAbort(pending)
+    }
   }
 
   /** 先结束 utility runtime 与事件队列，使调用方随后可等待 async generator cleanup。 */
@@ -123,8 +126,17 @@ export class PiUtilityAdapter {
   private failStoppedQuery(pending: PendingQuery, error: unknown): void {
     if (pending.ended || pending.runtimeFailed) return
     pending.runtimeFailed = true
+    this.abortCapabilitiesForQuery(pending.queryId)
     pending.queue.fail(error)
     void this.stopRuntime(pending).catch(() => {})
+  }
+
+  private abortCapabilitiesForQuery(queryId: string): void {
+    for (const [requestId, capability] of this.capabilityAbortControllers) {
+      if (capability.queryId !== queryId) continue
+      capability.controller.abort()
+      this.capabilityAbortControllers.delete(requestId)
+    }
   }
 
   async sendQueuedMessage(
