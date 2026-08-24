@@ -15,6 +15,7 @@ export interface DesignPaths {
   preferencesPath: string
   thumbnailsDir: string
   jobsDir: string
+  tracesDir: string
   stagingDir: string
 }
 
@@ -88,6 +89,7 @@ export function createDesignPathResolver(
         preferencesPath: join(cacheRoot, 'preferences.json'),
         thumbnailsDir: join(cacheRoot, 'thumbnails'),
         jobsDir: join(cacheRoot, 'jobs'),
+        tracesDir: join(cacheRoot, 'traces'),
         stagingDir: join(cacheRoot, 'staging'),
       }
     },

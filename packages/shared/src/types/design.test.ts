@@ -17,6 +17,7 @@ import type {
   SaveImageGenerationModelProfilesInput,
   ImportDesignAssetsInput,
   DesignJobRecord,
+  DesignTaskDetails,
   SaveDesignMutationsInput,
   UpdateDesignImageModelSelectionInput,
 } from './design'
@@ -38,10 +39,16 @@ const assetContract = {
 /** 编译期锁定任务与保存输入的关键字段。 */
 const jobContract = {
   id: 'job-1',
+  creativeTaskId: 'creative-1',
+  attemptNumber: 1,
   projectId: 'project-1',
   action: 'generate',
   status: 'queued',
   prompt: '生成图片',
+  originalRequest: '生成图片',
+  contextMode: 'none',
+  traceState: 'pending',
+  executionSessionCleanupState: 'pending',
   createdAt: 100,
   updatedAt: 100,
 } satisfies DesignJobRecord
@@ -173,7 +180,30 @@ describe('Design 共享契约', () => {
     expect(DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION).toBe('design:set-image-model-selection')
     expect(DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED).toBe('design:image-model-profiles-changed')
     expect(DESIGN_IPC_CHANNELS.IMAGE_MODEL_SELECTION_CHANGED).toBe('design:image-model-selection-changed')
+    expect(DESIGN_IPC_CHANNELS.GET_TASK_DETAILS).toBe('design:get-task-details')
+    expect(DESIGN_IPC_CHANNELS.GET_TASK_TRACE).toBe('design:get-task-trace')
     expect(DESIGN_IPC_CHANNELS.CHANGED).toBe('design:changed')
+  })
+
+  test('Given Design 首次尝试 When 构造公开记录 Then 创作任务与执行尝试拥有独立身份', () => {
+    expect(jobContract.creativeTaskId).not.toBe(jobContract.id)
+    expect(jobContract.attemptNumber).toBe(1)
+  })
+
+  test('Given 任务详情契约 When 序列化 Then 不包含内部会话或凭据字段', () => {
+    /** Renderer 可读取的轻量任务详情。 */
+    const details = {
+      creativeTaskId: 'creative-1',
+      currentJobId: 'job-1',
+      attempts: [],
+      traceState: 'ready',
+    } satisfies DesignTaskDetails
+    /** 用公开序列化结果验证敏感字段不会进入契约。 */
+    const encoded = JSON.stringify(details)
+
+    expect(encoded).not.toContain('apiKey')
+    expect(encoded).not.toContain('Authorization')
+    expect(encoded).not.toContain('sessionId')
   })
 
   test('Given 固定公开类型 When 编译契约 Then 保留素材、任务和 revision 输入字段', () => {

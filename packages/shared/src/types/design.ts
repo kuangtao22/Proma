@@ -22,6 +22,18 @@ export type DesignNodeKind = 'asset' | 'job'
 export type DesignJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export type DesignJobAction = 'generate' | 'edit'
 export type ImageGenerationExecutor = 'nano-banana' | 'openai-images'
+export type DesignContextMode = 'auto' | 'project' | 'none'
+export type DesignContextCategory =
+  | 'brand'
+  | 'product'
+  | 'code'
+  | 'character'
+  | 'story'
+  | 'scene'
+  | 'continuity'
+  | 'reference'
+export type DesignTraceState = 'pending' | 'ready' | 'unavailable'
+export type DesignExecutionSessionCleanupState = 'pending' | 'completed'
 
 /** 生图模型 profile 共享的非敏感字段。 */
 interface ImageGenerationModelProfileBase {
@@ -240,20 +252,83 @@ export type DesignMutation =
   | { type: 'remove-annotations'; annotationIds: string[] }
   | { type: 'patch-annotations'; removeIds: string[]; upserts: Array<DesignIndexedEntity<DesignAnnotation>> }
 
-/** 一次图片生成或编辑任务的可恢复记录。 */
-export interface DesignJobRecord {
+/** 单次 Design 执行实际读取的创作上下文引用。 */
+export interface DesignContextReference {
   id: string
+  category: DesignContextCategory
+  sourceKind: 'project-file' | 'context-document' | 'design-asset'
+  label: string
+  relativePath?: string
+  assetId?: string
+  purpose: string
+  readAt: number
+}
+
+/** Design Job 列表可直接展示的轻量追踪摘要。 */
+export interface DesignJobTraceSummary {
+  contextReferences?: DesignContextReference[]
+  designSummary?: string
+  finalImagePrompt?: string
+  rawThinkingAvailable?: boolean
+  contextWarning?: string
+}
+
+/** 延迟读取的单条 Design 执行追踪。 */
+export interface DesignTraceEntry {
+  timestamp: number
+  type: 'thinking' | 'context' | 'tool' | 'image' | 'validation' | 'status' | 'error'
+  title: string
+  content?: string
+  toolName?: string
+  isError?: boolean
+}
+
+/** 任务详情中单次执行尝试的公开信息。 */
+export interface DesignTaskAttemptDetails {
+  jobId: string
+  attemptNumber: number
+  status: DesignJobStatus
+  startedAt?: number
+  completedAt?: number
+  error?: string
+  traceState?: DesignTraceState
+  designSummary?: string
+  finalImagePrompt?: string
+  rawThinkingAvailable?: boolean
+}
+
+/** Renderer 按需读取的 Design 创作任务详情。 */
+export interface DesignTaskDetails {
+  creativeTaskId: string
+  currentJobId: string
+  attempts: DesignTaskAttemptDetails[]
+  traceState: DesignTraceState
+  trace?: DesignTraceEntry[]
+}
+
+/** 一次图片生成或编辑任务的可恢复记录。 */
+export interface DesignJobRecord extends DesignJobTraceSummary {
+  id: string
+  creativeTaskId: string
+  attemptNumber: number
   projectId: string
   sessionId?: string
   action: DesignJobAction
   status: DesignJobStatus
   prompt: string
+  originalRequest: string
+  contextMode: DesignContextMode
+  sourceAgentMessageId?: string
   imageModelSnapshot?: ImageGenerationModelSnapshot
   sourceSessionId?: string
   sourceAssetId?: string
   parentAssetId?: string
   outputAssetId?: string
   error?: string
+  traceState?: DesignTraceState
+  executionSessionCleanupState?: DesignExecutionSessionCleanupState
+  startedAt?: number
+  completedAt?: number
   createdAt: number
   updatedAt: number
 }
@@ -313,6 +388,12 @@ export interface DesignJobControlInput {
   jobId: string
 }
 
+/** 按项目和执行尝试读取 Design 创作任务详情的输入。 */
+export interface GetDesignTaskDetailsInput {
+  projectId: string
+  jobId: string
+}
+
 export interface PrepareDesignAssetForSessionInput {
   projectId: string
   assetId: string
@@ -358,6 +439,8 @@ export const DESIGN_IPC_CHANNELS = {
   CANCEL_JOB: 'design:cancel-job',
   RETRY_JOB: 'design:retry-job',
   LIST_JOBS: 'design:list-jobs',
+  GET_TASK_DETAILS: 'design:get-task-details',
+  GET_TASK_TRACE: 'design:get-task-trace',
   PREPARE_ASSET_FOR_SESSION: 'design:prepare-asset-for-session',
   IMPORT_AGENT_IMAGE: 'design:import-agent-image',
   RELEASE_MEDIA_ACCESS: 'design:release-media-access',

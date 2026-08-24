@@ -28,6 +28,7 @@ describe('Design 路径解析', () => {
       preferencesPath: '/home/test/.proma/design-cache/project-1/preferences.json',
       thumbnailsDir: '/home/test/.proma/design-cache/project-1/thumbnails',
       jobsDir: '/home/test/.proma/design-cache/project-1/jobs',
+      tracesDir: '/home/test/.proma/design-cache/project-1/traces',
       stagingDir: '/home/test/.proma/design-cache/project-1/staging',
     })
   })

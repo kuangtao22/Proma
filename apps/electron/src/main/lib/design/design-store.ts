@@ -585,7 +585,13 @@ function ensureDesignDirectories(paths: DesignPaths): void {
   /** 从稳定缓存路径反推出活动配置根。 */
   const configRoot = dirname(dirname(paths.cacheRoot))
   /** 缓存目录也使用同一 no-follow 创建规则。 */
-  const cacheDirectories = [paths.cacheRoot, paths.thumbnailsDir, paths.jobsDir, paths.stagingDir]
+  const cacheDirectories = [
+    paths.cacheRoot,
+    paths.thumbnailsDir,
+    paths.jobsDir,
+    paths.tracesDir,
+    paths.stagingDir,
+  ]
   for (const directory of cacheDirectories) {
     ensureContainedDirectory(configRoot, directory)
   }
