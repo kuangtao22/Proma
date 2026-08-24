@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type {
   DesignJobTraceSummary,
   DesignTraceEntry,
@@ -9,7 +9,7 @@ import type {
   SDKToolUseBlock,
   SDKUserMessage,
 } from '@proma/shared'
-import { removeFileAtomic, writeJsonLinesFileAtomic } from '../safe-file'
+import { ensureDirectoryDurable, removeFileAtomic, writeJsonLinesFileAtomic } from '../safe-file'
 import { isSafeDesignStableId, type DesignPathResolver } from './design-paths'
 
 /** Design 内部 Agent 当前唯一可信的图片工具入口。 */
@@ -153,10 +153,10 @@ export class DesignTraceStore {
       }
     }
 
-    writeJsonLinesFileAtomic(
-      resolveTracePath(this.dependencies.pathResolver, projectId, jobId),
-      entries,
-    )
+    /** 当前任务的受信任 trace 路径，兼容尚未创建 traces 子目录的旧项目。 */
+    const tracePath = resolveTracePath(this.dependencies.pathResolver, projectId, jobId)
+    ensureDirectoryDurable(dirname(tracePath))
+    writeJsonLinesFileAtomic(tracePath, entries)
     return {
       summary: { designSummary, finalImagePrompt, rawThinkingAvailable },
       entryCount: entries.length,

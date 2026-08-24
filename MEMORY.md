@@ -64,6 +64,12 @@
 - Design 生图模型按项目保存在本机 `design-cache` 偏好中；新任务在主进程固化 profile 快照，并通过单次 Pi 运行扩展强制 Nano Banana 使用该模型。重试复制原快照，配置删除、停用、执行器或模型 ID 变化、凭据失效时明确阻断，普通 Chat/Agent 的全局 Nano Banana 模型不受影响。
 - Design 生图模型的用户入口统一放在“模型配置”，但能力声明、执行协议与任务路由继续由 fork 自有 `image-generation-models.json` 和 executor 管理；GPT Image 2 profile 只引用现有渠道的 `channelId`/`modelId`，执行时通过 `channel-manager` 读取 Base URL 并解密 API Key，禁止扩展官方高频变化的 `ChannelModel` 或复制凭据。Nano Banana 暂留 legacy 工具凭据兼容。
 - 生图目录已升级为 schema v2；GPT Image 2 通过稳定 Pi 图片工具 ID 分派到 OpenAI Images generations/edits，渠道 Base URL 与 API Key 仅存在于主进程单次运行路由，Renderer、IPC 和 Design journal 不暴露凭据。远程图片响应必须逐跳执行 HTTPS、DNS/IP、重定向、MIME 与大小校验后才能保存，禁止直接下载供应商返回 URL。
+- Pi Runtime 的图片工具结果可能以 `user + tool_result` 消息返回；Design Job 收集输出时必须兼容该角色形态，同时继续校验工具 ID、错误状态、媒体类型和当前任务会话的附件归属，不能只扫描 `assistant/tool`。
+- Design 终态任务删除仅允许 `failed/cancelled/interrupted`，采用 journal `deletionState: pending` 记录可恢复意图，再幂等清理任务节点、历史异常分组引用和 journal；运行中任务必须先取消，Renderer 普通结构编辑仍不得删除 job 节点。
+- 所有 Design 生成和编辑必须经过内部 Pi Agent；Agent 可按 `自动/使用项目/不使用项目` 在授权范围内读取代码与创作上下文，最终提示词以真实图片工具入参为事实。普通 Agent 对话只在用户从对话发起时保留原始沟通，不承载 Design 执行过程。
+- Agent 与 Design 通过稳定 `creativeTaskId` 关联同一创作任务，单次 `DesignJobRecord.id` 只表示一次执行尝试；重试沿用任务 ID，基于成功版本继续则创建新任务并使用 `parentAssetId` 建立版本关系。
+- Design 内部执行会话必须从普通会话、搜索、归档、最近记录、托盘、状态岛、会话引用、项目记忆及 LAN/mobile 中排除；终态先把摘要、精确提示词、实际上下文引用、Thinking 和日志转存为 Design trace，再可恢复地回收会话。
+- Design 任务详情按 `projectId + jobId` 缓存轻量历史，只有用户展开 Thinking 或执行日志时才读取 trace；删除按 `creativeTaskId` 聚合清理全部尝试和详情缓存，成功素材删除后同步回收来源任务。旧项目缺少 `traces` 子目录时，由 trace 写入边界幂等补齐后再原子提交。
 
 ## 会话记录
 
@@ -126,3 +132,9 @@
 - 2026-08-23：完成 Design 项目级生图模型选择与可信双阶段调用：设置页支持多 profile，Inspector 展示项目选择，任务节点展示固化的名称与真实模型 ID；两批共 261 个相关回归测试、全仓类型检查和 Electron 完整构建通过。真实 Electron 窗口完成宽窄布局、明暗主题、禁用/错误状态、设置定位、长名称与模型 ID、焦点可见性验收；本机 Nano Banana API Key 未配置，因此未执行会产生外部计费的真实出图链路，自动化测试已覆盖 Agent LLM 后的可信模型路由、取消、重试与单次图片调用上限。
 - 2026-08-24：用户确认 GPT Image 2 采用低冲突统一模型配置方案：渠道继续管理连接、加密凭据和模型列表，生图目录只声明 `openai-images` 路由；设置入口从 Chat 工具迁到模型配置，Design 仍按项目固化可信快照并保持 Agent LLM -> 生图执行器的两阶段调用。
 - 2026-08-24：完成 GPT Image 2 统一模型配置接入：模型配置页在渠道区块后管理生图 profile，Design 的配置入口跳转并聚焦该区块，Chat 工具页仅保留 Nano Banana 连接凭据；GPT Image 2 generations/edits、参考图边界、URL 安全下载、渠道刷新、可信快照与 Nano Banana 向后兼容均有 BDD 回归覆盖。
+- 2026-08-24：修复 Design GPT Image 2 已生成图片却误报失败的问题，并为失败、已取消和已中断任务增加可恢复删除、垃圾桶入口及 Delete/Backspace 快捷键；现有成功图片无需重新付费生成。
+- 2026-08-24：用户确认 Agent 与 Design 应共享同一个创作任务：Agent 对话负责语义理解、澄清与结构化转交，Design 负责视觉执行和版本迭代；两边共享原始要求、附件、上下文和状态，底层 Design 执行会话不进入普通会话列表，转交前不启动付费生图。
+- 2026-08-24：Design 上下文从代码项目扩展为按任务匹配的创作上下文库，不固定项目类型；可按需使用品牌、产品、代码、角色、故事、场景和连续性资料，单次结果只有经用户确认采用为视觉标准后才能沉淀。完整 AI 漫剧分镜与批次生产另立规格。
+- 2026-08-24：合并最新正式上游 `v0.17.59` 并将应用版本重置为 `0.17.59-bone.1`；上游“在文件改动面板显示记忆更新”只增加 `WorkspaceMemoryChangeDock` 展示入口，不修改 `MEMORY.md` 格式、存储路径或维护规则，与现有项目记忆和 Design 记录无结构冲突。
+- 2026-08-24：完成 Agent 与 Design 统一创作任务的设计确认：结构化语义转交只预填不生图，所有 Design 提交走内部 Agent，上下文库支持品牌、产品、代码、角色、故事、场景、连续性和参考素材，任务详情展示摘要、精确提示词与可用 Thinking，内部会话转存 trace 后回收；完整 AI 漫剧生产另立规格。
+- 2026-08-24：完成 Design 任务透明度第一阶段：真实失败任务可查看原始要求、精确提示词、模型、尝试历史、Thinking 和执行日志，任务节点与快捷键共用不可恢复删除确认；修复旧项目 trace 目录缺失导致转存失败的问题，并通过阶段回归、类型检查、Electron 构建及真实窗口验收。

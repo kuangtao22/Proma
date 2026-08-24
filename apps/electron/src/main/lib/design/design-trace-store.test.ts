@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { SDKMessage } from '@proma/shared'
+import type { SDKAssistantMessage, SDKMessage } from '@proma/shared'
 import type { DesignPathResolver, DesignPaths } from './design-paths'
 import { DesignTraceStore } from './design-trace-store'
 
@@ -85,6 +85,14 @@ describe('DesignTraceStore', () => {
     }))
   })
 
+  test('Given 旧项目尚未创建 traces 目录 When 转存 trace Then 自动补齐目录并完成写入', () => {
+    rmSync(paths.tracesDir, { recursive: true, force: true })
+
+    store.writeFromMessages('project-1', 'job-1', createSdkMessages())
+
+    expect(existsSync(join(paths.tracesDir, 'job-1.jsonl'))).toBe(true)
+  })
+
   test('Given 工具详情含敏感和大字段 When 写入 trace Then 只保存白名单事实', () => {
     const result = store.writeFromMessages('project-1', 'job-1', createSdkMessages())
 
@@ -99,10 +107,14 @@ describe('DesignTraceStore', () => {
 
   test('Given 模型没有 Thinking When 转存 trace Then 不伪造原始思考', () => {
     const messages = createSdkMessages().map((message) => {
-      if (message.type !== 'assistant') return message
+      if (message.type !== 'assistant' || !('message' in message)) return message
+      const assistant = message as SDKAssistantMessage
       return {
-        ...message,
-        message: { ...message.message, content: message.message.content.filter((block) => block.type !== 'thinking') },
+        ...assistant,
+        message: {
+          ...assistant.message,
+          content: assistant.message.content.filter((block) => block.type !== 'thinking'),
+        },
       }
     })
 
