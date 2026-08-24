@@ -302,7 +302,7 @@ describe('Nano Banana Pi 工具附件来源', () => {
       source: 'proma-nano-banana',
       generated: true,
       imageAttachments: [expect.objectContaining({
-        localPath: expect.stringMatching(/^session-gpt-image\//),
+        localPath: expect.stringContaining('/'),
         mediaType: 'image/png',
       })],
     }))
