@@ -15,6 +15,8 @@ import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import type { AgentToolResultImage, ImageGenerationModelSnapshot } from '@proma/shared'
 import { saveAttachment, isImageAttachment } from '../attachment-service'
+import type { ResolveImageGenerationRoute } from '../image-generation-runtime'
+import { executeOpenAIImages } from './openai-images-executor'
 
 // ===== Gemini API 类型（REST API 使用 camelCase） =====
 
@@ -59,8 +61,8 @@ const sessionHistory = new Map<string, GeminiContent[]>()
 
 const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com'
 const DEFAULT_MODEL = 'gemini-3.1-flash-image-preview'
-/** Design 可信路由缺少主进程实时复核时使用的稳定拒绝原因。 */
-const MISSING_TRUSTED_ROUTE_ASSERTION_ERROR = '设计任务缺少可信生图模型实时复核，已拒绝执行'
+/** Design 可信路由缺少主进程实时解析时使用的稳定拒绝原因。 */
+const MISSING_TRUSTED_ROUTE_RESOLVER_ERROR = '设计任务缺少可信生图模型实时解析，已拒绝执行'
 
 // ===== MCP 内容块类型 =====
 
@@ -226,16 +228,10 @@ async function callGeminiAndBuildResult(
     allowedRoots?: string[]
     numberOfImages?: number
     trustedImageRoute?: ImageGenerationModelSnapshot
-    assertTrustedImageRouteAvailable?: (route: ImageGenerationModelSnapshot) => void
   },
   signal?: AbortSignal,
 ): Promise<McpToolResult> {
   signal?.throwIfAborted()
-  // 复核必须早于历史读取、参考图读取和 fetch，避免失效任务产生任何可计费或本地输入副作用。
-  if (options.trustedImageRoute) {
-    if (!options.assertTrustedImageRouteAvailable) throw new Error(MISSING_TRUSTED_ROUTE_ASSERTION_ERROR)
-    options.assertTrustedImageRouteAvailable(options.trustedImageRoute)
-  }
   const credentials = getToolCredentials('nano-banana')
   if (!credentials.apiKey?.trim()) throw new Error('Nano Banana API Key 未配置: nano-banana')
   const baseUrl = credentials.baseUrl?.trim() || DEFAULT_BASE_URL
@@ -382,8 +378,8 @@ export interface PiNanoBananaToolsContext {
   allowedRoots?: string[]
   /** Design Job 固化的可信模型，优先级高于全局凭据模型。 */
   trustedImageRoute?: ImageGenerationModelSnapshot
-  /** 每次图片工具执行前实时复核可信模型。 */
-  assertTrustedImageRouteAvailable?: (route: ImageGenerationModelSnapshot) => void
+  /** 每次图片工具执行前实时解析可信模型与主进程凭据。 */
+  resolveTrustedImageRoute?: ResolveImageGenerationRoute
 }
 
 function toPiToolResult(result: McpToolResult, toolUseId: string): AgentToolResult<NanoBananaToolResultDetails> {
@@ -398,7 +394,7 @@ function toPiToolResult(result: McpToolResult, toolUseId: string): AgentToolResu
     details: {
       source: 'proma-nano-banana',
       toolUseId,
-      generated: result.content.some((item) => item.type === 'image'),
+      generated: (result.imageAttachments?.length ?? 0) > 0,
       imageAttachments: result.imageAttachments ?? [],
     },
   }
@@ -412,9 +408,11 @@ export function buildPiNanoBananaTools(
   sdk: PiSdk,
   ctx: PiNanoBananaToolsContext,
 ): ToolDefinition[] {
-  const toolState = getToolState('nano-banana')
-  const credentials = getToolCredentials('nano-banana')
-  if (!ctx.trustedImageRoute && (!toolState.enabled || !credentials.apiKey)) return []
+  if (!ctx.trustedImageRoute) {
+    const toolState = getToolState('nano-banana')
+    const credentials = getToolCredentials('nano-banana')
+    if (!toolState.enabled || !credentials.apiKey) return []
+  }
 
   return [sdk.defineTool({
     name: 'mcp__nano_banana__generate_image',
@@ -430,18 +428,41 @@ export function buildPiNanoBananaTools(
     }),
     async execute(toolCallId, args, signal) {
       try {
-        const result = await callGeminiAndBuildResult(String(args.prompt), ctx.sessionId, {
-          aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
-          imageSize: typeof args.imageSize === 'string' ? args.imageSize : undefined,
-          referenceImagePaths: Array.isArray(args.referenceImagePaths)
-            ? args.referenceImagePaths.filter((path): path is string => typeof path === 'string')
-            : undefined,
-          cwd: ctx.agentCwd,
-          allowedRoots: ctx.allowedRoots,
-          numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
-          trustedImageRoute: ctx.trustedImageRoute,
-          assertTrustedImageRouteAvailable: ctx.assertTrustedImageRouteAvailable,
-        }, signal)
+        /** 可信路由解析必须早于历史、文件或网络副作用。 */
+        const resolvedRoute = ctx.trustedImageRoute
+          ? ctx.resolveTrustedImageRoute?.(ctx.trustedImageRoute)
+          : undefined
+        if (ctx.trustedImageRoute && !resolvedRoute) throw new Error(MISSING_TRUSTED_ROUTE_RESOLVER_ERROR)
+        const referenceImagePaths = Array.isArray(args.referenceImagePaths)
+          ? args.referenceImagePaths.filter((path): path is string => typeof path === 'string')
+          : undefined
+        const result: McpToolResult = resolvedRoute?.executor === 'openai-images'
+          ? {
+              content: [{ type: 'text', text: referenceImagePaths && referenceImagePaths.length > 1
+                ? '图片已生成。当前协议使用第一张参考图。'
+                : '图片已生成。' }],
+              imageAttachments: (await executeOpenAIImages({
+                route: resolvedRoute,
+                sessionId: ctx.sessionId,
+                prompt: String(args.prompt),
+                referenceImagePaths,
+                cwd: ctx.agentCwd,
+                allowedRoots: ctx.allowedRoots,
+                aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
+                imageSize: typeof args.imageSize === 'string' ? args.imageSize : undefined,
+                numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
+                signal,
+              })).imageAttachments,
+            }
+          : await callGeminiAndBuildResult(String(args.prompt), ctx.sessionId, {
+              aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
+              imageSize: typeof args.imageSize === 'string' ? args.imageSize : undefined,
+              referenceImagePaths,
+              cwd: ctx.agentCwd,
+              allowedRoots: ctx.allowedRoots,
+              numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
+              trustedImageRoute: ctx.trustedImageRoute,
+            }, signal)
         return toPiToolResult(result, toolCallId)
       } catch (error) {
         if (signal?.aborted) signal.throwIfAborted()

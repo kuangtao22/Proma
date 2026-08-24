@@ -1184,9 +1184,7 @@ export async function buildPiBuiltinTools(
         agentCwd: ctx.agentCwd,
         allowedRoots: ctx.allowedRoots,
         trustedImageRoute: ctx.trustedImageRoute,
-        assertTrustedImageRouteAvailable: ctx.resolveTrustedImageRoute
-          ? (route) => { ctx.resolveTrustedImageRoute?.(route) }
-          : undefined,
+        resolveTrustedImageRoute: ctx.resolveTrustedImageRoute,
       }))
     } catch (error) {
       console.error('[Pi 桥接] 注入 nano-banana 工具失败:', error)

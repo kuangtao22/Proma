@@ -1,12 +1,15 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 import type { AgentToolResultImage, ImageGenerationModelSnapshot } from '@proma/shared'
 import { createRunToolCallLimiter } from '../agent-run-tool-policy'
+import type { ResolveImageGenerationRoute } from '../image-generation-runtime'
 
 const originalFetch = globalThis.fetch
 /** 测试可切换的普通工具开关，验证 Design 可信路由不依赖全局配置。 */
 let toolEnabled = true
 /** 测试可切换的旧版全局凭据，验证普通会话模型行为保持不变。 */
 let toolCredentials = { apiKey: 'test-key', model: 'global-image-model' }
+/** 记录全局 Nano Banana 凭据读取，验证 GPT 路由完全隔离。 */
+let credentialReads = 0
 const saveAttachmentMock = mock(() => ({
   attachment: {
     id: 'attachment-1',
@@ -19,11 +22,15 @@ const saveAttachmentMock = mock(() => ({
 
 mock.module('../chat-tool-config', () => ({
   getToolState: () => ({ enabled: toolEnabled }),
-  getToolCredentials: () => toolCredentials,
+  getToolCredentials: () => {
+    credentialReads += 1
+    return toolCredentials
+  },
 }))
 
 mock.module('../attachment-service', () => ({
   saveAttachment: saveAttachmentMock,
+  deleteAttachment: () => undefined,
   isImageAttachment: (mediaType: string) => mediaType.startsWith('image/'),
 }))
 
@@ -77,10 +84,17 @@ beforeAll(async () => {
 beforeEach(() => {
   toolEnabled = true
   toolCredentials = { apiKey: 'test-key', model: 'global-image-model' }
+  credentialReads = 0
   fetchImplementation = async () => createFetchResponse()
   fetchMock.mockClear()
   saveAttachmentMock.mockClear()
 })
+
+/** 把 Nano Banana 公开快照解析为不含凭据的主进程运行路由。 */
+const resolveNanoRoute: ResolveImageGenerationRoute = (snapshot) => {
+  if (snapshot.executor !== 'nano-banana') throw new Error('测试预期 Nano Banana 路由')
+  return { executor: 'nano-banana', snapshot }
+}
 
 afterAll(() => {
   globalThis.fetch = originalFetch
@@ -122,7 +136,7 @@ describe('Nano Banana Pi 工具附件来源', () => {
     const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
       sessionId: 'session-design-model-b',
       trustedImageRoute,
-      assertTrustedImageRouteAvailable: () => undefined,
+      resolveTrustedImageRoute: resolveNanoRoute,
     }) as unknown as TestToolDefinition[]
 
     await tool!.execute('tool-design-1', { prompt: 'draw', model: 'gemini-model-a' })
@@ -171,7 +185,7 @@ describe('Nano Banana Pi 工具附件来源', () => {
     const [failedTool] = nanoBanana.buildPiNanoBananaTools(sdk, {
       sessionId: 'session-route-invalid',
       trustedImageRoute,
-      assertTrustedImageRouteAvailable: () => { throw new Error('所选生图模型已停用') },
+      resolveTrustedImageRoute: () => { throw new Error('所选生图模型已停用') },
     }) as unknown as TestToolDefinition[]
 
     const failed = await failedTool!.execute('tool-invalid-1', {
@@ -209,7 +223,7 @@ describe('Nano Banana Pi 工具附件来源', () => {
     expect(nanoBanana.buildPiNanoBananaTools(sdk, {
       sessionId: 'design-enabled',
       trustedImageRoute,
-      assertTrustedImageRouteAvailable: () => undefined,
+      resolveTrustedImageRoute: resolveNanoRoute,
     })).toHaveLength(1)
   })
 
@@ -225,7 +239,7 @@ describe('Nano Banana Pi 工具附件来源', () => {
     const tools = nanoBanana.buildPiNanoBananaTools(sdk, {
       sessionId: 'design-key-deleted',
       trustedImageRoute,
-      assertTrustedImageRouteAvailable: () => { throw new Error('Nano Banana API Key 未配置: nano-banana') },
+      resolveTrustedImageRoute: () => { throw new Error('Nano Banana API Key 未配置: nano-banana') },
     }) as unknown as TestToolDefinition[]
 
     expect(tools).toHaveLength(1)
@@ -246,8 +260,52 @@ describe('Nano Banana Pi 工具附件来源', () => {
     }) as unknown as TestToolDefinition[]
 
     const result = await tool!.execute('tool-missing-assertion', { prompt: 'draw' })
-    expect(result.content[0]?.text).toContain('缺少可信生图模型实时复核')
+    expect(result.content[0]?.text).toContain('缺少可信生图模型实时解析')
     expect(fetchMock).toHaveBeenCalledTimes(0)
+  })
+
+  test('Given Design 注入 GPT Image 2 路由 When 执行 Then 不读取 Nano Banana 凭据并返回本地附件', async () => {
+    toolEnabled = false
+    toolCredentials = { apiKey: '', model: 'global-image-model' }
+    fetchImplementation = async () => new Response(JSON.stringify({
+      data: [{ b64_json: Buffer.from('89504e470d0a1a0a', 'hex').toString('base64') }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const trustedImageRoute: ImageGenerationModelSnapshot = {
+      profileId: 'profile-gpt',
+      name: 'GPT Image 2',
+      executor: 'openai-images',
+      channelId: 'channel-gpt',
+      modelId: 'gpt-image-2',
+    }
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'session-gpt-image',
+      trustedImageRoute,
+      resolveTrustedImageRoute: (snapshot) => {
+        if (snapshot.executor !== 'openai-images') throw new Error('测试预期 OpenAI Images 路由')
+        return {
+          executor: 'openai-images',
+          snapshot,
+          baseUrl: 'http://100.124.186.117:8030/v1',
+          apiKey: 'gpt-secret',
+        }
+      },
+    }) as unknown as TestToolDefinition[]
+
+    const result = await tool!.execute('tool-gpt-image', { prompt: 'draw' })
+
+    expect(credentialReads).toBe(0)
+    expect(String(fetchMock.mock.calls[0]?.[0])).toEndWith('/images/generations')
+    expect(result.details).toEqual(expect.objectContaining({
+      source: 'proma-nano-banana',
+      generated: true,
+      imageAttachments: [expect.objectContaining({
+        localPath: expect.stringMatching(/^session-gpt-image\//),
+        mediaType: 'image/png',
+      })],
+    }))
   })
 
   test('Given 图片请求仍在等待 When Agent 取消 Then 抛 AbortError 且不保存附件或历史', async () => {
