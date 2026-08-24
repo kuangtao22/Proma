@@ -18,6 +18,8 @@ afterEach(() => {
 function createPaths(root: string, projectId: string): DesignPaths {
   /** 项目独立的 Design 缓存根。 */
   const cacheRoot = join(root, projectId)
+  /** 项目内可移植创作资料根。 */
+  const contextRoot = join(root, 'projects', projectId, '.proma', 'design', 'context')
   return {
     projectId,
     projectRoot: join(root, 'projects', projectId),
@@ -25,6 +27,10 @@ function createPaths(root: string, projectId: string): DesignPaths {
     canvasPath: join(root, 'projects', projectId, '.proma', 'design', 'canvas.json'),
     assetsDir: join(root, 'projects', projectId, '.proma', 'design', 'assets'),
     annotationsDir: join(root, 'projects', projectId, '.proma', 'design', 'annotations'),
+    contextRoot,
+    contextManifestPath: join(contextRoot, 'manifest.json'),
+    contextDocumentsDir: join(contextRoot, 'documents'),
+    contextReferencesDir: join(contextRoot, 'references'),
     cacheRoot,
     preferencesPath: join(cacheRoot, 'preferences.json'),
     thumbnailsDir: join(cacheRoot, 'thumbnails'),

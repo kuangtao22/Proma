@@ -4,8 +4,9 @@ import type {
   CreateDesignJobInput,
   DesignAsset,
   DesignCanvasDocument,
+  DesignContextMode,
 } from '@proma/shared'
-import { Download, ImageOff, RefreshCw, Send, Settings2, Trash2, Upload, X } from 'lucide-react'
+import { BookOpen, BookmarkPlus, Download, ImageOff, RefreshCw, Send, Settings2, Trash2, Upload, X } from 'lucide-react'
 import { useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
 import {
@@ -45,6 +46,7 @@ import {
   createDesignTaskDetailsController,
   DesignTaskDetails,
 } from './DesignTaskDetails'
+import { DesignContextLibrary } from './DesignContextLibrary'
 
 /** 首版图片生成允许的画面比例。 */
 export type DesignAspectRatio = '1:1' | '16:9' | '4:3' | '9:16' | '3:4'
@@ -76,11 +78,13 @@ export function createDesignGenerationJobInput(
   imageSize: DesignImageSize,
   imageModelProfileId: string,
   position: { x: number; y: number },
+  contextMode: DesignContextMode = 'auto',
 ): CreateDesignJobInput {
   return {
     projectId,
     action: 'generate',
     prompt: serializeDesignGenerationPrompt(prompt, aspectRatio, imageSize),
+    contextMode,
     imageModelProfileId,
     position,
   }
@@ -94,11 +98,13 @@ export function createDesignEditJobInput(
   maskAnnotationId: string | undefined,
   imageModelProfileId: string,
   position: { x: number; y: number },
+  contextMode: DesignContextMode = 'auto',
 ): CreateDesignJobInput {
   return {
     projectId,
     action: 'edit',
     prompt: prompt.trim(),
+    contextMode,
     imageModelProfileId,
     sourceAssetId,
     ...(maskAnnotationId ? { maskAnnotationId } : {}),
@@ -142,6 +148,8 @@ export interface DesignInspectorStateViewProps {
   onTabChange: (tab: DesignProjectState['inspectorTab']) => void
   onGenerationPromptChange?: (prompt: string) => void
   onEditPromptChange?: (prompt: string) => void
+  onContextModeChange?: (mode: DesignContextMode) => void
+  onOpenContextLibrary?: () => void
   onImportAssets: () => void
   onDeleteAsset: (assetId: string) => void
   onRelinkAsset: (assetId: string) => void
@@ -160,6 +168,7 @@ export interface DesignInspectorStateViewProps {
   onCopyTaskPrompt?: (prompt: string) => void
   onRetryJob?: (jobId: string) => void
   onContinueFromVersion?: (assetId: string) => void
+  onAdoptAssetAsVisualStandard?: (asset: DesignAsset) => void
 }
 
 /** 素材标签所需的选择上下文。 */
@@ -224,6 +233,7 @@ function AssetsPanel({
   onSendAssetToSession,
   onGroupSelection,
   onSelectAsset,
+  onAdoptAssetAsVisualStandard,
   onPreviewError,
   onPreviewLoad,
 }: {
@@ -238,6 +248,7 @@ function AssetsPanel({
   onSendAssetToSession?: (assetId: string, sessionId: string) => void
   onGroupSelection: () => void
   onSelectAsset: (assetId: string) => void
+  onAdoptAssetAsVisualStandard?: (asset: DesignAsset) => void
   onPreviewError: (assetId: string) => void
   onPreviewLoad: (assetId: string) => void
 }): React.ReactElement {
@@ -245,6 +256,10 @@ function AssetsPanel({
   const snapshot = state.snapshot!
   /** 无可用目标时保留按钮 disabled 语义，由外层可聚焦元素承载原因提示。 */
   const sessionMenuDisabled = targetSessions.length === 0 || !onSendAssetToSession
+  /** 只有来自成功 Design Job 的完整素材可沉淀为视觉标准。 */
+  const selectedAssetJobSucceeded = Boolean(selection.asset?.sourceJobId && state.jobs.some((job) => (
+    job.id === selection.asset?.sourceJobId && job.status === 'succeeded'
+  )))
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <section className="border-b border-border px-3 py-3">
@@ -298,6 +313,11 @@ function AssetsPanel({
               </DropdownMenu>
               <Button type="button" variant="ghost" size="icon-sm" aria-label="删除素材" disabled={!writable} onClick={() => onDeleteAsset(selection.asset!.id)}><Trash2 aria-hidden="true" /></Button>
             </div>
+            {selectedAssetJobSucceeded && writable && onAdoptAssetAsVisualStandard && (
+              <Button type="button" variant="outline" size="sm" className="w-full" onClick={() => onAdoptAssetAsVisualStandard(selection.asset!)}>
+                <BookmarkPlus aria-hidden="true" />采用为视觉标准
+              </Button>
+            )}
           </div>
         )}
       </section>
@@ -339,6 +359,8 @@ function AiPanel({
   createJobEnabled,
   onGenerationPromptChange,
   onEditPromptChange,
+  onContextModeChange,
+  onOpenContextLibrary,
   onCreateJob,
   onImageModelChange,
   onConfigureImageModels,
@@ -350,6 +372,8 @@ function AiPanel({
   createJobEnabled: boolean
   onGenerationPromptChange?: (prompt: string) => void
   onEditPromptChange?: (prompt: string) => void
+  onContextModeChange?: (mode: DesignContextMode) => void
+  onOpenContextLibrary?: () => void
   onCreateJob: (input: CreateDesignJobInput) => void
   onImageModelChange?: (profileId: string) => void
   onConfigureImageModels?: () => void
@@ -392,6 +416,7 @@ function AiPanel({
       imageSize,
       state.imageModelProfileId,
       position,
+      state.contextMode,
     ))
   }
   /** 提交单素材编辑任务。 */
@@ -405,6 +430,7 @@ function AiPanel({
       maskAnnotationId === 'none' ? undefined : maskAnnotationId,
       state.imageModelProfileId,
       position,
+      state.contextMode,
     ))
   }
 
@@ -487,6 +513,52 @@ function AiPanel({
     </div>
   )
 
+  /** 项目上下文是单次任务策略，不编码进用户提示词。 */
+  const contextModeOptions: ReadonlyArray<{
+    value: DesignContextMode
+    label: string
+    description: string
+  }> = [
+    { value: 'auto', label: '自动', description: 'Agent 按任务判断是否读取项目资料' },
+    { value: 'project', label: '使用项目', description: '要求 Agent 读取项目代码或创作资料' },
+    { value: 'none', label: '不使用项目', description: '只使用本次要求和附件' },
+  ]
+  /** 紧凑三态控件放在模型之后，保持生成与编辑入口一致。 */
+  const contextModeField = (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <Label className="text-xs">项目上下文</Label>
+        <Button type="button" variant="ghost" size="sm" className="h-7 px-2" onClick={onOpenContextLibrary}>
+          <BookOpen aria-hidden="true" />创作资料库
+        </Button>
+      </div>
+      <TooltipProvider delayDuration={200} disableHoverableContent>
+        <div role="radiogroup" aria-label="项目上下文" className="grid min-h-8 grid-cols-3 overflow-hidden rounded-sm border border-border bg-muted/40 p-0.5">
+          {contextModeOptions.map((option) => (
+            <Tooltip key={option.value}>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={state.contextMode === option.value}
+                  className={cn(
+                    'min-w-0 whitespace-normal rounded-sm px-1.5 py-1 text-[11px] leading-4 text-muted-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                    state.contextMode === option.value && 'bg-background font-medium text-foreground shadow-sm',
+                  )}
+                  disabled={!writable}
+                  onClick={() => onContextModeChange?.(option.value)}
+                >
+                  {option.label}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-56">{option.description}</TooltipContent>
+            </Tooltip>
+          ))}
+        </div>
+      </TooltipProvider>
+    </div>
+  )
+
   /** 根据选区生成模型字段之后的任务表单或限制说明。 */
   let taskContent: React.ReactElement
   if (selection.selectedNodeCount > 0 && !selection.canvasAssetNodeSelected) {
@@ -529,7 +601,7 @@ function AiPanel({
       <Button type="submit" size="sm" className="w-full" disabled={!enabled || !state.generationPrompt.trim()}><Send aria-hidden="true" />生成图片</Button>
     </form>
   }
-  return <div className="space-y-3">{imageModelField}{taskContent}</div>
+  return <div className="space-y-3">{imageModelField}{contextModeField}{taskContent}</div>
 }
 
 /** 迭代版本行避免深版本链递归渲染。 */
@@ -652,8 +724,8 @@ export function DesignInspectorStateView(props: DesignInspectorStateViewProps): 
           <TabsTrigger value="ai" className="min-w-0 px-1 text-xs">AI 编辑</TabsTrigger>
           <TabsTrigger value="versions" className="min-w-0 px-1 text-xs">版本</TabsTrigger>
         </TabsList>
-        <TabsContent value="assets" forceMount className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden"><AssetsPanel state={state} selection={selection} writable={writable} onImportAssets={props.onImportAssets} onDeleteAsset={props.onDeleteAsset} onRelinkAsset={props.onRelinkAsset} onExportAsset={props.onExportAsset} targetSessions={props.targetSessions ?? []} onSendAssetToSession={props.onSendAssetToSession} onGroupSelection={props.onGroupSelection} onSelectAsset={props.onSelectAsset} onPreviewError={(failedAssetId) => setMissingAssetIds((current) => new Set(current).add(failedAssetId))} onPreviewLoad={(loadedAssetId) => setMissingAssetIds((current) => { if (!current.has(loadedAssetId)) return current; const next = new Set(current); next.delete(loadedAssetId); return next })} /></TabsContent>
-        <TabsContent value="ai" forceMount className="mt-0 min-h-0 flex-1 overflow-y-auto px-3 py-3 data-[state=inactive]:hidden"><AiPanel state={state} selection={selection} writable={writable} createJobEnabled={props.createJobEnabled ?? true} onGenerationPromptChange={props.onGenerationPromptChange} onEditPromptChange={props.onEditPromptChange} onCreateJob={props.onCreateJob} onImageModelChange={props.onImageModelChange} onConfigureImageModels={props.onConfigureImageModels} onRetryImageModels={props.onRetryImageModels} /></TabsContent>
+        <TabsContent value="assets" forceMount className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden"><AssetsPanel state={state} selection={selection} writable={writable} onImportAssets={props.onImportAssets} onDeleteAsset={props.onDeleteAsset} onRelinkAsset={props.onRelinkAsset} onExportAsset={props.onExportAsset} targetSessions={props.targetSessions ?? []} onSendAssetToSession={props.onSendAssetToSession} onGroupSelection={props.onGroupSelection} onSelectAsset={props.onSelectAsset} onAdoptAssetAsVisualStandard={props.onAdoptAssetAsVisualStandard} onPreviewError={(failedAssetId) => setMissingAssetIds((current) => new Set(current).add(failedAssetId))} onPreviewLoad={(loadedAssetId) => setMissingAssetIds((current) => { if (!current.has(loadedAssetId)) return current; const next = new Set(current); next.delete(loadedAssetId); return next })} /></TabsContent>
+        <TabsContent value="ai" forceMount className="mt-0 min-h-0 flex-1 overflow-y-auto px-3 py-3 data-[state=inactive]:hidden"><AiPanel state={state} selection={selection} writable={writable} createJobEnabled={props.createJobEnabled ?? true} onGenerationPromptChange={props.onGenerationPromptChange} onEditPromptChange={props.onEditPromptChange} onContextModeChange={props.onContextModeChange} onOpenContextLibrary={props.onOpenContextLibrary} onCreateJob={props.onCreateJob} onImageModelChange={props.onImageModelChange} onConfigureImageModels={props.onConfigureImageModels} onRetryImageModels={props.onRetryImageModels} /></TabsContent>
         <TabsContent value="versions" forceMount className="mt-0 min-h-0 flex-1 overflow-y-auto px-3 py-3 data-[state=inactive]:hidden"><h3 className="mb-2 text-xs font-semibold">素材版本</h3><VersionsPanel assets={state.snapshot.document.assets} currentAssetId={selection.asset?.id ?? null} onSelectAsset={props.onSelectAsset} /></TabsContent>
       </Tabs>
     </aside>
@@ -694,6 +766,8 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
   const setChannelSettingsFocus = useSetAtom(channelSettingsFocusAtom)
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const openSession = useOpenSession()
+  /** 待确认的成功素材只保存在当前 Inspector 内存，不提前写入资料库。 */
+  const [visualStandardCandidate, setVisualStandardCandidate] = React.useState<DesignAsset | undefined>()
   /** 模型 controller 只在进入项目、模型广播和手动重试时访问主进程。 */
   const imageModelSelection = useDesignImageModelSelection(projectId)
   /** 当前项目内可接收素材的未归档会话，首项即默认目标。 */
@@ -782,14 +856,24 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
       toast.error(error instanceof Error ? error.message : '发送素材到会话失败')
     })
   }, [enqueuePendingMentions, openSession, projectId, setActiveView, targetSessions])
+  /** 稳定资料库状态更新函数，避免打开期间重复订阅上下文广播。 */
+  const handleContextStateChange = React.useCallback((update: Partial<Pick<
+    DesignProjectState,
+    'contextEntries' | 'contextLoadState' | 'contextError' | 'contextLibraryOpen'
+  >>): void => {
+    updateState({ projectId, update })
+  }, [projectId, updateState])
   return (
-    <DesignInspectorStateView
+    <>
+      <DesignInspectorStateView
       state={state}
       width={width}
       createJobEnabled
       onTabChange={(inspectorTab) => updateState({ projectId, update: { inspectorTab } })}
       onGenerationPromptChange={(generationPrompt) => updateState({ projectId, update: { generationPrompt } })}
       onEditPromptChange={(editPrompt) => updateState({ projectId, update: { editPrompt } })}
+      onContextModeChange={(contextMode) => updateState({ projectId, update: { contextMode } })}
+      onOpenContextLibrary={() => updateState({ projectId, update: { contextLibraryOpen: true } })}
       onImportAssets={actions.importAssets}
       onDeleteAsset={actions.deleteAsset}
       onRelinkAsset={actions.relinkAsset}
@@ -808,6 +892,19 @@ export function DesignInspector({ projectId, width }: DesignInspectorProps): Rea
       onCopyTaskPrompt={handleCopyTaskPrompt}
       onRetryJob={handleRetryJob}
       onContinueFromVersion={handleContinueFromVersion}
-    />
+      onAdoptAssetAsVisualStandard={(asset) => {
+        setVisualStandardCandidate(asset)
+        updateState({ projectId, update: { contextLibraryOpen: true } })
+      }}
+      />
+      <DesignContextLibrary
+        projectId={projectId}
+        state={state}
+        writable={Boolean(state.snapshot?.writable)}
+        visualStandardCandidate={visualStandardCandidate}
+        onVisualStandardCandidateChange={setVisualStandardCandidate}
+        onStateChange={handleContextStateChange}
+      />
+    </>
   )
 }

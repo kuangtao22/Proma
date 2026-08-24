@@ -181,6 +181,10 @@ describe('Design Inspector 状态', () => {
     expect(html).toContain('生成图片')
     expect(html).toContain('画面比例')
     expect(html).toContain('图片尺寸')
+    expect(html).toContain('自动')
+    expect(html).toContain('使用项目')
+    expect(html).toContain('不使用项目')
+    expect(html).toContain('创作资料库')
   })
 
   test('Given 单选素材节点 When 渲染 Then 显示文件、尺寸、来源和素材命令', () => {
@@ -191,6 +195,32 @@ describe('Design Inspector 状态', () => {
     expect(html).toContain('本地导入')
     expect(html).toContain('aria-label="导出素材"')
     expect(html).toContain('aria-label="删除素材"')
+  })
+
+  test('Given 素材来自成功或失败任务 When 渲染 Then 仅成功素材可采用为视觉标准', () => {
+    const snapshot = createSnapshot()
+    snapshot.document.assets[0] = createAsset({ sourceJobId: 'job-1' })
+    /** 同一创作任务只切换状态，验证动作不会泄露给失败结果。 */
+    const baseJob = {
+      id: 'job-1', creativeTaskId: 'creative-1', attemptNumber: 1,
+      projectId: 'project-1', action: 'generate' as const, prompt: '首页', originalRequest: '首页',
+      contextMode: 'auto' as const, createdAt: 1, updatedAt: 1,
+    }
+    const renderStatus = (status: 'succeeded' | 'failed'): string => renderToStaticMarkup(
+      <DesignInspectorStateView
+        state={{
+          ...createInitialDesignProjectState(), phase: 'ready', snapshot,
+          selectedNodeIds: ['node-1'], jobs: [{ ...baseJob, status }],
+        }}
+        onTabChange={() => undefined} onImportAssets={() => undefined} onDeleteAsset={() => undefined}
+        onRelinkAsset={() => undefined} onExportAsset={() => undefined} onGroupSelection={() => undefined}
+        onSelectAsset={() => undefined} onCreateJob={() => undefined}
+        onAdoptAssetAsVisualStandard={() => undefined}
+      />,
+    )
+
+    expect(renderStatus('succeeded')).toContain('采用为视觉标准')
+    expect(renderStatus('failed')).not.toContain('采用为视觉标准')
   })
 
   test('Given 当前项目没有目标会话 When 渲染发送菜单 Then 提示触发器可聚焦且按钮保持禁用', () => {
@@ -433,18 +463,18 @@ describe('Design Inspector 状态', () => {
 })
 
 describe('Design Inspector 纯业务契约', () => {
-  test('Given 选择了项目生图模型 When 创建生成和编辑输入 Then 两类任务都携带稳定 profile ID', () => {
+  test('Given 选择了项目生图模型和上下文模式 When 创建生成和编辑输入 Then 两类任务都透传选择', () => {
     expect(createDesignGenerationJobInput(
-      'project-1', '海报', '1:1', '1K', 'profile-flash', { x: 0, y: 0 },
-    ).imageModelProfileId).toBe('profile-flash')
+      'project-1', '海报', '1:1', '1K', 'profile-flash', { x: 0, y: 0 }, 'none',
+    )).toMatchObject({ imageModelProfileId: 'profile-flash', contextMode: 'none' })
     expect(createDesignEditJobInput(
-      'project-1', '换成蓝色', 'asset-1', undefined, 'profile-pro', { x: 0, y: 0 },
-    ).imageModelProfileId).toBe('profile-pro')
+      'project-1', '换成蓝色', 'asset-1', undefined, 'profile-pro', { x: 0, y: 0 }, 'project',
+    )).toMatchObject({ imageModelProfileId: 'profile-pro', contextMode: 'project' })
   })
 
   test('Given 当前项目缺少模型或任务携带旧模型 When 提交 Then 在主进程调用前阻断', () => {
     const input = createDesignGenerationJobInput(
-      'project-1', '海报', '1:1', '1K', 'profile-flash', { x: 0, y: 0 },
+      'project-1', '海报', '1:1', '1K', 'profile-flash', { x: 0, y: 0 }, 'auto',
     )
 
     expect(canCreateDesignJobWithSelectedModel(input, null)).toBe(false)
@@ -481,12 +511,12 @@ describe('Design Inspector 纯业务契约', () => {
   test('Given 生成与编辑表单 When 输出任务 Then 只使用现有共享字段并保留可选蒙版', () => {
     /** 模拟项目模型选择层补齐后的生成任务 fixture。 */
     const generationInput = {
-      ...createDesignGenerationJobInput('project-1', ' 生成海报 ', '3:4', '4K', 'profile-flash', { x: 5, y: 6 }),
+      ...createDesignGenerationJobInput('project-1', ' 生成海报 ', '3:4', '4K', 'profile-flash', { x: 5, y: 6 }, 'none'),
       imageModelProfileId: 'profile-flash',
     } satisfies CreateDesignJobInput
     /** 模拟项目模型选择层补齐后的编辑任务 fixture。 */
     const editInput = {
-      ...createDesignEditJobInput('project-1', ' 去掉文字 ', 'asset-1', 'mask-1', 'profile-flash', { x: 7, y: 8 }),
+      ...createDesignEditJobInput('project-1', ' 去掉文字 ', 'asset-1', 'mask-1', 'profile-flash', { x: 7, y: 8 }, 'project'),
       imageModelProfileId: 'profile-flash',
     } satisfies CreateDesignJobInput
 
@@ -494,6 +524,7 @@ describe('Design Inspector 纯业务契约', () => {
       projectId: 'project-1',
       action: 'generate',
       prompt: '生成海报\n\n[PROMA_DESIGN_CONSTRAINTS]\n{"aspectRatio":"3:4","imageSize":"4K"}',
+      contextMode: 'none',
       imageModelProfileId: 'profile-flash',
       position: { x: 5, y: 6 },
     })
@@ -501,6 +532,7 @@ describe('Design Inspector 纯业务契约', () => {
       projectId: 'project-1',
       action: 'edit',
       prompt: '去掉文字',
+      contextMode: 'project',
       imageModelProfileId: 'profile-flash',
       sourceAssetId: 'asset-1',
       maskAnnotationId: 'mask-1',

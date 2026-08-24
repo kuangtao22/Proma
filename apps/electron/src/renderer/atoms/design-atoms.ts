@@ -1,4 +1,6 @@
 import type {
+  DesignContextEntry,
+  DesignContextMode,
   DesignJobRecord,
   DesignTaskDetails,
   ImageGenerationModelOption,
@@ -57,6 +59,16 @@ export interface DesignProjectState {
   invalidImageModelProfileId: string | null
   /** 模型目录或项目偏好加载失败的独立错误。 */
   imageModelError: string | null
+  /** 当前项目新任务读取项目资料的策略。 */
+  contextMode: DesignContextMode
+  /** 当前项目已按需加载的创作资料清单。 */
+  contextEntries: DesignContextEntry[]
+  /** 创作资料库的独立加载阶段。 */
+  contextLoadState: 'idle' | 'loading' | 'ready' | 'failed'
+  /** 创作资料库最近一次读取或写入错误。 */
+  contextError: string | null
+  /** 当前项目是否打开创作资料库侧栏。 */
+  contextLibraryOpen: boolean
   selectedNodeIds: string[]
   /** 右栏直接选中的素材；允许无画布节点素材进入详情与删除流程。 */
   inspectorAssetId: string | null
@@ -96,6 +108,11 @@ export function createInitialDesignProjectState(): DesignProjectState {
     imageModelProfileId: null,
     invalidImageModelProfileId: null,
     imageModelError: null,
+    contextMode: 'auto',
+    contextEntries: [],
+    contextLoadState: 'idle',
+    contextError: null,
+    contextLibraryOpen: false,
     selectedNodeIds: [],
     inspectorAssetId: null,
     activeTool: 'select',

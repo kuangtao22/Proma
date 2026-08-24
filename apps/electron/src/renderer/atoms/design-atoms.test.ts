@@ -40,6 +40,16 @@ describe('Design 项目状态', () => {
     expect(state.deletingJobId).toBeNull()
   })
 
+  test('Given 新 Design 项目 When 创建状态 Then 默认使用自动上下文模式且资料库尚未加载', () => {
+    const state = createInitialDesignProjectState()
+
+    expect(state.contextMode).toBe('auto')
+    expect(state.contextEntries).toEqual([])
+    expect(state.contextLoadState).toBe('idle')
+    expect(state.contextError).toBeNull()
+    expect(state.contextLibraryOpen).toBe(false)
+  })
+
   test('Given 两个新项目 When 创建任务详情缓存 Then Map 不共享引用', () => {
     const first = createInitialDesignProjectState()
     const second = createInitialDesignProjectState()
@@ -57,6 +67,7 @@ describe('Design 项目状态', () => {
     expect(first.imageModelError).toBeNull()
     expect(first.imageModelOptions).toEqual([])
     expect(first.imageModelOptions).not.toBe(second.imageModelOptions)
+    expect(first.contextEntries).not.toBe(second.contextEntries)
   })
 
   test('Given 权威恢复正在加载 When 执行编辑或撤销 Then 旧快照保持不变', () => {
