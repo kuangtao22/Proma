@@ -1,5 +1,4 @@
 import { isAbsolute, join, posix, relative, resolve, sep, win32 } from 'node:path'
-import type { PlatformPath } from 'node:path'
 import {
   captureDirectoryGuard,
   needsPersistentJsonCommit,
@@ -24,6 +23,9 @@ import {
 } from './owned-path-rebaser-schema'
 import type { JsonObject } from './owned-path-rebaser-schema'
 import { isWorkspaceSlug } from './workspace-slug'
+
+/** POSIX 与 Win32 共用的路径 API 类型，避免依赖 Node 类型声明的内部命名空间导出。 */
+type PlatformPath = typeof posix
 
 /** 数据根重写参数。 */
 export interface RebaseDataRootOwnedPathsInput {
