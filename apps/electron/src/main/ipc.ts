@@ -172,7 +172,10 @@ import {
 import { DesignAssetService } from './lib/design/design-asset-service'
 import { DesignImageModelPreferences } from './lib/design/design-image-model-preferences'
 import { registerDesignIpcHandlers } from './lib/design/design-ipc'
-import { updateToolCredentialsWithImageModelBroadcast } from './lib/image-model-profile-broadcast'
+import {
+  runChannelMutationWithImageModelBroadcast,
+  updateToolCredentialsWithImageModelBroadcast,
+} from './lib/image-model-profile-broadcast'
 import { DesignSessionBridge } from './lib/design/design-session-bridge'
 import {
   DesignJobManager,
@@ -1517,7 +1520,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     CHANNEL_IPC_CHANNELS.CREATE,
     async (_, input: ChannelCreateInput): Promise<Channel> => {
-      return createChannel(input)
+      return runChannelMutationWithImageModelBroadcast({
+        mutate: () => createChannel(input),
+        listTargets: () => BrowserWindow.getAllWindows().map((window) => window.webContents),
+      })
     }
   )
 
@@ -1525,7 +1531,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     CHANNEL_IPC_CHANNELS.UPDATE,
     async (_, id: string, input: ChannelUpdateInput): Promise<Channel> => {
-      return updateChannel(id, input)
+      return runChannelMutationWithImageModelBroadcast({
+        mutate: () => updateChannel(id, input),
+        listTargets: () => BrowserWindow.getAllWindows().map((window) => window.webContents),
+      })
     }
   )
 
@@ -1533,7 +1542,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     CHANNEL_IPC_CHANNELS.DELETE,
     async (_, id: string): Promise<void> => {
-      return deleteChannel(id)
+      return runChannelMutationWithImageModelBroadcast({
+        mutate: () => deleteChannel(id),
+        listTargets: () => BrowserWindow.getAllWindows().map((window) => window.webContents),
+      })
     }
   )
 

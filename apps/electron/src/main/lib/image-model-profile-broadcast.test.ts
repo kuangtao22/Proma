@@ -20,6 +20,35 @@ function createTarget(id: number, destroyed = false): {
 }
 
 describe('image model profile broadcast', () => {
+  test('Given 渠道写入成功 When 创建更新或删除渠道 Then 生图目录收到无 payload 刷新', async () => {
+    const { runChannelMutationWithImageModelBroadcast } = broadcastModule
+    /** 记录渠道事务成功后的刷新事件。 */
+    const target = createTarget(1)
+
+    const result = await runChannelMutationWithImageModelBroadcast({
+      mutate: () => ({ id: 'channel-gpt' }),
+      listTargets: () => [target],
+    })
+
+    expect(result).toEqual({ id: 'channel-gpt' })
+    expect(target.sent).toEqual([{
+      channel: DESIGN_IPC_CHANNELS.IMAGE_MODEL_PROFILES_CHANGED,
+      value: undefined,
+    }])
+  })
+
+  test('Given 渠道写入失败 When 执行包装 Then 不广播', async () => {
+    const { runChannelMutationWithImageModelBroadcast } = broadcastModule
+    /** 失败事务不能产生与持久化事实不一致的刷新事件。 */
+    const target = createTarget(1)
+
+    expect(runChannelMutationWithImageModelBroadcast({
+      mutate: () => { throw new Error('渠道写入失败') },
+      listTargets: () => [target],
+    })).rejects.toThrow('渠道写入失败')
+    expect(target.sent).toEqual([])
+  })
+
   test('Given Nano Banana 凭据成功持久化 When 更新工具凭据 Then 两个窗口收到无凭据事件', async () => {
     const { updateToolCredentialsWithImageModelBroadcast } = broadcastModule
     /** 两个仍存活的相关窗口。 */

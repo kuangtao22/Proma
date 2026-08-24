@@ -17,6 +17,13 @@ interface UpdateToolCredentialsWithImageModelBroadcastInput {
   listTargets: () => ImageModelProfileBroadcastTarget[]
 }
 
+interface ChannelMutationWithImageModelBroadcastInput<Result> {
+  /** 执行渠道创建、更新或删除事务，并返回原始结果。 */
+  mutate: () => Result | Promise<Result>
+  /** 列出本次应接收无 payload 通知的相关窗口。 */
+  listTargets: () => ImageModelProfileBroadcastTarget[]
+}
+
 /** 向全部存活窗口广播既有模型目录变化事件，不携带任何凭据或目录内容。 */
 export function broadcastImageModelProfilesChanged(
   targets: readonly ImageModelProfileBroadcastTarget[],
@@ -38,4 +45,14 @@ export async function updateToolCredentialsWithImageModelBroadcast(
   await input.updateCredentials(input.toolId, input.credentials)
   if (input.toolId !== 'nano-banana') return
   broadcastImageModelProfilesChanged(input.listTargets())
+}
+
+/** 只在渠道事务成功后通知 Renderer 重算生图 profile 可用性。 */
+export async function runChannelMutationWithImageModelBroadcast<Result>(
+  input: ChannelMutationWithImageModelBroadcastInput<Result>,
+): Promise<Result> {
+  /** 保留渠道管理器的原始返回值和错误语义。 */
+  const result = await input.mutate()
+  broadcastImageModelProfilesChanged(input.listTargets())
+  return result
 }
