@@ -9,6 +9,7 @@ import {
   activeCanvasSessionAtom,
 } from '@/atoms/canvas-session-atoms'
 import { DesignWorkspaceView } from './DesignWorkspaceView'
+import { NativeCanvasWorkspace } from './NativeCanvasWorkspace'
 
 /** Canvas 主区当前应挂载的工作区类型。 */
 export type CanvasWorkspaceMode = 'missing' | 'legacy' | 'native'
@@ -26,6 +27,8 @@ export interface CanvasWorkspaceEntryStateViewProps {
   session: CanvasSessionMeta | null
   /** 只有 legacy 模式才会挂载的现有 Design 工作区。 */
   legacyWorkspace: React.ReactNode
+  /** 只有 native 模式才会挂载的原生 Canvas 工作区。 */
+  nativeWorkspace: React.ReactNode
 }
 
 /** 纯渲染分派层，确保原生 Canvas 不挂载旧 Design controller。 */
@@ -33,6 +36,7 @@ export function CanvasWorkspaceEntryStateView({
   mode,
   session,
   legacyWorkspace,
+  nativeWorkspace,
 }: CanvasWorkspaceEntryStateViewProps): React.ReactElement {
   if (mode === 'legacy') return <>{legacyWorkspace}</>
 
@@ -47,15 +51,7 @@ export function CanvasWorkspaceEntryStateView({
     )
   }
 
-  return (
-    <div className="flex h-full items-center justify-center bg-content-area px-6 text-center">
-      <div className="flex max-w-sm flex-col items-center gap-2">
-        <Workflow className="size-6 text-primary" aria-hidden="true" />
-        <h2 className="text-[15px] font-medium text-foreground">{session?.title}</h2>
-        <p className="text-[13px] text-muted-foreground">尚无节点</p>
-      </div>
-    </div>
-  )
+  return <>{nativeWorkspace}</>
 }
 
 /** 从 Canvas registry 解析当前选择并挂载对应工作区。 */
@@ -68,6 +64,13 @@ export function CanvasWorkspaceEntry(): React.ReactElement {
       mode={getCanvasWorkspaceMode(session)}
       session={session}
       legacyWorkspace={<DesignWorkspaceView />}
+      nativeWorkspace={session ? (
+        <NativeCanvasWorkspace
+          key={`${session.projectId}:${session.id}`}
+          target={{ projectId: session.projectId, canvasId: session.id }}
+          title={session.title}
+        />
+      ) : null}
     />
   )
 }

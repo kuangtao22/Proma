@@ -34,6 +34,7 @@ describe('Canvas 工作区分派', () => {
         mode={getCanvasWorkspaceMode(session)}
         session={session}
         legacyWorkspace={<div data-legacy-design-workspace>旧设计工作区</div>}
+        nativeWorkspace={<div data-native-canvas-workspace>原生 Canvas 工作区</div>}
       />,
     )
 
@@ -41,18 +42,19 @@ describe('Canvas 工作区分派', () => {
     expect(html).toContain('旧设计工作区')
   })
 
-  test('Given 原生 Canvas When 分派 Then 只显示独立空状态', () => {
+  test('Given 原生 Canvas When 分派 Then 挂载真实原生工作区槽位', () => {
     const session = createSession('canvas-1')
     const html = renderToStaticMarkup(
       <CanvasWorkspaceEntryStateView
         mode={getCanvasWorkspaceMode(session)}
         session={session}
         legacyWorkspace={<div data-legacy-design-workspace>旧设计工作区</div>}
+        nativeWorkspace={<div data-native-canvas-workspace>原生 Canvas 工作区</div>}
       />,
     )
 
-    expect(html).toContain('首页视觉探索')
-    expect(html).toContain('尚无节点')
+    expect(html).toContain('data-native-canvas-workspace')
+    expect(html).toContain('原生 Canvas 工作区')
     expect(html).not.toContain('data-legacy-design-workspace')
   })
 
@@ -68,8 +70,9 @@ describe('Canvas 工作区分派', () => {
       </Provider>,
     )
 
-    expect(html).toContain('首页视觉探索')
-    expect(html).toContain('尚无节点')
+    expect(html).toContain('data-native-canvas-workspace')
+    expect(html).toContain('data-project-id="project-1"')
+    expect(html).toContain('data-canvas-id="canvas-1"')
     expect(html).not.toContain('正在加载设计工作区')
   })
 
