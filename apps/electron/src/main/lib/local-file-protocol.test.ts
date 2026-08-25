@@ -53,6 +53,41 @@ describe('proma-file 目录授权', () => {
     expect(await response.text()).toBe('2345')
   })
 
+  test('Given 已授权 Buffer 注册为单文件 token When 原路径被替换 Then 协议始终返回授权内容', async () => {
+    const filePath = join(root, 'preview.webp')
+    const replacementPath = join(outsideRoot, 'replacement.webp')
+    writeFileSync(filePath, 'authorized-content', 'utf8')
+    writeFileSync(replacementPath, 'replacement-content', 'utf8')
+    const registry = createPromaFileProtocolRegistry({ now: () => 0 })
+    const authorizedContent = Buffer.from('authorized-content')
+    const fileUrl = registry.registerAuthorizedFile(filePath, authorizedContent)
+    renameSync(replacementPath, filePath)
+
+    const response = await registry.handleRequest(new Request(fileUrl))
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('authorized-content')
+    registry.revokePathUrl(fileUrl)
+    registry.revokePathUrl(fileUrl)
+    expect((await registry.handleRequest(new Request(fileUrl))).status).toBe(404)
+  })
+
+  test('Given 已授权 Buffer 超过总预算 When 注册新 token Then LRU 淘汰且单项超限明确拒绝', async () => {
+    let currentTime = 0
+    const registry = createPromaFileProtocolRegistry({
+      now: () => currentTime,
+      maxAuthorizedBufferBytes: 20,
+    })
+    const firstUrl = registry.registerAuthorizedFile(join(root, 'first.webp'), Buffer.alloc(10))
+    currentTime = 1
+    const secondUrl = registry.registerAuthorizedFile(join(root, 'second.webp'), Buffer.alloc(15))
+
+    expect((await registry.handleRequest(new Request(firstUrl))).status).toBe(404)
+    expect((await registry.handleRequest(new Request(secondUrl))).status).toBe(200)
+    expect(() => registry.registerAuthorizedFile(join(root, 'oversized.webp'), Buffer.alloc(21)))
+      .toThrow('本地文件授权内容超过内存预算')
+  })
+
   test('Given Range 起点越过文件末尾 When 读取媒体 Then 返回 416 与完整大小', async () => {
     writeFileSync(join(root, 'preview.webp'), 'preview', 'utf8')
     const registry = createPromaFileProtocolRegistry({ now: () => 0 })

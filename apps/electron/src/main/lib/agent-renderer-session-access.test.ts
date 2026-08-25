@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import type { AgentSessionMeta, FileAccessOptions } from '@proma/shared'
@@ -73,6 +73,522 @@ const NON_AGENT_FILE_CHANNELS = new Set([
   'file:read-binary-base64',
 ])
 
+/** 显式展开 namespace/channel，新增 handler 必须先完成安全语义登记。 */
+function defineRendererHandlerKeys(namespace: string, channels: readonly string[]): string[] {
+  return channels.map((channel) => `${namespace}:${channel}`)
+}
+
+/** ipc.ts 当前全部 Renderer handler 的审计基线；严禁按参数名动态推断分类。 */
+const ALL_RENDERER_HANDLER_KEYS = [
+  ...defineRendererHandlerKeys('AGENT_IPC_CHANNELS', [
+    'ADD_WORKTREE_REPO',
+    'APPROVE_WORKSPACE_PROJECT_KNOWLEDGE_MAINTENANCE',
+    'ASK_USER_RESPOND',
+    'ATTACH_DIRECTORY',
+    'ATTACH_FILE',
+    'ATTACH_WORKSPACE_DIRECTORY',
+    'ATTACH_WORKSPACE_FILE',
+    'BATCH_IMPORT_SKILLS_FROM_WORKSPACES',
+    'CANCEL_QUEUED_MESSAGE',
+    'CHECK_PATHS_TYPE',
+    'CLEAR_COMPLETION_STATE',
+    'CLOSE_BROWSER',
+    'CLOSE_BROWSER_TAB',
+    'CONFIRM_WORKSPACE_MEMORY_WINDOW_CLOSE',
+    'COUNT_ARCHIVED_SESSIONS',
+    'CREATE_BROWSER_TAB',
+    'CREATE_PROJECT',
+    'CREATE_SESSION',
+    'CREATE_SKILL_ENTRY',
+    'CREATE_WORKSPACE',
+    'DELETE_FILE',
+    'DELETE_SESSION',
+    'DELETE_SKILL',
+    'DELETE_SKILL_ENTRY',
+    'DELETE_WORKSPACE',
+    'DETACH_DIRECTORY',
+    'DETACH_FILE',
+    'DETACH_WORKSPACE_DIRECTORY',
+    'DETACH_WORKSPACE_FILE',
+    'ENQUEUE_QUEUED_MESSAGE',
+    'EXIT_PLAN_MODE_RESPOND',
+    'FORK_SESSION',
+    'GENERATE_TITLE',
+    'GET_BROWSER_STATE',
+    'GET_CAPABILITIES',
+    'GET_DEFAULT_SKILL_SLUGS',
+    'GET_MCP_CONFIG',
+    'GET_OTHER_WORKSPACE_SKILLS',
+    'GET_PENDING_REQUESTS',
+    'GET_PI_REASONING_CAPABILITY',
+    'GET_SDK_MESSAGES',
+    'GET_SESSION_PATH',
+    'GET_SKILLS',
+    'GET_SKILLS_DIR',
+    'GET_WORKSPACE_ATTACHED_FILES',
+    'GET_WORKSPACE_DIRECTORIES',
+    'GET_WORKSPACE_FILES_PATH',
+    'GET_WORKSPACE_MEMORY_SUMMARY',
+    'GET_WORKTREE_REPOS',
+    'GO_BACK_BROWSER',
+    'GO_FORWARD_BROWSER',
+    'IMPORT_SKILL_FROM_WORKSPACE',
+    'LIST_ACTIVE_SESSIONS',
+    'LIST_ARCHIVED_SESSIONS',
+    'LIST_ATTACHED_DIRECTORY',
+    'LIST_BROWSER_TABS',
+    'LIST_DIRECTORY',
+    'LIST_SESSIONS',
+    'LIST_SKILL_FILES',
+    'LIST_WORKSPACES',
+    'LIST_WORKSPACE_AUTO_MEMORY_FILES',
+    'MIGRATE_CHAT_TO_AGENT',
+    'MINIMIZE_BROWSER',
+    'MOVE_ATTACHED_FILE',
+    'MOVE_FILE',
+    'MOVE_QUEUED_MESSAGE',
+    'MOVE_SESSION_TO_WORKSPACE',
+    'NAVIGATE_BROWSER',
+    'OPEN_BROWSER',
+    'OPEN_FILE',
+    'OPEN_FILE_OR_FOLDER_DIALOG',
+    'OPEN_FOLDER_DIALOG',
+    'OPEN_FOLDER_IN_TERMINAL',
+    'OPEN_WORKSPACE_MEMORY_WINDOW',
+    'PERMISSION_RESPOND',
+    'QUEUE_MESSAGE',
+    'READ_ATTACHED_FILE',
+    'READ_SKILL_CONTENT',
+    'READ_SKILL_FILE',
+    'READ_WORKSPACE_AGENTS_MD',
+    'READ_WORKSPACE_AUTO_MEMORY_FILE',
+    'RELINK_WORKSPACE_PROJECT_ROOT',
+    'RELOAD_BROWSER',
+    'REMOVE_WORKTREE_REPO',
+    'RENAME_ATTACHED_FILE',
+    'RENAME_FILE',
+    'RENAME_SKILL_ENTRY',
+    'REORDER_WORKSPACES',
+    'RESTORE_WORKSPACE_PROJECT_ROOT',
+    'REWIND_SESSION',
+    'SAVE_FILES_TO_SESSION',
+    'SAVE_FILES_TO_WORKSPACE',
+    'SAVE_MCP_CONFIG',
+    'SEARCH_MESSAGES',
+    'SEARCH_SESSION_REFERENCES',
+    'SEARCH_WORKSPACE_FILES',
+    'SELECT_BROWSER_TAB',
+    'SEND_MESSAGE',
+    'SET_ACTIVE_WORKTREE',
+    'SET_BROWSER_LAYOUT',
+    'SET_BUILTIN_MCP_ENABLED',
+    'SET_VISIBLE_STREAM_SESSION',
+    'SHOW_ATTACHED_IN_FOLDER',
+    'SHOW_IN_FOLDER',
+    'START_WORKSPACE_MEMORY_WATCH',
+    'STOP_AGENT',
+    'STOP_WORKSPACE_MEMORY_WATCH',
+    'SUBMIT_OR_ENQUEUE_MESSAGE',
+    'TEST_MCP_SERVER',
+    'TOGGLE_ARCHIVE',
+    'TOGGLE_PIN',
+    'TOGGLE_SKILL',
+    'TOGGLE_STAR',
+    'UPDATE_SESSION_CODEX_FAST_MODE',
+    'UPDATE_SESSION_MODEL',
+    'UPDATE_SESSION_PERMISSION_MODE',
+    'UPDATE_SESSION_REASONING_LEVEL',
+    'UPDATE_SKILL_FROM_SOURCE',
+    'UPDATE_TITLE',
+    'UPDATE_WORKSPACE',
+    'WORKSPACE_MEMORY_WINDOW_READY',
+    'WRITE_CLIPBOARD_PREVIEW',
+    'WRITE_SKILL_CONTENT',
+    'WRITE_SKILL_FILE',
+    'WRITE_WORKSPACE_AGENTS_MD',
+    'WRITE_WORKSPACE_AUTO_MEMORY_FILE',
+  ]),
+  ...defineRendererHandlerKeys('APP_ICON_IPC_CHANNELS', [
+    'SET',
+  ]),
+  ...defineRendererHandlerKeys('AUTOMATION_IPC_CHANNELS', [
+    'CREATE',
+    'DELETE',
+    'LIST',
+    'RUN_NOW',
+    'TOGGLE',
+    'UPDATE',
+  ]),
+  ...defineRendererHandlerKeys('CHANNEL_IPC_CHANNELS', [
+    'CODEX_OAUTH_CANCEL',
+    'CODEX_OAUTH_LOGIN',
+    'CREATE',
+    'DECRYPT_KEY',
+    'DELETE',
+    'FETCH_MODELS',
+    'GET_PLAN_QUOTA',
+    'LIST',
+    'TEST',
+    'TEST_DIRECT',
+    'UPDATE',
+    'XAI_OAUTH_CANCEL',
+    'XAI_OAUTH_LOGIN',
+  ]),
+  ...defineRendererHandlerKeys('CHAT_IPC_CHANNELS', [
+    'CREATE_CONVERSATION',
+    'CREATE_WELCOME_CONVERSATION',
+    'DELETE_ATTACHMENT',
+    'DELETE_CONVERSATION',
+    'DELETE_MESSAGE',
+    'EXTRACT_ATTACHMENT_TEXT',
+    'GENERATE_TITLE',
+    'GET_MESSAGES',
+    'GET_RECENT_MESSAGES',
+    'GET_TUTORIAL_CONTENT',
+    'LIST_CONVERSATIONS',
+    'OPEN_FILE_DIALOG',
+    'READ_ATTACHMENT',
+    'SAVE_ATTACHMENT',
+    'SAVE_IMAGE_AS',
+    'SAVE_RESOURCE_FILE_AS',
+    'SEARCH_MESSAGES',
+    'SEND_MESSAGE',
+    'STOP_GENERATION',
+    'TOGGLE_ARCHIVE',
+    'TOGGLE_PIN',
+    'TRUNCATE_MESSAGES_FROM',
+    'UPDATE_CONTEXT_DIVIDERS',
+    'UPDATE_MODEL',
+    'UPDATE_TITLE',
+  ]),
+  ...defineRendererHandlerKeys('CHAT_TOOL_IPC_CHANNELS', [
+    'CREATE_CUSTOM_TOOL',
+    'DELETE_CUSTOM_TOOL',
+    'GET_ALL_TOOLS',
+    'GET_TOOL_CREDENTIALS',
+    'TEST_TOOL',
+    'UPDATE_TOOL_CREDENTIALS',
+    'UPDATE_TOOL_STATE',
+  ]),
+  ...defineRendererHandlerKeys('DINGTALK_IPC_CHANNELS', [
+    'GET_BOT_DECRYPTED_SECRET',
+    'GET_CONFIG',
+    'GET_DECRYPTED_SECRET',
+    'GET_MULTI_CONFIG',
+    'GET_MULTI_STATUS',
+    'GET_STATUS',
+    'REMOVE_BOT',
+    'SAVE_BOT_CONFIG',
+    'SAVE_CONFIG',
+    'START_BOT',
+    'START_BRIDGE',
+    'STOP_BOT',
+    'STOP_BRIDGE',
+    'TEST_CONNECTION',
+  ]),
+  ...defineRendererHandlerKeys('DOCK_BADGE_IPC_CHANNELS', [
+    'SET_COUNT',
+  ]),
+  ...defineRendererHandlerKeys('ENVIRONMENT_IPC_CHANNELS', [
+    'CHECK',
+  ]),
+  ...defineRendererHandlerKeys('FEISHU_IPC_CHANNELS', [
+    'GET_BOT_DECRYPTED_SECRET',
+    'GET_CONFIG',
+    'GET_DECRYPTED_SECRET',
+    'GET_MULTI_CONFIG',
+    'GET_MULTI_STATUS',
+    'GET_STATUS',
+    'LIST_BINDINGS',
+    'REGISTER_APP_CANCEL',
+    'REGISTER_APP_START',
+    'REMOVE_BINDING',
+    'REMOVE_BOT',
+    'REPORT_PRESENCE',
+    'SAVE_BOT_CONFIG',
+    'SAVE_CONFIG',
+    'START_BOT',
+    'START_BRIDGE',
+    'STOP_BOT',
+    'STOP_BRIDGE',
+    'TEST_CONNECTION',
+    'UPDATE_BINDING',
+  ]),
+  ...defineRendererHandlerKeys('GITHUB_RELEASE_IPC_CHANNELS', [
+    'GET_LATEST_RELEASE',
+    'GET_RELEASE_BY_TAG',
+    'LIST_RELEASES',
+  ]),
+  ...defineRendererHandlerKeys('INSTALLER_IPC_CHANNELS', [
+    'CANCEL',
+    'DOWNLOAD',
+    'LAUNCH',
+    'MANIFEST',
+  ]),
+  ...defineRendererHandlerKeys('IPC_CHANNELS', [
+    'GET_DEFAULT_APP_FOR_FILE',
+    'GET_DETACHED_PREVIEW_DATA',
+    'GET_DIFF_CONTENTS',
+    'GET_FILE_DIFF',
+    'GET_GIT_REPO_STATUS',
+    'GET_RUNTIME_STATUS',
+    'GET_UNSTAGED_CHANGES',
+    'GET_UNTRACKED_CONTENT',
+    'GET_WORKTREE_CHANGES',
+    'INVALIDATE_GIT_DIFF_CACHE',
+    'LIST_WORKTREES',
+    'OPEN_DETACHED_PREVIEW',
+    'OPEN_EXTERNAL',
+    'REINIT_RUNTIME',
+    'REVERT_FILE',
+    'SCAN_EDITORS',
+    'SCREENSHOT_CAPTURE',
+    'SHOW_ITEM_IN_FOLDER',
+    'SYSTEM_OPEN_FILE',
+    'WINDOW_CLOSE',
+    'WINDOW_IS_MAXIMIZED',
+    'WINDOW_MAXIMIZE',
+    'WINDOW_MINIMIZE',
+    'WRITE_CLIPBOARD_TEXT',
+  ]),
+  ...defineRendererHandlerKeys('PLANNING_IPC_CHANNELS', [
+    'ACKNOWLEDGE_REMINDER',
+    'CONNECT_NATIVE_CONNECTION',
+    'CREATE_CALENDAR_EVENT',
+    'CREATE_GROUP',
+    'CREATE_TODO',
+    'DELETE_CALENDAR_EVENT',
+    'DELETE_GROUP',
+    'DELETE_TODO',
+    'DISCONNECT_NATIVE_CONNECTION',
+    'GET_NATIVE_SYNC_STATUS',
+    'LIST_ACTIVE_REMINDERS',
+    'LIST_CALENDAR_EVENTS',
+    'LIST_GROUPS',
+    'LIST_NATIVE_CONNECTIONS',
+    'LIST_NATIVE_CONNECTION_TARGETS',
+    'LIST_NATIVE_SYNC_CONFLICTS',
+    'LIST_NATIVE_SYNC_TARGETS',
+    'LIST_SYNC_PROFILES',
+    'LIST_TAGS',
+    'LIST_TODOS',
+    'OPEN_NATIVE_SYNC_PRIVACY_SETTINGS',
+    'OPEN_WINDOW',
+    'REQUEST_NATIVE_SYNC_ACCESS',
+    'RESOLVE_NATIVE_SYNC_CONFLICT',
+    'SAVE_SYNC_PROFILE',
+    'SNOOZE_REMINDER',
+    'START_TODO_AGENT',
+    'UPDATE_CALENDAR_EVENT',
+    'UPDATE_GROUP',
+    'UPDATE_TODO',
+  ]),
+  ...defineRendererHandlerKeys('PROXY_IPC_CHANNELS', [
+    'DETECT_SYSTEM',
+    'GET_SETTINGS',
+    'UPDATE_SETTINGS',
+  ]),
+  ...defineRendererHandlerKeys('QUICK_TASK_IPC_CHANNELS', [
+    'GET_GLOBAL_SHORTCUT_REGISTRATION_STATUS',
+    'HIDE',
+    'REREGISTER_GLOBAL_SHORTCUTS',
+    'SUBMIT',
+  ]),
+  ...defineRendererHandlerKeys('SCRATCH_PAD_IPC_CHANNELS', [
+    'CHOOSE_EXPORT_PATH',
+    'COPY_IMAGE',
+    'EXPORT',
+    'LOAD',
+    'SAVE',
+  ]),
+  ...defineRendererHandlerKeys('SETTINGS_IPC_CHANNELS', [
+    'GET',
+    'GET_SYSTEM_THEME',
+    'UPDATE',
+  ]),
+  ...defineRendererHandlerKeys('STORAGE_IPC_CHANNELS', [
+    'CLEANUP',
+    'CLEANUP_TEMP',
+    'GET_STATS',
+  ]),
+  ...defineRendererHandlerKeys('SYSTEM_PROMPT_IPC_CHANNELS', [
+    'CREATE',
+    'DELETE',
+    'GET_CONFIG',
+    'SET_DEFAULT',
+    'UPDATE',
+    'UPDATE_APPEND_SETTING',
+  ]),
+  ...defineRendererHandlerKeys('USER_PROFILE_IPC_CHANNELS', [
+    'GET',
+    'UPDATE',
+  ]),
+  ...defineRendererHandlerKeys('VOICE_DICTATION_IPC_CHANNELS', [
+    'CANCEL',
+    'CHECK_MIC_PERMISSION',
+    'COMMIT',
+    'GET_SETTINGS',
+    'HIDE',
+    'PREVIEW',
+    'REQUEST_MIC_PERMISSION',
+    'RESIZE',
+    'SEND_AUDIO',
+    'START',
+    'STOP',
+    'TEST_CONNECTION',
+    'TOGGLE',
+    'UPDATE_SETTINGS',
+  ]),
+  ...defineRendererHandlerKeys('WECHAT_IPC_CHANNELS', [
+    'GET_CONFIG',
+    'GET_STATUS',
+    'LOGOUT',
+    'START_BRIDGE',
+    'START_LOGIN',
+    'STOP_BRIDGE',
+  ]),
+  ...defineRendererHandlerKeys('WINDOWS_AGENT_ISLAND_IPC_CHANNELS', [
+    'OPEN_SESSION',
+  ]),
+  ...defineRendererHandlerKeys('literal', [
+    'file:docx-to-html',
+    'file:office-to-html',
+    'file:prepare-pdf-preview',
+    'file:read-binary-base64',
+    'file:resolve-and-read',
+    'file:resolve-html-preview-path',
+    'file:resolve-path',
+    'file:write-text',
+  ]),
+]
+
+
+type RendererHandlerPolicy =
+  | { kind: 'agent-session' | 'path', guards: readonly string[] }
+  | { kind: 'exempt', reason: string }
+
+/** 敏感入口逐 key 声明其 guard；其余显式 key 必须提供豁免语义。 */
+const GUARDED_RENDERER_HANDLER_POLICIES: Record<string, RendererHandlerPolicy> = {
+  'AGENT_IPC_CHANNELS:ASK_USER_RESPOND': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:ATTACH_DIRECTORY': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:ATTACH_FILE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:CANCEL_QUEUED_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:CHECK_PATHS_TYPE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:CLEAR_COMPLETION_STATE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:CLOSE_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:CLOSE_BROWSER_TAB': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:CREATE_BROWSER_TAB': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:DELETE_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:DELETE_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:DETACH_DIRECTORY': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:DETACH_FILE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:ENQUEUE_QUEUED_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:EXIT_PLAN_MODE_RESPOND': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:FORK_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:GET_BROWSER_STATE': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:GET_PENDING_REQUESTS': { kind: 'agent-session', guards: ['getUserVisiblePendingRequests'] },
+  'AGENT_IPC_CHANNELS:GET_SDK_MESSAGES': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:GET_SESSION_PATH': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:GO_BACK_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:GO_FORWARD_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:LIST_ATTACHED_DIRECTORY': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:LIST_BROWSER_TABS': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:LIST_DIRECTORY': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:MIGRATE_CHAT_TO_AGENT': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:MINIMIZE_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:MOVE_ATTACHED_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:MOVE_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:MOVE_QUEUED_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:MOVE_SESSION_TO_WORKSPACE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:NAVIGATE_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:OPEN_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:OPEN_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:OPEN_FOLDER_IN_TERMINAL': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:PERMISSION_RESPOND': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:QUEUE_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:READ_ATTACHED_FILE': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
+  'AGENT_IPC_CHANNELS:RELOAD_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:RENAME_ATTACHED_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:RENAME_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:REWIND_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:SAVE_FILES_TO_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:SEARCH_WORKSPACE_FILES': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:SELECT_BROWSER_TAB': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:SEND_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:SET_ACTIVE_WORKTREE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:SET_BROWSER_LAYOUT': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
+  'AGENT_IPC_CHANNELS:SET_VISIBLE_STREAM_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:SHOW_ATTACHED_IN_FOLDER': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:SHOW_IN_FOLDER': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'AGENT_IPC_CHANNELS:STOP_AGENT': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:SUBMIT_OR_ENQUEUE_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:TOGGLE_ARCHIVE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:TOGGLE_PIN': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:TOGGLE_STAR': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:UPDATE_SESSION_CODEX_FAST_MODE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:UPDATE_SESSION_MODEL': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:UPDATE_SESSION_PERMISSION_MODE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:UPDATE_SESSION_REASONING_LEVEL': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'AGENT_IPC_CHANNELS:UPDATE_TITLE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'FEISHU_IPC_CHANNELS:UPDATE_BINDING': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'IPC_CHANNELS:GET_DEFAULT_APP_FOR_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:GET_DIFF_CONTENTS': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:GET_FILE_DIFF': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:GET_GIT_REPO_STATUS': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:GET_UNSTAGED_CHANGES': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:GET_UNTRACKED_CONTENT': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:GET_WORKTREE_CHANGES': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:LIST_WORKTREES': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:OPEN_DETACHED_PREVIEW': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:REVERT_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:SHOW_ITEM_IN_FOLDER': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'IPC_CHANNELS:SYSTEM_OPEN_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
+  'WINDOWS_AGENT_ISLAND_IPC_CHANNELS:OPEN_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
+  'literal:file:docx-to-html': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
+  'literal:file:office-to-html': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
+  'literal:file:prepare-pdf-preview': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
+  'literal:file:read-binary-base64': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
+  'literal:file:resolve-and-read': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
+  'literal:file:resolve-html-preview-path': { kind: 'path', guards: ['Error'] },
+  'literal:file:resolve-path': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
+  'literal:file:write-text': { kind: 'path', guards: ['requireVisibleFileWriteAccess'] },
+}
+
+/** 各 IPC 域的显式豁免边界；只描述该域未列入 guarded 表的入口。 */
+const EXEMPT_REASON_BY_NAMESPACE: Record<string, string> = {
+  AGENT_IPC_CHANNELS: '入口使用 workspace、skill、dialog 或已单独验证的 request owner 能力，不接收未校验的普通 Agent sessionId/文件读取能力',
+  APP_ICON_IPC_CHANNELS: '只更新应用图标，不接收 sessionId 或文件路径',
+  AUTOMATION_IPC_CHANNELS: 'ID 属于 Automation 任务，不是 Agent 会话 ID；任务存储自行校验输入',
+  CHANNEL_IPC_CHANNELS: 'ID 与凭据属于模型渠道配置，不是 Agent 会话或 Renderer 文件能力',
+  CHAT_IPC_CHANNELS: 'session/conversation ID 属于旧 Chat 域，不是普通 Agent 会话 ID；附件由 Chat 存储边界管理',
+  CHAT_TOOL_IPC_CHANNELS: 'ID 属于自定义工具配置，不是 Agent 会话或 Renderer 文件能力',
+  DINGTALK_IPC_CHANNELS: 'ID 属于钉钉 Bot/连接，不是 Agent 会话或 Renderer 文件能力',
+  DOCK_BADGE_IPC_CHANNELS: '只更新 Dock 数字，不接收 sessionId 或文件路径',
+  ENVIRONMENT_IPC_CHANNELS: '只检查本机运行环境，不接收 sessionId 或 Renderer 文件路径',
+  FEISHU_IPC_CHANNELS: '除显式绑定入口外，ID 属于飞书 Bot/chat/注册流程，不是 Agent 会话 ID',
+  GITHUB_RELEASE_IPC_CHANNELS: '参数属于发布版本查询，不是 Agent 会话或 Renderer 文件能力',
+  INSTALLER_IPC_CHANNELS: '参数属于受管安装任务/产物，不是 Agent 会话或任意 Renderer 文件读取能力',
+  IPC_CHANNELS: '入口属于窗口、运行时或系统能力；所有 Renderer 文件路径入口已逐 key 列入 guarded 表',
+  PLANNING_IPC_CHANNELS: 'ID 属于 Todo、日历、同步连接或提醒，不是 Agent 会话 ID；无任意文件读取能力',
+  PROXY_IPC_CHANNELS: '只管理代理配置，不接收 sessionId 或文件路径',
+  QUICK_TASK_IPC_CHANNELS: 'Quick Task 使用自身窗口与提交模型，不接收普通 Agent 会话 ID 或任意文件读取能力',
+  SCRATCH_PAD_IPC_CHANNELS: '路径来自主进程选择的导出 capability，不是任意 Renderer 文件读取入口',
+  SETTINGS_IPC_CHANNELS: '只管理应用设置，不接收 sessionId 或文件路径',
+  STORAGE_IPC_CHANNELS: '只执行受管存储统计/清理，不接收 Renderer 指定路径',
+  SYSTEM_PROMPT_IPC_CHANNELS: 'ID 属于系统提示词配置，不是 Agent 会话或 Renderer 文件能力',
+  USER_PROFILE_IPC_CHANNELS: '只管理用户资料，不接收 sessionId 或文件路径',
+  VOICE_DICTATION_IPC_CHANNELS: 'sessionId 是 ASR 流实例 ID，不是 Agent 会话 ID；音频数据由语音模块自行隔离',
+  WECHAT_IPC_CHANNELS: 'ID 属于微信桥接登录/连接，不是 Agent 会话或 Renderer 文件能力',
+}
+
+/** 说明显式豁免项为何不属于普通 Agent 会话或敏感文件访问。 */
+function getRendererHandlerPolicy(key: string): RendererHandlerPolicy {
+  const guarded = GUARDED_RENDERER_HANDLER_POLICIES[key]
+  if (guarded) return guarded
+  const namespace = key.slice(0, key.indexOf(':'))
+  return { kind: 'exempt', reason: EXEMPT_REASON_BY_NAMESPACE[namespace] ?? '' }
+}
+
 interface RegisteredHandler {
   channel: string
   namespace: string
@@ -99,18 +615,6 @@ function containsSessionId(type: ts.Type, checker: ts.TypeChecker, seen = new Se
     return type.types.some((member) => containsSessionId(member, checker, seen))
   }
   return checker.getPropertyOfType(type, 'sessionId') !== undefined
-}
-
-/** 递归识别 handler 参数中的路径能力，避免只维护一份易漏的敏感通道集合。 */
-function containsPathCapability(type: ts.Type, checker: ts.TypeChecker, seen = new Set<ts.Type>()): boolean {
-  if (seen.has(type)) return false
-  seen.add(type)
-  if (type.isUnionOrIntersection()) {
-    return type.types.some((member) => containsPathCapability(member, checker, seen))
-  }
-  return checker.getPropertiesOfType(type).some((property) => (
-    /(?:path|file|directory|cwd|root)/i.test(property.name)
-  ))
 }
 
 /** 收集 handler 当前执行路径上的调用，跳过回调和嵌套函数体。 */
@@ -216,16 +720,6 @@ function handlerReceivesSessionId(handler: RegisteredHandler, checker: ts.TypeCh
   })
 }
 
-/** 按参数语义把每个 Renderer handler 归入唯一访问类别。 */
-function classifyRendererHandler(handler: RegisteredHandler, checker: ts.TypeChecker): 'session' | 'path' | 'non-sensitive' {
-  const receivesPath = handler.handler.parameters.slice(1).some((parameter) => (
-    /(?:path|file|directory|cwd|root)/i.test(parameter.name.getText())
-      || containsPathCapability(checker.getTypeAtLocation(parameter), checker)
-  ))
-  if (receivesPath) return 'path'
-  return handlerReceivesSessionId(handler, checker) ? 'session' : 'non-sensitive'
-}
-
 describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
   test('Given 不存在、Design、Canvas 或半归属会话 When 进入普通入口 Then 统一表现为会话不存在', () => {
     const internalSessions = [
@@ -253,6 +747,7 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       const guardIndex = calls.findIndex((call) => [
         'requireVisibleSession',
         'requireVisibleFileAccess',
+        'requireVisibleFileReadAccess',
         'assertBrowserSessionAccess',
       ].includes(getCallName(call)))
       expect(guardIndex, `${channel} 缺少普通会话可见性 guard`).toBeGreaterThanOrEqual(0)
@@ -273,6 +768,10 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       const registered = handlers.find((handler) => handler.channel === channel)
       expect(registered, `${channel} 未纳入全量 ipcMain.handle 矩阵`).toBeDefined()
       const calls = collectTopLevelExecutionCalls(registered!.handler.body)
+      if (channel === 'file:resolve-html-preview-path') {
+        expect(registered!.handler.body.getText()).toContain('throw new Error')
+        continue
+      }
       const guardIndex = calls.findIndex((call) => [
         'requireVisibleFileAccess',
         'requireVisibleFileReadAccess',
@@ -287,21 +786,28 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
     }
   })
 
-  test('Given ipc.ts 的全部 Renderer handler When 按参数能力分类 Then 每个入口唯一归入 session、path 或 non-sensitive', () => {
-    const { checker, handlers } = loadAgentHandlers()
-    const classifications = handlers.map((handler) => ({
-      channel: handler.channel,
-      category: classifyRendererHandler(handler, checker),
-    }))
+  test('Given ipc.ts 的全部 Renderer handler When 对照显式策略矩阵 Then 新增、遗漏或重复 key 均失败', () => {
+    const { handlers } = loadAgentHandlers()
+    const actualKeys = handlers.map(({ namespace, channel }) => `${namespace}:${channel}`).sort()
+    const declaredKeys = [...ALL_RENDERER_HANDLER_KEYS].sort()
 
-    expect(classifications).toHaveLength(handlers.length)
-    expect(classifications.filter(({ category }) => category === 'session').length).toBeGreaterThan(30)
-    expect(classifications.filter(({ category }) => category === 'path').length).toBeGreaterThan(25)
-    expect(classifications.filter(({ category }) => category === 'non-sensitive').length).toBeGreaterThan(100)
-    for (const channel of ['CHECK_PATHS_TYPE', 'SEARCH_WORKSPACE_FILES', 'SHOW_ITEM_IN_FOLDER']) {
-      expect(classifications.find((entry) => entry.channel === channel)?.category).toBe('path')
+    expect(new Set(declaredKeys).size).toBe(declaredKeys.length)
+    expect(actualKeys).toEqual(declaredKeys)
+    for (const registered of handlers) {
+      const key = `${registered.namespace}:${registered.channel}`
+      const policy = getRendererHandlerPolicy(key)
+      if (policy.kind === 'exempt') {
+        expect(policy.reason.length, `${key} 的 exempt 必须说明非 Agent/非敏感语义`).toBeGreaterThan(0)
+        continue
+      }
+      if (policy.guards.includes('Error')) {
+        expect(registered.handler.body.getText(), `${key} 必须明确 fail closed`).toContain('throw new Error')
+        continue
+      }
+      const calls = collectTopLevelExecutionCalls(registered.handler.body).map(getCallName)
+      const guardIndex = calls.findIndex((name) => policy.guards.includes(name))
+      expect(guardIndex, `${key} 缺少声明的 ${policy.kind} guard`).toBeGreaterThanOrEqual(0)
     }
-    expect(classifications.find((entry) => entry.channel === 'OPEN_SESSION')?.category).toBe('session')
   })
 
   test('Given 路径检查、搜索与系统显示入口 When 检查顶层执行路径 Then guard 先于 stat、readdir、cache 与 shell', () => {
@@ -401,6 +907,179 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       if (descriptor !== undefined) closeSync(descriptor)
       rmSync(root, { recursive: true, force: true })
     }
+  })
+
+  test('Given 授权时文件为 1B When 同一 inode 增长到 10B Then 固定大小读取拒绝返回增长内容', () => {
+    const { source } = loadAgentHandlers()
+    const root = mkdtempSync(join(tmpdir(), 'proma-renderer-fixed-size-'))
+    const filePath = join(root, 'growing.txt')
+    writeFileSync(filePath, 'a')
+    try {
+      const requireVisibleFileReadAccess = compileLocalFunction<(
+        access: FileAccessOptions | undefined,
+        filePath: string,
+        candidateBasePaths: readonly string[],
+        maxSize: number,
+      ) => { authorizedFiles: Map<string, { readBytes: () => Buffer, close: () => void }> }>(
+        source,
+        'requireVisibleFileReadAccess',
+        {
+          requireVisibleFileAccess: () => ({ options: undefined }),
+          getPreviewCandidateBasePaths: () => [root],
+          getRendererFileCandidates: () => [filePath],
+          openSync,
+          constants,
+          fstatSync,
+          realpathSync: (value: string) => value,
+          lstatSync,
+          isCanonicalPathAllowed: () => true,
+          closeSync,
+          readFileSync,
+          ftruncateSync: () => undefined,
+          writeFileSync,
+        },
+      )
+      const snapshot = requireVisibleFileReadAccess(undefined, filePath, [root], 2)
+      const authorizedFile = snapshot.authorizedFiles.get(filePath)!
+
+      writeFileSync(filePath, '0123456789')
+
+      expect(() => authorizedFile.readBytes()).toThrow('文件身份已变化')
+      authorizedFile.close()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('Given resolve-path guard 返回后路径被替换 When 注册协议 token Then 只注册授权 Buffer', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'file:resolve-path')
+    expect(registered).toBeDefined()
+    const root = mkdtempSync(join(tmpdir(), 'proma-renderer-resolve-path-race-'))
+    const filePath = join(root, 'preview.png')
+    const replacementPath = join(root, 'replacement.png')
+    writeFileSync(filePath, 'authorized-content')
+    writeFileSync(replacementPath, 'replacement-content')
+    let descriptor: number | undefined
+    let registeredContent = ''
+    try {
+      const requireVisibleFileReadAccess = () => {
+        descriptor = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+        renameSync(replacementPath, filePath)
+        return {
+          authorizedFiles: new Map([[filePath, {
+            canonicalPath: filePath,
+            readBytes: () => readFileSync(descriptor!),
+            close: () => closeSync(descriptor!),
+          }]]),
+        }
+      }
+      const handler = compileHandler<(event: object, path: string) => Promise<{ url: string } | null>>(registered!, {
+        requireVisibleFileAccess: () => ({ options: undefined }),
+        requireVisibleFileReadAccess,
+        getPreviewCandidateBasePaths: () => [root],
+        isPathAllowed: () => true,
+        registerPromaFilePath: (path: string) => {
+          registeredContent = readFileSync(path, 'utf8')
+          return 'proma-file://path-token'
+        },
+        registerPromaAuthorizedFile: (_path: string, content: Buffer) => {
+          registeredContent = content.toString('utf8')
+          return 'proma-file://buffer-token'
+        },
+        console,
+      })
+
+      await expect(handler({}, filePath)).resolves.toEqual({ url: 'proma-file://buffer-token' })
+      expect(registeredContent).toBe('authorized-content')
+      expect(() => fstatSync(descriptor!)).toThrow()
+    } finally {
+      if (descriptor !== undefined) {
+        try { closeSync(descriptor) } catch { /* handler 已关闭授权句柄 */ }
+      }
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('Given HTML 目录无法绑定稳定授权对象 When 请求预览 Then 明确禁用且不注册目录', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'file:resolve-html-preview-path')
+    expect(registered).toBeDefined()
+    let registerCallCount = 0
+    const handler = compileHandler<(event: object, path: string) => Promise<unknown>>(registered!, {
+      requireVisibleFileAccess: () => ({ options: undefined }),
+      requireVisibleFileReadAccess: () => { throw new Error('不应打开文件') },
+      getPreviewCandidateBasePaths: () => [],
+      isPathAllowed: () => true,
+      registerPromaDirectoryPath: () => { registerCallCount += 1; return 'proma-file://directory-token' },
+      dirname,
+      basename: (value: string) => value,
+      console,
+    })
+
+    await expect(handler({}, '/tmp/preview.html')).rejects.toThrow('HTML 目录预览已禁用：无法安全绑定相对资源目录')
+    expect(registerCallCount).toBe(0)
+  })
+
+  test('Given 附件 guard 返回后路径被替换 When 读取附件 Then 只消费授权 fd', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'READ_ATTACHED_FILE')
+    expect(registered).toBeDefined()
+    const root = mkdtempSync(join(tmpdir(), 'proma-renderer-attached-race-'))
+    const filePath = join(root, 'attached.txt')
+    const replacementPath = join(root, 'replacement.txt')
+    writeFileSync(filePath, 'authorized-content')
+    writeFileSync(replacementPath, 'replacement-content')
+    let descriptor: number | undefined
+    try {
+      const requireVisibleFileReadAccess = () => {
+        descriptor = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+        renameSync(replacementPath, filePath)
+        return {
+          authorizedFiles: new Map([[filePath, {
+            canonicalPath: filePath,
+            readBytes: () => readFileSync(descriptor!),
+            close: () => closeSync(descriptor!),
+          }]]),
+        }
+      }
+      const handler = compileHandler<(event: object, path: string) => Promise<string>>(registered!, {
+        requireVisibleFileAccess: requireVisibleFileReadAccess,
+        requireVisibleFileReadAccess,
+        resolve,
+        isPathAllowed: () => true,
+        readStableFile: (path: string) => readFileSync(path),
+      })
+
+      const result = await handler({}, filePath)
+      expect(Buffer.from(result, 'base64').toString('utf8')).toBe('authorized-content')
+    } finally {
+      if (descriptor !== undefined) {
+        try { closeSync(descriptor) } catch { /* handler 已关闭授权句柄 */ }
+      }
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 飞书绑定包含 Agent sessionId When 会话不可见 Then 修改副作用为零', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ namespace, channel }) => (
+      namespace === 'FEISHU_IPC_CHANNELS' && channel === 'UPDATE_BINDING'
+    ))
+    expect(registered).toBeDefined()
+    let sideEffectCount = 0
+    const handler = compileHandler<(event: object, input: { chatId: string, sessionId?: string }) => Promise<unknown>>(registered!, {
+      requireVisibleSession: () => { throw new Error('Agent 会话不存在') },
+      feishuBridgeManager: {
+        findBridgeByChatId: () => {
+          sideEffectCount += 1
+          return { updateBinding: () => { sideEffectCount += 1; return null } }
+        },
+      },
+    })
+
+    await expect(handler({}, { chatId: 'chat-1', sessionId: 'canvas' })).rejects.toThrow('Agent 会话不存在')
+    expect(sideEffectCount).toBe(0)
   })
 
   test.each([
@@ -727,7 +1406,13 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       path: string,
       sessionId?: string,
       workspaceSlug?: string,
-    ) => Promise<string>>(readHandlerNode!, { requireVisibleFileAccess })
+    ) => Promise<string>>(readHandlerNode!, {
+      requireVisibleFileAccess,
+      requireVisibleFileReadAccess: (access: FileAccessOptions | undefined, path: string) => {
+        requireVisibleFileAccess(access, [path])
+        return { authorizedFiles: new Map() }
+      },
+    })
     await expect(readHandler({}, '/workspace-file', '')).rejects.toThrow('Agent 会话不存在')
     await expect(readHandler({}, '/canvas-cwd')).rejects.toThrow('Agent 会话不存在')
     await expect(readHandler({}, '/visible-b-cwd', 'visible-a')).rejects.toThrow('Agent 会话不存在')

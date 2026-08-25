@@ -10,15 +10,27 @@ import { randomUUID } from 'node:crypto'
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, read, realpathSync, statSync } from 'node:fs'
 import { extname, resolve, sep } from 'node:path'
 
-interface RegisteredEntry {
+interface RegisteredPathEntry {
+  kind: 'path'
   root: string
   isDirectory: boolean
   lastAccessedAt: number
   retained: boolean
 }
 
+interface RegisteredBufferEntry {
+  kind: 'buffer'
+  canonicalPath: string
+  content: Buffer
+  lastAccessedAt: number
+  retained: boolean
+}
+
+type RegisteredEntry = RegisteredPathEntry | RegisteredBufferEntry
+
 const ENTRY_TTL_MS = 60 * 60 * 1000
 const MAX_ENTRIES = 500
+const MAX_AUTHORIZED_BUFFER_BYTES = 256 * 1024 * 1024
 
 /** 本地文件协议 registry 的可注入时间与 fetch 依赖。 */
 export interface PromaFileProtocolRegistryDependencies {
@@ -28,6 +40,8 @@ export interface PromaFileProtocolRegistryDependencies {
   afterResolveBeforeOpen?: (targetPath: string) => void
   /** 稳定 fd 打开后调用，仅供验证流取消与 HEAD 及时关闭。 */
   onDescriptorOpened?: (descriptor: number) => void
+  /** 已授权 Buffer 总预算，测试可用小值验证 LRU 淘汰。 */
+  maxAuthorizedBufferBytes?: number
 }
 
 function realpathExisting(path: string): string {
@@ -45,6 +59,7 @@ function isInsideDirectory(target: string, root: string): boolean {
 /** 单个独立的 opaque 本地文件授权 registry。 */
 export interface PromaFileProtocolRegistry {
   registerFilePath: (path: string) => string
+  registerAuthorizedFile: (canonicalPath: string, content: Buffer) => string
   registerDirectoryPath: (path: string) => string
   registerRetainedDirectoryPaths: (paths: string[]) => string[]
   retainPathUrl: (url: string) => boolean
@@ -66,6 +81,32 @@ export function createPromaFileProtocolRegistry(
     }
   }
 
+  /** 为新 token 预留容量，普通 token 按最久未访问顺序淘汰。 */
+  function reserveEntryCapacity(currentTime: number, newEntryCount: number, newBufferBytes = 0): void {
+    pruneExpiredEntries(currentTime)
+    const evictionCount = Math.max(0, registeredEntries.size + newEntryCount - MAX_ENTRIES)
+    const evictable = [...registeredEntries.entries()]
+      .filter(([, entry]) => !entry.retained)
+      .sort((left, right) => left[1].lastAccessedAt - right[1].lastAccessedAt)
+    if (evictable.length < evictionCount) throw new Error('本地文件授权数量已达上限')
+    const evictedTokens = new Set(evictable.slice(0, evictionCount).map(([token]) => token))
+    const maxBufferBytes = dependencies.maxAuthorizedBufferBytes ?? MAX_AUTHORIZED_BUFFER_BYTES
+    if (newBufferBytes > maxBufferBytes) throw new Error('本地文件授权内容超过内存预算')
+    let retainedBufferBytes = [...registeredEntries.entries()].reduce((total, [token, entry]) => (
+      total + (entry.kind === 'buffer' && !evictedTokens.has(token) ? entry.content.byteLength : 0)
+    ), 0)
+    for (const [token, entry] of evictable) {
+      if (retainedBufferBytes + newBufferBytes <= maxBufferBytes) break
+      if (entry.kind !== 'buffer' || evictedTokens.has(token)) continue
+      evictedTokens.add(token)
+      retainedBufferBytes -= entry.content.byteLength
+    }
+    if (retainedBufferBytes + newBufferBytes > maxBufferBytes) {
+      throw new Error('本地文件授权内容超过内存预算')
+    }
+    for (const token of evictedTokens) registeredEntries.delete(token)
+  }
+
   /** 批量校验路径并原子预留容量，失败时不插入任何新 token。 */
   function registerEntries(
     inputs: Array<{ path: string, isDirectory: boolean }>,
@@ -80,18 +121,27 @@ export function createPromaFileProtocolRegistry(
       if (!isDirectory && !st.isFile()) throw new Error(`不是文件: ${path}`)
       return { root, isDirectory }
     })
-    pruneExpiredEntries(currentTime)
-    const evictionCount = Math.max(0, registeredEntries.size + validated.length - MAX_ENTRIES)
-    const evictable = [...registeredEntries.entries()]
-      .filter(([, entry]) => !entry.retained)
-      .sort((left, right) => left[1].lastAccessedAt - right[1].lastAccessedAt)
-    if (evictable.length < evictionCount) throw new Error('本地文件授权数量已达上限')
-    for (const [token] of evictable.slice(0, evictionCount)) registeredEntries.delete(token)
+    reserveEntryCapacity(currentTime, validated.length)
     return validated.map(({ root, isDirectory }) => {
       const token = randomUUID()
-      registeredEntries.set(token, { root, isDirectory, lastAccessedAt: currentTime, retained })
+      registeredEntries.set(token, { kind: 'path', root, isDirectory, lastAccessedAt: currentTime, retained })
       return `proma-file://${token}`
     })
+  }
+
+  /** 注册已由上游稳定 lease 读取的单文件 Buffer，协议后续不再按路径打开。 */
+  function registerAuthorizedFile(canonicalPath: string, content: Buffer): string {
+    const currentTime = (dependencies.now ?? Date.now)()
+    reserveEntryCapacity(currentTime, 1, content.byteLength)
+    const token = randomUUID()
+    registeredEntries.set(token, {
+      kind: 'buffer',
+      canonicalPath,
+      content,
+      lastAccessedAt: currentTime,
+      retained: false,
+    })
+    return `proma-file://${token}`
   }
 
   /** 显式释放单个 opaque URL。 */
@@ -136,6 +186,29 @@ export function createPromaFileProtocolRegistry(
     if (!entry.retained && currentTime - entry.lastAccessedAt >= ENTRY_TTL_MS) {
       registeredEntries.delete(token)
       return new Response('Not Found', { status: 404 })
+    }
+
+    if (entry.kind === 'buffer') {
+      if (url.pathname && url.pathname !== '/') return new Response('Not Found', { status: 404 })
+      const range = parseByteRange(request.headers.get('range'), entry.content.byteLength)
+      if (range === 'unsatisfiable') {
+        return new Response(null, {
+          status: 416,
+          headers: { 'accept-ranges': 'bytes', 'content-range': `bytes */${entry.content.byteLength}` },
+        })
+      }
+      const start = range?.start ?? 0
+      const end = range?.end ?? entry.content.byteLength - 1
+      const body = entry.content.subarray(start, Math.max(start, end + 1))
+      const headers = new Headers({
+        'accept-ranges': 'bytes',
+        'content-length': String(body.byteLength),
+        'content-type': contentTypeForPath(entry.canonicalPath),
+      })
+      if (range) headers.set('content-range', `bytes ${start}-${end}/${entry.content.byteLength}`)
+      entry.lastAccessedAt = currentTime
+      const responseBody = request.method === 'HEAD' ? null : Uint8Array.from(body)
+      return new Response(responseBody, { status: range ? 206 : 200, headers })
     }
 
     let target = entry.root
@@ -213,6 +286,7 @@ export function createPromaFileProtocolRegistry(
 
   return {
     registerFilePath: (path) => registerEntries([{ path, isDirectory: false }], false)[0]!,
+    registerAuthorizedFile,
     registerDirectoryPath: (path) => registerEntries([{ path, isDirectory: true }], false)[0]!,
     registerRetainedDirectoryPaths: (paths) => registerEntries(
       paths.map((path) => ({ path, isDirectory: true })),
@@ -317,6 +391,11 @@ function contentTypeForPath(path: string): string {
 
 export function registerPromaFilePath(path: string): string {
   return defaultRegistry.registerFilePath(path)
+}
+
+/** 注册稳定授权内容；token 生命周期内协议不会重新按 canonicalPath 打开文件。 */
+export function registerPromaAuthorizedFile(canonicalPath: string, content: Buffer): string {
+  return defaultRegistry.registerAuthorizedFile(canonicalPath, content)
 }
 
 export function registerPromaDirectoryPath(path: string): string {

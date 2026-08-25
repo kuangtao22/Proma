@@ -17,6 +17,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   statSync,
   writeFileSync,
@@ -175,7 +176,7 @@ import { resolveBrowserProfileKey } from './lib/browser-profile-policy'
 import { getUnstagedChanges, invalidateGitDiffCache, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges, getMainRepoRoot } from './lib/git-diff-service'
 import {
   registerPromaDirectoryPath,
-  registerPromaFilePath,
+  registerPromaAuthorizedFile,
   registerRetainedPromaDirectoryPaths,
   revokePromaPathUrl,
 } from './lib/local-file-protocol'
@@ -888,9 +889,25 @@ function requireVisibleFileReadAccess(
         readBytes: () => {
           if (closed) throw new Error('Renderer 文件稳定句柄已关闭')
           if (openedStat.size > maxSize) throw new Error('文件过大')
-          const content = readFileSync(stableDescriptor)
+          const beforeReadStat = fstatSync(stableDescriptor)
+          if (
+            beforeReadStat.dev !== openedStat.dev
+            || beforeReadStat.ino !== openedStat.ino
+            || beforeReadStat.size !== openedStat.size
+          ) throw new Error('文件身份已变化')
+          const content = Buffer.alloc(openedStat.size)
+          let offset = 0
+          while (offset < content.byteLength) {
+            const bytesRead = readSync(stableDescriptor, content, offset, content.byteLength - offset, offset)
+            if (bytesRead === 0) throw new Error('文件身份已变化')
+            offset += bytesRead
+          }
           const completedStat = fstatSync(stableDescriptor)
-          if (completedStat.dev !== openedStat.dev || completedStat.ino !== openedStat.ino) {
+          if (
+            completedStat.dev !== openedStat.dev
+            || completedStat.ino !== openedStat.ino
+            || completedStat.size !== openedStat.size
+          ) {
             throw new Error('文件身份已变化')
           }
           return content
@@ -4446,39 +4463,26 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     'file:resolve-path',
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<ResolvedFileUrl | null> => {
-      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
-      const { resolveFilePath } = await import('./lib/file-preview-service')
-      const options = accessSnapshot.options
-      const result = resolveFilePath(filePath, getPreviewCandidateBasePaths(options, accessSnapshot))
-      if (!result || !isPathAllowed(result, options, accessSnapshot)) return null
-      // registerPromaFilePath 对目录路径会抛「不是文件」。渲染端（如悬浮预览解析 markdown
-      // 链接）可能传入目录路径，此处优雅降级为 null，而不是让异常冒泡成未捕获的 handler 错误。
+      const accessSnapshot = requireVisibleFileReadAccess(access, filePath, undefined, 100 * 1024 * 1024)
+      const authorizedFile = accessSnapshot.authorizedFiles.get(filePath)
+      if (!authorizedFile) return null
       try {
-        return { url: registerPromaFilePath(result) }
+        const content = authorizedFile.readBytes()
+        return { url: registerPromaAuthorizedFile(authorizedFile.canonicalPath, content) }
       } catch (err) {
-        console.warn('[IPC] file:resolve-path 无法注册为文件，跳过:', result, err instanceof Error ? err.message : err)
+        console.warn('[IPC] file:resolve-path 无法注册稳定文件，跳过:', err instanceof Error ? err.message : err)
         return null
+      } finally {
+        authorizedFile.close()
       }
     }
   )
 
-  // 为 HTML 预览注册所在目录，使相对 CSS、脚本和图片资源保持可加载。
-  // 返回的仍是 token-gated proma-file URL，不向渲染进程泄露本机绝对路径。
+  // HTML 相对资源需要目录级路径能力，当前无法绑定稳定目录对象，因此明确 fail closed。
   ipcMain.handle(
     'file:resolve-html-preview-path',
-    async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<ResolvedFileUrl | null> => {
-      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
-      const { resolveFilePath } = await import('./lib/file-preview-service')
-      const options = accessSnapshot.options
-      const result = resolveFilePath(filePath, getPreviewCandidateBasePaths(options, accessSnapshot))
-      if (!result || !isPathAllowed(result, options, accessSnapshot)) return null
-      try {
-        const directoryUrl = registerPromaDirectoryPath(dirname(result))
-        return { url: `${directoryUrl}/${encodeURIComponent(basename(result))}` }
-      } catch (err) {
-        console.warn('[IPC] file:resolve-html-preview-path 无法注册预览目录，跳过:', result, err instanceof Error ? err.message : err)
-        return null
-      }
+    async (): Promise<ResolvedFileUrl | null> => {
+      throw new Error('HTML 目录预览已禁用：无法安全绑定相对资源目录')
     }
   )
 
@@ -4605,27 +4609,22 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.READ_ATTACHED_FILE,
     async (_, filePath: string, sessionId?: string, workspaceSlug?: string): Promise<string> => {
-      const access: FileAccessOptions = { workspaceSlug }
-      if (sessionId !== undefined) access.sessionId = sessionId
-      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       if (!filePath || typeof filePath !== 'string') {
         throw new Error('无效的文件路径')
       }
-
-      const { realpath } = await import('node:fs/promises')
-
-      // 使用 realpath 解析符号链接，防止 symlink 绕过路径检查
-      const safePath = await realpath(resolve(filePath)).catch(() => {
-        throw new Error(`文件不存在: ${filePath}`)
-      })
-      if (!isPathAllowed(safePath, accessSnapshot.options, accessSnapshot)) throw new Error('访问路径不在允许范围内')
-
       const MAX_FILE_SIZE = 20 * 1024 * 1024 // 20 MB
+      const access: FileAccessOptions = { workspaceSlug }
+      if (sessionId !== undefined) access.sessionId = sessionId
+      const accessSnapshot = requireVisibleFileReadAccess(access, filePath, undefined, MAX_FILE_SIZE)
+      const authorizedFile = accessSnapshot.authorizedFiles.get(filePath)
+      if (!authorizedFile) throw new Error(`文件不存在: ${filePath}`)
       try {
-        return readStableFile(safePath, MAX_FILE_SIZE).toString('base64')
+        return authorizedFile.readBytes().toString('base64')
       } catch (error) {
         if (error instanceof Error && error.message === '文件过大') throw new Error('文件过大，最大支持 20MB')
         throw error
+      } finally {
+        authorizedFile.close()
       }
     }
   )
@@ -5159,6 +5158,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     FEISHU_IPC_CHANNELS.UPDATE_BINDING,
     async (_, input: FeishuUpdateBindingInput): Promise<FeishuChatBinding | null> => {
+      if (input.sessionId !== undefined) requireVisibleSession(input.sessionId)
       const bridge = feishuBridgeManager.findBridgeByChatId(input.chatId)
       return bridge?.updateBinding(input) ?? null
     }
