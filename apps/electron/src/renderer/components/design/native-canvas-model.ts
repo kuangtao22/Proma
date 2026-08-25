@@ -172,6 +172,18 @@ export function areNativeCanvasMutationsPositionOnly(mutations: CanvasMutation[]
   return mutations.every(isNativeCanvasPositionMutation)
 }
 
+/** 判断位置 mutation 的全部节点引用能否在指定权威文档上安全重放。 */
+export function canReplayNativeCanvasPositionMutations(
+  authoritativeDocument: CanvasDocument,
+  mutations: CanvasMutation[],
+): boolean {
+  if (!areNativeCanvasMutationsPositionOnly(mutations)) return false
+  /** 权威节点集合用于线性校验全部待移动引用，避免恢复后提交无效 mutation。 */
+  const authoritativeNodeIds = new Set(authoritativeDocument.nodes.map((node) => node.id))
+  return mutations.every((mutation) => mutation.type !== 'move-nodes'
+    || mutation.positions.every((position) => authoritativeNodeIds.has(position.nodeId)))
+}
+
 /** 在恢复后的权威文档上按顺序重放位置类 pending。 */
 export function replayNativeCanvasPositionMutations(
   authoritativeDocument: CanvasDocument,

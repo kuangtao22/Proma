@@ -22,7 +22,7 @@ import type { DesignAdapter } from '@/lib/design-adapter'
 import { NativeCanvasGraph } from './NativeCanvasGraph'
 import type { NativeCanvasFlowRenderer } from './NativeCanvasGraph'
 import {
-  areNativeCanvasMutationsPositionOnly,
+  canReplayNativeCanvasPositionMutations,
   coalesceNativeCanvasMutationsForSave,
   replayNativeCanvasPositionMutations,
 } from './native-canvas-model'
@@ -161,7 +161,7 @@ export function createNativeCanvasWorkspaceController(
   const applyAuthoritativeSnapshot = (snapshot: CanvasWorkspaceSnapshot): void => {
     const latest = dependencies.getState()
     const pending = latest.pendingMutations
-    if (!areNativeCanvasMutationsPositionOnly(pending)) {
+    if (!canReplayNativeCanvasPositionMutations(snapshot.document, pending)) {
       dependencies.updateState({
         phase: 'ready',
         snapshot,

@@ -450,6 +450,48 @@ describe('原生 Canvas controller 权威恢复', () => {
     expect(harness.getState().pendingMutations).toEqual([move, viewport])
   })
 
+  test('Given 远端已删除本地待移动节点 When recovery 接管 Then 保留 pending 冲突且采用远端后恢复可编辑', async () => {
+    const base = createSnapshot(5)
+    base.document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: '本地 Agent',
+      agentSessionId: 'session-1', position: { x: 0, y: 0 },
+    }]
+    const harness = createHarness({ phase: 'ready', snapshot: base })
+    harness.controller.start()
+    const move: CanvasMutation = {
+      type: 'move-nodes', positions: [{ nodeId: 'agent-1', position: { x: 20, y: 30 } }],
+    }
+    harness.controller.enqueueMutation(move)
+    harness.scheduler.runAll()
+
+    harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'recovery' })
+    const remote = createSnapshot(6)
+    remote.document.nodes = []
+    harness.loads[1]?.resolve(remote)
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      snapshot: remote,
+      pendingMutations: [move],
+      inFlightMutations: [],
+      saveState: 'conflict',
+      error: NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
+    })
+    expect(harness.scheduler.getDelay()).toBeUndefined()
+    expect(harness.saves).toHaveLength(1)
+
+    harness.controller.acceptRemoteVersion()
+    expect(harness.getState()).toMatchObject({
+      snapshot: remote,
+      pendingMutations: [],
+      inFlightMutations: [],
+      saveState: 'saved',
+      error: null,
+    })
+    harness.controller.enqueueMutation({ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1.1 } })
+    expect(harness.getState()).toMatchObject({ saveState: 'dirty' })
+  })
+
   test('Given pending 含结构 mutation When recovery 成功 Then 接管权威结构并显式冲突', async () => {
     const structural: CanvasMutation = { type: 'remove-nodes', nodeIds: ['agent-1'] }
     const harness = createHarness({
@@ -590,11 +632,21 @@ describe('原生 Canvas controller 权威恢复', () => {
     const secondA = createHarness(persistedA, targetA)
     secondA.controller.start()
     expect(secondA.loads).toHaveLength(1)
-    secondA.loads[0]?.resolve(createSnapshot(1, targetA))
+    const recoveredA = createSnapshot(1, targetA)
+    recoveredA.document.nodes = [{
+      id: 'agent-a', kind: 'agent', title: '恢复 Agent A',
+      agentSessionId: 'session-a', position: { x: 1, y: 1 },
+    }]
+    secondA.loads[0]?.resolve(recoveredA)
     await flushPromises()
 
     expect(secondA.loads).toHaveLength(2)
-    secondA.loads[1]?.resolve(createSnapshot(9, targetA))
+    const reconciledA = createSnapshot(9, targetA)
+    reconciledA.document.nodes = [{
+      id: 'agent-a', kind: 'agent', title: '最新 Agent A',
+      agentSessionId: 'session-a', position: { x: 2, y: 2 },
+    }]
+    secondA.loads[1]?.resolve(reconciledA)
     await flushPromises()
 
     expect(secondA.getState()).toMatchObject({
