@@ -68,6 +68,8 @@ export interface SecureAtomicJsonWriteOptions extends DurabilitySyncOptions {
 
 /** 原子删除普通文件时允许替换的窄测试依赖。 */
 export interface AtomicFileRemoveOptions extends DurabilitySyncOptions {
+  /** 只允许删除与调用方此前读取身份一致的文件。 */
+  expectedIdentity?: AtomicFileIdentity
   /** rename 完成后、身份复验前调用，仅供稳定覆盖置换竞态。 */
   afterRenameBeforeVerify?: (tombstonePath: string) => void
   /** rename 已提交后清理 tombstone；生产默认使用 unlinkSync。 */
@@ -81,13 +83,16 @@ export interface AtomicFileRemoveOptions extends DurabilitySyncOptions {
 /** 持久创建目录时允许替换的窄测试依赖。 */
 export interface DurableDirectoryOptions extends DurabilitySyncOptions {}
 
-/** 需要跨检查保持不变的文件系统对象身份。 */
-interface FileSystemIdentity {
+/** 可由读取方传回删除边界的最小文件系统对象身份。 */
+export interface AtomicFileIdentity {
   /** 所在设备编号。 */
-  dev: number
+  dev: number | bigint
   /** 同一设备内 inode/file index。 */
-  ino: number
+  ino: number | bigint
 }
+
+/** safe-file 内部复用的文件身份别名。 */
+type FileSystemIdentity = AtomicFileIdentity
 
 /**
  * 原子写入 JSON 文件：write-to-temp → rename
@@ -144,21 +149,38 @@ export function removeFileAtomic(
   try {
     parentStat = lstatSync(parentPath)
   } catch (error) {
-    if (isMissingPathError(error)) return 'directory'
+    if (isMissingPathError(error)) {
+      if (options.expectedIdentity) throw new Error('原子删除目标身份不匹配', { cause: error })
+      return 'directory'
+    }
     throw error
   }
   if (!parentStat.isDirectory()) throw new Error('原子删除父路径不是目录')
   const parentIdentity = toIdentity(parentStat)
+  /** 绑定删除时先读取目标，避免回收 tombstone 后才发现调用方身份已经失效。 */
+  let targetStat: Stats | undefined
+  if (options.expectedIdentity) {
+    try {
+      targetStat = lstatSync(filePath)
+    } catch (error) {
+      throw new Error('原子删除目标身份不匹配', { cause: error })
+    }
+    if (!targetStat.isFile()) throw new Error('原子删除目标不是普通文件')
+    if (!isSameIdentity(toIdentity(targetStat), options.expectedIdentity)) {
+      throw new Error('原子删除目标身份不匹配')
+    }
+  }
   /** 回收旧 tombstone 后已达到的最低持久化等级。 */
   let durability = recoverAtomicDeleteTombstones(parentPath, parentIdentity, options)
 
   /** 删除前 no-follow 读取的目标身份。 */
-  let targetStat: ReturnType<typeof lstatSync>
-  try {
-    targetStat = lstatSync(filePath)
-  } catch (error) {
-    if (isMissingPathError(error)) return durability
-    throw error
+  if (!targetStat) {
+    try {
+      targetStat = lstatSync(filePath)
+    } catch (error) {
+      if (isMissingPathError(error)) return durability
+      throw error
+    }
   }
   if (!targetStat.isFile()) throw new Error('原子删除目标不是普通文件')
   const targetIdentity = toIdentity(targetStat)

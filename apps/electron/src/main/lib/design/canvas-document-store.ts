@@ -21,6 +21,7 @@ import type {
   CanvasNode,
 } from '@proma/shared'
 import { removeFileAtomic, writeJsonFileAtomicSecure } from '../safe-file'
+import type { AtomicFileIdentity } from '../safe-file'
 import type { CanvasSessionStore } from './canvas-session-store'
 import { designPathResolver, isSafeDesignStableId } from './design-paths'
 import type { CanvasPaths, DesignPathResolver } from './design-paths'
@@ -62,6 +63,12 @@ interface CanvasSecureWriteOptions {
   beforeRename?: (temporaryPath: string) => void
 }
 
+/** Canvas Store 消费恢复 tmp 时传给 safe-file 的最小身份合同。 */
+interface CanvasRemoveFileOptions {
+  /** 候选读取时绑定的文件 dev/ino。 */
+  expectedIdentity?: AtomicFileIdentity
+}
+
 /** Canvas 文档 Store 的可信依赖与窄测试注入点。 */
 export interface CanvasDocumentStoreOptions {
   /** 项目 Canvas registry 的 native 归属守卫。 */
@@ -79,7 +86,11 @@ export interface CanvasDocumentStoreOptions {
     options?: CanvasSecureWriteOptions,
   ) => unknown
   /** 固定恢复 tmp 的安全原子删除边界。 */
-  removeFileAtomic?: (filePath: string) => unknown
+  removeFileAtomic?: (filePath: string, options?: CanvasRemoveFileOptions) => unknown
+  /** 候选完成解析后、最终状态复验前调用的竞态测试 hook。 */
+  afterCandidateRead?: (candidatePath: string) => void
+  /** tmp 提升为主文件后、绑定身份删除前调用的竞态测试 hook。 */
+  beforeConsumeRecoveredTemporary?: (temporaryPath: string) => void
 }
 
 /** 未知 JSON 普通对象的安全索引结构。 */
@@ -96,15 +107,26 @@ interface CanvasDirectoryIdentity {
 }
 
 /** 可比较的文件系统对象身份。 */
-interface CanvasFileIdentity {
+interface CanvasFileState extends AtomicFileIdentity {
+  size: number | bigint
+  mtimeMs: number | bigint
+  ctimeMs: number | bigint
+}
+
+/** lstat/fstat 两类 Node stats 共同提供的内容状态字段。 */
+interface CanvasFileStat {
   dev: number | bigint
   ino: number | bigint
+  size: number | bigint
+  mtimeMs: number | bigint
+  ctimeMs: number | bigint
 }
 
 /** 单个主/tmp/bak 候选的安全读取结果。 */
 interface CanvasCandidateState {
   exists: boolean
   document: CanvasDocument | null
+  identity?: AtomicFileIdentity
 }
 
 /** 整条恢复链的权威读取结果。 */
@@ -112,6 +134,7 @@ interface CanvasDocumentReadResult {
   document: CanvasDocument | null
   recoveredFrom?: NonNullable<CanvasWorkspaceSnapshot['recoveredFrom']>
   hasCandidate: boolean
+  recoveredIdentity?: AtomicFileIdentity
 }
 
 /** 判断未知值是否为无额外原型行为的普通对象。 */
@@ -417,9 +440,24 @@ function assertDirectoryIdentity(identity: CanvasDirectoryIdentity): void {
   }
 }
 
-/** 确认两个 no-follow 文件状态指向同一对象。 */
-function isSameFileIdentity(left: CanvasFileIdentity, right: CanvasFileIdentity): boolean {
-  return left.dev === right.dev && left.ino === right.ino
+/** 从 lstat/fstat 提取读取期间必须保持稳定的内容状态。 */
+function toCanvasFileState(stats: CanvasFileStat): CanvasFileState {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs,
+  }
+}
+
+/** 确认两次文件状态的身份与可观察内容版本完全一致。 */
+function isSameFileState(left: CanvasFileState, right: CanvasFileState): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs
 }
 
 /**
@@ -461,6 +499,7 @@ function readCanvasCandidate(
   target: CanvasTarget,
   directoryIdentity: CanvasDirectoryIdentity,
   validateDocument: (value: unknown, target: CanvasTarget) => CanvasDocument,
+  afterCandidateRead?: (candidatePath: string) => void,
 ): CanvasCandidateState {
   if (dirname(candidatePath) !== directoryIdentity.path) {
     throw unsafeCanvasPath(`文档候选不在 Canvas 根: ${candidatePath}`)
@@ -472,30 +511,45 @@ function readCanvasCandidate(
   if (pathStats.isSymbolicLink() || !pathStats.isFile()) {
     throw unsafeCanvasPath(`文档候选不是实际文件: ${candidatePath}`)
   }
+  /** 路径初始身份与内容版本用于约束整个读取和解析窗口。 */
+  const initialState = toCanvasFileState(pathStats)
   /** descriptor 只在本次稳定读取期间拥有。 */
   let descriptor: number | null = null
   try {
     descriptor = openSync(candidatePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
     /** 打开后身份必须与路径 lstat 完全一致。 */
     const openedStats = fstatSync(descriptor)
-    if (!openedStats.isFile() || !isSameFileIdentity(pathStats, openedStats)) {
+    if (!openedStats.isFile() || !isSameFileState(initialState, toCanvasFileState(openedStats))) {
       throw unsafeCanvasPath(`文档候选身份已变化: ${candidatePath}`)
     }
     /** 从稳定 descriptor 读取候选原文。 */
     const raw = readFileSync(descriptor, 'utf8')
-    /** 读取后 descriptor 和目录身份都不得变化。 */
-    const finalStats = fstatSync(descriptor)
-    if (!isSameFileIdentity(pathStats, finalStats)) {
-      throw unsafeCanvasPath(`文档候选读取期间被替换: ${candidatePath}`)
-    }
-    assertDirectoryIdentity(directoryIdentity)
+    /** 解析失败只标记候选损坏，仍必须完成读取后的身份复验。 */
+    let document: CanvasDocument | null = null
     try {
       /** 所有 JSON.parse 结果按 unknown 进入严格 validator。 */
       const value: unknown = JSON.parse(raw)
-      return { exists: true, document: validateDocument(value, target) }
-    } catch (error) {
-      if (error instanceof Error && error.message.startsWith('CANVAS_PATH_UNSAFE')) throw error
-      return { exists: true, document: null }
+      document = validateDocument(value, target)
+    } catch { /* schema 或 JSON 损坏由恢复链继续处理。 */ }
+    afterCandidateRead?.(candidatePath)
+    /** 解析后 fd 的身份、大小和修改时间都必须与打开前一致。 */
+    const finalStats = fstatSync(descriptor)
+    if (!finalStats.isFile() || !isSameFileState(initialState, toCanvasFileState(finalStats))) {
+      throw unsafeCanvasPath(`文档候选读取期间内容已变化: ${candidatePath}`)
+    }
+    /** 同名路径必须仍指向最初 inode，且内容状态没有原地变化。 */
+    const finalPathStats = lstatOrNull(candidatePath)
+    if (!finalPathStats
+      || finalPathStats.isSymbolicLink()
+      || !finalPathStats.isFile()
+      || !isSameFileState(initialState, toCanvasFileState(finalPathStats))) {
+      throw unsafeCanvasPath(`文档候选路径已变化: ${candidatePath}`)
+    }
+    assertDirectoryIdentity(directoryIdentity)
+    return {
+      exists: true,
+      document,
+      identity: { dev: initialState.dev, ino: initialState.ino },
     }
   } finally {
     if (descriptor !== null) closeSync(descriptor)
@@ -508,20 +562,29 @@ function readCanvasDocument(
   target: CanvasTarget,
   directoryIdentity: CanvasDirectoryIdentity,
   validateDocument: (value: unknown, target: CanvasTarget) => CanvasDocument,
+  afterCandidateRead?: (candidatePath: string) => void,
 ): CanvasDocumentReadResult {
   /** 当前正式主文件候选。 */
-  const primary = readCanvasCandidate(paths.documentPath, target, directoryIdentity, validateDocument)
+  const primary = readCanvasCandidate(
+    paths.documentPath, target, directoryIdentity, validateDocument, afterCandidateRead,
+  )
   if (primary.document) return { document: primary.document, hasCandidate: true }
   /** 上次固定恢复流程遗留的 tmp 候选。 */
   const temporary = readCanvasCandidate(
-    `${paths.documentPath}.tmp`, target, directoryIdentity, validateDocument,
+    `${paths.documentPath}.tmp`, target, directoryIdentity, validateDocument, afterCandidateRead,
   )
   if (temporary.document) {
-    return { document: temporary.document, recoveredFrom: 'tmp', hasCandidate: true }
+    if (!temporary.identity) throw unsafeCanvasPath('tmp 候选缺少稳定身份')
+    return {
+      document: temporary.document,
+      recoveredFrom: 'tmp',
+      recoveredIdentity: temporary.identity,
+      hasCandidate: true,
+    }
   }
   /** 最近一次稳定 revision 的 bak 候选。 */
   const backup = readCanvasCandidate(
-    `${paths.documentPath}.bak`, target, directoryIdentity, validateDocument,
+    `${paths.documentPath}.bak`, target, directoryIdentity, validateDocument, afterCandidateRead,
   )
   if (backup.document) {
     return { document: backup.document, recoveredFrom: 'backup', hasCandidate: true }
@@ -538,6 +601,18 @@ function requireNow(now: () => number): number {
   const value = now()
   if (!isTimestamp(value)) throw new Error('CANVAS_TIMESTAMP_INVALID')
   return value
+}
+
+/** 返回严格晚于当前文档且保持有限的更新时间。 */
+function requireNextUpdatedAt(now: () => number, currentUpdatedAt: number): number {
+  /** 增量至少为 1；大数使用相对 epsilon 跨过当前浮点间距。 */
+  const increment = Math.max(1, Math.abs(currentUpdatedAt) * Number.EPSILON)
+  /** 墙钟前进时尊重墙钟，停滞或回拨时使用单调逻辑时间。 */
+  const nextUpdatedAt = Math.max(requireNow(now), currentUpdatedAt + increment)
+  if (!Number.isFinite(nextUpdatedAt) || nextUpdatedAt <= currentUpdatedAt) {
+    throw new Error('CANVAS_TIMESTAMP_INVALID')
+  }
+  return nextUpdatedAt
 }
 
 /**
@@ -609,6 +684,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
       target,
       authorized.directoryIdentity,
       validateDocument,
+      options.afterCandidateRead,
     )
     if (!readResult.document && readResult.hasCandidate) {
       throw new Error(`CANVAS_DOCUMENT_CORRUPT: ${target.projectId}/${target.canvasId}`)
@@ -622,7 +698,11 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
         readResult.document,
       )
       if (readResult.recoveredFrom === 'tmp') {
-        removeFile(`${authorized.paths.documentPath}.tmp`)
+        if (!readResult.recoveredIdentity) throw unsafeCanvasPath('tmp 恢复缺少绑定身份')
+        /** 删除只消费本次实际读取的 tmp inode，置换文件必须保留。 */
+        const temporaryPath = `${authorized.paths.documentPath}.tmp`
+        options.beforeConsumeRecoveredTemporary?.(temporaryPath)
+        removeFile(temporaryPath, { expectedIdentity: readResult.recoveredIdentity })
         assertDirectoryIdentity(authorized.directoryIdentity)
       }
     }
@@ -663,20 +743,21 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     validateCanvasMutations(mutations)
     /** reducer 只执行一次，结果随后只走一次完整文档 schema 链。 */
     const mutated = applyCanvasMutations(current, mutations)
-    /** revision 与 updatedAt 只在最终提交对象上推进。 */
+    /** updatedAt 独立生成，时间边界错误不得伪装为 mutation schema 错误。 */
+    const updatedAt = requireNextUpdatedAt(now, current.updatedAt)
     /** 当前基线已严格合法，结果 schema 失败只能由本批 mutation 引入。 */
     let next: CanvasDocument
     try {
       next = validateDocument({
         ...mutated,
         revision: current.revision + 1,
-        updatedAt: requireNow(now),
+        updatedAt,
       }, target)
     } catch (error) {
       throw new Error('CANVAS_MUTATION_INVALID', { cause: error })
     }
     /** 写入前重新解析并复验路径，适配项目根在调用间迁移。 */
-    const authorized = resolveTargetPaths(target)
+    const authorized = resolveAuthorizedTarget(target)
     /** 主文件存在时先安全保存当前稳定 revision 作为固定备份。 */
     const primaryStats = lstatOrNull(authorized.paths.documentPath)
     if (primaryStats) {

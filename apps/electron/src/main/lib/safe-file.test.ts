@@ -550,6 +550,45 @@ describe('removeFileAtomic', () => {
     }
   })
 
+  test('Given 删除目标身份与预期不匹配 When 原子删除 Then 在 rename 前拒绝且保留新文件', () => {
+    /** 先记录旧文件身份，再用同名新 inode 置换。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-expected-'))
+    const filePath = join(tempDir, 'journal.json')
+    const oldPath = join(tempDir, 'journal-old.json')
+    writeFileSync(filePath, 'old', 'utf8')
+    const expectedStat = statSync(filePath)
+    renameSync(filePath, oldPath)
+    writeFileSync(filePath, 'replacement', 'utf8')
+
+    try {
+      expect(() => removeFileAtomic(filePath, {
+        expectedIdentity: { dev: expectedStat.dev, ino: expectedStat.ino },
+      })).toThrow('原子删除目标身份不匹配')
+      expect(readFileSync(filePath, 'utf8')).toBe('replacement')
+      expect(readFileNames(tempDir).sort()).toEqual(['journal-old.json', 'journal.json'])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 删除目标身份与预期一致 When 原子删除 Then 仍完成安全 rename 与清理', () => {
+    /** 当前文件 lstat 身份用于绑定本次明确消费。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-matched-'))
+    const filePath = join(tempDir, 'journal.json')
+    writeFileSync(filePath, 'owned', 'utf8')
+    const expectedStat = statSync(filePath)
+
+    try {
+      removeFileAtomic(filePath, {
+        expectedIdentity: { dev: expectedStat.dev, ino: expectedStat.ino },
+      })
+      expect(existsSync(filePath)).toBe(false)
+      expect(readFileNames(tempDir)).toEqual([])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('Given journal 与父目录均已不存在 When 重复原子删除 Then 仍幂等成功', () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-remove-missing-parent-'))
     const filePath = join(tempDir, 'removed-parent', 'journal.json')

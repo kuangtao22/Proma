@@ -4,7 +4,10 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -34,9 +37,14 @@ interface CanvasStoreFixture {
 
 /** 测试只允许替换性能计数和安全文件边界，不替换 registry 与路径所有权。 */
 interface CanvasStoreOverrides {
+  sessions?: CanvasDocumentStoreOptions['sessions']
+  pathResolver?: CanvasDocumentStoreOptions['pathResolver']
+  now?: CanvasDocumentStoreOptions['now']
   validateDocument?: CanvasDocumentStoreOptions['validateDocument']
   writeJsonFileAtomicSecure?: CanvasDocumentStoreOptions['writeJsonFileAtomicSecure']
   removeFileAtomic?: CanvasDocumentStoreOptions['removeFileAtomic']
+  afterCandidateRead?: CanvasDocumentStoreOptions['afterCandidateRead']
+  beforeConsumeRecoveredTemporary?: CanvasDocumentStoreOptions['beforeConsumeRecoveredTemporary']
 }
 
 describe('CanvasDocumentStore', () => {
@@ -78,11 +86,16 @@ describe('CanvasDocumentStore', () => {
     })
     sessions.create({ projectId: 'project-1', title: '原生 Canvas' })
     /** 文档 Store 默认使用固定时钟，便于断言 revision 时间语义。 */
+    /** 所有权依赖默认使用真实 fixture，单测可窄替换观察安全顺序。 */
     const store = createCanvasDocumentStore({
-      pathResolver,
-      sessions,
-      now: () => 100,
-      ...overrides,
+      pathResolver: overrides.pathResolver ?? pathResolver,
+      sessions: overrides.sessions ?? sessions,
+      now: overrides.now ?? (() => 100),
+      validateDocument: overrides.validateDocument,
+      writeJsonFileAtomicSecure: overrides.writeJsonFileAtomicSecure,
+      removeFileAtomic: overrides.removeFileAtomic,
+      afterCandidateRead: overrides.afterCandidateRead,
+      beforeConsumeRecoveredTemporary: overrides.beforeConsumeRecoveredTemporary,
     })
     /** 原生文档必须只位于 resolveCanvas 给出的独立目录。 */
     const documentPath = pathResolver.resolveCanvas('project-1', 'canvas-1').documentPath
@@ -188,6 +201,53 @@ describe('CanvasDocumentStore', () => {
     expect(stable.document).toEqual(recovered.document)
   })
 
+  test('Given 候选读取后同 inode 被原地改写 When load Then 内容状态变化 fail closed', () => {
+    const fixture = createFixture({
+      afterCandidateRead: (candidatePath) => {
+        if (candidatePath !== fixture.documentPath) return
+        /** 追加合法 JSON 空白会保留 inode，但改变 size/mtime/ctime。 */
+        writeFileSync(candidatePath, `${readFileSync(candidatePath, 'utf8')} `, 'utf8')
+      },
+    })
+    writeDocument(fixture.documentPath, createConnectedDocument())
+
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_PATH_UNSAFE')
+  })
+
+  test('Given 候选读取后路径被新 inode 置换 When load Then 重新 lstat 拒绝替换路径', () => {
+    const fixture = createFixture({
+      afterCandidateRead: (candidatePath) => {
+        if (candidatePath !== fixture.documentPath) return
+        /** 原 fd 仍绑定旧 inode，但同名路径已经指向攻击者替换文件。 */
+        renameSync(candidatePath, `${candidatePath}.original`)
+        writeDocument(candidatePath, createConnectedDocument(4))
+      },
+    })
+    writeDocument(fixture.documentPath, createConnectedDocument())
+
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_PATH_UNSAFE')
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(4)
+  })
+
+  test('Given tmp 提升后被新 inode 置换 When 消费恢复文件 Then 不删除替换文件', () => {
+    const fixture = createFixture({
+      beforeConsumeRecoveredTemporary: (temporaryPath) => {
+        /** 保留已读取 tmp，并在原路径放置另一个合法文档。 */
+        renameSync(temporaryPath, `${temporaryPath}.original`)
+        writeDocument(temporaryPath, createConnectedDocument(4))
+      },
+    })
+    writeDocument(fixture.documentPath, { broken: true })
+    writeDocument(`${fixture.documentPath}.tmp`, createConnectedDocument(2))
+
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('原子删除目标身份不匹配')
+    expect(JSON.parse(readFileSync(`${fixture.documentPath}.tmp`, 'utf8')).revision).toBe(4)
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(2)
+  })
+
   test('Given 主 tmp bak 全部损坏 When load Then 明确失败且不覆盖任何候选', () => {
     const fixture = createFixture()
     /** 三份损坏原文用于验证失败不会触发修复性覆盖。 */
@@ -209,6 +269,140 @@ describe('CanvasDocumentStore', () => {
       2,
       [{ type: 'set-viewport', viewport: { x: 1, y: 1, zoom: 1 } }],
     )).toThrow('CANVAS_REVISION_CONFLICT: expected=2, current=3')
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(3)
+  })
+
+  test('Given validateCurrent 后 native 授权被撤销 When mutate 提交 Then 二次授权先于路径和写入', () => {
+    const fixture = createFixture()
+    /** 第二次授权模拟 Canvas 在校验后被归档迁移或删除。 */
+    let authorizationCalls = 0
+    const sessions: CanvasDocumentStoreOptions['sessions'] = {
+      requireNative: () => {
+        authorizationCalls += 1
+        if (authorizationCalls === 2) throw new Error('Canvas 会话不存在')
+        return fixture.sessions.requireNative('project-1', 'canvas-1')
+      },
+    }
+    /** 只允许首次 load 解析一次文档路径。 */
+    let resolveCanvasCalls = 0
+    const pathResolver: DesignPathResolver = {
+      resolve: fixture.pathResolver.resolve,
+      resolveCanvas: (projectId, canvasId) => {
+        resolveCanvasCalls += 1
+        return fixture.pathResolver.resolveCanvas(projectId, canvasId)
+      },
+    }
+    /** 写边界不得在二次授权失败后触达。 */
+    let writeCalls = 0
+    const store = createCanvasDocumentStore({
+      sessions,
+      pathResolver,
+      now: () => 100,
+      writeJsonFileAtomicSecure: () => { writeCalls += 1 },
+    })
+
+    expect(() => store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      0,
+      [{ type: 'set-viewport', viewport: { x: 1, y: 1, zoom: 1 } }],
+      () => undefined,
+    )).toThrow('Canvas 会话不存在')
+    expect(authorizationCalls).toBe(2)
+    expect(resolveCanvasCalls).toBe(1)
+    expect(writeCalls).toBe(0)
+  })
+
+  test('Given validateCurrent 拒绝且 revision 也冲突 When mutate Then 策略先于冲突、apply 和写入', () => {
+    /** 当前文档确保 expectedRevision 明确过期。 */
+    let writeCalls = 0
+    const fixture = createFixture({
+      writeJsonFileAtomicSecure: () => { writeCalls += 1 },
+    })
+    writeDocument(fixture.documentPath, createConnectedDocument(2))
+
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      1,
+      [{ type: 'upsert-nodes', nodes: [createConnectedDocument().nodes[0]!, createConnectedDocument().nodes[0]!] }],
+      (document) => {
+        expect(document.revision).toBe(2)
+        throw new Error('CURRENT_POLICY_REJECTED')
+      },
+    )).toThrow('CURRENT_POLICY_REJECTED')
+    expect(writeCalls).toBe(0)
+  })
+
+  test.each([
+    ['同值时钟', 22],
+    ['回拨时钟', 10],
+  ] as const)('Given %s When mutate Then updatedAt 严格推进且 createdAt 不变', (_label, now) => {
+    const fixture = createFixture({ now: () => now })
+    writeDocument(fixture.documentPath, createConnectedDocument(2))
+
+    const result = fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
+    )
+
+    expect(result.updatedAt).toBeGreaterThan(22)
+    expect(result.createdAt).toBe(20)
+  })
+
+  test('Given 当前 updatedAt 已无法生成有限更大值 When mutate Then 明确失败且不写', () => {
+    let writeCalls = 0
+    const fixture = createFixture({
+      now: () => 100,
+      writeJsonFileAtomicSecure: () => { writeCalls += 1 },
+    })
+    writeDocument(fixture.documentPath, {
+      ...createConnectedDocument(2),
+      updatedAt: Number.MAX_VALUE,
+    })
+
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
+    )).toThrow('CANVAS_TIMESTAMP_INVALID')
+    expect(writeCalls).toBe(0)
+  })
+
+  test('Given 首次 mutate 发现恢复候选 When 保存 Then 提升后要求 Renderer 重载且不应用 mutation', () => {
+    const fixture = createFixture()
+    writeDocument(fixture.documentPath, { broken: true })
+    writeDocument(`${fixture.documentPath}.tmp`, createConnectedDocument(2))
+
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [{ type: 'set-viewport', viewport: { x: 9, y: 9, zoom: 2 } }],
+    )).toThrow('CANVAS_RECOVERY_REQUIRED: recoveredFrom=tmp')
+    /** 主文件只包含恢复 revision，未包含本次 mutation。 */
+    const promoted = JSON.parse(readFileSync(fixture.documentPath, 'utf8')) as CanvasDocument
+    expect(promoted.revision).toBe(2)
+    expect(promoted.viewport).toEqual({ x: 0, y: 0, zoom: 1 })
+  })
+
+  test('Given 已有主文件 When mutate Then 一次安全备份写后一次主提交写', () => {
+    /** 记录安全写路径并真实落盘，锁定恢复开销与主提交口径。 */
+    const writePaths: string[] = []
+    const fixture = createFixture({
+      writeJsonFileAtomicSecure: (path, document) => {
+        writePaths.push(path)
+        writeDocument(path, document)
+      },
+    })
+    writeDocument(fixture.documentPath, createConnectedDocument(2))
+
+    fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
+    )
+
+    expect(writePaths).toEqual([`${fixture.documentPath}.bak`, fixture.documentPath])
+    expect(JSON.parse(readFileSync(`${fixture.documentPath}.bak`, 'utf8')).revision).toBe(2)
     expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(3)
   })
 
@@ -265,6 +459,23 @@ describe('CanvasDocumentStore', () => {
       .toThrow('CANVAS_PATH_UNSAFE')
   })
 
+  test('Given 文档候选是 symlink 或非普通文件 When load Then no-follow 边界拒绝', () => {
+    const fixture = createFixture()
+    /** 外部合法文档不得经 symlink 候选进入 Canvas。 */
+    const outsidePath = join(root, 'outside-canvas.json')
+    writeDocument(outsidePath, createConnectedDocument())
+    mkdirSync(join(fixture.documentPath, '..'), { recursive: true })
+    symlinkSync(outsidePath, fixture.documentPath)
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_PATH_UNSAFE')
+
+    /** 同名目录同样不是可读取的普通候选。 */
+    unlinkSync(fixture.documentPath)
+    mkdirSync(fixture.documentPath)
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_PATH_UNSAFE')
+  })
+
   test.each([
     ['未知根字段', (document: CanvasDocument) => ({ ...document, secret: true })],
     ['重复节点 ID', (document: CanvasDocument) => ({ ...document, nodes: [document.nodes[0]!, document.nodes[0]!] })],
@@ -284,6 +495,61 @@ describe('CanvasDocumentStore', () => {
   ] as const)('Given 文档包含%s When load Then 严格 schema 拒绝', (_label, corrupt) => {
     const fixture = createFixture()
     writeDocument(fixture.documentPath, corrupt(createConnectedDocument()))
+
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_DOCUMENT_CORRUPT')
+  })
+
+  test.each([
+    ['非有限节点坐标', (document: CanvasDocument) => ({
+      ...document,
+      nodes: [{ ...document.nodes[0], position: { x: Number.NaN, y: 0 } }],
+      edges: [],
+    })],
+    ['非有限 viewport', (document: CanvasDocument) => ({
+      ...document,
+      viewport: { x: Number.POSITIVE_INFINITY, y: 0, zoom: 1 },
+    })],
+    ['非正 zoom', (document: CanvasDocument) => ({ ...document, viewport: { x: 0, y: 0, zoom: 0 } })],
+    ['非整数 revision', (document: CanvasDocument) => ({ ...document, revision: 1.5 })],
+    ['非有限 createdAt', (document: CanvasDocument) => ({ ...document, createdAt: Number.NaN })],
+    ['非有限 updatedAt', (document: CanvasDocument) => ({ ...document, updatedAt: Number.POSITIVE_INFINITY })],
+    ['空节点标题', (document: CanvasDocument) => ({
+      ...document,
+      nodes: [{ ...document.nodes[0], title: '   ' }],
+      edges: [],
+    })],
+  ] as const)('Given 文档包含%s When load Then 有限 schema 拒绝', (_label, corrupt) => {
+    const fixture = createFixture()
+    writeDocument(fixture.documentPath, corrupt(createConnectedDocument()))
+
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_DOCUMENT_CORRUPT')
+  })
+
+  test.each([
+    ['agent', {
+      id: 'node-agent', kind: 'agent', title: 'Agent', position: { x: 0, y: 0 },
+      agentSessionId: 'session-1', assetId: 'forged',
+    }],
+    ['image', {
+      id: 'node-image', kind: 'image', title: 'Image', position: { x: 0, y: 0 },
+      assetId: 'asset-1', agentSessionId: 'forged',
+    }],
+    ['visual-document', {
+      id: 'node-document', kind: 'visual-document', title: 'Document', position: { x: 0, y: 0 },
+      visualDocumentId: 'document-1', url: 'https://example.com',
+    }],
+    ['webview', {
+      id: 'node-webview', kind: 'webview', title: 'Webview', position: { x: 0, y: 0 },
+      url: 'https://example.com', visualDocumentId: 'forged',
+    }],
+  ] as const)('Given %s 节点夹带其他类别引用 When load Then exact schema 拒绝', (_kind, node) => {
+    const fixture = createFixture()
+    writeDocument(fixture.documentPath, {
+      ...createEmptyCanvasDocument('project-1', 'canvas-1', 20),
+      nodes: [node],
+    })
 
     expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
       .toThrow('CANVAS_DOCUMENT_CORRUPT')
