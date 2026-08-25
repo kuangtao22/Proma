@@ -112,6 +112,7 @@ import { settingsOpenAtom } from '@/atoms/settings-tab'
 import { deliverPendingMentionsToComposer } from '@/lib/design-session-actions'
 import { shouldOfferDesignHandoff } from '@/lib/agent-design-intent'
 import { activeViewAtom } from '@/atoms/active-view'
+import { activeCanvasSelectionAtom } from '@/atoms/canvas-session-atoms'
 import { updateDesignProjectStateAtom } from '@/atoms/design-atoms'
 import { longTextPasteAsAttachmentEnabledAtom } from '@/atoms/ui-preferences'
 import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
@@ -121,7 +122,7 @@ import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { useOpenPreview } from '@/components/diff/preview-opener'
 import type { AgentDeferredQueueMessageInput, AgentSendInput, AgentPendingFile, AgentThinkingLevel, FileDialogLargeFile, FileDialogResult, ModelOption, ReasoningCapability, SDKMessage, SDKUserMessage } from '@proma/shared'
-import { inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedModel, MAX_ATTACHMENT_SIZE, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningCapability, resolveReasoningProfile } from '@proma/shared'
+import { inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedModel, LEGACY_DESIGN_CANVAS_ID, MAX_ATTACHMENT_SIZE, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningCapability, resolveReasoningProfile } from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
 import { getFilePanelDragData, INSERT_FILE_MENTION_EVENT, type FilePanelDragItem } from '@/lib/file-panel-drag'
 import { buildQuotedSelectionBlock, expandAgentHistoryQuoteMentions } from '@/lib/quoted-selection'
@@ -469,6 +470,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   /** 用户明确选择继续 Agent 后，仅绕过同一段文本一次。 */
   const designHandoffBypassPromptRef = React.useRef<string | null>(null)
   const setActiveView = useSetAtom(activeViewAtom)
+  const setActiveCanvasSelection = useSetAtom(activeCanvasSelectionAtom)
   const updateDesignProjectState = useSetAtom(updateDesignProjectStateAtom)
   React.useEffect(() => window.electronAPI.onPlanningAgentOperation((operation) => {
     if (operation.sessionId !== sessionId) return
@@ -2302,9 +2304,10 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       return next
     })
     setPendingDesignHandoff(null)
+    setActiveCanvasSelection({ projectId: currentWorkspaceId, canvasId: LEGACY_DESIGN_CANVAS_ID })
     setActiveView('design')
     toast.success('已打开设计面板', { description: '原始要求已填入，确认后再生成图片。' })
-  }, [currentWorkspaceId, pendingDesignHandoff, sessionId, setActiveView, setCurrentAgentWorkspaceId, setInputContent, setPromptSuggestions, updateDesignProjectState])
+  }, [currentWorkspaceId, pendingDesignHandoff, sessionId, setActiveCanvasSelection, setActiveView, setCurrentAgentWorkspaceId, setInputContent, setPromptSuggestions, updateDesignProjectState])
 
   /** 停止生成。异常流未发出终态时，允许再次下发幂等的 abort 请求。 */
   const handleStop = React.useCallback((): void => {

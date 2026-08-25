@@ -3,8 +3,10 @@ import type { CanvasSessionMeta } from '@proma/shared'
 import { createStore } from 'jotai'
 import {
   activeCanvasSelectionAtom,
+  activeCanvasSessionAtom,
   canvasSessionsByProjectAtom,
   replaceCanvasSessionsAtom,
+  resolveActiveCanvasSession,
   upsertCanvasSessionAtom,
 } from './canvas-session-atoms'
 
@@ -77,5 +79,31 @@ describe('Canvas Renderer registry', () => {
     })
 
     expect(store.get(activeCanvasSelectionAtom)).toBeNull()
+  })
+
+  test('Given Agent 显式转交 legacy Design When 旧画布尚未落盘 Then 保留确定性兼容入口', () => {
+    const store = createStore()
+    const selection = { projectId: 'project-a', canvasId: 'legacy-design' }
+    store.set(activeCanvasSelectionAtom, selection)
+
+    store.set(replaceCanvasSessionsAtom, { projectId: 'project-a', sessions: [] })
+
+    expect(store.get(activeCanvasSelectionAtom)).toEqual(selection)
+    expect(resolveActiveCanvasSession(selection, store.get(canvasSessionsByProjectAtom))).toMatchObject({
+      id: 'legacy-design',
+      projectId: 'project-a',
+      archived: false,
+    })
+  })
+
+  test('Given legacy Design 已归档 When 解析迟到选择 Then 不生成虚拟兼容入口', () => {
+    const store = createStore()
+    const selection = { projectId: 'project-a', canvasId: 'legacy-design' }
+    const archived = createCanvas('legacy-design', 'project-a', { archived: true })
+    store.set(activeCanvasSelectionAtom, selection)
+    store.set(canvasSessionsByProjectAtom, new Map([['project-a', [archived]]]))
+
+    expect(resolveActiveCanvasSession(selection, new Map([['project-a', [archived]]]))).toBeNull()
+    expect(store.get(activeCanvasSessionAtom)).toBeNull()
   })
 })

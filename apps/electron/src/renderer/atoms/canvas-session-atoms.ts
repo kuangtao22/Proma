@@ -1,4 +1,7 @@
-import type { CanvasSessionMeta } from '@proma/shared'
+import {
+  LEGACY_DESIGN_CANVAS_ID,
+  type CanvasSessionMeta,
+} from '@proma/shared'
 import { atom } from 'jotai'
 
 /** 当前主视图选择的 Canvas 双重稳定身份。 */
@@ -33,6 +36,39 @@ export const canvasSessionStatusByProjectAtom = atom<Map<string, CanvasSessionPr
 /** 当前打开的 Canvas；null 表示主视图未处于 Canvas 会话。 */
 export const activeCanvasSelectionAtom = atom<ActiveCanvasSelection | null>(null)
 
+/**
+ * 解析当前选择对应的可见 Canvas。
+ * legacy 兼容入口允许在旧画布首次落盘前使用确定性虚拟元数据，其它缺失会话一律返回 null。
+ */
+export function resolveActiveCanvasSession(
+  selection: ActiveCanvasSelection | null,
+  sessionsByProject: Map<string, CanvasSessionMeta[]>,
+): CanvasSessionMeta | null {
+  if (!selection) return null
+  /** 只允许在选择所属项目中按 ID 命中，避免跨项目同名会话串用。 */
+  const existing = sessionsByProject
+    .get(selection.projectId)
+    ?.find((session) => session.id === selection.canvasId)
+  if (existing) return existing.archived ? null : existing
+  if (selection.canvasId !== LEGACY_DESIGN_CANVAS_ID) return null
+  return {
+    id: LEGACY_DESIGN_CANVAS_ID,
+    projectId: selection.projectId,
+    title: '默认设计画布',
+    archived: false,
+    createdAt: 0,
+    updatedAt: 0,
+  }
+}
+
+/** 已通过项目归属、归档状态和 legacy 兼容规则解析的当前 Canvas。 */
+export const activeCanvasSessionAtom = atom((get): CanvasSessionMeta | null => (
+  resolveActiveCanvasSession(
+    get(activeCanvasSelectionAtom),
+    get(canvasSessionsByProjectAtom),
+  )
+))
+
 /** 只更新目标项目的 Canvas 索引加载状态。 */
 export const setCanvasSessionProjectStatusAtom = atom(
   null,
@@ -51,6 +87,10 @@ function hasActiveCanvas(
   sessions: CanvasSessionMeta[],
 ): boolean {
   if (selection.projectId !== projectId) return true
+  if (selection.canvasId === LEGACY_DESIGN_CANVAS_ID
+    && !sessions.some((session) => session.id === LEGACY_DESIGN_CANVAS_ID && session.archived)) {
+    return true
+  }
   return sessions.some((session) => session.id === selection.canvasId && !session.archived)
 }
 

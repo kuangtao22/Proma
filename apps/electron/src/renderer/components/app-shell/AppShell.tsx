@@ -17,6 +17,7 @@ import { leftSidebarWidthAtom } from '@/atoms/sidebar-atoms'
 import { sidebarCollapsedAtom } from '@/atoms/tab-atoms'
 import { automationFormAtom } from '@/atoms/automation-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
+import { activeCanvasSessionAtom } from '@/atoms/canvas-session-atoms'
 import { useProjectActions } from '@/hooks/useProjectActions'
 import { WorkspaceMemoryChangeObserver } from '@/components/agent-skills/WorkspaceMemoryChangeObserver'
 import { interfaceVariantAtom } from '@/atoms/theme'
@@ -57,11 +58,17 @@ export function AppShell(): React.ReactElement {
   const isClassic = interfaceVariant === 'classic'
   // 右栏模式同时覆盖会话文件和项目设计，设计视图不依赖当前会话。
   const activeView = useAtomValue(activeViewAtom)
+  const activeCanvasSession = useAtomValue(activeCanvasSessionAtom)
+  /** Design 右栏严格跟随 Canvas 选择；普通会话继续使用当前项目。 */
+  const rightPanelProjectId = activeView === 'design'
+    ? activeCanvasSession?.projectId ?? null
+    : currentWorkspace?.id ?? null
   /** 当前视图需要挂载的右栏类型。 */
   const rightPanelMode = getRightPanelMode({
     activeView,
     appMode,
-    projectId: currentWorkspace?.id ?? null,
+    projectId: rightPanelProjectId,
+    canvasId: activeCanvasSession?.id ?? null,
     sessionId: currentSessionId,
     automationOpen: automationForm.open,
   })
@@ -244,7 +251,7 @@ export function AppShell(): React.ReactElement {
                 )}
                 <RightSidePanel
                   mode={rightPanelMode}
-                  projectId={currentWorkspace?.id ?? null}
+                  projectId={rightPanelProjectId}
                   width={clampedRightPanelWidth}
                 />
               </div>

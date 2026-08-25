@@ -4,6 +4,9 @@ export const DESIGN_DOCUMENT_VERSION = 1
 /** Canvas 会话标题长度上限，阻断无界标题放大索引和侧栏布局。 */
 export const CANVAS_SESSION_TITLE_MAX_LENGTH = 120
 
+/** 旧项目级 Design 映射到 Canvas registry 的确定性兼容身份。 */
+export const LEGACY_DESIGN_CANVAS_ID = 'legacy-design'
+
 /** 项目下可见的 Canvas 顶层会话，不携带 Agent runtime 字段。 */
 export interface CanvasSessionMeta {
   id: string

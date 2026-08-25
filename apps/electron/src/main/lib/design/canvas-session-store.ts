@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import {
   CANVAS_SESSION_TITLE_MAX_LENGTH,
+  LEGACY_DESIGN_CANVAS_ID,
   type CanvasSessionMeta,
   type CreateCanvasSessionInput,
   type ListCanvasSessionsInput,
@@ -13,9 +14,6 @@ import { isSafeDesignStableId } from './design-paths'
 
 /** Canvas 会话索引当前 schema。 */
 const CANVAS_SESSION_INDEX_VERSION = 1
-/** 旧项目级 Design 对应的确定性 Canvas ID。 */
-export const LEGACY_DESIGN_CANVAS_ID = 'legacy-design'
-
 /** 索引内部记录额外保存实际存储形态，不向 Renderer 暴露。 */
 interface CanvasSessionRecord extends CanvasSessionMeta {
   storageKind: 'legacy' | 'native'

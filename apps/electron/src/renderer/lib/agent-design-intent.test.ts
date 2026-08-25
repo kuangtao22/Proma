@@ -34,10 +34,12 @@ describe('Agent 到 Design 的发送前意图判断', () => {
     const handlerEnd = source.indexOf('/** 停止生成', handlerStart)
     const handlerBody = source.slice(handlerStart, handlerEnd)
     const projectSwitchIndex = handlerBody.indexOf('setCurrentAgentWorkspaceId(currentWorkspaceId)')
+    const canvasSelectionIndex = handlerBody.indexOf('canvasId: LEGACY_DESIGN_CANVAS_ID')
     const designViewIndex = handlerBody.indexOf("setActiveView('design')")
 
     expect(handlerStart).toBeGreaterThan(-1)
     expect(projectSwitchIndex).toBeGreaterThan(-1)
-    expect(designViewIndex).toBeGreaterThan(projectSwitchIndex)
+    expect(canvasSelectionIndex).toBeGreaterThan(projectSwitchIndex)
+    expect(designViewIndex).toBeGreaterThan(canvasSelectionIndex)
   })
 })

@@ -1,25 +1,25 @@
 import * as React from 'react'
-import type { AgentWorkspace } from '@proma/shared'
+import type { CanvasSessionMeta } from '@proma/shared'
 import { useAtomValue } from 'jotai'
-import { Palette } from 'lucide-react'
+import { Workflow } from 'lucide-react'
 import { interfaceVariantAtom } from '@/atoms/theme'
 import { cn } from '@/lib/utils'
 
-export interface DesignProjectTabProps {
-  /** 当前设计工作区绑定的项目。 */
-  workspace: AgentWorkspace
-  /** 标签是否对应当前主视图。 */
+export interface CanvasSessionTabProps {
+  /** 当前顶部入口对应的 Canvas 轻量元数据。 */
+  session: CanvasSessionMeta
+  /** 当前主视图是否正在展示该 Canvas。 */
   active: boolean
-  /** 激活当前项目设计工作区。 */
+  /** 激活当前 Canvas 主视图。 */
   onActivate: () => void
 }
 
-/** 渲染不可关闭、不可拖拽的项目级设计入口。 */
-export function DesignProjectTab({
-  workspace,
+/** 渲染不可关闭、不可拖拽的当前 Canvas 顶部入口。 */
+export function CanvasSessionTab({
+  session,
   active,
   onActivate,
-}: DesignProjectTabProps): React.ReactElement {
+}: CanvasSessionTabProps): React.ReactElement {
   /** 当前界面样式决定标签圆角和背景规则。 */
   const isClassic = useAtomValue(interfaceVariantAtom) === 'classic'
 
@@ -44,8 +44,8 @@ export function DesignProjectTab({
         )}
         onClick={onActivate}
       >
-        <Palette className="size-3.5 shrink-0" aria-hidden="true" />
-        <span className="min-w-0 flex-1 truncate text-left">设计 · {workspace.name}</span>
+        <Workflow className="size-3.5 shrink-0" aria-hidden="true" />
+        <span className="min-w-0 flex-1 truncate text-left">{session.title}</span>
       </button>
     </div>
   )
