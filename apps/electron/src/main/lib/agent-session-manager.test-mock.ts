@@ -1,5 +1,5 @@
 import { mock } from 'bun:test'
-import type { AgentSessionMeta } from '@proma/shared'
+import type { AgentSessionMeta, SDKMessage } from '@proma/shared'
 
 /** Agent 会话管理器共享测试替身状态，避免 Bun 进程级 mock.module 相互覆盖。 */
 class AgentSessionManagerTestMock {
@@ -11,6 +11,8 @@ class AgentSessionManagerTestMock {
   sessionIdPrefix = 'created'
   /** 可选元数据读取覆盖，仅供需要独立变量驱动的调度器测试。 */
   getSessionMetaOverride?: (sessionId: string) => AgentSessionMeta | undefined
+  /** 可选 SDK 消息读取覆盖，用于计数或注入历史消息。 */
+  getAgentSessionSDKMessagesOverride?: (sessionId: string) => SDKMessage[]
 
   /** 恢复共享替身的空白状态。 */
   reset(): void {
@@ -18,6 +20,7 @@ class AgentSessionManagerTestMock {
     this.createdSessionIds.length = 0
     this.sessionIdPrefix = 'created'
     this.getSessionMetaOverride = undefined
+    this.getAgentSessionSDKMessagesOverride = undefined
   }
 }
 
@@ -57,5 +60,5 @@ mock.module('./agent-session-manager', () => ({
     if (session) agentSessionManagerTestMock.sessions.set(sessionId, { ...session, ...updates })
   },
   getAgentSessionMessages: () => [],
-  getAgentSessionSDKMessages: () => [],
+  getAgentSessionSDKMessages: (sessionId: string) => agentSessionManagerTestMock.getAgentSessionSDKMessagesOverride?.(sessionId) ?? [],
 }))

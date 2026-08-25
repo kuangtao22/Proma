@@ -1,23 +1,24 @@
-import { beforeAll, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import type { AgentSessionMeta } from '@proma/shared'
+import { agentSessionManagerTestMock } from './agent-session-manager.test-mock'
 
 /** 测试用会话索引，允许伪造 Renderer 提交的内部会话引用。 */
-const sessions = new Map<string, AgentSessionMeta>()
+const sessions = agentSessionManagerTestMock.sessions
 /** 记录消息读取次数，证明可见性判断发生在内容读取之前。 */
 let messageReadCount = 0
-/** 注入会话索引读取故障，验证存储异常不能伪装成“不存在”。 */
-let sessionStorageError: Error | undefined
 
-mock.module('./agent-session-manager', () => ({
-  getAgentSessionMeta: (sessionId: string) => {
-    if (sessionStorageError) throw sessionStorageError
-    return sessions.get(sessionId)
-  },
-  getAgentSessionSDKMessages: () => {
+beforeEach(() => {
+  agentSessionManagerTestMock.reset()
+  messageReadCount = 0
+  agentSessionManagerTestMock.getAgentSessionSDKMessagesOverride = () => {
     messageReadCount += 1
     return []
-  },
-}))
+  }
+})
+
+afterEach(() => {
+  agentSessionManagerTestMock.reset()
+})
 
 type ContextPromptModule = typeof import('./agent-session-context-prompt')
 let contextPrompt: ContextPromptModule
@@ -40,8 +41,6 @@ const configRootResolver = { requireActiveRoot: () => '/tmp/proma-context-prompt
 
 describe('被引用 Agent 会话的主进程可见性复核', () => {
   test('Given 普通会话引用 When 构建 prompt Then 保留引用信息', () => {
-    sessions.clear()
-    sessionStorageError = undefined
     sessions.set('visible', session({ id: 'visible', title: '普通会话' }))
 
     const prompt = contextPrompt.buildReferencedSessionsPrompt('current', ['visible'], undefined, configRootResolver)
@@ -55,10 +54,7 @@ describe('被引用 Agent 会话的主进程可见性复核', () => {
     ['半归属 Canvas', session({ id: 'partial-canvas', sourceCanvasProjectId: 'project-1' })],
     ['Design', session({ id: 'design', sourceDesignProjectId: 'project-1', sourceDesignJobId: 'job-1' })],
   ])('Given Renderer 伪造 %s 会话引用 When 构建 prompt Then 不泄露标题或历史路径', (_label, internalSession) => {
-    sessions.clear()
-    sessionStorageError = undefined
     sessions.set(internalSession.id, internalSession)
-    messageReadCount = 0
 
     const prompt = contextPrompt.buildReferencedSessionsPrompt('current', [internalSession.id], undefined, configRootResolver)
 
@@ -69,8 +65,9 @@ describe('被引用 Agent 会话的主进程可见性复核', () => {
   })
 
   test('Given 会话索引读取故障 When 构建引用 prompt Then 向上抛出而非静默丢失引用', () => {
-    sessions.clear()
-    sessionStorageError = new Error('会话索引读取失败')
+    agentSessionManagerTestMock.getSessionMetaOverride = () => {
+      throw new Error('会话索引读取失败')
+    }
 
     expect(() => contextPrompt.buildReferencedSessionsPrompt(
       'current',
@@ -78,7 +75,5 @@ describe('被引用 Agent 会话的主进程可见性复核', () => {
       undefined,
       configRootResolver,
     )).toThrow('会话索引读取失败')
-
-    sessionStorageError = undefined
   })
 })
