@@ -1,9 +1,13 @@
 #include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -12,6 +16,7 @@
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include <winternl.h>
 #else
 #include <dirent.h>
 #include <fcntl.h>
@@ -33,6 +38,8 @@ struct Config {
   std::size_t max_output_bytes = 16 * 1024 * 1024;
   std::set<std::string> ignore_directories;
   std::set<std::string> ignore_files;
+  std::string child_name;
+  std::string file_name;
 };
 
 struct EntryBudget {
@@ -94,7 +101,8 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
     }
     const std::string value = args[++index];
     if (key == "--mode") {
-      if (value != "list" && value != "scan") {
+      if (value != "list" && value != "scan"
+          && value != "canvas-intent-scan" && value != "canvas-intent-write") {
         *error = "unsupported mode";
         return false;
       }
@@ -122,6 +130,10 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
       config->ignore_directories.insert(value);
     } else if (key == "--ignore-file") {
       config->ignore_files.insert(value);
+    } else if (key == "--child-name") {
+      config->child_name = value;
+    } else if (key == "--file-name") {
+      config->file_name = value;
     } else {
       *error = "unknown argument: " + key;
       return false;
@@ -131,7 +143,65 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
     *error = "at least one root is required";
     return false;
   }
+  const bool canvas_mode = config->mode == "canvas-intent-scan" || config->mode == "canvas-intent-write";
+  if (canvas_mode && (config->roots.size() != 1 || config->child_name != "transactions")) {
+    *error = "invalid canvas intent directory contract";
+    return false;
+  }
+  if (config->mode == "canvas-intent-write"
+      && (config->file_name.empty()
+          || config->file_name.find('/') != std::string::npos
+          || config->file_name.find('\\') != std::string::npos)) {
+    *error = "invalid canvas intent file contract";
+    return false;
+  }
   return true;
+}
+
+// 解码授权后 stdin 携带的 Base64 正文；输入编码文本，输出原始字节并限制 64 KiB。
+bool DecodeBase64(const std::string& encoded, std::string* output) {
+  static constexpr char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  int table[256];
+  std::fill(std::begin(table), std::end(table), -1);
+  for (int index = 0; index < 64; ++index) table[static_cast<unsigned char>(kAlphabet[index])] = index;
+  output->clear();
+  std::uint32_t value = 0;
+  int bits = 0;
+  bool padding = false;
+  for (unsigned char ch : encoded) {
+    if (ch == '=') {
+      padding = true;
+      continue;
+    }
+    if (padding || table[ch] < 0) return false;
+    value = (value << 6) | static_cast<std::uint32_t>(table[ch]);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      output->push_back(static_cast<char>((value >> bits) & 0xff));
+      value &= bits == 0 ? 0 : ((std::uint32_t{1} << bits) - 1);
+      if (output->size() > 64 * 1024) return false;
+    }
+  }
+  return true;
+}
+
+// 只把正式或看似正式的 agent-node JSON 交给上层校验，忽略其它目录杂项。
+bool IsCanvasIntentCandidateName(const std::string& name) {
+  constexpr char kPrefix[] = "agent-node-";
+  constexpr char kSuffix[] = ".json";
+  return name.rfind(kPrefix, 0) == 0
+      && name.size() >= sizeof(kPrefix) - 1 + sizeof(kSuffix) - 1
+      && name.compare(name.size() - (sizeof(kSuffix) - 1), sizeof(kSuffix) - 1, kSuffix) == 0;
+}
+
+// 解析 ALLOW 或 ALLOW\t<Base64> 决策；写模式返回已解码正文。
+bool ParseAuthorization(const Config& config, const std::string& decision, std::string* payload) {
+  if (config.mode != "canvas-intent-write") return decision == "ALLOW";
+  constexpr char kPrefix[] = "ALLOW\t";
+  if (decision.rfind(kPrefix, 0) != 0) return false;
+  return DecodeBase64(decision.substr(sizeof(kPrefix) - 1), payload);
 }
 
 // 提取跨平台路径末段；输入完整路径，返回文件或目录名。
@@ -178,6 +248,19 @@ std::string EntryJson(std::size_t root_index, const std::string& name, const std
       << ",\"name\":\"" << JsonEscape(name) << "\",\"path\":\"" << JsonEscape(path)
       << "\",\"isDirectory\":" << (is_directory ? "true" : "false");
   if (!is_directory) out << ",\"size\":" << size;
+  out << '}';
+  return out.str();
+}
+
+// 序列化内存中的 Canvas intent；正文由 helper 相对打开并读取，不返回可再次打开的绝对路径。
+std::string CanvasIntentEntryJson(const std::string& name, bool is_directory,
+                                  std::uint64_t size, const std::string& content) {
+  std::ostringstream out;
+  out << "{\"type\":\"entry\",\"rootIndex\":0,\"name\":\"" << JsonEscape(name)
+      << "\",\"path\":\"\",\"isDirectory\":" << (is_directory ? "true" : "false");
+  if (!is_directory) {
+    out << ",\"size\":" << size << ",\"content\":\"" << JsonEscape(content) << '"';
+  }
   out << '}';
   return out.str();
 }
@@ -296,6 +379,176 @@ bool TraverseDirectory(const Config& config, EntryBudget* budget, std::size_t ro
   return true;
 }
 
+// 仅通过已授权 Canvas root fd 创建并打开 transactions，拒绝链接或非目录替换。
+bool OpenCanvasTransactions(const Config& config, const StableRoot& root,
+                            UniqueFd* transactions, std::string* error) {
+  if (!S_ISDIR(root.identity.st_mode)) {
+    *error = "canvas root is not a directory";
+    return false;
+  }
+  if (mkdirat(root.descriptor.Get(), config.child_name.c_str(), 0700) != 0 && errno != EEXIST) {
+    *error = "cannot create canvas transactions directory";
+    return false;
+  }
+  transactions->Reset(openat(root.descriptor.Get(), config.child_name.c_str(),
+      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+  if (transactions->Get() < 0) {
+    *error = "cannot open canvas transactions directory";
+    return false;
+  }
+  struct stat identity {};
+  if (fstat(transactions->Get(), &identity) != 0 || !S_ISDIR(identity.st_mode)) {
+    *error = "canvas transactions entry is not a directory";
+    return false;
+  }
+  return true;
+}
+
+// 把完整正文写入已打开临时 fd；返回写入和落盘是否全部成功。
+bool WriteAndSync(int descriptor, const std::string& payload) {
+  std::size_t offset = 0;
+  while (offset < payload.size()) {
+    const ssize_t written = write(descriptor, payload.data() + offset, payload.size() - offset);
+    if (written <= 0) return false;
+    offset += static_cast<std::size_t>(written);
+  }
+  return fsync(descriptor) == 0;
+}
+
+// 在 transactions fd 内创建临时文件、落盘并相对 rename，失败时清理同一目录中的临时项。
+bool WriteCanvasIntentAtomic(const Config& config, int transactions_fd,
+                             const std::string& payload, std::string* error) {
+  std::string temporary_name;
+  UniqueFd temporary;
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    temporary_name = ".intent-" + std::to_string(getpid()) + "-"
+        + std::to_string(static_cast<unsigned long long>(std::random_device{}())) + ".tmp";
+    temporary.Reset(openat(transactions_fd, temporary_name.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+    if (temporary.Get() >= 0) break;
+    if (errno != EEXIST) {
+      *error = "cannot create canvas intent temporary file";
+      return false;
+    }
+  }
+  if (temporary.Get() < 0) {
+    *error = "cannot allocate canvas intent temporary file";
+    return false;
+  }
+  if (!WriteAndSync(temporary.Get(), payload)) {
+    unlinkat(transactions_fd, temporary_name.c_str(), 0);
+    *error = "cannot persist canvas intent temporary file";
+    return false;
+  }
+  if (renameat(transactions_fd, temporary_name.c_str(), transactions_fd, config.file_name.c_str()) != 0) {
+    unlinkat(transactions_fd, temporary_name.c_str(), 0);
+    *error = "cannot commit canvas intent file";
+    return false;
+  }
+  if (fsync(transactions_fd) != 0) {
+    *error = "cannot persist canvas transactions directory";
+    return false;
+  }
+  return true;
+}
+
+// 在同一 transactions fd 下列出并读取直接子项，读取前后复核稳定身份与纳秒时间戳。
+bool ScanCanvasIntents(const Config& config, int transactions_fd,
+                       EntryBudget* budget, std::string* error) {
+  UniqueFd duplicate(dup(transactions_fd));
+  if (duplicate.Get() < 0) { *error = "cannot duplicate canvas transactions directory"; return false; }
+  DIR* raw_directory = fdopendir(duplicate.Release());
+  if (!raw_directory) { *error = "cannot enumerate canvas transactions directory"; return false; }
+  std::unique_ptr<DIR, int (*)(DIR*)> directory(raw_directory, closedir);
+  while (dirent* item = readdir(directory.get())) {
+    const std::string name(item->d_name);
+    if (name == "." || name == "..") continue;
+    if (!IsCanvasIntentCandidateName(name)) continue;
+    if (budget->entries >= config.max_entries) {
+      *error = "canvas intent entry limit exceeded";
+      return false;
+    }
+    struct stat listed {};
+    if (fstatat(transactions_fd, name.c_str(), &listed, AT_SYMLINK_NOFOLLOW) != 0) {
+      *error = "cannot stat canvas intent entry";
+      return false;
+    }
+    if (S_ISLNK(listed.st_mode) || (!S_ISDIR(listed.st_mode) && !S_ISREG(listed.st_mode))) {
+      *error = "invalid canvas intent entry type";
+      return false;
+    }
+    std::string content;
+    if (S_ISREG(listed.st_mode)) {
+      if (listed.st_size < 0 || listed.st_size > 64 * 1024) {
+        *error = "invalid canvas intent file size";
+        return false;
+      }
+      UniqueFd file(openat(transactions_fd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+      struct stat opened {};
+      if (file.Get() < 0 || fstat(file.Get(), &opened) != 0
+          || opened.st_dev != listed.st_dev || opened.st_ino != listed.st_ino
+          || opened.st_size != listed.st_size
+#ifdef __APPLE__
+          || opened.st_mtimespec.tv_sec != listed.st_mtimespec.tv_sec
+          || opened.st_mtimespec.tv_nsec != listed.st_mtimespec.tv_nsec
+          || opened.st_ctimespec.tv_sec != listed.st_ctimespec.tv_sec
+          || opened.st_ctimespec.tv_nsec != listed.st_ctimespec.tv_nsec
+#else
+          || opened.st_mtim.tv_sec != listed.st_mtim.tv_sec
+          || opened.st_mtim.tv_nsec != listed.st_mtim.tv_nsec
+          || opened.st_ctim.tv_sec != listed.st_ctim.tv_sec
+          || opened.st_ctim.tv_nsec != listed.st_ctim.tv_nsec
+#endif
+      ) {
+        *error = "canvas intent changed before read";
+        return false;
+      }
+      content.resize(static_cast<std::size_t>(opened.st_size));
+      std::size_t offset = 0;
+      while (offset < content.size()) {
+        const ssize_t count = read(file.Get(), content.data() + offset, content.size() - offset);
+        if (count <= 0) { *error = "cannot read canvas intent"; return false; }
+        offset += static_cast<std::size_t>(count);
+      }
+      struct stat final_state {};
+      struct stat final_path_state {};
+      if (fstat(file.Get(), &final_state) != 0
+          || fstatat(transactions_fd, name.c_str(), &final_path_state, AT_SYMLINK_NOFOLLOW) != 0
+          || final_state.st_dev != opened.st_dev || final_state.st_ino != opened.st_ino
+          || final_state.st_size != opened.st_size
+          || final_path_state.st_dev != opened.st_dev || final_path_state.st_ino != opened.st_ino
+          || final_path_state.st_size != opened.st_size
+#ifdef __APPLE__
+          || final_state.st_mtimespec.tv_sec != opened.st_mtimespec.tv_sec
+          || final_state.st_mtimespec.tv_nsec != opened.st_mtimespec.tv_nsec
+          || final_state.st_ctimespec.tv_sec != opened.st_ctimespec.tv_sec
+          || final_state.st_ctimespec.tv_nsec != opened.st_ctimespec.tv_nsec
+          || final_path_state.st_mtimespec.tv_sec != opened.st_mtimespec.tv_sec
+          || final_path_state.st_mtimespec.tv_nsec != opened.st_mtimespec.tv_nsec
+          || final_path_state.st_ctimespec.tv_sec != opened.st_ctimespec.tv_sec
+          || final_path_state.st_ctimespec.tv_nsec != opened.st_ctimespec.tv_nsec
+#else
+          || final_state.st_mtim.tv_sec != opened.st_mtim.tv_sec
+          || final_state.st_mtim.tv_nsec != opened.st_mtim.tv_nsec
+          || final_state.st_ctim.tv_sec != opened.st_ctim.tv_sec
+          || final_state.st_ctim.tv_nsec != opened.st_ctim.tv_nsec
+          || final_path_state.st_mtim.tv_sec != opened.st_mtim.tv_sec
+          || final_path_state.st_mtim.tv_nsec != opened.st_mtim.tv_nsec
+          || final_path_state.st_ctim.tv_sec != opened.st_ctim.tv_sec
+          || final_path_state.st_ctim.tv_nsec != opened.st_ctim.tv_nsec
+#endif
+      ) {
+        *error = "canvas intent changed during read";
+        return false;
+      }
+    }
+    if (!EmitLine(CanvasIntentEntryJson(name, S_ISDIR(listed.st_mode),
+        static_cast<std::uint64_t>(listed.st_size), content), config, budget)) return false;
+    ++budget->entries;
+  }
+  return true;
+}
+
 // 序列化全部已打开 POSIX roots；输入稳定 roots，返回 OPENED JSON 行。
 std::string OpenedJson(const std::vector<StableRoot>& roots) {
   std::ostringstream out;
@@ -326,7 +579,30 @@ int RunPlatform(const Config& config) {
   EntryBudget budget;
   if (!EmitLine(OpenedJson(roots), config, &budget)) return 4;
   std::string decision;
-  if (!std::getline(std::cin, decision) || decision != "ALLOW") return 3;
+  std::string payload;
+  if (!std::getline(std::cin, decision) || !ParseAuthorization(config, decision, &payload)) return 3;
+  if (config.mode == "canvas-intent-scan" || config.mode == "canvas-intent-write") {
+    UniqueFd transactions;
+    std::string error;
+    if (!OpenCanvasTransactions(config, roots.front(), &transactions, &error)) {
+      std::cerr << error << '\n';
+      return 4;
+    }
+    if (config.mode == "canvas-intent-write") {
+      if (!WriteCanvasIntentAtomic(config, transactions.Get(), payload, &error)) {
+        std::cerr << error << '\n';
+        return 4;
+      }
+    } else {
+      if (!ScanCanvasIntents(config, transactions.Get(), &budget, &error)) {
+        std::cerr << error << '\n';
+        return 4;
+      }
+    }
+    std::ostringstream done;
+    done << "{\"type\":\"done\",\"entryCount\":" << budget.entries << '}';
+    return EmitLine(done.str(), config, &budget) ? 0 : 4;
+  }
   for (std::size_t index = 0; index < roots.size(); ++index) {
     const StableRoot& root = roots[index];
     if (S_ISREG(root.identity.st_mode)) {
@@ -377,6 +653,66 @@ class UniqueHandle {
   HANDLE value_;
 };
 
+#ifndef FILE_OPEN_REPARSE_POINT
+#define FILE_OPEN_REPARSE_POINT 0x00200000
+#endif
+
+using NtCreateFileFunction = NTSTATUS (NTAPI *)(
+    PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER,
+    ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+
+// 通过 NtCreateFile 的 RootDirectory 相对打开对象，禁止路径重新解析到已授权根之外。
+bool OpenRelativeWindows(HANDLE RootDirectory, const std::wstring& name,
+                         ACCESS_MASK access, ULONG disposition, ULONG options,
+                         UniqueHandle* output, std::string* error) {
+  if (name.empty() || name.size() * sizeof(wchar_t) > USHRT_MAX) {
+    *error = "invalid relative Windows name";
+    return false;
+  }
+  const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  const auto nt_create_file = reinterpret_cast<NtCreateFileFunction>(
+      ntdll ? GetProcAddress(ntdll, "NtCreateFile") : nullptr);
+  if (!nt_create_file) { *error = "NtCreateFile unavailable"; return false; }
+  UNICODE_STRING relative_name {};
+  relative_name.Buffer = const_cast<PWSTR>(name.data());
+  relative_name.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+  relative_name.MaximumLength = relative_name.Length;
+  OBJECT_ATTRIBUTES attributes {};
+  InitializeObjectAttributes(&attributes, &relative_name, OBJ_CASE_INSENSITIVE, RootDirectory, nullptr);
+  IO_STATUS_BLOCK status_block {};
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  const NTSTATUS status = nt_create_file(
+      &handle, access, &attributes, &status_block, nullptr, FILE_ATTRIBUTE_NORMAL,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, disposition,
+      options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
+  if (status < 0 || handle == INVALID_HANDLE_VALUE) {
+    *error = "cannot open relative Windows object";
+    return false;
+  }
+  output->Reset(handle);
+  return true;
+}
+
+// 读取 Windows 句柄身份与内容时间状态，供读取前后完整绑定。
+bool ReadWindowsFileState(HANDLE handle, BY_HANDLE_FILE_INFORMATION* identity, FILE_BASIC_INFO* basic) {
+  return GetFileInformationByHandle(handle, identity)
+      && GetFileInformationByHandleEx(handle, FileBasicInfo, basic, sizeof(*basic));
+}
+
+// 比较 Windows intent 的 volume/fileId/size/lastWrite/changeTime 状态。
+bool SameWindowsFileState(const BY_HANDLE_FILE_INFORMATION& left,
+                          const FILE_BASIC_INFO& left_basic,
+                          const BY_HANDLE_FILE_INFORMATION& right,
+                          const FILE_BASIC_INFO& right_basic) {
+  return left.dwVolumeSerialNumber == right.dwVolumeSerialNumber
+      && left.nFileIndexHigh == right.nFileIndexHigh
+      && left.nFileIndexLow == right.nFileIndexLow
+      && left.nFileSizeHigh == right.nFileSizeHigh
+      && left.nFileSizeLow == right.nFileSizeLow
+      && left_basic.LastWriteTime.QuadPart == right_basic.LastWriteTime.QuadPart
+      && left_basic.ChangeTime.QuadPart == right_basic.ChangeTime.QuadPart;
+}
+
 // 保存授权前已打开的 Windows root、canonical 路径与稳定身份。
 struct StableRoot {
   std::string requested_path;
@@ -415,6 +751,186 @@ bool OpenStableRoot(const std::string& requested_path, StableRoot* root, std::st
   root->identity = identity;
   root->handle = std::move(handle);
   return true;
+}
+
+// 仅通过已授权 Canvas HANDLE 相对创建或打开 transactions，并拒绝 reparse point。
+bool OpenCanvasTransactions(const Config& config, const StableRoot& root,
+                            UniqueHandle* transactions, std::string* error) {
+  if ((root.identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    *error = "canvas root is not a directory";
+    return false;
+  }
+  const std::wstring name = Utf8ToWide(config.child_name);
+  if (!OpenRelativeWindows(root.handle.Get(), name,
+      FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD
+          | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_OPEN_IF, FILE_DIRECTORY_FILE, transactions, error)) return false;
+  BY_HANDLE_FILE_INFORMATION identity {};
+  if (!GetFileInformationByHandle(transactions->Get(), &identity)
+      || (identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+      || (identity.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    *error = "canvas transactions entry is a reparse point or not a directory";
+    return false;
+  }
+  return true;
+}
+
+// 标记同一目录句柄中的临时文件删除，供任一步失败时回收。
+void DeleteTemporaryWindowsFile(HANDLE handle) {
+  FILE_DISPOSITION_INFO disposition {};
+  disposition.DeleteFile = TRUE;
+  SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition));
+}
+
+// 在 transactions HANDLE 下相对创建、落盘并 rename intent，目标路径不会重新解析。
+bool WriteCanvasIntentAtomic(const Config& config, HANDLE transactions,
+                             const std::string& payload, std::string* error) {
+  UniqueHandle temporary;
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    const std::wstring temporary_name = L".intent-" + std::to_wstring(GetCurrentProcessId())
+        + L"-" + std::to_wstring(static_cast<unsigned long long>(std::random_device{}())) + L".tmp";
+    if (OpenRelativeWindows(transactions, temporary_name,
+        FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        FILE_CREATE, FILE_NON_DIRECTORY_FILE, &temporary, error)) break;
+  }
+  if (temporary.Get() == INVALID_HANDLE_VALUE) {
+    *error = "cannot allocate canvas intent temporary file";
+    return false;
+  }
+  std::size_t offset = 0;
+  while (offset < payload.size()) {
+    const DWORD remaining = static_cast<DWORD>(std::min<std::size_t>(payload.size() - offset, MAXDWORD));
+    DWORD written = 0;
+    if (!WriteFile(temporary.Get(), payload.data() + offset, remaining, &written, nullptr) || written == 0) {
+      DeleteTemporaryWindowsFile(temporary.Get());
+      *error = "cannot write canvas intent temporary file";
+      return false;
+    }
+    offset += written;
+  }
+  if (!FlushFileBuffers(temporary.Get())) {
+    DeleteTemporaryWindowsFile(temporary.Get());
+    *error = "cannot persist canvas intent temporary file";
+    return false;
+  }
+  const std::wstring target = Utf8ToWide(config.file_name);
+  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target.size() * sizeof(wchar_t);
+  std::vector<unsigned char> rename_buffer(rename_size);
+  auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
+  rename_info->ReplaceIfExists = TRUE;
+  rename_info->RootDirectory = transactions;
+  rename_info->FileNameLength = static_cast<DWORD>(target.size() * sizeof(wchar_t));
+  std::memcpy(rename_info->FileName, target.data(), rename_info->FileNameLength);
+  if (!SetFileInformationByHandle(
+      temporary.Get(), FileRenameInfo, rename_info, static_cast<DWORD>(rename_buffer.size()))) {
+    DeleteTemporaryWindowsFile(temporary.Get());
+    *error = "cannot commit canvas intent file";
+    return false;
+  }
+  /** Windows 对目录 FlushFileBuffers 的支持依文件系统而异；成功时强化 rename 元数据持久性。 */
+  if (!FlushFileBuffers(transactions)) {
+    const DWORD flush_error = GetLastError();
+    if (flush_error != ERROR_INVALID_HANDLE && flush_error != ERROR_ACCESS_DENIED) {
+      *error = "cannot persist canvas transactions directory";
+      return false;
+    }
+  }
+  return true;
+}
+
+// 从相对打开的 Windows intent HANDLE 读取正文并在读取前后绑定完整文件状态。
+bool ReadCanvasIntentWindows(HANDLE transactions, const std::wstring& name,
+                             std::uint64_t listed_file_id, std::string* content,
+                             std::uint64_t* size, std::string* error) {
+  UniqueHandle file;
+  if (!OpenRelativeWindows(transactions, name,
+      FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_OPEN, FILE_NON_DIRECTORY_FILE, &file, error)) return false;
+  BY_HANDLE_FILE_INFORMATION initial {};
+  FILE_BASIC_INFO initial_basic {};
+  if (!ReadWindowsFileState(file.Get(), &initial, &initial_basic)
+      || (initial.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0
+      || WindowsFileId(initial) != listed_file_id) {
+    *error = "canvas intent changed before read";
+    return false;
+  }
+  *size = (static_cast<std::uint64_t>(initial.nFileSizeHigh) << 32) | initial.nFileSizeLow;
+  if (*size > 64 * 1024) { *error = "invalid canvas intent file size"; return false; }
+  content->resize(static_cast<std::size_t>(*size));
+  std::size_t offset = 0;
+  while (offset < content->size()) {
+    DWORD read_bytes = 0;
+    const DWORD remaining = static_cast<DWORD>(content->size() - offset);
+    if (!ReadFile(file.Get(), content->data() + offset, remaining, &read_bytes, nullptr) || read_bytes == 0) {
+      *error = "cannot read canvas intent";
+      return false;
+    }
+    offset += read_bytes;
+  }
+  BY_HANDLE_FILE_INFORMATION final_state {};
+  FILE_BASIC_INFO final_basic {};
+  UniqueHandle final_path;
+  BY_HANDLE_FILE_INFORMATION final_path_state {};
+  FILE_BASIC_INFO final_path_basic {};
+  if (!ReadWindowsFileState(file.Get(), &final_state, &final_basic)
+      || !OpenRelativeWindows(transactions, name,
+          FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+          FILE_OPEN, FILE_NON_DIRECTORY_FILE, &final_path, error)
+      || !ReadWindowsFileState(final_path.Get(), &final_path_state, &final_path_basic)
+      || !SameWindowsFileState(initial, initial_basic, final_state, final_basic)
+      || !SameWindowsFileState(initial, initial_basic, final_path_state, final_path_basic)) {
+    *error = "canvas intent changed during read";
+    return false;
+  }
+  return true;
+}
+
+// 直接枚举 transactions HANDLE，并把相对读取的 intent 正文放入协议内存结果。
+bool ScanCanvasIntents(const Config& config, HANDLE transactions,
+                       EntryBudget* budget, std::string* error) {
+  std::vector<unsigned char> buffer(64 * 1024);
+  bool restart = true;
+  while (true) {
+    if (!GetFileInformationByHandleEx(transactions,
+        restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
+        buffer.data(), static_cast<DWORD>(buffer.size()))) {
+      return GetLastError() == ERROR_NO_MORE_FILES;
+    }
+    restart = false;
+    unsigned char* cursor = buffer.data();
+    while (true) {
+      auto* item = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(cursor);
+      const std::wstring name(item->FileName, item->FileNameLength / sizeof(wchar_t));
+      if (name != L"." && name != L"..") {
+        const std::string utf8_name = WideToUtf8(name);
+        if (!IsCanvasIntentCandidateName(utf8_name)) {
+          if (item->NextEntryOffset == 0) break;
+          cursor += item->NextEntryOffset;
+          continue;
+        }
+        if (budget->entries >= config.max_entries) {
+          *error = "canvas intent entry limit exceeded";
+          return false;
+        }
+        if ((item->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+          *error = "invalid canvas intent entry type";
+          return false;
+        }
+        const bool is_directory = (item->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        std::string content;
+        std::uint64_t size = 0;
+        if (!is_directory && !ReadCanvasIntentWindows(
+            transactions, name, static_cast<std::uint64_t>(item->FileId.QuadPart),
+            &content, &size, error)) return false;
+        if (!EmitLine(CanvasIntentEntryJson(utf8_name, is_directory, size, content), config, budget)) {
+          return false;
+        }
+        ++budget->entries;
+      }
+      if (item->NextEntryOffset == 0) break;
+      cursor += item->NextEntryOffset;
+    }
+  }
 }
 
 // 比较 Windows canonical 边界；输入候选与 root，返回候选是否位于 root 内。
@@ -499,7 +1015,26 @@ int RunPlatform(const Config& config) {
   EntryBudget budget;
   if (!EmitLine(OpenedJson(roots), config, &budget)) return 4;
   std::string decision;
-  if (!std::getline(std::cin, decision) || decision != "ALLOW") return 3;
+  std::string payload;
+  if (!std::getline(std::cin, decision) || !ParseAuthorization(config, decision, &payload)) return 3;
+  if (config.mode == "canvas-intent-scan" || config.mode == "canvas-intent-write") {
+    UniqueHandle transactions;
+    std::string error;
+    if (!OpenCanvasTransactions(config, roots.front(), &transactions, &error)) {
+      std::cerr << error << '\n';
+      return 4;
+    }
+    const bool succeeded = config.mode == "canvas-intent-write"
+      ? WriteCanvasIntentAtomic(config, transactions.Get(), payload, &error)
+      : ScanCanvasIntents(config, transactions.Get(), &budget, &error);
+    if (!succeeded) {
+      std::cerr << error << '\n';
+      return 4;
+    }
+    std::ostringstream done;
+    done << "{\"type\":\"done\",\"entryCount\":" << budget.entries << '}';
+    return EmitLine(done.str(), config, &budget) ? 0 : 4;
+  }
   for (std::size_t index = 0; index < roots.size(); ++index) {
     const StableRoot& root = roots[index];
     const bool is_directory = (root.identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;

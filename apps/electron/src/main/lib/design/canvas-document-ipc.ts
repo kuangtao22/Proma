@@ -44,7 +44,7 @@ export interface CanvasDocumentIpcRegistration {
 
 /** 同一 lease 内的对账与后续操作结果，错误必须延迟到发布对账事件后再抛出。 */
 type ReconciledOperationOutcome<T> = {
-  reconciliation: ReturnType<CanvasAgentNodeCreationService['reconcile']>
+  reconciliation: Awaited<ReturnType<CanvasAgentNodeCreationService['reconcile']>>
 } & (
   | { ok: true; value: T }
   | { ok: false; error: unknown }
@@ -212,113 +212,143 @@ export function registerCanvasDocumentIpcHandlers(
   /** 热重载前先移除同名旧 handler。 */
   for (const channel of channels) options.ipc.removeHandler(channel)
   currentRegistrationTokens.set(options.ipc, registrationToken)
+  /** 同一 Canvas 的完整异步写链串行，不同 Canvas 仍保持并行。 */
+  const canvasOperationTails = new Map<string, Promise<void>>()
+  /** 在指定项目与 Canvas 的键控队列中执行一次完整 IPC 写操作。 */
+  const runCanvasExclusive = async <T>(
+    projectId: string,
+    canvasId: string,
+    effect: () => Promise<T>,
+  ): Promise<T> => {
+    const key = `${projectId}\0${canvasId}`
+    const previous = canvasOperationTails.get(key) ?? Promise.resolve()
+    let release = (): void => {}
+    const current = new Promise<void>((resolvePromise) => { release = resolvePromise })
+    const tail = previous.catch(() => undefined).then(() => current)
+    canvasOperationTails.set(key, tail)
+    void tail.finally(() => {
+      if (canvasOperationTails.get(key) === tail) canvasOperationTails.delete(key)
+    })
+    await previous.catch(() => undefined)
+    try {
+      return await effect()
+    } finally {
+      release()
+    }
+  }
 
-  options.ipc.handle(CANVAS_IPC_CHANNELS.LOAD, (event, value): CanvasWorkspaceSnapshot => {
+  options.ipc.handle(CANVAS_IPC_CHANNELS.LOAD, async (event, value): Promise<CanvasWorkspaceSnapshot> => {
     assertAuthorizedSender(event, options)
     /** 外层输入解析后只保留双重稳定身份。 */
     const input = parseLoadInput(value)
     requireWritableProject(input.projectId, options)
     /** LOAD 可能创建 Canvas 根或提升恢复候选，因此也必须持有写 lease。 */
-    const reconciliation = options.guard.runWorkspaceWrite(
-      input.projectId,
-      () => options.creation.reconcile({ projectId: input.projectId, canvasId: input.canvasId }),
-    )
-    const snapshot = reconciliation.snapshot
-    if (snapshot.recoveredFrom) {
-      broadcastChange(options, {
-        projectId: input.projectId,
-        canvasId: input.canvasId,
-        revision: snapshot.document.revision,
-        cause: 'recovery',
-      })
-    } else if (reconciliation.documentChanged) {
-      broadcastChange(options, {
-        projectId: input.projectId,
-        canvasId: input.canvasId,
-        revision: snapshot.document.revision,
-        cause: 'graph',
-      })
-    }
-    return snapshot
+    return runCanvasExclusive(input.projectId, input.canvasId, async () => {
+      const reconciliation = await options.guard.runWorkspaceWrite(
+        input.projectId,
+        () => options.creation.reconcile({ projectId: input.projectId, canvasId: input.canvasId }),
+      )
+      const snapshot = reconciliation.snapshot
+      if (snapshot.recoveredFrom) {
+        broadcastChange(options, {
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+          revision: snapshot.document.revision,
+          cause: 'recovery',
+        })
+      } else if (reconciliation.documentChanged) {
+        broadcastChange(options, {
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+          revision: snapshot.document.revision,
+          cause: 'graph',
+        })
+      }
+      return snapshot
+    })
   })
 
-  options.ipc.handle(CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, (event, value) => {
+  options.ipc.handle(CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, async (event, value) => {
     assertAuthorizedSender(event, options)
     /** 保存输入在进入只读检查和 Store 前完成外层重建。 */
     const input = parseSaveInput(value)
     requireWritableProject(input.projectId, options)
     /** Store 在同一项目写 lease 内执行权威 schema、revision 和原子提交。 */
-    const outcome = options.guard.runWorkspaceWrite(
-      input.projectId,
-      (): ReconciledOperationOutcome<CanvasWorkspaceSnapshot['document']> => {
-        /** SAVE 先在同一 lease 内完成创建事务发布屏障，禁止二次加锁。 */
-        const reconciliation = options.creation.reconcile({
+    return runCanvasExclusive(input.projectId, input.canvasId, async () => {
+      const outcome = await options.guard.runWorkspaceWrite(
+        input.projectId,
+        async (): Promise<ReconciledOperationOutcome<CanvasWorkspaceSnapshot['document']>> => {
+          /** SAVE 先在同一 lease 内完成创建事务发布屏障，禁止二次加锁。 */
+          const reconciliation = await options.creation.reconcile({
+            projectId: input.projectId,
+            canvasId: input.canvasId,
+          })
+          try {
+            const document = options.store.mutate(
+              { projectId: input.projectId, canvasId: input.canvasId },
+              input.expectedRevision,
+              input.mutations,
+            )
+            return { ok: true, value: document, reconciliation }
+          } catch (error) {
+            /** 已提交的对账 revision 不能被后续 SAVE 错误吞掉。 */
+            return { ok: false, error, reconciliation }
+          }
+        },
+      )
+      if (outcome.reconciliation.documentChanged) {
+        broadcastChange(options, {
           projectId: input.projectId,
           canvasId: input.canvasId,
+          revision: outcome.reconciliation.snapshot.document.revision,
+          cause: 'graph',
         })
-        try {
-          const document = options.store.mutate(
-            { projectId: input.projectId, canvasId: input.canvasId },
-            input.expectedRevision,
-            input.mutations,
-          )
-          return { ok: true, value: document, reconciliation }
-        } catch (error) {
-          /** 已提交的对账 revision 不能被后续 SAVE 错误吞掉。 */
-          return { ok: false, error, reconciliation }
-        }
-      },
-    )
-    if (outcome.reconciliation.documentChanged) {
-      broadcastChange(options, {
-        projectId: input.projectId,
-        canvasId: input.canvasId,
-        revision: outcome.reconciliation.snapshot.document.revision,
-        cause: 'graph',
-      })
-    }
-    if (!outcome.ok) throw outcome.error
-    const document = outcome.value
-    if (document.revision > input.expectedRevision) {
-      broadcastChange(options, {
-        projectId: input.projectId,
-        canvasId: input.canvasId,
-        revision: document.revision,
-        cause: 'graph',
-      })
-    }
-    return document
+      }
+      if (!outcome.ok) throw outcome.error
+      const document = outcome.value
+      if (document.revision > input.expectedRevision) {
+        broadcastChange(options, {
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+          revision: document.revision,
+          cause: 'graph',
+        })
+      }
+      return document
+    })
   })
 
-  options.ipc.handle(CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, (event, value): CanvasAgentNodeCreationResult => {
+  options.ipc.handle(CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, async (event, value): Promise<CanvasAgentNodeCreationResult> => {
     assertAuthorizedSender(event, options)
     const input = parseCreateAgentNodeInput(value)
     requireWritableProject(input.projectId, options)
     /** 创建服务内部不加锁，整个事务只持有这一份 workspace write lease。 */
-    const outcome = options.guard.runWorkspaceWrite(
-      input.projectId,
-      () => options.creation.createReconciled(input),
-    )
-    if (outcome.reconciliation.documentChanged) {
-      broadcastChange(options, {
-        projectId: input.projectId,
-        canvasId: input.canvasId,
-        revision: outcome.reconciliation.snapshot.document.revision,
-        cause: 'graph',
-      })
-    }
-    if (!outcome.operationOutcome.ok) throw outcome.operationOutcome.error
-    const result = outcome.operationOutcome.value
-    if (result.documentChanged) {
-      broadcastChange(options, {
-        projectId: input.projectId,
-        canvasId: input.canvasId,
-        revision: result.document.revision,
-        cause: 'graph',
-      })
-    }
-    /** documentChanged 属于主进程发布策略，不暴露给 Renderer。 */
-    return { document: result.document, session: result.session }
+    return runCanvasExclusive(input.projectId, input.canvasId, async () => {
+      const outcome = await options.guard.runWorkspaceWrite(
+        input.projectId,
+        () => options.creation.createReconciled(input),
+      )
+      if (outcome.reconciliation.documentChanged) {
+        broadcastChange(options, {
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+          revision: outcome.reconciliation.snapshot.document.revision,
+          cause: 'graph',
+        })
+      }
+      if (!outcome.operationOutcome.ok) throw outcome.operationOutcome.error
+      const result = outcome.operationOutcome.value
+      if (result.documentChanged) {
+        broadcastChange(options, {
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+          revision: result.document.revision,
+          cause: 'graph',
+        })
+      }
+      /** documentChanged 属于主进程发布策略，不暴露给 Renderer。 */
+      return { document: result.document, session: result.session }
+    })
   })
 
   /** dispose 只移除本注册器的三个 invoke handler。 */

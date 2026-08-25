@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { execFileSync, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -19,6 +19,7 @@ interface FakeHelperOptions {
   oversizedOutput?: boolean
   autoOpen?: boolean
   completeOnAllow?: boolean
+  intentContent?: string
 }
 
 /** 创建严格等待 ALLOW/DENY 的假 helper，用于验证主进程两阶段授权协议。 */
@@ -48,14 +49,25 @@ function createFakeHelper(options: FakeHelperOptions = {}): {
   stdin.on('data', (chunk: string) => {
     const decision = chunk.trim()
     decisions.push(decision)
-    if (decision === 'ALLOW') {
+    if (decision === 'ALLOW' || decision.startsWith('ALLOW\t')) {
       didEnumerate = true
       if (options.completeOnAllow === false) return
       if (options.oversizedOutput) {
         stdout.write(`${'x'.repeat(2048)}\n`)
         return
       }
-      stdout.write(`${JSON.stringify({ type: 'entry', rootIndex: 0, name: 'file.txt', path: '/stable/file.txt', isDirectory: false, size: 4 })}\n`)
+      const entry = options.intentContent === undefined
+        ? { type: 'entry', rootIndex: 0, name: 'file.txt', path: '/stable/file.txt', isDirectory: false, size: 4 }
+        : {
+            type: 'entry',
+            rootIndex: 0,
+            name: 'agent-node-test.json',
+            path: '',
+            isDirectory: false,
+            size: Buffer.byteLength(options.intentContent),
+            content: options.intentContent,
+          }
+      stdout.write(`${JSON.stringify(entry)}\n`)
       stdout.write(`${JSON.stringify({ type: 'done', entryCount: 1 })}\n`)
       processEvents.emit('exit', 0, null)
     } else if (decision === 'DENY') {
@@ -355,6 +367,30 @@ describe('stable directory native host', () => {
     ])
   })
 
+  test('Given Canvas intent scan When helper 相对读取正文 Then host 只返回内存内容且无可重开路径', async () => {
+    const fake = createFakeHelper({ intentContent: '{"state":"prepared"}' })
+
+    const result = await runStableDirectoryNative(
+      {
+        mode: 'canvas-intent-scan',
+        roots: ['/requested'],
+        childName: 'transactions',
+        maxEntries: 512,
+      },
+      () => true,
+      createDependencies(fake),
+    )
+
+    expect(result.entries).toEqual([{
+      rootIndex: 0,
+      name: 'agent-node-test.json',
+      path: '',
+      isDirectory: false,
+      size: 20,
+      content: '{"state":"prepared"}',
+    }])
+  })
+
   test('Given helper 在授权前发送 entry When host 消费协议 Then 终止并拒绝结果', async () => {
     const fake = createFakeHelper({ emitEntryBeforeAuthorization: true })
 
@@ -402,6 +438,90 @@ describe('stable directory native host', () => {
       expect(result.entries.map((entry) => entry.name)).toEqual(['allowed.txt'])
       expect(result.entries.map((entry) => entry.name)).not.toContain('secret.txt')
       expect(readFileSync(join(authorized, 'secret.txt'), 'utf8')).toBe('secret')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Given Canvas 根在 OPENED 后被外部 symlink 置换 When helper 相对写 intent Then replacement 零写入', async () => {
+    const appDir = resolve(import.meta.dir, '../../..')
+    const buildScript = resolve(appDir, 'scripts/build-stable-directory-native.ts')
+    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
+    execFileSync(process.execPath, [buildScript], { stdio: 'pipe' })
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-race-'))
+    const canvasRoot = join(root, 'canvas')
+    const movedCanvasRoot = join(root, 'canvas-original')
+    const replacement = join(root, 'replacement')
+    mkdirSync(canvasRoot)
+    mkdirSync(replacement)
+
+    try {
+      await runStableDirectoryNative(
+        {
+          mode: 'canvas-intent-write',
+          roots: [canvasRoot],
+          childName: 'transactions',
+          fileName: 'agent-node-11111111-1111-4111-8111-111111111111.json',
+          content: '{"state":"prepared"}',
+        },
+        () => {
+          renameSync(canvasRoot, movedCanvasRoot)
+          symlinkSync(replacement, canvasRoot, 'dir')
+          return true
+        },
+        { helperPath: () => helperPath },
+      )
+
+      expect(readdirSync(replacement)).toEqual([])
+      expect(existsSync(join(replacement, 'transactions'))).toBe(false)
+      expect(readFileSync(join(
+        movedCanvasRoot,
+        'transactions',
+        'agent-node-11111111-1111-4111-8111-111111111111.json',
+      ), 'utf8')).toBe('{"state":"prepared"}')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Given Canvas intent 位于已打开根 When 根路径在授权后被替换 Then helper 只返回原 inode 内存正文', async () => {
+    const appDir = resolve(import.meta.dir, '../../..')
+    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
+    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-scan-race-'))
+    const canvasRoot = join(root, 'canvas')
+    const movedCanvasRoot = join(root, 'canvas-original')
+    const replacement = join(root, 'replacement')
+    const intentName = 'agent-node-11111111-1111-4111-8111-111111111111.json'
+    mkdirSync(join(canvasRoot, 'transactions'), { recursive: true })
+    mkdirSync(replacement)
+    writeFileSync(join(canvasRoot, 'transactions', intentName), '{"state":"prepared"}')
+
+    try {
+      const result = await runStableDirectoryNative(
+        {
+          mode: 'canvas-intent-scan',
+          roots: [canvasRoot],
+          childName: 'transactions',
+          maxEntries: 512,
+        },
+        () => {
+          renameSync(canvasRoot, movedCanvasRoot)
+          symlinkSync(replacement, canvasRoot, 'dir')
+          return true
+        },
+        { helperPath: () => helperPath },
+      )
+
+      expect(result.entries).toEqual([{
+        rootIndex: 0,
+        name: intentName,
+        path: '',
+        isDirectory: false,
+        size: 20,
+        content: '{"state":"prepared"}',
+      }])
+      expect(readdirSync(replacement)).toEqual([])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

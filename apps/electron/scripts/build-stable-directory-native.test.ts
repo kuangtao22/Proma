@@ -43,3 +43,15 @@ test('Given Windows helper 实现 When 检查源码合同 Then 内部递归保�
   expect(source).toContain('root->canonical_wide = extended_final_path')
   expect(source).toContain('OpenStableRoot(WideToUtf8(child_path)')
 })
+
+test('Given stable directory helper 的 Canvas intent 模式 When 检查三平台系统调用合同 Then POSIX 相对操作且 Windows 拒绝 reparse', () => {
+  const source = readFileSync(resolve(import.meta.dir, '../native/stable-directory/stable-directory-helper.cc'), 'utf8')
+
+  expect(source).toContain('mkdirat(')
+  expect(source).toContain('openat(')
+  expect(source).toContain('renameat(')
+  expect(source).toContain('fsync(')
+  expect(source).toContain('RootDirectory')
+  expect(source).toContain('FILE_OPEN_REPARSE_POINT')
+  expect(source).toContain('FILE_ATTRIBUTE_REPARSE_POINT')
+})

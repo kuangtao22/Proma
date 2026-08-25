@@ -37,6 +37,7 @@ import type {
   SecureAtomicJsonPriorBackup,
 } from '../safe-file'
 import type { CanvasSessionStore } from './canvas-session-store'
+import type { StableDirectoryOpenedRoot } from '../stable-directory-native-host'
 import { designPathResolver, isSafeDesignStableId } from './design-paths'
 import type { CanvasPaths, DesignPathResolver } from './design-paths'
 
@@ -62,10 +63,14 @@ export interface CanvasDocumentStore {
 
 /** 已绑定目录链身份的可信单目录 capability。 */
 export interface CanvasTrustedDirectoryCapability {
-  /** 仅供主进程内部拼接已验证单段文件名的目录路径。 */
+  /** 仅供兼容读取测试拼接已验证单段文件名，生产 intent I/O 不按此路径打开。 */
   readonly path: string
-  /** 复验 canvasesRoot、canvasRoot 与当前目录的完整身份链。 */
+  /** helper 启动时使用的具体 Canvas root。 */
+  readonly rootPath: string
+  /** 复验 canvasesRoot 与 canvasRoot 的完整身份链。 */
   assertValid: () => void
+  /** 对 helper 已打开根的 canonical/dev/ino 事实执行双向复验。 */
+  authorizeOpenedRoots: (roots: readonly StableDirectoryOpenedRoot[]) => boolean
 }
 
 /** Canvas LOAD 与同一目录授权事实的组合，不向 Renderer 暴露。 */
@@ -859,30 +864,28 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
         if (dirname(childPath) !== scopeIdentity.canvasRoot.path || basename(childPath) !== name) {
           throw unsafeCanvasPath('Canvas 子目录不满足单级合同')
         }
-        /** 创建前先复验两级父目录，禁止跟随 LOAD 后置换的 canvasRoot。 */
-        assertCanvasDirectoryScope(scopeIdentity)
-        if (lstatOrNull(childPath) === null) {
-          try {
-            mkdirSync(childPath)
-          } catch (error) {
-            if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
-          }
-        }
-        const childIdentity = captureDirectoryIdentity(
-          childPath,
-          scopeIdentity.canvasRoot.canonicalPath,
-        )
-        if (dirname(childIdentity.canonicalPath) !== scopeIdentity.canvasRoot.canonicalPath) {
-          throw unsafeCanvasPath('Canvas 子目录逃逸具体 Canvas 根')
-        }
-        /** capability 每次使用都复验三层 dev/ino/canonical 身份。 */
-        const assertValid = (): void => {
-          assertCanvasDirectoryScope(scopeIdentity)
-          assertDirectoryIdentity(childIdentity)
-          assertCanvasDirectoryScope(scopeIdentity)
+        /** 子目录创建和打开交给 native helper 在已授权 root HANDLE 下完成。 */
+        const assertValid = (): void => assertCanvasDirectoryScope(scopeIdentity)
+        /** OPENED 必须与同次 LOAD 捕获的具体 Canvas 根身份完全一致。 */
+        const authorizeOpenedRoots = (roots: readonly StableDirectoryOpenedRoot[]): boolean => {
+          assertValid()
+          const [root] = roots
+          const allowed = roots.length === 1
+            && root?.requestedPath === scopeIdentity.canvasRoot.path
+            && root.canonicalPath === scopeIdentity.canvasRoot.canonicalPath
+            && root.isDirectory
+            && root.volume === String(scopeIdentity.canvasRoot.dev)
+            && root.fileId === String(scopeIdentity.canvasRoot.ino)
+          assertValid()
+          return allowed
         }
         assertValid()
-        return { path: childPath, assertValid }
+        return {
+          path: childPath,
+          rootPath: scopeIdentity.canvasRoot.path,
+          assertValid,
+          authorizeOpenedRoots,
+        }
       },
     }
   }

@@ -57,6 +57,7 @@ function createContext(options: {
     snapshot: { document: CanvasDocument; writable: true }
     documentChanged: boolean
   }
+  beforeCreate?: () => Promise<void>
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -90,9 +91,15 @@ function createContext(options: {
         if (options.guardError) throw options.guardError
         leaseHeld = true
         try {
-          return effect()
-        } finally {
+          const result = effect()
+          if (result instanceof Promise) {
+            return result.finally(() => { leaseHeld = false }) as ReturnType<typeof effect>
+          }
           leaseHeld = false
+          return result
+        } catch (error) {
+          leaseHeld = false
+          throw error
         }
       },
     },
@@ -111,7 +118,7 @@ function createContext(options: {
       },
     },
     creation: {
-      reconcile: (target) => {
+      reconcile: async (target) => {
         calls.push('creation:reconcile')
         storeInputs.push(target)
         if (options.reconcileError ?? options.loadError) throw options.reconcileError ?? options.loadError
@@ -120,9 +127,10 @@ function createContext(options: {
           documentChanged: false,
         }
       },
-      createReconciled: (input) => {
+      createReconciled: async (input) => {
         calls.push('creation:create')
         storeInputs.push(input)
+        await options.beforeCreate?.()
         const reconciliation = options.reconcileResult ?? {
           snapshot: options.loadResult ?? { document: createDocument(4), writable: true },
           documentChanged: false,
@@ -326,6 +334,42 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.broadcastLeaseStates).toEqual([false])
   })
 
+  test('Given 同一 Canvas 两个异步 CREATE When 首个尚未完成 Then 第二个等待完整事务释放', async () => {
+    let createEntrances = 0
+    let releaseFirst = (): void => {}
+    const firstGate = new Promise<void>((resolvePromise) => { releaseFirst = resolvePromise })
+    const context = createContext({
+      beforeCreate: async () => {
+        createEntrances += 1
+        if (createEntrances === 1) await firstGate
+      },
+    })
+    const baseInput = {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      title: '首页 Agent',
+      position: { x: 10, y: 20 },
+    }
+    const first = invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, {
+      ...baseInput,
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-1',
+    })
+    while (createEntrances === 0) await Promise.resolve()
+    const second = invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, {
+      ...baseInput,
+      operationId: '33333333-3333-4333-8333-333333333333',
+      nodeId: 'node-2',
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(createEntrances).toBe(1)
+    releaseFirst()
+    await Promise.all([first, second])
+    expect(createEntrances).toBe(2)
+  })
+
   test('Given 文档已写但 committed intent 失败 When 创建返回错误 Then 不广播且不泄漏节点', async () => {
     const error = new Error('Canvas Agent 创建事务提交失败')
     const context = createContext({ createError: error })
@@ -474,11 +518,11 @@ describe('原生 Canvas 文档 IPC', () => {
         mutate: () => createDocument(revision),
       },
       creation: {
-        reconcile: () => ({
+        reconcile: async () => ({
           snapshot: { document: createDocument(revision), writable: true as const },
           documentChanged: false,
         }),
-        createReconciled: () => ({
+        createReconciled: async () => ({
           reconciliation: {
             snapshot: { document: createDocument(revision), writable: true as const },
             documentChanged: false,

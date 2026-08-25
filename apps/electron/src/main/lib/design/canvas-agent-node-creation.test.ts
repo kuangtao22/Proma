@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { execFileSync } from 'node:child_process'
 import {
   mkdirSync,
   mkdtempSync,
@@ -9,7 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { createEmptyCanvasDocument } from '@proma/shared'
 import type { AgentSessionMeta, CanvasDocument, CanvasTarget } from '@proma/shared'
 import {
@@ -17,6 +18,8 @@ import {
   type CanvasAgentNodeCreationIntent,
 } from './canvas-agent-node-creation'
 import { createCanvasDocumentStore } from './canvas-document-store'
+import { runStableDirectoryNative } from '../stable-directory-native-host'
+import type { SecureAtomicJsonWriteOptions } from '../safe-file'
 
 const OPERATION_ID = '11111111-1111-4111-8111-111111111111'
 const SESSION_ID = '22222222-2222-4222-8222-222222222222'
@@ -31,6 +34,9 @@ function createHarness(options: {
   afterLoad?: (paths: { canvasRoot: string; transactionsDir: string }) => void
   beforeGetSettings?: (paths: { canvasRoot: string; transactionsDir: string }) => void
   onWriteIntentCall?: () => void
+  afterIntentLstat?: (filePath: string) => void
+  afterIntentRead?: (filePath: string) => void
+  nativeIntentIo?: boolean
 } = {}) {
   /** 测试目标的双重身份。 */
   const target: CanvasTarget = {
@@ -43,6 +49,7 @@ function createHarness(options: {
   const canvasRoot = join(root, 'canvases', target.canvasId)
   const transactionsDir = join(canvasRoot, 'transactions')
   mkdirSync(canvasRoot, { recursive: true })
+  mkdirSync(transactionsDir)
   /** 真实 Store 只负责提供与 LOAD 同源的目录 capability，文档 mutation 仍由内存夹具控制。 */
   const pathResolver = {
     resolve: () => ({ canvasesRoot: join(root, 'canvases') }) as never,
@@ -130,16 +137,33 @@ function createHarness(options: {
     },
     now: () => 10,
     randomUUID: () => SESSION_ID,
-    readTransactionsDirectory: (directoryPath) => {
-      transactionDirectoryReads += 1
-      return readdirSync(directoryPath, { withFileTypes: true })
-    },
-    writeIntent: (filePath, intent, writeOptions) => {
-      options.onWriteIntentCall?.()
-      if (failedState === intent.state) throw new Error(`模拟 ${intent.state} intent 写失败`)
-      const { writeJsonFileAtomicSecure } = require('../safe-file') as typeof import('../safe-file')
-      writeJsonFileAtomicSecure(filePath, intent, writeOptions)
-    },
+    ...(options.nativeIntentIo
+      ? {
+          runStableDirectoryNative: (request, authorize) => runStableDirectoryNative(
+            request,
+            authorize,
+            {
+              helperPath: () => resolve(
+                import.meta.dir,
+                `../../../../resources/stable-directory/stable-directory-helper${process.platform === 'win32' ? '.exe' : ''}`,
+              ),
+            },
+          ),
+        }
+      : {
+          readTransactionsDirectory: (directoryPath: string) => {
+            transactionDirectoryReads += 1
+            return readdirSync(directoryPath, { withFileTypes: true })
+          },
+          writeIntent: (filePath: string, intent: CanvasAgentNodeCreationIntent, writeOptions?: SecureAtomicJsonWriteOptions) => {
+            options.onWriteIntentCall?.()
+            if (failedState === intent.state) throw new Error(`模拟 ${intent.state} intent 写失败`)
+            const { writeJsonFileAtomicSecure } = require('../safe-file') as typeof import('../safe-file')
+            writeJsonFileAtomicSecure(filePath, intent, writeOptions)
+          },
+        }),
+    afterIntentLstat: options.afterIntentLstat,
+    afterIntentRead: options.afterIntentRead,
   })
 
   return {
@@ -173,15 +197,64 @@ function createInput(target: CanvasTarget) {
 }
 
 describe('Canvas Agent 节点创建事务', () => {
-  test('Given 历史 intent 对账已发布 When 新 operation 模型校验失败 Then 联合结果保留 revision、原始错误且只扫描一次', () => {
+  test('Given 生产 native intent I/O When 创建并重放同一 operation Then helper 扫描写入且只创建一次 session', async () => {
+    const appDir = resolve(import.meta.dir, '../../../..')
+    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    const harness = createHarness({ nativeIntentIo: true })
+
+    const first = await harness.createService().create(createInput(harness.target))
+    const replayed = await harness.createService().create(createInput(harness.target))
+
+    expect(first.session.id).toBe(SESSION_ID)
+    expect(replayed.document).toEqual(first.document)
+    expect(harness.createdInputs).toHaveLength(1)
+    expect(JSON.parse(readFileSync(harness.intentPath, 'utf8'))).toMatchObject({ state: 'committed' })
+  })
+
+  test('Given intent 在 lstat 后被同名新 inode 替换 When 打开读取 Then 拒绝 replacement', async () => {
+    let replaced = false
+    const harness = createHarness({
+      afterIntentLstat: (filePath) => {
+        if (replaced) return
+        replaced = true
+        const raw = readFileSync(filePath, 'utf8')
+        renameSync(filePath, `${filePath}.original`)
+        writeFileSync(filePath, raw, 'utf8')
+      },
+    })
+    await harness.createService().create(createInput(harness.target))
+
+    await expect(harness.createService().reconcile(harness.target))
+      .rejects.toThrow('读取前文件已变化')
+  })
+
+  test('Given intent 同 inode 被等长改写 When 读取完成 Then 通过 mtime/ctime 拒绝内容变化', async () => {
+    let rewritten = false
+    const harness = createHarness({
+      afterIntentRead: (filePath) => {
+        if (rewritten) return
+        rewritten = true
+        const raw = readFileSync(filePath, 'utf8')
+        const changed = raw.replace('首页设计 Agent', '发现设计 Agent')
+        expect(Buffer.byteLength(changed)).toBe(Buffer.byteLength(raw))
+        writeFileSync(filePath, changed, 'utf8')
+      },
+    })
+    await harness.createService().create(createInput(harness.target))
+
+    await expect(harness.createService().reconcile(harness.target))
+      .rejects.toThrow('读取期间文件变化')
+  })
+
+  test('Given 历史 intent 对账已发布 When 新 operation 模型校验失败 Then 联合结果保留 revision、原始错误且只扫描一次', async () => {
     const error = new Error('Canvas Agent 渠道或模型不可用')
     const harness = createHarness({ failCreateSession: true, modelError: error })
-    expect(() => harness.createService().create(createInput(harness.target))).toThrow('模拟 prepared 后崩溃')
+    await expect(harness.createService().create(createInput(harness.target))).rejects.toThrow('模拟 prepared 后崩溃')
     harness.setFailCreateSession(false)
     harness.setSettings({ agentChannelId: 'channel-disabled', agentModelId: 'model-disabled' })
     harness.resetTransactionDirectoryReads()
 
-    const outcome = harness.createService().createReconciled({
+    const outcome = await harness.createService().createReconciled({
       ...createInput(harness.target),
       operationId: '33333333-3333-4333-8333-333333333333',
       nodeId: 'node-2',
@@ -195,12 +268,12 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(harness.getTransactionDirectoryReads()).toBe(1)
   })
 
-  test('Given 同一 operation 重试 When 首次已完整提交 Then 复用 session 和节点且不重复 mutation', () => {
+  test('Given 同一 operation 重试 When 首次已完整提交 Then 复用 session 和节点且不重复 mutation', async () => {
     const harness = createHarness()
     const service = harness.createService()
 
-    const first = service.create(createInput(harness.target))
-    const retried = service.create(createInput(harness.target))
+    const first = await service.create(createInput(harness.target))
+    const retried = await service.create(createInput(harness.target))
 
     expect(first.document.nodes).toContainEqual(expect.objectContaining({
       id: 'node-1', agentSessionId: SESSION_ID,
@@ -211,14 +284,14 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(harness.getDocument().revision).toBe(1)
   })
 
-  test('Given prepared 后主进程退出且默认模型变化 When 重试 Then 仍使用 intent 固化的旧默认值', () => {
+  test('Given prepared 后主进程退出且默认模型变化 When 重试 Then 仍使用 intent 固化的旧默认值', async () => {
     const harness = createHarness({ failCreateSession: true })
-    expect(() => harness.createService().create(createInput(harness.target)))
-      .toThrow('模拟 prepared 后崩溃')
+    await expect(harness.createService().create(createInput(harness.target)))
+      .rejects.toThrow('模拟 prepared 后崩溃')
 
     harness.setSettings({ agentChannelId: 'channel-new', agentModelId: 'model-new' })
     harness.setFailCreateSession(false)
-    const recovered = harness.createService().create(createInput(harness.target))
+    const recovered = await harness.createService().create(createInput(harness.target))
 
     expect(recovered.session).toMatchObject({ channelId: 'channel-old', modelId: 'model-old' })
     expect(harness.createdInputs.at(-1)).toMatchObject({
@@ -226,14 +299,14 @@ describe('Canvas Agent 节点创建事务', () => {
     })
   })
 
-  test('Given 文档已写入但 committed intent 写失败 When 重启恢复 Then 不重复创建并补写 committed', () => {
+  test('Given 文档已写入但 committed intent 写失败 When 重启恢复 Then 不重复创建并补写 committed', async () => {
     const harness = createHarness({ failIntentState: 'committed' })
-    expect(() => harness.createService().create(createInput(harness.target)))
-      .toThrow('模拟 committed intent 写失败')
+    await expect(harness.createService().create(createInput(harness.target)))
+      .rejects.toThrow('模拟 committed intent 写失败')
     expect(harness.getDocument().nodes).toContainEqual(expect.objectContaining({ id: 'node-1' }))
 
     harness.setFailedState(undefined)
-    const recovered = harness.createService().reconcile(harness.target)
+    const recovered = await harness.createService().reconcile(harness.target)
 
     expect(recovered.snapshot.document.nodes).toContainEqual(expect.objectContaining({
       id: 'node-1', agentSessionId: SESSION_ID,
@@ -242,22 +315,22 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(JSON.parse(readFileSync(harness.intentPath, 'utf8'))).toMatchObject({ state: 'committed' })
   })
 
-  test('Given committed 节点后来被用户删除 When 对账 Then 写 detached 且永不重建', () => {
+  test('Given committed 节点后来被用户删除 When 对账 Then 写 detached 且永不重建', async () => {
     const harness = createHarness()
     const service = harness.createService()
-    service.create(createInput(harness.target))
+    await service.create(createInput(harness.target))
     harness.setDocument({ ...harness.getDocument(), nodes: [], revision: 2 })
 
-    const reconciled = service.reconcile(harness.target)
+    const reconciled = await service.reconcile(harness.target)
 
     expect(reconciled.snapshot.document.nodes).toEqual([])
     expect(JSON.parse(readFileSync(harness.intentPath, 'utf8'))).toMatchObject({ state: 'detached' })
-    expect(() => service.create(createInput(harness.target))).toThrow('已与节点解除关联')
+    await expect(service.create(createInput(harness.target))).rejects.toThrow('已与节点解除关联')
   })
 
-  test('Given prepared 对应半归属或跨 Canvas session When 恢复 Then fail closed 且不写节点', () => {
+  test('Given prepared 对应半归属或跨 Canvas session When 恢复 Then fail closed 且不写节点', async () => {
     const harness = createHarness({ failCreateSession: true })
-    expect(() => harness.createService().create(createInput(harness.target))).toThrow()
+    await expect(harness.createService().create(createInput(harness.target))).rejects.toThrow()
     harness.setFailCreateSession(false)
     harness.sessions.set(SESSION_ID, {
       id: SESSION_ID,
@@ -269,7 +342,7 @@ describe('Canvas Agent 节点创建事务', () => {
       updatedAt: 1,
     })
 
-    expect(() => harness.createService().reconcile(harness.target)).toThrow('归属损坏')
+    await expect(harness.createService().reconcile(harness.target)).rejects.toThrow('归属损坏')
     expect(harness.getDocument().nodes).toEqual([])
   })
 
@@ -285,9 +358,9 @@ describe('Canvas Agent 节点创建事务', () => {
       delegationGoal: '分析项目',
     }],
     ['半 Delegation', { sourceDelegationId: 'delegation-1' }],
-  ])('Given prepared session 混入%s 来源 When 恢复 Then fail closed 且不写节点', (_label, contamination) => {
+  ])('Given prepared session 混入%s 来源 When 恢复 Then fail closed 且不写节点', async (_label, contamination) => {
     const harness = createHarness({ failCreateSession: true })
-    expect(() => harness.createService().create(createInput(harness.target))).toThrow()
+    await expect(harness.createService().create(createInput(harness.target))).rejects.toThrow()
     harness.setFailCreateSession(false)
     harness.sessions.set(SESSION_ID, {
       id: SESSION_ID,
@@ -303,38 +376,38 @@ describe('Canvas Agent 节点创建事务', () => {
       updatedAt: 1,
     })
 
-    expect(() => harness.createService().reconcile(harness.target)).toThrow('归属损坏')
+    await expect(harness.createService().reconcile(harness.target)).rejects.toThrow('归属损坏')
     expect(harness.getDocument().nodes).toEqual([])
   })
 
-  test('Given 某 Canvas intent 损坏 When 对账其它 Canvas Then 只阻断所属 Canvas', () => {
+  test('Given 某 Canvas intent 损坏 When 对账其它 Canvas Then 只阻断所属 Canvas', async () => {
     const broken = createHarness({ canvasId: 'canvas-broken' })
-    expect(() => broken.createService().create(createInput(broken.target))).not.toThrow()
+    await expect(broken.createService().create(createInput(broken.target))).resolves.toBeDefined()
     writeFileSync(broken.intentPath, '{broken', 'utf8')
-    expect(() => broken.createService().reconcile(broken.target)).toThrow('创建事务损坏')
+    await expect(broken.createService().reconcile(broken.target)).rejects.toThrow('创建事务损坏')
 
     const healthy = createHarness({ canvasId: 'canvas-healthy' })
-    expect(() => healthy.createService().reconcile(healthy.target)).not.toThrow()
+    await expect(healthy.createService().reconcile(healthy.target)).resolves.toBeDefined()
   })
 
-  test('Given agent-node intent 文件名伪造非 UUID When 对账 Then 不得静默忽略', () => {
+  test('Given agent-node intent 文件名伪造非 UUID When 对账 Then 不得静默忽略', async () => {
     const harness = createHarness()
-    harness.createService().reconcile(harness.target)
+    await harness.createService().reconcile(harness.target)
     writeFileSync(join(harness.transactionsDir, 'agent-node-not-a-uuid.json'), '{}', 'utf8')
 
-    expect(() => harness.createService().reconcile(harness.target))
-      .toThrow('创建事务损坏：文件名无效')
+    await expect(harness.createService().reconcile(harness.target))
+      .rejects.toThrow('创建事务损坏：文件名无效')
   })
 
-  test('Given intent 固化渠道或模型已失效 When 恢复 Then 明确拒绝且不静默换默认值', () => {
+  test('Given intent 固化渠道或模型已失效 When 恢复 Then 明确拒绝且不静默换默认值', async () => {
     const harness = createHarness({ failCreateSession: true })
     harness.setSettings({ agentChannelId: 'channel-disabled', agentModelId: 'model-disabled' })
-    expect(() => harness.createService().create(createInput(harness.target)))
-      .toThrow('Canvas Agent 渠道或模型不可用')
+    await expect(harness.createService().create(createInput(harness.target)))
+      .rejects.toThrow('Canvas Agent 渠道或模型不可用')
     expect(harness.createdInputs).toHaveLength(0)
   })
 
-  test('Given Store LOAD 后 Canvas 根被替换为外部 symlink When 打开 transactions Then fail closed 且外部零写入', () => {
+  test('Given Store LOAD 后 Canvas 根被替换为外部 symlink When 打开 transactions Then fail closed 且外部零写入', async () => {
     const outside = mkdtempSync(join(tmpdir(), 'proma-canvas-agent-outside-'))
     let replaced = false
     const harness = createHarness({
@@ -346,11 +419,11 @@ describe('Canvas Agent 节点创建事务', () => {
       },
     })
 
-    expect(() => harness.createService().reconcile(harness.target)).toThrow('CANVAS_PATH_UNSAFE')
+    await expect(harness.createService().reconcile(harness.target)).rejects.toThrow('CANVAS_PATH_UNSAFE')
     expect(readdirSync(outside)).toEqual([])
   })
 
-  test('Given transactions 已捕获后父 Canvas 根被置换 When 写 prepared Then 写边界前 fail closed 且外部零写入', () => {
+  test('Given transactions 已捕获后父 Canvas 根被置换 When 写 prepared Then 写边界前 fail closed 且外部零写入', async () => {
     const outside = mkdtempSync(join(tmpdir(), 'proma-canvas-agent-outside-'))
     const outsideTransactions = join(outside, 'transactions')
     mkdirSync(outsideTransactions)
@@ -366,8 +439,8 @@ describe('Canvas Agent 节点创建事务', () => {
       onWriteIntentCall: () => { writeCalls += 1 },
     })
 
-    expect(() => harness.createService().create(createInput(harness.target)))
-      .toThrow('CANVAS_PATH_UNSAFE')
+    await expect(harness.createService().create(createInput(harness.target)))
+      .rejects.toThrow('CANVAS_PATH_UNSAFE')
     expect(writeCalls).toBe(0)
     expect(readdirSync(outsideTransactions)).toEqual([])
   })
