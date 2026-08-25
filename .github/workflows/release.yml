@@ -248,6 +248,9 @@ jobs:
       - name: 准备 Electron 打包资源
         run: bun run --filter='@proma/electron' package:prepare
 
+      - name: 测试稳定目录 helper
+        run: bun test apps/electron/src/main/lib/stable-directory-native-host.test.ts apps/electron/scripts/build-stable-directory-native.test.ts
+
       - name: 打包 (Windows)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

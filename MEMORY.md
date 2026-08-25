@@ -148,3 +148,4 @@
 - 2026-08-25：Canvas 顶层会话基础使用项目内独立原子索引，不写入 `AgentSessionMeta` 或 Agent 会话索引；旧 `.proma/design/canvas.json` 仅在列表时以固定 `legacy-design` ID 幂等投影，现有 Design Store、生图、素材、任务和 trace 继续使用旧路径，待后续迁移阶段显式切换。
 - 2026-08-25：Renderer Canvas registry 独立于 Agent atoms；`legacy-design` 是唯一允许加载旧 Design 工作区的兼容入口，原生 Canvas 缺少独立文档时显示空画布，禁止别名复用旧画布。Agent 发起 Design 转交时使用确定性的 legacy Canvas 选择；所有普通会话统一导航入口在守卫通过后必须清理 Canvas 选择，避免顶部身份与主视图不一致。
 - 2026-08-25：归档 Canvas 分组固定排在 Agent 归档历史之前，避免 Agent 归档异步加载或超长历史列表把 Canvas 恢复入口挤到列表末尾；归档状态仍只由项目 Canvas 原子索引维护。
+- 2026-08-26：稳定目录 Windows 安全合同固定为：授权后若目录被 junction 替换且无法相对根 HANDLE 重开子项，整项 fail closed 为空并绝不读取 replacement；独立 Windows 构建与正式发布必须在打包前运行 helper/host 定向测试，UNC 管理共享不可用时只能显式 skip。

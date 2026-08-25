@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -90,6 +90,19 @@ function createDependencies(fake: ReturnType<typeof createFakeHelper>): StableDi
     totalTimeoutMs: 1_000,
   }
 }
+
+/** 把 Windows drive 路径转换为 localhost 管理共享路径；非 drive 路径返回 null。 */
+function toLocalhostAdminShare(path: string): string | null {
+  const driveMatch = /^([A-Za-z]):\\(.*)$/.exec(path)
+  return driveMatch ? `\\\\localhost\\${driveMatch[1]}$\\${driveMatch[2]}` : null
+}
+
+/** 当前 Windows 临时目录是否可通过 localhost 管理共享访问。 */
+const windowsAdminShareAvailable = (() => {
+  if (process.platform !== 'win32') return false
+  const uncTempDir = toLocalhostAdminShare(tmpdir())
+  return uncTempDir !== null && existsSync(uncTempDir)
+})()
 
 describe('stable directory native host', () => {
   test('Given active=1 且 queue=1 When 第三个请求进入 Then 立即拒绝并在前项完成后依次启动', async () => {
@@ -249,6 +262,42 @@ describe('stable directory native host', () => {
     expect(spawnCount).toBe(2)
   })
 
+  test('Given 真实 Node spawn 异步报错 When 两个请求排队 Then 当前请求拒绝且槽位只释放一次', async () => {
+    const host = createStableDirectoryNativeHost({ maxActiveHelpers: 1, maxQueuedRequests: 2, maxRootsPerRequest: 32 })
+    const held = createFakeHelper({ autoOpen: false })
+    const next = createFakeHelper()
+    const queuedHelpers = [held, next]
+    let queuedSpawnCount = 0
+    const queuedDependencies: StableDirectoryNativeHostDependencies = {
+      helperPath: () => '/fake/stable-directory-helper',
+      helperExists: () => true,
+      spawnProcess: () => queuedHelpers[queuedSpawnCount++]!.child,
+      startupTimeoutMs: 500,
+      totalTimeoutMs: 1_000,
+    }
+    const missingHelperPath = join(tmpdir(), `proma-missing-stable-helper-${process.pid}-${Date.now()}`)
+    const failedPromise = host.run(
+      { mode: 'list', roots: ['/requested'] },
+      () => true,
+      {
+        helperPath: () => missingHelperPath,
+        helperExists: () => true,
+        spawnProcess: (path, args) => spawn(path, args, { stdio: ['pipe', 'pipe', 'pipe'] }),
+        startupTimeoutMs: 500,
+        totalTimeoutMs: 1_000,
+      },
+    )
+    const heldPromise = host.run({ mode: 'list', roots: ['/held'] }, () => true, queuedDependencies)
+    const nextPromise = host.run({ mode: 'list', roots: ['/next'] }, () => true, queuedDependencies)
+
+    await expect(failedPromise).rejects.toThrow('稳定目录 helper 进程错误')
+    expect(queuedSpawnCount).toBe(1)
+    held.emitOpened()
+    await heldPromise
+    await nextPromise
+    expect(queuedSpawnCount).toBe(2)
+  })
+
   test('Given DENY、协议错误或输出溢出 When 下一请求等待 Then 每条失败路径都释放槽位', async () => {
     const scenarios = [
       { name: 'deny', fake: () => createFakeHelper({ canonicalPath: '/replacement' }), error: '目录授权被拒绝' },
@@ -378,7 +427,7 @@ describe('stable directory native host', () => {
     }
   })
 
-  test.skipIf(process.platform !== 'win32')('Given Windows 目录打开后被 junction 替换 When helper 枚举 Then 不跟随 reparse replacement', async () => {
+  test.skipIf(process.platform !== 'win32')('Given Windows 目录打开后被 junction 替换 When 无法相对根 HANDLE 重开子项 Then fail closed 为空且不跟随 replacement', async () => {
     const appDir = resolve(import.meta.dir, '../../..')
     const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper.exe')
     execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
@@ -400,23 +449,23 @@ describe('stable directory native host', () => {
         },
         { helperPath: () => helperPath },
       )
-      expect(result.entries.map((entry) => entry.name)).toContain('allowed.txt')
-      expect(result.entries.map((entry) => entry.name)).not.toContain('secret.txt')
+      /** Windows 当前按 canonical path 重开子项；竞态发生后拒绝整项，不能读取 replacement。 */
+      const entryNames = result.entries.map((entry) => entry.name)
+      expect(entryNames).toEqual([])
+      expect(entryNames).not.toContain('secret.txt')
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
   })
 
-  test.skipIf(process.platform !== 'win32')('Given 当前 Windows 临时目录可通过管理共享访问 When 使用 UNC root Then canonical 保留 UNC 展示形式', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'proma-win-unc-'))
-    const driveMatch = /^([A-Za-z]):\\(.*)$/.exec(root)
-    if (!driveMatch) return
-    const uncRoot = `\\\\localhost\\${driveMatch[1]}$\\${driveMatch[2]}`
-    if (!existsSync(uncRoot)) return
+  test.skipIf(process.platform !== 'win32' || !windowsAdminShareAvailable)('Given Windows localhost 管理共享可用 When 使用 UNC root Then canonical 保留 UNC 展示形式', async () => {
     const appDir = resolve(import.meta.dir, '../../..')
     const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper.exe')
     execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    const root = mkdtempSync(join(tmpdir(), 'proma-win-unc-'))
     try {
+      const uncRoot = toLocalhostAdminShare(root)
+      if (!uncRoot) throw new Error('Windows 临时目录不是 drive 绝对路径')
       writeFileSync(join(root, 'unc.txt'), 'unc')
       const result = await runStableDirectoryNative(
         { mode: 'list', roots: [uncRoot] }, () => true, { helperPath: () => helperPath },

@@ -38,6 +38,9 @@ jobs:
       - name: Prepare Electron package
         run: bun run --filter='@proma/electron' package:prepare
 
+      - name: Test stable directory helper
+        run: bun test apps/electron/src/main/lib/stable-directory-native-host.test.ts apps/electron/scripts/build-stable-directory-native.test.ts
+
       - name: Package (Windows)
         run: npx electron-builder --win --x64 --publish never
         working-directory: apps/electron

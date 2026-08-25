@@ -69,6 +69,20 @@ function readReleaseWorkflow(): string {
   return readFileSync(workflowPath, 'utf8')
 }
 
+/** 返回仓库中的独立 Windows 构建工作流文本。 */
+function readWindowsBuildWorkflow(): string {
+  /** 当前脚本到仓库根目录的相对路径。 */
+  const workflowPath = resolve(import.meta.dir, '../../../.github/workflows/build-windows.yml')
+  return readFileSync(workflowPath, 'utf8')
+}
+
+/** 返回工作流任务中所有 shell 命令。 */
+function workflowCommands(job: WorkflowJob | undefined): string[] {
+  return job?.steps
+    ?.map((step) => step.run)
+    .filter((command): command is string => typeof command === 'string') ?? []
+}
+
 /** 返回 Electron workspace 的包元数据。 */
 function readElectronPackageMetadata(): ElectronPackageMetadata {
   /** 当前测试脚本到 Electron package.json 的路径。 */
@@ -161,6 +175,18 @@ test('稳定目录 helper 进入三平台资源并纳入 macOS 签名', () => {
     }),
   ]))
   expect(config.mac?.binaries).toContain('resources/stable-directory/stable-directory-helper')
+})
+
+test('Windows 构建与发布在打包前执行稳定目录原生回归', () => {
+  /** Windows 上必须真实运行的 helper/host 定向测试命令。 */
+  const stableDirectoryTests = 'bun test apps/electron/src/main/lib/stable-directory-native-host.test.ts apps/electron/scripts/build-stable-directory-native.test.ts'
+  /** 独立 Windows 构建工作流。 */
+  const buildWorkflow = Bun.YAML.parse(readWindowsBuildWorkflow()) as ReleaseWorkflow
+  /** 正式发布工作流。 */
+  const releaseWorkflow = Bun.YAML.parse(readReleaseWorkflow()) as ReleaseWorkflow
+
+  expect(workflowCommands(buildWorkflow.jobs?.['build-windows-x64'])).toContain(stableDirectoryTests)
+  expect(workflowCommands(releaseWorkflow.jobs?.['build-windows-x64'])).toContain(stableDirectoryTests)
 })
 
 test('Release 工作流在全平台构建前校验 Bone 发布合同', () => {
