@@ -6,10 +6,10 @@
  */
 
 import { basename, join, dirname, extname, resolve, posix as pathPosix } from 'node:path'
-import { readFileSync, readdirSync, statSync, mkdirSync, existsSync, writeFileSync, unlinkSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { createRequire } from 'node:module'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import AdmZip from 'adm-zip'
 import { DOMParser } from '@xmldom/xmldom'
 import type { OfficePreviewResult } from '@proma/shared'
@@ -44,6 +44,47 @@ function writeTempHtml(html: string): string {
     writeFileSync(tmpFile, html, 'utf-8')
   }
   return tmpFile
+}
+
+/** 将稳定读取的二进制内容写入独占临时副本，避免解析器重新打开原路径。 */
+function writeTempBinary(content: Buffer, extension: string): string {
+  const tmpFile = join(getPreviewTmpDir(), `preview-${randomUUID()}${extension}`)
+  writeFileSync(tmpFile, content, { flag: 'wx', mode: 0o600 })
+  return tmpFile
+}
+
+/** 使用 no-follow fd 绑定预览源文件与父目录身份。 */
+export function readPreviewFileStable(
+  filePath: string,
+  maxSize: number,
+  afterAuthorized?: () => void,
+): Buffer {
+  const safePath = resolve(filePath)
+  const pathStat = lstatSync(safePath)
+  const parentPath = dirname(safePath)
+  const parentStat = lstatSync(parentPath)
+  if (!pathStat.isFile() || pathStat.isSymbolicLink() || !parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    throw new Error('文件身份已变化')
+  }
+  afterAuthorized?.()
+  let descriptor: number | null = null
+  try {
+    descriptor = openSync(safePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    const openedStat = fstatSync(descriptor)
+    const currentParent = lstatSync(parentPath)
+    if (
+      !openedStat.isFile()
+      || openedStat.dev !== pathStat.dev
+      || openedStat.ino !== pathStat.ino
+      || !currentParent.isDirectory()
+      || currentParent.dev !== parentStat.dev
+      || currentParent.ino !== parentStat.ino
+    ) throw new Error('文件身份已变化')
+    if (openedStat.size > maxSize) throw new Error('文件过大')
+    return readFileSync(descriptor)
+  } finally {
+    if (descriptor !== null) closeSync(descriptor)
+  }
 }
 
 /** 清理所有临时预览文件 */
@@ -416,8 +457,8 @@ function renderXlsxTable(rows: string[][]): string {
   return `<div class="office-table-wrap"><table><thead><tr><th></th>${headerCells}</tr></thead><tbody>${bodyRows}</tbody></table></div>`
 }
 
-function convertXlsxToHtml(filePath: string, resolvedPath: string): OfficePreviewResult {
-  const zip = new AdmZip(resolvedPath)
+function convertXlsxToHtml(filePath: string, resolvedPath: string, content: Buffer): OfficePreviewResult {
+  const zip = new AdmZip(content)
   const workbookXml = readZipText(zip, 'xl/workbook.xml')
   if (!workbookXml) throw new Error('Invalid XLSX: workbook.xml missing')
 
@@ -503,8 +544,8 @@ function getPptxSlideText(zip: AdmZip, slidePath: string): string[] {
     .filter(Boolean)
 }
 
-function convertPptxToHtml(filePath: string, resolvedPath: string): OfficePreviewResult {
-  const zip = new AdmZip(resolvedPath)
+function convertPptxToHtml(filePath: string, resolvedPath: string, content: Buffer): OfficePreviewResult {
+  const zip = new AdmZip(content)
   const slidePaths = getPptxSlidePaths(zip)
   const visibleSlidePaths = slidePaths.slice(0, MAX_PPTX_SLIDES)
   const textParts: string[] = []
@@ -574,17 +615,16 @@ export function resolveAndReadFile(filePath: string, basePaths?: string[]): { re
   const safePath = resolveTargetPath(filePath, basePaths)
   if (!existsSync(safePath)) return null
   try {
-    const st = statSync(safePath)
-    if (st.size > MAX_TEXT_PREVIEW_SIZE) {
-      return { resolvedPath: safePath, content: '', isBinary: false, isTooLarge: true }
-    }
-    const rawContent = readFileSync(safePath)
+    const rawContent = readPreviewFileStable(safePath, MAX_TEXT_PREVIEW_SIZE)
     const content = readSafeText(rawContent)
     if (content === null) {
       return { resolvedPath: safePath, content: '', isBinary: true, isTooLarge: false }
     }
     return { resolvedPath: safePath, content, isBinary: false, isTooLarge: false }
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message === '文件过大') {
+      return { resolvedPath: safePath, content: '', isBinary: false, isTooLarge: true }
+    }
     return null
   }
 }
@@ -599,8 +639,12 @@ export function resolveFilePath(filePath: string, basePaths?: string[]): string 
 export async function preparePdfPreview(filePath: string, basePaths?: string[]): Promise<{ resolvedPath: string; tmpHtmlUrl: string } | null> {
   const safePath = resolveTargetPath(filePath, basePaths)
   if (!existsSync(safePath)) return null
-  const st = statSync(safePath)
-  if (st.size > MAX_FILE_SIZE) return null
+  let stablePdf: Buffer
+  try {
+    stablePdf = readPreviewFileStable(safePath, MAX_FILE_SIZE)
+  } catch {
+    return null
+  }
 
   let fileUrl: string
   let pdfScriptUrl: string
@@ -610,7 +654,7 @@ export async function preparePdfPreview(filePath: string, basePaths?: string[]):
   try {
     const { registerPromaDirectoryPath, registerPromaFilePath } = await import('./local-file-protocol')
     registerFilePath = registerPromaFilePath
-    fileUrl = registerPromaFilePath(safePath)
+    fileUrl = registerPromaFilePath(writeTempBinary(stablePdf, '.pdf'))
     pdfScriptUrl = registerPromaFilePath(require.resolve(`${PDFJS_PACKAGE}/build/pdf.min.mjs`))
     pdfWorkerUrl = registerPromaFilePath(require.resolve(`${PDFJS_PACKAGE}/build/pdf.worker.min.mjs`))
     const pdfPackageDir = dirname(require.resolve(`${PDFJS_PACKAGE}/package.json`))
@@ -699,10 +743,9 @@ export async function convertDocxToHtml(filePath: string, basePaths?: string[]):
   const safePath = resolveTargetPath(filePath, basePaths)
   if (!existsSync(safePath)) return null
   try {
-    const st = statSync(safePath)
-    if (st.size > MAX_FILE_SIZE) return null
+    const stableDocx = readPreviewFileStable(safePath, MAX_FILE_SIZE)
     const mammoth = await import('mammoth')
-    const result = await mammoth.convertToHtml({ path: safePath })
+    const result = await mammoth.convertToHtml({ buffer: stableDocx })
     return { resolvedPath: safePath, html: result.value }
   } catch (err) {
     console.error('[file-preview] convertDocxToHtml failed:', err)
@@ -726,20 +769,26 @@ function renderOfficeTextFallback(filePath: string, text: string, kind: OfficePr
 export async function convertOfficeToHtml(filePath: string, basePaths?: string[]): Promise<OfficePreviewResult | null> {
   const safePath = resolveTargetPath(filePath, basePaths)
   if (!existsSync(safePath)) return null
+  let stableOffice: Buffer
+  try {
+    stableOffice = readPreviewFileStable(safePath, MAX_FILE_SIZE)
+  } catch (error) {
+    console.error('[file-preview] convertOfficeToHtml stable read failed:', error)
+    return null
+  }
 
   try {
-    const st = statSync(safePath)
-    if (st.size > MAX_FILE_SIZE) return null
-
     const ext = extname(safePath).toLowerCase()
-    if (ext === '.xlsx') return convertXlsxToHtml(filePath, safePath)
-    if (ext === '.pptx') return convertPptxToHtml(filePath, safePath)
+    if (ext === '.xlsx') return convertXlsxToHtml(filePath, safePath, stableOffice)
+    if (ext === '.pptx') return convertPptxToHtml(filePath, safePath, stableOffice)
     return null
   } catch (err) {
     console.error('[file-preview] convertOfficeToHtml structured preview failed:', err)
     try {
       const officeParser = await import('officeparser')
-      const text = await officeParser.parseOfficeAsync(safePath)
+      /** 包运行时与顶层 typings 支持 Buffer，但动态 import 的条件声明仍只暴露 string。 */
+      const parseOfficeBuffer = officeParser.parseOfficeAsync as (file: string | Buffer) => Promise<string>
+      const text = await parseOfficeBuffer(stableOffice)
       const ext = extname(safePath).toLowerCase()
       const kind: OfficePreviewResult['kind'] = ext === '.pptx' ? 'presentation' : 'spreadsheet'
       return {

@@ -6,8 +6,24 @@
 
 import { ipcMain, nativeTheme, shell, dialog, BrowserWindow, app, clipboard, nativeImage } from 'electron'
 import type { OpenDialogOptions, SaveDialogOptions, WebContents } from 'electron'
+import { randomUUID } from 'node:crypto'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { existsSync, realpathSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs'
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  ftruncateSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, isPromaPermissionMode, normalizePathForCompare } from '@proma/shared'
@@ -316,7 +332,7 @@ import {
   searchAgentSessionMessages,
   searchAgentSessionReferences,
 } from './lib/agent-session-manager'
-import { requireUserVisibleAgentSession } from './lib/agent-session-visibility'
+import { isAgentSessionUserVisible, requireUserVisibleAgentSession } from './lib/agent-session-visibility'
 import { agentEventBus, runAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, reserveAgentSessionStart, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import {
@@ -500,41 +516,265 @@ function hasExplicitSessionId(value?: FileAccessOptions | string[]): boolean {
   )
 }
 
+/** 单次 Renderer 文件 IPC 固化的会话、工作区与授权根快照。 */
+interface RendererFileAccessSnapshot {
+  options?: FileAccessOptions
+  sessionsById: Map<string, AgentSessionMeta>
+  workspacesById: Map<string, AgentWorkspace>
+  workspacesBySlug: Map<string, AgentWorkspace>
+  managedRoot: string
+  authorizedRoots: string[]
+}
+
+/** 托管路径归属判定；managed=true 且无 owner 表示孤儿或损坏布局。 */
+interface ManagedAgentPathOwner {
+  managed: boolean
+  owner?: AgentSessionMeta
+}
+
+/** 只把路径缺失视为可向现有祖先回溯，权限与 IO 故障继续向上抛。 */
+function isMissingFileSystemPath(error: unknown): boolean {
+  return error instanceof Error
+    && 'code' in error
+    && (error.code === 'ENOENT' || error.code === 'ENOTDIR')
+}
+
+/**
+ * 通过最近存在祖先解析 canonical 路径，兼容尚未创建的写入目标。
+ * @param filePath Renderer 提交的绝对或相对路径。
+ * @returns 消除已有祖先 symlink 后的绝对路径。
+ */
+function canonicalizeAccessPath(filePath: string): string {
+  const suffix: string[] = []
+  let cursor = resolve(filePath)
+  while (true) {
+    try {
+      return resolve(realpathSync(cursor), ...suffix.reverse())
+    } catch (error) {
+      if (!isMissingFileSystemPath(error)) throw error
+      const parent = dirname(cursor)
+      if (parent === cursor) throw error
+      suffix.push(basename(cursor))
+      cursor = parent
+    }
+  }
+}
+
+/** 文件系统对象的稳定身份，用于绑定授权与实际消费。 */
+interface StableFileSystemIdentity {
+  dev: number
+  ino: number
+}
+
+/** 工作区级共享项不属于任何会话，owner 解析时必须与 session 目录区分。 */
+const MANAGED_WORKSPACE_SHARED_ENTRIES = new Set([
+  'workspace-files',
+  'skills',
+  'skills-inactive',
+  '.claude',
+  'memory',
+  'AGENTS.md',
+  'CLAUDE.md',
+  'mcp.json',
+  'config.json',
+])
+
+/** 捕获实际文件或目录身份，符号链接不视为可消费对象。 */
+function captureStablePathIdentity(filePath: string): StableFileSystemIdentity {
+  const stats = lstatSync(filePath)
+  if (stats.isSymbolicLink() || (!stats.isFile() && !stats.isDirectory())) throw new Error('文件身份已变化')
+  return { dev: stats.dev, ino: stats.ino }
+}
+
+/** 复验路径仍指向授权时的同一文件系统对象。 */
+function assertStablePathIdentity(filePath: string, expected: StableFileSystemIdentity): void {
+  let current: ReturnType<typeof lstatSync>
+  try {
+    current = lstatSync(filePath)
+  } catch (error) {
+    throw new Error('文件身份已变化', { cause: error })
+  }
+  if (current.isSymbolicLink() || current.dev !== expected.dev || current.ino !== expected.ino) {
+    throw new Error('文件身份已变化')
+  }
+}
+
+/** 使用 no-follow fd 读取授权时的同一普通文件。 */
+function readStableFile(filePath: string, maxSize: number, afterAuthorized?: () => void): Buffer {
+  const safePath = resolve(filePath)
+  const fileIdentity = captureStablePathIdentity(safePath)
+  const parentPath = dirname(safePath)
+  const parentIdentity = captureStablePathIdentity(parentPath)
+  afterAuthorized?.()
+  let descriptor: number | null = null
+  try {
+    descriptor = openSync(safePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    const opened = fstatSync(descriptor)
+    if (!opened.isFile() || opened.dev !== fileIdentity.dev || opened.ino !== fileIdentity.ino) {
+      throw new Error('文件身份已变化')
+    }
+    assertStablePathIdentity(parentPath, parentIdentity)
+    if (opened.size > maxSize) throw new Error('文件过大')
+    const content = readFileSync(descriptor)
+    const completed = fstatSync(descriptor)
+    if (completed.dev !== fileIdentity.dev || completed.ino !== fileIdentity.ino) throw new Error('文件身份已变化')
+    return content
+  } finally {
+    if (descriptor !== null) closeSync(descriptor)
+  }
+}
+
+/** 严格解码稳定读取的文本内容，拒绝伪装成 UTF-8 的二进制文件。 */
+function decodeStablePreviewText(content: Buffer): string | null {
+  if (content.includes(0)) return null
+  let text: string
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(content)
+  } catch {
+    return null
+  }
+  let unsafeControlCount = 0
+  for (let index = 0; index < content.length; index++) {
+    const byte = content[index]!
+    if (byte < 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) {
+      if (byte === 0x1b && content[index + 1] === 0x5b) continue
+      unsafeControlCount += 1
+    }
+  }
+  return unsafeControlCount > Math.max(4, Math.floor(content.length * 0.01)) ? null : text
+}
+
+/** 使用 no-follow fd 覆盖授权时的同一普通文件。 */
+function writeStableTextFile(filePath: string, content: string, afterAuthorized?: () => void): void {
+  const safePath = resolve(filePath)
+  const fileIdentity = captureStablePathIdentity(safePath)
+  const parentPath = dirname(safePath)
+  const parentIdentity = captureStablePathIdentity(parentPath)
+  afterAuthorized?.()
+  let descriptor: number | null = null
+  try {
+    descriptor = openSync(safePath, constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0))
+    const opened = fstatSync(descriptor)
+    if (!opened.isFile() || opened.dev !== fileIdentity.dev || opened.ino !== fileIdentity.ino) {
+      throw new Error('文件身份已变化')
+    }
+    assertStablePathIdentity(parentPath, parentIdentity)
+    ftruncateSync(descriptor, 0)
+    writeFileSync(descriptor, content, 'utf8')
+    const completed = fstatSync(descriptor)
+    if (completed.dev !== fileIdentity.dev || completed.ino !== fileIdentity.ino) throw new Error('文件身份已变化')
+  } finally {
+    if (descriptor !== null) closeSync(descriptor)
+  }
+}
+
+/** 先绑定源与父目录身份，再通过同目录 tombstone 删除同一对象。 */
+function removeStablePath(filePath: string, afterAuthorized?: () => void): void {
+  const safePath = resolve(filePath)
+  const sourceIdentity = captureStablePathIdentity(safePath)
+  const parentPath = dirname(safePath)
+  const parentIdentity = captureStablePathIdentity(parentPath)
+  afterAuthorized?.()
+  assertStablePathIdentity(parentPath, parentIdentity)
+  assertStablePathIdentity(safePath, sourceIdentity)
+  const tombstonePath = join(parentPath, `.proma-renderer-delete-${randomUUID()}.tombstone`)
+  renameSync(safePath, tombstonePath)
+  assertStablePathIdentity(parentPath, parentIdentity)
+  assertStablePathIdentity(tombstonePath, sourceIdentity)
+  rmSync(tombstonePath, { recursive: true, force: false })
+}
+
+/** 绑定源、父目录与目标缺失状态后执行同目录重命名。 */
+function renameStablePath(sourcePath: string, destinationPath: string, afterAuthorized?: () => void): void {
+  const source = resolve(sourcePath)
+  const destination = resolve(destinationPath)
+  const sourceIdentity = captureStablePathIdentity(source)
+  const parentPath = dirname(source)
+  const parentIdentity = captureStablePathIdentity(parentPath)
+  if (existsSync(destination)) throw new Error('目标文件已存在')
+  afterAuthorized?.()
+  assertStablePathIdentity(parentPath, parentIdentity)
+  assertStablePathIdentity(source, sourceIdentity)
+  if (existsSync(destination)) throw new Error('目标文件已存在')
+  renameSync(source, destination)
+  assertStablePathIdentity(destination, sourceIdentity)
+}
+
+/** 绑定源和目标目录身份后执行移动，并复验最终对象身份。 */
+function moveStablePath(sourcePath: string, targetDir: string, afterAuthorized?: () => void): string {
+  const source = resolve(sourcePath)
+  const target = resolve(targetDir)
+  const sourceIdentity = captureStablePathIdentity(source)
+  const sourceParent = dirname(source)
+  const sourceParentIdentity = captureStablePathIdentity(sourceParent)
+  const targetIdentity = captureStablePathIdentity(target)
+  const destination = join(target, basename(source))
+  if (existsSync(destination)) throw new Error('目标文件已存在')
+  afterAuthorized?.()
+  assertStablePathIdentity(sourceParent, sourceParentIdentity)
+  assertStablePathIdentity(target, targetIdentity)
+  assertStablePathIdentity(source, sourceIdentity)
+  if (existsSync(destination)) throw new Error('目标文件已存在')
+  const movedPath = movePathSafely(source, target)
+  assertStablePathIdentity(movedPath, sourceIdentity)
+  return movedPath
+}
+
+/** 普通 Renderer IPC 只能访问用户可见的 Agent 会话。 */
+function requireVisibleSession(sessionId: string, sessionsById?: ReadonlyMap<string, AgentSessionMeta>): AgentSessionMeta {
+  return requireUserVisibleAgentSession(sessionsById?.get(sessionId) ?? getAgentSessionMeta(sessionId))
+}
+
 /**
  * 解析 Proma 托管 Agent cwd 的会话 owner，不读取目标文件内容。
  * @param filePath 待访问路径，可为 cwd 本身或其任意后代。
- * @returns 已登记的会话 owner；普通 workspace/tmp/外部路径返回 undefined。
+ * @param snapshot 本次 IPC 固化的会话与工作区索引。
+ * @returns 是否属于托管 session 形态，以及已验证的 owner。
  */
-function getManagedAgentSessionPathOwner(filePath: string): AgentSessionMeta | undefined {
-  const managedRoot = resolve(join(getConfigDir(), 'agent-workspaces'))
-  const relativePath = relative(managedRoot, resolve(filePath))
+function getManagedAgentSessionPathOwner(
+  filePath: string,
+  snapshot: RendererFileAccessSnapshot,
+): ManagedAgentPathOwner {
+  const relativePath = relative(snapshot.managedRoot, canonicalizeAccessPath(filePath))
   if (!relativePath || relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
-    return undefined
+    return { managed: false }
   }
   /** 托管布局固定为 agent-workspaces/{workspaceSlug}/{sessionId}/...。 */
   const pathSegments = relativePath.split(sep)
+  if (pathSegments.length < 2) return { managed: false }
+  const workspace = snapshot.workspacesBySlug.get(pathSegments[0]!)
+  if (!workspace) return { managed: true }
+  if (MANAGED_WORKSPACE_SHARED_ENTRIES.has(pathSegments[1]!)) return { managed: false }
   const candidateSessionId = pathSegments[1]
-  return candidateSessionId ? getAgentSessionMeta(candidateSessionId) : undefined
+  const owner = candidateSessionId ? snapshot.sessionsById.get(candidateSessionId) : undefined
+  if (!owner || owner.workspaceId !== workspace.id) return { managed: true }
+  return { managed: true, owner }
 }
 
 /** 校验 canonical 路径的 session owner，供所有 file access 边界兜底。 */
-function isManagedAgentSessionPathAllowed(filePath: string, options?: FileAccessOptions): boolean {
-  const owner = getManagedAgentSessionPathOwner(filePath)
-  if (!owner) return true
-  if (!hasExplicitSessionId(options)) return false
-  try {
-    const declaredSession = requireUserVisibleAgentSession(getAgentSessionMeta(options?.sessionId ?? ''))
-    const visibleOwner = requireUserVisibleAgentSession(owner)
-    return declaredSession.id === visibleOwner.id
-  } catch {
-    return false
-  }
+function isManagedAgentSessionPathAllowed(filePath: string, snapshot: RendererFileAccessSnapshot): boolean {
+  const result = getManagedAgentSessionPathOwner(filePath, snapshot)
+  if (!result.managed) return true
+  if (!result.owner || !hasExplicitSessionId(snapshot.options)) return false
+  const declaredSession = snapshot.sessionsById.get(snapshot.options?.sessionId ?? '')
+  return Boolean(
+    declaredSession
+      && isAgentSessionUserVisible(declaredSession)
+      && isAgentSessionUserVisible(result.owner)
+      && declaredSession.id === result.owner.id,
+  )
 }
 
-function getAuthorizedRoots(options?: FileAccessOptions): string[] {
+function getAuthorizedRoots(
+  options?: FileAccessOptions,
+  accessSnapshot?: Omit<RendererFileAccessSnapshot, 'authorizedRoots'>,
+): string[] {
+  const sessionsById = accessSnapshot?.sessionsById ?? new Map(listAgentSessions().map((session) => [session.id, session]))
+  const workspaces = accessSnapshot ? [...accessSnapshot.workspacesById.values()] : listAgentWorkspaces()
+  const workspacesById = accessSnapshot?.workspacesById ?? new Map(workspaces.map((workspace) => [workspace.id, workspace]))
   const roots: string[] = [
     join(tmpdir(), 'proma-preview'),
-    ...listAgentWorkspaces().map((workspace) => (
+    ...workspaces.map((workspace) => (
       join(getConfigDir(), 'agent-workspaces', workspace.slug, 'workspace-files')
     )),
   ]
@@ -542,7 +782,7 @@ function getAuthorizedRoots(options?: FileAccessOptions): string[] {
   const workspaceSlugs = new Set<string>()
 
   if (options?.sessionId) {
-    const meta = getAgentSessionMeta(options.sessionId)
+    const meta = sessionsById.get(options.sessionId)
     if (meta?.attachedDirectories) {
       roots.push(...meta.attachedDirectories)
     }
@@ -553,7 +793,7 @@ function getAuthorizedRoots(options?: FileAccessOptions): string[] {
       roots.push(...meta.attachedFiles)
     }
     if (meta?.workspaceId) {
-      const workspace = getAgentWorkspace(meta.workspaceId)
+      const workspace = workspacesById.get(meta.workspaceId)
       if (workspace?.slug) {
         workspaceSlugs.add(workspace.slug)
         roots.push(join(getConfigDir(), 'agent-workspaces', workspace.slug, meta.id))
@@ -574,6 +814,43 @@ function getAuthorizedRoots(options?: FileAccessOptions): string[] {
   return roots
 }
 
+/** 每个文件 IPC 只读取一次 session/workspace 索引并预计算授权根。 */
+function createRendererFileAccessSnapshot(access?: FileAccessOptions | string[]): RendererFileAccessSnapshot {
+  const options = normalizeFileAccessOptions(access)
+  const sessionsById = new Map(listAgentSessions().map((session) => [session.id, session]))
+  const workspaces = listAgentWorkspaces()
+  const workspacesById = new Map(workspaces.map((workspace) => [workspace.id, workspace]))
+  const workspacesBySlug = new Map(workspaces.map((workspace) => [workspace.slug, workspace]))
+  const baseSnapshot = {
+    options,
+    sessionsById,
+    workspacesById,
+    workspacesBySlug,
+    managedRoot: canonicalizeAccessPath(join(getConfigDir(), 'agent-workspaces')),
+  }
+  return { ...baseSnapshot, authorizedRoots: getAuthorizedRoots(options, baseSnapshot) }
+}
+
+/** 在任何路径解析或文件系统访问前验证声明会话与目标 cwd owner。 */
+function requireVisibleFileAccess(
+  access?: FileAccessOptions | string[],
+  targetPaths: readonly string[] = [],
+): RendererFileAccessSnapshot {
+  const snapshot = createRendererFileAccessSnapshot(access)
+  const sessionIdWasProvided = hasExplicitSessionId(access)
+  const declaredSession = sessionIdWasProvided
+    ? requireVisibleSession(snapshot.options?.sessionId ?? '', snapshot.sessionsById)
+    : undefined
+  for (const targetPath of targetPaths) {
+    const result = getManagedAgentSessionPathOwner(targetPath, snapshot)
+    if (!result.managed) continue
+    if (!result.owner) throw new Error('Agent 会话不存在')
+    const visibleOwner = requireUserVisibleAgentSession(result.owner)
+    if (!declaredSession || declaredSession.id !== visibleOwner.id) throw new Error('Agent 会话不存在')
+  }
+  return snapshot
+}
+
 function isUnderRoot(resolvedPath: string, root: string): boolean {
   const resolvedRoot = realpathOrResolve(root)
   const relativePath = relative(resolvedRoot, resolvedPath)
@@ -584,18 +861,23 @@ function isUnderRoot(resolvedPath: string, root: string): boolean {
   )
 }
 
-function isPathAllowed(filePath: string, options?: FileAccessOptions): boolean {
+function isPathAllowed(
+  filePath: string,
+  options?: FileAccessOptions,
+  accessSnapshot?: RendererFileAccessSnapshot,
+): boolean {
   let resolved: string
   try {
     resolved = realpathSync(resolve(filePath))
   } catch {
     return false
   }
-  if (!isManagedAgentSessionPathAllowed(resolved, options)) return false
+  const snapshot = accessSnapshot ?? createRendererFileAccessSnapshot(options)
+  if (!isManagedAgentSessionPathAllowed(resolved, snapshot)) return false
   // 文件面板应反映 Agent 实际可访问的路径。调用方已明确开启 unrestricted 时，
   // 保留 realpath 校验以拒绝不存在的目标，但不再按会话附件重复收窄范围。
   if (options?.unrestricted) return true
-  return getAuthorizedRoots(options).some((root) => isUnderRoot(resolved, root))
+  return snapshot.authorizedRoots.some((root) => isUnderRoot(resolved, root))
 }
 
 function normalizeFileAccessOptions(value?: FileAccessOptions | string[]): FileAccessOptions | undefined {
@@ -615,12 +897,15 @@ function normalizeFileAccessOptions(value?: FileAccessOptions | string[]): FileA
   return normalized
 }
 
-function getWorkspaceSlugsForAccess(options?: FileAccessOptions): string[] {
+function getWorkspaceSlugsForAccess(
+  options?: FileAccessOptions,
+  accessSnapshot?: RendererFileAccessSnapshot,
+): string[] {
   const workspaceSlugs = new Set<string>()
   if (options?.sessionId) {
-    const meta = getAgentSessionMeta(options.sessionId)
+    const meta = accessSnapshot?.sessionsById.get(options.sessionId) ?? getAgentSessionMeta(options.sessionId)
     if (meta?.workspaceId) {
-      const workspace = getAgentWorkspace(meta.workspaceId)
+      const workspace = accessSnapshot?.workspacesById.get(meta.workspaceId) ?? getAgentWorkspace(meta.workspaceId)
       if (workspace?.slug) workspaceSlugs.add(workspace.slug)
     }
   }
@@ -630,15 +915,23 @@ function getWorkspaceSlugsForAccess(options?: FileAccessOptions): string[] {
   return Array.from(workspaceSlugs)
 }
 
-function getManagedSkillBasePath(options?: FileAccessOptions): string | undefined {
+function getManagedSkillBasePath(
+  options?: FileAccessOptions,
+  accessSnapshot?: RendererFileAccessSnapshot,
+): string | undefined {
   const workspaceSlug = options?.workspaceSkillSlug
-  if (!workspaceSlug || !getWorkspaceSlugsForAccess(options).includes(workspaceSlug)) return undefined
-  const workspace = listAgentWorkspaces().find((item) => item.slug === workspaceSlug)
+  if (!workspaceSlug || !getWorkspaceSlugsForAccess(options, accessSnapshot).includes(workspaceSlug)) return undefined
+  const workspace = accessSnapshot?.workspacesBySlug.get(workspaceSlug)
+    ?? listAgentWorkspaces().find((item) => item.slug === workspaceSlug)
   return workspace ? getWorkspaceSkillsDir(workspace.slug) : undefined
 }
 
-function getAllowedCandidateBasePaths(options?: FileAccessOptions): string[] | undefined {
-  const allowed = (getPreviewCandidateBasePaths(options) ?? []).filter((p) => isPathAllowed(p, options))
+function getAllowedCandidateBasePaths(
+  options?: FileAccessOptions,
+  accessSnapshot?: RendererFileAccessSnapshot,
+): string[] | undefined {
+  const allowed = (getPreviewCandidateBasePaths(options, accessSnapshot) ?? [])
+    .filter((p) => isPathAllowed(p, options, accessSnapshot))
   return allowed.length > 0 ? allowed : undefined
 }
 
@@ -649,9 +942,12 @@ function getLegacySkillBasePath(options?: FileAccessOptions): string | undefined
   return normalized.match(/^(.*\/skills)\/[^/]+\/SKILL\.md$/i)?.[1]
 }
 
-function getPreviewCandidateBasePaths(options?: FileAccessOptions): string[] | undefined {
+function getPreviewCandidateBasePaths(
+  options?: FileAccessOptions,
+  accessSnapshot?: RendererFileAccessSnapshot,
+): string[] | undefined {
   const bases = options?.candidateBasePaths?.filter((p) => typeof p === 'string' && p.length > 0) ?? []
-  const managedSkillBasePath = getManagedSkillBasePath(options)
+  const managedSkillBasePath = getManagedSkillBasePath(options, accessSnapshot)
   if (managedSkillBasePath && !bases.includes(managedSkillBasePath)) {
     bases.unshift(managedSkillBasePath)
   }
@@ -663,12 +959,16 @@ function getPreviewCandidateBasePaths(options?: FileAccessOptions): string[] | u
 }
 
 /** Resolve preview-only relative paths before handing them to OS-level file actions. */
-async function resolveFileAccessPath(filePath: string, options?: FileAccessOptions): Promise<string> {
+async function resolveFileAccessPath(
+  filePath: string,
+  options?: FileAccessOptions,
+  accessSnapshot?: RendererFileAccessSnapshot,
+): Promise<string> {
   const [{ resolve }, { resolveFilePath }] = await Promise.all([
     import('node:path'),
     import('./lib/file-preview-service'),
   ])
-  return resolveFilePath(filePath, getPreviewCandidateBasePaths(options)) ?? resolve(filePath)
+  return resolveFilePath(filePath, getPreviewCandidateBasePaths(options, accessSnapshot)) ?? resolve(filePath)
 }
 
 async function getAccessRootMainRepo(root: string): Promise<string | null> {
@@ -683,8 +983,12 @@ async function getAccessRootMainRepo(root: string): Promise<string | null> {
   return getMainRepoRoot(probePath)
 }
 
-function ensurePathAllowed(filePath: string, options?: FileAccessOptions): boolean {
-  if (isPathAllowed(filePath, options)) return true
+function ensurePathAllowed(
+  filePath: string,
+  options?: FileAccessOptions,
+  accessSnapshot?: RendererFileAccessSnapshot,
+): boolean {
+  if (isPathAllowed(filePath, options, accessSnapshot)) return true
   console.warn('[IPC] 拒绝越界路径:', filePath)
   return false
 }
@@ -696,19 +1000,24 @@ function ensurePathAllowed(filePath: string, options?: FileAccessOptions): boole
  * 授权根下，会被 ensurePathAllowed 拒绝。但只要它回溯到的主仓库已被授权，就应放行。
  * 用 git 自身背书（--git-common-dir），避免粗暴跳过安全检查。
  */
-async function ensurePathAllowedWithWorktree(filePath: string, options?: FileAccessOptions): Promise<boolean> {
-  if (isPathAllowed(filePath, options)) return true
+async function ensurePathAllowedWithWorktree(
+  filePath: string,
+  options?: FileAccessOptions,
+  accessSnapshot?: RendererFileAccessSnapshot,
+): Promise<boolean> {
+  const snapshot = accessSnapshot ?? createRendererFileAccessSnapshot(options)
+  if (isPathAllowed(filePath, options, snapshot)) return true
   const mainRepo = await getMainRepoRoot(filePath)
-  if (mainRepo && isPathAllowed(mainRepo, options)) return true
+  if (mainRepo && isPathAllowed(mainRepo, options, snapshot)) return true
   if (mainRepo) {
     const targetMainRepo = normalizePathForCompare(realpathOrResolve(mainRepo))
-    for (const root of getAuthorizedRoots(options)) {
+    for (const root of snapshot.authorizedRoots) {
       const authorizedMainRepo = await getAccessRootMainRepo(root)
       if (!authorizedMainRepo) continue
       const authorizedRoot = normalizePathForCompare(realpathOrResolve(authorizedMainRepo))
       if (authorizedRoot === targetMainRepo) return true
     }
-    for (const workspaceSlug of getWorkspaceSlugsForAccess(options)) {
+    for (const workspaceSlug of getWorkspaceSlugsForAccess(options, snapshot)) {
       let repos: import('@proma/shared').WorkspaceWorktreeRepo[]
       try {
         repos = await getWorktreeRepos(workspaceSlug)
@@ -1009,12 +1318,9 @@ async function getWindowsDefaultAppInfo(filePath: string): Promise<{ appPath: st
 }
 
 async function getDefaultAppInfoForFile(
-  filePath: string,
-  options?: FileAccessOptions,
+  absPath: string,
 ): Promise<import('@proma/shared').DefaultAppInfo | null> {
-  const absPath = await resolveFileAccessPath(filePath, options)
-
-  const cacheKey = `${process.platform}:${extOf(filePath) || filePath}`
+  const cacheKey = `${process.platform}:${extOf(absPath) || absPath}`
   const cachedInfo = defaultAppCache.get(cacheKey) ?? getCachedDefaultAppInfo(cacheKey)
   if (cachedInfo) {
     defaultAppCache.set(cacheKey, cachedInfo)
@@ -1049,7 +1355,7 @@ if let appUrl = NSWorkspace.shared.urlForApplication(toOpen: url) {
       appName = base.replace(/\.app$/, '')
     }
   } else if (process.platform === 'win32') {
-    const info = await getWindowsDefaultAppInfo(filePath)
+    const info = await getWindowsDefaultAppInfo(absPath)
     console.log('[DefaultApp] win32 getWindowsDefaultAppInfo 结果:', info)
     if (!info) return cacheNull(cacheKey)
     appPath = info.isUwp ? absPath : info.appPath
@@ -1391,7 +1697,8 @@ export function registerIpcHandlers(): void {
         console.warn('[IPC] git:get-repo-status 收到无效的目录路径')
         return null
       }
-
+      const accessSnapshot = requireVisibleFileAccess(undefined, [dirPath])
+      if (!isPathAllowed(dirPath, undefined, accessSnapshot)) return null
       return getGitRepoStatus(dirPath)
     }
   )
@@ -1404,13 +1711,22 @@ export function registerIpcHandlers(): void {
         console.warn('[IPC] git:get-unstaged-changes 收到无效的目录路径')
         return { isGitRepo: false, files: [], untrackedFiles: [], gitRootNames: [] }
       }
-      const access = normalizeFileAccessOptions({ sessionId })
-      if (!ensurePathAllowed(dirPath, access)) {
+      const rawAccess = sessionId !== undefined ? { sessionId } : undefined
+      /** 在 guard 前仅使用表达式组装参数，不引入未审计的函数调用。 */
+      const targetPaths = [
+        dirPath,
+        ...(sessionPath ? [sessionPath] : []),
+        ...(workspaceFilesPath ? [workspaceFilesPath] : []),
+        ...(extraPaths ?? []),
+      ]
+      const accessSnapshot = requireVisibleFileAccess(rawAccess, targetPaths)
+      const access = accessSnapshot.options
+      if (!ensurePathAllowed(dirPath, access, accessSnapshot)) {
         return { isGitRepo: false, files: [], untrackedFiles: [], gitRootNames: [] }
       }
-      const allowedSessionPath = sessionPath && isPathAllowed(sessionPath, access) ? sessionPath : undefined
-      const allowedWorkspaceFilesPath = workspaceFilesPath && isPathAllowed(workspaceFilesPath, access) ? workspaceFilesPath : undefined
-      const allowedExtraPaths = extraPaths?.filter((p) => isPathAllowed(p, access))
+      const allowedSessionPath = sessionPath && isPathAllowed(sessionPath, access, accessSnapshot) ? sessionPath : undefined
+      const allowedWorkspaceFilesPath = workspaceFilesPath && isPathAllowed(workspaceFilesPath, access, accessSnapshot) ? workspaceFilesPath : undefined
+      const allowedExtraPaths = extraPaths?.filter((p) => isPathAllowed(p, access, accessSnapshot))
       return getUnstagedChanges(dirPath, allowedSessionPath, allowedWorkspaceFilesPath, allowedExtraPaths)
     }
   )
@@ -1437,8 +1753,9 @@ export function registerIpcHandlers(): void {
         console.warn('[IPC] git:get-file-diff 收到无效参数')
         return ''
       }
-      const access = normalizeFileAccessOptions({ sessionId })
-      if (!(await ensurePathAllowedWithWorktree(dirPath, access)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access)))) return ''
+      const accessSnapshot = requireVisibleFileAccess({ sessionId }, [dirPath, ...(gitRoot ? [gitRoot] : [])])
+      const access = accessSnapshot.options
+      if (!(await ensurePathAllowedWithWorktree(dirPath, access, accessSnapshot)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access, accessSnapshot)))) return ''
       return getFileDiff(dirPath, filePath, gitRoot)
     }
   )
@@ -1452,8 +1769,9 @@ export function registerIpcHandlers(): void {
         console.warn('[IPC] git:get-untracked-content 收到无效参数')
         return ''
       }
-      const access = normalizeFileAccessOptions({ sessionId })
-      if (!(await ensurePathAllowedWithWorktree(dirPath, access)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access)))) return ''
+      const accessSnapshot = requireVisibleFileAccess({ sessionId }, [dirPath, ...(gitRoot ? [gitRoot] : [])])
+      const access = accessSnapshot.options
+      if (!(await ensurePathAllowedWithWorktree(dirPath, access, accessSnapshot)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access, accessSnapshot)))) return ''
       return getUntrackedContent(dirPath, filePath, gitRoot)
     }
   )
@@ -1467,8 +1785,9 @@ export function registerIpcHandlers(): void {
         console.warn('[IPC] git:revert-file 收到无效参数')
         return
       }
-      const access = normalizeFileAccessOptions({ sessionId })
-      if (!(await ensurePathAllowedWithWorktree(dirPath, access)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access)))) return
+      const accessSnapshot = requireVisibleFileAccess({ sessionId }, [dirPath, ...(gitRoot ? [gitRoot] : [])])
+      const access = accessSnapshot.options
+      if (!(await ensurePathAllowedWithWorktree(dirPath, access, accessSnapshot)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access, accessSnapshot)))) return
       await revertFile(dirPath, filePath, gitRoot)
     }
   )
@@ -1482,8 +1801,9 @@ export function registerIpcHandlers(): void {
         console.warn('[IPC] git:get-diff-contents 收到无效参数')
         return null
       }
-      const access = normalizeFileAccessOptions({ sessionId })
-      if (!(await ensurePathAllowedWithWorktree(dirPath, access)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access)))) return null
+      const accessSnapshot = requireVisibleFileAccess({ sessionId }, [dirPath, ...(gitRoot ? [gitRoot] : [])])
+      const access = accessSnapshot.options
+      if (!(await ensurePathAllowedWithWorktree(dirPath, access, accessSnapshot)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access, accessSnapshot)))) return null
       return getDiffContents(dirPath, filePath, gitRoot, input.baseRef)
     }
   )
@@ -1491,8 +1811,10 @@ export function registerIpcHandlers(): void {
   // 列出 Git Worktree（只读取 worktree 元信息，不涉及文件内容，跳过路径安全检查）
   ipcMain.handle(
     IPC_CHANNELS.LIST_WORKTREES,
-    async (_, repoPath: string, _sessionId: string) => {
+    async (_, repoPath: string, sessionId: string) => {
       if (!repoPath || typeof repoPath !== 'string') return []
+      const accessSnapshot = requireVisibleFileAccess({ sessionId }, [repoPath])
+      if (!(await ensurePathAllowedWithWorktree(repoPath, accessSnapshot.options, accessSnapshot))) return []
       return await listWorktrees(repoPath)
     }
   )
@@ -1504,8 +1826,9 @@ export function registerIpcHandlers(): void {
       if (!worktreePath || typeof worktreePath !== 'string') {
         return { isGitRepo: false, files: [], untrackedFiles: [], gitRootNames: [] }
       }
-      const access = normalizeFileAccessOptions({ sessionId })
-      if (!(await ensurePathAllowedWithWorktree(worktreePath, access))) {
+      const accessSnapshot = requireVisibleFileAccess({ sessionId }, [worktreePath])
+      const access = accessSnapshot.options
+      if (!(await ensurePathAllowedWithWorktree(worktreePath, access, accessSnapshot))) {
         return { isGitRepo: false, files: [], untrackedFiles: [], gitRootNames: [] }
       }
       return getWorktreeChanges(worktreePath, baseBranch)
@@ -1520,6 +1843,7 @@ export function registerIpcHandlers(): void {
         console.warn('[IPC] preview:open-detached 收到无效参数')
         return null
       }
+      requireVisibleFileAccess({ sessionId: input.sessionId }, [input.filePath, input.dirPath])
       const { openDetachedPreviewWindow } = await import('./lib/detached-preview-window')
       const sourceWindow = BrowserWindow.fromWebContents(event.sender)
       return openDetachedPreviewWindow(input, sourceWindow)
@@ -1577,9 +1901,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     IPC_CHANNELS.SYSTEM_OPEN_FILE,
     async (_, filePath: string, appName?: string, access?: FileAccessOptions | string[]): Promise<void> => {
-      const options = normalizeFileAccessOptions(access)
-      const absPath = await resolveFileAccessPath(filePath, options)
-      if (!isPathAllowed(absPath, options)) {
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
+      const options = accessSnapshot.options
+      const absPath = await resolveFileAccessPath(filePath, options, accessSnapshot)
+      if (!isPathAllowed(absPath, options, accessSnapshot)) {
         console.warn('[IPC] shell:system-open-file 拒绝越界路径:', absPath)
         return
       }
@@ -1627,15 +1952,16 @@ export function registerIpcHandlers(): void {
     IPC_CHANNELS.GET_DEFAULT_APP_FOR_FILE,
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<import('@proma/shared').DefaultAppInfo | null> => {
       if (!filePath || typeof filePath !== 'string') return null
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
+      const options = accessSnapshot.options
       try {
-        const options = normalizeFileAccessOptions(access)
-        const resolvedPath = await resolveFileAccessPath(filePath, options)
-        if (options && !isPathAllowed(resolvedPath, options)) {
+        const resolvedPath = await resolveFileAccessPath(filePath, options, accessSnapshot)
+        if (!isPathAllowed(resolvedPath, options, accessSnapshot)) {
           console.warn('[IPC] shell:get-default-app-for-file 拒绝越界路径:', resolvedPath)
           return null
         }
         console.log('[IPC] get-default-app-for-file 收到请求:', resolvedPath)
-        const result = await getDefaultAppInfoForFile(resolvedPath, options)
+        const result = await getDefaultAppInfoForFile(resolvedPath)
         console.log('[IPC] get-default-app-for-file 返回:', result ? `name=${result.name} appPath=${result.appPath} iconLen=${result.iconDataUrl?.length}` : 'null')
         return result
       } catch (err) {
@@ -2408,42 +2734,16 @@ export function registerIpcHandlers(): void {
 
   // ===== Agent 会话管理相关 =====
 
-  /** 普通 Renderer IPC 只能访问用户可见的 Agent 会话。 */
-  const requireVisibleSession = (sessionId: string): AgentSessionMeta => (
-    requireUserVisibleAgentSession(getAgentSessionMeta(sessionId))
+  /** 一次读取会话索引；存储故障必须向上抛，不能伪装成 pending 为空。 */
+  const createVisibleSessionIdSet = (): Set<string> => new Set(
+    listAgentSessions().filter(isAgentSessionUserVisible).map((session) => session.id),
   )
 
-  /** 普通文件 IPC 在路径解析或文件系统访问前验证声明会话与目标 cwd owner。 */
-  const requireVisibleFileAccess = (
-    access?: FileAccessOptions | string[],
-    targetPaths: readonly string[] = [],
-  ): void => {
-    const sessionIdWasProvided = hasExplicitSessionId(access)
-    const options = normalizeFileAccessOptions(access)
-    const declaredSession = sessionIdWasProvided
-      ? requireVisibleSession(options?.sessionId ?? '')
-      : undefined
-    for (const targetPath of targetPaths) {
-      const owner = getManagedAgentSessionPathOwner(targetPath)
-      if (!owner) continue
-      const visibleOwner = requireVisibleSession(owner.id)
-      if (!declaredSession || declaredSession.id !== visibleOwner.id) {
-        throw new Error('Agent 会话不存在')
-      }
-    }
-  }
-
-  /** 过滤 pending 快照中的内部或已删除会话，未知 owner 默认不可见。 */
-  const getUserVisiblePendingRequests = <T extends { sessionId: string }>(requests: T[]): T[] => (
-    requests.filter((request) => {
-      try {
-        requireVisibleSession(request.sessionId)
-        return true
-      } catch {
-        return false
-      }
-    })
-  )
+  /** 使用同一 visible ID Set 过滤三类 pending，避免 P*S 重复查索引。 */
+  const getUserVisiblePendingRequests = <T extends { sessionId: string }>(
+    requests: T[],
+    visibleSessionIds: ReadonlySet<string>,
+  ): T[] => requests.filter((request) => visibleSessionIds.has(request.sessionId))
 
   // 获取 Agent 会话列表
   ipcMain.handle(
@@ -3595,10 +3895,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.GET_PENDING_REQUESTS,
     async (): Promise<import('@proma/shared').PendingRequestsSnapshot> => {
+      const visibleSessionIds = createVisibleSessionIdSet()
       return {
-        permissions: getUserVisiblePendingRequests(permissionService.getPendingRequests()),
-        askUsers: getUserVisiblePendingRequests(askUserService.getPendingRequests()),
-        exitPlans: getUserVisiblePendingRequests(exitPlanService.getPendingRequests()),
+        permissions: getUserVisiblePendingRequests(permissionService.getPendingRequests(), visibleSessionIds),
+        askUsers: getUserVisiblePendingRequests(askUserService.getPendingRequests(), visibleSessionIds),
+        exitPlans: getUserVisiblePendingRequests(exitPlanService.getPendingRequests(), visibleSessionIds),
       }
     }
   )
@@ -3836,8 +4137,9 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.GET_SESSION_PATH,
     async (_, workspaceId: string, sessionId: string): Promise<string | null> => {
-      requireVisibleSession(sessionId)
-      const ws = getAgentWorkspace(workspaceId)
+      const session = requireVisibleSession(sessionId)
+      if (!session.workspaceId || session.workspaceId !== workspaceId) return null
+      const ws = getAgentWorkspace(session.workspaceId)
       if (!ws) return null
       return getAgentSessionWorkspacePath(ws.slug, sessionId)
     }
@@ -3847,11 +4149,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.LIST_DIRECTORY,
     async (_, dirPath: string, access?: FileAccessOptions): Promise<FileEntry[]> => {
-      requireVisibleFileAccess(access, [dirPath])
+      const accessSnapshot = requireVisibleFileAccess(access, [dirPath])
       const safePath = resolve(dirPath)
       // 目录可能已被删除（如删除 Agent 会话后面板仍持有旧路径），优雅返回空列表。
       if (!existsSync(safePath)) return []
-      if (!isPathAllowed(safePath, normalizeFileAccessOptions(access))) {
+      if (!isPathAllowed(safePath, accessSnapshot.options, accessSnapshot)) {
         // 路径可能刚好在 existsSync 与 realpath 校验之间被删除。
         if (!existsSync(safePath)) return []
         throw new Error('访问路径超出当前会话的授权范围')
@@ -3865,16 +4167,12 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DELETE_FILE,
     async (_, filePath: string, access?: FileAccessOptions): Promise<void> => {
-      requireVisibleFileAccess(access, [filePath])
-      const { rmSync } = await import('node:fs')
-      const { resolve } = await import('node:path')
-
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       const safePath = resolve(filePath)
-      if (!isPathAllowed(safePath, normalizeFileAccessOptions(access))) {
+      if (!isPathAllowed(safePath, accessSnapshot.options, accessSnapshot)) {
         throw new Error('访问路径超出当前会话的授权范围')
       }
-
-      rmSync(safePath, { recursive: true, force: true })
+      removeStablePath(safePath)
       console.log(`[Agent 文件] 已删除: ${safePath}`)
     }
   )
@@ -3883,11 +4181,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.OPEN_FILE,
     async (_, filePath: string, access?: FileAccessOptions): Promise<void> => {
-      requireVisibleFileAccess(access, [filePath])
-      const { resolve } = await import('node:path')
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
 
       const safePath = resolve(filePath)
-      if (!isPathAllowed(safePath, normalizeFileAccessOptions(access))) {
+      if (!isPathAllowed(safePath, accessSnapshot.options, accessSnapshot)) {
         throw new Error('访问路径超出当前会话的授权范围')
       }
 
@@ -3936,11 +4233,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.SHOW_IN_FOLDER,
     async (_, filePath: string, access?: FileAccessOptions): Promise<void> => {
-      requireVisibleFileAccess(access, [filePath])
-      const { resolve } = await import('node:path')
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
 
       const safePath = resolve(filePath)
-      if (!isPathAllowed(safePath, normalizeFileAccessOptions(access))) {
+      if (!isPathAllowed(safePath, accessSnapshot.options, accessSnapshot)) {
         throw new Error('访问路径超出当前会话的授权范围')
       }
 
@@ -3952,11 +4248,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.OPEN_FOLDER_IN_TERMINAL,
     async (_, folderPath: string, access?: FileAccessOptions): Promise<void> => {
-      requireVisibleFileAccess(access, [folderPath])
+      const accessSnapshot = requireVisibleFileAccess(access, [folderPath])
       if (process.platform !== 'darwin') {
         throw new Error('当前仅支持在 macOS 终端中打开文件夹')
       }
-      if (!isPathAllowed(folderPath, normalizeFileAccessOptions(access))) {
+      if (!isPathAllowed(folderPath, accessSnapshot.options, accessSnapshot)) {
         throw new Error('访问路径超出当前会话的授权范围')
       }
 
@@ -3999,14 +4295,25 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     'file:resolve-and-read',
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<{ resolvedPath: string; content: string; isBinary: boolean; isTooLarge: boolean } | null> => {
-      const { resolveAndReadFile, resolveFilePath } = await import('./lib/file-preview-service')
-      const options = normalizeFileAccessOptions(access)
-      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
-      if (!resolved) {
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
+      const { resolveFilePath } = await import('./lib/file-preview-service')
+      const options = accessSnapshot.options
+      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options, accessSnapshot))
+      if (!resolved || !isPathAllowed(resolved, options, accessSnapshot)) {
         return null
       }
-      const result = resolveAndReadFile(resolved)
-      return result
+      try {
+        const rawContent = readStableFile(resolved, 5 * 1024 * 1024)
+        const content = decodeStablePreviewText(rawContent)
+        return content === null
+          ? { resolvedPath: resolved, content: '', isBinary: true, isTooLarge: false }
+          : { resolvedPath: resolved, content, isBinary: false, isTooLarge: false }
+      } catch (error) {
+        if (error instanceof Error && error.message === '文件过大') {
+          return { resolvedPath: resolved, content: '', isBinary: false, isTooLarge: true }
+        }
+        throw error
+      }
     }
   )
 
@@ -4015,16 +4322,16 @@ export function registerIpcHandlers(): void {
     'file:write-text',
     async (_, filePath: string, content: string, access?: FileAccessOptions | string[]): Promise<boolean> => {
       if (typeof content !== 'string') return false
-      const { writeFileSync } = await import('node:fs')
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       const { resolveFilePath } = await import('./lib/file-preview-service')
-      const options = normalizeFileAccessOptions(access)
-      const allowedBasePaths = getAllowedCandidateBasePaths(options)
+      const options = accessSnapshot.options
+      const allowedBasePaths = getAllowedCandidateBasePaths(options, accessSnapshot)
       const resolved = resolveFilePath(filePath, allowedBasePaths)
-      if (!resolved || !isPathAllowed(resolved, options)) {
+      if (!resolved || !isPathAllowed(resolved, options, accessSnapshot)) {
         console.warn('[IPC] file:write-text 拒绝越界路径:', resolved ?? filePath)
         return false
       }
-      writeFileSync(resolved, content, 'utf-8')
+      writeStableTextFile(resolved, content)
       return true
     }
   )
@@ -4033,10 +4340,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     'file:resolve-path',
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<ResolvedFileUrl | null> => {
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       const { resolveFilePath } = await import('./lib/file-preview-service')
-      const options = normalizeFileAccessOptions(access)
-      const result = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
-      if (!result) return null
+      const options = accessSnapshot.options
+      const result = resolveFilePath(filePath, getPreviewCandidateBasePaths(options, accessSnapshot))
+      if (!result || !isPathAllowed(result, options, accessSnapshot)) return null
       // registerPromaFilePath 对目录路径会抛「不是文件」。渲染端（如悬浮预览解析 markdown
       // 链接）可能传入目录路径，此处优雅降级为 null，而不是让异常冒泡成未捕获的 handler 错误。
       try {
@@ -4053,10 +4361,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     'file:resolve-html-preview-path',
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<ResolvedFileUrl | null> => {
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       const { resolveFilePath } = await import('./lib/file-preview-service')
-      const options = normalizeFileAccessOptions(access)
-      const result = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
-      if (!result) return null
+      const options = accessSnapshot.options
+      const result = resolveFilePath(filePath, getPreviewCandidateBasePaths(options, accessSnapshot))
+      if (!result || !isPathAllowed(result, options, accessSnapshot)) return null
       try {
         const directoryUrl = registerPromaDirectoryPath(dirname(result))
         return { url: `${directoryUrl}/${encodeURIComponent(basename(result))}` }
@@ -4071,10 +4380,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     'file:prepare-pdf-preview',
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<{ tmpHtmlUrl: string } | null> => {
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       const { preparePdfPreview, resolveFilePath } = await import('./lib/file-preview-service')
-      const options = normalizeFileAccessOptions(access)
-      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
-      if (!resolved) {
+      const options = accessSnapshot.options
+      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options, accessSnapshot))
+      if (!resolved || !isPathAllowed(resolved, options, accessSnapshot)) {
         return null
       }
       const result = await preparePdfPreview(resolved)
@@ -4086,10 +4396,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     'file:docx-to-html',
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<{ resolvedPath: string; html: string } | null> => {
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       const { convertDocxToHtml, resolveFilePath } = await import('./lib/file-preview-service')
-      const options = normalizeFileAccessOptions(access)
-      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
-      if (!resolved) {
+      const options = accessSnapshot.options
+      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options, accessSnapshot))
+      if (!resolved || !isPathAllowed(resolved, options, accessSnapshot)) {
         return null
       }
       const result = await convertDocxToHtml(resolved)
@@ -4101,10 +4412,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     'file:office-to-html',
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<import('@proma/shared').OfficePreviewResult | null> => {
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       const { convertOfficeToHtml, resolveFilePath } = await import('./lib/file-preview-service')
-      const options = normalizeFileAccessOptions(access)
-      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
-      if (!resolved) {
+      const options = accessSnapshot.options
+      const resolved = resolveFilePath(filePath, getPreviewCandidateBasePaths(options, accessSnapshot))
+      if (!resolved || !isPathAllowed(resolved, options, accessSnapshot)) {
         return null
       }
       return convertOfficeToHtml(resolved)
@@ -4115,22 +4427,25 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     'file:read-binary-base64',
     async (_, filePath: string, access?: FileAccessOptions | string[], maxSize?: number): Promise<string | null> => {
-      const { readFileSync, statSync } = await import('node:fs')
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       const { resolveFilePath } = await import('./lib/file-preview-service')
-      const options = normalizeFileAccessOptions(access)
+      const options = accessSnapshot.options
       // 该接口会把原始文件内容送回 renderer，只允许读取已授权路径；不能接受
       // 预览场景使用的 unrestricted 标志，避免 renderer 借此读取任意本地文件。
       const restrictedOptions = options?.unrestricted ? { ...options, unrestricted: false } : options
-      const allowedBasePaths = getAllowedCandidateBasePaths(restrictedOptions)
+      const allowedBasePaths = getAllowedCandidateBasePaths(restrictedOptions, accessSnapshot)
       const resolved = resolveFilePath(filePath, allowedBasePaths)
-      if (!resolved || !isPathAllowed(resolved, restrictedOptions)) return null
+      if (!resolved || !isPathAllowed(resolved, restrictedOptions, accessSnapshot)) return null
       const requestedMaxSize = typeof maxSize === 'number' && Number.isFinite(maxSize) && maxSize > 0
         ? maxSize
         : MAX_ATTACHMENT_SIZE
       const effectiveMaxSize = Math.min(requestedMaxSize, MAX_ATTACHMENT_SIZE)
-      const st = statSync(resolved)
-      if (st.size > effectiveMaxSize) return null
-      return readFileSync(resolved).toString('base64')
+      try {
+        return readStableFile(resolved, effectiveMaxSize).toString('base64')
+      } catch (error) {
+        if (error instanceof Error && error.message === '文件过大') return null
+        throw error
+      }
     }
   )
 
@@ -4138,21 +4453,19 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.RENAME_FILE,
     async (_, filePath: string, newName: string, access?: FileAccessOptions): Promise<void> => {
-      requireVisibleFileAccess(access, [filePath])
-      const { renameSync } = await import('node:fs')
-      const { resolve, dirname, join, sep } = await import('node:path')
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
 
       if (newName.includes('/') || newName.includes('\\') || newName.includes('..') || newName.includes(sep)) {
         throw new Error('文件名不能包含路径分隔符或 ".."')
       }
 
       const safePath = resolve(filePath)
-      if (!isPathAllowed(safePath, normalizeFileAccessOptions(access))) {
+      if (!isPathAllowed(safePath, accessSnapshot.options, accessSnapshot)) {
         throw new Error('访问路径超出当前会话的授权范围')
       }
 
       const newPath = join(dirname(safePath), newName)
-      renameSync(safePath, newPath)
+      renameStablePath(safePath, newPath)
       console.log(`[Agent 文件] 已重命名: ${safePath} → ${newPath}`)
     }
   )
@@ -4161,17 +4474,16 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.MOVE_FILE,
     async (_, filePath: string, targetDir: string, access?: FileAccessOptions): Promise<void> => {
-      requireVisibleFileAccess(access, [filePath, targetDir])
-      const { resolve } = await import('node:path')
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath, targetDir])
 
       const safePath = resolve(filePath)
       const safeTarget = resolve(targetDir)
-      const options = normalizeFileAccessOptions(access)
-      if (!isPathAllowed(safePath, options) || !isPathAllowed(safeTarget, options)) {
+      const options = accessSnapshot.options
+      if (!isPathAllowed(safePath, options, accessSnapshot) || !isPathAllowed(safeTarget, options, accessSnapshot)) {
         throw new Error('访问路径超出当前会话的授权范围')
       }
 
-      const newPath = movePathSafely(safePath, safeTarget)
+      const newPath = moveStablePath(safePath, safeTarget)
       console.log(`[Agent 文件] 已移动: ${safePath} → ${newPath}`)
     }
   )
@@ -4180,10 +4492,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.LIST_ATTACHED_DIRECTORY,
     async (_, dirPath: string, access?: FileAccessOptions | string[]): Promise<FileEntry[]> => {
-      requireVisibleFileAccess(access, [dirPath])
+      const accessSnapshot = requireVisibleFileAccess(access, [dirPath])
       const safePath = resolve(dirPath)
-      const options = normalizeFileAccessOptions(access)
-      if (!isPathAllowed(safePath, options)) {
+      const options = accessSnapshot.options
+      if (!isPathAllowed(safePath, options, accessSnapshot)) {
         // 已解绑或被删除的附加目录不应让文件面板持续报错。
         if (!existsSync(safePath)) return []
         throw new Error('访问路径不在允许范围内')
@@ -4197,66 +4509,28 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.READ_ATTACHED_FILE,
     async (_, filePath: string, sessionId?: string, workspaceSlug?: string): Promise<string> => {
-      const access = sessionId !== undefined ? { sessionId } : undefined
-      requireVisibleFileAccess(access, [filePath])
+      const access: FileAccessOptions = { workspaceSlug }
+      if (sessionId !== undefined) access.sessionId = sessionId
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       if (!filePath || typeof filePath !== 'string') {
         throw new Error('无效的文件路径')
       }
 
-      const { resolve, sep } = await import('node:path')
-      const { readFile, stat, realpath } = await import('node:fs/promises')
+      const { realpath } = await import('node:fs/promises')
 
       // 使用 realpath 解析符号链接，防止 symlink 绕过路径检查
       const safePath = await realpath(resolve(filePath)).catch(() => {
         throw new Error(`文件不存在: ${filePath}`)
       })
-      requireVisibleFileAccess(access, [safePath])
-
-      // 收集所有允许的路径：会话/工作区附加目录、附加文件 + 工作区文件目录
-      const allowedDirs: string[] = []
-      const allowedFiles: string[] = []
-
-      if (sessionId) {
-        const meta = getAgentSessionMeta(sessionId)
-        if (meta?.attachedDirectories) {
-          allowedDirs.push(...meta.attachedDirectories)
-        }
-        if (meta?.attachedFiles) {
-          allowedFiles.push(...meta.attachedFiles)
-        }
-      }
-      if (workspaceSlug) {
-        allowedDirs.push(...getWorkspaceAttachedDirectories(workspaceSlug))
-        allowedFiles.push(...getWorkspaceAttachedFiles(workspaceSlug))
-        allowedDirs.push(getProjectFilesPath(workspaceSlug))
-      }
-
-      // 还允许访问 agent-workspaces 根目录下的文件（session 文件等）
-      allowedDirs.push(getAgentWorkspacesDir())
-
-      const resolvedAllowedDirs = await Promise.all(
-        allowedDirs.map((dir) => realpath(resolve(dir)).catch(() => resolve(dir)))
-      )
-      const resolvedAllowedFiles = await Promise.all(
-        allowedFiles.map((file) => realpath(resolve(file)).catch(() => resolve(file)))
-      )
-      const isAllowed = resolvedAllowedDirs.some((dir) => safePath.startsWith(dir + sep) || safePath === dir)
-        || resolvedAllowedFiles.some((file) => safePath === file)
-      if (!isAllowed) {
-        throw new Error('访问路径不在允许范围内')
-      }
+      if (!isPathAllowed(safePath, accessSnapshot.options, accessSnapshot)) throw new Error('访问路径不在允许范围内')
 
       const MAX_FILE_SIZE = 20 * 1024 * 1024 // 20 MB
-      const fileStat = await stat(safePath).catch(() => null)
-      if (!fileStat) {
-        throw new Error(`文件不存在: ${filePath}`)
+      try {
+        return readStableFile(safePath, MAX_FILE_SIZE).toString('base64')
+      } catch (error) {
+        if (error instanceof Error && error.message === '文件过大') throw new Error('文件过大，最大支持 20MB')
+        throw error
       }
-      if (fileStat.size > MAX_FILE_SIZE) {
-        throw new Error(`文件过大（${Math.round(fileStat.size / 1024 / 1024)}MB），最大支持 20MB`)
-      }
-
-      const buffer = await readFile(safePath)
-      return buffer.toString('base64')
     }
   )
 
@@ -4264,11 +4538,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.SHOW_ATTACHED_IN_FOLDER,
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<void> => {
-      requireVisibleFileAccess(access, [filePath])
-      const { resolve } = await import('node:path')
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       const safePath = resolve(filePath)
-      const options = normalizeFileAccessOptions(access)
-      if (!isPathAllowed(safePath, options)) {
+      const options = accessSnapshot.options
+      if (!isPathAllowed(safePath, options, accessSnapshot)) {
         console.warn('[IPC] show-attached-in-folder 拒绝越界路径:', safePath)
         return
       }
@@ -4280,20 +4553,19 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.RENAME_ATTACHED_FILE,
     async (_, filePath: string, newName: string, access?: FileAccessOptions | string[]): Promise<void> => {
-      requireVisibleFileAccess(access, [filePath])
-      const { renameSync } = await import('node:fs')
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath])
       const { resolve, dirname, join, sep } = await import('node:path')
 
       if (newName.includes('/') || newName.includes('\\') || newName.includes('..') || newName.includes(sep)) {
         throw new Error('文件名不能包含路径分隔符或 ".."')
       }
       const safePath = resolve(filePath)
-      const options = normalizeFileAccessOptions(access)
-      if (!isPathAllowed(safePath, options)) {
+      const options = accessSnapshot.options
+      if (!isPathAllowed(safePath, options, accessSnapshot)) {
         throw new Error('访问路径不在允许范围内')
       }
       const newPath = join(dirname(safePath), newName)
-      renameSync(safePath, newPath)
+      renameStablePath(safePath, newPath)
       console.log(`[附加目录] 已重命名: ${safePath} → ${newPath}`)
     }
   )
@@ -4302,16 +4574,15 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.MOVE_ATTACHED_FILE,
     async (_, filePath: string, targetDir: string, access?: FileAccessOptions | string[]): Promise<void> => {
-      requireVisibleFileAccess(access, [filePath, targetDir])
-      const { resolve } = await import('node:path')
+      const accessSnapshot = requireVisibleFileAccess(access, [filePath, targetDir])
 
       const safePath = resolve(filePath)
       const safeTarget = resolve(targetDir)
-      const options = normalizeFileAccessOptions(access)
-      if (!isPathAllowed(safePath, options) || !isPathAllowed(safeTarget, options)) {
+      const options = accessSnapshot.options
+      if (!isPathAllowed(safePath, options, accessSnapshot) || !isPathAllowed(safeTarget, options, accessSnapshot)) {
         throw new Error('访问路径不在允许范围内')
       }
-      const newPath = movePathSafely(safePath, safeTarget)
+      const newPath = moveStablePath(safePath, safeTarget)
       console.log(`[附加目录] 已移动: ${safePath} → ${newPath}`)
     }
   )

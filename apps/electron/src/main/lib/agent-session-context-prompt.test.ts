@@ -5,9 +5,14 @@ import type { AgentSessionMeta } from '@proma/shared'
 const sessions = new Map<string, AgentSessionMeta>()
 /** 记录消息读取次数，证明可见性判断发生在内容读取之前。 */
 let messageReadCount = 0
+/** 注入会话索引读取故障，验证存储异常不能伪装成“不存在”。 */
+let sessionStorageError: Error | undefined
 
 mock.module('./agent-session-manager', () => ({
-  getAgentSessionMeta: (sessionId: string) => sessions.get(sessionId),
+  getAgentSessionMeta: (sessionId: string) => {
+    if (sessionStorageError) throw sessionStorageError
+    return sessions.get(sessionId)
+  },
   getAgentSessionSDKMessages: () => {
     messageReadCount += 1
     return []
@@ -36,6 +41,7 @@ const configRootResolver = { requireActiveRoot: () => '/tmp/proma-context-prompt
 describe('被引用 Agent 会话的主进程可见性复核', () => {
   test('Given 普通会话引用 When 构建 prompt Then 保留引用信息', () => {
     sessions.clear()
+    sessionStorageError = undefined
     sessions.set('visible', session({ id: 'visible', title: '普通会话' }))
 
     const prompt = contextPrompt.buildReferencedSessionsPrompt('current', ['visible'], undefined, configRootResolver)
@@ -50,6 +56,7 @@ describe('被引用 Agent 会话的主进程可见性复核', () => {
     ['Design', session({ id: 'design', sourceDesignProjectId: 'project-1', sourceDesignJobId: 'job-1' })],
   ])('Given Renderer 伪造 %s 会话引用 When 构建 prompt Then 不泄露标题或历史路径', (_label, internalSession) => {
     sessions.clear()
+    sessionStorageError = undefined
     sessions.set(internalSession.id, internalSession)
     messageReadCount = 0
 
@@ -59,5 +66,19 @@ describe('被引用 Agent 会话的主进程可见性复核', () => {
     expect(prompt).not.toContain(internalSession.title)
     expect(prompt).not.toContain(`${internalSession.id}.jsonl`)
     expect(messageReadCount).toBe(0)
+  })
+
+  test('Given 会话索引读取故障 When 构建引用 prompt Then 向上抛出而非静默丢失引用', () => {
+    sessions.clear()
+    sessionStorageError = new Error('会话索引读取失败')
+
+    expect(() => contextPrompt.buildReferencedSessionsPrompt(
+      'current',
+      ['visible'],
+      undefined,
+      configRootResolver,
+    )).toThrow('会话索引读取失败')
+
+    sessionStorageError = undefined
   })
 })

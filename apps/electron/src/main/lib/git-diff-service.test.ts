@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { getUnstagedChanges, invalidateGitDiffCache, listWorktreesStrict } from './git-diff-service'
+import { getUnstagedChanges, invalidateGitDiffCache, listWorktreesStrict, readWorkingTreeFileStable } from './git-diff-service'
 
 let repoPath = ''
 
@@ -32,6 +32,15 @@ afterEach(() => {
 })
 
 describe('git diff scan cache', () => {
+  test('Given Git 工作树文件授权后叶子被替换 When 稳定读取 Then 不读取替换内容', () => {
+    const target = join(repoPath, 'tracked.txt')
+    const replacement = join(repoPath, 'replacement.txt')
+    writeFileSync(replacement, 'outside-secret')
+
+    expect(() => readWorkingTreeFileStable(target, 1024, () => renameSync(replacement, target))).toThrow('文件身份已变化')
+    expect(readFileSync(target, 'utf8')).toBe('outside-secret')
+  })
+
   test('deduplicates concurrent scans and returns the cached snapshot until invalidated', async () => {
     const trackedPath = join(repoPath, 'tracked.txt')
     writeFileSync(trackedPath, 'base\nfirst\n')

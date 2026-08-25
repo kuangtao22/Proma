@@ -7,7 +7,7 @@
 
 import { spawn } from 'child_process'
 import { createHash } from 'node:crypto'
-import { constants, existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path'
 import type { ChangedFileEntry, UnstagedChangesResult, UntrackedFileEntry } from '@proma/shared'
@@ -434,6 +434,39 @@ function isPathInsideRoot(root: string, target: string): boolean {
   return target.startsWith(rootWithSep)
 }
 
+/** 绑定工作树文件与父目录身份后，通过 no-follow fd 读取同一普通文件。 */
+export function readWorkingTreeFileStable(
+  filePath: string,
+  maxSize: number,
+  afterAuthorized?: () => void,
+): Buffer {
+  const pathStat = lstatSync(filePath)
+  const parentPath = dirname(filePath)
+  const parentStat = lstatSync(parentPath)
+  if (!pathStat.isFile() || pathStat.isSymbolicLink() || !parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    throw new Error('文件身份已变化')
+  }
+  afterAuthorized?.()
+  let descriptor: number | null = null
+  try {
+    descriptor = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    const openedStat = fstatSync(descriptor)
+    const currentParent = lstatSync(parentPath)
+    if (
+      !openedStat.isFile()
+      || openedStat.dev !== pathStat.dev
+      || openedStat.ino !== pathStat.ino
+      || !currentParent.isDirectory()
+      || currentParent.dev !== parentStat.dev
+      || currentParent.ino !== parentStat.ino
+    ) throw new Error('文件身份已变化')
+    if (openedStat.size > maxSize) throw new Error('文件过大')
+    return readFileSync(descriptor)
+  } finally {
+    if (descriptor !== null) closeSync(descriptor)
+  }
+}
+
 /**
  * 统计未追踪文本文件的新增行数。
  *
@@ -852,12 +885,7 @@ export async function getDiffContents(dirPath: string, filePath: string, gitRoot
     let newContent = ''
     if (existsSync(fullPath)) {
       try {
-        const st = statSync(fullPath)
-        if (st.size > MAX_FILE_SIZE_BYTES) {
-          console.warn('[git-diff-service] 文件超过大小上限，跳过读取:', fullPath, st.size)
-        } else {
-          newContent = readFileSync(fullPath, 'utf-8')
-        }
+        newContent = readWorkingTreeFileStable(fullPath, MAX_FILE_SIZE_BYTES).toString('utf8')
       } catch {
         // 读取失败保持空字符串
       }
@@ -888,12 +916,7 @@ export async function getDiffContents(dirPath: string, filePath: string, gitRoot
   const fullPath = join(root, safePath)
   if (existsSync(fullPath)) {
     try {
-      const st = statSync(fullPath)
-      if (st.size > MAX_FILE_SIZE_BYTES) {
-        console.warn('[git-diff-service] 文件超过大小上限，跳过读取:', fullPath, st.size)
-      } else {
-        newContent = readFileSync(fullPath, 'utf-8')
-      }
+      newContent = readWorkingTreeFileStable(fullPath, MAX_FILE_SIZE_BYTES).toString('utf8')
     } catch {
       // 读取失败保持空字符串
     }
@@ -918,12 +941,7 @@ export async function getUntrackedContent(dirPath: string, filePath: string, git
   }
   const fullPath = resolve(root, safePath)
   try {
-    const st = statSync(fullPath)
-    if (st.size > MAX_FILE_SIZE_BYTES) {
-      console.warn('[git-diff-service] 未追踪文件超过大小上限:', fullPath, st.size)
-      return ''
-    }
-    return normalizeLineEndings(readFileSync(fullPath, 'utf-8'))
+    return normalizeLineEndings(readWorkingTreeFileStable(fullPath, MAX_FILE_SIZE_BYTES).toString('utf8'))
   } catch {
     return ''
   }
