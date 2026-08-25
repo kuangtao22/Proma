@@ -322,11 +322,18 @@ function parseUniqueStableIds(value: unknown, message: string): string[] {
   return ids
 }
 
-/** 在 reducer 前严格校验原始 mutation 字段、实体和批内重复 ID。 */
-function validateCanvasMutations(mutations: CanvasMutation[]): void {
+/** 在 reducer 前按顺序校验原始 mutation 字段、图引用和批内重复 ID。 */
+function validateCanvasMutations(current: CanvasDocument, mutations: CanvasMutation[]): void {
   /** 跨 mutation 追踪 upsert ID，阻止同批次先后覆盖隐藏重复输入。 */
   const upsertedNodeIds = new Set<string>()
   const upsertedEdgeIds = new Set<string>()
+  /** 当前步骤可引用的节点 ID，随 upsert/remove 顺序演进。 */
+  const currentNodeIds = new Set(current.nodes.map((node) => node.id))
+  /** 当前步骤的边端点，用于 remove-node 模拟 reducer 的级联删除。 */
+  const currentEdges = new Map(current.edges.map((edge) => [edge.id, {
+    sourceNodeId: edge.sourceNodeId,
+    targetNodeId: edge.targetNodeId,
+  }]))
   for (const mutation of mutations as unknown[]) {
     if (!isRecord(mutation) || typeof mutation.type !== 'string') {
       throw new Error('CANVAS_MUTATION_INVALID')
@@ -343,7 +350,8 @@ function validateCanvasMutations(mutations: CanvasMutation[]): void {
         if (!isRecord(position)
           || !hasExactKeys(position, ['nodeId', 'position'])
           || !isSafeDesignStableId(position.nodeId)
-          || positionIds.has(position.nodeId)) {
+          || positionIds.has(position.nodeId)
+          || !currentNodeIds.has(position.nodeId)) {
           throw new Error('CANVAS_MUTATION_INVALID')
         }
         parsePoint(position.position, 'CANVAS_MUTATION_INVALID')
@@ -358,25 +366,46 @@ function validateCanvasMutations(mutations: CanvasMutation[]): void {
         const node = parseCanvasNode(value, 'CANVAS_MUTATION_INVALID')
         if (upsertedNodeIds.has(node.id)) throw new Error('CANVAS_MUTATION_INVALID')
         upsertedNodeIds.add(node.id)
+        currentNodeIds.add(node.id)
       }
       continue
     }
     if (mutation.type === 'remove-nodes' && hasExactKeys(mutation, ['type', 'nodeIds'])) {
-      parseUniqueStableIds(mutation.nodeIds, 'CANVAS_MUTATION_INVALID')
+      /** 未知节点保持 reducer 的 no-op 语义，已存在节点同步移除相连边。 */
+      const removedNodeIds = new Set(parseUniqueStableIds(
+        mutation.nodeIds,
+        'CANVAS_MUTATION_INVALID',
+      ))
+      for (const nodeId of removedNodeIds) currentNodeIds.delete(nodeId)
+      for (const [edgeId, edge] of currentEdges) {
+        if (removedNodeIds.has(edge.sourceNodeId) || removedNodeIds.has(edge.targetNodeId)) {
+          currentEdges.delete(edgeId)
+        }
+      }
       continue
     }
     if (mutation.type === 'upsert-edges' && hasExactKeys(mutation, ['type', 'edges'])
       && Array.isArray(mutation.edges)) {
       for (const value of mutation.edges) {
-        /** 边的端口和节点 ID 在 reducer 前校验，引用存在性由结果文档统一校验。 */
+        /** 边的字段和当前步骤引用在 reducer 前校验，避免后续 mutation 掩盖非法输入。 */
         const edge = parseCanvasEdge(value, 'CANVAS_MUTATION_INVALID')
-        if (upsertedEdgeIds.has(edge.id)) throw new Error('CANVAS_MUTATION_INVALID')
+        if (upsertedEdgeIds.has(edge.id)
+          || !currentNodeIds.has(edge.sourceNodeId)
+          || !currentNodeIds.has(edge.targetNodeId)) {
+          throw new Error('CANVAS_MUTATION_INVALID')
+        }
         upsertedEdgeIds.add(edge.id)
+        currentEdges.set(edge.id, {
+          sourceNodeId: edge.sourceNodeId,
+          targetNodeId: edge.targetNodeId,
+        })
       }
       continue
     }
     if (mutation.type === 'remove-edges' && hasExactKeys(mutation, ['type', 'edgeIds'])) {
-      parseUniqueStableIds(mutation.edgeIds, 'CANVAS_MUTATION_INVALID')
+      /** 删除未知边继续保持 no-op；存在边只更新顺序状态。 */
+      const removedEdgeIds = parseUniqueStableIds(mutation.edgeIds, 'CANVAS_MUTATION_INVALID')
+      for (const edgeId of removedEdgeIds) currentEdges.delete(edgeId)
       continue
     }
     throw new Error('CANVAS_MUTATION_INVALID')
@@ -740,7 +769,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
       )
     }
     if (mutations.length === 0) return current
-    validateCanvasMutations(mutations)
+    validateCanvasMutations(current, mutations)
     /** reducer 只执行一次，结果随后只走一次完整文档 schema 链。 */
     const mutated = applyCanvasMutations(current, mutations)
     /** updatedAt 独立生成，时间边界错误不得伪装为 mutation schema 错误。 */

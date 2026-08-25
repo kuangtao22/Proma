@@ -596,6 +596,62 @@ describe('CanvasDocumentStore', () => {
     expect(existsSync(fixture.documentPath)).toBe(false)
   })
 
+  test('Given move-nodes 指向当前不存在节点 When mutate Then reducer 和完整校验前拒绝', () => {
+    /** 结果 validator 与写边界都不得触达。 */
+    let validationCalls = 0
+    let writeCalls = 0
+    const fixture = createFixture({
+      validateDocument: (value, target) => {
+        validationCalls += 1
+        return parseCanvasDocument(value, target)
+      },
+      writeJsonFileAtomicSecure: () => { writeCalls += 1 },
+    })
+
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      0,
+      [{ type: 'move-nodes', positions: [{
+        nodeId: 'missing-node',
+        position: { x: 10, y: 20 },
+      }] }],
+    )).toThrow('CANVAS_MUTATION_INVALID')
+    expect(validationCalls).toBe(0)
+    expect(writeCalls).toBe(0)
+    expect(existsSync(fixture.documentPath)).toBe(false)
+  })
+
+  test('Given 悬空边先 upsert 后同批 remove When mutate Then 后续删除不能掩盖非法引用', () => {
+    /** 最终 reducer 结果会为空，因此必须在逐步 mutation 校验时失败。 */
+    let validationCalls = 0
+    let writeCalls = 0
+    const fixture = createFixture({
+      validateDocument: (value, target) => {
+        validationCalls += 1
+        return parseCanvasDocument(value, target)
+      },
+      writeJsonFileAtomicSecure: () => { writeCalls += 1 },
+    })
+
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      0,
+      [
+        { type: 'upsert-edges', edges: [{
+          id: 'edge-dangling-hidden',
+          sourceNodeId: 'missing-source',
+          sourcePort: 'output',
+          targetNodeId: 'missing-target',
+          targetPort: 'input',
+        }] },
+        { type: 'remove-edges', edgeIds: ['edge-dangling-hidden'] },
+      ],
+    )).toThrow('CANVAS_MUTATION_INVALID')
+    expect(validationCalls).toBe(0)
+    expect(writeCalls).toBe(0)
+    expect(existsSync(fixture.documentPath)).toBe(false)
+  })
+
   test('Given 节点相连边和空 mutation When mutate Then 删除级联且空批次不推进不写入', () => {
     const fixture = createFixture()
     writeDocument(fixture.documentPath, createConnectedDocument(2))
