@@ -10,7 +10,8 @@
 import type { AgentStreamPayload } from '@proma/shared'
 import { getMainWindow } from './main-window-store'
 import { AGENT_IPC_CHANNELS } from '@proma/shared'
-import { createAgentSession, listAgentSessions, getAgentSessionMeta } from './agent-session-manager'
+import { createAgentSession, listVisibleAgentSessions, getAgentSessionMeta } from './agent-session-manager'
+import { isAgentSessionUserVisible } from './agent-session-visibility'
 import {
   listAgentWorkspacesByUpdatedAt,
   getAgentWorkspace,
@@ -240,7 +241,7 @@ export class BridgeCommandHandler {
 
   private isBindingValid(binding: BridgeChatBinding): boolean {
     const session = getAgentSessionMeta(binding.sessionId)
-    if (!session) return false
+    if (!session || !isAgentSessionUserVisible(session)) return false
 
     const sessionWorkspaceId = session.workspaceId ?? ''
     if (sessionWorkspaceId !== binding.workspaceId) return false
@@ -381,9 +382,9 @@ export class BridgeCommandHandler {
   }
 
   private async handleListCommand(chatId: string, contextData?: unknown): Promise<void> {
-    const sessions = listAgentSessions()
+    const sessions = listVisibleAgentSessions()
     const workspaces = listAgentWorkspacesByUpdatedAt()
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
 
     if (sessions.length === 0) {
       await this.send(chatId, '暂无会话。发送消息将自动创建，或使用 /new 创建。', contextData)
@@ -432,7 +433,7 @@ export class BridgeCommandHandler {
   }
 
   private async handleStopCommand(chatId: string, contextData?: unknown): Promise<void> {
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     if (!binding) {
       await this.send(chatId, '当前没有绑定的会话。', contextData)
       return
@@ -442,7 +443,7 @@ export class BridgeCommandHandler {
   }
 
   private async handleSwitchCommand(chatId: string, arg: string, contextData?: unknown): Promise<void> {
-    const sessions = listAgentSessions()
+    const sessions = listVisibleAgentSessions()
     const settings = getSettings()
 
     // 支持序号和 ID 前缀两种匹配
@@ -455,6 +456,11 @@ export class BridgeCommandHandler {
       await this.send(chatId, `未找到会话。使用 /list 查看可用会话。`, contextData)
       return
     }
+    const authoritativeMatch = getAgentSessionMeta(match.id)
+    if (!authoritativeMatch || !isAgentSessionUserVisible(authoritativeMatch)) {
+      await this.send(chatId, `未找到会话。使用 /list 查看可用会话。`, contextData)
+      return
+    }
 
     // 清理旧绑定
     const oldBinding = this.chatBindings.get(chatId)
@@ -464,21 +470,21 @@ export class BridgeCommandHandler {
 
     const binding: BridgeChatBinding = {
       chatId,
-      sessionId: match.id,
-      workspaceId: match.workspaceId ?? this.config.getDefaultWorkspaceId?.() ?? settings.agentWorkspaceId ?? '',
-      channelId: match.channelId ?? settings.agentChannelId ?? '',
+      sessionId: authoritativeMatch.id,
+      workspaceId: authoritativeMatch.workspaceId ?? this.config.getDefaultWorkspaceId?.() ?? settings.agentWorkspaceId ?? '',
+      channelId: authoritativeMatch.channelId ?? settings.agentChannelId ?? '',
       modelId: settings.agentModelId ?? undefined,
     }
     this.chatBindings.set(chatId, binding)
-    this.sessionToChat.set(match.id, chatId)
+    this.sessionToChat.set(authoritativeMatch.id, chatId)
     this.saveBindings()
 
-    await this.send(chatId, `✅ 已切换到会话: ${match.title} (${match.id.slice(0, 8)})`, contextData)
+    await this.send(chatId, `✅ 已切换到会话: ${authoritativeMatch.title} (${authoritativeMatch.id.slice(0, 8)})`, contextData)
   }
 
   private async handleWorkspaceCommand(chatId: string, arg?: string, contextData?: unknown): Promise<void> {
     const workspaces = listAgentWorkspacesByUpdatedAt()
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     const currentWorkspaceId = binding?.workspaceId
 
     // 无参数 → 列出
@@ -523,7 +529,7 @@ export class BridgeCommandHandler {
     this.config.onWorkspaceSwitched?.(match.id)
 
     // 列出该工作区下最近会话
-    const sessions = listAgentSessions()
+    const sessions = listVisibleAgentSessions()
     const recentSessions = sessions
       .filter((s) => s.workspaceId === match.id)
       .slice(0, 5)
@@ -546,7 +552,7 @@ export class BridgeCommandHandler {
   }
 
   private async handleNowCommand(chatId: string, contextData?: unknown): Promise<void> {
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     const lines: string[] = ['📊 当前状态:']
 
     // 会话信息
@@ -648,7 +654,7 @@ export class BridgeCommandHandler {
 
     // /model — 列出渠道
     if (parts.length === 0) {
-      const binding = this.chatBindings.get(chatId)
+      const binding = this.getValidBinding(chatId)
       const lines = ['📡 可用渠道:']
       channels.forEach((c, i) => {
         const marker = binding?.channelId === c.id ? ' ← 当前' : ''
@@ -672,7 +678,7 @@ export class BridgeCommandHandler {
 
     // /model <渠道> — 列出该渠道模型
     if (parts.length === 1) {
-      const binding = this.chatBindings.get(chatId)
+      const binding = this.getValidBinding(chatId)
       const lines = [`🤖 ${channel.name} 的可用模型:`]
       models.forEach((m, i) => {
         const isCurrent = binding?.channelId === channel.id && binding?.modelId === m.id
@@ -697,7 +703,7 @@ export class BridgeCommandHandler {
     }
 
     // 切换需要一个 binding 承载；没有则自动创建
-    let binding = this.chatBindings.get(chatId)
+    let binding = this.getValidBinding(chatId)
     if (!binding) {
       binding = this.ensureBinding(chatId) ?? undefined
       if (!binding) {
@@ -828,6 +834,11 @@ export class BridgeCommandHandler {
   private handleSessionComplete(sessionId: string): void {
     const buffer = this.sessionBuffers.get(sessionId)
     if (!buffer) return
+    const binding = this.getValidBinding(buffer.chatId)
+    if (!binding || binding.sessionId !== sessionId) {
+      this.sessionBuffers.delete(sessionId)
+      return
+    }
 
     const duration = ((Date.now() - buffer.startedAt) / 1000).toFixed(1)
     const replyText = buffer.text.trim() || '✅ Agent 已完成（无文本输出）'

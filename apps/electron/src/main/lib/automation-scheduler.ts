@@ -19,6 +19,7 @@ import {
   AUTOMATION_MAX_CONSECUTIVE_FAILURES,
   AUTOMATION_IPC_CHANNELS,
   AUTOMATION_DEFAULT_SESSION_MODE,
+  type AgentSessionMeta,
   type Automation,
   type AutomationRun,
 } from '@proma/shared'
@@ -49,6 +50,19 @@ const RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000
  * 留出与 SDK 自动压缩阈值（约 77.5%）的安全余量，避免本次运行刚开始就被压缩。
  */
 const DAILY_CONTEXT_ROLLOVER_THRESHOLD = 0.7
+
+/**
+ * 验证上次会话是否仍完整归属于当前 Automation。
+ * Automation 会话本身不是普通外部入口，不能用用户可见性代替所有权判断。
+ */
+function isReusableAutomationSession(session: AgentSessionMeta | undefined, automationId: string): boolean {
+  if (!session || session.sourceAutomationId !== automationId) return false
+  return session.sourceDesignProjectId === undefined
+    && session.sourceDesignJobId === undefined
+    && session.sourceCanvasProjectId === undefined
+    && session.sourceCanvasId === undefined
+    && session.sourceCanvasNodeId === undefined
+}
 
 /**
  * 判断两个时间戳是否落在同一个本地自然日。
@@ -184,7 +198,8 @@ export async function runAutomation(automation: Automation, manual = false): Pro
     if (lastSessionMeta?.automationGraduated) {
       console.log(`[定时任务] ${automation.name} 上次会话已被用户接管，本次自动开新会话`)
     }
-    if (automation.lastSessionId && lastSessionMeta && !lastSessionMeta.automationGraduated) {
+    const ownsReusableSession = isReusableAutomationSession(lastSessionMeta, automation.id)
+    if (automation.lastSessionId && lastSessionMeta && !lastSessionMeta.automationGraduated && ownsReusableSession) {
       if (lastSessionMeta.workspaceId !== automation.workspaceId) {
         console.warn(`[定时任务] ${automation.name} 上次会话项目已变化，本次自动开新会话`)
       } else if (sessionMode === 'reuse') {

@@ -266,11 +266,24 @@ function createDelegationCompletion(): Pick<DelegationRecord, 'completion' | 're
   return { completion, resolveCompletion }
 }
 
+/** Canvas Agent 只承担画布内受控对话，本阶段禁止进入任何 Collaboration 工具。 */
+function assertCollaborationAllowed(ctx: CollaborationToolContext): AgentSessionMeta | undefined {
+  const parent = getAgentSessionMeta(ctx.sessionId)
+  if (
+    parent?.sourceCanvasProjectId !== undefined
+    || parent?.sourceCanvasId !== undefined
+    || parent?.sourceCanvasNodeId !== undefined
+  ) {
+    throw new Error('Canvas Agent 不允许使用协作工具')
+  }
+  return parent
+}
+
 function assertCanCreateDelegation(
   ctx: CollaborationToolContext,
   requestedCount = 1,
 ): AgentSessionMeta | undefined {
-  const parent = getAgentSessionMeta(ctx.sessionId)
+  const parent = assertCollaborationAllowed(ctx)
   const delegationDepth = parent?.delegationDepth ?? 0
 
   if (ctx.triggeredBy === 'delegation' || delegationDepth > 0) {
@@ -762,6 +775,7 @@ export function buildPiCollaborationTools(
       description: '列出当前父会话渠道下已启用、可用于协作子 Agent 的模型。需要给 delegate_agent/delegate_agents 指定 modelId 前应先调用此工具。',
       parameters: Type.Object({}),
       async execute() {
+        assertCollaborationAllowed(ctx)
         return piJsonResult(getAvailableAgentModels(ctx))
       },
     }),
@@ -777,6 +791,7 @@ export function buildPiCollaborationTools(
         modelId: Type.Optional(Type.String({ description: '可选目标模型 ID' })),
       }),
       async execute(toolCallId: string, params: unknown) {
+        assertCollaborationAllowed(ctx)
         const args = params as DelegateAgentArgs
         const result = piDelegateAgentCalls.getOrCreate(ctx.sessionId, toolCallId, () => {
           const parent = assertCanCreateDelegation(ctx)
@@ -804,6 +819,7 @@ export function buildPiCollaborationTools(
         items: Type.Array(delegateItemType, { description: '要创建的子会话列表，最多 50 个' }),
       }),
       async execute(toolCallId: string, params: unknown) {
+        assertCollaborationAllowed(ctx)
         const args = params as { sharedContext?: string; items: DelegateAgentArgs[] }
         const batch = piDelegateAgentsCalls.getOrCreate(ctx.sessionId, toolCallId, () => {
           const parent = assertCanCreateDelegation(ctx, args.items.length)
@@ -861,6 +877,7 @@ export function buildPiCollaborationTools(
         timeoutSeconds: Type.Optional(Type.Number({ description: '最长等待秒数，默认 3600；最大 7200' })),
       }),
       async execute(_toolCallId: string, params: unknown) {
+        assertCollaborationAllowed(ctx)
         const args = params as { delegationIds?: string[]; mode?: 'all' | 'any'; minCompleted?: number; timeoutSeconds?: number }
         const ids = args.delegationIds?.length
           ? args.delegationIds
@@ -901,6 +918,7 @@ export function buildPiCollaborationTools(
         includeCompleted: Type.Optional(Type.Boolean({ description: '是否包含已完成委派，默认 true' })),
       }),
       async execute(_toolCallId: string, params: unknown) {
+        assertCollaborationAllowed(ctx)
         const args = params as { includeCompleted?: boolean }
         const items = listKnownDelegations(ctx.sessionId)
         const delegationsResult = args.includeCompleted === false
@@ -921,6 +939,7 @@ export function buildPiCollaborationTools(
         delegationIds: Type.Array(Type.String(), { description: '要读取结果的委派 ID 列表' }),
       }),
       async execute(_toolCallId: string, params: unknown) {
+        assertCollaborationAllowed(ctx)
         const args = params as { delegationIds: string[] }
         return piJsonResult({
           delegations: args.delegationIds.map((delegationId) => getDelegationResult(ctx.sessionId, delegationId)),
@@ -935,6 +954,7 @@ export function buildPiCollaborationTools(
         delegationId: Type.String({ description: '要停止的委派 ID' }),
       }),
       async execute(_toolCallId: string, params: unknown) {
+        assertCollaborationAllowed(ctx)
         const args = params as { delegationId: string }
         return piJsonResult(stopDelegation(ctx.sessionId, args.delegationId))
       },
@@ -947,6 +967,7 @@ export function buildPiCollaborationTools(
         delegationIds: Type.Array(Type.String(), { description: '要停止的委派 ID 列表' }),
       }),
       async execute(_toolCallId: string, params: unknown) {
+        assertCollaborationAllowed(ctx)
         const args = params as { delegationIds: string[] }
         return piJsonResult({
           results: args.delegationIds.map((delegationId) => stopDelegation(ctx.sessionId, delegationId)),
@@ -964,6 +985,7 @@ export function buildPiCollaborationTools(
         permissionBehavior: Type.Optional(Type.Union([Type.Literal('allow'), Type.Literal('deny')])),
       }),
       async execute(_toolCallId: string, params: unknown) {
+        assertCollaborationAllowed(ctx)
         const args = params as { delegationId: string; blockedEventId: string; answers?: Record<string, string>; permissionBehavior?: 'allow' | 'deny' }
         const blocked = getBlockedEventById(args.blockedEventId)
         if (!blocked) throw new Error(`阻塞事件不存在: ${args.blockedEventId}`)
@@ -1014,6 +1036,7 @@ export function buildPiCollaborationTools(
         message: Type.String({ description: '追加给子 Agent 的后续指令' }),
       }),
       async execute(_toolCallId: string, params: unknown) {
+        assertCollaborationAllowed(ctx)
         const args = params as { delegationId: string; message: string }
         const record = getDelegationRecordForContinuation(ctx, args.delegationId)
         if (!record) throw new Error(`未找到当前会话下的委派: ${args.delegationId}`)

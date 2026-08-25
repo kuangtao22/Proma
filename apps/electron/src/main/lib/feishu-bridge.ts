@@ -33,7 +33,8 @@ import type {
 import { FEISHU_IPC_CHANNELS, AGENT_IPC_CHANNELS } from '@proma/shared'
 import { getDecryptedBotAppSecret } from './feishu-config'
 import { agentEventBus, runAgentHeadless, stopAgent } from './agent-service'
-import { createAgentSession, listAgentSessions, getAgentSessionMeta } from './agent-session-manager'
+import { createAgentSession, listVisibleAgentSessions, getAgentSessionMeta } from './agent-session-manager'
+import { isAgentSessionUserVisible } from './agent-session-visibility'
 import {
   listAgentWorkspacesByUpdatedAt,
   getAgentWorkspace,
@@ -41,7 +42,7 @@ import {
   getWorkspaceCapabilities,
 } from './agent-workspace-manager'
 import { getFeishuBotBindingsPath, getFeishuBotMetadataPath } from './config-paths'
-import { writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync } from 'node:fs'
 import { readJsonFileSafe, writeJsonFileAtomic } from './safe-file'
 import {
   inferImageMediaType as inferImageMediaTypeShared,
@@ -376,7 +377,7 @@ class FeishuBridge {
       for (const b of bindings) {
         // 验证对应会话仍然存在
         const session = getAgentSessionMeta(b.sessionId)
-        if (session) {
+        if (session && isAgentSessionUserVisible(session)) {
           if (b.source === 'session-mirror' && session.archived) {
             b.archived = true
             b.archivedAt ??= session.updatedAt
@@ -394,6 +395,7 @@ class FeishuBridge {
           }
         }
       }
+      if (this.chatBindings.size !== bindings.length) this.saveBindings()
       if (this.chatBindings.size > 0) {
         console.log(`[飞书 Bridge] 已恢复 ${this.chatBindings.size} 个聊天绑定`)
         this.updateStatus({ activeBindings: this.getActiveBindingCount() })
@@ -408,7 +410,7 @@ class FeishuBridge {
     try {
       const bindings = Array.from(this.chatBindings.values())
       const bindingsPath = getFeishuBotBindingsPath(this.botConfig.id)
-      writeFileSync(bindingsPath, JSON.stringify(bindings, null, 2), 'utf-8')
+      writeJsonFileAtomic(bindingsPath, bindings)
     } catch (error) {
       console.error('[飞书 Bridge] 保存绑定失败:', redactSensitiveLogValue(error))
     }
@@ -457,15 +459,31 @@ class FeishuBridge {
   }
 
   listBindings(): FeishuChatBinding[] {
-    return Array.from(this.chatBindings.values())
+    return Array.from(this.chatBindings.keys())
+      .map((chatId) => this.getValidBinding(chatId))
+      .filter((binding): binding is FeishuChatBinding => Boolean(binding))
   }
 
   private getActiveBindingCount(): number {
-    return Array.from(this.chatBindings.values()).filter((binding) => !binding.archived).length
+    return this.listBindings().filter((binding) => !binding.archived).length
+  }
+
+  /** 读取已验证为普通用户可见的飞书绑定，失效绑定会同步清理。 */
+  private getValidBinding(chatId: string): FeishuChatBinding | undefined {
+    const binding = this.chatBindings.get(chatId)
+    if (!binding) return undefined
+    const session = getAgentSessionMeta(binding.sessionId)
+    if (session && isAgentSessionUserVisible(session)) return binding
+
+    this.sessionToChat.delete(binding.sessionId)
+    this.sessionBuffers.delete(binding.sessionId)
+    this.chatBindings.delete(chatId)
+    this.saveBindings()
+    return undefined
   }
 
   private markBindingUsed(chatId: string): void {
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     if (!binding) return
 
     const wasArchived = !!binding.archived
@@ -485,8 +503,13 @@ class FeishuBridge {
 
   /** 更新绑定的工作区/会话（从设置页调用） */
   updateBinding(input: FeishuUpdateBindingInput): FeishuChatBinding | null {
-    const binding = this.chatBindings.get(input.chatId)
+    const binding = this.getValidBinding(input.chatId)
     if (!binding) return null
+
+    if (input.sessionId !== undefined) {
+      const targetSession = getAgentSessionMeta(input.sessionId)
+      if (!targetSession || !isAgentSessionUserVisible(targetSession)) return null
+    }
 
     if (input.workspaceId !== undefined) {
       binding.workspaceId = input.workspaceId
@@ -536,6 +559,10 @@ class FeishuBridge {
    */
   async ensureSessionMirror(session: AgentSessionMeta): Promise<void> {
     if (!this.client) return
+
+    const authoritativeSession = getAgentSessionMeta(session.id)
+    if (!authoritativeSession || !isAgentSessionUserVisible(authoritativeSession)) return
+    session = authoritativeSession
 
     const existing = this.findBindingBySessionId(session.id)
     if (existing) return
@@ -587,6 +614,9 @@ class FeishuBridge {
   /** Agent 运行前为桌面 Session 镜像打开流式卡片。 */
   async startSessionMirrorRun(session: AgentSessionMeta): Promise<void> {
     if (!this.client) return
+    const authoritativeSession = getAgentSessionMeta(session.id)
+    if (!authoritativeSession || !isAgentSessionUserVisible(authoritativeSession)) return
+    session = authoritativeSession
     await this.ensureSessionMirror(session)
 
     const binding = this.findBindingBySessionId(session.id)
@@ -752,7 +782,7 @@ class FeishuBridge {
       return
     }
 
-    const existingBinding = this.chatBindings.get(chatId)
+    const existingBinding = this.getValidBinding(chatId)
     const isSessionMirrorGroup = existingBinding?.source === 'session-mirror'
 
     if (chatType === 'group') {
@@ -1139,8 +1169,9 @@ class FeishuBridge {
 
   private findBindingBySessionId(sessionId: string): FeishuChatBinding | undefined {
     const chatId = this.sessionToChat.get(sessionId)
-    if (chatId) return this.chatBindings.get(chatId)
-    return Array.from(this.chatBindings.values()).find((binding) => binding.sessionId === sessionId)
+    if (chatId) return this.getValidBinding(chatId)
+    const binding = Array.from(this.chatBindings.values()).find((item) => item.sessionId === sessionId)
+    return binding ? this.getValidBinding(binding.chatId) : undefined
   }
 
   private resolveMirrorUserOpenId(): string | null {
@@ -1224,9 +1255,9 @@ class FeishuBridge {
 
   private async handleListCommand(msgCtx: FeishuMessageContext): Promise<void> {
     const { chatId } = msgCtx
-    const sessions = listAgentSessions()
+    const sessions = listVisibleAgentSessions()
     const workspaces = listAgentWorkspacesByUpdatedAt()
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     const currentWorkspaceId = binding?.workspaceId
 
     // 每个工作区最多展示最近 5 个会话
@@ -1271,7 +1302,7 @@ class FeishuBridge {
 
   private async handleStopCommand(msgCtx: FeishuMessageContext): Promise<void> {
     const { chatId } = msgCtx
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     if (!binding) {
       await this.sendMessage(chatId, '当前没有绑定的会话。')
       return
@@ -1284,7 +1315,7 @@ class FeishuBridge {
 
   private async handleSwitchCommand(msgCtx: FeishuMessageContext, arg: string): Promise<void> {
     const { chatId } = msgCtx
-    const sessions = listAgentSessions()
+    const sessions = listVisibleAgentSessions()
 
     // 支持序号（如 /switch 1）和 ID 前缀两种方式
     const index = Number(arg)
@@ -1293,6 +1324,11 @@ class FeishuBridge {
       : sessions.find((s) => s.id.startsWith(arg))
 
     if (!match) {
+      await this.sendMessage(chatId, `未找到会话。使用 /list 查看可用会话。`)
+      return
+    }
+    const authoritativeMatch = getAgentSessionMeta(match.id)
+    if (!authoritativeMatch || !isAgentSessionUserVisible(authoritativeMatch)) {
       await this.sendMessage(chatId, `未找到会话。使用 /list 查看可用会话。`)
       return
     }
@@ -1308,9 +1344,9 @@ class FeishuBridge {
       chatId,
       botId: this.botConfig.id,
       userId: msgCtx.senderOpenId,
-      sessionId: match.id,
-      workspaceId: match.workspaceId ?? this.botConfig.defaultWorkspaceId ?? appSettings.agentWorkspaceId ?? '',
-      channelId: match.channelId ?? appSettings.agentChannelId ?? '',
+      sessionId: authoritativeMatch.id,
+      workspaceId: authoritativeMatch.workspaceId ?? this.botConfig.defaultWorkspaceId ?? appSettings.agentWorkspaceId ?? '',
+      channelId: authoritativeMatch.channelId ?? appSettings.agentChannelId ?? '',
       modelId: this.botConfig.defaultModelId ?? appSettings.agentModelId ?? undefined,
       source: 'feishu',
       chatType: msgCtx.chatType,
@@ -1319,17 +1355,17 @@ class FeishuBridge {
       lastUsedAt: Date.now(),
     }
     this.chatBindings.set(chatId, binding)
-    this.sessionToChat.set(match.id, chatId)
+    this.sessionToChat.set(authoritativeMatch.id, chatId)
     this.updateStatus({ activeBindings: this.getActiveBindingCount() })
     this.saveBindings()
 
-    await this.sendMessage(chatId, `已切换到会话: ${match.title} (${match.id.slice(0, 8)})`)
+    await this.sendMessage(chatId, `已切换到会话: ${authoritativeMatch.title} (${authoritativeMatch.id.slice(0, 8)})`)
   }
 
   private async handleWorkspaceCommand(msgCtx: FeishuMessageContext, arg?: string): Promise<void> {
     const { chatId } = msgCtx
     const workspaces = listAgentWorkspacesByUpdatedAt()
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     const currentWorkspaceId = binding?.workspaceId
 
     // 无参数 → 列出所有工作区供选择
@@ -1381,7 +1417,7 @@ class FeishuBridge {
     this.botConfig = { ...this.botConfig, defaultWorkspaceId: match.id }
 
     // 列出该工作区下最近 10 条会话（序号为全局排序位置）
-    const sessions = listAgentSessions()
+    const sessions = listVisibleAgentSessions()
     const recentSessions = sessions
       .filter((s) => s.workspaceId === match.id)
       .slice(0, 10)
@@ -1396,7 +1432,7 @@ class FeishuBridge {
 
   private async handleNowCommand(msgCtx: FeishuMessageContext): Promise<void> {
     const { chatId } = msgCtx
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
 
     const lines: string[] = []
 
@@ -1514,7 +1550,7 @@ class FeishuBridge {
     }
 
     const parts = arg.split(/\s+/).filter(Boolean)
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
 
     // /model — 列出渠道
     if (parts.length === 0) {
@@ -1564,7 +1600,7 @@ class FeishuBridge {
     let targetBinding = binding
     if (!targetBinding) {
       await this.createNewSession(msgCtx)
-      targetBinding = this.chatBindings.get(chatId)
+      targetBinding = this.getValidBinding(chatId)
       if (!targetBinding) {
         await this.sendMessage(chatId, '请先发送一条消息创建会话，或在 Proma 设置中选择 Agent 渠道。')
         return
@@ -1588,12 +1624,12 @@ class FeishuBridge {
     parentMessageId?: string,
   ): Promise<void> {
     const { chatId } = msgCtx
-    let binding = this.chatBindings.get(chatId)
+    let binding = this.getValidBinding(chatId)
 
     // 自动创建会话
     if (!binding) {
       await this.createNewSession(msgCtx)
-      binding = this.chatBindings.get(chatId)
+      binding = this.getValidBinding(chatId)
       if (!binding) return
     }
 
@@ -1604,7 +1640,7 @@ class FeishuBridge {
     // + finishedPromise 三层保证不会真正并发，移除此兜底以避免误丢消息。
 
     const session = getAgentSessionMeta(binding.sessionId)
-    if (!session?.workspaceId) {
+    if (!session || !isAgentSessionUserVisible(session) || !session.workspaceId) {
       console.error(`[飞书 Bridge] 绑定会话缺少有效项目: sessionId=${binding.sessionId}`)
       await this.sendCardMessage(chatId, buildErrorCard('当前会话项目不可用，请在 Proma 中重新选择会话。'))
       return
@@ -1792,6 +1828,14 @@ class FeishuBridge {
   // ===== EventBus 事件处理 =====
 
   private handleAgentPayload(sessionId: string, payload: AgentStreamPayload): void {
+    const session = getAgentSessionMeta(sessionId)
+    if (!session || !isAgentSessionUserVisible(session)) {
+      this.sessionBuffers.delete(sessionId)
+      this.streamingRunStates.delete(sessionId)
+      this.streamingCards.delete(sessionId)
+      this.streamingCardsUsedSessions.delete(sessionId)
+      return
+    }
     // 对于飞书发起的会话，缓冲由 handleUserMessage 初始化
     // 对于桌面发起的会话，complete 事件时检查是否需要通知
     const buffer = this.sessionBuffers.get(sessionId)
@@ -1959,6 +2003,8 @@ class FeishuBridge {
   }
 
   private async sendAgentReply(chatId: string, result: FormattedAgentResult): Promise<void> {
+    const binding = this.getValidBinding(chatId)
+    if (!binding) return
     const subtitle = this.resolveContextSubtitle(chatId)
 
     if (!result.text.trim()) {
@@ -1967,7 +2013,6 @@ class FeishuBridge {
     }
 
     // 群聊时，将 @Name 转换为飞书 <at> 标签
-    const binding = this.chatBindings.get(chatId)
     const processedResult: FormattedAgentResult = {
       ...result,
       text: binding?.chatType === 'group'
@@ -2417,7 +2462,7 @@ class FeishuBridge {
    * 用于在每条回复的飞书消息开头标注来源，方便用户区分。
    */
   private resolveContextPrefix(chatId: string): string {
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     if (!binding) return ''
 
     const workspace = binding.workspaceId ? getAgentWorkspace(binding.workspaceId) : undefined
@@ -2431,7 +2476,7 @@ class FeishuBridge {
 
   /** 获取卡片 header subtitle 用的上下文描述 */
   private resolveContextSubtitle(chatId: string): string {
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     if (!binding) return ''
 
     const workspace = binding.workspaceId ? getAgentWorkspace(binding.workspaceId) : undefined
@@ -2534,7 +2579,7 @@ class FeishuBridge {
    * 群聊时使用 reply（线程回复），单聊时使用 create。
    */
   private async sendMessage(chatId: string, text: string): Promise<void> {
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     const replyToId = binding?.chatType === 'group'
       ? this.lastUserMessageId.get(chatId)
       : undefined
@@ -2550,7 +2595,7 @@ class FeishuBridge {
    * 发送卡片消息到聊天（自动选择回复或新建）
    */
   private async sendCardMessage(chatId: string, card: Record<string, unknown>): Promise<void> {
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.getValidBinding(chatId)
     const replyToId = binding?.chatType === 'group'
       ? this.lastUserMessageId.get(chatId)
       : undefined

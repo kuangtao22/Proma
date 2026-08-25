@@ -12,7 +12,7 @@ function createSession(input: Partial<AgentSessionMeta> & Pick<AgentSessionMeta,
 }
 
 describe('托盘会话投影', () => {
-  test('Given 普通与内部 Design 会话 When 构建托盘 Then 运行中和最近列表都排除内部会话', () => {
+  test('Given 普通与内部 Design/Canvas 会话 When 构建托盘 Then 运行中和最近列表都排除内部会话', () => {
     /** 普通用户会话。 */
     const visible = createSession({ id: 'visible-1', title: '用户会话', updatedAt: 2 })
     /** Design 内部执行会话。 */
@@ -23,8 +23,19 @@ describe('托盘会话投影', () => {
       sourceDesignJobId: 'job-1',
       updatedAt: 3,
     })
+    /** 半归属 Canvas 会话也必须 fail closed。 */
+    const partialCanvas = createSession({
+      id: 'canvas-partial',
+      title: 'Canvas 半归属',
+      sourceCanvasNodeId: 'node-1',
+      updatedAt: 4,
+    })
 
-    expect(createTrayMenuModel([visible, internal], [], new Set(['design-1']))).toEqual({
+    expect(createTrayMenuModel(
+      [visible, internal, partialCanvas],
+      [],
+      new Set(['design-1', 'canvas-partial']),
+    )).toEqual({
       runningSessions: [],
       recentSessions: [{ id: 'visible-1', title: '用户会话', subtitle: '未选择项目' }],
       moreSessions: [],

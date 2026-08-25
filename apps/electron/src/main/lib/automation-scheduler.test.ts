@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
-import type { Automation, AutomationRun } from '@proma/shared'
+import type { AgentSessionMeta, Automation, AutomationRun } from '@proma/shared'
 import { acquireWorkspaceOperation } from './workspace-operation-lock'
 
 /** 记录 Automation 运行历史写入。 */
@@ -22,6 +22,10 @@ let updateAutomationError: Error | undefined
 let updateAutomationAttempts = 0
 /** 返回给失败退避逻辑的最新 Automation。 */
 let latestAutomation: Automation | undefined
+/** 返回给复用边界的上次会话元数据。 */
+let lastSessionMeta: AgentSessionMeta | undefined
+/** 记录实际交给 headless Agent 的会话 ID。 */
+let headlessSessionId: string | undefined
 
 mock.module('electron', () => ({
   BrowserWindow: {
@@ -60,13 +64,14 @@ mock.module('./agent-session-manager', () => ({
     return { id: `session-${createdSessionCount}` }
   },
   updateAgentSessionMeta: () => undefined,
-  getAgentSessionMeta: () => undefined,
+  getAgentSessionMeta: () => lastSessionMeta,
 }))
 
 mock.module('./agent-session-usage', () => ({ getSessionContextUsageRatio: () => undefined }))
 
 mock.module('./agent-service', () => ({
-  runAgentHeadless: async (_input: unknown, callbacks: { onComplete: () => void }) => {
+  runAgentHeadless: async (input: { sessionId: string }, callbacks: { onComplete: () => void }) => {
+    headlessSessionId = input.sessionId
     activeHeadlessCallbacks = callbacks
   },
   isAgentSessionActive: () => false,
@@ -94,6 +99,8 @@ beforeEach(() => {
   updateAutomationError = undefined
   updateAutomationAttempts = 0
   latestAutomation = undefined
+  lastSessionMeta = undefined
+  headlessSessionId = undefined
 })
 
 /** 创建指定工作区的最小 Automation。 */
@@ -210,5 +217,107 @@ describe('Automation 工作区迁移准入', () => {
     expect(appendedRuns).toHaveLength(1)
     expect(updateAutomationAttempts).toBe(1)
     expect(scheduler.hasRunningAutomationForWorkspace('workspace-update-error')).toBe(false)
+  })
+})
+
+describe('Automation 会话复用归属', () => {
+  test('Given lastSessionId 指向其他 Automation When reuse 运行 Then 新建本任务专属会话', async () => {
+    const automation = {
+      ...createAutomation('automation-owner', 'workspace-owner'),
+      sessionMode: 'reuse' as const,
+      lastSessionId: 'polluted-session',
+    }
+    lastSessionMeta = {
+      id: 'polluted-session',
+      title: '其他任务会话',
+      workspaceId: 'workspace-owner',
+      sourceAutomationId: 'automation-other',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+
+    const running = scheduler.runAutomation(automation)
+    await Promise.resolve()
+    activeHeadlessCallbacks?.onComplete()
+    await running
+
+    expect(createdSessionCount).toBe(1)
+    expect(headlessSessionId).toBe('session-1')
+  })
+
+  test('Given lastSessionId 被 Canvas 来源污染 When reuse 运行 Then 即使 Automation ID 匹配也不复用', async () => {
+    const automation = {
+      ...createAutomation('automation-canvas', 'workspace-canvas'),
+      sessionMode: 'reuse' as const,
+      lastSessionId: 'canvas-session',
+    }
+    lastSessionMeta = {
+      id: 'canvas-session',
+      title: 'Canvas 内部会话',
+      workspaceId: 'workspace-canvas',
+      sourceAutomationId: 'automation-canvas',
+      sourceCanvasProjectId: 'workspace-canvas',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+
+    const running = scheduler.runAutomation(automation)
+    await Promise.resolve()
+    activeHeadlessCallbacks?.onComplete()
+    await running
+
+    expect(createdSessionCount).toBe(1)
+    expect(headlessSessionId).toBe('session-1')
+  })
+
+  test('Given lastSessionId 被半归属 Design 来源污染 When reuse 运行 Then 即使 Automation ID 匹配也不复用', async () => {
+    const automation = {
+      ...createAutomation('automation-design', 'workspace-design'),
+      sessionMode: 'reuse' as const,
+      lastSessionId: 'design-session',
+    }
+    lastSessionMeta = {
+      id: 'design-session',
+      title: 'Design 半归属会话',
+      workspaceId: 'workspace-design',
+      sourceAutomationId: 'automation-design',
+      sourceDesignProjectId: 'workspace-design',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+
+    const running = scheduler.runAutomation(automation)
+    await Promise.resolve()
+    activeHeadlessCallbacks?.onComplete()
+    await running
+
+    expect(createdSessionCount).toBe(1)
+    expect(headlessSessionId).toBe('session-1')
+  })
+
+  test('Given lastSessionId 完整归属于当前 Automation When reuse 运行 Then 保持合法复用', async () => {
+    const automation = {
+      ...createAutomation('automation-valid', 'workspace-valid'),
+      sessionMode: 'reuse' as const,
+      lastSessionId: 'automation-session',
+    }
+    lastSessionMeta = {
+      id: 'automation-session',
+      title: '本任务会话',
+      workspaceId: 'workspace-valid',
+      sourceAutomationId: 'automation-valid',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+
+    const running = scheduler.runAutomation(automation)
+    await Promise.resolve()
+    activeHeadlessCallbacks?.onComplete()
+    await running
+
+    expect(createdSessionCount).toBe(0)
+    expect(headlessSessionId).toBe('automation-session')
   })
 })

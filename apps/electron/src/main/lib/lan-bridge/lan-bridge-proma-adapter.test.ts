@@ -61,6 +61,14 @@ function createDependencies(): LanBridgePromaDependencies {
         createdAt: 7,
         updatedAt: 8,
       },
+      {
+        id: 'canvas-partial',
+        title: 'Canvas 半归属',
+        workspaceId: 'workspace-1',
+        sourceCanvasNodeId: 'node-1',
+        createdAt: 9,
+        updatedAt: 10,
+      },
     ],
     getAgentSessionMessages: () => [],
     searchAgentSessionMessages: async () => [{
@@ -155,6 +163,7 @@ describe('LAN Bridge Proma Adapter', () => {
     expect(() => adapter.getAgentMessages('../agent-1')).toThrow('无效的会话 ID')
     expect(() => adapter.getAgentMessages('missing-agent')).toThrow('会话不存在')
     expect(() => adapter.getAgentMessages('design-agent')).toThrow('会话不存在')
+    expect(() => adapter.getAgentMessages('canvas-partial')).toThrow('会话不存在')
     expect(readCount).toBe(0)
   })
 
