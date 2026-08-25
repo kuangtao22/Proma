@@ -274,4 +274,53 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
     ])
   })
+
+  test('Given 同一 registrar 连续注册 A 和 B When dispose A Then 不删除 B 的 handler', async () => {
+    /** 两代注册共享的当前 handler 表。 */
+    const handlers = new Map<string, TestHandler>()
+    /** 记录每代注册和清理触发的通道移除。 */
+    const removed: string[] = []
+    /** 两代注册共享的授权主窗口。 */
+    const sender = createSender(1)
+    /** 模拟 Electron ipcMain 的稳定 registrar 对象。 */
+    const ipc = {
+      handle: (channel: string, handler: TestHandler): void => { handlers.set(channel, handler) },
+      removeHandler: (channel: string): void => { removed.push(channel); handlers.delete(channel) },
+    }
+    /** 创建使用同一 registrar、但返回不同 revision 的注册依赖。 */
+    const createOptions = (revision: number) => ({
+      ipc,
+      listAuthorizedWebContents: () => [sender],
+      guard: {
+        runWorkspaceWrite: <T>(_projectId: string, effect: () => T): T => effect(),
+      },
+      store: {
+        load: () => ({ document: createDocument(revision), writable: true as const }),
+        mutate: () => createDocument(revision),
+      },
+      getProjectReadOnlyReason: () => undefined,
+    })
+    /** 被后续注册替代的旧 generation。 */
+    const registrationA = registerCanvasDocumentIpcHandlers(createOptions(1))
+    /** 当前拥有 handler 的新 generation。 */
+    const registrationB = registerCanvasDocumentIpcHandlers(createOptions(2))
+    removed.length = 0
+
+    registrationA.dispose()
+
+    await expect(invoke(handlers, CANVAS_IPC_CHANNELS.LOAD, sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })).resolves.toEqual({ document: createDocument(2), writable: true })
+    expect(removed).toEqual([])
+
+    registrationB.dispose()
+    expect(handlers.size).toBe(0)
+    expect(removed).toEqual([
+      CANVAS_IPC_CHANNELS.LOAD,
+      CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
+    ])
+
+    registrationA.dispose()
+    expect(removed).toHaveLength(2)
+  })
 })

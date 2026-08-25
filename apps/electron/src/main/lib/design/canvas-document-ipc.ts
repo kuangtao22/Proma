@@ -36,6 +36,9 @@ export interface CanvasDocumentIpcRegistration {
   dispose: () => void
 }
 
+/** 每个 registrar 当前拥有 handler 的注册代次，防止旧 dispose 删除新 handler。 */
+const currentRegistrationTokens = new WeakMap<CanvasDocumentIpcRegistrar, symbol>()
+
 /**
  * 判断未知值是否为标准或 null prototype 的普通对象。
  * @param value Renderer 通过 IPC 提交的未知值。
@@ -159,8 +162,11 @@ export function registerCanvasDocumentIpcHandlers(
 ): CanvasDocumentIpcRegistration {
   /** CHANGED 仅用于 send，不注册 handler。 */
   const channels = [CANVAS_IPC_CHANNELS.LOAD, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS]
+  /** 当前调用独有的注册代次标识。 */
+  const registrationToken = Symbol('canvas-document-ipc-registration')
   /** 热重载前先移除同名旧 handler。 */
   for (const channel of channels) options.ipc.removeHandler(channel)
+  currentRegistrationTokens.set(options.ipc, registrationToken)
 
   options.ipc.handle(CANVAS_IPC_CHANNELS.LOAD, (event, value): CanvasWorkspaceSnapshot => {
     assertAuthorizedSender(event, options)
@@ -215,6 +221,9 @@ export function registerCanvasDocumentIpcHandlers(
     dispose: () => {
       if (disposed) return
       disposed = true
+      /** 被后续注册替代的 generation 已失去 handler 所有权。 */
+      if (currentRegistrationTokens.get(options.ipc) !== registrationToken) return
+      currentRegistrationTokens.delete(options.ipc)
       for (const channel of channels) options.ipc.removeHandler(channel)
     },
   }

@@ -20,7 +20,10 @@ import type {
   CanvasEdge,
   CanvasMutation,
   CanvasNode,
+  CanvasTarget,
+  CanvasWorkspaceSnapshot,
 } from '@proma/shared'
+export type { CanvasTarget, CanvasWorkspaceSnapshot } from '@proma/shared'
 import {
   AtomicDestinationConflictError,
   AtomicWritePostCommitError,
@@ -39,19 +42,6 @@ import type { CanvasPaths, DesignPathResolver } from './design-paths'
 
 /** Canvas 节点标题上限，避免无界文案放大文档和 Renderer 布局。 */
 const CANVAS_NODE_TITLE_MAX_LENGTH = 120
-
-/** Canvas 文档访问的项目与会话双重身份。 */
-export interface CanvasTarget {
-  projectId: string
-  canvasId: string
-}
-
-/** Canvas 文档加载结果；恢复来源只在首次安全提升时出现。 */
-export interface CanvasWorkspaceSnapshot {
-  document: CanvasDocument
-  writable: true
-  recoveredFrom?: 'tmp' | 'backup'
-}
 
 /** 原生 Canvas 文档的加载、稳定读取与 revision mutation 接口。 */
 export interface CanvasDocumentStore {
