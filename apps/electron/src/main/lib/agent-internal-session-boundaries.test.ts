@@ -1,19 +1,20 @@
 import { describe, expect, mock, test } from 'bun:test'
 import type { AgentSessionMeta, FeishuBotConfig, FeishuChatBinding, FeishuMessageContext } from '@proma/shared'
 import { readFileSync } from 'node:fs'
+import { agentSessionManagerTestMock } from './agent-session-manager.test-mock'
 
 /** 测试中模拟的全量 Agent 会话索引。 */
-const sessions = new Map<string, AgentSessionMeta>()
+const sessions = agentSessionManagerTestMock.sessions
 /** Bridge 对外发送的消息。 */
 const bridgeReplies: string[] = []
 /** Bridge 触发的停止副作用。 */
 const stoppedSessions: string[] = []
 /** Bridge 触发的 Agent 运行副作用。 */
 const startedSessions: string[] = []
+/** 测试捕获的无头 Agent 终态回调。 */
+const headlessCallbacks = new Map<string, { onError: (error: string) => void }>()
 /** 飞书对外发送的序列化消息内容。 */
 const feishuReplies: string[] = []
-/** Collaboration 创建的子会话数量。 */
-let collaborationCreatedCount = 0
 
 mock.module('electron', () => ({
   BrowserWindow: { getAllWindows: () => [] },
@@ -22,30 +23,6 @@ mock.module('electron', () => ({
     encryptString: (value: string) => Buffer.from(value),
     decryptString: (value: Buffer) => value.toString('utf-8'),
   },
-}))
-
-/** 判断测试会话是否属于普通用户入口。 */
-function isVisible(session: AgentSessionMeta): boolean {
-  return session.sourceDesignProjectId === undefined
-    && session.sourceDesignJobId === undefined
-    && session.sourceCanvasProjectId === undefined
-    && session.sourceCanvasId === undefined
-    && session.sourceCanvasNodeId === undefined
-}
-
-mock.module('./agent-session-manager', () => ({
-  listAgentSessions: () => Array.from(sessions.values()),
-  listVisibleAgentSessions: () => Array.from(sessions.values()).filter(isVisible),
-  getAgentSessionMeta: (sessionId: string) => sessions.get(sessionId),
-  createAgentSession: (_title: string, channelId: string, workspaceId?: string) => {
-    collaborationCreatedCount += 1
-    const created = createSession(`created-${collaborationCreatedCount}`, { channelId, workspaceId })
-    sessions.set(created.id, created)
-    return created
-  },
-  updateAgentSessionMeta: () => undefined,
-  getAgentSessionMessages: () => [],
-  getAgentSessionSDKMessages: () => [],
 }))
 
 mock.module('./agent-workspace-manager', () => ({
@@ -71,8 +48,12 @@ mock.module('./agent-service', () => ({
   agentEventBus: { on: () => () => undefined },
   isAgentSessionActive: () => false,
   stopAgent: (sessionId: string) => stoppedSessions.push(sessionId),
-  runAgentHeadless: async (input: { sessionId: string }) => {
+  runAgentHeadless: async (
+    input: { sessionId: string },
+    callbacks: { onError: (error: string) => void },
+  ) => {
     startedSessions.push(input.sessionId)
+    headlessCallbacks.set(input.sessionId, callbacks)
   },
 }))
 
@@ -107,7 +88,7 @@ function createSession(id: string, fields: Partial<AgentSessionMeta> = {}): Agen
 
 describe('外部 Bridge 会话边界', () => {
   test('Given 普通、Design、Canvas 与半归属会话 When Bridge 列表和按 ID 切换 Then 只允许普通会话', async () => {
-    sessions.clear()
+    agentSessionManagerTestMock.reset()
     bridgeReplies.length = 0
     sessions.set('visible-session', createSession('visible-session'))
     sessions.set('design-session', createSession('design-session', {
@@ -135,7 +116,7 @@ describe('外部 Bridge 会话边界', () => {
   })
 
   test('Given 持久化绑定恢复后会话变成半归属 Canvas When 停止或发送 Then 清除绑定且副作用为零', async () => {
-    sessions.clear()
+    agentSessionManagerTestMock.reset()
     bridgeReplies.length = 0
     stoppedSessions.length = 0
     startedSessions.length = 0
@@ -171,6 +152,35 @@ describe('外部 Bridge 会话边界', () => {
       expect(bridgeReplies).toHaveLength(replyCount)
     }
   })
+
+  test.each([
+    ['Canvas', { sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1' }],
+    ['Design', { sourceDesignProjectId: 'project-1', sourceDesignJobId: 'job-1' }],
+    ['半归属', { sourceCanvasId: 'canvas-1' }],
+    ['另一项目', { workspaceId: 'project-2' }],
+  ])('Given Common Bridge 运行中会话变为%s When terminal onError Then 不外发内部错误并清理缓冲', async (_name, fields) => {
+    agentSessionManagerTestMock.reset()
+    bridgeReplies.length = 0
+    startedSessions.length = 0
+    headlessCallbacks.clear()
+    sessions.set('terminal-race', createSession('terminal-race'))
+    const { BridgeCommandHandler } = await import('./bridge-command-handler')
+    const handler = new BridgeCommandHandler({
+      platformName: '测试',
+      adapter: { sendText: async (_chatId, reply) => { bridgeReplies.push(reply) } },
+    })
+
+    await handler.handleIncomingMessage('chat-terminal', '/switch terminal')
+    await handler.handleIncomingMessage('chat-terminal', '继续执行')
+    const replyCount = bridgeReplies.length
+    sessions.set('terminal-race', createSession('terminal-race', fields))
+
+    headlessCallbacks.get('terminal-race')?.onError('内部路径 /private/secret 不应外发')
+
+    const exposed = handler as unknown as { sessionBuffers: Map<string, unknown> }
+    expect(bridgeReplies).toHaveLength(replyCount)
+    expect(exposed.sessionBuffers.size).toBe(0)
+  })
 })
 
 describe('统一内部会话消费者合同', () => {
@@ -191,7 +201,7 @@ describe('统一内部会话消费者合同', () => {
 
 describe('飞书 Bridge 会话边界', () => {
   test('Given 普通与内部会话 When 飞书列表、按 ID 切换和设置页绑定 Then 只允许普通会话', async () => {
-    sessions.clear()
+    agentSessionManagerTestMock.reset()
     stoppedSessions.length = 0
     feishuReplies.length = 0
     sessions.set('visible-session', createSession('visible-session'))
@@ -272,7 +282,7 @@ describe('飞书 Bridge 会话边界', () => {
     }],
     ['Design 半归属', { sourceDesignProjectId: 'project-1' }],
   ])('Given 发送处理中会话变为%s When 即将启动 Agent Then 再次验证并阻止运行', async (_name, fields) => {
-    sessions.clear()
+    agentSessionManagerTestMock.reset()
     startedSessions.length = 0
     feishuReplies.length = 0
     sessions.set('racing-session', createSession('racing-session'))
@@ -334,7 +344,7 @@ describe('飞书 Bridge 会话边界', () => {
   })
 
   test('Given 发送处理中会话迁移到另一项目 When 即将启动 Agent Then 拒绝混用旧附件上下文与新项目', async () => {
-    sessions.clear()
+    agentSessionManagerTestMock.reset()
     startedSessions.length = 0
     sessions.set('workspace-race', createSession('workspace-race'))
     const { FeishuBridge } = await import('./feishu-bridge')
@@ -378,7 +388,7 @@ describe('飞书 Bridge 会话边界', () => {
   })
 
   test('Given 流式卡创建失败且会话同时转为内部会话 When 启动前拒绝 Then 所有本次运行状态均清空', async () => {
-    sessions.clear()
+    agentSessionManagerTestMock.reset()
     startedSessions.length = 0
     sessions.set('no-card-race', createSession('no-card-race'))
     const { FeishuBridge } = await import('./feishu-bridge')
@@ -427,6 +437,183 @@ describe('飞书 Bridge 会话边界', () => {
     expect(exposed.streamingCards.size).toBe(0)
     expect(exposed.streamingCardsUsedSessions.size).toBe(0)
   })
+
+  test('Given 飞书流式卡运行中身份失效且 close 抛错 When terminal onError Then 不外发错误且所有状态仍清空', async () => {
+    agentSessionManagerTestMock.reset()
+    startedSessions.length = 0
+    headlessCallbacks.clear()
+    feishuReplies.length = 0
+    sessions.set('feishu-terminal-card', createSession('feishu-terminal-card'))
+    const { FeishuBridge } = await import('./feishu-bridge')
+    const bridge = new FeishuBridge({
+      id: 'bot-terminal-card', name: '终态卡片', enabled: true, appId: 'app-id', appSecret: 'encrypted',
+    } as FeishuBotConfig)
+    const exposed = bridge as unknown as {
+      client: unknown
+      chatBindings: Map<string, FeishuChatBinding>
+      sessionToChat: Map<string, string>
+      sessionBuffers: Map<string, unknown>
+      streamingRunStates: Map<string, unknown>
+      streamingCards: Map<string, { close: () => Promise<void> }>
+      streamingCardsUsedSessions: Set<string>
+      streamingTerminalHandledSessions: Map<string, number>
+      saveBindings: () => void
+      handleUserMessage: (context: FeishuMessageContext, text: string) => Promise<void>
+    }
+    const binding: FeishuChatBinding = {
+      chatId: 'chat-terminal-card', botId: 'bot-terminal-card', userId: 'user-1',
+      sessionId: 'feishu-terminal-card', workspaceId: 'project-1', channelId: 'channel-1',
+      source: 'feishu', chatType: 'p2p', createdAt: 1, lastUsedAt: 1,
+    }
+    exposed.chatBindings.set(binding.chatId, binding)
+    exposed.sessionToChat.set(binding.sessionId, binding.chatId)
+    exposed.saveBindings = () => undefined
+    exposed.client = {
+      cardkit: { v1: { card: {
+        create: async () => ({ data: { card_id: 'card-terminal' } }),
+        update: async () => undefined,
+      } } },
+      im: { message: {
+        create: async (input: { data: { content: string } }) => {
+          feishuReplies.push(input.data.content)
+          return { data: { message_id: 'message-terminal' } }
+        },
+        reply: async () => ({ data: { message_id: 'reply-terminal' } }),
+      } },
+    }
+
+    await exposed.handleUserMessage({
+      chatId: binding.chatId, senderOpenId: 'user-1', messageId: 'incoming-terminal', chatType: 'p2p',
+    }, '继续执行')
+    const card = exposed.streamingCards.get(binding.sessionId)
+    let closeAttempts = 0
+    if (card) {
+      card.close = async () => {
+        closeAttempts += 1
+        throw new Error('close failed')
+      }
+    }
+    exposed.streamingTerminalHandledSessions.set(binding.sessionId, 1)
+    const replyCount = feishuReplies.length
+    sessions.set(binding.sessionId, createSession(binding.sessionId, { sourceCanvasNodeId: 'node-1' }))
+
+    headlessCallbacks.get(binding.sessionId)?.onError('内部飞书错误正文不应外发')
+
+    expect(feishuReplies).toHaveLength(replyCount)
+    expect(closeAttempts).toBe(1)
+    expect(exposed.sessionBuffers.size).toBe(0)
+    expect(exposed.streamingRunStates.size).toBe(0)
+    expect(exposed.streamingCards.size).toBe(0)
+    expect(exposed.streamingCardsUsedSessions.size).toBe(0)
+    expect(exposed.streamingTerminalHandledSessions.size).toBe(0)
+  })
+
+  test('Given 飞书流式卡创建失败后运行中身份失效 When terminal onError Then 不新增错误卡并清空无卡状态', async () => {
+    agentSessionManagerTestMock.reset()
+    startedSessions.length = 0
+    headlessCallbacks.clear()
+    feishuReplies.length = 0
+    sessions.set('feishu-terminal-no-card', createSession('feishu-terminal-no-card'))
+    const { FeishuBridge } = await import('./feishu-bridge')
+    const bridge = new FeishuBridge({
+      id: 'bot-terminal-no-card', name: '终态无卡', enabled: true, appId: 'app-id', appSecret: 'encrypted',
+    } as FeishuBotConfig)
+    const exposed = bridge as unknown as {
+      client: unknown
+      chatBindings: Map<string, FeishuChatBinding>
+      sessionToChat: Map<string, string>
+      sessionBuffers: Map<string, unknown>
+      streamingRunStates: Map<string, unknown>
+      streamingCards: Map<string, unknown>
+      streamingCardsUsedSessions: Set<string>
+      streamingTerminalHandledSessions: Map<string, number>
+      saveBindings: () => void
+      handleUserMessage: (context: FeishuMessageContext, text: string) => Promise<void>
+    }
+    const binding: FeishuChatBinding = {
+      chatId: 'chat-terminal-no-card', botId: 'bot-terminal-no-card', userId: 'user-1',
+      sessionId: 'feishu-terminal-no-card', workspaceId: 'project-1', channelId: 'channel-1',
+      source: 'feishu', chatType: 'p2p', createdAt: 1, lastUsedAt: 1,
+    }
+    exposed.chatBindings.set(binding.chatId, binding)
+    exposed.sessionToChat.set(binding.sessionId, binding.chatId)
+    exposed.saveBindings = () => undefined
+    exposed.client = {
+      cardkit: { v1: { card: { create: async () => { throw new Error('card open failed') } } } },
+      im: { message: {
+        create: async (input: { data: { content: string } }) => {
+          feishuReplies.push(input.data.content)
+          return { data: { message_id: `message-${feishuReplies.length}` } }
+        },
+        reply: async () => ({ data: { message_id: 'reply-terminal-no-card' } }),
+      } },
+    }
+
+    await exposed.handleUserMessage({
+      chatId: binding.chatId, senderOpenId: 'user-1', messageId: 'incoming-terminal-no-card', chatType: 'p2p',
+    }, '继续执行')
+    exposed.streamingTerminalHandledSessions.set(binding.sessionId, 1)
+    const replyCount = feishuReplies.length
+    sessions.set(binding.sessionId, createSession(binding.sessionId, { workspaceId: 'project-2' }))
+
+    headlessCallbacks.get(binding.sessionId)?.onError('内部无卡错误正文不应外发')
+
+    expect(feishuReplies).toHaveLength(replyCount)
+    expect(exposed.sessionBuffers.size).toBe(0)
+    expect(exposed.streamingRunStates.size).toBe(0)
+    expect(exposed.streamingCards.size).toBe(0)
+    expect(exposed.streamingCardsUsedSessions.size).toBe(0)
+    expect(exposed.streamingTerminalHandledSessions.size).toBe(0)
+  })
+
+  test('Given 飞书会话在流式事件前迁移项目 When handleAgentPayload Then 关闭卡片并统一清空失效状态', async () => {
+    agentSessionManagerTestMock.reset()
+    sessions.set('feishu-payload-race', createSession('feishu-payload-race', { workspaceId: 'project-2' }))
+    const { FeishuBridge } = await import('./feishu-bridge')
+    const bridge = new FeishuBridge({
+      id: 'bot-payload-race', name: '事件竞态', enabled: true, appId: 'app-id', appSecret: 'encrypted',
+    } as FeishuBotConfig)
+    let closeAttempts = 0
+    const exposed = bridge as unknown as {
+      chatBindings: Map<string, FeishuChatBinding>
+      sessionToChat: Map<string, string>
+      sessionBuffers: Map<string, unknown>
+      streamingRunStates: Map<string, unknown>
+      streamingCards: Map<string, { close: () => Promise<void> }>
+      streamingCardsUsedSessions: Set<string>
+      streamingTerminalHandledSessions: Map<string, number>
+      saveBindings: () => void
+      handleAgentPayload: (sessionId: string, payload: unknown) => void
+    }
+    const binding: FeishuChatBinding = {
+      chatId: 'chat-payload-race', botId: 'bot-payload-race', userId: 'user-1',
+      sessionId: 'feishu-payload-race', workspaceId: 'project-1', channelId: 'channel-1',
+      source: 'feishu', chatType: 'p2p', createdAt: 1, lastUsedAt: 1,
+    }
+    exposed.chatBindings.set(binding.chatId, binding)
+    exposed.sessionToChat.set(binding.sessionId, binding.chatId)
+    exposed.sessionBuffers.set(binding.sessionId, { text: '', toolSummaries: new Map(), startedAt: 1 })
+    exposed.streamingCards.set(binding.sessionId, {
+      close: async () => { closeAttempts += 1 },
+    })
+    exposed.streamingCardsUsedSessions.add(binding.sessionId)
+    exposed.streamingTerminalHandledSessions.set(binding.sessionId, 1)
+    exposed.saveBindings = () => undefined
+
+    exposed.handleAgentPayload(binding.sessionId, {
+      kind: 'sdk_message',
+      message: { type: 'assistant', message: { content: [] } },
+    })
+
+    expect(closeAttempts).toBe(1)
+    expect(exposed.chatBindings.size).toBe(0)
+    expect(exposed.sessionToChat.size).toBe(0)
+    expect(exposed.sessionBuffers.size).toBe(0)
+    expect(exposed.streamingRunStates.size).toBe(0)
+    expect(exposed.streamingCards.size).toBe(0)
+    expect(exposed.streamingCardsUsedSessions.size).toBe(0)
+    expect(exposed.streamingTerminalHandledSessions.size).toBe(0)
+  })
 })
 
 describe('Canvas Agent Collaboration 边界', () => {
@@ -436,8 +623,7 @@ describe('Canvas Agent Collaboration 边界', () => {
     }],
     ['半归属 Canvas', { sourceCanvasId: 'canvas-1' }],
   ])('Given %s 会话 When 调用 delegate_agent Then 明确拒绝且不创建子会话', async (_name, fields) => {
-    sessions.clear()
-    collaborationCreatedCount = 0
+    agentSessionManagerTestMock.reset()
     sessions.set('parent-session', createSession('parent-session', fields))
     const { buildPiCollaborationTools } = await import('./agent-collaboration-tools')
     const fakeSdk = {
@@ -458,11 +644,11 @@ describe('Canvas Agent Collaboration 边界', () => {
 
     await expect(delegate?.execute('call-1', { task: '分析任务' })).rejects.toThrow('Canvas Agent 不允许使用协作工具')
     await expect(list?.execute('call-2', {})).rejects.toThrow('Canvas Agent 不允许使用协作工具')
-    expect(collaborationCreatedCount).toBe(0)
+    expect(agentSessionManagerTestMock.createdSessionIds).toEqual([])
   })
 
   test('Given 普通 Agent 会话 When 列出历史委派 Then 保持原有 Collaboration 恢复入口可用', async () => {
-    sessions.clear()
+    agentSessionManagerTestMock.reset()
     sessions.set('ordinary-parent', createSession('ordinary-parent'))
     const { buildPiCollaborationTools } = await import('./agent-collaboration-tools')
     const fakeSdk = {

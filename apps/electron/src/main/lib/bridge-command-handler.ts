@@ -267,6 +267,25 @@ export class BridgeCommandHandler {
     return undefined
   }
 
+  /** 校验终态回调仍属于本次启动时捕获的普通会话与项目。 */
+  private isRequestedRunIdentityValid(
+    chatId: string,
+    requestedSessionId: string,
+    requestedWorkspaceId: string,
+  ): boolean {
+    const binding = this.getValidBinding(chatId)
+    const session = getAgentSessionMeta(requestedSessionId)
+    return Boolean(
+      binding
+      && binding.sessionId === requestedSessionId
+      && session
+      && isAgentSessionUserVisible(session)
+      && (session.workspaceId ?? '') === requestedWorkspaceId
+      && binding.workspaceId === requestedWorkspaceId
+      && binding.workspaceId === (session.workspaceId ?? ''),
+    )
+  }
+
   // ===== 命令路由 =====
 
   private async handleCommand(chatId: string, text: string, contextData?: unknown): Promise<void> {
@@ -765,8 +784,13 @@ export class BridgeCommandHandler {
       return
     }
 
+    /** 本次运行使用的稳定会话身份，终态回调不得跟随后续绑定变化。 */
+    const requestedSessionId = binding.sessionId
+    /** 本次运行使用的稳定项目身份，防止运行中跨项目外发内部结果。 */
+    const requestedWorkspaceId = binding.workspaceId
+
     // 初始化回复缓冲
-    this.sessionBuffers.set(binding.sessionId, {
+    this.sessionBuffers.set(requestedSessionId, {
       text: '',
       chatId,
       contextData,
@@ -786,19 +810,23 @@ export class BridgeCommandHandler {
     const userMessage = fileReferences + effectiveText
 
     const input = {
-      sessionId: binding.sessionId,
+      sessionId: requestedSessionId,
       userMessage,
       channelId: latestChannelId,
       modelId,
-      workspaceId: binding.workspaceId,
+      workspaceId: requestedWorkspaceId,
       permissionModeOverride: 'bypassPermissions' as const,
     }
 
     runAgentHeadless(input, {
       onError: (error) => {
+        if (!this.isRequestedRunIdentityValid(chatId, requestedSessionId, requestedWorkspaceId)) {
+          this.sessionBuffers.delete(requestedSessionId)
+          return
+        }
         this.log(`Agent 错误: ${error}`)
         this.send(chatId, `❌ Agent 错误: ${error}`, contextData).catch((sendError) => console.error(`[${this.config.platformName} Bridge] 发送错误消息失败:`, redactSensitiveLogValue(sendError)))
-        this.sessionBuffers.delete(binding!.sessionId)
+        this.sessionBuffers.delete(requestedSessionId)
       },
       onComplete: () => {
         // complete 由 EventBus listener 处理

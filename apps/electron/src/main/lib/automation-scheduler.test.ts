@@ -1,11 +1,10 @@
 import { beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 import type { AgentSessionMeta, Automation, AutomationRun } from '@proma/shared'
 import { acquireWorkspaceOperation } from './workspace-operation-lock'
+import { agentSessionManagerTestMock } from './agent-session-manager.test-mock'
 
 /** 记录 Automation 运行历史写入。 */
 const appendedRuns: Array<{ id: string; run: AutomationRun }> = []
-/** 记录子会话创建次数。 */
-let createdSessionCount = 0
 /** 保存 headless Agent 回调，允许测试观察运行中状态。 */
 let activeHeadlessCallbacks: { onComplete: () => void } | undefined
 /** 注入运行历史持久化异常。 */
@@ -58,15 +57,6 @@ mock.module('./automation-manager', () => ({
   computeNextRunAt: () => Date.now() + 60_000,
 }))
 
-mock.module('./agent-session-manager', () => ({
-  createAgentSession: () => {
-    createdSessionCount += 1
-    return { id: `session-${createdSessionCount}` }
-  },
-  updateAgentSessionMeta: () => undefined,
-  getAgentSessionMeta: () => lastSessionMeta,
-}))
-
 mock.module('./agent-session-usage', () => ({ getSessionContextUsageRatio: () => undefined }))
 
 mock.module('./agent-service', () => ({
@@ -90,7 +80,9 @@ beforeAll(async () => {
 
 beforeEach(() => {
   appendedRuns.length = 0
-  createdSessionCount = 0
+  agentSessionManagerTestMock.reset()
+  agentSessionManagerTestMock.sessionIdPrefix = 'session'
+  agentSessionManagerTestMock.getSessionMetaOverride = () => lastSessionMeta
   activeHeadlessCallbacks = undefined
   appendRunError = undefined
   appendRunAttempts = 0
@@ -141,7 +133,7 @@ describe('Automation 工作区迁移准入', () => {
       status: 'skipped',
       skipReason: '项目正在迁移，请等待完成后重试',
     })
-    expect(createdSessionCount).toBe(0)
+    expect(agentSessionManagerTestMock.createdSessionIds).toHaveLength(0)
     expect(activeHeadlessCallbacks).toBeUndefined()
     expect(scheduler.hasRunningAutomationForWorkspace('workspace-locked')).toBe(false)
   })
@@ -241,7 +233,7 @@ describe('Automation 会话复用归属', () => {
     activeHeadlessCallbacks?.onComplete()
     await running
 
-    expect(createdSessionCount).toBe(1)
+    expect(agentSessionManagerTestMock.createdSessionIds).toHaveLength(1)
     expect(headlessSessionId).toBe('session-1')
   })
 
@@ -268,7 +260,7 @@ describe('Automation 会话复用归属', () => {
     activeHeadlessCallbacks?.onComplete()
     await running
 
-    expect(createdSessionCount).toBe(1)
+    expect(agentSessionManagerTestMock.createdSessionIds).toHaveLength(1)
     expect(headlessSessionId).toBe('session-1')
   })
 
@@ -293,7 +285,7 @@ describe('Automation 会话复用归属', () => {
     activeHeadlessCallbacks?.onComplete()
     await running
 
-    expect(createdSessionCount).toBe(1)
+    expect(agentSessionManagerTestMock.createdSessionIds).toHaveLength(1)
     expect(headlessSessionId).toBe('session-1')
   })
 
@@ -329,7 +321,7 @@ describe('Automation 会话复用归属', () => {
     activeHeadlessCallbacks?.onComplete()
     await running
 
-    expect(createdSessionCount).toBe(1)
+    expect(agentSessionManagerTestMock.createdSessionIds).toHaveLength(1)
     expect(headlessSessionId).toBe('session-1')
   })
 
@@ -353,7 +345,7 @@ describe('Automation 会话复用归属', () => {
     activeHeadlessCallbacks?.onComplete()
     await running
 
-    expect(createdSessionCount).toBe(0)
+    expect(agentSessionManagerTestMock.createdSessionIds).toHaveLength(0)
     expect(headlessSessionId).toBe('automation-session')
   })
 })

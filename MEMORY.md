@@ -72,6 +72,8 @@
 - Design 任务详情按 `projectId + jobId` 缓存轻量历史，只有用户展开 Thinking 或执行日志时才读取 trace；删除按 `creativeTaskId` 聚合清理全部尝试和详情缓存，成功素材删除后同步回收来源任务。旧项目缺少 `traces` 子目录时，由 trace 写入边界幂等补齐后再原子提交。
 - Design 素材删除必须在画布 revision 变化前依次检查节点引用、`parentAssetId` 子版本引用和创作上下文 Catalog 的视觉标准引用；任一引用存在时保留元数据、原图、缩略图与来源任务，Catalog 通过主进程显式依赖注入，不在素材服务内隐式创建。
 - Electron 主进程输出为 CJS 且把 Pi SDK 标记为 external；`@earendil-works/pi-coding-agent` 仅提供 ESM import，因此主进程模块禁止顶层值导入该包。只需要类型时使用 `import type`，真实运行能力沿用动态 `import()`，纯 identity helper 应留在本地并用 CJS bundle 回归测试锁定不产生同步 `require()`。
+- Common Bridge 与飞书 Bridge 的 Agent terminal 回调必须以启动时捕获的 `sessionId + workspaceId` 复核当前绑定、用户可见性和项目一致性；身份漂移只允许清理/关闭，禁止向外部聊天发送内部错误正文。飞书失效清理由统一幂等边界先摘除 binding/反向索引和全部运行态，再异步关闭 CardStream，关闭失败不得恢复引用。
+- Bun 非 isolate 组合测试中的 `mock.module` 会跨文件覆盖；共享核心模块的测试替身必须提供组合消费者所需的完整导出合同，并复用同一可重置状态，禁止各测试文件注册互不兼容的局部 mock。
 
 ## 会话记录
 

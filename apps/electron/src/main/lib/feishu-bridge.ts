@@ -475,11 +475,27 @@ class FeishuBridge {
     const session = getAgentSessionMeta(binding.sessionId)
     if (session && isAgentSessionUserVisible(session)) return binding
 
-    this.sessionToChat.delete(binding.sessionId)
-    this.sessionBuffers.delete(binding.sessionId)
-    this.chatBindings.delete(chatId)
-    this.saveBindings()
+    this.invalidateSession(binding.sessionId, chatId)
     return undefined
+  }
+
+  /** 校验终态回调仍属于本次启动时捕获的普通会话与项目。 */
+  private isRequestedRunIdentityValid(
+    chatId: string,
+    requestedSessionId: string,
+    requestedWorkspaceId: string,
+  ): boolean {
+    const binding = this.getValidBinding(chatId)
+    const session = getAgentSessionMeta(requestedSessionId)
+    return Boolean(
+      binding
+      && binding.sessionId === requestedSessionId
+      && session
+      && isAgentSessionUserVisible(session)
+      && session.workspaceId === requestedWorkspaceId
+      && binding.workspaceId === requestedWorkspaceId
+      && binding.workspaceId === session.workspaceId,
+    )
   }
 
   private markBindingUsed(chatId: string): void {
@@ -1800,7 +1816,7 @@ class FeishuBridge {
       || authoritativeBinding.workspaceId !== authoritativeSession.workspaceId
     ) {
       const errorMessage = '当前会话项目不可用，请在 Proma 中重新选择会话。'
-      this.clearRejectedRunState(requestedSessionId, errorMessage)
+      this.invalidateSession(requestedSessionId, chatId)
       await this.sendCardMessage(chatId, buildErrorCard(errorMessage))
       return
     }
@@ -1828,15 +1844,20 @@ class FeishuBridge {
       await runAgentHeadless(input, {
         source: 'feishu',
         onError: (error) => {
+          if (!this.isRequestedRunIdentityValid(chatId, requestedSessionId, requestedWorkspaceId)) {
+            this.invalidateSession(requestedSessionId, chatId)
+            return
+          }
           const errPrefix = this.resolveContextPrefix(chatId)
           // 优先把错误显示到流式卡上；没有流式卡才发独立错误卡
-          if (this.streamingCards.has(binding!.sessionId)) {
-            this.markStreamingError(binding!.sessionId, error)
+          if (this.streamingCards.has(requestedSessionId)) {
+            this.markStreamingError(requestedSessionId, error)
           } else {
             this.sendCardMessage(chatId, buildErrorCard(`${errPrefix}${error}`)).catch((sendError) => console.error('[飞书 Bridge] 发送错误卡片失败:', redactSensitiveLogValue(sendError)))
           }
-          this.sessionBuffers.delete(binding!.sessionId)
-          this.streamingCardsUsedSessions.delete(binding!.sessionId)
+          this.sessionBuffers.delete(requestedSessionId)
+          this.streamingCardsUsedSessions.delete(requestedSessionId)
+          this.streamingTerminalHandledSessions.delete(requestedSessionId)
         },
         onComplete: () => {
           // complete 事件由 EventBus listener 处理
@@ -1855,11 +1876,22 @@ class FeishuBridge {
   private handleAgentPayload(sessionId: string, payload: AgentStreamPayload): void {
     const session = getAgentSessionMeta(sessionId)
     if (!session || !isAgentSessionUserVisible(session)) {
-      this.sessionBuffers.delete(sessionId)
-      this.streamingRunStates.delete(sessionId)
-      this.streamingCards.delete(sessionId)
-      this.streamingCardsUsedSessions.delete(sessionId)
+      this.invalidateSession(sessionId)
       return
+    }
+    const boundChatId = this.sessionToChat.get(sessionId)
+      ?? Array.from(this.chatBindings.values()).find((binding) => binding.sessionId === sessionId)?.chatId
+    if (boundChatId) {
+      const binding = this.getValidBinding(boundChatId)
+      if (
+        !binding
+        || binding.sessionId !== sessionId
+        || binding.workspaceId !== (session.workspaceId ?? '')
+        || (binding.workspaceId && !getAgentWorkspace(binding.workspaceId))
+      ) {
+        this.invalidateSession(sessionId, boundChatId)
+        return
+      }
     }
     // 对于飞书发起的会话，缓冲由 handleUserMessage 初始化
     // 对于桌面发起的会话，complete 事件时检查是否需要通知
@@ -1957,38 +1989,65 @@ class FeishuBridge {
   private markStreamingError(sessionId: string, message: string): void {
     const runState = this.streamingRunStates.get(sessionId)
     const cardStream = this.streamingCards.get(sessionId)
-    if (!runState || !cardStream) return
-    const nextState = markError(runState, message)
-    const header = this.resolveContextPrefix(this.sessionToChat.get(sessionId) ?? '')
-    const headerTitle = (header ? `${header.trim()} · ` : '') + 'Agent 出错'
-    void cardStream
-      .flush(renderRunCard(nextState, { header: headerTitle }))
-      .then(() => cardStream.close())
-      .catch((err) => console.error('[飞书 Bridge] error 终态刷新失败:', redactSensitiveLogValue(err)))
-    this.streamingRunStates.delete(sessionId)
-    this.streamingCards.delete(sessionId)
-  }
-
-  /**
-   * 启动前权威复核失败时无条件清理本次运行状态。
-   * CardStream 未创建成功时也必须删除 runState/buffer，不能依赖 markStreamingError。
-   */
-  private clearRejectedRunState(sessionId: string, message: string): void {
-    const cardStream = this.streamingCards.get(sessionId)
-    const runState = this.streamingRunStates.get(sessionId)
-    if (cardStream && runState) {
-      this.markStreamingError(sessionId, message)
+    if (runState && cardStream) {
+      const nextState = markError(runState, message)
+      const header = this.resolveContextPrefix(this.sessionToChat.get(sessionId) ?? '')
+      const headerTitle = (header ? `${header.trim()} · ` : '') + 'Agent 出错'
+      void cardStream
+        .flush(renderRunCard(nextState, { header: headerTitle }))
+        .then(() => cardStream.close())
+        .catch((err) => console.error('[飞书 Bridge] error 终态刷新失败:', redactSensitiveLogValue(err)))
     } else if (cardStream) {
-      void cardStream.close().catch((error) => {
-        console.error('[飞书 Bridge] 拒绝运行时关闭流式卡失败:', redactSensitiveLogValue(error))
+      void cardStream.close().catch((err) => {
+        console.error('[飞书 Bridge] error 关闭流式卡失败:', redactSensitiveLogValue(err))
       })
     }
-
     this.sessionBuffers.delete(sessionId)
     this.streamingRunStates.delete(sessionId)
     this.streamingCards.delete(sessionId)
     this.streamingCardsUsedSessions.delete(sessionId)
     this.streamingTerminalHandledSessions.delete(sessionId)
+  }
+
+  /**
+   * 会话失效时幂等摘除外部绑定与全部运行态。
+   * 状态先同步清空，再异步关闭卡片；关闭失败不得恢复已失效引用。
+   */
+  private invalidateSession(sessionId: string, expectedChatId?: string): void {
+    const chatIds = new Set<string>()
+    if (expectedChatId) chatIds.add(expectedChatId)
+    const reverseChatId = this.sessionToChat.get(sessionId)
+    if (reverseChatId) chatIds.add(reverseChatId)
+    for (const [chatId, binding] of this.chatBindings) {
+      if (binding.sessionId === sessionId) chatIds.add(chatId)
+    }
+
+    let removedBinding = false
+    for (const chatId of chatIds) {
+      const binding = this.chatBindings.get(chatId)
+      if (binding?.sessionId !== sessionId) continue
+      this.chatBindings.delete(chatId)
+      removedBinding = true
+    }
+    this.sessionToChat.delete(sessionId)
+
+    const cardStream = this.streamingCards.get(sessionId)
+    this.sessionBuffers.delete(sessionId)
+    this.streamingRunStates.delete(sessionId)
+    this.streamingCards.delete(sessionId)
+    this.streamingCardsUsedSessions.delete(sessionId)
+    this.streamingTerminalHandledSessions.delete(sessionId)
+
+    if (cardStream) {
+      void cardStream.close().catch((error) => {
+        console.error('[飞书 Bridge] 失效会话关闭流式卡失败:', redactSensitiveLogValue(error))
+      })
+    }
+    if (removedBinding) {
+      const activeBindings = Array.from(this.chatBindings.values()).filter((binding) => !binding.archived).length
+      this.updateStatus({ activeBindings })
+      this.saveBindings()
+    }
   }
 
   /** 给流式卡片打上 interrupted 终态。用于用户主动 /stop 或终止按钮触发。 */
