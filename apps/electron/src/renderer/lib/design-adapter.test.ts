@@ -20,6 +20,17 @@ describe('Design renderer adapter', () => {
     const modelInputs: unknown[] = []
     /** 上下文 API 收到的原始参数，验证 adapter 不做路径或元数据改写。 */
     const contextInputs: unknown[] = []
+    /** Canvas 会话 API 收到的原始参数。 */
+    const canvasInputs: unknown[] = []
+    /** Canvas 会话公开返回值，不包含存储路径和内部形态。 */
+    const canvasSession = {
+      id: 'canvas-1',
+      projectId: 'project-1',
+      title: '页面设计',
+      archived: false,
+      createdAt: 1,
+      updatedAt: 1,
+    }
     /** 公开模型目录返回对象。 */
     const catalog = { profiles: [], channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: true }
     /** 项目模型选择返回对象。 */
@@ -30,7 +41,12 @@ describe('Design renderer adapter', () => {
     /** 两类订阅释放函数必须原样返回。 */
     const releaseProfiles = (): void => undefined
     const releaseSelection = (): void => undefined
+    const releaseCanvas = (): void => undefined
     const api: PartialDesignApi = {
+      listCanvasSessions: async (input) => { canvasInputs.push(input); return [canvasSession] },
+      createCanvasSession: async (input) => { canvasInputs.push(input); return canvasSession },
+      updateCanvasSession: async (input) => { canvasInputs.push(input); return canvasSession },
+      onCanvasSessionChanged: () => releaseCanvas,
       listImageModelProfiles: async () => catalog,
       saveImageModelProfiles: async (input) => { modelInputs.push(input); return catalog },
       getImageModelSelection: async (projectId) => { modelInputs.push(projectId); return selection },
@@ -66,6 +82,14 @@ describe('Design renderer adapter', () => {
     expect(await adapter.getTaskDetails(taskInput)).toBe(taskDetails)
     expect(await adapter.getTaskTrace(taskInput)).toBe(taskTrace)
     expect(modelInputs).toEqual([saveProfilesInput, 'project-1', setSelectionInput])
+    /** 三个 Canvas 方法必须保留调用方对象身份。 */
+    const listCanvasInput = { projectId: 'project-1', archived: false }
+    const createCanvasInput = { projectId: 'project-1', title: '页面设计' }
+    const updateCanvasInput = { projectId: 'project-1', canvasId: 'canvas-1', archived: true }
+    expect(await adapter.listCanvasSessions(listCanvasInput)).toEqual([canvasSession])
+    expect(await adapter.createCanvasSession(createCanvasInput)).toBe(canvasSession)
+    expect(await adapter.updateCanvasSession(updateCanvasInput)).toBe(canvasSession)
+    expect(canvasInputs).toEqual([listCanvasInput, createCanvasInput, updateCanvasInput])
     /** 六个上下文方法必须保留调用方对象身份。 */
     const listContextInput = { projectId: 'project-1', query: 'brand' }
     const upsertContextInput = { projectId: 'project-1', category: 'brand' as const, title: '品牌', tags: [], markdown: '# Brand' }
@@ -85,6 +109,7 @@ describe('Design renderer adapter', () => {
     ])
     expect(adapter.onImageModelProfilesChanged(() => undefined)).toBe(releaseProfiles)
     expect(adapter.onImageModelSelectionChanged(() => undefined)).toBe(releaseSelection)
+    expect(adapter.onCanvasSessionChanged(() => undefined)).toBe(releaseCanvas)
     await expect(adapter.releaseMediaAccess()).resolves.toBeUndefined()
   })
 })

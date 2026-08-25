@@ -1,4 +1,6 @@
 import type {
+  CanvasSessionChangeEvent,
+  CreateCanvasSessionInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
   DeleteDesignContextInput,
@@ -15,7 +17,9 @@ import type {
   SaveDesignMutationsInput,
   SaveImageGenerationModelProfilesInput,
   ListDesignContextInput,
+  ListCanvasSessionsInput,
   UpsertDesignContextDocumentInput,
+  UpdateCanvasSessionInput,
   UpdateDesignContextEntryInput,
   UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
@@ -26,6 +30,10 @@ export type PartialDesignApi = Partial<DesignPreloadApi>
 
 /** Renderer 组件唯一使用的 Design 适配器。 */
 export interface DesignAdapter {
+  listCanvasSessions: (input: ListCanvasSessionsInput) => ReturnType<DesignPreloadApi['listCanvasSessions']>
+  createCanvasSession: (input: CreateCanvasSessionInput) => ReturnType<DesignPreloadApi['createCanvasSession']>
+  updateCanvasSession: (input: UpdateCanvasSessionInput) => ReturnType<DesignPreloadApi['updateCanvasSession']>
+  onCanvasSessionChanged: (listener: (event: CanvasSessionChangeEvent) => void) => ReturnType<DesignPreloadApi['onCanvasSessionChanged']>
   listImageModelProfiles: () => ReturnType<DesignPreloadApi['listImageModelProfiles']>
   saveImageModelProfiles: (input: SaveImageGenerationModelProfilesInput) => ReturnType<DesignPreloadApi['saveImageModelProfiles']>
   getImageModelSelection: (projectId: string) => ReturnType<DesignPreloadApi['getImageModelSelection']>
@@ -67,6 +75,10 @@ function requireMethod<K extends keyof DesignPreloadApi>(api: PartialDesignApi, 
 /** 创建只做类型收口和原样错误传播的 renderer adapter。 */
 export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
   return {
+    listCanvasSessions: (input) => requireMethod(api, 'listCanvasSessions')(input),
+    createCanvasSession: (input) => requireMethod(api, 'createCanvasSession')(input),
+    updateCanvasSession: (input) => requireMethod(api, 'updateCanvasSession')(input),
+    onCanvasSessionChanged: (listener) => requireMethod(api, 'onCanvasSessionChanged')(listener),
     listImageModelProfiles: () => requireMethod(api, 'listImageModelProfiles')(),
     saveImageModelProfiles: (input) => requireMethod(api, 'saveImageModelProfiles')(input),
     getImageModelSelection: (projectId) => requireMethod(api, 'getImageModelSelection')(projectId),

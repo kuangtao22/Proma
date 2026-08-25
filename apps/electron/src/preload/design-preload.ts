@@ -1,5 +1,8 @@
 import { DESIGN_IPC_CHANNELS } from '@proma/shared'
 import type {
+  CanvasSessionChangeEvent,
+  CanvasSessionMeta,
+  CreateCanvasSessionInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
   DeleteDesignContextInput,
@@ -18,6 +21,7 @@ import type {
   ImportDesignContextDocumentInput,
   ImportDesignAssetsInput,
   ImageGenerationModelCatalogResult,
+  ListCanvasSessionsInput,
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
   RelinkDesignAssetInput,
@@ -26,6 +30,7 @@ import type {
   SaveImageGenerationModelProfilesInput,
   ListDesignContextInput,
   UpsertDesignContextDocumentInput,
+  UpdateCanvasSessionInput,
   UpdateDesignContextEntryInput,
   UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
@@ -33,6 +38,10 @@ import type { IpcRendererEvent } from 'electron'
 
 /** Renderer 获得的稳定 Design API。 */
 export interface DesignPreloadApi {
+  listCanvasSessions: (input: ListCanvasSessionsInput) => Promise<CanvasSessionMeta[]>
+  createCanvasSession: (input: CreateCanvasSessionInput) => Promise<CanvasSessionMeta>
+  updateCanvasSession: (input: UpdateCanvasSessionInput) => Promise<CanvasSessionMeta>
+  onCanvasSessionChanged: (listener: (event: CanvasSessionChangeEvent) => void) => () => void
   listImageModelProfiles: () => Promise<ImageGenerationModelCatalogResult>
   saveImageModelProfiles: (input: SaveImageGenerationModelProfilesInput) => Promise<ImageGenerationModelCatalogResult>
   getImageModelSelection: (projectId: string) => Promise<DesignImageModelSelection>
@@ -74,6 +83,26 @@ export interface DesignPreloadIpc {
 /** 创建不暴露 ipcRenderer 本体的 Design preload API。 */
 export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi {
   return {
+    listCanvasSessions: (input) => ipc.invoke(
+      DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS,
+      input,
+    ) as Promise<CanvasSessionMeta[]>,
+    createCanvasSession: (input) => ipc.invoke(
+      DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION,
+      input,
+    ) as Promise<CanvasSessionMeta>,
+    updateCanvasSession: (input) => ipc.invoke(
+      DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION,
+      input,
+    ) as Promise<CanvasSessionMeta>,
+    onCanvasSessionChanged: (listener) => {
+      /** Electron event 对 Renderer 隐藏，只传 Canvas 会话业务变化。 */
+      const handler = (_event: IpcRendererEvent, value: unknown): void => (
+        listener(value as CanvasSessionChangeEvent)
+      )
+      ipc.on(DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED, handler)
+      return () => ipc.removeListener(DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED, handler)
+    },
     listImageModelProfiles: () => ipc.invoke(DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES) as Promise<ImageGenerationModelCatalogResult>,
     saveImageModelProfiles: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, input) as Promise<ImageGenerationModelCatalogResult>,
     getImageModelSelection: (projectId) => ipc.invoke(DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, { projectId }) as Promise<DesignImageModelSelection>,

@@ -25,6 +25,9 @@ describe('Design preload', () => {
     const recorded = createRecordingIpc()
     const api = createDesignPreloadApi(recorded.ipc)
     const calls: Array<[() => Promise<unknown>, string, unknown[]]> = [
+      [() => api.listCanvasSessions({ projectId: 'p1', archived: false }), DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS, [{ projectId: 'p1', archived: false }]],
+      [() => api.createCanvasSession({ projectId: 'p1', title: '页面设计' }), DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION, [{ projectId: 'p1', title: '页面设计' }]],
+      [() => api.updateCanvasSession({ projectId: 'p1', canvasId: 'canvas-1', archived: true }), DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION, [{ projectId: 'p1', canvasId: 'canvas-1', archived: true }]],
       [() => api.listImageModelProfiles(), DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, []],
       [() => api.saveImageModelProfiles({ profiles: [] }), DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, [{ profiles: [] }]],
       [() => api.getImageModelSelection('p1'), DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, [{ projectId: 'p1' }]],
@@ -86,5 +89,22 @@ describe('Design preload', () => {
     expect(selectionChanges).toEqual([{ projectId: 'p1' }])
     expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
     expect(recorded.removed[1]?.listener).toBe(recorded.added[1]?.listener)
+  })
+
+  test('Given Canvas 会话变化订阅 When 推送并取消 Then 只传业务事件且同引用解绑', () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    /** 收集 Renderer 实际收到的 Canvas 会话事件。 */
+    const received: unknown[] = []
+    const release = api.onCanvasSessionChanged((event) => received.push(event))
+    /** 主进程成功提交后的公开变化事件。 */
+    const change = { projectId: 'p1', canvasId: 'canvas-1', cause: 'created' as const }
+
+    recorded.added[0]?.listener({} as IpcRendererEvent, change)
+    release()
+
+    expect(received).toEqual([change])
+    expect(recorded.added[0]?.channel).toBe(DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED)
+    expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
   })
 })
