@@ -165,4 +165,33 @@ describe('CanvasSessionStore', () => {
     }))
     expect(() => store.list({ projectId: 'project-1' })).toThrow('项目归属不匹配')
   })
+
+  test('Given 未知或跨项目 Canvas When 要求 native Then 统一拒绝为会话不存在', () => {
+    const store = createStore(['project-1', 'project-2'])
+    /** 只在项目一登记的 native Canvas，不能被项目二索引读取。 */
+    store.create({ projectId: 'project-1', title: '项目一 Canvas' })
+
+    expect(() => store.requireNative('project-1', 'unknown-canvas')).toThrow('Canvas 会话不存在')
+    expect(() => store.requireNative('project-2', 'canvas-created')).toThrow('Canvas 会话不存在')
+  })
+
+  test('Given legacy Design 会话 When 要求 native Then 不泄露内部 storageKind', () => {
+    const store = createStore()
+    /** 旧画布文件只用于建立固定 legacy-design 索引记录。 */
+    const legacyPath = join(root, 'project-1', '.proma', 'design', 'canvas.json')
+    mkdirSync(join(root, 'project-1', '.proma', 'design'), { recursive: true })
+    writeFileSync(legacyPath, '{}', 'utf8')
+    store.ensureLegacySession('project-1')
+
+    /** Renderer 可见错误只表达会话不存在，不暴露迁移实现。 */
+    let message = ''
+    try {
+      store.requireNative('project-1', 'legacy-design')
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+    expect(message).toContain('Canvas 会话不存在')
+    expect(message).not.toContain('legacy')
+    expect(message).not.toContain('storageKind')
+  })
 })

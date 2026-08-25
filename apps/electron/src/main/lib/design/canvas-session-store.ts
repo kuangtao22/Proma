@@ -118,6 +118,21 @@ export class CanvasSessionStore {
   }
 
   /**
+   * 要求 Canvas 已登记在指定项目且使用原生文档存储。
+   * @param projectId 当前授权项目的稳定 ID。
+   * @param canvasId 需要访问的 Canvas 稳定 ID。
+   * @returns 不包含内部存储形态的公开会话元数据。
+   */
+  requireNative(projectId: string, canvasId: string): CanvasSessionMeta {
+    /** 只读取调用方指定项目自己的权威索引，禁止跨项目全局查找。 */
+    const index = this.readIndex(projectId)
+    /** 未知、跨项目和 legacy 会话统一表现为不存在，避免泄露迁移实现。 */
+    const record = index.sessions.find((session) => session.id === canvasId)
+    if (!record || record.storageKind !== 'native') throw new Error('Canvas 会话不存在')
+    return toPublicSession(record)
+  }
+
+  /**
    * 更新 Canvas 标题或归档状态；至少一个字段必须存在。
    * @param input 项目、Canvas ID 与待更新字段。
    * @returns 成功原子提交后的公开 Canvas 会话。
