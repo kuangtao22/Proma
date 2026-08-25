@@ -179,10 +179,12 @@ export function applyCanvasMutations(
   document: CanvasDocument,
   mutations: CanvasMutation[],
 ): CanvasDocument {
-  /** 深拷贝基线，保证归约过程不会修改调用方持有的文档。 */
-  let next = structuredClone(document)
+  /** 单次深拷贝同时隔离文档基线与 mutation payload，阻断调用方后续反向改写快照。 */
+  const isolatedInputs = structuredClone({ document, mutations })
+  /** 从隔离后的文档开始归约，保证调用方持有的基线不被修改。 */
+  let next = isolatedInputs.document
 
-  for (const mutation of mutations) {
+  for (const mutation of isolatedInputs.mutations) {
     switch (mutation.type) {
       case 'set-viewport':
         next.viewport = mutation.viewport

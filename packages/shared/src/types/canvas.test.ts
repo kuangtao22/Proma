@@ -9,6 +9,7 @@ import type {
   CanvasDocument,
   CanvasEdge,
   CanvasImageNode,
+  CanvasMutation,
   CanvasNode,
   CanvasVisualDocumentNode,
   CanvasWebviewNode,
@@ -259,6 +260,51 @@ describe('Canvas 图共享合同', () => {
 
     expect(result.nodes).toHaveLength(3)
     expect(result.nodes[1]?.title).toBe('第二版')
+  })
+
+  test('Given 可变 mutation payload When 归约后继续修改输入 Then 结果快照不受影响', () => {
+    /** set-viewport 持有的可变视口对象。 */
+    const viewport = { x: 50, y: 60, zoom: 1.5 }
+    /** move-nodes 持有的可变位置对象。 */
+    const position = { x: 250, y: 80 }
+    /** upsert-nodes 持有的可变节点对象。 */
+    const upsertedNode: CanvasImageNode = {
+      ...imageNode,
+      title: '隔离后的图片节点',
+      position: { x: 220, y: 40 },
+    }
+    /** upsert-edges 持有的可变边对象。 */
+    const upsertedEdge: CanvasEdge = {
+      id: 'edge-agent-document',
+      sourceNodeId: agentNode.id,
+      sourcePort: 'output',
+      targetNodeId: visualDocumentNode.id,
+      targetPort: 'input',
+    }
+    /** 覆盖四条对象引用写入路径的 mutation 批次。 */
+    const mutations: CanvasMutation[] = [
+      { type: 'set-viewport', viewport },
+      { type: 'move-nodes', positions: [{ nodeId: agentNode.id, position }] },
+      { type: 'upsert-nodes', nodes: [upsertedNode] },
+      { type: 'upsert-edges', edges: [upsertedEdge] },
+    ]
+    /** mutation 原始值归约形成的结果快照。 */
+    const result = applyCanvasMutations(createDocument(), mutations)
+
+    viewport.x = 999
+    position.x = 999
+    upsertedNode.title = '被外部修改的标题'
+    upsertedNode.position.x = 999
+    upsertedEdge.sourcePort = 'changed-output'
+
+    expect(result.viewport).toEqual({ x: 50, y: 60, zoom: 1.5 })
+    expect(result.nodes.find((node) => node.id === agentNode.id)?.position).toEqual({ x: 250, y: 80 })
+    expect(result.nodes.find((node) => node.id === imageNode.id)).toEqual({
+      ...imageNode,
+      title: '隔离后的图片节点',
+      position: { x: 220, y: 40 },
+    })
+    expect(result.edges.find((edge) => edge.id === upsertedEdge.id)?.sourcePort).toBe('output')
   })
 })
 
