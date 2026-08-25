@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -156,6 +158,18 @@ describe('CanvasDocumentStore', () => {
       .filter((name) => name.startsWith('.canvas.json') && name.endsWith('.tmp'))
   }
 
+  /** 把当前 Canvas 根转换为 helper OPENED 协议中的稳定身份事实。 */
+  function createOpenedCanvasRoot(canvasRoot: string) {
+    const stats = lstatSync(canvasRoot)
+    return {
+      requestedPath: canvasRoot,
+      canonicalPath: realpathSync(canvasRoot),
+      isDirectory: true,
+      volume: String(stats.dev),
+      fileId: String(stats.ino),
+    }
+  }
+
   test('Given 已登记 native Canvas 且文档缺失 When load Then 返回绑定双重身份的空文档且不落盘', () => {
     const fixture = createFixture()
 
@@ -164,6 +178,67 @@ describe('CanvasDocumentStore', () => {
       writable: true,
     })
     expect(existsSync(fixture.documentPath)).toBe(false)
+  })
+
+  test('Given helper OPENED 等待期间 Canvas registry 撤权 When 授权 scan Then fail closed 且零扫描', () => {
+    /** 可变 registry 用于模拟 LOAD 后、helper 授权前撤销 Canvas。 */
+    let authorized = true
+    const fixture = createFixture({
+      sessions: {
+        requireNative: () => {
+          if (!authorized) throw new Error('Canvas 会话不存在')
+          return {} as never
+        },
+      },
+    })
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const capability = fixture.store.loadWithDirectoryCapability(target)
+      .openSingleChildDirectory('transactions')
+    const openedRoot = createOpenedCanvasRoot(capability.rootPath)
+    /** 只有授权成功时才代表 helper 可以继续执行 scan。 */
+    let scanCalls = 0
+    authorized = false
+
+    expect(() => {
+      if (capability.authorizeOpenedRoots([openedRoot])) scanCalls += 1
+    }).toThrow('Canvas 会话不存在')
+    expect(scanCalls).toBe(0)
+  })
+
+  test('Given helper OPENED 等待期间项目迁移到新根 When 授权 write Then 旧根被拒绝且零写入', () => {
+    /** resolver 每次读取当前项目根，模拟迁移或重链后的权威路径切换。 */
+    let activeProjectRoot = join(root, 'project-before-migration')
+    const pathResolver = createDesignPathResolver({
+      getWorkspace: (projectId) => projectId === 'project-1' ? {
+        id: projectId,
+        name: '项目',
+        slug: projectId,
+        projectRootPath: activeProjectRoot,
+        createdAt: 1,
+        updatedAt: 1,
+      } : undefined,
+      getProjectFilesPath: () => activeProjectRoot,
+      getConfigDir: () => join(root, '.config'),
+    })
+    const store = createCanvasDocumentStore({
+      sessions: { requireNative: () => ({}) as never },
+      pathResolver,
+      now: () => 1,
+    })
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    /** 会话索引在真实流程中会先创建当前 Canvas 集合根。 */
+    mkdirSync(pathResolver.resolve(target.projectId).canvasesRoot, { recursive: true })
+    const capability = store.loadWithDirectoryCapability(target)
+      .openSingleChildDirectory('transactions')
+    const openedRoot = createOpenedCanvasRoot(capability.rootPath)
+    /** 只有旧 helper root 再次匹配当前 resolver 时才允许执行 write。 */
+    let writeCalls = 0
+    activeProjectRoot = join(root, 'project-after-migration')
+    mkdirSync(pathResolver.resolve(target.projectId).canvasesRoot, { recursive: true })
+
+    if (capability.authorizeOpenedRoots([openedRoot])) writeCalls += 1
+
+    expect(writeCalls).toBe(0)
   })
 
   test('Given legacy 画布存在且 native 缺失 When load Then 返回独立空文档绝不回退', () => {

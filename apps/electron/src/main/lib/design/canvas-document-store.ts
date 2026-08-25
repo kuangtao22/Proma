@@ -510,6 +510,17 @@ function assertCanvasDirectoryScope(identity: CanvasDirectoryScopeIdentity): voi
   assertDirectoryIdentity(identity.canvasesRoot)
 }
 
+/** 比较两次捕获的目录路径、物理路径和稳定文件身份。 */
+function isSameDirectoryIdentity(
+  left: CanvasDirectoryIdentity,
+  right: CanvasDirectoryIdentity,
+): boolean {
+  return left.path === right.path
+    && left.canonicalPath === right.canonicalPath
+    && left.dev === right.dev
+    && left.ino === right.ino
+}
+
 /** 从 lstat/fstat 提取读取期间必须保持稳定的内容状态。 */
 function toCanvasFileState(stats: CanvasFileStat): AtomicFileState {
   return {
@@ -866,16 +877,21 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
         }
         /** 子目录创建和打开交给 native helper 在已授权 root HANDLE 下完成。 */
         const assertValid = (): void => assertCanvasDirectoryScope(scopeIdentity)
-        /** OPENED 必须与同次 LOAD 捕获的具体 Canvas 根身份完全一致。 */
+        /** OPENED 必须同时匹配当前 registry/resolver 和首次 LOAD 捕获的 Canvas 根。 */
         const authorizeOpenedRoots = (roots: readonly StableDirectoryOpenedRoot[]): boolean => {
-          assertValid()
+          /** 授权瞬间重新读取 registry 和当前 resolver，撤权或迁移不得复用旧 capability。 */
+          const current = resolveAuthorizedTarget(target)
+          const currentCanvasRoot = current.directoryIdentity.canvasRoot
           const [root] = roots
           const allowed = roots.length === 1
-            && root?.requestedPath === scopeIdentity.canvasRoot.path
-            && root.canonicalPath === scopeIdentity.canvasRoot.canonicalPath
+            && isSameDirectoryIdentity(currentCanvasRoot, scopeIdentity.canvasRoot)
+            && root?.requestedPath === currentCanvasRoot.path
+            && root.canonicalPath === currentCanvasRoot.canonicalPath
             && root.isDirectory
-            && root.volume === String(scopeIdentity.canvasRoot.dev)
-            && root.fileId === String(scopeIdentity.canvasRoot.ino)
+            && root.volume === String(currentCanvasRoot.dev)
+            && root.fileId === String(currentCanvasRoot.ino)
+          /** 返回 ALLOW 前再次复验当前与首次目录身份，缩短捕获后的置换窗口。 */
+          assertCanvasDirectoryScope(current.directoryIdentity)
           assertValid()
           return allowed
         }

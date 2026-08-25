@@ -299,18 +299,19 @@ describe('Canvas Agent 节点创建事务', () => {
     })
   })
 
-  test('Given 文档已写入但 committed intent 写失败 When 重启恢复 Then 不重复创建并补写 committed', async () => {
+  test('Given 文档已写入但 committed intent 写失败 When 同 operation 重试 Then 补写 committed 并发布既有 revision', async () => {
     const harness = createHarness({ failIntentState: 'committed' })
     await expect(harness.createService().create(createInput(harness.target)))
       .rejects.toThrow('模拟 committed intent 写失败')
     expect(harness.getDocument().nodes).toContainEqual(expect.objectContaining({ id: 'node-1' }))
 
     harness.setFailedState(undefined)
-    const recovered = await harness.createService().reconcile(harness.target)
+    const recovered = await harness.createService().create(createInput(harness.target))
 
-    expect(recovered.snapshot.document.nodes).toContainEqual(expect.objectContaining({
+    expect(recovered.document.nodes).toContainEqual(expect.objectContaining({
       id: 'node-1', agentSessionId: SESSION_ID,
     }))
+    expect(recovered.documentChanged).toBe(true)
     expect(harness.createdInputs).toHaveLength(1)
     expect(JSON.parse(readFileSync(harness.intentPath, 'utf8'))).toMatchObject({ state: 'committed' })
   })

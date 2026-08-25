@@ -57,7 +57,13 @@ function createContext(options: {
     snapshot: { document: CanvasDocument; writable: true }
     documentChanged: boolean
   }
-  beforeCreate?: () => Promise<void>
+  retryReconcileResult?: {
+    snapshot: { document: CanvasDocument; writable: true }
+    documentChanged: boolean
+  }
+  beforeCreate?: (input: { projectId: string; canvasId: string }) => Promise<void>
+  createErrorOnce?: Error
+  createDocumentChanged?: boolean
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -79,6 +85,8 @@ function createContext(options: {
   const calls: string[] = []
   /** Store 收到的重建参数。 */
   const storeInputs: unknown[] = []
+  /** 创建调用次数用于模拟首次 committed 写失败后的同 operation 重试。 */
+  let createAttempts = 0
   const registration = registerCanvasDocumentIpcHandlers({
     ipc: {
       handle: (channel, handler) => { handlers.set(channel, handler) },
@@ -130,13 +138,17 @@ function createContext(options: {
       createReconciled: async (input) => {
         calls.push('creation:create')
         storeInputs.push(input)
-        await options.beforeCreate?.()
-        const reconciliation = options.reconcileResult ?? {
+        createAttempts += 1
+        await options.beforeCreate?.(input)
+        const reconciliation = (createAttempts > 1 ? options.retryReconcileResult : undefined)
+          ?? options.reconcileResult ?? {
           snapshot: options.loadResult ?? { document: createDocument(4), writable: true },
           documentChanged: false,
         }
-        if (options.createError) {
-          return { reconciliation, operationOutcome: { ok: false as const, error: options.createError } }
+        const createError = options.createError
+          ?? (createAttempts === 1 ? options.createErrorOnce : undefined)
+        if (createError) {
+          return { reconciliation, operationOutcome: { ok: false as const, error: createError } }
         }
         const document = createDocument(5)
         document.nodes = [{
@@ -158,7 +170,7 @@ function createContext(options: {
                 createdAt: 1,
                 updatedAt: 1,
               },
-              documentChanged: true,
+              documentChanged: options.createDocumentChanged ?? true,
             },
           },
         }
@@ -370,6 +382,40 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(createEntrances).toBe(2)
   })
 
+  test('Given Canvas A CREATE 阻塞 When Canvas B CREATE 进入 Then B 独立完成且无需等待 A', async () => {
+    /** 只阻塞 Canvas A，用于证明队列键包含 canvasId。 */
+    let releaseCanvasA = (): void => {}
+    const canvasAGate = new Promise<void>((resolvePromise) => { releaseCanvasA = resolvePromise })
+    const entrances: string[] = []
+    const context = createContext({
+      beforeCreate: async (input) => {
+        entrances.push(input.canvasId)
+        if (input.canvasId === 'canvas-a') await canvasAGate
+      },
+    })
+    const createFor = (canvasId: string, operationId: string, nodeId: string) => invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      context.sender,
+      {
+        projectId: 'project-1', canvasId, operationId, nodeId,
+        title: '首页 Agent', position: { x: 10, y: 20 },
+      },
+    )
+    const canvasA = createFor(
+      'canvas-a', '11111111-1111-4111-8111-111111111111', 'node-a',
+    )
+    while (!entrances.includes('canvas-a')) await Promise.resolve()
+
+    await expect(createFor(
+      'canvas-b', '33333333-3333-4333-8333-333333333333', 'node-b',
+    )).resolves.toBeDefined()
+    expect(entrances).toEqual(['canvas-a', 'canvas-b'])
+
+    releaseCanvasA()
+    await canvasA
+  })
+
   test('Given 文档已写但 committed intent 失败 When 创建返回错误 Then 不广播且不泄漏节点', async () => {
     const error = new Error('Canvas Agent 创建事务提交失败')
     const context = createContext({ createError: error })
@@ -385,6 +431,36 @@ describe('原生 Canvas 文档 IPC', () => {
       },
     )).rejects.toBe(error)
     expect(context.sender.sent).toEqual([])
+  })
+
+  test('Given committed 首次写失败 When 同 operation 重试越过发布屏障 Then 既有 revision 恰好广播一次', async () => {
+    const error = new Error('Canvas Agent 创建事务提交失败')
+    const context = createContext({
+      createErrorOnce: error,
+      createDocumentChanged: false,
+      retryReconcileResult: {
+        snapshot: { document: createDocument(5), writable: true },
+        documentChanged: true,
+      },
+    })
+    const input = {
+      projectId: 'project-1', canvasId: 'canvas-1',
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
+    }
+
+    await expect(invoke(
+      context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, input,
+    )).rejects.toBe(error)
+    expect(context.sender.sent).toEqual([])
+
+    await expect(invoke(
+      context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, input,
+    )).resolves.toBeDefined()
+    expect(context.sender.sent).toEqual([{
+      channel: CANVAS_IPC_CHANNELS.CHANGED,
+      value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
+    }])
   })
 
   test('Given SAVE 对账已提交图变更 When 后续 revision conflict Then 广播对账 revision 并原样抛错', async () => {

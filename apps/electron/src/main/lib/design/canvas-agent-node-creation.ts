@@ -71,7 +71,7 @@ export interface CanvasAgentNodeCreationIntent {
   updatedAt: number
 }
 
-/** 对账返回公开快照和是否产生新的图 revision。 */
+/** 对账返回公开快照和是否产生必须发布的图事实。 */
 export interface CanvasAgentNodeReconciliationResult {
   snapshot: CanvasWorkspaceSnapshot
   documentChanged: boolean
@@ -479,10 +479,11 @@ export class CanvasAgentNodeCreationService {
     originalIntent: CanvasAgentNodeCreationIntent,
     initialDocument: CanvasDocument,
     identity: CanvasTrustedDirectoryCapability,
-  ): Promise<{ intent: CanvasAgentNodeCreationIntent; document: CanvasDocument; documentChanged: boolean }> {
+  ): Promise<{ intent: CanvasAgentNodeCreationIntent; document: CanvasDocument; publishRequired: boolean }> {
     let intent = originalIntent
     let document = initialDocument
-    let documentChanged = false
+    /** 只有 committed 成功越过发布屏障后，既有 revision 才允许对外发布。 */
+    let publishRequired = false
     this.dependencies.assertModelAvailable(intent.channelId, intent.modelId)
 
     if (intent.state === 'prepared') {
@@ -525,13 +526,13 @@ export class CanvasAgentNodeCreationService {
           document.revision,
           [{ type: 'upsert-nodes', nodes: [node] }],
         )
-        documentChanged = true
       }
       /** committed 是唯一发布屏障；写失败时调用方不得广播或返回 document。 */
       intent = this.transitionIntent(intent, 'committed')
       await this.writeIntent(identity, intent)
+      publishRequired = true
     }
-    return { intent, document, documentChanged }
+    return { intent, document, publishRequired }
   }
 
   /** 在同一次 Store LOAD capability 上完成目标 Canvas 对账。 */
@@ -556,7 +557,7 @@ export class CanvasAgentNodeCreationService {
         const advanced = await this.advanceIntent(intent, document, identity)
         intent = advanced.intent
         document = advanced.document
-        documentChanged ||= advanced.documentChanged
+        documentChanged ||= advanced.publishRequired
       }
       if (intent.state === 'committed') {
         assertSessionMatchesIntent(this.dependencies.getSession(intent.sessionId), intent)
@@ -642,7 +643,7 @@ export class CanvasAgentNodeCreationService {
     return {
       document: advanced.document,
       session,
-      documentChanged: advanced.documentChanged,
+      documentChanged: advanced.publishRequired,
     }
   }
 
