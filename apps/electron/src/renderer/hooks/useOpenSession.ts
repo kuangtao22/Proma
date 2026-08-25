@@ -18,6 +18,7 @@ import {
 import { previewFileMapAtom } from '@/atoms/preview-atoms'
 import { appModeAtom } from '@/atoms/app-mode'
 import { activeViewAtom } from '@/atoms/active-view'
+import { activeCanvasSelectionAtom } from '@/atoms/canvas-session-atoms'
 import { automationFormAtom } from '@/atoms/automation-atoms'
 import { currentConversationIdAtom } from '@/atoms/chat-atoms'
 import {
@@ -44,6 +45,8 @@ export function useOpenSession(): OpenSessionFn {
   const setActiveTabId = useSetAtom(activeTabIdAtom)
   const setAppMode = useSetAtom(appModeAtom)
   const setActiveView = useSetAtom(activeViewAtom)
+  /** 普通会话导航成功后清理 Canvas 双重身份，避免顶部入口残留激活态。 */
+  const setActiveCanvasSelection = useSetAtom(activeCanvasSelectionAtom)
   const setAutomationForm = useSetAtom(automationFormAtom)
   const setCurrentConversationId = useSetAtom(currentConversationIdAtom)
   const setCurrentAgentSessionId = useSetAtom(currentAgentSessionIdAtom)
@@ -76,6 +79,7 @@ export function useOpenSession(): OpenSessionFn {
       setTabs(result.tabs)
       setActiveTabId(result.activeTabId)
       setAutomationForm({ open: false, draft: null })
+      setActiveCanvasSelection(null)
       setActiveView('conversations')
 
       if (type === 'chat') {
@@ -107,6 +111,6 @@ export function useOpenSession(): OpenSessionFn {
         setCurrentAgentSessionId(null)
       }
     },
-    [tabs, setTabs, setActiveTabId, setAutomationForm, setActiveView, setAppMode, setCurrentConversationId, setCurrentAgentSessionId, agentSessions, setCurrentAgentWorkspaceId, setUnviewedCompleted, settingsOpen, channelFormDirty, setSettingsOpen, setPendingSessionNavigation],
+    [tabs, setTabs, setActiveTabId, setAutomationForm, setActiveCanvasSelection, setActiveView, setAppMode, setCurrentConversationId, setCurrentAgentSessionId, agentSessions, setCurrentAgentWorkspaceId, setUnviewedCompleted, settingsOpen, channelFormDirty, setSettingsOpen, setPendingSessionNavigation],
   )
 }
