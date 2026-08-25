@@ -564,18 +564,18 @@ export function createAgentSessionWithMetadata(
   if (hasDesignMetadata && (!sourceDesignProjectId || !sourceDesignJobId)) {
     throw new Error('Design 内部会话来源字段必须成对提供')
   }
-  /** 规范化后的 Canvas 项目来源。 */
-  const sourceCanvasProjectId = input.sourceCanvasProjectId?.trim()
-  /** 规范化后的 Canvas 身份。 */
-  const sourceCanvasId = input.sourceCanvasId?.trim()
-  /** 规范化后的 Canvas 节点身份。 */
-  const sourceCanvasNodeId = input.sourceCanvasNodeId?.trim()
-  if (hasCanvasMetadata && !hasValidCanvasAgentOwnership({
+  /** 原始 Canvas 三字段是否均非空且不含首尾空格。 */
+  const hasCanonicalCanvasMetadata = [
+    input.sourceCanvasProjectId,
+    input.sourceCanvasId,
+    input.sourceCanvasNodeId,
+  ].every((value) => typeof value === 'string' && value.trim().length > 0 && value.trim() === value)
+  if (hasCanvasMetadata && (!hasCanonicalCanvasMetadata || !hasValidCanvasAgentOwnership({
     workspaceId: input.workspaceId,
-    sourceCanvasProjectId,
-    sourceCanvasId,
-    sourceCanvasNodeId,
-  })) {
+    sourceCanvasProjectId: input.sourceCanvasProjectId,
+    sourceCanvasId: input.sourceCanvasId,
+    sourceCanvasNodeId: input.sourceCanvasNodeId,
+  }))) {
     throw new Error('Canvas 内部会话来源字段必须完整且属于当前项目')
   }
 
@@ -596,7 +596,11 @@ export function createAgentSessionWithMetadata(
     // 新会话继承已持久化的全局思考偏好，之后仍可按会话单独调整。
     reasoningLevel: defaultThinkingLevel,
     ...(hasDesignMetadata ? { sourceDesignProjectId, sourceDesignJobId } : {}),
-    ...(hasCanvasMetadata ? { sourceCanvasProjectId, sourceCanvasId, sourceCanvasNodeId } : {}),
+    ...(hasCanvasMetadata ? {
+      sourceCanvasProjectId: input.sourceCanvasProjectId,
+      sourceCanvasId: input.sourceCanvasId,
+      sourceCanvasNodeId: input.sourceCanvasNodeId,
+    } : {}),
     createdAt: now,
     updatedAt: now,
   }

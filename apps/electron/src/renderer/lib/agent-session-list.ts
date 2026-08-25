@@ -90,6 +90,8 @@ export function upsertAgentSession(
  * - fetched 缺失、且本地 updatedAt 不早于快照水位的条目；
  * - fetched 同 ID 但其 updatedAt 不晚于本地的条目（例如 TITLE_UPDATED 已抵达，
  *   但该 fetch 在标题落盘前已开始）。
+ * 权威快照中的内部会话保留 ID tombstone 语义，但不参与普通会话新鲜度竞争；
+ * 本地内部残留同样不能覆盖权威恢复为普通身份的记录。
  *
  * 这样既能反映真实删除，又能抵御陈旧快照回冲。
  */
@@ -97,7 +99,11 @@ export function mergeFetchedAgentSessions(
   prev: readonly AgentSessionMeta[],
   fetched: readonly AgentSessionMeta[],
 ): AgentSessionMeta[] {
-  const previousById = new Map(prev.map((session) => [session.id, session]))
+  /** 只有本地普通会话可以参与同 ID 新鲜度竞争。 */
+  const visiblePreviousById = new Map(
+    prev.filter(isRendererVisibleAgentSession).map((session) => [session.id, session]),
+  )
+  /** 保留权威快照全部 ID，使内部记录可以阻止同 ID 本地条目幸存。 */
   const fetchedIds = new Set(fetched.map((session) => session.id))
   // 本次快照所反映的“数据新鲜度水位”：快照里最大的 updatedAt。
   // 比它更新的本地条目，说明在该快照生成之后才出现/更新，不能被它判定为删除。
@@ -107,17 +113,20 @@ export function mergeFetchedAgentSessions(
   )
 
   // 保留本地存在、fetched 缺失、且不早于水位的条目（疑似并发新建尚未被本快照看到）。
-  const survivingLocalOnly = prev.filter(
-    (session) =>
-      !fetchedIds.has(session.id) && session.updatedAt >= snapshotWatermark,
-  )
+  const survivingLocalOnly = prev
+    .filter(isRendererVisibleAgentSession)
+    .filter((session) => (
+      !fetchedIds.has(session.id) && session.updatedAt >= snapshotWatermark
+    ))
 
   // 同 ID 的旧快照不能覆盖已通过事件即时写入的本地状态。等值也保留本地，
   // 因为 TITLE_UPDATED 事件不携带权威 updatedAt，时间戳可能尚未来得及同步。
-  const mergedFetched = fetched.map((session) => {
-    const local = previousById.get(session.id)
-    return local && local.updatedAt >= session.updatedAt ? local : session
-  })
+  const mergedFetched = fetched
+    .filter(isRendererVisibleAgentSession)
+    .map((session) => {
+      const local = visiblePreviousById.get(session.id)
+      return local && local.updatedAt >= session.updatedAt ? local : session
+    })
 
   return sortAgentSessionsByUpdatedAtDesc(
     [...mergedFetched, ...survivingLocalOnly].filter(isRendererVisibleAgentSession),

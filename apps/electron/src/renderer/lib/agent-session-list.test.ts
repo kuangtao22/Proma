@@ -210,4 +210,30 @@ describe('mergeFetchedAgentSessions', () => {
 
     expect(result.map((session) => session.id)).toEqual(['visible'])
   })
+
+  test('Given 权威快照把同 ID 普通会话标记为内部 When 本地普通记录更新 Then 内部记录作为 tombstone', () => {
+    /** 本地事件中的较新普通记录不得压过权威内部身份。 */
+    const localVisible = makeSession('same-session', 100, { title: '本地普通记录' })
+    /** 权威快照中的内部身份决定该 ID 不再对用户可见。 */
+    const fetchedInternal = makeSession('same-session', 20, {
+      workspaceId: 'project-1',
+      sourceCanvasProjectId: 'project-1',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    })
+
+    expect(mergeFetchedAgentSessions([localVisible], [fetchedInternal])).toEqual([])
+  })
+
+  test('Given 本地同 ID 残留内部记录 When 权威快照返回普通会话 Then 采用权威普通记录', () => {
+    /** 本地较新的内部残留不能覆盖权威可见身份。 */
+    const localInternal = makeSession('same-session', 100, {
+      sourceDesignProjectId: 'project-1',
+      sourceDesignJobId: 'job-1',
+    })
+    /** 权威快照已经把该 ID 恢复为普通会话。 */
+    const fetchedVisible = makeSession('same-session', 20, { title: '权威普通记录' })
+
+    expect(mergeFetchedAgentSessions([localInternal], [fetchedVisible])).toEqual([fetchedVisible])
+  })
 })

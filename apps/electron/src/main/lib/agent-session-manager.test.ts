@@ -719,6 +719,9 @@ describe('Agent 会话 runtime 元数据', () => {
     ['缺少一个来源字段', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: 'workspace-canvas', sourceCanvasId: 'canvas-1' }],
     ['缺少两个来源字段', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: 'workspace-canvas' }],
     ['空字符串来源字段', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: 'workspace-canvas', sourceCanvasId: '', sourceCanvasNodeId: 'node-1' }],
+    ['项目 ID 带首尾空格', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: ' workspace-canvas ', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1' }],
+    ['Canvas ID 带首尾空格', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: 'workspace-canvas', sourceCanvasId: ' canvas-1 ', sourceCanvasNodeId: 'node-1' }],
+    ['节点 ID 带首尾空格', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: 'workspace-canvas', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: ' node-1 ' }],
     ['工作区不匹配', { workspaceId: 'workspace-other', sourceCanvasProjectId: 'workspace-canvas', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1' }],
     ['Design 与 Canvas 混用', {
       workspaceId: 'workspace-canvas',
