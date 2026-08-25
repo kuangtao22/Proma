@@ -22,6 +22,8 @@ describe('Design 路径解析', () => {
       projectRoot: '/projects/demo',
       designRoot: '/projects/demo/.proma/design',
       canvasPath: '/projects/demo/.proma/design/canvas.json',
+      canvasesRoot: '/projects/demo/.proma/design/canvases',
+      canvasSessionsIndexPath: '/projects/demo/.proma/design/canvases/index.json',
       assetsDir: '/projects/demo/.proma/design/assets',
       annotationsDir: '/projects/demo/.proma/design/annotations',
       contextRoot: '/projects/demo/.proma/design/context',
@@ -35,6 +37,21 @@ describe('Design 路径解析', () => {
       tracesDir: '/home/test/.proma/design-cache/project-1/traces',
       stagingDir: '/home/test/.proma/design-cache/project-1/staging',
     })
+
+    expect(resolver.resolveCanvas('project-1', 'canvas-1')).toEqual({
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      canvasRoot: '/projects/demo/.proma/design/canvases/canvas-1',
+      documentPath: '/projects/demo/.proma/design/canvases/canvas-1/canvas.json',
+      cacheRoot: '/home/test/.proma/design-cache/project-1/canvases/canvas-1',
+      jobsDir: '/home/test/.proma/design-cache/project-1/canvases/canvas-1/jobs',
+      tracesDir: '/home/test/.proma/design-cache/project-1/canvases/canvas-1/traces',
+      stagingDir: '/home/test/.proma/design-cache/project-1/canvases/canvas-1/staging',
+      thumbnailsDir: '/home/test/.proma/design-cache/project-1/canvases/canvas-1/thumbnails',
+    })
+
+    expect(() => resolver.resolveCanvas('project-1', '../escape')).toThrow('Canvas ID 非法')
+    expect(() => resolver.resolveCanvas('project-1', 'nested/path')).toThrow('Canvas ID 非法')
   })
 
   test('Given 托管项目 When 解析 Then 通过不可变 slug 获取项目根', () => {

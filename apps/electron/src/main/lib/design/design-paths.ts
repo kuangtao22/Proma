@@ -9,6 +9,8 @@ export interface DesignPaths {
   projectRoot: string
   designRoot: string
   canvasPath: string
+  canvasesRoot: string
+  canvasSessionsIndexPath: string
   assetsDir: string
   annotationsDir: string
   contextRoot: string
@@ -23,10 +25,25 @@ export interface DesignPaths {
   stagingDir: string
 }
 
-/** Design 路径解析器，只接受已登记项目 ID。 */
+/** 单个 Canvas 的正式文档与可重建缓存路径。 */
+export interface CanvasPaths {
+  projectId: string
+  canvasId: string
+  canvasRoot: string
+  documentPath: string
+  cacheRoot: string
+  jobsDir: string
+  tracesDir: string
+  stagingDir: string
+  thumbnailsDir: string
+}
+
+/** Design 路径解析器，只接受已登记项目和安全稳定 ID。 */
 export interface DesignPathResolver {
-  /** 根据项目 ID 解析受信任路径，不接受 Renderer 提供的路径。 */
+  /** 根据项目 ID 解析项目级共享路径。 */
   resolve: (projectId: string) => DesignPaths
+  /** 根据项目和 Canvas ID 解析 Canvas 专属路径。 */
+  resolveCanvas: (projectId: string, canvasId: string) => CanvasPaths
 }
 
 /** 路径解析器依赖，测试可注入隔离目录。 */
@@ -59,48 +76,77 @@ export function isSafeDesignStableId(value: unknown): value is string {
 export function createDesignPathResolver(
   dependencies: DesignPathResolverDependencies,
 ): DesignPathResolver {
+  /** 项目级路径只由受信任工作区索引解析，供共享与 Canvas 专属入口复用。 */
+  const resolveProject = (projectId: string): DesignPaths => {
+    if (!isSafeDesignStableId(projectId)) {
+      throw new Error(`项目 ID 非法: ${projectId}`)
+    }
+    /** 只有已登记工作区才拥有正式项目根。 */
+    const workspace = dependencies.getWorkspace(projectId)
+    if (!workspace || workspace.id !== projectId) {
+      throw new Error(`项目不存在: ${projectId}`)
+    }
+
+    /** 正式数据根只由工作区 slug 解析，禁止把项目 ID 当文件路径。 */
+    const projectRoot = dependencies.getProjectFilesPath(workspace.slug)
+    /** 缓存根只由活动配置根和已校验的稳定 ID 组成。 */
+    const configRoot = dependencies.getConfigDir()
+    if (!isAbsolute(projectRoot) || !isAbsolute(configRoot)) {
+      throw new Error('Design 路径必须位于绝对目录')
+    }
+
+    /** 项目内可移植的 Design 正式数据根。 */
+    const designRoot = join(projectRoot, '.proma', 'design')
+    /** 项目内多 Canvas 正式数据根。 */
+    const canvasesRoot = join(designRoot, 'canvases')
+    /** 项目内可移植的长期创作上下文根。 */
+    const contextRoot = join(designRoot, 'context')
+    /** 全局可重建的项目 Design 缓存根。 */
+    const cacheRoot = join(configRoot, 'design-cache', projectId)
+    return {
+      projectId,
+      projectRoot,
+      designRoot,
+      canvasPath: join(designRoot, 'canvas.json'),
+      canvasesRoot,
+      canvasSessionsIndexPath: join(canvasesRoot, 'index.json'),
+      assetsDir: join(designRoot, 'assets'),
+      annotationsDir: join(designRoot, 'annotations'),
+      contextRoot,
+      contextManifestPath: join(contextRoot, 'manifest.json'),
+      contextDocumentsDir: join(contextRoot, 'documents'),
+      contextReferencesDir: join(contextRoot, 'references'),
+      cacheRoot,
+      preferencesPath: join(cacheRoot, 'preferences.json'),
+      thumbnailsDir: join(cacheRoot, 'thumbnails'),
+      jobsDir: join(cacheRoot, 'jobs'),
+      tracesDir: join(cacheRoot, 'traces'),
+      stagingDir: join(cacheRoot, 'staging'),
+    }
+  }
+
   return {
-    resolve(projectId: string): DesignPaths {
-      if (!isSafeDesignStableId(projectId)) {
-        throw new Error(`项目 ID 非法: ${projectId}`)
+    resolve: resolveProject,
+    resolveCanvas(projectId: string, canvasId: string): CanvasPaths {
+      if (!isSafeDesignStableId(canvasId)) {
+        throw new Error(`Canvas ID 非法: ${canvasId}`)
       }
-      /** 只有已登记工作区才拥有正式项目根。 */
-      const workspace = dependencies.getWorkspace(projectId)
-      if (!workspace || workspace.id !== projectId) {
-        throw new Error(`项目不存在: ${projectId}`)
-      }
-
-      /** 正式数据根只由工作区 slug 解析，禁止把项目 ID 当文件路径。 */
-      const projectRoot = dependencies.getProjectFilesPath(workspace.slug)
-      /** 缓存根只由活动配置根和已校验的稳定 ID 组成。 */
-      const configRoot = dependencies.getConfigDir()
-      if (!isAbsolute(projectRoot) || !isAbsolute(configRoot)) {
-        throw new Error('Design 路径必须位于绝对目录')
-      }
-
-      /** 项目内可移植的 Design 正式数据根。 */
-      const designRoot = join(projectRoot, '.proma', 'design')
-      /** 项目内可移植的长期创作上下文根。 */
-      const contextRoot = join(designRoot, 'context')
-      /** 全局可重建的项目 Design 缓存根。 */
-      const cacheRoot = join(configRoot, 'design-cache', projectId)
+      /** 项目级路径继续由同一个受信任解析入口产生。 */
+      const projectPaths = resolveProject(projectId)
+      /** Canvas 正式目录只由已验证稳定 ID 拼接。 */
+      const canvasRoot = join(projectPaths.canvasesRoot, canvasId)
+      /** Canvas 缓存继续位于当前 Proma 数据根，并按项目和 Canvas 双重隔离。 */
+      const canvasCacheRoot = join(projectPaths.cacheRoot, 'canvases', canvasId)
       return {
         projectId,
-        projectRoot,
-        designRoot,
-        canvasPath: join(designRoot, 'canvas.json'),
-        assetsDir: join(designRoot, 'assets'),
-        annotationsDir: join(designRoot, 'annotations'),
-        contextRoot,
-        contextManifestPath: join(contextRoot, 'manifest.json'),
-        contextDocumentsDir: join(contextRoot, 'documents'),
-        contextReferencesDir: join(contextRoot, 'references'),
-        cacheRoot,
-        preferencesPath: join(cacheRoot, 'preferences.json'),
-        thumbnailsDir: join(cacheRoot, 'thumbnails'),
-        jobsDir: join(cacheRoot, 'jobs'),
-        tracesDir: join(cacheRoot, 'traces'),
-        stagingDir: join(cacheRoot, 'staging'),
+        canvasId,
+        canvasRoot,
+        documentPath: join(canvasRoot, 'canvas.json'),
+        cacheRoot: canvasCacheRoot,
+        jobsDir: join(canvasCacheRoot, 'jobs'),
+        tracesDir: join(canvasCacheRoot, 'traces'),
+        stagingDir: join(canvasCacheRoot, 'staging'),
+        thumbnailsDir: join(canvasCacheRoot, 'thumbnails'),
       }
     },
   }
