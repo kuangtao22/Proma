@@ -1,7 +1,10 @@
-import { DESIGN_IPC_CHANNELS } from '@proma/shared'
+import { CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS } from '@proma/shared'
 import type {
+  CanvasChangeEvent,
+  CanvasDocument,
   CanvasSessionChangeEvent,
   CanvasSessionMeta,
+  CanvasWorkspaceSnapshot,
   CreateCanvasSessionInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
@@ -22,11 +25,13 @@ import type {
   ImportDesignAssetsInput,
   ImageGenerationModelCatalogResult,
   ListCanvasSessionsInput,
+  LoadCanvasInput,
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
   RelinkDesignAssetInput,
   RegisterDesignContextAssetInput,
   SaveDesignMutationsInput,
+  SaveCanvasMutationsInput,
   SaveImageGenerationModelProfilesInput,
   ListDesignContextInput,
   UpsertDesignContextDocumentInput,
@@ -38,6 +43,12 @@ import type { IpcRendererEvent } from 'electron'
 
 /** Renderer 获得的稳定 Design API。 */
 export interface DesignPreloadApi {
+  /** 加载项目中指定原生 Canvas 的公开工作区快照。 */
+  loadCanvasWorkspace: (input: LoadCanvasInput) => Promise<CanvasWorkspaceSnapshot>
+  /** 在权威 revision 上保存指定原生 Canvas mutation。 */
+  saveCanvasMutations: (input: SaveCanvasMutationsInput) => Promise<CanvasDocument>
+  /** 订阅所有原生 Canvas 变化，双身份过滤由 Renderer adapter 执行。 */
+  onCanvasChanged: (listener: (event: CanvasChangeEvent) => void) => () => void
   listCanvasSessions: (input: ListCanvasSessionsInput) => Promise<CanvasSessionMeta[]>
   createCanvasSession: (input: CreateCanvasSessionInput) => Promise<CanvasSessionMeta>
   updateCanvasSession: (input: UpdateCanvasSessionInput) => Promise<CanvasSessionMeta>
@@ -83,6 +94,22 @@ export interface DesignPreloadIpc {
 /** 创建不暴露 ipcRenderer 本体的 Design preload API。 */
 export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi {
   return {
+    loadCanvasWorkspace: (input) => ipc.invoke(
+      CANVAS_IPC_CHANNELS.LOAD,
+      input,
+    ) as Promise<CanvasWorkspaceSnapshot>,
+    saveCanvasMutations: (input) => ipc.invoke(
+      CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
+      input,
+    ) as Promise<CanvasDocument>,
+    onCanvasChanged: (listener) => {
+      /** Electron event 对 Renderer 隐藏，只传原生 Canvas 业务变化。 */
+      const handler = (_event: IpcRendererEvent, value: unknown): void => (
+        listener(value as CanvasChangeEvent)
+      )
+      ipc.on(CANVAS_IPC_CHANNELS.CHANGED, handler)
+      return () => ipc.removeListener(CANVAS_IPC_CHANNELS.CHANGED, handler)
+    },
     listCanvasSessions: (input) => ipc.invoke(
       DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS,
       input,

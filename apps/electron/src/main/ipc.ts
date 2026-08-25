@@ -5,7 +5,7 @@
  */
 
 import { ipcMain, nativeTheme, shell, dialog, BrowserWindow, app, clipboard, nativeImage } from 'electron'
-import type { OpenDialogOptions, SaveDialogOptions } from 'electron'
+import type { OpenDialogOptions, SaveDialogOptions, WebContents } from 'electron'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { existsSync, realpathSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
@@ -173,6 +173,8 @@ import { DesignImageModelPreferences } from './lib/design/design-image-model-pre
 import { registerDesignIpcHandlers } from './lib/design/design-ipc'
 import { registerCanvasSessionIpcHandlers } from './lib/design/canvas-session-ipc'
 import { CanvasSessionStore } from './lib/design/canvas-session-store'
+import { registerCanvasDocumentIpcHandlers } from './lib/design/canvas-document-ipc'
+import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import {
   runChannelMutationWithImageModelBroadcast,
   updateToolCredentialsWithImageModelBroadcast,
@@ -1107,6 +1109,8 @@ export function registerIpcHandlers(): void {
   })
   /** Canvas 顶层会话使用独立索引，禁止写入 Agent 会话索引。 */
   const canvasSessionStore = new CanvasSessionStore({ pathResolver: designPathResolver })
+  /** 原生 Canvas 文档复用同一会话索引作为项目与 Canvas 双身份授权事实。 */
+  const canvasDocumentStore = createCanvasDocumentStore({ sessions: canvasSessionStore })
   /** 项目离线或迁移时返回稳定 Design/Canvas 只读原因。 */
   const getDesignProjectReadOnlyReason = (projectId: string): string | undefined => {
     /** 未登记项目仍交给路径解析器或 store 抛出明确的项目不存在错误。 */
@@ -1208,23 +1212,29 @@ export function registerIpcHandlers(): void {
     assets: designAssetService,
   })
   setDefaultDesignJobManager(designJobManager)
+  /** Canvas 与 legacy Design 共用仍存活主窗口授权边界。 */
+  const listAuthorizedDesignWebContents = (): WebContents[] => {
+    /** 销毁窗口不能继续调用 handler 或接收广播。 */
+    const contents = getStoredMainWindow()?.webContents
+    return contents && !contents.isDestroyed() ? [contents] : []
+  }
   registerCanvasSessionIpcHandlers({
     ipc: ipcMain,
-    listAuthorizedWebContents: () => {
-      /** Canvas 会话当前只允许主窗口访问。 */
-      const contents = getStoredMainWindow()?.webContents
-      return contents && !contents.isDestroyed() ? [contents] : []
-    },
+    listAuthorizedWebContents: listAuthorizedDesignWebContents,
     guard: workspaceOperationGuard,
     sessions: canvasSessionStore,
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
   })
+  registerCanvasDocumentIpcHandlers({
+    ipc: ipcMain,
+    listAuthorizedWebContents: listAuthorizedDesignWebContents,
+    guard: workspaceOperationGuard,
+    store: canvasDocumentStore,
+    getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
+  })
   registerDesignIpcHandlers({
     ipc: ipcMain,
-    listAuthorizedWebContents: () => {
-      const contents = getStoredMainWindow()?.webContents
-      return contents && !contents.isDestroyed() ? [contents] : []
-    },
+    listAuthorizedWebContents: listAuthorizedDesignWebContents,
     guard: workspaceOperationGuard,
     store: designStore,
     assets: designAssetService,

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { DESIGN_IPC_CHANNELS } from '@proma/shared'
+import { CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS } from '@proma/shared'
 import type { IpcRendererEvent } from 'electron'
 import { createDesignPreloadApi, type DesignPreloadIpc } from './design-preload'
 
@@ -25,6 +25,8 @@ describe('Design preload', () => {
     const recorded = createRecordingIpc()
     const api = createDesignPreloadApi(recorded.ipc)
     const calls: Array<[() => Promise<unknown>, string, unknown[]]> = [
+      [() => api.loadCanvasWorkspace({ projectId: 'p1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.LOAD, [{ projectId: 'p1', canvasId: 'canvas-1' }]],
+      [() => api.saveCanvasMutations({ projectId: 'p1', canvasId: 'canvas-1', expectedRevision: 0, mutations: [] }), CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, [{ projectId: 'p1', canvasId: 'canvas-1', expectedRevision: 0, mutations: [] }]],
       [() => api.listCanvasSessions({ projectId: 'p1', archived: false }), DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS, [{ projectId: 'p1', archived: false }]],
       [() => api.createCanvasSession({ projectId: 'p1', title: '页面设计' }), DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION, [{ projectId: 'p1', title: '页面设计' }]],
       [() => api.updateCanvasSession({ projectId: 'p1', canvasId: 'canvas-1', archived: true }), DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION, [{ projectId: 'p1', canvasId: 'canvas-1', archived: true }]],
@@ -105,6 +107,26 @@ describe('Design preload', () => {
 
     expect(received).toEqual([change])
     expect(recorded.added[0]?.channel).toBe(DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED)
+    expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
+  })
+
+  test('Given 原生 Canvas 文档变化订阅 When 推送并取消 Then 使用固定通道且同引用解绑', () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    /** 收集 Renderer 收到的原生 Canvas 事件。 */
+    const received: unknown[] = []
+    const release = api.onCanvasChanged((event) => received.push(event))
+    /** 同时携带项目与 Canvas 身份的恢复事件。 */
+    const change = {
+      projectId: 'p1', canvasId: 'canvas-1', revision: 1, cause: 'recovery' as const,
+    }
+
+    recorded.added[0]?.listener({} as IpcRendererEvent, change)
+    release()
+
+    expect(received).toEqual([change])
+    expect(recorded.added[0]?.channel).toBe(CANVAS_IPC_CHANNELS.CHANGED)
+    expect(recorded.removed[0]?.channel).toBe(CANVAS_IPC_CHANNELS.CHANGED)
     expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
   })
 })

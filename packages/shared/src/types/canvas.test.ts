@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  CANVAS_IPC_CHANNELS,
   CANVAS_DOCUMENT_VERSION,
   applyCanvasMutations,
   createEmptyCanvasDocument,
 } from './canvas'
 import type {
+  CanvasChangeEvent,
   CanvasAgentNode,
   CanvasDocument,
   CanvasEdge,
@@ -13,6 +15,9 @@ import type {
   CanvasNode,
   CanvasVisualDocumentNode,
   CanvasWebviewNode,
+  CanvasWorkspaceSnapshot,
+  LoadCanvasInput,
+  SaveCanvasMutationsInput,
 } from './canvas'
 
 /** 测试使用的固定时间，避免文档合同依赖系统时钟。 */
@@ -93,6 +98,47 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given 原生 Canvas IPC When 构造公开合同 Then 只暴露双重身份、revision 与恢复来源', () => {
+    /** 加载请求必须同时绑定项目与 Canvas。 */
+    const loadInput: LoadCanvasInput = { projectId: 'project-1', canvasId: 'canvas-1' }
+    /** 保存请求只携带权威 revision 与 mutation，不包含存储路径。 */
+    const saveInput: SaveCanvasMutationsInput = {
+      ...loadInput,
+      expectedRevision: 0,
+      mutations: [],
+    }
+    /** Renderer 可见的恢复快照不暴露 storageKind 或路径。 */
+    const snapshot: CanvasWorkspaceSnapshot = {
+      document: createEmptyCanvasDocument('project-1', 'canvas-1', now),
+      writable: true,
+      recoveredFrom: 'backup',
+    }
+    /** 恢复事件允许使用低 revision，消费者据 cause 决定无条件失效。 */
+    const change: CanvasChangeEvent = {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      revision: 0,
+      cause: 'recovery',
+    }
+
+    expect(CANVAS_IPC_CHANNELS).toEqual({
+      LOAD: 'canvas:load',
+      SAVE_MUTATIONS: 'canvas:save-mutations',
+      CHANGED: 'canvas:changed',
+    })
+    expect(loadInput).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })
+    expect(saveInput.mutations).toEqual([])
+    expect(snapshot.recoveredFrom).toBe('backup')
+    expect(change).toEqual({
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      revision: 0,
+      cause: 'recovery',
+    })
+    expect('path' in snapshot).toBe(false)
+    expect('storageKind' in snapshot).toBe(false)
+  })
+
   test('Given 项目与 Canvas 身份 When 创建空文档 Then 同时固化两级身份和初始状态', () => {
     /** 新 Canvas 的空文档。 */
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', now)

@@ -1,9 +1,74 @@
 import { describe, expect, test } from 'bun:test'
-import { createEmptyDesignDocument } from '@proma/shared'
-import type { SaveDesignMutationsInput } from '@proma/shared'
+import { createEmptyCanvasDocument, createEmptyDesignDocument } from '@proma/shared'
+import type { CanvasChangeEvent, SaveDesignMutationsInput } from '@proma/shared'
 import { createDesignAdapter, type PartialDesignApi } from './design-adapter'
 
 describe('Design renderer adapter', () => {
+  test('Given 原生 Canvas preload 缺失或失败 When adapter 调用 Then 使用稳定接线错误并原样传播失败', async () => {
+    const missing = createDesignAdapter({})
+    expect(() => missing.loadCanvas({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('Design API 未接通: loadCanvasWorkspace')
+
+    /** preload 抛出的原始错误对象。 */
+    const originalError = new Error('CANVAS_COMMIT_UNCERTAIN: main durability requires reload')
+    const failed = createDesignAdapter({
+      saveCanvasMutations: async () => { throw originalError },
+    })
+    await expect(failed.saveCanvas({
+      projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 1, mutations: [],
+    })).rejects.toBe(originalError)
+  })
+
+  test('Given 原生 Canvas API When 加载和保存 Then 参数与返回值保持同一引用', async () => {
+    /** preload 收到的输入引用。 */
+    const received: unknown[] = []
+    /** preload 返回的公开快照。 */
+    const snapshot = {
+      document: createEmptyCanvasDocument('project-1', 'canvas-1', 1),
+      writable: true as const,
+    }
+    const api: PartialDesignApi = {
+      loadCanvasWorkspace: async (input) => { received.push(input); return snapshot },
+      saveCanvasMutations: async (input) => { received.push(input); return snapshot.document },
+    }
+    const adapter = createDesignAdapter(api)
+    const loadInput = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const saveInput = { ...loadInput, expectedRevision: 0, mutations: [] }
+
+    expect(await adapter.loadCanvas(loadInput)).toBe(snapshot)
+    expect(await adapter.saveCanvas(saveInput)).toBe(snapshot.document)
+    expect(received).toEqual([loadInput, saveInput])
+    expect(received[0]).toBe(loadInput)
+    expect(received[1]).toBe(saveInput)
+  })
+
+  test('Given 多个 Canvas 事件 When 订阅目标 B Then recovery 和 graph 都只按双身份隔离', () => {
+    /** 捕获 preload 层注册的未过滤 listener。 */
+    let sourceListener: ((event: CanvasChangeEvent) => void) | undefined
+    /** preload 释放函数必须由 adapter 原样返回。 */
+    const release = (): void => undefined
+    const adapter = createDesignAdapter({
+      onCanvasChanged: (listener) => { sourceListener = listener; return release },
+    })
+    /** 目标 B 实际收到的事件。 */
+    const received: CanvasChangeEvent[] = []
+    const returnedRelease = adapter.onCanvasChanged(
+      { projectId: 'project-1', canvasId: 'canvas-b' },
+      (event) => received.push(event),
+    )
+    const events: CanvasChangeEvent[] = [
+      { projectId: 'project-1', canvasId: 'canvas-a', revision: 9, cause: 'graph' },
+      { projectId: 'project-1', canvasId: 'canvas-a', revision: 1, cause: 'recovery' },
+      { projectId: 'project-2', canvasId: 'canvas-b', revision: 10, cause: 'graph' },
+      { projectId: 'project-1', canvasId: 'canvas-b', revision: 2, cause: 'recovery' },
+      { projectId: 'project-1', canvasId: 'canvas-b', revision: 3, cause: 'graph' },
+    ]
+    for (const event of events) sourceListener?.(event)
+
+    expect(returnedRelease).toBe(release)
+    expect(received).toEqual(events.slice(3))
+  })
+
   test('Given preload 拒绝加载 When adapter 调用 Then 保留稳定错误供 UI 展示', async () => {
     const adapter = createDesignAdapter({
       loadDesignWorkspace: async () => { throw new Error('项目离线，只能查看缓存') },

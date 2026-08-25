@@ -1,5 +1,12 @@
 import type { DesignPoint, DesignViewport } from './design'
 
+/** 原生 Canvas 图文档使用的固定 IPC 通道。 */
+export const CANVAS_IPC_CHANNELS = {
+  LOAD: 'canvas:load',
+  SAVE_MUTATIONS: 'canvas:save-mutations',
+  CHANGED: 'canvas:changed',
+} as const
+
 /** 独立 Canvas 图文档的当前 schema 版本。 */
 export const CANVAS_DOCUMENT_VERSION = 1
 
@@ -130,6 +137,34 @@ export type CanvasMutation =
   | RemoveCanvasNodesMutation
   | UpsertCanvasEdgesMutation
   | RemoveCanvasEdgesMutation
+
+/** 原生 Canvas 文档的项目与会话双重身份。 */
+export interface CanvasTarget {
+  projectId: string
+  canvasId: string
+}
+
+/** 加载单个原生 Canvas 文档的公开输入。 */
+export interface LoadCanvasInput extends CanvasTarget {}
+
+/** 在指定权威 revision 上保存一批 Canvas mutation。 */
+export interface SaveCanvasMutationsInput extends CanvasTarget {
+  expectedRevision: number
+  mutations: CanvasMutation[]
+}
+
+/** Renderer 可见的原生 Canvas 工作区快照，不暴露路径或存储实现。 */
+export interface CanvasWorkspaceSnapshot {
+  document: CanvasDocument
+  writable: true
+  recoveredFrom?: 'tmp' | 'backup'
+}
+
+/** 原生 Canvas 文档变化事件，始终携带项目和 Canvas 双重身份。 */
+export interface CanvasChangeEvent extends CanvasTarget {
+  revision: number
+  cause: 'graph' | 'recovery'
+}
 
 /**
  * 创建同时绑定项目和 Canvas 会话身份的空图文档。

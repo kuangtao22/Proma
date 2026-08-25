@@ -1,4 +1,6 @@
 import type {
+  CanvasChangeEvent,
+  CanvasTarget,
   CanvasSessionChangeEvent,
   CreateCanvasSessionInput,
   CreateDesignJobInput,
@@ -18,6 +20,8 @@ import type {
   SaveImageGenerationModelProfilesInput,
   ListDesignContextInput,
   ListCanvasSessionsInput,
+  LoadCanvasInput,
+  SaveCanvasMutationsInput,
   UpsertDesignContextDocumentInput,
   UpdateCanvasSessionInput,
   UpdateDesignContextEntryInput,
@@ -30,6 +34,15 @@ export type PartialDesignApi = Partial<DesignPreloadApi>
 
 /** Renderer 组件唯一使用的 Design 适配器。 */
 export interface DesignAdapter {
+  /** 加载目标原生 Canvas，避免与 legacy Design load 混淆。 */
+  loadCanvas: (input: LoadCanvasInput) => ReturnType<DesignPreloadApi['loadCanvasWorkspace']>
+  /** 保存目标原生 Canvas，避免与 legacy Design save 混淆。 */
+  saveCanvas: (input: SaveCanvasMutationsInput) => ReturnType<DesignPreloadApi['saveCanvasMutations']>
+  /** 只向监听器传递项目与 Canvas 身份均匹配的事件。 */
+  onCanvasChanged: (
+    target: CanvasTarget,
+    listener: (event: CanvasChangeEvent) => void,
+  ) => ReturnType<DesignPreloadApi['onCanvasChanged']>
   listCanvasSessions: (input: ListCanvasSessionsInput) => ReturnType<DesignPreloadApi['listCanvasSessions']>
   createCanvasSession: (input: CreateCanvasSessionInput) => ReturnType<DesignPreloadApi['createCanvasSession']>
   updateCanvasSession: (input: UpdateCanvasSessionInput) => ReturnType<DesignPreloadApi['updateCanvasSession']>
@@ -75,6 +88,12 @@ function requireMethod<K extends keyof DesignPreloadApi>(api: PartialDesignApi, 
 /** 创建只做类型收口和原样错误传播的 renderer adapter。 */
 export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
   return {
+    loadCanvas: (input) => requireMethod(api, 'loadCanvasWorkspace')(input),
+    saveCanvas: (input) => requireMethod(api, 'saveCanvasMutations')(input),
+    onCanvasChanged: (target, listener) => requireMethod(api, 'onCanvasChanged')((event) => {
+      /** adapter 只隔离双重身份，revision 与 recovery 策略留给工作区 controller。 */
+      if (event.projectId === target.projectId && event.canvasId === target.canvasId) listener(event)
+    }),
     listCanvasSessions: (input) => requireMethod(api, 'listCanvasSessions')(input),
     createCanvasSession: (input) => requireMethod(api, 'createCanvasSession')(input),
     updateCanvasSession: (input) => requireMethod(api, 'updateCanvasSession')(input),
