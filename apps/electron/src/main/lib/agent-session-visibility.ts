@@ -51,7 +51,7 @@ export function hasValidCanvasAgentOwnership(session: InternalSessionFields): bo
     session.sourceCanvasProjectId?.trim()
       && session.sourceCanvasId?.trim()
       && session.sourceCanvasNodeId?.trim()
-      && session.workspaceId === session.sourceCanvasProjectId.trim(),
+      && session.workspaceId === session.sourceCanvasProjectId,
   )
 }
 

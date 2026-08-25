@@ -54,6 +54,19 @@ describe('Agent 内部 Canvas 会话归属与可见性', () => {
     expect(isAgentSessionUserVisible(internal)).toBe(false)
   })
 
+  test('Given Canvas 项目原值不同但 trim 后相等 When 判断归属 Then 非法且 fail closed', () => {
+    /** 来源项目带空格时不得通过严格项目身份比较。 */
+    const malformed = {
+      workspaceId: 'project-1',
+      sourceCanvasProjectId: ' project-1 ',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    }
+
+    expect(hasValidCanvasAgentOwnership(malformed)).toBe(false)
+    expect(isAgentSessionUserVisible(malformed)).toBe(false)
+  })
+
   test.each([
     ['缺少项目字段', { workspaceId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1' }],
     ['缺少画布字段', { workspaceId: 'project-1', sourceCanvasProjectId: 'project-1', sourceCanvasNodeId: 'node-1' }],
