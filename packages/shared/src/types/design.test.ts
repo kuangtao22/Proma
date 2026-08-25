@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  CANVAS_SESSION_TITLE_MAX_LENGTH,
   DESIGN_DOCUMENT_VERSION,
   DESIGN_IPC_CHANNELS,
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
@@ -7,6 +8,9 @@ import {
   createEmptyDesignDocument,
 } from './design'
 import type {
+  CanvasSessionChangeEvent,
+  CanvasSessionMeta,
+  CreateCanvasSessionInput,
   CreateDesignJobInput,
   DesignAsset,
   DesignContextEntry,
@@ -15,11 +19,13 @@ import type {
   ImageGenerationModelCatalogResult,
   ImageGenerationModelProfile,
   ImageGenerationModelSnapshot,
+  ListCanvasSessionsInput,
   SaveImageGenerationModelProfilesInput,
   ImportDesignAssetsInput,
   DesignJobRecord,
   DesignTaskDetails,
   SaveDesignMutationsInput,
+  UpdateCanvasSessionInput,
   UpdateDesignImageModelSelectionInput,
 } from './design'
 
@@ -204,6 +210,52 @@ describe('Design 共享契约', () => {
     expect(DESIGN_IPC_CHANNELS.REGISTER_CONTEXT_ASSET).toBe('design:register-context-asset')
     expect(DESIGN_IPC_CHANNELS.DELETE_CONTEXT).toBe('design:delete-context')
     expect(DESIGN_IPC_CHANNELS.CHANGED).toBe('design:changed')
+  })
+
+  test('Given Canvas 会话合同 When 构造公开值 Then 身份与通道保持稳定', () => {
+    /** 固定时间用于验证公开元数据不依赖运行环境。 */
+    const now = 100
+    /** Canvas 顶层会话样例，不携带 Agent runtime 字段。 */
+    const session: CanvasSessionMeta = {
+      id: 'canvas-1',
+      projectId: 'project-1',
+      title: 'App 页面设计',
+      archived: false,
+      createdAt: now,
+      updatedAt: now,
+    }
+    /** 四层 IPC 使用的结构化请求样例。 */
+    const listInput: ListCanvasSessionsInput = { projectId: 'project-1', archived: false }
+    /** 新建请求只接受项目与可选标题。 */
+    const createInput: CreateCanvasSessionInput = { projectId: 'project-1', title: 'App 页面设计' }
+    /** 更新请求只允许标题和归档状态。 */
+    const updateInput: UpdateCanvasSessionInput = {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      title: 'App 页面视觉',
+      archived: true,
+    }
+    /** 成功提交后的公开变化事件。 */
+    const event: CanvasSessionChangeEvent = {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      cause: 'updated',
+    }
+
+    expect(session).toEqual({
+      id: 'canvas-1',
+      projectId: 'project-1',
+      title: 'App 页面设计',
+      archived: false,
+      createdAt: now,
+      updatedAt: now,
+    })
+    expect([listInput, createInput, updateInput, event]).toHaveLength(4)
+    expect(CANVAS_SESSION_TITLE_MAX_LENGTH).toBe(120)
+    expect(DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS).toBe('design:list-canvas-sessions')
+    expect(DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION).toBe('design:create-canvas-session')
+    expect(DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION).toBe('design:update-canvas-session')
+    expect(DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED).toBe('design:canvas-session-changed')
   })
 
   test('Given Design 上下文条目 When 序列化 Then 只包含稳定 ID、相对路径或 assetId', () => {

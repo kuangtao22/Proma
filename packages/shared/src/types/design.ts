@@ -1,6 +1,49 @@
 /** Design 画布文档的当前 schema 版本。 */
 export const DESIGN_DOCUMENT_VERSION = 1
 
+/** Canvas 会话标题长度上限，阻断无界标题放大索引和侧栏布局。 */
+export const CANVAS_SESSION_TITLE_MAX_LENGTH = 120
+
+/** 项目下可见的 Canvas 顶层会话，不携带 Agent runtime 字段。 */
+export interface CanvasSessionMeta {
+  id: string
+  projectId: string
+  title: string
+  archived: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+/** 查询项目 Canvas 会话的输入；archived 缺失时返回全部。 */
+export interface ListCanvasSessionsInput {
+  projectId: string
+  archived?: boolean
+}
+
+/** 新建 Canvas 会话的输入。 */
+export interface CreateCanvasSessionInput {
+  projectId: string
+  title?: string
+}
+
+/** 更新 Canvas 会话可变展示字段的输入。 */
+export interface UpdateCanvasSessionInput {
+  projectId: string
+  canvasId: string
+  title?: string
+  archived?: boolean
+}
+
+/** Canvas 会话索引成功提交后的变化原因。 */
+export type CanvasSessionChangeCause = 'created' | 'updated'
+
+/** 主进程广播给 Renderer 的 Canvas 会话变化。 */
+export interface CanvasSessionChangeEvent {
+  projectId: string
+  canvasId: string
+  cause: CanvasSessionChangeCause
+}
+
 /** 生图配置名称保留充足展示空间，同时阻断无界粘贴放大配置、IPC 与任务 journal。 */
 export const IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH = 128
 
@@ -493,6 +536,10 @@ export type DesignChangeEvent = {
 
 /** Design 专用 IPC 通道，避免与会话和文件预览通道混用。 */
 export const DESIGN_IPC_CHANNELS = {
+  LIST_CANVAS_SESSIONS: 'design:list-canvas-sessions',
+  CREATE_CANVAS_SESSION: 'design:create-canvas-session',
+  UPDATE_CANVAS_SESSION: 'design:update-canvas-session',
+  CANVAS_SESSION_CHANGED: 'design:canvas-session-changed',
   LIST_IMAGE_MODEL_PROFILES: 'design:list-image-model-profiles',
   SAVE_IMAGE_MODEL_PROFILES: 'design:save-image-model-profiles',
   GET_IMAGE_MODEL_SELECTION: 'design:get-image-model-selection',
