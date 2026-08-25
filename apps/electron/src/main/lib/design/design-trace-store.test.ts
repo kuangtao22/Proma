@@ -12,11 +12,14 @@ const IMAGE_TOOL = 'mcp__nano_banana__generate_image'
 function createPaths(root: string): DesignPaths {
   const designRoot = join(root, 'project', '.proma', 'design')
   const cacheRoot = join(root, 'cache', 'project-1')
+  /** 项目内多 Canvas 正式数据根。 */
+  const canvasesRoot = join(designRoot, 'canvases')
   /** 项目内可移植创作资料根。 */
   const contextRoot = join(designRoot, 'context')
   return {
     projectId: 'project-1', projectRoot: join(root, 'project'), designRoot,
-    canvasPath: join(designRoot, 'canvas.json'), assetsDir: join(designRoot, 'assets'),
+    canvasPath: join(designRoot, 'canvas.json'), canvasesRoot,
+    canvasSessionsIndexPath: join(canvasesRoot, 'index.json'), assetsDir: join(designRoot, 'assets'),
     annotationsDir: join(designRoot, 'annotations'), cacheRoot,
     contextRoot, contextManifestPath: join(contextRoot, 'manifest.json'),
     contextDocumentsDir: join(contextRoot, 'documents'), contextReferencesDir: join(contextRoot, 'references'),

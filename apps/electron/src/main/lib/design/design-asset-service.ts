@@ -75,7 +75,7 @@ export interface DesignAssetImportBatch extends Array<DesignAsset> {
 /** 素材服务仅依赖可信路径、revision store 与主进程能力。 */
 export interface DesignAssetServiceDependencies {
   /** 从稳定项目 ID 解析项目正式目录与可重建缓存目录。 */
-  pathResolver: DesignPathResolver
+  pathResolver: Pick<DesignPathResolver, 'resolve'>
   /** 提交素材元数据的 revision store。 */
   store: DesignStore
   /** 返回当前时间，测试可注入固定值。 */

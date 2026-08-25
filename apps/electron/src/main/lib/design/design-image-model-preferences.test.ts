@@ -18,15 +18,21 @@ afterEach(() => {
 function createPaths(root: string, projectId: string): DesignPaths {
   /** 项目独立的 Design 缓存根。 */
   const cacheRoot = join(root, projectId)
+  /** 项目内可移植的 Design 正式数据根。 */
+  const designRoot = join(root, 'projects', projectId, '.proma', 'design')
+  /** 项目内多 Canvas 正式数据根。 */
+  const canvasesRoot = join(designRoot, 'canvases')
   /** 项目内可移植创作资料根。 */
-  const contextRoot = join(root, 'projects', projectId, '.proma', 'design', 'context')
+  const contextRoot = join(designRoot, 'context')
   return {
     projectId,
     projectRoot: join(root, 'projects', projectId),
-    designRoot: join(root, 'projects', projectId, '.proma', 'design'),
-    canvasPath: join(root, 'projects', projectId, '.proma', 'design', 'canvas.json'),
-    assetsDir: join(root, 'projects', projectId, '.proma', 'design', 'assets'),
-    annotationsDir: join(root, 'projects', projectId, '.proma', 'design', 'annotations'),
+    designRoot,
+    canvasPath: join(designRoot, 'canvas.json'),
+    canvasesRoot,
+    canvasSessionsIndexPath: join(canvasesRoot, 'index.json'),
+    assetsDir: join(designRoot, 'assets'),
+    annotationsDir: join(designRoot, 'annotations'),
     contextRoot,
     contextManifestPath: join(contextRoot, 'manifest.json'),
     contextDocumentsDir: join(contextRoot, 'documents'),

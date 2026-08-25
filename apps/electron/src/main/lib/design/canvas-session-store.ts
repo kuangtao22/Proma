@@ -318,17 +318,19 @@ function parseCanvasSessionIndex(value: unknown, projectId: string): CanvasSessi
   if (value.projectId !== projectId) throw new Error('Canvas 会话索引项目归属不匹配')
   if (!Array.isArray(value.sessions)) throw new Error('Canvas 会话索引 sessions 无效')
   if (!isTimestamp(value.updatedAt)) throw new Error('Canvas 会话索引 updatedAt 无效')
+  /** 已验证时间保存为局部值，避免数组回调重新读取未知对象属性。 */
+  const indexUpdatedAt = value.updatedAt
   /** 同一项目内 Canvas ID 必须唯一。 */
   const seenIds = new Set<string>()
   /** 逐项创建新对象，禁止未知原型进入业务层。 */
   const sessions = value.sessions.map((session) => parseCanvasSessionRecord(session, projectId, seenIds))
-  if (sessions.some((session) => session.updatedAt > value.updatedAt)) {
+  if (sessions.some((session) => session.updatedAt > indexUpdatedAt)) {
     throw new Error('Canvas 会话索引 updatedAt 早于记录更新时间')
   }
   return {
     schemaVersion: CANVAS_SESSION_INDEX_VERSION,
     projectId,
     sessions,
-    updatedAt: value.updatedAt,
+    updatedAt: indexUpdatedAt,
   }
 }
