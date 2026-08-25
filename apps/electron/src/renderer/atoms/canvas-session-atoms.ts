@@ -13,11 +13,36 @@ export interface ReplaceCanvasSessionsInput {
   sessions: CanvasSessionMeta[]
 }
 
+/** 单项目 Canvas 索引的 Renderer 加载状态。 */
+export interface CanvasSessionProjectStatus {
+  phase: 'idle' | 'loading' | 'ready' | 'failed'
+  error: string | null
+}
+
+/** 更新单项目 Canvas 加载状态的输入。 */
+export interface SetCanvasSessionProjectStatusInput extends CanvasSessionProjectStatus {
+  projectId: string
+}
+
 /** 按项目保存全部 Canvas 元数据，归档筛选由消费组件完成。 */
 export const canvasSessionsByProjectAtom = atom<Map<string, CanvasSessionMeta[]>>(new Map())
 
+/** 按项目隔离 Canvas 索引加载状态，避免单项目故障阻断整个侧栏。 */
+export const canvasSessionStatusByProjectAtom = atom<Map<string, CanvasSessionProjectStatus>>(new Map())
+
 /** 当前打开的 Canvas；null 表示主视图未处于 Canvas 会话。 */
 export const activeCanvasSelectionAtom = atom<ActiveCanvasSelection | null>(null)
+
+/** 只更新目标项目的 Canvas 索引加载状态。 */
+export const setCanvasSessionProjectStatusAtom = atom(
+  null,
+  (get, set, input: SetCanvasSessionProjectStatusInput): void => {
+    /** 只复制 Map 与目标状态对象，保持其它项目引用稳定。 */
+    const next = new Map(get(canvasSessionStatusByProjectAtom))
+    next.set(input.projectId, { phase: input.phase, error: input.error })
+    set(canvasSessionStatusByProjectAtom, next)
+  },
+)
 
 /** 判断当前选择是否仍指向指定项目中的可见 Canvas。 */
 function hasActiveCanvas(

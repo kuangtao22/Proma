@@ -26,6 +26,7 @@ import { SettingsPanel } from '@/components/settings/SettingsPanel'
 import { detectIsWindows, WINDOW_CONTROLS_INSET_RIGHT } from '@/lib/platform'
 import { cn } from '@/lib/utils'
 import { getRightPanelMode } from './design-layout'
+import { useCanvasSessionRegistry } from '@/hooks/useCanvasSessionRegistry'
 
 const MIN_RIGHT_PANEL_WIDTH = 300
 const MAX_RIGHT_PANEL_WIDTH = 560
@@ -44,6 +45,8 @@ function clampLeftSidebarWidth(width: number): number {
 export function AppShell(): React.ReactElement {
   const appMode = useAtomValue(appModeAtom)
   const { workspaces, currentWorkspaceId } = useProjectActions()
+  /** AppShell 单例同步所有项目的轻量 Canvas 索引。 */
+  useCanvasSessionRegistry(workspaces.map((workspace) => workspace.id))
   const currentWorkspace = workspaces.find((workspace) => workspace.id === currentWorkspaceId)
   const currentSessionId = useAtomValue(currentAgentSessionIdAtom)
   const isPanelOpen = useAtomValue(currentSessionSidePanelOpenAtom)
