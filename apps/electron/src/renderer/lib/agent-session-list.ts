@@ -5,6 +5,13 @@ interface AgentSessionTreeLike {
   childSessions: readonly Pick<AgentSessionMeta, 'id'>[]
 }
 
+/** Renderer 会话入口必须排除带任一 Design 归属标记的内部执行会话。 */
+function isRendererVisibleAgentSession(
+  session: Pick<AgentSessionMeta, 'sourceDesignProjectId' | 'sourceDesignJobId'>,
+): boolean {
+  return !session.sourceDesignProjectId && !session.sourceDesignJobId
+}
+
 /** 按最近更新时间排序 Agent 会话，保持与主进程 listAgentSessions 一致。 */
 export function sortAgentSessionsByUpdatedAtDesc(
   sessions: readonly AgentSessionMeta[],
@@ -35,11 +42,14 @@ export function upsertAgentSession(
   sessions: readonly AgentSessionMeta[],
   incoming: AgentSessionMeta,
 ): AgentSessionMeta[] {
-  const existing = sessions.find((session) => session.id === incoming.id)
+  /** 增量事件到达前可能已有旧版本残留，先收敛为用户可见集合。 */
+  const visibleSessions = sessions.filter(isRendererVisibleAgentSession)
+  const existing = visibleSessions.find((session) => session.id === incoming.id)
   const merged: AgentSessionMeta = existing
     ? { ...existing, ...incoming }
     : incoming
-  const others = sessions.filter((session) => session.id !== incoming.id)
+  const others = visibleSessions.filter((session) => session.id !== incoming.id)
+  if (!isRendererVisibleAgentSession(merged)) return sortAgentSessionsByUpdatedAtDesc(others)
   return sortAgentSessionsByUpdatedAtDesc([merged, ...others])
 }
 
@@ -88,7 +98,9 @@ export function mergeFetchedAgentSessions(
     return local && local.updatedAt >= session.updatedAt ? local : session
   })
 
-  return sortAgentSessionsByUpdatedAtDesc([...mergedFetched, ...survivingLocalOnly])
+  return sortAgentSessionsByUpdatedAtDesc(
+    [...mergedFetched, ...survivingLocalOnly].filter(isRendererVisibleAgentSession),
+  )
 }
 
 /** 收集可见会话树里的父/子会话 id，用于判断当前会话是否已显示在侧栏中。 */

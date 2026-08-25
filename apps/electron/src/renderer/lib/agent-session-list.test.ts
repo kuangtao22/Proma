@@ -80,6 +80,18 @@ describe('upsertAgentSession', () => {
     // 父会话与子会话 a 都必须仍然在列表中
     expect(result.map((s) => s.id).sort()).toEqual(['child-a', 'child-b', 'parent'])
   })
+
+  test('Given Design 内部会话通过增量事件到达 When upsert Then 不进入用户会话列表', () => {
+    /** 模拟 headless Design run 携带完整内部归属元数据进入 Renderer。 */
+    const internal = makeSession('design-session', 12, {
+      sourceDesignProjectId: 'project-1',
+      sourceDesignJobId: 'job-1',
+    })
+
+    const result = upsertAgentSession([makeSession('visible', 10)], internal)
+
+    expect(result.map((session) => session.id)).toEqual(['visible'])
+  })
 })
 
 describe('mergeFetchedAgentSessions', () => {
@@ -122,5 +134,20 @@ describe('mergeFetchedAgentSessions', () => {
     const result = mergeFetchedAgentSessions(sessions, sessions)
     expect(result.map((s) => s.id)).toEqual(['a', 'b'])
     expect(result).toHaveLength(2)
+  })
+
+  test('Given 本地残留 Design 内部会话 When 合并权威快照 Then 清除内部记录', () => {
+    /** 内部会话更新时间可能高于快照水位，仍不能按并发新会话规则保留。 */
+    const internal = makeSession('design-session', 100, {
+      sourceDesignProjectId: 'project-1',
+      sourceDesignJobId: 'job-1',
+    })
+
+    const result = mergeFetchedAgentSessions(
+      [makeSession('visible', 10), internal],
+      [makeSession('visible', 20)],
+    )
+
+    expect(result.map((session) => session.id)).toEqual(['visible'])
   })
 })

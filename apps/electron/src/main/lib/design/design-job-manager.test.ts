@@ -368,6 +368,21 @@ describe('Design Job Manager', () => {
     expect(document.nodes[0]).toMatchObject({ kind: 'asset', assetId: 'asset-output' })
   })
 
+  test('Given Pi 只在持久化 SDK 消息返回图片 When 完成 Then 导入图片而不是误报无输出', async () => {
+    harness.messages = []
+    harness.sdkMessages = createSdkToolMessages('session-1/output.png')
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'succeeded',
+      outputAssetId: 'asset-output',
+      sessionId: 'session-1',
+    })
+    expect(document.nodes[0]).toMatchObject({ kind: 'asset', assetId: 'asset-output' })
+  })
+
   test('Given 失败任务仍拥有占位节点 When 删除 Then 同一写锁内移除节点和 journal', async () => {
     const job = harness.manager.create(createGenerateInput())
     await harness.manager.run(job.id)
@@ -1677,4 +1692,28 @@ function createToolMessage(localPath: string, role: AgentMessage['role'] = 'tool
       imageAttachments: [{ localPath, filename: 'output.png', mediaType: 'image/png' }],
     }],
   }
+}
+
+/** 创建真实 Pi 持久化链路使用的 SDK tool_use/tool_result 消息对。 */
+function createSdkToolMessages(localPath: string): SDKMessage[] {
+  return [{
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { content: [{
+      type: 'tool_use',
+      id: 'tool-1',
+      name: NANO_BANANA_TOOL,
+      input: { prompt: 'exact image prompt', designSummary: 'quiet hierarchy' },
+    }] },
+  }, {
+    type: 'user',
+    parent_tool_use_id: null,
+    message: { content: [{
+      type: 'tool_result',
+      tool_use_id: 'tool-1',
+      content: '图片已生成',
+      is_error: false,
+      imageAttachments: [{ localPath, filename: 'output.png', mediaType: 'image/png' }],
+    }] },
+  }] as SDKMessage[]
 }

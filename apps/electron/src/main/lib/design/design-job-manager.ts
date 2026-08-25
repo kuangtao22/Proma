@@ -13,7 +13,11 @@ import type {
   DesignPoint,
   DesignTaskDetails,
   ImageGenerationModelSnapshot,
+  SDKAssistantMessage,
   SDKMessage,
+  SDKToolResultBlock,
+  SDKToolUseBlock,
+  SDKUserMessage,
 } from '@proma/shared'
 import {
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
@@ -374,7 +378,9 @@ export class DesignJobManager {
         this.updateStatus(latest, 'failed', { error: runError })
         return
       }
+      /** 完成回调兼容旧消息；当前 Pi 的结构化附件以持久化 SDK 消息为权威事实。 */
       const outputPath = this.findOwnedOutputPath(messages, session.id)
+        ?? this.findOwnedOutputPath(this.dependencies.getSessionMessages(session.id), session.id)
       if (!outputPath) {
         this.updateStatus(latest, 'failed', { error: DESIGN_JOB_OUTPUT_ERROR })
         return
@@ -740,8 +746,39 @@ export class DesignJobManager {
   }
 
   /** 从本轮消息中选择第一张成功且属于当前会话的 Nano Banana 图片。 */
-  private findOwnedOutputPath(messages: AgentMessage[], sessionId: string): string | undefined {
+  private findOwnedOutputPath(
+    messages: Array<AgentMessage | SDKMessage>,
+    sessionId: string,
+  ): string | undefined {
+    /** SDK 工具结果必须与同一有序消息序列中更早的真实图片工具调用精确关联。 */
+    const sdkToolNames = new Map<string, string>()
     for (const message of messages) {
+      if ('type' in message) {
+        if (message.type === 'assistant') {
+          const content = (message as SDKAssistantMessage).message?.content
+          if (!Array.isArray(content)) continue
+          for (const block of content) {
+            if (block.type !== 'tool_use') continue
+            const toolUse = block as SDKToolUseBlock
+            sdkToolNames.set(toolUse.id, toolUse.name)
+          }
+          continue
+        }
+        if (message.type !== 'user') continue
+        const content = (message as SDKUserMessage).message?.content
+        if (!Array.isArray(content)) continue
+        for (const block of content) {
+          if (block.type !== 'tool_result') continue
+          const result = block as SDKToolResultBlock
+          if (sdkToolNames.get(result.tool_use_id) !== DESIGN_IMAGE_TOOL || result.is_error === true) continue
+          for (const image of result.imageAttachments ?? []) {
+            if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(image.mediaType)) continue
+            const path = this.dependencies.resolveOwnedOutputPath(sessionId, image.localPath)
+            if (path) return path
+          }
+        }
+        continue
+      }
       /** Pi 把工具结果建模为 user/tool_result；旧适配器也可能返回 tool 或 assistant 事件。 */
       if (message.role !== 'assistant' && message.role !== 'tool' && message.role !== 'user') continue
       for (const event of message.events ?? []) {
