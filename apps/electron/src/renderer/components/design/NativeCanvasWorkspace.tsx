@@ -84,8 +84,10 @@ function getNativeCanvasErrorMessage(error: unknown): string {
 export function createNativeCanvasWorkspaceController(
   dependencies: NativeCanvasWorkspaceControllerDependencies,
 ): NativeCanvasWorkspaceController {
-  /** LOAD 与 SAVE 使用独立代次，互不错误取消。 */
-  let loadGeneration = 0
+  /** 普通图刷新 LOAD 代次，不允许取消权威恢复。 */
+  let ordinaryLoadGeneration = 0
+  /** 权威恢复 LOAD 独立代次，不受普通 graph 事件影响。 */
+  let recoveryLoadGeneration = 0
   let saveGeneration = 0
   /** 当前远端变化订阅释放函数。 */
   let unsubscribe: (() => void) | null = null
@@ -95,6 +97,8 @@ export function createNativeCanvasWorkspaceController(
   let activeSave: ActiveNativeCanvasSave | null = null
   /** controller 卸载后所有迟到回调均无副作用。 */
   let disposed = false
+  /** 当前 controller 是否有权威恢复 LOAD 在途。 */
+  let authoritativeRecoveryInFlight = false
 
   /** 清除尚未触发的保存任务。 */
   const clearSaveTimer = (): void => {
@@ -159,18 +163,49 @@ export function createNativeCanvasWorkspaceController(
     scheduleSave()
   }
 
-  /** 发起普通或权威 LOAD；每次新请求都使同类旧回调失效。 */
+  /** 合并 recovery 期间观察到的最高普通 graph revision。 */
+  const deferGraphRefresh = (revision: number): void => {
+    dependencies.updateState((latest) => ({
+      deferredGraphRevision: Math.max(latest.deferredGraphRevision ?? revision, revision),
+    }))
+  }
+
+  /** recovery 成功后消费最高目标，并最多发起一次普通图对账。 */
+  const flushDeferredGraphRefresh = (recoveredRevision: number): void => {
+    if (disposed) return
+    const targetRevision = dependencies.getState().deferredGraphRevision
+    if (targetRevision === null) return
+    dependencies.updateState({ deferredGraphRevision: null })
+    if (targetRevision > recoveredRevision) loadSnapshot(false)
+  }
+
+  /** 发起普通或权威 LOAD；两类请求只失效各自旧回调。 */
   const loadSnapshot = (authoritative: boolean): void => {
     if (disposed) return
-    const generation = loadGeneration + 1
-    loadGeneration = generation
+    const generation = authoritative
+      ? recoveryLoadGeneration + 1
+      : ordinaryLoadGeneration + 1
+    if (authoritative) {
+      recoveryLoadGeneration = generation
+      authoritativeRecoveryInFlight = true
+      /** recovery 开始时旧普通结果已失去基线资格。 */
+      ordinaryLoadGeneration += 1
+    } else {
+      ordinaryLoadGeneration = generation
+    }
+    /** 判断本次请求是否仍持有对应 LOAD 类别的最新代次。 */
+    const isCurrentRequest = (): boolean => authoritative
+      ? generation === recoveryLoadGeneration
+      : generation === ordinaryLoadGeneration
     if (!authoritative && !dependencies.getState().snapshot) {
       dependencies.updateState({ phase: 'loading', error: null })
     }
     void dependencies.adapter.loadCanvas(dependencies.target).then((snapshot) => {
-      if (disposed || generation !== loadGeneration) return
+      if (disposed || !isCurrentRequest()) return
       if (authoritative || snapshot.recoveredFrom) {
+        if (authoritative) authoritativeRecoveryInFlight = false
         applyAuthoritativeSnapshot(snapshot)
+        flushDeferredGraphRefresh(snapshot.document.revision)
         return
       }
       /** 普通图刷新保留本窗口尚未提交的乐观 mutation。 */
@@ -184,8 +219,9 @@ export function createNativeCanvasWorkspaceController(
         error: null,
       })
     }).catch((error: unknown) => {
-      if (disposed || generation !== loadGeneration) return
+      if (disposed || !isCurrentRequest()) return
       if (authoritative) {
+        authoritativeRecoveryInFlight = false
         dependencies.updateState((latest) => ({
           phase: latest.snapshot ? 'ready' : 'error',
           saveState: 'failed',
@@ -278,10 +314,21 @@ export function createNativeCanvasWorkspaceController(
           startAuthoritativeRecovery()
           return
         }
-        /** 普通图事件只在 revision 单调前进时刷新。 */
-        const currentRevision = dependencies.getState().snapshot?.document.revision ?? -1
+        /** recovery 期间只保留最高 graph 目标，禁止普通 LOAD 抢占恢复代次。 */
+        const latest = dependencies.getState()
+        if (authoritativeRecoveryInFlight || latest.authoritativeRecoveryState !== 'idle') {
+          deferGraphRefresh(event.revision)
+          return
+        }
+        /** 稳定状态下普通图事件只在 revision 单调前进时刷新。 */
+        const currentRevision = latest.snapshot?.document.revision ?? -1
         if (event.revision > currentRevision) loadSnapshot(false)
       })
+      /** remount 必须继续 keyed state 中未完成或失败的权威恢复。 */
+      if (dependencies.getState().authoritativeRecoveryState !== 'idle') {
+        startAuthoritativeRecovery()
+        return
+      }
       loadSnapshot(false)
     },
     sync: () => {
@@ -308,6 +355,10 @@ export function createNativeCanvasWorkspaceController(
     },
     retryLoad: () => {
       if (disposed) return
+      if (dependencies.getState().authoritativeRecoveryState !== 'idle') {
+        startAuthoritativeRecovery()
+        return
+      }
       dependencies.updateState({ phase: 'loading', error: null })
       loadSnapshot(false)
     },
@@ -328,8 +379,10 @@ export function createNativeCanvasWorkspaceController(
       /** 归还在途 batch 后再使旧回调失效，避免 mutation 丢失或重复归还。 */
       restoreActiveSave()
       disposed = true
-      loadGeneration += 1
+      ordinaryLoadGeneration += 1
+      recoveryLoadGeneration += 1
       saveGeneration += 1
+      authoritativeRecoveryInFlight = false
       unsubscribe?.()
       unsubscribe = null
     },

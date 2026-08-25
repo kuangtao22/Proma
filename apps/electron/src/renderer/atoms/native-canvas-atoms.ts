@@ -17,6 +17,8 @@ export interface NativeCanvasState {
   selectedNodeId: string | null
   conversationNodeId: string | null
   authoritativeRecoveryState: 'idle' | 'loading' | 'failed'
+  /** recovery 期间观察到的最高普通 graph revision，跨 remount 保留。 */
+  deferredGraphRevision: number | null
   error: string | null
 }
 
@@ -31,6 +33,7 @@ export function createInitialNativeCanvasState(): NativeCanvasState {
     selectedNodeId: null,
     conversationNodeId: null,
     authoritativeRecoveryState: 'idle',
+    deferredGraphRevision: null,
     error: null,
   }
 }

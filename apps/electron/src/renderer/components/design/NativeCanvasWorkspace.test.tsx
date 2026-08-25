@@ -47,9 +47,12 @@ async function flushPromises(): Promise<void> {
   await Promise.resolve()
 }
 
-/** 创建指定 revision 的测试快照。 */
-function createSnapshot(revision: number): CanvasWorkspaceSnapshot {
-  const document = createEmptyCanvasDocument('project-1', 'canvas-1', revision)
+/** 创建指定双身份与 revision 的测试快照。 */
+function createSnapshot(
+  revision: number,
+  target: CanvasTarget = { projectId: 'project-1', canvasId: 'canvas-1' },
+): CanvasWorkspaceSnapshot {
+  const document = createEmptyCanvasDocument(target.projectId, target.canvasId, revision)
   document.revision = revision
   return { document, writable: true }
 }
@@ -100,15 +103,17 @@ interface ControllerHarness {
   unsubscribeCount: () => number
 }
 
-/** 创建绑定固定 projectId:canvasId 的纯 controller 测试夹具。 */
-function createHarness(initial?: Partial<NativeCanvasState>): ControllerHarness {
+/** 创建绑定指定 projectId:canvasId 的纯 controller 测试夹具。 */
+function createHarness(
+  initial?: Partial<NativeCanvasState>,
+  target: CanvasTarget = { projectId: 'project-1', canvasId: 'canvas-1' },
+): ControllerHarness {
   let state: NativeCanvasState = { ...createInitialNativeCanvasState(), ...initial }
   const scheduler = new ManualScheduler()
   const loads: Deferred<CanvasWorkspaceSnapshot>[] = []
   const saves: ControllerHarness['saves'] = []
   let listener: ((event: CanvasChangeEvent) => void) | undefined
   let releases = 0
-  const target: CanvasTarget = { projectId: 'project-1', canvasId: 'canvas-1' }
   const dependencies: NativeCanvasWorkspaceControllerDependencies = {
     target,
     adapter: {
@@ -176,6 +181,30 @@ describe('原生 Canvas controller 加载与事件', () => {
       authoritativeRecoveryState: 'loading',
       saveState: 'failed',
     })
+  })
+
+  test('Given recovery LOAD 在途 When 收到多个更高 graph revision Then 恢复完成后只按最高目标对账一次', async () => {
+    const harness = createHarness()
+    harness.controller.start()
+    harness.loads[0]?.resolve(createSnapshot(8))
+    await flushPromises()
+
+    harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 4, cause: 'recovery' })
+    harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 10, cause: 'graph' })
+    harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 12, cause: 'graph' })
+    harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 11, cause: 'graph' })
+
+    expect(harness.loads).toHaveLength(2)
+    expect(harness.getState().deferredGraphRevision).toBe(12)
+    harness.loads[1]?.resolve(createSnapshot(4))
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({ authoritativeRecoveryState: 'idle' })
+    expect(harness.getState().deferredGraphRevision).toBeNull()
+    expect(harness.loads).toHaveLength(3)
+    harness.loads[2]?.resolve(createSnapshot(12))
+    await flushPromises()
+    expect(harness.getState().snapshot?.document.revision).toBe(12)
   })
 
   test('Given 两次 LOAD 乱序 When 旧请求最后返回 Then 旧结果无副作用', async () => {
@@ -327,16 +356,73 @@ describe('原生 Canvas controller 权威恢复', () => {
     const harness = createHarness({ phase: 'ready', snapshot: createSnapshot(5) })
     harness.controller.start()
     harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 1, cause: 'recovery' })
+    harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 7, cause: 'graph' })
     harness.loads[1]?.reject(new Error('恢复文件损坏'))
     await flushPromises()
     expect(harness.getState()).toMatchObject({
-      authoritativeRecoveryState: 'failed', saveState: 'failed',
+      authoritativeRecoveryState: 'failed', deferredGraphRevision: 7, saveState: 'failed',
     })
 
     harness.controller.retryRecovery()
     expect(harness.loads).toHaveLength(3)
     harness.loads[2]?.resolve(createSnapshot(1))
     await flushPromises()
-    expect(harness.getState()).toMatchObject({ authoritativeRecoveryState: 'idle', saveState: 'saved' })
+    expect(harness.loads).toHaveLength(4)
+    expect(harness.getState()).toMatchObject({
+      authoritativeRecoveryState: 'idle', deferredGraphRevision: null, saveState: 'saved',
+    })
+    harness.loads[3]?.resolve(createSnapshot(7))
+    await flushPromises()
+    expect(harness.getState().snapshot?.document.revision).toBe(7)
+  })
+
+  test('Given A recovery 在途 When 切换 B 再返回 A Then A 继续权威恢复且 B 不继承队列', async () => {
+    const targetA: CanvasTarget = { projectId: 'project-1', canvasId: 'canvas-a' }
+    const targetB: CanvasTarget = { projectId: 'project-1', canvasId: 'canvas-b' }
+    const snapshotA = createSnapshot(5, targetA)
+    snapshotA.document.nodes = [{
+      id: 'agent-a', kind: 'agent', title: 'Agent A',
+      agentSessionId: 'session-a', position: { x: 0, y: 0 },
+    }]
+    const firstA = createHarness({ phase: 'ready', snapshot: snapshotA }, targetA)
+    const moveA: CanvasMutation = {
+      type: 'move-nodes', positions: [{ nodeId: 'agent-a', position: { x: 20, y: 30 } }],
+    }
+    firstA.controller.start()
+    firstA.controller.enqueueMutation(moveA)
+    firstA.scheduler.runAll()
+    firstA.emit({ projectId: targetA.projectId, canvasId: targetA.canvasId, revision: 1, cause: 'recovery' })
+    firstA.emit({ projectId: targetA.projectId, canvasId: targetA.canvasId, revision: 9, cause: 'graph' })
+    firstA.controller.dispose()
+
+    const persistedA = firstA.getState()
+    expect(persistedA).toMatchObject({
+      pendingMutations: [moveA], inFlightMutations: [], authoritativeRecoveryState: 'loading',
+      deferredGraphRevision: 9,
+    })
+
+    const canvasB = createHarness(undefined, targetB)
+    canvasB.controller.start()
+    expect(canvasB.getState()).toMatchObject({
+      pendingMutations: [], inFlightMutations: [], authoritativeRecoveryState: 'idle',
+    })
+    canvasB.loads[0]?.resolve(createSnapshot(2, targetB))
+    await flushPromises()
+
+    const secondA = createHarness(persistedA, targetA)
+    secondA.controller.start()
+    expect(secondA.loads).toHaveLength(1)
+    secondA.loads[0]?.resolve(createSnapshot(1, targetA))
+    await flushPromises()
+
+    expect(secondA.loads).toHaveLength(2)
+    secondA.loads[1]?.resolve(createSnapshot(9, targetA))
+    await flushPromises()
+
+    expect(secondA.getState()).toMatchObject({
+      phase: 'ready', pendingMutations: [moveA], authoritativeRecoveryState: 'idle',
+      deferredGraphRevision: null, saveState: 'dirty',
+    })
+    expect(canvasB.getState().pendingMutations).toEqual([])
   })
 })
