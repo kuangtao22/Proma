@@ -272,6 +272,22 @@ describe('CanvasDocumentStore', () => {
     expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(3)
   })
 
+  test('Given mutate 读取 revision 后另一写者推进主文件 When 提交 Then CAS 冲突且 main 与 bak 均不降级', () => {
+    /** validateCurrent 位于稳定读取之后，模拟进程外写者提交更高 revision。 */
+    const fixture = createFixture()
+    writeDocument(fixture.documentPath, createConnectedDocument(2))
+    writeDocument(`${fixture.documentPath}.bak`, createConnectedDocument(1))
+
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [{ type: 'set-viewport', viewport: { x: 1, y: 1, zoom: 1 } }],
+      () => writeDocument(fixture.documentPath, createConnectedDocument(9)),
+    )).toThrow('CANVAS_REVISION_CONFLICT')
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(9)
+    expect(JSON.parse(readFileSync(`${fixture.documentPath}.bak`, 'utf8')).revision).toBe(1)
+  })
+
   test('Given validateCurrent 后 native 授权被撤销 When mutate 提交 Then 二次授权先于路径和写入', () => {
     const fixture = createFixture()
     /** 第二次授权模拟 Canvas 在校验后被归档迁移或删除。 */
@@ -384,15 +400,46 @@ describe('CanvasDocumentStore', () => {
     expect(promoted.viewport).toEqual({ x: 0, y: 0, zoom: 1 })
   })
 
-  test('Given 已有主文件 When mutate Then 一次安全备份写后一次主提交写', () => {
-    /** 记录安全写路径并真实落盘，锁定恢复开销与主提交口径。 */
-    const writePaths: string[] = []
+  test('Given backup 读取后另一写者修复主文件 When load Then 恢复 CAS 失败且所有候选保持不变', () => {
+    /** backup hook 发生在主损坏状态已读取之后，用真实文件模拟并发修复。 */
     const fixture = createFixture({
-      writeJsonFileAtomicSecure: (path, document) => {
-        writePaths.push(path)
-        writeDocument(path, document)
+      afterCandidateRead: (candidatePath) => {
+        if (candidatePath === `${fixture.documentPath}.bak`) {
+          writeDocument(fixture.documentPath, createConnectedDocument(9))
+        }
       },
     })
+    writeDocument(fixture.documentPath, { broken: true })
+    writeFileSync(`${fixture.documentPath}.tmp`, '{broken-tmp', 'utf8')
+    writeDocument(`${fixture.documentPath}.bak`, createConnectedDocument(2))
+
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_REVISION_CONFLICT')
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(9)
+    expect(readFileSync(`${fixture.documentPath}.tmp`, 'utf8')).toBe('{broken-tmp')
+    expect(JSON.parse(readFileSync(`${fixture.documentPath}.bak`, 'utf8')).revision).toBe(2)
+  })
+
+  test('Given 主文件缺失且 tmp 读取后另一写者创建主文件 When load Then 恢复失败且 tmp 不被消费', () => {
+    /** tmp hook 在恢复提升前创建新主文件，验证 missing CAS 与消费顺序。 */
+    const fixture = createFixture({
+      afterCandidateRead: (candidatePath) => {
+        if (candidatePath === `${fixture.documentPath}.tmp`) {
+          writeDocument(fixture.documentPath, createConnectedDocument(9))
+        }
+      },
+    })
+    writeDocument(`${fixture.documentPath}.tmp`, createConnectedDocument(2))
+
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_REVISION_CONFLICT')
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(9)
+    expect(JSON.parse(readFileSync(`${fixture.documentPath}.tmp`, 'utf8')).revision).toBe(2)
+  })
+
+  test('Given 已有主文件 When mutate 成功 Then 单次 CAS 提交并保留 previous revision backup', () => {
+    /** 使用真实 secure write 锁定主文件与 backup 的共同提交合同。 */
+    const fixture = createFixture()
     writeDocument(fixture.documentPath, createConnectedDocument(2))
 
     fixture.store.mutate(
@@ -401,7 +448,6 @@ describe('CanvasDocumentStore', () => {
       [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
     )
 
-    expect(writePaths).toEqual([`${fixture.documentPath}.bak`, fixture.documentPath])
     expect(JSON.parse(readFileSync(`${fixture.documentPath}.bak`, 'utf8')).revision).toBe(2)
     expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(3)
   })

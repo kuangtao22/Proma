@@ -25,6 +25,7 @@ import {
   writeJsonFileAtomicSecure,
   writeTextFileAtomic,
 } from './safe-file'
+import type { AtomicFileState } from './safe-file'
 
 /** safe-file validator 测试使用的最小 schema。 */
 interface VersionedValue {
@@ -93,6 +94,19 @@ function isVersionedValue(value: unknown): value is VersionedValue {
 /** 构造带 Node 文件系统错误字段的稳定测试错误。 */
 function createFileSystemError(code: string, syscall: string): Error & { code: string; syscall: string } {
   return Object.assign(new Error(`${syscall} ${code}`), { code, syscall })
+}
+
+/** 捕获安全写 CAS 使用的完整目标文件状态。 */
+function captureAtomicFileState(filePath: string): AtomicFileState {
+  /** 普通 stat 数值字段与生产 lstat/fstat 合同保持一致。 */
+  const stats = statSync(filePath)
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs,
+  }
 }
 
 describe('Windows durability capability', () => {
@@ -372,6 +386,77 @@ describe('readJsonFileSafe validator', () => {
 })
 
 describe('writeJsonFileAtomicSecure', () => {
+  test('Given CAS 预期目标缺失但提交前出现文件 When 安全写入 Then 拒绝且保留新文件', () => {
+    /** beforeRename 模拟另一写者在 temp 落盘后创建目标。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-cas-appeared-'))
+    const filePath = join(tempDir, 'marker.json')
+    try {
+      expect(() => writeJsonFileAtomicSecure(filePath, { owner: 'stale' }, {
+        expectedDestination: { kind: 'missing' },
+        beforeRename: () => writeFileSync(filePath, '{"owner":"new-writer"}', 'utf8'),
+      })).toThrow('安全原子写入目标状态冲突')
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ owner: 'new-writer' })
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given CAS 预期已有文件但同 inode 原地改写 When 安全写入 Then 完整状态变化被拒绝', () => {
+    /** 改变 size/mtime/ctime，证明校验不只比较 dev/ino。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-cas-rewrite-'))
+    const filePath = join(tempDir, 'marker.json')
+    const backupPath = `${filePath}.bak`
+    writeFileSync(filePath, '{"revision":2}', 'utf8')
+    writeFileSync(backupPath, '{"revision":1}', 'utf8')
+    const expectedState = captureAtomicFileState(filePath)
+    try {
+      expect(() => writeJsonFileAtomicSecure(filePath, { revision: 3 }, {
+        expectedDestination: { kind: 'state', state: expectedState },
+        priorBackup: { filePath: backupPath, data: { revision: 2 } },
+        beforeRename: () => writeFileSync(filePath, '{"revision":900}', 'utf8'),
+      })).toThrow('安全原子写入目标状态冲突')
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ revision: 900 })
+      expect(JSON.parse(readFileSync(backupPath, 'utf8'))).toEqual({ revision: 1 })
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given CAS 预期已有文件但调用前 inode 已替换 When 安全写入 Then temp 创建前拒绝', () => {
+    /** 保存旧状态后置换同名路径，验证首次 CAS 不产生随机 temp。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-cas-replaced-'))
+    const filePath = join(tempDir, 'marker.json')
+    writeFileSync(filePath, '{"revision":2}', 'utf8')
+    const expectedState = captureAtomicFileState(filePath)
+    renameSync(filePath, `${filePath}.old`)
+    writeFileSync(filePath, '{"revision":9}', 'utf8')
+    try {
+      expect(() => writeJsonFileAtomicSecure(filePath, { revision: 3 }, {
+        expectedDestination: { kind: 'state', state: expectedState },
+      })).toThrow('安全原子写入目标状态冲突')
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ revision: 9 })
+      expect(readdirSync(tempDir).filter((name) => name.endsWith('.tmp'))).toEqual([])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given CAS 完整目标状态匹配 When 安全写入 Then 正常替换目标', () => {
+    /** 匹配状态必须保持旧调用相同的原子写成功语义。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-cas-matched-'))
+    const filePath = join(tempDir, 'marker.json')
+    writeFileSync(filePath, '{"revision":2}', 'utf8')
+    const expectedState = captureAtomicFileState(filePath)
+    try {
+      writeJsonFileAtomicSecure(filePath, { revision: 3 }, {
+        expectedDestination: { kind: 'state', state: expectedState },
+      })
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ revision: 3 })
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('Given 固定 .tmp 是根外 symlink When 安全写入 Then 不跟随且根外文件保持不变', () => {
     /** 隔离目录与根外哨兵文件。 */
     const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-'))

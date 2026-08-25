@@ -62,8 +62,20 @@ export interface AtomicWriteOptions extends DurabilitySyncOptions {}
 
 /** no-follow 原子 JSON 写入的故障注入配置。 */
 export interface SecureAtomicJsonWriteOptions extends DurabilitySyncOptions {
+  /** 调用方读取期绑定的目标状态；不传时保持原有身份复验语义。 */
+  expectedDestination?: AtomicDestinationExpectation
+  /** 主文件提交成功后发布的 previous revision 备份。 */
+  priorBackup?: SecureAtomicJsonPriorBackup
   /** 临时文件完成 fsync/close 后、最终身份复验前调用，仅供竞态回归测试。 */
   beforeRename?: (tempPath: string) => void
+}
+
+/** 与主文件一同预写、在主提交后发布的 JSON 备份。 */
+export interface SecureAtomicJsonPriorBackup {
+  /** 固定备份路径，必须与主文件位于同一目录。 */
+  filePath: string
+  /** 读取期主文件对应的 previous revision 数据。 */
+  data: object
 }
 
 /** 原子删除普通文件时允许替换的窄测试依赖。 */
@@ -86,9 +98,35 @@ export interface DurableDirectoryOptions extends DurabilitySyncOptions {}
 /** 可由读取方传回删除边界的最小文件系统对象身份。 */
 export interface AtomicFileIdentity {
   /** 所在设备编号。 */
-  dev: number | bigint
+  dev: number
   /** 同一设备内 inode/file index。 */
-  ino: number | bigint
+  ino: number
+}
+
+/** 可用于 compare-and-swap 的完整文件内容状态。 */
+export interface AtomicFileState extends AtomicFileIdentity {
+  /** 文件字节数。 */
+  size: number
+  /** 最后修改时间戳。 */
+  mtimeMs: number
+  /** inode metadata 最后变化时间戳。 */
+  ctimeMs: number
+}
+
+/** 明确区分目标应缺失或应匹配具体读取状态的 CAS 合同。 */
+export type AtomicDestinationExpectation =
+  | { kind: 'missing' }
+  | { kind: 'state'; state: AtomicFileState }
+
+/** 目标不再匹配调用方读取状态时抛出的可识别冲突。 */
+export class AtomicDestinationConflictError extends Error {
+  /** 稳定错误码供业务 Store 映射 revision 冲突。 */
+  readonly code = 'ATOMIC_DESTINATION_CONFLICT'
+
+  constructor() {
+    super('安全原子写入目标状态冲突')
+    this.name = 'AtomicDestinationConflictError'
+  }
 }
 
 /** safe-file 内部复用的文件身份别名。 */
@@ -439,11 +477,30 @@ export function writeJsonFileAtomicSecure(
   if (!parentStat.isDirectory()) throw new Error('安全原子写入父路径不是目录')
   const parentIdentity = toIdentity(parentStat)
   /** 目标缺失或为当前用户拥有的普通文件，symlink/device 一律拒绝。 */
-  const destinationIdentity = readDestinationIdentity(filePath)
+  const destinationState = readDestinationState(filePath)
+  if (options.expectedDestination) {
+    assertExpectedDestinationState(destinationState, options.expectedDestination)
+  }
+  /** prior backup 只允许同目录的独立文件路径。 */
+  const priorBackup = options.priorBackup
+  if (priorBackup
+    && (dirname(priorBackup.filePath) !== parentPath || priorBackup.filePath === filePath)) {
+    throw new Error('安全原子写入备份路径无效')
+  }
+  /** 固定 backup 的初始状态用于阻断主提交期间的并发置换。 */
+  const backupDestinationState = priorBackup
+    ? readDestinationState(priorBackup.filePath)
+    : null
   /** 随机同目录名称避免攻击者预置固定 `.tmp` 路径。 */
   const tempPath = join(parentPath, `.${basename(filePath)}.${randomUUID()}.tmp`)
+  /** backup 同样使用随机 staging，主 CAS 失败前绝不触碰固定路径。 */
+  const backupTempPath = priorBackup
+    ? join(parentPath, `.${basename(priorBackup.filePath)}.${randomUUID()}.tmp`)
+    : null
   /** temp 创建后固定的身份，只用于清理自己创建且未被替换的路径。 */
   let tempIdentity: FileSystemIdentity | null = null
+  /** backup staging 的身份独立追踪，失败只清理自身 inode。 */
+  let backupTempIdentity: FileSystemIdentity | null = null
   /** descriptor 仅在本函数内拥有，所有失败路径都关闭。 */
   let descriptor: number | null = null
 
@@ -463,32 +520,125 @@ export function writeJsonFileAtomicSecure(
     closeSync(descriptor)
     descriptor = null
 
+    if (priorBackup && backupTempPath) {
+      descriptor = openSync(backupTempPath, flags, 0o600)
+      const openedBackupStat = fstatSync(descriptor)
+      if (!openedBackupStat.isFile() || !isOwnedByCurrentUser(openedBackupStat.uid)) {
+        throw new Error('安全原子写入备份临时文件身份无效')
+      }
+      backupTempIdentity = toIdentity(openedBackupStat)
+      writeFileSync(descriptor, JSON.stringify(priorBackup.data, null, 2), 'utf8')
+      fsyncSync(descriptor)
+      closeSync(descriptor)
+      descriptor = null
+    }
+
     options.beforeRename?.(tempPath)
     assertIdentityUnchanged(parentPath, parentIdentity, '安全原子写入父目录身份已变化', true)
-    assertDestinationUnchanged(filePath, destinationIdentity)
+    if (options.expectedDestination) {
+      assertExpectedDestination(filePath, options.expectedDestination)
+    } else {
+      assertDestinationUnchanged(filePath, destinationState)
+    }
     assertIdentityUnchanged(tempPath, tempIdentity, '安全原子写入临时文件身份已变化', false)
+    if (priorBackup && backupTempPath && backupTempIdentity) {
+      assertDestinationStateUnchanged(priorBackup.filePath, backupDestinationState)
+      assertIdentityUnchanged(
+        backupTempPath,
+        backupTempIdentity,
+        '安全原子写入备份临时文件身份已变化',
+        false,
+      )
+    }
     renameSync(tempPath, filePath)
     tempIdentity = null
+    /** 主 rename 是业务提交点；此后失败必须明确主文件已经改变。 */
+    if (priorBackup && backupTempPath && backupTempIdentity) {
+      try {
+        const mainDurability = syncCommittedFileDurability(filePath, options)
+        assertIdentityUnchanged(parentPath, parentIdentity, '安全原子写入父目录身份已变化', true)
+        assertDestinationStateUnchanged(priorBackup.filePath, backupDestinationState)
+        assertIdentityUnchanged(
+          backupTempPath,
+          backupTempIdentity,
+          '安全原子写入备份临时文件身份已变化',
+          false,
+        )
+        renameSync(backupTempPath, priorBackup.filePath)
+        backupTempIdentity = null
+        const backupDurability = syncCommittedFileDurability(priorBackup.filePath, options)
+        return mainDurability === 'directory' && backupDurability === 'directory'
+          ? 'directory'
+          : 'file-only'
+      } catch (error) {
+        throw new Error('安全原子写入主文件已提交但备份发布失败', { cause: error })
+      }
+    }
     return syncCommittedFileDurability(filePath, options)
   } finally {
     if (descriptor !== null) {
       try { closeSync(descriptor) } catch { /* 原始写入错误优先向上传播。 */ }
     }
     if (tempIdentity !== null) unlinkIfIdentityMatches(tempPath, tempIdentity)
+    if (backupTempPath && backupTempIdentity !== null) {
+      unlinkIfIdentityMatches(backupTempPath, backupTempIdentity)
+    }
   }
 }
 
-/** 读取目标身份；不存在返回 null，存在但不是安全普通文件则拒绝。 */
-function readDestinationIdentity(path: string): FileSystemIdentity | null {
+/** 读取目标完整状态；不存在返回 null，存在但不是安全普通文件则拒绝。 */
+function readDestinationState(path: string): AtomicFileState | null {
   try {
     const stat = lstatSync(path)
     if (!stat.isFile() || !isOwnedByCurrentUser(stat.uid)) {
       throw new Error('安全原子写入目标不是普通文件')
     }
-    return toIdentity(stat)
+    return toFileState(stat)
   } catch (error) {
     if (isMissingPathError(error)) return null
     throw error
+  }
+}
+
+/** 在 temp 创建前确认当前状态满足调用方显式 CAS 预期。 */
+function assertExpectedDestinationState(
+  actual: AtomicFileState | null,
+  expected: AtomicDestinationExpectation,
+): void {
+  if (expected.kind === 'missing') {
+    if (actual !== null) throw new AtomicDestinationConflictError()
+    return
+  }
+  if (actual === null || !isSameFileState(actual, expected.state)) {
+    throw new AtomicDestinationConflictError()
+  }
+}
+
+/** rename 前重新读取并确认显式 CAS 目标状态。 */
+function assertExpectedDestination(path: string, expected: AtomicDestinationExpectation): void {
+  let actual: AtomicFileState | null
+  try {
+    actual = readDestinationState(path)
+  } catch {
+    throw new AtomicDestinationConflictError()
+  }
+  assertExpectedDestinationState(actual, expected)
+}
+
+/** 确认普通安全路径的完整状态未在事务期间变化。 */
+function assertDestinationStateUnchanged(
+  path: string,
+  expected: AtomicFileState | null,
+): void {
+  let actual: AtomicFileState | null
+  try {
+    actual = readDestinationState(path)
+  } catch {
+    throw new Error('安全原子写入备份目标状态已变化')
+  }
+  if ((actual === null) !== (expected === null)
+    || (actual !== null && expected !== null && !isSameFileState(actual, expected))) {
+    throw new Error('安全原子写入备份目标状态已变化')
   }
 }
 
@@ -536,6 +686,25 @@ function unlinkIfIdentityMatches(path: string, expected: FileSystemIdentity): vo
 /** 提取跨复验稳定的文件系统身份字段。 */
 function toIdentity(stat: Stats): FileSystemIdentity {
   return { dev: stat.dev, ino: stat.ino }
+}
+
+/** 提取显式 CAS 所需的完整 number 状态。 */
+function toFileState(stat: Stats): AtomicFileState {
+  return {
+    ...toIdentity(stat),
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+  }
+}
+
+/** 比较文件身份和所有可观察内容版本字段。 */
+function isSameFileState(left: AtomicFileState, right: AtomicFileState): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs
 }
 
 /** 判断两个路径状态指向同一文件系统对象。 */

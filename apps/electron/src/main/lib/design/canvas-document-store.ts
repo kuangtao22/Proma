@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
 } from 'node:fs'
+import type { Stats } from 'node:fs'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import {
   applyCanvasMutations,
@@ -20,8 +21,17 @@ import type {
   CanvasMutation,
   CanvasNode,
 } from '@proma/shared'
-import { removeFileAtomic, writeJsonFileAtomicSecure } from '../safe-file'
-import type { AtomicFileIdentity } from '../safe-file'
+import {
+  AtomicDestinationConflictError,
+  removeFileAtomic,
+  writeJsonFileAtomicSecure,
+} from '../safe-file'
+import type {
+  AtomicDestinationExpectation,
+  AtomicFileIdentity,
+  AtomicFileState,
+  SecureAtomicJsonPriorBackup,
+} from '../safe-file'
 import type { CanvasSessionStore } from './canvas-session-store'
 import { designPathResolver, isSafeDesignStableId } from './design-paths'
 import type { CanvasPaths, DesignPathResolver } from './design-paths'
@@ -59,6 +69,10 @@ export interface CanvasDocumentStore {
 
 /** safe-file 安全原子写所需的最小回调合同。 */
 interface CanvasSecureWriteOptions {
+  /** 读取期主文件状态，用于绑定最终 rename 的 compare-and-swap。 */
+  expectedDestination?: AtomicDestinationExpectation
+  /** 与主提交共同预写、提交后发布的 previous revision backup。 */
+  priorBackup?: SecureAtomicJsonPriorBackup
   /** temp 完成落盘后、rename 主提交前执行的目录复验。 */
   beforeRename?: (temporaryPath: string) => void
 }
@@ -102,39 +116,33 @@ interface UnknownRecord {
 interface CanvasDirectoryIdentity {
   path: string
   canonicalPath: string
-  dev: number | bigint
-  ino: number | bigint
-}
-
-/** 可比较的文件系统对象身份。 */
-interface CanvasFileState extends AtomicFileIdentity {
-  size: number | bigint
-  mtimeMs: number | bigint
-  ctimeMs: number | bigint
+  dev: number
+  ino: number
 }
 
 /** lstat/fstat 两类 Node stats 共同提供的内容状态字段。 */
 interface CanvasFileStat {
-  dev: number | bigint
-  ino: number | bigint
-  size: number | bigint
-  mtimeMs: number | bigint
-  ctimeMs: number | bigint
+  dev: number
+  ino: number
+  size: number
+  mtimeMs: number
+  ctimeMs: number
 }
 
 /** 单个主/tmp/bak 候选的安全读取结果。 */
 interface CanvasCandidateState {
   exists: boolean
   document: CanvasDocument | null
-  identity?: AtomicFileIdentity
+  state?: AtomicFileState
 }
 
 /** 整条恢复链的权威读取结果。 */
 interface CanvasDocumentReadResult {
   document: CanvasDocument | null
+  primaryExpectation: AtomicDestinationExpectation
   recoveredFrom?: NonNullable<CanvasWorkspaceSnapshot['recoveredFrom']>
   hasCandidate: boolean
-  recoveredIdentity?: AtomicFileIdentity
+  recoveredState?: AtomicFileState
 }
 
 /** 判断未知值是否为无额外原型行为的普通对象。 */
@@ -418,7 +426,7 @@ function unsafeCanvasPath(message: string): Error {
 }
 
 /** lstat 不存在路径时返回 null，其他错误保持原样。 */
-function lstatOrNull(path: string): ReturnType<typeof lstatSync> | null {
+function lstatOrNull(path: string): Stats | null {
   try {
     return lstatSync(path)
   } catch (error) {
@@ -470,7 +478,7 @@ function assertDirectoryIdentity(identity: CanvasDirectoryIdentity): void {
 }
 
 /** 从 lstat/fstat 提取读取期间必须保持稳定的内容状态。 */
-function toCanvasFileState(stats: CanvasFileStat): CanvasFileState {
+function toCanvasFileState(stats: CanvasFileStat): AtomicFileState {
   return {
     dev: stats.dev,
     ino: stats.ino,
@@ -481,7 +489,7 @@ function toCanvasFileState(stats: CanvasFileStat): CanvasFileState {
 }
 
 /** 确认两次文件状态的身份与可观察内容版本完全一致。 */
-function isSameFileState(left: CanvasFileState, right: CanvasFileState): boolean {
+function isSameFileState(left: AtomicFileState, right: AtomicFileState): boolean {
   return left.dev === right.dev
     && left.ino === right.ino
     && left.size === right.size
@@ -578,7 +586,7 @@ function readCanvasCandidate(
     return {
       exists: true,
       document,
-      identity: { dev: initialState.dev, ino: initialState.ino },
+      state: initialState,
     }
   } finally {
     if (descriptor !== null) closeSync(descriptor)
@@ -597,17 +605,24 @@ function readCanvasDocument(
   const primary = readCanvasCandidate(
     paths.documentPath, target, directoryIdentity, validateDocument, afterCandidateRead,
   )
-  if (primary.document) return { document: primary.document, hasCandidate: true }
+  /** 主文件无论缺失、合法或损坏，都形成最终写入必须匹配的 CAS 预期。 */
+  const primaryExpectation: AtomicDestinationExpectation = primary.state
+    ? { kind: 'state', state: primary.state }
+    : { kind: 'missing' }
+  if (primary.document) {
+    return { document: primary.document, primaryExpectation, hasCandidate: true }
+  }
   /** 上次固定恢复流程遗留的 tmp 候选。 */
   const temporary = readCanvasCandidate(
     `${paths.documentPath}.tmp`, target, directoryIdentity, validateDocument, afterCandidateRead,
   )
   if (temporary.document) {
-    if (!temporary.identity) throw unsafeCanvasPath('tmp 候选缺少稳定身份')
+    if (!temporary.state) throw unsafeCanvasPath('tmp 候选缺少稳定状态')
     return {
       document: temporary.document,
+      primaryExpectation,
       recoveredFrom: 'tmp',
-      recoveredIdentity: temporary.identity,
+      recoveredState: temporary.state,
       hasCandidate: true,
     }
   }
@@ -616,10 +631,17 @@ function readCanvasDocument(
     `${paths.documentPath}.bak`, target, directoryIdentity, validateDocument, afterCandidateRead,
   )
   if (backup.document) {
-    return { document: backup.document, recoveredFrom: 'backup', hasCandidate: true }
+    return {
+      document: backup.document,
+      primaryExpectation,
+      recoveredFrom: 'backup',
+      recoveredState: backup.state,
+      hasCandidate: true,
+    }
   }
   return {
     document: null,
+    primaryExpectation,
     hasCandidate: primary.exists || temporary.exists || backup.exists,
   }
 }
@@ -667,11 +689,13 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     directoryIdentity: CanvasDirectoryIdentity,
     filePath: string,
     document: CanvasDocument,
+    writeOptions: Pick<CanvasSecureWriteOptions, 'expectedDestination' | 'priorBackup'> = {},
   ): void {
     if (dirname(filePath) !== paths.canvasRoot) {
       throw unsafeCanvasPath(`文档文件不在 Canvas 根: ${filePath}`)
     }
     writeJson(filePath, document, {
+      ...writeOptions,
       beforeRename: () => assertDirectoryIdentity(directoryIdentity),
     })
   }
@@ -703,8 +727,11 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     return resolveTargetPaths(target)
   }
 
-  /** 从恢复链加载文档，合法恢复候选会安全提升为主文件。 */
-  function load(target: CanvasTarget): CanvasWorkspaceSnapshot {
+  /** 内部加载结果额外保留读取期主状态，公开接口不泄露文件系统信息。 */
+  function loadWithAuthoritativeState(target: CanvasTarget): {
+    snapshot: CanvasWorkspaceSnapshot
+    primaryExpectation: AtomicDestinationExpectation
+  } {
     /** 授权和路径复验是任何文档候选访问的先决条件。 */
     const authorized = resolveAuthorizedTarget(target)
     /** 当前主/tmp/bak 候选链的读取结果。 */
@@ -720,27 +747,50 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     }
     if (readResult.document && readResult.recoveredFrom) {
       /** 恢复候选先安全提升，随后 tmp 才能被原子消费。 */
-      writeCanvasJsonSecure(
-        authorized.paths,
-        authorized.directoryIdentity,
-        authorized.paths.documentPath,
-        readResult.document,
-      )
+      try {
+        writeCanvasJsonSecure(
+          authorized.paths,
+          authorized.directoryIdentity,
+          authorized.paths.documentPath,
+          readResult.document,
+          { expectedDestination: readResult.primaryExpectation },
+        )
+      } catch (error) {
+        if (error instanceof AtomicDestinationConflictError) {
+          throw new Error('CANVAS_REVISION_CONFLICT: document changed during recovery', {
+            cause: error,
+          })
+        }
+        throw error
+      }
       if (readResult.recoveredFrom === 'tmp') {
-        if (!readResult.recoveredIdentity) throw unsafeCanvasPath('tmp 恢复缺少绑定身份')
+        if (!readResult.recoveredState) throw unsafeCanvasPath('tmp 恢复缺少绑定状态')
         /** 删除只消费本次实际读取的 tmp inode，置换文件必须保留。 */
         const temporaryPath = `${authorized.paths.documentPath}.tmp`
         options.beforeConsumeRecoveredTemporary?.(temporaryPath)
-        removeFile(temporaryPath, { expectedIdentity: readResult.recoveredIdentity })
+        removeFile(temporaryPath, {
+          expectedIdentity: {
+            dev: readResult.recoveredState.dev,
+            ino: readResult.recoveredState.ino,
+          },
+        })
         assertDirectoryIdentity(authorized.directoryIdentity)
       }
     }
     return {
-      document: readResult.document
-        ?? createEmptyCanvasDocument(target.projectId, target.canvasId, requireNow(now)),
-      writable: true,
-      ...(readResult.recoveredFrom ? { recoveredFrom: readResult.recoveredFrom } : {}),
+      snapshot: {
+        document: readResult.document
+          ?? createEmptyCanvasDocument(target.projectId, target.canvasId, requireNow(now)),
+        writable: true,
+        ...(readResult.recoveredFrom ? { recoveredFrom: readResult.recoveredFrom } : {}),
+      },
+      primaryExpectation: readResult.primaryExpectation,
     }
+  }
+
+  /** 从恢复链加载文档，合法恢复候选会安全提升为主文件。 */
+  function load(target: CanvasTarget): CanvasWorkspaceSnapshot {
+    return loadWithAuthoritativeState(target).snapshot
   }
 
   /** 加载可用于副作用的稳定权威文档，恢复首次调用必须由上层重载确认。 */
@@ -761,7 +811,11 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     validateCurrent?: (document: CanvasDocument) => void,
   ): CanvasDocument {
     /** mutation 始终从稳定权威文档开始，禁止跨恢复边界写入。 */
-    const current = requireStableAuthoritativeDocument(target)
+    const loaded = loadWithAuthoritativeState(target)
+    const current = loaded.snapshot.document
+    if (loaded.snapshot.recoveredFrom) {
+      throw new Error(`CANVAS_RECOVERY_REQUIRED: recoveredFrom=${loaded.snapshot.recoveredFrom}`)
+    }
     validateCurrent?.(current)
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== current.revision) {
       throw new Error(
@@ -787,26 +841,31 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     }
     /** 写入前重新解析并复验路径，适配项目根在调用间迁移。 */
     const authorized = resolveAuthorizedTarget(target)
-    /** 主文件存在时先安全保存当前稳定 revision 作为固定备份。 */
-    const primaryStats = lstatOrNull(authorized.paths.documentPath)
-    if (primaryStats) {
-      if (primaryStats.isSymbolicLink() || !primaryStats.isFile()) {
-        throw unsafeCanvasPath(`主文档不是实际文件: ${authorized.paths.documentPath}`)
-      }
+    /** 主提交与 previous revision backup 共用一次 CAS 安全写边界。 */
+    try {
       writeCanvasJsonSecure(
         authorized.paths,
         authorized.directoryIdentity,
-        `${authorized.paths.documentPath}.bak`,
-        current,
+        authorized.paths.documentPath,
+        next,
+        {
+          expectedDestination: loaded.primaryExpectation,
+          ...(loaded.primaryExpectation.kind === 'state' ? {
+            priorBackup: {
+              filePath: `${authorized.paths.documentPath}.bak`,
+              data: current,
+            },
+          } : {}),
+        },
       )
+    } catch (error) {
+      if (error instanceof AtomicDestinationConflictError) {
+        throw new Error('CANVAS_REVISION_CONFLICT: document changed before commit', {
+          cause: error,
+        })
+      }
+      throw error
     }
-    /** 主提交始终只调用一次生产 safe-file 写边界。 */
-    writeCanvasJsonSecure(
-      authorized.paths,
-      authorized.directoryIdentity,
-      authorized.paths.documentPath,
-      next,
-    )
     return next
   }
 
