@@ -297,6 +297,42 @@ describe('Automation 会话复用归属', () => {
     expect(headlessSessionId).toBe('session-1')
   })
 
+  test.each([
+    ['完整 delegation', {
+      parentSessionId: 'automation-parent',
+      rootSessionId: 'automation-parent',
+      sourceDelegationId: 'delegation-1',
+      delegationRole: 'implement' as const,
+      delegationStatus: 'completed' as const,
+      delegationDepth: 1,
+      delegationGoal: '完成子任务',
+    }],
+    ['半归属 delegation', { sourceDelegationId: '' }],
+  ])('Given lastSessionId 指向同 Automation 的%s When reuse 运行 Then 新建直接会话', async (_name, fields) => {
+    const automation = {
+      ...createAutomation('automation-delegation', 'workspace-delegation'),
+      sessionMode: 'reuse' as const,
+      lastSessionId: 'delegation-session',
+    }
+    lastSessionMeta = {
+      id: 'delegation-session',
+      title: 'Automation 协作子会话',
+      workspaceId: 'workspace-delegation',
+      sourceAutomationId: 'automation-delegation',
+      createdAt: 1,
+      updatedAt: 1,
+      ...fields,
+    }
+
+    const running = scheduler.runAutomation(automation)
+    await Promise.resolve()
+    activeHeadlessCallbacks?.onComplete()
+    await running
+
+    expect(createdSessionCount).toBe(1)
+    expect(headlessSessionId).toBe('session-1')
+  })
+
   test('Given lastSessionId 完整归属于当前 Automation When reuse 运行 Then 保持合法复用', async () => {
     const automation = {
       ...createAutomation('automation-valid', 'workspace-valid'),

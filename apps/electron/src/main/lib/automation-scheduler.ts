@@ -57,7 +57,15 @@ const DAILY_CONTEXT_ROLLOVER_THRESHOLD = 0.7
  */
 function isReusableAutomationSession(session: AgentSessionMeta | undefined, automationId: string): boolean {
   if (!session || session.sourceAutomationId !== automationId) return false
-  return session.sourceDesignProjectId === undefined
+  const hasDelegationOwnership = session.parentSessionId !== undefined
+    || session.rootSessionId !== undefined
+    || session.sourceDelegationId !== undefined
+    || session.delegationRole !== undefined
+    || session.delegationStatus !== undefined
+    || session.delegationDepth !== undefined
+    || session.delegationGoal !== undefined
+  return !hasDelegationOwnership
+    && session.sourceDesignProjectId === undefined
     && session.sourceDesignJobId === undefined
     && session.sourceCanvasProjectId === undefined
     && session.sourceCanvasId === undefined

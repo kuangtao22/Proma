@@ -265,6 +265,73 @@ describe('飞书 Bridge 会话边界', () => {
     expect(stoppedSessions).toEqual([])
     expect(bridge.listBindings()).toEqual([])
   })
+
+  test.each([
+    ['Canvas', {
+      sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
+    }],
+    ['Design 半归属', { sourceDesignProjectId: 'project-1' }],
+  ])('Given 发送处理中会话变为%s When 即将启动 Agent Then 再次验证并阻止运行', async (_name, fields) => {
+    sessions.clear()
+    startedSessions.length = 0
+    feishuReplies.length = 0
+    sessions.set('racing-session', createSession('racing-session'))
+    const { FeishuBridge } = await import('./feishu-bridge')
+    const bridge = new FeishuBridge({
+      id: 'bot-race',
+      name: '竞态测试',
+      enabled: true,
+      appId: 'app-id',
+      appSecret: 'encrypted',
+    } as FeishuBotConfig)
+    const exposed = bridge as unknown as {
+      client: unknown
+      chatBindings: Map<string, FeishuChatBinding>
+      sessionToChat: Map<string, string>
+      saveBindings: () => void
+      handleUserMessage: (context: FeishuMessageContext, text: string) => Promise<void>
+    }
+    const binding: FeishuChatBinding = {
+      chatId: 'chat-race',
+      botId: 'bot-race',
+      userId: 'user-1',
+      sessionId: 'racing-session',
+      workspaceId: 'project-1',
+      channelId: 'channel-1',
+      source: 'feishu',
+      chatType: 'p2p',
+      createdAt: 1,
+      lastUsedAt: 1,
+    }
+    exposed.chatBindings.set(binding.chatId, binding)
+    exposed.sessionToChat.set(binding.sessionId, binding.chatId)
+    exposed.saveBindings = () => undefined
+    exposed.client = {
+      cardkit: { v1: { card: {
+        create: async () => {
+          sessions.set('racing-session', createSession('racing-session', fields))
+          return { data: { card_id: 'card-race' } }
+        },
+        update: async () => undefined,
+      } } },
+      im: { message: {
+        create: async (input: { data: { content: string } }) => {
+          feishuReplies.push(input.data.content)
+          return { data: { message_id: 'message-race' } }
+        },
+        reply: async () => ({ data: { message_id: 'reply-race' } }),
+      } },
+    }
+
+    await exposed.handleUserMessage({
+      chatId: 'chat-race',
+      senderOpenId: 'user-1',
+      messageId: 'incoming-race',
+      chatType: 'p2p',
+    }, '继续执行')
+
+    expect(startedSessions).toEqual([])
+  })
 })
 
 describe('Canvas Agent Collaboration 边界', () => {

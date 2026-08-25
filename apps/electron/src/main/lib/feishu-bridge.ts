@@ -1781,6 +1781,26 @@ class FeishuBridge {
       ? [this.buildPiFeishuChatHistoryTool(chatId)]
       : undefined
 
+    // 上述卡片、引用和群历史均包含 await；启动 Agent 前必须重新读取权威绑定与会话，
+    // 防止等待期间绑定被切换，或原会话被转成 Canvas/Design 内部会话。
+    const authoritativeBinding = this.getValidBinding(chatId)
+    const authoritativeSession = getAgentSessionMeta(binding.sessionId)
+    if (
+      !authoritativeBinding
+      || authoritativeBinding.sessionId !== binding.sessionId
+      || !authoritativeSession
+      || !isAgentSessionUserVisible(authoritativeSession)
+      || !authoritativeSession.workspaceId
+    ) {
+      const errorMessage = '当前会话项目不可用，请在 Proma 中重新选择会话。'
+      this.markStreamingError(binding.sessionId, errorMessage)
+      this.sessionBuffers.delete(binding.sessionId)
+      this.streamingCardsUsedSessions.delete(binding.sessionId)
+      await this.sendCardMessage(chatId, buildErrorCard(errorMessage))
+      return
+    }
+    binding = authoritativeBinding
+
     // 渠道/模型解析：binding（per-chat 用户在 IM 里切过的）优先，其次 Bot 配置、应用设置
     const latestSettings = getSettings()
     const channelId = binding.channelId || this.botConfig.defaultChannelId || latestSettings.agentChannelId || ''
@@ -1791,7 +1811,7 @@ class FeishuBridge {
       userMessage: agentMessage,
       channelId,
       modelId,
-      workspaceId: session.workspaceId,
+      workspaceId: authoritativeSession.workspaceId,
       permissionModeOverride: 'bypassPermissions',
     }
 
