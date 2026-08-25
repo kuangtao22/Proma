@@ -70,3 +70,6 @@ export * from './path-management'
 
 // 项目级 Design 工作区相关类型
 export * from './design'
+
+// 独立 Canvas 图文档相关类型
+export * from './canvas'
