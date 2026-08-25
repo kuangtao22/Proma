@@ -533,7 +533,7 @@ export function WorkspaceMemoryTab({ workspaceSlug, search }: WorkspaceMemoryTab
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => window.electronAPI.showItemInFolder(selected.absolutePath)}
+                    onClick={() => window.electronAPI.showItemInFolder(selected.absolutePath, { workspaceSlug })}
                   >
                     <FolderOpen size={14} className="mr-1.5" />
                     打开文件夹

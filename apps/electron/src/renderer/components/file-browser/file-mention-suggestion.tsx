@@ -25,6 +25,7 @@ export function createFileMentionSuggestion(
   attachedDirsRef?: React.RefObject<string[]>,
   mentionItemCountRef?: React.MutableRefObject<number>,
   sessionAttachedDirsRef?: React.RefObject<string[]>,
+  currentSessionIdRef?: React.RefObject<string | null>,
 ): Omit<SuggestionOptions<FileIndexEntry>, 'editor'> {
   let missingWorkspaceToastShown = false
   // Esc 抑制：记录被 Esc 关闭的触发片段文本。
@@ -80,6 +81,7 @@ export function createFileMentionSuggestion(
           200,
           additionalPaths.length > 0 ? additionalPaths : undefined,
           sessionPaths.length > 0 ? sessionPaths : undefined,
+          { sessionId: currentSessionIdRef?.current ?? undefined },
         )
         return result.entries
       } catch (error) {

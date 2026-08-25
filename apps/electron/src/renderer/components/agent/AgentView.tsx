@@ -1797,7 +1797,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
     if (paths.length > 0) {
       try {
         // 通过主进程检测目录 vs 文件
-        const { directories, files: filePaths } = await window.electronAPI.checkPathsType(paths)
+        const { directories, files: filePaths } = await window.electronAPI.checkPathsType(paths, { sessionId })
 
         // 拖拽的文件夹：附加到会话 + 插入可见的文件夹引用（与右侧面板拖拽体验一致）
         for (const dirPath of directories) {

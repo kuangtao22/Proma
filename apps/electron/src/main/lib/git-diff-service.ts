@@ -22,6 +22,12 @@ export interface ListWorktreesStrictOptions {
   maxDiscoveryEntries?: number
 }
 
+/** Renderer IPC 可注入已完成会话授权的稳定工作树读取器。 */
+export interface GitWorkingTreeReadOptions {
+  /** 读取指定工作树文件；实现必须把授权与实际消费绑定到同一对象。 */
+  readFile?: (filePath: string, maxSize: number) => Buffer
+}
+
 /** 大文件读取上限：超过则跳过，避免 IPC 序列化撑爆内存 */
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
@@ -871,7 +877,8 @@ export async function getFileDiff(dirPath: string, filePath: string, gitRoot?: s
 /**
  * 获取文件的旧版本（git HEAD 或指定 baseRef）和新版本（磁盘）内容
  */
-export async function getDiffContents(dirPath: string, filePath: string, gitRoot?: string, baseRef?: string): Promise<{ oldContent: string; newContent: string } | null> {
+export async function getDiffContents(dirPath: string, filePath: string, gitRoot?: string, baseRef?: string, readOptions?: GitWorkingTreeReadOptions): Promise<{ oldContent: string; newContent: string } | null> {
+  const readWorkingTreeFile = readOptions?.readFile ?? readWorkingTreeFileStable
   const root = gitRoot || await findGitRoot(dirPath)
 
   // 无 git root：纯文件预览（无 git HEAD 可比较），仅读磁盘文件，安全检查依赖 dirPath
@@ -885,7 +892,7 @@ export async function getDiffContents(dirPath: string, filePath: string, gitRoot
     let newContent = ''
     if (existsSync(fullPath)) {
       try {
-        newContent = readWorkingTreeFileStable(fullPath, MAX_FILE_SIZE_BYTES).toString('utf8')
+        newContent = readWorkingTreeFile(fullPath, MAX_FILE_SIZE_BYTES).toString('utf8')
       } catch {
         // 读取失败保持空字符串
       }
@@ -916,7 +923,7 @@ export async function getDiffContents(dirPath: string, filePath: string, gitRoot
   const fullPath = join(root, safePath)
   if (existsSync(fullPath)) {
     try {
-      newContent = readWorkingTreeFileStable(fullPath, MAX_FILE_SIZE_BYTES).toString('utf8')
+      newContent = readWorkingTreeFile(fullPath, MAX_FILE_SIZE_BYTES).toString('utf8')
     } catch {
       // 读取失败保持空字符串
     }
@@ -931,7 +938,7 @@ export async function getDiffContents(dirPath: string, filePath: string, gitRoot
  * filePath 应为相对于 gitRoot 或 dirPath 的相对路径。
  * 拒绝绝对路径和 `..` 穿越。
  */
-export async function getUntrackedContent(dirPath: string, filePath: string, gitRoot?: string): Promise<string> {
+export async function getUntrackedContent(dirPath: string, filePath: string, gitRoot?: string, readOptions?: GitWorkingTreeReadOptions): Promise<string> {
   if (!filePath || typeof filePath !== 'string') return ''
   const root = gitRoot || await findGitRoot(dirPath) || dirPath
   const safePath = normalizeSafePath(root, filePath)
@@ -941,7 +948,8 @@ export async function getUntrackedContent(dirPath: string, filePath: string, git
   }
   const fullPath = resolve(root, safePath)
   try {
-    return normalizeLineEndings(readWorkingTreeFileStable(fullPath, MAX_FILE_SIZE_BYTES).toString('utf8'))
+    const readWorkingTreeFile = readOptions?.readFile ?? readWorkingTreeFileStable
+    return normalizeLineEndings(readWorkingTreeFile(fullPath, MAX_FILE_SIZE_BYTES).toString('utf8'))
   } catch {
     return ''
   }

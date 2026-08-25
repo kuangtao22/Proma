@@ -197,10 +197,11 @@ export function FilePathChip({ filePath, basePath, basePaths, className }: FileP
 
   const handleShowInFolder = React.useCallback(() => {
     const bases = candidateBases.length > 0 ? candidateBases : undefined
-    window.electronAPI.showItemInFolder(cleanPath, bases)
+    const sessionId = store.get(currentAgentSessionIdAtom)
+    window.electronAPI.showItemInFolder(cleanPath, { sessionId: sessionId ?? undefined, candidateBasePaths: bases })
       .then((ok) => { if (!ok) toast.error(`未找到文件：${filename}`) })
       .catch(() => toast.error(`未找到文件：${filename}`))
-  }, [cleanPath, candidateBases, filename])
+  }, [cleanPath, candidateBases, filename, store])
 
   return (
     <ContextMenu>

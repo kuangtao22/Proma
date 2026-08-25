@@ -130,7 +130,8 @@ export function FileDropZone({ workspaceSlug, sessionId, target = 'session', onF
 
     if (paths.length > 0) {
       try {
-        const { directories, files: filePaths } = await window.electronAPI.checkPathsType(paths)
+        const access = sessionId ? { sessionId, workspaceSlug } : { workspaceSlug }
+        const { directories, files: filePaths } = await window.electronAPI.checkPathsType(paths, access)
 
         // 左侧：只上传文件，忽略目录
         if (side === 'left') {

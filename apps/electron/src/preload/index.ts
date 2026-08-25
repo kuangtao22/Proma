@@ -884,8 +884,8 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   /** 使用系统终端打开文件夹 */
   openFolderInTerminal: (folderPath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<void>
 
-  /** 在系统文件管理器中显示文件（无工作区限制，支持候选基础目录） */
-  showItemInFolder: (filePath: string, candidateBasePaths?: string[]) => Promise<boolean>
+  /** 在系统文件管理器中显示当前会话或工作区已授权的文件 */
+  showItemInFolder: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<boolean>
 
   /** 解析文件路径并读取内容（供内联预览使用） */
   resolveAndReadFile: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<{ resolvedPath: string; content: string; isBinary: boolean; isTooLarge: boolean } | null>
@@ -936,13 +936,13 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   moveAttachedFile: (filePath: string, targetDir: string, access?: import('@proma/shared').FileAccessOptions) => Promise<void>
 
   /** 检查路径类型（文件 or 目录），用于拖拽检测 */
-  checkPathsType: (paths: string[]) => Promise<{ directories: string[]; files: string[] }>
+  checkPathsType: (paths: string[], access?: import('@proma/shared').FileAccessOptions) => Promise<{ directories: string[]; files: string[] }>
 
   /** 获取拖拽文件的本地路径（替代已废弃的 File.path） */
   getPathForFile: (file: File) => string
 
   /** 搜索工作区文件（用于 @ 引用，支持附加目录） */
-  searchWorkspaceFiles: (rootPath: string, query: string, limit?: number, additionalPaths?: string[], sessionPaths?: string[]) => Promise<FileSearchResult>
+  searchWorkspaceFiles: (rootPath: string, query: string, limit?: number, additionalPaths?: string[], sessionPaths?: string[], access?: import('@proma/shared').FileAccessOptions) => Promise<FileSearchResult>
 
   // ===== 系统提示词管理 =====
 
@@ -2271,9 +2271,9 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.OPEN_FOLDER_IN_TERMINAL, folderPath, access)
   },
 
-  /** 在系统文件管理器中显示文件（无工作区限制，支持候选基础目录） */
-  showItemInFolder: (filePath: string, candidateBasePaths?: string[]): Promise<boolean> => {
-    return ipcRenderer.invoke(IPC_CHANNELS.SHOW_ITEM_IN_FOLDER, filePath, candidateBasePaths)
+  /** 在系统文件管理器中显示当前会话或工作区已授权的文件 */
+  showItemInFolder: (filePath: string, access?: import('@proma/shared').FileAccessOptions): Promise<boolean> => {
+    return ipcRenderer.invoke(IPC_CHANNELS.SHOW_ITEM_IN_FOLDER, filePath, access)
   },
 
   resolveAndReadFile: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => {
@@ -2340,16 +2340,16 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.MOVE_ATTACHED_FILE, filePath, targetDir, access)
   },
 
-  checkPathsType: (paths: string[]) => {
-    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.CHECK_PATHS_TYPE, paths)
+  checkPathsType: (paths: string[], access?: import('@proma/shared').FileAccessOptions) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.CHECK_PATHS_TYPE, paths, access)
   },
 
   getPathForFile: (file: File) => {
     return webUtils.getPathForFile(file)
   },
 
-  searchWorkspaceFiles: (rootPath: string, query: string, limit = 20, additionalPaths?: string[], sessionPaths?: string[]) => {
-    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SEARCH_WORKSPACE_FILES, rootPath, query, limit, additionalPaths, sessionPaths)
+  searchWorkspaceFiles: (rootPath: string, query: string, limit = 20, additionalPaths?: string[], sessionPaths?: string[], access?: import('@proma/shared').FileAccessOptions) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SEARCH_WORKSPACE_FILES, rootPath, query, limit, additionalPaths, sessionPaths, access)
   },
 
   // 系统提示词管理

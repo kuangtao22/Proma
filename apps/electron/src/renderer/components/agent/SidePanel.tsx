@@ -7,6 +7,7 @@
 
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
+import { toast } from 'sonner'
 import { X, ExternalLink, ChevronRight, MoreHorizontal, FolderSearch, Pencil, FolderInput, MessageSquarePlus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -1153,6 +1154,9 @@ function AttachedDirItem({ entry, depth, selectedPaths, onSelect, refreshVersion
       setCurrentPath(newPath)
     } catch (err) {
       console.error('[AttachedDirItem] 重命名失败:', err)
+      toast.error('重命名失败', {
+        description: err instanceof Error ? err.message : '无法重命名文件',
+      })
     }
     setIsRenaming(false)
   }
@@ -1174,6 +1178,9 @@ function AttachedDirItem({ entry, depth, selectedPaths, onSelect, refreshVersion
       setCurrentPath(newPath)
     } catch (err) {
       console.error('[AttachedDirItem] 移动失败:', err)
+      toast.error('移动失败', {
+        description: err instanceof Error ? err.message : '无法移动文件',
+      })
     }
   }
 

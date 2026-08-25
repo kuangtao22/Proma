@@ -312,6 +312,9 @@ export function FileBrowser({ rootPath, roots, hideToolbar, embedded, hideEmpty,
       await loadRoot()
     } catch (err) {
       console.error('[FileBrowser] 删除失败:', err)
+      toast.error('删除失败', {
+        description: err instanceof Error ? err.message : '无法删除文件',
+      })
     }
     setDeleteTarget(null)
   }, [deleteTarget, selectedPaths, loadRoot, access])
@@ -334,6 +337,9 @@ export function FileBrowser({ rootPath, roots, hideToolbar, embedded, hideEmpty,
       await loadRoot()
     } catch (err) {
       console.error('[FileBrowser] 移动失败:', err)
+      toast.error('移动失败', {
+        description: err instanceof Error ? err.message : '无法移动文件',
+      })
     } finally {
       setMoving(false)
     }

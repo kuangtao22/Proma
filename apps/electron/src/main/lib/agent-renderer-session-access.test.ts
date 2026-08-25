@@ -1,8 +1,7 @@
 import { describe, expect, test } from 'bun:test'
-import { randomUUID } from 'node:crypto'
-import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import type { AgentSessionMeta, FileAccessOptions } from '@proma/shared'
 import ts from 'typescript'
 import { requireUserVisibleAgentSession } from './agent-session-visibility'
@@ -14,7 +13,9 @@ const PURE_VALIDATION_CALLS = new Set([
   'Number.isSafeInteger',
   'Object.keys',
   'String',
+  'Math.min',
   'isPromaPermissionMode',
+  'normalizeFileAccessOptions',
   'validThinkingLevels.includes',
 ])
 
@@ -98,6 +99,18 @@ function containsSessionId(type: ts.Type, checker: ts.TypeChecker, seen = new Se
     return type.types.some((member) => containsSessionId(member, checker, seen))
   }
   return checker.getPropertyOfType(type, 'sessionId') !== undefined
+}
+
+/** 递归识别 handler 参数中的路径能力，避免只维护一份易漏的敏感通道集合。 */
+function containsPathCapability(type: ts.Type, checker: ts.TypeChecker, seen = new Set<ts.Type>()): boolean {
+  if (seen.has(type)) return false
+  seen.add(type)
+  if (type.isUnionOrIntersection()) {
+    return type.types.some((member) => containsPathCapability(member, checker, seen))
+  }
+  return checker.getPropertiesOfType(type).some((property) => (
+    /(?:path|file|directory|cwd|root)/i.test(property.name)
+  ))
 }
 
 /** 收集 handler 当前执行路径上的调用，跳过回调和嵌套函数体。 */
@@ -203,6 +216,16 @@ function handlerReceivesSessionId(handler: RegisteredHandler, checker: ts.TypeCh
   })
 }
 
+/** 按参数语义把每个 Renderer handler 归入唯一访问类别。 */
+function classifyRendererHandler(handler: RegisteredHandler, checker: ts.TypeChecker): 'session' | 'path' | 'non-sensitive' {
+  const receivesPath = handler.handler.parameters.slice(1).some((parameter) => (
+    /(?:path|file|directory|cwd|root)/i.test(parameter.name.getText())
+      || containsPathCapability(checker.getTypeAtLocation(parameter), checker)
+  ))
+  if (receivesPath) return 'path'
+  return handlerReceivesSessionId(handler, checker) ? 'session' : 'non-sensitive'
+}
+
 describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
   test('Given 不存在、Design、Canvas 或半归属会话 When 进入普通入口 Then 统一表现为会话不存在', () => {
     const internalSessions = [
@@ -250,7 +273,11 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       const registered = handlers.find((handler) => handler.channel === channel)
       expect(registered, `${channel} 未纳入全量 ipcMain.handle 矩阵`).toBeDefined()
       const calls = collectTopLevelExecutionCalls(registered!.handler.body)
-      const guardIndex = calls.findIndex((call) => getCallName(call) === 'requireVisibleFileAccess')
+      const guardIndex = calls.findIndex((call) => [
+        'requireVisibleFileAccess',
+        'requireVisibleFileReadAccess',
+        'requireVisibleFileWriteAccess',
+      ].includes(getCallName(call)))
       expect(guardIndex, `${channel} 缺少文件访问 guard`).toBeGreaterThanOrEqual(0)
       const businessCallsBeforeGuard = calls
         .slice(0, guardIndex)
@@ -258,6 +285,55 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
         .filter((name) => !PURE_VALIDATION_CALLS.has(name) && name !== 'Error' && name !== 'console.warn')
       expect(businessCallsBeforeGuard, `${channel} 在 guard 前执行了业务调用`).toEqual([])
     }
+  })
+
+  test('Given ipc.ts 的全部 Renderer handler When 按参数能力分类 Then 每个入口唯一归入 session、path 或 non-sensitive', () => {
+    const { checker, handlers } = loadAgentHandlers()
+    const classifications = handlers.map((handler) => ({
+      channel: handler.channel,
+      category: classifyRendererHandler(handler, checker),
+    }))
+
+    expect(classifications).toHaveLength(handlers.length)
+    expect(classifications.filter(({ category }) => category === 'session').length).toBeGreaterThan(30)
+    expect(classifications.filter(({ category }) => category === 'path').length).toBeGreaterThan(25)
+    expect(classifications.filter(({ category }) => category === 'non-sensitive').length).toBeGreaterThan(100)
+    for (const channel of ['CHECK_PATHS_TYPE', 'SEARCH_WORKSPACE_FILES', 'SHOW_ITEM_IN_FOLDER']) {
+      expect(classifications.find((entry) => entry.channel === channel)?.category).toBe('path')
+    }
+    expect(classifications.find((entry) => entry.channel === 'OPEN_SESSION')?.category).toBe('session')
+  })
+
+  test('Given 路径检查、搜索与系统显示入口 When 检查顶层执行路径 Then guard 先于 stat、readdir、cache 与 shell', () => {
+    const { handlers } = loadAgentHandlers()
+    for (const channel of ['CHECK_PATHS_TYPE', 'SEARCH_WORKSPACE_FILES', 'SHOW_ITEM_IN_FOLDER']) {
+      const registered = handlers.find((handler) => handler.channel === channel)
+      expect(registered).toBeDefined()
+      const calls = collectTopLevelExecutionCalls(registered!.handler.body)
+      const guardIndex = calls.findIndex((call) => getCallName(call) === 'requireVisibleFileAccess')
+      expect(guardIndex, `${channel} 缺少路径 guard`).toBeGreaterThanOrEqual(0)
+      const businessCallsBeforeGuard = calls
+        .slice(0, guardIndex)
+        .map(getCallName)
+        .filter((name) => !PURE_VALIDATION_CALLS.has(name) && name !== 'Error' && name !== 'console.warn')
+      expect(businessCallsBeforeGuard, `${channel} 在 guard 前执行了业务调用`).toEqual([])
+    }
+  })
+
+  test('Given Windows Agent Island 收到内部会话 When 打开会话 Then guard 失败且窗口与已读状态零副作用', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find((handler) => handler.channel === 'OPEN_SESSION')
+    expect(registered).toBeDefined()
+    let sideEffectCount = 0
+    const handler = compileHandler<(event: object, sessionId: string, title: string) => Promise<void>>(registered!, {
+      isNonEmptyString: () => true,
+      requireVisibleSession: () => { throw new Error('Agent 会话不存在') },
+      markAgentIslandSessionViewed: () => { sideEffectCount += 1 },
+      getMainWindow: () => { sideEffectCount += 1; return null },
+    })
+
+    await expect(handler({}, 'canvas', 'Canvas')).rejects.toThrow('Agent 会话不存在')
+    expect(sideEffectCount).toBe(0)
   })
 
   test('Given Git、独立预览与 file handler 收到内部或未知会话 When 执行真实 handler Then 业务副作用为零', async () => {
@@ -268,6 +344,7 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       let businessCallCount = 0
       const handler = compileHandler<(...args: unknown[]) => Promise<unknown>>(registered!, {
         requireVisibleFileAccess: () => { throw new Error('Agent 会话不存在') },
+        requireVisibleFileReadAccess: () => { throw new Error('Agent 会话不存在') },
         normalizeFileAccessOptions: (value: unknown) => value,
         ensurePathAllowedWithWorktree: async () => { businessCallCount += 1; return true },
         getFileDiff: () => { businessCallCount += 1; return '' },
@@ -281,6 +358,116 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       await expect(handler(...args)).rejects.toThrow('Agent 会话不存在')
       expect(businessCallCount, `${channel} 在 guard 失败后仍执行副作用`).toBe(0)
     }
+  })
+
+  test('Given 文件 guard 已打开授权对象 When 路径在首次读取前被替换 Then resolve-and-read 绝不读取替换内容', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find((handler) => handler.channel === 'file:resolve-and-read')
+    expect(registered).toBeDefined()
+    const root = mkdtempSync(join(tmpdir(), 'proma-renderer-guard-read-race-'))
+    const authorizedPath = join(root, 'authorized.txt')
+    const replacementPath = join(root, 'replacement.txt')
+    writeFileSync(authorizedPath, 'authorized-content')
+    writeFileSync(replacementPath, 'replacement-content')
+    let descriptor: number | undefined
+    try {
+      /** 模拟 guard：先打开授权 inode，再让攻击者替换路径，随后才返回给 handler。 */
+      const openAccessSnapshot = () => {
+        descriptor = openSync(authorizedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+        renameSync(replacementPath, authorizedPath)
+        return {
+          options: undefined,
+          authorizedFiles: new Map([[authorizedPath, {
+            canonicalPath: authorizedPath,
+            readBytes: () => readFileSync(descriptor!),
+            close: () => undefined,
+          }]]),
+        }
+      }
+      const handler = compileHandler<(event: object, filePath: string) => Promise<{ content: string } | null>>(registered!, {
+        requireVisibleFileAccess: openAccessSnapshot,
+        requireVisibleFileReadAccess: openAccessSnapshot,
+        getPreviewCandidateBasePaths: () => [],
+        resolveFilePath: () => authorizedPath,
+        isPathAllowed: () => true,
+        readStableFile: (filePath: string) => readFileSync(filePath),
+        decodeStablePreviewText: (content: Buffer) => content.toString('utf8'),
+      })
+
+      const result = await handler({}, authorizedPath)
+      expect(result?.content).toBe('authorized-content')
+      expect(result?.content).not.toBe('replacement-content')
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor)
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    ['DELETE_FILE', ['/source.txt', undefined]],
+    ['RENAME_FILE', ['/source.txt', 'renamed.txt', undefined]],
+    ['MOVE_FILE', ['/source.txt', '/target', undefined]],
+    ['RENAME_ATTACHED_FILE', ['/source.txt', 'renamed.txt', undefined]],
+    ['MOVE_ATTACHED_FILE', ['/source.txt', '/target', undefined]],
+  ])('Given Renderer 调用 %s 且源或目标可能并发变化 When 执行 handler Then 明确拒绝并保持文件零损伤', async (channel, args) => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find((handler) => handler.channel === channel)
+    expect(registered).toBeDefined()
+    const root = mkdtempSync(join(tmpdir(), 'proma-renderer-disabled-mutation-'))
+    const sourcePath = join(root, 'source.txt')
+    const targetDir = join(root, 'target')
+    const concurrentTarget = join(targetDir, 'source.txt')
+    mkdirSync(targetDir)
+    writeFileSync(sourcePath, 'source-content')
+    writeFileSync(concurrentTarget, 'concurrent-target-content')
+    let mutationCallCount = 0
+    try {
+      const handler = compileHandler<(...handlerArgs: unknown[]) => Promise<void>>(registered!, {
+        requireVisibleFileAccess: () => ({ options: undefined }),
+        resolve: (value: string) => value === '/source.txt' ? sourcePath : value === '/target' ? targetDir : value,
+        isPathAllowed: () => true,
+        dirname,
+        join,
+        sep: '/',
+        removeStablePath: () => { mutationCallCount += 1 },
+        renameStablePath: () => { mutationCallCount += 1 },
+        moveStablePath: () => { mutationCallCount += 1; return concurrentTarget },
+        RENDERER_FILE_MUTATION_DISABLED_MESSAGE: 'Renderer 暂不支持删除、重命名或移动文件；请通过 Agent 或系统文件管理器操作',
+      })
+
+      await expect(handler({}, ...args)).rejects.toThrow('Renderer 暂不支持删除、重命名或移动文件')
+      expect(mutationCallCount).toBe(0)
+      expect(readFileSync(sourcePath, 'utf8')).toBe('source-content')
+      expect(readFileSync(concurrentTarget, 'utf8')).toBe('concurrent-target-content')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 路径型 Preload API When 检查四层合同 Then 类型、bridge 与调用端都传入 FileAccessOptions', () => {
+    const electronRoot = join(import.meta.dir, '../..')
+    const preloadSource = readFileSync(join(electronRoot, 'preload/index.ts'), 'utf8')
+    const sourceByPath = new Map([
+      ['AgentView', readFileSync(join(electronRoot, 'renderer/components/agent/AgentView.tsx'), 'utf8')],
+      ['FileDropZone', readFileSync(join(electronRoot, 'renderer/components/file-browser/FileDropZone.tsx'), 'utf8')],
+      ['FileSearchBar', readFileSync(join(electronRoot, 'renderer/components/file-browser/FileSearchBar.tsx'), 'utf8')],
+      ['FileMentionSuggestion', readFileSync(join(electronRoot, 'renderer/components/file-browser/file-mention-suggestion.tsx'), 'utf8')],
+      ['RichTextInput', readFileSync(join(electronRoot, 'renderer/components/ai-elements/rich-text-input.tsx'), 'utf8')],
+      ['FilePathChip', readFileSync(join(electronRoot, 'renderer/components/ai-elements/file-path-chip.tsx'), 'utf8')],
+      ['WorkspaceMemoryTab', readFileSync(join(electronRoot, 'renderer/components/agent-skills/WorkspaceMemoryTab.tsx'), 'utf8')],
+    ])
+
+    expect(preloadSource).toMatch(/checkPathsType:\s*\(paths: string\[\], access\?: import\('@proma\/shared'\)\.FileAccessOptions\)/)
+    expect(preloadSource).toMatch(/searchWorkspaceFiles:[\s\S]*sessionPaths\?: string\[\],[\s\S]*access\?: import\('@proma\/shared'\)\.FileAccessOptions/)
+    expect(preloadSource).toMatch(/showItemInFolder:\s*\(filePath: string, access\?: import\('@proma\/shared'\)\.FileAccessOptions\)/)
+    expect(sourceByPath.get('AgentView')).toMatch(/checkPathsType\(paths,\s*\{\s*sessionId\s*\}\)/)
+    expect(sourceByPath.get('FileDropZone')).toMatch(/const access = sessionId \? \{ sessionId, workspaceSlug \} : \{ workspaceSlug \}/)
+    expect(sourceByPath.get('FileDropZone')).toContain('checkPathsType(paths, access)')
+    expect(sourceByPath.get('FileSearchBar')).toMatch(/searchWorkspaceFiles\([\s\S]*\{\s*sessionId\s*\}/)
+    expect(sourceByPath.get('FileMentionSuggestion')).toMatch(/searchWorkspaceFiles\([\s\S]*\{\s*sessionId:\s*currentSessionIdRef\?\.current/)
+    expect(sourceByPath.get('RichTextInput')).toContain('currentSessionIdRef,')
+    expect(sourceByPath.get('FilePathChip')).toMatch(/showItemInFolder\(cleanPath,\s*\{[\s\S]*sessionId:[\s\S]*candidateBasePaths:/)
+    expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/showItemInFolder\(selected\.absolutePath,\s*\{\s*workspaceSlug\s*\}\)/)
   })
 
   test('Given AGENT handler 使用裸 id 参数 When 检查矩阵 Then 每个 id 都必须显式归类', () => {
@@ -421,6 +608,19 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
         sep: '/',
         isAbsolute: (path: string) => path.startsWith('/'),
         canonicalizeAccessPath: (path: string) => canonicalPaths.get(path) ?? path,
+        getManagedAgentSessionCanonicalPathOwner: compileLocalFunction(
+          source,
+          'getManagedAgentSessionCanonicalPathOwner',
+          {
+            relative: (root: string, path: string) => path.startsWith(`${root}/`) ? path.slice(root.length + 1) : '../outside',
+            sep: '/',
+            isAbsolute: (path: string) => path.startsWith('/'),
+            MANAGED_WORKSPACE_SHARED_ENTRIES: new Set([
+              'workspace-files', 'skills', 'skills-inactive', '.claude', 'memory',
+              'AGENTS.md', 'CLAUDE.md', 'mcp.json', 'config.json',
+            ]),
+          },
+        ),
         MANAGED_WORKSPACE_SHARED_ENTRIES: new Set([
           'workspace-files', 'skills', 'skills-inactive', '.claude', 'memory',
           'AGENTS.md', 'CLAUDE.md', 'mcp.json', 'config.json',
@@ -535,7 +735,7 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
     expect(listCallCount).toBe(2)
   })
 
-  test('Given 文件授权后叶子或祖先被替换 When 稳定读写删除重命名移动 Then 不消费替换后的对象', () => {
+  test('Given 文件授权后叶子或祖先被替换 When 稳定读取 Then 不消费替换后的对象', () => {
     const { source } = loadAgentHandlers()
     const root = mkdtempSync(join(tmpdir(), 'proma-renderer-file-race-'))
     try {
@@ -545,64 +745,11 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       const readStableFile = compileLocalFunction<(path: string, maxSize: number, hook?: () => void) => Buffer>(source, 'readStableFile', {
         ...sharedDependencies, openSync, constants, fstatSync, readFileSync, closeSync,
       })
-      const writeStableTextFile = compileLocalFunction<(path: string, content: string, hook?: () => void) => void>(source, 'writeStableTextFile', {
-        ...sharedDependencies, openSync, constants, fstatSync, ftruncateSync, writeFileSync, closeSync,
-      })
-      const removeStablePath = compileLocalFunction<(path: string, hook?: () => void) => void>(source, 'removeStablePath', {
-        ...sharedDependencies, join, randomUUID, renameSync, rmSync,
-      })
-      const renameStablePath = compileLocalFunction<(sourcePath: string, destinationPath: string, hook?: () => void) => void>(source, 'renameStablePath', {
-        ...sharedDependencies, renameSync,
-      })
-      const moveStablePath = compileLocalFunction<(sourcePath: string, targetDir: string, hook?: () => void) => string>(source, 'moveStablePath', {
-        ...sharedDependencies,
-        basename,
-        join,
-        movePathSafely: (sourcePath: string, targetDir: string) => {
-          const destination = join(targetDir, basename(sourcePath))
-          renameSync(sourcePath, destination)
-          return destination
-        },
-      })
-
       const authorized = join(root, 'authorized.txt')
       const replacement = join(root, 'replacement.txt')
       writeFileSync(authorized, 'authorized')
       writeFileSync(replacement, 'replacement')
       expect(() => readStableFile(authorized, 1024, () => renameSync(replacement, authorized))).toThrow('文件身份已变化')
-
-      const writeTarget = join(root, 'write.txt')
-      const writeReplacement = join(root, 'write-replacement.txt')
-      writeFileSync(writeTarget, 'original')
-      writeFileSync(writeReplacement, 'do-not-touch')
-      expect(() => writeStableTextFile(writeTarget, 'attacker-overwrite', () => renameSync(writeReplacement, writeTarget))).toThrow('文件身份已变化')
-      expect(readFileSync(writeTarget, 'utf8')).toBe('do-not-touch')
-
-      const deleteTarget = join(root, 'delete.txt')
-      const deleteReplacement = join(root, 'delete-replacement.txt')
-      writeFileSync(deleteTarget, 'original')
-      writeFileSync(deleteReplacement, 'do-not-delete')
-      expect(() => removeStablePath(deleteTarget, () => renameSync(deleteReplacement, deleteTarget))).toThrow('文件身份已变化')
-      expect(readFileSync(deleteTarget, 'utf8')).toBe('do-not-delete')
-
-      const renameTarget = join(root, 'rename.txt')
-      const renameReplacement = join(root, 'rename-replacement.txt')
-      const renamed = join(root, 'renamed.txt')
-      writeFileSync(renameTarget, 'original')
-      writeFileSync(renameReplacement, 'do-not-rename')
-      expect(() => renameStablePath(renameTarget, renamed, () => renameSync(renameReplacement, renameTarget))).toThrow('文件身份已变化')
-      expect(existsSync(renamed)).toBe(false)
-      expect(readFileSync(renameTarget, 'utf8')).toBe('do-not-rename')
-
-      const moveTarget = join(root, 'move.txt')
-      const moveReplacement = join(root, 'move-replacement.txt')
-      const targetDir = join(root, 'target')
-      mkdirSync(targetDir)
-      writeFileSync(moveTarget, 'original')
-      writeFileSync(moveReplacement, 'do-not-move')
-      expect(() => moveStablePath(moveTarget, targetDir, () => renameSync(moveReplacement, moveTarget))).toThrow('文件身份已变化')
-      expect(existsSync(join(targetDir, 'move.txt'))).toBe(false)
-      expect(readFileSync(moveTarget, 'utf8')).toBe('do-not-move')
 
       const ancestor = join(root, 'ancestor')
       const movedAncestor = join(root, 'ancestor-old')

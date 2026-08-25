@@ -361,6 +361,7 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
       attachedDirsRef,
       mentionItemCountRef,
       sessionAttachedDirsRef,
+      currentSessionIdRef,
     ),
     [],
   )

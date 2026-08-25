@@ -132,6 +132,8 @@ export function FileSearchBar({
               trimmed,
               30,
               workspaceAttachedDirs.length > 0 ? workspaceAttachedDirs : undefined,
+              undefined,
+              { sessionId },
             ).then((r) => r.entries.map((e) => ({ ...e, source: 'workspace' as const })))
             .catch(() => [] as FileIndexEntry[]),
           )
@@ -144,6 +146,8 @@ export function FileSearchBar({
               trimmed,
               30,
               sessionAttachedDirs.length > 0 ? sessionAttachedDirs : undefined,
+              undefined,
+              { sessionId },
             ).then((r) => r.entries.map((e) => ({ ...e, source: 'session' as const })))
             .catch(() => [] as FileIndexEntry[]),
           )

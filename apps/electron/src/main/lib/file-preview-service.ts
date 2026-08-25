@@ -636,12 +636,12 @@ export function resolveFilePath(filePath: string, basePaths?: string[]): string 
 }
 
 /** 为内联 PDF 预览生成临时 HTML 文件（使用 proma-file:// 加载 PDF，无体积膨胀） */
-export async function preparePdfPreview(filePath: string, basePaths?: string[]): Promise<{ resolvedPath: string; tmpHtmlUrl: string } | null> {
+export async function preparePdfPreview(filePath: string, basePaths?: string[], authorizedContent?: Buffer): Promise<{ resolvedPath: string; tmpHtmlUrl: string } | null> {
   const safePath = resolveTargetPath(filePath, basePaths)
   if (!existsSync(safePath)) return null
   let stablePdf: Buffer
   try {
-    stablePdf = readPreviewFileStable(safePath, MAX_FILE_SIZE)
+    stablePdf = authorizedContent ?? readPreviewFileStable(safePath, MAX_FILE_SIZE)
   } catch {
     return null
   }
@@ -739,11 +739,11 @@ export async function preparePdfPreview(filePath: string, basePaths?: string[]):
 }
 
 /** 将 DOCX 文件转换为 HTML（供内联预览使用） */
-export async function convertDocxToHtml(filePath: string, basePaths?: string[]): Promise<{ resolvedPath: string; html: string } | null> {
+export async function convertDocxToHtml(filePath: string, basePaths?: string[], authorizedContent?: Buffer): Promise<{ resolvedPath: string; html: string } | null> {
   const safePath = resolveTargetPath(filePath, basePaths)
   if (!existsSync(safePath)) return null
   try {
-    const stableDocx = readPreviewFileStable(safePath, MAX_FILE_SIZE)
+    const stableDocx = authorizedContent ?? readPreviewFileStable(safePath, MAX_FILE_SIZE)
     const mammoth = await import('mammoth')
     const result = await mammoth.convertToHtml({ buffer: stableDocx })
     return { resolvedPath: safePath, html: result.value }
@@ -766,12 +766,12 @@ function renderOfficeTextFallback(filePath: string, text: string, kind: OfficePr
 }
 
 /** 将 XLSX/PPTX 转成可内联展示的 HTML 预览 */
-export async function convertOfficeToHtml(filePath: string, basePaths?: string[]): Promise<OfficePreviewResult | null> {
+export async function convertOfficeToHtml(filePath: string, basePaths?: string[], authorizedContent?: Buffer): Promise<OfficePreviewResult | null> {
   const safePath = resolveTargetPath(filePath, basePaths)
   if (!existsSync(safePath)) return null
   let stableOffice: Buffer
   try {
-    stableOffice = readPreviewFileStable(safePath, MAX_FILE_SIZE)
+    stableOffice = authorizedContent ?? readPreviewFileStable(safePath, MAX_FILE_SIZE)
   } catch (error) {
     console.error('[file-preview] convertOfficeToHtml stable read failed:', error)
     return null
