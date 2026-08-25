@@ -7,6 +7,7 @@
 
 import * as React from 'react'
 import { useSetAtom } from 'jotai'
+import { toast } from 'sonner'
 import { Search, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { FileTypeIcon } from './FileTypeIcon'
@@ -121,6 +122,7 @@ export function FileSearchBar({
       setSearching(true)
       try {
         const allResults: FileIndexEntry[] = []
+        let searchError: unknown
 
         // 分别搜索项目文件和会话文件，确保两边都用相对路径
         const searches: Promise<FileIndexEntry[]>[] = []
@@ -135,7 +137,7 @@ export function FileSearchBar({
               undefined,
               { sessionId },
             ).then((r) => r.entries.map((e) => ({ ...e, source: 'workspace' as const })))
-            .catch(() => [] as FileIndexEntry[]),
+            .catch((error) => { searchError = error; return [] as FileIndexEntry[] }),
           )
         }
 
@@ -149,12 +151,19 @@ export function FileSearchBar({
               undefined,
               { sessionId },
             ).then((r) => r.entries.map((e) => ({ ...e, source: 'session' as const })))
-            .catch(() => [] as FileIndexEntry[]),
+            .catch((error) => { searchError = error; return [] as FileIndexEntry[] }),
           )
         }
 
         const results_ = await Promise.all(searches)
         for (const r of results_) allResults.push(...r)
+
+        if (searchError) {
+          toast.error('文件搜索不可用', {
+            id: 'file-search-unavailable',
+            description: searchError instanceof Error ? searchError.message : '无法安全遍历当前目录',
+          })
+        }
 
         if (ac.signal.aborted) return
 

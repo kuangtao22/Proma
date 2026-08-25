@@ -16,6 +16,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   readSync,
   realpathSync,
@@ -173,7 +174,7 @@ import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
 import { browserController } from './lib/browser-controller'
 import { resolveBrowserProfileKey } from './lib/browser-profile-policy'
-import { getUnstagedChanges, invalidateGitDiffCache, getFileDiff, getUntrackedContent, revertFile, getDiffContents, listWorktrees, getWorktreeChanges, getMainRepoRoot } from './lib/git-diff-service'
+import { getUnstagedChanges, invalidateGitDiffCache, getFileDiff, getUntrackedContent, getDiffContents, listWorktrees, getWorktreeChanges, getMainRepoRoot } from './lib/git-diff-service'
 import {
   registerPromaDirectoryPath,
   registerPromaAuthorizedFile,
@@ -433,8 +434,8 @@ import { feishuBridgeManager } from './lib/feishu-bridge-manager'
 import { syncFeishuSyncSleepBlocker } from './lib/feishu-sleep-blocker'
 import { presenceService } from './lib/feishu-presence'
 import { getDingTalkConfig, saveDingTalkConfig, getDecryptedClientSecret, getDingTalkMultiBotConfig, saveDingTalkBotConfig, removeDingTalkBot, getDecryptedBotClientSecret } from './lib/dingtalk-config'
-import { listShallowDirectory } from './lib/directory-listing'
 import { dingtalkBridgeManager } from './lib/dingtalk-bridge-manager'
+import { listShallowDirectory } from './lib/directory-listing'
 import { getWeChatConfig } from './lib/wechat-config'
 import { wechatBridge } from './lib/wechat-bridge'
 
@@ -593,6 +594,129 @@ const MANAGED_WORKSPACE_SHARED_ENTRIES = new Set([
 
 /** 普通 Renderer 缺少跨平台原子 no-replace 能力，文件变更统一 fail closed。 */
 const RENDERER_FILE_MUTATION_DISABLED_MESSAGE = 'Renderer 暂不支持删除、重命名或移动文件；请通过 Agent 或系统文件管理器操作'
+const RENDERER_GIT_REVERT_DISABLED_MESSAGE = 'Renderer 暂不支持还原文件；请通过 Agent 或 Git 工具操作'
+const RENDERER_DIRECTORY_TRAVERSAL_UNSUPPORTED_MESSAGE = '当前平台不支持稳定目录遍历，已拒绝 Renderer 文件浏览'
+
+interface StableDirectoryHandle {
+  canonicalPath: string
+  descriptor: number
+}
+
+/** 在支持 `/proc/self/fd` 的平台稳定打开目录，绑定授权时的目录身份。 */
+function openStableDirectory(directoryPath: string, snapshot: RendererFileAccessSnapshot): StableDirectoryHandle {
+  if (process.platform !== 'linux') throw new Error(RENDERER_DIRECTORY_TRAVERSAL_UNSUPPORTED_MESSAGE)
+  const canonicalPath = realpathSync(resolve(directoryPath))
+  if (!isPathAllowed(canonicalPath, snapshot.options, snapshot)) {
+    throw new Error('访问路径超出当前会话的授权范围')
+  }
+  const identity = captureStablePathIdentity(canonicalPath)
+  const descriptor = openSync(canonicalPath, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0))
+  const opened = fstatSync(descriptor)
+  if (!opened.isDirectory() || opened.dev !== identity.dev || opened.ino !== identity.ino) {
+    closeSync(descriptor)
+    throw new Error('目录身份已变化')
+  }
+  return { canonicalPath, descriptor }
+}
+
+/** 通过父目录 fd no-follow 打开子目录，避免递归时重新消费可变路径。 */
+function openStableChildDirectory(parent: StableDirectoryHandle, name: string): StableDirectoryHandle {
+  const descriptorPath = `/proc/self/fd/${parent.descriptor}/${name}`
+  const identity = captureStablePathIdentity(descriptorPath)
+  const descriptor = openSync(descriptorPath, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0))
+  const opened = fstatSync(descriptor)
+  if (!opened.isDirectory() || opened.dev !== identity.dev || opened.ino !== identity.ino) {
+    closeSync(descriptor)
+    throw new Error('目录身份已变化')
+  }
+  return { canonicalPath: join(parent.canonicalPath, name), descriptor }
+}
+
+/** 从稳定目录 fd 列出浅层条目，符号链接和遍历期间变化的条目直接跳过。 */
+function listStableDirectory(directoryPath: string, snapshot: RendererFileAccessSnapshot): FileEntry[] {
+  const handle = openStableDirectory(directoryPath, snapshot)
+  try {
+    const entries: FileEntry[] = []
+    for (const item of readdirSync(`/proc/self/fd/${handle.descriptor}`, { withFileTypes: true })) {
+      if (item.name === '.DS_Store' || item.name === 'Thumbs.db' || item.isSymbolicLink()) continue
+      const descriptorPath = `/proc/self/fd/${handle.descriptor}/${item.name}`
+      let stats: ReturnType<typeof lstatSync>
+      try {
+        stats = lstatSync(descriptorPath)
+      } catch {
+        continue
+      }
+      if (stats.isSymbolicLink() || (!stats.isFile() && !stats.isDirectory())) continue
+      entries.push({
+        name: item.name,
+        path: join(handle.canonicalPath, item.name),
+        isDirectory: stats.isDirectory(),
+        size: stats.isFile() ? stats.size : undefined,
+      })
+    }
+    entries.sort((left, right) => {
+      if (left.isDirectory !== right.isDirectory) return left.isDirectory ? -1 : 1
+      if (left.name.startsWith('.') !== right.name.startsWith('.')) return left.name.startsWith('.') ? 1 : -1
+      return left.name.localeCompare(right.name)
+    })
+    return entries
+  } finally {
+    closeSync(handle.descriptor)
+  }
+}
+
+interface StableSearchEntry {
+  name: string
+  path: string
+  isDirectory: boolean
+}
+
+/** 递归扫描稳定目录 fd；每层子目录都重新 no-follow 打开并在结束时关闭。 */
+function scanStableDirectory(
+  directoryPath: string,
+  maxDepth: number,
+  maxEntries: number,
+  ignoreDirectories: ReadonlySet<string>,
+  ignoreFiles: ReadonlySet<string>,
+  snapshot: RendererFileAccessSnapshot,
+): StableSearchEntry[] {
+  const root = openStableDirectory(directoryPath, snapshot)
+  const entries: StableSearchEntry[] = []
+  const visit = (handle: StableDirectoryHandle, depth: number): void => {
+    if (depth > maxDepth || entries.length >= maxEntries) return
+    const items = readdirSync(`/proc/self/fd/${handle.descriptor}`, { withFileTypes: true })
+    for (const item of items) {
+      if (entries.length >= maxEntries) break
+      if (ignoreFiles.has(item.name) || item.isSymbolicLink()) continue
+      const descriptorPath = `/proc/self/fd/${handle.descriptor}/${item.name}`
+      let stats: ReturnType<typeof lstatSync>
+      try {
+        stats = lstatSync(descriptorPath)
+      } catch {
+        continue
+      }
+      if (stats.isSymbolicLink() || (!stats.isFile() && !stats.isDirectory())) continue
+      if (stats.isDirectory() && ignoreDirectories.has(item.name)) continue
+      entries.push({ name: item.name, path: join(handle.canonicalPath, item.name), isDirectory: stats.isDirectory() })
+      if (!stats.isDirectory() || depth >= maxDepth) continue
+      let child: StableDirectoryHandle | null = null
+      try {
+        child = openStableChildDirectory(handle, item.name)
+        visit(child, depth + 1)
+      } catch {
+        // 条目在枚举与打开之间变化时跳过其子树，绝不回退到路径遍历。
+      } finally {
+        if (child) closeSync(child.descriptor)
+      }
+    }
+  }
+  try {
+    visit(root, 0)
+    return entries
+  } finally {
+    closeSync(root.descriptor)
+  }
+}
 
 /** 捕获实际文件或目录身份，符号链接不视为可消费对象。 */
 function captureStablePathIdentity(filePath: string): StableFileSystemIdentity {
@@ -719,14 +843,8 @@ function getAuthorizedRoots(
   const sessionsById = accessSnapshot?.sessionsById ?? new Map(listAgentSessions().map((session) => [session.id, session]))
   const workspaces = accessSnapshot ? [...accessSnapshot.workspacesById.values()] : listAgentWorkspaces()
   const workspacesById = accessSnapshot?.workspacesById ?? new Map(workspaces.map((workspace) => [workspace.id, workspace]))
-  const roots: string[] = [
-    join(tmpdir(), 'proma-preview'),
-    ...workspaces.map((workspace) => (
-      join(getConfigDir(), 'agent-workspaces', workspace.slug, 'workspace-files')
-    )),
-  ]
-
-  const workspaceSlugs = new Set<string>()
+  const workspacesBySlug = accessSnapshot?.workspacesBySlug ?? new Map(workspaces.map((workspace) => [workspace.slug, workspace]))
+  const roots: string[] = [join(tmpdir(), 'proma-preview')]
 
   if (options?.sessionId) {
     const meta = sessionsById.get(options.sessionId)
@@ -742,20 +860,21 @@ function getAuthorizedRoots(
     if (meta?.workspaceId) {
       const workspace = workspacesById.get(meta.workspaceId)
       if (workspace?.slug) {
-        workspaceSlugs.add(workspace.slug)
         roots.push(join(getConfigDir(), 'agent-workspaces', workspace.slug, meta.id))
+        roots.push(getProjectFilesPath(workspace.slug))
+        roots.push(...getWorkspaceAttachedDirectories(workspace.slug))
+        roots.push(...getWorkspaceAttachedFiles(workspace.slug))
       }
     }
   }
 
   if (options?.workspaceSlug) {
-    workspaceSlugs.add(options.workspaceSlug)
-  }
-
-  for (const slug of workspaceSlugs) {
-    roots.push(getProjectFilesPath(slug))
-    roots.push(...getWorkspaceAttachedDirectories(slug))
-    roots.push(...getWorkspaceAttachedFiles(slug))
+    const workspace = workspacesBySlug.get(options.workspaceSlug)
+    if (!workspace) return roots
+    const workspaceRoot = join(getConfigDir(), 'agent-workspaces', workspace.slug)
+    roots.push(...[...MANAGED_WORKSPACE_SHARED_ENTRIES].map((entry) => join(workspaceRoot, entry)))
+    roots.push(...getWorkspaceAttachedDirectories(workspace.slug))
+    roots.push(...getWorkspaceAttachedFiles(workspace.slug))
   }
 
   return roots
@@ -1800,13 +1919,13 @@ export function registerIpcHandlers(): void {
   // 获取指定目录的 Git 仓库状态
   ipcMain.handle(
     IPC_CHANNELS.GET_GIT_REPO_STATUS,
-    async (_, dirPath: string): Promise<GitRepoStatus | null> => {
+    async (_, dirPath: string, access?: FileAccessOptions): Promise<GitRepoStatus | null> => {
       if (!dirPath || typeof dirPath !== 'string') {
         console.warn('[IPC] git:get-repo-status 收到无效的目录路径')
         return null
       }
-      const accessSnapshot = requireVisibleFileAccess(undefined, [dirPath])
-      if (!isPathAllowed(dirPath, undefined, accessSnapshot)) return null
+      const accessSnapshot = requireVisibleFileAccess(access, [dirPath])
+      if (!isPathAllowed(dirPath, accessSnapshot.options, accessSnapshot)) return null
       return getGitRepoStatus(dirPath)
     }
   )
@@ -1899,15 +2018,12 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     IPC_CHANNELS.REVERT_FILE,
     async (_, input: RevertFileInput) => {
-      const { dirPath, filePath, gitRoot, sessionId } = input
+      const { dirPath, filePath } = input
       if (!dirPath || !filePath || typeof dirPath !== 'string' || typeof filePath !== 'string') {
         console.warn('[IPC] git:revert-file 收到无效参数')
         return
       }
-      const accessSnapshot = requireVisibleFileAccess({ sessionId }, [dirPath, ...(gitRoot ? [gitRoot] : [])])
-      const access = accessSnapshot.options
-      if (!(await ensurePathAllowedWithWorktree(dirPath, access, accessSnapshot)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access, accessSnapshot)))) return
-      await revertFile(dirPath, filePath, gitRoot)
+      throw new Error(RENDERER_GIT_REVERT_DISABLED_MESSAGE)
     }
   )
 
@@ -4289,7 +4405,7 @@ export function registerIpcHandlers(): void {
         throw new Error('访问路径超出当前会话的授权范围')
       }
 
-      return listShallowDirectory(safePath)
+      return listStableDirectory(safePath, accessSnapshot)
     }
   )
 
@@ -4707,7 +4823,6 @@ export function registerIpcHandlers(): void {
     async (_, rootPath: string, query: string, limit = 20, additionalPaths?: string[], sessionPaths?: string[], access?: FileAccessOptions): Promise<FileSearchResult> => {
       const targetPaths = [rootPath, ...(additionalPaths ?? []), ...(sessionPaths ?? [])]
       const accessSnapshot = requireVisibleFileAccess(access, targetPaths)
-      const { readdirSync, statSync } = await import('node:fs')
       const { resolve, relative, basename } = await import('node:path')
 
       const safeRoot = resolve(rootPath)
@@ -4731,35 +4846,20 @@ export function registerIpcHandlers(): void {
 
       function scan(
         dir: string,
-        depth: number,
         baseRoot: string,
         target: Entry[],
         useAbsPath: boolean,
         source: 'session' | 'workspace',
       ): void {
-        if (depth > 10 || target.length >= INDEX_ENTRY_CAP_PER_GROUP) return
-        try {
-          const items = readdirSync(dir, { withFileTypes: true })
-          for (const item of items) {
-            if (target.length >= INDEX_ENTRY_CAP_PER_GROUP) break
-            if (ignoreFiles.has(item.name)) continue
-            if (item.isDirectory() && ignoreDirs.has(item.name)) continue
-
-            const fullPath = resolve(dir, item.name)
-            const entryPath = useAbsPath ? fullPath : relative(baseRoot, fullPath)
-            target.push({
-              name: item.name,
-              path: entryPath,
-              type: item.isDirectory() ? 'dir' : 'file',
-              source,
-            })
-
-            if (item.isDirectory()) {
-              scan(fullPath, depth + 1, baseRoot, target, useAbsPath, source)
-            }
-          }
-        } catch {
-          // 忽略无权限的目录
+        if (target.length >= INDEX_ENTRY_CAP_PER_GROUP) return
+        const availableEntries = INDEX_ENTRY_CAP_PER_GROUP - target.length
+        for (const item of scanStableDirectory(dir, 10, availableEntries, ignoreDirs, ignoreFiles, accessSnapshot)) {
+          target.push({
+            name: item.name,
+            path: useAbsPath ? item.path : relative(baseRoot, item.path),
+            type: item.isDirectory ? 'dir' : 'file',
+            source,
+          })
         }
       }
 
@@ -4770,19 +4870,32 @@ export function registerIpcHandlers(): void {
           const name = basename(attachedPath)
           if (ignoreFiles.has(name)) return
 
-          const stats = statSync(attachedPath)
-          if (stats.isFile()) {
+          /** canonical 路径必须使用同一快照重新授权，随后再固定文件身份。 */
+          const canonicalAttachedPath = realpathSync(attachedPath)
+          if (!isPathAllowed(canonicalAttachedPath, accessSnapshot.options, accessSnapshot)) {
+            throw new Error('访问路径超出当前会话的授权范围')
+          }
+          const identity = captureStablePathIdentity(canonicalAttachedPath)
+          const attachedStats = lstatSync(canonicalAttachedPath)
+          if (attachedStats.isFile()) {
+            const descriptor = openSync(canonicalAttachedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+            try {
+              const opened = fstatSync(descriptor)
+              if (!opened.isFile() || opened.dev !== identity.dev || opened.ino !== identity.ino) return
+            } finally {
+              closeSync(descriptor)
+            }
             if (target.length >= INDEX_ENTRY_CAP_PER_GROUP) return
             target.push({
               name,
-              path: attachedPath,
+              path: canonicalAttachedPath,
               type: 'file',
               source,
             })
             return
           }
 
-          if (!stats.isDirectory()) return
+          if (!attachedStats.isDirectory()) return
           if (ignoreDirs.has(name)) return
 
           if (target.length >= INDEX_ENTRY_CAP_PER_GROUP) return
@@ -4792,7 +4905,7 @@ export function registerIpcHandlers(): void {
             type: 'dir',
             source,
           })
-          scan(attachedPath, 0, attachedPath, target, true, source)
+          scan(canonicalAttachedPath, canonicalAttachedPath, target, true, source)
         } catch {
           // 忽略不存在或无权限的附加路径
         }
@@ -4807,7 +4920,7 @@ export function registerIpcHandlers(): void {
         workspaceEntries = [...cachedIndex.workspaceEntries]
       } else {
         // session 目录：相对路径
-        scan(safeRoot, 0, safeRoot, rootEntries, false, 'session')
+        scan(safeRoot, safeRoot, rootEntries, false, 'session')
 
         // 会话级附加路径：绝对路径，标记为 session（归入会话文件分组）
         for (const sessionPath of resolvedSessionPaths) {

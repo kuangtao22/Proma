@@ -88,6 +88,55 @@ describe('proma-file 目录授权', () => {
       .toThrow('本地文件授权内容超过内存预算')
   })
 
+  test('Given Buffer 响应达到并发字节预算 When 再发起响应 Then 拒绝且取消后释放预算', async () => {
+    const registry = createPromaFileProtocolRegistry({
+      now: () => 0,
+      maxActiveResponseBytes: 100 * 1024 * 1024,
+    })
+    const firstUrl = registry.registerAuthorizedFile(join(root, 'first.bin'), Buffer.alloc(100 * 1024 * 1024, 1))
+    const secondUrl = registry.registerAuthorizedFile(join(root, 'second.bin'), Buffer.alloc(1, 2))
+
+    const firstResponse = await registry.handleRequest(new Request(firstUrl))
+    expect(firstResponse.status).toBe(200)
+    expect((await registry.handleRequest(new Request(secondUrl))).status).toBe(429)
+
+    await firstResponse.body!.cancel()
+    expect((await registry.handleRequest(new Request(secondUrl))).status).toBe(200)
+  })
+
+  test('Given Buffer Range 与 HEAD When 计算并发预算 Then Range 按区间计费且 HEAD 不占预算', async () => {
+    const registry = createPromaFileProtocolRegistry({ now: () => 0, maxActiveResponseBytes: 4 })
+    const fileUrl = registry.registerAuthorizedFile(join(root, 'preview.bin'), Buffer.from('0123456789'))
+
+    const head = await registry.handleRequest(new Request(fileUrl, { method: 'HEAD' }))
+    const range = await registry.handleRequest(new Request(fileUrl, { headers: { Range: 'bytes=2-5' } }))
+
+    expect(head.status).toBe(200)
+    expect(head.body).toBeNull()
+    expect(range.status).toBe(206)
+    expect(await range.text()).toBe('2345')
+  })
+
+  test('Given Buffer token 在流式响应中被释放 When 继续消费 Then 在途响应保持有效', async () => {
+    const registry = createPromaFileProtocolRegistry({ now: () => 0 })
+    const fileUrl = registry.registerAuthorizedFile(join(root, 'preview.bin'), Buffer.alloc(256 * 1024, 7))
+    const response = await registry.handleRequest(new Request(fileUrl))
+    const reader = response.body!.getReader()
+
+    const firstChunk = await reader.read()
+    expect(firstChunk.done).toBe(false)
+    registry.revokePathUrl(fileUrl)
+    let receivedBytes = firstChunk.value?.byteLength ?? 0
+    while (true) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      receivedBytes += chunk.value.byteLength
+    }
+
+    expect(receivedBytes).toBe(256 * 1024)
+    expect((await registry.handleRequest(new Request(fileUrl))).status).toBe(404)
+  })
+
   test('Given Range 起点越过文件末尾 When 读取媒体 Then 返回 416 与完整大小', async () => {
     writeFileSync(join(root, 'preview.webp'), 'preview', 'utf8')
     const registry = createPromaFileProtocolRegistry({ now: () => 0 })

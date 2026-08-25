@@ -153,7 +153,7 @@ export function AgentSkillsView(): React.ReactElement {
   const selectedIsBuiltin = selectedSkill ? data.defaultSkillSlugs.has(selectedSkill.slug) : false
 
   const openSkillFolder = (slug: string): void => {
-    if (data.skillsDir) window.electronAPI.openFile(`${data.skillsDir}/${slug}`)
+    if (data.skillsDir) window.electronAPI.openFile(`${data.skillsDir}/${slug}`, { workspaceSlug: data.workspaceSlug })
   }
 
   const configureBuiltinMcp = React.useCallback((serverId: string): void => {

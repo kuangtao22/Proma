@@ -31,6 +31,8 @@ type RegisteredEntry = RegisteredPathEntry | RegisteredBufferEntry
 const ENTRY_TTL_MS = 60 * 60 * 1000
 const MAX_ENTRIES = 500
 const MAX_AUTHORIZED_BUFFER_BYTES = 256 * 1024 * 1024
+const MAX_ACTIVE_RESPONSE_BYTES = 100 * 1024 * 1024
+const MAX_ACTIVE_RESPONSES = 8
 
 /** 本地文件协议 registry 的可注入时间与 fetch 依赖。 */
 export interface PromaFileProtocolRegistryDependencies {
@@ -42,6 +44,10 @@ export interface PromaFileProtocolRegistryDependencies {
   onDescriptorOpened?: (descriptor: number) => void
   /** 已授权 Buffer 总预算，测试可用小值验证 LRU 淘汰。 */
   maxAuthorizedBufferBytes?: number
+  /** 在途 Buffer 响应总字节预算，按请求实际区间计费。 */
+  maxActiveResponseBytes?: number
+  /** 在途 Buffer 响应数量上限，防止大量小响应耗尽资源。 */
+  maxActiveResponses?: number
 }
 
 function realpathExisting(path: string): string {
@@ -73,6 +79,25 @@ export function createPromaFileProtocolRegistry(
 ): PromaFileProtocolRegistry {
   /** 当前 registry 独占的授权 token 集合。 */
   const registeredEntries = new Map<string, RegisteredEntry>()
+  /** 当前尚未完成或取消的 Buffer 响应资源占用。 */
+  let activeResponseBytes = 0
+  let activeResponseCount = 0
+
+  /** 尝试预留单个 Buffer 响应预算，返回的释放函数可幂等调用。 */
+  function reserveActiveResponse(contentLength: number): (() => void) | null {
+    const maxBytes = dependencies.maxActiveResponseBytes ?? MAX_ACTIVE_RESPONSE_BYTES
+    const maxResponses = dependencies.maxActiveResponses ?? MAX_ACTIVE_RESPONSES
+    if (activeResponseCount >= maxResponses || activeResponseBytes + contentLength > maxBytes) return null
+    activeResponseCount += 1
+    activeResponseBytes += contentLength
+    let released = false
+    return (): void => {
+      if (released) return
+      released = true
+      activeResponseCount -= 1
+      activeResponseBytes -= contentLength
+    }
+  }
 
   /** 清理普通闲置 token；retained token 只能显式释放。 */
   function pruneExpiredEntries(currentTime: number): void {
@@ -207,8 +232,16 @@ export function createPromaFileProtocolRegistry(
       })
       if (range) headers.set('content-range', `bytes ${start}-${end}/${entry.content.byteLength}`)
       entry.lastAccessedAt = currentTime
-      const responseBody = request.method === 'HEAD' ? null : Uint8Array.from(body)
-      return new Response(responseBody, { status: range ? 206 : 200, headers })
+      if (request.method === 'HEAD') return new Response(null, { status: range ? 206 : 200, headers })
+      const releaseBudget = reserveActiveResponse(body.byteLength)
+      if (!releaseBudget) return new Response('Too Many Requests', { status: 429 })
+      try {
+        /** 直接对已授权 Buffer 分块取视图，避免为完整响应再复制一份内容。 */
+        return new Response(createBufferStream(body, releaseBudget), { status: range ? 206 : 200, headers })
+      } catch (error) {
+        releaseBudget()
+        throw error
+      }
     }
 
     let target = entry.root
@@ -369,6 +402,40 @@ function createDescriptorStream(descriptor: number, start: number, end: number):
       })
     }),
     cancel: () => closeDescriptor(),
+  })
+}
+
+/** 从已授权 Buffer 分块创建流，完成、取消或错误均释放活动响应预算。 */
+function createBufferStream(content: Buffer, finalize: () => void): ReadableStream<Uint8Array> {
+  /** 下一块未发送内容的偏移。 */
+  let offset = 0
+  let finished = false
+  const finish = (): void => {
+    if (finished) return
+    finished = true
+    finalize()
+  }
+  return new ReadableStream<Uint8Array>({
+    pull: (controller) => {
+      try {
+        if (offset >= content.byteLength) {
+          finish()
+          controller.close()
+          return
+        }
+        const nextOffset = Math.min(content.byteLength, offset + 64 * 1024)
+        controller.enqueue(content.subarray(offset, nextOffset))
+        offset = nextOffset
+        if (offset >= content.byteLength) {
+          finish()
+          controller.close()
+        }
+      } catch (error) {
+        finish()
+        controller.error(error)
+      }
+    },
+    cancel: () => finish(),
   })
 }
 

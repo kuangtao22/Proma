@@ -451,17 +451,21 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'CHECK_PATHS_TYPE',
     'DELETE_FILE',
     'LIST_ATTACHED_DIRECTORY',
-    'LIST_DIRECTORY',
     'MOVE_ATTACHED_FILE',
     'MOVE_FILE',
     'OPEN_FILE',
     'OPEN_FOLDER_IN_TERMINAL',
     'RENAME_ATTACHED_FILE',
     'RENAME_FILE',
-    'SEARCH_WORKSPACE_FILES',
     'SHOW_ATTACHED_IN_FOLDER',
     'SHOW_IN_FOLDER',
   ], { kind: 'path', guards: ['requireVisibleFileAccess'] }),
+  ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
+    'LIST_DIRECTORY',
+  ], { kind: 'path', guards: ['requireVisibleFileAccess', 'listStableDirectory'] }),
+  ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
+    'SEARCH_WORKSPACE_FILES',
+  ], { kind: 'path', guards: ['requireVisibleFileAccess', 'scanStableDirectory'] }),
   ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
     'CLOSE_BROWSER',
     'CLOSE_BROWSER_TAB',
@@ -496,10 +500,12 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'GET_WORKTREE_CHANGES',
     'LIST_WORKTREES',
     'OPEN_DETACHED_PREVIEW',
-    'REVERT_FILE',
     'SHOW_ITEM_IN_FOLDER',
     'SYSTEM_OPEN_FILE',
   ], { kind: 'path', guards: ['requireVisibleFileAccess'] }),
+  ...defineRendererHandlerPolicies('IPC_CHANNELS', [
+    'REVERT_FILE',
+  ], { kind: 'path', guards: ['Error'] }),
   ...defineRendererHandlerPolicies('WINDOWS_AGENT_ISLAND_IPC_CHANNELS', [
     'OPEN_SESSION',
   ], { kind: 'agent-session', guards: ['requireVisibleSession'] }),
@@ -712,7 +718,7 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       const registered = handlers.find((handler) => handler.channel === channel)
       expect(registered, `${channel} 未纳入全量 ipcMain.handle 矩阵`).toBeDefined()
       const calls = collectTopLevelExecutionCalls(registered!.handler.body)
-      if (channel === 'file:resolve-html-preview-path') {
+      if (channel === 'file:resolve-html-preview-path' || channel === 'REVERT_FILE') {
         expect(registered!.handler.body.getText()).toContain('throw new Error')
         continue
       }
@@ -1095,11 +1101,17 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       ['RichTextInput', readFileSync(join(electronRoot, 'renderer/components/ai-elements/rich-text-input.tsx'), 'utf8')],
       ['FilePathChip', readFileSync(join(electronRoot, 'renderer/components/ai-elements/file-path-chip.tsx'), 'utf8')],
       ['WorkspaceMemoryTab', readFileSync(join(electronRoot, 'renderer/components/agent-skills/WorkspaceMemoryTab.tsx'), 'utf8')],
+      ['AgentSkillsView', readFileSync(join(electronRoot, 'renderer/components/agent-skills/AgentSkillsView.tsx'), 'utf8')],
+      ['GlobalAgentListeners', readFileSync(join(electronRoot, 'renderer/hooks/useGlobalAgentListeners.ts'), 'utf8')],
+      ['FileSearchBar', readFileSync(join(electronRoot, 'renderer/components/file-browser/FileSearchBar.tsx'), 'utf8')],
+      ['FileMentionSuggestion', readFileSync(join(electronRoot, 'renderer/components/file-browser/file-mention-suggestion.tsx'), 'utf8')],
     ])
 
     expect(preloadSource).toMatch(/checkPathsType:\s*\(paths: string\[\], access\?: import\('@proma\/shared'\)\.FileAccessOptions\)/)
     expect(preloadSource).toMatch(/searchWorkspaceFiles:[\s\S]*sessionPaths\?: string\[\],[\s\S]*access\?: import\('@proma\/shared'\)\.FileAccessOptions/)
     expect(preloadSource).toMatch(/showItemInFolder:\s*\(filePath: string, access\?: import\('@proma\/shared'\)\.FileAccessOptions\)/)
+    expect(preloadSource).toMatch(/getGitRepoStatus:\s*\(dirPath: string, access\?: import\('@proma\/shared'\)\.FileAccessOptions\)/)
+    expect(preloadSource).toMatch(/GET_GIT_REPO_STATUS, dirPath, access/)
     expect(sourceByPath.get('AgentView')).toMatch(/checkPathsType\(paths,\s*\{\s*sessionId\s*\}\)/)
     expect(sourceByPath.get('FileDropZone')).toMatch(/const access = sessionId \? \{ sessionId, workspaceSlug \} : \{ workspaceSlug \}/)
     expect(sourceByPath.get('FileDropZone')).toContain('checkPathsType(paths, access)')
@@ -1108,6 +1120,11 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
     expect(sourceByPath.get('RichTextInput')).toContain('currentSessionIdRef,')
     expect(sourceByPath.get('FilePathChip')).toMatch(/showItemInFolder\(cleanPath,\s*\{[\s\S]*sessionId:[\s\S]*candidateBasePaths:/)
     expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/showItemInFolder\(selected\.absolutePath,\s*\{\s*workspaceSlug\s*\}\)/)
+    expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/access=\{\{\s*workspaceSlug\s*\}\}/)
+    expect(sourceByPath.get('AgentSkillsView')).toMatch(/openFile\(`\$\{data\.skillsDir\}\/\$\{slug\}`,\s*\{\s*workspaceSlug:\s*data\.workspaceSlug\s*\}\)/)
+    expect(sourceByPath.get('GlobalAgentListeners')).toMatch(/getGitRepoStatus\(dirPath,\s*\{\s*sessionId:\s*sid\s*\}\)/)
+    expect(sourceByPath.get('FileSearchBar')).toContain("toast.error('文件搜索不可用'")
+    expect(sourceByPath.get('FileMentionSuggestion')).toContain("toast.error('暂时无法引用文件'")
   })
 
   test('Given AGENT handler 使用裸 id 参数 When 检查矩阵 Then 每个 id 都必须显式归类', () => {
@@ -1197,7 +1214,7 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
     expect(businessCallCount).toBe(3)
   })
 
-  test('Given 文件入口未提供 session context When 计算授权根 Then 仅保留 workspace-files 与 tmp', () => {
+  test('Given 文件入口未提供 session context When 计算授权根 Then 仅保留临时预览目录', () => {
     const { source } = loadAgentHandlers()
     const getAuthorizedRoots = compileLocalFunction<(access?: FileAccessOptions) => string[]>(source, 'getAuthorizedRoots', {
       tmpdir: () => '/tmp',
@@ -1212,12 +1229,154 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       getWorkspaceAttachedFiles: () => [],
     })
 
-    expect(getAuthorizedRoots()).toEqual([
-      '/tmp/proma-preview',
-      '/config/agent-workspaces/alpha/workspace-files',
-      '/config/agent-workspaces/beta/workspace-files',
-    ])
+    expect(getAuthorizedRoots()).toEqual(['/tmp/proma-preview'])
     expect(getAuthorizedRoots()).not.toContain('/config/agent-workspaces')
+  })
+
+  test('Given 仅提供 workspaceSlug When 计算授权根 Then 只展开明确共享项而不授权项目根', () => {
+    const { source } = loadAgentHandlers()
+    const getAuthorizedRoots = compileLocalFunction<(access?: FileAccessOptions) => string[]>(source, 'getAuthorizedRoots', {
+      tmpdir: () => '/tmp',
+      join,
+      getConfigDir: () => '/config',
+      listAgentSessions: () => [],
+      listAgentWorkspaces: () => [{ id: 'a', slug: 'alpha' }],
+      getProjectFilesPath: () => '/projects/alpha',
+      getWorkspaceAttachedDirectories: () => ['/attached-directory'],
+      getWorkspaceAttachedFiles: () => ['/attached-file'],
+      MANAGED_WORKSPACE_SHARED_ENTRIES: new Set([
+        'workspace-files', 'skills', 'skills-inactive', '.claude', 'memory',
+        'AGENTS.md', 'CLAUDE.md', 'mcp.json', 'config.json',
+      ]),
+    })
+
+    const roots = getAuthorizedRoots({ workspaceSlug: 'alpha' })
+    expect(roots).toContain('/config/agent-workspaces/alpha/skills')
+    expect(roots).toContain('/config/agent-workspaces/alpha/memory')
+    expect(roots).toContain('/config/agent-workspaces/alpha/AGENTS.md')
+    expect(roots).toContain('/attached-directory')
+    expect(roots).toContain('/attached-file')
+    expect(roots).not.toContain('/projects/alpha')
+    expect(roots).not.toContain('/config/agent-workspaces/alpha')
+    expect(getAuthorizedRoots({ workspaceSlug: '../unknown' })).toEqual(['/tmp/proma-preview'])
+  })
+
+  test('Given 可见会话查询 Git 状态 When 执行真实 handler Then 同一 access snapshot 完成授权并调用 Git', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'GET_GIT_REPO_STATUS')
+    expect(registered).toBeDefined()
+    const snapshot = { options: { sessionId: 'visible' } }
+    let receivedAccess: FileAccessOptions | undefined
+    let receivedSnapshot: unknown
+    let gitCallCount = 0
+    const handler = compileHandler<(event: object, dirPath: string, access?: FileAccessOptions) => Promise<unknown>>(registered!, {
+      console,
+      requireVisibleFileAccess: (access: FileAccessOptions | undefined) => {
+        receivedAccess = access
+        return snapshot
+      },
+      isPathAllowed: (_path: string, access: FileAccessOptions | undefined, accessSnapshot: unknown) => {
+        expect(access).toBe(snapshot.options)
+        receivedSnapshot = accessSnapshot
+        return true
+      },
+      getGitRepoStatus: () => { gitCallCount += 1; return { isRepo: true } },
+    })
+
+    await expect(handler({}, '/repo', { sessionId: 'visible' })).resolves.toEqual({ isRepo: true })
+    expect(receivedAccess).toEqual({ sessionId: 'visible' })
+    expect(receivedSnapshot).toBe(snapshot)
+    expect(gitCallCount).toBe(1)
+  })
+
+  test('Given Renderer 请求还原文件 When 执行真实 handler Then 在任何路径或 Git 调用前明确拒绝', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'REVERT_FILE')
+    expect(registered).toBeDefined()
+    let sideEffectCalls = 0
+    const handler = compileHandler<(event: object, input: { dirPath: string, filePath: string, gitRoot?: string, sessionId?: string }) => Promise<void>>(registered!, {
+      console,
+      RENDERER_GIT_REVERT_DISABLED_MESSAGE: 'Renderer 暂不支持还原文件',
+      requireVisibleFileAccess: () => { sideEffectCalls += 1 },
+      ensurePathAllowedWithWorktree: () => { sideEffectCalls += 1 },
+      revertFile: () => { sideEffectCalls += 1 },
+    })
+
+    await expect(handler({}, { dirPath: '/repo', filePath: 'file.ts', gitRoot: '/repo', sessionId: 'visible' }))
+      .rejects.toThrow('Renderer 暂不支持还原文件')
+    expect(sideEffectCalls).toBe(0)
+  })
+
+  test('Given 当前平台缺少稳定目录 fd 遍历 When 打开目录 Then 在路径消费前明确 fail closed', () => {
+    const { source } = loadAgentHandlers()
+    let pathCallCount = 0
+    const openStableDirectory = compileLocalFunction<(path: string) => unknown>(source, 'openStableDirectory', {
+      process: { platform: 'darwin' },
+      RENDERER_DIRECTORY_TRAVERSAL_UNSUPPORTED_MESSAGE: '当前平台不支持稳定目录遍历',
+      isPathAllowed: () => { pathCallCount += 1; return true },
+      realpathSync: () => { pathCallCount += 1 },
+      resolve,
+      captureStablePathIdentity: () => { pathCallCount += 1 },
+      openSync: () => { pathCallCount += 1 },
+      constants,
+      fstatSync,
+      closeSync,
+    })
+
+    expect(() => openStableDirectory('/authorized')).toThrow('当前平台不支持稳定目录遍历')
+    expect(pathCallCount).toBe(0)
+    expect(source.getFullText()).toContain('`/proc/self/fd/${parent.descriptor}/${name}`')
+  })
+
+  test('Given macOS 目录授权后祖先被替换 When 执行真实列表 handler Then 明确拒绝且不枚举 replacement', async () => {
+    const { handlers, source } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'LIST_DIRECTORY')
+    expect(registered).toBeDefined()
+    const root = mkdtempSync(join(tmpdir(), 'proma-list-race-'))
+    const authorized = join(root, 'authorized')
+    const moved = join(root, 'authorized-old')
+    const replacement = join(root, 'replacement')
+    mkdirSync(authorized)
+    mkdirSync(replacement)
+    writeFileSync(join(authorized, 'allowed.txt'), 'allowed')
+    writeFileSync(join(replacement, 'secret.txt'), 'secret')
+    let replaced = false
+    let enumeratedNames: string[] = []
+    try {
+      const openStableDirectory = compileLocalFunction<(path: string, snapshot: unknown) => unknown>(source, 'openStableDirectory', {
+        process: { platform: 'darwin' },
+        RENDERER_DIRECTORY_TRAVERSAL_UNSUPPORTED_MESSAGE: '当前平台不支持稳定目录遍历',
+      })
+      const listStableDirectory = compileLocalFunction<(path: string, snapshot: unknown) => unknown>(source, 'listStableDirectory', {
+        openStableDirectory,
+        readdirSync: (path: string) => {
+          enumeratedNames = [path]
+          return []
+        },
+        closeSync,
+      })
+      const snapshot = { options: { sessionId: 'visible' } }
+      const handler = compileHandler<(event: object, path: string, access: FileAccessOptions) => Promise<unknown>>(registered!, {
+        requireVisibleFileAccess: () => snapshot,
+        resolve,
+        existsSync,
+        isPathAllowed: () => {
+          if (!replaced) {
+            replaced = true
+            renameSync(authorized, moved)
+            symlinkSync(replacement, authorized)
+          }
+          return true
+        },
+        listStableDirectory,
+      })
+
+      await expect(handler({}, authorized, { sessionId: 'visible' })).rejects.toThrow('当前平台不支持稳定目录遍历')
+      expect(enumeratedNames).toEqual([])
+      expect(readFileSync(join(authorized, 'secret.txt'), 'utf8')).toBe('secret')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test('Given Git worktree 进入兜底授权分支 When 获取工作区 slug Then 复用当前 IPC 快照', () => {
@@ -1340,7 +1499,7 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       existsSync: () => true,
       normalizeFileAccessOptions: (access: FileAccessOptions | undefined) => access,
       isPathAllowed: () => true,
-      listShallowDirectory: () => { listCallCount += 1; return [] },
+      listStableDirectory: () => { listCallCount += 1; return [] },
     })
 
     const rejectedCases: Array<[string, FileAccessOptions | undefined]> = [

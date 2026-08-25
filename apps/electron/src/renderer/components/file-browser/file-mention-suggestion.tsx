@@ -86,6 +86,10 @@ export function createFileMentionSuggestion(
         return result.entries
       } catch (error) {
         console.error('[FileMention] search failed:', error)
+        toast.error('暂时无法引用文件', {
+          id: 'file-search-unavailable',
+          description: error instanceof Error ? error.message : '无法安全遍历当前目录',
+        })
         return []
       }
     }),

@@ -525,6 +525,7 @@ export function WorkspaceMemoryTab({ workspaceSlug, search }: WorkspaceMemoryTab
                 {selected && (
                   <DefaultAppOpenButton
                     filePath={selected.absolutePath}
+                    access={{ workspaceSlug }}
                     variant="labeled"
                     className="h-8 max-w-[170px] border border-border/60 bg-background px-2 shadow-sm"
                   />

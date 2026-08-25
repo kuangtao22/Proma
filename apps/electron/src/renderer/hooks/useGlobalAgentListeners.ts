@@ -810,7 +810,7 @@ export function useGlobalAgentListeners(): void {
       let previewOnly = true
       if (dirPath) {
         try {
-          const status = await window.electronAPI.getGitRepoStatus(dirPath)
+          const status = await window.electronAPI.getGitRepoStatus(dirPath, { sessionId: sid })
           previewOnly = status?.isRepo !== true
         } catch {
           previewOnly = true

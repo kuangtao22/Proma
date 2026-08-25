@@ -208,7 +208,7 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
    * @param dirPath - 目录路径
    * @returns Git 仓库状态
    */
-  getGitRepoStatus: (dirPath: string) => Promise<GitRepoStatus | null>
+  getGitRepoStatus: (dirPath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<GitRepoStatus | null>
 
   /** 获取未暂存的变更文件列表 */
   getUnstagedChanges: (dirPath: string, sessionPath?: string, workspaceFilesPath?: string, extraPaths?: string[], sessionId?: string) => Promise<import('@proma/shared').UnstagedChangesResult>
@@ -1292,8 +1292,8 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(IPC_CHANNELS.REINIT_RUNTIME)
   },
 
-  getGitRepoStatus: (dirPath: string) => {
-    return ipcRenderer.invoke(IPC_CHANNELS.GET_GIT_REPO_STATUS, dirPath)
+  getGitRepoStatus: (dirPath: string, access?: import('@proma/shared').FileAccessOptions) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.GET_GIT_REPO_STATUS, dirPath, access)
   },
 
   getUnstagedChanges: (dirPath: string, sessionPath?: string, workspaceFilesPath?: string, extraPaths?: string[], sessionId?: string) => {
