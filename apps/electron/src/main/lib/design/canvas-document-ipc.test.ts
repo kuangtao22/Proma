@@ -64,6 +64,16 @@ function createContext(options: {
   const removed: string[] = []
   /** 默认授权主窗口。 */
   const sender = createSender(1)
+  /** 记录广播发生时 workspace lease 是否仍被持有。 */
+  const broadcastLeaseStates: boolean[] = []
+  /** 当前测试调用是否位于 workspace write lease 内。 */
+  let leaseHeld = false
+  /** 保留原始发送实现，包装后可观察广播时机。 */
+  const send = sender.send
+  sender.send = (channel, value) => {
+    broadcastLeaseStates.push(leaseHeld)
+    send(channel, value)
+  }
   /** 按执行顺序记录只读、guard 和 store 边界。 */
   const calls: string[] = []
   /** Store 收到的重建参数。 */
@@ -78,7 +88,12 @@ function createContext(options: {
       runWorkspaceWrite: (projectId, effect) => {
         calls.push(`guard:${projectId}`)
         if (options.guardError) throw options.guardError
-        return effect()
+        leaseHeld = true
+        try {
+          return effect()
+        } finally {
+          leaseHeld = false
+        }
       },
     },
     store: {
@@ -105,10 +120,16 @@ function createContext(options: {
           documentChanged: false,
         }
       },
-      create: (input) => {
+      createReconciled: (input) => {
         calls.push('creation:create')
         storeInputs.push(input)
-        if (options.createError) throw options.createError
+        const reconciliation = options.reconcileResult ?? {
+          snapshot: options.loadResult ?? { document: createDocument(4), writable: true },
+          documentChanged: false,
+        }
+        if (options.createError) {
+          return { reconciliation, operationOutcome: { ok: false as const, error: options.createError } }
+        }
         const document = createDocument(5)
         document.nodes = [{
           id: input.nodeId,
@@ -118,14 +139,20 @@ function createContext(options: {
           agentSessionId: '22222222-2222-4222-8222-222222222222',
         }]
         return {
-          document,
-          session: {
-            id: '22222222-2222-4222-8222-222222222222',
-            title: input.title,
-            createdAt: 1,
-            updatedAt: 1,
+          reconciliation,
+          operationOutcome: {
+            ok: true as const,
+            value: {
+              document,
+              session: {
+                id: '22222222-2222-4222-8222-222222222222',
+                title: input.title,
+                createdAt: 1,
+                updatedAt: 1,
+              },
+              documentChanged: true,
+            },
           },
-          documentChanged: true,
         }
       },
     },
@@ -134,7 +161,7 @@ function createContext(options: {
       return options.readOnlyReason
     },
   })
-  return { handlers, removed, sender, calls, storeInputs, registration }
+  return { handlers, removed, sender, calls, storeInputs, broadcastLeaseStates, registration }
 }
 
 describe('原生 Canvas 文档 IPC', () => {
@@ -286,16 +313,17 @@ describe('原生 Canvas 文档 IPC', () => {
     ) as Record<string, unknown>
 
     expect(context.calls).toEqual([
-      'readonly:project-1', 'guard:project-1', 'creation:reconcile', 'creation:create',
+      'readonly:project-1', 'guard:project-1', 'creation:create',
     ])
-    expect(context.storeInputs[1]).toEqual(input)
-    expect(context.storeInputs[1]).not.toBe(input)
+    expect(context.storeInputs[0]).toEqual(input)
+    expect(context.storeInputs[0]).not.toBe(input)
     expect(result).not.toHaveProperty('documentChanged')
     expect(result).toHaveProperty('session.id', '22222222-2222-4222-8222-222222222222')
     expect(context.sender.sent).toEqual([{
       channel: CANVAS_IPC_CHANNELS.CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
     }])
+    expect(context.broadcastLeaseStates).toEqual([false])
   })
 
   test('Given 文档已写但 committed intent 失败 When 创建返回错误 Then 不广播且不泄漏节点', async () => {
@@ -353,6 +381,10 @@ describe('原生 Canvas 文档 IPC', () => {
       channel: CANVAS_IPC_CHANNELS.CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph' },
     }])
+    expect(context.calls).toEqual([
+      'readonly:project-1', 'guard:project-1', 'creation:create',
+    ])
+    expect(context.broadcastLeaseStates).toEqual([false])
   })
 
   test('Given guard 或 Store 原样失败 When LOAD/SAVE Then 不广播', async () => {
@@ -446,10 +478,19 @@ describe('原生 Canvas 文档 IPC', () => {
           snapshot: { document: createDocument(revision), writable: true as const },
           documentChanged: false,
         }),
-        create: () => ({
-          document: createDocument(revision),
-          session: { id: 'session-1', title: 'Agent', createdAt: 1, updatedAt: 1 },
-          documentChanged: false,
+        createReconciled: () => ({
+          reconciliation: {
+            snapshot: { document: createDocument(revision), writable: true as const },
+            documentChanged: false,
+          },
+          operationOutcome: {
+            ok: true as const,
+            value: {
+              document: createDocument(revision),
+              session: { id: 'session-1', title: 'Agent', createdAt: 1, updatedAt: 1 },
+              documentChanged: false,
+            },
+          },
         }),
       },
       getProjectReadOnlyReason: () => undefined,

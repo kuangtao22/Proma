@@ -27,6 +27,7 @@ function createHarness(options: {
   canvasId?: string
   failIntentState?: CanvasAgentNodeCreationIntent['state']
   failCreateSession?: boolean
+  modelError?: Error
   afterLoad?: (paths: { canvasRoot: string; transactionsDir: string }) => void
   beforeGetSettings?: (paths: { canvasRoot: string; transactionsDir: string }) => void
   onWriteIntentCall?: () => void
@@ -61,7 +62,10 @@ function createHarness(options: {
   /** 内存权威文档模拟 Canvas Store 的 revision 行为。 */
   let document = createEmptyCanvasDocument(target.projectId, target.canvasId, 1)
   /** 当前 Agent 默认值，测试可在 prepared 后切换。 */
-  let settings = { agentChannelId: 'channel-old', agentModelId: 'model-old' }
+  let settings: { agentChannelId?: string; agentModelId?: string } = {
+    agentChannelId: 'channel-old',
+    agentModelId: 'model-old',
+  }
   /** 已持久化内部会话事实。 */
   const sessions = new Map<string, AgentSessionMeta>()
   /** 所有真实创建调用，用于证明恢复不重复创建。 */
@@ -70,6 +74,8 @@ function createHarness(options: {
   let failedState = options.failIntentState
   /** 会话创建前可切换的崩溃模拟。 */
   let failCreateSession = options.failCreateSession ?? false
+  /** transactions 目录扫描次数，用于锁定单次 CREATE 的 I/O 上界。 */
+  let transactionDirectoryReads = 0
 
   /** 生成使用当前依赖的新服务，模拟主进程重启。 */
   const createService = (): CanvasAgentNodeCreationService => new CanvasAgentNodeCreationService({
@@ -100,7 +106,7 @@ function createHarness(options: {
     },
     assertModelAvailable: (channelId, modelId) => {
       if (channelId === 'channel-disabled' || modelId === 'model-disabled') {
-        throw new Error('Canvas Agent 渠道或模型不可用')
+        throw options.modelError ?? new Error('Canvas Agent 渠道或模型不可用')
       }
     },
     getSession: (sessionId) => sessions.get(sessionId),
@@ -124,6 +130,10 @@ function createHarness(options: {
     },
     now: () => 10,
     randomUUID: () => SESSION_ID,
+    readTransactionsDirectory: (directoryPath) => {
+      transactionDirectoryReads += 1
+      return readdirSync(directoryPath, { withFileTypes: true })
+    },
     writeIntent: (filePath, intent, writeOptions) => {
       options.onWriteIntentCall?.()
       if (failedState === intent.state) throw new Error(`模拟 ${intent.state} intent 写失败`)
@@ -142,6 +152,8 @@ function createHarness(options: {
     setSettings: (next: typeof settings) => { settings = next },
     setFailedState: (state?: CanvasAgentNodeCreationIntent['state']) => { failedState = state },
     setFailCreateSession: (value: boolean) => { failCreateSession = value },
+    getTransactionDirectoryReads: () => transactionDirectoryReads,
+    resetTransactionDirectoryReads: () => { transactionDirectoryReads = 0 },
     root,
     canvasRoot,
     intentPath: join(transactionsDir, `agent-node-${OPERATION_ID}.json`),
@@ -161,6 +173,28 @@ function createInput(target: CanvasTarget) {
 }
 
 describe('Canvas Agent 节点创建事务', () => {
+  test('Given 历史 intent 对账已发布 When 新 operation 模型校验失败 Then 联合结果保留 revision、原始错误且只扫描一次', () => {
+    const error = new Error('Canvas Agent 渠道或模型不可用')
+    const harness = createHarness({ failCreateSession: true, modelError: error })
+    expect(() => harness.createService().create(createInput(harness.target))).toThrow('模拟 prepared 后崩溃')
+    harness.setFailCreateSession(false)
+    harness.setSettings({ agentChannelId: 'channel-disabled', agentModelId: 'model-disabled' })
+    harness.resetTransactionDirectoryReads()
+
+    const outcome = harness.createService().createReconciled({
+      ...createInput(harness.target),
+      operationId: '33333333-3333-4333-8333-333333333333',
+      nodeId: 'node-2',
+    })
+
+    expect(outcome.reconciliation.documentChanged).toBe(true)
+    expect(outcome.reconciliation.snapshot.document.revision).toBe(1)
+    expect(outcome.operationOutcome.ok).toBe(false)
+    if (outcome.operationOutcome.ok) throw new Error('预期创建失败')
+    expect(outcome.operationOutcome.error).toBe(error)
+    expect(harness.getTransactionDirectoryReads()).toBe(1)
+  })
+
   test('Given 同一 operation 重试 When 首次已完整提交 Then 复用 session 和节点且不重复 mutation', () => {
     const harness = createHarness()
     const service = harness.createService()

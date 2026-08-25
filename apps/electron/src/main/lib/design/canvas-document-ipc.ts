@@ -30,8 +30,8 @@ export interface CanvasDocumentIpcOptions {
   listAuthorizedWebContents: () => WebContents[]
   guard: Pick<WorkspaceOperationGuard, 'runWorkspaceWrite'>
   store: Pick<CanvasDocumentStore, 'load' | 'mutate'>
-  /** 已持有 lease 时执行目标 Canvas 创建事务对账。 */
-  creation: Pick<CanvasAgentNodeCreationService, 'reconcile' | 'create'>
+  /** 已持有 lease 时执行目标 Canvas 对账或联合创建事务。 */
+  creation: Pick<CanvasAgentNodeCreationService, 'reconcile' | 'createReconciled'>
   getProjectReadOnlyReason: (projectId: string) => string | undefined
 }
 
@@ -297,18 +297,7 @@ export function registerCanvasDocumentIpcHandlers(
     /** 创建服务内部不加锁，整个事务只持有这一份 workspace write lease。 */
     const outcome = options.guard.runWorkspaceWrite(
       input.projectId,
-      (): ReconciledOperationOutcome<ReturnType<CanvasAgentNodeCreationService['create']>> => {
-        const reconciliation = options.creation.reconcile({
-          projectId: input.projectId,
-          canvasId: input.canvasId,
-        })
-        try {
-          return { ok: true, value: options.creation.create(input), reconciliation }
-        } catch (error) {
-          /** 默认模型或新请求失败不能撤销已经提交的历史 intent 对账。 */
-          return { ok: false, error, reconciliation }
-        }
-      },
+      () => options.creation.createReconciled(input),
     )
     if (outcome.reconciliation.documentChanged) {
       broadcastChange(options, {
@@ -318,8 +307,8 @@ export function registerCanvasDocumentIpcHandlers(
         cause: 'graph',
       })
     }
-    if (!outcome.ok) throw outcome.error
-    const result = outcome.value
+    if (!outcome.operationOutcome.ok) throw outcome.operationOutcome.error
+    const result = outcome.operationOutcome.value
     if (result.documentChanged) {
       broadcastChange(options, {
         projectId: input.projectId,

@@ -7,7 +7,7 @@ import {
   readFileSync,
   readdirSync,
 } from 'node:fs'
-import type { Stats } from 'node:fs'
+import type { Dirent, Stats } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { randomUUID as createRandomUUID } from 'node:crypto'
 import type {
@@ -78,6 +78,20 @@ export interface CanvasAgentNodeCreationServiceResult extends CanvasAgentNodeCre
   documentChanged: boolean
 }
 
+/** 单次 CREATE 同时保留历史对账发布事实与当前操作结果。 */
+export interface CanvasAgentNodeCreateReconciledOutcome {
+  reconciliation: CanvasAgentNodeReconciliationResult
+  operationOutcome:
+    | { ok: true; value: CanvasAgentNodeCreationServiceResult }
+    | { ok: false; error: unknown }
+}
+
+/** 服务内部对账结果额外携带同次目录 capability 和最终 intent 集合。 */
+interface CanvasAgentNodeReconciledState extends CanvasAgentNodeReconciliationResult {
+  directory: CanvasTrustedDirectoryCapability
+  intents: CanvasAgentNodeCreationIntent[]
+}
+
 /** 默认配置只读取 Agent 当前渠道和模型。 */
 interface CanvasAgentDefaultSettings {
   agentChannelId?: string
@@ -93,6 +107,7 @@ export interface CanvasAgentNodeCreationDependencies {
   createSession: (input: CreateAgentSessionWithMetadataInput) => AgentSessionMeta
   now?: () => number
   randomUUID?: () => string
+  readTransactionsDirectory?: (directoryPath: string) => Dirent[]
   writeIntent?: (
     filePath: string,
     intent: CanvasAgentNodeCreationIntent,
@@ -284,11 +299,14 @@ function assertNodeMatchesIntent(
 export class CanvasAgentNodeCreationService {
   private readonly now: () => number
   private readonly randomUUID: () => string
+  private readonly readTransactionsDirectory: (directoryPath: string) => Dirent[]
   private readonly writeIntentFile: NonNullable<CanvasAgentNodeCreationDependencies['writeIntent']>
 
   constructor(private readonly dependencies: CanvasAgentNodeCreationDependencies) {
     this.now = dependencies.now ?? Date.now
     this.randomUUID = dependencies.randomUUID ?? createRandomUUID
+    this.readTransactionsDirectory = dependencies.readTransactionsDirectory
+      ?? ((directoryPath) => readdirSync(directoryPath, { withFileTypes: true }))
     this.writeIntentFile = dependencies.writeIntent ?? writeJsonFileAtomicSecure
   }
 
@@ -298,7 +316,7 @@ export class CanvasAgentNodeCreationService {
     directoryIdentity: CanvasTrustedDirectoryCapability,
   ): CanvasAgentNodeCreationIntent[] {
     directoryIdentity.assertValid()
-    const entries = readdirSync(directoryIdentity.path, { withFileTypes: true })
+    const entries = this.readTransactionsDirectory(directoryIdentity.path)
     if (entries.length > MAX_AGENT_NODE_INTENTS) {
       throw new Error('Canvas Agent 创建事务过多，已停止对账')
     }
@@ -414,9 +432,7 @@ export class CanvasAgentNodeCreationService {
   }
 
   /** 在同一次 Store LOAD capability 上完成目标 Canvas 对账。 */
-  private reconcileWithDirectory(target: CanvasTarget): CanvasAgentNodeReconciliationResult & {
-    directory: CanvasTrustedDirectoryCapability
-  } {
+  private reconcileWithDirectory(target: CanvasTarget): CanvasAgentNodeReconciledState {
     if (!isSafeDesignStableId(target.projectId)
       || target.projectId.length > MAX_CANVAS_STABLE_ID_LENGTH
       || !isSafeDesignStableId(target.canvasId)
@@ -428,6 +444,8 @@ export class CanvasAgentNodeCreationService {
     const identity = loaded.openSingleChildDirectory('transactions')
     let document = snapshot.document
     let documentChanged = false
+    /** 保留每个事务对账后的最终阶段，供同次 CREATE 直接复用。 */
+    const intents: CanvasAgentNodeCreationIntent[] = []
 
     for (const originalIntent of this.readIntents(target, identity)) {
       let intent = originalIntent
@@ -442,33 +460,35 @@ export class CanvasAgentNodeCreationService {
         const node = document.nodes.find((candidate) => candidate.id === intent.nodeId)
         if (!node) {
           /** committed 后节点缺失代表用户删除引用，必须永久 detached。 */
-          this.writeIntent(identity, this.transitionIntent(intent, 'detached'))
+          intent = this.transitionIntent(intent, 'detached')
+          this.writeIntent(identity, intent)
         } else {
           assertNodeMatchesIntent(node, intent)
         }
       }
+      intents.push(intent)
     }
     return {
       snapshot: { ...snapshot, document },
       documentChanged,
       directory: identity,
+      intents,
     }
   }
 
   /** 惰性对账目标 Canvas，调用方必须已持有唯一 workspace write lease。 */
   reconcile(target: CanvasTarget): CanvasAgentNodeReconciliationResult {
-    const { directory: _directory, ...result } = this.reconcileWithDirectory(target)
+    const { directory: _directory, intents: _intents, ...result } = this.reconcileWithDirectory(target)
     return result
   }
 
-  /** 首次准备或幂等重放单次用户创建 operation。 */
-  create(input: CreateCanvasAgentNodeInput): CanvasAgentNodeCreationServiceResult {
-    assertCreateCanvasAgentNodeInput(input)
-    const target = { projectId: input.projectId, canvasId: input.canvasId }
-    const reconciled = this.reconcileWithDirectory(target)
+  /** 基于同次对账结果首次准备或幂等重放用户创建 operation。 */
+  private createAfterReconciliation(
+    input: CreateCanvasAgentNodeInput,
+    reconciled: CanvasAgentNodeReconciledState,
+  ): CanvasAgentNodeCreationServiceResult {
     const identity = reconciled.directory
-    const intents = this.readIntents(target, identity)
-    const existing = intents.find((intent) => intent.operationId === input.operationId)
+    const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
     if (existing) {
       if (existing.nodeId !== input.nodeId
         || existing.title !== input.title
@@ -482,7 +502,7 @@ export class CanvasAgentNodeCreationService {
       }
       const session = this.dependencies.getSession(existing.sessionId)
       assertSessionMatchesIntent(session, existing)
-      return { document: reconciled.snapshot.document, session, documentChanged: reconciled.documentChanged }
+      return { document: reconciled.snapshot.document, session, documentChanged: false }
     }
 
     const settings = this.dependencies.getSettings()
@@ -519,7 +539,49 @@ export class CanvasAgentNodeCreationService {
     return {
       document: advanced.document,
       session,
-      documentChanged: reconciled.documentChanged || advanced.documentChanged,
+      documentChanged: advanced.documentChanged,
+    }
+  }
+
+  /**
+   * 在一次目录扫描内完成历史对账和当前创建，并保留对账后的操作错误。
+   * @param input 已由 IPC 重建的公开创建请求。
+   * @returns 可独立发布历史 revision 的对账结果与当前操作结果。
+   */
+  createReconciled(input: CreateCanvasAgentNodeInput): CanvasAgentNodeCreateReconciledOutcome {
+    assertCreateCanvasAgentNodeInput(input)
+    /** 对账失败尚无可确认发布事实，继续按原错误直接抛出。 */
+    const reconciled = this.reconcileWithDirectory({
+      projectId: input.projectId,
+      canvasId: input.canvasId,
+    })
+    /** 公开对账结果不得泄露目录 capability 或 intent。 */
+    const reconciliation: CanvasAgentNodeReconciliationResult = {
+      snapshot: reconciled.snapshot,
+      documentChanged: reconciled.documentChanged,
+    }
+    try {
+      return {
+        reconciliation,
+        operationOutcome: {
+          ok: true,
+          value: this.createAfterReconciliation(input, reconciled),
+        },
+      }
+    } catch (error) {
+      return { reconciliation, operationOutcome: { ok: false, error } }
+    }
+  }
+
+  /** 兼容服务内直接调用；生产 IPC 应使用 createReconciled 保留发布事实。 */
+  create(input: CreateCanvasAgentNodeInput): CanvasAgentNodeCreationServiceResult {
+    /** 兼容结果继续合并历史对账与当前操作的文档变化标记。 */
+    const outcome = this.createReconciled(input)
+    if (!outcome.operationOutcome.ok) throw outcome.operationOutcome.error
+    return {
+      ...outcome.operationOutcome.value,
+      documentChanged: outcome.reconciliation.documentChanged
+        || outcome.operationOutcome.value.documentChanged,
     }
   }
 }
