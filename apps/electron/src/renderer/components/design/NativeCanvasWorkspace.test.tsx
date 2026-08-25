@@ -11,6 +11,7 @@ import type { NativeCanvasState } from '@/atoms/native-canvas-atoms'
 import { createInitialNativeCanvasState } from '@/atoms/native-canvas-atoms'
 import {
   NATIVE_CANVAS_SAVE_DEBOUNCE_MS,
+  NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
   createNativeCanvasWorkspaceController,
 } from './NativeCanvasWorkspace'
 import type {
@@ -350,6 +351,46 @@ describe('原生 Canvas controller 权威恢复', () => {
     harness.loads[0]?.resolve(createSnapshot(9))
     await flushPromises()
     expect(harness.getState().snapshot?.document.revision).toBe(1)
+  })
+
+  test('Given 结构 pending 与 deferred graph When recovery 后对账 Then 始终展示权威结构且保留冲突', async () => {
+    const structural: CanvasMutation = { type: 'remove-nodes', nodeIds: ['agent-1'] }
+    const initial = createSnapshot(5)
+    initial.document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: '旧 Agent',
+      agentSessionId: 'session-1', position: { x: 0, y: 0 },
+    }]
+    const harness = createHarness({
+      phase: 'ready', snapshot: initial,
+      pendingMutations: [structural], saveState: 'dirty',
+    })
+    harness.controller.start()
+    harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 1, cause: 'recovery' })
+    harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 9, cause: 'graph' })
+    const recovered = createSnapshot(1)
+    recovered.document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: '恢复权威 Agent',
+      agentSessionId: 'session-1', position: { x: 10, y: 20 },
+    }]
+    harness.loads[1]?.resolve(recovered)
+    await flushPromises()
+
+    const reconciled = createSnapshot(9)
+    reconciled.document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: '最新权威 Agent',
+      agentSessionId: 'session-1', position: { x: 30, y: 40 },
+    }]
+    harness.loads[2]?.resolve(reconciled)
+    await flushPromises()
+
+    expect(harness.getState().snapshot?.document.nodes).toEqual(reconciled.document.nodes)
+    expect(harness.getState()).toMatchObject({
+      pendingMutations: [structural],
+      saveState: 'conflict',
+      error: NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
+    })
+    expect(harness.saves).toHaveLength(0)
+    expect(harness.scheduler.getDelay()).toBeUndefined()
   })
 
   test('Given recovery LOAD 失败 When 显式重试 Then 保持阻断直到新权威快照成功', async () => {

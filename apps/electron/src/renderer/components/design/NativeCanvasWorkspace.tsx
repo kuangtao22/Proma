@@ -210,6 +210,11 @@ export function createNativeCanvasWorkspaceController(
       }
       /** 普通图刷新保留本窗口尚未提交的乐观 mutation。 */
       const latest = dependencies.getState()
+      if (latest.saveState === 'conflict') {
+        /** 结构冲突只能展示权威结构，pending 与错误保留给显式冲突处理。 */
+        dependencies.updateState({ phase: 'ready', snapshot })
+        return
+      }
       const localMutations = [...latest.inFlightMutations, ...latest.pendingMutations]
       const document = applyCanvasMutations(snapshot.document, localMutations)
       dependencies.updateState({
