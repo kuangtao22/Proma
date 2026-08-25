@@ -5,7 +5,9 @@ import type {
   CanvasSessionChangeEvent,
   CanvasSessionMeta,
   CanvasWorkspaceSnapshot,
+  CanvasAgentNodeCreationResult,
   CreateCanvasSessionInput,
+  CreateCanvasAgentNodeInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
   DeleteDesignContextInput,
@@ -47,6 +49,8 @@ export interface DesignPreloadApi {
   loadCanvasWorkspace: (input: LoadCanvasInput) => Promise<CanvasWorkspaceSnapshot>
   /** 在权威 revision 上保存指定原生 Canvas mutation。 */
   saveCanvasMutations: (input: SaveCanvasMutationsInput) => Promise<CanvasDocument>
+  /** 在目标 Canvas 内幂等创建内部 Agent 节点。 */
+  createCanvasAgentNode: (input: CreateCanvasAgentNodeInput) => Promise<CanvasAgentNodeCreationResult>
   /** 订阅所有原生 Canvas 变化，双身份过滤由 Renderer adapter 执行。 */
   onCanvasChanged: (listener: (event: CanvasChangeEvent) => void) => () => void
   listCanvasSessions: (input: ListCanvasSessionsInput) => Promise<CanvasSessionMeta[]>
@@ -102,6 +106,10 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       input,
     ) as Promise<CanvasDocument>,
+    createCanvasAgentNode: (input) => ipc.invoke(
+      CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      input,
+    ) as Promise<CanvasAgentNodeCreationResult>,
     onCanvasChanged: (listener) => {
       /** Electron event 对 Renderer 隐藏，只传原生 Canvas 业务变化。 */
       const handler = (_event: IpcRendererEvent, value: unknown): void => (

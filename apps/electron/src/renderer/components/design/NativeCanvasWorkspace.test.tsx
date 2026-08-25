@@ -22,6 +22,7 @@ import {
   NATIVE_CANVAS_SAVE_DEBOUNCE_MS,
   NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
   NativeCanvasWorkspace,
+  createCanvasAgentNodeCommandController,
   createNativeCanvasWorkspaceController,
 } from './NativeCanvasWorkspace'
 import type {
@@ -690,5 +691,106 @@ describe('原生 Canvas 冲突提示', () => {
 
     expect(html).toContain(NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE)
     expect(html).toContain('采用远端版本')
+  })
+})
+
+describe('原生 Canvas 添加 Agent 命令', () => {
+  test('Given 用户连续点击 When 首次创建仍在途 Then 只发送一个 operation', async () => {
+    const deferred = createDeferred<{
+      document: CanvasDocument
+      session: { id: string }
+    }>()
+    /** 主进程实际收到的创建请求。 */
+    const inputs: unknown[] = []
+    const controller = createCanvasAgentNodeCommandController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      createAgentNode: (input) => {
+        inputs.push(input)
+        return deferred.promise as never
+      },
+      createId: (() => {
+        const ids = ['11111111-1111-4111-8111-111111111111', 'node-1']
+        return () => ids.shift()!
+      })(),
+      getPosition: () => ({ x: 100, y: 80 }),
+      onStateChange: () => undefined,
+      onSuccess: () => undefined,
+    })
+
+    const first = controller.execute()
+    const duplicate = controller.execute()
+
+    expect(inputs).toHaveLength(1)
+    expect(inputs[0]).toMatchObject({
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-1', position: { x: 100, y: 80 },
+    })
+    expect(duplicate).toBe(first)
+    deferred.resolve({ document: createSnapshot(1).document, session: { id: 'session-1' } })
+    await first
+  })
+
+  test('Given 首次失败 When 显式重试 Then 复用 operation；成功后选中并打开对话', async () => {
+    /** 两次请求及按钮状态变化。 */
+    const inputs: Array<{ operationId: string; nodeId: string }> = []
+    const states: Array<{ loading: boolean; error: string | null }> = []
+    const successes: Array<{ nodeId: string; document: CanvasDocument }> = []
+    let attempts = 0
+    const document = createSnapshot(1).document
+    const controller = createCanvasAgentNodeCommandController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      createAgentNode: async (input) => {
+        inputs.push(input)
+        attempts += 1
+        if (attempts === 1) throw new Error('创建失败，请重试')
+        return { document, session: { id: 'session-1' } as never }
+      },
+      createId: (() => {
+        const ids = ['11111111-1111-4111-8111-111111111111', 'node-1']
+        return () => ids.shift()!
+      })(),
+      getPosition: () => ({ x: 0, y: 0 }),
+      onStateChange: (state) => states.push(state),
+      onSuccess: (nodeId, result) => successes.push({ nodeId, document: result.document }),
+    })
+
+    await expect(controller.execute()).rejects.toThrow('创建失败，请重试')
+    await expect(controller.execute()).resolves.toBeUndefined()
+
+    expect(inputs).toHaveLength(2)
+    expect(inputs[1]).toEqual(inputs[0])
+    expect(states).toContainEqual({ loading: false, error: '创建失败，请重试' })
+    expect(successes).toEqual([{ nodeId: 'node-1', document }])
+  })
+
+  test('Given Canvas 已加载 When 渲染工具栏 Then 添加 Agent 按钮可达并有 tooltip', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const store = createStore()
+    store.set(nativeCanvasStatesAtom, new Map([[
+      createNativeCanvasKey(target.projectId, target.canvasId),
+      { ...createInitialNativeCanvasState(), phase: 'ready', snapshot: createSnapshot(0) },
+    ]]))
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          target={target}
+          title="页面 Canvas"
+          adapter={{
+            loadCanvas: async () => createSnapshot(0),
+            saveCanvas: async () => createSnapshot(1).document,
+            createCanvasAgentNode: async () => ({
+              document: createSnapshot(1).document,
+              session: { id: 'session-1' } as never,
+            }),
+            onCanvasChanged: () => () => {},
+          }}
+          flowRenderer={() => <div />}
+        />
+      </Provider>,
+    )
+
+    expect(html).toContain('aria-label="添加 Agent"')
+    expect(html).toContain('添加 Agent')
   })
 })

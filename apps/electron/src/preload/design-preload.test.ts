@@ -27,6 +27,15 @@ describe('Design preload', () => {
     const calls: Array<[() => Promise<unknown>, string, unknown[]]> = [
       [() => api.loadCanvasWorkspace({ projectId: 'p1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.LOAD, [{ projectId: 'p1', canvasId: 'canvas-1' }]],
       [() => api.saveCanvasMutations({ projectId: 'p1', canvasId: 'canvas-1', expectedRevision: 0, mutations: [] }), CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, [{ projectId: 'p1', canvasId: 'canvas-1', expectedRevision: 0, mutations: [] }]],
+      [() => api.createCanvasAgentNode({
+        projectId: 'p1', canvasId: 'canvas-1',
+        operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1',
+        title: '首页 Agent', position: { x: 10, y: 20 },
+      }), CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, [{
+        projectId: 'p1', canvasId: 'canvas-1',
+        operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1',
+        title: '首页 Agent', position: { x: 10, y: 20 },
+      }]],
       [() => api.listCanvasSessions({ projectId: 'p1', archived: false }), DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS, [{ projectId: 'p1', archived: false }]],
       [() => api.createCanvasSession({ projectId: 'p1', title: '页面设计' }), DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION, [{ projectId: 'p1', title: '页面设计' }]],
       [() => api.updateCanvasSession({ projectId: 'p1', canvasId: 'canvas-1', archived: true }), DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION, [{ projectId: 'p1', canvasId: 'canvas-1', archived: true }]],

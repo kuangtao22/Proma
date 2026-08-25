@@ -3,6 +3,7 @@ import type {
   CanvasTarget,
   CanvasSessionChangeEvent,
   CreateCanvasSessionInput,
+  CreateCanvasAgentNodeInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
   DeleteDesignContextInput,
@@ -38,6 +39,8 @@ export interface DesignAdapter {
   loadCanvas: (input: LoadCanvasInput) => ReturnType<DesignPreloadApi['loadCanvasWorkspace']>
   /** 保存目标原生 Canvas，避免与 legacy Design save 混淆。 */
   saveCanvas: (input: SaveCanvasMutationsInput) => ReturnType<DesignPreloadApi['saveCanvasMutations']>
+  /** 在目标 Canvas 内创建 Agent 节点并等待主进程 committed。 */
+  createCanvasAgentNode: (input: CreateCanvasAgentNodeInput) => ReturnType<DesignPreloadApi['createCanvasAgentNode']>
   /** 只向监听器传递项目与 Canvas 身份均匹配的事件。 */
   onCanvasChanged: (
     target: CanvasTarget,
@@ -90,6 +93,7 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
   return {
     loadCanvas: (input) => requireMethod(api, 'loadCanvasWorkspace')(input),
     saveCanvas: (input) => requireMethod(api, 'saveCanvasMutations')(input),
+    createCanvasAgentNode: (input) => requireMethod(api, 'createCanvasAgentNode')(input),
     onCanvasChanged: (target, listener) => requireMethod(api, 'onCanvasChanged')((event) => {
       /** adapter 只隔离双重身份，revision 与 recovery 策略留给工作区 controller。 */
       if (event.projectId === target.projectId && event.canvasId === target.canvasId) listener(event)

@@ -43,6 +43,7 @@ describe('Design 路径解析', () => {
       canvasId: 'canvas-1',
       canvasRoot: '/projects/demo/.proma/design/canvases/canvas-1',
       documentPath: '/projects/demo/.proma/design/canvases/canvas-1/canvas.json',
+      transactionsDir: '/projects/demo/.proma/design/canvases/canvas-1/transactions',
       cacheRoot: '/home/test/.proma/design-cache/project-1/canvases/canvas-1',
       jobsDir: '/home/test/.proma/design-cache/project-1/canvases/canvas-1/jobs',
       tracesDir: '/home/test/.proma/design-cache/project-1/canvases/canvas-1/traces',

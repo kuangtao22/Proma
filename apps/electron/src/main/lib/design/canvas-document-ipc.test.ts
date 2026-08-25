@@ -51,6 +51,8 @@ function createContext(options: {
   guardError?: Error
   loadError?: Error
   mutateError?: Error
+  reconcileError?: Error
+  createError?: Error
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -87,6 +89,40 @@ function createContext(options: {
         storeInputs.push({ target, expectedRevision, mutations })
         if (options.mutateError) throw options.mutateError
         return options.mutateResult ?? createDocument(expectedRevision + (mutations.length > 0 ? 1 : 0))
+      },
+    },
+    creation: {
+      reconcile: (target) => {
+        calls.push('creation:reconcile')
+        storeInputs.push(target)
+        if (options.reconcileError ?? options.loadError) throw options.reconcileError ?? options.loadError
+        return {
+          snapshot: options.loadResult ?? { document: createDocument(4), writable: true },
+          documentChanged: false,
+        }
+      },
+      create: (input) => {
+        calls.push('creation:create')
+        storeInputs.push(input)
+        if (options.createError) throw options.createError
+        const document = createDocument(5)
+        document.nodes = [{
+          id: input.nodeId,
+          kind: 'agent',
+          title: input.title,
+          position: input.position,
+          agentSessionId: '22222222-2222-4222-8222-222222222222',
+        }]
+        return {
+          document,
+          session: {
+            id: '22222222-2222-4222-8222-222222222222',
+            title: input.title,
+            createdAt: 1,
+            updatedAt: 1,
+          },
+          documentChanged: true,
+        }
       },
     },
     getProjectReadOnlyReason: (projectId) => {
@@ -127,6 +163,25 @@ describe('原生 Canvas 文档 IPC', () => {
       { channel: CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, input: { projectId: 'project-1', canvasId: 'bad/id', expectedRevision: 0, mutations: [] } },
       { channel: CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, input: { projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 0, mutations: {} } },
       { channel: CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, input: { projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 0, mutations: {}, extra: true } },
+      { channel: CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, input: {
+        projectId: 'project-1', canvasId: 'canvas-1', operationId: 'not-uuid',
+        nodeId: 'node-1', title: 'Agent', position: { x: 0, y: 0 },
+      } },
+      { channel: CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, input: {
+        projectId: 'p'.repeat(121), canvasId: 'canvas-1',
+        operationId: '11111111-1111-4111-8111-111111111111',
+        nodeId: 'node-1', title: 'Agent', position: { x: 0, y: 0 },
+      } },
+      { channel: CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, input: {
+        projectId: 'project-1', canvasId: 'canvas-1',
+        operationId: '11111111-1111-4111-8111-111111111111',
+        nodeId: 'bad/node', title: 'Agent', position: { x: 0, y: 0 },
+      } },
+      { channel: CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, input: {
+        projectId: 'project-1', canvasId: 'canvas-1',
+        operationId: '11111111-1111-4111-8111-111111111111',
+        nodeId: 'node-1', title: '', position: { x: Number.NaN, y: 0 }, extra: true,
+      } },
     ]
 
     for (const item of invalidCases) {
@@ -159,12 +214,12 @@ describe('原生 Canvas 文档 IPC', () => {
     await invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, saveInput)
 
     expect(context.calls).toEqual([
-      'readonly:project-1', 'guard:project-1', 'store:load',
-      'readonly:project-1', 'guard:project-1', 'store:mutate',
+      'readonly:project-1', 'guard:project-1', 'creation:reconcile',
+      'readonly:project-1', 'guard:project-1', 'creation:reconcile', 'store:mutate',
     ])
     expect(context.storeInputs[0]).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })
     expect(context.storeInputs[0]).not.toBe(loadInput)
-    expect(context.storeInputs[1]).toEqual({
+    expect(context.storeInputs[2]).toEqual({
       target: { projectId: 'project-1', canvasId: 'canvas-1' },
       expectedRevision: 4,
       mutations,
@@ -214,6 +269,46 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(unchanged.sender.sent).toEqual([])
   })
 
+  test('Given 有效创建请求 When intent committed 后返回 Then 广播准确双身份并隐藏内部字段', async () => {
+    const context = createContext()
+    const input = {
+      projectId: 'project-1', canvasId: 'canvas-1',
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
+    }
+
+    const result = await invoke(
+      context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, input,
+    ) as Record<string, unknown>
+
+    expect(context.calls).toEqual(['readonly:project-1', 'guard:project-1', 'creation:create'])
+    expect(context.storeInputs[0]).toEqual(input)
+    expect(context.storeInputs[0]).not.toBe(input)
+    expect(result).not.toHaveProperty('documentChanged')
+    expect(result).toHaveProperty('session.id', '22222222-2222-4222-8222-222222222222')
+    expect(context.sender.sent).toEqual([{
+      channel: CANVAS_IPC_CHANNELS.CHANGED,
+      value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
+    }])
+  })
+
+  test('Given 文档已写但 committed intent 失败 When 创建返回错误 Then 不广播且不泄漏节点', async () => {
+    const error = new Error('Canvas Agent 创建事务提交失败')
+    const context = createContext({ createError: error })
+
+    await expect(invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      context.sender,
+      {
+        projectId: 'project-1', canvasId: 'canvas-1',
+        operationId: '11111111-1111-4111-8111-111111111111',
+        nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
+      },
+    )).rejects.toBe(error)
+    expect(context.sender.sent).toEqual([])
+  })
+
   test('Given guard 或 Store 原样失败 When LOAD/SAVE Then 不广播', async () => {
     const guardError = new Error('工作区迁移中')
     const guarded = createContext({ guardError })
@@ -258,11 +353,12 @@ describe('原生 Canvas 文档 IPC', () => {
     errorSpy.mockRestore()
   })
 
-  test('Given 已注册处理器 When 重复 dispose Then 仅移除两个固定 invoke 通道一次', () => {
+  test('Given 已注册处理器 When 重复 dispose Then 仅移除三个固定 invoke 通道一次', () => {
     const context = createContext()
     expect(context.registration.channels).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
+      CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
     ])
     context.removed.length = 0
 
@@ -272,6 +368,7 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.removed).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
+      CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
     ])
   })
 
@@ -298,6 +395,17 @@ describe('原生 Canvas 文档 IPC', () => {
         load: () => ({ document: createDocument(revision), writable: true as const }),
         mutate: () => createDocument(revision),
       },
+      creation: {
+        reconcile: () => ({
+          snapshot: { document: createDocument(revision), writable: true as const },
+          documentChanged: false,
+        }),
+        create: () => ({
+          document: createDocument(revision),
+          session: { id: 'session-1', title: 'Agent', createdAt: 1, updatedAt: 1 },
+          documentChanged: false,
+        }),
+      },
       getProjectReadOnlyReason: () => undefined,
     })
     /** 被后续注册替代的旧 generation。 */
@@ -318,9 +426,10 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(removed).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
+      CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
     ])
 
     registrationA.dispose()
-    expect(removed).toHaveLength(2)
+    expect(removed).toHaveLength(3)
   })
 })

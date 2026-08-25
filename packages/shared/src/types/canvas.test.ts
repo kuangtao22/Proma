@@ -124,6 +124,7 @@ describe('Canvas 图共享合同', () => {
     expect(CANVAS_IPC_CHANNELS).toEqual({
       LOAD: 'canvas:load',
       SAVE_MUTATIONS: 'canvas:save-mutations',
+      CREATE_AGENT_NODE: 'canvas:create-agent-node',
       CHANGED: 'canvas:changed',
     })
     expect(loadInput).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })

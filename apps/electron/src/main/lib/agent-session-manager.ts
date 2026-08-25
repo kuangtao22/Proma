@@ -511,6 +511,8 @@ export function resolveAgentWorkbenchDir(
 
 /** 原子创建 Agent 会话时允许一并写入的元数据。 */
 export interface CreateAgentSessionWithMetadataInput {
+  /** 仅供主进程受信任事务使用的预分配 UUID；普通入口不得传入。 */
+  trustedSessionId?: string
   title?: string
   channelId?: string
   workspaceId?: string
@@ -525,6 +527,31 @@ export interface CreateAgentSessionWithMetadataInput {
   sourceCanvasId?: string
   /** Canvas 节点 ID，用于绑定内部 Agent。 */
   sourceCanvasNodeId?: string
+}
+
+/** 主进程预分配会话仅接受标准 UUID，阻断路径和无界索引键。 */
+const TRUSTED_AGENT_SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+/**
+ * 判断已存在会话是否与预分配创建请求的全部必要事实一致。
+ * @param existing 索引中已占用相同 ID 的会话。
+ * @param expected 本次创建将持久化的必要事实。
+ * @returns 标题、模型、工作区、布局与 Canvas 归属完全相同时返回 true。
+ */
+function matchesTrustedSessionCreation(
+  existing: AgentSessionMeta,
+  expected: Pick<AgentSessionMeta,
+    | 'title' | 'channelId' | 'modelId' | 'workspaceId' | 'agentCwdMode'
+    | 'sessionWorkbenchLayout' | 'sourceCanvasProjectId' | 'sourceCanvasId'
+    | 'sourceCanvasNodeId' | 'sourceDesignProjectId' | 'sourceDesignJobId'>,
+): boolean {
+  /** 只比较创建事务拥有的稳定事实；时间与运行期字段不参与幂等判定。 */
+  const keys = [
+    'title', 'channelId', 'modelId', 'workspaceId', 'agentCwdMode',
+    'sessionWorkbenchLayout', 'sourceCanvasProjectId', 'sourceCanvasId',
+    'sourceCanvasNodeId', 'sourceDesignProjectId', 'sourceDesignJobId',
+  ] as const
+  return keys.every((key) => existing[key] === expected[key])
 }
 
 /**
@@ -579,14 +606,25 @@ export function createAgentSessionWithMetadata(
     throw new Error('Canvas 内部会话来源字段必须完整且属于当前项目')
   }
 
+  /** 预分配 ID 必须在读取索引和创建目录前完成严格验证。 */
+  const trustedSessionId = input.trustedSessionId
+  if (trustedSessionId !== undefined
+    && (trustedSessionId.length !== 36 || !TRUSTED_AGENT_SESSION_ID_PATTERN.test(trustedSessionId))) {
+    throw new Error('预分配会话 ID 非法')
+  }
+  if (trustedSessionId !== undefined && !hasCanvasMetadata) {
+    throw new Error('预分配会话 ID 仅允许完整 Canvas 内部会话使用')
+  }
+
   const index = readIndex()
   const now = Date.now()
 
   const settings = getSettings()
   const defaultThinkingLevel = settings.defaultOpenAIThinkingLevel
     ?? resolvePiThinkingLevel(settings, undefined, 'openai-codex')
+  /** 创建请求归一化后的稳定事实，同时用于幂等冲突检查。 */
   const meta: AgentSessionMeta = {
-    id: randomUUID(),
+    id: trustedSessionId ?? randomUUID(),
     title: input.title || '新 Agent 会话',
     channelId: input.channelId,
     modelId: input.modelId,
@@ -603,6 +641,19 @@ export function createAgentSessionWithMetadata(
     } : {}),
     createdAt: now,
     updatedAt: now,
+  }
+
+  if (trustedSessionId) {
+    /** 相同预分配 ID 只能复用完全相同的主进程事实。 */
+    const existing = index.sessions.find((session) => session.id === trustedSessionId)
+    if (existing) {
+      if (!matchesTrustedSessionCreation(existing, meta)) {
+        throw new Error('预分配会话 ID 已被不同事实占用')
+      }
+      /** 崩溃可能发生在索引提交和目录初始化之间，重试负责补齐目录。 */
+      initializeAgentSessionDirectories(existing)
+      return existing
+    }
   }
 
   index.sessions.push(meta)

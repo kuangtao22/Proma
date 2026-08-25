@@ -1,14 +1,17 @@
 import * as React from 'react'
 import { applyCanvasMutations } from '@proma/shared'
 import type {
+  CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
   CanvasDocument,
   CanvasMutation,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
+  CreateCanvasAgentNodeInput,
+  DesignPoint,
 } from '@proma/shared'
 import { useAtomValue, useSetAtom, useStore } from 'jotai'
-import { LoaderCircle, RotateCcw } from 'lucide-react'
+import { Bot, LoaderCircle, RotateCcw } from 'lucide-react'
 import {
   createInitialNativeCanvasState,
   createNativeCanvasKey,
@@ -17,6 +20,7 @@ import {
 } from '@/atoms/native-canvas-atoms'
 import type { NativeCanvasState } from '@/atoms/native-canvas-atoms'
 import { Button } from '@/components/ui/button'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { designAdapter } from '@/lib/design-adapter'
 import type { DesignAdapter } from '@/lib/design-adapter'
 import { NativeCanvasGraph } from './NativeCanvasGraph'
@@ -43,6 +47,81 @@ export interface NativeCanvasAdapter {
   loadCanvas: DesignAdapter['loadCanvas']
   saveCanvas: DesignAdapter['saveCanvas']
   onCanvasChanged: DesignAdapter['onCanvasChanged']
+  /** 旧测试替身可省略，真实 Design adapter 始终提供。 */
+  createCanvasAgentNode?: DesignAdapter['createCanvasAgentNode']
+}
+
+/** 添加 Agent 按钮的局部异步状态。 */
+export interface CanvasAgentNodeCommandState {
+  loading: boolean
+  error: string | null
+}
+
+/** 添加 Agent 命令的可注入依赖，避免把幂等 operation 混入保存状态机。 */
+export interface CanvasAgentNodeCommandDependencies {
+  target: CanvasTarget
+  createAgentNode: (input: CreateCanvasAgentNodeInput) => Promise<CanvasAgentNodeCreationResult>
+  createId: () => string
+  getPosition: () => DesignPoint
+  onStateChange: (state: CanvasAgentNodeCommandState) => void
+  onSuccess: (nodeId: string, result: CanvasAgentNodeCreationResult) => void
+}
+
+/** 单次用户创建 operation 的命令接口。 */
+export interface CanvasAgentNodeCommandController {
+  execute: () => Promise<void>
+  cancel: () => void
+}
+
+/**
+ * 创建保留失败 operationId 的 Agent 节点命令控制器。
+ * @param dependencies 主进程创建 API、ID、位置和状态回调。
+ * @returns 防重复执行、支持显式重试与取消的命令。
+ */
+export function createCanvasAgentNodeCommandController(
+  dependencies: CanvasAgentNodeCommandDependencies,
+): CanvasAgentNodeCommandController {
+  /** 首次点击生成并在失败重试间保留的完整请求。 */
+  let operation: CreateCanvasAgentNodeInput | null = null
+  /** 当前唯一在途 Promise，连续点击必须返回同一引用。 */
+  let inFlight: Promise<void> | null = null
+
+  return {
+    execute: () => {
+      if (inFlight) return inFlight
+      if (!operation) {
+        operation = {
+          ...dependencies.target,
+          operationId: dependencies.createId(),
+          nodeId: dependencies.createId(),
+          title: '新 Agent',
+          position: dependencies.getPosition(),
+        }
+      }
+      /** 当前调用固定捕获 request，成功清理 operation 也不影响回调节点 ID。 */
+      const request = operation
+      dependencies.onStateChange({ loading: true, error: null })
+      const requestPromise = dependencies.createAgentNode(request).then((result) => {
+        dependencies.onSuccess(request.nodeId, result)
+        operation = null
+        dependencies.onStateChange({ loading: false, error: null })
+      }).catch((error: unknown) => {
+        /** 失败保留 operation，下一次 execute 原样重放。 */
+        dependencies.onStateChange({ loading: false, error: getNativeCanvasErrorMessage(error) })
+        throw error
+      }).finally(() => {
+        if (inFlight === requestPromise) inFlight = null
+      })
+      inFlight = requestPromise
+      return requestPromise
+    },
+    cancel: () => {
+      /** 不能取消已经发送的主进程事务，只允许清理尚未在途的失败 operation。 */
+      if (inFlight) return
+      operation = null
+      dependencies.onStateChange({ loading: false, error: null })
+    },
+  }
 }
 
 /** 可注入的尾触发调度器。 */
@@ -460,6 +539,12 @@ export function NativeCanvasWorkspace({
   const updateNativeCanvasState = useSetAtom(updateNativeCanvasStateAtom)
   const store = useStore()
   const controllerRef = React.useRef<NativeCanvasWorkspaceController | null>(null)
+  const commandRef = React.useRef<CanvasAgentNodeCommandController | null>(null)
+  const canvasViewportRef = React.useRef<HTMLDivElement | null>(null)
+  const [createState, setCreateState] = React.useState<CanvasAgentNodeCommandState>({
+    loading: false,
+    error: null,
+  })
   /** SSR 首帧使用该 key 专属的全新状态，不启动任何消息或 Canvas API。 */
   const fallbackState = React.useMemo(createInitialNativeCanvasState, [stateKey])
   const state = states.get(stateKey) ?? fallbackState
@@ -471,7 +556,7 @@ export function NativeCanvasWorkspace({
       clearTimeout: (timerId) => window.clearTimeout(timerId),
     }
     const controller = createNativeCanvasWorkspaceController({
-      target,
+      target: { projectId: target.projectId, canvasId: target.canvasId },
       adapter,
       getState: () => store.get(nativeCanvasStatesAtom).get(stateKey)
         ?? createInitialNativeCanvasState(),
@@ -486,6 +571,57 @@ export function NativeCanvasWorkspace({
     }
   }, [adapter, stateKey, store, target.canvasId, target.projectId, updateNativeCanvasState])
 
+  React.useEffect(() => {
+    if (!adapter.createCanvasAgentNode) {
+      commandRef.current = null
+      return
+    }
+    /** 每个 projectId:canvasId 生命周期拥有独立 operation，切换即视为取消。 */
+    const command = createCanvasAgentNodeCommandController({
+      target,
+      createAgentNode: adapter.createCanvasAgentNode,
+      createId: () => window.crypto.randomUUID(),
+      getPosition: () => {
+        /** 以点击时最新 viewport 和容器尺寸换算世界坐标中心。 */
+        const latest = store.get(nativeCanvasStatesAtom).get(stateKey)
+        const viewport = latest?.snapshot?.document.viewport ?? { x: 0, y: 0, zoom: 1 }
+        const bounds = canvasViewportRef.current?.getBoundingClientRect()
+        return {
+          x: ((bounds?.width ?? 0) / 2 - viewport.x) / viewport.zoom,
+          y: ((bounds?.height ?? 0) / 2 - viewport.y) / viewport.zoom,
+        }
+      },
+      onStateChange: setCreateState,
+      onSuccess: (nodeId, result) => updateNativeCanvasState({
+        key: stateKey,
+        update: (current) => ({
+          snapshot: current.snapshot
+            ? { ...current.snapshot, document: result.document }
+            : { document: result.document, writable: true },
+          selectedNodeId: nodeId,
+          conversationNodeId: nodeId,
+          error: null,
+        }),
+      }),
+    })
+    commandRef.current = command
+    return () => {
+      command.cancel()
+      if (commandRef.current === command) commandRef.current = null
+    }
+  }, [adapter, stateKey, store, target.canvasId, target.projectId, updateNativeCanvasState])
+
+  /** 创建期间要求权威快照无本地待提交变更，避免立即制造 revision conflict。 */
+  const canCreateAgent = Boolean(
+    adapter.createCanvasAgentNode
+    && state.snapshot
+    && state.saveState === 'saved'
+    && state.pendingMutations.length === 0
+    && state.inFlightMutations.length === 0
+    && state.authoritativeRecoveryState === 'idle'
+    && !createState.loading,
+  )
+
   return (
     <section
       className="flex h-full min-h-0 flex-col bg-content-area"
@@ -493,8 +629,36 @@ export function NativeCanvasWorkspace({
       data-project-id={target.projectId}
       data-canvas-id={target.canvasId}
     >
-      <header className="flex h-11 shrink-0 items-center border-b border-border px-4">
+      <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
         <h1 className="truncate text-sm font-medium text-foreground">{title}</h1>
+        <div className="ml-auto flex min-w-0 items-center gap-2">
+          {createState.error ? (
+            <span className="max-w-64 truncate text-xs text-destructive" role="status">
+              {createState.error}
+            </span>
+          ) : null}
+          <TooltipProvider delayDuration={200} disableHoverableContent>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  aria-label="添加 Agent"
+                  disabled={!canCreateAgent}
+                  onClick={() => { void commandRef.current?.execute().catch(() => undefined) }}
+                >
+                  {createState.loading ? (
+                    <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Bot className="size-4" aria-hidden="true" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">添加 Agent</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        </div>
       </header>
       <div className="min-h-0 flex-1">
         {(state.phase === 'idle' || state.phase === 'loading') && !state.snapshot ? (
@@ -510,7 +674,7 @@ export function NativeCanvasWorkspace({
             </Button>
           </div>
         ) : state.snapshot ? (
-          <div className="relative h-full">
+          <div ref={canvasViewportRef} className="relative h-full">
             <NativeCanvasGraph
               document={state.snapshot.document}
               writable={state.authoritativeRecoveryState === 'idle' && state.saveState !== 'conflict'}

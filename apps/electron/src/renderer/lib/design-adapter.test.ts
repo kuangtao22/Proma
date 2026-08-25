@@ -30,16 +30,27 @@ describe('Design renderer adapter', () => {
     const api: PartialDesignApi = {
       loadCanvasWorkspace: async (input) => { received.push(input); return snapshot },
       saveCanvasMutations: async (input) => { received.push(input); return snapshot.document },
+      createCanvasAgentNode: async (input) => {
+        received.push(input)
+        return { document: snapshot.document, session: { id: 'session-1' } as never }
+      },
     }
     const adapter = createDesignAdapter(api)
     const loadInput = { projectId: 'project-1', canvasId: 'canvas-1' }
     const saveInput = { ...loadInput, expectedRevision: 0, mutations: [] }
+    const createInput = {
+      ...loadInput,
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
+    }
 
     expect(await adapter.loadCanvas(loadInput)).toBe(snapshot)
     expect(await adapter.saveCanvas(saveInput)).toBe(snapshot.document)
-    expect(received).toEqual([loadInput, saveInput])
+    expect((await adapter.createCanvasAgentNode(createInput)).document).toBe(snapshot.document)
+    expect(received).toEqual([loadInput, saveInput, createInput])
     expect(received[0]).toBe(loadInput)
     expect(received[1]).toBe(saveInput)
+    expect(received[2]).toBe(createInput)
   })
 
   test('Given 多个 Canvas 事件 When 订阅目标 B Then recovery 和 graph 都只按双身份隔离', () => {

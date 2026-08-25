@@ -1,9 +1,11 @@
 import type { DesignPoint, DesignViewport } from './design'
+import type { AgentSessionMeta } from './agent'
 
 /** 原生 Canvas 图文档使用的固定 IPC 通道。 */
 export const CANVAS_IPC_CHANNELS = {
   LOAD: 'canvas:load',
   SAVE_MUTATIONS: 'canvas:save-mutations',
+  CREATE_AGENT_NODE: 'canvas:create-agent-node',
   CHANGED: 'canvas:changed',
 } as const
 
@@ -151,6 +153,24 @@ export interface LoadCanvasInput extends CanvasTarget {}
 export interface SaveCanvasMutationsInput extends CanvasTarget {
   expectedRevision: number
   mutations: CanvasMutation[]
+}
+
+/** 在已有原生 Canvas 中幂等创建一个内部 Agent 节点。 */
+export interface CreateCanvasAgentNodeInput extends CanvasTarget {
+  /** Renderer 为单次用户操作生成的稳定 UUID，失败重试必须复用。 */
+  operationId: string
+  /** 本次操作预分配的稳定节点 ID，不允许由主进程替换。 */
+  nodeId: string
+  /** 节点与内部会话共享的展示标题。 */
+  title: string
+  /** 节点在当前 Canvas 世界坐标中的初始位置。 */
+  position: DesignPoint
+}
+
+/** Agent 节点事务 committed 后向 Renderer 发布的公开结果。 */
+export interface CanvasAgentNodeCreationResult {
+  document: CanvasDocument
+  session: AgentSessionMeta
 }
 
 /** Renderer 可见的原生 Canvas 工作区快照，不暴露路径或存储实现。 */

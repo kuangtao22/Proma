@@ -1,14 +1,18 @@
 import { CANVAS_IPC_CHANNELS } from '@proma/shared'
 import type {
+  CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
   CanvasMutation,
   CanvasWorkspaceSnapshot,
+  CreateCanvasAgentNodeInput,
   LoadCanvasInput,
   SaveCanvasMutationsInput,
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
 import type { CanvasDocumentStore } from './canvas-document-store'
+import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
+import { assertCreateCanvasAgentNodeInput } from './canvas-agent-node-creation'
 import { isSafeDesignStableId } from './design-paths'
 
 /** Canvas 文档 IPC handler 的最小签名。 */
@@ -26,6 +30,8 @@ export interface CanvasDocumentIpcOptions {
   listAuthorizedWebContents: () => WebContents[]
   guard: Pick<WorkspaceOperationGuard, 'runWorkspaceWrite'>
   store: Pick<CanvasDocumentStore, 'load' | 'mutate'>
+  /** 已持有 lease 时执行目标 Canvas 创建事务对账。 */
+  creation: Pick<CanvasAgentNodeCreationService, 'reconcile' | 'create'>
   getProjectReadOnlyReason: (projectId: string) => string | undefined
 }
 
@@ -113,6 +119,33 @@ function parseSaveInput(value: unknown): SaveCanvasMutationsInput {
 }
 
 /**
+ * 解析并重建 Agent 节点创建输入，不接受 Renderer 传 sessionId 或模型字段。
+ * @param value Renderer 提交的未知输入。
+ * @returns 仅包含公开创建合同字段的新对象。
+ */
+function parseCreateAgentNodeInput(value: unknown): CreateCanvasAgentNodeInput {
+  if (!isRecord(value) || !hasExactDataKeys(value, [
+    'projectId', 'canvasId', 'operationId', 'nodeId', 'title', 'position',
+  ])) {
+    throw new Error('Canvas Agent 创建参数无效')
+  }
+  if (!isRecord(value.position) || !hasExactDataKeys(value.position, ['x', 'y'])) {
+    throw new Error('Canvas Agent 位置参数无效')
+  }
+  /** 重建对象后交给共享主进程 validator 进行 ID、长度和有限数值检查。 */
+  const input = {
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    operationId: value.operationId,
+    nodeId: value.nodeId,
+    title: value.title,
+    position: { x: value.position.x, y: value.position.y },
+  } as CreateCanvasAgentNodeInput
+  assertCreateCanvasAgentNodeInput(input)
+  return input
+}
+
+/**
  * 确认调用来自仍存活的授权主窗口。
  * @param event Electron invoke 事件。
  * @param options 当前注册器可信依赖。
@@ -153,7 +186,7 @@ function broadcastChange(options: CanvasDocumentIpcOptions, event: CanvasChangeE
 }
 
 /**
- * 注册原生 Canvas 文档 LOAD/SAVE IPC。
+ * 注册原生 Canvas 文档 LOAD/SAVE/Agent 节点创建 IPC。
  * @param options 授权窗口、项目守卫和原生 Store。
  * @returns 本注册器拥有的 invoke 通道和幂等清理函数。
  */
@@ -161,7 +194,11 @@ export function registerCanvasDocumentIpcHandlers(
   options: CanvasDocumentIpcOptions,
 ): CanvasDocumentIpcRegistration {
   /** CHANGED 仅用于 send，不注册 handler。 */
-  const channels = [CANVAS_IPC_CHANNELS.LOAD, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS]
+  const channels = [
+    CANVAS_IPC_CHANNELS.LOAD,
+    CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
+    CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+  ]
   /** 当前调用独有的注册代次标识。 */
   const registrationToken = Symbol('canvas-document-ipc-registration')
   /** 热重载前先移除同名旧 handler。 */
@@ -174,16 +211,24 @@ export function registerCanvasDocumentIpcHandlers(
     const input = parseLoadInput(value)
     requireWritableProject(input.projectId, options)
     /** LOAD 可能创建 Canvas 根或提升恢复候选，因此也必须持有写 lease。 */
-    const snapshot = options.guard.runWorkspaceWrite(
+    const reconciliation = options.guard.runWorkspaceWrite(
       input.projectId,
-      () => options.store.load({ projectId: input.projectId, canvasId: input.canvasId }),
+      () => options.creation.reconcile({ projectId: input.projectId, canvasId: input.canvasId }),
     )
+    const snapshot = reconciliation.snapshot
     if (snapshot.recoveredFrom) {
       broadcastChange(options, {
         projectId: input.projectId,
         canvasId: input.canvasId,
         revision: snapshot.document.revision,
         cause: 'recovery',
+      })
+    } else if (reconciliation.documentChanged) {
+      broadcastChange(options, {
+        projectId: input.projectId,
+        canvasId: input.canvasId,
+        revision: snapshot.document.revision,
+        cause: 'graph',
       })
     }
     return snapshot
@@ -195,14 +240,23 @@ export function registerCanvasDocumentIpcHandlers(
     const input = parseSaveInput(value)
     requireWritableProject(input.projectId, options)
     /** Store 在同一项目写 lease 内执行权威 schema、revision 和原子提交。 */
-    const document = options.guard.runWorkspaceWrite(
+    const result = options.guard.runWorkspaceWrite(
       input.projectId,
-      () => options.store.mutate(
-        { projectId: input.projectId, canvasId: input.canvasId },
-        input.expectedRevision,
-        input.mutations,
-      ),
+      () => {
+        /** SAVE 先在同一 lease 内完成创建事务发布屏障，禁止二次加锁。 */
+        const reconciliation = options.creation.reconcile({
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+        })
+        const document = options.store.mutate(
+          { projectId: input.projectId, canvasId: input.canvasId },
+          input.expectedRevision,
+          input.mutations,
+        )
+        return { document, reconciliation }
+      },
     )
+    const document = result.document
     if (document.revision > input.expectedRevision) {
       broadcastChange(options, {
         projectId: input.projectId,
@@ -214,7 +268,28 @@ export function registerCanvasDocumentIpcHandlers(
     return document
   })
 
-  /** dispose 只移除本注册器的两个 invoke handler。 */
+  options.ipc.handle(CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, (event, value): CanvasAgentNodeCreationResult => {
+    assertAuthorizedSender(event, options)
+    const input = parseCreateAgentNodeInput(value)
+    requireWritableProject(input.projectId, options)
+    /** 创建服务内部不加锁，整个事务只持有这一份 workspace write lease。 */
+    const result = options.guard.runWorkspaceWrite(
+      input.projectId,
+      () => options.creation.create(input),
+    )
+    if (result.documentChanged) {
+      broadcastChange(options, {
+        projectId: input.projectId,
+        canvasId: input.canvasId,
+        revision: result.document.revision,
+        cause: 'graph',
+      })
+    }
+    /** documentChanged 属于主进程发布策略，不暴露给 Renderer。 */
+    return { document: result.document, session: result.session }
+  })
+
+  /** dispose 只移除本注册器的三个 invoke handler。 */
   let disposed = false
   return {
     channels: [...channels],

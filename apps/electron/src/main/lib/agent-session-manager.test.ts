@@ -715,6 +715,81 @@ describe('Agent 会话 runtime 元数据', () => {
     expect(manager.listVisibleAgentSessions()).not.toContainEqual(expect.objectContaining({ id: session.id }))
   })
 
+  test('Given 主进程预分配稳定 UUID When 同一 Canvas 事实重试 Then 幂等复用且补齐会话目录', () => {
+    writeAgentSessionsIndex([])
+    writeAgentWorkspacesIndex([{
+      id: 'workspace-canvas', name: 'Canvas 项目', slug: 'workspace-canvas', createdAt: 1, updatedAt: 1,
+    }])
+    const input = {
+      trustedSessionId: '22222222-2222-4222-8222-222222222222',
+      title: 'Canvas 节点 Agent',
+      channelId: 'channel-1',
+      modelId: 'model-1',
+      workspaceId: 'workspace-canvas',
+      sourceCanvasProjectId: 'workspace-canvas',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    }
+
+    const first = manager.createAgentSessionWithMetadata(input)
+    const second = manager.createAgentSessionWithMetadata(input)
+
+    expect(second).toEqual(first)
+    expect(manager.listAgentSessions().filter((session) => session.id === input.trustedSessionId)).toHaveLength(1)
+    expect(existsSync(join(
+      tempHome, '.proma', 'agent-workspaces', 'workspace-canvas', input.trustedSessionId,
+    ))).toBe(true)
+  })
+
+  test.each([
+    ['非 UUID', 'session-1'],
+    ['过长 UUID', '22222222-2222-4222-8222-222222222222-extra'],
+  ])('Given 受信任预分配 ID %s When 创建 Then 在索引写入前拒绝', (_label, trustedSessionId) => {
+    writeAgentSessionsIndex([])
+    expect(() => manager.createAgentSessionWithMetadata({
+      trustedSessionId,
+      workspaceId: 'workspace-canvas',
+      sourceCanvasProjectId: 'workspace-canvas',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    })).toThrow('预分配会话 ID 非法')
+    expect(manager.listAgentSessions()).toEqual([])
+  })
+
+  test('Given 普通会话尝试使用预分配 ID When 创建 Then 拒绝扩大受信任入口', () => {
+    writeAgentSessionsIndex([])
+    expect(() => manager.createAgentSessionWithMetadata({
+      trustedSessionId: '22222222-2222-4222-8222-222222222222',
+      title: '普通会话',
+      workspaceId: 'workspace-canvas',
+    })).toThrow('预分配会话 ID 仅允许完整 Canvas 内部会话使用')
+    expect(manager.listAgentSessions()).toEqual([])
+  })
+
+  test('Given 预分配 ID 已绑定不同 Canvas 事实 When 重试 Then 冲突且不覆盖旧会话', () => {
+    const trustedSessionId = '22222222-2222-4222-8222-222222222222'
+    writeAgentSessionsIndex([{
+      id: trustedSessionId,
+      title: '旧节点',
+      workspaceId: 'workspace-canvas',
+      sourceCanvasProjectId: 'workspace-canvas',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-old',
+      createdAt: 1,
+      updatedAt: 1,
+    }])
+
+    expect(() => manager.createAgentSessionWithMetadata({
+      trustedSessionId,
+      title: '新节点',
+      workspaceId: 'workspace-canvas',
+      sourceCanvasProjectId: 'workspace-canvas',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-new',
+    })).toThrow('预分配会话 ID 已被不同事实占用')
+    expect(manager.getAgentSessionMeta(trustedSessionId)?.sourceCanvasNodeId).toBe('node-old')
+  })
+
   test.each([
     ['缺少一个来源字段', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: 'workspace-canvas', sourceCanvasId: 'canvas-1' }],
     ['缺少两个来源字段', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: 'workspace-canvas' }],

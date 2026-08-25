@@ -194,6 +194,7 @@ import { registerCanvasSessionIpcHandlers } from './lib/design/canvas-session-ip
 import { CanvasSessionStore } from './lib/design/canvas-session-store'
 import { registerCanvasDocumentIpcHandlers } from './lib/design/canvas-document-ipc'
 import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
+import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
 import {
   runChannelMutationWithImageModelBroadcast,
   updateToolCredentialsWithImageModelBroadcast,
@@ -335,6 +336,10 @@ import {
   searchAgentSessionMessages,
   searchAgentSessionReferences,
 } from './lib/agent-session-manager'
+import {
+  assertEnabledModelForChannel,
+  listEnabledAgentModelsForChannel,
+} from './lib/agent-model-selection'
 import { isAgentSessionUserVisible, requireUserVisibleAgentSession } from './lib/agent-session-visibility'
 import { agentEventBus, runAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, reserveAgentSessionStart, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
@@ -1621,6 +1626,19 @@ export function registerIpcHandlers(): void {
   const canvasSessionStore = new CanvasSessionStore({ pathResolver: designPathResolver })
   /** 原生 Canvas 文档复用同一会话索引作为项目与 Canvas 双身份授权事实。 */
   const canvasDocumentStore = createCanvasDocumentStore({ sessions: canvasSessionStore })
+  /** Canvas Agent 创建事务复用现有 Agent 索引与模型可用性事实。 */
+  const canvasAgentNodeCreation = new CanvasAgentNodeCreationService({
+    pathResolver: designPathResolver,
+    store: canvasDocumentStore,
+    getSettings,
+    assertModelAvailable: (channelId, modelId) => {
+      /** 即使 modelId 为空也必须先验证渠道存在且启用。 */
+      listEnabledAgentModelsForChannel(channelId, 'Canvas Agent ')
+      assertEnabledModelForChannel({ channelId, modelId, purpose: 'Canvas Agent ' })
+    },
+    getSession: getAgentSessionMeta,
+    createSession: createAgentSessionWithMetadata,
+  })
   /** 项目离线或迁移时返回稳定 Design/Canvas 只读原因。 */
   const getDesignProjectReadOnlyReason = (projectId: string): string | undefined => {
     /** 未登记项目仍交给路径解析器或 store 抛出明确的项目不存在错误。 */
@@ -1740,6 +1758,7 @@ export function registerIpcHandlers(): void {
     listAuthorizedWebContents: listAuthorizedDesignWebContents,
     guard: workspaceOperationGuard,
     store: canvasDocumentStore,
+    creation: canvasAgentNodeCreation,
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
   })
   registerDesignIpcHandlers({
