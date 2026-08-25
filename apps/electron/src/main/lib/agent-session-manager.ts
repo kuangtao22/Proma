@@ -545,6 +545,10 @@ function matchesTrustedSessionCreation(
     | 'sessionWorkbenchLayout' | 'sourceCanvasProjectId' | 'sourceCanvasId'
     | 'sourceCanvasNodeId' | 'sourceDesignProjectId' | 'sourceDesignJobId'>,
 ): boolean {
+  /** 预分配幂等复用只接受独占 Canvas 所有权，拒绝历史或并发污染。 */
+  if (!hasValidCanvasAgentOwnership(existing) || !hasValidCanvasAgentOwnership(expected)) {
+    return false
+  }
   /** 只比较创建事务拥有的稳定事实；时间与运行期字段不参与幂等判定。 */
   const keys = [
     'title', 'channelId', 'modelId', 'workspaceId', 'agentCwdMode',

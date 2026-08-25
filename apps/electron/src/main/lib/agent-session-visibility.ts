@@ -9,7 +9,31 @@ type InternalSessionFields = Pick<
   | 'sourceCanvasProjectId'
   | 'sourceCanvasId'
   | 'sourceCanvasNodeId'
+  | 'sourceAutomationId'
+  | 'automationGraduated'
+  | 'parentSessionId'
+  | 'rootSessionId'
+  | 'sourceDelegationId'
+  | 'delegationRole'
+  | 'delegationStatus'
+  | 'delegationDepth'
+  | 'delegationGoal'
 >
+
+/** Canvas 内部会话必须排除的其它来源与协作字段。 */
+const CANVAS_EXCLUSIVE_OWNERSHIP_FIELDS = [
+  'sourceDesignProjectId',
+  'sourceDesignJobId',
+  'sourceAutomationId',
+  'automationGraduated',
+  'parentSessionId',
+  'rootSessionId',
+  'sourceDelegationId',
+  'delegationRole',
+  'delegationStatus',
+  'delegationDepth',
+  'delegationGoal',
+] as const
 
 /**
  * 判断会话是否声明了任一 Canvas 来源字段。
@@ -43,16 +67,20 @@ export function hasValidDesignSessionOwnership(session: InternalSessionFields): 
 /**
  * 判断内部 Canvas Agent 是否拥有完整且唯一的项目归属。
  * @param session 待判断的工作区及内部来源字段。
- * @returns Canvas 三字段非空、项目匹配且未混入 Design 来源时返回 true。
+ * @returns Canvas 三字段规范、项目匹配且未混入其它来源或协作字段时返回 true。
  */
 export function hasValidCanvasAgentOwnership(session: InternalSessionFields): boolean {
-  if (isInternalDesignSession(session)) return false
-  return Boolean(
-    session.sourceCanvasProjectId?.trim()
-      && session.sourceCanvasId?.trim()
-      && session.sourceCanvasNodeId?.trim()
-      && session.workspaceId === session.sourceCanvasProjectId,
-  )
+  /** Canvas Agent 是独占会话类型，任何其它来源字段都表示所有权污染。 */
+  if (CANVAS_EXCLUSIVE_OWNERSHIP_FIELDS.some((field) => session[field] !== undefined)) return false
+  const canvasFields = [
+    session.sourceCanvasProjectId,
+    session.sourceCanvasId,
+    session.sourceCanvasNodeId,
+  ]
+  return canvasFields.every((value) => typeof value === 'string'
+    && value.length > 0
+    && value.trim() === value)
+    && session.workspaceId === session.sourceCanvasProjectId
 }
 
 /**

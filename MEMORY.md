@@ -152,3 +152,4 @@
 - 2026-08-25：归档 Canvas 分组固定排在 Agent 归档历史之前，避免 Agent 归档异步加载或超长历史列表把 Canvas 恢复入口挤到列表末尾；归档状态仍只由项目 Canvas 原子索引维护。
 - 2026-08-26：稳定目录 Windows 安全合同固定为：授权后若目录被 junction 替换且无法相对根 HANDLE 重开子项，整项 fail closed 为空并绝不读取 replacement；独立 Windows 构建与正式发布必须在打包前运行 helper/host 定向测试，UNC 管理共享不可用时只能显式 skip。
 - 2026-08-26：Canvas Agent 节点创建使用目标 Canvas 内的可恢复 intent 事务，在同一 workspace write lease 内按 `prepared -> session-created -> committed` 推进；LOAD、SAVE 和 CREATE 都先对账，只有 committed 后才能广播或返回。用户后来删除节点时 intent 转为 `detached`，不重建引用；预分配会话 ID 仅允许完整 Canvas 归属的内部会话幂等复用。
+- 2026-08-26：Canvas 创建事务对账产生的 graph revision 是独立发布事实，SAVE/CREATE 后续失败也必须在 workspace lease 释放后广播并原样抛错；Canvas Agent 会话必须独占 Canvas 三字段归属，禁止混入 Design、Automation 或 Delegation/父子协作来源。事务目录只能由 Store 同次安全 LOAD 返回的 capability 在固定 `canvasesRoot/canvasRoot` 下单级创建，intent 读写前及 safe-file rename 前均复验三层目录身份。

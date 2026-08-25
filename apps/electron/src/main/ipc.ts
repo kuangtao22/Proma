@@ -1628,7 +1628,6 @@ export function registerIpcHandlers(): void {
   const canvasDocumentStore = createCanvasDocumentStore({ sessions: canvasSessionStore })
   /** Canvas Agent 创建事务复用现有 Agent 索引与模型可用性事实。 */
   const canvasAgentNodeCreation = new CanvasAgentNodeCreationService({
-    pathResolver: designPathResolver,
     store: canvasDocumentStore,
     getSettings,
     assertModelAvailable: (channelId, modelId) => {

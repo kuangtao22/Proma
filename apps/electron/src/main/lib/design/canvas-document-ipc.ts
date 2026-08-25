@@ -42,6 +42,14 @@ export interface CanvasDocumentIpcRegistration {
   dispose: () => void
 }
 
+/** 同一 lease 内的对账与后续操作结果，错误必须延迟到发布对账事件后再抛出。 */
+type ReconciledOperationOutcome<T> = {
+  reconciliation: ReturnType<CanvasAgentNodeCreationService['reconcile']>
+} & (
+  | { ok: true; value: T }
+  | { ok: false; error: unknown }
+)
+
 /** 每个 registrar 当前拥有 handler 的注册代次，防止旧 dispose 删除新 handler。 */
 const currentRegistrationTokens = new WeakMap<CanvasDocumentIpcRegistrar, symbol>()
 
@@ -240,23 +248,37 @@ export function registerCanvasDocumentIpcHandlers(
     const input = parseSaveInput(value)
     requireWritableProject(input.projectId, options)
     /** Store 在同一项目写 lease 内执行权威 schema、revision 和原子提交。 */
-    const result = options.guard.runWorkspaceWrite(
+    const outcome = options.guard.runWorkspaceWrite(
       input.projectId,
-      () => {
+      (): ReconciledOperationOutcome<CanvasWorkspaceSnapshot['document']> => {
         /** SAVE 先在同一 lease 内完成创建事务发布屏障，禁止二次加锁。 */
         const reconciliation = options.creation.reconcile({
           projectId: input.projectId,
           canvasId: input.canvasId,
         })
-        const document = options.store.mutate(
-          { projectId: input.projectId, canvasId: input.canvasId },
-          input.expectedRevision,
-          input.mutations,
-        )
-        return { document, reconciliation }
+        try {
+          const document = options.store.mutate(
+            { projectId: input.projectId, canvasId: input.canvasId },
+            input.expectedRevision,
+            input.mutations,
+          )
+          return { ok: true, value: document, reconciliation }
+        } catch (error) {
+          /** 已提交的对账 revision 不能被后续 SAVE 错误吞掉。 */
+          return { ok: false, error, reconciliation }
+        }
       },
     )
-    const document = result.document
+    if (outcome.reconciliation.documentChanged) {
+      broadcastChange(options, {
+        projectId: input.projectId,
+        canvasId: input.canvasId,
+        revision: outcome.reconciliation.snapshot.document.revision,
+        cause: 'graph',
+      })
+    }
+    if (!outcome.ok) throw outcome.error
+    const document = outcome.value
     if (document.revision > input.expectedRevision) {
       broadcastChange(options, {
         projectId: input.projectId,
@@ -273,10 +295,31 @@ export function registerCanvasDocumentIpcHandlers(
     const input = parseCreateAgentNodeInput(value)
     requireWritableProject(input.projectId, options)
     /** 创建服务内部不加锁，整个事务只持有这一份 workspace write lease。 */
-    const result = options.guard.runWorkspaceWrite(
+    const outcome = options.guard.runWorkspaceWrite(
       input.projectId,
-      () => options.creation.create(input),
+      (): ReconciledOperationOutcome<ReturnType<CanvasAgentNodeCreationService['create']>> => {
+        const reconciliation = options.creation.reconcile({
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+        })
+        try {
+          return { ok: true, value: options.creation.create(input), reconciliation }
+        } catch (error) {
+          /** 默认模型或新请求失败不能撤销已经提交的历史 intent 对账。 */
+          return { ok: false, error, reconciliation }
+        }
+      },
     )
+    if (outcome.reconciliation.documentChanged) {
+      broadcastChange(options, {
+        projectId: input.projectId,
+        canvasId: input.canvasId,
+        revision: outcome.reconciliation.snapshot.document.revision,
+        cause: 'graph',
+      })
+    }
+    if (!outcome.ok) throw outcome.error
+    const result = outcome.value
     if (result.documentChanged) {
       broadcastChange(options, {
         projectId: input.projectId,

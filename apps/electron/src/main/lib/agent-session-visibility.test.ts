@@ -96,6 +96,31 @@ describe('Agent 内部 Canvas 会话归属与可见性', () => {
     expect(isAgentSessionUserVisible(mixed)).toBe(false)
   })
 
+  test.each([
+    ['Automation 来源', { sourceAutomationId: 'automation-1' }],
+    ['完整 Delegation 来源', {
+      parentSessionId: 'parent-1',
+      rootSessionId: 'root-1',
+      sourceDelegationId: 'delegation-1',
+      delegationRole: 'explore' as const,
+      delegationStatus: 'running' as const,
+      delegationDepth: 1,
+      delegationGoal: '分析项目',
+    }],
+    ['半 Delegation 来源', { sourceDelegationId: 'delegation-1' }],
+  ])('Given Canvas 会话混入%s When 判断归属 Then 拒绝非独占所有权', (_label, contamination) => {
+    const mixed = {
+      workspaceId: 'project-1',
+      sourceCanvasProjectId: 'project-1',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+      ...contamination,
+    }
+
+    expect(hasValidCanvasAgentOwnership(mixed)).toBe(false)
+    expect(isAgentSessionUserVisible(mixed)).toBe(false)
+  })
+
   test('Given 普通会话 When 判断 Canvas 归属与可见性 Then 保持普通会话行为', () => {
     expect(hasValidCanvasAgentOwnership({ workspaceId: 'project-1' })).toBe(false)
     expect(isAgentSessionUserVisible({ workspaceId: 'project-1' })).toBe(true)

@@ -3,11 +3,9 @@ import {
   constants,
   fstatSync,
   lstatSync,
-  mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
-  realpathSync,
 } from 'node:fs'
 import type { Stats } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
@@ -25,9 +23,10 @@ import type {
 import { writeJsonFileAtomicSecure } from '../safe-file'
 import type { SecureAtomicJsonWriteOptions } from '../safe-file'
 import type { CreateAgentSessionWithMetadataInput } from '../agent-session-manager'
+import { hasValidCanvasAgentOwnership } from '../agent-session-visibility'
 import type { CanvasDocumentStore } from './canvas-document-store'
-import { designPathResolver, isSafeDesignStableId } from './design-paths'
-import type { CanvasPaths, DesignPathResolver } from './design-paths'
+import type { CanvasTrustedDirectoryCapability } from './canvas-document-store'
+import { isSafeDesignStableId } from './design-paths'
 
 /** 单个 Canvas 最多保留的 Agent 创建事务，阻断无界目录扫描。 */
 const MAX_AGENT_NODE_INTENTS = 512
@@ -87,8 +86,7 @@ interface CanvasAgentDefaultSettings {
 
 /** 创建服务的可替换边界，生产依赖均由主进程显式注入。 */
 export interface CanvasAgentNodeCreationDependencies {
-  pathResolver?: DesignPathResolver
-  store: Pick<CanvasDocumentStore, 'load' | 'mutate'>
+  store: Pick<CanvasDocumentStore, 'loadWithDirectoryCapability' | 'mutate'>
   getSettings: () => CanvasAgentDefaultSettings
   assertModelAvailable: (channelId: string, modelId?: string) => void
   getSession: (sessionId: string) => AgentSessionMeta | undefined
@@ -100,14 +98,6 @@ export interface CanvasAgentNodeCreationDependencies {
     intent: CanvasAgentNodeCreationIntent,
     options?: SecureAtomicJsonWriteOptions,
   ) => unknown
-}
-
-/** transactions 目录身份，写入 rename 前必须保持不变。 */
-interface TransactionsDirectoryIdentity {
-  path: string
-  canonicalPath: string
-  dev: number
-  ino: number
 }
 
 /** 判断未知值是否为无自定义原型的 JSON 对象。 */
@@ -210,49 +200,18 @@ function parseIntent(
   return value as unknown as CanvasAgentNodeCreationIntent
 }
 
-/** 比较目录当前身份与读取/写入开始时是否一致。 */
-function assertTransactionsDirectory(identity: TransactionsDirectoryIdentity): void {
-  const stats = lstatSync(identity.path)
-  if (stats.isSymbolicLink()
-    || !stats.isDirectory()
-    || stats.dev !== identity.dev
-    || stats.ino !== identity.ino
-    || realpathSync(identity.path) !== identity.canonicalPath) {
-    throw new Error('Canvas Agent transactions 目录身份已变化')
-  }
-}
-
-/** 创建并绑定当前 Canvas 的 transactions 目录身份。 */
-function ensureTransactionsDirectory(paths: CanvasPaths): TransactionsDirectoryIdentity {
-  mkdirSync(paths.transactionsDir, { recursive: true })
-  const stats = lstatSync(paths.transactionsDir)
-  if (stats.isSymbolicLink() || !stats.isDirectory()) {
-    throw new Error('Canvas Agent transactions 路径不安全')
-  }
-  /** canonical 父目录必须仍是当前 Canvas 根，阻断 resolver 越界。 */
-  const canonicalPath = realpathSync(paths.transactionsDir)
-  if (dirname(canonicalPath) !== realpathSync(paths.canvasRoot)) {
-    throw new Error('Canvas Agent transactions 路径越界')
-  }
-  return {
-    path: paths.transactionsDir,
-    canonicalPath,
-    dev: stats.dev,
-    ino: stats.ino,
-  }
-}
-
 /** 从同一 no-follow fd 读取有限 intent，并复核路径和目录身份。 */
 function readIntentFile(
   filePath: string,
   target: CanvasTarget,
   operationId: string,
-  directoryIdentity: TransactionsDirectoryIdentity,
+  directoryIdentity: CanvasTrustedDirectoryCapability,
 ): CanvasAgentNodeCreationIntent {
   /** O_NOFOLLOW 在不支持的平台退化为 0，随后 lstat 仍拒绝链接。 */
   const noFollow = constants.O_NOFOLLOW ?? 0
   let descriptor: number | null = null
   try {
+    directoryIdentity.assertValid()
     const pathStats = lstatSync(filePath)
     if (pathStats.isSymbolicLink() || !pathStats.isFile()) {
       throw new Error('Canvas Agent 创建事务损坏：文件类型无效')
@@ -269,7 +228,7 @@ function readIntentFile(
     if (!isSameFile(initialStats, finalStats) || !isSameFile(initialStats, finalPathStats)) {
       throw new Error('Canvas Agent 创建事务损坏：读取期间文件变化')
     }
-    assertTransactionsDirectory(directoryIdentity)
+    directoryIdentity.assertValid()
     try {
       return parseIntent(JSON.parse(raw) as unknown, target, operationId)
     } catch (error) {
@@ -294,6 +253,7 @@ function assertSessionMatchesIntent(
   intent: CanvasAgentNodeCreationIntent,
 ): asserts session is AgentSessionMeta {
   if (!session
+    || !hasValidCanvasAgentOwnership(session)
     || session.id !== intent.sessionId
     || session.title !== intent.title
     || session.channelId !== intent.channelId
@@ -322,13 +282,11 @@ function assertNodeMatchesIntent(
 
 /** 在调用方已持有 workspace write lease 时执行事务对账和创建。 */
 export class CanvasAgentNodeCreationService {
-  private readonly pathResolver: DesignPathResolver
   private readonly now: () => number
   private readonly randomUUID: () => string
   private readonly writeIntentFile: NonNullable<CanvasAgentNodeCreationDependencies['writeIntent']>
 
   constructor(private readonly dependencies: CanvasAgentNodeCreationDependencies) {
-    this.pathResolver = dependencies.pathResolver ?? designPathResolver
     this.now = dependencies.now ?? Date.now
     this.randomUUID = dependencies.randomUUID ?? createRandomUUID
     this.writeIntentFile = dependencies.writeIntent ?? writeJsonFileAtomicSecure
@@ -337,10 +295,10 @@ export class CanvasAgentNodeCreationService {
   /** 只扫描目标 Canvas 的有限 transactions 目录。 */
   private readIntents(
     target: CanvasTarget,
-    paths: CanvasPaths,
-    directoryIdentity: TransactionsDirectoryIdentity,
+    directoryIdentity: CanvasTrustedDirectoryCapability,
   ): CanvasAgentNodeCreationIntent[] {
-    const entries = readdirSync(paths.transactionsDir, { withFileTypes: true })
+    directoryIdentity.assertValid()
+    const entries = readdirSync(directoryIdentity.path, { withFileTypes: true })
     if (entries.length > MAX_AGENT_NODE_INTENTS) {
       throw new Error('Canvas Agent 创建事务过多，已停止对账')
     }
@@ -361,25 +319,27 @@ export class CanvasAgentNodeCreationService {
         throw new Error('Canvas Agent 创建事务损坏：文件名无效')
       }
       intents.push(readIntentFile(
-        join(paths.transactionsDir, entry.name), target, operationId, directoryIdentity,
+        join(directoryIdentity.path, entry.name), target, operationId, directoryIdentity,
       ))
     }
+    directoryIdentity.assertValid()
     return intents
   }
 
   /** 使用 safe-file 写入下一阶段，并在 rename 前复验 transactions 目录。 */
   private writeIntent(
-    paths: CanvasPaths,
-    identity: TransactionsDirectoryIdentity,
+    identity: CanvasTrustedDirectoryCapability,
     intent: CanvasAgentNodeCreationIntent,
   ): void {
-    const filePath = join(paths.transactionsDir, `agent-node-${intent.operationId}.json`)
-    if (dirname(filePath) !== paths.transactionsDir
+    const filePath = join(identity.path, `agent-node-${intent.operationId}.json`)
+    if (dirname(filePath) !== identity.path
       || basename(filePath) !== `agent-node-${intent.operationId}.json`) {
       throw new Error('Canvas Agent intent 路径无效')
     }
+    /** safe-file 创建 staging 前先复验三层目录，避免外部目录出现临时写入。 */
+    identity.assertValid()
     this.writeIntentFile(filePath, intent, {
-      beforeRename: () => assertTransactionsDirectory(identity),
+      beforeRename: identity.assertValid,
     })
   }
 
@@ -397,8 +357,7 @@ export class CanvasAgentNodeCreationService {
   private advanceIntent(
     originalIntent: CanvasAgentNodeCreationIntent,
     initialDocument: CanvasDocument,
-    paths: CanvasPaths,
-    identity: TransactionsDirectoryIdentity,
+    identity: CanvasTrustedDirectoryCapability,
   ): { intent: CanvasAgentNodeCreationIntent; document: CanvasDocument; documentChanged: boolean } {
     let intent = originalIntent
     let document = initialDocument
@@ -423,7 +382,7 @@ export class CanvasAgentNodeCreationService {
         assertSessionMatchesIntent(session, intent)
       }
       intent = this.transitionIntent(intent, 'session-created')
-      this.writeIntent(paths, identity, intent)
+      this.writeIntent(identity, intent)
     }
 
     if (intent.state === 'session-created') {
@@ -449,29 +408,31 @@ export class CanvasAgentNodeCreationService {
       }
       /** committed 是唯一发布屏障；写失败时调用方不得广播或返回 document。 */
       intent = this.transitionIntent(intent, 'committed')
-      this.writeIntent(paths, identity, intent)
+      this.writeIntent(identity, intent)
     }
     return { intent, document, documentChanged }
   }
 
-  /** 惰性对账目标 Canvas，调用方必须已持有唯一 workspace write lease。 */
-  reconcile(target: CanvasTarget): CanvasAgentNodeReconciliationResult {
+  /** 在同一次 Store LOAD capability 上完成目标 Canvas 对账。 */
+  private reconcileWithDirectory(target: CanvasTarget): CanvasAgentNodeReconciliationResult & {
+    directory: CanvasTrustedDirectoryCapability
+  } {
     if (!isSafeDesignStableId(target.projectId)
       || target.projectId.length > MAX_CANVAS_STABLE_ID_LENGTH
       || !isSafeDesignStableId(target.canvasId)
       || target.canvasId.length > MAX_CANVAS_STABLE_ID_LENGTH) {
       throw new Error('Canvas 项目或会话 ID 非法')
     }
-    const snapshot = this.dependencies.store.load(target)
-    const paths = this.pathResolver.resolveCanvas(target.projectId, target.canvasId)
-    const identity = ensureTransactionsDirectory(paths)
+    const loaded = this.dependencies.store.loadWithDirectoryCapability(target)
+    const snapshot = loaded.snapshot
+    const identity = loaded.openSingleChildDirectory('transactions')
     let document = snapshot.document
     let documentChanged = false
 
-    for (const originalIntent of this.readIntents(target, paths, identity)) {
+    for (const originalIntent of this.readIntents(target, identity)) {
       let intent = originalIntent
       if (intent.state === 'prepared' || intent.state === 'session-created') {
-        const advanced = this.advanceIntent(intent, document, paths, identity)
+        const advanced = this.advanceIntent(intent, document, identity)
         intent = advanced.intent
         document = advanced.document
         documentChanged ||= advanced.documentChanged
@@ -481,7 +442,7 @@ export class CanvasAgentNodeCreationService {
         const node = document.nodes.find((candidate) => candidate.id === intent.nodeId)
         if (!node) {
           /** committed 后节点缺失代表用户删除引用，必须永久 detached。 */
-          this.writeIntent(paths, identity, this.transitionIntent(intent, 'detached'))
+          this.writeIntent(identity, this.transitionIntent(intent, 'detached'))
         } else {
           assertNodeMatchesIntent(node, intent)
         }
@@ -490,17 +451,23 @@ export class CanvasAgentNodeCreationService {
     return {
       snapshot: { ...snapshot, document },
       documentChanged,
+      directory: identity,
     }
+  }
+
+  /** 惰性对账目标 Canvas，调用方必须已持有唯一 workspace write lease。 */
+  reconcile(target: CanvasTarget): CanvasAgentNodeReconciliationResult {
+    const { directory: _directory, ...result } = this.reconcileWithDirectory(target)
+    return result
   }
 
   /** 首次准备或幂等重放单次用户创建 operation。 */
   create(input: CreateCanvasAgentNodeInput): CanvasAgentNodeCreationServiceResult {
     assertCreateCanvasAgentNodeInput(input)
     const target = { projectId: input.projectId, canvasId: input.canvasId }
-    const reconciled = this.reconcile(target)
-    const paths = this.pathResolver.resolveCanvas(input.projectId, input.canvasId)
-    const identity = ensureTransactionsDirectory(paths)
-    const intents = this.readIntents(target, paths, identity)
+    const reconciled = this.reconcileWithDirectory(target)
+    const identity = reconciled.directory
+    const intents = this.readIntents(target, identity)
     const existing = intents.find((intent) => intent.operationId === input.operationId)
     if (existing) {
       if (existing.nodeId !== input.nodeId
@@ -545,8 +512,8 @@ export class CanvasAgentNodeCreationService {
       createdAt,
       updatedAt: createdAt,
     }
-    this.writeIntent(paths, identity, prepared)
-    const advanced = this.advanceIntent(prepared, reconciled.snapshot.document, paths, identity)
+    this.writeIntent(identity, prepared)
+    const advanced = this.advanceIntent(prepared, reconciled.snapshot.document, identity)
     const session = this.dependencies.getSession(advanced.intent.sessionId)
     assertSessionMatchesIntent(session, advanced.intent)
     return {

@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createEmptyCanvasDocument } from '@proma/shared'
@@ -8,6 +16,7 @@ import {
   CanvasAgentNodeCreationService,
   type CanvasAgentNodeCreationIntent,
 } from './canvas-agent-node-creation'
+import { createCanvasDocumentStore } from './canvas-document-store'
 
 const OPERATION_ID = '11111111-1111-4111-8111-111111111111'
 const SESSION_ID = '22222222-2222-4222-8222-222222222222'
@@ -18,6 +27,9 @@ function createHarness(options: {
   canvasId?: string
   failIntentState?: CanvasAgentNodeCreationIntent['state']
   failCreateSession?: boolean
+  afterLoad?: (paths: { canvasRoot: string; transactionsDir: string }) => void
+  beforeGetSettings?: (paths: { canvasRoot: string; transactionsDir: string }) => void
+  onWriteIntentCall?: () => void
 } = {}) {
   /** 测试目标的双重身份。 */
   const target: CanvasTarget = {
@@ -26,6 +38,26 @@ function createHarness(options: {
   }
   /** 每个夹具独占的 Canvas 正式根。 */
   const root = mkdtempSync(join(tmpdir(), 'proma-canvas-agent-create-'))
+  /** 真实目录用于覆盖父目录置换竞态，创建服务不得自行递归越界。 */
+  const canvasRoot = join(root, 'canvases', target.canvasId)
+  const transactionsDir = join(canvasRoot, 'transactions')
+  mkdirSync(canvasRoot, { recursive: true })
+  /** 真实 Store 只负责提供与 LOAD 同源的目录 capability，文档 mutation 仍由内存夹具控制。 */
+  const pathResolver = {
+    resolve: () => ({ canvasesRoot: join(root, 'canvases') }) as never,
+    resolveCanvas: (projectId: string, canvasId: string) => ({
+      projectId,
+      canvasId,
+      canvasRoot: join(root, 'canvases', canvasId),
+      documentPath: join(root, 'canvases', canvasId, 'canvas.json'),
+      transactionsDir: join(root, 'canvases', canvasId, 'transactions'),
+    }) as never,
+  }
+  const directoryStore = createCanvasDocumentStore({
+    sessions: { requireNative: () => ({}) as never },
+    pathResolver,
+    now: () => 1,
+  })
   /** 内存权威文档模拟 Canvas Store 的 revision 行为。 */
   let document = createEmptyCanvasDocument(target.projectId, target.canvasId, 1)
   /** 当前 Agent 默认值，测试可在 prepared 后切换。 */
@@ -41,18 +73,15 @@ function createHarness(options: {
 
   /** 生成使用当前依赖的新服务，模拟主进程重启。 */
   const createService = (): CanvasAgentNodeCreationService => new CanvasAgentNodeCreationService({
-    pathResolver: {
-      resolve: () => ({ canvasesRoot: join(root, 'canvases') }) as never,
-      resolveCanvas: (projectId, canvasId) => ({
-        projectId,
-        canvasId,
-        canvasRoot: join(root, 'canvases', canvasId),
-        documentPath: join(root, 'canvases', canvasId, 'canvas.json'),
-        transactionsDir: join(root, 'canvases', canvasId, 'transactions'),
-      }) as never,
-    },
     store: {
-      load: () => ({ document: structuredClone(document), writable: true }),
+      loadWithDirectoryCapability: (loadTarget) => {
+        const loaded = directoryStore.loadWithDirectoryCapability(loadTarget)
+        options.afterLoad?.({ canvasRoot, transactionsDir })
+        return {
+          ...loaded,
+          snapshot: { document: structuredClone(document), writable: true as const },
+        }
+      },
       mutate: (_target, expectedRevision, mutations) => {
         expect(expectedRevision).toBe(document.revision)
         const upsert = mutations[0]
@@ -65,7 +94,10 @@ function createHarness(options: {
         return structuredClone(document)
       },
     },
-    getSettings: () => settings,
+    getSettings: () => {
+      options.beforeGetSettings?.({ canvasRoot, transactionsDir })
+      return settings
+    },
     assertModelAvailable: (channelId, modelId) => {
       if (channelId === 'channel-disabled' || modelId === 'model-disabled') {
         throw new Error('Canvas Agent 渠道或模型不可用')
@@ -93,6 +125,7 @@ function createHarness(options: {
     now: () => 10,
     randomUUID: () => SESSION_ID,
     writeIntent: (filePath, intent, writeOptions) => {
+      options.onWriteIntentCall?.()
       if (failedState === intent.state) throw new Error(`模拟 ${intent.state} intent 写失败`)
       const { writeJsonFileAtomicSecure } = require('../safe-file') as typeof import('../safe-file')
       writeJsonFileAtomicSecure(filePath, intent, writeOptions)
@@ -109,8 +142,10 @@ function createHarness(options: {
     setSettings: (next: typeof settings) => { settings = next },
     setFailedState: (state?: CanvasAgentNodeCreationIntent['state']) => { failedState = state },
     setFailCreateSession: (value: boolean) => { failCreateSession = value },
-    intentPath: join(root, 'canvases', target.canvasId, 'transactions', `agent-node-${OPERATION_ID}.json`),
-    transactionsDir: join(root, 'canvases', target.canvasId, 'transactions'),
+    root,
+    canvasRoot,
+    intentPath: join(transactionsDir, `agent-node-${OPERATION_ID}.json`),
+    transactionsDir,
   }
 }
 
@@ -204,6 +239,40 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(harness.getDocument().nodes).toEqual([])
   })
 
+  test.each([
+    ['Automation', { sourceAutomationId: 'automation-1' }],
+    ['完整 Delegation', {
+      parentSessionId: 'parent-1',
+      rootSessionId: 'root-1',
+      sourceDelegationId: 'delegation-1',
+      delegationRole: 'explore' as const,
+      delegationStatus: 'running' as const,
+      delegationDepth: 1,
+      delegationGoal: '分析项目',
+    }],
+    ['半 Delegation', { sourceDelegationId: 'delegation-1' }],
+  ])('Given prepared session 混入%s 来源 When 恢复 Then fail closed 且不写节点', (_label, contamination) => {
+    const harness = createHarness({ failCreateSession: true })
+    expect(() => harness.createService().create(createInput(harness.target))).toThrow()
+    harness.setFailCreateSession(false)
+    harness.sessions.set(SESSION_ID, {
+      id: SESSION_ID,
+      title: '首页设计 Agent',
+      channelId: 'channel-old',
+      modelId: 'model-old',
+      workspaceId: 'project-1',
+      sourceCanvasProjectId: 'project-1',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+      ...contamination,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+
+    expect(() => harness.createService().reconcile(harness.target)).toThrow('归属损坏')
+    expect(harness.getDocument().nodes).toEqual([])
+  })
+
   test('Given 某 Canvas intent 损坏 When 对账其它 Canvas Then 只阻断所属 Canvas', () => {
     const broken = createHarness({ canvasId: 'canvas-broken' })
     expect(() => broken.createService().create(createInput(broken.target))).not.toThrow()
@@ -229,5 +298,43 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(() => harness.createService().create(createInput(harness.target)))
       .toThrow('Canvas Agent 渠道或模型不可用')
     expect(harness.createdInputs).toHaveLength(0)
+  })
+
+  test('Given Store LOAD 后 Canvas 根被替换为外部 symlink When 打开 transactions Then fail closed 且外部零写入', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'proma-canvas-agent-outside-'))
+    let replaced = false
+    const harness = createHarness({
+      afterLoad: ({ canvasRoot }) => {
+        if (replaced) return
+        replaced = true
+        renameSync(canvasRoot, `${canvasRoot}.original`)
+        symlinkSync(outside, canvasRoot, 'dir')
+      },
+    })
+
+    expect(() => harness.createService().reconcile(harness.target)).toThrow('CANVAS_PATH_UNSAFE')
+    expect(readdirSync(outside)).toEqual([])
+  })
+
+  test('Given transactions 已捕获后父 Canvas 根被置换 When 写 prepared Then 写边界前 fail closed 且外部零写入', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'proma-canvas-agent-outside-'))
+    const outsideTransactions = join(outside, 'transactions')
+    mkdirSync(outsideTransactions)
+    let writeCalls = 0
+    let replaced = false
+    const harness = createHarness({
+      beforeGetSettings: ({ canvasRoot }) => {
+        if (replaced) return
+        replaced = true
+        renameSync(canvasRoot, `${canvasRoot}.original`)
+        symlinkSync(outside, canvasRoot, 'dir')
+      },
+      onWriteIntentCall: () => { writeCalls += 1 },
+    })
+
+    expect(() => harness.createService().create(createInput(harness.target)))
+      .toThrow('CANVAS_PATH_UNSAFE')
+    expect(writeCalls).toBe(0)
+    expect(readdirSync(outsideTransactions)).toEqual([])
   })
 })

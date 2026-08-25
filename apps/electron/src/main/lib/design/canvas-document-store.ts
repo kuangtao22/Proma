@@ -9,7 +9,7 @@ import {
   realpathSync,
 } from 'node:fs'
 import type { Stats } from 'node:fs'
-import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   applyCanvasMutations,
   CANVAS_DOCUMENT_VERSION,
@@ -47,6 +47,8 @@ const CANVAS_NODE_TITLE_MAX_LENGTH = 120
 export interface CanvasDocumentStore {
   /** 加载文档并在必要时提升安全恢复候选。 */
   load: (target: CanvasTarget) => CanvasWorkspaceSnapshot
+  /** 加载文档并返回绑定同一次授权目录身份的子目录 capability。 */
+  loadWithDirectoryCapability: (target: CanvasTarget) => CanvasDocumentDirectoryCapability
   /** 要求当前文档无需恢复即可作为副作用基线。 */
   requireStableAuthoritativeDocument: (target: CanvasTarget) => CanvasDocument
   /** 在权威 revision 上应用并提交一批 mutation。 */
@@ -56,6 +58,21 @@ export interface CanvasDocumentStore {
     mutations: CanvasMutation[],
     validateCurrent?: (document: CanvasDocument) => void,
   ) => CanvasDocument
+}
+
+/** 已绑定目录链身份的可信单目录 capability。 */
+export interface CanvasTrustedDirectoryCapability {
+  /** 仅供主进程内部拼接已验证单段文件名的目录路径。 */
+  readonly path: string
+  /** 复验 canvasesRoot、canvasRoot 与当前目录的完整身份链。 */
+  assertValid: () => void
+}
+
+/** Canvas LOAD 与同一目录授权事实的组合，不向 Renderer 暴露。 */
+export interface CanvasDocumentDirectoryCapability {
+  snapshot: CanvasWorkspaceSnapshot
+  /** 只在已固定 canvasRoot 下创建或打开一个安全单级子目录。 */
+  openSingleChildDirectory: (name: string) => CanvasTrustedDirectoryCapability
 }
 
 /** safe-file 安全原子写所需的最小回调合同。 */
@@ -111,6 +128,12 @@ interface CanvasDirectoryIdentity {
   canonicalPath: string
   dev: number
   ino: number
+}
+
+/** 同一次授权捕获的 Canvas 集合根与具体 Canvas 根身份。 */
+interface CanvasDirectoryScopeIdentity {
+  canvasesRoot: CanvasDirectoryIdentity
+  canvasRoot: CanvasDirectoryIdentity
 }
 
 /** lstat/fstat 两类 Node stats 共同提供的内容状态字段。 */
@@ -470,6 +493,18 @@ function assertDirectoryIdentity(identity: CanvasDirectoryIdentity): void {
   }
 }
 
+/** 复验 Canvas 集合根和具体 Canvas 根仍保持原始父子身份。 */
+function assertCanvasDirectoryScope(identity: CanvasDirectoryScopeIdentity): void {
+  assertDirectoryIdentity(identity.canvasesRoot)
+  assertDirectoryIdentity(identity.canvasRoot)
+  if (dirname(identity.canvasRoot.path) !== identity.canvasesRoot.path
+    || dirname(identity.canvasRoot.canonicalPath) !== identity.canvasesRoot.canonicalPath) {
+    throw unsafeCanvasPath('Canvas 根不再属于已授权集合根')
+  }
+  /** 再次复验上层，缩短检查具体 Canvas 时的父目录竞态窗口。 */
+  assertDirectoryIdentity(identity.canvasesRoot)
+}
+
 /** 从 lstat/fstat 提取读取期间必须保持稳定的内容状态。 */
 function toCanvasFileState(stats: CanvasFileStat): AtomicFileState {
   return {
@@ -496,7 +531,7 @@ function isSameFileState(left: AtomicFileState, right: AtomicFileState): boolean
  * @param canvasesRoot resolve(projectId) 产生的可信 Canvas 集合根。
  * @returns 已复验的 canvasRoot 目录身份。
  */
-function ensureCanvasDirectory(paths: CanvasPaths, canvasesRoot: string): CanvasDirectoryIdentity {
+function ensureCanvasDirectory(paths: CanvasPaths, canvasesRoot: string): CanvasDirectoryScopeIdentity {
   if (!isAbsolute(canvasesRoot)
     || !isAbsolute(paths.canvasRoot)
     || !isAbsolute(paths.documentPath)
@@ -519,8 +554,9 @@ function ensureCanvasDirectory(paths: CanvasPaths, canvasesRoot: string): Canvas
   }
   /** 单级 Canvas 目录必须保持在集合根的物理路径之下。 */
   const canvasIdentity = captureDirectoryIdentity(paths.canvasRoot, rootIdentity.canonicalPath)
-  assertDirectoryIdentity(rootIdentity)
-  return canvasIdentity
+  const identity = { canvasesRoot: rootIdentity, canvasRoot: canvasIdentity }
+  assertCanvasDirectoryScope(identity)
+  return identity
 }
 
 /** 使用 no-follow 稳定句柄读取单个 Canvas 文档候选。 */
@@ -691,7 +727,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
   /** 在安全写 rename 前复验固定父目录和路径身份。 */
   function writeCanvasJsonSecure(
     paths: CanvasPaths,
-    directoryIdentity: CanvasDirectoryIdentity,
+    directoryIdentity: CanvasDirectoryScopeIdentity,
     filePath: string,
     document: CanvasDocument,
     writeOptions: Pick<CanvasSecureWriteOptions, 'expectedDestination' | 'priorBackup'> = {},
@@ -701,14 +737,14 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     }
     writeJson(filePath, document, {
       ...writeOptions,
-      beforeRename: () => assertDirectoryIdentity(directoryIdentity),
+      beforeRename: () => assertCanvasDirectoryScope(directoryIdentity),
     })
   }
 
   /** 在已授权边界内解析并复验当前 native 文档路径。 */
   function resolveTargetPaths(target: CanvasTarget): {
     paths: CanvasPaths
-    directoryIdentity: CanvasDirectoryIdentity
+    directoryIdentity: CanvasDirectoryScopeIdentity
   } {
     /** 路径每次重新解析，适配项目根迁移且不缓存旧位置。 */
     const projectPaths = pathResolver.resolve(target.projectId)
@@ -725,7 +761,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
   /** 先完成 registry 授权，再解析并复验任何 native 文档路径。 */
   function resolveAuthorizedTarget(target: CanvasTarget): {
     paths: CanvasPaths
-    directoryIdentity: CanvasDirectoryIdentity
+    directoryIdentity: CanvasDirectoryScopeIdentity
   } {
     options.sessions.requireNative(target.projectId, target.canvasId)
     /** requireNative 成功后才能触达项目与 Canvas 文档路径解析。 */
@@ -736,6 +772,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
   function loadWithAuthoritativeState(target: CanvasTarget): {
     snapshot: CanvasWorkspaceSnapshot
     primaryExpectation: AtomicDestinationExpectation
+    authorized: ReturnType<typeof resolveAuthorizedTarget>
   } {
     /** 授权和路径复验是任何文档候选访问的先决条件。 */
     const authorized = resolveAuthorizedTarget(target)
@@ -743,7 +780,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     const readResult = readCanvasDocument(
       authorized.paths,
       target,
-      authorized.directoryIdentity,
+      authorized.directoryIdentity.canvasRoot,
       validateDocument,
       options.afterCandidateRead,
     )
@@ -790,7 +827,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
             ino: readResult.recoveredState.ino,
           },
         })
-        assertDirectoryIdentity(authorized.directoryIdentity)
+        assertCanvasDirectoryScope(authorized.directoryIdentity)
       }
     }
     return {
@@ -801,12 +838,53 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
         ...(readResult.recoveredFrom ? { recoveredFrom: readResult.recoveredFrom } : {}),
       },
       primaryExpectation: readResult.primaryExpectation,
+      authorized,
     }
   }
 
   /** 从恢复链加载文档，合法恢复候选会安全提升为主文件。 */
   function load(target: CanvasTarget): CanvasWorkspaceSnapshot {
     return loadWithAuthoritativeState(target).snapshot
+  }
+
+  /** 从同一次 LOAD 授权事实派生单级子目录 capability。 */
+  function loadWithDirectoryCapability(target: CanvasTarget): CanvasDocumentDirectoryCapability {
+    const loaded = loadWithAuthoritativeState(target)
+    const scopeIdentity = loaded.authorized.directoryIdentity
+    return {
+      snapshot: loaded.snapshot,
+      openSingleChildDirectory: (name): CanvasTrustedDirectoryCapability => {
+        if (!isSafeDesignStableId(name)) throw unsafeCanvasPath('Canvas 子目录名非法')
+        const childPath = join(scopeIdentity.canvasRoot.path, name)
+        if (dirname(childPath) !== scopeIdentity.canvasRoot.path || basename(childPath) !== name) {
+          throw unsafeCanvasPath('Canvas 子目录不满足单级合同')
+        }
+        /** 创建前先复验两级父目录，禁止跟随 LOAD 后置换的 canvasRoot。 */
+        assertCanvasDirectoryScope(scopeIdentity)
+        if (lstatOrNull(childPath) === null) {
+          try {
+            mkdirSync(childPath)
+          } catch (error) {
+            if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
+          }
+        }
+        const childIdentity = captureDirectoryIdentity(
+          childPath,
+          scopeIdentity.canvasRoot.canonicalPath,
+        )
+        if (dirname(childIdentity.canonicalPath) !== scopeIdentity.canvasRoot.canonicalPath) {
+          throw unsafeCanvasPath('Canvas 子目录逃逸具体 Canvas 根')
+        }
+        /** capability 每次使用都复验三层 dev/ino/canonical 身份。 */
+        const assertValid = (): void => {
+          assertCanvasDirectoryScope(scopeIdentity)
+          assertDirectoryIdentity(childIdentity)
+          assertCanvasDirectoryScope(scopeIdentity)
+        }
+        assertValid()
+        return { path: childPath, assertValid }
+      },
+    }
   }
 
   /** 加载可用于副作用的稳定权威文档，恢复首次调用必须由上层重载确认。 */
@@ -897,5 +975,5 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     return next
   }
 
-  return { load, requireStableAuthoritativeDocument, mutate }
+  return { load, loadWithDirectoryCapability, requireStableAuthoritativeDocument, mutate }
 }

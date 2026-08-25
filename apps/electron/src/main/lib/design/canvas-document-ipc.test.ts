@@ -53,6 +53,10 @@ function createContext(options: {
   mutateError?: Error
   reconcileError?: Error
   createError?: Error
+  reconcileResult?: {
+    snapshot: { document: CanvasDocument; writable: true }
+    documentChanged: boolean
+  }
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -96,7 +100,7 @@ function createContext(options: {
         calls.push('creation:reconcile')
         storeInputs.push(target)
         if (options.reconcileError ?? options.loadError) throw options.reconcileError ?? options.loadError
-        return {
+        return options.reconcileResult ?? {
           snapshot: options.loadResult ?? { document: createDocument(4), writable: true },
           documentChanged: false,
         }
@@ -281,9 +285,11 @@ describe('原生 Canvas 文档 IPC', () => {
       context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, input,
     ) as Record<string, unknown>
 
-    expect(context.calls).toEqual(['readonly:project-1', 'guard:project-1', 'creation:create'])
-    expect(context.storeInputs[0]).toEqual(input)
-    expect(context.storeInputs[0]).not.toBe(input)
+    expect(context.calls).toEqual([
+      'readonly:project-1', 'guard:project-1', 'creation:reconcile', 'creation:create',
+    ])
+    expect(context.storeInputs[1]).toEqual(input)
+    expect(context.storeInputs[1]).not.toBe(input)
     expect(result).not.toHaveProperty('documentChanged')
     expect(result).toHaveProperty('session.id', '22222222-2222-4222-8222-222222222222')
     expect(context.sender.sent).toEqual([{
@@ -307,6 +313,46 @@ describe('原生 Canvas 文档 IPC', () => {
       },
     )).rejects.toBe(error)
     expect(context.sender.sent).toEqual([])
+  })
+
+  test('Given SAVE 对账已提交图变更 When 后续 revision conflict Then 广播对账 revision 并原样抛错', async () => {
+    const error = new Error('CANVAS_REVISION_CONFLICT: expected=4, current=5')
+    const context = createContext({
+      reconcileResult: {
+        snapshot: { document: createDocument(5), writable: true },
+        documentChanged: true,
+      },
+      mutateError: error,
+    })
+
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4, mutations: [],
+    })).rejects.toBe(error)
+    expect(context.sender.sent).toEqual([{
+      channel: CANVAS_IPC_CHANNELS.CHANGED,
+      value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
+    }])
+  })
+
+  test('Given CREATE 对账已提交图变更 When 新请求默认模型失败 Then 广播对账 revision 并原样抛错', async () => {
+    const error = new Error('Canvas Agent 需要先配置默认渠道')
+    const context = createContext({
+      reconcileResult: {
+        snapshot: { document: createDocument(6), writable: true },
+        documentChanged: true,
+      },
+      createError: error,
+    })
+
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
+    })).rejects.toBe(error)
+    expect(context.sender.sent).toEqual([{
+      channel: CANVAS_IPC_CHANNELS.CHANGED,
+      value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph' },
+    }])
   })
 
   test('Given guard 或 Store 原样失败 When LOAD/SAVE Then 不广播', async () => {

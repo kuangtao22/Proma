@@ -83,7 +83,11 @@ function writeAgentSessionJsonl(sessionId: string, rows: string[]): void {
 function writeAgentSessionsIndex(sessions: Array<{
   id: string
   title: string
+  channelId?: string
+  modelId?: string
   workspaceId: string
+  agentCwdMode?: 'project' | 'session'
+  sessionWorkbenchLayout?: 'root' | 'legacy-context'
   createdAt: number
   updatedAt: number
   agentRuntime?: string
@@ -101,6 +105,15 @@ function writeAgentSessionsIndex(sessions: Array<{
   sourceCanvasProjectId?: string
   sourceCanvasId?: string
   sourceCanvasNodeId?: string
+  sourceAutomationId?: string
+  automationGraduated?: boolean
+  parentSessionId?: string
+  rootSessionId?: string
+  sourceDelegationId?: string
+  delegationRole?: 'explore' | 'research' | 'implement' | 'review' | 'custom'
+  delegationStatus?: 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  delegationDepth?: number
+  delegationGoal?: string
 }>): void {
   const dir = join(tempHome, '.proma')
   mkdirSync(dir, { recursive: true })
@@ -788,6 +801,48 @@ describe('Agent 会话 runtime 元数据', () => {
       sourceCanvasNodeId: 'node-new',
     })).toThrow('预分配会话 ID 已被不同事实占用')
     expect(manager.getAgentSessionMeta(trustedSessionId)?.sourceCanvasNodeId).toBe('node-old')
+  })
+
+  test.each([
+    ['Automation', { sourceAutomationId: 'automation-1' }],
+    ['完整 Delegation', {
+      parentSessionId: 'parent-1',
+      rootSessionId: 'root-1',
+      sourceDelegationId: 'delegation-1',
+      delegationRole: 'explore' as const,
+      delegationStatus: 'running' as const,
+      delegationDepth: 1,
+      delegationGoal: '分析项目',
+    }],
+    ['半 Delegation', { sourceDelegationId: 'delegation-1' }],
+  ])('Given 预分配 ID 已绑定混入%s 的 Canvas 会话 When 幂等重试 Then fail closed', (_label, contamination) => {
+    const trustedSessionId = '22222222-2222-4222-8222-222222222222'
+    writeAgentSessionsIndex([{
+      id: trustedSessionId,
+      title: 'Canvas 节点 Agent',
+      channelId: 'channel-1',
+      modelId: 'model-1',
+      workspaceId: 'workspace-canvas',
+      agentCwdMode: 'project',
+      sessionWorkbenchLayout: 'root',
+      sourceCanvasProjectId: 'workspace-canvas',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+      ...contamination,
+      createdAt: 1,
+      updatedAt: 1,
+    }])
+
+    expect(() => manager.createAgentSessionWithMetadata({
+      trustedSessionId,
+      title: 'Canvas 节点 Agent',
+      channelId: 'channel-1',
+      modelId: 'model-1',
+      workspaceId: 'workspace-canvas',
+      sourceCanvasProjectId: 'workspace-canvas',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    })).toThrow('预分配会话 ID 已被不同事实占用')
   })
 
   test.each([
