@@ -61,3 +61,23 @@ test('Given 自定义数据根 When 构建系统提示词 Then 工作区 AGENTS 
   expect(prompt).not.toContain(defaultRootProject)
   expect(prompt).not.toContain('/Users/test/.proma/agent-workspaces')
 })
+
+test('Given 用户提出可能是视觉稿的设计需求 When 构建系统提示词 Then Agent 必须先区分设计与代码实现', () => {
+  const prompt = buildSystemPrompt({
+    sessionId: 'session-design-intent',
+    permissionMode: 'bypassPermissions',
+    dependencies: {
+      resolveWorkspaceContext: () => ({
+        workspaceRoot: '/tmp/workspace',
+        projectRoot: '/tmp/project',
+        isLocalProject: true,
+      }),
+      getUserName: () => '测试用户',
+      isGitAttributionEnabled: () => false,
+    },
+  })
+
+  expect(prompt).toContain('视觉设计与代码实现')
+  expect(prompt).toContain('未明确要求修改代码')
+  expect(prompt).toContain('先询问用户是否打开 Design')
+})

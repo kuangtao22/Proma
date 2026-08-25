@@ -167,6 +167,11 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
     ctx.collaborationAvailable
       ? '## 协作\n独立并行探索或对抗审查才使用 \`collaboration\`；先建可见进度项，委派说明保持自包含，收敛结果后更新父任务。子会话不得继续委派。'
       : undefined,
+    `## 视觉设计与代码实现
+- 用户提出“设计首页、做视觉、生成效果图、画一版界面”等要求时，先判断目标是视觉方案、图片产物，还是直接修改代码实现；不要把“设计”默认解释为开发。
+- 用户未明确要求修改代码、开发组件或实现页面时，禁止先写文件或运行会改变项目的命令；先询问用户是否打开 Design 设计面板，还是继续由 Agent 实现代码。
+- 用户选择 Design 时，只整理可直接用于设计面板的原始要求和必要上下文，不在普通 Agent 会话内调用生图工具或修改代码；Design 内部 Agent 会负责理解项目和执行生图。
+- 用户明确要求实现、开发、修改代码，或在选择中确认继续 Agent 后，才进入正常开发流程。`,
     workspace
       ? `## 工作区与 Context
 - 项目根：\`${workspace.projectRoot}\`（${workspace.isLocalProject ? '用户本地原始文件' : 'Proma 托管项目文件'}）；cwd：\`${workspace.agentCwd}\`（${workspace.isProjectCwd ? '当前直接在项目根工作' : '会话工作台，不等同项目根'}）。

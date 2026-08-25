@@ -17,7 +17,7 @@ import * as React from 'react'
 import { unstable_batchedUpdates } from 'react-dom'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { CornerDownLeft, Square, Settings, X, Copy, Check, Brain, Sparkles, ListTodo, Paperclip } from 'lucide-react'
+import { CornerDownLeft, Square, Settings, X, Copy, Check, Brain, Sparkles, ListTodo, Paperclip, Palette } from 'lucide-react'
 import { AgentMessages, type AgentHistoryQuoteNavigationRequest } from './AgentMessages'
 import { AgentHeader } from './AgentHeader'
 import { AgentMessageQueue } from './AgentMessageQueue'
@@ -41,7 +41,7 @@ import {
   inputToolbarSendButtonClass,
 } from '@/components/ai-elements/input-toolbar-styles'
 import { Button } from '@/components/ui/button'
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
@@ -110,6 +110,9 @@ import {
 } from '@/atoms/agent-atoms'
 import { settingsOpenAtom } from '@/atoms/settings-tab'
 import { deliverPendingMentionsToComposer } from '@/lib/design-session-actions'
+import { shouldOfferDesignHandoff } from '@/lib/agent-design-intent'
+import { activeViewAtom } from '@/atoms/active-view'
+import { updateDesignProjectStateAtom } from '@/atoms/design-atoms'
 import { longTextPasteAsAttachmentEnabledAtom } from '@/atoms/ui-preferences'
 import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
 import { todoPlanningGroupsAtom } from '@/atoms/planning-atoms'
@@ -147,6 +150,11 @@ function endOfToday(): number {
 
 interface OptimisticSDKUserMessage extends SDKUserMessage {
   _createdAt: number
+}
+
+/** 尚未发送、等待用户选择视觉设计或代码实现的请求。 */
+interface PendingDesignHandoff {
+  prompt: string
 }
 
 interface PreparedAgentAttachment {
@@ -457,6 +465,11 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const [todoSourceText, setTodoSourceText] = React.useState('')
   const [todoGroupId, setTodoGroupId] = React.useState('__none__')
   const [creatingTodo, setCreatingTodo] = React.useState(false)
+  const [pendingDesignHandoff, setPendingDesignHandoff] = React.useState<PendingDesignHandoff | null>(null)
+  /** 用户明确选择继续 Agent 后，仅绕过同一段文本一次。 */
+  const designHandoffBypassPromptRef = React.useRef<string | null>(null)
+  const setActiveView = useSetAtom(activeViewAtom)
+  const updateDesignProjectState = useSetAtom(updateDesignProjectStateAtom)
   React.useEffect(() => window.electronAPI.onPlanningAgentOperation((operation) => {
     if (operation.sessionId !== sessionId) return
     const target = operation.target === 'todo' ? 'Todo' : '日程'
@@ -479,6 +492,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
   const setModelSelectorOpen = useSetAtom(modelSelectorOpenAtom)
   const setDraftSessionIds = useSetAtom(draftSessionIdsAtom)
   const globalWorkspaceId = useAtomValue(currentAgentWorkspaceIdAtom)
+  const setCurrentAgentWorkspaceId = useSetAtom(currentAgentWorkspaceIdAtom)
   // 从会话元数据派生 workspaceId：会话数据已加载时以自身为准，未加载时回退全局 atom
   const currentWorkspaceId = React.useMemo(() => {
     if (!sessionMeta) return globalWorkspaceId // 数据未加载，回退全局
@@ -2014,6 +2028,17 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       })
       return
     }
+    /** 附件和选区可能是实现依据，保持原 Agent 流程；纯文本视觉请求才进入本地选择。 */
+    const bypassDesignHandoff = designHandoffBypassPromptRef.current === effectiveText
+    if (bypassDesignHandoff) designHandoffBypassPromptRef.current = null
+    if (!bypassDesignHandoff
+      && currentWorkspaceId
+      && pendingFilesSnapshot.length === 0
+      && !currentQuotedSelection
+      && shouldOfferDesignHandoff(effectiveText)) {
+      setPendingDesignHandoff({ prompt: effectiveText })
+      return
+    }
     const additionalDirectoriesForRun = createBaseAdditionalDirectories()
 
     if (streaming) {
@@ -2246,7 +2271,40 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         return map
       })
     })
-  }, [createBaseAdditionalDirectories, preparePendingFilesForSend, restoreQueuedAttachmentsToPending, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, consumeQuotedSelection, setStreamingStates, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, setQuotedSelectionMap, sendPlainTextAgentMessage, isLegacyTranscript, isStopping])
+  }, [createBaseAdditionalDirectories, preparePendingFilesForSend, restoreQueuedAttachmentsToPending, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, consumeQuotedSelection, currentQuotedSelection, setStreamingStates, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, setQuotedSelectionMap, sendPlainTextAgentMessage, isLegacyTranscript, isStopping])
+
+  /** 用户明确选择代码实现后，复用原发送链并只绕过一次 Design 判断。 */
+  const handleContinueDesignRequestInAgent = React.useCallback((): void => {
+    if (!pendingDesignHandoff) return
+    designHandoffBypassPromptRef.current = pendingDesignHandoff.prompt
+    setPendingDesignHandoff(null)
+    void handleSend(pendingDesignHandoff.prompt, true)
+  }, [handleSend, pendingDesignHandoff])
+
+  /** 将原始要求预填到当前项目 Design，不发送消息、不自动开始付费生图。 */
+  const handleOpenDesignHandoff = React.useCallback((): void => {
+    if (!pendingDesignHandoff || !currentWorkspaceId) return
+    updateDesignProjectState({
+      projectId: currentWorkspaceId,
+      update: {
+        inspectorTab: 'ai',
+        generationPrompt: pendingDesignHandoff.prompt,
+      },
+    })
+    setCurrentAgentWorkspaceId(currentWorkspaceId)
+    void window.electronAPI.updateSettings({ agentWorkspaceId: currentWorkspaceId }).catch(console.error)
+    setInputContent('')
+    setInputHtmlContent('')
+    setPromptSuggestions((previous) => {
+      if (!previous.has(sessionId)) return previous
+      const next = new Map(previous)
+      next.delete(sessionId)
+      return next
+    })
+    setPendingDesignHandoff(null)
+    setActiveView('design')
+    toast.success('已打开设计面板', { description: '原始要求已填入，确认后再生成图片。' })
+  }, [currentWorkspaceId, pendingDesignHandoff, sessionId, setActiveView, setCurrentAgentWorkspaceId, setInputContent, setPromptSuggestions, updateDesignProjectState])
 
   /** 停止生成。异常流未发出终态时，允许再次下发幂等的 abort 请求。 */
   const handleStop = React.useCallback((): void => {
@@ -3122,6 +3180,29 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           </label>
         </div>
         <DialogFooter><Button type="button" variant="ghost" onClick={() => setTodoDialogOpen(false)}>取消</Button><Button type="button" onClick={() => void handleCreateReplyTodo()} disabled={creatingTodo || !todoDraftTitle.trim()}><ListTodo size={15} />添加 Todo</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog
+      open={pendingDesignHandoff !== null}
+      onOpenChange={(open) => { if (!open) setPendingDesignHandoff(null) }}
+    >
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>这次先做视觉稿吗？</DialogTitle>
+          <DialogDescription>
+            当前要求可能同时表示视觉方案和代码实现。打开设计面板只会预填描述，不会立即生成图片。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={handleContinueDesignRequestInAgent}>
+            继续让 Agent 实现
+          </Button>
+          <Button type="button" onClick={handleOpenDesignHandoff}>
+            <Palette aria-hidden="true" />
+            打开设计面板
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
 
