@@ -27,6 +27,7 @@ import type {
   StableDirectoryAuthorization,
   StableDirectoryNativeRequest,
   StableDirectoryNativeResult,
+  StableDirectoryNativeWriteOutcome,
 } from '../stable-directory-native-host'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasTrustedDirectoryCapability } from './canvas-document-store'
@@ -75,6 +76,8 @@ export interface CanvasAgentNodeCreationIntent {
 export interface CanvasAgentNodeReconciliationResult {
   snapshot: CanvasWorkspaceSnapshot
   documentChanged: boolean
+  /** 已确认发布事实后仍需向调用方传播的持久性错误。 */
+  error?: unknown
 }
 
 /** 服务内部结果额外携带发布判断，IPC 不得向 Renderer 暴露该字段。 */
@@ -87,7 +90,7 @@ export interface CanvasAgentNodeCreateReconciledOutcome {
   reconciliation: CanvasAgentNodeReconciliationResult
   operationOutcome:
     | { ok: true; value: CanvasAgentNodeCreationServiceResult }
-    | { ok: false; error: unknown }
+    | { ok: false; error: unknown; publication?: CanvasDocument }
 }
 
 /** 服务内部对账结果额外携带同次目录 capability 和最终 intent 集合。 */
@@ -118,7 +121,7 @@ export interface CanvasAgentNodeCreationDependencies {
     filePath: string,
     intent: CanvasAgentNodeCreationIntent,
     options?: SecureAtomicJsonWriteOptions,
-  ) => unknown | Promise<unknown>
+  ) => void | StableDirectoryNativeWriteOutcome | Promise<void | StableDirectoryNativeWriteOutcome>
   /** 测试可替换 native helper，生产使用模块级受限 host。 */
   runStableDirectoryNative?: (
     request: StableDirectoryNativeRequest,
@@ -132,6 +135,41 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   /** 自定义原型可能携带 getter，不能进入事务 schema。 */
   const prototype = Object.getPrototypeOf(value)
   return prototype === Object.prototype || prototype === null
+}
+
+/** 已提交图需要发布后再向 IPC 传播的持久性错误。 */
+class CanvasAgentNodePublishedError extends Error {
+  constructor(readonly causeError: Error, readonly document: CanvasDocument) {
+    super(causeError.message)
+    this.name = 'CanvasAgentNodePublishedError'
+    this.cause = causeError
+  }
+}
+
+/** intent 写入完成后的可信确认结果。 */
+interface CanvasIntentWriteConfirmation {
+  durabilityError?: Error
+}
+
+/** 精确比较重扫后的 intent 与刚提交内容。 */
+function isSameIntent(
+  left: CanvasAgentNodeCreationIntent,
+  right: CanvasAgentNodeCreationIntent,
+): boolean {
+  return left.schemaVersion === right.schemaVersion
+    && left.operationId === right.operationId
+    && left.projectId === right.projectId
+    && left.canvasId === right.canvasId
+    && left.nodeId === right.nodeId
+    && left.sessionId === right.sessionId
+    && left.title === right.title
+    && left.channelId === right.channelId
+    && left.modelId === right.modelId
+    && left.position.x === right.position.x
+    && left.position.y === right.position.y
+    && left.state === right.state
+    && left.createdAt === right.createdAt
+    && left.updatedAt === right.updatedAt
 }
 
 /** 判断对象是否只包含指定字段，并要求必填字段存在。 */
@@ -445,16 +483,23 @@ export class CanvasAgentNodeCreationService {
   private async writeIntent(
     identity: CanvasTrustedDirectoryCapability,
     intent: CanvasAgentNodeCreationIntent,
-  ): Promise<void> {
+  ): Promise<CanvasIntentWriteConfirmation> {
     const fileName = `agent-node-${intent.operationId}.json`
     if (!AGENT_NODE_INTENT_FILE_PATTERN.test(fileName)) throw new Error('Canvas Agent intent 路径无效')
     if (this.writeIntentFile) {
       const filePath = join(identity.path, fileName)
       identity.assertValid()
-      await this.writeIntentFile(filePath, intent, { beforeRename: identity.assertValid })
-      return
+      const outcome = await this.writeIntentFile(
+        filePath,
+        intent,
+        { beforeRename: identity.assertValid },
+      )
+      return this.confirmIntentWrite(identity, intent, outcome ?? {
+        commitVisible: true,
+        durabilityUncertain: false,
+      })
     }
-    await this.runNative({
+    const result = await this.runNative({
       mode: 'canvas-intent-write',
       roots: [identity.rootPath],
       childName: 'transactions',
@@ -462,6 +507,34 @@ export class CanvasAgentNodeCreationService {
       content: `${JSON.stringify(intent, null, 2)}\n`,
       maxEntries: MAX_AGENT_NODE_INTENTS,
     }, identity.authorizeOpenedRoots)
+    if (!result.writeOutcome) throw new Error('Canvas Agent intent helper 未返回写入结果')
+    return this.confirmIntentWrite(identity, intent, result.writeOutcome)
+  }
+
+  /** 对结构化写结果执行失败传播或 rename 后可见性重扫。 */
+  private async confirmIntentWrite(
+    identity: CanvasTrustedDirectoryCapability,
+    intent: CanvasAgentNodeCreationIntent,
+    outcome: StableDirectoryNativeWriteOutcome,
+  ): Promise<CanvasIntentWriteConfirmation> {
+    if (!outcome.commitVisible) {
+      throw new Error(`CANVAS_INTENT_WRITE_FAILED: ${outcome.error ?? 'intent 未提交'}`)
+    }
+    if (!outcome.durabilityUncertain) return {}
+    /** rename 已发生时只信任同一稳定目录 capability 的重新扫描结果。 */
+    const rescanned = await this.readIntents({
+      projectId: intent.projectId,
+      canvasId: intent.canvasId,
+    }, identity)
+    const committed = rescanned.find((candidate) => candidate.operationId === intent.operationId)
+    if (!committed || !isSameIntent(committed, intent)) {
+      throw new Error('CANVAS_INTENT_COMMIT_UNCONFIRMED: rename 后未找到精确 intent')
+    }
+    return {
+      durabilityError: new Error(
+        `CANVAS_INTENT_DURABILITY_UNCERTAIN: ${outcome.error ?? '目录持久性未确认'}`,
+      ),
+    }
   }
 
   /** 返回更新时间单调前进的新阶段 intent。 */
@@ -479,7 +552,12 @@ export class CanvasAgentNodeCreationService {
     originalIntent: CanvasAgentNodeCreationIntent,
     initialDocument: CanvasDocument,
     identity: CanvasTrustedDirectoryCapability,
-  ): Promise<{ intent: CanvasAgentNodeCreationIntent; document: CanvasDocument; publishRequired: boolean }> {
+  ): Promise<{
+    intent: CanvasAgentNodeCreationIntent
+    document: CanvasDocument
+    publishRequired: boolean
+    error?: Error
+  }> {
     let intent = originalIntent
     let document = initialDocument
     /** 只有 committed 成功越过发布屏障后，既有 revision 才允许对外发布。 */
@@ -504,7 +582,10 @@ export class CanvasAgentNodeCreationService {
         assertSessionMatchesIntent(session, intent)
       }
       intent = this.transitionIntent(intent, 'session-created')
-      await this.writeIntent(identity, intent)
+      const confirmation = await this.writeIntent(identity, intent)
+      if (confirmation.durabilityError) {
+        return { intent, document, publishRequired, error: confirmation.durabilityError }
+      }
     }
 
     if (intent.state === 'session-created') {
@@ -529,8 +610,11 @@ export class CanvasAgentNodeCreationService {
       }
       /** committed 是唯一发布屏障；写失败时调用方不得广播或返回 document。 */
       intent = this.transitionIntent(intent, 'committed')
-      await this.writeIntent(identity, intent)
+      const confirmation = await this.writeIntent(identity, intent)
       publishRequired = true
+      if (confirmation.durabilityError) {
+        return { intent, document, publishRequired, error: confirmation.durabilityError }
+      }
     }
     return { intent, document, publishRequired }
   }
@@ -548,6 +632,7 @@ export class CanvasAgentNodeCreationService {
     const identity = loaded.openSingleChildDirectory('transactions')
     let document = snapshot.document
     let documentChanged = false
+    let reconciliationError: Error | undefined
     /** 保留每个事务对账后的最终阶段，供同次 CREATE 直接复用。 */
     const intents: CanvasAgentNodeCreationIntent[] = []
 
@@ -558,6 +643,11 @@ export class CanvasAgentNodeCreationService {
         intent = advanced.intent
         document = advanced.document
         documentChanged ||= advanced.publishRequired
+        if (advanced.error) {
+          reconciliationError = advanced.error
+          intents.push(intent)
+          break
+        }
       }
       if (intent.state === 'committed') {
         assertSessionMatchesIntent(this.dependencies.getSession(intent.sessionId), intent)
@@ -575,6 +665,7 @@ export class CanvasAgentNodeCreationService {
     return {
       snapshot: { ...snapshot, document },
       documentChanged,
+      ...(reconciliationError ? { error: reconciliationError } : {}),
       directory: identity,
       intents,
     }
@@ -636,8 +727,15 @@ export class CanvasAgentNodeCreationService {
       createdAt,
       updatedAt: createdAt,
     }
-    await this.writeIntent(identity, prepared)
+    const preparedConfirmation = await this.writeIntent(identity, prepared)
+    if (preparedConfirmation.durabilityError) throw preparedConfirmation.durabilityError
     const advanced = await this.advanceIntent(prepared, reconciled.snapshot.document, identity)
+    if (advanced.error) {
+      if (advanced.publishRequired) {
+        throw new CanvasAgentNodePublishedError(advanced.error, advanced.document)
+      }
+      throw advanced.error
+    }
     const session = this.dependencies.getSession(advanced.intent.sessionId)
     assertSessionMatchesIntent(session, advanced.intent)
     return {
@@ -663,6 +761,13 @@ export class CanvasAgentNodeCreationService {
     const reconciliation: CanvasAgentNodeReconciliationResult = {
       snapshot: reconciled.snapshot,
       documentChanged: reconciled.documentChanged,
+      ...(reconciled.error ? { error: reconciled.error } : {}),
+    }
+    if (reconciliation.error) {
+      return {
+        reconciliation,
+        operationOutcome: { ok: false, error: reconciliation.error },
+      }
     }
     try {
       return {
@@ -673,6 +778,16 @@ export class CanvasAgentNodeCreationService {
         },
       }
     } catch (error) {
+      if (error instanceof CanvasAgentNodePublishedError) {
+        return {
+          reconciliation,
+          operationOutcome: {
+            ok: false,
+            error: error.causeError,
+            publication: error.document,
+          },
+        }
+      }
       return { reconciliation, operationOutcome: { ok: false, error } }
     }
   }

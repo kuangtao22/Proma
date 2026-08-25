@@ -32,6 +32,13 @@ export interface StableDirectoryNativeEntry {
   content?: string
 }
 
+/** Canvas intent 原子写的提交可见性与持久性结果。 */
+export interface StableDirectoryNativeWriteOutcome {
+  commitVisible: boolean
+  durabilityUncertain: boolean
+  error?: string
+}
+
 export interface StableDirectoryNativeRequest {
   mode: 'list' | 'scan' | 'canvas-intent-scan' | 'canvas-intent-write'
   roots: string[]
@@ -52,6 +59,8 @@ export interface StableDirectoryNativeRequest {
 export interface StableDirectoryNativeResult {
   roots: StableDirectoryOpenedRoot[]
   entries: StableDirectoryNativeEntry[]
+  /** 仅 canvas-intent-write 模式返回。 */
+  writeOutcome?: StableDirectoryNativeWriteOutcome
 }
 
 export interface StableDirectoryNativeHostDependencies {
@@ -173,6 +182,22 @@ function parseEntry(
   }
 }
 
+/** 校验 canvas-intent-write 的单次结构化结果。 */
+function parseWriteOutcome(value: unknown): StableDirectoryNativeWriteOutcome | null {
+  if (!value || typeof value !== 'object') return null
+  const record = value as Record<string, unknown>
+  if (record.type !== 'write-result'
+    || typeof record.commitVisible !== 'boolean'
+    || typeof record.durabilityUncertain !== 'boolean'
+    || (record.error !== undefined && typeof record.error !== 'string')
+    || (record.durabilityUncertain && !record.commitVisible)) return null
+  return {
+    commitVisible: record.commitVisible,
+    durabilityUncertain: record.durabilityUncertain,
+    ...(typeof record.error === 'string' ? { error: record.error } : {}),
+  }
+}
+
 /**
  * 启动一次稳定目录 helper，在 OPENED 与 ALLOW 之间执行主进程授权。
  * helper 进程是单请求生命周期，任何异常、超时或取消都会终止并清理管道。
@@ -206,6 +231,7 @@ function executeStableDirectoryNative(
     let denialPending = false
     let openedRoots: StableDirectoryOpenedRoot[] | null = null
     const entries: StableDirectoryNativeEntry[] = []
+    let writeOutcome: StableDirectoryNativeWriteOutcome | null = null
     let stdoutBuffer = ''
     let stdoutBytes = 0
     let stderrBuffer = ''
@@ -297,12 +323,28 @@ function executeStableDirectoryNative(
         entries.push(entry)
         return
       }
+      if (record?.type === 'write-result') {
+        if (!authorized || authorizationPending || request.mode !== 'canvas-intent-write' || writeOutcome) {
+          finish(new Error('稳定目录 helper write-result 响应无效'))
+          return
+        }
+        writeOutcome = parseWriteOutcome(value)
+        if (!writeOutcome) finish(new Error('稳定目录 helper write-result 响应无效'))
+        return
+      }
       if (record?.type === 'done') {
-        if (!authorized || !Number.isSafeInteger(record.entryCount) || record.entryCount !== entries.length) {
+        if (!authorized
+          || !Number.isSafeInteger(record.entryCount)
+          || record.entryCount !== entries.length
+          || (request.mode === 'canvas-intent-write') !== Boolean(writeOutcome)) {
           finish(new Error('稳定目录 helper done 响应无效'))
           return
         }
-        finish(undefined, { roots: openedRoots, entries })
+        finish(undefined, {
+          roots: openedRoots,
+          entries,
+          ...(writeOutcome ? { writeOutcome } : {}),
+        })
         return
       }
       if (record?.type === 'fatal' && typeof record.message === 'string') {

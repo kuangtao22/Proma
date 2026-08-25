@@ -8,7 +8,7 @@ import {
   readFileSync,
   realpathSync,
 } from 'node:fs'
-import type { Stats } from 'node:fs'
+import type { BigIntStats, Stats } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   applyCanvasMutations,
@@ -131,8 +131,8 @@ interface UnknownRecord {
 interface CanvasDirectoryIdentity {
   path: string
   canonicalPath: string
-  dev: number
-  ino: number
+  dev: bigint
+  ino: bigint
 }
 
 /** 同一次授权捕获的 Canvas 集合根与具体 Canvas 根身份。 */
@@ -456,6 +456,16 @@ function lstatOrNull(path: string): Stats | null {
   }
 }
 
+/** 目录身份使用 bigint 读取，避免 Windows 64 位 file ID 经 number 丢失精度。 */
+function lstatDirectoryOrNull(path: string): BigIntStats | null {
+  try {
+    return lstatSync(path, { bigint: true })
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null
+    throw error
+  }
+}
+
 /** 判断 candidate 的物理路径位于可信 root 内或等于 root。 */
 function isCanonicalPathContained(root: string, candidate: string): boolean {
   /** 物理相对路径不得返回可信根上级。 */
@@ -472,7 +482,7 @@ function captureDirectoryIdentity(
   canonicalRoot?: string,
 ): CanvasDirectoryIdentity {
   /** 最后一段目录必须自身为实际目录，禁止 symlink。 */
-  const stats = lstatOrNull(directoryPath)
+  const stats = lstatDirectoryOrNull(directoryPath)
   if (!stats || stats.isSymbolicLink() || !stats.isDirectory()) {
     throw unsafeCanvasPath(`目录必须是实际目录: ${directoryPath}`)
   }
@@ -487,7 +497,7 @@ function captureDirectoryIdentity(
 /** 复验目录路径仍指向捕获时的实际目录身份。 */
 function assertDirectoryIdentity(identity: CanvasDirectoryIdentity): void {
   /** 当前路径状态用于阻断读取或 rename 期间的目录置换。 */
-  const stats = lstatOrNull(identity.path)
+  const stats = lstatDirectoryOrNull(identity.path)
   if (!stats
     || stats.isSymbolicLink()
     || !stats.isDirectory()
@@ -519,6 +529,22 @@ function isSameDirectoryIdentity(
     && left.canonicalPath === right.canonicalPath
     && left.dev === right.dev
     && left.ino === right.ino
+}
+
+/**
+ * 精确比较 helper OPENED 与 Node bigint 目录身份。
+ * @param identity 当前或首次 LOAD 捕获的目录身份。
+ * @param root helper 从已打开目录句柄读取的十进制身份。
+ */
+export function isOpenedRootSameDirectoryIdentity(
+  identity: CanvasDirectoryIdentity,
+  root: StableDirectoryOpenedRoot,
+): boolean {
+  return root.requestedPath === identity.path
+    && root.canonicalPath === identity.canonicalPath
+    && root.isDirectory
+    && root.volume === identity.dev.toString(10)
+    && root.fileId === identity.ino.toString(10)
 }
 
 /** 从 lstat/fstat 提取读取期间必须保持稳定的内容状态。 */
@@ -885,11 +911,8 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
           const [root] = roots
           const allowed = roots.length === 1
             && isSameDirectoryIdentity(currentCanvasRoot, scopeIdentity.canvasRoot)
-            && root?.requestedPath === currentCanvasRoot.path
-            && root.canonicalPath === currentCanvasRoot.canonicalPath
-            && root.isDirectory
-            && root.volume === String(currentCanvasRoot.dev)
-            && root.fileId === String(currentCanvasRoot.ino)
+            && root !== undefined
+            && isOpenedRootSameDirectoryIdentity(currentCanvasRoot, root)
           /** 返回 ALLOW 前再次复验当前与首次目录身份，缩短捕获后的置换窗口。 */
           assertCanvasDirectoryScope(current.directoryIdentity)
           assertValid()

@@ -20,6 +20,11 @@ interface FakeHelperOptions {
   autoOpen?: boolean
   completeOnAllow?: boolean
   intentContent?: string
+  writeOutcome?: {
+    commitVisible: boolean
+    durabilityUncertain: boolean
+    error?: string
+  }
 }
 
 /** 创建严格等待 ALLOW/DENY 的假 helper，用于验证主进程两阶段授权协议。 */
@@ -54,6 +59,12 @@ function createFakeHelper(options: FakeHelperOptions = {}): {
       if (options.completeOnAllow === false) return
       if (options.oversizedOutput) {
         stdout.write(`${'x'.repeat(2048)}\n`)
+        return
+      }
+      if (options.writeOutcome) {
+        stdout.write(`${JSON.stringify({ type: 'write-result', ...options.writeOutcome })}\n`)
+        stdout.write(`${JSON.stringify({ type: 'done', entryCount: 0 })}\n`)
+        processEvents.emit('exit', 0, null)
         return
       }
       const entry = options.intentContent === undefined
@@ -391,6 +402,30 @@ describe('stable directory native host', () => {
     }])
   })
 
+  test('Given helper 报告 rename 后目录持久性未确认 When host 消费协议 Then 保留可见提交结果而非提前退出', async () => {
+    const fake = createFakeHelper({
+      writeOutcome: {
+        commitVisible: true,
+        durabilityUncertain: true,
+        error: 'cannot persist canvas transactions directory',
+      },
+    })
+
+    const result = await runStableDirectoryNative({
+      mode: 'canvas-intent-write',
+      roots: ['/requested'],
+      childName: 'transactions',
+      fileName: 'agent-node-11111111-1111-4111-8111-111111111111.json',
+      content: '{"state":"committed"}',
+    }, () => true, createDependencies(fake))
+
+    expect(result.writeOutcome).toEqual({
+      commitVisible: true,
+      durabilityUncertain: true,
+      error: 'cannot persist canvas transactions directory',
+    })
+  })
+
   test('Given helper 在授权前发送 entry When host 消费协议 Then 终止并拒绝结果', async () => {
     const fake = createFakeHelper({ emitEntryBeforeAuthorization: true })
 
@@ -479,6 +514,49 @@ describe('stable directory native host', () => {
         'transactions',
         'agent-node-11111111-1111-4111-8111-111111111111.json',
       ), 'utf8')).toBe('{"state":"prepared"}')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Given 512 个合法 intent 与目录杂项 When 覆盖或新增 Then 覆盖成功、第 513 个拒绝且后续扫描仍成功', async () => {
+    const appDir = resolve(import.meta.dir, '../../..')
+    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
+    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-capacity-'))
+    const canvasRoot = join(root, 'canvas')
+    const transactions = join(canvasRoot, 'transactions')
+    mkdirSync(transactions, { recursive: true })
+    /** 固定 UUID v4 形态，覆盖完整 512 容量。 */
+    const intentNames = Array.from({ length: 512 }, (_, index) => (
+      `agent-node-00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}.json`
+    ))
+    for (const name of intentNames) writeFileSync(join(transactions, name), '{}', 'utf8')
+    writeFileSync(join(transactions, 'agent-node-not-a-uuid.json'), '{}', 'utf8')
+    mkdirSync(join(transactions, 'agent-node-00000000-0000-4000-8000-ffffffffffff.json'))
+
+    try {
+      const write = (fileName: string) => runStableDirectoryNative({
+        mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
+        fileName, content: '{"state":"committed"}', maxEntries: 512,
+      }, () => true, { helperPath: () => helperPath })
+
+      await expect(write(intentNames[0]!)).resolves.toHaveProperty(
+        'writeOutcome.commitVisible', true,
+      )
+      await expect(write('agent-node-00000000-0000-4000-8000-000000000200.json'))
+        .resolves.toHaveProperty('writeOutcome', {
+          commitVisible: false,
+          durabilityUncertain: false,
+          error: 'canvas intent entry limit exceeded',
+        })
+
+      const scanned = await runStableDirectoryNative({
+        mode: 'canvas-intent-scan', roots: [canvasRoot], childName: 'transactions',
+        maxEntries: 512, maxOutputBytes: 40 * 1024 * 1024,
+      }, () => true, { helperPath: () => helperPath })
+      expect(scanned.entries).toHaveLength(512)
+      expect(scanned.entries.every((entry) => !entry.isDirectory)).toBe(true)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

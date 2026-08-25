@@ -187,13 +187,52 @@ bool DecodeBase64(const std::string& encoded, std::string* output) {
   return true;
 }
 
-// 只把正式或看似正式的 agent-node JSON 交给上层校验，忽略其它目录杂项。
+// 判断 ASCII 十六进制字符；用于跨平台锁定 UUID 文件名合同。
+bool IsHexDigit(char value) {
+  return (value >= '0' && value <= '9')
+      || (value >= 'a' && value <= 'f')
+      || (value >= 'A' && value <= 'F');
+}
+
+// 只接受固定 agent-node-<UUID>.json 文件名，伪前缀和目录杂项不消耗容量。
 bool IsCanvasIntentCandidateName(const std::string& name) {
-  constexpr char kPrefix[] = "agent-node-";
-  constexpr char kSuffix[] = ".json";
-  return name.rfind(kPrefix, 0) == 0
-      && name.size() >= sizeof(kPrefix) - 1 + sizeof(kSuffix) - 1
-      && name.compare(name.size() - (sizeof(kSuffix) - 1), sizeof(kSuffix) - 1, kSuffix) == 0;
+  constexpr std::size_t kPrefixLength = 11;
+  constexpr std::size_t kUuidLength = 36;
+  constexpr std::size_t kSuffixLength = 5;
+  if (name.size() != kPrefixLength + kUuidLength + kSuffixLength
+      || name.compare(0, kPrefixLength, "agent-node-") != 0
+      || name.compare(kPrefixLength + kUuidLength, kSuffixLength, ".json") != 0) return false;
+  const std::string uuid = name.substr(kPrefixLength, kUuidLength);
+  for (std::size_t index = 0; index < uuid.size(); ++index) {
+    if (index == 8 || index == 13 || index == 18 || index == 23) {
+      if (uuid[index] != '-') return false;
+    } else if (!IsHexDigit(uuid[index])) {
+      return false;
+    }
+  }
+  const char version = uuid[14];
+  const char variant = static_cast<char>(uuid[19] | 0x20);
+  return version >= '1' && version <= '5'
+      && (variant == '8' || variant == '9' || variant == 'a' || variant == 'b');
+}
+
+// Canvas intent 写结果区分 rename 前失败、正常提交和 rename 后持久性未确认。
+struct CanvasIntentWriteOutcome {
+  bool commit_visible = false;
+  bool durability_uncertain = false;
+  std::string error;
+};
+
+// 序列化结构化写结果；输入提交状态，返回单行 JSON。
+std::string CanvasIntentWriteResultJson(const CanvasIntentWriteOutcome& outcome) {
+  std::ostringstream out;
+  out << "{\"type\":\"write-result\",\"commitVisible\":"
+      << (outcome.commit_visible ? "true" : "false")
+      << ",\"durabilityUncertain\":"
+      << (outcome.durability_uncertain ? "true" : "false");
+  if (!outcome.error.empty()) out << ",\"error\":\"" << JsonEscape(outcome.error) << '\"';
+  out << '}';
+  return out.str();
 }
 
 // 解析 ALLOW 或 ALLOW\t<Base64> 决策；写模式返回已解码正文。
@@ -415,9 +454,39 @@ bool WriteAndSync(int descriptor, const std::string& payload) {
   return fsync(descriptor) == 0;
 }
 
-// 在 transactions fd 内创建临时文件、落盘并相对 rename，失败时清理同一目录中的临时项。
-bool WriteCanvasIntentAtomic(const Config& config, int transactions_fd,
-                             const std::string& payload, std::string* error) {
+// 写入前在同一 transactions fd 下统计合法普通 intent；覆盖不占新名额。
+bool CheckCanvasIntentCapacity(const Config& config, int transactions_fd, std::string* error) {
+  UniqueFd duplicate(dup(transactions_fd));
+  if (duplicate.Get() < 0) { *error = "cannot duplicate canvas transactions directory"; return false; }
+  DIR* raw_directory = fdopendir(duplicate.Release());
+  if (!raw_directory) { *error = "cannot enumerate canvas transactions directory"; return false; }
+  std::unique_ptr<DIR, int (*)(DIR*)> directory(raw_directory, closedir);
+  std::size_t count = 0;
+  bool target_exists = false;
+  while (dirent* item = readdir(directory.get())) {
+    const std::string name(item->d_name);
+    if (!IsCanvasIntentCandidateName(name)) continue;
+    struct stat listed {};
+    if (fstatat(transactions_fd, name.c_str(), &listed, AT_SYMLINK_NOFOLLOW) != 0) {
+      *error = "cannot stat canvas intent entry";
+      return false;
+    }
+    if (!S_ISREG(listed.st_mode)) continue;
+    ++count;
+    if (name == config.file_name) target_exists = true;
+  }
+  if (!target_exists && count >= config.max_entries) {
+    *error = "canvas intent entry limit exceeded";
+    return false;
+  }
+  return true;
+}
+
+// 在 transactions fd 内创建临时文件、落盘并相对 rename，返回精确提交阶段。
+CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, int transactions_fd,
+                                                 const std::string& payload) {
+  CanvasIntentWriteOutcome outcome;
+  if (!CheckCanvasIntentCapacity(config, transactions_fd, &outcome.error)) return outcome;
   std::string temporary_name;
   UniqueFd temporary;
   for (int attempt = 0; attempt < 32; ++attempt) {
@@ -427,29 +496,30 @@ bool WriteCanvasIntentAtomic(const Config& config, int transactions_fd,
         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
     if (temporary.Get() >= 0) break;
     if (errno != EEXIST) {
-      *error = "cannot create canvas intent temporary file";
-      return false;
+      outcome.error = "cannot create canvas intent temporary file";
+      return outcome;
     }
   }
   if (temporary.Get() < 0) {
-    *error = "cannot allocate canvas intent temporary file";
-    return false;
+    outcome.error = "cannot allocate canvas intent temporary file";
+    return outcome;
   }
   if (!WriteAndSync(temporary.Get(), payload)) {
     unlinkat(transactions_fd, temporary_name.c_str(), 0);
-    *error = "cannot persist canvas intent temporary file";
-    return false;
+    outcome.error = "cannot persist canvas intent temporary file";
+    return outcome;
   }
   if (renameat(transactions_fd, temporary_name.c_str(), transactions_fd, config.file_name.c_str()) != 0) {
     unlinkat(transactions_fd, temporary_name.c_str(), 0);
-    *error = "cannot commit canvas intent file";
-    return false;
+    outcome.error = "cannot commit canvas intent file";
+    return outcome;
   }
+  outcome.commit_visible = true;
   if (fsync(transactions_fd) != 0) {
-    *error = "cannot persist canvas transactions directory";
-    return false;
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist canvas transactions directory";
   }
-  return true;
+  return outcome;
 }
 
 // 在同一 transactions fd 下列出并读取直接子项，读取前后复核稳定身份与纳秒时间戳。
@@ -473,10 +543,7 @@ bool ScanCanvasIntents(const Config& config, int transactions_fd,
       *error = "cannot stat canvas intent entry";
       return false;
     }
-    if (S_ISLNK(listed.st_mode) || (!S_ISDIR(listed.st_mode) && !S_ISREG(listed.st_mode))) {
-      *error = "invalid canvas intent entry type";
-      return false;
-    }
+    if (!S_ISREG(listed.st_mode)) continue;
     std::string content;
     if (S_ISREG(listed.st_mode)) {
       if (listed.st_size < 0 || listed.st_size > 64 * 1024) {
@@ -542,7 +609,7 @@ bool ScanCanvasIntents(const Config& config, int transactions_fd,
         return false;
       }
     }
-    if (!EmitLine(CanvasIntentEntryJson(name, S_ISDIR(listed.st_mode),
+    if (!EmitLine(CanvasIntentEntryJson(name, false,
         static_cast<std::uint64_t>(listed.st_size), content), config, budget)) return false;
     ++budget->entries;
   }
@@ -589,10 +656,9 @@ int RunPlatform(const Config& config) {
       return 4;
     }
     if (config.mode == "canvas-intent-write") {
-      if (!WriteCanvasIntentAtomic(config, transactions.Get(), payload, &error)) {
-        std::cerr << error << '\n';
-        return 4;
-      }
+      const CanvasIntentWriteOutcome outcome = WriteCanvasIntentAtomic(
+          config, transactions.Get(), payload);
+      if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
     } else {
       if (!ScanCanvasIntents(config, transactions.Get(), &budget, &error)) {
         std::cerr << error << '\n';
@@ -782,20 +848,60 @@ void DeleteTemporaryWindowsFile(HANDLE handle) {
   SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition));
 }
 
-// 在 transactions HANDLE 下相对创建、落盘并 rename intent，目标路径不会重新解析。
-bool WriteCanvasIntentAtomic(const Config& config, HANDLE transactions,
-                             const std::string& payload, std::string* error) {
+// 写入前在同一 transactions HANDLE 下统计合法普通 intent；覆盖不占新名额。
+bool CheckCanvasIntentCapacity(const Config& config, HANDLE transactions, std::string* error) {
+  std::vector<unsigned char> buffer(64 * 1024);
+  bool restart = true;
+  std::size_t count = 0;
+  bool target_exists = false;
+  const std::wstring target = Utf8ToWide(config.file_name);
+  while (true) {
+    if (!GetFileInformationByHandleEx(transactions,
+        restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
+        buffer.data(), static_cast<DWORD>(buffer.size()))) {
+      if (GetLastError() == ERROR_NO_MORE_FILES) break;
+      *error = "cannot enumerate canvas transactions directory";
+      return false;
+    }
+    restart = false;
+    unsigned char* cursor = buffer.data();
+    while (true) {
+      auto* item = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(cursor);
+      const std::wstring name(item->FileName, item->FileNameLength / sizeof(wchar_t));
+      const std::string utf8_name = WideToUtf8(name);
+      const bool regular = (item->FileAttributes
+          & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+      if (regular && IsCanvasIntentCandidateName(utf8_name)) {
+        ++count;
+        if (_wcsicmp(name.c_str(), target.c_str()) == 0) target_exists = true;
+      }
+      if (item->NextEntryOffset == 0) break;
+      cursor += item->NextEntryOffset;
+    }
+  }
+  if (!target_exists && count >= config.max_entries) {
+    *error = "canvas intent entry limit exceeded";
+    return false;
+  }
+  return true;
+}
+
+// 在 transactions HANDLE 下相对创建、落盘并 rename intent，返回精确提交阶段。
+CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, HANDLE transactions,
+                                                 const std::string& payload) {
+  CanvasIntentWriteOutcome outcome;
+  if (!CheckCanvasIntentCapacity(config, transactions, &outcome.error)) return outcome;
   UniqueHandle temporary;
   for (int attempt = 0; attempt < 32; ++attempt) {
     const std::wstring temporary_name = L".intent-" + std::to_wstring(GetCurrentProcessId())
         + L"-" + std::to_wstring(static_cast<unsigned long long>(std::random_device{}())) + L".tmp";
     if (OpenRelativeWindows(transactions, temporary_name,
         FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
-        FILE_CREATE, FILE_NON_DIRECTORY_FILE, &temporary, error)) break;
+        FILE_CREATE, FILE_NON_DIRECTORY_FILE, &temporary, &outcome.error)) break;
   }
   if (temporary.Get() == INVALID_HANDLE_VALUE) {
-    *error = "cannot allocate canvas intent temporary file";
-    return false;
+    outcome.error = "cannot allocate canvas intent temporary file";
+    return outcome;
   }
   std::size_t offset = 0;
   while (offset < payload.size()) {
@@ -803,15 +909,15 @@ bool WriteCanvasIntentAtomic(const Config& config, HANDLE transactions,
     DWORD written = 0;
     if (!WriteFile(temporary.Get(), payload.data() + offset, remaining, &written, nullptr) || written == 0) {
       DeleteTemporaryWindowsFile(temporary.Get());
-      *error = "cannot write canvas intent temporary file";
-      return false;
+      outcome.error = "cannot write canvas intent temporary file";
+      return outcome;
     }
     offset += written;
   }
   if (!FlushFileBuffers(temporary.Get())) {
     DeleteTemporaryWindowsFile(temporary.Get());
-    *error = "cannot persist canvas intent temporary file";
-    return false;
+    outcome.error = "cannot persist canvas intent temporary file";
+    return outcome;
   }
   const std::wstring target = Utf8ToWide(config.file_name);
   const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target.size() * sizeof(wchar_t);
@@ -824,18 +930,19 @@ bool WriteCanvasIntentAtomic(const Config& config, HANDLE transactions,
   if (!SetFileInformationByHandle(
       temporary.Get(), FileRenameInfo, rename_info, static_cast<DWORD>(rename_buffer.size()))) {
     DeleteTemporaryWindowsFile(temporary.Get());
-    *error = "cannot commit canvas intent file";
-    return false;
+    outcome.error = "cannot commit canvas intent file";
+    return outcome;
   }
+  outcome.commit_visible = true;
   /** Windows 对目录 FlushFileBuffers 的支持依文件系统而异；成功时强化 rename 元数据持久性。 */
   if (!FlushFileBuffers(transactions)) {
     const DWORD flush_error = GetLastError();
     if (flush_error != ERROR_INVALID_HANDLE && flush_error != ERROR_ACCESS_DENIED) {
-      *error = "cannot persist canvas transactions directory";
-      return false;
+      outcome.durability_uncertain = true;
+      outcome.error = "cannot persist canvas transactions directory";
     }
   }
-  return true;
+  return outcome;
 }
 
 // 从相对打开的 Windows intent HANDLE 读取正文并在读取前后绑定完整文件状态。
@@ -912,17 +1019,18 @@ bool ScanCanvasIntents(const Config& config, HANDLE transactions,
           *error = "canvas intent entry limit exceeded";
           return false;
         }
-        if ((item->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-          *error = "invalid canvas intent entry type";
-          return false;
-        }
         const bool is_directory = (item->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (is_directory || (item->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+          if (item->NextEntryOffset == 0) break;
+          cursor += item->NextEntryOffset;
+          continue;
+        }
         std::string content;
         std::uint64_t size = 0;
         if (!is_directory && !ReadCanvasIntentWindows(
             transactions, name, static_cast<std::uint64_t>(item->FileId.QuadPart),
             &content, &size, error)) return false;
-        if (!EmitLine(CanvasIntentEntryJson(utf8_name, is_directory, size, content), config, budget)) {
+        if (!EmitLine(CanvasIntentEntryJson(utf8_name, false, size, content), config, budget)) {
           return false;
         }
         ++budget->entries;
@@ -1024,10 +1132,11 @@ int RunPlatform(const Config& config) {
       std::cerr << error << '\n';
       return 4;
     }
-    const bool succeeded = config.mode == "canvas-intent-write"
-      ? WriteCanvasIntentAtomic(config, transactions.Get(), payload, &error)
-      : ScanCanvasIntents(config, transactions.Get(), &budget, &error);
-    if (!succeeded) {
+    if (config.mode == "canvas-intent-write") {
+      const CanvasIntentWriteOutcome outcome = WriteCanvasIntentAtomic(
+          config, transactions.Get(), payload);
+      if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
+    } else if (!ScanCanvasIntents(config, transactions.Get(), &budget, &error)) {
       std::cerr << error << '\n';
       return 4;
     }

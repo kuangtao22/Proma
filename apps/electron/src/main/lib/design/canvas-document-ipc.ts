@@ -194,6 +194,37 @@ function broadcastChange(options: CanvasDocumentIpcOptions, event: CanvasChangeE
 }
 
 /**
+ * 发布一次创建事务对账事实，恢复优先于普通图变化。
+ * @param options 当前注册器可信依赖。
+ * @param target 已校验的项目与 Canvas 身份。
+ * @param reconciliation 同一 lease 内完成的权威对账结果。
+ */
+function publishReconciliation(
+  options: CanvasDocumentIpcOptions,
+  target: { projectId: string; canvasId: string },
+  reconciliation: Awaited<ReturnType<CanvasAgentNodeCreationService['reconcile']>>,
+): void {
+  const snapshot = reconciliation.snapshot
+  if (snapshot.recoveredFrom) {
+    broadcastChange(options, {
+      projectId: target.projectId,
+      canvasId: target.canvasId,
+      revision: snapshot.document.revision,
+      cause: 'recovery',
+    })
+    return
+  }
+  if (reconciliation.documentChanged) {
+    broadcastChange(options, {
+      projectId: target.projectId,
+      canvasId: target.canvasId,
+      revision: snapshot.document.revision,
+      cause: 'graph',
+    })
+  }
+}
+
+/**
  * 注册原生 Canvas 文档 LOAD/SAVE/Agent 节点创建 IPC。
  * @param options 授权窗口、项目守卫和原生 Store。
  * @returns 本注册器拥有的 invoke 通道和幂等清理函数。
@@ -248,23 +279,9 @@ export function registerCanvasDocumentIpcHandlers(
         input.projectId,
         () => options.creation.reconcile({ projectId: input.projectId, canvasId: input.canvasId }),
       )
-      const snapshot = reconciliation.snapshot
-      if (snapshot.recoveredFrom) {
-        broadcastChange(options, {
-          projectId: input.projectId,
-          canvasId: input.canvasId,
-          revision: snapshot.document.revision,
-          cause: 'recovery',
-        })
-      } else if (reconciliation.documentChanged) {
-        broadcastChange(options, {
-          projectId: input.projectId,
-          canvasId: input.canvasId,
-          revision: snapshot.document.revision,
-          cause: 'graph',
-        })
-      }
-      return snapshot
+      publishReconciliation(options, input, reconciliation)
+      if (reconciliation.error) throw reconciliation.error
+      return reconciliation.snapshot
     })
   })
 
@@ -283,6 +300,9 @@ export function registerCanvasDocumentIpcHandlers(
             projectId: input.projectId,
             canvasId: input.canvasId,
           })
+          if (reconciliation.error) {
+            return { ok: false, error: reconciliation.error, reconciliation }
+          }
           try {
             const document = options.store.mutate(
               { projectId: input.projectId, canvasId: input.canvasId },
@@ -296,14 +316,7 @@ export function registerCanvasDocumentIpcHandlers(
           }
         },
       )
-      if (outcome.reconciliation.documentChanged) {
-        broadcastChange(options, {
-          projectId: input.projectId,
-          canvasId: input.canvasId,
-          revision: outcome.reconciliation.snapshot.document.revision,
-          cause: 'graph',
-        })
-      }
+      publishReconciliation(options, input, outcome.reconciliation)
       if (!outcome.ok) throw outcome.error
       const document = outcome.value
       if (document.revision > input.expectedRevision) {
@@ -328,15 +341,18 @@ export function registerCanvasDocumentIpcHandlers(
         input.projectId,
         () => options.creation.createReconciled(input),
       )
-      if (outcome.reconciliation.documentChanged) {
-        broadcastChange(options, {
-          projectId: input.projectId,
-          canvasId: input.canvasId,
-          revision: outcome.reconciliation.snapshot.document.revision,
-          cause: 'graph',
-        })
+      publishReconciliation(options, input, outcome.reconciliation)
+      if (!outcome.operationOutcome.ok) {
+        if (outcome.operationOutcome.publication) {
+          broadcastChange(options, {
+            projectId: input.projectId,
+            canvasId: input.canvasId,
+            revision: outcome.operationOutcome.publication.revision,
+            cause: 'graph',
+          })
+        }
+        throw outcome.operationOutcome.error
       }
-      if (!outcome.operationOutcome.ok) throw outcome.operationOutcome.error
       const result = outcome.operationOutcome.value
       if (result.documentChanged) {
         broadcastChange(options, {

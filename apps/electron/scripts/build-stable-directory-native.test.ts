@@ -54,4 +54,6 @@ test('Given stable directory helper 的 Canvas intent 模式 When 检查三平�
   expect(source).toContain('RootDirectory')
   expect(source).toContain('FILE_OPEN_REPARSE_POINT')
   expect(source).toContain('FILE_ATTRIBUTE_REPARSE_POINT')
+  expect(source).toContain('FILE_CREATE, FILE_NON_DIRECTORY_FILE, &temporary, &outcome.error')
+  expect(source).toContain('CanvasIntentWriteResultJson(outcome)')
 })

@@ -85,9 +85,14 @@ export function createCanvasAgentNodeCommandController(
   let operation: CreateCanvasAgentNodeInput | null = null
   /** 当前唯一在途 Promise，连续点击必须返回同一引用。 */
   let inFlight: Promise<void> | null = null
+  /** 生命周期代次用于隔离切换 Canvas 后迟到的异步回调。 */
+  let generation = 0
+  /** cleanup 后控制器永久失效，旧结果不得写入新 Canvas UI。 */
+  let disposed = false
 
   return {
     execute: () => {
+      if (disposed) return Promise.reject(new Error('Canvas Agent 创建命令已取消'))
       if (inFlight) return inFlight
       if (!operation) {
         operation = {
@@ -100,14 +105,18 @@ export function createCanvasAgentNodeCommandController(
       }
       /** 当前调用固定捕获 request，成功清理 operation 也不影响回调节点 ID。 */
       const request = operation
+      const requestGeneration = generation
       dependencies.onStateChange({ loading: true, error: null })
       const requestPromise = dependencies.createAgentNode(request).then((result) => {
+        if (disposed || generation !== requestGeneration) return
         dependencies.onSuccess(request.nodeId, result)
         operation = null
         dependencies.onStateChange({ loading: false, error: null })
       }).catch((error: unknown) => {
         /** 失败保留 operation，下一次 execute 原样重放。 */
-        dependencies.onStateChange({ loading: false, error: getNativeCanvasErrorMessage(error) })
+        if (!disposed && generation === requestGeneration) {
+          dependencies.onStateChange({ loading: false, error: getNativeCanvasErrorMessage(error) })
+        }
         throw error
       }).finally(() => {
         if (inFlight === requestPromise) inFlight = null
@@ -116,8 +125,9 @@ export function createCanvasAgentNodeCommandController(
       return requestPromise
     },
     cancel: () => {
-      /** 不能取消已经发送的主进程事务，只允许清理尚未在途的失败 operation。 */
-      if (inFlight) return
+      /** 不能撤回主进程事务，但可立即废弃本地回调代次。 */
+      disposed = true
+      generation += 1
       operation = null
       dependencies.onStateChange({ loading: false, error: null })
     },
@@ -577,6 +587,7 @@ export function NativeCanvasWorkspace({
       return
     }
     /** 每个 projectId:canvasId 生命周期拥有独立 operation，切换即视为取消。 */
+    setCreateState({ loading: false, error: null })
     const command = createCanvasAgentNodeCommandController({
       target,
       createAgentNode: adapter.createCanvasAgentNode,

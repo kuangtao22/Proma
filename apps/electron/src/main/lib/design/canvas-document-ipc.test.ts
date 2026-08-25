@@ -53,12 +53,13 @@ function createContext(options: {
   mutateError?: Error
   reconcileError?: Error
   createError?: Error
+  createPublication?: CanvasDocument
   reconcileResult?: {
-    snapshot: { document: CanvasDocument; writable: true }
+    snapshot: { document: CanvasDocument; writable: true; recoveredFrom?: 'tmp' | 'backup' }
     documentChanged: boolean
   }
   retryReconcileResult?: {
-    snapshot: { document: CanvasDocument; writable: true }
+    snapshot: { document: CanvasDocument; writable: true; recoveredFrom?: 'tmp' | 'backup' }
     documentChanged: boolean
   }
   beforeCreate?: (input: { projectId: string; canvasId: string }) => Promise<void>
@@ -75,11 +76,13 @@ function createContext(options: {
   const broadcastLeaseStates: boolean[] = []
   /** 当前测试调用是否位于 workspace write lease 内。 */
   let leaseHeld = false
-  /** 保留原始发送实现，包装后可观察广播时机。 */
-  const send = sender.send
-  sender.send = (channel, value) => {
-    broadcastLeaseStates.push(leaseHeld)
-    send(channel, value)
+  /** 包装所有测试授权窗口，观察多窗口广播是否位于 lease 释放后。 */
+  for (const contents of new Set([sender, ...(options.authorized ?? [])])) {
+    const send = contents.send
+    contents.send = (channel, value) => {
+      broadcastLeaseStates.push(leaseHeld)
+      send(channel, value)
+    }
   }
   /** 按执行顺序记录只读、guard 和 store 边界。 */
   const calls: string[] = []
@@ -148,7 +151,14 @@ function createContext(options: {
         const createError = options.createError
           ?? (createAttempts === 1 ? options.createErrorOnce : undefined)
         if (createError) {
-          return { reconciliation, operationOutcome: { ok: false as const, error: createError } }
+          return {
+            reconciliation,
+            operationOutcome: {
+              ok: false as const,
+              error: createError,
+              ...(options.createPublication ? { publication: options.createPublication } : {}),
+            },
+          }
         }
         const document = createDocument(5)
         document.nodes = [{
@@ -302,6 +312,67 @@ describe('原生 Canvas 文档 IPC', () => {
     }
   })
 
+  test('Given SAVE 对账恢复到更低 revision 且后续保存失败 When lease 释放 Then 所有窗口仍仅收到 recovery', async () => {
+    const sender = createSender(2)
+    const observer = createSender(3)
+    const error = new Error('保存 revision 冲突')
+    const context = createContext({
+      authorized: [sender, observer],
+      mutateError: error,
+      reconcileResult: {
+        snapshot: { document: createDocument(1), writable: true, recoveredFrom: 'backup' },
+        documentChanged: false,
+      },
+    })
+
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 9, mutations: [],
+    })).rejects.toBe(error)
+
+    const expected = [{
+      channel: CANVAS_IPC_CHANNELS.CHANGED,
+      value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 1, cause: 'recovery' },
+    }]
+    expect(sender.sent).toEqual(expected)
+    expect(observer.sent).toEqual(expected)
+    expect(context.broadcastLeaseStates).toEqual([false, false])
+  })
+
+  test('Given CREATE 对账发生 recovery When 当前创建成功或失败 Then recovery 均优先于 graph 且只广播一次', async () => {
+    const createInput = {
+      projectId: 'project-1', canvasId: 'canvas-1',
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
+    }
+    for (const createError of [undefined, new Error('当前创建失败')]) {
+      const context = createContext({
+        createError,
+        reconcileResult: {
+          snapshot: { document: createDocument(1), writable: true, recoveredFrom: 'tmp' },
+          documentChanged: true,
+        },
+      })
+
+      if (createError) {
+        await expect(invoke(
+          context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, createInput,
+        )).rejects.toBe(createError)
+      } else {
+        await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, createInput)
+      }
+      const expected = [{
+        channel: CANVAS_IPC_CHANNELS.CHANGED,
+        value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 1, cause: 'recovery' },
+      }]
+      if (!createError) expected.push({
+        channel: CANVAS_IPC_CHANNELS.CHANGED,
+        value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
+      })
+      expect(context.sender.sent).toEqual(expected)
+      expect(context.broadcastLeaseStates).toEqual(expected.map(() => false))
+    }
+  })
+
   test('Given 有效保存或空保存 When Store 成功 Then 仅 revision 前进时广播 graph', async () => {
     const changed = createContext({ mutateResult: createDocument(5) })
     await invoke(changed.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, changed.sender, {
@@ -431,6 +502,30 @@ describe('原生 Canvas 文档 IPC', () => {
       },
     )).rejects.toBe(error)
     expect(context.sender.sent).toEqual([])
+  })
+
+  test('Given committed intent 可见但持久性未确认 When CREATE 返回发布事实 Then lease 后广播再原样抛错', async () => {
+    const error = new Error('CANVAS_INTENT_DURABILITY_UNCERTAIN: 目录持久性未确认')
+    const context = createContext({
+      createError: error,
+      createPublication: createDocument(5),
+    })
+
+    await expect(invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      context.sender,
+      {
+        projectId: 'project-1', canvasId: 'canvas-1',
+        operationId: '11111111-1111-4111-8111-111111111111',
+        nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
+      },
+    )).rejects.toBe(error)
+    expect(context.sender.sent).toEqual([{
+      channel: CANVAS_IPC_CHANNELS.CHANGED,
+      value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
+    }])
+    expect(context.broadcastLeaseStates).toEqual([false])
   })
 
   test('Given committed 首次写失败 When 同 operation 重试越过发布屏障 Then 既有 revision 恰好广播一次', async () => {

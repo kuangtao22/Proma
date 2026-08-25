@@ -19,6 +19,7 @@ import {
 } from './canvas-agent-node-creation'
 import { createCanvasDocumentStore } from './canvas-document-store'
 import { runStableDirectoryNative } from '../stable-directory-native-host'
+import type { StableDirectoryNativeWriteOutcome } from '../stable-directory-native-host'
 import type { SecureAtomicJsonWriteOptions } from '../safe-file'
 
 const OPERATION_ID = '11111111-1111-4111-8111-111111111111'
@@ -37,6 +38,8 @@ function createHarness(options: {
   afterIntentLstat?: (filePath: string) => void
   afterIntentRead?: (filePath: string) => void
   nativeIntentIo?: boolean
+  writeIntentOutcome?: (intent: CanvasAgentNodeCreationIntent) => StableDirectoryNativeWriteOutcome | undefined
+  hideUncertainIntent?: boolean
 } = {}) {
   /** 测试目标的双重身份。 */
   const target: CanvasTarget = {
@@ -158,8 +161,13 @@ function createHarness(options: {
           writeIntent: (filePath: string, intent: CanvasAgentNodeCreationIntent, writeOptions?: SecureAtomicJsonWriteOptions) => {
             options.onWriteIntentCall?.()
             if (failedState === intent.state) throw new Error(`模拟 ${intent.state} intent 写失败`)
+            const outcome = options.writeIntentOutcome?.(intent)
+            if (outcome?.commitVisible === false || (outcome?.durabilityUncertain && options.hideUncertainIntent)) {
+              return outcome
+            }
             const { writeJsonFileAtomicSecure } = require('../safe-file') as typeof import('../safe-file')
             writeJsonFileAtomicSecure(filePath, intent, writeOptions)
+            return outcome
           },
         }),
     afterIntentLstat: options.afterIntentLstat,
@@ -197,6 +205,57 @@ function createInput(target: CanvasTarget) {
 }
 
 describe('Canvas Agent 节点创建事务', () => {
+  test('Given prepared 写在 rename 前失败 When 创建 Then 不创建 session、节点或发布事实', async () => {
+    const harness = createHarness({
+      writeIntentOutcome: (intent) => intent.state === 'prepared'
+        ? { commitVisible: false, durabilityUncertain: false, error: 'cannot commit canvas intent file' }
+        : undefined,
+    })
+
+    const outcome = await harness.createService().createReconciled(createInput(harness.target))
+
+    expect(outcome.operationOutcome.ok).toBe(false)
+    expect(outcome.reconciliation.documentChanged).toBe(false)
+    expect(harness.createdInputs).toEqual([])
+    expect(harness.getDocument().nodes).toEqual([])
+  })
+
+  test('Given committed rename 可见但目录持久性未确认 When 重扫精确 intent 可见 Then 携带发布事实并返回明确降级错误', async () => {
+    const harness = createHarness({
+      writeIntentOutcome: (intent) => intent.state === 'committed'
+        ? { commitVisible: true, durabilityUncertain: true, error: 'cannot persist canvas transactions directory' }
+        : undefined,
+    })
+
+    const outcome = await harness.createService().createReconciled(createInput(harness.target))
+
+    expect(outcome.operationOutcome.ok).toBe(false)
+    if (outcome.operationOutcome.ok) throw new Error('预期 durability uncertain')
+    expect(outcome.operationOutcome.error).toHaveProperty('message', expect.stringContaining('CANVAS_INTENT_DURABILITY_UNCERTAIN'))
+    expect(outcome.operationOutcome.publication?.revision).toBe(1)
+    expect(harness.getDocument().nodes).toContainEqual(expect.objectContaining({ id: 'node-1' }))
+    await expect(harness.createService().reconcile(harness.target)).resolves.toMatchObject({
+      documentChanged: false,
+      snapshot: { document: { revision: 1 } },
+    })
+  })
+
+  test('Given helper 声称 committed 可见但重扫找不到目标 When 创建 Then fail closed 且不得发布', async () => {
+    const harness = createHarness({
+      hideUncertainIntent: true,
+      writeIntentOutcome: (intent) => intent.state === 'committed'
+        ? { commitVisible: true, durabilityUncertain: true, error: 'cannot persist canvas transactions directory' }
+        : undefined,
+    })
+
+    const outcome = await harness.createService().createReconciled(createInput(harness.target))
+
+    expect(outcome.operationOutcome.ok).toBe(false)
+    if (outcome.operationOutcome.ok) throw new Error('预期 durability uncertain')
+    expect(outcome.operationOutcome.publication).toBeUndefined()
+    expect(outcome.operationOutcome.error).toHaveProperty('message', expect.stringContaining('CANVAS_INTENT_COMMIT_UNCONFIRMED'))
+  })
+
   test('Given 生产 native intent I/O When 创建并重放同一 operation Then helper 扫描写入且只创建一次 session', async () => {
     const appDir = resolve(import.meta.dir, '../../../..')
     execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })

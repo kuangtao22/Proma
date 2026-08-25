@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { createEmptyCanvasDocument } from '@proma/shared'
 import type {
+  CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
   CanvasDocument,
   CanvasMutation,
@@ -26,6 +27,7 @@ import {
   createNativeCanvasWorkspaceController,
 } from './NativeCanvasWorkspace'
 import type {
+  CanvasAgentNodeCommandState,
   NativeCanvasScheduler,
   NativeCanvasWorkspaceController,
   NativeCanvasWorkspaceControllerDependencies,
@@ -695,6 +697,63 @@ describe('原生 Canvas 冲突提示', () => {
 })
 
 describe('原生 Canvas 添加 Agent 命令', () => {
+  test('Given Canvas A 创建中切换到 B When A 延迟成功 Then 不更新 B 的状态或节点', async () => {
+    const deferred = createDeferred<CanvasAgentNodeCreationResult>()
+    const states: CanvasAgentNodeCommandState[] = []
+    const successes: string[] = []
+    const controller = createCanvasAgentNodeCommandController({
+      target: { projectId: 'project-1', canvasId: 'canvas-a' },
+      createAgentNode: () => deferred.promise,
+      createId: (() => {
+        const ids = ['11111111-1111-4111-8111-111111111111', 'node-a']
+        return () => ids.shift()!
+      })(),
+      getPosition: () => ({ x: 0, y: 0 }),
+      onStateChange: (state) => states.push(state),
+      onSuccess: (nodeId) => successes.push(nodeId),
+    })
+
+    const request = controller.execute()
+    controller.cancel()
+    deferred.resolve({
+      document: createSnapshot(1).document,
+      session: { id: 'session-a' } as never,
+    })
+    await request
+
+    expect(states).toEqual([
+      { loading: true, error: null },
+      { loading: false, error: null },
+    ])
+    expect(successes).toEqual([])
+  })
+
+  test('Given Canvas A 创建中切换到 B When A 延迟失败 Then B 保持非 loading 且无旧错误', async () => {
+    const deferred = createDeferred<CanvasAgentNodeCreationResult>()
+    const states: CanvasAgentNodeCommandState[] = []
+    const controller = createCanvasAgentNodeCommandController({
+      target: { projectId: 'project-1', canvasId: 'canvas-a' },
+      createAgentNode: () => deferred.promise,
+      createId: (() => {
+        const ids = ['11111111-1111-4111-8111-111111111111', 'node-a']
+        return () => ids.shift()!
+      })(),
+      getPosition: () => ({ x: 0, y: 0 }),
+      onStateChange: (state) => states.push(state),
+      onSuccess: () => undefined,
+    })
+
+    const request = controller.execute()
+    controller.cancel()
+    deferred.reject(new Error('Canvas A 创建失败'))
+    await expect(request).rejects.toThrow('Canvas A 创建失败')
+
+    expect(states).toEqual([
+      { loading: true, error: null },
+      { loading: false, error: null },
+    ])
+  })
+
   test('Given 用户连续点击 When 首次创建仍在途 Then 只发送一个 operation', async () => {
     const deferred = createDeferred<{
       document: CanvasDocument

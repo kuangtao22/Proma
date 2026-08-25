@@ -22,6 +22,7 @@ import {
 import type { CanvasDocument, CanvasMutation, CanvasNode } from '@proma/shared'
 import {
   createCanvasDocumentStore,
+  isOpenedRootSameDirectoryIdentity,
   parseCanvasDocument,
 } from './canvas-document-store'
 import type { CanvasDocumentStoreOptions } from './canvas-document-store'
@@ -53,6 +54,22 @@ interface CanvasStoreOverrides {
 }
 
 describe('CanvasDocumentStore', () => {
+  test('Given dev/ino 超过 2^53 When 比较当前、首次与 helper 身份 Then 只接受十进制精确一致', () => {
+    const identity = {
+      path: '/canvas', canonicalPath: '/canvas',
+      dev: 9_007_199_254_740_993n,
+      ino: 18_014_398_509_481_985n,
+    }
+    expect(isOpenedRootSameDirectoryIdentity(identity, {
+      requestedPath: '/canvas', canonicalPath: '/canvas', isDirectory: true,
+      volume: '9007199254740993', fileId: '18014398509481985',
+    })).toBe(true)
+    expect(isOpenedRootSameDirectoryIdentity(identity, {
+      requestedPath: '/canvas', canonicalPath: '/canvas', isDirectory: true,
+      volume: '9007199254740992', fileId: '18014398509481984',
+    })).toBe(false)
+  })
+
   /** 每个测试独占的临时项目和配置根。 */
   let root = ''
 
