@@ -103,6 +103,15 @@ export class AgentAskUserService {
   }
 
   /**
+   * 只读查询待处理 AskUser 请求所属会话。
+   * @param requestId Renderer 提交的问答请求 ID。
+   * @returns 请求所属 sessionId；请求不存在时返回 null，不消费请求。
+   */
+  getPendingRequestOwner(requestId: string): string | null {
+    return this.pendingRequests.get(requestId)?.request.sessionId ?? null
+  }
+
+  /**
    * 获取当前所有待处理的 AskUser 请求（用于渲染进程重载后恢复状态）
    */
   getPendingRequests(): AskUserRequest[] {

@@ -1,6 +1,8 @@
 import { getAgentSessionMeta, getAgentSessionSDKMessages } from './agent-session-manager'
 import { join } from 'node:path'
+import type { AgentSessionMeta } from '@proma/shared'
 import { getBundledCliPath, getConfigDir, type ConfigRootResolver } from './config-paths'
+import { requireUserVisibleAgentSession } from './agent-session-visibility'
 
 /** 最大回填消息条数 */
 export const MAX_CONTEXT_MESSAGES = 20
@@ -195,8 +197,14 @@ export function buildReferencedSessionsPrompt(
   for (const referencedSessionId of uniqueIds) {
     if (referencedSessionId === currentSessionId) continue
 
-    const meta = getAgentSessionMeta(referencedSessionId)
-    if (!meta || meta.archived) continue
+    /** Renderer 候选列表不构成授权，主进程必须逐个复核统一可见性。 */
+    let meta: AgentSessionMeta
+    try {
+      meta = requireUserVisibleAgentSession(getAgentSessionMeta(referencedSessionId))
+    } catch {
+      continue
+    }
+    if (meta.archived) continue
 
     const title = escapeContextAttr(meta.title)
     const historyPath = getSessionHistoryPath(referencedSessionId, configRootResolver)

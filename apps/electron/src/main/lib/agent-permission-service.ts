@@ -215,6 +215,15 @@ export class AgentPermissionService {
   }
 
   /**
+   * 只读查询待处理权限请求所属会话。
+   * @param requestId Renderer 提交的权限请求 ID。
+   * @returns 请求所属 sessionId；请求不存在时返回 null，不消费请求。
+   */
+  getPendingRequestOwner(requestId: string): string | null {
+    return this.pendingPermissions.get(requestId)?.request.sessionId ?? null
+  }
+
+  /**
    * 清除指定会话的所有待处理请求（会话结束或中止时调用）
    */
   clearSessionPending(sessionId: string): void {

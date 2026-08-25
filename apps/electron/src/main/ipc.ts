@@ -2360,6 +2360,24 @@ export function registerIpcHandlers(): void {
     requireUserVisibleAgentSession(getAgentSessionMeta(sessionId))
   )
 
+  /** 普通文件 IPC 若携带 sessionId，必须在路径解析或文件系统访问前验证会话。 */
+  const requireVisibleFileAccess = (access?: FileAccessOptions | string[]): void => {
+    const options = normalizeFileAccessOptions(access)
+    if (options?.sessionId) requireVisibleSession(options.sessionId)
+  }
+
+  /** 过滤 pending 快照中的内部或已删除会话，未知 owner 默认不可见。 */
+  const getUserVisiblePendingRequests = <T extends { sessionId: string }>(requests: T[]): T[] => (
+    requests.filter((request) => {
+      try {
+        requireVisibleSession(request.sessionId)
+        return true
+      } catch {
+        return false
+      }
+    })
+  )
+
   // 获取 Agent 会话列表
   ipcMain.handle(
     AGENT_IPC_CHANNELS.LIST_SESSIONS,
@@ -2405,8 +2423,8 @@ export function registerIpcHandlers(): void {
     }
   }
   const assertBrowserSessionAccess = async (senderId: number, sessionId: string): Promise<void> => {
-    await assertMainRenderer(senderId)
     const session = requireVisibleSession(sessionId)
+    await assertMainRenderer(senderId)
     // 自动任务与协作子会话同样可以使用受管浏览器；仅校验会话仍存在。
     browserController.configureSession(sessionId, {
       profileKey: resolveBrowserProfileKey(session.workspaceId, sessionId),
@@ -3240,6 +3258,8 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.PERMISSION_RESPOND,
     async (event, response: PermissionResponse): Promise<void> => {
       const { requestId, behavior, alwaysAllow } = response
+      const ownerSessionId = permissionService.getPendingRequestOwner(requestId)
+      requireVisibleSession(ownerSessionId ?? '')
       const sessionId = permissionService.respondToPermission(requestId, behavior, alwaysAllow)
 
       // 发送 permission_resolved 事件给渲染进程
@@ -3449,6 +3469,8 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.ASK_USER_RESPOND,
     async (event, response: AskUserResponse): Promise<void> => {
       const { requestId, answers } = response
+      const ownerSessionId = askUserService.getPendingRequestOwner(requestId)
+      requireVisibleSession(ownerSessionId ?? '')
       const sessionId = askUserService.respondToAskUser(requestId, answers)
 
       if (sessionId) {
@@ -3466,6 +3488,8 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.EXIT_PLAN_MODE_RESPOND,
     async (event, response: ExitPlanModeResponse): Promise<void> => {
+      const ownerSessionId = exitPlanService.getPendingRequestOwner(response.requestId)
+      requireVisibleSession(ownerSessionId ?? '')
       const result = exitPlanService.respondToExitPlanMode(response)
 
       if (result) {
@@ -3505,9 +3529,9 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.GET_PENDING_REQUESTS,
     async (): Promise<import('@proma/shared').PendingRequestsSnapshot> => {
       return {
-        permissions: permissionService.getPendingRequests(),
-        askUsers: askUserService.getPendingRequests(),
-        exitPlans: exitPlanService.getPendingRequests(),
+        permissions: getUserVisiblePendingRequests(permissionService.getPendingRequests()),
+        askUsers: getUserVisiblePendingRequests(askUserService.getPendingRequests()),
+        exitPlans: getUserVisiblePendingRequests(exitPlanService.getPendingRequests()),
       }
     }
   )
@@ -3518,6 +3542,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.SAVE_FILES_TO_SESSION,
     async (_, input: AgentSaveFilesInput): Promise<AgentSavedFile[]> => {
+      requireVisibleSession(input.sessionId)
       return saveFilesToAgentSession(input)
     }
   )
@@ -3570,6 +3595,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_DIRECTORY,
     async (_, input: AgentAttachDirectoryInput): Promise<string[]> => {
+      requireVisibleSession(input.sessionId)
       return workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
         const meta = getAgentSessionMeta(input.sessionId)
         if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
@@ -3590,6 +3616,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DETACH_DIRECTORY,
     async (_, input: AgentAttachDirectoryInput): Promise<string[]> => {
+      requireVisibleSession(input.sessionId)
       return workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
         const meta = getAgentSessionMeta(input.sessionId)
         if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
@@ -3607,6 +3634,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ATTACH_FILE,
     async (_, input: AgentAttachFileInput): Promise<string[]> => {
+      requireVisibleSession(input.sessionId)
       return workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
         const meta = getAgentSessionMeta(input.sessionId)
         if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
@@ -3630,6 +3658,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DETACH_FILE,
     async (_, input: AgentAttachFileInput): Promise<string[]> => {
+      requireVisibleSession(input.sessionId)
       return workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
         const meta = getAgentSessionMeta(input.sessionId)
         if (!meta) throw new Error(`会话不存在: ${input.sessionId}`)
@@ -3740,6 +3769,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.GET_SESSION_PATH,
     async (_, workspaceId: string, sessionId: string): Promise<string | null> => {
+      requireVisibleSession(sessionId)
       const ws = getAgentWorkspace(workspaceId)
       if (!ws) return null
       return getAgentSessionWorkspacePath(ws.slug, sessionId)
@@ -3750,6 +3780,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.LIST_DIRECTORY,
     async (_, dirPath: string, access?: FileAccessOptions): Promise<FileEntry[]> => {
+      requireVisibleFileAccess(access)
       const safePath = resolve(dirPath)
       // 目录可能已被删除（如删除 Agent 会话后面板仍持有旧路径），优雅返回空列表。
       if (!existsSync(safePath)) return []
@@ -3767,6 +3798,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DELETE_FILE,
     async (_, filePath: string, access?: FileAccessOptions): Promise<void> => {
+      requireVisibleFileAccess(access)
       const { rmSync } = await import('node:fs')
       const { resolve } = await import('node:path')
 
@@ -3784,6 +3816,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.OPEN_FILE,
     async (_, filePath: string, access?: FileAccessOptions): Promise<void> => {
+      requireVisibleFileAccess(access)
       const { resolve } = await import('node:path')
 
       const safePath = resolve(filePath)
@@ -3836,6 +3869,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.SHOW_IN_FOLDER,
     async (_, filePath: string, access?: FileAccessOptions): Promise<void> => {
+      requireVisibleFileAccess(access)
       const { resolve } = await import('node:path')
 
       const safePath = resolve(filePath)
@@ -3851,6 +3885,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.OPEN_FOLDER_IN_TERMINAL,
     async (_, folderPath: string, access?: FileAccessOptions): Promise<void> => {
+      requireVisibleFileAccess(access)
       if (process.platform !== 'darwin') {
         throw new Error('当前仅支持在 macOS 终端中打开文件夹')
       }
@@ -4036,6 +4071,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.RENAME_FILE,
     async (_, filePath: string, newName: string, access?: FileAccessOptions): Promise<void> => {
+      requireVisibleFileAccess(access)
       const { renameSync } = await import('node:fs')
       const { resolve, dirname, join, sep } = await import('node:path')
 
@@ -4058,6 +4094,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.MOVE_FILE,
     async (_, filePath: string, targetDir: string, access?: FileAccessOptions): Promise<void> => {
+      requireVisibleFileAccess(access)
       const { resolve } = await import('node:path')
 
       const safePath = resolve(filePath)
@@ -4076,6 +4113,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.LIST_ATTACHED_DIRECTORY,
     async (_, dirPath: string, access?: FileAccessOptions | string[]): Promise<FileEntry[]> => {
+      requireVisibleFileAccess(access)
       const safePath = resolve(dirPath)
       const options = normalizeFileAccessOptions(access)
       if (!isPathAllowed(safePath, options)) {
@@ -4092,6 +4130,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.READ_ATTACHED_FILE,
     async (_, filePath: string, sessionId?: string, workspaceSlug?: string): Promise<string> => {
+      if (sessionId) requireVisibleSession(sessionId)
       if (!filePath || typeof filePath !== 'string') {
         throw new Error('无效的文件路径')
       }
@@ -4156,6 +4195,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.SHOW_ATTACHED_IN_FOLDER,
     async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<void> => {
+      requireVisibleFileAccess(access)
       const { resolve } = await import('node:path')
       const safePath = resolve(filePath)
       const options = normalizeFileAccessOptions(access)
@@ -4171,6 +4211,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.RENAME_ATTACHED_FILE,
     async (_, filePath: string, newName: string, access?: FileAccessOptions | string[]): Promise<void> => {
+      requireVisibleFileAccess(access)
       const { renameSync } = await import('node:fs')
       const { resolve, dirname, join, sep } = await import('node:path')
 
@@ -4192,6 +4233,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.MOVE_ATTACHED_FILE,
     async (_, filePath: string, targetDir: string, access?: FileAccessOptions | string[]): Promise<void> => {
+      requireVisibleFileAccess(access)
       const { resolve } = await import('node:path')
 
       const safePath = resolve(filePath)
