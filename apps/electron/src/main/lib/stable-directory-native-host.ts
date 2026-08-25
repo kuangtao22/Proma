@@ -7,6 +7,9 @@ const STABLE_DIRECTORY_PROTOCOL = 1
 const DEFAULT_STARTUP_TIMEOUT_MS = 3_000
 const DEFAULT_TOTAL_TIMEOUT_MS = 15_000
 const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+const DEFAULT_MAX_ACTIVE_HELPERS = 4
+const DEFAULT_MAX_QUEUED_REQUESTS = 16
+const DEFAULT_MAX_ROOTS_PER_REQUEST = 32
 const { app } = electron
 
 export interface StableDirectoryOpenedRoot {
@@ -48,6 +51,24 @@ export interface StableDirectoryNativeHostDependencies {
   spawnProcess?: (path: string, args: string[]) => ChildProcessWithoutNullStreams
   startupTimeoutMs?: number
   totalTimeoutMs?: number
+}
+
+export interface StableDirectoryNativeHostLimits {
+  /** 同时运行的 helper 进程上限。 */
+  maxActiveHelpers?: number
+  /** 等待 helper 槽位的请求上限。 */
+  maxQueuedRequests?: number
+  /** 单次请求允许稳定打开的 root 上限。 */
+  maxRootsPerRequest?: number
+}
+
+export interface StableDirectoryNativeHost {
+  /** 在模块级资源预算内运行一次稳定目录请求。 */
+  run: (
+    request: StableDirectoryNativeRequest,
+    authorize: StableDirectoryAuthorization,
+    dependencies?: StableDirectoryNativeHostDependencies,
+  ) => Promise<StableDirectoryNativeResult>
 }
 
 type StableDirectoryAuthorization = (
@@ -129,12 +150,11 @@ function parseEntry(value: unknown, rootCount: number): StableDirectoryNativeEnt
  * 启动一次稳定目录 helper，在 OPENED 与 ALLOW 之间执行主进程授权。
  * helper 进程是单请求生命周期，任何异常、超时或取消都会终止并清理管道。
  */
-export function runStableDirectoryNative(
+function executeStableDirectoryNative(
   request: StableDirectoryNativeRequest,
   authorize: StableDirectoryAuthorization,
   dependencies: StableDirectoryNativeHostDependencies = {},
 ): Promise<StableDirectoryNativeResult> {
-  if (request.roots.length === 0) return Promise.resolve({ roots: [], entries: [] })
   const path = (dependencies.helperPath ?? defaultHelperPath)()
   if (!(dependencies.helperExists ?? existsSync)(path)) {
     return Promise.reject(new Error(`稳定目录 helper 不存在: ${path}`))
@@ -212,7 +232,7 @@ export function runStableDirectoryNative(
         openedRoots = roots
         if (startupTimer) clearTimeout(startupTimer)
         authorizationPending = true
-        void Promise.resolve(authorize(roots)).then((allowed) => {
+        void Promise.resolve().then(() => authorize(roots)).then((allowed) => {
           if (settled) return
           authorizationPending = false
           if (!allowed) {
@@ -288,4 +308,150 @@ export function runStableDirectoryNative(
       finish(new Error(`稳定目录 helper 提前退出: code=${code ?? 'null'}, signal=${signal ?? 'none'}${stderrBuffer ? `, stderr=${stderrBuffer.trim()}` : ''}`))
     })
   })
+}
+
+interface PendingStableDirectoryRequest {
+  /** 请求进入 host 的绝对截止时间。 */
+  deadline: number
+  /** 请求取消信号。 */
+  signal?: AbortSignal
+  /** 获得槽位后启动 helper。 */
+  start: (remainingTimeoutMs: number, release: () => void) => void
+  /** 排队阶段拒绝 Promise。 */
+  reject: (error: Error) => void
+  /** 排队取消监听。 */
+  abortHandler?: () => void
+  /** 排队总超时计时器。 */
+  queueTimer?: ReturnType<typeof setTimeout>
+  /** 防止取消、超时和启动重复结算。 */
+  settled: boolean
+}
+
+/** 创建带独立进程与队列预算的 stable-directory host。 */
+export function createStableDirectoryNativeHost(
+  limits: StableDirectoryNativeHostLimits = {},
+): StableDirectoryNativeHost {
+  const maxActiveHelpers = limits.maxActiveHelpers ?? DEFAULT_MAX_ACTIVE_HELPERS
+  const maxQueuedRequests = limits.maxQueuedRequests ?? DEFAULT_MAX_QUEUED_REQUESTS
+  const maxRootsPerRequest = limits.maxRootsPerRequest ?? DEFAULT_MAX_ROOTS_PER_REQUEST
+  if (!Number.isSafeInteger(maxActiveHelpers) || maxActiveHelpers <= 0
+    || !Number.isSafeInteger(maxQueuedRequests) || maxQueuedRequests < 0
+    || !Number.isSafeInteger(maxRootsPerRequest) || maxRootsPerRequest <= 0) {
+    throw new Error('稳定目录 host 资源预算非法')
+  }
+
+  let activeHelpers = 0
+  const queue: PendingStableDirectoryRequest[] = []
+
+  /** 清理排队阶段的取消与超时资源。 */
+  const cleanupPending = (pending: PendingStableDirectoryRequest): void => {
+    if (pending.abortHandler) pending.signal?.removeEventListener('abort', pending.abortHandler)
+    if (pending.queueTimer) clearTimeout(pending.queueTimer)
+  }
+
+  /** 从队列移除尚未启动的请求。 */
+  const removePending = (pending: PendingStableDirectoryRequest): void => {
+    const index = queue.indexOf(pending)
+    if (index >= 0) queue.splice(index, 1)
+  }
+
+  /** 启动一个已预留槽位的请求，并提供幂等 release。 */
+  const startPending = (pending: PendingStableDirectoryRequest): void => {
+    if (pending.settled) return
+    pending.settled = true
+    cleanupPending(pending)
+    activeHelpers += 1
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      activeHelpers -= 1
+      drainQueue()
+    }
+    const remainingTimeoutMs = pending.deadline - Date.now()
+    if (remainingTimeoutMs <= 0) {
+      release()
+      pending.reject(new Error('稳定目录请求排队超时'))
+      return
+    }
+    pending.start(remainingTimeoutMs, release)
+  }
+
+  /** 在空闲槽位内按 FIFO 唤醒排队请求。 */
+  const drainQueue = (): void => {
+    while (activeHelpers < maxActiveHelpers && queue.length > 0) {
+      const pending = queue.shift()
+      if (pending && !pending.settled) startPending(pending)
+    }
+  }
+
+  return {
+    run: (request, authorize, dependencies = {}) => {
+      if (request.roots.length === 0) return Promise.resolve({ roots: [], entries: [] })
+      if (request.roots.length > maxRootsPerRequest) {
+        return Promise.reject(new Error(`稳定目录 roots 超过上限: ${maxRootsPerRequest}`))
+      }
+      const totalTimeoutMs = dependencies.totalTimeoutMs ?? DEFAULT_TOTAL_TIMEOUT_MS
+      return new Promise<StableDirectoryNativeResult>((resolvePromise, rejectPromise) => {
+        const pending: PendingStableDirectoryRequest = {
+          deadline: Date.now() + totalTimeoutMs,
+          signal: request.signal,
+          reject: rejectPromise,
+          settled: false,
+          start: (remainingTimeoutMs, release) => {
+            const executionDependencies = { ...dependencies, totalTimeoutMs: remainingTimeoutMs }
+            void executeStableDirectoryNative(request, authorize, executionDependencies).then(
+              (result) => { release(); resolvePromise(result) },
+              (error: unknown) => {
+                release()
+                rejectPromise(error instanceof Error ? error : new Error(String(error)))
+              },
+            )
+          },
+        }
+        if (request.signal?.aborted) {
+          pending.settled = true
+          rejectPromise(new Error('稳定目录请求已取消'))
+          return
+        }
+        if (activeHelpers < maxActiveHelpers) {
+          startPending(pending)
+          return
+        }
+        if (queue.length >= maxQueuedRequests) {
+          pending.settled = true
+          rejectPromise(new Error('稳定目录请求队列已满'))
+          return
+        }
+        pending.abortHandler = () => {
+          if (pending.settled) return
+          pending.settled = true
+          removePending(pending)
+          cleanupPending(pending)
+          rejectPromise(new Error('稳定目录请求已取消'))
+        }
+        request.signal?.addEventListener('abort', pending.abortHandler, { once: true })
+        pending.queueTimer = setTimeout(() => {
+          if (pending.settled) return
+          pending.settled = true
+          removePending(pending)
+          cleanupPending(pending)
+          rejectPromise(new Error('稳定目录请求排队超时'))
+        }, Math.max(0, totalTimeoutMs))
+        queue.push(pending)
+      })
+    },
+  }
+}
+
+/** 应用进程共享的默认资源预算，避免 Renderer 并发请求无限 spawn。 */
+const defaultStableDirectoryNativeHost = createStableDirectoryNativeHost()
+
+/** 使用默认模块级资源预算运行一次稳定目录请求。 */
+export function runStableDirectoryNative(
+  request: StableDirectoryNativeRequest,
+  authorize: StableDirectoryAuthorization,
+  dependencies: StableDirectoryNativeHostDependencies = {},
+): Promise<StableDirectoryNativeResult> {
+  return defaultStableDirectoryNativeHost.run(request, authorize, dependencies)
 }

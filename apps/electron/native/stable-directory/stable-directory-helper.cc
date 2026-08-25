@@ -151,6 +151,25 @@ std::string JoinPath(const std::string& parent, const std::string& name) {
   return parent + separator + name;
 }
 
+// 把 Windows drive/UNC 绝对路径转换为 extended-length 形式；已扩展路径保持不变。
+[[maybe_unused]] std::string ToExtendedWindowsPath(const std::string& path) {
+  if (path.rfind("\\\\?\\", 0) == 0) return path;
+  if (path.rfind("\\\\", 0) == 0) return "\\\\?\\UNC\\" + path.substr(2);
+  if (path.size() >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/')) {
+    std::string normalized = path;
+    std::replace(normalized.begin(), normalized.end(), '/', '\\');
+    return "\\\\?\\" + normalized;
+  }
+  return path;
+}
+
+// 把 extended-length 路径转换为用户可见 canonical；UNC 恢复双反斜杠前缀。
+[[maybe_unused]] std::string WindowsPathForDisplay(const std::string& path) {
+  if (path.rfind("\\\\?\\UNC\\", 0) == 0) return "\\\\" + path.substr(8);
+  if (path.rfind("\\\\?\\", 0) == 0) return path.substr(4);
+  return path;
+}
+
 // 序列化单条目录结果；输入根索引、名称、路径和类型大小，返回 JSON 行。
 std::string EntryJson(std::size_t root_index, const std::string& name, const std::string& path,
                       bool is_directory, std::uint64_t size) {
@@ -374,7 +393,7 @@ std::uint64_t WindowsFileId(const BY_HANDLE_FILE_INFORMATION& identity) {
 
 // 以禁止跟随 reparse point 的方式打开 root；返回稳定对象或错误。
 bool OpenStableRoot(const std::string& requested_path, StableRoot* root, std::string* error) {
-  const std::wstring requested = Utf8ToWide(requested_path);
+  const std::wstring requested = Utf8ToWide(ToExtendedWindowsPath(requested_path));
   if (requested.empty()) { *error = "invalid UTF-8 root"; return false; }
   UniqueHandle handle(CreateFileW(requested.c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
@@ -389,11 +408,10 @@ bool OpenStableRoot(const std::string& requested_path, StableRoot* root, std::st
   std::vector<wchar_t> final_path(32768);
   const DWORD length = GetFinalPathNameByHandleW(handle.Get(), final_path.data(), static_cast<DWORD>(final_path.size()), FILE_NAME_NORMALIZED);
   if (length == 0 || length >= final_path.size()) { *error = "cannot resolve opened root"; return false; }
-  std::wstring canonical(final_path.data(), length);
-  if (canonical.rfind(L"\\\\?\\", 0) == 0) canonical.erase(0, 4);
+  const std::wstring extended_final_path(final_path.data(), length);
   root->requested_path = requested_path;
-  root->canonical_path = WideToUtf8(canonical);
-  root->canonical_wide = canonical;
+  root->canonical_path = WindowsPathForDisplay(WideToUtf8(extended_final_path));
+  root->canonical_wide = extended_final_path;
   root->identity = identity;
   root->handle = std::move(handle);
   return true;
@@ -499,7 +517,7 @@ int RunPlatform(const Config& config) {
 #endif
 
 // 解析参数并分派当前平台实现；输入 argv，返回稳定协议退出码。
-int Run(const std::vector<std::string>& args) {
+[[maybe_unused]] int Run(const std::vector<std::string>& args) {
   Config config;
   std::string error;
   if (!ParseArguments(args, &config, &error)) {
@@ -511,6 +529,7 @@ int Run(const std::vector<std::string>& args) {
 
 }  // namespace
 
+#ifndef STABLE_DIRECTORY_HELPER_LIBRARY
 #ifdef _WIN32
 int wmain(int argc, wchar_t** argv) {
   std::vector<std::string> args;
@@ -523,4 +542,5 @@ int main(int argc, char** argv) {
   for (int index = 1; index < argc; ++index) args.emplace_back(argv[index]);
   return Run(args);
 }
+#endif
 #endif
