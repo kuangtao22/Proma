@@ -5,7 +5,8 @@ import type {
   CanvasMutation,
   DesignViewport,
 } from '@proma/shared'
-import type { Edge, Node } from '@xyflow/react'
+import { Position } from '@xyflow/react'
+import type { Edge, Node, NodeHandle } from '@xyflow/react'
 import type { CanvasAgentNodeData, CanvasAgentFlowNode } from './CanvasAgentNode'
 
 /** 首版原生 Canvas 节点固定宽度，避免状态变化引发重排。 */
@@ -38,14 +39,40 @@ function projectSafeWebviewUrl(url: string): string | undefined {
 
 /** 将持久节点投影为固定尺寸且无消息读取能力的 XYFlow 节点。 */
 export function toNativeCanvasFlowNodes(document: CanvasDocument): NativeCanvasFlowNode[] {
+  /** 仅为真实边涉及的节点建立端口索引，避免无边大画布节点承担 handle 成本。 */
+  const handlesByNodeId = new Map<string, NodeHandle[]>()
+  /** 向节点追加一次静态端口；相同方向与 ID 的端口只保留一个。 */
+  const appendHandle = (nodeId: string, handle: NodeHandle): void => {
+    /** 当前节点已登记的静态端口。 */
+    const handles = handlesByNodeId.get(nodeId) ?? []
+    if (handles.some((current) => current.id === handle.id && current.type === handle.type)) return
+    handles.push(handle)
+    handlesByNodeId.set(nodeId, handles)
+  }
+  for (const edge of document.edges) {
+    appendHandle(edge.sourceNodeId, {
+      id: edge.sourcePort,
+      type: 'source',
+      position: Position.Right,
+      x: NATIVE_CANVAS_NODE_WIDTH,
+      y: NATIVE_CANVAS_NODE_HEIGHT / 2,
+    })
+    appendHandle(edge.targetNodeId, {
+      id: edge.targetPort,
+      type: 'target',
+      position: Position.Left,
+      x: 0,
+      y: NATIVE_CANVAS_NODE_HEIGHT / 2,
+    })
+  }
   return document.nodes.map((node): NativeCanvasFlowNode => {
-    /** 四类节点共享稳定布局与显式空 handles，支持大画布可见区裁剪。 */
+    /** 四类节点共享稳定布局；无边节点继续显式空 handles 以支持可见区裁剪。 */
     const base = {
       id: node.id,
       position: node.position,
       width: NATIVE_CANVAS_NODE_WIDTH,
       height: NATIVE_CANVAS_NODE_HEIGHT,
-      handles: [],
+      handles: handlesByNodeId.get(node.id) ?? [],
     }
     if (node.kind === 'agent') {
       /** 当前文档只持有会话引用；在对话状态接通前采用本地空闲态。 */

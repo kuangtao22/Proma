@@ -10,7 +10,9 @@ import type {
   Edge,
   NodeProps,
   NodeTypes,
+  OnMove,
   OnMoveEnd,
+  OnMoveStart,
   OnNodeDrag,
   OnNodesChange,
   ReactFlowProps,
@@ -68,7 +70,7 @@ export interface NativeCanvasGraphProps {
   writable: boolean
   selectedNodeId: string | null
   onMutation: (mutation: CanvasMutation) => void
-  onNodeSelect: (nodeId: string, conversationNodeId: string | null) => void
+  onNodeSelect: (nodeId: string | null, conversationNodeId: string | null) => void
   flowRenderer?: NativeCanvasFlowRenderer
 }
 
@@ -78,6 +80,39 @@ export interface NativeCanvasFlowProps extends ReactFlowProps<NativeCanvasFlowNo
   edges: Edge[]
   onNodeDragStop: OnNodeDrag<NativeCanvasFlowNode>
   onMoveEnd: OnMoveEnd
+}
+
+/** 受控 viewport 在手势期间保留远端更新，结束时优先采用权威值。 */
+export interface NativeCanvasViewportState {
+  viewport: CanvasDocument['viewport']
+  gestureActive: boolean
+  deferredViewport: CanvasDocument['viewport'] | null
+}
+
+/** viewport reducer 支持文档重渲染与手势事件按单一顺序收敛。 */
+export type NativeCanvasViewportEvent =
+  | { type: 'document-sync'; viewport: CanvasDocument['viewport'] }
+  | { type: 'move-start' }
+  | { type: 'move'; viewport: CanvasDocument['viewport'] }
+  | { type: 'move-end'; viewport: CanvasDocument['viewport'] }
+
+/** 计算下一 viewport 状态，确保恢复快照不会被迟到的本地手势覆盖。 */
+export function reduceNativeCanvasViewportState(
+  state: NativeCanvasViewportState,
+  event: NativeCanvasViewportEvent,
+): NativeCanvasViewportState {
+  if (event.type === 'document-sync') {
+    return state.gestureActive
+      ? { ...state, deferredViewport: event.viewport }
+      : { ...state, viewport: event.viewport, deferredViewport: null }
+  }
+  if (event.type === 'move-start') return { ...state, gestureActive: true, deferredViewport: null }
+  if (event.type === 'move') return { ...state, viewport: event.viewport }
+  return {
+    viewport: state.deferredViewport ?? event.viewport,
+    gestureActive: false,
+    deferredViewport: null,
+  }
 }
 
 /** 无 DOM 测试可注入的 Flow renderer。 */
@@ -99,6 +134,23 @@ export function NativeCanvasGraph({
       selected: node.id === selectedNodeId,
     }))
   ))
+  /** viewport reducer 让挂载后的远端文档更新实际同步给 XYFlow。 */
+  const [viewportState, setViewportState] = React.useState<NativeCanvasViewportState>({
+    viewport: document.viewport,
+    gestureActive: false,
+    deferredViewport: null,
+  })
+  /** 同步镜像供结束回调判断手势中是否收到了权威 viewport。 */
+  const viewportStateRef = React.useRef(viewportState)
+  viewportStateRef.current = viewportState
+  /** 同步推进 ref 与 React 状态，避免连续 XYFlow 事件受批处理时序影响。 */
+  const updateViewportState = React.useCallback((event: NativeCanvasViewportEvent): NativeCanvasViewportState => {
+    /** 基于最近一次事件结果而非最近一次 React render 计算下一状态。 */
+    const nextState = reduceNativeCanvasViewportState(viewportStateRef.current, event)
+    viewportStateRef.current = nextState
+    setViewportState(nextState)
+    return nextState
+  }, [])
 
   React.useEffect(() => {
     /** 权威文档变化时同步稳定展示字段与选中态。 */
@@ -107,6 +159,10 @@ export function NativeCanvasGraph({
       selected: node.id === selectedNodeId,
     })))
   }, [document, selectedNodeId])
+
+  React.useEffect(() => {
+    updateViewportState({ type: 'document-sync', viewport: document.viewport })
+  }, [document.viewport, updateViewportState])
 
   /** 逐帧节点变化只更新组件局部状态。 */
   const handleNodesChange = React.useCallback<OnNodesChange<NativeCanvasFlowNode>>((changes) => {
@@ -121,15 +177,45 @@ export function NativeCanvasGraph({
     onMutation(createMoveCanvasNodesMutation(movedNodes))
   }, [onMutation, writable])
 
-  /** 视口手势结束时只提交最终 viewport。 */
+  /** 视口手势开始后暂缓远端 viewport 覆盖本地逐帧反馈。 */
+  const handleMoveStart = React.useCallback<OnMoveStart>(() => {
+    updateViewportState({ type: 'move-start' })
+  }, [updateViewportState])
+
+  /** 视口逐帧变化只更新组件局部受控值。 */
+  const handleMove = React.useCallback<OnMove>((_event, viewport) => {
+    updateViewportState({ type: 'move', viewport })
+  }, [updateViewportState])
+
+  /** 视口手势结束时只提交最终 viewport；权威更新在途时直接采用远端且不回写旧值。 */
   const handleMoveEnd = React.useCallback<OnMoveEnd>((_event, viewport) => {
+    /** 手势中收到的远端 viewport 优先级高于本地结束事件。 */
+    const hasDeferredViewport = viewportStateRef.current.deferredViewport !== null
+    updateViewportState({ type: 'move-end', viewport })
     if (!writable) return
+    if (hasDeferredViewport) return
     onMutation(createViewportCanvasMutation(viewport))
-  }, [onMutation, writable])
+  }, [onMutation, updateViewportState, writable])
 
   /** 点击 Agent 时同时记录未来对话节点身份；其他节点只更新选中态。 */
   const handleNodeClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeClick']>>((_event, node) => {
     onNodeSelect(node.id, node.type === 'canvasAgent' ? node.id : null)
+  }, [onNodeSelect])
+
+  /** XYFlow 清空选择时同步清理 Jotai 的节点与对话所有权。 */
+  const handleSelectionChange = React.useCallback<NonNullable<NativeCanvasFlowProps['onSelectionChange']>>(({ nodes }) => {
+    /** 首个节点是单选合同下的唯一选区。 */
+    const node = nodes[0]
+    if (!node) {
+      onNodeSelect(null, null)
+      return
+    }
+    onNodeSelect(node.id, node.type === 'canvasAgent' ? node.id : null)
+  }, [onNodeSelect])
+
+  /** 点击空白 pane 时立即清理选区，覆盖 XYFlow 未产生 selection change 的路径。 */
+  const handlePaneClick = React.useCallback((): void => {
+    onNodeSelect(null, null)
   }, [onNodeSelect])
 
   /** 受控 Flow 属性集中声明只读连线合同。 */
@@ -137,20 +223,25 @@ export function NativeCanvasGraph({
     nodes: flowNodes,
     edges: toNativeCanvasFlowEdges(document),
     nodeTypes: NATIVE_CANVAS_NODE_TYPES,
-    defaultViewport: document.viewport,
+    viewport: viewportState.viewport,
     minZoom: 0.05,
     maxZoom: 8,
     onlyRenderVisibleElements: true,
     nodesDraggable: writable,
     nodesConnectable: false,
     elementsSelectable: true,
+    multiSelectionKeyCode: null,
     edgesFocusable: false,
     edgesReconnectable: false,
     deleteKeyCode: null,
     onNodesChange: handleNodesChange,
     onNodeDragStop: handleNodeDragStop,
+    onMoveStart: handleMoveStart,
+    onMove: handleMove,
     onMoveEnd: handleMoveEnd,
     onNodeClick: handleNodeClick,
+    onSelectionChange: handleSelectionChange,
+    onPaneClick: handlePaneClick,
   }
 
   return (

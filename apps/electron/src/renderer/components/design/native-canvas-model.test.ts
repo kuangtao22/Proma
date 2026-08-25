@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { createEmptyCanvasDocument } from '@proma/shared'
 import type { CanvasDocument, CanvasMutation } from '@proma/shared'
+import { Position } from '@xyflow/react'
 import {
   areNativeCanvasMutationsPositionOnly,
   coalesceNativeCanvasMutationsForSave,
@@ -39,7 +40,14 @@ describe('原生 Canvas 纯投影', () => {
       ['web-1', 'canvasUnsupported', { x: 7, y: 8 }],
     ])
     expect(nodes.every((node) => node.width === 288 && node.height === 144)).toBe(true)
-    expect(nodes.every((node) => node.handles?.length === 0)).toBe(true)
+    expect(nodes.find((node) => node.id === 'agent-1')?.handles).toEqual([{
+      id: 'output', type: 'source', position: Position.Right, x: 288, y: 72,
+    }])
+    expect(nodes.find((node) => node.id === 'image-1')?.handles).toEqual([{
+      id: 'input', type: 'target', position: Position.Left, x: 0, y: 72,
+    }])
+    expect(nodes.filter((node) => node.id !== 'agent-1' && node.id !== 'image-1')
+      .every((node) => node.handles?.length === 0)).toBe(true)
     expect(nodes[0]?.data).toEqual({
       id: 'agent-1', title: '研究助手', agentSessionId: 'session-1', status: 'idle',
     })

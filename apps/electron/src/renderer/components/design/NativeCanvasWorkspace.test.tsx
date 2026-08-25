@@ -7,11 +7,21 @@ import type {
   CanvasTarget,
   CanvasWorkspaceSnapshot,
 } from '@proma/shared'
+import { createStore, Provider } from 'jotai'
+import { renderToStaticMarkup } from 'react-dom/server'
 import type { NativeCanvasState } from '@/atoms/native-canvas-atoms'
-import { createInitialNativeCanvasState } from '@/atoms/native-canvas-atoms'
 import {
+  createInitialNativeCanvasState,
+  createNativeCanvasKey,
+  nativeCanvasStatesAtom,
+} from '@/atoms/native-canvas-atoms'
+import {
+  NATIVE_CANVAS_COMMIT_UNCERTAIN_CODE,
+  NATIVE_CANVAS_RECOVERY_REQUIRED_CODE,
+  NATIVE_CANVAS_REVISION_CONFLICT_CODE,
   NATIVE_CANVAS_SAVE_DEBOUNCE_MS,
   NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
+  NativeCanvasWorkspace,
   createNativeCanvasWorkspaceController,
 } from './NativeCanvasWorkspace'
 import type {
@@ -286,9 +296,118 @@ describe('原生 Canvas controller 保存', () => {
     expect(harness.getState().snapshot?.document.revision).toBe(2)
     expect(harness.getState().pendingMutations).toEqual([mutation])
   })
+
+  for (const errorCode of [
+    NATIVE_CANVAS_RECOVERY_REQUIRED_CODE,
+    NATIVE_CANVAS_COMMIT_UNCERTAIN_CODE,
+  ]) {
+    test(`Given SAVE 返回 ${errorCode} When 权威 LOAD 完成 Then 归还批次并隔离迟到回调`, async () => {
+      const harness = createHarness({ phase: 'ready', snapshot: createSnapshot(6) })
+      const mutation: CanvasMutation = { type: 'set-viewport', viewport: { x: 7, y: 8, zoom: 1.4 } }
+      harness.controller.enqueueMutation(mutation)
+      harness.scheduler.runAll()
+
+      harness.saves[0]?.deferred.reject(new Error(`${errorCode}: reload required`))
+      await flushPromises()
+
+      expect(harness.loads).toHaveLength(1)
+      expect(harness.getState()).toMatchObject({
+        pendingMutations: [mutation], inFlightMutations: [], authoritativeRecoveryState: 'loading',
+      })
+      harness.loads[0]?.resolve(createSnapshot(2))
+      await flushPromises()
+      expect(harness.getState().snapshot?.document).toMatchObject({
+        revision: 2, viewport: { x: 7, y: 8, zoom: 1.4 },
+      })
+
+      harness.saves[0]?.deferred.resolve(createSnapshot(99).document)
+      await flushPromises()
+      expect(harness.getState().snapshot?.document.revision).toBe(2)
+    })
+  }
+
+  test('Given Electron 包装 recovery-required 错误 When SAVE 失败 Then 仍按稳定错误码权威加载', async () => {
+    const harness = createHarness({ phase: 'ready', snapshot: createSnapshot(6) })
+    harness.controller.enqueueMutation({ type: 'set-viewport', viewport: { x: 3, y: 4, zoom: 1.1 } })
+    harness.scheduler.runAll()
+
+    harness.saves[0]?.deferred.reject(new Error(
+      `Error invoking remote method 'DESIGN_CANVAS_SAVE': Error: ${NATIVE_CANVAS_RECOVERY_REQUIRED_CODE}: reload required`,
+    ))
+    await flushPromises()
+
+    expect(harness.loads).toHaveLength(1)
+    expect(harness.getState().authoritativeRecoveryState).toBe('loading')
+  })
+
+  test('Given SAVE revision conflict 且仅有位置 mutation When 远端加载 Then 重放到远端并重新保存', async () => {
+    const harness = createHarness({ phase: 'ready', snapshot: createSnapshot(3) })
+    const mutation: CanvasMutation = { type: 'set-viewport', viewport: { x: 12, y: 13, zoom: 1.8 } }
+    harness.controller.enqueueMutation(mutation)
+    harness.scheduler.runAll()
+    harness.saves[0]?.deferred.reject(new Error(`${NATIVE_CANVAS_REVISION_CONFLICT_CODE}: expected=3, current=4`))
+    await flushPromises()
+
+    expect(harness.loads).toHaveLength(1)
+    harness.loads[0]?.resolve(createSnapshot(4))
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      pendingMutations: [mutation], saveState: 'dirty', authoritativeRecoveryState: 'idle',
+    })
+    expect(harness.getState().snapshot?.document.viewport).toEqual(mutation.viewport)
+    expect(harness.scheduler.getDelay()).toBe(NATIVE_CANVAS_SAVE_DEBOUNCE_MS)
+  })
+
+  test('Given SAVE revision conflict 且含结构 mutation When 远端加载 Then 保留权威结构并进入冲突', async () => {
+    const structural: CanvasMutation = { type: 'remove-nodes', nodeIds: ['agent-1'] }
+    const harness = createHarness({ phase: 'ready', snapshot: createSnapshot(3) })
+    harness.controller.enqueueMutation(structural)
+    harness.scheduler.runAll()
+    harness.saves[0]?.deferred.reject(new Error(`${NATIVE_CANVAS_REVISION_CONFLICT_CODE}: expected=3, current=4`))
+    await flushPromises()
+
+    const remote = createSnapshot(4)
+    remote.document.nodes = [{
+      id: 'remote-agent', kind: 'agent', title: '远端 Agent',
+      agentSessionId: 'remote-session', position: { x: 1, y: 2 },
+    }]
+    harness.loads[0]?.resolve(remote)
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      pendingMutations: [structural], saveState: 'conflict',
+      error: NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
+    })
+    expect(harness.getState().snapshot?.document.nodes).toEqual(remote.document.nodes)
+  })
 })
 
 describe('原生 Canvas controller 权威恢复', () => {
+  test('Given 普通 LOAD 返回 recoveredFrom 且旧 SAVE 在途 When 应用恢复快照 Then 旧回调无副作用', async () => {
+    const harness = createHarness({ phase: 'ready', snapshot: createSnapshot(5) })
+    harness.controller.start()
+    const mutation: CanvasMutation = { type: 'set-viewport', viewport: { x: 4, y: 5, zoom: 1.2 } }
+    harness.controller.enqueueMutation(mutation)
+    harness.scheduler.runAll()
+    harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph' })
+
+    const recovered = { ...createSnapshot(1), recoveredFrom: 'backup' as const }
+    harness.loads[1]?.resolve(recovered)
+    await flushPromises()
+    expect(harness.getState()).toMatchObject({
+      pendingMutations: [mutation], inFlightMutations: [], saveState: 'dirty',
+    })
+    expect(harness.getState().snapshot?.document).toMatchObject({
+      revision: 1, viewport: { x: 4, y: 5, zoom: 1.2 },
+    })
+
+    harness.saves[0]?.deferred.resolve(createSnapshot(88).document)
+    await flushPromises()
+    expect(harness.getState().snapshot?.document.revision).toBe(1)
+    expect(harness.getState().pendingMutations).toEqual([mutation])
+  })
+
   test('Given 在途与待保存均为位置类 When recovery 成功 Then 归还、重放并稍后自动保存', async () => {
     const base = createSnapshot(2)
     base.document.nodes = [{
@@ -351,6 +470,24 @@ describe('原生 Canvas controller 权威恢复', () => {
     harness.loads[0]?.resolve(createSnapshot(9))
     await flushPromises()
     expect(harness.getState().snapshot?.document.revision).toBe(1)
+  })
+
+  test('Given 已进入结构冲突 When 采用远端版本 Then 丢弃旧 mutation 并恢复可编辑状态', () => {
+    const structural: CanvasMutation = { type: 'remove-nodes', nodeIds: ['agent-1'] }
+    const remote = createSnapshot(7)
+    const harness = createHarness({
+      phase: 'ready', snapshot: remote, pendingMutations: [structural],
+      inFlightMutations: [structural], saveState: 'conflict',
+      error: NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
+    })
+
+    harness.controller.acceptRemoteVersion()
+
+    expect(harness.getState()).toMatchObject({
+      snapshot: remote, pendingMutations: [], inFlightMutations: [],
+      saveState: 'saved', error: null,
+    })
+    expect(harness.scheduler.getDelay()).toBeUndefined()
   })
 
   test('Given 结构 pending 与 deferred graph When recovery 后对账 Then 始终展示权威结构且保留冲突', async () => {
@@ -465,5 +602,41 @@ describe('原生 Canvas controller 权威恢复', () => {
       deferredGraphRevision: null, saveState: 'dirty',
     })
     expect(canvasB.getState().pendingMutations).toEqual([])
+  })
+})
+
+describe('原生 Canvas 冲突提示', () => {
+  test('Given 结构冲突 When 渲染工作区 Then 明确提示并提供采用远端版本动作', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const store = createStore()
+    store.set(nativeCanvasStatesAtom, new Map([[
+      createNativeCanvasKey(target.projectId, target.canvasId),
+      {
+        ...createInitialNativeCanvasState(),
+        phase: 'ready',
+        snapshot: createSnapshot(7),
+        pendingMutations: [{ type: 'remove-nodes', nodeIds: ['agent-1'] }],
+        saveState: 'conflict',
+        error: NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
+      },
+    ]]))
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          target={target}
+          title="冲突 Canvas"
+          adapter={{
+            loadCanvas: async () => createSnapshot(7),
+            saveCanvas: async () => createSnapshot(8).document,
+            onCanvasChanged: () => () => {},
+          }}
+          flowRenderer={() => <div />}
+        />
+      </Provider>,
+    )
+
+    expect(html).toContain(NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE)
+    expect(html).toContain('采用远端版本')
   })
 })

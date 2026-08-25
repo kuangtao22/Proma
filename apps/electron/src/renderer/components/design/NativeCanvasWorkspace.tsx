@@ -29,6 +29,12 @@ import {
 
 /** 原生 Canvas 自动保存采用 400ms 尾触发。 */
 export const NATIVE_CANVAS_SAVE_DEBOUNCE_MS = 400
+/** SAVE 要求立即加载权威恢复快照的稳定错误前缀。 */
+export const NATIVE_CANVAS_RECOVERY_REQUIRED_CODE = 'CANVAS_RECOVERY_REQUIRED'
+/** SAVE 基线 revision 已落后的稳定错误前缀。 */
+export const NATIVE_CANVAS_REVISION_CONFLICT_CODE = 'CANVAS_REVISION_CONFLICT'
+/** SAVE 提交结果无法确认时的稳定错误前缀。 */
+export const NATIVE_CANVAS_COMMIT_UNCERTAIN_CODE = 'CANVAS_COMMIT_UNCERTAIN'
 /** 无法安全重放结构修改时显示的稳定冲突文本。 */
 export const NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE = 'Canvas 结构已在恢复期间变化，请处理本地结构冲突'
 
@@ -66,6 +72,7 @@ export interface NativeCanvasWorkspaceController {
   retryLoad: () => void
   retrySave: () => void
   retryRecovery: () => void
+  acceptRemoteVersion: () => void
   dispose: () => void
 }
 
@@ -78,6 +85,17 @@ interface ActiveNativeCanvasSave {
 /** 将未知异常转换为稳定用户文本。 */
 function getNativeCanvasErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Canvas 操作失败'
+}
+
+/** 从主进程稳定消息前缀识别需要权威 LOAD 的 SAVE 错误。 */
+function isNativeCanvasAuthoritativeSaveError(error: unknown): boolean {
+  /** 非 Error 值没有稳定前缀，继续沿用普通失败路径。 */
+  if (!(error instanceof Error)) return false
+  return [
+    NATIVE_CANVAS_RECOVERY_REQUIRED_CODE,
+    NATIVE_CANVAS_REVISION_CONFLICT_CODE,
+    NATIVE_CANVAS_COMMIT_UNCERTAIN_CODE,
+  ].some((code) => error.message.includes(code))
 }
 
 /** 创建无 React 依赖、绑定固定双身份的原生 Canvas controller。 */
@@ -129,6 +147,14 @@ export function createNativeCanvasWorkspaceController(
       inFlightMutations: [],
       saveState: 'dirty',
     }))
+  }
+
+  /** 统一阻断旧 SAVE/普通 LOAD，并把在途 mutation 归还给当前权威切换。 */
+  const fenceAuthoritativeSnapshot = (): void => {
+    clearSaveTimer()
+    restoreActiveSave()
+    saveGeneration += 1
+    ordinaryLoadGeneration += 1
   }
 
   /** 权威恢复成功后按位置/结构边界接管新快照。 */
@@ -204,6 +230,8 @@ export function createNativeCanvasWorkspaceController(
       if (disposed || !isCurrentRequest()) return
       if (authoritative || snapshot.recoveredFrom) {
         if (authoritative) authoritativeRecoveryInFlight = false
+        /** 普通 LOAD 也可能在磁盘提升后返回恢复快照，必须执行完整 SAVE fence。 */
+        if (!authoritative) fenceAuthoritativeSnapshot()
         applyAuthoritativeSnapshot(snapshot)
         flushDeferredGraphRefresh(snapshot.document.revision)
         return
@@ -242,9 +270,7 @@ export function createNativeCanvasWorkspaceController(
   /** 开始权威恢复：先归还在途所有权，再失效旧 SAVE 与 LOAD 回调。 */
   const startAuthoritativeRecovery = (): void => {
     if (disposed) return
-    clearSaveTimer()
-    restoreActiveSave()
-    saveGeneration += 1
+    fenceAuthoritativeSnapshot()
     dependencies.updateState((latest) => ({
       phase: latest.snapshot ? 'ready' : 'loading',
       inFlightMutations: [],
@@ -297,6 +323,11 @@ export function createNativeCanvasWorkspaceController(
         scheduleSave()
       }).catch((error: unknown) => {
         if (disposed || generation !== saveGeneration || activeSave !== request) return
+        if (isNativeCanvasAuthoritativeSaveError(error)) {
+          /** 由 recovery-required、revision conflict 与 commit-uncertain 共同进入权威 LOAD。 */
+          startAuthoritativeRecovery()
+          return
+        }
         activeSave = null
         dependencies.updateState((latest) => ({
           pendingMutations: [...batch, ...latest.pendingMutations],
@@ -377,6 +408,20 @@ export function createNativeCanvasWorkspaceController(
     retryRecovery: () => {
       if (disposed || dependencies.getState().authoritativeRecoveryState !== 'failed') return
       startAuthoritativeRecovery()
+    },
+    acceptRemoteVersion: () => {
+      if (disposed || dependencies.getState().saveState !== 'conflict') return
+      clearSaveTimer()
+      /** 用户明确采用远端版本时丢弃冲突 batch，并隔离任何旧 SAVE 回调。 */
+      activeSave = null
+      saveGeneration += 1
+      dependencies.updateState({
+        pendingMutations: [],
+        inFlightMutations: [],
+        saveState: 'saved',
+        authoritativeRecoveryState: 'idle',
+        error: null,
+      })
     },
     dispose: () => {
       if (disposed) return
@@ -477,7 +522,18 @@ export function NativeCanvasWorkspace({
               })}
               flowRenderer={flowRenderer}
             />
-            {(state.authoritativeRecoveryState === 'failed'
+            {state.saveState === 'conflict' ? (
+              <div className="absolute inset-x-3 top-3 flex items-center justify-between gap-3 rounded-[8px] border border-destructive/30 bg-background/95 px-3 py-2 shadow-sm">
+                <p className="truncate text-xs text-destructive">{state.error}</p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => controllerRef.current?.acceptRemoteVersion()}
+                >
+                  采用远端版本
+                </Button>
+              </div>
+            ) : (state.authoritativeRecoveryState === 'failed'
               || (state.saveState === 'failed' && state.authoritativeRecoveryState === 'idle')) ? (
               <div className="absolute inset-x-3 top-3 flex items-center justify-between gap-3 rounded-[8px] border border-destructive/30 bg-background/95 px-3 py-2 shadow-sm">
                 <p className="truncate text-xs text-destructive">{state.error}</p>
