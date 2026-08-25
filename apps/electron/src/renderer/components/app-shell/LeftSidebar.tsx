@@ -2723,6 +2723,64 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
 
   const agentArchivedVirtualRows = React.useMemo<VirtualSidebarRow[]>(() => {
     const rows: VirtualSidebarRow[] = []
+    /** Canvas 归档固定置顶，避免 Agent 历史异步加载后把入口挤到长列表末尾。 */
+    const archivedCanvasGroups = workspaces.map((workspace) => ({
+      workspace,
+      sessions: (canvasSessionsByProject.get(workspace.id) ?? []).filter((session) => session.archived),
+      status: canvasSessionStatusByProject.get(workspace.id),
+    })).filter((group) => (
+      group.sessions.length > 0
+      || group.status?.phase === 'failed'
+      || group.status?.phase === 'loading'
+    ))
+
+    if (archivedCanvasGroups.length > 0) {
+      rows.push({
+        id: 'canvas-archived-heading',
+        estimateSize: 30,
+        content: <div className="px-3 pt-2 pb-1 text-[13px] font-medium leading-[18px] text-foreground/40 select-none">Canvas</div>,
+      })
+    }
+
+    for (const group of archivedCanvasGroups) {
+      rows.push({
+        id: `canvas-archived-project-${group.workspace.id}`,
+        estimateSize: 26,
+        content: <div className="px-4 pt-1.5 pb-0.5 text-[12px] text-foreground/35 select-none">{group.workspace.name}</div>,
+      })
+      for (const canvasSession of group.sessions) {
+        rows.push({
+          id: `canvas-archived-${canvasSession.projectId}-${canvasSession.id}`,
+          estimateSize: 34,
+          content: (
+            <div className="px-3">
+              <CanvasSessionItem
+                session={canvasSession}
+                active={false}
+                selectDisabled
+                onSelect={handleSelectCanvasSession}
+                onRename={handleRenameCanvasSession}
+                onToggleArchive={handleToggleArchiveCanvasSession}
+              />
+            </div>
+          ),
+        })
+      }
+      if (group.status?.phase === 'failed') {
+        rows.push({
+          id: `canvas-archived-error-${group.workspace.id}`,
+          estimateSize: 28,
+          content: <div role="status" className="px-4 py-0.5 text-[12px] text-destructive/75 select-none">Canvas 加载失败</div>,
+        })
+      } else if (group.status?.phase === 'loading' && group.sessions.length === 0) {
+        rows.push({
+          id: `canvas-archived-loading-${group.workspace.id}`,
+          estimateSize: 28,
+          content: <div className="px-4 py-0.5 text-[12px] text-foreground/25 select-none">正在加载 Canvas…</div>,
+        })
+      }
+    }
+
     for (const group of archivedAgentSessionTrees) {
       rows.push({
         id: `agent-archived-date-${group.label}`,
@@ -2798,63 +2856,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
       }
     }
 
-    /** 归档 Canvas 按项目展示，避免与按日期分组的 Agent 会话混淆。 */
-    const archivedCanvasGroups = workspaces.map((workspace) => ({
-      workspace,
-      sessions: (canvasSessionsByProject.get(workspace.id) ?? []).filter((session) => session.archived),
-      status: canvasSessionStatusByProject.get(workspace.id),
-    })).filter((group) => (
-      group.sessions.length > 0
-      || group.status?.phase === 'failed'
-      || group.status?.phase === 'loading'
-    ))
-
-    if (archivedCanvasGroups.length > 0) {
-      rows.push({
-        id: 'canvas-archived-heading',
-        estimateSize: 30,
-        content: <div className="px-3 pt-2 pb-1 text-[13px] font-medium leading-[18px] text-foreground/40 select-none">Canvas</div>,
-      })
-    }
-
-    for (const group of archivedCanvasGroups) {
-      rows.push({
-        id: `canvas-archived-project-${group.workspace.id}`,
-        estimateSize: 26,
-        content: <div className="px-4 pt-1.5 pb-0.5 text-[12px] text-foreground/35 select-none">{group.workspace.name}</div>,
-      })
-      for (const canvasSession of group.sessions) {
-        rows.push({
-          id: `canvas-archived-${canvasSession.projectId}-${canvasSession.id}`,
-          estimateSize: 34,
-          content: (
-            <div className="px-3">
-              <CanvasSessionItem
-                session={canvasSession}
-                active={false}
-                selectDisabled
-                onSelect={handleSelectCanvasSession}
-                onRename={handleRenameCanvasSession}
-                onToggleArchive={handleToggleArchiveCanvasSession}
-              />
-            </div>
-          ),
-        })
-      }
-      if (group.status?.phase === 'failed') {
-        rows.push({
-          id: `canvas-archived-error-${group.workspace.id}`,
-          estimateSize: 28,
-          content: <div role="status" className="px-4 py-0.5 text-[12px] text-destructive/75 select-none">Canvas 加载失败</div>,
-        })
-      } else if (group.status?.phase === 'loading' && group.sessions.length === 0) {
-        rows.push({
-          id: `canvas-archived-loading-${group.workspace.id}`,
-          estimateSize: 28,
-          content: <div className="px-4 py-0.5 text-[12px] text-foreground/25 select-none">正在加载 Canvas…</div>,
-        })
-      }
-    }
     return rows
   }, [activeSessionId, agentIndicatorMap, archivedAgentSessionTrees, canvasSessionsByProject, canvasSessionStatusByProject, collapsedDelegationParentIds, expandedDelegationParentIds, handleAgentRename, handleRenameCanvasSession, handleRequestDelete, handleRequestMove, handleSelectAgentSession, handleToggleArchiveAgent, handleToggleArchiveCanvasSession, handleToggleDelegationParent, handleTogglePinAgent, handleToggleStarAgent, relativeTimeNow, sessionHoverPreviewEnabled, workspaceNameMap, workspaces])
 

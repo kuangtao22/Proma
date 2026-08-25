@@ -146,3 +146,5 @@
 - 2026-08-25：Agent 项目会话中的高置信度视觉请求必须在发送前询问“打开设计面板/继续 Agent 实现”；Design 交接先切到会话所属项目，只预填原始要求且不自动生图。明确代码实现和普通分析不拦截，未命中本地判断的歧义表达由 Agent 系统提示词继续澄清，禁止把“设计”默认解释为修改代码。
 - 2026-08-25：用户确认以项目下 `Canvas` 会话类型替代“一项目一张全局 Design 画布”：每个 Canvas 可包含多个独立 Pi Agent、生图、视觉文档和底层 `webview`/界面“原型”模块；连线是显式数据与任务合同，无连线完全独立。Agent 按语义自动建模块和连线，讨论只建待运行结构，明确执行才调用付费能力，上游变化仅标记下游待更新；旧 Design 迁移为默认 Canvas 并保留素材、任务、版本和布局。
 - 2026-08-25：Canvas 顶层会话基础使用项目内独立原子索引，不写入 `AgentSessionMeta` 或 Agent 会话索引；旧 `.proma/design/canvas.json` 仅在列表时以固定 `legacy-design` ID 幂等投影，现有 Design Store、生图、素材、任务和 trace 继续使用旧路径，待后续迁移阶段显式切换。
+- 2026-08-25：Renderer Canvas registry 独立于 Agent atoms；`legacy-design` 是唯一允许加载旧 Design 工作区的兼容入口，原生 Canvas 缺少独立文档时显示空画布，禁止别名复用旧画布。Agent 发起 Design 转交时使用确定性的 legacy Canvas 选择；所有普通会话统一导航入口在守卫通过后必须清理 Canvas 选择，避免顶部身份与主视图不一致。
+- 2026-08-25：归档 Canvas 分组固定排在 Agent 归档历史之前，避免 Agent 归档异步加载或超长历史列表把 Canvas 恢复入口挤到列表末尾；归档状态仍只由项目 Canvas 原子索引维护。
