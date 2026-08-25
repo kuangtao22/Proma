@@ -332,6 +332,101 @@ describe('飞书 Bridge 会话边界', () => {
 
     expect(startedSessions).toEqual([])
   })
+
+  test('Given 发送处理中会话迁移到另一项目 When 即将启动 Agent Then 拒绝混用旧附件上下文与新项目', async () => {
+    sessions.clear()
+    startedSessions.length = 0
+    sessions.set('workspace-race', createSession('workspace-race'))
+    const { FeishuBridge } = await import('./feishu-bridge')
+    const bridge = new FeishuBridge({
+      id: 'bot-workspace-race', name: '项目竞态', enabled: true, appId: 'app-id', appSecret: 'encrypted',
+    } as FeishuBotConfig)
+    const exposed = bridge as unknown as {
+      client: unknown
+      chatBindings: Map<string, FeishuChatBinding>
+      sessionToChat: Map<string, string>
+      saveBindings: () => void
+      handleUserMessage: (context: FeishuMessageContext, text: string) => Promise<void>
+    }
+    const binding: FeishuChatBinding = {
+      chatId: 'chat-workspace-race', botId: 'bot-workspace-race', userId: 'user-1',
+      sessionId: 'workspace-race', workspaceId: 'project-1', channelId: 'channel-1',
+      source: 'feishu', chatType: 'p2p', createdAt: 1, lastUsedAt: 1,
+    }
+    exposed.chatBindings.set(binding.chatId, binding)
+    exposed.sessionToChat.set(binding.sessionId, binding.chatId)
+    exposed.saveBindings = () => undefined
+    exposed.client = {
+      cardkit: { v1: { card: {
+        create: async () => {
+          sessions.set('workspace-race', createSession('workspace-race', { workspaceId: 'project-2' }))
+          return { data: { card_id: 'card-workspace-race' } }
+        },
+        update: async () => undefined,
+      } } },
+      im: { message: {
+        create: async () => ({ data: { message_id: 'message-workspace-race' } }),
+        reply: async () => ({ data: { message_id: 'reply-workspace-race' } }),
+      } },
+    }
+
+    await exposed.handleUserMessage({
+      chatId: binding.chatId, senderOpenId: 'user-1', messageId: 'incoming-workspace-race', chatType: 'p2p',
+    }, '继续执行')
+
+    expect(startedSessions).toEqual([])
+  })
+
+  test('Given 流式卡创建失败且会话同时转为内部会话 When 启动前拒绝 Then 所有本次运行状态均清空', async () => {
+    sessions.clear()
+    startedSessions.length = 0
+    sessions.set('no-card-race', createSession('no-card-race'))
+    const { FeishuBridge } = await import('./feishu-bridge')
+    const bridge = new FeishuBridge({
+      id: 'bot-no-card', name: '无卡竞态', enabled: true, appId: 'app-id', appSecret: 'encrypted',
+    } as FeishuBotConfig)
+    const exposed = bridge as unknown as {
+      client: unknown
+      chatBindings: Map<string, FeishuChatBinding>
+      sessionToChat: Map<string, string>
+      sessionBuffers: Map<string, unknown>
+      streamingRunStates: Map<string, unknown>
+      streamingCards: Map<string, unknown>
+      streamingCardsUsedSessions: Set<string>
+      saveBindings: () => void
+      handleUserMessage: (context: FeishuMessageContext, text: string) => Promise<void>
+    }
+    const binding: FeishuChatBinding = {
+      chatId: 'chat-no-card', botId: 'bot-no-card', userId: 'user-1', sessionId: 'no-card-race',
+      workspaceId: 'project-1', channelId: 'channel-1', source: 'feishu', chatType: 'p2p',
+      createdAt: 1, lastUsedAt: 1,
+    }
+    exposed.chatBindings.set(binding.chatId, binding)
+    exposed.sessionToChat.set(binding.sessionId, binding.chatId)
+    exposed.saveBindings = () => undefined
+    exposed.client = {
+      cardkit: { v1: { card: {
+        create: async () => {
+          sessions.set('no-card-race', createSession('no-card-race', { sourceCanvasNodeId: 'node-1' }))
+          throw new Error('card open failed')
+        },
+      } } },
+      im: { message: {
+        create: async () => ({ data: { message_id: 'message-no-card' } }),
+        reply: async () => ({ data: { message_id: 'reply-no-card' } }),
+      } },
+    }
+
+    await exposed.handleUserMessage({
+      chatId: binding.chatId, senderOpenId: 'user-1', messageId: 'incoming-no-card', chatType: 'p2p',
+    }, '继续执行')
+
+    expect(startedSessions).toEqual([])
+    expect(exposed.sessionBuffers.size).toBe(0)
+    expect(exposed.streamingRunStates.size).toBe(0)
+    expect(exposed.streamingCards.size).toBe(0)
+    expect(exposed.streamingCardsUsedSessions.size).toBe(0)
+  })
 })
 
 describe('Canvas Agent Collaboration 边界', () => {
