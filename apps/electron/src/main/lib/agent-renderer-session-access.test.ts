@@ -73,56 +73,75 @@ const NON_AGENT_FILE_CHANNELS = new Set([
   'file:read-binary-base64',
 ])
 
-/** 显式展开 namespace/channel，新增 handler 必须先完成安全语义登记。 */
-function defineRendererHandlerKeys(namespace: string, channels: readonly string[]): string[] {
-  return channels.map((channel) => `${namespace}:${channel}`)
+type FullChannelKey = `${string}:${string}`
+
+type RendererHandlerPolicy =
+  | { kind: 'agent-session' | 'path', guards: readonly string[] }
+  | { kind: 'exempt', reason: string }
+
+/** 为一组同语义 channel 逐项生成完整 key policy，不提供任何默认或 fallback。 */
+function defineRendererHandlerPolicies(
+  namespace: string,
+  channels: readonly string[],
+  policy: RendererHandlerPolicy,
+): Record<FullChannelKey, RendererHandlerPolicy> {
+  return Object.fromEntries(
+    channels.map((channel) => [`${namespace}:${channel}` as FullChannelKey, policy]),
+  ) as Record<FullChannelKey, RendererHandlerPolicy>
 }
 
-/** ipc.ts 当前全部 Renderer handler 的审计基线；严禁按参数名动态推断分类。 */
-const ALL_RENDERER_HANDLER_KEYS = [
-  ...defineRendererHandlerKeys('AGENT_IPC_CHANNELS', [
+/** 显式豁免理由可共享文案，但每个完整 key 都必须在最终 Record 中绑定 policy。 */
+const EXEMPT_REASONS = {
+  AGENT_IPC_CHANNELS: "入口使用 workspace、skill、dialog 或已单独验证的 request owner 能力，不接收未校验的普通 Agent sessionId/文件读取能力",
+  APP_ICON_IPC_CHANNELS: "只更新应用图标，不接收 sessionId 或文件路径",
+  AUTOMATION_IPC_CHANNELS: "ID 属于 Automation 任务，不是 Agent 会话 ID；任务存储自行校验输入",
+  CHANNEL_IPC_CHANNELS: "ID 与凭据属于模型渠道配置，不是 Agent 会话或 Renderer 文件能力",
+  CHAT_IPC_CHANNELS: "session/conversation ID 属于旧 Chat 域，不是普通 Agent 会话 ID；附件由 Chat 存储边界管理",
+  CHAT_TOOL_IPC_CHANNELS: "ID 属于自定义工具配置，不是 Agent 会话或 Renderer 文件能力",
+  DINGTALK_IPC_CHANNELS: "ID 属于钉钉 Bot/连接，不是 Agent 会话或 Renderer 文件能力",
+  DOCK_BADGE_IPC_CHANNELS: "只更新 Dock 数字，不接收 sessionId 或文件路径",
+  ENVIRONMENT_IPC_CHANNELS: "只检查本机运行环境，不接收 sessionId 或 Renderer 文件路径",
+  FEISHU_IPC_CHANNELS: "除显式绑定入口外，ID 属于飞书 Bot/chat/注册流程，不是 Agent 会话 ID",
+  GITHUB_RELEASE_IPC_CHANNELS: "参数属于发布版本查询，不是 Agent 会话或 Renderer 文件能力",
+  INSTALLER_IPC_CHANNELS: "参数属于受管安装任务/产物，不是 Agent 会话或任意 Renderer 文件读取能力",
+  IPC_CHANNELS: "入口属于窗口、运行时或系统能力；所有 Renderer 文件路径入口已逐 key 列入 guarded 表",
+  PLANNING_IPC_CHANNELS: "ID 属于 Todo、日历、同步连接或提醒，不是 Agent 会话 ID；无任意文件读取能力",
+  PROXY_IPC_CHANNELS: "只管理代理配置，不接收 sessionId 或文件路径",
+  QUICK_TASK_IPC_CHANNELS: "Quick Task 使用自身窗口与提交模型，不接收普通 Agent 会话 ID 或任意文件读取能力",
+  SCRATCH_PAD_IPC_CHANNELS: "路径来自主进程选择的导出 capability，不是任意 Renderer 文件读取入口",
+  SETTINGS_IPC_CHANNELS: "只管理应用设置，不接收 sessionId 或文件路径",
+  STORAGE_IPC_CHANNELS: "只执行受管存储统计/清理，不接收 Renderer 指定路径",
+  SYSTEM_PROMPT_IPC_CHANNELS: "ID 属于系统提示词配置，不是 Agent 会话或 Renderer 文件能力",
+  USER_PROFILE_IPC_CHANNELS: "只管理用户资料，不接收 sessionId 或文件路径",
+  VOICE_DICTATION_IPC_CHANNELS: "sessionId 是 ASR 流实例 ID，不是 Agent 会话 ID；音频数据由语音模块自行隔离",
+  WECHAT_IPC_CHANNELS: "ID 属于微信桥接登录/连接，不是 Agent 会话或 Renderer 文件能力",
+} as const
+
+/** 全部 Renderer handler 的单一逐 key 策略产物。 */
+const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> = {
+  ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
     'ADD_WORKTREE_REPO',
     'APPROVE_WORKSPACE_PROJECT_KNOWLEDGE_MAINTENANCE',
-    'ASK_USER_RESPOND',
-    'ATTACH_DIRECTORY',
-    'ATTACH_FILE',
     'ATTACH_WORKSPACE_DIRECTORY',
     'ATTACH_WORKSPACE_FILE',
     'BATCH_IMPORT_SKILLS_FROM_WORKSPACES',
-    'CANCEL_QUEUED_MESSAGE',
-    'CHECK_PATHS_TYPE',
-    'CLEAR_COMPLETION_STATE',
-    'CLOSE_BROWSER',
-    'CLOSE_BROWSER_TAB',
     'CONFIRM_WORKSPACE_MEMORY_WINDOW_CLOSE',
     'COUNT_ARCHIVED_SESSIONS',
-    'CREATE_BROWSER_TAB',
     'CREATE_PROJECT',
     'CREATE_SESSION',
     'CREATE_SKILL_ENTRY',
     'CREATE_WORKSPACE',
-    'DELETE_FILE',
-    'DELETE_SESSION',
     'DELETE_SKILL',
     'DELETE_SKILL_ENTRY',
     'DELETE_WORKSPACE',
-    'DETACH_DIRECTORY',
-    'DETACH_FILE',
     'DETACH_WORKSPACE_DIRECTORY',
     'DETACH_WORKSPACE_FILE',
-    'ENQUEUE_QUEUED_MESSAGE',
-    'EXIT_PLAN_MODE_RESPOND',
-    'FORK_SESSION',
     'GENERATE_TITLE',
-    'GET_BROWSER_STATE',
     'GET_CAPABILITIES',
     'GET_DEFAULT_SKILL_SLUGS',
     'GET_MCP_CONFIG',
     'GET_OTHER_WORKSPACE_SKILLS',
-    'GET_PENDING_REQUESTS',
     'GET_PI_REASONING_CAPABILITY',
-    'GET_SDK_MESSAGES',
-    'GET_SESSION_PATH',
     'GET_SKILLS',
     'GET_SKILLS_DIR',
     'GET_WORKSPACE_ATTACHED_FILES',
@@ -130,76 +149,35 @@ const ALL_RENDERER_HANDLER_KEYS = [
     'GET_WORKSPACE_FILES_PATH',
     'GET_WORKSPACE_MEMORY_SUMMARY',
     'GET_WORKTREE_REPOS',
-    'GO_BACK_BROWSER',
-    'GO_FORWARD_BROWSER',
     'IMPORT_SKILL_FROM_WORKSPACE',
     'LIST_ACTIVE_SESSIONS',
     'LIST_ARCHIVED_SESSIONS',
-    'LIST_ATTACHED_DIRECTORY',
-    'LIST_BROWSER_TABS',
-    'LIST_DIRECTORY',
     'LIST_SESSIONS',
     'LIST_SKILL_FILES',
     'LIST_WORKSPACES',
     'LIST_WORKSPACE_AUTO_MEMORY_FILES',
-    'MIGRATE_CHAT_TO_AGENT',
-    'MINIMIZE_BROWSER',
-    'MOVE_ATTACHED_FILE',
-    'MOVE_FILE',
-    'MOVE_QUEUED_MESSAGE',
-    'MOVE_SESSION_TO_WORKSPACE',
-    'NAVIGATE_BROWSER',
-    'OPEN_BROWSER',
-    'OPEN_FILE',
     'OPEN_FILE_OR_FOLDER_DIALOG',
     'OPEN_FOLDER_DIALOG',
-    'OPEN_FOLDER_IN_TERMINAL',
     'OPEN_WORKSPACE_MEMORY_WINDOW',
-    'PERMISSION_RESPOND',
-    'QUEUE_MESSAGE',
-    'READ_ATTACHED_FILE',
     'READ_SKILL_CONTENT',
     'READ_SKILL_FILE',
     'READ_WORKSPACE_AGENTS_MD',
     'READ_WORKSPACE_AUTO_MEMORY_FILE',
     'RELINK_WORKSPACE_PROJECT_ROOT',
-    'RELOAD_BROWSER',
     'REMOVE_WORKTREE_REPO',
-    'RENAME_ATTACHED_FILE',
-    'RENAME_FILE',
     'RENAME_SKILL_ENTRY',
     'REORDER_WORKSPACES',
     'RESTORE_WORKSPACE_PROJECT_ROOT',
-    'REWIND_SESSION',
-    'SAVE_FILES_TO_SESSION',
     'SAVE_FILES_TO_WORKSPACE',
     'SAVE_MCP_CONFIG',
     'SEARCH_MESSAGES',
     'SEARCH_SESSION_REFERENCES',
-    'SEARCH_WORKSPACE_FILES',
-    'SELECT_BROWSER_TAB',
-    'SEND_MESSAGE',
-    'SET_ACTIVE_WORKTREE',
-    'SET_BROWSER_LAYOUT',
     'SET_BUILTIN_MCP_ENABLED',
-    'SET_VISIBLE_STREAM_SESSION',
-    'SHOW_ATTACHED_IN_FOLDER',
-    'SHOW_IN_FOLDER',
     'START_WORKSPACE_MEMORY_WATCH',
-    'STOP_AGENT',
     'STOP_WORKSPACE_MEMORY_WATCH',
-    'SUBMIT_OR_ENQUEUE_MESSAGE',
     'TEST_MCP_SERVER',
-    'TOGGLE_ARCHIVE',
-    'TOGGLE_PIN',
     'TOGGLE_SKILL',
-    'TOGGLE_STAR',
-    'UPDATE_SESSION_CODEX_FAST_MODE',
-    'UPDATE_SESSION_MODEL',
-    'UPDATE_SESSION_PERMISSION_MODE',
-    'UPDATE_SESSION_REASONING_LEVEL',
     'UPDATE_SKILL_FROM_SOURCE',
-    'UPDATE_TITLE',
     'UPDATE_WORKSPACE',
     'WORKSPACE_MEMORY_WINDOW_READY',
     'WRITE_CLIPBOARD_PREVIEW',
@@ -207,19 +185,19 @@ const ALL_RENDERER_HANDLER_KEYS = [
     'WRITE_SKILL_FILE',
     'WRITE_WORKSPACE_AGENTS_MD',
     'WRITE_WORKSPACE_AUTO_MEMORY_FILE',
-  ]),
-  ...defineRendererHandlerKeys('APP_ICON_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.AGENT_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('APP_ICON_IPC_CHANNELS', [
     'SET',
-  ]),
-  ...defineRendererHandlerKeys('AUTOMATION_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.APP_ICON_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('AUTOMATION_IPC_CHANNELS', [
     'CREATE',
     'DELETE',
     'LIST',
     'RUN_NOW',
     'TOGGLE',
     'UPDATE',
-  ]),
-  ...defineRendererHandlerKeys('CHANNEL_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.AUTOMATION_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('CHANNEL_IPC_CHANNELS', [
     'CODEX_OAUTH_CANCEL',
     'CODEX_OAUTH_LOGIN',
     'CREATE',
@@ -233,8 +211,8 @@ const ALL_RENDERER_HANDLER_KEYS = [
     'UPDATE',
     'XAI_OAUTH_CANCEL',
     'XAI_OAUTH_LOGIN',
-  ]),
-  ...defineRendererHandlerKeys('CHAT_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.CHANNEL_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('CHAT_IPC_CHANNELS', [
     'CREATE_CONVERSATION',
     'CREATE_WELCOME_CONVERSATION',
     'DELETE_ATTACHMENT',
@@ -260,8 +238,8 @@ const ALL_RENDERER_HANDLER_KEYS = [
     'UPDATE_CONTEXT_DIVIDERS',
     'UPDATE_MODEL',
     'UPDATE_TITLE',
-  ]),
-  ...defineRendererHandlerKeys('CHAT_TOOL_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.CHAT_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('CHAT_TOOL_IPC_CHANNELS', [
     'CREATE_CUSTOM_TOOL',
     'DELETE_CUSTOM_TOOL',
     'GET_ALL_TOOLS',
@@ -269,8 +247,8 @@ const ALL_RENDERER_HANDLER_KEYS = [
     'TEST_TOOL',
     'UPDATE_TOOL_CREDENTIALS',
     'UPDATE_TOOL_STATE',
-  ]),
-  ...defineRendererHandlerKeys('DINGTALK_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.CHAT_TOOL_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('DINGTALK_IPC_CHANNELS', [
     'GET_BOT_DECRYPTED_SECRET',
     'GET_CONFIG',
     'GET_DECRYPTED_SECRET',
@@ -285,14 +263,14 @@ const ALL_RENDERER_HANDLER_KEYS = [
     'STOP_BOT',
     'STOP_BRIDGE',
     'TEST_CONNECTION',
-  ]),
-  ...defineRendererHandlerKeys('DOCK_BADGE_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.DINGTALK_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('DOCK_BADGE_IPC_CHANNELS', [
     'SET_COUNT',
-  ]),
-  ...defineRendererHandlerKeys('ENVIRONMENT_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.DOCK_BADGE_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('ENVIRONMENT_IPC_CHANNELS', [
     'CHECK',
-  ]),
-  ...defineRendererHandlerKeys('FEISHU_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.ENVIRONMENT_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('FEISHU_IPC_CHANNELS', [
     'GET_BOT_DECRYPTED_SECRET',
     'GET_CONFIG',
     'GET_DECRYPTED_SECRET',
@@ -312,46 +290,33 @@ const ALL_RENDERER_HANDLER_KEYS = [
     'STOP_BOT',
     'STOP_BRIDGE',
     'TEST_CONNECTION',
-    'UPDATE_BINDING',
-  ]),
-  ...defineRendererHandlerKeys('GITHUB_RELEASE_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.FEISHU_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('GITHUB_RELEASE_IPC_CHANNELS', [
     'GET_LATEST_RELEASE',
     'GET_RELEASE_BY_TAG',
     'LIST_RELEASES',
-  ]),
-  ...defineRendererHandlerKeys('INSTALLER_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.GITHUB_RELEASE_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('INSTALLER_IPC_CHANNELS', [
     'CANCEL',
     'DOWNLOAD',
     'LAUNCH',
     'MANIFEST',
-  ]),
-  ...defineRendererHandlerKeys('IPC_CHANNELS', [
-    'GET_DEFAULT_APP_FOR_FILE',
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.INSTALLER_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('IPC_CHANNELS', [
     'GET_DETACHED_PREVIEW_DATA',
-    'GET_DIFF_CONTENTS',
-    'GET_FILE_DIFF',
-    'GET_GIT_REPO_STATUS',
     'GET_RUNTIME_STATUS',
-    'GET_UNSTAGED_CHANGES',
-    'GET_UNTRACKED_CONTENT',
-    'GET_WORKTREE_CHANGES',
     'INVALIDATE_GIT_DIFF_CACHE',
-    'LIST_WORKTREES',
-    'OPEN_DETACHED_PREVIEW',
     'OPEN_EXTERNAL',
     'REINIT_RUNTIME',
-    'REVERT_FILE',
     'SCAN_EDITORS',
     'SCREENSHOT_CAPTURE',
-    'SHOW_ITEM_IN_FOLDER',
-    'SYSTEM_OPEN_FILE',
     'WINDOW_CLOSE',
     'WINDOW_IS_MAXIMIZED',
     'WINDOW_MAXIMIZE',
     'WINDOW_MINIMIZE',
     'WRITE_CLIPBOARD_TEXT',
-  ]),
-  ...defineRendererHandlerKeys('PLANNING_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('PLANNING_IPC_CHANNELS', [
     'ACKNOWLEDGE_REMINDER',
     'CONNECT_NATIVE_CONNECTION',
     'CREATE_CALENDAR_EVENT',
@@ -382,48 +347,48 @@ const ALL_RENDERER_HANDLER_KEYS = [
     'UPDATE_CALENDAR_EVENT',
     'UPDATE_GROUP',
     'UPDATE_TODO',
-  ]),
-  ...defineRendererHandlerKeys('PROXY_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.PLANNING_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('PROXY_IPC_CHANNELS', [
     'DETECT_SYSTEM',
     'GET_SETTINGS',
     'UPDATE_SETTINGS',
-  ]),
-  ...defineRendererHandlerKeys('QUICK_TASK_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.PROXY_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('QUICK_TASK_IPC_CHANNELS', [
     'GET_GLOBAL_SHORTCUT_REGISTRATION_STATUS',
     'HIDE',
     'REREGISTER_GLOBAL_SHORTCUTS',
     'SUBMIT',
-  ]),
-  ...defineRendererHandlerKeys('SCRATCH_PAD_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.QUICK_TASK_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('SCRATCH_PAD_IPC_CHANNELS', [
     'CHOOSE_EXPORT_PATH',
     'COPY_IMAGE',
     'EXPORT',
     'LOAD',
     'SAVE',
-  ]),
-  ...defineRendererHandlerKeys('SETTINGS_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.SCRATCH_PAD_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('SETTINGS_IPC_CHANNELS', [
     'GET',
     'GET_SYSTEM_THEME',
     'UPDATE',
-  ]),
-  ...defineRendererHandlerKeys('STORAGE_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.SETTINGS_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('STORAGE_IPC_CHANNELS', [
     'CLEANUP',
     'CLEANUP_TEMP',
     'GET_STATS',
-  ]),
-  ...defineRendererHandlerKeys('SYSTEM_PROMPT_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.STORAGE_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('SYSTEM_PROMPT_IPC_CHANNELS', [
     'CREATE',
     'DELETE',
     'GET_CONFIG',
     'SET_DEFAULT',
     'UPDATE',
     'UPDATE_APPEND_SETTING',
-  ]),
-  ...defineRendererHandlerKeys('USER_PROFILE_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.SYSTEM_PROMPT_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('USER_PROFILE_IPC_CHANNELS', [
     'GET',
     'UPDATE',
-  ]),
-  ...defineRendererHandlerKeys('VOICE_DICTATION_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.USER_PROFILE_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('VOICE_DICTATION_IPC_CHANNELS', [
     'CANCEL',
     'CHECK_MIC_PERMISSION',
     'COMMIT',
@@ -438,155 +403,134 @@ const ALL_RENDERER_HANDLER_KEYS = [
     'TEST_CONNECTION',
     'TOGGLE',
     'UPDATE_SETTINGS',
-  ]),
-  ...defineRendererHandlerKeys('WECHAT_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.VOICE_DICTATION_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('WECHAT_IPC_CHANNELS', [
     'GET_CONFIG',
     'GET_STATUS',
     'LOGOUT',
     'START_BRIDGE',
     'START_LOGIN',
     'STOP_BRIDGE',
-  ]),
-  ...defineRendererHandlerKeys('WINDOWS_AGENT_ISLAND_IPC_CHANNELS', [
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.WECHAT_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
+    'ASK_USER_RESPOND',
+    'ATTACH_DIRECTORY',
+    'ATTACH_FILE',
+    'CANCEL_QUEUED_MESSAGE',
+    'CLEAR_COMPLETION_STATE',
+    'DELETE_SESSION',
+    'DETACH_DIRECTORY',
+    'DETACH_FILE',
+    'ENQUEUE_QUEUED_MESSAGE',
+    'EXIT_PLAN_MODE_RESPOND',
+    'FORK_SESSION',
+    'GET_SDK_MESSAGES',
+    'GET_SESSION_PATH',
+    'MIGRATE_CHAT_TO_AGENT',
+    'MOVE_QUEUED_MESSAGE',
+    'MOVE_SESSION_TO_WORKSPACE',
+    'PERMISSION_RESPOND',
+    'QUEUE_MESSAGE',
+    'REWIND_SESSION',
+    'SAVE_FILES_TO_SESSION',
+    'SEND_MESSAGE',
+    'SET_ACTIVE_WORKTREE',
+    'SET_VISIBLE_STREAM_SESSION',
+    'STOP_AGENT',
+    'SUBMIT_OR_ENQUEUE_MESSAGE',
+    'TOGGLE_ARCHIVE',
+    'TOGGLE_PIN',
+    'TOGGLE_STAR',
+    'UPDATE_SESSION_CODEX_FAST_MODE',
+    'UPDATE_SESSION_MODEL',
+    'UPDATE_SESSION_PERMISSION_MODE',
+    'UPDATE_SESSION_REASONING_LEVEL',
+    'UPDATE_TITLE',
+  ], { kind: 'agent-session', guards: ['requireVisibleSession'] }),
+  ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
+    'CHECK_PATHS_TYPE',
+    'DELETE_FILE',
+    'LIST_ATTACHED_DIRECTORY',
+    'LIST_DIRECTORY',
+    'MOVE_ATTACHED_FILE',
+    'MOVE_FILE',
+    'OPEN_FILE',
+    'OPEN_FOLDER_IN_TERMINAL',
+    'RENAME_ATTACHED_FILE',
+    'RENAME_FILE',
+    'SEARCH_WORKSPACE_FILES',
+    'SHOW_ATTACHED_IN_FOLDER',
+    'SHOW_IN_FOLDER',
+  ], { kind: 'path', guards: ['requireVisibleFileAccess'] }),
+  ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
+    'CLOSE_BROWSER',
+    'CLOSE_BROWSER_TAB',
+    'CREATE_BROWSER_TAB',
+    'GET_BROWSER_STATE',
+    'GO_BACK_BROWSER',
+    'GO_FORWARD_BROWSER',
+    'LIST_BROWSER_TABS',
+    'MINIMIZE_BROWSER',
+    'NAVIGATE_BROWSER',
+    'OPEN_BROWSER',
+    'RELOAD_BROWSER',
+    'SELECT_BROWSER_TAB',
+    'SET_BROWSER_LAYOUT',
+  ], { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] }),
+  ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
+    'GET_PENDING_REQUESTS',
+  ], { kind: 'agent-session', guards: ['getUserVisiblePendingRequests'] }),
+  ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
+    'READ_ATTACHED_FILE',
+  ], { kind: 'path', guards: ['requireVisibleFileReadAccess'] }),
+  ...defineRendererHandlerPolicies('FEISHU_IPC_CHANNELS', [
+    'UPDATE_BINDING',
+  ], { kind: 'agent-session', guards: ['requireVisibleSession'] }),
+  ...defineRendererHandlerPolicies('IPC_CHANNELS', [
+    'GET_DEFAULT_APP_FOR_FILE',
+    'GET_DIFF_CONTENTS',
+    'GET_FILE_DIFF',
+    'GET_GIT_REPO_STATUS',
+    'GET_UNSTAGED_CHANGES',
+    'GET_UNTRACKED_CONTENT',
+    'GET_WORKTREE_CHANGES',
+    'LIST_WORKTREES',
+    'OPEN_DETACHED_PREVIEW',
+    'REVERT_FILE',
+    'SHOW_ITEM_IN_FOLDER',
+    'SYSTEM_OPEN_FILE',
+  ], { kind: 'path', guards: ['requireVisibleFileAccess'] }),
+  ...defineRendererHandlerPolicies('WINDOWS_AGENT_ISLAND_IPC_CHANNELS', [
     'OPEN_SESSION',
-  ]),
-  ...defineRendererHandlerKeys('literal', [
+  ], { kind: 'agent-session', guards: ['requireVisibleSession'] }),
+  ...defineRendererHandlerPolicies('literal', [
     'file:docx-to-html',
     'file:office-to-html',
     'file:prepare-pdf-preview',
     'file:read-binary-base64',
     'file:resolve-and-read',
-    'file:resolve-html-preview-path',
     'file:resolve-path',
+  ], { kind: 'path', guards: ['requireVisibleFileReadAccess'] }),
+  ...defineRendererHandlerPolicies('literal', [
+    'file:resolve-html-preview-path',
+  ], { kind: 'path', guards: ['Error'] }),
+  ...defineRendererHandlerPolicies('literal', [
     'file:write-text',
-  ]),
-]
-
-
-type RendererHandlerPolicy =
-  | { kind: 'agent-session' | 'path', guards: readonly string[] }
-  | { kind: 'exempt', reason: string }
-
-/** 敏感入口逐 key 声明其 guard；其余显式 key 必须提供豁免语义。 */
-const GUARDED_RENDERER_HANDLER_POLICIES: Record<string, RendererHandlerPolicy> = {
-  'AGENT_IPC_CHANNELS:ASK_USER_RESPOND': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:ATTACH_DIRECTORY': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:ATTACH_FILE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:CANCEL_QUEUED_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:CHECK_PATHS_TYPE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:CLEAR_COMPLETION_STATE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:CLOSE_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:CLOSE_BROWSER_TAB': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:CREATE_BROWSER_TAB': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:DELETE_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:DELETE_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:DETACH_DIRECTORY': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:DETACH_FILE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:ENQUEUE_QUEUED_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:EXIT_PLAN_MODE_RESPOND': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:FORK_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:GET_BROWSER_STATE': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:GET_PENDING_REQUESTS': { kind: 'agent-session', guards: ['getUserVisiblePendingRequests'] },
-  'AGENT_IPC_CHANNELS:GET_SDK_MESSAGES': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:GET_SESSION_PATH': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:GO_BACK_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:GO_FORWARD_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:LIST_ATTACHED_DIRECTORY': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:LIST_BROWSER_TABS': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:LIST_DIRECTORY': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:MIGRATE_CHAT_TO_AGENT': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:MINIMIZE_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:MOVE_ATTACHED_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:MOVE_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:MOVE_QUEUED_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:MOVE_SESSION_TO_WORKSPACE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:NAVIGATE_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:OPEN_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:OPEN_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:OPEN_FOLDER_IN_TERMINAL': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:PERMISSION_RESPOND': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:QUEUE_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:READ_ATTACHED_FILE': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
-  'AGENT_IPC_CHANNELS:RELOAD_BROWSER': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:RENAME_ATTACHED_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:RENAME_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:REWIND_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:SAVE_FILES_TO_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:SEARCH_WORKSPACE_FILES': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:SELECT_BROWSER_TAB': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:SEND_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:SET_ACTIVE_WORKTREE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:SET_BROWSER_LAYOUT': { kind: 'agent-session', guards: ['assertBrowserSessionAccess'] },
-  'AGENT_IPC_CHANNELS:SET_VISIBLE_STREAM_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:SHOW_ATTACHED_IN_FOLDER': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:SHOW_IN_FOLDER': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'AGENT_IPC_CHANNELS:STOP_AGENT': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:SUBMIT_OR_ENQUEUE_MESSAGE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:TOGGLE_ARCHIVE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:TOGGLE_PIN': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:TOGGLE_STAR': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:UPDATE_SESSION_CODEX_FAST_MODE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:UPDATE_SESSION_MODEL': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:UPDATE_SESSION_PERMISSION_MODE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:UPDATE_SESSION_REASONING_LEVEL': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'AGENT_IPC_CHANNELS:UPDATE_TITLE': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'FEISHU_IPC_CHANNELS:UPDATE_BINDING': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'IPC_CHANNELS:GET_DEFAULT_APP_FOR_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:GET_DIFF_CONTENTS': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:GET_FILE_DIFF': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:GET_GIT_REPO_STATUS': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:GET_UNSTAGED_CHANGES': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:GET_UNTRACKED_CONTENT': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:GET_WORKTREE_CHANGES': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:LIST_WORKTREES': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:OPEN_DETACHED_PREVIEW': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:REVERT_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:SHOW_ITEM_IN_FOLDER': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'IPC_CHANNELS:SYSTEM_OPEN_FILE': { kind: 'path', guards: ['requireVisibleFileAccess'] },
-  'WINDOWS_AGENT_ISLAND_IPC_CHANNELS:OPEN_SESSION': { kind: 'agent-session', guards: ['requireVisibleSession'] },
-  'literal:file:docx-to-html': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
-  'literal:file:office-to-html': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
-  'literal:file:prepare-pdf-preview': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
-  'literal:file:read-binary-base64': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
-  'literal:file:resolve-and-read': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
-  'literal:file:resolve-html-preview-path': { kind: 'path', guards: ['Error'] },
-  'literal:file:resolve-path': { kind: 'path', guards: ['requireVisibleFileReadAccess'] },
-  'literal:file:write-text': { kind: 'path', guards: ['requireVisibleFileWriteAccess'] },
+  ], { kind: 'path', guards: ['requireVisibleFileWriteAccess'] }),
 }
 
-/** 各 IPC 域的显式豁免边界；只描述该域未列入 guarded 表的入口。 */
-const EXEMPT_REASON_BY_NAMESPACE: Record<string, string> = {
-  AGENT_IPC_CHANNELS: '入口使用 workspace、skill、dialog 或已单独验证的 request owner 能力，不接收未校验的普通 Agent sessionId/文件读取能力',
-  APP_ICON_IPC_CHANNELS: '只更新应用图标，不接收 sessionId 或文件路径',
-  AUTOMATION_IPC_CHANNELS: 'ID 属于 Automation 任务，不是 Agent 会话 ID；任务存储自行校验输入',
-  CHANNEL_IPC_CHANNELS: 'ID 与凭据属于模型渠道配置，不是 Agent 会话或 Renderer 文件能力',
-  CHAT_IPC_CHANNELS: 'session/conversation ID 属于旧 Chat 域，不是普通 Agent 会话 ID；附件由 Chat 存储边界管理',
-  CHAT_TOOL_IPC_CHANNELS: 'ID 属于自定义工具配置，不是 Agent 会话或 Renderer 文件能力',
-  DINGTALK_IPC_CHANNELS: 'ID 属于钉钉 Bot/连接，不是 Agent 会话或 Renderer 文件能力',
-  DOCK_BADGE_IPC_CHANNELS: '只更新 Dock 数字，不接收 sessionId 或文件路径',
-  ENVIRONMENT_IPC_CHANNELS: '只检查本机运行环境，不接收 sessionId 或 Renderer 文件路径',
-  FEISHU_IPC_CHANNELS: '除显式绑定入口外，ID 属于飞书 Bot/chat/注册流程，不是 Agent 会话 ID',
-  GITHUB_RELEASE_IPC_CHANNELS: '参数属于发布版本查询，不是 Agent 会话或 Renderer 文件能力',
-  INSTALLER_IPC_CHANNELS: '参数属于受管安装任务/产物，不是 Agent 会话或任意 Renderer 文件读取能力',
-  IPC_CHANNELS: '入口属于窗口、运行时或系统能力；所有 Renderer 文件路径入口已逐 key 列入 guarded 表',
-  PLANNING_IPC_CHANNELS: 'ID 属于 Todo、日历、同步连接或提醒，不是 Agent 会话 ID；无任意文件读取能力',
-  PROXY_IPC_CHANNELS: '只管理代理配置，不接收 sessionId 或文件路径',
-  QUICK_TASK_IPC_CHANNELS: 'Quick Task 使用自身窗口与提交模型，不接收普通 Agent 会话 ID 或任意文件读取能力',
-  SCRATCH_PAD_IPC_CHANNELS: '路径来自主进程选择的导出 capability，不是任意 Renderer 文件读取入口',
-  SETTINGS_IPC_CHANNELS: '只管理应用设置，不接收 sessionId 或文件路径',
-  STORAGE_IPC_CHANNELS: '只执行受管存储统计/清理，不接收 Renderer 指定路径',
-  SYSTEM_PROMPT_IPC_CHANNELS: 'ID 属于系统提示词配置，不是 Agent 会话或 Renderer 文件能力',
-  USER_PROFILE_IPC_CHANNELS: '只管理用户资料，不接收 sessionId 或文件路径',
-  VOICE_DICTATION_IPC_CHANNELS: 'sessionId 是 ASR 流实例 ID，不是 Agent 会话 ID；音频数据由语音模块自行隔离',
-  WECHAT_IPC_CHANNELS: 'ID 属于微信桥接登录/连接，不是 Agent 会话或 Renderer 文件能力',
-}
-
-/** 说明显式豁免项为何不属于普通 Agent 会话或敏感文件访问。 */
-function getRendererHandlerPolicy(key: string): RendererHandlerPolicy {
-  const guarded = GUARDED_RENDERER_HANDLER_POLICIES[key]
-  if (guarded) return guarded
-  const namespace = key.slice(0, key.indexOf(':'))
-  return { kind: 'exempt', reason: EXEMPT_REASON_BY_NAMESPACE[namespace] ?? '' }
+/** 严格验证实际 handler 与逐 key policy 双向完整覆盖。 */
+function assertRendererHandlerPolicyCoverage(
+  actualKeys: readonly string[],
+  policies: Readonly<Record<FullChannelKey, RendererHandlerPolicy>>,
+): void {
+  const sortedActualKeys = [...actualKeys].sort()
+  const sortedPolicyKeys = Object.keys(policies).sort()
+  if (
+    new Set(sortedActualKeys).size !== sortedActualKeys.length
+    || sortedActualKeys.length !== sortedPolicyKeys.length
+    || sortedActualKeys.some((key, index) => key !== sortedPolicyKeys[index])
+  ) throw new Error('Renderer handler 策略矩阵未完整覆盖')
 }
 
 interface RegisteredHandler {
@@ -789,13 +733,16 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
   test('Given ipc.ts 的全部 Renderer handler When 对照显式策略矩阵 Then 新增、遗漏或重复 key 均失败', () => {
     const { handlers } = loadAgentHandlers()
     const actualKeys = handlers.map(({ namespace, channel }) => `${namespace}:${channel}`).sort()
-    const declaredKeys = [...ALL_RENDERER_HANDLER_KEYS].sort()
+    const declaredKeys = Object.keys(RENDERER_HANDLER_POLICIES).sort()
 
     expect(new Set(declaredKeys).size).toBe(declaredKeys.length)
     expect(actualKeys).toEqual(declaredKeys)
+    expect(() => assertRendererHandlerPolicyCoverage(actualKeys, RENDERER_HANDLER_POLICIES)).not.toThrow()
     for (const registered of handlers) {
-      const key = `${registered.namespace}:${registered.channel}`
-      const policy = getRendererHandlerPolicy(key)
+      const key = `${registered.namespace}:${registered.channel}` as FullChannelKey
+      const policy = RENDERER_HANDLER_POLICIES[key]
+      expect(policy, `${key} 缺少逐 key 策略`).toBeDefined()
+      if (!policy) continue
       if (policy.kind === 'exempt') {
         expect(policy.reason.length, `${key} 的 exempt 必须说明非 Agent/非敏感语义`).toBeGreaterThan(0)
         continue
@@ -808,6 +755,20 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       const guardIndex = calls.findIndex((name) => policy.guards.includes(name))
       expect(guardIndex, `${key} 缺少声明的 ${policy.kind} guard`).toBeGreaterThanOrEqual(0)
     }
+  })
+
+  test('Given 策略被删除或源码新增 handler key When 校验完整覆盖 Then 都明确失败', () => {
+    const { handlers } = loadAgentHandlers()
+    const actualKeys = handlers.map(({ namespace, channel }) => `${namespace}:${channel}`)
+    const missingPolicyMap = { ...RENDERER_HANDLER_POLICIES }
+    delete missingPolicyMap[actualKeys[0]! as FullChannelKey]
+
+    expect(() => assertRendererHandlerPolicyCoverage(actualKeys, missingPolicyMap))
+      .toThrow('Renderer handler 策略矩阵未完整覆盖')
+    expect(() => assertRendererHandlerPolicyCoverage(
+      [...actualKeys, 'literal:file:future-unregistered-handler'],
+      RENDERER_HANDLER_POLICIES,
+    )).toThrow('Renderer handler 策略矩阵未完整覆盖')
   })
 
   test('Given 路径检查、搜索与系统显示入口 When 检查顶层执行路径 Then guard 先于 stat、readdir、cache 与 shell', () => {
