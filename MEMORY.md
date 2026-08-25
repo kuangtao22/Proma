@@ -145,3 +145,4 @@
 - 2026-08-25：真实 GPT Image 2 验证发现图片已生成但 Design 误报失败，根因是完成回调仍使用旧 `AgentMessage.events`，而 Pi 把结构化附件写入持久化 SDK `user/tool_result.imageAttachments`；现改为在真实图片工具调用关联、会话归属、媒体类型和文件校验边界内兼容该权威消息，并在 Renderer 增量 upsert 与全量合并入口统一排除 Design 内部会话。
 - 2026-08-25：Agent 项目会话中的高置信度视觉请求必须在发送前询问“打开设计面板/继续 Agent 实现”；Design 交接先切到会话所属项目，只预填原始要求且不自动生图。明确代码实现和普通分析不拦截，未命中本地判断的歧义表达由 Agent 系统提示词继续澄清，禁止把“设计”默认解释为修改代码。
 - 2026-08-25：用户确认以项目下 `Canvas` 会话类型替代“一项目一张全局 Design 画布”：每个 Canvas 可包含多个独立 Pi Agent、生图、视觉文档和底层 `webview`/界面“原型”模块；连线是显式数据与任务合同，无连线完全独立。Agent 按语义自动建模块和连线，讨论只建待运行结构，明确执行才调用付费能力，上游变化仅标记下游待更新；旧 Design 迁移为默认 Canvas 并保留素材、任务、版本和布局。
+- 2026-08-25：Canvas 顶层会话基础使用项目内独立原子索引，不写入 `AgentSessionMeta` 或 Agent 会话索引；旧 `.proma/design/canvas.json` 仅在列表时以固定 `legacy-design` ID 幂等投影，现有 Design Store、生图、素材、任务和 trace 继续使用旧路径，待后续迁移阶段显式切换。

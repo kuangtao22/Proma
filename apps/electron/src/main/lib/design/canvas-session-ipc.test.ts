@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import { DESIGN_IPC_CHANNELS } from '@proma/shared'
 import type {
   CanvasSessionMeta,
@@ -246,6 +246,8 @@ describe('Canvas 会话 IPC', () => {
     const handlers = new Map<string, TestHandler>()
     const failingSender = createSender(1)
     const receivingSender = createSender(2)
+    /** 捕获预期诊断，避免故障注入污染测试输出。 */
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
     failingSender.send = () => { throw new Error('窗口发送失败') }
     registerCanvasSessionIpcHandlers({
       ipc: {
@@ -273,5 +275,10 @@ describe('Canvas 会话 IPC', () => {
       channel: DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', cause: 'created' },
     }])
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[CanvasSessionIPC] 会话变化广播失败:',
+      expect.objectContaining({ message: '窗口发送失败' }),
+    )
+    errorSpy.mockRestore()
   })
 })
