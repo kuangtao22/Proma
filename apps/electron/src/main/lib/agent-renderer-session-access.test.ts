@@ -465,7 +465,7 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
   ], { kind: 'path', guards: ['requireVisibleFileAccess', 'listStableDirectory'] }),
   ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
     'SEARCH_WORKSPACE_FILES',
-  ], { kind: 'path', guards: ['requireVisibleFileAccess', 'scanStableDirectory'] }),
+  ], { kind: 'path', guards: ['requireVisibleFileAccess', 'runStableDirectoryNative'] }),
   ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
     'CLOSE_BROWSER',
     'CLOSE_BROWSER_TAB',
@@ -627,8 +627,12 @@ function compileLocalFunction<T>(source: ts.SourceFile, functionName: string, de
       return
     }
     if (ts.isFunctionDeclaration(node) && node.name?.text === functionName) {
+      /** 局部 async 函数转为表达式时必须保留 async，否则测试编译结果会变成无效语法。 */
+      const asyncModifiers = node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)
+        ? [ts.factory.createModifier(ts.SyntaxKind.AsyncKeyword)]
+        : undefined
       initializer = ts.factory.createFunctionExpression(
-        undefined,
+        asyncModifiers,
         node.asteriskToken,
         node.name,
         node.typeParameters,
@@ -1307,28 +1311,42 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
     expect(sideEffectCalls).toBe(0)
   })
 
-  test('Given 当前平台缺少稳定目录 fd 遍历 When 打开目录 Then 在路径消费前明确 fail closed', () => {
-    const { source } = loadAgentHandlers()
-    let pathCallCount = 0
-    const openStableDirectory = compileLocalFunction<(path: string) => unknown>(source, 'openStableDirectory', {
-      process: { platform: 'darwin' },
-      RENDERER_DIRECTORY_TRAVERSAL_UNSUPPORTED_MESSAGE: '当前平台不支持稳定目录遍历',
-      isPathAllowed: () => { pathCallCount += 1; return true },
-      realpathSync: () => { pathCallCount += 1 },
+  test('Given LIST helper 打开的 canonical root 未获授权 When 执行真实 handler Then 拒绝且零枚举', async () => {
+    const { handlers, source } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'LIST_DIRECTORY')
+    expect(registered).toBeDefined()
+    const snapshot = { options: { sessionId: 'visible' } }
+    let enumeratedEntryCount = 0
+    const authorizeStableDirectoryRoots = compileLocalFunction<(
+      roots: Array<{ requestedPath: string; canonicalPath: string; isDirectory: boolean; volume: string; fileId: string }>,
+      requestedPaths: string[],
+      accessSnapshot: unknown,
+    ) => boolean>(source, 'authorizeStableDirectoryRoots', {
+      isPathAllowed: () => false,
+    })
+    const listStableDirectory = compileLocalFunction<(path: string, accessSnapshot: unknown) => Promise<unknown>>(source, 'listStableDirectory', {
+      authorizeStableDirectoryRoots,
+      runStableDirectoryNative: async (
+        _request: unknown,
+        authorize: (roots: Array<{ requestedPath: string; canonicalPath: string; isDirectory: boolean; volume: string; fileId: string }>) => boolean,
+      ) => {
+        const allowed = authorize([{ requestedPath: '/authorized', canonicalPath: '/replacement', isDirectory: true, volume: '1', fileId: '2' }])
+        if (!allowed) throw new Error('目录授权被拒绝')
+        enumeratedEntryCount += 1
+        return { roots: [], entries: [] }
+      },
+    })
+    const handler = compileHandler<(event: object, path: string, access: FileAccessOptions) => Promise<unknown>>(registered!, {
+      requireVisibleFileAccess: () => snapshot,
       resolve,
-      captureStablePathIdentity: () => { pathCallCount += 1 },
-      openSync: () => { pathCallCount += 1 },
-      constants,
-      fstatSync,
-      closeSync,
+      listStableDirectory,
     })
 
-    expect(() => openStableDirectory('/authorized')).toThrow('当前平台不支持稳定目录遍历')
-    expect(pathCallCount).toBe(0)
-    expect(source.getFullText()).toContain('`/proc/self/fd/${parent.descriptor}/${name}`')
+    await expect(handler({}, '/authorized', { sessionId: 'visible' })).rejects.toThrow('目录授权被拒绝')
+    expect(enumeratedEntryCount).toBe(0)
   })
 
-  test('Given macOS 目录授权后祖先被替换 When 执行真实列表 handler Then 明确拒绝且不枚举 replacement', async () => {
+  test('Given macOS 目录授权后祖先被替换 When 执行真实列表 handler Then 只返回已打开对象中的条目', async () => {
     const { handlers, source } = loadAgentHandlers()
     const registered = handlers.find(({ channel }) => channel === 'LIST_DIRECTORY')
     expect(registered).toBeDefined()
@@ -1340,27 +1358,16 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
     mkdirSync(replacement)
     writeFileSync(join(authorized, 'allowed.txt'), 'allowed')
     writeFileSync(join(replacement, 'secret.txt'), 'secret')
+    const canonicalAuthorized = realpathSync(authorized)
     let replaced = false
-    let enumeratedNames: string[] = []
     try {
-      const openStableDirectory = compileLocalFunction<(path: string, snapshot: unknown) => unknown>(source, 'openStableDirectory', {
-        process: { platform: 'darwin' },
-        RENDERER_DIRECTORY_TRAVERSAL_UNSUPPORTED_MESSAGE: '当前平台不支持稳定目录遍历',
-      })
-      const listStableDirectory = compileLocalFunction<(path: string, snapshot: unknown) => unknown>(source, 'listStableDirectory', {
-        openStableDirectory,
-        readdirSync: (path: string) => {
-          enumeratedNames = [path]
-          return []
-        },
-        closeSync,
-      })
-      const snapshot = { options: { sessionId: 'visible' } }
-      const handler = compileHandler<(event: object, path: string, access: FileAccessOptions) => Promise<unknown>>(registered!, {
-        requireVisibleFileAccess: () => snapshot,
-        resolve,
-        existsSync,
-        isPathAllowed: () => {
+      const authorizeStableDirectoryRoots = compileLocalFunction<(
+        roots: Array<{ requestedPath: string; canonicalPath: string; isDirectory: boolean; volume: string; fileId: string }>,
+        requestedPaths: string[],
+        accessSnapshot: unknown,
+      ) => boolean>(source, 'authorizeStableDirectoryRoots', {
+        isPathAllowed: (path: string) => {
+          expect(path).toBe(canonicalAuthorized)
           if (!replaced) {
             replaced = true
             renameSync(authorized, moved)
@@ -1368,15 +1375,113 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
           }
           return true
         },
+      })
+      const listStableDirectory = compileLocalFunction<(path: string, snapshot: unknown) => Promise<unknown>>(source, 'listStableDirectory', {
+      authorizeStableDirectoryRoots,
+      runStableDirectoryNative: async (
+        request: { ignoreFiles?: string[] },
+        authorize: (roots: Array<{ requestedPath: string; canonicalPath: string; isDirectory: boolean; volume: string; fileId: string }>) => boolean,
+      ) => {
+        expect(request.ignoreFiles).toEqual(['.DS_Store', 'Thumbs.db'])
+        const roots = [{ requestedPath: authorized, canonicalPath: canonicalAuthorized, isDirectory: true, volume: '1', fileId: '2' }]
+          expect(authorize(roots)).toBe(true)
+          return {
+            roots,
+            entries: [{ rootIndex: 0, name: 'allowed.txt', path: join(canonicalAuthorized, 'allowed.txt'), isDirectory: false, size: 7 }],
+          }
+        },
+      })
+      const snapshot = { options: { sessionId: 'visible' } }
+      const handler = compileHandler<(event: object, path: string, access: FileAccessOptions) => Promise<unknown>>(registered!, {
+        requireVisibleFileAccess: () => snapshot,
+        resolve,
         listStableDirectory,
       })
 
-      await expect(handler({}, authorized, { sessionId: 'visible' })).rejects.toThrow('当前平台不支持稳定目录遍历')
-      expect(enumeratedNames).toEqual([])
+      await expect(handler({}, authorized, { sessionId: 'visible' })).resolves.toEqual([
+        { name: 'allowed.txt', path: join(canonicalAuthorized, 'allowed.txt'), isDirectory: false, size: 7 },
+      ])
       expect(readFileSync(join(authorized, 'secret.txt'), 'utf8')).toBe('secret')
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  })
+
+  test('Given SEARCH 包含会话与工作区附加路径 When 建立索引 Then 单次打开全部 roots 且授权前不缓存', async () => {
+    const { handlers, source } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'SEARCH_WORKSPACE_FILES')
+    expect(registered).toBeDefined()
+    const snapshot = { options: { sessionId: 'visible' } }
+    const indexCache = new Map<string, unknown>()
+    const expectedRoots = ['/session', '/session-attachment', '/workspace-attachment']
+    let authorizationCallCount = 0
+    const authorizeStableDirectoryRoots = compileLocalFunction<(
+      roots: Array<{ requestedPath: string; canonicalPath: string; isDirectory: boolean; volume: string; fileId: string }>,
+      requestedPaths: string[],
+      accessSnapshot: unknown,
+    ) => boolean>(source, 'authorizeStableDirectoryRoots', {
+      isPathAllowed: (_path: string, _options: unknown, accessSnapshot: unknown) => {
+        expect(accessSnapshot).toBe(snapshot)
+        authorizationCallCount += 1
+        return true
+      },
+    })
+    let helperCallCount = 0
+    const handler = compileHandler<(
+      event: object,
+      rootPath: string,
+      query: string,
+      limit: number,
+      additionalPaths: string[],
+      sessionPaths: string[],
+      access: FileAccessOptions,
+    ) => Promise<{ entries: Array<{ name: string; path: string; source: string }> }>>(registered!, {
+      requireVisibleFileAccess: () => snapshot,
+      isPathAllowed: () => { throw new Error('禁止在 helper OPENED 前执行路径授权') },
+      authorizeStableDirectoryRoots,
+      runStableDirectoryNative: async (
+        request: { roots: string[] },
+        authorize: (roots: Array<{ requestedPath: string; canonicalPath: string; isDirectory: boolean; volume: string; fileId: string }>) => boolean,
+      ) => {
+        helperCallCount += 1
+        expect(request.roots).toEqual(expectedRoots)
+        expect(indexCache.size).toBe(0)
+        const roots = expectedRoots.map((path, index) => ({
+          requestedPath: path,
+          canonicalPath: path,
+          isDirectory: true,
+          volume: '1',
+          fileId: String(index + 1),
+        }))
+        expect(authorize(roots)).toBe(true)
+        return {
+          roots,
+          entries: [
+            { rootIndex: 0, name: 'root.ts', path: '/session/root.ts', isDirectory: false, size: 1 },
+            { rootIndex: 1, name: 'session.ts', path: '/session-attachment/session.ts', isDirectory: false, size: 1 },
+            { rootIndex: 2, name: 'workspace.ts', path: '/workspace-attachment/workspace.ts', isDirectory: false, size: 1 },
+          ],
+        }
+      },
+      workspaceFileSearchIndexCache: indexCache,
+      WORKSPACE_FILE_INDEX_CACHE_TTL_MS: 3_000,
+      WORKSPACE_FILE_INDEX_CACHE_MAX_ENTRIES: 20,
+    })
+
+    const result = await handler(
+      {}, '/session', '', 20, ['/workspace-attachment'], ['/session-attachment'], { sessionId: 'visible' },
+    )
+    const cachedResult = await handler(
+      {}, '/session', 'root', 20, ['/workspace-attachment'], ['/session-attachment'], { sessionId: 'visible' },
+    )
+
+    expect(helperCallCount).toBe(1)
+    expect(authorizationCallCount).toBe(6)
+    expect(indexCache.size).toBe(1)
+    expect(result.entries.map((entry) => entry.name)).toEqual(expect.arrayContaining([
+      'root.ts', 'session-attachment', 'session.ts', 'workspace-attachment', 'workspace.ts',
+    ]))
+    expect(cachedResult.entries.map((entry) => entry.name)).toContain('root.ts')
   })
 
   test('Given Git worktree 进入兜底授权分支 When 获取工作区 slug Then 复用当前 IPC 快照', () => {

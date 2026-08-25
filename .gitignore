@@ -12,6 +12,8 @@ apps/electron/resources/bin/
 apps/electron/resources/agent-island/
 # Objective-C++ 编译的 macOS EventKit N-API addon（构建时生成，按宿主架构分发）
 apps/electron/resources/eventkit/
+# C++ 编译的跨平台稳定目录 helper（构建时生成，按宿主平台与架构分发）
+apps/electron/resources/stable-directory/
 # bun build --compile 的临时中间产物
 *.bun-build
 

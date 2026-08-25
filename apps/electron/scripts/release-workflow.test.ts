@@ -28,6 +28,15 @@ interface ElectronPackageMetadata {
 interface PlatformArtifactConfig {
   /** 当前平台的安装包文件名模板。 */
   artifactName?: string
+  /** 当前平台需要签名的额外二进制。 */
+  binaries?: string[]
+}
+
+interface ExtraResourceConfig {
+  /** 构建目录中的资源来源。 */
+  from?: string
+  /** 安装包 resources 下的目标目录。 */
+  to?: string
 }
 
 interface ElectronBuilderConfig {
@@ -37,6 +46,8 @@ interface ElectronBuilderConfig {
   productName?: string
   /** 是否根据预发布后缀自动改变更新频道。 */
   detectUpdateChannel?: boolean
+  /** 三个平台共同携带的额外运行时资源。 */
+  extraResources?: ExtraResourceConfig[]
   /** Electron Updater 使用的固定发布仓库。 */
   publish?: {
     provider?: string
@@ -137,6 +148,19 @@ test('正式安装包名称包含完整版本、平台和架构', () => {
   expect(config.mac?.artifactName).toBe('Proma-${version}-macos-${arch}.${ext}')
   expect(config.win?.artifactName).toBe('Proma-${version}-windows-${arch}.${ext}')
   expect(config.linux?.artifactName).toBe('Proma-${version}-linux-${arch}.${ext}')
+})
+
+test('稳定目录 helper 进入三平台资源并纳入 macOS 签名', () => {
+  /** Electron Builder 的正式打包配置。 */
+  const config = readElectronBuilderConfig()
+
+  expect(config.extraResources).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      from: 'resources/stable-directory',
+      to: 'stable-directory',
+    }),
+  ]))
+  expect(config.mac?.binaries).toContain('resources/stable-directory/stable-directory-helper')
 })
 
 test('Release 工作流在全平台构建前校验 Bone 发布合同', () => {

@@ -117,6 +117,20 @@ describe('proma-file 目录授权', () => {
     expect(await range.text()).toBe('2345')
   })
 
+  test('Given Buffer 响应数量预算为一 When 首个响应 EOF Then 第二个响应可重试成功', async () => {
+    const registry = createPromaFileProtocolRegistry({ now: () => 0, maxActiveResponses: 1 })
+    const firstUrl = registry.registerAuthorizedFile(join(root, 'first.bin'), Buffer.alloc(128 * 1024, 1))
+    const secondUrl = registry.registerAuthorizedFile(join(root, 'second.bin'), Buffer.from('second'))
+
+    const firstResponse = await registry.handleRequest(new Request(firstUrl))
+    expect((await registry.handleRequest(new Request(secondUrl))).status).toBe(429)
+    expect((await firstResponse.arrayBuffer()).byteLength).toBe(128 * 1024)
+
+    const retriedResponse = await registry.handleRequest(new Request(secondUrl))
+    expect(retriedResponse.status).toBe(200)
+    expect(await retriedResponse.text()).toBe('second')
+  })
+
   test('Given Buffer token 在流式响应中被释放 When 继续消费 Then 在途响应保持有效', async () => {
     const registry = createPromaFileProtocolRegistry({ now: () => 0 })
     const fileUrl = registry.registerAuthorizedFile(join(root, 'preview.bin'), Buffer.alloc(256 * 1024, 7))

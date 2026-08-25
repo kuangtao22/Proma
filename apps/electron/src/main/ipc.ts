@@ -16,7 +16,6 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readdirSync,
   readFileSync,
   readSync,
   realpathSync,
@@ -181,6 +180,11 @@ import {
   registerRetainedPromaDirectoryPaths,
   revokePromaPathUrl,
 } from './lib/local-file-protocol'
+import {
+  runStableDirectoryNative,
+  type StableDirectoryNativeEntry,
+  type StableDirectoryOpenedRoot,
+} from './lib/stable-directory-native-host'
 import { DesignAssetService } from './lib/design/design-asset-service'
 import { DesignContextCatalog } from './lib/design/design-context-catalog'
 import { DesignContextOrchestrator } from './lib/design/design-context-orchestrator'
@@ -595,127 +599,47 @@ const MANAGED_WORKSPACE_SHARED_ENTRIES = new Set([
 /** 普通 Renderer 缺少跨平台原子 no-replace 能力，文件变更统一 fail closed。 */
 const RENDERER_FILE_MUTATION_DISABLED_MESSAGE = 'Renderer 暂不支持删除、重命名或移动文件；请通过 Agent 或系统文件管理器操作'
 const RENDERER_GIT_REVERT_DISABLED_MESSAGE = 'Renderer 暂不支持还原文件；请通过 Agent 或 Git 工具操作'
-const RENDERER_DIRECTORY_TRAVERSAL_UNSUPPORTED_MESSAGE = '当前平台不支持稳定目录遍历，已拒绝 Renderer 文件浏览'
 
-interface StableDirectoryHandle {
-  canonicalPath: string
-  descriptor: number
-}
-
-/** 在支持 `/proc/self/fd` 的平台稳定打开目录，绑定授权时的目录身份。 */
-function openStableDirectory(directoryPath: string, snapshot: RendererFileAccessSnapshot): StableDirectoryHandle {
-  if (process.platform !== 'linux') throw new Error(RENDERER_DIRECTORY_TRAVERSAL_UNSUPPORTED_MESSAGE)
-  const canonicalPath = realpathSync(resolve(directoryPath))
-  if (!isPathAllowed(canonicalPath, snapshot.options, snapshot)) {
-    throw new Error('访问路径超出当前会话的授权范围')
-  }
-  const identity = captureStablePathIdentity(canonicalPath)
-  const descriptor = openSync(canonicalPath, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0))
-  const opened = fstatSync(descriptor)
-  if (!opened.isDirectory() || opened.dev !== identity.dev || opened.ino !== identity.ino) {
-    closeSync(descriptor)
-    throw new Error('目录身份已变化')
-  }
-  return { canonicalPath, descriptor }
-}
-
-/** 通过父目录 fd no-follow 打开子目录，避免递归时重新消费可变路径。 */
-function openStableChildDirectory(parent: StableDirectoryHandle, name: string): StableDirectoryHandle {
-  const descriptorPath = `/proc/self/fd/${parent.descriptor}/${name}`
-  const identity = captureStablePathIdentity(descriptorPath)
-  const descriptor = openSync(descriptorPath, constants.O_RDONLY | constants.O_DIRECTORY | (constants.O_NOFOLLOW ?? 0))
-  const opened = fstatSync(descriptor)
-  if (!opened.isDirectory() || opened.dev !== identity.dev || opened.ino !== identity.ino) {
-    closeSync(descriptor)
-    throw new Error('目录身份已变化')
-  }
-  return { canonicalPath: join(parent.canonicalPath, name), descriptor }
-}
-
-/** 从稳定目录 fd 列出浅层条目，符号链接和遍历期间变化的条目直接跳过。 */
-function listStableDirectory(directoryPath: string, snapshot: RendererFileAccessSnapshot): FileEntry[] {
-  const handle = openStableDirectory(directoryPath, snapshot)
-  try {
-    const entries: FileEntry[] = []
-    for (const item of readdirSync(`/proc/self/fd/${handle.descriptor}`, { withFileTypes: true })) {
-      if (item.name === '.DS_Store' || item.name === 'Thumbs.db' || item.isSymbolicLink()) continue
-      const descriptorPath = `/proc/self/fd/${handle.descriptor}/${item.name}`
-      let stats: ReturnType<typeof lstatSync>
-      try {
-        stats = lstatSync(descriptorPath)
-      } catch {
-        continue
-      }
-      if (stats.isSymbolicLink() || (!stats.isFile() && !stats.isDirectory())) continue
-      entries.push({
-        name: item.name,
-        path: join(handle.canonicalPath, item.name),
-        isDirectory: stats.isDirectory(),
-        size: stats.isFile() ? stats.size : undefined,
-      })
-    }
-    entries.sort((left, right) => {
-      if (left.isDirectory !== right.isDirectory) return left.isDirectory ? -1 : 1
-      if (left.name.startsWith('.') !== right.name.startsWith('.')) return left.name.startsWith('.') ? 1 : -1
-      return left.name.localeCompare(right.name)
-    })
-    return entries
-  } finally {
-    closeSync(handle.descriptor)
-  }
-}
-
-interface StableSearchEntry {
-  name: string
-  path: string
-  isDirectory: boolean
-}
-
-/** 递归扫描稳定目录 fd；每层子目录都重新 no-follow 打开并在结束时关闭。 */
-function scanStableDirectory(
-  directoryPath: string,
-  maxDepth: number,
-  maxEntries: number,
-  ignoreDirectories: ReadonlySet<string>,
-  ignoreFiles: ReadonlySet<string>,
+/** 使用同一 Renderer 快照授权 helper 已经打开的全部 canonical root。 */
+function authorizeStableDirectoryRoots(
+  openedRoots: readonly StableDirectoryOpenedRoot[],
+  requestedPaths: readonly string[],
   snapshot: RendererFileAccessSnapshot,
-): StableSearchEntry[] {
-  const root = openStableDirectory(directoryPath, snapshot)
-  const entries: StableSearchEntry[] = []
-  const visit = (handle: StableDirectoryHandle, depth: number): void => {
-    if (depth > maxDepth || entries.length >= maxEntries) return
-    const items = readdirSync(`/proc/self/fd/${handle.descriptor}`, { withFileTypes: true })
-    for (const item of items) {
-      if (entries.length >= maxEntries) break
-      if (ignoreFiles.has(item.name) || item.isSymbolicLink()) continue
-      const descriptorPath = `/proc/self/fd/${handle.descriptor}/${item.name}`
-      let stats: ReturnType<typeof lstatSync>
-      try {
-        stats = lstatSync(descriptorPath)
-      } catch {
-        continue
-      }
-      if (stats.isSymbolicLink() || (!stats.isFile() && !stats.isDirectory())) continue
-      if (stats.isDirectory() && ignoreDirectories.has(item.name)) continue
-      entries.push({ name: item.name, path: join(handle.canonicalPath, item.name), isDirectory: stats.isDirectory() })
-      if (!stats.isDirectory() || depth >= maxDepth) continue
-      let child: StableDirectoryHandle | null = null
-      try {
-        child = openStableChildDirectory(handle, item.name)
-        visit(child, depth + 1)
-      } catch {
-        // 条目在枚举与打开之间变化时跳过其子树，绝不回退到路径遍历。
-      } finally {
-        if (child) closeSync(child.descriptor)
-      }
-    }
-  }
-  try {
-    visit(root, 0)
-    return entries
-  } finally {
-    closeSync(root.descriptor)
-  }
+): boolean {
+  return openedRoots.length === requestedPaths.length && openedRoots.every((root, index) => (
+    root.requestedPath === requestedPaths[index]
+      && isPathAllowed(root.canonicalPath, snapshot.options, snapshot)
+  ))
+}
+
+/** 通过两阶段原生 helper 浅层列出一个已授权目录。 */
+async function listStableDirectory(
+  directoryPath: string,
+  snapshot: RendererFileAccessSnapshot,
+): Promise<FileEntry[]> {
+  const result = await runStableDirectoryNative(
+    {
+      mode: 'list',
+      roots: [directoryPath],
+      maxDepth: 0,
+      maxEntries: 10_000,
+      ignoreFiles: ['.DS_Store', 'Thumbs.db'],
+    },
+    (openedRoots) => authorizeStableDirectoryRoots(openedRoots, [directoryPath], snapshot)
+      && openedRoots[0]?.isDirectory === true,
+  )
+  const entries = result.entries.map((entry): FileEntry => ({
+    name: entry.name,
+    path: entry.path,
+    isDirectory: entry.isDirectory,
+    size: entry.size,
+  }))
+  entries.sort((left, right) => {
+    if (left.isDirectory !== right.isDirectory) return left.isDirectory ? -1 : 1
+    if (left.name.startsWith('.') !== right.name.startsWith('.')) return left.name.startsWith('.') ? 1 : -1
+    return left.name.localeCompare(right.name)
+  })
+  return entries
 }
 
 /** 捕获实际文件或目录身份，符号链接不视为可消费对象。 */
@@ -4397,14 +4321,6 @@ export function registerIpcHandlers(): void {
     async (_, dirPath: string, access?: FileAccessOptions): Promise<FileEntry[]> => {
       const accessSnapshot = requireVisibleFileAccess(access, [dirPath])
       const safePath = resolve(dirPath)
-      // 目录可能已被删除（如删除 Agent 会话后面板仍持有旧路径），优雅返回空列表。
-      if (!existsSync(safePath)) return []
-      if (!isPathAllowed(safePath, accessSnapshot.options, accessSnapshot)) {
-        // 路径可能刚好在 existsSync 与 realpath 校验之间被删除。
-        if (!existsSync(safePath)) return []
-        throw new Error('访问路径超出当前会话的授权范围')
-      }
-
       return listStableDirectory(safePath, accessSnapshot)
     }
   )
@@ -4812,6 +4728,7 @@ export function registerIpcHandlers(): void {
   }
   const workspaceFileSearchIndexCache = new Map<string, {
     expiresAt: number
+    openedRoots: StableDirectoryOpenedRoot[]
     rootEntries: WorkspaceFileSearchEntry[]
     workspaceEntries: WorkspaceFileSearchEntry[]
   }>()
@@ -4828,11 +4745,7 @@ export function registerIpcHandlers(): void {
       const safeRoot = resolve(rootPath)
       const resolvedAdditionalPaths = (additionalPaths ?? []).map((entry) => resolve(entry))
       const resolvedSessionPaths = (sessionPaths ?? []).map((entry) => resolve(entry))
-      for (const targetPath of [safeRoot, ...resolvedAdditionalPaths, ...resolvedSessionPaths]) {
-        if (!isPathAllowed(targetPath, accessSnapshot.options, accessSnapshot)) {
-          throw new Error('访问路径超出当前会话的授权范围')
-        }
-      }
+      const orderedRoots = [safeRoot, ...resolvedSessionPaths, ...resolvedAdditionalPaths]
       const ignoreDirs = new Set(['node_modules', '.git', 'dist', '.next', '__pycache__', '.venv', 'build', '.cache'])
       const ignoreFiles = new Set(['.DS_Store', '.Spotlight-V100', '.Trashes', 'Thumbs.db', 'desktop.ini'])
       const BROWSE_LIMIT_PER_GROUP = 2000
@@ -4844,92 +4757,73 @@ export function registerIpcHandlers(): void {
       let rootEntries: Entry[] = []
       let workspaceEntries: Entry[] = []
 
-      function scan(
-        dir: string,
-        baseRoot: string,
-        target: Entry[],
-        useAbsPath: boolean,
-        source: 'session' | 'workspace',
-      ): void {
-        if (target.length >= INDEX_ENTRY_CAP_PER_GROUP) return
-        const availableEntries = INDEX_ENTRY_CAP_PER_GROUP - target.length
-        for (const item of scanStableDirectory(dir, 10, availableEntries, ignoreDirs, ignoreFiles, accessSnapshot)) {
-          target.push({
-            name: item.name,
-            path: useAbsPath ? item.path : relative(baseRoot, item.path),
-            type: item.isDirectory ? 'dir' : 'file',
-            source,
-          })
-        }
-      }
-
-      function addAttachedPath(pathValue: string, target: Entry[], source: 'session' | 'workspace'): void {
-        if (target.length >= INDEX_ENTRY_CAP_PER_GROUP) return
-        try {
-          const attachedPath = resolve(pathValue)
-          const name = basename(attachedPath)
-          if (ignoreFiles.has(name)) return
-
-          /** canonical 路径必须使用同一快照重新授权，随后再固定文件身份。 */
-          const canonicalAttachedPath = realpathSync(attachedPath)
-          if (!isPathAllowed(canonicalAttachedPath, accessSnapshot.options, accessSnapshot)) {
-            throw new Error('访问路径超出当前会话的授权范围')
-          }
-          const identity = captureStablePathIdentity(canonicalAttachedPath)
-          const attachedStats = lstatSync(canonicalAttachedPath)
-          if (attachedStats.isFile()) {
-            const descriptor = openSync(canonicalAttachedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-            try {
-              const opened = fstatSync(descriptor)
-              if (!opened.isFile() || opened.dev !== identity.dev || opened.ino !== identity.ino) return
-            } finally {
-              closeSync(descriptor)
-            }
-            if (target.length >= INDEX_ENTRY_CAP_PER_GROUP) return
-            target.push({
-              name,
-              path: canonicalAttachedPath,
-              type: 'file',
-              source,
-            })
-            return
-          }
-
-          if (!attachedStats.isDirectory()) return
-          if (ignoreDirs.has(name)) return
-
-          if (target.length >= INDEX_ENTRY_CAP_PER_GROUP) return
-          target.push({
-            name: name === 'workspace-files' ? '项目文件' : name,
-            path: attachedPath,
-            type: 'dir',
-            source,
-          })
-          scan(canonicalAttachedPath, canonicalAttachedPath, target, true, source)
-        } catch {
-          // 忽略不存在或无权限的附加路径
-        }
-      }
-
       const cacheKey = JSON.stringify([safeRoot, resolvedAdditionalPaths, resolvedSessionPaths])
       const now = Date.now()
       const cachedIndex = workspaceFileSearchIndexCache.get(cacheKey)
       if (cachedIndex && cachedIndex.expiresAt > now) {
+        if (!authorizeStableDirectoryRoots(cachedIndex.openedRoots, orderedRoots, accessSnapshot)
+          || cachedIndex.openedRoots[0]?.isDirectory !== true) {
+          throw new Error('访问路径超出当前会话的授权范围')
+        }
         // 查询排序会原地修改数组；每次从缓存复制外壳，索引条目本身保持只读复用。
         rootEntries = [...cachedIndex.rootEntries]
         workspaceEntries = [...cachedIndex.workspaceEntries]
       } else {
-        // session 目录：相对路径
-        scan(safeRoot, safeRoot, rootEntries, false, 'session')
-
-        // 会话级附加路径：绝对路径，标记为 session（归入会话文件分组）
-        for (const sessionPath of resolvedSessionPaths) {
-          addAttachedPath(sessionPath, rootEntries, 'session')
+        /** 单次 helper 请求先稳定打开全部 root，再由同一快照原子授权。 */
+        const nativeResult = await runStableDirectoryNative(
+          {
+            mode: 'scan',
+            roots: orderedRoots,
+            maxDepth: 10,
+            maxEntries: INDEX_ENTRY_CAP_PER_GROUP * 2,
+            ignoreDirectories: [...ignoreDirs],
+            ignoreFiles: [...ignoreFiles],
+          },
+          (openedRoots) => authorizeStableDirectoryRoots(openedRoots, orderedRoots, accessSnapshot)
+            && openedRoots[0]?.isDirectory === true,
+        )
+        /** 按 rootIndex 分组，业务层只负责来源标签与相对路径呈现。 */
+        const entriesByRoot = new Map<number, StableDirectoryNativeEntry[]>()
+        for (const entry of nativeResult.entries) {
+          const entries = entriesByRoot.get(entry.rootIndex) ?? []
+          entries.push(entry)
+          entriesByRoot.set(entry.rootIndex, entries)
+        }
+        const appendRootEntries = (
+          rootIndex: number,
+          target: Entry[],
+          source: 'session' | 'workspace',
+          includeRoot: boolean,
+        ): void => {
+          const openedRoot = nativeResult.roots[rootIndex]
+          if (!openedRoot || target.length >= INDEX_ENTRY_CAP_PER_GROUP) return
+          const rootName = basename(openedRoot.canonicalPath)
+          if (includeRoot && !ignoreFiles.has(rootName) && (!openedRoot.isDirectory || !ignoreDirs.has(rootName))) {
+            target.push({
+              name: rootName === 'workspace-files' ? '项目文件' : rootName,
+              path: openedRoot.canonicalPath,
+              type: openedRoot.isDirectory ? 'dir' : 'file',
+              source,
+            })
+          }
+          if (!openedRoot.isDirectory) return
+          for (const entry of entriesByRoot.get(rootIndex) ?? []) {
+            if (target.length >= INDEX_ENTRY_CAP_PER_GROUP) break
+            target.push({
+              name: entry.name,
+              path: rootIndex === 0 ? relative(openedRoot.canonicalPath, entry.path) : entry.path,
+              type: entry.isDirectory ? 'dir' : 'file',
+              source,
+            })
+          }
         }
 
-        // 工作区文件 + 工作区级附加路径：绝对路径，标记为 workspace
-        for (const additionalPath of resolvedAdditionalPaths) {
-          addAttachedPath(additionalPath, workspaceEntries, 'workspace')
+        appendRootEntries(0, rootEntries, 'session', false)
+        for (let index = 0; index < resolvedSessionPaths.length; index += 1) {
+          appendRootEntries(1 + index, rootEntries, 'session', true)
+        }
+        for (let index = 0; index < resolvedAdditionalPaths.length; index += 1) {
+          appendRootEntries(1 + resolvedSessionPaths.length + index, workspaceEntries, 'workspace', true)
         }
 
         for (const [key, cached] of workspaceFileSearchIndexCache) {
@@ -4942,6 +4836,7 @@ export function registerIpcHandlers(): void {
         }
         workspaceFileSearchIndexCache.set(cacheKey, {
           expiresAt: now + WORKSPACE_FILE_INDEX_CACHE_TTL_MS,
+          openedRoots: nativeResult.roots.map((root) => ({ ...root })),
           rootEntries: [...rootEntries],
           workspaceEntries: [...workspaceEntries],
         })
