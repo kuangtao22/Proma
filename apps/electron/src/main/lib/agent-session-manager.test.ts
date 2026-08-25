@@ -98,6 +98,9 @@ function writeAgentSessionsIndex(sessions: Array<{
   archived?: boolean
   sourceDesignProjectId?: string
   sourceDesignJobId?: string
+  sourceCanvasProjectId?: string
+  sourceCanvasId?: string
+  sourceCanvasNodeId?: string
 }>): void {
   const dir = join(tempHome, '.proma')
   mkdirSync(dir, { recursive: true })
@@ -692,6 +695,46 @@ describe('Agent 会话 runtime 元数据', () => {
     })
   })
 
+  test('Given Canvas 创建内部会话 When 三字段完整且项目匹配 Then 原子持久化且普通列表不可见', () => {
+    writeAgentSessionsIndex([])
+    const session = manager.createAgentSessionWithMetadata({
+      title: 'Canvas 节点 Agent',
+      workspaceId: 'workspace-canvas',
+      sourceCanvasProjectId: 'workspace-canvas',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    })
+
+    expect(manager.listAgentSessions()).toContainEqual(expect.objectContaining({
+      id: session.id,
+      workspaceId: 'workspace-canvas',
+      sourceCanvasProjectId: 'workspace-canvas',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    }))
+    expect(manager.listVisibleAgentSessions()).not.toContainEqual(expect.objectContaining({ id: session.id }))
+  })
+
+  test.each([
+    ['缺少一个来源字段', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: 'workspace-canvas', sourceCanvasId: 'canvas-1' }],
+    ['缺少两个来源字段', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: 'workspace-canvas' }],
+    ['空字符串来源字段', { workspaceId: 'workspace-canvas', sourceCanvasProjectId: 'workspace-canvas', sourceCanvasId: '', sourceCanvasNodeId: 'node-1' }],
+    ['工作区不匹配', { workspaceId: 'workspace-other', sourceCanvasProjectId: 'workspace-canvas', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1' }],
+    ['Design 与 Canvas 混用', {
+      workspaceId: 'workspace-canvas',
+      sourceDesignProjectId: 'workspace-canvas',
+      sourceDesignJobId: 'job-1',
+      sourceCanvasProjectId: 'workspace-canvas',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    }],
+  ])('Given Canvas %s When 创建内部会话 Then 拒绝损坏归属且不写入索引', (_label, input) => {
+    writeAgentSessionsIndex([])
+
+    expect(() => manager.createAgentSessionWithMetadata(input)).toThrow()
+    expect(manager.listAgentSessions()).toEqual([])
+  })
+
   test('Given 普通与内部会话混合 When 查询列表和归档计数 Then 只投影用户会话', () => {
     writeAgentSessionsIndex([
       { id: 'visible-active', title: '普通会话', workspaceId: 'workspace-a', createdAt: 1, updatedAt: 4 },
@@ -703,6 +746,20 @@ describe('Agent 会话 runtime 元数据', () => {
       {
         id: 'internal-archived', title: '内部归档', workspaceId: 'workspace-a', archived: true,
         sourceDesignProjectId: 'workspace-a', sourceDesignJobId: 'job-2', createdAt: 1, updatedAt: 1,
+      },
+      {
+        id: 'canvas-active', title: 'Canvas 内部会话', workspaceId: 'workspace-a',
+        sourceCanvasProjectId: 'workspace-a', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
+        createdAt: 1, updatedAt: 2,
+      },
+      {
+        id: 'canvas-archived', title: 'Canvas 内部归档', workspaceId: 'workspace-a', archived: true,
+        sourceCanvasProjectId: 'workspace-a', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-2',
+        createdAt: 1, updatedAt: 1,
+      },
+      {
+        id: 'canvas-broken', title: 'Canvas 半归属', workspaceId: 'workspace-a',
+        sourceCanvasId: 'canvas-1', createdAt: 1, updatedAt: 1,
       },
     ])
 
@@ -728,6 +785,28 @@ describe('Agent 会话 runtime 元数据', () => {
 })
 
 describe('Agent 会话正文搜索', () => {
+  test('Given Canvas 内部与半归属会话正文命中 When 搜索 Then 均不返回内部记录', async () => {
+    writeAgentSessionsIndex([
+      {
+        id: 'canvas-search-session', title: 'Canvas 内部任务', workspaceId: 'workspace-a',
+        sourceCanvasProjectId: 'workspace-a', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
+        createdAt: 1, updatedAt: 2,
+      },
+      {
+        id: 'broken-canvas-search-session', title: 'Canvas 半归属任务', workspaceId: 'workspace-a',
+        sourceCanvasNodeId: '', createdAt: 1, updatedAt: 1,
+      },
+    ])
+    writeAgentSessionJsonl('canvas-search-session', [
+      JSON.stringify({ type: 'user', uuid: 'canvas-user', message: { content: [{ type: 'text', text: 'Canvas 隐藏命中词' }] } }),
+    ])
+    writeAgentSessionJsonl('broken-canvas-search-session', [
+      JSON.stringify({ type: 'user', uuid: 'broken-canvas-user', message: { content: [{ type: 'text', text: 'Canvas 隐藏命中词' }] } }),
+    ])
+
+    expect(await manager.searchAgentSessionMessages('Canvas 隐藏命中词')).toEqual([])
+  })
+
   test('Given 内部 Design 会话正文命中 When 搜索 Then 不读取或返回内部记录', async () => {
     writeAgentSessionsIndex([{
       id: 'internal-search-session',
@@ -851,6 +930,24 @@ describe('Agent 会话正文搜索', () => {
 })
 
 describe('Agent 会话引用搜索', () => {
+  test('Given Canvas 内部会话标题与正文命中 When 搜索引用 Then 不返回内部记录', async () => {
+    writeAgentSessionsIndex([{
+      id: 'canvas-reference-session',
+      title: '隐藏 Canvas 任务',
+      workspaceId: 'workspace-a',
+      sourceCanvasProjectId: 'workspace-a',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+      createdAt: 1,
+      updatedAt: 2,
+    }])
+    writeAgentSessionJsonl('canvas-reference-session', [
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: '隐藏 Canvas 任务正文' }] } }),
+    ])
+
+    expect(await manager.searchAgentSessionReferences({ query: '隐藏 Canvas 任务' })).toEqual([])
+  })
+
   test('Given 内部 Design 会话标题与正文命中 When 搜索引用 Then 不返回内部记录', async () => {
     writeAgentSessionsIndex([{
       id: 'internal-reference-session',

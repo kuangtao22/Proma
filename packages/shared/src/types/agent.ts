@@ -785,6 +785,12 @@ export interface AgentSessionMeta {
   sourceDesignProjectId?: string
   /** 来源设计任务 ID；用于从会话追溯画布占位节点。 */
   sourceDesignJobId?: string
+  /** 来源 Canvas 所属项目 ID；必须与 workspaceId 一致。 */
+  sourceCanvasProjectId?: string
+  /** 来源 Canvas ID；用于把内部 Agent 绑定到唯一画布。 */
+  sourceCanvasId?: string
+  /** 来源 Canvas 节点 ID；用于把内部 Agent 绑定到唯一节点。 */
+  sourceCanvasNodeId?: string
   /**
    * 自动任务会话是否已被用户手动接管而"毕业"：true 时该会话回到普通项目会话列表，
    * 且调度器不再复用它注入新的定时运行（避免污染用户已接管的会话）。默认 undefined/false。

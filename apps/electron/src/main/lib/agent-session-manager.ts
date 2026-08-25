@@ -56,7 +56,7 @@ import { clearNanoBananaAgentHistory } from './chat-tools/nano-banana-mcp'
 import { assertEnabledModelForChannel } from './agent-model-selection'
 import { copyForkWorkspaceFiles } from './agent-fork-workspace-copy'
 import { isAgentSessionsIndex } from './owned-path-rebaser-schema'
-import { isAgentSessionUserVisible } from './agent-session-visibility'
+import { hasValidCanvasAgentOwnership, isAgentSessionUserVisible } from './agent-session-visibility'
 
 /**
  * 会话索引文件格式
@@ -519,6 +519,12 @@ export interface CreateAgentSessionWithMetadataInput {
   sessionWorkbenchLayout?: SessionWorkbenchLayout
   sourceDesignProjectId?: string
   sourceDesignJobId?: string
+  /** Canvas 所属项目 ID，必须与 workspaceId 一致。 */
+  sourceCanvasProjectId?: string
+  /** Canvas ID，用于绑定内部 Agent。 */
+  sourceCanvasId?: string
+  /** Canvas 节点 ID，用于绑定内部 Agent。 */
+  sourceCanvasNodeId?: string
 }
 
 /**
@@ -535,7 +541,7 @@ function initializeAgentSessionDirectories(meta: AgentSessionMeta): void {
 
 /**
  * 单次原子索引写入创建 Agent 会话及其来源元数据。
- * @param input 会话展示、模型、工作区及可选 Design 所有权字段。
+ * @param input 会话展示、模型、工作区及可选内部执行所有权字段。
  * @returns 已持久化的新会话元数据。
  */
 export function createAgentSessionWithMetadata(
@@ -548,8 +554,29 @@ export function createAgentSessionWithMetadata(
   /** 任一调用字段出现时都必须提供完整非空归属。 */
   const hasDesignMetadata = input.sourceDesignProjectId !== undefined
     || input.sourceDesignJobId !== undefined
+  /** Canvas 任一来源字段出现时都按内部会话校验。 */
+  const hasCanvasMetadata = input.sourceCanvasProjectId !== undefined
+    || input.sourceCanvasId !== undefined
+    || input.sourceCanvasNodeId !== undefined
+  if (hasDesignMetadata && hasCanvasMetadata) {
+    throw new Error('Agent 内部会话不能同时声明 Design 与 Canvas 来源')
+  }
   if (hasDesignMetadata && (!sourceDesignProjectId || !sourceDesignJobId)) {
     throw new Error('Design 内部会话来源字段必须成对提供')
+  }
+  /** 规范化后的 Canvas 项目来源。 */
+  const sourceCanvasProjectId = input.sourceCanvasProjectId?.trim()
+  /** 规范化后的 Canvas 身份。 */
+  const sourceCanvasId = input.sourceCanvasId?.trim()
+  /** 规范化后的 Canvas 节点身份。 */
+  const sourceCanvasNodeId = input.sourceCanvasNodeId?.trim()
+  if (hasCanvasMetadata && !hasValidCanvasAgentOwnership({
+    workspaceId: input.workspaceId,
+    sourceCanvasProjectId,
+    sourceCanvasId,
+    sourceCanvasNodeId,
+  })) {
+    throw new Error('Canvas 内部会话来源字段必须完整且属于当前项目')
   }
 
   const index = readIndex()
@@ -569,6 +596,7 @@ export function createAgentSessionWithMetadata(
     // 新会话继承已持久化的全局思考偏好，之后仍可按会话单独调整。
     reasoningLevel: defaultThinkingLevel,
     ...(hasDesignMetadata ? { sourceDesignProjectId, sourceDesignJobId } : {}),
+    ...(hasCanvasMetadata ? { sourceCanvasProjectId, sourceCanvasId, sourceCanvasNodeId } : {}),
     createdAt: now,
     updatedAt: now,
   }

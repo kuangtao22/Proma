@@ -30,6 +30,21 @@ describe('sortAgentSessionsByUpdatedAtDesc', () => {
     ])
     expect(result.map((s) => s.id)).toEqual(['b', 'c', 'a'])
   })
+
+  test('Given fetch 返回 Canvas 内部与半归属会话 When 排序投影 Then 只保留普通会话', () => {
+    const result = sortAgentSessionsByUpdatedAtDesc([
+      makeSession('visible', 1),
+      makeSession('canvas', 3, {
+        workspaceId: 'project-1',
+        sourceCanvasProjectId: 'project-1',
+        sourceCanvasId: 'canvas-1',
+        sourceCanvasNodeId: 'node-1',
+      }),
+      makeSession('broken-canvas', 2, { sourceCanvasId: '' }),
+    ])
+
+    expect(result.map((session) => session.id)).toEqual(['visible'])
+  })
 })
 
 describe('replaceAgentSessionInFreshnessOrder', () => {
@@ -40,6 +55,15 @@ describe('replaceAgentSessionInFreshnessOrder', () => {
     )
     expect(result.map((s) => s.id)).toEqual(['a', 'b'])
     expect(result.find((s) => s.id === 'a')?.title).toBe('新标题')
+  })
+
+  test('Given Canvas 内部会话通过单条 fetch 替换 When 更新 Then 不进入用户列表', () => {
+    const result = replaceAgentSessionInFreshnessOrder(
+      [makeSession('visible', 1)],
+      makeSession('canvas', 5, { sourceCanvasNodeId: 'node-1' }),
+    )
+
+    expect(result.map((session) => session.id)).toEqual(['visible'])
   })
 })
 
@@ -89,6 +113,23 @@ describe('upsertAgentSession', () => {
     })
 
     const result = upsertAgentSession([makeSession('visible', 10)], internal)
+
+    expect(result.map((session) => session.id)).toEqual(['visible'])
+  })
+
+  test('Given Canvas 内部会话通过增量事件到达 When upsert Then 完整与半归属均不进入用户列表', () => {
+    /** 完整 Canvas 归属的增量事件。 */
+    const internal = makeSession('canvas-session', 12, {
+      workspaceId: 'project-1',
+      sourceCanvasProjectId: 'project-1',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    })
+    /** 损坏字段也必须 fail closed。 */
+    const broken = makeSession('broken-canvas-session', 13, { sourceCanvasProjectId: '' })
+
+    const afterInternal = upsertAgentSession([makeSession('visible', 10)], internal)
+    const result = upsertAgentSession(afterInternal, broken)
 
     expect(result.map((session) => session.id)).toEqual(['visible'])
   })
@@ -146,6 +187,25 @@ describe('mergeFetchedAgentSessions', () => {
     const result = mergeFetchedAgentSessions(
       [makeSession('visible', 10), internal],
       [makeSession('visible', 20)],
+    )
+
+    expect(result.map((session) => session.id)).toEqual(['visible'])
+  })
+
+  test('Given 本地与快照含 Canvas 内部会话 When 合并 Then 清除完整与半归属记录', () => {
+    /** 高于快照水位的本地内部会话也不能幸存。 */
+    const localInternal = makeSession('local-canvas', 100, { sourceCanvasId: 'canvas-1' })
+    /** 权威快照直接返回的内部会话同样不得进入列表。 */
+    const fetchedInternal = makeSession('fetched-canvas', 30, {
+      workspaceId: 'project-1',
+      sourceCanvasProjectId: 'project-1',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    })
+
+    const result = mergeFetchedAgentSessions(
+      [makeSession('visible', 10), localInternal],
+      [makeSession('visible', 20), fetchedInternal],
     )
 
     expect(result.map((session) => session.id)).toEqual(['visible'])

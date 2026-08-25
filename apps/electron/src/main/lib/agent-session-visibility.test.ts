@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  hasValidCanvasAgentOwnership,
   hasValidDesignSessionOwnership,
   isAgentSessionUserVisible,
   isInternalDesignSession,
@@ -36,5 +37,54 @@ describe('Agent 内部 Design 会话可见性', () => {
       createdAt: 1,
       updatedAt: 1,
     })).toThrow('Agent 会话不存在')
+  })
+})
+
+describe('Agent 内部 Canvas 会话归属与可见性', () => {
+  test('Given Canvas 三字段完整且工作区匹配 When 判断归属 Then 认定为合法内部会话', () => {
+    /** 完整且归属同一项目的 Canvas Agent 元数据。 */
+    const internal = {
+      workspaceId: 'project-1',
+      sourceCanvasProjectId: 'project-1',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    }
+
+    expect(hasValidCanvasAgentOwnership(internal)).toBe(true)
+    expect(isAgentSessionUserVisible(internal)).toBe(false)
+  })
+
+  test.each([
+    ['缺少项目字段', { workspaceId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1' }],
+    ['缺少画布字段', { workspaceId: 'project-1', sourceCanvasProjectId: 'project-1', sourceCanvasNodeId: 'node-1' }],
+    ['缺少节点字段', { workspaceId: 'project-1', sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1' }],
+    ['只提供项目字段', { workspaceId: 'project-1', sourceCanvasProjectId: 'project-1' }],
+    ['项目字段为空', { workspaceId: 'project-1', sourceCanvasProjectId: '', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1' }],
+    ['画布字段为空白', { workspaceId: 'project-1', sourceCanvasProjectId: 'project-1', sourceCanvasId: ' ', sourceCanvasNodeId: 'node-1' }],
+    ['节点字段为空', { workspaceId: 'project-1', sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: '' }],
+    ['工作区不匹配', { workspaceId: 'project-2', sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1' }],
+  ])('Given Canvas %s When 判断归属与可见性 Then 非法且 fail closed', (_label, session) => {
+    expect(hasValidCanvasAgentOwnership(session)).toBe(false)
+    expect(isAgentSessionUserVisible(session)).toBe(false)
+  })
+
+  test('Given Design 与 Canvas 来源同时存在 When 判断 Canvas 归属 Then 拒绝混合所有权', () => {
+    /** 同时声明两种内部执行来源的冲突元数据。 */
+    const mixed = {
+      workspaceId: 'project-1',
+      sourceDesignProjectId: 'project-1',
+      sourceDesignJobId: 'job-1',
+      sourceCanvasProjectId: 'project-1',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    }
+
+    expect(hasValidCanvasAgentOwnership(mixed)).toBe(false)
+    expect(isAgentSessionUserVisible(mixed)).toBe(false)
+  })
+
+  test('Given 普通会话 When 判断 Canvas 归属与可见性 Then 保持普通会话行为', () => {
+    expect(hasValidCanvasAgentOwnership({ workspaceId: 'project-1' })).toBe(false)
+    expect(isAgentSessionUserVisible({ workspaceId: 'project-1' })).toBe(true)
   })
 })

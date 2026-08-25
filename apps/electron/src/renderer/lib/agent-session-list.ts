@@ -5,18 +5,39 @@ interface AgentSessionTreeLike {
   childSessions: readonly Pick<AgentSessionMeta, 'id'>[]
 }
 
-/** Renderer 会话入口必须排除带任一 Design 归属标记的内部执行会话。 */
+/**
+ * 判断会话是否允许进入 Renderer 普通用户列表。
+ * @param session 待判断的内部来源字段。
+ * @returns 未声明任何 Design 或 Canvas 来源字段时返回 true。
+ */
 function isRendererVisibleAgentSession(
-  session: Pick<AgentSessionMeta, 'sourceDesignProjectId' | 'sourceDesignJobId'>,
+  session: Pick<
+    AgentSessionMeta,
+    | 'sourceDesignProjectId'
+    | 'sourceDesignJobId'
+    | 'sourceCanvasProjectId'
+    | 'sourceCanvasId'
+    | 'sourceCanvasNodeId'
+  >,
 ): boolean {
-  return !session.sourceDesignProjectId && !session.sourceDesignJobId
+  return session.sourceDesignProjectId === undefined
+    && session.sourceDesignJobId === undefined
+    && session.sourceCanvasProjectId === undefined
+    && session.sourceCanvasId === undefined
+    && session.sourceCanvasNodeId === undefined
 }
 
-/** 按最近更新时间排序 Agent 会话，保持与主进程 listAgentSessions 一致。 */
+/**
+ * 过滤内部执行会话并按最近更新时间排序，供 Renderer fetch 投影复用。
+ * @param sessions 后端或本地提供的候选会话。
+ * @returns 仅含普通用户会话的更新时间降序副本。
+ */
 export function sortAgentSessionsByUpdatedAtDesc(
   sessions: readonly AgentSessionMeta[],
 ): AgentSessionMeta[] {
-  return [...sessions].sort((a, b) => b.updatedAt - a.updatedAt)
+  return sessions
+    .filter(isRendererVisibleAgentSession)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
 }
 
 /** 用后端返回的新元数据替换本地条目，并按最近更新时间重新排序。 */
