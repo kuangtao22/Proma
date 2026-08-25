@@ -129,6 +129,31 @@ export class AtomicDestinationConflictError extends Error {
   }
 }
 
+/** 主文件 rename 后可能出现的稳定提交阶段。 */
+export type AtomicWritePostCommitStage =
+  | 'mainDurabilityUncertain'
+  | 'priorBackupDegraded'
+
+/** 主文件已 rename 后抛出的 typed error，调用方不得按普通失败重试。 */
+export class AtomicWritePostCommitError extends Error {
+  /** 主文件 rename 已完成，是所有 post-commit 错误的不变量。 */
+  readonly committed = true
+  /** 区分主 durability 未确认或 backup 已降级。 */
+  readonly stage: AtomicWritePostCommitStage
+  /** 保留原始系统错误或安全状态错误。 */
+  override readonly cause: unknown
+
+  constructor(stage: AtomicWritePostCommitStage, cause: unknown) {
+    const message = stage === 'mainDurabilityUncertain'
+      ? '安全原子写入主文件已提交但持久性未确认'
+      : '安全原子写入主文件已确认但备份降级'
+    super(message, { cause })
+    this.name = 'AtomicWritePostCommitError'
+    this.stage = stage
+    this.cause = cause
+  }
+}
+
 /** safe-file 内部复用的文件身份别名。 */
 type FileSystemIdentity = AtomicFileIdentity
 
@@ -552,10 +577,16 @@ export function writeJsonFileAtomicSecure(
     }
     renameSync(tempPath, filePath)
     tempIdentity = null
-    /** 主 rename 是业务提交点；此后失败必须明确主文件已经改变。 */
+    /** 主 rename 是业务提交点，durability 失败必须单独标记为未确认。 */
+    let mainDurability: DurabilityResult
+    try {
+      mainDurability = syncCommittedFileDurability(filePath, options)
+    } catch (error) {
+      throw new AtomicWritePostCommitError('mainDurabilityUncertain', error)
+    }
+    /** main durability 已确认；后续错误只允许降级 prior backup。 */
     if (priorBackup && backupTempPath && backupTempIdentity) {
       try {
-        const mainDurability = syncCommittedFileDurability(filePath, options)
         assertIdentityUnchanged(parentPath, parentIdentity, '安全原子写入父目录身份已变化', true)
         assertDestinationStateUnchanged(priorBackup.filePath, backupDestinationState)
         assertIdentityUnchanged(
@@ -571,10 +602,10 @@ export function writeJsonFileAtomicSecure(
           ? 'directory'
           : 'file-only'
       } catch (error) {
-        throw new Error('安全原子写入主文件已提交但备份发布失败', { cause: error })
+        throw new AtomicWritePostCommitError('priorBackupDegraded', error)
       }
     }
-    return syncCommittedFileDurability(filePath, options)
+    return mainDurability
   } finally {
     if (descriptor !== null) {
       try { closeSync(descriptor) } catch { /* 原始写入错误优先向上传播。 */ }

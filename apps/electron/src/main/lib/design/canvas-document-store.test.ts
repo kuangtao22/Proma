@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -25,6 +26,7 @@ import type { CanvasDocumentStoreOptions } from './canvas-document-store'
 import { CanvasSessionStore } from './canvas-session-store'
 import { createDesignPathResolver } from './design-paths'
 import type { DesignPathResolver } from './design-paths'
+import { writeJsonFileAtomicSecure } from '../safe-file'
 
 /** 单个测试环境中的可信路径、会话索引和文档 Store。 */
 interface CanvasStoreFixture {
@@ -45,6 +47,7 @@ interface CanvasStoreOverrides {
   removeFileAtomic?: CanvasDocumentStoreOptions['removeFileAtomic']
   afterCandidateRead?: CanvasDocumentStoreOptions['afterCandidateRead']
   beforeConsumeRecoveredTemporary?: CanvasDocumentStoreOptions['beforeConsumeRecoveredTemporary']
+  onRecoveryDegraded?: CanvasDocumentStoreOptions['onRecoveryDegraded']
 }
 
 describe('CanvasDocumentStore', () => {
@@ -96,6 +99,7 @@ describe('CanvasDocumentStore', () => {
       removeFileAtomic: overrides.removeFileAtomic,
       afterCandidateRead: overrides.afterCandidateRead,
       beforeConsumeRecoveredTemporary: overrides.beforeConsumeRecoveredTemporary,
+      onRecoveryDegraded: overrides.onRecoveryDegraded,
     })
     /** 原生文档必须只位于 resolveCanvas 给出的独立目录。 */
     const documentPath = pathResolver.resolveCanvas('project-1', 'canvas-1').documentPath
@@ -144,6 +148,12 @@ describe('CanvasDocumentStore', () => {
   function writeDocument(path: string, document: object): void {
     mkdirSync(join(path, '..'), { recursive: true })
     writeFileSync(path, JSON.stringify(document), 'utf8')
+  }
+
+  /** 返回 Canvas 根内残留的随机安全写 staging 文件。 */
+  function listAtomicStagingFiles(documentPath: string): string[] {
+    return readdirSync(join(documentPath, '..'))
+      .filter((name) => name.startsWith('.canvas.json') && name.endsWith('.tmp'))
   }
 
   test('Given 已登记 native Canvas 且文档缺失 When load Then 返回绑定双重身份的空文档且不落盘', () => {
@@ -450,6 +460,120 @@ describe('CanvasDocumentStore', () => {
 
     expect(JSON.parse(readFileSync(`${fixture.documentPath}.bak`, 'utf8')).revision).toBe(2)
     expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(3)
+  })
+
+  test('Given main durable 后 backup rename 前 CAS 失败 When mutate Then 返回 next 并告警且旧 backup 保留', () => {
+    /** 第一次目录同步后触碰 backup 内容状态，真实触发 priorBackupDegraded。 */
+    const degradedErrors: Error[] = []
+    const fixture = createFixture({
+      writeJsonFileAtomicSecure: (path, document, options) => writeJsonFileAtomicSecure(
+        path,
+        document,
+        {
+          ...options,
+          syncDirectory: () => {
+            const backupPath = `${path}.bak`
+            const content = readFileSync(backupPath, 'utf8')
+            writeFileSync(backupPath, content, 'utf8')
+          },
+        },
+      ),
+      onRecoveryDegraded: (_message, error) => { degradedErrors.push(error) },
+    })
+    writeDocument(fixture.documentPath, createConnectedDocument(2))
+    writeDocument(`${fixture.documentPath}.bak`, createConnectedDocument(1))
+
+    const next = fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [{ type: 'set-viewport', viewport: { x: 3, y: 4, zoom: 1 } }],
+    )
+
+    expect(next.revision).toBe(3)
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(3)
+    expect(JSON.parse(readFileSync(`${fixture.documentPath}.bak`, 'utf8')).revision).toBe(1)
+    expect(listAtomicStagingFiles(fixture.documentPath)).toEqual([])
+    expect(degradedErrors).toHaveLength(1)
+    expect(fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }).document).toEqual(next)
+  })
+
+  test('Given backup rename 后 durability 失败 When mutate Then 返回 next 并告警且 previous backup 可见', () => {
+    /** 第二次目录同步注入 EIO，此时 main 与 backup rename 都已完成。 */
+    let syncCalls = 0
+    const degradedErrors: Error[] = []
+    const fixture = createFixture({
+      writeJsonFileAtomicSecure: (path, document, options) => writeJsonFileAtomicSecure(
+        path,
+        document,
+        {
+          ...options,
+          syncDirectory: () => {
+            syncCalls += 1
+            if (syncCalls === 2) throw new Error('backup durability failed')
+          },
+        },
+      ),
+      onRecoveryDegraded: (_message, error) => { degradedErrors.push(error) },
+    })
+    writeDocument(fixture.documentPath, createConnectedDocument(2))
+    writeDocument(`${fixture.documentPath}.bak`, createConnectedDocument(1))
+
+    const next = fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [{ type: 'set-viewport', viewport: { x: 3, y: 4, zoom: 1 } }],
+    )
+
+    expect(next.revision).toBe(3)
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(3)
+    expect(JSON.parse(readFileSync(`${fixture.documentPath}.bak`, 'utf8')).revision).toBe(2)
+    expect(listAtomicStagingFiles(fixture.documentPath)).toEqual([])
+    expect(degradedErrors).toHaveLength(1)
+  })
+
+  test('Given main rename 后 durability 失败 When mutate Then 要求对账且不自动重复 mutation', () => {
+    /** 第一次目录同步即失败，主文件已 rename 但 durability 尚未确认。 */
+    const fixture = createFixture({
+      writeJsonFileAtomicSecure: (path, document, options) => writeJsonFileAtomicSecure(
+        path,
+        document,
+        { ...options, syncDirectory: () => { throw new Error('main durability failed') } },
+      ),
+    })
+    writeDocument(fixture.documentPath, createConnectedDocument(2))
+    writeDocument(`${fixture.documentPath}.bak`, createConnectedDocument(1))
+
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [{ type: 'set-viewport', viewport: { x: 3, y: 4, zoom: 1 } }],
+    )).toThrow('CANVAS_COMMIT_UNCERTAIN')
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(3)
+    expect(JSON.parse(readFileSync(`${fixture.documentPath}.bak`, 'utf8')).revision).toBe(1)
+    expect(listAtomicStagingFiles(fixture.documentPath)).toEqual([])
+    const reconciled = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }).document
+    expect(reconciled.revision).toBe(3)
+    expect(reconciled.viewport).toEqual({ x: 3, y: 4, zoom: 1 })
+  })
+
+  test('Given recovery promotion main durability 未确认 When load Then 要求恢复对账且不消费 tmp', () => {
+    /** recovery 无 priorBackup，主 rename 后同步失败仍必须使用 typed uncertain 分流。 */
+    const fixture = createFixture({
+      writeJsonFileAtomicSecure: (path, document, options) => writeJsonFileAtomicSecure(
+        path,
+        document,
+        { ...options, syncDirectory: () => { throw new Error('recovery durability failed') } },
+      ),
+    })
+    writeDocument(fixture.documentPath, { broken: true })
+    writeDocument(`${fixture.documentPath}.tmp`, createConnectedDocument(2))
+
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_RECOVERY_REQUIRED')
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).revision).toBe(2)
+    expect(JSON.parse(readFileSync(`${fixture.documentPath}.tmp`, 'utf8')).revision).toBe(2)
+    expect(listAtomicStagingFiles(fixture.documentPath)).toEqual([])
+    expect(fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }).document.revision).toBe(2)
   })
 
   test('Given 未知、跨项目或 legacy Canvas When load Then 在 resolveCanvas 前统一拒绝', () => {

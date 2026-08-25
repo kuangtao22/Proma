@@ -23,6 +23,7 @@ import type {
 } from '@proma/shared'
 import {
   AtomicDestinationConflictError,
+  AtomicWritePostCommitError,
   removeFileAtomic,
   writeJsonFileAtomicSecure,
 } from '../safe-file'
@@ -105,6 +106,8 @@ export interface CanvasDocumentStoreOptions {
   afterCandidateRead?: (candidatePath: string) => void
   /** tmp 提升为主文件后、绑定身份删除前调用的竞态测试 hook。 */
   beforeConsumeRecoveredTemporary?: (temporaryPath: string) => void
+  /** 主提交 durable 但 previous backup 降级时的非阻塞告警。 */
+  onRecoveryDegraded?: (message: string, error: AtomicWritePostCommitError) => void
 }
 
 /** 未知 JSON 普通对象的安全索引结构。 */
@@ -682,6 +685,18 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
   const removeFile = options.removeFileAtomic ?? removeFileAtomic
   /** 生产默认使用系统当前时间。 */
   const now = options.now ?? Date.now
+  /** 生产默认输出中文降级告警，禁止把已提交 mutation 伪装为失败。 */
+  const onRecoveryDegraded = options.onRecoveryDegraded
+    ?? ((message: string, error: AtomicWritePostCommitError) => console.warn(message, error))
+
+  /** 降级通知属于观察副作用，自身失败不得改变已提交 mutation 的返回语义。 */
+  function reportRecoveryDegraded(message: string, error: AtomicWritePostCommitError): void {
+    try {
+      onRecoveryDegraded(message, error)
+    } catch (reportError) {
+      console.warn(`${message}；降级通知失败`, reportError)
+    }
+  }
 
   /** 在安全写 rename 前复验固定父目录和路径身份。 */
   function writeCanvasJsonSecure(
@@ -761,7 +776,18 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
             cause: error,
           })
         }
-        throw error
+        if (error instanceof AtomicWritePostCommitError
+          && error.stage === 'mainDurabilityUncertain') {
+          throw new Error('CANVAS_RECOVERY_REQUIRED: promotion commit durability uncertain', {
+            cause: error,
+          })
+        }
+        if (error instanceof AtomicWritePostCommitError
+          && error.stage === 'priorBackupDegraded') {
+          reportRecoveryDegraded('Canvas 恢复主文件已提交，但恢复备份状态已降级', error)
+        } else {
+          throw error
+        }
       }
       if (readResult.recoveredFrom === 'tmp') {
         if (!readResult.recoveredState) throw unsafeCanvasPath('tmp 恢复缺少绑定状态')
@@ -861,6 +887,18 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     } catch (error) {
       if (error instanceof AtomicDestinationConflictError) {
         throw new Error('CANVAS_REVISION_CONFLICT: document changed before commit', {
+          cause: error,
+        })
+      }
+      if (error instanceof AtomicWritePostCommitError) {
+        if (error.stage === 'priorBackupDegraded') {
+          reportRecoveryDegraded(
+            `Canvas mutation 已提交，但 previous revision backup 降级: ${target.projectId}/${target.canvasId}`,
+            error,
+          )
+          return next
+        }
+        throw new Error('CANVAS_COMMIT_UNCERTAIN: main durability requires reload', {
           cause: error,
         })
       }

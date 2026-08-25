@@ -211,16 +211,29 @@ describe('Windows durability capability', () => {
     }
   })
 
-  test('Given Windows 安全写遇到 EIO When 提交后同步 Then 仍向上传播真实 I/O 错误', () => {
-    /** 真实设备 I/O 错误不得被 Windows capability 降级吞掉。 */
+  test('Given 主文件 rename 后 durability 遇到 EIO When 安全写入 Then 抛出 typed uncertain 错误', () => {
+    /** 真实设备 I/O 错误必须携带已提交但 durability 未确认的稳定阶段。 */
     const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-win-io-error-'))
     const filePath = join(tempDir, 'journal.json')
     try {
-      expect(() => writeJsonFileAtomicSecure(filePath, { stage: 'copying' }, {
-        platform: 'win32',
-        syncFile: () => {},
-        syncDirectory: () => { throw createFileSystemError('EIO', 'fsync') },
-      })).toThrow('fsync EIO')
+      let caughtError: unknown
+      try {
+        writeJsonFileAtomicSecure(filePath, { stage: 'copying' }, {
+          platform: 'win32',
+          syncFile: () => {},
+          syncDirectory: () => { throw createFileSystemError('EIO', 'fsync') },
+        })
+      } catch (error) {
+        caughtError = error
+      }
+      expect(caughtError).toBeInstanceOf(Error)
+      expect(caughtError).toMatchObject({
+        committed: true,
+        stage: 'mainDurabilityUncertain',
+        cause: { code: 'EIO', syscall: 'fsync' },
+      })
+      expect((caughtError as Error).constructor.name).toBe('AtomicWritePostCommitError')
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ stage: 'copying' })
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }
@@ -386,6 +399,76 @@ describe('readJsonFileSafe validator', () => {
 })
 
 describe('writeJsonFileAtomicSecure', () => {
+  test('Given main durability 已确认但 backup rename 前状态变化 When 安全写入 Then typed degraded 且旧 backup 保留', () => {
+    /** 第一次目录同步发生在 main durability，随后原地触碰 backup 触发发布前 CAS。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-backup-before-rename-'))
+    const filePath = join(tempDir, 'marker.json')
+    const backupPath = `${filePath}.bak`
+    writeFileSync(filePath, '{"revision":2}', 'utf8')
+    writeFileSync(backupPath, '{"revision":1}', 'utf8')
+    const expectedState = captureAtomicFileState(filePath)
+    let caughtError: unknown
+    try {
+      try {
+        writeJsonFileAtomicSecure(filePath, { revision: 3 }, {
+          expectedDestination: { kind: 'state', state: expectedState },
+          priorBackup: { filePath: backupPath, data: { revision: 2 } },
+          syncDirectory: () => {
+            const content = readFileSync(backupPath, 'utf8')
+            writeFileSync(backupPath, content, 'utf8')
+          },
+        })
+      } catch (error) {
+        caughtError = error
+      }
+      expect(caughtError).toMatchObject({
+        committed: true,
+        stage: 'priorBackupDegraded',
+      })
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ revision: 3 })
+      expect(JSON.parse(readFileSync(backupPath, 'utf8'))).toEqual({ revision: 1 })
+      expect(readdirSync(tempDir).filter((name) => name.endsWith('.tmp'))).toEqual([])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given backup rename 后 durability 失败 When 安全写入 Then typed degraded 且新 backup 可见', () => {
+    /** 第二次目录同步发生在 backup rename 后，稳定注入发布后 durability 故障。 */
+    const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-backup-after-rename-'))
+    const filePath = join(tempDir, 'marker.json')
+    const backupPath = `${filePath}.bak`
+    writeFileSync(filePath, '{"revision":2}', 'utf8')
+    writeFileSync(backupPath, '{"revision":1}', 'utf8')
+    const expectedState = captureAtomicFileState(filePath)
+    let syncCalls = 0
+    let caughtError: unknown
+    try {
+      try {
+        writeJsonFileAtomicSecure(filePath, { revision: 3 }, {
+          expectedDestination: { kind: 'state', state: expectedState },
+          priorBackup: { filePath: backupPath, data: { revision: 2 } },
+          syncDirectory: () => {
+            syncCalls += 1
+            if (syncCalls === 2) throw createFileSystemError('EIO', 'fsync')
+          },
+        })
+      } catch (error) {
+        caughtError = error
+      }
+      expect(caughtError).toMatchObject({
+        committed: true,
+        stage: 'priorBackupDegraded',
+        cause: { code: 'EIO', syscall: 'fsync' },
+      })
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ revision: 3 })
+      expect(JSON.parse(readFileSync(backupPath, 'utf8'))).toEqual({ revision: 2 })
+      expect(readdirSync(tempDir).filter((name) => name.endsWith('.tmp'))).toEqual([])
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
   test('Given CAS 预期目标缺失但提交前出现文件 When 安全写入 Then 拒绝且保留新文件', () => {
     /** beforeRename 模拟另一写者在 temp 落盘后创建目标。 */
     const tempDir = mkdtempSync(join(tmpdir(), 'proma-secure-json-cas-appeared-'))
