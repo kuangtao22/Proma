@@ -171,6 +171,8 @@ import { DesignContextCatalog } from './lib/design/design-context-catalog'
 import { DesignContextOrchestrator } from './lib/design/design-context-orchestrator'
 import { DesignImageModelPreferences } from './lib/design/design-image-model-preferences'
 import { registerDesignIpcHandlers } from './lib/design/design-ipc'
+import { registerCanvasSessionIpcHandlers } from './lib/design/canvas-session-ipc'
+import { CanvasSessionStore } from './lib/design/canvas-session-store'
 import {
   runChannelMutationWithImageModelBroadcast,
   updateToolCredentialsWithImageModelBroadcast,
@@ -1103,6 +1105,24 @@ export function registerIpcHandlers(): void {
     getWorkspaceIdBySlug: (slug) => getAgentWorkspaceBySlug(slug)?.id,
     getWorkspaceOperationBlockReason,
   })
+  /** Canvas 顶层会话使用独立索引，禁止写入 Agent 会话索引。 */
+  const canvasSessionStore = new CanvasSessionStore({ pathResolver: designPathResolver })
+  /** 项目离线或迁移时返回稳定 Design/Canvas 只读原因。 */
+  const getDesignProjectReadOnlyReason = (projectId: string): string | undefined => {
+    /** 未登记项目仍交给路径解析器或 store 抛出明确的项目不存在错误。 */
+    const workspace = getAgentWorkspace(projectId)
+    if (!workspace) return undefined
+    /** 外部项目不可访问时禁止创建同名替代目录。 */
+    const rootStatus = getLocalProjectRootStatus(workspace.projectRootPath)
+    if (rootStatus && rootStatus !== 'available') {
+      return '项目路径不可访问，设计工作区已切换为只读'
+    }
+    /** 项目迁移期间保留最后状态，只暂停索引、媒体重绑和画布写入。 */
+    if (getWorkspaceOperationBlockReason(projectId)) {
+      return '项目路径不可访问，设计工作区已切换为只读'
+    }
+    return undefined
+  }
   /** Design IPC 的模型目录和项目偏好在进程内只创建一次。 */
   const { imageModels, imagePreferences } = getDesignImageModelServices()
   /** 长期创作资料和项目文本索引只在 Design 任务按需调用时读取。 */
@@ -1188,6 +1208,17 @@ export function registerIpcHandlers(): void {
     assets: designAssetService,
   })
   setDefaultDesignJobManager(designJobManager)
+  registerCanvasSessionIpcHandlers({
+    ipc: ipcMain,
+    listAuthorizedWebContents: () => {
+      /** Canvas 会话当前只允许主窗口访问。 */
+      const contents = getStoredMainWindow()?.webContents
+      return contents && !contents.isDestroyed() ? [contents] : []
+    },
+    guard: workspaceOperationGuard,
+    sessions: canvasSessionStore,
+    getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
+  })
   registerDesignIpcHandlers({
     ipc: ipcMain,
     listAuthorizedWebContents: () => {
@@ -1202,21 +1233,7 @@ export function registerIpcHandlers(): void {
     imageModels,
     imagePreferences,
     sessionBridge: designSessionBridge,
-    getProjectReadOnlyReason: (projectId) => {
-      /** 未登记项目仍交给 store 抛出明确的项目不存在错误。 */
-      const workspace = getAgentWorkspace(projectId)
-      if (!workspace) return undefined
-      /** 外部项目不可访问时禁止创建同名替代目录。 */
-      const rootStatus = getLocalProjectRootStatus(workspace.projectRootPath)
-      if (rootStatus && rootStatus !== 'available') {
-        return '项目路径不可访问，设计工作区已切换为只读'
-      }
-      /** 项目迁移期间保留最后画布，只暂停媒体重绑和写入。 */
-      if (getWorkspaceOperationBlockReason(projectId)) {
-        return '项目路径不可访问，设计工作区已切换为只读'
-      }
-      return undefined
-    },
+    getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
     pickImageFiles: async (sender) => {
       /** 图片路径只由主进程系统选择器产生，renderer 无法注入任意路径。 */
       const owner = BrowserWindow.fromWebContents(sender)
