@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import { createStore } from 'jotai'
 import {
+  canvasAgentActiveInternalInvalidSessionIdsAtom,
   canvasAgentInternalInvalidSessionIdsAtom,
   canvasAgentLifecycleAtom,
   canvasAgentOpenSessionIdsAtom,
   canvasAgentOwnersAtom,
   canvasAgentPersistedMessagesAtom,
+  canvasAgentRunningSessionIdsAtom,
   createInitialNativeCanvasState,
   createNativeCanvasKey,
   nativeCanvasStatesAtom,
@@ -109,7 +111,7 @@ describe('原生 Canvas 状态隔离', () => {
     store.set(canvasAgentLifecycleAtom, { type: 'prune' })
     expect(store.get(canvasAgentPersistedMessagesAtom).size).toBeLessThanOrEqual(20)
 
-    store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId: 'session-24' })
+    store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId: 'session-24', terminal: true })
     expect(store.get(canvasAgentOwnersAtom).has('session-24')).toBe(false)
     expect(store.get(canvasAgentPersistedMessagesAtom).has('session-24')).toBe(false)
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).has('session-24')).toBe(true)
@@ -150,7 +152,7 @@ describe('原生 Canvas 状态隔离', () => {
     expect(store.get(canvasAgentPersistedMessagesAtom).get('closed')).toHaveLength(500)
   })
 
-  test('Given 1000 个仍运行的损坏 session When bootstrap 与事件持续到达 Then 最早阻断项不被上限淘汰', () => {
+  test('Given 1000 个仍运行的损坏 session When soft completion 到达 Then 全部保持 active fail closed', () => {
     const store = createStore()
     /** active invalid 属于安全保护集合，数量可超过 terminal tombstone 上限。 */
     const activeInvalidIds = Array.from({ length: 1_000 }, (_, index) => `active-invalid-${index}`)
@@ -160,10 +162,32 @@ describe('原生 Canvas 状态隔离', () => {
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).size).toBe(1_000)
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).has('active-invalid-0')).toBe(true)
 
-    /** completion 后 active invalid 转为 terminal tombstone，最终集合才允许有界。 */
+    /** soft completion 不是终态，不得把 active invalid 降级成可淘汰 tombstone。 */
     for (const sessionId of activeInvalidIds) {
-      store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId })
+      store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: false })
+    }
+    expect(store.get(canvasAgentActiveInternalInvalidSessionIdsAtom).size).toBe(1_000)
+    expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).size).toBe(1_000)
+    expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).has('active-invalid-0')).toBe(true)
+
+    /** 只有 hard terminal completion 才转为有界 terminal tombstone。 */
+    for (const sessionId of activeInvalidIds) {
+      store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: true })
     }
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).size).toBeLessThanOrEqual(100)
+  })
+
+  test('Given 合法 Canvas owner 正在运行 When soft completion 到达 Then owner 与 running 都保留', () => {
+    const store = createStore()
+    /** soft completion 只更新流式软空闲态，不结束 Canvas lifecycle。 */
+    const owner = {
+      sessionId: 'canvas-soft', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+    }
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner })
+    store.set(canvasAgentLifecycleAtom, { type: 'owner-updated', owner })
+
+    expect(store.get(canvasAgentOwnersAtom).has(owner.sessionId)).toBe(true)
+    expect(store.get(canvasAgentRunningSessionIdsAtom).has(owner.sessionId)).toBe(true)
   })
 })

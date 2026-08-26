@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import type { AgentSessionMeta } from '@proma/shared'
+import type { AgentSendInput, AgentSessionMeta, AgentStreamCompletePayload } from '@proma/shared'
 import * as completionPayload from './agent-completion-payload'
 
 describe('Agent completion payload', () => {
@@ -43,5 +43,43 @@ describe('Agent completion payload', () => {
     })
     expect(requestedIds).toEqual(['canvas-session'])
     expect(selectSession('missing', () => undefined)).toBeUndefined()
+  })
+
+  test('Given headless 已开始后异常 When 构造 completion Then 普通会话仍携带权威轻量 metadata', () => {
+    /** 待实现的统一权威 completion builder，所有 producer 都必须经过此入口。 */
+    const buildPayload = (completionPayload as typeof completionPayload & {
+      buildAuthoritativeAgentStreamCompletePayload?: (
+        run: Readonly<Pick<AgentSendInput, 'sessionId' | 'triggeredBy'>>,
+        getSession: (sessionId: string) => AgentSessionMeta | undefined,
+        details: { messages: []; stoppedByUser: boolean; startedAt: number },
+      ) => AgentStreamCompletePayload
+    }).buildAuthoritativeAgentStreamCompletePayload
+    expect(buildPayload).toBeFunction()
+    if (!buildPayload) return
+
+    /** 普通 external/headless 会话，不含 Canvas 内部归属。 */
+    const ordinarySession = {
+      id: 'ordinary-headless',
+      title: '飞书任务',
+      workspaceId: 'project-1',
+      createdAt: 1,
+      updatedAt: 2,
+      piEntryBindings: { entry: 'message' },
+    } as AgentSessionMeta
+    const payload = buildPayload(
+      { sessionId: ordinarySession.id, triggeredBy: 'user' },
+      () => ordinarySession,
+      { messages: [], stoppedByUser: false, startedAt: 10 },
+    )
+
+    expect(payload.session).toEqual({
+      id: 'ordinary-headless',
+      title: '飞书任务',
+      workspaceId: 'project-1',
+      createdAt: 1,
+      updatedAt: 2,
+    })
+    expect(payload.messages).toEqual([])
+    expect(payload.startedAt).toBe(10)
   })
 })

@@ -1491,6 +1491,7 @@ export function useGlobalAgentListeners(): void {
       },
       allowUnknownAfterReady: (event) => event.type !== 'complete',
       allowInternalInvalid: (event) => event.type === 'complete',
+      isTerminalEvent: (event) => event.type === 'complete',
     })
 
     /** 单次本地主进程快照恢复 active Canvas owner，失败时未知事件持续 fail closed。 */
@@ -1532,7 +1533,9 @@ export function useGlobalAgentListeners(): void {
           store.get(canvasAgentInternalInvalidSessionIdsAtom).has(data.sessionId),
         )
         if (completionRoute.kind === 'internal-invalid') {
-          store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId: data.sessionId })
+          store.set(canvasAgentLifecycleAtom, {
+            type: 'invalidated', sessionId: data.sessionId, terminal: !backgroundTasksPending,
+          })
         } else if (completionRoute.kind === 'canvas') {
           store.set(canvasAgentLifecycleAtom, { type: 'owner-updated', owner: completionRoute.owner })
         }

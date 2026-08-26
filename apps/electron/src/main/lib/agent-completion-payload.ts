@@ -5,10 +5,13 @@ import type {
   AgentStreamCompletePayload,
 } from '@proma/shared'
 
-export type AgentStreamCompletionDetails = Omit<
+type AgentStreamCompletionPayloadDetails = Omit<
   AgentStreamCompletePayload,
   'sessionId' | 'triggeredBy'
 >
+
+/** completion producer 可提供的业务字段；session 必须由主进程权威索引注入。 */
+export type AgentStreamCompletionDetails = Omit<AgentStreamCompletionPayloadDetails, 'session'>
 
 export interface AgentStreamCompleteTarget {
   send(channel: string, payload: AgentStreamCompletePayload): void
@@ -30,9 +33,9 @@ export function selectAgentCompletionSessionMeta(
   return meta
 }
 
-export function buildAgentStreamCompletePayload(
+function buildAgentStreamCompletePayload(
   run: Readonly<Pick<AgentSendInput, 'sessionId' | 'triggeredBy'>>,
-  details: AgentStreamCompletionDetails = {},
+  details: AgentStreamCompletionPayloadDetails = {},
 ): AgentStreamCompletePayload {
   return {
     sessionId: run.sessionId,
@@ -41,13 +44,39 @@ export function buildAgentStreamCompletePayload(
   }
 }
 
-export function sendAgentStreamComplete(
+/**
+ * 使用主进程权威 session 索引构造 completion payload。
+ * @param run completion 对应的运行身份。
+ * @param getSession 主进程权威 session getter。
+ * @param details completion 的业务终态字段。
+ * @returns 始终经过轻量 metadata 选择器的 completion payload。
+ */
+export function buildAuthoritativeAgentStreamCompletePayload(
+  run: Readonly<Pick<AgentSendInput, 'sessionId' | 'triggeredBy'>>,
+  getSession: (sessionId: string) => AgentSessionMeta | undefined,
+  details: AgentStreamCompletionDetails = {},
+): AgentStreamCompletePayload {
+  return buildAgentStreamCompletePayload(run, {
+    ...details,
+    session: selectAgentCompletionSessionMeta(run.sessionId, getSession),
+  })
+}
+
+/**
+ * 向目标 Renderer 发送带权威轻量 metadata 的 completion。
+ * @param target Electron webContents 兼容发送目标。
+ * @param run completion 对应的运行身份。
+ * @param getSession 主进程权威 session getter。
+ * @param details completion 的业务终态字段。
+ */
+export function sendAuthoritativeAgentStreamComplete(
   target: AgentStreamCompleteTarget,
   run: Readonly<Pick<AgentSendInput, 'sessionId' | 'triggeredBy'>>,
+  getSession: (sessionId: string) => AgentSessionMeta | undefined,
   details: AgentStreamCompletionDetails = {},
 ): void {
   target.send(
     AGENT_IPC_CHANNELS.STREAM_COMPLETE,
-    buildAgentStreamCompletePayload(run, details),
+    buildAuthoritativeAgentStreamCompletePayload(run, getSession, details),
   )
 }

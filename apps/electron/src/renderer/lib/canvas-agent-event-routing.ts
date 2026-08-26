@@ -27,6 +27,8 @@ export interface CanvasAgentBootstrapGateOptions<T extends { sessionId: string }
   allowUnknownAfterReady?: (event: T) => boolean
   /** 是否允许已确认损坏的内部事件进入专用终态清理。 */
   allowInternalInvalid?: (event: T) => boolean
+  /** 标识不能被 stream/title 洪峰淘汰的 session 终态事件。 */
+  isTerminalEvent?: (event: T) => boolean
 }
 
 /** renderer reload 期间未知事件的有界暂存入口。 */
@@ -46,10 +48,50 @@ export function createCanvasAgentBootstrapGate<T extends { sessionId: string }>(
 ): CanvasAgentBootstrapGate<T> {
   /** pending 只持续一次本地主进程 IPC；failed 时未知事件持续 fail closed。 */
   let phase: 'pending' | 'ready' | 'failed' = 'pending'
-  /** 防止异常 IPC 长挂时事件数组无限增长。 */
-  const maxBufferedEvents = options.maxBufferedEvents ?? 2_000
-  /** 保持 stream/title 到达顺序的有界队列。 */
-  const bufferedEvents: T[] = []
+  /** 防止异常 IPC 长挂时事件缓存无限增长。 */
+  const maxBufferedEvents = Math.max(0, Math.floor(options.maxBufferedEvents ?? 2_000))
+  /** stream/title 使用固定容量环形缓冲，token 入队与淘汰均为 O(1)。 */
+  const bufferedEvents = new Array<T | undefined>(maxBufferedEvents)
+  /** 环形缓冲最旧事件的位置。 */
+  let bufferedStart = 0
+  /** 环形缓冲当前有效事件数。 */
+  let bufferedSize = 0
+  /** completion 按 session 单独保留，避免被 token 洪峰淘汰。 */
+  const bufferedTerminalEvents = new Map<string, T>()
+  /** completion 缓冲至少保留一个 session，同时继续受配置上限约束。 */
+  const maxBufferedTerminalEvents = Math.max(1, maxBufferedEvents)
+
+  /** O(1) 追加普通事件，满载时覆盖最旧项。 */
+  const bufferEvent = (event: T): void => {
+    if (maxBufferedEvents === 0) return
+    if (bufferedSize < maxBufferedEvents) {
+      const index = (bufferedStart + bufferedSize) % maxBufferedEvents
+      bufferedEvents[index] = event
+      bufferedSize += 1
+      return
+    }
+    bufferedEvents[bufferedStart] = event
+    bufferedStart = (bufferedStart + 1) % maxBufferedEvents
+  }
+
+  /** O(1) 按 session 覆盖终态；只有终态洪峰自身能触发终态 LRU 淘汰。 */
+  const bufferTerminalEvent = (event: T): void => {
+    if (bufferedTerminalEvents.has(event.sessionId)) {
+      bufferedTerminalEvents.delete(event.sessionId)
+    } else if (bufferedTerminalEvents.size >= maxBufferedTerminalEvents) {
+      const oldestSessionId = bufferedTerminalEvents.keys().next().value
+      if (oldestSessionId !== undefined) bufferedTerminalEvents.delete(oldestSessionId)
+    }
+    bufferedTerminalEvents.set(event.sessionId, event)
+  }
+
+  /** 清空 pending 缓冲，供成功重放后或永久失败时释放引用。 */
+  const clearBufferedEvents = (): void => {
+    bufferedEvents.fill(undefined)
+    bufferedStart = 0
+    bufferedSize = 0
+    bufferedTerminalEvents.clear()
+  }
   const route = (event: T): void => {
     const kind = options.classify(event)
     if (kind === 'canvas' || kind === 'agent') options.dispatch(event)
@@ -61,8 +103,8 @@ export function createCanvasAgentBootstrapGate<T extends { sessionId: string }>(
       options.dispatch(event)
     }
     else if (kind === 'unknown' && phase === 'pending') {
-      if (bufferedEvents.length >= maxBufferedEvents) bufferedEvents.shift()
-      bufferedEvents.push(event)
+      if (options.isTerminalEvent?.(event) === true) bufferTerminalEvent(event)
+      else bufferEvent(event)
     }
   }
   return {
@@ -70,13 +112,21 @@ export function createCanvasAgentBootstrapGate<T extends { sessionId: string }>(
     complete: () => {
       if (phase !== 'pending') return
       phase = 'ready'
-      const replay = bufferedEvents.splice(0)
-      for (const event of replay) route(event)
+      /** 先重放 stream/title，再按 session 重放 completion，保证每会话先流后终态。 */
+      const replayEvents: T[] = []
+      for (let offset = 0; offset < bufferedSize; offset += 1) {
+        const event = bufferedEvents[(bufferedStart + offset) % maxBufferedEvents]
+        if (event !== undefined) replayEvents.push(event)
+      }
+      const replayTerminalEvents = [...bufferedTerminalEvents.values()]
+      clearBufferedEvents()
+      for (const event of replayEvents) route(event)
+      for (const event of replayTerminalEvents) route(event)
     },
     fail: () => {
       if (phase !== 'pending') return
       phase = 'failed'
-      bufferedEvents.length = 0
+      clearBufferedEvents()
     },
   }
 }

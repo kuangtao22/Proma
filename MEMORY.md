@@ -75,7 +75,7 @@
 - Common Bridge 与飞书 Bridge 的 Agent terminal 回调必须以启动时捕获的 `sessionId + workspaceId` 复核当前绑定、用户可见性和项目一致性；身份漂移只允许清理/关闭，禁止向外部聊天发送内部错误正文。飞书失效清理由统一幂等边界先摘除 binding/反向索引和全部运行态，再异步关闭 CardStream，关闭失败不得恢复引用。
 - Bun 非 isolate 组合测试中的 `mock.module` 会跨文件覆盖；共享核心模块的测试替身必须提供组合消费者所需的完整导出合同，并复用同一可重置状态，禁止各测试文件注册互不兼容的局部 mock。
 - Canvas Agent 对话只允许通过专用 GET/SEND/STOP IPC 访问：每次调用先对账 pending intent，再从权威 Canvas 文档解析 `node -> session` 并复核会话三字段独占归属；运行复用 Pi Agent runtime，但单次强制 `Read`、`Glob`、`Grep` 只读工具白名单。持久化 JSONL 仅在打开对话时读取，关闭或切换 Canvas 不停止运行；全局事件按最小 owner 路由，完整归属只进入 Canvas live/error/完成导航，半归属、混合归属和损坏归属 fail closed，禁止进入普通会话、未读、状态岛或 Agent tab。
-- Renderer reload 只通过一次性 active Canvas run 快照恢复 busy session 的最小 owner；主进程正常与早期失败 completion 均从权威 session 索引附带轻量 metadata，未知 completion 与 stream/title 共用有界 bootstrap gate 并在失败时 fail closed。owner/messages 统一按 open/running/completed/invalid 生命周期回收：open/running 保留完整权威消息，只有终态非保护缓存按单会话 500 条、20 个 session、总计 2000 条修剪；active invalid 全量保护，terminal invalid tombstone 才按 100 条 LRU 回收，token 热路径只做 O(1) 分类查询。
+- Renderer reload 只通过一次性 active Canvas run 快照恢复 busy session 的最小 owner；renderer/headless 的正常与异常 completion producer 均强制从权威 session 索引附带轻量 metadata。未知 completion 与 stream/title 共用有界 bootstrap gate：stream/title 使用 O(1) 环形缓冲，completion 按 session 独立有界保留并在重放时后于流事件，bootstrap 失败后全部 fail closed。owner/messages 统一按 open/running/completed/invalid 生命周期回收：open/running 保留完整权威消息，只有终态非保护缓存按单会话 500 条、20 个 session、总计 2000 条修剪；soft completion 保持 active invalid 阻断，只有 hard terminal 才转为 100 条 LRU tombstone，token 热路径只做 O(1) 分类查询。
 
 ## 会话记录
 
@@ -163,3 +163,4 @@
 - 2026-08-26：Canvas intent 的所有状态迁移（包括 `detached`）都必须消费 helper 的结构化写确认；detached rename 已可见但目录持久性未确认时原样传播明确错误，同时保持 `documentChanged=false` 且不发布 graph revision。intent scan 容量只统计 no-follow 验证后的合法普通文件，目录、symlink 与 Windows reparse point 均忽略且不占 512 项预算。
 - 2026-08-26：修复 Canvas Agent renderer reload 归属恢复、损坏 completion 旧缓存 fallback、完成通知未切 Design 视图、切节点 SEND 迟到回调污染和 owner/messages 无界生命周期；active-run bootstrap、事件 gate 与 Jotai lifecycle 均有 BDD 回归覆盖。
 - 2026-08-26：Canvas Agent completion 的正常与早期异常路径统一携带主进程权威轻量 metadata，所有 completion 进入 bootstrap gate；SEND 准入拒绝的全局 lifecycle 收口不再依赖已卸载 UI，open/running 消息完整保真，active invalid 与有界 terminal tombstone 分层管理。
+- 2026-08-26：补齐 headless completion 异常路径的权威 metadata，统一四条 completion producer；soft completion 不再提前结束合法或损坏 Canvas 运行，bootstrap gate 改为 O(1) 环形流缓冲与独立有界终态缓冲，token 洪峰不再淘汰 completion。

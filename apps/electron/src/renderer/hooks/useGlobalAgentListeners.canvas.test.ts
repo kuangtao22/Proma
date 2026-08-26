@@ -43,6 +43,7 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     expect(source).toContain("| { type: 'complete'; sessionId: string; value: AgentStreamCompletePayload }")
     expect(source).toContain("allowUnknownAfterReady: (event) => event.type !== 'complete'")
     expect(source).toContain("allowInternalInvalid: (event) => event.type === 'complete'")
+    expect(source).toContain("isTerminalEvent: (event) => event.type === 'complete'")
     expect(source).toContain("type: 'complete', sessionId: data.sessionId, value: data")
   })
 
@@ -51,5 +52,11 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     expect(source).toContain("completionRoute.kind === 'internal-invalid'")
     expect(source).toContain("type: 'invalidated'")
     expect(source).not.toContain("completionRoute.kind === 'canvas'\n          ? completionRoute.owner\n          : store.get(canvasAgentOwnersAtom).get(data.sessionId)")
+  })
+
+  test('Given internal-invalid soft completion When 处理终态 Then 保留 active 阻断直到 hard terminal', () => {
+    /** soft completion 必须把终态语义显式传入 lifecycle，不能无条件 terminalize。 */
+    const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
+    expect(source).toContain("type: 'invalidated', sessionId: data.sessionId, terminal: !backgroundTasksPending")
   })
 })

@@ -45,8 +45,7 @@ import { buildCanvasAgentActiveRunSnapshot } from './agent-session-visibility'
 import { setAgentStopper, setHeadlessAgentRunner } from './agent-headless-runner-registry'
 import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
 import {
-  selectAgentCompletionSessionMeta,
-  sendAgentStreamComplete,
+  sendAuthoritativeAgentStreamComplete,
 } from './agent-completion-payload'
 import { AgentStreamForwarder } from './agent-stream-forwarder'
 import { AgentQueueCoordinator } from './agent-queue-coordinator'
@@ -204,14 +203,6 @@ function reportAgentServiceTerminalEffectError(name: string, error: unknown): vo
 
 // ===== EventBus IPC 转发中间件 =====
 
-/**
- * 完成事件只需要侧栏/导航使用的轻量 meta。Pi 的 entry bindings 仅用于主进程
- * session fork/rewind，传到 renderer 会在长会话完成时徒增 IPC 序列化成本。
- */
-function getSessionMetaForRenderer(sessionId: string) {
-  return selectAgentCompletionSessionMeta(sessionId, getAgentSessionMeta)
-}
-
 eventBus.use((sessionId, payload, next) => {
   const wc = sessionWebContents.get(sessionId)
   if (wc && !wc.isDestroyed()) {
@@ -283,15 +274,13 @@ export async function runAgent(
             name: 'renderer-complete',
             run: () => {
               if (!webContents.isDestroyed()) {
-                sendAgentStreamComplete(webContents, input, {
+                sendAuthoritativeAgentStreamComplete(webContents, input, getAgentSessionMeta, {
                   messages,
                   stoppedByUser: opts?.stoppedByUser ?? false,
                   startedAt: opts?.startedAt,
                   resultSubtype: opts?.resultSubtype,
                   resultErrors: opts?.resultErrors,
                   backgroundTasksPending: opts?.backgroundTasksPending,
-                  // 只读取刚完成的轻量 meta，renderer 可据此增量更新列表，避免再取 5,000+ 条全量会话。
-                  session: getSessionMetaForRenderer(input.sessionId),
                 })
               }
             },
@@ -372,11 +361,9 @@ export async function runAgent(
         name: 'renderer-complete',
         run: () => {
           if (!webContents.isDestroyed()) {
-            sendAgentStreamComplete(webContents, input, {
+            sendAuthoritativeAgentStreamComplete(webContents, input, getAgentSessionMeta, {
               messages: [],
               stoppedByUser: false,
-              // 即使 Orchestrator 在准入早期失败，也只从主进程权威索引读取归属。
-              session: getSessionMetaForRenderer(input.sessionId),
             })
           }
         },
@@ -453,15 +440,13 @@ export async function runAgentHeadless(
             name: 'renderer-complete',
             run: () => {
               if (wc && !wc.isDestroyed()) {
-                sendAgentStreamComplete(wc, runInput, {
+                sendAuthoritativeAgentStreamComplete(wc, runInput, getAgentSessionMeta, {
                   messages,
                   stoppedByUser: opts?.stoppedByUser ?? false,
                   startedAt: opts?.startedAt,
                   resultSubtype: opts?.resultSubtype,
                   resultErrors: opts?.resultErrors,
                   backgroundTasksPending: opts?.backgroundTasksPending,
-                  // 只读取刚完成的轻量 meta，renderer 可据此增量更新列表，避免再取 5,000+ 条全量会话。
-                  session: getSessionMetaForRenderer(runInput.sessionId),
                 })
               }
             },
@@ -535,7 +520,12 @@ export async function runAgentHeadless(
         name: 'renderer-complete',
         run: () => {
           if (wc && !wc.isDestroyed()) {
-            sendAgentStreamComplete(wc, runInput, { messages: [], stoppedByUser: false, startedAt })
+            sendAuthoritativeAgentStreamComplete(
+              wc,
+              runInput,
+              getAgentSessionMeta,
+              { messages: [], stoppedByUser: false, startedAt },
+            )
           }
         },
       },

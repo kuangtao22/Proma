@@ -108,6 +108,74 @@ describe('Canvas Agent 全局事件路由', () => {
     expect(dispatchedKinds).toEqual(['internal-invalid'])
   })
 
+  test('Given max 为 3 且 token 与 completion 交错 When bootstrap 恢复 Then completion 不被 token 洪水淘汰', () => {
+    /** bootstrap 恢复后所有测试会话都成为普通 Agent。 */
+    let ready = false
+    /** 模拟普通终态清理：completion 必须移除对应 running lifecycle。 */
+    const runningIds = new Set(['session-1', 'session-2', 'session-3'])
+    /** 记录重放顺序，要求每个 session 的 stream 先于 completion。 */
+    const dispatched: string[] = []
+    interface BufferedEvent {
+      sessionId: string
+      type: 'stream' | 'complete'
+    }
+    const gate = routing.createCanvasAgentBootstrapGate<BufferedEvent>({
+      classify: () => ready ? 'agent' : 'unknown',
+      dispatch: (event) => {
+        dispatched.push(`${event.sessionId}:${event.type}`)
+        if (event.type === 'complete') runningIds.delete(event.sessionId)
+      },
+      maxBufferedEvents: 3,
+      isTerminalEvent: (event) => event.type === 'complete',
+    })
+
+    for (let index = 1; index <= 3; index += 1) {
+      gate.handle({ sessionId: `session-${index}`, type: 'complete' })
+      gate.handle({ sessionId: `session-${index}`, type: 'stream' })
+    }
+    ready = true
+    gate.complete()
+
+    expect(dispatched).toEqual([
+      'session-1:stream', 'session-2:stream', 'session-3:stream',
+      'session-1:complete', 'session-2:complete', 'session-3:complete',
+    ])
+    expect(runningIds.size).toBe(0)
+  })
+
+  test('Given 普通 headless completion 携带 metadata When Renderer gate ready Then 保留普通终态清理与通知', () => {
+    /** 普通 metadata 必须明确分类为 agent，不能因 Canvas fail-closed 丢终态。 */
+    let cleaned = false
+    let notifications = 0
+    const gate = routing.createCanvasAgentBootstrapGate<{
+      sessionId: string
+      type: 'complete'
+      session: AgentSessionMeta
+    }>({
+      classify: (event) => routing.routeCanvasAgentEvent(event.session).kind,
+      dispatch: () => {
+        cleaned = true
+        notifications += 1
+      },
+      allowUnknownAfterReady: () => false,
+      isTerminalEvent: () => true,
+    })
+    gate.complete()
+    gate.handle({
+      sessionId: 'ordinary-headless',
+      type: 'complete',
+      session: createCanvasSession({
+        id: 'ordinary-headless',
+        sourceCanvasProjectId: undefined,
+        sourceCanvasId: undefined,
+        sourceCanvasNodeId: undefined,
+      }),
+    })
+
+    expect(cleaned).toBe(true)
+    expect(notifications).toBe(1)
+  })
+
   test('Given renderer reload 与 Canvas 早期 completion When deferred、failed 或有可信 meta Then 普通副作用始终为零', () => {
     /** 模拟 reload 后由 bootstrap 恢复的最小 owner 索引。 */
     const owners = new Map<string, routing.CanvasAgentOwner>()

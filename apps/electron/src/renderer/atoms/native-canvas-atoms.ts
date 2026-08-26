@@ -78,7 +78,8 @@ export type CanvasAgentLifecycleEvent =
   | { type: 'bootstrap'; owners: CanvasAgentOwner[]; internalInvalidSessionIds: string[] }
   | { type: 'opened'; owner: CanvasAgentOwner; messages: SDKMessage[] }
   | { type: 'started' | 'owner-updated'; owner: CanvasAgentOwner }
-  | { type: 'closed' | 'completed' | 'invalidated'; sessionId: string }
+  | { type: 'closed' | 'completed'; sessionId: string }
+  | { type: 'invalidated'; sessionId: string; terminal: boolean }
   | { type: 'prune' }
 
 /** 非打开、非运行的历史消息缓存最大 session 数。 */
@@ -87,7 +88,7 @@ const MAX_UNPROTECTED_CANVAS_AGENT_SESSIONS = 20
 const MAX_CANVAS_AGENT_MESSAGES_PER_SESSION = 500
 /** 非保护 Canvas Agent 的持久化消息总上限。 */
 const MAX_UNPROTECTED_CANVAS_AGENT_MESSAGES = 2_000
-/** 损坏 session 抑制集合上限，避免异常来源无限增长。 */
+/** 终态损坏 session tombstone 上限；active invalid 不受此限制。 */
 const MAX_INVALID_CANVAS_AGENT_SESSIONS = 100
 
 /**
@@ -183,10 +184,15 @@ export const canvasAgentLifecycleAtom = atom(
       owners.delete(event.sessionId)
       messages.delete(event.sessionId)
       openSessionIds.delete(event.sessionId)
-      runningSessionIds.delete(event.sessionId)
-      activeInvalidSessionIds.delete(event.sessionId)
-      terminalInvalidSessionIds.delete(event.sessionId)
-      terminalInvalidSessionIds.add(event.sessionId)
+      if (event.terminal) {
+        runningSessionIds.delete(event.sessionId)
+        activeInvalidSessionIds.delete(event.sessionId)
+        terminalInvalidSessionIds.delete(event.sessionId)
+        terminalInvalidSessionIds.add(event.sessionId)
+      } else if (!terminalInvalidSessionIds.has(event.sessionId)) {
+        /** soft completion 后运行仍可恢复，继续以 active invalid 阻断后续流事件。 */
+        activeInvalidSessionIds.add(event.sessionId)
+      }
     }
 
     /** 打开或运行的 session 是保护项，可暂时超过非保护总量。 */

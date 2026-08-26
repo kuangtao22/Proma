@@ -134,6 +134,17 @@ describe('Agent service 迁移准入', () => {
     const catchBody = body.slice(catchStart)
 
     expect(catchStart).toBeGreaterThan(-1)
-    expect(catchBody).toContain('session: getSessionMetaForRenderer(input.sessionId)')
+    expect(catchBody).toContain('sendAuthoritativeAgentStreamComplete(webContents, input, getAgentSessionMeta')
+  })
+
+  test('Given renderer 与 headless 的成功或异常完成 When 检查所有 producer Then 统一经权威 session builder', () => {
+    /** 读取真实 service，防止任一 completion producer 再手工遗漏 metadata。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    /** 四条 producer：renderer success/catch 与 headless success/catch。 */
+    const authoritativeCalls = source.match(/sendAuthoritativeAgentStreamComplete\(/g)?.length ?? 0
+
+    expect(authoritativeCalls).toBe(4)
+    expect(source).not.toContain('sendAgentStreamComplete(')
+    expect(source).not.toContain('session: getSessionMetaForRenderer(')
   })
 })
