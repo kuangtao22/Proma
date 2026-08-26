@@ -82,6 +82,9 @@ export const canvasAgentRunGenerationsAtom = atom<Map<string, number | null>>(ne
 /** Renderer 已提交但主进程尚未确认的 Canvas Agent 乐观运行代次。 */
 export const canvasAgentOptimisticRunGenerationsAtom = atom<Map<string, number>>(new Map<string, number>())
 
+/** Canvas hard completion 后等待权威 JSONL GET 接管的运行代次。 */
+export const canvasAgentPendingHandoffGenerationsAtom = atom<Map<string, number>>(new Map<string, number>())
+
 /** 已确认 Canvas 字段损坏的内部 session，未知事件必须 fail closed。 */
 export const canvasAgentInternalInvalidSessionIdsAtom = atom<Set<string>>(new Set<string>())
 
@@ -127,6 +130,15 @@ export function isCanvasAgentGenerationCurrent(
   const authoritativeGenerations = store.get(canvasAgentRunGenerationsAtom)
   if (authoritativeGenerations.has(sessionId)) return authoritativeGenerations.get(sessionId) === startedAt
   return store.get(canvasAgentOptimisticRunGenerationsAtom).get(sessionId) === startedAt
+}
+
+/** 判断异步 JSONL GET 是否仍属于等待交接的 Canvas Agent 终态代次。 */
+export function isCanvasAgentHandoffGenerationCurrent(
+  store: Pick<Store, 'get'>,
+  sessionId: string,
+  startedAt: number,
+): boolean {
+  return store.get(canvasAgentPendingHandoffGenerationsAtom).get(sessionId) === startedAt
 }
 
 /**
@@ -180,21 +192,24 @@ export const canvasAgentLifecycleAtom = atom(
     const optimisticRunTokens = new Map(get(canvasAgentOptimisticRunTokensAtom))
     const runGenerations = new Map(get(canvasAgentRunGenerationsAtom))
     const optimisticRunGenerations = new Map(get(canvasAgentOptimisticRunGenerationsAtom))
+    const pendingHandoffGenerations = new Map(get(canvasAgentPendingHandoffGenerationsAtom))
     const activeInvalidSessionIds = new Set(get(canvasAgentActiveInternalInvalidSessionIdsAtom))
     const terminalInvalidSessionIds = new Set(get(canvasAgentTerminalInternalInvalidSessionIdsAtom))
 
-    if (event.type === 'completed' || event.type === 'settled'
-      || (event.type === 'invalidated' && event.terminal)) {
+    if (event.type === 'completed' || (event.type === 'invalidated' && event.terminal)) {
       /** 权威代次存在时绝不回退乐观值，避免 busy 误发覆盖真实运行。 */
       const currentGeneration = runGenerations.has(event.sessionId)
         ? runGenerations.get(event.sessionId)
         : optimisticRunGenerations.get(event.sessionId)
       if (currentGeneration !== event.startedAt) return
     }
+    if (event.type === 'settled'
+      && pendingHandoffGenerations.get(event.sessionId) !== event.startedAt) return
 
     if (event.type === 'bootstrap') {
       /** reload 初始快照替换运行态；仍打开的面板由后续 GET 再建立。 */
       authoritativeRunningSessionIds.clear()
+      runGenerations.clear()
       activeInvalidSessionIds.clear()
       for (const owner of event.owners) {
         /** bootstrap 快照的运行代次与纯 owner 分开保存，避免内部字段污染导航归属。 */
@@ -208,14 +223,6 @@ export const canvasAgentLifecycleAtom = atom(
         terminalInvalidSessionIds.delete(invalidRun.sessionId)
         activeInvalidSessionIds.add(invalidRun.sessionId)
         runGenerations.set(invalidRun.sessionId, invalidRun.startedAt)
-      }
-      /** snapshot replace 后仅保留当前权威运行或仍受本地乐观 token 保护的代次。 */
-      for (const sessionId of runGenerations.keys()) {
-        if (!authoritativeRunningSessionIds.has(sessionId)
-          && !activeInvalidSessionIds.has(sessionId)
-          && !optimisticRunTokens.has(sessionId)) {
-          runGenerations.delete(sessionId)
-        }
       }
     } else if (event.type === 'opened') {
       owners.delete(event.owner.sessionId)
@@ -234,6 +241,7 @@ export const canvasAgentLifecycleAtom = atom(
       terminalInvalidSessionIds.delete(event.owner.sessionId)
       authoritativeRunningSessionIds.add(event.owner.sessionId)
       runGenerations.set(event.owner.sessionId, event.startedAt)
+      pendingHandoffGenerations.delete(event.owner.sessionId)
     } else if (event.type === 'invalid-started') {
       const currentGeneration = runGenerations.get(event.sessionId)
       if (typeof currentGeneration === 'number' && currentGeneration > event.startedAt) return
@@ -243,6 +251,7 @@ export const canvasAgentLifecycleAtom = atom(
       activeInvalidSessionIds.add(event.sessionId)
       terminalInvalidSessionIds.delete(event.sessionId)
       runGenerations.set(event.sessionId, event.startedAt)
+      pendingHandoffGenerations.delete(event.sessionId)
     } else if (event.type === 'owner-updated') {
       owners.delete(event.owner.sessionId)
       owners.set(event.owner.sessionId, event.owner)
@@ -253,6 +262,7 @@ export const canvasAgentLifecycleAtom = atom(
       owners.set(event.owner.sessionId, event.owner)
       optimisticRunTokens.set(event.owner.sessionId, event.token)
       optimisticRunGenerations.set(event.owner.sessionId, event.startedAt)
+      pendingHandoffGenerations.delete(event.owner.sessionId)
       activeInvalidSessionIds.delete(event.owner.sessionId)
       terminalInvalidSessionIds.delete(event.owner.sessionId)
     } else if (event.type === 'send-rejected') {
@@ -275,6 +285,7 @@ export const canvasAgentLifecycleAtom = atom(
       }
     } else if (event.type === 'closed') {
       openSessionIds.delete(event.sessionId)
+      pendingHandoffGenerations.delete(event.sessionId)
       if (!runningSessionIds.has(event.sessionId)) {
         owners.delete(event.sessionId)
         messages.delete(event.sessionId)
@@ -284,19 +295,22 @@ export const canvasAgentLifecycleAtom = atom(
     } else if (event.type === 'completed') {
       authoritativeRunningSessionIds.delete(event.sessionId)
       optimisticRunTokens.delete(event.sessionId)
-      optimisticRunGenerations.delete(event.sessionId)
-      if (!openSessionIds.has(event.sessionId)) {
-        owners.delete(event.sessionId)
-        messages.delete(event.sessionId)
-        runGenerations.delete(event.sessionId)
-      }
-    } else if (event.type === 'settled') {
       runGenerations.delete(event.sessionId)
       optimisticRunGenerations.delete(event.sessionId)
+      if (openSessionIds.has(event.sessionId)) {
+        pendingHandoffGenerations.set(event.sessionId, event.startedAt)
+      } else {
+        pendingHandoffGenerations.delete(event.sessionId)
+        owners.delete(event.sessionId)
+        messages.delete(event.sessionId)
+      }
+    } else if (event.type === 'settled') {
+      pendingHandoffGenerations.delete(event.sessionId)
     } else if (event.type === 'invalidated') {
       owners.delete(event.sessionId)
       messages.delete(event.sessionId)
       openSessionIds.delete(event.sessionId)
+      pendingHandoffGenerations.delete(event.sessionId)
       if (event.terminal) {
         authoritativeRunningSessionIds.delete(event.sessionId)
         optimisticRunTokens.delete(event.sessionId)
@@ -356,6 +370,7 @@ export const canvasAgentLifecycleAtom = atom(
     set(canvasAgentOptimisticRunTokensAtom, optimisticRunTokens)
     set(canvasAgentRunGenerationsAtom, runGenerations)
     set(canvasAgentOptimisticRunGenerationsAtom, optimisticRunGenerations)
+    set(canvasAgentPendingHandoffGenerationsAtom, pendingHandoffGenerations)
     set(canvasAgentActiveInternalInvalidSessionIdsAtom, activeInvalidSessionIds)
     set(canvasAgentTerminalInternalInvalidSessionIdsAtom, terminalInvalidSessionIds)
     set(canvasAgentInternalInvalidSessionIdsAtom, invalidSessionIds)

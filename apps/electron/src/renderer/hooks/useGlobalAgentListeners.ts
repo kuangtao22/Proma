@@ -69,6 +69,7 @@ import {
   canvasAgentLifecycleAtom,
   canvasAgentOpenSessionIdsAtom,
   canvasAgentRunningSessionIdsAtom,
+  isCanvasAgentHandoffGenerationCurrent,
   isCanvasAgentGenerationCurrent,
   createNativeCanvasKey,
   updateNativeCanvasStateAtom,
@@ -1737,7 +1738,7 @@ export function useGlobalAgentListeners(): void {
                 canvasId: canvasOwner.canvasId,
                 nodeId: canvasOwner.nodeId,
               }).then((result) => {
-                if (!isCanvasAgentGenerationCurrent(store, data.sessionId, data.startedAt!)) return
+                if (!isCanvasAgentHandoffGenerationCurrent(store, data.sessionId, data.startedAt!)) return
                 if (!store.get(canvasAgentOpenSessionIdsAtom).has(data.sessionId)) return
                 if (store.get(canvasAgentRunningSessionIdsAtom).has(data.sessionId)) return
                 store.set(canvasAgentLifecycleAtom, {

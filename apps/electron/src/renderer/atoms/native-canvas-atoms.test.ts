@@ -5,7 +5,9 @@ import {
   canvasAgentInternalInvalidSessionIdsAtom,
   canvasAgentLifecycleAtom,
   canvasAgentOpenSessionIdsAtom,
+  canvasAgentOptimisticRunGenerationsAtom,
   canvasAgentOptimisticRunTokensAtom,
+  canvasAgentPendingHandoffGenerationsAtom,
   canvasAgentOwnersAtom,
   canvasAgentPersistedMessagesAtom,
   canvasAgentRunningSessionIdsAtom,
@@ -16,6 +18,7 @@ import {
   nativeCanvasStatesAtom,
   updateNativeCanvasStateAtom,
   isCanvasAgentGenerationCurrent,
+  isCanvasAgentHandoffGenerationCurrent,
 } from './native-canvas-atoms'
 import {
   agentSessionStreamingStateAtomFamily,
@@ -160,7 +163,8 @@ describe('原生 Canvas 状态隔离', () => {
 
     store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: owner.sessionId, startedAt: 100 })
     expect(store.get(canvasAgentAuthoritativeRunningSessionIdsAtom).has(owner.sessionId)).toBe(false)
-    expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 100)).toBe(true)
+    expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 100)).toBe(false)
+    expect(isCanvasAgentHandoffGenerationCurrent(store, owner.sessionId, 100)).toBe(true)
     store.set(canvasAgentLifecycleAtom, { type: 'settled', sessionId: owner.sessionId, startedAt: 100 })
     expect(store.get(canvasAgentRunGenerationsAtom).has(owner.sessionId)).toBe(false)
 
@@ -247,13 +251,133 @@ describe('原生 Canvas 状态隔离', () => {
     store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
     store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: 200 })
     store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: owner.sessionId, startedAt: 200 })
-    expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 200)).toBe(true)
+    expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 200)).toBe(false)
+    expect(isCanvasAgentHandoffGenerationCurrent(store, owner.sessionId, 200)).toBe(true)
 
     store.set(canvasAgentLifecycleAtom, { type: 'optimistic-started', owner, token: 'message-next', startedAt: 300 })
     store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: 300 })
 
     expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 200)).toBe(false)
     expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 300)).toBe(true)
+  })
+
+  test('Given open 运行完成且权威 GET 在途 When 空 bootstrap 替换快照 Then handoff 代次保留到 GET settled', () => {
+    const store = createStore()
+    const owner = {
+      sessionId: 'handoff-bootstrap', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+    }
+    const finalMessages = [{
+      type: 'assistant' as const,
+      message: { content: [{ type: 'text' as const, text: '最终结果' }] },
+    }]
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: 100 })
+    store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: owner.sessionId, startedAt: 100 })
+
+    store.set(canvasAgentLifecycleAtom, { type: 'bootstrap', owners: [], internalInvalidRuns: [] })
+
+    expect(store.get(canvasAgentRunGenerationsAtom).has(owner.sessionId)).toBe(false)
+    expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 100)).toBe(false)
+    expect(isCanvasAgentHandoffGenerationCurrent(store, owner.sessionId, 100)).toBe(true)
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: finalMessages })
+    store.set(canvasAgentLifecycleAtom, { type: 'settled', sessionId: owner.sessionId, startedAt: 100 })
+    expect(store.get(canvasAgentPersistedMessagesAtom).get(owner.sessionId)).toEqual(finalMessages)
+    expect(isCanvasAgentHandoffGenerationCurrent(store, owner.sessionId, 100)).toBe(false)
+  })
+
+  test('Given authority 100 与 optimistic 200 并存 When 空 bootstrap 替换快照 Then 删除旧 authority 并由 200 接管', () => {
+    const store = createStore()
+    const owner = {
+      sessionId: 'optimistic-after-bootstrap', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+    }
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: 100 })
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'optimistic-started', owner, token: 'message-200', startedAt: 200,
+    })
+
+    store.set(canvasAgentLifecycleAtom, { type: 'bootstrap', owners: [], internalInvalidRuns: [] })
+
+    expect(store.get(canvasAgentRunGenerationsAtom).has(owner.sessionId)).toBe(false)
+    expect(store.get(canvasAgentOptimisticRunTokensAtom).get(owner.sessionId)).toBe('message-200')
+    expect(store.get(canvasAgentOptimisticRunGenerationsAtom).get(owner.sessionId)).toBe(200)
+    expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 100)).toBe(false)
+    expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 200)).toBe(true)
+  })
+
+  test('Given completion 100 正在 handoff When 新权威 run_started 200 到达 Then 清除过期 handoff', () => {
+    const store = createStore()
+    const owner = {
+      sessionId: 'handoff-replaced', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+    }
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: 100 })
+    store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: owner.sessionId, startedAt: 100 })
+    store.set(canvasAgentLifecycleAtom, { type: 'bootstrap', owners: [], internalInvalidRuns: [] })
+    expect(isCanvasAgentHandoffGenerationCurrent(store, owner.sessionId, 100)).toBe(true)
+
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: 200 })
+    store.set(canvasAgentLifecycleAtom, { type: 'settled', sessionId: owner.sessionId, startedAt: 100 })
+
+    expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 100)).toBe(false)
+    expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 200)).toBe(true)
+    expect(store.get(canvasAgentAuthoritativeRunningSessionIdsAtom).has(owner.sessionId)).toBe(true)
+  })
+
+  test('Given 120 个 handoff、authority 与 optimistic 混合状态 When snapshot 替换并全部终态 Then generation 状态有界清零', () => {
+    const store = createStore()
+    for (let index = 0; index < 40; index += 1) {
+      const sessionId = `handoff-mixed-${index}`
+      const owner = {
+        sessionId, projectId: 'project-a', canvasId: 'canvas-a', nodeId: `node-${index}`, title: 'Agent',
+      }
+      store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+      store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: index })
+      store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId, startedAt: index })
+    }
+    for (let index = 40; index < 80; index += 1) {
+      store.set(canvasAgentLifecycleAtom, {
+        type: 'started',
+        owner: {
+          sessionId: `authority-mixed-${index}`, projectId: 'project-a', canvasId: 'canvas-a',
+          nodeId: `node-${index}`, title: 'Agent',
+        },
+        startedAt: index,
+      })
+    }
+    for (let index = 80; index < 120; index += 1) {
+      store.set(canvasAgentLifecycleAtom, {
+        type: 'optimistic-started',
+        owner: {
+          sessionId: `optimistic-mixed-${index}`, projectId: 'project-a', canvasId: 'canvas-a',
+          nodeId: `node-${index}`, title: 'Agent',
+        },
+        token: `message-${index}`,
+        startedAt: index,
+      })
+    }
+
+    store.set(canvasAgentLifecycleAtom, { type: 'bootstrap', owners: [], internalInvalidRuns: [] })
+    expect(store.get(canvasAgentRunGenerationsAtom).size).toBe(0)
+    expect(store.get(canvasAgentPendingHandoffGenerationsAtom).size).toBe(40)
+    for (let index = 0; index < 40; index += 1) {
+      expect(isCanvasAgentHandoffGenerationCurrent(store, `handoff-mixed-${index}`, index)).toBe(true)
+      store.set(canvasAgentLifecycleAtom, { type: 'settled', sessionId: `handoff-mixed-${index}`, startedAt: index })
+      store.set(canvasAgentLifecycleAtom, { type: 'closed', sessionId: `handoff-mixed-${index}` })
+    }
+    for (let index = 80; index < 120; index += 1) {
+      const sessionId = `optimistic-mixed-${index}`
+      expect(isCanvasAgentGenerationCurrent(store, sessionId, index)).toBe(true)
+      store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId, startedAt: index })
+    }
+
+    expect(store.get(canvasAgentRunGenerationsAtom).size).toBe(0)
+    expect(store.get(canvasAgentOptimisticRunTokensAtom).size).toBe(0)
+    expect(store.get(canvasAgentOptimisticRunGenerationsAtom).size).toBe(0)
+    expect(store.get(canvasAgentPendingHandoffGenerationsAtom).size).toBe(0)
+    for (let index = 0; index < 120; index += 1) {
+      const prefix = index < 40 ? 'handoff' : index < 80 ? 'authority' : 'optimistic'
+      expect(isCanvasAgentGenerationCurrent(store, `${prefix}-mixed-${index}`, index)).toBe(false)
+    }
   })
 
   test('Given 损坏 completion 与大量关闭缓存 When 生命周期收口 Then 立即失效且非保护缓存有界', () => {
