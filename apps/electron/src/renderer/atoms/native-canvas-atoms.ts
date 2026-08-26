@@ -18,6 +18,8 @@ export type NativeCanvasSaveState = 'saved' | 'dirty' | 'saving' | 'failed' | 'c
 export interface NativeCanvasState {
   phase: NativeCanvasPhase
   snapshot: CanvasWorkspaceSnapshot | null
+  /** 当前鼠标在画布上的主交互工具。 */
+  activeTool: 'select' | 'pan'
   pendingMutations: CanvasMutation[]
   inFlightMutations: CanvasMutation[]
   saveState: NativeCanvasSaveState
@@ -34,6 +36,7 @@ export function createInitialNativeCanvasState(): NativeCanvasState {
   return {
     phase: 'idle',
     snapshot: null,
+    activeTool: 'select',
     pendingMutations: [],
     inFlightMutations: [],
     saveState: 'saved',

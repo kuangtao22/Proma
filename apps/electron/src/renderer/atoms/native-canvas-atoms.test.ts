@@ -28,6 +28,13 @@ import {
 } from './agent-atoms'
 
 describe('原生 Canvas 状态隔离', () => {
+  test('Given 新建状态 When 切换工具 Then activeTool 只允许 select 或 pan', () => {
+    const initial = createInitialNativeCanvasState()
+
+    expect(initial.activeTool).toBe('select')
+    expect({ ...initial, activeTool: 'pan' as const }.activeTool).toBe('pan')
+  })
+
   test('Given 两个 Canvas When 更新其中一个 Then pending、错误与选区不会串用', () => {
     const store = createStore()
     const firstKey = createNativeCanvasKey('project-a', 'canvas-a')

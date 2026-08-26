@@ -1,5 +1,5 @@
 import * as React from 'react'
-import type { CanvasDocument, CanvasMutation } from '@proma/shared'
+import type { CanvasDocument, CanvasMutation, CanvasNodeIssue } from '@proma/shared'
 import {
   Background,
   Controls,
@@ -64,10 +64,22 @@ export const NATIVE_CANVAS_NODE_TYPES = {
   canvasUnsupported: NativeCanvasUnsupportedNode,
 } satisfies NodeTypes
 
+/** 未提供运行时问题时复用稳定空数组，避免投影 effect 每次重跑。 */
+const EMPTY_CANVAS_NODE_ISSUES: CanvasNodeIssue[] = []
+/** 未提供运行态时复用稳定空集合。 */
+const EMPTY_RUNNING_SESSION_IDS = new Set<string>()
+/** 未接通扩展命令时使用稳定空操作。 */
+const NOOP_EXPAND = (): void => undefined
+
 /** 原生 Canvas Graph 组件输入。 */
 export interface NativeCanvasGraphProps {
   document: CanvasDocument
   writable: boolean
+  activeTool?: 'select' | 'pan'
+  nodeIssues?: CanvasNodeIssue[]
+  runningSessionIds?: ReadonlySet<string>
+  canExpand?: boolean
+  onExpand?: (nodeId: string) => void
   selectedNodeId: string | null
   onMutation: (mutation: CanvasMutation) => void
   /** 只同步 XYFlow 当前选区，不隐式打开 Agent 对话。 */
@@ -125,6 +137,11 @@ export type NativeCanvasFlowRenderer = (props: NativeCanvasFlowProps) => React.R
 export function NativeCanvasGraph({
   document,
   writable,
+  activeTool = 'select',
+  nodeIssues = EMPTY_CANVAS_NODE_ISSUES,
+  runningSessionIds = EMPTY_RUNNING_SESSION_IDS,
+  canExpand = false,
+  onExpand = NOOP_EXPAND,
   selectedNodeId,
   onMutation,
   onNodeSelect,
@@ -133,7 +150,12 @@ export function NativeCanvasGraph({
 }: NativeCanvasGraphProps): React.ReactElement {
   /** 首帧投影只使用 Canvas 文档内存数据，不读取 Agent 消息。 */
   const [flowNodes, setFlowNodes] = React.useState<NativeCanvasFlowNode[]>(() => (
-    toNativeCanvasFlowNodes(document).map((node) => ({
+    toNativeCanvasFlowNodes(document, {
+      nodeIssues,
+      runningSessionIds,
+      canExpand: writable && canExpand,
+      onExpand,
+    }).map((node) => ({
       ...node,
       selected: node.id === selectedNodeId,
     }))
@@ -158,11 +180,16 @@ export function NativeCanvasGraph({
 
   React.useEffect(() => {
     /** 权威文档变化时同步稳定展示字段与选中态。 */
-    setFlowNodes(toNativeCanvasFlowNodes(document).map((node) => ({
+    setFlowNodes(toNativeCanvasFlowNodes(document, {
+      nodeIssues,
+      runningSessionIds,
+      canExpand: writable && canExpand,
+      onExpand,
+    }).map((node) => ({
       ...node,
       selected: node.id === selectedNodeId,
     })))
-  }, [document, selectedNodeId])
+  }, [canExpand, document, nodeIssues, onExpand, runningSessionIds, selectedNodeId, writable])
 
   React.useEffect(() => {
     updateViewportState({ type: 'document-sync', viewport: document.viewport })
@@ -175,11 +202,11 @@ export function NativeCanvasGraph({
 
   /** 拖动结束后把多选集合合成单一 move mutation。 */
   const handleNodeDragStop = React.useCallback<OnNodeDrag<NativeCanvasFlowNode>>((_event, node, nodes) => {
-    if (!writable) return
+    if (!writable || activeTool !== 'select') return
     /** XYFlow 单节点拖动可能不给多选集合，此时显式回退到当前节点。 */
     const movedNodes = nodes.length > 0 ? nodes : [node]
     onMutation(createMoveCanvasNodesMutation(movedNodes))
-  }, [onMutation, writable])
+  }, [activeTool, onMutation, writable])
 
   /** 视口手势开始后暂缓远端 viewport 覆盖本地逐帧反馈。 */
   const handleMoveStart = React.useCallback<OnMoveStart>(() => {
@@ -203,9 +230,10 @@ export function NativeCanvasGraph({
 
   /** 点击 Agent 时同时记录未来对话节点身份；其他节点只更新选中态。 */
   const handleNodeClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeClick']>>((_event, node) => {
+    if (activeTool !== 'select') return
     onNodeSelect(node.id)
     onConversationNodeChange(node.type === 'canvasAgent' ? node.id : null)
-  }, [onConversationNodeChange, onNodeSelect])
+  }, [activeTool, onConversationNodeChange, onNodeSelect])
 
   /** XYFlow 选区变化只同步选中节点；仅在清空选区时同步关闭对话。 */
   const handleSelectionChange = React.useCallback<NonNullable<NativeCanvasFlowProps['onSelectionChange']>>(({ nodes }) => {
@@ -221,9 +249,10 @@ export function NativeCanvasGraph({
 
   /** 点击空白 pane 时立即清理选区，覆盖 XYFlow 未产生 selection change 的路径。 */
   const handlePaneClick = React.useCallback((): void => {
+    if (activeTool !== 'select') return
     onNodeSelect(null)
     onConversationNodeChange(null)
-  }, [onConversationNodeChange, onNodeSelect])
+  }, [activeTool, onConversationNodeChange, onNodeSelect])
 
   /** 受控 Flow 属性集中声明只读连线合同。 */
   const flowProps: NativeCanvasFlowProps = {
@@ -234,9 +263,11 @@ export function NativeCanvasGraph({
     minZoom: 0.05,
     maxZoom: 8,
     onlyRenderVisibleElements: true,
-    nodesDraggable: writable,
+    nodesDraggable: writable && activeTool === 'select',
     nodesConnectable: false,
-    elementsSelectable: true,
+    elementsSelectable: activeTool === 'select',
+    panOnDrag: activeTool === 'pan' ? true : [1],
+    selectionOnDrag: activeTool === 'select',
     multiSelectionKeyCode: null,
     edgesFocusable: false,
     edgesReconnectable: false,

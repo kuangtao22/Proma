@@ -78,6 +78,39 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(captured?.onlyRenderVisibleElements).toBe(true)
   })
 
+  test('Given select 或 pan 工具 When 构造 Flow Then 交互配置互斥且布局稳定', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    /** 两种工具各自捕获一次 XYFlow 属性。 */
+    const captured: NativeCanvasFlowProps[] = []
+    for (const activeTool of ['select', 'pan'] as const) {
+      renderToStaticMarkup(
+        <NativeCanvasGraph
+          document={document}
+          writable
+          activeTool={activeTool}
+          selectedNodeId={null}
+          onMutation={() => {}}
+          onNodeSelect={() => {}}
+          onConversationNodeChange={() => {}}
+          flowRenderer={(props) => { captured.push(props); return <div /> }}
+        />,
+      )
+    }
+
+    expect(captured[0]).toMatchObject({
+      nodesDraggable: true,
+      elementsSelectable: true,
+      panOnDrag: [1],
+      selectionOnDrag: true,
+    })
+    expect(captured[1]).toMatchObject({
+      nodesDraggable: false,
+      elementsSelectable: false,
+      panOnDrag: true,
+      selectionOnDrag: false,
+    })
+  })
+
   test('Given 节点拖动 When 手势结束 Then 只提交一次批量 move mutation', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     document.nodes = [{

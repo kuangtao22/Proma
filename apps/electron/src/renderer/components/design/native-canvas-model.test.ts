@@ -7,6 +7,7 @@ import {
   coalesceNativeCanvasMutationsForSave,
   createMoveCanvasNodesMutation,
   createViewportCanvasMutation,
+  findAvailableNativeCanvasChildPosition,
   findAvailableNativeCanvasNodePosition,
   NATIVE_CANVAS_NODE_GAP,
   NATIVE_CANVAS_NODE_HEIGHT,
@@ -33,6 +34,22 @@ function createDocument(): CanvasDocument {
 }
 
 describe('原生 Canvas 纯投影', () => {
+  test('Given Agent 节点存在问题和运行快照 When 投影 Then unavailable 优先且不可扩展', () => {
+    const document = createDocument()
+    const nodes = toNativeCanvasFlowNodes(document, {
+      nodeIssues: [{
+        nodeId: 'agent-1',
+        code: 'AGENT_SESSION_UNAVAILABLE',
+        allowedActions: ['rebuild-agent-session', 'remove-node'],
+      }],
+      runningSessionIds: new Set(['session-1']),
+      canExpand: true,
+      onExpand: () => undefined,
+    })
+
+    expect(nodes[0]?.data).toMatchObject({ status: 'unavailable', canExpand: false })
+  })
+
   test('Given 四类节点 When 投影 Then 只公开稳定展示字段且不携带消息或路径', () => {
     const nodes = toNativeCanvasFlowNodes(createDocument())
     const serialized = JSON.stringify(nodes)
@@ -53,7 +70,7 @@ describe('原生 Canvas 纯投影', () => {
     expect(nodes.filter((node) => node.id !== 'agent-1' && node.id !== 'image-1')
       .every((node) => node.handles?.length === 0)).toBe(true)
     expect(nodes[0]?.data).toEqual({
-      id: 'agent-1', title: '研究助手', agentSessionId: 'session-1', status: 'idle',
+      id: 'agent-1', title: '研究助手', agentSessionId: 'session-1', status: 'idle', canExpand: false,
     })
     expect(nodes[1]?.data).toMatchObject({ assetId: 'asset-1', unsupportedLabel: '当前版本暂不支持' })
     expect(nodes[2]?.data).toMatchObject({ visualDocumentId: 'visual-1', unsupportedLabel: '当前版本暂不支持' })
@@ -74,6 +91,21 @@ describe('原生 Canvas 纯投影', () => {
 })
 
 describe('原生 Canvas mutation', () => {
+  test('Given 源节点右侧被占用 When 计算扩展落点 Then 确定性寻找下一处不重叠位置', () => {
+    const nodes = [
+      { id: 'source', position: { x: 100, y: 100 } },
+      {
+        id: 'occupied',
+        position: { x: 100 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP, y: 100 },
+      },
+    ]
+
+    expect(findAvailableNativeCanvasChildPosition('source', nodes)).toEqual({
+      x: 100 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
+      y: 100 + NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP,
+    })
+  })
+
   test('Given 可视中心已有节点 When 添加 Agent Then 选择不重叠的相邻位置', () => {
     const visibleCenter = { x: 500, y: 300 }
     const centeredPosition = { x: 356, y: 228 }

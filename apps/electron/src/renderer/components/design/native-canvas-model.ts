@@ -3,6 +3,7 @@ import type {
   CanvasDocument,
   CanvasEdge,
   CanvasMutation,
+  CanvasNodeIssue,
   DesignPoint,
   DesignViewport,
 } from '@proma/shared'
@@ -22,6 +23,27 @@ export const NATIVE_CANVAS_UNSUPPORTED_LABEL = '当前版本暂不支持'
 /** 新节点避让只依赖已有节点的持久化位置。 */
 export interface NativeCanvasPositionedNode {
   position: DesignPoint
+}
+
+/** 扩展落点需要同时读取稳定节点 ID 和持久化位置。 */
+export interface NativeCanvasIdentifiedPositionedNode extends NativeCanvasPositionedNode {
+  id: string
+}
+
+/** Agent 节点投影使用的运行时状态和命令能力。 */
+export interface NativeCanvasProjectionOptions {
+  nodeIssues: CanvasNodeIssue[]
+  runningSessionIds: ReadonlySet<string>
+  canExpand: boolean
+  onExpand: (nodeId: string) => void
+}
+
+/** 默认投影不暴露运行态或扩展命令，保持纯文档调用兼容。 */
+const DEFAULT_NATIVE_CANVAS_PROJECTION_OPTIONS: NativeCanvasProjectionOptions = {
+  nodeIssues: [],
+  runningSessionIds: new Set<string>(),
+  canExpand: false,
+  onExpand: () => undefined,
 }
 
 /** 暂未接入交互的原生 Canvas 节点安全展示数据。 */
@@ -101,13 +123,52 @@ export function findAvailableNativeCanvasNodePosition(
   throw new Error('Canvas 节点落点计算失败')
 }
 
+/**
+ * 从源节点右侧开始按行向下寻找首个不重叠位置。
+ * @param sourceNodeId 扩展关系的源节点 ID。
+ * @param nodes 当前 Canvas 全部节点身份与位置。
+ * @returns 与固定节点尺寸和间距对齐的确定性右侧落点。
+ */
+export function findAvailableNativeCanvasChildPosition(
+  sourceNodeId: string,
+  nodes: ReadonlyArray<NativeCanvasIdentifiedPositionedNode>,
+): DesignPoint {
+  /** 源节点必须来自当前权威文档，禁止为迟到命令猜测位置。 */
+  const source = nodes.find((node) => node.id === sourceNodeId)
+  if (!source) throw new Error('Canvas 扩展源节点不存在')
+  /** 扩展默认从源节点正右侧开始。 */
+  const start = {
+    x: source.position.x + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
+    y: source.position.y,
+  }
+  /** 横纵间距分别与当前固定卡片尺寸对齐。 */
+  const horizontalStep = NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP
+  const verticalStep = NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP
+  /** 任意位置节点只要进入固定间距范围即视为占用候选。 */
+  const overlapsExistingNode = (candidate: DesignPoint): boolean => nodes.some((node) => (
+    Math.abs(candidate.x - node.position.x) < horizontalStep
+    && Math.abs(candidate.y - node.position.y) < verticalStep
+  ))
+  for (let row = 0; row <= nodes.length; row += 1) {
+    /** 候选始终位于同一右侧列，避免扩展关系在画布上来回跳跃。 */
+    const candidate = { x: start.x, y: start.y + row * verticalStep }
+    if (!overlapsExistingNode(candidate)) return candidate
+  }
+  throw new Error('Canvas 扩展落点计算失败')
+}
+
 /** 仅允许可恢复的网页地址进入 Renderer 投影，阻断文件路径与内嵌数据。 */
 function projectSafeWebviewUrl(url: string): string | undefined {
   return /^https?:\/\//u.test(url) ? url : undefined
 }
 
 /** 将持久节点投影为固定尺寸且无消息读取能力的 XYFlow 节点。 */
-export function toNativeCanvasFlowNodes(document: CanvasDocument): NativeCanvasFlowNode[] {
+export function toNativeCanvasFlowNodes(
+  document: CanvasDocument,
+  options: NativeCanvasProjectionOptions = DEFAULT_NATIVE_CANVAS_PROJECTION_OPTIONS,
+): NativeCanvasFlowNode[] {
+  /** 节点问题先建索引，避免大画布逐节点线性扫描全部问题。 */
+  const unavailableNodeIds = new Set(options.nodeIssues.map((issue) => issue.nodeId))
   /** 仅为真实边涉及的节点建立端口索引，避免无边大画布节点承担 handle 成本。 */
   const handlesByNodeId = new Map<string, NodeHandle[]>()
   /** 向节点追加一次静态端口；相同方向与 ID 的端口只保留一个。 */
@@ -144,12 +205,19 @@ export function toNativeCanvasFlowNodes(document: CanvasDocument): NativeCanvasF
       handles: handlesByNodeId.get(node.id) ?? [],
     }
     if (node.kind === 'agent') {
-      /** 当前文档只持有会话引用；在对话状态接通前采用本地空闲态。 */
+      /** unavailable 优先于运行态，坏节点不得继续扩展。 */
+      const unavailable = unavailableNodeIds.has(node.id)
+      /** 只有可写且健康的 Agent 节点才能创建下游节点。 */
+      const canExpand = options.canExpand && !unavailable
       const data: CanvasAgentNodeData = {
         id: node.id,
         title: node.title,
         agentSessionId: node.agentSessionId,
-        status: 'idle',
+        status: unavailable
+          ? 'unavailable'
+          : options.runningSessionIds.has(node.agentSessionId) ? 'running' : 'idle',
+        canExpand,
+        ...(canExpand ? { onExpand: options.onExpand } : {}),
       }
       return { ...base, type: 'canvasAgent', data }
     }
