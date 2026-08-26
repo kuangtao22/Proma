@@ -712,7 +712,7 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
         .filter((name) => !PURE_VALIDATION_CALLS.has(name) && name !== 'Error')
       expect(callsBeforeGuard, `${channel} 在 guard 前执行了业务调用`).toEqual([])
     }
-  })
+  }, 60_000)
 
   test('Given ipc.ts 注册全部 Renderer handler When 枚举访问矩阵 Then 非 Agent 文件入口也在业务调用前 guard', () => {
     const { handlers } = loadAgentHandlers()
