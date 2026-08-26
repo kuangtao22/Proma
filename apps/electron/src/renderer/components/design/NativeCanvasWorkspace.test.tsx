@@ -7,6 +7,8 @@ import type {
   CanvasMutation,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
+  CreateCanvasAgentNodeInput,
+  RebuildCanvasAgentNodeResult,
 } from '@proma/shared'
 import { createStore, Provider } from 'jotai'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -14,8 +16,10 @@ import type { NativeCanvasState } from '@/atoms/native-canvas-atoms'
 import {
   createInitialNativeCanvasState,
   createNativeCanvasKey,
+  canvasAgentRunningSessionIdsAtom,
   nativeCanvasStatesAtom,
 } from '@/atoms/native-canvas-atoms'
+import { CanvasPublicOperationError } from '@/lib/design-adapter'
 import {
   NATIVE_CANVAS_COMMIT_UNCERTAIN_CODE,
   NATIVE_CANVAS_RECOVERY_REQUIRED_CODE,
@@ -24,7 +28,11 @@ import {
   NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
   NativeCanvasWorkspace,
   createCanvasAgentNodeCommandController,
+  createCanvasAgentNodeRebuildController,
+  createRebuiltNativeCanvasStateUpdate,
   createNativeCanvasWorkspaceController,
+  getNativeCanvasConnectedEdgeCount,
+  isPendingCanvasStopDeleteCurrent,
 } from './NativeCanvasWorkspace'
 import type {
   CanvasAgentNodeCommandState,
@@ -70,7 +78,7 @@ function createSnapshot(
 ): CanvasWorkspaceSnapshot {
   const document = createEmptyCanvasDocument(target.projectId, target.canvasId, revision)
   document.revision = revision
-  return { document, writable: true }
+  return { document, writable: true, nodeIssues: [] }
 }
 
 /** 手动推进的 trailing debounce 调度器。 */
@@ -171,6 +179,20 @@ function createHarness(
 }
 
 describe('原生 Canvas controller 加载与事件', () => {
+  test('Given LOAD 异常含内部正文 When 加载失败 Then 状态只保留固定公开文案', async () => {
+    const harness = createHarness()
+    harness.controller.start()
+    harness.loads[0]?.reject(new Error(
+      'Error invoking remote method /Users/name 11111111-1111-4111-8111-111111111111',
+    ))
+    await flushPromises()
+
+    expect(harness.getState()).toMatchObject({
+      phase: 'error',
+      error: '画布暂时无法加载。',
+    })
+  })
+
   test('Given 普通 graph 事件 When revision 未前进 Then 忽略；更高时才加载', async () => {
     const harness = createHarness()
     harness.controller.start()
@@ -275,7 +297,7 @@ describe('原生 Canvas controller 保存', () => {
       pendingMutations: [first, later],
       inFlightMutations: [],
       saveState: 'failed',
-      error: '磁盘忙',
+      error: '画布暂时无法保存。',
     })
     harness.scheduler.runAll()
     expect(harness.saves).toHaveLength(1)
@@ -699,6 +721,264 @@ describe('原生 Canvas 冲突提示', () => {
 })
 
 describe('原生 Canvas 添加 Agent 命令', () => {
+  test('Given CREATE 异常含内部正文 When 创建失败 Then 按钮状态只保留固定公开文案', async () => {
+    const states: CanvasAgentNodeCommandState[] = []
+    const controller = createCanvasAgentNodeCommandController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      createAgentNode: async () => {
+        throw new Error(
+          'Error invoking remote method /Users/name 11111111-1111-4111-8111-111111111111',
+        )
+      },
+      createId: (() => {
+        const ids = ['operation-1', 'node-1']
+        return () => ids.shift()!
+      })(),
+      getPosition: () => ({ x: 0, y: 0 }),
+      onStateChange: (state) => states.push(state),
+      onSuccess: () => undefined,
+    })
+
+    await expect(controller.execute()).rejects.toThrow('Error invoking remote method')
+    expect(states.at(-1)).toEqual({
+      loading: false,
+      error: '节点创建失败，请重试。',
+    })
+  })
+
+  test('Given 健康源节点 When 扩展 Agent Then 预分配稳定边并使用源节点落点', async () => {
+    const inputs: CreateCanvasAgentNodeInput[] = []
+    const controller = createCanvasAgentNodeCommandController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      createAgentNode: async (input) => {
+        inputs.push(input)
+        return { document: createSnapshot(2).document, session: { id: 'session-2' } as never }
+      },
+      createId: (() => {
+        const ids = ['operation-1', 'node-2', 'edge-1']
+        return () => ids.shift()!
+      })(),
+      getPosition: (sourceNodeId) => sourceNodeId === 'agent-1'
+        ? { x: 412, y: 268 }
+        : { x: 0, y: 0 },
+      onStateChange: () => undefined,
+      onSuccess: () => undefined,
+    })
+
+    await controller.execute({ sourceNodeId: 'agent-1' })
+
+    expect(inputs).toEqual([{
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      operationId: 'operation-1',
+      nodeId: 'node-2',
+      title: '新 Agent',
+      position: { x: 412, y: 268 },
+      relationship: { sourceNodeId: 'agent-1', edgeId: 'edge-1' },
+    }])
+  })
+
+  test('Given 独立添加 When 创建 Agent Then 不生成 relationship', async () => {
+    let input: CreateCanvasAgentNodeInput | undefined
+    const controller = createCanvasAgentNodeCommandController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      createAgentNode: async (current) => {
+        input = current
+        return { document: createSnapshot(2).document, session: { id: 'session-2' } as never }
+      },
+      createId: (() => {
+        const ids = ['operation-1', 'node-2']
+        return () => ids.shift()!
+      })(),
+      getPosition: () => ({ x: 20, y: 40 }),
+      onStateChange: () => undefined,
+      onSuccess: () => undefined,
+    })
+
+    await controller.execute()
+
+    expect(input?.position).toEqual({ x: 20, y: 40 })
+    expect(input).not.toHaveProperty('relationship')
+  })
+
+  test('Given 节点有输入输出边 When 计算删除影响 Then 只统计一次每条关联边', () => {
+    const document = createSnapshot(1).document
+    document.nodes = [
+      { id: 'agent-1', kind: 'agent', title: 'Agent 1', agentSessionId: 'session-1', position: { x: 0, y: 0 } },
+      { id: 'agent-2', kind: 'agent', title: 'Agent 2', agentSessionId: 'session-2', position: { x: 320, y: 0 } },
+    ]
+    document.edges = [
+      { id: 'edge-in', sourceNodeId: 'agent-2', sourcePort: 'output', targetNodeId: 'agent-1', targetPort: 'input' },
+      { id: 'edge-out', sourceNodeId: 'agent-1', sourcePort: 'output', targetNodeId: 'agent-2', targetPort: 'input' },
+    ]
+
+    expect(getNativeCanvasConnectedEdgeCount(document, 'agent-1')).toBe(2)
+  })
+
+  test('Given 停止后删除请求 When Canvas 或 session 已切换 Then 旧请求不得提交删除', () => {
+    const pending = {
+      canvasKey: 'project-1:canvas-a',
+      nodeId: 'agent-1',
+      sessionId: 'session-old',
+      stopAccepted: true,
+    }
+    const currentNode = {
+      id: 'agent-1', kind: 'agent' as const, title: 'Agent 1',
+      agentSessionId: 'session-old', position: { x: 0, y: 0 },
+    }
+
+    expect(isPendingCanvasStopDeleteCurrent(pending, 'project-1:canvas-a', currentNode)).toBe(true)
+    expect(isPendingCanvasStopDeleteCurrent(pending, 'project-1:canvas-b', currentNode)).toBe(false)
+    expect(isPendingCanvasStopDeleteCurrent(
+      pending,
+      'project-1:canvas-a',
+      { ...currentNode, agentSessionId: 'session-new' },
+    )).toBe(false)
+  })
+
+  test('Given 坏节点重建首次失败 When 显式重试 Then 复用完整 operation 并整体接管快照', async () => {
+    const requests: Array<{ operationId: string; nodeId: string }> = []
+    const states: CanvasAgentNodeCommandState[] = []
+    const rebuiltSnapshot = createSnapshot(8)
+    rebuiltSnapshot.nodeIssues = []
+    const result: RebuildCanvasAgentNodeResult = {
+      snapshot: rebuiltSnapshot,
+      session: { id: 'session-new' } as never,
+    }
+    let attempts = 0
+    let success: RebuildCanvasAgentNodeResult | undefined
+    const controller = createCanvasAgentNodeRebuildController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'agent-1' },
+      rebuildAgentNode: async (input) => {
+        requests.push(input)
+        attempts += 1
+        if (attempts === 1) {
+          throw new CanvasPublicOperationError(
+            'AGENT_SESSION_REBUILD_FAILED',
+            '重建失败，请重试。',
+          )
+        }
+        return result
+      },
+      createId: () => 'operation-rebuild-1',
+      onStateChange: (state) => states.push(state),
+      onSuccess: (current) => { success = current },
+    })
+
+    await expect(controller.execute()).rejects.toThrow('重建失败，请重试。')
+    await expect(controller.execute()).resolves.toBeUndefined()
+
+    expect(requests).toHaveLength(2)
+    expect(requests[1]).toEqual(requests[0])
+    expect(states).toContainEqual({ loading: false, error: '重建失败，请重试。' })
+    expect(success).toBe(result)
+    expect(createRebuiltNativeCanvasStateUpdate(result, 'agent-1')).toEqual({
+      snapshot: rebuiltSnapshot,
+      selectedNodeId: 'agent-1',
+      conversationNodeId: 'agent-1',
+      error: null,
+    })
+  })
+
+  test('Given 坏 Agent 节点 When 渲染 Workspace Then 绕过对话并显示恢复面板', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const snapshot = createSnapshot(7, target)
+    snapshot.document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: '首页设计',
+      agentSessionId: 'session-broken', position: { x: 0, y: 0 },
+    }]
+    snapshot.nodeIssues = [{
+      nodeId: 'agent-1',
+      code: 'AGENT_SESSION_UNAVAILABLE',
+      allowedActions: ['rebuild-agent-session', 'remove-node'],
+    }]
+    const stateKey = createNativeCanvasKey(target.projectId, target.canvasId)
+    const store = createStore()
+    store.set(nativeCanvasStatesAtom, new Map([[stateKey, {
+      ...createInitialNativeCanvasState(),
+      phase: 'ready',
+      snapshot,
+      selectedNodeId: 'agent-1',
+      conversationNodeId: 'agent-1',
+    }]]))
+    let conversationRenderCount = 0
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          target={target}
+          title="首页 Canvas"
+          adapter={{
+            loadCanvas: async () => snapshot,
+            saveCanvas: async () => snapshot.document,
+            onCanvasChanged: () => () => {},
+            getCanvasAgentMessages: async () => {
+              throw new Error('坏节点禁止读取消息')
+            },
+            sendCanvasAgentMessage: async () => ({ ok: true }),
+            stopCanvasAgent: async () => undefined,
+          }}
+          flowRenderer={() => <div />}
+          conversationRenderer={() => {
+            conversationRenderCount += 1
+            return <div>不应渲染</div>
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(html).toContain('此节点关联的 Agent 会话不可用。')
+    expect(html).toContain('重建会话')
+    expect(conversationRenderCount).toBe(0)
+  })
+
+  test('Given Canvas 有工具状态、问题和运行节点 When 渲染 Graph Then 传入真实投影参数', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const snapshot = createSnapshot(3, target)
+    snapshot.document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: 'Agent 1',
+      agentSessionId: 'session-1', position: { x: 0, y: 0 },
+    }]
+    snapshot.nodeIssues = [{
+      nodeId: 'agent-1', code: 'AGENT_SESSION_UNAVAILABLE',
+      allowedActions: ['rebuild-agent-session', 'remove-node'],
+    }]
+    const store = createStore()
+    store.set(nativeCanvasStatesAtom, new Map([[
+      createNativeCanvasKey(target.projectId, target.canvasId),
+      { ...createInitialNativeCanvasState(), phase: 'ready', snapshot, activeTool: 'pan' },
+    ]]))
+    store.set(canvasAgentRunningSessionIdsAtom, new Set(['session-1']))
+    let flowProps: NativeCanvasFlowProps | undefined
+
+    renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          target={target}
+          title="Canvas 1"
+          adapter={{
+            loadCanvas: async () => snapshot,
+            saveCanvas: async () => snapshot.document,
+            createCanvasAgentNode: async () => ({
+              document: snapshot.document,
+              session: { id: 'session-new' } as never,
+            }),
+            onCanvasChanged: () => () => {},
+          }}
+          flowRenderer={(props) => {
+            flowProps = props
+            return <div />
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(flowProps?.nodes[0]).toMatchObject({
+      data: { status: 'unavailable', canExpand: false },
+    })
+    expect(flowProps?.nodesDraggable).toBe(false)
+    expect(flowProps?.panOnDrag).toBe(true)
+  })
+
   test('Given Agent 节点仍被选中 When 关闭对话 Then 同时清空选区避免立即重开', () => {
     const target = { projectId: 'project-1', canvasId: 'canvas-1' }
     const snapshot = createSnapshot(7, target)
@@ -873,7 +1153,9 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       createAgentNode: async (input) => {
         inputs.push(input)
         attempts += 1
-        if (attempts === 1) throw new Error('创建失败，请重试')
+        if (attempts === 1) {
+          throw new CanvasPublicOperationError('CANVAS_CREATE_FAILED', '创建失败，请重试')
+        }
         return { document, session: { id: 'session-1' } as never }
       },
       createId: (() => {
@@ -921,7 +1203,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       </Provider>,
     )
 
-    expect(html).toContain('aria-label="添加 Agent"')
-    expect(html).toContain('添加 Agent')
+    expect(html).toContain('aria-label="添加节点"')
+    expect(html).toContain('aria-label="选择工具"')
   })
 })

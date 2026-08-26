@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { applyCanvasMutations } from '@proma/shared'
 import type {
+  CanvasAgentTarget,
   CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
   CanvasDocument,
@@ -9,10 +10,13 @@ import type {
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
   DesignPoint,
+  RebuildCanvasAgentNodeInput,
+  RebuildCanvasAgentNodeResult,
 } from '@proma/shared'
 import { useAtomValue, useSetAtom, useStore } from 'jotai'
-import { Bot, LoaderCircle, RotateCcw } from 'lucide-react'
+import { LoaderCircle, RotateCcw } from 'lucide-react'
 import {
+  canvasAgentRunningSessionIdsAtom,
   createInitialNativeCanvasState,
   createNativeCanvasKey,
   nativeCanvasStatesAtom,
@@ -20,11 +24,13 @@ import {
 } from '@/atoms/native-canvas-atoms'
 import type { NativeCanvasState } from '@/atoms/native-canvas-atoms'
 import { Button } from '@/components/ui/button'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { designAdapter } from '@/lib/design-adapter'
+import { CanvasPublicOperationError, designAdapter } from '@/lib/design-adapter'
 import type { DesignAdapter } from '@/lib/design-adapter'
+import { CanvasAgentRecoveryPanel } from './CanvasAgentRecoveryPanel'
 import { NativeCanvasGraph } from './NativeCanvasGraph'
 import type { NativeCanvasFlowRenderer } from './NativeCanvasGraph'
+import { NativeCanvasDeleteDialog, isNativeCanvasDeleteShortcut } from './NativeCanvasDeleteDialog'
+import { NativeCanvasToolbar } from './NativeCanvasToolbar'
 import {
   CanvasAgentConversation,
   type CanvasAgentConversationAdapter,
@@ -33,6 +39,7 @@ import {
 import {
   canReplayNativeCanvasPositionMutations,
   coalesceNativeCanvasMutationsForSave,
+  findAvailableNativeCanvasChildPosition,
   findAvailableNativeCanvasNodePosition,
   replayNativeCanvasPositionMutations,
 } from './native-canvas-model'
@@ -55,6 +62,8 @@ export interface NativeCanvasAdapter {
   onCanvasChanged: DesignAdapter['onCanvasChanged']
   /** 旧测试替身可省略，真实 Design adapter 始终提供。 */
   createCanvasAgentNode?: DesignAdapter['createCanvasAgentNode']
+  /** 坏节点重建能力仅在完整 Adapter 接通时可用。 */
+  rebuildCanvasAgentNode?: DesignAdapter['rebuildCanvasAgentNode']
   /** Canvas Agent 对话三入口需同时存在才渲染面板。 */
   getCanvasAgentMessages?: DesignAdapter['getCanvasAgentMessages']
   sendCanvasAgentMessage?: DesignAdapter['sendCanvasAgentMessage']
@@ -67,20 +76,48 @@ export interface CanvasAgentNodeCommandState {
   error: string | null
 }
 
+/** 添加 Agent 命令可选的扩展来源。 */
+export interface CanvasAgentNodeCommandRequest {
+  sourceNodeId?: string
+}
+
 /** 添加 Agent 命令的可注入依赖，避免把幂等 operation 混入保存状态机。 */
 export interface CanvasAgentNodeCommandDependencies {
   target: CanvasTarget
   createAgentNode: (input: CreateCanvasAgentNodeInput) => Promise<CanvasAgentNodeCreationResult>
   createId: () => string
-  getPosition: () => DesignPoint
+  getPosition: (sourceNodeId?: string) => DesignPoint
   onStateChange: (state: CanvasAgentNodeCommandState) => void
   onSuccess: (nodeId: string, result: CanvasAgentNodeCreationResult) => void
 }
 
 /** 单次用户创建 operation 的命令接口。 */
 export interface CanvasAgentNodeCommandController {
+  execute: (request?: CanvasAgentNodeCommandRequest) => Promise<void>
+  cancel: () => void
+}
+
+/** 重建坏 Agent 节点命令的可注入依赖。 */
+export interface CanvasAgentNodeRebuildDependencies {
+  target: CanvasAgentTarget
+  rebuildAgentNode: (input: RebuildCanvasAgentNodeInput) => Promise<RebuildCanvasAgentNodeResult>
+  createId: () => string
+  onStateChange: (state: CanvasAgentNodeCommandState) => void
+  onSuccess: (result: RebuildCanvasAgentNodeResult) => void
+}
+
+/** 单个坏节点重建 operation 的命令接口。 */
+export interface CanvasAgentNodeRebuildController {
   execute: () => Promise<void>
   cancel: () => void
+}
+
+/** 运行节点停止完成前保留的删除身份与 Canvas 代次。 */
+export interface PendingCanvasStopDelete {
+  canvasKey: string
+  nodeId: string
+  sessionId: string
+  stopAccepted: boolean
 }
 
 /**
@@ -95,6 +132,57 @@ export function createClosedNativeCanvasConversationUpdate(): Pick<
 }
 
 /**
+ * 统计删除节点会同步移除的关联边。
+ * @param document 当前权威 Canvas 文档。
+ * @param nodeId 待删除节点 ID。
+ * @returns 输入或输出命中该节点的边数量。
+ */
+export function getNativeCanvasConnectedEdgeCount(
+  document: CanvasDocument,
+  nodeId: string,
+): number {
+  return document.edges.filter((edge) => (
+    edge.sourceNodeId === nodeId || edge.targetNodeId === nodeId
+  )).length
+}
+
+/**
+ * 复核停止后删除请求仍属于当前 Canvas 和同一 Agent session。
+ * @param pending 待完成的停止后删除身份。
+ * @param stateKey 当前 Renderer Canvas 组合键。
+ * @param node 当前权威文档中同 ID 节点。
+ * @returns Canvas、节点和 session 均未漂移时返回 true。
+ */
+export function isPendingCanvasStopDeleteCurrent(
+  pending: PendingCanvasStopDelete,
+  stateKey: string,
+  node: CanvasDocument['nodes'][number] | undefined,
+): boolean {
+  return pending.canvasKey === stateKey
+    && node?.kind === 'agent'
+    && node.id === pending.nodeId
+    && node.agentSessionId === pending.sessionId
+}
+
+/**
+ * 生成重建成功后的完整状态更新。
+ * @param result 主进程返回的权威重建结果。
+ * @param nodeId 已重建的节点 ID。
+ * @returns 整体接管 snapshot 并保持目标节点打开的状态更新。
+ */
+export function createRebuiltNativeCanvasStateUpdate(
+  result: RebuildCanvasAgentNodeResult,
+  nodeId: string,
+): Partial<NativeCanvasState> {
+  return {
+    snapshot: result.snapshot,
+    selectedNodeId: nodeId,
+    conversationNodeId: nodeId,
+    error: null,
+  }
+}
+
+/**
  * 创建保留失败 operationId 的 Agent 节点命令控制器。
  * @param dependencies 主进程创建 API、ID、位置和状态回调。
  * @returns 防重复执行、支持显式重试与取消的命令。
@@ -104,6 +192,8 @@ export function createCanvasAgentNodeCommandController(
 ): CanvasAgentNodeCommandController {
   /** 首次点击生成并在失败重试间保留的完整请求。 */
   let operation: CreateCanvasAgentNodeInput | null = null
+  /** 当前失败 operation 对应的扩展来源，切换来源时创建新 operation。 */
+  let operationSourceNodeId: string | undefined
   /** 当前唯一在途 Promise，连续点击必须返回同一引用。 */
   let inFlight: Promise<void> | null = null
   /** 生命周期代次用于隔离切换 Canvas 后迟到的异步回调。 */
@@ -112,16 +202,26 @@ export function createCanvasAgentNodeCommandController(
   let disposed = false
 
   return {
-    execute: () => {
+    execute: (commandRequest = {}) => {
       if (disposed) return Promise.reject(new Error('Canvas Agent 创建命令已取消'))
       if (inFlight) return inFlight
-      if (!operation) {
+      if (!operation || operationSourceNodeId !== commandRequest.sourceNodeId) {
+        /** 不同入口代表不同用户意图，只有同一入口的失败重试复用 operation。 */
+        operationSourceNodeId = commandRequest.sourceNodeId
         operation = {
           ...dependencies.target,
           operationId: dependencies.createId(),
           nodeId: dependencies.createId(),
           title: '新 Agent',
-          position: dependencies.getPosition(),
+          position: dependencies.getPosition(commandRequest.sourceNodeId),
+          ...(commandRequest.sourceNodeId
+            ? {
+                relationship: {
+                  sourceNodeId: commandRequest.sourceNodeId,
+                  edgeId: dependencies.createId(),
+                },
+              }
+            : {}),
         }
       }
       /** 当前调用固定捕获 request，成功清理 operation 也不影响回调节点 ID。 */
@@ -132,11 +232,15 @@ export function createCanvasAgentNodeCommandController(
         if (disposed || generation !== requestGeneration) return
         dependencies.onSuccess(request.nodeId, result)
         operation = null
+        operationSourceNodeId = undefined
         dependencies.onStateChange({ loading: false, error: null })
       }).catch((error: unknown) => {
         /** 失败保留 operation，下一次 execute 原样重放。 */
         if (!disposed && generation === requestGeneration) {
-          dependencies.onStateChange({ loading: false, error: getNativeCanvasErrorMessage(error) })
+          dependencies.onStateChange({
+            loading: false,
+            error: getNativeCanvasOperationErrorMessage('create', error),
+          })
         }
         throw error
       }).finally(() => {
@@ -147,6 +251,60 @@ export function createCanvasAgentNodeCommandController(
     },
     cancel: () => {
       /** 不能撤回主进程事务，但可立即废弃本地回调代次。 */
+      disposed = true
+      generation += 1
+      operation = null
+      operationSourceNodeId = undefined
+      dependencies.onStateChange({ loading: false, error: null })
+    },
+  }
+}
+
+/** 创建保留失败 operationId 的坏节点重建控制器。 */
+export function createCanvasAgentNodeRebuildController(
+  dependencies: CanvasAgentNodeRebuildDependencies,
+): CanvasAgentNodeRebuildController {
+  /** 首次重建生成并在失败重试时复用的完整请求。 */
+  let operation: RebuildCanvasAgentNodeInput | null = null
+  /** 单节点只允许一个重建请求在途。 */
+  let inFlight: Promise<void> | null = null
+  /** lifecycle 代次隔离切换 Canvas 后的迟到结果。 */
+  let generation = 0
+  /** cleanup 后控制器永久失效。 */
+  let disposed = false
+
+  return {
+    execute: () => {
+      if (disposed) return Promise.reject(new Error('Canvas Agent 重建命令已取消'))
+      if (inFlight) return inFlight
+      if (!operation) {
+        operation = { ...dependencies.target, operationId: dependencies.createId() }
+      }
+      /** 本轮请求固定捕获 operation 和代次。 */
+      const request = operation
+      const requestGeneration = generation
+      dependencies.onStateChange({ loading: true, error: null })
+      const requestPromise = dependencies.rebuildAgentNode(request).then((result) => {
+        if (disposed || generation !== requestGeneration) return
+        dependencies.onSuccess(result)
+        operation = null
+        dependencies.onStateChange({ loading: false, error: null })
+      }).catch((error: unknown) => {
+        if (!disposed && generation === requestGeneration) {
+          dependencies.onStateChange({
+            loading: false,
+            error: getNativeCanvasOperationErrorMessage('rebuild', error),
+          })
+        }
+        throw error
+      }).finally(() => {
+        if (inFlight === requestPromise) inFlight = null
+      })
+      inFlight = requestPromise
+      return requestPromise
+    },
+    cancel: () => {
+      if (disposed) return
       disposed = true
       generation += 1
       operation = null
@@ -192,13 +350,38 @@ interface ActiveNativeCanvasSave {
   batch: CanvasMutation[]
 }
 
-/** 将未知异常转换为稳定用户文本。 */
-function getNativeCanvasErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : 'Canvas 操作失败'
+/** Workspace 各操作遇到未知异常时使用的固定公开文案。 */
+const NATIVE_CANVAS_OPERATION_ERROR_MESSAGES = {
+  load: '画布暂时无法加载。',
+  save: '画布暂时无法保存。',
+  create: '节点创建失败，请重试。',
+  rebuild: '重建失败，请重试。',
+  stop: '停止失败，节点未删除。',
+} as const
+
+/** Workspace 可显示错误对应的操作类型。 */
+type NativeCanvasOperation = keyof typeof NATIVE_CANVAS_OPERATION_ERROR_MESSAGES
+
+/**
+ * 将未知异常转换为稳定用户文本。
+ * @param operation 当前 Canvas 操作。
+ * @param error Adapter 或运行时抛出的未知异常。
+ * @returns 公开错误文案或当前操作的固定回退。
+ */
+function getNativeCanvasOperationErrorMessage(
+  operation: NativeCanvasOperation,
+  error: unknown,
+): string {
+  return error instanceof CanvasPublicOperationError
+    ? error.message
+    : NATIVE_CANVAS_OPERATION_ERROR_MESSAGES[operation]
 }
 
 /** 从主进程稳定消息前缀识别需要权威 LOAD 的 SAVE 错误。 */
 function isNativeCanvasAuthoritativeSaveError(error: unknown): boolean {
+  if (error instanceof CanvasPublicOperationError) {
+    return error.code === 'CANVAS_REVISION_CONFLICT'
+  }
   /** 非 Error 值没有稳定前缀，继续沿用普通失败路径。 */
   if (!(error instanceof Error)) return false
   return [
@@ -369,11 +552,14 @@ export function createNativeCanvasWorkspaceController(
           phase: latest.snapshot ? 'ready' : 'error',
           saveState: 'failed',
           authoritativeRecoveryState: 'failed',
-          error: `恢复 Canvas 失败：${getNativeCanvasErrorMessage(error)}`,
+          error: `恢复 Canvas 失败：${getNativeCanvasOperationErrorMessage('load', error)}`,
         }))
         return
       }
-      dependencies.updateState({ phase: 'error', error: getNativeCanvasErrorMessage(error) })
+      dependencies.updateState({
+        phase: 'error',
+        error: getNativeCanvasOperationErrorMessage('load', error),
+      })
     })
   }
 
@@ -443,7 +629,7 @@ export function createNativeCanvasWorkspaceController(
           pendingMutations: [...batch, ...latest.pendingMutations],
           inFlightMutations: [],
           saveState: 'failed',
-          error: getNativeCanvasErrorMessage(error),
+          error: getNativeCanvasOperationErrorMessage('save', error),
         }))
       })
     }, NATIVE_CANVAS_SAVE_DEBOUNCE_MS)
@@ -572,16 +758,42 @@ export function NativeCanvasWorkspace({
   const states = useAtomValue(nativeCanvasStatesAtom)
   const updateNativeCanvasState = useSetAtom(updateNativeCanvasStateAtom)
   const store = useStore()
+  const runningSessionIds = useAtomValue(canvasAgentRunningSessionIdsAtom)
   const controllerRef = React.useRef<NativeCanvasWorkspaceController | null>(null)
   const commandRef = React.useRef<CanvasAgentNodeCommandController | null>(null)
+  const rebuildCommandRef = React.useRef<CanvasAgentNodeRebuildController | null>(null)
+  /** 删除异步回调代次，Canvas 切换后立即失效旧停止请求。 */
+  const deleteGenerationRef = React.useRef(0)
   const canvasViewportRef = React.useRef<HTMLDivElement | null>(null)
   const [createState, setCreateState] = React.useState<CanvasAgentNodeCommandState>({
     loading: false,
     error: null,
   })
+  const [rebuildState, setRebuildState] = React.useState<CanvasAgentNodeCommandState>({
+    loading: false,
+    error: null,
+  })
+  const [deleteDialogOpen, setDeleteDialogOpen] = React.useState(false)
+  const [deleteSubmitting, setDeleteSubmitting] = React.useState(false)
+  const [deleteError, setDeleteError] = React.useState<string | null>(null)
+  /** 停止请求与权威运行终态之间的待删除身份。 */
+  const [pendingStopDelete, setPendingStopDelete] = React.useState<PendingCanvasStopDelete | null>(null)
   /** SSR 首帧使用该 key 专属的全新状态，不启动任何消息或 Canvas API。 */
   const fallbackState = React.useMemo(createInitialNativeCanvasState, [stateKey])
   const state = states.get(stateKey) ?? fallbackState
+  /** 对话节点始终从当前 Canvas 权威内存文档解析，不保存 Renderer sessionId。 */
+  const conversationNode = state.snapshot?.document.nodes.find((node) => (
+    node.id === state.conversationNodeId && node.kind === 'agent'
+  ))
+  /** 节点问题只取主进程权威快照，不从会话读取失败反推。 */
+  const conversationNodeIssue = state.snapshot?.nodeIssues.find((issue) => (
+    issue.nodeId === conversationNode?.id
+  ))
+  /** 工具栏删除始终作用于当前单选节点。 */
+  const selectedNode = state.snapshot?.document.nodes.find((node) => node.id === state.selectedNodeId)
+  /** 运行态仅按当前 Agent 节点绑定的 session 判断。 */
+  const selectedNodeBusy = selectedNode?.kind === 'agent'
+    && runningSessionIds.has(selectedNode.agentSessionId)
 
   React.useEffect(() => {
     /** 浏览器调度器仅在 effect 内创建，SSR 不触发副作用。 */
@@ -616,9 +828,11 @@ export function NativeCanvasWorkspace({
       target,
       createAgentNode: adapter.createCanvasAgentNode,
       createId: () => window.crypto.randomUUID(),
-      getPosition: () => {
+      getPosition: (sourceNodeId) => {
         /** 以点击时最新 viewport 和容器尺寸换算世界坐标中心。 */
         const latest = store.get(nativeCanvasStatesAtom).get(stateKey)
+        const nodes = latest?.snapshot?.document.nodes ?? []
+        if (sourceNodeId) return findAvailableNativeCanvasChildPosition(sourceNodeId, nodes)
         const viewport = latest?.snapshot?.document.viewport ?? { x: 0, y: 0, zoom: 1 }
         const bounds = canvasViewportRef.current?.getBoundingClientRect()
         /** 当前可视区域中心对应的世界坐标。 */
@@ -628,7 +842,7 @@ export function NativeCanvasWorkspace({
         }
         return findAvailableNativeCanvasNodePosition(
           visibleCenter,
-          latest?.snapshot?.document.nodes ?? [],
+          nodes,
         )
       },
       onStateChange: setCreateState,
@@ -637,7 +851,7 @@ export function NativeCanvasWorkspace({
         update: (current) => ({
           snapshot: current.snapshot
             ? { ...current.snapshot, document: result.document }
-            : { document: result.document, writable: true },
+            : { document: result.document, writable: true, nodeIssues: [] },
           selectedNodeId: nodeId,
           conversationNodeId: nodeId,
           error: null,
@@ -651,20 +865,48 @@ export function NativeCanvasWorkspace({
     }
   }, [adapter, stateKey, store, target.canvasId, target.projectId, updateNativeCanvasState])
 
+  React.useEffect(() => {
+    if (!adapter.rebuildCanvasAgentNode || !conversationNode || !conversationNodeIssue) {
+      rebuildCommandRef.current = null
+      setRebuildState({ loading: false, error: null })
+      return
+    }
+    /** 每个问题节点独占重建 operation，切换节点或 Canvas 后立即取消旧 UI 回调。 */
+    const command = createCanvasAgentNodeRebuildController({
+      target: { ...target, nodeId: conversationNode.id },
+      rebuildAgentNode: adapter.rebuildCanvasAgentNode,
+      createId: () => window.crypto.randomUUID(),
+      onStateChange: setRebuildState,
+      onSuccess: (result) => updateNativeCanvasState({
+        key: stateKey,
+        update: createRebuiltNativeCanvasStateUpdate(result, conversationNode.id),
+      }),
+    })
+    rebuildCommandRef.current = command
+    return () => {
+      command.cancel()
+      if (rebuildCommandRef.current === command) rebuildCommandRef.current = null
+    }
+  }, [
+    adapter.rebuildCanvasAgentNode,
+    conversationNode,
+    conversationNodeIssue,
+    stateKey,
+    target,
+    updateNativeCanvasState,
+  ])
+
   /** 创建期间要求权威快照无本地待提交变更，避免立即制造 revision conflict。 */
   const canCreateAgent = Boolean(
     adapter.createCanvasAgentNode
     && state.snapshot
+    && state.snapshot.writable
     && state.saveState === 'saved'
     && state.pendingMutations.length === 0
     && state.inFlightMutations.length === 0
     && state.authoritativeRecoveryState === 'idle'
     && !createState.loading,
   )
-  /** 对话节点始终从当前 Canvas 权威内存文档解析，不保存 Renderer sessionId。 */
-  const conversationNode = state.snapshot?.document.nodes.find((node) => (
-    node.id === state.conversationNodeId && node.kind === 'agent'
-  ))
   /** 三个 API 缺一即 fail closed，不展示无法完整控制的对话面板。 */
   const conversationAdapter: CanvasAgentConversationAdapter | null = adapter.getCanvasAgentMessages
     && adapter.sendCanvasAgentMessage
@@ -677,6 +919,155 @@ export function NativeCanvasWorkspace({
     : null
   /** 保持生产默认组件不变，同时允许测试捕获 Workspace 提供的真实回调。 */
   const ConversationRenderer = conversationRenderer ?? CanvasAgentConversation
+  /** 恢复、冲突以外的稳定状态允许结构命令。 */
+  const workspaceWritable = Boolean(
+    state.snapshot?.writable
+    && state.authoritativeRecoveryState === 'idle'
+    && state.saveState !== 'conflict',
+  )
+  /** 删除只要求存在当前节点和可写快照，主进程继续复核运行态。 */
+  const canDeleteNode = workspaceWritable && selectedNode !== undefined && !deleteSubmitting
+  /** 当前节点删除会同步移除的关联边数量。 */
+  const connectedEdgeCount = state.snapshot && selectedNode
+    ? getNativeCanvasConnectedEdgeCount(state.snapshot.document, selectedNode.id)
+    : 0
+
+  /** 关闭右侧面板时同步清理选区，避免迟到 selection change 立即重开。 */
+  const closeConversationPanel = React.useCallback((): void => {
+    updateNativeCanvasState({
+      key: stateKey,
+      update: createClosedNativeCanvasConversationUpdate(),
+    })
+  }, [stateKey, updateNativeCanvasState])
+
+  /** 打开统一删除确认框，并清理上一次停止错误。 */
+  const requestSelectedNodeDelete = React.useCallback((): void => {
+    if (!canDeleteNode) return
+    setDeleteError(null)
+    setDeleteDialogOpen(true)
+  }, [canDeleteNode])
+
+  /** 提交单一 remove-nodes mutation，并同步关闭目标节点面板。 */
+  const commitNodeDelete = React.useCallback((nodeId: string): void => {
+    controllerRef.current?.enqueueMutation({ type: 'remove-nodes', nodeIds: [nodeId] })
+    updateNativeCanvasState({
+      key: stateKey,
+      update: (current) => ({
+        selectedNodeId: current.selectedNodeId === nodeId ? null : current.selectedNodeId,
+        conversationNodeId: current.conversationNodeId === nodeId ? null : current.conversationNodeId,
+      }),
+    })
+    setPendingStopDelete(null)
+    setDeleteSubmitting(false)
+    setDeleteError(null)
+    setDeleteDialogOpen(false)
+  }, [stateKey, updateNativeCanvasState])
+
+  React.useEffect(() => {
+    if (!pendingStopDelete?.stopAccepted) return
+    if (pendingStopDelete.canvasKey !== stateKey) {
+      setPendingStopDelete(null)
+      setDeleteSubmitting(false)
+      return
+    }
+    if (runningSessionIds.has(pendingStopDelete.sessionId)) return
+    /** 停止完成后再次读取当前 keyed 状态，防止切换 Canvas 或重建换绑后误删。 */
+    const latest = store.get(nativeCanvasStatesAtom).get(stateKey)
+    const latestNode = latest?.snapshot?.document.nodes.find((node) => (
+      node.id === pendingStopDelete.nodeId && node.kind === 'agent'
+    ))
+    if (!isPendingCanvasStopDeleteCurrent(pendingStopDelete, stateKey, latestNode)) {
+      setPendingStopDelete(null)
+      setDeleteSubmitting(false)
+      setDeleteDialogOpen(false)
+      return
+    }
+    commitNodeDelete(pendingStopDelete.nodeId)
+  }, [commitNodeDelete, pendingStopDelete, runningSessionIds, stateKey, store])
+
+  /** 删除确认的唯一执行入口，运行节点等待权威终态后再删除。 */
+  const confirmSelectedNodeDelete = React.useCallback((
+    mode: 'delete' | 'stop-and-delete',
+  ): void => {
+    if (!selectedNode || !workspaceWritable) return
+    if (mode === 'delete') {
+      commitNodeDelete(selectedNode.id)
+      return
+    }
+    if (selectedNode.kind !== 'agent' || !adapter.stopCanvasAgent) {
+      setDeleteError('停止失败，节点未删除。')
+      return
+    }
+    /** 当前停止请求绑定节点和 session，重建换绑后不会删除新会话节点。 */
+    const pending = {
+      canvasKey: stateKey,
+      nodeId: selectedNode.id,
+      sessionId: selectedNode.agentSessionId,
+      stopAccepted: false,
+    }
+    /** 当前代次只允许更新发起停止时的 Canvas。 */
+    const deleteGeneration = deleteGenerationRef.current
+    setDeleteSubmitting(true)
+    setDeleteError(null)
+    setPendingStopDelete(pending)
+    void adapter.stopCanvasAgent({ ...target, nodeId: selectedNode.id }).then(() => {
+      if (deleteGenerationRef.current !== deleteGeneration) return
+      setPendingStopDelete((current) => current
+        && current.canvasKey === pending.canvasKey
+        && current.nodeId === pending.nodeId
+        && current.sessionId === pending.sessionId
+        ? { ...current, stopAccepted: true }
+        : current)
+    }).catch((error: unknown) => {
+      if (deleteGenerationRef.current !== deleteGeneration) return
+      setPendingStopDelete(null)
+      setDeleteSubmitting(false)
+      setDeleteError(getNativeCanvasOperationErrorMessage('stop', error))
+    })
+  }, [adapter.stopCanvasAgent, commitNodeDelete, selectedNode, stateKey, target, workspaceWritable])
+
+  React.useEffect(() => {
+    /** Delete/Backspace 与工具栏共用确认入口，编辑控件内部按键不拦截。 */
+    const handleDeleteShortcut = (event: KeyboardEvent): void => {
+      if (!isNativeCanvasDeleteShortcut({
+        key: event.key,
+        target: event.target as EventTarget & { closest?: (selector: string) => unknown },
+      })) return
+      if (!canDeleteNode || deleteDialogOpen) return
+      event.preventDefault()
+      requestSelectedNodeDelete()
+    }
+    window.addEventListener('keydown', handleDeleteShortcut)
+    return () => window.removeEventListener('keydown', handleDeleteShortcut)
+  }, [canDeleteNode, deleteDialogOpen, requestSelectedNodeDelete])
+
+  React.useEffect(() => {
+    /** Canvas 身份切换时本地弹窗和待停止删除不得跨工作区延续。 */
+    deleteGenerationRef.current += 1
+    setDeleteDialogOpen(false)
+    setDeleteSubmitting(false)
+    setDeleteError(null)
+    setPendingStopDelete(null)
+  }, [stateKey])
+
+  /** 聚焦第一个问题节点并打开局部恢复面板。 */
+  const focusFirstIssue = React.useCallback((): void => {
+    const issue = state.snapshot?.nodeIssues[0]
+    if (!issue) return
+    updateNativeCanvasState({
+      key: stateKey,
+      update: { selectedNodeId: issue.nodeId, conversationNodeId: issue.nodeId },
+    })
+  }, [state.snapshot?.nodeIssues, stateKey, updateNativeCanvasState])
+
+  /** 重建入口只调用当前问题节点绑定的可取消命令。 */
+  const rebuildConversationNode = React.useCallback((): void => {
+    if (!rebuildCommandRef.current) {
+      setRebuildState({ loading: false, error: '重建功能暂时不可用。' })
+      return
+    }
+    void rebuildCommandRef.current.execute().catch(() => undefined)
+  }, [])
 
   return (
     <section
@@ -687,34 +1078,6 @@ export function NativeCanvasWorkspace({
     >
       <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
         <h1 className="truncate text-sm font-medium text-foreground">{title}</h1>
-        <div className="ml-auto flex min-w-0 items-center gap-2">
-          {createState.error ? (
-            <span className="max-w-64 truncate text-xs text-destructive" role="status">
-              {createState.error}
-            </span>
-          ) : null}
-          <TooltipProvider delayDuration={200} disableHoverableContent>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  aria-label="添加 Agent"
-                  disabled={!canCreateAgent}
-                  onClick={() => { void commandRef.current?.execute().catch(() => undefined) }}
-                >
-                  {createState.loading ? (
-                    <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />
-                  ) : (
-                    <Bot className="size-4" aria-hidden="true" />
-                  )}
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">添加 Agent</TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        </div>
       </header>
       <div className="min-h-0 flex-1">
         {(state.phase === 'idle' || state.phase === 'loading') && !state.snapshot ? (
@@ -731,9 +1094,30 @@ export function NativeCanvasWorkspace({
           </div>
         ) : state.snapshot ? (
           <div ref={canvasViewportRef} className="relative h-full">
+            <NativeCanvasToolbar
+              activeTool={state.activeTool}
+              writable={workspaceWritable}
+              canAdd={canCreateAgent}
+              canDelete={canDeleteNode}
+              issueCount={state.snapshot.nodeIssues.length}
+              onToolChange={(activeTool) => updateNativeCanvasState({
+                key: stateKey,
+                update: { activeTool },
+              })}
+              onAddAgent={() => { void commandRef.current?.execute().catch(() => undefined) }}
+              onDelete={requestSelectedNodeDelete}
+              onFocusFirstIssue={focusFirstIssue}
+            />
             <NativeCanvasGraph
               document={state.snapshot.document}
-              writable={state.authoritativeRecoveryState === 'idle' && state.saveState !== 'conflict'}
+              writable={workspaceWritable}
+              activeTool={state.activeTool}
+              nodeIssues={state.snapshot.nodeIssues}
+              runningSessionIds={runningSessionIds}
+              canExpand={canCreateAgent}
+              onExpand={(sourceNodeId) => {
+                void commandRef.current?.execute({ sourceNodeId }).catch(() => undefined)
+              }}
               selectedNodeId={state.selectedNodeId}
               onMutation={(mutation) => controllerRef.current?.enqueueMutation(mutation)}
               onNodeSelect={(selectedNodeId) => updateNativeCanvasState({
@@ -746,20 +1130,32 @@ export function NativeCanvasWorkspace({
               })}
               flowRenderer={flowRenderer}
             />
-            {conversationNode && conversationAdapter ? (
+            {conversationNode && conversationNodeIssue ? (
+              <CanvasAgentRecoveryPanel
+                key={`${target.projectId}:${target.canvasId}:${conversationNode.id}:recovery`}
+                title={conversationNode.title}
+                rebuilding={rebuildState.loading}
+                error={rebuildState.error}
+                onRebuild={rebuildConversationNode}
+                onDelete={requestSelectedNodeDelete}
+                onClose={closeConversationPanel}
+              />
+            ) : conversationNode && conversationAdapter ? (
               <ConversationRenderer
                 key={`${target.projectId}:${target.canvasId}:${conversationNode.id}`}
                 target={{ ...target, nodeId: conversationNode.id }}
                 title={conversationNode.title}
                 adapter={conversationAdapter}
-                onClose={() => updateNativeCanvasState({
-                  key: stateKey,
-                  update: createClosedNativeCanvasConversationUpdate(),
-                })}
+                onClose={closeConversationPanel}
               />
             ) : null}
+            {createState.error ? (
+              <div className="absolute left-1/2 top-14 z-10 max-w-[calc(100%-1.5rem)] -translate-x-1/2 rounded-[6px] border border-destructive/30 bg-background/95 px-3 py-2 text-xs text-destructive shadow-sm" role="status">
+                {createState.error}
+              </div>
+            ) : null}
             {state.saveState === 'conflict' ? (
-              <div className="absolute inset-x-3 top-3 flex items-center justify-between gap-3 rounded-[8px] border border-destructive/30 bg-background/95 px-3 py-2 shadow-sm">
+              <div className="absolute inset-x-3 top-14 flex items-center justify-between gap-3 rounded-[8px] border border-destructive/30 bg-background/95 px-3 py-2 shadow-sm">
                 <p className="truncate text-xs text-destructive">{state.error}</p>
                 <Button
                   size="sm"
@@ -771,7 +1167,7 @@ export function NativeCanvasWorkspace({
               </div>
             ) : (state.authoritativeRecoveryState === 'failed'
               || (state.saveState === 'failed' && state.authoritativeRecoveryState === 'idle')) ? (
-              <div className="absolute inset-x-3 top-3 flex items-center justify-between gap-3 rounded-[8px] border border-destructive/30 bg-background/95 px-3 py-2 shadow-sm">
+              <div className="absolute inset-x-3 top-14 flex items-center justify-between gap-3 rounded-[8px] border border-destructive/30 bg-background/95 px-3 py-2 shadow-sm">
                 <p className="truncate text-xs text-destructive">{state.error}</p>
                 <Button
                   size="sm"
@@ -789,6 +1185,20 @@ export function NativeCanvasWorkspace({
           </div>
         ) : null}
       </div>
+      <NativeCanvasDeleteDialog
+        open={deleteDialogOpen && selectedNode !== undefined}
+        nodeTitle={selectedNode?.title ?? ''}
+        connectedEdgeCount={connectedEdgeCount}
+        busy={Boolean(selectedNodeBusy)}
+        submitting={deleteSubmitting}
+        error={deleteError}
+        onOpenChange={(open) => {
+          if (deleteSubmitting) return
+          setDeleteDialogOpen(open)
+          if (!open) setDeleteError(null)
+        }}
+        onConfirm={confirmSelectedNodeDelete}
+      />
     </section>
   )
 }

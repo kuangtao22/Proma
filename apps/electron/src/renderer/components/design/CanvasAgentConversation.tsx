@@ -23,6 +23,32 @@ import { AgentMessages } from '@/components/agent/AgentMessages'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
+import { CanvasPublicOperationError } from '@/lib/design-adapter'
+
+/** Canvas Agent 对话三类用户操作。 */
+export type CanvasAgentConversationOperation = 'load' | 'send' | 'stop'
+
+/** 未知异常不得进入界面的固定操作文案。 */
+const CANVAS_AGENT_ERROR_MESSAGES: Record<CanvasAgentConversationOperation, string> = {
+  load: '对话暂时无法加载。',
+  send: '发送失败，请重试。',
+  stop: '停止失败，请重试。',
+}
+
+/**
+ * 将 Canvas Agent 操作异常转换为可公开显示的文案。
+ * @param operation 当前失败的对话操作。
+ * @param error Adapter 或意外运行时抛出的未知异常。
+ * @returns 共享公开错误文案，或不含内部正文的固定回退文案。
+ */
+export function getCanvasAgentConversationErrorMessage(
+  operation: CanvasAgentConversationOperation,
+  error: unknown,
+): string {
+  return error instanceof CanvasPublicOperationError
+    ? error.message
+    : CANVAS_AGENT_ERROR_MESSAGES[operation]
+}
 
 /** 对话组件使用的 Canvas adapter 最小合同。 */
 export interface CanvasAgentConversationAdapter {
@@ -85,18 +111,26 @@ export function createCanvasAgentConversationController(
       dependencies.onSendingChange(true)
       dependencies.onError(null)
       /** 统一恢复本地输入；全局 lifecycle 即使面板已卸载也必须按 token 收口。 */
-      const rejectSend = (error: unknown, preserveRunning: boolean): never => {
+      const rejectSend = (
+        error: unknown,
+        preserveRunning: boolean,
+        publicMessage?: string,
+      ): never => {
         dependencies.onSendRejected?.({ token: userMessageUuid, preserveRunning })
         if (!disposed) {
           dependencies.onComposerChange(composerRestore)
-          dependencies.onError(error instanceof Error ? error.message : '发送失败')
+          dependencies.onError(publicMessage ?? getCanvasAgentConversationErrorMessage('send', error))
         }
         throw error
       }
       const request = dependencies.send(message, userMessageUuid, startedAt).then(
         (result) => {
           if (result.ok) return
-          rejectSend(new Error(result.error.message), result.error.code === 'SESSION_BUSY')
+          rejectSend(
+            new Error(result.error.message),
+            result.error.code === 'SESSION_BUSY',
+            result.error.message,
+          )
         },
         (error: unknown) => rejectSend(error, false),
       ).finally(() => {
@@ -192,7 +226,7 @@ export function CanvasAgentConversation({
     })
     controllerRef.current = controller
     void controller.load().catch((error: unknown) => {
-      if (active) setLoadingError(error instanceof Error ? error.message : '消息加载失败')
+      if (active) setLoadingError(getCanvasAgentConversationErrorMessage('load', error))
     })
     return () => {
       active = false
@@ -241,7 +275,7 @@ export function CanvasAgentConversation({
             <TooltipTrigger asChild>
               <Button type="button" size="icon" variant="ghost" aria-label="停止 Agent" disabled={!running} onClick={() => {
                 void controllerRef.current?.stop().catch((error: unknown) => {
-                  setLocalError(error instanceof Error ? error.message : '停止失败')
+                  setLocalError(getCanvasAgentConversationErrorMessage('stop', error))
                 })
               }}>
                 <Square className="size-4" aria-hidden="true" />

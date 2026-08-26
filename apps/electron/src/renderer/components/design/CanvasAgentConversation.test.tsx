@@ -6,7 +6,9 @@ import type { CanvasAgentMessagesResult } from '@proma/shared'
 import {
   CanvasAgentConversation,
   createCanvasAgentConversationController,
+  getCanvasAgentConversationErrorMessage,
 } from './CanvasAgentConversation'
+import { CanvasPublicOperationError } from '@/lib/design-adapter'
 import {
   canvasAgentLifecycleAtom,
   canvasAgentOwnersAtom,
@@ -24,6 +26,26 @@ function createResult(): CanvasAgentMessagesResult {
 }
 
 describe('Canvas Agent 对话', () => {
+  test('Given API 异常含内部正文 When 生成界面错误 Then 只保留固定公开文案', () => {
+    const internalError = new Error(
+      'Error invoking remote method /Users/name 11111111-1111-4111-8111-111111111111',
+    )
+
+    expect(getCanvasAgentConversationErrorMessage('load', internalError)).toBe('对话暂时无法加载。')
+    expect(getCanvasAgentConversationErrorMessage('send', internalError)).toBe('发送失败，请重试。')
+    expect(getCanvasAgentConversationErrorMessage('stop', internalError)).toBe('停止失败，请重试。')
+  })
+
+  test('Given Adapter 已提供公开错误 When 生成界面错误 Then 允许显示共享安全文案', () => {
+    const publicError = new CanvasPublicOperationError(
+      'CANVAS_AGENT_SEND_FAILED',
+      '消息发送失败，请重试。',
+    )
+
+    expect(getCanvasAgentConversationErrorMessage('send', publicError))
+      .toBe('消息发送失败，请重试。')
+  })
+
   test('Given 面板首次打开 When load Then 按需读取一次且关闭不触发 stop', async () => {
     const calls: string[] = []
     const controller = createCanvasAgentConversationController({
@@ -65,7 +87,7 @@ describe('Canvas Agent 对话', () => {
     await expect(first).rejects.toThrow('会话正在运行')
     expect(composer).toEqual(['', '保留这段内容'])
     expect(sending).toEqual([true, false])
-    expect(errors).toEqual([null, '会话正在运行'])
+    expect(errors).toEqual([null, '发送失败，请重试。'])
     expect(controller.getComposerRestore()).toBe('保留这段内容')
   })
 
