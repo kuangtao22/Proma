@@ -67,6 +67,8 @@ import {
   canvasAgentOwnersAtom,
   canvasAgentInternalInvalidSessionIdsAtom,
   canvasAgentLifecycleAtom,
+  canvasAgentOpenSessionIdsAtom,
+  canvasAgentRunningSessionIdsAtom,
   createNativeCanvasKey,
   updateNativeCanvasStateAtom,
 } from '@/atoms/native-canvas-atoms'
@@ -77,7 +79,7 @@ import { channelsAtom } from '@/atoms/chat-atoms'
 import { previewFileMapAtom } from '@/atoms/preview-atoms'
 import type { NotificationSoundType } from '@/types/settings'
 import { toast } from 'sonner'
-import type { AgentStreamEvent, AgentStreamCompletePayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, SDKAssistantMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock } from '@proma/shared'
+import type { AgentStreamEvent, AgentStreamCompletePayload, AgentStreamErrorPayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, SDKAssistantMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock } from '@proma/shared'
 import { inferContextWindow } from '@proma/shared'
 import { buildExternalAgentRunActivation, shouldActivateExternalAgentRun } from '@/lib/external-agent-run'
 import { upsertAgentSession, mergeFetchedAgentSessions } from '@/lib/agent-session-list'
@@ -1429,11 +1431,47 @@ export function useGlobalAgentListeners(): void {
         }
         }) // unstable_batchedUpdates
     }
-    /** bootstrap gate 统一承载流式与标题事件，保证跨类型到达顺序。 */
+    /** 按权威 metadata 处理错误；Canvas 错误禁止触发普通消息刷新。 */
+    const handleAgentError = (data: AgentStreamErrorPayload): void => {
+      unstable_batchedUpdates(() => {
+        console.error('[GlobalAgentListeners] 流式错误:', data.error)
+        const route = resolveCanvasAgentCompletion(
+          data.sessionId,
+          data.session,
+          store.get(canvasAgentInternalInvalidSessionIdsAtom).has(data.sessionId),
+        )
+        if (route.kind === 'internal-invalid') {
+          store.set(canvasAgentLifecycleAtom, {
+            type: 'invalidated', sessionId: data.sessionId, terminal: false,
+          })
+          return
+        }
+        if (route.kind === 'canvas') {
+          store.set(canvasAgentLifecycleAtom, { type: 'owner-updated', owner: route.owner })
+        }
+        store.set(agentStreamErrorsAtom, (prev) => {
+          const map = new Map(prev)
+          map.set(data.sessionId, data.error)
+          return map
+        })
+        if (route.kind === 'canvas') return
+        const state = store.get(agentStreamingStatesAtom).get(data.sessionId)
+        if (!state?.running) {
+          store.set(agentMessageRefreshAtom, (prev) => {
+            const map = new Map(prev)
+            map.set(data.sessionId, (prev.get(data.sessionId) ?? 0) + 1)
+            return map
+          })
+        }
+      })
+    }
+
+    /** bootstrap gate 统一承载流式、标题、错误与完成事件，保证跨类型到达顺序。 */
     type CanvasBootstrapEvent =
       | { type: 'stream'; sessionId: string; value: AgentStreamEvent }
       | { type: 'title'; sessionId: string; value: { sessionId: string; title: string } }
       | { type: 'complete'; sessionId: string; value: AgentStreamCompletePayload }
+      | { type: 'error'; sessionId: string; value: AgentStreamErrorPayload }
 
     /** 标题事件的真实处理器；Canvas 标题只更新 owner，不接触普通 tab 或会话列表。 */
     const handleTitleUpdated = ({ sessionId, title }: { sessionId: string; title: string }): void => {
@@ -1468,14 +1506,12 @@ export function useGlobalAgentListeners(): void {
       classify: (event) => {
         const { sessionId } = event
         /** completion 携带主进程权威 metadata 时优先分类；缺失时等待 bootstrap 恢复。 */
-        if (event.type === 'complete') {
-          const cachedOwner = store.get(canvasAgentOwnersAtom).get(sessionId)
+        if (event.type === 'complete' || event.type === 'error') {
           const knownInvalid = store.get(canvasAgentInternalInvalidSessionIdsAtom).has(sessionId)
-          if (event.value.session === undefined && !cachedOwner && !knownInvalid) return 'unknown'
+          if (event.value.session === undefined) return 'unknown'
           return resolveCanvasAgentCompletion(
             sessionId,
             event.value.session,
-            cachedOwner,
             knownInvalid,
           ).kind
         }
@@ -1487,11 +1523,13 @@ export function useGlobalAgentListeners(): void {
       dispatch: (event) => {
         if (event.type === 'stream') handleStreamEvent(event.value)
         else if (event.type === 'title') handleTitleUpdated(event.value)
-        else handleAgentComplete(event.value)
+        else if (event.type === 'complete') handleAgentComplete(event.value)
+        else handleAgentError(event.value)
       },
-      allowUnknownAfterReady: (event) => event.type !== 'complete',
-      allowInternalInvalid: (event) => event.type === 'complete',
-      isTerminalEvent: (event) => event.type === 'complete',
+      allowUnknownAfterReady: (event) => event.type !== 'complete' && event.type !== 'error',
+      allowInternalInvalid: (event) => event.type === 'complete' || event.type === 'error',
+      isTerminalEvent: (event) => event.type === 'complete' || event.type === 'error',
+      getTerminalEventKey: (event) => `${event.type}:${event.sessionId}`,
     })
 
     /** 单次本地主进程快照恢复 active Canvas owner，失败时未知事件持续 fail closed。 */
@@ -1525,11 +1563,10 @@ export function useGlobalAgentListeners(): void {
         const backgroundTasksPending = data.backgroundTasksPending === true
         const hasStreamError = store.get(agentStreamErrorsAtom).has(data.sessionId)
 
-        /** 明确 metadata 优先于缓存；只有 payload 缺失 metadata 时才允许已验证 owner fallback。 */
+        /** completion 只信任 payload 的权威 metadata；缺失或损坏时 fail closed。 */
         const completionRoute = resolveCanvasAgentCompletion(
           data.sessionId,
           data.session,
-          store.get(canvasAgentOwnersAtom).get(data.sessionId),
           store.get(canvasAgentInternalInvalidSessionIdsAtom).has(data.sessionId),
         )
         if (completionRoute.kind === 'internal-invalid') {
@@ -1685,6 +1722,25 @@ export function useGlobalAgentListeners(): void {
         if (isCanvasAgentCompletion) {
           if (canvasOwner && !backgroundTasksPending) {
             store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: data.sessionId })
+            /** 打开面板先以权威 JSONL 接管最终消息，再释放 live/error/stream。 */
+            if (store.get(canvasAgentOpenSessionIdsAtom).has(data.sessionId)) {
+              void window.electronAPI.getCanvasAgentMessages({
+                projectId: canvasOwner.projectId,
+                canvasId: canvasOwner.canvasId,
+                nodeId: canvasOwner.nodeId,
+              }).then((result) => {
+                if (!store.get(canvasAgentOpenSessionIdsAtom).has(data.sessionId)) return
+                if (store.get(canvasAgentRunningSessionIdsAtom).has(data.sessionId)) return
+                store.set(canvasAgentLifecycleAtom, {
+                  type: 'opened',
+                  owner: { sessionId: result.sessionId, ...result.owner },
+                  messages: result.messages,
+                })
+                store.set(canvasAgentLifecycleAtom, { type: 'settled', sessionId: data.sessionId })
+              }).catch((error: unknown) => {
+                console.error('[GlobalAgentListeners] Canvas Agent 最终消息交接失败:', error)
+              })
+            }
           }
           return
         }
@@ -1787,27 +1843,10 @@ export function useGlobalAgentListeners(): void {
 
     // ===== 3. 流式错误 =====
     const cleanupError = window.electronAPI.onAgentStreamError(
-      (data: { sessionId: string; error: string }) => {
-        unstable_batchedUpdates(() => {
-        console.error('[GlobalAgentListeners] 流式错误:', data.error)
-
-        // 存储错误消息
-        store.set(agentStreamErrorsAtom, (prev) => {
-          const map = new Map(prev)
-          map.set(data.sessionId, data.error)
-          return map
+      (data: AgentStreamErrorPayload) => {
+        canvasAgentBootstrapGate.handle({
+          type: 'error', sessionId: data.sessionId, value: data,
         })
-
-        // 递增消息刷新版本号，通知 AgentView 重新加载消息
-        const state = store.get(agentStreamingStatesAtom).get(data.sessionId)
-        if (!state?.running) {
-          store.set(agentMessageRefreshAtom, (prev) => {
-            const map = new Map(prev)
-            map.set(data.sessionId, (prev.get(data.sessionId) ?? 0) + 1)
-            return map
-          })
-        }
-        }) // unstable_batchedUpdates
       }
     )
 

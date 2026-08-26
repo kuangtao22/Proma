@@ -2,7 +2,9 @@ import { AGENT_IPC_CHANNELS } from '@proma/shared'
 import type {
   AgentSendInput,
   AgentSessionMeta,
+  AgentStreamErrorPayload,
   AgentStreamCompletePayload,
+  AgentStreamSessionMeta,
 } from '@proma/shared'
 
 type AgentStreamCompletionPayloadDetails = Omit<
@@ -26,11 +28,41 @@ export interface AgentStreamCompleteTarget {
 export function selectAgentCompletionSessionMeta(
   sessionId: string,
   getSession: (sessionId: string) => AgentSessionMeta | undefined,
-): AgentSessionMeta | undefined {
+): AgentStreamSessionMeta | undefined {
   const session = getSession(sessionId)
   if (!session) return undefined
-  const { piEntryBindings: _piEntryBindings, ...meta } = session
+  /** 只先建立全部会话共有字段，其余可选字段逐项复制。 */
+  const meta: AgentStreamSessionMeta = {
+    id: session.id,
+    title: session.title,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+  }
+  if (session.workspaceId !== undefined) meta.workspaceId = session.workspaceId
+  if (session.sourceAutomationId !== undefined) meta.sourceAutomationId = session.sourceAutomationId
+  if (session.sourceDesignProjectId !== undefined) meta.sourceDesignProjectId = session.sourceDesignProjectId
+  if (session.sourceDesignJobId !== undefined) meta.sourceDesignJobId = session.sourceDesignJobId
+  if (session.sourceCanvasProjectId !== undefined) meta.sourceCanvasProjectId = session.sourceCanvasProjectId
+  if (session.sourceCanvasId !== undefined) meta.sourceCanvasId = session.sourceCanvasId
+  if (session.sourceCanvasNodeId !== undefined) meta.sourceCanvasNodeId = session.sourceCanvasNodeId
+  if (session.automationGraduated !== undefined) meta.automationGraduated = session.automationGraduated
+  if (session.parentSessionId !== undefined) meta.parentSessionId = session.parentSessionId
+  if (session.rootSessionId !== undefined) meta.rootSessionId = session.rootSessionId
+  if (session.sourceDelegationId !== undefined) meta.sourceDelegationId = session.sourceDelegationId
+  if (session.delegationRole !== undefined) meta.delegationRole = session.delegationRole
+  if (session.delegationStatus !== undefined) meta.delegationStatus = session.delegationStatus
+  if (session.delegationDepth !== undefined) meta.delegationDepth = session.delegationDepth
+  if (session.delegationGoal !== undefined) meta.delegationGoal = session.delegationGoal
   return meta
+}
+
+/** 使用与 completion 相同的公开元数据构造流式错误载荷。 */
+export function buildAuthoritativeAgentStreamErrorPayload(
+  sessionId: string,
+  error: string,
+  getSession: (sessionId: string) => AgentSessionMeta | undefined,
+): AgentStreamErrorPayload {
+  return { sessionId, error, session: selectAgentCompletionSessionMeta(sessionId, getSession) }
 }
 
 function buildAgentStreamCompletePayload(

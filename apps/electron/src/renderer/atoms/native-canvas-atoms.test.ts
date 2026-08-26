@@ -13,6 +13,11 @@ import {
   nativeCanvasStatesAtom,
   updateNativeCanvasStateAtom,
 } from './native-canvas-atoms'
+import {
+  agentSessionStreamingStateAtomFamily,
+  agentStreamErrorsAtom,
+  liveMessagesMapAtom,
+} from './agent-atoms'
 
 describe('原生 Canvas 状态隔离', () => {
   test('Given 两个 Canvas When 更新其中一个 Then pending、错误与选区不会串用', () => {
@@ -189,5 +194,54 @@ describe('原生 Canvas 状态隔离', () => {
 
     expect(store.get(canvasAgentOwnersAtom).has(owner.sessionId)).toBe(true)
     expect(store.get(canvasAgentRunningSessionIdsAtom).has(owner.sessionId)).toBe(true)
+  })
+
+  test('Given 120 个已关闭 Canvas session When hard completion 收口 Then 所有运行时 Map 最终有界', () => {
+    const store = createStore()
+    for (let index = 0; index < 120; index += 1) {
+      const sessionId = `closed-${index}`
+      const owner = {
+        sessionId, projectId: 'project-a', canvasId: 'canvas-a', nodeId: `node-${index}`, title: 'Agent',
+      }
+      store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+      store.set(canvasAgentLifecycleAtom, { type: 'started', owner })
+      store.set(liveMessagesMapAtom, (previous) => new Map(previous).set(sessionId, []))
+      store.set(agentStreamErrorsAtom, (previous) => new Map(previous).set(sessionId, '旧错误'))
+      store.set(agentSessionStreamingStateAtomFamily(sessionId), { running: true })
+      store.set(canvasAgentLifecycleAtom, { type: 'closed', sessionId })
+      store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId })
+    }
+
+    expect(store.get(liveMessagesMapAtom).size).toBe(0)
+    expect(store.get(agentStreamErrorsAtom).size).toBe(0)
+    expect(store.get(canvasAgentOwnersAtom).size).toBe(0)
+    expect(store.get(canvasAgentPersistedMessagesAtom).size).toBe(0)
+    expect(store.get(canvasAgentRunningSessionIdsAtom).size).toBe(0)
+  })
+
+  test('Given 打开的 Canvas session hard completion When 权威 GET 交接 Then 最终 assistant 保留且 live/error/stream 清理', () => {
+    const store = createStore()
+    const owner = {
+      sessionId: 'opened-final', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent',
+    }
+    const finalMessages = [{
+      type: 'assistant' as const,
+      message: { content: [{ type: 'text' as const, text: '最终结果' }] },
+    }]
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner })
+    store.set(liveMessagesMapAtom, new Map([[owner.sessionId, finalMessages]]))
+    store.set(agentStreamErrorsAtom, new Map([[owner.sessionId, '旧错误']]))
+    store.set(agentSessionStreamingStateAtomFamily(owner.sessionId), { running: true })
+
+    store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: owner.sessionId })
+    expect(store.get(liveMessagesMapAtom).has(owner.sessionId)).toBe(true)
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: finalMessages })
+    store.set(canvasAgentLifecycleAtom, { type: 'settled', sessionId: owner.sessionId })
+
+    expect(store.get(canvasAgentPersistedMessagesAtom).get(owner.sessionId)).toEqual(finalMessages)
+    expect(store.get(liveMessagesMapAtom).has(owner.sessionId)).toBe(false)
+    expect(store.get(agentStreamErrorsAtom).has(owner.sessionId)).toBe(false)
+    expect(store.get(agentSessionStreamingStateAtomFamily(owner.sessionId))).toBeUndefined()
   })
 })

@@ -164,3 +164,4 @@
 - 2026-08-26：修复 Canvas Agent renderer reload 归属恢复、损坏 completion 旧缓存 fallback、完成通知未切 Design 视图、切节点 SEND 迟到回调污染和 owner/messages 无界生命周期；active-run bootstrap、事件 gate 与 Jotai lifecycle 均有 BDD 回归覆盖。
 - 2026-08-26：Canvas Agent completion 的正常与早期异常路径统一携带主进程权威轻量 metadata，所有 completion 进入 bootstrap gate；SEND 准入拒绝的全局 lifecycle 收口不再依赖已卸载 UI，open/running 消息完整保真，active invalid 与有界 terminal tombstone 分层管理。
 - 2026-08-26：补齐 headless completion 异常路径的权威 metadata，统一四条 completion producer；soft completion 不再提前结束合法或损坏 Canvas 运行，bootstrap gate 改为 O(1) 环形流缓冲与独立有界终态缓冲，token 洪峰不再淘汰 completion。
+- 2026-08-26：Agent completion/error 跨 IPC 只允许显式公开 metadata 白名单，缺 metadata 不再使用 Renderer owner fallback；Canvas error 与 completion 共用 bootstrap gate，面板 busy 同时服从 active-run 快照和 stream state，hard completion 先由权威 JSONL 接管最终消息，再在 closed/settled 边界回收 live/error/stream 状态。

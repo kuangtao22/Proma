@@ -61,14 +61,14 @@ export function replaceAgentSessionInFreshnessOrder(
  */
 export function upsertAgentSession(
   sessions: readonly AgentSessionMeta[],
-  incoming: AgentSessionMeta,
+  incoming: Pick<AgentSessionMeta, 'id' | 'title' | 'createdAt' | 'updatedAt'> & Partial<AgentSessionMeta>,
 ): AgentSessionMeta[] {
   /** 增量事件到达前可能已有旧版本残留，先收敛为用户可见集合。 */
   const visibleSessions = sessions.filter(isRendererVisibleAgentSession)
   const existing = visibleSessions.find((session) => session.id === incoming.id)
   const merged: AgentSessionMeta = existing
     ? { ...existing, ...incoming }
-    : incoming
+    : incoming as AgentSessionMeta
   const others = visibleSessions.filter((session) => session.id !== incoming.id)
   if (!isRendererVisibleAgentSession(merged)) return sortAgentSessionsByUpdatedAtDesc(others)
   return sortAgentSessionsByUpdatedAtDesc([merged, ...others])

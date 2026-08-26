@@ -11,10 +11,12 @@ import { LoaderCircle, Send, Square, X } from 'lucide-react'
 import {
   agentSessionStreamingStateAtomFamily,
   agentStreamErrorsAtom,
+  clearAgentStreamError,
 } from '@/atoms/agent-atoms'
 import {
   canvasAgentLifecycleAtom,
   canvasAgentPersistedMessagesAtom,
+  canvasAgentRunningSessionIdsAtom,
 } from '@/atoms/native-canvas-atoms'
 import { AgentMessages } from '@/components/agent/AgentMessages'
 import { Button } from '@/components/ui/button'
@@ -37,6 +39,8 @@ export interface CanvasAgentConversationControllerDependencies {
   onComposerChange: (value: string) => void
   onSendingChange: (sending: boolean) => void
   onError: (error: string | null) => void
+  /** 返回主进程快照和流事件合成后的权威忙碌状态。 */
+  isBusy: () => boolean
   /** SEND Promise reject 时无条件收口对应 session 的全局伪运行 lifecycle。 */
   onSendRejected?: () => void
 }
@@ -74,6 +78,7 @@ export function createCanvasAgentConversationController(
     },
     send: (message, userMessageUuid, startedAt) => {
       if (sendPromise) return sendPromise
+      if (dependencies.isBusy()) return Promise.resolve()
       composerRestore = message
       dependencies.onComposerChange('')
       dependencies.onSendingChange(true)
@@ -127,7 +132,13 @@ export function CanvasAgentConversation({
   const updateLifecycle = useSetAtom(canvasAgentLifecycleAtom)
   const persistedMessagesMap = useAtomValue(canvasAgentPersistedMessagesAtom)
   const streamErrors = useAtomValue(agentStreamErrorsAtom)
+  /** 新 SEND 前清除该会话上一轮错误。 */
+  const setStreamErrors = useSetAtom(agentStreamErrorsAtom)
+  /** reload 快照恢复的 Canvas 权威运行集合。 */
+  const runningSessionIds = useAtomValue(canvasAgentRunningSessionIdsAtom)
   const streamState = useAtomValue(agentSessionStreamingStateAtomFamily(sessionId ?? ''))
+  /** controller 通过 ref 读取最新权威 busy，避免只依赖按钮 disabled。 */
+  const busyRef = React.useRef(false)
   const controllerRef = React.useRef<CanvasAgentConversationController | null>(null)
 
   React.useEffect(() => {
@@ -148,6 +159,7 @@ export function CanvasAgentConversation({
         ...currentTarget, message, userMessageUuid, startedAt,
       }),
       stop: () => stopCanvasAgent(currentTarget),
+      isBusy: () => busyRef.current,
       onLoaded: (result) => {
         /** GET 返回的主进程 owner 成为未打开 Canvas 事件路由的 O(1) 本地索引。 */
         const owner: CanvasAgentOwner = {
@@ -182,19 +194,26 @@ export function CanvasAgentConversation({
   /** 提交当前纯文本；失败时恢复原文，避免用户输入丢失。 */
   const submit = React.useCallback((): void => {
     const message = composer.trim()
-    if (!message || sending || !messagesLoaded || !sessionId) return
+    if (!message || busyRef.current || !messagesLoaded || !sessionId) return
     const controller = controllerRef.current
     if (!controller) return
+    setStreamErrors((prev) => clearAgentStreamError(prev, sessionId))
     updateLifecycle({
       type: 'started',
       owner: { sessionId, projectId, canvasId, nodeId, title },
     })
     void controller.send(message, window.crypto.randomUUID(), Date.now()).catch(() => undefined)
-  }, [canvasId, composer, messagesLoaded, nodeId, projectId, sending, sessionId, title, updateLifecycle])
+  }, [canvasId, composer, messagesLoaded, nodeId, projectId, sessionId, setStreamErrors, title, updateLifecycle])
 
   const persistedMessages = sessionId ? persistedMessagesMap.get(sessionId) ?? [] : []
   const visibleError = localError ?? (sessionId ? streamErrors.get(sessionId) ?? null : null)
-  const running = streamState?.running === true
+  /** stream 与 bootstrap 任一仍忙时均保持 STOP 可用、SEND 禁用。 */
+  const running = sessionId !== null && (
+    runningSessionIds.has(sessionId) || streamState?.running === true || streamState?.backgroundWaiting === true
+  )
+  /** 本地 IPC 发送期与权威运行态的统一忙碌值。 */
+  const busy = sending || running
+  busyRef.current = busy
 
   return (
     <aside className="absolute inset-y-0 right-0 z-20 flex w-full max-w-[min(28rem,100%)] flex-col border-l border-border bg-background shadow-lg">
@@ -243,7 +262,7 @@ export function CanvasAgentConversation({
             aria-label="Canvas Agent 消息输入"
             value={composer}
             rows={2}
-            disabled={sending || !messagesLoaded || !sessionId}
+            disabled={busy || !messagesLoaded || !sessionId}
             className="min-h-16 min-w-0 flex-1 resize-none rounded-[6px] border border-input bg-background px-3 py-2 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
             onChange={(event) => setComposer(event.target.value)}
             onKeyDown={(event) => {
@@ -256,7 +275,7 @@ export function CanvasAgentConversation({
           <TooltipProvider delayDuration={200} disableHoverableContent>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button type="button" size="icon" aria-label="发送消息" disabled={sending || !messagesLoaded || !sessionId || composer.trim().length === 0} onClick={submit}>
+                <Button type="button" size="icon" aria-label="发送消息" disabled={busy || !messagesLoaded || !sessionId || composer.trim().length === 0} onClick={submit}>
                   {sending ? <LoaderCircle className="size-4 animate-spin" aria-hidden="true" /> : <Send className="size-4" aria-hidden="true" />}
                 </Button>
               </TooltipTrigger>

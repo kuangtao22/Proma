@@ -1,4 +1,4 @@
-import type { AgentSessionMeta } from '@proma/shared'
+import type { AgentStreamSessionMeta } from '@proma/shared'
 
 /** Renderer 可公开持有的最小 Canvas Agent owner，不包含路径或存储形态。 */
 export interface CanvasAgentOwner {
@@ -29,6 +29,8 @@ export interface CanvasAgentBootstrapGateOptions<T extends { sessionId: string }
   allowInternalInvalid?: (event: T) => boolean
   /** 标识不能被 stream/title 洪峰淘汰的 session 终态事件。 */
   isTerminalEvent?: (event: T) => boolean
+  /** 同一 session 存在多类关键事件时提供独立 coalesce key。 */
+  getTerminalEventKey?: (event: T) => string
 }
 
 /** renderer reload 期间未知事件的有界暂存入口。 */
@@ -76,13 +78,15 @@ export function createCanvasAgentBootstrapGate<T extends { sessionId: string }>(
 
   /** O(1) 按 session 覆盖终态；只有终态洪峰自身能触发终态 LRU 淘汰。 */
   const bufferTerminalEvent = (event: T): void => {
-    if (bufferedTerminalEvents.has(event.sessionId)) {
-      bufferedTerminalEvents.delete(event.sessionId)
+    /** 默认仍按 session 合并；错误与完成可由调用方提供不同类型键。 */
+    const key = options.getTerminalEventKey?.(event) ?? event.sessionId
+    if (bufferedTerminalEvents.has(key)) {
+      bufferedTerminalEvents.delete(key)
     } else if (bufferedTerminalEvents.size >= maxBufferedTerminalEvents) {
       const oldestSessionId = bufferedTerminalEvents.keys().next().value
       if (oldestSessionId !== undefined) bufferedTerminalEvents.delete(oldestSessionId)
     }
-    bufferedTerminalEvents.set(event.sessionId, event)
+    bufferedTerminalEvents.set(key, event)
   }
 
   /** 清空 pending 缓冲，供成功重放后或永久失败时释放引用。 */
@@ -144,14 +148,14 @@ const CANVAS_EXCLUSIVE_OWNERSHIP_FIELDS = [
   'delegationStatus',
   'delegationDepth',
   'delegationGoal',
-] as const satisfies readonly (keyof AgentSessionMeta)[]
+] as const satisfies readonly (keyof AgentStreamSessionMeta)[]
 
 /**
  * 根据主进程安全 metadata 纯函数路由 Agent 事件。
  * @param session 完成事件或启动事件携带的轻量会话元数据。
  * @returns 完整 Canvas 归属才进入内部路径，损坏元数据 fail closed 为普通不可提升路径。
  */
-export function routeCanvasAgentEvent(session: AgentSessionMeta | undefined): CanvasAgentEventRoute {
+export function routeCanvasAgentEvent(session: AgentStreamSessionMeta | undefined): CanvasAgentEventRoute {
   if (!session) return { kind: 'agent' }
   const hasCanvasSource = session.sourceCanvasProjectId !== undefined
     || session.sourceCanvasId !== undefined
@@ -188,20 +192,17 @@ export function routeCanvasAgentEvent(session: AgentSessionMeta | undefined): Ca
  * 解析 completion 的 Canvas 归属，明确 metadata 永远优先于旧缓存。
  * @param sessionId completion 会话 ID。
  * @param session completion 携带的安全 metadata，缺失表示旧协议或异常路径。
- * @param cachedOwner Renderer 已验证的 owner 缓存。
- * @returns 损坏 metadata fail closed；仅 metadata 缺失时允许使用缓存。
+ * @returns 损坏或缺失 metadata 均 fail closed，禁止使用 Renderer 缓存提升权限。
  */
 export function resolveCanvasAgentCompletion(
   sessionId: string,
-  session: AgentSessionMeta | undefined,
-  cachedOwner: CanvasAgentOwner | undefined,
+  session: AgentStreamSessionMeta | undefined,
   knownInternalInvalid = false,
 ): CanvasAgentEventRoute {
+  if (session === undefined) return { kind: 'internal-invalid' }
+  if (session.id !== sessionId) return { kind: 'internal-invalid' }
   const route = routeCanvasAgentEvent(session)
   if (route.kind !== 'agent') return route
-  if (session === undefined && knownInternalInvalid) return { kind: 'internal-invalid' }
-  if (session === undefined && cachedOwner?.sessionId === sessionId) {
-    return { kind: 'canvas', owner: cachedOwner }
-  }
+  if (knownInternalInvalid) return { kind: 'internal-invalid' }
   return route
 }

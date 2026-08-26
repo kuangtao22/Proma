@@ -143,6 +143,28 @@ describe('Canvas Agent 全局事件路由', () => {
     expect(runningIds.size).toBe(0)
   })
 
+  test('Given 同一 Canvas error 与 completion 在 bootstrap pending When owner 恢复 Then 两类关键事件都重放', () => {
+    let ready = false
+    const dispatched: string[] = []
+    interface BufferedEvent {
+      sessionId: string
+      type: 'error' | 'complete'
+    }
+    const gate = routing.createCanvasAgentBootstrapGate<BufferedEvent>({
+      classify: () => ready ? 'canvas' : 'unknown',
+      dispatch: (event) => dispatched.push(event.type),
+      maxBufferedEvents: 2,
+      isTerminalEvent: () => true,
+      getTerminalEventKey: (event) => `${event.type}:${event.sessionId}`,
+    })
+    gate.handle({ sessionId: 'canvas-session', type: 'error' })
+    gate.handle({ sessionId: 'canvas-session', type: 'complete' })
+    ready = true
+    gate.complete()
+
+    expect(dispatched).toEqual(['error', 'complete'])
+  })
+
   test('Given 普通 headless completion 携带 metadata When Renderer gate ready Then 保留普通终态清理与通知', () => {
     /** 普通 metadata 必须明确分类为 agent，不能因 Canvas fail-closed 丢终态。 */
     let cleaned = false
@@ -191,15 +213,13 @@ describe('Canvas Agent 全局事件路由', () => {
     /** 创建与真实 hook 相同的 completion gate 分类。 */
     const createCompletionGate = () => routing.createCanvasAgentBootstrapGate<CompletionEvent>({
       classify: (event) => {
-        const owner = owners.get(event.sessionId)
-        if (event.session === undefined && !owner) return 'unknown'
-        return routing.resolveCanvasAgentCompletion(event.sessionId, event.session, owner).kind
+        if (event.session === undefined) return 'unknown'
+        return routing.resolveCanvasAgentCompletion(event.sessionId, event.session).kind
       },
       dispatch: (event) => {
         const route = routing.resolveCanvasAgentCompletion(
           event.sessionId,
           event.session,
-          owners.get(event.sessionId),
         )
         if (route.kind === 'canvas') canvasRoutes.push(route.owner.sessionId)
         else if (route.kind === 'agent') {
@@ -226,7 +246,7 @@ describe('Canvas Agent 全局事件路由', () => {
 
     const trustedMetaGate = createCompletionGate()
     trustedMetaGate.handle({ sessionId: 'trusted-canvas', session: createCanvasSession({ id: 'trusted-canvas' }) })
-    expect(canvasRoutes).toEqual(['deferred-canvas', 'trusted-canvas'])
+    expect(canvasRoutes).toEqual(['trusted-canvas'])
     expect(ordinaryNotifications).toBe(0)
     expect(ordinaryListUpserts).toBe(0)
   })
@@ -266,7 +286,6 @@ describe('Canvas Agent 全局事件路由', () => {
       resolveCanvasAgentCompletion?: (
         sessionId: string,
         session: AgentSessionMeta | undefined,
-        cachedOwner: routing.CanvasAgentOwner | undefined,
       ) => routing.CanvasAgentEventRoute
     }).resolveCanvasAgentCompletion
     expect(resolveCompletion).toBeFunction()
@@ -279,13 +298,10 @@ describe('Canvas Agent 全局事件路由', () => {
     expect(resolveCompletion(
       'session-1',
       createCanvasSession({ sourceCanvasNodeId: undefined }),
-      cachedOwner,
     )).toEqual({ kind: 'internal-invalid' })
-    expect(resolveCompletion('session-1', undefined, cachedOwner)).toEqual({
-      kind: 'canvas', owner: cachedOwner,
-    })
+    expect(resolveCompletion('session-1', undefined)).toEqual({ kind: 'internal-invalid' })
     expect(resolveCompletion('session-1', {
       id: 'session-1', title: '普通会话', createdAt: 1, updatedAt: 1,
-    }, cachedOwner)).toEqual({ kind: 'agent' })
+    })).toEqual({ kind: 'agent' })
   })
 })

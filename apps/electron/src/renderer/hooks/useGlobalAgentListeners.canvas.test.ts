@@ -59,4 +59,13 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
     expect(source).toContain("type: 'invalidated', sessionId: data.sessionId, terminal: !backgroundTasksPending")
   })
+
+  test('Given Canvas STREAM_ERROR When bootstrap pending、ready 或 failed Then 与 completion 共用 fail-closed gate', () => {
+    const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
+    expect(source).toContain("| { type: 'error'; sessionId: string; value: AgentStreamErrorPayload }")
+    expect(source).toContain("type: 'error', sessionId: data.sessionId, value: data")
+    expect(source).toContain("event.type !== 'complete' && event.type !== 'error'")
+    expect(source).toContain("event.type === 'complete' || event.type === 'error'")
+    expect(source).toContain("getTerminalEventKey: (event) => `${event.type}:${event.sessionId}`")
+  })
 })

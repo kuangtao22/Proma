@@ -1319,6 +1319,32 @@ export interface RewindSessionResult {
 // ===== Agent 流式事件载荷 =====
 
 /**
+ * Agent 流事件允许跨 IPC 公开的最小会话元数据。
+ * 仅包含事件分类、列表新鲜度与通知所需字段，禁止加入路径、凭据或运行时存储细节。
+ */
+export interface AgentStreamSessionMeta {
+  id: string
+  title: string
+  workspaceId?: string
+  sourceAutomationId?: string
+  sourceDesignProjectId?: string
+  sourceDesignJobId?: string
+  sourceCanvasProjectId?: string
+  sourceCanvasId?: string
+  sourceCanvasNodeId?: string
+  automationGraduated?: boolean
+  parentSessionId?: string
+  rootSessionId?: string
+  sourceDelegationId?: string
+  delegationRole?: AgentDelegationRole
+  delegationStatus?: AgentDelegationStatus
+  delegationDepth?: number
+  delegationGoal?: string
+  createdAt: number
+  updatedAt: number
+}
+
+/**
  * Agent 流式事件（主进程 → 渲染进程推送）
  */
 export interface AgentStreamEvent {
@@ -1351,7 +1377,15 @@ export interface AgentStreamCompletePayload {
   /** 本轮主体结束但仍有后台任务/定时任务在飞行：UI 进入"空闲可输入"态，等待任务完成自动唤醒 */
   backgroundTasksPending?: boolean
   /** 完成时的最新会话元数据，供 renderer 增量更新列表，避免重新传输全量会话索引。 */
-  session?: AgentSessionMeta
+  session?: AgentStreamSessionMeta
+}
+
+/** Agent 流式错误事件载荷（主进程 → 渲染进程）。 */
+export interface AgentStreamErrorPayload {
+  sessionId: string
+  error: string
+  /** 与 completion 共用的安全会话分类元数据。 */
+  session?: AgentStreamSessionMeta
 }
 
 // ===== 文件浏览器 =====

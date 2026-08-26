@@ -1,6 +1,11 @@
 import type { CanvasMutation, CanvasWorkspaceSnapshot, SDKMessage } from '@proma/shared'
 import { atom } from 'jotai'
 import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
+import {
+  agentSessionStreamingStateAtomFamily,
+  agentStreamErrorsAtom,
+  liveMessagesMapAtom,
+} from '@/atoms/agent-atoms'
 
 /** 原生 Canvas 单工作区的加载阶段。 */
 export type NativeCanvasPhase = 'idle' | 'loading' | 'ready' | 'error'
@@ -79,6 +84,7 @@ export type CanvasAgentLifecycleEvent =
   | { type: 'opened'; owner: CanvasAgentOwner; messages: SDKMessage[] }
   | { type: 'started' | 'owner-updated'; owner: CanvasAgentOwner }
   | { type: 'closed' | 'completed'; sessionId: string }
+  | { type: 'settled'; sessionId: string }
   | { type: 'invalidated'; sessionId: string; terminal: boolean }
   | { type: 'prune' }
 
@@ -193,6 +199,27 @@ export const canvasAgentLifecycleAtom = atom(
         /** soft completion 后运行仍可恢复，继续以 active invalid 阻断后续流事件。 */
         activeInvalidSessionIds.add(event.sessionId)
       }
+    }
+
+    /** 只有不再打开且不再运行，或 GET 已完成交接时，才释放共享流式状态。 */
+    const shouldReleaseRuntimeState = (event.type === 'settled' && !runningSessionIds.has(event.sessionId))
+      || ((event.type === 'closed' || event.type === 'completed')
+        && !openSessionIds.has(event.sessionId)
+        && !runningSessionIds.has(event.sessionId))
+    if (shouldReleaseRuntimeState) {
+      set(liveMessagesMapAtom, (previous) => {
+        if (!previous.has(event.sessionId)) return previous
+        const next = new Map(previous)
+        next.delete(event.sessionId)
+        return next
+      })
+      set(agentStreamErrorsAtom, (previous) => {
+        if (!previous.has(event.sessionId)) return previous
+        const next = new Map(previous)
+        next.delete(event.sessionId)
+        return next
+      })
+      set(agentSessionStreamingStateAtomFamily(event.sessionId), undefined)
     }
 
     /** 打开或运行的 session 是保护项，可暂时超过非保护总量。 */

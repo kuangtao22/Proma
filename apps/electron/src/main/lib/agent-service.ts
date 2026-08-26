@@ -45,6 +45,7 @@ import { buildCanvasAgentActiveRunSnapshot } from './agent-session-visibility'
 import { setAgentStopper, setHeadlessAgentRunner } from './agent-headless-runner-registry'
 import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
 import {
+  buildAuthoritativeAgentStreamErrorPayload,
   sendAuthoritativeAgentStreamComplete,
 } from './agent-completion-payload'
 import { AgentStreamForwarder } from './agent-stream-forwarder'
@@ -256,10 +257,10 @@ export async function runAgent(
           name: 'renderer-error',
           run: () => {
             if (!webContents.isDestroyed()) {
-              webContents.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
-                sessionId: input.sessionId,
-                error,
-              })
+              webContents.send(
+                AGENT_IPC_CHANNELS.STREAM_ERROR,
+                buildAuthoritativeAgentStreamErrorPayload(input.sessionId, error, getAgentSessionMeta),
+              )
             }
           },
         }], reportAgentServiceTerminalEffectError)
@@ -350,10 +351,10 @@ export async function runAgent(
         name: 'renderer-error',
         run: () => {
           if (!webContents.isDestroyed()) {
-            webContents.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
-              sessionId: input.sessionId,
-              error: errorMessage,
-            })
+            webContents.send(
+              AGENT_IPC_CHANNELS.STREAM_ERROR,
+              buildAuthoritativeAgentStreamErrorPayload(input.sessionId, errorMessage, getAgentSessionMeta),
+            )
           }
         },
       },
@@ -420,10 +421,10 @@ export async function runAgentHeadless(
             name: 'renderer-error',
             run: () => {
               if (wc && !wc.isDestroyed()) {
-                wc.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
-                  sessionId: runInput.sessionId,
-                  error,
-                })
+                wc.send(
+                  AGENT_IPC_CHANNELS.STREAM_ERROR,
+                  buildAuthoritativeAgentStreamErrorPayload(runInput.sessionId, error, getAgentSessionMeta),
+                )
               }
             },
           },
@@ -512,7 +513,10 @@ export async function runAgentHeadless(
         name: 'renderer-error',
         run: () => {
           if (wc && !wc.isDestroyed()) {
-            wc.send(AGENT_IPC_CHANNELS.STREAM_ERROR, { sessionId: runInput.sessionId, error: errorMessage })
+            wc.send(
+              AGENT_IPC_CHANNELS.STREAM_ERROR,
+              buildAuthoritativeAgentStreamErrorPayload(runInput.sessionId, errorMessage, getAgentSessionMeta),
+            )
           }
         },
       },

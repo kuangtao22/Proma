@@ -30,6 +30,7 @@ describe('Canvas Agent 对话', () => {
       load: async () => { calls.push('load'); return createResult() },
       send: async () => { calls.push('send') },
       stop: async () => { calls.push('stop') },
+      isBusy: () => false,
       onLoaded: () => calls.push('loaded'),
       onComposerChange: () => undefined,
       onSendingChange: () => undefined,
@@ -50,6 +51,7 @@ describe('Canvas Agent 对话', () => {
       load: async () => createResult(),
       send: () => new Promise<void>((_resolve, reject) => { rejectSend = reject }),
       stop: async () => undefined,
+      isBusy: () => false,
       onLoaded: () => undefined,
       onComposerChange: (value) => composer.push(value),
       onSendingChange: (value) => sending.push(value),
@@ -67,6 +69,29 @@ describe('Canvas Agent 对话', () => {
     expect(controller.getComposerRestore()).toBe('保留这段内容')
   })
 
+  test('Given reload 恢复的权威运行态 When controller submit Then 不调用 SEND 且 STOP 仍可用', async () => {
+    const calls: string[] = []
+    let busy = true
+    const controller = createCanvasAgentConversationController({
+      load: async () => createResult(),
+      send: async () => { calls.push('send') },
+      stop: async () => { calls.push('stop') },
+      isBusy: () => busy,
+      onLoaded: () => undefined,
+      onComposerChange: () => undefined,
+      onSendingChange: () => undefined,
+      onError: () => undefined,
+    })
+
+    await controller.send('不能重复发送', 'message-1', 10)
+    await controller.stop()
+    expect(calls).toEqual(['stop'])
+
+    busy = false
+    await controller.send('可以发送', 'message-2', 20)
+    expect(calls).toEqual(['stop', 'send'])
+  })
+
   test.each(['resolve', 'reject'] as const)(
     'Given A 节点 SEND 未完成 When 切到 B 后旧请求 %s Then 不污染 B 的 composer、sending 或 error',
     async (outcome) => {
@@ -80,6 +105,7 @@ describe('Canvas Agent 对话', () => {
           settleSend = () => outcome === 'resolve' ? resolve() : reject(new Error('A 失败'))
         }),
         stop: async () => undefined,
+        isBusy: () => false,
         onLoaded: () => undefined,
         onComposerChange: (value) => callbacks.push(`composer:${value}`),
         onSendingChange: (value) => callbacks.push(`sending:${value}`),
@@ -114,6 +140,7 @@ describe('Canvas Agent 对话', () => {
         load: async () => createResult(),
         send: async () => { throw new Error('会话正在启动或运行中') },
         stop: async () => undefined,
+        isBusy: () => false,
         onLoaded: () => undefined,
         onComposerChange: (value) => uiCallbacks.push(`composer:${value}`),
         onSendingChange: (value) => uiCallbacks.push(`sending:${value}`),

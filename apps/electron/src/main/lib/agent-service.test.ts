@@ -147,4 +147,12 @@ describe('Agent service 迁移准入', () => {
     expect(source).not.toContain('sendAgentStreamComplete(')
     expect(source).not.toContain('session: getSessionMetaForRenderer(')
   })
+
+  test('Given renderer 与 headless 的流式错误 When 检查所有 producer Then 统一携带权威安全 metadata', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    const builderCalls = source.match(/buildAuthoritativeAgentStreamErrorPayload\(/g)?.length ?? 0
+
+    expect(builderCalls).toBe(4)
+    expect(source).not.toMatch(/send\(AGENT_IPC_CHANNELS\.STREAM_ERROR,\s*\{\s*sessionId:/)
+  })
 })

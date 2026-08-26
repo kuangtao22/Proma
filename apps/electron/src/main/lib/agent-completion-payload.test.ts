@@ -14,7 +14,7 @@ describe('Agent completion payload', () => {
     expect(selectSession).toBeFunction()
     if (!selectSession) return
 
-    /** 主进程权威 Canvas session，包含不应跨 IPC 的 Pi 内部映射。 */
+    /** 主进程权威 Canvas session，包含所有不应跨 IPC 的路径和内部存储字段。 */
     const session = {
       id: 'canvas-session',
       title: 'Canvas Agent',
@@ -24,7 +24,18 @@ describe('Agent completion payload', () => {
       sourceCanvasNodeId: 'node-1',
       createdAt: 1,
       updatedAt: 1,
+      piSessionFile: '/Users/example/.proma/agent-sessions/canvas-session.jsonl',
       piEntryBindings: { entry: 'message' },
+      activeWorktree: {
+        id: 'worktree-1',
+        branch: 'feature/canvas-agent',
+        path: '/Users/example/project-worktree',
+        mainRepoRoot: '/Users/example/project',
+        selectedAt: 1,
+      },
+      attachedDirectories: ['/Users/example/reference'],
+      attachedFiles: ['/Users/example/secret.png'],
+      forkSourceDir: '/Users/example/source-session',
     } as AgentSessionMeta
     /** 记录选择器确实只按目标 sessionId 查询一次。 */
     const requestedIds: string[] = []
@@ -41,6 +52,14 @@ describe('Agent completion payload', () => {
       createdAt: 1,
       updatedAt: 1,
     })
+    const serialized = JSON.stringify(selectSession('canvas-session', () => session))
+    expect(serialized).not.toContain('piSessionFile')
+    expect(serialized).not.toContain('piEntryBindings')
+    expect(serialized).not.toContain('activeWorktree')
+    expect(serialized).not.toContain('attachedDirectories')
+    expect(serialized).not.toContain('attachedFiles')
+    expect(serialized).not.toContain('forkSourceDir')
+    expect(serialized).not.toContain('/Users/example')
     expect(requestedIds).toEqual(['canvas-session'])
     expect(selectSession('missing', () => undefined)).toBeUndefined()
   })
@@ -81,5 +100,23 @@ describe('Agent completion payload', () => {
     })
     expect(payload.messages).toEqual([])
     expect(payload.startedAt).toBe(10)
+  })
+
+  test('Given Canvas 流式错误 When 构造错误 payload Then 携带同一份安全归属且不泄露路径', () => {
+    const session = {
+      id: 'canvas-error', title: '失败任务', workspaceId: 'project-1',
+      sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
+      createdAt: 1, updatedAt: 2,
+      piSessionFile: '/Users/example/private.jsonl',
+      attachedFiles: ['/Users/example/secret.png'],
+    } as AgentSessionMeta
+    const payload = completionPayload.buildAuthoritativeAgentStreamErrorPayload(
+      session.id,
+      '模型失败',
+      () => session,
+    )
+
+    expect(payload.session?.sourceCanvasNodeId).toBe('node-1')
+    expect(JSON.stringify(payload)).not.toContain('/Users/example')
   })
 })
