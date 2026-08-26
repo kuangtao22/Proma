@@ -11,8 +11,8 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { createEmptyCanvasDocument } from '@proma/shared'
-import type { AgentSessionMeta, CanvasDocument, CanvasTarget } from '@proma/shared'
+import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
+import type { AgentSessionMeta, CanvasDocument, CanvasMutation, CanvasTarget } from '@proma/shared'
 import {
   CanvasAgentNodeCreationService,
   type CanvasAgentNodeCreationIntent,
@@ -86,6 +86,8 @@ function createHarness(options: {
   let failCreateSession = options.failCreateSession ?? false
   /** transactions 目录扫描次数，用于锁定单次 CREATE 的 I/O 上界。 */
   let transactionDirectoryReads = 0
+  /** Store 收到的完整 mutation 批次，用于验证节点与边原子提交。 */
+  const mutationBatches: CanvasMutation[][] = []
 
   /** 生成使用当前依赖的新服务，模拟主进程重启。 */
   const createService = (): CanvasAgentNodeCreationService => new CanvasAgentNodeCreationService({
@@ -104,12 +106,11 @@ function createHarness(options: {
       },
       mutate: (_target, expectedRevision, mutations) => {
         expect(expectedRevision).toBe(document.revision)
-        const upsert = mutations[0]
-        if (upsert?.type !== 'upsert-nodes') throw new Error('测试只接受节点 upsert')
+        mutationBatches.push(structuredClone(mutations))
+        const mutated = applyCanvasMutations(document, mutations)
         document = {
-          ...document,
+          ...mutated,
           revision: document.revision + 1,
-          nodes: [...document.nodes.filter((node) => node.id !== upsert.nodes[0]?.id), ...upsert.nodes],
         }
         return structuredClone(document)
       },
@@ -190,6 +191,7 @@ function createHarness(options: {
     setFailCreateSession: (value: boolean) => { failCreateSession = value },
     getTransactionDirectoryReads: () => transactionDirectoryReads,
     resetTransactionDirectoryReads: () => { transactionDirectoryReads = 0 },
+    mutationBatches,
     root,
     canvasRoot,
     intentPath: join(transactionsDir, `agent-node-${OPERATION_ID}.json`),
@@ -345,6 +347,96 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(retried.session.id).toBe(first.session.id)
     expect(harness.createdInputs).toHaveLength(1)
     expect(harness.getDocument().revision).toBe(1)
+  })
+
+  test('Given 健康源节点 When 扩展 Agent Then 节点与边在同一 revision 提交', async () => {
+    const harness = createHarness()
+    const sourceNode = {
+      id: 'source-1',
+      kind: 'agent' as const,
+      title: '源 Agent',
+      position: { x: 20, y: 40 },
+      agentSessionId: 'source-session',
+    }
+    harness.setDocument({
+      ...harness.getDocument(),
+      nodes: [sourceNode],
+    })
+    const input = {
+      ...createInput(harness.target),
+      nodeId: 'target-1',
+      relationship: {
+        sourceNodeId: sourceNode.id,
+        edgeId: '33333333-3333-4333-8333-333333333333',
+      },
+    }
+
+    const result = await harness.createService().create(input)
+
+    expect(result.document.revision).toBe(1)
+    expect(result.document.nodes).toContainEqual(expect.objectContaining({ id: 'target-1' }))
+    expect(result.document.edges).toContainEqual({
+      id: '33333333-3333-4333-8333-333333333333',
+      sourceNodeId: 'source-1',
+      sourcePort: 'output',
+      targetNodeId: 'target-1',
+      targetPort: 'input',
+    })
+    expect(harness.mutationBatches).toEqual([[
+      expect.objectContaining({ type: 'upsert-nodes' }),
+      expect.objectContaining({ type: 'upsert-edges' }),
+    ]])
+  })
+
+  test('Given 相同扩展 operation 已 committed When 重试 Then 不重复节点或边', async () => {
+    const harness = createHarness()
+    harness.setDocument({
+      ...harness.getDocument(),
+      nodes: [{
+        id: 'source-1',
+        kind: 'agent',
+        title: '源 Agent',
+        position: { x: 20, y: 40 },
+        agentSessionId: 'source-session',
+      }],
+    })
+    const input = {
+      ...createInput(harness.target),
+      nodeId: 'target-1',
+      relationship: {
+        sourceNodeId: 'source-1',
+        edgeId: '33333333-3333-4333-8333-333333333333',
+      },
+    }
+    const service = harness.createService()
+
+    await service.create(input)
+    const retried = await service.create(input)
+
+    expect(retried.document.nodes.filter((node) => node.id === 'target-1')).toHaveLength(1)
+    expect(retried.document.edges.filter((edge) => edge.id === input.relationship.edgeId)).toHaveLength(1)
+    expect(harness.mutationBatches).toHaveLength(1)
+  })
+
+  test('Given 源节点存在 node issue When 请求扩展 Then 创建 session 前拒绝且文档不变', async () => {
+    const harness = createHarness()
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    harness.sessions.delete(SESSION_ID)
+    const documentBefore = harness.getDocument()
+
+    await expect(service.create({
+      ...createInput(harness.target),
+      operationId: '33333333-3333-4333-8333-333333333333',
+      nodeId: 'node-2',
+      relationship: {
+        sourceNodeId: 'node-1',
+        edgeId: '44444444-4444-4444-8444-444444444444',
+      },
+    })).rejects.toThrow('源节点会话不可用')
+
+    expect(harness.getDocument()).toEqual(documentBefore)
+    expect(harness.createdInputs).toHaveLength(1)
   })
 
   test('Given prepared 后主进程退出且默认模型变化 When 重试 Then 仍使用 intent 固化的旧默认值', async () => {

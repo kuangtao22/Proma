@@ -14,10 +14,13 @@ import type {
   CanvasAgentNode,
   CanvasAgentNodeCreationResult,
   CanvasDocument,
+  CanvasEdge,
+  CanvasMutation,
   CanvasNodeIssue,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
+  CreateCanvasAgentNodeRelationship,
   DesignPoint,
 } from '@proma/shared'
 import type { SecureAtomicJsonWriteOptions } from '../safe-file'
@@ -68,6 +71,7 @@ export interface CanvasAgentNodeCreationIntent {
   channelId: string
   modelId?: string
   position: DesignPoint
+  relationship?: CreateCanvasAgentNodeRelationship
   state: CanvasAgentNodeCreationState
   createdAt: number
   updatedAt: number
@@ -152,6 +156,15 @@ interface CanvasIntentWriteConfirmation {
   durabilityError?: Error
 }
 
+/** 精确比较两个可选扩展关系。 */
+function isSameRelationship(
+  left: CreateCanvasAgentNodeRelationship | undefined,
+  right: CreateCanvasAgentNodeRelationship | undefined,
+): boolean {
+  if (!left || !right) return left === right
+  return left.sourceNodeId === right.sourceNodeId && left.edgeId === right.edgeId
+}
+
 /** 精确比较重扫后的 intent 与刚提交内容。 */
 function isSameIntent(
   left: CanvasAgentNodeCreationIntent,
@@ -168,6 +181,7 @@ function isSameIntent(
     && left.modelId === right.modelId
     && left.position.x === right.position.x
     && left.position.y === right.position.y
+    && isSameRelationship(left.relationship, right.relationship)
     && left.state === right.state
     && left.createdAt === right.createdAt
     && left.updatedAt === right.updatedAt
@@ -203,6 +217,16 @@ function isCanonicalLimitedString(value: unknown, maxLength: number): value is s
     && value.trim() === value
 }
 
+/** 校验从源节点到新节点的稳定关系身份。 */
+function isValidRelationship(value: unknown): value is CreateCanvasAgentNodeRelationship {
+  return isRecord(value)
+    && hasIntentKeys(value, ['sourceNodeId', 'edgeId'])
+    && isSafeDesignStableId(value.sourceNodeId)
+    && value.sourceNodeId.length <= MAX_CANVAS_STABLE_ID_LENGTH
+    && isSafeDesignStableId(value.edgeId)
+    && value.edgeId.length <= MAX_CANVAS_STABLE_ID_LENGTH
+}
+
 /** 校验 Renderer 创建输入；IPC 和服务边界均调用以保持纵深防御。 */
 export function assertCreateCanvasAgentNodeInput(
   input: CreateCanvasAgentNodeInput,
@@ -223,6 +247,12 @@ export function assertCreateCanvasAgentNodeInput(
     throw new Error('Canvas Agent 标题无效')
   }
   if (!isValidPosition(input.position)) throw new Error('Canvas Agent 位置无效')
+  if (input.relationship !== undefined) {
+    if (!isValidRelationship(input.relationship)) throw new Error('Canvas Agent 扩展关系无效')
+    if (input.relationship.sourceNodeId === input.nodeId) {
+      throw new Error('Canvas Agent 扩展源节点不能是目标节点')
+    }
+  }
 }
 
 /** 将未知 JSON 解析为 exact-key 创建事务。 */
@@ -235,7 +265,7 @@ function parseIntent(
     'schemaVersion', 'operationId', 'projectId', 'canvasId', 'nodeId', 'sessionId',
     'title', 'channelId', 'position', 'state', 'createdAt', 'updatedAt',
   ] as const
-  if (!isRecord(value) || !hasIntentKeys(value, required, ['modelId'])) {
+  if (!isRecord(value) || !hasIntentKeys(value, required, ['modelId', 'relationship'])) {
     throw new Error('Canvas Agent 创建事务损坏：schema 字段无效')
   }
   if (value.schemaVersion !== 1
@@ -255,6 +285,8 @@ function parseIntent(
     || (value.modelId !== undefined
       && !isCanonicalLimitedString(value.modelId, MAX_AGENT_MODEL_ID_LENGTH))
     || !isValidPosition(value.position)
+    || (value.relationship !== undefined && !isValidRelationship(value.relationship))
+    || (isValidRelationship(value.relationship) && value.relationship.sourceNodeId === value.nodeId)
     || !['prepared', 'session-created', 'committed', 'detached'].includes(String(value.state))
     || !Number.isSafeInteger(value.createdAt)
     || !Number.isSafeInteger(value.updatedAt)
@@ -408,6 +440,35 @@ function assertNodeMatchesIntent(
     || node.position.x !== intent.position.x
     || node.position.y !== intent.position.y) {
     throw new Error(`Canvas Agent 节点归属损坏: ${intent.nodeId}`)
+  }
+}
+
+/** 从创建 intent 生成固定兼容端口连线。 */
+function createRelationshipEdge(intent: CanvasAgentNodeCreationIntent): CanvasEdge | undefined {
+  if (!intent.relationship) return undefined
+  return {
+    id: intent.relationship.edgeId,
+    sourceNodeId: intent.relationship.sourceNodeId,
+    sourcePort: 'output',
+    targetNodeId: intent.nodeId,
+    targetPort: 'input',
+  }
+}
+
+/** 验证已提交扩展边没有被另一关系占用或部分丢失。 */
+function assertRelationshipMatchesIntent(
+  document: CanvasDocument,
+  intent: CanvasAgentNodeCreationIntent,
+): void {
+  const expected = createRelationshipEdge(intent)
+  if (!expected) return
+  const edge = document.edges.find((candidate) => candidate.id === expected.id)
+  if (!edge
+    || edge.sourceNodeId !== expected.sourceNodeId
+    || edge.sourcePort !== expected.sourcePort
+    || edge.targetNodeId !== expected.targetNodeId
+    || edge.targetPort !== expected.targetPort) {
+    throw new Error(`Canvas Agent 扩展边归属损坏: ${expected.id}`)
   }
 }
 
@@ -611,6 +672,7 @@ export class CanvasAgentNodeCreationService {
       const existingNode = document.nodes.find((node) => node.id === intent.nodeId)
       if (existingNode) {
         assertNodeMatchesIntent(existingNode, intent)
+        assertRelationshipMatchesIntent(document, intent)
       } else {
         /** 节点只引用 session，不复制消息或运行状态。 */
         const node: CanvasAgentNode = {
@@ -620,10 +682,23 @@ export class CanvasAgentNodeCreationService {
           position: intent.position,
           agentSessionId: intent.sessionId,
         }
+        /** 节点与可选边必须通过同一 Store 批次共享 revision。 */
+        const mutations: CanvasMutation[] = [{ type: 'upsert-nodes', nodes: [node] }]
+        const relationshipEdge = createRelationshipEdge(intent)
+        if (relationshipEdge) {
+          const sourceNode = document.nodes.find((candidate) => (
+            candidate.id === relationshipEdge.sourceNodeId
+          ))
+          if (!sourceNode) throw new Error('Canvas 扩展源节点不存在')
+          if (document.edges.some((edge) => edge.id === relationshipEdge.id)) {
+            throw new Error('Canvas 扩展边 ID 已被占用')
+          }
+          mutations.push({ type: 'upsert-edges', edges: [relationshipEdge] })
+        }
         document = this.dependencies.store.mutate(
           { projectId: intent.projectId, canvasId: intent.canvasId },
           document.revision,
-          [{ type: 'upsert-nodes', nodes: [node] }],
+          mutations,
         )
       }
       /** committed 是唯一发布屏障；写失败时调用方不得广播或返回 document。 */
@@ -682,6 +757,7 @@ export class CanvasAgentNodeCreationService {
           }
         } else {
           assertNodeMatchesIntent(node, intent)
+          assertRelationshipMatchesIntent(document, intent)
           if (!sessionMatchesIntent(this.dependencies.getSession(intent.sessionId), intent)) {
             nodeIssues.push(createUnavailableSessionIssue(node.id))
           }
@@ -715,7 +791,8 @@ export class CanvasAgentNodeCreationService {
       if (existing.nodeId !== input.nodeId
         || existing.title !== input.title
         || existing.position.x !== input.position.x
-        || existing.position.y !== input.position.y) {
+        || existing.position.y !== input.position.y
+        || !isSameRelationship(existing.relationship, input.relationship)) {
         throw new Error('Canvas operationId 已被不同创建请求占用')
       }
       if (existing.state === 'detached') throw new Error('Canvas Agent 创建操作已与节点解除关联')
@@ -725,6 +802,16 @@ export class CanvasAgentNodeCreationService {
       const session = this.dependencies.getSession(existing.sessionId)
       assertSessionMatchesIntent(session, existing)
       return { document: reconciled.snapshot.document, session, documentChanged: false }
+    }
+
+    if (input.relationship) {
+      const sourceNode = reconciled.snapshot.document.nodes.find((candidate) => (
+        candidate.id === input.relationship?.sourceNodeId
+      ))
+      if (!sourceNode) throw new Error('Canvas 扩展源节点不存在')
+      if (reconciled.snapshot.nodeIssues.some((issue) => issue.nodeId === sourceNode.id)) {
+        throw new Error('Canvas 扩展源节点会话不可用')
+      }
     }
 
     const settings = this.dependencies.getSettings()
@@ -750,6 +837,9 @@ export class CanvasAgentNodeCreationService {
       channelId,
       ...(modelId ? { modelId } : {}),
       position: { ...input.position },
+      ...(input.relationship
+        ? { relationship: { ...input.relationship } }
+        : {}),
       state: 'prepared',
       createdAt,
       updatedAt: createdAt,

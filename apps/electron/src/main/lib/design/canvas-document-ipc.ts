@@ -205,13 +205,20 @@ function parseSaveInput(value: unknown): SaveCanvasMutationsInput {
  * @returns 仅包含公开创建合同字段的新对象。
  */
 function parseCreateAgentNodeInput(value: unknown): CreateCanvasAgentNodeInput {
-  if (!isRecord(value) || !hasExactDataKeys(value, [
-    'projectId', 'canvasId', 'operationId', 'nodeId', 'title', 'position',
-  ])) {
+  const baseKeys = ['projectId', 'canvasId', 'operationId', 'nodeId', 'title', 'position'] as const
+  if (!isRecord(value) || !hasExactDataKeys(
+    value,
+    value.relationship === undefined ? baseKeys : [...baseKeys, 'relationship'],
+  )) {
     throw new Error('Canvas Agent 创建参数无效')
   }
   if (!isRecord(value.position) || !hasExactDataKeys(value.position, ['x', 'y'])) {
     throw new Error('Canvas Agent 位置参数无效')
+  }
+  if (value.relationship !== undefined
+    && (!isRecord(value.relationship)
+      || !hasExactDataKeys(value.relationship, ['sourceNodeId', 'edgeId']))) {
+    throw new Error('Canvas Agent 扩展关系参数无效')
   }
   /** 重建对象后交给共享主进程 validator 进行 ID、长度和有限数值检查。 */
   const input = {
@@ -221,6 +228,14 @@ function parseCreateAgentNodeInput(value: unknown): CreateCanvasAgentNodeInput {
     nodeId: value.nodeId,
     title: value.title,
     position: { x: value.position.x, y: value.position.y },
+    ...(isRecord(value.relationship)
+      ? {
+          relationship: {
+            sourceNodeId: value.relationship.sourceNodeId,
+            edgeId: value.relationship.edgeId,
+          },
+        }
+      : {}),
   } as CreateCanvasAgentNodeInput
   assertCreateCanvasAgentNodeInput(input)
   return input

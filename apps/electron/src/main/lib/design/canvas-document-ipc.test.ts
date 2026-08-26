@@ -579,6 +579,27 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.broadcastLeaseStates).toEqual([false])
   })
 
+  test('Given 有效扩展创建请求 When IPC 重建输入 Then 保留源节点与稳定边 ID', async () => {
+    const context = createContext()
+    const input = {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-2',
+      title: '下游 Agent',
+      position: { x: 420, y: 20 },
+      relationship: {
+        sourceNodeId: 'node-1',
+        edgeId: '33333333-3333-4333-8333-333333333333',
+      },
+    }
+
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, input)
+
+    expect(context.storeInputs[0]).toEqual(input)
+    expect(context.storeInputs[0]).not.toBe(input)
+  })
+
   test('Given 同一 Canvas 两个异步 CREATE When 首个尚未完成 Then 第二个等待完整事务释放', async () => {
     let createEntrances = 0
     let releaseFirst = (): void => {}
