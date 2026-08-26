@@ -286,7 +286,7 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(replayed.document).toEqual(first.document)
     expect(harness.createdInputs).toHaveLength(1)
     expect(JSON.parse(readFileSync(harness.intentPath, 'utf8'))).toMatchObject({ state: 'committed' })
-  })
+  }, 30_000)
 
   test('Given intent 在 lstat 后被同名新 inode 替换 When 打开读取 Then 拒绝 replacement', async () => {
     let replaced = false

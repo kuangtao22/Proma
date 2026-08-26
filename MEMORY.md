@@ -174,3 +174,4 @@
 - 2026-08-26：Canvas Agent 权威 `startedAt` 与 Renderer 乐观 generation 必须分表保存，权威代次存在时禁止回退乐观值；active-invalid bootstrap 仅公开并恢复 `sessionId + startedAt + valid:false`，snapshot replace 同步回收无当前运行和无 optimistic token 保护的 stale generation。
 - 2026-08-26：完成 Canvas Agent 节点创建落点与对话关闭交互收口：新节点按可视中心确定性避让，关闭对话后迟到选区事件不再重开；真实 Electron 验证新增节点、Canvas 切换、重载恢复和深浅主题，既有修复前重叠节点保持原位置不做隐式迁移。
 - 2026-08-26：用户确认 Canvas 节点操作与局部故障恢复设计：恢复顶部悬浮工具栏，区分独立添加和节点扩展连线，删除保留对话；单个坏会话不再阻断整张画布，提供显式重建或删除并使用公开中文错误状态。
+- 2026-08-26：原生 Canvas 节点命令统一由顶部工具栏与节点侧扩展入口触发；扩展节点和边共享事务 revision，删除保留底层会话并受主进程 active-run 守卫。committed 坏会话只派生内存 `nodeIssues`，重建通过独立可恢复 intent 换绑空白 session；Preload/Adapter 只允许公开错误信封进入 Renderer。
