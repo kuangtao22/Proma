@@ -79,6 +79,7 @@
 - Canvas Agent 的 authority 在每次 bootstrap 时严格按当前 active-run snapshot 重建；Renderer optimistic token/generation 与 hard completion 后的 JSONL GET handoff generation 独立保存，空 snapshot 不撤销后两者，GET 晚回只凭 handoff 代次接管并由新 run、close、settled 或 invalid 精确清理。
 - Canvas Agent 的 `run_started` 必须携带主进程权威轻量 session metadata；Renderer reload 先注册全部 lifecycle listener，再由可 dispose 的 coordinator 应用一次性 active-run snapshot 并重放期间非普通事件，StrictMode 旧 snapshot 无副作用，禁止用定时重拉或 owner cache fallback 修补竞态。bootstrap 期间的 `run_started` 与 completion 分别按 session 独立有界保留，并固定按启动、普通流、终态顺序重放，避免 token 洪峰淘汰 owner/generation 建立事实。
 - Canvas 新节点从当前可视中心开始，按固定节点尺寸、间距和确定性方形环寻找首个不重叠位置；Agent 对话只允许明确节点点击打开，关闭时同步清空选区和对话身份但不停止 Agent，XYFlow 的迟到 selection change 只能恢复选区、不得隐式重开面板。
+- Canvas 节点操作采用顶部悬浮工具栏管理全局添加与删除，节点右侧 `+` 创建并原子连线下游节点；删除只移除节点和关联边并保留底层对话。Canvas LOAD 对已提交 Agent 引用的会话缺失或归属异常返回运行时 `nodeIssues`，局部显示“会话不可用”并允许显式重建为空白 session；图文档、授权和未完成事务损坏仍整图 fail closed，UI 禁止暴露 IPC 前缀、内部 UUID、路径或堆栈。
 
 ## 会话记录
 
@@ -172,3 +173,4 @@
 - 2026-08-26：Canvas Agent completion 必须在主进程启动预留、active-run bootstrap、Renderer lifecycle 和 JSONL GET 交接全链路携带并复核同一 `startedAt`；缺 generation 或旧 generation 完全无终态副作用，GET 晚回需二次校验，closed/settled 后释放 generation。异常 completion toast 只属于普通 Agent，合法 Canvas 仅更新面板错误，损坏内部会话不进入 toast、通知或普通会话 upsert。
 - 2026-08-26：Canvas Agent 权威 `startedAt` 与 Renderer 乐观 generation 必须分表保存，权威代次存在时禁止回退乐观值；active-invalid bootstrap 仅公开并恢复 `sessionId + startedAt + valid:false`，snapshot replace 同步回收无当前运行和无 optimistic token 保护的 stale generation。
 - 2026-08-26：完成 Canvas Agent 节点创建落点与对话关闭交互收口：新节点按可视中心确定性避让，关闭对话后迟到选区事件不再重开；真实 Electron 验证新增节点、Canvas 切换、重载恢复和深浅主题，既有修复前重叠节点保持原位置不做隐式迁移。
+- 2026-08-26：用户确认 Canvas 节点操作与局部故障恢复设计：恢复顶部悬浮工具栏，区分独立添加和节点扩展连线，删除保留对话；单个坏会话不再阻断整张画布，提供显式重建或删除并使用公开中文错误状态。
