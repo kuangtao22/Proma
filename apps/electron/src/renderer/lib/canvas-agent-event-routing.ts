@@ -15,6 +15,62 @@ export type CanvasAgentEventRoute =
   | { kind: 'agent' }
   | { kind: 'internal-invalid' }
 
+/** bootstrap gate 对单个事件的当前分类。 */
+export type CanvasAgentBootstrapEventKind = CanvasAgentEventRoute['kind'] | 'unknown'
+
+/** 一次性 bootstrap gate 的依赖。 */
+export interface CanvasAgentBootstrapGateOptions<T extends { sessionId: string }> {
+  classify: (event: T) => CanvasAgentBootstrapEventKind
+  dispatch: (event: T) => void
+  maxBufferedEvents?: number
+}
+
+/** renderer reload 期间未知事件的有界暂存入口。 */
+export interface CanvasAgentBootstrapGate<T extends { sessionId: string }> {
+  handle: (event: T) => void
+  complete: () => void
+  fail: () => void
+}
+
+/**
+ * 创建一次性 Canvas owner bootstrap gate。
+ * @param options 动态分类、真实分发与最大暂存数。
+ * @returns bootstrap 前暂存未知事件、成功后重放、失败后 fail closed 的 gate。
+ */
+export function createCanvasAgentBootstrapGate<T extends { sessionId: string }>(
+  options: CanvasAgentBootstrapGateOptions<T>,
+): CanvasAgentBootstrapGate<T> {
+  /** pending 只持续一次本地主进程 IPC；failed 时未知事件持续 fail closed。 */
+  let phase: 'pending' | 'ready' | 'failed' = 'pending'
+  /** 防止异常 IPC 长挂时事件数组无限增长。 */
+  const maxBufferedEvents = options.maxBufferedEvents ?? 2_000
+  /** 保持 stream/title 到达顺序的有界队列。 */
+  const bufferedEvents: T[] = []
+  const route = (event: T): void => {
+    const kind = options.classify(event)
+    if (kind === 'canvas' || kind === 'agent') options.dispatch(event)
+    else if (kind === 'unknown' && phase === 'ready') options.dispatch(event)
+    else if (kind === 'unknown' && phase === 'pending') {
+      if (bufferedEvents.length >= maxBufferedEvents) bufferedEvents.shift()
+      bufferedEvents.push(event)
+    }
+  }
+  return {
+    handle: route,
+    complete: () => {
+      if (phase !== 'pending') return
+      phase = 'ready'
+      const replay = bufferedEvents.splice(0)
+      for (const event of replay) route(event)
+    },
+    fail: () => {
+      if (phase !== 'pending') return
+      phase = 'failed'
+      bufferedEvents.length = 0
+    },
+  }
+}
+
 /** Canvas owner 必须排除的其它内部来源，保持与主进程会话可见性合同一致。 */
 const CANVAS_EXCLUSIVE_OWNERSHIP_FIELDS = [
   'sourceDesignProjectId',
@@ -66,4 +122,24 @@ export function routeCanvasAgentEvent(session: AgentSessionMeta | undefined): Ca
       title: session.title,
     },
   }
+}
+
+/**
+ * 解析 completion 的 Canvas 归属，明确 metadata 永远优先于旧缓存。
+ * @param sessionId completion 会话 ID。
+ * @param session completion 携带的安全 metadata，缺失表示旧协议或异常路径。
+ * @param cachedOwner Renderer 已验证的 owner 缓存。
+ * @returns 损坏 metadata fail closed；仅 metadata 缺失时允许使用缓存。
+ */
+export function resolveCanvasAgentCompletion(
+  sessionId: string,
+  session: AgentSessionMeta | undefined,
+  cachedOwner: CanvasAgentOwner | undefined,
+): CanvasAgentEventRoute {
+  const route = routeCanvasAgentEvent(session)
+  if (route.kind !== 'agent') return route
+  if (session === undefined && cachedOwner?.sessionId === sessionId) {
+    return { kind: 'canvas', owner: cachedOwner }
+  }
+  return route
 }

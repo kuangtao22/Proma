@@ -721,6 +721,7 @@ export function NativeCanvasWorkspace({
             />
             {conversationNode && conversationAdapter ? (
               <CanvasAgentConversation
+                key={`${target.projectId}:${target.canvasId}:${conversationNode.id}`}
                 target={{ ...target, nodeId: conversationNode.id }}
                 title={conversationNode.title}
                 adapter={conversationAdapter}

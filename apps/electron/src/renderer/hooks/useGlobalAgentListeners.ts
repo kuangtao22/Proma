@@ -61,9 +61,12 @@ import {
   playNotificationSoundForType,
 } from '@/atoms/notifications'
 import { appModeAtom } from '@/atoms/app-mode'
+import { activeViewAtom } from '@/atoms/active-view'
 import { activeCanvasSelectionAtom } from '@/atoms/canvas-session-atoms'
 import {
   canvasAgentOwnersAtom,
+  canvasAgentInternalInvalidSessionIdsAtom,
+  canvasAgentLifecycleAtom,
   createNativeCanvasKey,
   updateNativeCanvasStateAtom,
 } from '@/atoms/native-canvas-atoms'
@@ -88,7 +91,10 @@ import { detectIsWindows } from '@/lib/platform'
 import { getSessionFileChangeKind, getOwnedSessionWatcherPaths, upsertSessionFileChange } from '@/lib/session-file-changes'
 import { removeQueuedMessage, createQueuedAgentStreamState } from '@/lib/agent-message-queue'
 import { createAgentStreamEventBatcher } from '@/lib/agent-stream-event-batcher'
-import { routeCanvasAgentEvent } from '@/lib/canvas-agent-event-routing'
+import {
+  createCanvasAgentBootstrapGate,
+  resolveCanvasAgentCompletion,
+} from '@/lib/canvas-agent-event-routing'
 import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
 
 /** 触发右侧文件浏览器自动定位的写入类工具集合 */
@@ -652,6 +658,7 @@ export function useGlobalAgentListeners(): void {
         },
       })
       store.set(appModeAtom, 'agent')
+      store.set(activeViewAtom, 'design')
       store.set(currentAgentSessionIdAtom, null)
       store.set(currentAgentWorkspaceIdAtom, owner.projectId)
     }
@@ -951,6 +958,8 @@ export function useGlobalAgentListeners(): void {
           ? payload.event
           : null
         if (runStartedEvent) {
+          const canvasOwner = store.get(canvasAgentOwnersAtom).get(sessionId)
+          if (canvasOwner) store.set(canvasAgentLifecycleAtom, { type: 'started', owner: canvasOwner })
           // 队列 run 会先通过独立 IPC 发送 started 投影，但该投影可能在窗口
           // 重载或跨 renderer 路由时丢失。run_started 是同一轮的第二个权威启动信号，
           // 必须在首个 SDK/tool 事件之前恢复 running、startedAt 和正常的 live UI。
@@ -1420,8 +1429,71 @@ export function useGlobalAgentListeners(): void {
         }
         }) // unstable_batchedUpdates
     }
+    /** bootstrap gate 统一承载流式与标题事件，保证跨类型到达顺序。 */
+    type CanvasBootstrapEvent =
+      | { type: 'stream'; sessionId: string; value: AgentStreamEvent }
+      | { type: 'title'; sessionId: string; value: { sessionId: string; title: string } }
+
+    /** 标题事件的真实处理器；Canvas 标题只更新 owner，不接触普通 tab 或会话列表。 */
+    const handleTitleUpdated = ({ sessionId, title }: { sessionId: string; title: string }): void => {
+      const canvasOwner = store.get(canvasAgentOwnersAtom).get(sessionId)
+      if (canvasOwner) {
+        store.set(canvasAgentLifecycleAtom, {
+          type: 'owner-updated',
+          owner: { ...canvasOwner, title },
+        })
+        return
+      }
+      // 先使用事件 payload 立即同步标签页，避免依赖会话列表旧快照比较。
+      store.set(tabsAtom, (tabs) => updateTabTitle(tabs, sessionId, title))
+      const existing = store.get(agentSessionsAtom).find((session) => session.id === sessionId)
+      if (existing) {
+        // 标题写入会更新 updatedAt；本地以当前时刻维持与后端一致的“最近会话”排序。
+        store.set(agentSessionsAtom, (prev) => upsertAgentSession(prev, {
+          ...existing,
+          title,
+          updatedAt: Date.now(),
+        }))
+        return
+      }
+      window.electronAPI
+        .listAgentSessions()
+        .then((sessions) => store.set(agentSessionsAtom, (prev) => mergeFetchedAgentSessions(prev, sessions)))
+        .catch(console.error)
+    }
+
+    /** reload 期间未知 session 先暂存；已知普通、Canvas 与损坏内部 session 可立即判定。 */
+    const canvasAgentBootstrapGate = createCanvasAgentBootstrapGate<CanvasBootstrapEvent>({
+      classify: ({ sessionId }) => {
+        if (store.get(canvasAgentOwnersAtom).has(sessionId)) return 'canvas'
+        if (store.get(canvasAgentInternalInvalidSessionIdsAtom).has(sessionId)) return 'internal-invalid'
+        if (store.get(agentSessionsAtom).some((session) => session.id === sessionId)) return 'agent'
+        return 'unknown'
+      },
+      dispatch: (event) => {
+        if (event.type === 'stream') handleStreamEvent(event.value)
+        else handleTitleUpdated(event.value)
+      },
+    })
+
+    /** 单次本地主进程快照恢复 active Canvas owner，失败时未知事件持续 fail closed。 */
+    void window.electronAPI.listActiveCanvasAgentRuns().then((snapshot) => {
+      store.set(canvasAgentLifecycleAtom, {
+        type: 'bootstrap',
+        owners: snapshot.owners,
+        internalInvalidSessionIds: snapshot.internalInvalidSessionIds,
+      })
+      canvasAgentBootstrapGate.complete()
+    }).catch((error: unknown) => {
+      console.error('[GlobalAgentListeners] Canvas Agent 运行快照恢复失败:', error)
+      canvasAgentBootstrapGate.fail()
+    })
     // partial 仅保留每个会话在一帧内最新的累计全文，非 partial（尤其 final）立即处理。
-    const streamEventBatcher = createAgentStreamEventBatcher({ dispatch: handleStreamEvent })
+    const streamEventBatcher = createAgentStreamEventBatcher({
+      dispatch: (streamEvent) => canvasAgentBootstrapGate.handle({
+        type: 'stream', sessionId: streamEvent.sessionId, value: streamEvent,
+      }),
+    })
     const cleanupEvent = window.electronAPI.onAgentStreamEvent((streamEvent) => {
       streamEventBatcher.push(streamEvent)
     })
@@ -1438,16 +1510,18 @@ export function useGlobalAgentListeners(): void {
         const backgroundTasksPending = data.backgroundTasksPending === true
         const hasStreamError = store.get(agentStreamErrorsAtom).has(data.sessionId)
 
-        /** 完成 payload 的主进程安全 metadata 可恢复未打开 Canvas 的 owner。 */
-        const completionRoute = routeCanvasAgentEvent(data.session)
-        if (completionRoute.kind === 'canvas') {
-          store.set(canvasAgentOwnersAtom, (current) => (
-            new Map(current).set(data.sessionId, completionRoute.owner)
-          ))
+        /** 明确 metadata 优先于缓存；只有 payload 缺失 metadata 时才允许已验证 owner fallback。 */
+        const completionRoute = resolveCanvasAgentCompletion(
+          data.sessionId,
+          data.session,
+          store.get(canvasAgentOwnersAtom).get(data.sessionId),
+        )
+        if (completionRoute.kind === 'internal-invalid') {
+          store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId: data.sessionId })
+        } else if (completionRoute.kind === 'canvas') {
+          store.set(canvasAgentLifecycleAtom, { type: 'owner-updated', owner: completionRoute.owner })
         }
-        const canvasOwner = completionRoute.kind === 'canvas'
-          ? completionRoute.owner
-          : store.get(canvasAgentOwnersAtom).get(data.sessionId)
+        const canvasOwner = completionRoute.kind === 'canvas' ? completionRoute.owner : undefined
         const isCanvasAgentCompletion = canvasOwner !== undefined
           || completionRoute.kind === 'internal-invalid'
 
@@ -1589,8 +1663,13 @@ export function useGlobalAgentListeners(): void {
           return next
         })
 
-        /** Canvas 保留 live 消息供已打开面板展示；重开时再从权威 JSONL 合并恢复。 */
-        if (isCanvasAgentCompletion) return
+        /** Canvas 终态按面板打开态回收 owner/messages；live 消息仍留给已打开面板。 */
+        if (isCanvasAgentCompletion) {
+          if (canvasOwner && !backgroundTasksPending) {
+            store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: data.sessionId })
+          }
+          return
+        }
 
         /** 竞态保护：检查该会话是否已有新的流式请求正在运行 */
         const isNewStreamRunning = (): boolean => {
@@ -1728,25 +1807,8 @@ export function useGlobalAgentListeners(): void {
     })
 
     // ===== 5. 标题更新 =====
-    const cleanupTitleUpdated = window.electronAPI.onAgentTitleUpdated(({ sessionId, title }) => {
-      // 先使用事件 payload 立即同步标签页，避免依赖会话列表旧快照比较。
-      store.set(tabsAtom, (tabs) => updateTabTitle(tabs, sessionId, title))
-      const existing = store.get(agentSessionsAtom).find((session) => session.id === sessionId)
-      if (existing) {
-        // 标题写入会更新 updatedAt；本地以当前时刻维持与后端一致的“最近会话”排序，
-        // 不再为一行标题变化传输整个会话索引。
-        store.set(agentSessionsAtom, (prev) => upsertAgentSession(prev, {
-          ...existing,
-          title,
-          updatedAt: Date.now(),
-        }))
-        return
-      }
-      // 外部桥接可能先发标题、后发 run-start；仅在本地未知该会话时走恢复性全量同步。
-      window.electronAPI
-        .listAgentSessions()
-        .then((sessions) => store.set(agentSessionsAtom, (prev) => mergeFetchedAgentSessions(prev, sessions)))
-        .catch(console.error)
+    const cleanupTitleUpdated = window.electronAPI.onAgentTitleUpdated((value) => {
+      canvasAgentBootstrapGate.handle({ type: 'title', sessionId: value.sessionId, value })
     })
 
     // ===== 6. Windows Agent Island 提示音委托 =====

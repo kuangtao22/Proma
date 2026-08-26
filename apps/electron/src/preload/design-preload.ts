@@ -7,6 +7,7 @@ import type {
   CanvasWorkspaceSnapshot,
   CanvasAgentNodeCreationResult,
   CanvasAgentMessagesResult,
+  CanvasAgentActiveRunSnapshot,
   CreateCanvasSessionInput,
   CreateCanvasAgentNodeInput,
   GetCanvasAgentMessagesInput,
@@ -57,6 +58,8 @@ export interface DesignPreloadApi {
   createCanvasAgentNode: (input: CreateCanvasAgentNodeInput) => Promise<CanvasAgentNodeCreationResult>
   /** 仅在用户打开节点对话时读取该会话 JSONL。 */
   getCanvasAgentMessages: (input: GetCanvasAgentMessagesInput) => Promise<CanvasAgentMessagesResult>
+  /** Renderer reload 时一次性恢复仍在运行的 Canvas Agent 归属。 */
+  listActiveCanvasAgentRuns: () => Promise<CanvasAgentActiveRunSnapshot>
   /** 通过 Canvas 唯一入口发送纯文本消息。 */
   sendCanvasAgentMessage: (input: SendCanvasAgentMessageInput) => Promise<void>
   /** 通过 Canvas 唯一入口停止节点运行。 */
@@ -120,6 +123,9 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
       input,
     ) as Promise<CanvasAgentNodeCreationResult>,
+    listActiveCanvasAgentRuns: () => ipc.invoke(
+      CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
+    ) as Promise<CanvasAgentActiveRunSnapshot>,
     getCanvasAgentMessages: (input) => ipc.invoke(
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       input,

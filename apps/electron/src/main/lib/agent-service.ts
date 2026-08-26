@@ -32,6 +32,7 @@ import type {
   PromaPermissionMode,
   AgentExternalRunSource,
   AgentMessage,
+  CanvasAgentActiveRunSnapshot,
 } from '@proma/shared'
 import { PiAgentAdapter } from './adapters/pi-agent-adapter'
 import { PiUtilityAdapter } from './adapters/pi-utility-adapter'
@@ -39,7 +40,8 @@ import { AgentEventBus } from './agent-event-bus'
 import { AgentOrchestrator } from './agent-orchestrator'
 import { getAgentSessionWorkspacePath } from './config-paths'
 import { getAgentWorkspaceBySlug, getLocalProjectRootStatus, getProjectFilesPath } from './agent-workspace-manager'
-import { getAgentSessionMeta, updateAgentSessionMeta } from './agent-session-manager'
+import { getAgentSessionMeta, listAgentSessions, updateAgentSessionMeta } from './agent-session-manager'
+import { buildCanvasAgentActiveRunSnapshot } from './agent-session-visibility'
 import { setAgentStopper, setHeadlessAgentRunner } from './agent-headless-runner-registry'
 import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
 import { sendAgentStreamComplete } from './agent-completion-payload'
@@ -167,6 +169,14 @@ export function isAgentSessionBusy(sessionId: string): boolean {
   return startingAgentSessions.has(sessionId)
     || orchestrator.isActive(sessionId)
     || agentQueueCoordinator.hasPending(sessionId)
+}
+
+/**
+ * 一次性列出 Renderer reload 后仍需恢复归属的运行中 Canvas Agent。
+ * @returns 不暴露路径、JSONL 或普通内部字段的安全快照。
+ */
+export function listActiveCanvasAgentRuns(): CanvasAgentActiveRunSnapshot {
+  return buildCanvasAgentActiveRunSnapshot(listAgentSessions(), isAgentSessionBusy)
 }
 
 function publishRunStopped(

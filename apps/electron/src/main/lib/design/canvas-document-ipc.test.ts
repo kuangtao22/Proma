@@ -67,6 +67,10 @@ function createContext(options: {
   beforeCreate?: (input: { projectId: string; canvasId: string }) => Promise<void>
   createErrorOnce?: Error
   createDocumentChanged?: boolean
+  activeRunSnapshot?: {
+    owners: Array<{ sessionId: string; projectId: string; canvasId: string; nodeId: string; title: string }>
+    internalInvalidSessionIds: string[]
+  }
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -198,6 +202,7 @@ function createContext(options: {
       },
     },
     agent: {
+      listActiveRuns: () => options.activeRunSnapshot ?? { owners: [], internalInvalidSessionIds: [] },
       getSession: (sessionId) => sessionId === agentSession.id ? agentSession : undefined,
       getMessages: (sessionId) => {
         agentCalls.push({ type: 'messages', value: sessionId })
@@ -221,6 +226,29 @@ function createContext(options: {
 }
 
 describe('原生 Canvas 文档 IPC', () => {
+  test('Given renderer 重载 When bootstrap active Canvas run Then 只返回最小 owner 与损坏会话 ID', async () => {
+    /** 主进程已经按忙碌状态和归属完成过滤的安全快照。 */
+    const snapshot = {
+      owners: [{
+        sessionId: 'session-1', projectId: 'project-1', canvasId: 'canvas-1',
+        nodeId: 'node-1', title: '首页 Agent',
+      }],
+      internalInvalidSessionIds: ['session-invalid'],
+    }
+    const context = createContext({ activeRunSnapshot: snapshot })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
+      context.sender,
+      undefined,
+    )
+
+    expect(result).toEqual(snapshot)
+    expect(context.calls).toEqual([])
+    expect(context.agentCalls).toEqual([])
+  })
+
   test('Given 权威 Agent 节点 When GET/SEND/STOP Then 每次先对账并只使用节点引用 session', async () => {
     const document = createDocument(4)
     document.nodes = [{
@@ -738,12 +766,13 @@ describe('原生 Canvas 文档 IPC', () => {
     errorSpy.mockRestore()
   })
 
-  test('Given 已注册处理器 When 重复 dispose Then 仅移除六个固定 invoke 通道一次', () => {
+  test('Given 已注册处理器 When 重复 dispose Then 仅移除七个固定 invoke 通道一次', () => {
     const context = createContext()
     expect(context.registration.channels).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
       CANVAS_IPC_CHANNELS.STOP_AGENT,
@@ -757,6 +786,7 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
       CANVAS_IPC_CHANNELS.STOP_AGENT,
@@ -807,6 +837,7 @@ describe('原生 Canvas 文档 IPC', () => {
         }),
       },
       agent: {
+        listActiveRuns: () => ({ owners: [], internalInvalidSessionIds: [] }),
         getSession: () => undefined,
         getMessages: () => [],
         reserveStart: () => () => undefined,
@@ -834,12 +865,13 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
       CANVAS_IPC_CHANNELS.STOP_AGENT,
     ])
 
     registrationA.dispose()
-    expect(removed).toHaveLength(6)
+    expect(removed).toHaveLength(7)
   })
 })

@@ -13,7 +13,7 @@ import {
   agentStreamErrorsAtom,
 } from '@/atoms/agent-atoms'
 import {
-  canvasAgentOwnersAtom,
+  canvasAgentLifecycleAtom,
   canvasAgentPersistedMessagesAtom,
 } from '@/atoms/native-canvas-atoms'
 import { AgentMessages } from '@/components/agent/AgentMessages'
@@ -77,7 +77,10 @@ export function createCanvasAgentConversationController(
       dependencies.onSendingChange(true)
       dependencies.onError(null)
       const request = dependencies.send(message, userMessageUuid, startedAt).catch((error: unknown) => {
-        if (!disposed) dependencies.onError(error instanceof Error ? error.message : '发送失败')
+        if (!disposed) {
+          dependencies.onComposerChange(composerRestore)
+          dependencies.onError(error instanceof Error ? error.message : '发送失败')
+        }
         throw error
       }).finally(() => {
         if (!disposed) dependencies.onSendingChange(false)
@@ -118,8 +121,7 @@ export function CanvasAgentConversation({
   const [localError, setLocalError] = React.useState<string | null>(null)
   const [composer, setComposer] = React.useState('')
   const [sending, setSending] = React.useState(false)
-  const setOwners = useSetAtom(canvasAgentOwnersAtom)
-  const setPersistedMessages = useSetAtom(canvasAgentPersistedMessagesAtom)
+  const updateLifecycle = useSetAtom(canvasAgentLifecycleAtom)
   const persistedMessagesMap = useAtomValue(canvasAgentPersistedMessagesAtom)
   const streamErrors = useAtomValue(agentStreamErrorsAtom)
   const streamState = useAtomValue(agentSessionStreamingStateAtomFamily(sessionId ?? ''))
@@ -131,6 +133,10 @@ export function CanvasAgentConversation({
     setMessagesLoaded(false)
     setLoadingError(null)
     setLocalError(null)
+    setComposer('')
+    setSending(false)
+    /** 当前 effect 成功打开的 session，cleanup 据此关闭生命周期。 */
+    let openedSessionId: string | null = null
     /** effect 内按稳定身份重建 target，避免父组件对象重建导致重复读取 JSONL。 */
     const currentTarget = { projectId, canvasId, nodeId }
     const controller = createCanvasAgentConversationController({
@@ -145,14 +151,20 @@ export function CanvasAgentConversation({
           sessionId: result.sessionId,
           ...result.owner,
         }
+        openedSessionId = result.sessionId
         setSessionId(result.sessionId)
-        setOwners((current) => new Map(current).set(result.sessionId, owner))
-        setPersistedMessages((current) => new Map(current).set(result.sessionId, result.messages))
+        updateLifecycle({ type: 'opened', owner, messages: result.messages })
         setMessagesLoaded(true)
       },
       onComposerChange: setComposer,
       onSendingChange: setSending,
-      onError: setLocalError,
+      onError: (error) => {
+        setLocalError(error)
+        /** SEND 在运行准入前失败时不会可靠收到 completion，必须主动释放伪运行保护。 */
+        if (error && openedSessionId) {
+          updateLifecycle({ type: 'completed', sessionId: openedSessionId })
+        }
+      },
     })
     controllerRef.current = controller
     void controller.load().catch((error: unknown) => {
@@ -161,9 +173,10 @@ export function CanvasAgentConversation({
     return () => {
       active = false
       controller.dispose()
+      if (openedSessionId) updateLifecycle({ type: 'closed', sessionId: openedSessionId })
       if (controllerRef.current === controller) controllerRef.current = null
     }
-  }, [canvasId, getCanvasAgentMessages, nodeId, projectId, sendCanvasAgentMessage, setOwners, setPersistedMessages, stopCanvasAgent])
+  }, [canvasId, getCanvasAgentMessages, nodeId, projectId, sendCanvasAgentMessage, stopCanvasAgent, updateLifecycle])
 
   /** 提交当前纯文本；失败时恢复原文，避免用户输入丢失。 */
   const submit = React.useCallback((): void => {
@@ -171,10 +184,12 @@ export function CanvasAgentConversation({
     if (!message || sending || !messagesLoaded || !sessionId) return
     const controller = controllerRef.current
     if (!controller) return
-    void controller.send(message, window.crypto.randomUUID(), Date.now()).catch(() => {
-      setComposer(controller.getComposerRestore())
+    updateLifecycle({
+      type: 'started',
+      owner: { sessionId, projectId, canvasId, nodeId, title },
     })
-  }, [composer, messagesLoaded, sending, sessionId])
+    void controller.send(message, window.crypto.randomUUID(), Date.now()).catch(() => undefined)
+  }, [canvasId, composer, messagesLoaded, nodeId, projectId, sending, sessionId, title, updateLifecycle])
 
   const persistedMessages = sessionId ? persistedMessagesMap.get(sessionId) ?? [] : []
   const visibleError = localError ?? (sessionId ? streamErrors.get(sessionId) ?? null : null)

@@ -7,6 +7,7 @@ export const CANVAS_IPC_CHANNELS = {
   LOAD: 'canvas:load',
   SAVE_MUTATIONS: 'canvas:save-mutations',
   CREATE_AGENT_NODE: 'canvas:create-agent-node',
+  LIST_ACTIVE_AGENT_RUNS: 'canvas:list-active-agent-runs',
   GET_AGENT_MESSAGES: 'canvas:get-agent-messages',
   SEND_AGENT_MESSAGE: 'canvas:send-agent-message',
   STOP_AGENT: 'canvas:stop-agent',
@@ -172,6 +173,12 @@ export interface StopCanvasAgentInput extends CanvasAgentTarget {}
 export interface CanvasAgentPublicOwner extends CanvasTarget {
   nodeId: string
   title: string
+}
+
+/** Renderer 重载时一次性恢复的运行中 Canvas Agent 安全快照。 */
+export interface CanvasAgentActiveRunSnapshot {
+  owners: Array<CanvasAgentPublicOwner & { sessionId: string }>
+  internalInvalidSessionIds: string[]
 }
 
 /** 按需加载结果不暴露 JSONL 路径或存储类型。 */

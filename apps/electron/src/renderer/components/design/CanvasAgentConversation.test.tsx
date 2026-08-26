@@ -55,11 +55,41 @@ describe('Canvas Agent 对话', () => {
     expect(second).toBe(first)
     rejectSend?.(new Error('会话正在运行'))
     await expect(first).rejects.toThrow('会话正在运行')
-    expect(composer).toEqual([''])
+    expect(composer).toEqual(['', '保留这段内容'])
     expect(sending).toEqual([true, false])
     expect(errors).toEqual([null, '会话正在运行'])
     expect(controller.getComposerRestore()).toBe('保留这段内容')
   })
+
+  test.each(['resolve', 'reject'] as const)(
+    'Given A 节点 SEND 未完成 When 切到 B 后旧请求 %s Then 不污染 B 的 composer、sending 或 error',
+    async (outcome) => {
+      /** 控制 A 节点请求终态的 deferred。 */
+      let settleSend: (() => void) | undefined
+      /** 收集切换后仍可能发生的旧 A UI 回调。 */
+      const callbacks: string[] = []
+      const controller = createCanvasAgentConversationController({
+        load: async () => createResult(),
+        send: () => new Promise<void>((resolve, reject) => {
+          settleSend = () => outcome === 'resolve' ? resolve() : reject(new Error('A 失败'))
+        }),
+        stop: async () => undefined,
+        onLoaded: () => undefined,
+        onComposerChange: (value) => callbacks.push(`composer:${value}`),
+        onSendingChange: (value) => callbacks.push(`sending:${value}`),
+        onError: (value) => callbacks.push(`error:${value ?? ''}`),
+      })
+      const request = controller.send('A 草稿', 'message-a', 10)
+      expect(callbacks).toEqual(['composer:', 'sending:true', 'error:'])
+      controller.dispose()
+      callbacks.length = 0
+
+      settleSend?.()
+      if (outcome === 'reject') await expect(request).rejects.toThrow('A 失败')
+      else await request
+      expect(callbacks).toEqual([])
+    },
+  )
 
   test('Given 窄屏对话面板 When SSR Then 只有文本发送停止关闭控件', () => {
     const html = renderToStaticMarkup(

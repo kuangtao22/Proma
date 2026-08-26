@@ -341,7 +341,7 @@ import {
   listEnabledAgentModelsForChannel,
 } from './lib/agent-model-selection'
 import { isAgentSessionUserVisible, requireUserVisibleAgentSession } from './lib/agent-session-visibility'
-import { agentEventBus, runAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, reserveAgentSessionStart, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
+import { agentEventBus, runAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, reserveAgentSessionStart, listActiveCanvasAgentRuns, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import {
   getDefaultWorkspaceProjectRelocator,
@@ -1759,6 +1759,7 @@ export function registerIpcHandlers(): void {
     store: canvasDocumentStore,
     creation: canvasAgentNodeCreation,
     agent: {
+      listActiveRuns: listActiveCanvasAgentRuns,
       getSession: getAgentSessionMeta,
       getMessages: getAgentSessionSDKMessages,
       reserveStart: reserveAgentSessionStart,

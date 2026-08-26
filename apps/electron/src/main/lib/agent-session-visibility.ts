@@ -1,4 +1,4 @@
-import type { AgentSessionMeta } from '@proma/shared'
+import type { AgentSessionMeta, CanvasAgentActiveRunSnapshot } from '@proma/shared'
 
 /** 包含内部 Agent 会话所有权字段的最小判断输入。 */
 type InternalSessionFields = Pick<
@@ -44,6 +44,37 @@ function hasAnyCanvasSourceField(session: InternalSessionFields): boolean {
   return session.sourceCanvasProjectId !== undefined
     || session.sourceCanvasId !== undefined
     || session.sourceCanvasNodeId !== undefined
+}
+
+/**
+ * 从全量会话索引构造 Renderer 重载所需的最小运行快照。
+ * @param sessions 主进程全量会话元数据。
+ * @param isBusy 判断会话是否处于启动、运行或排队状态。
+ * @returns 仅包含合法 owner 与损坏内部会话 ID 的安全快照。
+ */
+export function buildCanvasAgentActiveRunSnapshot(
+  sessions: AgentSessionMeta[],
+  isBusy: (sessionId: string) => boolean,
+): CanvasAgentActiveRunSnapshot {
+  /** 完整且独占的运行中 Canvas owner。 */
+  const owners: CanvasAgentActiveRunSnapshot['owners'] = []
+  /** 带 Canvas 字段但归属损坏的运行中会话，Renderer 必须 fail closed。 */
+  const internalInvalidSessionIds: string[] = []
+  for (const session of sessions) {
+    if (!isBusy(session.id) || !hasAnyCanvasSourceField(session)) continue
+    if (!hasValidCanvasAgentOwnership(session)) {
+      internalInvalidSessionIds.push(session.id)
+      continue
+    }
+    owners.push({
+      sessionId: session.id,
+      projectId: session.sourceCanvasProjectId!,
+      canvasId: session.sourceCanvasId!,
+      nodeId: session.sourceCanvasNodeId!,
+      title: session.title,
+    })
+  }
+  return { owners, internalInvalidSessionIds }
 }
 
 /**

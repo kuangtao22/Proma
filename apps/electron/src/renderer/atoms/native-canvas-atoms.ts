@@ -58,6 +58,140 @@ export const canvasAgentOwnersAtom = atom<Map<string, CanvasAgentOwner>>(new Map
 /** 仅在打开对话后填充的权威 JSONL 消息缓存，未打开节点不会触发读取。 */
 export const canvasAgentPersistedMessagesAtom = atom<Map<string, SDKMessage[]>>(new Map())
 
+/** 当前仍打开对话面板的 Canvas Agent session。 */
+export const canvasAgentOpenSessionIdsAtom = atom<Set<string>>(new Set<string>())
+
+/** 当前启动、运行或排队中的 Canvas Agent session。 */
+export const canvasAgentRunningSessionIdsAtom = atom<Set<string>>(new Set<string>())
+
+/** 已确认 Canvas 字段损坏的内部 session，未知事件必须 fail closed。 */
+export const canvasAgentInternalInvalidSessionIdsAtom = atom<Set<string>>(new Set<string>())
+
+/** Canvas owner 与持久化消息缓存的生命周期事件。 */
+export type CanvasAgentLifecycleEvent =
+  | { type: 'bootstrap'; owners: CanvasAgentOwner[]; internalInvalidSessionIds: string[] }
+  | { type: 'opened'; owner: CanvasAgentOwner; messages: SDKMessage[] }
+  | { type: 'started' | 'owner-updated'; owner: CanvasAgentOwner }
+  | { type: 'closed' | 'completed' | 'invalidated'; sessionId: string }
+  | { type: 'prune' }
+
+/** 非打开、非运行的历史消息缓存最大 session 数。 */
+const MAX_UNPROTECTED_CANVAS_AGENT_SESSIONS = 20
+/** 单个 Canvas Agent 的持久化消息缓存上限。 */
+const MAX_CANVAS_AGENT_MESSAGES_PER_SESSION = 500
+/** 非保护 Canvas Agent 的持久化消息总上限。 */
+const MAX_UNPROTECTED_CANVAS_AGENT_MESSAGES = 2_000
+/** 损坏 session 抑制集合上限，避免异常来源无限增长。 */
+const MAX_INVALID_CANVAS_AGENT_SESSIONS = 100
+
+/**
+ * 修剪非打开、非运行的 Canvas Agent owner 与消息缓存。
+ * @param owners 当前 owner Map，可在函数内原位修剪。
+ * @param messages 当前消息 Map，可在函数内原位修剪。
+ * @param protectedIds 当前打开或运行中的 session 集合。
+ */
+function pruneCanvasAgentCaches(
+  owners: Map<string, CanvasAgentOwner>,
+  messages: Map<string, SDKMessage[]>,
+  protectedIds: Set<string>,
+): void {
+  /** 每个 session 只保留末尾消息，打开和运行中的面板也遵守单会话上限。 */
+  for (const [sessionId, entries] of messages) {
+    if (entries.length > MAX_CANVAS_AGENT_MESSAGES_PER_SESSION) {
+      messages.set(sessionId, entries.slice(-MAX_CANVAS_AGENT_MESSAGES_PER_SESSION))
+    }
+  }
+  /** Map 插入顺序作为轻量 LRU；GET/open 会重新插入目标 session。 */
+  const unprotectedIds = [...messages.keys()].filter((sessionId) => !protectedIds.has(sessionId))
+  /** 非保护消息总数，超限时优先回收最旧 session。 */
+  let unprotectedMessageCount = unprotectedIds.reduce(
+    (count, sessionId) => count + (messages.get(sessionId)?.length ?? 0),
+    0,
+  )
+  while (unprotectedIds.length > MAX_UNPROTECTED_CANVAS_AGENT_SESSIONS
+    || unprotectedMessageCount > MAX_UNPROTECTED_CANVAS_AGENT_MESSAGES) {
+    const sessionId = unprotectedIds.shift()
+    if (!sessionId) break
+    unprotectedMessageCount -= messages.get(sessionId)?.length ?? 0
+    messages.delete(sessionId)
+    owners.delete(sessionId)
+  }
+  /** 没有消息条目的非保护 owner 同样不允许无限残留。 */
+  for (const sessionId of owners.keys()) {
+    if (!protectedIds.has(sessionId) && !messages.has(sessionId)) owners.delete(sessionId)
+  }
+}
+
+/** owner、打开态、运行态与消息缓存的唯一生命周期写入口。 */
+export const canvasAgentLifecycleAtom = atom(
+  null,
+  (get, set, event: CanvasAgentLifecycleEvent): void => {
+    /** 生命周期事件频率远低于 token 事件，可以在此集中复制一次 Map/Set。 */
+    const owners = new Map(get(canvasAgentOwnersAtom))
+    const messages = new Map(get(canvasAgentPersistedMessagesAtom))
+    const openSessionIds = new Set(get(canvasAgentOpenSessionIdsAtom))
+    const runningSessionIds = new Set(get(canvasAgentRunningSessionIdsAtom))
+    const invalidSessionIds = new Set(get(canvasAgentInternalInvalidSessionIdsAtom))
+
+    if (event.type === 'bootstrap') {
+      /** reload 初始快照替换运行态；仍打开的面板由后续 GET 再建立。 */
+      runningSessionIds.clear()
+      invalidSessionIds.clear()
+      for (const owner of event.owners) {
+        owners.delete(owner.sessionId)
+        owners.set(owner.sessionId, owner)
+        runningSessionIds.add(owner.sessionId)
+      }
+      for (const sessionId of event.internalInvalidSessionIds) invalidSessionIds.add(sessionId)
+    } else if (event.type === 'opened') {
+      owners.delete(event.owner.sessionId)
+      owners.set(event.owner.sessionId, event.owner)
+      messages.delete(event.owner.sessionId)
+      messages.set(event.owner.sessionId, event.messages)
+      openSessionIds.add(event.owner.sessionId)
+      invalidSessionIds.delete(event.owner.sessionId)
+    } else if (event.type === 'started' || event.type === 'owner-updated') {
+      owners.delete(event.owner.sessionId)
+      owners.set(event.owner.sessionId, event.owner)
+      invalidSessionIds.delete(event.owner.sessionId)
+      if (event.type === 'started') runningSessionIds.add(event.owner.sessionId)
+    } else if (event.type === 'closed') {
+      openSessionIds.delete(event.sessionId)
+      if (!runningSessionIds.has(event.sessionId)) {
+        owners.delete(event.sessionId)
+        messages.delete(event.sessionId)
+      }
+    } else if (event.type === 'completed') {
+      runningSessionIds.delete(event.sessionId)
+      if (!openSessionIds.has(event.sessionId)) {
+        owners.delete(event.sessionId)
+        messages.delete(event.sessionId)
+      }
+    } else if (event.type === 'invalidated') {
+      owners.delete(event.sessionId)
+      messages.delete(event.sessionId)
+      openSessionIds.delete(event.sessionId)
+      runningSessionIds.delete(event.sessionId)
+      invalidSessionIds.delete(event.sessionId)
+      invalidSessionIds.add(event.sessionId)
+    }
+
+    /** 打开或运行的 session 是保护项，可暂时超过非保护总量。 */
+    const protectedIds = new Set([...openSessionIds, ...runningSessionIds])
+    pruneCanvasAgentCaches(owners, messages, protectedIds)
+    while (invalidSessionIds.size > MAX_INVALID_CANVAS_AGENT_SESSIONS) {
+      const oldestSessionId = invalidSessionIds.values().next().value
+      if (oldestSessionId === undefined) break
+      invalidSessionIds.delete(oldestSessionId)
+    }
+    set(canvasAgentOwnersAtom, owners)
+    set(canvasAgentPersistedMessagesAtom, messages)
+    set(canvasAgentOpenSessionIdsAtom, openSessionIds)
+    set(canvasAgentRunningSessionIdsAtom, runningSessionIds)
+    set(canvasAgentInternalInvalidSessionIdsAtom, invalidSessionIds)
+  },
+)
+
 /** 单个原生 Canvas 状态更新输入。 */
 export interface UpdateNativeCanvasStateInput {
   key: string

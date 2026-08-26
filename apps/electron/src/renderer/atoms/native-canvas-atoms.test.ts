@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import { createStore } from 'jotai'
 import {
+  canvasAgentInternalInvalidSessionIdsAtom,
+  canvasAgentLifecycleAtom,
+  canvasAgentOpenSessionIdsAtom,
   canvasAgentOwnersAtom,
   canvasAgentPersistedMessagesAtom,
   createInitialNativeCanvasState,
@@ -61,5 +64,54 @@ describe('原生 Canvas 状态隔离', () => {
 
     expect(store.get(canvasAgentOwnersAtom).get('session-1')?.canvasId).toBe('canvas-a')
     expect(store.get(canvasAgentPersistedMessagesAtom).has('session-1')).toBe(true)
+  })
+
+  test('Given Canvas session 生命周期 When 完成或关闭 Then 只保留仍运行或仍打开的缓存', () => {
+    const store = createStore()
+    /** 两个会话分别覆盖“运行中关闭”和“终态仍打开”。 */
+    const owner = (sessionId: string) => ({
+      sessionId, projectId: 'project-a', canvasId: 'canvas-a', nodeId: `node-${sessionId}`, title: sessionId,
+    })
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'bootstrap', owners: [owner('running')], internalInvalidSessionIds: [],
+    })
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'opened', owner: owner('running'), messages: [],
+    })
+    store.set(canvasAgentLifecycleAtom, { type: 'closed', sessionId: 'running' })
+    expect(store.get(canvasAgentOwnersAtom).has('running')).toBe(true)
+    expect(store.get(canvasAgentPersistedMessagesAtom).has('running')).toBe(true)
+
+    store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: 'running' })
+    expect(store.get(canvasAgentOwnersAtom).has('running')).toBe(false)
+    expect(store.get(canvasAgentPersistedMessagesAtom).has('running')).toBe(false)
+
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'opened', owner: owner('open'), messages: [],
+    })
+    store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: 'open' })
+    expect(store.get(canvasAgentOwnersAtom).has('open')).toBe(true)
+    store.set(canvasAgentLifecycleAtom, { type: 'closed', sessionId: 'open' })
+    expect(store.get(canvasAgentOwnersAtom).has('open')).toBe(false)
+    expect(store.get(canvasAgentOpenSessionIdsAtom).size).toBe(0)
+  })
+
+  test('Given 损坏 completion 与大量关闭缓存 When 生命周期收口 Then 立即失效且非保护缓存有界', () => {
+    const store = createStore()
+    /** 生成超过非保护缓存上限的历史会话。 */
+    for (let index = 0; index < 25; index += 1) {
+      const sessionId = `session-${index}`
+      store.set(canvasAgentOwnersAtom, (current) => new Map(current).set(sessionId, {
+        sessionId, projectId: 'project-a', canvasId: 'canvas-a', nodeId: `node-${index}`, title: sessionId,
+      }))
+      store.set(canvasAgentPersistedMessagesAtom, (current) => new Map(current).set(sessionId, []))
+    }
+    store.set(canvasAgentLifecycleAtom, { type: 'prune' })
+    expect(store.get(canvasAgentPersistedMessagesAtom).size).toBeLessThanOrEqual(20)
+
+    store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId: 'session-24' })
+    expect(store.get(canvasAgentOwnersAtom).has('session-24')).toBe(false)
+    expect(store.get(canvasAgentPersistedMessagesAtom).has('session-24')).toBe(false)
+    expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).has('session-24')).toBe(true)
   })
 })

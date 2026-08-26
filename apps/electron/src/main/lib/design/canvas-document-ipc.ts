@@ -2,6 +2,7 @@ import { CANVAS_IPC_CHANNELS } from '@proma/shared'
 import type {
   CanvasAgentNodeCreationResult,
   CanvasAgentMessagesResult,
+  CanvasAgentActiveRunSnapshot,
   CanvasChangeEvent,
   CanvasMutation,
   CanvasWorkspaceSnapshot,
@@ -46,6 +47,7 @@ export interface CanvasDocumentIpcOptions {
   creation: Pick<CanvasAgentNodeCreationService, 'reconcile' | 'createReconciled'>
   /** Canvas 专用 Agent 能力；运行仍复用全局 Pi runtime。 */
   agent: {
+    listActiveRuns: () => CanvasAgentActiveRunSnapshot
     getSession: (sessionId: string) => AgentSessionMeta | undefined
     getMessages: (sessionId: string) => SDKMessage[]
     reserveStart: (sessionId: string) => () => void
@@ -300,6 +302,7 @@ export function registerCanvasDocumentIpcHandlers(
     CANVAS_IPC_CHANNELS.LOAD,
     CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
     CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+    CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
     CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
     CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
     CANVAS_IPC_CHANNELS.STOP_AGENT,
@@ -333,6 +336,14 @@ export function registerCanvasDocumentIpcHandlers(
       release()
     }
   }
+
+  options.ipc.handle(
+    CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
+    (event): CanvasAgentActiveRunSnapshot => {
+      assertAuthorizedSender(event, options)
+      return options.agent.listActiveRuns()
+    },
+  )
 
   /** 在 Canvas 串行队列和 workspace lease 内完成 pending 对账与双向归属确认。 */
   const resolveAgentOwner = async (input: GetCanvasAgentMessagesInput) => {

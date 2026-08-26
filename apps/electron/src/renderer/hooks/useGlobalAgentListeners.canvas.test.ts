@@ -14,7 +14,7 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     expect(source).toContain('if (!isCanvasAgentCompletion && data.session && !backgroundTasksPending)')
     expect(source).toContain('else if (!isCanvasAgentCompletion) notifyAgentCompletion')
     expect(source).toContain('if (!isCanvasAgentCompletion && completionMarkers.markUnviewedCompleted')
-    expect(source).toContain('if (isCanvasAgentCompletion) return')
+    expect(source).toContain('if (isCanvasAgentCompletion) {')
   })
 
   test('Given Canvas 完成通知 When 用户点击 Then 返回原 Canvas 与节点对话且不打开 Agent tab', () => {
@@ -23,8 +23,24 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     const end = source.indexOf('\n    /**', start + 1)
     const body = source.slice(start, end)
     expect(body).toContain('store.set(activeCanvasSelectionAtom')
+    expect(body).toContain("store.set(activeViewAtom, 'design')")
     expect(body).toContain('conversationNodeId: owner.nodeId')
     expect(body).toContain('selectedNodeId: owner.nodeId')
     expect(body).not.toContain('openTab(')
+  })
+
+  test('Given renderer 重载且 bootstrap 未完成 When 未知流与标题先到 Then 暂存并在 owner 恢复后重放一次', () => {
+    const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
+    expect(source).toContain('window.electronAPI.listActiveCanvasAgentRuns()')
+    expect(source).toContain('canvasAgentBootstrapGate.complete()')
+    expect(source).toContain('canvasAgentBootstrapGate.fail()')
+    expect(source).toContain('canvasAgentBootstrapGate.handle')
+  })
+
+  test('Given completion payload 明确损坏 When 本地已有旧 owner Then 失效缓存且禁止 fallback', () => {
+    const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
+    expect(source).toContain("completionRoute.kind === 'internal-invalid'")
+    expect(source).toContain("type: 'invalidated'")
+    expect(source).not.toContain("completionRoute.kind === 'canvas'\n          ? completionRoute.owner\n          : store.get(canvasAgentOwnersAtom).get(data.sessionId)")
   })
 })

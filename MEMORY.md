@@ -75,6 +75,7 @@
 - Common Bridge 与飞书 Bridge 的 Agent terminal 回调必须以启动时捕获的 `sessionId + workspaceId` 复核当前绑定、用户可见性和项目一致性；身份漂移只允许清理/关闭，禁止向外部聊天发送内部错误正文。飞书失效清理由统一幂等边界先摘除 binding/反向索引和全部运行态，再异步关闭 CardStream，关闭失败不得恢复引用。
 - Bun 非 isolate 组合测试中的 `mock.module` 会跨文件覆盖；共享核心模块的测试替身必须提供组合消费者所需的完整导出合同，并复用同一可重置状态，禁止各测试文件注册互不兼容的局部 mock。
 - Canvas Agent 对话只允许通过专用 GET/SEND/STOP IPC 访问：每次调用先对账 pending intent，再从权威 Canvas 文档解析 `node -> session` 并复核会话三字段独占归属；运行复用 Pi Agent runtime，但单次强制 `Read`、`Glob`、`Grep` 只读工具白名单。持久化 JSONL 仅在打开对话时读取，关闭或切换 Canvas 不停止运行；全局事件按最小 owner 路由，完整归属只进入 Canvas live/error/完成导航，半归属、混合归属和损坏归属 fail closed，禁止进入普通会话、未读、状态岛或 Agent tab。
+- Renderer reload 只通过一次性 active Canvas run 快照恢复 busy session 的最小 owner；快照返回合法 owner 与损坏内部 session ID，bootstrap 前未知 stream/title 有界暂存并在失败时 fail closed。owner/messages 统一按 open/running/completed/invalid 生命周期回收，非保护缓存限制为 20 个 session、单会话 500 条、总计 2000 条，禁止在 token 热路径查询全量 session 或修剪 Map。
 
 ## 会话记录
 
@@ -160,3 +161,4 @@
 - 2026-08-26：Canvas reconciliation 发布统一以 `recoveredFrom` 优先于普通 graph，SAVE/CREATE 后续成功或失败均不能吞掉恢复事实，且所有广播必须在 workspace lease 释放后执行。Canvas intent helper 在同一 transactions fd/HANDLE 下只统计合法 UUID 普通文件，512 个时允许覆盖并拒绝新增；写协议区分 rename 前失败、提交成功和 rename 后耐久性未确认，后者由服务重扫精确 intent，可见后先发布再传播明确错误，不可见则 fail closed。目录 `dev/ino` 全程使用 bigint 与 helper 十进制字符串精确比较；Renderer 切换 Canvas 时以命令代次隔离旧创建请求的迟到结果。
 - 2026-08-26：Canvas intent 容量检查、目标覆盖、相对 rename 与目录 flush 必须由固定内部普通锁文件提供跨进程原子性，不能只依赖单进程或单 IPC 串行；POSIX 锁文件使用 `O_NOFOLLOW`/`O_CLOEXEC` 与 `flock`，Windows 必须在同一 transactions HANDLE 下相对打开、拒绝 reparse 并使用 `LockFileEx`。锁文件不计入 intent 容量，helper 被 host 超时终止后由系统释放锁。
 - 2026-08-26：Canvas intent 的所有状态迁移（包括 `detached`）都必须消费 helper 的结构化写确认；detached rename 已可见但目录持久性未确认时原样传播明确错误，同时保持 `documentChanged=false` 且不发布 graph revision。intent scan 容量只统计 no-follow 验证后的合法普通文件，目录、symlink 与 Windows reparse point 均忽略且不占 512 项预算。
+- 2026-08-26：修复 Canvas Agent renderer reload 归属恢复、损坏 completion 旧缓存 fallback、完成通知未切 Design 视图、切节点 SEND 迟到回调污染和 owner/messages 无界生命周期；active-run bootstrap、事件 gate 与 Jotai lifecycle 均有 BDD 回归覆盖。

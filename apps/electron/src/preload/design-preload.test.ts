@@ -36,6 +36,7 @@ describe('Design preload', () => {
         operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1',
         title: '首页 Agent', position: { x: 10, y: 20 },
       }]],
+      [() => api.listActiveCanvasAgentRuns(), CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS, []],
       [() => api.getCanvasAgentMessages({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }), CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }]],
       [() => api.sendCanvasAgentMessage({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1', message: '继续', userMessageUuid: 'message-1', startedAt: 10 }), CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1', message: '继续', userMessageUuid: 'message-1', startedAt: 10 }]],
       [() => api.stopCanvasAgent({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }), CANVAS_IPC_CHANNELS.STOP_AGENT, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }]],

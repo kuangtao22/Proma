@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test'
+import type { AgentSessionMeta, CanvasAgentActiveRunSnapshot } from '@proma/shared'
+import * as visibility from './agent-session-visibility'
 import {
   hasValidCanvasAgentOwnership,
   hasValidDesignSessionOwnership,
@@ -41,6 +43,46 @@ describe('Agent 内部 Design 会话可见性', () => {
 })
 
 describe('Agent 内部 Canvas 会话归属与可见性', () => {
+  test('Given 全量会话 When 构造 active Canvas 快照 Then 仅分流 busy 的合法与损坏归属', () => {
+    /** 待实现的纯快照构造函数，先以运行时合同锁定 API。 */
+    const buildSnapshot = (visibility as typeof visibility & {
+      buildCanvasAgentActiveRunSnapshot?: (
+        sessions: AgentSessionMeta[],
+        isBusy: (sessionId: string) => boolean,
+      ) => CanvasAgentActiveRunSnapshot
+    }).buildCanvasAgentActiveRunSnapshot
+    expect(buildSnapshot).toBeFunction()
+    if (!buildSnapshot) return
+    /** busy 集合模拟 starting/orchestrator/queue 三种运行来源的合并判断。 */
+    const busyIds = new Set(['valid', 'invalid', 'ordinary'])
+    const snapshot = buildSnapshot([
+      {
+        id: 'valid', title: 'Canvas Agent', workspaceId: 'project-1',
+        sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
+        createdAt: 1, updatedAt: 1,
+      },
+      {
+        id: 'invalid', title: '损坏 Canvas', workspaceId: 'project-1',
+        sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1',
+        createdAt: 1, updatedAt: 1,
+      },
+      { id: 'ordinary', title: '普通会话', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
+      {
+        id: 'idle-canvas', title: '空闲 Canvas', workspaceId: 'project-1',
+        sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-2',
+        createdAt: 1, updatedAt: 1,
+      },
+    ], (sessionId) => busyIds.has(sessionId))
+
+    expect(snapshot).toEqual({
+      owners: [{
+        sessionId: 'valid', projectId: 'project-1', canvasId: 'canvas-1',
+        nodeId: 'node-1', title: 'Canvas Agent',
+      }],
+      internalInvalidSessionIds: ['invalid'],
+    })
+  })
+
   test('Given Canvas 三字段完整且工作区匹配 When 判断归属 Then 认定为合法内部会话', () => {
     /** 完整且归属同一项目的 Canvas Agent 元数据。 */
     const internal = {
