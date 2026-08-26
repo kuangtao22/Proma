@@ -51,7 +51,7 @@ export interface CanvasDocumentIpcOptions {
     listActiveRuns: () => CanvasAgentActiveRunSnapshot
     getSession: (sessionId: string) => AgentSessionMeta | undefined
     getMessages: (sessionId: string) => SDKMessage[]
-    reserveStart: (sessionId: string) => () => void
+    reserveStart: (sessionId: string, startedAt?: number) => () => void
     run: (input: AgentSendInput, sender: WebContents, extensions: AgentRunExtensions) => Promise<void>
     stop: (sessionId: string) => void
   }
@@ -390,7 +390,7 @@ export function registerCanvasDocumentIpcHandlers(
     /** 只有同会话 busy 属于 Renderer 可恢复的结构化准入结果。 */
     let releaseStart: () => void
     try {
-      releaseStart = options.agent.reserveStart(owner.session.id)
+      releaseStart = options.agent.reserveStart(owner.session.id, input.startedAt)
     } catch (error) {
       if (isAgentSessionBusyError(error)) {
         return {

@@ -49,6 +49,7 @@ describe('Agent 内部 Canvas 会话归属与可见性', () => {
       buildCanvasAgentActiveRunSnapshot?: (
         sessions: AgentSessionMeta[],
         isBusy: (sessionId: string) => boolean,
+        getStartedAt?: (sessionId: string) => number | undefined,
       ) => CanvasAgentActiveRunSnapshot
     }).buildCanvasAgentActiveRunSnapshot
     expect(buildSnapshot).toBeFunction()
@@ -72,12 +73,12 @@ describe('Agent 内部 Canvas 会话归属与可见性', () => {
         sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-2',
         createdAt: 1, updatedAt: 1,
       },
-    ], (sessionId) => busyIds.has(sessionId))
+    ], (sessionId) => busyIds.has(sessionId), (sessionId) => sessionId === 'valid' ? 123 : undefined)
 
     expect(snapshot).toEqual({
       owners: [{
         sessionId: 'valid', projectId: 'project-1', canvasId: 'canvas-1',
-        nodeId: 'node-1', title: 'Canvas Agent',
+        nodeId: 'node-1', title: 'Canvas Agent', startedAt: 123,
       }],
       internalInvalidSessionIds: ['invalid'],
     })

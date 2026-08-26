@@ -209,14 +209,17 @@ export function CanvasAgentConversation({
     const controller = controllerRef.current
     if (!controller) return
     setStreamErrors((prev) => clearAgentStreamError(prev, sessionId))
-    /** userMessageUuid 同时作为 IPC 幂等身份与 Renderer 乐观运行 generation。 */
+    /** userMessageUuid 同时作为 IPC 幂等身份与 Renderer 乐观运行 token。 */
     const operationToken = window.crypto.randomUUID()
+    /** 与主进程 completion.startedAt 共用的本轮代次。 */
+    const startedAt = Date.now()
     updateLifecycle({
       type: 'optimistic-started',
       owner: { sessionId, projectId, canvasId, nodeId, title },
       token: operationToken,
+      startedAt,
     })
-    void controller.send(message, operationToken, Date.now()).catch(() => undefined)
+    void controller.send(message, operationToken, startedAt).catch(() => undefined)
   }, [canvasId, composer, messagesLoaded, nodeId, projectId, sessionId, setStreamErrors, title, updateLifecycle])
 
   const persistedMessages = sessionId ? persistedMessagesMap.get(sessionId) ?? [] : []

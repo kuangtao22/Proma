@@ -1,5 +1,6 @@
 import type { CanvasMutation, CanvasWorkspaceSnapshot, SDKMessage } from '@proma/shared'
 import { atom } from 'jotai'
+import type { Store } from 'jotai/vanilla/store'
 import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
 import {
   agentSessionStreamingStateAtomFamily,
@@ -75,6 +76,9 @@ export const canvasAgentAuthoritativeRunningSessionIdsAtom = atom<Set<string>>(n
 /** Renderer 已提交但主进程尚未确认的 Canvas Agent 运行 token。 */
 export const canvasAgentOptimisticRunTokensAtom = atom<Map<string, string>>(new Map<string, string>())
 
+/** 每个 Canvas Agent 最新已知运行代次；null 表示 bootstrap 只确认 busy、未确认代次。 */
+export const canvasAgentRunGenerationsAtom = atom<Map<string, number | null>>(new Map<string, number | null>())
+
 /** 已确认 Canvas 字段损坏的内部 session，未知事件必须 fail closed。 */
 export const canvasAgentInternalInvalidSessionIdsAtom = atom<Set<string>>(new Set<string>())
 
@@ -86,13 +90,14 @@ export const canvasAgentTerminalInternalInvalidSessionIdsAtom = atom<Set<string>
 
 /** Canvas owner 与持久化消息缓存的生命周期事件。 */
 export type CanvasAgentLifecycleEvent =
-  | { type: 'bootstrap'; owners: CanvasAgentOwner[]; internalInvalidSessionIds: string[] }
+  | { type: 'bootstrap'; owners: Array<CanvasAgentOwner & { startedAt?: number }>; internalInvalidSessionIds: string[] }
   | { type: 'opened'; owner: CanvasAgentOwner; messages: SDKMessage[] }
-  | { type: 'started' | 'owner-updated'; owner: CanvasAgentOwner }
-  | { type: 'optimistic-started'; owner: CanvasAgentOwner; token: string }
+  | { type: 'started'; owner: CanvasAgentOwner; startedAt: number }
+  | { type: 'owner-updated'; owner: CanvasAgentOwner }
+  | { type: 'optimistic-started'; owner: CanvasAgentOwner; token: string; startedAt: number }
   | { type: 'send-rejected'; sessionId: string; token: string; preserveRunning: boolean }
-  | { type: 'closed' | 'completed'; sessionId: string }
-  | { type: 'settled'; sessionId: string }
+  | { type: 'closed'; sessionId: string }
+  | { type: 'completed' | 'settled'; sessionId: string; startedAt: number }
   | { type: 'invalidated'; sessionId: string; terminal: boolean }
   | { type: 'prune' }
 
@@ -104,6 +109,15 @@ const MAX_CANVAS_AGENT_MESSAGES_PER_SESSION = 500
 const MAX_UNPROTECTED_CANVAS_AGENT_MESSAGES = 2_000
 /** 终态损坏 session tombstone 上限；active invalid 不受此限制。 */
 const MAX_INVALID_CANVAS_AGENT_SESSIONS = 100
+
+/** 判断异步终态副作用是否仍属于当前 Canvas Agent 运行代次。 */
+export function isCanvasAgentGenerationCurrent(
+  store: Pick<Store, 'get'>,
+  sessionId: string,
+  startedAt: number,
+): boolean {
+  return store.get(canvasAgentRunGenerationsAtom).get(sessionId) === startedAt
+}
 
 /**
  * 修剪非打开、非运行的 Canvas Agent owner 与消息缓存。
@@ -154,17 +168,24 @@ export const canvasAgentLifecycleAtom = atom(
     const runningSessionIds = new Set(get(canvasAgentRunningSessionIdsAtom))
     const authoritativeRunningSessionIds = new Set(get(canvasAgentAuthoritativeRunningSessionIdsAtom))
     const optimisticRunTokens = new Map(get(canvasAgentOptimisticRunTokensAtom))
+    const runGenerations = new Map(get(canvasAgentRunGenerationsAtom))
     const activeInvalidSessionIds = new Set(get(canvasAgentActiveInternalInvalidSessionIdsAtom))
     const terminalInvalidSessionIds = new Set(get(canvasAgentTerminalInternalInvalidSessionIdsAtom))
+
+    if ((event.type === 'completed' || event.type === 'settled')
+      && runGenerations.get(event.sessionId) !== event.startedAt) return
 
     if (event.type === 'bootstrap') {
       /** reload 初始快照替换运行态；仍打开的面板由后续 GET 再建立。 */
       authoritativeRunningSessionIds.clear()
       activeInvalidSessionIds.clear()
       for (const owner of event.owners) {
+        /** bootstrap 快照的运行代次与纯 owner 分开保存，避免内部字段污染导航归属。 */
+        const { startedAt, ...canvasOwner } = owner
         owners.delete(owner.sessionId)
-        owners.set(owner.sessionId, owner)
+        owners.set(owner.sessionId, canvasOwner)
         authoritativeRunningSessionIds.add(owner.sessionId)
+        runGenerations.set(owner.sessionId, startedAt ?? null)
       }
       for (const sessionId of event.internalInvalidSessionIds) {
         terminalInvalidSessionIds.delete(sessionId)
@@ -178,23 +199,37 @@ export const canvasAgentLifecycleAtom = atom(
       openSessionIds.add(event.owner.sessionId)
       activeInvalidSessionIds.delete(event.owner.sessionId)
       terminalInvalidSessionIds.delete(event.owner.sessionId)
-    } else if (event.type === 'started' || event.type === 'owner-updated') {
+    } else if (event.type === 'started') {
+      const currentGeneration = runGenerations.get(event.owner.sessionId)
+      if (typeof currentGeneration === 'number' && currentGeneration > event.startedAt) return
       owners.delete(event.owner.sessionId)
       owners.set(event.owner.sessionId, event.owner)
       activeInvalidSessionIds.delete(event.owner.sessionId)
       terminalInvalidSessionIds.delete(event.owner.sessionId)
-      if (event.type === 'started') authoritativeRunningSessionIds.add(event.owner.sessionId)
+      authoritativeRunningSessionIds.add(event.owner.sessionId)
+      runGenerations.set(event.owner.sessionId, event.startedAt)
+    } else if (event.type === 'owner-updated') {
+      owners.delete(event.owner.sessionId)
+      owners.set(event.owner.sessionId, event.owner)
+      activeInvalidSessionIds.delete(event.owner.sessionId)
+      terminalInvalidSessionIds.delete(event.owner.sessionId)
     } else if (event.type === 'optimistic-started') {
       owners.delete(event.owner.sessionId)
       owners.set(event.owner.sessionId, event.owner)
       optimisticRunTokens.set(event.owner.sessionId, event.token)
+      runGenerations.set(event.owner.sessionId, event.startedAt)
       activeInvalidSessionIds.delete(event.owner.sessionId)
       terminalInvalidSessionIds.delete(event.owner.sessionId)
     } else if (event.type === 'send-rejected') {
       /** 迟到的旧请求只能收口自己的 token，不能覆盖同 session 的新一轮运行。 */
       if (optimisticRunTokens.get(event.sessionId) === event.token) {
         optimisticRunTokens.delete(event.sessionId)
-        if (event.preserveRunning) authoritativeRunningSessionIds.add(event.sessionId)
+        if (event.preserveRunning) {
+          if (!authoritativeRunningSessionIds.has(event.sessionId)) runGenerations.set(event.sessionId, null)
+          authoritativeRunningSessionIds.add(event.sessionId)
+        } else if (!authoritativeRunningSessionIds.has(event.sessionId)) {
+          runGenerations.delete(event.sessionId)
+        }
         if (!event.preserveRunning
           && !authoritativeRunningSessionIds.has(event.sessionId)
           && !openSessionIds.has(event.sessionId)) {
@@ -207,6 +242,7 @@ export const canvasAgentLifecycleAtom = atom(
       if (!runningSessionIds.has(event.sessionId)) {
         owners.delete(event.sessionId)
         messages.delete(event.sessionId)
+        runGenerations.delete(event.sessionId)
       }
     } else if (event.type === 'completed') {
       authoritativeRunningSessionIds.delete(event.sessionId)
@@ -214,7 +250,10 @@ export const canvasAgentLifecycleAtom = atom(
       if (!openSessionIds.has(event.sessionId)) {
         owners.delete(event.sessionId)
         messages.delete(event.sessionId)
+        runGenerations.delete(event.sessionId)
       }
+    } else if (event.type === 'settled') {
+      runGenerations.delete(event.sessionId)
     } else if (event.type === 'invalidated') {
       owners.delete(event.sessionId)
       messages.delete(event.sessionId)
@@ -222,6 +261,7 @@ export const canvasAgentLifecycleAtom = atom(
       if (event.terminal) {
         authoritativeRunningSessionIds.delete(event.sessionId)
         optimisticRunTokens.delete(event.sessionId)
+        runGenerations.delete(event.sessionId)
         activeInvalidSessionIds.delete(event.sessionId)
         terminalInvalidSessionIds.delete(event.sessionId)
         terminalInvalidSessionIds.add(event.sessionId)
@@ -274,6 +314,7 @@ export const canvasAgentLifecycleAtom = atom(
     set(canvasAgentRunningSessionIdsAtom, runningSessionIds)
     set(canvasAgentAuthoritativeRunningSessionIdsAtom, authoritativeRunningSessionIds)
     set(canvasAgentOptimisticRunTokensAtom, optimisticRunTokens)
+    set(canvasAgentRunGenerationsAtom, runGenerations)
     set(canvasAgentActiveInternalInvalidSessionIdsAtom, activeInvalidSessionIds)
     set(canvasAgentTerminalInternalInvalidSessionIdsAtom, terminalInvalidSessionIds)
     set(canvasAgentInternalInvalidSessionIdsAtom, invalidSessionIds)

@@ -55,6 +55,7 @@ function hasAnyCanvasSourceField(session: InternalSessionFields): boolean {
 export function buildCanvasAgentActiveRunSnapshot(
   sessions: AgentSessionMeta[],
   isBusy: (sessionId: string) => boolean,
+  getStartedAt: (sessionId: string) => number | undefined = () => undefined,
 ): CanvasAgentActiveRunSnapshot {
   /** 完整且独占的运行中 Canvas owner。 */
   const owners: CanvasAgentActiveRunSnapshot['owners'] = []
@@ -66,12 +67,14 @@ export function buildCanvasAgentActiveRunSnapshot(
       internalInvalidSessionIds.push(session.id)
       continue
     }
+    const startedAt = getStartedAt(session.id)
     owners.push({
       sessionId: session.id,
       projectId: session.sourceCanvasProjectId!,
       canvasId: session.sourceCanvasId!,
       nodeId: session.sourceCanvasNodeId!,
       title: session.title,
+      ...(startedAt !== undefined ? { startedAt } : {}),
     })
   }
   return { owners, internalInvalidSessionIds }

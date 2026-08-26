@@ -185,7 +185,7 @@ export interface CanvasAgentPublicOwner extends CanvasTarget {
 
 /** Renderer 重载时一次性恢复的运行中 Canvas Agent 安全快照。 */
 export interface CanvasAgentActiveRunSnapshot {
-  owners: Array<CanvasAgentPublicOwner & { sessionId: string }>
+  owners: Array<CanvasAgentPublicOwner & { sessionId: string; startedAt?: number }>
   internalInvalidSessionIds: string[]
 }
 

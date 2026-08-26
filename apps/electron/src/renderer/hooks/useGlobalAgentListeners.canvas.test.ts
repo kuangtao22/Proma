@@ -17,6 +17,19 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     expect(source).toContain('if (isCanvasAgentCompletion) {')
   })
 
+  test('Given Canvas completion When 代次不匹配或 GET 晚回 Then 所有终态副作用 fail closed', () => {
+    const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
+    expect(source).toContain('currentGeneration !== data.startedAt')
+    expect(source).toContain('if (!isCanvasAgentGenerationCurrent(store, data.sessionId, data.startedAt!)) return')
+    expect(source).toContain("type: 'completed', sessionId: data.sessionId, startedAt: data.startedAt!")
+    expect(source).toContain("type: 'settled', sessionId: data.sessionId, startedAt: data.startedAt!")
+  })
+
+  test('Given completion warning When 真实 listener 分派 Then 必须携 route kind 再决定 toast', () => {
+    const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
+    expect(source).toContain('notifyAgentCompletionWarning(completionRoute.kind, data, (message) => {')
+  })
+
   test('Given Canvas 完成通知 When 用户点击 Then 返回原 Canvas 与节点对话且不打开 Agent tab', () => {
     const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
     const start = source.indexOf('const makeNavigateToCanvasAgent')

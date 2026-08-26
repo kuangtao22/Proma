@@ -158,12 +158,12 @@ const agentQueueCoordinator = new AgentQueueCoordinator({
  * Renderer run 在创建飞书镜像卡片时尚未进入 orchestrator.activeSessions。
  * 在此期间保留启动槽位，避免会话迁移改变已接受请求的项目归属。
  */
-const startingAgentSessions = new Set<string>()
+const startingAgentSessions = new Map<string, number | undefined>()
 
 /** 主进程内部稳定 busy 错误码，仅用于可信 IPC 边界分类。 */
 const AGENT_SESSION_BUSY_ERROR_CODE = 'AGENT_SESSION_BUSY'
 
-export function reserveAgentSessionStart(sessionId: string): () => void {
+export function reserveAgentSessionStart(sessionId: string, startedAt?: number): () => void {
   if (startingAgentSessions.has(sessionId) || orchestrator.isActive(sessionId)) {
     /** 附加稳定内部码，避免 IPC 依赖可能变化的中文错误文案。 */
     const busyError = Object.assign(
@@ -172,7 +172,7 @@ export function reserveAgentSessionStart(sessionId: string): () => void {
     )
     throw busyError
   }
-  startingAgentSessions.add(sessionId)
+  startingAgentSessions.set(sessionId, startedAt)
   return () => startingAgentSessions.delete(sessionId)
 }
 
@@ -187,7 +187,11 @@ export function isAgentSessionBusy(sessionId: string): boolean {
  * @returns 不暴露路径、JSONL 或普通内部字段的安全快照。
  */
 export function listActiveCanvasAgentRuns(): CanvasAgentActiveRunSnapshot {
-  return buildCanvasAgentActiveRunSnapshot(listAgentSessions(), isAgentSessionBusy)
+  return buildCanvasAgentActiveRunSnapshot(
+    listAgentSessions(),
+    isAgentSessionBusy,
+    (sessionId) => startingAgentSessions.get(sessionId),
+  )
 }
 
 function publishRunStopped(
@@ -373,6 +377,7 @@ export async function runAgent(
             sendAuthoritativeAgentStreamComplete(webContents, input, getAgentSessionMeta, {
               messages: [],
               stoppedByUser: false,
+              startedAt: input.startedAt,
             })
           }
         },

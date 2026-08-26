@@ -69,6 +69,8 @@ import {
   canvasAgentLifecycleAtom,
   canvasAgentOpenSessionIdsAtom,
   canvasAgentRunningSessionIdsAtom,
+  canvasAgentRunGenerationsAtom,
+  isCanvasAgentGenerationCurrent,
   createNativeCanvasKey,
   updateNativeCanvasStateAtom,
 } from '@/atoms/native-canvas-atoms'
@@ -86,6 +88,7 @@ import { upsertAgentSession, mergeFetchedAgentSessions } from '@/lib/agent-sessi
 import {
   getAgentCompletionMarkers,
   notifyAgentCompletion,
+  notifyAgentCompletionWarning,
 } from '@/lib/agent-completion-presence'
 import { getPlanModeChangeFromToolName, updatePlanModeSessionSet } from '@/lib/agent-plan-mode'
 import { buildTodoAgentPrompt } from '@/lib/todo-agent-prompt'
@@ -961,7 +964,9 @@ export function useGlobalAgentListeners(): void {
           : null
         if (runStartedEvent) {
           const canvasOwner = store.get(canvasAgentOwnersAtom).get(sessionId)
-          if (canvasOwner) store.set(canvasAgentLifecycleAtom, { type: 'started', owner: canvasOwner })
+          if (canvasOwner) store.set(canvasAgentLifecycleAtom, {
+            type: 'started', owner: canvasOwner, startedAt: runStartedEvent.startedAt,
+          })
           // 队列 run 会先通过独立 IPC 发送 started 投影，但该投影可能在窗口
           // 重载或跨 renderer 路由时丢失。run_started 是同一轮的第二个权威启动信号，
           // 必须在首个 SDK/tool 事件之前恢复 running、startedAt 和正常的 live UI。
@@ -1569,6 +1574,13 @@ export function useGlobalAgentListeners(): void {
           data.session,
           store.get(canvasAgentInternalInvalidSessionIdsAtom).has(data.sessionId),
         )
+        if (completionRoute.kind !== 'agent') {
+          const trackedGeneration = store.get(canvasAgentRunGenerationsAtom).get(data.sessionId)
+          const streamGeneration = store.get(agentSessionStreamingStateAtomFamily(data.sessionId))?.startedAt
+          const currentGeneration = typeof trackedGeneration === 'number' ? trackedGeneration : streamGeneration
+          /** 未知 bootstrap 代次或迟到 completion 均不得产生任何终态副作用。 */
+          if (data.startedAt == null || currentGeneration !== data.startedAt) return
+        }
         if (completionRoute.kind === 'internal-invalid') {
           store.set(canvasAgentLifecycleAtom, {
             type: 'invalidated', sessionId: data.sessionId, terminal: !backgroundTasksPending,
@@ -1692,23 +1704,9 @@ export function useGlobalAgentListeners(): void {
           return prev
         })
 
-        // 非正常结束时显示截断提示
-        if (data.resultSubtype && data.resultSubtype !== 'success' && !data.stoppedByUser) {
-          const messages: Record<string, string> = {
-            error_max_turns: '任务被中断：已达到轮次上限。继续对话可让 Agent 接着完成。',
-            error_max_budget_usd: '任务被中断：已达到预算上限。',
-            error_during_execution: '任务执行过程中发生错误。',
-            empty_response: 'Agent 本轮结束了，但没有返回任何可展示内容。你的消息已保留，可以直接重试或切换模型。',
-          }
-          // error_during_execution 等执行期错误：优先展示 SDK result.errors[] 携带的真实原因，
-          // 让用户能据此判断重试 / 改提问 / 报 bug，而非只看到泛泛的兜底文案。
-          const detail = data.resultErrors?.find((e) => typeof e === 'string' && e.trim().length > 0)?.trim()
-          const fallback = messages[data.resultSubtype] ?? `任务异常结束（${data.resultSubtype}）`
-          const msg = detail
-            ? `任务执行出错：${detail}`
-            : fallback
-          toast.warning(msg, { duration: 8000 })
-        }
+        notifyAgentCompletionWarning(completionRoute.kind, data, (message) => {
+          toast.warning(message, { duration: 8000 })
+        })
 
         // 清除 Plan 模式状态（防止异常退出时残留）
         if (!isCanvasAgentCompletion) store.set(agentPlanModeSessionsAtom, (prev: Set<string>) => {
@@ -1721,7 +1719,9 @@ export function useGlobalAgentListeners(): void {
         /** Canvas 终态按面板打开态回收 owner/messages；live 消息仍留给已打开面板。 */
         if (isCanvasAgentCompletion) {
           if (canvasOwner && !backgroundTasksPending) {
-            store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: data.sessionId })
+            store.set(canvasAgentLifecycleAtom, {
+              type: 'completed', sessionId: data.sessionId, startedAt: data.startedAt!,
+            })
             /** 打开面板先以权威 JSONL 接管最终消息，再释放 live/error/stream。 */
             if (store.get(canvasAgentOpenSessionIdsAtom).has(data.sessionId)) {
               void window.electronAPI.getCanvasAgentMessages({
@@ -1729,6 +1729,7 @@ export function useGlobalAgentListeners(): void {
                 canvasId: canvasOwner.canvasId,
                 nodeId: canvasOwner.nodeId,
               }).then((result) => {
+                if (!isCanvasAgentGenerationCurrent(store, data.sessionId, data.startedAt!)) return
                 if (!store.get(canvasAgentOpenSessionIdsAtom).has(data.sessionId)) return
                 if (store.get(canvasAgentRunningSessionIdsAtom).has(data.sessionId)) return
                 store.set(canvasAgentLifecycleAtom, {
@@ -1736,7 +1737,9 @@ export function useGlobalAgentListeners(): void {
                   owner: { sessionId: result.sessionId, ...result.owner },
                   messages: result.messages,
                 })
-                store.set(canvasAgentLifecycleAtom, { type: 'settled', sessionId: data.sessionId })
+                store.set(canvasAgentLifecycleAtom, {
+                  type: 'settled', sessionId: data.sessionId, startedAt: data.startedAt!,
+                })
               }).catch((error: unknown) => {
                 console.error('[GlobalAgentListeners] Canvas Agent 最终消息交接失败:', error)
               })

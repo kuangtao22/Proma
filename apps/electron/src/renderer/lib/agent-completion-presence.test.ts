@@ -1,5 +1,10 @@
-import { describe, expect, test } from 'bun:test'
-import { getAgentCompletionMarkers, isAgentSessionActiveForCompletion, shouldNotifyAgentCompletion } from './agent-completion-presence'
+import { describe, expect, mock, test } from 'bun:test'
+import {
+  getAgentCompletionMarkers,
+  isAgentSessionActiveForCompletion,
+  notifyAgentCompletionWarning,
+  shouldNotifyAgentCompletion,
+} from './agent-completion-presence'
 import type { TabItem } from '@/atoms/tab-atoms'
 
 describe('Agent 完成归属判断', () => {
@@ -88,5 +93,27 @@ describe('Agent 完成归属判断', () => {
       session,
       documentHasFocus: false,
     })).toEqual({ markUnviewedCompleted: false })
+  })
+
+  test.each(['canvas', 'internal-invalid'] as const)(
+    'Given %s error completion When 分派警告 Then 不调用普通 toast',
+    (routeKind) => {
+      /** 模拟真实 listener 传入的 toast.warning 分派函数。 */
+      const warn = mock((_message: string): void => undefined)
+      notifyAgentCompletionWarning(routeKind, {
+        sessionId: 'session-1', resultSubtype: 'error_during_execution', resultErrors: ['模型失败'],
+      }, warn)
+      expect(warn).toHaveBeenCalledTimes(0)
+    },
+  )
+
+  test('Given 普通 Agent error completion When 分派警告 Then 调用一次具体错误 toast', () => {
+    /** 模拟真实 listener 传入的 toast.warning 分派函数。 */
+    const warn = mock((_message: string): void => undefined)
+    notifyAgentCompletionWarning('agent', {
+      sessionId: 'session-1', resultSubtype: 'error_during_execution', resultErrors: ['模型失败'],
+    }, warn)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledWith('任务执行出错：模型失败')
   })
 })

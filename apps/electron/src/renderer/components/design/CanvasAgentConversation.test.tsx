@@ -134,7 +134,7 @@ describe('Canvas Agent 对话', () => {
       }
       store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
       store.set(canvasAgentLifecycleAtom, {
-        type: 'optimistic-started', owner, token: `message-${index}`,
+        type: 'optimistic-started', owner, token: `message-${index}`, startedAt: index,
       })
       /** 切换到 B 后所有旧 A UI callback 必须被抑制。 */
       const uiCallbacks: string[] = []
@@ -169,8 +169,10 @@ describe('Canvas Agent 对话', () => {
       sessionId: 'session-busy', projectId: 'project-1', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
     }
     store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
-    store.set(canvasAgentLifecycleAtom, { type: 'optimistic-started', owner, token: 'message-busy' })
-    store.set(canvasAgentLifecycleAtom, { type: 'started', owner })
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'optimistic-started', owner, token: 'message-busy', startedAt: 10,
+    })
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: 10 })
     const composer: string[] = []
     const sending: boolean[] = []
     const errors: Array<string | null> = []

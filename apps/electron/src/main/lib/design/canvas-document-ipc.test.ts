@@ -69,7 +69,14 @@ function createContext(options: {
   createDocumentChanged?: boolean
   reserveStartError?: Error
   activeRunSnapshot?: {
-    owners: Array<{ sessionId: string; projectId: string; canvasId: string; nodeId: string; title: string }>
+    owners: Array<{
+      sessionId: string
+      projectId: string
+      canvasId: string
+      nodeId: string
+      title: string
+      startedAt?: number
+    }>
     internalInvalidSessionIds: string[]
   }
 } = {}) {
@@ -209,8 +216,8 @@ function createContext(options: {
         agentCalls.push({ type: 'messages', value: sessionId })
         return [{ type: 'user', message: { content: [{ type: 'text', text: '已有消息' }] } }] as SDKMessage[]
       },
-      reserveStart: (sessionId) => {
-        agentCalls.push({ type: 'reserve', value: sessionId })
+      reserveStart: (sessionId, startedAt) => {
+        agentCalls.push({ type: 'reserve', value: { sessionId, startedAt } })
         if (options.reserveStartError) throw options.reserveStartError
         return () => { agentCalls.push({ type: 'release', value: sessionId }) }
       },
@@ -233,7 +240,7 @@ describe('原生 Canvas 文档 IPC', () => {
     const snapshot = {
       owners: [{
         sessionId: 'session-1', projectId: 'project-1', canvasId: 'canvas-1',
-        nodeId: 'node-1', title: '首页 Agent',
+        nodeId: 'node-1', title: '首页 Agent', startedAt: 10,
       }],
       internalInvalidSessionIds: ['session-invalid'],
     }
@@ -275,7 +282,10 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(3)
     expect(context.agentCalls).toEqual([
       { type: 'messages', value: '22222222-2222-4222-8222-222222222222' },
-      { type: 'reserve', value: '22222222-2222-4222-8222-222222222222' },
+      { type: 'reserve', value: {
+        sessionId: '22222222-2222-4222-8222-222222222222',
+        startedAt: 10,
+      } },
       { type: 'run', value: {
         input: {
           sessionId: '22222222-2222-4222-8222-222222222222',
@@ -312,7 +322,10 @@ describe('原生 Canvas 文档 IPC', () => {
       error: { code: 'SESSION_BUSY', message: '会话正在运行，请先停止当前任务。' },
     })
     expect(context.agentCalls).toEqual([
-      { type: 'reserve', value: '22222222-2222-4222-8222-222222222222' },
+      { type: 'reserve', value: {
+        sessionId: '22222222-2222-4222-8222-222222222222',
+        startedAt: 10,
+      } },
     ])
   })
 

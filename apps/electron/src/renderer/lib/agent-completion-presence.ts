@@ -54,6 +54,29 @@ export function notifyAgentCompletion({
   }
 }
 
+/** 仅为普通 Agent 分派异常完成 toast，Canvas 与损坏内部会话使用各自状态表面。 */
+export function notifyAgentCompletionWarning(
+  routeKind: 'agent' | 'canvas' | 'internal-invalid',
+  completion: AgentStreamCompletePayload,
+  warn: (message: string) => void,
+): void {
+  if (routeKind !== 'agent'
+    || !completion.resultSubtype
+    || completion.resultSubtype === 'success'
+    || completion.stoppedByUser) return
+  /** 各 SDK 终态的稳定用户提示。 */
+  const messages: Record<string, string> = {
+    error_max_turns: '任务被中断：已达到轮次上限。继续对话可让 Agent 接着完成。',
+    error_max_budget_usd: '任务被中断：已达到预算上限。',
+    error_during_execution: '任务执行过程中发生错误。',
+    empty_response: 'Agent 本轮结束了，但没有返回任何可展示内容。你的消息已保留，可以直接重试或切换模型。',
+  }
+  const detail = completion.resultErrors?.find((error) => error.trim().length > 0)?.trim()
+  warn(detail
+    ? `任务执行出错：${detail}`
+    : messages[completion.resultSubtype] ?? `任务异常结束（${completion.resultSubtype}）`)
+}
+
 /** 判断 Agent 完成时用户是否仍停留在该会话入口 */
 export function isAgentSessionActiveForCompletion({
   tabs,
