@@ -15,7 +15,7 @@ import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
 import type { AgentSessionMeta, CanvasDocument, CanvasMutation, CanvasTarget } from '@proma/shared'
 import {
   CanvasAgentNodeCreationService,
-  type CanvasAgentNodeCreationIntent,
+  type CanvasAgentNodeDurableIntent,
 } from './canvas-agent-node-creation'
 import { createCanvasDocumentStore } from './canvas-document-store'
 import { runStableDirectoryNative } from '../stable-directory-native-host'
@@ -24,12 +24,14 @@ import type { SecureAtomicJsonWriteOptions } from '../safe-file'
 
 const OPERATION_ID = '11111111-1111-4111-8111-111111111111'
 const SESSION_ID = '22222222-2222-4222-8222-222222222222'
+const REBUILD_OPERATION_ID = '55555555-5555-4555-8555-555555555555'
+const REPLACEMENT_SESSION_ID = '66666666-6666-4666-8666-666666666666'
 
 /** 创建可变内存文档与真实 intent 目录组合的测试夹具。 */
 function createHarness(options: {
   projectId?: string
   canvasId?: string
-  failIntentState?: CanvasAgentNodeCreationIntent['state']
+  failIntentState?: CanvasAgentNodeDurableIntent['state']
   failCreateSession?: boolean
   modelError?: Error
   afterLoad?: (paths: { canvasRoot: string; transactionsDir: string }) => void
@@ -38,8 +40,9 @@ function createHarness(options: {
   afterIntentLstat?: (filePath: string) => void
   afterIntentRead?: (filePath: string) => void
   nativeIntentIo?: boolean
-  writeIntentOutcome?: (intent: CanvasAgentNodeCreationIntent) => StableDirectoryNativeWriteOutcome | undefined
+  writeIntentOutcome?: (intent: CanvasAgentNodeDurableIntent) => StableDirectoryNativeWriteOutcome | undefined
   hideUncertainIntent?: boolean
+  sessionIds?: string[]
 } = {}) {
   /** 测试目标的双重身份。 */
   const target: CanvasTarget = {
@@ -86,6 +89,8 @@ function createHarness(options: {
   let failCreateSession = options.failCreateSession ?? false
   /** transactions 目录扫描次数，用于锁定单次 CREATE 的 I/O 上界。 */
   let transactionDirectoryReads = 0
+  /** 依次提供创建与重建需要的 session ID。 */
+  let sessionIdCursor = 0
   /** Store 收到的完整 mutation 批次，用于验证节点与边原子提交。 */
   const mutationBatches: CanvasMutation[][] = []
 
@@ -144,7 +149,13 @@ function createHarness(options: {
       return session
     },
     now: () => 10,
-    randomUUID: () => SESSION_ID,
+    randomUUID: () => {
+      const sessionIds = options.sessionIds ?? [SESSION_ID]
+      const sessionId = sessionIds[Math.min(sessionIdCursor, sessionIds.length - 1)]
+      sessionIdCursor += 1
+      if (!sessionId) throw new Error('测试 session ID 未配置')
+      return sessionId
+    },
     ...(options.nativeIntentIo
       ? {
           runStableDirectoryNative: (request, authorize) => runStableDirectoryNative(
@@ -163,7 +174,7 @@ function createHarness(options: {
             transactionDirectoryReads += 1
             return readdirSync(directoryPath, { withFileTypes: true })
           },
-          writeIntent: (filePath: string, intent: CanvasAgentNodeCreationIntent, writeOptions?: SecureAtomicJsonWriteOptions) => {
+          writeIntent: (filePath: string, intent: CanvasAgentNodeDurableIntent, writeOptions?: SecureAtomicJsonWriteOptions) => {
             options.onWriteIntentCall?.()
             if (failedState === intent.state) throw new Error(`模拟 ${intent.state} intent 写失败`)
             const outcome = options.writeIntentOutcome?.(intent)
@@ -187,7 +198,7 @@ function createHarness(options: {
     getDocument: () => structuredClone(document),
     setDocument: (next: CanvasDocument) => { document = structuredClone(next) },
     setSettings: (next: typeof settings) => { settings = next },
-    setFailedState: (state?: CanvasAgentNodeCreationIntent['state']) => { failedState = state },
+    setFailedState: (state?: CanvasAgentNodeDurableIntent['state']) => { failedState = state },
     setFailCreateSession: (value: boolean) => { failCreateSession = value },
     getTransactionDirectoryReads: () => transactionDirectoryReads,
     resetTransactionDirectoryReads: () => { transactionDirectoryReads = 0 },
@@ -195,6 +206,7 @@ function createHarness(options: {
     root,
     canvasRoot,
     intentPath: join(transactionsDir, `agent-node-${OPERATION_ID}.json`),
+    rebuildIntentPath: join(transactionsDir, `agent-node-rebuild-${REBUILD_OPERATION_ID}.json`),
     transactionsDir,
   }
 }
@@ -529,6 +541,108 @@ describe('Canvas Agent 节点创建事务', () => {
     harness.sessions.delete(SESSION_ID)
 
     await expect(service.reconcile(harness.target)).rejects.toThrow('归属损坏')
+  })
+
+  test('Given 坏 Agent 节点 When 重建成功 Then 只替换 session 引用并保留节点和边', async () => {
+    const harness = createHarness({ sessionIds: [SESSION_ID, REPLACEMENT_SESSION_ID] })
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    const oldSession = harness.sessions.get(SESSION_ID)
+    if (!oldSession) throw new Error('测试旧 session 未创建')
+    harness.sessions.set(SESSION_ID, { ...oldSession, sourceCanvasId: 'canvas-other' })
+    const document = harness.getDocument()
+    harness.setDocument({
+      ...document,
+      nodes: [
+        ...document.nodes,
+        {
+          id: 'image-1',
+          kind: 'image',
+          title: '首页效果图',
+          position: { x: 420, y: 80 },
+          assetId: 'asset-1',
+        },
+      ],
+      edges: [{
+        id: 'edge-1',
+        sourceNodeId: 'node-1',
+        sourcePort: 'output',
+        targetNodeId: 'image-1',
+        targetPort: 'input',
+      }],
+    })
+
+    const result = await service.rebuildReconciled({
+      ...harness.target,
+      nodeId: 'node-1',
+      operationId: REBUILD_OPERATION_ID,
+    })
+
+    expect(result.snapshot.document.nodes.find((node) => node.id === 'node-1')).toMatchObject({
+      id: 'node-1',
+      title: '首页设计 Agent',
+      position: { x: 120, y: 80 },
+      agentSessionId: REPLACEMENT_SESSION_ID,
+    })
+    expect(result.snapshot.document.edges).toEqual(harness.getDocument().edges)
+    expect(result.snapshot.nodeIssues).toEqual([])
+    expect(result.session.id).toBe(REPLACEMENT_SESSION_ID)
+    expect(harness.sessions.has(SESSION_ID)).toBe(true)
+  })
+
+  test('Given 重建已 committed When 相同 operation 重试 Then 返回同一新 session 且不重复创建', async () => {
+    const harness = createHarness({ sessionIds: [SESSION_ID, REPLACEMENT_SESSION_ID] })
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    const oldSession = harness.sessions.get(SESSION_ID)
+    if (!oldSession) throw new Error('测试旧 session 未创建')
+    harness.sessions.set(SESSION_ID, { ...oldSession, sourceCanvasId: 'canvas-other' })
+    const input = {
+      ...harness.target,
+      nodeId: 'node-1',
+      operationId: REBUILD_OPERATION_ID,
+    }
+
+    const first = await service.rebuildReconciled(input)
+    const second = await service.rebuildReconciled(input)
+
+    expect(second.session.id).toBe(first.session.id)
+    expect(harness.createdInputs.map((item) => item.trustedSessionId)).toEqual([
+      SESSION_ID,
+      REPLACEMENT_SESSION_ID,
+    ])
+    expect(harness.mutationBatches).toHaveLength(2)
+  })
+
+  test('Given session-created 重建 intent 且节点已换绑 When LOAD 对账 Then 完成 committed 且不重复换绑', async () => {
+    const harness = createHarness({ sessionIds: [SESSION_ID, REPLACEMENT_SESSION_ID] })
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    const oldSession = harness.sessions.get(SESSION_ID)
+    if (!oldSession) throw new Error('测试旧 session 未创建')
+    harness.sessions.set(SESSION_ID, { ...oldSession, sourceCanvasId: 'canvas-other' })
+    harness.setFailedState('committed')
+
+    await expect(service.rebuildReconciled({
+      ...harness.target,
+      nodeId: 'node-1',
+      operationId: REBUILD_OPERATION_ID,
+    })).rejects.toThrow('模拟 committed intent 写失败')
+    expect(harness.getDocument().nodes.find((node) => node.id === 'node-1'))
+      .toMatchObject({ agentSessionId: REPLACEMENT_SESSION_ID })
+    harness.setFailedState(undefined)
+
+    const reconciled = await service.reconcile(harness.target)
+
+    expect(reconciled.snapshot.document.nodes.find((node) => node.id === 'node-1'))
+      .toMatchObject({ agentSessionId: REPLACEMENT_SESSION_ID })
+    expect(reconciled.snapshot.nodeIssues).toEqual([])
+    expect(JSON.parse(readFileSync(harness.rebuildIntentPath, 'utf8'))).toMatchObject({
+      state: 'committed',
+      previousSessionId: SESSION_ID,
+      replacementSessionId: REPLACEMENT_SESSION_ID,
+    })
+    expect(harness.mutationBatches).toHaveLength(2)
   })
 
   test('Given detached 写在 rename 前失败 When 对账 Then fail closed 且保留 committed 供重试', async () => {
