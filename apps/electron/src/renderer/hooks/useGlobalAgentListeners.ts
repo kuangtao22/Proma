@@ -96,6 +96,7 @@ import { detectIsWindows } from '@/lib/platform'
 import { getSessionFileChangeKind, getOwnedSessionWatcherPaths, upsertSessionFileChange } from '@/lib/session-file-changes'
 import { removeQueuedMessage, createQueuedAgentStreamState } from '@/lib/agent-message-queue'
 import { createAgentStreamEventBatcher } from '@/lib/agent-stream-event-batcher'
+import { designAdapter } from '@/lib/design-adapter'
 import {
   createCanvasAgentBootstrapCoordinator,
   resolveCanvasAgentCompletion,
@@ -1768,7 +1769,7 @@ export function useGlobalAgentListeners(): void {
             })
             /** 打开面板先以权威 JSONL 接管最终消息，再释放 live/error/stream。 */
             if (store.get(canvasAgentOpenSessionIdsAtom).has(data.sessionId)) {
-              void window.electronAPI.getCanvasAgentMessages({
+              void designAdapter.getCanvasAgentMessages({
                 projectId: canvasOwner.projectId,
                 canvasId: canvasOwner.canvasId,
                 nodeId: canvasOwner.nodeId,

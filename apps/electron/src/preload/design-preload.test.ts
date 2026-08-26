@@ -36,6 +36,13 @@ describe('Design preload', () => {
         operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1',
         title: '首页 Agent', position: { x: 10, y: 20 },
       }]],
+      [() => api.rebuildCanvasAgentNode({
+        projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1',
+        operationId: '22222222-2222-4222-8222-222222222222',
+      }), CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE, [{
+        projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1',
+        operationId: '22222222-2222-4222-8222-222222222222',
+      }]],
       [() => api.listActiveCanvasAgentRuns(), CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS, []],
       [() => api.getCanvasAgentMessages({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }), CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }]],
       [() => api.sendCanvasAgentMessage({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1', message: '继续', userMessageUuid: 'message-1', startedAt: 10 }), CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1', message: '继续', userMessageUuid: 'message-1', startedAt: 10 }]],
@@ -72,6 +79,26 @@ describe('Design preload', () => {
     ]
     for (const [call] of calls) await call()
     expect(recorded.invokes).toEqual(calls.map(([, channel, args]) => ({ channel, args })))
+  })
+
+  test('Given Electron invoke rejection 含内部信息 When preload 调用 LOAD Then 丢弃原始正文', async () => {
+    const recorded = createRecordingIpc()
+    /** 模拟 Electron 对主进程 reject 的包装异常。 */
+    recorded.ipc.invoke = async () => {
+      throw new Error(
+        'Error invoking remote method canvas:load /Users/name 11111111-1111-4111-8111-111111111111',
+      )
+    }
+    const api = createDesignPreloadApi(recorded.ipc)
+
+    const result = await api.loadCanvasWorkspace({ projectId: 'p1', canvasId: 'canvas-1' })
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+    })
+    expect(JSON.stringify(result)).not.toContain('remote method')
+    expect(JSON.stringify(result)).not.toContain('/Users/name')
   })
 
   test('Given change 订阅 When 推送并取消 Then 使用同一个 listener 引用', () => {

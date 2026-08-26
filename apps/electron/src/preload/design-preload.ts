@@ -2,6 +2,8 @@ import { CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS } from '@proma/shared'
 import type {
   CanvasChangeEvent,
   CanvasDocument,
+  CanvasInvokeResult,
+  CanvasPublicError,
   CanvasSessionChangeEvent,
   CanvasSessionMeta,
   CanvasWorkspaceSnapshot,
@@ -31,6 +33,8 @@ import type {
   ImageGenerationModelCatalogResult,
   ListCanvasSessionsInput,
   LoadCanvasInput,
+  RebuildCanvasAgentNodeInput,
+  RebuildCanvasAgentNodeResult,
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
   RelinkDesignAssetInput,
@@ -52,19 +56,21 @@ import type { IpcRendererEvent } from 'electron'
 /** Renderer 获得的稳定 Design API。 */
 export interface DesignPreloadApi {
   /** 加载项目中指定原生 Canvas 的公开工作区快照。 */
-  loadCanvasWorkspace: (input: LoadCanvasInput) => Promise<CanvasWorkspaceSnapshot>
+  loadCanvasWorkspace: (input: LoadCanvasInput) => Promise<CanvasInvokeResult<CanvasWorkspaceSnapshot>>
   /** 在权威 revision 上保存指定原生 Canvas mutation。 */
-  saveCanvasMutations: (input: SaveCanvasMutationsInput) => Promise<CanvasDocument>
+  saveCanvasMutations: (input: SaveCanvasMutationsInput) => Promise<CanvasInvokeResult<CanvasDocument>>
   /** 在目标 Canvas 内幂等创建内部 Agent 节点。 */
-  createCanvasAgentNode: (input: CreateCanvasAgentNodeInput) => Promise<CanvasAgentNodeCreationResult>
+  createCanvasAgentNode: (input: CreateCanvasAgentNodeInput) => Promise<CanvasInvokeResult<CanvasAgentNodeCreationResult>>
+  /** 为坏 Agent 节点重建空白内部会话。 */
+  rebuildCanvasAgentNode: (input: RebuildCanvasAgentNodeInput) => Promise<CanvasInvokeResult<RebuildCanvasAgentNodeResult>>
   /** 仅在用户打开节点对话时读取该会话 JSONL。 */
-  getCanvasAgentMessages: (input: GetCanvasAgentMessagesInput) => Promise<CanvasAgentMessagesResult>
+  getCanvasAgentMessages: (input: GetCanvasAgentMessagesInput) => Promise<CanvasInvokeResult<CanvasAgentMessagesResult>>
   /** Renderer reload 时一次性恢复仍在运行的 Canvas Agent 归属。 */
   listActiveCanvasAgentRuns: () => Promise<CanvasAgentActiveRunSnapshot>
   /** 通过 Canvas 唯一入口发送纯文本消息。 */
-  sendCanvasAgentMessage: (input: SendCanvasAgentMessageInput) => Promise<SendCanvasAgentMessageResult>
+  sendCanvasAgentMessage: (input: SendCanvasAgentMessageInput) => Promise<CanvasInvokeResult<SendCanvasAgentMessageResult>>
   /** 通过 Canvas 唯一入口停止节点运行。 */
-  stopCanvasAgent: (input: StopCanvasAgentInput) => Promise<void>
+  stopCanvasAgent: (input: StopCanvasAgentInput) => Promise<CanvasInvokeResult<void>>
   /** 订阅所有原生 Canvas 变化，双身份过滤由 Renderer adapter 执行。 */
   onCanvasChanged: (listener: (event: CanvasChangeEvent) => void) => () => void
   listCanvasSessions: (input: ListCanvasSessionsInput) => Promise<CanvasSessionMeta[]>
@@ -109,36 +115,86 @@ export interface DesignPreloadIpc {
   removeListener: (channel: string, listener: (event: IpcRendererEvent, value: unknown) => void) => void
 }
 
+/** Preload 无法调用主进程时使用的固定 Canvas 公开失败。 */
+const CANVAS_PRELOAD_FALLBACKS = {
+  load: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+  save: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
+  create: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
+  rebuild: { code: 'AGENT_SESSION_REBUILD_FAILED', message: '重建失败，请重试。' },
+  messages: { code: 'CANVAS_AGENT_MESSAGES_FAILED', message: '会话消息暂时无法加载。' },
+  send: { code: 'CANVAS_AGENT_SEND_FAILED', message: '消息发送失败，请重试。' },
+  stop: { code: 'CANVAS_AGENT_STOP_FAILED', message: '停止 Agent 失败，请重试。' },
+} as const satisfies Record<string, CanvasPublicError>
+
+/**
+ * 捕获 Electron invoke rejection，并丢弃其路径、通道和堆栈正文。
+ * @param ipc preload 可用的最小 ipcRenderer 能力。
+ * @param channel 当前 Canvas invoke 通道。
+ * @param input 已由 Renderer 构造的公开请求对象。
+ * @param fallback 当前操作固定公开失败。
+ * @returns 主进程安全结果，或 Preload 自行生成的固定失败。
+ */
+async function invokeCanvasSafely<T>(
+  ipc: DesignPreloadIpc,
+  channel: string,
+  input: unknown,
+  fallback: CanvasPublicError,
+): Promise<CanvasInvokeResult<T>> {
+  try {
+    return await ipc.invoke(channel, input) as CanvasInvokeResult<T>
+  } catch {
+    return { ok: false, error: { ...fallback } }
+  }
+}
+
 /** 创建不暴露 ipcRenderer 本体的 Design preload API。 */
 export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi {
   return {
-    loadCanvasWorkspace: (input) => ipc.invoke(
+    loadCanvasWorkspace: (input) => invokeCanvasSafely(
+      ipc,
       CANVAS_IPC_CHANNELS.LOAD,
       input,
-    ) as Promise<CanvasWorkspaceSnapshot>,
-    saveCanvasMutations: (input) => ipc.invoke(
+      CANVAS_PRELOAD_FALLBACKS.load,
+    ),
+    saveCanvasMutations: (input) => invokeCanvasSafely(
+      ipc,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       input,
-    ) as Promise<CanvasDocument>,
-    createCanvasAgentNode: (input) => ipc.invoke(
+      CANVAS_PRELOAD_FALLBACKS.save,
+    ),
+    createCanvasAgentNode: (input) => invokeCanvasSafely(
+      ipc,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
       input,
-    ) as Promise<CanvasAgentNodeCreationResult>,
+      CANVAS_PRELOAD_FALLBACKS.create,
+    ),
+    rebuildCanvasAgentNode: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE,
+      input,
+      CANVAS_PRELOAD_FALLBACKS.rebuild,
+    ),
     listActiveCanvasAgentRuns: () => ipc.invoke(
       CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
     ) as Promise<CanvasAgentActiveRunSnapshot>,
-    getCanvasAgentMessages: (input) => ipc.invoke(
+    getCanvasAgentMessages: (input) => invokeCanvasSafely(
+      ipc,
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       input,
-    ) as Promise<CanvasAgentMessagesResult>,
-    sendCanvasAgentMessage: (input) => ipc.invoke(
+      CANVAS_PRELOAD_FALLBACKS.messages,
+    ),
+    sendCanvasAgentMessage: (input) => invokeCanvasSafely(
+      ipc,
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
       input,
-    ) as Promise<SendCanvasAgentMessageResult>,
-    stopCanvasAgent: (input) => ipc.invoke(
+      CANVAS_PRELOAD_FALLBACKS.send,
+    ),
+    stopCanvasAgent: (input) => invokeCanvasSafely(
+      ipc,
       CANVAS_IPC_CHANNELS.STOP_AGENT,
       input,
-    ) as Promise<void>,
+      CANVAS_PRELOAD_FALLBACKS.stop,
+    ),
     onCanvasChanged: (listener) => {
       /** Electron event 对 Renderer 隐藏，只传原生 Canvas 业务变化。 */
       const handler = (_event: IpcRendererEvent, value: unknown): void => (

@@ -1,13 +1,22 @@
 import { describe, expect, test } from 'bun:test'
 import { createEmptyCanvasDocument, createEmptyDesignDocument } from '@proma/shared'
 import type { CanvasChangeEvent, SaveDesignMutationsInput } from '@proma/shared'
-import { createDesignAdapter, type PartialDesignApi } from './design-adapter'
+import {
+  CanvasPublicOperationError,
+  createDesignAdapter,
+  type PartialDesignApi,
+} from './design-adapter'
 
 describe('Design renderer adapter', () => {
-  test('Given 原生 Canvas preload 缺失或失败 When adapter 调用 Then 使用稳定接线错误并原样传播失败', async () => {
+  test('Given 原生 Canvas preload 缺失或异常拒绝 When adapter 调用 Then 只返回当前操作公开错误', async () => {
     const missing = createDesignAdapter({})
-    expect(() => missing.loadCanvas({ projectId: 'project-1', canvasId: 'canvas-1' }))
-      .toThrow('Design API 未接通: loadCanvasWorkspace')
+    await expect(Promise.resolve().then(() => missing.loadCanvas({
+      projectId: 'project-1', canvasId: 'canvas-1',
+    }))).rejects.toMatchObject({
+      name: 'CanvasPublicOperationError',
+      code: 'CANVAS_LOAD_FAILED',
+      message: '画布暂时无法加载。',
+    })
 
     /** preload 抛出的原始错误对象。 */
     const originalError = new Error('CANVAS_COMMIT_UNCERTAIN: main durability requires reload')
@@ -16,7 +25,29 @@ describe('Design renderer adapter', () => {
     })
     await expect(failed.saveCanvas({
       projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 1, mutations: [],
-    })).rejects.toBe(originalError)
+    })).rejects.toMatchObject({
+      name: 'CanvasPublicOperationError',
+      code: 'CANVAS_SAVE_FAILED',
+      message: '画布暂时无法保存。',
+    })
+  })
+
+  test('Given Adapter 收到公开失败 When 调用 LOAD Then 只抛公开码和文案', async () => {
+    const adapter = createDesignAdapter({
+      loadCanvasWorkspace: async () => ({
+        ok: false,
+        error: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+      }),
+    })
+
+    const promise = adapter.loadCanvas({ projectId: 'project-1', canvasId: 'canvas-1' })
+
+    await expect(promise).rejects.toBeInstanceOf(CanvasPublicOperationError)
+    await expect(promise).rejects.toMatchObject({
+      name: 'CanvasPublicOperationError',
+      code: 'CANVAS_LOAD_FAILED',
+      message: '画布暂时无法加载。',
+    })
   })
 
   test('Given 原生 Canvas API When 加载和保存 Then 参数与返回值保持同一引用', async () => {
@@ -26,17 +57,43 @@ describe('Design renderer adapter', () => {
     const snapshot = {
       document: createEmptyCanvasDocument('project-1', 'canvas-1', 1),
       writable: true as const,
+      nodeIssues: [],
     }
     const api: PartialDesignApi = {
-      loadCanvasWorkspace: async (input) => { received.push(input); return snapshot },
-      saveCanvasMutations: async (input) => { received.push(input); return snapshot.document },
+      loadCanvasWorkspace: async (input) => { received.push(input); return { ok: true, value: snapshot } },
+      saveCanvasMutations: async (input) => { received.push(input); return { ok: true, value: snapshot.document } },
       createCanvasAgentNode: async (input) => {
         received.push(input)
-        return { document: snapshot.document, session: { id: 'session-1' } as never }
+        return {
+          ok: true,
+          value: { document: snapshot.document, session: { id: 'session-1' } as never },
+        }
       },
-      getCanvasAgentMessages: async (input) => { received.push(input); return { sessionId: 'session-1', owner: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', title: 'Agent' }, messages: [] } },
-      sendCanvasAgentMessage: async (input) => { received.push(input); return { ok: true } },
-      stopCanvasAgent: async (input) => { received.push(input) },
+      rebuildCanvasAgentNode: async (input) => {
+        received.push(input)
+        return {
+          ok: true,
+          value: { snapshot, session: { id: 'session-2' } as never },
+        }
+      },
+      getCanvasAgentMessages: async (input) => {
+        received.push(input)
+        return {
+          ok: true,
+          value: {
+            sessionId: 'session-1',
+            owner: {
+              projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', title: 'Agent',
+            },
+            messages: [],
+          },
+        }
+      },
+      sendCanvasAgentMessage: async (input) => {
+        received.push(input)
+        return { ok: true, value: { ok: true } }
+      },
+      stopCanvasAgent: async (input) => { received.push(input); return { ok: true, value: undefined } },
     }
     const adapter = createDesignAdapter(api)
     const loadInput = { projectId: 'project-1', canvasId: 'canvas-1' }
@@ -47,18 +104,26 @@ describe('Design renderer adapter', () => {
       nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
     }
     const agentTarget = { ...loadInput, nodeId: 'node-1' }
+    const rebuildInput = {
+      ...agentTarget,
+      operationId: '22222222-2222-4222-8222-222222222222',
+    }
     const sendInput = { ...agentTarget, message: '继续', userMessageUuid: 'message-1', startedAt: 10 }
 
     expect(await adapter.loadCanvas(loadInput)).toBe(snapshot)
     expect(await adapter.saveCanvas(saveInput)).toBe(snapshot.document)
     expect((await adapter.createCanvasAgentNode(createInput)).document).toBe(snapshot.document)
+    expect((await adapter.rebuildCanvasAgentNode(rebuildInput)).snapshot).toBe(snapshot)
     expect((await adapter.getCanvasAgentMessages(agentTarget)).sessionId).toBe('session-1')
     await adapter.sendCanvasAgentMessage(sendInput)
     await adapter.stopCanvasAgent(agentTarget)
-    expect(received).toEqual([loadInput, saveInput, createInput, agentTarget, sendInput, agentTarget])
+    expect(received).toEqual([
+      loadInput, saveInput, createInput, rebuildInput, agentTarget, sendInput, agentTarget,
+    ])
     expect(received[0]).toBe(loadInput)
     expect(received[1]).toBe(saveInput)
     expect(received[2]).toBe(createInput)
+    expect(received[3]).toBe(rebuildInput)
   })
 
   test('Given 多个 Canvas 事件 When 订阅目标 B Then recovery 和 graph 都只按双身份隔离', () => {
