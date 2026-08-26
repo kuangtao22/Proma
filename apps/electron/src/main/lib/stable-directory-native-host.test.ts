@@ -562,6 +562,177 @@ describe('stable directory native host', () => {
     }
   })
 
+  test.skipIf(process.platform !== 'darwin')('Given 511 个合法 intent When 两个真实 helper 并发新增 Then 只提交一个且最终保持 512', async () => {
+    const appDir = resolve(import.meta.dir, '../../..')
+    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
+    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-concurrency-'))
+
+    try {
+      for (let round = 0; round < 6; round += 1) {
+        const canvasRoot = join(root, `canvas-${round}`)
+        const transactions = join(canvasRoot, 'transactions')
+        mkdirSync(transactions, { recursive: true })
+        /** 每轮固定预置 511 个合法 UUID intent，放大容量检查与 rename 之间的竞争窗口。 */
+        for (let index = 0; index < 511; index += 1) {
+          const name = `agent-node-00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}.json`
+          writeFileSync(join(transactions, name), '{}', 'utf8')
+        }
+        const write = (suffix: string) => runStableDirectoryNative({
+          mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
+          fileName: `agent-node-ffffffff-ffff-4fff-8fff-${suffix}.json`,
+          content: '{"state":"committed"}', maxEntries: 512,
+        }, () => true, { helperPath: () => helperPath })
+
+        const outcomes = await Promise.all([
+          write(`${round.toString(16).padStart(2, '0')}0000000001`),
+          write(`${round.toString(16).padStart(2, '0')}0000000002`),
+        ])
+        const visible = outcomes.filter((result) => result.writeOutcome?.commitVisible)
+        const rejected = outcomes.filter((result) => !result.writeOutcome?.commitVisible)
+        expect(visible).toHaveLength(1)
+        expect(rejected).toHaveLength(1)
+        expect(rejected[0]?.writeOutcome).toEqual({
+          commitVisible: false,
+          durabilityUncertain: false,
+          error: 'canvas intent entry limit exceeded',
+        })
+        expect(readdirSync(transactions).filter((name) => /^agent-node-.*\.json$/.test(name))).toHaveLength(512)
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Given intent 锁文件是 symlink When helper 写入 Then fail closed 且目标不可见', async () => {
+    const appDir = resolve(import.meta.dir, '../../..')
+    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
+    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-lock-symlink-'))
+    const canvasRoot = join(root, 'canvas')
+    const transactions = join(canvasRoot, 'transactions')
+    const targetName = 'agent-node-ffffffff-ffff-4fff-8fff-ffffffffffff.json'
+    mkdirSync(transactions, { recursive: true })
+    writeFileSync(join(root, 'outside-lock'), 'outside', 'utf8')
+    symlinkSync(join(root, 'outside-lock'), join(transactions, '.canvas-intent.lock'))
+
+    try {
+      const result = await runStableDirectoryNative({
+        mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
+        fileName: targetName, content: '{"state":"committed"}', maxEntries: 512,
+      }, () => true, { helperPath: () => helperPath })
+
+      expect(result.writeOutcome).toEqual({
+        commitVisible: false,
+        durabilityUncertain: false,
+        error: 'canvas intent lock is unsafe',
+      })
+      expect(existsSync(join(transactions, targetName))).toBe(false)
+      expect(readFileSync(join(root, 'outside-lock'), 'utf8')).toBe('outside')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'win32')('Given Windows intent 锁位是 junction When helper 写入 Then 拒绝 reparse 且目标不可见', async () => {
+    const appDir = resolve(import.meta.dir, '../../..')
+    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper.exe')
+    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    const root = mkdtempSync(join(tmpdir(), 'proma-win-intent-lock-reparse-'))
+    const canvasRoot = join(root, 'canvas')
+    const transactions = join(canvasRoot, 'transactions')
+    const replacement = join(root, 'replacement')
+    const targetName = 'agent-node-ffffffff-ffff-4fff-8fff-dddddddddddd.json'
+    mkdirSync(transactions, { recursive: true })
+    mkdirSync(replacement)
+    symlinkSync(replacement, join(transactions, '.canvas-intent.lock'), 'junction')
+
+    try {
+      const result = await runStableDirectoryNative({
+        mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
+        fileName: targetName, content: '{"state":"committed"}', maxEntries: 512,
+      }, () => true, { helperPath: () => helperPath })
+
+      expect(result.writeOutcome).toEqual({
+        commitVisible: false,
+        durabilityUncertain: false,
+        error: 'canvas intent lock is unsafe',
+      })
+      expect(existsSync(join(transactions, targetName))).toBe(false)
+      expect(readdirSync(replacement)).toEqual([])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Given 外部进程持有 intent 锁 When helper 超时退出 Then 释放等待资源且后续写入成功', async () => {
+    const appDir = resolve(import.meta.dir, '../../..')
+    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
+    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-lock-timeout-'))
+    const canvasRoot = join(root, 'canvas')
+    const transactions = join(canvasRoot, 'transactions')
+    const holderSource = join(root, 'lock-holder.cc')
+    const holderPath = join(root, 'lock-holder')
+    const lockPath = join(transactions, '.canvas-intent.lock')
+    mkdirSync(transactions, { recursive: true })
+    writeFileSync(holderSource, [
+      '#include <fcntl.h>',
+      '#include <stdio.h>',
+      '#include <sys/file.h>',
+      '#include <sys/stat.h>',
+      '#include <unistd.h>',
+      'int main(int argc, char** argv) {',
+      '  if (argc != 2) return 2;',
+      '  const int fd = open(argv[1], O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);',
+      '  struct stat state {};',
+      '  if (fd < 0 || fstat(fd, &state) != 0 || !S_ISREG(state.st_mode) || flock(fd, LOCK_EX) != 0) return 3;',
+      '  puts("LOCKED"); fflush(stdout);',
+      '  pause();',
+      '  return 0;',
+      '}',
+    ].join('\n'), 'utf8')
+    execFileSync('xcrun', ['clang++', '-std=c++17', holderSource, '-o', holderPath])
+    const holder = spawn(holderPath, [lockPath], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+    try {
+      await new Promise<void>((resolvePromise, rejectPromise) => {
+        const timer = setTimeout(() => rejectPromise(new Error('锁持有进程启动超时')), 2_000)
+        holder.stdout.on('data', (chunk: Buffer) => {
+          if (!chunk.toString('utf8').includes('LOCKED')) return
+          clearTimeout(timer)
+          resolvePromise()
+        })
+        holder.once('exit', (code) => {
+          clearTimeout(timer)
+          rejectPromise(new Error(`锁持有进程意外退出: ${code}`))
+        })
+      })
+      const request = {
+        mode: 'canvas-intent-write' as const,
+        roots: [canvasRoot], childName: 'transactions',
+        fileName: 'agent-node-ffffffff-ffff-4fff-8fff-eeeeeeeeeeee.json',
+        content: '{"state":"committed"}', maxEntries: 512,
+      }
+
+      await expect(runStableDirectoryNative(request, () => true, {
+        helperPath: () => helperPath,
+        startupTimeoutMs: 1_000,
+        totalTimeoutMs: 1_000,
+      })).rejects.toThrow('稳定目录 helper 执行超时')
+      const holderExited = new Promise<void>((resolvePromise) => holder.once('exit', () => resolvePromise()))
+      holder.kill('SIGTERM')
+      await holderExited
+      await expect(runStableDirectoryNative(request, () => true, {
+        helperPath: () => helperPath,
+        totalTimeoutMs: 5_000,
+      })).resolves.toHaveProperty('writeOutcome.commitVisible', true)
+    } finally {
+      if (!holder.killed) holder.kill('SIGTERM')
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   test.skipIf(process.platform !== 'darwin')('Given Canvas intent 位于已打开根 When 根路径在授权后被替换 Then helper 只返回原 inode 内存正文', async () => {
     const appDir = resolve(import.meta.dir, '../../..')
     const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')

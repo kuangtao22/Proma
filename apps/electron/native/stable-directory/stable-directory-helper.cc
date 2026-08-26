@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -29,6 +30,7 @@
 namespace {
 
 constexpr int kProtocol = 1;
+constexpr char kCanvasIntentLockName[] = ".canvas-intent.lock";
 
 struct Config {
   std::string mode = "list";
@@ -325,6 +327,56 @@ class UniqueFd {
   int value_;
 };
 
+// 在固定内部普通文件上持有跨进程排他锁，析构时解锁并关闭 fd。
+class CanvasIntentLock {
+ public:
+  CanvasIntentLock() = default;
+  ~CanvasIntentLock() {
+    if (locked_) flock(descriptor_.Get(), LOCK_UN);
+  }
+  CanvasIntentLock(const CanvasIntentLock&) = delete;
+  CanvasIntentLock& operator=(const CanvasIntentLock&) = delete;
+
+  // 相对 transactions fd 安全打开固定锁文件并阻塞取得排他锁。
+  bool Acquire(int transactions_fd, std::string* error) {
+    int open_error = 0;
+    for (int attempt = 0; attempt < 32 && descriptor_.Get() < 0; ++attempt) {
+      descriptor_.Reset(openat(transactions_fd, kCanvasIntentLockName,
+          O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+      if (descriptor_.Get() >= 0) break;
+      open_error = errno;
+      if (open_error != EEXIST) break;
+      descriptor_.Reset(openat(transactions_fd, kCanvasIntentLockName,
+          O_RDWR | O_NOFOLLOW | O_CLOEXEC));
+      if (descriptor_.Get() >= 0) break;
+      open_error = errno;
+      if (open_error != ENOENT) break;
+    }
+    if (descriptor_.Get() < 0) {
+      *error = open_error == ELOOP ? "canvas intent lock is unsafe" : "cannot open canvas intent lock";
+      return false;
+    }
+    struct stat identity {};
+    if (fstat(descriptor_.Get(), &identity) != 0
+        || !S_ISREG(identity.st_mode)
+        || identity.st_nlink != 1) {
+      *error = "canvas intent lock is unsafe";
+      return false;
+    }
+    while (flock(descriptor_.Get(), LOCK_EX) != 0) {
+      if (errno == EINTR) continue;
+      *error = "cannot lock canvas intent";
+      return false;
+    }
+    locked_ = true;
+    return true;
+  }
+
+ private:
+  UniqueFd descriptor_;
+  bool locked_ = false;
+};
+
 // 保存授权前已打开的 POSIX root、canonical 路径与稳定身份。
 struct StableRoot {
   std::string requested_path;
@@ -486,6 +538,8 @@ bool CheckCanvasIntentCapacity(const Config& config, int transactions_fd, std::s
 CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, int transactions_fd,
                                                  const std::string& payload) {
   CanvasIntentWriteOutcome outcome;
+  CanvasIntentLock lock;
+  if (!lock.Acquire(transactions_fd, &outcome.error)) return outcome;
   if (!CheckCanvasIntentCapacity(config, transactions_fd, &outcome.error)) return outcome;
   std::string temporary_name;
   UniqueFd temporary;
@@ -759,6 +813,47 @@ bool OpenRelativeWindows(HANDLE RootDirectory, const std::wstring& name,
   return true;
 }
 
+// 在固定内部普通文件上持有 Windows 跨进程排他锁，析构时解锁并关闭 HANDLE。
+class CanvasIntentLock {
+ public:
+  CanvasIntentLock() = default;
+  ~CanvasIntentLock() {
+    if (locked_) UnlockFileEx(handle_.Get(), 0, 1, 0, &overlapped_);
+  }
+  CanvasIntentLock(const CanvasIntentLock&) = delete;
+  CanvasIntentLock& operator=(const CanvasIntentLock&) = delete;
+
+  // 相对 transactions HANDLE 打开固定锁文件，拒绝 reparse/非普通文件后阻塞加锁。
+  bool Acquire(HANDLE transactions, std::string* error) {
+    std::string open_error;
+    if (!OpenRelativeWindows(transactions, Utf8ToWide(kCanvasIntentLockName),
+        FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE, &handle_, &open_error)) {
+      *error = "canvas intent lock is unsafe";
+      return false;
+    }
+    BY_HANDLE_FILE_INFORMATION identity {};
+    if (!GetFileInformationByHandle(handle_.Get(), &identity)
+        || (identity.dwFileAttributes
+            & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0
+        || identity.nNumberOfLinks != 1) {
+      *error = "canvas intent lock is unsafe";
+      return false;
+    }
+    if (!LockFileEx(handle_.Get(), LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped_)) {
+      *error = "cannot lock canvas intent";
+      return false;
+    }
+    locked_ = true;
+    return true;
+  }
+
+ private:
+  UniqueHandle handle_;
+  OVERLAPPED overlapped_ {};
+  bool locked_ = false;
+};
+
 // 读取 Windows 句柄身份与内容时间状态，供读取前后完整绑定。
 bool ReadWindowsFileState(HANDLE handle, BY_HANDLE_FILE_INFORMATION* identity, FILE_BASIC_INFO* basic) {
   return GetFileInformationByHandle(handle, identity)
@@ -890,6 +985,8 @@ bool CheckCanvasIntentCapacity(const Config& config, HANDLE transactions, std::s
 CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, HANDLE transactions,
                                                  const std::string& payload) {
   CanvasIntentWriteOutcome outcome;
+  CanvasIntentLock lock;
+  if (!lock.Acquire(transactions, &outcome.error)) return outcome;
   if (!CheckCanvasIntentCapacity(config, transactions, &outcome.error)) return outcome;
   UniqueHandle temporary;
   for (int attempt = 0; attempt < 32; ++attempt) {
