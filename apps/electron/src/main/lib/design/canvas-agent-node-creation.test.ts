@@ -388,6 +388,48 @@ describe('Canvas Agent 节点创建事务', () => {
     await expect(service.create(createInput(harness.target))).rejects.toThrow('已与节点解除关联')
   })
 
+  test('Given detached 写在 rename 前失败 When 对账 Then fail closed 且保留 committed 供重试', async () => {
+    const harness = createHarness({
+      writeIntentOutcome: (intent) => intent.state === 'detached'
+        ? { commitVisible: false, durabilityUncertain: false, error: 'cannot commit canvas intent file' }
+        : undefined,
+    })
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    harness.setDocument({ ...harness.getDocument(), nodes: [], revision: 2 })
+
+    await expect(service.reconcile(harness.target)).rejects.toThrow('CANVAS_INTENT_WRITE_FAILED')
+    expect(JSON.parse(readFileSync(harness.intentPath, 'utf8'))).toMatchObject({ state: 'committed' })
+    expect(harness.getDocument().nodes).toEqual([])
+  })
+
+  test('Given detached rename 可见但目录持久性未确认 When 对账 Then 明确报错且下次不重建或重复发布', async () => {
+    let injectUncertain = true
+    const harness = createHarness({
+      writeIntentOutcome: (intent) => intent.state === 'detached' && injectUncertain
+        ? { commitVisible: true, durabilityUncertain: true, error: 'cannot persist canvas transactions directory' }
+        : undefined,
+    })
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    harness.setDocument({ ...harness.getDocument(), nodes: [], revision: 2 })
+
+    const uncertain = await service.reconcile(harness.target)
+
+    expect(uncertain.documentChanged).toBe(false)
+    expect(uncertain.error).toHaveProperty(
+      'message',
+      expect.stringContaining('CANVAS_INTENT_DURABILITY_UNCERTAIN'),
+    )
+    expect(JSON.parse(readFileSync(harness.intentPath, 'utf8'))).toMatchObject({ state: 'detached' })
+    injectUncertain = false
+    await expect(service.reconcile(harness.target)).resolves.toMatchObject({
+      documentChanged: false,
+      snapshot: { document: { revision: 2, nodes: [] } },
+    })
+    expect(harness.createdInputs).toHaveLength(1)
+  })
+
   test('Given prepared 对应半归属或跨 Canvas session When 恢复 Then fail closed 且不写节点', async () => {
     const harness = createHarness({ failCreateSession: true })
     await expect(harness.createService().create(createInput(harness.target))).rejects.toThrow()

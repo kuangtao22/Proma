@@ -534,6 +534,11 @@ describe('stable directory native host', () => {
     for (const name of intentNames) writeFileSync(join(transactions, name), '{}', 'utf8')
     writeFileSync(join(transactions, 'agent-node-not-a-uuid.json'), '{}', 'utf8')
     mkdirSync(join(transactions, 'agent-node-00000000-0000-4000-8000-ffffffffffff.json'))
+    writeFileSync(join(root, 'outside-intent'), '{}', 'utf8')
+    symlinkSync(
+      join(root, 'outside-intent'),
+      join(transactions, 'agent-node-ffffffff-ffff-4fff-8fff-ffffffffffff.json'),
+    )
 
     try {
       const write = (fileName: string) => runStableDirectoryNative({
@@ -557,6 +562,61 @@ describe('stable directory native host', () => {
       }, () => true, { helperPath: () => helperPath })
       expect(scanned.entries).toHaveLength(512)
       expect(scanned.entries.every((entry) => !entry.isDirectory)).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Given 预算为零且只有合法 UUID 名非普通项 When 扫描 Then 忽略杂项而非误报 intent limit', async () => {
+    const appDir = resolve(import.meta.dir, '../../..')
+    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
+    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-non-regular-budget-'))
+    const canvasRoot = join(root, 'canvas')
+    const transactions = join(canvasRoot, 'transactions')
+    mkdirSync(transactions, { recursive: true })
+    mkdirSync(join(transactions, 'agent-node-00000000-0000-4000-8000-ffffffffffff.json'))
+    writeFileSync(join(root, 'outside-intent'), '{}', 'utf8')
+    symlinkSync(
+      join(root, 'outside-intent'),
+      join(transactions, 'agent-node-ffffffff-ffff-4fff-8fff-ffffffffffff.json'),
+    )
+
+    try {
+      const result = await runStableDirectoryNative({
+        mode: 'canvas-intent-scan', roots: [canvasRoot], childName: 'transactions',
+        maxEntries: 0,
+      }, () => true, { helperPath: () => helperPath })
+
+      expect(result.entries).toEqual([])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'win32')('Given Windows 预算为零且合法 UUID 名是 junction When 扫描 Then 拒绝 reparse 消耗 intent budget', async () => {
+    const appDir = resolve(import.meta.dir, '../../..')
+    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper.exe')
+    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    const root = mkdtempSync(join(tmpdir(), 'proma-win-intent-non-regular-budget-'))
+    const canvasRoot = join(root, 'canvas')
+    const transactions = join(canvasRoot, 'transactions')
+    const replacement = join(root, 'replacement')
+    mkdirSync(transactions, { recursive: true })
+    mkdirSync(replacement)
+    symlinkSync(
+      replacement,
+      join(transactions, 'agent-node-ffffffff-ffff-4fff-8fff-ffffffffffff.json'),
+      'junction',
+    )
+
+    try {
+      const result = await runStableDirectoryNative({
+        mode: 'canvas-intent-scan', roots: [canvasRoot], childName: 'transactions',
+        maxEntries: 0,
+      }, () => true, { helperPath: () => helperPath })
+
+      expect(result.entries).toEqual([])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

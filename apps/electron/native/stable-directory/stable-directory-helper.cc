@@ -588,16 +588,16 @@ bool ScanCanvasIntents(const Config& config, int transactions_fd,
     const std::string name(item->d_name);
     if (name == "." || name == "..") continue;
     if (!IsCanvasIntentCandidateName(name)) continue;
-    if (budget->entries >= config.max_entries) {
-      *error = "canvas intent entry limit exceeded";
-      return false;
-    }
     struct stat listed {};
     if (fstatat(transactions_fd, name.c_str(), &listed, AT_SYMLINK_NOFOLLOW) != 0) {
       *error = "cannot stat canvas intent entry";
       return false;
     }
     if (!S_ISREG(listed.st_mode)) continue;
+    if (budget->entries >= config.max_entries) {
+      *error = "canvas intent entry limit exceeded";
+      return false;
+    }
     std::string content;
     if (S_ISREG(listed.st_mode)) {
       if (listed.st_size < 0 || listed.st_size > 64 * 1024) {
@@ -1112,15 +1112,15 @@ bool ScanCanvasIntents(const Config& config, HANDLE transactions,
           cursor += item->NextEntryOffset;
           continue;
         }
-        if (budget->entries >= config.max_entries) {
-          *error = "canvas intent entry limit exceeded";
-          return false;
-        }
         const bool is_directory = (item->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         if (is_directory || (item->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
           if (item->NextEntryOffset == 0) break;
           cursor += item->NextEntryOffset;
           continue;
+        }
+        if (budget->entries >= config.max_entries) {
+          *error = "canvas intent entry limit exceeded";
+          return false;
         }
         std::string content;
         std::uint64_t size = 0;

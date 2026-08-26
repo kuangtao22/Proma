@@ -59,4 +59,12 @@ test('Given stable directory helper 的 Canvas intent 模式 When 检查三平�
   expect(source).toContain('FILE_ATTRIBUTE_REPARSE_POINT')
   expect(source).toContain('FILE_CREATE, FILE_NON_DIRECTORY_FILE, &temporary, &outcome.error')
   expect(source).toContain('CanvasIntentWriteResultJson(outcome)')
+  /** Windows scan 必须先排除目录/reparse，再让真实普通 intent 消耗容量。 */
+  const windowsScan = source.slice(
+    source.indexOf('// 直接枚举 transactions HANDLE'),
+    source.indexOf('// 比较 Windows canonical 边界'),
+  )
+  expect(windowsScan.indexOf('FILE_ATTRIBUTE_REPARSE_POINT')).toBeLessThan(
+    windowsScan.indexOf('budget->entries >= config.max_entries'),
+  )
 })

@@ -57,10 +57,12 @@ function createContext(options: {
   reconcileResult?: {
     snapshot: { document: CanvasDocument; writable: true; recoveredFrom?: 'tmp' | 'backup' }
     documentChanged: boolean
+    error?: Error
   }
   retryReconcileResult?: {
     snapshot: { document: CanvasDocument; writable: true; recoveredFrom?: 'tmp' | 'backup' }
     documentChanged: boolean
+    error?: Error
   }
   beforeCreate?: (input: { projectId: string; canvasId: string }) => Promise<void>
   createErrorOnce?: Error
@@ -575,6 +577,24 @@ describe('原生 Canvas 文档 IPC', () => {
       channel: CANVAS_IPC_CHANNELS.CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
     }])
+  })
+
+  test('Given detached intent 已可见但目录持久性未确认 When LOAD 对账 Then 原样抛错且不广播 graph', async () => {
+    /** detached 不改变画布 revision，因此耐久性错误不能伪造图发布事实。 */
+    const error = new Error('CANVAS_INTENT_DURABILITY_UNCERTAIN: 目录持久性未确认')
+    const context = createContext({
+      reconcileResult: {
+        snapshot: { document: createDocument(4), writable: true },
+        documentChanged: false,
+        error,
+      },
+    })
+
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })).rejects.toBe(error)
+    expect(context.sender.sent).toEqual([])
+    expect(context.broadcastLeaseStates).toEqual([])
   })
 
   test('Given CREATE 对账已提交图变更 When 新请求默认模型失败 Then 广播对账 revision 并原样抛错', async () => {

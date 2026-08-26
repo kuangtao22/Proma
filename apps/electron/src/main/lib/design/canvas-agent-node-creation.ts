@@ -655,7 +655,12 @@ export class CanvasAgentNodeCreationService {
         if (!node) {
           /** committed 后节点缺失代表用户删除引用，必须永久 detached。 */
           intent = this.transitionIntent(intent, 'detached')
-          await this.writeIntent(identity, intent)
+          const confirmation = await this.writeIntent(identity, intent)
+          if (confirmation.durabilityError) {
+            reconciliationError = confirmation.durabilityError
+            intents.push(intent)
+            break
+          }
         } else {
           assertNodeMatchesIntent(node, intent)
         }
