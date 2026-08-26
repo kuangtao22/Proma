@@ -45,6 +45,7 @@ import { buildCanvasAgentActiveRunSnapshot } from './agent-session-visibility'
 import { setAgentStopper, setHeadlessAgentRunner } from './agent-headless-runner-registry'
 import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
 import {
+  buildAuthoritativeAgentRunStartedEvent,
   buildAuthoritativeAgentStreamErrorPayload,
   sendAuthoritativeAgentStreamComplete,
 } from './agent-completion-payload'
@@ -338,7 +339,7 @@ export async function runAgent(
           }
           eventBus.emit(input.sessionId, {
             kind: 'proma_event',
-            event: { type: 'run_started', startedAt },
+            event: buildAuthoritativeAgentRunStartedEvent(input.sessionId, startedAt, getAgentSessionMeta),
           })
         })
       },

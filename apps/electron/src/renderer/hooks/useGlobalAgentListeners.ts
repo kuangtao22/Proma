@@ -97,7 +97,7 @@ import { getSessionFileChangeKind, getOwnedSessionWatcherPaths, upsertSessionFil
 import { removeQueuedMessage, createQueuedAgentStreamState } from '@/lib/agent-message-queue'
 import { createAgentStreamEventBatcher } from '@/lib/agent-stream-event-batcher'
 import {
-  createCanvasAgentBootstrapGate,
+  createCanvasAgentBootstrapCoordinator,
   resolveCanvasAgentCompletion,
 } from '@/lib/canvas-agent-event-routing'
 import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
@@ -950,8 +950,9 @@ export function useGlobalAgentListeners(): void {
     // ===== 1. 流式事件 =====
     const handleStreamEvent = (streamEvent: AgentStreamEvent): void => {
         const { sessionId, payload } = streamEvent
-        /** Canvas owner 存在于全局 session 索引，不依赖当前打开的 Canvas。 */
+        /** Canvas owner 或损坏内部身份存在于全局索引，不依赖当前打开的 Canvas。 */
         const isCanvasAgent = store.get(canvasAgentOwnersAtom).has(sessionId)
+          || store.get(canvasAgentInternalInvalidSessionIdsAtom).has(sessionId)
 
         unstable_batchedUpdates(() => {
 
@@ -1514,11 +1515,20 @@ export function useGlobalAgentListeners(): void {
         .catch(console.error)
     }
 
-    /** reload 期间未知 session 先暂存；已知普通、Canvas 与损坏内部 session 可立即判定。 */
-    const canvasAgentBootstrapGate = createCanvasAgentBootstrapGate<CanvasBootstrapEvent>({
+    /** reload 期间用 snapshot + 事件重放建立线性化边界，普通 Agent 仍即时分发。 */
+    const canvasAgentBootstrapCoordinator = createCanvasAgentBootstrapCoordinator<
+      CanvasBootstrapEvent,
+      Awaited<ReturnType<typeof window.electronAPI.listActiveCanvasAgentRuns>>
+    >({
+      loadSnapshot: () => window.electronAPI.listActiveCanvasAgentRuns(),
+      applySnapshot: (snapshot) => store.set(canvasAgentLifecycleAtom, {
+        type: 'bootstrap',
+        owners: snapshot.owners,
+        internalInvalidRuns: snapshot.internalInvalidRuns,
+      }),
       classify: (event) => {
         const { sessionId } = event
-        /** completion 携带主进程权威 metadata 时优先分类；缺失时等待 bootstrap 恢复。 */
+        /** run_started/completion/error 携权威 metadata 时优先分类；缺失时等待 bootstrap。 */
         if (event.type === 'complete' || event.type === 'error') {
           const knownInvalid = store.get(canvasAgentInternalInvalidSessionIdsAtom).has(sessionId)
           if (event.value.session === undefined) return 'unknown'
@@ -1528,38 +1538,63 @@ export function useGlobalAgentListeners(): void {
             knownInvalid,
           ).kind
         }
+        if (event.type === 'stream'
+          && event.value.payload.kind === 'proma_event'
+          && event.value.payload.event.type === 'run_started'
+          && event.value.payload.event.session !== undefined) {
+          return resolveCanvasAgentCompletion(
+            sessionId,
+            event.value.payload.event.session,
+            store.get(canvasAgentInternalInvalidSessionIdsAtom).has(sessionId),
+          ).kind
+        }
         if (store.get(canvasAgentOwnersAtom).has(sessionId)) return 'canvas'
         if (store.get(canvasAgentInternalInvalidSessionIdsAtom).has(sessionId)) return 'internal-invalid'
         if (store.get(agentSessionsAtom).some((session) => session.id === sessionId)) return 'agent'
         return 'unknown'
       },
       dispatch: (event) => {
+        /** snapshot 为空时先用 run_started 的权威 metadata 建立 owner/generation。 */
+        if (event.type === 'stream'
+          && event.value.payload.kind === 'proma_event'
+          && event.value.payload.event.type === 'run_started'
+          && event.value.payload.event.session !== undefined) {
+          const runStartedEvent = event.value.payload.event
+          const route = resolveCanvasAgentCompletion(
+            event.sessionId,
+            runStartedEvent.session,
+            store.get(canvasAgentInternalInvalidSessionIdsAtom).has(event.sessionId),
+          )
+          if (route.kind === 'canvas') store.set(canvasAgentLifecycleAtom, {
+            type: 'started', owner: route.owner, startedAt: runStartedEvent.startedAt,
+          })
+          else if (route.kind === 'internal-invalid') store.set(canvasAgentLifecycleAtom, {
+            type: 'invalid-started', sessionId: event.sessionId, startedAt: runStartedEvent.startedAt,
+          })
+        }
         if (event.type === 'stream') handleStreamEvent(event.value)
         else if (event.type === 'title') handleTitleUpdated(event.value)
         else if (event.type === 'complete') handleAgentComplete(event.value)
         else handleAgentError(event.value)
       },
       allowUnknownAfterReady: (event) => event.type !== 'complete' && event.type !== 'error',
-      allowInternalInvalid: (event) => event.type === 'complete' || event.type === 'error',
+      allowInternalInvalid: (event) => event.type === 'complete'
+        || event.type === 'error'
+        || (event.type === 'stream'
+          && event.value.payload.kind === 'proma_event'
+          && event.value.payload.event.type === 'run_started'),
+      isStartEvent: (event) => event.type === 'stream'
+        && event.value.payload.kind === 'proma_event'
+        && event.value.payload.event.type === 'run_started',
       isTerminalEvent: (event) => event.type === 'complete' || event.type === 'error',
       getTerminalEventKey: (event) => `${event.type}:${event.sessionId}`,
-    })
-
-    /** 单次本地主进程快照恢复 active Canvas owner，失败时未知事件持续 fail closed。 */
-    void window.electronAPI.listActiveCanvasAgentRuns().then((snapshot) => {
-      store.set(canvasAgentLifecycleAtom, {
-        type: 'bootstrap',
-        owners: snapshot.owners,
-        internalInvalidRuns: snapshot.internalInvalidRuns,
-      })
-      canvasAgentBootstrapGate.complete()
-    }).catch((error: unknown) => {
-      console.error('[GlobalAgentListeners] Canvas Agent 运行快照恢复失败:', error)
-      canvasAgentBootstrapGate.fail()
+      onError: (error) => {
+        console.error('[GlobalAgentListeners] Canvas Agent 运行快照恢复失败:', error)
+      },
     })
     // partial 仅保留每个会话在一帧内最新的累计全文，非 partial（尤其 final）立即处理。
     const streamEventBatcher = createAgentStreamEventBatcher({
-      dispatch: (streamEvent) => canvasAgentBootstrapGate.handle({
+      dispatch: (streamEvent) => canvasAgentBootstrapCoordinator.handle({
         type: 'stream', sessionId: streamEvent.sessionId, value: streamEvent,
       }),
     })
@@ -1847,7 +1882,7 @@ export function useGlobalAgentListeners(): void {
       (data: AgentStreamCompletePayload) => {
         // 无终态 assistant 的异常路径也不能让等待中的 partial 在完成后倒灌。
         streamEventBatcher.clear(data.sessionId)
-        canvasAgentBootstrapGate.handle({
+        canvasAgentBootstrapCoordinator.handle({
           type: 'complete', sessionId: data.sessionId, value: data,
         })
       },
@@ -1856,7 +1891,7 @@ export function useGlobalAgentListeners(): void {
     // ===== 3. 流式错误 =====
     const cleanupError = window.electronAPI.onAgentStreamError(
       (data: AgentStreamErrorPayload) => {
-        canvasAgentBootstrapGate.handle({
+        canvasAgentBootstrapCoordinator.handle({
           type: 'error', sessionId: data.sessionId, value: data,
         })
       }
@@ -1885,7 +1920,7 @@ export function useGlobalAgentListeners(): void {
 
     // ===== 5. 标题更新 =====
     const cleanupTitleUpdated = window.electronAPI.onAgentTitleUpdated((value) => {
-      canvasAgentBootstrapGate.handle({ type: 'title', sessionId: value.sessionId, value })
+      canvasAgentBootstrapCoordinator.handle({ type: 'title', sessionId: value.sessionId, value })
     })
 
     // ===== 6. Windows Agent Island 提示音委托 =====
@@ -1996,8 +2031,11 @@ export function useGlobalAgentListeners(): void {
     }
     syncVisibleAgentStreamSession()
     const unsubscribeVisibleSession = store.sub(activeSessionIdAtom, syncVisibleAgentStreamSession)
+    /** 所有 lifecycle listener 注册完成后再发起 snapshot，消除订阅建立前的事件窗口。 */
+    void canvasAgentBootstrapCoordinator.start()
 
     return () => {
+      canvasAgentBootstrapCoordinator.dispose()
       cleanupEvent()
       streamEventBatcher.dispose()
       unsubscribeVisibleSession()

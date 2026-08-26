@@ -137,6 +137,18 @@ describe('Agent service 迁移准入', () => {
     expect(catchBody).toContain('sendAuthoritativeAgentStreamComplete(webContents, input, getAgentSessionMeta')
   })
 
+  test('Given renderer run 真正开始 When 发布 run_started Then 统一携带主进程权威轻量 metadata', () => {
+    /** 读取真实 service，锁定启动事件不能继续只发送 startedAt。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    /** 只检查 renderer runAgent 的启动 producer。 */
+    const start = source.indexOf('export async function runAgent(')
+    const end = source.indexOf('\n/**', start + 1)
+    const body = source.slice(start, end)
+
+    expect(body).toContain('buildAuthoritativeAgentRunStartedEvent(input.sessionId, startedAt, getAgentSessionMeta)')
+    expect(body).not.toContain("event: { type: 'run_started', startedAt }")
+  })
+
   test('Given renderer 与 headless 的成功或异常完成 When 检查所有 producer Then 统一经权威 session builder', () => {
     /** 读取真实 service，防止任一 completion producer 再手工遗漏 metadata。 */
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')

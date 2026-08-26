@@ -77,6 +77,7 @@
 - Canvas Agent 对话只允许通过专用 GET/SEND/STOP IPC 访问：每次调用先对账 pending intent，再从权威 Canvas 文档解析 `node -> session` 并复核会话三字段独占归属；运行复用 Pi Agent runtime，但单次强制 `Read`、`Glob`、`Grep` 只读工具白名单。持久化 JSONL 仅在打开对话时读取，关闭或切换 Canvas 不停止运行；全局事件按最小 owner 路由，完整归属只进入 Canvas live/error/完成导航，半归属、混合归属和损坏归属 fail closed，禁止进入普通会话、未读、状态岛或 Agent tab。
 - Renderer reload 只通过一次性 active Canvas run 快照恢复 busy session 的最小 owner；renderer/headless 的正常与异常 completion producer 均强制从权威 session 索引附带轻量 metadata。未知 completion 与 stream/title 共用有界 bootstrap gate：stream/title 使用 O(1) 环形缓冲，completion 按 session 独立有界保留并在重放时后于流事件，bootstrap 失败后全部 fail closed。owner/messages 统一按 open/running/completed/invalid 生命周期回收：open/running 保留完整权威消息，只有终态非保护缓存按单会话 500 条、20 个 session、总计 2000 条修剪；soft completion 保持 active invalid 阻断，只有 hard terminal 才转为 100 条 LRU tombstone，token 热路径只做 O(1) 分类查询。
 - Canvas Agent 的 authority 在每次 bootstrap 时严格按当前 active-run snapshot 重建；Renderer optimistic token/generation 与 hard completion 后的 JSONL GET handoff generation 独立保存，空 snapshot 不撤销后两者，GET 晚回只凭 handoff 代次接管并由新 run、close、settled 或 invalid 精确清理。
+- Canvas Agent 的 `run_started` 必须携带主进程权威轻量 session metadata；Renderer reload 先注册全部 lifecycle listener，再由可 dispose 的 coordinator 应用一次性 active-run snapshot 并重放期间非普通事件，StrictMode 旧 snapshot 无副作用，禁止用定时重拉或 owner cache fallback 修补竞态。bootstrap 期间的 `run_started` 与 completion 分别按 session 独立有界保留，并固定按启动、普通流、终态顺序重放，避免 token 洪峰淘汰 owner/generation 建立事实。
 
 ## 会话记录
 

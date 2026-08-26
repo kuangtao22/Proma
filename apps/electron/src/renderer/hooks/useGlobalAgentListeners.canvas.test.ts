@@ -45,9 +45,11 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
   test('Given renderer 重载且 bootstrap 未完成 When 未知流与标题先到 Then 暂存并在 owner 恢复后重放一次', () => {
     const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
     expect(source).toContain('window.electronAPI.listActiveCanvasAgentRuns()')
-    expect(source).toContain('canvasAgentBootstrapGate.complete()')
-    expect(source).toContain('canvasAgentBootstrapGate.fail()')
-    expect(source).toContain('canvasAgentBootstrapGate.handle')
+    expect(source).toContain('createCanvasAgentBootstrapCoordinator')
+    expect(source).toContain('canvasAgentBootstrapCoordinator.start()')
+    expect(source).toContain('canvasAgentBootstrapCoordinator.dispose()')
+    expect(source).toContain('canvasAgentBootstrapCoordinator.handle')
+    expect(source).toContain('event.value.payload.event.session !== undefined')
   })
 
   test('Given renderer 重载且 completion 早到 When bootstrap deferred 或失败 Then completion 也通过有界 gate', () => {

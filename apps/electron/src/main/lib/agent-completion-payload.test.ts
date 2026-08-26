@@ -1,8 +1,43 @@
 import { describe, expect, test } from 'bun:test'
-import type { AgentSendInput, AgentSessionMeta, AgentStreamCompletePayload } from '@proma/shared'
+import type { AgentSendInput, AgentSessionMeta, AgentStreamCompletePayload, PromaEvent } from '@proma/shared'
 import * as completionPayload from './agent-completion-payload'
 
 describe('Agent completion payload', () => {
+  test('Given Canvas run_started When 构造公开事件 Then 携权威轻量 metadata 且不泄露路径', () => {
+    /** 待实现的权威 run_started builder，必须复用 completion 的白名单。 */
+    const buildRunStarted = (completionPayload as typeof completionPayload & {
+      buildAuthoritativeAgentRunStartedEvent?: (
+        sessionId: string,
+        startedAt: number,
+        getSession: (sessionId: string) => AgentSessionMeta | undefined,
+      ) => Extract<PromaEvent, { type: 'run_started' }>
+    }).buildAuthoritativeAgentRunStartedEvent
+    expect(buildRunStarted).toBeFunction()
+    if (!buildRunStarted) return
+
+    /** 主进程权威 Canvas session，路径字段不得跨 IPC。 */
+    const session = {
+      id: 'canvas-started', title: 'Canvas Agent', workspaceId: 'project-1',
+      sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
+      createdAt: 1, updatedAt: 2,
+      piSessionFile: '/Users/example/private.jsonl',
+      attachedFiles: ['/Users/example/secret.png'],
+    } as AgentSessionMeta
+
+    const event = buildRunStarted(session.id, 456, () => session)
+
+    expect(event).toEqual({
+      type: 'run_started',
+      startedAt: 456,
+      session: {
+        id: 'canvas-started', title: 'Canvas Agent', workspaceId: 'project-1',
+        sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
+        createdAt: 1, updatedAt: 2,
+      },
+    })
+    expect(JSON.stringify(event)).not.toContain('/Users/example')
+  })
+
   test('Given Canvas run 在准入早期失败 When 读取 completion metadata Then 只信任主进程 session getter', () => {
     /** 待实现的权威轻量 metadata 选择器。 */
     const selectSession = (completionPayload as typeof completionPayload & {

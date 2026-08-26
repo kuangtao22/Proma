@@ -5,6 +5,7 @@ import type {
   AgentStreamErrorPayload,
   AgentStreamCompletePayload,
   AgentStreamSessionMeta,
+  PromaEvent,
 } from '@proma/shared'
 
 type AgentStreamCompletionPayloadDetails = Omit<
@@ -54,6 +55,25 @@ export function selectAgentCompletionSessionMeta(
   if (session.delegationDepth !== undefined) meta.delegationDepth = session.delegationDepth
   if (session.delegationGoal !== undefined) meta.delegationGoal = session.delegationGoal
   return meta
+}
+
+/**
+ * 构造携带主进程权威轻量 metadata 的 run_started 事件。
+ * @param sessionId 已由 Orchestrator 准入的会话 ID。
+ * @param startedAt 本轮权威运行代次。
+ * @param getSession 主进程权威 session getter。
+ * @returns 不暴露路径或运行时存储字段的启动事件。
+ */
+export function buildAuthoritativeAgentRunStartedEvent(
+  sessionId: string,
+  startedAt: number,
+  getSession: (sessionId: string) => AgentSessionMeta | undefined,
+): Extract<PromaEvent, { type: 'run_started' }> {
+  return {
+    type: 'run_started',
+    startedAt,
+    session: selectAgentCompletionSessionMeta(sessionId, getSession),
+  }
 }
 
 /** 使用与 completion 相同的公开元数据构造流式错误载荷。 */

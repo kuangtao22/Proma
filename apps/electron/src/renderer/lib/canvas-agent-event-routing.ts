@@ -29,8 +29,12 @@ export interface CanvasAgentBootstrapGateOptions<T extends { sessionId: string }
   allowInternalInvalid?: (event: T) => boolean
   /** 标识不能被 stream/title 洪峰淘汰的 session 终态事件。 */
   isTerminalEvent?: (event: T) => boolean
+  /** 标识必须在 stream/title 与终态之前重放的 session 启动事件。 */
+  isStartEvent?: (event: T) => boolean
   /** 同一 session 存在多类关键事件时提供独立 coalesce key。 */
   getTerminalEventKey?: (event: T) => string
+  /** pending 时延迟已确认 Canvas/internal 事件，供 snapshot 应用后线性化重放。 */
+  deferNonAgentWhilePending?: boolean
 }
 
 /** renderer reload 期间未知事件的有界暂存入口。 */
@@ -60,6 +64,10 @@ export function createCanvasAgentBootstrapGate<T extends { sessionId: string }>(
   let bufferedSize = 0
   /** completion 按 session 单独保留，避免被 token 洪峰淘汰。 */
   const bufferedTerminalEvents = new Map<string, T>()
+  /** run_started 按 session 单独保留，确保 owner/generation 先于流与终态建立。 */
+  const bufferedStartEvents = new Map<string, T>()
+  /** 启动缓冲至少保留一个 session，同时继续受配置上限约束。 */
+  const maxBufferedStartEvents = Math.max(1, maxBufferedEvents)
   /** completion 缓冲至少保留一个 session，同时继续受配置上限约束。 */
   const maxBufferedTerminalEvents = Math.max(1, maxBufferedEvents)
 
@@ -89,15 +97,37 @@ export function createCanvasAgentBootstrapGate<T extends { sessionId: string }>(
     bufferedTerminalEvents.set(key, event)
   }
 
+  /** O(1) 按 session 保留最新启动事实，只有启动事件洪峰自身能触发淘汰。 */
+  const bufferStartEvent = (event: T): void => {
+    const key = event.sessionId
+    if (bufferedStartEvents.has(key)) {
+      bufferedStartEvents.delete(key)
+    } else if (bufferedStartEvents.size >= maxBufferedStartEvents) {
+      const oldestSessionId = bufferedStartEvents.keys().next().value
+      if (oldestSessionId !== undefined) bufferedStartEvents.delete(oldestSessionId)
+    }
+    bufferedStartEvents.set(key, event)
+  }
+
   /** 清空 pending 缓冲，供成功重放后或永久失败时释放引用。 */
   const clearBufferedEvents = (): void => {
     bufferedEvents.fill(undefined)
     bufferedStart = 0
     bufferedSize = 0
+    bufferedStartEvents.clear()
     bufferedTerminalEvents.clear()
   }
   const route = (event: T): void => {
     const kind = options.classify(event)
+    /** 普通 Agent 不依赖 Canvas snapshot；其余事件在 pending 时按原有界策略延迟。 */
+    if (phase === 'pending'
+      && kind !== 'agent'
+      && (kind === 'unknown' || options.deferNonAgentWhilePending === true)) {
+      if (options.isStartEvent?.(event) === true) bufferStartEvent(event)
+      else if (options.isTerminalEvent?.(event) === true) bufferTerminalEvent(event)
+      else bufferEvent(event)
+      return
+    }
     if (kind === 'canvas' || kind === 'agent') options.dispatch(event)
     else if (kind === 'internal-invalid' && options.allowInternalInvalid?.(event) === true) {
       options.dispatch(event)
@@ -106,31 +136,95 @@ export function createCanvasAgentBootstrapGate<T extends { sessionId: string }>(
       && (options.allowUnknownAfterReady?.(event) ?? true)) {
       options.dispatch(event)
     }
-    else if (kind === 'unknown' && phase === 'pending') {
-      if (options.isTerminalEvent?.(event) === true) bufferTerminalEvent(event)
-      else bufferEvent(event)
+  }
+  /** 按启动、流事件先到顺序、终态最后的合同重放当前缓冲。 */
+  const replayBufferedEvents = (): void => {
+    const replayStartEvents = [...bufferedStartEvents.values()]
+    const replayEvents: T[] = []
+    for (let offset = 0; offset < bufferedSize; offset += 1) {
+      const event = bufferedEvents[(bufferedStart + offset) % maxBufferedEvents]
+      if (event !== undefined) replayEvents.push(event)
     }
+    const replayTerminalEvents = [...bufferedTerminalEvents.values()]
+    clearBufferedEvents()
+    for (const event of replayStartEvents) route(event)
+    for (const event of replayEvents) route(event)
+    for (const event of replayTerminalEvents) route(event)
   }
   return {
     handle: route,
     complete: () => {
       if (phase !== 'pending') return
       phase = 'ready'
-      /** 先重放 stream/title，再按 session 重放 completion，保证每会话先流后终态。 */
-      const replayEvents: T[] = []
-      for (let offset = 0; offset < bufferedSize; offset += 1) {
-        const event = bufferedEvents[(bufferedStart + offset) % maxBufferedEvents]
-        if (event !== undefined) replayEvents.push(event)
-      }
-      const replayTerminalEvents = [...bufferedTerminalEvents.values()]
-      clearBufferedEvents()
-      for (const event of replayEvents) route(event)
-      for (const event of replayTerminalEvents) route(event)
+      /** 先建立 owner/generation，再重放 stream/title 与 completion。 */
+      replayBufferedEvents()
     },
     fail: () => {
       if (phase !== 'pending') return
       phase = 'failed'
-      clearBufferedEvents()
+      /** snapshot 失败时只让重新分类后仍可信的事件通过，unknown 继续 fail closed。 */
+      if (options.deferNonAgentWhilePending === true) replayBufferedEvents()
+      else clearBufferedEvents()
+    },
+  }
+}
+
+/** snapshot 与 listener 事件线性化协调器的依赖。 */
+export interface CanvasAgentBootstrapCoordinatorOptions<
+  T extends { sessionId: string },
+  TSnapshot,
+> extends CanvasAgentBootstrapGateOptions<T> {
+  loadSnapshot: () => Promise<TSnapshot>
+  applySnapshot: (snapshot: TSnapshot) => void
+  onError?: (error: unknown) => void
+}
+
+/** 可由 React effect cleanup 精确撤销的 bootstrap 协调器。 */
+export interface CanvasAgentBootstrapCoordinator<T extends { sessionId: string }> {
+  handle: (event: T) => void
+  start: () => Promise<void>
+  dispose: () => void
+}
+
+/**
+ * 创建 snapshot 与并发 listener 事件的线性化边界。
+ * @param options 可注入的 snapshot API、状态应用、动态分类与真实事件分发。
+ * @returns 先应用 snapshot、再重放期间事件，dispose 后拒绝旧异步结果的协调器。
+ */
+export function createCanvasAgentBootstrapCoordinator<
+  T extends { sessionId: string },
+  TSnapshot,
+>(
+  options: CanvasAgentBootstrapCoordinatorOptions<T, TSnapshot>,
+): CanvasAgentBootstrapCoordinator<T> {
+  /** StrictMode cleanup 后旧 snapshot 与事件都不得再触发副作用。 */
+  let active = true
+  /** 同一 coordinator 的 snapshot API 只允许启动一次。 */
+  let startPromise: Promise<void> | null = null
+  const gate = createCanvasAgentBootstrapGate<T>({
+    ...options,
+    deferNonAgentWhilePending: true,
+  })
+
+  return {
+    handle: (event) => {
+      if (active) gate.handle(event)
+    },
+    start: () => {
+      if (startPromise) return startPromise
+      startPromise = options.loadSnapshot().then((snapshot) => {
+        if (!active) return
+        options.applySnapshot(snapshot)
+        if (active) gate.complete()
+      }).catch((error: unknown) => {
+        if (!active) return
+        gate.fail()
+        options.onError?.(error)
+      })
+      return startPromise
+    },
+    dispose: () => {
+      active = false
     },
   }
 }
