@@ -37,6 +37,8 @@ export interface CanvasAgentConversationControllerDependencies {
   onComposerChange: (value: string) => void
   onSendingChange: (sending: boolean) => void
   onError: (error: string | null) => void
+  /** SEND Promise reject 时无条件收口对应 session 的全局伪运行 lifecycle。 */
+  onSendRejected?: () => void
 }
 
 /** 按需加载、单次发送和停止的命令边界。 */
@@ -77,6 +79,7 @@ export function createCanvasAgentConversationController(
       dependencies.onSendingChange(true)
       dependencies.onError(null)
       const request = dependencies.send(message, userMessageUuid, startedAt).catch((error: unknown) => {
+        dependencies.onSendRejected?.()
         if (!disposed) {
           dependencies.onComposerChange(composerRestore)
           dependencies.onError(error instanceof Error ? error.message : '发送失败')
@@ -158,12 +161,10 @@ export function CanvasAgentConversation({
       },
       onComposerChange: setComposer,
       onSendingChange: setSending,
-      onError: (error) => {
-        setLocalError(error)
-        /** SEND 在运行准入前失败时不会可靠收到 completion，必须主动释放伪运行保护。 */
-        if (error && openedSessionId) {
-          updateLifecycle({ type: 'completed', sessionId: openedSessionId })
-        }
+      onError: setLocalError,
+      onSendRejected: () => {
+        /** IPC reject 表示尚未进入会吞掉异常并发布 completion 的 runAgent 边界。 */
+        if (openedSessionId) updateLifecycle({ type: 'completed', sessionId: openedSessionId })
       },
     })
     controllerRef.current = controller

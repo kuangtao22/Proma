@@ -67,6 +67,12 @@ export const canvasAgentRunningSessionIdsAtom = atom<Set<string>>(new Set<string
 /** 已确认 Canvas 字段损坏的内部 session，未知事件必须 fail closed。 */
 export const canvasAgentInternalInvalidSessionIdsAtom = atom<Set<string>>(new Set<string>())
 
+/** bootstrap 确认仍在运行的损坏内部 session，不受 terminal tombstone 上限影响。 */
+export const canvasAgentActiveInternalInvalidSessionIdsAtom = atom<Set<string>>(new Set<string>())
+
+/** 已终态的损坏内部 session tombstone，仅用于抑制迟到事件并按 LRU 有界。 */
+export const canvasAgentTerminalInternalInvalidSessionIdsAtom = atom<Set<string>>(new Set<string>())
+
 /** Canvas owner 与持久化消息缓存的生命周期事件。 */
 export type CanvasAgentLifecycleEvent =
   | { type: 'bootstrap'; owners: CanvasAgentOwner[]; internalInvalidSessionIds: string[] }
@@ -95,9 +101,9 @@ function pruneCanvasAgentCaches(
   messages: Map<string, SDKMessage[]>,
   protectedIds: Set<string>,
 ): void {
-  /** 每个 session 只保留末尾消息，打开和运行中的面板也遵守单会话上限。 */
+  /** 只有非保护历史允许截断；open/running 必须保留完整权威 JSONL。 */
   for (const [sessionId, entries] of messages) {
-    if (entries.length > MAX_CANVAS_AGENT_MESSAGES_PER_SESSION) {
+    if (!protectedIds.has(sessionId) && entries.length > MAX_CANVAS_AGENT_MESSAGES_PER_SESSION) {
       messages.set(sessionId, entries.slice(-MAX_CANVAS_AGENT_MESSAGES_PER_SESSION))
     }
   }
@@ -131,29 +137,35 @@ export const canvasAgentLifecycleAtom = atom(
     const messages = new Map(get(canvasAgentPersistedMessagesAtom))
     const openSessionIds = new Set(get(canvasAgentOpenSessionIdsAtom))
     const runningSessionIds = new Set(get(canvasAgentRunningSessionIdsAtom))
-    const invalidSessionIds = new Set(get(canvasAgentInternalInvalidSessionIdsAtom))
+    const activeInvalidSessionIds = new Set(get(canvasAgentActiveInternalInvalidSessionIdsAtom))
+    const terminalInvalidSessionIds = new Set(get(canvasAgentTerminalInternalInvalidSessionIdsAtom))
 
     if (event.type === 'bootstrap') {
       /** reload 初始快照替换运行态；仍打开的面板由后续 GET 再建立。 */
       runningSessionIds.clear()
-      invalidSessionIds.clear()
+      activeInvalidSessionIds.clear()
       for (const owner of event.owners) {
         owners.delete(owner.sessionId)
         owners.set(owner.sessionId, owner)
         runningSessionIds.add(owner.sessionId)
       }
-      for (const sessionId of event.internalInvalidSessionIds) invalidSessionIds.add(sessionId)
+      for (const sessionId of event.internalInvalidSessionIds) {
+        terminalInvalidSessionIds.delete(sessionId)
+        activeInvalidSessionIds.add(sessionId)
+      }
     } else if (event.type === 'opened') {
       owners.delete(event.owner.sessionId)
       owners.set(event.owner.sessionId, event.owner)
       messages.delete(event.owner.sessionId)
       messages.set(event.owner.sessionId, event.messages)
       openSessionIds.add(event.owner.sessionId)
-      invalidSessionIds.delete(event.owner.sessionId)
+      activeInvalidSessionIds.delete(event.owner.sessionId)
+      terminalInvalidSessionIds.delete(event.owner.sessionId)
     } else if (event.type === 'started' || event.type === 'owner-updated') {
       owners.delete(event.owner.sessionId)
       owners.set(event.owner.sessionId, event.owner)
-      invalidSessionIds.delete(event.owner.sessionId)
+      activeInvalidSessionIds.delete(event.owner.sessionId)
+      terminalInvalidSessionIds.delete(event.owner.sessionId)
       if (event.type === 'started') runningSessionIds.add(event.owner.sessionId)
     } else if (event.type === 'closed') {
       openSessionIds.delete(event.sessionId)
@@ -172,22 +184,27 @@ export const canvasAgentLifecycleAtom = atom(
       messages.delete(event.sessionId)
       openSessionIds.delete(event.sessionId)
       runningSessionIds.delete(event.sessionId)
-      invalidSessionIds.delete(event.sessionId)
-      invalidSessionIds.add(event.sessionId)
+      activeInvalidSessionIds.delete(event.sessionId)
+      terminalInvalidSessionIds.delete(event.sessionId)
+      terminalInvalidSessionIds.add(event.sessionId)
     }
 
     /** 打开或运行的 session 是保护项，可暂时超过非保护总量。 */
     const protectedIds = new Set([...openSessionIds, ...runningSessionIds])
     pruneCanvasAgentCaches(owners, messages, protectedIds)
-    while (invalidSessionIds.size > MAX_INVALID_CANVAS_AGENT_SESSIONS) {
-      const oldestSessionId = invalidSessionIds.values().next().value
+    while (terminalInvalidSessionIds.size > MAX_INVALID_CANVAS_AGENT_SESSIONS) {
+      const oldestSessionId = terminalInvalidSessionIds.values().next().value
       if (oldestSessionId === undefined) break
-      invalidSessionIds.delete(oldestSessionId)
+      terminalInvalidSessionIds.delete(oldestSessionId)
     }
+    /** union 只在低频 lifecycle 写入口重建；token 分类继续直接 O(1) 查询。 */
+    const invalidSessionIds = new Set([...activeInvalidSessionIds, ...terminalInvalidSessionIds])
     set(canvasAgentOwnersAtom, owners)
     set(canvasAgentPersistedMessagesAtom, messages)
     set(canvasAgentOpenSessionIdsAtom, openSessionIds)
     set(canvasAgentRunningSessionIdsAtom, runningSessionIds)
+    set(canvasAgentActiveInternalInvalidSessionIdsAtom, activeInvalidSessionIds)
+    set(canvasAgentTerminalInternalInvalidSessionIdsAtom, terminalInvalidSessionIds)
     set(canvasAgentInternalInvalidSessionIdsAtom, invalidSessionIds)
   },
 )

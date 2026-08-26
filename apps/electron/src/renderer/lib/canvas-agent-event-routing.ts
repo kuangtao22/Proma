@@ -23,6 +23,10 @@ export interface CanvasAgentBootstrapGateOptions<T extends { sessionId: string }
   classify: (event: T) => CanvasAgentBootstrapEventKind
   dispatch: (event: T) => void
   maxBufferedEvents?: number
+  /** ready 后是否允许未知事件进入普通恢复路径。 */
+  allowUnknownAfterReady?: (event: T) => boolean
+  /** 是否允许已确认损坏的内部事件进入专用终态清理。 */
+  allowInternalInvalid?: (event: T) => boolean
 }
 
 /** renderer reload 期间未知事件的有界暂存入口。 */
@@ -49,7 +53,13 @@ export function createCanvasAgentBootstrapGate<T extends { sessionId: string }>(
   const route = (event: T): void => {
     const kind = options.classify(event)
     if (kind === 'canvas' || kind === 'agent') options.dispatch(event)
-    else if (kind === 'unknown' && phase === 'ready') options.dispatch(event)
+    else if (kind === 'internal-invalid' && options.allowInternalInvalid?.(event) === true) {
+      options.dispatch(event)
+    } else if (kind === 'unknown'
+      && phase === 'ready'
+      && (options.allowUnknownAfterReady?.(event) ?? true)) {
+      options.dispatch(event)
+    }
     else if (kind === 'unknown' && phase === 'pending') {
       if (bufferedEvents.length >= maxBufferedEvents) bufferedEvents.shift()
       bufferedEvents.push(event)
@@ -135,9 +145,11 @@ export function resolveCanvasAgentCompletion(
   sessionId: string,
   session: AgentSessionMeta | undefined,
   cachedOwner: CanvasAgentOwner | undefined,
+  knownInternalInvalid = false,
 ): CanvasAgentEventRoute {
   const route = routeCanvasAgentEvent(session)
   if (route.kind !== 'agent') return route
+  if (session === undefined && knownInternalInvalid) return { kind: 'internal-invalid' }
   if (session === undefined && cachedOwner?.sessionId === sessionId) {
     return { kind: 'canvas', owner: cachedOwner }
   }

@@ -114,4 +114,56 @@ describe('原生 Canvas 状态隔离', () => {
     expect(store.get(canvasAgentPersistedMessagesAtom).has('session-24')).toBe(false)
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).has('session-24')).toBe(true)
   })
+
+  test('Given open 或 running 会话加载 501 条权威消息 When 生命周期修剪 Then 完整历史不被静默截断', () => {
+    const store = createStore()
+    /** 构造超过旧单会话上限的权威 JSONL 消息。 */
+    const messages = Array.from({ length: 501 }, (_, index) => ({
+      type: 'user' as const,
+      message: { content: [{ type: 'text' as const, text: String(index) }] },
+    }))
+    /** 测试使用的最小 Canvas owner。 */
+    const owner = {
+      sessionId: 'protected', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+    }
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages })
+    expect(store.get(canvasAgentPersistedMessagesAtom).get('protected')).toHaveLength(501)
+
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner })
+    store.set(canvasAgentLifecycleAtom, { type: 'closed', sessionId: 'protected' })
+    store.set(canvasAgentLifecycleAtom, { type: 'prune' })
+    expect(store.get(canvasAgentPersistedMessagesAtom).get('protected')).toHaveLength(501)
+  })
+
+  test('Given closed terminal 非保护会话有 501 条消息 When 修剪 Then 只裁剪非保护历史', () => {
+    const store = createStore()
+    /** 非保护历史允许进入数量上限，避免缓存无限增长。 */
+    const messages = Array.from({ length: 501 }, (_, index) => ({
+      type: 'user' as const,
+      message: { content: [{ type: 'text' as const, text: String(index) }] },
+    }))
+    store.set(canvasAgentOwnersAtom, new Map([['closed', {
+      sessionId: 'closed', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+    }]]))
+    store.set(canvasAgentPersistedMessagesAtom, new Map([['closed', messages]]))
+    store.set(canvasAgentLifecycleAtom, { type: 'prune' })
+    expect(store.get(canvasAgentPersistedMessagesAtom).get('closed')).toHaveLength(500)
+  })
+
+  test('Given 1000 个仍运行的损坏 session When bootstrap 与事件持续到达 Then 最早阻断项不被上限淘汰', () => {
+    const store = createStore()
+    /** active invalid 属于安全保护集合，数量可超过 terminal tombstone 上限。 */
+    const activeInvalidIds = Array.from({ length: 1_000 }, (_, index) => `active-invalid-${index}`)
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'bootstrap', owners: [], internalInvalidSessionIds: activeInvalidIds,
+    })
+    expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).size).toBe(1_000)
+    expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).has('active-invalid-0')).toBe(true)
+
+    /** completion 后 active invalid 转为 terminal tombstone，最终集合才允许有界。 */
+    for (const sessionId of activeInvalidIds) {
+      store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId })
+    }
+    expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).size).toBeLessThanOrEqual(100)
+  })
 })

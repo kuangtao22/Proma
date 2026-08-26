@@ -44,7 +44,10 @@ import { getAgentSessionMeta, listAgentSessions, updateAgentSessionMeta } from '
 import { buildCanvasAgentActiveRunSnapshot } from './agent-session-visibility'
 import { setAgentStopper, setHeadlessAgentRunner } from './agent-headless-runner-registry'
 import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
-import { sendAgentStreamComplete } from './agent-completion-payload'
+import {
+  selectAgentCompletionSessionMeta,
+  sendAgentStreamComplete,
+} from './agent-completion-payload'
 import { AgentStreamForwarder } from './agent-stream-forwarder'
 import { AgentQueueCoordinator } from './agent-queue-coordinator'
 import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
@@ -206,10 +209,7 @@ function reportAgentServiceTerminalEffectError(name: string, error: unknown): vo
  * session fork/rewind，传到 renderer 会在长会话完成时徒增 IPC 序列化成本。
  */
 function getSessionMetaForRenderer(sessionId: string) {
-  const session = getAgentSessionMeta(sessionId)
-  if (!session) return undefined
-  const { piEntryBindings: _piEntryBindings, ...meta } = session
-  return meta
+  return selectAgentCompletionSessionMeta(sessionId, getAgentSessionMeta)
 }
 
 eventBus.use((sessionId, payload, next) => {
@@ -372,7 +372,12 @@ export async function runAgent(
         name: 'renderer-complete',
         run: () => {
           if (!webContents.isDestroyed()) {
-            sendAgentStreamComplete(webContents, input, { messages: [], stoppedByUser: false })
+            sendAgentStreamComplete(webContents, input, {
+              messages: [],
+              stoppedByUser: false,
+              // 即使 Orchestrator 在准入早期失败，也只从主进程权威索引读取归属。
+              session: getSessionMetaForRenderer(input.sessionId),
+            })
           }
         },
       },

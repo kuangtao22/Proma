@@ -7,6 +7,12 @@ import {
   CanvasAgentConversation,
   createCanvasAgentConversationController,
 } from './CanvasAgentConversation'
+import {
+  canvasAgentLifecycleAtom,
+  canvasAgentOwnersAtom,
+  canvasAgentPersistedMessagesAtom,
+  canvasAgentRunningSessionIdsAtom,
+} from '../../atoms/native-canvas-atoms'
 
 /** 创建公开消息加载结果。 */
 function createResult(): CanvasAgentMessagesResult {
@@ -90,6 +96,41 @@ describe('Canvas Agent 对话', () => {
       expect(callbacks).toEqual([])
     },
   )
+
+  test('Given A SEND 准入拒绝后已切到 B When 旧请求 reject Then A 全局 lifecycle 回收且 B UI 不污染', async () => {
+    const store = createStore()
+    /** 重复构造准入拒绝，验证 owner/messages/running 不随切换单调增长。 */
+    for (let index = 0; index < 100; index += 1) {
+      const sessionId = `session-${index}`
+      /** 当前 A 节点的全局 owner。 */
+      const owner = {
+        sessionId, projectId: 'project-1', canvasId: 'canvas-a', nodeId: `node-${index}`, title: 'Agent A',
+      }
+      store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+      store.set(canvasAgentLifecycleAtom, { type: 'started', owner })
+      /** 切换到 B 后所有旧 A UI callback 必须被抑制。 */
+      const uiCallbacks: string[] = []
+      const controller = createCanvasAgentConversationController({
+        load: async () => createResult(),
+        send: async () => { throw new Error('会话正在启动或运行中') },
+        stop: async () => undefined,
+        onLoaded: () => undefined,
+        onComposerChange: (value) => uiCallbacks.push(`composer:${value}`),
+        onSendingChange: (value) => uiCallbacks.push(`sending:${value}`),
+        onError: (value) => uiCallbacks.push(`error:${value ?? ''}`),
+        onSendRejected: () => store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId }),
+      })
+      const request = controller.send('A 草稿', `message-${index}`, index)
+      controller.dispose()
+      store.set(canvasAgentLifecycleAtom, { type: 'closed', sessionId })
+      uiCallbacks.length = 0
+      await expect(request).rejects.toThrow('会话正在启动或运行中')
+      expect(uiCallbacks).toEqual([])
+    }
+    expect(store.get(canvasAgentRunningSessionIdsAtom).size).toBe(0)
+    expect(store.get(canvasAgentOwnersAtom).size).toBe(0)
+    expect(store.get(canvasAgentPersistedMessagesAtom).size).toBe(0)
+  })
 
   test('Given 窄屏对话面板 When SSR Then 只有文本发送停止关闭控件', () => {
     const html = renderToStaticMarkup(

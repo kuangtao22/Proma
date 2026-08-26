@@ -69,6 +69,100 @@ describe('Canvas Agent 全局事件路由', () => {
     expect(dispatched).toEqual(['ordinary'])
   })
 
+  test('Given completion 缺少 metadata When bootstrap 完成或失败 Then 未知会话始终禁止普通分发', () => {
+    /** completion 未知态在 ready 后也必须 fail closed，不能降级成普通 Agent。 */
+    const dispatched: string[] = []
+    const readyGate = routing.createCanvasAgentBootstrapGate<{ sessionId: string; type: 'complete' }>({
+      classify: () => 'unknown',
+      dispatch: (event) => dispatched.push(event.sessionId),
+      allowUnknownAfterReady: () => false,
+    })
+    readyGate.handle({ sessionId: 'canvas-early-error', type: 'complete' })
+    readyGate.complete()
+    readyGate.handle({ sessionId: 'canvas-after-bootstrap', type: 'complete' })
+
+    const failedGate = routing.createCanvasAgentBootstrapGate<{ sessionId: string; type: 'complete' }>({
+      classify: () => 'unknown',
+      dispatch: (event) => dispatched.push(event.sessionId),
+      allowUnknownAfterReady: () => false,
+    })
+    failedGate.handle({ sessionId: 'canvas-before-failure', type: 'complete' })
+    failedGate.fail()
+    failedGate.handle({ sessionId: 'canvas-after-failure', type: 'complete' })
+    expect(dispatched).toEqual([])
+  })
+
+  test('Given bootstrap 恢复 active invalid When completion 重放 Then 进入内部终态而非普通通知', () => {
+    /** active invalid completion 允许进入内部清理 handler，但不能进入普通 Agent handler。 */
+    const invalidIds = new Set<string>()
+    const dispatchedKinds: routing.CanvasAgentBootstrapEventKind[] = []
+    const gate = routing.createCanvasAgentBootstrapGate<{ sessionId: string; type: 'complete' }>({
+      classify: (event) => invalidIds.has(event.sessionId) ? 'internal-invalid' : 'unknown',
+      dispatch: (event) => dispatchedKinds.push(invalidIds.has(event.sessionId) ? 'internal-invalid' : 'unknown'),
+      allowUnknownAfterReady: () => false,
+      allowInternalInvalid: (event) => event.type === 'complete',
+    })
+    gate.handle({ sessionId: 'active-invalid', type: 'complete' })
+    invalidIds.add('active-invalid')
+    gate.complete()
+    expect(dispatchedKinds).toEqual(['internal-invalid'])
+  })
+
+  test('Given renderer reload 与 Canvas 早期 completion When deferred、failed 或有可信 meta Then 普通副作用始终为零', () => {
+    /** 模拟 reload 后由 bootstrap 恢复的最小 owner 索引。 */
+    const owners = new Map<string, routing.CanvasAgentOwner>()
+    /** 记录普通通知与列表 upsert，Canvas completion 不得触发两者。 */
+    let ordinaryNotifications = 0
+    let ordinaryListUpserts = 0
+    /** 记录正确恢复的 Canvas completion。 */
+    const canvasRoutes: string[] = []
+    interface CompletionEvent {
+      sessionId: string
+      session?: AgentSessionMeta
+    }
+    /** 创建与真实 hook 相同的 completion gate 分类。 */
+    const createCompletionGate = () => routing.createCanvasAgentBootstrapGate<CompletionEvent>({
+      classify: (event) => {
+        const owner = owners.get(event.sessionId)
+        if (event.session === undefined && !owner) return 'unknown'
+        return routing.resolveCanvasAgentCompletion(event.sessionId, event.session, owner).kind
+      },
+      dispatch: (event) => {
+        const route = routing.resolveCanvasAgentCompletion(
+          event.sessionId,
+          event.session,
+          owners.get(event.sessionId),
+        )
+        if (route.kind === 'canvas') canvasRoutes.push(route.owner.sessionId)
+        else if (route.kind === 'agent') {
+          ordinaryNotifications += 1
+          ordinaryListUpserts += 1
+        }
+      },
+      allowUnknownAfterReady: () => false,
+    })
+
+    const deferredGate = createCompletionGate()
+    deferredGate.handle({ sessionId: 'deferred-canvas' })
+    expect(canvasRoutes).toEqual([])
+    owners.set('deferred-canvas', {
+      sessionId: 'deferred-canvas', projectId: 'project-1', canvasId: 'canvas-1',
+      nodeId: 'node-1', title: '恢复 Canvas',
+    })
+    deferredGate.complete()
+
+    const failedGate = createCompletionGate()
+    failedGate.handle({ sessionId: 'failed-canvas' })
+    failedGate.fail()
+    failedGate.handle({ sessionId: 'failed-canvas' })
+
+    const trustedMetaGate = createCompletionGate()
+    trustedMetaGate.handle({ sessionId: 'trusted-canvas', session: createCanvasSession({ id: 'trusted-canvas' }) })
+    expect(canvasRoutes).toEqual(['deferred-canvas', 'trusted-canvas'])
+    expect(ordinaryNotifications).toBe(0)
+    expect(ordinaryListUpserts).toBe(0)
+  })
+
   test('Given 完整 Canvas owner When 路由 Then 保留 O(1) owner 且禁止普通会话副作用', () => {
     expect(routeCanvasAgentEvent(createCanvasSession())).toEqual({
       kind: 'canvas',

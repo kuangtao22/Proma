@@ -121,4 +121,19 @@ describe('Agent service 迁移准入', () => {
     expect(source).toContain("name: 'external-on-complete'")
     expect(source).toContain("name: 'renderer-complete'")
   })
+
+  test('Given Canvas run 在准入早期抛错 When runAgent 发布 completion Then 仍附带主进程权威轻量 metadata', () => {
+    /** 读取真实 service，锁定外层 catch 不能发布无归属 completion。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    /** 只检查 renderer runAgent，避免 headless 合同干扰。 */
+    const start = source.indexOf('export async function runAgent(')
+    const end = source.indexOf('\n/**', start + 1)
+    const body = source.slice(start, end)
+    /** 外层 catch 是 Orchestrator 准入或发送早期异常的 completion 生产路径。 */
+    const catchStart = body.indexOf("console.error('[Agent 服务] runAgent 未处理异常:'")
+    const catchBody = body.slice(catchStart)
+
+    expect(catchStart).toBeGreaterThan(-1)
+    expect(catchBody).toContain('session: getSessionMetaForRenderer(input.sessionId)')
+  })
 })

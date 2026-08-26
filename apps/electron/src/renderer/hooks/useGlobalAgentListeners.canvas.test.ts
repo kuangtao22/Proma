@@ -37,6 +37,15 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     expect(source).toContain('canvasAgentBootstrapGate.handle')
   })
 
+  test('Given renderer 重载且 completion 早到 When bootstrap deferred 或失败 Then completion 也通过有界 gate', () => {
+    /** completion 必须与 stream/title 共用 bootstrap 判定，禁止直接走普通通知。 */
+    const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
+    expect(source).toContain("| { type: 'complete'; sessionId: string; value: AgentStreamCompletePayload }")
+    expect(source).toContain("allowUnknownAfterReady: (event) => event.type !== 'complete'")
+    expect(source).toContain("allowInternalInvalid: (event) => event.type === 'complete'")
+    expect(source).toContain("type: 'complete', sessionId: data.sessionId, value: data")
+  })
+
   test('Given completion payload 明确损坏 When 本地已有旧 owner Then 失效缓存且禁止 fallback', () => {
     const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
     expect(source).toContain("completionRoute.kind === 'internal-invalid'")

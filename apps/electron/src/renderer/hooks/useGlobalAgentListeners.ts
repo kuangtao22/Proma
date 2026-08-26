@@ -1433,6 +1433,7 @@ export function useGlobalAgentListeners(): void {
     type CanvasBootstrapEvent =
       | { type: 'stream'; sessionId: string; value: AgentStreamEvent }
       | { type: 'title'; sessionId: string; value: { sessionId: string; title: string } }
+      | { type: 'complete'; sessionId: string; value: AgentStreamCompletePayload }
 
     /** 标题事件的真实处理器；Canvas 标题只更新 owner，不接触普通 tab 或会话列表。 */
     const handleTitleUpdated = ({ sessionId, title }: { sessionId: string; title: string }): void => {
@@ -1464,7 +1465,20 @@ export function useGlobalAgentListeners(): void {
 
     /** reload 期间未知 session 先暂存；已知普通、Canvas 与损坏内部 session 可立即判定。 */
     const canvasAgentBootstrapGate = createCanvasAgentBootstrapGate<CanvasBootstrapEvent>({
-      classify: ({ sessionId }) => {
+      classify: (event) => {
+        const { sessionId } = event
+        /** completion 携带主进程权威 metadata 时优先分类；缺失时等待 bootstrap 恢复。 */
+        if (event.type === 'complete') {
+          const cachedOwner = store.get(canvasAgentOwnersAtom).get(sessionId)
+          const knownInvalid = store.get(canvasAgentInternalInvalidSessionIdsAtom).has(sessionId)
+          if (event.value.session === undefined && !cachedOwner && !knownInvalid) return 'unknown'
+          return resolveCanvasAgentCompletion(
+            sessionId,
+            event.value.session,
+            cachedOwner,
+            knownInvalid,
+          ).kind
+        }
         if (store.get(canvasAgentOwnersAtom).has(sessionId)) return 'canvas'
         if (store.get(canvasAgentInternalInvalidSessionIdsAtom).has(sessionId)) return 'internal-invalid'
         if (store.get(agentSessionsAtom).some((session) => session.id === sessionId)) return 'agent'
@@ -1472,8 +1486,11 @@ export function useGlobalAgentListeners(): void {
       },
       dispatch: (event) => {
         if (event.type === 'stream') handleStreamEvent(event.value)
-        else handleTitleUpdated(event.value)
+        else if (event.type === 'title') handleTitleUpdated(event.value)
+        else handleAgentComplete(event.value)
       },
+      allowUnknownAfterReady: (event) => event.type !== 'complete',
+      allowInternalInvalid: (event) => event.type === 'complete',
     })
 
     /** 单次本地主进程快照恢复 active Canvas owner，失败时未知事件持续 fail closed。 */
@@ -1499,10 +1516,7 @@ export function useGlobalAgentListeners(): void {
     })
 
     // ===== 2. 流式完成 =====
-    const cleanupComplete = window.electronAPI.onAgentStreamComplete(
-      (data: AgentStreamCompletePayload) => {
-        // 无终态 assistant 的异常路径也不能让等待中的 partial 在完成后倒灌。
-        streamEventBatcher.clear(data.sessionId)
+    const handleAgentComplete = (data: AgentStreamCompletePayload): void => {
         unstable_batchedUpdates(() => {
         // 后台任务等待态：turn 主体结束但仍有后台任务在飞行，UI 进入"空闲可输入"。
         // 不发"任务已完成"通知（任务并未真正完成）、不清后台任务列表、不重载消息——
@@ -1515,6 +1529,7 @@ export function useGlobalAgentListeners(): void {
           data.sessionId,
           data.session,
           store.get(canvasAgentOwnersAtom).get(data.sessionId),
+          store.get(canvasAgentInternalInvalidSessionIdsAtom).has(data.sessionId),
         )
         if (completionRoute.kind === 'internal-invalid') {
           store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId: data.sessionId })
@@ -1756,7 +1771,15 @@ export function useGlobalAgentListeners(): void {
         }
         finalize()
         }) // unstable_batchedUpdates
-      }
+    }
+    const cleanupComplete = window.electronAPI.onAgentStreamComplete(
+      (data: AgentStreamCompletePayload) => {
+        // 无终态 assistant 的异常路径也不能让等待中的 partial 在完成后倒灌。
+        streamEventBatcher.clear(data.sessionId)
+        canvasAgentBootstrapGate.handle({
+          type: 'complete', sessionId: data.sessionId, value: data,
+        })
+      },
     )
 
     // ===== 3. 流式错误 =====
