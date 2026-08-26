@@ -8,11 +8,14 @@ import {
 import type {
   CanvasChangeEvent,
   CanvasAgentNode,
+  CanvasInvokeResult,
   CanvasDocument,
   CanvasEdge,
   CanvasImageNode,
   CanvasMutation,
   CanvasNode,
+  CreateCanvasAgentNodeInput,
+  RebuildCanvasAgentNodeResult,
   CanvasVisualDocumentNode,
   CanvasWebviewNode,
   CanvasWorkspaceSnapshot,
@@ -111,6 +114,7 @@ describe('Canvas 图共享合同', () => {
     const snapshot: CanvasWorkspaceSnapshot = {
       document: createEmptyCanvasDocument('project-1', 'canvas-1', now),
       writable: true,
+      nodeIssues: [],
       recoveredFrom: 'backup',
     }
     /** 恢复事件允许使用低 revision，消费者据 cause 决定无条件失效。 */
@@ -125,6 +129,7 @@ describe('Canvas 图共享合同', () => {
       LOAD: 'canvas:load',
       SAVE_MUTATIONS: 'canvas:save-mutations',
       CREATE_AGENT_NODE: 'canvas:create-agent-node',
+      REBUILD_AGENT_NODE: 'canvas:rebuild-agent-node',
       LIST_ACTIVE_AGENT_RUNS: 'canvas:list-active-agent-runs',
       GET_AGENT_MESSAGES: 'canvas:get-agent-messages',
       SEND_AGENT_MESSAGE: 'canvas:send-agent-message',
@@ -142,6 +147,59 @@ describe('Canvas 图共享合同', () => {
     })
     expect('path' in snapshot).toBe(false)
     expect('storageKind' in snapshot).toBe(false)
+  })
+
+  test('Given 节点会话不可用 When 构造工作区快照 Then 问题只存在于运行时快照', () => {
+    /** 运行时节点问题不得污染持久化 Canvas 文档。 */
+    const snapshot: CanvasWorkspaceSnapshot = {
+      document: createEmptyCanvasDocument('project-1', 'canvas-1', now),
+      writable: true,
+      nodeIssues: [{
+        nodeId: 'node-1',
+        code: 'AGENT_SESSION_UNAVAILABLE',
+        allowedActions: ['rebuild-agent-session', 'remove-node'],
+      }],
+    }
+
+    expect(snapshot.nodeIssues).toHaveLength(1)
+    expect('nodeIssues' in snapshot.document).toBe(false)
+  })
+
+  test('Given 扩展创建输入 When 读取关系 Then 保留源节点和稳定边 ID', () => {
+    /** 扩展操作预分配节点与边身份，失败重试必须复用。 */
+    const input: CreateCanvasAgentNodeInput = {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: '22222222-2222-4222-8222-222222222222',
+      title: '下游 Agent',
+      position: { x: 480, y: 120 },
+      relationship: {
+        sourceNodeId: 'source-1',
+        edgeId: '33333333-3333-4333-8333-333333333333',
+      },
+    }
+
+    expect(input.relationship).toEqual({
+      sourceNodeId: 'source-1',
+      edgeId: '33333333-3333-4333-8333-333333333333',
+    })
+  })
+
+  test('Given 重建公开失败 When 判别结果 Then 只能读取安全错误', () => {
+    /** 失败联合只携带稳定码和用户可见文案。 */
+    const result: CanvasInvokeResult<RebuildCanvasAgentNodeResult> = {
+      ok: false,
+      error: { code: 'AGENT_SESSION_REBUILD_FAILED', message: '重建失败，请重试。' },
+    }
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.error).toEqual({
+        code: 'AGENT_SESSION_REBUILD_FAILED',
+        message: '重建失败，请重试。',
+      })
+    }
   })
 
   test('Given 项目与 Canvas 身份 When 创建空文档 Then 同时固化两级身份和初始状态', () => {

@@ -7,6 +7,7 @@ export const CANVAS_IPC_CHANNELS = {
   LOAD: 'canvas:load',
   SAVE_MUTATIONS: 'canvas:save-mutations',
   CREATE_AGENT_NODE: 'canvas:create-agent-node',
+  REBUILD_AGENT_NODE: 'canvas:rebuild-agent-node',
   LIST_ACTIVE_AGENT_RUNS: 'canvas:list-active-agent-runs',
   GET_AGENT_MESSAGES: 'canvas:get-agent-messages',
   SEND_AGENT_MESSAGE: 'canvas:send-agent-message',
@@ -156,6 +157,42 @@ export interface CanvasAgentTarget extends CanvasTarget {
   nodeId: string
 }
 
+/** Canvas 节点可由用户执行的恢复动作。 */
+export type CanvasNodeIssueAction = 'rebuild-agent-session' | 'remove-node'
+
+/** 首批节点问题只公开用户可恢复的会话不可用状态。 */
+export type CanvasNodeIssueCode = 'AGENT_SESSION_UNAVAILABLE'
+
+/** 主进程派生的节点问题，不写入 CanvasDocument。 */
+export interface CanvasNodeIssue {
+  nodeId: string
+  code: CanvasNodeIssueCode
+  allowedActions: CanvasNodeIssueAction[]
+}
+
+/** Renderer 可见的 Canvas 业务错误码。 */
+export type CanvasPublicErrorCode =
+  | 'CANVAS_LOAD_FAILED'
+  | 'CANVAS_SAVE_FAILED'
+  | 'CANVAS_CREATE_FAILED'
+  | 'CANVAS_REVISION_CONFLICT'
+  | 'AGENT_SESSION_BUSY'
+  | 'AGENT_SESSION_REBUILD_FAILED'
+  | 'CANVAS_AGENT_MESSAGES_FAILED'
+  | 'CANVAS_AGENT_SEND_FAILED'
+  | 'CANVAS_AGENT_STOP_FAILED'
+
+/** 不含内部路径、UUID、通道或堆栈的公开错误。 */
+export interface CanvasPublicError {
+  code: CanvasPublicErrorCode
+  message: string
+}
+
+/** 所有原生 Canvas invoke 共用的安全结果信封。 */
+export type CanvasInvokeResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: CanvasPublicError }
+
 /** 按需读取单个 Canvas Agent 持久化消息的输入。 */
 export interface GetCanvasAgentMessagesInput extends CanvasAgentTarget {}
 
@@ -205,6 +242,12 @@ export interface SaveCanvasMutationsInput extends CanvasTarget {
   mutations: CanvasMutation[]
 }
 
+/** 从源节点创建下游节点时使用的稳定关系身份。 */
+export interface CreateCanvasAgentNodeRelationship {
+  sourceNodeId: string
+  edgeId: string
+}
+
 /** 在已有原生 Canvas 中幂等创建一个内部 Agent 节点。 */
 export interface CreateCanvasAgentNodeInput extends CanvasTarget {
   /** Renderer 为单次用户操作生成的稳定 UUID，失败重试必须复用。 */
@@ -215,6 +258,8 @@ export interface CreateCanvasAgentNodeInput extends CanvasTarget {
   title: string
   /** 节点在当前 Canvas 世界坐标中的初始位置。 */
   position: DesignPoint
+  /** 存在时创建源节点指向新节点的稳定连线。 */
+  relationship?: CreateCanvasAgentNodeRelationship
 }
 
 /** Agent 节点事务 committed 后向 Renderer 发布的公开结果。 */
@@ -223,10 +268,23 @@ export interface CanvasAgentNodeCreationResult {
   session: AgentSessionMeta
 }
 
+/** 显式把坏 Agent 节点换绑到新空白会话的输入。 */
+export interface RebuildCanvasAgentNodeInput extends CanvasAgentTarget {
+  /** Renderer 为重建操作生成的稳定 UUID，失败重试必须复用。 */
+  operationId: string
+}
+
+/** 重建完成后返回的权威快照与新空白会话。 */
+export interface RebuildCanvasAgentNodeResult {
+  snapshot: CanvasWorkspaceSnapshot
+  session: AgentSessionMeta
+}
+
 /** Renderer 可见的原生 Canvas 工作区快照，不暴露路径或存储实现。 */
 export interface CanvasWorkspaceSnapshot {
   document: CanvasDocument
   writable: true
+  nodeIssues: CanvasNodeIssue[]
   recoveredFrom?: 'tmp' | 'backup'
 }
 
