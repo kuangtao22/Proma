@@ -14,6 +14,7 @@ import type {
   CanvasAgentNode,
   CanvasAgentNodeCreationResult,
   CanvasDocument,
+  CanvasNodeIssue,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
@@ -360,22 +361,39 @@ function isSameIntentFileState(left: IntentFileState, right: IntentFileState): b
     && left.ctimeNs === right.ctimeNs
 }
 
-/** 验证已有 Agent session 完整属于当前 intent。 */
+/** 判断已有 Agent session 是否完整属于当前 intent。 */
+function sessionMatchesIntent(
+  session: AgentSessionMeta | undefined,
+  intent: CanvasAgentNodeCreationIntent,
+): session is AgentSessionMeta {
+  return Boolean(session
+    && hasValidCanvasAgentOwnership(session)
+    && session.id === intent.sessionId
+    && session.title === intent.title
+    && session.channelId === intent.channelId
+    && session.modelId === intent.modelId
+    && session.workspaceId === intent.projectId
+    && session.sourceCanvasProjectId === intent.projectId
+    && session.sourceCanvasId === intent.canvasId
+    && session.sourceCanvasNodeId === intent.nodeId)
+}
+
+/** 验证未完成事务中的 Agent session 完整属于当前 intent。 */
 function assertSessionMatchesIntent(
   session: AgentSessionMeta | undefined,
   intent: CanvasAgentNodeCreationIntent,
 ): asserts session is AgentSessionMeta {
-  if (!session
-    || !hasValidCanvasAgentOwnership(session)
-    || session.id !== intent.sessionId
-    || session.title !== intent.title
-    || session.channelId !== intent.channelId
-    || session.modelId !== intent.modelId
-    || session.workspaceId !== intent.projectId
-    || session.sourceCanvasProjectId !== intent.projectId
-    || session.sourceCanvasId !== intent.canvasId
-    || session.sourceCanvasNodeId !== intent.nodeId) {
+  if (!sessionMatchesIntent(session, intent)) {
     throw new Error(`Canvas Agent session 归属损坏: ${intent.sessionId}`)
+  }
+}
+
+/** 为 committed 坏会话节点生成不含内部身份的公开问题。 */
+function createUnavailableSessionIssue(nodeId: string): CanvasNodeIssue {
+  return {
+    nodeId,
+    code: 'AGENT_SESSION_UNAVAILABLE',
+    allowedActions: ['rebuild-agent-session', 'remove-node'],
   }
 }
 
@@ -635,6 +653,8 @@ export class CanvasAgentNodeCreationService {
     let reconciliationError: Error | undefined
     /** 保留每个事务对账后的最终阶段，供同次 CREATE 直接复用。 */
     const intents: CanvasAgentNodeCreationIntent[] = []
+    /** committed 会话异常只派生当前 LOAD 的节点问题，不写入文档。 */
+    const nodeIssues: CanvasNodeIssue[] = []
 
     for (const originalIntent of await this.readIntents(target, identity)) {
       let intent = originalIntent
@@ -650,7 +670,6 @@ export class CanvasAgentNodeCreationService {
         }
       }
       if (intent.state === 'committed') {
-        assertSessionMatchesIntent(this.dependencies.getSession(intent.sessionId), intent)
         const node = document.nodes.find((candidate) => candidate.id === intent.nodeId)
         if (!node) {
           /** committed 后节点缺失代表用户删除引用，必须永久 detached。 */
@@ -663,12 +682,15 @@ export class CanvasAgentNodeCreationService {
           }
         } else {
           assertNodeMatchesIntent(node, intent)
+          if (!sessionMatchesIntent(this.dependencies.getSession(intent.sessionId), intent)) {
+            nodeIssues.push(createUnavailableSessionIssue(node.id))
+          }
         }
       }
       intents.push(intent)
     }
     return {
-      snapshot: { ...snapshot, document },
+      snapshot: { ...snapshot, document, nodeIssues },
       documentChanged,
       ...(reconciliationError ? { error: reconciliationError } : {}),
       directory: identity,

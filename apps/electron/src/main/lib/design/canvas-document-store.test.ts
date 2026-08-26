@@ -193,6 +193,7 @@ describe('CanvasDocumentStore', () => {
     expect(fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })).toEqual({
       document: createEmptyCanvasDocument('project-1', 'canvas-1', 100),
       writable: true,
+      nodeIssues: [],
     })
     expect(existsSync(fixture.documentPath)).toBe(false)
   })

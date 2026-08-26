@@ -95,7 +95,11 @@ function createHarness(options: {
         options.afterLoad?.({ canvasRoot, transactionsDir })
         return {
           ...loaded,
-          snapshot: { document: structuredClone(document), writable: true as const },
+          snapshot: {
+            document: structuredClone(document),
+            writable: true as const,
+            nodeIssues: [],
+          },
         }
       },
       mutate: (_target, expectedRevision, mutations) => {
@@ -380,12 +384,59 @@ describe('Canvas Agent 节点创建事务', () => {
     const service = harness.createService()
     await service.create(createInput(harness.target))
     harness.setDocument({ ...harness.getDocument(), nodes: [], revision: 2 })
+    harness.sessions.delete(SESSION_ID)
 
     const reconciled = await service.reconcile(harness.target)
 
     expect(reconciled.snapshot.document.nodes).toEqual([])
+    expect(reconciled.snapshot.nodeIssues).toEqual([])
     expect(JSON.parse(readFileSync(harness.intentPath, 'utf8'))).toMatchObject({ state: 'detached' })
     await expect(service.create(createInput(harness.target))).rejects.toThrow('已与节点解除关联')
+  })
+
+  test('Given committed 节点的 session 缺失 When LOAD 对账 Then 返回完整文档并只标记目标节点', async () => {
+    const harness = createHarness()
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    harness.sessions.delete(SESSION_ID)
+
+    const reconciled = await service.reconcile(harness.target)
+
+    expect(reconciled.error).toBeUndefined()
+    expect(reconciled.snapshot.document.nodes).toContainEqual(expect.objectContaining({ id: 'node-1' }))
+    expect(reconciled.snapshot.nodeIssues).toEqual([{
+      nodeId: 'node-1',
+      code: 'AGENT_SESSION_UNAVAILABLE',
+      allowedActions: ['rebuild-agent-session', 'remove-node'],
+    }])
+  })
+
+  test('Given committed 节点的 session 归属异常 When LOAD 对账 Then 只派生公开节点问题', async () => {
+    const harness = createHarness()
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    const session = harness.sessions.get(SESSION_ID)
+    if (!session) throw new Error('测试 session 未创建')
+    harness.sessions.set(SESSION_ID, { ...session, sourceCanvasId: 'canvas-other' })
+
+    const reconciled = await service.reconcile(harness.target)
+
+    expect(reconciled.snapshot.document.nodes).toHaveLength(1)
+    expect(reconciled.snapshot.nodeIssues).toEqual([{
+      nodeId: 'node-1',
+      code: 'AGENT_SESSION_UNAVAILABLE',
+      allowedActions: ['rebuild-agent-session', 'remove-node'],
+    }])
+  })
+
+  test('Given session-created 未完成事务的 session 缺失 When LOAD 对账 Then 继续 fail closed', async () => {
+    const harness = createHarness({ failIntentState: 'committed' })
+    const service = harness.createService()
+    await expect(service.create(createInput(harness.target)))
+      .rejects.toThrow('模拟 committed intent 写失败')
+    harness.sessions.delete(SESSION_ID)
+
+    await expect(service.reconcile(harness.target)).rejects.toThrow('归属损坏')
   })
 
   test('Given detached 写在 rename 前失败 When 对账 Then fail closed 且保留 committed 供重试', async () => {

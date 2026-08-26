@@ -877,6 +877,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
         document: readResult.document
           ?? createEmptyCanvasDocument(target.projectId, target.canvasId, requireNow(now)),
         writable: true,
+        nodeIssues: [],
         ...(readResult.recoveredFrom ? { recoveredFrom: readResult.recoveredFrom } : {}),
       },
       primaryExpectation: readResult.primaryExpectation,
