@@ -1,6 +1,15 @@
 import { describe, expect, spyOn, test } from 'bun:test'
 import { CANVAS_IPC_CHANNELS, createEmptyCanvasDocument } from '@proma/shared'
-import type { AgentSessionMeta, CanvasDocument, CanvasMutation, SDKMessage } from '@proma/shared'
+import type {
+  AgentSessionMeta,
+  CanvasAgentNodeCreationResult,
+  CanvasDocument,
+  CanvasInvokeResult,
+  CanvasMutation,
+  CanvasWorkspaceSnapshot,
+  RebuildCanvasAgentNodeResult,
+  SDKMessage,
+} from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
 
@@ -46,7 +55,7 @@ function createDocument(revision: number): CanvasDocument {
 function createContext(options: {
   authorized?: TestWebContents[]
   readOnlyReason?: string
-  loadResult?: { document: CanvasDocument; writable: true; recoveredFrom?: 'tmp' | 'backup' }
+  loadResult?: CanvasWorkspaceSnapshot
   mutateResult?: CanvasDocument
   guardError?: Error
   loadError?: Error
@@ -55,18 +64,19 @@ function createContext(options: {
   createError?: Error
   createPublication?: CanvasDocument
   reconcileResult?: {
-    snapshot: { document: CanvasDocument; writable: true; recoveredFrom?: 'tmp' | 'backup' }
+    snapshot: CanvasWorkspaceSnapshot
     documentChanged: boolean
     error?: Error
   }
   retryReconcileResult?: {
-    snapshot: { document: CanvasDocument; writable: true; recoveredFrom?: 'tmp' | 'backup' }
+    snapshot: CanvasWorkspaceSnapshot
     documentChanged: boolean
     error?: Error
   }
   beforeCreate?: (input: { projectId: string; canvasId: string }) => Promise<void>
   createErrorOnce?: Error
   createDocumentChanged?: boolean
+  rebuildError?: Error
   reserveStartError?: Error
   activeRunSnapshot?: {
     owners: Array<{
@@ -142,7 +152,7 @@ function createContext(options: {
         calls.push('store:load')
         storeInputs.push(target)
         if (options.loadError) throw options.loadError
-        return options.loadResult ?? { document: createDocument(4), writable: true }
+        return options.loadResult ?? { document: createDocument(4), writable: true, nodeIssues: [] }
       },
       mutate: (target, expectedRevision, mutations) => {
         calls.push('store:mutate')
@@ -157,7 +167,7 @@ function createContext(options: {
         storeInputs.push(target)
         if (options.reconcileError ?? options.loadError) throw options.reconcileError ?? options.loadError
         return options.reconcileResult ?? {
-          snapshot: options.loadResult ?? { document: createDocument(4), writable: true },
+          snapshot: options.loadResult ?? { document: createDocument(4), writable: true, nodeIssues: [] },
           documentChanged: false,
         }
       },
@@ -168,7 +178,7 @@ function createContext(options: {
         await options.beforeCreate?.(input)
         const reconciliation = (createAttempts > 1 ? options.retryReconcileResult : undefined)
           ?? options.reconcileResult ?? {
-          snapshot: options.loadResult ?? { document: createDocument(4), writable: true },
+          snapshot: options.loadResult ?? { document: createDocument(4), writable: true, nodeIssues: [] },
           documentChanged: false,
         }
         const createError = options.createError
@@ -208,6 +218,29 @@ function createContext(options: {
           },
         }
       },
+      rebuildReconciled: async (input) => {
+        calls.push('creation:rebuild')
+        storeInputs.push(input)
+        if (options.rebuildError) throw options.rebuildError
+        const document = createDocument(5)
+        document.nodes = [{
+          id: input.nodeId,
+          kind: 'agent',
+          title: '首页 Agent',
+          position: { x: 10, y: 20 },
+          agentSessionId: '44444444-4444-4444-8444-444444444444',
+        }]
+        return {
+          snapshot: { document, writable: true, nodeIssues: [] },
+          session: {
+            id: '44444444-4444-4444-8444-444444444444',
+            title: '首页 Agent',
+            createdAt: 2,
+            updatedAt: 2,
+          },
+          documentChanged: true,
+        }
+      },
     },
     agent: {
       listActiveRuns: () => options.activeRunSnapshot ?? { owners: [], internalInvalidRuns: [] },
@@ -235,6 +268,197 @@ function createContext(options: {
 }
 
 describe('原生 Canvas 文档 IPC', () => {
+  test('Given 内部 LOAD 异常含路径和 UUID When IPC 返回 Then 只暴露公开文案', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const context = createContext({
+      loadError: new Error(
+        'Error invoking remote method canvas:load /Users/name 11111111-1111-4111-8111-111111111111',
+      ),
+    })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+    }) as CanvasInvokeResult<CanvasWorkspaceSnapshot>
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+    })
+    errorSpy.mockRestore()
+  })
+
+  test('Given 运行中 Agent 节点 When SAVE 删除 Then 拒绝整个 batch 且 Store 不变', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-1',
+      kind: 'agent',
+      title: '首页 Agent',
+      position: { x: 0, y: 0 },
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+    }]
+    const context = createContext({
+      loadResult: { document, writable: true, nodeIssues: [] },
+      activeRunSnapshot: {
+        owners: [{
+          sessionId: '22222222-2222-4222-8222-222222222222',
+          projectId: 'project-1',
+          canvasId: 'canvas-1',
+          nodeId: 'node-1',
+          title: '首页 Agent',
+          startedAt: 10,
+        }],
+        internalInvalidRuns: [],
+      },
+    })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      expectedRevision: 4,
+      mutations: [{ type: 'remove-nodes', nodeIds: ['node-1'] }],
+    }) as CanvasInvokeResult<CanvasDocument>
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'AGENT_SESSION_BUSY', message: '请先停止 Agent，再删除节点。' },
+    })
+    expect(context.calls).not.toContain('store:mutate')
+  })
+
+  test('Given 坏节点 When GET 消息 Then 不读取 JSONL 并返回安全失败', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-1',
+      kind: 'agent',
+      title: '首页 Agent',
+      position: { x: 0, y: 0 },
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+    }]
+    const context = createContext({
+      loadResult: {
+        document,
+        writable: true,
+        nodeIssues: [{
+          nodeId: 'node-1',
+          code: 'AGENT_SESSION_UNAVAILABLE',
+          allowedActions: ['rebuild-agent-session', 'remove-node'],
+        }],
+      },
+    })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES, context.sender, {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      nodeId: 'node-1',
+    }) as CanvasInvokeResult<unknown>
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_AGENT_MESSAGES_FAILED', message: '会话不可用。' },
+    })
+    expect(context.agentCalls).toEqual([])
+  })
+
+  test('Given 坏节点旧会话仍在运行 When REBUILD Then 拒绝且不创建替代会话', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-1',
+      kind: 'agent',
+      title: '首页 Agent',
+      position: { x: 0, y: 0 },
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+    }]
+    const context = createContext({
+      loadResult: {
+        document,
+        writable: true,
+        nodeIssues: [{
+          nodeId: 'node-1',
+          code: 'AGENT_SESSION_UNAVAILABLE',
+          allowedActions: ['rebuild-agent-session', 'remove-node'],
+        }],
+      },
+      activeRunSnapshot: {
+        owners: [],
+        internalInvalidRuns: [{
+          sessionId: '22222222-2222-4222-8222-222222222222',
+          startedAt: 10,
+          valid: false,
+        }],
+      },
+    })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE, context.sender, {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      nodeId: 'node-1',
+      operationId: '11111111-1111-4111-8111-111111111111',
+    }) as CanvasInvokeResult<RebuildCanvasAgentNodeResult>
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'AGENT_SESSION_BUSY', message: '请先停止 Agent，再重建会话。' },
+    })
+    expect(context.calls).not.toContain('creation:rebuild')
+  })
+
+  test('Given 坏节点已停止 When REBUILD Then 换绑新会话并在 lease 外广播', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-1',
+      kind: 'agent',
+      title: '首页 Agent',
+      position: { x: 0, y: 0 },
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+    }]
+    const context = createContext({
+      loadResult: {
+        document,
+        writable: true,
+        nodeIssues: [{
+          nodeId: 'node-1',
+          code: 'AGENT_SESSION_UNAVAILABLE',
+          allowedActions: ['rebuild-agent-session', 'remove-node'],
+        }],
+      },
+    })
+    const input = {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      nodeId: 'node-1',
+      operationId: '11111111-1111-4111-8111-111111111111',
+    }
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE,
+      context.sender,
+      input,
+    ) as CanvasInvokeResult<RebuildCanvasAgentNodeResult>
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        snapshot: { document: { revision: 5 }, nodeIssues: [] },
+        session: { id: '44444444-4444-4444-8444-444444444444' },
+      },
+    })
+    expect(context.calls).toEqual([
+      'readonly:project-1',
+      'guard:project-1',
+      'creation:reconcile',
+      'creation:rebuild',
+    ])
+    expect(context.storeInputs.at(-1)).toEqual(input)
+    expect(context.storeInputs.at(-1)).not.toBe(input)
+    expect(context.sender.sent).toEqual([{
+      channel: CANVAS_IPC_CHANNELS.CHANGED,
+      value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
+    }])
+    expect(context.broadcastLeaseStates).toEqual([false])
+  })
+
   test('Given renderer 重载 When bootstrap active Canvas run Then 只返回最小 owner 与损坏会话安全代次', async () => {
     /** 主进程已经按忙碌状态和归属完成过滤的安全快照。 */
     const snapshot = {
@@ -264,21 +488,25 @@ describe('原生 Canvas 文档 IPC', () => {
       id: 'node-1', kind: 'agent', title: '首页 Agent', position: { x: 0, y: 0 },
       agentSessionId: '22222222-2222-4222-8222-222222222222',
     }]
-    const context = createContext({ loadResult: { document, writable: true } })
+    const context = createContext({ loadResult: { document, writable: true, nodeIssues: [] } })
     const target = { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1' }
 
     const loaded = await invoke(context.handlers, CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES, context.sender, target)
     const sent = await invoke(context.handlers, CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, context.sender, {
       ...target, message: '请分析当前项目', userMessageUuid: 'message-1', startedAt: 10,
     })
-    await invoke(context.handlers, CANVAS_IPC_CHANNELS.STOP_AGENT, context.sender, target)
+    const stopped = await invoke(context.handlers, CANVAS_IPC_CHANNELS.STOP_AGENT, context.sender, target)
 
     expect(loaded).toEqual({
-      sessionId: '22222222-2222-4222-8222-222222222222',
-      messages: [{ type: 'user', message: { content: [{ type: 'text', text: '已有消息' }] } }],
-      owner: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', title: '首页 Agent' },
+      ok: true,
+      value: {
+        sessionId: '22222222-2222-4222-8222-222222222222',
+        messages: [{ type: 'user', message: { content: [{ type: 'text', text: '已有消息' }] } }],
+        owner: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', title: '首页 Agent' },
+      },
     })
-    expect(sent).toEqual({ ok: true })
+    expect(sent).toEqual({ ok: true, value: { ok: true } })
+    expect(stopped).toEqual({ ok: true, value: undefined })
     expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(3)
     expect(context.agentCalls).toEqual([
       { type: 'messages', value: '22222222-2222-4222-8222-222222222222' },
@@ -310,7 +538,7 @@ describe('原生 Canvas 文档 IPC', () => {
     /** 主进程内部 busy code 不得作为 Electron reject 细节泄露给 Renderer。 */
     const busyError = Object.assign(new Error('内部启动状态细节'), { code: 'AGENT_SESSION_BUSY' })
     const context = createContext({
-      loadResult: { document, writable: true },
+      loadResult: { document, writable: true, nodeIssues: [] },
       reserveStartError: busyError,
     })
 
@@ -318,8 +546,11 @@ describe('原生 Canvas 文档 IPC', () => {
       projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
       message: '继续', userMessageUuid: 'message-1', startedAt: 10,
     })).resolves.toEqual({
-      ok: false,
-      error: { code: 'SESSION_BUSY', message: '会话正在运行，请先停止当前任务。' },
+      ok: true,
+      value: {
+        ok: false,
+        error: { code: 'SESSION_BUSY', message: '会话正在运行，请先停止当前任务。' },
+      },
     })
     expect(context.agentCalls).toEqual([
       { type: 'reserve', value: {
@@ -329,32 +560,42 @@ describe('原生 Canvas 文档 IPC', () => {
     ])
   })
 
-  test('Given Canvas Agent 普通准入错误 When SEND 预留启动槽失败 Then 保留原始 reject', async () => {
+  test('Given Canvas Agent 普通准入错误 When SEND 预留启动槽失败 Then 返回安全发送失败', async () => {
     const document = createDocument(4)
     document.nodes = [{
       id: 'node-1', kind: 'agent', title: '首页 Agent', position: { x: 0, y: 0 },
       agentSessionId: '22222222-2222-4222-8222-222222222222',
     }]
-    /** 配置与权限错误仍走 reject，避免被错误归类为并发 busy。 */
+    /** 内部配置错误正文不得跨 IPC 暴露给 Renderer。 */
     const admissionError = new Error('模型配置缺失')
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const context = createContext({
-      loadResult: { document, writable: true },
+      loadResult: { document, writable: true, nodeIssues: [] },
       reserveStartError: admissionError,
     })
 
     await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, context.sender, {
       projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
       message: '继续', userMessageUuid: 'message-1', startedAt: 10,
-    })).rejects.toBe(admissionError)
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_AGENT_SEND_FAILED', message: '消息发送失败，请重试。' },
+    })
+    errorSpy.mockRestore()
   })
 
   test('Given Renderer 伪造 sessionId 或未知字段 When 调用 Canvas Agent IPC Then 在对账前拒绝', async () => {
     const context = createContext()
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.STOP_AGENT, context.sender, {
       projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', sessionId: 'forged',
-    })).rejects.toThrow('Canvas Agent 参数无效')
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_AGENT_STOP_FAILED', message: '停止 Agent 失败，请重试。' },
+    })
     expect(context.calls).toEqual([])
     expect(context.agentCalls).toEqual([])
+    errorSpy.mockRestore()
   })
 
   test('Given 未授权 sender When 提交带 getter 的请求 Then 在解析和 Store 前拒绝', async () => {
@@ -368,15 +609,21 @@ describe('原生 Canvas 文档 IPC', () => {
     })
     Object.defineProperty(input, 'canvasId', { enumerable: true, value: 'canvas-1' })
     const context = createContext({ authorized: [] })
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
 
     await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, unauthorized, input))
-      .rejects.toThrow('无权访问 Canvas 文档')
+      .resolves.toEqual({
+        ok: false,
+        error: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+      })
     expect(getterReads).toBe(0)
     expect(context.calls).toEqual([])
+    errorSpy.mockRestore()
   })
 
   test('Given 非精确外层对象或非法身份和 revision When 调用 Then 全部在 guard 前拒绝', async () => {
     const context = createContext()
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const invalidCases: Array<{ channel: string; input: unknown }> = [
       { channel: CANVAS_IPC_CHANNELS.LOAD, input: { projectId: 'project-1', canvasId: 'canvas-1', path: '/tmp/x' } },
       { channel: CANVAS_IPC_CHANNELS.LOAD, input: { projectId: '../project', canvasId: 'canvas-1' } },
@@ -408,23 +655,33 @@ describe('原生 Canvas 文档 IPC', () => {
     ]
 
     for (const item of invalidCases) {
-      await expect(invoke(context.handlers, item.channel, context.sender, item.input)).rejects.toThrow()
+      const result = await invoke(context.handlers, item.channel, context.sender, item.input)
+      expect(result).toMatchObject({ ok: false })
     }
     expect(context.calls).toEqual([])
     expect(context.storeInputs).toEqual([])
+    errorSpy.mockRestore()
   })
 
-  test('Given 只读项目 When LOAD 或 SAVE Then 在 guard 和 Store 前返回原只读原因', async () => {
+  test('Given 只读项目 When LOAD 或 SAVE Then 在 guard 和 Store 前返回安全失败', async () => {
     const context = createContext({ readOnlyReason: '项目路径不可访问' })
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
 
     await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
       projectId: 'project-1', canvasId: 'canvas-1',
-    })).rejects.toThrow('项目路径不可访问')
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+    })
     await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, {
       projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4, mutations: [],
-    })).rejects.toThrow('项目路径不可访问')
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
+    })
     expect(context.calls).toEqual(['readonly:project-1', 'readonly:project-1'])
     expect(context.storeInputs).toEqual([])
+    errorSpy.mockRestore()
   })
 
   test('Given 可写项目 When LOAD 和 SAVE Then guard 包裹 Store 且参数由 IPC 重建', async () => {
@@ -450,19 +707,19 @@ describe('原生 Canvas 文档 IPC', () => {
   })
 
   test('Given 普通加载 When 成功 Then 返回公开快照且不广播', async () => {
-    const snapshot = { document: createDocument(4), writable: true as const }
+    const snapshot = { document: createDocument(4), writable: true as const, nodeIssues: [] }
     const context = createContext({ loadResult: snapshot })
 
     expect(await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
       projectId: 'project-1', canvasId: 'canvas-1',
-    })).toBe(snapshot)
+    })).toEqual({ ok: true, value: snapshot })
     expect(context.sender.sent).toEqual([])
   })
 
   test('Given tmp 或 backup 恢复可能得到低 revision When LOAD Then 广播双身份 recovery', async () => {
     for (const recoveredFrom of ['tmp', 'backup'] as const) {
       const context = createContext({
-        loadResult: { document: createDocument(1), writable: true, recoveredFrom },
+        loadResult: { document: createDocument(1), writable: true, nodeIssues: [], recoveredFrom },
       })
       await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
         projectId: 'project-1', canvasId: 'canvas-1',
@@ -478,18 +735,22 @@ describe('原生 Canvas 文档 IPC', () => {
     const sender = createSender(2)
     const observer = createSender(3)
     const error = new Error('保存 revision 冲突')
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const context = createContext({
       authorized: [sender, observer],
       mutateError: error,
       reconcileResult: {
-        snapshot: { document: createDocument(1), writable: true, recoveredFrom: 'backup' },
+        snapshot: { document: createDocument(1), writable: true, nodeIssues: [], recoveredFrom: 'backup' },
         documentChanged: false,
       },
     })
 
     await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, sender, {
       projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 9, mutations: [],
-    })).rejects.toBe(error)
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
+    })
 
     const expected = [{
       channel: CANVAS_IPC_CHANNELS.CHANGED,
@@ -498,9 +759,11 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(sender.sent).toEqual(expected)
     expect(observer.sent).toEqual(expected)
     expect(context.broadcastLeaseStates).toEqual([false, false])
+    errorSpy.mockRestore()
   })
 
   test('Given CREATE 对账发生 recovery When 当前创建成功或失败 Then recovery 均优先于 graph 且只广播一次', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const createInput = {
       projectId: 'project-1', canvasId: 'canvas-1',
       operationId: '11111111-1111-4111-8111-111111111111',
@@ -510,7 +773,7 @@ describe('原生 Canvas 文档 IPC', () => {
       const context = createContext({
         createError,
         reconcileResult: {
-          snapshot: { document: createDocument(1), writable: true, recoveredFrom: 'tmp' },
+          snapshot: { document: createDocument(1), writable: true, nodeIssues: [], recoveredFrom: 'tmp' },
           documentChanged: true,
         },
       })
@@ -518,7 +781,10 @@ describe('原生 Canvas 文档 IPC', () => {
       if (createError) {
         await expect(invoke(
           context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, createInput,
-        )).rejects.toBe(createError)
+        )).resolves.toEqual({
+          ok: false,
+          error: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
+        })
       } else {
         await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, createInput)
       }
@@ -533,6 +799,7 @@ describe('原生 Canvas 文档 IPC', () => {
       expect(context.sender.sent).toEqual(expected)
       expect(context.broadcastLeaseStates).toEqual(expected.map(() => false))
     }
+    errorSpy.mockRestore()
   })
 
   test('Given 有效保存或空保存 When Store 成功 Then 仅 revision 前进时广播 graph', async () => {
@@ -563,15 +830,15 @@ describe('原生 Canvas 文档 IPC', () => {
 
     const result = await invoke(
       context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, input,
-    ) as Record<string, unknown>
+    ) as CanvasInvokeResult<CanvasAgentNodeCreationResult>
 
     expect(context.calls).toEqual([
       'readonly:project-1', 'guard:project-1', 'creation:create',
     ])
     expect(context.storeInputs[0]).toEqual(input)
     expect(context.storeInputs[0]).not.toBe(input)
-    expect(result).not.toHaveProperty('documentChanged')
-    expect(result).toHaveProperty('session.id', '22222222-2222-4222-8222-222222222222')
+    expect(result).not.toHaveProperty('value.documentChanged')
+    expect(result).toHaveProperty('value.session.id', '22222222-2222-4222-8222-222222222222')
     expect(context.sender.sent).toEqual([{
       channel: CANVAS_IPC_CHANNELS.CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
@@ -672,6 +939,7 @@ describe('原生 Canvas 文档 IPC', () => {
 
   test('Given 文档已写但 committed intent 失败 When 创建返回错误 Then 不广播且不泄漏节点', async () => {
     const error = new Error('Canvas Agent 创建事务提交失败')
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const context = createContext({ createError: error })
 
     await expect(invoke(
@@ -683,12 +951,17 @@ describe('原生 Canvas 文档 IPC', () => {
         operationId: '11111111-1111-4111-8111-111111111111',
         nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
       },
-    )).rejects.toBe(error)
+    )).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
+    })
     expect(context.sender.sent).toEqual([])
+    errorSpy.mockRestore()
   })
 
-  test('Given committed intent 可见但持久性未确认 When CREATE 返回发布事实 Then lease 后广播再原样抛错', async () => {
+  test('Given committed intent 可见但持久性未确认 When CREATE 返回发布事实 Then lease 后广播再返回安全失败', async () => {
     const error = new Error('CANVAS_INTENT_DURABILITY_UNCERTAIN: 目录持久性未确认')
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const context = createContext({
       createError: error,
       createPublication: createDocument(5),
@@ -703,21 +976,26 @@ describe('原生 Canvas 文档 IPC', () => {
         operationId: '11111111-1111-4111-8111-111111111111',
         nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
       },
-    )).rejects.toBe(error)
+    )).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
+    })
     expect(context.sender.sent).toEqual([{
       channel: CANVAS_IPC_CHANNELS.CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
     }])
     expect(context.broadcastLeaseStates).toEqual([false])
+    errorSpy.mockRestore()
   })
 
   test('Given committed 首次写失败 When 同 operation 重试越过发布屏障 Then 既有 revision 恰好广播一次', async () => {
     const error = new Error('Canvas Agent 创建事务提交失败')
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const context = createContext({
       createErrorOnce: error,
       createDocumentChanged: false,
       retryReconcileResult: {
-        snapshot: { document: createDocument(5), writable: true },
+        snapshot: { document: createDocument(5), writable: true, nodeIssues: [] },
         documentChanged: true,
       },
     })
@@ -729,7 +1007,10 @@ describe('原生 Canvas 文档 IPC', () => {
 
     await expect(invoke(
       context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, input,
-    )).rejects.toBe(error)
+    )).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
+    })
     expect(context.sender.sent).toEqual([])
 
     await expect(invoke(
@@ -739,13 +1020,15 @@ describe('原生 Canvas 文档 IPC', () => {
       channel: CANVAS_IPC_CHANNELS.CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
     }])
+    errorSpy.mockRestore()
   })
 
-  test('Given SAVE 对账已提交图变更 When 后续 revision conflict Then 广播对账 revision 并原样抛错', async () => {
+  test('Given SAVE 对账已提交图变更 When 后续 revision conflict Then 广播对账 revision 并返回公开冲突', async () => {
     const error = new Error('CANVAS_REVISION_CONFLICT: expected=4, current=5')
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const context = createContext({
       reconcileResult: {
-        snapshot: { document: createDocument(5), writable: true },
+        snapshot: { document: createDocument(5), writable: true, nodeIssues: [] },
         documentChanged: true,
       },
       mutateError: error,
@@ -753,19 +1036,24 @@ describe('原生 Canvas 文档 IPC', () => {
 
     await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, {
       projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4, mutations: [],
-    })).rejects.toBe(error)
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_REVISION_CONFLICT', message: '画布已更新，请重新加载后重试。' },
+    })
     expect(context.sender.sent).toEqual([{
       channel: CANVAS_IPC_CHANNELS.CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
     }])
+    errorSpy.mockRestore()
   })
 
-  test('Given detached intent 已可见但目录持久性未确认 When LOAD 对账 Then 原样抛错且不广播 graph', async () => {
+  test('Given detached intent 已可见但目录持久性未确认 When LOAD 对账 Then 返回安全失败且不广播 graph', async () => {
     /** detached 不改变画布 revision，因此耐久性错误不能伪造图发布事实。 */
     const error = new Error('CANVAS_INTENT_DURABILITY_UNCERTAIN: 目录持久性未确认')
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const context = createContext({
       reconcileResult: {
-        snapshot: { document: createDocument(4), writable: true },
+        snapshot: { document: createDocument(4), writable: true, nodeIssues: [] },
         documentChanged: false,
         error,
       },
@@ -773,16 +1061,21 @@ describe('原生 Canvas 文档 IPC', () => {
 
     await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
       projectId: 'project-1', canvasId: 'canvas-1',
-    })).rejects.toBe(error)
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+    })
     expect(context.sender.sent).toEqual([])
     expect(context.broadcastLeaseStates).toEqual([])
+    errorSpy.mockRestore()
   })
 
-  test('Given CREATE 对账已提交图变更 When 新请求默认模型失败 Then 广播对账 revision 并原样抛错', async () => {
+  test('Given CREATE 对账已提交图变更 When 新请求默认模型失败 Then 广播对账 revision 并返回安全失败', async () => {
     const error = new Error('Canvas Agent 需要先配置默认渠道')
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const context = createContext({
       reconcileResult: {
-        snapshot: { document: createDocument(6), writable: true },
+        snapshot: { document: createDocument(6), writable: true, nodeIssues: [] },
         documentChanged: true,
       },
       createError: error,
@@ -792,7 +1085,10 @@ describe('原生 Canvas 文档 IPC', () => {
       projectId: 'project-1', canvasId: 'canvas-1',
       operationId: '11111111-1111-4111-8111-111111111111',
       nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
-    })).rejects.toBe(error)
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
+    })
     expect(context.sender.sent).toEqual([{
       channel: CANVAS_IPC_CHANNELS.CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph' },
@@ -801,14 +1097,19 @@ describe('原生 Canvas 文档 IPC', () => {
       'readonly:project-1', 'guard:project-1', 'creation:create',
     ])
     expect(context.broadcastLeaseStates).toEqual([false])
+    errorSpy.mockRestore()
   })
 
-  test('Given guard 或 Store 原样失败 When LOAD/SAVE Then 不广播', async () => {
+  test('Given guard 或 Store 内部失败 When LOAD/SAVE Then 返回安全失败且不广播', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const guardError = new Error('工作区迁移中')
     const guarded = createContext({ guardError })
     await expect(invoke(guarded.handlers, CANVAS_IPC_CHANNELS.LOAD, guarded.sender, {
       projectId: 'project-1', canvasId: 'canvas-1',
-    })).rejects.toBe(guardError)
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+    })
     expect(guarded.sender.sent).toEqual([])
 
     /** 恢复对账错误必须保留 Store 原始对象和完整消息。 */
@@ -816,7 +1117,10 @@ describe('原生 Canvas 文档 IPC', () => {
     const recoveryFailed = createContext({ loadError: recoveryError })
     await expect(invoke(recoveryFailed.handlers, CANVAS_IPC_CHANNELS.LOAD, recoveryFailed.sender, {
       projectId: 'project-1', canvasId: 'canvas-1',
-    })).rejects.toBe(recoveryError)
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+    })
     expect(recoveryFailed.sender.sent).toEqual([])
 
     /** durability 不确定错误同样不能被 IPC 字符串重写。 */
@@ -824,8 +1128,12 @@ describe('原生 Canvas 文档 IPC', () => {
     const failed = createContext({ mutateError: storeError })
     await expect(invoke(failed.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, failed.sender, {
       projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4, mutations: [],
-    })).rejects.toBe(storeError)
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
+    })
     expect(failed.sender.sent).toEqual([])
+    errorSpy.mockRestore()
   })
 
   test('Given 单窗口发送失败 When Store 已提交 Then 请求仍成功且其它窗口收到事件', async () => {
@@ -838,7 +1146,7 @@ describe('原生 Canvas 文档 IPC', () => {
     await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, receiving, {
       projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4,
       mutations: [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
-    })).resolves.toEqual(createDocument(5))
+    })).resolves.toEqual({ ok: true, value: createDocument(5) })
     expect(receiving.sent).toHaveLength(1)
     expect(errorSpy).toHaveBeenCalledWith(
       '[CanvasDocumentIPC] Canvas 变化广播失败:',
@@ -847,12 +1155,13 @@ describe('原生 Canvas 文档 IPC', () => {
     errorSpy.mockRestore()
   })
 
-  test('Given 已注册处理器 When 重复 dispose Then 仅移除七个固定 invoke 通道一次', () => {
+  test('Given 已注册处理器 When 重复 dispose Then 仅移除八个固定 invoke 通道一次', () => {
     const context = createContext()
     expect(context.registration.channels).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE,
       CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
@@ -867,6 +1176,7 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE,
       CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
@@ -894,17 +1204,17 @@ describe('原生 Canvas 文档 IPC', () => {
         runWorkspaceWrite: <T>(_projectId: string, effect: () => T): T => effect(),
       },
       store: {
-        load: () => ({ document: createDocument(revision), writable: true as const }),
+        load: () => ({ document: createDocument(revision), writable: true as const, nodeIssues: [] }),
         mutate: () => createDocument(revision),
       },
       creation: {
         reconcile: async () => ({
-          snapshot: { document: createDocument(revision), writable: true as const },
+          snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] },
           documentChanged: false,
         }),
         createReconciled: async () => ({
           reconciliation: {
-            snapshot: { document: createDocument(revision), writable: true as const },
+            snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] },
             documentChanged: false,
           },
           operationOutcome: {
@@ -915,6 +1225,15 @@ describe('原生 Canvas 文档 IPC', () => {
               documentChanged: false,
             },
           },
+        }),
+        rebuildReconciled: async () => ({
+          snapshot: {
+            document: createDocument(revision),
+            writable: true as const,
+            nodeIssues: [],
+          },
+          session: { id: 'session-2', title: 'Agent', createdAt: 2, updatedAt: 2 },
+          documentChanged: false,
         }),
       },
       agent: {
@@ -937,7 +1256,10 @@ describe('原生 Canvas 文档 IPC', () => {
 
     await expect(invoke(handlers, CANVAS_IPC_CHANNELS.LOAD, sender, {
       projectId: 'project-1', canvasId: 'canvas-1',
-    })).resolves.toEqual({ document: createDocument(2), writable: true })
+    })).resolves.toEqual({
+      ok: true,
+      value: { document: createDocument(2), writable: true, nodeIssues: [] },
+    })
     expect(removed).toEqual([])
 
     registrationB.dispose()
@@ -946,6 +1268,7 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE,
       CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
@@ -953,6 +1276,6 @@ describe('原生 Canvas 文档 IPC', () => {
     ])
 
     registrationA.dispose()
-    expect(removed).toHaveLength(7)
+    expect(removed).toHaveLength(8)
   })
 })
