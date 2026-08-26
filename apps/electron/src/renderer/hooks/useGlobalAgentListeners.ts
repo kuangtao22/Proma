@@ -69,7 +69,6 @@ import {
   canvasAgentLifecycleAtom,
   canvasAgentOpenSessionIdsAtom,
   canvasAgentRunningSessionIdsAtom,
-  canvasAgentRunGenerationsAtom,
   isCanvasAgentGenerationCurrent,
   createNativeCanvasKey,
   updateNativeCanvasStateAtom,
@@ -967,6 +966,11 @@ export function useGlobalAgentListeners(): void {
           if (canvasOwner) store.set(canvasAgentLifecycleAtom, {
             type: 'started', owner: canvasOwner, startedAt: runStartedEvent.startedAt,
           })
+          else if (store.get(canvasAgentInternalInvalidSessionIdsAtom).has(sessionId)) {
+            store.set(canvasAgentLifecycleAtom, {
+              type: 'invalid-started', sessionId, startedAt: runStartedEvent.startedAt,
+            })
+          }
           // 队列 run 会先通过独立 IPC 发送 started 投影，但该投影可能在窗口
           // 重载或跨 renderer 路由时丢失。run_started 是同一轮的第二个权威启动信号，
           // 必须在首个 SDK/tool 事件之前恢复 running、startedAt 和正常的 live UI。
@@ -1445,9 +1449,12 @@ export function useGlobalAgentListeners(): void {
           data.session,
           store.get(canvasAgentInternalInvalidSessionIdsAtom).has(data.sessionId),
         )
+        if (route.kind !== 'agent'
+          && (data.startedAt == null
+            || !isCanvasAgentGenerationCurrent(store, data.sessionId, data.startedAt))) return
         if (route.kind === 'internal-invalid') {
           store.set(canvasAgentLifecycleAtom, {
-            type: 'invalidated', sessionId: data.sessionId, terminal: false,
+            type: 'invalidated', sessionId: data.sessionId, terminal: true, startedAt: data.startedAt,
           })
           return
         }
@@ -1542,7 +1549,7 @@ export function useGlobalAgentListeners(): void {
       store.set(canvasAgentLifecycleAtom, {
         type: 'bootstrap',
         owners: snapshot.owners,
-        internalInvalidSessionIds: snapshot.internalInvalidSessionIds,
+        internalInvalidRuns: snapshot.internalInvalidRuns,
       })
       canvasAgentBootstrapGate.complete()
     }).catch((error: unknown) => {
@@ -1575,15 +1582,16 @@ export function useGlobalAgentListeners(): void {
           store.get(canvasAgentInternalInvalidSessionIdsAtom).has(data.sessionId),
         )
         if (completionRoute.kind !== 'agent') {
-          const trackedGeneration = store.get(canvasAgentRunGenerationsAtom).get(data.sessionId)
-          const streamGeneration = store.get(agentSessionStreamingStateAtomFamily(data.sessionId))?.startedAt
-          const currentGeneration = typeof trackedGeneration === 'number' ? trackedGeneration : streamGeneration
           /** 未知 bootstrap 代次或迟到 completion 均不得产生任何终态副作用。 */
-          if (data.startedAt == null || currentGeneration !== data.startedAt) return
+          if (data.startedAt == null
+            || !isCanvasAgentGenerationCurrent(store, data.sessionId, data.startedAt)) return
         }
         if (completionRoute.kind === 'internal-invalid') {
           store.set(canvasAgentLifecycleAtom, {
-            type: 'invalidated', sessionId: data.sessionId, terminal: !backgroundTasksPending,
+            type: 'invalidated',
+            sessionId: data.sessionId,
+            terminal: !backgroundTasksPending,
+            ...(!backgroundTasksPending ? { startedAt: data.startedAt } : {}),
           })
         } else if (completionRoute.kind === 'canvas') {
           store.set(canvasAgentLifecycleAtom, { type: 'owner-updated', owner: completionRoute.owner })

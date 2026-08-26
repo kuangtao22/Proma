@@ -271,7 +271,7 @@ export async function runAgent(
             if (!webContents.isDestroyed()) {
               webContents.send(
                 AGENT_IPC_CHANNELS.STREAM_ERROR,
-                buildAuthoritativeAgentStreamErrorPayload(input.sessionId, error, getAgentSessionMeta),
+                buildAuthoritativeAgentStreamErrorPayload(input.sessionId, error, getAgentSessionMeta, input.startedAt),
               )
             }
           },
@@ -365,7 +365,7 @@ export async function runAgent(
           if (!webContents.isDestroyed()) {
             webContents.send(
               AGENT_IPC_CHANNELS.STREAM_ERROR,
-              buildAuthoritativeAgentStreamErrorPayload(input.sessionId, errorMessage, getAgentSessionMeta),
+              buildAuthoritativeAgentStreamErrorPayload(input.sessionId, errorMessage, getAgentSessionMeta, input.startedAt),
             )
           }
         },
@@ -436,7 +436,7 @@ export async function runAgentHeadless(
               if (wc && !wc.isDestroyed()) {
                 wc.send(
                   AGENT_IPC_CHANNELS.STREAM_ERROR,
-                  buildAuthoritativeAgentStreamErrorPayload(runInput.sessionId, error, getAgentSessionMeta),
+                  buildAuthoritativeAgentStreamErrorPayload(runInput.sessionId, error, getAgentSessionMeta, runInput.startedAt),
                 )
               }
             },
@@ -528,7 +528,12 @@ export async function runAgentHeadless(
           if (wc && !wc.isDestroyed()) {
             wc.send(
               AGENT_IPC_CHANNELS.STREAM_ERROR,
-              buildAuthoritativeAgentStreamErrorPayload(runInput.sessionId, errorMessage, getAgentSessionMeta),
+              buildAuthoritativeAgentStreamErrorPayload(
+                runInput.sessionId,
+                errorMessage,
+                getAgentSessionMeta,
+                runInput.startedAt,
+              ),
             )
           }
         },

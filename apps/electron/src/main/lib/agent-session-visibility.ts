@@ -50,7 +50,7 @@ function hasAnyCanvasSourceField(session: InternalSessionFields): boolean {
  * 从全量会话索引构造 Renderer 重载所需的最小运行快照。
  * @param sessions 主进程全量会话元数据。
  * @param isBusy 判断会话是否处于启动、运行或排队状态。
- * @returns 仅包含合法 owner 与损坏内部会话 ID 的安全快照。
+ * @returns 仅包含合法 owner 与损坏内部会话安全代次的快照。
  */
 export function buildCanvasAgentActiveRunSnapshot(
   sessions: AgentSessionMeta[],
@@ -59,15 +59,16 @@ export function buildCanvasAgentActiveRunSnapshot(
 ): CanvasAgentActiveRunSnapshot {
   /** 完整且独占的运行中 Canvas owner。 */
   const owners: CanvasAgentActiveRunSnapshot['owners'] = []
-  /** 带 Canvas 字段但归属损坏的运行中会话，Renderer 必须 fail closed。 */
-  const internalInvalidSessionIds: string[] = []
+  /** 带 Canvas 字段但归属损坏的运行中会话，仅公开终态校验所需代次。 */
+  const internalInvalidRuns: CanvasAgentActiveRunSnapshot['internalInvalidRuns'] = []
   for (const session of sessions) {
     if (!isBusy(session.id) || !hasAnyCanvasSourceField(session)) continue
+    const startedAt = getStartedAt(session.id)
     if (!hasValidCanvasAgentOwnership(session)) {
-      internalInvalidSessionIds.push(session.id)
+      /** 缺少权威代次时保持未知 fail closed，禁止构造无法安全终态化的 invalid run。 */
+      if (startedAt !== undefined) internalInvalidRuns.push({ sessionId: session.id, startedAt, valid: false })
       continue
     }
-    const startedAt = getStartedAt(session.id)
     owners.push({
       sessionId: session.id,
       projectId: session.sourceCanvasProjectId!,
@@ -77,7 +78,7 @@ export function buildCanvasAgentActiveRunSnapshot(
       ...(startedAt !== undefined ? { startedAt } : {}),
     })
   }
-  return { owners, internalInvalidSessionIds }
+  return { owners, internalInvalidRuns }
 }
 
 /**

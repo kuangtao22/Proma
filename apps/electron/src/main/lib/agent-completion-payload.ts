@@ -61,8 +61,14 @@ export function buildAuthoritativeAgentStreamErrorPayload(
   sessionId: string,
   error: string,
   getSession: (sessionId: string) => AgentSessionMeta | undefined,
+  startedAt?: number,
 ): AgentStreamErrorPayload {
-  return { sessionId, error, session: selectAgentCompletionSessionMeta(sessionId, getSession) }
+  return {
+    sessionId,
+    error,
+    ...(startedAt !== undefined ? { startedAt } : {}),
+    session: selectAgentCompletionSessionMeta(sessionId, getSession),
+  }
 }
 
 function buildAgentStreamCompletePayload(

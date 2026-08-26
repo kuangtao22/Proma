@@ -77,7 +77,7 @@ function createContext(options: {
       title: string
       startedAt?: number
     }>
-    internalInvalidSessionIds: string[]
+    internalInvalidRuns: Array<{ sessionId: string; startedAt: number; valid: false }>
   }
 } = {}) {
   /** 当前注册的 invoke handler。 */
@@ -210,7 +210,7 @@ function createContext(options: {
       },
     },
     agent: {
-      listActiveRuns: () => options.activeRunSnapshot ?? { owners: [], internalInvalidSessionIds: [] },
+      listActiveRuns: () => options.activeRunSnapshot ?? { owners: [], internalInvalidRuns: [] },
       getSession: (sessionId) => sessionId === agentSession.id ? agentSession : undefined,
       getMessages: (sessionId) => {
         agentCalls.push({ type: 'messages', value: sessionId })
@@ -235,14 +235,14 @@ function createContext(options: {
 }
 
 describe('原生 Canvas 文档 IPC', () => {
-  test('Given renderer 重载 When bootstrap active Canvas run Then 只返回最小 owner 与损坏会话 ID', async () => {
+  test('Given renderer 重载 When bootstrap active Canvas run Then 只返回最小 owner 与损坏会话安全代次', async () => {
     /** 主进程已经按忙碌状态和归属完成过滤的安全快照。 */
     const snapshot = {
       owners: [{
         sessionId: 'session-1', projectId: 'project-1', canvasId: 'canvas-1',
         nodeId: 'node-1', title: '首页 Agent', startedAt: 10,
       }],
-      internalInvalidSessionIds: ['session-invalid'],
+      internalInvalidRuns: [{ sessionId: 'session-invalid', startedAt: 20, valid: false as const }],
     }
     const context = createContext({ activeRunSnapshot: snapshot })
 
@@ -897,7 +897,7 @@ describe('原生 Canvas 文档 IPC', () => {
         }),
       },
       agent: {
-        listActiveRuns: () => ({ owners: [], internalInvalidSessionIds: [] }),
+        listActiveRuns: () => ({ owners: [], internalInvalidRuns: [] }),
         getSession: () => undefined,
         getMessages: () => [],
         reserveStart: () => () => undefined,

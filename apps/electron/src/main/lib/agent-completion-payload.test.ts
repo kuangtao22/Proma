@@ -114,9 +114,11 @@ describe('Agent completion payload', () => {
       session.id,
       '模型失败',
       () => session,
+      456,
     )
 
     expect(payload.session?.sourceCanvasNodeId).toBe('node-1')
+    expect(payload.startedAt).toBe(456)
     expect(JSON.stringify(payload)).not.toContain('/Users/example')
   })
 })

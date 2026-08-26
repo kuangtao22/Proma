@@ -19,7 +19,7 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
 
   test('Given Canvas completion When 代次不匹配或 GET 晚回 Then 所有终态副作用 fail closed', () => {
     const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
-    expect(source).toContain('currentGeneration !== data.startedAt')
+    expect(source).toContain('!isCanvasAgentGenerationCurrent(store, data.sessionId, data.startedAt)')
     expect(source).toContain('if (!isCanvasAgentGenerationCurrent(store, data.sessionId, data.startedAt!)) return')
     expect(source).toContain("type: 'completed', sessionId: data.sessionId, startedAt: data.startedAt!")
     expect(source).toContain("type: 'settled', sessionId: data.sessionId, startedAt: data.startedAt!")
@@ -70,7 +70,8 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
   test('Given internal-invalid soft completion When 处理终态 Then 保留 active 阻断直到 hard terminal', () => {
     /** soft completion 必须把终态语义显式传入 lifecycle，不能无条件 terminalize。 */
     const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
-    expect(source).toContain("type: 'invalidated', sessionId: data.sessionId, terminal: !backgroundTasksPending")
+    expect(source).toContain('terminal: !backgroundTasksPending')
+    expect(source).toContain("...(!backgroundTasksPending ? { startedAt: data.startedAt } : {})")
   })
 
   test('Given Canvas STREAM_ERROR When bootstrap pending、ready 或 failed Then 与 completion 共用 fail-closed gate', () => {
@@ -80,5 +81,12 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     expect(source).toContain("event.type !== 'complete' && event.type !== 'error'")
     expect(source).toContain("event.type === 'complete' || event.type === 'error'")
     expect(source).toContain("getTerminalEventKey: (event) => `${event.type}:${event.sessionId}`")
+    expect(source).toContain("type: 'invalidated', sessionId: data.sessionId, terminal: true, startedAt: data.startedAt")
+  })
+
+  test('Given internal-invalid 没有安全 owner When run_started 到达 Then 只更新 generation 并继续 fail closed', () => {
+    const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
+    expect(source).toContain("type: 'invalid-started', sessionId, startedAt: runStartedEvent.startedAt")
+    expect(source).toContain('internalInvalidRuns: snapshot.internalInvalidRuns')
   })
 })

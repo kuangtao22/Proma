@@ -73,14 +73,19 @@ describe('Agent 内部 Canvas 会话归属与可见性', () => {
         sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-2',
         createdAt: 1, updatedAt: 1,
       },
-    ], (sessionId) => busyIds.has(sessionId), (sessionId) => sessionId === 'valid' ? 123 : undefined)
+    ], (sessionId) => busyIds.has(sessionId), (sessionId) => {
+      /** active 快照只能公开运行代次，不公开损坏会话的其它元数据。 */
+      if (sessionId === 'valid') return 123
+      if (sessionId === 'invalid') return 456
+      return undefined
+    })
 
     expect(snapshot).toEqual({
       owners: [{
         sessionId: 'valid', projectId: 'project-1', canvasId: 'canvas-1',
         nodeId: 'node-1', title: 'Canvas Agent', startedAt: 123,
       }],
-      internalInvalidSessionIds: ['invalid'],
+      internalInvalidRuns: [{ sessionId: 'invalid', startedAt: 456, valid: false }],
     })
   })
 

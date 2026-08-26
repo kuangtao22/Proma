@@ -1384,6 +1384,8 @@ export interface AgentStreamCompletePayload {
 export interface AgentStreamErrorPayload {
   sessionId: string
   error: string
+  /** 本轮流式开始时间戳；内部 Canvas 会话仅允许匹配代次的错误终态化。 */
+  startedAt?: number
   /** 与 completion 共用的安全会话分类元数据。 */
   session?: AgentStreamSessionMeta
 }

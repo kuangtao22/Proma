@@ -85,7 +85,7 @@ describe('原生 Canvas 状态隔离', () => {
       sessionId, projectId: 'project-a', canvasId: 'canvas-a', nodeId: `node-${sessionId}`, title: sessionId,
     })
     store.set(canvasAgentLifecycleAtom, {
-      type: 'bootstrap', owners: [{ ...owner('running'), startedAt: 100 }], internalInvalidSessionIds: [],
+      type: 'bootstrap', owners: [{ ...owner('running'), startedAt: 100 }], internalInvalidRuns: [],
     })
     store.set(canvasAgentLifecycleAtom, {
       type: 'opened', owner: owner('running'), messages: [],
@@ -122,7 +122,7 @@ describe('原生 Canvas 状态隔离', () => {
       })
       if (authoritativeSource === 'bootstrap') {
         store.set(canvasAgentLifecycleAtom, {
-          type: 'bootstrap', owners: [{ ...owner, startedAt: 100 }], internalInvalidSessionIds: [],
+          type: 'bootstrap', owners: [{ ...owner, startedAt: 100 }], internalInvalidRuns: [],
         })
       } else {
         store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: 100 })
@@ -138,6 +138,39 @@ describe('原生 Canvas 状态隔离', () => {
       expect(store.get(canvasAgentOwnersAtom).get(owner.sessionId)).toEqual(owner)
     },
   )
+
+  test('Given 权威运行 100 已存在 When 误发乐观 200 后 busy Then 100 仍可完成交接且 200 仅由新 run_started 接管', () => {
+    const store = createStore()
+    /** 同一 Canvas 节点在旧运行尚未结束时误触发第二次发送。 */
+    const owner = {
+      sessionId: 'authoritative-generation', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+    }
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: 100 })
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'optimistic-started', owner, token: 'message-200', startedAt: 200,
+    })
+
+    expect(store.get(canvasAgentRunGenerationsAtom).get(owner.sessionId)).toBe(100)
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'send-rejected', sessionId: owner.sessionId, token: 'message-200', preserveRunning: true,
+    })
+    expect(store.get(canvasAgentRunGenerationsAtom).get(owner.sessionId)).toBe(100)
+    expect(store.get(canvasAgentOptimisticRunTokensAtom).has(owner.sessionId)).toBe(false)
+
+    store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId: owner.sessionId, startedAt: 100 })
+    expect(store.get(canvasAgentAuthoritativeRunningSessionIdsAtom).has(owner.sessionId)).toBe(false)
+    expect(isCanvasAgentGenerationCurrent(store, owner.sessionId, 100)).toBe(true)
+    store.set(canvasAgentLifecycleAtom, { type: 'settled', sessionId: owner.sessionId, startedAt: 100 })
+    expect(store.get(canvasAgentRunGenerationsAtom).has(owner.sessionId)).toBe(false)
+
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'optimistic-started', owner, token: 'message-200-new', startedAt: 200,
+    })
+    expect(store.get(canvasAgentRunGenerationsAtom).has(owner.sessionId)).toBe(false)
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner, startedAt: 200 })
+    expect(store.get(canvasAgentRunGenerationsAtom).get(owner.sessionId)).toBe(200)
+  })
 
   test('Given 无权威运行 When 普通 SEND 准入失败 Then 只清除匹配的乐观运行', () => {
     const store = createStore()
@@ -236,7 +269,10 @@ describe('原生 Canvas 状态隔离', () => {
     store.set(canvasAgentLifecycleAtom, { type: 'prune' })
     expect(store.get(canvasAgentPersistedMessagesAtom).size).toBeLessThanOrEqual(20)
 
-    store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId: 'session-24', terminal: true })
+    store.set(canvasAgentLifecycleAtom, { type: 'invalid-started', sessionId: 'session-24', startedAt: 24 })
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'invalidated', sessionId: 'session-24', terminal: true, startedAt: 24,
+    })
     expect(store.get(canvasAgentOwnersAtom).has('session-24')).toBe(false)
     expect(store.get(canvasAgentPersistedMessagesAtom).has('session-24')).toBe(false)
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).has('session-24')).toBe(true)
@@ -282,7 +318,11 @@ describe('原生 Canvas 状态隔离', () => {
     /** active invalid 属于安全保护集合，数量可超过 terminal tombstone 上限。 */
     const activeInvalidIds = Array.from({ length: 1_000 }, (_, index) => `active-invalid-${index}`)
     store.set(canvasAgentLifecycleAtom, {
-      type: 'bootstrap', owners: [], internalInvalidSessionIds: activeInvalidIds,
+      type: 'bootstrap',
+      owners: [],
+      internalInvalidRuns: activeInvalidIds.map((sessionId, startedAt) => ({
+        sessionId, startedAt, valid: false as const,
+      })),
     })
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).size).toBe(1_000)
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).has('active-invalid-0')).toBe(true)
@@ -296,10 +336,69 @@ describe('原生 Canvas 状态隔离', () => {
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).has('active-invalid-0')).toBe(true)
 
     /** 只有 hard terminal completion 才转为有界 terminal tombstone。 */
-    for (const sessionId of activeInvalidIds) {
-      store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: true })
+    for (const [startedAt, sessionId] of activeInvalidIds.entries()) {
+      store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: true, startedAt })
     }
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).size).toBeLessThanOrEqual(100)
+  })
+
+  test('Given invalid active snapshot 带权威代次 When hard terminal 到达 Then 仅匹配代次可终态化回收', () => {
+    const store = createStore()
+    const sessionId = 'invalid-generation'
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'bootstrap',
+      owners: [],
+      internalInvalidRuns: [{ sessionId, startedAt: 100, valid: false }],
+    })
+
+    expect(store.get(canvasAgentRunGenerationsAtom).get(sessionId)).toBe(100)
+    store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: true, startedAt: 100 })
+    expect(store.get(canvasAgentActiveInternalInvalidSessionIdsAtom).has(sessionId)).toBe(false)
+    expect(store.get(canvasAgentRunGenerationsAtom).has(sessionId)).toBe(false)
+
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'bootstrap',
+      owners: [],
+      internalInvalidRuns: [{ sessionId, startedAt: 200, valid: false }],
+    })
+    store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: true, startedAt: 100 })
+    expect(store.get(canvasAgentActiveInternalInvalidSessionIdsAtom).has(sessionId)).toBe(true)
+    expect(store.get(canvasAgentRunGenerationsAtom).get(sessionId)).toBe(200)
+  })
+
+  test('Given 损坏 active session 无安全 owner When 新 run_started 到达 Then 只更新权威代次并保持 fail closed', () => {
+    const store = createStore()
+    const sessionId = 'invalid-run-started'
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'bootstrap',
+      owners: [],
+      internalInvalidRuns: [{ sessionId, startedAt: 100, valid: false }],
+    })
+
+    store.set(canvasAgentLifecycleAtom, { type: 'invalid-started', sessionId, startedAt: 200 })
+
+    expect(store.get(canvasAgentRunGenerationsAtom).get(sessionId)).toBe(200)
+    expect(store.get(canvasAgentActiveInternalInvalidSessionIdsAtom).has(sessionId)).toBe(true)
+    expect(store.get(canvasAgentOwnersAtom).has(sessionId)).toBe(false)
+  })
+
+  test('Given 120 个 stale generation When StrictMode 重复空 bootstrap Then 全部回收', () => {
+    const store = createStore()
+    for (let index = 0; index < 120; index += 1) {
+      store.set(canvasAgentLifecycleAtom, {
+        type: 'started',
+        owner: {
+          sessionId: `stale-${index}`, projectId: 'project-a', canvasId: 'canvas-a',
+          nodeId: `node-${index}`, title: 'Agent',
+        },
+        startedAt: index,
+      })
+    }
+
+    store.set(canvasAgentLifecycleAtom, { type: 'bootstrap', owners: [], internalInvalidRuns: [] })
+    store.set(canvasAgentLifecycleAtom, { type: 'bootstrap', owners: [], internalInvalidRuns: [] })
+
+    expect(store.get(canvasAgentRunGenerationsAtom).size).toBe(0)
   })
 
   test('Given 120 个损坏 session 持有共享流状态 When hard invalid Then 三类运行时状态全部有界回收', () => {
@@ -309,7 +408,8 @@ describe('原生 Canvas 状态隔离', () => {
       store.set(liveMessagesMapAtom, (previous) => new Map(previous).set(sessionId, []))
       store.set(agentStreamErrorsAtom, (previous) => new Map(previous).set(sessionId, '损坏事件'))
       store.set(agentSessionStreamingStateAtomFamily(sessionId), { running: true })
-      store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: true })
+      store.set(canvasAgentLifecycleAtom, { type: 'invalid-started', sessionId, startedAt: index })
+      store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: true, startedAt: index })
     }
 
     expect(store.get(liveMessagesMapAtom).size).toBe(0)
