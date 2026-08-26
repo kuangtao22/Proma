@@ -7,6 +7,10 @@ import {
   coalesceNativeCanvasMutationsForSave,
   createMoveCanvasNodesMutation,
   createViewportCanvasMutation,
+  findAvailableNativeCanvasNodePosition,
+  NATIVE_CANVAS_NODE_GAP,
+  NATIVE_CANVAS_NODE_HEIGHT,
+  NATIVE_CANVAS_NODE_WIDTH,
   replayNativeCanvasPositionMutations,
   toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
@@ -70,6 +74,39 @@ describe('原生 Canvas 纯投影', () => {
 })
 
 describe('原生 Canvas mutation', () => {
+  test('Given 可视中心已有节点 When 添加 Agent Then 选择不重叠的相邻位置', () => {
+    const visibleCenter = { x: 500, y: 300 }
+    const centeredPosition = { x: 356, y: 228 }
+
+    expect(findAvailableNativeCanvasNodePosition(visibleCenter, []))
+      .toEqual(centeredPosition)
+    expect(findAvailableNativeCanvasNodePosition(visibleCenter, [
+      { position: centeredPosition },
+    ])).toEqual({ x: 668, y: 228 })
+  })
+
+  test('Given 半网格节点同时阻塞四个候选 When 添加 Agent Then 越过四候选并保持固定间距', () => {
+    const visibleCenter = { x: 500, y: 300 }
+    const origin = { x: 356, y: 228 }
+    const horizontalStep = NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP
+    const verticalStep = NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP
+    /** 半网格位置会同时覆盖中心、右、右下和下方四个整数网格候选。 */
+    const blocker = {
+      position: {
+        x: origin.x + horizontalStep / 2,
+        y: origin.y + verticalStep / 2,
+      },
+    }
+
+    const position = findAvailableNativeCanvasNodePosition(visibleCenter, [blocker])
+
+    expect(position).toEqual({ x: origin.x - horizontalStep, y: origin.y + verticalStep })
+    expect(
+      Math.abs(position.x - blocker.position.x) >= horizontalStep
+      || Math.abs(position.y - blocker.position.y) >= verticalStep,
+    ).toBe(true)
+  })
+
   test('Given 多节点拖动与视口 When 创建 mutation Then 分别形成单批位置变更', () => {
     expect(createMoveCanvasNodesMutation([
       { id: 'a', position: { x: 10, y: 20 } },

@@ -70,7 +70,10 @@ export interface NativeCanvasGraphProps {
   writable: boolean
   selectedNodeId: string | null
   onMutation: (mutation: CanvasMutation) => void
-  onNodeSelect: (nodeId: string | null, conversationNodeId: string | null) => void
+  /** 只同步 XYFlow 当前选区，不隐式打开 Agent 对话。 */
+  onNodeSelect: (nodeId: string | null) => void
+  /** 只响应显式节点点击或选区清空，控制 Agent 对话开关。 */
+  onConversationNodeChange: (nodeId: string | null) => void
   flowRenderer?: NativeCanvasFlowRenderer
 }
 
@@ -125,6 +128,7 @@ export function NativeCanvasGraph({
   selectedNodeId,
   onMutation,
   onNodeSelect,
+  onConversationNodeChange,
   flowRenderer,
 }: NativeCanvasGraphProps): React.ReactElement {
   /** 首帧投影只使用 Canvas 文档内存数据，不读取 Agent 消息。 */
@@ -199,24 +203,27 @@ export function NativeCanvasGraph({
 
   /** 点击 Agent 时同时记录未来对话节点身份；其他节点只更新选中态。 */
   const handleNodeClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeClick']>>((_event, node) => {
-    onNodeSelect(node.id, node.type === 'canvasAgent' ? node.id : null)
-  }, [onNodeSelect])
+    onNodeSelect(node.id)
+    onConversationNodeChange(node.type === 'canvasAgent' ? node.id : null)
+  }, [onConversationNodeChange, onNodeSelect])
 
-  /** XYFlow 清空选择时同步清理 Jotai 的节点与对话所有权。 */
+  /** XYFlow 选区变化只同步选中节点；仅在清空选区时同步关闭对话。 */
   const handleSelectionChange = React.useCallback<NonNullable<NativeCanvasFlowProps['onSelectionChange']>>(({ nodes }) => {
     /** 首个节点是单选合同下的唯一选区。 */
     const node = nodes[0]
     if (!node) {
-      onNodeSelect(null, null)
+      onNodeSelect(null)
+      onConversationNodeChange(null)
       return
     }
-    onNodeSelect(node.id, node.type === 'canvasAgent' ? node.id : null)
-  }, [onNodeSelect])
+    onNodeSelect(node.id)
+  }, [onConversationNodeChange, onNodeSelect])
 
   /** 点击空白 pane 时立即清理选区，覆盖 XYFlow 未产生 selection change 的路径。 */
   const handlePaneClick = React.useCallback((): void => {
-    onNodeSelect(null, null)
-  }, [onNodeSelect])
+    onNodeSelect(null)
+    onConversationNodeChange(null)
+  }, [onConversationNodeChange, onNodeSelect])
 
   /** 受控 Flow 属性集中声明只读连线合同。 */
   const flowProps: NativeCanvasFlowProps = {

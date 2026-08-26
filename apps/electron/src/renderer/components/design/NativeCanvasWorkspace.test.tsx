@@ -32,6 +32,8 @@ import type {
   NativeCanvasWorkspaceController,
   NativeCanvasWorkspaceControllerDependencies,
 } from './NativeCanvasWorkspace'
+import type { CanvasAgentConversationProps } from './CanvasAgentConversation'
+import type { NativeCanvasFlowProps } from './NativeCanvasGraph'
 
 /** 可从测试精确控制完成时机的 Promise。 */
 interface Deferred<T> {
@@ -697,6 +699,76 @@ describe('原生 Canvas 冲突提示', () => {
 })
 
 describe('原生 Canvas 添加 Agent 命令', () => {
+  test('Given Agent 节点仍被选中 When 关闭对话 Then 同时清空选区避免立即重开', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const snapshot = createSnapshot(7, target)
+    snapshot.document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: 'Agent 1',
+      agentSessionId: 'session-1', position: { x: 0, y: 0 },
+    }]
+    const store = createStore()
+    const stateKey = createNativeCanvasKey(target.projectId, target.canvasId)
+    store.set(nativeCanvasStatesAtom, new Map([[stateKey, {
+      ...createInitialNativeCanvasState(),
+      phase: 'ready',
+      snapshot,
+      selectedNodeId: 'agent-1',
+      conversationNodeId: 'agent-1',
+    }]]))
+    let conversationProps: CanvasAgentConversationProps | undefined
+    let flowProps: NativeCanvasFlowProps | undefined
+    renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          target={target}
+          title="Canvas 1"
+          adapter={{
+            loadCanvas: async () => snapshot,
+            saveCanvas: async () => snapshot.document,
+            onCanvasChanged: () => () => {},
+            getCanvasAgentMessages: async () => ({
+              sessionId: 'session-1',
+              owner: { ...target, nodeId: 'agent-1', title: 'Agent 1' },
+              messages: [],
+            }),
+            sendCanvasAgentMessage: async () => ({ ok: true }),
+            stopCanvasAgent: async () => undefined,
+          }}
+          flowRenderer={(props) => {
+            flowProps = props
+            return <div />
+          }}
+          conversationRenderer={(props) => {
+            conversationProps = props
+            return <div data-testid="canvas-agent-conversation" />
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(conversationProps?.target).toEqual({ ...target, nodeId: 'agent-1' })
+    expect(conversationProps?.onClose).toBeFunction()
+    conversationProps?.onClose()
+    expect(store.get(nativeCanvasStatesAtom).get(stateKey)).toMatchObject({
+      selectedNodeId: null,
+      conversationNodeId: null,
+    })
+
+    /** close 后 XYFlow 可能补发同一受控节点的 selection change，不得借此重开对话。 */
+    flowProps?.onSelectionChange?.({ nodes: [flowProps.nodes[0]!], edges: [] })
+    expect(store.get(nativeCanvasStatesAtom).get(stateKey)).toMatchObject({
+      selectedNodeId: 'agent-1',
+      conversationNodeId: null,
+    })
+
+    /** 用户再次明确点击同一 Agent 节点时仍应正常重开对话。 */
+    flowProps?.onNodeClick?.({} as never, flowProps.nodes[0]!)
+    expect(store.get(nativeCanvasStatesAtom).get(stateKey)).toMatchObject({
+      selectedNodeId: 'agent-1',
+      conversationNodeId: 'agent-1',
+    })
+  })
+
   test('Given Canvas A 创建中切换到 B When A 延迟成功 Then 不更新 B 的状态或节点', async () => {
     const deferred = createDeferred<CanvasAgentNodeCreationResult>()
     const states: CanvasAgentNodeCommandState[] = []

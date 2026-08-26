@@ -3,6 +3,7 @@ import type {
   CanvasDocument,
   CanvasEdge,
   CanvasMutation,
+  DesignPoint,
   DesignViewport,
 } from '@proma/shared'
 import { Position } from '@xyflow/react'
@@ -13,8 +14,15 @@ import type { CanvasAgentNodeData, CanvasAgentFlowNode } from './CanvasAgentNode
 export const NATIVE_CANVAS_NODE_WIDTH = 288
 /** 首版原生 Canvas 节点固定高度。 */
 export const NATIVE_CANVAS_NODE_HEIGHT = 144
+/** 新增节点之间保留的最小间距，避免边框与选中环相互遮挡。 */
+export const NATIVE_CANVAS_NODE_GAP = 24
 /** 未正式接入的节点类别统一使用简洁占位。 */
 export const NATIVE_CANVAS_UNSUPPORTED_LABEL = '当前版本暂不支持'
+
+/** 新节点避让只依赖已有节点的持久化位置。 */
+export interface NativeCanvasPositionedNode {
+  position: DesignPoint
+}
 
 /** 暂未接入交互的原生 Canvas 节点安全展示数据。 */
 export interface NativeCanvasUnsupportedNodeData extends Record<string, unknown> {
@@ -31,6 +39,67 @@ export interface NativeCanvasUnsupportedNodeData extends Record<string, unknown>
 export type NativeCanvasUnsupportedFlowNode = Node<NativeCanvasUnsupportedNodeData, 'canvasUnsupported'>
 /** 原生 Canvas 当前全部 XYFlow 节点联合。 */
 export type NativeCanvasFlowNode = CanvasAgentFlowNode | NativeCanvasUnsupportedFlowNode
+
+/**
+ * 从可视区域中心开始按顺时针方形环寻找首个不重叠位置。
+ * @param visibleCenter 当前视口中心对应的世界坐标。
+ * @param nodes 当前 Canvas 内已有节点的位置集合。
+ * @returns 以固定节点尺寸和间距计算出的左上角世界坐标。
+ */
+export function findAvailableNativeCanvasNodePosition(
+  visibleCenter: DesignPoint,
+  nodes: ReadonlyArray<NativeCanvasPositionedNode>,
+): DesignPoint {
+  /** 首选位置让节点本身居中，而不是让节点左上角落在视口中心。 */
+  const origin = {
+    x: visibleCenter.x - NATIVE_CANVAS_NODE_WIDTH / 2,
+    y: visibleCenter.y - NATIVE_CANVAS_NODE_HEIGHT / 2,
+  }
+  /** 相邻网格列之间的固定跨度。 */
+  const horizontalStep = NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP
+  /** 相邻网格行之间的固定跨度。 */
+  const verticalStep = NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP
+  /** 单个任意位置节点最多阻塞相邻四个网格候选，因此检查 4N+1 个即可找到空位。 */
+  const candidateLimit = nodes.length * 4 + 1
+  /** 已检查候选数包含中心原点。 */
+  let inspectedCandidates = 1
+
+  /** 判断候选矩形与任一固定尺寸节点是否小于最小间距。 */
+  const overlapsExistingNode = (candidate: DesignPoint): boolean => nodes.some((node) => (
+    Math.abs(candidate.x - node.position.x) < horizontalStep
+    && Math.abs(candidate.y - node.position.y) < verticalStep
+  ))
+  /** 将整数网格偏移转换为真实世界坐标。 */
+  const resolveCandidate = (gridX: number, gridY: number): DesignPoint => ({
+    x: origin.x + gridX * horizontalStep,
+    y: origin.y + gridY * verticalStep,
+  })
+  /** 按顺时针顺序检查单个方形环，首个候选固定在中心右侧。 */
+  const createRingOffsets = (radius: number): DesignPoint[] => {
+    /** 当前半径上的全部整数网格偏移。 */
+    const offsets: DesignPoint[] = [{ x: radius, y: 0 }]
+    for (let y = 1; y <= radius; y += 1) offsets.push({ x: radius, y })
+    for (let x = radius - 1; x >= -radius; x -= 1) offsets.push({ x, y: radius })
+    for (let y = radius - 1; y >= -radius; y -= 1) offsets.push({ x: -radius, y })
+    for (let x = -radius + 1; x <= radius; x += 1) offsets.push({ x, y: -radius })
+    for (let y = -radius + 1; y < 0; y += 1) offsets.push({ x: radius, y })
+    return offsets
+  }
+
+  if (!overlapsExistingNode(origin)) return origin
+  for (let radius = 1; inspectedCandidates <= candidateLimit; radius += 1) {
+    /** 当前环按用户最常用的从左到右流程优先检查右侧位置。 */
+    const offsets = createRingOffsets(radius)
+    for (const offset of offsets) {
+      /** 当前网格偏移对应的真实候选位置。 */
+      const candidate = resolveCandidate(offset.x, offset.y)
+      inspectedCandidates += 1
+      if (!overlapsExistingNode(candidate)) return candidate
+      if (inspectedCandidates > candidateLimit) break
+    }
+  }
+  throw new Error('Canvas 节点落点计算失败')
+}
 
 /** 仅允许可恢复的网页地址进入 Renderer 投影，阻断文件路径与内嵌数据。 */
 function projectSafeWebviewUrl(url: string): string | undefined {

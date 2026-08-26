@@ -28,10 +28,12 @@ import type { NativeCanvasFlowRenderer } from './NativeCanvasGraph'
 import {
   CanvasAgentConversation,
   type CanvasAgentConversationAdapter,
+  type CanvasAgentConversationProps,
 } from './CanvasAgentConversation'
 import {
   canReplayNativeCanvasPositionMutations,
   coalesceNativeCanvasMutationsForSave,
+  findAvailableNativeCanvasNodePosition,
   replayNativeCanvasPositionMutations,
 } from './native-canvas-model'
 
@@ -79,6 +81,17 @@ export interface CanvasAgentNodeCommandDependencies {
 export interface CanvasAgentNodeCommandController {
   execute: () => Promise<void>
   cancel: () => void
+}
+
+/**
+ * 关闭对话时同时取消 Agent 节点选中，避免 XYFlow selection 回调立即重开面板。
+ * @returns 可直接提交给当前 Canvas 状态的局部更新。
+ */
+export function createClosedNativeCanvasConversationUpdate(): Pick<
+  NativeCanvasState,
+  'selectedNodeId' | 'conversationNodeId'
+> {
+  return { selectedNodeId: null, conversationNodeId: null }
 }
 
 /**
@@ -542,6 +555,8 @@ export interface NativeCanvasWorkspaceProps {
   title: string
   adapter?: NativeCanvasAdapter
   flowRenderer?: NativeCanvasFlowRenderer
+  /** 测试或宿主可注入对话渲染器；默认使用真实 Canvas Agent 对话组件。 */
+  conversationRenderer?: React.ComponentType<CanvasAgentConversationProps>
 }
 
 /** 将隔离 Jotai 状态绑定到纯 controller，并渲染当前加载阶段。 */
@@ -550,6 +565,7 @@ export function NativeCanvasWorkspace({
   title,
   adapter = designAdapter,
   flowRenderer,
+  conversationRenderer,
 }: NativeCanvasWorkspaceProps): React.ReactElement {
   /** 双身份 key 决定唯一状态与 effect 生命周期。 */
   const stateKey = createNativeCanvasKey(target.projectId, target.canvasId)
@@ -605,10 +621,15 @@ export function NativeCanvasWorkspace({
         const latest = store.get(nativeCanvasStatesAtom).get(stateKey)
         const viewport = latest?.snapshot?.document.viewport ?? { x: 0, y: 0, zoom: 1 }
         const bounds = canvasViewportRef.current?.getBoundingClientRect()
-        return {
+        /** 当前可视区域中心对应的世界坐标。 */
+        const visibleCenter = {
           x: ((bounds?.width ?? 0) / 2 - viewport.x) / viewport.zoom,
           y: ((bounds?.height ?? 0) / 2 - viewport.y) / viewport.zoom,
         }
+        return findAvailableNativeCanvasNodePosition(
+          visibleCenter,
+          latest?.snapshot?.document.nodes ?? [],
+        )
       },
       onStateChange: setCreateState,
       onSuccess: (nodeId, result) => updateNativeCanvasState({
@@ -654,6 +675,8 @@ export function NativeCanvasWorkspace({
         stopCanvasAgent: adapter.stopCanvasAgent,
       }
     : null
+  /** 保持生产默认组件不变，同时允许测试捕获 Workspace 提供的真实回调。 */
+  const ConversationRenderer = conversationRenderer ?? CanvasAgentConversation
 
   return (
     <section
@@ -713,21 +736,25 @@ export function NativeCanvasWorkspace({
               writable={state.authoritativeRecoveryState === 'idle' && state.saveState !== 'conflict'}
               selectedNodeId={state.selectedNodeId}
               onMutation={(mutation) => controllerRef.current?.enqueueMutation(mutation)}
-              onNodeSelect={(selectedNodeId, conversationNodeId) => updateNativeCanvasState({
+              onNodeSelect={(selectedNodeId) => updateNativeCanvasState({
                 key: stateKey,
-                update: { selectedNodeId, conversationNodeId },
+                update: { selectedNodeId },
+              })}
+              onConversationNodeChange={(conversationNodeId) => updateNativeCanvasState({
+                key: stateKey,
+                update: { conversationNodeId },
               })}
               flowRenderer={flowRenderer}
             />
             {conversationNode && conversationAdapter ? (
-              <CanvasAgentConversation
+              <ConversationRenderer
                 key={`${target.projectId}:${target.canvasId}:${conversationNode.id}`}
                 target={{ ...target, nodeId: conversationNode.id }}
                 title={conversationNode.title}
                 adapter={conversationAdapter}
                 onClose={() => updateNativeCanvasState({
                   key: stateKey,
-                  update: { conversationNodeId: null },
+                  update: createClosedNativeCanvasConversationUpdate(),
                 })}
               />
             ) : null}

@@ -5,7 +5,13 @@ import { ReactFlow } from '@xyflow/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { NativeCanvasGraph, reduceNativeCanvasViewportState } from './NativeCanvasGraph'
 import type { NativeCanvasFlowProps } from './NativeCanvasGraph'
-import { toNativeCanvasFlowNodes } from './native-canvas-model'
+import {
+  findAvailableNativeCanvasNodePosition,
+  NATIVE_CANVAS_NODE_GAP,
+  NATIVE_CANVAS_NODE_HEIGHT,
+  NATIVE_CANVAS_NODE_WIDTH,
+  toNativeCanvasFlowNodes,
+} from './native-canvas-model'
 
 describe('原生 Canvas 大画布性能预算', () => {
   test('Given 1,000 个 Agent 节点 When 投影 Then 纯内存完成且 API 不接受消息读取器', () => {
@@ -25,6 +31,34 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(toNativeCanvasFlowNodes.length).toBe(1)
   })
 
+  test('Given 1,024 个多环密集节点 When 查找落点 Then 在宽松预算内保持固定尺寸与间距', () => {
+    const visibleCenter = { x: 4_000, y: 3_000 }
+    const origin = {
+      x: visibleCenter.x - NATIVE_CANVAS_NODE_WIDTH / 2,
+      y: visibleCenter.y - NATIVE_CANVAS_NODE_HEIGHT / 2,
+    }
+    const horizontalStep = NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP
+    const verticalStep = NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP
+    /** 32x32 网格覆盖中心周围多个完整方形环。 */
+    const nodes = Array.from({ length: 1_024 }, (_, index) => ({
+      position: {
+        x: origin.x + (index % 32 - 16) * horizontalStep,
+        y: origin.y + (Math.floor(index / 32) - 16) * verticalStep,
+      },
+    }))
+
+    const startedAt = performance.now()
+    const position = findAvailableNativeCanvasNodePosition(visibleCenter, nodes)
+    const elapsedMs = performance.now() - startedAt
+
+    expect(nodes.every((node) => (
+      Math.abs(position.x - node.position.x) >= horizontalStep
+      || Math.abs(position.y - node.position.y) >= verticalStep
+    ))).toBe(true)
+    /** 预算刻意宽松，只锁定算法没有退化到不可交互级别。 */
+    expect(elapsedMs).toBeLessThan(2_000)
+  })
+
   test('Given 原生 Canvas Graph When 构造 Flow Then 只渲染可见元素', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     let captured: NativeCanvasFlowProps | undefined
@@ -36,6 +70,7 @@ describe('原生 Canvas 大画布性能预算', () => {
         selectedNodeId={null}
         onMutation={() => {}}
         onNodeSelect={() => {}}
+        onConversationNodeChange={() => {}}
         flowRenderer={(props) => { captured = props; return <div /> }}
       />,
     )
@@ -58,6 +93,7 @@ describe('原生 Canvas 大画布性能预算', () => {
         selectedNodeId={null}
         onMutation={(mutation) => mutations.push(mutation)}
         onNodeSelect={() => {}}
+        onConversationNodeChange={() => {}}
         flowRenderer={(props) => { captured = props; return <div /> }}
       />,
     )
@@ -88,6 +124,7 @@ describe('原生 Canvas 大画布性能预算', () => {
         selectedNodeId={null}
         onMutation={() => {}}
         onNodeSelect={() => {}}
+        onConversationNodeChange={() => {}}
         flowRenderer={(props) => { captured = props; return <div /> }}
       />,
     )
@@ -122,6 +159,7 @@ describe('原生 Canvas 大画布性能预算', () => {
         selectedNodeId={null}
         onMutation={() => {}}
         onNodeSelect={() => {}}
+        onConversationNodeChange={() => {}}
         flowRenderer={(props) => <ReactFlow {...props} width={1_200} height={800} />}
       />,
     )
@@ -156,7 +194,8 @@ describe('原生 Canvas 大画布性能预算', () => {
       id: 'agent-1', kind: 'agent', title: 'Agent',
       agentSessionId: 'session-1', position: { x: 0, y: 0 },
     }]
-    const selected: Array<[string | null, string | null]> = []
+    const selected: Array<string | null> = []
+    const conversations: Array<string | null> = []
     const mutations: CanvasMutation[] = []
     let captured: NativeCanvasFlowProps | undefined
     renderToStaticMarkup(
@@ -165,7 +204,8 @@ describe('原生 Canvas 大画布性能预算', () => {
         writable
         selectedNodeId={null}
         onMutation={(mutation) => mutations.push(mutation)}
-        onNodeSelect={(nodeId, conversationNodeId) => selected.push([nodeId, conversationNodeId])}
+        onNodeSelect={(nodeId) => selected.push(nodeId)}
+        onConversationNodeChange={(nodeId) => conversations.push(nodeId)}
         flowRenderer={(props) => { captured = props; return <div /> }}
       />,
     )
@@ -174,7 +214,8 @@ describe('原生 Canvas 大画布性能预算', () => {
     captured!.onMoveEnd(null, { x: 4, y: 5, zoom: 1.2 })
     captured!.onSelectionChange?.({ nodes: [], edges: [] })
 
-    expect(selected).toEqual([['agent-1', 'agent-1'], [null, null]])
+    expect(selected).toEqual(['agent-1', null])
+    expect(conversations).toEqual(['agent-1', null])
     expect(mutations).toEqual([{
       type: 'set-viewport', viewport: { x: 4, y: 5, zoom: 1.2 },
     }])
