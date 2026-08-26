@@ -4,6 +4,7 @@ import type {
   CanvasAgentTarget,
   GetCanvasAgentMessagesInput,
   SendCanvasAgentMessageInput,
+  SendCanvasAgentMessageResult,
   StopCanvasAgentInput,
 } from '@proma/shared'
 import { useAtomValue, useSetAtom } from 'jotai'
@@ -26,14 +27,14 @@ import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
 /** 对话组件使用的 Canvas adapter 最小合同。 */
 export interface CanvasAgentConversationAdapter {
   getCanvasAgentMessages: (input: GetCanvasAgentMessagesInput) => Promise<CanvasAgentMessagesResult>
-  sendCanvasAgentMessage: (input: SendCanvasAgentMessageInput) => Promise<void>
+  sendCanvasAgentMessage: (input: SendCanvasAgentMessageInput) => Promise<SendCanvasAgentMessageResult>
   stopCanvasAgent: (input: StopCanvasAgentInput) => Promise<void>
 }
 
 /** 无 React 请求控制器的依赖。 */
 export interface CanvasAgentConversationControllerDependencies {
   load: () => Promise<CanvasAgentMessagesResult>
-  send: (message: string, userMessageUuid: string, startedAt: number) => Promise<void>
+  send: (message: string, userMessageUuid: string, startedAt: number) => Promise<SendCanvasAgentMessageResult>
   stop: () => Promise<void>
   onLoaded: (result: CanvasAgentMessagesResult) => void
   onComposerChange: (value: string) => void
@@ -41,8 +42,8 @@ export interface CanvasAgentConversationControllerDependencies {
   onError: (error: string | null) => void
   /** 返回主进程快照和流事件合成后的权威忙碌状态。 */
   isBusy: () => boolean
-  /** SEND Promise reject 时无条件收口对应 session 的全局伪运行 lifecycle。 */
-  onSendRejected?: () => void
+  /** SEND 准入失败时按本轮 token 收口乐观态，并可保留主进程确认的真实运行。 */
+  onSendRejected?: (input: { token: string; preserveRunning: boolean }) => void
 }
 
 /** 按需加载、单次发送和停止的命令边界。 */
@@ -83,14 +84,22 @@ export function createCanvasAgentConversationController(
       dependencies.onComposerChange('')
       dependencies.onSendingChange(true)
       dependencies.onError(null)
-      const request = dependencies.send(message, userMessageUuid, startedAt).catch((error: unknown) => {
-        dependencies.onSendRejected?.()
+      /** 统一恢复本地输入；全局 lifecycle 即使面板已卸载也必须按 token 收口。 */
+      const rejectSend = (error: unknown, preserveRunning: boolean): never => {
+        dependencies.onSendRejected?.({ token: userMessageUuid, preserveRunning })
         if (!disposed) {
           dependencies.onComposerChange(composerRestore)
           dependencies.onError(error instanceof Error ? error.message : '发送失败')
         }
         throw error
-      }).finally(() => {
+      }
+      const request = dependencies.send(message, userMessageUuid, startedAt).then(
+        (result) => {
+          if (result.ok) return
+          rejectSend(new Error(result.error.message), result.error.code === 'SESSION_BUSY')
+        },
+        (error: unknown) => rejectSend(error, false),
+      ).finally(() => {
         if (!disposed) dependencies.onSendingChange(false)
         if (sendPromise === request) sendPromise = null
       })
@@ -174,9 +183,11 @@ export function CanvasAgentConversation({
       onComposerChange: setComposer,
       onSendingChange: setSending,
       onError: setLocalError,
-      onSendRejected: () => {
-        /** IPC reject 表示尚未进入会吞掉异常并发布 completion 的 runAgent 边界。 */
-        if (openedSessionId) updateLifecycle({ type: 'completed', sessionId: openedSessionId })
+      onSendRejected: ({ token, preserveRunning }) => {
+        /** 准入失败尚未进入会吞掉异常并发布 completion 的 runAgent 边界。 */
+        if (openedSessionId) updateLifecycle({
+          type: 'send-rejected', sessionId: openedSessionId, token, preserveRunning,
+        })
       },
     })
     controllerRef.current = controller
@@ -198,11 +209,14 @@ export function CanvasAgentConversation({
     const controller = controllerRef.current
     if (!controller) return
     setStreamErrors((prev) => clearAgentStreamError(prev, sessionId))
+    /** userMessageUuid 同时作为 IPC 幂等身份与 Renderer 乐观运行 generation。 */
+    const operationToken = window.crypto.randomUUID()
     updateLifecycle({
-      type: 'started',
+      type: 'optimistic-started',
       owner: { sessionId, projectId, canvasId, nodeId, title },
+      token: operationToken,
     })
-    void controller.send(message, window.crypto.randomUUID(), Date.now()).catch(() => undefined)
+    void controller.send(message, operationToken, Date.now()).catch(() => undefined)
   }, [canvasId, composer, messagesLoaded, nodeId, projectId, sessionId, setStreamErrors, title, updateLifecycle])
 
   const persistedMessages = sessionId ? persistedMessagesMap.get(sessionId) ?? [] : []

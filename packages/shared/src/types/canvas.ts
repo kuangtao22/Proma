@@ -166,6 +166,14 @@ export interface SendCanvasAgentMessageInput extends CanvasAgentTarget {
   startedAt: number
 }
 
+/** Renderer 可处理的 Canvas Agent 发送拒绝码。 */
+export type CanvasAgentSendErrorCode = 'SESSION_BUSY'
+
+/** Canvas Agent 发送准入结果；运行期错误仍通过 Agent 流事件发布。 */
+export type SendCanvasAgentMessageResult =
+  | { ok: true }
+  | { ok: false; error: { code: CanvasAgentSendErrorCode; message: string } }
+
 /** 中止单个 Canvas Agent 的输入。 */
 export interface StopCanvasAgentInput extends CanvasAgentTarget {}
 

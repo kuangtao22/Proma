@@ -5,9 +5,11 @@ import {
   canvasAgentInternalInvalidSessionIdsAtom,
   canvasAgentLifecycleAtom,
   canvasAgentOpenSessionIdsAtom,
+  canvasAgentOptimisticRunTokensAtom,
   canvasAgentOwnersAtom,
   canvasAgentPersistedMessagesAtom,
   canvasAgentRunningSessionIdsAtom,
+  canvasAgentAuthoritativeRunningSessionIdsAtom,
   createInitialNativeCanvasState,
   createNativeCanvasKey,
   nativeCanvasStatesAtom,
@@ -16,6 +18,7 @@ import {
 import {
   agentSessionStreamingStateAtomFamily,
   agentStreamErrorsAtom,
+  agentStreamingStatesAtom,
   liveMessagesMapAtom,
 } from './agent-atoms'
 
@@ -103,6 +106,67 @@ describe('原生 Canvas 状态隔离', () => {
     expect(store.get(canvasAgentOpenSessionIdsAtom).size).toBe(0)
   })
 
+  test.each(['bootstrap', 'run_started'] as const)(
+    'Given 权威 %s 先于 busy 返回 When 本轮乐观 SEND 被拒绝 Then 真实运行与 owner 保留',
+    (authoritativeSource) => {
+      const store = createStore()
+      const owner = {
+        sessionId: 'session-busy', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+      }
+      store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+      store.set(canvasAgentLifecycleAtom, { type: 'optimistic-started', owner, token: 'message-old' })
+      if (authoritativeSource === 'bootstrap') {
+        store.set(canvasAgentLifecycleAtom, { type: 'bootstrap', owners: [owner], internalInvalidSessionIds: [] })
+      } else {
+        store.set(canvasAgentLifecycleAtom, { type: 'started', owner })
+      }
+
+      store.set(canvasAgentLifecycleAtom, {
+        type: 'send-rejected', sessionId: owner.sessionId, token: 'message-old', preserveRunning: true,
+      })
+
+      expect(store.get(canvasAgentAuthoritativeRunningSessionIdsAtom).has(owner.sessionId)).toBe(true)
+      expect(store.get(canvasAgentOptimisticRunTokensAtom).has(owner.sessionId)).toBe(false)
+      expect(store.get(canvasAgentRunningSessionIdsAtom).has(owner.sessionId)).toBe(true)
+      expect(store.get(canvasAgentOwnersAtom).get(owner.sessionId)).toEqual(owner)
+    },
+  )
+
+  test('Given 无权威运行 When 普通 SEND 准入失败 Then 只清除匹配的乐观运行', () => {
+    const store = createStore()
+    const owner = {
+      sessionId: 'session-failed', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+    }
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+    store.set(canvasAgentLifecycleAtom, { type: 'optimistic-started', owner, token: 'message-1' })
+
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'send-rejected', sessionId: owner.sessionId, token: 'message-1', preserveRunning: false,
+    })
+
+    expect(store.get(canvasAgentAuthoritativeRunningSessionIdsAtom).has(owner.sessionId)).toBe(false)
+    expect(store.get(canvasAgentOptimisticRunTokensAtom).has(owner.sessionId)).toBe(false)
+    expect(store.get(canvasAgentRunningSessionIdsAtom).has(owner.sessionId)).toBe(false)
+    expect(store.get(canvasAgentOwnersAtom).get(owner.sessionId)).toEqual(owner)
+  })
+
+  test('Given 同一 session 已开始新一轮 When 旧 token reject 到达 Then 新运行不被覆盖', () => {
+    const store = createStore()
+    const owner = {
+      sessionId: 'session-new', projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+    }
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+    store.set(canvasAgentLifecycleAtom, { type: 'optimistic-started', owner, token: 'message-old' })
+    store.set(canvasAgentLifecycleAtom, { type: 'optimistic-started', owner, token: 'message-new' })
+
+    store.set(canvasAgentLifecycleAtom, {
+      type: 'send-rejected', sessionId: owner.sessionId, token: 'message-old', preserveRunning: false,
+    })
+
+    expect(store.get(canvasAgentOptimisticRunTokensAtom).get(owner.sessionId)).toBe('message-new')
+    expect(store.get(canvasAgentRunningSessionIdsAtom).has(owner.sessionId)).toBe(true)
+  })
+
   test('Given 损坏 completion 与大量关闭缓存 When 生命周期收口 Then 立即失效且非保护缓存有界', () => {
     const store = createStore()
     /** 生成超过非保护缓存上限的历史会话。 */
@@ -180,6 +244,35 @@ describe('原生 Canvas 状态隔离', () => {
       store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: true })
     }
     expect(store.get(canvasAgentInternalInvalidSessionIdsAtom).size).toBeLessThanOrEqual(100)
+  })
+
+  test('Given 120 个损坏 session 持有共享流状态 When hard invalid Then 三类运行时状态全部有界回收', () => {
+    const store = createStore()
+    for (let index = 0; index < 120; index += 1) {
+      const sessionId = `hard-invalid-${index}`
+      store.set(liveMessagesMapAtom, (previous) => new Map(previous).set(sessionId, []))
+      store.set(agentStreamErrorsAtom, (previous) => new Map(previous).set(sessionId, '损坏事件'))
+      store.set(agentSessionStreamingStateAtomFamily(sessionId), { running: true })
+      store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: true })
+    }
+
+    expect(store.get(liveMessagesMapAtom).size).toBe(0)
+    expect(store.get(agentStreamErrorsAtom).size).toBe(0)
+    expect(store.get(agentStreamingStatesAtom).size).toBe(0)
+  })
+
+  test('Given active invalid 仍可能恢复 When soft invalid Then 保留共享流状态', () => {
+    const store = createStore()
+    const sessionId = 'soft-invalid-runtime'
+    store.set(liveMessagesMapAtom, new Map([[sessionId, []]]))
+    store.set(agentStreamErrorsAtom, new Map([[sessionId, '等待恢复']]))
+    store.set(agentSessionStreamingStateAtomFamily(sessionId), { running: true })
+
+    store.set(canvasAgentLifecycleAtom, { type: 'invalidated', sessionId, terminal: false })
+
+    expect(store.get(liveMessagesMapAtom).has(sessionId)).toBe(true)
+    expect(store.get(agentStreamErrorsAtom).get(sessionId)).toBe('等待恢复')
+    expect(store.get(agentStreamingStatesAtom).get(sessionId)?.running).toBe(true)
   })
 
   test('Given 合法 Canvas owner 正在运行 When soft completion 到达 Then owner 与 running 都保留', () => {

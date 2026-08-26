@@ -10,6 +10,7 @@ import type {
   GetCanvasAgentMessagesInput,
   LoadCanvasInput,
   SendCanvasAgentMessageInput,
+  SendCanvasAgentMessageResult,
   SaveCanvasMutationsInput,
   StopCanvasAgentInput,
   AgentSendInput,
@@ -98,6 +99,13 @@ function parseSendAgentInput(value: unknown): SendCanvasAgentMessageInput {
     userMessageUuid: value.userMessageUuid,
     startedAt: value.startedAt,
   }
+}
+
+/** 判断 Agent 启动槽是否因同会话已有任务而拒绝。 */
+function isAgentSessionBusyError(error: unknown): boolean {
+  return error instanceof Error
+    && 'code' in error
+    && error.code === 'AGENT_SESSION_BUSY'
 }
 
 /** 注册结果用于退出和测试清理。 */
@@ -375,11 +383,23 @@ export function registerCanvasDocumentIpcHandlers(
     }
   })
 
-  options.ipc.handle(CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, async (event, value): Promise<void> => {
+  options.ipc.handle(CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, async (event, value): Promise<SendCanvasAgentMessageResult> => {
     assertAuthorizedSender(event, options)
     const input = parseSendAgentInput(value)
     const owner = await resolveAgentOwner(input)
-    const releaseStart = options.agent.reserveStart(owner.session.id)
+    /** 只有同会话 busy 属于 Renderer 可恢复的结构化准入结果。 */
+    let releaseStart: () => void
+    try {
+      releaseStart = options.agent.reserveStart(owner.session.id)
+    } catch (error) {
+      if (isAgentSessionBusyError(error)) {
+        return {
+          ok: false,
+          error: { code: 'SESSION_BUSY', message: '会话正在运行，请先停止当前任务。' },
+        }
+      }
+      throw error
+    }
     try {
       await options.agent.run({
         sessionId: owner.session.id,
@@ -395,6 +415,7 @@ export function registerCanvasDocumentIpcHandlers(
     } finally {
       releaseStart()
     }
+    return { ok: true }
   })
 
   options.ipc.handle(CANVAS_IPC_CHANNELS.STOP_AGENT, async (event, value): Promise<void> => {

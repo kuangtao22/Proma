@@ -67,6 +67,7 @@ function createContext(options: {
   beforeCreate?: (input: { projectId: string; canvasId: string }) => Promise<void>
   createErrorOnce?: Error
   createDocumentChanged?: boolean
+  reserveStartError?: Error
   activeRunSnapshot?: {
     owners: Array<{ sessionId: string; projectId: string; canvasId: string; nodeId: string; title: string }>
     internalInvalidSessionIds: string[]
@@ -210,6 +211,7 @@ function createContext(options: {
       },
       reserveStart: (sessionId) => {
         agentCalls.push({ type: 'reserve', value: sessionId })
+        if (options.reserveStartError) throw options.reserveStartError
         return () => { agentCalls.push({ type: 'release', value: sessionId }) }
       },
       run: async (input, sender, extensions) => {
@@ -259,7 +261,7 @@ describe('原生 Canvas 文档 IPC', () => {
     const target = { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1' }
 
     const loaded = await invoke(context.handlers, CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES, context.sender, target)
-    await invoke(context.handlers, CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, context.sender, {
+    const sent = await invoke(context.handlers, CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, context.sender, {
       ...target, message: '请分析当前项目', userMessageUuid: 'message-1', startedAt: 10,
     })
     await invoke(context.handlers, CANVAS_IPC_CHANNELS.STOP_AGENT, context.sender, target)
@@ -269,6 +271,7 @@ describe('原生 Canvas 文档 IPC', () => {
       messages: [{ type: 'user', message: { content: [{ type: 'text', text: '已有消息' }] } }],
       owner: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', title: '首页 Agent' },
     })
+    expect(sent).toEqual({ ok: true })
     expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(3)
     expect(context.agentCalls).toEqual([
       { type: 'messages', value: '22222222-2222-4222-8222-222222222222' },
@@ -286,6 +289,50 @@ describe('原生 Canvas 文档 IPC', () => {
       { type: 'release', value: '22222222-2222-4222-8222-222222222222' },
       { type: 'stop', value: '22222222-2222-4222-8222-222222222222' },
     ])
+  })
+
+  test('Given Canvas Agent 已在运行 When SEND 预留启动槽失败 Then 只返回稳定公开 busy 结果', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-1', kind: 'agent', title: '首页 Agent', position: { x: 0, y: 0 },
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+    }]
+    /** 主进程内部 busy code 不得作为 Electron reject 细节泄露给 Renderer。 */
+    const busyError = Object.assign(new Error('内部启动状态细节'), { code: 'AGENT_SESSION_BUSY' })
+    const context = createContext({
+      loadResult: { document, writable: true },
+      reserveStartError: busyError,
+    })
+
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      message: '继续', userMessageUuid: 'message-1', startedAt: 10,
+    })).resolves.toEqual({
+      ok: false,
+      error: { code: 'SESSION_BUSY', message: '会话正在运行，请先停止当前任务。' },
+    })
+    expect(context.agentCalls).toEqual([
+      { type: 'reserve', value: '22222222-2222-4222-8222-222222222222' },
+    ])
+  })
+
+  test('Given Canvas Agent 普通准入错误 When SEND 预留启动槽失败 Then 保留原始 reject', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-1', kind: 'agent', title: '首页 Agent', position: { x: 0, y: 0 },
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+    }]
+    /** 配置与权限错误仍走 reject，避免被错误归类为并发 busy。 */
+    const admissionError = new Error('模型配置缺失')
+    const context = createContext({
+      loadResult: { document, writable: true },
+      reserveStartError: admissionError,
+    })
+
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      message: '继续', userMessageUuid: 'message-1', startedAt: 10,
+    })).rejects.toBe(admissionError)
   })
 
   test('Given Renderer 伪造 sessionId 或未知字段 When 调用 Canvas Agent IPC Then 在对账前拒绝', async () => {

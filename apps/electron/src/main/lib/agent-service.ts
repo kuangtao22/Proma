@@ -160,9 +160,17 @@ const agentQueueCoordinator = new AgentQueueCoordinator({
  */
 const startingAgentSessions = new Set<string>()
 
+/** 主进程内部稳定 busy 错误码，仅用于可信 IPC 边界分类。 */
+const AGENT_SESSION_BUSY_ERROR_CODE = 'AGENT_SESSION_BUSY'
+
 export function reserveAgentSessionStart(sessionId: string): () => void {
   if (startingAgentSessions.has(sessionId) || orchestrator.isActive(sessionId)) {
-    throw new Error('会话正在启动或运行中，请等待当前请求结束后再发送。')
+    /** 附加稳定内部码，避免 IPC 依赖可能变化的中文错误文案。 */
+    const busyError = Object.assign(
+      new Error('会话正在启动或运行中，请等待当前请求结束后再发送。'),
+      { code: AGENT_SESSION_BUSY_ERROR_CODE },
+    )
+    throw busyError
   }
   startingAgentSessions.add(sessionId)
   return () => startingAgentSessions.delete(sessionId)

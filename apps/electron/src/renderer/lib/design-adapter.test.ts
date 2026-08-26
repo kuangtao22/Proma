@@ -35,7 +35,7 @@ describe('Design renderer adapter', () => {
         return { document: snapshot.document, session: { id: 'session-1' } as never }
       },
       getCanvasAgentMessages: async (input) => { received.push(input); return { sessionId: 'session-1', owner: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', title: 'Agent' }, messages: [] } },
-      sendCanvasAgentMessage: async (input) => { received.push(input) },
+      sendCanvasAgentMessage: async (input) => { received.push(input); return { ok: true } },
       stopCanvasAgent: async (input) => { received.push(input) },
     }
     const adapter = createDesignAdapter(api)

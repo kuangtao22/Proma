@@ -28,7 +28,7 @@ describe('Canvas Agent 对话', () => {
     const calls: string[] = []
     const controller = createCanvasAgentConversationController({
       load: async () => { calls.push('load'); return createResult() },
-      send: async () => { calls.push('send') },
+      send: async () => { calls.push('send'); return { ok: true } },
       stop: async () => { calls.push('stop') },
       isBusy: () => false,
       onLoaded: () => calls.push('loaded'),
@@ -49,7 +49,7 @@ describe('Canvas Agent 对话', () => {
     const errors: Array<string | null> = []
     const controller = createCanvasAgentConversationController({
       load: async () => createResult(),
-      send: () => new Promise<void>((_resolve, reject) => { rejectSend = reject }),
+      send: () => new Promise((_resolve, reject) => { rejectSend = reject }),
       stop: async () => undefined,
       isBusy: () => false,
       onLoaded: () => undefined,
@@ -74,7 +74,7 @@ describe('Canvas Agent 对话', () => {
     let busy = true
     const controller = createCanvasAgentConversationController({
       load: async () => createResult(),
-      send: async () => { calls.push('send') },
+      send: async () => { calls.push('send'); return { ok: true } },
       stop: async () => { calls.push('stop') },
       isBusy: () => busy,
       onLoaded: () => undefined,
@@ -101,8 +101,8 @@ describe('Canvas Agent 对话', () => {
       const callbacks: string[] = []
       const controller = createCanvasAgentConversationController({
         load: async () => createResult(),
-        send: () => new Promise<void>((resolve, reject) => {
-          settleSend = () => outcome === 'resolve' ? resolve() : reject(new Error('A 失败'))
+        send: () => new Promise((resolve, reject) => {
+          settleSend = () => outcome === 'resolve' ? resolve({ ok: true }) : reject(new Error('A 失败'))
         }),
         stop: async () => undefined,
         isBusy: () => false,
@@ -133,7 +133,9 @@ describe('Canvas Agent 对话', () => {
         sessionId, projectId: 'project-1', canvasId: 'canvas-a', nodeId: `node-${index}`, title: 'Agent A',
       }
       store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
-      store.set(canvasAgentLifecycleAtom, { type: 'started', owner })
+      store.set(canvasAgentLifecycleAtom, {
+        type: 'optimistic-started', owner, token: `message-${index}`,
+      })
       /** 切换到 B 后所有旧 A UI callback 必须被抑制。 */
       const uiCallbacks: string[] = []
       const controller = createCanvasAgentConversationController({
@@ -145,7 +147,9 @@ describe('Canvas Agent 对话', () => {
         onComposerChange: (value) => uiCallbacks.push(`composer:${value}`),
         onSendingChange: (value) => uiCallbacks.push(`sending:${value}`),
         onError: (value) => uiCallbacks.push(`error:${value ?? ''}`),
-        onSendRejected: () => store.set(canvasAgentLifecycleAtom, { type: 'completed', sessionId }),
+        onSendRejected: ({ token, preserveRunning }) => store.set(canvasAgentLifecycleAtom, {
+          type: 'send-rejected', sessionId, token, preserveRunning,
+        }),
       })
       const request = controller.send('A 草稿', `message-${index}`, index)
       controller.dispose()
@@ -159,6 +163,43 @@ describe('Canvas Agent 对话', () => {
     expect(store.get(canvasAgentPersistedMessagesAtom).size).toBe(0)
   })
 
+  test('Given 主进程返回 SESSION_BUSY When controller 收口 Then 恢复输入并保留全局真实运行', async () => {
+    const store = createStore()
+    const owner = {
+      sessionId: 'session-busy', projectId: 'project-1', canvasId: 'canvas-a', nodeId: 'node-a', title: 'Agent A',
+    }
+    store.set(canvasAgentLifecycleAtom, { type: 'opened', owner, messages: [] })
+    store.set(canvasAgentLifecycleAtom, { type: 'optimistic-started', owner, token: 'message-busy' })
+    store.set(canvasAgentLifecycleAtom, { type: 'started', owner })
+    const composer: string[] = []
+    const sending: boolean[] = []
+    const errors: Array<string | null> = []
+    const controller = createCanvasAgentConversationController({
+      load: async () => createResult(),
+      send: async () => ({
+        ok: false,
+        error: { code: 'SESSION_BUSY', message: '会话正在运行，请先停止当前任务。' },
+      }),
+      stop: async () => undefined,
+      isBusy: () => false,
+      onLoaded: () => undefined,
+      onComposerChange: (value) => composer.push(value),
+      onSendingChange: (value) => sending.push(value),
+      onError: (value) => errors.push(value),
+      onSendRejected: ({ token, preserveRunning }) => store.set(canvasAgentLifecycleAtom, {
+        type: 'send-rejected', sessionId: owner.sessionId, token, preserveRunning,
+      }),
+    })
+
+    await expect(controller.send('保留输入', 'message-busy', 10))
+      .rejects.toThrow('会话正在运行，请先停止当前任务。')
+    expect(composer).toEqual(['', '保留输入'])
+    expect(sending).toEqual([true, false])
+    expect(errors).toEqual([null, '会话正在运行，请先停止当前任务。'])
+    expect(store.get(canvasAgentRunningSessionIdsAtom).has(owner.sessionId)).toBe(true)
+    expect(store.get(canvasAgentOwnersAtom).get(owner.sessionId)).toEqual(owner)
+  })
+
   test('Given 窄屏对话面板 When SSR Then 只有文本发送停止关闭控件', () => {
     const html = renderToStaticMarkup(
       <Provider store={createStore()}>
@@ -167,7 +208,7 @@ describe('Canvas Agent 对话', () => {
           title="研究 Agent"
           adapter={{
             getCanvasAgentMessages: async () => createResult(),
-            sendCanvasAgentMessage: async () => undefined,
+            sendCanvasAgentMessage: async () => ({ ok: true }),
             stopCanvasAgent: async () => undefined,
           }}
           onClose={() => undefined}

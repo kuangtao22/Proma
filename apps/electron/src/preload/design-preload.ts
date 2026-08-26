@@ -38,6 +38,7 @@ import type {
   SaveDesignMutationsInput,
   SaveCanvasMutationsInput,
   SendCanvasAgentMessageInput,
+  SendCanvasAgentMessageResult,
   StopCanvasAgentInput,
   SaveImageGenerationModelProfilesInput,
   ListDesignContextInput,
@@ -61,7 +62,7 @@ export interface DesignPreloadApi {
   /** Renderer reload 时一次性恢复仍在运行的 Canvas Agent 归属。 */
   listActiveCanvasAgentRuns: () => Promise<CanvasAgentActiveRunSnapshot>
   /** 通过 Canvas 唯一入口发送纯文本消息。 */
-  sendCanvasAgentMessage: (input: SendCanvasAgentMessageInput) => Promise<void>
+  sendCanvasAgentMessage: (input: SendCanvasAgentMessageInput) => Promise<SendCanvasAgentMessageResult>
   /** 通过 Canvas 唯一入口停止节点运行。 */
   stopCanvasAgent: (input: StopCanvasAgentInput) => Promise<void>
   /** 订阅所有原生 Canvas 变化，双身份过滤由 Renderer adapter 执行。 */
@@ -133,7 +134,7 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
     sendCanvasAgentMessage: (input) => ipc.invoke(
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
       input,
-    ) as Promise<void>,
+    ) as Promise<SendCanvasAgentMessageResult>,
     stopCanvasAgent: (input) => ipc.invoke(
       CANVAS_IPC_CHANNELS.STOP_AGENT,
       input,

@@ -69,6 +69,12 @@ export const canvasAgentOpenSessionIdsAtom = atom<Set<string>>(new Set<string>()
 /** 当前启动、运行或排队中的 Canvas Agent session。 */
 export const canvasAgentRunningSessionIdsAtom = atom<Set<string>>(new Set<string>())
 
+/** 已由 bootstrap 或 Agent 流事件确认运行的 Canvas Agent session。 */
+export const canvasAgentAuthoritativeRunningSessionIdsAtom = atom<Set<string>>(new Set<string>())
+
+/** Renderer 已提交但主进程尚未确认的 Canvas Agent 运行 token。 */
+export const canvasAgentOptimisticRunTokensAtom = atom<Map<string, string>>(new Map<string, string>())
+
 /** 已确认 Canvas 字段损坏的内部 session，未知事件必须 fail closed。 */
 export const canvasAgentInternalInvalidSessionIdsAtom = atom<Set<string>>(new Set<string>())
 
@@ -83,6 +89,8 @@ export type CanvasAgentLifecycleEvent =
   | { type: 'bootstrap'; owners: CanvasAgentOwner[]; internalInvalidSessionIds: string[] }
   | { type: 'opened'; owner: CanvasAgentOwner; messages: SDKMessage[] }
   | { type: 'started' | 'owner-updated'; owner: CanvasAgentOwner }
+  | { type: 'optimistic-started'; owner: CanvasAgentOwner; token: string }
+  | { type: 'send-rejected'; sessionId: string; token: string; preserveRunning: boolean }
   | { type: 'closed' | 'completed'; sessionId: string }
   | { type: 'settled'; sessionId: string }
   | { type: 'invalidated'; sessionId: string; terminal: boolean }
@@ -144,17 +152,19 @@ export const canvasAgentLifecycleAtom = atom(
     const messages = new Map(get(canvasAgentPersistedMessagesAtom))
     const openSessionIds = new Set(get(canvasAgentOpenSessionIdsAtom))
     const runningSessionIds = new Set(get(canvasAgentRunningSessionIdsAtom))
+    const authoritativeRunningSessionIds = new Set(get(canvasAgentAuthoritativeRunningSessionIdsAtom))
+    const optimisticRunTokens = new Map(get(canvasAgentOptimisticRunTokensAtom))
     const activeInvalidSessionIds = new Set(get(canvasAgentActiveInternalInvalidSessionIdsAtom))
     const terminalInvalidSessionIds = new Set(get(canvasAgentTerminalInternalInvalidSessionIdsAtom))
 
     if (event.type === 'bootstrap') {
       /** reload 初始快照替换运行态；仍打开的面板由后续 GET 再建立。 */
-      runningSessionIds.clear()
+      authoritativeRunningSessionIds.clear()
       activeInvalidSessionIds.clear()
       for (const owner of event.owners) {
         owners.delete(owner.sessionId)
         owners.set(owner.sessionId, owner)
-        runningSessionIds.add(owner.sessionId)
+        authoritativeRunningSessionIds.add(owner.sessionId)
       }
       for (const sessionId of event.internalInvalidSessionIds) {
         terminalInvalidSessionIds.delete(sessionId)
@@ -173,7 +183,25 @@ export const canvasAgentLifecycleAtom = atom(
       owners.set(event.owner.sessionId, event.owner)
       activeInvalidSessionIds.delete(event.owner.sessionId)
       terminalInvalidSessionIds.delete(event.owner.sessionId)
-      if (event.type === 'started') runningSessionIds.add(event.owner.sessionId)
+      if (event.type === 'started') authoritativeRunningSessionIds.add(event.owner.sessionId)
+    } else if (event.type === 'optimistic-started') {
+      owners.delete(event.owner.sessionId)
+      owners.set(event.owner.sessionId, event.owner)
+      optimisticRunTokens.set(event.owner.sessionId, event.token)
+      activeInvalidSessionIds.delete(event.owner.sessionId)
+      terminalInvalidSessionIds.delete(event.owner.sessionId)
+    } else if (event.type === 'send-rejected') {
+      /** 迟到的旧请求只能收口自己的 token，不能覆盖同 session 的新一轮运行。 */
+      if (optimisticRunTokens.get(event.sessionId) === event.token) {
+        optimisticRunTokens.delete(event.sessionId)
+        if (event.preserveRunning) authoritativeRunningSessionIds.add(event.sessionId)
+        if (!event.preserveRunning
+          && !authoritativeRunningSessionIds.has(event.sessionId)
+          && !openSessionIds.has(event.sessionId)) {
+          owners.delete(event.sessionId)
+          messages.delete(event.sessionId)
+        }
+      }
     } else if (event.type === 'closed') {
       openSessionIds.delete(event.sessionId)
       if (!runningSessionIds.has(event.sessionId)) {
@@ -181,7 +209,8 @@ export const canvasAgentLifecycleAtom = atom(
         messages.delete(event.sessionId)
       }
     } else if (event.type === 'completed') {
-      runningSessionIds.delete(event.sessionId)
+      authoritativeRunningSessionIds.delete(event.sessionId)
+      optimisticRunTokens.delete(event.sessionId)
       if (!openSessionIds.has(event.sessionId)) {
         owners.delete(event.sessionId)
         messages.delete(event.sessionId)
@@ -191,7 +220,8 @@ export const canvasAgentLifecycleAtom = atom(
       messages.delete(event.sessionId)
       openSessionIds.delete(event.sessionId)
       if (event.terminal) {
-        runningSessionIds.delete(event.sessionId)
+        authoritativeRunningSessionIds.delete(event.sessionId)
+        optimisticRunTokens.delete(event.sessionId)
         activeInvalidSessionIds.delete(event.sessionId)
         terminalInvalidSessionIds.delete(event.sessionId)
         terminalInvalidSessionIds.add(event.sessionId)
@@ -201,11 +231,17 @@ export const canvasAgentLifecycleAtom = atom(
       }
     }
 
+    /** 对外 busy 集合始终由权威运行与当前乐观 token 的并集派生。 */
+    runningSessionIds.clear()
+    for (const sessionId of authoritativeRunningSessionIds) runningSessionIds.add(sessionId)
+    for (const sessionId of optimisticRunTokens.keys()) runningSessionIds.add(sessionId)
+
     /** 只有不再打开且不再运行，或 GET 已完成交接时，才释放共享流式状态。 */
     const shouldReleaseRuntimeState = (event.type === 'settled' && !runningSessionIds.has(event.sessionId))
       || ((event.type === 'closed' || event.type === 'completed')
         && !openSessionIds.has(event.sessionId)
         && !runningSessionIds.has(event.sessionId))
+      || (event.type === 'invalidated' && event.terminal)
     if (shouldReleaseRuntimeState) {
       set(liveMessagesMapAtom, (previous) => {
         if (!previous.has(event.sessionId)) return previous
@@ -236,6 +272,8 @@ export const canvasAgentLifecycleAtom = atom(
     set(canvasAgentPersistedMessagesAtom, messages)
     set(canvasAgentOpenSessionIdsAtom, openSessionIds)
     set(canvasAgentRunningSessionIdsAtom, runningSessionIds)
+    set(canvasAgentAuthoritativeRunningSessionIdsAtom, authoritativeRunningSessionIds)
+    set(canvasAgentOptimisticRunTokensAtom, optimisticRunTokens)
     set(canvasAgentActiveInternalInvalidSessionIdsAtom, activeInvalidSessionIds)
     set(canvasAgentTerminalInternalInvalidSessionIdsAtom, terminalInvalidSessionIds)
     set(canvasAgentInternalInvalidSessionIdsAtom, invalidSessionIds)
