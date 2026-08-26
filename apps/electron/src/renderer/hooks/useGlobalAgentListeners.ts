@@ -61,6 +61,12 @@ import {
   playNotificationSoundForType,
 } from '@/atoms/notifications'
 import { appModeAtom } from '@/atoms/app-mode'
+import { activeCanvasSelectionAtom } from '@/atoms/canvas-session-atoms'
+import {
+  canvasAgentOwnersAtom,
+  createNativeCanvasKey,
+  updateNativeCanvasStateAtom,
+} from '@/atoms/native-canvas-atoms'
 import { tabsAtom, activeTabIdAtom, activeSessionIdAtom, openTab, updateTabTitle } from '@/atoms/tab-atoms'
 import type { AgentStreamState } from '@/atoms/agent-atoms'
 import { agentDiffUnseenChangesAtom, agentDiffUnseenFilesAtom } from '@/atoms/agent-atoms'
@@ -82,6 +88,8 @@ import { detectIsWindows } from '@/lib/platform'
 import { getSessionFileChangeKind, getOwnedSessionWatcherPaths, upsertSessionFileChange } from '@/lib/session-file-changes'
 import { removeQueuedMessage, createQueuedAgentStreamState } from '@/lib/agent-message-queue'
 import { createAgentStreamEventBatcher } from '@/lib/agent-stream-event-batcher'
+import { routeCanvasAgentEvent } from '@/lib/canvas-agent-event-routing'
+import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
 
 /** 触发右侧文件浏览器自动定位的写入类工具集合 */
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Update'])
@@ -630,6 +638,24 @@ export function useGlobalAgentListeners(): void {
       }
     }
 
+    /** 构建返回原 Canvas 与节点对话的通知动作，不创建普通 Agent tab。 */
+    const makeNavigateToCanvasAgent = (owner: CanvasAgentOwner) => () => {
+      store.set(activeCanvasSelectionAtom, {
+        projectId: owner.projectId,
+        canvasId: owner.canvasId,
+      })
+      store.set(updateNativeCanvasStateAtom, {
+        key: createNativeCanvasKey(owner.projectId, owner.canvasId),
+        update: {
+          selectedNodeId: owner.nodeId,
+          conversationNodeId: owner.nodeId,
+        },
+      })
+      store.set(appModeAtom, 'agent')
+      store.set(currentAgentSessionIdAtom, null)
+      store.set(currentAgentWorkspaceIdAtom, owner.projectId)
+    }
+
     /** 获取会话标题 */
     const getSessionTitle = (sessionId: string): string => {
       const sessions = store.get(agentSessionsAtom)
@@ -912,10 +938,12 @@ export function useGlobalAgentListeners(): void {
     // ===== 1. 流式事件 =====
     const handleStreamEvent = (streamEvent: AgentStreamEvent): void => {
         const { sessionId, payload } = streamEvent
+        /** Canvas owner 存在于全局 session 索引，不依赖当前打开的 Canvas。 */
+        const isCanvasAgent = store.get(canvasAgentOwnersAtom).has(sessionId)
 
         unstable_batchedUpdates(() => {
 
-        if (payload.kind === 'proma_event' && payload.event.type === 'external_run_started') {
+        if (!isCanvasAgent && payload.kind === 'proma_event' && payload.event.type === 'external_run_started') {
           activateExternalAgentRun(payload.event)
         }
 
@@ -938,7 +966,7 @@ export function useGlobalAgentListeners(): void {
             map.set(sessionId, createQueuedAgentStreamState(current, runStartedEvent.startedAt))
             return map
           })
-          store.set(unviewedCompletedSessionIdsAtom, (prev) => {
+          if (!isCanvasAgent) store.set(unviewedCompletedSessionIdsAtom, (prev) => {
             if (!prev.has(sessionId)) return prev
             const next = new Set(prev)
             next.delete(sessionId)
@@ -957,7 +985,7 @@ export function useGlobalAgentListeners(): void {
 
         // 如果收到未知会话的事件（跨工作区场景），立即刷新会话列表
         const knownSessions = store.get(agentSessionsAtom)
-        if (!knownSessions.some((s) => s.id === sessionId)) {
+        if (!isCanvasAgent && !knownSessions.some((s) => s.id === sessionId)) {
           window.electronAPI.listAgentSessions()
             .then((sessions) => store.set(agentSessionsAtom, (prev) => mergeFetchedAgentSessions(prev, sessions)))
             .catch(console.error)
@@ -1410,9 +1438,22 @@ export function useGlobalAgentListeners(): void {
         const backgroundTasksPending = data.backgroundTasksPending === true
         const hasStreamError = store.get(agentStreamErrorsAtom).has(data.sessionId)
 
+        /** 完成 payload 的主进程安全 metadata 可恢复未打开 Canvas 的 owner。 */
+        const completionRoute = routeCanvasAgentEvent(data.session)
+        if (completionRoute.kind === 'canvas') {
+          store.set(canvasAgentOwnersAtom, (current) => (
+            new Map(current).set(data.sessionId, completionRoute.owner)
+          ))
+        }
+        const canvasOwner = completionRoute.kind === 'canvas'
+          ? completionRoute.owner
+          : store.get(canvasAgentOwnersAtom).get(data.sessionId)
+        const isCanvasAgentCompletion = canvasOwner !== undefined
+          || completionRoute.kind === 'internal-invalid'
+
         // 主进程随完成事件携带刚落盘的单条 meta；不要为此重新拉取整个会话索引。
         // 后台任务的轻量完成并未更新会话新鲜度，保留现有列表顺序。
-        if (data.session && !backgroundTasksPending) {
+        if (!isCanvasAgentCompletion && data.session && !backgroundTasksPending) {
           store.set(agentSessionsAtom, (prev) => upsertAgentSession(prev, data.session!))
         }
 
@@ -1423,7 +1464,24 @@ export function useGlobalAgentListeners(): void {
         const soundEnabled = store.get(notificationSoundEnabledAtom)
         const sounds = store.get(notificationSoundsAtom)
         const sessionTitle = getSessionTitle(data.sessionId)
-        notifyAgentCompletion({
+        if (canvasOwner) {
+          const isSuccessfulCompletion = !data.stoppedByUser
+            && !hasStreamError
+            && (!data.resultSubtype || data.resultSubtype === 'success')
+          if (!backgroundTasksPending && isSuccessfulCompletion) {
+            sendDesktopNotification(
+              'Canvas Agent 任务完成',
+              `[${canvasOwner.title}] 任务已完成`,
+              enabled,
+              {
+                playSound: enabled && soundEnabled,
+                soundType: 'taskComplete',
+                sounds,
+                onNavigate: makeNavigateToCanvasAgent(canvasOwner),
+              },
+            )
+          }
+        } else if (!isCanvasAgentCompletion) notifyAgentCompletion({
           completion: data,
           session: completionSession,
           hasStreamError,
@@ -1478,19 +1536,19 @@ export function useGlobalAgentListeners(): void {
           session: completionSession,
           documentHasFocus: document.hasFocus(),
         })
-        if (completionMarkers.markUnviewedCompleted && !backgroundTasksPending) {
+        if (!isCanvasAgentCompletion && completionMarkers.markUnviewedCompleted && !backgroundTasksPending) {
           store.set(unviewedCompletedSessionIdsAtom, (prev: Set<string>) => {
             const next = new Set(prev)
             next.add(data.sessionId)
             return next
           })
-        } else if (!backgroundTasksPending) {
+        } else if (!isCanvasAgentCompletion && !backgroundTasksPending) {
           // 当前聚焦会话已在主应用可见；同步确认，避免灵动岛把这次完成继续当未读。
           void window.electronAPI.agentIsland.markSessionViewed(data.sessionId).catch(console.error)
         }
 
         // 对齐本次会话的主动打断状态，无需借助全量列表刷新重建整个 Set。
-        store.set(stoppedByUserSessionsAtom, (prev: Set<string>) => {
+        if (!isCanvasAgentCompletion) store.set(stoppedByUserSessionsAtom, (prev: Set<string>) => {
           const wasStopped = prev.has(data.sessionId)
           if (data.stoppedByUser === true && !wasStopped) {
             const next = new Set(prev)
@@ -1524,12 +1582,15 @@ export function useGlobalAgentListeners(): void {
         }
 
         // 清除 Plan 模式状态（防止异常退出时残留）
-        store.set(agentPlanModeSessionsAtom, (prev: Set<string>) => {
+        if (!isCanvasAgentCompletion) store.set(agentPlanModeSessionsAtom, (prev: Set<string>) => {
           if (!prev.has(data.sessionId)) return prev
           const next = new Set(prev)
           next.delete(data.sessionId)
           return next
         })
+
+        /** Canvas 保留 live 消息供已打开面板展示；重开时再从权威 JSONL 合并恢复。 */
+        if (isCanvasAgentCompletion) return
 
         /** 竞态保护：检查该会话是否已有新的流式请求正在运行 */
         const isNewStreamRunning = (): boolean => {

@@ -125,6 +125,9 @@ describe('Canvas 图共享合同', () => {
       LOAD: 'canvas:load',
       SAVE_MUTATIONS: 'canvas:save-mutations',
       CREATE_AGENT_NODE: 'canvas:create-agent-node',
+      GET_AGENT_MESSAGES: 'canvas:get-agent-messages',
+      SEND_AGENT_MESSAGE: 'canvas:send-agent-message',
+      STOP_AGENT: 'canvas:stop-agent',
       CHANGED: 'canvas:changed',
     })
     expect(loadInput).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })

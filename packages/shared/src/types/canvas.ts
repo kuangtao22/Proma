@@ -1,11 +1,15 @@
 import type { DesignPoint, DesignViewport } from './design'
 import type { AgentSessionMeta } from './agent'
+import type { SDKMessage } from './agent'
 
 /** 原生 Canvas 图文档使用的固定 IPC 通道。 */
 export const CANVAS_IPC_CHANNELS = {
   LOAD: 'canvas:load',
   SAVE_MUTATIONS: 'canvas:save-mutations',
   CREATE_AGENT_NODE: 'canvas:create-agent-node',
+  GET_AGENT_MESSAGES: 'canvas:get-agent-messages',
+  SEND_AGENT_MESSAGE: 'canvas:send-agent-message',
+  STOP_AGENT: 'canvas:stop-agent',
   CHANGED: 'canvas:changed',
 } as const
 
@@ -144,6 +148,37 @@ export type CanvasMutation =
 export interface CanvasTarget {
   projectId: string
   canvasId: string
+}
+
+/** Canvas Agent 节点的项目、Canvas 与节点三重身份。 */
+export interface CanvasAgentTarget extends CanvasTarget {
+  nodeId: string
+}
+
+/** 按需读取单个 Canvas Agent 持久化消息的输入。 */
+export interface GetCanvasAgentMessagesInput extends CanvasAgentTarget {}
+
+/** 向单个 Canvas Agent 发送纯文本消息的输入。 */
+export interface SendCanvasAgentMessageInput extends CanvasAgentTarget {
+  message: string
+  userMessageUuid: string
+  startedAt: number
+}
+
+/** 中止单个 Canvas Agent 的输入。 */
+export interface StopCanvasAgentInput extends CanvasAgentTarget {}
+
+/** Renderer 可见的最小 Canvas Agent owner。 */
+export interface CanvasAgentPublicOwner extends CanvasTarget {
+  nodeId: string
+  title: string
+}
+
+/** 按需加载结果不暴露 JSONL 路径或存储类型。 */
+export interface CanvasAgentMessagesResult {
+  sessionId: string
+  owner: CanvasAgentPublicOwner
+  messages: SDKMessage[]
 }
 
 /** 加载单个原生 Canvas 文档的公开输入。 */

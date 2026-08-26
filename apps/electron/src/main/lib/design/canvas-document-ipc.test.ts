@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test'
 import { CANVAS_IPC_CHANNELS, createEmptyCanvasDocument } from '@proma/shared'
-import type { CanvasDocument, CanvasMutation } from '@proma/shared'
+import type { AgentSessionMeta, CanvasDocument, CanvasMutation, SDKMessage } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
 
@@ -92,6 +92,15 @@ function createContext(options: {
   const storeInputs: unknown[] = []
   /** 创建调用次数用于模拟首次 committed 写失败后的同 operation 重试。 */
   let createAttempts = 0
+  /** Canvas Agent 专用 IPC 调用记录。 */
+  const agentCalls: Array<{ type: string; value: unknown }> = []
+  /** 权威 Canvas 会话元数据。 */
+  const agentSession: AgentSessionMeta = {
+    id: '22222222-2222-4222-8222-222222222222', title: '首页 Agent',
+    channelId: 'channel-1', modelId: 'model-1', workspaceId: 'project-1',
+    sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
+    createdAt: 1, updatedAt: 1,
+  }
   const registration = registerCanvasDocumentIpcHandlers({
     ipc: {
       handle: (channel, handler) => { handlers.set(channel, handler) },
@@ -188,15 +197,78 @@ function createContext(options: {
         }
       },
     },
+    agent: {
+      getSession: (sessionId) => sessionId === agentSession.id ? agentSession : undefined,
+      getMessages: (sessionId) => {
+        agentCalls.push({ type: 'messages', value: sessionId })
+        return [{ type: 'user', message: { content: [{ type: 'text', text: '已有消息' }] } }] as SDKMessage[]
+      },
+      reserveStart: (sessionId) => {
+        agentCalls.push({ type: 'reserve', value: sessionId })
+        return () => { agentCalls.push({ type: 'release', value: sessionId }) }
+      },
+      run: async (input, sender, extensions) => {
+        agentCalls.push({ type: 'run', value: { input, senderId: sender.id, extensions } })
+      },
+      stop: (sessionId) => { agentCalls.push({ type: 'stop', value: sessionId }) },
+    },
     getProjectReadOnlyReason: (projectId) => {
       calls.push(`readonly:${projectId}`)
       return options.readOnlyReason
     },
   })
-  return { handlers, removed, sender, calls, storeInputs, broadcastLeaseStates, registration }
+  return { handlers, removed, sender, calls, storeInputs, agentCalls, broadcastLeaseStates, registration }
 }
 
 describe('原生 Canvas 文档 IPC', () => {
+  test('Given 权威 Agent 节点 When GET/SEND/STOP Then 每次先对账并只使用节点引用 session', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-1', kind: 'agent', title: '首页 Agent', position: { x: 0, y: 0 },
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+    }]
+    const context = createContext({ loadResult: { document, writable: true } })
+    const target = { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1' }
+
+    const loaded = await invoke(context.handlers, CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES, context.sender, target)
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, context.sender, {
+      ...target, message: '请分析当前项目', userMessageUuid: 'message-1', startedAt: 10,
+    })
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.STOP_AGENT, context.sender, target)
+
+    expect(loaded).toEqual({
+      sessionId: '22222222-2222-4222-8222-222222222222',
+      messages: [{ type: 'user', message: { content: [{ type: 'text', text: '已有消息' }] } }],
+      owner: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', title: '首页 Agent' },
+    })
+    expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(3)
+    expect(context.agentCalls).toEqual([
+      { type: 'messages', value: '22222222-2222-4222-8222-222222222222' },
+      { type: 'reserve', value: '22222222-2222-4222-8222-222222222222' },
+      { type: 'run', value: {
+        input: {
+          sessionId: '22222222-2222-4222-8222-222222222222',
+          userMessage: '请分析当前项目', rawUserMessage: '请分析当前项目',
+          userMessageUuid: 'message-1', startedAt: 10,
+          channelId: 'channel-1', modelId: 'model-1', workspaceId: 'project-1', triggeredBy: 'user',
+        },
+        senderId: 1,
+        extensions: { allowedToolNames: ['Read', 'Glob', 'Grep'] },
+      } },
+      { type: 'release', value: '22222222-2222-4222-8222-222222222222' },
+      { type: 'stop', value: '22222222-2222-4222-8222-222222222222' },
+    ])
+  })
+
+  test('Given Renderer 伪造 sessionId 或未知字段 When 调用 Canvas Agent IPC Then 在对账前拒绝', async () => {
+    const context = createContext()
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.STOP_AGENT, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', sessionId: 'forged',
+    })).rejects.toThrow('Canvas Agent 参数无效')
+    expect(context.calls).toEqual([])
+    expect(context.agentCalls).toEqual([])
+  })
+
   test('Given 未授权 sender When 提交带 getter 的请求 Then 在解析和 Store 前拒绝', async () => {
     /** 未授权窗口不能触发 payload getter。 */
     const unauthorized = createSender(9)
@@ -666,12 +738,15 @@ describe('原生 Canvas 文档 IPC', () => {
     errorSpy.mockRestore()
   })
 
-  test('Given 已注册处理器 When 重复 dispose Then 仅移除三个固定 invoke 通道一次', () => {
+  test('Given 已注册处理器 When 重复 dispose Then 仅移除六个固定 invoke 通道一次', () => {
     const context = createContext()
     expect(context.registration.channels).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
+      CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
+      CANVAS_IPC_CHANNELS.STOP_AGENT,
     ])
     context.removed.length = 0
 
@@ -682,6 +757,9 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
+      CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
+      CANVAS_IPC_CHANNELS.STOP_AGENT,
     ])
   })
 
@@ -728,6 +806,13 @@ describe('原生 Canvas 文档 IPC', () => {
           },
         }),
       },
+      agent: {
+        getSession: () => undefined,
+        getMessages: () => [],
+        reserveStart: () => () => undefined,
+        run: async () => undefined,
+        stop: () => undefined,
+      },
       getProjectReadOnlyReason: () => undefined,
     })
     /** 被后续注册替代的旧 generation。 */
@@ -749,9 +834,12 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
+      CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
+      CANVAS_IPC_CHANNELS.STOP_AGENT,
     ])
 
     registrationA.dispose()
-    expect(removed).toHaveLength(3)
+    expect(removed).toHaveLength(6)
   })
 })

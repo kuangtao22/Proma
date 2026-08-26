@@ -242,6 +242,7 @@ export function setVisibleAgentSession(webContents: WebContents, sessionId: stri
 export async function runAgent(
   input: AgentSendInput,
   webContents: WebContents,
+  extensions: AgentRunExtensions = {},
 ): Promise<void> {
   // deferred queue runs carry their queue id as an internal extension.
   const queueMessageId = (input as Partial<AgentDeferredQueueMessageInput>).queueMessageId
@@ -341,7 +342,7 @@ export async function runAgent(
           })
         }
       },
-    })
+    }, extensions)
   } catch (err) {
     console.error('[Agent 服务] runAgent 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'

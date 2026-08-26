@@ -1758,6 +1758,13 @@ export function registerIpcHandlers(): void {
     guard: workspaceOperationGuard,
     store: canvasDocumentStore,
     creation: canvasAgentNodeCreation,
+    agent: {
+      getSession: getAgentSessionMeta,
+      getMessages: getAgentSessionSDKMessages,
+      reserveStart: reserveAgentSessionStart,
+      run: runAgent,
+      stop: stopAgent,
+    },
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
   })
   registerDesignIpcHandlers({

@@ -26,6 +26,10 @@ import type { DesignAdapter } from '@/lib/design-adapter'
 import { NativeCanvasGraph } from './NativeCanvasGraph'
 import type { NativeCanvasFlowRenderer } from './NativeCanvasGraph'
 import {
+  CanvasAgentConversation,
+  type CanvasAgentConversationAdapter,
+} from './CanvasAgentConversation'
+import {
   canReplayNativeCanvasPositionMutations,
   coalesceNativeCanvasMutationsForSave,
   replayNativeCanvasPositionMutations,
@@ -49,6 +53,10 @@ export interface NativeCanvasAdapter {
   onCanvasChanged: DesignAdapter['onCanvasChanged']
   /** 旧测试替身可省略，真实 Design adapter 始终提供。 */
   createCanvasAgentNode?: DesignAdapter['createCanvasAgentNode']
+  /** Canvas Agent 对话三入口需同时存在才渲染面板。 */
+  getCanvasAgentMessages?: DesignAdapter['getCanvasAgentMessages']
+  sendCanvasAgentMessage?: DesignAdapter['sendCanvasAgentMessage']
+  stopCanvasAgent?: DesignAdapter['stopCanvasAgent']
 }
 
 /** 添加 Agent 按钮的局部异步状态。 */
@@ -632,6 +640,20 @@ export function NativeCanvasWorkspace({
     && state.authoritativeRecoveryState === 'idle'
     && !createState.loading,
   )
+  /** 对话节点始终从当前 Canvas 权威内存文档解析，不保存 Renderer sessionId。 */
+  const conversationNode = state.snapshot?.document.nodes.find((node) => (
+    node.id === state.conversationNodeId && node.kind === 'agent'
+  ))
+  /** 三个 API 缺一即 fail closed，不展示无法完整控制的对话面板。 */
+  const conversationAdapter: CanvasAgentConversationAdapter | null = adapter.getCanvasAgentMessages
+    && adapter.sendCanvasAgentMessage
+    && adapter.stopCanvasAgent
+    ? {
+        getCanvasAgentMessages: adapter.getCanvasAgentMessages,
+        sendCanvasAgentMessage: adapter.sendCanvasAgentMessage,
+        stopCanvasAgent: adapter.stopCanvasAgent,
+      }
+    : null
 
   return (
     <section
@@ -697,6 +719,17 @@ export function NativeCanvasWorkspace({
               })}
               flowRenderer={flowRenderer}
             />
+            {conversationNode && conversationAdapter ? (
+              <CanvasAgentConversation
+                target={{ ...target, nodeId: conversationNode.id }}
+                title={conversationNode.title}
+                adapter={conversationAdapter}
+                onClose={() => updateNativeCanvasState({
+                  key: stateKey,
+                  update: { conversationNodeId: null },
+                })}
+              />
+            ) : null}
             {state.saveState === 'conflict' ? (
               <div className="absolute inset-x-3 top-3 flex items-center justify-between gap-3 rounded-[8px] border border-destructive/30 bg-background/95 px-3 py-2 shadow-sm">
                 <p className="truncate text-xs text-destructive">{state.error}</p>

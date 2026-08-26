@@ -6,8 +6,10 @@ import type {
   CanvasSessionMeta,
   CanvasWorkspaceSnapshot,
   CanvasAgentNodeCreationResult,
+  CanvasAgentMessagesResult,
   CreateCanvasSessionInput,
   CreateCanvasAgentNodeInput,
+  GetCanvasAgentMessagesInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
   DeleteDesignContextInput,
@@ -34,6 +36,8 @@ import type {
   RegisterDesignContextAssetInput,
   SaveDesignMutationsInput,
   SaveCanvasMutationsInput,
+  SendCanvasAgentMessageInput,
+  StopCanvasAgentInput,
   SaveImageGenerationModelProfilesInput,
   ListDesignContextInput,
   UpsertDesignContextDocumentInput,
@@ -51,6 +55,12 @@ export interface DesignPreloadApi {
   saveCanvasMutations: (input: SaveCanvasMutationsInput) => Promise<CanvasDocument>
   /** 在目标 Canvas 内幂等创建内部 Agent 节点。 */
   createCanvasAgentNode: (input: CreateCanvasAgentNodeInput) => Promise<CanvasAgentNodeCreationResult>
+  /** 仅在用户打开节点对话时读取该会话 JSONL。 */
+  getCanvasAgentMessages: (input: GetCanvasAgentMessagesInput) => Promise<CanvasAgentMessagesResult>
+  /** 通过 Canvas 唯一入口发送纯文本消息。 */
+  sendCanvasAgentMessage: (input: SendCanvasAgentMessageInput) => Promise<void>
+  /** 通过 Canvas 唯一入口停止节点运行。 */
+  stopCanvasAgent: (input: StopCanvasAgentInput) => Promise<void>
   /** 订阅所有原生 Canvas 变化，双身份过滤由 Renderer adapter 执行。 */
   onCanvasChanged: (listener: (event: CanvasChangeEvent) => void) => () => void
   listCanvasSessions: (input: ListCanvasSessionsInput) => Promise<CanvasSessionMeta[]>
@@ -110,6 +120,18 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
       input,
     ) as Promise<CanvasAgentNodeCreationResult>,
+    getCanvasAgentMessages: (input) => ipc.invoke(
+      CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
+      input,
+    ) as Promise<CanvasAgentMessagesResult>,
+    sendCanvasAgentMessage: (input) => ipc.invoke(
+      CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
+      input,
+    ) as Promise<void>,
+    stopCanvasAgent: (input) => ipc.invoke(
+      CANVAS_IPC_CHANNELS.STOP_AGENT,
+      input,
+    ) as Promise<void>,
     onCanvasChanged: (listener) => {
       /** Electron event 对 Renderer 隐藏，只传原生 Canvas 业务变化。 */
       const handler = (_event: IpcRendererEvent, value: unknown): void => (

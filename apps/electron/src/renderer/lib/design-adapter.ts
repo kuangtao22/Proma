@@ -4,6 +4,7 @@ import type {
   CanvasSessionChangeEvent,
   CreateCanvasSessionInput,
   CreateCanvasAgentNodeInput,
+  GetCanvasAgentMessagesInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
   DeleteDesignContextInput,
@@ -23,6 +24,8 @@ import type {
   ListCanvasSessionsInput,
   LoadCanvasInput,
   SaveCanvasMutationsInput,
+  SendCanvasAgentMessageInput,
+  StopCanvasAgentInput,
   UpsertDesignContextDocumentInput,
   UpdateCanvasSessionInput,
   UpdateDesignContextEntryInput,
@@ -41,6 +44,12 @@ export interface DesignAdapter {
   saveCanvas: (input: SaveCanvasMutationsInput) => ReturnType<DesignPreloadApi['saveCanvasMutations']>
   /** 在目标 Canvas 内创建 Agent 节点并等待主进程 committed。 */
   createCanvasAgentNode: (input: CreateCanvasAgentNodeInput) => ReturnType<DesignPreloadApi['createCanvasAgentNode']>
+  /** 按需加载节点引用会话的持久化消息。 */
+  getCanvasAgentMessages: (input: GetCanvasAgentMessagesInput) => ReturnType<DesignPreloadApi['getCanvasAgentMessages']>
+  /** 发送 Canvas Agent 纯文本消息。 */
+  sendCanvasAgentMessage: (input: SendCanvasAgentMessageInput) => ReturnType<DesignPreloadApi['sendCanvasAgentMessage']>
+  /** 停止 Canvas Agent 当前运行。 */
+  stopCanvasAgent: (input: StopCanvasAgentInput) => ReturnType<DesignPreloadApi['stopCanvasAgent']>
   /** 只向监听器传递项目与 Canvas 身份均匹配的事件。 */
   onCanvasChanged: (
     target: CanvasTarget,
@@ -94,6 +103,9 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
     loadCanvas: (input) => requireMethod(api, 'loadCanvasWorkspace')(input),
     saveCanvas: (input) => requireMethod(api, 'saveCanvasMutations')(input),
     createCanvasAgentNode: (input) => requireMethod(api, 'createCanvasAgentNode')(input),
+    getCanvasAgentMessages: (input) => requireMethod(api, 'getCanvasAgentMessages')(input),
+    sendCanvasAgentMessage: (input) => requireMethod(api, 'sendCanvasAgentMessage')(input),
+    stopCanvasAgent: (input) => requireMethod(api, 'stopCanvasAgent')(input),
     onCanvasChanged: (target, listener) => requireMethod(api, 'onCanvasChanged')((event) => {
       /** adapter 只隔离双重身份，revision 与 recovery 策略留给工作区 controller。 */
       if (event.projectId === target.projectId && event.canvasId === target.canvasId) listener(event)

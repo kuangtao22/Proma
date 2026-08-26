@@ -34,6 +34,9 @@ describe('Design renderer adapter', () => {
         received.push(input)
         return { document: snapshot.document, session: { id: 'session-1' } as never }
       },
+      getCanvasAgentMessages: async (input) => { received.push(input); return { sessionId: 'session-1', owner: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', title: 'Agent' }, messages: [] } },
+      sendCanvasAgentMessage: async (input) => { received.push(input) },
+      stopCanvasAgent: async (input) => { received.push(input) },
     }
     const adapter = createDesignAdapter(api)
     const loadInput = { projectId: 'project-1', canvasId: 'canvas-1' }
@@ -43,11 +46,16 @@ describe('Design renderer adapter', () => {
       operationId: '11111111-1111-4111-8111-111111111111',
       nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
     }
+    const agentTarget = { ...loadInput, nodeId: 'node-1' }
+    const sendInput = { ...agentTarget, message: '继续', userMessageUuid: 'message-1', startedAt: 10 }
 
     expect(await adapter.loadCanvas(loadInput)).toBe(snapshot)
     expect(await adapter.saveCanvas(saveInput)).toBe(snapshot.document)
     expect((await adapter.createCanvasAgentNode(createInput)).document).toBe(snapshot.document)
-    expect(received).toEqual([loadInput, saveInput, createInput])
+    expect((await adapter.getCanvasAgentMessages(agentTarget)).sessionId).toBe('session-1')
+    await adapter.sendCanvasAgentMessage(sendInput)
+    await adapter.stopCanvasAgent(agentTarget)
+    expect(received).toEqual([loadInput, saveInput, createInput, agentTarget, sendInput, agentTarget])
     expect(received[0]).toBe(loadInput)
     expect(received[1]).toBe(saveInput)
     expect(received[2]).toBe(createInput)

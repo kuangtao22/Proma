@@ -74,6 +74,7 @@
 - Electron 主进程输出为 CJS 且把 Pi SDK 标记为 external；`@earendil-works/pi-coding-agent` 仅提供 ESM import，因此主进程模块禁止顶层值导入该包。只需要类型时使用 `import type`，真实运行能力沿用动态 `import()`，纯 identity helper 应留在本地并用 CJS bundle 回归测试锁定不产生同步 `require()`。
 - Common Bridge 与飞书 Bridge 的 Agent terminal 回调必须以启动时捕获的 `sessionId + workspaceId` 复核当前绑定、用户可见性和项目一致性；身份漂移只允许清理/关闭，禁止向外部聊天发送内部错误正文。飞书失效清理由统一幂等边界先摘除 binding/反向索引和全部运行态，再异步关闭 CardStream，关闭失败不得恢复引用。
 - Bun 非 isolate 组合测试中的 `mock.module` 会跨文件覆盖；共享核心模块的测试替身必须提供组合消费者所需的完整导出合同，并复用同一可重置状态，禁止各测试文件注册互不兼容的局部 mock。
+- Canvas Agent 对话只允许通过专用 GET/SEND/STOP IPC 访问：每次调用先对账 pending intent，再从权威 Canvas 文档解析 `node -> session` 并复核会话三字段独占归属；运行复用 Pi Agent runtime，但单次强制 `Read`、`Glob`、`Grep` 只读工具白名单。持久化 JSONL 仅在打开对话时读取，关闭或切换 Canvas 不停止运行；全局事件按最小 owner 路由，完整归属只进入 Canvas live/error/完成导航，半归属、混合归属和损坏归属 fail closed，禁止进入普通会话、未读、状态岛或 Agent tab。
 
 ## 会话记录
 

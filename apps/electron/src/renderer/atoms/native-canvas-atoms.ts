@@ -1,5 +1,6 @@
-import type { CanvasMutation, CanvasWorkspaceSnapshot } from '@proma/shared'
+import type { CanvasMutation, CanvasWorkspaceSnapshot, SDKMessage } from '@proma/shared'
 import { atom } from 'jotai'
+import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
 
 /** 原生 Canvas 单工作区的加载阶段。 */
 export type NativeCanvasPhase = 'idle' | 'loading' | 'ready' | 'error'
@@ -50,6 +51,12 @@ export function createNativeCanvasKey(projectId: string, canvasId: string): stri
 
 /** 所有已挂载原生 Canvas 的隔离状态。 */
 export const nativeCanvasStatesAtom = atom<Map<string, NativeCanvasState>>(new Map())
+
+/** 全局流事件按 sessionId 保存的最小 Canvas owner，切换 Canvas 或关闭面板不会清理。 */
+export const canvasAgentOwnersAtom = atom<Map<string, CanvasAgentOwner>>(new Map())
+
+/** 仅在打开对话后填充的权威 JSONL 消息缓存，未打开节点不会触发读取。 */
+export const canvasAgentPersistedMessagesAtom = atom<Map<string, SDKMessage[]>>(new Map())
 
 /** 单个原生 Canvas 状态更新输入。 */
 export interface UpdateNativeCanvasStateInput {

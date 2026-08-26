@@ -7,7 +7,7 @@ export interface AgentCompletionPresenceInput {
   currentAgentSessionId: string | null
   sessionId: string
   /** 委派子会话由父会话汇总，不计入用户级未读完成。 */
-  session?: Pick<AgentSessionMeta, 'sourceDelegationId'>
+  session?: Pick<AgentSessionMeta, 'sourceDelegationId' | 'sourceCanvasProjectId'>
   /** 完成发生时应用窗口是否处于前台。窗口失焦时即使是当前 Tab 也不算"正在查看"。 */
   documentHasFocus: boolean
 }
@@ -18,7 +18,7 @@ export interface AgentCompletionMarkers {
 
 export interface AgentCompletionNotificationInput {
   completion: AgentStreamCompletePayload
-  session?: Pick<AgentSessionMeta, 'sourceDelegationId'>
+  session?: Pick<AgentSessionMeta, 'sourceDelegationId' | 'sourceCanvasProjectId'>
 }
 
 export interface NotifyAgentCompletionInput extends AgentCompletionNotificationInput {
@@ -31,7 +31,9 @@ export function shouldNotifyAgentCompletion({
   completion,
   session,
 }: AgentCompletionNotificationInput): boolean {
-  return completion.triggeredBy !== 'delegation' && !session?.sourceDelegationId
+  return completion.triggeredBy !== 'delegation'
+    && !session?.sourceDelegationId
+    && !session?.sourceCanvasProjectId
 }
 
 /** 仅在真正成功且无需等待后台任务时调用完成通知 callback */
@@ -76,6 +78,8 @@ export function isAgentSessionActiveForCompletion({
 export function getAgentCompletionMarkers(input: AgentCompletionPresenceInput): AgentCompletionMarkers {
   const isActiveSession = isAgentSessionActiveForCompletion(input)
   return {
-    markUnviewedCompleted: !input.session?.sourceDelegationId && !isActiveSession,
+    markUnviewedCompleted: !input.session?.sourceDelegationId
+      && !input.session?.sourceCanvasProjectId
+      && !isActiveSession,
   }
 }

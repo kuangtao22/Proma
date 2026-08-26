@@ -1,17 +1,29 @@
 import { CANVAS_IPC_CHANNELS } from '@proma/shared'
 import type {
   CanvasAgentNodeCreationResult,
+  CanvasAgentMessagesResult,
   CanvasChangeEvent,
   CanvasMutation,
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
+  GetCanvasAgentMessagesInput,
   LoadCanvasInput,
+  SendCanvasAgentMessageInput,
   SaveCanvasMutationsInput,
+  StopCanvasAgentInput,
+  AgentSendInput,
+  AgentSessionMeta,
+  SDKMessage,
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
+import type { AgentRunExtensions } from '../agent-run-extensions'
+import {
+  CANVAS_AGENT_ALLOWED_TOOL_NAMES,
+  requireCanvasAgentRunOwner,
+} from './canvas-agent-run-policy'
 import { assertCreateCanvasAgentNodeInput } from './canvas-agent-node-creation'
 import { isSafeDesignStableId } from './design-paths'
 
@@ -32,7 +44,58 @@ export interface CanvasDocumentIpcOptions {
   store: Pick<CanvasDocumentStore, 'load' | 'mutate'>
   /** 已持有 lease 时执行目标 Canvas 对账或联合创建事务。 */
   creation: Pick<CanvasAgentNodeCreationService, 'reconcile' | 'createReconciled'>
+  /** Canvas 专用 Agent 能力；运行仍复用全局 Pi runtime。 */
+  agent: {
+    getSession: (sessionId: string) => AgentSessionMeta | undefined
+    getMessages: (sessionId: string) => SDKMessage[]
+    reserveStart: (sessionId: string) => () => void
+    run: (input: AgentSendInput, sender: WebContents, extensions: AgentRunExtensions) => Promise<void>
+    stop: (sessionId: string) => void
+  }
   getProjectReadOnlyReason: (projectId: string) => string | undefined
+}
+
+/** Canvas Agent target 的 exact-key 解析结果。 */
+function parseAgentTarget(value: unknown): GetCanvasAgentMessagesInput {
+  if (!isRecord(value) || !hasExactDataKeys(value, ['projectId', 'canvasId', 'nodeId'])) {
+    throw new Error('Canvas Agent 参数无效')
+  }
+  if (!isSafeDesignStableId(value.projectId)
+    || !isSafeDesignStableId(value.canvasId)
+    || !isSafeDesignStableId(value.nodeId)) {
+    throw new Error('Canvas Agent 参数无效')
+  }
+  return { projectId: value.projectId, canvasId: value.canvasId, nodeId: value.nodeId }
+}
+
+/** Canvas Agent 发送输入只接受有限纯文本与 Renderer 生成的本轮身份。 */
+function parseSendAgentInput(value: unknown): SendCanvasAgentMessageInput {
+  if (!isRecord(value) || !hasExactDataKeys(
+    value,
+    ['projectId', 'canvasId', 'nodeId', 'message', 'userMessageUuid', 'startedAt'],
+  )) throw new Error('Canvas Agent 参数无效')
+  const target = parseAgentTarget({
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+  })
+  if (typeof value.message !== 'string'
+    || value.message.trim().length === 0
+    || value.message.length > 100_000
+    || typeof value.userMessageUuid !== 'string'
+    || value.userMessageUuid.length === 0
+    || value.userMessageUuid.length > 120
+    || typeof value.startedAt !== 'number'
+    || !Number.isSafeInteger(value.startedAt)
+    || value.startedAt < 0) {
+    throw new Error('Canvas Agent 参数无效')
+  }
+  return {
+    ...target,
+    message: value.message,
+    userMessageUuid: value.userMessageUuid,
+    startedAt: value.startedAt,
+  }
 }
 
 /** 注册结果用于退出和测试清理。 */
@@ -237,6 +300,9 @@ export function registerCanvasDocumentIpcHandlers(
     CANVAS_IPC_CHANNELS.LOAD,
     CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
     CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+    CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
+    CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
+    CANVAS_IPC_CHANNELS.STOP_AGENT,
   ]
   /** 当前调用独有的注册代次标识。 */
   const registrationToken = Symbol('canvas-document-ipc-registration')
@@ -267,6 +333,65 @@ export function registerCanvasDocumentIpcHandlers(
       release()
     }
   }
+
+  /** 在 Canvas 串行队列和 workspace lease 内完成 pending 对账与双向归属确认。 */
+  const resolveAgentOwner = async (input: GetCanvasAgentMessagesInput) => {
+    requireWritableProject(input.projectId, options)
+    return runCanvasExclusive(input.projectId, input.canvasId, async () => {
+      const reconciliation = await options.guard.runWorkspaceWrite(
+        input.projectId,
+        () => options.creation.reconcile({ projectId: input.projectId, canvasId: input.canvasId }),
+      )
+      publishReconciliation(options, input, reconciliation)
+      if (reconciliation.error) throw reconciliation.error
+      return requireCanvasAgentRunOwner({
+        target: input,
+        nodeId: input.nodeId,
+        document: reconciliation.snapshot.document,
+        getSession: options.agent.getSession,
+      })
+    })
+  }
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES, async (event, value): Promise<CanvasAgentMessagesResult> => {
+    assertAuthorizedSender(event, options)
+    const input = parseAgentTarget(value)
+    const owner = await resolveAgentOwner(input)
+    return {
+      sessionId: owner.session.id,
+      owner: { ...input, title: owner.node.title },
+      messages: options.agent.getMessages(owner.session.id),
+    }
+  })
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, async (event, value): Promise<void> => {
+    assertAuthorizedSender(event, options)
+    const input = parseSendAgentInput(value)
+    const owner = await resolveAgentOwner(input)
+    const releaseStart = options.agent.reserveStart(owner.session.id)
+    try {
+      await options.agent.run({
+        sessionId: owner.session.id,
+        userMessage: input.message,
+        rawUserMessage: input.message,
+        userMessageUuid: input.userMessageUuid,
+        startedAt: input.startedAt,
+        channelId: owner.session.channelId ?? '',
+        ...(owner.session.modelId ? { modelId: owner.session.modelId } : {}),
+        workspaceId: input.projectId,
+        triggeredBy: 'user',
+      }, event.sender, { allowedToolNames: CANVAS_AGENT_ALLOWED_TOOL_NAMES })
+    } finally {
+      releaseStart()
+    }
+  })
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.STOP_AGENT, async (event, value): Promise<void> => {
+    assertAuthorizedSender(event, options)
+    const input = parseAgentTarget(value) as StopCanvasAgentInput
+    const owner = await resolveAgentOwner(input)
+    options.agent.stop(owner.session.id)
+  })
 
   options.ipc.handle(CANVAS_IPC_CHANNELS.LOAD, async (event, value): Promise<CanvasWorkspaceSnapshot> => {
     assertAuthorizedSender(event, options)

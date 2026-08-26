@@ -4,6 +4,16 @@ import { join } from 'node:path'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 
 describe('Agent service 迁移准入', () => {
+  test('Given Canvas 专用运行 When 检查 service 入口 Then 复用 renderer runtime 并接受单次工具扩展', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    const start = source.indexOf('export async function runAgent(')
+    const end = source.indexOf('\n/**', start + 1)
+    const body = source.slice(start, end)
+
+    expect(body).toContain('extensions: AgentRunExtensions = {}')
+    expect(body).toContain('}, extensions)')
+  })
+
   test('Given 数据根迁移预检 When 检查 service 导出 Then 使用 generation-owned 写查询并提供 workspace 维度能力', () => {
     /** 读取 service 源码约束迁移查询不退化为 UI 活跃状态。 */
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')

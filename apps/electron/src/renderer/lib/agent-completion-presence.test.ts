@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { getAgentCompletionMarkers, isAgentSessionActiveForCompletion } from './agent-completion-presence'
+import { getAgentCompletionMarkers, isAgentSessionActiveForCompletion, shouldNotifyAgentCompletion } from './agent-completion-presence'
 import type { TabItem } from '@/atoms/tab-atoms'
 
 describe('Agent 完成归属判断', () => {
@@ -68,5 +68,25 @@ describe('Agent 完成归属判断', () => {
     expect(getAgentCompletionMarkers(input)).toEqual({
       markUnviewedCompleted: true,
     })
+  })
+
+  test('Given Canvas Agent 完成 When 计算普通提醒和未读 Then 不进入普通 Agent 表面', () => {
+    const session = {
+      sourceCanvasProjectId: 'project-1',
+      sourceCanvasId: 'canvas-1',
+      sourceCanvasNodeId: 'node-1',
+    }
+    expect(shouldNotifyAgentCompletion({
+      completion: { sessionId: 'session-1', stoppedByUser: false },
+      session,
+    })).toBe(false)
+    expect(getAgentCompletionMarkers({
+      tabs: [],
+      activeTabId: null,
+      currentAgentSessionId: null,
+      sessionId: 'session-1',
+      session,
+      documentHasFocus: false,
+    })).toEqual({ markUnviewedCompleted: false })
   })
 })
