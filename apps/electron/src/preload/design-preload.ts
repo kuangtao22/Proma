@@ -10,8 +10,12 @@ import type {
   CanvasAgentNodeCreationResult,
   CanvasAgentMessagesResult,
   CanvasAgentActiveRunSnapshot,
+  CanvasNodeLifecycleResult,
+  CanvasTrashEntry,
   CreateCanvasSessionInput,
   CreateCanvasAgentNodeInput,
+  CreateCanvasContentNodeInput,
+  DeleteCanvasNodeInput,
   GetCanvasAgentMessagesInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
@@ -35,6 +39,7 @@ import type {
   LoadCanvasInput,
   RebuildCanvasAgentNodeInput,
   RebuildCanvasAgentNodeResult,
+  RestoreCanvasNodeInput,
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
   RelinkDesignAssetInput,
@@ -61,6 +66,14 @@ export interface DesignPreloadApi {
   saveCanvasMutations: (input: SaveCanvasMutationsInput) => Promise<CanvasInvokeResult<CanvasDocument>>
   /** 在目标 Canvas 内幂等创建内部 Agent 节点。 */
   createCanvasAgentNode: (input: CreateCanvasAgentNodeInput) => Promise<CanvasInvokeResult<CanvasAgentNodeCreationResult>>
+  /** 幂等创建一个受管内容节点。 */
+  createCanvasContentNode: (input: CreateCanvasContentNodeInput) => Promise<CanvasInvokeResult<CanvasNodeLifecycleResult>>
+  /** 通过通用生命周期入口删除任意节点。 */
+  deleteCanvasNode: (input: DeleteCanvasNodeInput) => Promise<CanvasInvokeResult<CanvasNodeLifecycleResult>>
+  /** 列出目标 Canvas 的可恢复内容节点。 */
+  listCanvasTrash: (input: LoadCanvasInput) => Promise<CanvasInvokeResult<CanvasTrashEntry[]>>
+  /** 从回收区恢复一个内容节点。 */
+  restoreCanvasNode: (input: RestoreCanvasNodeInput) => Promise<CanvasInvokeResult<CanvasNodeLifecycleResult>>
   /** 为坏 Agent 节点重建空白内部会话。 */
   rebuildCanvasAgentNode: (input: RebuildCanvasAgentNodeInput) => Promise<CanvasInvokeResult<RebuildCanvasAgentNodeResult>>
   /** 仅在用户打开节点对话时读取该会话 JSONL。 */
@@ -120,6 +133,9 @@ const CANVAS_PRELOAD_FALLBACKS = {
   load: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
   save: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
   create: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
+  delete: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' },
+  listTrash: { code: 'CANVAS_CONTENT_INVALID', message: '回收区暂时无法加载。' },
+  restore: { code: 'CANVAS_RESTORE_FAILED', message: '节点恢复失败，请重试。' },
   rebuild: { code: 'AGENT_SESSION_REBUILD_FAILED', message: '重建失败，请重试。' },
   messages: { code: 'CANVAS_AGENT_MESSAGES_FAILED', message: '会话消息暂时无法加载。' },
   send: { code: 'CANVAS_AGENT_SEND_FAILED', message: '消息发送失败，请重试。' },
@@ -167,6 +183,30 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
       input,
       CANVAS_PRELOAD_FALLBACKS.create,
+    ),
+    createCanvasContentNode: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
+      input,
+      CANVAS_PRELOAD_FALLBACKS.create,
+    ),
+    deleteCanvasNode: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.DELETE_NODE,
+      input,
+      CANVAS_PRELOAD_FALLBACKS.delete,
+    ),
+    listCanvasTrash: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.LIST_TRASH,
+      input,
+      CANVAS_PRELOAD_FALLBACKS.listTrash,
+    ),
+    restoreCanvasNode: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.RESTORE_NODE,
+      input,
+      CANVAS_PRELOAD_FALLBACKS.restore,
     ),
     rebuildCanvasAgentNode: (input) => invokeCanvasSafely(
       ipc,

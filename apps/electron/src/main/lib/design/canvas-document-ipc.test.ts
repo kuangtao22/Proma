@@ -6,6 +6,8 @@ import type {
   CanvasDocument,
   CanvasInvokeResult,
   CanvasMutation,
+  CanvasNodeLifecycleResult,
+  CanvasTrashEntry,
   CanvasWorkspaceSnapshot,
   RebuildCanvasAgentNodeResult,
   SDKMessage,
@@ -89,6 +91,9 @@ function createContext(options: {
     }>
     internalInvalidRuns: Array<{ sessionId: string; startedAt: number; valid: false }>
   }
+  contentOperationError?: Error
+  contentOperationPublication?: CanvasDocument
+  contentReconciliationPublication?: CanvasDocument
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -242,6 +247,38 @@ function createContext(options: {
         }
       },
     },
+    contentLifecycle: {
+      load: async () => {
+        calls.push('content:load')
+        return { snapshot: options.loadResult ?? { document: createDocument(4), writable: true as const, nodeIssues: [] }, documentChanged: false }
+      },
+      createReconciled: async (input) => {
+        calls.push('content:create')
+        storeInputs.push(input)
+        return createContentOutcome(input.nodeId)
+      },
+      deleteReconciled: async (input) => {
+        calls.push('content:delete')
+        storeInputs.push(input)
+        return createContentOutcome()
+      },
+      listTrashReconciled: async (input) => {
+        calls.push('content:list-trash')
+        storeInputs.push(input)
+        return {
+          reconciliation: {
+            snapshot: options.loadResult ?? { document: createDocument(4), writable: true as const, nodeIssues: [] },
+            documentChanged: false,
+          },
+          operationOutcome: { ok: true as const, value: [] },
+        }
+      },
+      restoreReconciled: async (input) => {
+        calls.push('content:restore')
+        storeInputs.push(input)
+        return createContentOutcome('node-restored')
+      },
+    },
     agent: {
       listActiveRuns: () => options.activeRunSnapshot ?? { owners: [], internalInvalidRuns: [] },
       getSession: (sessionId) => sessionId === agentSession.id ? agentSession : undefined,
@@ -264,10 +301,148 @@ function createContext(options: {
       return options.readOnlyReason
     },
   })
+  /** 构造内容 lifecycle 的历史对账与当前操作分离结果。 */
+  function createContentOutcome(selectedNodeId?: string) {
+    const reconciliation = {
+      snapshot: options.loadResult ?? { document: createDocument(4), writable: true as const, nodeIssues: [] },
+      documentChanged: Boolean(options.contentReconciliationPublication),
+      ...(options.contentReconciliationPublication ? { publication: options.contentReconciliationPublication } : {}),
+    }
+    if (options.contentOperationError) {
+      return {
+        reconciliation,
+        operationOutcome: {
+          ok: false as const,
+          error: options.contentOperationError,
+          ...(options.contentOperationPublication ? { publication: options.contentOperationPublication } : {}),
+        },
+      }
+    }
+    const value: CanvasNodeLifecycleResult = {
+      snapshot: { document: createDocument(5), writable: true as const, nodeIssues: [] },
+      ...(selectedNodeId ? { selectedNodeId } : {}),
+    }
+    return { reconciliation, operationOutcome: { ok: true as const, value } }
+  }
   return { handlers, removed, sender, calls, storeInputs, agentCalls, broadcastLeaseStates, registration }
 }
 
 describe('原生 Canvas 文档 IPC', () => {
+  test('Given 四类内容生命周期命令 When IPC 调用 Then Agent 对账后调用内容服务并只返回公开业务字段', async () => {
+    const context = createContext()
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const createResult = await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, context.sender, {
+      ...target, operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-content', kind: 'document', contentId: 'content-1', title: '文档', position: { x: 1, y: 2 }, expectedRevision: 4,
+    }) as CanvasInvokeResult<CanvasNodeLifecycleResult>
+    const deleteResult = await invoke(context.handlers, CANVAS_IPC_CHANNELS.DELETE_NODE, context.sender, {
+      ...target, operationId: '22222222-2222-4222-8222-222222222222', nodeId: 'node-content', expectedRevision: 4,
+    }) as CanvasInvokeResult<CanvasNodeLifecycleResult>
+    const listResult = await invoke(context.handlers, CANVAS_IPC_CHANNELS.LIST_TRASH, context.sender, target) as CanvasInvokeResult<CanvasTrashEntry[]>
+    const restoreResult = await invoke(context.handlers, CANVAS_IPC_CHANNELS.RESTORE_NODE, context.sender, {
+      ...target, operationId: '33333333-3333-4333-8333-333333333333', trashId: 'trash-1', expectedRevision: 4, position: { x: 3, y: 4 },
+    }) as CanvasInvokeResult<CanvasNodeLifecycleResult>
+
+    expect(createResult).toMatchObject({ ok: true, value: { selectedNodeId: 'node-content' } })
+    expect(deleteResult).toMatchObject({ ok: true, value: { snapshot: { document: { revision: 5 } } } })
+    expect(listResult).toEqual({ ok: true, value: [] })
+    expect(restoreResult).toMatchObject({ ok: true, value: { selectedNodeId: 'node-restored' } })
+    expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(4)
+    expect(context.calls.filter((call) => call.startsWith('content:'))).toEqual([
+      'content:create', 'content:delete', 'content:list-trash', 'content:restore',
+    ])
+    expect(context.sender.sent).toEqual([
+      { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { ...target, revision: 5, cause: 'graph' } },
+      { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { ...target, revision: 5, cause: 'graph' } },
+      { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { ...target, revision: 5, cause: 'graph' } },
+    ])
+    expect(JSON.stringify([createResult, deleteResult, listResult, restoreResult])).not.toContain('path')
+  })
+
+  test('Given 内容命令含未知字段、sessionId、path 或 getter When IPC 调用 Then 拒绝且不进入 lifecycle', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const context = createContext()
+    const invalidValues: Array<{ channel: string; value: unknown }> = [
+      { channel: CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, value: { projectId: 'project-1', canvasId: 'canvas-1', operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1', kind: 'image', contentId: 'content-1', title: '图片', position: { x: 0, y: 0 }, expectedRevision: 0, path: '/tmp/x' } },
+      { channel: CANVAS_IPC_CHANNELS.DELETE_NODE, value: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', operationId: '22222222-2222-4222-8222-222222222222', expectedRevision: 0, sessionId: 'secret' } },
+      { channel: CANVAS_IPC_CHANNELS.LIST_TRASH, value: { projectId: 'project-1', canvasId: 'canvas-1', trashEntry: {} } },
+      { channel: CANVAS_IPC_CHANNELS.RESTORE_NODE, value: Object.defineProperty({ projectId: 'project-1', canvasId: 'canvas-1', operationId: '33333333-3333-4333-8333-333333333333', trashId: 'trash-1', expectedRevision: 0, position: { x: 0, y: 0 } }, 'path', { enumerable: true, get: () => '/tmp/x' }) },
+    ]
+
+    for (const item of invalidValues) {
+      const result = await invoke(context.handlers, item.channel, context.sender, item.value) as CanvasInvokeResult<unknown>
+      expect(result.ok).toBe(false)
+    }
+    expect(context.calls.some((call) => call.startsWith('content:'))).toBe(false)
+    errorSpy.mockRestore()
+  })
+
+  test('Given 历史内容 publication 后当前删除失败 When IPC 返回 Then 先广播历史再返回稳定删除错误', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const context = createContext({
+      contentReconciliationPublication: createDocument(5),
+      contentOperationError: new Error('/private/content/CANVAS_INTERNAL'),
+    })
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.DELETE_NODE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', operationId: '44444444-4444-4444-8444-444444444444', expectedRevision: 4,
+    }) as CanvasInvokeResult<unknown>
+
+    expect(context.sender.sent).toEqual([{ channel: CANVAS_IPC_CHANNELS.CHANGED, value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' } }])
+    expect(result).toEqual({ ok: false, error: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' } })
+    expect(context.broadcastLeaseStates).toEqual([false])
+    errorSpy.mockRestore()
+  })
+
+  test('Given SAVE remove-nodes 指向内容节点 When 保存 Then 拒绝旧入口且不调用 Store mutate', async () => {
+    const document = createDocument(4)
+    document.nodes = [{ id: 'node-content', kind: 'document', title: '文档', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 0 }]
+    const context = createContext({ loadResult: { document, writable: true, nodeIssues: [] } })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4,
+      mutations: [{ type: 'remove-nodes', nodeIds: ['node-content'] }],
+    }) as CanvasInvokeResult<unknown>
+
+    expect(result).toEqual({ ok: false, error: { code: 'CANVAS_CONTENT_INVALID', message: '请使用节点删除操作。' } })
+    expect(context.calls).not.toContain('store:mutate')
+  })
+
+  test('Given 内容节点 revision conflict 或 Agent busy When 删除 Then 映射稳定公开错误', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const conflict = createContext({ contentOperationError: new Error('CANVAS_REVISION_CONFLICT') })
+    const busy = createContext({
+      contentOperationError: Object.assign(new Error('内部运行身份'), { code: 'AGENT_SESSION_BUSY' }),
+    })
+    const input = { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', operationId: '55555555-5555-4555-8555-555555555555', expectedRevision: 4 }
+
+    expect(await invoke(conflict.handlers, CANVAS_IPC_CHANNELS.DELETE_NODE, conflict.sender, input)).toEqual({
+      ok: false, error: { code: 'CANVAS_REVISION_CONFLICT', message: '画布已更新，请重新加载后重试。' },
+    })
+    expect(await invoke(busy.handlers, CANVAS_IPC_CHANNELS.DELETE_NODE, busy.sender, input)).toEqual({
+      ok: false, error: { code: 'AGENT_SESSION_BUSY', message: '请先停止 Agent，再继续节点操作。' },
+    })
+    errorSpy.mockRestore()
+  })
+
+  test('Given 未授权窗口或只读项目 When 调用内容节点通道 Then 在 lifecycle 前安全拒绝', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const unauthorized = createContext({ authorized: [createSender(2)] })
+    const readOnly = createContext({ readOnlyReason: '项目只读' })
+    const createInput = { projectId: 'project-1', canvasId: 'canvas-1', operationId: '66666666-6666-4666-8666-666666666666', nodeId: 'node-1', kind: 'image', contentId: 'content-1', title: '图片', position: { x: 0, y: 0 }, expectedRevision: 4 }
+
+    expect((await invoke(unauthorized.handlers, CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, unauthorized.sender, createInput) as CanvasInvokeResult<unknown>).ok).toBe(false)
+    expect((await invoke(readOnly.handlers, CANVAS_IPC_CHANNELS.LIST_TRASH, readOnly.sender, { projectId: 'project-1', canvasId: 'canvas-1' }) as CanvasInvokeResult<unknown>).ok).toBe(false)
+    expect(unauthorized.calls.some((call) => call.startsWith('content:'))).toBe(false)
+    expect(readOnly.calls.some((call) => call.startsWith('content:'))).toBe(false)
+    errorSpy.mockRestore()
+  })
+
+  test('Given LOAD When 执行 Then 内容迁移完成后再执行 Agent 对账', async () => {
+    const context = createContext()
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, { projectId: 'project-1', canvasId: 'canvas-1' })
+    expect(context.calls).toEqual([
+      'readonly:project-1', 'guard:project-1', 'content:load', 'creation:reconcile',
+    ])
+  })
   test('Given 内部 LOAD 异常含路径和 UUID When IPC 返回 Then 只暴露公开文案', async () => {
     const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const context = createContext({
@@ -694,7 +869,7 @@ describe('原生 Canvas 文档 IPC', () => {
     await invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, saveInput)
 
     expect(context.calls).toEqual([
-      'readonly:project-1', 'guard:project-1', 'creation:reconcile',
+      'readonly:project-1', 'guard:project-1', 'content:load', 'creation:reconcile',
       'readonly:project-1', 'guard:project-1', 'creation:reconcile', 'store:mutate',
     ])
     expect(context.storeInputs[0]).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })
@@ -1155,12 +1330,16 @@ describe('原生 Canvas 文档 IPC', () => {
     errorSpy.mockRestore()
   })
 
-  test('Given 已注册处理器 When 重复 dispose Then 仅移除八个固定 invoke 通道一次', () => {
+  test('Given 已注册处理器 When 重复 dispose Then 仅移除十二个固定 invoke 通道一次', () => {
     const context = createContext()
     expect(context.registration.channels).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
+      CANVAS_IPC_CHANNELS.DELETE_NODE,
+      CANVAS_IPC_CHANNELS.LIST_TRASH,
+      CANVAS_IPC_CHANNELS.RESTORE_NODE,
       CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE,
       CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
@@ -1176,6 +1355,10 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
+      CANVAS_IPC_CHANNELS.DELETE_NODE,
+      CANVAS_IPC_CHANNELS.LIST_TRASH,
+      CANVAS_IPC_CHANNELS.RESTORE_NODE,
       CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE,
       CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
@@ -1236,6 +1419,16 @@ describe('原生 Canvas 文档 IPC', () => {
           documentChanged: false,
         }),
       },
+      contentLifecycle: {
+        load: async () => ({
+          snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] },
+          documentChanged: false,
+        }),
+        createReconciled: async () => ({ reconciliation: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] }, documentChanged: false }, operationOutcome: { ok: true as const, value: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] } } } }),
+        deleteReconciled: async () => ({ reconciliation: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] }, documentChanged: false }, operationOutcome: { ok: true as const, value: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] } } } }),
+        listTrashReconciled: async () => ({ reconciliation: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] }, documentChanged: false }, operationOutcome: { ok: true as const, value: [] } }),
+        restoreReconciled: async () => ({ reconciliation: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] }, documentChanged: false }, operationOutcome: { ok: true as const, value: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] } } } }),
+      },
       agent: {
         listActiveRuns: () => ({ owners: [], internalInvalidRuns: [] }),
         getSession: () => undefined,
@@ -1268,6 +1461,10 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+      CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
+      CANVAS_IPC_CHANNELS.DELETE_NODE,
+      CANVAS_IPC_CHANNELS.LIST_TRASH,
+      CANVAS_IPC_CHANNELS.RESTORE_NODE,
       CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE,
       CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
@@ -1276,6 +1473,6 @@ describe('原生 Canvas 文档 IPC', () => {
     ])
 
     registrationA.dispose()
-    expect(removed).toHaveLength(8)
+    expect(removed).toHaveLength(12)
   })
 })

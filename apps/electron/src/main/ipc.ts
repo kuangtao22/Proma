@@ -195,6 +195,8 @@ import { CanvasSessionStore } from './lib/design/canvas-session-store'
 import { registerCanvasDocumentIpcHandlers } from './lib/design/canvas-document-ipc'
 import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
+import { createCanvasNodeContentStore } from './lib/design/canvas-node-content-store'
+import { createCanvasContentNodeLifecycle } from './lib/design/canvas-content-node-lifecycle'
 import {
   runChannelMutationWithImageModelBroadcast,
   updateToolCredentialsWithImageModelBroadcast,
@@ -1608,6 +1610,16 @@ async function withOAuthDeviceCodeQr<T extends CodexOAuthDeviceCode | XaiOAuthDe
   }
 }
 
+/** 内容节点删除命中活动 Agent 时使用的稳定内部错误。 */
+class CanvasContentAgentBusyError extends Error {
+  readonly code = 'AGENT_SESSION_BUSY' as const
+
+  constructor() {
+    super('Canvas Agent 仍在运行')
+    this.name = 'CanvasContentAgentBusyError'
+  }
+}
+
 export function registerIpcHandlers(): void {
   console.log('[IPC] 正在注册 IPC 处理器...')
 
@@ -1626,6 +1638,21 @@ export function registerIpcHandlers(): void {
   const canvasSessionStore = new CanvasSessionStore({ pathResolver: designPathResolver })
   /** 原生 Canvas 文档复用同一会话索引作为项目与 Canvas 双身份授权事实。 */
   const canvasDocumentStore = createCanvasDocumentStore({ sessions: canvasSessionStore })
+  /** 非 Agent 内容目录与图文档共享唯一 Store 实例和目录 capability。 */
+  const canvasNodeContentStore = createCanvasNodeContentStore({ store: canvasDocumentStore })
+  /** 内容节点可恢复生命周期只在主进程注册期创建一次。 */
+  const canvasContentNodeLifecycle = createCanvasContentNodeLifecycle({
+    store: canvasDocumentStore,
+    contentStore: canvasNodeContentStore,
+    assertAgentNodeIdle: (nodeId, sessionId) => {
+      /** 节点或会话任一命中活动事实都必须拒绝删除。 */
+      const activeRuns = listActiveCanvasAgentRuns()
+      const busy = activeRuns.owners.some((owner) => (
+        owner.nodeId === nodeId || owner.sessionId === sessionId
+      )) || activeRuns.internalInvalidRuns.some((run) => run.sessionId === sessionId)
+      if (busy) throw new CanvasContentAgentBusyError()
+    },
+  })
   /** Canvas Agent 创建事务复用现有 Agent 索引与模型可用性事实。 */
   const canvasAgentNodeCreation = new CanvasAgentNodeCreationService({
     store: canvasDocumentStore,
@@ -1758,6 +1785,7 @@ export function registerIpcHandlers(): void {
     guard: workspaceOperationGuard,
     store: canvasDocumentStore,
     creation: canvasAgentNodeCreation,
+    contentLifecycle: canvasContentNodeLifecycle,
     agent: {
       listActiveRuns: listActiveCanvasAgentRuns,
       getSession: getAgentSessionMeta,

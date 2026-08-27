@@ -23,6 +23,8 @@ function createFixture(options: {
   let migrationCommits = 0
   /** 模拟 v1 CAS 成功后后续 LOAD 只返回 v2 capability 与空 seeds。 */
   let migrationPending = options.migratedSeeds !== undefined
+  /** intent 扫描次数用于锁定单次公开操作只执行一次内容对账。 */
+  let scanCount = 0
   const store = {
     loadWithMigrationCapability: () => ({
       snapshot: { document, writable: true as const, nodeIssues: [] }, migratedFrom: migrationPending ? 1 as const : undefined,
@@ -53,7 +55,7 @@ function createFixture(options: {
   /** 每次构造都模拟一次新的主进程生命周期服务实例。 */
   const createService = () => createCanvasContentNodeLifecycle({
     store, contentStore,
-    scanIntents: async () => [...intents.values()],
+    scanIntents: async () => { scanCount += 1; return [...intents.values()] },
     writeIntent: async (intent) => {
       const outcome = options.writeOutcome?.(intent) ?? { commitVisible: true, durabilityUncertain: false }
       if (outcome.commitVisible) intents.set(intent.operationId, structuredClone(intent))
@@ -64,7 +66,7 @@ function createFixture(options: {
     randomUUID: () => `aaaaaaaa-aaaa-4aaa-8aaa-${String(++uuidCounter).padStart(12, '0')}`,
   })
   const service = createService()
-  return { service, restartService: createService, intents, trash, contents, running, getDocument: () => document, setDocument: (next: CanvasDocument) => { document = next }, getMigrationCommits: () => migrationCommits }
+  return { service, restartService: createService, intents, trash, contents, running, getDocument: () => document, setDocument: (next: CanvasDocument) => { document = next }, getMigrationCommits: () => migrationCommits, getScanCount: () => scanCount }
 }
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
@@ -429,5 +431,50 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(result.snapshot.document.nodes).toHaveLength(0)
     expect(result.trashEntry).toBeUndefined()
     expect(fixture.intents.size).toBe(0)
+  })
+
+  test('Given 历史图发布后当前创建 revision 冲突 When createReconciled Then 分离发布与当前错误且只扫描一次', async () => {
+    let failCommitted = false
+    const fixture = createFixture({ writeOutcome: (intent) => {
+      if (failCommitted && intent.state === 'committed') {
+        failCommitted = false
+        return { commitVisible: false, durabilityUncertain: false, error: 'injected' }
+      }
+      return { commitVisible: true, durabilityUncertain: false }
+    } })
+    failCommitted = true
+    await expect(fixture.service.create({
+      ...target, operationId: '41414141-4141-4141-8141-414141414141', nodeId: 'node-41',
+      kind: 'document', contentId: 'content-41', title: '历史文档', position: { x: 0, y: 0 }, expectedRevision: 0,
+    })).rejects.toHaveProperty('document.revision', 1)
+    const restarted = fixture.restartService()
+    const before = fixture.getScanCount()
+
+    const result = await restarted.createReconciled({
+      ...target, operationId: '42424242-4242-4242-8242-424242424242', nodeId: 'node-42',
+      kind: 'image', contentId: 'content-42', title: '当前图片', position: { x: 10, y: 20 }, expectedRevision: 0,
+    })
+
+    expect(result.reconciliation.publication?.revision).toBe(1)
+    expect(result.operationOutcome.ok).toBe(false)
+    if (!result.operationOutcome.ok) expect(result.operationOutcome.error).toHaveProperty('message', 'CANVAS_REVISION_CONFLICT')
+    expect(fixture.getScanCount() - before).toBe(1)
+  })
+
+  test('Given 回收区存在条目 When listTrashReconciled Then 对账一次并返回公开条目', async () => {
+    const fixture = createFixture()
+    await fixture.service.create({
+      ...target, operationId: '43434343-4343-4343-8343-434343434343', nodeId: 'node-43',
+      kind: 'webview', contentId: 'content-43', title: '原型', position: { x: 0, y: 0 }, expectedRevision: 0,
+    })
+    await fixture.service.delete({
+      ...target, operationId: '44444444-4444-4444-8444-444444444444', nodeId: 'node-43', expectedRevision: 1,
+    })
+    const before = fixture.getScanCount()
+
+    const result = await fixture.service.listTrashReconciled(target)
+
+    expect(result.operationOutcome).toMatchObject({ ok: true, value: [{ nodeId: 'node-43', kind: 'webview' }] })
+    expect(fixture.getScanCount() - before).toBe(1)
   })
 })

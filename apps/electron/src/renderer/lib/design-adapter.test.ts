@@ -62,6 +62,10 @@ describe('Design renderer adapter', () => {
     const api: PartialDesignApi = {
       loadCanvasWorkspace: async (input) => { received.push(input); return { ok: true, value: snapshot } },
       saveCanvasMutations: async (input) => { received.push(input); return { ok: true, value: snapshot.document } },
+      createCanvasContentNode: async (input) => { received.push(input); return { ok: true, value: { snapshot, selectedNodeId: 'node-content' } } },
+      deleteCanvasNode: async (input) => { received.push(input); return { ok: true, value: { snapshot } } },
+      listCanvasTrash: async (input) => { received.push(input); return { ok: true, value: [] } },
+      restoreCanvasNode: async (input) => { received.push(input); return { ok: true, value: { snapshot, selectedNodeId: 'node-content' } } },
       createCanvasAgentNode: async (input) => {
         received.push(input)
         return {
@@ -104,6 +108,9 @@ describe('Design renderer adapter', () => {
       nodeId: 'node-1', title: '首页 Agent', position: { x: 10, y: 20 },
     }
     const agentTarget = { ...loadInput, nodeId: 'node-1' }
+    const contentCreateInput = { ...loadInput, operationId: '33333333-3333-4333-8333-333333333333', nodeId: 'node-content', kind: 'document' as const, contentId: 'content-1', title: '文档', position: { x: 0, y: 0 }, expectedRevision: 0 }
+    const deleteInput = { ...loadInput, operationId: '44444444-4444-4444-8444-444444444444', nodeId: 'node-content', expectedRevision: 1 }
+    const restoreInput = { ...loadInput, operationId: '55555555-5555-4555-8555-555555555555', trashId: 'trash-1', expectedRevision: 2, position: { x: 1, y: 2 } }
     const rebuildInput = {
       ...agentTarget,
       operationId: '22222222-2222-4222-8222-222222222222',
@@ -112,18 +119,32 @@ describe('Design renderer adapter', () => {
 
     expect(await adapter.loadCanvas(loadInput)).toBe(snapshot)
     expect(await adapter.saveCanvas(saveInput)).toBe(snapshot.document)
+    expect((await adapter.createCanvasContentNode(contentCreateInput)).selectedNodeId).toBe('node-content')
+    await adapter.deleteCanvasNode(deleteInput)
+    expect(await adapter.listCanvasTrash(loadInput)).toEqual([])
+    expect((await adapter.restoreCanvasNode(restoreInput)).selectedNodeId).toBe('node-content')
     expect((await adapter.createCanvasAgentNode(createInput)).document).toBe(snapshot.document)
     expect((await adapter.rebuildCanvasAgentNode(rebuildInput)).snapshot).toBe(snapshot)
     expect((await adapter.getCanvasAgentMessages(agentTarget)).sessionId).toBe('session-1')
     await adapter.sendCanvasAgentMessage(sendInput)
     await adapter.stopCanvasAgent(agentTarget)
     expect(received).toEqual([
-      loadInput, saveInput, createInput, rebuildInput, agentTarget, sendInput, agentTarget,
+      loadInput, saveInput, contentCreateInput, deleteInput, loadInput, restoreInput,
+      createInput, rebuildInput, agentTarget, sendInput, agentTarget,
     ])
     expect(received[0]).toBe(loadInput)
     expect(received[1]).toBe(saveInput)
-    expect(received[2]).toBe(createInput)
-    expect(received[3]).toBe(rebuildInput)
+    expect(received[2]).toBe(contentCreateInput)
+    expect(received[5]).toBe(restoreInput)
+  })
+
+  test('Given 内容节点 bridge 缺失或 rejection When adapter 调用 Then 隐藏内部正文并按操作返回稳定错误', async () => {
+    const missing = createDesignAdapter({})
+    await expect(missing.deleteCanvasNode({ projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', operationId: '11111111-1111-4111-8111-111111111111', expectedRevision: 0 })).rejects.toMatchObject({ code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' })
+    const failed = createDesignAdapter({
+      restoreCanvasNode: async () => { throw new Error('/private/path/CANVAS_INTERNAL') },
+    })
+    await expect(failed.restoreCanvasNode({ projectId: 'project-1', canvasId: 'canvas-1', operationId: '22222222-2222-4222-8222-222222222222', trashId: 'trash-1', expectedRevision: 0, position: { x: 0, y: 0 } })).rejects.toMatchObject({ code: 'CANVAS_RESTORE_FAILED', message: '节点恢复失败，请重试。' })
   })
 
   test('Given 多个 Canvas 事件 When 订阅目标 B Then recovery 和 graph 都只按双身份隔离', () => {

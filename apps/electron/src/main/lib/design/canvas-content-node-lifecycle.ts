@@ -81,6 +81,17 @@ export interface CanvasContentNodeReconciliationResult {
   error?: unknown
 }
 
+/** 对账后当前命令的独立结果，避免历史发布被后续失败吞掉。 */
+export type CanvasContentNodeOperationOutcome<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: unknown; publication?: CanvasDocument }
+
+/** 单次扫描同时返回历史对账与当前命令结果。 */
+export interface CanvasContentNodeReconciledResult<T> {
+  reconciliation: CanvasContentNodeReconciliationResult
+  operationOutcome: CanvasContentNodeOperationOutcome<T>
+}
+
 /** 服务依赖只覆盖图、内容、intent 与 Agent 运行守卫。 */
 export interface CanvasContentNodeLifecycleDependencies {
   store: Pick<CanvasDocumentStore, 'loadWithMigrationCapability' | 'mutate'>
@@ -96,6 +107,10 @@ export interface CanvasContentNodeLifecycleDependencies {
 export interface CanvasContentNodeLifecycle {
   reconcile: (target: CanvasTarget) => Promise<CanvasContentNodeReconciliationResult>
   load: (target: CanvasTarget) => Promise<CanvasContentNodeReconciliationResult>
+  createReconciled: (input: CreateCanvasContentNodeInput) => Promise<CanvasContentNodeReconciledResult<CanvasNodeLifecycleResult>>
+  deleteReconciled: (input: DeleteCanvasNodeInput) => Promise<CanvasContentNodeReconciledResult<CanvasNodeLifecycleResult>>
+  restoreReconciled: (input: RestoreCanvasNodeInput) => Promise<CanvasContentNodeReconciledResult<CanvasNodeLifecycleResult>>
+  listTrashReconciled: (target: CanvasTarget) => Promise<CanvasContentNodeReconciledResult<CanvasTrashEntry[]>>
   create: (input: CreateCanvasContentNodeInput) => Promise<CanvasNodeLifecycleResult>
   delete: (input: DeleteCanvasNodeInput) => Promise<CanvasNodeLifecycleResult>
   restore: (input: RestoreCanvasNodeInput) => Promise<CanvasNodeLifecycleResult>
@@ -462,18 +477,125 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
     return { result: { snapshot: snapshot(document), documentChanged: publishRequired, ...(publishRequired ? { publication: document } : {}), ...(error ? { error } : {}) }, capability, intents }
   }
 
-  /** 在公开操作前对账，并拒绝历史持久性错误被当前操作覆盖。 */
-  const requireReconciled = async (target: CanvasTarget) => {
+  /** 将未知错误规范为 Error，供旧公开方法保持异常合同。 */
+  const asError = (error: unknown): Error => error instanceof Error ? error : new Error(String(error))
+
+  /** 旧公开方法消费分离结果，同时保留已可见图事实。 */
+  const unwrapReconciled = <T>(result: CanvasContentNodeReconciledResult<T>): T => {
+    if (result.operationOutcome.ok) return result.operationOutcome.value
+    const publication = result.operationOutcome.publication ?? result.reconciliation.publication
+    if (publication) throw new CanvasNodeLifecyclePublishedError(asError(result.operationOutcome.error), publication)
+    throw result.operationOutcome.error
+  }
+
+  /** 在一次历史对账后执行当前操作，并把当前 publication 与历史 publication 分离。 */
+  const runReconciledOperation = async <T>(
+    target: CanvasTarget,
+    operation: (reconciled: Awaited<ReturnType<typeof reconcileInternal>>) => Promise<T>,
+  ): Promise<CanvasContentNodeReconciledResult<T>> => {
     const reconciled = await reconcileInternal(target)
     if (reconciled.result.error) {
-      if (reconciled.result.publication) {
-        const error = reconciled.result.error instanceof Error
-          ? reconciled.result.error : new Error(String(reconciled.result.error))
-        throw new CanvasNodeLifecyclePublishedError(error, reconciled.result.publication)
-      }
-      throw reconciled.result.error
+      return { reconciliation: reconciled.result, operationOutcome: { ok: false, error: reconciled.result.error } }
     }
-    return reconciled
+    try {
+      return { reconciliation: reconciled.result, operationOutcome: { ok: true, value: await operation(reconciled) } }
+    } catch (error) {
+      if (error instanceof CanvasNodeLifecyclePublishedError) {
+        return {
+          reconciliation: reconciled.result,
+          operationOutcome: { ok: false, error: error.causeError, publication: error.document },
+        }
+      }
+      return { reconciliation: reconciled.result, operationOutcome: { ok: false, error } }
+    }
+  }
+
+  /** 单次对账后执行内容节点创建。 */
+  const createReconciled = async (rawInput: CreateCanvasContentNodeInput) => {
+    const input = parseCreateCanvasContentNodeInput(rawInput)
+    return runReconciledOperation(input, async (reconciled) => {
+      const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
+      if (existing) {
+        if (!sameCreate(existing, input)) throw new Error('CANVAS_OPERATION_CONFLICT')
+        return { snapshot: reconciled.result.snapshot, selectedNodeId: existing.node.id }
+      }
+      const timestamp = now()
+      const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'create', state: 'prepared', operationId: input.operationId, projectId: input.projectId, canvasId: input.canvasId, node: createContentNode(input), expectedRevision: input.expectedRevision, ...(input.relationship ? { relationship: input.relationship } : {}), createdAt: timestamp, updatedAt: timestamp }
+      if (reconciled.result.snapshot.document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+      const error = await write(intent, reconciled.capability)
+      if (error) throw error
+      const advanced = await advance(intent, reconciled.result.snapshot.document, reconciled.capability)
+      if (advanced.error) {
+        if (advanced.publishRequired) throw new CanvasNodeLifecyclePublishedError(asError(advanced.error), advanced.document)
+        throw advanced.error
+      }
+      return { snapshot: snapshot(advanced.document), selectedNodeId: input.nodeId }
+    })
+  }
+
+  /** 单次对账后执行任意节点删除。 */
+  const deleteReconciled = async (rawInput: DeleteCanvasNodeInput) => {
+    const input = parseDeleteCanvasNodeInput(rawInput)
+    return runReconciledOperation(input, async (reconciled) => {
+      const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
+      if (existing) {
+        if (existing.operation !== 'delete' || existing.node.id !== input.nodeId || existing.expectedRevision !== input.expectedRevision) throw new Error('CANVAS_OPERATION_CONFLICT')
+        return { snapshot: reconciled.result.snapshot, ...(existing.trashEntry ? { trashEntry: existing.trashEntry } : {}) }
+      }
+      const document = reconciled.result.snapshot.document
+      if (document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+      const node = document.nodes.find((candidate) => candidate.id === input.nodeId)
+      if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
+      if (node.kind === 'agent') {
+        dependencies.assertAgentNodeIdle(node.id, node.agentSessionId)
+        const deleted = dependencies.store.mutate(targetFrom(input), document.revision, [{ type: 'remove-nodes', nodeIds: [node.id] }])
+        return { snapshot: snapshot(deleted) }
+      }
+      const identity = contentIdentity(node)
+      const timestamp = now()
+      const trashId = identity ? randomUUID() : undefined
+      const trashEntry = identity ? parseCanvasTrashEntry({ schemaVersion: 1, trashId, nodeId: node.id, kind: identity.kind, contentId: identity.contentId, title: node.title, position: node.position, deletedRevision: document.revision, deletedAt: timestamp }) : undefined
+      const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'delete', state: 'prepared', operationId: input.operationId, ...targetFrom(input), node, expectedRevision: input.expectedRevision, ...(trashId ? { trashId } : {}), ...(trashEntry ? { trashEntry } : {}), createdAt: timestamp, updatedAt: timestamp }
+      const error = await write(intent, reconciled.capability)
+      if (error) throw error
+      const advanced = await advance(intent, document, reconciled.capability)
+      if (advanced.error) {
+        if (advanced.publishRequired) throw new CanvasNodeLifecyclePublishedError(asError(advanced.error), advanced.document)
+        throw advanced.error
+      }
+      return { snapshot: snapshot(advanced.document), ...(trashEntry ? { trashEntry } : {}) }
+    })
+  }
+
+  /** 单次对账后执行回收区节点恢复。 */
+  const restoreReconciled = async (rawInput: RestoreCanvasNodeInput) => {
+    const input = parseRestoreCanvasNodeInput(rawInput)
+    return runReconciledOperation(input, async (reconciled) => {
+      const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
+      if (existing) {
+        if (existing.operation !== 'restore' || existing.trashId !== input.trashId || existing.expectedRevision !== input.expectedRevision || existing.node.position.x !== input.position.x || existing.node.position.y !== input.position.y) throw new Error('CANVAS_OPERATION_CONFLICT')
+        return { snapshot: reconciled.result.snapshot, selectedNodeId: existing.node.id, trashEntry: existing.trashEntry }
+      }
+      const document = reconciled.result.snapshot.document
+      if (document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+      const entry = (await dependencies.contentStore.listTrash(input)).find((candidate) => candidate.trashId === input.trashId)
+      if (!entry) throw new Error('CANVAS_TRASH_ENTRY_NOT_FOUND')
+      const base = { id: entry.nodeId, title: entry.title, position: input.position }
+      const node: CanvasNode = entry.kind === 'image' ? { ...base, kind: 'image', imageModuleId: entry.contentId }
+        : entry.kind === 'document' ? { ...base, kind: 'document', documentId: entry.contentId, contentRevision: 0 }
+          : { ...base, kind: 'webview', prototypeId: entry.contentId, contentRevision: 0 }
+      if (document.nodes.some((candidate) => candidate.id === node.id)) throw new Error('CANVAS_NODE_IDENTITY_CONFLICT')
+      const timestamp = now()
+      const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'restore', state: 'prepared', operationId: input.operationId, ...targetFrom(input), node, expectedRevision: input.expectedRevision, trashId: input.trashId, trashEntry: entry, createdAt: timestamp, updatedAt: timestamp }
+      const error = await write(intent, reconciled.capability)
+      if (error) throw error
+      const advanced = await advance(intent, document, reconciled.capability)
+      if (advanced.error) {
+        if (advanced.publishRequired) throw new CanvasNodeLifecyclePublishedError(asError(advanced.error), advanced.document)
+        throw advanced.error
+      }
+      return { snapshot: snapshot(advanced.document), selectedNodeId: node.id, trashEntry: entry }
+    })
   }
 
   return {
@@ -497,89 +619,13 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       const advanced = await advance(intent, document, reconciled.capability)
       return { snapshot: snapshot(advanced.document), documentChanged: advanced.publishRequired, ...(advanced.publishRequired ? { publication: advanced.document } : {}), ...(advanced.error ? { error: advanced.error } : {}) }
     },
-    create: async (rawInput) => {
-      const input = parseCreateCanvasContentNodeInput(rawInput)
-      const reconciled = await requireReconciled(input)
-      const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
-      if (existing) {
-        if (!sameCreate(existing, input)) throw new Error('CANVAS_OPERATION_CONFLICT')
-        return { snapshot: reconciled.result.snapshot, selectedNodeId: existing.node.id }
-      }
-      const timestamp = now()
-      const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'create', state: 'prepared', operationId: input.operationId, projectId: input.projectId, canvasId: input.canvasId, node: createContentNode(input), expectedRevision: input.expectedRevision, ...(input.relationship ? { relationship: input.relationship } : {}), createdAt: timestamp, updatedAt: timestamp }
-      if (reconciled.result.snapshot.document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
-      const error = await write(intent, reconciled.capability)
-      if (error) throw error
-      const advanced = await advance(intent, reconciled.result.snapshot.document, reconciled.capability)
-      if (advanced.error) {
-        if (advanced.publishRequired) throw new CanvasNodeLifecyclePublishedError(advanced.error, advanced.document)
-        throw advanced.error
-      }
-      return { snapshot: snapshot(advanced.document), selectedNodeId: input.nodeId }
-    },
-    delete: async (rawInput) => {
-      const input = parseDeleteCanvasNodeInput(rawInput)
-      const reconciled = await requireReconciled(input)
-      const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
-      if (existing) {
-        if (existing.operation !== 'delete' || existing.node.id !== input.nodeId || existing.expectedRevision !== input.expectedRevision) throw new Error('CANVAS_OPERATION_CONFLICT')
-        return { snapshot: reconciled.result.snapshot, ...(existing.trashEntry ? { trashEntry: existing.trashEntry } : {}) }
-      }
-      const document = reconciled.result.snapshot.document
-      if (document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
-      const node = document.nodes.find((candidate) => candidate.id === input.nodeId)
-      if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
-      if (node.kind === 'agent') {
-        dependencies.assertAgentNodeIdle(node.id, node.agentSessionId)
-        const deleted = dependencies.store.mutate(
-          targetFrom(input),
-          document.revision,
-          [{ type: 'remove-nodes', nodeIds: [node.id] }],
-        )
-        return { snapshot: snapshot(deleted) }
-      }
-      const identity = contentIdentity(node)
-      const timestamp = now()
-      const trashId = identity ? randomUUID() : undefined
-      const trashEntry = identity ? parseCanvasTrashEntry({ schemaVersion: 1, trashId, nodeId: node.id, kind: identity.kind, contentId: identity.contentId, title: node.title, position: node.position, deletedRevision: document.revision, deletedAt: timestamp }) : undefined
-      const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'delete', state: 'prepared', operationId: input.operationId, ...targetFrom(input), node, expectedRevision: input.expectedRevision, ...(trashId ? { trashId } : {}), ...(trashEntry ? { trashEntry } : {}), createdAt: timestamp, updatedAt: timestamp }
-      const error = await write(intent, reconciled.capability)
-      if (error) throw error
-      const advanced = await advance(intent, document, reconciled.capability)
-      if (advanced.error) {
-        if (advanced.publishRequired) throw new CanvasNodeLifecyclePublishedError(advanced.error, advanced.document)
-        throw advanced.error
-      }
-      return { snapshot: snapshot(advanced.document), ...(trashEntry ? { trashEntry } : {}) }
-    },
-    restore: async (rawInput) => {
-      const input = parseRestoreCanvasNodeInput(rawInput)
-      const reconciled = await requireReconciled(input)
-      const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
-      if (existing) {
-        if (existing.operation !== 'restore' || existing.trashId !== input.trashId || existing.expectedRevision !== input.expectedRevision || existing.node.position.x !== input.position.x || existing.node.position.y !== input.position.y) throw new Error('CANVAS_OPERATION_CONFLICT')
-        return { snapshot: reconciled.result.snapshot, selectedNodeId: existing.node.id, trashEntry: existing.trashEntry }
-      }
-      const document = reconciled.result.snapshot.document
-      if (document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
-      const entry = (await dependencies.contentStore.listTrash(input)).find((candidate) => candidate.trashId === input.trashId)
-      if (!entry) throw new Error('CANVAS_TRASH_ENTRY_NOT_FOUND')
-      const base = { id: entry.nodeId, title: entry.title, position: input.position }
-      const node: CanvasNode = entry.kind === 'image' ? { ...base, kind: 'image', imageModuleId: entry.contentId }
-        : entry.kind === 'document' ? { ...base, kind: 'document', documentId: entry.contentId, contentRevision: 0 }
-          : { ...base, kind: 'webview', prototypeId: entry.contentId, contentRevision: 0 }
-      if (document.nodes.some((candidate) => candidate.id === node.id)) throw new Error('CANVAS_NODE_IDENTITY_CONFLICT')
-      const timestamp = now()
-      const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'restore', state: 'prepared', operationId: input.operationId, ...targetFrom(input), node, expectedRevision: input.expectedRevision, trashId: input.trashId, trashEntry: entry, createdAt: timestamp, updatedAt: timestamp }
-      const error = await write(intent, reconciled.capability)
-      if (error) throw error
-      const advanced = await advance(intent, document, reconciled.capability)
-      if (advanced.error) {
-        if (advanced.publishRequired) throw new CanvasNodeLifecyclePublishedError(advanced.error, advanced.document)
-        throw advanced.error
-      }
-      return { snapshot: snapshot(advanced.document), selectedNodeId: node.id, trashEntry: entry }
-    },
+    createReconciled,
+    deleteReconciled,
+    restoreReconciled,
+    listTrashReconciled: async (target) => runReconciledOperation(target, async () => dependencies.contentStore.listTrash(target)),
+    create: async (input) => unwrapReconciled(await createReconciled(input)),
+    delete: async (input) => unwrapReconciled(await deleteReconciled(input)),
+    restore: async (input) => unwrapReconciled(await restoreReconciled(input)),
   }
 }
 

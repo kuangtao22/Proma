@@ -4,13 +4,17 @@ import type {
   CanvasChangeEvent,
   CanvasDocument,
   CanvasInvokeResult,
+  CanvasNodeLifecycleResult,
   CanvasPublicError,
   CanvasPublicErrorCode,
   CanvasTarget,
+  CanvasTrashEntry,
   CanvasSessionChangeEvent,
   CanvasWorkspaceSnapshot,
   CreateCanvasSessionInput,
   CreateCanvasAgentNodeInput,
+  CreateCanvasContentNodeInput,
+  DeleteCanvasNodeInput,
   GetCanvasAgentMessagesInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
@@ -32,6 +36,7 @@ import type {
   LoadCanvasInput,
   RebuildCanvasAgentNodeInput,
   RebuildCanvasAgentNodeResult,
+  RestoreCanvasNodeInput,
   SaveCanvasMutationsInput,
   SendCanvasAgentMessageInput,
   SendCanvasAgentMessageResult,
@@ -54,6 +59,14 @@ export interface DesignAdapter {
   saveCanvas: (input: SaveCanvasMutationsInput) => Promise<CanvasDocument>
   /** 在目标 Canvas 内创建 Agent 节点并等待主进程 committed。 */
   createCanvasAgentNode: (input: CreateCanvasAgentNodeInput) => Promise<CanvasAgentNodeCreationResult>
+  /** 创建受管图片、文档或原型节点。 */
+  createCanvasContentNode: (input: CreateCanvasContentNodeInput) => Promise<CanvasNodeLifecycleResult>
+  /** 统一删除 Agent 或内容节点。 */
+  deleteCanvasNode: (input: DeleteCanvasNodeInput) => Promise<CanvasNodeLifecycleResult>
+  /** 获取可恢复的内容节点列表。 */
+  listCanvasTrash: (input: CanvasTarget) => Promise<CanvasTrashEntry[]>
+  /** 从回收区恢复内容节点。 */
+  restoreCanvasNode: (input: RestoreCanvasNodeInput) => Promise<CanvasNodeLifecycleResult>
   /** 为坏 Agent 节点重建空白内部会话。 */
   rebuildCanvasAgentNode: (input: RebuildCanvasAgentNodeInput) => Promise<RebuildCanvasAgentNodeResult>
   /** 按需加载节点引用会话的持久化消息。 */
@@ -130,6 +143,9 @@ const CANVAS_ADAPTER_FALLBACKS = {
   load: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
   save: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
   create: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
+  delete: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' },
+  listTrash: { code: 'CANVAS_CONTENT_INVALID', message: '回收区暂时无法加载。' },
+  restore: { code: 'CANVAS_RESTORE_FAILED', message: '节点恢复失败，请重试。' },
   rebuild: { code: 'AGENT_SESSION_REBUILD_FAILED', message: '重建失败，请重试。' },
   messages: { code: 'CANVAS_AGENT_MESSAGES_FAILED', message: '会话消息暂时无法加载。' },
   send: { code: 'CANVAS_AGENT_SEND_FAILED', message: '消息发送失败，请重试。' },
@@ -178,6 +194,22 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
     createCanvasAgentNode: (input) => callCanvasApi(
       () => requireMethod(api, 'createCanvasAgentNode')(input),
       CANVAS_ADAPTER_FALLBACKS.create,
+    ),
+    createCanvasContentNode: (input) => callCanvasApi(
+      () => requireMethod(api, 'createCanvasContentNode')(input),
+      CANVAS_ADAPTER_FALLBACKS.create,
+    ),
+    deleteCanvasNode: (input) => callCanvasApi(
+      () => requireMethod(api, 'deleteCanvasNode')(input),
+      CANVAS_ADAPTER_FALLBACKS.delete,
+    ),
+    listCanvasTrash: (input) => callCanvasApi(
+      () => requireMethod(api, 'listCanvasTrash')(input),
+      CANVAS_ADAPTER_FALLBACKS.listTrash,
+    ),
+    restoreCanvasNode: (input) => callCanvasApi(
+      () => requireMethod(api, 'restoreCanvasNode')(input),
+      CANVAS_ADAPTER_FALLBACKS.restore,
     ),
     rebuildCanvasAgentNode: (input) => callCanvasApi(
       () => requireMethod(api, 'rebuildCanvasAgentNode')(input),

@@ -7,6 +7,10 @@ export const CANVAS_IPC_CHANNELS = {
   LOAD: 'canvas:load',
   SAVE_MUTATIONS: 'canvas:save-mutations',
   CREATE_AGENT_NODE: 'canvas:create-agent-node',
+  CREATE_CONTENT_NODE: 'canvas:create-content-node',
+  DELETE_NODE: 'canvas:delete-node',
+  LIST_TRASH: 'canvas:list-trash',
+  RESTORE_NODE: 'canvas:restore-node',
   REBUILD_AGENT_NODE: 'canvas:rebuild-agent-node',
   LIST_ACTIVE_AGENT_RUNS: 'canvas:list-active-agent-runs',
   GET_AGENT_MESSAGES: 'canvas:get-agent-messages',
@@ -311,6 +315,9 @@ export type CanvasPublicErrorCode =
   | 'CANVAS_LOAD_FAILED'
   | 'CANVAS_SAVE_FAILED'
   | 'CANVAS_CREATE_FAILED'
+  | 'CANVAS_CONTENT_INVALID'
+  | 'CANVAS_DELETE_FAILED'
+  | 'CANVAS_RESTORE_FAILED'
   | 'CANVAS_REVISION_CONFLICT'
   | 'AGENT_SESSION_BUSY'
   | 'AGENT_SESSION_REBUILD_FAILED'

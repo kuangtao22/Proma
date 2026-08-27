@@ -1,4 +1,9 @@
-import { CANVAS_IPC_CHANNELS } from '@proma/shared'
+import {
+  CANVAS_IPC_CHANNELS,
+  parseCreateCanvasContentNodeInput,
+  parseDeleteCanvasNodeInput,
+  parseRestoreCanvasNodeInput,
+} from '@proma/shared'
 import type {
   CanvasAgentNode,
   CanvasDocument,
@@ -11,11 +16,16 @@ import type {
   CanvasPublicError,
   CanvasPublicErrorCode,
   CanvasWorkspaceSnapshot,
+  CanvasNodeLifecycleResult,
+  CanvasTrashEntry,
   CreateCanvasAgentNodeInput,
+  CreateCanvasContentNodeInput,
+  DeleteCanvasNodeInput,
   GetCanvasAgentMessagesInput,
   LoadCanvasInput,
   RebuildCanvasAgentNodeInput,
   RebuildCanvasAgentNodeResult,
+  RestoreCanvasNodeInput,
   SendCanvasAgentMessageInput,
   SendCanvasAgentMessageResult,
   SaveCanvasMutationsInput,
@@ -28,6 +38,11 @@ import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
+import type {
+  CanvasContentNodeLifecycle,
+  CanvasContentNodeReconciledResult,
+  CanvasContentNodeReconciliationResult,
+} from './canvas-content-node-lifecycle'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import {
   CANVAS_AGENT_ALLOWED_TOOL_NAMES,
@@ -56,6 +71,8 @@ export interface CanvasDocumentIpcOptions {
   store: Pick<CanvasDocumentStore, 'load' | 'mutate'>
   /** 已持有 lease 时执行目标 Canvas 对账或联合创建事务。 */
   creation: Pick<CanvasAgentNodeCreationService, 'reconcile' | 'createReconciled' | 'rebuildReconciled'>
+  /** 非 Agent 内容节点的可恢复生命周期，只开放 IPC 所需窄接口。 */
+  contentLifecycle: Pick<CanvasContentNodeLifecycle, 'load' | 'createReconciled' | 'deleteReconciled' | 'listTrashReconciled' | 'restoreReconciled'>
   /** Canvas 专用 Agent 能力；运行仍复用全局 Pi runtime。 */
   agent: {
     listActiveRuns: () => CanvasAgentActiveRunSnapshot
@@ -119,7 +136,7 @@ function isAgentSessionBusyError(error: unknown): boolean {
 }
 
 /** 需要安全结果信封的 Canvas 操作类别。 */
-type CanvasInvokeOperation = 'load' | 'save' | 'create' | 'rebuild' | 'messages' | 'send' | 'stop'
+type CanvasInvokeOperation = 'load' | 'save' | 'create' | 'delete' | 'listTrash' | 'restore' | 'rebuild' | 'messages' | 'send' | 'stop'
 
 /** 主进程内部携带公开错误码的可预期业务失败。 */
 class CanvasPublicFailure extends Error {
@@ -142,6 +159,9 @@ const CANVAS_OPERATION_FALLBACKS: Record<CanvasInvokeOperation, CanvasPublicErro
   load: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
   save: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
   create: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
+  delete: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' },
+  listTrash: { code: 'CANVAS_CONTENT_INVALID', message: '回收区暂时无法加载。' },
+  restore: { code: 'CANVAS_RESTORE_FAILED', message: '节点恢复失败，请重试。' },
   rebuild: { code: 'AGENT_SESSION_REBUILD_FAILED', message: '重建失败，请重试。' },
   messages: { code: 'CANVAS_AGENT_MESSAGES_FAILED', message: '会话消息暂时无法加载。' },
   send: { code: 'CANVAS_AGENT_SEND_FAILED', message: '消息发送失败，请重试。' },
@@ -154,7 +174,7 @@ const CANVAS_OPERATION_FALLBACKS: Record<CanvasInvokeOperation, CanvasPublicErro
  * @returns 错误具有稳定 revision 冲突前缀时返回 true。
  */
 function isCanvasRevisionConflict(error: unknown): boolean {
-  return error instanceof Error && error.message.startsWith('CANVAS_REVISION_CONFLICT:')
+  return error instanceof Error && error.message.startsWith('CANVAS_REVISION_CONFLICT')
 }
 
 /**
@@ -170,11 +190,15 @@ function toCanvasPublicError(
   if (error instanceof CanvasPublicFailure) {
     return { code: error.code, message: error.message }
   }
-  if (operation === 'save' && isCanvasRevisionConflict(error)) {
+  if ((operation === 'save' || operation === 'create' || operation === 'delete' || operation === 'restore')
+    && isCanvasRevisionConflict(error)) {
     return {
       code: 'CANVAS_REVISION_CONFLICT',
       message: '画布已更新，请重新加载后重试。',
     }
+  }
+  if (isAgentSessionBusyError(error)) {
+    return { code: 'AGENT_SESSION_BUSY', message: '请先停止 Agent，再继续节点操作。' }
   }
   /** 返回新对象，避免调用方意外修改模块级默认值。 */
   const fallback = CANVAS_OPERATION_FALLBACKS[operation]
@@ -250,6 +274,22 @@ function assertRemovedAgentNodesAreIdle(
   }
 }
 
+/** 拒绝旧 SAVE mutation 绕过内容生命周期而留下孤儿目录。 */
+function assertRemovedContentNodesUseLifecycle(
+  document: CanvasDocument,
+  mutations: CanvasMutation[],
+): void {
+  /** 整批删除 ID 用集合收敛，保持检查复杂度为 O(nodes + ids)。 */
+  const removedNodeIds = new Set<string>()
+  for (const mutation of mutations) {
+    if (mutation.type !== 'remove-nodes') continue
+    for (const nodeId of mutation.nodeIds) removedNodeIds.add(nodeId)
+  }
+  if (document.nodes.some((node) => node.kind !== 'agent' && removedNodeIds.has(node.id))) {
+    throw new CanvasPublicFailure('CANVAS_CONTENT_INVALID', '请使用节点删除操作。')
+  }
+}
+
 /** 注册结果用于退出和测试清理。 */
 export interface CanvasDocumentIpcRegistration {
   /** 仅包含本注册器拥有的 invoke handler 通道。 */
@@ -312,6 +352,69 @@ function parseLoadInput(value: unknown): LoadCanvasInput {
     throw new Error('Canvas 项目或会话 ID 非法')
   }
   return { projectId: value.projectId, canvasId: value.canvasId }
+}
+
+/** 解析并重建内容节点创建输入，嵌套对象同样拒绝 getter。 */
+function parseCreateContentNodeInput(value: unknown): CreateCanvasContentNodeInput {
+  const baseKeys = ['projectId', 'canvasId', 'operationId', 'nodeId', 'kind', 'contentId', 'title', 'position', 'expectedRevision'] as const
+  if (!isRecord(value)) throw new Error('Canvas 内容节点创建参数无效')
+  /** 可选 relationship 是否存在只读取字段名，避免提前触发 getter。 */
+  const hasRelationship = Object.keys(value).includes('relationship')
+  if (!hasExactDataKeys(value, hasRelationship ? [...baseKeys, 'relationship'] : baseKeys)
+    || !isRecord(value.position)
+    || !hasExactDataKeys(value.position, ['x', 'y'])) {
+    throw new Error('Canvas 内容节点创建参数无效')
+  }
+  if (hasRelationship && (!isRecord(value.relationship)
+    || !hasExactDataKeys(value.relationship, ['sourceNodeId', 'edgeId']))) {
+    throw new Error('Canvas 内容节点扩展关系参数无效')
+  }
+  return parseCreateCanvasContentNodeInput({
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    operationId: value.operationId,
+    nodeId: value.nodeId,
+    kind: value.kind,
+    contentId: value.contentId,
+    title: value.title,
+    position: { x: value.position.x, y: value.position.y },
+    expectedRevision: value.expectedRevision,
+    ...(hasRelationship && isRecord(value.relationship)
+      ? { relationship: { sourceNodeId: value.relationship.sourceNodeId, edgeId: value.relationship.edgeId } }
+      : {}),
+  })
+}
+
+/** 解析并重建通用节点删除输入。 */
+function parseDeleteNodeInput(value: unknown): DeleteCanvasNodeInput {
+  if (!isRecord(value) || !hasExactDataKeys(value, ['projectId', 'canvasId', 'nodeId', 'operationId', 'expectedRevision'])) {
+    throw new Error('Canvas 节点删除参数无效')
+  }
+  return parseDeleteCanvasNodeInput({
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    operationId: value.operationId,
+    expectedRevision: value.expectedRevision,
+  })
+}
+
+/** 解析并重建回收区恢复输入。 */
+function parseRestoreNodeInput(value: unknown): RestoreCanvasNodeInput {
+  if (!isRecord(value)
+    || !hasExactDataKeys(value, ['projectId', 'canvasId', 'operationId', 'trashId', 'expectedRevision', 'position'])
+    || !isRecord(value.position)
+    || !hasExactDataKeys(value.position, ['x', 'y'])) {
+    throw new Error('Canvas 节点恢复参数无效')
+  }
+  return parseRestoreCanvasNodeInput({
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    operationId: value.operationId,
+    trashId: value.trashId,
+    expectedRevision: value.expectedRevision,
+    position: { x: value.position.x, y: value.position.y },
+  })
 }
 
 /**
@@ -490,6 +593,10 @@ export function registerCanvasDocumentIpcHandlers(
     CANVAS_IPC_CHANNELS.LOAD,
     CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
     CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
+    CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
+    CANVAS_IPC_CHANNELS.DELETE_NODE,
+    CANVAS_IPC_CHANNELS.LIST_TRASH,
+    CANVAS_IPC_CHANNELS.RESTORE_NODE,
     CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE,
     CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
     CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
@@ -525,6 +632,82 @@ export function registerCanvasDocumentIpcHandlers(
       release()
     }
   }
+
+  /** 按发生顺序发布历史或当前图事实，并去重同 cause + revision。 */
+  const publishUniqueChange = (
+    target: { projectId: string; canvasId: string },
+    published: Set<string>,
+    revision: number,
+    cause: CanvasChangeEvent['cause'],
+  ): void => {
+    const key = `${cause}:${revision}`
+    if (published.has(key)) return
+    published.add(key)
+    broadcastChange(options, {
+      projectId: target.projectId,
+      canvasId: target.canvasId,
+      revision,
+      cause,
+    })
+  }
+
+  /** 发布单次 Agent 或内容对账事实，恢复来源优先于普通图变化。 */
+  const publishUniqueReconciliation = (
+    target: { projectId: string; canvasId: string },
+    published: Set<string>,
+    reconciliation: CanvasContentNodeReconciliationResult,
+  ): void => {
+    if (reconciliation.snapshot.recoveredFrom) {
+      publishUniqueChange(target, published, reconciliation.snapshot.document.revision, 'recovery')
+      return
+    }
+    if (reconciliation.documentChanged) {
+      publishUniqueChange(
+        target,
+        published,
+        reconciliation.publication?.revision ?? reconciliation.snapshot.document.revision,
+        'graph',
+      )
+    }
+  }
+
+  /** 在同一 Canvas 队列与 workspace lease 内串接 Agent 对账和内容生命周期。 */
+  const runContentLifecycle = async <T>(
+    input: LoadCanvasInput,
+    effect: () => Promise<CanvasContentNodeReconciledResult<T>>,
+    getSuccessfulDocument?: (value: T) => CanvasDocument | undefined,
+  ): Promise<T> => runCanvasExclusive(input.projectId, input.canvasId, async () => {
+    const outcome = await options.guard.runWorkspaceWrite(input.projectId, async () => {
+      /** Agent intent 先收敛，内容 wrapper 自身随后只扫描一次 content intent。 */
+      const agentReconciliation = await options.creation.reconcile(input)
+      if (agentReconciliation.error) return { agentReconciliation }
+      return { agentReconciliation, content: await effect() }
+    })
+    /** 所有广播必须发生在 workspace lease 释放后。 */
+    const published = new Set<string>()
+    publishUniqueReconciliation(input, published, outcome.agentReconciliation)
+    if (outcome.agentReconciliation.error) throw outcome.agentReconciliation.error
+    if (!outcome.content) throw new Error('CANVAS_CONTENT_LIFECYCLE_MISSING')
+    publishUniqueReconciliation(input, published, outcome.content.reconciliation)
+    if (!outcome.content.operationOutcome.ok) {
+      if (outcome.content.operationOutcome.publication) {
+        publishUniqueChange(
+          input,
+          published,
+          outcome.content.operationOutcome.publication.revision,
+          'graph',
+        )
+      }
+      throw outcome.content.operationOutcome.error
+    }
+    /** 成功操作仅在本轮 revision 前进时发布，幂等重放不重复广播。 */
+    const successfulDocument = getSuccessfulDocument?.(outcome.content.operationOutcome.value)
+    if (successfulDocument
+      && successfulDocument.revision !== outcome.content.reconciliation.snapshot.document.revision) {
+      publishUniqueChange(input, published, successfulDocument.revision, 'graph')
+    }
+    return outcome.content.operationOutcome.value
+  })
 
   options.ipc.handle(
     CANVAS_IPC_CHANNELS.LIST_ACTIVE_AGENT_RUNS,
@@ -638,14 +821,19 @@ export function registerCanvasDocumentIpcHandlers(
       requireWritableProject(input.projectId, options)
       /** LOAD 可能创建 Canvas 根或提升恢复候选，因此也必须持有写 lease。 */
       return runCanvasExclusive(input.projectId, input.canvasId, async () => {
-        /** LOAD 直接返回创建事务对账后的权威快照。 */
-        const reconciliation = await options.guard.runWorkspaceWrite(
-          input.projectId,
-          () => options.creation.reconcile({ projectId: input.projectId, canvasId: input.canvasId }),
-        )
-        publishReconciliation(options, input, reconciliation)
-        if (reconciliation.error) throw reconciliation.error
-        return reconciliation.snapshot
+        /** v1 内容必须先物化并提交 schema v2，Agent 对账才可安全 mutate。 */
+        const outcome = await options.guard.runWorkspaceWrite(input.projectId, async () => {
+          const content = await options.contentLifecycle.load(input)
+          if (content.error) return { content }
+          return { content, agent: await options.creation.reconcile(input) }
+        })
+        const published = new Set<string>()
+        publishUniqueReconciliation(input, published, outcome.content)
+        if (outcome.content.error) throw outcome.content.error
+        if (!outcome.agent) throw new Error('CANVAS_AGENT_RECONCILIATION_MISSING')
+        publishUniqueReconciliation(input, published, outcome.agent)
+        if (outcome.agent.error) throw outcome.agent.error
+        return outcome.agent.snapshot
       })
     })
   ))
@@ -671,6 +859,10 @@ export function registerCanvasDocumentIpcHandlers(
               return { ok: false, error: reconciliation.error, reconciliation }
             }
             try {
+              assertRemovedContentNodesUseLifecycle(
+                reconciliation.snapshot.document,
+                input.mutations,
+              )
               assertRemovedAgentNodesAreIdle(
                 reconciliation.snapshot.document,
                 input.mutations,
@@ -703,6 +895,58 @@ export function registerCanvasDocumentIpcHandlers(
         }
         return document
       })
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, (event, value) => (
+    invokeCanvasOperation<CanvasNodeLifecycleResult>('create', async () => {
+      assertAuthorizedSender(event, options)
+      /** Renderer 只能提交公开内容身份，不能指定路径或内部 intent。 */
+      const input = parseCreateContentNodeInput(value)
+      requireWritableProject(input.projectId, options)
+      return runContentLifecycle(
+        input,
+        () => options.contentLifecycle.createReconciled(input),
+        (result) => result.snapshot.document,
+      )
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.DELETE_NODE, (event, value) => (
+    invokeCanvasOperation<CanvasNodeLifecycleResult>('delete', async () => {
+      assertAuthorizedSender(event, options)
+      /** 通用删除入口只接受节点身份和乐观 revision。 */
+      const input = parseDeleteNodeInput(value)
+      requireWritableProject(input.projectId, options)
+      return runContentLifecycle(
+        input,
+        () => options.contentLifecycle.deleteReconciled(input),
+        (result) => result.snapshot.document,
+      )
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.LIST_TRASH, (event, value) => (
+    invokeCanvasOperation<CanvasTrashEntry[]>('listTrash', async () => {
+      assertAuthorizedSender(event, options)
+      /** 回收区列表只按项目与 Canvas 身份读取，不接受路径或 trash 条目。 */
+      const input = parseLoadInput(value)
+      requireWritableProject(input.projectId, options)
+      return runContentLifecycle(input, () => options.contentLifecycle.listTrashReconciled(input))
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.RESTORE_NODE, (event, value) => (
+    invokeCanvasOperation<CanvasNodeLifecycleResult>('restore', async () => {
+      assertAuthorizedSender(event, options)
+      /** 恢复位置与回收身份均由严格共享 parser 重建。 */
+      const input = parseRestoreNodeInput(value)
+      requireWritableProject(input.projectId, options)
+      return runContentLifecycle(
+        input,
+        () => options.contentLifecycle.restoreReconciled(input),
+        (result) => result.snapshot.document,
+      )
     })
   ))
 

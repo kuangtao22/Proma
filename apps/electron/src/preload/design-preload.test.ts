@@ -27,6 +27,10 @@ describe('Design preload', () => {
     const calls: Array<[() => Promise<unknown>, string, unknown[]]> = [
       [() => api.loadCanvasWorkspace({ projectId: 'p1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.LOAD, [{ projectId: 'p1', canvasId: 'canvas-1' }]],
       [() => api.saveCanvasMutations({ projectId: 'p1', canvasId: 'canvas-1', expectedRevision: 0, mutations: [] }), CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, [{ projectId: 'p1', canvasId: 'canvas-1', expectedRevision: 0, mutations: [] }]],
+      [() => api.createCanvasContentNode({ projectId: 'p1', canvasId: 'canvas-1', operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-image', kind: 'image', contentId: 'content-image', title: '图片', position: { x: 1, y: 2 }, expectedRevision: 0 }), CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, [{ projectId: 'p1', canvasId: 'canvas-1', operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-image', kind: 'image', contentId: 'content-image', title: '图片', position: { x: 1, y: 2 }, expectedRevision: 0 }]],
+      [() => api.deleteCanvasNode({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', operationId: '22222222-2222-4222-8222-222222222222', expectedRevision: 1 }), CANVAS_IPC_CHANNELS.DELETE_NODE, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', operationId: '22222222-2222-4222-8222-222222222222', expectedRevision: 1 }]],
+      [() => api.listCanvasTrash({ projectId: 'p1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.LIST_TRASH, [{ projectId: 'p1', canvasId: 'canvas-1' }]],
+      [() => api.restoreCanvasNode({ projectId: 'p1', canvasId: 'canvas-1', operationId: '33333333-3333-4333-8333-333333333333', trashId: 'trash-1', expectedRevision: 2, position: { x: 3, y: 4 } }), CANVAS_IPC_CHANNELS.RESTORE_NODE, [{ projectId: 'p1', canvasId: 'canvas-1', operationId: '33333333-3333-4333-8333-333333333333', trashId: 'trash-1', expectedRevision: 2, position: { x: 3, y: 4 } }]],
       [() => api.createCanvasAgentNode({
         projectId: 'p1', canvasId: 'canvas-1',
         operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1',
@@ -99,6 +103,18 @@ describe('Design preload', () => {
     })
     expect(JSON.stringify(result)).not.toContain('remote method')
     expect(JSON.stringify(result)).not.toContain('/Users/name')
+  })
+
+  test('Given 内容节点通道 rejection When preload 调用 Then 每类操作返回固定公开错误', async () => {
+    const recorded = createRecordingIpc()
+    recorded.ipc.invoke = async () => { throw new Error('/Users/private/canvas intent failed') }
+    const api = createDesignPreloadApi(recorded.ipc)
+    const target = { projectId: 'p1', canvasId: 'canvas-1' }
+
+    expect(await api.createCanvasContentNode({ ...target, operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1', kind: 'document', contentId: 'content-1', title: '文档', position: { x: 0, y: 0 }, expectedRevision: 0 })).toEqual({ ok: false, error: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' } })
+    expect(await api.deleteCanvasNode({ ...target, operationId: '22222222-2222-4222-8222-222222222222', nodeId: 'node-1', expectedRevision: 1 })).toEqual({ ok: false, error: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' } })
+    expect(await api.listCanvasTrash(target)).toEqual({ ok: false, error: { code: 'CANVAS_CONTENT_INVALID', message: '回收区暂时无法加载。' } })
+    expect(await api.restoreCanvasNode({ ...target, operationId: '33333333-3333-4333-8333-333333333333', trashId: 'trash-1', expectedRevision: 2, position: { x: 1, y: 2 } })).toEqual({ ok: false, error: { code: 'CANVAS_RESTORE_FAILED', message: '节点恢复失败，请重试。' } })
   })
 
   test('Given change 订阅 When 推送并取消 Then 使用同一个 listener 引用', () => {
