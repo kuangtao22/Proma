@@ -192,6 +192,71 @@ export function createClosedNativeCanvasWorkbenchUpdate(): Pick<
   }
 }
 
+/** 工作台卸载清理协调器使用的微任务调度入口。 */
+export type NativeCanvasWorkbenchCleanupScheduler = (task: () => void) => void
+
+/** 按 stateKey 隔离 StrictMode 演练与真实卸载的协调接口。 */
+export interface NativeCanvasWorkbenchCleanupCoordinator {
+  mount: (stateKey: string, clearWorkbench: () => void) => () => void
+}
+
+/** 单个 stateKey 当前活跃挂载与待清理代次。 */
+interface NativeCanvasWorkbenchCleanupEntry {
+  activeMountIds: Set<number>
+  pendingCleanupId: number | null
+}
+
+/**
+ * 创建按 stateKey 隔离的延迟卸载协调器。
+ * @param scheduleMicrotask 将候选清理排到当前 React effect 序列之后。
+ * @returns setup 可取消同 key 待清理、真实最后卸载才执行的协调器。
+ */
+export function createNativeCanvasWorkbenchCleanupCoordinator(
+  scheduleMicrotask: NativeCanvasWorkbenchCleanupScheduler,
+): NativeCanvasWorkbenchCleanupCoordinator {
+  /** 每个 Canvas 独立保存挂载集合，避免不同 workspace 相互取消。 */
+  const entries = new Map<string, NativeCanvasWorkbenchCleanupEntry>()
+  let nextIdentity = 1
+  return {
+    mount: (stateKey, clearWorkbench) => {
+      const entry = entries.get(stateKey) ?? {
+        activeMountIds: new Set<number>(),
+        pendingCleanupId: null,
+      }
+      entries.set(stateKey, entry)
+      /** 同 key 在微任务前重挂表示 StrictMode 演练或即时恢复，取消旧候选。 */
+      entry.pendingCleanupId = null
+      const mountId = nextIdentity
+      nextIdentity += 1
+      entry.activeMountIds.add(mountId)
+      let disposed = false
+      return () => {
+        if (disposed) return
+        disposed = true
+        entry.activeMountIds.delete(mountId)
+        if (entry.activeMountIds.size > 0) return
+        const cleanupId = nextIdentity
+        nextIdentity += 1
+        entry.pendingCleanupId = cleanupId
+        scheduleMicrotask(() => {
+          /** 旧代次、已重挂或已被替换的 entry 都没有清理资格。 */
+          if (entries.get(stateKey) !== entry
+            || entry.pendingCleanupId !== cleanupId
+            || entry.activeMountIds.size > 0) return
+          entries.delete(stateKey)
+          entry.pendingCleanupId = null
+          clearWorkbench()
+        })
+      }
+    },
+  }
+}
+
+/** Renderer 生命周期共享协调器，同 key StrictMode 重挂可取消前一轮候选清理。 */
+const nativeCanvasWorkbenchCleanupCoordinator = createNativeCanvasWorkbenchCleanupCoordinator(
+  (task) => { void Promise.resolve().then(task) },
+)
+
 /**
  * 计算独立 Agent 节点创建位置。
  * @param document 当前权威 Canvas 文档。
@@ -986,13 +1051,13 @@ export function NativeCanvasWorkspace({
     }
   }, [adapter, stateKey, store, target.canvasId, target.projectId, updateNativeCanvasState])
 
-  React.useEffect(() => () => {
-    /** Canvas 切换或卸载时旧 keyed 状态不得保留工作台和草稿。 */
+  React.useEffect(() => nativeCanvasWorkbenchCleanupCoordinator.mount(stateKey, () => {
+    /** 微任务后仍未重挂才表示真实 Canvas 切换或卸载。 */
     updateNativeCanvasState({
       key: stateKey,
       update: createClosedNativeCanvasWorkbenchUpdate(),
     })
-  }, [stateKey, updateNativeCanvasState])
+  }), [stateKey, updateNativeCanvasState])
 
   React.useEffect(() => {
     if (!adapter.createCanvasAgentNode) {

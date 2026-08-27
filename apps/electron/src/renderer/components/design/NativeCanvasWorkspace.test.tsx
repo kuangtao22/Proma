@@ -30,6 +30,7 @@ import {
   NativeCanvasWorkspace,
   createCanvasAgentNodeCommandController,
   createCanvasAgentNodeRebuildController,
+  createNativeCanvasWorkbenchCleanupCoordinator,
   createNativeCanvasAgentNodeSuccessUpdate,
   createNativeCanvasWorkbenchChangeUpdate,
   createResolvedNativeCanvasWorkbenchSwitchUpdate,
@@ -113,6 +114,86 @@ describe('原生 Canvas 单工作台切换', () => {
       nodeId: 'node-document',
       commitDraft: async () => undefined,
     })).toEqual({ enabled: true, reason: null })
+  })
+})
+
+describe('原生 Canvas 工作台卸载清理协调', () => {
+  /** 创建可手动推进的微任务队列。 */
+  function createCleanupHarness() {
+    const tasks: Array<() => void> = []
+    const cleared: string[] = []
+    const coordinator = createNativeCanvasWorkbenchCleanupCoordinator((task) => tasks.push(task))
+    const flush = (): void => {
+      while (tasks.length > 0) tasks.shift()?.()
+    }
+    return { coordinator, cleared, flush }
+  }
+
+  test('Given StrictMode 同 key cleanup 后立即 setup When 微任务执行 Then 不清理新挂载状态', () => {
+    const harness = createCleanupHarness()
+    const disposeFirst = harness.coordinator.mount('project-1:canvas-1', () => {
+      harness.cleared.push('first')
+    })
+
+    disposeFirst()
+    const disposeSecond = harness.coordinator.mount('project-1:canvas-1', () => {
+      harness.cleared.push('second')
+    })
+    harness.flush()
+
+    expect(harness.cleared).toEqual([])
+    disposeSecond()
+    harness.flush()
+    expect(harness.cleared).toEqual(['second'])
+  })
+
+  test('Given 工作台真实卸载 When 微任务执行 Then 清理一次', () => {
+    const harness = createCleanupHarness()
+    const dispose = harness.coordinator.mount('project-1:canvas-1', () => {
+      harness.cleared.push('canvas-1')
+    })
+
+    dispose()
+    dispose()
+    harness.flush()
+
+    expect(harness.cleared).toEqual(['canvas-1'])
+  })
+
+  test('Given Workspace 从 A 切到 B When A 清理微任务执行 Then 只清 A', () => {
+    const harness = createCleanupHarness()
+    const disposeA = harness.coordinator.mount('project-1:canvas-a', () => {
+      harness.cleared.push('canvas-a')
+    })
+
+    disposeA()
+    const disposeB = harness.coordinator.mount('project-1:canvas-b', () => {
+      harness.cleared.push('canvas-b')
+    })
+    harness.flush()
+
+    expect(harness.cleared).toEqual(['canvas-a'])
+    disposeB()
+  })
+
+  test('Given 不同 workspace 各自待清理 When 其中一个同 key 重挂 Then 不取消另一个清理', () => {
+    const harness = createCleanupHarness()
+    const disposeA = harness.coordinator.mount('project-a:canvas-1', () => {
+      harness.cleared.push('project-a')
+    })
+    const disposeB = harness.coordinator.mount('project-b:canvas-1', () => {
+      harness.cleared.push('project-b')
+    })
+
+    disposeA()
+    disposeB()
+    const disposeNextA = harness.coordinator.mount('project-a:canvas-1', () => {
+      harness.cleared.push('project-a-next')
+    })
+    harness.flush()
+
+    expect(harness.cleared).toEqual(['project-b'])
+    disposeNextA()
   })
 })
 
