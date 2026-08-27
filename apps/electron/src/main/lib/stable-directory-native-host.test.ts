@@ -463,6 +463,59 @@ describe('stable directory native host', () => {
     expect(spawnCount).toBe(0)
   })
 
+  test('Given Canvas 内容请求携带通用遍历控制字段 When 提交 host Then 四种 mode 均在 spawn 前拒绝', async () => {
+    /** 记录遍历控制字段是否越过 host 边界启动 helper。 */
+    let spawnCount = 0
+    const dependencies: StableDirectoryNativeHostDependencies = {
+      helperPath: () => '/fake',
+      helperExists: () => true,
+      spawnProcess: () => {
+        spawnCount += 1
+        throw new Error('不应启动 helper')
+      },
+    }
+    /** 异常值与看似合法值都应拒绝，证明控制面按字段收窄而非只校验数值。 */
+    const requests = [
+      { mode: 'canvas-content-write' as const, roots: ['/requested'], childName: 'nodes', entryId: 'entry-1', fileName: 'meta.json', content: '{}', maxDepth: -1 },
+      { mode: 'canvas-content-read' as const, roots: ['/requested'], childName: 'nodes', entryId: 'entry-1', fileName: 'meta.json', maxOutputBytes: Number.NaN },
+      { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', ignoreDirectories: ['node_modules'] },
+      { mode: 'canvas-content-move' as const, roots: ['/requested'], childName: 'nodes', entryId: 'entry-1', destinationChildName: 'trash', destinationEntryId: 'trash-1', ignoreFiles: ['.DS_Store'] },
+      { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', maxDepth: 0 },
+      { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', maxOutputBytes: 16 * 1024 * 1024 },
+      { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', ignoreDirectories: [] },
+      { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', ignoreFiles: [] },
+    ]
+
+    for (const request of requests) {
+      await expect(runStableDirectoryNative(request, () => true, dependencies))
+        .rejects.toThrow('Canvas 内容原生请求合同无效')
+    }
+    expect(spawnCount).toBe(0)
+  })
+
+  test('Given 合法 Canvas 内容请求 When host 启动 helper Then argv 不包含通用遍历控制字段', async () => {
+    const fake = createFakeHelper({
+      writeOutcome: { commitVisible: true, durabilityUncertain: false },
+    })
+    /** 捕获结构化请求生成的 helper argv。 */
+    let helperArguments: string[] = []
+    await runStableDirectoryNative({
+      mode: 'canvas-content-write', roots: ['/requested'], childName: 'nodes',
+      entryId: 'entry-1', fileName: 'meta.json', content: '{}',
+    }, () => true, {
+      ...createDependencies(fake),
+      spawnProcess: (_path, args) => {
+        helperArguments = args
+        return fake.child
+      },
+    })
+
+    expect(helperArguments).not.toContain('--max-depth')
+    expect(helperArguments).not.toContain('--max-output-bytes')
+    expect(helperArguments).not.toContain('--ignore-dir')
+    expect(helperArguments).not.toContain('--ignore-file')
+  })
+
   test('Given move 已提交但目录持久性未确认 When host 解析结果 Then 保留可见提交供上层对账', async () => {
     /** 模拟 Windows 或 POSIX rename 已可见、目录 flush 失败。 */
     const fake = createFakeHelper({

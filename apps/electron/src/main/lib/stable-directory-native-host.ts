@@ -140,13 +140,18 @@ function defaultHelperPath(): string {
 function buildHelperArguments(request: StableDirectoryNativeRequest): string[] {
   const args = ['--mode', request.mode]
   for (const root of request.roots) args.push('--root', root)
-  args.push('--max-depth', String(request.maxDepth ?? (request.mode === 'list' ? 0 : 10)))
+  const isCanvasContent = request.mode.startsWith('canvas-content-')
+  if (!isCanvasContent) {
+    args.push('--max-depth', String(request.maxDepth ?? (request.mode === 'list' ? 0 : 10)))
+  }
   /** Canvas 内部目录协议固定 512 项，普通扫描继续使用既有默认预算。 */
   const defaultMaxEntries = request.mode.startsWith('canvas-') ? 512 : 10_000
   args.push('--max-entries', String(request.maxEntries ?? defaultMaxEntries))
-  args.push('--max-output-bytes', String(request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES))
-  for (const name of request.ignoreDirectories ?? []) args.push('--ignore-dir', name)
-  for (const name of request.ignoreFiles ?? []) args.push('--ignore-file', name)
+  if (!isCanvasContent) {
+    args.push('--max-output-bytes', String(request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES))
+    for (const name of request.ignoreDirectories ?? []) args.push('--ignore-dir', name)
+    for (const name of request.ignoreFiles ?? []) args.push('--ignore-file', name)
+  }
   if (request.childName) args.push('--child-name', request.childName)
   if (request.entryId) args.push('--entry-id', request.entryId)
   if (request.destinationChildName) args.push('--destination-child-name', request.destinationChildName)
@@ -589,6 +594,10 @@ export function createStableDirectoryNativeHost(
       }
       if (request.mode.startsWith('canvas-content-')) {
         const maxEntries = request.maxEntries ?? 512
+        const traversalControlsAreAbsent = request.maxDepth === undefined
+          && request.maxOutputBytes === undefined
+          && request.ignoreDirectories === undefined
+          && request.ignoreFiles === undefined
         const childIsSafe = request.childName !== undefined
           && CANVAS_CONTENT_CHILD_NAMES.has(request.childName)
         const needsEntry = request.mode !== 'canvas-content-list'
@@ -627,6 +636,7 @@ export function createStableDirectoryNativeHost(
           || !destinationIsSafe
           || !contentIsSafe
           || !fieldsMatchMode
+          || !traversalControlsAreAbsent
           || !Number.isSafeInteger(maxEntries)
           || maxEntries < 1
           || maxEntries > 512) {
