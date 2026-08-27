@@ -375,14 +375,14 @@ function parseLegacyCanvasNode(value: unknown, message: string): ParsedLegacyCan
         id: value.id,
         kind: 'agent',
         title: value.title,
-        position,
+        position: { x: position.x, y: position.y },
         agentSessionId: value.agentSessionId,
       },
       persistenceNode: {
         id: value.id,
         kind: 'agent',
         title: value.title,
-        position,
+        position: { x: position.x, y: position.y },
         agentSessionId: value.agentSessionId,
       },
     }
@@ -395,7 +395,7 @@ function parseLegacyCanvasNode(value: unknown, message: string): ParsedLegacyCan
         id: value.id,
         kind: 'image',
         title: value.title,
-        position,
+        position: { x: position.x, y: position.y },
         imageModuleId: value.assetId,
         adoptedAssetId: value.assetId,
       },
@@ -403,7 +403,7 @@ function parseLegacyCanvasNode(value: unknown, message: string): ParsedLegacyCan
         id: value.id,
         kind: 'image',
         title: value.title,
-        position,
+        position: { x: position.x, y: position.y },
         assetId: value.assetId,
       },
       legacyContentSeed: {
@@ -421,7 +421,7 @@ function parseLegacyCanvasNode(value: unknown, message: string): ParsedLegacyCan
         id: value.id,
         kind: 'document',
         title: value.title,
-        position,
+        position: { x: position.x, y: position.y },
         documentId: value.visualDocumentId,
         contentRevision: 0,
       },
@@ -429,7 +429,7 @@ function parseLegacyCanvasNode(value: unknown, message: string): ParsedLegacyCan
         id: value.id,
         kind: 'visual-document',
         title: value.title,
-        position,
+        position: { x: position.x, y: position.y },
         visualDocumentId: value.visualDocumentId,
       },
       legacyContentSeed: { kind: 'document', contentId: value.visualDocumentId },
@@ -443,7 +443,7 @@ function parseLegacyCanvasNode(value: unknown, message: string): ParsedLegacyCan
         id: value.id,
         kind: 'webview',
         title: value.title,
-        position,
+        position: { x: position.x, y: position.y },
         prototypeId: value.id,
         contentRevision: 0,
       },
@@ -451,7 +451,7 @@ function parseLegacyCanvasNode(value: unknown, message: string): ParsedLegacyCan
         id: value.id,
         kind: 'webview',
         title: value.title,
-        position,
+        position: { x: position.x, y: position.y },
         url: value.url,
       },
       legacyContentSeed: {
@@ -546,7 +546,7 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
   if (edges.some((edge) => !nodeIds.has(edge.sourceNodeId) || !nodeIds.has(edge.targetNodeId))) {
     throw new Error('CANVAS_DOCUMENT_INVALID')
   }
-  /** 视口只解析一次，供公开 v2 图和 canonical 持久化载荷共用。 */
+  /** 视口只解析一次，v1 持久化载荷再从校验结果独立重建。 */
   const viewport = parseViewport(value.viewport, 'CANVAS_DOCUMENT_INVALID')
   /** Renderer 始终只看到规范化后的 v2 文档。 */
   const document: CanvasDocument = {
@@ -567,9 +567,15 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
       projectId: target.projectId,
       canvasId: target.canvasId,
       revision,
-      viewport,
+      viewport: { x: viewport.x, y: viewport.y, zoom: viewport.zoom },
       nodes: parsedLegacyNodes.map((parsed) => parsed.persistenceNode),
-      edges,
+      edges: edges.map((edge) => ({
+        id: edge.id,
+        sourceNodeId: edge.sourceNodeId,
+        sourcePort: edge.sourcePort,
+        targetNodeId: edge.targetNodeId,
+        targetPort: edge.targetPort,
+      })),
       createdAt: value.createdAt,
       updatedAt: value.updatedAt,
     }

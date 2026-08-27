@@ -275,6 +275,42 @@ describe('CanvasDocumentStore', () => {
     })
   })
 
+  test('Given v1 解析结果 When 修改规范化文档 Then 不污染旧持久化载荷', () => {
+    /** 分别修改三类嵌套对象，证明迁移结果两侧没有共享可变引用。 */
+    const parsed = parseCanvasDocument(createLegacyDocument(), {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })
+    if (parsed.persistencePayload.schemaVersion !== 1) {
+      throw new Error('测试需要 v1 持久化载荷')
+    }
+
+    parsed.document.viewport.x = 999
+    parsed.document.nodes[0]!.position.x = 999
+    parsed.document.edges[0]!.sourcePort = 'changed'
+
+    expect(parsed.persistencePayload.viewport.x).toBe(1)
+    expect(parsed.persistencePayload.nodes[0]!.position.x).toBe(0)
+    expect(parsed.persistencePayload.edges[0]!.sourcePort).toBe('output')
+  })
+
+  test('Given v1 解析结果 When 修改旧持久化载荷 Then 不污染规范化文档', () => {
+    /** 使用新的解析结果隔离反向修改，避免前一个场景的状态影响断言。 */
+    const parsed = parseCanvasDocument(createLegacyDocument(), {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })
+    if (parsed.persistencePayload.schemaVersion !== 1) {
+      throw new Error('测试需要 v1 持久化载荷')
+    }
+
+    parsed.persistencePayload.viewport.x = 999
+    parsed.persistencePayload.nodes[0]!.position.x = 999
+    parsed.persistencePayload.edges[0]!.sourcePort = 'changed'
+
+    expect(parsed.document.viewport.x).toBe(1)
+    expect(parsed.document.nodes[0]!.position.x).toBe(0)
+    expect(parsed.document.edges[0]!.sourcePort).toBe('output')
+  })
+
   test('Given v1 图片与 Webview 节点 When 解析 Then 生成不进入图文档的私有内容种子', () => {
     /** v1 解析结果用于同时检查图节点和私有种子。 */
     const parsed = parseCanvasDocument(createLegacyDocument(), {
