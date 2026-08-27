@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test'
 import type { AgentStreamPayload } from '@proma/shared'
 import { AgentEventBus } from '../agent-event-bus'
 import * as mapper from './lan-bridge-event-mapper'
@@ -95,7 +95,7 @@ describe('LAN Bridge Pi 增量事件映射', () => {
     /** 真实事件总线用于验证订阅注册与异步状态读取。 */
     const eventBus = new AgentEventBus()
 
-    subscription.startSubscription(eventBus, () => 'blocked')
+    subscription.startSubscription(eventBus, () => 'blocked', () => true)
     eventBus.emit('session-1', {
       kind: 'proma_event',
       event: { type: 'run_started', startedAt: 1 },
@@ -122,5 +122,58 @@ describe('LAN Bridge Pi 增量事件映射', () => {
       type: 'stream.chunk',
       data: { sessionId: 'session-1', text: '正文' },
     }])
+  })
+
+  test('Given Canvas 内部会话事件 When LAN 订阅收到状态变化 Then 不读取也不广播普通会话状态', async () => {
+    broadcastMessages.length = 0
+    subscriberMessages.length = 0
+    /** 真实事件总线用于模拟 Canvas 内部会话进入全局流。 */
+    const eventBus = new AgentEventBus()
+    /** 记录内部会话是否错误触发普通 Agent 运行态读取。 */
+    let runtimeReadCount = 0
+
+    subscription.startSubscription(
+      eventBus,
+      () => {
+        runtimeReadCount += 1
+        return 'running'
+      },
+      () => false,
+    )
+    eventBus.emit('canvas-session-1', {
+      kind: 'proma_event',
+      event: { type: 'run_started', startedAt: 1 },
+    })
+    await Promise.resolve()
+
+    expect(runtimeReadCount).toBe(0)
+    expect(broadcastMessages).toEqual([])
+  })
+
+  test('Given 普通会话状态读取异常 When 异步订阅处理事件 Then 记录错误且不击穿主进程', async () => {
+    broadcastMessages.length = 0
+    subscriberMessages.length = 0
+    /** 真实事件总线用于触发微任务中的状态读取异常。 */
+    const eventBus = new AgentEventBus()
+    /** 隔离预期错误日志，同时验证异常被订阅边界接住。 */
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+
+    try {
+      subscription.startSubscription(
+        eventBus,
+        () => { throw new Error('状态读取失败') },
+        () => true,
+      )
+      eventBus.emit('session-1', {
+        kind: 'proma_event',
+        event: { type: 'run_started', startedAt: 1 },
+      })
+      await Promise.resolve()
+
+      expect(broadcastMessages).toEqual([])
+      expect(errorSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      errorSpy.mockRestore()
+    }
   })
 })

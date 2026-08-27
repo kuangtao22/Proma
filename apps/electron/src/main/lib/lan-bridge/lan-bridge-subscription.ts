@@ -15,6 +15,8 @@ import { mapAgentPayloadToLanMessages } from './lan-bridge-event-mapper'
 let unsubscribe: (() => void) | null = null
 /** 当前 LAN Bridge 用于读取主进程权威四态的函数。 */
 let runtimeStatusReader: ((sessionId: string) => LanBridgeAgentSessionRuntimeStatus) | null = null
+/** 当前 LAN Bridge 判断会话是否允许进入普通 Agent 推送的函数。 */
+let agentSessionVisibilityReader: ((sessionId: string) => boolean) | null = null
 
 /** 判断事件是否可能改变会话四态，过滤 token 级高频增量。 */
 function affectsAgentRuntimeStatus(payload: AgentStreamPayload): boolean {
@@ -42,9 +44,11 @@ function affectsAgentRuntimeStatus(payload: AgentStreamPayload): boolean {
 export function startSubscription(
   eventBus: AgentEventBus,
   readRuntimeStatus: (sessionId: string) => LanBridgeAgentSessionRuntimeStatus,
+  isAgentSessionVisible: (sessionId: string) => boolean,
 ): void {
   stopSubscription()
   runtimeStatusReader = readRuntimeStatus
+  agentSessionVisibilityReader = isAgentSessionVisible
   unsubscribe = eventBus.on(handleAgentPayload)
 }
 
@@ -55,6 +59,7 @@ export function stopSubscription(): void {
     unsubscribe = null
   }
   runtimeStatusReader = null
+  agentSessionVisibilityReader = null
 }
 
 function handleAgentPayload(sessionId: string, payload: AgentStreamPayload): void {
@@ -65,14 +70,22 @@ function handleAgentPayload(sessionId: string, payload: AgentStreamPayload): voi
     queueMicrotask(() => {
       const currentManager = getSessionManager()
       const currentReader = runtimeStatusReader
-      if (!currentManager || !currentReader) return
-      currentManager.broadcast({
-        type: 'agent.session.runtime_updated',
-        data: {
-          sessionId,
-          runtimeStatus: currentReader(sessionId),
-        },
-      })
+      /** 微任务执行时重新取得当前会话可见性读取器，避免 Bridge 停止后使用旧引用。 */
+      const currentVisibilityReader = agentSessionVisibilityReader
+      if (!currentManager || !currentReader || !currentVisibilityReader) return
+      try {
+        if (!currentVisibilityReader(sessionId)) return
+        currentManager.broadcast({
+          type: 'agent.session.runtime_updated',
+          data: {
+            sessionId,
+            runtimeStatus: currentReader(sessionId),
+          },
+        })
+      } catch (error) {
+        /** 异步订阅错误只能降级当前状态推送，不能升级为 Electron 主进程未捕获异常。 */
+        console.error(`[LAN Bridge] 读取 Agent 会话运行状态失败: sessionId=${sessionId}`, error)
+      }
     })
   }
   const subscribers = manager.getSubscribers(sessionId)
