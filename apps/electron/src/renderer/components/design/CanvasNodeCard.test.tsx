@@ -29,6 +29,16 @@ function renderCard(kind: CanvasNodeKind): string {
   )
 }
 
+/** 折叠卡片类型禁止注入内容读取函数。 */
+// @ts-expect-error loadContent 不属于折叠卡片的轻量展示合同。
+const propsWithLoadContent: CanvasNodeCardProps = { ...createProps('document'), loadContent: () => undefined }
+/** 折叠卡片类型禁止注入消息读取函数。 */
+// @ts-expect-error loadMessages 不属于折叠卡片的轻量展示合同。
+const propsWithLoadMessages: CanvasNodeCardProps = { ...createProps('agent'), loadMessages: () => undefined }
+/** 折叠卡片类型禁止直接携带原型 HTML 正文。 */
+// @ts-expect-error html 正文只能由展开后的工作台按需读取。
+const propsWithHtml: CanvasNodeCardProps = { ...createProps('webview'), html: '<main />' }
+
 describe('Canvas 通用折叠节点卡片', () => {
   test.each([
     ['agent', 'Agent'],
@@ -61,5 +71,6 @@ describe('Canvas 通用折叠节点卡片', () => {
     expect(propNames).not.toContain('loadContent')
     expect(propNames).not.toContain('loadMessages')
     expect(propNames).not.toContain('loadPreview')
+    expect([propsWithLoadContent, propsWithLoadMessages, propsWithHtml]).toHaveLength(3)
   })
 })

@@ -254,14 +254,13 @@ export function NativeCanvasGraph({
     onMutation(createViewportCanvasMutation(viewport))
   }, [onMutation, updateViewportState, writable])
 
-  /** 点击 Agent 时同时记录未来对话节点身份；其他节点只更新选中态。 */
+  /** 普通节点单击只更新选中态，不隐式打开旧对话或工作台。 */
   const handleNodeClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeClick']>>((_event, node) => {
     if (activeTool !== 'select') return
     syncSelectedNodeId(node.id)
-    onConversationNodeChange(node.type === 'canvasAgent' ? node.id : null)
-  }, [activeTool, onConversationNodeChange, syncSelectedNodeId])
+  }, [activeTool, syncSelectedNodeId])
 
-  /** 双击节点只打开对应工作台；普通单击语义保持选择或 Agent 对话。 */
+  /** 双击节点只打开对应工作台；普通单击始终只选择节点。 */
   const handleNodeDoubleClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeDoubleClick']>>((_event, node) => {
     if (activeTool !== 'select') return
     syncSelectedNodeId(node.id)

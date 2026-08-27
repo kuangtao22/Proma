@@ -1,7 +1,7 @@
 import * as React from 'react'
 import type { Node, NodeProps } from '@xyflow/react'
 import { CanvasNodeCard } from './CanvasNodeCard'
-import type { CanvasNodeCardData } from './CanvasNodeCard'
+import type { CanvasNodeCardData, CanvasNodeFlowData } from './CanvasNodeCard'
 
 /** Agent 节点当前可显示的本地运行状态。 */
 export type CanvasAgentStatus = 'idle' | 'running' | 'unavailable'
@@ -13,8 +13,10 @@ export interface CanvasAgentNodeData extends CanvasNodeCardData {
   status: CanvasAgentStatus
 }
 
+/** Agent 展示数据与 XYFlow 索引签名要求之间的适配类型。 */
+export type CanvasAgentFlowData = CanvasAgentNodeData & CanvasNodeFlowData
 /** 原生 Canvas 的 Agent XYFlow 节点类型。 */
-export type CanvasAgentFlowNode = Node<CanvasAgentNodeData, 'canvasAgent'>
+export type CanvasAgentFlowNode = Node<CanvasAgentFlowData, 'canvasAgent'>
 
 /** Agent 状态对应的简洁中文标签。 */
 export const AGENT_STATUS_LABELS: Record<CanvasAgentStatus, string> = {

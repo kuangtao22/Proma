@@ -10,8 +10,8 @@ import type {
 import { Position } from '@xyflow/react'
 import type { Edge, Node, NodeHandle } from '@xyflow/react'
 import { AGENT_STATUS_LABELS } from './CanvasAgentNode'
-import type { CanvasAgentNodeData, CanvasAgentFlowNode } from './CanvasAgentNode'
-import type { CanvasNodeCardData } from './CanvasNodeCard'
+import type { CanvasAgentFlowData, CanvasAgentFlowNode } from './CanvasAgentNode'
+import type { CanvasNodeCardData, CanvasNodeFlowData } from './CanvasNodeCard'
 
 /** 首版原生 Canvas 节点固定宽度，避免状态变化引发重排。 */
 export const NATIVE_CANVAS_NODE_WIDTH = 288
@@ -112,12 +112,14 @@ export interface NativeCanvasContentNodeData extends CanvasNodeCardData {
   contentRevision?: number
 }
 
+/** 非 Agent 展示数据与 XYFlow 索引签名要求之间的适配类型。 */
+export type NativeCanvasContentFlowData = NativeCanvasContentNodeData & CanvasNodeFlowData
 /** XYFlow 中的生图折叠节点。 */
-export type NativeCanvasImageFlowNode = Node<NativeCanvasContentNodeData & { kind: 'image' }, 'canvasImage'>
+export type NativeCanvasImageFlowNode = Node<NativeCanvasContentFlowData & { kind: 'image' }, 'canvasImage'>
 /** XYFlow 中的文档折叠节点。 */
-export type NativeCanvasDocumentFlowNode = Node<NativeCanvasContentNodeData & { kind: 'document' }, 'canvasDocument'>
+export type NativeCanvasDocumentFlowNode = Node<NativeCanvasContentFlowData & { kind: 'document' }, 'canvasDocument'>
 /** XYFlow 中的原型折叠节点。 */
-export type NativeCanvasWebviewFlowNode = Node<NativeCanvasContentNodeData & { kind: 'webview' }, 'canvasWebview'>
+export type NativeCanvasWebviewFlowNode = Node<NativeCanvasContentFlowData & { kind: 'webview' }, 'canvasWebview'>
 /** 原生 Canvas 当前全部 XYFlow 节点联合。 */
 export type NativeCanvasFlowNode =
   | CanvasAgentFlowNode
@@ -260,7 +262,7 @@ export function toNativeCanvasFlowNodes(
       const status = unavailable
         ? 'unavailable'
         : options.runningSessionIds.has(node.agentSessionId) ? 'running' : 'idle'
-      const data: CanvasAgentNodeData = {
+      const data: CanvasAgentFlowData = {
         id: node.id,
         kind: node.kind,
         title: node.title,

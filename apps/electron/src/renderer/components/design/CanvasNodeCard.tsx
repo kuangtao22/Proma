@@ -6,8 +6,8 @@ import { Bot, CircleAlert, FileImage, FileText, LoaderCircle, Maximize2, Monitor
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 
-/** 折叠卡片只接收画布文档中的轻量展示字段和命令回调。 */
-export interface CanvasNodeCardData extends Record<string, unknown> {
+/** 折叠卡片只接收画布文档中的精确轻量展示字段和命令回调。 */
+export interface CanvasNodeCardData {
   id: string
   kind: CanvasNodeKind
   title: string
@@ -17,6 +17,9 @@ export interface CanvasNodeCardData extends Record<string, unknown> {
   onExpand?: (nodeId: string) => void
   onCreateChild?: (sourceNodeId: string) => void
 }
+
+/** XYFlow 泛型要求的数据适配层；展示组件继续只公开精确字段。 */
+export type CanvasNodeFlowData = CanvasNodeCardData & Record<string, unknown>
 
 /** 通用折叠卡片输入包含 XYFlow 当前选中态。 */
 export interface CanvasNodeCardProps extends CanvasNodeCardData {

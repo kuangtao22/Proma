@@ -118,12 +118,18 @@ describe('原生 Canvas 大画布性能预算', () => {
     ])
   })
 
-  test('Given 折叠节点 When 单击和双击 Then 单击只选择而双击打开工作台', () => {
+  test('Given Agent 与非 Agent 折叠节点 When 单击和双击 Then 单击只选择而双击打开工作台', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
-    document.nodes = [{
-      id: 'image-1', kind: 'image', title: '主视觉', imageModuleId: 'image-module-1',
-      position: { x: 0, y: 0 },
-    }]
+    document.nodes = [
+      {
+        id: 'agent-1', kind: 'agent', title: '研究助手', agentSessionId: 'session-1',
+        position: { x: 0, y: 0 },
+      },
+      {
+        id: 'image-1', kind: 'image', title: '主视觉', imageModuleId: 'image-module-1',
+        position: { x: 320, y: 0 },
+      },
+    ]
     const selected: Array<string | null> = []
     const conversations: Array<string | null> = []
     const workbenches: string[] = []
@@ -142,13 +148,13 @@ describe('原生 Canvas 大画布性能预算', () => {
       />,
     )
 
-    captured!.onNodeClick?.({} as never, captured!.nodes[0]!)
-    expect(selected).toEqual(['image-1'])
-    expect(conversations).toEqual([null])
+    for (const node of captured!.nodes) captured!.onNodeClick?.({} as never, node)
+    expect(selected).toEqual(['agent-1', 'image-1'])
+    expect(conversations).toEqual([])
     expect(workbenches).toEqual([])
 
-    captured!.onNodeDoubleClick?.({} as never, captured!.nodes[0]!)
-    expect(workbenches).toEqual(['image-1'])
+    for (const node of captured!.nodes) captured!.onNodeDoubleClick?.({} as never, node)
+    expect(workbenches).toEqual(['agent-1', 'image-1'])
   })
 
   test('Given 深色主题 When 渲染原生 Canvas Then 根容器进入统一设计画布主题作用域', () => {
@@ -316,44 +322,6 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(ended).toEqual({
       viewport: { x: 90, y: 80, zoom: 0.8 }, gestureActive: false, deferredViewport: null,
     })
-  })
-
-  test('Given Agent 点击后收到迟到空选区 When 用户未点击空白处 Then 保持对话直到显式 pane 点击', () => {
-    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
-    document.nodes = [{
-      id: 'agent-1', kind: 'agent', title: 'Agent',
-      agentSessionId: 'session-1', position: { x: 0, y: 0 },
-    }]
-    const selected: Array<string | null> = []
-    const conversations: Array<string | null> = []
-    const mutations: CanvasMutation[] = []
-    let captured: NativeCanvasFlowProps | undefined
-    renderToStaticMarkup(
-      <NativeCanvasGraph
-        document={document}
-        writable
-        selectedNodeId={null}
-        onMutation={(mutation) => mutations.push(mutation)}
-        onNodeSelect={(nodeId) => selected.push(nodeId)}
-        onConversationNodeChange={(nodeId) => conversations.push(nodeId)}
-        flowRenderer={(props) => { captured = props; return <div /> }}
-      />,
-    )
-
-    captured!.onNodeClick?.({} as never, captured!.nodes[0]!)
-    captured!.onMoveEnd(null, { x: 4, y: 5, zoom: 1.2 })
-
-    expect(selected).toEqual(['agent-1'])
-    expect(conversations).toEqual(['agent-1'])
-    expect(captured!.onSelectionChange).toBeUndefined()
-    captured!.onPaneClick?.({} as never)
-
-    expect(selected).toEqual(['agent-1', null])
-    expect(conversations).toEqual(['agent-1', null])
-    expect(mutations).toEqual([{
-      type: 'set-viewport', viewport: { x: 4, y: 5, zoom: 1.2 },
-    }])
-    expect(captured?.multiSelectionKeyCode).toBeNull()
   })
 
   test('Given XYFlow 产生节点选择 change When 同步单选 Then 更新选中节点但不隐式打开对话', () => {
