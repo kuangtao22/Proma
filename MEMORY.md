@@ -189,3 +189,5 @@
 - 2026-08-27：Canvas 非 Agent 内容以 `meta.json` 最后提交作为创建完成标记；`trashId` 只表示一次回收身份，始终与稳定 `contentId` 分离。删除、恢复与重放必须保留 helper 的结构化提交证据，提交已可见但耐久性未确认时优先返回可对账错误，授权或后置校验失败不得覆盖该事实。
 - 2026-08-27：Canvas `content-node` intent 永不承载 Agent 节点；Agent 与内容 intent 共享 `transactions` 的 512 项总容量。内容生命周期的 committed tombstone 负责 operation 幂等，图 publication 与本轮是否再次 mutation 分离：重启仅补 tombstone 时仍发布既有 revision，后续 committed 对账不重复发布。
 - 2026-08-27：Canvas 多类型节点四层接口只使用主进程唯一的内容 Store/Lifecycle；LOAD 在同一 workspace lease 内先完成内容迁移与对账，再执行 Agent 对账。历史与当前 publication 必须在 lease 释放后按顺序发布，并按 `cause + revision` 去重；通用 SAVE 禁止绕过生命周期直接删除非 Agent 节点。
+- 2026-08-28：Canvas 节点工作台只由 Renderer `expandedNodeId` 驱动，同一时刻最多挂载一个节点锚定覆盖层；dirty 跨节点切换必须走保存、放弃、取消三分支，通知导航也必须复用同一 dirty-aware 状态转换。切换 Canvas、recovery、删除和真实卸载清理临时态，StrictMode 同 key 演练重挂不得误清。
+- 2026-08-28：Canvas 工作台草稿保存 Promise 必须同时复核 workspace key、源节点、目标节点和单调 operation generation；业务身份 stale 时只收口当前 generation 的 saving，generation 或 workspace stale 时完全无副作用，避免迟到结果关闭新工作台或永久锁住切换对话框。
