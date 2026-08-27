@@ -95,6 +95,8 @@ function createContext(options: {
   contentOperationError?: Error
   contentOperationPublication?: CanvasDocument
   contentReconciliationPublication?: CanvasDocument
+  contentResultFactory?: (selectedNodeId?: string) => CanvasNodeLifecycleResult
+  contentTrashResult?: CanvasTrashEntry[]
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -271,7 +273,7 @@ function createContext(options: {
             snapshot: options.loadResult ?? { document: createDocument(4), writable: true as const, nodeIssues: [] },
             documentChanged: false,
           },
-          operationOutcome: { ok: true as const, value: [] },
+          operationOutcome: { ok: true as const, value: options.contentTrashResult ?? [] },
         }
       },
       restoreReconciled: async (input) => {
@@ -319,7 +321,7 @@ function createContext(options: {
         },
       }
     }
-    const value: CanvasNodeLifecycleResult = {
+    const value = options.contentResultFactory?.(selectedNodeId) ?? {
       snapshot: { document: createDocument(5), writable: true as const, nodeIssues: [] },
       ...(selectedNodeId ? { selectedNodeId } : {}),
     }
@@ -330,7 +332,49 @@ function createContext(options: {
 
 describe('原生 Canvas 文档 IPC', () => {
   test('Given 四类内容生命周期命令 When IPC 调用 Then Agent 对账后调用内容服务并只返回公开业务字段', async () => {
-    const context = createContext()
+    /** 合法公开图包含 Agent session 引用，不能按字段名称误删。 */
+    const publicDocument = createDocument(5)
+    publicDocument.nodes = [{
+      id: 'agent-public', kind: 'agent', title: '公开 Agent', position: { x: 0, y: 0 },
+      agentSessionId: 'session-public',
+    }]
+    /** 合法节点问题用于确认 IPC 会逐字段重建嵌套数组。 */
+    const nodeIssues = [{
+      nodeId: 'agent-public', code: 'AGENT_SESSION_UNAVAILABLE' as const,
+      allowedActions: ['rebuild-agent-session', 'remove-node'] as const,
+    }]
+    /** 合法回收条目用于确认 list 会逐项严格重建。 */
+    const trashEntry: CanvasTrashEntry = {
+      schemaVersion: 1,
+      trashId: 'trash-public',
+      nodeId: 'document-public',
+      kind: 'document',
+      contentId: 'content-public',
+      title: '公开文档',
+      position: { x: 3, y: 4 },
+      deletedRevision: 4,
+      deletedAt: 10,
+    }
+    /** 生命周期故意夹带根与 snapshot 内部字段，IPC 必须丢弃而非透传。 */
+    const context = createContext({
+      contentResultFactory: (selectedNodeId) => ({
+        snapshot: {
+          document: publicDocument,
+          writable: true,
+          nodeIssues,
+          recoveredFrom: 'backup',
+          contentPath: '/private/content',
+          internalIntent: { state: 'committed' },
+        },
+        ...(selectedNodeId ? { selectedNodeId } : {}),
+        ...(!selectedNodeId ? { trashEntry } : {}),
+        contentPath: '/private/content',
+        transactionsPath: '/private/transactions',
+        internalIntent: { state: 'committed' },
+        credential: 'credential-secret',
+      } as unknown as CanvasNodeLifecycleResult),
+      contentTrashResult: [trashEntry],
+    })
     const target = { projectId: 'project-1', canvasId: 'canvas-1' }
     const createResult = await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, context.sender, {
       ...target, operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-content', kind: 'document', contentId: 'content-1', title: '文档', position: { x: 1, y: 2 }, expectedRevision: 4,
@@ -343,10 +387,26 @@ describe('原生 Canvas 文档 IPC', () => {
       ...target, operationId: '33333333-3333-4333-8333-333333333333', trashId: 'trash-1', expectedRevision: 4, position: { x: 3, y: 4 },
     }) as CanvasInvokeResult<CanvasNodeLifecycleResult>
 
-    expect(createResult).toMatchObject({ ok: true, value: { selectedNodeId: 'node-content' } })
-    expect(deleteResult).toMatchObject({ ok: true, value: { snapshot: { document: { revision: 5 } } } })
-    expect(listResult).toEqual({ ok: true, value: [] })
-    expect(restoreResult).toMatchObject({ ok: true, value: { selectedNodeId: 'node-restored' } })
+    /** 四个公开操作共享的精确规范化 snapshot。 */
+    const expectedSnapshot: CanvasWorkspaceSnapshot = {
+      document: publicDocument,
+      writable: true,
+      nodeIssues: nodeIssues.map((issue) => ({ ...issue, allowedActions: [...issue.allowedActions] })),
+      recoveredFrom: 'backup',
+    }
+    expect(createResult).toEqual({
+      ok: true,
+      value: { snapshot: expectedSnapshot, selectedNodeId: 'node-content' },
+    })
+    expect(deleteResult).toEqual({
+      ok: true,
+      value: { snapshot: expectedSnapshot, trashEntry },
+    })
+    expect(listResult).toEqual({ ok: true, value: [trashEntry] })
+    expect(restoreResult).toEqual({
+      ok: true,
+      value: { snapshot: expectedSnapshot, selectedNodeId: 'node-restored' },
+    })
     expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(4)
     expect(context.calls.filter((call) => call.startsWith('content:'))).toEqual([
       'content:create', 'content:delete', 'content:list-trash', 'content:restore',
@@ -356,11 +416,68 @@ describe('原生 Canvas 文档 IPC', () => {
       { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { ...target, revision: 5, cause: 'graph' } },
       { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { ...target, revision: 5, cause: 'graph' } },
     ])
-    /** 序列化公开结果，用于统一检查内部身份不会进入普通可见响应。 */
-    const serializedResults = JSON.stringify([createResult, deleteResult, listResult, restoreResult])
-    expect(serializedResults).not.toContain('path')
-    expect(serializedResults).not.toContain('session')
     expect(context.agentCalls).toEqual([])
+  })
+
+  test('Given lifecycle 回收条目夹带内部字段 When IPC 列表 Then fail closed 为公开错误', async () => {
+    /** 回收条目嵌套合同必须 exact，不能只丢弃未知字段后继续接受。 */
+    const invalidEntry = {
+      schemaVersion: 1,
+      trashId: 'trash-invalid',
+      nodeId: 'document-invalid',
+      kind: 'document',
+      contentId: 'content-invalid',
+      title: '损坏条目',
+      position: { x: 0, y: 0 },
+      deletedRevision: 1,
+      deletedAt: 10,
+      transactionsPath: '/private/transactions',
+      credential: 'credential-secret',
+    } as unknown as CanvasTrashEntry
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const context = createContext({ contentTrashResult: [invalidEntry] })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.LIST_TRASH, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_CONTENT_INVALID', message: '回收区暂时无法加载。' },
+    })
+    errorSpy.mockRestore()
+  })
+
+  test('Given lifecycle nodeIssue 夹带内部字段 When IPC 创建 Then fail closed 为公开错误', async () => {
+    /** nodeIssue 是 snapshot 内部公开联合，未知字段必须使整次结果失效。 */
+    const context = createContext({
+      contentResultFactory: () => ({
+        snapshot: {
+          document: createDocument(5),
+          writable: true,
+          nodeIssues: [{
+            nodeId: 'agent-invalid',
+            code: 'AGENT_SESSION_UNAVAILABLE',
+            allowedActions: ['remove-node'],
+            internalIntent: { state: 'committed' },
+          }],
+        },
+      } as unknown as CanvasNodeLifecycleResult),
+    })
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+      operationId: '99999999-9999-4999-8999-999999999999',
+      nodeId: 'document-invalid', kind: 'document', contentId: 'content-invalid',
+      title: '损坏文档', position: { x: 0, y: 0 }, expectedRevision: 4,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
+    })
+    errorSpy.mockRestore()
   })
 
   test('Given 内容命令含未知字段、sessionId、path 或 getter When IPC 调用 Then 拒绝且不进入 lifecycle', async () => {

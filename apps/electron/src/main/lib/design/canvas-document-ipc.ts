@@ -1,5 +1,6 @@
 import {
   CANVAS_IPC_CHANNELS,
+  parseCanvasTrashEntry,
   parseCreateCanvasContentNodeInput,
   parseDeleteCanvasNodeInput,
   parseRestoreCanvasNodeInput,
@@ -13,6 +14,7 @@ import type {
   CanvasChangeEvent,
   CanvasInvokeResult,
   CanvasMutation,
+  CanvasNodeIssue,
   CanvasPublicError,
   CanvasPublicErrorCode,
   CanvasWorkspaceSnapshot,
@@ -36,6 +38,7 @@ import type {
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
+import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
 import type {
@@ -337,6 +340,103 @@ function hasExactDataKeys(value: Record<string, unknown>, keys: readonly string[
     const descriptor = Object.getOwnPropertyDescriptor(value, key)
     return descriptor !== undefined && Object.hasOwn(descriptor, 'value')
   })
+}
+
+/**
+ * 校验对象至少包含指定自有数据字段，允许边界重建时忽略其它内部字段。
+ * @param value 已确认 prototype 安全的普通对象。
+ * @param keys 必须存在且只能是数据属性的公开字段。
+ * @returns 所有公开字段均可安全读取时返回 true。
+ */
+function hasOwnDataKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return keys.every((key) => {
+    /** getter/setter 不能进入主进程公开结果重建。 */
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return descriptor !== undefined && Object.hasOwn(descriptor, 'value')
+  })
+}
+
+/** 严格重建 Renderer 可见的节点问题。 */
+function rebuildCanvasNodeIssue(value: unknown): CanvasNodeIssue {
+  if (!isRecord(value)
+    || !hasExactDataKeys(value, ['nodeId', 'code', 'allowedActions'])
+    || !isSafeDesignStableId(value.nodeId)
+    || value.code !== 'AGENT_SESSION_UNAVAILABLE'
+    || !Array.isArray(value.allowedActions)) {
+    throw new Error('CANVAS_NODE_ISSUE_INVALID')
+  }
+  /** 只允许共享合同声明的两类恢复动作。 */
+  const allowedActions = value.allowedActions
+  if (allowedActions.some((action) => (
+    action !== 'rebuild-agent-session' && action !== 'remove-node'
+  )) || new Set(allowedActions).size !== allowedActions.length) {
+    throw new Error('CANVAS_NODE_ISSUE_INVALID')
+  }
+  return {
+    nodeId: value.nodeId,
+    code: value.code,
+    allowedActions: allowedActions.map((action) => action as CanvasNodeIssue['allowedActions'][number]),
+  }
+}
+
+/** 严格重建 Renderer 可见的 Canvas 工作区快照。 */
+function rebuildCanvasWorkspaceSnapshot(
+  value: unknown,
+  target: LoadCanvasInput,
+): CanvasWorkspaceSnapshot {
+  if (!isRecord(value)
+    || !hasOwnDataKeys(value, ['document', 'writable', 'nodeIssues'])
+    || value.writable !== true
+    || !Array.isArray(value.nodeIssues)) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  }
+  /** recoveredFrom 存在时必须是固定公开枚举且不能是 getter。 */
+  const hasRecoveredFrom = Object.hasOwn(value, 'recoveredFrom')
+  if (hasRecoveredFrom && (!hasOwnDataKeys(value, ['recoveredFrom'])
+    || (value.recoveredFrom !== 'tmp' && value.recoveredFrom !== 'backup'))) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  }
+  /** Store parser 负责规范化 v1 并严格验证完整 v2 文档。 */
+  const document = parseCanvasDocument(value.document, target).document
+  /** 节点问题逐项重建，禁止内部字段穿透。 */
+  const nodeIssues = value.nodeIssues.map(rebuildCanvasNodeIssue)
+  return {
+    document,
+    writable: true,
+    nodeIssues,
+    ...(hasRecoveredFrom ? { recoveredFrom: value.recoveredFrom as 'tmp' | 'backup' } : {}),
+  }
+}
+
+/** 严格重建内容节点生命周期的公开结果。 */
+function rebuildCanvasNodeLifecycleResult(
+  value: unknown,
+  target: LoadCanvasInput,
+): CanvasNodeLifecycleResult {
+  if (!isRecord(value) || !hasOwnDataKeys(value, ['snapshot'])) {
+    throw new Error('CANVAS_NODE_LIFECYCLE_RESULT_INVALID')
+  }
+  /** 两个可选字段只按自有数据属性读取，根级内部字段由重建自然丢弃。 */
+  const hasSelectedNodeId = Object.hasOwn(value, 'selectedNodeId')
+  const hasTrashEntry = Object.hasOwn(value, 'trashEntry')
+  if (hasSelectedNodeId && (!hasOwnDataKeys(value, ['selectedNodeId'])
+    || !isSafeDesignStableId(value.selectedNodeId))) {
+    throw new Error('CANVAS_NODE_LIFECYCLE_RESULT_INVALID')
+  }
+  if (hasTrashEntry && !hasOwnDataKeys(value, ['trashEntry'])) {
+    throw new Error('CANVAS_NODE_LIFECYCLE_RESULT_INVALID')
+  }
+  return {
+    snapshot: rebuildCanvasWorkspaceSnapshot(value.snapshot, target),
+    ...(hasSelectedNodeId ? { selectedNodeId: value.selectedNodeId as string } : {}),
+    ...(hasTrashEntry ? { trashEntry: parseCanvasTrashEntry(value.trashEntry) } : {}),
+  }
+}
+
+/** 严格逐项重建回收区公开列表。 */
+function rebuildCanvasTrashEntries(value: unknown): CanvasTrashEntry[] {
+  if (!Array.isArray(value)) throw new Error('CANVAS_TRASH_LIST_INVALID')
+  return value.map(parseCanvasTrashEntry)
 }
 
 /**
@@ -675,6 +775,7 @@ export function registerCanvasDocumentIpcHandlers(
   const runContentLifecycle = async <T>(
     input: LoadCanvasInput,
     effect: () => Promise<CanvasContentNodeReconciledResult<T>>,
+    rebuildValue: (value: T) => T,
     getSuccessfulDocument?: (value: T) => CanvasDocument | undefined,
   ): Promise<T> => runCanvasExclusive(input.projectId, input.canvasId, async () => {
     const outcome = await options.guard.runWorkspaceWrite(input.projectId, async () => {
@@ -700,13 +801,15 @@ export function registerCanvasDocumentIpcHandlers(
       }
       throw outcome.content.operationOutcome.error
     }
+    /** 成功值先经过 IPC 边界严格重建，非法嵌套合同不得参与发布或返回。 */
+    const value = rebuildValue(outcome.content.operationOutcome.value)
     /** 成功操作仅在本轮 revision 前进时发布，幂等重放不重复广播。 */
-    const successfulDocument = getSuccessfulDocument?.(outcome.content.operationOutcome.value)
+    const successfulDocument = getSuccessfulDocument?.(value)
     if (successfulDocument
       && successfulDocument.revision !== outcome.content.reconciliation.snapshot.document.revision) {
       publishUniqueChange(input, published, successfulDocument.revision, 'graph')
     }
-    return outcome.content.operationOutcome.value
+    return value
   })
 
   options.ipc.handle(
@@ -907,6 +1010,7 @@ export function registerCanvasDocumentIpcHandlers(
       return runContentLifecycle(
         input,
         () => options.contentLifecycle.createReconciled(input),
+        (result) => rebuildCanvasNodeLifecycleResult(result, input),
         (result) => result.snapshot.document,
       )
     })
@@ -921,6 +1025,7 @@ export function registerCanvasDocumentIpcHandlers(
       return runContentLifecycle(
         input,
         () => options.contentLifecycle.deleteReconciled(input),
+        (result) => rebuildCanvasNodeLifecycleResult(result, input),
         (result) => result.snapshot.document,
       )
     })
@@ -932,7 +1037,11 @@ export function registerCanvasDocumentIpcHandlers(
       /** 回收区列表只按项目与 Canvas 身份读取，不接受路径或 trash 条目。 */
       const input = parseLoadInput(value)
       requireWritableProject(input.projectId, options)
-      return runContentLifecycle(input, () => options.contentLifecycle.listTrashReconciled(input))
+      return runContentLifecycle(
+        input,
+        () => options.contentLifecycle.listTrashReconciled(input),
+        rebuildCanvasTrashEntries,
+      )
     })
   ))
 
@@ -945,6 +1054,7 @@ export function registerCanvasDocumentIpcHandlers(
       return runContentLifecycle(
         input,
         () => options.contentLifecycle.restoreReconciled(input),
+        (result) => rebuildCanvasNodeLifecycleResult(result, input),
         (result) => result.snapshot.document,
       )
     })
