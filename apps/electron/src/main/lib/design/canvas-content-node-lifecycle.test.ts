@@ -21,11 +21,13 @@ function createFixture(options: {
   const running = new Set<string>()
   /** 迁移提交次数用于证明内容全部准备后只提交一次图。 */
   let migrationCommits = 0
+  /** 模拟 v1 CAS 成功后后续 LOAD 只返回 v2 capability 与空 seeds。 */
+  let migrationPending = options.migratedSeeds !== undefined
   const store = {
     loadWithMigrationCapability: () => ({
-      snapshot: { document, writable: true as const, nodeIssues: [] }, migratedFrom: options.migratedSeeds ? 1 as const : undefined,
-      legacyContentSeeds: options.migratedSeeds ?? [], openSingleChildDirectory: () => { throw new Error('unused') },
-      commitMigration: () => { migrationCommits += 1; return document },
+      snapshot: { document, writable: true as const, nodeIssues: [] }, migratedFrom: migrationPending ? 1 as const : undefined,
+      legacyContentSeeds: migrationPending ? options.migratedSeeds ?? [] : [], openSingleChildDirectory: () => { throw new Error('unused') },
+      commitMigration: () => { migrationCommits += 1; migrationPending = false; return document },
     }),
     mutate: (_target: object, expectedRevision: number, mutations: CanvasMutation[]) => {
       if (expectedRevision !== document.revision) throw new Error('CANVAS_REVISION_CONFLICT')
@@ -48,7 +50,8 @@ function createFixture(options: {
   }
   /** 每次删除使用独立回收身份。 */
   let uuidCounter = 0
-  const service = createCanvasContentNodeLifecycle({
+  /** 每次构造都模拟一次新的主进程生命周期服务实例。 */
+  const createService = () => createCanvasContentNodeLifecycle({
     store, contentStore,
     scanIntents: async () => [...intents.values()],
     writeIntent: async (intent) => {
@@ -60,7 +63,8 @@ function createFixture(options: {
     now: (() => { let value = 100; return () => value++ })(),
     randomUUID: () => `aaaaaaaa-aaaa-4aaa-8aaa-${String(++uuidCounter).padStart(12, '0')}`,
   })
-  return { service, intents, trash, contents, running, getDocument: () => document, setDocument: (next: CanvasDocument) => { document = next }, getMigrationCommits: () => migrationCommits }
+  const service = createService()
+  return { service, restartService: createService, intents, trash, contents, running, getDocument: () => document, setDocument: (next: CanvasDocument) => { document = next }, getMigrationCommits: () => migrationCommits }
 }
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
@@ -167,6 +171,61 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(fixture.intents.values().next().value?.state).toBe('committed')
   })
 
+  test('Given 迁移 CAS 已提交但 committed rename 前失败 When 重启对账 Then 用 v2 文档补写并发布一次', async () => {
+    let failed = false
+    const fixture = createFixture({
+      migratedSeeds: [{ kind: 'document', contentId: 'doc-restart' }],
+      writeOutcome: (intent) => {
+        if (intent.operation === 'migrate' && intent.state === 'committed' && !failed) {
+          failed = true
+          return { commitVisible: false, durabilityUncertain: false, error: 'injected' }
+        }
+        return { commitVisible: true, durabilityUncertain: false }
+      },
+    })
+    fixture.setDocument({
+      ...fixture.getDocument(), revision: 7, createdAt: 10, updatedAt: 17,
+      nodes: [{ id: 'node-migration-restart', kind: 'document', title: '迁移文档', position: { x: 0, y: 0 }, documentId: 'doc-restart', contentRevision: 0 }],
+    })
+    const first = await fixture.service.load(target)
+    expect(first.error).toBeDefined()
+    const committedDocument = structuredClone(fixture.getDocument())
+    const restarted = fixture.restartService()
+    const reconciled = await restarted.reconcile(target)
+    expect(reconciled.documentChanged).toBe(true)
+    expect(reconciled.publication).toEqual(committedDocument)
+    expect(reconciled.snapshot.document).toEqual(committedDocument)
+    expect(fixture.intents.values().next().value?.state).toBe('committed')
+    expect(fixture.getMigrationCommits()).toBe(1)
+    const repeated = await restarted.reconcile(target)
+    expect(repeated.documentChanged).toBe(false)
+    expect(repeated.publication).toBeUndefined()
+  })
+
+  test('Given 迁移 CAS 已提交但 v2 文档已变化 When 重启对账 Then fail closed', async () => {
+    let failed = false
+    const fixture = createFixture({
+      migratedSeeds: [{ kind: 'document', contentId: 'doc-conflict' }],
+      writeOutcome: (intent) => {
+        if (intent.operation === 'migrate' && intent.state === 'committed' && !failed) {
+          failed = true
+          return { commitVisible: false, durabilityUncertain: false, error: 'injected' }
+        }
+        return { commitVisible: true, durabilityUncertain: false }
+      },
+    })
+    fixture.setDocument({
+      ...fixture.getDocument(), revision: 3,
+      nodes: [{ id: 'node-migration-conflict', kind: 'document', title: '原文档', position: { x: 0, y: 0 }, documentId: 'doc-conflict', contentRevision: 0 }],
+    })
+    expect((await fixture.service.load(target)).error).toBeDefined()
+    fixture.setDocument({
+      ...fixture.getDocument(),
+      nodes: fixture.getDocument().nodes.map((node) => ({ ...node, title: '冲突标题' })),
+    })
+    await expect(fixture.restartService().reconcile(target)).rejects.toThrow('CANVAS_MIGRATION_IDENTITY_CONFLICT')
+  })
+
   test('Given 扩展创建 When 提交 Then 节点与边共享一个 revision 且重放不重复', async () => {
     const fixture = createFixture()
     fixture.setDocument({
@@ -211,6 +270,23 @@ describe('CanvasContentNodeLifecycle', () => {
     }
   })
 
+  test('Given create 图已提交但 committed rename 前失败 When 重启对账 Then 补写后仍发布一次', async () => {
+    let failed = false
+    const fixture = createFixture({ writeOutcome: (intent) => {
+      if (intent.operation === 'create' && intent.state === 'committed' && !failed) {
+        failed = true
+        return { commitVisible: false, durabilityUncertain: false, error: 'injected' }
+      }
+      return { commitVisible: true, durabilityUncertain: false }
+    } })
+    await expect(fixture.service.create({ ...target, operationId: '30303030-3030-4030-8030-303030303030', nodeId: 'node-30', kind: 'document', contentId: 'content-30', title: '文档', position: { x: 0, y: 0 }, expectedRevision: 0 })).rejects.toHaveProperty('document.revision', 1)
+    const restarted = fixture.restartService()
+    const reconciled = await restarted.reconcile(target)
+    expect(reconciled.documentChanged).toBe(true)
+    expect(reconciled.publication?.revision).toBe(1)
+    expect((await restarted.reconcile(target)).publication).toBeUndefined()
+  })
+
   test('Given 内容节点 When 删除恢复再删除 Then 内容身份稳定且 trashId 每次独立', async () => {
     const fixture = createFixture()
     await fixture.service.create({ ...target, operationId: '33333333-3333-4333-8333-333333333333', nodeId: 'node-3', kind: 'webview', contentId: 'content-3', title: '原型', position: { x: 5, y: 6 }, expectedRevision: 0 })
@@ -249,6 +325,26 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(retried.snapshot.document.nodes).toHaveLength(0)
   })
 
+  test('Given delete 图已提交但 committed rename 前失败 When 重启对账 Then 补写后仍发布一次', async () => {
+    let failCommitted = false
+    let failed = false
+    const fixture = createFixture({ writeOutcome: (intent) => {
+      if (failCommitted && intent.operation === 'delete' && intent.state === 'committed' && !failed) {
+        failed = true
+        return { commitVisible: false, durabilityUncertain: false, error: 'injected' }
+      }
+      return { commitVisible: true, durabilityUncertain: false }
+    } })
+    await fixture.service.create({ ...target, operationId: '31313131-3131-4131-8131-313131313131', nodeId: 'node-31', kind: 'image', contentId: 'content-31', title: '图片', position: { x: 0, y: 0 }, expectedRevision: 0 })
+    failCommitted = true
+    await expect(fixture.service.delete({ ...target, operationId: '32323232-3232-4232-8232-323232323232', nodeId: 'node-31', expectedRevision: 1 })).rejects.toHaveProperty('document.revision', 2)
+    const restarted = fixture.restartService()
+    const reconciled = await restarted.reconcile(target)
+    expect(reconciled.documentChanged).toBe(true)
+    expect(reconciled.publication?.revision).toBe(2)
+    expect((await restarted.reconcile(target)).publication).toBeUndefined()
+  })
+
   test.each(contentKinds)('Given %s restore prepared intent 写失败 Then 仍留在回收区且图不变', async (kind) => {
     let failPrepared = false
     const fixture = createFixture({ writeOutcome: (intent) => failPrepared && intent.operation === 'restore' && intent.state === 'prepared'
@@ -277,6 +373,27 @@ describe('CanvasContentNodeLifecycle', () => {
     const retried = await fixture.service.restore(input)
     expect(retried.snapshot.document.revision).toBe(3)
     expect(retried.snapshot.document.nodes).toHaveLength(1)
+  })
+
+  test('Given restore 图已提交但 committed rename 前失败 When 重启对账 Then 补写后仍发布一次', async () => {
+    let failCommitted = false
+    let failed = false
+    const fixture = createFixture({ writeOutcome: (intent) => {
+      if (failCommitted && intent.operation === 'restore' && intent.state === 'committed' && !failed) {
+        failed = true
+        return { commitVisible: false, durabilityUncertain: false, error: 'injected' }
+      }
+      return { commitVisible: true, durabilityUncertain: false }
+    } })
+    await fixture.service.create({ ...target, operationId: '33333333-3333-4333-8333-333333333330', nodeId: 'node-33', kind: 'webview', contentId: 'content-33', title: '原型', position: { x: 0, y: 0 }, expectedRevision: 0 })
+    const deleted = await fixture.service.delete({ ...target, operationId: '34343434-3434-4434-8434-343434343434', nodeId: 'node-33', expectedRevision: 1 })
+    failCommitted = true
+    await expect(fixture.service.restore({ ...target, operationId: '35353535-3535-4535-8535-353535353535', trashId: deleted.trashEntry!.trashId, expectedRevision: 2, position: { x: 3, y: 3 } })).rejects.toHaveProperty('document.revision', 3)
+    const restarted = fixture.restartService()
+    const reconciled = await restarted.reconcile(target)
+    expect(reconciled.documentChanged).toBe(true)
+    expect(reconciled.publication?.revision).toBe(3)
+    expect((await restarted.reconcile(target)).publication).toBeUndefined()
   })
 
   test.each(contentKinds.flatMap((kind) => ['delete', 'restore'].map((operation) => [kind, operation] as const)))('Given %s %s 图已提交但 committed intent 耐久未确认 Then 错误携带发布 revision', async (kind, operation) => {

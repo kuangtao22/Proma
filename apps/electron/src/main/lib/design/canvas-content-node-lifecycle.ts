@@ -313,7 +313,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
   }
 
   /** 推进一个未完成 intent，所有阶段均可安全重放。 */
-  const advance = async (original: CanvasContentNodeIntent, initial: CanvasDocument, capability: CanvasDocumentMigrationCapability): Promise<{ intent: CanvasContentNodeIntent; document: CanvasDocument; changed: boolean; error?: Error }> => {
+  const advance = async (original: CanvasContentNodeIntent, initial: CanvasDocument, capability: CanvasDocumentMigrationCapability): Promise<{ intent: CanvasContentNodeIntent; document: CanvasDocument; changed: boolean; publishRequired: boolean; error?: Error }> => {
     /** 即使测试注入或未来内部调用绕过扫描，也在副作用前重新执行完整严格解析。 */
     let intent = parseCanvasContentNodeIntent(
       original,
@@ -322,13 +322,32 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
     )
     let document = initial
     let changed = false
+    let publishRequired = false
     const target = { projectId: intent.projectId, canvasId: intent.canvasId }
     /** 注入测试或未来调用方绕过 parser 时仍在副作用前拒绝 Agent 节点。 */
     const intentIdentity = requireContentIdentity(intent.node)
+    /** 图已提交后，持久化 committed；失败也必须携带待发布图事实。 */
+    const persistCommitted = async (): Promise<Error | undefined> => {
+      intent = transition(intent, 'committed', now)
+      publishRequired = true
+      try {
+        return await write(intent, capability)
+      } catch (error) {
+        if (error instanceof Error) return error
+        throw error
+      }
+    }
     if (intent.operation === 'migrate') {
-      if (!intent.migrationDocument
-        || JSON.stringify(intent.migrationDocument) !== JSON.stringify(capability.snapshot.document)
-        || JSON.stringify(intent.legacyContentSeeds ?? []) !== JSON.stringify(capability.legacyContentSeeds)) {
+      const migrationDocumentMatches = intent.migrationDocument
+        && JSON.stringify(intent.migrationDocument) === JSON.stringify(capability.snapshot.document)
+      if (!migrationDocumentMatches) {
+        throw new Error('CANVAS_MIGRATION_IDENTITY_CONFLICT')
+      }
+      if (capability.migratedFrom === 1
+        && JSON.stringify(intent.legacyContentSeeds ?? []) !== JSON.stringify(capability.legacyContentSeeds)) {
+        throw new Error('CANVAS_MIGRATION_IDENTITY_CONFLICT')
+      }
+      if (capability.migratedFrom !== 1 && intent.state !== 'content-created') {
         throw new Error('CANVAS_MIGRATION_IDENTITY_CONFLICT')
       }
       if (intent.state === 'prepared') {
@@ -340,15 +359,17 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
         }
         intent = transition(intent, 'content-created', now)
         const error = await write(intent, capability)
-        if (error) return { intent, document, changed, error }
+        if (error) return { intent, document, changed, publishRequired, error }
       }
       if (intent.state === 'content-created') {
-        document = capability.commitMigration()
-        intent = transition(intent, 'committed', now)
-        const error = await write(intent, capability)
-        if (error) return { intent, document, changed: true, error }
+        if (capability.migratedFrom === 1) {
+          document = capability.commitMigration()
+          changed = true
+        }
+        const error = await persistCommitted()
+        if (error) return { intent, document, changed, publishRequired, error }
       }
-      return { intent, document, changed }
+      return { intent, document, changed, publishRequired }
     }
     if (intent.operation === 'create') {
       const identity = intentIdentity
@@ -359,7 +380,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
         }
         intent = transition(intent, 'content-created', now)
         const error = await write(intent, capability)
-        if (error) return { intent, document, changed, error }
+        if (error) return { intent, document, changed, publishRequired, error }
       }
       if (intent.state === 'content-created') {
         const existing = document.nodes.find((node) => node.id === intent.node.id)
@@ -374,11 +395,10 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
           document = dependencies.store.mutate(target, document.revision, mutations)
           changed = true
         }
-        intent = transition(intent, 'committed', now)
-        const error = await write(intent, capability)
-        if (error) return { intent, document, changed: true, error }
+        const error = await persistCommitted()
+        if (error) return { intent, document, changed, publishRequired, error }
       }
-      return { intent, document, changed }
+      return { intent, document, changed, publishRequired }
     }
     if (intent.operation === 'delete') {
       if (!intent.trashEntry) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
@@ -390,18 +410,17 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
         }
         intent = transition(intent, 'trashed', now)
         const error = await write(intent, capability)
-        if (error) return { intent, document, changed, error }
+        if (error) return { intent, document, changed, publishRequired, error }
       }
       if (intent.state === 'trashed') {
         if (document.nodes.some((node) => node.id === intent.node.id)) {
           document = dependencies.store.mutate(target, document.revision, [{ type: 'remove-nodes', nodeIds: [intent.node.id] }])
           changed = true
         }
-        intent = transition(intent, 'committed', now)
-        const error = await write(intent, capability)
-        if (error) return { intent, document, changed: true, error }
+        const error = await persistCommitted()
+        if (error) return { intent, document, changed, publishRequired, error }
       }
-      return { intent, document, changed }
+      return { intent, document, changed, publishRequired }
     }
     if (!intent.trashEntry) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
     if (intent.state === 'prepared') {
@@ -409,7 +428,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       if (JSON.stringify(restored) !== JSON.stringify(intent.trashEntry)) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
       intent = transition(intent, 'restored', now)
       const error = await write(intent, capability)
-      if (error) return { intent, document, changed, error }
+      if (error) return { intent, document, changed, publishRequired, error }
     }
     if (intent.state === 'restored') {
       const existing = document.nodes.find((node) => node.id === intent.node.id)
@@ -418,11 +437,10 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
         document = dependencies.store.mutate(target, document.revision, [{ type: 'upsert-nodes', nodes: [intent.node] }])
         changed = true
       }
-      intent = transition(intent, 'committed', now)
-      const error = await write(intent, capability)
-      if (error) return { intent, document, changed: true, error }
+      const error = await persistCommitted()
+      if (error) return { intent, document, changed, publishRequired, error }
     }
-    return { intent, document, changed }
+    return { intent, document, changed, publishRequired }
   }
 
   /** 单次扫描并按 operationId 确定性推进全部历史事务。 */
@@ -431,15 +449,17 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
     const intents = await scan(target, capability)
     let document = capability.snapshot.document
     let changed = false
+    let publishRequired = false
     let error: unknown
     for (const original of [...intents].sort((left, right) => left.operationId.localeCompare(right.operationId))) {
       if (original.state === 'committed') continue
       const advanced = await advance(original, document, capability)
       document = advanced.document
       changed ||= advanced.changed
+      publishRequired ||= advanced.publishRequired
       if (advanced.error) { error = advanced.error; break }
     }
-    return { result: { snapshot: snapshot(document), documentChanged: changed, ...(changed ? { publication: document } : {}), ...(error ? { error } : {}) }, capability, intents }
+    return { result: { snapshot: snapshot(document), documentChanged: publishRequired, ...(publishRequired ? { publication: document } : {}), ...(error ? { error } : {}) }, capability, intents }
   }
 
   /** 在公开操作前对账，并拒绝历史持久性错误被当前操作覆盖。 */
@@ -475,7 +495,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       const writeError = await write(intent, reconciled.capability)
       if (writeError) return { ...reconciled.result, error: writeError }
       const advanced = await advance(intent, document, reconciled.capability)
-      return { snapshot: snapshot(advanced.document), documentChanged: advanced.changed, ...(advanced.changed ? { publication: advanced.document } : {}), ...(advanced.error ? { error: advanced.error } : {}) }
+      return { snapshot: snapshot(advanced.document), documentChanged: advanced.publishRequired, ...(advanced.publishRequired ? { publication: advanced.document } : {}), ...(advanced.error ? { error: advanced.error } : {}) }
     },
     create: async (rawInput) => {
       const input = parseCreateCanvasContentNodeInput(rawInput)
@@ -492,7 +512,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       if (error) throw error
       const advanced = await advance(intent, reconciled.result.snapshot.document, reconciled.capability)
       if (advanced.error) {
-        if (advanced.changed) throw new CanvasNodeLifecyclePublishedError(advanced.error, advanced.document)
+        if (advanced.publishRequired) throw new CanvasNodeLifecyclePublishedError(advanced.error, advanced.document)
         throw advanced.error
       }
       return { snapshot: snapshot(advanced.document), selectedNodeId: input.nodeId }
@@ -527,7 +547,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       if (error) throw error
       const advanced = await advance(intent, document, reconciled.capability)
       if (advanced.error) {
-        if (advanced.changed) throw new CanvasNodeLifecyclePublishedError(advanced.error, advanced.document)
+        if (advanced.publishRequired) throw new CanvasNodeLifecyclePublishedError(advanced.error, advanced.document)
         throw advanced.error
       }
       return { snapshot: snapshot(advanced.document), ...(trashEntry ? { trashEntry } : {}) }
@@ -555,7 +575,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       if (error) throw error
       const advanced = await advance(intent, document, reconciled.capability)
       if (advanced.error) {
-        if (advanced.changed) throw new CanvasNodeLifecyclePublishedError(advanced.error, advanced.document)
+        if (advanced.publishRequired) throw new CanvasNodeLifecyclePublishedError(advanced.error, advanced.document)
         throw advanced.error
       }
       return { snapshot: snapshot(advanced.document), selectedNodeId: node.id, trashEntry: entry }
