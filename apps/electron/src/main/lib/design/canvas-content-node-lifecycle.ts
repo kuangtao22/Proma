@@ -1,3 +1,4 @@
+import { randomUUID as createRandomUUID } from 'node:crypto'
 import {
   parseCanvasTrashEntry,
   parseCreateCanvasContentNodeInput,
@@ -291,7 +292,7 @@ function snapshot(document: CanvasDocument): CanvasWorkspaceSnapshot {
 /** 创建 Canvas 内容节点可恢复生命周期服务。 */
 export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNodeLifecycleDependencies): CanvasContentNodeLifecycle {
   const now = dependencies.now ?? Date.now
-  const randomUUID = dependencies.randomUUID ?? crypto.randomUUID
+  const randomUUID = dependencies.randomUUID ?? createRandomUUID
 
   /** 读取全部 content intent；生产路径只解析固定前缀并忽略 Agent 文件。 */
   const scan = async (target: CanvasTarget, capability: CanvasDocumentMigrationCapability): Promise<CanvasContentNodeIntent[]> => {

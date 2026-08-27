@@ -8,6 +8,8 @@ import type { CanvasContentNodeIntent } from './canvas-content-node-lifecycle'
 function createFixture(options: {
   writeOutcome?: (intent: CanvasContentNodeIntent) => { commitVisible: boolean; durabilityUncertain: boolean; error?: string }
   migratedSeeds?: Array<{ kind: 'image' | 'document' | 'webview'; contentId: string; adoptedAssetId?: string; legacySourceUrl?: string }>
+  /** 为 true 时不注入测试 UUID，覆盖生产默认生成器。 */
+  useDefaultRandomUUID?: boolean
 } = {}) {
   /** 当前权威图文档。 */
   let document = createEmptyCanvasDocument('project-1', 'canvas-1', 10)
@@ -63,7 +65,9 @@ function createFixture(options: {
     },
     assertAgentNodeIdle: (nodeId) => { if (running.has(nodeId)) throw new Error('AGENT_SESSION_BUSY') },
     now: (() => { let value = 100; return () => value++ })(),
-    randomUUID: () => `aaaaaaaa-aaaa-4aaa-8aaa-${String(++uuidCounter).padStart(12, '0')}`,
+    ...(options.useDefaultRandomUUID ? {} : {
+      randomUUID: () => `aaaaaaaa-aaaa-4aaa-8aaa-${String(++uuidCounter).padStart(12, '0')}`,
+    }),
   })
   const service = createService()
   return { service, restartService: createService, intents, trash, contents, running, getDocument: () => document, setDocument: (next: CanvasDocument) => { document = next }, getMigrationCommits: () => migrationCommits, getScanCount: () => scanCount }
@@ -171,6 +175,29 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(fixture.getMigrationCommits()).toBe(1)
     expect(result.snapshot.document.revision).toBe(7)
     expect(fixture.intents.values().next().value?.state).toBe('committed')
+  })
+
+  test('Given v1 私有 seeds 且未注入 UUID When LOAD 迁移 Then 默认生成的 operationId 可通过 intent parser', async () => {
+    /** 使用生产默认 UUID 路径，复现 Electron 主进程 Web Crypto 接收者约束。 */
+    const fixture = createFixture({
+      migratedSeeds: [{ kind: 'document', contentId: 'document-default-uuid' }],
+      useDefaultRandomUUID: true,
+    })
+    fixture.setDocument({
+      ...fixture.getDocument(),
+      nodes: [{
+        id: 'node-default-uuid', kind: 'document', title: '默认 UUID 文档',
+        position: { x: 0, y: 0 }, documentId: 'document-default-uuid', contentRevision: 0,
+      }],
+    })
+
+    await fixture.service.load(target)
+
+    /** 已持久化 intent 必须携带可由严格 parser 接受的 UUID。 */
+    const intent = fixture.intents.values().next().value
+    if (!intent) throw new Error('迁移 intent 未生成')
+    expect(parseCanvasContentNodeIntent(intent, target, intent.operationId).operationId)
+      .toBe(intent.operationId)
   })
 
   test('Given 迁移 CAS 已提交但 committed rename 前失败 When 重启对账 Then 用 v2 文档补写并发布一次', async () => {
