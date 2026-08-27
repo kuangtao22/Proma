@@ -17,9 +17,8 @@ import type {
   OnNodesChange,
   ReactFlowProps,
 } from '@xyflow/react'
-import { FileImage, FileText, Monitor } from 'lucide-react'
-import { cn } from '@/lib/utils'
 import { CanvasAgentNode } from './CanvasAgentNode'
+import { CanvasNodeCard } from './CanvasNodeCard'
 import {
   createMoveCanvasNodesMutation,
   createViewportCanvasMutation,
@@ -27,41 +26,33 @@ import {
   toNativeCanvasFlowNodes,
 } from './native-canvas-model'
 import type {
+  NativeCanvasDocumentFlowNode,
   NativeCanvasFlowNode,
-  NativeCanvasUnsupportedFlowNode,
+  NativeCanvasImageFlowNode,
+  NativeCanvasWebviewFlowNode,
 } from './native-canvas-model'
 
-/** 渲染尚未正式接入的持久节点，保留身份但不伪造能力。 */
-function NativeCanvasUnsupportedNode({
-  data,
-  selected,
-}: NodeProps<NativeCanvasUnsupportedFlowNode>): React.ReactElement {
-  /** 每类占位节点使用可辨识但克制的图标。 */
-  const Icon = data.kind === 'image' ? FileImage : data.kind === 'document' ? FileText : Monitor
-  return (
-    <article
-      className={cn(
-        'flex h-[144px] w-[288px] flex-col overflow-hidden rounded-[8px] border bg-card px-4 py-3 text-card-foreground shadow-sm',
-        selected ? 'border-primary ring-2 ring-primary/25' : 'border-border',
-      )}
-      aria-label={`${data.title}，${data.unsupportedLabel}`}
-    >
-      <div className="flex items-center gap-2 text-muted-foreground">
-        <Icon className="size-4 shrink-0" aria-hidden="true" />
-        <span className="text-xs font-medium">{data.kind}</span>
-      </div>
-      <h3 className="mt-3 line-clamp-2 overflow-hidden break-words text-sm font-medium leading-5">
-        {data.title}
-      </h3>
-      <p className="mt-auto text-xs text-muted-foreground">{data.unsupportedLabel}</p>
-    </article>
-  )
+/** 渲染生图折叠节点，不读取图片历史。 */
+function NativeCanvasImageNode({ data, selected }: NodeProps<NativeCanvasImageFlowNode>): React.ReactElement {
+  return <CanvasNodeCard {...data} selected={selected} />
+}
+
+/** 渲染文档折叠节点，不读取 Markdown 正文。 */
+function NativeCanvasDocumentNode({ data, selected }: NodeProps<NativeCanvasDocumentFlowNode>): React.ReactElement {
+  return <CanvasNodeCard {...data} selected={selected} />
+}
+
+/** 渲染原型折叠节点，不加载 HTML 或 iframe。 */
+function NativeCanvasWebviewNode({ data, selected }: NodeProps<NativeCanvasWebviewFlowNode>): React.ReactElement {
+  return <CanvasNodeCard {...data} selected={selected} />
 }
 
 /** 模块级稳定节点表，避免 XYFlow 在重渲染时重复注册节点组件。 */
 export const NATIVE_CANVAS_NODE_TYPES = {
   canvasAgent: CanvasAgentNode,
-  canvasUnsupported: NativeCanvasUnsupportedNode,
+  canvasImage: NativeCanvasImageNode,
+  canvasDocument: NativeCanvasDocumentNode,
+  canvasWebview: NativeCanvasWebviewNode,
 } satisfies NodeTypes
 
 /** 未提供运行时问题时复用稳定空数组，避免投影 effect 每次重跑。 */
@@ -86,6 +77,8 @@ export interface NativeCanvasGraphProps {
   onNodeSelect: (nodeId: string | null) => void
   /** 只响应显式节点点击或空白 pane 点击，控制 Agent 对话开关。 */
   onConversationNodeChange: (nodeId: string | null) => void
+  /** 双击或卡片按钮只切换节点工作台，不改变图文档。 */
+  onWorkbenchNodeChange?: (nodeId: string) => void
   flowRenderer?: NativeCanvasFlowRenderer
 }
 
@@ -146,15 +139,19 @@ export function NativeCanvasGraph({
   onMutation,
   onNodeSelect,
   onConversationNodeChange,
+  onWorkbenchNodeChange,
   flowRenderer,
 }: NativeCanvasGraphProps): React.ReactElement {
+  /** 未接通工作台状态前仍渲染稳定入口，Task 8 可直接注入真实切换命令。 */
+  const workbenchNodeChange = onWorkbenchNodeChange ?? NOOP_EXPAND
   /** 首帧投影只使用 Canvas 文档内存数据，不读取 Agent 消息。 */
   const [flowNodes, setFlowNodes] = React.useState<NativeCanvasFlowNode[]>(() => (
     toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
-      canExpand: writable && canExpand,
-      onExpand,
+      canCreateChild: writable && canExpand,
+      onCreateChild: onExpand,
+      onWorkbenchNodeChange: workbenchNodeChange,
     }).map((node) => ({
       ...node,
       selected: node.id === selectedNodeId,
@@ -192,15 +189,16 @@ export function NativeCanvasGraph({
     const nextNodes = toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
-      canExpand: writable && canExpand,
-      onExpand,
+      canCreateChild: writable && canExpand,
+      onCreateChild: onExpand,
+      onWorkbenchNodeChange: workbenchNodeChange,
     }).map((node) => ({
       ...node,
       selected: node.id === selectedNodeId,
     }))
     flowNodesRef.current = nextNodes
     setFlowNodes(nextNodes)
-  }, [canExpand, document, nodeIssues, onExpand, runningSessionIds, selectedNodeId, writable])
+  }, [canExpand, document, nodeIssues, onExpand, runningSessionIds, selectedNodeId, workbenchNodeChange, writable])
 
   React.useEffect(() => {
     updateViewportState({ type: 'document-sync', viewport: document.viewport })
@@ -263,6 +261,13 @@ export function NativeCanvasGraph({
     onConversationNodeChange(node.type === 'canvasAgent' ? node.id : null)
   }, [activeTool, onConversationNodeChange, syncSelectedNodeId])
 
+  /** 双击节点只打开对应工作台；普通单击语义保持选择或 Agent 对话。 */
+  const handleNodeDoubleClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeDoubleClick']>>((_event, node) => {
+    if (activeTool !== 'select') return
+    syncSelectedNodeId(node.id)
+    workbenchNodeChange(node.id)
+  }, [activeTool, syncSelectedNodeId, workbenchNodeChange])
+
   /** 点击空白 pane 时立即清理选区，覆盖 XYFlow 未产生 selection change 的路径。 */
   const handlePaneClick = React.useCallback((): void => {
     if (activeTool !== 'select') return
@@ -294,6 +299,7 @@ export function NativeCanvasGraph({
     onMove: handleMove,
     onMoveEnd: handleMoveEnd,
     onNodeClick: handleNodeClick,
+    onNodeDoubleClick: handleNodeDoubleClick,
     onPaneClick: handlePaneClick,
   }
 

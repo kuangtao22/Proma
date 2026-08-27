@@ -53,11 +53,13 @@ describe('原生 Canvas 纯投影', () => {
         allowedActions: ['rebuild-agent-session', 'remove-node'],
       }],
       runningSessionIds: new Set(['session-1']),
-      canExpand: true,
-      onExpand: () => undefined,
+      canCreateChild: true,
+      onCreateChild: () => undefined,
+      onWorkbenchNodeChange: () => undefined,
     })
 
-    expect(nodes[0]?.data).toMatchObject({ status: 'unavailable', canExpand: false })
+    expect(nodes[0]?.data).toMatchObject({ status: 'unavailable', canExpand: true })
+    expect(nodes[0]?.data.onCreateChild).toBeUndefined()
   })
 
   test('Given 四类节点 When 投影 Then 只公开稳定展示字段且不携带消息或路径', () => {
@@ -66,9 +68,9 @@ describe('原生 Canvas 纯投影', () => {
 
     expect(nodes.map((node) => [node.id, node.type, node.position])).toEqual([
       ['agent-1', 'canvasAgent', { x: 1, y: 2 }],
-      ['image-1', 'canvasUnsupported', { x: 3, y: 4 }],
-      ['doc-1', 'canvasUnsupported', { x: 5, y: 6 }],
-      ['web-1', 'canvasUnsupported', { x: 7, y: 8 }],
+      ['image-1', 'canvasImage', { x: 3, y: 4 }],
+      ['doc-1', 'canvasDocument', { x: 5, y: 6 }],
+      ['web-1', 'canvasWebview', { x: 7, y: 8 }],
     ])
     expect(nodes.every((node) => node.width === 288 && node.height === 144)).toBe(true)
     expect(nodes.find((node) => node.id === 'agent-1')?.handles).toEqual([{
@@ -80,16 +82,21 @@ describe('原生 Canvas 纯投影', () => {
     expect(nodes.filter((node) => node.id !== 'agent-1' && node.id !== 'image-1')
       .every((node) => node.handles?.length === 0)).toBe(true)
     expect(nodes[0]?.data).toEqual({
-      id: 'agent-1', title: '研究助手', agentSessionId: 'session-1', status: 'idle', canExpand: false,
+      id: 'agent-1', kind: 'agent', title: '研究助手', agentSessionId: 'session-1',
+      status: 'idle', statusLabel: '空闲', summary: '独立 Agent 会话', canExpand: true,
+      onExpand: expect.any(Function),
     })
     expect(nodes[1]?.data).toMatchObject({
-      imageModuleId: 'image-1', adoptedAssetId: 'asset-1', unsupportedLabel: '当前版本暂不支持',
+      kind: 'image', imageModuleId: 'image-1', adoptedAssetId: 'asset-1',
+      statusLabel: '已有素材', summary: '已采用画布素材', canExpand: true,
     })
     expect(nodes[2]?.data).toMatchObject({
-      documentId: 'document-1', contentRevision: 2, unsupportedLabel: '当前版本暂不支持',
+      kind: 'document', documentId: 'document-1', contentRevision: 2,
+      statusLabel: '已创建', summary: '内容版本 2', canExpand: true,
     })
     expect(nodes[3]?.data).toMatchObject({
-      prototypeId: 'prototype-1', contentRevision: 3, unsupportedLabel: '当前版本暂不支持',
+      kind: 'webview', prototypeId: 'prototype-1', contentRevision: 3,
+      statusLabel: '已创建', summary: '内容版本 3', canExpand: true,
     })
     expect(serialized).not.toContain('messages')
     expect(serialized).not.toContain('messageCount')

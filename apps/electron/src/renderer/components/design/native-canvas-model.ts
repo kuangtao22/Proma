@@ -9,7 +9,9 @@ import type {
 } from '@proma/shared'
 import { Position } from '@xyflow/react'
 import type { Edge, Node, NodeHandle } from '@xyflow/react'
+import { AGENT_STATUS_LABELS } from './CanvasAgentNode'
 import type { CanvasAgentNodeData, CanvasAgentFlowNode } from './CanvasAgentNode'
+import type { CanvasNodeCardData } from './CanvasNodeCard'
 
 /** 首版原生 Canvas 节点固定宽度，避免状态变化引发重排。 */
 export const NATIVE_CANVAS_NODE_WIDTH = 288
@@ -17,9 +19,6 @@ export const NATIVE_CANVAS_NODE_WIDTH = 288
 export const NATIVE_CANVAS_NODE_HEIGHT = 144
 /** 新增节点之间保留的最小间距，避免边框与选中环相互遮挡。 */
 export const NATIVE_CANVAS_NODE_GAP = 24
-/** 未正式接入的节点类别统一使用简洁占位。 */
-export const NATIVE_CANVAS_UNSUPPORTED_LABEL = '当前版本暂不支持'
-
 /** 新节点避让只依赖已有节点的持久化位置。 */
 export interface NativeCanvasPositionedNode {
   position: DesignPoint
@@ -85,28 +84,27 @@ export function overlapsNativeCanvasNodes(
   ))
 }
 
-/** Agent 节点投影使用的运行时状态和命令能力。 */
+/** 四类节点投影使用的运行时状态和轻量命令能力。 */
 export interface NativeCanvasProjectionOptions {
   nodeIssues: CanvasNodeIssue[]
   runningSessionIds: ReadonlySet<string>
-  canExpand: boolean
-  onExpand: (nodeId: string) => void
+  canCreateChild: boolean
+  onCreateChild: (nodeId: string) => void
+  onWorkbenchNodeChange: (nodeId: string) => void
 }
 
 /** 默认投影不暴露运行态或扩展命令，保持纯文档调用兼容。 */
 const DEFAULT_NATIVE_CANVAS_PROJECTION_OPTIONS: NativeCanvasProjectionOptions = {
   nodeIssues: [],
   runningSessionIds: new Set<string>(),
-  canExpand: false,
-  onExpand: () => undefined,
+  canCreateChild: false,
+  onCreateChild: () => undefined,
+  onWorkbenchNodeChange: () => undefined,
 }
 
-/** 暂未接入交互的原生 Canvas 节点安全展示数据。 */
-export interface NativeCanvasUnsupportedNodeData extends Record<string, unknown> {
-  id: string
+/** 非 Agent 折叠节点只附带稳定业务引用，不读取引用内容。 */
+export interface NativeCanvasContentNodeData extends CanvasNodeCardData {
   kind: 'image' | 'document' | 'webview'
-  title: string
-  unsupportedLabel: typeof NATIVE_CANVAS_UNSUPPORTED_LABEL
   imageModuleId?: string
   adoptedAssetId?: string
   documentId?: string
@@ -114,10 +112,18 @@ export interface NativeCanvasUnsupportedNodeData extends Record<string, unknown>
   contentRevision?: number
 }
 
-/** XYFlow 中的未支持节点占位类型。 */
-export type NativeCanvasUnsupportedFlowNode = Node<NativeCanvasUnsupportedNodeData, 'canvasUnsupported'>
+/** XYFlow 中的生图折叠节点。 */
+export type NativeCanvasImageFlowNode = Node<NativeCanvasContentNodeData & { kind: 'image' }, 'canvasImage'>
+/** XYFlow 中的文档折叠节点。 */
+export type NativeCanvasDocumentFlowNode = Node<NativeCanvasContentNodeData & { kind: 'document' }, 'canvasDocument'>
+/** XYFlow 中的原型折叠节点。 */
+export type NativeCanvasWebviewFlowNode = Node<NativeCanvasContentNodeData & { kind: 'webview' }, 'canvasWebview'>
 /** 原生 Canvas 当前全部 XYFlow 节点联合。 */
-export type NativeCanvasFlowNode = CanvasAgentFlowNode | NativeCanvasUnsupportedFlowNode
+export type NativeCanvasFlowNode =
+  | CanvasAgentFlowNode
+  | NativeCanvasImageFlowNode
+  | NativeCanvasDocumentFlowNode
+  | NativeCanvasWebviewFlowNode
 
 /**
  * 从可视区域中心开始按顺时针方形环寻找首个不重叠位置。
@@ -249,57 +255,75 @@ export function toNativeCanvasFlowNodes(
       /** unavailable 优先于运行态，坏节点不得继续扩展。 */
       const unavailable = unavailableNodeIds.has(node.id)
       /** 只有可写且健康的 Agent 节点才能创建下游节点。 */
-      const canExpand = options.canExpand && !unavailable
+      const canCreateChild = options.canCreateChild && !unavailable
+      /** 当前 Agent 的轻量运行态不读取消息历史。 */
+      const status = unavailable
+        ? 'unavailable'
+        : options.runningSessionIds.has(node.agentSessionId) ? 'running' : 'idle'
       const data: CanvasAgentNodeData = {
         id: node.id,
+        kind: node.kind,
         title: node.title,
         agentSessionId: node.agentSessionId,
-        status: unavailable
-          ? 'unavailable'
-          : options.runningSessionIds.has(node.agentSessionId) ? 'running' : 'idle',
-        canExpand,
-        ...(canExpand ? { onExpand: options.onExpand } : {}),
+        status,
+        statusLabel: AGENT_STATUS_LABELS[status],
+        summary: unavailable ? '需要重建或删除节点' : '独立 Agent 会话',
+        canExpand: true,
+        onExpand: options.onWorkbenchNodeChange,
+        ...(canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
       }
       return { ...base, type: 'canvasAgent', data }
     }
     if (node.kind === 'image') {
       return {
         ...base,
-        type: 'canvasUnsupported',
+        type: 'canvasImage',
         data: {
           id: node.id,
           kind: node.kind,
           title: node.title,
           imageModuleId: node.imageModuleId,
           ...(node.adoptedAssetId ? { adoptedAssetId: node.adoptedAssetId } : {}),
-          unsupportedLabel: NATIVE_CANVAS_UNSUPPORTED_LABEL,
+          statusLabel: node.adoptedAssetId ? '已有素材' : '待创作',
+          summary: node.adoptedAssetId ? '已采用画布素材' : '尚未生成图片',
+          canExpand: true,
+          onExpand: options.onWorkbenchNodeChange,
+          ...(options.canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
         },
       }
     }
     if (node.kind === 'document') {
       return {
         ...base,
-        type: 'canvasUnsupported',
+        type: 'canvasDocument',
         data: {
           id: node.id,
           kind: node.kind,
           title: node.title,
           documentId: node.documentId,
           contentRevision: node.contentRevision,
-          unsupportedLabel: NATIVE_CANVAS_UNSUPPORTED_LABEL,
+          statusLabel: '已创建',
+          summary: `内容版本 ${node.contentRevision}`,
+          canExpand: true,
+          onExpand: options.onWorkbenchNodeChange,
+          ...(options.canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
         },
       }
     }
     return {
       ...base,
-      type: 'canvasUnsupported',
+      type: 'canvasWebview',
       data: {
         id: node.id,
         kind: node.kind,
         title: node.title,
         prototypeId: node.prototypeId,
         contentRevision: node.contentRevision,
-        unsupportedLabel: NATIVE_CANVAS_UNSUPPORTED_LABEL,
+        statusLabel: '已创建',
+        summary: `内容版本 ${node.contentRevision}`,
+        canExpand: true,
+        onExpand: options.onWorkbenchNodeChange,
+        ...(options.canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
       },
     }
   })

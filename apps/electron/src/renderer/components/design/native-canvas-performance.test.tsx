@@ -15,20 +15,36 @@ import {
 } from './native-canvas-model'
 
 describe('原生 Canvas 大画布性能预算', () => {
-  test('Given 1,000 个 Agent 节点 When 投影 Then 纯内存完成且 API 不接受消息读取器', () => {
+  test('Given 1,000 个四类折叠节点 When 投影 Then 纯内存完成且无边节点使用空 handles', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
-    document.nodes = Array.from({ length: 1_000 }, (_, index) => ({
-      id: `agent-${index}`,
-      kind: 'agent' as const,
-      title: `Agent ${index}`,
-      agentSessionId: `session-${index}`,
-      position: { x: (index % 40) * 320, y: Math.floor(index / 40) * 180 },
-    }))
+    document.nodes = Array.from({ length: 1_000 }, (_, index) => {
+      const position = { x: (index % 40) * 320, y: Math.floor(index / 40) * 180 }
+      const kindIndex = index % 4
+      if (kindIndex === 0) return {
+        id: `agent-${index}`, kind: 'agent' as const, title: `Agent ${index}`,
+        agentSessionId: `session-${index}`, position,
+      }
+      if (kindIndex === 1) return {
+        id: `image-${index}`, kind: 'image' as const, title: `生图 ${index}`,
+        imageModuleId: `image-module-${index}`, position,
+      }
+      if (kindIndex === 2) return {
+        id: `document-${index}`, kind: 'document' as const, title: `文档 ${index}`,
+        documentId: `document-content-${index}`, contentRevision: 0, position,
+      }
+      return {
+        id: `webview-${index}`, kind: 'webview' as const, title: `原型 ${index}`,
+        prototypeId: `prototype-${index}`, contentRevision: 0, position,
+      }
+    })
 
     const nodes = toNativeCanvasFlowNodes(document)
 
     expect(nodes).toHaveLength(1_000)
     expect(nodes.every((node) => node.handles?.length === 0)).toBe(true)
+    expect(new Set(nodes.map((node) => node.type))).toEqual(new Set([
+      'canvasAgent', 'canvasImage', 'canvasDocument', 'canvasWebview',
+    ]))
     expect(toNativeCanvasFlowNodes.length).toBe(1)
   })
 
@@ -97,6 +113,42 @@ describe('原生 Canvas 大画布性能预算', () => {
     )
 
     expect(captured?.onlyRenderVisibleElements).toBe(true)
+    expect(Object.keys(captured?.nodeTypes ?? {}).sort()).toEqual([
+      'canvasAgent', 'canvasDocument', 'canvasImage', 'canvasWebview',
+    ])
+  })
+
+  test('Given 折叠节点 When 单击和双击 Then 单击只选择而双击打开工作台', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [{
+      id: 'image-1', kind: 'image', title: '主视觉', imageModuleId: 'image-module-1',
+      position: { x: 0, y: 0 },
+    }]
+    const selected: Array<string | null> = []
+    const conversations: Array<string | null> = []
+    const workbenches: string[] = []
+    let captured: NativeCanvasFlowProps | undefined
+
+    renderToStaticMarkup(
+      <NativeCanvasGraph
+        document={document}
+        writable
+        selectedNodeId={null}
+        onMutation={() => {}}
+        onNodeSelect={(nodeId) => selected.push(nodeId)}
+        onConversationNodeChange={(nodeId) => conversations.push(nodeId)}
+        onWorkbenchNodeChange={(nodeId) => workbenches.push(nodeId)}
+        flowRenderer={(props) => { captured = props; return <div /> }}
+      />,
+    )
+
+    captured!.onNodeClick?.({} as never, captured!.nodes[0]!)
+    expect(selected).toEqual(['image-1'])
+    expect(conversations).toEqual([null])
+    expect(workbenches).toEqual([])
+
+    captured!.onNodeDoubleClick?.({} as never, captured!.nodes[0]!)
+    expect(workbenches).toEqual(['image-1'])
   })
 
   test('Given 深色主题 When 渲染原生 Canvas Then 根容器进入统一设计画布主题作用域', () => {

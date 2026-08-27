@@ -1,0 +1,65 @@
+import { describe, expect, test } from 'bun:test'
+import type { CanvasNodeKind } from '@proma/shared'
+import { ReactFlowProvider } from '@xyflow/react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { CanvasNodeCard } from './CanvasNodeCard'
+import type { CanvasNodeCardProps } from './CanvasNodeCard'
+
+/** 创建不含任何重内容读取能力的折叠卡片输入。 */
+function createProps(kind: CanvasNodeKind): CanvasNodeCardProps {
+  return {
+    id: `${kind}-1`,
+    kind,
+    title: '一个需要最多显示两行的很长节点标题',
+    statusLabel: '已创建',
+    summary: '这是只来自画布文档的单行摘要',
+    selected: kind === 'agent',
+    canExpand: true,
+    onExpand: () => undefined,
+    onCreateChild: () => undefined,
+  }
+}
+
+/** 在 XYFlow 上下文中渲染折叠节点卡片。 */
+function renderCard(kind: CanvasNodeKind): string {
+  return renderToStaticMarkup(
+    <ReactFlowProvider>
+      <CanvasNodeCard {...createProps(kind)} />
+    </ReactFlowProvider>,
+  )
+}
+
+describe('Canvas 通用折叠节点卡片', () => {
+  test.each([
+    ['agent', 'Agent'],
+    ['image', '生图'],
+    ['document', '文档'],
+    ['webview', '原型'],
+  ] as const)('Given %s 节点 When 折叠渲染 Then 显示类型和展开入口', (kind, label) => {
+    const html = renderCard(kind)
+
+    expect(html).toContain(`>${label}<`)
+    expect(html).toContain(`aria-label="展开${label}工作台"`)
+    expect(html).toContain('w-[288px]')
+    expect(html).toContain('h-[144px]')
+    expect(html).toContain('line-clamp-2')
+    expect(html).toContain('truncate')
+  })
+
+  test('Given 节点允许创建下游 When 折叠渲染 Then 保留节点侧扩展入口和静态端口', () => {
+    const html = renderCard('image')
+
+    expect(html).toContain('aria-label="从此节点扩展"')
+    expect(html).toContain('data-handleid="input"')
+    expect(html).toContain('data-handleid="output"')
+  })
+
+  test('Given 卡片输入 When 检查公开合同 Then 不接受内容加载函数', () => {
+    const props = createProps('document')
+    const propNames = Object.keys(props)
+
+    expect(propNames).not.toContain('loadContent')
+    expect(propNames).not.toContain('loadMessages')
+    expect(propNames).not.toContain('loadPreview')
+  })
+})
