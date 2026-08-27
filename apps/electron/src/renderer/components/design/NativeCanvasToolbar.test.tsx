@@ -25,6 +25,7 @@ describe('原生 Canvas 顶部工具栏', () => {
     expect(html).toContain('aria-pressed="true"')
     expect(html).toContain('aria-label="平移工具"')
     expect(html).toContain('aria-label="添加节点"')
+    expect(html).not.toContain('aria-haspopup="menu"')
     expect(html).toContain('aria-label="删除节点"')
   })
 

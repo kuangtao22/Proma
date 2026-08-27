@@ -361,6 +361,26 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(harness.getDocument().revision).toBe(1)
   })
 
+  test('Given committed Agent 节点已被用户移动 When LOAD 对账 Then 保留新位置且归属仍有效', async () => {
+    const harness = createHarness()
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    const document = harness.getDocument()
+    const node = document.nodes[0]
+    if (!node) throw new Error('测试 Agent 节点未创建')
+    harness.setDocument({
+      ...document,
+      revision: document.revision + 1,
+      nodes: [{ ...node, position: { x: 360, y: 240 } }],
+    })
+
+    const reconciled = await service.reconcile(harness.target)
+
+    expect(reconciled.snapshot.document.nodes[0]?.position).toEqual({ x: 360, y: 240 })
+    expect(reconciled.snapshot.nodeIssues).toEqual([])
+    expect(reconciled.documentChanged).toBe(false)
+  })
+
   test('Given 健康源节点 When 扩展 Agent Then 节点与边在同一 revision 提交', async () => {
     const harness = createHarness()
     const sourceNode = {
@@ -554,7 +574,9 @@ describe('Canvas Agent 节点创建事务', () => {
     harness.setDocument({
       ...document,
       nodes: [
-        ...document.nodes,
+        ...document.nodes.map((node) => (
+          node.id === 'node-1' ? { ...node, position: { x: 360, y: 240 } } : node
+        )),
         {
           id: 'image-1',
           kind: 'image',
@@ -581,7 +603,7 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(result.snapshot.document.nodes.find((node) => node.id === 'node-1')).toMatchObject({
       id: 'node-1',
       title: '首页设计 Agent',
-      position: { x: 120, y: 80 },
+      position: { x: 360, y: 240 },
       agentSessionId: REPLACEMENT_SESSION_ID,
     })
     expect(result.snapshot.document.edges).toEqual(harness.getDocument().edges)

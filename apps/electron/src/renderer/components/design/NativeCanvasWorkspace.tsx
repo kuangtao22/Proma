@@ -39,6 +39,7 @@ import {
 import {
   canReplayNativeCanvasPositionMutations,
   coalesceNativeCanvasMutationsForSave,
+  createNativeCanvasNodeRevealViewport,
   findAvailableNativeCanvasChildPosition,
   findAvailableNativeCanvasNodePosition,
   replayNativeCanvasPositionMutations,
@@ -54,6 +55,8 @@ export const NATIVE_CANVAS_REVISION_CONFLICT_CODE = 'CANVAS_REVISION_CONFLICT'
 export const NATIVE_CANVAS_COMMIT_UNCERTAIN_CODE = 'CANVAS_COMMIT_UNCERTAIN'
 /** 无法安全重放结构修改时显示的稳定冲突文本。 */
 export const NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE = 'Canvas 结构已在恢复期间变化，请处理本地结构冲突'
+/** 客户端在首帧前校正被面板裁剪的节点，SSR 保持无副作用。 */
+const useNativeCanvasLayoutEffect = typeof window === 'undefined' ? React.useEffect : React.useLayoutEffect
 
 /** controller 使用的最小原生 Canvas adapter 合同。 */
 export interface NativeCanvasAdapter {
@@ -764,7 +767,10 @@ export function NativeCanvasWorkspace({
   const rebuildCommandRef = React.useRef<CanvasAgentNodeRebuildController | null>(null)
   /** 删除异步回调代次，Canvas 切换后立即失效旧停止请求。 */
   const deleteGenerationRef = React.useRef(0)
-  const canvasViewportRef = React.useRef<HTMLDivElement | null>(null)
+  /** 新增落点与对话聚焦都必须使用收窄后的真实画布表面。 */
+  const canvasSurfaceRef = React.useRef<HTMLDivElement | null>(null)
+  /** 同一次面板打开只尝试聚焦一次，避免 viewport 保存形成反馈循环。 */
+  const revealedConversationKeyRef = React.useRef<string | null>(null)
   const [createState, setCreateState] = React.useState<CanvasAgentNodeCommandState>({
     loading: false,
     error: null,
@@ -834,7 +840,7 @@ export function NativeCanvasWorkspace({
         const nodes = latest?.snapshot?.document.nodes ?? []
         if (sourceNodeId) return findAvailableNativeCanvasChildPosition(sourceNodeId, nodes)
         const viewport = latest?.snapshot?.document.viewport ?? { x: 0, y: 0, zoom: 1 }
-        const bounds = canvasViewportRef.current?.getBoundingClientRect()
+        const bounds = canvasSurfaceRef.current?.getBoundingClientRect()
         /** 当前可视区域中心对应的世界坐标。 */
         const visibleCenter = {
           x: ((bounds?.width ?? 0) / 2 - viewport.x) / viewport.zoom,
@@ -917,6 +923,30 @@ export function NativeCanvasWorkspace({
         stopCanvasAgent: adapter.stopCanvasAgent,
       }
     : null
+  /** 只有真实渲染右侧面板时才收窄画布表面，避免工具栏和缩放控件被覆盖。 */
+  const conversationPanelOpen = Boolean(conversationNode && (conversationNodeIssue || conversationAdapter))
+
+  useNativeCanvasLayoutEffect(() => {
+    if (!conversationPanelOpen || !conversationNode || !state.snapshot) {
+      revealedConversationKeyRef.current = null
+      return
+    }
+    /** 每次显式打开一个节点面板只处理一次，关闭后允许再次检查。 */
+    const revealKey = `${stateKey}:${conversationNode.id}`
+    if (revealedConversationKeyRef.current === revealKey) return
+    const bounds = canvasSurfaceRef.current?.getBoundingClientRect()
+    const controller = controllerRef.current
+    if (!bounds || !controller) return
+    revealedConversationKeyRef.current = revealKey
+    /** 只有节点被面板裁剪时才平移，已可见节点保持用户 viewport 不变。 */
+    const nextViewport = createNativeCanvasNodeRevealViewport(
+      conversationNode.position,
+      state.snapshot.document.viewport,
+      { width: bounds.width, height: bounds.height },
+    )
+    if (!nextViewport) return
+    controller.enqueueMutation({ type: 'set-viewport', viewport: nextViewport })
+  }, [conversationNode, conversationPanelOpen, state.snapshot, stateKey])
   /** 保持生产默认组件不变，同时允许测试捕获 Workspace 提供的真实回调。 */
   const ConversationRenderer = conversationRenderer ?? CanvasAgentConversation
   /** 恢复、冲突以外的稳定状态允许结构命令。 */
@@ -1093,43 +1123,51 @@ export function NativeCanvasWorkspace({
             </Button>
           </div>
         ) : state.snapshot ? (
-          <div ref={canvasViewportRef} className="relative h-full">
-            <NativeCanvasToolbar
-              activeTool={state.activeTool}
-              writable={workspaceWritable}
-              canAdd={canCreateAgent}
-              canDelete={canDeleteNode}
-              issueCount={state.snapshot.nodeIssues.length}
-              onToolChange={(activeTool) => updateNativeCanvasState({
-                key: stateKey,
-                update: { activeTool },
-              })}
-              onAddAgent={() => { void commandRef.current?.execute().catch(() => undefined) }}
-              onDelete={requestSelectedNodeDelete}
-              onFocusFirstIssue={focusFirstIssue}
-            />
-            <NativeCanvasGraph
-              document={state.snapshot.document}
-              writable={workspaceWritable}
-              activeTool={state.activeTool}
-              nodeIssues={state.snapshot.nodeIssues}
-              runningSessionIds={runningSessionIds}
-              canExpand={canCreateAgent}
-              onExpand={(sourceNodeId) => {
-                void commandRef.current?.execute({ sourceNodeId }).catch(() => undefined)
-              }}
-              selectedNodeId={state.selectedNodeId}
-              onMutation={(mutation) => controllerRef.current?.enqueueMutation(mutation)}
-              onNodeSelect={(selectedNodeId) => updateNativeCanvasState({
-                key: stateKey,
-                update: { selectedNodeId },
-              })}
-              onConversationNodeChange={(conversationNodeId) => updateNativeCanvasState({
-                key: stateKey,
-                update: { conversationNodeId },
-              })}
-              flowRenderer={flowRenderer}
-            />
+          <div className="relative h-full">
+            <div
+              ref={canvasSurfaceRef}
+              data-native-canvas-surface
+              className={conversationPanelOpen
+                ? 'relative mr-[min(28rem,100%)] h-full min-w-0'
+                : 'relative h-full min-w-0'}
+            >
+              <NativeCanvasToolbar
+                activeTool={state.activeTool}
+                writable={workspaceWritable}
+                canAdd={canCreateAgent}
+                canDelete={canDeleteNode}
+                issueCount={state.snapshot.nodeIssues.length}
+                onToolChange={(activeTool) => updateNativeCanvasState({
+                  key: stateKey,
+                  update: { activeTool },
+                })}
+                onAddAgent={() => { void commandRef.current?.execute().catch(() => undefined) }}
+                onDelete={requestSelectedNodeDelete}
+                onFocusFirstIssue={focusFirstIssue}
+              />
+              <NativeCanvasGraph
+                document={state.snapshot.document}
+                writable={workspaceWritable}
+                activeTool={state.activeTool}
+                nodeIssues={state.snapshot.nodeIssues}
+                runningSessionIds={runningSessionIds}
+                canExpand={canCreateAgent}
+                onExpand={(sourceNodeId) => {
+                  void commandRef.current?.execute({ sourceNodeId }).catch(() => undefined)
+                }}
+                selectedNodeId={state.selectedNodeId}
+                onMutation={(mutation) => controllerRef.current?.enqueueMutation(mutation)}
+                onNodeSelect={(selectedNodeId) => updateNativeCanvasState({
+                  key: stateKey,
+                  update: { selectedNodeId },
+                })}
+                onConversationNodeChange={(conversationNodeId) => updateNativeCanvasState({
+                  key: stateKey,
+                  update: { conversationNodeId },
+                })}
+                flowRenderer={flowRenderer}
+              />
+            </div>
             {conversationNode && conversationNodeIssue ? (
               <CanvasAgentRecoveryPanel
                 key={`${target.projectId}:${target.canvasId}:${conversationNode.id}:recovery`}

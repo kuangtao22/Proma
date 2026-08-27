@@ -619,15 +619,25 @@ function assertNodeMatchesIntent(
   }
 }
 
-/** 重建后继续验证原创建 intent 拥有的稳定展示和布局字段。 */
-function assertNodeLayoutMatchesIntent(
+/** committed 后位置允许用户编辑，只继续验证原 session 与稳定展示身份。 */
+function assertCommittedNodeMatchesIntent(
   node: CanvasDocument['nodes'][number],
   intent: CanvasAgentNodeCreationIntent,
 ): asserts node is CanvasAgentNode {
   if (node.kind !== 'agent'
-    || node.title !== intent.title
-    || node.position.x !== intent.position.x
-    || node.position.y !== intent.position.y) {
+    || node.agentSessionId !== intent.sessionId
+    || node.title !== intent.title) {
+    throw new Error(`Canvas Agent 节点归属损坏: ${intent.nodeId}`)
+  }
+}
+
+/** 重建后 session 已换绑，只验证原创建 intent 拥有的稳定展示身份。 */
+function assertCommittedNodeDisplayMatchesIntent(
+  node: CanvasDocument['nodes'][number],
+  intent: CanvasAgentNodeCreationIntent,
+): asserts node is CanvasAgentNode {
+  if (node.kind !== 'agent'
+    || node.title !== intent.title) {
     throw new Error(`Canvas Agent 节点布局归属损坏: ${intent.nodeId}`)
   }
 }
@@ -1138,9 +1148,9 @@ export class CanvasAgentNodeCreationService {
         } else {
           const rebuildIntent = latestRebuildByNodeId.get(intent.nodeId)
           if (rebuildIntent) {
-            assertNodeLayoutMatchesIntent(node, intent)
+            assertCommittedNodeDisplayMatchesIntent(node, intent)
           } else {
-            assertNodeMatchesIntent(node, intent)
+            assertCommittedNodeMatchesIntent(node, intent)
           }
           assertRelationshipMatchesIntent(document, intent)
           if (!rebuildIntent

@@ -84,7 +84,7 @@ export interface NativeCanvasGraphProps {
   onMutation: (mutation: CanvasMutation) => void
   /** 只同步 XYFlow 当前选区，不隐式打开 Agent 对话。 */
   onNodeSelect: (nodeId: string | null) => void
-  /** 只响应显式节点点击或选区清空，控制 Agent 对话开关。 */
+  /** 只响应显式节点点击或空白 pane 点击，控制 Agent 对话开关。 */
   onConversationNodeChange: (nodeId: string | null) => void
   flowRenderer?: NativeCanvasFlowRenderer
 }
@@ -160,6 +160,15 @@ export function NativeCanvasGraph({
       selected: node.id === selectedNodeId,
     }))
   ))
+  /** 最新局部节点用于在同一批 React 更新内连续应用 XYFlow change。 */
+  const flowNodesRef = React.useRef(flowNodes)
+  flowNodesRef.current = flowNodes
+  /** 选中身份由 Canvas 单向管理，避免 XYFlow 派生选区再次反写形成反馈循环。 */
+  const selectedNodeIdRef = React.useRef(selectedNodeId)
+  selectedNodeIdRef.current = selectedNodeId
+  /** 父级回调保存在 ref 中，使 onNodesChange 不因父组件渲染而改变身份。 */
+  const onNodeSelectRef = React.useRef(onNodeSelect)
+  onNodeSelectRef.current = onNodeSelect
   /** viewport reducer 让挂载后的远端文档更新实际同步给 XYFlow。 */
   const [viewportState, setViewportState] = React.useState<NativeCanvasViewportState>({
     viewport: document.viewport,
@@ -180,7 +189,7 @@ export function NativeCanvasGraph({
 
   React.useEffect(() => {
     /** 权威文档变化时同步稳定展示字段与选中态。 */
-    setFlowNodes(toNativeCanvasFlowNodes(document, {
+    const nextNodes = toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
       canExpand: writable && canExpand,
@@ -188,17 +197,36 @@ export function NativeCanvasGraph({
     }).map((node) => ({
       ...node,
       selected: node.id === selectedNodeId,
-    })))
+    }))
+    flowNodesRef.current = nextNodes
+    setFlowNodes(nextNodes)
   }, [canExpand, document, nodeIssues, onExpand, runningSessionIds, selectedNodeId, writable])
 
   React.useEffect(() => {
     updateViewportState({ type: 'document-sync', viewport: document.viewport })
   }, [document.viewport, updateViewportState])
 
-  /** 逐帧节点变化只更新组件局部状态。 */
-  const handleNodesChange = React.useCallback<OnNodesChange<NativeCanvasFlowNode>>((changes) => {
-    setFlowNodes((current) => applyNodeChanges(changes, current))
+  /**
+   * 同步 Canvas 的单一选中身份。
+   * @param nodeId 用户交互产生的新选中节点；null 表示清空。
+   * @returns 无返回值；相同身份不会重复写入 Jotai。
+   */
+  const syncSelectedNodeId = React.useCallback((nodeId: string | null): void => {
+    if (selectedNodeIdRef.current === nodeId) return
+    selectedNodeIdRef.current = nodeId
+    onNodeSelectRef.current(nodeId)
   }, [])
+
+  /** 逐帧节点变化只更新组件局部状态；用户选择 change 同步到 Canvas 单选状态。 */
+  const handleNodesChange = React.useCallback<OnNodesChange<NativeCanvasFlowNode>>((changes) => {
+    const nextNodes = applyNodeChanges(changes, flowNodesRef.current)
+    flowNodesRef.current = nextNodes
+    setFlowNodes(nextNodes)
+    if (!changes.some((change) => change.type === 'select')) return
+    /** 当前合同只允许一个选中节点；框选返回多个时沿用文档顺序的首个节点。 */
+    const nextSelectedNodeId = nextNodes.find((node) => node.selected)?.id ?? null
+    syncSelectedNodeId(nextSelectedNodeId)
+  }, [syncSelectedNodeId])
 
   /** 拖动结束后把多选集合合成单一 move mutation。 */
   const handleNodeDragStop = React.useCallback<OnNodeDrag<NativeCanvasFlowNode>>((_event, node, nodes) => {
@@ -231,28 +259,16 @@ export function NativeCanvasGraph({
   /** 点击 Agent 时同时记录未来对话节点身份；其他节点只更新选中态。 */
   const handleNodeClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeClick']>>((_event, node) => {
     if (activeTool !== 'select') return
-    onNodeSelect(node.id)
+    syncSelectedNodeId(node.id)
     onConversationNodeChange(node.type === 'canvasAgent' ? node.id : null)
-  }, [activeTool, onConversationNodeChange, onNodeSelect])
-
-  /** XYFlow 选区变化只同步选中节点；仅在清空选区时同步关闭对话。 */
-  const handleSelectionChange = React.useCallback<NonNullable<NativeCanvasFlowProps['onSelectionChange']>>(({ nodes }) => {
-    /** 首个节点是单选合同下的唯一选区。 */
-    const node = nodes[0]
-    if (!node) {
-      onNodeSelect(null)
-      onConversationNodeChange(null)
-      return
-    }
-    onNodeSelect(node.id)
-  }, [onConversationNodeChange, onNodeSelect])
+  }, [activeTool, onConversationNodeChange, syncSelectedNodeId])
 
   /** 点击空白 pane 时立即清理选区，覆盖 XYFlow 未产生 selection change 的路径。 */
   const handlePaneClick = React.useCallback((): void => {
     if (activeTool !== 'select') return
-    onNodeSelect(null)
+    syncSelectedNodeId(null)
     onConversationNodeChange(null)
-  }, [activeTool, onConversationNodeChange, onNodeSelect])
+  }, [activeTool, onConversationNodeChange, syncSelectedNodeId])
 
   /** 受控 Flow 属性集中声明只读连线合同。 */
   const flowProps: NativeCanvasFlowProps = {
@@ -278,12 +294,11 @@ export function NativeCanvasGraph({
     onMove: handleMove,
     onMoveEnd: handleMoveEnd,
     onNodeClick: handleNodeClick,
-    onSelectionChange: handleSelectionChange,
     onPaneClick: handlePaneClick,
   }
 
   return (
-    <div className="relative h-full w-full" aria-label="Canvas 画布">
+    <div className="design-canvas relative h-full w-full" aria-label="Canvas 画布">
       {flowRenderer ? flowRenderer(flowProps) : (
         <ReactFlow<NativeCanvasFlowNode, Edge> {...flowProps}>
           <Background gap={24} size={1} />

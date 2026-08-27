@@ -1,4 +1,5 @@
 import * as React from 'react'
+import { Handle, Position } from '@xyflow/react'
 import type { Node, NodeProps } from '@xyflow/react'
 import { Bot, CircleAlert, LoaderCircle, Plus } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
@@ -51,6 +52,15 @@ export function CanvasAgentNode({ data, selected }: NodeProps<CanvasAgentFlowNod
   const statusLabel = AGENT_STATUS_LABELS[data.status]
   return (
     <div className="group relative h-[144px] w-[288px]">
+      <Handle
+        id="input"
+        type="target"
+        position={Position.Left}
+        isConnectable={false}
+        isConnectableStart={false}
+        isConnectableEnd={false}
+        className="!size-2 !border-2 !border-background !bg-muted-foreground"
+      />
       <article
         className={cn(
           'flex h-[144px] w-[288px] flex-col overflow-hidden rounded-[8px] border bg-card text-card-foreground shadow-sm',
@@ -74,6 +84,15 @@ export function CanvasAgentNode({ data, selected }: NodeProps<CanvasAgentFlowNod
           </div>
         </div>
       </article>
+      <Handle
+        id="output"
+        type="source"
+        position={Position.Right}
+        isConnectable={false}
+        isConnectableStart={false}
+        isConnectableEnd={false}
+        className="!size-2 !border-2 !border-background !bg-muted-foreground"
+      />
       {data.canExpand && data.status !== 'unavailable' && data.onExpand ? (
         <TooltipProvider delayDuration={200} disableHoverableContent>
           <Tooltip>

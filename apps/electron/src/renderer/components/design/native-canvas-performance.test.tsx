@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { NativeCanvasGraph, reduceNativeCanvasViewportState } from './NativeCanvasGraph'
 import type { NativeCanvasFlowProps } from './NativeCanvasGraph'
 import {
+  createNativeCanvasNodeRevealViewport,
   findAvailableNativeCanvasNodePosition,
   NATIVE_CANVAS_NODE_GAP,
   NATIVE_CANVAS_NODE_HEIGHT,
@@ -59,6 +60,26 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(elapsedMs).toBeLessThan(2_000)
   })
 
+  test('Given 对话面板裁掉选中节点 When 计算可见 viewport Then 保持缩放并把节点移回画布中心', () => {
+    const viewport = createNativeCanvasNodeRevealViewport(
+      { x: 400, y: 300 },
+      { x: 0, y: 0, zoom: 1 },
+      { width: 360, height: 600 },
+    )
+
+    expect(viewport).toEqual({ x: -364, y: -72, zoom: 1 })
+  })
+
+  test('Given 节点完整位于收窄画布 When 计算可见 viewport Then 不制造额外保存', () => {
+    const viewport = createNativeCanvasNodeRevealViewport(
+      { x: 40, y: 80 },
+      { x: 0, y: 0, zoom: 1 },
+      { width: 800, height: 600 },
+    )
+
+    expect(viewport).toBeNull()
+  })
+
   test('Given 原生 Canvas Graph When 构造 Flow Then 只渲染可见元素', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     let captured: NativeCanvasFlowProps | undefined
@@ -76,6 +97,24 @@ describe('原生 Canvas 大画布性能预算', () => {
     )
 
     expect(captured?.onlyRenderVisibleElements).toBe(true)
+  })
+
+  test('Given 深色主题 When 渲染原生 Canvas Then 根容器进入统一设计画布主题作用域', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+
+    const html = renderToStaticMarkup(
+      <NativeCanvasGraph
+        document={document}
+        writable
+        selectedNodeId={null}
+        onMutation={() => {}}
+        onNodeSelect={() => {}}
+        onConversationNodeChange={() => {}}
+        flowRenderer={() => <div />}
+      />,
+    )
+
+    expect(html).toContain('class="design-canvas relative h-full w-full"')
   })
 
   test('Given select 或 pan 工具 When 构造 Flow Then 交互配置互斥且布局稳定', () => {
@@ -221,7 +260,7 @@ describe('原生 Canvas 大画布性能预算', () => {
     })
   })
 
-  test('Given Agent 点击与视口结束 When 回调 Then 选择 Agent 并提交视口 mutation', () => {
+  test('Given Agent 点击后收到迟到空选区 When 用户未点击空白处 Then 保持对话直到显式 pane 点击', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     document.nodes = [{
       id: 'agent-1', kind: 'agent', title: 'Agent',
@@ -245,7 +284,11 @@ describe('原生 Canvas 大画布性能预算', () => {
 
     captured!.onNodeClick?.({} as never, captured!.nodes[0]!)
     captured!.onMoveEnd(null, { x: 4, y: 5, zoom: 1.2 })
-    captured!.onSelectionChange?.({ nodes: [], edges: [] })
+
+    expect(selected).toEqual(['agent-1'])
+    expect(conversations).toEqual(['agent-1'])
+    expect(captured!.onSelectionChange).toBeUndefined()
+    captured!.onPaneClick?.({} as never)
 
     expect(selected).toEqual(['agent-1', null])
     expect(conversations).toEqual(['agent-1', null])
@@ -253,5 +296,33 @@ describe('原生 Canvas 大画布性能预算', () => {
       type: 'set-viewport', viewport: { x: 4, y: 5, zoom: 1.2 },
     }])
     expect(captured?.multiSelectionKeyCode).toBeNull()
+  })
+
+  test('Given XYFlow 产生节点选择 change When 同步单选 Then 更新选中节点但不隐式打开对话', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: 'Agent',
+      agentSessionId: 'session-1', position: { x: 0, y: 0 },
+    }]
+    const selected: Array<string | null> = []
+    const conversations: Array<string | null> = []
+    let captured: NativeCanvasFlowProps | undefined
+    renderToStaticMarkup(
+      <NativeCanvasGraph
+        document={document}
+        writable
+        selectedNodeId={null}
+        onMutation={() => {}}
+        onNodeSelect={(nodeId) => selected.push(nodeId)}
+        onConversationNodeChange={(nodeId) => conversations.push(nodeId)}
+        flowRenderer={(props) => { captured = props; return <div /> }}
+      />,
+    )
+
+    captured!.onNodesChange?.([{ id: 'agent-1', type: 'select', selected: true }])
+
+    expect(selected).toEqual(['agent-1'])
+    expect(conversations).toEqual([])
+    expect(captured!.onSelectionChange).toBeUndefined()
   })
 })

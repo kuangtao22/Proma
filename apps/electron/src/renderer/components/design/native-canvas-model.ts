@@ -30,6 +30,48 @@ export interface NativeCanvasIdentifiedPositionedNode extends NativeCanvasPositi
   id: string
 }
 
+/** Renderer 可用于判断节点是否被面板裁剪的画布尺寸。 */
+export interface NativeCanvasSurfaceBounds {
+  width: number
+  height: number
+}
+
+/** 节点与画布边缘保留的最小屏幕间距。 */
+const NATIVE_CANVAS_REVEAL_PADDING = 24
+
+/**
+ * 节点被收窄画布裁剪时计算一次居中 viewport。
+ * @param position 节点左上角世界坐标。
+ * @param viewport 当前持久化 viewport。
+ * @param bounds 当前真实 Canvas surface 尺寸。
+ * @returns 节点已完整可见时返回 null，否则返回保持原缩放的新 viewport。
+ */
+export function createNativeCanvasNodeRevealViewport(
+  position: DesignPoint,
+  viewport: DesignViewport,
+  bounds: NativeCanvasSurfaceBounds,
+): DesignViewport | null {
+  if (bounds.width <= 0 || bounds.height <= 0) return null
+  /** 节点当前投影到 surface 内的屏幕边界。 */
+  const left = position.x * viewport.zoom + viewport.x
+  const top = position.y * viewport.zoom + viewport.y
+  const right = left + NATIVE_CANVAS_NODE_WIDTH * viewport.zoom
+  const bottom = top + NATIVE_CANVAS_NODE_HEIGHT * viewport.zoom
+  /** 完整落在安全区域内时不制造 viewport mutation 或磁盘写入。 */
+  if (left >= NATIVE_CANVAS_REVEAL_PADDING
+    && top >= NATIVE_CANVAS_REVEAL_PADDING
+    && right <= bounds.width - NATIVE_CANVAS_REVEAL_PADDING
+    && bottom <= bounds.height - NATIVE_CANVAS_REVEAL_PADDING) {
+    return null
+  }
+  /** 仅平移到当前 surface 中心，保留用户原有缩放级别。 */
+  return {
+    x: bounds.width / 2 - (position.x + NATIVE_CANVAS_NODE_WIDTH / 2) * viewport.zoom,
+    y: bounds.height / 2 - (position.y + NATIVE_CANVAS_NODE_HEIGHT / 2) * viewport.zoom,
+    zoom: viewport.zoom,
+  }
+}
+
 /** Agent 节点投影使用的运行时状态和命令能力。 */
 export interface NativeCanvasProjectionOptions {
   nodeIssues: CanvasNodeIssue[]

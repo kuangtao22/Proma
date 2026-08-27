@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { ReactFlowProvider } from '@xyflow/react'
 import type { NodeProps } from '@xyflow/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { CanvasAgentNode } from './CanvasAgentNode'
@@ -29,7 +30,11 @@ function renderNode(status: CanvasAgentStatus, selected = false, canExpand = fal
     width: 288,
     height: 144,
   } satisfies NodeProps<CanvasAgentFlowNode>
-  return renderToStaticMarkup(<CanvasAgentNode {...props} />)
+  return renderToStaticMarkup(
+    <ReactFlowProvider>
+      <CanvasAgentNode {...props} />
+    </ReactFlowProvider>,
+  )
 }
 
 describe('Canvas Agent 节点', () => {
@@ -57,5 +62,18 @@ describe('Canvas Agent 节点', () => {
     expect(html).toContain('h-[144px]')
     expect(html).toContain('break-words')
     expect(html).toContain('ring-2')
+  })
+
+  test('Given Agent 参与持久关系 When 渲染健康或坏节点 Then 固定输入输出端口始终存在', () => {
+    for (const status of ['idle', 'unavailable'] satisfies CanvasAgentStatus[]) {
+      const html = renderNode(status)
+
+      expect(html).toContain('data-handleid="input"')
+      expect(html).toContain('data-handleid="output"')
+      expect(html).toMatch(/data-handleid="input"[^>]*class="[^"]*\btarget\b/u)
+      expect(html).toMatch(/data-handleid="output"[^>]*class="[^"]*\bsource\b/u)
+      expect(html).not.toContain('connectablestart')
+      expect(html).not.toContain('connectableend')
+    }
   })
 })

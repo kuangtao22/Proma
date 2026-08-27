@@ -1034,19 +1034,56 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       conversationNodeId: null,
     })
 
-    /** close 后 XYFlow 可能补发同一受控节点的 selection change，不得借此重开对话。 */
-    flowProps?.onSelectionChange?.({ nodes: [flowProps.nodes[0]!], edges: [] })
+    /** close 后不再订阅 XYFlow 派生 selection，避免受控选区反写形成反馈循环。 */
+    expect(flowProps?.onSelectionChange).toBeUndefined()
     expect(store.get(nativeCanvasStatesAtom).get(stateKey)).toMatchObject({
-      selectedNodeId: 'agent-1',
+      selectedNodeId: null,
       conversationNodeId: null,
     })
+  })
 
-    /** 用户再次明确点击同一 Agent 节点时仍应正常重开对话。 */
-    flowProps?.onNodeClick?.({} as never, flowProps.nodes[0]!)
-    expect(store.get(nativeCanvasStatesAtom).get(stateKey)).toMatchObject({
+  test('Given Agent 对话面板已打开 When 渲染 Canvas Then 画布表面为右侧面板预留空间', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const snapshot = createSnapshot(7, target)
+    snapshot.document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: 'Agent 1',
+      agentSessionId: 'session-1', position: { x: 0, y: 0 },
+    }]
+    const store = createStore()
+    const stateKey = createNativeCanvasKey(target.projectId, target.canvasId)
+    store.set(nativeCanvasStatesAtom, new Map([[stateKey, {
+      ...createInitialNativeCanvasState(),
+      phase: 'ready',
+      snapshot,
       selectedNodeId: 'agent-1',
       conversationNodeId: 'agent-1',
-    })
+    }]]))
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          target={target}
+          title="Canvas 1"
+          adapter={{
+            loadCanvas: async () => snapshot,
+            saveCanvas: async () => snapshot.document,
+            onCanvasChanged: () => () => {},
+            getCanvasAgentMessages: async () => ({
+              sessionId: 'session-1',
+              owner: { ...target, nodeId: 'agent-1', title: 'Agent 1' },
+              messages: [],
+            }),
+            sendCanvasAgentMessage: async () => ({ ok: true }),
+            stopCanvasAgent: async () => undefined,
+          }}
+          flowRenderer={() => <div />}
+          conversationRenderer={() => <div data-testid="canvas-agent-conversation" />}
+        />
+      </Provider>,
+    )
+
+    expect(html).toMatch(/data-native-canvas-surface="true"[^>]*class="[^"]*mr-\[min\(28rem,100%\)\]/u)
+    expect(html).toMatch(/data-native-canvas-surface="true"[^>]*class="[^"]*relative/u)
   })
 
   test('Given Canvas A 创建中切换到 B When A 延迟成功 Then 不更新 B 的状态或节点', async () => {
