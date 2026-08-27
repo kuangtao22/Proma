@@ -120,6 +120,13 @@ function contentIdentity(node: CanvasNode): { kind: CanvasContentKind; contentId
   return null
 }
 
+/** 要求 content intent 只能引用三类受管内容节点。 */
+function requireContentIdentity(node: CanvasNode): { kind: CanvasContentKind; contentId: string } {
+  const identity = contentIdentity(node)
+  if (!identity) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
+  return identity
+}
+
 /** 严格重建 intent 内节点，避免未知字段绕过图 Store。 */
 function parseIntentNode(value: unknown): CanvasNode {
   if (!isRecord(value) || typeof value.kind !== 'string') throw new Error('CANVAS_CONTENT_INTENT_INVALID')
@@ -200,13 +207,32 @@ export function parseCanvasContentNodeIntent(value: unknown, target: CanvasTarge
     }).relationship
   })()
   const nodeIdentity = contentIdentity(node)
+  if (!nodeIdentity) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
   if (value.operation === 'migrate' && (!legacyContentSeeds || !isRecord(value.migrationDocument))) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
   if (value.operation !== 'migrate' && (legacyContentSeeds !== undefined || value.migrationDocument !== undefined)) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
   if ((value.operation === 'migrate' || value.operation === 'create') && (value.trashId !== undefined || trashEntry !== undefined)) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
   if (value.operation === 'restore' && (typeof value.trashId !== 'string' || !trashEntry)) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
-  if (value.operation === 'delete' && nodeIdentity && (typeof value.trashId !== 'string' || !trashEntry)) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
-  if (value.operation === 'delete' && !nodeIdentity && (value.trashId !== undefined || trashEntry !== undefined)) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
-  if (trashEntry && trashEntry.nodeId !== node.id) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
+  if (value.operation === 'delete' && (typeof value.trashId !== 'string' || !trashEntry)) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
+  if (trashEntry) {
+    const identityMatches = trashEntry.trashId === value.trashId
+      && trashEntry.nodeId === node.id
+      && trashEntry.kind === nodeIdentity.kind
+      && trashEntry.contentId === nodeIdentity.contentId
+      && trashEntry.title === node.title
+    if (!identityMatches) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
+    if (value.operation === 'delete'
+      && (trashEntry.position.x !== node.position.x
+        || trashEntry.position.y !== node.position.y
+        || trashEntry.deletedRevision !== value.expectedRevision
+        || trashEntry.deletedAt !== value.createdAt)) {
+      throw new Error('CANVAS_CONTENT_INTENT_INVALID')
+    }
+    if (value.operation === 'restore'
+      && (trashEntry.deletedRevision > (value.expectedRevision as number)
+        || trashEntry.deletedAt > (value.createdAt as number))) {
+      throw new Error('CANVAS_CONTENT_INTENT_INVALID')
+    }
+  }
   return {
     schemaVersion: 1, operation: value.operation, state: value.state as CanvasContentNodeState,
     operationId, projectId: target.projectId, canvasId: target.canvasId, node,
@@ -288,10 +314,17 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
 
   /** 推进一个未完成 intent，所有阶段均可安全重放。 */
   const advance = async (original: CanvasContentNodeIntent, initial: CanvasDocument, capability: CanvasDocumentMigrationCapability): Promise<{ intent: CanvasContentNodeIntent; document: CanvasDocument; changed: boolean; error?: Error }> => {
-    let intent = original
+    /** 即使测试注入或未来内部调用绕过扫描，也在副作用前重新执行完整严格解析。 */
+    let intent = parseCanvasContentNodeIntent(
+      original,
+      { projectId: original.projectId, canvasId: original.canvasId },
+      original.operationId,
+    )
     let document = initial
     let changed = false
     const target = { projectId: intent.projectId, canvasId: intent.canvasId }
+    /** 注入测试或未来调用方绕过 parser 时仍在副作用前拒绝 Agent 节点。 */
+    const intentIdentity = requireContentIdentity(intent.node)
     if (intent.operation === 'migrate') {
       if (!intent.migrationDocument
         || JSON.stringify(intent.migrationDocument) !== JSON.stringify(capability.snapshot.document)
@@ -318,7 +351,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       return { intent, document, changed }
     }
     if (intent.operation === 'create') {
-      const identity = contentIdentity(intent.node)!
+      const identity = intentIdentity
       if (intent.state === 'prepared') {
         try { await dependencies.contentStore.prepareEmptyContent(target, identity) } catch (error) {
           if (!(error instanceof Error) || !error.message.includes('CANVAS_CONTENT_COMMIT_UNCONFIRMED')) throw error
@@ -348,18 +381,6 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       return { intent, document, changed }
     }
     if (intent.operation === 'delete') {
-      const identity = contentIdentity(intent.node)
-      if (!identity) {
-        if (intent.node.kind !== 'agent') throw new Error('CANVAS_NODE_IDENTITY_CONFLICT')
-        dependencies.assertAgentNodeIdle(intent.node.id, intent.node.agentSessionId)
-        if (document.nodes.some((node) => node.id === intent.node.id)) {
-          document = dependencies.store.mutate(target, document.revision, [{ type: 'remove-nodes', nodeIds: [intent.node.id] }])
-          changed = true
-        }
-        intent = transition(intent, 'committed', now)
-        const error = await write(intent, capability)
-        return { intent, document, changed, ...(error ? { error } : {}) }
-      }
       if (!intent.trashEntry) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
       if (intent.state === 'prepared') {
         try { await dependencies.contentStore.moveToTrash(target, intent.trashEntry) } catch (error) {
@@ -443,7 +464,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       if (reconciled.capability.migratedFrom !== 1) return reconciled.result
       const operationId = randomUUID()
       const document = reconciled.capability.snapshot.document
-      const representative = document.nodes.find((node) => node.kind !== 'agent') ?? document.nodes[0]
+      const representative = document.nodes.find((node) => node.kind !== 'agent')
       if (!representative) {
         /** 空 v1 图没有内容副作用，直接由同次 CAS capability 完成纯 schema 提升。 */
         const migrated = reconciled.capability.commitMigration()
@@ -488,7 +509,15 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       if (document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
       const node = document.nodes.find((candidate) => candidate.id === input.nodeId)
       if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
-      if (node.kind === 'agent') dependencies.assertAgentNodeIdle(node.id, node.agentSessionId)
+      if (node.kind === 'agent') {
+        dependencies.assertAgentNodeIdle(node.id, node.agentSessionId)
+        const deleted = dependencies.store.mutate(
+          targetFrom(input),
+          document.revision,
+          [{ type: 'remove-nodes', nodeIds: [node.id] }],
+        )
+        return { snapshot: snapshot(deleted) }
+      }
       const identity = contentIdentity(node)
       const timestamp = now()
       const trashId = identity ? randomUUID() : undefined
