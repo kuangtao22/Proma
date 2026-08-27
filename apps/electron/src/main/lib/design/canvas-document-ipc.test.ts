@@ -13,6 +13,7 @@ import type {
   SDKMessage,
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
+import { parseCanvasDocument } from './canvas-document-store'
 import { registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
 
 /** 测试 IPC handler 的最小签名。 */
@@ -355,7 +356,11 @@ describe('原生 Canvas 文档 IPC', () => {
       { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { ...target, revision: 5, cause: 'graph' } },
       { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { ...target, revision: 5, cause: 'graph' } },
     ])
-    expect(JSON.stringify([createResult, deleteResult, listResult, restoreResult])).not.toContain('path')
+    /** 序列化公开结果，用于统一检查内部身份不会进入普通可见响应。 */
+    const serializedResults = JSON.stringify([createResult, deleteResult, listResult, restoreResult])
+    expect(serializedResults).not.toContain('path')
+    expect(serializedResults).not.toContain('session')
+    expect(context.agentCalls).toEqual([])
   })
 
   test('Given 内容命令含未知字段、sessionId、path 或 getter When IPC 调用 Then 拒绝且不进入 lifecycle', async () => {
@@ -389,6 +394,39 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.sender.sent).toEqual([{ channel: CANVAS_IPC_CHANNELS.CHANGED, value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' } }])
     expect(result).toEqual({ ok: false, error: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' } })
     expect(context.broadcastLeaseStates).toEqual([false])
+    errorSpy.mockRestore()
+  })
+
+  test('Given Agent 与内容对账发布相同 revision 且当前操作发布更高 revision When 删除失败 Then 按 revision 去重并保持顺序', async () => {
+    /** 当前操作失败日志不属于公开合同，测试只观察安全结果与广播。 */
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    /** 组合相同历史 revision 与更高当前 publication 的 IPC 上下文。 */
+    const context = createContext({
+      reconcileResult: {
+        snapshot: { document: createDocument(5), writable: true, nodeIssues: [] },
+        documentChanged: true,
+      },
+      contentReconciliationPublication: createDocument(5),
+      contentOperationPublication: createDocument(6),
+      contentOperationError: new Error('CANVAS_CONTENT_WRITE_FAILED'),
+    })
+
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.DELETE_NODE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-content',
+      operationId: '77777777-7777-4777-8777-777777777777', expectedRevision: 5,
+    })
+
+    expect(context.sender.sent).toEqual([
+      {
+        channel: CANVAS_IPC_CHANNELS.CHANGED,
+        value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' },
+      },
+      {
+        channel: CANVAS_IPC_CHANNELS.CHANGED,
+        value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph' },
+      },
+    ])
+    expect(context.broadcastLeaseStates).toEqual([false, false])
     errorSpy.mockRestore()
   })
 
@@ -442,6 +480,46 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.calls).toEqual([
       'readonly:project-1', 'guard:project-1', 'content:load', 'creation:reconcile',
     ])
+  })
+
+  test('Given schema v1 文档已规范化 When 经 IPC 加载并执行下一次写入 Then 公开文档始终为 v2', async () => {
+    /** 迁移解析与 IPC 调用共享的稳定双身份。 */
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    /** 真实 v1 parser 输出的规范化 v2 文档。 */
+    const migrated = parseCanvasDocument({
+      schemaVersion: 1,
+      ...target,
+      revision: 4,
+      createdAt: 1,
+      updatedAt: 2,
+      viewport: { x: 0, y: 0, zoom: 1 },
+      nodes: [{
+        id: 'legacy-document', kind: 'visual-document', title: '旧文档',
+        position: { x: 0, y: 0 }, visualDocumentId: 'document-1',
+      }],
+      edges: [],
+    }, target).document
+    /** 模拟迁移后下一次正常 mutation 的 v2 写入结果。 */
+    const written = { ...migrated, revision: 5, updatedAt: 3 }
+    /** IPC 上下文同时返回迁移快照与后续写入结果。 */
+    const context = createContext({
+      loadResult: { document: migrated, writable: true, nodeIssues: [] },
+      mutateResult: written,
+    })
+
+    /** Renderer 通过 LOAD 获得的公开迁移结果。 */
+    const loaded = await invoke(
+      context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, target,
+    ) as CanvasInvokeResult<CanvasWorkspaceSnapshot>
+    /** Renderer 在迁移基线上执行下一次写入获得的公开结果。 */
+    const saved = await invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, {
+      ...target,
+      expectedRevision: 4,
+      mutations: [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
+    }) as CanvasInvokeResult<CanvasDocument>
+
+    expect(loaded).toHaveProperty('value.document.schemaVersion', 2)
+    expect(saved).toHaveProperty('value.schemaVersion', 2)
   })
   test('Given 内部 LOAD 异常含路径和 UUID When IPC 返回 Then 只暴露公开文案', async () => {
     const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)

@@ -107,14 +107,38 @@ describe('Design preload', () => {
 
   test('Given 内容节点通道 rejection When preload 调用 Then 每类操作返回固定公开错误', async () => {
     const recorded = createRecordingIpc()
-    recorded.ipc.invoke = async () => { throw new Error('/Users/private/canvas intent failed') }
+    recorded.ipc.invoke = async () => {
+      throw new Error(
+        '/Users/private/.proma/canvases/canvas-1/nodes/content-1 '
+        + 'trash/trash-1 transactions/intent.json apiKey=credential-secret',
+      )
+    }
     const api = createDesignPreloadApi(recorded.ipc)
     const target = { projectId: 'p1', canvasId: 'canvas-1' }
 
-    expect(await api.createCanvasContentNode({ ...target, operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1', kind: 'document', contentId: 'content-1', title: '文档', position: { x: 0, y: 0 }, expectedRevision: 0 })).toEqual({ ok: false, error: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' } })
-    expect(await api.deleteCanvasNode({ ...target, operationId: '22222222-2222-4222-8222-222222222222', nodeId: 'node-1', expectedRevision: 1 })).toEqual({ ok: false, error: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' } })
-    expect(await api.listCanvasTrash(target)).toEqual({ ok: false, error: { code: 'CANVAS_CONTENT_INVALID', message: '回收区暂时无法加载。' } })
-    expect(await api.restoreCanvasNode({ ...target, operationId: '33333333-3333-4333-8333-333333333333', trashId: 'trash-1', expectedRevision: 2, position: { x: 1, y: 2 } })).toEqual({ ok: false, error: { code: 'CANVAS_RESTORE_FAILED', message: '节点恢复失败，请重试。' } })
+    /** 四类内容 lifecycle 调用的公开失败结果。 */
+    const results = [
+      await api.createCanvasContentNode({ ...target, operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1', kind: 'document', contentId: 'content-1', title: '文档', position: { x: 0, y: 0 }, expectedRevision: 0 }),
+      await api.deleteCanvasNode({ ...target, operationId: '22222222-2222-4222-8222-222222222222', nodeId: 'node-1', expectedRevision: 1 }),
+      await api.listCanvasTrash(target),
+      await api.restoreCanvasNode({ ...target, operationId: '33333333-3333-4333-8333-333333333333', trashId: 'trash-1', expectedRevision: 2, position: { x: 1, y: 2 } }),
+    ]
+
+    expect(results).toEqual([
+      { ok: false, error: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' } },
+      { ok: false, error: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' } },
+      { ok: false, error: { code: 'CANVAS_CONTENT_INVALID', message: '回收区暂时无法加载。' } },
+      { ok: false, error: { code: 'CANVAS_RESTORE_FAILED', message: '节点恢复失败，请重试。' } },
+    ])
+    /** 聚合公开结果，集中检查所有内部信息均被错误封装丢弃。 */
+    const serialized = JSON.stringify(results)
+    /** 主进程异常中不得穿透 Preload 的内部字段与凭据片段。 */
+    for (const internalValue of [
+      '/Users/private', '.proma', 'nodes/content-1', 'trash/trash-1',
+      'transactions', 'intent.json', 'apiKey', 'credential-secret',
+    ]) {
+      expect(serialized).not.toContain(internalValue)
+    }
   })
 
   test('Given change 订阅 When 推送并取消 Then 使用同一个 listener 引用', () => {

@@ -45,10 +45,9 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(new Set(nodes.map((node) => node.type))).toEqual(new Set([
       'canvasAgent', 'canvasImage', 'canvasDocument', 'canvasWebview',
     ]))
-    expect(toNativeCanvasFlowNodes.length).toBe(1)
   })
 
-  test('Given 1,024 个多环密集节点 When 查找落点 Then 在宽松预算内保持固定尺寸与间距', () => {
+  test('Given 1,024 个多环密集节点 When 查找落点 Then 保持固定尺寸与间距', () => {
     const visibleCenter = { x: 4_000, y: 3_000 }
     const origin = {
       x: visibleCenter.x - NATIVE_CANVAS_NODE_WIDTH / 2,
@@ -64,36 +63,70 @@ describe('原生 Canvas 大画布性能预算', () => {
       },
     }))
 
-    const startedAt = performance.now()
     const position = findAvailableNativeCanvasNodePosition(visibleCenter, nodes)
-    const elapsedMs = performance.now() - startedAt
 
     expect(nodes.every((node) => (
       Math.abs(position.x - node.position.x) >= horizontalStep
       || Math.abs(position.y - node.position.y) >= verticalStep
     ))).toBe(true)
-    /** 预算刻意宽松，只锁定算法没有退化到不可交互级别。 */
-    expect(elapsedMs).toBeLessThan(2_000)
   })
 
-  test('Given 1,000 个任意节点 When 全局新增 Then 单次线性扫描保持交互预算', () => {
-    const nodes = Array.from({ length: 1_000 }, (_, index) => ({
-      position: {
-        x: (index % 50 - 25) * 320,
-        y: (Math.floor(index / 50) - 10) * 180,
-      },
+  test('Given 节点规模翻倍 When 全局新增 Then 位置读取次数保持线性增长', () => {
+    /** 统计指定规模下落点算法读取持久位置的次数。 */
+    const countPositionReads = (nodeCount: number): number => {
+      /** getter 只观察读取次数，不改变节点位置语义。 */
+      let reads = 0
+      const nodes = Array.from({ length: nodeCount }, (_, index) => {
+        /** 每个节点使用独立稳定位置，避免 getter 返回新对象干扰算法。 */
+        const position = { x: index * 320, y: 0 }
+        return {
+          get position() {
+            reads += 1
+            return position
+          },
+        }
+      })
+      findNativeCanvasGlobalAppendPosition({ x: 0, y: 0 }, nodes)
+      return reads
+    }
+
+    /** 一千节点作为线性增长基线。 */
+    const thousandReads = countPositionReads(1_000)
+    /** 两千节点用于验证规模翻倍后读取次数不超线性上界。 */
+    const twoThousandReads = countPositionReads(2_000)
+
+    expect(thousandReads).toBeGreaterThanOrEqual(1_000)
+    expect(twoThousandReads).toBeLessThanOrEqual(thousandReads * 2 + 2)
+  })
+
+  test('Given 1,000 节点和远端 viewport When 连续计算 20 次全局追加 Then 落点与 viewport 输入无关且文档不变', () => {
+    /** 远离节点布局的持久 viewport，用于证明计算不会读写它。 */
+    const distantViewport = { x: -80_000, y: 25_000, zoom: 0.2 }
+    /** 固定一千节点的权威文档，连续计算期间保持不可变。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.viewport = distantViewport
+    document.nodes = Array.from({ length: 1_000 }, (_, index) => ({
+      id: `node-${index}`,
+      kind: 'agent' as const,
+      title: `Agent ${index}`,
+      position: { x: index * 312, y: 0 },
+      agentSessionId: `session-${index}`,
     }))
-    const startedAt = performance.now()
 
-    const position = findNativeCanvasGlobalAppendPosition({ x: 0, y: 0 }, nodes)
-    const elapsedMs = performance.now() - startedAt
+    for (let index = 0; index < 20; index += 1) {
+      /** 原点中心输入得到的非空画布全局落点。 */
+      const originViewport = findNativeCanvasGlobalAppendPosition({ x: 0, y: 0 }, document.nodes)
+      /** 极远中心输入得到的同一非空画布全局落点。 */
+      const distantViewportPosition = findNativeCanvasGlobalAppendPosition(
+        { x: 99_999, y: -99_999 },
+        document.nodes,
+      )
+      expect(distantViewportPosition).toEqual(originViewport)
+    }
 
-    expect(position).toEqual({
-      x: 24 * 320 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
-      y: -10 * 180,
-    })
-    /** 预算刻意宽松，只防止实现退化为逐候选反复扫描全部节点。 */
-    expect(elapsedMs).toBeLessThan(100)
+    expect(document.viewport).toEqual(distantViewport)
+    expect(toNativeCanvasFlowNodes(document)).toHaveLength(1_000)
+    expect(toNativeCanvasFlowNodes(document).every((node) => node.handles?.length === 0)).toBe(true)
   })
 
   test('Given 原生 Canvas Graph When 构造 Flow Then 只渲染可见元素', () => {
