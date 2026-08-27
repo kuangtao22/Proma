@@ -832,6 +832,89 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     expect(updated.conversationNodeId).toBeNull()
   })
 
+  test('Given 当前 revision 更高且已含新节点 When 迟到创建结果返回 Then 保留当前文档并只选中新节点', () => {
+    const current = createInitialNativeCanvasState()
+    current.phase = 'ready'
+    current.snapshot = createSnapshot(8)
+    current.snapshot.document.viewport = { x: 90, y: 80, zoom: 1.6 }
+    current.snapshot.document.nodes = [{
+      id: 'node-new', kind: 'agent', title: '新 Agent',
+      agentSessionId: 'session-new', position: { x: 400, y: 200 },
+    }]
+    current.selectedNodeId = 'agent-existing'
+    current.conversationNodeId = 'agent-existing'
+    const pendingViewport: CanvasMutation = {
+      type: 'set-viewport', viewport: { x: 90, y: 80, zoom: 1.6 },
+    }
+    current.pendingMutations = [pendingViewport]
+    const currentDocument = current.snapshot.document
+    const staleDocument = createSnapshot(7).document
+    staleDocument.viewport = { x: 0, y: 0, zoom: 1 }
+    const result: CanvasAgentNodeCreationResult = {
+      document: staleDocument,
+      session: { id: 'session-new' } as never,
+    }
+
+    const update = createNativeCanvasAgentNodeSuccessUpdate(current, 'node-new', result)
+    const updated = { ...current, ...update }
+
+    expect(update).not.toHaveProperty('snapshot')
+    expect(updated.snapshot?.document).toBe(currentDocument)
+    expect(updated.snapshot?.document.viewport).toEqual({ x: 90, y: 80, zoom: 1.6 })
+    expect(updated.selectedNodeId).toBe('node-new')
+    expect(updated.conversationNodeId).toBe('agent-existing')
+    expect(updated.pendingMutations).toEqual([pendingViewport])
+  })
+
+  test('Given 当前 revision 更高且不含新节点 When 迟到创建结果返回 Then 保留当前文档与原选区', () => {
+    const current = createInitialNativeCanvasState()
+    current.phase = 'ready'
+    current.snapshot = createSnapshot(9)
+    current.snapshot.document.nodes = [{
+      id: 'agent-existing', kind: 'agent', title: '已有节点',
+      agentSessionId: 'session-existing', position: { x: 40, y: 60 },
+    }]
+    current.selectedNodeId = 'agent-existing'
+    const currentDocument = current.snapshot.document
+    const result: CanvasAgentNodeCreationResult = {
+      document: createSnapshot(8).document,
+      session: { id: 'session-new' } as never,
+    }
+
+    const update = createNativeCanvasAgentNodeSuccessUpdate(current, 'node-new', result)
+    const updated = { ...current, ...update }
+
+    expect(update).not.toHaveProperty('snapshot')
+    expect(updated.snapshot?.document).toBe(currentDocument)
+    expect(updated.selectedNodeId).toBe('agent-existing')
+  })
+
+  test('Given 当前与创建结果 revision 相等 When 创建成功 Then 正常接管结果并重放位置 mutation', () => {
+    const current = createInitialNativeCanvasState()
+    current.phase = 'ready'
+    current.snapshot = createSnapshot(5)
+    const pendingViewport: CanvasMutation = {
+      type: 'set-viewport', viewport: { x: 70, y: 50, zoom: 1.4 },
+    }
+    current.pendingMutations = [pendingViewport]
+    const equalRevisionDocument = createSnapshot(5).document
+    equalRevisionDocument.nodes = [{
+      id: 'node-new', kind: 'agent', title: '新 Agent',
+      agentSessionId: 'session-new', position: { x: 312, y: 0 },
+    }]
+    const result: CanvasAgentNodeCreationResult = {
+      document: equalRevisionDocument,
+      session: { id: 'session-new' } as never,
+    }
+
+    const update = createNativeCanvasAgentNodeSuccessUpdate(current, 'node-new', result)
+
+    expect(update.snapshot?.document.revision).toBe(5)
+    expect(update.snapshot?.document.nodes.map((node) => node.id)).toEqual(['node-new'])
+    expect(update.snapshot?.document.viewport).toEqual({ x: 70, y: 50, zoom: 1.4 })
+    expect(update.selectedNodeId).toBe('node-new')
+  })
+
   test('Given CREATE 异常含内部正文 When 创建失败 Then 按钮状态只保留固定公开文案', async () => {
     const states: CanvasAgentNodeCommandState[] = []
     const controller = createCanvasAgentNodeCommandController({

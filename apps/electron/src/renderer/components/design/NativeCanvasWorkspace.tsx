@@ -167,6 +167,16 @@ export function createNativeCanvasAgentNodeSuccessUpdate(
   nodeId: string,
   result: CanvasAgentNodeCreationResult,
 ): Partial<NativeCanvasState> {
+  /** 普通 graph 可能先于创建回调接管更高 revision，迟到结果不得倒退文档。 */
+  const currentDocument = current.snapshot?.document
+  if (currentDocument && currentDocument.revision > result.document.revision) {
+    /** 只有更高 revision 已包含新节点时才允许把选区切到该节点。 */
+    const containsCreatedNode = currentDocument.nodes.some((node) => node.id === nodeId)
+    return {
+      selectedNodeId: containsCreatedNode ? nodeId : current.selectedNodeId,
+      error: null,
+    }
+  }
   /** 创建请求在途期间已经投影的位置变更按真实发生顺序重新收集。 */
   const positionMutations = [
     ...current.inFlightMutations,
