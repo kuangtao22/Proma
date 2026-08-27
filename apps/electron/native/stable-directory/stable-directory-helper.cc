@@ -3,6 +3,7 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -24,6 +25,9 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -31,6 +35,8 @@ namespace {
 
 constexpr int kProtocol = 1;
 constexpr char kCanvasIntentLockName[] = ".canvas-intent.lock";
+constexpr char kCanvasContentLockName[] = ".content.lock";
+constexpr std::size_t kCanvasContentMaxFileBytes = 256 * 1024;
 
 struct Config {
   std::string mode = "list";
@@ -41,6 +47,8 @@ struct Config {
   std::set<std::string> ignore_directories;
   std::set<std::string> ignore_files;
   std::string child_name;
+  std::string entry_id;
+  std::string destination_child_name;
   std::string file_name;
 };
 
@@ -104,7 +112,9 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
     const std::string value = args[++index];
     if (key == "--mode") {
       if (value != "list" && value != "scan"
-          && value != "canvas-intent-scan" && value != "canvas-intent-write") {
+          && value != "canvas-intent-scan" && value != "canvas-intent-write"
+          && value != "canvas-content-write" && value != "canvas-content-read"
+          && value != "canvas-content-list" && value != "canvas-content-move") {
         *error = "unsupported mode";
         return false;
       }
@@ -134,6 +144,10 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
       config->ignore_files.insert(value);
     } else if (key == "--child-name") {
       config->child_name = value;
+    } else if (key == "--entry-id") {
+      config->entry_id = value;
+    } else if (key == "--destination-child-name") {
+      config->destination_child_name = value;
     } else if (key == "--file-name") {
       config->file_name = value;
     } else {
@@ -157,11 +171,46 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
     *error = "invalid canvas intent file contract";
     return false;
   }
+  const bool content_mode = config->mode.rfind("canvas-content-", 0) == 0;
+  const bool safe_child = config->child_name == "nodes" || config->child_name == "trash";
+  const bool needs_entry = config->mode != "canvas-content-list";
+  const bool needs_file = config->mode == "canvas-content-write"
+      || config->mode == "canvas-content-read";
+  const bool safe_file = config->file_name == "config.json" || config->file_name == "meta.json"
+      || config->file_name == "content.md" || config->file_name == "index.html"
+      || config->file_name == "entry.json";
+  const bool fields_match_mode = config->mode == "canvas-content-write"
+      ? config->destination_child_name.empty()
+      : config->mode == "canvas-content-read"
+        ? config->destination_child_name.empty()
+        : config->mode == "canvas-content-list"
+          ? config->entry_id.empty() && config->destination_child_name.empty()
+              && config->file_name.empty()
+          : config->file_name.empty();
+  if (content_mode && (config->roots.size() != 1 || !safe_child
+      || config->max_entries > 512 || !fields_match_mode
+      || (needs_entry && (config->entry_id.empty() || config->entry_id.size() > 128))
+      || (needs_file && !safe_file)
+      || (config->mode == "canvas-content-move"
+          && ((config->destination_child_name != "nodes" && config->destination_child_name != "trash")
+              || config->destination_child_name == config->child_name)))) {
+    *error = "invalid canvas content directory contract";
+    return false;
+  }
+  if (content_mode && needs_entry) {
+    for (unsigned char value : config->entry_id) {
+      if (!((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z')
+          || (value >= '0' && value <= '9') || value == '_' || value == '-')) {
+        *error = "invalid canvas content entry id";
+        return false;
+      }
+    }
+  }
   return true;
 }
 
-// 解码授权后 stdin 携带的 Base64 正文；输入编码文本，输出原始字节并限制 64 KiB。
-bool DecodeBase64(const std::string& encoded, std::string* output) {
+// 解码授权后 stdin 携带的 Base64 正文；输入编码文本、字节上限与输出指针。
+bool DecodeBase64(const std::string& encoded, std::size_t max_bytes, std::string* output) {
   static constexpr char kAlphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   int table[256];
@@ -183,7 +232,7 @@ bool DecodeBase64(const std::string& encoded, std::string* output) {
       bits -= 8;
       output->push_back(static_cast<char>((value >> bits) & 0xff));
       value &= bits == 0 ? 0 : ((std::uint32_t{1} << bits) - 1);
-      if (output->size() > 64 * 1024) return false;
+      if (output->size() > max_bytes) return false;
     }
   }
   return true;
@@ -237,12 +286,51 @@ std::string CanvasIntentWriteResultJson(const CanvasIntentWriteOutcome& outcome)
   return out.str();
 }
 
+// 序列化 Canvas 内容目录 move 结果；字段语义与原子写保持一致。
+std::string CanvasContentMoveResultJson(const CanvasIntentWriteOutcome& outcome) {
+  std::ostringstream out;
+  out << "{\"type\":\"move-result\",\"commitVisible\":"
+      << (outcome.commit_visible ? "true" : "false")
+      << ",\"durabilityUncertain\":"
+      << (outcome.durability_uncertain ? "true" : "false");
+  if (!outcome.error.empty()) out << ",\"error\":\"" << JsonEscape(outcome.error) << '"';
+  out << '}';
+  return out.str();
+}
+
+// 序列化 Canvas 内容文件读取结果；不返回路径，仅返回稳定身份与内存正文。
+std::string CanvasContentReadResultJson(const std::string& status, const std::string& content,
+                                        std::uint64_t size, const std::string& volume,
+                                        const std::string& file_id, const std::string& error) {
+  std::ostringstream out;
+  out << "{\"type\":\"read-result\",\"status\":\"" << status << '"';
+  if (status == "ok") {
+    out << ",\"content\":\"" << JsonEscape(content) << "\",\"size\":" << size
+        << ",\"volume\":\"" << JsonEscape(volume) << "\",\"fileId\":\""
+        << JsonEscape(file_id) << '"';
+  } else if (!error.empty()) {
+    out << ",\"error\":\"" << JsonEscape(error) << '"';
+  }
+  out << '}';
+  return out.str();
+}
+
+// 序列化 Canvas 内容根下的安全 entry 目录；不暴露绝对路径。
+std::string CanvasContentEntryJson(const std::string& name) {
+  return "{\"type\":\"entry\",\"rootIndex\":0,\"name\":\"" + JsonEscape(name)
+      + "\",\"path\":\"\",\"isDirectory\":true}";
+}
+
 // 解析 ALLOW 或 ALLOW\t<Base64> 决策；写模式返回已解码正文。
 bool ParseAuthorization(const Config& config, const std::string& decision, std::string* payload) {
-  if (config.mode != "canvas-intent-write") return decision == "ALLOW";
+  if (config.mode != "canvas-intent-write" && config.mode != "canvas-content-write") {
+    return decision == "ALLOW";
+  }
   constexpr char kPrefix[] = "ALLOW\t";
   if (decision.rfind(kPrefix, 0) != 0) return false;
-  return DecodeBase64(decision.substr(sizeof(kPrefix) - 1), payload);
+  const std::size_t limit = config.mode == "canvas-content-write"
+      ? kCanvasContentMaxFileBytes : 64 * 1024;
+  return DecodeBase64(decision.substr(sizeof(kPrefix) - 1), limit, payload);
 }
 
 // 提取跨平台路径末段；输入完整路径，返回文件或目录名。
@@ -377,6 +465,32 @@ class CanvasIntentLock {
   bool locked_ = false;
 };
 
+// 在 Canvas root 固定普通文件上持有内容操作跨进程排他锁。
+class CanvasContentLock {
+ public:
+  ~CanvasContentLock() { if (locked_) flock(descriptor_.Get(), LOCK_UN); }
+  bool Acquire(int canvas_root_fd, std::string* error) {
+    descriptor_.Reset(openat(canvas_root_fd, kCanvasContentLockName,
+        O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600));
+    struct stat identity {};
+    if (descriptor_.Get() < 0 || fstat(descriptor_.Get(), &identity) != 0
+        || !S_ISREG(identity.st_mode) || identity.st_nlink != 1) {
+      *error = "canvas content lock is unsafe";
+      return false;
+    }
+    while (flock(descriptor_.Get(), LOCK_EX) != 0) {
+      if (errno == EINTR) continue;
+      *error = "cannot lock canvas content";
+      return false;
+    }
+    locked_ = true;
+    return true;
+  }
+ private:
+  UniqueFd descriptor_;
+  bool locked_ = false;
+};
+
 // 保存授权前已打开的 POSIX root、canonical 路径与稳定身份。
 struct StableRoot {
   std::string requested_path;
@@ -504,6 +618,247 @@ bool WriteAndSync(int descriptor, const std::string& payload) {
     offset += static_cast<std::size_t>(written);
   }
   return fsync(descriptor) == 0;
+}
+
+// 在两个已打开目录之间执行禁止覆盖的原子 rename。
+bool RenameDirectoryNoReplace(int source_fd, const std::string& source_name,
+                              int destination_fd, const std::string& destination_name) {
+#ifdef __APPLE__
+  return renameatx_np(source_fd, source_name.c_str(), destination_fd,
+      destination_name.c_str(), RENAME_EXCL) == 0;
+#elif defined(__linux__)
+  constexpr unsigned int kRenameNoReplace = 1;
+  return syscall(SYS_renameat2, source_fd, source_name.c_str(), destination_fd,
+      destination_name.c_str(), kRenameNoReplace) == 0;
+#else
+  errno = ENOTSUP;
+  return false;
+#endif
+}
+
+// 在已授权 Canvas root 下创建或打开固定 nodes/trash 根，禁止 symlink 和非目录对象。
+bool OpenCanvasContentRoot(const StableRoot& root, const std::string& name, bool create,
+                           UniqueFd* directory, bool* missing, std::string* error) {
+  *missing = false;
+  if (!S_ISDIR(root.identity.st_mode)) { *error = "canvas root is not a directory"; return false; }
+  if (create && mkdirat(root.descriptor.Get(), name.c_str(), 0700) != 0 && errno != EEXIST) {
+    *error = "cannot create canvas content root";
+    return false;
+  }
+  directory->Reset(openat(root.descriptor.Get(), name.c_str(),
+      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+  if (directory->Get() < 0 && !create && errno == ENOENT) { *missing = true; return true; }
+  struct stat identity {};
+  if (directory->Get() < 0 || fstat(directory->Get(), &identity) != 0 || !S_ISDIR(identity.st_mode)) {
+    *error = "canvas content root is unsafe";
+    return false;
+  }
+  return true;
+}
+
+// 在固定内容根下创建或打开单个安全 entry 目录。
+bool OpenCanvasContentEntry(int content_root_fd, const std::string& entry_id, bool create,
+                            UniqueFd* entry, bool* missing, std::string* error) {
+  *missing = false;
+  if (create && mkdirat(content_root_fd, entry_id.c_str(), 0700) != 0 && errno != EEXIST) {
+    *error = "cannot create canvas content entry";
+    return false;
+  }
+  entry->Reset(openat(content_root_fd, entry_id.c_str(),
+      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+  if (entry->Get() < 0 && !create && errno == ENOENT) { *missing = true; return true; }
+  struct stat identity {};
+  if (entry->Get() < 0 || fstat(entry->Get(), &identity) != 0 || !S_ISDIR(identity.st_mode)) {
+    *error = "canvas content entry is unsafe";
+    return false;
+  }
+  return true;
+}
+
+// 在安全 entry fd 内原子覆盖一个白名单文件，返回 rename 精确阶段。
+CanvasIntentWriteOutcome WriteCanvasContentAtomic(const Config& config, const StableRoot& root,
+                                                  const std::string& payload) {
+  CanvasIntentWriteOutcome outcome;
+  CanvasContentLock lock;
+  if (!lock.Acquire(root.descriptor.Get(), &outcome.error)) return outcome;
+  UniqueFd content_root;
+  bool missing = false;
+  if (!OpenCanvasContentRoot(root, config.child_name, true, &content_root, &missing, &outcome.error)) return outcome;
+  UniqueFd entry;
+  if (!OpenCanvasContentEntry(content_root.Get(), config.entry_id, true, &entry, &missing, &outcome.error)) return outcome;
+  std::string temporary_name;
+  UniqueFd temporary;
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    temporary_name = ".content-" + std::to_string(getpid()) + "-"
+        + std::to_string(static_cast<unsigned long long>(std::random_device{}())) + ".tmp";
+    temporary.Reset(openat(entry.Get(), temporary_name.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+    if (temporary.Get() >= 0) break;
+    if (errno != EEXIST) { outcome.error = "cannot create canvas content temporary file"; return outcome; }
+  }
+  if (temporary.Get() < 0) { outcome.error = "cannot allocate canvas content temporary file"; return outcome; }
+  if (!WriteAndSync(temporary.Get(), payload)) {
+    unlinkat(entry.Get(), temporary_name.c_str(), 0);
+    outcome.error = "cannot persist canvas content temporary file";
+    return outcome;
+  }
+  if (renameat(entry.Get(), temporary_name.c_str(), entry.Get(), config.file_name.c_str()) != 0) {
+    unlinkat(entry.Get(), temporary_name.c_str(), 0);
+    outcome.error = "cannot commit canvas content file";
+    return outcome;
+  }
+  outcome.commit_visible = true;
+  if (fsync(entry.Get()) != 0 || fsync(content_root.Get()) != 0 || fsync(root.descriptor.Get()) != 0) {
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist canvas content directories";
+  }
+  return outcome;
+}
+
+// 比较 POSIX 内容文件的稳定身份、大小与纳秒时间状态。
+bool SameCanvasContentFileState(const struct stat& left, const struct stat& right) {
+  if (left.st_dev != right.st_dev || left.st_ino != right.st_ino
+      || left.st_size != right.st_size || !S_ISREG(right.st_mode)) return false;
+#ifdef __APPLE__
+  return left.st_mtimespec.tv_sec == right.st_mtimespec.tv_sec
+      && left.st_mtimespec.tv_nsec == right.st_mtimespec.tv_nsec
+      && left.st_ctimespec.tv_sec == right.st_ctimespec.tv_sec
+      && left.st_ctimespec.tv_nsec == right.st_ctimespec.tv_nsec;
+#else
+  return left.st_mtim.tv_sec == right.st_mtim.tv_sec
+      && left.st_mtim.tv_nsec == right.st_mtim.tv_nsec
+      && left.st_ctim.tv_sec == right.st_ctim.tv_sec
+      && left.st_ctim.tv_nsec == right.st_ctim.tv_nsec;
+#endif
+}
+
+// 在安全 entry 内 no-follow 读取白名单文件，并绑定路径与 fd 的稳定身份。
+std::string ReadCanvasContent(const Config& config, const StableRoot& root) {
+  CanvasContentLock lock;
+  std::string error;
+  if (!lock.Acquire(root.descriptor.Get(), &error)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", error);
+  }
+  UniqueFd content_root;
+  bool missing = false;
+  if (!OpenCanvasContentRoot(root, config.child_name, false, &content_root, &missing, &error)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", error);
+  }
+  if (missing) return CanvasContentReadResultJson("missing", "", 0, "", "", "");
+  UniqueFd entry;
+  if (!OpenCanvasContentEntry(content_root.Get(), config.entry_id, false, &entry, &missing, &error)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", error);
+  }
+  if (missing) return CanvasContentReadResultJson("missing", "", 0, "", "", "");
+  struct stat listed {};
+  if (fstatat(entry.Get(), config.file_name.c_str(), &listed, AT_SYMLINK_NOFOLLOW) != 0) {
+    if (errno == ENOENT) return CanvasContentReadResultJson("missing", "", 0, "", "", "");
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "cannot stat canvas content file");
+  }
+  if (!S_ISREG(listed.st_mode) || listed.st_nlink != 1 || listed.st_size < 0
+      || listed.st_size > static_cast<off_t>(kCanvasContentMaxFileBytes)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "canvas content file is unsafe");
+  }
+  UniqueFd file(openat(entry.Get(), config.file_name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+  struct stat opened {};
+  if (file.Get() < 0 || fstat(file.Get(), &opened) != 0
+      || !SameCanvasContentFileState(listed, opened)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "canvas content file changed before read");
+  }
+  std::string content(static_cast<std::size_t>(opened.st_size), '\0');
+  std::size_t offset = 0;
+  while (offset < content.size()) {
+    const ssize_t count = read(file.Get(), content.data() + offset, content.size() - offset);
+    if (count <= 0) return CanvasContentReadResultJson("corrupt", "", 0, "", "", "cannot read canvas content file");
+    offset += static_cast<std::size_t>(count);
+  }
+  struct stat final_file {};
+  struct stat final_path {};
+  if (fstat(file.Get(), &final_file) != 0
+      || fstatat(entry.Get(), config.file_name.c_str(), &final_path, AT_SYMLINK_NOFOLLOW) != 0
+      || !SameCanvasContentFileState(opened, final_file)
+      || !SameCanvasContentFileState(opened, final_path)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "canvas content file changed during read");
+  }
+  return CanvasContentReadResultJson("ok", content, static_cast<std::uint64_t>(opened.st_size),
+      std::to_string(opened.st_dev), std::to_string(opened.st_ino), "");
+}
+
+// 确定性列出固定内容根下的合法普通 entry 目录，忽略链接和杂项。
+bool ListCanvasContent(const Config& config, const StableRoot& root,
+                       EntryBudget* budget, std::string* error) {
+  CanvasContentLock lock;
+  if (!lock.Acquire(root.descriptor.Get(), error)) return false;
+  UniqueFd content_root;
+  bool missing = false;
+  if (!OpenCanvasContentRoot(root, config.child_name, false, &content_root, &missing, error)) return false;
+  if (missing) return true;
+  UniqueFd duplicate(dup(content_root.Get()));
+  if (duplicate.Get() < 0) { *error = "cannot duplicate canvas content root"; return false; }
+  DIR* raw_directory = fdopendir(duplicate.Release());
+  if (!raw_directory) { *error = "cannot enumerate canvas content root"; return false; }
+  std::unique_ptr<DIR, int (*)(DIR*)> directory(raw_directory, closedir);
+  std::vector<std::string> names;
+  while (dirent* item = readdir(directory.get())) {
+    const std::string name(item->d_name);
+    if (name.empty() || name.size() > 128) continue;
+    bool valid_name = true;
+    for (unsigned char value : name) {
+      if (!((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z')
+          || (value >= '0' && value <= '9') || value == '_' || value == '-')) valid_name = false;
+    }
+    if (!valid_name) continue;
+    struct stat listed {};
+    if (fstatat(content_root.Get(), name.c_str(), &listed, AT_SYMLINK_NOFOLLOW) != 0
+        || !S_ISDIR(listed.st_mode)) continue;
+    UniqueFd opened(openat(content_root.Get(), name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    struct stat opened_identity {};
+    if (opened.Get() < 0 || fstat(opened.Get(), &opened_identity) != 0
+        || opened_identity.st_dev != listed.st_dev || opened_identity.st_ino != listed.st_ino) continue;
+    names.push_back(name);
+  }
+  std::sort(names.begin(), names.end());
+  if (names.size() > config.max_entries) { *error = "canvas content entry limit exceeded"; return false; }
+  for (const std::string& name : names) {
+    if (!EmitLine(CanvasContentEntryJson(name), config, budget)) return false;
+    ++budget->entries;
+  }
+  return true;
+}
+
+// 在固定 nodes/trash 根之间相对原子移动 entry 目录，目标必须不存在。
+CanvasIntentWriteOutcome MoveCanvasContent(const Config& config, const StableRoot& root) {
+  CanvasIntentWriteOutcome outcome;
+  CanvasContentLock lock;
+  if (!lock.Acquire(root.descriptor.Get(), &outcome.error)) return outcome;
+  UniqueFd source_root;
+  UniqueFd destination_root;
+  bool missing = false;
+  if (!OpenCanvasContentRoot(root, config.child_name, false, &source_root, &missing, &outcome.error)) return outcome;
+  if (missing) { outcome.error = "canvas content move source missing"; return outcome; }
+  if (!OpenCanvasContentRoot(root, config.destination_child_name, true, &destination_root, &missing, &outcome.error)) return outcome;
+  struct stat source {};
+  if (fstatat(source_root.Get(), config.entry_id.c_str(), &source, AT_SYMLINK_NOFOLLOW) != 0
+      || !S_ISDIR(source.st_mode)) { outcome.error = "canvas content move source is unsafe"; return outcome; }
+  struct stat destination {};
+  if (fstatat(destination_root.Get(), config.entry_id.c_str(), &destination, AT_SYMLINK_NOFOLLOW) == 0) {
+    outcome.error = "canvas content move destination exists";
+    return outcome;
+  }
+  if (errno != ENOENT) { outcome.error = "cannot inspect canvas content move destination"; return outcome; }
+  if (!RenameDirectoryNoReplace(source_root.Get(), config.entry_id,
+      destination_root.Get(), config.entry_id)) {
+    outcome.error = errno == EEXIST ? "canvas content move destination exists"
+                                    : "cannot commit canvas content move";
+    return outcome;
+  }
+  outcome.commit_visible = true;
+  if (fsync(source_root.Get()) != 0 || fsync(destination_root.Get()) != 0
+      || fsync(root.descriptor.Get()) != 0) {
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist canvas content move";
+  }
+  return outcome;
 }
 
 // 写入前在同一 transactions fd 下统计合法普通 intent；覆盖不占新名额。
@@ -702,6 +1057,26 @@ int RunPlatform(const Config& config) {
   std::string decision;
   std::string payload;
   if (!std::getline(std::cin, decision) || !ParseAuthorization(config, decision, &payload)) return 3;
+  if (config.mode.rfind("canvas-content-", 0) == 0) {
+    std::string error;
+    if (config.mode == "canvas-content-write") {
+      const CanvasIntentWriteOutcome outcome = WriteCanvasContentAtomic(config, roots.front(), payload);
+      if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
+    } else if (config.mode == "canvas-content-read") {
+      if (!EmitLine(ReadCanvasContent(config, roots.front()), config, &budget)) return 4;
+    } else if (config.mode == "canvas-content-list") {
+      if (!ListCanvasContent(config, roots.front(), &budget, &error)) {
+        std::cerr << error << '\n';
+        return 4;
+      }
+    } else {
+      const CanvasIntentWriteOutcome outcome = MoveCanvasContent(config, roots.front());
+      if (!EmitLine(CanvasContentMoveResultJson(outcome), config, &budget)) return 4;
+    }
+    std::ostringstream done;
+    done << "{\"type\":\"done\",\"entryCount\":" << budget.entries << '}';
+    return EmitLine(done.str(), config, &budget) ? 0 : 4;
+  }
   if (config.mode == "canvas-intent-scan" || config.mode == "canvas-intent-write") {
     UniqueFd transactions;
     std::string error;
@@ -854,6 +1229,40 @@ class CanvasIntentLock {
   bool locked_ = false;
 };
 
+// 在 Canvas root 固定普通文件上持有 Windows 内容操作排他锁。
+class CanvasContentLock {
+ public:
+  ~CanvasContentLock() {
+    if (locked_) UnlockFileEx(handle_.Get(), 0, 1, 0, &overlapped_);
+  }
+  bool Acquire(HANDLE canvas_root, std::string* error) {
+    std::string open_error;
+    if (!OpenRelativeWindows(canvas_root, Utf8ToWide(kCanvasContentLockName),
+        FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE, &handle_, &open_error)) {
+      *error = "canvas content lock is unsafe";
+      return false;
+    }
+    BY_HANDLE_FILE_INFORMATION identity {};
+    if (!GetFileInformationByHandle(handle_.Get(), &identity)
+        || (identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0
+        || identity.nNumberOfLinks != 1) {
+      *error = "canvas content lock is unsafe";
+      return false;
+    }
+    if (!LockFileEx(handle_.Get(), LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped_)) {
+      *error = "cannot lock canvas content";
+      return false;
+    }
+    locked_ = true;
+    return true;
+  }
+ private:
+  UniqueHandle handle_;
+  OVERLAPPED overlapped_ {};
+  bool locked_ = false;
+};
+
 // 读取 Windows 句柄身份与内容时间状态，供读取前后完整绑定。
 bool ReadWindowsFileState(HANDLE handle, BY_HANDLE_FILE_INFORMATION* identity, FILE_BASIC_INFO* basic) {
   return GetFileInformationByHandle(handle, identity)
@@ -889,10 +1298,13 @@ std::uint64_t WindowsFileId(const BY_HANDLE_FILE_INFORMATION& identity) {
 }
 
 // 以禁止跟随 reparse point 的方式打开 root；返回稳定对象或错误。
-bool OpenStableRoot(const std::string& requested_path, StableRoot* root, std::string* error) {
+bool OpenStableRoot(const std::string& requested_path, StableRoot* root, std::string* error,
+                    bool content_access = false) {
   const std::wstring requested = Utf8ToWide(ToExtendedWindowsPath(requested_path));
   if (requested.empty()) { *error = "invalid UTF-8 root"; return false; }
-  UniqueHandle handle(CreateFileW(requested.c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+  const DWORD access = FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY
+      | (content_access ? FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD : 0);
+  UniqueHandle handle(CreateFileW(requested.c_str(), access,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
   if (handle.Get() == INVALID_HANDLE_VALUE) { *error = "cannot open root"; return false; }
@@ -941,6 +1353,300 @@ void DeleteTemporaryWindowsFile(HANDLE handle) {
   FILE_DISPOSITION_INFO disposition {};
   disposition.DeleteFile = TRUE;
   SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition));
+}
+
+// 相对 Canvas HANDLE 创建或打开固定 nodes/trash 根，并拒绝 reparse point。
+bool OpenCanvasContentRootWindows(const StableRoot& root, const std::string& name, bool create,
+                                  UniqueHandle* directory, bool* missing, std::string* error) {
+  *missing = false;
+  if ((root.identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    *error = "canvas root is not a directory";
+    return false;
+  }
+  if (!OpenRelativeWindows(root.handle.Get(), Utf8ToWide(name),
+      FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD
+          | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      create ? FILE_OPEN_IF : FILE_OPEN, FILE_DIRECTORY_FILE, directory, error)) {
+    if (!create) { *missing = true; return true; }
+    *error = "cannot create canvas content root";
+    return false;
+  }
+  BY_HANDLE_FILE_INFORMATION identity {};
+  if (!GetFileInformationByHandle(directory->Get(), &identity)
+      || (identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+      || (identity.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    *error = "canvas content root is unsafe";
+    return false;
+  }
+  return true;
+}
+
+// 相对固定内容根创建或打开安全 entry 目录。
+bool OpenCanvasContentEntryWindows(HANDLE content_root, const std::string& entry_id, bool create,
+                                   UniqueHandle* entry, bool* missing, std::string* error) {
+  *missing = false;
+  if (!OpenRelativeWindows(content_root, Utf8ToWide(entry_id),
+      FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD
+          | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+      create ? FILE_OPEN_IF : FILE_OPEN, FILE_DIRECTORY_FILE, entry, error)) {
+    if (!create) { *missing = true; return true; }
+    *error = "cannot create canvas content entry";
+    return false;
+  }
+  BY_HANDLE_FILE_INFORMATION identity {};
+  if (!GetFileInformationByHandle(entry->Get(), &identity)
+      || (identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+      || (identity.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    *error = "canvas content entry is unsafe";
+    return false;
+  }
+  return true;
+}
+
+// Windows 目录 flush 在部分文件系统不支持；仅真实 I/O 错误标记持久性未确认。
+bool FlushCanvasDirectoryWindows(HANDLE directory) {
+  if (FlushFileBuffers(directory)) return true;
+  const DWORD error = GetLastError();
+  return error == ERROR_INVALID_HANDLE || error == ERROR_ACCESS_DENIED;
+}
+
+// 在安全 entry HANDLE 内原子覆盖白名单文件。
+CanvasIntentWriteOutcome WriteCanvasContentAtomic(const Config& config, const StableRoot& root,
+                                                  const std::string& payload) {
+  CanvasIntentWriteOutcome outcome;
+  CanvasContentLock lock;
+  if (!lock.Acquire(root.handle.Get(), &outcome.error)) return outcome;
+  UniqueHandle content_root;
+  UniqueHandle entry;
+  bool missing = false;
+  if (!OpenCanvasContentRootWindows(root, config.child_name, true,
+      &content_root, &missing, &outcome.error)) return outcome;
+  if (!OpenCanvasContentEntryWindows(content_root.Get(), config.entry_id, true,
+      &entry, &missing, &outcome.error)) return outcome;
+  UniqueHandle temporary;
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    const std::wstring name = L".content-" + std::to_wstring(GetCurrentProcessId()) + L"-"
+        + std::to_wstring(static_cast<unsigned long long>(std::random_device{}())) + L".tmp";
+    if (OpenRelativeWindows(entry.Get(), name,
+        FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        FILE_CREATE, FILE_NON_DIRECTORY_FILE, &temporary, &outcome.error)) break;
+  }
+  if (temporary.Get() == INVALID_HANDLE_VALUE) {
+    outcome.error = "cannot allocate canvas content temporary file";
+    return outcome;
+  }
+  std::size_t offset = 0;
+  while (offset < payload.size()) {
+    const DWORD remaining = static_cast<DWORD>(std::min<std::size_t>(payload.size() - offset, MAXDWORD));
+    DWORD written = 0;
+    if (!WriteFile(temporary.Get(), payload.data() + offset, remaining, &written, nullptr) || written == 0) {
+      DeleteTemporaryWindowsFile(temporary.Get());
+      outcome.error = "cannot write canvas content temporary file";
+      return outcome;
+    }
+    offset += written;
+  }
+  if (!FlushFileBuffers(temporary.Get())) {
+    DeleteTemporaryWindowsFile(temporary.Get());
+    outcome.error = "cannot persist canvas content temporary file";
+    return outcome;
+  }
+  const std::wstring target = Utf8ToWide(config.file_name);
+  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target.size() * sizeof(wchar_t);
+  std::vector<unsigned char> rename_buffer(rename_size);
+  auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
+  rename_info->ReplaceIfExists = TRUE;
+  rename_info->RootDirectory = entry.Get();
+  rename_info->FileNameLength = static_cast<DWORD>(target.size() * sizeof(wchar_t));
+  std::memcpy(rename_info->FileName, target.data(), rename_info->FileNameLength);
+  if (!SetFileInformationByHandle(temporary.Get(), FileRenameInfo,
+      rename_info, static_cast<DWORD>(rename_buffer.size()))) {
+    DeleteTemporaryWindowsFile(temporary.Get());
+    outcome.error = "cannot commit canvas content file";
+    return outcome;
+  }
+  outcome.commit_visible = true;
+  if (!FlushCanvasDirectoryWindows(entry.Get()) || !FlushCanvasDirectoryWindows(content_root.Get())
+      || !FlushCanvasDirectoryWindows(root.handle.Get())) {
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist canvas content directories";
+  }
+  return outcome;
+}
+
+// 从安全 entry HANDLE no-follow 读取白名单文件并复核稳定身份。
+std::string ReadCanvasContent(const Config& config, const StableRoot& root) {
+  CanvasContentLock lock;
+  std::string error;
+  if (!lock.Acquire(root.handle.Get(), &error)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", error);
+  }
+  UniqueHandle content_root;
+  UniqueHandle entry;
+  bool missing = false;
+  if (!OpenCanvasContentRootWindows(root, config.child_name, false,
+      &content_root, &missing, &error)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", error);
+  }
+  if (missing) return CanvasContentReadResultJson("missing", "", 0, "", "", "");
+  if (!OpenCanvasContentEntryWindows(content_root.Get(), config.entry_id, false,
+      &entry, &missing, &error)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", error);
+  }
+  if (missing) return CanvasContentReadResultJson("missing", "", 0, "", "", "");
+  UniqueHandle file;
+  if (!OpenRelativeWindows(entry.Get(), Utf8ToWide(config.file_name),
+      FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_OPEN, FILE_NON_DIRECTORY_FILE, &file, &error)) {
+    return CanvasContentReadResultJson("missing", "", 0, "", "", "");
+  }
+  BY_HANDLE_FILE_INFORMATION initial {};
+  FILE_BASIC_INFO initial_basic {};
+  if (!ReadWindowsFileState(file.Get(), &initial, &initial_basic)
+      || (initial.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0
+      || initial.nNumberOfLinks != 1) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "canvas content file is unsafe");
+  }
+  const std::uint64_t size = (static_cast<std::uint64_t>(initial.nFileSizeHigh) << 32)
+      | initial.nFileSizeLow;
+  if (size > kCanvasContentMaxFileBytes) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "canvas content file is unsafe");
+  }
+  std::string content(static_cast<std::size_t>(size), '\0');
+  std::size_t offset = 0;
+  while (offset < content.size()) {
+    DWORD read_bytes = 0;
+    if (!ReadFile(file.Get(), content.data() + offset,
+        static_cast<DWORD>(content.size() - offset), &read_bytes, nullptr) || read_bytes == 0) {
+      return CanvasContentReadResultJson("corrupt", "", 0, "", "", "cannot read canvas content file");
+    }
+    offset += read_bytes;
+  }
+  BY_HANDLE_FILE_INFORMATION final_state {};
+  FILE_BASIC_INFO final_basic {};
+  UniqueHandle final_path;
+  BY_HANDLE_FILE_INFORMATION final_path_state {};
+  FILE_BASIC_INFO final_path_basic {};
+  if (!ReadWindowsFileState(file.Get(), &final_state, &final_basic)
+      || !OpenRelativeWindows(entry.Get(), Utf8ToWide(config.file_name),
+          FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_OPEN, FILE_NON_DIRECTORY_FILE, &final_path, &error)
+      || !ReadWindowsFileState(final_path.Get(), &final_path_state, &final_path_basic)
+      || !SameWindowsFileState(initial, initial_basic, final_state, final_basic)
+      || !SameWindowsFileState(initial, initial_basic, final_path_state, final_path_basic)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "canvas content file changed during read");
+  }
+  return CanvasContentReadResultJson("ok", content, size,
+      std::to_string(initial.dwVolumeSerialNumber), std::to_string(WindowsFileId(initial)), "");
+}
+
+// 确定性列出固定内容根下合法、非 reparse 的直接 entry 目录。
+bool ListCanvasContent(const Config& config, const StableRoot& root,
+                       EntryBudget* budget, std::string* error) {
+  CanvasContentLock lock;
+  if (!lock.Acquire(root.handle.Get(), error)) return false;
+  UniqueHandle content_root;
+  bool missing = false;
+  if (!OpenCanvasContentRootWindows(root, config.child_name, false,
+      &content_root, &missing, error)) return false;
+  if (missing) return true;
+  std::vector<unsigned char> buffer(64 * 1024);
+  std::vector<std::string> names;
+  bool restart = true;
+  while (true) {
+    if (!GetFileInformationByHandleEx(content_root.Get(),
+        restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
+        buffer.data(), static_cast<DWORD>(buffer.size()))) {
+      if (GetLastError() == ERROR_NO_MORE_FILES) break;
+      *error = "cannot enumerate canvas content root";
+      return false;
+    }
+    restart = false;
+    unsigned char* cursor = buffer.data();
+    while (true) {
+      auto* item = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(cursor);
+      const std::wstring name(item->FileName, item->FileNameLength / sizeof(wchar_t));
+      const std::string utf8_name = WideToUtf8(name);
+      bool safe_name = !utf8_name.empty() && utf8_name.size() <= 128;
+      for (unsigned char value : utf8_name) {
+        if (!((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z')
+            || (value >= '0' && value <= '9') || value == '_' || value == '-')) safe_name = false;
+      }
+      if (safe_name
+          && (item->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+          && (item->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+        UniqueHandle opened;
+        std::string open_error;
+        if (OpenRelativeWindows(content_root.Get(), name,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_OPEN, FILE_DIRECTORY_FILE, &opened, &open_error)) {
+          BY_HANDLE_FILE_INFORMATION identity {};
+          if (GetFileInformationByHandle(opened.Get(), &identity)
+              && (identity.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+              && WindowsFileId(identity) == static_cast<std::uint64_t>(item->FileId.QuadPart)) {
+            names.push_back(utf8_name);
+          }
+        }
+      }
+      if (item->NextEntryOffset == 0) break;
+      cursor += item->NextEntryOffset;
+    }
+  }
+  std::sort(names.begin(), names.end());
+  if (names.size() > config.max_entries) { *error = "canvas content entry limit exceeded"; return false; }
+  for (const std::string& name : names) {
+    if (!EmitLine(CanvasContentEntryJson(name), config, budget)) return false;
+    ++budget->entries;
+  }
+  return true;
+}
+
+// 在固定 nodes/trash HANDLE 之间原子移动 entry 目录，禁止覆盖目标。
+CanvasIntentWriteOutcome MoveCanvasContent(const Config& config, const StableRoot& root) {
+  CanvasIntentWriteOutcome outcome;
+  CanvasContentLock lock;
+  if (!lock.Acquire(root.handle.Get(), &outcome.error)) return outcome;
+  UniqueHandle source_root;
+  UniqueHandle destination_root;
+  bool missing = false;
+  if (!OpenCanvasContentRootWindows(root, config.child_name, false,
+      &source_root, &missing, &outcome.error)) return outcome;
+  if (missing) { outcome.error = "canvas content move source missing"; return outcome; }
+  if (!OpenCanvasContentRootWindows(root, config.destination_child_name, true,
+      &destination_root, &missing, &outcome.error)) return outcome;
+  UniqueHandle source;
+  if (!OpenCanvasContentEntryWindows(source_root.Get(), config.entry_id, false,
+      &source, &missing, &outcome.error) || missing) {
+    outcome.error = missing ? "canvas content move source missing" : "canvas content move source is unsafe";
+    return outcome;
+  }
+  UniqueHandle destination;
+  std::string destination_error;
+  bool destination_missing = false;
+  if (!OpenCanvasContentEntryWindows(destination_root.Get(), config.entry_id, false,
+      &destination, &destination_missing, &destination_error) || !destination_missing) {
+    outcome.error = "canvas content move destination exists";
+    return outcome;
+  }
+  const std::wstring target = Utf8ToWide(config.entry_id);
+  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target.size() * sizeof(wchar_t);
+  std::vector<unsigned char> rename_buffer(rename_size);
+  auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
+  rename_info->ReplaceIfExists = FALSE;
+  rename_info->RootDirectory = destination_root.Get();
+  rename_info->FileNameLength = static_cast<DWORD>(target.size() * sizeof(wchar_t));
+  std::memcpy(rename_info->FileName, target.data(), rename_info->FileNameLength);
+  if (!SetFileInformationByHandle(source.Get(), FileRenameInfo,
+      rename_info, static_cast<DWORD>(rename_buffer.size()))) {
+    outcome.error = "cannot commit canvas content move";
+    return outcome;
+  }
+  outcome.commit_visible = true;
+  if (!FlushCanvasDirectoryWindows(source_root.Get())
+      || !FlushCanvasDirectoryWindows(destination_root.Get())
+      || !FlushCanvasDirectoryWindows(root.handle.Get())) {
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist canvas content move";
+  }
+  return outcome;
 }
 
 // 写入前在同一 transactions HANDLE 下统计合法普通 intent；覆盖不占新名额。
@@ -1213,15 +1919,39 @@ std::string OpenedJson(const std::vector<StableRoot>& roots) {
 // 执行 Windows 两阶段协议；输入解析后的配置，返回进程退出码。
 int RunPlatform(const Config& config) {
   std::vector<StableRoot> roots(config.roots.size());
+  const bool content_access = config.mode.rfind("canvas-content-", 0) == 0;
   for (std::size_t index = 0; index < config.roots.size(); ++index) {
     std::string error;
-    if (!OpenStableRoot(config.roots[index], &roots[index], &error)) { std::cerr << error << '\n'; return 2; }
+    if (!OpenStableRoot(config.roots[index], &roots[index], &error, content_access)) {
+      std::cerr << error << '\n';
+      return 2;
+    }
   }
   EntryBudget budget;
   if (!EmitLine(OpenedJson(roots), config, &budget)) return 4;
   std::string decision;
   std::string payload;
   if (!std::getline(std::cin, decision) || !ParseAuthorization(config, decision, &payload)) return 3;
+  if (content_access) {
+    std::string error;
+    if (config.mode == "canvas-content-write") {
+      const CanvasIntentWriteOutcome outcome = WriteCanvasContentAtomic(config, roots.front(), payload);
+      if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
+    } else if (config.mode == "canvas-content-read") {
+      if (!EmitLine(ReadCanvasContent(config, roots.front()), config, &budget)) return 4;
+    } else if (config.mode == "canvas-content-list") {
+      if (!ListCanvasContent(config, roots.front(), &budget, &error)) {
+        std::cerr << error << '\n';
+        return 4;
+      }
+    } else {
+      const CanvasIntentWriteOutcome outcome = MoveCanvasContent(config, roots.front());
+      if (!EmitLine(CanvasContentMoveResultJson(outcome), config, &budget)) return 4;
+    }
+    std::ostringstream done;
+    done << "{\"type\":\"done\",\"entryCount\":" << budget.entries << '}';
+    return EmitLine(done.str(), config, &budget) ? 0 : 4;
+  }
   if (config.mode == "canvas-intent-scan" || config.mode == "canvas-intent-write") {
     UniqueHandle transactions;
     std::string error;

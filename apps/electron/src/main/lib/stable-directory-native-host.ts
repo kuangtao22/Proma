@@ -11,6 +11,12 @@ const DEFAULT_MAX_ACTIVE_HELPERS = 4
 const DEFAULT_MAX_QUEUED_REQUESTS = 16
 const DEFAULT_MAX_ROOTS_PER_REQUEST = 32
 const CANVAS_INTENT_FILE_PATTERN = /^agent-node-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/i
+const CANVAS_CONTENT_ENTRY_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
+const CANVAS_CONTENT_CHILD_NAMES = new Set(['nodes', 'trash'])
+const CANVAS_CONTENT_FILE_NAMES = new Set([
+  'config.json', 'meta.json', 'content.md', 'index.html', 'entry.json',
+])
+const CANVAS_CONTENT_MAX_FILE_BYTES = 256 * 1024
 const { app } = electron
 
 export interface StableDirectoryOpenedRoot {
@@ -39,8 +45,25 @@ export interface StableDirectoryNativeWriteOutcome {
   error?: string
 }
 
+/** Canvas 内容文件的 no-follow 读取结果，不包含可再次打开的路径。 */
+export type StableDirectoryNativeReadOutcome =
+  | { status: 'missing' }
+  | { status: 'corrupt'; error: string }
+  | { status: 'ok'; content: string; size: number; volume: string; fileId: string }
+
+/** Canvas 内容目录 rename 的提交可见性与持久性结果。 */
+export interface StableDirectoryNativeMoveOutcome extends StableDirectoryNativeWriteOutcome {}
+
 export interface StableDirectoryNativeRequest {
-  mode: 'list' | 'scan' | 'canvas-intent-scan' | 'canvas-intent-write'
+  mode:
+    | 'list'
+    | 'scan'
+    | 'canvas-intent-scan'
+    | 'canvas-intent-write'
+    | 'canvas-content-write'
+    | 'canvas-content-read'
+    | 'canvas-content-list'
+    | 'canvas-content-move'
   roots: string[]
   maxDepth?: number
   maxEntries?: number
@@ -49,9 +72,13 @@ export interface StableDirectoryNativeRequest {
   ignoreFiles?: string[]
   /** Canvas intent 模式下固定的单级事务目录名。 */
   childName?: string
+  /** Canvas 内容模式下固定根目录内的安全稳定 ID。 */
+  entryId?: string
+  /** Canvas 内容 move 的目标固定根目录。 */
+  destinationChildName?: string
   /** 原子写模式下固定的单级目标文件名。 */
   fileName?: string
-  /** 原子写模式下不超过 64 KiB 的 UTF-8 JSON。 */
+  /** 原子写正文；intent 上限 64 KiB，Canvas 内容文件上限 256 KiB。 */
   content?: string
   signal?: AbortSignal
 }
@@ -61,6 +88,10 @@ export interface StableDirectoryNativeResult {
   entries: StableDirectoryNativeEntry[]
   /** 仅 canvas-intent-write 模式返回。 */
   writeOutcome?: StableDirectoryNativeWriteOutcome
+  /** 仅 canvas-content-read 模式返回。 */
+  readOutcome?: StableDirectoryNativeReadOutcome
+  /** 仅 canvas-content-move 模式返回。 */
+  moveOutcome?: StableDirectoryNativeMoveOutcome
 }
 
 export interface StableDirectoryNativeHostDependencies {
@@ -108,11 +139,15 @@ function buildHelperArguments(request: StableDirectoryNativeRequest): string[] {
   const args = ['--mode', request.mode]
   for (const root of request.roots) args.push('--root', root)
   args.push('--max-depth', String(request.maxDepth ?? (request.mode === 'list' ? 0 : 10)))
-  args.push('--max-entries', String(request.maxEntries ?? 10_000))
+  /** Canvas 内部目录协议固定 512 项，普通扫描继续使用既有默认预算。 */
+  const defaultMaxEntries = request.mode.startsWith('canvas-') ? 512 : 10_000
+  args.push('--max-entries', String(request.maxEntries ?? defaultMaxEntries))
   args.push('--max-output-bytes', String(request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES))
   for (const name of request.ignoreDirectories ?? []) args.push('--ignore-dir', name)
   for (const name of request.ignoreFiles ?? []) args.push('--ignore-file', name)
   if (request.childName) args.push('--child-name', request.childName)
+  if (request.entryId) args.push('--entry-id', request.entryId)
+  if (request.destinationChildName) args.push('--destination-child-name', request.destinationChildName)
   if (request.fileName) args.push('--file-name', request.fileName)
   return args
 }
@@ -163,6 +198,7 @@ function parseEntry(
       && (typeof record.size !== 'number' || !Number.isSafeInteger(record.size) || record.size < 0))
     || (record.content !== undefined && typeof record.content !== 'string')) return null
   const isCanvasScan = request.mode === 'canvas-intent-scan'
+  const isCanvasContentList = request.mode === 'canvas-content-list'
   if (isCanvasScan && (record.path !== '' || (!record.isDirectory && typeof record.content !== 'string'))) {
     return null
   }
@@ -171,6 +207,13 @@ function parseEntry(
       || Buffer.byteLength(record.content as string, 'utf8') !== record.size
       || record.size > 64 * 1024)) return null
   if (isCanvasScan && record.isDirectory && record.content !== undefined) return null
+  if (isCanvasContentList
+    && (record.rootIndex !== 0
+      || record.path !== ''
+      || record.isDirectory !== true
+      || record.size !== undefined
+      || record.content !== undefined
+      || !CANVAS_CONTENT_ENTRY_ID_PATTERN.test(record.name))) return null
   if (!isCanvasScan && record.content !== undefined) return null
   return {
     rootIndex: record.rootIndex,
@@ -196,6 +239,37 @@ function parseWriteOutcome(value: unknown): StableDirectoryNativeWriteOutcome | 
     durabilityUncertain: record.durabilityUncertain,
     ...(typeof record.error === 'string' ? { error: record.error } : {}),
   }
+}
+
+/** 校验 canvas-content-read 的无路径结构化结果。 */
+function parseReadOutcome(value: unknown): StableDirectoryNativeReadOutcome | null {
+  if (!value || typeof value !== 'object') return null
+  const record = value as Record<string, unknown>
+  if (record.type !== 'read-result' || !['missing', 'corrupt', 'ok'].includes(String(record.status))) return null
+  if (record.status === 'missing') return { status: 'missing' }
+  if (record.status === 'corrupt') {
+    return typeof record.error === 'string' ? { status: 'corrupt', error: record.error } : null
+  }
+  if (typeof record.content !== 'string'
+    || typeof record.size !== 'number'
+    || !Number.isSafeInteger(record.size)
+    || record.size < 0
+    || record.size > CANVAS_CONTENT_MAX_FILE_BYTES
+    || Buffer.byteLength(record.content, 'utf8') !== record.size
+    || typeof record.volume !== 'string'
+    || typeof record.fileId !== 'string') return null
+  return {
+    status: 'ok', content: record.content, size: record.size,
+    volume: record.volume, fileId: record.fileId,
+  }
+}
+
+/** 校验 canvas-content-move 的提交阶段结果。 */
+function parseMoveOutcome(value: unknown): StableDirectoryNativeMoveOutcome | null {
+  if (!value || typeof value !== 'object') return null
+  const record = value as Record<string, unknown>
+  if (record.type !== 'move-result') return null
+  return parseWriteOutcome({ ...record, type: 'write-result' })
 }
 
 /**
@@ -232,6 +306,8 @@ function executeStableDirectoryNative(
     let openedRoots: StableDirectoryOpenedRoot[] | null = null
     const entries: StableDirectoryNativeEntry[] = []
     let writeOutcome: StableDirectoryNativeWriteOutcome | null = null
+    let readOutcome: StableDirectoryNativeReadOutcome | null = null
+    let moveOutcome: StableDirectoryNativeMoveOutcome | null = null
     let stdoutBuffer = ''
     let stdoutBytes = 0
     let stderrBuffer = ''
@@ -296,7 +372,7 @@ function executeStableDirectoryNative(
           }
           authorized = true
           /** 写入正文只走授权后的 stdin，不进入 argv 或进程列表。 */
-          const payload = request.mode === 'canvas-intent-write'
+          const payload = request.mode === 'canvas-intent-write' || request.mode === 'canvas-content-write'
             ? `\t${Buffer.from(request.content ?? '', 'utf8').toString('base64')}`
             : ''
           child.stdin.write(`ALLOW${payload}\n`)
@@ -324,7 +400,9 @@ function executeStableDirectoryNative(
         return
       }
       if (record?.type === 'write-result') {
-        if (!authorized || authorizationPending || request.mode !== 'canvas-intent-write' || writeOutcome) {
+        if (!authorized || authorizationPending
+          || (request.mode !== 'canvas-intent-write' && request.mode !== 'canvas-content-write')
+          || writeOutcome) {
           finish(new Error('稳定目录 helper write-result 响应无效'))
           return
         }
@@ -332,11 +410,31 @@ function executeStableDirectoryNative(
         if (!writeOutcome) finish(new Error('稳定目录 helper write-result 响应无效'))
         return
       }
+      if (record?.type === 'read-result') {
+        if (!authorized || authorizationPending || request.mode !== 'canvas-content-read' || readOutcome) {
+          finish(new Error('稳定目录 helper read-result 响应无效'))
+          return
+        }
+        readOutcome = parseReadOutcome(value)
+        if (!readOutcome) finish(new Error('稳定目录 helper read-result 响应无效'))
+        return
+      }
+      if (record?.type === 'move-result') {
+        if (!authorized || authorizationPending || request.mode !== 'canvas-content-move' || moveOutcome) {
+          finish(new Error('稳定目录 helper move-result 响应无效'))
+          return
+        }
+        moveOutcome = parseMoveOutcome(value)
+        if (!moveOutcome) finish(new Error('稳定目录 helper move-result 响应无效'))
+        return
+      }
       if (record?.type === 'done') {
         if (!authorized
           || !Number.isSafeInteger(record.entryCount)
           || record.entryCount !== entries.length
-          || (request.mode === 'canvas-intent-write') !== Boolean(writeOutcome)) {
+          || ((request.mode === 'canvas-intent-write' || request.mode === 'canvas-content-write') !== Boolean(writeOutcome))
+          || ((request.mode === 'canvas-content-read') !== Boolean(readOutcome))
+          || ((request.mode === 'canvas-content-move') !== Boolean(moveOutcome))) {
           finish(new Error('稳定目录 helper done 响应无效'))
           return
         }
@@ -344,6 +442,8 @@ function executeStableDirectoryNative(
           roots: openedRoots,
           entries,
           ...(writeOutcome ? { writeOutcome } : {}),
+          ...(readOutcome ? { readOutcome } : {}),
+          ...(moveOutcome ? { moveOutcome } : {}),
         })
         return
       }
@@ -461,7 +561,11 @@ export function createStableDirectoryNativeHost(
 
   return {
     run: (request, authorize, dependencies = {}) => {
-      if (request.roots.length === 0) return Promise.resolve({ roots: [], entries: [] })
+      if (request.roots.length === 0) {
+        return request.mode.startsWith('canvas-')
+          ? Promise.reject(new Error('Canvas 原生请求必须绑定单个根目录'))
+          : Promise.resolve({ roots: [], entries: [] })
+      }
       if (request.roots.length > maxRootsPerRequest) {
         return Promise.reject(new Error(`稳定目录 roots 超过上限: ${maxRootsPerRequest}`))
       }
@@ -478,6 +582,43 @@ export function createStableDirectoryNativeHost(
         }
         if ((request.maxEntries ?? 512) > 512) {
           return Promise.reject(new Error('Canvas intent 原生扫描数量超过上限'))
+        }
+      }
+      if (request.mode.startsWith('canvas-content-')) {
+        const childIsSafe = request.childName !== undefined
+          && CANVAS_CONTENT_CHILD_NAMES.has(request.childName)
+        const needsEntry = request.mode !== 'canvas-content-list'
+        const entryIsSafe = !needsEntry
+          || (request.entryId !== undefined && CANVAS_CONTENT_ENTRY_ID_PATTERN.test(request.entryId))
+        const needsFile = request.mode === 'canvas-content-write' || request.mode === 'canvas-content-read'
+        const fileIsSafe = !needsFile
+          || (request.fileName !== undefined && CANVAS_CONTENT_FILE_NAMES.has(request.fileName))
+        const destinationIsSafe = request.mode !== 'canvas-content-move'
+          || (request.destinationChildName !== undefined
+            && CANVAS_CONTENT_CHILD_NAMES.has(request.destinationChildName)
+            && request.destinationChildName !== request.childName)
+        const contentIsSafe = request.mode !== 'canvas-content-write'
+          || (typeof request.content === 'string'
+            && Buffer.byteLength(request.content, 'utf8') <= CANVAS_CONTENT_MAX_FILE_BYTES)
+        const fieldsMatchMode = request.mode === 'canvas-content-write'
+          ? request.destinationChildName === undefined
+          : request.mode === 'canvas-content-read'
+            ? request.destinationChildName === undefined && request.content === undefined
+            : request.mode === 'canvas-content-list'
+              ? request.entryId === undefined
+                && request.destinationChildName === undefined
+                && request.fileName === undefined
+                && request.content === undefined
+              : request.fileName === undefined && request.content === undefined
+        if (request.roots.length !== 1
+          || !childIsSafe
+          || !entryIsSafe
+          || !fileIsSafe
+          || !destinationIsSafe
+          || !contentIsSafe
+          || !fieldsMatchMode
+          || (request.maxEntries ?? 512) > 512) {
+          return Promise.reject(new Error('Canvas 内容原生请求合同无效'))
         }
       }
       const totalTimeoutMs = dependencies.totalTimeoutMs ?? DEFAULT_TOTAL_TIMEOUT_MS

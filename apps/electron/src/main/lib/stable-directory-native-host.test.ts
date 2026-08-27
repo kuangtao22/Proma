@@ -27,6 +27,11 @@ interface FakeHelperOptions {
     durabilityUncertain: boolean
     error?: string
   }
+  moveOutcome?: {
+    commitVisible: boolean
+    durabilityUncertain: boolean
+    error?: string
+  }
 }
 
 /** 创建严格等待 ALLOW/DENY 的假 helper，用于验证主进程两阶段授权协议。 */
@@ -88,6 +93,12 @@ function createFakeHelper(options: FakeHelperOptions = {}): {
           return
         }
         emitWriteResult()
+        emitProcessClosed(0, null)
+        return
+      }
+      if (options.moveOutcome) {
+        stdout.write(`${JSON.stringify({ type: 'move-result', ...options.moveOutcome })}\n`)
+        stdout.write(`${JSON.stringify({ type: 'done', entryCount: 0 })}\n`)
         emitProcessClosed(0, null)
         return
       }
@@ -418,6 +429,56 @@ describe('stable directory native host', () => {
     ])
   })
 
+  test('Given Canvas 内容请求包含不安全路径片段 When 提交 host Then 在 spawn 前拒绝', async () => {
+    /** 记录 helper 是否被错误启动。 */
+    let spawnCount = 0
+    /** 不安全请求共用同一组零启动依赖。 */
+    const dependencies: StableDirectoryNativeHostDependencies = {
+      helperPath: () => '/fake',
+      helperExists: () => true,
+      spawnProcess: () => {
+        spawnCount += 1
+        throw new Error('不应启动 helper')
+      },
+    }
+    /** 覆盖根目录、entry ID 与文件名三个独立路径输入边界。 */
+    const requests = [
+      { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'transactions' },
+      { mode: 'canvas-content-read' as const, roots: ['/requested'], childName: 'nodes', entryId: '../escape', fileName: 'meta.json' },
+      { mode: 'canvas-content-write' as const, roots: ['/requested'], childName: 'nodes', entryId: 'entry-1', fileName: '../meta.json', content: '{}' },
+      { mode: 'canvas-content-write' as const, roots: ['/requested'], childName: 'nodes', entryId: 'entry-1', fileName: 'meta.json', content: 'x'.repeat(256 * 1024 + 1) },
+      { mode: 'canvas-content-read' as const, roots: ['/requested'], childName: 'nodes', entryId: 'x'.repeat(129), fileName: 'meta.json' },
+    ]
+
+    for (const request of requests) {
+      await expect(runStableDirectoryNative(request, () => true, dependencies))
+        .rejects.toThrow('Canvas 内容原生请求合同无效')
+    }
+    expect(spawnCount).toBe(0)
+  })
+
+  test('Given move 已提交但目录持久性未确认 When host 解析结果 Then 保留可见提交供上层对账', async () => {
+    /** 模拟 Windows 或 POSIX rename 已可见、目录 flush 失败。 */
+    const fake = createFakeHelper({
+      moveOutcome: {
+        commitVisible: true,
+        durabilityUncertain: true,
+        error: 'cannot persist canvas content move',
+      },
+    })
+
+    const result = await runStableDirectoryNative({
+      mode: 'canvas-content-move', roots: ['/requested'], childName: 'nodes',
+      destinationChildName: 'trash', entryId: 'content-1',
+    }, () => true, createDependencies(fake))
+
+    expect(result.moveOutcome).toEqual({
+      commitVisible: true,
+      durabilityUncertain: true,
+      error: 'cannot persist canvas content move',
+    })
+  })
+
   test('Given Canvas intent scan When helper 相对读取正文 Then host 只返回内存内容且无可重开路径', async () => {
     const fake = createFakeHelper({ intentContent: '{"state":"prepared"}' })
 
@@ -573,6 +634,226 @@ describe('stable directory native host', () => {
         'transactions',
         'agent-node-11111111-1111-4111-8111-111111111111.json',
       ), 'utf8')).toBe('{"state":"prepared"}')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(!nativeHelperPlatformSupported)('Given 已授权 Canvas 根 When 写读列出并移动内容 Then 全程只返回无路径结构化结果', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-content-flow-'))
+    const canvasRoot = join(root, 'canvas')
+    mkdirSync(canvasRoot)
+    try {
+      /** 写入固定 entry 下的受限元数据文件。 */
+      const written = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'content-1', fileName: 'meta.json', content: '{"schemaVersion":1}',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(written.writeOutcome).toEqual({ commitVisible: true, durabilityUncertain: false })
+
+      /** 读取结果携带稳定文件身份，但不携带绝对路径。 */
+      const read = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'content-1', fileName: 'meta.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(read.readOutcome).toEqual({
+        status: 'ok',
+        content: '{"schemaVersion":1}',
+        size: 19,
+        volume: expect.any(String),
+        fileId: expect.any(String),
+      })
+      expect('path' in (read.readOutcome ?? {})).toBe(false)
+
+      /** 列表只公开排序后的安全 entry ID。 */
+      const listed = await runStableDirectoryNative({
+        mode: 'canvas-content-list', roots: [canvasRoot], childName: 'nodes', maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(listed.entries).toEqual([{
+        rootIndex: 0, name: 'content-1', path: '', isDirectory: true,
+      }])
+
+      /** move 提交后源目录消失、目标目录可按同一安全协议读取。 */
+      const moved = await runStableDirectoryNative({
+        mode: 'canvas-content-move', roots: [canvasRoot], childName: 'nodes',
+        destinationChildName: 'trash', entryId: 'content-1',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(moved.moveOutcome).toEqual({ commitVisible: true, durabilityUncertain: false })
+      const sourceRead = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'content-1', fileName: 'meta.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(sourceRead.readOutcome).toEqual({ status: 'missing' })
+      const targetRead = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: 'trash',
+        entryId: 'content-1', fileName: 'meta.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(targetRead.readOutcome?.status).toBe('ok')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Given 内容 entry 或 leaf 是 symlink When 读写 Then fail closed 且外部文件不变', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-content-symlink-'))
+    const canvasRoot = join(root, 'canvas')
+    const outside = join(root, 'outside')
+    mkdirSync(join(canvasRoot, 'nodes'), { recursive: true })
+    mkdirSync(outside)
+    writeFileSync(join(outside, 'meta.json'), 'outside', 'utf8')
+    symlinkSync(outside, join(canvasRoot, 'nodes', 'linked-entry'))
+    mkdirSync(join(canvasRoot, 'nodes', 'leaf-entry'))
+    symlinkSync(join(outside, 'meta.json'), join(canvasRoot, 'nodes', 'leaf-entry', 'meta.json'))
+    try {
+      const read = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'linked-entry', fileName: 'meta.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(read.readOutcome).toEqual({ status: 'corrupt', error: 'canvas content entry is unsafe' })
+      const write = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'linked-entry', fileName: 'meta.json', content: 'changed',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(write.writeOutcome?.commitVisible).toBe(false)
+      const leafRead = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'leaf-entry', fileName: 'meta.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(leafRead.readOutcome).toEqual({ status: 'corrupt', error: 'canvas content file is unsafe' })
+      expect(readFileSync(join(outside, 'meta.json'), 'utf8')).toBe('outside')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'win32')('Given Windows 内容 entry 是 junction When 读写列出 Then 拒绝 reparse 且 replacement 零写入', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-win-content-junction-'))
+    const canvasRoot = join(root, 'canvas')
+    const nodes = join(canvasRoot, 'nodes')
+    const replacement = join(root, 'replacement')
+    mkdirSync(nodes, { recursive: true })
+    mkdirSync(replacement)
+    writeFileSync(join(replacement, 'meta.json'), 'outside', 'utf8')
+    symlinkSync(replacement, join(nodes, 'linked-entry'), 'junction')
+    try {
+      const read = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'linked-entry', fileName: 'meta.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(read.readOutcome).toEqual({ status: 'corrupt', error: 'canvas content entry is unsafe' })
+      const write = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'linked-entry', fileName: 'meta.json', content: 'changed',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(write.writeOutcome?.commitVisible).toBe(false)
+      const listed = await runStableDirectoryNative({
+        mode: 'canvas-content-list', roots: [canvasRoot], childName: 'nodes', maxEntries: 0,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(listed.entries).toEqual([])
+      expect(readFileSync(join(replacement, 'meta.json'), 'utf8')).toBe('outside')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(!nativeHelperPlatformSupported)('Given move 目标已存在 When 提交 Then 返回 rename 前失败且两端保持不变', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-content-conflict-'))
+    const canvasRoot = join(root, 'canvas')
+    mkdirSync(join(canvasRoot, 'nodes', 'same-id'), { recursive: true })
+    mkdirSync(join(canvasRoot, 'trash', 'same-id'), { recursive: true })
+    try {
+      const result = await runStableDirectoryNative({
+        mode: 'canvas-content-move', roots: [canvasRoot], childName: 'nodes',
+        destinationChildName: 'trash', entryId: 'same-id',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(result.moveOutcome).toEqual({
+        commitVisible: false,
+        durabilityUncertain: false,
+        error: 'canvas content move destination exists',
+      })
+      expect(existsSync(join(canvasRoot, 'nodes', 'same-id'))).toBe(true)
+      expect(existsSync(join(canvasRoot, 'trash', 'same-id'))).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(!nativeHelperPlatformSupported)('Given 两个 helper 并发移动同一 entry When 竞争 Then 只有一个提交可见', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-content-move-race-'))
+    const canvasRoot = join(root, 'canvas')
+    mkdirSync(join(canvasRoot, 'nodes', 'content-1'), { recursive: true })
+    try {
+      /** 两个进程共享固定 `.content.lock`，容量检查和 rename 在同一锁内串行。 */
+      const move = () => runStableDirectoryNative({
+        mode: 'canvas-content-move' as const, roots: [canvasRoot], childName: 'nodes',
+        destinationChildName: 'trash', entryId: 'content-1',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      const results = await Promise.all([move(), move()])
+
+      expect(results.filter((result) => result.moveOutcome?.commitVisible)).toHaveLength(1)
+      expect(results.filter((result) => !result.moveOutcome?.commitVisible)).toHaveLength(1)
+      expect(existsSync(join(canvasRoot, 'trash', 'content-1'))).toBe(true)
+      expect(existsSync(join(canvasRoot, 'nodes', 'content-1'))).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Given 内容列表超过 512 项且混有 symlink When 列出 Then symlink 不计数且第 513 个普通目录触发上限', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-content-list-limit-'))
+    const canvasRoot = join(root, 'canvas')
+    const nodes = join(canvasRoot, 'nodes')
+    const outside = join(root, 'outside')
+    mkdirSync(nodes, { recursive: true })
+    mkdirSync(outside)
+    for (let index = 0; index < 513; index += 1) {
+      mkdirSync(join(nodes, `content-${index.toString().padStart(3, '0')}`))
+    }
+    symlinkSync(outside, join(nodes, 'linked-entry'))
+    try {
+      await expect(runStableDirectoryNative({
+        mode: 'canvas-content-list', roots: [canvasRoot], childName: 'nodes', maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath }))
+        .rejects.toThrow('canvas content entry limit exceeded')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Given 内容锁是 symlink When 写入 Then fail closed 且外部文件不变', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-content-lock-symlink-'))
+    const canvasRoot = join(root, 'canvas')
+    const outside = join(root, 'outside-lock')
+    mkdirSync(canvasRoot)
+    writeFileSync(outside, 'outside', 'utf8')
+    symlinkSync(outside, join(canvasRoot, '.content.lock'))
+    try {
+      const result = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'content-1', fileName: 'meta.json', content: '{}',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(result.writeOutcome).toEqual({
+        commitVisible: false,
+        durabilityUncertain: false,
+        error: 'canvas content lock is unsafe',
+      })
+      expect(readFileSync(outside, 'utf8')).toBe('outside')
+      expect(existsSync(join(canvasRoot, 'nodes'))).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(!nativeHelperPlatformSupported)('Given OPENED 后授权被撤销 When 内容写请求收到 DENY Then 不创建任何内容目录', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-content-deny-'))
+    const canvasRoot = join(root, 'canvas')
+    mkdirSync(canvasRoot)
+    try {
+      await expect(runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'content-1', fileName: 'meta.json', content: '{}',
+      }, () => false, { helperPath: () => nativeHelperPath })).rejects.toThrow('目录授权被拒绝')
+      expect(readdirSync(canvasRoot)).toEqual([])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
