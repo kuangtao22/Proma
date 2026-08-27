@@ -29,6 +29,8 @@ import {
   NativeCanvasWorkspace,
   createCanvasAgentNodeCommandController,
   createCanvasAgentNodeRebuildController,
+  createNativeCanvasAgentNodeSuccessUpdate,
+  findNativeCanvasAgentNodeCreationPosition,
   createRebuiltNativeCanvasStateUpdate,
   createNativeCanvasWorkspaceController,
   getNativeCanvasConnectedEdgeCount,
@@ -721,6 +723,58 @@ describe('原生 Canvas 冲突提示', () => {
 })
 
 describe('原生 Canvas 添加 Agent 命令', () => {
+  test('Given 空图和真实 surface When 独立新增 Then 只用 surface 中心换算世界坐标', () => {
+    const document = createSnapshot(1).document
+    document.viewport = { x: -100, y: 50, zoom: 2 }
+
+    expect(findNativeCanvasAgentNodeCreationPosition(document, { width: 800, height: 600 }))
+      .toEqual({ x: 106, y: 53 })
+  })
+
+  test('Given 非空图和不同 viewport When 独立新增 Then 全局落点完全不受平移缩放影响', () => {
+    const first = createSnapshot(1).document
+    first.nodes = [
+      { id: 'first', kind: 'agent', title: '首节点', agentSessionId: 's-1', position: { x: -200, y: 40 } },
+      { id: 'right', kind: 'agent', title: '右节点', agentSessionId: 's-2', position: { x: 500, y: 300 } },
+    ]
+    const second = structuredClone(first)
+    first.viewport = { x: 0, y: 0, zoom: 1 }
+    second.viewport = { x: 8_000, y: -6_000, zoom: 2.5 }
+
+    expect(findNativeCanvasAgentNodeCreationPosition(first, { width: 300, height: 200 }))
+      .toEqual(findNativeCanvasAgentNodeCreationPosition(second, { width: 1_400, height: 900 }))
+  })
+
+  test('Given 创建前已有 viewport mutation 与对话状态 When 创建成功 Then 只接管权威文档和选中新节点', () => {
+    const current = createInitialNativeCanvasState()
+    const viewportMutation: CanvasMutation = {
+      type: 'set-viewport', viewport: { x: 12, y: 34, zoom: 1.5 },
+    }
+    current.phase = 'ready'
+    current.snapshot = createSnapshot(2)
+    current.snapshot.document.viewport = { x: 12, y: 34, zoom: 1.5 }
+    current.pendingMutations = [viewportMutation]
+    current.conversationNodeId = 'agent-existing'
+    const createdDocument = createSnapshot(3).document
+    createdDocument.viewport = { ...current.snapshot.document.viewport }
+    const result: CanvasAgentNodeCreationResult = {
+      document: createdDocument,
+      session: { id: 'session-new' } as never,
+    }
+
+    const update = createNativeCanvasAgentNodeSuccessUpdate(current, 'node-new', result)
+
+    expect({ ...current, ...update }).toMatchObject({
+      snapshot: { document: result.document },
+      selectedNodeId: 'node-new',
+      conversationNodeId: 'agent-existing',
+      pendingMutations: [viewportMutation],
+    })
+    expect(update.snapshot?.document.viewport).toEqual({ x: 12, y: 34, zoom: 1.5 })
+    expect(update).not.toHaveProperty('conversationNodeId')
+    expect(update).not.toHaveProperty('pendingMutations')
+  })
+
   test('Given CREATE 异常含内部正文 When 创建失败 Then 按钮状态只保留固定公开文案', async () => {
     const states: CanvasAgentNodeCommandState[] = []
     const controller = createCanvasAgentNodeCommandController({
@@ -1178,7 +1232,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     await first
   })
 
-  test('Given 首次失败 When 显式重试 Then 复用 operation；成功后选中并打开对话', async () => {
+  test('Given 首次失败 When 显式重试 Then 复用 operation 并回传权威创建结果', async () => {
     /** 两次请求及按钮状态变化。 */
     const inputs: Array<{ operationId: string; nodeId: string }> = []
     const states: Array<{ loading: boolean; error: string | null }> = []

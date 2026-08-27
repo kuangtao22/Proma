@@ -30,46 +30,59 @@ export interface NativeCanvasIdentifiedPositionedNode extends NativeCanvasPositi
   id: string
 }
 
-/** Renderer 可用于判断节点是否被面板裁剪的画布尺寸。 */
-export interface NativeCanvasSurfaceBounds {
-  width: number
-  height: number
+/**
+ * 计算顶部独立新增节点的全局追加位置。
+ * @param emptyCanvasCenter 空画布真实 surface 中心换算出的世界坐标。
+ * @param nodes 当前权威文档节点顺序与位置。
+ * @returns 新节点左上角世界坐标。
+ */
+export function findNativeCanvasGlobalAppendPosition(
+  emptyCanvasCenter: DesignPoint,
+  nodes: ReadonlyArray<NativeCanvasPositionedNode>,
+): DesignPoint {
+  if (nodes.length === 0) {
+    return {
+      x: emptyCanvasCenter.x - NATIVE_CANVAS_NODE_WIDTH / 2,
+      y: emptyCanvasCenter.y - NATIVE_CANVAS_NODE_HEIGHT / 2,
+    }
+  }
+  /** 文档中首个仍存在节点固定定义新增节点的纵向基线。 */
+  const baselineY = nodes[0]?.position.y ?? 0
+  /** 一次线性扫描得到全局最右边界，独立于当前 viewport。 */
+  let maxRight = Number.NEGATIVE_INFINITY
+  for (const node of nodes) {
+    maxRight = Math.max(maxRight, node.position.x + NATIVE_CANVAS_NODE_WIDTH)
+  }
+  /** 顶部新增始终固定在全局最右侧的新列。 */
+  const appendX = maxRight + NATIVE_CANVAS_NODE_GAP
+  /** 新列按固定行高向下寻找首个满足间距的候选。 */
+  const verticalStep = NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP
+  for (let row = 0; row <= nodes.length; row += 1) {
+    /** 候选纵坐标保持首节点基线优先，只有占用时才向下。 */
+    const candidate = { x: appendX, y: baselineY + row * verticalStep }
+    if (!overlapsNativeCanvasNodes(candidate, nodes)) return candidate
+  }
+  throw new Error('Canvas 全局追加落点计算失败')
 }
 
-/** 节点与画布边缘保留的最小屏幕间距。 */
-const NATIVE_CANVAS_REVEAL_PADDING = 24
-
 /**
- * 节点被收窄画布裁剪时计算一次居中 viewport。
- * @param position 节点左上角世界坐标。
- * @param viewport 当前持久化 viewport。
- * @param bounds 当前真实 Canvas surface 尺寸。
- * @returns 节点已完整可见时返回 null，否则返回保持原缩放的新 viewport。
+ * 判断固定尺寸候选是否侵入任一节点要求的最小间距。
+ * @param candidate 待验证节点的左上角世界坐标。
+ * @param nodes 当前 Canvas 的持久化节点位置。
+ * @returns 候选与任一节点横纵间距同时不足时返回 true。
  */
-export function createNativeCanvasNodeRevealViewport(
-  position: DesignPoint,
-  viewport: DesignViewport,
-  bounds: NativeCanvasSurfaceBounds,
-): DesignViewport | null {
-  if (bounds.width <= 0 || bounds.height <= 0) return null
-  /** 节点当前投影到 surface 内的屏幕边界。 */
-  const left = position.x * viewport.zoom + viewport.x
-  const top = position.y * viewport.zoom + viewport.y
-  const right = left + NATIVE_CANVAS_NODE_WIDTH * viewport.zoom
-  const bottom = top + NATIVE_CANVAS_NODE_HEIGHT * viewport.zoom
-  /** 完整落在安全区域内时不制造 viewport mutation 或磁盘写入。 */
-  if (left >= NATIVE_CANVAS_REVEAL_PADDING
-    && top >= NATIVE_CANVAS_REVEAL_PADDING
-    && right <= bounds.width - NATIVE_CANVAS_REVEAL_PADDING
-    && bottom <= bounds.height - NATIVE_CANVAS_REVEAL_PADDING) {
-    return null
-  }
-  /** 仅平移到当前 surface 中心，保留用户原有缩放级别。 */
-  return {
-    x: bounds.width / 2 - (position.x + NATIVE_CANVAS_NODE_WIDTH / 2) * viewport.zoom,
-    y: bounds.height / 2 - (position.y + NATIVE_CANVAS_NODE_HEIGHT / 2) * viewport.zoom,
-    zoom: viewport.zoom,
-  }
+export function overlapsNativeCanvasNodes(
+  candidate: DesignPoint,
+  nodes: ReadonlyArray<NativeCanvasPositionedNode>,
+): boolean {
+  /** 固定卡片水平方向包含节点宽度与最小间距。 */
+  const horizontalStep = NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP
+  /** 固定卡片纵向包含节点高度与最小间距。 */
+  const verticalStep = NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP
+  return nodes.some((node) => (
+    Math.abs(candidate.x - node.position.x) < horizontalStep
+    && Math.abs(candidate.y - node.position.y) < verticalStep
+  ))
 }
 
 /** Agent 节点投影使用的运行时状态和命令能力。 */
@@ -130,11 +143,6 @@ export function findAvailableNativeCanvasNodePosition(
   /** 已检查候选数包含中心原点。 */
   let inspectedCandidates = 1
 
-  /** 判断候选矩形与任一固定尺寸节点是否小于最小间距。 */
-  const overlapsExistingNode = (candidate: DesignPoint): boolean => nodes.some((node) => (
-    Math.abs(candidate.x - node.position.x) < horizontalStep
-    && Math.abs(candidate.y - node.position.y) < verticalStep
-  ))
   /** 将整数网格偏移转换为真实世界坐标。 */
   const resolveCandidate = (gridX: number, gridY: number): DesignPoint => ({
     x: origin.x + gridX * horizontalStep,
@@ -152,7 +160,7 @@ export function findAvailableNativeCanvasNodePosition(
     return offsets
   }
 
-  if (!overlapsExistingNode(origin)) return origin
+  if (!overlapsNativeCanvasNodes(origin, nodes)) return origin
   for (let radius = 1; inspectedCandidates <= candidateLimit; radius += 1) {
     /** 当前环按用户最常用的从左到右流程优先检查右侧位置。 */
     const offsets = createRingOffsets(radius)
@@ -160,7 +168,7 @@ export function findAvailableNativeCanvasNodePosition(
       /** 当前网格偏移对应的真实候选位置。 */
       const candidate = resolveCandidate(offset.x, offset.y)
       inspectedCandidates += 1
-      if (!overlapsExistingNode(candidate)) return candidate
+      if (!overlapsNativeCanvasNodes(candidate, nodes)) return candidate
       if (inspectedCandidates > candidateLimit) break
     }
   }
@@ -185,18 +193,12 @@ export function findAvailableNativeCanvasChildPosition(
     x: source.position.x + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
     y: source.position.y,
   }
-  /** 横纵间距分别与当前固定卡片尺寸对齐。 */
-  const horizontalStep = NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP
+  /** 纵向避让间距与当前固定卡片尺寸对齐。 */
   const verticalStep = NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP
-  /** 任意位置节点只要进入固定间距范围即视为占用候选。 */
-  const overlapsExistingNode = (candidate: DesignPoint): boolean => nodes.some((node) => (
-    Math.abs(candidate.x - node.position.x) < horizontalStep
-    && Math.abs(candidate.y - node.position.y) < verticalStep
-  ))
   for (let row = 0; row <= nodes.length; row += 1) {
     /** 候选始终位于同一右侧列，避免扩展关系在画布上来回跳跃。 */
     const candidate = { x: start.x, y: start.y + row * verticalStep }
-    if (!overlapsExistingNode(candidate)) return candidate
+    if (!overlapsNativeCanvasNodes(candidate, nodes)) return candidate
   }
   throw new Error('Canvas 扩展落点计算失败')
 }

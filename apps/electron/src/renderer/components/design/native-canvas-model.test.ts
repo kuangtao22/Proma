@@ -9,6 +9,7 @@ import {
   createViewportCanvasMutation,
   findAvailableNativeCanvasChildPosition,
   findAvailableNativeCanvasNodePosition,
+  findNativeCanvasGlobalAppendPosition,
   NATIVE_CANVAS_NODE_GAP,
   NATIVE_CANVAS_NODE_HEIGHT,
   NATIVE_CANVAS_NODE_WIDTH,
@@ -106,6 +107,46 @@ describe('原生 Canvas 纯投影', () => {
 })
 
 describe('原生 Canvas mutation', () => {
+  test('Given 空画布 When 全局新增 Then 固定节点中心对齐真实画布世界中心', () => {
+    expect(findNativeCanvasGlobalAppendPosition({ x: 500, y: 300 }, []))
+      .toEqual({ x: 356, y: 228 })
+  })
+
+  test('Given 多列节点含负坐标 When 全局新增 Then 追加到全局最右并沿用首节点基线', () => {
+    const nodes = [
+      { position: { x: -200, y: 40 } },
+      { position: { x: 500, y: 300 } },
+      { position: { x: 20, y: -500 } },
+    ]
+
+    expect(findNativeCanvasGlobalAppendPosition({ x: -9_999, y: 9_999 }, nodes)).toEqual({
+      x: 500 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
+      y: 40,
+    })
+  })
+
+  test('Given 首节点右侧列同 x 已占用 When 扩展节点 Then 沿固定列向下避让且关系落点语义不变', () => {
+    const nodes = [
+      { id: 'source', position: { x: -200, y: 40 } },
+      {
+        id: 'occupied-1',
+        position: { x: -200 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP, y: 40 },
+      },
+      {
+        id: 'occupied-2',
+        position: {
+          x: -200 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
+          y: 40 + NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP,
+        },
+      },
+    ]
+
+    expect(findAvailableNativeCanvasChildPosition('source', nodes)).toEqual({
+      x: -200 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
+      y: 40 + 2 * (NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP),
+    })
+  })
+
   test('Given 源节点右侧被占用 When 计算扩展落点 Then 确定性寻找下一处不重叠位置', () => {
     const nodes = [
       { id: 'source', position: { x: 100, y: 100 } },

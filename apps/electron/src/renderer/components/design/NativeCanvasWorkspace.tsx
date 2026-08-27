@@ -39,9 +39,8 @@ import {
 import {
   canReplayNativeCanvasPositionMutations,
   coalesceNativeCanvasMutationsForSave,
-  createNativeCanvasNodeRevealViewport,
   findAvailableNativeCanvasChildPosition,
-  findAvailableNativeCanvasNodePosition,
+  findNativeCanvasGlobalAppendPosition,
   replayNativeCanvasPositionMutations,
 } from './native-canvas-model'
 
@@ -55,9 +54,6 @@ export const NATIVE_CANVAS_REVISION_CONFLICT_CODE = 'CANVAS_REVISION_CONFLICT'
 export const NATIVE_CANVAS_COMMIT_UNCERTAIN_CODE = 'CANVAS_COMMIT_UNCERTAIN'
 /** 无法安全重放结构修改时显示的稳定冲突文本。 */
 export const NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE = 'Canvas 结构已在恢复期间变化，请处理本地结构冲突'
-/** 客户端在首帧前校正被面板裁剪的节点，SSR 保持无副作用。 */
-const useNativeCanvasLayoutEffect = typeof window === 'undefined' ? React.useEffect : React.useLayoutEffect
-
 /** controller 使用的最小原生 Canvas adapter 合同。 */
 export interface NativeCanvasAdapter {
   loadCanvas: DesignAdapter['loadCanvas']
@@ -77,6 +73,12 @@ export interface NativeCanvasAdapter {
 export interface CanvasAgentNodeCommandState {
   loading: boolean
   error: string | null
+}
+
+/** 空图创建位置换算使用的真实 Canvas surface 尺寸。 */
+export interface NativeCanvasSurfaceBounds {
+  width: number
+  height: number
 }
 
 /** 添加 Agent 命令可选的扩展来源。 */
@@ -132,6 +134,45 @@ export function createClosedNativeCanvasConversationUpdate(): Pick<
   'selectedNodeId' | 'conversationNodeId'
 > {
   return { selectedNodeId: null, conversationNodeId: null }
+}
+
+/**
+ * 计算独立 Agent 节点创建位置。
+ * @param document 当前权威 Canvas 文档。
+ * @param surfaceBounds 当前真实 Canvas surface 尺寸。
+ * @returns 新节点左上角世界坐标。
+ */
+export function findNativeCanvasAgentNodeCreationPosition(
+  document: CanvasDocument,
+  surfaceBounds: NativeCanvasSurfaceBounds,
+): DesignPoint {
+  /** 只有空图才把真实 surface 中心换算为世界坐标。 */
+  const emptyCanvasCenter = {
+    x: (surfaceBounds.width / 2 - document.viewport.x) / document.viewport.zoom,
+    y: (surfaceBounds.height / 2 - document.viewport.y) / document.viewport.zoom,
+  }
+  return findNativeCanvasGlobalAppendPosition(emptyCanvasCenter, document.nodes)
+}
+
+/**
+ * 创建 Agent 节点成功后的局部状态更新。
+ * @param current 创建完成时的当前 Canvas 状态。
+ * @param nodeId 主进程已创建的节点 ID。
+ * @param result 主进程返回的权威创建结果。
+ * @returns 只接管权威文档、选区与错误的局部更新。
+ */
+export function createNativeCanvasAgentNodeSuccessUpdate(
+  current: NativeCanvasState,
+  nodeId: string,
+  result: CanvasAgentNodeCreationResult,
+): Partial<NativeCanvasState> {
+  return {
+    snapshot: current.snapshot
+      ? { ...current.snapshot, document: result.document }
+      : { document: result.document, writable: true, nodeIssues: [] },
+    selectedNodeId: nodeId,
+    error: null,
+  }
 }
 
 /**
@@ -767,10 +808,8 @@ export function NativeCanvasWorkspace({
   const rebuildCommandRef = React.useRef<CanvasAgentNodeRebuildController | null>(null)
   /** 删除异步回调代次，Canvas 切换后立即失效旧停止请求。 */
   const deleteGenerationRef = React.useRef(0)
-  /** 新增落点与对话聚焦都必须使用收窄后的真实画布表面。 */
+  /** 空图新增落点必须使用真实画布表面，不读取侧栏或窗口全宽。 */
   const canvasSurfaceRef = React.useRef<HTMLDivElement | null>(null)
-  /** 同一次面板打开只尝试聚焦一次，避免 viewport 保存形成反馈循环。 */
-  const revealedConversationKeyRef = React.useRef<string | null>(null)
   const [createState, setCreateState] = React.useState<CanvasAgentNodeCommandState>({
     loading: false,
     error: null,
@@ -835,33 +874,23 @@ export function NativeCanvasWorkspace({
       createAgentNode: adapter.createCanvasAgentNode,
       createId: () => window.crypto.randomUUID(),
       getPosition: (sourceNodeId) => {
-        /** 以点击时最新 viewport 和容器尺寸换算世界坐标中心。 */
+        /** 点击时读取最新权威文档，避免迟到视图闭包决定创建位置。 */
         const latest = store.get(nativeCanvasStatesAtom).get(stateKey)
-        const nodes = latest?.snapshot?.document.nodes ?? []
-        if (sourceNodeId) return findAvailableNativeCanvasChildPosition(sourceNodeId, nodes)
-        const viewport = latest?.snapshot?.document.viewport ?? { x: 0, y: 0, zoom: 1 }
-        const bounds = canvasSurfaceRef.current?.getBoundingClientRect()
-        /** 当前可视区域中心对应的世界坐标。 */
-        const visibleCenter = {
-          x: ((bounds?.width ?? 0) / 2 - viewport.x) / viewport.zoom,
-          y: ((bounds?.height ?? 0) / 2 - viewport.y) / viewport.zoom,
+        const document = latest?.snapshot?.document
+        if (!document) throw new Error('Canvas 尚未加载完成')
+        if (sourceNodeId) {
+          return findAvailableNativeCanvasChildPosition(sourceNodeId, document.nodes)
         }
-        return findAvailableNativeCanvasNodePosition(
-          visibleCenter,
-          nodes,
-        )
+        const bounds = canvasSurfaceRef.current?.getBoundingClientRect()
+        return findNativeCanvasAgentNodeCreationPosition(document, {
+          width: bounds?.width ?? 0,
+          height: bounds?.height ?? 0,
+        })
       },
       onStateChange: setCreateState,
       onSuccess: (nodeId, result) => updateNativeCanvasState({
         key: stateKey,
-        update: (current) => ({
-          snapshot: current.snapshot
-            ? { ...current.snapshot, document: result.document }
-            : { document: result.document, writable: true, nodeIssues: [] },
-          selectedNodeId: nodeId,
-          conversationNodeId: nodeId,
-          error: null,
-        }),
+        update: (current) => createNativeCanvasAgentNodeSuccessUpdate(current, nodeId, result),
       }),
     })
     commandRef.current = command
@@ -926,27 +955,6 @@ export function NativeCanvasWorkspace({
   /** 只有真实渲染右侧面板时才收窄画布表面，避免工具栏和缩放控件被覆盖。 */
   const conversationPanelOpen = Boolean(conversationNode && (conversationNodeIssue || conversationAdapter))
 
-  useNativeCanvasLayoutEffect(() => {
-    if (!conversationPanelOpen || !conversationNode || !state.snapshot) {
-      revealedConversationKeyRef.current = null
-      return
-    }
-    /** 每次显式打开一个节点面板只处理一次，关闭后允许再次检查。 */
-    const revealKey = `${stateKey}:${conversationNode.id}`
-    if (revealedConversationKeyRef.current === revealKey) return
-    const bounds = canvasSurfaceRef.current?.getBoundingClientRect()
-    const controller = controllerRef.current
-    if (!bounds || !controller) return
-    revealedConversationKeyRef.current = revealKey
-    /** 只有节点被面板裁剪时才平移，已可见节点保持用户 viewport 不变。 */
-    const nextViewport = createNativeCanvasNodeRevealViewport(
-      conversationNode.position,
-      state.snapshot.document.viewport,
-      { width: bounds.width, height: bounds.height },
-    )
-    if (!nextViewport) return
-    controller.enqueueMutation({ type: 'set-viewport', viewport: nextViewport })
-  }, [conversationNode, conversationPanelOpen, state.snapshot, stateKey])
   /** 保持生产默认组件不变，同时允许测试捕获 Workspace 提供的真实回调。 */
   const ConversationRenderer = conversationRenderer ?? CanvasAgentConversation
   /** 恢复、冲突以外的稳定状态允许结构命令。 */

@@ -6,8 +6,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { NativeCanvasGraph, reduceNativeCanvasViewportState } from './NativeCanvasGraph'
 import type { NativeCanvasFlowProps } from './NativeCanvasGraph'
 import {
-  createNativeCanvasNodeRevealViewport,
   findAvailableNativeCanvasNodePosition,
+  findNativeCanvasGlobalAppendPosition,
   NATIVE_CANVAS_NODE_GAP,
   NATIVE_CANVAS_NODE_HEIGHT,
   NATIVE_CANVAS_NODE_WIDTH,
@@ -60,24 +60,24 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(elapsedMs).toBeLessThan(2_000)
   })
 
-  test('Given 对话面板裁掉选中节点 When 计算可见 viewport Then 保持缩放并把节点移回画布中心', () => {
-    const viewport = createNativeCanvasNodeRevealViewport(
-      { x: 400, y: 300 },
-      { x: 0, y: 0, zoom: 1 },
-      { width: 360, height: 600 },
-    )
+  test('Given 1,000 个任意节点 When 全局新增 Then 单次线性扫描保持交互预算', () => {
+    const nodes = Array.from({ length: 1_000 }, (_, index) => ({
+      position: {
+        x: (index % 50 - 25) * 320,
+        y: (Math.floor(index / 50) - 10) * 180,
+      },
+    }))
+    const startedAt = performance.now()
 
-    expect(viewport).toEqual({ x: -364, y: -72, zoom: 1 })
-  })
+    const position = findNativeCanvasGlobalAppendPosition({ x: 0, y: 0 }, nodes)
+    const elapsedMs = performance.now() - startedAt
 
-  test('Given 节点完整位于收窄画布 When 计算可见 viewport Then 不制造额外保存', () => {
-    const viewport = createNativeCanvasNodeRevealViewport(
-      { x: 40, y: 80 },
-      { x: 0, y: 0, zoom: 1 },
-      { width: 800, height: 600 },
-    )
-
-    expect(viewport).toBeNull()
+    expect(position).toEqual({
+      x: 24 * 320 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
+      y: -10 * 180,
+    })
+    /** 预算刻意宽松，只防止实现退化为逐候选反复扫描全部节点。 */
+    expect(elapsedMs).toBeLessThan(100)
   })
 
   test('Given 原生 Canvas Graph When 构造 Flow Then 只渲染可见元素', () => {
