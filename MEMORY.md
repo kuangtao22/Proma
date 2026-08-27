@@ -33,6 +33,7 @@
 - 从纯 `0.17.42` 迁移到 `0.17.42-bone.5` 需要手动安装一次；后续 Bone 版本使用预发布 SemVer 正常递增更新，不开启全局降级。
 - fork 的 LAN、移动端与后续公网能力必须保持为低耦合扩展层；每次合并官方 Proma 新版本后，通过协议契约、适配层和自动化兼容检查确认自有功能不回退，同时继续获得上游新功能与 Bug 修复。
 - LAN 扩展固定按版本化协议、Proma Adapter、IPC、Preload 与 UI 分层；官方运行时服务只允许由 Adapter 接入，降低上游模块重构对移动端功能的影响。
+- LAN Bridge 虽订阅全局 AgentEventBus，但普通 Agent 状态推送必须先通过用户可见性边界排除 Design/Canvas 内部会话；异步状态读取异常只能降级当前推送并记录日志，禁止击穿 Electron 主进程。
 - LAN 设备认证由进程级唯一 `AuthService`/`DeviceStore` 管理；一次性 ticket 仅经 URL fragment 和内存传递。移动端长期设备凭证永久有效直至桌面撤销，桌面仅保存其 SHA-256 哈希；访问令牌固定 15 分钟，受设备版本与撤销状态约束，IP 只作审计元数据，不参与身份校验。
 - 上游兼容检查每周临时合并最新正式 `v*` 标签后运行协议、接缝、测试、类型和构建验证；Workflow 保持只读，不 push、不创建 PR、不发布。
 - LAN Bridge 停启复用进程级 HMAC；可信设备通过长期凭证自动签发新的 15 分钟访问令牌，Bridge 重启或 DHCP/IP 变化不会要求重新配对，重新扫码会轮换该设备的凭证和 Token 版本。
@@ -80,6 +81,11 @@
 - Canvas Agent 的 `run_started` 必须携带主进程权威轻量 session metadata；Renderer reload 先注册全部 lifecycle listener，再由可 dispose 的 coordinator 应用一次性 active-run snapshot 并重放期间非普通事件，StrictMode 旧 snapshot 无副作用，禁止用定时重拉或 owner cache fallback 修补竞态。bootstrap 期间的 `run_started` 与 completion 分别按 session 独立有界保留，并固定按启动、普通流、终态顺序重放，避免 token 洪峰淘汰 owner/generation 建立事实。
 - Canvas 新节点从当前可视中心开始，按固定节点尺寸、间距和确定性方形环寻找首个不重叠位置；Agent 对话只允许明确节点点击打开，关闭时同步清空选区和对话身份但不停止 Agent，XYFlow 的迟到 selection change 只能恢复选区、不得隐式重开面板。
 - Canvas 节点操作采用顶部悬浮工具栏管理全局添加与删除，节点右侧 `+` 创建并原子连线下游节点；删除只移除节点和关联边并保留底层对话。Canvas LOAD 对已提交 Agent 引用的会话缺失或归属异常返回运行时 `nodeIssues`，局部显示“会话不可用”并允许显式重建为空白 session；图文档、授权和未完成事务损坏仍整图 fail closed，UI 禁止暴露 IPC 前缀、内部 UUID、路径或堆栈。
+- 原生 Canvas 根容器必须复用 `design-canvas` 主题作用域，确保 XYFlow 控件在深浅主题下使用统一变量；右侧 Agent 对话面板收窄画布时，顶部工具栏等绝对定位元素的 containing block 必须绑定收窄后的 Canvas surface，不能继续按完整工作区定位。
+- Canvas 新节点落点必须按右侧面板收窄后的真实 Canvas surface 计算，不能按完整工作区宽度放置；面板打开后仅在目标节点被裁剪时执行一次保持 zoom 的 viewport 平移，完整可见时不得制造额外保存或反馈循环。
+- Canvas 多类型节点目标改为顶部添加始终选择 Agent/生图/文档/原型，视频只显示“即将支持”；独立节点按全画布最右侧追加且不得修改 viewport/zoom，节点默认折叠并在卡片锚点内按需展开单一工作台。有连线才共享直接上游已提交上下文，无连线完全独立；上游变化只标记待更新，不自动产生模型或付费调用。
+- 原生 Canvas 单选状态只能由真实 `onNodesChange` 用户交互与显式节点/空白点击同步，禁止再用 React Flow 派生 `onSelectionChange` 反写权威 `selectedNodeId`；后者会在受控 selected 与回调 identity 更新之间形成双向反馈，使多个节点的选中边框持续交替。
+- Canvas Agent committed intent 的永久归属只包含节点身份、session 绑定、稳定展示身份和关系合同；`position` 是用户后续可编辑的画布状态，对账与坏会话重建必须保留当前位置，禁止再以初始落点判定归属损坏。
 
 ## 会话记录
 
@@ -177,3 +183,6 @@
 - 2026-08-26：原生 Canvas 节点命令统一由顶部工具栏与节点侧扩展入口触发；扩展节点和边共享事务 revision，删除保留底层会话并受主进程 active-run 守卫。committed 坏会话只派生内存 `nodeIssues`，重建通过独立可恢复 intent 换绑空白 session；Preload/Adapter 只允许公开错误信封进入 Renderer。
 - 2026-08-27：`stable-directory-native-host` 的真实 helper 合同测试必须在文件级只编译一次原生产物，禁止每个用例重复冷编译挤占 Bun 默认 5 秒卡死保护；组级构建钩子可单独使用 30 秒上限，单用例继续保留默认超时。
 - 2026-08-27：`stable-directory-native-host` 必须等 ChildProcess `close` 后再判断协议是否提前结束；`exit` 可能早于 stdout 管道排空，不能据此拒绝已经正常产出的尾部 `write-result`/`done`。
+- 2026-08-27：完成原生 Canvas 客户端手测，覆盖创建与重命名、独立/扩展 Agent、自动连线、对话、删除确认与快捷键、缩放平移拖动持久化、深浅主题、归档恢复和窄窗口布局；修复深色缩放控件不可见、对话面板遮挡工具栏及移动节点被 LOAD 对账误判归属损坏，83 项定向测试、全仓类型检查和 Electron 完整构建通过。
+- 2026-08-27：修复新 Canvas 顶部添加入口看似无响应，以及 Agent 面板打开后节点被裁在边界造成选中框闪烁的问题；单类型时直接创建，新增落点与一次性可见区校正统一基于真实 Canvas surface，89 项定向测试、全仓类型检查和 Electron 完整构建通过。
+- 2026-08-27：用户复测确认边框仍闪后，通过真实客户端像素与 Electron DOM 连续采样定位第二根因：两个节点的 `selectedNodeId` 被 React Flow 派生 selection 回调循环互换；改为由 `onNodesChange` 单向同步用户选择并去重，连续 5 秒节点 ID 与 16 帧边框像素稳定，90 项定向测试、全仓类型检查和 Electron 完整构建通过。
