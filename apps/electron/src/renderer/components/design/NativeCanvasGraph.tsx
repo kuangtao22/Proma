@@ -1,5 +1,5 @@
 import * as React from 'react'
-import type { CanvasDocument, CanvasMutation, CanvasNode, CanvasNodeIssue } from '@proma/shared'
+import type { CanvasDocument, CanvasMutation, CanvasNode, CanvasNodeIssue, CanvasNodeKind } from '@proma/shared'
 import {
   Background,
   Controls,
@@ -91,6 +91,8 @@ const EMPTY_CANVAS_NODE_ISSUES: CanvasNodeIssue[] = []
 const EMPTY_RUNNING_SESSION_IDS = new Set<string>()
 /** 未接通扩展命令时使用稳定空操作。 */
 const NOOP_EXPAND = (): void => undefined
+/** 未接通类型化扩展命令时使用稳定空操作。 */
+const NOOP_CREATE_CHILD = (): void => undefined
 
 /** 按节点权威身份构造当前工作台内容。 */
 export type NativeCanvasWorkbenchRenderer = (node: CanvasNode) => React.ReactNode
@@ -126,7 +128,7 @@ export interface NativeCanvasGraphProps {
   nodeIssues?: CanvasNodeIssue[]
   runningSessionIds?: ReadonlySet<string>
   canExpand?: boolean
-  onExpand?: (nodeId: string) => void
+  onExpand?: (nodeId: string, kind: CanvasNodeKind) => void
   selectedNodeId: string | null
   onMutation: (mutation: CanvasMutation) => void
   /** 只同步 XYFlow 当前选区，不隐式打开 Agent 对话。 */
@@ -194,7 +196,7 @@ export function NativeCanvasGraph({
   nodeIssues = EMPTY_CANVAS_NODE_ISSUES,
   runningSessionIds = EMPTY_RUNNING_SESSION_IDS,
   canExpand = false,
-  onExpand = NOOP_EXPAND,
+  onExpand = NOOP_CREATE_CHILD,
   selectedNodeId,
   onMutation,
   onNodeSelect,

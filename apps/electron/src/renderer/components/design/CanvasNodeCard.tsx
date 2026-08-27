@@ -4,7 +4,14 @@ import { Handle, Position } from '@xyflow/react'
 import type { LucideIcon } from 'lucide-react'
 import { Bot, CircleAlert, FileImage, FileText, LoaderCircle, Maximize2, Monitor, Plus } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
+import { NATIVE_CANVAS_NODE_TYPE_OPTIONS } from './NativeCanvasToolbar'
 
 /** 折叠卡片只接收画布文档中的精确轻量展示字段和命令回调。 */
 export interface CanvasNodeCardData {
@@ -15,7 +22,7 @@ export interface CanvasNodeCardData {
   summary: string
   canExpand: boolean
   onExpand?: (nodeId: string) => void
-  onCreateChild?: (sourceNodeId: string) => void
+  onCreateChild?: (sourceNodeId: string, kind: CanvasNodeKind) => void
 }
 
 /** XYFlow 泛型要求的数据适配层；展示组件继续只公开精确字段。 */
@@ -32,6 +39,25 @@ const CANVAS_NODE_PRESENTATION: Record<CanvasNodeKind, { label: string; Icon: Lu
   image: { label: '生图', Icon: FileImage },
   document: { label: '文档', Icon: FileText },
   webview: { label: '原型', Icon: Monitor },
+}
+
+/** 节点侧菜单单项的最小结构，兼容顶部菜单的禁用视频项。 */
+export interface CanvasNodeChildTypeOption {
+  kind: CanvasNodeKind | 'video'
+  label: string
+  enabled: boolean
+}
+
+/** 为可用目标类型创建精确扩展处理器，禁用项不触发回调。 */
+export function createCanvasNodeChildTypeSelectHandler(
+  option: CanvasNodeChildTypeOption,
+  sourceNodeId: string,
+  onCreateChild: (sourceNodeId: string, kind: CanvasNodeKind) => void,
+): (() => void) | undefined {
+  if (!option.enabled || option.kind === 'video') return undefined
+  /** 捕获已收窄类型，避免回调执行时重新读取宽联合字段。 */
+  const kind = option.kind
+  return () => onCreateChild(sourceNodeId, kind)
 }
 
 /** Agent 折叠态保留既有运行与故障图标，其他类型无需额外状态图标。 */
@@ -126,27 +152,47 @@ export function CanvasNodeCard({
           className="!size-2 !border-2 !border-background !bg-muted-foreground"
         />
         {onCreateChild ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                aria-label="从此节点扩展"
-                className={cn(
-                  'nodrag nopan absolute -right-9 top-1/2 flex size-7 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background text-foreground shadow-sm transition-opacity hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                  selected
-                    ? 'opacity-100'
-                    : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
-                )}
-                onClick={(event) => {
-                  event.stopPropagation()
-                  onCreateChild(id)
-                }}
-              >
-                <Plus className="size-4" aria-hidden="true" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right">从此节点扩展</TooltipContent>
-          </Tooltip>
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="从此节点扩展"
+                    className={cn(
+                      'nodrag nopan absolute -right-9 top-1/2 flex size-7 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background text-foreground shadow-sm transition-opacity hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                      selected
+                        ? 'opacity-100'
+                        : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
+                    )}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <Plus className="size-4" aria-hidden="true" />
+                  </button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="right">从此节点扩展</TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent
+              side="right"
+              align="center"
+              className="w-48 max-w-[calc(100vw-1rem)]"
+              onPointerDown={(event) => event.stopPropagation()}
+            >
+              {NATIVE_CANVAS_NODE_TYPE_OPTIONS.map((option) => (
+                <DropdownMenuItem
+                  key={option.kind}
+                  disabled={!option.enabled}
+                  aria-disabled={!option.enabled}
+                  aria-label={option.enabled ? option.label : `${option.label}，即将支持`}
+                  onSelect={createCanvasNodeChildTypeSelectHandler(option, id, onCreateChild)}
+                >
+                  <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                  {!option.enabled ? <span className="text-[11px] text-muted-foreground">即将支持</span> : null}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
         ) : null}
       </div>
     </TooltipProvider>

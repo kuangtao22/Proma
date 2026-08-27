@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type { CanvasNodeKind } from '@proma/shared'
 import { ReactFlowProvider } from '@xyflow/react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { CanvasNodeCard } from './CanvasNodeCard'
+import { CanvasNodeCard, createCanvasNodeChildTypeSelectHandler } from './CanvasNodeCard'
 import type { CanvasNodeCardProps } from './CanvasNodeCard'
 
 /** 创建不含任何重内容读取能力的折叠卡片输入。 */
@@ -40,6 +40,25 @@ const propsWithLoadMessages: CanvasNodeCardProps = { ...createProps('agent'), lo
 const propsWithHtml: CanvasNodeCardProps = { ...createProps('webview'), html: '<main />' }
 
 describe('Canvas 通用折叠节点卡片', () => {
+  test('Given 节点侧选择文档 When 扩展 Then 同时传递源节点和目标类型', () => {
+    const calls: Array<[string, CanvasNodeKind]> = []
+    const handler = createCanvasNodeChildTypeSelectHandler(
+      { kind: 'document', label: '文档', enabled: true },
+      'source-1',
+      (sourceNodeId, kind) => calls.push([sourceNodeId, kind]),
+    )
+    handler?.()
+    expect(calls).toEqual([['source-1', 'document']])
+  })
+
+  test('Given 节点侧选择视频 When 菜单项禁用 Then 不生成选择处理器', () => {
+    expect(createCanvasNodeChildTypeSelectHandler(
+      { kind: 'video', label: '视频', enabled: false },
+      'source-1',
+      () => undefined,
+    )).toBeUndefined()
+  })
+
   test.each([
     ['agent', 'Agent'],
     ['image', '生图'],

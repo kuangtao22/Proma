@@ -1,4 +1,5 @@
 import * as React from 'react'
+import type { CanvasNodeKind } from '@proma/shared'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -42,13 +43,16 @@ export function getNativeCanvasDeleteDialogCopy(
   nodeTitle: string,
   connectedEdgeCount: number,
   busy: boolean,
+  kind: CanvasNodeKind = 'agent',
 ): NativeCanvasDeleteDialogCopy {
   return {
     title: `删除“${nodeTitle}”？`,
     edgeMessage: connectedEdgeCount > 0
       ? `将同时删除 ${connectedEdgeCount} 条关联连线。`
       : '此节点没有关联连线。',
-    retentionMessage: 'Agent 对话记录会保留。',
+    retentionMessage: kind === 'agent'
+      ? 'Agent 对话记录会保留。'
+      : '内容将移入回收区，可稍后恢复。',
     confirmLabel: busy ? '停止后删除' : '删除节点',
   }
 }
@@ -73,6 +77,7 @@ export interface NativeCanvasDeleteDialogProps {
   nodeTitle: string
   connectedEdgeCount: number
   busy: boolean
+  kind?: CanvasNodeKind
   submitting?: boolean
   error?: string | null
   onOpenChange: (open: boolean) => void
@@ -85,13 +90,14 @@ export function NativeCanvasDeleteDialog({
   nodeTitle,
   connectedEdgeCount,
   busy,
+  kind = 'agent',
   submitting = false,
   error = null,
   onOpenChange,
   onConfirm,
 }: NativeCanvasDeleteDialogProps): React.ReactElement {
   /** 文案只依赖公开节点标题、边数量和忙碌状态。 */
-  const copy = getNativeCanvasDeleteDialogCopy(nodeTitle, connectedEdgeCount, busy)
+  const copy = getNativeCanvasDeleteDialogCopy(nodeTitle, connectedEdgeCount, busy, kind)
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent className="max-w-md">

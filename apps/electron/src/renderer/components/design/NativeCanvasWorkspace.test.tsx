@@ -4,11 +4,13 @@ import type {
   CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
   CanvasDocument,
+  CanvasNodeLifecycleResult,
   CanvasMutation,
   CanvasNodeKind,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
+  CreateCanvasContentNodeInput,
   RebuildCanvasAgentNodeResult,
 } from '@proma/shared'
 import { createStore, Provider } from 'jotai'
@@ -29,11 +31,14 @@ import {
   NATIVE_CANVAS_SAVE_DEBOUNCE_MS,
   NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
   NativeCanvasWorkspace,
+  createCanvasNodeCommandController,
   createCanvasAgentNodeCommandController,
   createCanvasAgentNodeRebuildController,
   createNativeCanvasWorkbenchDraftCommitCoordinator,
   createNativeCanvasWorkbenchCleanupCoordinator,
   createNativeCanvasAgentNodeSuccessUpdate,
+  createNativeCanvasNodeCreationSuccessUpdate,
+  createNativeCanvasLifecycleSuccessUpdate,
   createResolvedNativeCanvasWorkbenchSwitchUpdate,
   getNativeCanvasWorkbenchCommitAvailability,
   findNativeCanvasAgentNodeCreationPosition,
@@ -53,22 +58,14 @@ import type { CanvasAgentConversationProps } from './CanvasAgentConversation'
 import type { NativeCanvasFlowProps } from './NativeCanvasGraph'
 
 describe('原生 Canvas 顶部添加节点路由', () => {
-  test('Given 选择 Agent When 路由顶部添加命令 Then 执行既有 Agent 创建', () => {
-    const executeAgent = mock(() => undefined)
-
-    runNativeCanvasToolbarAddNode('agent', executeAgent)
-
-    expect(executeAgent).toHaveBeenCalledTimes(1)
-  })
-
-  test.each<CanvasNodeKind>(['image', 'document', 'webview'])(
-    'Given 选择 %s When 内容创建尚未接线 Then 不误创建 Agent',
+  test.each<CanvasNodeKind>(['agent', 'image', 'document', 'webview'])(
+    'Given 选择 %s When 路由顶部添加命令 Then 原样传递节点类型',
     (kind) => {
-      const executeAgent = mock(() => undefined)
+      const execute = mock((_request: { kind: CanvasNodeKind }) => undefined)
 
-      runNativeCanvasToolbarAddNode(kind, executeAgent)
+      runNativeCanvasToolbarAddNode(kind, execute)
 
-      expect(executeAgent).not.toHaveBeenCalled()
+      expect(execute).toHaveBeenCalledWith({ kind })
     },
   )
 })
@@ -1125,6 +1122,152 @@ describe('原生 Canvas 冲突提示', () => {
 })
 
 describe('原生 Canvas 添加 Agent 命令', () => {
+  test.each([
+    ['agent', '新 Agent'],
+    ['image', '新生图'],
+    ['document', '新文档'],
+    ['webview', '新原型'],
+  ] as const)('Given 顶部选择 %s When 创建 Then 使用固定标题并复用失败操作身份', async (kind, title) => {
+    const agentInputs: CreateCanvasAgentNodeInput[] = []
+    const contentInputs: CreateCanvasContentNodeInput[] = []
+    const document = createSnapshot(7).document
+    let attempts = 0
+    const controller = createCanvasNodeCommandController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      createAgentNode: async (input) => {
+        agentInputs.push(input)
+        attempts += 1
+        if (attempts === 1) throw new Error('first failure')
+        return { document: createSnapshot(8).document, session: { id: 'session-1' } as never }
+      },
+      createContentNode: async (input) => {
+        contentInputs.push(input)
+        attempts += 1
+        if (attempts === 1) throw new Error('first failure')
+        return { snapshot: createSnapshot(8), selectedNodeId: input.nodeId }
+      },
+      createId: (() => {
+        const ids = ['operation-1', 'node-1', 'content-1']
+        return () => ids.shift() ?? 'unexpected-id'
+      })(),
+      getDocument: () => document,
+      getPosition: () => ({ x: 320, y: 40 }),
+      onStateChange: () => undefined,
+      onSuccess: () => undefined,
+    })
+
+    await expect(controller.execute({ kind })).rejects.toThrow('first failure')
+    await expect(controller.execute({ kind })).resolves.toBeUndefined()
+
+    const inputs = kind === 'agent' ? agentInputs : contentInputs
+    expect(inputs).toHaveLength(2)
+    expect(inputs[1]).toEqual(inputs[0])
+    expect(inputs[0]).toMatchObject({ title, position: { x: 320, y: 40 } })
+    if (kind !== 'agent') {
+      expect(contentInputs[0]).toMatchObject({ kind, contentId: 'content-1', expectedRevision: 7 })
+    }
+  })
+
+  test.each<CanvasNodeKind>(['agent', 'image', 'document', 'webview'])(
+    'Given 节点侧选择 %s When 扩展 Then 请求包含稳定连线身份',
+    async (kind) => {
+      const inputs: Array<CreateCanvasAgentNodeInput | CreateCanvasContentNodeInput> = []
+      const controller = createCanvasNodeCommandController({
+        target: { projectId: 'project-1', canvasId: 'canvas-1' },
+        createAgentNode: async (input) => {
+          inputs.push(input)
+          return { document: createSnapshot(2).document, session: { id: 'session-2' } as never }
+        },
+        createContentNode: async (input) => {
+          inputs.push(input)
+          return { snapshot: createSnapshot(2), selectedNodeId: input.nodeId }
+        },
+        createId: (() => {
+          const ids = kind === 'agent'
+            ? ['operation-1', 'node-2', 'edge-1']
+            : ['operation-1', 'node-2', 'content-2', 'edge-1']
+          return () => ids.shift() ?? 'unexpected-id'
+        })(),
+        getDocument: () => createSnapshot(1).document,
+        getPosition: () => ({ x: 412, y: 268 }),
+        onStateChange: () => undefined,
+        onSuccess: () => undefined,
+      })
+
+      await controller.execute({ kind, sourceNodeId: 'source-1' })
+
+      expect(inputs[0]).toMatchObject({
+        relationship: { sourceNodeId: 'source-1', edgeId: 'edge-1' },
+      })
+    },
+  )
+
+  test('Given 生命周期成功 When 接管权威快照 Then 清理选区、展开和 dirty 临时态', () => {
+    const current = createInitialNativeCanvasState()
+    current.snapshot = createSnapshot(4)
+    current.selectedNodeId = 'document-1'
+    current.expandedNodeId = 'document-1'
+    current.pendingWorkbenchSwitchNodeId = 'webview-1'
+    current.workbenchDraft = { nodeId: 'document-1', dirty: true }
+    const result: CanvasNodeLifecycleResult = { snapshot: createSnapshot(5) }
+
+    expect(createNativeCanvasLifecycleSuccessUpdate(current, result, null)).toMatchObject({
+      snapshot: result.snapshot,
+      selectedNodeId: null,
+      expandedNodeId: null,
+      pendingWorkbenchSwitchNodeId: null,
+      workbenchDraft: null,
+      error: null,
+    })
+  })
+
+  test('Given 生命周期结果 revision 已落后 When 当前 Canvas 更高 Then 迟到结果完全无副作用', () => {
+    const current = createInitialNativeCanvasState()
+    current.snapshot = createSnapshot(8)
+    current.selectedNodeId = 'document-current'
+    current.expandedNodeId = 'document-current'
+    current.workbenchDraft = { nodeId: 'document-current', dirty: true }
+
+    expect(createNativeCanvasLifecycleSuccessUpdate(
+      current,
+      { snapshot: createSnapshot(7), selectedNodeId: 'document-old' },
+      'document-old',
+    )).toEqual({})
+  })
+
+  test('Given 创建结果 revision 可接管 When 创建成功 Then 只选中新节点且不自动展开', () => {
+    const current = createInitialNativeCanvasState()
+    current.snapshot = createSnapshot(4)
+    current.expandedNodeId = 'document-old'
+    current.workbenchDraft = { nodeId: 'document-old', dirty: false }
+    const result: CanvasNodeLifecycleResult = {
+      snapshot: createSnapshot(5),
+      selectedNodeId: 'document-new',
+    }
+
+    expect(createNativeCanvasNodeCreationSuccessUpdate(current, {
+      kind: 'document', nodeId: 'document-new', result,
+    })).toMatchObject({
+      selectedNodeId: 'document-new',
+      expandedNodeId: null,
+      pendingWorkbenchSwitchNodeId: null,
+      workbenchDraft: null,
+    })
+  })
+
+  test('Given 创建结果 revision 已落后 When 新 Canvas 状态更高 Then 不关闭当前工作台', () => {
+    const current = createInitialNativeCanvasState()
+    current.snapshot = createSnapshot(8)
+    current.expandedNodeId = 'document-current'
+    current.workbenchDraft = { nodeId: 'document-current', dirty: true }
+
+    expect(createNativeCanvasNodeCreationSuccessUpdate(current, {
+      kind: 'agent',
+      nodeId: 'agent-old',
+      result: { document: createSnapshot(7).document, session: { id: 'session-old' } as never },
+    })).not.toHaveProperty('expandedNodeId')
+  })
+
   test('Given 空图和真实 surface When 独立新增 Then 只用 surface 中心换算世界坐标', () => {
     const document = createSnapshot(1).document
     document.viewport = { x: -100, y: 50, zoom: 2 }

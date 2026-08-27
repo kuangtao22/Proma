@@ -3,6 +3,7 @@ import type {
   CanvasDocument,
   CanvasEdge,
   CanvasMutation,
+  CanvasNodeKind,
   CanvasNodeIssue,
   DesignPoint,
   DesignViewport,
@@ -89,7 +90,7 @@ export interface NativeCanvasProjectionOptions {
   nodeIssues: CanvasNodeIssue[]
   runningSessionIds: ReadonlySet<string>
   canCreateChild: boolean
-  onCreateChild: (nodeId: string) => void
+  onCreateChild: (nodeId: string, kind: CanvasNodeKind) => void
   onWorkbenchNodeChange: (nodeId: string) => void
 }
 
