@@ -49,6 +49,8 @@ export interface CanvasTrashEntry {
 
 /** Canvas 内容稳定 ID 的共享边界，与 native helper 合同保持一致。 */
 const CANVAS_CONTENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
+/** Canvas 可恢复命令使用的 UUID，避免 operationId 与稳定内容 ID 混用。 */
+const CANVAS_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 /** Canvas 回收条目标题上限，避免无界数据进入 Renderer。 */
 const CANVAS_TRASH_TITLE_MAX_LENGTH = 120
 
@@ -380,6 +382,122 @@ export interface SaveCanvasMutationsInput extends CanvasTarget {
 export interface CreateCanvasAgentNodeRelationship {
   sourceNodeId: string
   edgeId: string
+}
+
+/** 幂等创建非 Agent 内容节点的严格输入。 */
+export interface CreateCanvasContentNodeInput extends CanvasTarget {
+  operationId: string
+  nodeId: string
+  kind: CanvasContentKind
+  contentId: string
+  title: string
+  position: DesignPoint
+  expectedRevision: number
+  relationship?: CreateCanvasAgentNodeRelationship
+}
+
+/** 幂等删除任意 Canvas 节点的严格输入。 */
+export interface DeleteCanvasNodeInput extends CanvasAgentTarget {
+  operationId: string
+  expectedRevision: number
+}
+
+/** 从回收区恢复内容节点的严格输入。 */
+export interface RestoreCanvasNodeInput extends CanvasTarget {
+  operationId: string
+  trashId: string
+  expectedRevision: number
+  position: DesignPoint
+}
+
+/** 内容节点生命周期操作完成后的公开业务事实。 */
+export interface CanvasNodeLifecycleResult {
+  snapshot: CanvasWorkspaceSnapshot
+  selectedNodeId?: string
+  trashEntry?: CanvasTrashEntry
+}
+
+/** 判断未知坐标是否为 exact-key 有限二维点。 */
+function isCanvasLifecyclePosition(value: unknown): value is DesignPoint {
+  return hasExactCanvasKeys(value, ['x', 'y'])
+    && typeof value.x === 'number' && Number.isFinite(value.x)
+    && typeof value.y === 'number' && Number.isFinite(value.y)
+}
+
+/** 判断共享生命周期命令使用的稳定 ID。 */
+function isCanvasLifecycleId(value: unknown): value is string {
+  return typeof value === 'string' && CANVAS_CONTENT_ID_PATTERN.test(value)
+}
+
+/** 判断标题已规范化且长度有界。 */
+function isCanvasLifecycleTitle(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() === value && value.length > 0 && value.length <= 120
+}
+
+/** 严格解析可选的右侧扩展关系。 */
+function parseCanvasLifecycleRelationship(value: unknown): CreateCanvasAgentNodeRelationship | undefined {
+  if (value === undefined) return undefined
+  if (!hasExactCanvasKeys(value, ['sourceNodeId', 'edgeId'])
+    || !isCanvasLifecycleId(value.sourceNodeId)
+    || !isCanvasLifecycleId(value.edgeId)) {
+    throw new Error('CANVAS_RELATIONSHIP_INVALID')
+  }
+  return { sourceNodeId: value.sourceNodeId, edgeId: value.edgeId }
+}
+
+/** 严格解析非 Agent 内容节点创建命令。 */
+export function parseCreateCanvasContentNodeInput(value: unknown): CreateCanvasContentNodeInput {
+  const required = [
+    'projectId', 'canvasId', 'operationId', 'nodeId', 'kind', 'contentId',
+    'title', 'position', 'expectedRevision',
+  ] as const
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('CANVAS_CREATE_INPUT_INVALID')
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record)
+  if (!required.every((key) => Object.hasOwn(record, key))
+    || keys.some((key) => !required.includes(key as typeof required[number]) && key !== 'relationship')
+    || !isCanvasLifecycleId(record.projectId)
+    || !isCanvasLifecycleId(record.canvasId)
+    || typeof record.operationId !== 'string' || !CANVAS_OPERATION_ID_PATTERN.test(record.operationId)
+    || !isCanvasLifecycleId(record.nodeId)
+    || !isCanvasContentKind(record.kind)
+    || !isCanvasLifecycleId(record.contentId)
+    || !isCanvasLifecycleTitle(record.title)
+    || !isCanvasLifecyclePosition(record.position)
+    || !isCanvasNonNegativeInteger(record.expectedRevision)) {
+    throw new Error('CANVAS_CREATE_INPUT_INVALID')
+  }
+  const relationship = parseCanvasLifecycleRelationship(record.relationship)
+  if (relationship?.sourceNodeId === record.nodeId) throw new Error('CANVAS_RELATIONSHIP_INVALID')
+  return {
+    projectId: record.projectId, canvasId: record.canvasId, operationId: record.operationId,
+    nodeId: record.nodeId, kind: record.kind, contentId: record.contentId, title: record.title,
+    position: { x: record.position.x, y: record.position.y }, expectedRevision: record.expectedRevision,
+    ...(relationship ? { relationship } : {}),
+  }
+}
+
+/** 严格解析节点删除命令。 */
+export function parseDeleteCanvasNodeInput(value: unknown): DeleteCanvasNodeInput {
+  const keys = ['projectId', 'canvasId', 'nodeId', 'operationId', 'expectedRevision'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId) || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasLifecycleId(value.nodeId)
+    || typeof value.operationId !== 'string' || !CANVAS_OPERATION_ID_PATTERN.test(value.operationId)
+    || !isCanvasNonNegativeInteger(value.expectedRevision)) throw new Error('CANVAS_DELETE_INPUT_INVALID')
+  return { projectId: value.projectId, canvasId: value.canvasId, nodeId: value.nodeId, operationId: value.operationId, expectedRevision: value.expectedRevision }
+}
+
+/** 严格解析回收区恢复命令。 */
+export function parseRestoreCanvasNodeInput(value: unknown): RestoreCanvasNodeInput {
+  const keys = ['projectId', 'canvasId', 'operationId', 'trashId', 'expectedRevision', 'position'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId) || !isCanvasLifecycleId(value.canvasId)
+    || typeof value.operationId !== 'string' || !CANVAS_OPERATION_ID_PATTERN.test(value.operationId)
+    || !isCanvasLifecycleId(value.trashId)
+    || !isCanvasNonNegativeInteger(value.expectedRevision)
+    || !isCanvasLifecyclePosition(value.position)) throw new Error('CANVAS_RESTORE_INPUT_INVALID')
+  return { projectId: value.projectId, canvasId: value.canvasId, operationId: value.operationId, trashId: value.trashId, expectedRevision: value.expectedRevision, position: { x: value.position.x, y: value.position.y } }
 }
 
 /** 在已有原生 Canvas 中幂等创建一个内部 Agent 节点。 */

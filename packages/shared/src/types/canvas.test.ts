@@ -4,6 +4,9 @@ import {
   CANVAS_DOCUMENT_VERSION,
   applyCanvasMutations,
   createEmptyCanvasDocument,
+  parseCreateCanvasContentNodeInput,
+  parseDeleteCanvasNodeInput,
+  parseRestoreCanvasNodeInput,
   parseCanvasNodeContentMeta,
   parseCanvasTrashEntry,
 } from './canvas'
@@ -106,6 +109,34 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given 内容节点创建命令 When 严格解析 Then 保留有限关系且拒绝未知字段', () => {
+    const input = parseCreateCanvasContentNodeInput({
+      projectId: 'project-1', canvasId: 'canvas-1',
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-1', kind: 'document', contentId: 'content-1', title: '首页说明',
+      position: { x: 10, y: 20 }, expectedRevision: 3,
+      relationship: { sourceNodeId: 'source-1', edgeId: 'edge-1' },
+    })
+    expect(input.kind).toBe('document')
+    expect(() => parseCreateCanvasContentNodeInput({ ...input, extra: true })).toThrow()
+  })
+
+  test('Given 删除与恢复命令 When 严格解析 Then 拒绝负 revision 与未知字段', () => {
+    expect(parseDeleteCanvasNodeInput({
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      operationId: '22222222-2222-4222-8222-222222222222', expectedRevision: 4,
+    }).nodeId).toBe('node-1')
+    expect(parseRestoreCanvasNodeInput({
+      projectId: 'project-1', canvasId: 'canvas-1',
+      operationId: '33333333-3333-4333-8333-333333333333', trashId: 'trash-1',
+      expectedRevision: 5, position: { x: 1, y: 2 },
+    }).trashId).toBe('trash-1')
+    expect(() => parseRestoreCanvasNodeInput({
+      projectId: 'project-1', canvasId: 'canvas-1',
+      operationId: '33333333-3333-4333-8333-333333333333', trashId: 'trash-1',
+      expectedRevision: -1, position: { x: 1, y: 2 },
+    })).toThrow()
+  })
   test('Given 合法内容元数据和回收条目 When 严格解析 Then 保留公开字段且不暴露路径', () => {
     /** 内容目录最终提交标记。 */
     const meta = parseCanvasNodeContentMeta({

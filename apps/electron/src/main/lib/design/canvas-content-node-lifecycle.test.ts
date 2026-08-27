@@ -1,0 +1,240 @@
+import { describe, expect, test } from 'bun:test'
+import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
+import type { CanvasDocument, CanvasMutation, CanvasTrashEntry } from '@proma/shared'
+import { createCanvasContentNodeLifecycle, parseCanvasContentNodeIntent } from './canvas-content-node-lifecycle'
+import type { CanvasContentNodeIntent } from './canvas-content-node-lifecycle'
+
+/** 创建可观察的内存生命周期环境，避免测试依赖真实磁盘正文。 */
+function createFixture(options: {
+  writeOutcome?: (intent: CanvasContentNodeIntent) => { commitVisible: boolean; durabilityUncertain: boolean; error?: string }
+  migratedSeeds?: Array<{ kind: 'image' | 'document' | 'webview'; contentId: string; adoptedAssetId?: string; legacySourceUrl?: string }>
+} = {}) {
+  /** 当前权威图文档。 */
+  let document = createEmptyCanvasDocument('project-1', 'canvas-1', 10)
+  /** 按 operationId 持久化的 intent tombstone。 */
+  const intents = new Map<string, CanvasContentNodeIntent>()
+  /** 回收区的公开业务条目。 */
+  const trash = new Map<string, CanvasTrashEntry>()
+  /** 已准备的内容身份。 */
+  const contents = new Set<string>()
+  /** 模拟仍运行中的 Agent 节点。 */
+  const running = new Set<string>()
+  /** 迁移提交次数用于证明内容全部准备后只提交一次图。 */
+  let migrationCommits = 0
+  const store = {
+    loadWithMigrationCapability: () => ({
+      snapshot: { document, writable: true as const, nodeIssues: [] }, migratedFrom: options.migratedSeeds ? 1 as const : undefined,
+      legacyContentSeeds: options.migratedSeeds ?? [], openSingleChildDirectory: () => { throw new Error('unused') },
+      commitMigration: () => { migrationCommits += 1; return document },
+    }),
+    mutate: (_target: object, expectedRevision: number, mutations: CanvasMutation[]) => {
+      if (expectedRevision !== document.revision) throw new Error('CANVAS_REVISION_CONFLICT')
+      document = { ...applyCanvasMutations(document, mutations), revision: document.revision + 1, updatedAt: document.updatedAt + 1 }
+      return document
+    },
+  }
+  const contentStore = {
+    prepareEmptyContent: async (_target: object, input: { contentId: string }) => { contents.add(input.contentId) },
+    prepareMigratedContent: async (_target: object, seed: { contentId: string }) => { contents.add(seed.contentId) },
+    assertContent: async () => { throw new Error('unused') },
+    moveToTrash: async (_target: object, entry: CanvasTrashEntry) => { contents.delete(entry.contentId); trash.set(entry.trashId, entry) },
+    restoreFromTrash: async (_target: object, trashId: string) => {
+      const entry = trash.get(trashId)
+      if (!entry) throw new Error('CANVAS_TRASH_ENTRY_NOT_FOUND')
+      contents.add(entry.contentId)
+      return entry
+    },
+    listTrash: async () => [...trash.values()],
+  }
+  /** 每次删除使用独立回收身份。 */
+  let uuidCounter = 0
+  const service = createCanvasContentNodeLifecycle({
+    store, contentStore,
+    scanIntents: async () => [...intents.values()],
+    writeIntent: async (intent) => {
+      const outcome = options.writeOutcome?.(intent) ?? { commitVisible: true, durabilityUncertain: false }
+      if (outcome.commitVisible) intents.set(intent.operationId, structuredClone(intent))
+      return outcome as { commitVisible: true; durabilityUncertain: false } | { commitVisible: false; durabilityUncertain: false; error: string } | { commitVisible: true; durabilityUncertain: true; error: string }
+    },
+    assertAgentNodeIdle: (nodeId) => { if (running.has(nodeId)) throw new Error('AGENT_SESSION_BUSY') },
+    now: (() => { let value = 100; return () => value++ })(),
+    randomUUID: () => `aaaaaaaa-aaaa-4aaa-8aaa-${String(++uuidCounter).padStart(12, '0')}`,
+  })
+  return { service, intents, trash, contents, running, getDocument: () => document, setDocument: (next: CanvasDocument) => { document = next }, getMigrationCommits: () => migrationCommits }
+}
+
+const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+
+describe('CanvasContentNodeLifecycle', () => {
+  test('Given content intent When 严格解析 Then 拒绝未知字段、不可达状态与时间倒退', () => {
+    const value = {
+      schemaVersion: 1, operation: 'create', state: 'prepared',
+      operationId: '11111111-1111-4111-8111-111111111111', ...target,
+      node: { id: 'node-1', kind: 'document', title: '文档', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 0 },
+      expectedRevision: 0, createdAt: 10, updatedAt: 10,
+    }
+    expect(parseCanvasContentNodeIntent(value, target, value.operationId).state).toBe('prepared')
+    expect(() => parseCanvasContentNodeIntent({ ...value, state: 'trashed' }, target, value.operationId)).toThrow('CANVAS_CONTENT_INTENT_INVALID')
+    expect(() => parseCanvasContentNodeIntent({ ...value, updatedAt: 9 }, target, value.operationId)).toThrow('CANVAS_CONTENT_INTENT_INVALID')
+    expect(() => parseCanvasContentNodeIntent({ ...value, extra: true }, target, value.operationId)).toThrow('CANVAS_CONTENT_INTENT_INVALID')
+  })
+
+  test.each(['image', 'document', 'webview'] as const)('Given %s 创建 When 执行 Then 内容与图在 committed 后同时可见', async (kind) => {
+    const fixture = createFixture()
+    const result = await fixture.service.create({
+      ...target, operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-1', kind, contentId: 'content-1', title: '首页', position: { x: 1, y: 2 }, expectedRevision: 0,
+    })
+    expect(result.snapshot.document.nodes[0]?.kind).toBe(kind)
+    expect(fixture.contents.has('content-1')).toBe(true)
+    expect(fixture.intents.values().next().value?.state).toBe('committed')
+  })
+
+  test.each(['image', 'document', 'webview'] as const)('Given %s prepared intent 写失败 When 创建 Then 内容和图均零副作用', async (kind) => {
+    const fixture = createFixture({ writeOutcome: (intent) => intent.state === 'prepared'
+      ? { commitVisible: false, durabilityUncertain: false, error: 'injected' }
+      : { commitVisible: true, durabilityUncertain: false } })
+    await expect(fixture.service.create({
+      ...target, operationId: '17171717-1717-4717-8717-171717171717',
+      nodeId: 'node-17', kind, contentId: 'content-17', title: '内容', position: { x: 0, y: 0 }, expectedRevision: 0,
+    })).rejects.toThrow('CANVAS_CONTENT_INTENT_WRITE_FAILED')
+    expect(fixture.contents.size).toBe(0)
+    expect(fixture.getDocument().nodes).toHaveLength(0)
+  })
+
+  test('Given v1 私有 seeds When LOAD 迁移 Then 全部内容先物化再提交且图 revision 不变', async () => {
+    const seeds = [
+      { kind: 'image' as const, contentId: 'asset-1', adoptedAssetId: 'asset-1' },
+      { kind: 'document' as const, contentId: 'doc-1' },
+      { kind: 'webview' as const, contentId: 'web-1', legacySourceUrl: 'https://example.com' },
+    ]
+    const fixture = createFixture({ migratedSeeds: seeds })
+    fixture.setDocument({ ...fixture.getDocument(), revision: 7, createdAt: 10, updatedAt: 17, nodes: [{ id: 'node-image', kind: 'image', title: '图片', position: { x: 0, y: 0 }, imageModuleId: 'asset-1', adoptedAssetId: 'asset-1' }] })
+    const result = await fixture.service.load(target)
+    expect([...fixture.contents].sort()).toEqual(['asset-1', 'doc-1', 'web-1'])
+    expect(fixture.getMigrationCommits()).toBe(1)
+    expect(result.snapshot.document.revision).toBe(7)
+    expect(fixture.intents.values().next().value?.state).toBe('committed')
+  })
+
+  test('Given 扩展创建 When 提交 Then 节点与边共享一个 revision 且重放不重复', async () => {
+    const fixture = createFixture()
+    fixture.setDocument({
+      ...fixture.getDocument(), nodes: [{ id: 'source-1', kind: 'agent', title: '源', position: { x: 0, y: 0 }, agentSessionId: 'session-1' }],
+    })
+    const input = { ...target, operationId: '22222222-2222-4222-8222-222222222222', nodeId: 'node-2', kind: 'document' as const, contentId: 'content-2', title: '文档', position: { x: 3, y: 4 }, expectedRevision: 0, relationship: { sourceNodeId: 'source-1', edgeId: 'edge-1' } }
+    const first = await fixture.service.create(input)
+    const second = await fixture.service.create(input)
+    expect(first.snapshot.document.revision).toBe(1)
+    expect(second.snapshot.document.revision).toBe(1)
+    expect(second.snapshot.document.edges).toHaveLength(1)
+    await expect(fixture.service.create({ ...input, title: '冲突' })).rejects.toThrow('CANVAS_OPERATION_CONFLICT')
+  })
+
+  test('Given create 在 content-created tombstone 前中断 When 重试 Then 从 prepared 收敛且不重复内容', async () => {
+    let failed = false
+    const fixture = createFixture({ writeOutcome: (intent) => {
+      if (intent.state === 'content-created' && !failed) {
+        failed = true
+        return { commitVisible: false, durabilityUncertain: false, error: 'injected' }
+      }
+      return { commitVisible: true, durabilityUncertain: false }
+    } })
+    const input = { ...target, operationId: '88888888-8888-4888-8888-888888888888', nodeId: 'node-8', kind: 'image' as const, contentId: 'content-8', title: '图片', position: { x: 0, y: 0 }, expectedRevision: 0 }
+    await expect(fixture.service.create(input)).rejects.toThrow('CANVAS_CONTENT_INTENT_WRITE_FAILED')
+    expect(fixture.getDocument().nodes).toHaveLength(0)
+    const retried = await fixture.service.create(input)
+    expect(retried.snapshot.document.nodes).toHaveLength(1)
+  })
+
+  test('Given graph 已提交但 committed intent 耐久未确认 When create Then 错误保留发布 revision', async () => {
+    const fixture = createFixture({ writeOutcome: (intent) => intent.state === 'committed'
+      ? { commitVisible: true, durabilityUncertain: true, error: 'injected' }
+      : { commitVisible: true, durabilityUncertain: false } })
+    const input = { ...target, operationId: '99999999-9999-4999-8999-999999999999', nodeId: 'node-9', kind: 'document' as const, contentId: 'content-9', title: '文档', position: { x: 0, y: 0 }, expectedRevision: 0 }
+    try {
+      await fixture.service.create(input)
+      throw new Error('expected published error')
+    } catch (error) {
+      expect(error).toHaveProperty('document.revision', 1)
+      expect(fixture.getDocument().nodes).toHaveLength(1)
+    }
+  })
+
+  test('Given 内容节点 When 删除恢复再删除 Then 内容身份稳定且 trashId 每次独立', async () => {
+    const fixture = createFixture()
+    await fixture.service.create({ ...target, operationId: '33333333-3333-4333-8333-333333333333', nodeId: 'node-3', kind: 'webview', contentId: 'content-3', title: '原型', position: { x: 5, y: 6 }, expectedRevision: 0 })
+    const deleted = await fixture.service.delete({ ...target, nodeId: 'node-3', operationId: '44444444-4444-4444-8444-444444444444', expectedRevision: 1 })
+    expect(deleted.trashEntry?.contentId).toBe('content-3')
+    const restored = await fixture.service.restore({ ...target, operationId: '55555555-5555-4555-8555-555555555555', trashId: deleted.trashEntry!.trashId, expectedRevision: 2, position: { x: 8, y: 9 } })
+    expect(restored.snapshot.document.nodes[0]?.position).toEqual({ x: 8, y: 9 })
+    const deletedAgain = await fixture.service.delete({ ...target, nodeId: 'node-3', operationId: '66666666-6666-4666-8666-666666666666', expectedRevision: 3 })
+    expect(deletedAgain.trashEntry?.trashId).not.toBe(deleted.trashEntry?.trashId)
+  })
+
+  test('Given delete 在 trashed tombstone 前中断 When 重试 Then 图引用最后只删除一次', async () => {
+    let failed = false
+    const fixture = createFixture({ writeOutcome: (intent) => {
+      if (intent.state === 'trashed' && !failed) { failed = true; return { commitVisible: false, durabilityUncertain: false, error: 'injected' } }
+      return { commitVisible: true, durabilityUncertain: false }
+    } })
+    await fixture.service.create({ ...target, operationId: '12121212-1212-4212-8212-121212121212', nodeId: 'node-12', kind: 'image', contentId: 'content-12', title: '图片', position: { x: 0, y: 0 }, expectedRevision: 0 })
+    const input = { ...target, nodeId: 'node-12', operationId: '13131313-1313-4313-8313-131313131313', expectedRevision: 1 }
+    await expect(fixture.service.delete(input)).rejects.toThrow('CANVAS_CONTENT_INTENT_WRITE_FAILED')
+    expect(fixture.getDocument().nodes).toHaveLength(1)
+    const retried = await fixture.service.delete(input)
+    expect(retried.snapshot.document.revision).toBe(2)
+    expect(retried.snapshot.document.nodes).toHaveLength(0)
+  })
+
+  test('Given restore 在 restored tombstone 前中断 When 重试 Then 恢复节点只提交一次', async () => {
+    let failRestore = false
+    const fixture = createFixture({ writeOutcome: (intent) => {
+      if (intent.state === 'restored' && failRestore) { failRestore = false; return { commitVisible: false, durabilityUncertain: false, error: 'injected' } }
+      return { commitVisible: true, durabilityUncertain: false }
+    } })
+    await fixture.service.create({ ...target, operationId: '14141414-1414-4414-8414-141414141414', nodeId: 'node-14', kind: 'document', contentId: 'content-14', title: '文档', position: { x: 0, y: 0 }, expectedRevision: 0 })
+    const deleted = await fixture.service.delete({ ...target, nodeId: 'node-14', operationId: '15151515-1515-4515-8515-151515151515', expectedRevision: 1 })
+    failRestore = true
+    const input = { ...target, operationId: '16161616-1616-4616-8616-161616161616', trashId: deleted.trashEntry!.trashId, expectedRevision: 2, position: { x: 4, y: 5 } }
+    await expect(fixture.service.restore(input)).rejects.toThrow('CANVAS_CONTENT_INTENT_WRITE_FAILED')
+    expect(fixture.getDocument().nodes).toHaveLength(0)
+    const retried = await fixture.service.restore(input)
+    expect(retried.snapshot.document.revision).toBe(3)
+    expect(retried.snapshot.document.nodes).toHaveLength(1)
+  })
+
+  test.each(['delete', 'restore'] as const)('Given %s 图已提交但 committed intent 耐久未确认 Then 错误携带发布 revision', async (operation) => {
+    let enableUncertain = false
+    const fixture = createFixture({ writeOutcome: (intent) => enableUncertain && intent.state === 'committed'
+      ? { commitVisible: true, durabilityUncertain: true, error: 'injected' }
+      : { commitVisible: true, durabilityUncertain: false } })
+    await fixture.service.create({ ...target, operationId: '18181818-1818-4818-8818-181818181818', nodeId: 'node-18', kind: 'webview', contentId: 'content-18', title: '原型', position: { x: 0, y: 0 }, expectedRevision: 0 })
+    const deleted = await fixture.service.delete({ ...target, nodeId: 'node-18', operationId: '19191919-1919-4919-8919-191919191919', expectedRevision: 1 })
+    if (operation === 'restore') enableUncertain = true
+    try {
+      if (operation === 'delete') {
+        await fixture.service.restore({ ...target, operationId: '20202020-2020-4020-8020-202020202020', trashId: deleted.trashEntry!.trashId, expectedRevision: 2, position: { x: 1, y: 1 } })
+        enableUncertain = true
+        await fixture.service.delete({ ...target, nodeId: 'node-18', operationId: '21212121-2121-4121-8121-212121212121', expectedRevision: 3 })
+      } else {
+        await fixture.service.restore({ ...target, operationId: '22222222-2222-4222-8222-222222222222', trashId: deleted.trashEntry!.trashId, expectedRevision: 2, position: { x: 1, y: 1 } })
+      }
+      throw new Error('expected published error')
+    } catch (error) {
+      expect(error).toHaveProperty('document.revision', operation === 'delete' ? 4 : 3)
+    }
+  })
+
+  test('Given Agent 节点 When 删除 Then 运行中拒绝，空闲时只移除图引用', async () => {
+    const fixture = createFixture()
+    fixture.setDocument({ ...fixture.getDocument(), nodes: [{ id: 'agent-1', kind: 'agent', title: 'Agent', position: { x: 0, y: 0 }, agentSessionId: 'session-keep' }] })
+    fixture.running.add('agent-1')
+    const input = { ...target, nodeId: 'agent-1', operationId: '77777777-7777-4777-8777-777777777777', expectedRevision: 0 }
+    await expect(fixture.service.delete(input)).rejects.toThrow('AGENT_SESSION_BUSY')
+    fixture.running.clear()
+    const result = await fixture.service.delete(input)
+    expect(result.snapshot.document.nodes).toHaveLength(0)
+    expect(result.trashEntry).toBeUndefined()
+  })
+})
