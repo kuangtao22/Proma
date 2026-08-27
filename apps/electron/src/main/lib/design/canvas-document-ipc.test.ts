@@ -477,6 +477,13 @@ describe('原生 Canvas 文档 IPC', () => {
       ok: false,
       error: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
     })
+    expect(context.sender.sent).toEqual([{
+      channel: CANVAS_IPC_CHANNELS.CHANGED,
+      value: {
+        projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph',
+      },
+    }])
+    expect(context.broadcastLeaseStates).toEqual([false])
     errorSpy.mockRestore()
   })
 

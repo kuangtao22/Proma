@@ -408,6 +408,26 @@ function rebuildCanvasWorkspaceSnapshot(
   }
 }
 
+/**
+ * 从生命周期成功值中独立重建已提交的权威文档。
+ * @param value 内容生命周期返回的原始成功值。
+ * @param target 当前项目与 Canvas 的公开身份。
+ * @returns 通过严格身份和 schema 校验的 Canvas 文档。
+ */
+function rebuildCanvasNodeLifecycleDocument(
+  value: unknown,
+  target: LoadCanvasInput,
+): CanvasDocument {
+  if (!isRecord(value)
+    || !hasOwnDataKeys(value, ['snapshot'])
+    || !isRecord(value.snapshot)
+    || !hasOwnDataKeys(value.snapshot, ['document'])) {
+    throw new Error('CANVAS_NODE_LIFECYCLE_DOCUMENT_INVALID')
+  }
+  /** 附属公开字段损坏不能吞掉已经提交且可严格验证的图 revision。 */
+  return parseCanvasDocument(value.snapshot.document, target).document
+}
+
 /** 严格重建内容节点生命周期的公开结果。 */
 function rebuildCanvasNodeLifecycleResult(
   value: unknown,
@@ -801,14 +821,14 @@ export function registerCanvasDocumentIpcHandlers(
       }
       throw outcome.content.operationOutcome.error
     }
-    /** 成功值先经过 IPC 边界严格重建，非法嵌套合同不得参与发布或返回。 */
-    const value = rebuildValue(outcome.content.operationOutcome.value)
-    /** 成功操作仅在本轮 revision 前进时发布，幂等重放不重复广播。 */
-    const successfulDocument = getSuccessfulDocument?.(value)
+    /** 先从原始成功值独立验证已提交文档，附属字段损坏不能吞掉发布事实。 */
+    const successfulDocument = getSuccessfulDocument?.(outcome.content.operationOutcome.value)
     if (successfulDocument
       && successfulDocument.revision !== outcome.content.reconciliation.snapshot.document.revision) {
       publishUniqueChange(input, published, successfulDocument.revision, 'graph')
     }
+    /** 完整公开结果随后严格重建，非法嵌套合同仍须 fail closed。 */
+    const value = rebuildValue(outcome.content.operationOutcome.value)
     return value
   })
 
@@ -1011,7 +1031,7 @@ export function registerCanvasDocumentIpcHandlers(
         input,
         () => options.contentLifecycle.createReconciled(input),
         (result) => rebuildCanvasNodeLifecycleResult(result, input),
-        (result) => result.snapshot.document,
+        (result) => rebuildCanvasNodeLifecycleDocument(result, input),
       )
     })
   ))
@@ -1026,7 +1046,7 @@ export function registerCanvasDocumentIpcHandlers(
         input,
         () => options.contentLifecycle.deleteReconciled(input),
         (result) => rebuildCanvasNodeLifecycleResult(result, input),
-        (result) => result.snapshot.document,
+        (result) => rebuildCanvasNodeLifecycleDocument(result, input),
       )
     })
   ))
@@ -1055,7 +1075,7 @@ export function registerCanvasDocumentIpcHandlers(
         input,
         () => options.contentLifecycle.restoreReconciled(input),
         (result) => rebuildCanvasNodeLifecycleResult(result, input),
-        (result) => result.snapshot.document,
+        (result) => rebuildCanvasNodeLifecycleDocument(result, input),
       )
     })
   ))
