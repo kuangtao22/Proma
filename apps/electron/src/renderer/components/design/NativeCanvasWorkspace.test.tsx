@@ -44,6 +44,7 @@ import {
   findNativeCanvasAgentNodeCreationPosition,
   createRebuiltNativeCanvasStateUpdate,
   createStopAcceptedPendingCanvasDelete,
+  settleNativeCanvasStopDeleteAttempt,
   createNativeCanvasWorkspaceController,
   getNativeCanvasConnectedEdgeCount,
   getPendingCanvasStopDeleteGenerationStatus,
@@ -53,6 +54,7 @@ import {
 import type {
   CanvasAgentNodeCommandState,
   NativeCanvasScheduler,
+  PendingCanvasStopDelete,
   NativeCanvasWorkspaceController,
   NativeCanvasWorkspaceControllerDependencies,
 } from './NativeCanvasWorkspace'
@@ -1563,6 +1565,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
 
   test('Given 停止后删除请求 When Canvas 或 session 已切换 Then 旧请求不得提交删除', () => {
     const pending = {
+      requestGeneration: 1,
       canvasKey: 'project-1:canvas-a',
       nodeId: 'agent-1',
       sessionId: 'session-old',
@@ -1587,7 +1590,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
 
   test('Given STOP 绑定 generation 100 When 同 session generation 200 接管 Then 旧删除立即取消', () => {
     const pending = {
-      canvasKey: 'project-1:canvas-a', nodeId: 'agent-1', sessionId: 'session-1',
+      requestGeneration: 1, canvasKey: 'project-1:canvas-a', nodeId: 'agent-1', sessionId: 'session-1',
       startedAt: 100, stopAccepted: true,
     }
     expect(getPendingCanvasStopDeleteGenerationStatus(
@@ -1598,9 +1601,116 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     )).toBe('replaced')
   })
 
+  test('Given gen100 STOP 在途 When gen200 pending 后旧 reject 到达 Then 新删除状态完全不变', async () => {
+    const deferred = createDeferred<void>()
+    const oldPending = {
+      requestGeneration: 1, canvasKey: 'project-1:canvas-a', nodeId: 'agent-1',
+      sessionId: 'session-1', startedAt: 100, stopAccepted: false,
+    }
+    const newPending = { ...oldPending, requestGeneration: 2, startedAt: 200 }
+    let currentGeneration = 1
+    let pending: PendingCanvasStopDelete | null = oldPending
+    let submitting = true
+    let error: string | null = null
+    let deleteCalls = 0
+    const settled = settleNativeCanvasStopDeleteAttempt(oldPending, deferred.promise, {
+      getCurrentRequestGeneration: () => currentGeneration,
+      getPending: () => pending,
+      onAccepted: () => { deleteCalls += 1 },
+      onRejected: () => { pending = null; submitting = false; error = '旧错误' },
+    })
+
+    currentGeneration = 2
+    pending = newPending
+    deferred.reject(new Error('gen100 stop failed'))
+    await settled
+
+    expect({ pending, submitting, error, deleteCalls }).toEqual({
+      pending: newPending, submitting: true, error: null, deleteCalls: 0,
+    })
+  })
+
+  test('Given gen200 已提交删除 When gen100 旧 reject 到达 Then 不干扰在途删除', async () => {
+    const deferred = createDeferred<void>()
+    const oldPending = {
+      requestGeneration: 1, canvasKey: 'project-1:canvas-a', nodeId: 'agent-1',
+      sessionId: 'session-1', startedAt: 100, stopAccepted: false,
+    }
+    const newPending = {
+      ...oldPending, requestGeneration: 2, startedAt: 200, stopAccepted: true,
+    }
+    let pending: PendingCanvasStopDelete | null = newPending
+    let submitting = true
+    let error: string | null = null
+    let deleteCalls = 1
+    const settled = settleNativeCanvasStopDeleteAttempt(oldPending, deferred.promise, {
+      getCurrentRequestGeneration: () => 2,
+      getPending: () => pending,
+      onAccepted: () => { deleteCalls += 1 },
+      onRejected: () => { pending = null; submitting = false; error = '旧错误' },
+    })
+
+    deferred.reject(new Error('gen100 stop failed'))
+    await settled
+
+    expect({ pending, submitting, error, deleteCalls }).toEqual({
+      pending: newPending, submitting: true, error: null, deleteCalls: 1,
+    })
+  })
+
+  test('Given gen100 STOP 在途 When gen200 接管后旧 resolve 到达 Then 不接受或触发删除', async () => {
+    const deferred = createDeferred<void>()
+    const oldPending = {
+      requestGeneration: 1, canvasKey: 'project-1:canvas-a', nodeId: 'agent-1',
+      sessionId: 'session-1', startedAt: 100, stopAccepted: false,
+    }
+    const newPending = { ...oldPending, requestGeneration: 2, startedAt: 200 }
+    let accepted = 0
+    const settled = settleNativeCanvasStopDeleteAttempt(oldPending, deferred.promise, {
+      getCurrentRequestGeneration: () => 2,
+      getPending: () => newPending,
+      onAccepted: () => { accepted += 1 },
+      onRejected: () => undefined,
+    })
+
+    deferred.resolve()
+    await settled
+
+    expect(accepted).toBe(0)
+  })
+
+  test('Given 当前 STOP attempt When reject 到达 Then 只结束自身 submitting 并显示错误', async () => {
+    const deferred = createDeferred<void>()
+    const currentPending = {
+      requestGeneration: 3, canvasKey: 'project-1:canvas-a', nodeId: 'agent-1',
+      sessionId: 'session-1', startedAt: 300, stopAccepted: false,
+    }
+    let pending: PendingCanvasStopDelete | null = currentPending
+    let submitting = true
+    let error: string | null = null
+    const settled = settleNativeCanvasStopDeleteAttempt(currentPending, deferred.promise, {
+      getCurrentRequestGeneration: () => 3,
+      getPending: () => pending,
+      onAccepted: () => undefined,
+      onRejected: () => { pending = null; submitting = false; error = '停止失败，节点未删除。' },
+    })
+
+    deferred.reject(new Error('current stop failed'))
+    await settled
+
+    const getState = (): {
+      pending: PendingCanvasStopDelete | null
+      submitting: boolean
+      error: string | null
+    } => ({ pending, submitting, error })
+    expect(getState()).toEqual({
+      pending: null, submitting: false, error: '停止失败，节点未删除。',
+    })
+  })
+
   test('Given 旧 STOP Promise 晚回 When 同节点新 generation 已接管 Then 不标记新删除为已停止', () => {
     const oldPending = {
-      canvasKey: 'project-1:canvas-a', nodeId: 'agent-1', sessionId: 'session-1',
+      requestGeneration: 1, canvasKey: 'project-1:canvas-a', nodeId: 'agent-1', sessionId: 'session-1',
       startedAt: 100, stopAccepted: false,
     }
     const newPending = { ...oldPending, startedAt: 200 }
@@ -1614,7 +1724,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
 
   test('Given STOP 绑定 generation 100 When 匹配代次明确结束 Then 允许提交删除', () => {
     const pending = {
-      canvasKey: 'project-1:canvas-a', nodeId: 'agent-1', sessionId: 'session-1',
+      requestGeneration: 1, canvasKey: 'project-1:canvas-a', nodeId: 'agent-1', sessionId: 'session-1',
       startedAt: 100, stopAccepted: true,
     }
     expect(getPendingCanvasStopDeleteGenerationStatus(

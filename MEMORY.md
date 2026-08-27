@@ -191,4 +191,4 @@
 - 2026-08-27：Canvas 多类型节点四层接口只使用主进程唯一的内容 Store/Lifecycle；LOAD 在同一 workspace lease 内先完成内容迁移与对账，再执行 Agent 对账。历史与当前 publication 必须在 lease 释放后按顺序发布，并按 `cause + revision` 去重；通用 SAVE 禁止绕过生命周期直接删除非 Agent 节点。
 - 2026-08-28：Canvas 节点工作台只由 Renderer `expandedNodeId` 驱动，同一时刻最多挂载一个节点锚定覆盖层；dirty 跨节点切换必须走保存、放弃、取消三分支，通知导航也必须复用同一 dirty-aware 状态转换。切换 Canvas、recovery、删除和真实卸载清理临时态，StrictMode 同 key 演练重挂不得误清。
 - 2026-08-28：Canvas 工作台草稿保存 Promise 必须同时复核 workspace key、源节点、目标节点和单调 operation generation；业务身份 stale 时只收口当前 generation 的 saving，generation 或 workspace stale 时完全无副作用，避免迟到结果关闭新工作台或永久锁住切换对话框。
-- 2026-08-28：Canvas 运行中 Agent 的“停止并删除”必须 authoritative-first 绑定明确 `startedAt`，STOP 回调同时复核 Canvas、节点、session 和代次；新运行接管或代次未知时 fail closed。回收区每次列表读取使用独立单调请求代次，恢复成功、关闭和销毁都会失效旧请求，禁止迟到结果复活旧条目或覆盖新状态。
+- 2026-08-28：Canvas 运行中 Agent 的“停止并删除”必须 authoritative-first 绑定明确 `startedAt`，每次 STOP attempt 另有独立单调请求代次；resolve/reject 在任何 UI 副作用前同时复核请求 token、Canvas、节点、session、`startedAt` 和当前 pending 身份，新运行接管、代次未知、Canvas 切换或卸载时先失效旧 token 并 fail closed。回收区每次列表读取使用独立单调请求代次，恢复成功、关闭和销毁都会失效旧请求，禁止迟到结果复活旧条目或覆盖新状态。

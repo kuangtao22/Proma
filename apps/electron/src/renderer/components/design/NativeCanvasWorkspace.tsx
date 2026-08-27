@@ -189,6 +189,8 @@ export interface CanvasAgentNodeRebuildController {
 
 /** 运行节点停止完成前保留的删除身份与 Canvas 代次。 */
 export interface PendingCanvasStopDelete {
+  /** 每次 STOP attempt 独立递增的 Renderer 请求代次。 */
+  requestGeneration: number
   canvasKey: string
   nodeId: string
   sessionId: string
@@ -491,11 +493,56 @@ export function createStopAcceptedPendingCanvasDelete(
   requested: PendingCanvasStopDelete,
 ): PendingCanvasStopDelete | null {
   if (!current
+    || current.requestGeneration !== requested.requestGeneration
     || current.canvasKey !== requested.canvasKey
     || current.nodeId !== requested.nodeId
     || current.sessionId !== requested.sessionId
     || current.startedAt !== requested.startedAt) return current
   return { ...current, stopAccepted: true }
+}
+
+/** STOP Promise settle 前读取的同步身份与副作用边界。 */
+export interface NativeCanvasStopDeleteAttemptDependencies {
+  getCurrentRequestGeneration: () => number
+  getPending: () => PendingCanvasStopDelete | null
+  onAccepted: () => void
+  onRejected: (error: unknown) => void
+}
+
+/** 判断 STOP 回调是否仍属于当前 token 和完整 pending 身份。 */
+function isNativeCanvasStopDeleteAttemptCurrent(
+  requested: PendingCanvasStopDelete,
+  dependencies: NativeCanvasStopDeleteAttemptDependencies,
+): boolean {
+  if (dependencies.getCurrentRequestGeneration() !== requested.requestGeneration) return false
+  const current = dependencies.getPending()
+  return current?.requestGeneration === requested.requestGeneration
+    && current.canvasKey === requested.canvasKey
+    && current.nodeId === requested.nodeId
+    && current.sessionId === requested.sessionId
+    && current.startedAt === requested.startedAt
+}
+
+/**
+ * 等待单次 STOP，并在任何 UI 副作用前复核 token 与完整业务身份。
+ * @param requested 发起 STOP 时固化的 pending 身份。
+ * @param stopPromise 当前 STOP 请求 Promise。
+ * @param dependencies 同步身份读取与当前 attempt 专属副作用。
+ * @returns Promise settle 后完成，不传播已由 UI 收口的失败。
+ */
+export async function settleNativeCanvasStopDeleteAttempt(
+  requested: PendingCanvasStopDelete,
+  stopPromise: Promise<void>,
+  dependencies: NativeCanvasStopDeleteAttemptDependencies,
+): Promise<void> {
+  try {
+    await stopPromise
+    if (!isNativeCanvasStopDeleteAttemptCurrent(requested, dependencies)) return
+    dependencies.onAccepted()
+  } catch (error) {
+    if (!isNativeCanvasStopDeleteAttemptCurrent(requested, dependencies)) return
+    dependencies.onRejected(error)
+  }
 }
 
 /** 捕获当前 authoritative-first 明确运行代次；未知或缺失统一返回 null。 */
@@ -1295,8 +1342,10 @@ export function NativeCanvasWorkspace({
   const commandRef = React.useRef<CanvasNodeCreateCommandController | null>(null)
   const trashControllerRef = React.useRef<NativeCanvasTrashController | null>(null)
   const rebuildCommandRef = React.useRef<CanvasAgentNodeRebuildController | null>(null)
-  /** 删除异步回调代次，Canvas 切换后立即失效旧停止请求。 */
+  /** DELETE 异步回调代次，Canvas 切换后立即失效旧删除请求。 */
   const deleteGenerationRef = React.useRef(0)
+  /** STOP attempt 独立单调代次，不能与后续 DELETE 请求共用生命周期。 */
+  const stopDeleteRequestGenerationRef = React.useRef(0)
   /** 删除失败重试复用同一完整幂等请求，成功或 Canvas 切换后清理。 */
   const deleteOperationRef = React.useRef<DeleteCanvasNodeInput | null>(null)
   /** 空图新增落点必须使用真实画布表面，不读取侧栏或窗口全宽。 */
@@ -1340,6 +1389,18 @@ export function NativeCanvasWorkspace({
   }
   /** 停止请求与权威运行终态之间的待删除身份。 */
   const [pendingStopDelete, setPendingStopDelete] = React.useState<PendingCanvasStopDelete | null>(null)
+  /** Promise 回调同步读取当前 pending，避免 React state 提交时序留下竞态窗口。 */
+  const pendingStopDeleteRef = React.useRef<PendingCanvasStopDelete | null>(null)
+  /** 同步替换 ref 与 React state，所有 STOP 回调只读取该唯一身份。 */
+  const replacePendingStopDelete = React.useCallback((next: PendingCanvasStopDelete | null): void => {
+    pendingStopDeleteRef.current = next
+    setPendingStopDelete(next)
+  }, [])
+  /** 失效当前 STOP token 后清除 pending，迟到 resolve/reject 完全无副作用。 */
+  const invalidatePendingStopDelete = React.useCallback((): void => {
+    stopDeleteRequestGenerationRef.current += 1
+    replacePendingStopDelete(null)
+  }, [replacePendingStopDelete])
   /** SSR 首帧使用该 key 专属的全新状态，不启动任何消息或 Canvas API。 */
   const fallbackState = React.useMemo(createInitialNativeCanvasState, [stateKey])
   const state = states.get(stateKey) ?? fallbackState
@@ -1644,22 +1705,29 @@ export function NativeCanvasWorkspace({
         update: (current) => createNativeCanvasLifecycleSuccessUpdate(current, result, null),
       })
       deleteOperationRef.current = null
-      setPendingStopDelete(null)
+      invalidatePendingStopDelete()
       setDeleteSubmitting(false)
       setDeleteError(null)
       setDeleteDialogOpen(false)
     }).catch((error: unknown) => {
       if (deleteGenerationRef.current !== deleteGeneration) return
-      setPendingStopDelete(null)
+      invalidatePendingStopDelete()
       setDeleteSubmitting(false)
       setDeleteError(getNativeCanvasOperationErrorMessage('delete', error))
     })
-  }, [adapter.deleteCanvasNode, stateKey, store, target, updateNativeCanvasState])
+  }, [
+    adapter.deleteCanvasNode,
+    invalidatePendingStopDelete,
+    stateKey,
+    store,
+    target,
+    updateNativeCanvasState,
+  ])
 
   React.useEffect(() => {
     if (!pendingStopDelete) return
     if (pendingStopDelete.canvasKey !== stateKey) {
-      setPendingStopDelete(null)
+      invalidatePendingStopDelete()
       setDeleteSubmitting(false)
       return
     }
@@ -1669,7 +1737,7 @@ export function NativeCanvasWorkspace({
       node.id === pendingStopDelete.nodeId && node.kind === 'agent'
     ))
     if (!isPendingCanvasStopDeleteTargetCurrent(pendingStopDelete, stateKey, latestNode)) {
-      setPendingStopDelete(null)
+      invalidatePendingStopDelete()
       setDeleteSubmitting(false)
       setDeleteDialogOpen(false)
       return
@@ -1682,7 +1750,7 @@ export function NativeCanvasWorkspace({
     )
     if (generationStatus === 'active') return
     if (generationStatus === 'replaced' || generationStatus === 'unknown') {
-      setPendingStopDelete(null)
+      invalidatePendingStopDelete()
       setDeleteSubmitting(false)
       setDeleteError(generationStatus === 'replaced'
         ? 'Agent 已开始新的运行，旧删除已取消。'
@@ -1693,6 +1761,7 @@ export function NativeCanvasWorkspace({
     commitNodeDelete(pendingStopDelete.nodeId)
   }, [
     commitNodeDelete,
+    invalidatePendingStopDelete,
     optimisticRunGenerations,
     pendingStopDelete,
     runGenerations,
@@ -1725,31 +1794,40 @@ export function NativeCanvasWorkspace({
     }
     /** 当前停止请求绑定节点和 session，重建换绑后不会删除新会话节点。 */
     const pending = {
+      requestGeneration: stopDeleteRequestGenerationRef.current + 1,
       canvasKey: stateKey,
       nodeId: selectedNode.id,
       sessionId: selectedNode.agentSessionId,
       startedAt,
       stopAccepted: false,
     }
-    /** 当前代次只允许更新发起停止时的 Canvas。 */
-    const deleteGeneration = deleteGenerationRef.current
+    stopDeleteRequestGenerationRef.current = pending.requestGeneration
     setDeleteSubmitting(true)
     setDeleteError(null)
-    setPendingStopDelete(pending)
-    void adapter.stopCanvasAgent({ ...target, nodeId: selectedNode.id }).then(() => {
-      if (deleteGenerationRef.current !== deleteGeneration) return
-      setPendingStopDelete((current) => createStopAcceptedPendingCanvasDelete(current, pending))
-    }).catch((error: unknown) => {
-      if (deleteGenerationRef.current !== deleteGeneration) return
-      setPendingStopDelete(null)
-      setDeleteSubmitting(false)
-      setDeleteError(getNativeCanvasOperationErrorMessage('stop', error))
-    })
+    replacePendingStopDelete(pending)
+    void settleNativeCanvasStopDeleteAttempt(
+      pending,
+      adapter.stopCanvasAgent({ ...target, nodeId: selectedNode.id }),
+      {
+        getCurrentRequestGeneration: () => stopDeleteRequestGenerationRef.current,
+        getPending: () => pendingStopDeleteRef.current,
+        onAccepted: () => replacePendingStopDelete(
+          createStopAcceptedPendingCanvasDelete(pendingStopDeleteRef.current, pending),
+        ),
+        onRejected: (error) => {
+          invalidatePendingStopDelete()
+          setDeleteSubmitting(false)
+          setDeleteError(getNativeCanvasOperationErrorMessage('stop', error))
+        },
+      },
+    )
   }, [
     adapter.stopCanvasAgent,
     canDeleteNode,
     commitNodeDelete,
     optimisticRunGenerations,
+    invalidatePendingStopDelete,
+    replacePendingStopDelete,
     runGenerations,
     selectedNode,
     stateKey,
@@ -1775,16 +1853,21 @@ export function NativeCanvasWorkspace({
     /** Canvas 身份切换时本地弹窗和待停止删除不得跨工作区延续。 */
     workbenchDraftCommitCoordinatorRef.current?.invalidate()
     deleteGenerationRef.current += 1
+    invalidatePendingStopDelete()
     deleteOperationRef.current = null
     setDeleteDialogOpen(false)
     setDeleteSubmitting(false)
     setDeleteError(null)
-    setPendingStopDelete(null)
     setTrashOpen(false)
     setTrashState({ entries: [], loading: false, restoringTrashId: null, error: null })
     setWorkbenchSwitchSaving(false)
     setWorkbenchSwitchError(null)
-  }, [stateKey])
+    return () => {
+      /** Canvas 切换或真实卸载时同步失效 STOP，cleanup 不再触发 React state。 */
+      stopDeleteRequestGenerationRef.current += 1
+      pendingStopDeleteRef.current = null
+    }
+  }, [invalidatePendingStopDelete, stateKey])
 
   React.useEffect(() => {
     if (state.authoritativeRecoveryState === 'idle') return
