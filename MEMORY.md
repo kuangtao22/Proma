@@ -188,3 +188,4 @@
 - 2026-08-27：用户复测确认边框仍闪后，通过真实客户端像素与 Electron DOM 连续采样定位第二根因：两个节点的 `selectedNodeId` 被 React Flow 派生 selection 回调循环互换；改为由 `onNodesChange` 单向同步用户选择并去重，连续 5 秒节点 ID 与 16 帧边框像素稳定，90 项定向测试、全仓类型检查和 Electron 完整构建通过。
 - 2026-08-27：Canvas 非 Agent 内容以 `meta.json` 最后提交作为创建完成标记；`trashId` 只表示一次回收身份，始终与稳定 `contentId` 分离。删除、恢复与重放必须保留 helper 的结构化提交证据，提交已可见但耐久性未确认时优先返回可对账错误，授权或后置校验失败不得覆盖该事实。
 - 2026-08-27：Canvas `content-node` intent 永不承载 Agent 节点；Agent 与内容 intent 共享 `transactions` 的 512 项总容量。内容生命周期的 committed tombstone 负责 operation 幂等，图 publication 与本轮是否再次 mutation 分离：重启仅补 tombstone 时仍发布既有 revision，后续 committed 对账不重复发布。
+- 2026-08-27：Canvas 多类型节点四层接口只使用主进程唯一的内容 Store/Lifecycle；LOAD 在同一 workspace lease 内先完成内容迁移与对账，再执行 Agent 对账。历史与当前 publication 必须在 lease 释放后按顺序发布，并按 `cause + revision` 去重；通用 SAVE 禁止绕过生命周期直接删除非 Agent 节点。
