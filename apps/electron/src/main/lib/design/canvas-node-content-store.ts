@@ -131,6 +131,11 @@ function isIsolatedTrashItemError(error: unknown): boolean {
   return error instanceof CanvasContentItemError
 }
 
+/** 创建保留底层 scope/复验失败原因的提交未确认错误。 */
+function contentCommitUnconfirmed(detail: string, cause: unknown): Error {
+  return new Error(`CANVAS_CONTENT_COMMIT_UNCONFIRMED: ${detail}`, { cause })
+}
+
 /** 严格解析 JSON，语法错误统一按内容损坏处理。 */
 function parseJson(content: string, label: string): unknown {
   try {
@@ -290,14 +295,63 @@ export function createCanvasNodeContentStore(
     capability: CanvasTrustedDirectoryCapability,
     outcome: StableDirectoryNativeWriteOutcome | undefined,
   ): Error | null => {
-    capability.assertValid()
     if (!outcome) throw new Error('CANVAS_CONTENT_PROTOCOL_INVALID: missing write outcome')
-    if (!outcome.commitVisible) {
-      throw new Error(`CANVAS_CONTENT_WRITE_FAILED: ${outcome.error ?? 'write not committed'}`)
+    /** outcome 必须先于 post-assert 被保存，防止撤权覆盖已提交事实。 */
+    const committedOutcome = outcome
+    /** helper 返回后的 capability 复验错误。 */
+    let scopeError: unknown
+    try {
+      capability.assertValid()
+    } catch (error: unknown) {
+      scopeError = error
     }
-    return outcome.durabilityUncertain
-      ? new Error(`CANVAS_CONTENT_DURABILITY_UNCERTAIN: ${outcome.error}`)
-      : null
+    if (!committedOutcome.commitVisible) {
+      throw new Error(
+        `CANVAS_CONTENT_WRITE_FAILED: ${committedOutcome.error ?? 'write not committed'}`,
+        scopeError === undefined ? undefined : { cause: scopeError },
+      )
+    }
+    if (committedOutcome.durabilityUncertain) {
+      if (scopeError !== undefined) {
+        throw contentCommitUnconfirmed('write visible but scope revalidation failed', scopeError)
+      }
+      return new Error(`CANVAS_CONTENT_DURABILITY_UNCERTAIN: ${committedOutcome.error}`)
+    }
+    if (scopeError !== undefined) throw scopeError
+    return null
+  }
+
+  /** 通过 helper 原子写入或替换一个固定受管文件。 */
+  const writeManagedFile = async (
+    capability: CanvasTrustedDirectoryCapability,
+    childName: 'nodes' | 'trash',
+    entryId: string,
+    fileName: 'config.json' | 'meta.json' | 'content.md' | 'index.html' | 'entry.json',
+    content: string,
+  ): Promise<void> => {
+    /** helper 原子写结果。 */
+    const result = await runNative({
+      mode: 'canvas-content-write',
+      roots: [capability.rootPath],
+      childName,
+      entryId,
+      fileName,
+      content,
+      maxEntries: MAX_CONTENT_ENTRIES,
+    }, capability.authorizeOpenedRoots)
+    /** rename 后耐久性不确定时，复读失败不得覆盖已可见证据。 */
+    const durabilityError = confirmWrite(capability, result.writeOutcome)
+    if (durabilityError) {
+      try {
+        const committed = await readFile(capability, childName, entryId, fileName)
+        if (committed !== content) {
+          throw new Error('committed content does not match requested content')
+        }
+      } catch (error: unknown) {
+        throw contentCommitUnconfirmed('write visible but content verification failed', error)
+      }
+      throw durabilityError
+    }
   }
 
   /** 幂等写固定文件；已有不同正文一律按身份冲突 fail closed。 */
@@ -314,23 +368,7 @@ export function createCanvasNodeContentStore(
       if (existing !== content) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
       return
     }
-    /** helper 原子写结果。 */
-    const result = await runNative({
-      mode: 'canvas-content-write',
-      roots: [capability.rootPath],
-      childName,
-      entryId,
-      fileName,
-      content,
-      maxEntries: MAX_CONTENT_ENTRIES,
-    }, capability.authorizeOpenedRoots)
-    /** rename 后耐久性不确定时，先复读确认正文可见，再向上层传播。 */
-    const durabilityError = confirmWrite(capability, result.writeOutcome)
-    if (durabilityError) {
-      const committed = await readFile(capability, childName, entryId, fileName)
-      if (committed !== content) throw new Error('CANVAS_CONTENT_COMMIT_UNCONFIRMED')
-      throw durabilityError
-    }
+    await writeManagedFile(capability, childName, entryId, fileName, content)
   }
 
   /** 读取并严格解析内容最终 meta；缺失返回 null 供部分写重放。 */
@@ -415,6 +453,50 @@ export function createCanvasNodeContentStore(
     /** 已提交 meta 用于幂等重放和冲突拒绝。 */
     const existingMeta = await readMeta(nodes, 'nodes', contentId)
     if (existingMeta) assertSameIdentity(existingMeta, { kind, contentId })
+    if (existingMeta) {
+      if (existingMeta.revision !== 0) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      if (kind === 'image') {
+        /** 已提交图片必须完整存在，meta-last 之后禁止补写 config。 */
+        const configContent = await readFile(nodes, 'nodes', contentId, 'config.json')
+        if (configContent === null) {
+          throw new CanvasContentItemError('CANVAS_CONTENT_CORRUPT', 'committed image missing config.json')
+        }
+        /** 已提交图片配置。 */
+        const config = parseImageConfig(configContent)
+        if (config.contentId !== contentId
+          || config.revision !== 0
+          || config.createdAt !== config.updatedAt
+          || config.createdAt !== existingMeta.createdAt
+          || config.updatedAt !== existingMeta.updatedAt
+          || config.prompt !== ''
+          || config.selectedModelProfileId !== null
+          || config.adoptedAssetId !== (seed.adoptedAssetId ?? null)) {
+          throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+        }
+        return
+      }
+      if (kind === 'document') {
+        /** 已提交文档正文。 */
+        const content = await readFile(nodes, 'nodes', contentId, 'content.md')
+        if (content === null) {
+          throw new CanvasContentItemError('CANVAS_CONTENT_CORRUPT', 'committed document missing content.md')
+        }
+        if (content !== '') throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+        return
+      }
+      /** 已提交 Webview 的 legacy 来源必须与本次 seed 一致。 */
+      const existingSource = 'legacySourceUrl' in existingMeta ? existingMeta.legacySourceUrl : null
+      if (existingSource !== (seed.legacySourceUrl ?? null)) {
+        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      }
+      /** 已提交 Webview 正文。 */
+      const html = await readFile(nodes, 'nodes', contentId, 'index.html')
+      if (html === null) {
+        throw new CanvasContentItemError('CANVAS_CONTENT_CORRUPT', 'committed webview missing index.html')
+      }
+      if (html !== EMPTY_WEBVIEW_HTML) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      return
+    }
     /** 新内容使用的有限时间戳。 */
     const timestamp = now()
     if (!Number.isSafeInteger(timestamp) || timestamp < 0) throw new Error('CANVAS_CONTENT_TIME_INVALID')
@@ -486,13 +568,6 @@ export function createCanvasNodeContentStore(
       kind: 'webview',
       legacySourceUrl: seed.legacySourceUrl ?? null,
     }
-    if (existingMeta) {
-      const existingSource = 'legacySourceUrl' in existingMeta ? existingMeta.legacySourceUrl : null
-      if (existingSource !== webviewMeta.legacySourceUrl) {
-        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
-      }
-      return
-    }
     await ensureExactFile(nodes, 'nodes', contentId, 'meta.json', `${JSON.stringify(webviewMeta, null, 2)}\n`)
   }
 
@@ -517,15 +592,31 @@ export function createCanvasNodeContentStore(
       destinationEntryId,
       maxEntries: MAX_CONTENT_ENTRIES,
     }, source.authorizeOpenedRoots)
-    source.assertValid()
-    destination.assertValid()
     if (!result.moveOutcome) throw new Error('CANVAS_CONTENT_PROTOCOL_INVALID: missing move outcome')
-    if (!result.moveOutcome.commitVisible) {
-      throw new Error(`CANVAS_CONTENT_MOVE_FAILED: ${result.moveOutcome.error ?? 'move not committed'}`)
+    /** outcome 必须先于 post-assert 被保存，防止撤权覆盖 rename 事实。 */
+    const committedOutcome = result.moveOutcome
+    /** move 后任一 capability 的复验错误。 */
+    let scopeError: unknown
+    try {
+      source.assertValid()
+      destination.assertValid()
+    } catch (error: unknown) {
+      scopeError = error
     }
-    return result.moveOutcome.durabilityUncertain
-      ? new Error(`CANVAS_CONTENT_DURABILITY_UNCERTAIN: ${result.moveOutcome.error}`)
-      : null
+    if (!committedOutcome.commitVisible) {
+      throw new Error(
+        `CANVAS_CONTENT_MOVE_FAILED: ${committedOutcome.error ?? 'move not committed'}`,
+        scopeError === undefined ? undefined : { cause: scopeError },
+      )
+    }
+    if (committedOutcome.durabilityUncertain) {
+      if (scopeError !== undefined) {
+        throw contentCommitUnconfirmed('move visible but scope revalidation failed', scopeError)
+      }
+      return new Error(`CANVAS_CONTENT_DURABILITY_UNCERTAIN: ${committedOutcome.error}`)
+    }
+    if (scopeError !== undefined) throw scopeError
+    return null
   }
 
   /** 严格读取 entry.json；缺失返回 null。 */
@@ -547,6 +638,64 @@ export function createCanvasNodeContentStore(
       }
       throw error
     }
+  }
+
+  /** 判断两个回收 marker 是否属于同一节点内容身份。 */
+  const isSameTrashOwner = (left: CanvasTrashEntry, right: CanvasTrashEntry): boolean => (
+    left.nodeId === right.nodeId
+    && left.kind === right.kind
+    && left.contentId === right.contentId
+  )
+
+  /** 判断两个回收 marker 是否为完全相同的删除事实。 */
+  const isSameTrashEntry = (left: CanvasTrashEntry, right: CanvasTrashEntry): boolean => (
+    left.schemaVersion === right.schemaVersion
+    && left.trashId === right.trashId
+    && left.nodeId === right.nodeId
+    && left.kind === right.kind
+    && left.contentId === right.contentId
+    && left.title === right.title
+    && left.position.x === right.position.x
+    && left.position.y === right.position.y
+    && left.deletedRevision === right.deletedRevision
+    && left.deletedAt === right.deletedAt
+  )
+
+  /** 写入本次 marker；同 owner 的历史 marker 可原子替换，其它事实 fail closed。 */
+  const commitTrashMarker = async (
+    capability: CanvasTrustedDirectoryCapability,
+    trashId: string,
+    entry: CanvasTrashEntry,
+  ): Promise<void> => {
+    /** move 后目标内当前 marker，可能来自上一次恢复。 */
+    const current = await readTrashEntry(capability, 'trash', trashId)
+    if (current) {
+      if (isSameTrashEntry(current, entry)) return
+      if (!isSameTrashOwner(current, entry)) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+    }
+    await writeManagedFile(
+      capability,
+      'trash',
+      trashId,
+      'entry.json',
+      `${JSON.stringify(entry, null, 2)}\n`,
+    )
+  }
+
+  /** 在 uncertain move 后执行复验，失败时保留 move 已可见但未确认的主错误。 */
+  const verifyAfterMove = async (
+    durabilityError: Error | null,
+    verify: () => Promise<void>,
+  ): Promise<void> => {
+    try {
+      await verify()
+    } catch (error: unknown) {
+      if (durabilityError) {
+        throw contentCommitUnconfirmed('move visible but follow-up verification failed', error)
+      }
+      throw error
+    }
+    if (durabilityError) throw durabilityError
   }
 
   /** 在已恢复 nodes 中按 trashId 找到幂等重放条目。 */
@@ -593,6 +742,11 @@ export function createCanvasNodeContentStore(
         assertSameIdentity(sourceMeta, entry)
         if (targetMeta) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
         await assertContentInScope(scopes.nodes, 'nodes', entry)
+        /** 恢复后遗留在 nodes 的 marker 必须在 move 前验证 owner。 */
+        const sourceMarker = await readTrashEntry(scopes.nodes, 'nodes', entry.contentId)
+        if (sourceMarker && !isSameTrashOwner(sourceMarker, entry)) {
+          throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+        }
         durabilityError = await moveDirectory(
           scopes.nodes, trash, 'nodes', entry.contentId, 'trash', entry.trashId,
         )
@@ -600,15 +754,10 @@ export function createCanvasNodeContentStore(
         if (!targetMeta) throw new Error('CANVAS_CONTENT_NOT_FOUND')
         assertSameIdentity(targetMeta, entry)
       }
-      await assertContentInScope(trash, 'trash', entry, entry.trashId)
-      await ensureExactFile(
-        trash,
-        'trash',
-        entry.trashId,
-        'entry.json',
-        `${JSON.stringify(entry, null, 2)}\n`,
-      )
-      if (durabilityError) throw durabilityError
+      await verifyAfterMove(durabilityError, async () => {
+        await assertContentInScope(trash, 'trash', entry, entry.trashId)
+        await commitTrashMarker(trash, entry.trashId, entry)
+      })
     },
     restoreFromTrash: async (target, rawTrashId) => {
       const trashId = requireContentId(rawTrashId, 'trashId')
@@ -630,8 +779,9 @@ export function createCanvasNodeContentStore(
       const durabilityError = await moveDirectory(
         trash, scopes.nodes, 'trash', trashId, 'nodes', entry.contentId,
       )
-      await assertContentInScope(scopes.nodes, 'nodes', entry)
-      if (durabilityError) throw durabilityError
+      await verifyAfterMove(durabilityError, async () => {
+        await assertContentInScope(scopes.nodes, 'nodes', entry)
+      })
       return entry
     },
     listTrash: async (target) => {

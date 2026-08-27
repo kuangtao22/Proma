@@ -63,6 +63,8 @@ function createFixture(options: {
   revokeOnAuthorize?: boolean
   revokeOnAssertCall?: number
   entryReadError?: string
+  revokeAfterWriteFileName?: string
+  revokeAfterMove?: boolean
   outcomeFor?: (request: StableDirectoryNativeRequest) => StableDirectoryNativeResult['writeOutcome']
   moveOutcome?: StableDirectoryNativeResult['moveOutcome']
 } = {}) {
@@ -113,10 +115,14 @@ function createFixture(options: {
         const files = entryFiles ?? {}
         files[request.fileName!] = request.content!
         scopes[childName].set(request.entryId!, files)
+        if (request.fileName === options.revokeAfterWriteFileName) valid = false
       }
       return { roots: [], entries: [], writeOutcome: outcome }
     }
     if (request.mode === 'canvas-content-list') {
+      if (scopes[childName].size > (request.maxEntries ?? 512)) {
+        throw new Error('canvas content entry limit exceeded')
+      }
       return {
         roots: [],
         entries: [...scopes[childName].keys()].sort().slice(0, request.maxEntries).map((name) => ({
@@ -137,12 +143,18 @@ function createFixture(options: {
         },
       }
     }
+    /** 注入的 move 三态结果必须先于内存 rename 生效。 */
+    const moveOutcome = options.moveOutcome ?? { commitVisible: true, durabilityUncertain: false }
+    if (!moveOutcome.commitVisible) {
+      return { roots: [], entries: [], moveOutcome }
+    }
     destination.set(request.destinationEntryId!, source)
     scopes[childName].delete(request.entryId!)
+    if (options.revokeAfterMove) valid = false
     return {
       roots: [],
       entries: [],
-      moveOutcome: options.moveOutcome ?? { commitVisible: true, durabilityUncertain: false },
+      moveOutcome,
     }
   }
   /** 被测 Store，只能从同一次 LOAD 派生目录 capability。 */
@@ -278,6 +290,57 @@ describe('Canvas 节点内容 Store', () => {
     expect(fixture.scopes.nodes.get('image-partial')?.['meta.json']).toBeUndefined()
   })
 
+  test.each([
+    ['image', 'config.json'],
+    ['document', 'content.md'],
+    ['webview', 'index.html'],
+  ] as const)('Given %s 已提交 meta 但缺少 %s When 重放 Then 明确损坏且绝不补文件', async (kind, bodyName) => {
+    const fixture = createFixture()
+    fixture.scopes.nodes.set('committed-content', {
+      'meta.json': JSON.stringify({
+        schemaVersion: 1,
+        kind,
+        contentId: 'committed-content',
+        revision: 0,
+        createdAt: 100,
+        updatedAt: 100,
+        ...(kind === 'webview' ? { legacySourceUrl: null } : {}),
+      }),
+    })
+
+    await expect(fixture.store.prepareEmptyContent(target, {
+      kind,
+      contentId: 'committed-content',
+    })).rejects.toThrow('CANVAS_CONTENT_CORRUPT')
+    expect(fixture.scopes.nodes.get('committed-content')?.[bodyName]).toBeUndefined()
+    expect(fixture.requests.some((request) => request.mode === 'canvas-content-write')).toBe(false)
+  })
+
+  test.each([
+    ['document', 'content.md', 'unexpected'],
+    ['webview', 'index.html', '<!doctype html><html><body>changed</body></html>'],
+  ] as const)('Given %s 已提交 meta 但正文冲突 When 重放 Then fail closed 且不覆盖', async (kind, bodyName, body) => {
+    const fixture = createFixture()
+    fixture.scopes.nodes.set('committed-content', {
+      [bodyName]: body,
+      'meta.json': JSON.stringify({
+        schemaVersion: 1,
+        kind,
+        contentId: 'committed-content',
+        revision: 0,
+        createdAt: 100,
+        updatedAt: 100,
+        ...(kind === 'webview' ? { legacySourceUrl: null } : {}),
+      }),
+    })
+
+    await expect(fixture.store.prepareEmptyContent(target, {
+      kind,
+      contentId: 'committed-content',
+    })).rejects.toThrow('CANVAS_CONTENT_IDENTITY_CONFLICT')
+    expect(fixture.scopes.nodes.get('committed-content')?.[bodyName]).toBe(body)
+  })
+
   test('Given 内容节点 When 移入独立 trashId 并恢复 Then entry 严格持久化且重放幂等', async () => {
     const fixture = createFixture()
     await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' })
@@ -293,6 +356,63 @@ describe('Canvas 节点内容 Store', () => {
     expect(await fixture.store.restoreFromTrash(target, 'trash-1')).toEqual(trashEntry)
     expect(fixture.scopes.nodes.has('content-1')).toBe(true)
     expect(fixture.scopes.trash.has('trash-1')).toBe(false)
+  })
+
+  test('Given 删除A恢复A再删除B恢复B When 使用新 trashId Then 历史 marker 可安全替换', async () => {
+    const fixture = createFixture()
+    const entryA: CanvasTrashEntry = { ...trashEntry, trashId: 'trash-a' }
+    const entryB: CanvasTrashEntry = { ...trashEntry, trashId: 'trash-b', deletedAt: 300 }
+    await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' })
+
+    await fixture.store.moveToTrash(target, entryA)
+    await fixture.store.restoreFromTrash(target, entryA.trashId)
+    await fixture.store.moveToTrash(target, entryB)
+    expect(readJson<CanvasTrashEntry>(fixture.scopes.trash.get('trash-b')!, 'entry.json')).toEqual(entryB)
+    expect(await fixture.store.restoreFromTrash(target, entryB.trashId)).toEqual(entryB)
+  })
+
+  test('Given 第二次删除 move 后新 marker 写前失败 When 重放 Then 从历史 marker 收敛', async () => {
+    /** 只让 trash-b 的首次 entry.json 替换在 rename 前失败。 */
+    let failedOnce = false
+    const fixture = createFixture({
+      outcomeFor: (request) => {
+        if (request.childName === 'trash'
+          && request.entryId === 'trash-b'
+          && request.fileName === 'entry.json'
+          && !failedOnce) {
+          failedOnce = true
+          return { commitVisible: false, durabilityUncertain: false, error: 'injected marker failure' }
+        }
+        return undefined
+      },
+    })
+    const entryA: CanvasTrashEntry = { ...trashEntry, trashId: 'trash-a' }
+    const entryB: CanvasTrashEntry = { ...trashEntry, trashId: 'trash-b', deletedAt: 300 }
+    await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' })
+    await fixture.store.moveToTrash(target, entryA)
+    await fixture.store.restoreFromTrash(target, entryA.trashId)
+
+    await expect(fixture.store.moveToTrash(target, entryB)).rejects.toThrow('CANVAS_CONTENT_WRITE_FAILED')
+    expect(readJson<CanvasTrashEntry>(fixture.scopes.trash.get('trash-b')!, 'entry.json')).toEqual(entryA)
+    await fixture.store.moveToTrash(target, entryB)
+    expect(readJson<CanvasTrashEntry>(fixture.scopes.trash.get('trash-b')!, 'entry.json')).toEqual(entryB)
+  })
+
+  test('Given nodes 历史 marker 身份不匹配 When 再次删除 Then move 前拒绝且节点保持原位', async () => {
+    const fixture = createFixture()
+    await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' })
+    fixture.scopes.nodes.get('content-1')!['entry.json'] = JSON.stringify({
+      ...trashEntry,
+      trashId: 'trash-old',
+      nodeId: 'other-node',
+    })
+
+    await expect(fixture.store.moveToTrash(target, {
+      ...trashEntry,
+      trashId: 'trash-new',
+    })).rejects.toThrow('CANVAS_CONTENT_IDENTITY_CONFLICT')
+    expect(fixture.scopes.nodes.has('content-1')).toBe(true)
+    expect(fixture.scopes.trash.has('trash-new')).toBe(false)
   })
 
   test('Given move 已可见但目录持久性未确认 When 重放 Then 先补齐 entry 再明确告警且后续收敛', async () => {
@@ -323,19 +443,42 @@ describe('Canvas 节点内容 Store', () => {
     await expect(fixture.store.restoreFromTrash(target, 'trash-1')).rejects.toThrow('CANVAS_CONTENT_IDENTITY_CONFLICT')
   })
 
-  test('Given 多个与损坏回收条目 When 列表 Then 隔离损坏项、确定性排序并限制 512', async () => {
+  test('Given 512 个回收条目 When 列表 Then 确定性排序并保持上限', async () => {
     const fixture = createFixture()
-    for (let index = 0; index < 514; index += 1) {
+    for (let index = 0; index < 512; index += 1) {
       const trashId = `trash-${index.toString().padStart(3, '0')}`
       const entry = { ...trashEntry, trashId, contentId: `content-${index}`, deletedAt: index }
       fixture.scopes.trash.set(trashId, { 'entry.json': JSON.stringify(entry) })
     }
-    fixture.scopes.trash.set('trash-bad', { 'entry.json': '{bad' })
 
     const result = await fixture.store.listTrash(target)
     expect(result).toHaveLength(512)
     expect(result[0]?.deletedAt).toBe(511)
     expect(result.at(-1)?.deletedAt).toBe(0)
+  })
+
+  test('Given 回收区超过 512 项 When 列表 Then 原样传播 helper 上限错误', async () => {
+    const fixture = createFixture()
+    for (let index = 0; index < 513; index += 1) {
+      fixture.scopes.trash.set(`trash-${index}`, { 'entry.json': JSON.stringify({
+        ...trashEntry,
+        trashId: `trash-${index}`,
+        contentId: `content-${index}`,
+      }) })
+    }
+
+    await expect(fixture.store.listTrash(target)).rejects.toThrow('canvas content entry limit exceeded')
+  })
+
+  test('Given move rename 前失败 When 删除 Then fake 保持源与目标不变', async () => {
+    const fixture = createFixture({
+      moveOutcome: { commitVisible: false, durabilityUncertain: false, error: 'injected move failure' },
+    })
+    await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' })
+
+    await expect(fixture.store.moveToTrash(target, trashEntry)).rejects.toThrow('CANVAS_CONTENT_MOVE_FAILED')
+    expect(fixture.scopes.nodes.has('content-1')).toBe(true)
+    expect(fixture.scopes.trash.has('trash-1')).toBe(false)
   })
 
   test('Given 回收区包含损坏 entry.json When 列表 Then 只隔离损坏单项', async () => {
@@ -408,6 +551,63 @@ describe('Canvas 节点内容 Store', () => {
     await expect(uncertain.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' }))
       .rejects.toThrow('CANVAS_CONTENT_DURABILITY_UNCERTAIN')
     expect(uncertain.scopes.nodes.has('content-1')).toBe(true)
+  })
+
+  test.each([
+    [
+      { commitVisible: true, durabilityUncertain: true, error: 'directory flush failed' } as const,
+      'CANVAS_CONTENT_COMMIT_UNCONFIRMED',
+    ],
+    [
+      { commitVisible: true, durabilityUncertain: false } as const,
+      'CANVAS_DIRECTORY_SCOPE_CHANGED',
+    ],
+  ])('Given write outcome=%j 且 post-assert 撤权 When 写入 Then 保留提交事实和正确主错误', async (outcome, expectedError) => {
+    const fixture = createFixture({
+      revokeAfterWriteFileName: 'content.md',
+      outcomeFor: (request) => request.fileName === 'content.md' ? outcome : undefined,
+    })
+
+    try {
+      await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' })
+      throw new Error('预期写入失败')
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toContain(expectedError)
+      if (outcome.durabilityUncertain) {
+        expect((error as Error).cause).toBeInstanceOf(Error)
+        expect(((error as Error).cause as Error).message).toContain('CANVAS_DIRECTORY_SCOPE_CHANGED')
+      }
+    }
+    expect(fixture.scopes.nodes.get('content-1')?.['content.md']).toBe('')
+  })
+
+  test.each([
+    [
+      { commitVisible: true, durabilityUncertain: true, error: 'directory flush failed' } as const,
+      'CANVAS_CONTENT_COMMIT_UNCONFIRMED',
+    ],
+    [
+      { commitVisible: true, durabilityUncertain: false } as const,
+      'CANVAS_DIRECTORY_SCOPE_CHANGED',
+    ],
+  ])('Given move outcome=%j 且 post-assert 撤权 When 删除 Then 保留 rename 事实和正确主错误', async (outcome, expectedError) => {
+    const fixture = createFixture({ moveOutcome: outcome, revokeAfterMove: true })
+    await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' })
+
+    try {
+      await fixture.store.moveToTrash(target, trashEntry)
+      throw new Error('预期移动失败')
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toContain(expectedError)
+      if (outcome.durabilityUncertain) {
+        expect((error as Error).cause).toBeInstanceOf(Error)
+        expect(((error as Error).cause as Error).message).toContain('CANVAS_DIRECTORY_SCOPE_CHANGED')
+      }
+    }
+    expect(fixture.scopes.nodes.has('content-1')).toBe(false)
+    expect(fixture.scopes.trash.has('trash-1')).toBe(true)
   })
 
   test('Given 任意内容操作 When 检查 helper 请求 Then 仅包含 canvasRoot 与相对受限字段', async () => {
