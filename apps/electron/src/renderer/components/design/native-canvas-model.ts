@@ -91,12 +91,14 @@ const DEFAULT_NATIVE_CANVAS_PROJECTION_OPTIONS: NativeCanvasProjectionOptions = 
 /** 暂未接入交互的原生 Canvas 节点安全展示数据。 */
 export interface NativeCanvasUnsupportedNodeData extends Record<string, unknown> {
   id: string
-  kind: 'image' | 'visual-document' | 'webview'
+  kind: 'image' | 'document' | 'webview'
   title: string
   unsupportedLabel: typeof NATIVE_CANVAS_UNSUPPORTED_LABEL
-  assetId?: string
-  visualDocumentId?: string
-  url?: string
+  imageModuleId?: string
+  adoptedAssetId?: string
+  documentId?: string
+  prototypeId?: string
+  contentRevision?: number
 }
 
 /** XYFlow 中的未支持节点占位类型。 */
@@ -199,11 +201,6 @@ export function findAvailableNativeCanvasChildPosition(
   throw new Error('Canvas 扩展落点计算失败')
 }
 
-/** 仅允许可恢复的网页地址进入 Renderer 投影，阻断文件路径与内嵌数据。 */
-function projectSafeWebviewUrl(url: string): string | undefined {
-  return /^https?:\/\//u.test(url) ? url : undefined
-}
-
 /** 将持久节点投影为固定尺寸且无消息读取能力的 XYFlow 节点。 */
 export function toNativeCanvasFlowNodes(
   document: CanvasDocument,
@@ -271,12 +268,13 @@ export function toNativeCanvasFlowNodes(
           id: node.id,
           kind: node.kind,
           title: node.title,
-          assetId: node.assetId,
+          imageModuleId: node.imageModuleId,
+          ...(node.adoptedAssetId ? { adoptedAssetId: node.adoptedAssetId } : {}),
           unsupportedLabel: NATIVE_CANVAS_UNSUPPORTED_LABEL,
         },
       }
     }
-    if (node.kind === 'visual-document') {
+    if (node.kind === 'document') {
       return {
         ...base,
         type: 'canvasUnsupported',
@@ -284,7 +282,8 @@ export function toNativeCanvasFlowNodes(
           id: node.id,
           kind: node.kind,
           title: node.title,
-          visualDocumentId: node.visualDocumentId,
+          documentId: node.documentId,
+          contentRevision: node.contentRevision,
           unsupportedLabel: NATIVE_CANVAS_UNSUPPORTED_LABEL,
         },
       }
@@ -296,7 +295,8 @@ export function toNativeCanvasFlowNodes(
         id: node.id,
         kind: node.kind,
         title: node.title,
-        url: projectSafeWebviewUrl(node.url),
+        prototypeId: node.prototypeId,
+        contentRevision: node.contentRevision,
         unsupportedLabel: NATIVE_CANVAS_UNSUPPORTED_LABEL,
       },
     }

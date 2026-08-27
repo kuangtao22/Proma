@@ -37,7 +37,7 @@ function NativeCanvasUnsupportedNode({
   selected,
 }: NodeProps<NativeCanvasUnsupportedFlowNode>): React.ReactElement {
   /** 每类占位节点使用可辨识但克制的图标。 */
-  const Icon = data.kind === 'image' ? FileImage : data.kind === 'visual-document' ? FileText : Monitor
+  const Icon = data.kind === 'image' ? FileImage : data.kind === 'document' ? FileText : Monitor
   return (
     <article
       className={cn(

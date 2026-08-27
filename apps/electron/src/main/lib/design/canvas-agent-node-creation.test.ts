@@ -582,7 +582,8 @@ describe('Canvas Agent 节点创建事务', () => {
           kind: 'image',
           title: '首页效果图',
           position: { x: 420, y: 80 },
-          assetId: 'asset-1',
+          imageModuleId: 'image-1',
+          adoptedAssetId: 'asset-1',
         },
       ],
       edges: [{

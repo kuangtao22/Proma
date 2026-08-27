@@ -22,9 +22,18 @@ function createDocument(): CanvasDocument {
   const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
   document.nodes = [
     { id: 'agent-1', kind: 'agent', title: '研究助手', agentSessionId: 'session-1', position: { x: 1, y: 2 } },
-    { id: 'image-1', kind: 'image', title: '主视觉', assetId: 'asset-1', position: { x: 3, y: 4 } },
-    { id: 'doc-1', kind: 'visual-document', title: '分镜', visualDocumentId: 'visual-1', position: { x: 5, y: 6 } },
-    { id: 'web-1', kind: 'webview', title: '原型', url: 'https://example.com/prototype', position: { x: 7, y: 8 } },
+    {
+      id: 'image-1', kind: 'image', title: '主视觉', imageModuleId: 'image-1',
+      adoptedAssetId: 'asset-1', position: { x: 3, y: 4 },
+    },
+    {
+      id: 'doc-1', kind: 'document', title: '分镜', documentId: 'document-1',
+      contentRevision: 2, position: { x: 5, y: 6 },
+    },
+    {
+      id: 'web-1', kind: 'webview', title: '原型', prototypeId: 'prototype-1',
+      contentRevision: 3, position: { x: 7, y: 8 },
+    },
   ]
   document.edges = [{
     id: 'edge-1', sourceNodeId: 'agent-1', sourcePort: 'output',
@@ -72,9 +81,15 @@ describe('原生 Canvas 纯投影', () => {
     expect(nodes[0]?.data).toEqual({
       id: 'agent-1', title: '研究助手', agentSessionId: 'session-1', status: 'idle', canExpand: false,
     })
-    expect(nodes[1]?.data).toMatchObject({ assetId: 'asset-1', unsupportedLabel: '当前版本暂不支持' })
-    expect(nodes[2]?.data).toMatchObject({ visualDocumentId: 'visual-1', unsupportedLabel: '当前版本暂不支持' })
-    expect(nodes[3]?.data).toMatchObject({ url: 'https://example.com/prototype', unsupportedLabel: '当前版本暂不支持' })
+    expect(nodes[1]?.data).toMatchObject({
+      imageModuleId: 'image-1', adoptedAssetId: 'asset-1', unsupportedLabel: '当前版本暂不支持',
+    })
+    expect(nodes[2]?.data).toMatchObject({
+      documentId: 'document-1', contentRevision: 2, unsupportedLabel: '当前版本暂不支持',
+    })
+    expect(nodes[3]?.data).toMatchObject({
+      prototypeId: 'prototype-1', contentRevision: 3, unsupportedLabel: '当前版本暂不支持',
+    })
     expect(serialized).not.toContain('messages')
     expect(serialized).not.toContain('messageCount')
     expect(serialized).not.toContain('relativePath')

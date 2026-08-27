@@ -25,7 +25,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 export const NATIVE_CANVAS_NODE_TYPE_OPTIONS = [
   { kind: 'agent', label: 'Agent', enabled: true },
   { kind: 'image', label: '生图', enabled: false },
-  { kind: 'visual-document', label: '视觉文档', enabled: false },
+  { kind: 'document', label: '视觉文档', enabled: false },
   { kind: 'webview', label: '原型', enabled: false },
 ] as const
 
@@ -54,7 +54,7 @@ function NativeCanvasNodeTypeIcon({
 }): React.ReactElement {
   if (kind === 'agent') return <Bot aria-hidden="true" />
   if (kind === 'image') return <FileImage aria-hidden="true" />
-  if (kind === 'visual-document') return <FileText aria-hidden="true" />
+  if (kind === 'document') return <FileText aria-hidden="true" />
   return <Monitor aria-hidden="true" />
 }
 

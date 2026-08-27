@@ -182,7 +182,10 @@ describe('原生 Canvas 大画布性能预算', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     document.nodes = [
       { id: 'agent-1', kind: 'agent', title: 'Agent', agentSessionId: 'session-1', position: { x: 0, y: 0 } },
-      { id: 'image-1', kind: 'image', title: 'Image', assetId: 'asset-1', position: { x: 300, y: 0 } },
+      {
+        id: 'image-1', kind: 'image', title: 'Image', imageModuleId: 'image-1',
+        adoptedAssetId: 'asset-1', position: { x: 300, y: 0 },
+      },
     ]
     document.edges = [{
       id: 'edge-1', sourceNodeId: 'agent-1', sourcePort: 'out',
@@ -217,7 +220,10 @@ describe('原生 Canvas 大画布性能预算', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     document.nodes = [
       { id: 'agent-1', kind: 'agent', title: 'Agent', agentSessionId: 'session-1', position: { x: 0, y: 0 } },
-      { id: 'image-1', kind: 'image', title: 'Image', assetId: 'asset-1', position: { x: 360, y: 0 } },
+      {
+        id: 'image-1', kind: 'image', title: 'Image', imageModuleId: 'image-1',
+        adoptedAssetId: 'asset-1', position: { x: 360, y: 0 },
+      },
     ]
     document.edges = [{
       id: 'edge-1', sourceNodeId: 'agent-1', sourcePort: 'out',

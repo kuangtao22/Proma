@@ -33,7 +33,7 @@ describe('原生 Canvas 顶部工具栏', () => {
     expect(NATIVE_CANVAS_NODE_TYPE_OPTIONS).toEqual([
       { kind: 'agent', label: 'Agent', enabled: true },
       { kind: 'image', label: '生图', enabled: false },
-      { kind: 'visual-document', label: '视觉文档', enabled: false },
+      { kind: 'document', label: '视觉文档', enabled: false },
       { kind: 'webview', label: '原型', enabled: false },
     ])
   })

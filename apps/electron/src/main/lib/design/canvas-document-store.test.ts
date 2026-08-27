@@ -262,6 +262,9 @@ describe('CanvasDocumentStore', () => {
 
     expect(parsed.migratedFrom).toBe(1)
     expect(parsed.document.schemaVersion).toBe(2)
+    expect(parsed.persistencePayload).toEqual(
+      createLegacyDocument() as typeof parsed.persistencePayload,
+    )
     expect(parsed.document.nodes[2]).toEqual({
       id: 'node-document',
       kind: 'document',
@@ -321,6 +324,7 @@ describe('CanvasDocumentStore', () => {
     })
 
     expect(parsed.document).toEqual(document)
+    expect(parsed.persistencePayload).toEqual(document)
     expect(parsed.migratedFrom).toBeUndefined()
     expect(parsed.legacyContentSeeds).toEqual([])
   })
@@ -354,17 +358,29 @@ describe('CanvasDocumentStore', () => {
     expect(snapshot.document.schemaVersion).toBe(2)
     expect('legacyContentSeeds' in snapshot).toBe(false)
     expect('migratedFrom' in snapshot).toBe(false)
+    expect('persistencePayload' in snapshot).toBe(false)
     expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8'))).toEqual(legacyDocument)
   })
 
   test.each([
     ['tmp', '.tmp'],
     ['backup', '.bak'],
-  ] as const)('Given v1 %s 恢复候选 When load Then 保持恢复语义并返回规范化 v2', (source, suffix) => {
+  ] as const)('Given v1 %s 恢复候选 When load Then 提升 canonical v1 并在重载时保留 seed', (source, suffix) => {
     /** 每个恢复来源使用独立文件系统环境。 */
-    const fixture = createFixture()
+    const parsedLoads: ReturnType<typeof parseCanvasDocument>[] = []
+    /** validator 只记录严格解析成功的候选，损坏主文件不进入数组。 */
+    const fixture = createFixture({
+      validateDocument: (value, target) => {
+        /** 候选仍由真实严格 parser 校验和重建。 */
+        const parsed = parseCanvasDocument(value, target)
+        parsedLoads.push(parsed)
+        return parsed
+      },
+    })
+    /** 旧文档用于同时比较恢复后的磁盘载荷。 */
+    const legacyDocument = createLegacyDocument()
     writeDocument(fixture.documentPath, { broken: true })
-    writeDocument(`${fixture.documentPath}${suffix}`, createLegacyDocument())
+    writeDocument(`${fixture.documentPath}${suffix}`, legacyDocument)
 
     /** 恢复来源保留，文档内容在返回前规范化。 */
     const snapshot = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
@@ -375,6 +391,54 @@ describe('CanvasDocumentStore', () => {
       'agent', 'image', 'document', 'webview',
     ])
     expect('legacyContentSeeds' in snapshot).toBe(false)
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8'))).toEqual(legacyDocument)
+
+    /** 第二次 LOAD 必须从提升后的 v1 主文件重新生成同一批 seed。 */
+    const expectedSeeds = parsedLoads.at(-1)?.legacyContentSeeds
+    parsedLoads.length = 0
+    const reloaded = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
+    expect(reloaded.document.schemaVersion).toBe(2)
+    expect(reloaded.recoveredFrom).toBeUndefined()
+    expect(parsedLoads.at(-1)?.legacyContentSeeds).toEqual(expectedSeeds)
+  })
+
+  test('Given v1 主文件 When mutation 或副作用读取 Then 要求先完成迁移且磁盘不变', () => {
+    /** 真实 Store 与旧主文件用于验证两条写入前阻断边界。 */
+    const fixture = createFixture()
+    writeDocument(fixture.documentPath, createLegacyDocument())
+    /** 字节级基线能发现任何意外规范化写回。 */
+    const before = readFileSync(fixture.documentPath, 'utf8')
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+
+    expect(() => fixture.store.mutate(
+      target,
+      2,
+      [{ type: 'set-viewport', viewport: { x: 9, y: 9, zoom: 2 } }],
+    )).toThrow('CANVAS_MIGRATION_REQUIRED')
+    expect(() => fixture.store.requireStableAuthoritativeDocument(target))
+      .toThrow('CANVAS_MIGRATION_REQUIRED')
+    expect(readFileSync(fixture.documentPath, 'utf8')).toBe(before)
+    expect(existsSync(`${fixture.documentPath}.tmp`)).toBe(false)
+    expect(existsSync(`${fixture.documentPath}.bak`)).toBe(false)
+  })
+
+  test('Given v1 tmp 恢复候选 When mutation Then 迁移阻断不提升或消费任何候选', () => {
+    /** 损坏主文件与合法 v1 tmp 用于验证 mutation 的零写入边界。 */
+    const fixture = createFixture()
+    writeDocument(fixture.documentPath, { broken: true })
+    writeDocument(`${fixture.documentPath}.tmp`, createLegacyDocument())
+    /** 两个候选的字节基线必须在调用后完全不变。 */
+    const mainBefore = readFileSync(fixture.documentPath, 'utf8')
+    const temporaryBefore = readFileSync(`${fixture.documentPath}.tmp`, 'utf8')
+
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [{ type: 'set-viewport', viewport: { x: 9, y: 9, zoom: 2 } }],
+    )).toThrow('CANVAS_MIGRATION_REQUIRED')
+    expect(readFileSync(fixture.documentPath, 'utf8')).toBe(mainBefore)
+    expect(readFileSync(`${fixture.documentPath}.tmp`, 'utf8')).toBe(temporaryBefore)
+    expect(existsSync(`${fixture.documentPath}.bak`)).toBe(false)
   })
 
   test('Given helper OPENED 等待期间 Canvas registry 撤权 When 授权 scan Then fail closed 且零扫描', () => {
