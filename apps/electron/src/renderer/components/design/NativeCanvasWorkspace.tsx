@@ -353,7 +353,7 @@ export function createNativeCanvasAgentNodeSuccessUpdate(
  * 将四类创建结果归一为只选中新折叠节点的状态更新。
  * @param current 创建完成时当前 keyed Canvas 状态。
  * @param success 类型化创建结果和预分配节点身份。
- * @returns 可接管时关闭旧工作台；迟到旧 revision 不改变当前工作台。
+ * @returns 只接管权威文档和新节点选区，始终保留请求期间形成的工作台状态。
  */
 export function createNativeCanvasNodeCreationSuccessUpdate(
   current: NativeCanvasState,
@@ -370,12 +370,12 @@ export function createNativeCanvasNodeCreationSuccessUpdate(
     success.nodeId,
     agentResult,
   )
-  /** 更高 revision 已接管时只沿用单调 helper 结果，禁止关闭当前工作台。 */
+  /** 更高 revision 已接管时只沿用单调 helper 结果，禁止覆盖当前工作台。 */
   if (current.snapshot && current.snapshot.document.revision > resultDocument.revision) return update
   if (success.kind !== 'agent' && update.snapshot && 'snapshot' in success.result) {
     update.snapshot = { ...success.result.snapshot, document: update.snapshot.document }
   }
-  return { ...update, ...createClosedNativeCanvasWorkbenchUpdate() }
+  return update
 }
 
 /**

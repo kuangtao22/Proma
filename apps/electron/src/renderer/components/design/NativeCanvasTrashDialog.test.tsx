@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test'
-import type { CanvasDocument, CanvasTrashEntry } from '@proma/shared'
+import type {
+  CanvasDocument,
+  CanvasNodeLifecycleResult,
+  CanvasTrashEntry,
+  CanvasWorkspaceSnapshot,
+} from '@proma/shared'
 import { renderToStaticMarkup } from 'react-dom/server'
 import {
   NativeCanvasTrashEntries,
@@ -20,6 +25,18 @@ function createTrashEntry(): CanvasTrashEntry {
     position: { x: 40, y: 80 },
     deletedRevision: 3,
     deletedAt: Date.UTC(2026, 7, 28, 8, 0),
+  }
+}
+
+/** 创建回收恢复后的权威快照。 */
+function createTrashRestoreSnapshot(revision: number): CanvasWorkspaceSnapshot {
+  return {
+    document: {
+      schemaVersion: 2, projectId: 'project-1', canvasId: 'canvas-1', revision,
+      createdAt: 1, updatedAt: 2, viewport: { x: 0, y: 0, zoom: 1 }, nodes: [], edges: [],
+    },
+    writable: true,
+    nodeIssues: [],
   }
 }
 
@@ -213,6 +230,38 @@ describe('原生 Canvas 回收区', () => {
     stale.resolve([entry])
     await staleLoad
     expect(harness.getState().entries).toEqual([])
+  })
+
+  test('Given 关闭后重开 list 在途 When 关闭前 restore 晚成功 Then 收口 loading 且旧 list 不复活条目', async () => {
+    const entry = createTrashEntry()
+    const restore = createDeferred<CanvasNodeLifecycleResult>()
+    const reopenedList = createDeferred<CanvasTrashEntry[]>()
+    let state: NativeCanvasTrashState = {
+      entries: [entry], loading: false, restoringTrashId: null, error: null,
+    }
+    const controller = createNativeCanvasTrashController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      listTrash: () => reopenedList.promise,
+      restoreNode: () => restore.promise,
+      createId: () => 'operation-1',
+      getDocument: () => ({
+        schemaVersion: 2, projectId: 'project-1', canvasId: 'canvas-1', revision: 4,
+        createdAt: 1, updatedAt: 1, viewport: { x: 0, y: 0, zoom: 1 }, nodes: [], edges: [],
+      }),
+      getEmptyCanvasCenter: () => ({ x: 0, y: 0 }),
+      onStateChange: (nextState) => { state = nextState },
+      onRestored: () => undefined,
+    })
+    const restoring = controller.restore(entry)
+    controller.close()
+    const loading = controller.load()
+
+    restore.resolve({ snapshot: createTrashRestoreSnapshot(5), selectedNodeId: entry.nodeId })
+    await restoring
+    reopenedList.resolve([entry])
+    await loading
+
+    expect(state).toEqual({ entries: [], loading: false, restoringTrashId: null, error: null })
   })
 
   test('Given 旧 load reject 晚于新 load success When settle Then 不覆盖新成功状态', async () => {

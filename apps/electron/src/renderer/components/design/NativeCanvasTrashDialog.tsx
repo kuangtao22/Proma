@@ -133,6 +133,7 @@ export function createNativeCanvasTrashController(
         restoreOperations.delete(entry.trashId)
         updateState({
           entries: state.entries.filter((current) => current.trashId !== entry.trashId),
+          loading: false,
           restoringTrashId: null,
           error: null,
         })

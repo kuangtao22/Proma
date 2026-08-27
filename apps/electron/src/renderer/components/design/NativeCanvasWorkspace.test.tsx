@@ -1239,23 +1239,89 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     )).toEqual({})
   })
 
-  test('Given 创建结果 revision 可接管 When 创建成功 Then 只选中新节点且不自动展开', () => {
+  test('Given 创建结果 revision 可接管 When 创建成功 Then 只选中新节点并保留当前工作台', () => {
     const current = createInitialNativeCanvasState()
     current.snapshot = createSnapshot(4)
     current.expandedNodeId = 'document-old'
-    current.workbenchDraft = { nodeId: 'document-old', dirty: false }
+    current.pendingWorkbenchSwitchNodeId = 'webview-next'
+    current.workbenchDraft = { nodeId: 'document-old', dirty: true }
     const result: CanvasNodeLifecycleResult = {
       snapshot: createSnapshot(5),
       selectedNodeId: 'document-new',
     }
 
-    expect(createNativeCanvasNodeCreationSuccessUpdate(current, {
+    const update = createNativeCanvasNodeCreationSuccessUpdate(current, {
       kind: 'document', nodeId: 'document-new', result,
-    })).toMatchObject({
+    })
+    expect({ ...current, ...update }).toMatchObject({
+      selectedNodeId: 'document-new',
+      expandedNodeId: 'document-old',
+      pendingWorkbenchSwitchNodeId: 'webview-next',
+      workbenchDraft: { nodeId: 'document-old', dirty: true },
+    })
+    expect(update).not.toHaveProperty('expandedNodeId')
+    expect(update).not.toHaveProperty('pendingWorkbenchSwitchNodeId')
+    expect(update).not.toHaveProperty('workbenchDraft')
+  })
+
+  test('Given 创建期间工作台始终为空 When 创建成功 Then 空工作台自然保持为空', () => {
+    const current = createInitialNativeCanvasState()
+    current.snapshot = createSnapshot(4)
+    const updated = {
+      ...current,
+      ...createNativeCanvasNodeCreationSuccessUpdate(current, {
+        kind: 'document', nodeId: 'document-new',
+        result: { snapshot: createSnapshot(5), selectedNodeId: 'document-new' },
+      }),
+    }
+
+    expect(updated).toMatchObject({
       selectedNodeId: 'document-new',
       expandedNodeId: null,
       pendingWorkbenchSwitchNodeId: null,
       workbenchDraft: null,
+    })
+  })
+
+  test('Given CREATE 在途后用户产生 dirty 工作台 When 迟到成功 Then 只接管文档和新节点选区', async () => {
+    const deferred = createDeferred<CanvasAgentNodeCreationResult>()
+    let current = createInitialNativeCanvasState()
+    current.snapshot = createSnapshot(4)
+    const controller = createCanvasAgentNodeCommandController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      createAgentNode: () => deferred.promise,
+      createId: (() => {
+        const ids = ['11111111-1111-4111-8111-111111111111', 'agent-new']
+        return () => ids.shift()!
+      })(),
+      getPosition: () => ({ x: 0, y: 0 }),
+      onStateChange: () => undefined,
+      onSuccess: (nodeId, result) => {
+        current = {
+          ...current,
+          ...createNativeCanvasNodeCreationSuccessUpdate(current, {
+            kind: 'agent', nodeId, result,
+          }),
+        }
+      },
+    })
+    const creating = controller.execute()
+    current.expandedNodeId = 'document-current'
+    current.pendingWorkbenchSwitchNodeId = 'webview-next'
+    current.workbenchDraft = { nodeId: 'document-current', dirty: true }
+
+    deferred.resolve({
+      document: createSnapshot(5).document,
+      session: { id: 'session-new' } as never,
+    })
+    await creating
+
+    expect(current).toMatchObject({
+      snapshot: { document: { revision: 5 } },
+      selectedNodeId: 'agent-new',
+      expandedNodeId: 'document-current',
+      pendingWorkbenchSwitchNodeId: 'webview-next',
+      workbenchDraft: { nodeId: 'document-current', dirty: true },
     })
   })
 
