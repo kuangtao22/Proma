@@ -775,6 +775,63 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     expect(update).not.toHaveProperty('pendingMutations')
   })
 
+  test('Given 创建期间发生缩放平移与节点拖动 When 旧 viewport 的创建结果返回 Then 按原顺序重放安全位置投影', () => {
+    const current = createInitialNativeCanvasState()
+    current.phase = 'ready'
+    current.snapshot = createSnapshot(2)
+    current.snapshot.document.nodes = [{
+      id: 'agent-existing', kind: 'agent', title: '已有节点',
+      agentSessionId: 'session-existing', position: { x: 360, y: 240 },
+    }]
+    const inFlightViewport: CanvasMutation = {
+      type: 'set-viewport', viewport: { x: 20, y: 30, zoom: 1.2 },
+    }
+    const inFlightMove: CanvasMutation = {
+      type: 'move-nodes', positions: [{ nodeId: 'agent-existing', position: { x: 120, y: 80 } }],
+    }
+    const structural: CanvasMutation = { type: 'remove-nodes', nodeIds: ['agent-other'] }
+    const pendingViewport: CanvasMutation = {
+      type: 'set-viewport', viewport: { x: 80, y: 90, zoom: 1.8 },
+    }
+    const pendingMove: CanvasMutation = {
+      type: 'move-nodes', positions: [{ nodeId: 'agent-existing', position: { x: 360, y: 240 } }],
+    }
+    current.inFlightMutations = [inFlightViewport, inFlightMove]
+    current.pendingMutations = [structural, pendingViewport, pendingMove]
+    const createdDocument = createSnapshot(3).document
+    createdDocument.nodes = [
+      {
+        id: 'agent-existing', kind: 'agent', title: '已有节点',
+        agentSessionId: 'session-existing', position: { x: 0, y: 0 },
+      },
+      {
+        id: 'node-new', kind: 'agent', title: '新 Agent',
+        agentSessionId: 'session-new', position: { x: 312, y: 0 },
+      },
+      {
+        id: 'agent-other', kind: 'agent', title: '其他节点',
+        agentSessionId: 'session-other', position: { x: 624, y: 0 },
+      },
+    ]
+    createdDocument.viewport = { x: 0, y: 0, zoom: 1 }
+    const result: CanvasAgentNodeCreationResult = {
+      document: createdDocument,
+      session: { id: 'session-new' } as never,
+    }
+
+    const update = createNativeCanvasAgentNodeSuccessUpdate(current, 'node-new', result)
+    const updated = { ...current, ...update }
+
+    expect(updated.snapshot?.document.viewport).toEqual({ x: 80, y: 90, zoom: 1.8 })
+    expect(updated.snapshot?.document.nodes.find((node) => node.id === 'agent-existing')?.position)
+      .toEqual({ x: 360, y: 240 })
+    expect(updated.snapshot?.document.nodes.map((node) => node.id))
+      .toEqual(['agent-existing', 'node-new', 'agent-other'])
+    expect(updated.inFlightMutations).toEqual([inFlightViewport, inFlightMove])
+    expect(updated.pendingMutations).toEqual([structural, pendingViewport, pendingMove])
+    expect(updated.conversationNodeId).toBeNull()
+  })
+
   test('Given CREATE 异常含内部正文 When 创建失败 Then 按钮状态只保留固定公开文案', async () => {
     const states: CanvasAgentNodeCommandState[] = []
     const controller = createCanvasAgentNodeCommandController({

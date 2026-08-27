@@ -41,6 +41,7 @@ import {
   coalesceNativeCanvasMutationsForSave,
   findAvailableNativeCanvasChildPosition,
   findNativeCanvasGlobalAppendPosition,
+  isNativeCanvasPositionMutation,
   replayNativeCanvasPositionMutations,
 } from './native-canvas-model'
 
@@ -166,10 +167,20 @@ export function createNativeCanvasAgentNodeSuccessUpdate(
   nodeId: string,
   result: CanvasAgentNodeCreationResult,
 ): Partial<NativeCanvasState> {
+  /** 创建请求在途期间已经投影的位置变更按真实发生顺序重新收集。 */
+  const positionMutations = [
+    ...current.inFlightMutations,
+    ...current.pendingMutations,
+  ].filter((mutation) => (
+    isNativeCanvasPositionMutation(mutation)
+    && canReplayNativeCanvasPositionMutations(result.document, [mutation])
+  ))
+  /** 只在主进程新权威结构上重放安全位置，不自动应用任何结构 mutation。 */
+  const projectedDocument = replayNativeCanvasPositionMutations(result.document, positionMutations)
   return {
     snapshot: current.snapshot
-      ? { ...current.snapshot, document: result.document }
-      : { document: result.document, writable: true, nodeIssues: [] },
+      ? { ...current.snapshot, document: projectedDocument }
+      : { document: projectedDocument, writable: true, nodeIssues: [] },
     selectedNodeId: nodeId,
     error: null,
   }
