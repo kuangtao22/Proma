@@ -123,6 +123,7 @@ describe('原生 Canvas 单工作台切换', () => {
     const firstKey = createNativeCanvasKey('project-1', 'canvas-1')
     const secondKey = createNativeCanvasKey('project-1', 'canvas-2')
     let activeKey = firstKey
+    let saving = false
     const errors: string[] = []
     const settled: string[] = []
     const coordinator = createNativeCanvasWorkbenchDraftCommitCoordinator({
@@ -140,7 +141,10 @@ describe('原生 Canvas 单工作台切换', () => {
         ))
       },
       onFailure: () => errors.push('保存草稿失败，请重试。'),
-      onSettled: ({ stateKey }) => settled.push(stateKey),
+      onSettled: ({ targetNodeId }) => {
+        saving = false
+        settled.push(targetNodeId)
+      },
     })
     const setWorkbench = (
       key: string,
@@ -162,6 +166,8 @@ describe('原生 Canvas 单工作台切换', () => {
       secondKey,
       settled,
       store,
+      getSaving: () => saving,
+      setSaving: (value: boolean) => { saving = value },
       setActiveKey: (key: string) => { activeKey = key },
       setWorkbench,
     }
@@ -240,7 +246,115 @@ describe('原生 Canvas 单工作台切换', () => {
       workbenchDraft: null,
     })
     expect(harness.errors).toEqual([])
-    expect(harness.settled).toEqual([harness.firstKey])
+    expect(harness.settled).toEqual(['webview-1'])
+  })
+
+  test.each([
+    { outcome: 'resolve' as const },
+    { outcome: 'reject' as const },
+  ])('Given 保存 B 期间通知把目标改为 C When 旧 Promise $outcome Then 不切节点但收口当前 saving', async ({ outcome }) => {
+    const harness = createDraftCommitHarness()
+    const deferred = createDeferred<void>()
+    harness.setWorkbench(harness.firstKey, 'document-1', 'webview-b')
+    harness.setSaving(true)
+    const execution = harness.coordinator.execute({
+      stateKey: harness.firstKey,
+      sourceExpandedNodeId: 'document-1',
+      sourceDraftNodeId: 'document-1',
+      targetNodeId: 'webview-b',
+      commitDraft: () => deferred.promise,
+    })
+
+    harness.setWorkbench(harness.firstKey, 'document-1', 'webview-c')
+    if (outcome === 'resolve') deferred.resolve()
+    else deferred.reject(new Error('旧保存失败'))
+    await execution
+
+    expect(harness.store.get(nativeCanvasStatesAtom).get(harness.firstKey)).toMatchObject({
+      expandedNodeId: 'document-1',
+      pendingWorkbenchSwitchNodeId: 'webview-c',
+      workbenchDraft: { nodeId: 'document-1', dirty: true },
+    })
+    expect(harness.errors).toEqual([])
+    expect(harness.getSaving()).toBe(false)
+    expect(harness.settled).toEqual(['webview-b'])
+  })
+
+  test('Given LOAD 已删除保存源节点 When 旧 Promise settle Then 不恢复身份但收口当前 saving', async () => {
+    const harness = createDraftCommitHarness()
+    const deferred = createDeferred<void>()
+    harness.setWorkbench(harness.firstKey, 'document-1', 'webview-1')
+    harness.setSaving(true)
+    const execution = harness.coordinator.execute({
+      stateKey: harness.firstKey,
+      sourceExpandedNodeId: 'document-1',
+      sourceDraftNodeId: 'document-1',
+      targetNodeId: 'webview-1',
+      commitDraft: () => deferred.promise,
+    })
+
+    harness.store.set(nativeCanvasStatesAtom, new Map([[harness.firstKey, createInitialNativeCanvasState()]]))
+    deferred.resolve()
+    await execution
+
+    expect(harness.store.get(nativeCanvasStatesAtom).get(harness.firstKey)).toMatchObject({
+      expandedNodeId: null,
+      pendingWorkbenchSwitchNodeId: null,
+      workbenchDraft: null,
+    })
+    expect(harness.getSaving()).toBe(false)
+    expect(harness.settled).toEqual(['webview-1'])
+  })
+
+  test('Given 新 generation 已接管 saving When 旧 Promise settle Then 不关闭新 saving', async () => {
+    const harness = createDraftCommitHarness()
+    const firstDeferred = createDeferred<void>()
+    const secondDeferred = createDeferred<void>()
+    harness.setWorkbench(harness.firstKey, 'document-1', 'webview-1')
+    harness.setSaving(true)
+    const firstExecution = harness.coordinator.execute({
+      stateKey: harness.firstKey,
+      sourceExpandedNodeId: 'document-1',
+      sourceDraftNodeId: 'document-1',
+      targetNodeId: 'webview-1',
+      commitDraft: () => firstDeferred.promise,
+    })
+    const secondExecution = harness.coordinator.execute({
+      stateKey: harness.firstKey,
+      sourceExpandedNodeId: 'document-1',
+      sourceDraftNodeId: 'document-1',
+      targetNodeId: 'webview-1',
+      commitDraft: () => secondDeferred.promise,
+    })
+
+    firstDeferred.resolve()
+    await firstExecution
+
+    expect(harness.getSaving()).toBe(true)
+    expect(harness.settled).toEqual([])
+    secondDeferred.resolve()
+    await secondExecution
+  })
+
+  test('Given Workspace 已真实卸载 When 旧 Promise settle Then 不再更新本地 saving', async () => {
+    const harness = createDraftCommitHarness()
+    const deferred = createDeferred<void>()
+    harness.setWorkbench(harness.firstKey, 'document-1', 'webview-1')
+    harness.setSaving(true)
+    const execution = harness.coordinator.execute({
+      stateKey: harness.firstKey,
+      sourceExpandedNodeId: 'document-1',
+      sourceDraftNodeId: 'document-1',
+      targetNodeId: 'webview-1',
+      commitDraft: () => deferred.promise,
+    })
+
+    harness.coordinator.invalidate()
+    deferred.resolve()
+    await execution
+
+    expect(harness.getSaving()).toBe(true)
+    expect(harness.settled).toEqual([])
   })
 })
 

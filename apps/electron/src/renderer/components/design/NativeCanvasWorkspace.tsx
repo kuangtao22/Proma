@@ -974,13 +974,18 @@ export function createNativeCanvasWorkbenchDraftCommitCoordinator(
   dependencies: NativeCanvasWorkbenchDraftCommitCoordinatorDependencies,
 ): NativeCanvasWorkbenchDraftCommitCoordinator {
   let generation = 0
-  /** 同时核验 operation 代次、当前 Workspace 和源/目标工作台身份。 */
-  const isCurrent = (
+  /** 只有同代次且 Workspace 仍挂载时，旧 Promise 才拥有本地 saving 指示器。 */
+  const ownsSavingIndicator = (
+    operation: NativeCanvasWorkbenchDraftCommitOperation,
+    operationGeneration: number,
+  ): boolean => operationGeneration === generation
+    && dependencies.getCurrentWorkspaceKey() === operation.stateKey
+  /** 完整源/目标身份仍匹配时，才允许应用保存成功或失败的业务结果。 */
+  const canApplyResult = (
     operation: NativeCanvasWorkbenchDraftCommitOperation,
     operationGeneration: number,
   ): boolean => {
-    if (operationGeneration !== generation
-      || dependencies.getCurrentWorkspaceKey() !== operation.stateKey) return false
+    if (!ownsSavingIndicator(operation, operationGeneration)) return false
     const current = dependencies.getState(operation.stateKey)
     return current?.expandedNodeId === operation.sourceExpandedNodeId
       && (current.workbenchDraft?.nodeId ?? null) === operation.sourceDraftNodeId
@@ -993,13 +998,13 @@ export function createNativeCanvasWorkbenchDraftCommitCoordinator(
       try {
         await operation.commitDraft()
       } catch {
-        if (!isCurrent(operation, operationGeneration)) return
-        dependencies.onFailure(operation)
+        if (!ownsSavingIndicator(operation, operationGeneration)) return
+        if (canApplyResult(operation, operationGeneration)) dependencies.onFailure(operation)
         dependencies.onSettled(operation)
         return
       }
-      if (!isCurrent(operation, operationGeneration)) return
-      dependencies.onSuccess(operation)
+      if (!ownsSavingIndicator(operation, operationGeneration)) return
+      if (canApplyResult(operation, operationGeneration)) dependencies.onSuccess(operation)
       dependencies.onSettled(operation)
     },
     invalidate: () => {
