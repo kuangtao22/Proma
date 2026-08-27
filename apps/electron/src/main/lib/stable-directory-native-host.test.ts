@@ -538,6 +538,31 @@ describe('stable directory native host', () => {
     })
   })
 
+  test('Given helper 返回矛盾提交状态 When host 解析 write 与 move Then 两类结果均拒绝', async () => {
+    /** 四种非法组合覆盖状态矛盾、缺少错误和成功夹带错误。 */
+    const invalidOutcomes = [
+      { commitVisible: false, durabilityUncertain: true, error: 'invalid' },
+      { commitVisible: false, durabilityUncertain: false },
+      { commitVisible: true, durabilityUncertain: false, error: 'invalid' },
+      { commitVisible: true, durabilityUncertain: true },
+    ]
+
+    for (const writeOutcome of invalidOutcomes) {
+      const fake = createFakeHelper({ writeOutcome })
+      await expect(runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: ['/requested'], childName: 'nodes',
+        entryId: 'entry-1', fileName: 'meta.json', content: '{}',
+      }, () => true, createDependencies(fake))).rejects.toThrow('write-result 响应无效')
+    }
+    for (const moveOutcome of invalidOutcomes) {
+      const fake = createFakeHelper({ moveOutcome })
+      await expect(runStableDirectoryNative({
+        mode: 'canvas-content-move', roots: ['/requested'], childName: 'nodes',
+        entryId: 'entry-1', destinationChildName: 'trash', destinationEntryId: 'trash-1',
+      }, () => true, createDependencies(fake))).rejects.toThrow('move-result 响应无效')
+    }
+  })
+
   test('Given 内容 write 与 move 需要刷新多个目录 When 检查原生合同 Then 每个 flush 独立执行后再聚合', () => {
     /** 原生源码合同用于锁定 `||` 短路不会跳过后续目录 flush。 */
     const source = readFileSync(resolve(appDir, 'native/stable-directory/stable-directory-helper.cc'), 'utf8')
@@ -551,6 +576,43 @@ describe('stable directory native host', () => {
     expect(source).toContain('const bool source_persisted = FlushCanvasDirectoryWindows(source_root.Get());')
     expect(source).not.toMatch(/fsync\([^\n]+\) != 0 \|\| fsync/)
     expect(source).not.toMatch(/FlushCanvasDirectoryWindows\([^\n]+\) \|\|/)
+  })
+
+  test.skipIf(process.platform === 'win32')('Given Windows missing 与 flush 错误码 When 运行纯分类合同 Then 仅明确不存在映射 missing 且所有 flush 失败均不耐久', () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-windows-error-contract-'))
+    const contractSource = join(root, 'windows-error-contract.cc')
+    const output = join(root, 'windows-error-contract')
+    const helperSource = resolve(appDir, 'native/stable-directory/stable-directory-helper.cc')
+    writeFileSync(contractSource, [
+      '#define STABLE_DIRECTORY_HELPER_LIBRARY',
+      `#include ${JSON.stringify(helperSource)}`,
+      'int main() {',
+      '  if (!IsCanvasWindowsMissingError(2UL) || !IsCanvasWindowsMissingError(3UL)) return 1;',
+      '  if (IsCanvasWindowsMissingError(5UL) || IsCanvasWindowsMissingError(6UL)) return 2;',
+      '  if (IsCanvasWindowsMissingError(32UL) || IsCanvasWindowsMissingError(1117UL)) return 3;',
+      '  if (!IsCanvasWindowsDirectoryFlushDurable(true, 0UL)) return 4;',
+      '  if (IsCanvasWindowsDirectoryFlushDurable(false, 5UL)) return 5;',
+      '  if (IsCanvasWindowsDirectoryFlushDurable(false, 6UL)) return 6;',
+      '  return 0;',
+      '}',
+    ].join('\n'), 'utf8')
+    try {
+      if (process.platform === 'darwin') {
+        execFileSync('xcrun', ['clang++', '-std=c++17', '-Wall', '-Wextra', contractSource, '-o', output])
+      } else {
+        execFileSync(process.env.CXX || 'g++', ['-std=c++17', '-Wall', '-Wextra', contractSource, '-o', output])
+      }
+      execFileSync(output)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('Given fdopendir 接管 duplicated fd When 检查失败路径 Then 成功前仍由 UniqueFd 持有', () => {
+    const source = readFileSync(resolve(appDir, 'native/stable-directory/stable-directory-helper.cc'), 'utf8')
+
+    expect(source).toContain('fdopendir(duplicate.Get())')
+    expect(source).not.toContain('fdopendir(duplicate.Release())')
   })
 
   test('Given Canvas intent scan When helper 相对读取正文 Then host 只返回内存内容且无可重开路径', async () => {
@@ -875,6 +937,61 @@ describe('stable directory native host', () => {
       })
       expect(existsSync(join(canvasRoot, 'nodes', 'source-id'))).toBe(true)
       expect(existsSync(join(canvasRoot, 'trash', 'trash-id'))).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(!nativeHelperPlatformSupported)('Given 内容 scope 已有 512 个安全 entry When 覆盖、新增并 move Then 仅覆盖成功且失败后仍可列出', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-content-capacity-'))
+    const canvasRoot = join(root, 'canvas')
+    const nodes = join(canvasRoot, 'nodes')
+    const trash = join(canvasRoot, 'trash')
+    mkdirSync(join(nodes, 'overwrite-id'), { recursive: true })
+    writeFileSync(join(nodes, 'overwrite-id', 'meta.json'), 'before', 'utf8')
+    for (let index = 0; index < 511; index += 1) {
+      mkdirSync(join(nodes, `content-${index.toString().padStart(3, '0')}`))
+    }
+    mkdirSync(join(trash, 'move-source'), { recursive: true })
+    try {
+      const overwritten = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'overwrite-id', fileName: 'meta.json', content: 'after',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(overwritten.writeOutcome).toEqual({ commitVisible: true, durabilityUncertain: false })
+      expect(readFileSync(join(nodes, 'overwrite-id', 'meta.json'), 'utf8')).toBe('after')
+
+      const added = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'new-entry', fileName: 'meta.json', content: '{}',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(added.writeOutcome).toEqual({
+        commitVisible: false,
+        durabilityUncertain: false,
+        error: 'canvas content entry limit exceeded',
+      })
+      expect(existsSync(join(nodes, 'new-entry'))).toBe(false)
+
+      const moved = await runStableDirectoryNative({
+        mode: 'canvas-content-move', roots: [canvasRoot], childName: 'trash',
+        entryId: 'move-source', destinationChildName: 'nodes', destinationEntryId: 'move-target',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(moved.moveOutcome).toEqual({
+        commitVisible: false,
+        durabilityUncertain: false,
+        error: 'canvas content entry limit exceeded',
+      })
+      expect(existsSync(join(trash, 'move-source'))).toBe(true)
+      expect(existsSync(join(nodes, 'move-target'))).toBe(false)
+
+      const listedNodes = await runStableDirectoryNative({
+        mode: 'canvas-content-list', roots: [canvasRoot], childName: 'nodes', maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(listedNodes.entries).toHaveLength(512)
+      const listedTrash = await runStableDirectoryNative({
+        mode: 'canvas-content-list', roots: [canvasRoot], childName: 'trash', maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(listedTrash.entries.map((entry) => entry.name)).toEqual(['move-source'])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

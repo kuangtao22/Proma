@@ -39,11 +39,10 @@ export interface StableDirectoryNativeEntry {
 }
 
 /** Canvas intent 原子写的提交可见性与持久性结果。 */
-export interface StableDirectoryNativeWriteOutcome {
-  commitVisible: boolean
-  durabilityUncertain: boolean
-  error?: string
-}
+export type StableDirectoryNativeWriteOutcome =
+  | { commitVisible: true; durabilityUncertain: false; error?: never }
+  | { commitVisible: false; durabilityUncertain: false; error: string }
+  | { commitVisible: true; durabilityUncertain: true; error: string }
 
 /** Canvas 内容文件的 no-follow 读取结果，不包含可再次打开的路径。 */
 export type StableDirectoryNativeReadOutcome =
@@ -52,7 +51,7 @@ export type StableDirectoryNativeReadOutcome =
   | { status: 'ok'; content: string; size: number; volume: string; fileId: string }
 
 /** Canvas 内容目录 rename 的提交可见性与持久性结果。 */
-export interface StableDirectoryNativeMoveOutcome extends StableDirectoryNativeWriteOutcome {}
+export type StableDirectoryNativeMoveOutcome = StableDirectoryNativeWriteOutcome
 
 export interface StableDirectoryNativeRequest {
   mode:
@@ -240,13 +239,17 @@ function parseWriteOutcome(value: unknown): StableDirectoryNativeWriteOutcome | 
   if (record.type !== 'write-result'
     || typeof record.commitVisible !== 'boolean'
     || typeof record.durabilityUncertain !== 'boolean'
-    || (record.error !== undefined && typeof record.error !== 'string')
-    || (record.durabilityUncertain && !record.commitVisible)) return null
-  return {
-    commitVisible: record.commitVisible,
-    durabilityUncertain: record.durabilityUncertain,
-    ...(typeof record.error === 'string' ? { error: record.error } : {}),
+    || (record.error !== undefined && typeof record.error !== 'string')) return null
+  if (record.commitVisible && !record.durabilityUncertain && record.error === undefined) {
+    return { commitVisible: true, durabilityUncertain: false }
   }
+  if (!record.commitVisible && !record.durabilityUncertain && typeof record.error === 'string') {
+    return { commitVisible: false, durabilityUncertain: false, error: record.error }
+  }
+  if (record.commitVisible && record.durabilityUncertain && typeof record.error === 'string') {
+    return { commitVisible: true, durabilityUncertain: true, error: record.error }
+  }
+  return null
 }
 
 /** 校验 canvas-content-read 的无路径结构化结果。 */
