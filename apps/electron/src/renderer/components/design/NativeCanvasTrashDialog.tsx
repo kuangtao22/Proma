@@ -46,6 +46,7 @@ export interface NativeCanvasTrashControllerDependencies {
 export interface NativeCanvasTrashController {
   load: () => Promise<void>
   restore: (entry: CanvasTrashEntry) => Promise<void>
+  close: () => void
   cancel: () => void
 }
 
@@ -76,6 +77,8 @@ export function createNativeCanvasTrashController(
     error: null,
   }
   let generation = 0
+  /** 每次列表读取使用独立单调代次，连续打开或刷新不能互相覆盖。 */
+  let listRequestGeneration = 0
   let disposed = false
   /** 同一恢复失败重试必须复用完整 operation。 */
   const restoreOperations = new Map<string, RestoreCanvasNodeInput>()
@@ -87,13 +90,18 @@ export function createNativeCanvasTrashController(
   return {
     load: async () => {
       const requestGeneration = generation
+      const requestListGeneration = ++listRequestGeneration
       updateState({ loading: true, error: null })
       try {
         const entries = await dependencies.listTrash(dependencies.target)
-        if (disposed || generation !== requestGeneration) return
+        if (disposed
+          || generation !== requestGeneration
+          || listRequestGeneration !== requestListGeneration) return
         updateState({ entries, loading: false, error: null })
       } catch {
-        if (disposed || generation !== requestGeneration) return
+        if (disposed
+          || generation !== requestGeneration
+          || listRequestGeneration !== requestListGeneration) return
         updateState({ loading: false, error: '回收区暂时无法加载。' })
       }
     },
@@ -120,6 +128,8 @@ export function createNativeCanvasTrashController(
       try {
         const result = await dependencies.restoreNode(operation)
         if (disposed || generation !== requestGeneration) return
+        /** 恢复已改变回收区事实，所有更早 list 回调必须立即失效。 */
+        listRequestGeneration += 1
         restoreOperations.delete(entry.trashId)
         updateState({
           entries: state.entries.filter((current) => current.trashId !== entry.trashId),
@@ -132,9 +142,15 @@ export function createNativeCanvasTrashController(
         updateState({ restoringTrashId: null, error: '节点恢复失败，请重试。' })
       }
     },
+    close: () => {
+      /** 关闭只失效列表请求，控制器仍可在下次打开时复用。 */
+      listRequestGeneration += 1
+      updateState({ loading: false })
+    },
     cancel: () => {
       disposed = true
       generation += 1
+      listRequestGeneration += 1
       restoreOperations.clear()
     },
   }

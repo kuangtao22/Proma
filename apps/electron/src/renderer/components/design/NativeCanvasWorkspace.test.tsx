@@ -43,8 +43,10 @@ import {
   getNativeCanvasWorkbenchCommitAvailability,
   findNativeCanvasAgentNodeCreationPosition,
   createRebuiltNativeCanvasStateUpdate,
+  createStopAcceptedPendingCanvasDelete,
   createNativeCanvasWorkspaceController,
   getNativeCanvasConnectedEdgeCount,
+  getPendingCanvasStopDeleteGenerationStatus,
   isPendingCanvasStopDeleteCurrent,
   runNativeCanvasToolbarAddNode,
 } from './NativeCanvasWorkspace'
@@ -1564,6 +1566,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       canvasKey: 'project-1:canvas-a',
       nodeId: 'agent-1',
       sessionId: 'session-old',
+      startedAt: 100,
       stopAccepted: true,
     }
     const currentNode = {
@@ -1571,13 +1574,61 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       agentSessionId: 'session-old', position: { x: 0, y: 0 },
     }
 
-    expect(isPendingCanvasStopDeleteCurrent(pending, 'project-1:canvas-a', currentNode)).toBe(true)
-    expect(isPendingCanvasStopDeleteCurrent(pending, 'project-1:canvas-b', currentNode)).toBe(false)
+    expect(isPendingCanvasStopDeleteCurrent(pending, 'project-1:canvas-a', currentNode, 100)).toBe(true)
+    expect(isPendingCanvasStopDeleteCurrent(pending, 'project-1:canvas-b', currentNode, 100)).toBe(false)
     expect(isPendingCanvasStopDeleteCurrent(
       pending,
       'project-1:canvas-a',
       { ...currentNode, agentSessionId: 'session-new' },
+      100,
     )).toBe(false)
+    expect(isPendingCanvasStopDeleteCurrent(pending, 'project-1:canvas-a', currentNode, 200)).toBe(false)
+  })
+
+  test('Given STOP 绑定 generation 100 When 同 session generation 200 接管 Then 旧删除立即取消', () => {
+    const pending = {
+      canvasKey: 'project-1:canvas-a', nodeId: 'agent-1', sessionId: 'session-1',
+      startedAt: 100, stopAccepted: true,
+    }
+    expect(getPendingCanvasStopDeleteGenerationStatus(
+      pending,
+      new Map([['session-1', 200]]),
+      new Map(),
+      new Set(['session-1']),
+    )).toBe('replaced')
+  })
+
+  test('Given 旧 STOP Promise 晚回 When 同节点新 generation 已接管 Then 不标记新删除为已停止', () => {
+    const oldPending = {
+      canvasKey: 'project-1:canvas-a', nodeId: 'agent-1', sessionId: 'session-1',
+      startedAt: 100, stopAccepted: false,
+    }
+    const newPending = { ...oldPending, startedAt: 200 }
+
+    expect(createStopAcceptedPendingCanvasDelete(newPending, oldPending)).toBe(newPending)
+    expect(createStopAcceptedPendingCanvasDelete(oldPending, oldPending)).toEqual({
+      ...oldPending,
+      stopAccepted: true,
+    })
+  })
+
+  test('Given STOP 绑定 generation 100 When 匹配代次明确结束 Then 允许提交删除', () => {
+    const pending = {
+      canvasKey: 'project-1:canvas-a', nodeId: 'agent-1', sessionId: 'session-1',
+      startedAt: 100, stopAccepted: true,
+    }
+    expect(getPendingCanvasStopDeleteGenerationStatus(
+      pending,
+      new Map(),
+      new Map(),
+      new Set(),
+    )).toBe('ended')
+    expect(getPendingCanvasStopDeleteGenerationStatus(
+      pending,
+      new Map([['session-1', null]]),
+      new Map(),
+      new Set(['session-1']),
+    )).toBe('unknown')
   })
 
   test('Given 坏节点重建首次失败 When 显式重试 Then 复用完整 operation 并整体接管快照', async () => {
