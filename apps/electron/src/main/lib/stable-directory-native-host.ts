@@ -376,7 +376,8 @@ function executeStableDirectoryNative(
       if (stderrBuffer.length < 8_192) stderrBuffer += chunk.slice(0, 8_192 - stderrBuffer.length)
     })
     child.once('error', (error) => finish(new Error(`稳定目录 helper 进程错误: ${error.message}`)))
-    child.once('exit', (code, signal) => {
+    /** 等待 stdio 全部关闭后再判断协议缺失，避免 exit 早于 stdout 排空造成误拒绝。 */
+    child.once('close', (code, signal) => {
       if (settled || denialPending) return
       finish(new Error(`稳定目录 helper 提前退出: code=${code ?? 'null'}, signal=${signal ?? 'none'}${stderrBuffer ? `, stderr=${stderrBuffer.trim()}` : ''}`))
     })

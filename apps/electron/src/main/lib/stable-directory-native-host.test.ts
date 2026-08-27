@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { beforeAll, describe, expect, test } from 'bun:test'
 import { execFileSync, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
@@ -19,6 +19,8 @@ interface FakeHelperOptions {
   oversizedOutput?: boolean
   autoOpen?: boolean
   completeOnAllow?: boolean
+  /** 模拟子进程先退出、stdout 稍后排空的 Node 事件顺序。 */
+  exitBeforeOutputDrain?: boolean
   intentContent?: string
   writeOutcome?: {
     commitVisible: boolean
@@ -42,11 +44,21 @@ function createFakeHelper(options: FakeHelperOptions = {}): {
   const decisions: string[] = []
   let didEnumerate = false
   let killed = false
+  /**
+   * 同步发出进程退出与管道关闭事件，模拟标准 ChildProcess 生命周期。
+   * @param code 子进程退出码。
+   * @param signal 终止子进程的信号。
+   * @returns 无返回值。
+   */
+  const emitProcessClosed = (code: number | null, signal: NodeJS.Signals | null): void => {
+    processEvents.emit('exit', code, signal)
+    processEvents.emit('close', code, signal)
+  }
   const child = Object.assign(processEvents, {
     stdin,
     stdout,
     stderr,
-    kill: () => { killed = true; processEvents.emit('exit', null, 'SIGTERM'); return true },
+    kill: () => { killed = true; emitProcessClosed(null, 'SIGTERM'); return true },
   }) as unknown as ChildProcessWithoutNullStreams
   Object.defineProperty(child, 'killed', { get: () => killed })
 
@@ -62,9 +74,21 @@ function createFakeHelper(options: FakeHelperOptions = {}): {
         return
       }
       if (options.writeOutcome) {
-        stdout.write(`${JSON.stringify({ type: 'write-result', ...options.writeOutcome })}\n`)
-        stdout.write(`${JSON.stringify({ type: 'done', entryCount: 0 })}\n`)
-        processEvents.emit('exit', 0, null)
+        /** 输出完整写结果，供正常顺序与 exit/stdout 竞态共用。 */
+        const emitWriteResult = (): void => {
+          stdout.write(`${JSON.stringify({ type: 'write-result', ...options.writeOutcome })}\n`)
+          stdout.write(`${JSON.stringify({ type: 'done', entryCount: 0 })}\n`)
+        }
+        if (options.exitBeforeOutputDrain) {
+          processEvents.emit('exit', 0, null)
+          queueMicrotask(() => {
+            emitWriteResult()
+            processEvents.emit('close', 0, null)
+          })
+          return
+        }
+        emitWriteResult()
+        emitProcessClosed(0, null)
         return
       }
       const entry = options.intentContent === undefined
@@ -80,9 +104,9 @@ function createFakeHelper(options: FakeHelperOptions = {}): {
           }
       stdout.write(`${JSON.stringify(entry)}\n`)
       stdout.write(`${JSON.stringify({ type: 'done', entryCount: 1 })}\n`)
-      processEvents.emit('exit', 0, null)
+      emitProcessClosed(0, null)
     } else if (decision === 'DENY') {
-      processEvents.emit('exit', 3, null)
+      emitProcessClosed(3, null)
     }
   })
 
@@ -126,6 +150,22 @@ const windowsAdminShareAvailable = (() => {
   const uncTempDir = toLocalhostAdminShare(tmpdir())
   return uncTempDir !== null && existsSync(uncTempDir)
 })()
+
+/** 当前平台是否需要运行真实 stable-directory helper 合同测试。 */
+const nativeHelperPlatformSupported = process.platform === 'darwin' || process.platform === 'win32'
+/** Electron 应用根目录，用于定位原生构建脚本和产物。 */
+const appDir = resolve(import.meta.dir, '../../..')
+/** 当前平台共享的 stable-directory helper 可执行文件路径。 */
+const nativeHelperPath = resolve(
+  appDir,
+  `resources/stable-directory/stable-directory-helper${process.platform === 'win32' ? '.exe' : ''}`,
+)
+
+/** 真实 helper 测试共享一次原生编译，避免重复编译挤占单用例的卡死保护时间。 */
+beforeAll(() => {
+  if (!nativeHelperPlatformSupported) return
+  execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+}, 30_000)
 
 describe('stable directory native host', () => {
   test('Given active=1 且 queue=1 When 第三个请求进入 Then 立即拒绝并在前项完成后依次启动', async () => {
@@ -426,6 +466,33 @@ describe('stable directory native host', () => {
     })
   })
 
+  test('Given helper exit 早于 stdout 排空 When close 前收到完整协议 Then 返回结果而非误报提前退出', async () => {
+    /** 模拟 exit 先于 stdout 排空的 helper。 */
+    const fake = createFakeHelper({
+      exitBeforeOutputDrain: true,
+      writeOutcome: {
+        commitVisible: false,
+        durabilityUncertain: false,
+        error: 'canvas intent entry limit exceeded',
+      },
+    })
+
+    /** host 等待 close 后解析得到的完整写结果。 */
+    const result = await runStableDirectoryNative({
+      mode: 'canvas-intent-write',
+      roots: ['/requested'],
+      childName: 'transactions',
+      fileName: 'agent-node-11111111-1111-4111-8111-111111111111.json',
+      content: '{"state":"committed"}',
+    }, () => true, createDependencies(fake))
+
+    expect(result.writeOutcome).toEqual({
+      commitVisible: false,
+      durabilityUncertain: false,
+      error: 'canvas intent entry limit exceeded',
+    })
+  })
+
   test('Given helper 在授权前发送 entry When host 消费协议 Then 终止并拒绝结果', async () => {
     const fake = createFakeHelper({ emitEntryBeforeAuthorization: true })
 
@@ -444,10 +511,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'darwin')('Given 已打开目录授权后祖先被替换 When 真实 helper 枚举 Then 只返回原稳定对象', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const buildScript = resolve(appDir, 'scripts/build-stable-directory-native.ts')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
-    execFileSync(process.execPath, [buildScript], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-native-directory-race-'))
     const authorized = join(root, 'authorized')
     const moved = join(root, 'authorized-old')
@@ -467,7 +530,7 @@ describe('stable directory native host', () => {
           symlinkSync(replacement, authorized)
           return true
         },
-        { helperPath: () => helperPath },
+        { helperPath: () => nativeHelperPath },
       )
 
       expect(result.entries.map((entry) => entry.name)).toEqual(['allowed.txt'])
@@ -479,10 +542,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'darwin')('Given Canvas 根在 OPENED 后被外部 symlink 置换 When helper 相对写 intent Then replacement 零写入', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const buildScript = resolve(appDir, 'scripts/build-stable-directory-native.ts')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
-    execFileSync(process.execPath, [buildScript], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-race-'))
     const canvasRoot = join(root, 'canvas')
     const movedCanvasRoot = join(root, 'canvas-original')
@@ -504,7 +563,7 @@ describe('stable directory native host', () => {
           symlinkSync(replacement, canvasRoot, 'dir')
           return true
         },
-        { helperPath: () => helperPath },
+        { helperPath: () => nativeHelperPath },
       )
 
       expect(readdirSync(replacement)).toEqual([])
@@ -520,9 +579,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'darwin')('Given 512 个合法 intent 与目录杂项 When 覆盖或新增 Then 覆盖成功、第 513 个拒绝且后续扫描仍成功', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-capacity-'))
     const canvasRoot = join(root, 'canvas')
     const transactions = join(canvasRoot, 'transactions')
@@ -544,7 +600,7 @@ describe('stable directory native host', () => {
       const write = (fileName: string) => runStableDirectoryNative({
         mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
         fileName, content: '{"state":"committed"}', maxEntries: 512,
-      }, () => true, { helperPath: () => helperPath })
+      }, () => true, { helperPath: () => nativeHelperPath })
 
       await expect(write(intentNames[0]!)).resolves.toHaveProperty(
         'writeOutcome.commitVisible', true,
@@ -559,7 +615,7 @@ describe('stable directory native host', () => {
       const scanned = await runStableDirectoryNative({
         mode: 'canvas-intent-scan', roots: [canvasRoot], childName: 'transactions',
         maxEntries: 512, maxOutputBytes: 40 * 1024 * 1024,
-      }, () => true, { helperPath: () => helperPath })
+      }, () => true, { helperPath: () => nativeHelperPath })
       expect(scanned.entries).toHaveLength(512)
       expect(scanned.entries.every((entry) => !entry.isDirectory)).toBe(true)
     } finally {
@@ -568,9 +624,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'darwin')('Given 预算为零且只有合法 UUID 名非普通项 When 扫描 Then 忽略杂项而非误报 intent limit', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-non-regular-budget-'))
     const canvasRoot = join(root, 'canvas')
     const transactions = join(canvasRoot, 'transactions')
@@ -586,7 +639,7 @@ describe('stable directory native host', () => {
       const result = await runStableDirectoryNative({
         mode: 'canvas-intent-scan', roots: [canvasRoot], childName: 'transactions',
         maxEntries: 0,
-      }, () => true, { helperPath: () => helperPath })
+      }, () => true, { helperPath: () => nativeHelperPath })
 
       expect(result.entries).toEqual([])
     } finally {
@@ -595,9 +648,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'win32')('Given Windows 预算为零且合法 UUID 名是 junction When 扫描 Then 拒绝 reparse 消耗 intent budget', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper.exe')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-win-intent-non-regular-budget-'))
     const canvasRoot = join(root, 'canvas')
     const transactions = join(canvasRoot, 'transactions')
@@ -614,7 +664,7 @@ describe('stable directory native host', () => {
       const result = await runStableDirectoryNative({
         mode: 'canvas-intent-scan', roots: [canvasRoot], childName: 'transactions',
         maxEntries: 0,
-      }, () => true, { helperPath: () => helperPath })
+      }, () => true, { helperPath: () => nativeHelperPath })
 
       expect(result.entries).toEqual([])
     } finally {
@@ -623,9 +673,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'darwin')('Given 511 个合法 intent When 两个真实 helper 并发新增 Then 只提交一个且最终保持 512', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-concurrency-'))
 
     try {
@@ -642,7 +689,7 @@ describe('stable directory native host', () => {
           mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
           fileName: `agent-node-ffffffff-ffff-4fff-8fff-${suffix}.json`,
           content: '{"state":"committed"}', maxEntries: 512,
-        }, () => true, { helperPath: () => helperPath })
+        }, () => true, { helperPath: () => nativeHelperPath })
 
         const outcomes = await Promise.all([
           write(`${round.toString(16).padStart(2, '0')}0000000001`),
@@ -665,9 +712,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'darwin')('Given intent 锁文件是 symlink When helper 写入 Then fail closed 且目标不可见', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-lock-symlink-'))
     const canvasRoot = join(root, 'canvas')
     const transactions = join(canvasRoot, 'transactions')
@@ -680,7 +724,7 @@ describe('stable directory native host', () => {
       const result = await runStableDirectoryNative({
         mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
         fileName: targetName, content: '{"state":"committed"}', maxEntries: 512,
-      }, () => true, { helperPath: () => helperPath })
+      }, () => true, { helperPath: () => nativeHelperPath })
 
       expect(result.writeOutcome).toEqual({
         commitVisible: false,
@@ -695,9 +739,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'win32')('Given Windows intent 锁位是 junction When helper 写入 Then 拒绝 reparse 且目标不可见', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper.exe')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-win-intent-lock-reparse-'))
     const canvasRoot = join(root, 'canvas')
     const transactions = join(canvasRoot, 'transactions')
@@ -711,7 +752,7 @@ describe('stable directory native host', () => {
       const result = await runStableDirectoryNative({
         mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
         fileName: targetName, content: '{"state":"committed"}', maxEntries: 512,
-      }, () => true, { helperPath: () => helperPath })
+      }, () => true, { helperPath: () => nativeHelperPath })
 
       expect(result.writeOutcome).toEqual({
         commitVisible: false,
@@ -726,9 +767,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'darwin')('Given 外部进程持有 intent 锁 When helper 超时退出 Then 释放等待资源且后续写入成功', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-lock-timeout-'))
     const canvasRoot = join(root, 'canvas')
     const transactions = join(canvasRoot, 'transactions')
@@ -776,7 +814,7 @@ describe('stable directory native host', () => {
       }
 
       await expect(runStableDirectoryNative(request, () => true, {
-        helperPath: () => helperPath,
+        helperPath: () => nativeHelperPath,
         startupTimeoutMs: 1_000,
         totalTimeoutMs: 1_000,
       })).rejects.toThrow('稳定目录 helper 执行超时')
@@ -784,7 +822,7 @@ describe('stable directory native host', () => {
       holder.kill('SIGTERM')
       await holderExited
       await expect(runStableDirectoryNative(request, () => true, {
-        helperPath: () => helperPath,
+        helperPath: () => nativeHelperPath,
         totalTimeoutMs: 5_000,
       })).resolves.toHaveProperty('writeOutcome.commitVisible', true)
     } finally {
@@ -794,9 +832,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'darwin')('Given Canvas intent 位于已打开根 When 根路径在授权后被替换 Then helper 只返回原 inode 内存正文', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-scan-race-'))
     const canvasRoot = join(root, 'canvas')
     const movedCanvasRoot = join(root, 'canvas-original')
@@ -819,7 +854,7 @@ describe('stable directory native host', () => {
           symlinkSync(replacement, canvasRoot, 'dir')
           return true
         },
-        { helperPath: () => helperPath },
+        { helperPath: () => nativeHelperPath },
       )
 
       expect(result.entries).toEqual([{
@@ -837,9 +872,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'win32')('Given Windows drive 长路径 When helper 打开并枚举 Then canonical 用普通 drive 展示且内部仍可访问', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper.exe')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-win-long-path-'))
     let longRoot = root
     try {
@@ -847,7 +879,7 @@ describe('stable directory native host', () => {
       mkdirSync(longRoot, { recursive: true })
       writeFileSync(join(longRoot, 'long.txt'), 'long')
       const result = await runStableDirectoryNative(
-        { mode: 'list', roots: [longRoot] }, () => true, { helperPath: () => helperPath },
+        { mode: 'list', roots: [longRoot] }, () => true, { helperPath: () => nativeHelperPath },
       )
       expect(result.roots[0]?.canonicalPath).not.toStartWith('\\\\?\\')
       expect(result.entries.map((entry) => entry.name)).toContain('long.txt')
@@ -857,9 +889,6 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'win32')('Given Windows 目录打开后被 junction 替换 When 无法相对根 HANDLE 重开子项 Then fail closed 为空且不跟随 replacement', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper.exe')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-win-directory-race-'))
     const authorized = join(root, 'authorized')
     const moved = join(root, 'authorized-old')
@@ -876,7 +905,7 @@ describe('stable directory native host', () => {
           symlinkSync(replacement, authorized, 'junction')
           return true
         },
-        { helperPath: () => helperPath },
+        { helperPath: () => nativeHelperPath },
       )
       /** Windows 当前按 canonical path 重开子项；竞态发生后拒绝整项，不能读取 replacement。 */
       const entryNames = result.entries.map((entry) => entry.name)
@@ -888,16 +917,13 @@ describe('stable directory native host', () => {
   })
 
   test.skipIf(process.platform !== 'win32' || !windowsAdminShareAvailable)('Given Windows localhost 管理共享可用 When 使用 UNC root Then canonical 保留 UNC 展示形式', async () => {
-    const appDir = resolve(import.meta.dir, '../../..')
-    const helperPath = resolve(appDir, 'resources/stable-directory/stable-directory-helper.exe')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
     const root = mkdtempSync(join(tmpdir(), 'proma-win-unc-'))
     try {
       const uncRoot = toLocalhostAdminShare(root)
       if (!uncRoot) throw new Error('Windows 临时目录不是 drive 绝对路径')
       writeFileSync(join(root, 'unc.txt'), 'unc')
       const result = await runStableDirectoryNative(
-        { mode: 'list', roots: [uncRoot] }, () => true, { helperPath: () => helperPath },
+        { mode: 'list', roots: [uncRoot] }, () => true, { helperPath: () => nativeHelperPath },
       )
       expect(result.roots[0]?.canonicalPath).toStartWith('\\\\')
       expect(result.roots[0]?.canonicalPath).not.toStartWith('\\\\?\\UNC\\')

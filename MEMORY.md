@@ -175,3 +175,5 @@
 - 2026-08-26：完成 Canvas Agent 节点创建落点与对话关闭交互收口：新节点按可视中心确定性避让，关闭对话后迟到选区事件不再重开；真实 Electron 验证新增节点、Canvas 切换、重载恢复和深浅主题，既有修复前重叠节点保持原位置不做隐式迁移。
 - 2026-08-26：用户确认 Canvas 节点操作与局部故障恢复设计：恢复顶部悬浮工具栏，区分独立添加和节点扩展连线，删除保留对话；单个坏会话不再阻断整张画布，提供显式重建或删除并使用公开中文错误状态。
 - 2026-08-26：原生 Canvas 节点命令统一由顶部工具栏与节点侧扩展入口触发；扩展节点和边共享事务 revision，删除保留底层会话并受主进程 active-run 守卫。committed 坏会话只派生内存 `nodeIssues`，重建通过独立可恢复 intent 换绑空白 session；Preload/Adapter 只允许公开错误信封进入 Renderer。
+- 2026-08-27：`stable-directory-native-host` 的真实 helper 合同测试必须在文件级只编译一次原生产物，禁止每个用例重复冷编译挤占 Bun 默认 5 秒卡死保护；组级构建钩子可单独使用 30 秒上限，单用例继续保留默认超时。
+- 2026-08-27：`stable-directory-native-host` 必须等 ChildProcess `close` 后再判断协议是否提前结束；`exit` 可能早于 stdout 管道排空，不能据此拒绝已经正常产出的尾部 `write-result`/`done`。
