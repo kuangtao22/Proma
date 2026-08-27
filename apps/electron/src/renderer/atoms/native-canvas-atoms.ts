@@ -74,6 +74,29 @@ export function createNativeCanvasKey(projectId: string, canvasId: string): stri
   return `${projectId}:${canvasId}`
 }
 
+/**
+ * 请求打开目标节点工作台，dirty 时只登记待确认目标。
+ * @param current 当前 Canvas 临时状态。
+ * @param nodeId 用户或通知请求打开的目标节点。
+ * @returns 不接触图快照和 mutation 的局部状态更新。
+ */
+export function createNativeCanvasWorkbenchChangeUpdate(
+  current: NativeCanvasState,
+  nodeId: string,
+): Partial<NativeCanvasState> {
+  if (current.expandedNodeId === nodeId) return { pendingWorkbenchSwitchNodeId: null }
+  if (current.expandedNodeId
+    && current.workbenchDraft?.nodeId === current.expandedNodeId
+    && current.workbenchDraft.dirty) {
+    return { pendingWorkbenchSwitchNodeId: nodeId }
+  }
+  return {
+    expandedNodeId: nodeId,
+    pendingWorkbenchSwitchNodeId: null,
+    workbenchDraft: null,
+  }
+}
+
 /** 所有已挂载原生 Canvas 的隔离状态。 */
 export const nativeCanvasStatesAtom = atom<Map<string, NativeCanvasState>>(new Map())
 

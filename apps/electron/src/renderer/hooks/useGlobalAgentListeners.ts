@@ -72,6 +72,7 @@ import {
   isCanvasAgentHandoffGenerationCurrent,
   isCanvasAgentGenerationCurrent,
   createNativeCanvasKey,
+  createNativeCanvasWorkbenchChangeUpdate,
   updateNativeCanvasStateAtom,
 } from '@/atoms/native-canvas-atoms'
 import { tabsAtom, activeTabIdAtom, activeSessionIdAtom, openTab, updateTabTitle } from '@/atoms/tab-atoms'
@@ -658,10 +659,10 @@ export function useGlobalAgentListeners(): void {
       })
       store.set(updateNativeCanvasStateAtom, {
         key: createNativeCanvasKey(owner.projectId, owner.canvasId),
-        update: {
+        update: (current) => ({
           selectedNodeId: owner.nodeId,
-          expandedNodeId: owner.nodeId,
-        },
+          ...createNativeCanvasWorkbenchChangeUpdate(current, owner.nodeId),
+        }),
       })
       store.set(appModeAtom, 'agent')
       store.set(activeViewAtom, 'design')

@@ -15,6 +15,7 @@ import {
   canvasAgentAuthoritativeRunningSessionIdsAtom,
   createInitialNativeCanvasState,
   createNativeCanvasKey,
+  createNativeCanvasWorkbenchChangeUpdate,
   nativeCanvasStatesAtom,
   updateNativeCanvasStateAtom,
   isCanvasAgentGenerationCurrent,
@@ -28,6 +29,65 @@ import {
 } from './agent-atoms'
 
 describe('原生 Canvas 状态隔离', () => {
+  test.each([
+    {
+      name: 'dirty 工作台收到其他节点完成通知',
+      initial: {
+        expandedNodeId: 'node-document',
+        workbenchDraft: { nodeId: 'node-document', dirty: true },
+      },
+      targetNodeId: 'node-agent',
+      expected: {
+        expandedNodeId: 'node-document',
+        pendingWorkbenchSwitchNodeId: 'node-agent',
+        workbenchDraft: { nodeId: 'node-document', dirty: true },
+      },
+    },
+    {
+      name: 'clean 工作台收到其他节点完成通知',
+      initial: {
+        expandedNodeId: 'node-document',
+        workbenchDraft: { nodeId: 'node-document', dirty: false },
+      },
+      targetNodeId: 'node-agent',
+      expected: {
+        expandedNodeId: 'node-agent',
+        pendingWorkbenchSwitchNodeId: null,
+        workbenchDraft: null,
+      },
+    },
+    {
+      name: '当前节点收到自身完成通知',
+      initial: {
+        expandedNodeId: 'node-agent',
+        workbenchDraft: { nodeId: 'node-agent', dirty: true },
+      },
+      targetNodeId: 'node-agent',
+      expected: {
+        expandedNodeId: 'node-agent',
+        pendingWorkbenchSwitchNodeId: null,
+        workbenchDraft: { nodeId: 'node-agent', dirty: true },
+      },
+    },
+  ])('Given $name When 通过通知导航更新 Jotai Then 遵守统一工作台切换规则', ({ initial, targetNodeId, expected }) => {
+    const store = createStore()
+    const key = createNativeCanvasKey('project-a', 'canvas-a')
+    store.set(updateNativeCanvasStateAtom, { key, update: initial })
+
+    store.set(updateNativeCanvasStateAtom, {
+      key,
+      update: (current) => ({
+        selectedNodeId: targetNodeId,
+        ...createNativeCanvasWorkbenchChangeUpdate(current, targetNodeId),
+      }),
+    })
+
+    expect(store.get(nativeCanvasStatesAtom).get(key)).toMatchObject({
+      selectedNodeId: targetNodeId,
+      ...expected,
+    })
+  })
+
   test('Given 新建状态 When 切换工具 Then activeTool 只允许 select 或 pan', () => {
     const initial = createInitialNativeCanvasState()
 

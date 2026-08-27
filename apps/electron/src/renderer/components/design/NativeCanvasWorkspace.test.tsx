@@ -17,6 +17,7 @@ import type { NativeCanvasState } from '@/atoms/native-canvas-atoms'
 import {
   createInitialNativeCanvasState,
   createNativeCanvasKey,
+  createNativeCanvasWorkbenchChangeUpdate,
   canvasAgentRunningSessionIdsAtom,
   nativeCanvasStatesAtom,
 } from '@/atoms/native-canvas-atoms'
@@ -30,9 +31,9 @@ import {
   NativeCanvasWorkspace,
   createCanvasAgentNodeCommandController,
   createCanvasAgentNodeRebuildController,
+  createNativeCanvasWorkbenchDraftCommitCoordinator,
   createNativeCanvasWorkbenchCleanupCoordinator,
   createNativeCanvasAgentNodeSuccessUpdate,
-  createNativeCanvasWorkbenchChangeUpdate,
   createResolvedNativeCanvasWorkbenchSwitchUpdate,
   getNativeCanvasWorkbenchCommitAvailability,
   findNativeCanvasAgentNodeCreationPosition,
@@ -114,6 +115,132 @@ describe('原生 Canvas 单工作台切换', () => {
       nodeId: 'node-document',
       commitDraft: async () => undefined,
     })).toEqual({ enabled: true, reason: null })
+  })
+
+  /** 创建使用真实 Jotai 状态的草稿保存协调测试环境。 */
+  function createDraftCommitHarness() {
+    const store = createStore()
+    const firstKey = createNativeCanvasKey('project-1', 'canvas-1')
+    const secondKey = createNativeCanvasKey('project-1', 'canvas-2')
+    let activeKey = firstKey
+    const errors: string[] = []
+    const settled: string[] = []
+    const coordinator = createNativeCanvasWorkbenchDraftCommitCoordinator({
+      getCurrentWorkspaceKey: () => activeKey,
+      getState: (key) => store.get(nativeCanvasStatesAtom).get(key),
+      onSuccess: ({ stateKey }) => {
+        store.set(nativeCanvasStatesAtom, new Map(store.get(nativeCanvasStatesAtom)).set(
+          stateKey,
+          {
+            ...store.get(nativeCanvasStatesAtom).get(stateKey)!,
+            ...createResolvedNativeCanvasWorkbenchSwitchUpdate(
+              store.get(nativeCanvasStatesAtom).get(stateKey)!,
+            ),
+          },
+        ))
+      },
+      onFailure: () => errors.push('保存草稿失败，请重试。'),
+      onSettled: ({ stateKey }) => settled.push(stateKey),
+    })
+    const setWorkbench = (
+      key: string,
+      expandedNodeId: string,
+      pendingWorkbenchSwitchNodeId: string,
+      draftNodeId = expandedNodeId,
+    ): void => {
+      store.set(nativeCanvasStatesAtom, new Map(store.get(nativeCanvasStatesAtom)).set(key, {
+        ...createInitialNativeCanvasState(),
+        expandedNodeId,
+        pendingWorkbenchSwitchNodeId,
+        workbenchDraft: { nodeId: draftNodeId, dirty: true },
+      }))
+    }
+    return {
+      coordinator,
+      errors,
+      firstKey,
+      secondKey,
+      settled,
+      store,
+      setActiveKey: (key: string) => { activeKey = key },
+      setWorkbench,
+    }
+  }
+
+  test('Given 旧保存仍在途 When Canvas 已切换且新工作台已有草稿 Then 旧 resolve 不关闭或清理新状态', async () => {
+    const harness = createDraftCommitHarness()
+    const deferred = createDeferred<void>()
+    harness.setWorkbench(harness.firstKey, 'document-old', 'webview-old')
+    const execution = harness.coordinator.execute({
+      stateKey: harness.firstKey,
+      sourceExpandedNodeId: 'document-old',
+      sourceDraftNodeId: 'document-old',
+      targetNodeId: 'webview-old',
+      commitDraft: () => deferred.promise,
+    })
+
+    harness.coordinator.invalidate()
+    harness.setActiveKey(harness.secondKey)
+    harness.setWorkbench(harness.secondKey, 'document-new', 'image-new')
+    deferred.resolve()
+    await execution
+
+    expect(harness.store.get(nativeCanvasStatesAtom).get(harness.secondKey)).toMatchObject({
+      expandedNodeId: 'document-new',
+      pendingWorkbenchSwitchNodeId: 'image-new',
+      workbenchDraft: { nodeId: 'document-new', dirty: true },
+    })
+    expect(harness.settled).toEqual([])
+  })
+
+  test('Given 旧保存仍在途 When 操作已失效 Then 旧 reject 不污染新工作台错误或保存状态', async () => {
+    const harness = createDraftCommitHarness()
+    const deferred = createDeferred<void>()
+    harness.setWorkbench(harness.firstKey, 'document-old', 'webview-old')
+    const execution = harness.coordinator.execute({
+      stateKey: harness.firstKey,
+      sourceExpandedNodeId: 'document-old',
+      sourceDraftNodeId: 'document-old',
+      targetNodeId: 'webview-old',
+      commitDraft: () => deferred.promise,
+    })
+
+    harness.coordinator.invalidate()
+    harness.setWorkbench(harness.firstKey, 'document-new', 'image-new')
+    deferred.reject(new Error('旧保存失败'))
+    await execution
+
+    expect(harness.errors).toEqual([])
+    expect(harness.settled).toEqual([])
+    expect(harness.store.get(nativeCanvasStatesAtom).get(harness.firstKey)).toMatchObject({
+      expandedNodeId: 'document-new',
+      pendingWorkbenchSwitchNodeId: 'image-new',
+      workbenchDraft: { nodeId: 'document-new', dirty: true },
+    })
+  })
+
+  test('Given 保存身份与代次均匹配 When commit resolve Then 正常切换并结束保存态', async () => {
+    const harness = createDraftCommitHarness()
+    const deferred = createDeferred<void>()
+    harness.setWorkbench(harness.firstKey, 'document-1', 'webview-1')
+    const execution = harness.coordinator.execute({
+      stateKey: harness.firstKey,
+      sourceExpandedNodeId: 'document-1',
+      sourceDraftNodeId: 'document-1',
+      targetNodeId: 'webview-1',
+      commitDraft: () => deferred.promise,
+    })
+
+    deferred.resolve()
+    await execution
+
+    expect(harness.store.get(nativeCanvasStatesAtom).get(harness.firstKey)).toMatchObject({
+      expandedNodeId: 'webview-1',
+      pendingWorkbenchSwitchNodeId: null,
+      workbenchDraft: null,
+    })
+    expect(harness.errors).toEqual([])
+    expect(harness.settled).toEqual([harness.firstKey])
   })
 })
 
