@@ -31,6 +31,9 @@ import {
   createCanvasAgentNodeCommandController,
   createCanvasAgentNodeRebuildController,
   createNativeCanvasAgentNodeSuccessUpdate,
+  createNativeCanvasWorkbenchChangeUpdate,
+  createResolvedNativeCanvasWorkbenchSwitchUpdate,
+  getNativeCanvasWorkbenchCommitAvailability,
   findNativeCanvasAgentNodeCreationPosition,
   createRebuiltNativeCanvasStateUpdate,
   createNativeCanvasWorkspaceController,
@@ -66,6 +69,51 @@ describe('原生 Canvas 顶部添加节点路由', () => {
       expect(executeAgent).not.toHaveBeenCalled()
     },
   )
+})
+
+describe('原生 Canvas 单工作台切换', () => {
+  test('Given 文档工作台有未保存草稿 When 请求展开原型 Then 只登记待切换且不改变图', () => {
+    const current = createInitialNativeCanvasState()
+    current.snapshot = createSnapshot(4)
+    current.expandedNodeId = 'node-document'
+    current.workbenchDraft = { nodeId: 'node-document', dirty: true }
+    const beforeDocument = structuredClone(current.snapshot.document)
+
+    const update = createNativeCanvasWorkbenchChangeUpdate(current, 'node-webview')
+    const updated = { ...current, ...update }
+
+    expect(updated).toMatchObject({
+      expandedNodeId: 'node-document',
+      pendingWorkbenchSwitchNodeId: 'node-webview',
+      workbenchDraft: { nodeId: 'node-document', dirty: true },
+    })
+    expect(updated.snapshot?.document).toEqual(beforeDocument)
+    expect(updated.pendingMutations).toEqual([])
+  })
+
+  test('Given 已确认放弃草稿 When 完成切换 Then 同时只保留目标工作台', () => {
+    const current = createInitialNativeCanvasState()
+    current.expandedNodeId = 'node-document'
+    current.pendingWorkbenchSwitchNodeId = 'node-webview'
+    current.workbenchDraft = { nodeId: 'node-document', dirty: true }
+
+    expect(createResolvedNativeCanvasWorkbenchSwitchUpdate(current)).toEqual({
+      expandedNodeId: 'node-webview',
+      pendingWorkbenchSwitchNodeId: null,
+      workbenchDraft: null,
+    })
+  })
+
+  test('Given 当前 dirty 工作台未注册提交器 When 显示切换确认 Then 保存不可用且说明原因', () => {
+    expect(getNativeCanvasWorkbenchCommitAvailability('node-document', undefined)).toEqual({
+      enabled: false,
+      reason: '当前工作台未注册保存能力，暂时不能保存并切换。',
+    })
+    expect(getNativeCanvasWorkbenchCommitAvailability('node-document', {
+      nodeId: 'node-document',
+      commitDraft: async () => undefined,
+    })).toEqual({ enabled: true, reason: null })
+  })
 })
 
 /** 可从测试精确控制完成时机的 Promise。 */
@@ -437,7 +485,12 @@ describe('原生 Canvas controller 保存', () => {
 
 describe('原生 Canvas controller 权威恢复', () => {
   test('Given 普通 LOAD 返回 recoveredFrom 且旧 SAVE 在途 When 应用恢复快照 Then 旧回调无副作用', async () => {
-    const harness = createHarness({ phase: 'ready', snapshot: createSnapshot(5) })
+    const harness = createHarness({
+      phase: 'ready',
+      snapshot: createSnapshot(5),
+      expandedNodeId: 'agent-1',
+      workbenchDraft: { nodeId: 'agent-1', dirty: true },
+    })
     harness.controller.start()
     const mutation: CanvasMutation = { type: 'set-viewport', viewport: { x: 4, y: 5, zoom: 1.2 } }
     harness.controller.enqueueMutation(mutation)
@@ -449,6 +502,7 @@ describe('原生 Canvas controller 权威恢复', () => {
     await flushPromises()
     expect(harness.getState()).toMatchObject({
       pendingMutations: [mutation], inFlightMutations: [], saveState: 'dirty',
+      expandedNodeId: null, pendingWorkbenchSwitchNodeId: null, workbenchDraft: null,
     })
     expect(harness.getState().snapshot?.document).toMatchObject({
       revision: 1, viewport: { x: 4, y: 5, zoom: 1.2 },
@@ -549,6 +603,8 @@ describe('原生 Canvas controller 权威恢复', () => {
     const harness = createHarness({
       phase: 'ready', snapshot: createSnapshot(5), pendingMutations: [structural],
       saveState: 'dirty', selectedNodeId: 'agent-1', conversationNodeId: 'agent-1',
+      expandedNodeId: 'agent-1', pendingWorkbenchSwitchNodeId: 'agent-other',
+      workbenchDraft: { nodeId: 'agent-1', dirty: true },
     })
     harness.controller.start()
     harness.emit({ projectId: 'project-1', canvasId: 'canvas-1', revision: 1, cause: 'recovery' })
@@ -558,6 +614,7 @@ describe('原生 Canvas controller 权威恢复', () => {
     expect(harness.getState()).toMatchObject({
       pendingMutations: [structural], saveState: 'conflict',
       authoritativeRecoveryState: 'idle', selectedNodeId: null, conversationNodeId: null,
+      expandedNodeId: null, pendingWorkbenchSwitchNodeId: null, workbenchDraft: null,
     })
     expect(harness.getState().error).toContain('结构')
     expect(harness.scheduler.getDelay()).toBeUndefined()
@@ -778,6 +835,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     current.snapshot.document.viewport = { x: 12, y: 34, zoom: 1.5 }
     current.pendingMutations = [viewportMutation]
     current.conversationNodeId = 'agent-existing'
+    current.expandedNodeId = 'agent-existing'
     const createdDocument = createSnapshot(3).document
     createdDocument.viewport = { ...current.snapshot.document.viewport }
     const result: CanvasAgentNodeCreationResult = {
@@ -791,10 +849,12 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       snapshot: { document: result.document },
       selectedNodeId: 'node-new',
       conversationNodeId: 'agent-existing',
+      expandedNodeId: 'agent-existing',
       pendingMutations: [viewportMutation],
     })
     expect(update.snapshot?.document.viewport).toEqual({ x: 12, y: 34, zoom: 1.5 })
     expect(update).not.toHaveProperty('conversationNodeId')
+    expect(update).not.toHaveProperty('expandedNodeId')
     expect(update).not.toHaveProperty('pendingMutations')
   })
 
@@ -866,6 +926,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     }]
     current.selectedNodeId = 'agent-existing'
     current.conversationNodeId = 'agent-existing'
+    current.expandedNodeId = 'agent-existing'
     const pendingViewport: CanvasMutation = {
       type: 'set-viewport', viewport: { x: 90, y: 80, zoom: 1.6 },
     }
@@ -886,6 +947,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     expect(updated.snapshot?.document.viewport).toEqual({ x: 90, y: 80, zoom: 1.6 })
     expect(updated.selectedNodeId).toBe('node-new')
     expect(updated.conversationNodeId).toBe('agent-existing')
+    expect(updated.expandedNodeId).toBe('agent-existing')
     expect(updated.pendingMutations).toEqual([pendingViewport])
   })
 
@@ -1092,7 +1154,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     expect(createRebuiltNativeCanvasStateUpdate(result, 'agent-1')).toEqual({
       snapshot: rebuiltSnapshot,
       selectedNodeId: 'agent-1',
-      conversationNodeId: 'agent-1',
+      expandedNodeId: 'agent-1',
       error: null,
     })
   })
@@ -1116,7 +1178,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       phase: 'ready',
       snapshot,
       selectedNodeId: 'agent-1',
-      conversationNodeId: 'agent-1',
+      expandedNodeId: 'agent-1',
     }]]))
     let conversationRenderCount = 0
     const html = renderToStaticMarkup(
@@ -1134,7 +1196,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
             sendCanvasAgentMessage: async () => ({ ok: true }),
             stopCanvasAgent: async () => undefined,
           }}
-          flowRenderer={() => <div />}
+          flowRenderer={(props) => <>{props.nodes[0]?.data.workbench}</>}
           conversationRenderer={() => {
             conversationRenderCount += 1
             return <div>不应渲染</div>
@@ -1190,13 +1252,13 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     )
 
     expect(flowProps?.nodes[0]).toMatchObject({
-      data: { status: 'unavailable', canExpand: false },
+      data: { status: 'unavailable', canExpand: true },
     })
     expect(flowProps?.nodesDraggable).toBe(false)
     expect(flowProps?.panOnDrag).toBe(true)
   })
 
-  test('Given Agent 节点仍被选中 When 关闭对话 Then 同时清空选区避免立即重开', () => {
+  test('Given Agent 节点工作台已打开 When 收起工作台 Then 保留普通选区且不再挂载对话', () => {
     const target = { projectId: 'project-1', canvasId: 'canvas-1' }
     const snapshot = createSnapshot(7, target)
     snapshot.document.nodes = [{
@@ -1210,7 +1272,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       phase: 'ready',
       snapshot,
       selectedNodeId: 'agent-1',
-      conversationNodeId: 'agent-1',
+      expandedNodeId: 'agent-1',
     }]]))
     let conversationProps: CanvasAgentConversationProps | undefined
     let flowProps: NativeCanvasFlowProps | undefined
@@ -1233,7 +1295,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
           }}
           flowRenderer={(props) => {
             flowProps = props
-            return <div />
+            return <>{props.nodes[0]?.data.workbench}</>
           }}
           conversationRenderer={(props) => {
             conversationProps = props
@@ -1247,19 +1309,65 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     expect(conversationProps?.onClose).toBeFunction()
     conversationProps?.onClose()
     expect(store.get(nativeCanvasStatesAtom).get(stateKey)).toMatchObject({
-      selectedNodeId: null,
-      conversationNodeId: null,
+      selectedNodeId: 'agent-1',
+      expandedNodeId: null,
+      pendingWorkbenchSwitchNodeId: null,
+      workbenchDraft: null,
     })
 
     /** close 后不再订阅 XYFlow 派生 selection，避免受控选区反写形成反馈循环。 */
     expect(flowProps?.onSelectionChange).toBeUndefined()
     expect(store.get(nativeCanvasStatesAtom).get(stateKey)).toMatchObject({
-      selectedNodeId: null,
-      conversationNodeId: null,
+      selectedNodeId: 'agent-1',
+      expandedNodeId: null,
     })
   })
 
-  test('Given Agent 对话面板已打开 When 渲染 Canvas Then 画布表面为右侧面板预留空间', () => {
+  test('Given 两个内容节点 When 只展开文档 Then Graph 只注入一个文档工作台', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const snapshot = createSnapshot(2, target)
+    snapshot.document.nodes = [
+      {
+        id: 'document-1', kind: 'document', title: '需求文档',
+        documentId: 'content-1', contentRevision: 0, position: { x: 0, y: 0 },
+      },
+      {
+        id: 'webview-1', kind: 'webview', title: '首页原型',
+        prototypeId: 'prototype-1', contentRevision: 0, position: { x: 320, y: 0 },
+      },
+    ]
+    const store = createStore()
+    store.set(nativeCanvasStatesAtom, new Map([[
+      createNativeCanvasKey(target.projectId, target.canvasId),
+      {
+        ...createInitialNativeCanvasState(), phase: 'ready', snapshot,
+        selectedNodeId: 'document-1', expandedNodeId: 'document-1',
+      },
+    ]]))
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          target={target}
+          title="Canvas 1"
+          adapter={{
+            loadCanvas: async () => snapshot,
+            saveCanvas: async () => snapshot.document,
+            onCanvasChanged: () => () => {},
+          }}
+          flowRenderer={(props) => (
+            <>{props.nodes[0]?.data.workbench}{props.nodes[1]?.data.workbench}</>
+          )}
+        />
+      </Provider>,
+    )
+
+    expect(html).toContain('aria-label="文档工作台"')
+    expect(html).not.toContain('aria-label="原型工作台"')
+    expect(html.match(/aria-label="文档工作台"/gu)).toHaveLength(1)
+  })
+
+  test('Given Agent 工作台已展开 When 渲染 Canvas Then 对话只挂载在节点覆盖层且画布不缩窄', () => {
     const target = { projectId: 'project-1', canvasId: 'canvas-1' }
     const snapshot = createSnapshot(7, target)
     snapshot.document.nodes = [{
@@ -1273,7 +1381,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       phase: 'ready',
       snapshot,
       selectedNodeId: 'agent-1',
-      conversationNodeId: 'agent-1',
+      expandedNodeId: 'agent-1',
     }]]))
 
     const html = renderToStaticMarkup(
@@ -1293,13 +1401,15 @@ describe('原生 Canvas 添加 Agent 命令', () => {
             sendCanvasAgentMessage: async () => ({ ok: true }),
             stopCanvasAgent: async () => undefined,
           }}
-          flowRenderer={() => <div />}
+          flowRenderer={(props) => <>{props.nodes[0]?.data.workbench}</>}
           conversationRenderer={() => <div data-testid="canvas-agent-conversation" />}
         />
       </Provider>,
     )
 
-    expect(html).toMatch(/data-native-canvas-surface="true"[^>]*class="[^"]*mr-\[min\(28rem,100%\)\]/u)
+    expect(html).toContain('aria-label="Agent工作台"')
+    expect(html).toContain('data-testid="canvas-agent-conversation"')
+    expect(html).not.toContain('mr-[min(28rem,100%)]')
     expect(html).toMatch(/data-native-canvas-surface="true"[^>]*class="[^"]*relative/u)
   })
 

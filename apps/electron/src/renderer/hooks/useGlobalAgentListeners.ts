@@ -660,7 +660,7 @@ export function useGlobalAgentListeners(): void {
         key: createNativeCanvasKey(owner.projectId, owner.canvasId),
         update: {
           selectedNodeId: owner.nodeId,
-          conversationNodeId: owner.nodeId,
+          expandedNodeId: owner.nodeId,
         },
       })
       store.set(appModeAtom, 'agent')

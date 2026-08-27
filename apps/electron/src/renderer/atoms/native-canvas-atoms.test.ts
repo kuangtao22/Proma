@@ -32,6 +32,11 @@ describe('原生 Canvas 状态隔离', () => {
     const initial = createInitialNativeCanvasState()
 
     expect(initial.activeTool).toBe('select')
+    expect(initial).toMatchObject({
+      expandedNodeId: null,
+      pendingWorkbenchSwitchNodeId: null,
+      workbenchDraft: null,
+    })
     expect({ ...initial, activeTool: 'pan' as const }.activeTool).toBe('pan')
   })
 

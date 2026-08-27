@@ -14,6 +14,12 @@ export type NativeCanvasPhase = 'idle' | 'loading' | 'ready' | 'error'
 /** 原生 Canvas mutation 保存阶段。 */
 export type NativeCanvasSaveState = 'saved' | 'dirty' | 'saving' | 'failed' | 'conflict'
 
+/** 单个节点工作台尚未提交的轻量草稿状态。 */
+export interface NativeCanvasWorkbenchDraftState {
+  nodeId: string
+  dirty: boolean
+}
+
 /** 按项目与 Canvas 双重身份隔离的 Renderer 状态。 */
 export interface NativeCanvasState {
   phase: NativeCanvasPhase
@@ -24,7 +30,14 @@ export interface NativeCanvasState {
   inFlightMutations: CanvasMutation[]
   saveState: NativeCanvasSaveState
   selectedNodeId: string | null
+  /** 旧完成通知兼容字段，不再驱动任何可见面板。 */
   conversationNodeId: string | null
+  /** 当前唯一展开的节点内工作台。 */
+  expandedNodeId: string | null
+  /** dirty 草稿确认框通过后准备切换的目标节点。 */
+  pendingWorkbenchSwitchNodeId: string | null
+  /** 工作台草稿只记录身份和 dirty，不复制正文或 Agent 运行态。 */
+  workbenchDraft: NativeCanvasWorkbenchDraftState | null
   authoritativeRecoveryState: 'idle' | 'loading' | 'failed'
   /** recovery 期间观察到的最高普通 graph revision，跨 remount 保留。 */
   deferredGraphRevision: number | null
@@ -42,6 +55,9 @@ export function createInitialNativeCanvasState(): NativeCanvasState {
     saveState: 'saved',
     selectedNodeId: null,
     conversationNodeId: null,
+    expandedNodeId: null,
+    pendingWorkbenchSwitchNodeId: null,
+    workbenchDraft: null,
     authoritativeRecoveryState: 'idle',
     deferredGraphRevision: null,
     error: null,
