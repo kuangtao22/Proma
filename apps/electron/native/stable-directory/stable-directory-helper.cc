@@ -269,15 +269,23 @@ bool IsHexDigit(char value) {
       || (value >= 'A' && value <= 'F');
 }
 
-// 只接受固定 agent-node-<UUID>.json 文件名，伪前缀和目录杂项不消耗容量。
+// 只接受固定 agent-node/content-node UUID 文件名，伪前缀和目录杂项不消耗容量。
 bool IsCanvasIntentCandidateName(const std::string& name) {
-  constexpr std::size_t kPrefixLength = 11;
+  constexpr std::size_t kAgentPrefixLength = 11;
+  constexpr std::size_t kContentPrefixLength = 13;
   constexpr std::size_t kUuidLength = 36;
   constexpr std::size_t kSuffixLength = 5;
-  if (name.size() != kPrefixLength + kUuidLength + kSuffixLength
-      || name.compare(0, kPrefixLength, "agent-node-") != 0
-      || name.compare(kPrefixLength + kUuidLength, kSuffixLength, ".json") != 0) return false;
-  const std::string uuid = name.substr(kPrefixLength, kUuidLength);
+  std::size_t prefix_length = 0;
+  if (name.compare(0, kAgentPrefixLength, "agent-node-") == 0) {
+    prefix_length = kAgentPrefixLength;
+  } else if (name.compare(0, kContentPrefixLength, "content-node-") == 0) {
+    prefix_length = kContentPrefixLength;
+  } else {
+    return false;
+  }
+  if (name.size() != prefix_length + kUuidLength + kSuffixLength
+      || name.compare(prefix_length + kUuidLength, kSuffixLength, ".json") != 0) return false;
+  const std::string uuid = name.substr(prefix_length, kUuidLength);
   for (std::size_t index = 0; index < uuid.size(); ++index) {
     if (index == 8 || index == 13 || index == 18 || index == 23) {
       if (uuid[index] != '-') return false;

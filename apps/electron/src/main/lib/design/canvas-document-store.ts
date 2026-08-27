@@ -50,6 +50,8 @@ export interface CanvasDocumentStore {
   load: (target: CanvasTarget) => CanvasWorkspaceSnapshot
   /** 加载文档并返回绑定同一次授权目录身份的子目录 capability。 */
   loadWithDirectoryCapability: (target: CanvasTarget) => CanvasDocumentDirectoryCapability
+  /** 加载并绑定一次私有 v1 内容迁移事务，路径与 CAS 身份不离开闭包。 */
+  loadWithMigrationCapability: (target: CanvasTarget) => CanvasDocumentMigrationCapability
   /** 要求当前文档无需恢复即可作为副作用基线。 */
   requireStableAuthoritativeDocument: (target: CanvasTarget) => CanvasDocument
   /** 在权威 revision 上应用并提交一批 mutation。 */
@@ -59,6 +61,14 @@ export interface CanvasDocumentStore {
     mutations: CanvasMutation[],
     validateCurrent?: (document: CanvasDocument) => void,
   ) => CanvasDocument
+}
+
+/** 主进程私有的旧内容迁移能力，不进入共享合同或 IPC。 */
+export interface CanvasDocumentMigrationCapability extends CanvasDocumentDirectoryCapability {
+  migratedFrom?: 1
+  legacyContentSeeds: LegacyCanvasContentSeed[]
+  /** 把同次读取的规范化 v2 载荷按 CAS 提交，保持图 revision 与时间不变。 */
+  commitMigration: () => CanvasDocument
 }
 
 /** 已绑定目录链身份的可信单目录 capability。 */
@@ -1064,6 +1074,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     snapshot: CanvasWorkspaceSnapshot
     parsedDocument: ParsedCanvasDocument
     primaryExpectation: AtomicDestinationExpectation
+    recoveredState?: AtomicFileState
     authorized: ReturnType<typeof resolveAuthorizedTarget>
   } {
     /** 授权和路径复验是任何文档候选访问的先决条件。 */
@@ -1145,6 +1156,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
       },
       parsedDocument,
       primaryExpectation: readResult.primaryExpectation,
+      recoveredState: readResult.recoveredState,
       authorized,
     }
   }
@@ -1190,6 +1202,73 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
           assertValid,
           authorizeOpenedRoots,
         }
+      },
+    }
+  }
+
+  /** 返回只绑定同一次读取事实的旧内容迁移能力。 */
+  function loadWithMigrationCapability(target: CanvasTarget): CanvasDocumentMigrationCapability {
+    const loaded = loadWithAuthoritativeState(target, true)
+    const scopeIdentity = loaded.authorized.directoryIdentity
+    /** 为内容 Store 提供同一 Canvas 根下的窄子目录能力。 */
+    const openSingleChildDirectory = (name: string): CanvasTrustedDirectoryCapability => {
+      if (!isSafeDesignStableId(name)) throw unsafeCanvasPath('Canvas 子目录名非法')
+      const childPath = join(scopeIdentity.canvasRoot.path, name)
+      if (dirname(childPath) !== scopeIdentity.canvasRoot.path || basename(childPath) !== name) {
+        throw unsafeCanvasPath('Canvas 子目录不满足单级合同')
+      }
+      const assertValid = (): void => assertCanvasDirectoryScope(scopeIdentity)
+      const authorizeOpenedRoots = (roots: readonly StableDirectoryOpenedRoot[]): boolean => {
+        const current = resolveAuthorizedTarget(target)
+        const currentCanvasRoot = current.directoryIdentity.canvasRoot
+        const [root] = roots
+        const allowed = roots.length === 1
+          && isSameDirectoryIdentity(currentCanvasRoot, scopeIdentity.canvasRoot)
+          && root !== undefined
+          && isOpenedRootSameDirectoryIdentity(currentCanvasRoot, root)
+        assertCanvasDirectoryScope(current.directoryIdentity)
+        assertValid()
+        return allowed
+      }
+      assertValid()
+      return { path: childPath, rootPath: scopeIdentity.canvasRoot.path, assertValid, authorizeOpenedRoots }
+    }
+    return {
+      snapshot: loaded.snapshot,
+      migratedFrom: loaded.parsedDocument.migratedFrom,
+      legacyContentSeeds: loaded.parsedDocument.legacyContentSeeds.map((seed) => ({ ...seed })),
+      openSingleChildDirectory,
+      commitMigration: (): CanvasDocument => {
+        if (loaded.parsedDocument.migratedFrom !== 1) return loaded.snapshot.document
+        assertCanvasDirectoryScope(scopeIdentity)
+        try {
+          writeCanvasJsonSecure(
+            loaded.authorized.paths,
+            scopeIdentity,
+            loaded.authorized.paths.documentPath,
+            loaded.parsedDocument.document,
+            { expectedDestination: loaded.primaryExpectation },
+          )
+        } catch (error) {
+          if (error instanceof AtomicDestinationConflictError) {
+            throw new Error('CANVAS_REVISION_CONFLICT: document changed during migration', { cause: error })
+          }
+          if (error instanceof AtomicWritePostCommitError) {
+            throw new Error('CANVAS_COMMIT_UNCERTAIN: migration durability requires reload', { cause: error })
+          }
+          throw error
+        }
+        assertCanvasDirectoryScope(scopeIdentity)
+        if (loaded.snapshot.recoveredFrom === 'tmp') {
+          if (!loaded.recoveredState) throw unsafeCanvasPath('tmp 迁移缺少绑定状态')
+          const temporaryPath = `${loaded.authorized.paths.documentPath}.tmp`
+          options.beforeConsumeRecoveredTemporary?.(temporaryPath)
+          removeFile(temporaryPath, {
+            expectedIdentity: { dev: loaded.recoveredState.dev, ino: loaded.recoveredState.ino },
+          })
+          assertCanvasDirectoryScope(scopeIdentity)
+        }
+        return loaded.parsedDocument.document
       },
     }
   }
@@ -1284,5 +1363,5 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     return next
   }
 
-  return { load, loadWithDirectoryCapability, requireStableAuthoritativeDocument, mutate }
+  return { load, loadWithDirectoryCapability, loadWithMigrationCapability, requireStableAuthoritativeDocument, mutate }
 }

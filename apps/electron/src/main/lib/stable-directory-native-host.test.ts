@@ -639,6 +639,21 @@ describe('stable directory native host', () => {
     }])
   })
 
+  test('Given 内容节点 intent 文件名 When 写入 Then 只接受固定 content-node UUID 合同', async () => {
+    const fake = createFakeHelper({ writeOutcome: { commitVisible: true, durabilityUncertain: false } })
+    const run = createStableDirectoryNativeHost().run
+    await expect(run({
+      mode: 'canvas-intent-write', roots: ['/requested'], childName: 'transactions',
+      fileName: 'content-node-11111111-1111-4111-8111-111111111111.json', content: '{}',
+    }, () => true, createDependencies(fake))).resolves.toMatchObject({
+      writeOutcome: { commitVisible: true, durabilityUncertain: false },
+    })
+    await expect(run({
+      mode: 'canvas-intent-write', roots: ['/requested'], childName: 'transactions',
+      fileName: 'content-node-fake.json', content: '{}',
+    }, () => true, createDependencies(fake))).rejects.toThrow('合同无效')
+  })
+
   test('Given helper 报告 rename 后目录持久性未确认 When host 消费协议 Then 保留可见提交结果而非提前退出', async () => {
     const fake = createFakeHelper({
       writeOutcome: {
@@ -1085,7 +1100,7 @@ describe('stable directory native host', () => {
     mkdirSync(transactions, { recursive: true })
     /** 固定 UUID v4 形态，覆盖完整 512 容量。 */
     const intentNames = Array.from({ length: 512 }, (_, index) => (
-      `agent-node-00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}.json`
+      `${index === 511 ? 'content' : 'agent'}-node-00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}.json`
     ))
     for (const name of intentNames) writeFileSync(join(transactions, name), '{}', 'utf8')
     writeFileSync(join(transactions, 'agent-node-not-a-uuid.json'), '{}', 'utf8')

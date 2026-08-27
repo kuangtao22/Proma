@@ -398,6 +398,49 @@ describe('CanvasDocumentStore', () => {
     expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8'))).toEqual(legacyDocument)
   })
 
+  test('Given v1 主文件 When 取得私有迁移能力并提交 Then seeds 不泄露且 revision 与时间不变', () => {
+    const fixture = createFixture()
+    const legacyDocument = createLegacyDocument(7) as CanvasDocument
+    writeDocument(fixture.documentPath, legacyDocument)
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+
+    const capability = fixture.store.loadWithMigrationCapability(target)
+    expect(capability.migratedFrom).toBe(1)
+    expect(capability.legacyContentSeeds).toHaveLength(3)
+    expect('legacyContentSeeds' in capability.snapshot).toBe(false)
+    const committed = capability.commitMigration()
+
+    expect(committed.revision).toBe(7)
+    expect(committed.createdAt).toBe(20)
+    expect(committed.updatedAt).toBe(27)
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).schemaVersion).toBe(2)
+    expect('legacyContentSeeds' in fixture.store.load(target)).toBe(false)
+  })
+
+  test.each([['tmp', '.tmp'], ['backup', '.bak']] as const)('Given v1 %s 候选 When 私有迁移提交 Then 直接 CAS v2 且 tmp 只消费读取 inode', (_source, suffix) => {
+    const fixture = createFixture()
+    const legacyDocument = createLegacyDocument(4)
+    writeDocument(fixture.documentPath, { broken: true })
+    writeDocument(`${fixture.documentPath}${suffix}`, legacyDocument)
+    const capability = fixture.store.loadWithMigrationCapability({ projectId: 'project-1', canvasId: 'canvas-1' })
+    expect(capability.migratedFrom).toBe(1)
+    capability.commitMigration()
+    const persisted = JSON.parse(readFileSync(fixture.documentPath, 'utf8')) as CanvasDocument
+    expect(persisted.schemaVersion).toBe(2)
+    expect(persisted.revision).toBe(4)
+    if (suffix === '.tmp') expect(existsSync(`${fixture.documentPath}.tmp`)).toBe(false)
+  })
+
+  test('Given 迁移能力读取后主文件身份变化 When 提交 Then CAS 冲突且不覆盖新主文件', () => {
+    const fixture = createFixture()
+    writeDocument(fixture.documentPath, createLegacyDocument(2))
+    const capability = fixture.store.loadWithMigrationCapability({ projectId: 'project-1', canvasId: 'canvas-1' })
+    const concurrent = createConnectedDocument(9)
+    writeDocument(fixture.documentPath, concurrent)
+    expect(() => capability.commitMigration()).toThrow('CANVAS_REVISION_CONFLICT')
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8'))).toEqual(concurrent)
+  })
+
   test.each([
     ['tmp', '.tmp'],
     ['backup', '.bak'],
