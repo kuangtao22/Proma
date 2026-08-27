@@ -150,7 +150,8 @@ describe('CanvasDocumentStore', () => {
           kind: 'image',
           title: '图片',
           position: { x: 10, y: 10 },
-          assetId: 'asset-1',
+          imageModuleId: 'image-module-1',
+          adoptedAssetId: 'asset-1',
         },
       ],
       edges: [{
@@ -160,6 +161,60 @@ describe('CanvasDocumentStore', () => {
         targetNodeId: 'node-image',
         targetPort: 'input',
       }],
+    }
+  }
+
+  /**
+   * 创建包含旧四类节点的 schema v1 文档。
+   * @param revision 需要固化的旧文档 revision。
+   * @returns 可用于验证内存迁移和恢复链的 v1 原始对象。
+   */
+  function createLegacyDocument(revision = 2): object {
+    return {
+      schemaVersion: 1,
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      revision,
+      viewport: { x: 1, y: 2, zoom: 1 },
+      nodes: [
+        {
+          id: 'node-agent',
+          kind: 'agent',
+          title: 'Agent',
+          position: { x: 0, y: 0 },
+          agentSessionId: 'agent-session-1',
+        },
+        {
+          id: 'node-image',
+          kind: 'image',
+          title: '图片',
+          position: { x: 10, y: 10 },
+          assetId: 'asset-1',
+        },
+        {
+          id: 'node-document',
+          kind: 'visual-document',
+          title: '文档',
+          position: { x: 20, y: 20 },
+          visualDocumentId: 'visual-document-1',
+        },
+        {
+          id: 'node-webview',
+          kind: 'webview',
+          title: '原型',
+          position: { x: 30, y: 30 },
+          url: 'https://example.com/prototype',
+        },
+      ],
+      edges: [{
+        id: 'edge-1',
+        sourceNodeId: 'node-document',
+        sourcePort: 'output',
+        targetNodeId: 'node-image',
+        targetPort: 'input',
+      }],
+      createdAt: 20,
+      updatedAt: 20 + revision,
     }
   }
 
@@ -196,6 +251,130 @@ describe('CanvasDocumentStore', () => {
       nodeIssues: [],
     })
     expect(existsSync(fixture.documentPath)).toBe(false)
+  })
+
+  test('Given v1 视觉文档节点 When 解析 Then 规范化为保留内容 ID 的 v2 文档节点', () => {
+    /** 主进程解析结果同时提供规范化文档和私有迁移信息。 */
+    const parsed = parseCanvasDocument(createLegacyDocument(), {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+    })
+
+    expect(parsed.migratedFrom).toBe(1)
+    expect(parsed.document.schemaVersion).toBe(2)
+    expect(parsed.document.nodes[2]).toEqual({
+      id: 'node-document',
+      kind: 'document',
+      title: '文档',
+      position: { x: 20, y: 20 },
+      documentId: 'visual-document-1',
+      contentRevision: 0,
+    })
+  })
+
+  test('Given v1 图片与 Webview 节点 When 解析 Then 生成不进入图文档的私有内容种子', () => {
+    /** v1 解析结果用于同时检查图节点和私有种子。 */
+    const parsed = parseCanvasDocument(createLegacyDocument(), {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+    })
+
+    expect(parsed.document.nodes[1]).toMatchObject({
+      kind: 'image',
+      imageModuleId: 'asset-1',
+      adoptedAssetId: 'asset-1',
+    })
+    expect(parsed.document.nodes[3]).toMatchObject({
+      kind: 'webview',
+      prototypeId: 'node-webview',
+      contentRevision: 0,
+    })
+    expect(parsed.legacyContentSeeds).toEqual([
+      { kind: 'image', contentId: 'asset-1', adoptedAssetId: 'asset-1' },
+      { kind: 'document', contentId: 'visual-document-1' },
+      {
+        kind: 'webview',
+        contentId: 'node-webview',
+        legacySourceUrl: 'https://example.com/prototype',
+      },
+    ])
+    expect('url' in parsed.document.nodes[3]!).toBe(false)
+  })
+
+  test('Given v2 四类节点 When 解析 Then 严格重建且不产生迁移种子', () => {
+    /** 在已有 Agent/图片节点上补齐文档与 Webview 节点。 */
+    const document = createConnectedDocument()
+    document.nodes.push(
+      {
+        id: 'node-document', kind: 'document', title: '文档', position: { x: 20, y: 20 },
+        documentId: 'document-1', contentRevision: 5,
+      },
+      {
+        id: 'node-webview', kind: 'webview', title: '原型', position: { x: 30, y: 30 },
+        prototypeId: 'prototype-1', contentRevision: 6,
+      },
+    )
+
+    /** v2 解析结果不应携带任何旧文档迁移状态。 */
+    const parsed = parseCanvasDocument(document, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })
+
+    expect(parsed.document).toEqual(document)
+    expect(parsed.migratedFrom).toBeUndefined()
+    expect(parsed.legacyContentSeeds).toEqual([])
+  })
+
+  test('Given v2 仍包含 visual-document When 解析 Then 以文档错误拒绝', () => {
+    /** 伪造的 v2 文档仍使用已废弃节点类型。 */
+    const document = {
+      ...createConnectedDocument(),
+      nodes: [{
+        id: 'node-document', kind: 'visual-document', title: '文档', position: { x: 0, y: 0 },
+        visualDocumentId: 'document-1',
+      }],
+      edges: [],
+    }
+
+    expect(() => parseCanvasDocument(document, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })).toThrow('CANVAS_DOCUMENT_INVALID')
+  })
+
+  test('Given v1 主文件 When load Then 只返回 v2 公开快照且不回写磁盘', () => {
+    /** 真实 Store 用于验证主文件迁移只发生在内存。 */
+    const fixture = createFixture()
+    /** 磁盘原文需要在 load 后保持 v1 不变。 */
+    const legacyDocument = createLegacyDocument()
+    writeDocument(fixture.documentPath, legacyDocument)
+
+    /** 公开快照只允许包含规范化文档和既有工作区字段。 */
+    const snapshot = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
+
+    expect(snapshot.document.schemaVersion).toBe(2)
+    expect('legacyContentSeeds' in snapshot).toBe(false)
+    expect('migratedFrom' in snapshot).toBe(false)
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8'))).toEqual(legacyDocument)
+  })
+
+  test.each([
+    ['tmp', '.tmp'],
+    ['backup', '.bak'],
+  ] as const)('Given v1 %s 恢复候选 When load Then 保持恢复语义并返回规范化 v2', (source, suffix) => {
+    /** 每个恢复来源使用独立文件系统环境。 */
+    const fixture = createFixture()
+    writeDocument(fixture.documentPath, { broken: true })
+    writeDocument(`${fixture.documentPath}${suffix}`, createLegacyDocument())
+
+    /** 恢复来源保留，文档内容在返回前规范化。 */
+    const snapshot = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
+
+    expect(snapshot.recoveredFrom).toBe(source)
+    expect(snapshot.document.schemaVersion).toBe(2)
+    expect(snapshot.document.nodes.map((node) => node.kind)).toEqual([
+      'agent', 'image', 'document', 'webview',
+    ])
+    expect('legacyContentSeeds' in snapshot).toBe(false)
   })
 
   test('Given helper OPENED 等待期间 Canvas registry 撤权 When 授权 scan Then fail closed 且零扫描', () => {
@@ -793,19 +972,19 @@ describe('CanvasDocumentStore', () => {
   test.each([
     ['agent', {
       id: 'node-agent', kind: 'agent', title: 'Agent', position: { x: 0, y: 0 },
-      agentSessionId: 'session-1', assetId: 'forged',
+      agentSessionId: 'session-1', imageModuleId: 'forged',
     }],
     ['image', {
       id: 'node-image', kind: 'image', title: 'Image', position: { x: 0, y: 0 },
-      assetId: 'asset-1', agentSessionId: 'forged',
+      imageModuleId: 'image-module-1', agentSessionId: 'forged',
     }],
-    ['visual-document', {
-      id: 'node-document', kind: 'visual-document', title: 'Document', position: { x: 0, y: 0 },
-      visualDocumentId: 'document-1', url: 'https://example.com',
+    ['document', {
+      id: 'node-document', kind: 'document', title: 'Document', position: { x: 0, y: 0 },
+      documentId: 'document-1', contentRevision: 0, prototypeId: 'forged',
     }],
     ['webview', {
       id: 'node-webview', kind: 'webview', title: 'Webview', position: { x: 0, y: 0 },
-      url: 'https://example.com', visualDocumentId: 'forged',
+      prototypeId: 'prototype-1', contentRevision: 0, documentId: 'forged',
     }],
   ] as const)('Given %s 节点夹带其他类别引用 When load Then exact schema 拒绝', (_kind, node) => {
     const fixture = createFixture()
@@ -829,6 +1008,21 @@ describe('CanvasDocumentStore', () => {
     }
     expect(() => fixture.store.mutate(
       { projectId: 'project-1', canvasId: 'canvas-1' }, 0, [duplicate],
+    )).toThrow('CANVAS_MUTATION_INVALID')
+
+    /** v2 新写入不得把旧 visual-document 节点带回磁盘。 */
+    const legacyNodeMutation = {
+      type: 'upsert-nodes',
+      nodes: [{
+        id: 'node-document',
+        kind: 'visual-document',
+        title: '旧视觉文档',
+        position: { x: 0, y: 0 },
+        visualDocumentId: 'document-1',
+      }],
+    } as unknown as CanvasMutation
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' }, 0, [legacyNodeMutation],
     )).toThrow('CANVAS_MUTATION_INVALID')
 
     /** 非法端口和悬空引用同样在任何写入前失败。 */

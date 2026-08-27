@@ -12,11 +12,11 @@ import type {
   CanvasDocument,
   CanvasEdge,
   CanvasImageNode,
+  CanvasDocumentNode,
   CanvasMutation,
   CanvasNode,
   CreateCanvasAgentNodeInput,
   RebuildCanvasAgentNodeResult,
-  CanvasVisualDocumentNode,
   CanvasWebviewNode,
   CanvasWorkspaceSnapshot,
   LoadCanvasInput,
@@ -41,29 +41,32 @@ const imageNode = {
   kind: 'image',
   title: '首页主视觉',
   position: { x: 200, y: 20 },
-  assetId: 'asset-1',
+  imageModuleId: 'image-module-1',
+  adoptedAssetId: 'asset-1',
 } satisfies CanvasImageNode
 
-/** 视觉文档节点只引用独立视觉文档。 */
-const visualDocumentNode = {
+/** 文档节点只引用独立内容文档与当前修订。 */
+const documentNode = {
   id: 'node-document',
-  kind: 'visual-document',
+  kind: 'document',
   title: '品牌规范',
   position: { x: 400, y: 20 },
-  visualDocumentId: 'visual-document-1',
-} satisfies CanvasVisualDocumentNode
+  documentId: 'document-1',
+  contentRevision: 3,
+} satisfies CanvasDocumentNode
 
-/** Webview 节点只保存可恢复的页面引用。 */
+/** Webview 节点只引用独立原型内容与当前修订。 */
 const webviewNode = {
   id: 'node-webview',
   kind: 'webview',
   title: '交互原型',
   position: { x: 600, y: 20 },
-  url: 'https://example.com/prototype',
+  prototypeId: 'prototype-1',
+  contentRevision: 4,
 } satisfies CanvasWebviewNode
 
 /** 四类节点组成的联合类型样例，用于锁定 discriminant。 */
-const nodeContracts = [agentNode, imageNode, visualDocumentNode, webviewNode] satisfies CanvasNode[]
+const nodeContracts = [agentNode, imageNode, documentNode, webviewNode] satisfies CanvasNode[]
 
 /** Agent 节点禁止把消息历史复制进 Canvas 文档。 */
 // @ts-expect-error messages 归 Agent 会话持久化所有，不属于 Canvas 节点合同。
@@ -71,7 +74,7 @@ const agentNodeWithMessages: CanvasAgentNode = { ...agentNode, messages: [] }
 
 /** 节点引用字段必须互斥，避免一个节点同时拥有多个业务身份。 */
 // @ts-expect-error Agent 节点不能同时引用图片素材。
-const agentNodeWithAsset: CanvasNode = { ...agentNode, assetId: 'asset-1' }
+const agentNodeWithImageModule: CanvasNode = { ...agentNode, imageModuleId: 'image-module-1' }
 
 /** 创建带节点和边的测试文档。
  * @returns revision 固定为 7 的独立 Canvas 文档。
@@ -80,7 +83,7 @@ function createDocument(): CanvasDocument {
   return {
     ...createEmptyCanvasDocument('project-1', 'canvas-1', now),
     revision: 7,
-    nodes: [agentNode, imageNode, visualDocumentNode],
+    nodes: [agentNode, imageNode, documentNode],
     edges: [
       {
         id: 'edge-agent-image',
@@ -91,7 +94,7 @@ function createDocument(): CanvasDocument {
       },
       {
         id: 'edge-document-image',
-        sourceNodeId: visualDocumentNode.id,
+        sourceNodeId: documentNode.id,
         sourcePort: 'content',
         targetNodeId: imageNode.id,
         targetPort: 'reference',
@@ -206,8 +209,9 @@ describe('Canvas 图共享合同', () => {
     /** 新 Canvas 的空文档。 */
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', now)
 
+    expect(CANVAS_DOCUMENT_VERSION).toBe(2)
     expect(document).toEqual({
-      schemaVersion: CANVAS_DOCUMENT_VERSION,
+      schemaVersion: 2,
       projectId: 'project-1',
       canvasId: 'canvas-1',
       revision: 0,
@@ -221,21 +225,28 @@ describe('Canvas 图共享合同', () => {
 
   test('Given 四类节点 When 读取联合类型 Then discriminant 与唯一引用字段保持对应', () => {
     /** 所有业务引用字段，用于验证每类节点只携带自身引用。 */
-    const referenceFields = ['agentSessionId', 'assetId', 'visualDocumentId', 'url']
+    const referenceFields = [
+      'agentSessionId',
+      'imageModuleId',
+      'adoptedAssetId',
+      'documentId',
+      'prototypeId',
+      'contentRevision',
+    ]
     /** 各节点实际携带的业务引用字段。 */
     const actualReferences = nodeContracts.map((node) => referenceFields.filter((field) => field in node))
 
     expect(nodeContracts.map((node) => node.kind)).toEqual([
       'agent',
       'image',
-      'visual-document',
+      'document',
       'webview',
     ])
     expect(actualReferences).toEqual([
       ['agentSessionId'],
-      ['assetId'],
-      ['visualDocumentId'],
-      ['url'],
+      ['imageModuleId', 'adoptedAssetId'],
+      ['documentId', 'contentRevision'],
+      ['prototypeId', 'contentRevision'],
     ])
     expect('messages' in agentNode).toBe(false)
   })
@@ -278,7 +289,7 @@ describe('Canvas 图共享合同', () => {
     expect(result.nodes.map((node) => [node.id, node.position])).toEqual([
       [agentNode.id, agentNode.position],
       [imageNode.id, { x: 250, y: 80 }],
-      [visualDocumentNode.id, visualDocumentNode.position],
+      [documentNode.id, documentNode.position],
     ])
     expect(result.revision).toBe(7)
     expect(document.nodes[1]).toEqual(imageNode)
@@ -294,7 +305,7 @@ describe('Canvas 图共享合同', () => {
     /** 替换已有边后的新值。 */
     const updatedEdge: CanvasEdge = {
       id: 'edge-document-image',
-      sourceNodeId: visualDocumentNode.id,
+      sourceNodeId: documentNode.id,
       sourcePort: 'summary',
       targetNodeId: imageNode.id,
       targetPort: 'reference',
@@ -316,7 +327,7 @@ describe('Canvas 图共享合同', () => {
     expect(result.nodes.map((node) => node.id)).toEqual([
       agentNode.id,
       imageNode.id,
-      visualDocumentNode.id,
+      documentNode.id,
       webviewNode.id,
     ])
     expect(result.nodes[1]).toEqual(updatedImageNode)
@@ -334,7 +345,7 @@ describe('Canvas 图共享合同', () => {
       { type: 'remove-nodes', nodeIds: [imageNode.id] },
     ])
 
-    expect(result.nodes.map((node) => node.id)).toEqual([agentNode.id, visualDocumentNode.id])
+    expect(result.nodes.map((node) => node.id)).toEqual([agentNode.id, documentNode.id])
     expect(result.edges).toEqual([])
     expect(result.revision).toBe(7)
   })
@@ -349,7 +360,7 @@ describe('Canvas 图共享合同', () => {
     expect(result.nodes.map((node) => node.id)).toEqual([
       agentNode.id,
       imageNode.id,
-      visualDocumentNode.id,
+      documentNode.id,
     ])
     expect(result.edges.map((edge) => edge.id)).toEqual(['edge-document-image'])
     expect(result.revision).toBe(7)
@@ -387,7 +398,7 @@ describe('Canvas 图共享合同', () => {
       id: 'edge-agent-document',
       sourceNodeId: agentNode.id,
       sourcePort: 'output',
-      targetNodeId: visualDocumentNode.id,
+      targetNodeId: documentNode.id,
       targetPort: 'input',
     }
     /** 覆盖四条对象引用写入路径的 mutation 批次。 */
@@ -418,4 +429,4 @@ describe('Canvas 图共享合同', () => {
 })
 
 void agentNodeWithMessages
-void agentNodeWithAsset
+void agentNodeWithImageModule

@@ -16,10 +16,10 @@ export const CANVAS_IPC_CHANNELS = {
 } as const
 
 /** 独立 Canvas 图文档的当前 schema 版本。 */
-export const CANVAS_DOCUMENT_VERSION = 1
+export const CANVAS_DOCUMENT_VERSION = 2
 
 /** Canvas 支持的节点类别，每类节点只引用自身业务事实源。 */
-export type CanvasNodeKind = 'agent' | 'image' | 'visual-document' | 'webview'
+export type CanvasNodeKind = 'agent' | 'image' | 'document' | 'webview'
 
 /** Canvas 节点共享的展示和布局字段。 */
 export interface CanvasNodeBase {
@@ -33,44 +33,52 @@ export interface CanvasNodeBase {
 export interface CanvasAgentNode extends CanvasNodeBase {
   kind: 'agent'
   agentSessionId: string
-  assetId?: never
-  visualDocumentId?: never
-  url?: never
+  imageModuleId?: never
+  adoptedAssetId?: never
+  documentId?: never
+  prototypeId?: never
+  contentRevision?: never
   messages?: never
 }
 
 /** 引用 Canvas 图片素材的节点。 */
 export interface CanvasImageNode extends CanvasNodeBase {
   kind: 'image'
-  assetId: string
+  imageModuleId: string
+  adoptedAssetId?: string
   agentSessionId?: never
-  visualDocumentId?: never
-  url?: never
+  documentId?: never
+  prototypeId?: never
+  contentRevision?: never
 }
 
-/** 引用独立视觉文档的节点。 */
-export interface CanvasVisualDocumentNode extends CanvasNodeBase {
-  kind: 'visual-document'
-  visualDocumentId: string
+/** 引用独立内容文档及其当前修订的节点。 */
+export interface CanvasDocumentNode extends CanvasNodeBase {
+  kind: 'document'
+  documentId: string
+  contentRevision: number
   agentSessionId?: never
-  assetId?: never
-  url?: never
+  imageModuleId?: never
+  adoptedAssetId?: never
+  prototypeId?: never
 }
 
-/** 引用可恢复页面地址的 Webview 节点。 */
+/** 引用独立原型内容及其当前修订的 Webview 节点。 */
 export interface CanvasWebviewNode extends CanvasNodeBase {
   kind: 'webview'
-  url: string
+  prototypeId: string
+  contentRevision: number
   agentSessionId?: never
-  assetId?: never
-  visualDocumentId?: never
+  imageModuleId?: never
+  adoptedAssetId?: never
+  documentId?: never
 }
 
 /** Canvas 中四类互斥业务引用节点。 */
 export type CanvasNode =
   | CanvasAgentNode
   | CanvasImageNode
-  | CanvasVisualDocumentNode
+  | CanvasDocumentNode
   | CanvasWebviewNode
 
 /** 连接两个节点稳定端口的数据或任务边。 */

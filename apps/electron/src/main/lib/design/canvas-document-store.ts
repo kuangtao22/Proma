@@ -105,7 +105,7 @@ export interface CanvasDocumentStoreOptions {
   /** 返回当前有限时间戳，测试可注入固定值。 */
   now?: () => number
   /** 完整文档 schema 解析器，测试可统计全量校验次数。 */
-  validateDocument?: (value: unknown, target: CanvasTarget) => CanvasDocument
+  validateDocument?: (value: unknown, target: CanvasTarget) => ParsedCanvasDocument
   /** 主提交使用的 safe-file 写边界，测试可统计提交次数。 */
   writeJsonFileAtomicSecure?: (
     filePath: string,
@@ -120,6 +120,21 @@ export interface CanvasDocumentStoreOptions {
   beforeConsumeRecoveredTemporary?: (temporaryPath: string) => void
   /** 主提交 durable 但 previous backup 降级时的非阻塞告警。 */
   onRecoveryDegraded?: (message: string, error: AtomicWritePostCommitError) => void
+}
+
+/** v1 节点迁移后供后续内容目录落盘的主进程私有种子。 */
+export interface LegacyCanvasContentSeed {
+  kind: 'image' | 'document' | 'webview'
+  contentId: string
+  adoptedAssetId?: string
+  legacySourceUrl?: string
+}
+
+/** 严格解析后的 v2 文档与不对 Renderer 公开的迁移上下文。 */
+export interface ParsedCanvasDocument {
+  document: CanvasDocument
+  migratedFrom?: 1
+  legacyContentSeeds: LegacyCanvasContentSeed[]
 }
 
 /** 未知 JSON 普通对象的安全索引结构。 */
@@ -153,13 +168,13 @@ interface CanvasFileStat {
 /** 单个主/tmp/bak 候选的安全读取结果。 */
 interface CanvasCandidateState {
   exists: boolean
-  document: CanvasDocument | null
+  parsedDocument: ParsedCanvasDocument | null
   state?: AtomicFileState
 }
 
 /** 整条恢复链的权威读取结果。 */
 interface CanvasDocumentReadResult {
-  document: CanvasDocument | null
+  parsedDocument: ParsedCanvasDocument | null
   primaryExpectation: AtomicDestinationExpectation
   recoveredFrom?: NonNullable<CanvasWorkspaceSnapshot['recoveredFrom']>
   hasCandidate: boolean
@@ -221,7 +236,7 @@ function parseViewport(value: unknown, message: string): { x: number; y: number;
   return { x: value.x, y: value.y, zoom: value.zoom }
 }
 
-/** 严格解析四类互斥引用节点并重建对象。 */
+/** 严格解析 v2 四类互斥引用节点并重建对象。 */
 function parseCanvasNode(value: unknown, message: string): CanvasNode {
   if (!isRecord(value)
     || !isSafeDesignStableId(value.id)
@@ -236,25 +251,141 @@ function parseCanvasNode(value: unknown, message: string): CanvasNode {
     return { id: value.id, kind: 'agent', title: value.title, position, agentSessionId: value.agentSessionId }
   }
   if (value.kind === 'image'
+    && (hasExactKeys(value, ['id', 'kind', 'title', 'position', 'imageModuleId'])
+      || hasExactKeys(value, [
+        'id', 'kind', 'title', 'position', 'imageModuleId', 'adoptedAssetId',
+      ]))
+    && isSafeDesignStableId(value.imageModuleId)
+    && (value.adoptedAssetId === undefined || isSafeDesignStableId(value.adoptedAssetId))) {
+    return {
+      id: value.id,
+      kind: 'image',
+      title: value.title,
+      position,
+      imageModuleId: value.imageModuleId,
+      ...(value.adoptedAssetId === undefined ? {} : { adoptedAssetId: value.adoptedAssetId }),
+    }
+  }
+  if (value.kind === 'document'
+    && hasExactKeys(value, [
+      'id', 'kind', 'title', 'position', 'documentId', 'contentRevision',
+    ])
+    && isSafeDesignStableId(value.documentId)
+    && Number.isSafeInteger(value.contentRevision)
+    && (value.contentRevision as number) >= 0) {
+    return {
+      id: value.id,
+      kind: 'document',
+      title: value.title,
+      position,
+      documentId: value.documentId,
+      contentRevision: value.contentRevision as number,
+    }
+  }
+  if (value.kind === 'webview'
+    && hasExactKeys(value, [
+      'id', 'kind', 'title', 'position', 'prototypeId', 'contentRevision',
+    ])
+    && isSafeDesignStableId(value.prototypeId)
+    && Number.isSafeInteger(value.contentRevision)
+    && (value.contentRevision as number) >= 0) {
+    return {
+      id: value.id,
+      kind: 'webview',
+      title: value.title,
+      position,
+      prototypeId: value.prototypeId,
+      contentRevision: value.contentRevision as number,
+    }
+  }
+  throw new Error(message)
+}
+
+/** v1 节点规范化结果，内容种子只保留在主进程。 */
+interface ParsedLegacyCanvasNode {
+  node: CanvasNode
+  legacyContentSeed?: LegacyCanvasContentSeed
+}
+
+/**
+ * 严格解析 v1 节点并重建为 v2 节点与内容种子。
+ * @param value 从 v1 文档节点数组取得的未知值。
+ * @param message 严格校验失败时保持的上层错误码。
+ * @returns 规范化节点，以及非 Agent 节点可选的私有迁移种子。
+ */
+function parseLegacyCanvasNode(value: unknown, message: string): ParsedLegacyCanvasNode {
+  if (!isRecord(value)
+    || !isSafeDesignStableId(value.id)
+    || !isBoundedNonEmptyString(value.title, CANVAS_NODE_TITLE_MAX_LENGTH)) {
+    throw new Error(message)
+  }
+  /** 旧节点位置与 v2 共用有限坐标合同。 */
+  const position = parsePoint(value.position, message)
+  if (value.kind === 'agent'
+    && hasExactKeys(value, ['id', 'kind', 'title', 'position', 'agentSessionId'])
+    && isSafeDesignStableId(value.agentSessionId)) {
+    return {
+      node: {
+        id: value.id,
+        kind: 'agent',
+        title: value.title,
+        position,
+        agentSessionId: value.agentSessionId,
+      },
+    }
+  }
+  if (value.kind === 'image'
     && hasExactKeys(value, ['id', 'kind', 'title', 'position', 'assetId'])
     && isSafeDesignStableId(value.assetId)) {
-    return { id: value.id, kind: 'image', title: value.title, position, assetId: value.assetId }
+    return {
+      node: {
+        id: value.id,
+        kind: 'image',
+        title: value.title,
+        position,
+        imageModuleId: value.assetId,
+        adoptedAssetId: value.assetId,
+      },
+      legacyContentSeed: {
+        kind: 'image',
+        contentId: value.assetId,
+        adoptedAssetId: value.assetId,
+      },
+    }
   }
   if (value.kind === 'visual-document'
     && hasExactKeys(value, ['id', 'kind', 'title', 'position', 'visualDocumentId'])
     && isSafeDesignStableId(value.visualDocumentId)) {
     return {
-      id: value.id,
-      kind: 'visual-document',
-      title: value.title,
-      position,
-      visualDocumentId: value.visualDocumentId,
+      node: {
+        id: value.id,
+        kind: 'document',
+        title: value.title,
+        position,
+        documentId: value.visualDocumentId,
+        contentRevision: 0,
+      },
+      legacyContentSeed: { kind: 'document', contentId: value.visualDocumentId },
     }
   }
   if (value.kind === 'webview'
     && hasExactKeys(value, ['id', 'kind', 'title', 'position', 'url'])
     && isBoundedNonEmptyString(value.url, 2_048)) {
-    return { id: value.id, kind: 'webview', title: value.title, position, url: value.url }
+    return {
+      node: {
+        id: value.id,
+        kind: 'webview',
+        title: value.title,
+        position,
+        prototypeId: value.id,
+        contentRevision: 0,
+      },
+      legacyContentSeed: {
+        kind: 'webview',
+        contentId: value.id,
+        legacySourceUrl: value.url,
+      },
+    }
   }
   throw new Error(message)
 }
@@ -289,9 +420,9 @@ function assertUniqueIds(items: readonly { id: string }[], message: string): voi
  * 严格解析未知 Canvas 文档，逐字段重建并校验双重身份与跨实体引用。
  * @param value JSON 解析结果或 mutation 归约后的未知文档。
  * @param target 当前已授权项目与 Canvas 身份。
- * @returns 不携带未知字段和外部原型的完整 Canvas 文档。
+ * @returns 规范化 v2 文档与主进程私有迁移上下文。
  */
-export function parseCanvasDocument(value: unknown, target: CanvasTarget): CanvasDocument {
+export function parseCanvasDocument(value: unknown, target: CanvasTarget): ParsedCanvasDocument {
   const fields = [
     'schemaVersion',
     'projectId',
@@ -305,7 +436,7 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Canva
   ] as const
   if (!isRecord(value)
     || !hasExactKeys(value, fields)
-    || value.schemaVersion !== CANVAS_DOCUMENT_VERSION
+    || (value.schemaVersion !== 1 && value.schemaVersion !== CANVAS_DOCUMENT_VERSION)
     || value.projectId !== target.projectId
     || value.canvasId !== target.canvasId
     || !Number.isSafeInteger(value.revision)
@@ -319,8 +450,17 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Canva
   }
   /** 基础字段通过后使用局部变量保持 unknown 收窄稳定。 */
   const revision = value.revision as number
+  /** v1 需要同时产生规范化节点与不公开的内容种子。 */
+  const legacyContentSeeds: LegacyCanvasContentSeed[] = []
   /** 节点和边逐项重建，拒绝未知字段和互斥引用混用。 */
-  const nodes = value.nodes.map((node) => parseCanvasNode(node, 'CANVAS_DOCUMENT_INVALID'))
+  const nodes = value.schemaVersion === 1
+    ? value.nodes.map((node) => {
+      /** 单节点迁移结果的 seed 与节点顺序保持稳定。 */
+      const parsed = parseLegacyCanvasNode(node, 'CANVAS_DOCUMENT_INVALID')
+      if (parsed.legacyContentSeed) legacyContentSeeds.push(parsed.legacyContentSeed)
+      return parsed.node
+    })
+    : value.nodes.map((node) => parseCanvasNode(node, 'CANVAS_DOCUMENT_INVALID'))
   const edges = value.edges.map((edge) => parseCanvasEdge(edge, 'CANVAS_DOCUMENT_INVALID'))
   assertUniqueIds(nodes, 'CANVAS_DOCUMENT_INVALID')
   assertUniqueIds(edges, 'CANVAS_DOCUMENT_INVALID')
@@ -330,15 +470,19 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Canva
     throw new Error('CANVAS_DOCUMENT_INVALID')
   }
   return {
-    schemaVersion: CANVAS_DOCUMENT_VERSION,
-    projectId: target.projectId,
-    canvasId: target.canvasId,
-    revision,
-    viewport: parseViewport(value.viewport, 'CANVAS_DOCUMENT_INVALID'),
-    nodes,
-    edges,
-    createdAt: value.createdAt,
-    updatedAt: value.updatedAt,
+    document: {
+      schemaVersion: CANVAS_DOCUMENT_VERSION,
+      projectId: target.projectId,
+      canvasId: target.canvasId,
+      revision,
+      viewport: parseViewport(value.viewport, 'CANVAS_DOCUMENT_INVALID'),
+      nodes,
+      edges,
+      createdAt: value.createdAt,
+      updatedAt: value.updatedAt,
+    },
+    ...(value.schemaVersion === 1 ? { migratedFrom: 1 as const } : {}),
+    legacyContentSeeds,
   }
 }
 
@@ -606,7 +750,7 @@ function readCanvasCandidate(
   candidatePath: string,
   target: CanvasTarget,
   directoryIdentity: CanvasDirectoryIdentity,
-  validateDocument: (value: unknown, target: CanvasTarget) => CanvasDocument,
+  validateDocument: (value: unknown, target: CanvasTarget) => ParsedCanvasDocument,
   afterCandidateRead?: (candidatePath: string) => void,
 ): CanvasCandidateState {
   if (dirname(candidatePath) !== directoryIdentity.path) {
@@ -615,7 +759,7 @@ function readCanvasCandidate(
   assertDirectoryIdentity(directoryIdentity)
   /** 打开前不跟随 symlink 的路径状态。 */
   const pathStats = lstatOrNull(candidatePath)
-  if (!pathStats) return { exists: false, document: null }
+  if (!pathStats) return { exists: false, parsedDocument: null }
   if (pathStats.isSymbolicLink() || !pathStats.isFile()) {
     throw unsafeCanvasPath(`文档候选不是实际文件: ${candidatePath}`)
   }
@@ -633,11 +777,11 @@ function readCanvasCandidate(
     /** 从稳定 descriptor 读取候选原文。 */
     const raw = readFileSync(descriptor, 'utf8')
     /** 解析失败只标记候选损坏，仍必须完成读取后的身份复验。 */
-    let document: CanvasDocument | null = null
+    let parsedDocument: ParsedCanvasDocument | null = null
     try {
       /** 所有 JSON.parse 结果按 unknown 进入严格 validator。 */
       const value: unknown = JSON.parse(raw)
-      document = validateDocument(value, target)
+      parsedDocument = validateDocument(value, target)
     } catch { /* schema 或 JSON 损坏由恢复链继续处理。 */ }
     afterCandidateRead?.(candidatePath)
     /** 解析后 fd 的身份、大小和修改时间都必须与打开前一致。 */
@@ -656,7 +800,7 @@ function readCanvasCandidate(
     assertDirectoryIdentity(directoryIdentity)
     return {
       exists: true,
-      document,
+      parsedDocument,
       state: initialState,
     }
   } finally {
@@ -669,7 +813,7 @@ function readCanvasDocument(
   paths: CanvasPaths,
   target: CanvasTarget,
   directoryIdentity: CanvasDirectoryIdentity,
-  validateDocument: (value: unknown, target: CanvasTarget) => CanvasDocument,
+  validateDocument: (value: unknown, target: CanvasTarget) => ParsedCanvasDocument,
   afterCandidateRead?: (candidatePath: string) => void,
 ): CanvasDocumentReadResult {
   /** 当前正式主文件候选。 */
@@ -680,17 +824,17 @@ function readCanvasDocument(
   const primaryExpectation: AtomicDestinationExpectation = primary.state
     ? { kind: 'state', state: primary.state }
     : { kind: 'missing' }
-  if (primary.document) {
-    return { document: primary.document, primaryExpectation, hasCandidate: true }
+  if (primary.parsedDocument) {
+    return { parsedDocument: primary.parsedDocument, primaryExpectation, hasCandidate: true }
   }
   /** 上次固定恢复流程遗留的 tmp 候选。 */
   const temporary = readCanvasCandidate(
     `${paths.documentPath}.tmp`, target, directoryIdentity, validateDocument, afterCandidateRead,
   )
-  if (temporary.document) {
+  if (temporary.parsedDocument) {
     if (!temporary.state) throw unsafeCanvasPath('tmp 候选缺少稳定状态')
     return {
-      document: temporary.document,
+      parsedDocument: temporary.parsedDocument,
       primaryExpectation,
       recoveredFrom: 'tmp',
       recoveredState: temporary.state,
@@ -701,9 +845,9 @@ function readCanvasDocument(
   const backup = readCanvasCandidate(
     `${paths.documentPath}.bak`, target, directoryIdentity, validateDocument, afterCandidateRead,
   )
-  if (backup.document) {
+  if (backup.parsedDocument) {
     return {
-      document: backup.document,
+      parsedDocument: backup.parsedDocument,
       primaryExpectation,
       recoveredFrom: 'backup',
       recoveredState: backup.state,
@@ -711,7 +855,7 @@ function readCanvasDocument(
     }
   }
   return {
-    document: null,
+    parsedDocument: null,
     primaryExpectation,
     hasCandidate: primary.exists || temporary.exists || backup.exists,
   }
@@ -813,6 +957,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
   /** 内部加载结果额外保留读取期主状态，公开接口不泄露文件系统信息。 */
   function loadWithAuthoritativeState(target: CanvasTarget): {
     snapshot: CanvasWorkspaceSnapshot
+    parsedDocument: ParsedCanvasDocument
     primaryExpectation: AtomicDestinationExpectation
     authorized: ReturnType<typeof resolveAuthorizedTarget>
   } {
@@ -826,17 +971,22 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
       validateDocument,
       options.afterCandidateRead,
     )
-    if (!readResult.document && readResult.hasCandidate) {
+    if (!readResult.parsedDocument && readResult.hasCandidate) {
       throw new Error(`CANVAS_DOCUMENT_CORRUPT: ${target.projectId}/${target.canvasId}`)
     }
-    if (readResult.document && readResult.recoveredFrom) {
+    /** 缺失文档与磁盘解析结果统一为内部完整解析合同。 */
+    const parsedDocument = readResult.parsedDocument ?? {
+      document: createEmptyCanvasDocument(target.projectId, target.canvasId, requireNow(now)),
+      legacyContentSeeds: [],
+    }
+    if (readResult.parsedDocument && readResult.recoveredFrom) {
       /** 恢复候选先安全提升，随后 tmp 才能被原子消费。 */
       try {
         writeCanvasJsonSecure(
           authorized.paths,
           authorized.directoryIdentity,
           authorized.paths.documentPath,
-          readResult.document,
+          readResult.parsedDocument.document,
           { expectedDestination: readResult.primaryExpectation },
         )
       } catch (error) {
@@ -874,12 +1024,12 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     }
     return {
       snapshot: {
-        document: readResult.document
-          ?? createEmptyCanvasDocument(target.projectId, target.canvasId, requireNow(now)),
+        document: parsedDocument.document,
         writable: true,
         nodeIssues: [],
         ...(readResult.recoveredFrom ? { recoveredFrom: readResult.recoveredFrom } : {}),
       },
+      parsedDocument,
       primaryExpectation: readResult.primaryExpectation,
       authorized,
     }
@@ -972,7 +1122,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
         ...mutated,
         revision: current.revision + 1,
         updatedAt,
-      }, target)
+      }, target).document
     } catch (error) {
       throw new Error('CANVAS_MUTATION_INVALID', { cause: error })
     }
