@@ -33,6 +33,10 @@ export interface CanvasPaths {
   documentPath: string
   /** 可恢复创建等小型事务 tombstone 的正式目录。 */
   transactionsDir: string
+  /** 非 Agent 节点受管内容目录。 */
+  nodesDir: string
+  /** 非 Agent 节点可恢复删除目录。 */
+  trashDir: string
   cacheRoot: string
   jobsDir: string
   tracesDir: string
@@ -145,6 +149,8 @@ export function createDesignPathResolver(
         canvasRoot,
         documentPath: join(canvasRoot, 'canvas.json'),
         transactionsDir: join(canvasRoot, 'transactions'),
+        nodesDir: join(canvasRoot, 'nodes'),
+        trashDir: join(canvasRoot, 'trash'),
         cacheRoot: canvasCacheRoot,
         jobsDir: join(canvasCacheRoot, 'jobs'),
         tracesDir: join(canvasCacheRoot, 'traces'),

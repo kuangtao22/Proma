@@ -21,6 +21,132 @@ export const CANVAS_DOCUMENT_VERSION = 2
 /** Canvas 支持的节点类别，每类节点只引用自身业务事实源。 */
 export type CanvasNodeKind = 'agent' | 'image' | 'document' | 'webview'
 
+/** 拥有独立受管内容目录的非 Agent 节点类别。 */
+export type CanvasContentKind = Exclude<CanvasNodeKind, 'agent'>
+
+/** 非 Agent 节点内容目录的最终身份提交标记。 */
+export interface CanvasNodeContentMeta {
+  schemaVersion: 1
+  kind: CanvasContentKind
+  contentId: string
+  revision: number
+  createdAt: number
+  updatedAt: number
+}
+
+/** Renderer 可见的 Canvas 回收区条目，不包含任何磁盘路径。 */
+export interface CanvasTrashEntry {
+  schemaVersion: 1
+  trashId: string
+  nodeId: string
+  kind: CanvasContentKind
+  contentId: string
+  title: string
+  position: DesignPoint
+  deletedRevision: number
+  deletedAt: number
+}
+
+/** Canvas 内容稳定 ID 的共享边界，与 native helper 合同保持一致。 */
+const CANVAS_CONTENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
+/** Canvas 回收条目标题上限，避免无界数据进入 Renderer。 */
+const CANVAS_TRASH_TITLE_MAX_LENGTH = 120
+
+/** 判断未知值是否为无未知字段的普通记录。 */
+function hasExactCanvasKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  /** 实际字段排序后用于与固定合同逐项比较。 */
+  const actualKeys = Object.keys(value).sort()
+  /** 期望字段排序后避免调用方顺序影响判断。 */
+  const expectedKeys = [...keys].sort()
+  return actualKeys.length === expectedKeys.length
+    && actualKeys.every((key, index) => key === expectedKeys[index])
+}
+
+/** 判断未知值是否为非负安全整数。 */
+function isCanvasNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+/** 判断未知值是否为受限的 Canvas 内容类别。 */
+function isCanvasContentKind(value: unknown): value is CanvasContentKind {
+  return value === 'image' || value === 'document' || value === 'webview'
+}
+
+/**
+ * 严格解析非 Agent 节点内容身份。
+ * @param value 待解析的未知磁盘或进程边界值。
+ * @returns 无未知字段、数值有限且 ID 安全的内容元数据。
+ */
+export function parseCanvasNodeContentMeta(value: unknown): CanvasNodeContentMeta {
+  /** 内容元数据允许的完整字段集合。 */
+  const keys = ['schemaVersion', 'kind', 'contentId', 'revision', 'createdAt', 'updatedAt'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || value.schemaVersion !== 1
+    || !isCanvasContentKind(value.kind)
+    || typeof value.contentId !== 'string'
+    || !CANVAS_CONTENT_ID_PATTERN.test(value.contentId)
+    || !isCanvasNonNegativeInteger(value.revision)
+    || !isCanvasNonNegativeInteger(value.createdAt)
+    || !isCanvasNonNegativeInteger(value.updatedAt)) {
+    throw new Error('CANVAS_CONTENT_META_INVALID')
+  }
+  return {
+    schemaVersion: 1,
+    kind: value.kind,
+    contentId: value.contentId,
+    revision: value.revision,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  }
+}
+
+/**
+ * 严格解析 Renderer 可见回收区条目。
+ * @param value 待解析的未知磁盘或进程边界值。
+ * @returns 不含路径、字段有界且坐标有限的回收条目。
+ */
+export function parseCanvasTrashEntry(value: unknown): CanvasTrashEntry {
+  /** 回收条目允许的完整字段集合。 */
+  const keys = [
+    'schemaVersion', 'trashId', 'nodeId', 'kind', 'contentId', 'title',
+    'position', 'deletedRevision', 'deletedAt',
+  ] as const
+  /** 坐标对象允许的完整字段集合。 */
+  const positionKeys = ['x', 'y'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || value.schemaVersion !== 1
+    || typeof value.trashId !== 'string'
+    || !CANVAS_CONTENT_ID_PATTERN.test(value.trashId)
+    || typeof value.nodeId !== 'string'
+    || !CANVAS_CONTENT_ID_PATTERN.test(value.nodeId)
+    || !isCanvasContentKind(value.kind)
+    || typeof value.contentId !== 'string'
+    || !CANVAS_CONTENT_ID_PATTERN.test(value.contentId)
+    || typeof value.title !== 'string'
+    || value.title.length > CANVAS_TRASH_TITLE_MAX_LENGTH
+    || !hasExactCanvasKeys(value.position, positionKeys)
+    || typeof value.position.x !== 'number'
+    || !Number.isFinite(value.position.x)
+    || typeof value.position.y !== 'number'
+    || !Number.isFinite(value.position.y)
+    || !isCanvasNonNegativeInteger(value.deletedRevision)
+    || !isCanvasNonNegativeInteger(value.deletedAt)) {
+    throw new Error('CANVAS_TRASH_ENTRY_INVALID')
+  }
+  return {
+    schemaVersion: 1,
+    trashId: value.trashId,
+    nodeId: value.nodeId,
+    kind: value.kind,
+    contentId: value.contentId,
+    title: value.title,
+    position: { x: value.position.x, y: value.position.y },
+    deletedRevision: value.deletedRevision,
+    deletedAt: value.deletedAt,
+  }
+}
+
 /** Canvas 节点共享的展示和布局字段。 */
 export interface CanvasNodeBase {
   id: string

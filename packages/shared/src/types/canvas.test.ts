@@ -4,6 +4,8 @@ import {
   CANVAS_DOCUMENT_VERSION,
   applyCanvasMutations,
   createEmptyCanvasDocument,
+  parseCanvasNodeContentMeta,
+  parseCanvasTrashEntry,
 } from './canvas'
 import type {
   CanvasChangeEvent,
@@ -104,6 +106,67 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given 合法内容元数据和回收条目 When 严格解析 Then 保留公开字段且不暴露路径', () => {
+    /** 内容目录最终提交标记。 */
+    const meta = parseCanvasNodeContentMeta({
+      schemaVersion: 1,
+      kind: 'document',
+      contentId: 'content-1',
+      revision: 0,
+      createdAt: 100,
+      updatedAt: 100,
+    })
+    /** Renderer 可见的回收区条目。 */
+    const entry = parseCanvasTrashEntry({
+      schemaVersion: 1,
+      trashId: 'trash-1',
+      nodeId: 'node-1',
+      kind: 'document',
+      contentId: 'content-1',
+      title: '首页说明',
+      position: { x: 10, y: 20 },
+      deletedRevision: 3,
+      deletedAt: 200,
+    })
+
+    expect(meta.kind).toBe('document')
+    expect(entry.position).toEqual({ x: 10, y: 20 })
+    expect('path' in entry).toBe(false)
+  })
+
+  test('Given 越界或未知内容合同 When 严格解析 Then fail closed', () => {
+    /** 合法元数据基线。 */
+    const meta = {
+      schemaVersion: 1,
+      kind: 'image',
+      contentId: 'content-1',
+      revision: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    /** 合法回收条目基线。 */
+    const entry = {
+      schemaVersion: 1,
+      trashId: 'trash-1',
+      nodeId: 'node-1',
+      kind: 'image',
+      contentId: 'content-1',
+      title: '图片',
+      position: { x: 0, y: 0 },
+      deletedRevision: 1,
+      deletedAt: 1,
+    }
+
+    expect(() => parseCanvasNodeContentMeta({ ...meta, contentId: 'x'.repeat(129) })).toThrow()
+    expect(() => parseCanvasNodeContentMeta({ ...meta, contentId: '../escape' })).toThrow()
+    expect(() => parseCanvasNodeContentMeta({ ...meta, revision: -1 })).toThrow()
+    expect(() => parseCanvasNodeContentMeta({ ...meta, createdAt: Number.NaN })).toThrow()
+    expect(() => parseCanvasNodeContentMeta({ ...meta, extra: true })).toThrow()
+    expect(() => parseCanvasTrashEntry({ ...entry, position: { x: Infinity, y: 0 } })).toThrow()
+    expect(() => parseCanvasTrashEntry({ ...entry, title: 'x'.repeat(121) })).toThrow()
+    expect(() => parseCanvasTrashEntry({ ...entry, unknown: true })).toThrow()
+  })
+
   test('Given 原生 Canvas IPC When 构造公开合同 Then 只暴露双重身份、revision 与恢复来源', () => {
     /** 加载请求必须同时绑定项目与 Canvas。 */
     const loadInput: LoadCanvasInput = { projectId: 'project-1', canvasId: 'canvas-1' }

@@ -44,6 +44,8 @@ describe('Design 路径解析', () => {
       canvasRoot: '/projects/demo/.proma/design/canvases/canvas-1',
       documentPath: '/projects/demo/.proma/design/canvases/canvas-1/canvas.json',
       transactionsDir: '/projects/demo/.proma/design/canvases/canvas-1/transactions',
+      nodesDir: '/projects/demo/.proma/design/canvases/canvas-1/nodes',
+      trashDir: '/projects/demo/.proma/design/canvases/canvas-1/trash',
       cacheRoot: '/home/test/.proma/design-cache/project-1/canvases/canvas-1',
       jobsDir: '/home/test/.proma/design-cache/project-1/canvases/canvas-1/jobs',
       tracesDir: '/home/test/.proma/design-cache/project-1/canvases/canvas-1/traces',
