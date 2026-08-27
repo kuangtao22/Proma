@@ -75,6 +75,26 @@ interface CanvasContentScopes {
   trash?: CanvasTrustedDirectoryCapability
 }
 
+/** 可被列表隔离的单项内容错误码。 */
+type CanvasContentItemErrorCode = 'CANVAS_CONTENT_CORRUPT' | 'CANVAS_TRASH_ENTRY_INVALID'
+
+/** 标记单个 entry 自身损坏，避免误吞授权或 helper 基础设施错误。 */
+class CanvasContentItemError extends Error {
+  /** 单项错误的稳定类别。 */
+  readonly code: CanvasContentItemErrorCode
+
+  /**
+   * 创建可辨识的单项内容错误。
+   * @param code 稳定错误类别。
+   * @param detail 不含路径的损坏详情。
+   */
+  constructor(code: CanvasContentItemErrorCode, detail: string) {
+    super(`${code}: ${detail}`)
+    this.name = 'CanvasContentItemError'
+    this.code = code
+  }
+}
+
 /** 判断未知值是否为无未知字段的普通记录。 */
 function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -106,12 +126,17 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** 仅识别可被回收区列表隔离的单项磁盘内容损坏。 */
+function isIsolatedTrashItemError(error: unknown): boolean {
+  return error instanceof CanvasContentItemError
+}
+
 /** 严格解析 JSON，语法错误统一按内容损坏处理。 */
 function parseJson(content: string, label: string): unknown {
   try {
     return JSON.parse(content) as unknown
   } catch (error: unknown) {
-    throw new Error(`CANVAS_CONTENT_CORRUPT: ${label}: ${errorText(error)}`)
+    throw new CanvasContentItemError('CANVAS_CONTENT_CORRUPT', `${label}: ${errorText(error)}`)
   }
 }
 
@@ -232,10 +257,10 @@ export function createCanvasNodeContentStore(
     if (!result.readOutcome) throw new Error('CANVAS_CONTENT_PROTOCOL_INVALID: missing read outcome')
     if (result.readOutcome.status === 'missing') return null
     if (result.readOutcome.status === 'corrupt') {
-      throw new Error(`CANVAS_CONTENT_CORRUPT: ${result.readOutcome.error}`)
+      throw new CanvasContentItemError('CANVAS_CONTENT_CORRUPT', result.readOutcome.error)
     }
     if (result.readOutcome.content.length > MAX_CONTENT_TEXT_LENGTH) {
-      throw new Error('CANVAS_CONTENT_CORRUPT: text exceeds limit')
+      throw new CanvasContentItemError('CANVAS_CONTENT_CORRUPT', 'text exceeds limit')
     }
     return result.readOutcome.content
   }
@@ -408,6 +433,8 @@ export function createCanvasNodeContentStore(
           }
         : parseImageConfig(existingConfigContent)
       if (config.contentId !== contentId
+        || config.revision !== 0
+        || config.createdAt !== config.updatedAt
         || config.prompt !== ''
         || config.selectedModelProfileId !== null
         || config.adoptedAssetId !== adoptedAssetId) {
@@ -508,7 +535,18 @@ export function createCanvasNodeContentStore(
     entryId: string,
   ): Promise<CanvasTrashEntry | null> => {
     const content = await readFile(capability, childName, entryId, 'entry.json')
-    return content === null ? null : parseCanvasTrashEntry(parseJson(content, 'entry.json'))
+    if (content === null) return null
+    /** 未知 JSON 条目，解析失败会保留可辨识的单项错误类型。 */
+    const value = parseJson(content, 'entry.json')
+    try {
+      return parseCanvasTrashEntry(value)
+    } catch (error: unknown) {
+      if (error instanceof CanvasContentItemError) throw error
+      if (error instanceof Error && error.message === 'CANVAS_TRASH_ENTRY_INVALID') {
+        throw new CanvasContentItemError('CANVAS_TRASH_ENTRY_INVALID', 'entry.json contract invalid')
+      }
+      throw error
+    }
   }
 
   /** 在已恢复 nodes 中按 trashId 找到幂等重放条目。 */
@@ -521,8 +559,9 @@ export function createCanvasNodeContentStore(
       try {
         const entry = await readTrashEntry(nodes, 'nodes', contentId)
         if (entry?.trashId === trashId && entry.contentId === contentId) return entry
-      } catch {
-        /** 其它节点的损坏 entry.json 不得阻断目标恢复重放。 */
+      } catch (error: unknown) {
+        /** 只隔离其它节点自身损坏，授权和 helper 故障必须原样传播。 */
+        if (!isIsolatedTrashItemError(error)) throw error
       }
     }
     return null
@@ -606,8 +645,9 @@ export function createCanvasNodeContentStore(
         try {
           const entry = await readTrashEntry(trash, 'trash', trashId)
           if (entry && entry.trashId === trashId) entries.push(entry)
-        } catch {
-          /** 损坏单项不应让整个回收区不可用。 */
+        } catch (error: unknown) {
+          /** 只隔离损坏单项，授权和 helper 基础设施错误必须原样传播。 */
+          if (!isIsolatedTrashItemError(error)) throw error
         }
       }
       return entries.sort((left, right) => (

@@ -61,6 +61,8 @@ interface FakeEntryFiles {
 function createFixture(options: {
   now?: number
   revokeOnAuthorize?: boolean
+  revokeOnAssertCall?: number
+  entryReadError?: string
   outcomeFor?: (request: StableDirectoryNativeRequest) => StableDirectoryNativeResult['writeOutcome']
   moveOutcome?: StableDirectoryNativeResult['moveOutcome']
 } = {}) {
@@ -73,6 +75,8 @@ function createFixture(options: {
   const requests: StableDirectoryNativeRequest[] = []
   /** capability 当前是否仍有效。 */
   let valid = true
+  /** capability assertValid 调用次数，用于精确模拟列表后的撤权竞态。 */
+  let assertCallCount = 0
   /** 单次 LOAD 次数，用于证明每个操作只取一次 capability。 */
   let loadCount = 0
   /** 协议 fake 只接受受限相对字段，不接受任意路径。 */
@@ -91,6 +95,9 @@ function createFixture(options: {
     /** 当前受限 entry。 */
     const entryFiles = request.entryId ? scopes[childName].get(request.entryId) : undefined
     if (request.mode === 'canvas-content-read') {
+      if (request.fileName === 'entry.json' && options.entryReadError) {
+        throw new Error(options.entryReadError)
+      }
       const content = entryFiles?.[request.fileName!]
       return {
         roots: [], entries: [],
@@ -150,6 +157,8 @@ function createFixture(options: {
             path: '/canvas/unused',
             rootPath: '/canvas',
             assertValid: () => {
+              assertCallCount += 1
+              if (assertCallCount === options.revokeOnAssertCall) valid = false
               if (!valid) throw new Error('CANVAS_DIRECTORY_SCOPE_CHANGED')
             },
             authorizeOpenedRoots: () => {
@@ -242,6 +251,33 @@ describe('Canvas 节点内容 Store', () => {
     expect(readJson<CanvasNodeContentMeta>(partial.scopes.nodes.get('image-2')!, 'meta.json').createdAt).toBe(100)
   })
 
+  test.each([
+    [{ revision: 1 }, 'revision 非 0'],
+    [{ updatedAt: 101 }, '初始时间不一致'],
+  ] as const)('Given 图片部分 config 的%s When 重放 Then 拒绝提交 meta', async (override) => {
+    const fixture = createFixture({ now: 999 })
+    fixture.scopes.nodes.set('image-partial', {
+      'config.json': JSON.stringify({
+        schemaVersion: 1,
+        kind: 'image',
+        contentId: 'image-partial',
+        revision: 0,
+        createdAt: 100,
+        updatedAt: 100,
+        prompt: '',
+        selectedModelProfileId: null,
+        adoptedAssetId: null,
+        ...override,
+      }),
+    })
+
+    await expect(fixture.store.prepareEmptyContent(target, {
+      kind: 'image',
+      contentId: 'image-partial',
+    })).rejects.toThrow('CANVAS_CONTENT_IDENTITY_CONFLICT')
+    expect(fixture.scopes.nodes.get('image-partial')?.['meta.json']).toBeUndefined()
+  })
+
   test('Given 内容节点 When 移入独立 trashId 并恢复 Then entry 严格持久化且重放幂等', async () => {
     const fixture = createFixture()
     await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' })
@@ -314,6 +350,38 @@ describe('Canvas 节点内容 Store', () => {
       ...trashEntry,
       trashId: 'trash-good',
     }])
+  })
+
+  test('Given list 已取得条目后 capability 撤权 When 逐项读取 Then 原样传播而不是返回空列表', async () => {
+    const fixture = createFixture({ revokeOnAssertCall: 5 })
+    fixture.scopes.trash.set('trash-1', { 'entry.json': JSON.stringify(trashEntry) })
+
+    await expect(fixture.store.listTrash(target)).rejects.toThrow('CANVAS_DIRECTORY_SCOPE_CHANGED')
+  })
+
+  test('Given helper 在逐项读取时协议失败 When 列出 Then 原样传播基础设施错误', async () => {
+    const fixture = createFixture({ entryReadError: 'STABLE_DIRECTORY_PROTOCOL_INVALID' })
+    fixture.scopes.trash.set('trash-1', { 'entry.json': JSON.stringify(trashEntry) })
+
+    await expect(fixture.store.listTrash(target)).rejects.toThrow('STABLE_DIRECTORY_PROTOCOL_INVALID')
+  })
+
+  test('Given restore 遇到损坏 entry 或授权失败 When 恢复 Then 两类错误保持可辨识', async () => {
+    const damaged = createFixture()
+    damaged.scopes.trash.set('trash-1', { 'entry.json': '{bad' })
+    await expect(damaged.store.restoreFromTrash(target, 'trash-1'))
+      .rejects.toThrow('CANVAS_CONTENT_CORRUPT')
+
+    const revoked = createFixture({ revokeOnAuthorize: true })
+    await expect(revoked.store.restoreFromTrash(target, 'trash-1'))
+      .rejects.toThrow('稳定目录授权被拒绝')
+
+    const revokedDuringReplayScan = createFixture({ revokeOnAssertCall: 7 })
+    revokedDuringReplayScan.scopes.nodes.set('content-1', {
+      'entry.json': JSON.stringify(trashEntry),
+    })
+    await expect(revokedDuringReplayScan.store.restoreFromTrash(target, 'trash-1'))
+      .rejects.toThrow('CANVAS_DIRECTORY_SCOPE_CHANGED')
   })
 
   test('Given OPENED 授权时撤权 When 操作 Then 拒绝且不写入', async () => {
