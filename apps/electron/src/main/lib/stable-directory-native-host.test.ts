@@ -448,6 +448,12 @@ describe('stable directory native host', () => {
       { mode: 'canvas-content-write' as const, roots: ['/requested'], childName: 'nodes', entryId: 'entry-1', fileName: '../meta.json', content: '{}' },
       { mode: 'canvas-content-write' as const, roots: ['/requested'], childName: 'nodes', entryId: 'entry-1', fileName: 'meta.json', content: 'x'.repeat(256 * 1024 + 1) },
       { mode: 'canvas-content-read' as const, roots: ['/requested'], childName: 'nodes', entryId: 'x'.repeat(129), fileName: 'meta.json' },
+      { mode: 'canvas-content-move' as const, roots: ['/requested'], childName: 'nodes', destinationChildName: 'trash', entryId: 'entry-1', destinationEntryId: '../trash-id' },
+      { mode: 'canvas-content-list' as const, roots: ['relative-root'], childName: 'nodes', maxEntries: 1 },
+      { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', maxEntries: 0 },
+      { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', maxEntries: 513 },
+      { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', maxEntries: 1.5 },
+      { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', maxEntries: Number.NaN },
     ]
 
     for (const request of requests) {
@@ -469,7 +475,7 @@ describe('stable directory native host', () => {
 
     const result = await runStableDirectoryNative({
       mode: 'canvas-content-move', roots: ['/requested'], childName: 'nodes',
-      destinationChildName: 'trash', entryId: 'content-1',
+      destinationChildName: 'trash', entryId: 'content-1', destinationEntryId: 'trash-1',
     }, () => true, createDependencies(fake))
 
     expect(result.moveOutcome).toEqual({
@@ -477,6 +483,21 @@ describe('stable directory native host', () => {
       durabilityUncertain: true,
       error: 'cannot persist canvas content move',
     })
+  })
+
+  test('Given 内容 write 与 move 需要刷新多个目录 When 检查原生合同 Then 每个 flush 独立执行后再聚合', () => {
+    /** 原生源码合同用于锁定 `||` 短路不会跳过后续目录 flush。 */
+    const source = readFileSync(resolve(appDir, 'native/stable-directory/stable-directory-helper.cc'), 'utf8')
+
+    expect(source).toContain('const bool entry_persisted = fsync(entry.Get()) == 0;')
+    expect(source).toContain('const bool content_root_persisted = fsync(content_root.Get()) == 0;')
+    expect(source).toContain('const bool canvas_root_persisted = fsync(root.descriptor.Get()) == 0;')
+    expect(source).toContain('const bool source_persisted = fsync(source_root.Get()) == 0;')
+    expect(source).toContain('const bool destination_persisted = fsync(destination_root.Get()) == 0;')
+    expect(source).toContain('const bool entry_persisted = FlushCanvasDirectoryWindows(entry.Get());')
+    expect(source).toContain('const bool source_persisted = FlushCanvasDirectoryWindows(source_root.Get());')
+    expect(source).not.toMatch(/fsync\([^\n]+\) != 0 \|\| fsync/)
+    expect(source).not.toMatch(/FlushCanvasDirectoryWindows\([^\n]+\) \|\|/)
   })
 
   test('Given Canvas intent scan When helper 相对读取正文 Then host 只返回内存内容且无可重开路径', async () => {
@@ -650,6 +671,8 @@ describe('stable directory native host', () => {
         entryId: 'content-1', fileName: 'meta.json', content: '{"schemaVersion":1}',
       }, () => true, { helperPath: () => nativeHelperPath })
       expect(written.writeOutcome).toEqual({ commitVisible: true, durabilityUncertain: false })
+      expect(written.roots).toEqual([])
+      expect(JSON.stringify(written)).not.toContain(canvasRoot)
 
       /** 读取结果携带稳定文件身份，但不携带绝对路径。 */
       const read = await runStableDirectoryNative({
@@ -664,6 +687,8 @@ describe('stable directory native host', () => {
         fileId: expect.any(String),
       })
       expect('path' in (read.readOutcome ?? {})).toBe(false)
+      expect(read.roots).toEqual([])
+      expect(JSON.stringify(read)).not.toContain(canvasRoot)
 
       /** 列表只公开排序后的安全 entry ID。 */
       const listed = await runStableDirectoryNative({
@@ -672,13 +697,17 @@ describe('stable directory native host', () => {
       expect(listed.entries).toEqual([{
         rootIndex: 0, name: 'content-1', path: '', isDirectory: true,
       }])
+      expect(listed.roots).toEqual([])
+      expect(JSON.stringify(listed)).not.toContain(canvasRoot)
 
       /** move 提交后源目录消失、目标目录可按同一安全协议读取。 */
       const moved = await runStableDirectoryNative({
         mode: 'canvas-content-move', roots: [canvasRoot], childName: 'nodes',
-        destinationChildName: 'trash', entryId: 'content-1',
+        destinationChildName: 'trash', entryId: 'content-1', destinationEntryId: 'trash-1',
       }, () => true, { helperPath: () => nativeHelperPath })
       expect(moved.moveOutcome).toEqual({ commitVisible: true, durabilityUncertain: false })
+      expect(moved.roots).toEqual([])
+      expect(JSON.stringify(moved)).not.toContain(canvasRoot)
       const sourceRead = await runStableDirectoryNative({
         mode: 'canvas-content-read', roots: [canvasRoot], childName: 'nodes',
         entryId: 'content-1', fileName: 'meta.json',
@@ -686,9 +715,20 @@ describe('stable directory native host', () => {
       expect(sourceRead.readOutcome).toEqual({ status: 'missing' })
       const targetRead = await runStableDirectoryNative({
         mode: 'canvas-content-read', roots: [canvasRoot], childName: 'trash',
-        entryId: 'content-1', fileName: 'meta.json',
+        entryId: 'trash-1', fileName: 'meta.json',
       }, () => true, { helperPath: () => nativeHelperPath })
       expect(targetRead.readOutcome?.status).toBe('ok')
+      /** 恢复可把 trash ID 映射为新的内容 ID。 */
+      const restored = await runStableDirectoryNative({
+        mode: 'canvas-content-move', roots: [canvasRoot], childName: 'trash',
+        destinationChildName: 'nodes', entryId: 'trash-1', destinationEntryId: 'restored-content',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(restored.moveOutcome?.commitVisible).toBe(true)
+      const restoredRead = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'restored-content', fileName: 'meta.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(restoredRead.readOutcome?.status).toBe('ok')
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -720,6 +760,15 @@ describe('stable directory native host', () => {
         entryId: 'leaf-entry', fileName: 'meta.json',
       }, () => true, { helperPath: () => nativeHelperPath })
       expect(leafRead.readOutcome).toEqual({ status: 'corrupt', error: 'canvas content file is unsafe' })
+      const leafWrite = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'nodes',
+        entryId: 'leaf-entry', fileName: 'meta.json', content: 'changed',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(leafWrite.writeOutcome).toEqual({
+        commitVisible: false,
+        durabilityUncertain: false,
+        error: 'canvas content file is unsafe',
+      })
       expect(readFileSync(join(outside, 'meta.json'), 'utf8')).toBe('outside')
     } finally {
       rmSync(root, { recursive: true, force: true })
@@ -747,7 +796,7 @@ describe('stable directory native host', () => {
       }, () => true, { helperPath: () => nativeHelperPath })
       expect(write.writeOutcome?.commitVisible).toBe(false)
       const listed = await runStableDirectoryNative({
-        mode: 'canvas-content-list', roots: [canvasRoot], childName: 'nodes', maxEntries: 0,
+        mode: 'canvas-content-list', roots: [canvasRoot], childName: 'nodes', maxEntries: 1,
       }, () => true, { helperPath: () => nativeHelperPath })
       expect(listed.entries).toEqual([])
       expect(readFileSync(join(replacement, 'meta.json'), 'utf8')).toBe('outside')
@@ -759,20 +808,20 @@ describe('stable directory native host', () => {
   test.skipIf(!nativeHelperPlatformSupported)('Given move 目标已存在 When 提交 Then 返回 rename 前失败且两端保持不变', async () => {
     const root = mkdtempSync(join(tmpdir(), 'proma-native-content-conflict-'))
     const canvasRoot = join(root, 'canvas')
-    mkdirSync(join(canvasRoot, 'nodes', 'same-id'), { recursive: true })
-    mkdirSync(join(canvasRoot, 'trash', 'same-id'), { recursive: true })
+    mkdirSync(join(canvasRoot, 'nodes', 'source-id'), { recursive: true })
+    mkdirSync(join(canvasRoot, 'trash', 'trash-id'), { recursive: true })
     try {
       const result = await runStableDirectoryNative({
         mode: 'canvas-content-move', roots: [canvasRoot], childName: 'nodes',
-        destinationChildName: 'trash', entryId: 'same-id',
+        destinationChildName: 'trash', entryId: 'source-id', destinationEntryId: 'trash-id',
       }, () => true, { helperPath: () => nativeHelperPath })
       expect(result.moveOutcome).toEqual({
         commitVisible: false,
         durabilityUncertain: false,
         error: 'canvas content move destination exists',
       })
-      expect(existsSync(join(canvasRoot, 'nodes', 'same-id'))).toBe(true)
-      expect(existsSync(join(canvasRoot, 'trash', 'same-id'))).toBe(true)
+      expect(existsSync(join(canvasRoot, 'nodes', 'source-id'))).toBe(true)
+      expect(existsSync(join(canvasRoot, 'trash', 'trash-id'))).toBe(true)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -786,13 +835,13 @@ describe('stable directory native host', () => {
       /** 两个进程共享固定 `.content.lock`，容量检查和 rename 在同一锁内串行。 */
       const move = () => runStableDirectoryNative({
         mode: 'canvas-content-move' as const, roots: [canvasRoot], childName: 'nodes',
-        destinationChildName: 'trash', entryId: 'content-1',
+        destinationChildName: 'trash', entryId: 'content-1', destinationEntryId: 'trash-1',
       }, () => true, { helperPath: () => nativeHelperPath })
       const results = await Promise.all([move(), move()])
 
       expect(results.filter((result) => result.moveOutcome?.commitVisible)).toHaveLength(1)
       expect(results.filter((result) => !result.moveOutcome?.commitVisible)).toHaveLength(1)
-      expect(existsSync(join(canvasRoot, 'trash', 'content-1'))).toBe(true)
+      expect(existsSync(join(canvasRoot, 'trash', 'trash-1'))).toBe(true)
       expect(existsSync(join(canvasRoot, 'nodes', 'content-1'))).toBe(false)
     } finally {
       rmSync(root, { recursive: true, force: true })

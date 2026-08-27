@@ -1,7 +1,7 @@
 import electron from 'electron'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 const STABLE_DIRECTORY_PROTOCOL = 1
 const DEFAULT_STARTUP_TIMEOUT_MS = 3_000
@@ -76,6 +76,8 @@ export interface StableDirectoryNativeRequest {
   entryId?: string
   /** Canvas 内容 move 的目标固定根目录。 */
   destinationChildName?: string
+  /** Canvas 内容 move 的目标安全稳定 ID。 */
+  destinationEntryId?: string
   /** 原子写模式下固定的单级目标文件名。 */
   fileName?: string
   /** 原子写正文；intent 上限 64 KiB，Canvas 内容文件上限 256 KiB。 */
@@ -148,6 +150,7 @@ function buildHelperArguments(request: StableDirectoryNativeRequest): string[] {
   if (request.childName) args.push('--child-name', request.childName)
   if (request.entryId) args.push('--entry-id', request.entryId)
   if (request.destinationChildName) args.push('--destination-child-name', request.destinationChildName)
+  if (request.destinationEntryId) args.push('--destination-entry-id', request.destinationEntryId)
   if (request.fileName) args.push('--file-name', request.fileName)
   return args
 }
@@ -439,7 +442,7 @@ function executeStableDirectoryNative(
           return
         }
         finish(undefined, {
-          roots: openedRoots,
+          roots: request.mode.startsWith('canvas-content-') ? [] : openedRoots,
           entries,
           ...(writeOutcome ? { writeOutcome } : {}),
           ...(readOutcome ? { readOutcome } : {}),
@@ -585,6 +588,7 @@ export function createStableDirectoryNativeHost(
         }
       }
       if (request.mode.startsWith('canvas-content-')) {
+        const maxEntries = request.maxEntries ?? 512
         const childIsSafe = request.childName !== undefined
           && CANVAS_CONTENT_CHILD_NAMES.has(request.childName)
         const needsEntry = request.mode !== 'canvas-content-list'
@@ -596,28 +600,36 @@ export function createStableDirectoryNativeHost(
         const destinationIsSafe = request.mode !== 'canvas-content-move'
           || (request.destinationChildName !== undefined
             && CANVAS_CONTENT_CHILD_NAMES.has(request.destinationChildName)
-            && request.destinationChildName !== request.childName)
+            && request.destinationChildName !== request.childName
+            && request.destinationEntryId !== undefined
+            && CANVAS_CONTENT_ENTRY_ID_PATTERN.test(request.destinationEntryId))
         const contentIsSafe = request.mode !== 'canvas-content-write'
           || (typeof request.content === 'string'
             && Buffer.byteLength(request.content, 'utf8') <= CANVAS_CONTENT_MAX_FILE_BYTES)
         const fieldsMatchMode = request.mode === 'canvas-content-write'
-          ? request.destinationChildName === undefined
+          ? request.destinationChildName === undefined && request.destinationEntryId === undefined
           : request.mode === 'canvas-content-read'
-            ? request.destinationChildName === undefined && request.content === undefined
+            ? request.destinationChildName === undefined
+              && request.destinationEntryId === undefined
+              && request.content === undefined
             : request.mode === 'canvas-content-list'
               ? request.entryId === undefined
                 && request.destinationChildName === undefined
+                && request.destinationEntryId === undefined
                 && request.fileName === undefined
                 && request.content === undefined
               : request.fileName === undefined && request.content === undefined
         if (request.roots.length !== 1
+          || !isAbsolute(request.roots[0] ?? '')
           || !childIsSafe
           || !entryIsSafe
           || !fileIsSafe
           || !destinationIsSafe
           || !contentIsSafe
           || !fieldsMatchMode
-          || (request.maxEntries ?? 512) > 512) {
+          || !Number.isSafeInteger(maxEntries)
+          || maxEntries < 1
+          || maxEntries > 512) {
           return Promise.reject(new Error('Canvas 内容原生请求合同无效'))
         }
       }

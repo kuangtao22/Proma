@@ -49,6 +49,7 @@ struct Config {
   std::string child_name;
   std::string entry_id;
   std::string destination_child_name;
+  std::string destination_entry_id;
   std::string file_name;
 };
 
@@ -148,6 +149,8 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
       config->entry_id = value;
     } else if (key == "--destination-child-name") {
       config->destination_child_name = value;
+    } else if (key == "--destination-entry-id") {
+      config->destination_entry_id = value;
     } else if (key == "--file-name") {
       config->file_name = value;
     } else {
@@ -180,20 +183,22 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
       || config->file_name == "content.md" || config->file_name == "index.html"
       || config->file_name == "entry.json";
   const bool fields_match_mode = config->mode == "canvas-content-write"
-      ? config->destination_child_name.empty()
+      ? config->destination_child_name.empty() && config->destination_entry_id.empty()
       : config->mode == "canvas-content-read"
-        ? config->destination_child_name.empty()
+        ? config->destination_child_name.empty() && config->destination_entry_id.empty()
         : config->mode == "canvas-content-list"
           ? config->entry_id.empty() && config->destination_child_name.empty()
-              && config->file_name.empty()
+              && config->destination_entry_id.empty() && config->file_name.empty()
           : config->file_name.empty();
   if (content_mode && (config->roots.size() != 1 || !safe_child
-      || config->max_entries > 512 || !fields_match_mode
+      || config->max_entries == 0 || config->max_entries > 512 || !fields_match_mode
       || (needs_entry && (config->entry_id.empty() || config->entry_id.size() > 128))
       || (needs_file && !safe_file)
       || (config->mode == "canvas-content-move"
           && ((config->destination_child_name != "nodes" && config->destination_child_name != "trash")
-              || config->destination_child_name == config->child_name)))) {
+              || config->destination_child_name == config->child_name
+              || config->destination_entry_id.empty()
+              || config->destination_entry_id.size() > 128)))) {
     *error = "invalid canvas content directory contract";
     return false;
   }
@@ -202,6 +207,15 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
       if (!((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z')
           || (value >= '0' && value <= '9') || value == '_' || value == '-')) {
         *error = "invalid canvas content entry id";
+        return false;
+      }
+    }
+  }
+  if (content_mode && config->mode == "canvas-content-move") {
+    for (unsigned char value : config->destination_entry_id) {
+      if (!((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z')
+          || (value >= '0' && value <= '9') || value == '_' || value == '-')) {
+        *error = "invalid canvas content destination entry id";
         return false;
       }
     }
@@ -686,6 +700,17 @@ CanvasIntentWriteOutcome WriteCanvasContentAtomic(const Config& config, const St
   if (!OpenCanvasContentRoot(root, config.child_name, true, &content_root, &missing, &outcome.error)) return outcome;
   UniqueFd entry;
   if (!OpenCanvasContentEntry(content_root.Get(), config.entry_id, true, &entry, &missing, &outcome.error)) return outcome;
+  // 覆盖前检查叶子本身，避免把符号链接或其它特殊对象替换为普通文件。
+  struct stat existing {};
+  if (fstatat(entry.Get(), config.file_name.c_str(), &existing, AT_SYMLINK_NOFOLLOW) == 0) {
+    if (!S_ISREG(existing.st_mode)) {
+      outcome.error = "canvas content file is unsafe";
+      return outcome;
+    }
+  } else if (errno != ENOENT) {
+    outcome.error = "canvas content file is unsafe";
+    return outcome;
+  }
   std::string temporary_name;
   UniqueFd temporary;
   for (int attempt = 0; attempt < 32; ++attempt) {
@@ -708,7 +733,10 @@ CanvasIntentWriteOutcome WriteCanvasContentAtomic(const Config& config, const St
     return outcome;
   }
   outcome.commit_visible = true;
-  if (fsync(entry.Get()) != 0 || fsync(content_root.Get()) != 0 || fsync(root.descriptor.Get()) != 0) {
+  const bool entry_persisted = fsync(entry.Get()) == 0;
+  const bool content_root_persisted = fsync(content_root.Get()) == 0;
+  const bool canvas_root_persisted = fsync(root.descriptor.Get()) == 0;
+  if (!entry_persisted || !content_root_persisted || !canvas_root_persisted) {
     outcome.durability_uncertain = true;
     outcome.error = "cannot persist canvas content directories";
   }
@@ -841,20 +869,22 @@ CanvasIntentWriteOutcome MoveCanvasContent(const Config& config, const StableRoo
   if (fstatat(source_root.Get(), config.entry_id.c_str(), &source, AT_SYMLINK_NOFOLLOW) != 0
       || !S_ISDIR(source.st_mode)) { outcome.error = "canvas content move source is unsafe"; return outcome; }
   struct stat destination {};
-  if (fstatat(destination_root.Get(), config.entry_id.c_str(), &destination, AT_SYMLINK_NOFOLLOW) == 0) {
+  if (fstatat(destination_root.Get(), config.destination_entry_id.c_str(), &destination, AT_SYMLINK_NOFOLLOW) == 0) {
     outcome.error = "canvas content move destination exists";
     return outcome;
   }
   if (errno != ENOENT) { outcome.error = "cannot inspect canvas content move destination"; return outcome; }
   if (!RenameDirectoryNoReplace(source_root.Get(), config.entry_id,
-      destination_root.Get(), config.entry_id)) {
+      destination_root.Get(), config.destination_entry_id)) {
     outcome.error = errno == EEXIST ? "canvas content move destination exists"
                                     : "cannot commit canvas content move";
     return outcome;
   }
   outcome.commit_visible = true;
-  if (fsync(source_root.Get()) != 0 || fsync(destination_root.Get()) != 0
-      || fsync(root.descriptor.Get()) != 0) {
+  const bool source_persisted = fsync(source_root.Get()) == 0;
+  const bool destination_persisted = fsync(destination_root.Get()) == 0;
+  const bool canvas_root_persisted = fsync(root.descriptor.Get()) == 0;
+  if (!source_persisted || !destination_persisted || !canvas_root_persisted) {
     outcome.durability_uncertain = true;
     outcome.error = "cannot persist canvas content move";
   }
@@ -1155,6 +1185,7 @@ class UniqueHandle {
 using NtCreateFileFunction = NTSTATUS (NTAPI *)(
     PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER,
     ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+using RtlNtStatusToDosErrorFunction = ULONG (WINAPI *)(NTSTATUS);
 
 // 通过 NtCreateFile 的 RootDirectory 相对打开对象，禁止路径重新解析到已授权根之外。
 bool OpenRelativeWindows(HANDLE RootDirectory, const std::wstring& name,
@@ -1181,6 +1212,9 @@ bool OpenRelativeWindows(HANDLE RootDirectory, const std::wstring& name,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, disposition,
       options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
   if (status < 0 || handle == INVALID_HANDLE_VALUE) {
+    const auto rtl_nt_status_to_dos_error = reinterpret_cast<RtlNtStatusToDosErrorFunction>(
+        ntdll ? GetProcAddress(ntdll, "RtlNtStatusToDosError") : nullptr);
+    SetLastError(rtl_nt_status_to_dos_error ? rtl_nt_status_to_dos_error(status) : ERROR_GEN_FAILURE);
     *error = "cannot open relative Windows object";
     return false;
   }
@@ -1423,6 +1457,21 @@ CanvasIntentWriteOutcome WriteCanvasContentAtomic(const Config& config, const St
       &content_root, &missing, &outcome.error)) return outcome;
   if (!OpenCanvasContentEntryWindows(content_root.Get(), config.entry_id, true,
       &entry, &missing, &outcome.error)) return outcome;
+  // 相对 entry HANDLE 检查现有叶子；普通文件可覆盖，目录与 reparse point 一律拒绝。
+  UniqueHandle existing;
+  std::string existing_error;
+  if (OpenRelativeWindows(entry.Get(), Utf8ToWide(config.file_name),
+      FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_OPEN, 0, &existing, &existing_error)) {
+    BY_HANDLE_FILE_INFORMATION identity {};
+    if (!GetFileInformationByHandle(existing.Get(), &identity)
+        || (identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+      outcome.error = "canvas content file is unsafe";
+      return outcome;
+    }
+  } else if (GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND) {
+    outcome.error = "canvas content file is unsafe";
+    return outcome;
+  }
   UniqueHandle temporary;
   for (int attempt = 0; attempt < 32; ++attempt) {
     const std::wstring name = L".content-" + std::to_wstring(GetCurrentProcessId()) + L"-"
@@ -1466,8 +1515,10 @@ CanvasIntentWriteOutcome WriteCanvasContentAtomic(const Config& config, const St
     return outcome;
   }
   outcome.commit_visible = true;
-  if (!FlushCanvasDirectoryWindows(entry.Get()) || !FlushCanvasDirectoryWindows(content_root.Get())
-      || !FlushCanvasDirectoryWindows(root.handle.Get())) {
+  const bool entry_persisted = FlushCanvasDirectoryWindows(entry.Get());
+  const bool content_root_persisted = FlushCanvasDirectoryWindows(content_root.Get());
+  const bool canvas_root_persisted = FlushCanvasDirectoryWindows(root.handle.Get());
+  if (!entry_persisted || !content_root_persisted || !canvas_root_persisted) {
     outcome.durability_uncertain = true;
     outcome.error = "cannot persist canvas content directories";
   }
@@ -1621,12 +1672,12 @@ CanvasIntentWriteOutcome MoveCanvasContent(const Config& config, const StableRoo
   UniqueHandle destination;
   std::string destination_error;
   bool destination_missing = false;
-  if (!OpenCanvasContentEntryWindows(destination_root.Get(), config.entry_id, false,
+  if (!OpenCanvasContentEntryWindows(destination_root.Get(), config.destination_entry_id, false,
       &destination, &destination_missing, &destination_error) || !destination_missing) {
     outcome.error = "canvas content move destination exists";
     return outcome;
   }
-  const std::wstring target = Utf8ToWide(config.entry_id);
+  const std::wstring target = Utf8ToWide(config.destination_entry_id);
   const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target.size() * sizeof(wchar_t);
   std::vector<unsigned char> rename_buffer(rename_size);
   auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
@@ -1640,9 +1691,10 @@ CanvasIntentWriteOutcome MoveCanvasContent(const Config& config, const StableRoo
     return outcome;
   }
   outcome.commit_visible = true;
-  if (!FlushCanvasDirectoryWindows(source_root.Get())
-      || !FlushCanvasDirectoryWindows(destination_root.Get())
-      || !FlushCanvasDirectoryWindows(root.handle.Get())) {
+  const bool source_persisted = FlushCanvasDirectoryWindows(source_root.Get());
+  const bool destination_persisted = FlushCanvasDirectoryWindows(destination_root.Get());
+  const bool canvas_root_persisted = FlushCanvasDirectoryWindows(root.handle.Get());
+  if (!source_persisted || !destination_persisted || !canvas_root_persisted) {
     outcome.durability_uncertain = true;
     outcome.error = "cannot persist canvas content move";
   }
