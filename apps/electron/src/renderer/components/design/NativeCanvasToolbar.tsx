@@ -1,4 +1,5 @@
 import * as React from 'react'
+import type { CanvasNodeKind } from '@proma/shared'
 import {
   Bot,
   FileImage,
@@ -9,13 +10,13 @@ import {
   Plus,
   Trash2,
   TriangleAlert,
+  Video,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Separator } from '@/components/ui/separator'
@@ -24,13 +25,23 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 /** 顶部添加菜单当前公开的节点类型合同。 */
 export const NATIVE_CANVAS_NODE_TYPE_OPTIONS = [
   { kind: 'agent', label: 'Agent', enabled: true },
-  { kind: 'image', label: '生图', enabled: false },
-  { kind: 'document', label: '视觉文档', enabled: false },
-  { kind: 'webview', label: '原型', enabled: false },
+  { kind: 'image', label: '生图', enabled: true },
+  { kind: 'document', label: '文档', enabled: true },
+  { kind: 'webview', label: '原型', enabled: true },
+  { kind: 'video', label: '视频', enabled: false },
 ] as const
 
-/** 当前只有一个可用类型时直接执行，未来多类型启用后自动恢复选择菜单。 */
-const ENABLED_NATIVE_CANVAS_NODE_TYPE_OPTIONS = NATIVE_CANVAS_NODE_TYPE_OPTIONS.filter((option) => option.enabled)
+/** 顶部菜单单项的稳定联合类型。 */
+type NativeCanvasNodeTypeOption = typeof NATIVE_CANVAS_NODE_TYPE_OPTIONS[number]
+
+/** 为可用节点类型创建精确选择处理器；禁用项不绑定任何回调。 */
+export function createNativeCanvasNodeTypeSelectHandler(
+  option: NativeCanvasNodeTypeOption,
+  onAddNode: (kind: CanvasNodeKind) => void,
+): (() => void) | undefined {
+  if (!option.enabled) return undefined
+  return () => onAddNode(option.kind)
+}
 
 /** 原生 Canvas 顶部工具栏输入。 */
 export interface NativeCanvasToolbarProps {
@@ -41,7 +52,7 @@ export interface NativeCanvasToolbarProps {
   canDelete: boolean
   issueCount: number
   onToolChange: (tool: 'select' | 'pan') => void
-  onAddAgent: () => void
+  onAddNode: (kind: CanvasNodeKind) => void
   onDelete: () => void
   onFocusFirstIssue: () => void
 }
@@ -55,39 +66,33 @@ function NativeCanvasNodeTypeIcon({
   if (kind === 'agent') return <Bot aria-hidden="true" />
   if (kind === 'image') return <FileImage aria-hidden="true" />
   if (kind === 'document') return <FileText aria-hidden="true" />
-  return <Monitor aria-hidden="true" />
+  if (kind === 'webview') return <Monitor aria-hidden="true" />
+  return <Video aria-hidden="true" />
 }
 
-/** 渲染单个添加菜单项，并为未来能力提供可悬停的禁用说明。 */
+/** 渲染单个添加菜单项，保持 Radix 原生 roving focus 结构。 */
 function NativeCanvasNodeTypeMenuItem({
   option,
-  onAddAgent,
+  onAddNode,
 }: {
-  option: typeof NATIVE_CANVAS_NODE_TYPE_OPTIONS[number]
-  onAddAgent: () => void
+  option: NativeCanvasNodeTypeOption
+  onAddNode: (kind: CanvasNodeKind) => void
 }): React.ReactElement {
-  /** 菜单项本体保持真实 menuitem 语义。 */
-  const item = (
+  /** 仅可用类型获得选择回调，视频保持纯禁用菜单项。 */
+  const onSelect = createNativeCanvasNodeTypeSelectHandler(option, onAddNode)
+  return (
     <DropdownMenuItem
       disabled={!option.enabled}
       aria-disabled={!option.enabled}
-      onSelect={option.enabled ? onAddAgent : undefined}
+      aria-label={option.enabled ? option.label : `${option.label}，即将支持`}
+      onSelect={onSelect}
     >
       <NativeCanvasNodeTypeIcon kind={option.kind} />
-      <span>{option.label}</span>
+      <span className="min-w-0 truncate">{option.label}</span>
       {!option.enabled ? (
-        <span className="ml-auto text-[11px] text-muted-foreground">即将支持</span>
+        <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">即将支持</span>
       ) : null}
     </DropdownMenuItem>
-  )
-  if (option.enabled) return item
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <div className="rounded-md">{item}</div>
-      </TooltipTrigger>
-      <TooltipContent side="right">即将支持</TooltipContent>
-    </Tooltip>
   )
 }
 
@@ -99,7 +104,7 @@ export function NativeCanvasToolbar({
   canDelete,
   issueCount,
   onToolChange,
-  onAddAgent,
+  onAddNode,
   onDelete,
   onFocusFirstIssue,
 }: NativeCanvasToolbarProps): React.ReactElement {
@@ -145,52 +150,35 @@ export function NativeCanvasToolbar({
 
         <Separator orientation="vertical" className="mx-0.5 h-5" />
 
-        {ENABLED_NATIVE_CANVAS_NODE_TYPE_OPTIONS.length === 1 ? (
+        <DropdownMenu>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button
-                type="button"
-                size="icon-sm"
-                variant="ghost"
-                className="size-8"
-                aria-label="添加节点"
-                disabled={!writable || !canAdd}
-                onClick={onAddAgent}
-              >
-                <Plus aria-hidden="true" />
-              </Button>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  className="size-8"
+                  aria-label="添加节点"
+                  disabled={!writable || !canAdd}
+                >
+                  <Plus aria-hidden="true" />
+                </Button>
+              </DropdownMenuTrigger>
             </TooltipTrigger>
-            <TooltipContent side="bottom">添加 Agent</TooltipContent>
+            <TooltipContent side="bottom">添加节点</TooltipContent>
           </Tooltip>
-        ) : (
-          <DropdownMenu>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    type="button"
-                    size="icon-sm"
-                    variant="ghost"
-                    className="size-8"
-                    aria-label="添加节点"
-                    disabled={!writable || !canAdd}
-                  >
-                    <Plus aria-hidden="true" />
-                  </Button>
-                </DropdownMenuTrigger>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">添加节点</TooltipContent>
-            </Tooltip>
-            <DropdownMenuContent align="center" side="bottom" className="w-48">
-              {NATIVE_CANVAS_NODE_TYPE_OPTIONS.map((option, index) => (
-                <React.Fragment key={option.kind}>
-                  {index === 1 ? <DropdownMenuSeparator /> : null}
-                  <NativeCanvasNodeTypeMenuItem option={option} onAddAgent={onAddAgent} />
-                </React.Fragment>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
+          <DropdownMenuContent
+            align="center"
+            side="bottom"
+            className="w-48 max-w-[calc(100vw-1rem)]"
+            data-canvas-node-menu-width="compact"
+          >
+            {NATIVE_CANVAS_NODE_TYPE_OPTIONS.map((option) => (
+              <NativeCanvasNodeTypeMenuItem key={option.kind} option={option} onAddNode={onAddNode} />
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
 
         <Tooltip>
           <TooltipTrigger asChild>

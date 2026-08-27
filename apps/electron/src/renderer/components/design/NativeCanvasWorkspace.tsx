@@ -6,6 +6,7 @@ import type {
   CanvasChangeEvent,
   CanvasDocument,
   CanvasMutation,
+  CanvasNodeKind,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
@@ -55,6 +56,15 @@ export const NATIVE_CANVAS_REVISION_CONFLICT_CODE = 'CANVAS_REVISION_CONFLICT'
 export const NATIVE_CANVAS_COMMIT_UNCERTAIN_CODE = 'CANVAS_COMMIT_UNCERTAIN'
 /** 无法安全重放结构修改时显示的稳定冲突文本。 */
 export const NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE = 'Canvas 结构已在恢复期间变化，请处理本地结构冲突'
+
+/** 路由顶部节点类型选择；内容节点由后续生命周期接线，当前不得误建 Agent。 */
+export function runNativeCanvasToolbarAddNode(
+  kind: CanvasNodeKind,
+  executeAgent: () => void,
+): void {
+  if (kind !== 'agent') return
+  executeAgent()
+}
 /** controller 使用的最小原生 Canvas adapter 合同。 */
 export interface NativeCanvasAdapter {
   loadCanvas: DesignAdapter['loadCanvas']
@@ -1170,7 +1180,9 @@ export function NativeCanvasWorkspace({
                   key: stateKey,
                   update: { activeTool },
                 })}
-                onAddAgent={() => { void commandRef.current?.execute().catch(() => undefined) }}
+                onAddNode={(kind) => runNativeCanvasToolbarAddNode(kind, () => {
+                  void commandRef.current?.execute().catch(() => undefined)
+                })}
                 onDelete={requestSelectedNodeDelete}
                 onFocusFirstIssue={focusFirstIssue}
               />

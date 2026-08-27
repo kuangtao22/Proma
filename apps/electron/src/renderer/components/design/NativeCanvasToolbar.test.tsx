@@ -1,77 +1,116 @@
 import * as React from 'react'
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, mock, test } from 'bun:test'
+import type { CanvasNodeKind } from '@proma/shared'
 import { renderToStaticMarkup } from 'react-dom/server'
 import {
   NATIVE_CANVAS_NODE_TYPE_OPTIONS,
   NativeCanvasToolbar,
+  createNativeCanvasNodeTypeSelectHandler,
 } from './NativeCanvasToolbar'
 
+/** 创建工具栏测试使用的稳定基础属性。 */
+function createToolbarProps(): React.ComponentProps<typeof NativeCanvasToolbar> {
+  return {
+    activeTool: 'select',
+    writable: true,
+    canDelete: true,
+    issueCount: 0,
+    onToolChange: () => undefined,
+    onAddNode: () => undefined,
+    onDelete: () => undefined,
+    onFocusFirstIssue: () => undefined,
+  }
+}
+
+/** 在未挂载的 React 元素树中查找指定属性，覆盖 Radix Portal 的结构合同。 */
+function hasElementProperty(
+  node: React.ReactNode,
+  propertyName: string,
+  propertyValue: unknown,
+): boolean {
+  if (!React.isValidElement<Record<string, unknown>>(node)) return false
+  if (node.props[propertyName] === propertyValue) return true
+  return React.Children.toArray(node.props.children as React.ReactNode).some(
+    (child) => hasElementProperty(child, propertyName, propertyValue),
+  )
+}
+
 describe('原生 Canvas 顶部工具栏', () => {
-  test('Given 可写 Canvas When 渲染工具栏 Then 选择、平移、添加和删除命令均可达', () => {
-    const html = renderToStaticMarkup(
-      <NativeCanvasToolbar
-        activeTool="select"
-        writable
-        canDelete
-        issueCount={0}
-        onToolChange={() => undefined}
-        onAddAgent={() => undefined}
-        onDelete={() => undefined}
-        onFocusFirstIssue={() => undefined}
-      />,
-    )
+  test('Given 可写 Canvas When 渲染工具栏 Then 添加入口始终公开菜单语义并保留既有命令', () => {
+    const html = renderToStaticMarkup(<NativeCanvasToolbar {...createToolbarProps()} />)
 
     expect(html).toContain('aria-label="选择工具"')
     expect(html).toContain('aria-pressed="true"')
     expect(html).toContain('aria-label="平移工具"')
     expect(html).toContain('aria-label="添加节点"')
-    expect(html).not.toContain('aria-haspopup="menu"')
+    expect(html).toContain('aria-haspopup="menu"')
     expect(html).toContain('aria-label="删除节点"')
   })
 
-  test('Given 首版节点类型 When 读取添加菜单 Then 只启用 Agent 并说明未来类型即将支持', () => {
+  test('Given 多类型节点基础层 When 读取添加选项 Then 固定五项顺序且仅视频禁用', () => {
     expect(NATIVE_CANVAS_NODE_TYPE_OPTIONS).toEqual([
       { kind: 'agent', label: 'Agent', enabled: true },
-      { kind: 'image', label: '生图', enabled: false },
-      { kind: 'document', label: '视觉文档', enabled: false },
-      { kind: 'webview', label: '原型', enabled: false },
+      { kind: 'image', label: '生图', enabled: true },
+      { kind: 'document', label: '文档', enabled: true },
+      { kind: 'webview', label: '原型', enabled: true },
+      { kind: 'video', label: '视频', enabled: false },
     ])
+  })
+
+  test('Given 四个可用类型 When 选择菜单项 Then 分别回传精确节点类型', () => {
+    const selected: CanvasNodeKind[] = []
+    const onAddNode = (kind: CanvasNodeKind): void => { selected.push(kind) }
+
+    for (const option of NATIVE_CANVAS_NODE_TYPE_OPTIONS) {
+      const handler = createNativeCanvasNodeTypeSelectHandler(option, onAddNode)
+      if (option.enabled) handler?.()
+    }
+
+    expect(selected).toEqual(['agent', 'image', 'document', 'webview'])
+  })
+
+  test('Given 视频尚未开放 When 尝试取得选择处理器 Then 不绑定回调', () => {
+    const onAddNode = mock(() => undefined)
+    const videoOption = NATIVE_CANVAS_NODE_TYPE_OPTIONS[4]
+
+    const handler = createNativeCanvasNodeTypeSelectHandler(videoOption, onAddNode)
+    handler?.()
+
+    expect(videoOption).toEqual({ kind: 'video', label: '视频', enabled: false })
+    expect(handler).toBeUndefined()
+    expect(onAddNode).not.toHaveBeenCalled()
   })
 
   test('Given 两个问题节点 When 渲染工具栏 Then 显示可聚焦的问题入口', () => {
     const html = renderToStaticMarkup(
-      <NativeCanvasToolbar
-        activeTool="pan"
-        writable
-        canDelete={false}
-        issueCount={2}
-        onToolChange={() => undefined}
-        onAddAgent={() => undefined}
-        onDelete={() => undefined}
-        onFocusFirstIssue={() => undefined}
-      />,
+      <NativeCanvasToolbar {...createToolbarProps()} activeTool="pan" canDelete={false} issueCount={2} />,
     )
 
     expect(html).toContain('2 个节点需要处理')
     expect(html).toContain('aria-label="聚焦首个问题节点"')
   })
 
-  test('Given Canvas 可写但创建暂不可用 When 渲染工具栏 Then 只禁用添加入口', () => {
+  test.each([
+    { writable: false, canAdd: true },
+    { writable: true, canAdd: false },
+  ])('Given 添加不允许 When 渲染工具栏 Then 添加入口禁用且菜单不可打开', ({ writable, canAdd }) => {
     const html = renderToStaticMarkup(
-      <NativeCanvasToolbar
-        activeTool="select"
-        writable
-        canAdd={false}
-        canDelete
-        issueCount={0}
-        onToolChange={() => undefined}
-        onAddAgent={() => undefined}
-        onDelete={() => undefined}
-        onFocusFirstIssue={() => undefined}
-      />,
+      <NativeCanvasToolbar {...createToolbarProps()} writable={writable} canAdd={canAdd} />,
     )
 
     expect(html).toMatch(/<button[^>]*aria-label="添加节点"[^>]*disabled=""/u)
-    expect(html).not.toMatch(/<button[^>]*aria-label="删除节点"[^>]*disabled=""/u)
+    const deleteDisabled = /<button[^>]*aria-label="删除节点"[^>]*disabled=""/u.test(html)
+    expect(deleteDisabled).toBe(!writable)
+  })
+
+  test('Given 窄窗口 When 渲染工具栏 Then 工具栏和菜单宽度受限且状态文本可截断', () => {
+    const html = renderToStaticMarkup(
+      <NativeCanvasToolbar {...createToolbarProps()} issueCount={12} />,
+    )
+    const elementTree = NativeCanvasToolbar({ ...createToolbarProps(), issueCount: 12 })
+
+    expect(html).toContain('max-w-[calc(100%-1rem)]')
+    expect(html).toContain('max-w-36 truncate')
+    expect(hasElementProperty(elementTree, 'data-canvas-node-menu-width', 'compact')).toBeTrue()
   })
 })

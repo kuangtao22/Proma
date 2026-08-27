@@ -1,10 +1,11 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, mock, test } from 'bun:test'
 import { createEmptyCanvasDocument } from '@proma/shared'
 import type {
   CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
   CanvasDocument,
   CanvasMutation,
+  CanvasNodeKind,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
@@ -35,6 +36,7 @@ import {
   createNativeCanvasWorkspaceController,
   getNativeCanvasConnectedEdgeCount,
   isPendingCanvasStopDeleteCurrent,
+  runNativeCanvasToolbarAddNode,
 } from './NativeCanvasWorkspace'
 import type {
   CanvasAgentNodeCommandState,
@@ -44,6 +46,27 @@ import type {
 } from './NativeCanvasWorkspace'
 import type { CanvasAgentConversationProps } from './CanvasAgentConversation'
 import type { NativeCanvasFlowProps } from './NativeCanvasGraph'
+
+describe('原生 Canvas 顶部添加节点路由', () => {
+  test('Given 选择 Agent When 路由顶部添加命令 Then 执行既有 Agent 创建', () => {
+    const executeAgent = mock(() => undefined)
+
+    runNativeCanvasToolbarAddNode('agent', executeAgent)
+
+    expect(executeAgent).toHaveBeenCalledTimes(1)
+  })
+
+  test.each<CanvasNodeKind>(['image', 'document', 'webview'])(
+    'Given 选择 %s When 内容创建尚未接线 Then 不误创建 Agent',
+    (kind) => {
+      const executeAgent = mock(() => undefined)
+
+      runNativeCanvasToolbarAddNode(kind, executeAgent)
+
+      expect(executeAgent).not.toHaveBeenCalled()
+    },
+  )
+})
 
 /** 可从测试精确控制完成时机的 Promise。 */
 interface Deferred<T> {
