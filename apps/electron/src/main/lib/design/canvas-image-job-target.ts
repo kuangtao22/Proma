@@ -1,4 +1,4 @@
-import type { DesignJobTarget } from '@proma/shared'
+import type { CanvasChangeEvent, DesignJobTarget } from '@proma/shared'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasImageModuleStore } from './canvas-image-module-store'
 
@@ -16,6 +16,8 @@ export interface CanvasImageJobTargetAdapter {
 export interface CanvasImageJobTargetAdapterDependencies {
   canvasStore: Pick<CanvasDocumentStore, 'requireStableAuthoritativeDocument' | 'mutate'>
   imageStore: Pick<CanvasImageModuleStore, 'load' | 'adoptAsset'>
+  /** 节点投影提交后通知 Renderer 重新加载对应 Canvas。 */
+  onCanvasChanged?: (event: CanvasChangeEvent) => void
 }
 
 /** 把 Job 目标补全为图片模块 Store 使用的四重身份。 */
@@ -69,7 +71,8 @@ export function createCanvasImageJobTargetAdapter(
         owned = await loadOwnedTarget(projectId, target)
       }
       if (owned.node.adoptedAssetId === assetId) return
-      dependencies.canvasStore.mutate(
+      /** 节点投影提交后的权威文档携带本次广播必须使用的准确 revision。 */
+      const updatedDocument = dependencies.canvasStore.mutate(
         { projectId, canvasId: target.canvasId },
         owned.document.revision,
         [{ type: 'upsert-nodes', nodes: [{ ...owned.node, adoptedAssetId: assetId }] }],
@@ -82,6 +85,17 @@ export function createCanvasImageJobTargetAdapter(
           }
         },
       )
+      try {
+        dependencies.onCanvasChanged?.({
+          projectId,
+          canvasId: target.canvasId,
+          revision: updatedDocument.revision,
+          cause: 'graph',
+        })
+      } catch (error) {
+        /** 广播失败不能回滚已经提交的配置与 Canvas 节点事实。 */
+        console.error('[CanvasImageJobTarget] Canvas 变化广播失败:', error)
+      }
     },
     isOutputAdopted: async (projectId, target, assetId) => {
       /** 只有配置事实和图投影同时命中才算采用完成。 */

@@ -45,6 +45,7 @@ interface TestToolDefinition {
   execute: (toolUseId: string, input: Record<string, unknown>, signal?: AbortSignal) => Promise<{
     content: Array<{ type: string; text?: string }>
     details: TestToolResultDetails
+    terminate?: boolean
   }>
 }
 
@@ -175,6 +176,34 @@ describe('Nano Banana Pi 工具附件来源', () => {
       prompt: 'A precise desktop workspace homepage...',
     }])
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('Given Design 图片工具成功或失败 When 返回工具结果 Then 终止本轮避免 Agent 再次调用', async () => {
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const trustedImageRoute: ImageGenerationModelSnapshot = {
+      profileId: 'profile-one-shot', name: '单次设计模型', executor: 'nano-banana', modelId: 'gemini-design',
+    }
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'session-design-one-shot',
+      trustedImageRoute,
+      resolveTrustedImageRoute: resolveNanoRoute,
+    }) as unknown as TestToolDefinition[]
+
+    const succeeded = await tool!.execute('tool-design-success', {
+      designSummary: '保持现有信息层级。',
+      prompt: 'A precise homepage...',
+    })
+    fetchImplementation = async () => { throw new Error('upstream timed out') }
+    const failed = await tool!.execute('tool-design-failed', {
+      designSummary: '保持现有信息层级。',
+      prompt: 'A precise homepage...',
+    })
+
+    expect(succeeded.terminate).toBe(true)
+    expect(failed.terminate).toBe(true)
+    expect(failed.content[0]?.text).toContain('upstream timed out')
   })
 
   test('Given Design 可信工具缺少摘要 When 执行 Then 在网络和捕获前拒绝', async () => {

@@ -519,7 +519,10 @@ export class DesignJobManager {
       const outputPath = this.findOwnedOutputPath(messages, session.id)
         ?? this.findOwnedOutputPath(this.dependencies.getSessionMessages(session.id), session.id)
       if (!outputPath) {
-        this.updateStatus(latest, 'failed', { error: DESIGN_JOB_OUTPUT_ERROR })
+        /** SDK 持久化消息最接近真实工具边界，优先于兼容 AgentMessage。 */
+        const imageToolError = this.findImageToolError(this.dependencies.getSessionMessages(session.id))
+          ?? this.findImageToolError(messages)
+        this.updateStatus(latest, 'failed', { error: imageToolError ?? DESIGN_JOB_OUTPUT_ERROR })
         return
       }
       await this.commitOutput(latest, session.id, outputPath)
@@ -962,6 +965,43 @@ export class DesignJobManager {
           const path = this.dependencies.resolveOwnedOutputPath(sessionId, image.localPath)
           if (path) return path
         }
+      }
+    }
+    return undefined
+  }
+
+  /** 从本轮消息提取第一条图片工具失败，并清洗为可直接展示的业务错误。 */
+  private findImageToolError(messages: Array<AgentMessage | SDKMessage>): string | undefined {
+    /** SDK user/tool_result 必须与此前真实图片 tool_use 关联。 */
+    const sdkToolNames = new Map<string, string>()
+    for (const message of messages) {
+      if ('type' in message) {
+        if (message.type === 'assistant') {
+          const content = (message as SDKAssistantMessage).message?.content
+          if (!Array.isArray(content)) continue
+          for (const block of content) {
+            if (block.type !== 'tool_use') continue
+            const toolUse = block as SDKToolUseBlock
+            sdkToolNames.set(toolUse.id, toolUse.name)
+          }
+          continue
+        }
+        if (message.type !== 'user') continue
+        const content = (message as SDKUserMessage).message?.content
+        if (!Array.isArray(content)) continue
+        for (const block of content) {
+          if (block.type !== 'tool_result') continue
+          const result = block as SDKToolResultBlock
+          if (sdkToolNames.get(result.tool_use_id) !== DESIGN_IMAGE_TOOL || result.is_error !== true) continue
+          return sanitizeImageToolError(extractToolResultText(result.content))
+        }
+        continue
+      }
+      for (const event of message.events ?? []) {
+        if (event.type !== 'tool_result'
+          || event.toolName !== DESIGN_IMAGE_TOOL
+          || !event.isError) continue
+        return sanitizeImageToolError(event.result)
       }
     }
     return undefined
@@ -1913,6 +1953,32 @@ function normalizeStoredDesignJob(value: unknown): StoredDesignJob | undefined {
       ?? (legacy.sessionId ? 'completed' : undefined),
   }
   return isStoredDesignJob(candidate) ? candidate : undefined
+}
+
+/** 从 SDK 工具结果的字符串或文本块中提取可诊断文本。 */
+function extractToolResultText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map((item) => isRecord(item) && item.type === 'text' && typeof item.text === 'string' ? item.text : '')
+    .filter(Boolean)
+    .join('\n')
+}
+
+/** 把图片工具底层错误转为不泄露内部 IPC、路径或调用标识的用户错误。 */
+function sanitizeImageToolError(value: string): string {
+  const normalized = value
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (/timeout|timed out|超时/i.test(normalized)) return '图片生成超时，请重试'
+  if (/aborted|已取消/i.test(normalized)) return '图片生成已取消'
+  if (/工具调用次数已达上限/.test(normalized)) return '图片生成未完成，请重试'
+  const detail = normalized.replace(/^图片生成失败[:：]\s*/, '')
+  if (/^(生图服务|Nano Banana|所选生图模型|设计任务|参考图|远程图片|图片|生图)/.test(detail)) {
+    return `图片生成失败：${detail.slice(0, 180)}`
+  }
+  return '图片生成失败，请重试'
 }
 
 /** 判断未知值是否为普通对象。 */

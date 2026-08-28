@@ -24,7 +24,7 @@ import {
 } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, isPromaPermissionMode, normalizePathForCompare, parseCanvasNodeContentMeta } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, CANVAS_IPC_CHANNELS, isPromaPermissionMode, normalizePathForCompare, parseCanvasNodeContentMeta } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS, TRAY_IPC_CHANNELS } from '../types'
 import type {
   QuickTaskSubmitInput,
@@ -168,6 +168,7 @@ import type {
   BrowserNavigateInput,
   BrowserTabInput,
   BrowserCreateTabInput,
+  CanvasChangeEvent,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
@@ -1641,6 +1642,22 @@ export function registerIpcHandlers(): void {
   const canvasSessionStore = new CanvasSessionStore({ pathResolver: designPathResolver })
   /** 原生 Canvas 文档复用同一会话索引作为项目与 Canvas 双身份授权事实。 */
   const canvasDocumentStore = createCanvasDocumentStore({ sessions: canvasSessionStore })
+  /** Canvas 与 legacy Design 共用仍存活主窗口授权边界。 */
+  const listAuthorizedDesignWebContents = (): WebContents[] => {
+    /** 销毁窗口不能继续调用 handler 或接收广播。 */
+    const contents = getStoredMainWindow()?.webContents
+    return contents && !contents.isDestroyed() ? [contents] : []
+  }
+  /** 图片任务直接更新 Canvas 节点后发布准确 revision，驱动折叠节点即时刷新。 */
+  const publishCanvasImageGraphChange = (event: CanvasChangeEvent): void => {
+    for (const contents of listAuthorizedDesignWebContents()) {
+      try {
+        contents.send(CANVAS_IPC_CHANNELS.CHANGED, event)
+      } catch (error) {
+        console.error('[IPC] Canvas 图片节点变化广播失败:', error)
+      }
+    }
+  }
   /** 非 Agent 内容目录与图文档共享唯一 Store 实例和目录 capability。 */
   const canvasNodeContentStore = createCanvasNodeContentStore({ store: canvasDocumentStore })
   /** 新图片节点默认模型复用现有项目级可用选择，不读取或复制凭据。 */
@@ -1651,6 +1668,7 @@ export function registerIpcHandlers(): void {
   const canvasImageJobTarget = createCanvasImageJobTargetAdapter({
     canvasStore: canvasDocumentStore,
     imageStore: canvasImageModuleStore,
+    onCanvasChanged: publishCanvasImageGraphChange,
   })
   /** 从受管节点目录读取已提交正文，meta.json 始终作为身份和 revision 事实。 */
   const readCommittedCanvasContent = async (
@@ -1852,12 +1870,6 @@ export function registerIpcHandlers(): void {
     assets: designAssetService,
   })
   setDefaultDesignJobManager(designJobManager)
-  /** Canvas 与 legacy Design 共用仍存活主窗口授权边界。 */
-  const listAuthorizedDesignWebContents = (): WebContents[] => {
-    /** 销毁窗口不能继续调用 handler 或接收广播。 */
-    const contents = getStoredMainWindow()?.webContents
-    return contents && !contents.isDestroyed() ? [contents] : []
-  }
   registerCanvasSessionIpcHandlers({
     ipc: ipcMain,
     listAuthorizedWebContents: listAuthorizedDesignWebContents,

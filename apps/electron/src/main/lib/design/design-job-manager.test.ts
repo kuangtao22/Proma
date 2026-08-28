@@ -716,6 +716,29 @@ describe('Design Job Manager', () => {
     expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: job.id })
   })
 
+  test('Given 图片工具超时且没有输出 When 完成 Then 保留提示词并显示清洗后的真实错误', async () => {
+    harness.runHeadless = async (callbacks, extensions) => {
+      extensions.captureDesignImageCall?.({
+        designSummary: '根据真实项目首页整理视觉层级。',
+        prompt: 'A precise project homepage mockup...',
+      })
+      harness.sdkMessages = createSdkToolErrorMessages(
+        'Main runtime request timed out: agent.capability.customTool',
+      )
+      callbacks.onComplete([])
+    }
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'failed',
+      error: '图片生成超时，请重试',
+      designSummary: '根据真实项目首页整理视觉层级。',
+      finalImagePrompt: 'A precise project homepage mockup...',
+    })
+  })
+
   test('Given Pi 以 user tool_result 返回已验证图片 When 完成 Then 导入图片而不是误报无输出', async () => {
     harness.messages = [createToolMessage('session-1/output.png', 'user')]
     const job = harness.manager.create(createGenerateInput())
@@ -2165,6 +2188,29 @@ function createSdkToolMessages(localPath: string): SDKMessage[] {
       content: '图片已生成',
       is_error: false,
       imageAttachments: [{ localPath, filename: 'output.png', mediaType: 'image/png' }],
+    }] },
+  }] as SDKMessage[]
+}
+
+/** 创建真实 Pi 持久化链路使用的失败图片工具消息对。 */
+function createSdkToolErrorMessages(error: string): SDKMessage[] {
+  return [{
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { content: [{
+      type: 'tool_use',
+      id: 'tool-error',
+      name: NANO_BANANA_TOOL,
+      input: { prompt: 'exact image prompt', designSummary: 'quiet hierarchy' },
+    }] },
+  }, {
+    type: 'user',
+    parent_tool_use_id: null,
+    message: { content: [{
+      type: 'tool_result',
+      tool_use_id: 'tool-error',
+      content: error,
+      is_error: true,
     }] },
   }] as SDKMessage[]
 }

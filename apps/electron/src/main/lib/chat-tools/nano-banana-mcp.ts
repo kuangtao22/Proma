@@ -491,16 +491,20 @@ export function buildPiNanoBananaTools(
               numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
               trustedImageRoute: ctx.trustedImageRoute,
             }, signal)
-        return toPiToolResult(result, toolCallId)
+        const toolResult = toPiToolResult(result, toolCallId)
+        /** Design 图片工具是单次任务终点，成功后直接交付结果，不再让 Agent 开启下一轮。 */
+        return ctx.trustedImageRoute ? { ...toolResult, terminate: true } : toolResult
       } catch (error) {
         if (signal?.aborted) signal.throwIfAborted()
         if (error instanceof Error && error.name === 'AbortError') throw error
         const message = error instanceof Error ? error.message : String(error)
         console.error('[Nano Banana Pi 工具] 执行失败:', error)
-        return {
+        const toolResult = {
           content: [{ type: 'text', text: `图片生成失败: ${message}` }],
           details: { generated: false },
         } as AgentToolResult<unknown>
+        /** 失败同样终止本轮，避免一次性付费工具被模型自行重试。 */
+        return ctx.trustedImageRoute ? { ...toolResult, terminate: true } : toolResult
       }
     },
   })]

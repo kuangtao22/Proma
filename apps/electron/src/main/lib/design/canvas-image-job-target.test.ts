@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
-import type { CanvasDocument, CanvasImageModuleConfig } from '@proma/shared'
+import type { CanvasChangeEvent, CanvasDocument, CanvasImageModuleConfig } from '@proma/shared'
 import { createCanvasImageJobTargetAdapter } from './canvas-image-job-target'
 import type { CanvasImageJobTarget } from './canvas-image-job-target'
 
@@ -33,6 +33,8 @@ function createFixture() {
       contextMode: 'auto', adoptedAssetId: null,
     },
   ]))
+  /** 记录节点投影提交后对 Renderer 发布的图变化事件。 */
+  const canvasChanges: CanvasChangeEvent[] = []
   const adapter = createCanvasImageJobTargetAdapter({
     canvasStore: {
       requireStableAuthoritativeDocument: () => document,
@@ -61,8 +63,9 @@ function createFixture() {
         return structuredClone(next)
       },
     },
+    onCanvasChanged: (event) => { canvasChanges.push(event) },
   })
-  return { adapter, configs, targetA, targetB, get document() { return document } }
+  return { adapter, canvasChanges, configs, targetA, targetB, get document() { return document } }
 }
 
 describe('Canvas 图片 Job 目标适配器', () => {
@@ -79,6 +82,9 @@ describe('Canvas 图片 Job 目标适配器', () => {
     expect(fixture.document.nodes.find((node) => node.id === fixture.targetB.nodeId))
       .not.toHaveProperty('adoptedAssetId')
     expect(await fixture.adapter.isOutputAdopted('project-1', fixture.targetA, 'asset-a')).toBe(true)
+    expect(fixture.canvasChanges).toEqual([{
+      projectId: 'project-1', canvasId: 'canvas-1', revision: 1, cause: 'graph',
+    }])
   })
 
   test('Given 配置已采用但节点投影滞后 When 重放采用 Then 只修复节点投影', async () => {
@@ -90,5 +96,8 @@ describe('Canvas 图片 Job 目标适配器', () => {
     await fixture.adapter.adoptOutput('project-1', fixture.targetA, 'asset-a')
 
     expect(await fixture.adapter.isOutputAdopted('project-1', fixture.targetA, 'asset-a')).toBe(true)
+    expect(fixture.canvasChanges).toEqual([{
+      projectId: 'project-1', canvasId: 'canvas-1', revision: 1, cause: 'graph',
+    }])
   })
 })
