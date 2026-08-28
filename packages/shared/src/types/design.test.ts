@@ -12,6 +12,7 @@ import type {
   CanvasSessionMeta,
   CreateCanvasSessionInput,
   CreateDesignJobInput,
+  CreateDesignJobTarget,
   DesignAsset,
   DesignContextEntry,
   DesignImageModelSelection,
@@ -23,6 +24,7 @@ import type {
   SaveImageGenerationModelProfilesInput,
   ImportDesignAssetsInput,
   DesignJobRecord,
+  DesignJobTarget,
   DesignTaskDetails,
   SaveDesignMutationsInput,
   UpdateCanvasSessionInput,
@@ -49,6 +51,11 @@ const jobContract = {
   creativeTaskId: 'creative-1',
   attemptNumber: 1,
   projectId: 'project-1',
+  target: {
+    kind: 'design-canvas',
+    nodeId: 'node-1',
+    position: { x: 10, y: 20 },
+  },
   action: 'generate',
   status: 'queued',
   prompt: '生成图片',
@@ -67,8 +74,24 @@ const createJobContract = {
   prompt: '生成图片',
   contextMode: 'auto',
   imageModelProfileId: 'profile-flash',
-  position: { x: 10, y: 20 },
+  target: { kind: 'design-canvas', position: { x: 10, y: 20 } },
 } satisfies CreateDesignJobInput
+
+/** 编译期锁定创建阶段的 Canvas 图片目标不提前包含旧 Design 布局位置。 */
+const createCanvasImageTargetContract = {
+  kind: 'canvas-image',
+  canvasId: 'canvas-1',
+  nodeId: 'image-1',
+  imageModuleId: 'module-1',
+} satisfies CreateDesignJobTarget
+
+/** 编译期锁定持久化 Canvas 图片目标不要求旧 Design 节点位置。 */
+const canvasImageTargetContract = {
+  kind: 'canvas-image',
+  canvasId: 'canvas-1',
+  nodeId: 'image-1',
+  imageModuleId: 'module-1',
+} satisfies DesignJobTarget
 
 /** 编译期锁定创作上下文只保存可移植引用，不暴露来源绝对路径。 */
 const contextEntryContract = {
@@ -270,6 +293,11 @@ describe('Design 共享契约', () => {
   test('Given Design 首次尝试 When 构造公开记录 Then 创作任务与执行尝试拥有独立身份', () => {
     expect(jobContract.creativeTaskId).not.toBe(jobContract.id)
     expect(jobContract.attemptNumber).toBe(1)
+  })
+
+  test('Given Canvas Job target When 读取类型 Then 不要求旧画布 position', () => {
+    expect(createCanvasImageTargetContract).toEqual(canvasImageTargetContract)
+    expect('position' in canvasImageTargetContract).toBe(false)
   })
 
   test('Given 任务详情契约 When 序列化 Then 不包含内部会话或凭据字段', () => {

@@ -1,3 +1,5 @@
+import type { CanvasImageInputReference, DesignGenerationConstraints } from './canvas'
+
 /** Design 画布文档的当前 schema 版本。 */
 export const DESIGN_DOCUMENT_VERSION = 1
 
@@ -58,6 +60,16 @@ export interface DesignPoint {
   x: number
   y: number
 }
+
+/** 已持久化 Design Job 的明确输出目标。 */
+export type DesignJobTarget =
+  | { kind: 'design-canvas'; nodeId: string; position: DesignPoint }
+  | { kind: 'canvas-image'; canvasId: string; nodeId: string; imageModuleId: string }
+
+/** 创建 Design Job 时尚未分配旧 Design 节点 ID 的目标。 */
+export type CreateDesignJobTarget =
+  | { kind: 'design-canvas'; position: DesignPoint }
+  | { kind: 'canvas-image'; canvasId: string; nodeId: string; imageModuleId: string }
 
 /** 画布视口位置与缩放比例。 */
 export interface DesignViewport extends DesignPoint {
@@ -380,12 +392,17 @@ export interface DesignJobRecord extends DesignJobTraceSummary {
   creativeTaskId: string
   attemptNumber: number
   projectId: string
+  /** Task journal 迁移完成前兼容旧记录；主进程规范化后必须提供明确目标。 */
+  target?: DesignJobTarget
   sessionId?: string
   action: DesignJobAction
   status: DesignJobStatus
   prompt: string
   originalRequest: string
   contextMode: DesignContextMode
+  generationConstraints?: DesignGenerationConstraints
+  canvasInputReferences?: CanvasImageInputReference[]
+  canvasImageConfigRevision?: number
   sourceAgentMessageId?: string
   imageModelSnapshot?: ImageGenerationModelSnapshot
   sourceSessionId?: string
@@ -446,10 +463,16 @@ export interface CreateDesignJobInput {
   prompt: string
   contextMode: DesignContextMode
   imageModelProfileId: string
+  /** 新调用方使用明确目标；旧 Design 创建入口在迁移阶段仍可只提供 position。 */
+  target?: CreateDesignJobTarget
+  generationConstraints?: DesignGenerationConstraints
+  canvasInputReferences?: CanvasImageInputReference[]
+  canvasImageConfigRevision?: number
   sourceSessionId?: string
   sourceAssetId?: string
   maskAnnotationId?: string
-  position: DesignPoint
+  /** 旧 Design 创建合同的过渡字段，Task journal 迁移后由 design-canvas target 取代。 */
+  position?: DesignPoint
 }
 
 /** 查询项目创作上下文的输入。 */

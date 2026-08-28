@@ -623,6 +623,11 @@ export class DesignJobManager {
     if (!isSafeDesignStableId(creativeTaskId) || creativeTaskId === id) {
       throw new Error('Design 创作任务 ID 非法')
     }
+    /** 迁移期间同时接受旧 position 与新的 design-canvas 创建目标。 */
+    const designCanvasPosition = input.target?.kind === 'design-canvas'
+      ? input.target.position
+      : input.position
+    if (!designCanvasPosition) throw new Error('Design 任务缺少画布位置')
     const now = this.now()
     const job: StoredDesignJob = {
       id,
@@ -642,7 +647,7 @@ export class DesignJobManager {
       ...(input.maskAnnotationId ? { maskAnnotationId: input.maskAnnotationId } : {}),
       placementState: 'pending',
       nodeId: replaced?.nodeId ?? `design-job-${id}`,
-      position: replaced?.position ?? input.position,
+      position: replaced?.position ?? designCanvasPosition,
       createdAt: now,
       updatedAt: now,
     }

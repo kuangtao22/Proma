@@ -1,4 +1,4 @@
-import type { DesignPoint, DesignViewport } from './design'
+import type { DesignContextMode, DesignPoint, DesignViewport } from './design'
 import type { AgentSessionMeta } from './agent'
 import type { SDKMessage } from './agent'
 
@@ -53,6 +53,8 @@ export interface CanvasTrashEntry {
 
 /** Canvas 内容稳定 ID 的共享边界，与 native helper 合同保持一致。 */
 const CANVAS_CONTENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
+/** 图片提示词上限，避免配置、IPC 与任务 journal 被无界文本放大。 */
+export const CANVAS_IMAGE_PROMPT_MAX_LENGTH = 100_000
 /** Canvas 可恢复命令使用的 UUID，避免 operationId 与稳定内容 ID 混用。 */
 const CANVAS_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 /** Canvas 回收条目标题上限，避免无界数据进入 Renderer。 */
@@ -292,6 +294,65 @@ export interface CanvasTarget {
   canvasId: string
 }
 
+/** Canvas 图片模块的完整业务身份，所有配置和任务操作必须逐项匹配。 */
+export interface CanvasImageTarget extends CanvasTarget {
+  nodeId: string
+  imageModuleId: string
+}
+
+/** 图片模块支持的固定画面比例。 */
+export type CanvasImageAspectRatio = '1:1' | '16:9' | '4:3' | '9:16' | '3:4'
+
+/** 图片模块支持的固定输出尺寸。 */
+export type CanvasImageSize = 'auto' | '1K' | '2K' | '4K'
+
+/** 图片模块 schema v2 的权威持久化配置。 */
+export interface CanvasImageModuleConfig {
+  schemaVersion: 2
+  kind: 'image'
+  contentId: string
+  revision: number
+  createdAt: number
+  updatedAt: number
+  prompt: string
+  selectedModelProfileId: string | null
+  aspectRatio: CanvasImageAspectRatio
+  imageSize: CanvasImageSize
+  contextMode: DesignContextMode
+  adoptedAssetId: string | null
+}
+
+/** 保存图片模块可编辑配置时使用的 CAS 输入。 */
+export interface SaveCanvasImageModuleInput extends CanvasImageTarget {
+  expectedConfigRevision: number
+  prompt: string
+  selectedModelProfileId: string | null
+  aspectRatio: CanvasImageAspectRatio
+  imageSize: CanvasImageSize
+  contextMode: DesignContextMode
+}
+
+/** 取消、重试和读取任务时绑定完整图片模块身份的输入。 */
+export interface CanvasImageJobControlInput extends CanvasImageTarget {
+  jobId: string
+}
+
+/** Design Job 固化的结构化图片生成约束。 */
+export interface DesignGenerationConstraints {
+  aspectRatio: CanvasImageAspectRatio
+  imageSize: CanvasImageSize
+}
+
+/** 图片任务从一条直接入边固化的已提交输入引用。 */
+export interface CanvasImageInputReference {
+  nodeId: string
+  kind: CanvasNodeKind
+  revision: number
+  summary: string
+  summaryHash: string
+  assetId?: string
+}
+
 /** Canvas Agent 节点的项目、Canvas 与节点三重身份。 */
 export interface CanvasAgentTarget extends CanvasTarget {
   nodeId: string
@@ -324,6 +385,10 @@ export type CanvasPublicErrorCode =
   | 'CANVAS_AGENT_MESSAGES_FAILED'
   | 'CANVAS_AGENT_SEND_FAILED'
   | 'CANVAS_AGENT_STOP_FAILED'
+  | 'CANVAS_IMAGE_LOAD_FAILED'
+  | 'CANVAS_IMAGE_SAVE_FAILED'
+  | 'CANVAS_IMAGE_JOB_FAILED'
+  | 'CANVAS_IMAGE_REVISION_CONFLICT'
 
 /** 不含内部路径、UUID、通道或堆栈的公开错误。 */
 export interface CanvasPublicError {
@@ -434,6 +499,160 @@ function isCanvasLifecyclePosition(value: unknown): value is DesignPoint {
 /** 判断共享生命周期命令使用的稳定 ID。 */
 function isCanvasLifecycleId(value: unknown): value is string {
   return typeof value === 'string' && CANVAS_CONTENT_ID_PATTERN.test(value)
+}
+
+/** 判断未知值是否为图片模块支持的画面比例。 */
+function isCanvasImageAspectRatio(value: unknown): value is CanvasImageAspectRatio {
+  return value === '1:1' || value === '16:9' || value === '4:3' || value === '9:16' || value === '3:4'
+}
+
+/** 判断未知值是否为图片模块支持的输出尺寸。 */
+function isCanvasImageSize(value: unknown): value is CanvasImageSize {
+  return value === 'auto' || value === '1K' || value === '2K' || value === '4K'
+}
+
+/** 判断未知值是否为 Design 支持的项目上下文模式。 */
+function isCanvasImageContextMode(value: unknown): value is DesignContextMode {
+  return value === 'auto' || value === 'project' || value === 'none'
+}
+
+/** 判断可选稳定 ID 是否为 null 或安全 ID。 */
+function isOptionalCanvasImageId(value: unknown): value is string | null {
+  return value === null || isCanvasLifecycleId(value)
+}
+
+/** 判断图片提示词是否为有界字符串。 */
+function isCanvasImagePrompt(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= CANVAS_IMAGE_PROMPT_MAX_LENGTH
+}
+
+/**
+ * 严格解析图片模块完整身份。
+ * @param value 待解析的 IPC 或持久化边界值。
+ * @returns 无未知字段且四级身份均为安全 ID 的目标。
+ */
+export function parseCanvasImageTarget(value: unknown): CanvasImageTarget {
+  /** 图片目标允许的完整字段集合。 */
+  const keys = ['projectId', 'canvasId', 'nodeId', 'imageModuleId'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasLifecycleId(value.nodeId)
+    || !isCanvasLifecycleId(value.imageModuleId)) {
+    throw new Error('CANVAS_IMAGE_TARGET_INVALID')
+  }
+  return {
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    imageModuleId: value.imageModuleId,
+  }
+}
+
+/**
+ * 严格解析图片模块 schema v2 配置。
+ * @param value 待解析的未知磁盘或进程边界值。
+ * @returns 字段精确、枚举受限且文本有界的图片配置。
+ */
+export function parseCanvasImageModuleConfig(value: unknown): CanvasImageModuleConfig {
+  /** v2 图片配置允许的完整字段集合。 */
+  const keys = [
+    'schemaVersion', 'kind', 'contentId', 'revision', 'createdAt', 'updatedAt',
+    'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode',
+    'adoptedAssetId',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || value.schemaVersion !== 2
+    || value.kind !== 'image'
+    || !isCanvasLifecycleId(value.contentId)
+    || !isCanvasNonNegativeInteger(value.revision)
+    || !isCanvasNonNegativeInteger(value.createdAt)
+    || !isCanvasNonNegativeInteger(value.updatedAt)
+    || !isCanvasImagePrompt(value.prompt)
+    || !isOptionalCanvasImageId(value.selectedModelProfileId)
+    || !isCanvasImageAspectRatio(value.aspectRatio)
+    || !isCanvasImageSize(value.imageSize)
+    || !isCanvasImageContextMode(value.contextMode)
+    || !isOptionalCanvasImageId(value.adoptedAssetId)) {
+    throw new Error('CANVAS_IMAGE_CONFIG_INVALID')
+  }
+  return {
+    schemaVersion: 2,
+    kind: 'image',
+    contentId: value.contentId,
+    revision: value.revision,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+    prompt: value.prompt,
+    selectedModelProfileId: value.selectedModelProfileId,
+    aspectRatio: value.aspectRatio,
+    imageSize: value.imageSize,
+    contextMode: value.contextMode,
+    adoptedAssetId: value.adoptedAssetId,
+  }
+}
+
+/**
+ * 严格解析图片模块 CAS 保存输入。
+ * @param value 待解析的 Renderer 输入。
+ * @returns 身份、revision 和全部可编辑字段均已验证的保存命令。
+ */
+export function parseSaveCanvasImageModuleInput(value: unknown): SaveCanvasImageModuleInput {
+  /** 图片保存命令允许的完整字段集合。 */
+  const keys = [
+    'projectId', 'canvasId', 'nodeId', 'imageModuleId', 'expectedConfigRevision',
+    'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasLifecycleId(value.nodeId)
+    || !isCanvasLifecycleId(value.imageModuleId)
+    || !isCanvasNonNegativeInteger(value.expectedConfigRevision)
+    || !isCanvasImagePrompt(value.prompt)
+    || !isOptionalCanvasImageId(value.selectedModelProfileId)
+    || !isCanvasImageAspectRatio(value.aspectRatio)
+    || !isCanvasImageSize(value.imageSize)
+    || !isCanvasImageContextMode(value.contextMode)) {
+    throw new Error('CANVAS_IMAGE_SAVE_INPUT_INVALID')
+  }
+  return {
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    imageModuleId: value.imageModuleId,
+    expectedConfigRevision: value.expectedConfigRevision,
+    prompt: value.prompt,
+    selectedModelProfileId: value.selectedModelProfileId,
+    aspectRatio: value.aspectRatio,
+    imageSize: value.imageSize,
+    contextMode: value.contextMode,
+  }
+}
+
+/**
+ * 严格解析图片任务控制输入。
+ * @param value 待解析的 Renderer 输入。
+ * @returns 完整图片身份与安全任务 ID。
+ */
+export function parseCanvasImageJobControlInput(value: unknown): CanvasImageJobControlInput {
+  /** 图片任务控制命令允许的完整字段集合。 */
+  const keys = ['projectId', 'canvasId', 'nodeId', 'imageModuleId', 'jobId'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasLifecycleId(value.nodeId)
+    || !isCanvasLifecycleId(value.imageModuleId)
+    || !isCanvasLifecycleId(value.jobId)) {
+    throw new Error('CANVAS_IMAGE_JOB_INPUT_INVALID')
+  }
+  return {
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    imageModuleId: value.imageModuleId,
+    jobId: value.jobId,
+  }
 }
 
 /** 判断标题已规范化且长度有界。 */

@@ -4,6 +4,8 @@ import {
   CANVAS_DOCUMENT_VERSION,
   applyCanvasMutations,
   createEmptyCanvasDocument,
+  parseCanvasImageJobControlInput,
+  parseCanvasImageModuleConfig,
   parseCreateCanvasContentNodeInput,
   parseDeleteCanvasNodeInput,
   parseRestoreCanvasNodeInput,
@@ -17,6 +19,7 @@ import type {
   CanvasDocument,
   CanvasEdge,
   CanvasImageNode,
+  CanvasImageModuleConfig,
   CanvasDocumentNode,
   CanvasMutation,
   CanvasNode,
@@ -109,6 +112,67 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given v2 图片配置 When 严格解析 Then 保留结构化生成选项', () => {
+    /** 图片模块磁盘配置的完整合法样例。 */
+    const config = parseCanvasImageModuleConfig({
+      schemaVersion: 2,
+      kind: 'image',
+      contentId: 'module-1',
+      revision: 3,
+      createdAt: 10,
+      updatedAt: 20,
+      prompt: '首页主视觉',
+      selectedModelProfileId: 'profile-1',
+      aspectRatio: '16:9',
+      imageSize: '2K',
+      contextMode: 'project',
+      adoptedAssetId: 'asset-1',
+    }) satisfies CanvasImageModuleConfig
+
+    expect(config).toMatchObject({
+      aspectRatio: '16:9',
+      imageSize: '2K',
+      contextMode: 'project',
+    })
+  })
+
+  test('Given 图片配置含未知字段或超长提示词 When 严格解析 Then fail closed', () => {
+    /** 合法配置基线用于只改变单一非法字段。 */
+    const config = {
+      schemaVersion: 2,
+      kind: 'image',
+      contentId: 'module-1',
+      revision: 0,
+      createdAt: 10,
+      updatedAt: 10,
+      prompt: '首页主视觉',
+      selectedModelProfileId: null,
+      aspectRatio: '1:1',
+      imageSize: 'auto',
+      contextMode: 'auto',
+      adoptedAssetId: null,
+    }
+
+    expect(() => parseCanvasImageModuleConfig({ ...config, extra: true })).toThrow()
+    expect(() => parseCanvasImageModuleConfig({ ...config, prompt: 'x'.repeat(100_001) })).toThrow()
+    expect(() => parseCanvasImageModuleConfig({ ...config, aspectRatio: '2:1' })).toThrow()
+  })
+
+  test('Given 图片任务控制输入 When 严格解析 Then 绑定完整模块身份并拒绝未知字段', () => {
+    /** 合法任务控制输入必须携带完整图片模块身份。 */
+    const input = {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      nodeId: 'node-1',
+      imageModuleId: 'module-1',
+      jobId: 'job-1',
+    }
+
+    expect(parseCanvasImageJobControlInput(input)).toEqual(input)
+    expect(() => parseCanvasImageJobControlInput({ ...input, extra: true })).toThrow()
+    expect(() => parseCanvasImageJobControlInput({ ...input, imageModuleId: '../escape' })).toThrow()
+  })
+
   test('Given 内容节点创建命令 When 严格解析 Then 保留有限关系且拒绝未知字段', () => {
     const input = parseCreateCanvasContentNodeInput({
       projectId: 'project-1', canvasId: 'canvas-1',
