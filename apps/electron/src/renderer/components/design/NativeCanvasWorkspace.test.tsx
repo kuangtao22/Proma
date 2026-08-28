@@ -4,6 +4,8 @@ import type {
   CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
   CanvasDocument,
+  CanvasImageModuleConfig,
+  CanvasImageModuleSnapshot,
   CanvasNodeLifecycleResult,
   CanvasMutation,
   CanvasNodeKind,
@@ -11,36 +13,50 @@ import type {
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
+  DesignJobRecord,
+  DesignTaskDetails,
   RebuildCanvasAgentNodeResult,
 } from '@proma/shared'
 import { createStore, Provider } from 'jotai'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { NativeCanvasState } from '@/atoms/native-canvas-atoms'
 import {
+  canvasImageModuleStatesAtom,
   createInitialNativeCanvasState,
+  createCanvasImageModuleKey,
+  createInitialCanvasImageModuleState,
   createNativeCanvasKey,
   createNativeCanvasWorkbenchChangeUpdate,
   canvasAgentRunningSessionIdsAtom,
   nativeCanvasStatesAtom,
 } from '@/atoms/native-canvas-atoms'
+import {
+  createInitialDesignProjectState,
+  designProjectStatesAtom,
+} from '@/atoms/design-atoms'
 import { CanvasPublicOperationError } from '@/lib/design-adapter'
 import {
   NATIVE_CANVAS_COMMIT_UNCERTAIN_CODE,
   NATIVE_CANVAS_RECOVERY_REQUIRED_CODE,
   NATIVE_CANVAS_REVISION_CONFLICT_CODE,
   NATIVE_CANVAS_SAVE_DEBOUNCE_MS,
+  NATIVE_CANVAS_IMAGE_SAVE_DEBOUNCE_MS,
   NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
+  NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET,
   NativeCanvasWorkspace,
+  createCanvasImageDraftAutoSaveController,
   createCanvasNodeCommandController,
   createCanvasAgentNodeCommandController,
   createCanvasAgentNodeRebuildController,
   createNativeCanvasWorkbenchDraftCommitCoordinator,
+  createNativeCanvasWorkbenchCloseRequestUpdate,
   createNativeCanvasWorkbenchCleanupCoordinator,
   createNativeCanvasAgentNodeSuccessUpdate,
   createNativeCanvasNodeCreationSuccessUpdate,
   createNativeCanvasLifecycleSuccessUpdate,
   createResolvedNativeCanvasWorkbenchSwitchUpdate,
   getNativeCanvasWorkbenchCommitAvailability,
+  createNativeCanvasWorkbenchDraftCommitterKey,
   findNativeCanvasAgentNodeCreationPosition,
   createRebuiltNativeCanvasStateUpdate,
   createStopAcceptedPendingCanvasDelete,
@@ -50,6 +66,7 @@ import {
   getPendingCanvasStopDeleteGenerationStatus,
   isPendingCanvasStopDeleteCurrent,
   runNativeCanvasToolbarAddNode,
+  commitCanvasImageDraftAndCreateJob,
 } from './NativeCanvasWorkspace'
 import type {
   CanvasAgentNodeCommandState,
@@ -74,7 +91,204 @@ describe('原生 Canvas 顶部添加节点路由', () => {
   )
 })
 
+describe('Canvas 生图工作台接入', () => {
+  test('Given 连续修改图片配置 When 短延迟结束 Then 合并为一次自动保存', async () => {
+    const callbacks = new Map<number, () => void>()
+    const cleared: number[] = []
+    const commits: string[] = []
+    let nextTimerId = 0
+    const controller = createCanvasImageDraftAutoSaveController({
+      scheduler: {
+        setTimeout: (callback, delayMs) => {
+          expect(delayMs).toBe(NATIVE_CANVAS_IMAGE_SAVE_DEBOUNCE_MS)
+          const timerId = ++nextTimerId
+          callbacks.set(timerId, callback)
+          return timerId
+        },
+        clearTimeout: (timerId) => {
+          cleared.push(timerId)
+          callbacks.delete(timerId)
+        },
+      },
+      commitDraft: async () => {
+        commits.push('save-image-config')
+        return null
+      },
+    })
+
+    controller.schedule({
+      prompt: '首页第一版', selectedModelProfileId: 'profile-1', aspectRatio: '16:9',
+      imageSize: '2K', contextMode: 'project', dirty: true,
+    }, 'dirty')
+    controller.schedule({
+      prompt: '首页第二版', selectedModelProfileId: 'profile-1', aspectRatio: '16:9',
+      imageSize: '2K', contextMode: 'project', dirty: true,
+    }, 'dirty')
+
+    expect(cleared).toEqual([1])
+    callbacks.get(2)?.()
+    await Promise.resolve()
+    expect(commits).toEqual(['save-image-config'])
+  })
+
+  test('Given dirty 图片草稿 When 生成 Then 严格先保存再创建任务', async () => {
+    const calls: string[] = []
+    const config = { revision: 2 } as CanvasImageModuleConfig
+
+    await commitCanvasImageDraftAndCreateJob({
+      commitDraft: async () => {
+        calls.push('save-image-config')
+        return config
+      },
+      createJob: async () => {
+        calls.push('create-image-job')
+        return { id: 'job-1' } as DesignJobRecord
+      },
+    })
+
+    expect(calls).toEqual(['save-image-config', 'create-image-job'])
+  })
+
+  test('Given 图片配置保存失败 When 生成 Then 不创建付费任务', async () => {
+    let createJobCalls = 0
+
+    await expect(commitCanvasImageDraftAndCreateJob({
+      commitDraft: async () => {
+        throw new Error('保存失败')
+      },
+      createJob: async () => {
+        createJobCalls += 1
+        return { id: 'job-1' } as DesignJobRecord
+      },
+    })).rejects.toThrow('保存失败')
+
+    expect(createJobCalls).toBe(0)
+  })
+
+  test('Given 展开 image 节点 When 渲染 Then 挂载真实工作台且不显示占位文字', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const imageTarget = { ...target, nodeId: 'image-1', imageModuleId: 'module-1' }
+    const snapshot = createSnapshot(3, target)
+    snapshot.document.nodes = [{
+      id: imageTarget.nodeId,
+      kind: 'image',
+      title: '首页视觉',
+      imageModuleId: imageTarget.imageModuleId,
+      position: { x: 0, y: 0 },
+    }]
+    const imageSnapshot: CanvasImageModuleSnapshot = {
+      target: imageTarget,
+      config: {
+        schemaVersion: 2,
+        kind: 'image',
+        contentId: imageTarget.imageModuleId,
+        revision: 2,
+        createdAt: 1,
+        updatedAt: 2,
+        prompt: '生成首页效果图',
+        selectedModelProfileId: 'profile-1',
+        aspectRatio: '16:9',
+        imageSize: '2K',
+        contextMode: 'project',
+        adoptedAssetId: null,
+      },
+      jobs: [],
+      assets: [],
+      assetBaseUrl: 'proma-file://assets',
+      thumbnailBaseUrl: 'proma-file://thumbnails',
+    }
+    const store = createStore()
+    const workspaceKey = createNativeCanvasKey(target.projectId, target.canvasId)
+    const imageKey = createCanvasImageModuleKey(imageTarget)
+    store.set(nativeCanvasStatesAtom, new Map([[workspaceKey, {
+      ...createInitialNativeCanvasState(),
+      phase: 'ready',
+      snapshot,
+      selectedNodeId: imageTarget.nodeId,
+      expandedNodeId: imageTarget.nodeId,
+    }]]))
+    store.set(canvasImageModuleStatesAtom, new Map([[imageKey, {
+      ...createInitialCanvasImageModuleState(),
+      phase: 'ready',
+      snapshot: imageSnapshot,
+      draft: {
+        prompt: imageSnapshot.config.prompt,
+        selectedModelProfileId: imageSnapshot.config.selectedModelProfileId,
+        aspectRatio: imageSnapshot.config.aspectRatio,
+        imageSize: imageSnapshot.config.imageSize,
+        contextMode: imageSnapshot.config.contextMode,
+        dirty: false,
+      },
+    }]]))
+    store.set(designProjectStatesAtom, new Map([[target.projectId, {
+      ...createInitialDesignProjectState(),
+      imageModelLoadState: 'ready',
+      imageModelProfileId: 'profile-1',
+      imageModelOptions: [{
+        profileId: 'profile-1',
+        name: 'GPT Image 2',
+        modelId: 'gpt-image-2',
+        executor: 'openai-images',
+        channelId: 'channel-1',
+        available: true,
+      }],
+    }]]))
+    const job = { id: 'job-1' } as DesignJobRecord
+    const taskDetails = {
+      creativeTaskId: 'creative-1', currentJobId: 'job-1', attempts: [], traceState: 'ready',
+    } satisfies DesignTaskDetails
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          target={target}
+          title="首页 Canvas"
+          adapter={{
+            loadCanvas: async () => snapshot,
+            saveCanvas: async () => snapshot.document,
+            onCanvasChanged: () => () => {},
+            loadCanvasImageModule: async () => imageSnapshot,
+            saveCanvasImageModule: async () => imageSnapshot.config,
+            createCanvasImageJob: async () => job,
+            cancelCanvasImageJob: async () => job,
+            retryCanvasImageJob: async () => job,
+            adoptCanvasImageAsset: async () => imageSnapshot.config,
+            releaseCanvasImageMedia: async () => undefined,
+            onCanvasImageModuleChanged: () => () => {},
+            getTaskDetails: async () => taskDetails,
+            getTaskTrace: async () => taskDetails,
+            getImageModelSelection: async () => ({
+              projectId: target.projectId,
+              selectedProfileId: 'profile-1',
+              options: [],
+            }),
+            setImageModelSelection: async () => ({
+              projectId: target.projectId,
+              selectedProfileId: 'profile-1',
+              options: [],
+            }),
+            onImageModelProfilesChanged: () => () => {},
+            onImageModelSelectionChanged: () => () => {},
+          }}
+          flowRenderer={(props) => <>{props.nodes[0]?.data.workbench}</>}
+        />
+      </Provider>,
+    )
+
+    expect(html).toContain('生成图片')
+    expect(html).toContain('提示词')
+    expect(html).not.toContain('生图节点已创建')
+  })
+})
+
 describe('原生 Canvas 单工作台切换', () => {
+  test('Given 两个 Canvas 含同名节点 When 创建提交器键 Then Workspace 身份保持隔离', () => {
+    const first = createNativeCanvasWorkbenchDraftCommitterKey('project-1:canvas-a', 'image-1')
+    const second = createNativeCanvasWorkbenchDraftCommitterKey('project-1:canvas-b', 'image-1')
+
+    expect(first).not.toBe(second)
+  })
+
   test('Given 文档工作台有未保存草稿 When 请求展开原型 Then 只登记待切换且不改变图', () => {
     const current = createInitialNativeCanvasState()
     current.snapshot = createSnapshot(4)
@@ -92,6 +306,35 @@ describe('原生 Canvas 单工作台切换', () => {
     })
     expect(updated.snapshot?.document).toEqual(beforeDocument)
     expect(updated.pendingMutations).toEqual([])
+  })
+
+  test('Given 图片工作台有未保存草稿 When 请求关闭 Then 登记关闭目标并保留当前内容', () => {
+    const current = createInitialNativeCanvasState()
+    current.expandedNodeId = 'node-image'
+    current.workbenchDraft = { nodeId: 'node-image', dirty: true }
+
+    expect(createNativeCanvasWorkbenchCloseRequestUpdate(current)).toEqual({
+      pendingWorkbenchSwitchNodeId: NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET,
+    })
+    expect(createResolvedNativeCanvasWorkbenchSwitchUpdate({
+      ...current,
+      pendingWorkbenchSwitchNodeId: NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET,
+    })).toEqual({
+      expandedNodeId: null,
+      pendingWorkbenchSwitchNodeId: null,
+      workbenchDraft: null,
+    })
+  })
+
+  test('Given 当前工作台没有未保存草稿 When 请求关闭 Then 立即关闭', () => {
+    const current = createInitialNativeCanvasState()
+    current.expandedNodeId = 'node-image'
+
+    expect(createNativeCanvasWorkbenchCloseRequestUpdate(current)).toEqual({
+      expandedNodeId: null,
+      pendingWorkbenchSwitchNodeId: null,
+      workbenchDraft: null,
+    })
   })
 
   test('Given 已确认放弃草稿 When 完成切换 Then 同时只保留目标工作台', () => {

@@ -7,6 +7,11 @@ import { updateDesignProjectStateAtom } from '@/atoms/design-atoms'
 import type { DesignAdapter } from '@/lib/design-adapter'
 import { designAdapter } from '@/lib/design-adapter'
 
+/** 项目生图模型选择 hook 使用的最小 Adapter 合同。 */
+export type DesignImageModelSelectionAdapter = Pick<DesignAdapter,
+  'getImageModelSelection' | 'setImageModelSelection'
+  | 'onImageModelProfilesChanged' | 'onImageModelSelectionChanged'>
+
 /** 生图模型 controller 可写入的项目局部状态。 */
 export type DesignImageModelStateUpdate = Partial<DesignProjectState>
   | ((current: DesignProjectState) => Partial<DesignProjectState>)
@@ -16,9 +21,7 @@ export interface DesignImageModelSelectionControllerDependencies {
   /** 当前 Inspector 绑定的稳定项目 ID。 */
   projectId: string
   /** 只包含模型选择 IPC 的 Renderer adapter。 */
-  adapter: Pick<DesignAdapter,
-    'getImageModelSelection' | 'setImageModelSelection'
-    | 'onImageModelProfilesChanged' | 'onImageModelSelectionChanged'>
+  adapter: DesignImageModelSelectionAdapter
   /** 原子更新当前项目状态。 */
   updateState: (update: DesignImageModelStateUpdate) => void
   /** 向用户展示选择写入失败。 */
@@ -162,7 +165,10 @@ export interface UseDesignImageModelSelectionResult {
 }
 
 /** 连接项目 Jotai 状态、模型 IPC 和跨窗口广播。 */
-export function useDesignImageModelSelection(projectId: string): UseDesignImageModelSelectionResult {
+export function useDesignImageModelSelection(
+  projectId: string,
+  adapter: DesignImageModelSelectionAdapter = designAdapter,
+): UseDesignImageModelSelectionResult {
   const updateProjectState = useSetAtom(updateDesignProjectStateAtom)
   /** 当前挂载项目的 controller 引用，供事件回调稳定调用。 */
   const controllerRef = React.useRef<DesignImageModelSelectionController | null>(null)
@@ -171,7 +177,7 @@ export function useDesignImageModelSelection(projectId: string): UseDesignImageM
     /** Hook 只拥有模型选择生命周期，不进入画布 load/save controller。 */
     const controller = createDesignImageModelSelectionController({
       projectId,
-      adapter: designAdapter,
+      adapter,
       updateState: (update) => updateProjectState({ projectId, update }),
       onError: (message) => toast.error(message),
     })
@@ -181,7 +187,7 @@ export function useDesignImageModelSelection(projectId: string): UseDesignImageM
       controller.dispose()
       if (controllerRef.current === controller) controllerRef.current = null
     }
-  }, [projectId, updateProjectState])
+  }, [adapter, projectId, updateProjectState])
 
   return React.useMemo(() => ({
     selectProfile: (profileId: string) => controllerRef.current?.selectProfile(profileId),

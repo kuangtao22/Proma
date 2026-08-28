@@ -5,6 +5,7 @@ import type {
   CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
   CanvasDocument,
+  CanvasImageModuleConfig,
   CanvasNodeLifecycleResult,
   CanvasMutation,
   CanvasNode,
@@ -15,6 +16,7 @@ import type {
   CreateCanvasContentNodeInput,
   DeleteCanvasNodeInput,
   DesignPoint,
+  DesignJobRecord,
   RebuildCanvasAgentNodeInput,
   RebuildCanvasAgentNodeResult,
 } from '@proma/shared'
@@ -30,7 +32,20 @@ import {
   nativeCanvasStatesAtom,
   updateNativeCanvasStateAtom,
 } from '@/atoms/native-canvas-atoms'
-import type { NativeCanvasState } from '@/atoms/native-canvas-atoms'
+import type {
+  CanvasImageModuleDraft,
+  CanvasImageModuleSaveState,
+  NativeCanvasState,
+} from '@/atoms/native-canvas-atoms'
+import {
+  createInitialDesignProjectState,
+  designProjectStatesAtom,
+} from '@/atoms/design-atoms'
+import {
+  channelSettingsFocusAtom,
+  settingsOpenAtom,
+  settingsTabAtom,
+} from '@/atoms/settings-tab'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -42,8 +57,10 @@ import {
 } from '@/components/ui/dialog'
 import { CanvasPublicOperationError, designAdapter } from '@/lib/design-adapter'
 import type { DesignAdapter } from '@/lib/design-adapter'
+import { copyTextToClipboard } from '@/lib/clipboard'
 import { CanvasAgentRecoveryPanel } from './CanvasAgentRecoveryPanel'
 import { CanvasNodeWorkbenchOverlay } from './CanvasNodeWorkbenchOverlay'
+import { CanvasImageWorkbench } from './CanvasImageWorkbench'
 import { NativeCanvasGraph } from './NativeCanvasGraph'
 import type { NativeCanvasFlowRenderer } from './NativeCanvasGraph'
 import { NativeCanvasDeleteDialog, isNativeCanvasDeleteShortcut } from './NativeCanvasDeleteDialog'
@@ -70,9 +87,23 @@ import {
   overlapsNativeCanvasNodes,
   replayNativeCanvasPositionMutations,
 } from './native-canvas-model'
+import {
+  useCanvasImageModule,
+  type CanvasImageModuleAdapter,
+} from './use-canvas-image-module'
+import {
+  useDesignImageModelSelection,
+  type DesignImageModelSelectionAdapter,
+} from './use-design-image-model-selection'
 
 /** 原生 Canvas 自动保存采用 400ms 尾触发。 */
 export const NATIVE_CANVAS_SAVE_DEBOUNCE_MS = 400
+
+/** 图片配置连续编辑合并为一次保存，避免每次输入都触发磁盘写入。 */
+export const NATIVE_CANVAS_IMAGE_SAVE_DEBOUNCE_MS = 500
+
+/** 合法节点 ID 不允许使用该内部保留值，用于复用 dirty 切换确认关闭工作台。 */
+export const NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET = '__close-workbench__'
 /** SAVE 要求立即加载权威恢复快照的稳定错误前缀。 */
 export const NATIVE_CANVAS_RECOVERY_REQUIRED_CODE = 'CANVAS_RECOVERY_REQUIRED'
 /** SAVE 基线 revision 已落后的稳定错误前缀。 */
@@ -110,6 +141,22 @@ export interface NativeCanvasAdapter {
   getCanvasAgentMessages?: DesignAdapter['getCanvasAgentMessages']
   sendCanvasAgentMessage?: DesignAdapter['sendCanvasAgentMessage']
   stopCanvasAgent?: DesignAdapter['stopCanvasAgent']
+  /** 图片模块完整能力只在展开图片节点时按需组合。 */
+  loadCanvasImageModule?: DesignAdapter['loadCanvasImageModule']
+  saveCanvasImageModule?: DesignAdapter['saveCanvasImageModule']
+  createCanvasImageJob?: DesignAdapter['createCanvasImageJob']
+  cancelCanvasImageJob?: DesignAdapter['cancelCanvasImageJob']
+  retryCanvasImageJob?: DesignAdapter['retryCanvasImageJob']
+  adoptCanvasImageAsset?: DesignAdapter['adoptCanvasImageAsset']
+  releaseCanvasImageMedia?: DesignAdapter['releaseCanvasImageMedia']
+  onCanvasImageModuleChanged?: DesignAdapter['onCanvasImageModuleChanged']
+  getTaskDetails?: DesignAdapter['getTaskDetails']
+  getTaskTrace?: DesignAdapter['getTaskTrace']
+  /** Canvas 工作台复用项目模型目录，但模型选择仍写入图片模块草稿。 */
+  getImageModelSelection?: DesignAdapter['getImageModelSelection']
+  setImageModelSelection?: DesignAdapter['setImageModelSelection']
+  onImageModelProfilesChanged?: DesignAdapter['onImageModelProfilesChanged']
+  onImageModelSelectionChanged?: DesignAdapter['onImageModelSelectionChanged']
 }
 
 /** 添加 Agent 按钮的局部异步状态。 */
@@ -211,7 +258,9 @@ export function createResolvedNativeCanvasWorkbenchSwitchUpdate(
   current: NativeCanvasState,
 ): Pick<NativeCanvasState, 'expandedNodeId' | 'pendingWorkbenchSwitchNodeId' | 'workbenchDraft'> {
   return {
-    expandedNodeId: current.pendingWorkbenchSwitchNodeId,
+    expandedNodeId: current.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
+      ? null
+      : current.pendingWorkbenchSwitchNodeId,
     pendingWorkbenchSwitchNodeId: null,
     workbenchDraft: null,
   }
@@ -227,6 +276,22 @@ export function createClosedNativeCanvasWorkbenchUpdate(): Pick<
     pendingWorkbenchSwitchNodeId: null,
     workbenchDraft: null,
   }
+}
+
+/**
+ * 请求关闭工作台；dirty 时登记内部关闭目标并复用保存、放弃、取消确认。
+ * @param current 当前 Canvas 临时状态。
+ * @returns 立即关闭或等待确认的局部状态更新。
+ */
+export function createNativeCanvasWorkbenchCloseRequestUpdate(
+  current: NativeCanvasState,
+): Partial<NativeCanvasState> {
+  if (current.expandedNodeId
+    && current.workbenchDraft?.nodeId === current.expandedNodeId
+    && current.workbenchDraft.dirty) {
+    return { pendingWorkbenchSwitchNodeId: NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET }
+  }
+  return createClosedNativeCanvasWorkbenchUpdate()
 }
 
 /** 工作台卸载清理协调器使用的微任务调度入口。 */
@@ -837,6 +902,97 @@ export interface NativeCanvasScheduler {
   clearTimeout: (timerId: number) => void
 }
 
+/** 图片草稿尾触发自动保存控制器。 */
+export interface CanvasImageDraftAutoSaveController {
+  /** 根据最新草稿与保存状态重排一次自动保存。 */
+  schedule: (
+    draft: CanvasImageModuleDraft | null,
+    saveState: CanvasImageModuleSaveState,
+    enabled?: boolean,
+  ) => void
+  /** 真实卸载时取消定时器并隔离迟到回调。 */
+  dispose: () => void
+}
+
+/** 图片草稿自动保存控制器依赖。 */
+export interface CanvasImageDraftAutoSaveDependencies {
+  scheduler: NativeCanvasScheduler
+  commitDraft: () => Promise<CanvasImageModuleConfig | null>
+}
+
+/** 将可编辑字段序列化为稳定签名，用于区分新编辑与同内容失败重试。 */
+function createCanvasImageDraftSignature(draft: CanvasImageModuleDraft): string {
+  return JSON.stringify([
+    draft.prompt,
+    draft.selectedModelProfileId,
+    draft.aspectRatio,
+    draft.imageSize,
+    draft.contextMode,
+  ])
+}
+
+/**
+ * 创建图片草稿尾触发自动保存控制器。
+ * @param dependencies 调度器和当前图片模块提交命令。
+ * @returns 连续输入合并、保存串行且卸载安全的控制器。
+ */
+export function createCanvasImageDraftAutoSaveController(
+  dependencies: CanvasImageDraftAutoSaveDependencies,
+): CanvasImageDraftAutoSaveController {
+  let timerId: number | null = null
+  let disposed = false
+  let inFlight = false
+  let latestDraft: CanvasImageModuleDraft | null = null
+  let latestSaveState: CanvasImageModuleSaveState = 'saved'
+  let enabled = true
+  let lastAttemptedSignature: string | null = null
+
+  /** 清理尚未触发的保存，不影响已经进入主进程的请求。 */
+  const clearTimer = (): void => {
+    if (timerId === null) return
+    dependencies.scheduler.clearTimeout(timerId)
+    timerId = null
+  }
+
+  /** 使用最新状态安排一次保存；同内容失败不会形成无限重试。 */
+  const scheduleLatest = (): void => {
+    clearTimer()
+    if (disposed || !enabled || inFlight || !latestDraft?.dirty
+      || latestSaveState === 'saving' || latestSaveState === 'conflict') return
+    const signature = createCanvasImageDraftSignature(latestDraft)
+    if (latestSaveState === 'failed' && signature === lastAttemptedSignature) return
+    timerId = dependencies.scheduler.setTimeout(() => {
+      timerId = null
+      if (disposed || !enabled || inFlight) return
+      inFlight = true
+      lastAttemptedSignature = signature
+      void dependencies.commitDraft().catch(() => undefined).finally(() => {
+        inFlight = false
+        if (!disposed && latestDraft?.dirty
+          && createCanvasImageDraftSignature(latestDraft) !== lastAttemptedSignature) {
+          scheduleLatest()
+        }
+      })
+    }, NATIVE_CANVAS_IMAGE_SAVE_DEBOUNCE_MS)
+  }
+
+  return {
+    schedule: (draft, saveState, nextEnabled = true) => {
+      latestDraft = draft
+      latestSaveState = saveState
+      enabled = nextEnabled
+      if (!draft?.dirty) lastAttemptedSignature = null
+      scheduleLatest()
+    },
+    dispose: () => {
+      if (disposed) return
+      disposed = true
+      clearTimer()
+      latestDraft = null
+    },
+  }
+}
+
 /** controller 状态更新既支持局部值也支持基于最新状态计算。 */
 export type NativeCanvasStateUpdate = Partial<NativeCanvasState>
   | ((current: NativeCanvasState) => Partial<NativeCanvasState>)
@@ -1277,6 +1433,207 @@ export interface NativeCanvasWorkbenchDraftCommitter {
   commitDraft: () => Promise<void>
 }
 
+/** 创建包含 Workspace 与节点双身份的提交器注册键。 */
+export function createNativeCanvasWorkbenchDraftCommitterKey(
+  stateKey: string,
+  nodeId: string,
+): string {
+  return JSON.stringify([stateKey, nodeId])
+}
+
+/** 图片工作台同时需要模块命令和项目模型目录命令。 */
+type NativeCanvasImageWorkbenchAdapter = CanvasImageModuleAdapter & DesignImageModelSelectionAdapter
+
+/** 图片工作台向当前 Workspace 动态登记草稿提交器。 */
+type RegisterNativeCanvasWorkbenchDraftCommitter = (
+  committer: NativeCanvasWorkbenchDraftCommitter,
+) => () => void
+
+/** 生图前置流程只依赖保存和创建两个顺序命令。 */
+export interface CanvasImageGenerationPreflightDependencies {
+  commitDraft: () => Promise<CanvasImageModuleConfig | null>
+  createJob: () => Promise<DesignJobRecord | null>
+}
+
+/**
+ * 保存当前图片配置后才允许创建付费任务。
+ * @param dependencies 当前图片模块的保存和创建命令。
+ * @returns 主进程返回的任务；工作台已失效时返回 null。
+ */
+export async function commitCanvasImageDraftAndCreateJob(
+  dependencies: CanvasImageGenerationPreflightDependencies,
+): Promise<DesignJobRecord | null> {
+  /** null 表示模块已经失效或没有权威配置，必须停止创建。 */
+  const savedConfig = await dependencies.commitDraft()
+  if (!savedConfig) return null
+  return dependencies.createJob()
+}
+
+/** 从 Workspace 可选 Adapter 中提取图片工作台需要的完整窄合同。 */
+function createNativeCanvasImageWorkbenchAdapter(
+  adapter: NativeCanvasAdapter,
+): NativeCanvasImageWorkbenchAdapter | null {
+  if (!adapter.loadCanvasImageModule
+    || !adapter.saveCanvasImageModule
+    || !adapter.createCanvasImageJob
+    || !adapter.cancelCanvasImageJob
+    || !adapter.retryCanvasImageJob
+    || !adapter.adoptCanvasImageAsset
+    || !adapter.releaseCanvasImageMedia
+    || !adapter.onCanvasImageModuleChanged
+    || !adapter.getTaskDetails
+    || !adapter.getTaskTrace
+    || !adapter.getImageModelSelection
+    || !adapter.setImageModelSelection
+    || !adapter.onImageModelProfilesChanged
+    || !adapter.onImageModelSelectionChanged) return null
+  return {
+    loadCanvasImageModule: adapter.loadCanvasImageModule,
+    saveCanvasImageModule: adapter.saveCanvasImageModule,
+    createCanvasImageJob: adapter.createCanvasImageJob,
+    cancelCanvasImageJob: adapter.cancelCanvasImageJob,
+    retryCanvasImageJob: adapter.retryCanvasImageJob,
+    adoptCanvasImageAsset: adapter.adoptCanvasImageAsset,
+    releaseCanvasImageMedia: adapter.releaseCanvasImageMedia,
+    onCanvasImageModuleChanged: adapter.onCanvasImageModuleChanged,
+    getTaskDetails: adapter.getTaskDetails,
+    getTaskTrace: adapter.getTaskTrace,
+    getImageModelSelection: adapter.getImageModelSelection,
+    setImageModelSelection: adapter.setImageModelSelection,
+    onImageModelProfilesChanged: adapter.onImageModelProfilesChanged,
+    onImageModelSelectionChanged: adapter.onImageModelSelectionChanged,
+  }
+}
+
+/** 当前展开图片节点的真实工作台输入。 */
+interface CanvasImageNodeWorkbenchProps {
+  node: Extract<CanvasNode, { kind: 'image' }>
+  target: CanvasTarget
+  writable: boolean
+  adapter: NativeCanvasImageWorkbenchAdapter
+  autoSaveEnabled: boolean
+  onDirtyChange: (nodeId: string, dirty: boolean) => void
+  onRegisterDraftCommitter: RegisterNativeCanvasWorkbenchDraftCommitter
+}
+
+/** 只在图片节点展开时挂载模块状态、模型目录和媒体授权。 */
+function CanvasImageNodeWorkbench({
+  node,
+  target,
+  writable,
+  adapter,
+  autoSaveEnabled,
+  onDirtyChange,
+  onRegisterDraftCommitter,
+}: CanvasImageNodeWorkbenchProps): React.ReactElement {
+  /** 图片节点的四元业务身份。 */
+  const imageTarget = React.useMemo(() => ({
+    ...target,
+    nodeId: node.id,
+    imageModuleId: node.imageModuleId,
+  }), [node.id, node.imageModuleId, target.canvasId, target.projectId])
+  /** 当前图片模块独立的状态和命令。 */
+  const imageModule = useCanvasImageModule(imageTarget, adapter)
+  /** 模型目录复用项目级清洗选项，不改变图片模块自己的选择。 */
+  const projectModelStates = useAtomValue(designProjectStatesAtom)
+  /** 还未加载模型目录时使用不共享集合的项目初始状态。 */
+  const fallbackModelState = React.useMemo(createInitialDesignProjectState, [target.projectId])
+  /** 当前项目模型目录状态。 */
+  const modelState = projectModelStates.get(target.projectId) ?? fallbackModelState
+  /** 模型广播和手动重试命令。 */
+  const modelSelection = useDesignImageModelSelection(target.projectId, adapter)
+  /** 打开设置面板所需的三个原子命令。 */
+  const setSettingsOpen = useSetAtom(settingsOpenAtom)
+  const setSettingsTab = useSetAtom(settingsTabAtom)
+  const setChannelSettingsFocus = useSetAtom(channelSettingsFocusAtom)
+  /** 提交器始终转发到最近一次 render 的模块命令。 */
+  const commitDraftRef = React.useRef(imageModule.commitDraft)
+  commitDraftRef.current = imageModule.commitDraft
+  /** 当前挂载节点独占一个尾触发保存控制器，切换确认时会暂停。 */
+  const autoSaveController = React.useMemo(() => createCanvasImageDraftAutoSaveController({
+    scheduler: {
+      setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
+      clearTimeout: (timerId) => window.clearTimeout(timerId),
+    },
+    commitDraft: () => commitDraftRef.current(),
+  }), [])
+
+  React.useEffect(() => onRegisterDraftCommitter({
+    nodeId: node.id,
+    commitDraft: async () => {
+      await commitDraftRef.current()
+    },
+  }), [node.id, onRegisterDraftCommitter])
+
+  React.useEffect(() => {
+    onDirtyChange(node.id, imageModule.state.draft?.dirty === true)
+  }, [imageModule.state.draft?.dirty, node.id, onDirtyChange])
+
+  React.useEffect(() => {
+    autoSaveController.schedule(
+      imageModule.state.draft,
+      imageModule.state.saveState,
+      autoSaveEnabled,
+    )
+  }, [
+    autoSaveController,
+    autoSaveEnabled,
+    imageModule.state.draft,
+    imageModule.state.saveState,
+  ])
+
+  React.useEffect(() => () => autoSaveController.dispose(), [autoSaveController])
+
+  /** 打开渠道设置并聚焦生图模型区。 */
+  const configureModels = React.useCallback((): void => {
+    setSettingsTab('channels')
+    setChannelSettingsFocus('image-models')
+    setSettingsOpen(true)
+  }, [setChannelSettingsFocus, setSettingsOpen, setSettingsTab])
+
+  /** 生成严格等待草稿提交成功；错误由图片模块状态原位展示。 */
+  const generate = React.useCallback((): void => {
+    void commitCanvasImageDraftAndCreateJob({
+      commitDraft: imageModule.commitDraft,
+      createJob: imageModule.createJob,
+    }).catch(() => undefined)
+  }, [imageModule.commitDraft, imageModule.createJob])
+
+  /** 采用历史素材前从权威任务列表解析它的来源 Job。 */
+  const adoptAsset = React.useCallback((assetId: string): void => {
+    const sourceJob = imageModule.state.snapshot?.jobs.find((job) => (
+      job.status === 'succeeded' && job.outputAssetId === assetId
+    ))
+    if (!sourceJob) return
+    void imageModule.adoptAsset(sourceJob.id, assetId).catch(() => undefined)
+  }, [imageModule])
+
+  return (
+    <CanvasImageWorkbench
+      state={imageModule.state}
+      writable={writable}
+      imageModelOptions={modelState.imageModelOptions}
+      imageModelLoadState={modelState.imageModelLoadState}
+      imageModelError={modelState.imageModelError}
+      onDraftChange={imageModule.updateDraft}
+      onGenerate={generate}
+      onCancel={(jobId) => { void imageModule.cancelJob(jobId).catch(() => undefined) }}
+      onRetry={(jobId) => { void imageModule.retryJob(jobId).catch(() => undefined) }}
+      onPreviewAsset={(assetId) => imageModule.previewAsset(assetId)}
+      onAdoptAsset={adoptAsset}
+      onLoadTaskDetails={(jobId, includeTrace) => {
+        void imageModule.loadTaskDetails(jobId, includeTrace).catch(() => undefined)
+      }}
+      onConfigureModels={configureModels}
+      onRetryLoad={() => {
+        imageModule.retryLoad()
+        if (modelState.imageModelLoadState === 'failed') modelSelection.retryLoad()
+      }}
+      onCopyPrompt={(prompt) => { void copyTextToClipboard(prompt).catch(() => undefined) }}
+    />
+  )
+}
+
 /** dirty 工作台保存按钮的稳定可用性结果。 */
 export interface NativeCanvasWorkbenchCommitAvailability {
   enabled: boolean
@@ -1377,8 +1734,6 @@ export interface NativeCanvasWorkspaceProps {
   flowRenderer?: NativeCanvasFlowRenderer
   /** 测试或宿主可注入对话渲染器；默认使用真实 Canvas Agent 对话组件。 */
   conversationRenderer?: React.ComponentType<CanvasAgentConversationProps>
-  /** 后续重内容编辑器只通过该窄接口注册草稿提交能力。 */
-  workbenchDraftCommitter?: NativeCanvasWorkbenchDraftCommitter
 }
 
 /** 将隔离 Jotai 状态绑定到纯 controller，并渲染当前加载阶段。 */
@@ -1388,7 +1743,6 @@ export function NativeCanvasWorkspace({
   adapter = designAdapter,
   flowRenderer,
   conversationRenderer,
-  workbenchDraftCommitter,
 }: NativeCanvasWorkspaceProps): React.ReactElement {
   /** 双身份 key 决定唯一状态与 effect 生命周期。 */
   const stateKey = createNativeCanvasKey(target.projectId, target.canvasId)
@@ -1427,6 +1781,16 @@ export function NativeCanvasWorkspace({
   })
   const [workbenchSwitchSaving, setWorkbenchSwitchSaving] = React.useState(false)
   const [workbenchSwitchError, setWorkbenchSwitchError] = React.useState<string | null>(null)
+  /** 已挂载重内容工作台按节点 ID 动态登记的提交器。 */
+  const [workbenchDraftCommitters, setWorkbenchDraftCommitters] = React.useState<Map<
+    string,
+    NativeCanvasWorkbenchDraftCommitter
+  >>(() => new Map())
+  /** 图片工作台只有在 Adapter 四组合同齐全时才接通。 */
+  const imageWorkbenchAdapter = React.useMemo(
+    () => createNativeCanvasImageWorkbenchAdapter(adapter),
+    [adapter],
+  )
   /** 当前渲染的 Workspace key，供迟到草稿保存结果复核组件身份。 */
   const currentWorkspaceKeyRef = React.useRef(stateKey)
   currentWorkspaceKeyRef.current = stateKey
@@ -1477,6 +1841,25 @@ export function NativeCanvasWorkspace({
   /** 运行态仅按当前 Agent 节点绑定的 session 判断。 */
   const selectedNodeBusy = selectedNode?.kind === 'agent'
     && runningSessionIds.has(selectedNode.agentSessionId)
+
+  /** 登记提交器并返回身份安全的释放函数，迟到 cleanup 不删除新实例。 */
+  const registerWorkbenchDraftCommitter = React.useCallback<RegisterNativeCanvasWorkbenchDraftCommitter>((committer) => {
+    /** 注册键必须包含 Canvas，避免同名节点跨 Workspace 复用。 */
+    const registryKey = createNativeCanvasWorkbenchDraftCommitterKey(stateKey, committer.nodeId)
+    setWorkbenchDraftCommitters((current) => {
+      const next = new Map(current)
+      next.set(registryKey, committer)
+      return next
+    })
+    return () => {
+      setWorkbenchDraftCommitters((current) => {
+        if (current.get(registryKey) !== committer) return current
+        const next = new Map(current)
+        next.delete(registryKey)
+        return next
+      })
+    }
+  }, [stateKey])
 
   React.useEffect(() => {
     /** 浏览器调度器仅在 effect 内创建，SSR 不触发副作用。 */
@@ -1674,18 +2057,26 @@ export function NativeCanvasWorkspace({
   const connectedEdgeCount = state.snapshot && selectedNode
     ? getNativeCanvasConnectedEdgeCount(state.snapshot.document, selectedNode.id)
     : 0
+  /** 切换确认只读取当前展开节点自己登记的提交器。 */
+  const currentWorkbenchDraftCommitter = state.expandedNodeId
+    ? workbenchDraftCommitters.get(createNativeCanvasWorkbenchDraftCommitterKey(
+        stateKey,
+        state.expandedNodeId,
+      ))
+    : undefined
   /** dirty 保存严格绑定当前节点注册的窄提交器。 */
   const workbenchCommitAvailability = getNativeCanvasWorkbenchCommitAvailability(
     state.expandedNodeId,
-    workbenchDraftCommitter,
+    currentWorkbenchDraftCommitter,
   )
 
-  /** 收起节点工作台只清理 Renderer 临时态，不改变图和普通选区。 */
+  /** 收起节点工作台；dirty 时复用保存、放弃、取消确认，不改变图和普通选区。 */
   const closeWorkbench = React.useCallback((): void => {
     workbenchDraftCommitCoordinatorRef.current?.invalidate()
+    setWorkbenchSwitchError(null)
     updateNativeCanvasState({
       key: stateKey,
-      update: createClosedNativeCanvasWorkbenchUpdate(),
+      update: createNativeCanvasWorkbenchCloseRequestUpdate,
     })
   }, [stateKey, updateNativeCanvasState])
 
@@ -1696,6 +2087,20 @@ export function NativeCanvasWorkspace({
     updateNativeCanvasState({
       key: stateKey,
       update: (current) => createNativeCanvasWorkbenchChangeUpdate(current, nodeId),
+    })
+  }, [stateKey, updateNativeCanvasState])
+
+  /** 同步当前展开节点的 dirty 状态，其他节点的迟到 effect 无副作用。 */
+  const updateWorkbenchDirty = React.useCallback((nodeId: string, nextDirty: boolean): void => {
+    updateNativeCanvasState({
+      key: stateKey,
+      update: (current) => {
+        if (current.expandedNodeId !== nodeId) return {}
+        const currentDirty = current.workbenchDraft?.nodeId === nodeId
+          && current.workbenchDraft.dirty
+        if (currentDirty === nextDirty) return {}
+        return { workbenchDraft: nextDirty ? { nodeId, dirty: true } : null }
+      },
     })
   }, [stateKey, updateNativeCanvasState])
 
@@ -1714,7 +2119,7 @@ export function NativeCanvasWorkspace({
     const currentNodeId = state.expandedNodeId
     const targetNodeId = state.pendingWorkbenchSwitchNodeId
     if (!currentNodeId || !targetNodeId
-      || !workbenchCommitAvailability.enabled || !workbenchDraftCommitter) return
+      || !workbenchCommitAvailability.enabled || !currentWorkbenchDraftCommitter) return
     setWorkbenchSwitchSaving(true)
     setWorkbenchSwitchError(null)
     void workbenchDraftCommitCoordinatorRef.current?.execute({
@@ -1722,7 +2127,7 @@ export function NativeCanvasWorkspace({
       sourceExpandedNodeId: currentNodeId,
       sourceDraftNodeId: state.workbenchDraft?.nodeId ?? null,
       targetNodeId,
-      commitDraft: workbenchDraftCommitter.commitDraft,
+      commitDraft: currentWorkbenchDraftCommitter.commitDraft,
     })
   }, [
     state.expandedNodeId,
@@ -1730,7 +2135,7 @@ export function NativeCanvasWorkspace({
     state.workbenchDraft?.nodeId,
     stateKey,
     workbenchCommitAvailability.enabled,
-    workbenchDraftCommitter,
+    currentWorkbenchDraftCommitter,
   ])
 
   /** 打开统一删除确认框，并清理上一次停止错误。 */
@@ -1990,17 +2395,25 @@ export function NativeCanvasWorkspace({
           />
         )
       }
+    } else if (node.kind === 'image' && imageWorkbenchAdapter) {
+      content = (
+        <CanvasImageNodeWorkbench
+          key={`${target.projectId}:${target.canvasId}:${node.id}:image`}
+          node={node}
+          target={target}
+          writable={workspaceWritable}
+          adapter={imageWorkbenchAdapter}
+          autoSaveEnabled={state.pendingWorkbenchSwitchNodeId === null}
+          onDirtyChange={updateWorkbenchDirty}
+          onRegisterDraftCommitter={registerWorkbenchDraftCommitter}
+        />
+      )
     }
     return (
       <CanvasNodeWorkbenchOverlay
         node={node}
         dirty={dirty}
-        onDirtyChange={(nextDirty) => updateNativeCanvasState({
-          key: stateKey,
-          update: (current) => current.expandedNodeId === node.id
-            ? { workbenchDraft: nextDirty ? { nodeId: node.id, dirty: true } : null }
-            : {},
-        })}
+        onDirtyChange={(nextDirty) => updateWorkbenchDirty(node.id, nextDirty)}
         onClose={closeWorkbench}
       >
         {content}
@@ -2010,6 +2423,8 @@ export function NativeCanvasWorkspace({
     ConversationRenderer,
     closeWorkbench,
     conversationAdapter,
+    imageWorkbenchAdapter,
+    registerWorkbenchDraftCommitter,
     rebuildConversationNode,
     rebuildState.error,
     rebuildState.loading,
@@ -2018,7 +2433,8 @@ export function NativeCanvasWorkspace({
     state.workbenchDraft,
     stateKey,
     target,
-    updateNativeCanvasState,
+    updateWorkbenchDirty,
+    workspaceWritable,
   ])
 
   return (
@@ -2180,9 +2596,13 @@ export function NativeCanvasWorkspace({
       >
         <DialogContent className="max-w-md" hideClose>
           <DialogHeader>
-            <DialogTitle>切换工作台？</DialogTitle>
+            <DialogTitle>
+              {state.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
+                ? '关闭工作台？'
+                : '切换工作台？'}
+            </DialogTitle>
             <DialogDescription>
-              当前工作台有未保存更改。请选择保存、放弃或取消切换。
+              当前工作台有未保存更改。请选择保存、放弃或取消操作。
             </DialogDescription>
           </DialogHeader>
           {!workbenchCommitAvailability.enabled ? (
@@ -2214,14 +2634,20 @@ export function NativeCanvasWorkspace({
               disabled={workbenchSwitchSaving}
               onClick={resolveWorkbenchSwitch}
             >
-              放弃并切换
+              {state.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
+                ? '放弃并关闭'
+                : '放弃并切换'}
             </Button>
             <Button
               type="button"
               disabled={workbenchSwitchSaving || !workbenchCommitAvailability.enabled}
               onClick={saveAndSwitchWorkbench}
             >
-              {workbenchSwitchSaving ? '正在保存' : '保存并切换'}
+              {workbenchSwitchSaving
+                ? '正在保存'
+                : state.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
+                  ? '保存并关闭'
+                  : '保存并切换'}
             </Button>
           </DialogFooter>
         </DialogContent>
