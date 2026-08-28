@@ -1,10 +1,24 @@
-import type { DesignContextMode, DesignPoint, DesignViewport } from './design'
+import type {
+  DesignAsset,
+  DesignContextMode,
+  DesignJobRecord,
+  DesignPoint,
+  DesignViewport,
+} from './design'
 import type { AgentSessionMeta } from './agent'
 import type { SDKMessage } from './agent'
 
 /** 原生 Canvas 图文档使用的固定 IPC 通道。 */
 export const CANVAS_IPC_CHANNELS = {
   LOAD: 'canvas:load',
+  LOAD_IMAGE_MODULE: 'canvas:load-image-module',
+  SAVE_IMAGE_MODULE: 'canvas:save-image-module',
+  CREATE_IMAGE_JOB: 'canvas:create-image-job',
+  CANCEL_IMAGE_JOB: 'canvas:cancel-image-job',
+  RETRY_IMAGE_JOB: 'canvas:retry-image-job',
+  ADOPT_IMAGE_ASSET: 'canvas:adopt-image-asset',
+  RELEASE_IMAGE_MEDIA: 'canvas:release-image-media',
+  IMAGE_MODULE_CHANGED: 'canvas:image-module-changed',
   SAVE_MUTATIONS: 'canvas:save-mutations',
   CREATE_AGENT_NODE: 'canvas:create-agent-node',
   CREATE_CONTENT_NODE: 'canvas:create-content-node',
@@ -335,6 +349,16 @@ export interface SaveCanvasImageModuleInput extends CanvasImageTarget {
 /** 取消、重试和读取任务时绑定完整图片模块身份的输入。 */
 export interface CanvasImageJobControlInput extends CanvasImageTarget {
   jobId: string
+}
+
+/** Renderer 加载单个 Canvas 图片模块后得到的完整公开快照。 */
+export interface CanvasImageModuleSnapshot {
+  target: CanvasImageTarget
+  config: CanvasImageModuleConfig
+  jobs: DesignJobRecord[]
+  assets: DesignAsset[]
+  assetBaseUrl: string
+  thumbnailBaseUrl: string
 }
 
 /** Design Job 固化的结构化图片生成约束。 */

@@ -9,6 +9,11 @@ import type {
   CanvasNodeLifecycleResult,
   CanvasTrashEntry,
   CanvasWorkspaceSnapshot,
+  CanvasImageModuleConfig,
+  CanvasImageTarget,
+  DesignAsset,
+  DesignJobRecord,
+  SaveCanvasImageModuleInput,
   RebuildCanvasAgentNodeResult,
   SDKMessage,
 } from '@proma/shared'
@@ -22,18 +27,68 @@ type TestHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
 /** 可记录公开广播的测试窗口。 */
 interface TestWebContents extends WebContents {
   sent: Array<{ channel: string; value: unknown }>
+  destroyForTest: () => void
 }
 
 /** 创建固定 ID 且可记录广播的窗口。 */
 function createSender(id: number): TestWebContents {
   /** 当前窗口收到的全部公开事件。 */
   const sent: Array<{ channel: string; value: unknown }> = []
+  /** Electron destroyed 监听器集合。 */
+  const destroyedListeners = new Set<() => void>()
   return {
     id,
     sent,
     isDestroyed: () => false,
     send: (channel: string, value: unknown) => { sent.push({ channel, value }) },
+    once: (event: string, listener: () => void) => {
+      if (event === 'destroyed') destroyedListeners.add(listener)
+    },
+    removeListener: (event: string, listener: () => void) => {
+      if (event === 'destroyed') destroyedListeners.delete(listener)
+    },
+    destroyForTest: () => {
+      for (const listener of [...destroyedListeners]) listener()
+      destroyedListeners.clear()
+    },
   } as unknown as TestWebContents
+}
+
+/** 测试图片模块的完整身份。 */
+const imageTargetA: CanvasImageTarget = {
+  projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-node-a', imageModuleId: 'module-a',
+}
+/** 另一个图片模块身份，用于验证跨目标访问失败。 */
+const imageTargetB: CanvasImageTarget = {
+  projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-node-b', imageModuleId: 'module-b',
+}
+
+/** 创建指定模块 revision 的图片配置。 */
+function createImageConfig(target: CanvasImageTarget, revision = 3): CanvasImageModuleConfig {
+  return {
+    schemaVersion: 2, kind: 'image', contentId: target.imageModuleId, revision,
+    createdAt: 1, updatedAt: 2, prompt: '生成首页主视觉', selectedModelProfileId: 'profile-1',
+    aspectRatio: '16:9', imageSize: '2K', contextMode: 'project', adoptedAssetId: 'asset-a',
+  }
+}
+
+/** 创建归属指定图片模块的任务。 */
+function createImageJob(target: CanvasImageTarget, id: string, outputAssetId = 'asset-a'): DesignJobRecord {
+  return {
+    id, creativeTaskId: `creative-${id}`, attemptNumber: 1, projectId: target.projectId,
+    target: { kind: 'canvas-image', canvasId: target.canvasId, nodeId: target.nodeId, imageModuleId: target.imageModuleId },
+    action: 'generate', status: 'succeeded', prompt: '生成首页主视觉', originalRequest: '生成首页主视觉',
+    contextMode: 'project', outputAssetId, createdAt: 1, updatedAt: 2,
+  }
+}
+
+/** 创建由指定任务产出的 Design 素材。 */
+function createImageAsset(id: string, sourceJobId: string): DesignAsset {
+  return {
+    id, filename: `${id}.png`, relativePath: `assets/${id}.png`,
+    thumbnailRelativePath: `thumbnails/${id}.webp`, mediaType: 'image/png',
+    width: 100, height: 100, byteSize: 100, sha256: 'a'.repeat(64), createdAt: 2, sourceJobId,
+  }
 }
 
 /** 调用指定 invoke handler。 */
@@ -97,6 +152,11 @@ function createContext(options: {
   contentReconciliationPublication?: CanvasDocument
   contentResultFactory?: (selectedNodeId?: string) => CanvasNodeLifecycleResult
   contentTrashResult?: CanvasTrashEntry[]
+  imageConfig?: CanvasImageModuleConfig
+  imageJobs?: DesignJobRecord[]
+  imageAssets?: DesignAsset[]
+  imageLoadError?: Error
+  mediaAccessErrorAt?: number
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -124,6 +184,12 @@ function createContext(options: {
   let createAttempts = 0
   /** Canvas Agent 专用 IPC 调用记录。 */
   const agentCalls: Array<{ type: string; value: unknown }> = []
+  /** 图片模块服务调用记录。 */
+  const imageCalls: Array<{ type: string; value: unknown }> = []
+  /** 媒体 lease 释放次数，按候选创建顺序记录。 */
+  const mediaReleases: number[] = []
+  /** 媒体候选创建序号。 */
+  let mediaAccessCount = 0
   /** 权威 Canvas 会话元数据。 */
   const agentSession: AgentSessionMeta = {
     id: '22222222-2222-4222-8222-222222222222', title: '首页 Agent',
@@ -282,6 +348,53 @@ function createContext(options: {
         return createContentOutcome('node-restored')
       },
     },
+    imageModules: {
+      load: async (target) => {
+        imageCalls.push({ type: 'load', value: target })
+        if (options.imageLoadError) throw options.imageLoadError
+        return options.imageConfig ?? createImageConfig(target)
+      },
+      save: async (input) => {
+        imageCalls.push({ type: 'save', value: input })
+        return { ...(options.imageConfig ?? createImageConfig(input)), revision: input.expectedConfigRevision + 1 }
+      },
+    },
+    imageJobs: {
+      createCanvasImage: async (input) => {
+        imageCalls.push({ type: 'create', value: input })
+        return createImageJob(imageTargetA, 'job-created')
+      },
+      run: async (jobId) => { imageCalls.push({ type: 'run', value: jobId }) },
+      cancel: async (projectId, jobId) => {
+        imageCalls.push({ type: 'cancel', value: { projectId, jobId } })
+        return (options.imageJobs ?? [createImageJob(imageTargetA, 'job-a')]).find((job) => job.id === jobId)
+          ?? createImageJob(imageTargetA, jobId)
+      },
+      retry: (projectId, jobId) => {
+        imageCalls.push({ type: 'retry', value: { projectId, jobId } })
+        return createImageJob(imageTargetA, 'job-retry')
+      },
+      list: () => options.imageJobs ?? [createImageJob(imageTargetA, 'job-a')],
+      onChanged: () => () => undefined,
+    },
+    imageJobTarget: {
+      adoptOutput: async (projectId, target, assetId) => {
+        imageCalls.push({ type: 'adopt', value: { projectId, target, assetId } })
+      },
+    },
+    imageAssets: {
+      list: () => options.imageAssets ?? [createImageAsset('asset-a', 'job-a')],
+      createMediaAccess: () => {
+        const index = mediaAccessCount
+        mediaAccessCount += 1
+        if (options.mediaAccessErrorAt === index) throw new Error('媒体授权失败')
+        return {
+          assetBaseUrl: `proma-file://assets-${index}`,
+          thumbnailBaseUrl: `proma-file://thumbnails-${index}`,
+          release: () => { mediaReleases[index] = (mediaReleases[index] ?? 0) + 1 },
+        }
+      },
+    },
     agent: {
       listActiveRuns: () => options.activeRunSnapshot ?? { owners: [], internalInvalidRuns: [] },
       getSession: (sessionId) => sessionId === agentSession.id ? agentSession : undefined,
@@ -327,10 +440,119 @@ function createContext(options: {
     }
     return { reconciliation, operationOutcome: { ok: true as const, value } }
   }
-  return { handlers, removed, sender, calls, storeInputs, agentCalls, broadcastLeaseStates, registration }
+  return {
+    handlers, removed, sender, calls, storeInputs, agentCalls, imageCalls,
+    mediaReleases, broadcastLeaseStates, registration,
+  }
 }
 
 describe('原生 Canvas 文档 IPC', () => {
+  test('Given 合法图片目标 When LOAD Then 只返回目标配置、任务、资产和媒体 URL', async () => {
+    /** A/B 任务与无关素材共存，快照只能暴露 A 模块闭包。 */
+    const jobA = createImageJob(imageTargetA, 'job-a')
+    const jobB = createImageJob(imageTargetB, 'job-b', 'asset-b')
+    const context = createContext({
+      imageJobs: [jobA, jobB],
+      imageAssets: [
+        createImageAsset('asset-a', jobA.id),
+        createImageAsset('asset-b', jobB.id),
+        createImageAsset('asset-unrelated', 'job-unrelated'),
+      ],
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    )
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        target: imageTargetA,
+        config: createImageConfig(imageTargetA),
+        jobs: [jobA],
+        assets: [createImageAsset('asset-a', jobA.id)],
+        assetBaseUrl: 'proma-file://assets-0',
+        thumbnailBaseUrl: 'proma-file://thumbnails-0',
+      },
+    })
+  })
+
+  test('Given A job 配 B target When cancel retry adopt Then 全部拒绝且不操作任务或资产', async () => {
+    const jobA = createImageJob(imageTargetA, 'job-a')
+    const context = createContext({ imageJobs: [jobA], imageAssets: [createImageAsset('asset-a', jobA.id)] })
+
+    for (const [channel, input] of [
+      [CANVAS_IPC_CHANNELS.CANCEL_IMAGE_JOB, { ...imageTargetB, jobId: jobA.id }],
+      [CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB, { ...imageTargetB, jobId: jobA.id }],
+      [CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET, {
+        ...imageTargetB, jobId: jobA.id, assetId: 'asset-a', expectedConfigRevision: 3,
+      }],
+    ] as const) {
+      const result = await invoke(context.handlers, channel, context.sender, input)
+      expect(result).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_JOB_FAILED' } })
+    }
+    expect(context.imageCalls.filter((call) => ['cancel', 'retry', 'adopt'].includes(call.type))).toEqual([])
+  })
+
+  test('Given revision 身份或 asset 归属错误 When 写操作 Then fail closed 且无业务副作用', async () => {
+    const jobA = createImageJob(imageTargetA, 'job-a')
+    const context = createContext({
+      imageConfig: createImageConfig(imageTargetA, 4),
+      imageJobs: [jobA],
+      imageAssets: [createImageAsset('asset-foreign', 'job-foreign')],
+    })
+
+    const createResult = await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB, context.sender, {
+      ...imageTargetA, expectedConfigRevision: 3,
+    })
+    const adoptResult = await invoke(context.handlers, CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET, context.sender, {
+      ...imageTargetA, jobId: jobA.id, assetId: 'asset-foreign', expectedConfigRevision: 4,
+    })
+    const identityContext = createContext({ imageConfig: createImageConfig(imageTargetB) })
+    const loadResult = await invoke(
+      identityContext.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      identityContext.sender,
+      imageTargetA,
+    )
+
+    expect(createResult).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_REVISION_CONFLICT' } })
+    expect(adoptResult).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_JOB_FAILED' } })
+    expect(loadResult).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+    expect(context.imageCalls.filter((call) => ['create', 'run', 'adopt'].includes(call.type))).toEqual([])
+  })
+
+  test('Given 重复 LOAD 与释放路径 When lease 替换失败或成功 Then 保旧授权并幂等回收当前授权', async () => {
+    const failedReplacement = createContext({ mediaAccessErrorAt: 1 })
+    await invoke(failedReplacement.handlers, CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE, failedReplacement.sender, imageTargetA)
+    const failed = await invoke(
+      failedReplacement.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      failedReplacement.sender,
+      imageTargetA,
+    )
+    expect(failed).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+    expect(failedReplacement.mediaReleases[0] ?? 0).toBe(0)
+    await invoke(
+      failedReplacement.handlers,
+      CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
+      failedReplacement.sender,
+      imageTargetA,
+    )
+    expect(failedReplacement.mediaReleases[0]).toBe(1)
+
+    const replacement = createContext()
+    await invoke(replacement.handlers, CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE, replacement.sender, imageTargetA)
+    await invoke(replacement.handlers, CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE, replacement.sender, imageTargetA)
+    expect(replacement.mediaReleases[0]).toBe(1)
+    replacement.sender.destroyForTest()
+    replacement.sender.destroyForTest()
+    expect(replacement.mediaReleases[1]).toBe(1)
+  })
+
   test('Given 四类内容生命周期命令 When IPC 调用 Then Agent 对账后调用内容服务并只返回公开业务字段', async () => {
     /** 合法公开图包含 Agent session 引用，不能按字段名称误删。 */
     const publicDocument = createDocument(5)
@@ -1532,10 +1754,17 @@ describe('原生 Canvas 文档 IPC', () => {
     errorSpy.mockRestore()
   })
 
-  test('Given 已注册处理器 When 重复 dispose Then 仅移除十二个固定 invoke 通道一次', () => {
+  test('Given 已注册处理器 When 重复 dispose Then 仅移除十九个固定 invoke 通道一次', () => {
     const context = createContext()
     expect(context.registration.channels).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
+      CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB,
+      CANVAS_IPC_CHANNELS.CANCEL_IMAGE_JOB,
+      CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB,
+      CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET,
+      CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
       CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
@@ -1555,6 +1784,13 @@ describe('原生 Canvas 文档 IPC', () => {
 
     expect(context.removed).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
+      CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB,
+      CANVAS_IPC_CHANNELS.CANCEL_IMAGE_JOB,
+      CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB,
+      CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET,
+      CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
       CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
@@ -1631,6 +1867,27 @@ describe('原生 Canvas 文档 IPC', () => {
         listTrashReconciled: async () => ({ reconciliation: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] }, documentChanged: false }, operationOutcome: { ok: true as const, value: [] } }),
         restoreReconciled: async () => ({ reconciliation: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] }, documentChanged: false }, operationOutcome: { ok: true as const, value: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] } } } }),
       },
+      imageModules: {
+        load: async (target: CanvasImageTarget) => createImageConfig(target),
+        save: async (input: SaveCanvasImageModuleInput) => createImageConfig(input, input.expectedConfigRevision + 1),
+      },
+      imageJobs: {
+        createCanvasImage: async () => createImageJob(imageTargetA, 'job-created'),
+        run: async () => undefined,
+        cancel: async () => createImageJob(imageTargetA, 'job-a'),
+        retry: () => createImageJob(imageTargetA, 'job-retry'),
+        list: () => [],
+        onChanged: () => () => undefined,
+      },
+      imageJobTarget: { adoptOutput: async () => undefined },
+      imageAssets: {
+        list: () => [],
+        createMediaAccess: () => ({
+          assetBaseUrl: 'proma-file://assets',
+          thumbnailBaseUrl: 'proma-file://thumbnails',
+          release: () => undefined,
+        }),
+      },
       agent: {
         listActiveRuns: () => ({ owners: [], internalInvalidRuns: [] }),
         getSession: () => undefined,
@@ -1661,6 +1918,13 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(handlers.size).toBe(0)
     expect(removed).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
+      CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB,
+      CANVAS_IPC_CHANNELS.CANCEL_IMAGE_JOB,
+      CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB,
+      CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET,
+      CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
       CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
@@ -1675,6 +1939,6 @@ describe('原生 Canvas 文档 IPC', () => {
     ])
 
     registrationA.dispose()
-    expect(removed).toHaveLength(12)
+    expect(removed).toHaveLength(19)
   })
 })

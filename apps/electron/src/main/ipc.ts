@@ -24,7 +24,7 @@ import {
 } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, isPromaPermissionMode, normalizePathForCompare } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, isPromaPermissionMode, normalizePathForCompare, parseCanvasNodeContentMeta } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS, TRAY_IPC_CHANNELS } from '../types'
 import type {
   QuickTaskSubmitInput,
@@ -197,6 +197,9 @@ import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
 import { createCanvasNodeContentStore } from './lib/design/canvas-node-content-store'
 import { createCanvasContentNodeLifecycle } from './lib/design/canvas-content-node-lifecycle'
+import { createCanvasImageModuleStore } from './lib/design/canvas-image-module-store'
+import { createCanvasImageJobTargetAdapter } from './lib/design/canvas-image-job-target'
+import { createCanvasImageInputResolver } from './lib/design/canvas-image-input-resolver'
 import {
   runChannelMutationWithImageModelBroadcast,
   updateToolCredentialsWithImageModelBroadcast,
@@ -1658,6 +1661,68 @@ export function registerIpcHandlers(): void {
       canvasImagePreferences.getSelection(projectId).selectedProfileId ?? null
     ),
   })
+  /** Canvas 图片配置复用图文档 capability 与稳定目录 helper。 */
+  const canvasImageModuleStore = createCanvasImageModuleStore({ store: canvasDocumentStore })
+  /** 图片任务输出采用与 Canvas 节点投影共用同一 Store。 */
+  const canvasImageJobTarget = createCanvasImageJobTargetAdapter({
+    canvasStore: canvasDocumentStore,
+    imageStore: canvasImageModuleStore,
+  })
+  /** 从受管节点目录读取已提交正文，meta.json 始终作为身份和 revision 事实。 */
+  const readCommittedCanvasContent = async (
+    target: { projectId: string; canvasId: string },
+    contentId: string,
+    fileName: 'content.md' | 'index.html',
+  ): Promise<{ revision: number; content: string }> => {
+    const loaded = canvasDocumentStore.loadWithDirectoryCapability(target)
+    const capability = loaded.openSingleChildDirectory('nodes')
+    capability.assertValid()
+    /** meta 与正文在同一 capability 生命周期内读取，目录换绑会 fail closed。 */
+    const readFile = async (managedFileName: 'meta.json' | 'content.md' | 'index.html'): Promise<string> => {
+      const result = await runStableDirectoryNative({
+        mode: 'canvas-content-read',
+        roots: [capability.rootPath],
+        childName: 'nodes',
+        entryId: contentId,
+        fileName: managedFileName,
+      }, capability.authorizeOpenedRoots)
+      capability.assertValid()
+      if (result.readOutcome?.status !== 'ok') throw new Error('CANVAS_IMAGE_INPUT_CONTENT_INVALID')
+      return result.readOutcome.content
+    }
+    const meta = parseCanvasNodeContentMeta(JSON.parse(await readFile('meta.json')) as unknown)
+    const expectedKind = fileName === 'content.md' ? 'document' : 'webview'
+    if (meta.contentId !== contentId || meta.kind !== expectedKind) {
+      throw new Error('CANVAS_IMAGE_INPUT_CONTENT_INVALID')
+    }
+    return { revision: meta.revision, content: await readFile(fileName) }
+  }
+  /** 直接入边解析器只读取已提交 Agent JSONL、图片配置和受管正文。 */
+  const canvasImageInputResolver = createCanvasImageInputResolver({
+    canvasStore: canvasDocumentStore,
+    imageStore: canvasImageModuleStore,
+    getAgentOutput: async (sessionId) => {
+      const session = getAgentSessionMeta(sessionId)
+      if (!session) throw new Error('CANVAS_IMAGE_INPUT_AGENT_INVALID')
+      return { revision: session.updatedAt, messages: getAgentSessionSDKMessages(sessionId) }
+    },
+    readDocument: async (target, documentId) => {
+      const committed = await readCommittedCanvasContent(target, documentId, 'content.md')
+      return { revision: committed.revision, markdown: committed.content }
+    },
+    readPrototype: async (target, prototypeId) => {
+      const committed = await readCommittedCanvasContent(target, prototypeId, 'index.html')
+      /** 原型摘要只提取有界可见文本，不执行 HTML 或脚本。 */
+      const summary = committed.content
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 4_000)
+      return { revision: committed.revision, summary: summary || '已提交原型无可见文本' }
+    },
+  })
   /** Canvas Agent 创建事务复用现有 Agent 索引与模型可用性事实。 */
   const canvasAgentNodeCreation = new CanvasAgentNodeCreationService({
     store: canvasDocumentStore,
@@ -1729,6 +1794,8 @@ export function registerIpcHandlers(): void {
     pathResolver: designPathResolver,
     store: designStore,
     assetService: designAssetService,
+    canvasImageTargetAdapter: canvasImageJobTarget,
+    canvasImageInputResolver,
     imageModels,
     contextOrchestrator: designContextOrchestrator,
     getSettings,
@@ -1791,6 +1858,13 @@ export function registerIpcHandlers(): void {
     store: canvasDocumentStore,
     creation: canvasAgentNodeCreation,
     contentLifecycle: canvasContentNodeLifecycle,
+    imageModules: canvasImageModuleStore,
+    imageJobs: designJobManager,
+    imageJobTarget: canvasImageJobTarget,
+    imageAssets: {
+      list: (projectId) => designStore.requireStableAuthoritativeDocument(projectId).assets,
+      createMediaAccess: (projectId) => designAssetService.createMediaAccess(projectId),
+    },
     agent: {
       listActiveRuns: listActiveCanvasAgentRuns,
       getSession: getAgentSessionMeta,

@@ -288,6 +288,14 @@ describe('Canvas 图共享合同', () => {
 
     expect(CANVAS_IPC_CHANNELS).toEqual({
       LOAD: 'canvas:load',
+      LOAD_IMAGE_MODULE: 'canvas:load-image-module',
+      SAVE_IMAGE_MODULE: 'canvas:save-image-module',
+      CREATE_IMAGE_JOB: 'canvas:create-image-job',
+      CANCEL_IMAGE_JOB: 'canvas:cancel-image-job',
+      RETRY_IMAGE_JOB: 'canvas:retry-image-job',
+      ADOPT_IMAGE_ASSET: 'canvas:adopt-image-asset',
+      RELEASE_IMAGE_MEDIA: 'canvas:release-image-media',
+      IMAGE_MODULE_CHANGED: 'canvas:image-module-changed',
       SAVE_MUTATIONS: 'canvas:save-mutations',
       CREATE_AGENT_NODE: 'canvas:create-agent-node',
       CREATE_CONTENT_NODE: 'canvas:create-content-node',
