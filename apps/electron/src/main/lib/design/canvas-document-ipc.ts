@@ -893,14 +893,30 @@ export function registerCanvasDocumentIpcHandlers(
   ): void => {
     const previous = imageMediaBySender.get(sender.id)
     const onDestroyed = (): void => releaseImageMedia(sender.id)
+    /** IPC 边界自身也保证候选 release 幂等，不依赖底层实现。 */
+    let candidateReleased = false
+    const releaseCandidate = (): void => {
+      if (candidateReleased) return
+      candidateReleased = true
+      access.release()
+    }
+    if (sender.isDestroyed()) {
+      releaseCandidate()
+      throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+    }
     try {
-      imageMediaBySender.set(sender.id, { sender, target: { ...target }, release: access.release, onDestroyed })
+      imageMediaBySender.set(sender.id, { sender, target: { ...target }, release: releaseCandidate, onDestroyed })
       sender.once('destroyed', onDestroyed)
+      if (sender.isDestroyed()) {
+        releaseImageMedia(sender.id)
+        throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+      }
     } catch (error) {
       sender.removeListener('destroyed', onDestroyed)
-      if (previous) imageMediaBySender.set(sender.id, previous)
+      /** 销毁后的 sender 不恢复旧授权；其余提交失败仍保留旧授权。 */
+      if (!sender.isDestroyed() && previous) imageMediaBySender.set(sender.id, previous)
       else imageMediaBySender.delete(sender.id)
-      access.release()
+      releaseCandidate()
       throw error
     }
     if (!previous) return
@@ -958,6 +974,50 @@ export function registerCanvasDocumentIpcHandlers(
     } finally {
       release()
     }
+  }
+
+  /** 图片模块操作按 Canvas 串行，并只在实际轮到执行时获取 workspace lease。 */
+  const runImageCanvasExclusive = <T>(
+    target: CanvasImageTarget,
+    effect: () => Promise<T>,
+  ): Promise<T> => runCanvasExclusive(target.projectId, target.canvasId, () => (
+    options.guard.runWorkspaceWrite(target.projectId, effect)
+  ))
+
+  /** 从目标任务输出建立图片素材闭包，并拒绝任何跨目标或损坏引用。 */
+  const resolveOwnedImageAssets = (
+    config: CanvasImageModuleConfig,
+    jobs: DesignJobRecord[],
+    projectAssets: DesignAsset[],
+  ): DesignAsset[] => {
+    /** 每个输出素材只能由一个目标任务声明。 */
+    const ownerByAssetId = new Map<string, DesignJobRecord>()
+    for (const job of jobs) {
+      if (!job.outputAssetId) continue
+      if (ownerByAssetId.has(job.outputAssetId)) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+      ownerByAssetId.set(job.outputAssetId, job)
+    }
+    /** 只接纳 sourceJobId 和目标任务输出双向一致的公开素材。 */
+    const assetById = new Map<string, DesignAsset>()
+    for (const asset of projectAssets) {
+      const owner = ownerByAssetId.get(asset.id)
+      if (!owner || asset.sourceJobId !== owner.id) continue
+      if (assetById.has(asset.id)) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+      assetById.set(asset.id, asset)
+    }
+    /** 每个已声明输出都必须在 Design Store 中存在且反向归属同一 Job。 */
+    for (const outputAssetId of ownerByAssetId.keys()) {
+      if (!assetById.has(outputAssetId)) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+    }
+    /** 当前配置和所有历史任务引用只能落在上述目标输出闭包。 */
+    const referencedAssetIds = [
+      config.adoptedAssetId,
+      ...jobs.flatMap((job) => [job.sourceAssetId, job.parentAssetId, job.outputAssetId]),
+    ].filter((assetId): assetId is string => typeof assetId === 'string')
+    if (referencedAssetIds.some((assetId) => !assetById.has(assetId))) {
+      throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+    }
+    return [...assetById.values()]
   }
 
   /** 按发生顺序发布历史或当前图事实，并去重同 cause + revision。 */
@@ -1043,27 +1103,44 @@ export function registerCanvasDocumentIpcHandlers(
     invokeCanvasOperation<CanvasImageModuleSnapshot>('imageLoad', async () => {
       assertAuthorizedSender(event, options)
       const target = parseImageTargetInput(value)
-      requireWritableProject(target.projectId, options)
-      const config = await options.imageModules.load(target)
-      assertOwnedImageConfig(config, target)
-      /** 任务列表先按项目读取，再按完整图片目标逐项收窄。 */
-      const jobs = options.imageJobs.list(target.projectId).filter((job) => isOwnedImageJob(job, target))
-      /** 快照只公开目标任务或当前采用配置实际引用的素材。 */
-      const referencedAssetIds = new Set<string>(config.adoptedAssetId ? [config.adoptedAssetId] : [])
-      for (const job of jobs) {
-        if (job.sourceAssetId) referencedAssetIds.add(job.sourceAssetId)
-        if (job.parentAssetId) referencedAssetIds.add(job.parentAssetId)
-        if (job.outputAssetId) referencedAssetIds.add(job.outputAssetId)
+      /** await 前预注册销毁 gate，避免错过读取期间发生的 destroyed。 */
+      let senderDestroyed = event.sender.isDestroyed()
+      const onProvisionalDestroyed = (): void => {
+        senderDestroyed = true
+        releaseImageMedia(event.sender.id)
       }
-      const assets = options.imageAssets.list(target.projectId)
-        .filter((asset) => referencedAssetIds.has(asset.id))
-      /** 媒体 token 是候选；创建或提交失败均不得撤销旧授权。 */
-      const access = options.imageAssets.createMediaAccess(target.projectId)
-      commitImageMedia(event.sender, target, access)
-      return {
-        target: { ...target }, config, jobs, assets,
-        assetBaseUrl: access.assetBaseUrl,
-        thumbnailBaseUrl: access.thumbnailBaseUrl,
+      event.sender.once('destroyed', onProvisionalDestroyed)
+      try {
+        return await runImageCanvasExclusive(target, async () => {
+          requireWritableProject(target.projectId, options)
+          if (senderDestroyed || event.sender.isDestroyed()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          const config = await options.imageModules.load(target)
+          assertOwnedImageConfig(config, target)
+          if (senderDestroyed || event.sender.isDestroyed()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          /** 任务列表先按项目读取，再按完整图片目标逐项收窄。 */
+          const jobs = options.imageJobs.list(target.projectId).filter((job) => isOwnedImageJob(job, target))
+          if (senderDestroyed || event.sender.isDestroyed()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          const assets = resolveOwnedImageAssets(config, jobs, options.imageAssets.list(target.projectId))
+          if (senderDestroyed || event.sender.isDestroyed()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          /** 媒体 token 是候选；创建或提交失败均不得撤销旧授权。 */
+          const access = options.imageAssets.createMediaAccess(target.projectId)
+          if (senderDestroyed || event.sender.isDestroyed()) {
+            access.release()
+            throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          }
+          commitImageMedia(event.sender, target, access)
+          if (senderDestroyed || event.sender.isDestroyed()) {
+            releaseImageMedia(event.sender.id)
+            throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          }
+          return {
+            target: { ...target }, config, jobs, assets,
+            assetBaseUrl: access.assetBaseUrl,
+            thumbnailBaseUrl: access.thumbnailBaseUrl,
+          }
+        })
+      } finally {
+        event.sender.removeListener('destroyed', onProvisionalDestroyed)
       }
     })
   ))
@@ -1072,11 +1149,10 @@ export function registerCanvasDocumentIpcHandlers(
     invokeCanvasOperation<CanvasImageModuleConfig>('imageSave', async () => {
       assertAuthorizedSender(event, options)
       const input = parseImageSaveInput(value)
-      requireWritableProject(input.projectId, options)
-      const config = await options.guard.runWorkspaceWrite(
-        input.projectId,
-        () => options.imageModules.save(input),
-      )
+      const config = await runImageCanvasExclusive(input, async () => {
+        requireWritableProject(input.projectId, options)
+        return options.imageModules.save(input)
+      })
       assertOwnedImageConfig(config, input)
       broadcastImageModuleChanged(input)
       return config
@@ -1087,8 +1163,8 @@ export function registerCanvasDocumentIpcHandlers(
     invokeCanvasOperation<DesignJobRecord>('imageJob', async () => {
       assertAuthorizedSender(event, options)
       const input = parseCreateImageJobInput(value)
-      requireWritableProject(input.projectId, options)
-      const job = await options.guard.runWorkspaceWrite(input.projectId, async () => {
+      const job = await runImageCanvasExclusive(input, async () => {
+        requireWritableProject(input.projectId, options)
         const config = await options.imageModules.load(input)
         assertOwnedImageConfig(config, input)
         if (config.revision !== input.expectedConfigRevision) throw new Error('CANVAS_IMAGE_REVISION_CONFLICT')
@@ -1120,12 +1196,11 @@ export function registerCanvasDocumentIpcHandlers(
     invokeCanvasOperation<DesignJobRecord>('imageJob', async () => {
       assertAuthorizedSender(event, options)
       const input = parseImageJobControlInput(value)
-      requireWritableProject(input.projectId, options)
-      requireOwnedJob(input, input.jobId)
-      const job = await options.guard.runWorkspaceWrite(
-        input.projectId,
-        () => options.imageJobs.cancel(input.projectId, input.jobId),
-      )
+      const job = await runImageCanvasExclusive(input, async () => {
+        requireWritableProject(input.projectId, options)
+        requireOwnedJob(input, input.jobId)
+        return options.imageJobs.cancel(input.projectId, input.jobId)
+      })
       if (!isOwnedImageJob(job, input)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
       return job
     })
@@ -1135,12 +1210,11 @@ export function registerCanvasDocumentIpcHandlers(
     invokeCanvasOperation<DesignJobRecord>('imageJob', async () => {
       assertAuthorizedSender(event, options)
       const input = parseImageJobControlInput(value)
-      requireWritableProject(input.projectId, options)
-      requireOwnedJob(input, input.jobId)
-      const job = await options.guard.runWorkspaceWrite(
-        input.projectId,
-        () => options.imageJobs.retry(input.projectId, input.jobId),
-      )
+      const job = await runImageCanvasExclusive(input, async () => {
+        requireWritableProject(input.projectId, options)
+        requireOwnedJob(input, input.jobId)
+        return options.imageJobs.retry(input.projectId, input.jobId)
+      })
       if (!isOwnedImageJob(job, input)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
       void options.imageJobs.run(job.id).catch((error) => {
         console.error('[CanvasDocumentIPC] Canvas 图片任务后台重试失败:', error)
@@ -1153,8 +1227,8 @@ export function registerCanvasDocumentIpcHandlers(
     invokeCanvasOperation<CanvasImageModuleConfig>('imageJob', async () => {
       assertAuthorizedSender(event, options)
       const input = parseAdoptImageAssetInput(value)
-      requireWritableProject(input.projectId, options)
-      return options.guard.runWorkspaceWrite(input.projectId, async () => {
+      const adopted = await runImageCanvasExclusive(input, async () => {
+        requireWritableProject(input.projectId, options)
         const config = await options.imageModules.load(input)
         assertOwnedImageConfig(config, input)
         if (config.revision !== input.expectedConfigRevision) throw new Error('CANVAS_IMAGE_REVISION_CONFLICT')
@@ -1167,12 +1241,13 @@ export function registerCanvasDocumentIpcHandlers(
           kind: 'canvas-image', canvasId: input.canvasId,
           nodeId: input.nodeId, imageModuleId: input.imageModuleId,
         }, input.assetId)
-        const adopted = await options.imageModules.load(input)
-        assertOwnedImageConfig(adopted, input)
-        if (adopted.adoptedAssetId !== input.assetId) throw new Error('CANVAS_IMAGE_ADOPT_FAILED')
-        broadcastImageModuleChanged(input)
-        return adopted
+        const latest = await options.imageModules.load(input)
+        assertOwnedImageConfig(latest, input)
+        if (latest.adoptedAssetId !== input.assetId) throw new Error('CANVAS_IMAGE_ADOPT_FAILED')
+        return latest
       })
+      broadcastImageModuleChanged(input)
+      return adopted
     })
   ))
 

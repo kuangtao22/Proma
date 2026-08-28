@@ -36,10 +36,12 @@ function createSender(id: number): TestWebContents {
   const sent: Array<{ channel: string; value: unknown }> = []
   /** Electron destroyed 监听器集合。 */
   const destroyedListeners = new Set<() => void>()
+  /** 模拟 Electron WebContents 销毁后的权威状态。 */
+  let destroyed = false
   return {
     id,
     sent,
-    isDestroyed: () => false,
+    isDestroyed: () => destroyed,
     send: (channel: string, value: unknown) => { sent.push({ channel, value }) },
     once: (event: string, listener: () => void) => {
       if (event === 'destroyed') destroyedListeners.add(listener)
@@ -48,10 +50,27 @@ function createSender(id: number): TestWebContents {
       if (event === 'destroyed') destroyedListeners.delete(listener)
     },
     destroyForTest: () => {
+      destroyed = true
       for (const listener of [...destroyedListeners]) listener()
       destroyedListeners.clear()
     },
   } as unknown as TestWebContents
+}
+
+/** 创建可由测试显式完成的 Promise。 */
+function createDeferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+} {
+  let resolvePromise: ((value: T) => void) | undefined
+  const promise = new Promise<T>((resolve) => { resolvePromise = resolve })
+  return {
+    promise,
+    resolve: (value) => {
+      if (!resolvePromise) throw new Error('deferred 未初始化')
+      resolvePromise(value)
+    },
+  }
 }
 
 /** 测试图片模块的完整身份。 */
@@ -88,6 +107,22 @@ function createImageAsset(id: string, sourceJobId: string): DesignAsset {
     id, filename: `${id}.png`, relativePath: `assets/${id}.png`,
     thumbnailRelativePath: `thumbnails/${id}.webp`, mediaType: 'image/png',
     width: 100, height: 100, byteSize: 100, sha256: 'a'.repeat(64), createdAt: 2, sourceJobId,
+  }
+}
+
+/** 创建指定目标与 revision 的完整图片配置保存命令。 */
+function createImageSaveInput(
+  target: CanvasImageTarget,
+  expectedConfigRevision: number,
+): SaveCanvasImageModuleInput {
+  return {
+    ...target,
+    expectedConfigRevision,
+    prompt: '更新后的主视觉',
+    selectedModelProfileId: 'profile-1',
+    aspectRatio: '16:9',
+    imageSize: '2K',
+    contextMode: 'project',
   }
 }
 
@@ -157,6 +192,9 @@ function createContext(options: {
   imageAssets?: DesignAsset[]
   imageLoadError?: Error
   mediaAccessErrorAt?: number
+  imageLoad?: (target: CanvasImageTarget) => Promise<CanvasImageModuleConfig>
+  imageSave?: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
+  imageJobsList?: (projectId: string) => DesignJobRecord[]
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -352,10 +390,12 @@ function createContext(options: {
       load: async (target) => {
         imageCalls.push({ type: 'load', value: target })
         if (options.imageLoadError) throw options.imageLoadError
+        if (options.imageLoad) return options.imageLoad(target)
         return options.imageConfig ?? createImageConfig(target)
       },
       save: async (input) => {
         imageCalls.push({ type: 'save', value: input })
+        if (options.imageSave) return options.imageSave(input)
         return { ...(options.imageConfig ?? createImageConfig(input)), revision: input.expectedConfigRevision + 1 }
       },
     },
@@ -374,7 +414,8 @@ function createContext(options: {
         imageCalls.push({ type: 'retry', value: { projectId, jobId } })
         return createImageJob(imageTargetA, 'job-retry')
       },
-      list: () => options.imageJobs ?? [createImageJob(imageTargetA, 'job-a')],
+      list: (projectId) => options.imageJobsList?.(projectId)
+        ?? options.imageJobs ?? [createImageJob(imageTargetA, 'job-a')],
       onChanged: () => () => undefined,
     },
     imageJobTarget: {
@@ -443,6 +484,7 @@ function createContext(options: {
   return {
     handlers, removed, sender, calls, storeInputs, agentCalls, imageCalls,
     mediaReleases, broadcastLeaseStates, registration,
+    getMediaAccessCount: () => mediaAccessCount,
   }
 }
 
@@ -551,6 +593,135 @@ describe('原生 Canvas 文档 IPC', () => {
     replacement.sender.destroyForTest()
     replacement.sender.destroyForTest()
     expect(replacement.mediaReleases[1]).toBe(1)
+  })
+
+  test('Given 同 Canvas 两个 SAVE 并发 When 首个尚未提交 Then 第二个等待并按新 revision 冲突', async () => {
+    const firstSave = createDeferred<CanvasImageModuleConfig>()
+    const firstSaveEntered = createDeferred<void>()
+    let revision = 3
+    let saveCalls = 0
+    const context = createContext({
+      imageSave: async (input) => {
+        saveCalls += 1
+        if (saveCalls === 1) {
+          firstSaveEntered.resolve(undefined)
+          const result = await firstSave.promise
+          revision = result.revision
+          return result
+        }
+        if (input.expectedConfigRevision !== revision) throw new Error('CANVAS_IMAGE_REVISION_CONFLICT')
+        revision += 1
+        return createImageConfig(input, revision)
+      },
+    })
+    const input = createImageSaveInput(imageTargetA, 3)
+
+    const first = invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE, context.sender, input)
+    const second = invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE, context.sender, input)
+    await firstSaveEntered.promise
+
+    expect(saveCalls).toBe(1)
+    firstSave.resolve(createImageConfig(imageTargetA, 4))
+    await expect(first).resolves.toMatchObject({ ok: true, value: { revision: 4 } })
+    await expect(second).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'CANVAS_IMAGE_REVISION_CONFLICT' },
+    })
+    expect(saveCalls).toBe(2)
+  })
+
+  test('Given 不同 Canvas 的 SAVE When A 被阻塞 Then B 无需等待即可提交', async () => {
+    const blockedSave = createDeferred<CanvasImageModuleConfig>()
+    const targetOtherCanvas: CanvasImageTarget = {
+      projectId: 'project-1', canvasId: 'canvas-2', nodeId: 'image-node-c', imageModuleId: 'module-c',
+    }
+    const context = createContext({
+      imageSave: async (input) => input.canvasId === imageTargetA.canvasId
+        ? blockedSave.promise
+        : createImageConfig(input, input.expectedConfigRevision + 1),
+    })
+
+    const first = invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
+      context.sender,
+      createImageSaveInput(imageTargetA, 3),
+    )
+    const independent = invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
+      context.sender,
+      createImageSaveInput(targetOtherCanvas, 7),
+    )
+
+    await expect(independent).resolves.toMatchObject({ ok: true, value: { revision: 8 } })
+    blockedSave.resolve(createImageConfig(imageTargetA, 4))
+    await expect(first).resolves.toMatchObject({ ok: true, value: { revision: 4 } })
+  })
+
+  test('Given A job 引用 B job 输出 When LOAD A Then fail closed 且不返回跨目标素材元数据', async () => {
+    const jobA = {
+      ...createImageJob(imageTargetA, 'job-a'),
+      sourceAssetId: 'asset-b',
+    }
+    const jobB = createImageJob(imageTargetB, 'job-b', 'asset-b')
+    const context = createContext({
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-b' },
+      imageJobs: [jobA, jobB],
+      imageAssets: [createImageAsset('asset-a', jobA.id), createImageAsset('asset-b', jobB.id)],
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    )
+
+    expect(result).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+    expect(JSON.stringify(result)).not.toContain('asset-b.png')
+    expect(context.getMediaAccessCount()).toBe(0)
+  })
+
+  test('Given async LOAD 读取配置期间 sender destroyed When 读取恢复 Then 不创建或遗留媒体 lease', async () => {
+    const blockedLoad = createDeferred<CanvasImageModuleConfig>()
+    const context = createContext({ imageLoad: async () => blockedLoad.promise })
+    const loading = invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    )
+    await Promise.resolve()
+    context.sender.destroyForTest()
+    blockedLoad.resolve(createImageConfig(imageTargetA))
+
+    await expect(loading).resolves.toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+    expect(context.getMediaAccessCount()).toBe(0)
+    expect(context.mediaReleases.filter(Boolean)).toEqual([])
+    context.registration.dispose()
+    expect(context.mediaReleases.filter(Boolean)).toEqual([])
+  })
+
+  test('Given LOAD 列任务时 sender destroyed When 列表返回 Then 候选授权不得提交', async () => {
+    let context: ReturnType<typeof createContext>
+    context = createContext({
+      imageJobsList: () => {
+        context.sender.destroyForTest()
+        return [createImageJob(imageTargetA, 'job-a')]
+      },
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    )
+
+    expect(result).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+    expect(context.getMediaAccessCount()).toBe(0)
+    expect(context.mediaReleases.filter(Boolean)).toEqual([])
   })
 
   test('Given 四类内容生命周期命令 When IPC 调用 Then Agent 对账后调用内容服务并只返回公开业务字段', async () => {
