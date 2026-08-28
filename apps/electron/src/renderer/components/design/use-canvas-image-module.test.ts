@@ -291,33 +291,102 @@ describe('Canvas 生图模块 controller', () => {
     })
   })
 
-  test('Given save/job/detail 同 key 依次在途 When 旧回调迟到 Then 只有最新 generation 可写', async () => {
+  test('Given SAVE 在途 When 图片事件 LOAD 先返回更高 revision Then SAVE 成功收口且不回退权威配置', async () => {
     const fixture = createFixture()
-    const moduleTarget = target('generation')
+    const moduleTarget = target('save-load')
     const controller = fixture.controller(moduleTarget)
     controller.start()
     fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 4))
     await flush()
     controller.updateDraft({ prompt: '本地草稿' })
-    const staleSave = controller.commitDraft()
-    const staleJob = controller.createJob()
-    const latestDetails = controller.loadTaskDetails('job-latest')
+    const pendingSave = controller.commitDraft()
 
-    fixture.saveQueue[0]?.resolve(config(moduleTarget, 5, '旧保存'))
-    fixture.jobQueue[0]?.reject(new Error('旧任务失败'))
-    fixture.detailQueue[0]?.resolve({
-      creativeTaskId: 'task-1', currentJobId: 'job-latest', attempts: [], traceState: 'ready',
+    fixture.emit(moduleTarget)
+    fixture.loadQueue[1]?.resolve(snapshot(moduleTarget, 6, '更高权威配置'))
+    await flush()
+    expect(fixture.state(moduleTarget)).toMatchObject({ saveState: 'saving' })
+    expect(fixture.state(moduleTarget).snapshot?.config.revision).toBe(6)
+
+    fixture.saveQueue[0]?.resolve(config(moduleTarget, 5, '较旧保存结果'))
+    await pendingSave
+
+    expect(fixture.state(moduleTarget).snapshot?.config).toEqual(config(moduleTarget, 6, '更高权威配置'))
+    expect(fixture.state(moduleTarget)).toMatchObject({
+      saveState: 'saved', error: null, draft: { prompt: '更高权威配置', dirty: false },
     })
-    await staleSave
-    await expect(staleJob).rejects.toThrow('旧任务失败')
-    await latestDetails
+  })
+
+  test('Given SAVE 在途 When 启动 job 和 detail Then SAVE 返回仍接管服务端配置并结束 saving', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('save-job-detail')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 4))
+    await flush()
+    controller.updateDraft({ prompt: '本地草稿' })
+    const pendingSave = controller.commitDraft()
+    const pendingJob = controller.createJob()
+    const pendingDetails = controller.loadTaskDetails('job-detail')
+
+    fixture.saveQueue[0]?.resolve(config(moduleTarget, 5, '服务端保存结果'))
+    await pendingSave
+
+    expect(fixture.state(moduleTarget)).toMatchObject({
+      saveState: 'saved', error: null, draft: { prompt: '服务端保存结果', dirty: false },
+    })
+    expect(fixture.state(moduleTarget).snapshot?.config.revision).toBe(5)
+
+    fixture.jobQueue[0]?.reject(new Error('任务测试收口'))
+    fixture.detailQueue[0]?.resolve({
+      creativeTaskId: 'task-detail', currentJobId: 'job-detail', attempts: [], traceState: 'ready',
+    })
+    await expect(pendingJob).rejects.toThrow('任务测试收口')
+    await pendingDetails
+  })
+
+  test('Given 两个不同 job 详情并发 When 后发先回 Then 两个 job 各自保存结果', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('details-parallel')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 1))
     await flush()
 
-    expect(fixture.state(moduleTarget).snapshot?.config.revision).toBe(4)
-    expect(fixture.state(moduleTarget).error).toBeNull()
-    expect(fixture.state(moduleTarget).taskDetails.get('job-latest')?.details).toEqual({
-      creativeTaskId: 'task-1', currentJobId: 'job-latest', attempts: [], traceState: 'ready',
+    const jobA = controller.loadTaskDetails('job-a')
+    const jobB = controller.loadTaskDetails('job-b')
+    fixture.detailQueue[1]?.resolve({
+      creativeTaskId: 'task-b', currentJobId: 'job-b', attempts: [], traceState: 'ready',
     })
+    await flush()
+    fixture.detailQueue[0]?.resolve({
+      creativeTaskId: 'task-a', currentJobId: 'job-a', attempts: [], traceState: 'ready',
+    })
+    await Promise.all([jobA, jobB])
+
+    expect(fixture.state(moduleTarget).taskDetails.get('job-a')?.details?.creativeTaskId).toBe('task-a')
+    expect(fixture.state(moduleTarget).taskDetails.get('job-b')?.details?.creativeTaskId).toBe('task-b')
+  })
+
+  test('Given 同一 job 详情连续请求 When 旧请求最后返回 Then 只保留该 job 最新结果', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('details-latest')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 1))
+    await flush()
+
+    const older = controller.loadTaskDetails('job-same')
+    const newer = controller.loadTaskDetails('job-same')
+    fixture.detailQueue[1]?.resolve({
+      creativeTaskId: 'task-new', currentJobId: 'job-same', attempts: [], traceState: 'ready',
+    })
+    await flush()
+    fixture.detailQueue[0]?.resolve({
+      creativeTaskId: 'task-old', currentJobId: 'job-same', attempts: [], traceState: 'ready',
+    })
+    await Promise.all([older, newer])
+
+    expect(fixture.state(moduleTarget).taskDetails.get('job-same')?.details?.creativeTaskId).toBe('task-new')
   })
 
   test('Given adopt 回调在途 When 模块删除 Then 返回结果不复活状态', async () => {
