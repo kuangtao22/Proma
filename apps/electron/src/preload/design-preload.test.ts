@@ -21,6 +21,90 @@ function createRecordingIpc() {
 }
 
 describe('Design preload', () => {
+  test('Given Canvas 生图 API When 调用 Then 只向固定通道透传公开合同字段', async () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    /** 完整图片模块身份，额外字段不得进入主进程。 */
+    const target = {
+      projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1',
+      internalPath: '/Users/private/.proma/image-module-1',
+    }
+    /** 图片模块配置保存命令，额外字段不得越过 preload。 */
+    const saveInput = {
+      ...target,
+      expectedConfigRevision: 3,
+      prompt: '首页主视觉',
+      selectedModelProfileId: 'profile-1',
+      aspectRatio: '16:9' as const,
+      imageSize: '2K' as const,
+      contextMode: 'project' as const,
+      credential: 'secret',
+    }
+    /** 图片任务控制命令。 */
+    const jobInput = { ...target, jobId: 'job-1', stack: 'internal stack' }
+    /** 图片输出采用命令。 */
+    const adoptInput = {
+      ...jobInput, assetId: 'asset-1', expectedConfigRevision: 4, ipcChannel: 'arbitrary:channel',
+    }
+
+    await api.loadCanvasImageModule(target)
+    await api.saveCanvasImageModule(saveInput)
+    await api.createCanvasImageJob({ ...target, expectedConfigRevision: 3 })
+    await api.cancelCanvasImageJob(jobInput)
+    await api.retryCanvasImageJob(jobInput)
+    await api.adoptCanvasImageAsset(adoptInput)
+    await api.releaseCanvasImageMedia(target)
+
+    expect(recorded.invokes).toEqual([
+      { channel: CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1' }] },
+      { channel: CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', expectedConfigRevision: 3, prompt: '首页主视觉', selectedModelProfileId: 'profile-1', aspectRatio: '16:9', imageSize: '2K', contextMode: 'project' }] },
+      { channel: CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', expectedConfigRevision: 3 }] },
+      { channel: CANVAS_IPC_CHANNELS.CANCEL_IMAGE_JOB, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', jobId: 'job-1' }] },
+      { channel: CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', jobId: 'job-1' }] },
+      { channel: CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', jobId: 'job-1', assetId: 'asset-1', expectedConfigRevision: 4 }] },
+      { channel: CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1' }] },
+    ])
+  })
+
+  test('Given 多个 Canvas 生图订阅 When 推送并重复取消 Then 只映射公开目标且各自独立解绑', () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    /** 两个订阅分别收集同一公开事件。 */
+    const receivedA: unknown[] = []
+    const receivedB: unknown[] = []
+    const releaseA = api.onCanvasImageModuleChanged((event) => receivedA.push(event))
+    const releaseB = api.onCanvasImageModuleChanged((event) => receivedB.push(event))
+    const payload = {
+      projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1',
+      internalPath: '/Users/private/.proma/image-module-1', stack: 'internal stack',
+    }
+
+    recorded.added[0]?.listener({ sender: 'electron-event' } as never, payload)
+    recorded.added[1]?.listener({ sender: 'electron-event' } as never, payload)
+    releaseA()
+    releaseA()
+    releaseB()
+
+    const publicPayload = {
+      projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1',
+    }
+    expect(receivedA).toEqual([publicPayload])
+    expect(receivedB).toEqual([publicPayload])
+    expect(recorded.added.map(({ channel }) => channel)).toEqual([
+      CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED,
+      CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED,
+    ])
+    /** 两个已注册订阅在断言前均已确认存在。 */
+    const addedA = recorded.added[0]
+    /** 第二个订阅必须保持独立 handler。 */
+    const addedB = recorded.added[1]
+    if (!addedA || !addedB) throw new Error('图片模块订阅未完整注册')
+    expect(recorded.removed).toEqual([
+      addedA,
+      addedB,
+    ])
+  })
+
   test('Given 固定 API When 逐一调用 Then 只透传对应 Design 通道和结构化参数', async () => {
     const recorded = createRecordingIpc()
     const api = createDesignPreloadApi(recorded.ipc)

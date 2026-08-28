@@ -3,6 +3,10 @@ import type {
   CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
   CanvasDocument,
+  CanvasImageJobControlInput,
+  CanvasImageModuleConfig,
+  CanvasImageModuleSnapshot,
+  CanvasImageTarget,
   CanvasInvokeResult,
   CanvasNodeLifecycleResult,
   CanvasPublicError,
@@ -21,6 +25,7 @@ import type {
   DeleteDesignContextInput,
   DesignChangeEvent,
   DesignImageModelSelectionChangeEvent,
+  DesignJobRecord,
   ExportDesignAssetInput,
   GetDesignTaskDetailsInput,
   ImportAgentImageInput,
@@ -37,6 +42,7 @@ import type {
   RebuildCanvasAgentNodeInput,
   RebuildCanvasAgentNodeResult,
   RestoreCanvasNodeInput,
+  SaveCanvasImageModuleInput,
   SaveCanvasMutationsInput,
   SendCanvasAgentMessageInput,
   SendCanvasAgentMessageResult,
@@ -46,13 +52,36 @@ import type {
   UpdateDesignContextEntryInput,
   UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
-import type { DesignPreloadApi } from '../../preload/design-preload'
+import type {
+  AdoptCanvasImageAssetInput,
+  CreateCanvasImageJobInput,
+  DesignPreloadApi,
+} from '../../preload/design-preload'
 
 /** 测试和非 Electron 环境可注入的 Design API 子集。 */
 export type PartialDesignApi = Partial<DesignPreloadApi>
 
 /** Renderer 组件唯一使用的 Design 适配器。 */
 export interface DesignAdapter {
+  /** 加载单个 Canvas 生图模块公开快照。 */
+  loadCanvasImageModule: (input: CanvasImageTarget) => Promise<CanvasImageModuleSnapshot>
+  /** 保存单个 Canvas 生图模块配置。 */
+  saveCanvasImageModule: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
+  /** 从当前模块配置创建图片任务。 */
+  createCanvasImageJob: (input: CreateCanvasImageJobInput) => Promise<DesignJobRecord>
+  /** 取消目标图片任务。 */
+  cancelCanvasImageJob: (input: CanvasImageJobControlInput) => Promise<DesignJobRecord>
+  /** 重试目标图片任务。 */
+  retryCanvasImageJob: (input: CanvasImageJobControlInput) => Promise<DesignJobRecord>
+  /** 采用目标任务的指定输出素材。 */
+  adoptCanvasImageAsset: (input: AdoptCanvasImageAssetInput) => Promise<CanvasImageModuleConfig>
+  /** 释放当前图片模块的媒体访问授权。 */
+  releaseCanvasImageMedia: (input: CanvasImageTarget) => Promise<void>
+  /** 只向监听器传递四元身份完整匹配的图片模块事件。 */
+  onCanvasImageModuleChanged: (
+    target: CanvasImageTarget,
+    listener: (event: CanvasImageTarget) => void,
+  ) => ReturnType<DesignPreloadApi['onCanvasImageModuleChanged']>
   /** 加载目标原生 Canvas，避免与 legacy Design load 混淆。 */
   loadCanvas: (input: LoadCanvasInput) => Promise<CanvasWorkspaceSnapshot>
   /** 保存目标原生 Canvas，避免与 legacy Design save 混淆。 */
@@ -140,6 +169,9 @@ export class CanvasPublicOperationError extends Error {
 
 /** Adapter 无法调用 Preload 时使用的固定 Canvas 公开失败。 */
 const CANVAS_ADAPTER_FALLBACKS = {
+  imageLoad: { code: 'CANVAS_IMAGE_LOAD_FAILED', message: '生图节点暂时无法加载。' },
+  imageSave: { code: 'CANVAS_IMAGE_SAVE_FAILED', message: '生图配置保存失败，请重试。' },
+  imageJob: { code: 'CANVAS_IMAGE_JOB_FAILED', message: '图片任务操作失败，请重试。' },
   load: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
   save: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
   create: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
@@ -151,6 +183,21 @@ const CANVAS_ADAPTER_FALLBACKS = {
   send: { code: 'CANVAS_AGENT_SEND_FAILED', message: '消息发送失败，请重试。' },
   stop: { code: 'CANVAS_AGENT_STOP_FAILED', message: '停止 Agent 失败，请重试。' },
 } as const satisfies Record<string, CanvasPublicError>
+
+/**
+ * 把订阅释放函数包装为重复调用安全的边界。
+ * @param release Preload 返回的底层解绑函数。
+ * @returns 最多执行一次底层解绑的释放函数。
+ */
+function makeIdempotentAdapterRelease(release: () => void): () => void {
+  /** 标记该 adapter 订阅是否已释放。 */
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    release()
+  }
+}
 
 /**
  * 解包 Preload 安全结果，失败时只抛稳定公开错误。
@@ -183,6 +230,44 @@ async function callCanvasApi<T>(
 /** 创建负责 Canvas 安全解包与 legacy Design 原样适配的 renderer adapter。 */
 export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
   return {
+    loadCanvasImageModule: (input) => callCanvasApi(
+      () => requireMethod(api, 'loadCanvasImageModule')(input),
+      CANVAS_ADAPTER_FALLBACKS.imageLoad,
+    ),
+    saveCanvasImageModule: (input) => callCanvasApi(
+      () => requireMethod(api, 'saveCanvasImageModule')(input),
+      CANVAS_ADAPTER_FALLBACKS.imageSave,
+    ),
+    createCanvasImageJob: (input) => callCanvasApi(
+      () => requireMethod(api, 'createCanvasImageJob')(input),
+      CANVAS_ADAPTER_FALLBACKS.imageJob,
+    ),
+    cancelCanvasImageJob: (input) => callCanvasApi(
+      () => requireMethod(api, 'cancelCanvasImageJob')(input),
+      CANVAS_ADAPTER_FALLBACKS.imageJob,
+    ),
+    retryCanvasImageJob: (input) => callCanvasApi(
+      () => requireMethod(api, 'retryCanvasImageJob')(input),
+      CANVAS_ADAPTER_FALLBACKS.imageJob,
+    ),
+    adoptCanvasImageAsset: (input) => callCanvasApi(
+      () => requireMethod(api, 'adoptCanvasImageAsset')(input),
+      CANVAS_ADAPTER_FALLBACKS.imageJob,
+    ),
+    releaseCanvasImageMedia: (input) => callCanvasApi(
+      () => requireMethod(api, 'releaseCanvasImageMedia')(input),
+      CANVAS_ADAPTER_FALLBACKS.imageLoad,
+    ),
+    onCanvasImageModuleChanged: (target, listener) => {
+      /** 订阅完整图片目标，任一身份不符都不能触发当前工作台刷新。 */
+      const release = requireMethod(api, 'onCanvasImageModuleChanged')((event) => {
+        if (event.projectId === target.projectId
+          && event.canvasId === target.canvasId
+          && event.nodeId === target.nodeId
+          && event.imageModuleId === target.imageModuleId) listener(event)
+      })
+      return makeIdempotentAdapterRelease(release)
+    },
     loadCanvas: (input) => callCanvasApi(
       () => requireMethod(api, 'loadCanvasWorkspace')(input),
       CANVAS_ADAPTER_FALLBACKS.load,

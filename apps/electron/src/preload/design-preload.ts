@@ -2,6 +2,10 @@ import { CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS } from '@proma/shared'
 import type {
   CanvasChangeEvent,
   CanvasDocument,
+  CanvasImageJobControlInput,
+  CanvasImageModuleConfig,
+  CanvasImageModuleSnapshot,
+  CanvasImageTarget,
   CanvasInvokeResult,
   CanvasPublicError,
   CanvasSessionChangeEvent,
@@ -46,6 +50,7 @@ import type {
   RegisterDesignContextAssetInput,
   SaveDesignMutationsInput,
   SaveCanvasMutationsInput,
+  SaveCanvasImageModuleInput,
   SendCanvasAgentMessageInput,
   SendCanvasAgentMessageResult,
   StopCanvasAgentInput,
@@ -58,8 +63,35 @@ import type {
 } from '@proma/shared'
 import type { IpcRendererEvent } from 'electron'
 
+/** 创建 Canvas 图片任务时绑定配置 revision 的公开输入。 */
+export interface CreateCanvasImageJobInput extends CanvasImageTarget {
+  expectedConfigRevision: number
+}
+
+/** 采用 Canvas 图片任务输出时使用的公开输入。 */
+export interface AdoptCanvasImageAssetInput extends CanvasImageJobControlInput {
+  assetId: string
+  expectedConfigRevision: number
+}
+
 /** Renderer 获得的稳定 Design API。 */
 export interface DesignPreloadApi {
+  /** 加载单个 Canvas 生图模块及其媒体授权快照。 */
+  loadCanvasImageModule: (input: CanvasImageTarget) => Promise<CanvasInvokeResult<CanvasImageModuleSnapshot>>
+  /** 使用配置 revision 保存单个 Canvas 生图模块。 */
+  saveCanvasImageModule: (input: SaveCanvasImageModuleInput) => Promise<CanvasInvokeResult<CanvasImageModuleConfig>>
+  /** 从当前固化配置创建 Canvas 图片任务。 */
+  createCanvasImageJob: (input: CreateCanvasImageJobInput) => Promise<CanvasInvokeResult<DesignJobRecord>>
+  /** 取消完整目标身份下的 Canvas 图片任务。 */
+  cancelCanvasImageJob: (input: CanvasImageJobControlInput) => Promise<CanvasInvokeResult<DesignJobRecord>>
+  /** 重试完整目标身份下的 Canvas 图片任务。 */
+  retryCanvasImageJob: (input: CanvasImageJobControlInput) => Promise<CanvasInvokeResult<DesignJobRecord>>
+  /** 将指定图片任务输出采用为模块当前素材。 */
+  adoptCanvasImageAsset: (input: AdoptCanvasImageAssetInput) => Promise<CanvasInvokeResult<CanvasImageModuleConfig>>
+  /** 释放当前窗口为指定图片模块持有的媒体授权。 */
+  releaseCanvasImageMedia: (input: CanvasImageTarget) => Promise<CanvasInvokeResult<void>>
+  /** 订阅全部图片模块变化，只公开完整目标身份。 */
+  onCanvasImageModuleChanged: (listener: (target: CanvasImageTarget) => void) => () => void
   /** 加载项目中指定原生 Canvas 的公开工作区快照。 */
   loadCanvasWorkspace: (input: LoadCanvasInput) => Promise<CanvasInvokeResult<CanvasWorkspaceSnapshot>>
   /** 在权威 revision 上保存指定原生 Canvas mutation。 */
@@ -130,6 +162,9 @@ export interface DesignPreloadIpc {
 
 /** Preload 无法调用主进程时使用的固定 Canvas 公开失败。 */
 const CANVAS_PRELOAD_FALLBACKS = {
+  imageLoad: { code: 'CANVAS_IMAGE_LOAD_FAILED', message: '生图节点暂时无法加载。' },
+  imageSave: { code: 'CANVAS_IMAGE_SAVE_FAILED', message: '生图配置保存失败，请重试。' },
+  imageJob: { code: 'CANVAS_IMAGE_JOB_FAILED', message: '图片任务操作失败，请重试。' },
   load: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
   save: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
   create: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
@@ -141,6 +176,51 @@ const CANVAS_PRELOAD_FALLBACKS = {
   send: { code: 'CANVAS_AGENT_SEND_FAILED', message: '消息发送失败，请重试。' },
   stop: { code: 'CANVAS_AGENT_STOP_FAILED', message: '停止 Agent 失败，请重试。' },
 } as const satisfies Record<string, CanvasPublicError>
+
+/**
+ * 从调用输入中只拣选 Canvas 图片模块公开目标字段。
+ * @param input Renderer 提供的图片模块目标。
+ * @returns 不含额外字段的四元公开目标。
+ */
+function selectCanvasImageTarget(input: CanvasImageTarget): CanvasImageTarget {
+  return {
+    projectId: input.projectId,
+    canvasId: input.canvasId,
+    nodeId: input.nodeId,
+    imageModuleId: input.imageModuleId,
+  }
+}
+
+/**
+ * 将未知图片变化 payload 映射为公开四元目标。
+ * @param value Electron 事件携带的未知值。
+ * @returns 字段完整时的公开目标，否则返回 null。
+ */
+function mapCanvasImageChange(value: unknown): CanvasImageTarget | null {
+  /** 事件候选只读取公开字段，不向 Renderer 传递原对象。 */
+  const candidate = value as Partial<CanvasImageTarget> | null
+  if (!candidate
+    || typeof candidate.projectId !== 'string'
+    || typeof candidate.canvasId !== 'string'
+    || typeof candidate.nodeId !== 'string'
+    || typeof candidate.imageModuleId !== 'string') return null
+  return selectCanvasImageTarget(candidate as CanvasImageTarget)
+}
+
+/**
+ * 把底层释放函数包装为重复调用安全的取消函数。
+ * @param release 只应执行一次的底层解绑操作。
+ * @returns 可重复调用且最多解绑一次的函数。
+ */
+function makeIdempotentRelease(release: () => void): () => void {
+  /** 记录当前订阅是否已完成解绑。 */
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    release()
+  }
+}
 
 /**
  * 捕获 Electron invoke rejection，并丢弃其路径、通道和堆栈正文。
@@ -166,6 +246,73 @@ async function invokeCanvasSafely<T>(
 /** 创建不暴露 ipcRenderer 本体的 Design preload API。 */
 export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi {
   return {
+    loadCanvasImageModule: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      selectCanvasImageTarget(input),
+      CANVAS_PRELOAD_FALLBACKS.imageLoad,
+    ),
+    saveCanvasImageModule: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
+      {
+        ...selectCanvasImageTarget(input),
+        expectedConfigRevision: input.expectedConfigRevision,
+        prompt: input.prompt,
+        selectedModelProfileId: input.selectedModelProfileId,
+        aspectRatio: input.aspectRatio,
+        imageSize: input.imageSize,
+        contextMode: input.contextMode,
+      },
+      CANVAS_PRELOAD_FALLBACKS.imageSave,
+    ),
+    createCanvasImageJob: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB,
+      { ...selectCanvasImageTarget(input), expectedConfigRevision: input.expectedConfigRevision },
+      CANVAS_PRELOAD_FALLBACKS.imageJob,
+    ),
+    cancelCanvasImageJob: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.CANCEL_IMAGE_JOB,
+      { ...selectCanvasImageTarget(input), jobId: input.jobId },
+      CANVAS_PRELOAD_FALLBACKS.imageJob,
+    ),
+    retryCanvasImageJob: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB,
+      { ...selectCanvasImageTarget(input), jobId: input.jobId },
+      CANVAS_PRELOAD_FALLBACKS.imageJob,
+    ),
+    adoptCanvasImageAsset: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET,
+      {
+        ...selectCanvasImageTarget(input),
+        jobId: input.jobId,
+        assetId: input.assetId,
+        expectedConfigRevision: input.expectedConfigRevision,
+      },
+      CANVAS_PRELOAD_FALLBACKS.imageJob,
+    ),
+    releaseCanvasImageMedia: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
+      selectCanvasImageTarget(input),
+      CANVAS_PRELOAD_FALLBACKS.imageLoad,
+    ),
+    onCanvasImageModuleChanged: (listener) => {
+      /** Electron event 被丢弃，只把映射后的完整公开目标交给 Renderer。 */
+      const handler = (_event: IpcRendererEvent, value: unknown): void => {
+        /** 公开目标映射失败时忽略该事件，避免半身份刷新错误模块。 */
+        const target = mapCanvasImageChange(value)
+        if (target) listener(target)
+      }
+      ipc.on(CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, handler)
+      return makeIdempotentRelease(() => {
+        ipc.removeListener(CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, handler)
+      })
+    },
     loadCanvasWorkspace: (input) => invokeCanvasSafely(
       ipc,
       CANVAS_IPC_CHANNELS.LOAD,

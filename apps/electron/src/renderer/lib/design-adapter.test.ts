@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import { createEmptyCanvasDocument, createEmptyDesignDocument } from '@proma/shared'
-import type { CanvasChangeEvent, SaveDesignMutationsInput } from '@proma/shared'
+import type {
+  CanvasChangeEvent,
+  CanvasImageModuleConfig,
+  CanvasImageModuleSnapshot,
+  DesignJobRecord,
+  SaveDesignMutationsInput,
+} from '@proma/shared'
 import {
   CanvasPublicOperationError,
   createDesignAdapter,
@@ -8,6 +14,137 @@ import {
 } from './design-adapter'
 
 describe('Design renderer adapter', () => {
+  test('Given Canvas 生图 preload 成功 When adapter 调用全部方法 Then 解包结果并保留输入对象', async () => {
+    /** preload 收到的调用参数，用于锁定 adapter 不改写业务命令。 */
+    const received: unknown[] = []
+    /** 图片模块身份。 */
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1',
+    }
+    /** 共享公开快照。 */
+    const snapshot = {
+      target,
+      config: {
+        schemaVersion: 2,
+        kind: 'image',
+        contentId: 'image-module-1',
+        revision: 3,
+        createdAt: 1,
+        updatedAt: 2,
+        prompt: '首页',
+        selectedModelProfileId: 'profile-1',
+        aspectRatio: '16:9',
+        imageSize: '2K',
+        contextMode: 'project',
+        adoptedAssetId: null,
+      },
+      jobs: [],
+      assets: [],
+      assetBaseUrl: 'media://asset',
+      thumbnailBaseUrl: 'media://thumbnail',
+    } satisfies CanvasImageModuleSnapshot
+    /** 保存后的配置。 */
+    const config = { ...snapshot.config, revision: 4 } satisfies CanvasImageModuleConfig
+    /** 任务操作返回的公开任务。 */
+    const job = { id: 'job-1' } as DesignJobRecord
+    const adapter = createDesignAdapter({
+      loadCanvasImageModule: async (input) => { received.push(input); return { ok: true, value: snapshot as never } },
+      saveCanvasImageModule: async (input) => { received.push(input); return { ok: true, value: config as never } },
+      createCanvasImageJob: async (input) => { received.push(input); return { ok: true, value: job as never } },
+      cancelCanvasImageJob: async (input) => { received.push(input); return { ok: true, value: job as never } },
+      retryCanvasImageJob: async (input) => { received.push(input); return { ok: true, value: job as never } },
+      adoptCanvasImageAsset: async (input) => { received.push(input); return { ok: true, value: config as never } },
+      releaseCanvasImageMedia: async (input) => { received.push(input); return { ok: true, value: undefined } },
+    })
+    const saveInput = { ...target, expectedConfigRevision: 3, prompt: '首页', selectedModelProfileId: 'profile-1', aspectRatio: '16:9' as const, imageSize: '2K' as const, contextMode: 'project' as const }
+    const createInput = { ...target, expectedConfigRevision: 3 }
+    const jobInput = { ...target, jobId: 'job-1' }
+    const adoptInput = { ...jobInput, assetId: 'asset-1', expectedConfigRevision: 4 }
+
+    expect(await adapter.loadCanvasImageModule(target)).toBe(snapshot)
+    expect(await adapter.saveCanvasImageModule(saveInput)).toBe(config)
+    expect(await adapter.createCanvasImageJob(createInput)).toBe(job)
+    expect(await adapter.cancelCanvasImageJob(jobInput)).toBe(job)
+    expect(await adapter.retryCanvasImageJob(jobInput)).toBe(job)
+    expect(await adapter.adoptCanvasImageAsset(adoptInput)).toBe(config)
+    await expect(adapter.releaseCanvasImageMedia(target)).resolves.toBeUndefined()
+    expect(received).toEqual([target, saveInput, createInput, jobInput, jobInput, adoptInput, target])
+  })
+
+  test('Given Canvas 生图失败 When adapter 解包 Then 保留公开冲突并净化缺失接线与 rejection', async () => {
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1',
+    }
+    const missing = createDesignAdapter({})
+    await expect(missing.loadCanvasImageModule(target)).rejects.toMatchObject({
+      code: 'CANVAS_IMAGE_LOAD_FAILED', message: '生图节点暂时无法加载。',
+    })
+    await expect(missing.saveCanvasImageModule({
+      ...target, expectedConfigRevision: 1, prompt: '', selectedModelProfileId: null,
+      aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto',
+    })).rejects.toMatchObject({
+      code: 'CANVAS_IMAGE_SAVE_FAILED', message: '生图配置保存失败，请重试。',
+    })
+    const rejected = createDesignAdapter({
+      retryCanvasImageJob: async () => { throw new Error('canvas:retry-image-job /Users/private UUID=internal') },
+    })
+    const rejectedPromise = rejected.retryCanvasImageJob({ ...target, jobId: 'job-1' })
+    await expect(rejectedPromise).rejects.toMatchObject({
+      code: 'CANVAS_IMAGE_JOB_FAILED', message: '图片任务操作失败，请重试。',
+    })
+    await expect(rejectedPromise).rejects.not.toThrow('/Users/private')
+    const conflicted = createDesignAdapter({
+      adoptCanvasImageAsset: async () => ({
+        ok: false,
+        error: { code: 'CANVAS_IMAGE_REVISION_CONFLICT', message: '配置已在其他窗口更新。' },
+      }),
+    })
+    await expect(conflicted.adoptCanvasImageAsset({
+      ...target, jobId: 'job-1', assetId: 'asset-1', expectedConfigRevision: 2,
+    })).rejects.toMatchObject({
+      code: 'CANVAS_IMAGE_REVISION_CONFLICT', message: '配置已在其他窗口更新。',
+    })
+  })
+
+  test('Given 完整目标的图片变化 When adapter 订阅 Then 只传目标一致事件且取消保持幂等', () => {
+    /** 捕获每个 preload 图片事件监听器。 */
+    const sourceListeners: Array<(event: typeof target) => void> = []
+    /** preload 层释放调用次数。 */
+    let releaseCalls = 0
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1',
+    }
+    const adapter = createDesignAdapter({
+      onCanvasImageModuleChanged: (listener) => {
+        sourceListeners.push(listener)
+        return () => { releaseCalls += 1 }
+      },
+    })
+    /** 两个业务订阅必须互不影响。 */
+    const receivedA: unknown[] = []
+    const receivedB: unknown[] = []
+    const releaseA = adapter.onCanvasImageModuleChanged(target, (event) => receivedA.push(event))
+    const releaseB = adapter.onCanvasImageModuleChanged(target, (event) => receivedB.push(event))
+    const events = [
+      { ...target, projectId: 'project-2' },
+      { ...target, canvasId: 'canvas-2' },
+      { ...target, nodeId: 'node-other' },
+      { ...target, imageModuleId: 'image-module-2' },
+      target,
+    ]
+    for (const event of events) {
+      sourceListeners[0]?.(event)
+      sourceListeners[1]?.(event)
+    }
+    releaseA()
+    releaseA()
+    releaseB()
+
+    expect(receivedA).toEqual([target])
+    expect(receivedB).toEqual([target])
+    expect(releaseCalls).toBe(2)
+  })
+
   test('Given 原生 Canvas preload 缺失或异常拒绝 When adapter 调用 Then 只返回当前操作公开错误', async () => {
     const missing = createDesignAdapter({})
     await expect(Promise.resolve().then(() => missing.loadCanvas({
