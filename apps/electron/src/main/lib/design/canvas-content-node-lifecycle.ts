@@ -8,6 +8,7 @@ import {
 import type {
   CanvasContentKind,
   CanvasDocument,
+  CanvasImageTarget,
   CanvasMutation,
   CanvasNode,
   CanvasNodeLifecycleResult,
@@ -99,6 +100,8 @@ export interface CanvasContentNodeLifecycleDependencies {
   store: Pick<CanvasDocumentStore, 'loadWithMigrationCapability' | 'mutate'>
   contentStore: CanvasNodeContentStore
   assertAgentNodeIdle: (nodeId: string, sessionId: string) => void
+  /** 图片节点进入删除 intent 前必须确认该模块没有活动任务。 */
+  cancelActiveImageJobs: (target: CanvasImageTarget) => Promise<void>
   resolveDefaultImageModelProfileId?: (projectId: string) => string | null
   now?: () => number
   randomUUID?: () => string
@@ -571,6 +574,14 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
         dependencies.assertAgentNodeIdle(node.id, node.agentSessionId)
         const deleted = dependencies.store.mutate(targetFrom(input), document.revision, [{ type: 'remove-nodes', nodeIds: [node.id] }])
         return { snapshot: snapshot(deleted) }
+      }
+      if (node.kind === 'image') {
+        /** 取消失败时不得写 prepared intent，否则后续 LOAD 可能在用户不知情时继续删除。 */
+        await dependencies.cancelActiveImageJobs({
+          ...targetFrom(input),
+          nodeId: node.id,
+          imageModuleId: node.imageModuleId,
+        })
       }
       const identity = contentIdentity(node)
       const timestamp = now()

@@ -1645,22 +1645,6 @@ export function registerIpcHandlers(): void {
   const canvasNodeContentStore = createCanvasNodeContentStore({ store: canvasDocumentStore })
   /** 新图片节点默认模型复用现有项目级可用选择，不读取或复制凭据。 */
   const canvasImagePreferences = getDesignImageModelServices().imagePreferences
-  /** 内容节点可恢复生命周期只在主进程注册期创建一次。 */
-  const canvasContentNodeLifecycle = createCanvasContentNodeLifecycle({
-    store: canvasDocumentStore,
-    contentStore: canvasNodeContentStore,
-    assertAgentNodeIdle: (nodeId, sessionId) => {
-      /** 节点或会话任一命中活动事实都必须拒绝删除。 */
-      const activeRuns = listActiveCanvasAgentRuns()
-      const busy = activeRuns.owners.some((owner) => (
-        owner.nodeId === nodeId || owner.sessionId === sessionId
-      )) || activeRuns.internalInvalidRuns.some((run) => run.sessionId === sessionId)
-      if (busy) throw new CanvasContentAgentBusyError()
-    },
-    resolveDefaultImageModelProfileId: (projectId) => (
-      canvasImagePreferences.getSelection(projectId).selectedProfileId ?? null
-    ),
-  })
   /** Canvas 图片配置复用图文档 capability 与稳定目录 helper。 */
   const canvasImageModuleStore = createCanvasImageModuleStore({ store: canvasDocumentStore })
   /** 图片任务输出采用与 Canvas 节点投影共用同一 Store。 */
@@ -1816,6 +1800,36 @@ export function registerIpcHandlers(): void {
     resolveOwnedOutputPath: resolveOwnedDesignJobOutputPath,
     listProjectIds: () => listAgentWorkspaces().map((workspace) => workspace.id),
     runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+  })
+  /** 内容节点可恢复生命周期只在唯一 Job Manager 就绪后创建，删除图片可先取消活动任务。 */
+  const canvasContentNodeLifecycle = createCanvasContentNodeLifecycle({
+    store: canvasDocumentStore,
+    contentStore: canvasNodeContentStore,
+    assertAgentNodeIdle: (nodeId, sessionId) => {
+      /** 节点或会话任一命中活动事实都必须拒绝删除。 */
+      const activeRuns = listActiveCanvasAgentRuns()
+      const busy = activeRuns.owners.some((owner) => (
+        owner.nodeId === nodeId || owner.sessionId === sessionId
+      )) || activeRuns.internalInvalidRuns.some((run) => run.sessionId === sessionId)
+      if (busy) throw new CanvasContentAgentBusyError()
+    },
+    cancelActiveImageJobs: async (target) => {
+      /** 同一图片目标正常最多一个活动任务；逐项取消可兼容异常恢复出的重复 journal。 */
+      const activeJobs = designJobManager.listCanvasImageJobs(target).filter((job) => (
+        job.status === 'queued' || job.status === 'running'
+      ))
+      for (const job of activeJobs) {
+        await designJobManager.cancel(target.projectId, job.id)
+      }
+      /** 取消返回后重新读取权威索引，任何残留活动任务都必须阻断删除。 */
+      const remainsActive = designJobManager.listCanvasImageJobs(target).some((job) => (
+        job.status === 'queued' || job.status === 'running'
+      ))
+      if (remainsActive) throw new Error('Canvas 图片任务仍在运行，节点未删除')
+    },
+    resolveDefaultImageModelProfileId: (projectId) => (
+      canvasImagePreferences.getSelection(projectId).selectedProfileId ?? null
+    ),
   })
   cleanupSuccessfulDesignTask = (projectId, sourceJobId) => {
     designJobManager.cleanupTaskAfterSuccessfulAssetDeletion(projectId, sourceJobId)

@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
-import type { CanvasContentKind, CanvasDocument, CanvasMutation, CanvasNode, CanvasTrashEntry } from '@proma/shared'
+import type {
+  CanvasContentKind,
+  CanvasDocument,
+  CanvasImageTarget,
+  CanvasMutation,
+  CanvasNode,
+  CanvasTrashEntry,
+} from '@proma/shared'
 import { createCanvasContentNodeLifecycle, parseCanvasContentNodeIntent } from './canvas-content-node-lifecycle'
 import type { CanvasContentNodeIntent } from './canvas-content-node-lifecycle'
 
@@ -12,6 +19,8 @@ function createFixture(options: {
   useDefaultRandomUUID?: boolean
   /** 创建图片节点时解析并固化的项目默认生图模型。 */
   defaultImageModelProfileId?: string | null
+  /** 图片删除前可注入的任务取消行为。 */
+  cancelActiveImageJobs?: (target: CanvasImageTarget) => Promise<void>
 } = {}) {
   /** 当前权威图文档。 */
   let document = createEmptyCanvasDocument('project-1', 'canvas-1', 10)
@@ -23,6 +32,8 @@ function createFixture(options: {
   const contents = new Set<string>()
   /** 内容 Store 收到的空内容准备输入。 */
   const preparedInputs: Array<{ contentId: string; selectedModelProfileId?: string | null }> = []
+  /** 图片删除的关键副作用顺序。 */
+  const imageDeleteCalls: string[] = []
   /** 模拟仍运行中的 Agent 节点。 */
   const running = new Set<string>()
   /** 迁移提交次数用于证明内容全部准备后只提交一次图。 */
@@ -39,6 +50,9 @@ function createFixture(options: {
     }),
     mutate: (_target: object, expectedRevision: number, mutations: CanvasMutation[]) => {
       if (expectedRevision !== document.revision) throw new Error('CANVAS_REVISION_CONFLICT')
+      if (mutations.some((mutation) => mutation.type === 'remove-nodes')) {
+        imageDeleteCalls.push('remove-node')
+      }
       document = { ...applyCanvasMutations(document, mutations), revision: document.revision + 1, updatedAt: document.updatedAt + 1 }
       return document
     },
@@ -50,7 +64,11 @@ function createFixture(options: {
     },
     prepareMigratedContent: async (_target: object, seed: { contentId: string }) => { contents.add(seed.contentId) },
     assertContent: async () => { throw new Error('unused') },
-    moveToTrash: async (_target: object, entry: CanvasTrashEntry) => { contents.delete(entry.contentId); trash.set(entry.trashId, entry) },
+    moveToTrash: async (_target: object, entry: CanvasTrashEntry) => {
+      imageDeleteCalls.push('move-to-trash')
+      contents.delete(entry.contentId)
+      trash.set(entry.trashId, entry)
+    },
     restoreFromTrash: async (_target: object, trashId: string) => {
       const entry = trash.get(trashId)
       if (!entry) throw new Error('CANVAS_TRASH_ENTRY_NOT_FOUND')
@@ -71,6 +89,10 @@ function createFixture(options: {
       return outcome as { commitVisible: true; durabilityUncertain: false } | { commitVisible: false; durabilityUncertain: false; error: string } | { commitVisible: true; durabilityUncertain: true; error: string }
     },
     assertAgentNodeIdle: (nodeId) => { if (running.has(nodeId)) throw new Error('AGENT_SESSION_BUSY') },
+    cancelActiveImageJobs: async (imageTarget) => {
+      imageDeleteCalls.push('cancel-job')
+      await options.cancelActiveImageJobs?.(imageTarget)
+    },
     resolveDefaultImageModelProfileId: () => options.defaultImageModelProfileId ?? null,
     now: (() => { let value = 100; return () => value++ })(),
     ...(options.useDefaultRandomUUID ? {} : {
@@ -78,7 +100,20 @@ function createFixture(options: {
     }),
   })
   const service = createService()
-  return { service, restartService: createService, intents, trash, contents, preparedInputs, running, getDocument: () => document, setDocument: (next: CanvasDocument) => { document = next }, getMigrationCommits: () => migrationCommits, getScanCount: () => scanCount }
+  return {
+    service,
+    restartService: createService,
+    intents,
+    trash,
+    contents,
+    preparedInputs,
+    running,
+    imageDeleteCalls,
+    getDocument: () => document,
+    setDocument: (next: CanvasDocument) => { document = next },
+    getMigrationCommits: () => migrationCommits,
+    getScanCount: () => scanCount,
+  }
 }
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
@@ -350,6 +385,59 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(restored.snapshot.document.nodes[0]?.position).toEqual({ x: 8, y: 9 })
     const deletedAgain = await fixture.service.delete({ ...target, nodeId: 'node-3', operationId: '66666666-6666-4666-8666-666666666666', expectedRevision: 3 })
     expect(deletedAgain.trashEntry?.trashId).not.toBe(deleted.trashEntry?.trashId)
+  })
+
+  test('Given 图片节点有运行任务 When 删除 Then 先取消任务再进入回收事务', async () => {
+    const fixture = createFixture()
+    await fixture.service.create({
+      ...target,
+      operationId: '41414141-4141-4141-8141-414141414141',
+      nodeId: 'node-image-running',
+      kind: 'image',
+      contentId: 'content-image-running',
+      title: '运行中图片',
+      position: { x: 0, y: 0 },
+      expectedRevision: 0,
+    })
+    fixture.imageDeleteCalls.length = 0
+
+    await fixture.service.delete({
+      ...target,
+      nodeId: 'node-image-running',
+      operationId: '42424242-4242-4242-8242-424242424242',
+      expectedRevision: 1,
+    })
+
+    expect(fixture.imageDeleteCalls).toEqual(['cancel-job', 'move-to-trash', 'remove-node'])
+  })
+
+  test('Given 图片任务取消失败 When 删除 Then 不写删除意图且完整保留节点和内容', async () => {
+    const fixture = createFixture({
+      cancelActiveImageJobs: async () => { throw new Error('图片任务取消失败') },
+    })
+    await fixture.service.create({
+      ...target,
+      operationId: '43434343-4343-4343-8343-434343434343',
+      nodeId: 'node-image-cancel-failed',
+      kind: 'image',
+      contentId: 'content-image-cancel-failed',
+      title: '保留图片',
+      position: { x: 0, y: 0 },
+      expectedRevision: 0,
+    })
+    fixture.imageDeleteCalls.length = 0
+
+    await expect(fixture.service.delete({
+      ...target,
+      nodeId: 'node-image-cancel-failed',
+      operationId: '44444444-4343-4343-8343-434343434343',
+      expectedRevision: 1,
+    })).rejects.toThrow('图片任务取消失败')
+
+    expect(fixture.imageDeleteCalls).toEqual(['cancel-job'])
+    expect(fixture.getDocument().nodes.map((node) => node.id)).toEqual(['node-image-cancel-failed'])
+    expect(fixture.contents.has('content-image-cancel-failed')).toBe(true)
+    expect(fixture.intents.has('44444444-4343-4343-8343-434343434343')).toBe(false)
   })
 
   test.each(contentKinds)('Given %s delete prepared intent 写失败 Then 内容与图保持可见', async (kind) => {
