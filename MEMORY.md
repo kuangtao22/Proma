@@ -194,3 +194,4 @@
 - 2026-08-28：Canvas 运行中 Agent 的“停止并删除”必须 authoritative-first 绑定明确 `startedAt`，每次 STOP attempt 另有独立单调请求代次；resolve/reject 在任何 UI 副作用前同时复核请求 token、Canvas、节点、session、`startedAt` 和当前 pending 身份，新运行接管、代次未知、Canvas 切换或卸载时先失效旧 token 并 fail closed。回收区每次列表读取使用独立单调请求代次，恢复成功、关闭和销毁都会失效旧请求，禁止迟到结果复活旧条目或覆盖新状态；restore 成功失效在途 list 时必须同步收口 `loading:false`。
 - 2026-08-28：Canvas 顶部独立新增节点采用“可视区优先追加”：全局右侧追加位置完整可见时保持原有横向排列，超出可视区后在当前视口按从左到右、从上到下寻找空位；既有节点与 viewport 始终不移动，可视区无空位时才回退到确定性全局追加。
 - 2026-08-28：Canvas 顶部添加入口使用锚定 `+` 按钮下方的 Radix `Popover` 单列菜单；选择 Agent/生图/文档/原型后立即关闭并沿用工作区可视区追加逻辑，视频保留“即将支持”禁用占位。该实现不再使用曾出现视觉显示不稳定的 `DropdownMenu`，也不使用遮挡画布的居中 `Dialog`。
+- 2026-08-28：用户确认 Canvas 生图节点采用现有 Pi Agent/Design Job/Design Asset 的单引擎双目标适配；配置、任务和版本按 `projectId + canvasId + nodeId + imageModuleId` 隔离，成功自动采用、重试固化旧快照，工作台展示最终提示词、上下文和可用 trace。节点单击只选中，双击或放大按钮打开工作台；节点侧 `+` 打开 Agent/生图/文档/原型悬浮菜单并创建自动连线的下游节点。
