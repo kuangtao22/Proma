@@ -12,6 +12,7 @@ import type {
   SDKAssistantMessage,
   AgentSessionMeta,
   CreateDesignJobInput,
+  CanvasImageTarget,
   CanvasImageInputReference,
   DesignAsset,
   DesignCanvasDocument,
@@ -220,6 +221,81 @@ describe('Design Job Manager', () => {
     expect(reloaded.manager.getTaskDetails('project-1', job.id, false)).toMatchObject({
       canvasInputReferences: [expect.objectContaining({ kind: 'webview', nodeId: 'webview-1' })],
     })
+  })
+
+  test('Given 未 recover 的 Manager When 重复按完整 Canvas 图片目标查询 Then journal 只扫描一次并返回稳定防御副本', async () => {
+    const created = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    const reloaded = createHarness()
+    const target: CanvasImageTarget = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-node-a', imageModuleId: 'image-module-a',
+    }
+
+    const first = reloaded.manager.listCanvasImageJobs(target)
+    const firstTarget = first[0]?.target
+    if (firstTarget?.kind === 'canvas-image') firstTarget.imageModuleId = 'tampered-module'
+    const second = reloaded.manager.listCanvasImageJobs(target)
+
+    expect(reloaded.journalScanCount).toBe(1)
+    expect(first.map((job) => job.id)).toEqual([created.id])
+    expect(second).toEqual([expect.objectContaining({
+      id: created.id,
+      target: expect.objectContaining({ imageModuleId: 'image-module-a' }),
+    })])
+  })
+
+  test('Given Canvas Job 创建、状态变化和重试 When 按目标查询 Then 索引增量保持稳定顺序', async () => {
+    const target: CanvasImageTarget = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-node-a', imageModuleId: 'image-module-a',
+    }
+    const original = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    await harness.manager.run(original.id)
+    const replacement = harness.manager.retry('project-1', original.id)
+
+    expect(harness.manager.listCanvasImageJobs(target)).toEqual([
+      expect.objectContaining({ id: original.id, status: 'failed' }),
+      expect.objectContaining({ id: replacement.id, status: 'queued' }),
+    ])
+  })
+
+  test('Given Canvas 成功任务被回收 When 再按目标查询 Then 索引同步删除全部 attempt', async () => {
+    const target: CanvasImageTarget = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-node-a', imageModuleId: 'image-module-a',
+    }
+    harness.messages = [createToolMessage('session-1/output.png')]
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    await harness.manager.run(job.id)
+
+    harness.manager.cleanupTaskAfterSuccessfulAssetDeletion('project-1', job.id)
+
+    expect(harness.manager.listCanvasImageJobs(target)).toEqual([])
+  })
+
+  test('Given Canvas queued journal When recover 后按目标查询 Then 索引返回恢复后的 interrupted 状态且不重复扫描', async () => {
+    const created = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    const reloaded = createHarness()
+    const target: CanvasImageTarget = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-node-a', imageModuleId: 'image-module-a',
+    }
+
+    await reloaded.manager.recover('project-1')
+    const recovered = reloaded.manager.listCanvasImageJobs(target)
+
+    expect(reloaded.journalScanCount).toBe(1)
+    expect(recovered).toEqual([expect.objectContaining({ id: created.id, status: 'interrupted' })])
+  })
+
+  test('Given 已缓存 Canvas Job 的 journal 后续损坏 When recover Then 不返回陈旧内存任务', async () => {
+    const created = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    const target: CanvasImageTarget = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-node-a', imageModuleId: 'image-module-a',
+    }
+    expect(harness.manager.listCanvasImageJobs(target)).toHaveLength(1)
+    writeFileSync(join(cacheRoot, 'jobs', `${created.id}.json`), '{broken', 'utf8')
+
+    const recovered = await harness.manager.recover('project-1')
+
+    expect(recovered).toEqual([])
+    expect(harness.manager.listCanvasImageJobs(target)).toEqual([])
   })
 
   test('Given 同一图片模块并发创建 When 首次解析尚未完成 Then 只允许一个 queued journal', async () => {
@@ -1508,6 +1584,8 @@ describe('Design Job Manager', () => {
     let retryIntentWrites = 0
     /** 记录 trace 读取次数，证明详情首屏不会加载大日志。 */
     let traceReadCount = 0
+    /** 记录完整 journal 目录扫描次数，目标索引建立后不得重复扫描。 */
+    let journalScanCount = 0
     /** 测试详情展开时返回的固定 trace。 */
     const traceEntries: DesignTraceEntry[] = [{
       timestamp: 1, type: 'thinking', title: '模型原始 Thinking', content: '真实思考',
@@ -1548,6 +1626,10 @@ describe('Design Job Manager', () => {
     }
     const manager = new DesignJobManager({
       pathResolver: { resolve: () => ({ jobsDir: join(cacheRoot, 'jobs'), projectRoot }) },
+      readJobsDirectory: (path) => {
+        journalScanCount += 1
+        return readdirSync(path)
+      },
       store,
       assetService: {
         resolveAssetPath: () => '/trusted/source.png',
@@ -1758,6 +1840,7 @@ describe('Design Job Manager', () => {
       get batchRollbacks() { return batchRollbacks },
       get retryIntentWrites() { return retryIntentWrites },
       get traceReadCount() { return traceReadCount },
+      get journalScanCount() { return journalScanCount },
       get relocationAttemptError() { return state.relocationAttemptError },
       get canvasAdoptionOutsideWorkspace() { return canvasAdoptionOutsideWorkspace },
       get canvasAdoptionCount() { return canvasAdoptionCount },

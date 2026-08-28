@@ -91,9 +91,9 @@ export interface CanvasDocumentIpcOptions {
   /** 图片模块配置复用唯一受管内容 Store。 */
   imageModules: Pick<CanvasImageModuleStore, 'load' | 'save'>
   /** Canvas 图片任务复用唯一 Design Job Manager。 */
-  imageJobs: Pick<DesignJobManager, 'createCanvasImage' | 'run' | 'cancel' | 'retry' | 'list' | 'onChanged'>
+  imageJobs: Pick<DesignJobManager, 'createCanvasImage' | 'run' | 'cancel' | 'retry' | 'listCanvasImageJobs' | 'onChanged'>
   /** 图片采用复用 Job Manager 已注入的同一目标适配器。 */
-  imageJobTarget: Pick<CanvasImageJobTargetAdapter, 'adoptOutput'>
+  imageJobTarget: Pick<CanvasImageJobTargetAdapter, 'assertTarget' | 'adoptOutput'>
   /** 图片模块只读取 Design 素材公开元数据并创建目录媒体授权。 */
   imageAssets: {
     list: (projectId: string) => DesignAsset[]
@@ -872,9 +872,26 @@ export function registerCanvasDocumentIpcHandlers(
   const imageMediaBySender = new Map<number, {
     sender: WebContents
     target: CanvasImageTarget
+    generation: number
     release: () => void
     onDestroyed: () => void
   }>()
+  /** 每个 sender 的单调 LOAD 代次，旧请求不得覆盖新请求。 */
+  const imageLoadGenerations = new Map<number, number>()
+  /** 注册释放后所有在途 LOAD 必须 fail closed。 */
+  let disposed = false
+
+  /** 开始 sender 的新 LOAD 并使更早请求失效。 */
+  const beginImageLoad = (senderId: number): number => {
+    const generation = (imageLoadGenerations.get(senderId) ?? 0) + 1
+    imageLoadGenerations.set(senderId, generation)
+    return generation
+  }
+
+  /** 判断 LOAD 仍是当前注册和 sender 的最新请求。 */
+  const isCurrentImageLoad = (senderId: number, generation: number): boolean => (
+    !disposed && imageLoadGenerations.get(senderId) === generation
+  )
 
   /** 释放窗口当前图片媒体授权；重复释放不产生副作用。 */
   const releaseImageMedia = (senderId: number): void => {
@@ -885,11 +902,19 @@ export function registerCanvasDocumentIpcHandlers(
     current.release()
   }
 
+  /** 只释放指定 LOAD 代次拥有的 lease，禁止旧请求撤销新 lease。 */
+  const releaseImageMediaGeneration = (senderId: number, generation: number): void => {
+    const current = imageMediaBySender.get(senderId)
+    if (current?.generation !== generation) return
+    releaseImageMedia(senderId)
+  }
+
   /** 候选 lease 成功后先切换所有权，再撤销旧 lease。 */
   const commitImageMedia = (
     sender: WebContents,
     target: CanvasImageTarget,
     access: ReturnType<CanvasDocumentIpcOptions['imageAssets']['createMediaAccess']>,
+    generation: number,
   ): void => {
     const previous = imageMediaBySender.get(sender.id)
     const onDestroyed = (): void => releaseImageMedia(sender.id)
@@ -900,22 +925,26 @@ export function registerCanvasDocumentIpcHandlers(
       candidateReleased = true
       access.release()
     }
-    if (sender.isDestroyed()) {
+    if (sender.isDestroyed() || !isCurrentImageLoad(sender.id, generation)) {
       releaseCandidate()
       throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
     }
     try {
-      imageMediaBySender.set(sender.id, { sender, target: { ...target }, release: releaseCandidate, onDestroyed })
+      imageMediaBySender.set(sender.id, {
+        sender, target: { ...target }, generation, release: releaseCandidate, onDestroyed,
+      })
       sender.once('destroyed', onDestroyed)
-      if (sender.isDestroyed()) {
-        releaseImageMedia(sender.id)
+      if (sender.isDestroyed() || !isCurrentImageLoad(sender.id, generation)) {
+        releaseImageMediaGeneration(sender.id, generation)
         throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
       }
     } catch (error) {
       sender.removeListener('destroyed', onDestroyed)
-      /** 销毁后的 sender 不恢复旧授权；其余提交失败仍保留旧授权。 */
-      if (!sender.isDestroyed() && previous) imageMediaBySender.set(sender.id, previous)
-      else imageMediaBySender.delete(sender.id)
+      /** 只回滚自己仍持有的 map 槽；并发新 LOAD 已接管时禁止覆盖。 */
+      if (imageMediaBySender.get(sender.id)?.generation === generation) {
+        if (!sender.isDestroyed() && !disposed && previous) imageMediaBySender.set(sender.id, previous)
+        else imageMediaBySender.delete(sender.id)
+      }
       releaseCandidate()
       throw error
     }
@@ -938,7 +967,7 @@ export function registerCanvasDocumentIpcHandlers(
 
   /** 从项目任务中读取并验证目标任务归属。 */
   const requireOwnedJob = (target: CanvasImageTarget, jobId: string): DesignJobRecord => {
-    const job = options.imageJobs.list(target.projectId).find((candidate) => candidate.id === jobId)
+    const job = options.imageJobs.listCanvasImageJobs(target).find((candidate) => candidate.id === jobId)
     if (!job || !isOwnedImageJob(job, target)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
     return job
   }
@@ -990,6 +1019,12 @@ export function registerCanvasDocumentIpcHandlers(
     jobs: DesignJobRecord[],
     projectAssets: DesignAsset[],
   ): DesignAsset[] => {
+    /** 项目素材 ID 必须唯一，否则 lineage 无法确定性解析。 */
+    const projectAssetById = new Map<string, DesignAsset>()
+    for (const asset of projectAssets) {
+      if (projectAssetById.has(asset.id)) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+      projectAssetById.set(asset.id, asset)
+    }
     /** 每个输出素材只能由一个目标任务声明。 */
     const ownerByAssetId = new Map<string, DesignJobRecord>()
     for (const job of jobs) {
@@ -998,26 +1033,38 @@ export function registerCanvasDocumentIpcHandlers(
       ownerByAssetId.set(job.outputAssetId, job)
     }
     /** 只接纳 sourceJobId 和目标任务输出双向一致的公开素材。 */
-    const assetById = new Map<string, DesignAsset>()
-    for (const asset of projectAssets) {
-      const owner = ownerByAssetId.get(asset.id)
-      if (!owner || asset.sourceJobId !== owner.id) continue
-      if (assetById.has(asset.id)) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
-      assetById.set(asset.id, asset)
-    }
+    const visibleAssetById = new Map<string, DesignAsset>()
     /** 每个已声明输出都必须在 Design Store 中存在且反向归属同一 Job。 */
-    for (const outputAssetId of ownerByAssetId.keys()) {
-      if (!assetById.has(outputAssetId)) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+    for (const [outputAssetId, owner] of ownerByAssetId) {
+      const asset = projectAssetById.get(outputAssetId)
+      if (!asset || asset.sourceJobId !== owner.id) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+      visibleAssetById.set(asset.id, asset)
     }
-    /** 当前配置和所有历史任务引用只能落在上述目标输出闭包。 */
+    /** 当前 adopted 是稳定模块配置的可信根，允许 legacy 素材没有 Canvas Job 来源。 */
+    if (config.adoptedAssetId) {
+      const lineageVisited = new Set<string>()
+      let currentAssetId: string | undefined = config.adoptedAssetId
+      let depth = 0
+      while (currentAssetId) {
+        if (depth >= 256 || lineageVisited.has(currentAssetId)) {
+          throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+        }
+        const asset = projectAssetById.get(currentAssetId)
+        if (!asset) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+        lineageVisited.add(currentAssetId)
+        visibleAssetById.set(asset.id, asset)
+        currentAssetId = asset.parentAssetId
+        depth += 1
+      }
+    }
+    /** 所有目标任务引用只能落在目标输出或 adopted 祖先闭包。 */
     const referencedAssetIds = [
-      config.adoptedAssetId,
       ...jobs.flatMap((job) => [job.sourceAssetId, job.parentAssetId, job.outputAssetId]),
     ].filter((assetId): assetId is string => typeof assetId === 'string')
-    if (referencedAssetIds.some((assetId) => !assetById.has(assetId))) {
+    if (referencedAssetIds.some((assetId) => !visibleAssetById.has(assetId))) {
       throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
     }
-    return [...assetById.values()]
+    return [...visibleAssetById.values()]
   }
 
   /** 按发生顺序发布历史或当前图事实，并去重同 cause + revision。 */
@@ -1103,8 +1150,14 @@ export function registerCanvasDocumentIpcHandlers(
     invokeCanvasOperation<CanvasImageModuleSnapshot>('imageLoad', async () => {
       assertAuthorizedSender(event, options)
       const target = parseImageTargetInput(value)
+      const loadGeneration = beginImageLoad(event.sender.id)
       /** await 前预注册销毁 gate，避免错过读取期间发生的 destroyed。 */
       let senderDestroyed = event.sender.isDestroyed()
+      const isActiveLoad = (): boolean => (
+        !senderDestroyed
+        && !event.sender.isDestroyed()
+        && isCurrentImageLoad(event.sender.id, loadGeneration)
+      )
       const onProvisionalDestroyed = (): void => {
         senderDestroyed = true
         releaseImageMedia(event.sender.id)
@@ -1113,24 +1166,27 @@ export function registerCanvasDocumentIpcHandlers(
       try {
         return await runImageCanvasExclusive(target, async () => {
           requireWritableProject(target.projectId, options)
-          if (senderDestroyed || event.sender.isDestroyed()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          if (!isActiveLoad()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
           const config = await options.imageModules.load(target)
           assertOwnedImageConfig(config, target)
-          if (senderDestroyed || event.sender.isDestroyed()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
-          /** 任务列表先按项目读取，再按完整图片目标逐项收窄。 */
-          const jobs = options.imageJobs.list(target.projectId).filter((job) => isOwnedImageJob(job, target))
-          if (senderDestroyed || event.sender.isDestroyed()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          if (!isActiveLoad()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          /** 目标索引直接返回完整四元身份下的稳定任务集合。 */
+          const jobs = options.imageJobs.listCanvasImageJobs(target)
+          if (!jobs.every((job) => isOwnedImageJob(job, target))) {
+            throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
+          }
+          if (!isActiveLoad()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
           const assets = resolveOwnedImageAssets(config, jobs, options.imageAssets.list(target.projectId))
-          if (senderDestroyed || event.sender.isDestroyed()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          if (!isActiveLoad()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
           /** 媒体 token 是候选；创建或提交失败均不得撤销旧授权。 */
           const access = options.imageAssets.createMediaAccess(target.projectId)
-          if (senderDestroyed || event.sender.isDestroyed()) {
+          if (!isActiveLoad()) {
             access.release()
             throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
           }
-          commitImageMedia(event.sender, target, access)
-          if (senderDestroyed || event.sender.isDestroyed()) {
-            releaseImageMedia(event.sender.id)
+          commitImageMedia(event.sender, target, access, loadGeneration)
+          if (!isActiveLoad()) {
+            releaseImageMediaGeneration(event.sender.id, loadGeneration)
             throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
           }
           return {
@@ -1199,6 +1255,10 @@ export function registerCanvasDocumentIpcHandlers(
       const job = await runImageCanvasExclusive(input, async () => {
         requireWritableProject(input.projectId, options)
         requireOwnedJob(input, input.jobId)
+        await options.imageJobTarget.assertTarget(input.projectId, {
+          kind: 'canvas-image', canvasId: input.canvasId,
+          nodeId: input.nodeId, imageModuleId: input.imageModuleId,
+        })
         return options.imageJobs.cancel(input.projectId, input.jobId)
       })
       if (!isOwnedImageJob(job, input)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
@@ -1213,6 +1273,10 @@ export function registerCanvasDocumentIpcHandlers(
       const job = await runImageCanvasExclusive(input, async () => {
         requireWritableProject(input.projectId, options)
         requireOwnedJob(input, input.jobId)
+        await options.imageJobTarget.assertTarget(input.projectId, {
+          kind: 'canvas-image', canvasId: input.canvasId,
+          nodeId: input.nodeId, imageModuleId: input.imageModuleId,
+        })
         return options.imageJobs.retry(input.projectId, input.jobId)
       })
       if (!isOwnedImageJob(job, input)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
@@ -1255,6 +1319,7 @@ export function registerCanvasDocumentIpcHandlers(
     invokeCanvasOperation<void>('imageLoad', async () => {
       assertAuthorizedSender(event, options)
       const target = parseImageTargetInput(value)
+      beginImageLoad(event.sender.id)
       const current = imageMediaBySender.get(event.sender.id)
       if (current && isSameImageTarget(current.target, target)) releaseImageMedia(event.sender.id)
     })
@@ -1608,12 +1673,13 @@ export function registerCanvasDocumentIpcHandlers(
   ))
 
   /** dispose 幂等释放本注册器的订阅、媒体授权与 invoke handler。 */
-  let disposed = false
   return {
     channels: [...channels],
     dispose: () => {
       if (disposed) return
       disposed = true
+      /** 先失效全部在途 LOAD，再撤销已提交 lease。 */
+      for (const senderId of imageLoadGenerations.keys()) beginImageLoad(senderId)
       unsubscribeImageJobs()
       for (const senderId of [...imageMediaBySender.keys()]) releaseImageMedia(senderId)
       /** 被后续注册替代的 generation 已失去 handler 所有权。 */

@@ -172,6 +172,8 @@ export interface DesignJobManagerDependencies {
   runWorkspaceWrite: <T>(projectId: string, effect: () => T) => T
   /** 原子写入单个任务 journal；生产默认使用 safe-file，测试可注入 durability 故障。 */
   writeJobJournal?: (path: string, value: object) => void
+  /** 读取 journal 目录项；测试注入用于验证目标索引不会重复全量扫描。 */
+  readJobsDirectory?: (path: string) => string[]
   /** 单项目恢复失败时记录中文错误，默认输出到主进程错误日志。 */
   warn?: (message: string) => void
   /** 生图模型未知底层错误记录器，必须保留原始 Error 供主进程诊断。 */
@@ -235,6 +237,14 @@ export class DesignJobManager {
   private readonly jobs = new Map<string, StoredDesignJob>()
   private readonly projectRevisions = new Map<string, number>()
   private readonly listeners = new Set<DesignJobChangedListener>()
+  /** 已完成 Canvas 图片目标索引首轮 journal 扫描的项目。 */
+  private readonly indexedCanvasImageProjects = new Set<string>()
+  /** 完整 Canvas 图片目标到任务 ID 集合的进程内索引。 */
+  private readonly canvasImageJobIdsByTarget = new Map<string, Set<string>>()
+  /** 项目拥有的目标 key，用于 recover 时精确重建单项目索引。 */
+  private readonly canvasImageTargetKeysByProject = new Map<string, Set<string>>()
+  /** 任务当前所属目标 key，用于状态覆盖和删除时增量维护。 */
+  private readonly canvasImageTargetKeyByJobId = new Map<string, string>()
   /** 尚未写入 journal 的 Canvas 图片目标预留，封闭并发 create/retry 的扫描窗口。 */
   private readonly canvasImageReservations = new Set<string>()
   private readonly createId: () => string
@@ -331,8 +341,22 @@ export class DesignJobManager {
 
   /** 列出项目全部任务，并把磁盘 journal 载入内存索引。 */
   list(projectId: string): DesignJobRecord[] {
-    return this.readProjectJobs(projectId)
+    const jobs = this.readProjectJobs(projectId)
+    this.rebuildCanvasImageIndex(projectId, jobs)
+    return jobs
       .sort((left, right) => left.createdAt - right.createdAt)
+  }
+
+  /** 按完整 Canvas 图片目标查询，首次惰性扫描后只访问该目标任务集合。 */
+  listCanvasImageJobs(target: CanvasImageTarget): DesignJobRecord[] {
+    this.ensureCanvasImageIndex(target.projectId)
+    const key = createCanvasImageTargetKey(target.projectId, target)
+    const jobIds = this.canvasImageJobIdsByTarget.get(key) ?? new Set<string>()
+    return [...jobIds]
+      .map((jobId) => this.jobs.get(jobId))
+      .filter((job): job is StoredDesignJob => Boolean(job))
+      .sort(compareDesignJobs)
+      .map(clonePublicDesignJob)
   }
 
   /**
@@ -613,12 +637,14 @@ export class DesignJobManager {
   /** 在权威画布恢复后，仅二次对账 terminal pending，不中断其它活动任务。 */
   async reconcilePendingTerminals(projectId: string): Promise<DesignJobRecord[]> {
     return this.dependencies.runWorkspaceWrite(projectId, async () => {
-      for (const job of this.readProjectJobs(projectId)) {
+      const jobs = this.readProjectJobs(projectId)
+      this.rebuildCanvasImageIndex(projectId, jobs)
+      for (const job of jobs) {
         if (job.terminalState?.status === 'pending') await this.reconcileTerminalJob(job)
       }
-      const reconciled = this.list(projectId)
+      const reconciled = this.listCachedProjectJobs(projectId)
       await this.finalizeRecoveredTerminals(reconciled)
-      return this.list(projectId)
+      return this.listCachedProjectJobs(projectId).map(clonePublicDesignJob)
     })
   }
 
@@ -626,6 +652,7 @@ export class DesignJobManager {
   async recover(projectId: string): Promise<DesignJobRecord[]> {
     return this.dependencies.runWorkspaceWrite(projectId, async () => {
       const jobs = this.readProjectJobs(projectId)
+      this.rebuildCanvasImageIndex(projectId, jobs)
       for (const stored of jobs) {
         let job = stored
         if (job.deletionState?.status === 'pending') {
@@ -673,9 +700,9 @@ export class DesignJobManager {
           })
         }
       }
-      const recovered = this.list(projectId)
+      const recovered = this.listCachedProjectJobs(projectId)
       await this.finalizeRecoveredTerminals(recovered)
-      return this.list(projectId)
+      return this.listCachedProjectJobs(projectId).map(clonePublicDesignJob)
     })
   }
 
@@ -1402,7 +1429,8 @@ export class DesignJobManager {
     /** key 只包含模块业务身份，节点重建也不能绕过同一配置的互斥。 */
     const reservationKey = createCanvasImageReservationKey(projectId, target)
     if (this.canvasImageReservations.has(reservationKey)) throw new Error('图片模块已有进行中任务')
-    const conflicting = this.readProjectJobs(projectId).find((job) => (
+    this.ensureCanvasImageIndex(projectId)
+    const conflicting = this.listCachedProjectJobs(projectId).find((job) => (
       !ignoredJobIds.has(job.id)
       && isSameCanvasImageModule(job.target, target)
       && (job.status === 'queued' || job.status === 'running' || job.terminalState?.status === 'pending')
@@ -1460,13 +1488,16 @@ export class DesignJobManager {
   /** 原子持久化单个任务 journal。 */
   private writeJob(job: StoredDesignJob): void {
     if (!isStoredDesignJob(job)) throw new Error('拒绝写入无效设计任务 journal')
+    /** 内存缓存与 JSON journal 使用完全相同的可选字段形状。 */
+    const persistedJob = JSON.parse(JSON.stringify(job)) as StoredDesignJob
     const path = this.resolveJobJournalPath(job.projectId, job.id)
     const directoryPath = this.dependencies.pathResolver.resolve(job.projectId).jobsDir
     mkdirSync(directoryPath, { recursive: true })
     const writeJournal = this.dependencies.writeJobJournal
       ?? ((journalPath: string, value: object): void => { writeJsonFileAtomic(journalPath, value, true) })
-    writeJournal(path, job)
-    this.jobs.set(job.id, job)
+    writeJournal(path, persistedJob)
+    this.jobs.set(persistedJob.id, persistedJob)
+    if (this.indexedCanvasImageProjects.has(persistedJob.projectId)) this.indexCanvasImageJob(persistedJob)
   }
 
   /** 删除未建立占位节点的 pending journal 与内存索引。 */
@@ -1474,6 +1505,7 @@ export class DesignJobManager {
     const path = this.resolveJobJournalPath(job.projectId, job.id)
     removeFileAtomic(path)
     this.jobs.delete(job.id)
+    if (this.indexedCanvasImageProjects.has(job.projectId)) this.removeCanvasImageJobFromIndex(job)
   }
 
   /** 读取项目全部合法 journal。 */
@@ -1481,7 +1513,8 @@ export class DesignJobManager {
     const directoryPath = this.dependencies.pathResolver.resolve(projectId).jobsDir
     if (!existsSync(directoryPath)) return []
     const jobs: StoredDesignJob[] = []
-    for (const name of readdirSync(directoryPath)) {
+    const readDirectory = this.dependencies.readJobsDirectory ?? readdirSync
+    for (const name of readDirectory(directoryPath)) {
       if (!name.endsWith('.json')) continue
       /** 文件 basename 是 journal ID 的第一份所有权事实。 */
       const fileJobId = name.slice(0, -'.json'.length)
@@ -1500,6 +1533,7 @@ export class DesignJobManager {
       const normalized = normalizeStoredDesignJob(value)
       if (!normalized || normalized.projectId !== projectId || normalized.id !== jobId) return undefined
       this.jobs.set(normalized.id, normalized)
+      if (this.indexedCanvasImageProjects.has(projectId)) this.indexCanvasImageJob(normalized)
       return normalized
     } catch {
       return undefined
@@ -1530,6 +1564,63 @@ export class DesignJobManager {
     const job = this.requireJob(jobId)
     if (job.projectId !== projectId) throw new Error('设计任务不属于当前项目')
     return job
+  }
+
+  /** 首次目标查询时扫描一次项目 journal 并建立完整四元目标索引。 */
+  private ensureCanvasImageIndex(projectId: string): void {
+    if (this.indexedCanvasImageProjects.has(projectId)) return
+    const jobs = this.readProjectJobs(projectId)
+    this.rebuildCanvasImageIndex(projectId, jobs)
+  }
+
+  /** 用一次权威 journal 扫描结果替换单项目 Canvas 图片目标索引。 */
+  private rebuildCanvasImageIndex(projectId: string, jobs: StoredDesignJob[]): void {
+    /** 项目级扫描是磁盘权威事实，必须同步淘汰已缺失或损坏的旧缓存。 */
+    for (const [jobId, cached] of this.jobs) {
+      if (cached.projectId === projectId) this.jobs.delete(jobId)
+    }
+    for (const job of jobs) this.jobs.set(job.id, job)
+    const previousKeys = this.canvasImageTargetKeysByProject.get(projectId) ?? new Set<string>()
+    for (const key of previousKeys) this.canvasImageJobIdsByTarget.delete(key)
+    for (const [jobId, key] of this.canvasImageTargetKeyByJobId) {
+      if (previousKeys.has(key)) this.canvasImageTargetKeyByJobId.delete(jobId)
+    }
+    this.canvasImageTargetKeysByProject.set(projectId, new Set())
+    this.indexedCanvasImageProjects.add(projectId)
+    for (const job of jobs) this.indexCanvasImageJob(job)
+  }
+
+  /** 写入或状态变化后把单条任务增量同步到目标索引。 */
+  private indexCanvasImageJob(job: StoredDesignJob): void {
+    this.removeCanvasImageJobFromIndex(job)
+    if (job.target.kind !== 'canvas-image') return
+    const key = createCanvasImageTargetKey(job.projectId, job.target)
+    const jobIds = this.canvasImageJobIdsByTarget.get(key) ?? new Set<string>()
+    jobIds.add(job.id)
+    this.canvasImageJobIdsByTarget.set(key, jobIds)
+    const projectKeys = this.canvasImageTargetKeysByProject.get(job.projectId) ?? new Set<string>()
+    projectKeys.add(key)
+    this.canvasImageTargetKeysByProject.set(job.projectId, projectKeys)
+    this.canvasImageTargetKeyByJobId.set(job.id, key)
+  }
+
+  /** 删除任务或覆盖目标前移除旧索引项，不影响同目标其它 attempt。 */
+  private removeCanvasImageJobFromIndex(job: Pick<StoredDesignJob, 'id' | 'projectId'>): void {
+    const previousKey = this.canvasImageTargetKeyByJobId.get(job.id)
+    if (!previousKey) return
+    this.canvasImageTargetKeyByJobId.delete(job.id)
+    const jobIds = this.canvasImageJobIdsByTarget.get(previousKey)
+    jobIds?.delete(job.id)
+    if (jobIds && jobIds.size > 0) return
+    this.canvasImageJobIdsByTarget.delete(previousKey)
+    this.canvasImageTargetKeysByProject.get(job.projectId)?.delete(previousKey)
+  }
+
+  /** 从本轮已扫描和增量维护的内存事实读取项目任务，避免 recover 重复扫盘。 */
+  private listCachedProjectJobs(projectId: string): StoredDesignJob[] {
+    return [...this.jobs.values()]
+      .filter((job) => job.projectId === projectId)
+      .sort(compareDesignJobs)
   }
 
   /** 通知全部状态监听器。 */
@@ -1632,6 +1723,24 @@ function isSameCanvasImageModule(
 /** 创建进程内目标预留键，数组编码避免分隔符碰撞。 */
 function createCanvasImageReservationKey(projectId: string, target: CanvasImageJobTarget): string {
   return JSON.stringify([projectId, target.canvasId, target.imageModuleId])
+}
+
+/** 创建包含节点绑定的完整 Canvas 图片目标索引键。 */
+function createCanvasImageTargetKey(
+  projectId: string,
+  target: Pick<CanvasImageTarget, 'canvasId' | 'nodeId' | 'imageModuleId'>,
+): string {
+  return JSON.stringify([projectId, target.canvasId, target.nodeId, target.imageModuleId])
+}
+
+/** 任务目标查询使用创建时间和稳定 ID 确保跨平台顺序一致。 */
+function compareDesignJobs(left: StoredDesignJob, right: StoredDesignJob): number {
+  return left.createdAt - right.createdAt || left.id.localeCompare(right.id)
+}
+
+/** 通过 JSON 公开边界复制任务，并删除未定义的可选内部字段。 */
+function clonePublicDesignJob(job: StoredDesignJob): DesignJobRecord {
+  return JSON.parse(JSON.stringify(job)) as DesignJobRecord
 }
 
 /** 把 journal 目标补全为 Canvas Store 使用的四重身份。 */

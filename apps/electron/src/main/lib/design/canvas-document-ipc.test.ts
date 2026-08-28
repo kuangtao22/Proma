@@ -102,11 +102,13 @@ function createImageJob(target: CanvasImageTarget, id: string, outputAssetId = '
 }
 
 /** 创建由指定任务产出的 Design 素材。 */
-function createImageAsset(id: string, sourceJobId: string): DesignAsset {
+function createImageAsset(id: string, sourceJobId?: string, parentAssetId?: string): DesignAsset {
   return {
     id, filename: `${id}.png`, relativePath: `assets/${id}.png`,
     thumbnailRelativePath: `thumbnails/${id}.webp`, mediaType: 'image/png',
-    width: 100, height: 100, byteSize: 100, sha256: 'a'.repeat(64), createdAt: 2, sourceJobId,
+    width: 100, height: 100, byteSize: 100, sha256: 'a'.repeat(64), createdAt: 2,
+    ...(sourceJobId ? { sourceJobId } : {}),
+    ...(parentAssetId ? { parentAssetId } : {}),
   }
 }
 
@@ -195,6 +197,7 @@ function createContext(options: {
   imageLoad?: (target: CanvasImageTarget) => Promise<CanvasImageModuleConfig>
   imageSave?: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
   imageJobsList?: (projectId: string) => DesignJobRecord[]
+  imageTargetAssert?: (projectId: string, target: Omit<CanvasImageTarget, 'projectId'>) => Promise<void>
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -414,11 +417,21 @@ function createContext(options: {
         imageCalls.push({ type: 'retry', value: { projectId, jobId } })
         return createImageJob(imageTargetA, 'job-retry')
       },
-      list: (projectId) => options.imageJobsList?.(projectId)
-        ?? options.imageJobs ?? [createImageJob(imageTargetA, 'job-a')],
+      listCanvasImageJobs: (target) => (
+        options.imageJobsList?.(target.projectId)
+          ?? options.imageJobs ?? [createImageJob(imageTargetA, 'job-a')]
+      ).filter((job) => job.target?.kind === 'canvas-image'
+        && job.projectId === target.projectId
+        && job.target.canvasId === target.canvasId
+        && job.target.nodeId === target.nodeId
+        && job.target.imageModuleId === target.imageModuleId),
       onChanged: () => () => undefined,
     },
     imageJobTarget: {
+      assertTarget: async (projectId, target) => {
+        imageCalls.push({ type: 'assert-target', value: { projectId, target } })
+        await options.imageTargetAssert?.(projectId, target)
+      },
       adoptOutput: async (projectId, target, assetId) => {
         imageCalls.push({ type: 'adopt', value: { projectId, target, assetId } })
       },
@@ -537,6 +550,39 @@ describe('原生 Canvas 文档 IPC', () => {
       expect(result).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_JOB_FAILED' } })
     }
     expect(context.imageCalls.filter((call) => ['cancel', 'retry', 'adopt'].includes(call.type))).toEqual([])
+  })
+
+  test('Given 图片节点已删除或换绑 When CANCEL/RETRY Then 权威目标复核先失败且不产生任务副作用', async () => {
+    const deletedJob = { ...createImageJob(imageTargetA, 'job-running'), status: 'running' as const }
+    const reboundJob = { ...createImageJob(imageTargetA, 'job-failed'), status: 'failed' as const }
+    const deleted = createContext({
+      imageJobs: [deletedJob],
+      imageTargetAssert: async () => { throw new Error('CANVAS_IMAGE_TARGET_INVALID: deleted') },
+    })
+    const rebound = createContext({
+      imageJobs: [reboundJob],
+      imageTargetAssert: async () => { throw new Error('CANVAS_IMAGE_TARGET_INVALID: rebound') },
+    })
+
+    const cancelResult = await invoke(
+      deleted.handlers,
+      CANVAS_IPC_CHANNELS.CANCEL_IMAGE_JOB,
+      deleted.sender,
+      { ...imageTargetA, jobId: deletedJob.id },
+    )
+    const retryResult = await invoke(
+      rebound.handlers,
+      CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB,
+      rebound.sender,
+      { ...imageTargetA, jobId: reboundJob.id },
+    )
+
+    expect(cancelResult).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_JOB_FAILED' } })
+    expect(retryResult).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_JOB_FAILED' } })
+    expect(deleted.imageCalls.filter((call) => call.type === 'assert-target')).toHaveLength(1)
+    expect(rebound.imageCalls.filter((call) => call.type === 'assert-target')).toHaveLength(1)
+    expect(deleted.imageCalls.filter((call) => call.type === 'cancel')).toHaveLength(0)
+    expect(rebound.imageCalls.filter((call) => call.type === 'retry' || call.type === 'run')).toHaveLength(0)
   })
 
   test('Given revision 身份或 asset 归属错误 When 写操作 Then fail closed 且无业务副作用', async () => {
@@ -666,7 +712,7 @@ describe('原生 Canvas 文档 IPC', () => {
     }
     const jobB = createImageJob(imageTargetB, 'job-b', 'asset-b')
     const context = createContext({
-      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-b' },
+      imageConfig: createImageConfig(imageTargetA),
       imageJobs: [jobA, jobB],
       imageAssets: [createImageAsset('asset-a', jobA.id), createImageAsset('asset-b', jobB.id)],
     })
@@ -681,6 +727,154 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(result).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
     expect(JSON.stringify(result)).not.toContain('asset-b.png')
     expect(context.getMediaAccessCount()).toBe(0)
+  })
+
+  test('Given 零 Canvas Job 且配置采用 legacy 素材 When LOAD Then 返回可信 adopted 祖先闭包', async () => {
+    const legacyAsset = createImageAsset('asset-legacy')
+    const context = createContext({
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: legacyAsset.id },
+      imageJobs: [],
+      imageAssets: [legacyAsset, createImageAsset('asset-unrelated', 'job-unrelated')],
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    )
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { jobs: [], assets: [legacyAsset] },
+    })
+  })
+
+  test('Given 编辑 Job 以 legacy adopted 为来源 When LOAD Then 返回目标输出与完整祖先链', async () => {
+    const legacyAsset = createImageAsset('asset-legacy')
+    const editedAsset = createImageAsset('asset-edited', 'job-edit', legacyAsset.id)
+    const editJob = {
+      ...createImageJob(imageTargetA, 'job-edit', editedAsset.id),
+      action: 'edit' as const,
+      sourceAssetId: legacyAsset.id,
+      parentAssetId: legacyAsset.id,
+    }
+    const context = createContext({
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: editedAsset.id },
+      imageJobs: [editJob],
+      imageAssets: [legacyAsset, editedAsset],
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    )
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { jobs: [editJob], assets: [editedAsset, legacyAsset] },
+    })
+  })
+
+  test('Given adopted 素材祖先循环或超过上限 When LOAD Then fail closed 且不创建媒体 lease', async () => {
+    const cyclicJob = createImageJob(imageTargetA, 'job-cycle', 'asset-cycle-a')
+    const cyclic = createContext({
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-cycle-a' },
+      imageJobs: [cyclicJob],
+      imageAssets: [
+        createImageAsset('asset-cycle-a', cyclicJob.id, 'asset-cycle-b'),
+        createImageAsset('asset-cycle-b', undefined, 'asset-cycle-a'),
+      ],
+    })
+    const deepAssets = Array.from({ length: 257 }, (_, index) => (
+      createImageAsset(
+        `asset-depth-${index}`,
+        index === 0 ? 'job-depth' : undefined,
+        index < 256 ? `asset-depth-${index + 1}` : undefined,
+      )
+    ))
+    const deepJob = createImageJob(imageTargetA, 'job-depth', 'asset-depth-0')
+    const tooDeep = createContext({
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-depth-0' },
+      imageJobs: [deepJob],
+      imageAssets: deepAssets,
+    })
+
+    for (const context of [cyclic, tooDeep]) {
+      const result = await invoke(
+        context.handlers,
+        CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+        context.sender,
+        imageTargetA,
+      )
+      expect(result).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+      expect(context.getMediaAccessCount()).toBe(0)
+    }
+  })
+
+  test('Given 旧 LOAD 晚回且较新 Canvas LOAD 已提交 When 旧请求完成 Then 不能撤销较新 lease', async () => {
+    const oldLoad = createDeferred<CanvasImageModuleConfig>()
+    const newerTarget: CanvasImageTarget = {
+      projectId: 'project-1', canvasId: 'canvas-2', nodeId: 'image-node-new', imageModuleId: 'module-new',
+    }
+    const newerAsset = createImageAsset('asset-new', 'job-new')
+    const newerJob = createImageJob(newerTarget, 'job-new', newerAsset.id)
+    const oldAsset = createImageAsset('asset-a', 'job-old')
+    const oldJob = createImageJob(imageTargetA, 'job-old', oldAsset.id)
+    const context = createContext({
+      imageLoad: async (target) => target.canvasId === imageTargetA.canvasId
+        ? oldLoad.promise
+        : { ...createImageConfig(newerTarget), adoptedAssetId: newerAsset.id },
+      imageJobsList: () => [oldJob, newerJob],
+      imageAssets: [oldAsset, newerAsset],
+    })
+
+    const oldResult = invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    )
+    await Promise.resolve()
+    const newerResult = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      newerTarget,
+    )
+    oldLoad.resolve(createImageConfig(imageTargetA))
+
+    expect(newerResult).toMatchObject({ ok: true, value: { target: newerTarget } })
+    await expect(oldResult).resolves.toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+    expect(context.getMediaAccessCount()).toBe(1)
+    expect(context.mediaReleases[0] ?? 0).toBe(0)
+    await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
+      context.sender,
+      newerTarget,
+    )
+    expect(context.mediaReleases[0]).toBe(1)
+  })
+
+  test('Given registration dispose 时 LOAD 仍在读取 When 读取完成 Then 不得重新提交媒体 lease', async () => {
+    const blockedLoad = createDeferred<CanvasImageModuleConfig>()
+    const context = createContext({ imageLoad: async () => blockedLoad.promise })
+    const loading = invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    )
+    await Promise.resolve()
+    context.registration.dispose()
+    blockedLoad.resolve(createImageConfig(imageTargetA))
+
+    await expect(loading).resolves.toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+    expect(context.getMediaAccessCount()).toBe(0)
+    expect(context.mediaReleases.filter(Boolean)).toEqual([])
   })
 
   test('Given async LOAD 读取配置期间 sender destroyed When 读取恢复 Then 不创建或遗留媒体 lease', async () => {
@@ -2047,10 +2241,13 @@ describe('原生 Canvas 文档 IPC', () => {
         run: async () => undefined,
         cancel: async () => createImageJob(imageTargetA, 'job-a'),
         retry: () => createImageJob(imageTargetA, 'job-retry'),
-        list: () => [],
+        listCanvasImageJobs: () => [],
         onChanged: () => () => undefined,
       },
-      imageJobTarget: { adoptOutput: async () => undefined },
+      imageJobTarget: {
+        assertTarget: async () => undefined,
+        adoptOutput: async () => undefined,
+      },
       imageAssets: {
         list: () => [],
         createMediaAccess: () => ({
