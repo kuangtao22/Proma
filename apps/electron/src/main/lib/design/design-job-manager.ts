@@ -235,6 +235,8 @@ export class DesignJobManager {
   private readonly jobs = new Map<string, StoredDesignJob>()
   private readonly projectRevisions = new Map<string, number>()
   private readonly listeners = new Set<DesignJobChangedListener>()
+  /** 尚未写入 journal 的 Canvas 图片目标预留，封闭并发 create/retry 的扫描窗口。 */
+  private readonly canvasImageReservations = new Set<string>()
   private readonly createId: () => string
   private readonly createCreativeTaskId: () => string
   private readonly now: () => number
@@ -267,59 +269,59 @@ export class DesignJobManager {
     if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
     /** 局部常量保留跨异步调用和数组回调的 Canvas 目标收窄。 */
     const target = input.target
-    const prompt = input.prompt.trim()
-    if (!prompt) throw new Error('设计任务提示词不能为空')
-    if (!input.generationConstraints || input.canvasImageConfigRevision === undefined) {
-      throw new Error('Canvas 图片任务缺少生成快照')
+    /** 目标预留必须早于首个 await，保证同一事件循环内并发请求只能有一个进入。 */
+    const releaseReservation = this.reserveCanvasImageTarget(input.projectId, target)
+    try {
+      const prompt = input.prompt.trim()
+      if (!prompt) throw new Error('设计任务提示词不能为空')
+      if (!input.generationConstraints || input.canvasImageConfigRevision === undefined) {
+        throw new Error('Canvas 图片任务缺少生成快照')
+      }
+      const targetAdapter = this.dependencies.canvasImageTargetAdapter
+      const inputResolver = this.dependencies.canvasImageInputResolver
+      if (!targetAdapter || !inputResolver) throw new Error('Canvas 图片任务执行边界未初始化')
+      /** 完整目标必须在模型、输入、ID 和 journal 副作用前验证。 */
+      await targetAdapter.assertTarget(input.projectId, target)
+      /** 可信模型校验必须早于 ID、journal 和事件副作用。 */
+      const imageModelSnapshot = this.runImageModelValidation(
+        () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
+      )
+      /** 连线输入独立于 contextMode，始终从权威直接入边重新解析。 */
+      const canvasInputReferences = await inputResolver.resolve(toCanvasImageTarget(input.projectId, target))
+      /** 只读取旧 Design revision 作为兼容事件序列，不产生结构 mutation。 */
+      const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
+      const id = this.createId()
+      const creativeTaskId = this.createCreativeTaskId()
+      if (!isSafeDesignStableId(id) || !isSafeDesignStableId(creativeTaskId) || id === creativeTaskId) {
+        throw new Error('Design 创作任务 ID 非法')
+      }
+      const timestamp = this.now()
+      const job: StoredDesignJob = {
+        id,
+        creativeTaskId,
+        attemptNumber: 1,
+        projectId: input.projectId,
+        target: { ...target },
+        action: input.action,
+        status: 'queued',
+        prompt,
+        originalRequest: prompt,
+        contextMode: input.contextMode,
+        generationConstraints: { ...input.generationConstraints },
+        canvasInputReferences: canvasInputReferences.map((reference) => ({ ...reference })),
+        canvasImageConfigRevision: input.canvasImageConfigRevision,
+        imageModelSnapshot: { ...imageModelSnapshot },
+        traceState: 'pending',
+        executionSessionCleanupState: 'pending',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }
+      this.writeJob(job)
+      this.emit(job, current.revision)
+      return job
+    } finally {
+      releaseReservation()
     }
-    const targetAdapter = this.dependencies.canvasImageTargetAdapter
-    const inputResolver = this.dependencies.canvasImageInputResolver
-    if (!targetAdapter || !inputResolver) throw new Error('Canvas 图片任务执行边界未初始化')
-    /** 完整目标必须在模型、输入、ID 和 journal 副作用前验证。 */
-    await targetAdapter.assertTarget(input.projectId, target)
-    /** active 与 terminal pending 都可能覆盖模块当前版本，必须按完整目标互斥。 */
-    const conflicting = this.readProjectJobs(input.projectId).find((job) => (
-      isSameCanvasImageTarget(job.target, target)
-      && (job.status === 'queued' || job.status === 'running' || job.terminalState?.status === 'pending')
-    ))
-    if (conflicting) throw new Error('图片模块已有进行中任务')
-    /** 可信模型校验必须早于 ID、journal 和事件副作用。 */
-    const imageModelSnapshot = this.runImageModelValidation(
-      () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
-    )
-    /** 连线输入独立于 contextMode，始终从权威直接入边重新解析。 */
-    const canvasInputReferences = await inputResolver.resolve(toCanvasImageTarget(input.projectId, target))
-    /** 只读取旧 Design revision 作为兼容事件序列，不产生结构 mutation。 */
-    const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
-    const id = this.createId()
-    const creativeTaskId = this.createCreativeTaskId()
-    if (!isSafeDesignStableId(id) || !isSafeDesignStableId(creativeTaskId) || id === creativeTaskId) {
-      throw new Error('Design 创作任务 ID 非法')
-    }
-    const timestamp = this.now()
-    const job: StoredDesignJob = {
-      id,
-      creativeTaskId,
-      attemptNumber: 1,
-      projectId: input.projectId,
-      target: { ...target },
-      action: input.action,
-      status: 'queued',
-      prompt,
-      originalRequest: prompt,
-      contextMode: input.contextMode,
-      generationConstraints: { ...input.generationConstraints },
-      canvasInputReferences: canvasInputReferences.map((reference) => ({ ...reference })),
-      canvasImageConfigRevision: input.canvasImageConfigRevision,
-      imageModelSnapshot: { ...imageModelSnapshot },
-      traceState: 'pending',
-      executionSessionCleanupState: 'pending',
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    }
-    this.writeJob(job)
-    this.emit(job, current.revision)
-    return job
   }
 
   /** 查询已加载或磁盘可发现的任务。 */
@@ -508,35 +510,43 @@ export class DesignJobManager {
       if (!['failed', 'cancelled', 'interrupted'].includes(previous.status)) {
         throw new Error('当前设计任务不可重试')
       }
-      if (previous.target.kind === 'design-canvas') {
-        /** 旧 Design 重试继续要求占位节点由当前 attempt 独占。 */
-        const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
-        const ownsNode = current.nodes.some((node) => (
-          node.id === requireDesignCanvasTarget(previous).nodeId
-          && node.kind === 'job'
-          && node.jobId === previous.id
-        ))
-        if (!ownsNode) throw new Error('设计任务节点已被其他任务接管')
-      }
-      const replacementId = this.createId()
-      if (!isSafeDesignStableId(replacementId)) throw new Error('设计任务 ID 非法')
-      const intent: StoredDesignJob = {
-        ...previous,
-        replacedByJobId: replacementId,
-        retryState: { status: 'pending' },
-        updatedAt: this.now(),
-      }
+      /** Canvas retry 与新建共用同一目标预留，且忽略当前已终态的旧 attempt。 */
+      const releaseReservation = previous.target.kind === 'canvas-image'
+        ? this.reserveCanvasImageTarget(projectId, previous.target, new Set([previous.id]))
+        : undefined
       try {
-        this.writeJob(intent)
-        previous = intent
-      } catch (error) {
-        /** rename 后 durability 报错时以磁盘内容确认 intent 是否已经提交。 */
-        const durableIntent = this.readJobJournal(projectId, previous.id)
-        if (durableIntent?.replacedByJobId !== replacementId
-          || durableIntent.retryState?.status !== 'pending') throw error
-        previous = durableIntent
+        if (previous.target.kind === 'design-canvas') {
+          /** 旧 Design 重试继续要求占位节点由当前 attempt 独占。 */
+          const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
+          const ownsNode = current.nodes.some((node) => (
+            node.id === requireDesignCanvasTarget(previous).nodeId
+            && node.kind === 'job'
+            && node.jobId === previous.id
+          ))
+          if (!ownsNode) throw new Error('设计任务节点已被其他任务接管')
+        }
+        const replacementId = this.createId()
+        if (!isSafeDesignStableId(replacementId)) throw new Error('设计任务 ID 非法')
+        const intent: StoredDesignJob = {
+          ...previous,
+          replacedByJobId: replacementId,
+          retryState: { status: 'pending' },
+          updatedAt: this.now(),
+        }
+        try {
+          this.writeJob(intent)
+          previous = intent
+        } catch (error) {
+          /** rename 后 durability 报错时以磁盘内容确认 intent 是否已经提交。 */
+          const durableIntent = this.readJobJournal(projectId, previous.id)
+          if (durableIntent?.replacedByJobId !== replacementId
+            || durableIntent.retryState?.status !== 'pending') throw error
+          previous = durableIntent
+        }
+        return this.completeRetryIntent(previous, true)
+      } finally {
+        releaseReservation?.()
       }
-      return this.completeRetryIntent(previous)
     })
   }
 
@@ -598,49 +608,49 @@ export class DesignJobManager {
   }
 
   /** 在权威画布恢复后，仅二次对账 terminal pending，不中断其它活动任务。 */
-  reconcilePendingTerminals(projectId: string): DesignJobRecord[] {
-    return this.dependencies.runWorkspaceWrite(projectId, () => {
+  async reconcilePendingTerminals(projectId: string): Promise<DesignJobRecord[]> {
+    return this.dependencies.runWorkspaceWrite(projectId, async () => {
       for (const job of this.readProjectJobs(projectId)) {
-        if (job.terminalState?.status === 'pending') this.reconcileTerminalJob(job)
+        if (job.terminalState?.status === 'pending') await this.reconcileTerminalJob(job)
       }
       const reconciled = this.list(projectId)
-      this.finalizeRecoveredTerminals(reconciled)
-      return reconciled
+      await this.finalizeRecoveredTerminals(reconciled)
+      return this.list(projectId)
     })
   }
 
   /** 恢复单项目 journal，把无法续跑的 running 任务标记为 interrupted。 */
-  recover(projectId: string): DesignJobRecord[] {
-    const jobs = this.readProjectJobs(projectId)
-    for (const stored of jobs) {
-      let job = stored
-      if (job.deletionState?.status === 'pending') {
-        try {
-          this.dependencies.runWorkspaceWrite(projectId, () => this.completeDeletion(job))
-        } catch (error) {
-          this.warn(`[Design Job 恢复] 项目 ${projectId} 的删除任务 ${job.id} 恢复失败: ${String(error)}`)
-        }
-        continue
-      }
-      if (job.placementState === 'pending') {
-        const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
-        const placeholderExists = document.nodes.some((node) => (
-          node.id === requireDesignCanvasTarget(job).nodeId && node.kind === 'job' && node.jobId === job.id
-        ))
-        if (!placeholderExists) {
-          this.deleteJobJournal(job)
+  async recover(projectId: string): Promise<DesignJobRecord[]> {
+    return this.dependencies.runWorkspaceWrite(projectId, async () => {
+      const jobs = this.readProjectJobs(projectId)
+      for (const stored of jobs) {
+        let job = stored
+        if (job.deletionState?.status === 'pending') {
+          try {
+            this.completeDeletion(job)
+          } catch (error) {
+            this.warn(`[Design Job 恢复] 项目 ${projectId} 的删除任务 ${job.id} 恢复失败: ${String(error)}`)
+          }
           continue
         }
-        job = { ...job, placementState: 'ready' }
-        this.writeJob(job)
-      }
-      if (job.terminalState?.status === 'pending') {
-        this.reconcileTerminalJob(job)
-        continue
-      }
-      if (job.retryState?.status === 'pending') {
-        try {
-          this.dependencies.runWorkspaceWrite(projectId, () => {
+        if (job.placementState === 'pending') {
+          const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
+          const placeholderExists = document.nodes.some((node) => (
+            node.id === requireDesignCanvasTarget(job).nodeId && node.kind === 'job' && node.jobId === job.id
+          ))
+          if (!placeholderExists) {
+            this.deleteJobJournal(job)
+            continue
+          }
+          job = { ...job, placementState: 'ready' }
+          this.writeJob(job)
+        }
+        if (job.terminalState?.status === 'pending') {
+          await this.reconcileTerminalJob(job)
+          continue
+        }
+        if (job.retryState?.status === 'pending') {
+          try {
             /** 本次恢复补建的替代任务，必须在返回用户前收敛为可显式重试的终态。 */
             const replacement = this.completeRetryIntent(job)
             if (replacement.status === 'queued' || replacement.status === 'running') {
@@ -648,30 +658,30 @@ export class DesignJobManager {
                 error: replacement.status === 'queued' ? '应用退出，排队任务已中断' : '应用退出，任务已中断',
               })
             }
-          })
-        } catch (error) {
-          /** retry intent 保留到下次显式重试或恢复继续完成，同时留下项目级诊断。 */
-          this.warn(`[Design Job 恢复] 项目 ${projectId} 的重试任务 ${job.id} 恢复失败: ${String(error)}`)
+          } catch (error) {
+            /** retry intent 保留到下次显式重试或恢复继续完成，同时留下项目级诊断。 */
+            this.warn(`[Design Job 恢复] 项目 ${projectId} 的重试任务 ${job.id} 恢复失败: ${String(error)}`)
+          }
+          continue
         }
-        continue
+        if (job.status === 'queued' || job.status === 'running') {
+          this.updateStatus(job, 'interrupted', {
+            error: job.status === 'queued' ? '应用退出，排队任务已中断' : '应用退出，任务已中断',
+          })
+        }
       }
-      if (job.status === 'queued' || job.status === 'running') {
-        this.updateStatus(job, 'interrupted', {
-          error: job.status === 'queued' ? '应用退出，排队任务已中断' : '应用退出，任务已中断',
-        })
-      }
-    }
-    const recovered = this.list(projectId)
-    this.finalizeRecoveredTerminals(recovered)
-    return recovered
+      const recovered = this.list(projectId)
+      await this.finalizeRecoveredTerminals(recovered)
+      return this.list(projectId)
+    })
   }
 
   /** 启动时恢复全部已登记项目任务。 */
-  recoverAll(): DesignJobRecord[] {
+  async recoverAll(): Promise<DesignJobRecord[]> {
     const recovered: DesignJobRecord[] = []
     for (const projectId of this.dependencies.listProjectIds()) {
       try {
-        recovered.push(...this.recover(projectId))
+        recovered.push(...await this.recover(projectId))
       } catch (error) {
         this.warn(`[Design Job 恢复] 项目 ${projectId} 恢复失败，已继续处理其它项目: ${String(error)}`)
       }
@@ -958,10 +968,10 @@ export class DesignJobManager {
     }
   }
 
-  /** 对同步恢复结果启动终态附属收束；trace 写入在首个 await 前同步提交。 */
-  private finalizeRecoveredTerminals(jobs: DesignJobRecord[]): void {
+  /** 等待恢复任务的 trace 转存与内部会话清理全部收束。 */
+  private async finalizeRecoveredTerminals(jobs: DesignJobRecord[]): Promise<void> {
     for (const job of jobs) {
-      if (TERMINAL_JOB_STATUSES.has(job.status)) void this.finalizeExecution(job.id)
+      if (TERMINAL_JOB_STATUSES.has(job.status)) await this.finalizeExecution(job.id)
     }
   }
 
@@ -1192,9 +1202,9 @@ export class DesignJobManager {
   }
 
   /** 按 Store 当前事实完成一次 terminal pending 对账。 */
-  private reconcileTerminalJob(job: StoredDesignJob): void {
+  private async reconcileTerminalJob(job: StoredDesignJob): Promise<void> {
     if (job.target.kind === 'canvas-image') {
-      void this.reconcileCanvasImageTerminalJob(job)
+      await this.reconcileCanvasImageTerminalJob(job)
       return
     }
     try {
@@ -1253,7 +1263,7 @@ export class DesignJobManager {
   }
 
   /** 按已持久化 replacement ID 幂等创建或返回替代任务。 */
-  private completeRetryIntent(previous: StoredDesignJob): StoredDesignJob {
+  private completeRetryIntent(previous: StoredDesignJob, canvasReservationHeld = false): StoredDesignJob {
     if (!previous.imageModelSnapshot) throw new Error('旧任务未记录生图模型，请重新提交')
     const replacementId = previous.replacedByJobId
     if (!replacementId || previous.retryState?.status !== 'pending') {
@@ -1261,7 +1271,15 @@ export class DesignJobManager {
       throw new Error('设计任务重试 intent 无效')
     }
     if (previous.target.kind === 'canvas-image') {
-      return this.completeCanvasImageRetryIntent(previous, replacementId)
+      /** 恢复 pending intent 时自行预留；显式 retry 已从 intent 写入前持有同一预留。 */
+      const releaseReservation = !canvasReservationHeld && !this.findStoredJob(replacementId)
+        ? this.reserveCanvasImageTarget(previous.projectId, previous.target, new Set([previous.id]))
+        : undefined
+      try {
+        return this.completeCanvasImageRetryIntent(previous, replacementId)
+      } finally {
+        releaseReservation?.()
+      }
     }
     const existing = this.findStoredJob(replacementId)
     if (existing) {
@@ -1364,6 +1382,36 @@ export class DesignJobManager {
     this.emit(replacement)
     this.finalizeRetryIntent(previous)
     return replacement
+  }
+
+  /**
+   * 原子预留一个 Canvas 图片模块创建槽位。
+   * @param projectId 目标项目 ID。
+   * @param target Canvas 图片任务目标。
+   * @param ignoredJobIds 冲突扫描中忽略的终态或已知任务 ID。
+   * @returns 释放当前预留的幂等函数。
+   */
+  private reserveCanvasImageTarget(
+    projectId: string,
+    target: CanvasImageJobTarget,
+    ignoredJobIds = new Set<string>(),
+  ): () => void {
+    /** key 只包含模块业务身份，节点重建也不能绕过同一配置的互斥。 */
+    const reservationKey = createCanvasImageReservationKey(projectId, target)
+    if (this.canvasImageReservations.has(reservationKey)) throw new Error('图片模块已有进行中任务')
+    const conflicting = this.readProjectJobs(projectId).find((job) => (
+      !ignoredJobIds.has(job.id)
+      && isSameCanvasImageModule(job.target, target)
+      && (job.status === 'queued' || job.status === 'running' || job.terminalState?.status === 'pending')
+    ))
+    if (conflicting) throw new Error('图片模块已有进行中任务')
+    this.canvasImageReservations.add(reservationKey)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.canvasImageReservations.delete(reservationKey)
+    }
   }
 
   /** 尝试清除已完成 retry intent；失败时 pending intent 仍可幂等返回 replacement。 */
@@ -1568,6 +1616,21 @@ function isSameCanvasImageTarget(
     && left.imageModuleId === right.imageModuleId
 }
 
+/** 判断任务是否占用同一 Canvas 图片模块业务身份。 */
+function isSameCanvasImageModule(
+  left: DesignJobTarget,
+  right: CanvasImageJobTarget,
+): boolean {
+  return left.kind === 'canvas-image'
+    && left.canvasId === right.canvasId
+    && left.imageModuleId === right.imageModuleId
+}
+
+/** 创建进程内目标预留键，数组编码避免分隔符碰撞。 */
+function createCanvasImageReservationKey(projectId: string, target: CanvasImageJobTarget): string {
+  return JSON.stringify([projectId, target.canvasId, target.imageModuleId])
+}
+
 /** 把 journal 目标补全为 Canvas Store 使用的四重身份。 */
 function toCanvasImageTarget(
   projectId: string,
@@ -1587,7 +1650,7 @@ function isCanvasImageInputReference(value: unknown): boolean {
   const allowedFields = new Set(['nodeId', 'kind', 'revision', 'summary', 'summaryHash', 'assetId'])
   if (Object.keys(value).some((field) => !allowedFields.has(field))) return false
   if (!isSafeDesignStableId(value.nodeId)
-    || !['agent', 'image', 'document', 'prototype'].includes(String(value.kind))
+    || !['agent', 'image', 'document', 'webview'].includes(String(value.kind))
     || !Number.isSafeInteger(value.revision)
     || (value.revision as number) < 0
     || typeof value.summary !== 'string'

@@ -834,7 +834,7 @@ async function bootstrap(): Promise<void> {
   registerIpcHandlers()
 
   // IPC 初始化默认 Manager 后，收敛上次进程遗留的运行中 Design Job。
-  safeRun('recoverDesignJobs', () => { getDefaultDesignJobManager()?.recoverAll() })
+  await safeAwait('recoverDesignJobs', async () => { await getDefaultDesignJobManager()?.recoverAll() })
 
   // 收敛上次退出时遗留的运行中委派子会话（内存态丢失，无法续跑）
   safeRun('markRunningDelegationsAsInterrupted', markRunningDelegationsAsInterrupted)

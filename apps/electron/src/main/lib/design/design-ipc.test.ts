@@ -190,7 +190,7 @@ function createFixture(): {
         traceState: 'unavailable',
         ...(includeTrace ? { trace: [] } : {}),
       }),
-      reconcilePendingTerminals: () => [],
+      reconcilePendingTerminals: async () => [],
       onChanged: () => () => undefined,
     },
     imageModels: {
@@ -1204,18 +1204,27 @@ describe('Design IPC', () => {
   test('Given terminal pending 首次恢复未完成 When Renderer 显式加载权威画布 Then 同进程触发任务二次对账', async () => {
     const fixture = createFixture()
     const reconciledProjects: string[] = []
-    fixture.options.jobs.reconcilePendingTerminals = (projectId) => {
+    let releaseReconcile: (() => void) | undefined
+    const reconcileGate = new Promise<void>((resolve) => { releaseReconcile = resolve })
+    fixture.options.jobs.reconcilePendingTerminals = async (projectId) => {
       reconciledProjects.push(projectId)
+      await reconcileGate
       return []
     }
     registerDesignIpcHandlers(fixture.options)
 
-    await invoke(
+    let loadCompleted = false
+    const loading = invoke(
       fixture.handlers,
       DESIGN_IPC_CHANNELS.LOAD,
       fixture.senders[0]!,
       { projectId: 'project-1' },
-    )
+    ).then(() => { loadCompleted = true })
+    await Promise.resolve()
+
+    expect(loadCompleted).toBe(false)
+    releaseReconcile?.()
+    await loading
 
     expect(reconciledProjects).toEqual(['project-1'])
   })

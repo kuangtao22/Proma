@@ -145,7 +145,7 @@ describe('Design 跨模块恢复与资源边界', () => {
     expect(readFileSync(retainedAsset, 'utf8')).toBe('asset')
   })
 
-  test('Given 上个进程留下 running job When 启动恢复 Then 标记 interrupted', () => {
+  test('Given 上个进程留下 running job When 启动恢复 Then 标记 interrupted', async () => {
     store.load('project-1')
     const paths = pathResolver.resolve('project-1')
     writeFileSync(join(paths.jobsDir, 'job-running.json'), JSON.stringify({
@@ -159,13 +159,13 @@ describe('Design 跨模块恢复与资源边界', () => {
       onRunHeadless: () => { agentRunCount += 1 },
     })
 
-    expect(manager.recover('project-1')).toContainEqual(expect.objectContaining({
+    expect(await manager.recover('project-1')).toContainEqual(expect.objectContaining({
       id: 'job-running', status: 'interrupted', error: '应用退出，任务已中断', contextMode: 'none',
     }))
     expect(agentRunCount).toBe(0)
   })
 
-  test('Given 上个进程留下 Canvas active Job When 启动恢复 Then 只标记 interrupted 且不自动运行', () => {
+  test('Given 上个进程留下 Canvas active Job When 启动恢复 Then 只标记 interrupted 且不自动运行', async () => {
     store.load('project-1')
     const paths = pathResolver.resolve('project-1')
     writeFileSync(join(paths.jobsDir, 'job-canvas-running.json'), JSON.stringify({
@@ -196,7 +196,7 @@ describe('Design 跨模块恢复与资源边界', () => {
       onRunHeadless: () => { agentRunCount += 1 },
     })
 
-    expect(manager.recover('project-1')).toContainEqual(expect.objectContaining({
+    expect(await manager.recover('project-1')).toContainEqual(expect.objectContaining({
       id: 'job-canvas-running', status: 'interrupted',
       target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'image-node-1', imageModuleId: 'image-module-1' },
       generationConstraints: { aspectRatio: '16:9', imageSize: '2K' },
@@ -315,7 +315,7 @@ function createIpcFixture(store: DesignStore, readOnlyReason?: string): {
         traceState: 'unavailable',
         ...(includeTrace ? { trace: [] } : {}),
       }),
-      reconcilePendingTerminals: () => [],
+      reconcilePendingTerminals: async () => [],
       onChanged: () => () => undefined,
     },
     imageModels: {

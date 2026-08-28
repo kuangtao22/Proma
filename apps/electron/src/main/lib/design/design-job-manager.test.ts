@@ -204,6 +204,46 @@ describe('Design Job Manager', () => {
     expect(document.nodes).toEqual(before)
   })
 
+  test('Given webview 直接入边 When 创建并重载 Canvas Job Then journal 与任务详情保留共享枚举', async () => {
+    harness.canvasInputReferences = [{
+      nodeId: 'webview-1', kind: 'webview', revision: 3,
+      summary: '已提交首页原型', summaryHash: 'b'.repeat(64),
+    }]
+
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    const reloaded = createHarness()
+
+    expect(reloaded.manager.list('project-1')).toContainEqual(expect.objectContaining({
+      id: job.id,
+      canvasInputReferences: [expect.objectContaining({ kind: 'webview', nodeId: 'webview-1' })],
+    }))
+    expect(reloaded.manager.getTaskDetails('project-1', job.id, false)).toMatchObject({
+      canvasInputReferences: [expect.objectContaining({ kind: 'webview', nodeId: 'webview-1' })],
+    })
+  })
+
+  test('Given 同一图片模块并发创建 When 首次解析尚未完成 Then 只允许一个 queued journal', async () => {
+    let releaseResolver: (() => void) | undefined
+    let markResolverEntered: (() => void) | undefined
+    const resolverGate = new Promise<void>((resolve) => { releaseResolver = resolve })
+    const resolverEntered = new Promise<void>((resolve) => { markResolverEntered = resolve })
+    harness.resolveCanvasInputReferences = async () => {
+      markResolverEntered?.()
+      await resolverGate
+      return []
+    }
+
+    const first = harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    await resolverEntered
+    const second = harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    releaseResolver?.()
+    const results = await Promise.allSettled([first, second])
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
+    expect(harness.manager.list('project-1').filter((job) => job.status === 'queued')).toHaveLength(1)
+  })
+
   test('Given Canvas Job 成功 When 提交 Then 只新增 Asset 并采用到目标模块', async () => {
     const beforeNodes = structuredClone(document.nodes)
     harness.messages = [createToolMessage('session-1/output.png')]
@@ -231,13 +271,12 @@ describe('Design Job Manager', () => {
     expect(harness.batchCommits).toBe(1)
 
     harness.adoptOutputError = undefined
-    harness.manager.reconcilePendingTerminals('project-1')
-    /** 对账 API 同步返回当前快照，异步模块采用在下一轮事件循环收敛。 */
-    await new Promise<void>((resolve) => { setTimeout(resolve, 0) })
+    await harness.manager.reconcilePendingTerminals('project-1')
 
     expect(harness.manager.get(job.id)).toMatchObject({
-      status: 'succeeded', outputAssetId: 'asset-output', terminalState: undefined,
+      status: 'succeeded', outputAssetId: 'asset-output',
     })
+    expect(harness.manager.get(job.id)).not.toHaveProperty('terminalState')
     expect(harness.adoptedOutputs.get('image-module-a')).toBe('asset-output')
   })
 
@@ -290,6 +329,43 @@ describe('Design Job Manager', () => {
     })
   })
 
+  test('Given 旧 Canvas 任务失败且同模块已有新 active When 重试旧任务 Then 拒绝绕过模块互斥', async () => {
+    const original = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    await harness.manager.run(original.id)
+    const active = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+
+    expect(() => harness.manager.retry('project-1', original.id)).toThrow('图片模块已有进行中任务')
+    expect(harness.manager.get(active.id)).toMatchObject({ status: 'queued' })
+  })
+
+  test('Given 启动恢复 Canvas terminal pending When 模块采用仍在执行 Then recover 等待完成再返回终态', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    harness.adoptOutputError = new Error('首次采用失败')
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    await harness.manager.run(job.id)
+    harness.adoptOutputError = undefined
+    let releaseAdoption: (() => void) | undefined
+    const adoptionGate = new Promise<void>((resolve) => { releaseAdoption = resolve })
+    harness.adoptOutputBarrier = adoptionGate
+
+    let recoveredBeforeAdoption = false
+    const recovery = Promise.resolve(harness.manager.recover('project-1')).then((jobs) => {
+      recoveredBeforeAdoption = true
+      return jobs
+    })
+    await Promise.resolve()
+    const settledWhileAdoptionPending = recoveredBeforeAdoption
+    releaseAdoption?.()
+    const recovered = await recovery
+
+    expect(settledWhileAdoptionPending).toBe(false)
+    const recoveredJob = recovered.find((candidate) => candidate.id === job.id)
+    expect(recoveredJob).toMatchObject({ status: 'succeeded', outputAssetId: 'asset-output' })
+    expect(recoveredJob).not.toHaveProperty('terminalState')
+    expect(harness.cleanedSessionIds).toContain('session-1')
+    expect(harness.canvasAdoptionOutsideWorkspace).toBe(false)
+  })
+
   test('Given 重启留下 running 内部会话 When 恢复 Then 中断后继续 trace 与会话清理', async () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
@@ -307,8 +383,7 @@ describe('Design Job Manager', () => {
     }), 'utf8')
     harness.sdkMessages = []
 
-    harness.manager.recover('project-1')
-    await Promise.resolve()
+    await harness.manager.recover('project-1')
 
     expect(harness.manager.get('job-running')).toMatchObject({
       status: 'interrupted', traceState: 'ready', executionSessionCleanupState: 'completed',
@@ -534,7 +609,7 @@ describe('Design Job Manager', () => {
     expect(existsSync(journalPath)).toBe(true)
   })
 
-  test('Given 删除意图已持久化但应用退出 When 恢复 Then 完成节点和 journal 清理', () => {
+  test('Given 删除意图已持久化但应用退出 When 恢复 Then 完成节点和 journal 清理', async () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
     document.nodes = [{
@@ -547,7 +622,7 @@ describe('Design Job Manager', () => {
       placementState: 'ready', deletionState: { status: 'pending' }, createdAt: 1, updatedAt: 2,
     }))
 
-    const recovered = harness.manager.recover('project-1')
+    const recovered = await harness.manager.recover('project-1')
 
     expect(recovered).toEqual([])
     expect(document.nodes).toEqual([])
@@ -827,7 +902,7 @@ describe('Design Job Manager', () => {
     expect(harness.runInputs).toEqual([])
   })
 
-  test('Given journal 含越界 ID、错名 payload 和损坏 schema When 恢复 Then 全部忽略且无文件或 Store 副作用', () => {
+  test('Given journal 含越界 ID、错名 payload 和损坏 schema When 恢复 Then 全部忽略且无文件或 Store 副作用', async () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
     /** 越界删除目标哨兵，恶意 pending journal 不得触碰。 */
@@ -849,7 +924,7 @@ describe('Design Job Manager', () => {
       sessionId: 'session-broken', createdAt: 1, updatedAt: 1, unexpected: true,
     }))
 
-    const recovered = harness.manager.recover('project-1')
+    const recovered = await harness.manager.recover('project-1')
 
     expect(recovered).toEqual([])
     expect(readFileSync(sentinelPath, 'utf8')).toBe('sentinel')
@@ -858,14 +933,14 @@ describe('Design Job Manager', () => {
     expect(document.nodes).toEqual([])
   })
 
-  test('Given 项目 A 路径解析失败且项目 B 有 running 任务 When recoverAll Then 记录 A 错误并继续中断 B', () => {
+  test('Given 项目 A 路径解析失败且项目 B 有 running 任务 When recoverAll Then 记录 A 错误并继续中断 B', async () => {
     const projectBJobs = join(cacheRoot, 'project-b-jobs')
     mkdirSync(projectBJobs, { recursive: true })
     writeFileSync(join(projectBJobs, 'job-b.json'), JSON.stringify(createStoredRunningJob('project-b', 'job-b')))
     const warnings: string[] = []
     const manager = createMultiProjectRecoveryManager(projectBJobs, warnings)
 
-    const recovered = manager.recoverAll()
+    const recovered = await manager.recoverAll()
 
     expect(recovered).toHaveLength(1)
     expect(recovered[0]).toMatchObject({ id: 'job-b', projectId: 'project-b', status: 'interrupted' })
@@ -944,7 +1019,7 @@ describe('Design Job Manager', () => {
     })
 
     harness.outputReloadError = undefined
-    const recovered = harness.manager.recover('project-1')
+    const recovered = await harness.manager.recover('project-1')
 
     expect(recovered.find((candidate) => candidate.id === job.id)).toMatchObject({
       status: 'succeeded',
@@ -952,7 +1027,7 @@ describe('Design Job Manager', () => {
     })
   })
 
-  test('Given pending terminal journal 在 Store 中没有对应素材和节点 When 恢复 Then 对账为 failed 而非 interrupted', () => {
+  test('Given pending terminal journal 在 Store 中没有对应素材和节点 When 恢复 Then 对账为 failed 而非 interrupted', async () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
     document.nodes = [{
@@ -966,12 +1041,12 @@ describe('Design Job Manager', () => {
       sessionId: 'session-pending', createdAt: 1, updatedAt: 1,
     }))
 
-    const recovered = harness.manager.recover('project-1')
+    const recovered = await harness.manager.recover('project-1')
 
     expect(recovered[0]).toMatchObject({ status: 'failed', error: '设计任务终态提交未完成' })
   })
 
-  test('Given pending terminal 首次对账要求恢复 When 同进程权威加载完成 Then 可二次对账为 succeeded', () => {
+  test('Given pending terminal 首次对账要求恢复 When 同进程权威加载完成 Then 可二次对账为 succeeded', async () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
     document.assets.push(createAsset('asset-pending', {
@@ -990,12 +1065,12 @@ describe('Design Job Manager', () => {
     harness.outputReloadError = new Error('DESIGN_RECOVERY_REQUIRED: backup 已恢复')
     harness.forceOutputReloadError = true
 
-    expect(harness.manager.recover('project-1')[0]).toMatchObject({
+    expect((await harness.manager.recover('project-1'))[0]).toMatchObject({
       status: 'running', terminalState: { status: 'pending' },
     })
 
     harness.forceOutputReloadError = false
-    expect(harness.manager.reconcilePendingTerminals('project-1')[0]).toMatchObject({
+    expect((await harness.manager.reconcilePendingTerminals('project-1'))[0]).toMatchObject({
       status: 'succeeded', outputAssetId: 'asset-pending',
     })
   })
@@ -1086,7 +1161,7 @@ describe('Design Job Manager', () => {
     expect(harness.runInputs).toEqual([])
   })
 
-  test('Given 旧 journal 留下 retry intent 但没有模型快照 When 自动恢复 Then 不补建 replacement', () => {
+  test('Given 旧 journal 留下 retry intent 但没有模型快照 When 自动恢复 Then 不补建 replacement', async () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
     document.nodes = [{
@@ -1100,7 +1175,7 @@ describe('Design Job Manager', () => {
       retryState: { status: 'pending' }, error: '旧失败', createdAt: 1, updatedAt: 2,
     }))
 
-    const recovered = harness.manager.recover('project-1')
+    const recovered = await harness.manager.recover('project-1')
 
     expect(recovered).toHaveLength(1)
     expect(recovered[0]).toMatchObject({ id: 'job-legacy', status: 'failed' })
@@ -1114,7 +1189,7 @@ describe('Design Job Manager', () => {
   test.each([
     ['名称', { name: '名'.repeat(IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH + 1) }],
     ['模型 ID', { modelId: 'm'.repeat(IMAGE_GENERATION_MODEL_ID_MAX_LENGTH + 1) }],
-  ])('Given journal 模型快照%s超限 When 恢复项目 Then 忽略损坏任务且不产生 Store 或文件副作用', (_field, snapshotOverrides) => {
+  ])('Given journal 模型快照%s超限 When 恢复项目 Then 忽略损坏任务且不产生 Store 或文件副作用', async (_field, snapshotOverrides) => {
     /** 损坏 journal 所在目录。 */
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
@@ -1136,7 +1211,7 @@ describe('Design Job Manager', () => {
     writeFileSync(journalPath, rawJournal)
 
     /** 恢复结果不得包含被严格 parser 拒绝的任务。 */
-    const recovered = harness.manager.recover('project-1')
+    const recovered = await harness.manager.recover('project-1')
 
     expect(recovered).toEqual([])
     expect(readFileSync(journalPath, 'utf8')).toBe(rawJournal)
@@ -1215,7 +1290,7 @@ describe('Design Job Manager', () => {
     expect(harness.manager.retry('project-1', original.id).id).toBe('job-2')
   })
 
-  test('Given 重启时只有旧 retry intent When 新 Manager 恢复 Then 新 replacement 立即 interrupted 且可由用户重试', () => {
+  test('Given 重启时只有旧 retry intent When 新 Manager 恢复 Then 新 replacement 立即 interrupted 且可由用户重试', async () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
     document.nodes = [{
@@ -1235,7 +1310,7 @@ describe('Design Job Manager', () => {
     /** 丢弃旧进程内存索引，使用同一磁盘与 Store 创建真正的新 Manager。 */
     harness = createHarness()
 
-    const recovered = harness.manager.recover('project-1')
+    const recovered = await harness.manager.recover('project-1')
     const replacement = recovered.find((job) => job.id === 'job-2')
 
     expect(replacement).toMatchObject({
@@ -1281,7 +1356,7 @@ describe('Design Job Manager', () => {
     expect(harness.importSources).toEqual([])
   })
 
-  test('Given 上次进程留下无模型快照的 running job When 恢复 Then 标记 interrupted 但禁止重试', () => {
+  test('Given 上次进程留下无模型快照的 running job When 恢复 Then 标记 interrupted 但禁止重试', async () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
     document.nodes = [{
@@ -1294,7 +1369,7 @@ describe('Design Job Manager', () => {
       position: { x: 0, y: 0 }, createdAt: 1, updatedAt: 1,
     }))
 
-    const recovered = harness.manager.recover('project-1')
+    const recovered = await harness.manager.recover('project-1')
 
     expect(recovered[0]?.status).toBe('interrupted')
     expect(() => harness.manager.retry('project-1', 'job-running'))
@@ -1302,7 +1377,7 @@ describe('Design Job Manager', () => {
     expect(harness.createdSessions).toEqual([])
   })
 
-  test('Given 上次进程留下 queued 和未落占位的 pending journal When 恢复 Then queued 标记 interrupted 且孤立 pending 被删除', () => {
+  test('Given 上次进程留下 queued 和未落占位的 pending journal When 恢复 Then queued 标记 interrupted 且孤立 pending 被删除', async () => {
     const jobsDirectory = join(cacheRoot, 'jobs')
     mkdirSync(jobsDirectory, { recursive: true })
     document.nodes = [{
@@ -1320,7 +1395,7 @@ describe('Design Job Manager', () => {
       placementState: 'pending', createdAt: 1, updatedAt: 1,
     }))
 
-    const recovered = harness.manager.recover('project-1')
+    const recovered = await harness.manager.recover('project-1')
 
     expect(recovered).toHaveLength(1)
     expect(recovered[0]).toMatchObject({ id: 'job-queued', status: 'interrupted' })
@@ -1362,7 +1437,9 @@ describe('Design Job Manager', () => {
       resolveExecutionRoute: (snapshot: ImageGenerationModelSnapshot) => ResolvedImageGenerationRoute
       sdkMessages: SDKMessage[]
       canvasInputReferences: CanvasImageInputReference[]
+      resolveCanvasInputReferences?: () => Promise<CanvasImageInputReference[]>
       adoptOutputError?: Error
+      adoptOutputBarrier?: Promise<void>
       traceWriteError?: Error
       cleanupError?: Error
       projectFiles: Record<string, string>
@@ -1400,6 +1477,8 @@ describe('Design Job Manager', () => {
     /** 真实 lease registry 用于验证迁移无法插入 output 提交窗口。 */
     const workspaceRegistry = createWorkspaceOperationRegistry()
     let workspaceWriteDepth = 0
+    /** 记录 Canvas 采用是否逃逸出项目写 lease。 */
+    let canvasAdoptionOutsideWorkspace = false
     const outputEffects: string[] = []
     const unguardedOutputEffects: string[] = []
     let batchCommits = 0
@@ -1472,7 +1551,9 @@ describe('Design Job Manager', () => {
       canvasImageTargetAdapter: {
         assertTarget: async () => undefined,
         adoptOutput: async (_projectId, target, assetId) => {
+          if (workspaceWriteDepth === 0) canvasAdoptionOutsideWorkspace = true
           if (state.adoptOutputError) throw state.adoptOutputError
+          await state.adoptOutputBarrier
           adoptedOutputs.set(target.imageModuleId, assetId)
         },
         isOutputAdopted: async (_projectId, target, assetId) => (
@@ -1480,7 +1561,9 @@ describe('Design Job Manager', () => {
         ),
       },
       canvasImageInputResolver: {
-        resolve: async () => state.canvasInputReferences.map((reference) => ({ ...reference })),
+        resolve: async () => state.resolveCanvasInputReferences
+          ? state.resolveCanvasInputReferences()
+          : state.canvasInputReferences.map((reference) => ({ ...reference })),
       },
       imageModels: {
         resolveAvailableSnapshot: (profileId) => state.resolveAvailableSnapshot(profileId),
@@ -1653,6 +1736,7 @@ describe('Design Job Manager', () => {
       get retryIntentWrites() { return retryIntentWrites },
       get traceReadCount() { return traceReadCount },
       get relocationAttemptError() { return state.relocationAttemptError },
+      get canvasAdoptionOutsideWorkspace() { return canvasAdoptionOutsideWorkspace },
       get settings() { return state.settings },
       set settings(value: typeof state.settings) { state.settings = value },
       get messages() { return state.messages },
@@ -1661,7 +1745,11 @@ describe('Design Job Manager', () => {
       set canvasInputReferences(value: CanvasImageInputReference[]) {
         state.canvasInputReferences = value
       },
+      set resolveCanvasInputReferences(value: (() => Promise<CanvasImageInputReference[]>) | undefined) {
+        state.resolveCanvasInputReferences = value
+      },
       set adoptOutputError(value: Error | undefined) { state.adoptOutputError = value },
+      set adoptOutputBarrier(value: Promise<void> | undefined) { state.adoptOutputBarrier = value },
       set traceWriteError(value: Error | undefined) { state.traceWriteError = value },
       set cleanupError(value: Error | undefined) { state.cleanupError = value },
       get projectRoot() { return projectRoot },

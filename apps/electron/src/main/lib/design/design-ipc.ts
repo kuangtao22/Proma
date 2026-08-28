@@ -865,7 +865,7 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     }
     const snapshot = options.store.load(input.projectId)
     /** Store 已完成 tmp/backup 恢复后，同进程立即重试 terminal pending 对账。 */
-    options.jobs.reconcilePendingTerminals(input.projectId)
+    await options.jobs.reconcilePendingTerminals(input.projectId)
     lastReadableSnapshots.set(input.projectId, snapshot)
     if (snapshot.recoveredFrom) {
       /** 恢复提升已经改变权威磁盘基线，通知其它已打开窗口同步接管该 revision。 */
