@@ -417,6 +417,10 @@ function createContext(options: {
         imageCalls.push({ type: 'retry', value: { projectId, jobId } })
         return createImageJob(imageTargetA, 'job-retry')
       },
+      getProjectJob: (projectId, jobId) => (
+        options.imageJobsList?.(projectId)
+          ?? options.imageJobs ?? [createImageJob(imageTargetA, 'job-a')]
+      ).find((job) => job.projectId === projectId && job.id === jobId),
       listCanvasImageJobs: (target) => (
         options.imageJobsList?.(target.projectId)
           ?? options.imageJobs ?? [createImageJob(imageTargetA, 'job-a')]
@@ -819,6 +823,103 @@ describe('原生 Canvas 文档 IPC', () => {
       expect(JSON.stringify(result)).not.toContain('asset-foreign.png')
       expect(context.getMediaAccessCount()).toBe(0)
     }
+  })
+
+  test('Given generate Job 与输出素材协调伪造同一父链 When LOAD Then 仍 fail closed 且不授权父素材', async () => {
+    const parentAsset = createImageAsset('asset-generate-parent')
+    const generateJob = {
+      ...createImageJob(imageTargetA, 'job-generate-coordinated', 'asset-generate-output'),
+      sourceAssetId: parentAsset.id,
+      parentAssetId: parentAsset.id,
+    }
+    const context = createContext({
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-generate-output' },
+      imageJobs: [generateJob],
+      imageAssets: [
+        parentAsset,
+        createImageAsset('asset-generate-output', generateJob.id, parentAsset.id),
+      ],
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    )
+
+    expect(result).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+    expect(JSON.stringify(result)).not.toContain('asset-generate-parent.png')
+    expect(context.getMediaAccessCount()).toBe(0)
+  })
+
+  test('Given edit 来源由当前模块、跨模块或旧 Design Job 产出 When LOAD Then 只拒绝跨模块来源', async () => {
+    const currentSourceJob = createImageJob(imageTargetA, 'job-source-current', 'asset-source-current')
+    const currentEditJob = {
+      ...createImageJob(imageTargetA, 'job-edit-current', 'asset-edit-current'),
+      action: 'edit' as const,
+      sourceAssetId: 'asset-source-current',
+      parentAssetId: 'asset-source-current',
+    }
+    const crossSourceJob = createImageJob(imageTargetB, 'job-source-cross', 'asset-source-cross')
+    const crossEditJob = {
+      ...createImageJob(imageTargetA, 'job-edit-cross', 'asset-edit-cross'),
+      action: 'edit' as const,
+      sourceAssetId: 'asset-source-cross',
+      parentAssetId: 'asset-source-cross',
+    }
+    const designSourceJob: DesignJobRecord = {
+      id: 'job-source-design', creativeTaskId: 'creative-source-design', attemptNumber: 1,
+      projectId: imageTargetA.projectId,
+      target: { kind: 'design-canvas', nodeId: 'design-node-source', position: { x: 0, y: 0 } },
+      action: 'generate', status: 'succeeded', prompt: '旧 Design 来源', originalRequest: '旧 Design 来源',
+      contextMode: 'none', outputAssetId: 'asset-source-design', createdAt: 1, updatedAt: 2,
+    }
+    const designEditJob = {
+      ...createImageJob(imageTargetA, 'job-edit-design', 'asset-edit-design'),
+      action: 'edit' as const,
+      sourceAssetId: 'asset-source-design',
+      parentAssetId: 'asset-source-design',
+    }
+    const current = createContext({
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-edit-current' },
+      imageJobs: [currentSourceJob, currentEditJob],
+      imageAssets: [
+        createImageAsset('asset-source-current', currentSourceJob.id),
+        createImageAsset('asset-edit-current', currentEditJob.id, 'asset-source-current'),
+      ],
+    })
+    const cross = createContext({
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-edit-cross' },
+      imageJobs: [crossSourceJob, crossEditJob],
+      imageAssets: [
+        createImageAsset('asset-source-cross', crossSourceJob.id),
+        createImageAsset('asset-edit-cross', crossEditJob.id, 'asset-source-cross'),
+      ],
+    })
+    const design = createContext({
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-edit-design' },
+      imageJobs: [designSourceJob, designEditJob],
+      imageAssets: [
+        createImageAsset('asset-source-design', designSourceJob.id),
+        createImageAsset('asset-edit-design', designEditJob.id, 'asset-source-design'),
+      ],
+    })
+
+    const currentResult = await invoke(
+      current.handlers, CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE, current.sender, imageTargetA,
+    )
+    const crossResult = await invoke(
+      cross.handlers, CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE, cross.sender, imageTargetA,
+    )
+    const designResult = await invoke(
+      design.handlers, CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE, design.sender, imageTargetA,
+    )
+
+    expect(currentResult).toMatchObject({ ok: true, value: { jobs: [currentSourceJob, currentEditJob] } })
+    expect(crossResult).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+    expect(cross.getMediaAccessCount()).toBe(0)
+    expect(designResult).toMatchObject({ ok: true, value: { jobs: [designEditJob] } })
   })
 
   test('Given adopted 素材祖先循环或超过上限 When LOAD Then fail closed 且不创建媒体 lease', async () => {
@@ -2284,6 +2385,7 @@ describe('原生 Canvas 文档 IPC', () => {
         run: async () => undefined,
         cancel: async () => createImageJob(imageTargetA, 'job-a'),
         retry: () => createImageJob(imageTargetA, 'job-retry'),
+        getProjectJob: () => undefined,
         listCanvasImageJobs: () => [],
         onChanged: () => () => undefined,
       },

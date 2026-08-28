@@ -366,6 +366,14 @@ export class DesignJobManager {
       .map(clonePublicDesignJob)
   }
 
+  /** 在项目索引内按 ID 查询任务；首次建索引后存在与缺失查询均为 O(1)。 */
+  getProjectJob(projectId: string, jobId: string): DesignJobRecord | undefined {
+    if (!isSafeDesignStableId(projectId) || !isSafeDesignStableId(jobId)) return undefined
+    this.ensureCanvasImageIndex(projectId)
+    const job = this.jobs.get(jobId)
+    return job?.projectId === projectId ? clonePublicDesignJob(job) : undefined
+  }
+
   /**
    * 查询同一创作任务的尝试历史，并仅在显式请求时读取当前 trace。
    * @param projectId 当前 Design 项目 ID。

@@ -243,6 +243,24 @@ describe('Design Job Manager', () => {
     })])
   })
 
+  test('Given 项目索引已建立 When 按项目和 Job ID 查询存在或缺失任务 Then O(1) 返回防御副本且不重复扫描', async () => {
+    const created = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    const reloaded = createHarness()
+
+    const found = reloaded.manager.getProjectJob('project-1', created.id)
+    const foundTarget = found?.target
+    if (foundTarget?.kind === 'canvas-image') foundTarget.imageModuleId = 'tampered-module'
+    const missing = reloaded.manager.getProjectJob('project-1', 'job-missing')
+    const second = reloaded.manager.getProjectJob('project-1', created.id)
+
+    expect(reloaded.journalScanCount).toBe(1)
+    expect(missing).toBeUndefined()
+    expect(second).toMatchObject({
+      id: created.id,
+      target: { kind: 'canvas-image', imageModuleId: 'image-module-a' },
+    })
+  })
+
   test('Given Canvas Job 创建、状态变化和重试 When 按目标查询 Then 索引增量保持稳定顺序', async () => {
     const target: CanvasImageTarget = {
       projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-node-a', imageModuleId: 'image-module-a',

@@ -91,7 +91,7 @@ export interface CanvasDocumentIpcOptions {
   /** 图片模块配置复用唯一受管内容 Store。 */
   imageModules: Pick<CanvasImageModuleStore, 'load' | 'save'>
   /** Canvas 图片任务复用唯一 Design Job Manager。 */
-  imageJobs: Pick<DesignJobManager, 'createCanvasImage' | 'run' | 'cancel' | 'retry' | 'listCanvasImageJobs' | 'onChanged'>
+  imageJobs: Pick<DesignJobManager, 'createCanvasImage' | 'run' | 'cancel' | 'retry' | 'getProjectJob' | 'listCanvasImageJobs' | 'onChanged'>
   /** 图片采用复用 Job Manager 已注入的同一目标适配器。 */
   imageJobTarget: Pick<CanvasImageJobTargetAdapter, 'assertTarget' | 'adoptOutput'>
   /** 图片模块只读取 Design 素材公开元数据并创建目录媒体授权。 */
@@ -1015,6 +1015,7 @@ export function registerCanvasDocumentIpcHandlers(
 
   /** 从目标任务输出建立图片素材闭包，并拒绝任何跨目标或损坏引用。 */
   const resolveOwnedImageAssets = (
+    target: CanvasImageTarget,
     config: CanvasImageModuleConfig,
     jobs: DesignJobRecord[],
     projectAssets: DesignAsset[],
@@ -1028,10 +1029,25 @@ export function registerCanvasDocumentIpcHandlers(
     /** 每个输出素材只能由一个目标任务声明。 */
     const ownerByAssetId = new Map<string, DesignJobRecord>()
     for (const job of jobs) {
-      /** Job 自身必须声明确定父链；edit 额外要求存在来源素材。 */
-      if ((job.action === 'edit' && !job.sourceAssetId)
-        || job.parentAssetId !== job.sourceAssetId) {
-        throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+      /** generate 永远没有父链；edit 必须把来源和父级声明为同一素材。 */
+      if (job.action === 'generate') {
+        if (job.sourceAssetId !== undefined || job.parentAssetId !== undefined) {
+          throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+        }
+      } else {
+        const sourceAssetId = job.sourceAssetId
+        if (!sourceAssetId || job.parentAssetId !== sourceAssetId) {
+          throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+        }
+        const sourceAsset = projectAssetById.get(sourceAssetId)
+        if (!sourceAsset) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+        if (sourceAsset.sourceJobId) {
+          const sourceJob = options.imageJobs.getProjectJob(target.projectId, sourceAsset.sourceJobId)
+          if (!sourceJob
+            || (sourceJob.target?.kind === 'canvas-image' && !isOwnedImageJob(sourceJob, target))) {
+            throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+          }
+        }
       }
       if (!job.outputAssetId) continue
       if (ownerByAssetId.has(job.outputAssetId)) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
@@ -1185,7 +1201,7 @@ export function registerCanvasDocumentIpcHandlers(
             throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
           }
           if (!isActiveLoad()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
-          const assets = resolveOwnedImageAssets(config, jobs, options.imageAssets.list(target.projectId))
+          const assets = resolveOwnedImageAssets(target, config, jobs, options.imageAssets.list(target.projectId))
           if (!isActiveLoad()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
           /** 媒体 token 是候选；创建或提交失败均不得撤销旧授权。 */
           const access = options.imageAssets.createMediaAccess(target.projectId)
