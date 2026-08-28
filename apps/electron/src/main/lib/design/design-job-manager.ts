@@ -5,7 +5,9 @@ import type {
   AgentMessage,
   AgentSendInput,
   AgentSessionMeta,
+  CanvasImageTarget,
   CreateDesignJobInput,
+  DesignAsset,
   DesignCanvasDocument,
   DesignCanvasNode,
   DesignJobRecord,
@@ -30,11 +32,25 @@ import type { AgentRunExtensions } from '../agent-service'
 import type { ImageGenerationModelCatalog } from '../image-generation-model-catalog'
 import { runSafeImageModelOperation } from '../image-generation-model-error'
 import { resolveProjectInstructions } from '../project-instruction-resolver'
-import type { DesignAssetImportSource, DesignAssetService } from './design-asset-service'
+import type {
+  DesignAssetImportBatch,
+  DesignAssetImportSource,
+  DesignAssetService,
+} from './design-asset-service'
 import type { DesignContextOrchestrator } from './design-context-orchestrator'
 import { isSafeDesignStableId } from './design-paths'
 import type { DesignStore } from './design-store'
 import type { DesignTraceWriteResult } from './design-trace-store'
+import type {
+  CanvasImageJobTarget,
+  CanvasImageJobTargetAdapter,
+} from './canvas-image-job-target'
+import {
+  CANVAS_IMAGE_INPUT_MAX_MEDIA,
+  CANVAS_IMAGE_INPUT_MAX_REFERENCES,
+  CANVAS_IMAGE_INPUT_MAX_TEXT,
+} from './canvas-image-input-resolver'
+import type { CanvasImageInputResolver } from './canvas-image-input-resolver'
 
 const DESIGN_IMAGE_TOOL = 'mcp__nano_banana__generate_image'
 const DESIGN_JOB_MODEL_ERROR = '未配置可用的 Agent 渠道和模型'
@@ -111,6 +127,10 @@ export interface DesignJobManagerDependencies {
   pathResolver: { resolve: (projectId: string) => { jobsDir: string; projectRoot: string } }
   store: DesignStore
   assetService: Pick<DesignAssetService, 'resolveAssetPath' | 'importAuthorizedFiles'>
+  /** Canvas 图片输出采用与节点投影修复边界；旧 Design 路径不依赖它。 */
+  canvasImageTargetAdapter?: CanvasImageJobTargetAdapter
+  /** 从直接入边读取已提交事实并固化任务输入。 */
+  canvasImageInputResolver?: CanvasImageInputResolver
   /** 只暴露任务创建、预检和单次工具运行所需的模型路由能力。 */
   imageModels: Pick<
     ImageGenerationModelCatalog,
@@ -243,17 +263,32 @@ export class DesignJobManager {
   }
 
   /** 创建只归属 Canvas 图片模块的 queued journal，不修改旧 Design 节点。 */
-  createCanvasImage(input: CreateDesignJobInput): DesignJobRecord {
+  async createCanvasImage(input: CreateDesignJobInput): Promise<DesignJobRecord> {
     if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
+    /** 局部常量保留跨异步调用和数组回调的 Canvas 目标收窄。 */
+    const target = input.target
     const prompt = input.prompt.trim()
     if (!prompt) throw new Error('设计任务提示词不能为空')
     if (!input.generationConstraints || input.canvasImageConfigRevision === undefined) {
       throw new Error('Canvas 图片任务缺少生成快照')
     }
+    const targetAdapter = this.dependencies.canvasImageTargetAdapter
+    const inputResolver = this.dependencies.canvasImageInputResolver
+    if (!targetAdapter || !inputResolver) throw new Error('Canvas 图片任务执行边界未初始化')
+    /** 完整目标必须在模型、输入、ID 和 journal 副作用前验证。 */
+    await targetAdapter.assertTarget(input.projectId, target)
+    /** active 与 terminal pending 都可能覆盖模块当前版本，必须按完整目标互斥。 */
+    const conflicting = this.readProjectJobs(input.projectId).find((job) => (
+      isSameCanvasImageTarget(job.target, target)
+      && (job.status === 'queued' || job.status === 'running' || job.terminalState?.status === 'pending')
+    ))
+    if (conflicting) throw new Error('图片模块已有进行中任务')
     /** 可信模型校验必须早于 ID、journal 和事件副作用。 */
     const imageModelSnapshot = this.runImageModelValidation(
       () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
     )
+    /** 连线输入独立于 contextMode，始终从权威直接入边重新解析。 */
+    const canvasInputReferences = await inputResolver.resolve(toCanvasImageTarget(input.projectId, target))
     /** 只读取旧 Design revision 作为兼容事件序列，不产生结构 mutation。 */
     const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
     const id = this.createId()
@@ -267,14 +302,14 @@ export class DesignJobManager {
       creativeTaskId,
       attemptNumber: 1,
       projectId: input.projectId,
-      target: { ...input.target },
+      target: { ...target },
       action: input.action,
       status: 'queued',
       prompt,
       originalRequest: prompt,
       contextMode: input.contextMode,
       generationConstraints: { ...input.generationConstraints },
-      canvasInputReferences: input.canvasInputReferences?.map((reference) => ({ ...reference })),
+      canvasInputReferences: canvasInputReferences.map((reference) => ({ ...reference })),
       canvasImageConfigRevision: input.canvasImageConfigRevision,
       imageModelSnapshot: { ...imageModelSnapshot },
       traceState: 'pending',
@@ -323,15 +358,20 @@ export class DesignJobManager {
         rawThinkingAvailable: job.rawThinkingAvailable,
       }))
     const traceState = current.traceState ?? 'unavailable'
-    return {
+    /** 详情对象保留 Canvas 固化输入，旧消费者可忽略新增运行时字段。 */
+    const details = {
       creativeTaskId: current.creativeTaskId,
       currentJobId: current.id,
       attempts,
       traceState,
+      ...(current.canvasInputReferences
+        ? { canvasInputReferences: current.canvasInputReferences.map((reference) => ({ ...reference })) }
+        : {}),
       ...(includeTrace && traceState === 'ready'
         ? { trace: this.dependencies.traceStore.read(projectId, current.id) }
         : {}),
     }
+    return details
   }
 
   /** 订阅任意任务状态变化。 */
@@ -468,11 +508,16 @@ export class DesignJobManager {
       if (!['failed', 'cancelled', 'interrupted'].includes(previous.status)) {
         throw new Error('当前设计任务不可重试')
       }
-      const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
-      const ownsNode = current.nodes.some((node) => (
-        node.id === requireDesignCanvasTarget(previous).nodeId && node.kind === 'job' && node.jobId === previous.id
-      ))
-      if (!ownsNode) throw new Error('设计任务节点已被其他任务接管')
+      if (previous.target.kind === 'design-canvas') {
+        /** 旧 Design 重试继续要求占位节点由当前 attempt 独占。 */
+        const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
+        const ownsNode = current.nodes.some((node) => (
+          node.id === requireDesignCanvasTarget(previous).nodeId
+          && node.kind === 'job'
+          && node.jobId === previous.id
+        ))
+        if (!ownsNode) throw new Error('设计任务节点已被其他任务接管')
+      }
       const replacementId = this.createId()
       if (!isSafeDesignStableId(replacementId)) throw new Error('设计任务 ID 非法')
       const intent: StoredDesignJob = {
@@ -788,6 +833,14 @@ export class DesignJobManager {
       `上下文模式：${job.contextMode}`,
       `项目指令（仅来自显式项目根）：\n${projectInstructions}`,
     ]
+    if (job.target.kind === 'canvas-image') {
+      /** 比例、尺寸和连线输入只从 journal 的结构化快照编码，不信任 Renderer 隐藏文本。 */
+      commonInstructions.push(
+        `结构化画面比例：${job.generationConstraints?.aspectRatio ?? '1:1'}`,
+        `结构化输出尺寸：${job.generationConstraints?.imageSize ?? 'auto'}`,
+        `Canvas 直接入边已提交快照：${JSON.stringify(job.canvasInputReferences ?? [])}`,
+      )
+    }
     if (job.action === 'generate') {
       return [...commonInstructions, `用户要求：${job.prompt}`].join('\n')
     }
@@ -996,6 +1049,10 @@ export class DesignJobManager {
         this.updateStatus(latest, 'failed', { error: DESIGN_JOB_OUTPUT_ERROR })
         return
       }
+      if (job.target.kind === 'canvas-image') {
+        await this.commitCanvasImageOutput(job, latest, asset, batch)
+        return
+      }
       const current = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
       const placeholder = current.nodes.find((node) => node.id === requireDesignCanvasTarget(job).nodeId && node.jobId === job.id)
       if (!placeholder) {
@@ -1052,6 +1109,73 @@ export class DesignJobManager {
     })
   }
 
+  /** Canvas 图片输出只登记共享 Asset，再采用到独立模块，不创建旧 Design 节点。 */
+  private async commitCanvasImageOutput(
+    job: StoredDesignJob,
+    latest: StoredDesignJob,
+    asset: DesignAsset,
+    batch: DesignAssetImportBatch,
+  ): Promise<void> {
+    const targetAdapter = this.dependencies.canvasImageTargetAdapter
+    if (!targetAdapter || job.target.kind !== 'canvas-image') {
+      batch.rollback()
+      throw new Error('Canvas 图片任务执行边界未初始化')
+    }
+    /** 先持久化 terminal pending，后续每一步都能按 Asset 和模块事实对账。 */
+    const current = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
+    const pending = this.updateStatus(latest, latest.status, {
+      terminalState: { status: 'pending', outputAssetId: asset.id },
+    }, current.revision)
+    try {
+      /** 旧 Design 只登记共享 Asset，节点数组保持完全不变。 */
+      const updatedDocument = this.dependencies.store.mutate(job.projectId, current.revision, [
+        { type: 'upsert-assets', assets: [asset] },
+      ])
+      this.projectRevisions.set(job.projectId, updatedDocument.revision)
+      await targetAdapter.adoptOutput(job.projectId, job.target, asset.id)
+      batch.commit()
+      this.updateStatus(pending, 'succeeded', {
+        terminalState: undefined,
+        outputAssetId: asset.id,
+        parentAssetId: job.sourceAssetId,
+        error: undefined,
+      }, updatedDocument.revision)
+    } catch (error) {
+      let authoritative: DesignCanvasDocument
+      try {
+        authoritative = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
+      } catch {
+        /** Asset 是否提交无法确认时保留 batch 与 pending，等待恢复继续对账。 */
+        return
+      }
+      const assetExists = authoritative.assets.some((candidate) => (
+        candidate.id === asset.id && candidate.sourceJobId === job.id
+      ))
+      if (!assetExists) {
+        batch.rollback()
+        this.updateStatus(pending, 'failed', {
+          terminalState: undefined,
+          error: error instanceof Error ? error.message : String(error),
+        }, authoritative.revision)
+        return
+      }
+      /** Asset 已进入权威 Store 后必须保留文件；采用失败由 pending 恢复重放。 */
+      batch.commit()
+      try {
+        if (await targetAdapter.isOutputAdopted(job.projectId, job.target, asset.id)) {
+          this.updateStatus(pending, 'succeeded', {
+            terminalState: undefined,
+            outputAssetId: asset.id,
+            parentAssetId: job.sourceAssetId,
+            error: undefined,
+          }, authoritative.revision)
+        }
+      } catch {
+        /** 模块或 Canvas 暂不可读时继续保留 terminal pending。 */
+      }
+    }
+  }
+
   /** 判断 Store 是否同时持有当前任务输出素材及其替换后的画布节点。 */
   private isTerminalCommitPresent(
     document: DesignCanvasDocument,
@@ -1069,6 +1193,10 @@ export class DesignJobManager {
 
   /** 按 Store 当前事实完成一次 terminal pending 对账。 */
   private reconcileTerminalJob(job: StoredDesignJob): void {
+    if (job.target.kind === 'canvas-image') {
+      void this.reconcileCanvasImageTerminalJob(job)
+      return
+    }
     try {
       const document = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
       const outputAssetId = job.terminalState?.outputAssetId
@@ -1091,6 +1219,39 @@ export class DesignJobManager {
     }
   }
 
+  /** 按共享 Asset 和模块采用事实异步收敛 Canvas terminal pending。 */
+  private async reconcileCanvasImageTerminalJob(job: StoredDesignJob): Promise<void> {
+    try {
+      const outputAssetId = job.terminalState?.outputAssetId
+      const targetAdapter = this.dependencies.canvasImageTargetAdapter
+      if (!outputAssetId || !targetAdapter || job.target.kind !== 'canvas-image') return
+      /** Design Store 只需持有该 Job 导入的共享 Asset。 */
+      const document = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
+      const assetExists = document.assets.some((asset) => (
+        asset.id === outputAssetId && asset.sourceJobId === job.id
+      ))
+      if (!assetExists) {
+        this.updateStatus(job, 'failed', {
+          terminalState: undefined,
+          error: '设计任务终态提交未完成',
+        }, document.revision)
+        return
+      }
+      if (!await targetAdapter.isOutputAdopted(job.projectId, job.target, outputAssetId)) {
+        await targetAdapter.adoptOutput(job.projectId, job.target, outputAssetId)
+      }
+      if (!await targetAdapter.isOutputAdopted(job.projectId, job.target, outputAssetId)) return
+      this.updateStatus(job, 'succeeded', {
+        terminalState: undefined,
+        outputAssetId,
+        parentAssetId: job.sourceAssetId,
+        error: undefined,
+      }, document.revision)
+    } catch {
+      /** 权威 Asset 或 Canvas 模块暂不可读时保留 pending，等待下次显式恢复。 */
+    }
+  }
+
   /** 按已持久化 replacement ID 幂等创建或返回替代任务。 */
   private completeRetryIntent(previous: StoredDesignJob): StoredDesignJob {
     if (!previous.imageModelSnapshot) throw new Error('旧任务未记录生图模型，请重新提交')
@@ -1098,6 +1259,9 @@ export class DesignJobManager {
     if (!replacementId || previous.retryState?.status !== 'pending') {
       if (replacementId) return this.requireProjectJob(previous.projectId, replacementId)
       throw new Error('设计任务重试 intent 无效')
+    }
+    if (previous.target.kind === 'canvas-image') {
+      return this.completeCanvasImageRetryIntent(previous, replacementId)
     }
     const existing = this.findStoredJob(replacementId)
     if (existing) {
@@ -1141,6 +1305,63 @@ export class DesignJobManager {
         position: requireDesignCanvasTarget(previous).position,
       },
     }, previous.imageModelSnapshot, previous, replacementId)
+    this.finalizeRetryIntent(previous)
+    return replacement
+  }
+
+  /** 按固化 journal 幂等创建 Canvas 图片模块的替代 attempt。 */
+  private completeCanvasImageRetryIntent(
+    previous: StoredDesignJob,
+    replacementId: string,
+  ): StoredDesignJob {
+    if (previous.target.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
+    /** 显式保存收窄后的原目标，供 existing 分支和 replacement 快照复用。 */
+    const previousTarget = previous.target
+    /** 已写 replacement 时直接复用，禁止重复任务与付费运行。 */
+    const existing = this.findStoredJob(replacementId)
+    if (existing) {
+      if (existing.projectId !== previous.projectId
+        || !isSameCanvasImageTarget(existing.target, previousTarget)) {
+        throw new Error('替代 Canvas 图片任务归属异常')
+      }
+      this.finalizeRetryIntent(previous)
+      return existing
+    }
+    /** Canvas retry 不读取当前可编辑配置，只复制原 attempt 的完整执行快照。 */
+    const now = this.now()
+    const replacement: StoredDesignJob = {
+      ...previous,
+      id: replacementId,
+      attemptNumber: previous.attemptNumber + 1,
+      status: 'queued',
+      target: { ...previous.target },
+      generationConstraints: previous.generationConstraints
+        ? { ...previous.generationConstraints }
+        : undefined,
+      canvasInputReferences: previous.canvasInputReferences?.map((reference) => ({ ...reference })),
+      imageModelSnapshot: previous.imageModelSnapshot ? { ...previous.imageModelSnapshot } : undefined,
+      sessionId: undefined,
+      outputAssetId: undefined,
+      parentAssetId: previous.sourceAssetId,
+      error: undefined,
+      traceState: 'pending',
+      executionSessionCleanupState: 'pending',
+      contextReferences: undefined,
+      contextWarning: undefined,
+      designSummary: undefined,
+      finalImagePrompt: undefined,
+      rawThinkingAvailable: undefined,
+      startedAt: undefined,
+      completedAt: undefined,
+      terminalState: undefined,
+      replacedByJobId: undefined,
+      retryState: undefined,
+      deletionState: undefined,
+      createdAt: now,
+      updatedAt: now,
+    }
+    this.writeJob(replacement)
+    this.emit(replacement)
     this.finalizeRetryIntent(previous)
     return replacement
   }
@@ -1336,6 +1557,47 @@ function isDesignJobTarget(value: unknown): value is DesignJobTarget {
     && isSafeDesignStableId(value.imageModuleId)
 }
 
+/** 判断两个任务目标是否指向同一 Canvas 图片模块。 */
+function isSameCanvasImageTarget(
+  left: DesignJobTarget,
+  right: CanvasImageJobTarget,
+): boolean {
+  return left.kind === 'canvas-image'
+    && left.canvasId === right.canvasId
+    && left.nodeId === right.nodeId
+    && left.imageModuleId === right.imageModuleId
+}
+
+/** 把 journal 目标补全为 Canvas Store 使用的四重身份。 */
+function toCanvasImageTarget(
+  projectId: string,
+  target: CanvasImageJobTarget,
+): CanvasImageTarget {
+  return {
+    projectId,
+    canvasId: target.canvasId,
+    nodeId: target.nodeId,
+    imageModuleId: target.imageModuleId,
+  }
+}
+
+/** 严格校验 journal 内单条 Canvas 直接入边快照。 */
+function isCanvasImageInputReference(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  const allowedFields = new Set(['nodeId', 'kind', 'revision', 'summary', 'summaryHash', 'assetId'])
+  if (Object.keys(value).some((field) => !allowedFields.has(field))) return false
+  if (!isSafeDesignStableId(value.nodeId)
+    || !['agent', 'image', 'document', 'prototype'].includes(String(value.kind))
+    || !Number.isSafeInteger(value.revision)
+    || (value.revision as number) < 0
+    || typeof value.summary !== 'string'
+    || value.summary.length === 0
+    || value.summary.length > CANVAS_IMAGE_INPUT_MAX_TEXT
+    || typeof value.summaryHash !== 'string'
+    || !/^[a-f0-9]{64}$/.test(value.summaryHash)) return false
+  return value.assetId === undefined || isSafeDesignStableId(value.assetId)
+}
+
 /** Design 专属操作必须显式取得旧画布目标，禁止 Canvas 任务误入布局逻辑。 */
 function requireDesignCanvasTarget(
   job: StoredDesignJob,
@@ -1393,7 +1655,19 @@ function isStoredDesignJob(value: unknown): value is StoredDesignJob {
   if (value.canvasImageConfigRevision !== undefined
     && (!Number.isSafeInteger(value.canvasImageConfigRevision)
       || (value.canvasImageConfigRevision as number) < 0)) return false
-  if (value.canvasInputReferences !== undefined && !Array.isArray(value.canvasInputReferences)) return false
+  if (value.canvasInputReferences !== undefined) {
+    if (!Array.isArray(value.canvasInputReferences)
+      || value.canvasInputReferences.length > CANVAS_IMAGE_INPUT_MAX_REFERENCES
+      || !value.canvasInputReferences.every(isCanvasImageInputReference)) return false
+    /** journal 读取也执行解析器的总文本与媒体硬上限，拒绝手工膨胀输入。 */
+    const totalText = value.canvasInputReferences.reduce((sum, reference) => (
+      sum + (reference as { summary: string }).summary.length
+    ), 0)
+    const mediaCount = value.canvasInputReferences.filter((reference) => (
+      (reference as { assetId?: string }).assetId !== undefined
+    )).length
+    if (totalText > CANVAS_IMAGE_INPUT_MAX_TEXT || mediaCount > CANVAS_IMAGE_INPUT_MAX_MEDIA) return false
+  }
   if (value.placementState !== undefined && value.placementState !== 'pending' && value.placementState !== 'ready') return false
   if (value.terminalState !== undefined) {
     if (!isRecord(value.terminalState)

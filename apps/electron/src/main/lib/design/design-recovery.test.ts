@@ -112,7 +112,8 @@ describe('Design 跨模块恢复与资源边界', () => {
         channel: DESIGN_IPC_CHANNELS.CREATE_JOB,
         input: {
           projectId: 'project-1', action: 'generate', prompt: '生成海报',
-          contextMode: 'auto', imageModelProfileId: 'profile-test', position: { x: 0, y: 0 },
+          contextMode: 'auto', imageModelProfileId: 'profile-test',
+          target: { kind: 'design-canvas', position: { x: 0, y: 0 } },
         },
       },
       {
@@ -161,6 +162,47 @@ describe('Design 跨模块恢复与资源边界', () => {
     expect(manager.recover('project-1')).toContainEqual(expect.objectContaining({
       id: 'job-running', status: 'interrupted', error: '应用退出，任务已中断', contextMode: 'none',
     }))
+    expect(agentRunCount).toBe(0)
+  })
+
+  test('Given 上个进程留下 Canvas active Job When 启动恢复 Then 只标记 interrupted 且不自动运行', () => {
+    store.load('project-1')
+    const paths = pathResolver.resolve('project-1')
+    writeFileSync(join(paths.jobsDir, 'job-canvas-running.json'), JSON.stringify({
+      id: 'job-canvas-running', creativeTaskId: 'creative-canvas', attemptNumber: 1,
+      projectId: 'project-1', sessionId: 'session-canvas', action: 'generate', status: 'running',
+      prompt: '生成首页主视觉', originalRequest: '生成首页主视觉', contextMode: 'none',
+      target: {
+        kind: 'canvas-image', canvasId: 'canvas-1',
+        nodeId: 'image-node-1', imageModuleId: 'image-module-1',
+      },
+      generationConstraints: { aspectRatio: '16:9', imageSize: '2K' },
+      canvasImageConfigRevision: 3,
+      canvasInputReferences: [{
+        nodeId: 'document-1', kind: 'document', revision: 2,
+        summary: '已提交首页文档', summaryHash: 'a'.repeat(64),
+      }],
+      imageModelSnapshot: {
+        profileId: 'profile-test', name: '测试生图模型',
+        executor: 'nano-banana', modelId: 'image-model-test',
+      },
+      traceState: 'pending', executionSessionCleanupState: 'pending',
+      startedAt: 2, createdAt: 1, updatedAt: 2,
+    }))
+    let createdSessionCount = 0
+    let agentRunCount = 0
+    const manager = createRecoveryJobManager(store, pathResolver, {
+      onCreateSession: () => { createdSessionCount += 1 },
+      onRunHeadless: () => { agentRunCount += 1 },
+    })
+
+    expect(manager.recover('project-1')).toContainEqual(expect.objectContaining({
+      id: 'job-canvas-running', status: 'interrupted',
+      target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'image-node-1', imageModuleId: 'image-module-1' },
+      generationConstraints: { aspectRatio: '16:9', imageSize: '2K' },
+      canvasImageConfigRevision: 3,
+    }))
+    expect(createdSessionCount).toBe(0)
     expect(agentRunCount).toBe(0)
   })
 

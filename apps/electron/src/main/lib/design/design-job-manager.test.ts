@@ -12,6 +12,7 @@ import type {
   SDKAssistantMessage,
   AgentSessionMeta,
   CreateDesignJobInput,
+  CanvasImageInputReference,
   DesignAsset,
   DesignCanvasDocument,
   DesignJobRecord,
@@ -189,32 +190,104 @@ describe('Design Job Manager', () => {
     expect(JSON.parse(readFileSync(legacyPath, 'utf8'))).toEqual(legacy)
   })
 
-  test('Given canvas-image 目标 When 创建 Job Then 不修改旧 Design nodes', () => {
+  test('Given canvas-image 目标 When 创建 Job Then 不修改旧 Design nodes', async () => {
     /** 创建前的旧 Design 节点快照。 */
     const before = structuredClone(document.nodes)
-    const job = harness.manager.createCanvasImage({
-      projectId: 'project-1',
-      action: 'generate',
-      prompt: '生成首页主视觉',
-      contextMode: 'auto',
-      imageModelProfileId: 'profile-test',
-      target: {
-        kind: 'canvas-image',
-        canvasId: 'canvas-1',
-        nodeId: 'image-node-1',
-        imageModuleId: 'image-module-1',
-      },
-      generationConstraints: { aspectRatio: '16:9', imageSize: '2K' },
-      canvasImageConfigRevision: 0,
-    })
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
 
     expect(job.target).toEqual({
       kind: 'canvas-image',
       canvasId: 'canvas-1',
-      nodeId: 'image-node-1',
-      imageModuleId: 'image-module-1',
+      nodeId: 'image-node-a',
+      imageModuleId: 'image-module-a',
     })
     expect(document.nodes).toEqual(before)
+  })
+
+  test('Given Canvas Job 成功 When 提交 Then 只新增 Asset 并采用到目标模块', async () => {
+    const beforeNodes = structuredClone(document.nodes)
+    harness.messages = [createToolMessage('session-1/output.png')]
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({ status: 'succeeded', outputAssetId: 'asset-output' })
+    expect(document.assets).toContainEqual(expect.objectContaining({ id: 'asset-output', sourceJobId: job.id }))
+    expect(document.nodes).toEqual(beforeNodes)
+    expect(harness.adoptedOutputs.get('image-module-a')).toBe('asset-output')
+  })
+
+  test('Given Canvas Asset 已提交但模块采用失败 When 再次对账 Then 重放采用并收敛成功', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    harness.adoptOutputError = new Error('图片模块暂不可写')
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'running',
+      terminalState: { status: 'pending', outputAssetId: 'asset-output' },
+    })
+    expect(harness.batchCommits).toBe(1)
+
+    harness.adoptOutputError = undefined
+    harness.manager.reconcilePendingTerminals('project-1')
+    /** 对账 API 同步返回当前快照，异步模块采用在下一轮事件循环收敛。 */
+    await new Promise<void>((resolve) => { setTimeout(resolve, 0) })
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'succeeded', outputAssetId: 'asset-output', terminalState: undefined,
+    })
+    expect(harness.adoptedOutputs.get('image-module-a')).toBe('asset-output')
+  })
+
+  test('Given A 完成且 B 独立 When 提交 A Then B 配置和任务保持不变', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    const jobA = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    const jobB = await harness.manager.createCanvasImage(createCanvasImageInput('b'))
+    const beforeB = structuredClone(jobB)
+
+    await harness.manager.run(jobA.id)
+
+    expect(harness.adoptedOutputs.get('image-module-a')).toBe('asset-output')
+    expect(harness.adoptedOutputs.has('image-module-b')).toBe(false)
+    expect(harness.manager.get(jobB.id)).toEqual(beforeB)
+  })
+
+  test('Given 同模块已有 active 或 terminal pending When 再创建 Then 拒绝且不同模块仍可并行', async () => {
+    await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+
+    await expect(harness.manager.createCanvasImage(createCanvasImageInput('a')))
+      .rejects.toThrow('图片模块已有进行中任务')
+    await expect(harness.manager.createCanvasImage(createCanvasImageInput('b')))
+      .resolves.toMatchObject({ status: 'queued', target: { imageModuleId: 'image-module-b' } })
+  })
+
+  test('Given Canvas 失败任务 When 重试 Then 复用任务身份和全部固化快照', async () => {
+    harness.canvasInputReferences = [{
+      nodeId: 'document-1', kind: 'document', revision: 2,
+      summary: '已提交首页文档', summaryHash: 'a'.repeat(64),
+    }]
+    const original = await harness.manager.createCanvasImage({
+      ...createCanvasImageInput('a'),
+      contextMode: 'none',
+    })
+    await harness.manager.run(original.id)
+
+    const replacement = harness.manager.retry('project-1', original.id)
+
+    expect(replacement).toMatchObject({
+      creativeTaskId: original.creativeTaskId,
+      attemptNumber: 2,
+      target: original.target,
+      prompt: original.prompt,
+      originalRequest: original.originalRequest,
+      contextMode: 'none',
+      imageModelSnapshot: original.imageModelSnapshot,
+      generationConstraints: original.generationConstraints,
+      canvasImageConfigRevision: original.canvasImageConfigRevision,
+      canvasInputReferences: original.canvasInputReferences,
+    })
   })
 
   test('Given 重启留下 running 内部会话 When 恢复 Then 中断后继续 trace 与会话清理', async () => {
@@ -1288,6 +1361,8 @@ describe('Design Job Manager', () => {
       assertSnapshotAvailable: (snapshot: ImageGenerationModelSnapshot) => void
       resolveExecutionRoute: (snapshot: ImageGenerationModelSnapshot) => ResolvedImageGenerationRoute
       sdkMessages: SDKMessage[]
+      canvasInputReferences: CanvasImageInputReference[]
+      adoptOutputError?: Error
       traceWriteError?: Error
       cleanupError?: Error
       projectFiles: Record<string, string>
@@ -1312,11 +1387,14 @@ describe('Design Job Manager', () => {
         snapshot: snapshot as Extract<ImageGenerationModelSnapshot, { executor: 'nano-banana' }>,
       }),
       sdkMessages: [],
+      canvasInputReferences: [],
       projectFiles: { 'src/App.tsx': 'export function App() { return "首页" }' },
     }
     const createdSessions: AgentSessionMeta[] = []
     const stoppedSessions: string[] = []
     const importSources: DesignAssetImportSource[] = []
+    /** Canvas 图片模块当前采用的输出素材。 */
+    const adoptedOutputs = new Map<string, string>()
     const runInputs: Array<Record<string, unknown>> = []
     const warnings: string[] = []
     /** 真实 lease registry 用于验证迁移无法插入 output 提交窗口。 */
@@ -1390,6 +1468,19 @@ describe('Design Job Manager', () => {
           batch.rollback = () => { recordOutputEffect('rollback'); batchRollbacks += 1 }
           return batch
         },
+      },
+      canvasImageTargetAdapter: {
+        assertTarget: async () => undefined,
+        adoptOutput: async (_projectId, target, assetId) => {
+          if (state.adoptOutputError) throw state.adoptOutputError
+          adoptedOutputs.set(target.imageModuleId, assetId)
+        },
+        isOutputAdopted: async (_projectId, target, assetId) => (
+          adoptedOutputs.get(target.imageModuleId) === assetId
+        ),
+      },
+      canvasImageInputResolver: {
+        resolve: async () => state.canvasInputReferences.map((reference) => ({ ...reference })),
       },
       imageModels: {
         resolveAvailableSnapshot: (profileId) => state.resolveAvailableSnapshot(profileId),
@@ -1548,6 +1639,7 @@ describe('Design Job Manager', () => {
       createdSessions,
       stoppedSessions,
       importSources,
+      adoptedOutputs,
       runInputs,
       warnings,
       cleanedSessionIds,
@@ -1566,6 +1658,10 @@ describe('Design Job Manager', () => {
       get messages() { return state.messages },
       set messages(value: AgentMessage[]) { state.messages = value },
       set sdkMessages(value: SDKMessage[]) { state.sdkMessages = value },
+      set canvasInputReferences(value: CanvasImageInputReference[]) {
+        state.canvasInputReferences = value
+      },
+      set adoptOutputError(value: Error | undefined) { state.adoptOutputError = value },
       set traceWriteError(value: Error | undefined) { state.traceWriteError = value },
       set cleanupError(value: Error | undefined) { state.cleanupError = value },
       get projectRoot() { return projectRoot },
@@ -1677,6 +1773,20 @@ function createGenerateInput(): CreateDesignJobInput {
     projectId: 'project-1', action: 'generate', prompt: '生成海报',
     contextMode: 'auto',
     imageModelProfileId: 'profile-test', position: { x: 10, y: 20 },
+  }
+}
+
+/** 创建绑定独立 Canvas 图片模块的生成任务输入。 */
+function createCanvasImageInput(suffix: string): CreateDesignJobInput {
+  return {
+    projectId: 'project-1', action: 'generate', prompt: `生成首页主视觉 ${suffix}`,
+    contextMode: 'auto', imageModelProfileId: 'profile-test',
+    target: {
+      kind: 'canvas-image', canvasId: 'canvas-1',
+      nodeId: `image-node-${suffix}`, imageModuleId: `image-module-${suffix}`,
+    },
+    generationConstraints: { aspectRatio: '16:9', imageSize: '2K' },
+    canvasImageConfigRevision: 0,
   }
 }
 
