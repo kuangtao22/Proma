@@ -1028,6 +1028,11 @@ export function registerCanvasDocumentIpcHandlers(
     /** 每个输出素材只能由一个目标任务声明。 */
     const ownerByAssetId = new Map<string, DesignJobRecord>()
     for (const job of jobs) {
+      /** Job 自身必须声明确定父链；edit 额外要求存在来源素材。 */
+      if ((job.action === 'edit' && !job.sourceAssetId)
+        || job.parentAssetId !== job.sourceAssetId) {
+        throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+      }
       if (!job.outputAssetId) continue
       if (ownerByAssetId.has(job.outputAssetId)) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
       ownerByAssetId.set(job.outputAssetId, job)
@@ -1037,7 +1042,11 @@ export function registerCanvasDocumentIpcHandlers(
     /** 每个已声明输出都必须在 Design Store 中存在且反向归属同一 Job。 */
     for (const [outputAssetId, owner] of ownerByAssetId) {
       const asset = projectAssetById.get(outputAssetId)
-      if (!asset || asset.sourceJobId !== owner.id) throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+      if (!asset
+        || asset.sourceJobId !== owner.id
+        || asset.parentAssetId !== owner.parentAssetId) {
+        throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+      }
       visibleAssetById.set(asset.id, asset)
     }
     /** 当前 adopted 是稳定模块配置的可信根，允许 legacy 素材没有 Canvas Job 来源。 */

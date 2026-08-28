@@ -292,14 +292,18 @@ export class DesignJobManager {
       if (!targetAdapter || !inputResolver) throw new Error('Canvas 图片任务执行边界未初始化')
       /** 完整目标必须在模型、输入、ID 和 journal 副作用前验证。 */
       await targetAdapter.assertTarget(input.projectId, target)
+      if (input.action === 'edit' && !input.sourceAssetId) throw new Error('编辑任务缺少来源素材')
+      /** 来源素材必须先由当前项目权威 Store 证明，禁止跨项目或陈旧 ID 进入 journal。 */
+      const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
+      if (input.sourceAssetId && !current.assets.some((asset) => asset.id === input.sourceAssetId)) {
+        throw new Error(`素材不存在: ${input.sourceAssetId}`)
+      }
       /** 可信模型校验必须早于 ID、journal 和事件副作用。 */
       const imageModelSnapshot = this.runImageModelValidation(
         () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
       )
       /** 连线输入独立于 contextMode，始终从权威直接入边重新解析。 */
       const canvasInputReferences = await inputResolver.resolve(toCanvasImageTarget(input.projectId, target))
-      /** 只读取旧 Design revision 作为兼容事件序列，不产生结构 mutation。 */
-      const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
       const id = this.createId()
       const creativeTaskId = this.createCreativeTaskId()
       if (!isSafeDesignStableId(id) || !isSafeDesignStableId(creativeTaskId) || id === creativeTaskId) {
@@ -321,6 +325,9 @@ export class DesignJobManager {
         canvasInputReferences: canvasInputReferences.map((reference) => ({ ...reference })),
         canvasImageConfigRevision: input.canvasImageConfigRevision,
         imageModelSnapshot: { ...imageModelSnapshot },
+        ...(input.sourceAssetId
+          ? { sourceAssetId: input.sourceAssetId, parentAssetId: input.sourceAssetId }
+          : {}),
         traceState: 'pending',
         executionSessionCleanupState: 'pending',
         createdAt: timestamp,

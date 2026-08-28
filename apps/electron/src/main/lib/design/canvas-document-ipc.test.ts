@@ -778,6 +778,49 @@ describe('原生 Canvas 文档 IPC', () => {
     })
   })
 
+  test('Given Job 输出素材伪造父链 When LOAD Then edit 和 generate 均 fail closed 且不授权素材', async () => {
+    const sourceAsset = createImageAsset('asset-source')
+    const foreignAsset = createImageAsset('asset-foreign', undefined, sourceAsset.id)
+    const editJob = {
+      ...createImageJob(imageTargetA, 'job-edit-forged', 'asset-edit-output'),
+      action: 'edit' as const,
+      sourceAssetId: sourceAsset.id,
+      parentAssetId: sourceAsset.id,
+    }
+    const generateJob = createImageJob(imageTargetA, 'job-generate-forged', 'asset-generate-output')
+    const contexts = [
+      createContext({
+        imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-edit-output' },
+        imageJobs: [editJob],
+        imageAssets: [
+          sourceAsset,
+          foreignAsset,
+          createImageAsset('asset-edit-output', editJob.id, foreignAsset.id),
+        ],
+      }),
+      createContext({
+        imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-generate-output' },
+        imageJobs: [generateJob],
+        imageAssets: [
+          foreignAsset,
+          createImageAsset('asset-generate-output', generateJob.id, foreignAsset.id),
+        ],
+      }),
+    ]
+
+    for (const context of contexts) {
+      const result = await invoke(
+        context.handlers,
+        CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+        context.sender,
+        imageTargetA,
+      )
+      expect(result).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+      expect(JSON.stringify(result)).not.toContain('asset-foreign.png')
+      expect(context.getMediaAccessCount()).toBe(0)
+    }
+  })
+
   test('Given adopted 素材祖先循环或超过上限 When LOAD Then fail closed 且不创建媒体 lease', async () => {
     const cyclicJob = createImageJob(imageTargetA, 'job-cycle', 'asset-cycle-a')
     const cyclic = createContext({

@@ -333,6 +333,47 @@ describe('Design Job Manager', () => {
     expect(harness.adoptedOutputs.get('image-module-a')).toBe('asset-output')
   })
 
+  test('Given Canvas 编辑来源素材存在 When 创建重载并执行 Then journal、提示词和输出素材保留同一父链', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    const input = createCanvasImageEditInput()
+    const job = await harness.manager.createCanvasImage(input)
+    const reloaded = createHarness()
+
+    expect(job).toMatchObject({
+      action: 'edit', sourceAssetId: 'asset-source', parentAssetId: 'asset-source',
+    })
+    expect(reloaded.manager.listCanvasImageJobs({
+      projectId: input.projectId,
+      canvasId: 'canvas-1', nodeId: 'image-node-edit', imageModuleId: 'image-module-edit',
+    })).toEqual([expect.objectContaining({
+      id: job.id, sourceAssetId: 'asset-source', parentAssetId: 'asset-source',
+    })])
+
+    await harness.manager.run(job.id)
+
+    expect(harness.runInputs[0]?.userMessage).toContain('/trusted/source.png')
+    expect(harness.importSources).toEqual([{
+      kind: 'job', sourceJobId: job.id, sourceSessionId: 'session-1',
+      parentAssetId: 'asset-source', prompt: '移除 Canvas 图片文字',
+    }])
+    expect(document.assets).toContainEqual(expect.objectContaining({
+      id: 'asset-output', sourceJobId: job.id, parentAssetId: 'asset-source',
+    }))
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'succeeded', outputAssetId: 'asset-output', parentAssetId: 'asset-source',
+    })
+  })
+
+  test('Given Canvas 编辑来源素材不存在 When 创建 Then 在 journal 和事件副作用前拒绝', async () => {
+    const input = { ...createCanvasImageEditInput(), sourceAssetId: 'asset-missing' }
+
+    await expect(harness.manager.createCanvasImage(input)).rejects.toThrow('素材不存在: asset-missing')
+
+    expect(existsSync(join(cacheRoot, 'jobs'))).toBe(false)
+    expect(harness.changedEvents).toEqual([])
+    expect(harness.createdSessions).toEqual([])
+  })
+
   test('Given Canvas Asset 已提交但模块采用失败 When 再次对账 Then 重放采用并收敛成功', async () => {
     harness.messages = [createToolMessage('session-1/output.png')]
     harness.adoptOutputError = new Error('图片模块暂不可写')
@@ -1979,6 +2020,20 @@ function createCanvasImageInput(suffix: string): CreateDesignJobInput {
     target: {
       kind: 'canvas-image', canvasId: 'canvas-1',
       nodeId: `image-node-${suffix}`, imageModuleId: `image-module-${suffix}`,
+    },
+    generationConstraints: { aspectRatio: '16:9', imageSize: '2K' },
+    canvasImageConfigRevision: 0,
+  }
+}
+
+/** 创建绑定独立 Canvas 图片模块的编辑任务输入。 */
+function createCanvasImageEditInput(): CreateDesignJobInput {
+  return {
+    projectId: 'project-1', action: 'edit', prompt: '移除 Canvas 图片文字',
+    contextMode: 'auto', imageModelProfileId: 'profile-test', sourceAssetId: 'asset-source',
+    target: {
+      kind: 'canvas-image', canvasId: 'canvas-1',
+      nodeId: 'image-node-edit', imageModuleId: 'image-module-edit',
     },
     generationConstraints: { aspectRatio: '16:9', imageSize: '2K' },
     canvasImageConfigRevision: 0,
