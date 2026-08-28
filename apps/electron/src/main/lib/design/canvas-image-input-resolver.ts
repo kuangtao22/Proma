@@ -161,7 +161,9 @@ export function createCanvasImageInputResolver(
     resolve: async (target) => {
       /** 单次权威图读取决定直接入边集合，禁止递归扩散。 */
       const document: CanvasDocument = dependencies.canvasStore.requireStableAuthoritativeDocument(target)
-      const targetNode = document.nodes.find((node) => node.id === target.nodeId)
+      /** 单次建表把目标与候选节点查询从重复线性扫描降为常数时间。 */
+      const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
+      const targetNode = nodesById.get(target.nodeId)
       if (!targetNode || targetNode.kind !== 'image'
         || targetNode.imageModuleId !== target.imageModuleId) {
         throw new Error('CANVAS_IMAGE_TARGET_INVALID')
@@ -170,6 +172,7 @@ export function createCanvasImageInputResolver(
       const sourceIds = [...new Set(document.edges
         .filter((edge) => edge.targetNodeId === target.nodeId)
         .map((edge) => edge.sourceNodeId))]
+        .slice(0, CANVAS_IMAGE_INPUT_MAX_REFERENCES)
       /** 逐项消费固定引用、文本和媒体预算。 */
       const references: CanvasImageInputReference[] = []
       let textLength = 0
@@ -177,8 +180,10 @@ export function createCanvasImageInputResolver(
       for (const sourceId of sourceIds) {
         if (references.length >= CANVAS_IMAGE_INPUT_MAX_REFERENCES
           || textLength >= CANVAS_IMAGE_INPUT_MAX_TEXT) break
-        const node = document.nodes.find((candidate) => candidate.id === sourceId)
+        const node = nodesById.get(sourceId)
         if (!node) continue
+        /** 图片媒体预算已满时不触发模块 Store 读取。 */
+        if (node.kind === 'image' && mediaCount >= CANVAS_IMAGE_INPUT_MAX_MEDIA) continue
         const resolved = await resolveNode(target, node)
         if (!resolved) continue
         if (resolved.assetId && mediaCount >= CANVAS_IMAGE_INPUT_MAX_MEDIA) continue

@@ -280,6 +280,26 @@ describe('Design Job Manager', () => {
     expect(harness.adoptedOutputs.get('image-module-a')).toBe('asset-output')
   })
 
+  test('Given Canvas 输出已进入 terminal pending When 取消后对账 Then 拒绝取消并只采用一次', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    harness.adoptOutputError = new Error('图片模块暂不可写')
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    await harness.manager.run(job.id)
+
+    await expect(harness.manager.cancel('project-1', job.id))
+      .rejects.toThrow('任务已进入结果提交阶段，无法取消')
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'running', terminalState: { status: 'pending', outputAssetId: 'asset-output' },
+    })
+    expect(harness.stoppedSessions).toEqual([])
+
+    harness.adoptOutputError = undefined
+    await harness.manager.reconcilePendingTerminals('project-1')
+
+    expect(harness.manager.get(job.id)).toMatchObject({ status: 'succeeded', outputAssetId: 'asset-output' })
+    expect(harness.canvasAdoptionCount).toBe(1)
+  })
+
   test('Given A 完成且 B 独立 When 提交 A Then B 配置和任务保持不变', async () => {
     harness.messages = [createToolMessage('session-1/output.png')]
     const jobA = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
@@ -1479,6 +1499,8 @@ describe('Design Job Manager', () => {
     let workspaceWriteDepth = 0
     /** 记录 Canvas 采用是否逃逸出项目写 lease。 */
     let canvasAdoptionOutsideWorkspace = false
+    /** 记录真正完成的 Canvas 输出采用次数。 */
+    let canvasAdoptionCount = 0
     const outputEffects: string[] = []
     const unguardedOutputEffects: string[] = []
     let batchCommits = 0
@@ -1554,6 +1576,7 @@ describe('Design Job Manager', () => {
           if (workspaceWriteDepth === 0) canvasAdoptionOutsideWorkspace = true
           if (state.adoptOutputError) throw state.adoptOutputError
           await state.adoptOutputBarrier
+          canvasAdoptionCount += 1
           adoptedOutputs.set(target.imageModuleId, assetId)
         },
         isOutputAdopted: async (_projectId, target, assetId) => (
@@ -1737,6 +1760,7 @@ describe('Design Job Manager', () => {
       get traceReadCount() { return traceReadCount },
       get relocationAttemptError() { return state.relocationAttemptError },
       get canvasAdoptionOutsideWorkspace() { return canvasAdoptionOutsideWorkspace },
+      get canvasAdoptionCount() { return canvasAdoptionCount },
       get settings() { return state.settings },
       set settings(value: typeof state.settings) { state.settings = value },
       get messages() { return state.messages },

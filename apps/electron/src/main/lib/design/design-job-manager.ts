@@ -490,9 +490,12 @@ export class DesignJobManager {
   /** 取消 queued/running 任务；终态任务保持不变。 */
   async cancel(projectId: string, jobId: string): Promise<DesignJobRecord> {
     const job = this.requireProjectJob(projectId, jobId)
+    if (job.terminalState?.status === 'pending') throw new Error('任务已进入结果提交阶段，无法取消')
     if (job.status !== 'queued' && job.status !== 'running') return job
     if (job.sessionId) await this.dependencies.stopAgent(job.sessionId)
     const latest = this.requireProjectJob(projectId, jobId)
+    /** stopAgent 等待期间也可能跨过输出提交点，必须再次以最新 journal 判定。 */
+    if (latest.terminalState?.status === 'pending') throw new Error('任务已进入结果提交阶段，无法取消')
     if (latest.status !== 'queued' && latest.status !== 'running') return latest
     const cancelled = this.updateStatus(latest, 'cancelled', { error: undefined })
     await this.finalizeExecution(cancelled.id)

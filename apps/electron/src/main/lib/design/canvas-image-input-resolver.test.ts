@@ -78,26 +78,46 @@ describe('Canvas 图片直接输入解析器', () => {
 
   test('Given 直接入边和摘要超过预算 When 解析 Then 引用、文本和媒体均保持硬上限', async () => {
     const { document, target } = createDocument()
-    document.nodes = [document.nodes[0]!, ...Array.from({ length: 20 }, (_, index) => ({
+    document.nodes = [document.nodes[0]!, ...Array.from({ length: 24 }, (_, index) => ({
       id: `image-${index}`, kind: 'image' as const, title: `图片 ${index}`,
       position: { x: 0, y: 0 }, imageModuleId: `module-${index}`, adoptedAssetId: `asset-${index}`,
-    }))]
-    document.edges = document.nodes.slice(1).map((node, index) => ({
+    })), {
+      id: 'document-after-images', kind: 'document' as const, title: '候选上限外文档',
+      position: { x: 0, y: 0 }, documentId: 'document-after-images', contentRevision: 1,
+    }]
+    const directEdges = document.nodes.slice(1).map((node, index) => ({
       id: `edge-${index}`, sourceNodeId: node.id, sourcePort: 'output',
       targetNodeId: target.nodeId, targetPort: 'input',
     }))
+    /** 大量重复边不得扩大候选或实际读取工作量。 */
+    document.edges = [...directEdges, ...Array.from({ length: 80 }, (_, index) => ({
+      id: `duplicate-${index}`, sourceNodeId: `image-${index % 24}`, sourcePort: 'output',
+      targetNodeId: target.nodeId, targetPort: 'input',
+    }))]
+    let imageLoadCount = 0
+    let documentReadCount = 0
+    let prototypeReadCount = 0
     const resolver = createCanvasImageInputResolver({
       canvasStore: { requireStableAuthoritativeDocument: () => document },
       getAgentOutput: async () => ({ revision: 0, messages: [] }),
       imageStore: {
-        load: async (input) => ({
-          schemaVersion: 2, kind: 'image', contentId: input.imageModuleId,
-          revision: 1, createdAt: 1, updatedAt: 1, prompt: '', selectedModelProfileId: null,
-          aspectRatio: '1:1', imageSize: 'auto', contextMode: 'none', adoptedAssetId: `asset-${input.imageModuleId}`,
-        }),
+        load: async (input) => {
+          imageLoadCount += 1
+          return {
+            schemaVersion: 2, kind: 'image', contentId: input.imageModuleId,
+            revision: 1, createdAt: 1, updatedAt: 1, prompt: '', selectedModelProfileId: null,
+            aspectRatio: '1:1', imageSize: 'auto', contextMode: 'none', adoptedAssetId: `asset-${input.imageModuleId}`,
+          }
+        },
       },
-      readDocument: async () => ({ revision: 1, markdown: 'x'.repeat(CANVAS_IMAGE_INPUT_MAX_TEXT * 2) }),
-      readPrototype: async () => ({ revision: 1, summary: 'x'.repeat(CANVAS_IMAGE_INPUT_MAX_TEXT * 2) }),
+      readDocument: async () => {
+        documentReadCount += 1
+        return { revision: 1, markdown: 'x'.repeat(CANVAS_IMAGE_INPUT_MAX_TEXT * 2) }
+      },
+      readPrototype: async () => {
+        prototypeReadCount += 1
+        return { revision: 1, summary: 'x'.repeat(CANVAS_IMAGE_INPUT_MAX_TEXT * 2) }
+      },
     })
 
     const references = await resolver.resolve(target)
@@ -107,5 +127,8 @@ describe('Canvas 图片直接输入解析器', () => {
       .toBeLessThanOrEqual(CANVAS_IMAGE_INPUT_MAX_TEXT)
     expect(references.filter((reference) => reference.assetId).length)
       .toBeLessThanOrEqual(CANVAS_IMAGE_INPUT_MAX_MEDIA)
+    expect(imageLoadCount).toBe(CANVAS_IMAGE_INPUT_MAX_MEDIA)
+    expect(documentReadCount).toBe(0)
+    expect(prototypeReadCount).toBe(0)
   })
 })
