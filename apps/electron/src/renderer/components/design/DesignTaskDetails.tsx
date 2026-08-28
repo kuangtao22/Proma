@@ -255,18 +255,18 @@ function TraceEntry({ entry }: { entry: DesignTraceEntry }): React.ReactElement 
   )
 }
 
-export interface DesignTaskDetailsProps {
+export interface DesignTaskDetailsViewProps {
   job: DesignJobRecord
   detailsState: DesignTaskDetailsState
   onLoadDetails: () => void
   onLoadTrace: () => void
-  onCopyPrompt: (prompt: string) => void
-  onRetry: (jobId: string) => void
-  onContinueFromVersion: (assetId: string) => void
+  onCopyPrompt?: (prompt: string) => void
+  onRetry?: (jobId: string) => void
+  onContinueFromVersion?: (assetId: string) => void
 }
 
-/** Inspector 顶部的创作任务详情，默认轻量，Thinking 与日志按需展开。 */
-export function DesignTaskDetails({
+/** 可由旧 Design Inspector 与 Canvas 工作台复用的纯任务详情视图。 */
+export function DesignTaskDetailsView({
   job,
   detailsState,
   onLoadDetails,
@@ -274,7 +274,7 @@ export function DesignTaskDetails({
   onCopyPrompt,
   onRetry,
   onContinueFromVersion,
-}: DesignTaskDetailsProps): React.ReactElement {
+}: DesignTaskDetailsViewProps): React.ReactElement {
   const [thinkingOpen, setThinkingOpen] = React.useState(false)
   const [logsOpen, setLogsOpen] = React.useState(false)
   const traceRequested = React.useRef(false)
@@ -329,7 +329,7 @@ export function DesignTaskDetails({
           <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">
             {finalImagePrompt ?? '历史任务未记录此信息'}
           </span>
-          {finalImagePrompt && (
+          {finalImagePrompt && onCopyPrompt && (
             <Button
               type="button"
               variant="ghost"
@@ -437,12 +437,12 @@ export function DesignTaskDetails({
       </DetailField>
 
       <div className="flex flex-wrap gap-1.5">
-        {retryable && (
+        {retryable && onRetry && (
           <Button type="button" variant="outline" size="sm" onClick={() => onRetry(job.id)}>
             <RotateCcw aria-hidden="true" />重试
           </Button>
         )}
-        {job.status === 'succeeded' && job.outputAssetId && (
+        {job.status === 'succeeded' && job.outputAssetId && onContinueFromVersion && (
           <Button type="button" variant="outline" size="sm" onClick={() => onContinueFromVersion(job.outputAssetId!)}>
             基于此版本继续
           </Button>
@@ -450,4 +450,19 @@ export function DesignTaskDetails({
       </div>
     </section>
   )
+}
+
+/** 保持旧 Design Inspector 的必填动作合同不因 Canvas 复用而放宽。 */
+export interface DesignTaskDetailsProps extends Omit<
+  DesignTaskDetailsViewProps,
+  'onCopyPrompt' | 'onRetry' | 'onContinueFromVersion'
+> {
+  onCopyPrompt: (prompt: string) => void
+  onRetry: (jobId: string) => void
+  onContinueFromVersion: (assetId: string) => void
+}
+
+/** 旧 Design Inspector 使用的兼容入口。 */
+export function DesignTaskDetails(props: DesignTaskDetailsProps): React.ReactElement {
+  return <DesignTaskDetailsView {...props} />
 }

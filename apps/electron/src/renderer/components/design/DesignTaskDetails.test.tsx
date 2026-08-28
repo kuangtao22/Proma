@@ -7,6 +7,7 @@ import type { DesignAdapter } from '@/lib/design-adapter'
 import {
   createDesignTaskDetailsController,
   DesignTaskDetails,
+  DesignTaskDetailsView,
   getDesignThinkingMessage,
   partitionDesignTrace,
 } from './DesignTaskDetails'
@@ -103,6 +104,28 @@ describe('Design 任务详情', () => {
 
     expect(getDesignThinkingMessage(detailsState)).toBe('模型未返回原始 Thinking')
     expect(partitionDesignTrace(detailsState.details?.trace).thinking).toEqual([])
+  })
+
+  test('Given Canvas 复用任务详情视图 When 隐藏旧 Design 动作 Then 仍展示提示词与延迟详情入口', () => {
+    const html = renderToStaticMarkup(
+      <DesignTaskDetailsView
+        job={createJob()}
+        detailsState={{
+          phase: 'ready',
+          details: createDetails(),
+          traceLoaded: false,
+          traceLoading: false,
+        }}
+        onLoadDetails={() => undefined}
+        onLoadTrace={() => undefined}
+        onCopyPrompt={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('精确生图提示词')
+    expect(html).toContain('模型原始 Thinking')
+    expect(html).toContain('执行日志')
+    expect(html).not.toContain('基于此版本继续')
   })
 
   test('Given 首次打开任务详情 When 加载 Then 只请求轻量详情；展开后才请求 trace', async () => {
