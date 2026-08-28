@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { createStore } from 'jotai'
 import {
+  canvasImageModuleStatesAtom,
   canvasAgentActiveInternalInvalidSessionIdsAtom,
   canvasAgentInternalInvalidSessionIdsAtom,
   canvasAgentLifecycleAtom,
@@ -13,10 +14,13 @@ import {
   canvasAgentRunningSessionIdsAtom,
   canvasAgentRunGenerationsAtom,
   canvasAgentAuthoritativeRunningSessionIdsAtom,
+  createCanvasImageModuleKey,
+  createInitialCanvasImageModuleState,
   createInitialNativeCanvasState,
   createNativeCanvasKey,
   createNativeCanvasWorkbenchChangeUpdate,
   nativeCanvasStatesAtom,
+  updateCanvasImageModuleStateAtom,
   updateNativeCanvasStateAtom,
   isCanvasAgentGenerationCurrent,
   isCanvasAgentHandoffGenerationCurrent,
@@ -29,6 +33,46 @@ import {
 } from './agent-atoms'
 
 describe('原生 Canvas 状态隔离', () => {
+  test('Given 完整四元身份 When 创建图片模块 key Then 结构编码保持唯一且拒绝含分隔符的非法 ID', () => {
+    const first = createCanvasImageModuleKey({
+      projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', imageModuleId: 'module-a',
+    })
+    const second = createCanvasImageModuleKey({
+      projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-b', imageModuleId: 'module-a',
+    })
+
+    expect(first).not.toBe(second)
+    expect(JSON.parse(first)).toEqual(['project-a', 'canvas-a', 'node-a', 'module-a'])
+    expect(() => createCanvasImageModuleKey({
+      projectId: 'project:a', canvasId: 'canvas-a', nodeId: 'node-a', imageModuleId: 'module-a',
+    })).toThrow('CANVAS_IMAGE_TARGET_INVALID')
+  })
+
+  test('Given 两个图片模块 When 更新 A 的草稿 Then B 的快照和临时态不被复用', () => {
+    const store = createStore()
+    const keyA = createCanvasImageModuleKey({
+      projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', imageModuleId: 'module-a',
+    })
+    const keyB = createCanvasImageModuleKey({
+      projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-b', imageModuleId: 'module-b',
+    })
+
+    store.set(updateCanvasImageModuleStateAtom, {
+      key: keyA,
+      update: { phase: 'ready', previewAssetId: 'asset-a' },
+    })
+    store.set(updateCanvasImageModuleStateAtom, { key: keyB, update: { phase: 'loading' } })
+
+    const states = store.get(canvasImageModuleStatesAtom)
+    expect(states.get(keyA)).toMatchObject({ phase: 'ready', previewAssetId: 'asset-a' })
+    expect(states.get(keyB)).toMatchObject({ phase: 'loading', previewAssetId: null })
+    expect(createInitialCanvasImageModuleState().taskDetails)
+      .not.toBe(createInitialCanvasImageModuleState().taskDetails)
+    expect(Object.keys(createInitialCanvasImageModuleState()).sort()).toEqual([
+      'draft', 'error', 'phase', 'previewAssetId', 'saveState', 'snapshot', 'taskDetails',
+    ])
+  })
+
   test.each([
     {
       name: 'dirty 工作台收到其他节点完成通知',

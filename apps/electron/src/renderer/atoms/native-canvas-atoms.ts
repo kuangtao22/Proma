@@ -1,4 +1,15 @@
-import type { CanvasMutation, CanvasWorkspaceSnapshot, SDKMessage } from '@proma/shared'
+import {
+  parseCanvasImageTarget,
+  type CanvasImageAspectRatio,
+  type CanvasImageModuleSnapshot,
+  type CanvasImageSize,
+  type CanvasImageTarget,
+  type CanvasMutation,
+  type CanvasWorkspaceSnapshot,
+  type DesignContextMode,
+  type DesignTaskDetails,
+  type SDKMessage,
+} from '@proma/shared'
 import { atom } from 'jotai'
 import type { Store } from 'jotai/vanilla/store'
 import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
@@ -13,6 +24,69 @@ export type NativeCanvasPhase = 'idle' | 'loading' | 'ready' | 'error'
 
 /** 原生 Canvas mutation 保存阶段。 */
 export type NativeCanvasSaveState = 'saved' | 'dirty' | 'saving' | 'failed' | 'conflict'
+
+/** Canvas 生图模块加载阶段。 */
+export type CanvasImageModulePhase = 'idle' | 'loading' | 'ready' | 'error'
+
+/** Canvas 生图模块配置保存阶段。 */
+export type CanvasImageModuleSaveState = 'saved' | 'dirty' | 'saving' | 'failed' | 'conflict'
+
+/** Canvas 生图模块可编辑字段及本地 dirty 标记。 */
+export interface CanvasImageModuleDraft {
+  prompt: string
+  selectedModelProfileId: string | null
+  aspectRatio: CanvasImageAspectRatio
+  imageSize: CanvasImageSize
+  contextMode: DesignContextMode
+  dirty: boolean
+}
+
+/** 单个任务详情的按需加载状态。 */
+export interface CanvasImageTaskDetailsState {
+  phase: 'idle' | 'loading' | 'ready' | 'failed'
+  details: DesignTaskDetails | null
+  error: string | null
+}
+
+/** 单个四元身份图片模块的 Renderer 状态。 */
+export interface CanvasImageModuleViewState {
+  snapshot: CanvasImageModuleSnapshot | null
+  draft: CanvasImageModuleDraft | null
+  phase: CanvasImageModulePhase
+  saveState: CanvasImageModuleSaveState
+  error: string | null
+  previewAssetId: string | null
+  taskDetails: Map<string, CanvasImageTaskDetailsState>
+}
+
+/** 创建互不共享任务详情 Map 的图片模块初始状态。 */
+export function createInitialCanvasImageModuleState(): CanvasImageModuleViewState {
+  return {
+    snapshot: null,
+    draft: null,
+    phase: 'idle',
+    saveState: 'saved',
+    error: null,
+    previewAssetId: null,
+    taskDetails: new Map(),
+  }
+}
+
+/**
+ * 创建 Canvas 图片模块完整身份键。
+ * @param target 项目、Canvas、节点和图片模块四元身份。
+ * @returns 经过安全 ID 校验且无分隔符碰撞的结构化键。
+ */
+export function createCanvasImageModuleKey(target: CanvasImageTarget): string {
+  /** 复用共享边界校验，避免 Renderer 接受主进程不会接受的身份。 */
+  const validated = parseCanvasImageTarget(target)
+  return JSON.stringify([
+    validated.projectId,
+    validated.canvasId,
+    validated.nodeId,
+    validated.imageModuleId,
+  ])
+}
 
 /** 单个节点工作台尚未提交的轻量草稿状态。 */
 export interface NativeCanvasWorkbenchDraftState {
@@ -99,6 +173,46 @@ export function createNativeCanvasWorkbenchChangeUpdate(
 
 /** 所有已挂载原生 Canvas 的隔离状态。 */
 export const nativeCanvasStatesAtom = atom<Map<string, NativeCanvasState>>(new Map())
+
+/** 所有已挂载 Canvas 图片模块按完整四元身份隔离的状态。 */
+export const canvasImageModuleStatesAtom = atom<Map<string, CanvasImageModuleViewState>>(new Map())
+
+/** 图片模块状态支持局部对象或基于当前值的函数更新。 */
+export type CanvasImageModuleStateUpdate = Partial<CanvasImageModuleViewState>
+  | ((current: CanvasImageModuleViewState) => Partial<CanvasImageModuleViewState>)
+
+/** 单个 Canvas 图片模块状态更新输入。 */
+export interface UpdateCanvasImageModuleStateInput {
+  key: string
+  update: CanvasImageModuleStateUpdate
+}
+
+/** 只复制 Map 与目标图片模块状态的原子更新入口。 */
+export const updateCanvasImageModuleStateAtom = atom(
+  null,
+  (get, set, input: UpdateCanvasImageModuleStateInput): void => {
+    /** 未加载过的 key 获得独立初始状态，禁止跨节点共享 taskDetails。 */
+    const states = get(canvasImageModuleStatesAtom)
+    const current = states.get(input.key) ?? createInitialCanvasImageModuleState()
+    const update = typeof input.update === 'function' ? input.update(current) : input.update
+    const nextStates = new Map(states)
+    nextStates.set(input.key, { ...current, ...update })
+    set(canvasImageModuleStatesAtom, nextStates)
+  },
+)
+
+/** 删除已失效图片模块状态的输入键。 */
+export const removeCanvasImageModuleStateAtom = atom(
+  null,
+  (get, set, key: string): void => {
+    /** 无目标时保留原 Map 引用，避免无意义 Renderer 更新。 */
+    const states = get(canvasImageModuleStatesAtom)
+    if (!states.has(key)) return
+    const nextStates = new Map(states)
+    nextStates.delete(key)
+    set(canvasImageModuleStatesAtom, nextStates)
+  },
+)
 
 /** 全局流事件按 sessionId 保存的最小 Canvas owner，切换 Canvas 或关闭面板不会清理。 */
 export const canvasAgentOwnersAtom = atom<Map<string, CanvasAgentOwner>>(new Map())
