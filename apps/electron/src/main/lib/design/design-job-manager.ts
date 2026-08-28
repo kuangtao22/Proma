@@ -9,6 +9,7 @@ import type {
   DesignCanvasDocument,
   DesignCanvasNode,
   DesignJobRecord,
+  DesignJobTarget,
   DesignMutation,
   DesignPoint,
   DesignTaskDetails,
@@ -50,10 +51,9 @@ interface DesignJobSettings {
   agentModelId?: string
 }
 
-/** journal 额外保留重试所需的节点与蒙版输入。 */
-interface StoredDesignJob extends DesignJobRecord {
-  nodeId: string
-  position: DesignPoint
+/** journal 额外保留重试、布局提交和恢复所需的内部字段。 */
+interface StoredDesignJob extends Omit<DesignJobRecord, 'target'> {
+  target: DesignJobTarget
   maskAnnotationId?: string
   /** queued journal 与占位节点两步提交的恢复标记。 */
   placementState?: 'pending' | 'ready'
@@ -78,18 +78,22 @@ const STORED_JOB_FIELDS = new Set([
   'traceState', 'executionSessionCleanupState', 'contextReferences', 'designSummary',
   'finalImagePrompt', 'rawThinkingAvailable', 'contextWarning', 'startedAt', 'completedAt',
   'imageModelSnapshot',
-  'nodeId', 'position', 'maskAnnotationId', 'placementState', 'terminalState',
+  'target', 'generationConstraints', 'canvasInputReferences', 'canvasImageConfigRevision',
+  'maskAnnotationId', 'placementState', 'terminalState',
   'replacedByJobId', 'retryState', 'deletionState',
 ])
 /** journal 中必须始终存在的基础字段。 */
 const REQUIRED_STORED_JOB_FIELDS = [
   'id', 'creativeTaskId', 'attemptNumber', 'projectId', 'action', 'status', 'prompt',
-  'originalRequest', 'contextMode', 'createdAt', 'updatedAt', 'nodeId', 'position',
+  'originalRequest', 'contextMode', 'createdAt', 'updatedAt', 'target',
 ] as const
-/** 旧 journal 只允许历史字段，半升级记录不会被当作兼容输入。 */
+/** target 引入前的 journal 字段，存在 target 时绝不走兼容分支。 */
 const LEGACY_STORED_JOB_FIELDS = new Set([
-  'id', 'projectId', 'sessionId', 'action', 'status', 'prompt', 'sourceSessionId',
+  'id', 'creativeTaskId', 'attemptNumber', 'projectId', 'sessionId', 'action', 'status',
+  'prompt', 'originalRequest', 'contextMode', 'sourceAgentMessageId', 'sourceSessionId',
   'sourceAssetId', 'parentAssetId', 'outputAssetId', 'error', 'createdAt', 'updatedAt',
+  'traceState', 'executionSessionCleanupState', 'contextReferences', 'designSummary',
+  'finalImagePrompt', 'rawThinkingAvailable', 'contextWarning', 'startedAt', 'completedAt',
   'imageModelSnapshot', 'nodeId', 'position', 'maskAnnotationId', 'placementState',
   'terminalState', 'replacedByJobId', 'retryState', 'deletionState',
 ])
@@ -228,11 +232,59 @@ export class DesignJobManager {
 
   /** 创建 queued journal 和占位节点，不等待 Agent 运行。 */
   create(input: CreateDesignJobInput): DesignJobRecord {
+    if (input.target?.kind === 'canvas-image') {
+      throw new Error('Canvas 图片任务必须使用独立创建入口')
+    }
     /** 可信模型校验必须早于 Store 读取、ID 生成、journal 和占位节点写入。 */
     const imageModelSnapshot = this.runImageModelValidation(
       () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
     )
     return this.createInternal(input, imageModelSnapshot)
+  }
+
+  /** 创建只归属 Canvas 图片模块的 queued journal，不修改旧 Design 节点。 */
+  createCanvasImage(input: CreateDesignJobInput): DesignJobRecord {
+    if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
+    const prompt = input.prompt.trim()
+    if (!prompt) throw new Error('设计任务提示词不能为空')
+    if (!input.generationConstraints || input.canvasImageConfigRevision === undefined) {
+      throw new Error('Canvas 图片任务缺少生成快照')
+    }
+    /** 可信模型校验必须早于 ID、journal 和事件副作用。 */
+    const imageModelSnapshot = this.runImageModelValidation(
+      () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
+    )
+    /** 只读取旧 Design revision 作为兼容事件序列，不产生结构 mutation。 */
+    const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
+    const id = this.createId()
+    const creativeTaskId = this.createCreativeTaskId()
+    if (!isSafeDesignStableId(id) || !isSafeDesignStableId(creativeTaskId) || id === creativeTaskId) {
+      throw new Error('Design 创作任务 ID 非法')
+    }
+    const timestamp = this.now()
+    const job: StoredDesignJob = {
+      id,
+      creativeTaskId,
+      attemptNumber: 1,
+      projectId: input.projectId,
+      target: { ...input.target },
+      action: input.action,
+      status: 'queued',
+      prompt,
+      originalRequest: prompt,
+      contextMode: input.contextMode,
+      generationConstraints: { ...input.generationConstraints },
+      canvasInputReferences: input.canvasInputReferences?.map((reference) => ({ ...reference })),
+      canvasImageConfigRevision: input.canvasImageConfigRevision,
+      imageModelSnapshot: { ...imageModelSnapshot },
+      traceState: 'pending',
+      executionSessionCleanupState: 'pending',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }
+    this.writeJob(job)
+    this.emit(job, current.revision)
+    return job
   }
 
   /** 查询已加载或磁盘可发现的任务。 */
@@ -418,7 +470,7 @@ export class DesignJobManager {
       }
       const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
       const ownsNode = current.nodes.some((node) => (
-        node.id === previous.nodeId && node.kind === 'job' && node.jobId === previous.id
+        node.id === requireDesignCanvasTarget(previous).nodeId && node.kind === 'job' && node.jobId === previous.id
       ))
       if (!ownsNode) throw new Error('设计任务节点已被其他任务接管')
       const replacementId = this.createId()
@@ -451,7 +503,7 @@ export class DesignJobManager {
         throw new Error('当前设计任务不可删除')
       }
       const current = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
-      const ownedNode = current.nodes.find((node) => node.id === job.nodeId)
+      const ownedNode = current.nodes.find((node) => node.id === requireDesignCanvasTarget(job).nodeId)
       if (!ownedNode || ownedNode.kind !== 'job' || ownedNode.jobId !== job.id) {
         throw new Error('设计任务节点已被其他任务接管')
       }
@@ -528,7 +580,7 @@ export class DesignJobManager {
       if (job.placementState === 'pending') {
         const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
         const placeholderExists = document.nodes.some((node) => (
-          node.id === job.nodeId && node.kind === 'job' && node.jobId === job.id
+          node.id === requireDesignCanvasTarget(job).nodeId && node.kind === 'job' && node.jobId === job.id
         ))
         if (!placeholderExists) {
           this.deleteJobJournal(job)
@@ -623,7 +675,7 @@ export class DesignJobManager {
     if (!isSafeDesignStableId(creativeTaskId) || creativeTaskId === id) {
       throw new Error('Design 创作任务 ID 非法')
     }
-    /** 迁移期间同时接受旧 position 与新的 design-canvas 创建目标。 */
+    /** 旧 position 与新的 design-canvas 创建目标统一规范化为持久化 target。 */
     const designCanvasPosition = input.target?.kind === 'design-canvas'
       ? input.target.position
       : input.position
@@ -634,6 +686,11 @@ export class DesignJobManager {
       creativeTaskId,
       attemptNumber: replaced ? replaced.attemptNumber + 1 : 1,
       projectId: input.projectId,
+      target: {
+        kind: 'design-canvas',
+        nodeId: replaced ? requireDesignCanvasTarget(replaced).nodeId : `design-job-${id}`,
+        position: replaced ? requireDesignCanvasTarget(replaced).position : designCanvasPosition,
+      },
       action: input.action,
       status: 'queued',
       prompt,
@@ -646,21 +703,19 @@ export class DesignJobManager {
       ...(input.sourceAssetId ? { sourceAssetId: input.sourceAssetId, parentAssetId: input.sourceAssetId } : {}),
       ...(input.maskAnnotationId ? { maskAnnotationId: input.maskAnnotationId } : {}),
       placementState: 'pending',
-      nodeId: replaced?.nodeId ?? `design-job-${id}`,
-      position: replaced?.position ?? designCanvasPosition,
       createdAt: now,
       updatedAt: now,
     }
     this.writeJob(job)
     const node: DesignCanvasNode = {
-      id: job.nodeId,
+      id: requireDesignCanvasTarget(job).nodeId,
       kind: 'job',
       jobId: job.id,
-      position: job.position,
+      position: requireDesignCanvasTarget(job).position,
       width: 320,
       height: 240,
       zIndex: replaced
-        ? current.nodes.find((item) => item.id === replaced.nodeId)?.zIndex ?? current.nodes.length
+        ? current.nodes.find((item) => item.id === requireDesignCanvasTarget(replaced).nodeId)?.zIndex ?? current.nodes.length
         : current.nodes.length,
     }
     let authoritativeRevision: number
@@ -860,7 +915,7 @@ export class DesignJobManager {
   /** 完成已持久化的任务删除意图，允许重启后幂等续作。 */
   private completeDeletion(job: StoredDesignJob): DesignCanvasDocument {
     const current = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
-    const node = current.nodes.find((candidate) => candidate.id === job.nodeId)
+    const node = current.nodes.find((candidate) => candidate.id === requireDesignCanvasTarget(job).nodeId)
     if (!node) {
       this.deleteTaskPersistence(job)
       return current
@@ -942,7 +997,7 @@ export class DesignJobManager {
         return
       }
       const current = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
-      const placeholder = current.nodes.find((node) => node.id === job.nodeId && node.jobId === job.id)
+      const placeholder = current.nodes.find((node) => node.id === requireDesignCanvasTarget(job).nodeId && node.jobId === job.id)
       if (!placeholder) {
         batch.rollback()
         this.updateStatus(latest, 'failed', { error: '设计任务占位节点不存在' })
@@ -1007,7 +1062,7 @@ export class DesignJobManager {
       asset.id === outputAssetId && asset.sourceJobId === job.id
     ))
     const nodeExists = document.nodes.some((node) => (
-      node.id === job.nodeId && node.kind === 'asset' && node.assetId === outputAssetId
+      node.id === requireDesignCanvasTarget(job).nodeId && node.kind === 'asset' && node.assetId === outputAssetId
     ))
     return assetExists && nodeExists
   }
@@ -1049,7 +1104,7 @@ export class DesignJobManager {
       if (existing.projectId !== previous.projectId) throw new Error('替代设计任务不属于当前项目')
       const current = this.dependencies.store.requireStableAuthoritativeDocument(previous.projectId)
       const replacementOwnsNode = current.nodes.some((node) => (
-        node.id === previous.nodeId && node.kind === 'job' && node.jobId === replacementId
+        node.id === requireDesignCanvasTarget(previous).nodeId && node.kind === 'job' && node.jobId === replacementId
       ))
       if (replacementOwnsNode) {
         const ready = existing.placementState === 'ready'
@@ -1060,7 +1115,7 @@ export class DesignJobManager {
         return ready
       }
       const previousOwnsNode = current.nodes.some((node) => (
-        node.id === previous.nodeId && node.kind === 'job' && node.jobId === previous.id
+        node.id === requireDesignCanvasTarget(previous).nodeId && node.kind === 'job' && node.jobId === previous.id
       ))
       if (!previousOwnsNode || existing.placementState !== 'pending') {
         throw new Error('设计任务节点已被其他任务接管')
@@ -1070,7 +1125,7 @@ export class DesignJobManager {
     }
     const current = this.dependencies.store.requireStableAuthoritativeDocument(previous.projectId)
     const ownsNode = current.nodes.some((node) => (
-      node.id === previous.nodeId && node.kind === 'job' && node.jobId === previous.id
+      node.id === requireDesignCanvasTarget(previous).nodeId && node.kind === 'job' && node.jobId === previous.id
     ))
     if (!ownsNode) throw new Error('设计任务节点已被其他任务接管')
     const replacement = this.createInternal({
@@ -1081,7 +1136,10 @@ export class DesignJobManager {
       ...(previous.sourceSessionId ? { sourceSessionId: previous.sourceSessionId } : {}),
       ...(previous.sourceAssetId ? { sourceAssetId: previous.sourceAssetId } : {}),
       ...(previous.maskAnnotationId ? { maskAnnotationId: previous.maskAnnotationId } : {}),
-      position: previous.position,
+      target: {
+        kind: 'design-canvas',
+        position: requireDesignCanvasTarget(previous).position,
+      },
     }, previous.imageModelSnapshot, previous, replacementId)
     this.finalizeRetryIntent(previous)
     return replacement
@@ -1263,6 +1321,29 @@ function isImageModelSnapshot(value: unknown): value is ImageGenerationModelSnap
     && Object.keys(value).length === 5
 }
 
+/** 严格校验新 journal 的双目标联合。 */
+function isDesignJobTarget(value: unknown): value is DesignJobTarget {
+  if (!isRecord(value)) return false
+  if (value.kind === 'design-canvas') {
+    return Object.keys(value).length === 3
+      && isSafeDesignStableId(value.nodeId)
+      && isStoredPoint(value.position)
+  }
+  return value.kind === 'canvas-image'
+    && Object.keys(value).length === 4
+    && isSafeDesignStableId(value.canvasId)
+    && isSafeDesignStableId(value.nodeId)
+    && isSafeDesignStableId(value.imageModuleId)
+}
+
+/** Design 专属操作必须显式取得旧画布目标，禁止 Canvas 任务误入布局逻辑。 */
+function requireDesignCanvasTarget(
+  job: StoredDesignJob,
+): Extract<DesignJobTarget, { kind: 'design-canvas' }> {
+  if (job.target.kind !== 'design-canvas') throw new Error('Canvas 图片任务不属于旧 Design 画布')
+  return job.target
+}
+
 /** 严格解析完整 Design Job journal schema。 */
 function isStoredDesignJob(value: unknown): value is StoredDesignJob {
   if (!isRecord(value)) return false
@@ -1292,7 +1373,7 @@ function isStoredDesignJob(value: unknown): value is StoredDesignJob {
   if (!['generate', 'edit'].includes(String(value.action))) return false
   if (!['queued', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(value.status))) return false
   if (typeof value.prompt !== 'string' || value.prompt.trim().length === 0) return false
-  if (!isSafeDesignStableId(value.nodeId) || !isStoredPoint(value.position)) return false
+  if (!isDesignJobTarget(value.target)) return false
   if (typeof value.createdAt !== 'number' || !Number.isFinite(value.createdAt)
     || typeof value.updatedAt !== 'number' || !Number.isFinite(value.updatedAt)) return false
   for (const field of [
@@ -1303,60 +1384,16 @@ function isStoredDesignJob(value: unknown): value is StoredDesignJob {
   }
   if (value.error !== undefined && typeof value.error !== 'string') return false
   if (value.imageModelSnapshot !== undefined && !isImageModelSnapshot(value.imageModelSnapshot)) return false
-  if (value.placementState !== undefined && value.placementState !== 'pending' && value.placementState !== 'ready') return false
-  if (value.terminalState !== undefined) {
-    if (!isRecord(value.terminalState)
-      || Object.keys(value.terminalState).length !== 2
-      || value.terminalState.status !== 'pending'
-      || !isSafeDesignStableId(value.terminalState.outputAssetId)) return false
+  if (value.generationConstraints !== undefined) {
+    if (!isRecord(value.generationConstraints)
+      || Object.keys(value.generationConstraints).length !== 2
+      || !['1:1', '16:9', '4:3', '9:16', '3:4'].includes(String(value.generationConstraints.aspectRatio))
+      || !['auto', '1K', '2K', '4K'].includes(String(value.generationConstraints.imageSize))) return false
   }
-  if (value.retryState !== undefined) {
-    if (!isRecord(value.retryState)
-      || Object.keys(value.retryState).length !== 1
-      || value.retryState.status !== 'pending'
-      || !isSafeDesignStableId(value.replacedByJobId)) return false
-  }
-  if (value.deletionState !== undefined) {
-    if (!isRecord(value.deletionState)
-      || Object.keys(value.deletionState).length !== 1
-      || value.deletionState.status !== 'pending'
-      || !TERMINAL_JOB_STATUSES.has(value.status as DesignJobRecord['status'])) return false
-  }
-  if (value.action === 'edit' && !isSafeDesignStableId(value.sourceAssetId)) return false
-  if (value.status === 'succeeded' && !isSafeDesignStableId(value.outputAssetId)) return false
-  return true
-}
-
-/** 严格校验升级前的历史 journal，不接受任何半升级新字段。 */
-function isLegacyStoredDesignJob(value: unknown): value is Omit<
-  StoredDesignJob,
-  | 'creativeTaskId'
-  | 'attemptNumber'
-  | 'originalRequest'
-  | 'contextMode'
-  | 'traceState'
-  | 'executionSessionCleanupState'
-> {
-  if (!isRecord(value)) return false
-  if (Object.keys(value).some((field) => !LEGACY_STORED_JOB_FIELDS.has(field))) return false
-  if (REQUIRED_STORED_JOB_FIELDS
-    .filter((field) => !['creativeTaskId', 'attemptNumber', 'originalRequest', 'contextMode'].includes(field))
-    .some((field) => !Object.hasOwn(value, field))) return false
-  if (!isSafeDesignStableId(value.id) || !isSafeDesignStableId(value.projectId)) return false
-  if (!['generate', 'edit'].includes(String(value.action))) return false
-  if (!['queued', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(value.status))) return false
-  if (typeof value.prompt !== 'string' || value.prompt.trim().length === 0) return false
-  if (!isSafeDesignStableId(value.nodeId) || !isStoredPoint(value.position)) return false
-  if (typeof value.createdAt !== 'number' || !Number.isFinite(value.createdAt)
-    || typeof value.updatedAt !== 'number' || !Number.isFinite(value.updatedAt)) return false
-  for (const field of [
-    'sessionId', 'sourceSessionId', 'sourceAssetId', 'parentAssetId', 'outputAssetId',
-    'maskAnnotationId', 'replacedByJobId',
-  ] as const) {
-    if (!isOptionalStableId(value[field])) return false
-  }
-  if (value.error !== undefined && typeof value.error !== 'string') return false
-  if (value.imageModelSnapshot !== undefined && !isImageModelSnapshot(value.imageModelSnapshot)) return false
+  if (value.canvasImageConfigRevision !== undefined
+    && (!Number.isSafeInteger(value.canvasImageConfigRevision)
+      || (value.canvasImageConfigRevision as number) < 0)) return false
+  if (value.canvasInputReferences !== undefined && !Array.isArray(value.canvasInputReferences)) return false
   if (value.placementState !== undefined && value.placementState !== 'pending' && value.placementState !== 'ready') return false
   if (value.terminalState !== undefined) {
     if (!isRecord(value.terminalState)
@@ -1388,16 +1425,26 @@ function isLegacyStoredDesignJob(value: unknown): value is Omit<
  */
 function normalizeStoredDesignJob(value: unknown): StoredDesignJob | undefined {
   if (isStoredDesignJob(value)) return value
-  if (!isLegacyStoredDesignJob(value)) return undefined
-  return {
-    ...value,
-    creativeTaskId: value.id,
-    attemptNumber: 1,
-    originalRequest: value.prompt,
-    contextMode: 'none',
-    traceState: value.sessionId ? 'unavailable' : undefined,
-    executionSessionCleanupState: value.sessionId ? 'completed' : undefined,
+  if (!isRecord(value)
+    || Object.hasOwn(value, 'target')
+    || Object.keys(value).some((field) => !LEGACY_STORED_JOB_FIELDS.has(field))
+    || !isSafeDesignStableId(value.nodeId)
+    || !isStoredPoint(value.position)) return undefined
+  /** 旧布局字段只用于构造内存 target，不原样保留进新 journal。 */
+  const { nodeId, position, ...legacy } = value
+  /** 缺少创作任务字段的最旧记录补入稳定兼容默认值。 */
+  const candidate = {
+    ...legacy,
+    target: { kind: 'design-canvas' as const, nodeId, position },
+    creativeTaskId: legacy.creativeTaskId ?? legacy.id,
+    attemptNumber: legacy.attemptNumber ?? 1,
+    originalRequest: legacy.originalRequest ?? legacy.prompt,
+    contextMode: legacy.contextMode ?? 'none',
+    traceState: legacy.traceState ?? (legacy.sessionId ? 'unavailable' : undefined),
+    executionSessionCleanupState: legacy.executionSessionCleanupState
+      ?? (legacy.sessionId ? 'completed' : undefined),
   }
+  return isStoredDesignJob(candidate) ? candidate : undefined
 }
 
 /** 判断未知值是否为普通对象。 */

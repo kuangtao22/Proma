@@ -180,8 +180,41 @@ describe('Design Job Manager', () => {
     expect(harness.manager.list('project-1')).toContainEqual(expect.objectContaining({
       id: 'job-legacy', creativeTaskId: 'job-legacy', attemptNumber: 1,
       originalRequest: '旧任务', contextMode: 'none',
+      target: {
+        kind: 'design-canvas',
+        nodeId: 'node-legacy',
+        position: { x: 0, y: 0 },
+      },
     }))
     expect(JSON.parse(readFileSync(legacyPath, 'utf8'))).toEqual(legacy)
+  })
+
+  test('Given canvas-image 目标 When 创建 Job Then 不修改旧 Design nodes', () => {
+    /** 创建前的旧 Design 节点快照。 */
+    const before = structuredClone(document.nodes)
+    const job = harness.manager.createCanvasImage({
+      projectId: 'project-1',
+      action: 'generate',
+      prompt: '生成首页主视觉',
+      contextMode: 'auto',
+      imageModelProfileId: 'profile-test',
+      target: {
+        kind: 'canvas-image',
+        canvasId: 'canvas-1',
+        nodeId: 'image-node-1',
+        imageModuleId: 'image-module-1',
+      },
+      generationConstraints: { aspectRatio: '16:9', imageSize: '2K' },
+      canvasImageConfigRevision: 0,
+    })
+
+    expect(job.target).toEqual({
+      kind: 'canvas-image',
+      canvasId: 'canvas-1',
+      nodeId: 'image-node-1',
+      imageModuleId: 'image-module-1',
+    })
+    expect(document.nodes).toEqual(before)
   })
 
   test('Given 重启留下 running 内部会话 When 恢复 Then 中断后继续 trace 与会话清理', async () => {

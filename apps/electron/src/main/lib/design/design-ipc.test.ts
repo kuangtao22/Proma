@@ -526,7 +526,8 @@ describe('Design IPC', () => {
     await expect(invoke(
       fixture.handlers, DESIGN_IPC_CHANNELS.CREATE_JOB, fixture.senders[0]!, {
         projectId: 'project-1', action: 'generate', prompt: '生成',
-        contextMode: 'auto', imageModelProfileId: 'forged', position: { x: 1, y: 2 },
+        contextMode: 'auto', imageModelProfileId: 'forged',
+        target: { kind: 'design-canvas', position: { x: 1, y: 2 } },
       },
     )).rejects.toThrow('生图模型不存在: forged')
     expect(fixture.guardProjects).toEqual(['project-1'])
@@ -630,7 +631,8 @@ describe('Design IPC', () => {
       fixture.senders[0]!,
       {
         projectId: 'project-1', action: 'generate', prompt: '生成',
-        contextMode: 'auto', imageModelProfileId: 'profile-flash', position: { x: 1, y: 2 },
+        contextMode: 'auto', imageModelProfileId: 'profile-flash',
+        target: { kind: 'design-canvas', position: { x: 1, y: 2 } },
       },
     )
     const cancelled = await invoke(

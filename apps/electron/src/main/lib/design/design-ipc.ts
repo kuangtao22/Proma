@@ -588,7 +588,7 @@ function parseCreateJobInput(value: unknown): CreateDesignJobInput {
   if (!isRecord(value)
     || !hasOnlyKeys(value, [
       'projectId', 'action', 'prompt', 'contextMode', 'imageModelProfileId', 'sourceSessionId', 'sourceAssetId',
-      'maskAnnotationId', 'position',
+      'maskAnnotationId', 'target',
     ])
     || !isNonEmptyString(value.projectId)
     || (value.action !== 'generate' && value.action !== 'edit')
@@ -598,7 +598,10 @@ function parseCreateJobInput(value: unknown): CreateDesignJobInput {
     || (value.sourceSessionId !== undefined && !isNonEmptyString(value.sourceSessionId))
     || (value.sourceAssetId !== undefined && !isNonEmptyString(value.sourceAssetId))
     || (value.maskAnnotationId !== undefined && !isNonEmptyString(value.maskAnnotationId))
-    || !isPoint(value.position)) throw new Error('Design 请求结构无效')
+    || !isRecord(value.target)
+    || !hasOnlyKeys(value.target, ['kind', 'position'])
+    || value.target.kind !== 'design-canvas'
+    || !isPoint(value.target.position)) throw new Error('Design 请求结构无效')
   return {
     projectId: value.projectId,
     action: value.action,
@@ -608,7 +611,7 @@ function parseCreateJobInput(value: unknown): CreateDesignJobInput {
     ...(value.sourceSessionId ? { sourceSessionId: value.sourceSessionId } : {}),
     ...(value.sourceAssetId ? { sourceAssetId: value.sourceAssetId } : {}),
     ...(value.maskAnnotationId ? { maskAnnotationId: value.maskAnnotationId } : {}),
-    position: value.position,
+    target: { kind: 'design-canvas', position: value.target.position },
   }
 }
 

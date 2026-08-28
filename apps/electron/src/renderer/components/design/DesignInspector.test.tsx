@@ -526,7 +526,7 @@ describe('Design Inspector 纯业务契约', () => {
       prompt: '生成海报\n\n[PROMA_DESIGN_CONSTRAINTS]\n{"aspectRatio":"3:4","imageSize":"4K"}',
       contextMode: 'none',
       imageModelProfileId: 'profile-flash',
-      position: { x: 5, y: 6 },
+      target: { kind: 'design-canvas', position: { x: 5, y: 6 } },
     })
     expect(editInput).toEqual({
       projectId: 'project-1',
@@ -536,7 +536,7 @@ describe('Design Inspector 纯业务契约', () => {
       imageModelProfileId: 'profile-flash',
       sourceAssetId: 'asset-1',
       maskAnnotationId: 'mask-1',
-      position: { x: 7, y: 8 },
+      target: { kind: 'design-canvas', position: { x: 7, y: 8 } },
     })
   })
 

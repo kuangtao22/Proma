@@ -86,7 +86,7 @@ export function createDesignGenerationJobInput(
     prompt: serializeDesignGenerationPrompt(prompt, aspectRatio, imageSize),
     contextMode,
     imageModelProfileId,
-    position,
+    target: { kind: 'design-canvas', position },
   }
 }
 
@@ -108,7 +108,7 @@ export function createDesignEditJobInput(
     imageModelProfileId,
     sourceAssetId,
     ...(maskAnnotationId ? { maskAnnotationId } : {}),
-    position,
+    target: { kind: 'design-canvas', position },
   }
 }
 
