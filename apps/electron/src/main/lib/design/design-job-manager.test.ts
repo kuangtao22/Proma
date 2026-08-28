@@ -392,6 +392,32 @@ describe('Design Job Manager', () => {
     expect(harness.createdSessions).toEqual([])
   })
 
+  test('Given generate 任务伪造来源素材 When 直接创建 Then 在任何解析或持久化副作用前拒绝', async () => {
+    const input = { ...createCanvasImageInput('a'), sourceAssetId: 'asset-source' }
+
+    await expect(harness.manager.createCanvasImage(input)).rejects.toThrow('生成任务不得包含来源素材')
+
+    expect(harness.targetAssertionCount).toBe(0)
+    expect(harness.authoritativeReadCount).toBe(0)
+    expect(harness.modelResolutionCount).toBe(0)
+    expect(harness.createdIdCount).toBe(0)
+    expect(existsSync(join(cacheRoot, 'jobs'))).toBe(false)
+    expect(harness.changedEvents).toEqual([])
+  })
+
+  test('Given edit 任务缺少来源素材 When 直接创建 Then 保持在任何副作用前拒绝', async () => {
+    const input = { ...createCanvasImageInput('a'), action: 'edit' as const }
+
+    await expect(harness.manager.createCanvasImage(input)).rejects.toThrow('编辑任务缺少来源素材')
+
+    expect(harness.targetAssertionCount).toBe(0)
+    expect(harness.authoritativeReadCount).toBe(0)
+    expect(harness.modelResolutionCount).toBe(0)
+    expect(harness.createdIdCount).toBe(0)
+    expect(existsSync(join(cacheRoot, 'jobs'))).toBe(false)
+    expect(harness.changedEvents).toEqual([])
+  })
+
   test('Given Canvas Asset 已提交但模块采用失败 When 再次对账 Then 重放采用并收敛成功', async () => {
     harness.messages = [createToolMessage('session-1/output.png')]
     harness.adoptOutputError = new Error('图片模块暂不可写')
@@ -1645,6 +1671,11 @@ describe('Design Job Manager', () => {
     let traceReadCount = 0
     /** 记录完整 journal 目录扫描次数，目标索引建立后不得重复扫描。 */
     let journalScanCount = 0
+    /** 记录 Canvas 创建前的目标、来源、模型与 ID 副作用边界。 */
+    let targetAssertionCount = 0
+    let authoritativeReadCount = 0
+    let modelResolutionCount = 0
+    let createdIdCount = 0
     /** 测试详情展开时返回的固定 trace。 */
     const traceEntries: DesignTraceEntry[] = [{
       timestamp: 1, type: 'thinking', title: '模型原始 Thinking', content: '真实思考',
@@ -1661,6 +1692,7 @@ describe('Design Job Manager', () => {
     const store: DesignStore = {
       load: () => ({ document, writable: true }),
       requireStableAuthoritativeDocument: () => {
+        authoritativeReadCount += 1
         if (state.outputPhase) recordOutputEffect('authoritative-read')
         if ((state.outputMutationAttempted || state.forceOutputReloadError) && state.outputReloadError) {
           throw state.outputReloadError
@@ -1712,7 +1744,7 @@ describe('Design Job Manager', () => {
         },
       },
       canvasImageTargetAdapter: {
-        assertTarget: async () => undefined,
+        assertTarget: async () => { targetAssertionCount += 1 },
         adoptOutput: async (_projectId, target, assetId) => {
           if (workspaceWriteDepth === 0) canvasAdoptionOutsideWorkspace = true
           if (state.adoptOutputError) throw state.adoptOutputError
@@ -1730,7 +1762,10 @@ describe('Design Job Manager', () => {
           : state.canvasInputReferences.map((reference) => ({ ...reference })),
       },
       imageModels: {
-        resolveAvailableSnapshot: (profileId) => state.resolveAvailableSnapshot(profileId),
+        resolveAvailableSnapshot: (profileId) => {
+          modelResolutionCount += 1
+          return state.resolveAvailableSnapshot(profileId)
+        },
         assertSnapshotAvailable: (snapshot) => state.assertSnapshotAvailable(snapshot),
         resolveExecutionRoute: (snapshot) => state.resolveExecutionRoute(snapshot),
       },
@@ -1872,6 +1907,7 @@ describe('Design Job Manager', () => {
         if (job.id === 'job-1' && job.replacedByJobId && job.retryState?.status === 'pending') retryIntentWrites += 1
       },
       createId: () => {
+        createdIdCount += 1
         identity += 1
         return state.createId()
       },
@@ -1900,6 +1936,10 @@ describe('Design Job Manager', () => {
       get retryIntentWrites() { return retryIntentWrites },
       get traceReadCount() { return traceReadCount },
       get journalScanCount() { return journalScanCount },
+      get targetAssertionCount() { return targetAssertionCount },
+      get authoritativeReadCount() { return authoritativeReadCount },
+      get modelResolutionCount() { return modelResolutionCount },
+      get createdIdCount() { return createdIdCount },
       get relocationAttemptError() { return state.relocationAttemptError },
       get canvasAdoptionOutsideWorkspace() { return canvasAdoptionOutsideWorkspace },
       get canvasAdoptionCount() { return canvasAdoptionCount },

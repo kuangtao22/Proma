@@ -1044,6 +1044,7 @@ export function registerCanvasDocumentIpcHandlers(
         if (sourceAsset.sourceJobId) {
           const sourceJob = options.imageJobs.getProjectJob(target.projectId, sourceAsset.sourceJobId)
           if (!sourceJob
+            || sourceJob.outputAssetId !== sourceAsset.id
             || (sourceJob.target?.kind === 'canvas-image' && !isOwnedImageJob(sourceJob, target))) {
             throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
           }

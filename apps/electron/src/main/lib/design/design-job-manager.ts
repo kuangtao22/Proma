@@ -277,6 +277,11 @@ export class DesignJobManager {
   /** 创建只归属 Canvas 图片模块的 queued journal，不修改旧 Design 节点。 */
   async createCanvasImage(input: CreateDesignJobInput): Promise<DesignJobRecord> {
     if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
+    /** action 与来源素材的不变量必须先于预留、解析、ID 和持久化副作用。 */
+    if (input.action === 'generate' && input.sourceAssetId !== undefined) {
+      throw new Error('生成任务不得包含来源素材')
+    }
+    if (input.action === 'edit' && !input.sourceAssetId) throw new Error('编辑任务缺少来源素材')
     /** 局部常量保留跨异步调用和数组回调的 Canvas 目标收窄。 */
     const target = input.target
     /** 目标预留必须早于首个 await，保证同一事件循环内并发请求只能有一个进入。 */
@@ -292,7 +297,6 @@ export class DesignJobManager {
       if (!targetAdapter || !inputResolver) throw new Error('Canvas 图片任务执行边界未初始化')
       /** 完整目标必须在模型、输入、ID 和 journal 副作用前验证。 */
       await targetAdapter.assertTarget(input.projectId, target)
-      if (input.action === 'edit' && !input.sourceAssetId) throw new Error('编辑任务缺少来源素材')
       /** 来源素材必须先由当前项目权威 Store 证明，禁止跨项目或陈旧 ID 进入 journal。 */
       const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
       if (input.sourceAssetId && !current.assets.some((asset) => asset.id === input.sourceAssetId)) {

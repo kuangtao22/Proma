@@ -922,6 +922,36 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(designResult).toMatchObject({ ok: true, value: { jobs: [designEditJob] } })
   })
 
+  test('Given edit 来源素材伪造同目标 Job 归属但 Job 输出为其他素材 When LOAD Then fail closed 且不授权', async () => {
+    const sourceJob = createImageJob(imageTargetA, 'job-source-mismatch', 'asset-real-output')
+    const editJob = {
+      ...createImageJob(imageTargetA, 'job-edit-mismatch', 'asset-edit-mismatch'),
+      action: 'edit' as const,
+      sourceAssetId: 'asset-forged-source',
+      parentAssetId: 'asset-forged-source',
+    }
+    const context = createContext({
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: 'asset-edit-mismatch' },
+      imageJobs: [sourceJob, editJob],
+      imageAssets: [
+        createImageAsset('asset-real-output', sourceJob.id),
+        createImageAsset('asset-forged-source', sourceJob.id),
+        createImageAsset('asset-edit-mismatch', editJob.id, 'asset-forged-source'),
+      ],
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    )
+
+    expect(result).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
+    expect(JSON.stringify(result)).not.toContain('asset-forged-source.png')
+    expect(context.getMediaAccessCount()).toBe(0)
+  })
+
   test('Given adopted 素材祖先循环或超过上限 When LOAD Then fail closed 且不创建媒体 lease', async () => {
     const cyclicJob = createImageJob(imageTargetA, 'job-cycle', 'asset-cycle-a')
     const cyclic = createContext({
