@@ -240,7 +240,9 @@ export function createCanvasImageModuleController(
   let jobGeneration = 0
   /** 只有新采用操作会淘汰旧采用操作。 */
   let adoptGeneration = 0
-  /** 任务详情按 jobId 独立计数，不同任务允许并发完成。 */
+  /** 任务详情请求共用全局单调代次，Map 清理后也不得复用旧 token。 */
+  let nextDetailGeneration = 0
+  /** 任务详情按 jobId 保存当前 token，不同任务允许并发完成。 */
   const detailGenerations = new Map<string, number>()
   /** 当前可见模块 error 的内部请求所有权，不进入 Jotai 公开状态。 */
   let errorOwner: CanvasImageModuleErrorOwner | null = null
@@ -534,7 +536,7 @@ export function createCanvasImageModuleController(
       if (disposed || lifecycleLease?.isCurrent() !== true) return null
       /** 当前详情同时捕获实例代次和目标 job 独立代次。 */
       const epoch = instanceEpoch
-      const generation = (detailGenerations.get(jobId) ?? 0) + 1
+      const generation = ++nextDetailGeneration
       detailGenerations.set(jobId, generation)
       dependencies.updateState(key, (current) => {
         /** 每次详情更新只复制该 key 内的小 Map。 */

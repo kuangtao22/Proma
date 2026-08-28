@@ -594,6 +594,45 @@ describe('Canvas 生图模块 controller', () => {
     expect(fixture.state(moduleTarget).taskDetails.has('job-20')).toBe(true)
   })
 
+  test('Given job A 详情在途且被 LRU 淘汰 When 再请求 A 先成功且旧请求后失败 Then 旧回调不得覆盖新状态', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('details-lru-generation')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 1))
+    await flush()
+
+    /** 首次 A 请求保持在途，等待其 generation 被 LRU 清理。 */
+    const older = controller.loadTaskDetails('job-a')
+    for (let index = 0; index < 20; index += 1) {
+      /** 依次访问 20 个其它任务，使最旧的 A 详情退出缓存。 */
+      const filler = controller.loadTaskDetails(`job-filler-${index}`)
+      fixture.detailQueue[index + 1]?.resolve({
+        creativeTaskId: `task-filler-${index}`,
+        currentJobId: `job-filler-${index}`,
+        attempts: [],
+        traceState: 'ready',
+      })
+      await filler
+    }
+    expect(fixture.state(moduleTarget).taskDetails.has('job-a')).toBe(false)
+
+    /** 第二次 A 请求必须取得不同于旧请求的全局单调 token。 */
+    const newer = controller.loadTaskDetails('job-a')
+    fixture.detailQueue[21]?.resolve({
+      creativeTaskId: 'task-new', currentJobId: 'job-a', attempts: [], traceState: 'ready',
+    })
+    await newer
+
+    fixture.detailQueue[0]?.reject(new Error('旧请求迟到失败'))
+    await expect(older).rejects.toThrow('任务详情暂时无法加载。')
+    expect(fixture.state(moduleTarget).taskDetails.get('job-a')).toMatchObject({
+      phase: 'ready',
+      details: { creativeTaskId: 'task-new' },
+      error: null,
+    })
+  })
+
   test('Given 权威 LOAD 不再包含旧 job When 事件刷新 Then 删除旧详情并保留仍存在 job', async () => {
     const fixture = createFixture()
     const moduleTarget = target('details-authority')
