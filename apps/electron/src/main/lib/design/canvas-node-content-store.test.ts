@@ -219,6 +219,14 @@ describe('Canvas 节点内容 Store', () => {
       updatedAt: 100,
     } satisfies CanvasNodeContentMeta)
     expect(finalPrepareRequest?.fileName).toBe('meta.json')
+    if (kind === 'image') {
+      expect(readJson<Record<string, unknown>>(files, 'config.json')).toMatchObject({
+        schemaVersion: 2,
+        aspectRatio: '1:1',
+        imageSize: 'auto',
+        contextMode: 'auto',
+      })
+    }
     expect(fixture.loadCount).toBe(2)
   })
 

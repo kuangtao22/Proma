@@ -53,6 +53,7 @@ export interface CanvasContentNodeIntent {
   node: CanvasNode
   expectedRevision: number
   relationship?: CreateCanvasAgentNodeRelationship
+  imageModelProfileId?: string | null
   trashId?: string
   trashEntry?: CanvasTrashEntry
   legacyContentSeeds?: LegacyCanvasContentSeed[]
@@ -98,6 +99,7 @@ export interface CanvasContentNodeLifecycleDependencies {
   store: Pick<CanvasDocumentStore, 'loadWithMigrationCapability' | 'mutate'>
   contentStore: CanvasNodeContentStore
   assertAgentNodeIdle: (nodeId: string, sessionId: string) => void
+  resolveDefaultImageModelProfileId?: (projectId: string) => string | null
   now?: () => number
   randomUUID?: () => string
   scanIntents?: (target: CanvasTarget) => Promise<CanvasContentNodeIntent[]>
@@ -183,7 +185,7 @@ function parseIntentNode(value: unknown): CanvasNode {
 /** 严格解析单个 content intent，Agent intent 由扫描分类提前忽略。 */
 export function parseCanvasContentNodeIntent(value: unknown, target: CanvasTarget, operationId: string): CanvasContentNodeIntent {
   const required = ['schemaVersion', 'operation', 'state', 'operationId', 'projectId', 'canvasId', 'node', 'expectedRevision', 'createdAt', 'updatedAt'] as const
-  if (!isRecord(value) || !hasKeys(value, required, ['trashId', 'trashEntry', 'relationship', 'legacyContentSeeds', 'migrationDocument'])) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
+  if (!isRecord(value) || !hasKeys(value, required, ['trashId', 'trashEntry', 'relationship', 'imageModelProfileId', 'legacyContentSeeds', 'migrationDocument'])) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
   const validStates: Record<CanvasContentNodeOperation, readonly CanvasContentNodeState[]> = {
     migrate: ['prepared', 'content-created', 'committed'], create: ['prepared', 'content-created', 'committed'],
     delete: ['prepared', 'trashed', 'committed'], restore: ['prepared', 'restored', 'committed'],
@@ -195,6 +197,15 @@ export function parseCanvasContentNodeIntent(value: unknown, target: CanvasTarge
     || !Number.isSafeInteger(value.createdAt) || !Number.isSafeInteger(value.updatedAt)
     || (value.createdAt as number) < 0 || (value.updatedAt as number) < (value.createdAt as number)) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
   const node = parseIntentNode(value.node)
+  /** 图片创建 intent 可固化 null 或安全模型 profile ID。 */
+  const imageModelProfileId = value.imageModelProfileId
+  if (imageModelProfileId !== undefined
+    && (value.operation !== 'create'
+      || node.kind !== 'image'
+      || (imageModelProfileId !== null
+        && (typeof imageModelProfileId !== 'string' || !CONTENT_STABLE_ID.test(imageModelProfileId))))) {
+    throw new Error('CANVAS_CONTENT_INTENT_INVALID')
+  }
   const trashEntry = value.trashEntry === undefined ? undefined : parseCanvasTrashEntry(value.trashEntry)
   /** 迁移种子逐项拒绝未知字段、非法类别和身份。 */
   const legacyContentSeeds = value.legacyContentSeeds === undefined ? undefined : (() => {
@@ -254,6 +265,7 @@ export function parseCanvasContentNodeIntent(value: unknown, target: CanvasTarge
     operationId, projectId: target.projectId, canvasId: target.canvasId, node,
     expectedRevision: value.expectedRevision as number,
     ...(relationship ? { relationship } : {}),
+    ...(imageModelProfileId === undefined ? {} : { imageModelProfileId: imageModelProfileId as string | null }),
     ...(typeof value.trashId === 'string' ? { trashId: value.trashId } : {}),
     ...(trashEntry ? { trashEntry } : {}),
     ...(legacyContentSeeds ? { legacyContentSeeds } : {}),
@@ -390,7 +402,11 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
     if (intent.operation === 'create') {
       const identity = intentIdentity
       if (intent.state === 'prepared') {
-        try { await dependencies.contentStore.prepareEmptyContent(target, identity) } catch (error) {
+        /** 图片创建使用 intent 已固化的默认模型，重放不得重新解析偏好。 */
+        const prepareInput = identity.kind === 'image'
+          ? { ...identity, selectedModelProfileId: intent.imageModelProfileId ?? null }
+          : identity
+        try { await dependencies.contentStore.prepareEmptyContent(target, prepareInput) } catch (error) {
           if (!(error instanceof Error) || !error.message.includes('CANVAS_CONTENT_COMMIT_UNCONFIRMED')) throw error
           await dependencies.contentStore.assertContent(target, identity)
         }
@@ -521,7 +537,11 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
         return { snapshot: reconciled.result.snapshot, selectedNodeId: existing.node.id }
       }
       const timestamp = now()
-      const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'create', state: 'prepared', operationId: input.operationId, projectId: input.projectId, canvasId: input.canvasId, node: createContentNode(input), expectedRevision: input.expectedRevision, ...(input.relationship ? { relationship: input.relationship } : {}), createdAt: timestamp, updatedAt: timestamp }
+      /** 图片节点创建当下解析一次项目默认模型，并固化进可恢复 intent。 */
+      const imageModelProfileId = input.kind === 'image'
+        ? (dependencies.resolveDefaultImageModelProfileId?.(input.projectId) ?? null)
+        : undefined
+      const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'create', state: 'prepared', operationId: input.operationId, projectId: input.projectId, canvasId: input.canvasId, node: createContentNode(input), expectedRevision: input.expectedRevision, ...(input.relationship ? { relationship: input.relationship } : {}), ...(imageModelProfileId === undefined ? {} : { imageModelProfileId }), createdAt: timestamp, updatedAt: timestamp }
       if (reconciled.result.snapshot.document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
       const error = await write(intent, reconciled.capability)
       if (error) throw error

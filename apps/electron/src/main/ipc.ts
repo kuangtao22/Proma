@@ -1640,6 +1640,8 @@ export function registerIpcHandlers(): void {
   const canvasDocumentStore = createCanvasDocumentStore({ sessions: canvasSessionStore })
   /** 非 Agent 内容目录与图文档共享唯一 Store 实例和目录 capability。 */
   const canvasNodeContentStore = createCanvasNodeContentStore({ store: canvasDocumentStore })
+  /** 新图片节点默认模型复用现有项目级可用选择，不读取或复制凭据。 */
+  const canvasImagePreferences = getDesignImageModelServices().imagePreferences
   /** 内容节点可恢复生命周期只在主进程注册期创建一次。 */
   const canvasContentNodeLifecycle = createCanvasContentNodeLifecycle({
     store: canvasDocumentStore,
@@ -1652,6 +1654,9 @@ export function registerIpcHandlers(): void {
       )) || activeRuns.internalInvalidRuns.some((run) => run.sessionId === sessionId)
       if (busy) throw new CanvasContentAgentBusyError()
     },
+    resolveDefaultImageModelProfileId: (projectId) => (
+      canvasImagePreferences.getSelection(projectId).selectedProfileId ?? null
+    ),
   })
   /** Canvas Agent 创建事务复用现有 Agent 索引与模型可用性事实。 */
   const canvasAgentNodeCreation = new CanvasAgentNodeCreationService({

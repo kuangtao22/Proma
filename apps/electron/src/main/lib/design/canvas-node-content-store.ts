@@ -1,4 +1,5 @@
 import {
+  parseCanvasImageModuleConfig,
   parseCanvasNodeContentMeta,
   parseCanvasTrashEntry,
 } from '@proma/shared'
@@ -35,6 +36,7 @@ const EMPTY_WEBVIEW_HTML = '<!doctype html>\n<html lang="zh-CN">\n<head>\n<meta 
 export interface PrepareCanvasNodeContentInput {
   kind: CanvasContentKind
   contentId: string
+  selectedModelProfileId?: string | null
 }
 
 /** Canvas 非 Agent 节点内容与回收区的窄业务接口。 */
@@ -58,10 +60,19 @@ export interface CanvasNodeContentStoreDependencies {
 }
 
 /** 图片节点受管配置文件的严格磁盘结构。 */
-interface CanvasImageContentConfig extends CanvasNodeContentMeta {
+interface CanvasImageContentConfig {
+  schemaVersion: 1 | 2
+  kind: 'image'
+  contentId: string
+  revision: number
+  createdAt: number
+  updatedAt: number
   prompt: string
   selectedModelProfileId: string | null
   adoptedAssetId: string | null
+  aspectRatio: '1:1'
+  imageSize: 'auto'
+  contextMode: 'auto'
 }
 
 /** Webview 元数据允许携带旧来源，仅作为迁移参考，不用于加载远端内容。 */
@@ -150,11 +161,13 @@ function parseImageConfig(content: string): CanvasImageContentConfig {
   /** 图片配置的未知 JSON 值。 */
   const value = parseJson(content, 'config.json')
   /** 图片配置允许的完整字段集合。 */
-  const keys = [
+  const v1Keys = [
     'schemaVersion', 'kind', 'contentId', 'revision', 'createdAt', 'updatedAt',
     'prompt', 'selectedModelProfileId', 'adoptedAssetId',
   ] as const
-  if (!hasExactKeys(value, keys)
+  const v2Keys = [...v1Keys, 'aspectRatio', 'imageSize', 'contextMode'] as const
+  if (hasExactKeys(value, v2Keys)) return parseCanvasImageModuleConfig(value) as CanvasImageContentConfig
+  if (!hasExactKeys(value, v1Keys)
     || typeof value.prompt !== 'string'
     || value.prompt.length > MAX_CONTENT_TEXT_LENGTH
     || (value.selectedModelProfileId !== null
@@ -180,6 +193,9 @@ function parseImageConfig(content: string): CanvasImageContentConfig {
     prompt: value.prompt,
     selectedModelProfileId: value.selectedModelProfileId,
     adoptedAssetId: value.adoptedAssetId,
+    aspectRatio: '1:1',
+    imageSize: 'auto',
+    contextMode: 'auto',
   }
 }
 
@@ -212,7 +228,7 @@ function parseWebviewMeta(content: string): CanvasWebviewContentMeta {
 
 /** 比较公共内容身份，不把不同 kind 或 ID 当作可覆盖的重放。 */
 function assertSameIdentity(
-  meta: CanvasNodeContentMeta,
+  meta: Pick<CanvasNodeContentMeta, 'kind' | 'contentId'>,
   expected: PrepareCanvasNodeContentInput,
 ): void {
   if (meta.kind !== expected.kind || meta.contentId !== expected.contentId) {
@@ -436,13 +452,16 @@ export function createCanvasNodeContentStore(
     const allowedSeedKeys = new Set<string>([
       'kind',
       'contentId',
-      ...(kind === 'image' ? ['adoptedAssetId'] : []),
+      ...(kind === 'image' ? ['adoptedAssetId', 'selectedModelProfileId'] : []),
       ...(kind === 'webview' ? ['legacySourceUrl'] : []),
     ])
     if (Object.keys(seed).some((key) => !allowedSeedKeys.has(key))) {
       throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
     }
     if (seed.adoptedAssetId !== undefined) requireContentId(seed.adoptedAssetId, 'adoptedAssetId')
+    if (seed.selectedModelProfileId !== undefined && seed.selectedModelProfileId !== null) {
+      requireContentId(seed.selectedModelProfileId, 'selectedModelProfileId')
+    }
     if (seed.legacySourceUrl !== undefined
       && (typeof seed.legacySourceUrl !== 'string'
         || seed.legacySourceUrl.length > MAX_LEGACY_SOURCE_URL_LENGTH)) {
@@ -469,7 +488,7 @@ export function createCanvasNodeContentStore(
           || config.createdAt !== existingMeta.createdAt
           || config.updatedAt !== existingMeta.updatedAt
           || config.prompt !== ''
-          || config.selectedModelProfileId !== null
+          || config.selectedModelProfileId !== (seed.selectedModelProfileId ?? null)
           || config.adoptedAssetId !== (seed.adoptedAssetId ?? null)) {
           throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
         }
@@ -509,26 +528,31 @@ export function createCanvasNodeContentStore(
       /** 图片配置；已有部分写入时复用其时间身份。 */
       const config = existingConfigContent === null
         ? {
-            schemaVersion: 1 as const, kind: 'image' as const, contentId, revision: 0,
+            schemaVersion: 2 as const, kind: 'image' as const, contentId, revision: 0,
             createdAt: timestamp, updatedAt: timestamp, prompt: '',
-            selectedModelProfileId: null, adoptedAssetId,
+            selectedModelProfileId: seed.selectedModelProfileId ?? null, adoptedAssetId,
+            aspectRatio: '1:1' as const, imageSize: 'auto' as const, contextMode: 'auto' as const,
           }
         : parseImageConfig(existingConfigContent)
       if (config.contentId !== contentId
         || config.revision !== 0
         || config.createdAt !== config.updatedAt
         || config.prompt !== ''
-        || config.selectedModelProfileId !== null
+        || config.selectedModelProfileId !== (seed.selectedModelProfileId ?? null)
+        || config.aspectRatio !== '1:1'
+        || config.imageSize !== 'auto'
+        || config.contextMode !== 'auto'
         || config.adoptedAssetId !== adoptedAssetId) {
         throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
       }
       const configText = `${JSON.stringify(config, null, 2)}\n`
-      if (existingConfigContent !== null && existingConfigContent !== configText
-        && existingConfigContent !== JSON.stringify(config)) {
-        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
-      }
       if (existingConfigContent === null) {
         await ensureExactFile(nodes, 'nodes', contentId, 'config.json', configText)
+      } else if (config.schemaVersion === 1) {
+        /** 未提交 meta 的旧部分配置可在同一身份下安全升级为 v2。 */
+        await writeManagedFile(nodes, 'nodes', contentId, 'config.json', configText)
+      } else if (existingConfigContent !== configText && existingConfigContent !== JSON.stringify(config)) {
+        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
       }
       /** 公共 meta 始终最后提交。 */
       const meta: CanvasNodeContentMeta = {
@@ -720,6 +744,9 @@ export function createCanvasNodeContentStore(
     prepareEmptyContent: (target, input) => prepareContent(target, {
       kind: requireContentKind(input.kind),
       contentId: requireContentId(input.contentId, 'contentId'),
+      ...(input.kind === 'image'
+        ? { selectedModelProfileId: input.selectedModelProfileId ?? null }
+        : {}),
     }),
     prepareMigratedContent: prepareContent,
     assertContent: async (target, input) => {

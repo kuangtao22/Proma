@@ -10,6 +10,8 @@ function createFixture(options: {
   migratedSeeds?: Array<{ kind: 'image' | 'document' | 'webview'; contentId: string; adoptedAssetId?: string; legacySourceUrl?: string }>
   /** 为 true 时不注入测试 UUID，覆盖生产默认生成器。 */
   useDefaultRandomUUID?: boolean
+  /** 创建图片节点时解析并固化的项目默认生图模型。 */
+  defaultImageModelProfileId?: string | null
 } = {}) {
   /** 当前权威图文档。 */
   let document = createEmptyCanvasDocument('project-1', 'canvas-1', 10)
@@ -19,6 +21,8 @@ function createFixture(options: {
   const trash = new Map<string, CanvasTrashEntry>()
   /** 已准备的内容身份。 */
   const contents = new Set<string>()
+  /** 内容 Store 收到的空内容准备输入。 */
+  const preparedInputs: Array<{ contentId: string; selectedModelProfileId?: string | null }> = []
   /** 模拟仍运行中的 Agent 节点。 */
   const running = new Set<string>()
   /** 迁移提交次数用于证明内容全部准备后只提交一次图。 */
@@ -40,7 +44,10 @@ function createFixture(options: {
     },
   }
   const contentStore = {
-    prepareEmptyContent: async (_target: object, input: { contentId: string }) => { contents.add(input.contentId) },
+    prepareEmptyContent: async (_target: object, input: { contentId: string; selectedModelProfileId?: string | null }) => {
+      preparedInputs.push({ ...input })
+      contents.add(input.contentId)
+    },
     prepareMigratedContent: async (_target: object, seed: { contentId: string }) => { contents.add(seed.contentId) },
     assertContent: async () => { throw new Error('unused') },
     moveToTrash: async (_target: object, entry: CanvasTrashEntry) => { contents.delete(entry.contentId); trash.set(entry.trashId, entry) },
@@ -64,13 +71,14 @@ function createFixture(options: {
       return outcome as { commitVisible: true; durabilityUncertain: false } | { commitVisible: false; durabilityUncertain: false; error: string } | { commitVisible: true; durabilityUncertain: true; error: string }
     },
     assertAgentNodeIdle: (nodeId) => { if (running.has(nodeId)) throw new Error('AGENT_SESSION_BUSY') },
+    resolveDefaultImageModelProfileId: () => options.defaultImageModelProfileId ?? null,
     now: (() => { let value = 100; return () => value++ })(),
     ...(options.useDefaultRandomUUID ? {} : {
       randomUUID: () => `aaaaaaaa-aaaa-4aaa-8aaa-${String(++uuidCounter).padStart(12, '0')}`,
     }),
   })
   const service = createService()
-  return { service, restartService: createService, intents, trash, contents, running, getDocument: () => document, setDocument: (next: CanvasDocument) => { document = next }, getMigrationCommits: () => migrationCommits, getScanCount: () => scanCount }
+  return { service, restartService: createService, intents, trash, contents, preparedInputs, running, getDocument: () => document, setDocument: (next: CanvasDocument) => { document = next }, getMigrationCommits: () => migrationCommits, getScanCount: () => scanCount }
 }
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
@@ -148,6 +156,23 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(result.snapshot.document.nodes[0]?.kind).toBe(kind)
     expect(fixture.contents.has('content-1')).toBe(true)
     expect(fixture.intents.values().next().value?.state).toBe('committed')
+  })
+
+  test('Given 项目有默认生图模型 When 创建图片节点 Then intent 固化模型且重放不重新解析', async () => {
+    const fixture = createFixture({ defaultImageModelProfileId: 'profile-1' })
+    await fixture.service.create({
+      ...target,
+      operationId: '41414141-4141-4141-8141-414141414141',
+      nodeId: 'node-image-default',
+      kind: 'image',
+      contentId: 'module-image-default',
+      title: '首页主视觉',
+      position: { x: 0, y: 0 },
+      expectedRevision: 0,
+    })
+
+    expect(fixture.intents.values().next().value?.imageModelProfileId).toBe('profile-1')
+    expect(fixture.preparedInputs[0]?.selectedModelProfileId).toBe('profile-1')
   })
 
   test.each(contentKinds)('Given %s prepared intent 写失败 When 创建 Then 内容和图均零副作用', async (kind) => {

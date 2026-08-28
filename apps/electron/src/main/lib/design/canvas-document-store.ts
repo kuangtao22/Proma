@@ -137,6 +137,7 @@ export interface LegacyCanvasContentSeed {
   kind: 'image' | 'document' | 'webview'
   contentId: string
   adoptedAssetId?: string
+  selectedModelProfileId?: string | null
   legacySourceUrl?: string
 }
 
