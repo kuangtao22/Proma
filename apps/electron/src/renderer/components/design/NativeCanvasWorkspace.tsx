@@ -2503,8 +2503,8 @@ export function NativeCanvasWorkspace({
                 activeTool={state.activeTool}
                 nodeIssues={state.snapshot.nodeIssues}
                 runningSessionIds={runningSessionIds}
-                canExpand={canCreateNode}
-                onExpand={(sourceNodeId, kind) => {
+                canCreateChild={canCreateNode}
+                onCreateChild={(sourceNodeId, kind) => {
                   void commandRef.current?.execute({ kind, sourceNodeId }).catch(() => undefined)
                 }}
                 selectedNodeId={state.selectedNodeId}

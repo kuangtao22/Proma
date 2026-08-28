@@ -71,7 +71,7 @@ function NativeCanvasNodeTypeIcon({
 }
 
 /** 渲染单个节点类型选项；可用项选择后关闭悬浮菜单并创建节点。 */
-function NativeCanvasNodeTypePickerOption({
+export function NativeCanvasNodeTypePickerOption({
   option,
   onAddNode,
 }: {

@@ -2207,7 +2207,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     )
 
     expect(flowProps?.nodes[0]).toMatchObject({
-      data: { status: 'unavailable', canExpand: true },
+      data: { status: 'unavailable', canOpenWorkbench: true, canCreateChild: false },
     })
     expect(flowProps?.nodesDraggable).toBe(false)
     expect(flowProps?.panOnDrag).toBe(true)

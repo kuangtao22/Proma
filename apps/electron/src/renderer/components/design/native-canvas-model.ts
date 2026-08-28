@@ -271,8 +271,9 @@ export function toNativeCanvasFlowNodes(
         status,
         statusLabel: AGENT_STATUS_LABELS[status],
         summary: unavailable ? '需要重建或删除节点' : '独立 Agent 会话',
-        canExpand: true,
-        onExpand: options.onWorkbenchNodeChange,
+        canOpenWorkbench: true,
+        onOpenWorkbench: options.onWorkbenchNodeChange,
+        canCreateChild,
         ...(canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
       }
       return { ...base, type: 'canvasAgent', data }
@@ -289,8 +290,9 @@ export function toNativeCanvasFlowNodes(
           ...(node.adoptedAssetId ? { adoptedAssetId: node.adoptedAssetId } : {}),
           statusLabel: node.adoptedAssetId ? '已有素材' : '待创作',
           summary: node.adoptedAssetId ? '已采用画布素材' : '尚未生成图片',
-          canExpand: true,
-          onExpand: options.onWorkbenchNodeChange,
+          canOpenWorkbench: true,
+          onOpenWorkbench: options.onWorkbenchNodeChange,
+          canCreateChild: options.canCreateChild,
           ...(options.canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
         },
       }
@@ -307,8 +309,9 @@ export function toNativeCanvasFlowNodes(
           contentRevision: node.contentRevision,
           statusLabel: '已创建',
           summary: `内容版本 ${node.contentRevision}`,
-          canExpand: true,
-          onExpand: options.onWorkbenchNodeChange,
+          canOpenWorkbench: true,
+          onOpenWorkbench: options.onWorkbenchNodeChange,
+          canCreateChild: options.canCreateChild,
           ...(options.canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
         },
       }
@@ -324,8 +327,9 @@ export function toNativeCanvasFlowNodes(
         contentRevision: node.contentRevision,
         statusLabel: '已创建',
         summary: `内容版本 ${node.contentRevision}`,
-        canExpand: true,
-        onExpand: options.onWorkbenchNodeChange,
+        canOpenWorkbench: true,
+        onOpenWorkbench: options.onWorkbenchNodeChange,
+        canCreateChild: options.canCreateChild,
         ...(options.canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
       },
     }

@@ -127,8 +127,8 @@ export interface NativeCanvasGraphProps {
   activeTool?: 'select' | 'pan'
   nodeIssues?: CanvasNodeIssue[]
   runningSessionIds?: ReadonlySet<string>
-  canExpand?: boolean
-  onExpand?: (nodeId: string, kind: CanvasNodeKind) => void
+  canCreateChild?: boolean
+  onCreateChild?: (nodeId: string, kind: CanvasNodeKind) => void
   selectedNodeId: string | null
   onMutation: (mutation: CanvasMutation) => void
   /** 只同步 XYFlow 当前选区，不隐式打开 Agent 对话。 */
@@ -195,8 +195,8 @@ export function NativeCanvasGraph({
   activeTool = 'select',
   nodeIssues = EMPTY_CANVAS_NODE_ISSUES,
   runningSessionIds = EMPTY_RUNNING_SESSION_IDS,
-  canExpand = false,
-  onExpand = NOOP_CREATE_CHILD,
+  canCreateChild = false,
+  onCreateChild = NOOP_CREATE_CHILD,
   selectedNodeId,
   onMutation,
   onNodeSelect,
@@ -213,8 +213,8 @@ export function NativeCanvasGraph({
     attachNativeCanvasWorkbench(toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
-      canCreateChild: writable && canExpand,
-      onCreateChild: onExpand,
+      canCreateChild: writable && canCreateChild,
+      onCreateChild,
       onWorkbenchNodeChange: workbenchNodeChange,
     }).map((node) => ({
       ...node,
@@ -253,8 +253,8 @@ export function NativeCanvasGraph({
     const nextNodes = attachNativeCanvasWorkbench(toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
-      canCreateChild: writable && canExpand,
-      onCreateChild: onExpand,
+      canCreateChild: writable && canCreateChild,
+      onCreateChild,
       onWorkbenchNodeChange: workbenchNodeChange,
     }).map((node) => ({
       ...node,
@@ -262,7 +262,7 @@ export function NativeCanvasGraph({
     })), document, expandedNodeId, renderWorkbench)
     flowNodesRef.current = nextNodes
     setFlowNodes(nextNodes)
-  }, [canExpand, document, expandedNodeId, nodeIssues, onExpand, renderWorkbench, runningSessionIds, selectedNodeId, workbenchNodeChange, writable])
+  }, [canCreateChild, document, expandedNodeId, nodeIssues, onCreateChild, renderWorkbench, runningSessionIds, selectedNodeId, workbenchNodeChange, writable])
 
   React.useEffect(() => {
     updateViewportState({ type: 'document-sync', viewport: document.viewport })

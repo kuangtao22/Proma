@@ -58,7 +58,9 @@ describe('原生 Canvas 纯投影', () => {
       onWorkbenchNodeChange: () => undefined,
     })
 
-    expect(nodes[0]?.data).toMatchObject({ status: 'unavailable', canExpand: true })
+    expect(nodes[0]?.data).toMatchObject({
+      status: 'unavailable', canOpenWorkbench: true, canCreateChild: false,
+    })
     expect(nodes[0]?.data.onCreateChild).toBeUndefined()
   })
 
@@ -83,20 +85,23 @@ describe('原生 Canvas 纯投影', () => {
       .every((node) => node.handles?.length === 0)).toBe(true)
     expect(nodes[0]?.data).toEqual({
       id: 'agent-1', kind: 'agent', title: '研究助手', agentSessionId: 'session-1',
-      status: 'idle', statusLabel: '空闲', summary: '独立 Agent 会话', canExpand: true,
-      onExpand: expect.any(Function),
+      status: 'idle', statusLabel: '空闲', summary: '独立 Agent 会话',
+      canOpenWorkbench: true, onOpenWorkbench: expect.any(Function), canCreateChild: false,
     })
     expect(nodes[1]?.data).toMatchObject({
       kind: 'image', imageModuleId: 'image-1', adoptedAssetId: 'asset-1',
-      statusLabel: '已有素材', summary: '已采用画布素材', canExpand: true,
+      statusLabel: '已有素材', summary: '已采用画布素材',
+      canOpenWorkbench: true, canCreateChild: false,
     })
     expect(nodes[2]?.data).toMatchObject({
       kind: 'document', documentId: 'document-1', contentRevision: 2,
-      statusLabel: '已创建', summary: '内容版本 2', canExpand: true,
+      statusLabel: '已创建', summary: '内容版本 2',
+      canOpenWorkbench: true, canCreateChild: false,
     })
     expect(nodes[3]?.data).toMatchObject({
       kind: 'webview', prototypeId: 'prototype-1', contentRevision: 3,
-      statusLabel: '已创建', summary: '内容版本 3', canExpand: true,
+      statusLabel: '已创建', summary: '内容版本 3',
+      canOpenWorkbench: true, canCreateChild: false,
     })
     expect(serialized).not.toContain('messages')
     expect(serialized).not.toContain('messageCount')

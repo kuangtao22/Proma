@@ -5,13 +5,15 @@ import type { LucideIcon } from 'lucide-react'
 import { Bot, CircleAlert, FileImage, FileText, LoaderCircle, Maximize2, Monitor, Plus } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import { cn } from '@/lib/utils'
-import { NATIVE_CANVAS_NODE_TYPE_OPTIONS } from './NativeCanvasToolbar'
+import {
+  NATIVE_CANVAS_NODE_TYPE_OPTIONS,
+  NativeCanvasNodeTypePickerOption,
+} from './NativeCanvasToolbar'
 
 /** 折叠卡片只接收画布文档中的精确轻量展示字段和命令回调。 */
 export interface CanvasNodeCardData {
@@ -20,8 +22,9 @@ export interface CanvasNodeCardData {
   title: string
   statusLabel: string
   summary: string
-  canExpand: boolean
-  onExpand?: (nodeId: string) => void
+  canOpenWorkbench: boolean
+  onOpenWorkbench?: (nodeId: string) => void
+  canCreateChild: boolean
   onCreateChild?: (sourceNodeId: string, kind: CanvasNodeKind) => void
 }
 
@@ -80,8 +83,9 @@ export function CanvasNodeCard({
   statusLabel,
   summary,
   selected,
-  canExpand,
-  onExpand,
+  canOpenWorkbench,
+  onOpenWorkbench,
+  canCreateChild,
   onCreateChild,
 }: CanvasNodeCardProps): React.ReactElement {
   /** 当前节点类型的稳定中文名称和 Lucide 图标。 */
@@ -110,17 +114,19 @@ export function CanvasNodeCard({
               <Icon className="size-4" aria-hidden="true" />
             </span>
             <span className="min-w-0 flex-1 text-xs font-medium text-muted-foreground">{label}</span>
-            {canExpand && onExpand ? (
+            {canOpenWorkbench && onOpenWorkbench ? (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <button
                     type="button"
                     aria-label={`展开${label}工作台`}
                     className="nodrag nopan flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    onPointerDown={(event) => event.stopPropagation()}
                     onClick={(event) => {
                       event.stopPropagation()
-                      onExpand(id)
+                      onOpenWorkbench(id)
                     }}
+                    onDoubleClick={(event) => event.stopPropagation()}
                   >
                     <Maximize2 className="size-4" aria-hidden="true" />
                   </button>
@@ -151,48 +157,44 @@ export function CanvasNodeCard({
           isConnectableEnd={false}
           className="!size-2 !border-2 !border-background !bg-muted-foreground"
         />
-        {onCreateChild ? (
-          <DropdownMenu>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <DropdownMenuTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label="从此节点扩展"
-                    className={cn(
-                      'nodrag nopan absolute -right-9 top-1/2 flex size-7 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background text-foreground shadow-sm transition-opacity hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                      selected
-                        ? 'opacity-100'
-                        : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
-                    )}
-                    onClick={(event) => event.stopPropagation()}
-                  >
-                    <Plus className="size-4" aria-hidden="true" />
-                  </button>
-                </DropdownMenuTrigger>
-              </TooltipTrigger>
-              <TooltipContent side="right">从此节点扩展</TooltipContent>
-            </Tooltip>
-            <DropdownMenuContent
+        {canCreateChild && onCreateChild ? (
+          <Popover>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                aria-label="从此节点扩展"
+                title="从此节点扩展"
+                className={cn(
+                  'nodrag nopan absolute -right-9 top-1/2 flex size-7 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background text-foreground shadow-sm transition-opacity hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                  selected
+                    ? 'opacity-100'
+                    : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
+                )}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => event.stopPropagation()}
+                onDoubleClick={(event) => event.stopPropagation()}
+              >
+                <Plus className="size-4" aria-hidden="true" />
+              </button>
+            </PopoverTrigger>
+            <PopoverContent
               side="right"
               align="center"
-              className="w-48 max-w-[calc(100vw-1rem)]"
+              sideOffset={8}
+              className="w-48 max-w-[calc(100vw-1rem)] p-1"
               onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => event.stopPropagation()}
+              onDoubleClick={(event) => event.stopPropagation()}
             >
               {NATIVE_CANVAS_NODE_TYPE_OPTIONS.map((option) => (
-                <DropdownMenuItem
+                <NativeCanvasNodeTypePickerOption
                   key={option.kind}
-                  disabled={!option.enabled}
-                  aria-disabled={!option.enabled}
-                  aria-label={option.enabled ? option.label : `${option.label}，即将支持`}
-                  onSelect={createCanvasNodeChildTypeSelectHandler(option, id, onCreateChild)}
-                >
-                  <span className="min-w-0 flex-1 truncate">{option.label}</span>
-                  {!option.enabled ? <span className="text-[11px] text-muted-foreground">即将支持</span> : null}
-                </DropdownMenuItem>
+                  option={option}
+                  onAddNode={(childKind) => onCreateChild(id, childKind)}
+                />
               ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
+            </PopoverContent>
+          </Popover>
         ) : null}
       </div>
     </TooltipProvider>
