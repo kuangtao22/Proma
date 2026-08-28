@@ -64,6 +64,10 @@ import {
   findAvailableNativeCanvasChildPosition,
   findNativeCanvasGlobalAppendPosition,
   isNativeCanvasPositionMutation,
+  NATIVE_CANVAS_NODE_GAP,
+  NATIVE_CANVAS_NODE_HEIGHT,
+  NATIVE_CANVAS_NODE_WIDTH,
+  overlapsNativeCanvasNodes,
   replayNativeCanvasPositionMutations,
 } from './native-canvas-model'
 
@@ -305,7 +309,63 @@ export function findNativeCanvasAgentNodeCreationPosition(
     x: (surfaceBounds.width / 2 - document.viewport.x) / document.viewport.zoom,
     y: (surfaceBounds.height / 2 - document.viewport.y) / document.viewport.zoom,
   }
-  return findNativeCanvasGlobalAppendPosition(emptyCanvasCenter, document.nodes)
+  /** 空图仍以画布中心创建，避免初始节点贴近边缘。 */
+  if (document.nodes.length === 0) {
+    return findNativeCanvasGlobalAppendPosition(emptyCanvasCenter, document.nodes)
+  }
+  /** 优先保留既有全局横向追加语义。 */
+  const globalAppendPosition = findNativeCanvasGlobalAppendPosition(emptyCanvasCenter, document.nodes)
+  /** 当前可视世界坐标保留一格边距，避免新节点贴住画布边缘。 */
+  const visibleBounds = {
+    left: (NATIVE_CANVAS_NODE_GAP - document.viewport.x) / document.viewport.zoom,
+    top: (NATIVE_CANVAS_NODE_GAP - document.viewport.y) / document.viewport.zoom,
+    right: (surfaceBounds.width - NATIVE_CANVAS_NODE_GAP - document.viewport.x) / document.viewport.zoom,
+    bottom: (surfaceBounds.height - NATIVE_CANVAS_NODE_GAP - document.viewport.y) / document.viewport.zoom,
+  }
+  /** 全局追加点完整可见时不改变原有排列。 */
+  const globalAppendVisible = globalAppendPosition.x >= visibleBounds.left
+    && globalAppendPosition.y >= visibleBounds.top
+    && globalAppendPosition.x + NATIVE_CANVAS_NODE_WIDTH <= visibleBounds.right
+    && globalAppendPosition.y + NATIVE_CANVAS_NODE_HEIGHT <= visibleBounds.bottom
+  if (globalAppendVisible) return globalAppendPosition
+
+  /** 只用当前可视节点确定网格起点，用户平移到空白区域时从视口左上开始。 */
+  const visibleNodes = document.nodes.filter((node) => (
+    node.position.x + NATIVE_CANVAS_NODE_WIDTH >= visibleBounds.left
+    && node.position.x <= visibleBounds.right
+    && node.position.y + NATIVE_CANVAS_NODE_HEIGHT >= visibleBounds.top
+    && node.position.y <= visibleBounds.bottom
+  ))
+  /** 横向起点沿用可视节点最左列，保持已有卡片对齐。 */
+  const anchorX = visibleNodes.length > 0
+    ? Math.max(visibleBounds.left, Math.min(...visibleNodes.map((node) => node.position.x)))
+    : visibleBounds.left
+  /** 纵向起点沿用可视节点首行，新增节点自然换到下一行。 */
+  const anchorY = visibleNodes.length > 0
+    ? Math.max(visibleBounds.top, Math.min(...visibleNodes.map((node) => node.position.y)))
+    : visibleBounds.top
+  /** 可视区最多容纳的固定宽度列数。 */
+  const columnCount = Math.max(0, Math.floor(
+    (visibleBounds.right - anchorX + NATIVE_CANVAS_NODE_GAP)
+    / (NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP),
+  ))
+  /** 可视区最多容纳的固定高度行数。 */
+  const rowCount = Math.max(0, Math.floor(
+    (visibleBounds.bottom - anchorY + NATIVE_CANVAS_NODE_GAP)
+    / (NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP),
+  ))
+  for (let row = 0; row < rowCount; row += 1) {
+    for (let column = 0; column < columnCount; column += 1) {
+      /** 候选按从左到右、从上到下排列，已有节点位置始终不变。 */
+      const candidate = {
+        x: anchorX + column * (NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP),
+        y: anchorY + row * (NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP),
+      }
+      if (!overlapsNativeCanvasNodes(candidate, document.nodes)) return candidate
+    }
+  }
+  /** 可视区确实无空位时退回确定性的全局追加，避免创建被阻断。 */
+  return globalAppendPosition
 }
 
 /**

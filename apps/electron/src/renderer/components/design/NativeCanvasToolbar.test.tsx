@@ -2,6 +2,7 @@ import * as React from 'react'
 import { describe, expect, mock, test } from 'bun:test'
 import type { CanvasNodeKind } from '@proma/shared'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { Tooltip } from '@/components/ui/tooltip'
 import {
   NATIVE_CANVAS_NODE_TYPE_OPTIONS,
   NativeCanvasToolbar,
@@ -35,16 +36,53 @@ function hasElementProperty(
   )
 }
 
+/** 查找目标属性所在元素到根节点的路径，用于验证浮层触发器没有互相嵌套。 */
+function findElementPathByProperty(
+  node: React.ReactNode,
+  propertyName: string,
+  propertyValue: unknown,
+  path: React.ReactElement<Record<string, unknown>>[] = [],
+): React.ReactElement<Record<string, unknown>>[] | undefined {
+  if (!React.isValidElement<Record<string, unknown>>(node)) return undefined
+  /** 当前元素加入路径后再判断，返回值包含目标元素自身。 */
+  const currentPath = [...path, node]
+  if (node.props[propertyName] === propertyValue) return currentPath
+  for (const child of React.Children.toArray(node.props.children as React.ReactNode)) {
+    /** 找到首条目标路径后立即返回，工具栏中的 aria-label 保持唯一。 */
+    const childPath = findElementPathByProperty(child, propertyName, propertyValue, currentPath)
+    if (childPath) return childPath
+  }
+  return undefined
+}
+
 describe('原生 Canvas 顶部工具栏', () => {
-  test('Given 可写 Canvas When 渲染工具栏 Then 添加入口始终公开菜单语义并保留既有命令', () => {
+  test('Given 可写 Canvas When 渲染工具栏 Then 添加入口公开悬浮菜单语义并保留既有命令', () => {
     const html = renderToStaticMarkup(<NativeCanvasToolbar {...createToolbarProps()} />)
 
     expect(html).toContain('aria-label="选择工具"')
     expect(html).toContain('aria-pressed="true"')
     expect(html).toContain('aria-label="平移工具"')
     expect(html).toContain('aria-label="添加节点"')
-    expect(html).toContain('aria-haspopup="menu"')
+    expect(html).toContain('aria-haspopup="dialog"')
     expect(html).toContain('aria-label="删除节点"')
+  })
+
+  test('Given 添加节点悬浮菜单 When 渲染触发器 Then 不与 Tooltip 浮层嵌套竞争', () => {
+    const elementTree = NativeCanvasToolbar(createToolbarProps())
+    /** 添加按钮的祖先链用于锁定 Popover 之外没有 Tooltip 浮层。 */
+    const addButtonPath = findElementPathByProperty(elementTree, 'aria-label', '添加节点')
+
+    expect(addButtonPath).toBeDefined()
+    expect(addButtonPath?.some((element) => element.type === Tooltip)).toBeFalse()
+  })
+
+  test('Given 添加节点入口 When 渲染工具栏 Then 提供按钮下方的紧凑悬浮菜单', () => {
+    const elementTree = NativeCanvasToolbar(createToolbarProps())
+
+    expect(hasElementProperty(elementTree, 'data-canvas-node-picker', 'popover')).toBeTrue()
+    expect(hasElementProperty(elementTree, 'data-canvas-node-picker-width', 'compact')).toBeTrue()
+    expect(hasElementProperty(elementTree, 'side', 'bottom')).toBeTrue()
+    expect(hasElementProperty(elementTree, 'align', 'center')).toBeTrue()
   })
 
   test('Given 多类型节点基础层 When 读取添加选项 Then 固定五项顺序且仅视频禁用', () => {
@@ -57,7 +95,7 @@ describe('原生 Canvas 顶部工具栏', () => {
     ])
   })
 
-  test('Given 四个可用类型 When 选择菜单项 Then 分别回传精确节点类型', () => {
+  test('Given 四个可用类型 When 选择悬浮菜单选项 Then 分别回传精确节点类型', () => {
     const selected: CanvasNodeKind[] = []
     const onAddNode = (kind: CanvasNodeKind): void => { selected.push(kind) }
 
@@ -93,7 +131,7 @@ describe('原生 Canvas 顶部工具栏', () => {
   test.each([
     { writable: false, canAdd: true },
     { writable: true, canAdd: false },
-  ])('Given 添加不允许 When 渲染工具栏 Then 添加入口禁用且菜单不可打开', ({ writable, canAdd }) => {
+  ])('Given 添加不允许 When 渲染工具栏 Then 添加入口禁用且悬浮菜单不可打开', ({ writable, canAdd }) => {
     const html = renderToStaticMarkup(
       <NativeCanvasToolbar {...createToolbarProps()} writable={writable} canAdd={canAdd} />,
     )
@@ -103,7 +141,7 @@ describe('原生 Canvas 顶部工具栏', () => {
     expect(deleteDisabled).toBe(!writable)
   })
 
-  test('Given 窄窗口 When 渲染工具栏 Then 工具栏和菜单宽度受限且状态文本可截断', () => {
+  test('Given 窄窗口 When 渲染工具栏 Then 工具栏和悬浮菜单宽度受限且状态文本可截断', () => {
     const html = renderToStaticMarkup(
       <NativeCanvasToolbar {...createToolbarProps()} issueCount={12} />,
     )
@@ -111,6 +149,6 @@ describe('原生 Canvas 顶部工具栏', () => {
 
     expect(html).toContain('max-w-[calc(100%-1rem)]')
     expect(html).toContain('max-w-36 truncate')
-    expect(hasElementProperty(elementTree, 'data-canvas-node-menu-width', 'compact')).toBeTrue()
+    expect(hasElementProperty(elementTree, 'data-canvas-node-picker-width', 'compact')).toBeTrue()
   })
 })

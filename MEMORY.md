@@ -192,3 +192,5 @@
 - 2026-08-28：Canvas 节点工作台只由 Renderer `expandedNodeId` 驱动，同一时刻最多挂载一个节点锚定覆盖层；dirty 跨节点切换必须走保存、放弃、取消三分支，通知导航也必须复用同一 dirty-aware 状态转换。切换 Canvas、recovery、删除和真实卸载清理临时态，StrictMode 同 key 演练重挂不得误清。
 - 2026-08-28：Canvas 工作台草稿保存 Promise 必须同时复核 workspace key、源节点、目标节点和单调 operation generation；业务身份 stale 时只收口当前 generation 的 saving，generation 或 workspace stale 时完全无副作用，避免迟到结果关闭新工作台或永久锁住切换对话框。
 - 2026-08-28：Canvas 运行中 Agent 的“停止并删除”必须 authoritative-first 绑定明确 `startedAt`，每次 STOP attempt 另有独立单调请求代次；resolve/reject 在任何 UI 副作用前同时复核请求 token、Canvas、节点、session、`startedAt` 和当前 pending 身份，新运行接管、代次未知、Canvas 切换或卸载时先失效旧 token 并 fail closed。回收区每次列表读取使用独立单调请求代次，恢复成功、关闭和销毁都会失效旧请求，禁止迟到结果复活旧条目或覆盖新状态；restore 成功失效在途 list 时必须同步收口 `loading:false`。
+- 2026-08-28：Canvas 顶部独立新增节点采用“可视区优先追加”：全局右侧追加位置完整可见时保持原有横向排列，超出可视区后在当前视口按从左到右、从上到下寻找空位；既有节点与 viewport 始终不移动，可视区无空位时才回退到确定性全局追加。
+- 2026-08-28：Canvas 顶部添加入口使用锚定 `+` 按钮下方的 Radix `Popover` 单列菜单；选择 Agent/生图/文档/原型后立即关闭并沿用工作区可视区追加逻辑，视频保留“即将支持”禁用占位。该实现不再使用曾出现视觉显示不稳定的 `DropdownMenu`，也不使用遮挡画布的居中 `Dialog`。

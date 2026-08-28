@@ -1346,18 +1346,38 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       .toEqual({ x: 106, y: 53 })
   })
 
-  test('Given 非空图和不同 viewport When 独立新增 Then 全局落点完全不受平移缩放影响', () => {
-    const first = createSnapshot(1).document
-    first.nodes = [
+  test('Given 全局追加位置仍在可视区 When 独立新增 Then 保持既有横向追加顺序', () => {
+    const document = createSnapshot(1).document
+    document.nodes = [
       { id: 'first', kind: 'agent', title: '首节点', agentSessionId: 's-1', position: { x: -200, y: 40 } },
       { id: 'right', kind: 'agent', title: '右节点', agentSessionId: 's-2', position: { x: 500, y: 300 } },
     ]
-    const second = structuredClone(first)
-    first.viewport = { x: 0, y: 0, zoom: 1 }
-    second.viewport = { x: 8_000, y: -6_000, zoom: 2.5 }
+    document.viewport = { x: 0, y: 0, zoom: 1 }
 
-    expect(findNativeCanvasAgentNodeCreationPosition(first, { width: 300, height: 200 }))
-      .toEqual(findNativeCanvasAgentNodeCreationPosition(second, { width: 1_400, height: 900 }))
+    expect(findNativeCanvasAgentNodeCreationPosition(document, { width: 1_400, height: 900 }))
+      .toEqual({ x: 812, y: 40 })
+  })
+
+  test('Given 横向节点已延伸到屏幕外 When 独立新增 Then 在当前可视区下一行追加且不改已有布局', () => {
+    const document = createSnapshot(1).document
+    document.viewport = { x: 0, y: 0, zoom: 1 }
+    document.nodes = [
+      { id: 'first', kind: 'agent', title: '首节点', agentSessionId: 's-1', position: { x: 100, y: 100 } },
+      { id: 'second', kind: 'image', title: '第二节点', imageModuleId: 'i-2', position: { x: 412, y: 100 } },
+      {
+        id: 'third',
+        kind: 'document',
+        title: '第三节点',
+        documentId: 'd-3',
+        contentRevision: 0,
+        position: { x: 724, y: 100 },
+      },
+    ]
+    const original = structuredClone(document)
+
+    expect(findNativeCanvasAgentNodeCreationPosition(document, { width: 800, height: 600 }))
+      .toEqual({ x: 100, y: 268 })
+    expect(document).toEqual(original)
   })
 
   test('Given 创建前已有 viewport mutation 与对话状态 When 创建成功 Then 只接管权威文档和选中新节点', () => {

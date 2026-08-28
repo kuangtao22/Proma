@@ -14,15 +14,15 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
+  Popover,
+  PopoverClose,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import { Separator } from '@/components/ui/separator'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 
-/** 顶部添加菜单当前公开的节点类型合同。 */
+/** 顶部添加悬浮菜单当前公开的节点类型合同。 */
 export const NATIVE_CANVAS_NODE_TYPE_OPTIONS = [
   { kind: 'agent', label: 'Agent', enabled: true },
   { kind: 'image', label: '生图', enabled: true },
@@ -31,7 +31,7 @@ export const NATIVE_CANVAS_NODE_TYPE_OPTIONS = [
   { kind: 'video', label: '视频', enabled: false },
 ] as const
 
-/** 顶部菜单单项的稳定联合类型。 */
+/** 顶部悬浮菜单单项的稳定联合类型。 */
 type NativeCanvasNodeTypeOption = typeof NATIVE_CANVAS_NODE_TYPE_OPTIONS[number]
 
 /** 为可用节点类型创建精确选择处理器；禁用项不绑定任何回调。 */
@@ -70,29 +70,38 @@ function NativeCanvasNodeTypeIcon({
   return <Video aria-hidden="true" />
 }
 
-/** 渲染单个添加菜单项，保持 Radix 原生 roving focus 结构。 */
-function NativeCanvasNodeTypeMenuItem({
+/** 渲染单个节点类型选项；可用项选择后关闭悬浮菜单并创建节点。 */
+function NativeCanvasNodeTypePickerOption({
   option,
   onAddNode,
 }: {
   option: NativeCanvasNodeTypeOption
   onAddNode: (kind: CanvasNodeKind) => void
 }): React.ReactElement {
-  /** 仅可用类型获得选择回调，视频保持纯禁用菜单项。 */
-  const onSelect = createNativeCanvasNodeTypeSelectHandler(option, onAddNode)
-  return (
-    <DropdownMenuItem
+  /** 仅可用类型获得选择回调，视频保持纯禁用选项。 */
+  const onClick = createNativeCanvasNodeTypeSelectHandler(option, onAddNode)
+  const optionButton = (
+    <Button
+      type="button"
+      variant="ghost"
+      className="h-9 w-full min-w-0 justify-start gap-2 px-2"
       disabled={!option.enabled}
       aria-disabled={!option.enabled}
-      aria-label={option.enabled ? option.label : `${option.label}，即将支持`}
-      onSelect={onSelect}
+      aria-label={option.enabled ? `添加${option.label}节点` : `${option.label}，即将支持`}
+      onClick={onClick}
     >
       <NativeCanvasNodeTypeIcon kind={option.kind} />
       <span className="min-w-0 truncate">{option.label}</span>
       {!option.enabled ? (
         <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">即将支持</span>
       ) : null}
-    </DropdownMenuItem>
+    </Button>
+  )
+  if (!option.enabled) return optionButton
+  return (
+    <PopoverClose asChild data-canvas-node-picker-close="selection">
+      {optionButton}
+    </PopoverClose>
   )
 }
 
@@ -150,35 +159,36 @@ export function NativeCanvasToolbar({
 
         <Separator orientation="vertical" className="mx-0.5 h-5" />
 
-        <DropdownMenu>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  type="button"
-                  size="icon-sm"
-                  variant="ghost"
-                  className="size-8"
-                  aria-label="添加节点"
-                  disabled={!writable || !canAdd}
-                >
-                  <Plus aria-hidden="true" />
-                </Button>
-              </DropdownMenuTrigger>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">添加节点</TooltipContent>
-          </Tooltip>
-          <DropdownMenuContent
-            align="center"
+        <Popover>
+          <PopoverTrigger asChild>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              className="size-8"
+              aria-label="添加节点"
+              title="添加节点"
+              disabled={!writable || !canAdd}
+            >
+              <Plus aria-hidden="true" />
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent
             side="bottom"
-            className="w-48 max-w-[calc(100vw-1rem)]"
-            data-canvas-node-menu-width="compact"
+            align="center"
+            sideOffset={6}
+            className="w-48 max-w-[calc(100vw-1rem)] p-1"
+            data-canvas-node-picker="popover"
+            data-canvas-node-picker-width="compact"
+            onPointerDown={(event) => event.stopPropagation()}
           >
-            {NATIVE_CANVAS_NODE_TYPE_OPTIONS.map((option) => (
-              <NativeCanvasNodeTypeMenuItem key={option.kind} option={option} onAddNode={onAddNode} />
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
+            <div className="flex flex-col gap-0.5" aria-label="选择节点类型">
+              {NATIVE_CANVAS_NODE_TYPE_OPTIONS.map((option) => (
+                <NativeCanvasNodeTypePickerOption key={option.kind} option={option} onAddNode={onAddNode} />
+              ))}
+            </div>
+          </PopoverContent>
+        </Popover>
 
         <Tooltip>
           <TooltipTrigger asChild>

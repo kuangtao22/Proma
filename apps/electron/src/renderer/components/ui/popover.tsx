@@ -16,6 +16,9 @@ const PopoverTrigger = PopoverPrimitive.Trigger
 
 const PopoverAnchor = PopoverPrimitive.Anchor
 
+/** 关闭当前 Popover，用于选择完成后收起悬浮内容。 */
+const PopoverClose = PopoverPrimitive.Close
+
 const PopoverContent = React.forwardRef<
   React.ElementRef<typeof PopoverPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof PopoverPrimitive.Content>
@@ -39,4 +42,4 @@ const PopoverContent = React.forwardRef<
 ))
 PopoverContent.displayName = PopoverPrimitive.Content.displayName
 
-export { Popover, PopoverAnchor, PopoverTrigger, PopoverContent }
+export { Popover, PopoverAnchor, PopoverClose, PopoverTrigger, PopoverContent }
