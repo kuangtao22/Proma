@@ -32,6 +32,12 @@ export type CanvasImageModuleAdapter = Pick<DesignAdapter,
 /** 图片模块生命周期协调器使用的微任务调度入口。 */
 export type CanvasImageModuleCleanupScheduler = (task: () => void) => void
 
+/** 任务详情缓存上限，避免长时间打开工作台后 trace 常驻内存无界增长。 */
+const MAX_CANVAS_IMAGE_TASK_DETAILS = 20
+
+/** legacy 详情异常统一使用的安全中文文案。 */
+const CANVAS_IMAGE_TASK_DETAILS_ERROR = '任务详情暂时无法加载。'
+
 /** 单个挂载实例持有的生命周期凭据。 */
 export interface CanvasImageModuleLifecycleLease {
   /** 判断当前实例是否仍是该 key 的最新拥有者。 */
@@ -54,6 +60,16 @@ interface CanvasImageModuleLifecycleEntry {
   pendingCleanupId: number | null
   releaseMedia: () => void
   released: boolean
+}
+
+/** 单一可见 error 的内部所有权通道。 */
+type CanvasImageModuleErrorChannel = 'load' | 'save' | 'job' | 'adopt'
+
+/** 可见 error 只允许由创建它的实例、通道和请求代次清理。 */
+interface CanvasImageModuleErrorOwner {
+  epoch: number
+  channel: CanvasImageModuleErrorChannel
+  generation: number
 }
 
 /**
@@ -226,6 +242,8 @@ export function createCanvasImageModuleController(
   let adoptGeneration = 0
   /** 任务详情按 jobId 独立计数，不同任务允许并发完成。 */
   const detailGenerations = new Map<string, number>()
+  /** 当前可见模块 error 的内部请求所有权，不进入 Jotai 公开状态。 */
+  let errorOwner: CanvasImageModuleErrorOwner | null = null
   /** start 只能注册一次订阅和媒体 lease。 */
   let started = false
   /** dispose 或显式失效后永久阻止当前 controller 副作用。 */
@@ -242,6 +260,67 @@ export function createCanvasImageModuleController(
     && lifecycleLease?.isCurrent() === true
   )
 
+  /** 判断两个 error owner 是否表示同一请求。 */
+  const isSameErrorOwner = (
+    left: CanvasImageModuleErrorOwner | null,
+    right: CanvasImageModuleErrorOwner,
+  ): boolean => left?.epoch === right.epoch
+    && left.channel === right.channel
+    && left.generation === right.generation
+
+  /** 新请求只清理同实例、同通道的旧 error，不触碰其它业务通道。 */
+  const beginErrorOperation = (owner: CanvasImageModuleErrorOwner): void => {
+    if (errorOwner?.epoch !== owner.epoch || errorOwner.channel !== owner.channel) return
+    errorOwner = null
+    dependencies.updateState(key, { error: null })
+  }
+
+  /** 当前请求失败时接管唯一可见 error。 */
+  const setOwnedError = (owner: CanvasImageModuleErrorOwner, message: string): void => {
+    errorOwner = owner
+    dependencies.updateState(key, { error: message })
+  }
+
+  /** 成功回调只清理自己创建的 error。 */
+  const clearOwnedError = (owner: CanvasImageModuleErrorOwner): void => {
+    if (!isSameErrorOwner(errorOwner, owner)) return
+    errorOwner = null
+    dependencies.updateState(key, { error: null })
+  }
+
+  /** 按插入顺序修剪详情 LRU，并同步删除失效请求代次。 */
+  const pruneTaskDetails = (
+    taskDetails: Map<string, CanvasImageTaskDetailsState>,
+    validJobIds?: ReadonlySet<string>,
+  ): void => {
+    if (validJobIds) {
+      for (const jobId of detailGenerations.keys()) {
+        if (!validJobIds.has(jobId)) detailGenerations.delete(jobId)
+      }
+      for (const jobId of taskDetails.keys()) {
+        if (!validJobIds.has(jobId)) taskDetails.delete(jobId)
+      }
+    }
+    while (taskDetails.size > MAX_CANVAS_IMAGE_TASK_DETAILS) {
+      /** Map 首项是最久未访问的详情。 */
+      const oldestJobId = taskDetails.keys().next().value
+      if (oldestJobId === undefined) break
+      taskDetails.delete(oldestJobId)
+      detailGenerations.delete(oldestJobId)
+    }
+  }
+
+  /** 写入或访问详情时移动到 Map 末尾，并执行有界修剪。 */
+  const touchTaskDetails = (
+    taskDetails: Map<string, CanvasImageTaskDetailsState>,
+    jobId: string,
+    state: CanvasImageTaskDetailsState,
+  ): void => {
+    taskDetails.delete(jobId)
+    taskDetails.set(jobId, state)
+    pruneTaskDetails(taskDetails)
+  }
+
   /** 以当前权威配置和草稿 dirty 状态接管一次模块快照。 */
   const applySnapshot = (snapshot: Awaited<ReturnType<CanvasImageModuleAdapter['loadCanvasImageModule']>>): void => {
     if (createCanvasImageModuleKey(snapshot.target) !== key
@@ -252,13 +331,17 @@ export function createCanvasImageModuleController(
         && current.snapshot.config.revision > snapshot.config.revision
         ? current.snapshot.config
         : snapshot.config
+      /** LOAD 的 jobs 是详情缓存存在性的权威集合。 */
+      const validJobIds = new Set(snapshot.jobs.map((job) => job.id))
+      const taskDetails = new Map(current.taskDetails)
+      pruneTaskDetails(taskDetails, validJobIds)
       return {
         snapshot: { ...snapshot, config: authoritativeConfig },
         draft: current.draft?.dirty ? current.draft : createDraftFromConfig(authoritativeConfig),
         phase: 'ready',
         saveState: current.draft?.dirty ? current.saveState : 'saved',
-        error: null,
-        previewAssetId: current.previewAssetId ?? authoritativeConfig.adoptedAssetId,
+        previewAssetId: current.previewAssetId,
+        taskDetails,
       }
     })
   }
@@ -269,16 +352,17 @@ export function createCanvasImageModuleController(
     /** 当前 LOAD 同时捕获实例代次和 LOAD 通道代次。 */
     const epoch = instanceEpoch
     const generation = ++loadGeneration
-    dependencies.updateState(key, { phase: 'loading', error: null })
+    const owner: CanvasImageModuleErrorOwner = { epoch, channel: 'load', generation }
+    beginErrorOperation(owner)
+    dependencies.updateState(key, { phase: 'loading' })
     void dependencies.adapter.loadCanvasImageModule(dependencies.target).then((snapshot) => {
       if (!isCurrentInstance(epoch) || generation !== loadGeneration) return
+      clearOwnedError(owner)
       applySnapshot(snapshot)
     }).catch((error: unknown) => {
       if (!isCurrentInstance(epoch) || generation !== loadGeneration) return
-      dependencies.updateState(key, {
-        phase: 'error',
-        error: getCanvasImageModuleErrorMessage(error),
-      })
+      setOwnedError(owner, getCanvasImageModuleErrorMessage(error))
+      dependencies.updateState(key, { phase: 'error' })
     })
   }
 
@@ -290,16 +374,18 @@ export function createCanvasImageModuleController(
     /** 当前任务命令同时捕获实例代次和任务控制通道代次。 */
     const epoch = instanceEpoch
     const generation = ++jobGeneration
-    dependencies.updateState(key, { error: null })
+    const owner: CanvasImageModuleErrorOwner = { epoch, channel: 'job', generation }
+    beginErrorOperation(owner)
     try {
       /** 主进程返回的权威任务记录。 */
       const job = await operation()
       if (!isCurrentInstance(epoch) || generation !== jobGeneration) return null
+      clearOwnedError(owner)
       load()
       return job
     } catch (error) {
       if (isCurrentInstance(epoch) && generation === jobGeneration) {
-        dependencies.updateState(key, { error: getCanvasImageModuleErrorMessage(error) })
+        setOwnedError(owner, getCanvasImageModuleErrorMessage(error))
       }
       throw error
     }
@@ -325,7 +411,6 @@ export function createCanvasImageModuleController(
         return {
           draft: { ...current.draft, ...patch, dirty: true },
           saveState: 'dirty',
-          error: null,
         }
       })
     },
@@ -341,9 +426,11 @@ export function createCanvasImageModuleController(
       /** 当前 SAVE 同时捕获实例代次和 SAVE 通道代次。 */
       const epoch = instanceEpoch
       const generation = ++saveGeneration
+      const owner: CanvasImageModuleErrorOwner = { epoch, channel: 'save', generation }
+      beginErrorOperation(owner)
       /** 请求使用的本地草稿副本。 */
       const draft = { ...current.draft }
-      dependencies.updateState(key, { saveState: 'saving', error: null })
+      dependencies.updateState(key, { saveState: 'saving' })
       try {
         /** 服务端返回的权威配置可能含规范化字段和新 revision。 */
         const savedConfig = await dependencies.adapter.saveCanvasImageModule({
@@ -357,6 +444,7 @@ export function createCanvasImageModuleController(
         })
         if (!isCurrentInstance(epoch) || generation !== saveGeneration) return null
         if (savedConfig.contentId !== dependencies.target.imageModuleId) return null
+        clearOwnedError(owner)
         dependencies.updateState(key, (latest) => {
           if (!latest.snapshot) return {}
           /** 配置只允许 revision 单调前进，事件 LOAD 的更高权威值优先。 */
@@ -371,15 +459,14 @@ export function createCanvasImageModuleController(
               ? createDraftFromConfig(authoritativeConfig)
               : latest.draft ?? createDraftFromConfig(authoritativeConfig),
             saveState: submittedDraftIsCurrent ? 'saved' : latest.draft?.dirty ? 'dirty' : 'saved',
-            error: null,
           }
         })
         return savedConfig
       } catch (error) {
         if (isCurrentInstance(epoch) && generation === saveGeneration) {
+          setOwnedError(owner, getCanvasImageModuleErrorMessage(error))
           dependencies.updateState(key, {
             saveState: isCanvasImageRevisionConflict(error) ? 'conflict' : 'failed',
-            error: getCanvasImageModuleErrorMessage(error),
           })
         }
         throw error
@@ -410,6 +497,8 @@ export function createCanvasImageModuleController(
       /** 当前采用操作同时捕获实例代次和采用通道代次。 */
       const epoch = instanceEpoch
       const generation = ++adoptGeneration
+      const owner: CanvasImageModuleErrorOwner = { epoch, channel: 'adopt', generation }
+      beginErrorOperation(owner)
       try {
         /** 主进程返回采用后配置，禁止 Renderer 自行拼 adoptedAssetId。 */
         const savedConfig = await dependencies.adapter.adoptCanvasImageAsset({
@@ -420,6 +509,7 @@ export function createCanvasImageModuleController(
         })
         if (!isCurrentInstance(epoch) || generation !== adoptGeneration) return null
         if (savedConfig.contentId !== dependencies.target.imageModuleId) return null
+        clearOwnedError(owner)
         dependencies.updateState(key, (current) => {
           if (!current.snapshot) return {}
           /** 采用结果不得回退事件 LOAD 或 SAVE 已接管的更高配置 revision。 */
@@ -429,14 +519,13 @@ export function createCanvasImageModuleController(
           return {
             snapshot: { ...current.snapshot, config: authoritativeConfig },
             draft: current.draft?.dirty ? current.draft : createDraftFromConfig(authoritativeConfig),
-            previewAssetId: authoritativeConfig.adoptedAssetId,
-            error: null,
+            previewAssetId: null,
           }
         })
         return savedConfig
       } catch (error) {
         if (isCurrentInstance(epoch) && generation === adoptGeneration) {
-          dependencies.updateState(key, { error: getCanvasImageModuleErrorMessage(error) })
+          setOwnedError(owner, getCanvasImageModuleErrorMessage(error))
         }
         throw error
       }
@@ -450,7 +539,7 @@ export function createCanvasImageModuleController(
       dependencies.updateState(key, (current) => {
         /** 每次详情更新只复制该 key 内的小 Map。 */
         const taskDetails = new Map(current.taskDetails)
-        taskDetails.set(jobId, { phase: 'loading', details: null, error: null })
+        touchTaskDetails(taskDetails, jobId, { phase: 'loading', details: null, error: null })
         return { taskDetails }
       })
       try {
@@ -467,29 +556,30 @@ export function createCanvasImageModuleController(
         if (!isCurrentInstance(epoch) || detailGenerations.get(jobId) !== generation) return null
         dependencies.updateState(key, (current) => {
           const taskDetails = new Map(current.taskDetails)
-          taskDetails.set(jobId, { phase: 'ready', details: completeDetails, error: null })
+          touchTaskDetails(taskDetails, jobId, { phase: 'ready', details: completeDetails, error: null })
           return { taskDetails }
         })
         return completeDetails
-      } catch (error) {
+      } catch {
         if (isCurrentInstance(epoch) && detailGenerations.get(jobId) === generation) {
           dependencies.updateState(key, (current) => {
             const taskDetails = new Map(current.taskDetails)
             /** 详情失败只影响目标 job，不覆盖模块配置错误。 */
             const failed: CanvasImageTaskDetailsState = {
-              phase: 'failed', details: null, error: getCanvasImageModuleErrorMessage(error),
+              phase: 'failed', details: null, error: CANVAS_IMAGE_TASK_DETAILS_ERROR,
             }
-            taskDetails.set(jobId, failed)
+            touchTaskDetails(taskDetails, jobId, failed)
             return { taskDetails }
           })
         }
-        throw error
+        throw new Error(CANVAS_IMAGE_TASK_DETAILS_ERROR)
       }
     },
     invalidate: (_reason) => {
       if (disposed) return
       disposed = true
       instanceEpoch += 1
+      errorOwner = null
       unsubscribe?.()
       unsubscribe = null
       if (lifecycleLease?.isCurrent()) {
@@ -501,6 +591,7 @@ export function createCanvasImageModuleController(
       if (disposed) return
       disposed = true
       instanceEpoch += 1
+      errorOwner = null
       unsubscribe?.()
       unsubscribe = null
       lifecycleLease?.dispose()

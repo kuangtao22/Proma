@@ -66,6 +66,46 @@ function snapshot(moduleTarget: CanvasImageTarget, revision: number, prompt?: st
   }
 }
 
+/** 创建测试所需的最小权威任务记录。 */
+function jobRecord(moduleTarget: CanvasImageTarget, jobId: string): DesignJobRecord {
+  return {
+    id: jobId,
+    creativeTaskId: `task-${jobId}`,
+    attemptNumber: 1,
+    projectId: moduleTarget.projectId,
+    target: {
+      kind: 'canvas-image', canvasId: moduleTarget.canvasId,
+      nodeId: moduleTarget.nodeId, imageModuleId: moduleTarget.imageModuleId,
+    },
+    action: 'generate',
+    status: 'succeeded',
+    prompt: '测试任务',
+    originalRequest: '测试任务',
+    contextMode: 'none',
+    createdAt: 1,
+    updatedAt: 1,
+  }
+}
+
+/** 创建带指定 adopted 素材的权威快照。 */
+function adoptedSnapshot(
+  moduleTarget: CanvasImageTarget,
+  revision: number,
+  adoptedAssetId: string,
+): CanvasImageModuleSnapshot {
+  const current = snapshot(moduleTarget, revision)
+  return { ...current, config: { ...current.config, adoptedAssetId } }
+}
+
+/** 创建带指定任务集合的权威快照。 */
+function jobsSnapshot(
+  moduleTarget: CanvasImageTarget,
+  revision: number,
+  jobIds: string[],
+): CanvasImageModuleSnapshot {
+  return { ...snapshot(moduleTarget, revision), jobs: jobIds.map((jobId) => jobRecord(moduleTarget, jobId)) }
+}
+
 /** 创建只使用本任务窄合同的可控测试夹具。 */
 function createFixture() {
   const states = new Map<string, CanvasImageModuleViewState>()
@@ -421,5 +461,180 @@ describe('Canvas 生图模块 controller', () => {
     expect(fixture.state(moduleTarget).taskDetails.get('job-trace')?.details).toMatchObject({
       traceState: 'ready', trace: [],
     })
+  })
+
+  test('Given preview 跟随 adopted When 任务自动采用新素材 Then null 语义派生最新 adopted', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('preview-follow')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(adoptedSnapshot(moduleTarget, 1, 'asset-a'))
+    await flush()
+
+    expect(fixture.state(moduleTarget).previewAssetId).toBeNull()
+    expect(fixture.state(moduleTarget).previewAssetId
+      ?? fixture.state(moduleTarget).snapshot?.config.adoptedAssetId).toBe('asset-a')
+
+    fixture.emit(moduleTarget)
+    fixture.loadQueue[1]?.resolve(adoptedSnapshot(moduleTarget, 2, 'asset-b'))
+    await flush()
+
+    expect(fixture.state(moduleTarget).previewAssetId).toBeNull()
+    expect(fixture.state(moduleTarget).previewAssetId
+      ?? fixture.state(moduleTarget).snapshot?.config.adoptedAssetId).toBe('asset-b')
+  })
+
+  test('Given 用户显式预览历史素材 When 事件更新 adopted Then 保留预览；显式采用成功后恢复跟随', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('preview-explicit')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(adoptedSnapshot(moduleTarget, 1, 'asset-a'))
+    await flush()
+    controller.previewAsset('asset-history')
+
+    fixture.emit(moduleTarget)
+    fixture.loadQueue[1]?.resolve(adoptedSnapshot(moduleTarget, 2, 'asset-b'))
+    await flush()
+    expect(fixture.state(moduleTarget).previewAssetId).toBe('asset-history')
+
+    const adopting = controller.adoptAsset('job-history', 'asset-history')
+    fixture.saveQueue[0]?.resolve({
+      ...config(moduleTarget, 3), adoptedAssetId: 'asset-history',
+    })
+    await adopting
+
+    expect(fixture.state(moduleTarget).previewAssetId).toBeNull()
+    expect(fixture.state(moduleTarget).previewAssetId
+      ?? fixture.state(moduleTarget).snapshot?.config.adoptedAssetId).toBe('asset-history')
+  })
+
+  test('Given 较早 LOAD 在途 When SAVE conflict 先到 Then LOAD 成功不得清除 SAVE error', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('error-save-load')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 1))
+    await flush()
+    fixture.emit(moduleTarget)
+    controller.updateDraft({ prompt: '冲突草稿' })
+    const saving = controller.commitDraft()
+    fixture.saveQueue[0]?.reject(new CanvasPublicOperationError(
+      'CANVAS_IMAGE_REVISION_CONFLICT', '配置已在其他窗口更新',
+    ))
+    await expect(saving).rejects.toThrow('配置已在其他窗口更新')
+
+    fixture.loadQueue[1]?.resolve(snapshot(moduleTarget, 2))
+    await flush()
+    expect(fixture.state(moduleTarget)).toMatchObject({
+      saveState: 'conflict', error: '配置已在其他窗口更新',
+    })
+  })
+
+  test('Given SAVE conflict 已显示 When 无关 JOB 开始并失败 Then 不能提前清除 SAVE error', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('error-save-job')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 1))
+    await flush()
+    controller.updateDraft({ prompt: '冲突草稿' })
+    const saving = controller.commitDraft()
+    fixture.saveQueue[0]?.reject(new CanvasPublicOperationError(
+      'CANVAS_IMAGE_REVISION_CONFLICT', '配置已在其他窗口更新',
+    ))
+    await expect(saving).rejects.toThrow()
+
+    const job = controller.createJob()
+    expect(fixture.state(moduleTarget).error).toBe('配置已在其他窗口更新')
+    fixture.jobQueue[0]?.reject(new Error('任务失败'))
+    await expect(job).rejects.toThrow('任务失败')
+    expect(fixture.state(moduleTarget).error).toBe('任务失败')
+  })
+
+  test('Given LOAD error 已显示 When SAVE 成功 Then 无关 SAVE 不得清除 LOAD error', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('error-load-save')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 1))
+    await flush()
+    fixture.emit(moduleTarget)
+    fixture.loadQueue[1]?.reject(new Error('LOAD 失败'))
+    await flush()
+    controller.updateDraft({ prompt: '仍可保存的草稿' })
+
+    const saving = controller.commitDraft()
+    expect(fixture.state(moduleTarget).error).toBe('LOAD 失败')
+    fixture.saveQueue[0]?.resolve(config(moduleTarget, 2, '服务端保存'))
+    await saving
+    expect(fixture.state(moduleTarget).error).toBe('LOAD 失败')
+  })
+
+  test('Given 超过详情缓存上限的 trace When 依次加载 Then 只保留最近 20 个并淘汰 generation', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('details-limit')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 1))
+    await flush()
+
+    for (let index = 0; index < 21; index += 1) {
+      const jobId = `job-${index}`
+      const loading = controller.loadTaskDetails(jobId, true)
+      fixture.traceQueue[index]?.resolve({
+        creativeTaskId: `task-${index}`, currentJobId: jobId,
+        attempts: [], traceState: 'ready', trace: [],
+      })
+      await loading
+    }
+
+    expect(fixture.state(moduleTarget).taskDetails.size).toBe(20)
+    expect(fixture.state(moduleTarget).taskDetails.has('job-0')).toBe(false)
+    expect(fixture.state(moduleTarget).taskDetails.has('job-20')).toBe(true)
+  })
+
+  test('Given 权威 LOAD 不再包含旧 job When 事件刷新 Then 删除旧详情并保留仍存在 job', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('details-authority')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(jobsSnapshot(moduleTarget, 1, ['job-a', 'job-b']))
+    await flush()
+    const jobA = controller.loadTaskDetails('job-a')
+    const jobB = controller.loadTaskDetails('job-b')
+    fixture.detailQueue[0]?.resolve({
+      creativeTaskId: 'task-a', currentJobId: 'job-a', attempts: [], traceState: 'ready',
+    })
+    fixture.detailQueue[1]?.resolve({
+      creativeTaskId: 'task-b', currentJobId: 'job-b', attempts: [], traceState: 'ready',
+    })
+    await Promise.all([jobA, jobB])
+
+    fixture.emit(moduleTarget)
+    fixture.loadQueue[1]?.resolve(jobsSnapshot(moduleTarget, 2, ['job-b']))
+    await flush()
+
+    expect(fixture.state(moduleTarget).taskDetails.has('job-a')).toBe(false)
+    expect(fixture.state(moduleTarget).taskDetails.get('job-b')?.details?.creativeTaskId).toBe('task-b')
+  })
+
+  test('Given legacy 详情异常包含路径 UUID 和堆栈 When 加载失败 Then state 与 rejection 只保留固定中文', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('details-safe-error')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 1))
+    await flush()
+    const loading = controller.loadTaskDetails('job-secret')
+    fixture.detailQueue[0]?.reject(new Error(
+      '/Users/secret/design.json 123e4567-e89b-12d3-a456-426614174000\n at internal()',
+    ))
+
+    await expect(loading).rejects.toThrow('任务详情暂时无法加载。')
+    expect(fixture.state(moduleTarget).taskDetails.get('job-secret')).toMatchObject({
+      phase: 'failed', error: '任务详情暂时无法加载。',
+    })
+    expect(JSON.stringify(fixture.state(moduleTarget).taskDetails.get('job-secret'))).not.toContain('/Users/secret')
   })
 })
