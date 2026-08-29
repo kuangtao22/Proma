@@ -20,7 +20,7 @@ import type {
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { parseCanvasDocument } from './canvas-document-store'
-import { createCanvasOperationSerializer, registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
+import { createCanvasOperationSerializer, getCanvasToolProviderRuntime, registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
 
 /** 测试 IPC handler 的最小签名。 */
 type TestHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
@@ -267,6 +267,7 @@ function createContext(options: {
       },
     },
     store: {
+      loadWithDirectoryCapability: () => { throw new Error('测试未配置目录读取') },
       load: (target) => {
         calls.push('store:load')
         storeInputs.push(target)
@@ -279,6 +280,7 @@ function createContext(options: {
         if (options.mutateError) throw options.mutateError
         return options.mutateResult ?? createDocument(expectedRevision + (mutations.length > 0 ? 1 : 0))
       },
+      validateBatchOperations: (_target, _expectedRevision, operations) => structuredClone(operations) as CanvasMutation[],
     },
     batch: {
       reconcileLocked: async () => {
@@ -2612,6 +2614,8 @@ describe('原生 Canvas 文档 IPC', () => {
       handle: (channel: string, handler: TestHandler): void => { handlers.set(channel, handler) },
       removeHandler: (channel: string): void => { removed.push(channel); handlers.delete(channel) },
     }
+    /** 两代注册故意复用同一个 batch execute，验证清理按注册代次而不是函数身份。 */
+    const executeBatch = async () => ({ document: createDocument(3), operationId: 'batch-operation' })
     /** 创建使用同一 registrar、但返回不同 revision 的注册依赖。 */
     const createOptions = (revision: number) => ({
       ipc,
@@ -2620,10 +2624,13 @@ describe('原生 Canvas 文档 IPC', () => {
         runWorkspaceWrite: <T>(_projectId: string, effect: () => T): T => effect(),
       },
       store: {
+        loadWithDirectoryCapability: () => { throw new Error('测试未配置目录读取') },
         load: () => ({ document: createDocument(revision), writable: true as const, nodeIssues: [] }),
         mutate: () => createDocument(revision),
+        validateBatchOperations: (_target: unknown, _expectedRevision: number, operations: unknown[]) => structuredClone(operations) as CanvasMutation[],
       },
       batch: {
+        execute: executeBatch,
         reconcileLocked: async () => ({
           document: createDocument(revision), operationId: '', publications: [],
         }),
@@ -2706,9 +2713,11 @@ describe('原生 Canvas 文档 IPC', () => {
     const registrationA = registerCanvasDocumentIpcHandlers(createOptions(1))
     /** 当前拥有 handler 的新 generation。 */
     const registrationB = registerCanvasDocumentIpcHandlers(createOptions(2))
+    expect(getCanvasToolProviderRuntime()).not.toBeNull()
     removed.length = 0
 
     registrationA.dispose()
+    expect(getCanvasToolProviderRuntime()).not.toBeNull()
 
     await expect(invoke(handlers, CANVAS_IPC_CHANNELS.LOAD, sender, {
       projectId: 'project-1', canvasId: 'canvas-1',
@@ -2719,6 +2728,7 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(removed).toEqual([])
 
     registrationB.dispose()
+    expect(getCanvasToolProviderRuntime()).toBeNull()
     expect(handlers.size).toBe(0)
     expect(removed).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,

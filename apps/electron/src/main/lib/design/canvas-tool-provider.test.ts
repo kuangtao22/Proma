@@ -1,0 +1,214 @@
+import { describe, expect, test } from 'bun:test'
+import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
+import type { CanvasDocument, CanvasMutation, CanvasNodeReference } from '@proma/shared'
+import { createEmptyCanvasDocument } from '@proma/shared'
+import { CANVAS_TOOL_NAMES, createCanvasToolRun, type CanvasToolProviderDependencies, type CanvasToolRunContext } from './canvas-tool-provider'
+
+const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+const reference: CanvasNodeReference = { ...target, nodeId: 'doc-1', nodeType: 'document', nodeRevision: 3, title: '需求' }
+
+/** 调用指定 Pi custom tool。 */
+async function executeTool(tools: ToolDefinition[], name: string, args: Record<string, unknown>, toolCallId = 'tool-call-1') {
+  const tool = tools.find((candidate) => candidate.name === name)
+  if (!tool) throw new Error(`工具不存在: ${name}`)
+  return tool.execute(toolCallId, args as never, undefined as never, undefined as never, undefined as never)
+}
+
+/** 构造可观察写入、执行与全项目扫描的窄依赖。 */
+function createFixture(options: { conflictOnce?: boolean; conflictAlways?: boolean } = {}) {
+  let document: CanvasDocument = {
+    ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
+    nodes: [
+      { id: 'doc-1', kind: 'document', title: '需求', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 2 },
+      { id: 'image-1', kind: 'image', title: '主视觉', position: { x: 100, y: 0 }, imageModuleId: 'image-content-1' },
+    ],
+    edges: [{ id: 'edge-1', sourceNodeId: 'doc-1', sourcePort: 'output', targetNodeId: 'image-1', targetPort: 'input' }],
+  }
+  const linkedCanvasIds = ['canvas-1', 'canvas-2']
+  const batchInputs: Array<{ baseRevision: number; operations: unknown[]; sourceToolCallId: string }> = []
+  const runInputs: string[] = []
+  let listCalls = 0
+  const dependencies: CanvasToolProviderDependencies = {
+    sessions: {
+      list: () => { listCalls += 1; return [] },
+      create: (input) => ({ id: 'created-canvas', projectId: input.projectId, title: input.title ?? '新 Canvas', archived: false, createdAt: 1, updatedAt: 1 }),
+      requireNative: (projectId, canvasId) => {
+        if (projectId !== target.projectId || !['canvas-1', 'canvas-2', 'created-canvas'].includes(canvasId)) throw new Error('Canvas 会话不存在')
+        return { id: canvasId, projectId, title: canvasId, archived: false, createdAt: 1, updatedAt: 1 }
+      },
+    },
+    bindings: {
+      get: () => ({ projectId: target.projectId, sessionId: 'session-1', linkedCanvasIds: [...linkedCanvasIds], defaultCanvasId: 'canvas-1', lastActiveCanvasId: 'canvas-2', updatedAt: 1 }),
+      link: (input) => {
+        if (!linkedCanvasIds.includes(input.canvasId)) linkedCanvasIds.push(input.canvasId)
+        return { projectId: input.projectId, sessionId: input.sessionId, linkedCanvasIds: [...linkedCanvasIds], defaultCanvasId: input.makeDefault ? input.canvasId : 'canvas-1', lastActiveCanvasId: input.canvasId, updatedAt: 2 }
+      },
+      unlink: (input) => ({ projectId: input.projectId, sessionId: input.sessionId, linkedCanvasIds: linkedCanvasIds.filter((id) => id !== input.canvasId), defaultCanvasId: 'canvas-1', lastActiveCanvasId: 'canvas-1', updatedAt: 2 }),
+      setDefault: (input) => ({ projectId: input.projectId, sessionId: input.sessionId, linkedCanvasIds: [...linkedCanvasIds], defaultCanvasId: input.canvasId, lastActiveCanvasId: input.canvasId, updatedAt: 2 }),
+    },
+    documents: {
+      load: () => ({ document: structuredClone(document), writable: true, nodeIssues: [] }),
+      validateBatchOperations: (_target, expectedRevision, operations) => {
+        if (expectedRevision !== document.revision) throw new Error('CANVAS_REVISION_CONFLICT')
+        return structuredClone(operations) as CanvasMutation[]
+      },
+    },
+    readNodeContent: async (_target, node) => node.kind === 'document' ? 'A'.repeat(40_000) : '',
+    batch: { execute: async (input) => {
+      batchInputs.push({ baseRevision: input.baseRevision, operations: input.operations, sourceToolCallId: input.sourceToolCallId })
+      if (options.conflictAlways || (options.conflictOnce && batchInputs.length === 1)) {
+        document = { ...document, revision: 4 }
+        throw new Error('CANVAS_REVISION_CONFLICT')
+      }
+      document = { ...document, revision: input.baseRevision + 1 }
+      return { document, operationId: `operation-${batchInputs.length}` }
+    } },
+    runNode: async (_context, node) => { runInputs.push(node.id); return { status: 'started', taskId: `task-${node.id}` } },
+  }
+  const context: CanvasToolRunContext = { projectId: target.projectId, sessionId: 'session-1', runStartedAt: 99, explicitReferences: [reference], userIntent: 'discuss' }
+  return { dependencies, context, batchInputs, runInputs, getListCalls: () => listCalls }
+}
+
+describe('普通 Agent Canvas Tool Provider', () => {
+  test('Given 普通分析运行 When 获取上下文 Then 注入五工具且不扫描项目全部画布', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    expect(run.piCustomTools.map((tool) => tool.name)).toEqual([...CANVAS_TOOL_NAMES])
+    expect(run.allowedToolNames).toEqual([...CANVAS_TOOL_NAMES])
+    expect(run.allowedToolNamesMode).toBe('extend')
+    expect(run.systemPromptAppend).toContain('不要按“首页”或“设计”等关键词硬编码')
+    const result = await executeTool(run.piCustomTools, 'canvas_get_context', {})
+    expect(result.details).toMatchObject({ defaultCanvasId: 'canvas-1', activeCanvasId: 'canvas-2' })
+    expect(JSON.stringify(result.details)).toContain('doc-1')
+    expect(fixture.getListCalls()).toBe(0)
+  })
+
+  test('Given 只读分析 When 读取节点 Then 返回必要邻接、限制总字符并拒绝未关联画布', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const result = await executeTool(run.piCustomTools, 'canvas_read', { canvasId: 'canvas-1', nodeIds: ['doc-1'], includeNeighbors: true })
+    expect(result.details).toMatchObject({ canvasId: 'canvas-1', revision: 3, truncated: true })
+    expect(JSON.stringify(result.details).length).toBeLessThan(40_000)
+    await expect(executeTool(run.piCustomTools, 'canvas_read', { canvasId: 'foreign-canvas', nodeIds: ['doc-1'] })).rejects.toThrow('CANVAS_ACCESS_DENIED')
+  })
+
+  test('Given 高连接度节点 When 读取邻接 Then 节点和边共同受 32 节点预算约束', async () => {
+    const fixture = createFixture()
+    /** 构造一个中心节点连接 40 个邻居的权威文档。 */
+    const neighborNodes = Array.from({ length: 40 }, (_, index) => ({
+      id: `image-${index}`, kind: 'image' as const, title: `图片 ${index}`,
+      position: { x: index, y: 0 }, imageModuleId: `module-${index}`,
+    }))
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
+        nodes: [
+          { id: 'doc-1', kind: 'document', title: '中心', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 1 },
+          ...neighborNodes,
+        ],
+        edges: neighborNodes.map((node, index) => ({
+          id: `edge-${index}`, sourceNodeId: 'doc-1', sourcePort: 'output', targetNodeId: node.id, targetPort: 'input',
+        })),
+      },
+      writable: true,
+      nodeIssues: [],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const result = await executeTool(run.piCustomTools, 'canvas_read', {
+      canvasId: 'canvas-1', nodeIds: ['doc-1'], includeNeighbors: true,
+    })
+    const details = result.details as { nodes: Array<{ node: { id: string } }>; edges: Array<{ sourceNodeId: string; targetNodeId: string }> }
+    const returnedNodeIds = new Set(details.nodes.map((entry) => entry.node.id))
+    expect(details.nodes.length).toBeLessThanOrEqual(32)
+    expect(details.edges.every((edge) => returnedNodeIds.has(edge.sourceNodeId) && returnedNodeIds.has(edge.targetNodeId))).toBe(true)
+  })
+
+  test('Given manage 扩大访问 When 没有或已有明确选择 Then 分别拒绝与关联', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context, userIntent: 'plan' })
+    await expect(executeTool(run.piCustomTools, 'canvas_manage', { action: 'link', canvasId: 'created-canvas' })).rejects.toThrow('CANVAS_EXPLICIT_SELECTION_REQUIRED')
+    const result = await executeTool(run.piCustomTools, 'canvas_manage', { action: 'link', canvasId: 'created-canvas', explicitSelection: true })
+    expect(result.details).toMatchObject({ action: 'link', canvasId: 'created-canvas' })
+  })
+
+  test('Given 删除意图模糊或明确 When apply Then 模糊拒绝，明确返回 revision/task identity', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context, userIntent: 'execute' })
+    const args = { canvasId: 'canvas-1', baseRevision: 3, operations: [{ type: 'remove-nodes', nodeIds: ['doc-1'] }] }
+    await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', args)).rejects.toThrow('CANVAS_DESTRUCTIVE_INTENT_REQUIRED')
+    const result = await executeTool(run.piCustomTools, 'canvas_apply_changes', { ...args, destructiveIntent: 'explicit' }, 'task-tool-1')
+    expect(fixture.batchInputs).toHaveLength(1)
+    expect(result.details).toMatchObject({ revision: 4, operationId: 'operation-1', sourceToolCallId: 'task-tool-1' })
+  })
+
+  test('Given 首次 revision 冲突 When apply Then 权威重读后只重试一次', async () => {
+    const fixture = createFixture({ conflictOnce: true })
+    const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context, userIntent: 'execute' })
+    const result = await executeTool(run.piCustomTools, 'canvas_apply_changes', { canvasId: 'canvas-1', baseRevision: 3, operations: [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }] }, 'task-tool-conflict')
+    expect(fixture.batchInputs.map((input) => input.baseRevision)).toEqual([3, 4])
+    expect(result.details).toMatchObject({ revision: 5, sourceToolCallId: 'task-tool-conflict-retry' })
+  })
+
+  test('Given 最大长度 tool call ID When revision 冲突 Then 重试身份仍满足共享协议上限', async () => {
+    const fixture = createFixture({ conflictOnce: true })
+    const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context, userIntent: 'execute' })
+    const result = await executeTool(run.piCustomTools, 'canvas_apply_changes', {
+      canvasId: 'canvas-1', baseRevision: 3,
+      operations: [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
+    }, 't'.repeat(128))
+    expect((result.details as { sourceToolCallId: string }).sourceToolCallId.length).toBeLessThanOrEqual(128)
+  })
+
+  test('Given 两次 revision 冲突 When apply Then 恰好尝试两次并原样抛出第二次冲突', async () => {
+    const fixture = createFixture({ conflictAlways: true })
+    const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context, userIntent: 'execute' })
+    await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', {
+      canvasId: 'canvas-1', baseRevision: 3,
+      operations: [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
+    }, 'task-tool-conflict-twice')).rejects.toThrow('CANVAS_REVISION_CONFLICT')
+    expect(fixture.batchInputs).toHaveLength(2)
+  })
+
+  test('Given upsert 覆盖现有节点 When apply Then 必须声明明确破坏性意图', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context, userIntent: 'execute' })
+    const operations = [{
+      type: 'upsert-nodes',
+      nodes: [{ id: 'doc-1', kind: 'document', title: '覆盖需求', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 2 }],
+    }]
+    await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', {
+      canvasId: 'canvas-1', baseRevision: 3, operations,
+    })).rejects.toThrow('CANVAS_DESTRUCTIVE_INTENT_REQUIRED')
+    await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', {
+      canvasId: 'canvas-1', baseRevision: 3, operations, destructiveIntent: 'explicit',
+    })).resolves.toMatchObject({ details: { revision: 4 } })
+  })
+
+  test('Given discuss 与 execute When run_nodes Then 只有 execute 调用已有执行器', async () => {
+    const fixture = createFixture()
+    const discuss = createCanvasToolRun(fixture.dependencies, fixture.context)
+    await expect(executeTool(discuss.piCustomTools, 'canvas_run_nodes', { canvasId: 'canvas-1', nodeIds: ['image-1'] })).rejects.toThrow('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
+    const execute = createCanvasToolRun(fixture.dependencies, { ...fixture.context, userIntent: 'execute' })
+    const result = await executeTool(execute.piCustomTools, 'canvas_run_nodes', { canvasId: 'canvas-1', nodeIds: ['image-1'] })
+    expect(fixture.runInputs).toEqual(['image-1'])
+    expect(result.details).toMatchObject({ revision: 3, tasks: [{ nodeId: 'image-1', taskId: 'task-image-1' }] })
+  })
+
+  test('Given webview 暂无执行器 When execute run_nodes Then 返回稳定 unsupported', async () => {
+    const fixture = createFixture()
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
+        nodes: [{ id: 'webview-1', kind: 'webview', title: '原型', position: { x: 0, y: 0 }, prototypeId: 'prototype-1', contentRevision: 1 }],
+      },
+      writable: true,
+      nodeIssues: [],
+    })
+    fixture.dependencies.runNode = async () => ({ status: 'unsupported', message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' })
+    const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context, userIntent: 'execute' })
+    const result = await executeTool(run.piCustomTools, 'canvas_run_nodes', { canvasId: 'canvas-1', nodeIds: ['webview-1'] })
+    expect(result.details).toMatchObject({
+      tasks: [{ nodeId: 'webview-1', status: 'unsupported', message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' }],
+    })
+  })
+})

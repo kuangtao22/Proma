@@ -22,6 +22,8 @@ import type {
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
   CanvasMutation,
+  CanvasBatchOperationEnvelope,
+  CanvasNode,
   CanvasNodeIssue,
   CanvasPublicError,
   CanvasPublicErrorCode,
@@ -50,19 +52,21 @@ import type {
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import type { WorkspaceOperationGuard } from '../workspace-operation-guard'
+import { runStableDirectoryNative } from '../stable-directory-native-host'
 import type { CanvasImageModuleStore } from './canvas-image-module-store'
 import type { CanvasImageJobTargetAdapter } from './canvas-image-job-target'
 import type { DesignJobManager } from './design-job-manager'
 import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
-import type { CanvasBatchReconciliationResult } from './canvas-agent-batch-operation'
+import type { CanvasBatchOperationResult, CanvasBatchReconciliationResult } from './canvas-agent-batch-operation'
 import type {
   CanvasContentNodeLifecycle,
   CanvasContentNodeReconciledResult,
   CanvasContentNodeReconciliationResult,
 } from './canvas-content-node-lifecycle'
 import type { AgentRunExtensions } from '../agent-run-extensions'
+import type { CanvasToolNodeRunResult, CanvasToolRunContext } from './canvas-tool-provider'
 import {
   CANVAS_AGENT_ALLOWED_TOOL_NAMES,
   requireCanvasAgentRunOwner,
@@ -111,9 +115,12 @@ export interface CanvasDocumentIpcOptions {
   ipc: CanvasDocumentIpcRegistrar
   listAuthorizedWebContents: () => WebContents[]
   guard: Pick<WorkspaceOperationGuard, 'runWorkspaceWrite'>
-  store: Pick<CanvasDocumentStore, 'load' | 'mutate'>
+  store: Pick<CanvasDocumentStore, 'load' | 'loadWithDirectoryCapability' | 'mutate' | 'validateBatchOperations'>
   /** 唯一批处理服务；调用时外层已持有共享 Canvas 串行权和 workspace lease。 */
-  batch: { reconcileLocked: (target: CanvasTarget) => Promise<CanvasBatchReconciliationResult> }
+  batch: {
+    reconcileLocked: (target: CanvasTarget) => Promise<CanvasBatchReconciliationResult>
+    execute?: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult>
+  }
   /** 生产注入进程级唯一实例，测试未注入时由注册器本地创建。 */
   operationSerializer?: CanvasOperationSerializer
   /** 已持有 lease 时执行目标 Canvas 对账或联合创建事务。 */
@@ -145,6 +152,22 @@ export interface CanvasDocumentIpcOptions {
     stop: (sessionId: string) => void
   }
   getProjectReadOnlyReason: (projectId: string) => string | undefined
+}
+
+/** 普通 Agent 工具复用 IPC 已注册的唯一文档与 Task8 batch 实例。 */
+export interface CanvasToolProviderRuntime {
+  documents: Pick<CanvasDocumentStore, 'load' | 'validateBatchOperations'>
+  batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
+  readNodeContent: (target: CanvasTarget, node: CanvasNode) => Promise<string>
+  runNode: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<CanvasToolNodeRunResult>
+}
+
+/** 当前注册代次拥有的进程内运行时，不经过 Renderer IPC。 */
+let canvasToolProviderRuntime: { owner: symbol; value: CanvasToolProviderRuntime } | null = null
+
+/** IPC 尚未注册或测试未注入 execute 时返回 null，普通 Agent 保持原能力。 */
+export function getCanvasToolProviderRuntime(): CanvasToolProviderRuntime | null {
+  return canvasToolProviderRuntime?.value ?? null
 }
 
 /** Canvas Agent target 的 exact-key 解析结果。 */
@@ -1169,6 +1192,81 @@ export function registerCanvasDocumentIpcHandlers(
     options.guard.runWorkspaceWrite(target.projectId, effect)
   ))
 
+  /** 使用既有 no-follow helper 读取受管文档或原型正文。 */
+  const readCanvasNodeContent = async (target: CanvasTarget, node: CanvasNode): Promise<string> => {
+    if (node.kind !== 'document' && node.kind !== 'webview') return ''
+    const loaded = options.store.loadWithDirectoryCapability(target)
+    const nodes = loaded.openSingleChildDirectory('nodes')
+    nodes.assertValid()
+    const result = await runStableDirectoryNative({
+      mode: 'canvas-content-read',
+      roots: [nodes.rootPath],
+      childName: 'nodes',
+      entryId: node.kind === 'document' ? node.documentId : node.prototypeId,
+      fileName: node.kind === 'document' ? 'content.md' : 'index.html',
+    }, nodes.authorizeOpenedRoots)
+    nodes.assertValid()
+    if (!result.readOutcome || result.readOutcome.status !== 'ok') {
+      throw new Error(result.readOutcome?.status === 'corrupt'
+        ? `CANVAS_CONTENT_CORRUPT: ${result.readOutcome.error}`
+        : 'CANVAS_CONTENT_NOT_FOUND')
+    }
+    return result.readOutcome.content
+  }
+
+  /** 图片节点复用 Renderer 同一 Design Job 流程；仓库尚无 webview 执行器。 */
+  const runCanvasNode = async (
+    _context: CanvasToolRunContext,
+    node: CanvasNode,
+    target: CanvasTarget,
+  ): Promise<CanvasToolNodeRunResult> => {
+    if (node.kind !== 'image') {
+      return { status: 'unsupported', message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' }
+    }
+    const imageTarget: CanvasImageTarget = {
+      ...target,
+      nodeId: node.id,
+      imageModuleId: node.imageModuleId,
+    }
+    const job = await runImageCanvasExclusive(imageTarget, async () => {
+      requireWritableProject(target.projectId, options)
+      const config = await options.imageModules.load(imageTarget)
+      assertOwnedImageConfig(config, imageTarget)
+      if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
+      return options.imageJobs.createCanvasImage({
+        projectId: target.projectId,
+        target: {
+          kind: 'canvas-image', canvasId: target.canvasId,
+          nodeId: node.id, imageModuleId: node.imageModuleId,
+        },
+        action: config.adoptedAssetId ? 'edit' : 'generate',
+        prompt: config.prompt,
+        contextMode: config.contextMode,
+        imageModelProfileId: config.selectedModelProfileId,
+        generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
+        canvasImageConfigRevision: config.revision,
+        ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
+      })
+    })
+    if (!isOwnedImageJob(job, imageTarget)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
+    void options.imageJobs.run(job.id).catch((error) => {
+      console.error('[CanvasDocumentIPC] Agent Canvas 图片任务后台运行失败:', error)
+    })
+    return { status: 'started', taskId: job.id }
+  }
+
+  if (options.batch.execute) {
+    canvasToolProviderRuntime = {
+      owner: registrationToken,
+      value: {
+        documents: options.store,
+        batch: { execute: options.batch.execute },
+        readNodeContent: readCanvasNodeContent,
+        runNode: runCanvasNode,
+      },
+    }
+  }
+
   /** 从目标任务输出建立图片素材闭包，并拒绝任何跨目标或损坏引用。 */
   const resolveOwnedImageAssets = (
     target: CanvasImageTarget,
@@ -1918,6 +2016,9 @@ export function registerCanvasDocumentIpcHandlers(
       /** 被后续注册替代的 generation 已失去 handler 所有权。 */
       if (currentRegistrationTokens.get(options.ipc) !== registrationToken) return
       currentRegistrationTokens.delete(options.ipc)
+      if (canvasToolProviderRuntime?.owner === registrationToken) {
+        canvasToolProviderRuntime = null
+      }
       for (const channel of channels) options.ipc.removeHandler(channel)
     },
   }

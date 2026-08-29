@@ -1330,7 +1330,10 @@ export class AgentOrchestrator {
         const staleAtEntry = denyStaleToolRun()
         if (staleAtEntry) return staleAtEntry
         /** 单次运行白名单先于参数解析生效，bypassPermissions 也不能绕过。 */
-        const runPolicyDenial = denyToolOutsideRunAllowlist(toolName, extensions.allowedToolNames)
+        /** 普通 Agent 的 Canvas 工具采用追加模式，不能用局部名单删除既有工具能力。 */
+        const runPolicyDenial = extensions.allowedToolNamesMode === 'extend'
+          ? undefined
+          : denyToolOutsideRunAllowlist(toolName, extensions.allowedToolNames)
         if (runPolicyDenial) return runPolicyDenial
         const currentMode = getPermissionMode()
 

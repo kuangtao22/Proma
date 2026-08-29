@@ -62,6 +62,12 @@ describe('Agent 工作区迁移准入', () => {
 })
 
 describe('Agent sendMessage 准入顺序合同', () => {
+  test('Given Canvas 工具使用扩展 allowlist When 普通 Agent 检查权限 Then 不替换原有工具策略', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    expect(source).toContain("extensions.allowedToolNamesMode === 'extend'")
+    expect(source).toContain('denyToolOutsideRunAllowlist(toolName, extensions.allowedToolNames)')
+  })
+
   test('Given 已解析 Canvas 引用 When 持久化普通发送和 queue-now Then JSONL 写真实快照且原始文本不改写', () => {
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
     const persistStart = source.indexOf('  private persistUserMessage(')

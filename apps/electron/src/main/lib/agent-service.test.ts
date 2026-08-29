@@ -4,6 +4,23 @@ import { join } from 'node:path'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 
 describe('Agent service 迁移准入', () => {
+  test('Given 普通项目、无项目与 Design 内部会话 When 准备运行 Then 仅普通项目在引用解析后注入 Canvas 单轮工具', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    expect(source).toContain('createCanvasToolRun(')
+    expect(source).toContain('prepared.references')
+    expect(source).toContain('sessionMeta.sourceDesignProjectId')
+    expect(source).toContain('sessionMeta.sourceCanvasProjectId')
+    expect(source).toContain("|| input.triggeredBy === 'user'")
+    /** 只在运行准备函数体内比较调用顺序，避免 import 文本造成误报。 */
+    const functionStart = source.indexOf('export function prepareAgentRun')
+    /** 下一个顶层文档注释标记函数体结束。 */
+    const functionEnd = source.indexOf('/** Agent service', functionStart)
+    /** 被测运行准备函数的源码片段。 */
+    const functionBody = source.slice(functionStart, functionEnd)
+    expect(functionBody.indexOf('createCanvasToolRun('))
+      .toBeGreaterThan(functionBody.indexOf('prepareAgentCanvasMessageForSend('))
+  })
+
   test('Given 数据根迁移预检 When 检查 service 导出 Then 使用 generation-owned 写查询并提供 workspace 维度能力', () => {
     /** 读取 service 源码约束迁移查询不退化为 UI 活跃状态。 */
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')

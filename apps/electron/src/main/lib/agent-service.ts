@@ -70,6 +70,8 @@ import { createCanvasDocumentStore } from './design/canvas-document-store'
 import { createCanvasNodeReferenceResolver } from './design/canvas-node-reference-resolver'
 import { CanvasSessionStore } from './design/canvas-session-store'
 import { designPathResolver } from './design/design-paths'
+import { createCanvasToolRun } from './design/canvas-tool-provider'
+import { getCanvasToolProviderRuntime } from './design/canvas-document-ipc'
 
 /** 保持现有主进程调用方从 agent-service 导入运行扩展类型的兼容性。 */
 export type { AgentRunExtensions } from './agent-run-extensions'
@@ -85,10 +87,12 @@ const orchestrator = new AgentOrchestrator(adapter, eventBus)
 const canvasReferenceSessionStore = new CanvasSessionStore({ pathResolver: designPathResolver })
 /** 文档 Store 通过会话 registry 在每次 LOAD 时重新复核 Canvas 归属。 */
 const canvasReferenceDocumentStore = createCanvasDocumentStore({ sessions: canvasReferenceSessionStore })
+/** 普通 Agent 工具与引用解析共享同一进程内 binding Store。 */
+const canvasToolBindingStore = new AgentCanvasBindingStore()
 /** 发送边界的权威 Canvas 节点引用解析器。 */
 const canvasNodeReferenceResolver = createCanvasNodeReferenceResolver({
   getSession: getAgentSessionMeta,
-  getBinding: (projectId, sessionId) => new AgentCanvasBindingStore().get(projectId, sessionId),
+  getBinding: (projectId, sessionId) => canvasToolBindingStore.get(projectId, sessionId),
   requireCanvas: (projectId, canvasId) => canvasReferenceSessionStore.requireNative(projectId, canvasId),
   loadCanvas: (target) => canvasReferenceDocumentStore.load(target),
 })
@@ -98,7 +102,44 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
   input: T,
   extensions: AgentRunExtensions = {},
 ): PreparedAgentCanvasMessage<T> {
-  return prepareAgentCanvasMessageForSend(input, extensions, canvasNodeReferenceResolver)
+  /** 引用先完成权威解析，工具上下文只能使用解析后的快照。 */
+  const prepared = prepareAgentCanvasMessageForSend(input, extensions, canvasNodeReferenceResolver)
+  const sessionMeta = getAgentSessionMeta(input.sessionId)
+  const runtime = getCanvasToolProviderRuntime()
+  const isInteractiveUserRun = !('triggeredBy' in input)
+    || input.triggeredBy === undefined
+    || input.triggeredBy === 'user'
+  if (!runtime
+    || !sessionMeta?.workspaceId
+    || sessionMeta.sourceDesignProjectId
+    || sessionMeta.sourceCanvasProjectId
+    || !isInteractiveUserRun) return prepared
+  const canvasRun = createCanvasToolRun({
+    sessions: canvasReferenceSessionStore,
+    bindings: canvasToolBindingStore,
+    documents: runtime.documents,
+    readNodeContent: runtime.readNodeContent,
+    batch: runtime.batch,
+    runNode: runtime.runNode,
+  }, {
+    projectId: sessionMeta.workspaceId,
+    sessionId: input.sessionId,
+    runStartedAt: 'startedAt' in input && input.startedAt != null ? input.startedAt : Date.now(),
+    explicitReferences: prepared.references ?? [],
+    userIntent: extensions.canvasUserIntent ?? 'discuss',
+  })
+  return {
+    ...prepared,
+    extensions: {
+      ...prepared.extensions,
+      systemPromptAppend: [prepared.extensions.systemPromptAppend, canvasRun.systemPromptAppend]
+        .filter((section): section is string => Boolean(section?.trim()))
+        .join('\n\n'),
+      piCustomTools: [...(prepared.extensions.piCustomTools ?? []), ...canvasRun.piCustomTools],
+      allowedToolNames: [...(prepared.extensions.allowedToolNames ?? []), ...canvasRun.allowedToolNames],
+      allowedToolNamesMode: canvasRun.allowedToolNamesMode,
+    },
+  }
 }
 /** Agent service 与队列写入口共享的工作区迁移守卫。 */
 const workspaceOperationGuard = createWorkspaceOperationGuard({
