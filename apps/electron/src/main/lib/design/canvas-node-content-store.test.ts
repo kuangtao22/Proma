@@ -542,6 +542,18 @@ describe('Canvas 节点内容 Store', () => {
     expect(fixture.scopes.nodes.size).toBe(0)
   })
 
+  test('Given 批量事务已准备内容 When 提交前回滚 Then 原子移出 nodes 且不进入公开回收列表', async () => {
+    const fixture = createFixture()
+    const input = { kind: 'document' as const, contentId: 'content-batch' }
+    await fixture.store.prepareEmptyContent(target, input)
+
+    await fixture.store.discardPreparedContent(target, input, 'batch-rollback-1')
+
+    expect(fixture.scopes.nodes.has(input.contentId)).toBe(false)
+    expect(fixture.scopes.trash.has('batch-rollback-1')).toBe(true)
+    expect(await fixture.store.listTrash(target)).toEqual([])
+  })
+
   test('Given helper rename 前失败或 rename 后耐久性未确认 When 提交 Then 映射为明确错误', async () => {
     const failed = createFixture({
       outcomeFor: (request) => request.fileName === 'content.md'

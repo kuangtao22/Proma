@@ -44,6 +44,12 @@ export interface CanvasNodeContentStore {
   prepareEmptyContent: (target: CanvasTarget, input: PrepareCanvasNodeContentInput) => Promise<void>
   prepareMigratedContent: (target: CanvasTarget, seed: LegacyCanvasContentSeed) => Promise<void>
   assertContent: (target: CanvasTarget, input: PrepareCanvasNodeContentInput) => Promise<CanvasNodeContentMeta>
+  /** 把未进入图提交的本轮新内容移出 active nodes，且不暴露为可恢复回收项。 */
+  discardPreparedContent: (
+    target: CanvasTarget,
+    input: PrepareCanvasNodeContentInput,
+    rollbackId: string,
+  ) => Promise<void>
   moveToTrash: (target: CanvasTarget, entry: CanvasTrashEntry) => Promise<void>
   restoreFromTrash: (target: CanvasTarget, trashId: string) => Promise<CanvasTrashEntry>
   listTrash: (target: CanvasTarget) => Promise<CanvasTrashEntry[]>
@@ -754,6 +760,34 @@ export function createCanvasNodeContentStore(
       const contentId = requireContentId(input.contentId, 'contentId')
       const { nodes } = loadScopes(target)
       return assertContentInScope(nodes, 'nodes', { kind, contentId })
+    },
+    discardPreparedContent: async (target, input, rawRollbackId) => {
+      const kind = requireContentKind(input.kind)
+      const contentId = requireContentId(input.contentId, 'contentId')
+      const rollbackId = requireContentId(rawRollbackId, 'rollbackId')
+      const scopes = loadScopes(target, true)
+      const trash = scopes.trash!
+      const sourceMeta = await readMeta(scopes.nodes, 'nodes', contentId)
+      if (!sourceMeta) {
+        const existingRollback = await readMeta(trash, 'trash', rollbackId)
+        if (!existingRollback || existingRollback.kind !== kind || existingRollback.contentId !== contentId) {
+          throw new Error('CANVAS_CONTENT_NOT_FOUND')
+        }
+        return
+      }
+      if (sourceMeta.kind !== kind || sourceMeta.contentId !== contentId) {
+        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      }
+      const durabilityError = await moveDirectory(
+        scopes.nodes, trash, 'nodes', contentId, 'trash', rollbackId,
+      )
+      if (durabilityError) {
+        const moved = await readMeta(trash, 'trash', rollbackId)
+        if (!moved || moved.kind !== kind || moved.contentId !== contentId) {
+          throw contentCommitUnconfirmed('discard visible but verification failed', durabilityError)
+        }
+        throw durabilityError
+      }
     },
     moveToTrash: async (target, rawEntry) => {
       /** 严格克隆后的 Renderer 可见条目。 */

@@ -22,6 +22,7 @@ import type {
 } from '@proma/shared'
 import { runStableDirectoryNative } from '../stable-directory-native-host'
 import type { StableDirectoryNativeWriteOutcome } from '../stable-directory-native-host'
+import type { PrepareCanvasNodeContentInput } from './canvas-node-content-store'
 import type {
   CanvasDocumentMigrationCapability,
   CanvasDocumentStore,
@@ -120,6 +121,19 @@ export interface CanvasContentNodeLifecycle {
   create: (input: CreateCanvasContentNodeInput) => Promise<CanvasNodeLifecycleResult>
   delete: (input: DeleteCanvasNodeInput) => Promise<CanvasNodeLifecycleResult>
   restore: (input: RestoreCanvasNodeInput) => Promise<CanvasNodeLifecycleResult>
+  /** 批量事务只准备内容资源，不提交图 mutation。 */
+  prepareBatchContent: (
+    target: CanvasTarget,
+    input: PrepareCanvasNodeContentInput,
+  ) => Promise<{ created: boolean }>
+  /** 批量提交前失败时只回收本轮创建的内容资源。 */
+  cleanupBatchContent: (
+    target: CanvasTarget,
+    input: PrepareCanvasNodeContentInput,
+    rollbackId: string,
+  ) => Promise<void>
+  /** 批量删除提交前复用现有 Agent 运行守卫。 */
+  assertBatchAgentNodeIdle: (nodeId: string, sessionId: string) => void
 }
 
 /** 判断未知值为普通对象。 */
@@ -631,6 +645,28 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
   }
 
   return {
+    assertBatchAgentNodeIdle: dependencies.assertAgentNodeIdle,
+    prepareBatchContent: async (target, input) => {
+      const preparedInput = input.kind === 'image'
+        ? {
+            ...input,
+            selectedModelProfileId: input.selectedModelProfileId
+              ?? dependencies.resolveDefaultImageModelProfileId?.(target.projectId)
+              ?? null,
+          }
+        : input
+      try {
+        await dependencies.contentStore.assertContent(target, preparedInput)
+        return { created: false }
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes('CANVAS_CONTENT_NOT_FOUND')) throw error
+      }
+      await dependencies.contentStore.prepareEmptyContent(target, preparedInput)
+      return { created: true }
+    },
+    cleanupBatchContent: (target, input, rollbackId) => (
+      dependencies.contentStore.discardPreparedContent(target, input, rollbackId)
+    ),
     reconcile: async (target) => (await reconcileInternal(target)).result,
     load: async (target) => {
       const reconciled = await reconcileInternal(target)

@@ -148,6 +148,7 @@ function createHarness(options: {
       sessions.set(session.id, session)
       return session
     },
+    deleteSession: (sessionId) => { sessions.delete(sessionId) },
     now: () => 10,
     randomUUID: () => {
       const sessionIds = options.sessionIds ?? [SESSION_ID]
@@ -223,6 +224,22 @@ function createInput(target: CanvasTarget) {
 }
 
 describe('Canvas Agent 节点创建事务', () => {
+  test('Given 批量事务预分配 Agent session When 准备后回滚 Then 独占归属创建且可精确清理', () => {
+    const harness = createHarness()
+    const service = harness.createService()
+    const input = {
+      ...harness.target,
+      nodeId: 'batch-agent',
+      sessionId: SESSION_ID,
+      title: '批量 Agent',
+    }
+
+    expect(service.prepareBatchSession(input)).toMatchObject({ created: true })
+    expect(service.prepareBatchSession(input)).toMatchObject({ created: false })
+    service.cleanupBatchSession(input)
+    expect(harness.sessions.has(SESSION_ID)).toBe(false)
+  })
+
   test('Given prepared 写在 rename 前失败 When 创建 Then 不创建 session、节点或发布事实', async () => {
     const harness = createHarness({
       writeIntentOutcome: (intent) => intent.state === 'prepared'

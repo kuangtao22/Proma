@@ -54,6 +54,12 @@ export interface CanvasDocumentStore {
   loadWithMigrationCapability: (target: CanvasTarget) => CanvasDocumentMigrationCapability
   /** 要求当前文档无需恢复即可作为副作用基线。 */
   requireStableAuthoritativeDocument: (target: CanvasTarget) => CanvasDocument
+  /** 在创建外部资源前，基于权威文档严格解析一批不可信 mutation。 */
+  validateBatchOperations: (
+    target: CanvasTarget,
+    expectedRevision: number,
+    operations: unknown[],
+  ) => CanvasMutation[]
   /** 在权威 revision 上应用并提交一批 mutation。 */
   mutate: (
     target: CanvasTarget,
@@ -609,7 +615,7 @@ function parseUniqueStableIds(value: unknown, message: string): string[] {
 }
 
 /** 在 reducer 前按顺序校验原始 mutation 字段、图引用和批内重复 ID。 */
-function validateCanvasMutations(current: CanvasDocument, mutations: CanvasMutation[]): void {
+function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]): void {
   /** 跨 mutation 追踪 upsert ID，阻止同批次先后覆盖隐藏重复输入。 */
   const upsertedNodeIds = new Set<string>()
   const upsertedEdgeIds = new Set<string>()
@@ -1285,6 +1291,22 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     return loaded.snapshot.document
   }
 
+  /** 只验证并深拷贝 mutation，不产生 revision 或磁盘副作用。 */
+  function validateBatchOperations(
+    target: CanvasTarget,
+    expectedRevision: number,
+    operations: unknown[],
+  ): CanvasMutation[] {
+    const current = requireStableAuthoritativeDocument(target)
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== current.revision) {
+      throw new Error(
+        `CANVAS_REVISION_CONFLICT: expected=${expectedRevision}, current=${current.revision}`,
+      )
+    }
+    validateCanvasMutations(current, operations)
+    return structuredClone(operations) as CanvasMutation[]
+  }
+
   /** 在磁盘最新 revision 上应用一批受控 mutation 并安全提交。 */
   function mutate(
     target: CanvasTarget,
@@ -1364,5 +1386,5 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     return next
   }
 
-  return { load, loadWithDirectoryCapability, loadWithMigrationCapability, requireStableAuthoritativeDocument, mutate }
+  return { load, loadWithDirectoryCapability, loadWithMigrationCapability, requireStableAuthoritativeDocument, validateBatchOperations, mutate }
 }

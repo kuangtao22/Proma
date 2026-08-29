@@ -63,7 +63,11 @@ function createFixture(options: {
       contents.add(input.contentId)
     },
     prepareMigratedContent: async (_target: object, seed: { contentId: string }) => { contents.add(seed.contentId) },
-    assertContent: async () => { throw new Error('unused') },
+    assertContent: async (_target: object, input: { contentId: string }) => {
+      if (!contents.has(input.contentId)) throw new Error('CANVAS_CONTENT_NOT_FOUND')
+      return { schemaVersion: 1 as const, kind: 'document' as const, contentId: input.contentId, revision: 0, createdAt: 1, updatedAt: 1 }
+    },
+    discardPreparedContent: async (_target: object, input: { contentId: string }) => { contents.delete(input.contentId) },
     moveToTrash: async (_target: object, entry: CanvasTrashEntry) => {
       imageDeleteCalls.push('move-to-trash')
       contents.delete(entry.contentId)
@@ -131,6 +135,16 @@ function createIntentNode(kind: CanvasContentKind, position = { x: 1, y: 2 }): T
 }
 
 describe('CanvasContentNodeLifecycle', () => {
+  test('Given 批量内容准备 When 首次创建、复用并回滚 Then 只回收本轮 active 内容', async () => {
+    const fixture = createFixture()
+    const input = { kind: 'document' as const, contentId: 'batch-content' }
+
+    await expect(fixture.service.prepareBatchContent(target, input)).resolves.toEqual({ created: true })
+    await expect(fixture.service.prepareBatchContent(target, input)).resolves.toEqual({ created: false })
+    await fixture.service.cleanupBatchContent(target, input, 'batch-rollback-1')
+    expect(fixture.contents.has(input.contentId)).toBe(false)
+  })
+
   test('Given content intent When 严格解析 Then 拒绝未知字段、不可达状态与时间倒退', () => {
     const value = {
       schemaVersion: 1, operation: 'create', state: 'prepared',

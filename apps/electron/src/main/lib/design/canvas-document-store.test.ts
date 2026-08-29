@@ -1196,6 +1196,18 @@ describe('CanvasDocumentStore', () => {
     expect(existsSync(fixture.documentPath)).toBe(false)
   })
 
+  test('Given Agent batch 传入未知字段和重复节点 When 权威预验证 Then 资源副作用前拒绝', () => {
+    const fixture = createFixture()
+    expect(() => fixture.store.validateBatchOperations(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      0,
+      [{ type: 'upsert-nodes', nodes: [
+        { id: 'duplicate', kind: 'agent', title: '一', position: { x: 0, y: 0 }, agentSessionId: 'session-1' },
+        { id: 'duplicate', kind: 'agent', title: '二', position: { x: 1, y: 1 }, agentSessionId: 'session-2' },
+      ], internal: true }],
+    )).toThrow('CANVAS_MUTATION_INVALID')
+  })
+
   test('Given move-nodes 指向当前不存在节点 When mutate Then reducer 和完整校验前拒绝', () => {
     /** 结果 validator 与写边界都不得触达。 */
     let validationCalls = 0

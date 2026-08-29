@@ -2038,6 +2038,7 @@ export function registerIpcHandlers(): void {
     },
     getSession: getAgentSessionMeta,
     createSession: createAgentSessionWithMetadata,
+    deleteSession: deleteAgentSession,
   })
   /** 项目离线或迁移时返回稳定 Design/Canvas 只读原因。 */
   const getDesignProjectReadOnlyReason = (projectId: string): string | undefined => {

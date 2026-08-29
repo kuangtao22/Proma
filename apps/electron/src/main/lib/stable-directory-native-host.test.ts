@@ -666,6 +666,17 @@ describe('stable directory native host', () => {
     })
   })
 
+  test('Given Canvas batch intent 文件名 When 写入 Then 接受固定 UUID 合同', async () => {
+    const fake = createFakeHelper({ writeOutcome: { commitVisible: true, durabilityUncertain: false } })
+
+    await expect(createStableDirectoryNativeHost().run({
+      mode: 'canvas-intent-write', roots: ['/requested'], childName: 'transactions',
+      fileName: 'canvas-batch-11111111-1111-4111-8111-111111111111.json', content: '{}',
+    }, () => true, createDependencies(fake))).resolves.toMatchObject({
+      writeOutcome: { commitVisible: true, durabilityUncertain: false },
+    })
+  })
+
   test('Given helper 报告 rename 后目录持久性未确认 When host 消费协议 Then 保留可见提交结果而非提前退出', async () => {
     const fake = createFakeHelper({
       writeOutcome: {

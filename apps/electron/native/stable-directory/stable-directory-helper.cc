@@ -269,11 +269,12 @@ bool IsHexDigit(char value) {
       || (value >= 'A' && value <= 'F');
 }
 
-// 只接受固定 Agent 创建、Agent 重建和内容节点 UUID 文件名，伪前缀和目录杂项不消耗容量。
+// 只接受固定 Agent 创建、Agent 重建、内容节点和批量事务 UUID 文件名。
 bool IsCanvasIntentCandidateName(const std::string& name) {
   constexpr std::size_t kAgentRebuildPrefixLength = 19;
   constexpr std::size_t kAgentPrefixLength = 11;
   constexpr std::size_t kContentPrefixLength = 13;
+  constexpr std::size_t kBatchPrefixLength = 13;
   constexpr std::size_t kUuidLength = 36;
   constexpr std::size_t kSuffixLength = 5;
   std::size_t prefix_length = 0;
@@ -283,6 +284,8 @@ bool IsCanvasIntentCandidateName(const std::string& name) {
     prefix_length = kAgentPrefixLength;
   } else if (name.compare(0, kContentPrefixLength, "content-node-") == 0) {
     prefix_length = kContentPrefixLength;
+  } else if (name.compare(0, kBatchPrefixLength, "canvas-batch-") == 0) {
+    prefix_length = kBatchPrefixLength;
   } else {
     return false;
   }

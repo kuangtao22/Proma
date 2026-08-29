@@ -164,6 +164,8 @@ export interface CanvasAgentNodeCreationDependencies {
   assertModelAvailable: (channelId: string, modelId?: string) => void
   getSession: (sessionId: string) => AgentSessionMeta | undefined
   createSession: (input: CreateAgentSessionWithMetadataInput) => AgentSessionMeta
+  /** 批量事务提交前失败时删除本轮预分配的内部会话。 */
+  deleteSession?: (sessionId: string) => void
   now?: () => number
   randomUUID?: () => string
   readTransactionsDirectory?: (directoryPath: string) => Dirent[]
@@ -697,6 +699,71 @@ export class CanvasAgentNodeCreationService {
     this.readTransactionsDirectory = dependencies.readTransactionsDirectory
     this.writeIntentFile = dependencies.writeIntent
     this.runNative = dependencies.runStableDirectoryNative ?? runStableDirectoryNative
+  }
+
+  /** 为批量事务预备一个独占 Canvas Agent session，不提交图 mutation。 */
+  prepareBatchSession(input: {
+    projectId: string
+    canvasId: string
+    nodeId: string
+    sessionId: string
+    title: string
+  }): { session: AgentSessionMeta; created: boolean } {
+    /** 批量 intent 不复制渠道配置；重放只验证不可伪造的独占 Canvas 归属。 */
+    const matchesOwnership = (session: AgentSessionMeta): boolean => (
+      hasValidCanvasAgentOwnership(session)
+      && session.id === input.sessionId
+      && session.title === input.title
+      && session.workspaceId === input.projectId
+      && session.sourceCanvasProjectId === input.projectId
+      && session.sourceCanvasId === input.canvasId
+      && session.sourceCanvasNodeId === input.nodeId
+    )
+    const existing = this.dependencies.getSession(input.sessionId)
+    if (existing) {
+      if (!matchesOwnership(existing)) {
+        throw new Error('CANVAS_AGENT_SESSION_OWNERSHIP_CONFLICT')
+      }
+      return { session: existing, created: false }
+    }
+    const settings = this.dependencies.getSettings()
+    const channelId = settings.agentChannelId?.trim()
+    const modelId = settings.agentModelId?.trim() || undefined
+    if (!channelId) throw new Error('Canvas Agent 需要先配置默认渠道')
+    this.dependencies.assertModelAvailable(channelId, modelId)
+    const session = this.dependencies.createSession({
+      trustedSessionId: input.sessionId,
+      title: input.title,
+      channelId,
+      modelId,
+      workspaceId: input.projectId,
+      sourceCanvasProjectId: input.projectId,
+      sourceCanvasId: input.canvasId,
+      sourceCanvasNodeId: input.nodeId,
+    })
+    if (!matchesOwnership(session)) {
+      throw new Error('CANVAS_AGENT_SESSION_OWNERSHIP_CONFLICT')
+    }
+    return { session, created: true }
+  }
+
+  /** 只删除仍精确归属于本批节点的预分配会话。 */
+  cleanupBatchSession(input: {
+    projectId: string
+    canvasId: string
+    nodeId: string
+    sessionId: string
+  }): void {
+    const session = this.dependencies.getSession(input.sessionId)
+    if (!session
+      || session.workspaceId !== input.projectId
+      || session.sourceCanvasProjectId !== input.projectId
+      || session.sourceCanvasId !== input.canvasId
+      || session.sourceCanvasNodeId !== input.nodeId) {
+      throw new Error('CANVAS_AGENT_SESSION_OWNERSHIP_CONFLICT')
+    }
+    if (!this.dependencies.deleteSession) throw new Error('CANVAS_AGENT_SESSION_CLEANUP_UNAVAILABLE')
+    this.dependencies.deleteSession(input.sessionId)
   }
 
   /** 校验并解析一条已排序的 creation 或 rebuild intent 文件名。 */
