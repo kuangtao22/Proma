@@ -24,6 +24,7 @@ import {
   parseListAgentCanvasBindingsResult,
   parseSetDefaultAgentCanvasInput,
   parseUnlinkAgentCanvasInput,
+  parseUnlinkAgentCanvasResult,
 } from './canvas'
 import type {
   AgentCanvasBinding,
@@ -154,16 +155,36 @@ describe('Canvas 图共享合同', () => {
 
   test('Given 关联 IPC 输入 When 严格解析 Then 只接受安全身份与精确字段', () => {
     expect(parseListAgentCanvasBindingsInput({ projectId: 'project-1' })).toEqual({ projectId: 'project-1' })
-    expect(parseLinkAgentCanvasInput({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }))
-      .toEqual({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' })
+    expect(parseLinkAgentCanvasInput({
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: true,
+    })).toEqual({
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: true,
+    })
+    expect(parseLinkAgentCanvasInput({
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false,
+    }).makeDefault).toBe(false)
     expect(parseUnlinkAgentCanvasInput({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }))
       .toEqual({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' })
     expect(parseSetDefaultAgentCanvasInput({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }))
       .toEqual({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' })
-    expect(parseClearAgentCanvasBindingsInput({ projectId: 'project-1', sessionId: 'session-1' }))
-      .toEqual({ projectId: 'project-1', sessionId: 'session-1' })
+    expect(parseClearAgentCanvasBindingsInput({
+      projectId: 'project-1', target: 'session', sessionId: 'session-1',
+    })).toEqual({ projectId: 'project-1', target: 'session', sessionId: 'session-1' })
+    expect(parseClearAgentCanvasBindingsInput({
+      projectId: 'project-1', target: 'canvas', canvasId: 'canvas-1',
+    })).toEqual({ projectId: 'project-1', target: 'canvas', canvasId: 'canvas-1' })
     expect(() => parseLinkAgentCanvasInput({
-      projectId: 'project-1', sessionId: 'session-1', canvasId: '../escape',
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: 'yes',
+    })).toThrow()
+    expect(() => parseLinkAgentCanvasInput({
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1',
+      makeDefault: false, extra: true,
+    })).toThrow()
+    expect(() => parseClearAgentCanvasBindingsInput({
+      projectId: 'project-1', target: 'session', sessionId: 'session-1', canvasId: 'canvas-1',
+    })).toThrow()
+    expect(() => parseClearAgentCanvasBindingsInput({
+      projectId: 'project-1', target: 'canvas', canvasId: 'canvas-1', extra: true,
     })).toThrow()
     expect(() => parseListAgentCanvasBindingsInput({ projectId: 'project-1', extra: true })).toThrow()
   })
@@ -176,6 +197,7 @@ describe('Canvas 图共享合同', () => {
     }
 
     expect(parseLinkAgentCanvasResult(binding).linkedCanvasIds).toEqual(['canvas-1'])
+    expect(parseUnlinkAgentCanvasResult(null)).toBeNull()
     expect(parseListAgentCanvasBindingsResult([binding])).toEqual([{
       ...binding,
       linkedCanvasIds: ['canvas-1'],
@@ -214,6 +236,12 @@ describe('Canvas 图共享合同', () => {
     }
 
     expect(parseCanvasBatchOperationInput(batch)).toEqual(batch)
+    expect(parseCanvasBatchOperationInput({
+      ...batch,
+      operations: [{ type: 'future-task-8-validation', unknown: true }],
+    } as unknown as import('./canvas').CanvasBatchOperationInput).operations as unknown).toEqual([
+      { type: 'future-task-8-validation', unknown: true },
+    ])
     expect(parseCanvasRunNodesInput(run)).toEqual(run)
     expect(() => parseCanvasBatchOperationInput({ ...batch, baseRevision: -1 })).toThrow()
     expect(() => parseCanvasBatchOperationInput({ ...batch, internal: true })).toThrow()

@@ -361,6 +361,7 @@ export type ListAgentCanvasBindingsResult = AgentCanvasBinding[]
 /** 建立 Agent 与 Canvas 关联的输入。 */
 export interface LinkAgentCanvasInput extends CanvasTarget {
   sessionId: string
+  makeDefault: boolean
 }
 
 /** 建立关联后返回规范化的公开记录。 */
@@ -372,7 +373,7 @@ export interface UnlinkAgentCanvasInput extends CanvasTarget {
 }
 
 /** 解除关联后返回规范化的公开记录。 */
-export type UnlinkAgentCanvasResult = AgentCanvasBinding
+export type UnlinkAgentCanvasResult = AgentCanvasBinding | null
 
 /** 设置 Agent 默认 Canvas 的输入。 */
 export interface SetDefaultAgentCanvasInput extends CanvasTarget {
@@ -382,11 +383,26 @@ export interface SetDefaultAgentCanvasInput extends CanvasTarget {
 /** 设置默认 Canvas 后返回规范化的公开记录。 */
 export type SetDefaultAgentCanvasResult = AgentCanvasBinding
 
-/** 清空单个 Agent 全部 Canvas 关联的输入。 */
-export interface ClearAgentCanvasBindingsInput {
+/** 删除 Agent 时按会话清空全部 Canvas 关联。 */
+export interface ClearAgentCanvasBindingsBySessionInput {
   projectId: string
+  target: 'session'
   sessionId: string
+  canvasId?: never
 }
+
+/** 删除 Canvas 时按画布清空全部 Agent 关联。 */
+export interface ClearAgentCanvasBindingsByCanvasInput {
+  projectId: string
+  target: 'canvas'
+  canvasId: string
+  sessionId?: never
+}
+
+/** 清空关联的严格判别联合，目标会话与目标 Canvas 互斥。 */
+export type ClearAgentCanvasBindingsInput =
+  | ClearAgentCanvasBindingsBySessionInput
+  | ClearAgentCanvasBindingsByCanvasInput
 
 /** 清空关联不返回额外业务数据。 */
 export type ClearAgentCanvasBindingsResult = void
@@ -803,157 +819,6 @@ function isCanvasNodeKind(value: unknown): value is CanvasNodeKind {
   return value === 'agent' || value === 'image' || value === 'document' || value === 'webview'
 }
 
-/** 严格解析稳定 ID 数组，并复制结果隔离调用方后续修改。 */
-function parseCanvasStableIds(value: unknown, errorCode: string): string[] {
-  if (!Array.isArray(value) || !value.every(isCanvasLifecycleId)) throw new Error(errorCode)
-  return [...value]
-}
-
-/** 严格解析 Canvas 节点，供 Agent 批量 mutation 边界复用。 */
-function parseCanvasOperationNode(value: unknown): CanvasNode {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('CANVAS_BATCH_OPERATION_INPUT_INVALID')
-  }
-  /** 节点字段通过普通记录读取，后续按 kind 使用 exact-key 校验。 */
-  const node = value as Record<string, unknown>
-  /** 所有节点共享字段必须先满足安全边界。 */
-  if (!isCanvasLifecycleId(node.id)
-    || !isCanvasNodeKind(node.kind)
-    || !isCanvasLifecycleTitle(node.title)
-    || !isCanvasLifecyclePosition(node.position)) {
-    throw new Error('CANVAS_BATCH_OPERATION_INPUT_INVALID')
-  }
-  /** 已验证的节点稳定 ID，避免后续分支丢失收窄。 */
-  const nodeId = node.id
-  /** 已验证的节点展示标题。 */
-  const title = node.title
-  /** 复制后的坐标用于隔离调用方对象引用。 */
-  const position = { x: node.position.x, y: node.position.y }
-  if (node.kind === 'agent'
-    && hasExactCanvasKeys(node, ['id', 'kind', 'title', 'position', 'agentSessionId'])
-    && isCanvasLifecycleId(node.agentSessionId)) {
-    return { id: nodeId, kind: 'agent', title, position, agentSessionId: node.agentSessionId }
-  }
-  if (node.kind === 'image') {
-    /** 图片节点允许可选的已采用素材身份。 */
-    const allowedKeys = ['id', 'kind', 'title', 'position', 'imageModuleId', 'adoptedAssetId'] as const
-    /** 图片节点实际字段必须是允许集合的子集。 */
-    const actualKeys = Object.keys(node)
-    if (actualKeys.every((key) => allowedKeys.includes(key as typeof allowedKeys[number]))
-      && actualKeys.length >= 5
-      && Object.hasOwn(node, 'imageModuleId')
-      && isCanvasLifecycleId(node.imageModuleId)
-      && (node.adoptedAssetId === undefined || isCanvasLifecycleId(node.adoptedAssetId))) {
-      return {
-        id: nodeId,
-        kind: 'image',
-        title,
-        position,
-        imageModuleId: node.imageModuleId,
-        ...(node.adoptedAssetId === undefined ? {} : { adoptedAssetId: node.adoptedAssetId }),
-      }
-    }
-  }
-  if (node.kind === 'document'
-    && hasExactCanvasKeys(node, ['id', 'kind', 'title', 'position', 'documentId', 'contentRevision'])
-    && isCanvasLifecycleId(node.documentId)
-    && isCanvasNonNegativeInteger(node.contentRevision)) {
-    return {
-      id: nodeId, kind: 'document', title, position,
-      documentId: node.documentId, contentRevision: node.contentRevision,
-    }
-  }
-  if (node.kind === 'webview'
-    && hasExactCanvasKeys(node, ['id', 'kind', 'title', 'position', 'prototypeId', 'contentRevision'])
-    && isCanvasLifecycleId(node.prototypeId)
-    && isCanvasNonNegativeInteger(node.contentRevision)) {
-    return {
-      id: nodeId, kind: 'webview', title, position,
-      prototypeId: node.prototypeId, contentRevision: node.contentRevision,
-    }
-  }
-  throw new Error('CANVAS_BATCH_OPERATION_INPUT_INVALID')
-}
-
-/** 严格解析 Canvas 边，拒绝未知字段与不安全端口身份。 */
-function parseCanvasOperationEdge(value: unknown): CanvasEdge {
-  /** Canvas 边允许的完整字段集合。 */
-  const keys = ['id', 'sourceNodeId', 'sourcePort', 'targetNodeId', 'targetPort'] as const
-  if (!hasExactCanvasKeys(value, keys)
-    || !isCanvasLifecycleId(value.id)
-    || !isCanvasLifecycleId(value.sourceNodeId)
-    || !isCanvasLifecycleId(value.sourcePort)
-    || !isCanvasLifecycleId(value.targetNodeId)
-    || !isCanvasLifecycleId(value.targetPort)) {
-    throw new Error('CANVAS_BATCH_OPERATION_INPUT_INVALID')
-  }
-  return {
-    id: value.id,
-    sourceNodeId: value.sourceNodeId,
-    sourcePort: value.sourcePort,
-    targetNodeId: value.targetNodeId,
-    targetPort: value.targetPort,
-  }
-}
-
-/** 严格解析 Agent 工具提交的单条 Canvas mutation。 */
-function parseCanvasBatchMutation(value: unknown): CanvasMutation {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('CANVAS_BATCH_OPERATION_INPUT_INVALID')
-  }
-  /** mutation 记录按 type 分派到固定 schema。 */
-  const mutation = value as Record<string, unknown>
-  if (mutation.type === 'set-viewport'
-    && hasExactCanvasKeys(mutation, ['type', 'viewport'])
-    && hasExactCanvasKeys(mutation.viewport, ['x', 'y', 'zoom'])
-    && typeof mutation.viewport.x === 'number' && Number.isFinite(mutation.viewport.x)
-    && typeof mutation.viewport.y === 'number' && Number.isFinite(mutation.viewport.y)
-    && typeof mutation.viewport.zoom === 'number' && Number.isFinite(mutation.viewport.zoom)
-    && mutation.viewport.zoom > 0) {
-    return {
-      type: 'set-viewport',
-      viewport: { x: mutation.viewport.x, y: mutation.viewport.y, zoom: mutation.viewport.zoom },
-    }
-  }
-  if (mutation.type === 'move-nodes'
-    && hasExactCanvasKeys(mutation, ['type', 'positions'])
-    && Array.isArray(mutation.positions)) {
-    /** 位置项逐个严格重建，避免透传未知字段。 */
-    const positions = mutation.positions.map((entry): CanvasNodePosition => {
-      if (!hasExactCanvasKeys(entry, ['nodeId', 'position'])
-        || !isCanvasLifecycleId(entry.nodeId)
-        || !isCanvasLifecyclePosition(entry.position)) {
-        throw new Error('CANVAS_BATCH_OPERATION_INPUT_INVALID')
-      }
-      return { nodeId: entry.nodeId, position: { x: entry.position.x, y: entry.position.y } }
-    })
-    return { type: 'move-nodes', positions }
-  }
-  if (mutation.type === 'upsert-nodes'
-    && hasExactCanvasKeys(mutation, ['type', 'nodes'])
-    && Array.isArray(mutation.nodes)) {
-    return { type: 'upsert-nodes', nodes: mutation.nodes.map(parseCanvasOperationNode) }
-  }
-  if (mutation.type === 'remove-nodes' && hasExactCanvasKeys(mutation, ['type', 'nodeIds'])) {
-    return {
-      type: 'remove-nodes',
-      nodeIds: parseCanvasStableIds(mutation.nodeIds, 'CANVAS_BATCH_OPERATION_INPUT_INVALID'),
-    }
-  }
-  if (mutation.type === 'upsert-edges'
-    && hasExactCanvasKeys(mutation, ['type', 'edges'])
-    && Array.isArray(mutation.edges)) {
-    return { type: 'upsert-edges', edges: mutation.edges.map(parseCanvasOperationEdge) }
-  }
-  if (mutation.type === 'remove-edges' && hasExactCanvasKeys(mutation, ['type', 'edgeIds'])) {
-    return {
-      type: 'remove-edges',
-      edgeIds: parseCanvasStableIds(mutation.edgeIds, 'CANVAS_BATCH_OPERATION_INPUT_INVALID'),
-    }
-  }
-  throw new Error('CANVAS_BATCH_OPERATION_INPUT_INVALID')
-}
-
 /**
  * 严格解析 Agent-Canvas 关联记录并规范化重复画布 ID。
  * @param value 待解析的持久化或 IPC 输出值。
@@ -1053,11 +918,16 @@ export function parseCanvasBatchOperationInput(value: unknown): CanvasBatchOpera
     || !isCanvasLifecycleId(value.sourceToolCallId)) {
     throw new Error('CANVAS_BATCH_OPERATION_INPUT_INVALID')
   }
+  /**
+   * Task 1 只固化批量命令外壳；Task 8 必须在事务执行前通过 CanvasDocumentStore
+   * 权威校验每条 mutation 的完整 schema、重复 ID 与图引用语义。
+   */
+  const operations = [...value.operations] as CanvasMutation[]
   return {
     projectId: value.projectId,
     canvasId: value.canvasId,
     baseRevision: value.baseRevision,
-    operations: value.operations.map(parseCanvasBatchMutation),
+    operations,
     sourceSessionId: value.sourceSessionId,
     sourceRunStartedAt: value.sourceRunStartedAt,
     sourceToolCallId: value.sourceToolCallId,
@@ -1104,7 +974,7 @@ export function parseListAgentCanvasBindingsResult(value: unknown): ListAgentCan
 }
 
 /** 严格解析包含项目、会话与 Canvas 身份的关联命令。 */
-function parseAgentCanvasTarget(value: unknown, errorCode: string): LinkAgentCanvasInput {
+function parseAgentCanvasTarget(value: unknown, errorCode: string): UnlinkAgentCanvasInput {
   /** 关联命令允许的完整字段集合。 */
   const keys = ['projectId', 'sessionId', 'canvasId'] as const
   if (!hasExactCanvasKeys(value, keys)
@@ -1118,7 +988,21 @@ function parseAgentCanvasTarget(value: unknown, errorCode: string): LinkAgentCan
 
 /** 严格解析建立 Agent-Canvas 关联的输入。 */
 export function parseLinkAgentCanvasInput(value: unknown): LinkAgentCanvasInput {
-  return parseAgentCanvasTarget(value, 'LINK_AGENT_CANVAS_INPUT_INVALID')
+  /** 建立关联必须显式声明是否设为默认画布。 */
+  const keys = ['projectId', 'sessionId', 'canvasId', 'makeDefault'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.sessionId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || typeof value.makeDefault !== 'boolean') {
+    throw new Error('LINK_AGENT_CANVAS_INPUT_INVALID')
+  }
+  return {
+    projectId: value.projectId,
+    sessionId: value.sessionId,
+    canvasId: value.canvasId,
+    makeDefault: value.makeDefault,
+  }
 }
 
 /** 严格解析建立 Agent-Canvas 关联的输出。 */
@@ -1133,7 +1017,7 @@ export function parseUnlinkAgentCanvasInput(value: unknown): UnlinkAgentCanvasIn
 
 /** 严格解析解除 Agent-Canvas 关联的输出。 */
 export function parseUnlinkAgentCanvasResult(value: unknown): UnlinkAgentCanvasResult {
-  return parseAgentCanvasBinding(value)
+  return value === null ? null : parseAgentCanvasBinding(value)
 }
 
 /** 严格解析设置默认 Agent Canvas 的输入。 */
@@ -1146,16 +1030,21 @@ export function parseSetDefaultAgentCanvasResult(value: unknown): SetDefaultAgen
   return parseAgentCanvasBinding(value)
 }
 
-/** 严格解析清空单个 Agent 全部 Canvas 关联的输入。 */
+/** 严格解析按会话或 Canvas 清空关联的判别输入。 */
 export function parseClearAgentCanvasBindingsInput(value: unknown): ClearAgentCanvasBindingsInput {
-  /** 清空命令允许的完整字段集合。 */
-  const keys = ['projectId', 'sessionId'] as const
-  if (!hasExactCanvasKeys(value, keys)
-    || !isCanvasLifecycleId(value.projectId)
-    || !isCanvasLifecycleId(value.sessionId)) {
-    throw new Error('CLEAR_AGENT_CANVAS_BINDINGS_INPUT_INVALID')
+  if (hasExactCanvasKeys(value, ['projectId', 'target', 'sessionId'])
+    && isCanvasLifecycleId(value.projectId)
+    && value.target === 'session'
+    && isCanvasLifecycleId(value.sessionId)) {
+    return { projectId: value.projectId, target: 'session', sessionId: value.sessionId }
   }
-  return { projectId: value.projectId, sessionId: value.sessionId }
+  if (hasExactCanvasKeys(value, ['projectId', 'target', 'canvasId'])
+    && isCanvasLifecycleId(value.projectId)
+    && value.target === 'canvas'
+    && isCanvasLifecycleId(value.canvasId)) {
+    return { projectId: value.projectId, target: 'canvas', canvasId: value.canvasId }
+  }
+  throw new Error('CLEAR_AGENT_CANVAS_BINDINGS_INPUT_INVALID')
 }
 
 /** 严格解析无业务数据的清空关联输出。 */
