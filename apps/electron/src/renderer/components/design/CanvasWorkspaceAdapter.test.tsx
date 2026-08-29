@@ -11,6 +11,7 @@ import {
   createAgentCanvasViewKey,
   createInitialAgentCanvasViewState,
 } from '@/atoms/agent-canvas-atoms'
+import { createInitialNativeCanvasState, nativeCanvasStatesAtom } from '@/atoms/native-canvas-atoms'
 import { designAdapter } from '@/lib/design-adapter'
 import type { DesignAdapter } from '@/lib/design-adapter'
 import {
@@ -265,25 +266,39 @@ describe('Agent 右侧 Canvas 适配器', () => {
     expect(expanded).toContain('canvas-1')
   })
 
-  test('Given legacy Canvas When effect 挂载 Then 轻量 view 立即初始化且按 Agent 会话隔离', async () => {
+  test('Given legacy Canvas StrictMode 挂载 When session 切换并最终卸载 Then 只保留当前 view 且不清 graph', async () => {
     const store = createStore()
     const host = createHookRoot()
+    const graphState = createInitialNativeCanvasState()
+    store.set(nativeCanvasStatesAtom, new Map([['graph-sentinel', graphState]]))
     function Probe({ sessionId }: { sessionId: string }): null {
       useAgentCanvasLegacyViewInitialization(sessionId, 'project-1', LEGACY_DESIGN_CANVAS_ID)
       return null
     }
+    const firstKey = createAgentCanvasViewKey('agent-1', 'project-1', LEGACY_DESIGN_CANVAS_ID)
+    const secondKey = createAgentCanvasViewKey('agent-2', 'project-1', LEGACY_DESIGN_CANVAS_ID)
 
     try {
-      act(() => { host.render(<Provider store={store}><Probe sessionId="agent-1" /></Provider>) })
-      const firstKey = createAgentCanvasViewKey('agent-1', 'project-1', LEGACY_DESIGN_CANVAS_ID)
+      await act(async () => {
+        host.render(<React.StrictMode><Provider store={store}><Probe sessionId="agent-1" /></Provider></React.StrictMode>)
+        await Promise.resolve()
+      })
       expect(store.get(agentCanvasViewStatesAtom).get(firstKey)).toMatchObject({ isExpanded: false })
 
-      act(() => { host.render(<Provider store={store}><Probe sessionId="agent-2" /></Provider>) })
-      const secondKey = createAgentCanvasViewKey('agent-2', 'project-1', LEGACY_DESIGN_CANVAS_ID)
-      expect(store.get(agentCanvasViewStatesAtom).has(firstKey)).toBe(true)
+      await act(async () => {
+        host.render(<React.StrictMode><Provider store={store}><Probe sessionId="agent-2" /></Provider></React.StrictMode>)
+        await Promise.resolve()
+      })
+      expect(store.get(agentCanvasViewStatesAtom).has(firstKey)).toBe(false)
       expect(store.get(agentCanvasViewStatesAtom).has(secondKey)).toBe(true)
+      expect(store.get(nativeCanvasStatesAtom).get('graph-sentinel')).toBe(graphState)
     } finally {
-      act(() => { host.unmount() })
+      await act(async () => {
+        host.unmount()
+        await Promise.resolve()
+      })
+      expect(store.get(agentCanvasViewStatesAtom).has(secondKey)).toBe(false)
+      expect(store.get(nativeCanvasStatesAtom).get('graph-sentinel')).toBe(graphState)
       host.restore()
     }
   })

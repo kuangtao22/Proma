@@ -12,13 +12,18 @@ import {
   createAgentCanvasViewKey,
   agentCanvasViewStatesAtom,
   initializeAgentCanvasViewStateAtom,
+  removeAgentCanvasViewStateAtom,
   updateAgentCanvasViewStateAtom,
   type AgentCanvasViewState,
 } from '@/atoms/agent-canvas-atoms'
 import { designAdapter } from '@/lib/design-adapter'
 import type { DesignAdapter } from '@/lib/design-adapter'
 import { getCanvasWorkspaceTab, type AgentSidePanelTab } from '@/atoms/agent-atoms'
-import { NativeCanvasWorkspace } from './NativeCanvasWorkspace'
+import {
+  mountNativeCanvasSessionView,
+  NativeCanvasWorkspace,
+  nativeCanvasSessionViewCleanupCoordinator,
+} from './NativeCanvasWorkspace'
 import { DesignWorkspaceView } from './DesignWorkspaceView'
 import { cn } from '@/lib/utils'
 
@@ -357,11 +362,17 @@ export function useAgentCanvasLegacyViewInitialization(
   canvasId: string,
 ): void {
   const initializeViewState = useSetAtom(initializeAgentCanvasViewStateAtom)
+  const removeViewState = useSetAtom(removeAgentCanvasViewStateAtom)
   const key = createAgentCanvasViewKey(sessionId, projectId, canvasId)
   React.useEffect(() => {
     if (canvasId !== LEGACY_DESIGN_CANVAS_ID) return
     initializeViewState({ key, viewport: { x: 0, y: 0, zoom: 1 } })
-  }, [canvasId, initializeViewState, key])
+    return mountNativeCanvasSessionView(
+      nativeCanvasSessionViewCleanupCoordinator,
+      key,
+      removeViewState,
+    )
+  }, [canvasId, initializeViewState, key, removeViewState])
 }
 
 export interface CanvasWorkspaceAdapterProps {

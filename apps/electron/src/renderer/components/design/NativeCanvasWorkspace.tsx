@@ -398,7 +398,7 @@ export function mountNativeCanvasSessionView(
 }
 
 /** Renderer 生命周期共享协调器，同 key StrictMode 重挂可取消前一轮候选清理。 */
-const nativeCanvasWorkbenchCleanupCoordinator = createNativeCanvasWorkbenchCleanupCoordinator(
+export const nativeCanvasSessionViewCleanupCoordinator = createNativeCanvasWorkbenchCleanupCoordinator(
   (task) => { void Promise.resolve().then(task) },
 )
 
@@ -2255,7 +2255,7 @@ export function NativeCanvasWorkspace({
 
   React.useEffect(() => {
     const disposeCleanup = mountNativeCanvasSessionView(
-      nativeCanvasWorkbenchCleanupCoordinator,
+      nativeCanvasSessionViewCleanupCoordinator,
       viewStateKey,
       removeAgentCanvasViewState,
     )
