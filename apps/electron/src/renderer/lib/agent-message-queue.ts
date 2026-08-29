@@ -35,21 +35,53 @@ function createCanvasNodeReferenceKey(reference: CanvasNodeReference): string {
 }
 
 /**
- * 把新 Canvas 节点引用追加到已有引用，按 canvasId + nodeId 去重并保留首次出现顺序。
+ * 把权威 Canvas 节点引用合并到 composer，同 key 原位更新为最新快照。
  * @param current composer 或队列已有引用。
  * @param additions 本次从权威 Canvas 快照生成的引用。
- * @returns 新的去重数组；不会修改正文或输入数组。
+ * @returns 按首次出现位置排序、同 key 使用最新快照的新数组。
  */
 export function addCanvasNodeReferences(
   current: readonly CanvasNodeReference[],
   additions: readonly CanvasNodeReference[],
 ): CanvasNodeReference[] {
-  /** 首次出现的引用决定展示与发送顺序。 */
-  const seen = new Set<string>()
   /** 输出使用完整 shared 快照，不降级为仅 ID。 */
   const references: CanvasNodeReference[] = []
-  for (const reference of [...current, ...additions]) {
-    /** 同一画布同一节点只保留首次出现版本。 */
+  /** 同 key 的首次位置保持稳定，后续权威快照只替换该位置。 */
+  const indexes = new Map<string, number>()
+  for (const reference of current) {
+    const key = createCanvasNodeReferenceKey(reference)
+    if (indexes.has(key)) continue
+    indexes.set(key, references.length)
+    references.push(reference)
+  }
+  for (const reference of additions) {
+    const key = createCanvasNodeReferenceKey(reference)
+    const index = indexes.get(key)
+    if (index === undefined) {
+      indexes.set(key, references.length)
+      references.push(reference)
+    } else {
+      references[index] = reference
+    }
+  }
+  return references
+}
+
+/**
+ * 失败恢复或撤回时只补回当前缺失的引用，不用旧发送快照覆盖用户的新快照。
+ * @param current composer 当前引用。
+ * @param restored 失败消息或撤回消息携带的历史引用。
+ * @returns 保留当前快照并在尾部追加缺失 key 的新数组。
+ */
+export function restoreMissingCanvasNodeReferences(
+  current: readonly CanvasNodeReference[],
+  restored: readonly CanvasNodeReference[],
+): CanvasNodeReference[] {
+  /** 当前引用优先决定快照和顺序。 */
+  const references: CanvasNodeReference[] = []
+  /** 已存在 key 阻止旧快照覆盖当前引用。 */
+  const seen = new Set<string>()
+  for (const reference of [...current, ...restored]) {
     const key = createCanvasNodeReferenceKey(reference)
     if (seen.has(key)) continue
     seen.add(key)

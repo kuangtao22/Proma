@@ -152,6 +152,7 @@ import {
   addCanvasNodeReferences,
   removeCanvasNodeReference,
   removeSentCanvasNodeReferences,
+  restoreMissingCanvasNodeReferences,
   submitQueuedMessagePayload,
 } from '@/lib/agent-message-queue'
 import type { AgentMessageSubmissionOutcome, AgentQueuedAttachment, AgentQueuedMessage, QueueDropPlacement } from '@/lib/agent-message-queue'
@@ -2201,7 +2202,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         }
         restoreQueuedAttachmentsToPending(message.attachments)
         if (message.canvasNodeReferences && message.canvasNodeReferences.length > 0) {
-          setCanvasNodeReferences((current) => addCanvasNodeReferences(current, message.canvasNodeReferences ?? []))
+          setCanvasNodeReferences((current) => restoreMissingCanvasNodeReferences(current, message.canvasNodeReferences ?? []))
         }
       })
       return
@@ -2804,7 +2805,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         }
         restoreQueuedAttachmentsToPending(message.attachments)
         if (message.canvasNodeReferences && message.canvasNodeReferences.length > 0) {
-          setCanvasNodeReferences((current) => addCanvasNodeReferences(current, message.canvasNodeReferences ?? []))
+          setCanvasNodeReferences((current) => restoreMissingCanvasNodeReferences(current, message.canvasNodeReferences ?? []))
         }
 
         const currentDraft = store.get(agentSessionDraftsAtom).get(sessionId) ?? ''

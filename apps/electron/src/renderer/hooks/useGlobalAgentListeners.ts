@@ -10,6 +10,7 @@
 import { useEffect } from 'react'
 import { unstable_batchedUpdates } from 'react-dom'
 import { useStore } from 'jotai'
+import type { Store } from 'jotai/vanilla/store'
 import {
   agentStreamingStatesAtom,
   agentSessionStreamingStateAtomFamily,
@@ -95,7 +96,7 @@ import {
 } from '@/atoms/preview-atoms'
 import type { NotificationSoundType } from '@/types/settings'
 import { toast } from 'sonner'
-import type { AgentStreamEvent, AgentStreamCompletePayload, AgentStreamErrorPayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, SDKAssistantMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock } from '@proma/shared'
+import type { AgentStreamEvent, AgentStreamCompletePayload, AgentStreamErrorPayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, SDKAssistantMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock, AgentQueuedMessageStatus } from '@proma/shared'
 import { inferContextWindow } from '@proma/shared'
 import {
   buildExternalAgentRunActivation,
@@ -592,6 +593,66 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
   }
 }
 
+/**
+ * 应用主进程 after-current started 状态，并在删除队列项前捕获其结构化引用。
+ * @param store Renderer 全局 Jotai store。
+ * @param status 主进程已启动队列消息的权威状态。
+ * @returns 无返回值；同步更新运行态、队列、live 消息与错误状态。
+ */
+export function applyAgentQueuedMessageStartedStatus(store: Store, status: AgentQueuedMessageStatus): void {
+  unstable_batchedUpdates(() => {
+    /** started 状态本身不携带 Canvas 引用，必须在队列删除前保存匹配快照。 */
+    const queuedMessage = store.get(agentSessionMessageQueueAtom)
+      .get(status.sessionId)
+      ?.find((message) => message.id === status.messageId)
+    // 主进程在启动 deferred run 前先发送 started 投影。这里必须先建立完整的
+    // 当前 run 状态，否则首个 SDK/tool 事件到达前会被当成空闲；后续事件只能
+    // 隐式创建一个没有 startedAt 的状态，导致续跑的运行计时和 run 边界丢失。
+    store.set(agentStreamingStatesAtom, (prev) => {
+      const current = prev.get(status.sessionId)
+      // 不让迟到的队列状态覆盖已经开始的新一轮 run。
+      if (current?.startedAt != null && current.startedAt > status.startedAt) return prev
+      const map = new Map(prev)
+      map.set(status.sessionId, createQueuedAgentStreamState(current, status.startedAt))
+      return map
+    })
+    store.set(agentSessionMessageQueueAtom, (prev) => {
+      const current = prev.get(status.sessionId) ?? []
+      const next = removeQueuedMessage(current, status.messageId)
+      if (next.length === current.length) return prev
+      const map = new Map(prev)
+      if (next.length === 0) map.delete(status.sessionId)
+      else map.set(status.sessionId, next)
+      return map
+    })
+    store.set(liveMessagesMapAtom, (prev) => {
+      const current = prev.get(status.sessionId) ?? []
+      const uuid = status.messageId
+      if (current.some((message) => (message as unknown as { uuid?: string }).uuid === uuid)) return prev
+      const optimisticMessage: SDKMessage = {
+        type: "user",
+        uuid,
+        message: { content: [{ type: "text", text: status.rawUserMessage ?? status.userMessage }] },
+        parent_tool_use_id: null,
+        _createdAt: status.startedAt,
+        _promaLiveRunStartedAt: status.startedAt,
+        ...(queuedMessage?.canvasNodeReferences && queuedMessage.canvasNodeReferences.length > 0
+          ? { _canvasNodeReferences: [...queuedMessage.canvasNodeReferences] }
+          : {}),
+      } as unknown as SDKMessage
+      const map = new Map(prev)
+      map.set(status.sessionId, [...current, optimisticMessage])
+      return map
+    })
+    store.set(agentStreamErrorsAtom, (prev) => {
+      if (!prev.has(status.sessionId)) return prev
+      const map = new Map(prev)
+      map.delete(status.sessionId)
+      return map
+    })
+  })
+}
+
 export function useGlobalAgentListeners(): void {
   const store = useStore()
 
@@ -608,50 +669,7 @@ export function useGlobalAgentListeners(): void {
     const pendingGitMutateTools = new Map<string, string>()
 
     const cleanupQueuedMessageStatus = window.electronAPI.onAgentQueuedMessageStatus((status) => {
-      unstable_batchedUpdates(() => {
-        // 主进程在启动 deferred run 前先发送 started 投影。这里必须先建立完整的
-        // 当前 run 状态，否则首个 SDK/tool 事件到达前会被当成空闲；后续事件只能
-        // 隐式创建一个没有 startedAt 的状态，导致续跑的运行计时和 run 边界丢失。
-        store.set(agentStreamingStatesAtom, (prev) => {
-          const current = prev.get(status.sessionId)
-          // 不让迟到的队列状态覆盖已经开始的新一轮 run。
-          if (current?.startedAt != null && current.startedAt > status.startedAt) return prev
-          const map = new Map(prev)
-          map.set(status.sessionId, createQueuedAgentStreamState(current, status.startedAt))
-          return map
-        })
-        store.set(agentSessionMessageQueueAtom, (prev) => {
-          const current = prev.get(status.sessionId) ?? []
-          const next = removeQueuedMessage(current, status.messageId)
-          if (next.length === current.length) return prev
-          const map = new Map(prev)
-          if (next.length === 0) map.delete(status.sessionId)
-          else map.set(status.sessionId, next)
-          return map
-        })
-        store.set(liveMessagesMapAtom, (prev) => {
-          const current = prev.get(status.sessionId) ?? []
-          const uuid = status.messageId
-          if (current.some((message) => (message as unknown as { uuid?: string }).uuid === uuid)) return prev
-          const optimisticMessage: SDKMessage = {
-            type: "user",
-            uuid,
-            message: { content: [{ type: "text", text: status.rawUserMessage ?? status.userMessage }] },
-            parent_tool_use_id: null,
-            _createdAt: status.startedAt,
-            _promaLiveRunStartedAt: status.startedAt,
-          } as unknown as SDKMessage
-          const map = new Map(prev)
-          map.set(status.sessionId, [...current, optimisticMessage])
-          return map
-        })
-        store.set(agentStreamErrorsAtom, (prev) => {
-          if (!prev.has(status.sessionId)) return prev
-          const map = new Map(prev)
-          map.delete(status.sessionId)
-          return map
-        })
-      })
+      applyAgentQueuedMessageStartedStatus(store, status)
     })
 
     /** 构建导航到指定会话的回调 */

@@ -8,6 +8,7 @@ import {
   mergeAgentDraftWithRestoredMessage,
   parseQueuedMessageMentions,
   removeSentCanvasNodeReferences,
+  restoreMissingCanvasNodeReferences,
   submitQueuedMessagePayload,
 } from './agent-message-queue'
 
@@ -109,6 +110,32 @@ describe('Canvas 节点引用队列合同', () => {
       [canvasReferenceA, canvasReferenceB],
     )).toEqual([canvasReferenceA, canvasReferenceB])
     expect(text).toBe('基于这些页面继续设计')
+  })
+
+  test('Given rev1 正在发送 When 通过生产引用入口再次加入 rev2 且 rev1 成功 Then 原位保留 rev2', () => {
+    const rev1 = { ...canvasReferenceA, nodeRevision: 1, title: '需求说明 v1' }
+    const rev2 = { ...canvasReferenceA, nodeRevision: 2, title: '需求说明 v2' }
+    /** 模拟发送开始时捕获的旧引用快照。 */
+    const sentReferences = [rev1]
+
+    const referencesAfterNewCitation = addCanvasNodeReferences([rev1, canvasReferenceB], [rev2])
+    const referencesAfterOldSendCompletes = removeSentCanvasNodeReferences(
+      referencesAfterNewCitation,
+      sentReferences,
+    )
+
+    expect(referencesAfterNewCitation).toEqual([rev2, canvasReferenceB])
+    expect(referencesAfterOldSendCompletes).toEqual([rev2, canvasReferenceB])
+  })
+
+  test('Given composer 已有 rev2 When rev1 失败恢复或撤回 Then 旧快照不覆盖当前引用', () => {
+    const rev1 = { ...canvasReferenceA, nodeRevision: 1, title: '需求说明 v1' }
+    const rev2 = { ...canvasReferenceA, nodeRevision: 2, title: '需求说明 v2' }
+
+    expect(restoreMissingCanvasNodeReferences([rev2], [rev1, canvasReferenceB])).toEqual([
+      rev2,
+      canvasReferenceB,
+    ])
   })
 
   test('Given 排队消息携带节点引用 When 构建发送载荷 Then 完整保留结构化快照', () => {
