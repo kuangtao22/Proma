@@ -214,3 +214,4 @@
 - 2026-08-29：Canvas 图片详情的每次 LOAD 必须签发不可复用 `mediaLeaseId`，RELEASE 只精确释放对应授权；旧详情的迟到释放不得取消新 LOAD，失效 controller 收到迟到成功快照时主动回收该授权。
 - 2026-08-29：Canvas 折叠生图卡片复用工作区 LOAD 已验证的素材宽高计算受限比例，固定 288px 宽、预览高度限制 96–320px，图片使用完整展示且 XYFlow 节点与连线 Handle 共用同一高度事实；Canvas Agent 身份通过可信单次系统上下文追加，不改写用户消息或 JSONL，并明确禁止要求用户另建或切换 Design/Canvas。
 - 2026-08-29：用户确认将 Canvas 从左侧独立会话和独立主视图迁入普通 Agent 的右侧工作区，界面统一使用中文“画布”；画布仍归项目所有，每个 Agent 默认绑定一张并可关联多张，多个 Agent 可共享同一画布但视口、选区和面板状态按 `sessionId + canvasId` 隔离。节点通过结构化引用进入对话，Agent 使用受控画布工具按需读取、批量创建或修改节点并建立连线，明确执行才调用付费能力；长期上游接缝收敛到右侧工作区适配与 Pi 工具提供器。
+- 2026-08-29：Agent-Canvas 共享合同固定以 `AgentCanvasBinding` 维护项目内会话关联，重复画布按首现顺序去重且默认/最近画布必须已关联；发送与队列使用公开 `canvasNodeReferences`，SDK JSONL 持久化使用私有 `_canvasNodeReferences`，两者不复用附件或 mention。Agent 工具批量修改与节点执行必须携带源会话、运行开始时间和工具调用 ID，并在共享边界严格拒绝未知字段、非法 ID、节点类别与 revision。

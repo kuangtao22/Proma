@@ -12,8 +12,21 @@ import {
   parseRestoreCanvasNodeInput,
   parseCanvasNodeContentMeta,
   parseCanvasTrashEntry,
+  parseAgentCanvasBinding,
+  parseCanvasBatchOperationInput,
+  parseCanvasNodeReference,
+  parseCanvasRunNodesInput,
+  parseClearAgentCanvasBindingsInput,
+  parseClearAgentCanvasBindingsResult,
+  parseLinkAgentCanvasInput,
+  parseLinkAgentCanvasResult,
+  parseListAgentCanvasBindingsInput,
+  parseListAgentCanvasBindingsResult,
+  parseSetDefaultAgentCanvasInput,
+  parseUnlinkAgentCanvasInput,
 } from './canvas'
 import type {
+  AgentCanvasBinding,
   CanvasChangeEvent,
   CanvasAgentNode,
   CanvasInvokeResult,
@@ -113,6 +126,101 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given Agent 关联包含重复画布 When 严格解析 Then 去重并保持首现顺序', () => {
+    /** 持久化边界返回的关联记录，重复项应被规范化。 */
+    const binding = parseAgentCanvasBinding({
+      projectId: 'project-1',
+      sessionId: 'session-1',
+      defaultCanvasId: 'canvas-1',
+      linkedCanvasIds: ['canvas-1', 'canvas-2', 'canvas-1'],
+      lastActiveCanvasId: 'canvas-2',
+      updatedAt: 10,
+    }) satisfies AgentCanvasBinding
+
+    expect(binding.linkedCanvasIds).toEqual(['canvas-1', 'canvas-2'])
+  })
+
+  test('Given 默认或最近画布未关联 When 严格解析 Then 拒绝不一致记录与未知字段', () => {
+    /** 合法关联基线用于只改变单一非法字段。 */
+    const binding = {
+      projectId: 'project-1', sessionId: 'session-1',
+      linkedCanvasIds: ['canvas-1'], updatedAt: 10,
+    }
+
+    expect(() => parseAgentCanvasBinding({ ...binding, defaultCanvasId: 'canvas-2' })).toThrow()
+    expect(() => parseAgentCanvasBinding({ ...binding, lastActiveCanvasId: 'canvas-2' })).toThrow()
+    expect(() => parseAgentCanvasBinding({ ...binding, storagePath: '/private/bindings.json' })).toThrow()
+  })
+
+  test('Given 关联 IPC 输入 When 严格解析 Then 只接受安全身份与精确字段', () => {
+    expect(parseListAgentCanvasBindingsInput({ projectId: 'project-1' })).toEqual({ projectId: 'project-1' })
+    expect(parseLinkAgentCanvasInput({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }))
+      .toEqual({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' })
+    expect(parseUnlinkAgentCanvasInput({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }))
+      .toEqual({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' })
+    expect(parseSetDefaultAgentCanvasInput({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }))
+      .toEqual({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' })
+    expect(parseClearAgentCanvasBindingsInput({ projectId: 'project-1', sessionId: 'session-1' }))
+      .toEqual({ projectId: 'project-1', sessionId: 'session-1' })
+    expect(() => parseLinkAgentCanvasInput({
+      projectId: 'project-1', sessionId: 'session-1', canvasId: '../escape',
+    })).toThrow()
+    expect(() => parseListAgentCanvasBindingsInput({ projectId: 'project-1', extra: true })).toThrow()
+  })
+
+  test('Given 关联 IPC 输出 When 严格解析 Then 只返回公开绑定或 void', () => {
+    /** 关联命令公开输出只包含规范化绑定。 */
+    const binding = {
+      projectId: 'project-1', sessionId: 'session-1',
+      linkedCanvasIds: ['canvas-1', 'canvas-1'], updatedAt: 10,
+    }
+
+    expect(parseLinkAgentCanvasResult(binding).linkedCanvasIds).toEqual(['canvas-1'])
+    expect(parseListAgentCanvasBindingsResult([binding])).toEqual([{
+      ...binding,
+      linkedCanvasIds: ['canvas-1'],
+    }])
+    expect(parseClearAgentCanvasBindingsResult(undefined)).toBeUndefined()
+    expect(() => parseListAgentCanvasBindingsResult([{ ...binding, internalPath: '/private/binding.json' }]))
+      .toThrow()
+    expect(() => parseClearAgentCanvasBindingsResult({ cleared: true })).toThrow()
+  })
+
+  test('Given Canvas 节点引用 When 严格解析 Then 校验节点类型、revision 与未知字段', () => {
+    /** 合法引用不复用附件或 mention 字段。 */
+    const reference = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      nodeType: 'document', nodeRevision: 3, title: '需求文档',
+    } satisfies import('./canvas').CanvasNodeReference
+
+    expect(parseCanvasNodeReference(reference)).toEqual(reference)
+    expect(() => parseCanvasNodeReference({ ...reference, nodeRevision: -1 })).toThrow()
+    expect(() => parseCanvasNodeReference({ ...reference, nodeRevision: 1.5 })).toThrow()
+    expect(() => parseCanvasNodeReference({ ...reference, nodeType: 'video' })).toThrow()
+    expect(() => parseCanvasNodeReference({ ...reference, localPath: '/private/node.json' })).toThrow()
+  })
+
+  test('Given Agent 批量修改与执行输入 When 严格解析 Then 保留来源代次并拒绝未知字段', () => {
+    /** 批量操作使用现有 Canvas mutation，不引入第二套图修改协议。 */
+    const batch = {
+      projectId: 'project-1', canvasId: 'canvas-1', baseRevision: 2,
+      operations: [{ type: 'remove-nodes', nodeIds: ['node-1'] }],
+      sourceSessionId: 'session-1', sourceRunStartedAt: 100, sourceToolCallId: 'tool-1',
+    } satisfies import('./canvas').CanvasBatchOperationInput
+    /** 节点执行只提交稳定节点 ID 与来源代次。 */
+    const run = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeIds: ['node-1', 'node-2'],
+      sourceSessionId: 'session-1', sourceRunStartedAt: 100, sourceToolCallId: 'tool-1',
+    }
+
+    expect(parseCanvasBatchOperationInput(batch)).toEqual(batch)
+    expect(parseCanvasRunNodesInput(run)).toEqual(run)
+    expect(() => parseCanvasBatchOperationInput({ ...batch, baseRevision: -1 })).toThrow()
+    expect(() => parseCanvasBatchOperationInput({ ...batch, internal: true })).toThrow()
+    expect(() => parseCanvasRunNodesInput({ ...run, nodeIds: ['node-1', '../escape'] })).toThrow()
+    expect(() => parseCanvasRunNodesInput({ ...run, extra: true })).toThrow()
+  })
+
   test('Given 图片媒体释放输入 When 严格解析 Then 保留完整目标与授权身份并拒绝多余字段', () => {
     const input = {
       projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-image',
@@ -319,6 +427,11 @@ describe('Canvas 图共享合同', () => {
       GET_AGENT_MESSAGES: 'canvas:get-agent-messages',
       SEND_AGENT_MESSAGE: 'canvas:send-agent-message',
       STOP_AGENT: 'canvas:stop-agent',
+      LIST_AGENT_BINDINGS: 'canvas:list-agent-bindings',
+      LINK_AGENT_CANVAS: 'canvas:link-agent-canvas',
+      UNLINK_AGENT_CANVAS: 'canvas:unlink-agent-canvas',
+      SET_DEFAULT_AGENT_CANVAS: 'canvas:set-default-agent-canvas',
+      CLEAR_AGENT_BINDINGS: 'canvas:clear-agent-bindings',
       CHANGED: 'canvas:changed',
     })
     expect(loadInput).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })
