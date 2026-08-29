@@ -1,9 +1,14 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { AgentCanvasBinding } from '@proma/shared'
 import { AgentCanvasBindingStore } from './agent-canvas-binding-store'
 
 /** 测试配置文件的固定虚拟路径，不访问真实用户目录。 */
 const CONFIG_PATH = '/tmp/proma-agent-canvas-binding-store.json'
+/** 真实 safe-file 测试创建的临时目录，结束后统一清理。 */
+const temporaryDirectories: string[] = []
 
 /** 测试写入调用，保留每次原子提交的深拷贝。 */
 interface WriteCall {
@@ -50,6 +55,12 @@ function linkInput(
 
 beforeEach(() => {
   // 测试保持无全局 mock，避免 Bun 组合运行时污染其它 Store。
+})
+
+afterEach(() => {
+  for (const directory of temporaryDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true })
+  }
 })
 
 describe('AgentCanvasBindingStore', () => {
@@ -184,6 +195,100 @@ describe('AgentCanvasBindingStore', () => {
       version: 1,
       bindings: [store.get('project-1', 'session-1')],
     })
+  })
+
+  test('Given 主文件缺失、错误版本 tmp 与合法 bak When 读取 Then 跳过 tmp 并从 bak 恢复合法主文件', () => {
+    /** 真实文件系统临时目录用于运行 safe-file 恢复合同。 */
+    const directory = mkdtempSync(join(tmpdir(), 'proma-agent-canvas-recovery-'))
+    temporaryDirectories.push(directory)
+    /** safe-file 主文件及其固定候选路径。 */
+    const configPath = join(directory, 'agent-canvas-bindings.json')
+    /** 合法备份中唯一的关联记录。 */
+    const backupFile = {
+      version: 1,
+      bindings: [{
+        projectId: 'project-1',
+        sessionId: 'session-backup',
+        defaultCanvasId: 'canvas-backup',
+        linkedCanvasIds: ['canvas-backup'],
+        lastActiveCanvasId: 'canvas-backup',
+        updatedAt: 10,
+      }],
+    }
+    writeFileSync(`${configPath}.tmp`, JSON.stringify({ version: 2, bindings: [] }), 'utf8')
+    writeFileSync(`${configPath}.bak`, JSON.stringify(backupFile), 'utf8')
+
+    const result = new AgentCanvasBindingStore({ configPath }).listByProject('project-1')
+
+    expect(result).toEqual(backupFile.bindings)
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual(backupFile)
+    expect(existsSync(`${configPath}.tmp`)).toBe(false)
+  })
+
+  test('Given 主文件缺失与合法 tmp When 读取 Then safe-file 提升 tmp 为主文件', () => {
+    /** 真实文件系统临时目录用于运行 safe-file tmp 提升合同。 */
+    const directory = mkdtempSync(join(tmpdir(), 'proma-agent-canvas-tmp-'))
+    temporaryDirectories.push(directory)
+    /** safe-file 主文件及其固定临时候选路径。 */
+    const configPath = join(directory, 'agent-canvas-bindings.json')
+    /** 合法临时索引值。 */
+    const temporaryFile = {
+      version: 1,
+      bindings: [{
+        projectId: 'project-1',
+        sessionId: 'session-tmp',
+        linkedCanvasIds: ['canvas-tmp'],
+        updatedAt: 20,
+      }],
+    }
+    writeFileSync(`${configPath}.tmp`, JSON.stringify(temporaryFile), 'utf8')
+
+    const result = new AgentCanvasBindingStore({ configPath }).listByProject('project-1')
+
+    expect(result).toEqual(temporaryFile.bindings)
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual(temporaryFile)
+    expect(existsSync(`${configPath}.tmp`)).toBe(false)
+  })
+
+  test('Given 首次原子写在提交前失败 When 重试同一关联 Then 缓存保持旧状态且第二次仍写入', () => {
+    /** 写入前已有的稳定磁盘索引。 */
+    let diskValue: unknown = {
+      version: 1,
+      bindings: [{
+        projectId: 'project-1',
+        sessionId: 'session-1',
+        defaultCanvasId: 'canvas-a',
+        linkedCanvasIds: ['canvas-a'],
+        lastActiveCanvasId: 'canvas-a',
+        updatedAt: 10,
+      }],
+    }
+    /** 记录两次原子写尝试，第一次模拟 rename 前失败。 */
+    let writeAttempts = 0
+    const store = new AgentCanvasBindingStore({
+      configPath: CONFIG_PATH,
+      now: () => 20,
+      exists: () => true,
+      readFile: () => JSON.stringify(diskValue),
+      readJson: () => diskValue,
+      writeJson: (_path, value) => {
+        writeAttempts += 1
+        if (writeAttempts === 1) throw new Error('PRECOMMIT_WRITE_FAILED')
+        diskValue = JSON.parse(JSON.stringify(value)) as object
+        return 'directory'
+      },
+      warn: () => undefined,
+    })
+
+    expect(() => store.link(linkInput('session-1', 'canvas-b'))).toThrow(
+      'PRECOMMIT_WRITE_FAILED',
+    )
+    expect(store.get('project-1', 'session-1')?.linkedCanvasIds).toEqual(['canvas-a'])
+
+    expect(store.link(linkInput('session-1', 'canvas-b')).linkedCanvasIds).toEqual([
+      'canvas-a', 'canvas-b',
+    ])
+    expect(writeAttempts).toBe(2)
   })
 
   test.each([

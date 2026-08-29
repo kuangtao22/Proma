@@ -15,6 +15,7 @@ import {
 } from '@proma/shared'
 import { getAgentCanvasBindingsPath } from '../config-paths'
 import { readJsonFileSafe, writeJsonFileAtomic } from '../safe-file'
+import type { ReadJsonFileSafeOptions } from '../safe-file'
 
 /** Agent-画布关联索引的当前磁盘版本。 */
 const AGENT_CANVAS_BINDINGS_VERSION = 1
@@ -36,7 +37,7 @@ export interface AgentCanvasBindingStoreDependencies {
   /** 读取主文件原始内容，避免损坏读取触发候选提升。 */
   readFile?: (filePath: string, encoding: 'utf8') => string
   /** 使用 safe-file 读取合法主文件或缺失主文件的恢复候选。 */
-  readJson?: (filePath: string) => unknown | null
+  readJson?: (filePath: string, options: ReadJsonFileSafeOptions<unknown>) => unknown | null
   /** 使用 safe-file 原子写入完整索引。 */
   writeJson?: (filePath: string, value: object) => unknown
   /** 输出不含文件内容的中文损坏提示。 */
@@ -54,7 +55,10 @@ export class AgentCanvasBindingStore {
   /** 主文件原始内容读取边界。 */
   private readonly readFile: (filePath: string, encoding: 'utf8') => string
   /** safe-file JSON 恢复读取边界。 */
-  private readonly readJson: (filePath: string) => unknown | null
+  private readonly readJson: (
+    filePath: string,
+    options: ReadJsonFileSafeOptions<unknown>,
+  ) => unknown | null
   /** safe-file 原子 JSON 写入边界。 */
   private readonly writeJson: (filePath: string, value: object) => unknown
   /** 中文降级日志边界。 */
@@ -71,7 +75,9 @@ export class AgentCanvasBindingStore {
     this.now = dependencies.now ?? Date.now
     this.exists = dependencies.exists ?? existsSync
     this.readFile = dependencies.readFile ?? ((filePath, encoding) => readFileSync(filePath, encoding))
-    this.readJson = dependencies.readJson ?? ((filePath) => readJsonFileSafe<unknown>(filePath))
+    this.readJson = dependencies.readJson ?? ((filePath, options) => (
+      readJsonFileSafe<unknown>(filePath, options)
+    ))
     this.writeJson = dependencies.writeJson ?? ((filePath, value) => writeJsonFileAtomic(filePath, value))
     this.warn = dependencies.warn ?? ((message, error) => console.warn(message, error))
   }
@@ -115,7 +121,7 @@ export class AgentCanvasBindingStore {
     /** 共享边界严格解析后的关联命令。 */
     const input = parseLinkAgentCanvasInput(rawInput)
     /** 当前完整内存索引。 */
-    const bindings = this.load()
+    const bindings = this.load().map(copyBinding)
     /** 相同项目与会话的现有记录位置。 */
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
     /** 命中时用于判断重复操作或默认切换的现有记录。 */
@@ -135,7 +141,7 @@ export class AgentCanvasBindingStore {
         updatedAt: this.now(),
       }
       bindings[index] = updated
-      this.persist()
+      this.persist(bindings)
       return copyBinding(updated)
     }
 
@@ -160,7 +166,7 @@ export class AgentCanvasBindingStore {
     }
     if (index < 0) bindings.push(updated)
     else bindings[index] = updated
-    this.persist()
+    this.persist(bindings)
     return copyBinding(updated)
   }
 
@@ -173,7 +179,7 @@ export class AgentCanvasBindingStore {
     /** 共享边界严格解析后的解除命令。 */
     const input = parseUnlinkAgentCanvasInput(rawInput)
     /** 当前完整内存索引。 */
-    const bindings = this.load()
+    const bindings = this.load().map(copyBinding)
     /** 目标记录位置。 */
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
     if (index < 0) return null
@@ -184,7 +190,7 @@ export class AgentCanvasBindingStore {
     const linkedCanvasIds = existing.linkedCanvasIds.filter((canvasId) => canvasId !== input.canvasId)
     if (linkedCanvasIds.length === 0) {
       bindings.splice(index, 1)
-      this.persist()
+      this.persist(bindings)
       return null
     }
     /** 若默认被删除则稳定回退到剩余首项。 */
@@ -204,7 +210,7 @@ export class AgentCanvasBindingStore {
       updatedAt: this.now(),
     }
     bindings[index] = updated
-    this.persist()
+    this.persist(bindings)
     return copyBinding(updated)
   }
 
@@ -217,7 +223,7 @@ export class AgentCanvasBindingStore {
     /** 共享边界严格解析后的默认切换命令。 */
     const input = parseSetDefaultAgentCanvasInput(rawInput)
     /** 当前完整内存索引。 */
-    const bindings = this.load()
+    const bindings = this.load().map(copyBinding)
     /** 目标记录位置。 */
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
     /** 目标记录；未知会话或未知关联都明确拒绝。 */
@@ -237,7 +243,7 @@ export class AgentCanvasBindingStore {
       updatedAt: this.now(),
     }
     bindings[index] = updated
-    this.persist()
+    this.persist(bindings)
     return copyBinding(updated)
   }
 
@@ -251,12 +257,12 @@ export class AgentCanvasBindingStore {
     const input = parseClearAgentCanvasBindingsInput({ projectId, target: 'session', sessionId })
     if (input.target !== 'session') throw new Error('CLEAR_AGENT_CANVAS_BINDINGS_INPUT_INVALID')
     /** 当前完整内存索引。 */
-    const bindings = this.load()
+    const bindings = this.load().map(copyBinding)
     /** 目标记录位置。 */
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
     if (index < 0) return
     bindings.splice(index, 1)
-    this.persist()
+    this.persist(bindings)
   }
 
   /**
@@ -269,7 +275,7 @@ export class AgentCanvasBindingStore {
     const input = parseClearAgentCanvasBindingsInput({ projectId, target: 'canvas', canvasId })
     if (input.target !== 'canvas') throw new Error('CLEAR_AGENT_CANVAS_BINDINGS_INPUT_INVALID')
     /** 当前完整内存索引。 */
-    const bindings = this.load()
+    const bindings = this.load().map(copyBinding)
     /** 本轮是否实际修改过至少一条记录。 */
     let changed = false
     /** 同一次清理对所有保留记录使用一致时间戳。 */
@@ -306,7 +312,7 @@ export class AgentCanvasBindingStore {
         updatedAt: timestamp,
       }
     }
-    if (changed) this.persist()
+    if (changed) this.persist(bindings)
   }
 
   /** 延迟读取磁盘，并把损坏配置降级为空内存索引。 */
@@ -320,7 +326,7 @@ export class AgentCanvasBindingStore {
         parseBindingsFile(primaryValue)
       }
       /** safe-file 返回的主文件或缺失主文件恢复候选。 */
-      const value = this.readJson(this.configPath)
+      const value = this.readJson(this.configPath, { validate: isAgentCanvasBindingsFile })
       /** 规范化后的文件；全部候选缺失时使用空索引。 */
       const file = value === null ? createEmptyBindingsFile() : parseBindingsFile(value)
       this.bindings = file.bindings.map(copyBinding)
@@ -331,10 +337,13 @@ export class AgentCanvasBindingStore {
     return this.bindings
   }
 
-  /** 按稳定身份排序并原子提交完整索引。 */
-  private persist(): void {
+  /**
+   * 按稳定身份排序并原子提交候选索引。
+   * @param candidateBindings 尚未影响当前缓存的完整候选记录。
+   */
+  private persist(candidateBindings: readonly AgentCanvasBinding[]): void {
     /** 确定性排序后的隔离持久化记录。 */
-    const bindings = this.load().map(copyBinding).sort(compareBindings)
+    const bindings = candidateBindings.map(copyBinding).sort(compareBindings)
     /** 固定 schema v1 的完整写入值。 */
     const file: AgentCanvasBindingsFile = {
       version: AGENT_CANVAS_BINDINGS_VERSION,
@@ -342,6 +351,16 @@ export class AgentCanvasBindingStore {
     }
     this.writeJson(this.configPath, file)
     this.bindings = bindings
+  }
+}
+
+/** safe-file 使用的非抛出 schema validator，非法候选返回 false 继续恢复链。 */
+function isAgentCanvasBindingsFile(value: unknown): value is AgentCanvasBindingsFile {
+  try {
+    parseBindingsFile(value)
+    return true
+  } catch {
+    return false
   }
 }
 
