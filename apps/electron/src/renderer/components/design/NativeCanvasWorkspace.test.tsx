@@ -65,6 +65,7 @@ import {
   createNativeCanvasNodeCreationSuccessUpdate,
   createNativeCanvasLifecycleSuccessUpdate,
   deleteNativeCanvasNodesSequentially,
+  settleNativeCanvasSingleDeleteAttempt,
   createResolvedNativeCanvasWorkbenchSwitchUpdate,
   getNativeCanvasWorkbenchCommitAvailability,
   createNativeCanvasWorkbenchDraftCommitterKey,
@@ -276,6 +277,36 @@ describe('原生 Canvas 批量删除', () => {
     expect(result.deletedNodeIds).toEqual(['document-1'])
     expect(result.remainingNodeIds).toEqual(['webview-1'])
     expect(result.error).toBeInstanceOf(Error)
+  })
+
+  test('Given 单节点删除适配器同步抛错 When 收口删除尝试 Then 恢复提交状态并释放结构令牌', async () => {
+    /** 模拟组件在确认删除后已经进入提交态。 */
+    let submitting = true
+    /** 记录失败回调公开错误，避免测试依赖闭包赋值的控制流收窄。 */
+    const errors: string[] = []
+    /** 记录共享结构令牌的释放次数，防止异常路径永久阻塞后续操作。 */
+    let releaseCount = 0
+    const syncError = new Error('同步删除失败')
+
+    await settleNativeCanvasSingleDeleteAttempt({
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      nodeId: 'document-1',
+      operationId: 'operation-delete-1',
+      expectedRevision: 7,
+    }, {
+      deleteNode: () => { throw syncError },
+      onSuccess: () => undefined,
+      onFailure: (caughtError) => {
+        submitting = false
+        errors.push(caughtError === syncError ? '节点删除失败，请重试。' : '错误异常')
+      },
+      onSettled: () => { releaseCount += 1 },
+    })
+
+    expect(submitting).toBe(false)
+    expect(errors).toEqual(['节点删除失败，请重试。'])
+    expect(releaseCount).toBe(1)
   })
 })
 
@@ -1641,6 +1672,33 @@ describe('原生 Canvas 冲突提示', () => {
 })
 
 describe('原生 Canvas 添加 Agent 命令', () => {
+  test('Given 创建适配器同步抛错 When 执行创建 Then 返回拒绝并恢复状态与释放结构令牌', async () => {
+    const states: CanvasAgentNodeCommandState[] = []
+    /** 记录共享结构令牌的释放次数，确保同步异常与异步失败语义一致。 */
+    let releaseCount = 0
+    const syncError = new Error('同步创建失败')
+    const controller = createCanvasNodeCommandController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      createAgentNode: () => { throw syncError },
+      createContentNode: () => { throw syncError },
+      createId: (() => {
+        const ids = ['operation-create-1', 'agent-1']
+        return () => ids.shift() ?? 'unexpected-id'
+      })(),
+      getDocument: () => createSnapshot(7).document,
+      getPosition: () => ({ x: 320, y: 40 }),
+      onStateChange: (state) => states.push(state),
+      onSuccess: () => undefined,
+      beginOperation: () => true,
+      endOperation: () => { releaseCount += 1 },
+    })
+
+    await expect(controller.execute({ kind: 'agent' })).rejects.toBe(syncError)
+
+    expect(states.at(-1)).toEqual({ loading: false, error: '节点创建失败，请重试。' })
+    expect(releaseCount).toBe(1)
+  })
+
   test.each([
     ['agent', '新 Agent'],
     ['image', '新生图'],
@@ -2416,6 +2474,27 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       snapshot: rebuiltSnapshot,
       error: null,
     })
+  })
+
+  test('Given 重建适配器同步抛错 When 执行重建 Then 返回拒绝并恢复状态与释放结构令牌', async () => {
+    const states: CanvasAgentNodeCommandState[] = []
+    /** 记录共享结构令牌的释放次数，防止坏节点恢复永久锁住 Canvas。 */
+    let releaseCount = 0
+    const syncError = new Error('同步重建失败')
+    const controller = createCanvasAgentNodeRebuildController({
+      target: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'agent-1' },
+      rebuildAgentNode: () => { throw syncError },
+      createId: () => 'operation-rebuild-1',
+      onStateChange: (state) => states.push(state),
+      onSuccess: () => undefined,
+      beginOperation: () => true,
+      endOperation: () => { releaseCount += 1 },
+    })
+
+    await expect(controller.execute()).rejects.toBe(syncError)
+
+    expect(states.at(-1)).toEqual({ loading: false, error: '重建失败，请重试。' })
+    expect(releaseCount).toBe(1)
   })
 
   test('Given 坏 Agent 节点 When 渲染 Workspace Then 绕过对话并显示恢复面板', () => {

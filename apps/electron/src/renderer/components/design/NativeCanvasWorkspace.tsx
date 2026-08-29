@@ -655,6 +655,34 @@ export async function deleteNativeCanvasNodesSequentially(
   return { deletedNodeIds, remainingNodeIds: [], error: null }
 }
 
+/** 单节点删除尝试的生命周期依赖，统一收口同步抛错与异步拒绝。 */
+export interface NativeCanvasSingleDeleteAttemptDependencies {
+  deleteNode: (input: DeleteCanvasNodeInput) => Promise<CanvasNodeLifecycleResult>
+  onSuccess: (result: CanvasNodeLifecycleResult) => void
+  onFailure: (error: unknown) => void
+  onSettled: () => void
+}
+
+/**
+ * 执行单节点删除，并保证适配器以任意方式失败时都会释放结构操作。
+ * @param operation 已固化 operationId 与 revision 的幂等删除请求。
+ * @param dependencies 删除 API 与成功、失败、结束回调。
+ * @returns 删除结果已由回调收口后完成，不向组件事件边界传播失败。
+ */
+export async function settleNativeCanvasSingleDeleteAttempt(
+  operation: DeleteCanvasNodeInput,
+  dependencies: NativeCanvasSingleDeleteAttemptDependencies,
+): Promise<void> {
+  try {
+    const result = await dependencies.deleteNode(operation)
+    dependencies.onSuccess(result)
+  } catch (error: unknown) {
+    dependencies.onFailure(error)
+  } finally {
+    dependencies.onSettled()
+  }
+}
+
 /**
  * 统计删除节点会同步移除的关联边。
  * @param document 当前权威 Canvas 文档。
@@ -918,28 +946,35 @@ export function createCanvasNodeCommandController(
         return Promise.reject(new Error('Canvas 正在执行其它结构操作'))
       }
       dependencies.onStateChange({ loading: true, error: null })
-      const createPromise = commandKind === 'agent'
-        ? dependencies.createAgentNode(command as CreateCanvasAgentNodeInput)
-        : dependencies.createContentNode(command as CreateCanvasContentNodeInput)
-      const requestPromise = createPromise.then((result) => {
-        if (disposed || generation !== requestGeneration) return
-        dependencies.onSuccess({ kind: commandKind, nodeId: command.nodeId, result })
-        operation = null
-        operationRequest = null
-        dependencies.onStateChange({ loading: false, error: null })
-      }).catch((error: unknown) => {
-        if (!disposed && generation === requestGeneration) {
-          dependencies.onStateChange({
-            loading: false,
-            error: getNativeCanvasOperationErrorMessage('create', error),
-          })
+      /** async 边界把适配器同步抛错统一转换为 rejection，并保证结构令牌释放。 */
+      const requestPromise = (async (): Promise<void> => {
+        try {
+          const result = commandKind === 'agent'
+            ? await dependencies.createAgentNode(command as CreateCanvasAgentNodeInput)
+            : await dependencies.createContentNode(command as CreateCanvasContentNodeInput)
+          if (disposed || generation !== requestGeneration) return
+          dependencies.onSuccess({ kind: commandKind, nodeId: command.nodeId, result })
+          operation = null
+          operationRequest = null
+          dependencies.onStateChange({ loading: false, error: null })
+        } catch (error: unknown) {
+          if (!disposed && generation === requestGeneration) {
+            dependencies.onStateChange({
+              loading: false,
+              error: getNativeCanvasOperationErrorMessage('create', error),
+            })
+          }
+          throw error
+        } finally {
+          dependencies.endOperation?.(command.operationId)
         }
-        throw error
-      }).finally(() => {
-        dependencies.endOperation?.(command.operationId)
-        if (inFlight === requestPromise) inFlight = null
-      })
+      })()
       inFlight = requestPromise
+      /** Promise 建立后再独立清理引用，避免同步异常期间访问未初始化变量。 */
+      void requestPromise.then(
+        () => { if (inFlight === requestPromise) inFlight = null },
+        () => { if (inFlight === requestPromise) inFlight = null },
+      )
       return requestPromise
     },
     cancel: () => {
@@ -1013,24 +1048,32 @@ export function createCanvasAgentNodeRebuildController(
         return Promise.reject(new Error('Canvas 正在执行其它结构操作'))
       }
       dependencies.onStateChange({ loading: true, error: null })
-      const requestPromise = dependencies.rebuildAgentNode(request).then((result) => {
-        if (disposed || generation !== requestGeneration) return
-        dependencies.onSuccess(result)
-        operation = null
-        dependencies.onStateChange({ loading: false, error: null })
-      }).catch((error: unknown) => {
-        if (!disposed && generation === requestGeneration) {
-          dependencies.onStateChange({
-            loading: false,
-            error: getNativeCanvasOperationErrorMessage('rebuild', error),
-          })
+      /** async 边界把适配器同步抛错统一转换为 rejection，并保证结构令牌释放。 */
+      const requestPromise = (async (): Promise<void> => {
+        try {
+          const result = await dependencies.rebuildAgentNode(request)
+          if (disposed || generation !== requestGeneration) return
+          dependencies.onSuccess(result)
+          operation = null
+          dependencies.onStateChange({ loading: false, error: null })
+        } catch (error: unknown) {
+          if (!disposed && generation === requestGeneration) {
+            dependencies.onStateChange({
+              loading: false,
+              error: getNativeCanvasOperationErrorMessage('rebuild', error),
+            })
+          }
+          throw error
+        } finally {
+          dependencies.endOperation?.(request.operationId)
         }
-        throw error
-      }).finally(() => {
-        dependencies.endOperation?.(request.operationId)
-        if (inFlight === requestPromise) inFlight = null
-      })
+      })()
       inFlight = requestPromise
+      /** Promise 建立后再独立清理引用，避免同步异常期间访问未初始化变量。 */
+      void requestPromise.then(
+        () => { if (inFlight === requestPromise) inFlight = null },
+        () => { if (inFlight === requestPromise) inFlight = null },
+      )
       return requestPromise
     },
     cancel: () => {
@@ -2556,33 +2599,38 @@ export function NativeCanvasWorkspace({
     const deleteGeneration = deleteGenerationRef.current
     setDeleteSubmitting(true)
     setDeleteError(null)
-    void adapter.deleteCanvasNode(operation).then((result) => {
-      if (deleteGenerationRef.current !== deleteGeneration) return
-      workbenchDraftCommitCoordinatorRef.current?.invalidate()
-      updateNativeCanvasState({
-        key: stateKey,
-        update: (current) => createNativeCanvasLifecycleSuccessUpdate(current, result, null),
-      })
-      updateAgentCanvasViewState({
-        key: viewStateKey,
-        update: {
-          selectedNodeId: null,
-          selectedNodeIds: [],
-          ...createClosedAgentCanvasWorkbenchUpdate(),
-        },
-      })
-      deleteOperationRef.current = null
-      invalidatePendingStopDelete()
-      setDeleteSubmitting(false)
-      setDeleteError(null)
-      setDeleteDialogOpen(false)
-    }).catch((error: unknown) => {
-      if (deleteGenerationRef.current !== deleteGeneration) return
-      invalidatePendingStopDelete()
-      setDeleteSubmitting(false)
-      setDeleteError(getNativeCanvasOperationErrorMessage('delete', error))
-    }).finally(() => {
-      endStructuralOperation(operation.operationId)
+    void settleNativeCanvasSingleDeleteAttempt(operation, {
+      deleteNode: adapter.deleteCanvasNode,
+      onSuccess: (result) => {
+        if (deleteGenerationRef.current !== deleteGeneration) return
+        workbenchDraftCommitCoordinatorRef.current?.invalidate()
+        updateNativeCanvasState({
+          key: stateKey,
+          update: (current) => createNativeCanvasLifecycleSuccessUpdate(current, result, null),
+        })
+        updateAgentCanvasViewState({
+          key: viewStateKey,
+          update: {
+            selectedNodeId: null,
+            selectedNodeIds: [],
+            ...createClosedAgentCanvasWorkbenchUpdate(),
+          },
+        })
+        deleteOperationRef.current = null
+        invalidatePendingStopDelete()
+        setDeleteSubmitting(false)
+        setDeleteError(null)
+        setDeleteDialogOpen(false)
+      },
+      onFailure: (error) => {
+        if (deleteGenerationRef.current !== deleteGeneration) return
+        invalidatePendingStopDelete()
+        setDeleteSubmitting(false)
+        setDeleteError(getNativeCanvasOperationErrorMessage('delete', error))
+      },
+      onSettled: () => {
+        endStructuralOperation(operation.operationId)
+      },
     })
   }, [
     adapter.deleteCanvasNode,
