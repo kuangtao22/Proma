@@ -61,8 +61,8 @@ interface DiffPanelTabBarProps {
   onOpenChat?: () => void
   /** 当前项目的完整 Canvas 索引；归档项仍可从同一菜单恢复。 */
   canvasSessions?: CanvasSessionMeta[]
-  onOpenCanvas?: (session: CanvasSessionMeta) => void
-  onCreateCanvas?: () => void
+  onOpenCanvas?: (session: CanvasSessionMeta) => Promise<void>
+  onCreateCanvas?: () => Promise<void>
   defaultCanvasId?: string
   onRenameCanvas?: (session: CanvasSessionMeta, title: string) => Promise<void>
   onSetDefaultCanvas?: (session: CanvasSessionMeta) => Promise<void>
@@ -77,6 +77,39 @@ interface DiffPanelTabBarProps {
   onSplitTab?: (tab: AgentSidePanelTab, pane: RightWorkspacePane) => void
   onCollapseSplit?: () => void
   onClose?: () => void
+}
+
+/** Canvas 菜单内互斥异步动作的稳定身份。 */
+export type CanvasMenuPendingAction = `${'create' | 'open' | 'rename' | 'default' | 'archive'}:${string}`
+
+export interface RunCanvasMenuActionOptions {
+  pendingAction: CanvasMenuPendingAction
+  action: () => Promise<void>
+  onPendingChange: (pending: CanvasMenuPendingAction | null) => void
+  onSettled?: () => void
+}
+
+/** legacy Design 保留归档/恢复能力，但禁止进入不可恢复删除流程。 */
+export function canDeleteCanvasFromWorkspaceMenu(session: CanvasSessionMeta): boolean {
+  return session.id !== LEGACY_DESIGN_CANVAS_ID
+}
+
+/** 菜单动作在组件边界内吞掉 rejection，并保证 pending/editing 最终收口。 */
+export async function runCanvasMenuAction({
+  pendingAction,
+  action,
+  onPendingChange,
+  onSettled,
+}: RunCanvasMenuActionOptions): Promise<void> {
+  onPendingChange(pendingAction)
+  try {
+    await action()
+  } catch {
+    // 用户错误由 SidePanel 宿主统一提示；此处只阻断未处理拒绝。
+  } finally {
+    onPendingChange(null)
+    onSettled?.()
+  }
 }
 
 export function DiffPanelTabBar({
@@ -116,6 +149,7 @@ export function DiffPanelTabBar({
   const [isSplitTabGroupHovered, setIsSplitTabGroupHovered] = React.useState(false)
   const [renamingCanvasId, setRenamingCanvasId] = React.useState<string | null>(null)
   const [canvasTitleDraft, setCanvasTitleDraft] = React.useState('')
+  const [pendingCanvasAction, setPendingCanvasAction] = React.useState<CanvasMenuPendingAction | null>(null)
   const canvasRenameCancelledRef = React.useRef(false)
   // 仅鼠标在菜单外取消时抑制 Radix 的回焦；Esc 与键盘选择必须保留可见焦点。
   const suppressPointerDismissFocusRestoreRef = React.useRef(false)
@@ -132,8 +166,12 @@ export function DiffPanelTabBar({
       setRenamingCanvasId(null)
       return
     }
-    await onRenameCanvas(session, title)
-    setRenamingCanvasId(null)
+    await runCanvasMenuAction({
+      pendingAction: `rename:${session.id}`,
+      action: () => onRenameCanvas(session, title),
+      onPendingChange: setPendingCanvasAction,
+      onSettled: () => setRenamingCanvasId(null),
+    })
   }, [canvasTitleDraft, onRenameCanvas])
 
   React.useEffect(() => () => onAddTabMenuOpenChange?.(false), [onAddTabMenuOpenChange])
@@ -415,7 +453,16 @@ export function DiffPanelTabBar({
                   画布
                 </DropdownMenuSubTrigger>
                 <DropdownMenuSubContent className="z-[110] min-w-44">
-                  <DropdownMenuItem onSelect={onCreateCanvas}>
+                  <DropdownMenuItem
+                    disabled={pendingCanvasAction !== null}
+                    onSelect={() => {
+                      void runCanvasMenuAction({
+                        pendingAction: 'create:new',
+                        action: onCreateCanvas,
+                        onPendingChange: setPendingCanvasAction,
+                      })
+                    }}
+                  >
                     <Plus className="size-3.5" />
                     新建画布
                   </DropdownMenuItem>
@@ -436,6 +483,7 @@ export function DiffPanelTabBar({
                                 <input
                                   autoFocus
                                   value={canvasTitleDraft}
+                                  disabled={pendingCanvasAction !== null}
                                   onChange={(event) => setCanvasTitleDraft(event.target.value)}
                                   onKeyDown={(event) => {
                                     if (event.key === 'Enter') event.currentTarget.blur()
@@ -457,21 +505,36 @@ export function DiffPanelTabBar({
                               </div>
                             ) : (
                               <>
-                                <DropdownMenuItem onSelect={() => onOpenCanvas(session)}>
+                                <DropdownMenuItem
+                                  disabled={pendingCanvasAction !== null}
+                                  onSelect={() => {
+                                    void runCanvasMenuAction({
+                                      pendingAction: `open:${session.id}`,
+                                      action: () => onOpenCanvas(session),
+                                      onPendingChange: setPendingCanvasAction,
+                                    })
+                                  }}
+                                >
                                   <Workflow className="size-3.5" />
                                   {session.archived ? '恢复并打开' : '打开'}
                                 </DropdownMenuItem>
                                 {onSetDefaultCanvas && (
                                   <DropdownMenuItem
-                                    disabled={defaultCanvasId === session.id || session.archived}
-                                    onSelect={() => { void onSetDefaultCanvas(session) }}
+                                    disabled={pendingCanvasAction !== null || defaultCanvasId === session.id || session.archived}
+                                    onSelect={() => {
+                                      void runCanvasMenuAction({
+                                        pendingAction: `default:${session.id}`,
+                                        action: () => onSetDefaultCanvas(session),
+                                        onPendingChange: setPendingCanvasAction,
+                                      })
+                                    }}
                                   >
                                     <Star className="size-3.5" />
                                     {defaultCanvasId === session.id ? '已设为默认' : '设为默认'}
                                   </DropdownMenuItem>
                                 )}
                                 {onRenameCanvas && (
-                                  <DropdownMenuItem onSelect={(event) => {
+                                  <DropdownMenuItem disabled={pendingCanvasAction !== null} onSelect={(event) => {
                                     event.preventDefault()
                                     canvasRenameCancelledRef.current = false
                                     setCanvasTitleDraft(session.title)
@@ -482,15 +545,24 @@ export function DiffPanelTabBar({
                                   </DropdownMenuItem>
                                 )}
                                 {onToggleArchiveCanvas && (
-                                  <DropdownMenuItem onSelect={() => { void onToggleArchiveCanvas(session) }}>
+                                  <DropdownMenuItem
+                                    disabled={pendingCanvasAction !== null}
+                                    onSelect={() => {
+                                      void runCanvasMenuAction({
+                                        pendingAction: `archive:${session.id}`,
+                                        action: () => onToggleArchiveCanvas(session),
+                                        onPendingChange: setPendingCanvasAction,
+                                      })
+                                    }}
+                                  >
                                     {session.archived ? <ArchiveRestore className="size-3.5" /> : <Archive className="size-3.5" />}
                                     {session.archived ? '恢复' : '归档'}
                                   </DropdownMenuItem>
                                 )}
                                 {onRequestDeleteCanvas && (
                                   <DropdownMenuItem
-                                    disabled={session.id === LEGACY_DESIGN_CANVAS_ID}
-                                    title={session.id === LEGACY_DESIGN_CANVAS_ID ? '旧版默认设计画布不能删除' : undefined}
+                                    disabled={!canDeleteCanvasFromWorkspaceMenu(session)}
+                                    title={!canDeleteCanvasFromWorkspaceMenu(session) ? '旧版默认设计画布不能删除' : undefined}
                                     className="text-destructive focus:text-destructive"
                                     onSelect={() => onRequestDeleteCanvas(session)}
                                   >

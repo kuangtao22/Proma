@@ -143,6 +143,11 @@ import {
 } from '@/components/design/CanvasWorkspaceAdapter'
 import { designAdapter } from '@/lib/design-adapter'
 import { removeCanvasSessionAtom, upsertCanvasSessionAtom } from '@/atoms/canvas-session-atoms'
+import {
+  CANVAS_WORKSPACE_FAILURE_MESSAGES,
+  runCanvasDeleteAction,
+  runCanvasWorkspaceAction,
+} from './canvas-workspace-actions'
 
 function BrowserTabIcon({ favicon }: { favicon?: string }): React.ReactElement {
   const [loadFailed, setLoadFailed] = React.useState(false)
@@ -1169,6 +1174,12 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const removeCanvasSession = useSetAtom(removeCanvasSessionAtom)
   const [pendingDeleteCanvas, setPendingDeleteCanvas] = React.useState<CanvasSessionMeta | null>(null)
   const [deletingCanvas, setDeletingCanvas] = React.useState(false)
+  const reportCanvasActionError = React.useCallback((context: string, error: unknown): void => {
+    console.error(`[SidePanel] ${context}失败:`, error)
+  }, [])
+  const showCanvasActionError = React.useCallback((message: string): void => {
+    toast.error(message)
+  }, [])
   const canvasWorkspaceTabs = React.useMemo(
     () => buildCanvasWorkspaceTabs(
       canvasRegistry.binding,
@@ -1180,47 +1191,88 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
 
   /** 归档画布从菜单打开时先复用既有恢复合同，再建立当前 Agent 关联。 */
   const handleOpenCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<void> => {
-    try {
-      let visibleCanvas = canvas
-      if (canvas.archived) {
-        visibleCanvas = await designAdapter.updateCanvasSession({
-          projectId: canvas.projectId,
-          canvasId: canvas.id,
-          archived: false,
-        })
-        upsertCanvasSession(visibleCanvas)
-      }
-      await canvasRegistry.linkAndOpen(
-        visibleCanvas.id,
-        canvasRegistry.binding?.defaultCanvasId === undefined,
-      )
-    } catch (error) {
-      console.error('[SidePanel] 打开画布失败:', error)
-      toast.error('打开画布失败')
-    }
-  }, [canvasRegistry, upsertCanvasSession])
+    await runCanvasWorkspaceAction({
+      action: async () => {
+        let visibleCanvas = canvas
+        if (canvas.archived) {
+          visibleCanvas = await designAdapter.updateCanvasSession({
+            projectId: canvas.projectId,
+            canvasId: canvas.id,
+            archived: false,
+          })
+          upsertCanvasSession(visibleCanvas)
+        }
+        await canvasRegistry.linkAndOpen(
+          visibleCanvas.id,
+          canvasRegistry.binding?.defaultCanvasId === undefined,
+        )
+      },
+      failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.open,
+      logContext: '打开画布',
+      onErrorMessage: showCanvasActionError,
+      onLogError: reportCanvasActionError,
+    })
+  }, [canvasRegistry, reportCanvasActionError, showCanvasActionError, upsertCanvasSession])
+
+  /** 新建与关联作为一个用户动作收口，任一 IPC 失败都只显示固定提示。 */
+  const handleCreateCanvas = React.useCallback(async (): Promise<void> => {
+    await runCanvasWorkspaceAction({
+      action: canvasRegistry.createAndOpen,
+      failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.create,
+      logContext: '新建画布',
+      onErrorMessage: showCanvasActionError,
+      onLogError: reportCanvasActionError,
+    })
+  }, [canvasRegistry.createAndOpen, reportCanvasActionError, showCanvasActionError])
 
   const handleRenameCanvas = React.useCallback(async (
     canvas: CanvasSessionMeta,
     title: string,
   ): Promise<void> => {
-    const updated = await designAdapter.updateCanvasSession({
-      projectId: canvas.projectId,
-      canvasId: canvas.id,
-      title,
+    await runCanvasWorkspaceAction({
+      action: async () => {
+        const updated = await designAdapter.updateCanvasSession({
+          projectId: canvas.projectId,
+          canvasId: canvas.id,
+          title,
+        })
+        upsertCanvasSession(updated)
+      },
+      failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.rename,
+      logContext: '重命名画布',
+      onErrorMessage: showCanvasActionError,
+      onLogError: reportCanvasActionError,
     })
-    upsertCanvasSession(updated)
-  }, [upsertCanvasSession])
+  }, [reportCanvasActionError, showCanvasActionError, upsertCanvasSession])
+
+  const handleSetDefaultCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<void> => {
+    await runCanvasWorkspaceAction({
+      action: () => canvasRegistry.setDefault(canvas.id),
+      failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.setDefault,
+      logContext: '设置默认画布',
+      onErrorMessage: showCanvasActionError,
+      onLogError: reportCanvasActionError,
+    })
+  }, [canvasRegistry.setDefault, reportCanvasActionError, showCanvasActionError])
 
   const handleToggleArchiveCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<void> => {
-    const updated = await designAdapter.updateCanvasSession({
-      projectId: canvas.projectId,
-      canvasId: canvas.id,
-      archived: !canvas.archived,
+    const updated = await runCanvasWorkspaceAction({
+      action: () => designAdapter.updateCanvasSession({
+        projectId: canvas.projectId,
+        canvasId: canvas.id,
+        archived: !canvas.archived,
+      }),
+      failureMessage: canvas.archived
+        ? CANVAS_WORKSPACE_FAILURE_MESSAGES.restore
+        : CANVAS_WORKSPACE_FAILURE_MESSAGES.archive,
+      logContext: canvas.archived ? '恢复画布' : '归档画布',
+      onErrorMessage: showCanvasActionError,
+      onLogError: reportCanvasActionError,
     })
+    if (!updated) return
     upsertCanvasSession(updated)
     toast.success(updated.archived ? '画布已归档' : '画布已恢复')
-  }, [upsertCanvasSession])
+  }, [reportCanvasActionError, showCanvasActionError, upsertCanvasSession])
 
   /** 删除继续经过主进程运行中任务守卫；这里只复用确认和 Renderer 索引更新。 */
   const handleConfirmDeleteCanvas = React.useCallback(async (): Promise<void> => {
@@ -1228,19 +1280,21 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     if (!canvas || deletingCanvas) return
     setDeletingCanvas(true)
     try {
-      await designAdapter.deleteCanvasSession({ projectId: canvas.projectId, canvasId: canvas.id })
+      const deleted = await runCanvasDeleteAction({
+        action: async () => {
+          await designAdapter.deleteCanvasSession({ projectId: canvas.projectId, canvasId: canvas.id })
+        },
+        onErrorMessage: showCanvasActionError,
+        onLogError: reportCanvasActionError,
+      })
+      if (!deleted) return
       removeCanvasSession({ projectId: canvas.projectId, canvasId: canvas.id })
       setPendingDeleteCanvas(null)
       toast.success('画布已删除')
-    } catch (error) {
-      console.error('[SidePanel] 删除画布失败:', error)
-      toast.error(error instanceof Error && error.message.includes('任务运行')
-        ? '画布仍有任务运行，请先停止后再删除'
-        : '删除画布失败')
     } finally {
       setDeletingCanvas(false)
     }
-  }, [deletingCanvas, pendingDeleteCanvas, removeCanvasSession])
+  }, [deletingCanvas, pendingDeleteCanvas, removeCanvasSession, reportCanvasActionError, showCanvasActionError])
 
   const activeCanvasId = parseCanvasWorkspaceTab(activeTab)
   React.useEffect(() => {
@@ -1430,7 +1484,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     if (canvasId) {
       void canvasRegistry.unlink(canvasId).catch((error: unknown) => {
         console.error('[SidePanel] 解除画布关联失败:', error)
-        toast.error('关闭画布标签失败')
+        toast.error(CANVAS_WORKSPACE_FAILURE_MESSAGES.close)
       })
       returnToPreviousTabAfterClose(tab)
       return
@@ -1897,15 +1951,10 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
             onOpenTerminal={handleOpenTerminal}
             canvasSessions={canvasRegistry.sessions}
             defaultCanvasId={canvasRegistry.binding?.defaultCanvasId}
-            onOpenCanvas={(canvas) => { void handleOpenCanvas(canvas) }}
-            onCreateCanvas={() => {
-              void canvasRegistry.createAndOpen().catch((error: unknown) => {
-                console.error('[SidePanel] 新建画布失败:', error)
-                toast.error('新建画布失败')
-              })
-            }}
+            onOpenCanvas={handleOpenCanvas}
+            onCreateCanvas={handleCreateCanvas}
             onRenameCanvas={handleRenameCanvas}
-            onSetDefaultCanvas={(canvas) => canvasRegistry.setDefault(canvas.id)}
+            onSetDefaultCanvas={handleSetDefaultCanvas}
             onToggleArchiveCanvas={handleToggleArchiveCanvas}
             onRequestDeleteCanvas={setPendingDeleteCanvas}
             onOpenWorkspaceComponent={(component) => {

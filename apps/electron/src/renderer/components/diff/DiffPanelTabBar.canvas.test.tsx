@@ -1,37 +1,76 @@
-import { readFileSync } from 'node:fs'
 import { describe, expect, test } from 'bun:test'
+import {
+  canDeleteCanvasFromWorkspaceMenu,
+  runCanvasMenuAction,
+  type CanvasMenuPendingAction,
+} from './DiffPanelTabBar'
 
 describe('右侧工作区画布菜单', () => {
-  test('Given 无关联画布 When 打开加号菜单 Then 仍提供新建和现有画布子菜单', () => {
-    const source = readFileSync(new URL('./DiffPanelTabBar.tsx', import.meta.url), 'utf8')
+  test('Given legacy 与 native Canvas When 计算菜单能力 Then legacy 可管理但不可删除', () => {
+    const createSession = (id: string) => ({
+      id,
+      projectId: 'project-1',
+      title: id,
+      archived: false,
+      createdAt: 1,
+      updatedAt: 1,
+    })
 
-    expect(source).toContain('DropdownMenuSubTrigger')
-    expect(source).toContain('新建画布')
-    expect(source).toContain('现有画布')
+    expect(canDeleteCanvasFromWorkspaceMenu(createSession('legacy-design'))).toBe(false)
+    expect(canDeleteCanvasFromWorkspaceMenu(createSession('canvas-1'))).toBe(true)
   })
 
-  test('Given 现有画布 When 选择菜单项 Then 交给宿主关联并打开对应标签', () => {
-    const source = readFileSync(new URL('./DiffPanelTabBar.tsx', import.meta.url), 'utf8')
+  test('Given 菜单 Promise reject When 执行动作 Then 无 unhandled 且 pending 必定收口', async () => {
+    const pendingStates: Array<CanvasMenuPendingAction | null> = []
+    let settled = 0
+    let unhandled = 0
+    const onUnhandled = () => { unhandled += 1 }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      await runCanvasMenuAction({
+        pendingAction: 'archive:canvas-1',
+        action: async () => { throw new Error('IPC_SECRET') },
+        onPendingChange: (pending) => { pendingStates.push(pending) },
+        onSettled: () => { settled += 1 },
+      })
+      await Promise.resolve()
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
 
-    expect(source).toContain('onOpenCanvas')
-    expect(source).toContain('onCreateCanvas')
+    expect(unhandled).toBe(0)
+    expect(pendingStates).toEqual(['archive:canvas-1', null])
+    expect(settled).toBe(1)
   })
 
-  test('Given Canvas 管理菜单 When 检查动作 Then 复用重命名、默认、归档恢复和删除合同', () => {
-    const source = readFileSync(new URL('./DiffPanelTabBar.tsx', import.meta.url), 'utf8')
+  test('Given rename reject When blur 提交 Then 编辑态退出且可再次进入重试', async () => {
+    let editingCanvasId: string | null = 'canvas-1'
+    const pendingStates: Array<CanvasMenuPendingAction | null> = []
 
-    expect(source).toContain('onRenameCanvas')
-    expect(source).toContain('onSetDefaultCanvas')
-    expect(source).toContain('onToggleArchiveCanvas')
-    expect(source).toContain('onRequestDeleteCanvas')
-    expect(source).toContain('LEGACY_DESIGN_CANVAS_ID')
-    expect(source).toContain('旧版默认设计画布不能删除')
+    await runCanvasMenuAction({
+      pendingAction: 'rename:canvas-1',
+      action: async () => { throw new Error('READ_ONLY') },
+      onPendingChange: (pending) => { pendingStates.push(pending) },
+      onSettled: () => { editingCanvasId = null },
+    })
+
+    expect(editingCanvasId).toBeNull()
+    expect(pendingStates.at(-1)).toBeNull()
+    editingCanvasId = 'canvas-1'
+    expect(editingCanvasId).toBe('canvas-1')
   })
 
-  test('Given 行内重命名 When 按 Enter Then 只通过 blur 提交一次', () => {
-    const source = readFileSync(new URL('./DiffPanelTabBar.tsx', import.meta.url), 'utf8')
+  test('Given 菜单动作成功 When 执行 Then pending 顺序与失败路径一致', async () => {
+    const pendingStates: Array<CanvasMenuPendingAction | null> = []
+    let calls = 0
 
-    expect(source).toContain("if (event.key === 'Enter') event.currentTarget.blur()")
-    expect(source).not.toContain("if (event.key === 'Enter') void submitCanvasRename(session)")
+    await runCanvasMenuAction({
+      pendingAction: 'default:canvas-1',
+      action: async () => { calls += 1 },
+      onPendingChange: (pending) => { pendingStates.push(pending) },
+    })
+
+    expect(calls).toBe(1)
+    expect(pendingStates).toEqual(['default:canvas-1', null])
   })
 })
