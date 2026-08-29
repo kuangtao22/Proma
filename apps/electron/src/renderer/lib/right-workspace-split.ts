@@ -15,6 +15,15 @@ export interface RightWorkspaceSplitResolution {
   activeTab: AgentSidePanelTab
 }
 
+/** 判断内容宽度是否足以同时承载两个最小 Pane；不足时只降级呈现，不修改 split 状态。 */
+export function shouldRenderRightWorkspaceSplit(
+  totalWidth: number,
+  minimumPaneWidth = 320,
+  dividerWidth = 8,
+): boolean {
+  return totalWidth >= minimumPaneWidth * 2 + dividerWidth
+}
+
 export function clampRightWorkspaceSplitRatio(ratio: number): number {
   return Math.max(0.3, Math.min(0.7, ratio))
 }

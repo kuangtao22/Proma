@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { createStore } from 'jotai/vanilla'
 import type { FilePanelDragItem } from '@/lib/file-panel-drag'
 import {
@@ -13,6 +14,16 @@ import {
   isRetryEventForCurrentStream,
   type AgentStreamState,
 } from './agent-atoms'
+
+describe('Agent 右侧画布标签', () => {
+  test('Given 动态画布标签 When 解析 Then 只接受非空 canvas ID', () => {
+    const source = readFileSync(new URL('./agent-atoms.ts', import.meta.url), 'utf8')
+
+    expect(source).toContain('| `canvas:${string}`')
+    expect(source).toContain('export function parseCanvasWorkspaceTab')
+    expect(source).toContain("tab.slice('canvas:'.length) || null")
+  })
+})
 
 describe('Agent 会话待插入引用队列', () => {
   test('Given 两个会话各有待插入引用 When 成功后确认其中一个 Then 不串线且同一引用只确认一次', () => {

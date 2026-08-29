@@ -2034,6 +2034,8 @@ export interface NativeCanvasWorkspaceProps {
   flowRenderer?: NativeCanvasFlowRenderer
   /** 测试或宿主可注入对话渲染器；默认使用真实 Canvas Agent 对话组件。 */
   conversationRenderer?: React.ComponentType<CanvasAgentConversationProps>
+  /** 宿主布局语义；右侧工作区复用同一实现但保持紧凑呈现边界。 */
+  presentation?: 'main' | 'side-panel'
 }
 
 /** 将隔离 Jotai 状态绑定到纯 controller，并渲染当前加载阶段。 */
@@ -2044,6 +2046,7 @@ export function NativeCanvasWorkspace({
   adapter = designAdapter,
   flowRenderer,
   conversationRenderer,
+  presentation = 'main',
 }: NativeCanvasWorkspaceProps): React.ReactElement {
   /** graph key 只隔离共享图；view key 再加入 Agent 会话身份。 */
   const stateKey = createNativeCanvasKey(target.projectId, target.canvasId)
@@ -3002,6 +3005,7 @@ export function NativeCanvasWorkspace({
       data-native-canvas-workspace
       data-project-id={target.projectId}
       data-canvas-id={target.canvasId}
+      data-presentation={presentation}
     >
       <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
         <h1 className="truncate text-sm font-medium text-foreground">{title}</h1>

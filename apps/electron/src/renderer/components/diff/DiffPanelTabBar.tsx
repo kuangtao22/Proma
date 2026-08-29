@@ -6,7 +6,8 @@
 
 import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { Blocks, Brain, CalendarDays, Clock, Columns2, FolderOpen, Globe, ListTodo, MessageCircle, PanelRight, Plus, Repeat2, ServerCog, SquareTerminal, X } from 'lucide-react'
+import { Archive, ArchiveRestore, Blocks, Brain, CalendarDays, Clock, Columns2, FolderOpen, Globe, ListTodo, MessageCircle, PanelRight, Pencil, Plus, Repeat2, ServerCog, SquareTerminal, Star, Trash2, Workflow, X } from 'lucide-react'
+import { LEGACY_DESIGN_CANVAS_ID, type CanvasSessionMeta } from '@proma/shared'
 import { OBSIDIAN_NAME, ObsidianIcon } from '@/components/obsidian/obsidian-brand'
 import { cn } from '@/lib/utils'
 import { getScrollLeftToRevealTab } from '@/lib/tab-visibility'
@@ -16,6 +17,9 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import {
@@ -55,6 +59,15 @@ interface DiffPanelTabBarProps {
   onOpenWorkspaceComponent?: (component: WorkspaceComponentTab) => void
   onOpenVault?: () => void
   onOpenChat?: () => void
+  /** 当前项目的完整 Canvas 索引；归档项仍可从同一菜单恢复。 */
+  canvasSessions?: CanvasSessionMeta[]
+  onOpenCanvas?: (session: CanvasSessionMeta) => void
+  onCreateCanvas?: () => void
+  defaultCanvasId?: string
+  onRenameCanvas?: (session: CanvasSessionMeta, title: string) => Promise<void>
+  onSetDefaultCanvas?: (session: CanvasSessionMeta) => Promise<void>
+  onToggleArchiveCanvas?: (session: CanvasSessionMeta) => Promise<void>
+  onRequestDeleteCanvas?: (session: CanvasSessionMeta) => void
   /** 仅当前右侧 Tab 需要的紧凑动作，渲染于标签列表之后，不影响内容区布局。 */
   activeTabAction?: React.ReactNode
   visibleTabs?: Partial<Record<RightWorkspacePane, AgentSidePanelTab>>
@@ -78,6 +91,14 @@ export function DiffPanelTabBar({
   onOpenWorkspaceComponent,
   onOpenVault,
   onOpenChat,
+  canvasSessions = [],
+  onOpenCanvas,
+  onCreateCanvas,
+  defaultCanvasId,
+  onRenameCanvas,
+  onSetDefaultCanvas,
+  onToggleArchiveCanvas,
+  onRequestDeleteCanvas,
   activeTabAction,
   visibleTabs,
   focusedPane,
@@ -93,6 +114,9 @@ export function DiffPanelTabBar({
   const unseenChanges = unseenMap.get(currentSessionId ?? '') ?? false
   const [isAddTabMenuOpen, setIsAddTabMenuOpen] = React.useState(false)
   const [isSplitTabGroupHovered, setIsSplitTabGroupHovered] = React.useState(false)
+  const [renamingCanvasId, setRenamingCanvasId] = React.useState<string | null>(null)
+  const [canvasTitleDraft, setCanvasTitleDraft] = React.useState('')
+  const canvasRenameCancelledRef = React.useRef(false)
   // 仅鼠标在菜单外取消时抑制 Radix 的回焦；Esc 与键盘选择必须保留可见焦点。
   const suppressPointerDismissFocusRestoreRef = React.useRef(false)
   const tabListRef = React.useRef<HTMLDivElement>(null)
@@ -100,6 +124,17 @@ export function DiffPanelTabBar({
   const barRef = React.useRef<HTMLDivElement>(null)
   const suppressClickTabRef = React.useRef<AgentSidePanelTab | null>(null)
   const activeTabDragCancelRef = React.useRef<(() => void) | null>(null)
+
+  /** 在 Radix 子菜单内提交标题，避免为右侧入口新增独立弹窗。 */
+  const submitCanvasRename = React.useCallback(async (session: CanvasSessionMeta): Promise<void> => {
+    const title = canvasTitleDraft.trim()
+    if (!onRenameCanvas || !title || title === session.title) {
+      setRenamingCanvasId(null)
+      return
+    }
+    await onRenameCanvas(session, title)
+    setRenamingCanvasId(null)
+  }, [canvasTitleDraft, onRenameCanvas])
 
   React.useEffect(() => () => onAddTabMenuOpenChange?.(false), [onAddTabMenuOpenChange])
   React.useEffect(() => () => activeTabDragCancelRef.current?.(), [])
@@ -372,6 +407,108 @@ export function DiffPanelTabBar({
                 <SquareTerminal className="size-3.5" />
                 新建终端
               </DropdownMenuItem>
+            )}
+            {onOpenCanvas && onCreateCanvas && (
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <Workflow className="size-3.5" />
+                  画布
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="z-[110] min-w-44">
+                  <DropdownMenuItem onSelect={onCreateCanvas}>
+                    <Plus className="size-3.5" />
+                    新建画布
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  {canvasSessions.length > 0 ? (
+                    <>
+                      <span className="px-2 py-1 text-[11px] text-muted-foreground">现有画布</span>
+                      {canvasSessions.map((session) => (
+                        <DropdownMenuSub key={session.id}>
+                          <DropdownMenuSubTrigger>
+                            <Workflow className="size-3.5" />
+                            <span className="min-w-0 flex-1 truncate">{session.title}</span>
+                            {session.archived ? <span className="text-[10px] text-muted-foreground">已归档</span> : null}
+                          </DropdownMenuSubTrigger>
+                          <DropdownMenuSubContent className="z-[120] min-w-44">
+                            {renamingCanvasId === session.id ? (
+                              <div className="p-1.5">
+                                <input
+                                  autoFocus
+                                  value={canvasTitleDraft}
+                                  onChange={(event) => setCanvasTitleDraft(event.target.value)}
+                                  onKeyDown={(event) => {
+                                    if (event.key === 'Enter') event.currentTarget.blur()
+                                    if (event.key === 'Escape') {
+                                      canvasRenameCancelledRef.current = true
+                                      setRenamingCanvasId(null)
+                                    }
+                                  }}
+                                  onBlur={() => {
+                                    if (canvasRenameCancelledRef.current) {
+                                      canvasRenameCancelledRef.current = false
+                                      return
+                                    }
+                                    void submitCanvasRename(session)
+                                  }}
+                                  aria-label="画布标题"
+                                  className="h-7 w-full border-b border-primary/50 bg-transparent px-1 text-xs outline-none"
+                                />
+                              </div>
+                            ) : (
+                              <>
+                                <DropdownMenuItem onSelect={() => onOpenCanvas(session)}>
+                                  <Workflow className="size-3.5" />
+                                  {session.archived ? '恢复并打开' : '打开'}
+                                </DropdownMenuItem>
+                                {onSetDefaultCanvas && (
+                                  <DropdownMenuItem
+                                    disabled={defaultCanvasId === session.id || session.archived}
+                                    onSelect={() => { void onSetDefaultCanvas(session) }}
+                                  >
+                                    <Star className="size-3.5" />
+                                    {defaultCanvasId === session.id ? '已设为默认' : '设为默认'}
+                                  </DropdownMenuItem>
+                                )}
+                                {onRenameCanvas && (
+                                  <DropdownMenuItem onSelect={(event) => {
+                                    event.preventDefault()
+                                    canvasRenameCancelledRef.current = false
+                                    setCanvasTitleDraft(session.title)
+                                    setRenamingCanvasId(session.id)
+                                  }}>
+                                    <Pencil className="size-3.5" />
+                                    重命名
+                                  </DropdownMenuItem>
+                                )}
+                                {onToggleArchiveCanvas && (
+                                  <DropdownMenuItem onSelect={() => { void onToggleArchiveCanvas(session) }}>
+                                    {session.archived ? <ArchiveRestore className="size-3.5" /> : <Archive className="size-3.5" />}
+                                    {session.archived ? '恢复' : '归档'}
+                                  </DropdownMenuItem>
+                                )}
+                                {onRequestDeleteCanvas && (
+                                  <DropdownMenuItem
+                                    disabled={session.id === LEGACY_DESIGN_CANVAS_ID}
+                                    title={session.id === LEGACY_DESIGN_CANVAS_ID ? '旧版默认设计画布不能删除' : undefined}
+                                    className="text-destructive focus:text-destructive"
+                                    onSelect={() => onRequestDeleteCanvas(session)}
+                                  >
+                                    <Trash2 className="size-3.5" />
+                                    删除画布
+                                  </DropdownMenuItem>
+                                )}
+                              </>
+                            )}
+                          </DropdownMenuSubContent>
+                        </DropdownMenuSub>
+                      ))}
+                    </>
+                  ) : (
+                    <DropdownMenuItem disabled>暂无现有画布</DropdownMenuItem>
+                  )}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
             )}
             {onOpenWorkspaceComponent && (
               <>
