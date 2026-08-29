@@ -21,6 +21,7 @@ import { CornerDownLeft, Square, Settings, X, Copy, Check, Brain, Sparkles, List
 import { AgentMessages, type AgentHistoryQuoteNavigationRequest } from './AgentMessages'
 import { AgentHeader } from './AgentHeader'
 import { AgentMessageQueue } from './AgentMessageQueue'
+import { AgentComposerFrame } from './AgentComposerFrame'
 import { ContextUsageBadge } from './ContextUsageBadge'
 import { PermissionBanner } from './PermissionBanner'
 import { PermissionModeSelector } from './PermissionModeSelector'
@@ -32,7 +33,7 @@ import { AttachmentPreviewItem } from '@/components/chat/AttachmentPreviewItem'
 import { QuotedSelectionChip } from '@/components/diff/QuotedSelectionChip'
 import { RichTextInput, type RichTextInputHandle } from '@/components/ai-elements/rich-text-input'
 import { SpeechButton } from '@/components/ai-elements/speech-button'
-import { InputToolbarOverflow, type ToolbarItem } from '@/components/ai-elements/InputToolbarOverflow'
+import type { ToolbarItem } from '@/components/ai-elements/InputToolbarOverflow'
 import {
   inputToolbarActiveButtonClass,
   inputToolbarButtonClass,
@@ -3035,9 +3036,10 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         {/* 输入区域 — 交互横幅显示时隐藏，由横幅替代 */}
         {!hasBannerOverlay && (
         <div className="px-2.5 pb-2.5 md:px-[18px] md:pb-[18px]" data-input-mode="agent">
-          <div
+          <AgentComposerFrame
+            toolbarItems={inputToolbarItems}
+            trailing={inputTrailingNode}
             className={cn(
-              'rounded-[17px] border-[0.5px] border-border bg-background/70 backdrop-blur-sm transition-all duration-200',
               (isPlanMode || isPermissionPlanMode) && !isDragOver && 'plan-mode-border',
               isDragOver && 'border-[2px] border-dashed border-[#2ecc71] bg-[#2ecc71]/[0.03]'
             )}
@@ -3164,9 +3166,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
               onAgentHistoryQuoteClick={handleAgentHistoryQuoteClick}
             />
 
-            {/* Footer 工具栏 — 容器变窄时尾部按钮自动折叠进「更多」Popover */}
-            <InputToolbarOverflow items={inputToolbarItems} trailing={inputTrailingNode} />
-          </div>
+          </AgentComposerFrame>
         </div>
         )}
       </div>

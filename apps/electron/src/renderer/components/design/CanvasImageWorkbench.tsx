@@ -94,9 +94,16 @@ const JOB_STATUS_MESSAGES: Partial<Record<DesignJobRecord['status'], string>> = 
   interrupted: '应用中断了本次生成，可以使用原配置重试。',
 }
 
-/** 将授权根与受管相对路径组合为 Renderer 可读取的媒体 URL。 */
+/**
+ * 将目录级授权根与受管文件名组合为 Renderer 可读取的媒体 URL。
+ * @param baseUrl 已直接授权 assets 或 thumbnails 目录的 opaque 根地址。
+ * @param relativePath 持久化的项目相对路径，仅使用末段文件名。
+ * @returns 不重复目录层级且正确编码文件名的媒体 URL。
+ */
 function createMediaUrl(baseUrl: string, relativePath: string): string {
-  return `${baseUrl.replace(/\/+$/, '')}/${relativePath.replace(/^\/+/, '')}`
+  /** 授权根已经指向目标目录，继续拼 assets/ 或 thumbnails/ 会形成不存在的双重目录。 */
+  const filename = relativePath.split('/').at(-1) ?? relativePath
+  return `${baseUrl.replace(/\/+$/, '')}/${encodeURIComponent(filename)}`
 }
 
 /** 按更新时间从新到旧复制任务列表，避免改写权威快照数组。 */
@@ -369,7 +376,7 @@ export function CanvasImageWorkbench({
           )}
         </section>
 
-        <section className="min-w-0 space-y-4 p-4" aria-label="图片生成配置">
+        <section className="relative min-w-0 space-y-4 p-4" aria-label="图片生成配置">
           {!writable && (
             <p className="rounded-sm border border-border bg-muted/45 px-2.5 py-2 text-xs text-muted-foreground">
               当前画布为只读状态
@@ -506,30 +513,35 @@ export function CanvasImageWorkbench({
             )}
           </div>
 
-          {state.saveState === 'saving' && <p className="text-xs text-muted-foreground">正在保存配置</p>}
-          {state.saveState === 'dirty' && <p className="text-xs text-muted-foreground">配置尚未保存</p>}
-          {(state.saveState === 'failed' || state.saveState === 'conflict') && (
-            <p className="break-words text-xs text-destructive">{state.error ?? '生图配置保存失败，请重试'}</p>
-          )}
-          {state.saveState === 'conflict' && (
-            <Button type="button" variant="outline" className="w-full" onClick={onRetryLoad}>
-              <RefreshCw aria-hidden="true" />重新加载配置
-            </Button>
-          )}
+          <footer
+            aria-label="生图主操作"
+            className="sticky bottom-0 z-10 -mx-4 -mb-4 space-y-2 border-t border-border bg-background/95 p-3 backdrop-blur-sm"
+          >
+            {state.saveState === 'saving' && <p className="text-xs text-muted-foreground">正在保存配置</p>}
+            {state.saveState === 'dirty' && <p className="text-xs text-muted-foreground">配置尚未保存</p>}
+            {(state.saveState === 'failed' || state.saveState === 'conflict') && (
+              <p className="break-words text-xs text-destructive">{state.error ?? '生图配置保存失败，请重试'}</p>
+            )}
+            {state.saveState === 'conflict' && (
+              <Button type="button" variant="outline" className="w-full" onClick={onRetryLoad}>
+                <RefreshCw aria-hidden="true" />重新加载配置
+              </Button>
+            )}
 
-          {activeJob ? (
-            <Button type="button" variant="outline" className="w-full" disabled={!writable} onClick={() => onCancel(activeJob.id)}>
-              <Square aria-hidden="true" />取消生成
-            </Button>
-          ) : retryableJob ? (
-            <Button type="button" className="w-full" disabled={!writable} onClick={() => onRetry(retryableJob.id)}>
-              <RefreshCw aria-hidden="true" />重试生成
-            </Button>
-          ) : (
-            <Button type="button" className="w-full" disabled={generationDisabled} onClick={onGenerate}>
-              <Play aria-hidden="true" />生成图片
-            </Button>
-          )}
+            {activeJob ? (
+              <Button type="button" variant="outline" className="w-full" disabled={!writable} onClick={() => onCancel(activeJob.id)}>
+                <Square aria-hidden="true" />取消生成
+              </Button>
+            ) : retryableJob ? (
+              <Button type="button" className="w-full" disabled={!writable} onClick={() => onRetry(retryableJob.id)}>
+                <RefreshCw aria-hidden="true" />重试生成
+              </Button>
+            ) : (
+              <Button type="button" className="w-full" disabled={generationDisabled} onClick={onGenerate}>
+                <Play aria-hidden="true" />生成图片
+              </Button>
+            )}
+          </footer>
         </section>
       </div>
     </ScrollArea>

@@ -654,6 +654,18 @@ describe('stable directory native host', () => {
     }, () => true, createDependencies(fake))).rejects.toThrow('合同无效')
   })
 
+  test('Given Agent 重建 intent 文件名 When 写入 Then 接受固定 rebuild UUID 合同', async () => {
+    /** 假 helper 仅验证 Host 是否允许重建事务进入原生协议。 */
+    const fake = createFakeHelper({ writeOutcome: { commitVisible: true, durabilityUncertain: false } })
+
+    await expect(createStableDirectoryNativeHost().run({
+      mode: 'canvas-intent-write', roots: ['/requested'], childName: 'transactions',
+      fileName: 'agent-node-rebuild-11111111-1111-4111-8111-111111111111.json', content: '{}',
+    }, () => true, createDependencies(fake))).resolves.toMatchObject({
+      writeOutcome: { commitVisible: true, durabilityUncertain: false },
+    })
+  })
+
   test('Given helper 报告 rename 后目录持久性未确认 When host 消费协议 Then 保留可见提交结果而非提前退出', async () => {
     const fake = createFakeHelper({
       writeOutcome: {
@@ -1088,6 +1100,28 @@ describe('stable directory native host', () => {
         entryId: 'content-1', fileName: 'meta.json', content: '{}',
       }, () => false, { helperPath: () => nativeHelperPath })).rejects.toThrow('目录授权被拒绝')
       expect(readdirSync(canvasRoot)).toEqual([])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(!nativeHelperPlatformSupported)('Given 已授权 Canvas 根 When 原生 helper 写重建 intent Then 文件可提交并参与安全扫描', async () => {
+    /** 临时 Canvas 根用于演练真实原生写入与扫描合同。 */
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-rebuild-intent-'))
+    const canvasRoot = join(root, 'canvas')
+    const rebuildFileName = 'agent-node-rebuild-11111111-1111-4111-8111-111111111111.json'
+    mkdirSync(canvasRoot)
+    try {
+      const written = await runStableDirectoryNative({
+        mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
+        fileName: rebuildFileName, content: '{"state":"prepared"}', maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(written.writeOutcome).toEqual({ commitVisible: true, durabilityUncertain: false })
+
+      const scanned = await runStableDirectoryNative({
+        mode: 'canvas-intent-scan', roots: [canvasRoot], childName: 'transactions', maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(scanned.entries.map((entry) => entry.name)).toEqual([rebuildFileName])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

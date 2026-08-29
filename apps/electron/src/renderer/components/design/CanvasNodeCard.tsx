@@ -22,6 +22,8 @@ export interface CanvasNodeCardData {
   title: string
   statusLabel: string
   summary: string
+  /** 仅生图节点可携带的工作区授权缩略图 URL。 */
+  previewUrl?: string
   canOpenWorkbench: boolean
   onOpenWorkbench?: (nodeId: string) => void
   canCreateChild: boolean
@@ -82,6 +84,7 @@ export function CanvasNodeCard({
   title,
   statusLabel,
   summary,
+  previewUrl,
   selected,
   canOpenWorkbench,
   onOpenWorkbench,
@@ -90,6 +93,12 @@ export function CanvasNodeCard({
 }: CanvasNodeCardProps): React.ReactElement {
   /** 当前节点类型的稳定中文名称和 Lucide 图标。 */
   const { label, Icon } = CANVAS_NODE_PRESENTATION[kind]
+  /** 当前 URL 加载失败后隐藏图片，避免浏览器持续显示破图图标。 */
+  const [previewFailed, setPreviewFailed] = React.useState(false)
+  /** URL 切换代表新的素材版本，应允许重新尝试加载。 */
+  React.useEffect(() => setPreviewFailed(false), [previewUrl])
+  /** 只有生图节点的有效 URL 且未失败时显示缩略图。 */
+  const showPreview = kind === 'image' && Boolean(previewUrl) && !previewFailed
   return (
     <TooltipProvider delayDuration={200} disableHoverableContent>
       <div className="group relative h-[144px] w-[288px]">
@@ -135,18 +144,34 @@ export function CanvasNodeCard({
               </Tooltip>
             ) : null}
           </header>
-          <div className="flex min-h-0 flex-1 flex-col px-4 py-3">
-            <h3 className="line-clamp-2 overflow-hidden break-words text-sm font-medium leading-5">
-              {title}
-            </h3>
-            <div className="mt-auto flex min-w-0 items-center gap-2 text-xs">
-              <p className="min-w-0 flex-1 truncate text-muted-foreground">{summary}</p>
-              <span className="flex shrink-0 items-center gap-1 font-medium text-foreground" role="status">
-                <CanvasNodeStatusIcon kind={kind} statusLabel={statusLabel} />
-                {statusLabel}
-              </span>
+          {showPreview ? (
+            <div className="relative min-h-0 flex-1 bg-muted">
+              <img
+                src={previewUrl}
+                alt={`${title}缩略图`}
+                className="h-full w-full object-cover"
+                draggable={false}
+                onError={() => setPreviewFailed(true)}
+              />
+              <div className="absolute inset-x-0 bottom-0 flex min-w-0 items-center gap-2 bg-background/90 px-3 py-1.5 text-xs backdrop-blur-sm">
+                <p className="min-w-0 flex-1 truncate font-medium text-foreground">{title}</p>
+                <span className="shrink-0 text-muted-foreground" role="status">{statusLabel}</span>
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="flex min-h-0 flex-1 flex-col px-4 py-3">
+              <h3 className="line-clamp-2 overflow-hidden break-words text-sm font-medium leading-5">
+                {title}
+              </h3>
+              <div className="mt-auto flex min-w-0 items-center gap-2 text-xs">
+                <p className="min-w-0 flex-1 truncate text-muted-foreground">{summary}</p>
+                <span className="flex shrink-0 items-center gap-1 font-medium text-foreground" role="status">
+                  <CanvasNodeStatusIcon kind={kind} statusLabel={statusLabel} />
+                  {statusLabel}
+                </span>
+              </div>
+            </div>
+          )}
         </article>
         <Handle
           id="output"

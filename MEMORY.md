@@ -86,6 +86,7 @@
 - Canvas 多类型节点目标改为顶部添加始终选择 Agent/生图/文档/原型，视频只显示“即将支持”；独立节点按全画布最右侧追加且不得修改 viewport/zoom，节点默认折叠并在卡片锚点内按需展开单一工作台。有连线才共享直接上游已提交上下文，无连线完全独立；上游变化只标记待更新，不自动产生模型或付费调用。
 - 原生 Canvas 单选状态只能由真实 `onNodesChange` 用户交互与显式节点/空白点击同步，禁止再用 React Flow 派生 `onSelectionChange` 反写权威 `selectedNodeId`；后者会在受控 selected 与回调 identity 更新之间形成双向反馈，使多个节点的选中边框持续交替。
 - Canvas Agent committed intent 的永久归属只包含节点身份、session 绑定、稳定展示身份和关系合同；`position` 是用户后续可编辑的画布状态，对账与坏会话重建必须保留当前位置，禁止再以初始落点判定归属损坏。
+- Canvas 节点工作台尺寸只属于 Renderer 当前挂载期临时状态，不写入画布文档或 IPC；首次打开和窗口边界变化时必须收进 React Flow 可视区，右下角双向缩放按画布缩放比例换算，并保持 `nodrag nopan nowheel` 隔离。Agent 工作台的消息宿主必须是受高度约束的纵向 Flex 容器，确保消息区单独滚动且底部输入框不被内容挤出裁切。
 
 ## 会话记录
 
@@ -196,3 +197,12 @@
 - 2026-08-28：Canvas 顶部添加入口使用锚定 `+` 按钮下方的 Radix `Popover` 单列菜单；选择 Agent/生图/文档/原型后立即关闭并沿用工作区可视区追加逻辑，视频保留“即将支持”禁用占位。该实现不再使用曾出现视觉显示不稳定的 `DropdownMenu`，也不使用遮挡画布的居中 `Dialog`。
 - 2026-08-28：用户确认 Canvas 生图节点采用现有 Pi Agent/Design Job/Design Asset 的单引擎双目标适配；配置、任务和版本按 `projectId + canvasId + nodeId + imageModuleId` 隔离，成功自动采用、重试固化旧快照，工作台展示最终提示词、上下文和可用 trace。节点单击只选中，双击或放大按钮打开工作台；节点侧 `+` 打开 Agent/生图/文档/原型悬浮菜单并创建自动连线的下游节点。
 - 2026-08-28：Design 图片工具使用独立 10 分钟跨进程超时，普通工具继续保持 120 秒；单次图片工具调用后终止本轮以避免 Agent 自动二次付费调用，无图片输出时保留清洗后的真实工具错误。Canvas 图片采用提交后必须广播准确 revision 的 `graph` 变化事件，广播失败不得回滚已提交素材与节点事实。
+- 2026-08-28：Canvas Agent 工作台与普通 Agent 共享 `AgentMessages`、`RichTextInput` 和 `AgentComposerFrame`；Thinking、工具执行卡片、输入框表面及发送/停止控件保持同源样式，Canvas 仅保留节点工作台外壳和必要的轻量交互。
+- 2026-08-28：原生 Canvas 会话删除必须经过独立不可恢复确认，并打通 shared、main、preload、renderer 四层合同；删除前阻断运行中的 Canvas Agent/生图任务，成功后清理会话索引、Canvas 正式目录、可重建缓存和按完整 Canvas 归属隔离的内部 Agent 会话，同时关闭当前 Canvas 入口。`legacy-design` 仍引用项目级旧存储，只允许归档，不提供删除。
+- 2026-08-28：Canvas Agent 扩展连线只属于创建事务提交前的恢复合同；committed 后连线回归可编辑图状态，删除连线或上游节点时下游 Agent 合法转为独立节点。历史创建 intent 只继续约束节点与会话归属，禁止因已合法消失的初始连线阻断整张 Canvas 的加载或删除。
+- 2026-08-28：原生 Canvas 选择模型分为主节点 `selectedNodeId` 与 Renderer 完整多选集合：主节点继续服务详情和单节点工作台，完整集合负责框选、批量拖动与删除，禁止把 XYFlow 多选压缩成首个节点。批量删除复用单节点主进程生命周期并按权威 revision 串行提交，部分失败保留剩余选区和稳定 operation；多选含运行中 Agent 时整批阻断。
+- 2026-08-29：Canvas 节点工作台必须以 XYFlow 的 `nodrag nopan nowheel` 类隔离节点拖动、画布平移和滚轮手势，并恢复普通指针；生图工作台的配置内容随详情滚动，生成、取消和重试主操作固定在底部，避免长内容遮挡操作入口。
+- 2026-08-29：Canvas 生图媒体授权根已直接指向 `assets`/`thumbnails` 目录，Renderer 只能拼接编码后的文件名，不能再次拼持久化相对路径中的目录段；否则会形成 `assets/assets` 或 `thumbnails/thumbnails` 并让已成功素材显示为破图。
+- 2026-08-29：Canvas 折叠生图卡片通过工作区 LOAD 一次性接收已采用素材的安全 `imagePreviews`，同窗口同项目共享单个缩略图媒体授权，禁止逐节点加载图片模块；授权、素材或图片加载失败时回退文字卡片，旧生命周期快照不得清空已有预览。
+- 2026-08-29：Canvas Agent 重建事务固定使用 `agent-node-rebuild-<UUID>.json`，文件名合同必须由 TypeScript Host 与 C++ stable-directory helper 同步识别；开发客户端实际执行 `dist/resources` 副本，修改原生 helper 后必须执行资源同步并重启，否则会出现重建当下成功、重载后因旧 helper 漏扫重建事务而整张 Canvas 加载失败。
+- 2026-08-29：修复 Canvas Agent 详情消息撑高后裁掉输入框的问题，并为四类节点工作台增加右下角双向缩放；详情首次打开会按当前画布剩余空间收敛，真实 Electron 验证生图主操作和缩放手柄在底边可达，拖拽宽高同时变化且不移动节点。

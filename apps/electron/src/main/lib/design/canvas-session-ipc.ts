@@ -3,6 +3,7 @@ import type {
   CanvasSessionChangeEvent,
   CanvasSessionMeta,
   CreateCanvasSessionInput,
+  DeleteCanvasSessionInput,
   ListCanvasSessionsInput,
   UpdateCanvasSessionInput,
 } from '@proma/shared'
@@ -23,7 +24,7 @@ export interface CanvasSessionIpcRegistrar {
 /** IPC 实际依赖的 Canvas 会话 store 窄接口。 */
 type CanvasSessionStoreContract = Pick<
   CanvasSessionStore,
-  'ensureLegacySession' | 'list' | 'create' | 'update'
+  'ensureLegacySession' | 'list' | 'create' | 'update' | 'delete'
 >
 
 /** 注册 Canvas 会话 IPC 的可信依赖。 */
@@ -33,6 +34,10 @@ export interface CanvasSessionIpcOptions {
   guard: Pick<WorkspaceOperationGuard, 'runWorkspaceWrite'>
   sessions: CanvasSessionStoreContract
   getProjectReadOnlyReason: (projectId: string) => string | undefined
+  /** 删除前阻止仍有运行任务的 Canvas 进入不可恢复清理。 */
+  assertCanvasIdle?: (projectId: string, canvasId: string) => void
+  /** 索引删除成功后回收该 Canvas 独占的内部 Agent 会话。 */
+  cleanupInternalSessions?: (projectId: string, canvasId: string) => Promise<void>
 }
 
 /** 注册结果用于退出和测试清理。 */
@@ -136,6 +141,17 @@ function parseUpdateInput(value: unknown): UpdateCanvasSessionInput {
   }
 }
 
+/** 解析删除请求，只接受项目与 Canvas 双重稳定身份。 */
+function parseDeleteInput(value: unknown): DeleteCanvasSessionInput {
+  if (!isRecord(value)
+    || !hasKeys(value, ['projectId', 'canvasId'], ['projectId', 'canvasId'])
+    || !isSafeDesignStableId(value.projectId)
+    || !isSafeDesignStableId(value.canvasId)) {
+    throw new Error('Canvas 项目或会话 ID 非法')
+  }
+  return { projectId: value.projectId, canvasId: value.canvasId }
+}
+
 /**
  * 确认调用来自当前授权主窗口。
  * @param event Electron invoke 事件。
@@ -189,6 +205,7 @@ export function registerCanvasSessionIpcHandlers(
     DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS,
     DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION,
     DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION,
+    DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION,
   ]
   /** 热重载前先移除同名旧 handler。 */
   for (const channel of channels) options.ipc.removeHandler(channel)
@@ -225,6 +242,20 @@ export function registerCanvasSessionIpcHandlers(
     const session = options.guard.runWorkspaceWrite(input.projectId, () => options.sessions.update(input))
     broadcastChange(options, { projectId: input.projectId, canvasId: session.id, cause: 'updated' })
     return session
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION, async (event, value): Promise<CanvasSessionMeta> => {
+    assertAuthorizedSender(event, options)
+    /** 删除输入必须在只读、运行态和持久化访问前完成解析。 */
+    const input = parseDeleteInput(value)
+    requireWritableProject(input.projectId, options)
+    return options.guard.runWorkspaceWrite(input.projectId, async () => {
+      options.assertCanvasIdle?.(input.projectId, input.canvasId)
+      const session = options.sessions.delete(input)
+      await options.cleanupInternalSessions?.(input.projectId, input.canvasId)
+      broadcastChange(options, { projectId: input.projectId, canvasId: session.id, cause: 'deleted' })
+      return session
+    })
   })
 
   /** 清理函数只移除本注册器声明的通道。 */

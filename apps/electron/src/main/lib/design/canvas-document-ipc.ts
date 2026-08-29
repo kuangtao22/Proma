@@ -876,6 +876,14 @@ export function registerCanvasDocumentIpcHandlers(
     release: () => void
     onDestroyed: () => void
   }>()
+  /** 每个窗口共享一份原生 Canvas 折叠卡片缩略图授权，避免逐节点创建 lease。 */
+  const canvasPreviewMediaBySender = new Map<number, {
+    sender: WebContents
+    projectId: string
+    thumbnailBaseUrl: string
+    release: () => void
+    onDestroyed: () => void
+  }>()
   /** 每个 sender 的单调 LOAD 代次，旧请求不得覆盖新请求。 */
   const imageLoadGenerations = new Map<number, number>()
   /** 注册释放后所有在途 LOAD 必须 fail closed。 */
@@ -900,6 +908,103 @@ export function registerCanvasDocumentIpcHandlers(
     imageMediaBySender.delete(senderId)
     current.sender.removeListener('destroyed', current.onDestroyed)
     current.release()
+  }
+
+  /** 释放窗口当前 Canvas 卡片缩略图授权；重复调用不产生副作用。 */
+  const releaseCanvasPreviewMedia = (senderId: number): void => {
+    /** 当前窗口持有的共享缩略图授权。 */
+    const current = canvasPreviewMediaBySender.get(senderId)
+    if (!current) return
+    canvasPreviewMediaBySender.delete(senderId)
+    current.sender.removeListener('destroyed', current.onDestroyed)
+    current.release()
+  }
+
+  /** 为项目首次提交 Canvas 卡片共享媒体授权，并原子替换其它项目的旧授权。 */
+  const commitCanvasPreviewMedia = (
+    sender: WebContents,
+    projectId: string,
+    access: ReturnType<CanvasDocumentIpcOptions['imageAssets']['createMediaAccess']>,
+  ): string => {
+    /** 当前窗口可能仍持有上一项目的缩略图授权。 */
+    const previous = canvasPreviewMediaBySender.get(sender.id)
+    /** destroyed 回调只释放当前 map 所有权，避免捕获过期 lease。 */
+    const onDestroyed = (): void => releaseCanvasPreviewMedia(sender.id)
+    /** 候选释放在 IPC 边界保持幂等。 */
+    let candidateReleased = false
+    /** 释放本次候选媒体授权。 */
+    const releaseCandidate = (): void => {
+      if (candidateReleased) return
+      candidateReleased = true
+      access.release()
+    }
+    if (sender.isDestroyed() || disposed) {
+      releaseCandidate()
+      throw new Error('CANVAS_PREVIEW_SENDER_DESTROYED')
+    }
+    try {
+      canvasPreviewMediaBySender.set(sender.id, {
+        sender,
+        projectId,
+        thumbnailBaseUrl: access.thumbnailBaseUrl,
+        release: releaseCandidate,
+        onDestroyed,
+      })
+      sender.once('destroyed', onDestroyed)
+      if (sender.isDestroyed() || disposed) {
+        releaseCanvasPreviewMedia(sender.id)
+        throw new Error('CANVAS_PREVIEW_SENDER_DESTROYED')
+      }
+    } catch (error) {
+      sender.removeListener('destroyed', onDestroyed)
+      if (canvasPreviewMediaBySender.get(sender.id)?.release === releaseCandidate) {
+        if (!sender.isDestroyed() && !disposed && previous) canvasPreviewMediaBySender.set(sender.id, previous)
+        else canvasPreviewMediaBySender.delete(sender.id)
+      }
+      releaseCandidate()
+      throw error
+    }
+    if (previous) {
+      previous.sender.removeListener('destroyed', previous.onDestroyed)
+      previous.release()
+    }
+    return access.thumbnailBaseUrl
+  }
+
+  /** 把当前 Canvas 已采用素材解析为共享授权下的安全缩略图 URL。 */
+  const attachCanvasImagePreviews = (
+    sender: WebContents,
+    target: LoadCanvasInput,
+    snapshot: CanvasWorkspaceSnapshot,
+  ): CanvasWorkspaceSnapshot => {
+    /** 文档只需为真实采用的素材建立唯一索引。 */
+    const adoptedAssetIds = new Set(snapshot.document.nodes.flatMap((node) => (
+      node.kind === 'image' && node.adoptedAssetId ? [node.adoptedAssetId] : []
+    )))
+    if (adoptedAssetIds.size === 0) return { ...snapshot, imagePreviews: [] }
+    /** 项目素材只扫描一次，缺失引用自然回退到文字卡片。 */
+    const adoptedAssets = options.imageAssets.list(target.projectId).filter((asset) => (
+      adoptedAssetIds.has(asset.id)
+    ))
+    if (adoptedAssets.length === 0) return { ...snapshot, imagePreviews: [] }
+    /** 同项目重复 LOAD 复用现有目录授权，避免刷新图时反复创建 token。 */
+    const currentAccess = canvasPreviewMediaBySender.get(sender.id)
+    /** 当前项目缩略图授权根；跨项目时才创建并替换。 */
+    const thumbnailBaseUrl = currentAccess?.projectId === target.projectId
+      ? currentAccess.thumbnailBaseUrl
+      : commitCanvasPreviewMedia(
+          sender,
+          target.projectId,
+          options.imageAssets.createMediaAccess(target.projectId),
+        )
+    /** 授权根本身已经指向 thumbnails 目录，只允许追加编码后的文件名。 */
+    const normalizedBaseUrl = thumbnailBaseUrl.replace(/\/+$/, '')
+    /** Renderer 只接收不可反推出项目目录的公开 capability URL。 */
+    const imagePreviews = adoptedAssets.map((asset) => ({
+      assetId: asset.id,
+      previewUrl: `${normalizedBaseUrl}/${encodeURIComponent(asset.thumbnailRelativePath.split('/').at(-1) ?? asset.id)}`,
+    }))
+    return { ...snapshot, imagePreviews }
   }
 
   /** 只释放指定 LOAD 代次拥有的 lease，禁止旧请求撤销新 lease。 */
@@ -1475,7 +1580,13 @@ export function registerCanvasDocumentIpcHandlers(
         if (!outcome.agent) throw new Error('CANVAS_AGENT_RECONCILIATION_MISSING')
         publishUniqueReconciliation(input, published, outcome.agent)
         if (outcome.agent.error) throw outcome.agent.error
-        return outcome.agent.snapshot
+        try {
+          return attachCanvasImagePreviews(event.sender, input, outcome.agent.snapshot)
+        } catch (error) {
+          /** 缩略图是可降级展示能力，授权或素材索引失败不能阻断画布本体。 */
+          console.error('[CanvasDocumentIPC] Canvas 缩略图加载失败:', error)
+          return { ...outcome.agent.snapshot, imagePreviews: [] }
+        }
       })
     })
   ))
@@ -1708,6 +1819,7 @@ export function registerCanvasDocumentIpcHandlers(
       for (const senderId of imageLoadGenerations.keys()) beginImageLoad(senderId)
       unsubscribeImageJobs()
       for (const senderId of [...imageMediaBySender.keys()]) releaseImageMedia(senderId)
+      for (const senderId of [...canvasPreviewMediaBySender.keys()]) releaseCanvasPreviewMedia(senderId)
       /** 被后续注册替代的 generation 已失去 handler 所有权。 */
       if (currentRegistrationTokens.get(options.ipc) !== registrationToken) return
       currentRegistrationTokens.delete(options.ipc)

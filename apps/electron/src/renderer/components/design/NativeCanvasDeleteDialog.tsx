@@ -21,6 +21,13 @@ export interface NativeCanvasDeleteDialogCopy {
   confirmLabel: '删除节点' | '停止后删除'
 }
 
+/** 批量删除确认框需要的最小选区摘要。 */
+export interface NativeCanvasDeleteSelectionSummary {
+  count: number
+  hasAgent: boolean
+  hasContent: boolean
+}
+
 /** 可用于判断编辑器焦点的最小事件目标。 */
 export interface NativeCanvasDeleteShortcutTarget {
   closest?: (selector: string) => unknown
@@ -44,16 +51,25 @@ export function getNativeCanvasDeleteDialogCopy(
   connectedEdgeCount: number,
   busy: boolean,
   kind: CanvasNodeKind = 'agent',
+  selection?: NativeCanvasDeleteSelectionSummary,
 ): NativeCanvasDeleteDialogCopy {
+  /** 单节点调用沿用原有文案，批量调用只展示聚合事实。 */
+  const count = selection?.count ?? 1
+  const hasAgent = selection?.hasAgent ?? kind === 'agent'
+  const hasContent = selection?.hasContent ?? kind !== 'agent'
+  let retentionMessage = '内容将移入回收区，可稍后恢复。'
+  if (hasAgent && hasContent) {
+    retentionMessage = 'Agent 对话记录会保留；其他内容将移入回收区，可稍后恢复。'
+  } else if (hasAgent) {
+    retentionMessage = 'Agent 对话记录会保留。'
+  }
   return {
-    title: `删除“${nodeTitle}”？`,
+    title: count > 1 ? `删除 ${count} 个节点？` : `删除“${nodeTitle}”？`,
     edgeMessage: connectedEdgeCount > 0
       ? `将同时删除 ${connectedEdgeCount} 条关联连线。`
       : '此节点没有关联连线。',
-    retentionMessage: kind === 'agent'
-      ? 'Agent 对话记录会保留。'
-      : '内容将移入回收区，可稍后恢复。',
-    confirmLabel: busy ? '停止后删除' : '删除节点',
+    retentionMessage,
+    confirmLabel: busy && count === 1 ? '停止后删除' : '删除节点',
   }
 }
 
@@ -78,6 +94,10 @@ export interface NativeCanvasDeleteDialogProps {
   connectedEdgeCount: number
   busy: boolean
   kind?: CanvasNodeKind
+  selectedCount?: number
+  hasAgent?: boolean
+  hasContent?: boolean
+  blockedMessage?: string | null
   submitting?: boolean
   error?: string | null
   onOpenChange: (open: boolean) => void
@@ -91,13 +111,21 @@ export function NativeCanvasDeleteDialog({
   connectedEdgeCount,
   busy,
   kind = 'agent',
+  selectedCount = 1,
+  hasAgent = kind === 'agent',
+  hasContent = kind !== 'agent',
+  blockedMessage = null,
   submitting = false,
   error = null,
   onOpenChange,
   onConfirm,
 }: NativeCanvasDeleteDialogProps): React.ReactElement {
   /** 文案只依赖公开节点标题、边数量和忙碌状态。 */
-  const copy = getNativeCanvasDeleteDialogCopy(nodeTitle, connectedEdgeCount, busy, kind)
+  const copy = getNativeCanvasDeleteDialogCopy(nodeTitle, connectedEdgeCount, busy, kind, {
+    count: selectedCount,
+    hasAgent,
+    hasContent,
+  })
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent className="max-w-md">
@@ -107,7 +135,10 @@ export function NativeCanvasDeleteDialog({
             <div className="space-y-2">
               <p>{copy.edgeMessage}</p>
               <p>{copy.retentionMessage}</p>
-              {busy ? <p>当前 Agent 正在运行，将在停止完成后删除节点。</p> : null}
+              {busy && selectedCount === 1
+                ? <p>当前 Agent 正在运行，将在停止完成后删除节点。</p>
+                : null}
+              {blockedMessage ? <p className="text-destructive">{blockedMessage}</p> : null}
               {error ? <p className="text-destructive" role="alert">{error}</p> : null}
             </div>
           </AlertDialogDescription>
@@ -115,11 +146,11 @@ export function NativeCanvasDeleteDialog({
         <AlertDialogFooter>
           <AlertDialogCancel disabled={submitting}>取消</AlertDialogCancel>
           <AlertDialogAction
-            disabled={submitting}
+            disabled={submitting || Boolean(blockedMessage)}
             className={cn(buttonVariants({ variant: 'destructive' }))}
             onClick={(event) => {
               event.preventDefault()
-              onConfirm(busy ? 'stop-and-delete' : 'delete')
+              onConfirm(busy && selectedCount === 1 ? 'stop-and-delete' : 'delete')
             }}
           >
             {submitting ? '正在处理' : copy.confirmLabel}

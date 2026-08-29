@@ -1,9 +1,10 @@
 import * as React from 'react'
 import {
   CANVAS_SESSION_TITLE_MAX_LENGTH,
+  LEGACY_DESIGN_CANVAS_ID,
   type CanvasSessionMeta,
 } from '@proma/shared'
-import { Archive, ArchiveRestore, MoreHorizontal, Pencil, Workflow } from 'lucide-react'
+import { Archive, ArchiveRestore, MoreHorizontal, Pencil, Trash2, Workflow } from 'lucide-react'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -26,6 +27,8 @@ export interface CanvasSessionItemProps {
   onRename: (session: CanvasSessionMeta, title: string) => Promise<void>
   /** 切换当前 Canvas 的归档状态。 */
   onToggleArchive: (session: CanvasSessionMeta) => Promise<void>
+  /** 请求在上层展示不可恢复删除确认。 */
+  onRequestDelete: (session: CanvasSessionMeta) => void
 }
 
 /** 项目侧栏中的紧凑 Canvas 会话行。 */
@@ -36,10 +39,13 @@ export function CanvasSessionItem({
   onSelect,
   onRename,
   onToggleArchive,
+  onRequestDelete,
 }: CanvasSessionItemProps): React.ReactElement {
   const [editing, setEditing] = React.useState(false)
   const [titleDraft, setTitleDraft] = React.useState(session.title)
   const inputRef = React.useRef<HTMLInputElement>(null)
+  /** 旧版默认画布仍引用项目级共享存储，不能按原生 Canvas 目录删除。 */
+  const deleteDisabled = session.id === LEGACY_DESIGN_CANVAS_ID
 
   /** 进入行内标题编辑并在布局完成后选中文本。 */
   const startRenaming = (): void => {
@@ -170,6 +176,15 @@ export function CanvasSessionItem({
               >
                 {session.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
                 {session.archived ? '取消归档' : '归档'}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="py-1 text-xs text-destructive focus:text-destructive [&>svg]:size-3.5"
+                disabled={deleteDisabled}
+                title={deleteDisabled ? '旧版默认设计画布不能删除' : undefined}
+                onSelect={() => onRequestDelete(session)}
+              >
+                <Trash2 size={14} />
+                删除 Canvas
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>

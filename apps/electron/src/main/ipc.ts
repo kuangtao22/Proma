@@ -1876,6 +1876,42 @@ export function registerIpcHandlers(): void {
     guard: workspaceOperationGuard,
     sessions: canvasSessionStore,
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
+    assertCanvasIdle: (projectId, canvasId) => {
+      /** Agent 与图片任务任一仍运行时都保留画布，避免删除执行中的事实源。 */
+      const hasBusyAgent = listAgentSessions().some((session) => (
+        session.sourceCanvasProjectId === projectId
+        && session.sourceCanvasId === canvasId
+        && isAgentSessionBusy(session.id)
+      ))
+      const hasBusyImageJob = designJobManager.list(projectId).some((job) => (
+        job.target?.kind === 'canvas-image'
+        && job.target.canvasId === canvasId
+        && (job.status === 'queued' || job.status === 'running')
+      ))
+      if (hasBusyAgent || hasBusyImageJob) {
+        throw new Error('Canvas 仍有任务运行，请先停止后再删除')
+      }
+    },
+    cleanupInternalSessions: async (projectId, canvasId) => {
+      /** 内部 Agent 会话严格按完整 Canvas 归属筛选，不能波及其它画布或普通会话。 */
+      const sessions = listAgentSessions().filter((session) => (
+        session.sourceCanvasProjectId === projectId && session.sourceCanvasId === canvasId
+      ))
+      for (const session of sessions) {
+        try {
+          permissionService.clearSessionWhitelist(session.id)
+          permissionService.clearSessionPending(session.id)
+          askUserService.clearSessionPending(session.id)
+          exitPlanService.clearSessionPending(session.id)
+          clearAgentQueuedMessages(session.id)
+          await browserController.close(session.id)
+          deleteAgentSession(session.id)
+        } catch (error) {
+          /** Canvas 索引已经删除，单会话清理失败只能隔离记录并继续其它会话。 */
+          console.error(`[Canvas 会话] 内部 Agent 清理失败 (${session.id}):`, error)
+        }
+      }
+    },
   })
   registerCanvasDocumentIpcHandlers({
     ipc: ipcMain,

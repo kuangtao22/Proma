@@ -224,7 +224,7 @@ describe('Canvas Agent 对话', () => {
     expect(store.get(canvasAgentOwnersAtom).get(owner.sessionId)).toEqual(owner)
   })
 
-  test('Given 窄屏对话面板 When SSR Then 只有文本发送停止关闭控件', () => {
+  test('Given Canvas Agent 工作台 When SSR Then 复用普通 Agent 输入框并只保留必要控件', () => {
     const html = renderToStaticMarkup(
       <Provider store={createStore()}>
         <CanvasAgentConversation
@@ -240,12 +240,15 @@ describe('Canvas Agent 对话', () => {
       </Provider>,
     )
     expect(html).toContain('aria-label="关闭对话"')
-    expect(html).toContain('aria-label="停止 Agent"')
     expect(html).toContain('aria-label="发送消息"')
-    expect(html).toContain('aria-label="Canvas Agent 消息输入"')
-    expect(html).toMatch(/<textarea[^>]*aria-label="Canvas Agent 消息输入"[^>]*disabled=""/)
+    expect(html).toContain('data-agent-composer-frame="true"')
+    expect(html).toContain('data-canvas-agent-composer="true"')
+    expect(html).toContain('data-canvas-agent-messages-region="true"')
+    expect(html).toContain('flex min-h-0 flex-1 flex-col overflow-hidden')
+    expect(html).not.toContain('<textarea')
     expect(html).not.toContain('附件')
     expect(html).not.toContain('模型切换')
     expect(html).not.toContain('权限模式')
+    expect(html).not.toContain('aria-label="停止 Agent"')
   })
 })

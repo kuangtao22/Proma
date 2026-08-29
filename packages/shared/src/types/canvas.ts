@@ -782,11 +782,19 @@ export interface RebuildCanvasAgentNodeResult {
   session: AgentSessionMeta
 }
 
+/** 原生 Canvas 折叠生图节点使用的轻量图片预览，不暴露本地素材路径。 */
+export interface CanvasImagePreview {
+  assetId: string
+  previewUrl: string
+}
+
 /** Renderer 可见的原生 Canvas 工作区快照，不暴露路径或存储实现。 */
 export interface CanvasWorkspaceSnapshot {
   document: CanvasDocument
   writable: true
   nodeIssues: CanvasNodeIssue[]
+  /** LOAD 提供当前 Canvas 已采用素材的共享缩略图；生命周期旧结果可暂不携带。 */
+  imagePreviews?: CanvasImagePreview[]
   recoveredFrom?: 'tmp' | 'backup'
 }
 

@@ -3,6 +3,7 @@ import { DESIGN_IPC_CHANNELS } from '@proma/shared'
 import type {
   CanvasSessionMeta,
   CreateCanvasSessionInput,
+  DeleteCanvasSessionInput,
   ListCanvasSessionsInput,
   UpdateCanvasSessionInput,
 } from '@proma/shared'
@@ -55,7 +56,7 @@ function createSession(id: string, title = '页面设计'): CanvasSessionMeta {
 }
 
 describe('Canvas 会话 IPC', () => {
-  test('Given 主窗口 When 列出、新建和更新 Canvas Then 经过项目写守卫并广播', async () => {
+  test('Given 主窗口 When 列出、新建、更新和删除 Canvas Then 经过项目写守卫并广播', async () => {
     /** 记录每个通道注册的 handler。 */
     const handlers = new Map<string, TestHandler>()
     /** 记录项目写守卫收到的项目 ID。 */
@@ -87,6 +88,10 @@ describe('Canvas 会话 IPC', () => {
           calls.push('update')
           return { ...createSession(input.canvasId, input.title ?? '页面设计'), archived: input.archived ?? false }
         },
+        delete: (input: DeleteCanvasSessionInput) => {
+          calls.push('delete')
+          return createSession(input.canvasId)
+        },
       },
       getProjectReadOnlyReason: () => undefined,
     })
@@ -109,15 +114,24 @@ describe('Canvas 会话 IPC', () => {
       sender,
       { projectId: 'project-1', canvasId: 'canvas-1', archived: true },
     )).toMatchObject({ id: 'canvas-1', archived: true })
+    expect(await invoke(
+      handlers,
+      DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION,
+      sender,
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+    )).toMatchObject({ id: 'canvas-1' })
 
-    expect(guardedProjects).toEqual(['project-1', 'project-1', 'project-1'])
-    expect(calls).toEqual(['ensure', 'list:false', 'create', 'update'])
+    expect(guardedProjects).toEqual(['project-1', 'project-1', 'project-1', 'project-1'])
+    expect(calls).toEqual(['ensure', 'list:false', 'create', 'update', 'delete'])
     expect(sender.sent).toEqual([{
       channel: DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', cause: 'created' },
     }, {
       channel: DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', cause: 'updated' },
+    }, {
+      channel: DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED,
+      value: { projectId: 'project-1', canvasId: 'canvas-1', cause: 'deleted' },
     }])
     registration.dispose()
     expect(handlers.size).toBe(0)
@@ -142,6 +156,7 @@ describe('Canvas 会话 IPC', () => {
         list: () => { calls.push('list'); return [] },
         create: () => { calls.push('create'); return createSession('canvas-1') },
         update: () => { calls.push('update'); return createSession('canvas-1') },
+        delete: () => { calls.push('delete'); return createSession('canvas-1') },
       },
       getProjectReadOnlyReason: () => undefined,
     })
@@ -178,6 +193,7 @@ describe('Canvas 会话 IPC', () => {
         list: () => [],
         create: () => createSession('canvas-1'),
         update: () => createSession('canvas-1'),
+        delete: () => createSession('canvas-1'),
       },
       getProjectReadOnlyReason: () => undefined,
     })
@@ -193,6 +209,12 @@ describe('Canvas 会话 IPC', () => {
       DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION,
       sender,
       { projectId: 'project-1', canvasId: '../escape', archived: true },
+    )).rejects.toThrow('项目或会话 ID 非法')
+    await expect(invoke(
+      handlers,
+      DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION,
+      sender,
+      { projectId: 'project-1', canvasId: '../escape' },
     )).rejects.toThrow('项目或会话 ID 非法')
     expect(guardedProjects).toEqual([])
   })
@@ -215,6 +237,7 @@ describe('Canvas 会话 IPC', () => {
         list: () => { calls.push('list'); return [createSession('existing')] },
         create: () => { calls.push('create'); return createSession('canvas-1') },
         update: () => { calls.push('update'); return createSession('canvas-1') },
+        delete: () => { calls.push('delete'); return createSession('canvas-1') },
       },
       getProjectReadOnlyReason: () => '项目路径不可访问，设计工作区已切换为只读',
     })
@@ -230,6 +253,12 @@ describe('Canvas 会话 IPC', () => {
       DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION,
       sender,
       { projectId: 'project-1' },
+    )).rejects.toThrow('项目路径不可访问')
+    await expect(invoke(
+      handlers,
+      DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION,
+      sender,
+      { projectId: 'project-1', canvasId: 'existing' },
     )).rejects.toThrow('项目路径不可访问')
     await expect(invoke(
       handlers,
@@ -261,6 +290,7 @@ describe('Canvas 会话 IPC', () => {
         list: () => [],
         create: () => createSession('canvas-1'),
         update: () => createSession('canvas-1'),
+        delete: () => createSession('canvas-1'),
       },
       getProjectReadOnlyReason: () => undefined,
     })

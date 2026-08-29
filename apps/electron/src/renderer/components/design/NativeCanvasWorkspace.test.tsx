@@ -13,6 +13,7 @@ import type {
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
+  DeleteCanvasNodeInput,
   DesignJobRecord,
   DesignTaskDetails,
   RebuildCanvasAgentNodeResult,
@@ -54,6 +55,7 @@ import {
   createNativeCanvasAgentNodeSuccessUpdate,
   createNativeCanvasNodeCreationSuccessUpdate,
   createNativeCanvasLifecycleSuccessUpdate,
+  deleteNativeCanvasNodesSequentially,
   createResolvedNativeCanvasWorkbenchSwitchUpdate,
   getNativeCanvasWorkbenchCommitAvailability,
   createNativeCanvasWorkbenchDraftCommitterKey,
@@ -89,6 +91,63 @@ describe('原生 Canvas 顶部添加节点路由', () => {
       expect(execute).toHaveBeenCalledWith({ kind })
     },
   )
+})
+
+describe('原生 Canvas 批量删除', () => {
+  test('Given 框选两个节点 When 确认删除 Then 按最新 revision 串行提交独立 operation', async () => {
+    const requests: DeleteCanvasNodeInput[] = []
+    const deletedNodeIds: string[] = []
+    const operationIds = ['operation-delete-1', 'operation-delete-2']
+
+    const result = await deleteNativeCanvasNodesSequentially({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      nodeIds: ['agent-1', 'image-1'],
+      initialRevision: 7,
+      createOperationId: () => operationIds.shift()!,
+      deleteNode: async (input) => {
+        requests.push(input)
+        return { snapshot: createSnapshot(input.expectedRevision + 1) }
+      },
+      onDeleted: (nodeId) => deletedNodeIds.push(nodeId),
+    })
+
+    expect(requests.map(({ nodeId, operationId, expectedRevision }) => ({
+      nodeId,
+      operationId,
+      expectedRevision,
+    }))).toEqual([
+      { nodeId: 'agent-1', operationId: 'operation-delete-1', expectedRevision: 7 },
+      { nodeId: 'image-1', operationId: 'operation-delete-2', expectedRevision: 8 },
+    ])
+    expect(deletedNodeIds).toEqual(['agent-1', 'image-1'])
+    expect(result).toMatchObject({
+      deletedNodeIds: ['agent-1', 'image-1'],
+      remainingNodeIds: [],
+      error: null,
+    })
+  })
+
+  test('Given 第二个节点删除失败 When 批量提交 Then 保留已成功结果和剩余选区', async () => {
+    const deletedNodeIds: string[] = []
+    let attempts = 0
+    const result = await deleteNativeCanvasNodesSequentially({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      nodeIds: ['document-1', 'webview-1'],
+      initialRevision: 4,
+      createOperationId: () => `operation-${attempts + 1}`,
+      deleteNode: async (input) => {
+        attempts += 1
+        if (input.nodeId === 'webview-1') throw new Error('删除失败')
+        return { snapshot: createSnapshot(input.expectedRevision + 1) }
+      },
+      onDeleted: (nodeId) => deletedNodeIds.push(nodeId),
+    })
+
+    expect(deletedNodeIds).toEqual(['document-1'])
+    expect(result.deletedNodeIds).toEqual(['document-1'])
+    expect(result.remainingNodeIds).toEqual(['webview-1'])
+    expect(result.error).toBeInstanceOf(Error)
+  })
 })
 
 describe('Canvas 生图工作台接入', () => {
@@ -1482,6 +1541,19 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     )).toEqual({})
   })
 
+  test('Given 当前快照已有图片预览 When 生命周期旧结果未携带预览字段 Then 保留现有缩略图', () => {
+    const current = createInitialNativeCanvasState()
+    current.snapshot = {
+      ...createSnapshot(4),
+      imagePreviews: [{ assetId: 'asset-1', previewUrl: 'proma-file://thumbnail/result.webp' }],
+    }
+    const result: CanvasNodeLifecycleResult = { snapshot: createSnapshot(5) }
+
+    expect(createNativeCanvasLifecycleSuccessUpdate(current, result, null)).toMatchObject({
+      snapshot: { imagePreviews: current.snapshot.imagePreviews },
+    })
+  })
+
   test('Given 创建结果 revision 可接管 When 创建成功 Then 只选中新节点并保留当前工作台', () => {
     const current = createInitialNativeCanvasState()
     current.snapshot = createSnapshot(4)
@@ -1505,6 +1577,22 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     expect(update).not.toHaveProperty('expandedNodeId')
     expect(update).not.toHaveProperty('pendingWorkbenchSwitchNodeId')
     expect(update).not.toHaveProperty('workbenchDraft')
+  })
+
+  test('Given 当前快照已有图片预览 When 内容创建结果未携带预览字段 Then 创建后缩略图保持可见', () => {
+    const current = createInitialNativeCanvasState()
+    current.snapshot = {
+      ...createSnapshot(4),
+      imagePreviews: [{ assetId: 'asset-1', previewUrl: 'proma-file://thumbnail/result.webp' }],
+    }
+
+    const update = createNativeCanvasNodeCreationSuccessUpdate(current, {
+      kind: 'document',
+      nodeId: 'document-new',
+      result: { snapshot: createSnapshot(5), selectedNodeId: 'document-new' },
+    })
+
+    expect(update).toMatchObject({ snapshot: { imagePreviews: current.snapshot.imagePreviews } })
   })
 
   test('Given 创建期间工作台始终为空 When 创建成功 Then 空工作台自然保持为空', () => {

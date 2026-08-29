@@ -130,3 +130,14 @@ export const upsertCanvasSessionAtom = atom(
     })
   },
 )
+
+/** 删除单条 Canvas 元数据，并在命中当前选择时同步关闭 Canvas 入口。 */
+export const removeCanvasSessionAtom = atom(
+  null,
+  (get, set, input: ActiveCanvasSelection): void => {
+    /** 只复制目标项目列表，保持其它项目引用和加载状态稳定。 */
+    const current = get(canvasSessionsByProjectAtom).get(input.projectId) ?? []
+    const nextSessions = current.filter((session) => session.id !== input.canvasId)
+    set(replaceCanvasSessionsAtom, { projectId: input.projectId, sessions: nextSessions })
+  },
+)

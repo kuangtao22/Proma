@@ -11,6 +11,7 @@ import type {
   CanvasSessionChangeEvent,
   CanvasSessionMeta,
   CreateCanvasSessionInput,
+  DeleteCanvasSessionInput,
   CreateDesignJobInput,
   CreateDesignJobTarget,
   DesignAsset,
@@ -258,6 +259,11 @@ describe('Design 共享契约', () => {
       title: 'App 页面视觉',
       archived: true,
     }
+    /** 删除请求只携带项目与 Canvas 双重身份。 */
+    const deleteInput: DeleteCanvasSessionInput = {
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+    }
     /** 成功提交后的公开变化事件。 */
     const event: CanvasSessionChangeEvent = {
       projectId: 'project-1',
@@ -273,11 +279,12 @@ describe('Design 共享契约', () => {
       createdAt: now,
       updatedAt: now,
     })
-    expect([listInput, createInput, updateInput, event]).toHaveLength(4)
+    expect([listInput, createInput, updateInput, deleteInput, event]).toHaveLength(5)
     expect(CANVAS_SESSION_TITLE_MAX_LENGTH).toBe(120)
     expect(DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS).toBe('design:list-canvas-sessions')
     expect(DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION).toBe('design:create-canvas-session')
     expect(DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION).toBe('design:update-canvas-session')
+    expect(DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION).toBe('design:delete-canvas-session')
     expect(DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED).toBe('design:canvas-session-changed')
   })
 

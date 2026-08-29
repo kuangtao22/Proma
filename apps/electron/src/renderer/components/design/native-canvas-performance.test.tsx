@@ -190,6 +190,77 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(workbenches).toEqual(['agent-1', 'image-1'])
   })
 
+  test('Given 框选两个节点 When XYFlow 同步选区 Then 保留完整多选集合', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [
+      {
+        id: 'agent-1', kind: 'agent', title: 'Agent 1',
+        agentSessionId: 'session-1', position: { x: 0, y: 0 },
+      },
+      {
+        id: 'image-1', kind: 'image', title: '生图 1',
+        imageModuleId: 'image-module-1', position: { x: 320, y: 0 },
+      },
+    ]
+    const selections: string[][] = []
+    let captured: NativeCanvasFlowProps | undefined
+
+    renderToStaticMarkup(
+      <NativeCanvasGraph
+        document={document}
+        writable
+        selectedNodeId={null}
+        selectedNodeIds={[]}
+        onMutation={() => {}}
+        onNodeSelect={() => {}}
+        onNodeSelectionChange={(nodeIds) => selections.push([...nodeIds])}
+        onConversationNodeChange={() => {}}
+        flowRenderer={(props) => { captured = props; return <div /> }}
+      />,
+    )
+
+    captured?.onNodesChange?.([
+      { id: 'agent-1', type: 'select', selected: true },
+      { id: 'image-1', type: 'select', selected: true },
+    ])
+
+    expect(selections).toEqual([['agent-1', 'image-1']])
+  })
+
+  test('Given 受控多选集合 When Graph 渲染 Then 每个节点都保持选中', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [
+      {
+        id: 'agent-1', kind: 'agent', title: 'Agent 1',
+        agentSessionId: 'session-1', position: { x: 0, y: 0 },
+      },
+      {
+        id: 'image-1', kind: 'image', title: '生图 1',
+        imageModuleId: 'image-module-1', position: { x: 320, y: 0 },
+      },
+    ]
+    let captured: NativeCanvasFlowProps | undefined
+
+    renderToStaticMarkup(
+      <NativeCanvasGraph
+        document={document}
+        writable
+        selectedNodeId="agent-1"
+        selectedNodeIds={['agent-1', 'image-1']}
+        onMutation={() => {}}
+        onNodeSelect={() => {}}
+        onNodeSelectionChange={() => {}}
+        onConversationNodeChange={() => {}}
+        flowRenderer={(props) => { captured = props; return <div /> }}
+      />,
+    )
+
+    expect(captured?.nodes.filter((node) => node.selected).map((node) => node.id)).toEqual([
+      'agent-1',
+      'image-1',
+    ])
+  })
+
   test('Given 深色主题 When 渲染原生 Canvas Then 根容器进入统一设计画布主题作用域', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
 

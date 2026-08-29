@@ -30,6 +30,18 @@ function renderCard(kind: CanvasNodeKind): string {
   )
 }
 
+/** 在 XYFlow 上下文中渲染带缩略图地址的生图卡片。 */
+function renderImagePreviewCard(previewUrl?: string): string {
+  return renderToStaticMarkup(
+    <ReactFlowProvider>
+      <CanvasNodeCard
+        {...createProps('image')}
+        {...(previewUrl ? { previewUrl } : {})}
+      />
+    </ReactFlowProvider>,
+  )
+}
+
 /** 折叠卡片类型禁止注入内容读取函数。 */
 // @ts-expect-error loadContent 不属于折叠卡片的轻量展示合同。
 const propsWithLoadContent: CanvasNodeCardProps = { ...createProps('document'), loadContent: () => undefined }
@@ -93,6 +105,23 @@ describe('Canvas 通用折叠节点卡片', () => {
 
     expect(html).not.toContain('aria-label="从此节点扩展"')
     expect(html).toContain('aria-label="展开生图工作台"')
+  })
+
+  test('Given 生图节点存在安全预览地址 When 折叠渲染 Then 在固定尺寸卡片中显示图片缩略图', () => {
+    const html = renderImagePreviewCard('proma-file://thumbnail-token/result.webp')
+
+    expect(html).toContain('src="proma-file://thumbnail-token/result.webp"')
+    expect(html).toContain('alt="一个需要最多显示两行的很长节点标题缩略图"')
+    expect(html).toContain('w-[288px]')
+    expect(html).toContain('h-[144px]')
+  })
+
+  test('Given 生图节点没有预览地址 When 折叠渲染 Then 保留原有文字回退内容且不产生破图元素', () => {
+    const html = renderImagePreviewCard()
+
+    expect(html).not.toContain('<img')
+    expect(html).toContain('这是只来自画布文档的单行摘要')
+    expect(html).toContain('已创建')
   })
 
   test('Given 卡片输入 When 检查公开合同 Then 不接受内容加载函数', () => {

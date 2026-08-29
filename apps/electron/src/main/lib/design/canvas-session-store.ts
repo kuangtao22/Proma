@@ -5,9 +5,11 @@ import {
   LEGACY_DESIGN_CANVAS_ID,
   type CanvasSessionMeta,
   type CreateCanvasSessionInput,
+  type DeleteCanvasSessionInput,
   type ListCanvasSessionsInput,
   type UpdateCanvasSessionInput,
 } from '@proma/shared'
+import { rmSyncWithRetry } from '../fs-retry'
 import { writeJsonFileAtomic } from '../safe-file'
 import type { DesignPathResolver } from './design-paths'
 import { isSafeDesignStableId } from './design-paths'
@@ -29,7 +31,7 @@ interface CanvasSessionIndex {
 
 /** Canvas 会话 store 的稳定依赖。 */
 export interface CanvasSessionStoreDependencies {
-  pathResolver: Pick<DesignPathResolver, 'resolve'>
+  pathResolver: Pick<DesignPathResolver, 'resolve' | 'resolveCanvas'>
   now?: () => number
   createId?: () => string
 }
@@ -153,6 +155,37 @@ export class CanvasSessionStore {
     record.updatedAt = now
     index.updatedAt = now
     this.writeIndex(index)
+    return toPublicSession(record)
+  }
+
+  /**
+   * 删除原生 Canvas 的索引记录、正式目录和可重建缓存。
+   * @param input 项目与 Canvas 双重稳定身份。
+   * @returns 删除前的公开会话，供 IPC 广播和 Renderer 收敛状态。
+   */
+  delete(input: DeleteCanvasSessionInput): CanvasSessionMeta {
+    /** 删除只能命中调用方项目索引中的明确会话。 */
+    const index = this.readIndex(input.projectId)
+    const recordIndex = index.sessions.findIndex((session) => session.id === input.canvasId)
+    if (recordIndex < 0) throw new Error(`Canvas 会话不存在: ${input.canvasId}`)
+    const record = index.sessions[recordIndex]!
+    if (record.storageKind !== 'native') throw new Error('旧版默认设计画布不能删除')
+
+    /** 先提交权威索引，避免清理失败后 Renderer 继续打开已部分删除的画布。 */
+    index.sessions.splice(recordIndex, 1)
+    index.updatedAt = this.requireNow()
+    this.writeIndex(index)
+
+    /** 正式内容和缓存只使用受信任路径解析器产生的双身份目录。 */
+    const paths = this.dependencies.pathResolver.resolveCanvas(input.projectId, input.canvasId)
+    for (const directory of [paths.canvasRoot, paths.cacheRoot]) {
+      try {
+        rmSyncWithRetry(directory, { recursive: true, force: true })
+      } catch (error) {
+        /** 索引删除已经提交，残留目录不应把成功操作伪装成失败。 */
+        console.warn(`[Canvas 会话] 清理删除目录失败 (${input.projectId}/${input.canvasId}):`, error)
+      }
+    }
     return toPublicSession(record)
   }
 

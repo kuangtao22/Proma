@@ -143,6 +143,8 @@ interface RichTextInputProps {
   voiceInputId?: string
   /** 占位文字 */
   placeholder?: string
+  /** 编辑区域的无障碍名称。 */
+  ariaLabel?: string
   /** 是否显示建议样式（斜体占位符） */
   suggestionActive?: boolean
   /** 是否禁用 */
@@ -205,6 +207,7 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
   longTextPasteThreshold,
   voiceInputId,
   placeholder = '有什么可以帮助到你的呢？',
+  ariaLabel,
   suggestionActive = false,
   className,
   disabled = false,
@@ -682,6 +685,7 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
         return handleImageMentionClick(event)
       },
       attributes: {
+        ...(ariaLabel ? { 'aria-label': ariaLabel } : {}),
         class: cn(
           'prose dark:prose-invert max-w-none focus:outline-none',
           'min-h-[101px] w-full text-[15px] leading-[1.6]',

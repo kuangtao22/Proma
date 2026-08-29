@@ -127,12 +127,18 @@ export interface NativeCanvasGraphProps {
   activeTool?: 'select' | 'pan'
   nodeIssues?: CanvasNodeIssue[]
   runningSessionIds?: ReadonlySet<string>
+  /** Canvas 工作区一次加载得到的素材缩略图索引。 */
+  imagePreviewUrls?: ReadonlyMap<string, string>
   canCreateChild?: boolean
   onCreateChild?: (nodeId: string, kind: CanvasNodeKind) => void
   selectedNodeId: string | null
+  /** 完整受控选区；未提供时兼容旧单选调用方。 */
+  selectedNodeIds?: readonly string[]
   onMutation: (mutation: CanvasMutation) => void
   /** 只同步 XYFlow 当前选区，不隐式打开 Agent 对话。 */
   onNodeSelect: (nodeId: string | null) => void
+  /** 同步框选产生的完整节点集合，供批量拖动和删除使用。 */
+  onNodeSelectionChange?: (nodeIds: readonly string[]) => void
   /** 只响应显式节点点击或空白 pane 点击，控制 Agent 对话开关。 */
   onConversationNodeChange: (nodeId: string | null) => void
   /** 双击或卡片按钮只切换节点工作台，不改变图文档。 */
@@ -195,17 +201,30 @@ export function NativeCanvasGraph({
   activeTool = 'select',
   nodeIssues = EMPTY_CANVAS_NODE_ISSUES,
   runningSessionIds = EMPTY_RUNNING_SESSION_IDS,
+  imagePreviewUrls,
   canCreateChild = false,
   onCreateChild = NOOP_CREATE_CHILD,
   selectedNodeId,
+  selectedNodeIds,
   onMutation,
   onNodeSelect,
+  onNodeSelectionChange,
   onConversationNodeChange,
   onWorkbenchNodeChange,
   expandedNodeId = null,
   renderWorkbench,
   flowRenderer,
 }: NativeCanvasGraphProps): React.ReactElement {
+  /** 旧调用方只传主节点时退化为单选集合。 */
+  const controlledSelectedNodeIds = React.useMemo(
+    () => selectedNodeIds ?? (selectedNodeId ? [selectedNodeId] : []),
+    [selectedNodeId, selectedNodeIds],
+  )
+  /** 集合用于 O(1) 投影选中态，避免大画布逐节点扫描数组。 */
+  const controlledSelectedNodeIdSet = React.useMemo(
+    () => new Set(controlledSelectedNodeIds),
+    [controlledSelectedNodeIds],
+  )
   /** 未接通工作台状态前仍渲染稳定入口，Task 8 可直接注入真实切换命令。 */
   const workbenchNodeChange = onWorkbenchNodeChange ?? NOOP_EXPAND
   /** 首帧投影只使用 Canvas 文档内存数据，不读取 Agent 消息。 */
@@ -213,12 +232,13 @@ export function NativeCanvasGraph({
     attachNativeCanvasWorkbench(toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
+      imagePreviewUrls,
       canCreateChild: writable && canCreateChild,
       onCreateChild,
       onWorkbenchNodeChange: workbenchNodeChange,
     }).map((node) => ({
       ...node,
-      selected: node.id === selectedNodeId,
+      selected: controlledSelectedNodeIdSet.has(node.id),
     })), document, expandedNodeId, renderWorkbench)
   ))
   /** 最新局部节点用于在同一批 React 更新内连续应用 XYFlow change。 */
@@ -227,9 +247,15 @@ export function NativeCanvasGraph({
   /** 选中身份由 Canvas 单向管理，避免 XYFlow 派生选区再次反写形成反馈循环。 */
   const selectedNodeIdRef = React.useRef(selectedNodeId)
   selectedNodeIdRef.current = selectedNodeId
+  /** 完整选区镜像避免连续 selection change 受 React 批处理时序影响。 */
+  const selectedNodeIdsRef = React.useRef<readonly string[]>(controlledSelectedNodeIds)
+  selectedNodeIdsRef.current = controlledSelectedNodeIds
   /** 父级回调保存在 ref 中，使 onNodesChange 不因父组件渲染而改变身份。 */
   const onNodeSelectRef = React.useRef(onNodeSelect)
   onNodeSelectRef.current = onNodeSelect
+  /** 多选回调同样使用 ref，保持 XYFlow handler 身份稳定。 */
+  const onNodeSelectionChangeRef = React.useRef(onNodeSelectionChange)
+  onNodeSelectionChangeRef.current = onNodeSelectionChange
   /** viewport reducer 让挂载后的远端文档更新实际同步给 XYFlow。 */
   const [viewportState, setViewportState] = React.useState<NativeCanvasViewportState>({
     viewport: document.viewport,
@@ -253,16 +279,17 @@ export function NativeCanvasGraph({
     const nextNodes = attachNativeCanvasWorkbench(toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
+      imagePreviewUrls,
       canCreateChild: writable && canCreateChild,
       onCreateChild,
       onWorkbenchNodeChange: workbenchNodeChange,
     }).map((node) => ({
       ...node,
-      selected: node.id === selectedNodeId,
+      selected: controlledSelectedNodeIdSet.has(node.id),
     })), document, expandedNodeId, renderWorkbench)
     flowNodesRef.current = nextNodes
     setFlowNodes(nextNodes)
-  }, [canCreateChild, document, expandedNodeId, nodeIssues, onCreateChild, renderWorkbench, runningSessionIds, selectedNodeId, workbenchNodeChange, writable])
+  }, [canCreateChild, controlledSelectedNodeIdSet, document, expandedNodeId, imagePreviewUrls, nodeIssues, onCreateChild, renderWorkbench, runningSessionIds, workbenchNodeChange, writable])
 
   React.useEffect(() => {
     updateViewportState({ type: 'document-sync', viewport: document.viewport })
@@ -279,16 +306,30 @@ export function NativeCanvasGraph({
     onNodeSelectRef.current(nodeId)
   }, [])
 
-  /** 逐帧节点变化只更新组件局部状态；用户选择 change 同步到 Canvas 单选状态。 */
+  /**
+   * 同步完整节点选区，并把首个节点继续作为详情兼容主选中节点。
+   * @param nodeIds XYFlow 当前全部选中节点 ID。
+   * @returns 无返回值；集合未变化时不触发父级更新。
+   */
+  const syncSelectedNodeIds = React.useCallback((nodeIds: readonly string[]): void => {
+    const current = selectedNodeIdsRef.current
+    if (current.length === nodeIds.length
+      && current.every((nodeId, index) => nodeId === nodeIds[index])) return
+    selectedNodeIdsRef.current = nodeIds
+    onNodeSelectionChangeRef.current?.(nodeIds)
+    syncSelectedNodeId(nodeIds[0] ?? null)
+  }, [syncSelectedNodeId])
+
+  /** 逐帧节点变化只更新组件局部状态；用户选择 change 同步完整 Canvas 选区。 */
   const handleNodesChange = React.useCallback<OnNodesChange<NativeCanvasFlowNode>>((changes) => {
     const nextNodes = applyNodeChanges(changes, flowNodesRef.current)
     flowNodesRef.current = nextNodes
     setFlowNodes(nextNodes)
     if (!changes.some((change) => change.type === 'select')) return
-    /** 当前合同只允许一个选中节点；框选返回多个时沿用文档顺序的首个节点。 */
-    const nextSelectedNodeId = nextNodes.find((node) => node.selected)?.id ?? null
-    syncSelectedNodeId(nextSelectedNodeId)
-  }, [syncSelectedNodeId])
+    /** 按文档稳定顺序保留所有选中节点，避免框选被压缩成单选。 */
+    const nextSelectedNodeIds = nextNodes.filter((node) => node.selected).map((node) => node.id)
+    syncSelectedNodeIds(nextSelectedNodeIds)
+  }, [syncSelectedNodeIds])
 
   /** 拖动结束后把多选集合合成单一 move mutation。 */
   const handleNodeDragStop = React.useCallback<OnNodeDrag<NativeCanvasFlowNode>>((_event, node, nodes) => {
@@ -321,22 +362,22 @@ export function NativeCanvasGraph({
   /** 普通节点单击只更新选中态，不隐式打开旧对话或工作台。 */
   const handleNodeClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeClick']>>((_event, node) => {
     if (activeTool !== 'select') return
-    syncSelectedNodeId(node.id)
-  }, [activeTool, syncSelectedNodeId])
+    syncSelectedNodeIds([node.id])
+  }, [activeTool, syncSelectedNodeIds])
 
   /** 双击节点只打开对应工作台；普通单击始终只选择节点。 */
   const handleNodeDoubleClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeDoubleClick']>>((_event, node) => {
     if (activeTool !== 'select') return
-    syncSelectedNodeId(node.id)
+    syncSelectedNodeIds([node.id])
     workbenchNodeChange(node.id)
-  }, [activeTool, syncSelectedNodeId, workbenchNodeChange])
+  }, [activeTool, syncSelectedNodeIds, workbenchNodeChange])
 
   /** 点击空白 pane 时立即清理选区，覆盖 XYFlow 未产生 selection change 的路径。 */
   const handlePaneClick = React.useCallback((): void => {
     if (activeTool !== 'select') return
-    syncSelectedNodeId(null)
+    syncSelectedNodeIds([])
     onConversationNodeChange(null)
-  }, [activeTool, onConversationNodeChange, syncSelectedNodeId])
+  }, [activeTool, onConversationNodeChange, syncSelectedNodeIds])
 
   /** 受控 Flow 属性集中声明只读连线合同。 */
   const flowProps: NativeCanvasFlowProps = {

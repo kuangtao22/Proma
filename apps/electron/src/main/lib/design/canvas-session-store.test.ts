@@ -89,6 +89,36 @@ describe('CanvasSessionStore', () => {
     expect(existsSync(`${indexPath}.tmp`)).toBe(false)
   })
 
+  test('Given 原生 Canvas 已创建内容与缓存 When 删除 Then 索引、正式目录和缓存目录一并清理', () => {
+    const store = createStore()
+    const created = store.create({ projectId: 'project-1', title: '待删除 Canvas' })
+    /** 模拟已经落盘的画布文档和可重建缓存。 */
+    const canvasRoot = join(root, 'project-1', '.proma', 'design', 'canvases', created.id)
+    const cacheRoot = join(root, '.config', 'design-cache', 'project-1', 'canvases', created.id)
+    mkdirSync(canvasRoot, { recursive: true })
+    mkdirSync(cacheRoot, { recursive: true })
+    writeFileSync(join(canvasRoot, 'canvas.json'), '{}', 'utf8')
+    writeFileSync(join(cacheRoot, 'cache.json'), '{}', 'utf8')
+
+    expect(store.delete({ projectId: 'project-1', canvasId: created.id })).toEqual(created)
+    expect(store.list({ projectId: 'project-1' })).toEqual([])
+    expect(existsSync(canvasRoot)).toBe(false)
+    expect(existsSync(cacheRoot)).toBe(false)
+  })
+
+  test('Given legacy Design Canvas When 删除 Then 拒绝且保留兼容索引与旧画布', () => {
+    const store = createStore()
+    const legacyPath = join(root, 'project-1', '.proma', 'design', 'canvas.json')
+    mkdirSync(join(root, 'project-1', '.proma', 'design'), { recursive: true })
+    writeFileSync(legacyPath, '{}', 'utf8')
+    store.ensureLegacySession('project-1')
+
+    expect(() => store.delete({ projectId: 'project-1', canvasId: 'legacy-design' }))
+      .toThrow('旧版默认设计画布不能删除')
+    expect(store.list({ projectId: 'project-1' })).toHaveLength(1)
+    expect(existsSync(legacyPath)).toBe(true)
+  })
+
   test('Given 损坏索引 When 列表 Then 明确失败且不覆盖主文件', () => {
     const store = createStore()
     /** 已损坏主文件是需要显式处理的权威事实。 */

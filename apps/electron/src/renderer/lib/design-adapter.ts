@@ -19,6 +19,7 @@ import type {
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
   DeleteCanvasNodeInput,
+  DeleteCanvasSessionInput,
   GetCanvasAgentMessagesInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
@@ -112,6 +113,7 @@ export interface DesignAdapter {
   listCanvasSessions: (input: ListCanvasSessionsInput) => ReturnType<DesignPreloadApi['listCanvasSessions']>
   createCanvasSession: (input: CreateCanvasSessionInput) => ReturnType<DesignPreloadApi['createCanvasSession']>
   updateCanvasSession: (input: UpdateCanvasSessionInput) => ReturnType<DesignPreloadApi['updateCanvasSession']>
+  deleteCanvasSession: (input: DeleteCanvasSessionInput) => ReturnType<DesignPreloadApi['deleteCanvasSession']>
   onCanvasSessionChanged: (listener: (event: CanvasSessionChangeEvent) => void) => ReturnType<DesignPreloadApi['onCanvasSessionChanged']>
   listImageModelProfiles: () => ReturnType<DesignPreloadApi['listImageModelProfiles']>
   saveImageModelProfiles: (input: SaveImageGenerationModelProfilesInput) => ReturnType<DesignPreloadApi['saveImageModelProfiles']>
@@ -319,6 +321,7 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
     listCanvasSessions: (input) => requireMethod(api, 'listCanvasSessions')(input),
     createCanvasSession: (input) => requireMethod(api, 'createCanvasSession')(input),
     updateCanvasSession: (input) => requireMethod(api, 'updateCanvasSession')(input),
+    deleteCanvasSession: (input) => requireMethod(api, 'deleteCanvasSession')(input),
     onCanvasSessionChanged: (listener) => requireMethod(api, 'onCanvasSessionChanged')(listener),
     listImageModelProfiles: () => requireMethod(api, 'listImageModelProfiles')(),
     saveImageModelProfiles: (input) => requireMethod(api, 'saveImageModelProfiles')(input),

@@ -89,6 +89,8 @@ export function overlapsNativeCanvasNodes(
 export interface NativeCanvasProjectionOptions {
   nodeIssues: CanvasNodeIssue[]
   runningSessionIds: ReadonlySet<string>
+  /** 工作区共享的素材预览索引，节点投影不得自行加载图片模块。 */
+  imagePreviewUrls?: ReadonlyMap<string, string>
   canCreateChild: boolean
   onCreateChild: (nodeId: string, kind: CanvasNodeKind) => void
   onWorkbenchNodeChange: (nodeId: string) => void
@@ -108,6 +110,7 @@ export interface NativeCanvasContentNodeData extends CanvasNodeCardData {
   kind: 'image' | 'document' | 'webview'
   imageModuleId?: string
   adoptedAssetId?: string
+  previewUrl?: string
   documentId?: string
   prototypeId?: string
   contentRevision?: number
@@ -279,6 +282,10 @@ export function toNativeCanvasFlowNodes(
       return { ...base, type: 'canvasAgent', data }
     }
     if (node.kind === 'image') {
+      /** 只有已采用素材且工作区成功解析时才向卡片注入安全 URL。 */
+      const previewUrl = node.adoptedAssetId
+        ? options.imagePreviewUrls?.get(node.adoptedAssetId)
+        : undefined
       return {
         ...base,
         type: 'canvasImage',
@@ -288,6 +295,7 @@ export function toNativeCanvasFlowNodes(
           title: node.title,
           imageModuleId: node.imageModuleId,
           ...(node.adoptedAssetId ? { adoptedAssetId: node.adoptedAssetId } : {}),
+          ...(previewUrl ? { previewUrl } : {}),
           statusLabel: node.adoptedAssetId ? '已有素材' : '待创作',
           summary: node.adoptedAssetId ? '已采用画布素材' : '尚未生成图片',
           canOpenWorkbench: true,

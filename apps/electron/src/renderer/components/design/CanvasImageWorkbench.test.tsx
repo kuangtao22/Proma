@@ -157,7 +157,18 @@ describe('Canvas 生图工作台', () => {
     expect(html).toContain('当前图片')
     expect(html).toContain('GPT Image 2 · gpt-image-2')
     expect(html).toContain('首页面向内容创作者，主操作是创建项目。')
-    expect(html).toContain('proma-file://asset-token/assets/asset-2.png')
+    expect(html).toContain('proma-file://asset-token/asset-2.png')
+    expect(html).toContain('proma-file://thumbnail-token/asset-2.webp')
+    expect(html).not.toContain('/assets/asset-2.png')
+    expect(html).not.toContain('/thumbnails/asset-2.webp')
+  })
+
+  test('Given 配置内容超过工作台高度 When 渲染 Then 主操作固定在底部且工作台保持可滚动', () => {
+    const html = renderWorkbench(createState())
+
+    expect(html).toContain('aria-label="生图主操作"')
+    expect(html).toMatch(/aria-label="生图主操作"[^>]*class="[^"]*sticky[^"]*bottom-0/u)
+    expect(html).toContain('aria-label="生图节点工作台内容"')
   })
 
   test('Given 运行中任务 When 渲染 Then 主操作为取消且不再显示生成按钮', () => {
@@ -188,7 +199,7 @@ describe('Canvas 生图工作台', () => {
   test('Given 历史版本被预览 When 渲染 Then 原图切换但不会伪装成当前版本', () => {
     const html = renderWorkbench(createState({ previewAssetId: 'asset-1' }))
 
-    expect(html).toContain('proma-file://asset-token/assets/asset-1.png')
+    expect(html).toContain('proma-file://asset-token/asset-1.png')
     expect(html).toContain('正在预览历史版本')
     expect(html).toContain('设为当前')
     expect(html).toContain('历史版本')

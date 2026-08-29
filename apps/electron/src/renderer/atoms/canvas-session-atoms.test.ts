@@ -6,6 +6,7 @@ import {
   activeCanvasSessionAtom,
   canvasSessionsByProjectAtom,
   replaceCanvasSessionsAtom,
+  removeCanvasSessionAtom,
   resolveActiveCanvasSession,
   upsertCanvasSessionAtom,
 } from './canvas-session-atoms'
@@ -78,6 +79,23 @@ describe('Canvas Renderer registry', () => {
       sessions: [createCanvas('a-1', 'project-a', { archived: true })],
     })
 
+    expect(store.get(activeCanvasSelectionAtom)).toBeNull()
+  })
+
+  test('Given 当前 Canvas When 删除成功 Then 只移除目标项目记录并清除当前选择', () => {
+    const store = createStore()
+    const projectA = [createCanvas('a-1', 'project-a'), createCanvas('a-2', 'project-a')]
+    const projectB = [createCanvas('b-1', 'project-b')]
+    store.set(canvasSessionsByProjectAtom, new Map([
+      ['project-a', projectA],
+      ['project-b', projectB],
+    ]))
+    store.set(activeCanvasSelectionAtom, { projectId: 'project-a', canvasId: 'a-1' })
+
+    store.set(removeCanvasSessionAtom, { projectId: 'project-a', canvasId: 'a-1' })
+
+    expect(store.get(canvasSessionsByProjectAtom).get('project-a')?.map((item) => item.id)).toEqual(['a-2'])
+    expect(store.get(canvasSessionsByProjectAtom).get('project-b')).toBe(projectB)
     expect(store.get(activeCanvasSelectionAtom)).toBeNull()
   })
 

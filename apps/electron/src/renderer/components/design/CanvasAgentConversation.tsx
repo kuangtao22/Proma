@@ -8,7 +8,7 @@ import type {
   StopCanvasAgentInput,
 } from '@proma/shared'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { LoaderCircle, Send, Square, X } from 'lucide-react'
+import { CornerDownLeft, LoaderCircle, Square, X } from 'lucide-react'
 import {
   agentSessionStreamingStateAtomFamily,
   agentStreamErrorsAtom,
@@ -20,10 +20,18 @@ import {
   canvasAgentRunningSessionIdsAtom,
 } from '@/atoms/native-canvas-atoms'
 import { AgentMessages } from '@/components/agent/AgentMessages'
+import { AgentComposerFrame } from '@/components/agent/AgentComposerFrame'
+import { RichTextInput, type RichTextInputHandle } from '@/components/ai-elements/rich-text-input'
+import {
+  inputToolbarDangerButtonClass,
+  inputToolbarDisabledButtonClass,
+  inputToolbarSendButtonClass,
+} from '@/components/ai-elements/input-toolbar-styles'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
 import { CanvasPublicOperationError } from '@/lib/design-adapter'
+import { cn } from '@/lib/utils'
 
 /** Canvas Agent 对话三类用户操作。 */
 export type CanvasAgentConversationOperation = 'load' | 'send' | 'stop'
@@ -183,6 +191,7 @@ export function CanvasAgentConversation({
   /** controller 通过 ref 读取最新权威 busy，避免只依赖按钮 disabled。 */
   const busyRef = React.useRef(false)
   const controllerRef = React.useRef<CanvasAgentConversationController | null>(null)
+  const richTextInputRef = React.useRef<RichTextInputHandle>(null)
 
   React.useEffect(() => {
     let active = true
@@ -237,8 +246,8 @@ export function CanvasAgentConversation({
   }, [canvasId, getCanvasAgentMessages, nodeId, projectId, sendCanvasAgentMessage, stopCanvasAgent, updateLifecycle])
 
   /** 提交当前纯文本；失败时恢复原文，避免用户输入丢失。 */
-  const submit = React.useCallback((): void => {
-    const message = composer.trim()
+  const submit = React.useCallback((content?: string): void => {
+    const message = (content ?? composer).trim()
     if (!message || busyRef.current || !messagesLoaded || !sessionId) return
     const controller = controllerRef.current
     if (!controller) return
@@ -273,18 +282,6 @@ export function CanvasAgentConversation({
         <TooltipProvider delayDuration={200} disableHoverableContent>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button type="button" size="icon" variant="ghost" aria-label="停止 Agent" disabled={!running} onClick={() => {
-                void controllerRef.current?.stop().catch((error: unknown) => {
-                  setLocalError(getCanvasAgentConversationErrorMessage('stop', error))
-                })
-              }}>
-                <Square className="size-4" aria-hidden="true" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>停止 Agent</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
               <Button type="button" size="icon" variant="ghost" aria-label="关闭对话" onClick={onClose}>
                 <X className="size-4" aria-hidden="true" />
               </Button>
@@ -293,7 +290,10 @@ export function CanvasAgentConversation({
           </Tooltip>
         </TooltipProvider>
       </header>
-      <div className="min-h-0 flex-1">
+      <div
+        className="flex min-h-0 flex-1 flex-col overflow-hidden"
+        data-canvas-agent-messages-region="true"
+      >
         {!messagesLoaded ? (
           <div className="flex h-full items-center justify-center px-4 text-sm text-muted-foreground">
             {loadingError ?? <LoaderCircle className="size-5 animate-spin" aria-label="正在加载消息" />}
@@ -306,34 +306,71 @@ export function CanvasAgentConversation({
           />
         ) : null}
       </div>
-      <div className="shrink-0 border-t border-border p-3">
-        {visibleError ? <p className="mb-2 text-xs text-destructive" role="alert">{visibleError}</p> : null}
-        <div className="flex items-end gap-2">
-          <textarea
-            aria-label="Canvas Agent 消息输入"
-            value={composer}
-            rows={2}
-            disabled={busy || !messagesLoaded || !sessionId}
-            className="min-h-16 min-w-0 flex-1 resize-none rounded-[6px] border border-input bg-background px-3 py-2 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            onChange={(event) => setComposer(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault()
-                submit()
-              }
-            }}
-          />
-          <TooltipProvider delayDuration={200} disableHoverableContent>
+      <div className="shrink-0 px-2.5 pb-2.5 md:px-[18px] md:pb-[18px]" data-input-mode="agent">
+        <TooltipProvider delayDuration={200} disableHoverableContent>
+          <AgentComposerFrame
+            data-canvas-agent-composer="true"
+            trailing={running ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className={inputToolbarDangerButtonClass}
+                    aria-label="停止 Agent"
+                    onClick={() => {
+                      void controllerRef.current?.stop().catch((error: unknown) => {
+                        setLocalError(getCanvasAgentConversationErrorMessage('stop', error))
+                      })
+                    }}
+                  >
+                    <Square className="size-[16px]" fill="currentColor" strokeWidth={0} aria-hidden="true" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">停止 Agent</TooltipContent>
+              </Tooltip>
+            ) : (
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button type="button" size="icon" aria-label="发送消息" disabled={busy || !messagesLoaded || !sessionId || composer.trim().length === 0} onClick={submit}>
-                  {sending ? <LoaderCircle className="size-4 animate-spin" aria-hidden="true" /> : <Send className="size-4" aria-hidden="true" />}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className={cn(
+                    composer.trim().length > 0 && !busy && messagesLoaded && sessionId
+                      ? inputToolbarSendButtonClass
+                      : inputToolbarDisabledButtonClass,
+                  )}
+                  aria-label="发送消息"
+                  disabled={busy || !messagesLoaded || !sessionId || composer.trim().length === 0}
+                  onClick={() => submit(richTextInputRef.current?.getMarkdown())}
+                >
+                  {sending
+                    ? <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />
+                    : <CornerDownLeft className="size-[22px]" aria-hidden="true" />}
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>发送消息</TooltipContent>
+              <TooltipContent side="top">发送消息</TooltipContent>
             </Tooltip>
-          </TooltipProvider>
-        </div>
+            )}
+          >
+            {visibleError ? (
+              <p className="px-3 pt-2.5 text-xs text-destructive" role="alert">{visibleError}</p>
+            ) : null}
+            <RichTextInput
+              ref={richTextInputRef}
+              value={composer}
+              onChange={setComposer}
+              onSubmit={submit}
+              placeholder="输入消息...（Enter 发送）"
+              ariaLabel="Canvas Agent 消息输入"
+              disabled={busy || !messagesLoaded || !sessionId}
+              autoFocusTrigger={sessionId}
+              collapsible
+            />
+          </AgentComposerFrame>
+        </TooltipProvider>
       </div>
     </aside>
   )

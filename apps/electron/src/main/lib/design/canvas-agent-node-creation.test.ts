@@ -518,6 +518,45 @@ describe('Canvas Agent 节点创建事务', () => {
     await expect(service.create(createInput(harness.target))).rejects.toThrow('已与节点解除关联')
   })
 
+  test('Given 扩展源 Agent 已删除且下游节点保留 When 对账 Then 下游节点转为独立节点且不阻断后续操作', async () => {
+    /** 两个 Agent 创建操作依次获得独立的受管会话。 */
+    const harness = createHarness({ sessionIds: [SESSION_ID, REPLACEMENT_SESSION_ID] })
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    /** 下游 Agent 最初通过源节点扩展创建，并持久化初始连线关系。 */
+    const downstreamOperationId = '33333333-3333-4333-8333-333333333333'
+    const downstreamNodeId = 'node-2'
+    const relationshipEdgeId = '44444444-4444-4444-8444-444444444444'
+    await service.create({
+      ...harness.target,
+      operationId: downstreamOperationId,
+      nodeId: downstreamNodeId,
+      title: '下游 Agent',
+      position: { x: 420, y: 80 },
+      relationship: {
+        sourceNodeId: 'node-1',
+        edgeId: relationshipEdgeId,
+      },
+    })
+    /** 用户删除源节点时图 Store 同步删除关联边，但保留下游 Agent 及其对话。 */
+    const document = harness.getDocument()
+    harness.setDocument({
+      ...document,
+      nodes: document.nodes.filter((node) => node.id !== 'node-1'),
+      edges: document.edges.filter((edge) => edge.id !== relationshipEdgeId),
+      revision: document.revision + 1,
+    })
+
+    const reconciled = await service.reconcile(harness.target)
+
+    expect(reconciled.error).toBeUndefined()
+    expect(reconciled.snapshot.document.nodes).toContainEqual(expect.objectContaining({
+      id: downstreamNodeId,
+      agentSessionId: REPLACEMENT_SESSION_ID,
+    }))
+    expect(reconciled.snapshot.document.edges).toEqual([])
+  })
+
   test('Given committed 节点的 session 缺失 When LOAD 对账 Then 返回完整文档并只标记目标节点', async () => {
     const harness = createHarness()
     const service = harness.createService()

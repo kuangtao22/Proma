@@ -506,6 +506,71 @@ function createContext(options: {
 }
 
 describe('原生 Canvas 文档 IPC', () => {
+  test('Given Canvas 生图节点已采用素材 When 重复 LOAD Then 返回缩略图预览且项目级授权只创建一次', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-image',
+      kind: 'image',
+      title: '首页视觉',
+      position: { x: 0, y: 0 },
+      imageModuleId: 'module-image',
+      adoptedAssetId: 'asset-a',
+    }]
+    const context = createContext({
+      loadResult: { document, writable: true, nodeIssues: [] },
+      imageAssets: [createImageAsset('asset-a', 'job-a')],
+    })
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+
+    const first = await invoke(
+      context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, target,
+    ) as CanvasInvokeResult<CanvasWorkspaceSnapshot>
+    const second = await invoke(
+      context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, target,
+    ) as CanvasInvokeResult<CanvasWorkspaceSnapshot>
+
+    expect(first).toMatchObject({
+      ok: true,
+      value: {
+        imagePreviews: [{
+          assetId: 'asset-a',
+          previewUrl: 'proma-file://thumbnails-0/asset-a.webp',
+        }],
+      },
+    })
+    expect(second).toMatchObject({
+      ok: true,
+      value: { imagePreviews: first.ok ? first.value.imagePreviews : [] },
+    })
+    expect(context.getMediaAccessCount()).toBe(1)
+    expect(context.mediaReleases).toEqual([])
+
+    context.registration.dispose()
+    expect(context.mediaReleases).toEqual([1])
+  })
+
+  test('Given Canvas 缩略图授权失败 When LOAD Then 画布仍成功加载并回退为空预览', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-image', kind: 'image', title: '首页视觉', position: { x: 0, y: 0 },
+      imageModuleId: 'module-image', adoptedAssetId: 'asset-a',
+    }]
+    const context = createContext({
+      loadResult: { document, writable: true, nodeIssues: [] },
+      imageAssets: [createImageAsset('asset-a', 'job-a')],
+      mediaAccessErrorAt: 0,
+    })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })
+
+    expect(result).toMatchObject({ ok: true, value: { imagePreviews: [] } })
+    expect(context.mediaReleases).toEqual([])
+    errorSpy.mockRestore()
+  })
+
   test('Given 合法图片目标 When LOAD Then 只返回目标配置、任务、资产和媒体 URL', async () => {
     /** A/B 任务与无关素材共存，快照只能暴露 A 模块闭包。 */
     const jobA = createImageJob(imageTargetA, 'job-a')
@@ -1850,7 +1915,7 @@ describe('原生 Canvas 文档 IPC', () => {
 
     expect(await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
       projectId: 'project-1', canvasId: 'canvas-1',
-    })).toEqual({ ok: true, value: snapshot })
+    })).toEqual({ ok: true, value: { ...snapshot, imagePreviews: [] } })
     expect(context.sender.sent).toEqual([])
   })
 
@@ -2453,7 +2518,7 @@ describe('原生 Canvas 文档 IPC', () => {
       projectId: 'project-1', canvasId: 'canvas-1',
     })).resolves.toEqual({
       ok: true,
-      value: { document: createDocument(2), writable: true, nodeIssues: [] },
+      value: { document: createDocument(2), writable: true, nodeIssues: [], imagePreviews: [] },
     })
     expect(removed).toEqual([])
 

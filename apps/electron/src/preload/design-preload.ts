@@ -17,6 +17,7 @@ import type {
   CanvasNodeLifecycleResult,
   CanvasTrashEntry,
   CreateCanvasSessionInput,
+  DeleteCanvasSessionInput,
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
   DeleteCanvasNodeInput,
@@ -121,6 +122,7 @@ export interface DesignPreloadApi {
   listCanvasSessions: (input: ListCanvasSessionsInput) => Promise<CanvasSessionMeta[]>
   createCanvasSession: (input: CreateCanvasSessionInput) => Promise<CanvasSessionMeta>
   updateCanvasSession: (input: UpdateCanvasSessionInput) => Promise<CanvasSessionMeta>
+  deleteCanvasSession: (input: DeleteCanvasSessionInput) => Promise<CanvasSessionMeta>
   onCanvasSessionChanged: (listener: (event: CanvasSessionChangeEvent) => void) => () => void
   listImageModelProfiles: () => Promise<ImageGenerationModelCatalogResult>
   saveImageModelProfiles: (input: SaveImageGenerationModelProfilesInput) => Promise<ImageGenerationModelCatalogResult>
@@ -400,6 +402,10 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
     ) as Promise<CanvasSessionMeta>,
     updateCanvasSession: (input) => ipc.invoke(
       DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION,
+      input,
+    ) as Promise<CanvasSessionMeta>,
+    deleteCanvasSession: (input) => ipc.invoke(
+      DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION,
       input,
     ) as Promise<CanvasSessionMeta>,
     onCanvasSessionChanged: (listener) => {

@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import type { CanvasSessionMeta } from '@proma/shared'
 import type { ComponentProps } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -34,6 +35,7 @@ describe('Canvas 会话侧栏行', () => {
       onSelect: () => undefined,
       onRename: async () => undefined,
       onToggleArchive: async () => undefined,
+      onRequestDelete: () => undefined,
     })
 
     expect(html).toContain('首页视觉方案')
@@ -50,6 +52,7 @@ describe('Canvas 会话侧栏行', () => {
       onSelect: () => undefined,
       onRename: async () => undefined,
       onToggleArchive: async () => undefined,
+      onRequestDelete: () => undefined,
     })
 
     expect(html).toContain('aria-current="page"')
@@ -65,9 +68,21 @@ describe('Canvas 会话侧栏行', () => {
       onSelect: () => undefined,
       onRename: async () => undefined,
       onToggleArchive: async () => undefined,
+      onRequestDelete: () => undefined,
     })
 
     expect(html).toContain('aria-label="取消归档 Canvas"')
     expect(html).toContain('disabled=""')
+  })
+
+  test('Given Canvas 会话菜单 When 检查操作 Then 提供独立删除入口且使用危险样式', () => {
+    /** 菜单内容由 Radix Portal 延迟挂载，源码合同用于锁定入口与回调。 */
+    const source = readFileSync(new URL('./CanvasSessionItem.tsx', import.meta.url), 'utf8')
+
+    expect(source).toContain('onRequestDelete')
+    expect(source).toContain('删除 Canvas')
+    expect(source).toContain('text-destructive')
+    expect(source).toContain('LEGACY_DESIGN_CANVAS_ID')
+    expect(source).toContain('旧版默认设计画布不能删除')
   })
 })

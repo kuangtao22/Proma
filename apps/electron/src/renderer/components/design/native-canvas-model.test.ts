@@ -109,6 +109,28 @@ describe('原生 Canvas 纯投影', () => {
     expect(serialized).not.toContain('data:image')
   })
 
+  test('Given 已采用图片素材存在工作区预览 When 投影 Then 只给匹配生图节点注入安全缩略图地址', () => {
+    const document = createDocument()
+    document.nodes.push({
+      id: 'image-2', kind: 'image', title: '次视觉', imageModuleId: 'image-2',
+      adoptedAssetId: 'asset-missing', position: { x: 9, y: 10 },
+    })
+    const nodes = toNativeCanvasFlowNodes(document, {
+      nodeIssues: [],
+      runningSessionIds: new Set(),
+      canCreateChild: false,
+      onCreateChild: () => undefined,
+      onWorkbenchNodeChange: () => undefined,
+      imagePreviewUrls: new Map([['asset-1', 'proma-file://thumbnail-token/result.webp']]),
+    } as never)
+
+    expect(nodes.find((node) => node.id === 'image-1')?.data).toMatchObject({
+      adoptedAssetId: 'asset-1',
+      previewUrl: 'proma-file://thumbnail-token/result.webp',
+    })
+    expect(nodes.find((node) => node.id === 'image-2')?.data).not.toHaveProperty('previewUrl')
+  })
+
   test('Given 持久边 When 投影 Then 端口身份保留且边完全只读', () => {
     expect(toNativeCanvasFlowEdges(createDocument())).toEqual([{
       id: 'edge-1', source: 'agent-1', sourceHandle: 'output',

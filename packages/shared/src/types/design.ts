@@ -39,8 +39,14 @@ export interface UpdateCanvasSessionInput {
   archived?: boolean
 }
 
+/** 删除一个原生 Canvas 会话的输入。 */
+export interface DeleteCanvasSessionInput {
+  projectId: string
+  canvasId: string
+}
+
 /** Canvas 会话索引成功提交后的变化原因。 */
-export type CanvasSessionChangeCause = 'created' | 'updated'
+export type CanvasSessionChangeCause = 'created' | 'updated' | 'deleted'
 
 /** 主进程广播给 Renderer 的 Canvas 会话变化。 */
 export interface CanvasSessionChangeEvent {
@@ -565,6 +571,7 @@ export const DESIGN_IPC_CHANNELS = {
   LIST_CANVAS_SESSIONS: 'design:list-canvas-sessions',
   CREATE_CANVAS_SESSION: 'design:create-canvas-session',
   UPDATE_CANVAS_SESSION: 'design:update-canvas-session',
+  DELETE_CANVAS_SESSION: 'design:delete-canvas-session',
   CANVAS_SESSION_CHANGED: 'design:canvas-session-changed',
   LIST_IMAGE_MODEL_PROFILES: 'design:list-image-model-profiles',
   SAVE_IMAGE_MODEL_PROFILES: 'design:save-image-model-profiles',

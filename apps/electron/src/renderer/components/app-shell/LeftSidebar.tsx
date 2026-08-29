@@ -99,6 +99,7 @@ import {
   activeCanvasSelectionAtom,
   canvasSessionsByProjectAtom,
   canvasSessionStatusByProjectAtom,
+  removeCanvasSessionAtom,
   upsertCanvasSessionAtom,
 } from '@/atoms/canvas-session-atoms'
 import { CollapsedWorkspacePopover } from '@/components/agent/CollapsedWorkspacePopover'
@@ -749,6 +750,9 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
 
   /** 待删除对话 ID，非空时显示确认弹窗 */
   const [pendingDeleteId, setPendingDeleteId] = React.useState<string | null>(null)
+  /** 待删除 Canvas 会话；删除前必须经独立确认，不能复用普通 Agent 会话 ID。 */
+  const [pendingDeleteCanvasSession, setPendingDeleteCanvasSession] = React.useState<CanvasSessionMeta | null>(null)
+  const [deletingCanvasId, setDeletingCanvasId] = React.useState<string | null>(null)
   /** 待删除项目 ID，非空时显示项目删除确认弹窗 */
   const [pendingDeleteWorkspaceId, setPendingDeleteWorkspaceId] = React.useState<string | null>(null)
   const [deletingWorkspaceId, setDeletingWorkspaceId] = React.useState<string | null>(null)
@@ -807,6 +811,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
   const canvasSessionStatusByProject = useAtomValue(canvasSessionStatusByProjectAtom)
   const [activeCanvasSelection, setActiveCanvasSelection] = useAtom(activeCanvasSelectionAtom)
   const upsertCanvasSession = useSetAtom(upsertCanvasSessionAtom)
+  const removeCanvasSession = useSetAtom(removeCanvasSessionAtom)
 
   // 当前项目能力（MCP + Skill 计数）
   const [capabilities, setCapabilities] = React.useState<WorkspaceCapabilities | null>(null)
@@ -1435,6 +1440,35 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
       toast.error('更新 Canvas 归档状态失败')
     }
   }, [activeCanvasSelection, setActiveView, upsertCanvasSession])
+
+  /** 打开独立 Canvas 删除确认，避免右键菜单直接执行不可恢复操作。 */
+  const handleRequestDeleteCanvasSession = React.useCallback((session: CanvasSessionMeta): void => {
+    setPendingDeleteCanvasSession(session)
+  }, [])
+
+  /** 删除 Canvas 并同步清理 Renderer 索引与当前画布入口。 */
+  const handleConfirmDeleteCanvasSession = React.useCallback(async (): Promise<void> => {
+    const session = pendingDeleteCanvasSession
+    if (!session || deletingCanvasId) return
+    setDeletingCanvasId(session.id)
+    try {
+      await designAdapter.deleteCanvasSession({ projectId: session.projectId, canvasId: session.id })
+      removeCanvasSession({ projectId: session.projectId, canvasId: session.id })
+      if (activeCanvasSelection?.projectId === session.projectId
+        && activeCanvasSelection.canvasId === session.id) {
+        setActiveView('conversations')
+      }
+      toast.success('Canvas 已删除')
+      setPendingDeleteCanvasSession(null)
+    } catch (error) {
+      console.error('[侧边栏] 删除 Canvas 会话失败:', error)
+      toast.error(error instanceof Error && error.message.includes('任务运行')
+        ? 'Canvas 仍有任务运行，请先停止后再删除'
+        : '删除 Canvas 失败')
+    } finally {
+      setDeletingCanvasId(null)
+    }
+  }, [activeCanvasSelection, deletingCanvasId, pendingDeleteCanvasSession, removeCanvasSession, setActiveView])
 
   /** 切换当前项目；点击当前已选中工作区标题时则折叠/展开其会话列表 */
   const handleSelectProject = React.useCallback((workspaceId: string): void => {
@@ -2514,6 +2548,35 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     </AlertDialog>
   )
 
+  /** Canvas 删除使用独立确认文案，明确节点、原型和内部 Agent 对话都会一并移除。 */
+  const canvasDeleteDialog = (
+    <AlertDialog
+      open={pendingDeleteCanvasSession !== null}
+      onOpenChange={(open) => {
+        if (!open && !deletingCanvasId) setPendingDeleteCanvasSession(null)
+      }}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>确认删除 Canvas</AlertDialogTitle>
+          <AlertDialogDescription>
+            将永久删除“{pendingDeleteCanvasSession?.title ?? '该 Canvas'}”及其中的节点、原型内容和内部 Agent 对话。此操作无法恢复。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deletingCanvasId !== null}>取消</AlertDialogCancel>
+          <AlertDialogAction
+            disabled={deletingCanvasId !== null}
+            onClick={() => { void handleConfirmDeleteCanvasSession() }}
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+          >
+            {deletingCanvasId ? '正在删除…' : '删除'}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+
   // 项目删除确认弹窗（会同时删除项目下的会话与工作区资源）
   const projectDeleteDialog = (
     <AlertDialog
@@ -2761,6 +2824,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
                 onSelect={handleSelectCanvasSession}
                 onRename={handleRenameCanvasSession}
                 onToggleArchive={handleToggleArchiveCanvasSession}
+                onRequestDelete={handleRequestDeleteCanvasSession}
               />
             </div>
           ),
@@ -3151,6 +3215,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
                   onSelect={handleSelectCanvasSession}
                   onRename={handleRenameCanvasSession}
                   onToggleArchive={handleToggleArchiveCanvasSession}
+                  onRequestDelete={handleRequestDeleteCanvasSession}
                 />
               </div>
             ),
@@ -3471,6 +3536,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
         </div>
 
         {deleteDialog}
+        {canvasDeleteDialog}
         {projectDeleteDialog}
         {restoreProjectRootDialog}
         {moveDialog}
@@ -3697,6 +3763,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
       </div>
 
       {deleteDialog}
+      {canvasDeleteDialog}
       {projectDeleteDialog}
       {restoreProjectRootDialog}
       {moveDialog}

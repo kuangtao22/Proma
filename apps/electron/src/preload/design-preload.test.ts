@@ -138,6 +138,7 @@ describe('Design preload', () => {
       [() => api.listCanvasSessions({ projectId: 'p1', archived: false }), DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS, [{ projectId: 'p1', archived: false }]],
       [() => api.createCanvasSession({ projectId: 'p1', title: '页面设计' }), DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION, [{ projectId: 'p1', title: '页面设计' }]],
       [() => api.updateCanvasSession({ projectId: 'p1', canvasId: 'canvas-1', archived: true }), DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION, [{ projectId: 'p1', canvasId: 'canvas-1', archived: true }]],
+      [() => api.deleteCanvasSession({ projectId: 'p1', canvasId: 'canvas-1' }), DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION, [{ projectId: 'p1', canvasId: 'canvas-1' }]],
       [() => api.listImageModelProfiles(), DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, []],
       [() => api.saveImageModelProfiles({ profiles: [] }), DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, [{ profiles: [] }]],
       [() => api.getImageModelSelection('p1'), DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, [{ projectId: 'p1' }]],

@@ -498,7 +498,13 @@ export function createNativeCanvasNodeCreationSuccessUpdate(
   /** 更高 revision 已接管时只沿用单调 helper 结果，禁止覆盖当前工作台。 */
   if (current.snapshot && current.snapshot.document.revision > resultDocument.revision) return update
   if (success.kind !== 'agent' && update.snapshot && 'snapshot' in success.result) {
-    update.snapshot = { ...success.result.snapshot, document: update.snapshot.document }
+    /** 生命周期旧结果没有刷新预览时沿用当前授权 URL，后续 LOAD 再权威替换。 */
+    const imagePreviews = success.result.snapshot.imagePreviews ?? current.snapshot?.imagePreviews
+    update.snapshot = {
+      ...success.result.snapshot,
+      ...(imagePreviews ? { imagePreviews } : {}),
+      document: update.snapshot.document,
+    }
   }
   return update
 }
@@ -520,7 +526,15 @@ export function createNativeCanvasLifecycleSuccessUpdate(
     return {}
   }
   return {
-    snapshot: result.snapshot,
+    /** 删除或恢复旧结果未携带预览字段时保留当前共享缩略图映射。 */
+    snapshot: {
+      ...result.snapshot,
+      ...(result.snapshot.imagePreviews
+        ? {}
+        : current.snapshot?.imagePreviews
+          ? { imagePreviews: current.snapshot.imagePreviews }
+          : {}),
+    },
     selectedNodeId,
     conversationNodeId: null,
     expandedNodeId: null,
@@ -531,6 +545,82 @@ export function createNativeCanvasLifecycleSuccessUpdate(
     saveState: 'saved',
     error: null,
   }
+}
+
+/** 批量删除控制器依赖，复用单节点主进程生命周期并串行推进 revision。 */
+export interface NativeCanvasBatchDeleteDependencies {
+  target: CanvasTarget
+  nodeIds: readonly string[]
+  initialRevision: number
+  deleteNode: (input: DeleteCanvasNodeInput) => Promise<CanvasNodeLifecycleResult>
+  createOperationId: () => string
+  operationCache?: Map<string, DeleteCanvasNodeInput>
+  isActive?: () => boolean
+  onDeleted: (
+    nodeId: string,
+    result: CanvasNodeLifecycleResult,
+    remainingNodeIds: readonly string[],
+  ) => void
+}
+
+/** 批量删除串行结果；失败时已成功节点不会回滚。 */
+export interface NativeCanvasBatchDeleteResult {
+  deletedNodeIds: string[]
+  remainingNodeIds: string[]
+  error: unknown | null
+}
+
+/**
+ * 串行删除一组 Canvas 节点，后一请求始终使用前一权威结果的 revision。
+ * @param dependencies 删除目标、生命周期 API、幂等 ID 与成功回调。
+ * @returns 已删除、剩余节点和首个失败原因。
+ */
+export async function deleteNativeCanvasNodesSequentially(
+  dependencies: NativeCanvasBatchDeleteDependencies,
+): Promise<NativeCanvasBatchDeleteResult> {
+  /** 成功节点按提交顺序记录，供部分失败提示使用。 */
+  const deletedNodeIds: string[] = []
+  /** 调用方可持有缓存，使失败重试复用同一完整幂等请求。 */
+  const operationCache = dependencies.operationCache ?? new Map<string, DeleteCanvasNodeInput>()
+  /** 下一节点必须基于最近一次主进程权威 revision。 */
+  let expectedRevision = dependencies.initialRevision
+
+  for (let index = 0; index < dependencies.nodeIds.length; index += 1) {
+    if (dependencies.isActive && !dependencies.isActive()) {
+      return {
+        deletedNodeIds,
+        remainingNodeIds: dependencies.nodeIds.slice(index),
+        error: null,
+      }
+    }
+    /** 当前节点身份来自确认时的稳定选区快照。 */
+    const nodeId = dependencies.nodeIds[index]
+    if (!nodeId) continue
+    /** 同一失败节点重试时复用 operationId 和 expectedRevision。 */
+    const operation = operationCache.get(nodeId) ?? {
+      ...dependencies.target,
+      nodeId,
+      operationId: dependencies.createOperationId(),
+      expectedRevision,
+    }
+    operationCache.set(nodeId, operation)
+    try {
+      /** 每一步等待权威快照后才提交下一节点，避免 revision 并发冲突。 */
+      const result = await dependencies.deleteNode(operation)
+      deletedNodeIds.push(nodeId)
+      operationCache.delete(nodeId)
+      expectedRevision = result.snapshot.document.revision
+      const remainingNodeIds = dependencies.nodeIds.slice(index + 1)
+      dependencies.onDeleted(nodeId, result, remainingNodeIds)
+    } catch (error: unknown) {
+      return {
+        deletedNodeIds,
+        remainingNodeIds: dependencies.nodeIds.slice(index),
+        error,
+      }
+    }
+  }
+  return { deletedNodeIds, remainingNodeIds: [], error: null }
 }
 
 /**
@@ -545,6 +635,23 @@ export function getNativeCanvasConnectedEdgeCount(
 ): number {
   return document.edges.filter((edge) => (
     edge.sourceNodeId === nodeId || edge.targetNodeId === nodeId
+  )).length
+}
+
+/**
+ * 统计批量删除会移除的去重关联边。
+ * @param document 当前权威 Canvas 文档。
+ * @param nodeIds 待删除节点集合。
+ * @returns 任一端命中选区的边数量，每条边只计算一次。
+ */
+export function getNativeCanvasBatchConnectedEdgeCount(
+  document: CanvasDocument,
+  nodeIds: readonly string[],
+): number {
+  /** Set 避免节点数增加后产生边数乘节点数的重复扫描。 */
+  const selectedNodeIdSet = new Set(nodeIds)
+  return document.edges.filter((edge) => (
+    selectedNodeIdSet.has(edge.sourceNodeId) || selectedNodeIdSet.has(edge.targetNodeId)
   )).length
 }
 
@@ -1762,6 +1869,8 @@ export function NativeCanvasWorkspace({
   const stopDeleteRequestGenerationRef = React.useRef(0)
   /** 删除失败重试复用同一完整幂等请求，成功或 Canvas 切换后清理。 */
   const deleteOperationRef = React.useRef<DeleteCanvasNodeInput | null>(null)
+  /** 批量删除按节点缓存独立 operation，部分失败后只重试剩余节点。 */
+  const batchDeleteOperationRef = React.useRef(new Map<string, DeleteCanvasNodeInput>())
   /** 空图新增落点必须使用真实画布表面，不读取侧栏或窗口全宽。 */
   const canvasSurfaceRef = React.useRef<HTMLDivElement | null>(null)
   const [createState, setCreateState] = React.useState<CanvasAgentNodeCommandState>({
@@ -1775,6 +1884,8 @@ export function NativeCanvasWorkspace({
   const [deleteDialogOpen, setDeleteDialogOpen] = React.useState(false)
   const [deleteSubmitting, setDeleteSubmitting] = React.useState(false)
   const [deleteError, setDeleteError] = React.useState<string | null>(null)
+  /** Renderer 局部完整选区；Jotai 的 selectedNodeId 继续作为详情主节点。 */
+  const [selectedNodeIds, setSelectedNodeIds] = React.useState<string[]>([])
   const [trashOpen, setTrashOpen] = React.useState(false)
   const [trashState, setTrashState] = React.useState<NativeCanvasTrashState>({
     entries: [], loading: false, restoringTrashId: null, error: null,
@@ -1828,6 +1939,24 @@ export function NativeCanvasWorkspace({
   /** SSR 首帧使用该 key 专属的全新状态，不启动任何消息或 Canvas API。 */
   const fallbackState = React.useMemo(createInitialNativeCanvasState, [stateKey])
   const state = states.get(stateKey) ?? fallbackState
+  /** 工作区快照只建立一次素材预览索引，所有折叠卡片共享且不触发图片模块 LOAD。 */
+  const imagePreviewUrls = React.useMemo(() => new Map(
+    (state.snapshot?.imagePreviews ?? []).map((preview) => [preview.assetId, preview.previewUrl]),
+  ), [state.snapshot?.imagePreviews])
+  /** 识别创建、恢复和问题定位等外部主选中变化，避免旧多选遮住新目标。 */
+  const previousSelectedNodeIdRef = React.useRef(state.selectedNodeId)
+  /** 权威文档过滤已删除节点，防止迟到选区引用不存在的节点。 */
+  const validSelectedNodeIds = React.useMemo(() => {
+    if (!state.snapshot) return []
+    const documentNodeIds = new Set(state.snapshot.document.nodes.map((node) => node.id))
+    return selectedNodeIds.filter((nodeId) => documentNodeIds.has(nodeId))
+  }, [selectedNodeIds, state.snapshot])
+  /** 完整选区节点用于批量删除摘要和运行态边界检查。 */
+  const selectedNodes = React.useMemo(() => {
+    if (!state.snapshot) return []
+    const selectedNodeIdSet = new Set(validSelectedNodeIds)
+    return state.snapshot.document.nodes.filter((node) => selectedNodeIdSet.has(node.id))
+  }, [state.snapshot, validSelectedNodeIds])
   /** Agent 工作台节点始终从当前 Canvas 权威内存文档解析，不保存 Renderer sessionId。 */
   const conversationNode = state.snapshot?.document.nodes.find((node) => (
     node.id === state.expandedNodeId && node.kind === 'agent'
@@ -1836,11 +1965,39 @@ export function NativeCanvasWorkspace({
   const conversationNodeIssue = state.snapshot?.nodeIssues.find((issue) => (
     issue.nodeId === conversationNode?.id
   ))
-  /** 工具栏删除始终作用于当前单选节点。 */
-  const selectedNode = state.snapshot?.document.nodes.find((node) => node.id === state.selectedNodeId)
-  /** 运行态仅按当前 Agent 节点绑定的 session 判断。 */
+  /** 首个选中节点继续作为详情与单节点停止删除的主节点。 */
+  const selectedNode = selectedNodes[0]
+    ?? state.snapshot?.document.nodes.find((node) => node.id === state.selectedNodeId)
+  /** 单节点运行态仍按当前 Agent 节点绑定的 session 判断。 */
   const selectedNodeBusy = selectedNode?.kind === 'agent'
     && runningSessionIds.has(selectedNode.agentSessionId)
+  /** 批量选择中任意运行中 Agent 都会阻断整个批次，避免不明确的部分删除。 */
+  const hasBusySelectedNode = selectedNodes.some((node) => (
+    node.kind === 'agent' && runningSessionIds.has(node.agentSessionId)
+  ))
+
+  React.useEffect(() => {
+    /** 在调度状态更新前捕获变化事实，避免并发渲染时 ref 提前推进。 */
+    const primaryChanged = previousSelectedNodeIdRef.current !== state.selectedNodeId
+    previousSelectedNodeIdRef.current = state.selectedNodeId
+    /** 远端删除或首次加载时收敛选区；已有有效多选不得被主节点压缩。 */
+    setSelectedNodeIds((current) => {
+      if (!state.snapshot) return current.length === 0 ? current : []
+      const documentNodeIds = new Set(state.snapshot.document.nodes.map((node) => node.id))
+      const validNodeIds = current.filter((nodeId) => documentNodeIds.has(nodeId))
+      /** 外部命令切换主节点时改为新单选；Graph 自身更新时首项已经一致。 */
+      if (primaryChanged && state.selectedNodeId && documentNodeIds.has(state.selectedNodeId)
+        && validNodeIds[0] !== state.selectedNodeId) {
+        return [state.selectedNodeId]
+      }
+      if (validNodeIds.length > 0) {
+        return validNodeIds.length === current.length ? current : validNodeIds
+      }
+      return state.selectedNodeId && documentNodeIds.has(state.selectedNodeId)
+        ? [state.selectedNodeId]
+        : []
+    })
+  }, [state.selectedNodeId, state.snapshot, stateKey])
 
   /** 登记提交器并返回身份安全的释放函数，迟到 cleanup 不删除新实例。 */
   const registerWorkbenchDraftCommitter = React.useCallback<RegisterNativeCanvasWorkbenchDraftCommitter>((committer) => {
@@ -2043,19 +2200,22 @@ export function NativeCanvasWorkspace({
     && state.authoritativeRecoveryState === 'idle'
     && state.saveState !== 'conflict',
   )
-  /** 删除只要求存在当前节点和可写快照，主进程继续复核运行态。 */
+  /** 删除要求存在完整选区和可写快照，主进程继续逐节点复核运行态。 */
   const canDeleteNode = Boolean(
     workspaceWritable
     && adapter.deleteCanvasNode
-    && selectedNode
+    && selectedNodes.length > 0
     && state.saveState === 'saved'
     && state.pendingMutations.length === 0
     && state.inFlightMutations.length === 0
     && !deleteSubmitting,
   )
-  /** 当前节点删除会同步移除的关联边数量。 */
-  const connectedEdgeCount = state.snapshot && selectedNode
-    ? getNativeCanvasConnectedEdgeCount(state.snapshot.document, selectedNode.id)
+  /** 当前完整选区删除会同步移除的去重关联边数量。 */
+  const connectedEdgeCount = state.snapshot && selectedNodes.length > 0
+    ? getNativeCanvasBatchConnectedEdgeCount(
+        state.snapshot.document,
+        selectedNodes.map((node) => node.id),
+      )
     : 0
   /** 切换确认只读取当前展开节点自己登记的提交器。 */
   const currentWorkbenchDraftCommitter = state.expandedNodeId
@@ -2189,6 +2349,54 @@ export function NativeCanvasWorkspace({
     updateNativeCanvasState,
   ])
 
+  /** 通过既有单节点生命周期串行删除完整选区，部分失败时保留剩余节点供重试。 */
+  const commitBatchNodeDelete = React.useCallback((nodeIds: readonly string[]): void => {
+    const latest = store.get(nativeCanvasStatesAtom).get(stateKey)
+    if (!adapter.deleteCanvasNode || !latest?.snapshot || nodeIds.length < 2) return
+    /** 当前批次绑定 Canvas 删除代次，切换后不再提交后续节点。 */
+    const deleteGeneration = deleteGenerationRef.current
+    setDeleteSubmitting(true)
+    setDeleteError(null)
+    void deleteNativeCanvasNodesSequentially({
+      target,
+      nodeIds,
+      initialRevision: latest.snapshot.document.revision,
+      deleteNode: adapter.deleteCanvasNode,
+      createOperationId: () => window.crypto.randomUUID(),
+      operationCache: batchDeleteOperationRef.current,
+      isActive: () => deleteGenerationRef.current === deleteGeneration,
+      onDeleted: (_nodeId, result, remainingNodeIds) => {
+        if (deleteGenerationRef.current !== deleteGeneration) return
+        workbenchDraftCommitCoordinatorRef.current?.invalidate()
+        const nextSelectedNodeId = remainingNodeIds[0] ?? null
+        updateNativeCanvasState({
+          key: stateKey,
+          update: (current) => createNativeCanvasLifecycleSuccessUpdate(
+            current,
+            result,
+            nextSelectedNodeId,
+          ),
+        })
+        setSelectedNodeIds([...remainingNodeIds])
+      },
+    }).then((result) => {
+      if (deleteGenerationRef.current !== deleteGeneration) return
+      setDeleteSubmitting(false)
+      setSelectedNodeIds(result.remainingNodeIds)
+      if (result.error) {
+        /** 部分成功必须明确告诉用户已完成和未完成数量。 */
+        const progressMessage = result.deletedNodeIds.length > 0
+          ? `已删除 ${result.deletedNodeIds.length} 个，剩余 ${result.remainingNodeIds.length} 个未删除。`
+          : ''
+        setDeleteError(`${progressMessage}${getNativeCanvasOperationErrorMessage('delete', result.error)}`)
+        return
+      }
+      batchDeleteOperationRef.current.clear()
+      setDeleteError(null)
+      setDeleteDialogOpen(false)
+    })
+  }, [adapter.deleteCanvasNode, stateKey, store, target, updateNativeCanvasState])
+
   React.useEffect(() => {
     if (!pendingStopDelete) return
     if (pendingStopDelete.canvasKey !== stateKey) {
@@ -2240,6 +2448,14 @@ export function NativeCanvasWorkspace({
     mode: 'delete' | 'stop-and-delete',
   ): void => {
     if (!selectedNode || !canDeleteNode) return
+    if (selectedNodes.length > 1) {
+      if (hasBusySelectedNode) {
+        setDeleteError('选区中有正在运行的 Agent，请先单独停止后再批量删除。')
+        return
+      }
+      commitBatchNodeDelete(selectedNodes.map((node) => node.id))
+      return
+    }
     if (mode === 'delete') {
       commitNodeDelete(selectedNode.id)
       return
@@ -2289,12 +2505,15 @@ export function NativeCanvasWorkspace({
   }, [
     adapter.stopCanvasAgent,
     canDeleteNode,
+    commitBatchNodeDelete,
     commitNodeDelete,
+    hasBusySelectedNode,
     optimisticRunGenerations,
     invalidatePendingStopDelete,
     replacePendingStopDelete,
     runGenerations,
     selectedNode,
+    selectedNodes,
     stateKey,
     target,
   ])
@@ -2320,6 +2539,8 @@ export function NativeCanvasWorkspace({
     deleteGenerationRef.current += 1
     invalidatePendingStopDelete()
     deleteOperationRef.current = null
+    batchDeleteOperationRef.current.clear()
+    setSelectedNodeIds([])
     setDeleteDialogOpen(false)
     setDeleteSubmitting(false)
     setDeleteError(null)
@@ -2503,16 +2724,26 @@ export function NativeCanvasWorkspace({
                 activeTool={state.activeTool}
                 nodeIssues={state.snapshot.nodeIssues}
                 runningSessionIds={runningSessionIds}
+                imagePreviewUrls={imagePreviewUrls}
                 canCreateChild={canCreateNode}
                 onCreateChild={(sourceNodeId, kind) => {
                   void commandRef.current?.execute({ kind, sourceNodeId }).catch(() => undefined)
                 }}
                 selectedNodeId={state.selectedNodeId}
+                selectedNodeIds={validSelectedNodeIds}
                 onMutation={(mutation) => controllerRef.current?.enqueueMutation(mutation)}
                 onNodeSelect={(selectedNodeId) => updateNativeCanvasState({
                   key: stateKey,
                   update: { selectedNodeId },
                 })}
+                onNodeSelectionChange={(nodeIds) => {
+                  /** Graph 是完整选区来源，首个节点继续同步给详情兼容状态。 */
+                  setSelectedNodeIds([...nodeIds])
+                  updateNativeCanvasState({
+                    key: stateKey,
+                    update: { selectedNodeId: nodeIds[0] ?? null },
+                  })
+                }}
                 onConversationNodeChange={() => undefined}
                 onWorkbenchNodeChange={requestWorkbenchNodeChange}
                 expandedNodeId={state.expandedNodeId}
@@ -2557,17 +2788,27 @@ export function NativeCanvasWorkspace({
         ) : null}
       </div>
       <NativeCanvasDeleteDialog
-        open={deleteDialogOpen && selectedNode !== undefined}
+        open={deleteDialogOpen && selectedNodes.length > 0}
         nodeTitle={selectedNode?.title ?? ''}
         connectedEdgeCount={connectedEdgeCount}
-        busy={Boolean(selectedNodeBusy)}
+        busy={selectedNodes.length === 1 && Boolean(selectedNodeBusy)}
         kind={selectedNode?.kind}
+        selectedCount={selectedNodes.length}
+        hasAgent={selectedNodes.some((node) => node.kind === 'agent')}
+        hasContent={selectedNodes.some((node) => node.kind !== 'agent')}
+        blockedMessage={selectedNodes.length > 1 && hasBusySelectedNode
+          ? '选区中有正在运行的 Agent，请先单独停止后再批量删除。'
+          : null}
         submitting={deleteSubmitting}
         error={deleteError}
         onOpenChange={(open) => {
           if (deleteSubmitting) return
           setDeleteDialogOpen(open)
-          if (!open) setDeleteError(null)
+          if (!open) {
+            /** 用户取消批量操作后丢弃旧 revision operation，下一次按新选区重建。 */
+            batchDeleteOperationRef.current.clear()
+            setDeleteError(null)
+          }
         }}
         onConfirm={confirmSelectedNodeDelete}
       />

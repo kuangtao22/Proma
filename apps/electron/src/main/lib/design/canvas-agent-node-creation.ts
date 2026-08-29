@@ -1152,7 +1152,7 @@ export class CanvasAgentNodeCreationService {
           } else {
             assertCommittedNodeMatchesIntent(node, intent)
           }
-          assertRelationshipMatchesIntent(document, intent)
+          /** committed 后连线属于可编辑图状态；删线或删除源节点时下游 Agent 合法转为独立节点。 */
           if (!rebuildIntent
             && !sessionMatchesIntent(this.dependencies.getSession(intent.sessionId), intent)) {
             nodeIssues.push(createUnavailableSessionIssue(node.id))
