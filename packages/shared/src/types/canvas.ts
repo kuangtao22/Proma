@@ -342,6 +342,26 @@ export interface CanvasBatchOperationInput extends CanvasTarget {
   sourceToolCallId: string
 }
 
+/** Canvas 批量命令外壳允许携带的 JSON 基元。 */
+export type CanvasJsonPrimitive = null | string | boolean | number
+
+/** Canvas 批量命令外壳允许携带的 JSON 对象。 */
+export interface CanvasJsonObject {
+  [key: string]: CanvasJsonValue
+}
+
+/** Canvas 批量命令外壳允许携带的递归 JSON 值。 */
+export type CanvasJsonValue = CanvasJsonPrimitive | CanvasJsonObject | CanvasJsonValue[]
+
+/** Task 8 权威验证 mutation 前使用的不可信 JSON 命令外壳。 */
+export interface CanvasBatchOperationEnvelope extends CanvasTarget {
+  baseRevision: number
+  operations: CanvasJsonValue[]
+  sourceSessionId: string
+  sourceRunStartedAt: number
+  sourceToolCallId: string
+}
+
 /** Agent 工具明确执行一组 Canvas 节点的输入。 */
 export interface CanvasRunNodesInput extends CanvasTarget {
   nodeIds: string[]
@@ -901,8 +921,83 @@ export function parseCanvasNodeReferences(value: unknown): CanvasNodeReference[]
   return value.map(parseCanvasNodeReference)
 }
 
-/** 严格解析 Agent 工具批量修改 Canvas 的输入。 */
-export function parseCanvasBatchOperationInput(value: unknown): CanvasBatchOperationInput {
+/**
+ * 递归重建 Canvas 命令外壳中的 plain JSON 值。
+ * @param value 待隔离的未知 operation 值。
+ * @param active 当前递归路径中的对象，用于拒绝循环引用。
+ * @returns 与调用方引用完全隔离的 JSON 值。
+ */
+function cloneCanvasJsonValue(value: unknown, active: Set<object>): CanvasJsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('CANVAS_BATCH_OPERATION_ENVELOPE_INVALID')
+    return value
+  }
+  if (typeof value !== 'object') throw new Error('CANVAS_BATCH_OPERATION_ENVELOPE_INVALID')
+  if (active.has(value)) throw new Error('CANVAS_BATCH_OPERATION_ENVELOPE_INVALID')
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype
+      || Object.getOwnPropertySymbols(value).length > 0) {
+      throw new Error('CANVAS_BATCH_OPERATION_ENVELOPE_INVALID')
+    }
+    /** 数组描述符用于拒绝空洞、accessor 与额外字符串属性。 */
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    /** 数组只允许 length 与从 0 连续到末尾的索引。 */
+    const allowedKeys = new Set([
+      'length',
+      ...Array.from({ length: value.length }, (_, index) => String(index)),
+    ])
+    if (Object.keys(descriptors).some((key) => !allowedKeys.has(key))) {
+      throw new Error('CANVAS_BATCH_OPERATION_ENVELOPE_INVALID')
+    }
+    active.add(value)
+    try {
+      /** 隔离后的数组按索引顺序重建。 */
+      const clone: CanvasJsonValue[] = []
+      for (let index = 0; index < value.length; index += 1) {
+        /** 当前索引必须是可枚举的数据字段。 */
+        const descriptor = descriptors[String(index)]
+        if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+          throw new Error('CANVAS_BATCH_OPERATION_ENVELOPE_INVALID')
+        }
+        clone.push(cloneCanvasJsonValue(descriptor.value, active))
+      }
+      return clone
+    } finally {
+      active.delete(value)
+    }
+  }
+  /** 自定义类、Date 与其它原型对象不属于 plain JSON。 */
+  const prototype = Object.getPrototypeOf(value)
+  if ((prototype !== Object.prototype && prototype !== null)
+    || Object.getOwnPropertySymbols(value).length > 0) {
+    throw new Error('CANVAS_BATCH_OPERATION_ENVELOPE_INVALID')
+  }
+  /** 对象描述符用于拒绝 accessor 与不可枚举隐藏状态。 */
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  /** 重建对象通过数据属性写入，避免 __proto__ 键触发原型 setter。 */
+  const clone: CanvasJsonObject = {}
+  active.add(value)
+  try {
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (!descriptor.enumerable || !('value' in descriptor)) {
+        throw new Error('CANVAS_BATCH_OPERATION_ENVELOPE_INVALID')
+      }
+      Object.defineProperty(clone, key, {
+        value: cloneCanvasJsonValue(descriptor.value, active),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      })
+    }
+    return clone
+  } finally {
+    active.delete(value)
+  }
+}
+
+/** 严格解析 Agent 工具批量修改的 JSON 外壳，不声称 mutation 已验证。 */
+export function parseCanvasBatchOperationEnvelope(value: unknown): CanvasBatchOperationEnvelope {
   /** 批量修改命令允许的完整字段集合。 */
   const keys = [
     'projectId', 'canvasId', 'baseRevision', 'operations',
@@ -916,13 +1011,13 @@ export function parseCanvasBatchOperationInput(value: unknown): CanvasBatchOpera
     || !isCanvasLifecycleId(value.sourceSessionId)
     || !isCanvasNonNegativeInteger(value.sourceRunStartedAt)
     || !isCanvasLifecycleId(value.sourceToolCallId)) {
-    throw new Error('CANVAS_BATCH_OPERATION_INPUT_INVALID')
+    throw new Error('CANVAS_BATCH_OPERATION_ENVELOPE_INVALID')
   }
   /**
-   * Task 1 只固化批量命令外壳；Task 8 必须在事务执行前通过 CanvasDocumentStore
-   * 权威校验每条 mutation 的完整 schema、重复 ID 与图引用语义。
+   * operation 在进入 Task 8 前只作为隔离后的 JSON；CanvasDocumentStore 必须权威校验
+   * 完整 mutation schema、重复 ID 与图引用语义，再构造 CanvasBatchOperationInput。
    */
-  const operations = [...value.operations] as CanvasMutation[]
+  const operations = value.operations.map((operation) => cloneCanvasJsonValue(operation, new Set()))
   return {
     projectId: value.projectId,
     canvasId: value.canvasId,

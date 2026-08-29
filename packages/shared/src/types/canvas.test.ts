@@ -13,7 +13,7 @@ import {
   parseCanvasNodeContentMeta,
   parseCanvasTrashEntry,
   parseAgentCanvasBinding,
-  parseCanvasBatchOperationInput,
+  parseCanvasBatchOperationEnvelope,
   parseCanvasNodeReference,
   parseCanvasRunNodesInput,
   parseClearAgentCanvasBindingsInput,
@@ -222,31 +222,93 @@ describe('Canvas 图共享合同', () => {
     expect(() => parseCanvasNodeReference({ ...reference, localPath: '/private/node.json' })).toThrow()
   })
 
-  test('Given Agent 批量修改与执行输入 When 严格解析 Then 保留来源代次并拒绝未知字段', () => {
-    /** 批量操作使用现有 Canvas mutation，不引入第二套图修改协议。 */
+  test('Given Agent 批量修改外壳 When 严格解析 Then 保留 JSON 操作与来源身份', () => {
+    /** 未验证 operation 只属于 JSON 外壳，不能伪装成 CanvasMutation。 */
+    const operation = {
+      type: 'future-task-8-validation',
+      payload: { nodeIds: ['node-1'] },
+    }
+    /** 批量操作外壳在 Task 8 权威验证前只承诺 JSON 值。 */
     const batch = {
       projectId: 'project-1', canvasId: 'canvas-1', baseRevision: 2,
-      operations: [{ type: 'remove-nodes', nodeIds: ['node-1'] }],
+      operations: [operation],
       sourceSessionId: 'session-1', sourceRunStartedAt: 100, sourceToolCallId: 'tool-1',
-    } satisfies import('./canvas').CanvasBatchOperationInput
+    }
     /** 节点执行只提交稳定节点 ID 与来源代次。 */
     const run = {
       projectId: 'project-1', canvasId: 'canvas-1', nodeIds: ['node-1', 'node-2'],
       sourceSessionId: 'session-1', sourceRunStartedAt: 100, sourceToolCallId: 'tool-1',
     }
 
-    expect(parseCanvasBatchOperationInput(batch)).toEqual(batch)
-    expect(parseCanvasBatchOperationInput({
-      ...batch,
-      operations: [{ type: 'future-task-8-validation', unknown: true }],
-    } as unknown as import('./canvas').CanvasBatchOperationInput).operations as unknown).toEqual([
-      { type: 'future-task-8-validation', unknown: true },
-    ])
+    expect(parseCanvasBatchOperationEnvelope(batch)).toEqual(batch)
     expect(parseCanvasRunNodesInput(run)).toEqual(run)
-    expect(() => parseCanvasBatchOperationInput({ ...batch, baseRevision: -1 })).toThrow()
-    expect(() => parseCanvasBatchOperationInput({ ...batch, internal: true })).toThrow()
+    expect(() => parseCanvasBatchOperationEnvelope({ ...batch, baseRevision: -1 })).toThrow()
+    expect(() => parseCanvasBatchOperationEnvelope({ ...batch, internal: true })).toThrow()
     expect(() => parseCanvasRunNodesInput({ ...run, nodeIds: ['node-1', '../escape'] })).toThrow()
     expect(() => parseCanvasRunNodesInput({ ...run, extra: true })).toThrow()
+  })
+
+  test('Given 外壳解析后修改原 operation When 读取结果 Then 嵌套 JSON 保持隔离', () => {
+    /** 原始 operation 包含对象与数组两层可变引用。 */
+    const operation = {
+      type: 'remove-nodes',
+      payload: { nodeIds: ['node-1'] },
+    }
+    /** 解析后的可信 JSON 副本。 */
+    const parsed = parseCanvasBatchOperationEnvelope({
+      projectId: 'project-1', canvasId: 'canvas-1', baseRevision: 2,
+      operations: [operation],
+      sourceSessionId: 'session-1', sourceRunStartedAt: 100, sourceToolCallId: 'tool-1',
+    })
+
+    operation.type = 'changed'
+    operation.payload.nodeIds.push('node-2')
+
+    expect(parsed.operations).toEqual([{
+      type: 'remove-nodes',
+      payload: { nodeIds: ['node-1'] },
+    }])
+  })
+
+  test('Given operation 不是有限 plain JSON When 解析外壳 Then fail closed', () => {
+    /** 构造带循环引用的 plain object。 */
+    const circular: Record<string, unknown> = {}
+    circular.self = circular
+    /** 构造带自定义原型的非 plain object。 */
+    const customPrototype = Object.create({ inherited: true }) as unknown
+    /** 构造 JSON 不允许的稀疏数组。 */
+    const sparseArray = new Array(1)
+    /** 所有非法 JSON 值分别进入单个 operation。 */
+    const invalidOperations: unknown[] = [
+      undefined,
+      () => undefined,
+      Symbol('operation'),
+      1n,
+      Number.NaN,
+      new Date(),
+      customPrototype,
+      circular,
+      sparseArray,
+    ]
+
+    for (const operation of invalidOperations) {
+      expect(() => parseCanvasBatchOperationEnvelope({
+        projectId: 'project-1', canvasId: 'canvas-1', baseRevision: 2,
+        operations: [operation],
+        sourceSessionId: 'session-1', sourceRunStartedAt: 100, sourceToolCallId: 'tool-1',
+      })).toThrow()
+    }
+  })
+
+  test('Given Task 8 已验证 mutation When 构造内部命令 Then operations 保持强类型', () => {
+    /** 内部强类型命令只能携带 CanvasMutation，不由外壳 parser 声称产出。 */
+    const input: import('./canvas').CanvasBatchOperationInput = {
+      projectId: 'project-1', canvasId: 'canvas-1', baseRevision: 2,
+      operations: [{ type: 'remove-nodes', nodeIds: ['node-1'] }],
+      sourceSessionId: 'session-1', sourceRunStartedAt: 100, sourceToolCallId: 'tool-1',
+    }
+
+    expect(input.operations[0]?.type).toBe('remove-nodes')
   })
 
   test('Given 图片媒体释放输入 When 严格解析 Then 保留完整目标与授权身份并拒绝多余字段', () => {
