@@ -25,6 +25,7 @@ describe('Agent Canvas 节点引用合同', () => {
     const sendInput: AgentSendInput = {
       sessionId: 'session-1', userMessage: '总结这个节点', channelId: 'channel-1',
       canvasNodeReferences: [canvasNodeReference],
+      canvasNodeReferenceMode: 'exact',
     }
     /** 活跃 Agent 队列输入使用同一公开字段名。 */
     const queueInput: AgentQueueMessageInput = {
@@ -33,6 +34,7 @@ describe('Agent Canvas 节点引用合同', () => {
     }
 
     expect(sendInput.canvasNodeReferences).toEqual([canvasNodeReference])
+    expect(sendInput.canvasNodeReferenceMode).toBe('exact')
     expect(queueInput.canvasNodeReferences).toEqual([canvasNodeReference])
   })
 
@@ -71,6 +73,7 @@ describe('Agent Canvas 节点引用合同', () => {
     }
 
     expect('canvasNodeReferences' in sendInput).toBe(false)
+    expect('canvasNodeReferenceMode' in sendInput).toBe(false)
     expect('canvasNodeReferences' in queueInput).toBe(false)
   })
 

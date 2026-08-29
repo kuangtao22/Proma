@@ -106,6 +106,8 @@ function requireProjectAgent(
 export function isEligibleProjectAgent(session: AgentSessionMeta, projectId: string): boolean {
   return isAgentSessionUserVisible(session)
     && session.workspaceId === projectId
+    && !session.archived
+    && session.explorationParentSessionId === undefined
     && session.sourceAutomationId === undefined
     && session.parentSessionId === undefined
     && session.rootSessionId === undefined

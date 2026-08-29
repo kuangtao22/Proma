@@ -1232,6 +1232,9 @@ export interface WorkspaceCapabilities {
 
 // ===== Agent 发送输入 =====
 
+/** Canvas 节点引用在发送边界采用的 revision 解析语义。 */
+export type CanvasNodeReferenceMode = 'latest' | 'exact'
+
 /**
  * Agent 发送消息的输入参数
  */
@@ -1274,6 +1277,8 @@ export interface AgentSendInput {
   automationContext?: string
   /** 本次用户消息显式携带的 Canvas 节点引用快照。 */
   canvasNodeReferences?: CanvasNodeReference[]
+  /** latest 刷新普通发送快照；exact 保持历史重试的原 revision。 */
+  canvasNodeReferenceMode?: CanvasNodeReferenceMode
 }
 
 // ===== Agent 队列消息 =====

@@ -16,6 +16,7 @@ import { AgentCanvasBindingStore } from './agent-canvas-binding-store'
 import {
   cleanupDeletedAgentSessionCanvasBindings,
   cleanupDeletedCanvasBindings,
+  isEligibleProjectAgent,
   registerAgentCanvasBindingIpcHandlers,
 } from './agent-canvas-binding-ipc'
 
@@ -219,6 +220,16 @@ async function invoke<T>(
 }
 
 describe('Agent-画布关联 IPC', () => {
+  test.each([
+    { archived: true },
+    { explorationParentSessionId: 'parent-session' },
+  ] satisfies Array<Partial<AgentSessionMeta>>)(
+    'Given 非普通顶层会话 %o When 检查项目 Agent 资格 Then canonical helper 拒绝',
+    (overrides) => {
+      expect(isEligibleProjectAgent(createAgentSession('session-1', overrides), 'project-1')).toBe(false)
+    },
+  )
+
   test('Given 单会话、Canvas 与工作区删除入口 When 检查主进程接缝 Then 均在主删除成功后使用 best-effort helper', () => {
     const source = readFileSync(join(import.meta.dir, '../../ipc.ts'), 'utf8')
     expect(source).toContain('cleanupDeletedCanvasBindings(agentCanvasBindingCleanup, projectId, canvasId)')
@@ -740,6 +751,8 @@ describe('Agent-画布关联 IPC', () => {
       { delegationStatus: 'running' },
       { delegationDepth: 1 },
       { delegationGoal: '检查代码' },
+      { archived: true },
+      { explorationParentSessionId: 'parent-session' },
       { sourceAutomationId: '' },
       { parentSessionId: '' },
       { rootSessionId: '' },

@@ -2,6 +2,7 @@ import { parseCanvasNodeReferences } from '@proma/shared'
 import type {
   AgentCanvasBinding,
   AgentSessionMeta,
+  CanvasNodeReferenceMode,
   CanvasNodeReference,
   CanvasSessionMeta,
   CanvasTarget,
@@ -40,7 +41,7 @@ export interface CanvasNodeReferenceResolver {
   resolveForSend: (input: {
     sessionId: string
     /** latest 刷新新选择；exact 只允许仍可证明的历史 revision。 */
-    mode: 'latest' | 'exact'
+    mode: CanvasNodeReferenceMode
     references: CanvasNodeReference[]
   }) => ResolvedCanvasNodeReferences
 }
@@ -93,7 +94,6 @@ export function createCanvasNodeReferenceResolver(
         /** 当前权威会话必须仍是同项目普通顶层用户 Agent。 */
         const session = dependencies.getSession(input.sessionId)
         if (!session
-          || session.archived
           || !session.workspaceId
           || !isEligibleProjectAgent(session, session.workspaceId)) {
           throw invalidReferenceError()

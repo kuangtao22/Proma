@@ -35,7 +35,7 @@ describe('Agent service 迁移准入', () => {
       .toBeLessThan(helperBody.indexOf('canvasNodeReferenceResolver.resolveForSend('))
   })
 
-  test('Given 新发送与历史错误重试 When 解析 Canvas 引用 Then 分别使用 latest 与 exact revision 语义', () => {
+  test('Given 显式引用模式或普通新发送 When 解析 Canvas 引用 Then 只按 mode 选择 exact 或 latest', () => {
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
     const helperStart = source.indexOf('function resolveAgentCanvasReferencesForSend')
     const helperEnd = source.indexOf('\n\n/**', helperStart)
@@ -44,7 +44,9 @@ describe('Agent service 迁移准入', () => {
     const runEnd = source.indexOf('\n/**', runStart + 1)
     const runBody = source.slice(runStart, runEnd)
 
-    expect(helperBody).toContain("mode: 'retryOfErrorUuid' in input && input.retryOfErrorUuid ? 'exact' : 'latest'")
+    expect(helperBody).toContain("mode: 'canvasNodeReferenceMode' in input")
+    expect(helperBody).toContain("input.canvasNodeReferenceMode ?? 'latest'")
+    expect(helperBody).not.toContain('retryOfErrorUuid')
     expect(runBody.indexOf('resolveAgentCanvasReferencesForSend(input, extensions)'))
       .toBeLessThan(runBody.indexOf('orchestrator.sendMessage('))
   })

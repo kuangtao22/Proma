@@ -24,7 +24,7 @@ const reference: CanvasNodeReference = {
 }
 
 describe('Agent Canvas 节点引用 composer', () => {
-  test('Given 历史用户消息带 rev3 引用 When 点击重试 Then 正文与引用从同一 SDK 消息透传', () => {
+  test('Given 历史用户消息带 rev3 引用且错误 UUID 缺失 When 点击重试 Then 正文与 exact 引用从同一 SDK 消息透传', () => {
     const source = readFileSync(new URL('./AgentView.tsx', import.meta.url), 'utf8')
     const retryStart = source.indexOf('const handleRetry = React.useCallback(')
     const retryEnd = source.indexOf('\n  /**', retryStart + 1)
@@ -33,6 +33,7 @@ describe('Agent Canvas 节点引用 composer', () => {
     expect(retryBody).toContain('lastUserSDKMessage')
     expect(retryBody).toContain('lastUserSDKMessage._canvasNodeReferences')
     expect(retryBody).toContain('canvasNodeReferences: [...lastUserSDKMessage._canvasNodeReferences]')
+    expect(retryBody).toContain("canvasNodeReferenceMode: 'exact'")
   })
 
   test('Given 两个 Agent 会话 When 分别写入和移除引用 Then 状态按 session 隔离', () => {

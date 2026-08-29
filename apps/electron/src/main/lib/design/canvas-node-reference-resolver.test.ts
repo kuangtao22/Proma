@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { createEmptyCanvasDocument } from '@proma/shared'
 import type {
   AgentCanvasBinding,
@@ -143,6 +144,7 @@ describe('CanvasNodeReferenceResolver', () => {
     ['Design Agent 作为宿主', { session: createSession({ sourceDesignProjectId: 'project-1', sourceDesignJobId: 'job-1' }) }],
     ['Automation 作为宿主', { session: createSession({ sourceAutomationId: 'automation-1' }) }],
     ['会话已归档', { session: createSession({ archived: true }) }],
+    ['探索子会话作为宿主', { session: createSession({ explorationParentSessionId: 'parent-session' }) }],
   ])('Given %s When 发送 Then 以稳定公开错误拒绝', (_label, options) => {
     const { resolver } = createHarness(options)
 
@@ -207,5 +209,13 @@ describe('CanvasNodeReferenceResolver', () => {
       mode: 'latest',
       references: [createReference()],
     })).toThrow('CANVAS_REFERENCE_INVALID')
+  })
+
+  test('Given resolver 检查 Agent 资格 When 审计实现 Then 只复用 canonical helper', () => {
+    const source = readFileSync(new URL('./canvas-node-reference-resolver.ts', import.meta.url), 'utf8')
+
+    expect(source).toContain('isEligibleProjectAgent(session, session.workspaceId)')
+    expect(source).not.toContain('session.archived')
+    expect(source).not.toContain('session.explorationParentSessionId')
   })
 })

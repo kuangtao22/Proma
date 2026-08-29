@@ -2569,7 +2569,10 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       permissionModeOverride: permissionMode,
       ...(retryOfErrorUuid && { retryOfErrorUuid }),
       ...(lastUserSDKMessage._canvasNodeReferences?.length
-        ? { canvasNodeReferences: [...lastUserSDKMessage._canvasNodeReferences] }
+        ? {
+            canvasNodeReferences: [...lastUserSDKMessage._canvasNodeReferences],
+            canvasNodeReferenceMode: 'exact' as const,
+          }
         : {}),
     }).catch(console.error)
   }, [persistedSDKMessages, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, setAgentStreamErrors, setStreamingStates, setMessagesCache, permissionMode])

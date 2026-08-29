@@ -106,7 +106,9 @@ function resolveAgentCanvasReferencesForSend<T extends AgentSendInput | AgentQue
   /** Renderer 快照只作为定位输入，以下结果全部来自发送时权威文档。 */
   const resolved = canvasNodeReferenceResolver.resolveForSend({
     sessionId: input.sessionId,
-    mode: 'retryOfErrorUuid' in input && input.retryOfErrorUuid ? 'exact' : 'latest',
+    mode: 'canvasNodeReferenceMode' in input
+      ? input.canvasNodeReferenceMode ?? 'latest'
+      : 'latest',
     references: input.canvasNodeReferences,
   })
   /** 普通新 run 通过 extensions 进入 system prompt；queue-now 复用同一最小块。 */
