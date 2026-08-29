@@ -63,7 +63,7 @@ function createStore() {
     ...binding,
     linkedCanvasIds: [...binding.linkedCanvasIds],
   })
-  return {
+  const store = {
     listByProject: (projectId: string) => bindings
       .filter((binding) => binding.projectId === projectId)
       .map(copy),
@@ -154,6 +154,40 @@ function createStore() {
       return { bindings: bindings.filter((binding) => binding.projectId === projectId).map(copy), changes }
     },
   }
+  return {
+    ...store,
+    linkWithChange: (input: Parameters<typeof store.link>[0]) => {
+      const before = store.listByProject(input.projectId).find((binding) => binding.sessionId === input.sessionId) ?? null
+      const after = store.link(input)
+      return { before, after, changed: JSON.stringify(before) !== JSON.stringify(after) }
+    },
+    unlinkWithChange: (input: Parameters<typeof store.unlink>[0]) => {
+      const before = store.listByProject(input.projectId).find((binding) => binding.sessionId === input.sessionId) ?? null
+      const after = store.unlink(input)
+      return { before, after, changed: JSON.stringify(before) !== JSON.stringify(after) }
+    },
+    setDefaultWithChange: (input: Parameters<typeof store.setDefault>[0]) => {
+      const before = store.listByProject(input.projectId).find((binding) => binding.sessionId === input.sessionId) ?? null
+      const after = store.setDefault(input)
+      return { before, after, changed: JSON.stringify(before) !== JSON.stringify(after) }
+    },
+    clearSessionWithChanges: (projectId: string, sessionId: string) => {
+      const before = store.listByProject(projectId).find((binding) => binding.sessionId === sessionId) ?? null
+      store.clearSession(projectId, sessionId)
+      return before ? [{ sessionId, cause: 'session-cleared' as const, binding: null }] : []
+    },
+    clearCanvasWithChanges: (projectId: string, canvasId: string) => {
+      const before = store.listByProject(projectId)
+      store.clearCanvas(projectId, canvasId)
+      const after = new Map(store.listByProject(projectId).map((binding) => [binding.sessionId, binding]))
+      return before.flatMap((binding) => {
+        const current = after.get(binding.sessionId) ?? null
+        return JSON.stringify(binding) === JSON.stringify(current)
+          ? []
+          : [{ sessionId: binding.sessionId, cause: 'canvas-cleared' as const, binding: current }]
+      })
+    },
+  }
 }
 
 /** 测试默认让全部关联 mutation 通过项目写守卫。 */
@@ -208,12 +242,12 @@ describe('Agent-画布关联 IPC', () => {
       linkedCanvasIds: ['canvas-1'], lastActiveCanvasId: 'canvas-1', updatedAt: 1,
     }
     const store = {
-      listByProject: () => binding ? [binding] : [],
-      clearSession: (projectId: string, sessionId: string) => {
+      clearSessionWithChanges: (projectId: string, sessionId: string) => {
         cleared.push({ projectId, sessionId })
         binding = null
+        return [{ sessionId, cause: 'session-cleared' as const, binding: null }]
       },
-      clearCanvas: () => undefined,
+      clearCanvasWithChanges: () => [],
     }
 
     expect(cleanupDeletedAgentSessionCanvasBindings({ ...createCleanupMutationDependency(), store, broadcast: () => undefined }, createAgentSession())).toBeUndefined()
@@ -236,9 +270,8 @@ describe('Agent-画布关联 IPC', () => {
       linkedCanvasIds: ['canvas-1'], lastActiveCanvasId: 'canvas-1', updatedAt: 1,
     }
     const preCommitFailure = {
-      listByProject: () => [bindingValue],
-      clearSession: () => { throw new Error('/private/precommit-path') },
-      clearCanvas: () => { throw new Error('/private/store-path') },
+      clearSessionWithChanges: () => { throw new Error('/private/precommit-path') },
+      clearCanvasWithChanges: () => { throw new Error('/private/store-path') },
     }
     expect(() => cleanupDeletedAgentSessionCanvasBindings(
       { ...createCleanupMutationDependency(), store: preCommitFailure, broadcast: () => undefined },
@@ -246,9 +279,8 @@ describe('Agent-画布关联 IPC', () => {
     )).not.toThrow()
     let committed = true
     const postCommitFailure = {
-      listByProject: () => committed ? [bindingValue] : [],
-      clearSession: () => { committed = false; throw new Error('/private/postcommit-path') },
-      clearCanvas: () => undefined,
+      clearSessionWithChanges: () => { committed = false; throw new Error('/private/postcommit-path') },
+      clearCanvasWithChanges: () => [],
     }
     expect(() => cleanupDeletedAgentSessionCanvasBindings(
       { ...createCleanupMutationDependency(), store: postCommitFailure, broadcast: () => undefined },
@@ -381,11 +413,11 @@ describe('Agent-画布关联 IPC', () => {
       ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => handlers.delete(channel) },
       store: {
         listByProject: () => [stale],
-        link: () => stale,
-        unlink: () => stale,
-        setDefault: () => stale,
-        clearSession: () => { throw new Error('/private/store-path') },
-        clearCanvas: () => undefined,
+        linkWithChange: () => ({ before: null, after: stale, changed: true }),
+        unlinkWithChange: () => ({ before: stale, after: stale, changed: false }),
+        setDefaultWithChange: () => ({ before: stale, after: stale, changed: false }),
+        clearSessionWithChanges: () => { throw new Error('/private/store-path') },
+        clearCanvasWithChanges: () => [],
         reconcileProject: () => { throw new Error('/private/store-path') },
       },
       getAgentSession: () => null,
@@ -522,6 +554,159 @@ describe('Agent-画布关联 IPC', () => {
       projectId: 'project-1', sessionId: 'session-2', cause: 'canvas-cleared',
       binding: expect.objectContaining({ linkedCanvasIds: ['canvas-2'] }),
     }])
+  })
+
+  test('Given 双 Store 缓存错位 When link、unlink、default 与删除清理 Then 只按 fresh 提交事实精确广播', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'proma-agent-canvas-ipc-multi-store-'))
+    const configPath = join(directory, 'agent-canvas-bindings.json')
+    const storeA = new AgentCanvasBindingStore({ configPath, now: () => 20 })
+    const storeB = new AgentCanvasBindingStore({ configPath, now: () => 30 })
+    expect(storeA.listByProject('project-1')).toEqual([])
+    const handlers = new Map<string, TestHandler>()
+    const events: AgentCanvasBindingChangeEvent[] = []
+    registerAgentCanvasBindingIpcHandlers({
+      ...createProjectMutationDependencies(),
+      ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => handlers.delete(channel) },
+      store: storeA,
+      getAgentSession: (sessionId) => createAgentSession(sessionId),
+      listCanvasSessions: () => [createCanvasSession(), createCanvasSession('canvas-2')],
+      assertSenderProjectAccess: () => undefined,
+      broadcast: (event) => events.push(event),
+    })
+    const sender = createSender(1)
+    try {
+      storeB.link({ projectId: 'project-1', sessionId: 'session-clear', canvasId: 'canvas-1', makeDefault: false })
+      cleanupDeletedAgentSessionCanvasBindings({
+        store: storeA,
+        broadcast: (event) => events.push(event),
+        runProjectMutation: (_projectId, effect) => effect(),
+      }, createAgentSession('session-clear'))
+      expect(events.splice(0)).toEqual([{
+        projectId: 'project-1', sessionId: 'session-clear', cause: 'session-cleared', binding: null,
+      }])
+      expect(new AgentCanvasBindingStore({ configPath }).listByProject('project-1')).toEqual([])
+
+      storeB.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false })
+      await invoke(handlers, CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS, sender, {
+        projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false,
+      })
+      expect(events.splice(0)).toEqual([])
+
+      storeB.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-2', makeDefault: false })
+      await invoke(handlers, CANVAS_IPC_CHANNELS.UNLINK_AGENT_CANVAS, sender, {
+        projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-2',
+      })
+      expect(events.splice(0).map((event) => event.cause)).toEqual(['unlinked'])
+
+      storeB.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-2', makeDefault: true })
+      await invoke(handlers, CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS, sender, {
+        projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1',
+      })
+      expect(events.splice(0)).toEqual([expect.objectContaining({
+        sessionId: 'session-1', cause: 'default-changed',
+        binding: expect.objectContaining({ defaultCanvasId: 'canvas-1' }),
+      })])
+
+      storeB.link({ projectId: 'project-1', sessionId: 'session-2', canvasId: 'canvas-1', makeDefault: false })
+      cleanupDeletedCanvasBindings({
+        store: storeA,
+        broadcast: (event) => events.push(event),
+        runProjectMutation: (_projectId, effect) => effect(),
+      }, 'project-1', 'canvas-1')
+      expect(events.splice(0)).toEqual([expect.objectContaining({
+        sessionId: 'session-1', cause: 'canvas-cleared',
+        binding: expect.objectContaining({ linkedCanvasIds: ['canvas-2'] }),
+      }), {
+        projectId: 'project-1', sessionId: 'session-2', cause: 'canvas-cleared', binding: null,
+      }])
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 项目写守卫拒绝 When 调用五个 handler Then legacy、Store 与广播均零副作用', async () => {
+    const handlers = new Map<string, TestHandler>()
+    const effects: string[] = []
+    const store = createStore()
+    registerAgentCanvasBindingIpcHandlers({
+      ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => handlers.delete(channel) },
+      store: new Proxy(store, {
+        get: (target, property, receiver) => {
+          const value = Reflect.get(target, property, receiver)
+          if (typeof value !== 'function') return value
+          return (...args: unknown[]) => {
+            effects.push(`store:${String(property)}`)
+            return value(...args)
+          }
+        },
+      }),
+      getAgentSession: () => createAgentSession(),
+      listCanvasSessions: () => { effects.push('canvas-list'); return [createCanvasSession()] },
+      ensureLegacyCanvasSession: () => { effects.push('legacy') },
+      getProjectReadOnlyReason: () => undefined,
+      runProjectMutation: () => { effects.push('guard'); throw new Error('项目迁移中') },
+      assertSenderProjectAccess: () => undefined,
+      broadcast: () => { effects.push('broadcast') },
+    })
+    const sender = createSender(1)
+    const calls: Array<[string, unknown]> = [
+      [CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS, { projectId: 'project-1' }],
+      [CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false }],
+      [CANVAS_IPC_CHANNELS.UNLINK_AGENT_CANVAS, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }],
+      [CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }],
+      [CANVAS_IPC_CHANNELS.CLEAR_AGENT_BINDINGS, { projectId: 'project-1', target: 'session', sessionId: 'session-1' }],
+    ]
+    for (const [channel, input] of calls) {
+      expect((await invoke(handlers, channel, sender, input)).ok).toBe(false)
+    }
+    expect(effects).toEqual(['guard', 'guard', 'guard', 'guard', 'guard'])
+  })
+
+  test('Given 删除 helper 的项目守卫拒绝 When 清理 Then best-effort 返回且 Store 与广播零调用', () => {
+    const effects: string[] = []
+    const options = {
+      store: {
+        clearSessionWithChanges: () => { effects.push('store-session'); return [] },
+        clearCanvasWithChanges: () => { effects.push('store-canvas'); return [] },
+      },
+      broadcast: () => { effects.push('broadcast') },
+      runProjectMutation: () => { effects.push('guard'); throw new Error('项目迁移中') },
+    }
+    expect(() => cleanupDeletedAgentSessionCanvasBindings(options, createAgentSession())).not.toThrow()
+    expect(() => cleanupDeletedCanvasBindings(options, 'project-1', 'canvas-1')).not.toThrow()
+    expect(effects).toEqual(['guard', 'guard'])
+  })
+
+  test('Given 项目只读 When LIST Then 不投影 legacy、不进入 guard、不写盘且返回实时过滤视图', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'proma-agent-canvas-ipc-readonly-'))
+    const configPath = join(directory, 'agent-canvas-bindings.json')
+    const store = new AgentCanvasBindingStore({ configPath, now: () => 10 })
+    store.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false })
+    store.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-stale', makeDefault: false })
+    const before = readFileSync(configPath, 'utf8')
+    const handlers = new Map<string, TestHandler>()
+    const effects: string[] = []
+    registerAgentCanvasBindingIpcHandlers({
+      ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => handlers.delete(channel) },
+      store,
+      getAgentSession: () => createAgentSession(),
+      listCanvasSessions: () => [createCanvasSession()],
+      ensureLegacyCanvasSession: () => { effects.push('legacy') },
+      getProjectReadOnlyReason: () => '项目只读',
+      runProjectMutation: () => { effects.push('guard'); throw new Error('不应进入') },
+      assertSenderProjectAccess: () => undefined,
+      broadcast: () => { effects.push('broadcast') },
+    })
+    try {
+      expect(await invoke(handlers, CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS, createSender(1), { projectId: 'project-1' })).toEqual({
+        ok: true,
+        value: [expect.objectContaining({ linkedCanvasIds: ['canvas-1'] })],
+      })
+      expect(effects).toEqual([])
+      expect(readFileSync(configPath, 'utf8')).toBe(before)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
   })
 
   test('Given 未授权、销毁窗口、内部或跨项目身份 When 调用 Then fail closed 且 Store 无变化', async () => {

@@ -55,6 +55,13 @@ export interface AgentCanvasBindingReconcileResult {
   changes: AgentCanvasBindingReconcileChange[]
 }
 
+/** 单身份 mutation 在同一 fresh snapshot 上得到的提交事实。 */
+export interface AgentCanvasBindingMutationResult {
+  before: AgentCanvasBinding | null
+  after: AgentCanvasBinding | null
+  changed: boolean
+}
+
 /** Store 可替换的文件系统、时间与日志依赖。 */
 export interface AgentCanvasBindingStoreDependencies {
   /** 关联索引文件路径；默认位于当前业务配置根。 */
@@ -157,6 +164,11 @@ export class AgentCanvasBindingStore {
    * @returns 变更后的隔离关联副本。
    */
   link(rawInput: LinkAgentCanvasInput): AgentCanvasBinding {
+    return this.linkWithChange(rawInput).after!
+  }
+
+  /** 在同一 fresh snapshot 内建立关联并返回提交前后事实。 */
+  linkWithChange(rawInput: LinkAgentCanvasInput): AgentCanvasBindingMutationResult {
     /** 共享边界严格解析后的关联命令。 */
     const input = parseLinkAgentCanvasInput(rawInput)
     /** fresh 磁盘快照与隔离候选，避免长期缓存参与写入。 */
@@ -165,12 +177,13 @@ export class AgentCanvasBindingStore {
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
     /** 命中时用于判断重复操作或默认切换的现有记录。 */
     const existing = index < 0 ? null : bindings[index]!
+    const before = existing ? copyBinding(existing) : null
 
     if (existing?.linkedCanvasIds.includes(input.canvasId)) {
       if (!input.makeDefault
         || (existing.defaultCanvasId === input.canvasId
           && existing.lastActiveCanvasId === input.canvasId)) {
-        return copyBinding(existing)
+        return { before, after: copyBinding(existing), changed: false }
       }
       /** makeDefault=true 必须同步默认与最近画布。 */
       const updated: AgentCanvasBinding = {
@@ -181,7 +194,7 @@ export class AgentCanvasBindingStore {
       }
       bindings[index] = updated
       this.persist(bindings, snapshot)
-      return copyBinding(updated)
+      return { before, after: copyBinding(updated), changed: true }
     }
 
     /** 首次或追加关联后的稳定画布顺序。 */
@@ -206,7 +219,7 @@ export class AgentCanvasBindingStore {
     if (index < 0) bindings.push(updated)
     else bindings[index] = updated
     this.persist(bindings, snapshot)
-    return copyBinding(updated)
+    return { before, after: copyBinding(updated), changed: true }
   }
 
   /**
@@ -215,22 +228,30 @@ export class AgentCanvasBindingStore {
    * @returns 变更后副本；最后一个关联移除后返回 null。
    */
   unlink(rawInput: UnlinkAgentCanvasInput): AgentCanvasBinding | null {
+    return this.unlinkWithChange(rawInput).after
+  }
+
+  /** 在同一 fresh snapshot 内解除关联并返回提交前后事实。 */
+  unlinkWithChange(rawInput: UnlinkAgentCanvasInput): AgentCanvasBindingMutationResult {
     /** 共享边界严格解析后的解除命令。 */
     const input = parseUnlinkAgentCanvasInput(rawInput)
     /** fresh 磁盘快照与隔离候选，避免长期缓存参与写入。 */
     const { snapshot, bindings } = this.prepareMutation()
     /** 目标记录位置。 */
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
-    if (index < 0) return null
+    if (index < 0) return { before: null, after: null, changed: false }
     /** 当前目标记录。 */
     const existing = bindings[index]!
-    if (!existing.linkedCanvasIds.includes(input.canvasId)) return copyBinding(existing)
+    const before = copyBinding(existing)
+    if (!existing.linkedCanvasIds.includes(input.canvasId)) {
+      return { before, after: copyBinding(existing), changed: false }
+    }
     /** 删除目标后保留首现顺序的关联画布。 */
     const linkedCanvasIds = existing.linkedCanvasIds.filter((canvasId) => canvasId !== input.canvasId)
     if (linkedCanvasIds.length === 0) {
       bindings.splice(index, 1)
       this.persist(bindings, snapshot)
-      return null
+      return { before, after: null, changed: true }
     }
     /** 若默认被删除则稳定回退到剩余首项。 */
     const defaultCanvasId = existing.defaultCanvasId === input.canvasId
@@ -250,7 +271,7 @@ export class AgentCanvasBindingStore {
     }
     bindings[index] = updated
     this.persist(bindings, snapshot)
-    return copyBinding(updated)
+    return { before, after: copyBinding(updated), changed: true }
   }
 
   /**
@@ -259,6 +280,11 @@ export class AgentCanvasBindingStore {
    * @returns 更新后的隔离关联副本。
    */
   setDefault(rawInput: SetDefaultAgentCanvasInput): AgentCanvasBinding {
+    return this.setDefaultWithChange(rawInput).after!
+  }
+
+  /** 在同一 fresh snapshot 内切换默认画布并返回提交前后事实。 */
+  setDefaultWithChange(rawInput: SetDefaultAgentCanvasInput): AgentCanvasBindingMutationResult {
     /** 共享边界严格解析后的默认切换命令。 */
     const input = parseSetDefaultAgentCanvasInput(rawInput)
     /** fresh 磁盘快照与隔离候选，避免长期缓存参与写入。 */
@@ -272,7 +298,7 @@ export class AgentCanvasBindingStore {
     }
     if (existing.defaultCanvasId === input.canvasId
       && existing.lastActiveCanvasId === input.canvasId) {
-      return copyBinding(existing)
+      return { before: copyBinding(existing), after: copyBinding(existing), changed: false }
     }
     /** 默认切换后的规范化记录。 */
     const updated: AgentCanvasBinding = {
@@ -283,7 +309,7 @@ export class AgentCanvasBindingStore {
     }
     bindings[index] = updated
     this.persist(bindings, snapshot)
-    return copyBinding(updated)
+    return { before: copyBinding(existing), after: copyBinding(updated), changed: true }
   }
 
   /**
@@ -292,6 +318,14 @@ export class AgentCanvasBindingStore {
    * @param sessionId 普通 Agent 会话稳定 ID。
    */
   clearSession(projectId: string, sessionId: string): void {
+    this.clearSessionWithChanges(projectId, sessionId)
+  }
+
+  /** 在同一 fresh snapshot 内清理会话并返回已提交变化。 */
+  clearSessionWithChanges(
+    projectId: string,
+    sessionId: string,
+  ): AgentCanvasBindingReconcileChange[] {
     /** 共享清理合同验证后的会话目标。 */
     const input = parseClearAgentCanvasBindingsInput({ projectId, target: 'session', sessionId })
     if (input.target !== 'session') throw new Error('CLEAR_AGENT_CANVAS_BINDINGS_INPUT_INVALID')
@@ -299,9 +333,11 @@ export class AgentCanvasBindingStore {
     const { snapshot, bindings } = this.prepareMutation()
     /** 目标记录位置。 */
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
-    if (index < 0) return
+    if (index < 0) return []
+    const existing = bindings[index]!
     bindings.splice(index, 1)
     this.persist(bindings, snapshot)
+    return [{ sessionId: existing.sessionId, cause: 'session-cleared', binding: null }]
   }
 
   /**
@@ -310,6 +346,14 @@ export class AgentCanvasBindingStore {
    * @param canvasId 画布稳定 ID。
    */
   clearCanvas(projectId: string, canvasId: string): void {
+    this.clearCanvasWithChanges(projectId, canvasId)
+  }
+
+  /** 在同一 fresh snapshot 内清理画布并返回全部已提交变化。 */
+  clearCanvasWithChanges(
+    projectId: string,
+    canvasId: string,
+  ): AgentCanvasBindingReconcileChange[] {
     /** 共享清理合同验证后的画布目标。 */
     const input = parseClearAgentCanvasBindingsInput({ projectId, target: 'canvas', canvasId })
     if (input.target !== 'canvas') throw new Error('CLEAR_AGENT_CANVAS_BINDINGS_INPUT_INVALID')
@@ -319,6 +363,8 @@ export class AgentCanvasBindingStore {
     let changed = false
     /** 同一次清理对所有保留记录使用一致时间戳。 */
     let timestamp: number | null = null
+    /** 本轮按 fresh 身份顺序收集的精确提交变化。 */
+    const changes: AgentCanvasBindingReconcileChange[] = []
 
     for (let index = bindings.length - 1; index >= 0; index -= 1) {
       /** 当前候选记录。 */
@@ -332,6 +378,7 @@ export class AgentCanvasBindingStore {
       )
       if (linkedCanvasIds.length === 0) {
         bindings.splice(index, 1)
+        changes.push({ sessionId: existing.sessionId, cause: 'canvas-cleared', binding: null })
         continue
       }
       /** 被清理默认画布的稳定替代项。 */
@@ -343,15 +390,19 @@ export class AgentCanvasBindingStore {
         ? defaultCanvasId
         : existing.lastActiveCanvasId ?? defaultCanvasId
       timestamp ??= this.now()
-      bindings[index] = {
+      const updated: AgentCanvasBinding = {
         ...copyBinding(existing),
         defaultCanvasId,
         linkedCanvasIds,
         lastActiveCanvasId,
         updatedAt: timestamp,
       }
+      bindings[index] = updated
+      changes.push({ sessionId: existing.sessionId, cause: 'canvas-cleared', binding: copyBinding(updated) })
     }
     if (changed) this.persist(bindings, snapshot)
+    changes.reverse()
+    return changes
   }
 
   /**

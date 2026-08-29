@@ -36,7 +36,14 @@ export interface AgentCanvasBindingIpcRegistrar {
 /** 注册 Agent-Canvas 关联 IPC 所需的窄依赖。 */
 export interface RegisterAgentCanvasBindingIpcOptions {
   ipcMain: AgentCanvasBindingIpcRegistrar
-  store: Pick<AgentCanvasBindingStore, 'listByProject' | 'link' | 'unlink' | 'setDefault' | 'clearSession' | 'clearCanvas' | 'reconcileProject'>
+  store: Pick<AgentCanvasBindingStore,
+    | 'listByProject'
+    | 'linkWithChange'
+    | 'unlinkWithChange'
+    | 'setDefaultWithChange'
+    | 'clearSessionWithChanges'
+    | 'clearCanvasWithChanges'
+    | 'reconcileProject'>
   getAgentSession: (sessionId: string) => AgentSessionMeta | null | undefined
   /** 纯读列出已有 Canvas 索引，不得隐式投影 legacy 会话。 */
   listCanvasSessions: (projectId: string) => CanvasSessionMeta[]
@@ -111,7 +118,7 @@ function isEligibleProjectAgent(session: AgentSessionMeta, projectId: string): b
 
 /** 清理关联及广播所需的最小生命周期依赖。 */
 export interface AgentCanvasBindingCleanupOptions {
-  store: Pick<AgentCanvasBindingStore, 'listByProject' | 'clearSession' | 'clearCanvas'>
+  store: Pick<AgentCanvasBindingStore, 'clearSessionWithChanges' | 'clearCanvasWithChanges'>
   broadcast: (event: AgentCanvasBindingChangeEvent) => void
   /** 删除后清理同样必须进入项目写守卫。 */
   runProjectMutation: <T>(projectId: string, effect: () => T) => T
@@ -129,27 +136,19 @@ function broadcastChangeSafely(
   }
 }
 
-/** 对单个 session 或 canvas 执行前后差异清理并广播精确受影响身份。 */
+/** 对单个 session 或 canvas 广播 Store 同快照返回的已提交变化。 */
 export function clearAgentCanvasBindingsWithEvents(
   options: AgentCanvasBindingCleanupOptions,
   input: { projectId: string; target: 'session'; sessionId: string }
     | { projectId: string; target: 'canvas'; canvasId: string },
 ): void {
-  const before = parseListAgentCanvasBindingsResult(options.store.listByProject(input.projectId))
-  if (input.target === 'session') options.store.clearSession(input.projectId, input.sessionId)
-  else options.store.clearCanvas(input.projectId, input.canvasId)
-  const afterBySession = new Map(
-    parseListAgentCanvasBindingsResult(options.store.listByProject(input.projectId))
-      .map((binding) => [binding.sessionId, binding]),
-  )
-  for (const previous of before) {
-    const current = afterBySession.get(previous.sessionId) ?? null
-    if (current && bindingsEqual(previous, current)) continue
+  const changes = input.target === 'session'
+    ? options.store.clearSessionWithChanges(input.projectId, input.sessionId)
+    : options.store.clearCanvasWithChanges(input.projectId, input.canvasId)
+  for (const change of changes) {
     broadcastChangeSafely(options, {
       projectId: input.projectId,
-      sessionId: previous.sessionId,
-      cause: input.target === 'session' ? 'session-cleared' : 'canvas-cleared',
-      binding: current,
+      ...change,
     })
   }
 }
@@ -214,26 +213,6 @@ function broadcastChange(
   event: AgentCanvasBindingChangeEvent,
 ): void {
   broadcastChangeSafely(options, event)
-}
-
-/** 比较可空关联事实，供幂等写操作抑制伪变化事件。 */
-function nullableBindingsEqual(
-  left: AgentCanvasBinding | null,
-  right: AgentCanvasBinding | null,
-): boolean {
-  if (left === null || right === null) return left === right
-  return bindingsEqual(left, right)
-}
-
-/** 判断清理前后记录是否发生公开业务变化。 */
-function bindingsEqual(left: AgentCanvasBinding, right: AgentCanvasBinding): boolean {
-  return left.projectId === right.projectId
-    && left.sessionId === right.sessionId
-    && left.defaultCanvasId === right.defaultCanvasId
-    && left.lastActiveCanvasId === right.lastActiveCanvasId
-    && left.updatedAt === right.updatedAt
-    && left.linkedCanvasIds.length === right.linkedCanvasIds.length
-    && left.linkedCanvasIds.every((canvasId, index) => canvasId === right.linkedCanvasIds[index])
 }
 
 /** LIST 前按实时 Agent/Canvas 权威事实移除陈旧关联。 */
@@ -317,16 +296,14 @@ export function registerAgentCanvasBindingIpcHandlers(
       const input = parseLinkAgentCanvasInput(value)
       await options.assertSenderProjectAccess(event.sender, input.projectId)
       requireWritableProject(input.projectId, options)
-      const { before, binding } = options.runProjectMutation(input.projectId, () => {
+      const mutation = options.runProjectMutation(input.projectId, () => {
         options.ensureLegacyCanvasSession(input.projectId)
         requireProjectAgent(input.sessionId, input.projectId, options)
         requireProjectCanvas(input.canvasId, input.projectId, options)
-        const before = options.store.listByProject(input.projectId).find(
-          (candidate) => candidate.sessionId === input.sessionId,
-        ) ?? null
-        return { before, binding: parseLinkAgentCanvasResult(options.store.link(input)) }
+        return options.store.linkWithChange(input)
       })
-      if (!nullableBindingsEqual(before, binding)) {
+      const binding = parseLinkAgentCanvasResult(mutation.after)
+      if (mutation.changed) {
         broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'linked', binding })
       }
       return binding
@@ -339,16 +316,14 @@ export function registerAgentCanvasBindingIpcHandlers(
       const input = parseUnlinkAgentCanvasInput(value)
       await options.assertSenderProjectAccess(event.sender, input.projectId)
       requireWritableProject(input.projectId, options)
-      const { before, binding } = options.runProjectMutation(input.projectId, () => {
+      const mutation = options.runProjectMutation(input.projectId, () => {
         options.ensureLegacyCanvasSession(input.projectId)
         requireProjectAgent(input.sessionId, input.projectId, options)
         requireProjectCanvas(input.canvasId, input.projectId, options)
-        const before = options.store.listByProject(input.projectId).find(
-          (candidate) => candidate.sessionId === input.sessionId,
-        ) ?? null
-        return { before, binding: parseUnlinkAgentCanvasResult(options.store.unlink(input)) }
+        return options.store.unlinkWithChange(input)
       })
-      if (!nullableBindingsEqual(before, binding)) {
+      const binding = parseUnlinkAgentCanvasResult(mutation.after)
+      if (mutation.changed) {
         broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'unlinked', binding })
       }
       return binding
@@ -361,16 +336,14 @@ export function registerAgentCanvasBindingIpcHandlers(
       const input = parseSetDefaultAgentCanvasInput(value)
       await options.assertSenderProjectAccess(event.sender, input.projectId)
       requireWritableProject(input.projectId, options)
-      const { before, binding } = options.runProjectMutation(input.projectId, () => {
+      const mutation = options.runProjectMutation(input.projectId, () => {
         options.ensureLegacyCanvasSession(input.projectId)
         requireProjectAgent(input.sessionId, input.projectId, options)
         requireProjectCanvas(input.canvasId, input.projectId, options)
-        const before = options.store.listByProject(input.projectId).find(
-          (candidate) => candidate.sessionId === input.sessionId,
-        ) ?? null
-        return { before, binding: parseSetDefaultAgentCanvasResult(options.store.setDefault(input)) }
+        return options.store.setDefaultWithChange(input)
       })
-      if (!nullableBindingsEqual(before, binding)) {
+      const binding = parseSetDefaultAgentCanvasResult(mutation.after)
+      if (mutation.changed) {
         broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'default-changed', binding })
       }
       return binding
