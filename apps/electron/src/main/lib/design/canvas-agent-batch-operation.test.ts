@@ -37,6 +37,8 @@ function createFixture(options: {
   let maxActiveMutations = 0
   const publicationAttempts: number[] = []
   const publishedRevisions: number[] = []
+  /** 记录 Agent session 探测，证明身份冲突在任何外部资源读取前拒绝。 */
+  const agentSessionInspections: string[] = []
   /** 模拟生产 IPC 注入的按 Canvas 共享串行器。 */
   const tails = new Map<string, Promise<void>>()
   const store = {
@@ -129,7 +131,10 @@ function createFixture(options: {
       },
     },
     agentNodeCreation: {
-      inspectBatchSession: (input) => ({ exists: sessions.has(input.sessionId) }),
+      inspectBatchSession: (input) => {
+        agentSessionInspections.push(input.sessionId)
+        return { exists: sessions.has(input.sessionId) }
+      },
       prepareBatchSession: (input) => {
         events.push(`prepare:${input.sessionId}`)
         const existing = sessions.get(input.sessionId)
@@ -154,6 +159,7 @@ function createFixture(options: {
     sessions,
     publicationAttempts,
     publishedRevisions,
+    agentSessionInspections,
     getDocument: () => document,
     getMutateCalls: () => mutateCalls,
     getMaxActiveMutations: () => maxActiveMutations,
@@ -191,6 +197,7 @@ describe('CanvasAgentBatchOperationService', () => {
     expect(result.document.edges).toHaveLength(2)
     expect(fixture.getMutateCalls()).toBe(1)
     expect([...fixture.intents.values()][0]?.state).toBe('committed')
+    expect(fixture.agentSessionInspections).toEqual(['session-agent-1'])
   })
 
   test('Given 第二个内容目录 prepare 失败 When 执行 Then 清理第一项且图零提交', async () => {
@@ -378,6 +385,76 @@ describe('CanvasAgentBatchOperationService', () => {
     expect(fixture.contents.has(contentId)).toBe(true)
     expect(fixture.trash.size).toBe(0)
     expect(fixture.getDocument().nodes.map((node) => node.id)).toEqual([next.id])
+  })
+
+  test('Given Agent session 归属节点 A When 同批删除 A 并由 B 复用 Then intent 与 inspect 前拒绝', async () => {
+    const fixture = createFixture()
+    fixture.getDocument().nodes.push({
+      id: 'agent-a', kind: 'agent', title: 'Agent A', position: { x: 0, y: 0 }, agentSessionId: 'shared-agent-session',
+    })
+    fixture.sessions.set('shared-agent-session', {
+      id: 'shared-agent-session', title: 'Agent A', createdAt: 1, updatedAt: 1,
+      workspaceId: target.projectId, sourceCanvasProjectId: target.projectId,
+      sourceCanvasId: target.canvasId, sourceCanvasNodeId: 'agent-a',
+    } as AgentSessionMeta)
+
+    await expect(fixture.service.execute({
+      ...batch(),
+      operations: [
+        { type: 'remove-nodes', nodeIds: ['agent-a'] },
+        { type: 'upsert-nodes', nodes: [{
+          id: 'agent-b', kind: 'agent', title: 'Agent B', position: { x: 1, y: 1 }, agentSessionId: 'shared-agent-session',
+        }] },
+      ],
+    })).rejects.toThrow('CANVAS_BATCH_AGENT_SESSION_IDENTITY_CONFLICT')
+
+    expect(fixture.getDocument().revision).toBe(7)
+    expect(fixture.getDocument().nodes.map((node) => node.id)).toEqual(['agent-a'])
+    expect(fixture.intents.size).toBe(0)
+    expect(fixture.agentSessionInspections).toEqual([])
+    expect(fixture.events).toEqual([])
+    expect(fixture.getMutateCalls()).toBe(0)
+  })
+
+  test('Given 同图两个 Agent 节点共享 session When 规划任意批次 Then intent 前拒绝', async () => {
+    const fixture = createFixture()
+    fixture.getDocument().nodes.push(
+      { id: 'agent-duplicate-a', kind: 'agent', title: 'A', position: { x: 0, y: 0 }, agentSessionId: 'duplicate-session' },
+      { id: 'agent-duplicate-b', kind: 'agent', title: 'B', position: { x: 1, y: 1 }, agentSessionId: 'duplicate-session' },
+    )
+
+    await expect(fixture.service.execute({
+      ...batch(), operations: [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
+    })).rejects.toThrow('CANVAS_BATCH_AGENT_SESSION_IDENTITY_CONFLICT')
+
+    expect(fixture.getDocument().revision).toBe(7)
+    expect(fixture.intents.size).toBe(0)
+    expect(fixture.agentSessionInspections).toEqual([])
+    expect(fixture.events).toEqual([])
+    expect(fixture.getMutateCalls()).toBe(0)
+  })
+
+  test('Given Agent session 仍绑定同一节点 When 更新标题与位置 Then 合法提交并保留 session', async () => {
+    const fixture = createFixture()
+    fixture.getDocument().nodes.push({
+      id: 'agent-stable', kind: 'agent', title: '旧标题', position: { x: 0, y: 0 }, agentSessionId: 'stable-session',
+    })
+    fixture.sessions.set('stable-session', {
+      id: 'stable-session', title: '旧标题', createdAt: 1, updatedAt: 1,
+      workspaceId: target.projectId, sourceCanvasProjectId: target.projectId,
+      sourceCanvasId: target.canvasId, sourceCanvasNodeId: 'agent-stable',
+    } as AgentSessionMeta)
+
+    const result = await fixture.service.execute({
+      ...batch(), operations: [{ type: 'upsert-nodes', nodes: [{
+        id: 'agent-stable', kind: 'agent', title: '新标题', position: { x: 4, y: 5 }, agentSessionId: 'stable-session',
+      }] }],
+    })
+
+    expect(result.document.revision).toBe(8)
+    expect(result.document.nodes[0]).toMatchObject({ id: 'agent-stable', title: '新标题', position: { x: 4, y: 5 } })
+    expect(fixture.sessions.has('stable-session')).toBe(true)
+    expect(fixture.agentSessionInspections).toEqual([])
   })
 
   test('Given 两个节点共享同一内容 When 只删除一个引用 Then 内容仍保持活动', async () => {

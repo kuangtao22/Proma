@@ -252,12 +252,44 @@ function assertContentResourceKinds(documents: CanvasDocument[]): void {
   }
 }
 
+/** 构建 Agent session 的唯一节点所有权；同图重复绑定必须 fail closed。 */
+function indexAgentSessionOwners(document: CanvasDocument): Map<string, string> {
+  /** sessionId 到唯一 nodeId 的当前文档所有权索引。 */
+  const owners = new Map<string, string>()
+  for (const node of document.nodes) {
+    if (node.kind !== 'agent') continue
+    /** 已登记节点用于识别同一 session 的第二个所有者。 */
+    const existingNodeId = owners.get(node.agentSessionId)
+    if (existingNodeId !== undefined && existingNodeId !== node.id) {
+      throw new Error('CANVAS_BATCH_AGENT_SESSION_IDENTITY_CONFLICT')
+    }
+    owners.set(node.agentSessionId, node.id)
+  }
+  return owners
+}
+
+/** Agent session 只能保留在原节点，禁止按内容资源语义共享或转移。 */
+function assertAgentSessionIdentities(baseDocument: CanvasDocument, expectedDocument: CanvasDocument): void {
+  /** 基线所有权是 session 不可转移的比较起点。 */
+  const baseOwners = indexAgentSessionOwners(baseDocument)
+  /** 最终所有权同时负责验证计划结果内部唯一。 */
+  const finalOwners = indexAgentSessionOwners(expectedDocument)
+  for (const [sessionId, baseNodeId] of baseOwners) {
+    /** session 被删除时允许缺失；仍存在时必须继续属于原节点。 */
+    const finalNodeId = finalOwners.get(sessionId)
+    if (finalNodeId !== undefined && finalNodeId !== baseNodeId) {
+      throw new Error('CANVAS_BATCH_AGENT_SESSION_IDENTITY_CONFLICT')
+    }
+  }
+}
+
 /** 拒绝资源所有权无法用单一净差异安全表达的节点身份变换。 */
 function assertSupportedNodeTransitions(
   operations: CanvasMutation[],
   baseDocument: CanvasDocument,
   expectedDocument: CanvasDocument,
 ): void {
+  assertAgentSessionIdentities(baseDocument, expectedDocument)
   assertContentResourceKinds([baseDocument, expectedDocument])
   const removedNodeIds = new Set<string>()
   for (const operation of operations) {
