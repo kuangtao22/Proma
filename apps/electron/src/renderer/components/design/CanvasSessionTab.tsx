@@ -1,8 +1,6 @@
 import * as React from 'react'
 import type { CanvasSessionMeta } from '@proma/shared'
-import { useAtomValue } from 'jotai'
 import { Workflow } from 'lucide-react'
-import { interfaceVariantAtom } from '@/atoms/theme'
 import { cn } from '@/lib/utils'
 
 export interface CanvasSessionTabProps {
@@ -20,9 +18,6 @@ export function CanvasSessionTab({
   active,
   onActivate,
 }: CanvasSessionTabProps): React.ReactElement {
-  /** 当前界面样式决定标签圆角和背景规则。 */
-  const isClassic = useAtomValue(interfaceVariantAtom) === 'classic'
-
   return (
     <div className="relative min-w-[148px] max-w-[260px] flex-[1_0_148px] titlebar-no-drag">
       <button
@@ -31,16 +26,11 @@ export function CanvasSessionTab({
         aria-selected={active}
         data-active={active}
         className={cn(
-          'group relative flex h-[34px] w-full items-center gap-1.5 border border-b-0 border-transparent px-3',
-          isClassic ? 'rounded-t-lg' : 'rounded-none',
+          'group relative flex h-[34px] w-full items-center gap-1.5 rounded-none border border-b-0 border-transparent px-3',
           'cursor-pointer select-none text-xs transition-colors',
           active
-            ? isClassic
-              ? 'bg-content-area text-foreground border-border/50'
-              : 'app-tab-active text-foreground border-border/80'
-            : isClassic
-              ? 'text-muted-foreground hover:bg-muted/50 hover:text-foreground'
-              : 'app-tab-inactive text-muted-foreground hover:text-foreground',
+            ? 'app-tab-active text-foreground border-border/80'
+            : 'app-tab-inactive text-muted-foreground hover:text-foreground',
         )}
         onClick={onActivate}
       >

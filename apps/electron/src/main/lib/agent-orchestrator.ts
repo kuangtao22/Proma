@@ -19,7 +19,7 @@ import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { accessSync, constants, existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { app } from 'electron'
-import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
+import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, AgentActiveSessionSnapshot, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
 import {
   PROMA_DEFAULT_PERMISSION_MODE,
   PROMA_PERMISSION_MODE_CONFIG,
@@ -49,6 +49,7 @@ import pkg from '../../../package.json' with { type: 'json' }
 import { getEffectiveProxyUrl } from './proxy-settings-service'
 import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, removeSDKErrorMessage, updateSDKUserMessageSkillActivations, rewindPiAgentSession, resolveAgentCwd, getActiveWorktreePath, getAgentCwdMode, getSessionWorkbenchLayout } from './agent-session-manager'
 import { getAgentWorkspace, getLocalProjectRootStatus, getProjectFilesPath, getWorkspaceMcpConfig, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles, getWorkspaceAgentsMdPath, readWorkspaceAgentsMd, getWorkspaceMemoryGuidance, isWorkspaceProjectKnowledgeMaintenanceApproved } from './agent-workspace-manager'
+import { getMcpOAuthHeaders } from './mcp-oauth-service'
 import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceSkillsDir } from './config-paths'
 import { getRuntimeStatus } from './runtime-init'
 import { getSettings } from './settings-service'
@@ -66,6 +67,7 @@ import { createRunToolCallLimiter, denyToolOutsideRunAllowlist } from './agent-r
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
+import { getAgentVaultRoots, getVaultUserContext } from './vault-service'
 import { buildPiMcpTools } from './adapters/pi-mcp-tools'
 import { buildAgentRuntimeEnv, type AgentRuntimeEnv } from './agent-runtime-env'
 import { isVisibleRunMessage } from './agent-run-message-visibility'
@@ -100,6 +102,7 @@ const workspaceOperationGuard = createWorkspaceOperationGuard({
   getWorkspaceIdBySlug: () => undefined,
   getWorkspaceOperationBlockReason,
 })
+import { resolveRuntimeAdditionalDirectories } from './agent-orchestrator-vault-access'
 
 // ===== 类型定义 =====
 
@@ -264,6 +267,7 @@ export class AgentOrchestrator {
   private adapter: AgentProviderAdapter
   private eventBus: AgentEventBus
   private activeSessions = new Map<string, number>()
+  private activeSessionStartedAt = new Map<string, number>()
   private nextRunGeneration = 0
 
   /** 队列消息本地记录（sessionId → UUID 集合，用于防重） */
@@ -303,7 +307,7 @@ export class AgentOrchestrator {
   /**
    * 构建工作区 MCP 服务器配置
    */
-  private buildMcpServers(workspaceSlug: string | undefined): Record<string, Record<string, unknown>> {
+  private async buildMcpServers(workspaceSlug: string | undefined, proxyUrl?: string): Promise<Record<string, Record<string, unknown>>> {
     const mcpServers: Record<string, Record<string, unknown>> = {}
     if (!workspaceSlug) return mcpServers
 
@@ -326,10 +330,19 @@ export class AgentOrchestrator {
           startup_timeout_sec: entry.timeout ?? 30,
         }
       } else if ((type === 'http' || type === 'sse') && entry.url) {
+        let oauthHeaders: Record<string, string> | undefined
+        try {
+          oauthHeaders = await getMcpOAuthHeaders(workspaceSlug, name, entry.url)
+        } catch (error) {
+          console.warn(`[Agent 编排] MCP OAuth 凭据不可用：${name}`, error instanceof Error ? error.message : error)
+          continue
+        }
+        const headers = { ...entry.headers, ...oauthHeaders }
         mcpServers[name] = {
           type,
           url: entry.url,
-          ...(entry.headers && Object.keys(entry.headers).length > 0 && { headers: entry.headers }),
+          ...(Object.keys(headers).length > 0 && { headers }),
+          ...(proxyUrl && { proxyUrl }),
           required: false,
         }
       } else {
@@ -420,9 +433,10 @@ export class AgentOrchestrator {
   }
 
   /**
-   * 流完成后自动生成标题
+   * 流开始后自动生成标题。
    *
-   * 如果会话标题仍为默认值，自动调用标题生成并通过回调通知。
+   * 默认会话沿用首条消息自动命名；Pi `/tree` 探索分支则在首条**新增**用户消息时
+   * 重命名一次，摆脱「原标题 (fork)」，之后不再覆盖用户或分支自己的语义标题。
    */
   private async autoGenerateTitle(
     sessionId: string,
@@ -437,15 +451,35 @@ export class AgentOrchestrator {
     if (signal?.aborted) return
     try {
       const meta = getAgentSessionMeta(sessionId)
-      if (!meta || meta.title !== DEFAULT_SESSION_TITLE) return
+      if (!meta) return
+      const isDefaultSessionTitle = meta.title === DEFAULT_SESSION_TITLE
+      const isFirstExplorationMessage = Boolean(
+        meta.explorationParentSessionId
+        && !meta.explorationTitleInitializedAt,
+      )
+      if (!isDefaultSessionTitle && !isFirstExplorationMessage) return
+
+      // 分支的历史被 Pi fork 复制，不能按「第一条历史消息」命名；以首次继续发送的消息
+      // 作为唯一的命名信号。先持久化守卫，避免用户连发时启动多个竞争标题请求。
+      const explorationTitleInitializedAt = isFirstExplorationMessage ? Date.now() : undefined
+      if (explorationTitleInitializedAt) {
+        updateAgentSessionMeta(sessionId, { explorationTitleInitializedAt })
+      }
 
       const title = await this.generateTitle({ userMessage, channelId, modelId }, signal)
+        ?? (isFirstExplorationMessage ? createFallbackTitle(userMessage) : null)
       if (!isCurrent()) return
       if (!title || signal?.aborted) return
 
       // 标题请求是异步的；请求期间用户可能已手动重命名，不能用旧结果覆盖。
       const latestMeta = getAgentSessionMeta(sessionId)
-      if (!latestMeta || latestMeta.title !== DEFAULT_SESSION_TITLE) return
+      const canApplyDefaultTitle = isDefaultSessionTitle && latestMeta?.title === DEFAULT_SESSION_TITLE
+      const canApplyExplorationTitle = Boolean(
+        isFirstExplorationMessage
+        && latestMeta?.title === meta.title
+        && latestMeta.explorationTitleInitializedAt === explorationTitleInitializedAt,
+      )
+      if (!latestMeta || (!canApplyDefaultTitle && !canApplyExplorationTitle)) return
       if (!isCurrent()) return
 
       updateAgentSessionMeta(sessionId, { title })
@@ -582,6 +616,7 @@ export class AgentOrchestrator {
     userMessage: string,
     createdAt = Date.now(),
     uuid?: string,
+    vaultFocus?: import('@proma/shared').VaultFocusAttribution,
   ): string {
     const persistedUuid = uuid ?? randomUUID()
     const userSDKMsg: SDKMessage = {
@@ -592,6 +627,7 @@ export class AgentOrchestrator {
       },
       parent_tool_use_id: null,
       _createdAt: createdAt,
+      ...(vaultFocus ? { _vaultFocus: vaultFocus } : {}),
     } as unknown as SDKMessage
     appendSDKMessages(sessionId, [userSDKMsg])
     return persistedUuid
@@ -686,6 +722,8 @@ export class AgentOrchestrator {
     extensions: AgentRunExtensions = {},
   ): Promise<void> {
     const { sessionId, userMessage, rawUserMessage, userMessageUuid, channelId, modelId, workspaceId: requestedWorkspaceId, additionalDirectories, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid } = input
+    // Capture the focus once per turn. Later UI focus changes must not rewrite this reply's attribution.
+    const initialVaultFocus = getVaultUserContext(sessionId)
     const streamStartedAt = input.startedAt ?? Date.now()
     let userMessagePersisted = false
     let initialUserMessageUuid: string | undefined
@@ -707,6 +745,7 @@ export class AgentOrchestrator {
       const ownsActiveRun = this.activeSessions.get(sessionId) === runGeneration
       if (ownsActiveRun) {
         this.activeSessions.delete(sessionId)
+        this.activeSessionStartedAt.delete(sessionId)
         this.sessionPermissionModes.delete(sessionId)
         this.queuedMessageUuids.delete(sessionId)
       }
@@ -747,6 +786,11 @@ export class AgentOrchestrator {
         rawUserMessage ?? userMessage,
         Date.now(),
         userMessageUuid,
+        initialVaultFocus ? {
+          displayName: initialVaultFocus.displayName,
+          rootPath: initialVaultFocus.rootPath,
+          focus: initialVaultFocus.focus,
+        } : undefined,
       )
       userMessagePersisted = true
     }
@@ -779,6 +823,7 @@ export class AgentOrchestrator {
     }
     runGeneration = ++this.nextRunGeneration
     this.activeSessions.set(sessionId, runGeneration)
+    this.activeSessionStartedAt.set(sessionId, streamStartedAt)
     this.latestRunGenerations.set(sessionId, runGeneration)
     markInFlightGeneration(this.inFlightRunGenerations, sessionId, runGeneration)
 
@@ -1049,11 +1094,16 @@ export class AgentOrchestrator {
       // 从源会话继承并持久化，避免历史相对路径在恢复时切换到另一文件根。
 
       // 必须与 runtime 接收的附加目录保持一致；视觉助手据此限制允许外发的图片路径。
-      const allAdditionalDirectories = collectAttachedDirectories({
+      const vaultUserContext = getVaultUserContext(sessionId)
+      const attachedDirectories = collectAttachedDirectories({
         extraDirs: additionalDirectories,
         sessionMeta,
         workspaceSlug,
       })
+      const allAdditionalDirectories = resolveRuntimeAdditionalDirectories(
+        attachedDirectories,
+        getAgentVaultRoots(),
+      )
       const browserAllowedRoots = [...new Set([
         workspaceId ? agentCwd : undefined,
         workspaceSlug ? getProjectFilesPath(workspaceSlug) : undefined,
@@ -1068,7 +1118,7 @@ export class AgentOrchestrator {
       }
 
       // 10. 构建 MCP 服务器配置 + 记忆工具 + 生图工具 + 自定义工具
-      const mcpServers = this.buildMcpServers(workspaceSlug)
+      const mcpServers = await this.buildMcpServers(workspaceSlug, proxyUrl)
       let piBuiltinTools: unknown[] = []
       let piMcpTools: unknown[] = []
       const piSdk = await import('@earendil-works/pi-coding-agent')
@@ -1110,6 +1160,7 @@ export class AgentOrchestrator {
         workspaceSlug,
         agentCwd,
         userBrowserContext: browserController.getUserContext(sessionId),
+        userVaultContext: vaultUserContext,
       })
       // 11.5 注入 mention 引用指令（Skill/MCP/会话）— 仅影响 prompt，不影响持久化
       let enrichedMessage = userMessage
@@ -1240,7 +1291,7 @@ export class AgentOrchestrator {
         'mcp__planning__list_active_reminders',
       ])
       // Pi-native 浏览器工具不是 MCP：必须显式分类，避免被通用 mcp__ 调研放行规则遗漏。
-      const PLAN_MODE_READ_ONLY_BROWSER_TOOLS = new Set(['BrowserObserve', 'BrowserScreenshot', 'BrowserListTabs', 'BrowserPreviewOpen'])
+      const PLAN_MODE_READ_ONLY_BROWSER_TOOLS = new Set(['BrowserObserve', 'BrowserFind', 'BrowserExtract', 'BrowserScreenshot', 'BrowserListTabs', 'BrowserPreviewOpen'])
       const runTriggeredBy = input.triggeredBy
 
       /** Plan 模式是否已被 Agent 进入（初始 plan 模式时天然为 true，其他模式需 EnterPlanMode 触发） */
@@ -1374,6 +1425,21 @@ export class AgentOrchestrator {
             return { behavior: 'deny' as const, message: '计划模式下不能将本地图片发送给视觉模型，请在计划获批后执行。' }
           }
           return { behavior: 'allow' as const }
+        }
+
+        // 选择 file input 后，站点可能自动把本地文件上传到第三方；即使路径已在会话授权目录内，
+        // 仍需逐次确认该外发边界，不能被通用 Browser 放行规则覆盖。
+        if (toolName === 'BrowserUpload') {
+          if (currentMode === 'plan') return { behavior: 'deny' as const, message: '计划模式下不能选择网页上传文件，请在计划获批后执行。' }
+          return permissionService.requestSingleApproval(sessionId, toolName, input, options, (request) => {
+            this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
+          })
+        }
+
+        // 终端元数据与已缓冲的输出可在计划阶段只读检查；创建、执行、打断或关闭 PTY 都属于可见的本地副作用。
+        if (toolName === 'TerminalList' || toolName === 'TerminalRead') return { behavior: 'allow' as const, updatedInput: input }
+        if (toolName.startsWith('Terminal') && currentMode === 'plan') {
+          return { behavior: 'deny' as const, message: '计划模式下不能创建或操作本地终端，请在计划获批后执行。' }
         }
 
         // 所有 Pi 会话均可使用受管浏览器。主进程仍隔离网页来源并默认拒绝网页权限；下载和弹窗留在受管浏览器内，
@@ -1518,7 +1584,7 @@ export class AgentOrchestrator {
         permissionMode: initialPermissionMode,
         collaborationAvailable,
         currentModelId: selectedModelId,
-        legacyProjectInstructions: projectInstructions?.sources,
+        projectInstructions,
         projectKnowledgeMaintenanceApproved,
         memoryGuidance,
         memoryRefreshOpportunity,
@@ -2288,6 +2354,7 @@ export class AgentOrchestrator {
   stop(sessionId: string, stopBeforeRun = false): void {
     const runGeneration = this.activeSessions.get(sessionId)
     this.activeSessions.delete(sessionId)
+    this.activeSessionStartedAt.delete(sessionId)
     this.sessionPermissionModes.delete(sessionId)
     browserController.cancelSession(sessionId)
     if (runGeneration != null) {
@@ -2313,6 +2380,14 @@ export class AgentOrchestrator {
   /** 检查指定会话是否仍有未完全退出的 Agent 生命周期。 */
   isInFlight(sessionId: string): boolean {
     return hasInFlightGeneration(this.inFlightRunGenerations, sessionId)
+  }
+
+  /** 返回主进程当前仍在执行的 Agent，会话重载时供 renderer 恢复运行指示。 */
+  listActiveSessionSnapshots(): AgentActiveSessionSnapshot[] {
+    return [...this.activeSessions.keys()].map((sessionId) => ({
+      sessionId,
+      startedAt: this.activeSessionStartedAt.get(sessionId) ?? Date.now(),
+    }))
   }
 
   /** 是否存在任意运行中 Agent（含后台运行与外部触发的会话）。 */
@@ -2424,6 +2499,7 @@ export class AgentOrchestrator {
     // 即便 activeSessions 为空，也要调 dispose 清理可能残留的 pidMap / 子进程
     this.adapter.dispose()
     this.activeSessions.clear()
+    this.activeSessionStartedAt.clear()
     this.sessionPermissionModes.clear()
     this.stoppedBySessions.clear()
     this.inFlightRunGenerations.clear()
@@ -2472,10 +2548,11 @@ export class AgentOrchestrator {
       : undefined
 
     const userBrowserContext = browserController.getUserContext(sessionId)
+    const userVaultContext = getVaultUserContext(sessionId)
     // 运行中的 Agent 收到队列消息时也必须看到用户刚刚主动打开的页面。
     // 未打开浏览器时保持既有消息形态，避免给每条插队消息重复注入无关环境块。
-    let enrichedText = userBrowserContext
-      ? `${buildDynamicContext({ userBrowserContext })}\n\n${text}`
+    let enrichedText = userBrowserContext || userVaultContext
+      ? `${buildDynamicContext({ userBrowserContext, userVaultContext })}\n\n${text}`
       : text
     const referencedSessionsBlock = buildReferencedSessionsPrompt(sessionId, mentionedSessionIds, workspaceSlug)
     if (referencedSessionsBlock) {
@@ -2537,6 +2614,13 @@ export class AgentOrchestrator {
         },
         parent_tool_use_id: null,
         _createdAt: Date.now(),
+        ...(userVaultContext ? {
+          _vaultFocus: {
+            displayName: userVaultContext.displayName,
+            rootPath: userVaultContext.rootPath,
+            focus: userVaultContext.focus,
+          },
+        } : {}),
       } as unknown as SDKMessage
       appendSDKMessages(sessionId, [persistMsg])
       this.flushPendingUserSkillActivations(sessionId, uuid)
@@ -2546,6 +2630,7 @@ export class AgentOrchestrator {
       if (isMissingActiveQueueChannelError(error)) {
         console.warn(`[Agent 编排] 队列注入失败且消息通道已失效，释放陈旧运行状态: sessionId=${sessionId}`)
         this.activeSessions.delete(sessionId)
+        this.activeSessionStartedAt.delete(sessionId)
         this.sessionPermissionModes.delete(sessionId)
         this.queuedMessageUuids.delete(sessionId)
       }

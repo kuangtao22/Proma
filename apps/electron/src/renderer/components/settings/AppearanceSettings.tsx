@@ -18,22 +18,18 @@ import {
 import {
   themeModeAtom,
   themeStyleAtom,
-  interfaceVariantAtom,
   systemIsDarkAtom,
   updateThemeMode,
   updateThemeStyle,
-  updateInterfaceVariant,
   applyThemeToDOM,
-  applyInterfaceVariantToDOM,
 } from '@/atoms/theme'
 import {
   markdownFontSizeAtom,
   updateMarkdownFontSize,
 } from '@/atoms/markdown-font-size'
-import { previewModePreferenceAtom, type PreviewModePreference } from '@/atoms/preview-atoms'
 import { cn } from '@/lib/utils'
 import { detectIsWindows } from '@/lib/platform'
-import type { InterfaceVariant, ThemeMode, ThemeStyle, MarkdownFontSize } from '../../../types'
+import type { ThemeMode, ThemeStyle, MarkdownFontSize } from '../../../types'
 
 // ===== Logo 资源导入（用于图标选择器） =====
 import promaBlackLogo from '@/assets/bots/proma-logos/proma-black.png'
@@ -67,23 +63,11 @@ const THEME_OPTIONS = [
   { value: 'special', label: '特殊风格' },
 ]
 
-/** 界面风格选项 */
-const INTERFACE_VARIANT_OPTIONS: { value: InterfaceVariant; label: string }[] = [
-  { value: 'classic', label: '经典' },
-  { value: 'modern', label: '现代' },
-]
-
 /** Markdown 字号选项 */
 const MARKDOWN_FONT_SIZE_OPTIONS = [
   { value: 'small', label: '小' },
   { value: 'medium', label: '中' },
   { value: 'large', label: '大' },
-]
-
-/** 预览默认展开方式 */
-const PREVIEW_MODE_OPTIONS: { value: PreviewModePreference; label: string }[] = [
-  { value: 'tab', label: '标签页' },
-  { value: 'split', label: '侧边分屏' },
 ]
 
 /** 特殊风格 ID（排除 default） */
@@ -188,10 +172,8 @@ const ZOOM_HINT = isMac
 export function AppearanceSettings(): React.ReactElement {
   const [themeMode, setThemeMode] = useAtom(themeModeAtom)
   const [themeStyle, setThemeStyle] = useAtom(themeStyleAtom)
-  const [interfaceVariant, setInterfaceVariant] = useAtom(interfaceVariantAtom)
   const systemIsDark = useAtomValue(systemIsDarkAtom)
   const [markdownFontSize, setMarkdownFontSize] = useAtom(markdownFontSizeAtom)
-  const [previewModePref, setPreviewModePref] = useAtom(previewModePreferenceAtom)
 
   /** 切换主题模式 */
   const handleThemeChange = React.useCallback((value: string) => {
@@ -216,14 +198,6 @@ export function AppearanceSettings(): React.ReactElement {
     applyThemeToDOM('special', style, systemIsDark)
   }, [setThemeMode, setThemeStyle, systemIsDark])
 
-  /** 切换界面风格 */
-  const handleInterfaceVariantChange = React.useCallback((value: string) => {
-    const variant = value as InterfaceVariant
-    setInterfaceVariant(variant)
-    updateInterfaceVariant(variant)
-    applyInterfaceVariantToDOM(variant)
-  }, [setInterfaceVariant])
-
   /** 切换 Markdown 字号 */
   const handleMarkdownFontSizeChange = React.useCallback((value: string) => {
     const size = value as MarkdownFontSize
@@ -245,14 +219,6 @@ export function AppearanceSettings(): React.ReactElement {
             value={themeMode}
             onValueChange={handleThemeChange}
             options={THEME_OPTIONS}
-          />
-
-          <SettingsSegmentedControl
-            label="界面风格"
-            description="经典风保留旧版视觉；现代风使用更小圆角、更清晰分割线达成更统一干净的质感"
-            value={interfaceVariant}
-            onValueChange={handleInterfaceVariantChange}
-            options={INTERFACE_VARIANT_OPTIONS}
           />
 
           {/* 特殊风格 - 标签在上，卡片在下 */}
@@ -283,13 +249,6 @@ export function AppearanceSettings(): React.ReactElement {
             options={MARKDOWN_FONT_SIZE_OPTIONS}
           />
 
-          <SettingsSegmentedControl
-            label="Agent 预览展开方式"
-            description="点击文件、工具结果「预览」按钮时的默认展开位置；拖拽预览 Tab 出标签栏可即时切换为侧边分屏"
-            value={previewModePref}
-            onValueChange={(v) => setPreviewModePref(v as PreviewModePreference)}
-            options={PREVIEW_MODE_OPTIONS}
-          />
         </SettingsCard>
       </SettingsSection>
 

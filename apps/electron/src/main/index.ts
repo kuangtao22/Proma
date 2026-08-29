@@ -85,6 +85,7 @@ import { initializeRuntime } from './lib/runtime-init'
 import { seedDefaultSkills } from './lib/config-paths'
 import { upgradeDefaultSkillsInWorkspaces } from './lib/agent-workspace-manager'
 import { agentEventBus, hasActiveAgentSessions, stopAllAgents } from './lib/agent-service'
+import { stopAllTerminals } from './lib/terminal-service'
 import { disposePiMcpConnections } from './lib/adapters/pi-mcp-tools'
 import { browserController } from './lib/browser-controller'
 import { markRunningDelegationsAsInterrupted } from './lib/agent-session-manager'
@@ -865,14 +866,12 @@ async function bootstrap(): Promise<void> {
   })
   dataRootStartupRouter.resolveMode('normal')
   if (hasOpenPlanningArgument(process.argv)) showPlanningWindow()
-
   // Create system tray icon
   const hoverWin = process.platform === 'win32' ? getAgentStatusHoverWindow() : null
   if (hoverWin) safeRun('ensureHoverWindow', () => hoverWin.ensureCreated())
 
   createTray({
     showMainWindow: showAndFocusMainWindow,
-    showPlanningWindow,
     openAgentSession: (sessionId, title) => {
       sendToMainWindow(TRAY_IPC_CHANNELS.OPEN_AGENT_SESSION, { sessionId, title })
     },
@@ -934,7 +933,6 @@ async function bootstrap(): Promise<void> {
         openAgentSession: (sessionId, title) => {
           sendToMainWindow(TRAY_IPC_CHANNELS.OPEN_AGENT_SESSION, { sessionId, title })
         },
-        openPlanning: showPlanningWindow,
         enabled: () => getSettings().agentIsland?.enabled !== false,
       })
     })
@@ -953,9 +951,6 @@ async function bootstrap(): Promise<void> {
   )
   safeRun('registerGlobalShortcut:show-main-window', () =>
     registerGlobalShortcut('show-main-window', showAndFocusMainWindow),
-  )
-  safeRun('registerGlobalShortcut:open-planning', () =>
-    registerGlobalShortcut('open-planning', showPlanningWindow),
   )
   safeRun('registerGlobalShortcut:voice-dictation', () =>
     registerGlobalShortcut('voice-dictation', () => {
@@ -1057,6 +1052,7 @@ app.on('before-quit', () => {
     { name: '退出状态', run: setQuitting },
     { name: 'Design Job 中断', run: () => { getDefaultDesignJobManager()?.markRunningInterrupted() } },
     { name: 'Agent 进程', run: stopAllAgents },
+    { name: '终端进程', run: () => { void stopAllTerminals() } },
     { name: '浏览器控制器', run: () => { browserController.dispose() } },
     { name: '生成任务', run: stopAllGenerations },
     { name: '更新器', run: cleanupUpdater },

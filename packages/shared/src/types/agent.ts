@@ -771,6 +771,14 @@ export interface AgentSessionMeta {
   attachedFiles?: string[]
   /** 分叉来源：源会话的 Proma 工作目录（SDK session 文件在此目录的项目空间中，首次 resume 后清除） */
   forkSourceDir?: string
+  /** Pi `/tree` 探索分支所属的主线会话；仅探索分支设置，普通 fork 保持 undefined。 */
+  explorationParentSessionId?: string
+  /** Pi `/tree` 探索分支的 assistant 分叉锚点。 */
+  explorationSourceMessageId?: string
+  /** 用户可读的分叉来源，用于重新打开探索分支时恢复上下文提示。 */
+  explorationSourceLabel?: string
+  /** 探索分支的首条新增用户消息已触发过一次标题初始化，防止后续对话覆盖该名称。 */
+  explorationTitleInitializedAt?: number
   /** 历史兼容字段：旧版手动保留状态 */
   manualWorking?: boolean
   /** Agent 执行完成但用户尚未清除完成状态 */
@@ -994,6 +1002,60 @@ export interface WorkspaceMcpConfig {
   servers: Record<string, McpServerEntry>
 }
 
+/** Result of an atomic main-process MCP enable/install and validation operation. */
+export interface McpConnectionMutationResult {
+  config: WorkspaceMcpConfig
+  verification: {
+    success: boolean
+    message: string
+  }
+}
+
+export interface McpInstallMutationResult extends McpConnectionMutationResult {
+  installed: boolean
+}
+
+/** OAuth-capable remote MCP provider currently supported by the built-in connector flow. */
+export type McpOAuthProvider = 'notion' | 'github'
+
+/** Renderer-to-main request for a remote MCP authorization-code + PKCE flow. */
+export interface StartMcpOAuthInput {
+  workspaceSlug: string
+  serverName: string
+  provider: McpOAuthProvider
+  serverUrl: string
+}
+
+/** OAuth connection result that deliberately excludes all secret material. */
+export interface McpOAuthStartResult {
+  provider: McpOAuthProvider
+  serverName: string
+  expiresAt?: number
+}
+
+export interface SaveWorkspaceMcpConfigOptions {
+  /** Names explicitly disabled by a user action; cancels any in-flight validation. */
+  explicitlyDisabledServerNames?: string[]
+}
+
+/** Store a static MCP token in Keychain-backed safeStorage; never persisted in mcp.json. */
+export interface SaveMcpApiKeyInput {
+  workspaceSlug: string
+  serverName: string
+  serverUrl: string
+  headerName: string
+  value: string
+}
+
+/** Non-sensitive status for a CLI integration. Secret values are never returned to the renderer. */
+export interface CliIntegrationStatus {
+  id: string
+  /** Whether the third-party CLI reports an authenticated account. */
+  connected: boolean
+  /** Whether Proma is permitted to use this CLI in the current workspace. */
+  enabled: boolean
+}
+
 // ===== Skill 元数据 =====
 
 /** 从其他工作区导入的 Skill 来源元数据 */
@@ -1150,7 +1212,16 @@ export interface WorkspaceMemorySummary {
 
 /** 工作区能力摘要（MCP + Skill 计数） */
 export interface WorkspaceCapabilities {
-  mcpServers: Array<{ name: string; enabled: boolean; type: McpTransportType }>
+  /** Only non-sensitive validation evidence required for UI state and # MCP filtering. */
+  mcpServers: Array<{
+    name: string
+    enabled: boolean
+    type: McpTransportType
+    lastTestResult?: {
+      success: boolean
+      timestamp: number
+    }
+  }>
   builtinMcpServers: BuiltinMcpServerSummary[]
   skills: SkillMeta[]
   memory: WorkspaceMemorySummary
@@ -1194,8 +1265,8 @@ export interface AgentSendInput {
   startedAt?: number
   /** 用户点击错误消息的重试时，指向本轮开始前应删除的错误 UUID。 */
   retryOfErrorUuid?: string
-  /** 触发来源：用户手动、定时任务、父 Agent 委派（用于 UI 区分标记） */
-  triggeredBy?: 'user' | 'automation' | 'delegation'
+  /** 触发来源：用户手动、定时任务、父 Agent 委派或外部 Bridge（用于权限与 UI 区分）。 */
+  triggeredBy?: 'user' | 'automation' | 'delegation' | 'external'
   /** 定时任务执行上下文（注入到系统提示词，用户不可见） */
   automationContext?: string
 }
@@ -1292,6 +1363,8 @@ export interface ForkSessionInput {
   upToMessageUuid?: string
   /** 目标模型 ID。省略时继承源会话模型；传入时必须属于源会话同一渠道且已启用 */
   modelId?: string
+  /** 标记为 Pi `/tree` 探索分支，并持久化其在主线中的来源，供关闭后重新打开。 */
+  explorationSourceLabel?: string
 }
 
 /** 快照回退输入（同一会话内回退到指定点） */
@@ -1354,6 +1427,12 @@ export interface AgentStreamEvent {
   payload: AgentStreamPayload
   /** @deprecated 兼容旧格式，Phase 2 后移除 */
   event?: AgentEvent
+}
+
+export interface AgentActiveSessionSnapshot {
+  sessionId: string
+  /** 对应当前运行实例的启动时间，用于拒绝陈旧的 renderer 恢复快照。 */
+  startedAt: number
 }
 
 /**
@@ -1693,6 +1772,8 @@ export const AGENT_IPC_CHANNELS = {
   COUNT_ARCHIVED_SESSIONS: 'agent:count-archived-sessions',
   /** 创建会话 */
   CREATE_SESSION: 'agent:create-session',
+  /** 获取当前主进程仍在执行的 Agent 会话快照 */
+  ACTIVE_SESSIONS_SNAPSHOT: 'agent:active-sessions-snapshot',
   /** 获取会话 SDKMessage（Phase 4 新格式） */
   GET_SDK_MESSAGES: 'agent:get-sdk-messages',
   /** 更新会话标题 */
@@ -1701,6 +1782,8 @@ export const AGENT_IPC_CHANNELS = {
   UPDATE_SESSION_MODEL: 'agent:update-session-model',
   /** 选择或清除当前会话的活动 worktree */
   SET_ACTIVE_WORKTREE: 'agent:set-active-worktree',
+  /** 主进程通知 Renderer：Agent 主动切换了会话的活动 worktree */
+  ACTIVE_WORKTREE_UPDATED: 'agent:active-worktree-updated',
   /** 删除会话 */
   DELETE_SESSION: 'agent:delete-session',
   /** 迁移 Chat 对话记录到 Agent 会话 */
@@ -1767,6 +1850,7 @@ export const AGENT_IPC_CHANNELS = {
   RELOAD_BROWSER: 'agent:reload-browser',
   CLOSE_BROWSER: 'agent:close-browser',
   BROWSER_STATE_CHANGED: 'agent:browser-state-changed',
+  BROWSER_TAB_FOCUSED: 'agent:browser-tab-focused',
 
   // 工作区能力（MCP + Skill）
   /** 获取工作区能力摘要 */
@@ -1775,6 +1859,22 @@ export const AGENT_IPC_CHANNELS = {
   GET_MCP_CONFIG: 'agent:get-mcp-config',
   /** 保存工作区 MCP 配置 */
   SAVE_MCP_CONFIG: 'agent:save-mcp-config',
+  /** 刷新并持久化工作区 MCP 真实连接状态 */
+  REFRESH_MCP_CONNECTIONS: 'agent:refresh-mcp-connections',
+  /** 原子切换 MCP 启用状态，并在启用时条件持久化真实验证结果。 */
+  SET_MCP_ENABLED_AND_VALIDATE: 'agent:set-mcp-enabled-and-validate',
+  /** 原子新增 MCP，并在初始启用时条件持久化真实验证结果。 */
+  INSTALL_MCP_AND_VALIDATE: 'agent:install-mcp-and-validate',
+  /** 启动远程 MCP 的 OAuth PKCE 授权 */
+  START_MCP_OAUTH: 'agent:start-mcp-oauth',
+  /** 安全保存远程 MCP 的静态 API Key / Token */
+  SAVE_MCP_API_KEY: 'agent:save-mcp-api-key',
+  /** 删除工作区 MCP 对应的系统安全凭据，不返回任何凭据。 */
+  DELETE_MCP_CREDENTIAL: 'agent:delete-mcp-credential',
+  /** 查询本机 CLI 集成是否已完成官方配置，不返回任何凭据。 */
+  GET_CLI_INTEGRATION_STATUSES: 'agent:get-cli-integration-statuses',
+  /** 更新 Proma 对工作区 CLI 集成的启用状态；绝不调用第三方 CLI 登出或撤销授权。 */
+  SET_CLI_INTEGRATION_ENABLED: 'agent:set-cli-integration-enabled',
   /** 测试 MCP 服务器连接 */
   TEST_MCP_SERVER: 'agent:test-mcp-server',
   /** 启用或关闭 Proma 内置 MCP */

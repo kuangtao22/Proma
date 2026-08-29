@@ -232,13 +232,18 @@ export interface ResolvedFileUrl {
 }
 
 /** Office 文件内联预览类型 */
-export type OfficePreviewKind = 'spreadsheet' | 'presentation'
+export type OfficePreviewKind = 'document' | 'spreadsheet' | 'presentation'
 
 /** Office 文件内联预览结果 */
 export interface OfficePreviewResult {
   resolvedPath: string
   kind: OfficePreviewKind
+  /** 内置解析器生成、可直接嵌入的净化后 HTML。 */
   html: string
+  /** 高保真渲染器生成的受令牌保护独立 HTML 文档地址。 */
+  htmlUrl?: string
+  /** 实际产出该预览的渲染器；未指定时表示内置解析器。 */
+  renderer?: 'builtin' | 'officecli'
   text: string
 }
 
@@ -272,6 +277,32 @@ export interface DefaultAppInfo {
   appPath: string
   /** App 图标的 PNG dataURL；通过 Electron app.getFileIcon 抓取 */
   iconDataUrl: string
+}
+
+/** 无法内联渲染时仍可安全展示的基础文件信息。 */
+export interface FilePreviewMetadata {
+  /** 已解析文件的名称，不包含目录。 */
+  name: string
+  /** 小写扩展名，包含点；无扩展名时为空字符串。 */
+  extension: string
+  /** 文件大小（字节）。 */
+  size: number
+  /** 最近修改时间（Unix milliseconds）。 */
+  modifiedAt: number
+}
+
+/** 主进程完成安全文本检测后的预览读取结果。 */
+export interface FilePreviewReadResult {
+  /** 已解析的本机绝对路径，仅用于现有受控预览链路。 */
+  resolvedPath: string
+  /** 仅当 isBinary/isTooLarge 均为 false 时返回安全文本。 */
+  content: string
+  /** 内容不是可安全传给文本高亮器的 UTF-8 文本。 */
+  isBinary: boolean
+  /** 文件超过内联文本预览的大小上限。 */
+  isTooLarge: boolean
+  /** 无论是否可内联预览都返回的基础元数据。 */
+  metadata: FilePreviewMetadata
 }
 
 /** Windows Agent Shell 偏好：默认自动选择 Git Bash，用户可显式改用 WSL。 */

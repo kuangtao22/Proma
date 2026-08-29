@@ -11,6 +11,7 @@ import { AppWindow, Compass, Globe2, Keyboard, PencilLine, X } from 'lucide-reac
 import { shortcutGuideOpenAtom } from '@/atoms/shortcut-guide'
 import { shortcutOverridesAtom, sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { cn } from '@/lib/utils'
+import { iconButtonNoRingFocusClass } from '@/components/ui/icon-button-styles'
 import {
   DEFAULT_SHORTCUTS,
   SHORTCUT_CATEGORY_LABELS,
@@ -61,7 +62,7 @@ const SHORTCUT_DISPLAY_ORDER: Record<ShortcutCategory, readonly string[]> = {
     'editor-bold',
     'editor-strikethrough',
   ],
-  global: ['quick-task', 'show-main-window', 'open-planning', 'voice-dictation'],
+  global: ['quick-task', 'show-main-window', 'voice-dictation'],
 }
 
 const CATEGORY_ICONS: Record<ShortcutCategory, React.ComponentType<{ className?: string }>> = {
@@ -232,7 +233,11 @@ export function ShortcutGuideDialog(): React.ReactElement {
               </div>
             </div>
             <DialogPrimitive.Close
-              className="rounded-md p-1.5 text-muted-foreground/60 transition-colors hover:bg-muted hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+              className={cn(
+                'rounded-md p-1.5 text-muted-foreground/60 transition-colors hover:bg-muted hover:text-foreground',
+                'focus-visible:bg-muted focus-visible:text-foreground',
+                iconButtonNoRingFocusClass,
+              )}
               aria-label="关闭快捷键地图"
             >
               <X className="size-4" />

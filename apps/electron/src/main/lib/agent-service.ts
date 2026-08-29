@@ -31,6 +31,7 @@ import type {
   AgentMoveQueuedMessageInput,
   PromaPermissionMode,
   AgentExternalRunSource,
+  AgentActiveSessionSnapshot,
   AgentMessage,
   CanvasAgentActiveRunSnapshot,
 } from '@proma/shared'
@@ -50,6 +51,8 @@ import {
   sendAuthoritativeAgentStreamComplete,
 } from './agent-completion-payload'
 import { AgentStreamForwarder } from './agent-stream-forwarder'
+import { AgentStreamRouteRegistry } from './agent-stream-route-registry'
+import type { AgentStreamRoute } from './agent-stream-route-registry'
 import { AgentQueueCoordinator } from './agent-queue-coordinator'
 import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
@@ -87,12 +90,12 @@ import('./agent-collaboration-tools').then(({ registerCollaborationEventBus }) =
 }).catch(() => { /* collaboration 模块可能未加载 */ })
 
 /**
- * 会话 → webContents 映射
+ * 会话 → renderer 的流事件投递路由。
  *
- * EventBus IPC 转发中间件通过此映射找到目标 webContents。
- * runAgent 开始时注册，结束时清理。
+ * 每次 run 注册独立 owner；旧 run 只能清理自己仍拥有的 route，不能删除
+ * 队列接力或 renderer 重载后被新 run 接管的投递目标。
  */
-const sessionWebContents = new Map<string, WebContents>()
+const streamRoutes = new AgentStreamRouteRegistry<WebContents>()
 /** 每个 renderer 当前可见的 Agent 会话；仅该会话维持 20fps partial。 */
 const visibleAgentSessionByWebContents = new WeakMap<WebContents, string | null>()
 const streamForwarder = new AgentStreamForwarder()
@@ -106,29 +109,45 @@ const streamForwarder = new AgentStreamForwarder()
 const wcWithCleanupHook = new WeakSet<WebContents>()
 
 /**
- * 注册 sessionId → webContents 映射，并在 webContents 销毁时自动清理所有相关条目。
- *
- * 仅依赖 finally 块清理无法覆盖窗口关闭、渲染进程崩溃、headless 路径主窗口被替换等
- * webContents 提前销毁的场景——destroyed 事件兜底。
+ * 注册新的 stream route，并在 webContents 销毁时保留 owner 以等待 renderer 重绑或 run 收束。
  */
-function registerWebContents(sessionId: string, wc: WebContents): void {
-  // 同一 sessionId 切换 renderer 时，先丢弃捕获旧 wc.send 的等待 partial，避免投递到旧窗口。
-  const previousWebContents = sessionWebContents.get(sessionId)
-  if (previousWebContents && previousWebContents !== wc) streamForwarder.clear(sessionId)
-  // 旧 wc 的 destroyed 钩子仍由 WeakSet 持有，触发时会扫描 sessionWebContents 清理所有指向它的条目。
-  sessionWebContents.set(sessionId, wc)
+function attachWebContentsCleanup(wc: WebContents): void {
   if (wcWithCleanupHook.has(wc)) return
   wcWithCleanupHook.add(wc)
   wc.once('destroyed', () => {
-    // 单个 wc 可能映射到多个 sessionId（同窗口多 tab），需要清理所有指向它的条目
-    for (const [sid, mappedWc] of sessionWebContents) {
-      if (mappedWc === wc) {
-        sessionWebContents.delete(sid)
-        streamForwarder.clear(sid)
-      }
+    // 保留 route owner 到活跃 run 收束，允许新 renderer 重绑；取消旧 wc 捕获的 partial。
+    for (const sessionIdToClear of streamRoutes.markTargetDestroyed(wc)) {
+      streamForwarder.clear(sessionIdToClear)
     }
     visibleAgentSessionByWebContents.delete(wc)
   })
+}
+
+function registerWebContents(sessionId: string, wc: WebContents) {
+  const previousWebContents = streamRoutes.get(sessionId)?.target
+  if (previousWebContents && previousWebContents !== wc) streamForwarder.clear(sessionId)
+  const route = streamRoutes.bind(sessionId, wc)
+  attachWebContentsCleanup(wc)
+  return route
+}
+
+function getStreamRouteTargets(): Map<string, WebContents> {
+  const targets = new Map<string, WebContents>()
+  for (const snapshot of orchestrator.listActiveSessionSnapshots()) {
+    const target = streamRoutes.get(snapshot.sessionId)?.target
+    if (target) targets.set(snapshot.sessionId, target)
+  }
+  return targets
+}
+
+export function rebindActiveAgentStreams(webContents: WebContents): AgentActiveSessionSnapshot[] {
+  const snapshots = orchestrator.listActiveSessionSnapshots()
+  for (const snapshot of snapshots) {
+    streamForwarder.clear(snapshot.sessionId)
+    streamRoutes.rebind(snapshot.sessionId, webContents)
+  }
+  attachWebContentsCleanup(webContents)
+  return snapshots
 }
 
 function isMainRendererWindow(win: BrowserWindow): boolean {
@@ -148,7 +167,7 @@ function getMainRendererWebContents(): WebContents | null {
 
 const agentQueueCoordinator = new AgentQueueCoordinator({
   isActive: (sessionId) => orchestrator.isActive(sessionId),
-  getWebContents: (sessionId) => sessionWebContents.get(sessionId) ?? getMainRendererWebContents(),
+  getWebContents: (sessionId) => streamRoutes.get(sessionId)?.target ?? getMainRendererWebContents(),
   startRun: (input, webContents) => runAgent(input, webContents),
   sendStarted: (webContents, status) => {
     if (!webContents.isDestroyed()) webContents.send(AGENT_IPC_CHANNELS.QUEUED_MESSAGE_STATUS, status)
@@ -218,7 +237,7 @@ function reportAgentServiceTerminalEffectError(name: string, error: unknown): vo
 // ===== EventBus IPC 转发中间件 =====
 
 eventBus.use((sessionId, payload, next) => {
-  const wc = sessionWebContents.get(sessionId)
+  const wc = streamRoutes.get(sessionId)?.target
   if (wc && !wc.isDestroyed()) {
     try {
       streamForwarder.forward(
@@ -238,6 +257,7 @@ eventBus.use((sessionId, payload, next) => {
 
 /** renderer 切换标签时更新流式优先级；切入会话立即 flush 等待中的后台快照。 */
 export function setVisibleAgentSession(webContents: WebContents, sessionId: string | null): void {
+  rebindActiveAgentStreams(webContents)
   const previousSessionId = visibleAgentSessionByWebContents.get(webContents)
   if (previousSessionId && previousSessionId !== sessionId) {
     // 切出后将已排队的前台帧按后台频率重排，避免继续以 20fps 发送。
@@ -261,16 +281,21 @@ export async function runAgent(
 ): Promise<void> {
   // deferred queue runs carry their queue id as an internal extension.
   const queueMessageId = (input as Partial<AgentDeferredQueueMessageInput>).queueMessageId
-  /** 标记当前入口是否真正通过 Orchestrator 准入并注册 renderer。 */
-  let runStarted = false
+  /** 仅在 Orchestrator 准入后取得 owner，避免被拒绝的重复请求覆盖活跃路由。 */
+  let route: AgentStreamRoute<WebContents> | undefined
+  /** 获取当前运行仍拥有的 renderer；准入前错误只返回本次调用方。 */
+  const getRunTarget = (): WebContents | undefined => route
+    ? streamRoutes.getTargetIfOwner(input.sessionId, route.ownerId)
+    : (webContents.isDestroyed() ? undefined : webContents)
   try {
     await orchestrator.sendMessage(input, {
       onError: (error) => {
         runAgentServiceTerminalEffects([{
           name: 'renderer-error',
           run: () => {
-            if (!webContents.isDestroyed()) {
-              webContents.send(
+            const target = getRunTarget()
+            if (target) {
+              target.send(
                 AGENT_IPC_CHANNELS.STREAM_ERROR,
                 buildAuthoritativeAgentStreamErrorPayload(input.sessionId, error, getAgentSessionMeta, input.startedAt),
               )
@@ -287,8 +312,9 @@ export async function runAgent(
           {
             name: 'renderer-complete',
             run: () => {
-              if (!webContents.isDestroyed()) {
-                sendAuthoritativeAgentStreamComplete(webContents, input, getAgentSessionMeta, {
+              const target = getRunTarget()
+              if (target) {
+                sendAuthoritativeAgentStreamComplete(target, input, getAgentSessionMeta, {
                   messages,
                   stoppedByUser: opts?.stoppedByUser ?? false,
                   startedAt: opts?.startedAt,
@@ -319,8 +345,7 @@ export async function runAgent(
           requestedWorkspaceId: input.workspaceId,
         }, () => {
           // 只有 Orchestrator 真正准入后才绑定 renderer 并修改会话状态。
-          registerWebContents(input.sessionId, webContents)
-          runStarted = true
+          route = registerWebContents(input.sessionId, webContents)
           try {
             updateAgentSessionMeta(input.sessionId, { completedButUnconfirmed: false })
           } catch { /* 新会话可能尚未写入索引 */ }
@@ -348,8 +373,9 @@ export async function runAgent(
           kind: 'proma_event',
           event: { type: 'title_updated', title },
         })
-        if (!webContents.isDestroyed()) {
-          webContents.send(AGENT_IPC_CHANNELS.TITLE_UPDATED, {
+        const target = getRunTarget()
+        if (target) {
+          target.send(AGENT_IPC_CHANNELS.TITLE_UPDATED, {
             sessionId: input.sessionId,
             title,
           })
@@ -363,8 +389,9 @@ export async function runAgent(
       {
         name: 'renderer-error',
         run: () => {
-          if (!webContents.isDestroyed()) {
-            webContents.send(
+          const target = getRunTarget()
+          if (target) {
+            target.send(
               AGENT_IPC_CHANNELS.STREAM_ERROR,
               buildAuthoritativeAgentStreamErrorPayload(input.sessionId, errorMessage, getAgentSessionMeta, input.startedAt),
             )
@@ -389,10 +416,7 @@ export async function runAgent(
       },
     ], reportAgentServiceTerminalEffectError)
   } finally {
-    // 仅在 orchestrator 已完成此会话时清理映射
-    // 避免被拒绝的请求误删仍在运行的会话映射
-    if (runStarted && !orchestrator.isActive(input.sessionId)) {
-      sessionWebContents.delete(input.sessionId)
+    if (route && streamRoutes.removeIfOwner(input.sessionId, route.ownerId)) {
       streamForwarder.clear(input.sessionId)
     }
   }
@@ -417,14 +441,26 @@ export async function runAgentHeadless(
 ): Promise<void> {
   // 委派子会话优先回到父会话所在 renderer，外部无界面运行才回退任意主窗口。
   const wc = getHeadlessAgentRunTarget(
-    sessionWebContents,
+    getStreamRouteTargets(),
     callbacks.originSessionId,
     getMainRendererWebContents,
   )
-  const runInput: AgentSendInput = input.startedAt != null ? input : { ...input, startedAt: Date.now() }
+  // Headless runs originate from automation, delegation, or an external Bridge. Never
+  // treat an omitted source as an interactive desktop-user run: custom tools may grant
+  // local side effects that cannot be visibly supervised by an external sender.
+  const inferredTriggeredBy = callbacks.source === 'delegation' ? 'delegation' : 'external'
+  const runInput: AgentSendInput = {
+    ...input,
+    ...(input.triggeredBy ? {} : { triggeredBy: inferredTriggeredBy }),
+    ...(input.startedAt != null ? {} : { startedAt: Date.now() }),
+  }
   const startedAt = runInput.startedAt!
-  /** 标记 headless 入口是否真正开始并注册 renderer。 */
-  let runStarted = false
+  /** 仅在 headless 运行准入后绑定 renderer route。 */
+  let route: AgentStreamRoute<WebContents> | undefined
+  /** 获取本轮 headless 运行仍拥有的 renderer；准入前允许向初始窗口返回错误。 */
+  const getRunTarget = (): WebContents | undefined => route
+    ? streamRoutes.getTargetIfOwner(runInput.sessionId, route.ownerId)
+    : (wc && !wc.isDestroyed() ? wc : undefined)
 
   try {
     await orchestrator.sendMessage(runInput, {
@@ -434,8 +470,9 @@ export async function runAgentHeadless(
           {
             name: 'renderer-error',
             run: () => {
-              if (wc && !wc.isDestroyed()) {
-                wc.send(
+              const target = getRunTarget()
+              if (target) {
+                target.send(
                   AGENT_IPC_CHANNELS.STREAM_ERROR,
                   buildAuthoritativeAgentStreamErrorPayload(runInput.sessionId, error, getAgentSessionMeta, runInput.startedAt),
                 )
@@ -454,8 +491,9 @@ export async function runAgentHeadless(
           {
             name: 'renderer-complete',
             run: () => {
-              if (wc && !wc.isDestroyed()) {
-                sendAuthoritativeAgentStreamComplete(wc, runInput, getAgentSessionMeta, {
+              const target = getRunTarget()
+              if (target) {
+                sendAuthoritativeAgentStreamComplete(target, runInput, getAgentSessionMeta, {
                   messages,
                   stoppedByUser: opts?.stoppedByUser ?? false,
                   startedAt: opts?.startedAt,
@@ -485,9 +523,9 @@ export async function runAgentHeadless(
           kind: 'proma_event',
           event: { type: 'title_updated', title },
         })
-        // 同步到渲染进程
-        if (wc && !wc.isDestroyed()) {
-          wc.send(AGENT_IPC_CHANNELS.TITLE_UPDATED, {
+        const target = getRunTarget()
+        if (target) {
+          target.send(AGENT_IPC_CHANNELS.TITLE_UPDATED, {
             sessionId: runInput.sessionId,
             title,
           })
@@ -499,8 +537,7 @@ export async function runAgentHeadless(
           sessionWorkspaceId: session?.workspaceId,
           requestedWorkspaceId: runInput.workspaceId,
         }, () => {
-          if (wc) registerWebContents(runInput.sessionId, wc)
-          runStarted = true
+          if (wc) route = registerWebContents(runInput.sessionId, wc)
           eventBus.emit(runInput.sessionId, {
             kind: 'proma_event',
             event: {
@@ -526,8 +563,9 @@ export async function runAgentHeadless(
       {
         name: 'renderer-error',
         run: () => {
-          if (wc && !wc.isDestroyed()) {
-            wc.send(
+          const target = getRunTarget()
+          if (target) {
+            target.send(
               AGENT_IPC_CHANNELS.STREAM_ERROR,
               buildAuthoritativeAgentStreamErrorPayload(
                 runInput.sessionId,
@@ -542,9 +580,10 @@ export async function runAgentHeadless(
       {
         name: 'renderer-complete',
         run: () => {
-          if (wc && !wc.isDestroyed()) {
+          const target = getRunTarget()
+          if (target) {
             sendAuthoritativeAgentStreamComplete(
-              wc,
+              target,
               runInput,
               getAgentSessionMeta,
               { messages: [], stoppedByUser: false, startedAt },
@@ -558,8 +597,7 @@ export async function runAgentHeadless(
       },
     ], reportAgentServiceTerminalEffectError)
   } finally {
-    if (runStarted && !orchestrator.isActive(runInput.sessionId)) {
-      sessionWebContents.delete(runInput.sessionId)
+    if (route && streamRoutes.removeIfOwner(runInput.sessionId, route.ownerId)) {
       streamForwarder.clear(runInput.sessionId)
     }
   }
@@ -621,6 +659,11 @@ export function hasActiveAgentDataWrites(): boolean {
 /** 查询指定工作区是否仍有 Agent generation-owned 数据写。 */
 export function hasActiveAgentDataWritesForWorkspace(workspaceId: string): boolean {
   return orchestrator.hasGenerationOwnedWritesForWorkspace(workspaceId)
+}
+
+/** 列出当前活跃 Agent 会话的安全快照，供 renderer 重载恢复。 */
+export function listActiveAgentSessionSnapshots(): AgentActiveSessionSnapshot[] {
+  return orchestrator.listActiveSessionSnapshots()
 }
 
 /** 中止所有活跃的 Agent 会话（应用退出时调用） */

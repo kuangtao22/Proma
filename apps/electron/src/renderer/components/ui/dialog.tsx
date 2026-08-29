@@ -5,6 +5,7 @@ import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { X } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import { iconButtonNoRingFocusClass } from "@/components/ui/icon-button-styles"
 
 const Dialog = DialogPrimitive.Root
 
@@ -32,10 +33,16 @@ DialogOverlay.displayName = DialogPrimitive.Overlay.displayName
 
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & { hideClose?: boolean }
->(({ className, children, hideClose, ...props }, ref) => (
-  <DialogPortal>
-    <DialogOverlay />
+  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
+    hideClose?: boolean
+    /** 将弹框限制在指定容器内，而非默认挂载到 document.body。 */
+    container?: HTMLElement | null
+    /** 与本地容器配合时覆写 Overlay 的定位方式。 */
+    overlayClassName?: string
+  }
+>(({ className, children, hideClose, container, overlayClassName, ...props }, ref) => (
+  <DialogPortal container={container ?? undefined}>
+    <DialogOverlay className={overlayClassName} />
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
@@ -53,9 +60,16 @@ const DialogContent = React.forwardRef<
     >
       {children}
       {!hideClose && (
-        <DialogPrimitive.Close className="absolute right-4 top-4 rounded-md p-1 opacity-60 transition-all duration-150 hover:opacity-100 hover:bg-accent/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-offset-2 focus-visible:ring-offset-dialog disabled:pointer-events-none data-[state=open]:bg-accent data-[state=open]:text-muted-foreground">
+        <DialogPrimitive.Close
+          className={cn(
+            "absolute right-4 top-4 rounded-md p-1 opacity-60 transition-all duration-150",
+            "hover:bg-accent/60 hover:opacity-100 focus-visible:bg-accent/60 focus-visible:text-foreground focus-visible:opacity-100",
+            "disabled:pointer-events-none data-[state=open]:bg-accent data-[state=open]:text-muted-foreground",
+            iconButtonNoRingFocusClass,
+          )}
+        >
           <X className="h-4 w-4" />
-          <span className="sr-only">Close</span>
+          <span className="sr-only">关闭</span>
         </DialogPrimitive.Close>
       )}
     </DialogPrimitive.Content>

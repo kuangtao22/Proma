@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, extname, join, resolve } from 'node:path'
 import type { AgentSessionMeta, FileAccessOptions } from '@proma/shared'
 import ts from 'typescript'
 import { requireUserVisibleAgentSession } from './agent-session-visibility'
@@ -37,6 +37,7 @@ const NON_SESSION_ID_ALIAS_CHANNELS = new Set([
   'RELINK_WORKSPACE_PROJECT_ROOT',
   'RESTORE_WORKSPACE_PROJECT_ROOT',
   'SET_BUILTIN_MCP_ENABLED',
+  'SET_CLI_INTEGRATION_ENABLED',
   'UPDATE_WORKSPACE',
 ])
 
@@ -112,7 +113,9 @@ const EXEMPT_REASONS = {
   SETTINGS_IPC_CHANNELS: "只管理应用设置，不接收 sessionId 或文件路径",
   STORAGE_IPC_CHANNELS: "只执行受管存储统计/清理，不接收 Renderer 指定路径",
   SYSTEM_PROMPT_IPC_CHANNELS: "ID 属于系统提示词配置，不是 Agent 会话或 Renderer 文件能力",
+  TERMINAL_IPC_CHANNELS: "入口仅接受主窗口持有的终端 capability ID，不能指定可执行文件或访问其它 Renderer",
   USER_PROFILE_IPC_CHANNELS: "只管理用户资料，不接收 sessionId 或文件路径",
+  VAULT_IPC_CHANNELS: "入口只访问用户已授权 Vault 内的受校验相对路径，不接受任意绝对文件路径",
   VOICE_DICTATION_IPC_CHANNELS: "sessionId 是 ASR 流实例 ID，不是 Agent 会话 ID；音频数据由语音模块自行隔离",
   WECHAT_IPC_CHANNELS: "ID 属于微信桥接登录/连接，不是 Agent 会话或 Renderer 文件能力",
 } as const
@@ -136,8 +139,10 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'DELETE_WORKSPACE',
     'DETACH_WORKSPACE_DIRECTORY',
     'DETACH_WORKSPACE_FILE',
+    'DELETE_MCP_CREDENTIAL',
     'GENERATE_TITLE',
     'GET_CAPABILITIES',
+    'GET_CLI_INTEGRATION_STATUSES',
     'GET_DEFAULT_SKILL_SLUGS',
     'GET_MCP_CONFIG',
     'GET_OTHER_WORKSPACE_SKILLS',
@@ -150,6 +155,7 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'GET_WORKSPACE_MEMORY_SUMMARY',
     'GET_WORKTREE_REPOS',
     'IMPORT_SKILL_FROM_WORKSPACE',
+    'INSTALL_MCP_AND_VALIDATE',
     'LIST_ACTIVE_SESSIONS',
     'LIST_ARCHIVED_SESSIONS',
     'LIST_SESSIONS',
@@ -163,16 +169,21 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'READ_SKILL_FILE',
     'READ_WORKSPACE_AGENTS_MD',
     'READ_WORKSPACE_AUTO_MEMORY_FILE',
+    'REFRESH_MCP_CONNECTIONS',
     'RELINK_WORKSPACE_PROJECT_ROOT',
     'REMOVE_WORKTREE_REPO',
     'RENAME_SKILL_ENTRY',
     'REORDER_WORKSPACES',
     'RESTORE_WORKSPACE_PROJECT_ROOT',
+    'SAVE_MCP_API_KEY',
     'SAVE_FILES_TO_WORKSPACE',
     'SAVE_MCP_CONFIG',
     'SEARCH_MESSAGES',
     'SEARCH_SESSION_REFERENCES',
     'SET_BUILTIN_MCP_ENABLED',
+    'SET_CLI_INTEGRATION_ENABLED',
+    'SET_MCP_ENABLED_AND_VALIDATE',
+    'START_MCP_OAUTH',
     'START_WORKSPACE_MEMORY_WATCH',
     'STOP_WORKSPACE_MEMORY_WATCH',
     'TEST_MCP_SERVER',
@@ -338,7 +349,6 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'LIST_TAGS',
     'LIST_TODOS',
     'OPEN_NATIVE_SYNC_PRIVACY_SETTINGS',
-    'OPEN_WINDOW',
     'REQUEST_NATIVE_SYNC_ACCESS',
     'RESOLVE_NATIVE_SYNC_CONFLICT',
     'SAVE_SYNC_PROFILE',
@@ -384,10 +394,31 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'UPDATE',
     'UPDATE_APPEND_SETTING',
   ], { kind: 'exempt', reason: EXEMPT_REASONS.SYSTEM_PROMPT_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('TERMINAL_IPC_CHANNELS', [
+    'INPUT',
+    'KILL',
+    'RESIZE',
+    'SNAPSHOT',
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.TERMINAL_IPC_CHANNELS }),
   ...defineRendererHandlerPolicies('USER_PROFILE_IPC_CHANNELS', [
     'GET',
     'UPDATE',
   ], { kind: 'exempt', reason: EXEMPT_REASONS.USER_PROFILE_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('VAULT_IPC_CHANNELS', [
+    'AUTHORIZE_CANDIDATE',
+    'CREATE_FOLDER',
+    'CREATE_UNTITLED_FILE',
+    'CREATE_UNTITLED_FILE_IN_FOLDER',
+    'DELETE_FILE',
+    'GET_CONFIG',
+    'LIST_CANDIDATES',
+    'LIST_FILES',
+    'READ_FILE',
+    'RENAME_FILE',
+    'SELECT',
+    'SELECT_DEFAULT',
+    'WRITE_FILE',
+  ], { kind: 'exempt', reason: EXEMPT_REASONS.VAULT_IPC_CHANNELS }),
   ...defineRendererHandlerPolicies('VOICE_DICTATION_IPC_CHANNELS', [
     'CANCEL',
     'CHECK_MIC_PERMISSION',
@@ -412,6 +443,9 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'START_LOGIN',
     'STOP_BRIDGE',
   ], { kind: 'exempt', reason: EXEMPT_REASONS.WECHAT_IPC_CHANNELS }),
+  ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
+    'ACTIVE_SESSIONS_SNAPSHOT',
+  ], { kind: 'agent-session', guards: ['getUserVisiblePendingRequests'] }),
   ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
     'ASK_USER_RESPOND',
     'ATTACH_DIRECTORY',
@@ -446,6 +480,9 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'UPDATE_SESSION_PERMISSION_MODE',
     'UPDATE_SESSION_REASONING_LEVEL',
     'UPDATE_TITLE',
+  ], { kind: 'agent-session', guards: ['requireVisibleSession'] }),
+  ...defineRendererHandlerPolicies('AGENT_ISLAND_IPC_CHANNELS', [
+    'MARK_SESSION_VIEWED',
   ], { kind: 'agent-session', guards: ['requireVisibleSession'] }),
   ...defineRendererHandlerPolicies('AGENT_IPC_CHANNELS', [
     'CHECK_PATHS_TYPE',
@@ -508,6 +545,12 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
   ], { kind: 'path', guards: ['Error'] }),
   ...defineRendererHandlerPolicies('WINDOWS_AGENT_ISLAND_IPC_CHANNELS', [
     'OPEN_SESSION',
+  ], { kind: 'agent-session', guards: ['requireVisibleSession'] }),
+  ...defineRendererHandlerPolicies('TERMINAL_IPC_CHANNELS', [
+    'CREATE',
+  ], { kind: 'agent-session', guards: ['requireVisibleSession'] }),
+  ...defineRendererHandlerPolicies('VAULT_IPC_CHANNELS', [
+    'SET_USER_CONTEXT',
   ], { kind: 'agent-session', guards: ['requireVisibleSession'] }),
   ...defineRendererHandlerPolicies('literal', [
     'file:docx-to-html',
@@ -866,6 +909,8 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
         requireVisibleFileReadAccess: openAccessSnapshot,
         getPreviewCandidateBasePaths: () => [],
         resolveFilePath: () => authorizedPath,
+        basename,
+        extname,
         isPathAllowed: () => true,
         readStableFile: (filePath: string) => readFileSync(filePath),
         decodeStablePreviewText: (content: Buffer) => content.toString('utf8'),
@@ -1123,8 +1168,8 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
     expect(sourceByPath.get('FileMentionSuggestion')).toMatch(/searchWorkspaceFiles\([\s\S]*\{\s*sessionId:\s*currentSessionIdRef\?\.current/)
     expect(sourceByPath.get('RichTextInput')).toContain('currentSessionIdRef,')
     expect(sourceByPath.get('FilePathChip')).toMatch(/showItemInFolder\(cleanPath,\s*\{[\s\S]*sessionId:[\s\S]*candidateBasePaths:/)
-    expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/showItemInFolder\(selected\.absolutePath,\s*\{\s*workspaceSlug\s*\}\)/)
-    expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/access=\{\{\s*workspaceSlug\s*\}\}/)
+    expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/showItemInFolder\(summary\.agentsMd\.path,\s*\{\s*workspaceSlug\s*\}\)/)
+    expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/showItemInFolder\(autoMemoryPath\(summary, path\),\s*\{\s*workspaceSlug\s*\}\)/)
     expect(sourceByPath.get('AgentSkillsView')).toMatch(/openFile\(`\$\{data\.skillsDir\}\/\$\{slug\}`,\s*\{\s*workspaceSlug:\s*data\.workspaceSlug\s*\}\)/)
     expect(sourceByPath.get('GlobalAgentListeners')).toMatch(/getGitRepoStatus\(dirPath,\s*\{\s*sessionId:\s*sid\s*\}\)/)
     expect(sourceByPath.get('FileSearchBar')).toContain("toast.error('文件搜索不可用'")

@@ -13,7 +13,6 @@
 
 import { watch, existsSync, statSync } from 'node:fs'
 import type { FSWatcher } from 'node:fs'
-import { stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import type { BrowserWindow } from 'electron'
 import { AGENT_IPC_CHANNELS } from '@proma/shared'
@@ -73,11 +72,10 @@ function notifyWorkspaceFilesChanged(changedPath?: string): void {
     const changedPaths = [...attachedChangedPaths]
     attachedChangedPaths.clear()
     attachedFilesTimer = null
-    void filterExistingFiles(changedPaths).then((filePaths) => {
-      if (mainWin && !mainWin.isDestroyed()) {
-        mainWin.webContents.send(AGENT_IPC_CHANNELS.WORKSPACE_FILES_CHANGED, filePaths)
-      }
-    })
+    if (mainWin && !mainWin.isDestroyed()) {
+      // 保留删除路径，使当前预览也能从旧缓存切换到“文件不存在”状态。
+      mainWin.webContents.send(AGENT_IPC_CHANNELS.WORKSPACE_FILES_CHANGED, changedPaths)
+    }
   }, DEBOUNCE_MS)
 }
 
@@ -88,18 +86,6 @@ function isExistingDirectory(dirPath: string): boolean {
   } catch {
     return false
   }
-}
-
-/** debounce 后异步筛选存在的普通文件，目录和已删除路径仍会触发空刷新事件。 */
-async function filterExistingFiles(paths: readonly string[]): Promise<string[]> {
-  const results = await Promise.all(paths.map(async (filePath) => {
-    try {
-      return (await stat(filePath)).isFile() ? filePath : null
-    } catch {
-      return null
-    }
-  }))
-  return results.filter((filePath): filePath is string => filePath !== null)
 }
 
 function findNearestExistingDirectory(dirPath: string): string | null {
@@ -268,19 +254,18 @@ export function startWorkspaceWatcher(win: BrowserWindow): void {
           capabilitiesTimer = null
         }, DEBOUNCE_MS)
       } else {
-        // 其他文件变化 → 通知文件浏览器刷新。删除或目录事件会发送空路径列表，
-        // 仍让 Git Diff 刷新，但不会把非文件路径记录到会话改动中。
+        // 其他文件变化 → 通知文件浏览器刷新。保留删除与目录路径，
+        // renderer 会在记录会话文件改动前确认路径仍是实际文件。
         if (filesTimer) clearTimeout(filesTimer)
         changedFilePaths.add(join(watchDir, normalizedFilename))
         filesTimer = setTimeout(() => {
           const paths = [...changedFilePaths]
           changedFilePaths.clear()
           filesTimer = null
-          void filterExistingFiles(paths).then((filePaths) => {
-            if (!win.isDestroyed()) {
-              win.webContents.send(AGENT_IPC_CHANNELS.WORKSPACE_FILES_CHANGED, filePaths)
-            }
-          })
+          if (!win.isDestroyed()) {
+            // 保留删除路径，供当前预览精确失效；文件列表自行重新读取目录。
+            win.webContents.send(AGENT_IPC_CHANNELS.WORKSPACE_FILES_CHANGED, paths)
+          }
         }, DEBOUNCE_MS)
       }
     })

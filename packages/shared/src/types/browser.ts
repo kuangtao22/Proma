@@ -20,7 +20,7 @@ export interface BrowserViewLayout {
 
 export type BrowserExecutionSource = 'user' | 'automation' | 'delegation'
 
-export type BrowserTraceAction = 'navigate' | 'observe' | 'wait' | 'click' | 'fill' | 'press' | 'dom' | 'script' | 'screenshot' | 'tab' | 'download' | 'popup'
+export type BrowserTraceAction = 'navigate' | 'observe' | 'find' | 'wait' | 'click' | 'act' | 'fill' | 'press' | 'hover' | 'drag' | 'scroll' | 'extract' | 'select' | 'upload' | 'dom' | 'script' | 'screenshot' | 'tab' | 'download' | 'popup'
 export type BrowserOperationStatus = 'dispatched' | 'verified' | 'failed' | 'unknown'
 
 /** 脱敏的浏览器操作账本项；绝不含输入正文、Cookie、截图或脚本全文。 */
@@ -52,6 +52,8 @@ export interface BrowserTabSummary {
   tabId: string
   url: string
   title: string
+  /** 页面声明的 HTTP(S) favicon；未提供或加载失败时 renderer 使用默认图标。 */
+  favicon?: string
   loading: boolean
   /** 此标签由 Agent 创建（与当前默认工作标签无关）。 */
   openedByAgent: boolean
@@ -88,6 +90,12 @@ export interface BrowserSessionClosed {
 }
 
 export type BrowserStateChange = BrowserViewState | BrowserSessionClosed
+
+/** 原生 WebContentsView 获得用户焦点；renderer 用它同步双 Pane 焦点与工具栏目标。 */
+export interface BrowserTabFocusChange {
+  sessionId: string
+  tabId: string
+}
 
 export interface BrowserNavigateInput {
   sessionId: string

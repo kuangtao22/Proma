@@ -11,6 +11,6 @@ describe('侧栏归档 Canvas 分组', () => {
     const archivedRowsSource = source.slice(rowsStart, rowsEnd)
 
     expect(archivedRowsSource.indexOf("id: 'canvas-archived-heading'"))
-      .toBeLessThan(archivedRowsSource.indexOf('id: `agent-archived-date-${group.label}`'))
+      .toBeLessThan(archivedRowsSource.indexOf('id: `agent-archived-project-${group.id}`'))
   })
 })

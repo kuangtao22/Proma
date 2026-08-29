@@ -753,16 +753,50 @@ function isMissingPathError(error: unknown): boolean {
   return error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')
 }
 
-/** 原子重写文本文件（用于 JSONL 会话等非单个 JSON 文档）。 */
+/** 普通原子写复用的随机独占同目录临时文件。 */
+interface ExclusiveTemporaryFile {
+  filePath: string
+  descriptor: number
+}
+
+/** 创建不可预测且不会跟随既有符号链接的临时文件。 */
+function openExclusiveTemporarySibling(filePath: string): ExclusiveTemporaryFile {
+  const temporaryPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`)
+  const descriptor = openSync(
+    temporaryPath,
+    constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+    0o600,
+  )
+  return { filePath: temporaryPath, descriptor }
+}
+
+/**
+ * 原子重写文本文件（用于 JSONL 会话等非单个 JSON 文档）。
+ *
+ * 临时文件使用随机名称和独占创建，避免可预测 `<target>.tmp` 被预建为符号链接。
+ */
 export function writeTextFileAtomic(
   filePath: string,
   content: string,
   options: AtomicWriteOptions = {},
 ): DurabilityResult {
-  const tmpPath = filePath + '.tmp'
-  writeFileSync(tmpPath, content, 'utf-8')
-  renameSync(tmpPath, filePath)
-  return syncCommittedFileDurability(filePath, options)
+  const temporary = openExclusiveTemporarySibling(filePath)
+  let descriptor: number | null = temporary.descriptor
+  let committed = false
+  try {
+    writeFileSync(descriptor, content, 'utf-8')
+    fsyncSync(descriptor)
+    closeSync(descriptor)
+    descriptor = null
+    renameSync(temporary.filePath, filePath)
+    committed = true
+    return syncCommittedFileDurability(filePath, options)
+  } finally {
+    if (descriptor !== null) closeSync(descriptor)
+    if (!committed) {
+      try { unlinkSync(temporary.filePath) } catch { /* 临时文件可能已清理 */ }
+    }
+  }
 }
 
 /**
@@ -777,24 +811,27 @@ export function writeJsonLinesFileAtomic(
   values: Iterable<object>,
   options: AtomicWriteOptions = {},
 ): DurabilityResult {
-  /** 同目录临时文件保证最终 rename 不跨文件系统。 */
-  const temporaryPath = `${filePath}.tmp`
+  /** 同目录随机独占临时文件保证最终 rename 不跨文件系统且不跟随预建链接。 */
+  const temporary = openExclusiveTemporarySibling(filePath)
   /** 临时文件 descriptor 只在本次完整写入期间持有。 */
-  const descriptor = openSync(
-    temporaryPath,
-    constants.O_CREAT | constants.O_TRUNC | constants.O_WRONLY,
-    0o600,
-  )
+  let descriptor: number | null = temporary.descriptor
+  let committed = false
   try {
     for (const value of values) {
       writeFileSync(descriptor, `${JSON.stringify(value)}\n`, 'utf8')
     }
     fsyncSync(descriptor)
-  } finally {
     closeSync(descriptor)
+    descriptor = null
+    renameSync(temporary.filePath, filePath)
+    committed = true
+    return syncCommittedFileDurability(filePath, options)
+  } finally {
+    if (descriptor !== null) closeSync(descriptor)
+    if (!committed) {
+      try { unlinkSync(temporary.filePath) } catch { /* 临时文件可能已清理 */ }
+    }
   }
-  renameSync(temporaryPath, filePath)
-  return syncCommittedFileDurability(filePath, options)
 }
 
 /**

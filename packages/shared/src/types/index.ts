@@ -29,6 +29,7 @@ export * from './reasoning-profile'
 // Agent Provider 适配器接口
 export * from './agent-provider'
 export * from './agent-runtime'
+export * from './terminal'
 
 // 环境检测相关类型
 export * from './environment'
@@ -73,3 +74,5 @@ export * from './design'
 
 // 独立 Canvas 图文档相关类型
 export * from './canvas'
+// 用户授权的 Markdown Vault 相关类型
+export * from './vault'

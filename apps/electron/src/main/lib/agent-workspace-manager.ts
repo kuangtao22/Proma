@@ -766,6 +766,15 @@ export function getWorkspaceCapabilities(workspaceSlug: string): WorkspaceCapabi
     name,
     enabled: entry.enabled,
     type: entry.type,
+    // Do not cross the IPC boundary with the server-provided diagnostic message:
+    // it may contain endpoint details. The success bit and timestamp are enough
+    // for catalog status and # MCP eligibility.
+    ...(entry.lastTestResult ? {
+      lastTestResult: {
+        success: entry.lastTestResult.success,
+        timestamp: entry.lastTestResult.timestamp,
+      },
+    } : {}),
   }))
 
   return { mcpServers, builtinMcpServers, skills, memory }
@@ -1550,12 +1559,17 @@ export function readWorkspaceAgentsMd(workspaceSlug: string): SkillFileContent {
   }
 }
 
-export function writeWorkspaceAgentsMd(workspaceSlug: string, content: string): void {
+export function writeWorkspaceAgentsMd(workspaceSlug: string, content: string, expectedContent?: string): void {
+  const path = getWorkspaceAgentsMdPath(workspaceSlug)
+  const currentContent = existsSync(path) ? readFileSync(path, 'utf-8') : ''
+  if (expectedContent !== undefined && currentContent !== expectedContent) {
+    throw new Error('文件已被外部更新。请刷新后再处理你的修改。')
+  }
   const byteLen = Buffer.byteLength(content, 'utf-8')
   if (byteLen > SKILL_FILE_SIZE_LIMIT) {
     throw new Error(`内容过大（${(byteLen / 1024 / 1024).toFixed(2)} MB），超过 10 MB 限制`)
   }
-  writeTextFileAtomic(getWorkspaceAgentsMdPath(workspaceSlug), content)
+  writeTextFileAtomic(path, content)
   console.log(`[Agent 工作区] 已更新工作区 AGENTS.md: ${workspaceSlug}`)
 }
 
@@ -1587,9 +1601,13 @@ export function readWorkspaceAutoMemoryFile(workspaceSlug: string, relativePath:
   }
 }
 
-export function writeWorkspaceAutoMemoryFile(workspaceSlug: string, relativePath: string, content: string): void {
+export function writeWorkspaceAutoMemoryFile(workspaceSlug: string, relativePath: string, content: string, expectedContent?: string): void {
   const dir = getWorkspaceAutoMemoryDir(workspaceSlug)
   const abs = resolveAutoMemoryFilePath(dir, relativePath)
+  const currentContent = existsSync(abs) ? readFileSync(abs, 'utf-8') : ''
+  if (expectedContent !== undefined && currentContent !== expectedContent) {
+    throw new Error('文件已被外部更新。请刷新后再处理你的修改。')
+  }
   const byteLen = Buffer.byteLength(content, 'utf-8')
   if (byteLen > SKILL_FILE_SIZE_LIMIT) {
     throw new Error(`内容过大（${(byteLen / 1024 / 1024).toFixed(2)} MB），超过 10 MB 限制`)
@@ -1818,6 +1836,8 @@ interface WorkspaceConfig {
   attachedDirectories?: string[]
   attachedFiles?: string[]
   worktreeRepos?: import('@proma/shared').WorkspaceWorktreeRepo[]
+  /** CLI integrations disabled only for Proma in this workspace; third-party CLI credentials stay untouched. */
+  disabledCliIntegrationIds?: string[]
   /** User consent for Agent-initiated maintenance of the two AGENTS.md files. */
   projectKnowledgeMaintenanceApproved?: boolean
   /** Internal scheduling metadata only; Markdown remains the long-term memory source. */
@@ -1849,6 +1869,9 @@ function readWorkspaceConfig(workspaceSlug: string): WorkspaceConfig {
         : undefined,
       worktreeRepos: Array.isArray(data.worktreeRepos)
         ? data.worktreeRepos.filter((r) => r && typeof r.name === 'string' && typeof r.repoPath === 'string' && typeof r.worktreesPath === 'string')
+        : undefined,
+      disabledCliIntegrationIds: Array.isArray(data.disabledCliIntegrationIds)
+        ? [...new Set(data.disabledCliIntegrationIds.filter((id): id is string => typeof id === 'string' && id.length > 0))]
         : undefined,
       projectKnowledgeMaintenanceApproved: data.projectKnowledgeMaintenanceApproved === true ? true : undefined,
       // Read the prior public setting only to preserve its cooldown timestamp; its
@@ -1931,6 +1954,29 @@ function rebaseWorkspacePathArray(
     return join(resolve(targetRoot), relativePath)
   })
   return changed ? rebasedValues : values
+}
+
+/** IDs of CLI integrations that are intentionally disabled only for Proma in this workspace. */
+export function getDisabledCliIntegrationIds(workspaceSlug: string): Set<string> {
+  return new Set(readWorkspaceConfig(workspaceSlug).disabledCliIntegrationIds ?? [])
+}
+
+/**
+ * Changes Proma's permission to use a CLI integration without invoking third-party logout,
+ * credential deletion, or token revocation.
+ */
+export function setCliIntegrationEnabled(workspaceSlug: string, id: string, enabled: boolean): void {
+  const normalizedId = id.trim()
+  if (!normalizedId) throw new Error('CLI 集成 ID 不能为空')
+
+  const config = readWorkspaceConfig(workspaceSlug)
+  const disabledIds = new Set(config.disabledCliIntegrationIds ?? [])
+  if (enabled) disabledIds.delete(normalizedId)
+  else disabledIds.add(normalizedId)
+  writeWorkspaceConfig(workspaceSlug, {
+    ...config,
+    disabledCliIntegrationIds: [...disabledIds].sort(),
+  })
 }
 
 /** Whether the user explicitly enabled Agent-initiated maintenance of both AGENTS.md files. */

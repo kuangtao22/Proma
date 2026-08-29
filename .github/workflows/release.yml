@@ -67,6 +67,9 @@ jobs:
       - name: 安装依赖
         run: bun install --frozen-lockfile
 
+      - name: 准备 OfficeCLI（macOS arm64）
+        run: bun run --filter='@proma/electron' prepare:officecli
+
       - name: 检测 macOS 签名配置
         id: mac_signing
         env:
@@ -155,6 +158,9 @@ jobs:
 
       - name: 安装依赖
         run: bun install --frozen-lockfile
+
+      - name: 准备 OfficeCLI（macOS x64）
+        run: bun run --filter='@proma/electron' prepare:officecli
 
       - name: 检测 macOS 签名配置
         id: mac_signing

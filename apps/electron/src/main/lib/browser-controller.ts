@@ -1,6 +1,7 @@
 import { app, BrowserWindow, WebContentsView, session as electronSession, type DownloadItem, type Session, type WebContents } from 'electron'
 import path from 'node:path'
-import type { BrowserExecutionSource, BrowserOperationStatus, BrowserSessionClosed, BrowserTraceAction, BrowserTraceItem, BrowserViewLayout, BrowserViewState, BrowserTabState } from '@proma/shared'
+import { realpath, stat } from 'node:fs/promises'
+import type { BrowserExecutionSource, BrowserOperationStatus, BrowserSessionClosed, BrowserTabFocusChange, BrowserTraceAction, BrowserTraceItem, BrowserViewLayout, BrowserViewState, BrowserTabState } from '@proma/shared'
 import { AGENT_IPC_CHANNELS } from '@proma/shared'
 import { assertSafeBrowserDestination, assertSafeBrowserDestinationWithFallback, assertSafeBrowserDownloadUrl, assertSafeBrowserUrl, isSupportedBrowserPopupUrl, isTransientBrowserPopupUrl, USER_NEW_TAB_URL } from './browser-policy'
 import { createAuthorizedPreviewUrl, isAuthorizedPreviewProtocol } from './browser-preview-service'
@@ -9,9 +10,23 @@ import { BrowserCdpTimeoutError, BrowserOperationAbortedError, BROWSER_OBSERVE_T
 import { parseBrowserPressAction } from './browser-key-policy'
 import { browserObservationNameLimit, prioritizeBrowserObservationCandidates, resolveBrowserObserveMaxElements } from './browser-observation-policy'
 import { buildPersistentBrowserPartition, resolveBrowserProfileKey } from './browser-profile-policy'
+import { canBrowserSessionTakeForeground, isNewBrowserTabLayoutRevision } from './browser-presentation-policy'
 import { hasAcknowledgedBrowserRiskDisclaimer } from './browser-risk-disclaimer'
 import { buildPromaBrowserUserAgent } from './browser-identity'
-import { assertBrowserScript, buildBrowserDomActionExpression, type BrowserDomActionInput } from './browser-script-policy'
+import {
+  assertBrowserExtract,
+  assertBrowserScript,
+  assertBrowserScroll,
+  assertBrowserSelectOption,
+  buildBrowserDomActionExpression,
+  buildBrowserExtractExpression,
+  buildBrowserScrollExpression,
+  buildBrowserSelectOptionExpression,
+  type BrowserDomActionInput,
+  type BrowserExtractInput,
+  type BrowserScrollInput,
+  type BrowserSelectOptionInput,
+} from './browser-script-policy'
 import { getSettings } from './settings-service'
 import { isValidImageBytes } from './image-content-validation'
 
@@ -35,6 +50,7 @@ function sanitizeDownloadFilename(raw: string): string {
 
 type CdpResponse = Record<string, unknown>
 type RefEntry = { backendNodeId: number; generation: number; label: string; editable: boolean }
+type BrowserWaitCondition = { kind: 'url' | 'text' | 'selector'; value: string }
 type BrowserTabRecord = {
   tabId: string
   view: WebContentsView
@@ -56,6 +72,8 @@ type BrowserTabRecord = {
   popupInitialNavigationPending: boolean
   /** 用于在超限时优先回收最久未使用的 Agent 标签。 */
   lastActivityAt: number
+  /** 页面声明的 HTTP(S) favicon；仅用于 renderer 标签图标。 */
+  favicon: string | null
   highlightTimer?: ReturnType<typeof setTimeout>
   lastBounds?: BrowserViewLayout['bounds']
   /** 仅记录当前实际挂载的 owner；隐藏时 detach，但保留 WebContents 及页面状态。 */
@@ -99,7 +117,8 @@ type BrowserSessionRecord = {
   ledger: BrowserTraceItem[]
   /** 用户在面板中主动打开/操作过浏览器；用于下一条消息的实时上下文。 */
   userOpenedAt: number | null
-  lastLayoutRevision: number
+  /** 每个 BrowserSlot 独立拒绝晚到布局；双 Pane 下不能用 Session 级 revision 互相覆盖。 */
+  lastLayoutRevisionByTab: Map<string, number>
 }
 
 type BrowserSessionConfiguration = {
@@ -108,10 +127,7 @@ type BrowserSessionConfiguration = {
   executionSource: BrowserExecutionSource
 }
 
-/**
- * 主窗口只有一个原生浏览器展示槽。布局 revision 由 renderer 全局递增，
- * 因此可跨 Agent session 拒绝晚到的 show IPC。
- */
+/** 一个前台 BrowserSlot 对应一个原生 WebContentsView；同一 Agent Session 最多可同时呈现多个。 */
 type BrowserPresentation = {
   sessionId: string
   tabId: string
@@ -208,10 +224,12 @@ export class BrowserController {
   private readonly downloadGuardedSessions = new WeakSet<Session>()
   /** 自定义 partition 不继承 default session 的协议处理器，必须单独注册本地预览协议。 */
   private readonly previewProtocolSessions = new WeakSet<Session>()
-  /** 跨 Session 的唯一原生 WebContentsView 前台所有权。 */
-  private presentation: BrowserPresentation | null = null
-  /** 即使当前没有 Slot，也保留最新 show 代际以拒绝晚到的旧 show IPC。 */
-  private latestPresentationRevision = 0
+  /** 同一前台 Agent Session 可同时拥有多个原生 WebContentsView（双 Pane）。 */
+  private readonly presentations = new Map<string, BrowserPresentation>()
+  /** 原生视图仍只能属于一个前台 Agent Session，防止后台 Session 穿透到当前界面。 */
+  private foregroundPresentationSessionId: string | null = null
+  /** 最近一次切换前台 Session 的 show 代际，用于拒绝晚到的旧 Session show。 */
+  private latestForegroundPresentationRevision = 0
 
   configureSession(sessionId: string, input: ConfigureBrowserSessionInput): void {
     const previous = this.configurations.get(sessionId)
@@ -257,6 +275,12 @@ export class BrowserController {
     this.owner.webContents.send(AGENT_IPC_CHANNELS.BROWSER_STATE_CHANGED, change)
   }
 
+  private emitFocusedTab(browserSession: BrowserSessionRecord, tab: BrowserTabRecord): void {
+    if (!this.owner || this.owner.isDestroyed() || !this.isManagedTabCurrent(browserSession, tab)) return
+    const change: BrowserTabFocusChange = { sessionId: browserSession.sessionId, tabId: tab.tabId }
+    this.owner.webContents.send(AGENT_IPC_CHANNELS.BROWSER_TAB_FOCUSED, change)
+  }
+
   private buildState(browserSession: BrowserSessionRecord): BrowserViewState {
     const active = browserSession.tabs.get(browserSession.activeTabId)
     if (!active) throw new Error('受管浏览器没有有效标签。')
@@ -270,6 +294,7 @@ export class BrowserController {
         tabId: tab.tabId,
         url: tab.state.url,
         title: tab.state.title,
+        ...(tab.favicon ? { favicon: tab.favicon } : {}),
         loading: tab.state.loading,
         openedByAgent: tab.openedByAgent,
         openedByPopup: tab.openedByPopup,
@@ -395,11 +420,8 @@ export class BrowserController {
     if (browserSession.agentAbortController.signal.aborted) browserSession.agentAbortController = new AbortController()
     if (!signal) return browserSession.agentAbortController.signal
     if (signal.aborted) return signal
-    const merged = new AbortController()
-    const abort = () => merged.abort()
-    signal.addEventListener('abort', abort, { once: true })
-    browserSession.agentAbortController.signal.addEventListener('abort', abort, { once: true })
-    return merged.signal
+    // Native signal composition avoids retaining a per-operation closure on the session signal until Stop Agent.
+    return AbortSignal.any([signal, browserSession.agentAbortController.signal])
   }
 
   private runTabOperation<T>(browserSession: BrowserSessionRecord, tab: BrowserTabRecord, signal: AbortSignal | undefined, task: (operationSignal: AbortSignal | undefined) => Promise<T>, operationLease?: () => void): Promise<T> {
@@ -561,7 +583,7 @@ export class BrowserController {
       executionSource: configuration?.executionSource ?? 'user',
       ledger: [],
       userOpenedAt: null,
-      lastLayoutRevision: 0,
+      lastLayoutRevisionByTab: new Map(),
     }
     this.installSessionGuards(browserSession)
     this.installPreviewProtocol(browserSession)
@@ -597,6 +619,7 @@ export class BrowserController {
       popupInitialUrl,
       popupInitialNavigationPending: popupInitialUrl !== null && isTransientBrowserPopupUrl(popupInitialUrl),
       lastActivityAt: Date.now(),
+      favicon: null,
       attachedOwner: null,
     }
     view.setVisible(false)
@@ -623,6 +646,8 @@ export class BrowserController {
           })
           this.activateDisplayTab(browserSession, popup)
           this.trace(browserSession, popup, 'popup', isTransientBrowserPopupUrl(url) ? '已打开临时新窗口' : '已打开新窗口', 'dispatched')
+          // popup 尚未有 BrowserSlot，显式要求 renderer 将它放入当前焦点 Pane。
+          this.emitFocusedTab(browserSession, popup)
           return popup.view.webContents
         },
       }
@@ -643,20 +668,54 @@ export class BrowserController {
         this.trace(browserSession, tab, 'navigate', '已阻止不安全的页面跳转', 'failed')
       }
     })
-    view.webContents.on('did-start-loading', () => { this.invalidateTabDocument(tab); this.updateNavigationState(browserSession, tab) })
+    view.webContents.on('focus', () => {
+      if (!this.isManagedTabCurrent(browserSession, tab) || !this.hasPresentation(browserSession.sessionId, tab.tabId)) return
+      tab.lastActivityAt = Date.now()
+      browserSession.activeTabId = tab.tabId
+      this.emit(browserSession)
+      this.emitFocusedTab(browserSession, tab)
+    })
+    view.webContents.on('did-start-loading', () => {
+      // 加载状态会因子资源再次开始，不能在此清 favicon，否则已获取的页面图标会被覆盖回默认图标。
+      this.invalidateTabDocument(tab)
+      this.updateNavigationState(browserSession, tab)
+    })
+    view.webContents.on('page-favicon-updated', (_event, faviconUrls: string[]) => {
+      // favicon URL 来自不可信页面，renderer 仅允许加载普通 HTTP(S) 图片，避免 data/blob 等任意 scheme。
+      tab.favicon = faviconUrls.find((faviconUrl) => {
+        try {
+          const protocol = new URL(faviconUrl).protocol
+          return protocol === 'https:' || protocol === 'http:'
+        } catch {
+          return false
+        }
+      }) ?? null
+      this.emit(browserSession)
+    })
     view.webContents.on('did-stop-loading', () => this.updateNavigationState(browserSession, tab))
     view.webContents.on('page-title-updated', () => this.updateNavigationState(browserSession, tab))
-    view.webContents.on('did-navigate', () => { tab.popupInitialNavigationPending = false; this.invalidateTabDocument(tab); this.updateNavigationState(browserSession, tab) })
+    view.webContents.on('did-navigate', () => {
+      // 只在主框架真正完成跨文档导航时清理旧站点图标；新页面随后会通过 page-favicon-updated 重新发布。
+      tab.favicon = null
+      tab.popupInitialNavigationPending = false
+      this.invalidateTabDocument(tab)
+      this.updateNavigationState(browserSession, tab)
+    })
     view.webContents.on('did-navigate-in-page', () => { tab.popupInitialNavigationPending = false; this.invalidateTabDocument(tab); this.updateNavigationState(browserSession, tab) })
     view.webContents.on('destroyed', () => {
       if (!browserSession.tabs.has(tab.tabId)) return
       this.disposePopupChildren(browserSession, tab.tabId)
       browserSession.tabs.delete(tab.tabId)
+      browserSession.lastLayoutRevisionByTab.delete(tab.tabId)
+      this.removePresentation(browserSession.sessionId, tab.tabId)
       this.clearAgentTargetHighlight(tab)
       this.detachTabView(tab)
       this.repairTabSelection(browserSession, tab.tabId)
       if (browserSession.tabs.size === 0) {
         this.sessions.delete(browserSession.sessionId)
+        this.clearPresentationsForSession(browserSession.sessionId)
+        if (this.foregroundPresentationSessionId === browserSession.sessionId) this.foregroundPresentationSessionId = null
+        this.emitClosed(browserSession.sessionId)
         return
       }
       this.emit(browserSession)
@@ -765,17 +824,43 @@ export class BrowserController {
     return structuredClone(this.buildState(browserSession))
   }
 
+  private presentationKey(sessionId: string, tabId: string): string {
+    return `${sessionId}\u0000${tabId}`
+  }
+
+  private hasPresentation(sessionId: string, tabId: string): boolean {
+    return this.presentations.has(this.presentationKey(sessionId, tabId))
+  }
+
+  private hasPresentationForSession(sessionId: string): boolean {
+    for (const presentation of this.presentations.values()) {
+      if (presentation.sessionId === sessionId) return true
+    }
+    return false
+  }
+
+  private removePresentation(sessionId: string, tabId: string): void {
+    this.presentations.delete(this.presentationKey(sessionId, tabId))
+  }
+
+  private clearPresentationsForSession(sessionId: string): void {
+    for (const [key, presentation] of this.presentations) {
+      if (presentation.sessionId === sessionId) this.presentations.delete(key)
+    }
+  }
+
   /**
-   * 所有受管标签都挂在同一个 BrowserWindow.contentView，必须在 controller
-   * 层保证跨 Session 只有一个原生 View 可见，不能依赖 renderer 卸载顺序。
+   * 所有受管标签都挂在同一个 BrowserWindow.contentView。同一个前台 Agent Session
+   * 可以有多个不重叠的 Pane，但其他 Session 的原生 View 必须全部 detach。
    */
-  private hideAllViewsExcept(targetSessionId: string, targetTabId: string): Set<BrowserSessionRecord> {
+  private hideViewsOutsideSession(targetSessionId: string): Set<BrowserSessionRecord> {
     const changedSessions = new Set<BrowserSessionRecord>()
     for (const browserSession of this.sessions.values()) {
+      if (browserSession.sessionId === targetSessionId) continue
       for (const tab of browserSession.tabs.values()) {
-        if (browserSession.sessionId === targetSessionId && tab.tabId === targetTabId) continue
         if (this.hideTabView(tab)) changedSessions.add(browserSession)
       }
+      this.clearPresentationsForSession(browserSession.sessionId)
     }
     return changedSessions
   }
@@ -829,7 +914,7 @@ export class BrowserController {
   }
 
   private isBackgroundSession(browserSession: BrowserSessionRecord): boolean {
-    if (this.presentation?.sessionId === browserSession.sessionId) return false
+    if (this.hasPresentationForSession(browserSession.sessionId)) return false
     if (browserSession.preserveSessionOnHide) return false
     if (browserSession.activeAgentOperationCount > 0) return false
     return [...browserSession.tabs.values()].every((tab) => !tab.state.visible)
@@ -852,14 +937,17 @@ export class BrowserController {
     }
   }
 
-  /** 用户最小化当前浏览器：保留 WebContents，并在必要时回收最久未使用的后台 session。 */
+  /** 用户最小化当前浏览器：保留 WebContents，并隐藏该 Session 的所有可见 Pane。 */
   minimize(sessionId: string): void {
     const browserSession = this.getSession(sessionId)
-    const tab = this.getDisplayTab(browserSession)
-    tab.lastActivityAt = Date.now()
+    const activeTab = this.getDisplayTab(browserSession)
+    activeTab.lastActivityAt = Date.now()
     const changedSessions = new Set<BrowserSessionRecord>()
-    if (this.hideTabView(tab)) changedSessions.add(browserSession)
-    if (this.presentation?.sessionId === browserSession.sessionId) this.presentation = null
+    for (const tab of browserSession.tabs.values()) {
+      if (this.hideTabView(tab)) changedSessions.add(browserSession)
+    }
+    this.clearPresentationsForSession(browserSession.sessionId)
+    if (this.foregroundPresentationSessionId === browserSession.sessionId) this.foregroundPresentationSessionId = null
     browserSession.preserveSessionOnHide = false
     this.emitChangedSessions(changedSessions)
     this.pruneBackgroundSessions()
@@ -868,30 +956,41 @@ export class BrowserController {
   setLayout(layout: BrowserViewLayout): void {
     const browserSession = this.sessions.get(layout.sessionId)
     if (!browserSession) return
-    // React effect cleanup 和新 slot 的 IPC 可以交错到达。只采纳当前 Session 的最新布局。
-    if (!Number.isSafeInteger(layout.revision) || layout.revision <= browserSession.lastLayoutRevision) return
-    browserSession.lastLayoutRevision = layout.revision
-    browserSession.preserveSessionOnHide = layout.preserveSessionOnHide === true
-    const tab = browserSession.tabs.get(layout.tabId ?? browserSession.activeTabId)
+    const tabId = layout.tabId ?? browserSession.activeTabId
+    const tab = browserSession.tabs.get(tabId)
     // BrowserSlot 卸载与 tab 关闭可交错，晚到布局不应让 renderer 报错。
     if (!tab) return
+    // 双 Pane 中两个 Slot 会交错发布。每个 tab 只和自己的最新 revision 比较，
+    // 不能让右 Pane 的 resize 吞掉左 Pane 尚未到达的 show。
+    const previousRevision = browserSession.lastLayoutRevisionByTab.get(tab.tabId) ?? 0
+    if (!isNewBrowserTabLayoutRevision(layout.revision, previousRevision)) return
+    browserSession.lastLayoutRevisionByTab.set(tab.tabId, layout.revision)
+    browserSession.preserveSessionOnHide = layout.preserveSessionOnHide === true
 
     const bounds = layout.bounds
     const visible = layout.visible && bounds.width > 4 && bounds.height > 4 && !!this.owner && !this.owner.isDestroyed() && this.owner.isVisible()
     if (!visible) {
-      this.latestPresentationRevision = Math.max(this.latestPresentationRevision, layout.revision)
       const changedSessions = new Set<BrowserSessionRecord>()
       if (this.hideTabView(tab)) changedSessions.add(browserSession)
-      if (this.presentation?.sessionId === browserSession.sessionId && this.presentation.tabId === tab.tabId) {
-        this.presentation = null
-      }
+      this.removePresentation(browserSession.sessionId, tab.tabId)
       this.emitChangedSessions(changedSessions)
       return
     }
 
-    // revision 在 renderer 全局单调递增。A 的旧 show 即使在 B 已显示后晚到，
-    // 也不能重新把 A 的原生 view 放到前台。
-    if (layout.revision <= this.latestPresentationRevision) return
+    // revision 在 renderer 全局单调递增。只有切换 Agent Session 时才用全局 show
+    // 代际仲裁；同一 Session 的多个 Pane 必须独立接受各自的新布局。
+    if (!canBrowserSessionTakeForeground({
+      incomingSessionId: browserSession.sessionId,
+      foregroundSessionId: this.foregroundPresentationSessionId,
+      revision: layout.revision,
+      latestForegroundRevision: this.latestForegroundPresentationRevision,
+    })) return
+
+    const changedSessions = this.foregroundPresentationSessionId === browserSession.sessionId
+      ? new Set<BrowserSessionRecord>()
+      : this.hideViewsOutsideSession(browserSession.sessionId)
+    this.foregroundPresentationSessionId = browserSession.sessionId
+    this.latestForegroundPresentationRevision = Math.max(this.latestForegroundPresentationRevision, layout.revision)
 
     const zoomFactor = this.owner?.webContents.getZoomFactor() ?? 1
     const adjustedBounds = {
@@ -900,7 +999,6 @@ export class BrowserController {
       width: Math.round(bounds.width * zoomFactor),
       height: Math.round(bounds.height * zoomFactor),
     }
-    const changedSessions = this.hideAllViewsExcept(browserSession.sessionId, tab.tabId)
     if (!tab.lastBounds || Object.entries(adjustedBounds).some(([key, value]) => tab.lastBounds?.[key as keyof typeof adjustedBounds] !== value)) {
       tab.lastBounds = { ...adjustedBounds }
     }
@@ -909,40 +1007,35 @@ export class BrowserController {
       tab.state.visible = shown
       changedSessions.add(browserSession)
     }
-    this.presentation = shown ? { sessionId: browserSession.sessionId, tabId: tab.tabId, revision: layout.revision } : null
-    this.latestPresentationRevision = layout.revision
+    if (shown) {
+      this.presentations.set(this.presentationKey(browserSession.sessionId, tab.tabId), {
+        sessionId: browserSession.sessionId,
+        tabId: tab.tabId,
+        revision: layout.revision,
+      })
+    } else {
+      this.removePresentation(browserSession.sessionId, tab.tabId)
+    }
     this.emitChangedSessions(changedSessions)
     if (shown) this.pruneBackgroundSessions()
   }
 
   /**
-   * 会话内切 tab 可立即复用展示区域；后台 Session 只更新自身状态，绝不抢占
-   * 当前浏览器展示槽，等待其 BrowserSlot 成为前台后再由 setLayout 显示。
+   * Tab 激活只改变地址栏/历史操作的逻辑目标。原生 View 的增删和 bounds 由各自
+   * BrowserSlot 的 setLayout 驱动，因此聚焦一个 Browser Pane 不能隐藏另一个 Pane。
    */
   private activateDisplayTab(browserSession: BrowserSessionRecord, tab: BrowserTabRecord): void {
-    const previous = browserSession.tabs.get(browserSession.activeTabId)
     tab.lastActivityAt = Date.now()
     browserSession.activeTabId = tab.tabId
-    if (this.presentation?.sessionId !== browserSession.sessionId) {
-      // 后台 Session 的 tab 切换只更新逻辑状态，所有原生 View 都保持 detach。
-      for (const candidate of browserSession.tabs.values()) this.hideTabView(candidate)
-      this.emit(browserSession)
-      return
+    const isPresented = this.foregroundPresentationSessionId === browserSession.sessionId
+      && this.hasPresentation(browserSession.sessionId, tab.tabId)
+    const visible = isPresented && this.attachTabView(tab)
+    if (!visible) {
+      this.detachTabView(tab)
+      this.removePresentation(browserSession.sessionId, tab.tabId)
     }
-
-    if (!tab.lastBounds && previous?.lastBounds) {
-      tab.lastBounds = { ...previous.lastBounds }
-    }
-    const changedSessions = this.hideAllViewsExcept(browserSession.sessionId, tab.tabId)
-    const shouldShow = !!tab.lastBounds && !!this.owner && !this.owner.isDestroyed() && this.owner.isVisible()
-    const visible = shouldShow && this.attachTabView(tab)
-    if (!visible) this.detachTabView(tab)
-    if (tab.state.visible !== visible) {
-      tab.state.visible = visible
-      changedSessions.add(browserSession)
-    }
-    this.presentation = visible ? { ...this.presentation, tabId: tab.tabId } : null
-    this.emitChangedSessions(changedSessions)
+    if (tab.state.visible !== visible) tab.state.visible = visible
+    this.emit(browserSession)
   }
 
   private disposePopupChildren(browserSession: BrowserSessionRecord, openerTabId: string): void {
@@ -965,6 +1058,8 @@ export class BrowserController {
     // Child windows use Electron's opener lifetime and must not outlive a tab closed from Proma UI either.
     this.disposePopupChildren(browserSession, tab.tabId)
     browserSession.tabs.delete(tab.tabId)
+    browserSession.lastLayoutRevisionByTab.delete(tab.tabId)
+    this.removePresentation(browserSession.sessionId, tab.tabId)
     this.clearAgentTargetHighlight(tab)
     try { if (tab.view.webContents.debugger.isAttached()) tab.view.webContents.debugger.detach() } catch { /* 已销毁 */ }
     this.detachTabView(tab)
@@ -991,8 +1086,10 @@ export class BrowserController {
 
   /** Agent 新建工作 tab，并立即切到该标签让用户能看到接下来的操作。 */
   async createNewTab(sessionId: string, url?: string): Promise<BrowserViewState> {
-    const browserSession = this.getOrCreateSession(sessionId)
+    // 新会话由本方法直接创建 Agent 标签，不能经 getOrCreateSession 预建空白标签，
+    // 否则携带 URL 时会留下一个无用的初始标签。
     this.assertRiskDisclaimerAcknowledged()
+    const browserSession = this.sessions.get(sessionId) ?? this.createSession(sessionId)
     const tab = this.createTab(browserSession, false, true)
     browserSession.agentTabId = tab.tabId
     this.activateDisplayTab(browserSession, tab)
@@ -1006,7 +1103,9 @@ export class BrowserController {
 
   /** 用户在浏览器面板中新建 tab；不会抢占 Agent 的工作 tab。 */
   async createDisplayTab(sessionId: string, url?: string): Promise<BrowserViewState> {
-    const browserSession = this.getOrCreateSession(sessionId, [], false)
+    // 首次由历史链接携带 URL 创建时，此标签本身就是初始展示标签；不要先经
+    // getOrCreateSession 预建一个空白标签，否则会留下无用的空 Tab。
+    const browserSession = this.sessions.get(sessionId) ?? this.createSession(sessionId)
     this.assertRiskDisclaimerAcknowledged()
     this.markUserBrowserContext(browserSession)
     const tab = this.createTab(browserSession)
@@ -1044,7 +1143,8 @@ export class BrowserController {
     this.disposeTab(browserSession, tab)
     if (browserSession.tabs.size === 0) {
       this.sessions.delete(sessionId)
-      if (this.presentation?.sessionId === sessionId) this.presentation = null
+      this.clearPresentationsForSession(sessionId)
+      if (this.foregroundPresentationSessionId === sessionId) this.foregroundPresentationSessionId = null
       this.emitClosed(sessionId)
       return null
     }
@@ -1248,6 +1348,57 @@ export class BrowserController {
     }
   }
 
+  /** Find fresh semantic refs without returning a full accessibility snapshot to the model. */
+  async find(sessionId: string, query: { role?: string; name?: string; exact?: boolean; maxResults?: number }, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; title: string; generation: number; elements: BrowserObservation['elements'] }> {
+    const role = query.role?.trim().toLowerCase()
+    const name = query.name?.trim().toLowerCase()
+    const maxResults = query.maxResults ?? 20
+    if (!role && !name) throw new Error('语义定位至少需要 role 或 name。')
+    if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 50) throw new Error('maxResults 必须是 1 到 50 的整数。')
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      // Filter the AX tree before applying the observation ranking/cap so Find can discover a matching
+      // element that was absent from the compact BrowserObserve output.
+      const response = await this.cdp(tab, 'Accessibility.getFullAXTree', { depth: resolveBrowserObserveAxDepth(400) }, BROWSER_OBSERVE_TIMEOUT_MS, operationSignal)
+      throwIfBrowserOperationAborted(operationSignal)
+      const nodes = Array.isArray(response.nodes) ? response.nodes : []
+      const candidates: Array<{ backendNodeId: number; role: string; name: string; editable: boolean }> = []
+      for (const node of nodes) {
+        if (!node || typeof node !== 'object') continue
+        const ax = node as Record<string, unknown>
+        const backendNodeId = typeof ax.backendDOMNodeId === 'number' ? ax.backendDOMNodeId : 0
+        const candidateRole = textValue(ax.role)
+        const candidateName = textValue(ax.name)
+        const editable = isEditableAxNode(ax)
+        if (!backendNodeId || !candidateRole || (!candidateName && !editable && !['button', 'textbox', 'link', 'checkbox', 'combobox'].includes(candidateRole))) continue
+        const roleMatches = !role || candidateRole.toLowerCase() === role
+        const normalizedName = candidateName.toLowerCase()
+        const nameMatches = !name || (query.exact ? normalizedName === name : normalizedName.includes(name))
+        if (!roleMatches || !nameMatches) continue
+        candidates.push({ backendNodeId, role: candidateRole, name: candidateName.slice(0, browserObservationNameLimit(candidateRole)), editable })
+        if (candidates.length >= maxResults) break
+      }
+      tab.generation++
+      tab.refs.clear()
+      const elements: BrowserObservation['elements'] = []
+      for (const candidate of candidates) {
+        const ref = `r${tab.generation}-${elements.length + 1}`
+        tab.refs.set(ref, {
+          backendNodeId: candidate.backendNodeId,
+          generation: tab.generation,
+          label: candidate.name ? `${candidate.role}「${candidate.name.slice(0, 80)}」` : candidate.role,
+          editable: candidate.editable,
+        })
+        elements.push({ ref, role: candidate.role, name: candidate.name, editable: candidate.editable })
+      }
+      this.updateNavigationState(browserSession, tab)
+      this.trace(browserSession, tab, 'find', `语义定位到 ${elements.length} 个元素（AX 深度 ${resolveBrowserObserveAxDepth(400)}）`, 'verified')
+      return { tabId: tab.tabId, url: tab.state.url, title: tab.state.title, generation: tab.generation, elements }
+    })
+  }
+
   private resolveRef(tab: BrowserTabRecord, ref: string): RefEntry {
     const entry = tab.refs.get(ref)
     if (!entry || entry.generation !== tab.generation) throw new Error('元素引用已失效，请先重新调用 browser_observe。')
@@ -1268,7 +1419,31 @@ export class BrowserController {
     return { x: ((quad[0] as number) + (quad[2] as number) + (quad[4] as number) + (quad[6] as number)) / 4, y: ((quad[1] as number) + (quad[3] as number) + (quad[5] as number) + (quad[7] as number)) / 4 }
   }
 
+  private async clickRef(browserSession: BrowserSessionRecord, tab: BrowserTabRecord, ref: string, signal?: AbortSignal): Promise<RefEntry> {
+    const generation = tab.generation
+    const target = this.resolveRef(tab, ref)
+    const { x, y } = await this.centerForRef(tab, ref, signal, generation)
+    this.assertCurrentDocument(tab, generation, signal)
+    await this.highlightAgentTarget(tab, target.backendNodeId)
+    this.assertCurrentDocument(tab, generation, signal)
+    await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, undefined, signal)
+    this.assertCurrentDocument(tab, generation, signal)
+    await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, undefined, signal)
+    this.trace(browserSession, tab, 'click', `点击 ${target.label}`, 'dispatched')
+    return target
+  }
+
   async click(sessionId: string, ref: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      await this.clickRef(browserSession, tab, ref, operationSignal)
+      return structuredClone(this.buildState(browserSession))
+    })
+  }
+
+  async hover(sessionId: string, ref: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
     const browserSession = this.getOrCreateSession(sessionId)
     this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
@@ -1276,13 +1451,40 @@ export class BrowserController {
       const generation = tab.generation
       const target = this.resolveRef(tab, ref)
       const { x, y } = await this.centerForRef(tab, ref, operationSignal, generation)
-      this.assertCurrentDocument(tab, generation, operationSignal)
       await this.highlightAgentTarget(tab, target.backendNodeId)
       this.assertCurrentDocument(tab, generation, operationSignal)
-      await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, undefined, operationSignal)
+      await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, undefined, operationSignal)
+      this.trace(browserSession, tab, 'hover', `悬停 ${target.label}`, 'dispatched')
+      return structuredClone(this.buildState(browserSession))
+    })
+  }
+
+  /** Native pointer drag. It intentionally does not synthesize page JavaScript DragEvent/DataTransfer objects. */
+  async drag(sessionId: string, sourceRef: string, targetRef: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    if (!sourceRef || !targetRef) throw new Error('拖拽需要源元素和目标元素。')
+    if (sourceRef === targetRef) throw new Error('拖拽源元素和目标元素不能相同。')
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const generation = tab.generation
+      const source = this.resolveRef(tab, sourceRef)
+      const target = this.resolveRef(tab, targetRef)
+      const start = await this.centerForRef(tab, sourceRef, operationSignal, generation)
+      await this.highlightAgentTarget(tab, source.backendNodeId)
       this.assertCurrentDocument(tab, generation, operationSignal)
-      await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, undefined, operationSignal)
-      this.trace(browserSession, tab, 'click', `点击 ${target.label}`, 'dispatched')
+      await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: start.x, y: start.y, button: 'left', clickCount: 1 }, undefined, operationSignal)
+      try {
+        const end = await this.centerForRef(tab, targetRef, operationSignal, generation)
+        this.assertCurrentDocument(tab, generation, operationSignal)
+        await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: end.x, y: end.y, button: 'left', buttons: 1 }, undefined, operationSignal)
+        await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: end.x, y: end.y, button: 'left', clickCount: 1 }, undefined, operationSignal)
+      } catch (error) {
+        // Best effort release avoids a stuck pointer when a page navigation invalidates the drag midway.
+        try { await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: start.x, y: start.y, button: 'left', clickCount: 1 }) } catch { /* 页面已关闭 */ }
+        throw error
+      }
+      this.trace(browserSession, tab, 'drag', `从 ${source.label} 拖拽到 ${target.label}`, 'dispatched')
       return structuredClone(this.buildState(browserSession))
     })
   }
@@ -1368,34 +1570,54 @@ export class BrowserController {
     }
   }
 
-  async waitFor(sessionId: string, condition: { kind: 'url' | 'text' | 'selector'; value: string }, timeoutMs = 10_000, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; title: string; matched: boolean }> {
+  private assertWaitCondition(condition: BrowserWaitCondition, timeoutMs: number): void {
     if (!condition.value.trim()) throw new Error('等待条件不能为空。')
     if (!Number.isFinite(timeoutMs) || timeoutMs < 250 || timeoutMs > 30_000) throw new Error('等待超时必须在 250 到 30000 毫秒之间。')
+  }
+
+  private async waitForInternal(browserSession: BrowserSessionRecord, tab: BrowserTabRecord, condition: BrowserWaitCondition, timeoutMs: number, operationSignal?: AbortSignal): Promise<{ tabId: string; url: string; title: string; matched: boolean }> {
+    const startedAt = Date.now()
+    const payload = JSON.stringify(condition).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+    const expression = `(() => { const condition = ${payload}; try { if (condition.kind === 'url') return location.href.includes(condition.value); if (condition.kind === 'text') return (document.body?.innerText || '').includes(condition.value); return !!document.querySelector(condition.value); } catch { return false; } })()`
+    while (Date.now() - startedAt <= timeoutMs) {
+      throwIfBrowserOperationAborted(operationSignal)
+      const result = await this.executePageExpression(tab, expression, operationSignal)
+      if (result === true) {
+        this.trace(browserSession, tab, 'wait', `已满足${condition.kind}等待条件`, 'verified')
+        return { tabId: tab.tabId, url: tab.state.url, title: tab.state.title, matched: true }
+      }
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          operationSignal?.removeEventListener('abort', abort)
+          resolve()
+        }, 250)
+        const abort = () => { clearTimeout(timer); reject(new BrowserOperationAbortedError()) }
+        operationSignal?.addEventListener('abort', abort, { once: true })
+      })
+    }
+    this.trace(browserSession, tab, 'wait', `等待${condition.kind}条件超时`, 'failed')
+    return { tabId: tab.tabId, url: tab.state.url, title: tab.state.title, matched: false }
+  }
+
+  async waitFor(sessionId: string, condition: BrowserWaitCondition, timeoutMs = 10_000, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; title: string; matched: boolean }> {
+    this.assertWaitCondition(condition, timeoutMs)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, (operationSignal) => this.waitForInternal(browserSession, tab, condition, timeoutMs, operationSignal))
+  }
+
+  /** Perform a click and an optional bounded wait as one serialized, auditable browser operation. */
+  async act(sessionId: string, ref: string, waitFor: BrowserWaitCondition | undefined, timeoutMs = 10_000, tabId?: string, signal?: AbortSignal): Promise<{ state: BrowserViewState; wait: { tabId: string; url: string; title: string; matched: boolean } | null }> {
+    if (waitFor) this.assertWaitCondition(waitFor, timeoutMs)
     const browserSession = this.getOrCreateSession(sessionId)
     this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
-      const startedAt = Date.now()
-      const payload = JSON.stringify(condition).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
-      const expression = `(() => { const condition = ${payload}; try { if (condition.kind === 'url') return location.href.includes(condition.value); if (condition.kind === 'text') return (document.body?.innerText || '').includes(condition.value); return !!document.querySelector(condition.value); } catch { return false; } })()`
-      while (Date.now() - startedAt <= timeoutMs) {
-        throwIfBrowserOperationAborted(operationSignal)
-        const result = await this.executePageExpression(tab, expression, operationSignal)
-        if (result === true) {
-          this.trace(browserSession, tab, 'wait', `已满足${condition.kind}等待条件`, 'verified')
-          return { tabId: tab.tabId, url: tab.state.url, title: tab.state.title, matched: true }
-        }
-        await new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(() => {
-            operationSignal?.removeEventListener('abort', abort)
-            resolve()
-          }, 250)
-          const abort = () => { clearTimeout(timer); reject(new BrowserOperationAbortedError()) }
-          operationSignal?.addEventListener('abort', abort, { once: true })
-        })
-      }
-      this.trace(browserSession, tab, 'wait', `等待${condition.kind}条件超时`, 'failed')
-      return { tabId: tab.tabId, url: tab.state.url, title: tab.state.title, matched: false }
+      await this.clickRef(browserSession, tab, ref, operationSignal)
+      const wait = waitFor ? await this.waitForInternal(browserSession, tab, waitFor, timeoutMs, operationSignal) : null
+      this.trace(browserSession, tab, 'act', wait ? `点击后等待${waitFor?.kind}条件` : '点击操作', wait?.matched === false ? 'failed' : 'verified')
+      return { state: structuredClone(this.buildState(browserSession)), wait }
     })
   }
 
@@ -1411,6 +1633,86 @@ export class BrowserController {
       const result = await this.executePageExpression(tab, buildBrowserDomActionExpression(input), operationSignal)
       this.trace(browserSession, tab, 'dom', `DOM ${input.action}：${input.selector.slice(0, 100)}`, 'dispatched')
       return { tabId: tab.tabId, url: tab.state.url, result }
+    })
+  }
+
+  async scroll(sessionId: string, input: BrowserScrollInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
+    assertBrowserScroll(input)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const result = await this.executePageExpression(tab, buildBrowserScrollExpression(input), operationSignal)
+      this.trace(browserSession, tab, 'scroll', input.selector ? `滚动容器 ${input.selector.slice(0, 100)}` : '滚动页面', 'dispatched')
+      return { tabId: tab.tabId, url: tab.state.url, result }
+    })
+  }
+
+  async extract(sessionId: string, input: BrowserExtractInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
+    assertBrowserExtract(input)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const result = await this.executePageExpression(tab, buildBrowserExtractExpression(input), operationSignal)
+      this.trace(browserSession, tab, 'extract', input.selector ? `抽取区域 ${input.selector.slice(0, 100)}` : '抽取页面正文', 'verified')
+      return { tabId: tab.tabId, url: tab.state.url, result }
+    })
+  }
+
+  async selectOption(sessionId: string, input: BrowserSelectOptionInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
+    assertBrowserSelectOption(input)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const result = await this.executePageExpression(tab, buildBrowserSelectOptionExpression(input), operationSignal)
+      this.trace(browserSession, tab, 'select', `选择原生下拉选项 ${input.selector.slice(0, 100)}`, 'dispatched')
+      return { tabId: tab.tabId, url: tab.state.url, result }
+    })
+  }
+
+  private async assertUploadPaths(browserSession: BrowserSessionRecord, filePaths: string[]): Promise<string[]> {
+    if (filePaths.length < 1 || filePaths.length > 20) throw new Error('一次上传文件数量必须为 1 到 20。')
+    if (browserSession.allowedRoots.length === 0) throw new Error('当前会话没有获授权的文件目录，不能选择上传文件。')
+    const roots = await Promise.all(browserSession.allowedRoots.map(async (root) => realpath(root).catch(() => null)))
+    const authorizedRoots = roots.filter((root): root is string => !!root)
+    if (authorizedRoots.length === 0) throw new Error('当前会话的获授权目录不可访问，不能选择上传文件。')
+    return Promise.all(filePaths.map(async (filePath) => {
+      if (!path.isAbsolute(filePath)) throw new Error('上传文件必须使用绝对路径。')
+      const resolved = await realpath(filePath).catch(() => { throw new Error('上传文件不存在或不可访问。') })
+      const details = await stat(resolved).catch(() => { throw new Error('无法读取上传文件。') })
+      if (!details.isFile()) throw new Error('上传目标必须是普通文件。')
+      const authorized = authorizedRoots.some((root) => {
+        const relative = path.relative(root, resolved)
+        return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
+      })
+      if (!authorized) throw new Error('上传文件不在当前会话获授权的目录内。')
+      return resolved
+    }))
+  }
+
+  async upload(sessionId: string, ref: string, filePaths: string[], tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const generation = tab.generation
+      const target = this.resolveRef(tab, ref)
+      const files = await this.assertUploadPaths(browserSession, filePaths)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      const response = await this.cdp(tab, 'DOM.describeNode', { backendNodeId: target.backendNodeId, depth: 0 }, undefined, operationSignal)
+      const node = response.node as Record<string, unknown> | undefined
+      const nodeName = typeof node?.nodeName === 'string' ? node.nodeName.toLowerCase() : ''
+      const attributes = Array.isArray(node?.attributes) ? node.attributes : []
+      const typeIndex = attributes.findIndex((value) => value === 'type')
+      const inputType = typeIndex >= 0 && typeof attributes[typeIndex + 1] === 'string' ? String(attributes[typeIndex + 1]).toLowerCase() : ''
+      if (nodeName !== 'input' || inputType !== 'file') throw new Error('目标不是 file input，请先重新观察页面并选择文件上传控件。')
+      await this.highlightAgentTarget(tab, target.backendNodeId)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      await this.cdp(tab, 'DOM.setFileInputFiles', { files, backendNodeId: target.backendNodeId }, undefined, operationSignal)
+      this.trace(browserSession, tab, 'upload', `已选择 ${files.length} 个上传文件（文件名已脱敏）`, 'dispatched')
+      return structuredClone(this.buildState(browserSession))
     })
   }
 
@@ -1465,7 +1767,8 @@ export class BrowserController {
       return
     }
     this.sessions.delete(sessionId)
-    if (this.presentation?.sessionId === sessionId) this.presentation = null
+    this.clearPresentationsForSession(sessionId)
+    if (this.foregroundPresentationSessionId === sessionId) this.foregroundPresentationSessionId = null
     for (const tab of browserSession.tabs.values()) {
       this.clearAgentTargetHighlight(tab)
       try { if (tab.view.webContents.debugger.isAttached()) tab.view.webContents.debugger.detach() } catch { /* 已销毁 */ }
@@ -1479,8 +1782,9 @@ export class BrowserController {
   dispose(): void {
     for (const sessionId of [...this.sessions.keys()]) void this.close(sessionId)
     this.configurations.clear()
-    this.presentation = null
-    this.latestPresentationRevision = 0
+    this.presentations.clear()
+    this.foregroundPresentationSessionId = null
+    this.latestForegroundPresentationRevision = 0
     this.owner = null
   }
 }

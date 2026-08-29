@@ -87,6 +87,10 @@
 - 原生 Canvas 单选状态只能由真实 `onNodesChange` 用户交互与显式节点/空白点击同步，禁止再用 React Flow 派生 `onSelectionChange` 反写权威 `selectedNodeId`；后者会在受控 selected 与回调 identity 更新之间形成双向反馈，使多个节点的选中边框持续交替。
 - Canvas Agent committed intent 的永久归属只包含节点身份、session 绑定、稳定展示身份和关系合同；`position` 是用户后续可编辑的画布状态，对账与坏会话重建必须保留当前位置，禁止再以初始落点判定归属损坏。
 - Canvas 节点工作台尺寸只属于 Renderer 当前挂载期临时状态，不写入画布文档或 IPC；首次打开和窗口边界变化时必须收进 React Flow 可视区，右下角双向缩放按画布缩放比例换算，并保持 `nodrag nopan nowheel` 隔离。Agent 工作台的消息宿主必须是受高度约束的纵向 Flex 容器，确保消息区单独滚动且底部输入框不被内容挤出裁切。
+- 官方基线已同步到 `v0.19.1`，Electron fork 版本重置为 `0.19.1-bone.1`；后续继续按官方三段版本加 Bone 构建号发布。
+- 上游 Vault、Live Markdown、Terminal、OfficeCLI、双 Pane 与 MCP 安全能力通过现行 Renderer/IPC 边界接入；Canvas、DataRoot、LAN/mobile、稳定文件授权与迁移守卫继续保留。OfficeCLI 只能处理已授权 Buffer 生成的临时副本，禁止按原路径二次打开文件。
+- 独立规划窗口继续保留；Todo Agent 从该窗口启动后，通过 `TODO_AGENT_SESSION_READY` 由主窗口接管会话，避免独立窗口承担 Agent 工作区。
+- 普通 Renderer 的活跃会话快照、Agent Island 已读、Terminal 创建与 Vault 会话上下文必须排除 Design/Canvas 等内部会话，防止内部运行态混入普通 Agent 界面。
 
 ## 会话记录
 
@@ -206,3 +210,4 @@
 - 2026-08-29：Canvas 折叠生图卡片通过工作区 LOAD 一次性接收已采用素材的安全 `imagePreviews`，同窗口同项目共享单个缩略图媒体授权，禁止逐节点加载图片模块；授权、素材或图片加载失败时回退文字卡片，旧生命周期快照不得清空已有预览。
 - 2026-08-29：Canvas Agent 重建事务固定使用 `agent-node-rebuild-<UUID>.json`，文件名合同必须由 TypeScript Host 与 C++ stable-directory helper 同步识别；开发客户端实际执行 `dist/resources` 副本，修改原生 helper 后必须执行资源同步并重启，否则会出现重建当下成功、重载后因旧 helper 漏扫重建事务而整张 Canvas 加载失败。
 - 2026-08-29：修复 Canvas Agent 详情消息撑高后裁掉输入框的问题，并为四类节点工作台增加右下角双向缩放；详情首次打开会按当前画布剩余空间收敛，真实 Electron 验证生图主操作和缩放手柄在底边可达，拖拽宽高同时变化且不移动节点。
+- 2026-08-29：合并官方最新正式版 `v0.19.1` 并将应用版本重置为 `0.19.1-bone.1`；接入 Vault、Terminal、OfficeCLI、双 Pane 与 MCP 安全更新，保留 Canvas、DataRoot、独立规划窗口和 Todo Agent 跨窗口接管，并补齐普通 Renderer 对内部会话的隔离。

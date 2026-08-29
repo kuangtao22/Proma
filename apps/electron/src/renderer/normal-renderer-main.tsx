@@ -16,11 +16,9 @@ import App from './App'
 import {
   themeModeAtom,
   themeStyleAtom,
-  interfaceVariantAtom,
   systemIsDarkAtom,
   resolvedThemeAtom,
   applyThemeToDOM,
-  applyInterfaceVariantToDOM,
   initializeTheme,
 } from './atoms/theme'
 import {
@@ -45,6 +43,7 @@ import {
 import { updateStatusAtom, initializeUpdater } from './atoms/updater'
 import { automationsAtom } from './atoms/automation-atoms'
 import { calendarEventsAtom, calendarPlanningGroupsAtom, planningTagsAtom, todoPlanningGroupsAtom, todosAtom } from './atoms/planning-atoms'
+import { mergeTodoSnapshot, upsertTodo } from './lib/todo-state'
 import {
   notificationsEnabledAtom,
   notificationSoundEnabledAtom,
@@ -52,7 +51,6 @@ import {
   initializeNotifications,
 } from './atoms/notifications'
 import {
-  stickyUserMessageEnabledAtom,
   longTextPasteAsAttachmentEnabledAtom,
   richTextRenderingEnabledAtom,
   sessionHoverPreviewEnabledAtom,
@@ -64,7 +62,7 @@ import {
 } from './atoms/markdown-font-size'
 import { useGlobalAgentListeners } from './hooks/useGlobalAgentListeners'
 import { useGlobalChatListeners } from './hooks/useGlobalChatListeners'
-import { tabsAtom, activeTabIdAtom, ensureScratchPadTab, getPersistableTabState, scratchPadContentAtom, scratchPadLoadedAtom, SCRATCH_PAD_ID } from './atoms/tab-atoms'
+import { tabsAtom, activeTabIdAtom, getPersistableTabState } from './atoms/tab-atoms'
 import type { TabItem } from './atoms/tab-atoms'
 import { chatToolsAtom } from './atoms/chat-tool-atoms'
 import { feishuBotStatesAtom } from './atoms/feishu-atoms'
@@ -81,10 +79,11 @@ import { showCapabilityChangeToasts } from './lib/capabilities-toast'
 import { GlobalShortcuts } from './components/shortcuts/GlobalShortcuts'
 import { VoiceDictationApp } from './components/voice-dictation/VoiceDictationApp'
 import { TabSwitcher } from './components/tabs/TabSwitcher'
-import { htmlToMarkdown, markdownToHtml } from './lib/markdown-rich-text'
 import { PromaLogo } from './lib/model-logo'
 import { initShortcutRegistry, updateShortcutOverrides } from './lib/shortcut-registry'
+import { triggerLegacyScratchPadMigration } from './lib/legacy-scratch-pad-migration'
 import { initializePerformanceMonitor } from './lib/performance-monitor'
+import { createUpdateReminderScheduler, type UpdateReminderScheduler } from './lib/update-reminder-scheduler'
 import './styles/globals.css'
 import 'katex/dist/katex.min.css'
 
@@ -99,7 +98,7 @@ const isMainWindow = !isQuickTaskWindow && !isVoiceDictationIndicatorWindow && !
 
 initializePerformanceMonitor()
 
-// 主窗口和独立规划窗口均由内部面板管理滚动，避免页面本身出现第二层滚动。
+// 主窗口、独立规划窗口与记忆窗口均由内部面板管理滚动，避免页面本身出现第二层滚动。
 if (isMainWindow || isPlanningWindow || isWorkspaceMemoryWindow) {
   document.documentElement.classList.add('proma-main-window')
 }
@@ -113,11 +112,9 @@ if (isMainWindow || isPlanningWindow || isWorkspaceMemoryWindow) {
 function ThemeInitializer(): null {
   const setThemeMode = useSetAtom(themeModeAtom)
   const setThemeStyle = useSetAtom(themeStyleAtom)
-  const setInterfaceVariant = useSetAtom(interfaceVariantAtom)
   const setSystemIsDark = useSetAtom(systemIsDarkAtom)
   const themeMode = useAtomValue(themeModeAtom)
   const themeStyle = useAtomValue(themeStyleAtom)
-  const interfaceVariant = useAtomValue(interfaceVariantAtom)
   const systemIsDark = useAtomValue(systemIsDarkAtom)
 
   // 初始化：从主进程加载设置 + 订阅系统主题变化
@@ -125,7 +122,7 @@ function ThemeInitializer(): null {
     let isMounted = true
     let cleanup: (() => void) | undefined
 
-    initializeTheme(setThemeMode, setSystemIsDark, setThemeStyle, setInterfaceVariant).then((fn) => {
+    initializeTheme(setThemeMode, setSystemIsDark, setThemeStyle).then((fn) => {
       if (isMounted) {
         cleanup = fn
       } else {
@@ -138,7 +135,7 @@ function ThemeInitializer(): null {
       isMounted = false
       cleanup?.()
     }
-  }, [setThemeMode, setSystemIsDark, setThemeStyle, setInterfaceVariant])
+  }, [setThemeMode, setSystemIsDark, setThemeStyle])
 
   // 响应式应用主题到 DOM
   // 用 useMemo 计算"实际会影响 DOM 的状态签名"作为唯一依赖：
@@ -158,10 +155,6 @@ function ThemeInitializer(): null {
     applyThemeToDOM(themeMode, themeStyle, systemIsDark)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [themeSignature])
-
-  useEffect(() => {
-    applyInterfaceVariantToDOM(interfaceVariant)
-  }, [interfaceVariant])
 
   return null
 }
@@ -344,22 +337,22 @@ function AgentSettingsInitializer(): null {
 function UpdaterInitializer(): null {
   const setUpdateStatus = useSetAtom(updateStatusAtom)
   const updateStatus = useAtomValue(updateStatusAtom)
-  const notifiedDownloadVersionRef = useRef<string | null>(null)
+  const updateReminderSchedulerRef = useRef<UpdateReminderScheduler | null>(null)
+  const readyToastIdRef = useRef<string | number | null>(null)
+  const scheduledToastIdRef = useRef<string | number | null>(null)
 
   useEffect(() => {
     const cleanup = initializeUpdater(setUpdateStatus)
     return cleanup
   }, [setUpdateStatus])
 
-  useEffect(() => {
-    if (updateStatus.status !== 'downloaded') return
+  const showDownloadedUpdateReminder = React.useCallback((version: string): void => {
+    if (readyToastIdRef.current !== null) {
+      toast.dismiss(readyToastIdRef.current)
+    }
 
-    const version = updateStatus.version || '新版本'
-    if (notifiedDownloadVersionRef.current === version) return
-    notifiedDownloadVersionRef.current = version
     const versionLabel = version.startsWith('v') ? version : `v${version}`
-
-    toast.custom((toastId) => (
+    readyToastIdRef.current = toast.custom((toastId) => (
       <div className="w-[344px] max-w-[calc(100vw-32px)] rounded-xl bg-background/95 p-3 text-foreground shadow-[0_12px_32px_rgba(0,0,0,0.14)] ring-1 ring-black/5 backdrop-blur-xl dark:ring-white/10">
         <div className="flex items-center gap-2.5">
           <img src={PromaLogo} alt="Proma" className="size-8 rounded-lg" />
@@ -393,6 +386,7 @@ function UpdaterInitializer(): null {
               className="h-7 rounded-md bg-primary px-2.5 text-xs font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 active:scale-[0.96]"
               onClick={() => {
                 toast.dismiss(toastId)
+                readyToastIdRef.current = null
                 void window.electronAPI.updater?.installWhenIdle()
                   .then((scheduled) => {
                     if (!scheduled) {
@@ -400,7 +394,7 @@ function UpdaterInitializer(): null {
                       return
                     }
 
-                    toast.custom((scheduledToastId) => (
+                    scheduledToastIdRef.current = toast.custom((scheduledToastId) => (
                       <div className="w-[312px] max-w-[calc(100vw-32px)] rounded-xl bg-background/95 p-3 text-foreground shadow-[0_12px_32px_rgba(0,0,0,0.14)] ring-1 ring-black/5 backdrop-blur-xl dark:ring-white/10">
                         <div className="flex items-center gap-2.5">
                           <img src={PromaLogo} alt="Proma" className="size-7 rounded-md" />
@@ -416,6 +410,7 @@ function UpdaterInitializer(): null {
                             onClick={() => {
                               void window.electronAPI.updater?.cancelIdleInstall()
                               toast.dismiss(scheduledToastId)
+                              scheduledToastIdRef.current = null
                             }}
                           >
                             取消安排
@@ -443,7 +438,39 @@ function UpdaterInitializer(): null {
       dismissible: false,
       unstyled: true,
     })
-  }, [updateStatus])
+  }, [])
+
+  useEffect(() => {
+    if (!updateReminderSchedulerRef.current) {
+      updateReminderSchedulerRef.current = createUpdateReminderScheduler({
+        remind: showDownloadedUpdateReminder,
+      })
+    }
+
+    const scheduler = updateReminderSchedulerRef.current
+    const isInstallScheduled = updateStatus.status === 'downloaded' && updateStatus.installScheduled === true
+    if (!isInstallScheduled && scheduledToastIdRef.current !== null) {
+      toast.dismiss(scheduledToastIdRef.current)
+      scheduledToastIdRef.current = null
+    }
+
+    if (updateStatus.status !== 'downloaded' || isInstallScheduled) {
+      scheduler.stop()
+      if (readyToastIdRef.current !== null) {
+        toast.dismiss(readyToastIdRef.current)
+        readyToastIdRef.current = null
+      }
+      return
+    }
+
+    scheduler.start(updateStatus.version || '新版本')
+  }, [showDownloadedUpdateReminder, updateStatus.installScheduled, updateStatus.status, updateStatus.version])
+
+  useEffect(() => () => {
+    updateReminderSchedulerRef.current?.stop()
+    if (readyToastIdRef.current !== null) toast.dismiss(readyToastIdRef.current)
+    if (scheduledToastIdRef.current !== null) toast.dismiss(scheduledToastIdRef.current)
+  }, [])
 
   return null
 }
@@ -478,7 +505,7 @@ function PlanningInitializer(): null {
     const loadTodos = (): void => {
       const requestId = ++latestRequest.todos
       void window.electronAPI.listTodos().then((todos) => {
-        if (!disposed && requestId === latestRequest.todos) setTodos(todos)
+        if (!disposed && requestId === latestRequest.todos) setTodos((current) => mergeTodoSnapshot(current, todos))
       }).catch((error: unknown) => console.error('[任务/日程] 加载 Todo 失败:', error))
     }
     const loadCalendarEvents = (): void => {
@@ -514,7 +541,15 @@ function PlanningInitializer(): null {
       if (includes('tags')) loadTags()
     }
     load()
-    const unsubscribe = window.electronAPI.onPlanningChanged((change) => load(change.resources))
+    const unsubscribe = window.electronAPI.onPlanningChanged((change) => {
+      const todo = change.todo
+      if (change.resources.includes('todos') && todo) {
+        // 使在途快照过期，避免它在增量事件之后返回并覆盖最新 Todo。
+        latestRequest.todos += 1
+        setTodos((current) => upsertTodo(current, todo))
+      }
+      load(todo ? change.resources.filter((resource) => resource !== 'todos') : change.resources)
+    })
     return () => { disposed = true; unsubscribe() }
   }, [setCalendarEvents, setCalendarGroups, setTags, setTodoGroups, setTodos])
 
@@ -583,7 +618,7 @@ function DockBadgeInitializer(): null {
   useEffect(() => {
     const clearActiveSessionBadge = (): void => {
       if (!document.hasFocus() || !activeAgentSessionId) return
-      // 以实际激活的 Agent/预览 Tab 为准。Scratch Pad 会保留 currentAgentSessionId，
+      // 以实际激活的 Agent/预览 Tab 为准。旧版 Scratch Pad 状态不参与恢复，
       // 不能仅据此把后台会话误判为已查看。
       void window.electronAPI.agentIsland.markSessionViewed(activeAgentSessionId).catch(console.error)
       setUnviewedCompleted((prev) => {
@@ -609,22 +644,20 @@ function DockBadgeInitializer(): null {
 /**
  * UI 偏好初始化组件
  *
- * 从主进程加载 UI 偏好设置（悬浮置顶条、输入框 Markdown 渲染等）。
+ * 从主进程加载 UI 偏好设置（输入框 Markdown 渲染等）。
  */
 function UiPreferencesInitializer(): null {
-  const setStickyUserMessageEnabled = useSetAtom(stickyUserMessageEnabledAtom)
   const setLongTextPasteAsAttachmentEnabled = useSetAtom(longTextPasteAsAttachmentEnabledAtom)
   const setRichTextRenderingEnabled = useSetAtom(richTextRenderingEnabledAtom)
   const setSessionHoverPreviewEnabled = useSetAtom(sessionHoverPreviewEnabledAtom)
 
   useEffect(() => {
     initializeUiPreferences(
-      setStickyUserMessageEnabled,
       setLongTextPasteAsAttachmentEnabled,
       setRichTextRenderingEnabled,
       setSessionHoverPreviewEnabled
     )
-  }, [setStickyUserMessageEnabled, setLongTextPasteAsAttachmentEnabled, setRichTextRenderingEnabled, setSessionHoverPreviewEnabled])
+  }, [setLongTextPasteAsAttachmentEnabled, setRichTextRenderingEnabled, setSessionHoverPreviewEnabled])
 
   return null
 }
@@ -681,14 +714,12 @@ function ChatToolInitializer(): null {
       .catch((err: unknown) => console.error('[ChatToolInitializer] 加载工具列表失败:', err))
   }, [setChatTools])
 
-  // 订阅自定义工具配置变更
+  // 订阅自定义工具配置变更并静默刷新工具列表。
+  // 用户主动操作的反馈由各设置入口提供，避免文件监听产生重复 Toast。
   useEffect(() => {
     const cleanup = window.electronAPI.onCustomToolChanged(() => {
       window.electronAPI.getChatTools()
-        .then((tools) => {
-          setChatTools(tools)
-          toast.success('Chat 工具已更新')
-        })
+        .then(setChatTools)
         .catch((err: unknown) => console.error('[ChatToolInitializer] 刷新工具列表失败:', err))
     })
     return cleanup
@@ -891,7 +922,7 @@ function TabStatePersistenceInitializer(): null {
       }
 
       const activeTab = validTabs.find((t) => t.id === restoredActiveTabId) ?? validTabs[0] ?? null
-      store.set(tabsAtom, ensureScratchPadTab(activeTab ? [activeTab] : []))
+      store.set(tabsAtom, activeTab ? [activeTab] : [])
       store.set(activeTabIdAtom, restoredActiveTabId)
 
       // 同步 appMode 和 currentSessionId
@@ -965,109 +996,17 @@ function TabStatePersistenceInitializer(): null {
 }
 
 /**
- * Scratch Pad 初始化和持久化组件
- *
- * 启动时注入 scratch tab 到 tabsAtom 首位，
- * 从磁盘加载 scratch-pad.md 内容，自动保存到磁盘。
+ * Legacy Scratch Pad migration trigger.
+ * The retained load IPC moves old content into the managed Vault without restoring UI state.
  */
-function ScratchPadPersistence(): null {
-  const store = useStore()
-  const loadedRef = useRef(false)
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout>>()
-
-  // 启动：加载文件内容、注入 scratch tab、恢复激活状态
+function LegacyScratchPadMigrationInitializer(): null {
   useEffect(() => {
-    const init = async (): Promise<void> => {
-      try {
-        // 加载 scratch-pad.md 内容（磁盘存的是 markdown，转为 HTML 给编辑器用）
-        const [settings, loadedMd] = await Promise.all([
-          window.electronAPI.getSettings(),
-          window.electronAPI.loadScratchPad ? window.electronAPI.loadScratchPad() : Promise.resolve(''),
-        ])
-
-        const loadedHtml = loadedMd ? markdownToHtml(loadedMd) : ''
-        store.set(scratchPadContentAtom, loadedHtml)
-        store.set(scratchPadLoadedAtom, true)
-
-        // 将 scratch tab 注入首位
-        const currentTabs = store.get(tabsAtom)
-        const newTabs = ensureScratchPadTab(currentTabs)
-
-        // 如果 tabs 数组变了（新增了 scratch tab），写入 store
-        if (newTabs.length > currentTabs.length || newTabs[0]?.id !== currentTabs[0]?.id) {
-          store.set(tabsAtom, newTabs)
-        }
-
-        // 恢复 scratch 激活状态：如果上次关闭时在 scratch 页，则激活它
-        // 不改变 appMode，保留原有的 chat/agent 侧边栏状态
-        if (settings.scratchPadActive) {
-          store.set(activeTabIdAtom, SCRATCH_PAD_ID)
-        }
-
-        console.log('[ScratchPad] 初始化完成，已加载内容:', !!loadedMd)
-      } catch (err) {
-        console.error('[ScratchPad] 初始化失败:', err)
-      } finally {
-        loadedRef.current = true
-      }
-    }
-
-    init()
-  }, [store])
-
-  // 自动保存：监听 scratchPadContentAtom 变化，防抖写入磁盘
-  useEffect(() => {
-    const save = (): void => {
-      const html = store.get(scratchPadContentAtom)
-      if (window.electronAPI.saveScratchPad) {
-        const md = htmlToMarkdown(html)
-        window.electronAPI.saveScratchPad(md).then((ok) => {
-          if (!ok) console.error('[ScratchPad] 保存失败')
-        }).catch(console.error)
-      }
-    }
-
-    const debouncedSave = (): void => {
-      if (!loadedRef.current) return
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
-      saveTimerRef.current = setTimeout(save, 500)
-    }
-
-    const unsub = store.sub(scratchPadContentAtom, debouncedSave)
-
-    // beforeunload 时同步写入
-    const handleBeforeUnload = (): void => {
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
-      const html = store.get(scratchPadContentAtom)
-      if (window.electronAPI.saveScratchPadSync) {
-        const md = htmlToMarkdown(html)
-        window.electronAPI.saveScratchPadSync(md)
-      }
-    }
-    window.addEventListener('beforeunload', handleBeforeUnload)
-
-    return () => {
-      unsub()
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
-      window.removeEventListener('beforeunload', handleBeforeUnload)
-    }
-  }, [store])
-
-  // 监听 activeTabIdAtom 变化，持久化 scratchPadActive 到 settings
-  useEffect(() => {
-    const unsub = store.sub(activeTabIdAtom, () => {
-      const activeTabId = store.get(activeTabIdAtom)
-      const isScratchActive = activeTabId === SCRATCH_PAD_ID
-      window.electronAPI.updateSettings({
-        scratchPadActive: isScratchActive,
-      }).catch(() => {})
-    })
-    return unsub
-  }, [store])
-
+    triggerLegacyScratchPadMigration(window.electronAPI.loadScratchPad)
+  }, [])
   return null
 }
 
+// ===== 快速任务窗口：轻量渲染 =====
 if (isQuickTaskWindow) {
   import('./components/quick-task/QuickTaskApp').then(({ QuickTaskApp }) => {
     ReactDOM.createRoot(document.getElementById('root')!).render(
@@ -1093,7 +1032,7 @@ if (isQuickTaskWindow) {
         <ThemeInitializer />
         <MarkdownFontSizeInitializer />
         <DetachedPreviewApp />
-        <Toaster position="bottom-right" />
+        <Toaster position="top-right" offset={{ top: 58, right: 12 }} />
       </React.StrictMode>
     )
   })
@@ -1107,7 +1046,7 @@ if (isQuickTaskWindow) {
         <AutomationInitializer />
         <PlanningInitializer />
         <PlanningWindowApp />
-        <Toaster position="bottom-right" />
+        <Toaster position="top-right" offset={{ top: 58, right: 12 }} />
       </React.StrictMode>
     )
   })
@@ -1117,7 +1056,7 @@ if (isQuickTaskWindow) {
       <React.StrictMode>
         <ThemeInitializer />
         <WorkspaceMemoryWindowApp />
-        <Toaster position="bottom-right" />
+        <Toaster position="top-right" offset={{ top: 58, right: 12 }} />
       </React.StrictMode>
     )
   })
@@ -1149,12 +1088,11 @@ if (isQuickTaskWindow) {
       <FeishuInitializer />
       <DingTalkInitializer />
       <TabStatePersistenceInitializer />
-      <ScratchPadPersistence />
+      <LegacyScratchPadMigrationInitializer />
       <VoiceDictationApp embedded />
       <GlobalShortcuts />
       <TabSwitcher />
       <App />
-      <Toaster position="bottom-right" />
     </React.StrictMode>
   )
 }

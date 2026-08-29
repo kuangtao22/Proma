@@ -156,6 +156,15 @@ function parseArgs(): DistOptions {
 function main(): void {
   const opts = parseArgs()
   const arch = process.arch // arm64 或 x64
+  const hostPlatform: DistOptions['platform'] = process.platform === 'darwin'
+    ? 'mac'
+    : process.platform === 'win32'
+      ? 'win'
+      : 'linux'
+  if (opts.platform !== hostPlatform) {
+    console.error(`[dist] 当前可视化打包脚本只能在目标平台 Runner 上运行：目标 ${opts.platform}，当前 ${hostPlatform}`)
+    process.exit(1)
+  }
   const results: StepResult[] = []
 
   // 打印配置信息

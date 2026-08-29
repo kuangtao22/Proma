@@ -8,6 +8,7 @@ interface PlanningQuickEntryActions {
 
 /**
  * 配置操作系统原生入口。两个平台均复用主进程的单例规划窗口，避免产生第二份数据或运行时。
+ * @param actions 主窗口和规划窗口的显示动作。
  */
 export function configurePlanningQuickEntries(actions: PlanningQuickEntryActions): void {
   if (process.platform === 'darwin' && app.dock) {

@@ -1,12 +1,9 @@
 import type { AgentSessionMeta } from '@proma/shared'
 import type { AgentStreamState } from '@/atoms/agent-atoms'
+import type { TabItem } from '@/atoms/tab-atoms'
 
-export interface ExternalAgentRunTab {
-  id: string
-  type: 'chat' | 'agent' | 'scratch' | 'preview' | 'tutorial'
-  sessionId: string
-  title: string
-}
+/** 顶部入口与 TabItem 保持同一类型契约，避免已删除的入口类型回流。 */
+export type ExternalAgentRunTab = TabItem
 
 export interface ExternalAgentRunActivationInput {
   tabs: ExternalAgentRunTab[]
@@ -39,6 +36,17 @@ export function shouldActivateExternalAgentRun(
     return currentStreamState.running && !currentStreamState.backgroundWaiting
   }
   return true
+}
+
+/**
+ * 自动派生的协作子会话只能在其父会话正处于用户前台视图时展开。
+ * 后台父会话的事件仍会更新运行状态和侧栏树，但绝不能改变用户当前焦点。
+ */
+export function shouldRevealDelegatedSession(
+  parentSessionId: string,
+  activeSessionId: string | null,
+): boolean {
+  return parentSessionId === activeSessionId
 }
 
 export function buildExternalAgentRunActivation(

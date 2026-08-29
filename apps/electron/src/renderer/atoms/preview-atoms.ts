@@ -33,29 +33,36 @@ export interface PreviewFile {
 
 // ===== Atoms =====
 
+/** 预览 Tab 的稳定 key：同一文件在不同预览/比较上下文可独立打开。 */
+export function getPreviewFileId(file: PreviewFile): string {
+  return [file.filePath, file.previewOnly ? 'preview' : 'diff', file.gitRoot ?? '', file.baseRef ?? ''].join('\u0000')
+}
+
+/** 同一会话中单个预览文件的内容刷新版本。 */
+export function getPreviewContentRefreshKey(sessionId: string, file: Pick<PreviewFile, 'filePath' | 'previewOnly' | 'gitRoot' | 'baseRef'>): string {
+  return `${sessionId}\u0000${getPreviewFileId(file)}`
+}
+
+/**
+ * 纯文件预览的内容刷新版本：按 session + 文件隔离。
+ * 不复用 Git diff 的会话级版本，避免无关文件改动重载当前预览。
+ */
+export const previewContentRefreshVersionAtom = atom<Map<string, number>>(new Map())
+
+/** 纯预览最后一次实际解析到的绝对路径，用于精确匹配相对路径 watcher 事件。 */
+export const previewResolvedPathAtom = atom<Map<string, string>>(new Map())
+
 /** 每会话预览面板开关 */
 export const previewPanelOpenMapAtom = atom<Map<string, boolean>>(new Map())
 
-/** 每会话当前预览的文件（null 时显示 DiffChangesList） */
+/** 每会话已打开的预览文件；非激活项只保留轻量元数据。 */
+export const previewFilesMapAtom = atom<Map<string, PreviewFile[]>>(new Map())
+
+/** 每会话当前预览的文件（兼容旧调用方的激活文件投影）。 */
 export const previewFileMapAtom = atom<Map<string, PreviewFile | null>>(new Map())
 
 /** 分栏比例（对话占比），持久化 */
 export const previewSplitRatioAtom = atomWithStorage<number>('proma-preview-split-ratio', 0.5, undefined, { getOnInit: true })
-
-/**
- * 预览默认展开方式，持久化。
- * - 'tab'   = 以预览标签页形式打开（旧版默认）
- * - 'split' = 在主区域右侧分屏展开（可同时看到 Agent 输出与文件内容）
- *
- * 用户仍可通过拖拽 Tab 出区域、PreviewPanel 顶栏按钮等即时切换。
- */
-export type PreviewModePreference = 'tab' | 'split'
-export const previewModePreferenceAtom = atomWithStorage<PreviewModePreference>(
-  'proma-preview-mode-pref',
-  'tab',
-  undefined,
-  { getOnInit: true },
-)
 
 /** 代码预览换行偏好（默认不换行，保持现有横向滚动行为） */
 export const previewCodeWrapAtom = atomWithStorage<boolean>(
@@ -75,7 +82,7 @@ export const currentSessionPreviewOpenAtom = atom<boolean>((get) => {
 // ===== 引用选中文本（Quoted Selection）=====
 
 /** 选中文本引用的来源 */
-export type QuotedSelectionSourceType = 'file' | 'agent-history' | 'scratch-pad'
+export type QuotedSelectionSourceType = 'file' | 'agent-history'
 
 /** 从预览面板或 Agent 历史中选中的文本引用 */
 export interface QuotedSelection {

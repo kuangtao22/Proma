@@ -6,13 +6,16 @@
  */
 
 import { basename, join, dirname, extname, resolve, posix as pathPosix } from 'node:path'
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { createRequire } from 'node:module'
 import { createHash, randomUUID } from 'node:crypto'
 import AdmZip from 'adm-zip'
 import { DOMParser } from '@xmldom/xmldom'
-import type { OfficePreviewResult } from '@proma/shared'
+import type { FilePreviewReadResult, OfficePreviewResult } from '@proma/shared'
+import { getBundledOfficeCliPath } from './officecli-manager'
 
 const require = createRequire(__filename)
 const PDFJS_PACKAGE = 'pdfjs-dist'
@@ -25,6 +28,11 @@ const MAX_XLSX_SHEETS = 8
 const MAX_XLSX_ROWS = 200
 const MAX_XLSX_COLUMNS = 40
 const MAX_PPTX_SLIDES = 80
+const OFFICECLI_RENDER_TIMEOUT_MS = 15_000
+const OFFICECLI_TEXT_RENDER_TIMEOUT_MS = 5_000
+const OFFICECLI_MAX_HTML_SIZE = 20 * 1024 * 1024
+const PREVIEW_TEMP_FILE_TTL_MS = 60 * 60 * 1000
+const execFileAsync = promisify(execFile)
 
 // ─── 临时文件 ───
 
@@ -53,12 +61,19 @@ function writeTempBinary(content: Buffer, extension: string): string {
   return tmpFile
 }
 
+/** 稳定读取返回的内容与同一 fd 对应的展示元数据。 */
+interface StablePreviewFile {
+  content: Buffer
+  size: number
+  modifiedAt: number
+}
+
 /** 使用 no-follow fd 绑定预览源文件与父目录身份。 */
-export function readPreviewFileStable(
+function readPreviewFileStableResult(
   filePath: string,
   maxSize: number,
   afterAuthorized?: () => void,
-): Buffer {
+): StablePreviewFile {
   const safePath = resolve(filePath)
   const pathStat = lstatSync(safePath)
   const parentPath = dirname(safePath)
@@ -81,10 +96,38 @@ export function readPreviewFileStable(
       || currentParent.ino !== parentStat.ino
     ) throw new Error('文件身份已变化')
     if (openedStat.size > maxSize) throw new Error('文件过大')
-    return readFileSync(descriptor)
+    return {
+      content: readFileSync(descriptor),
+      size: openedStat.size,
+      modifiedAt: openedStat.mtimeMs,
+    }
   } finally {
     if (descriptor !== null) closeSync(descriptor)
   }
+}
+
+/** 使用稳定 fd 读取授权后的文件内容。 */
+export function readPreviewFileStable(
+  filePath: string,
+  maxSize: number,
+  afterAuthorized?: () => void,
+): Buffer {
+  return readPreviewFileStableResult(filePath, maxSize, afterAuthorized).content
+}
+
+function createOfficeCliOutputPath(sourcePath: string): string {
+  const fileHash = createHash('sha256')
+    .update(`${sourcePath}\0${Date.now()}\0${Math.random()}`)
+    .digest('hex')
+    .slice(0, 24)
+  return join(getPreviewTmpDir(), `officecli-${fileHash}.html`)
+}
+
+function removeTempFileLater(path: string): void {
+  const cleanup = setTimeout(() => {
+    try { unlinkSync(path) } catch { /* 已由启动清理或其他路径删除 */ }
+  }, PREVIEW_TEMP_FILE_TTL_MS)
+  cleanup.unref()
 }
 
 /** 清理所有临时预览文件 */
@@ -611,19 +654,36 @@ function readSafeText(content: Buffer): string | null {
 }
 
 /** 解析文件路径并读取内容（供内联文本/代码预览使用） */
-export function resolveAndReadFile(filePath: string, basePaths?: string[]): { resolvedPath: string; content: string; isBinary: boolean; isTooLarge: boolean } | null {
+export function resolveAndReadFile(filePath: string, basePaths?: string[]): FilePreviewReadResult | null {
   const safePath = resolveTargetPath(filePath, basePaths)
   if (!existsSync(safePath)) return null
   try {
-    const rawContent = readPreviewFileStable(safePath, MAX_TEXT_PREVIEW_SIZE)
-    const content = readSafeText(rawContent)
-    if (content === null) {
-      return { resolvedPath: safePath, content: '', isBinary: true, isTooLarge: false }
+    const stableFile = readPreviewFileStableResult(safePath, MAX_TEXT_PREVIEW_SIZE)
+    const metadata = {
+      name: basename(safePath),
+      extension: extname(safePath).toLowerCase(),
+      size: stableFile.size,
+      modifiedAt: stableFile.modifiedAt,
     }
-    return { resolvedPath: safePath, content, isBinary: false, isTooLarge: false }
+    const content = readSafeText(stableFile.content)
+    if (content === null) {
+      return { resolvedPath: safePath, content: '', isBinary: true, isTooLarge: false, metadata }
+    }
+    return { resolvedPath: safePath, content, isBinary: false, isTooLarge: false, metadata }
   } catch (error) {
     if (error instanceof Error && error.message === '文件过大') {
-      return { resolvedPath: safePath, content: '', isBinary: false, isTooLarge: true }
+      try {
+        const currentStat = statSync(safePath)
+        const metadata = {
+          name: basename(safePath),
+          extension: extname(safePath).toLowerCase(),
+          size: currentStat.size,
+          modifiedAt: currentStat.mtimeMs,
+        }
+        return { resolvedPath: safePath, content: '', isBinary: false, isTooLarge: true, metadata }
+      } catch {
+        return null
+      }
     }
     return null
   }
@@ -765,6 +825,125 @@ function renderOfficeTextFallback(filePath: string, text: string, kind: OfficePr
   return `<div class="office-preview office-preview-${kind}"><div class="office-preview-title">${title}</div>${body}</div>`
 }
 
+function getOfficeCliCandidates(): string[] {
+  return [getBundledOfficeCliPath()]
+}
+
+function isExecutableFile(path: string): boolean {
+  try {
+    const stats = statSync(path)
+    if (!stats.isFile()) return false
+    if (process.platform === 'win32') return true
+    return (stats.mode & 0o111) !== 0
+  } catch {
+    return false
+  }
+}
+
+function restrictOfficeCliHtml(html: string): string {
+  const contentSecurityPolicy = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; media-src data: blob:"
+  const policyTag = `<meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy}">`
+  if (/<head(?:\s[^>]*)?>/i.test(html)) {
+    return html.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${policyTag}`)
+  }
+  return html.replace(/<html(?:\s[^>]*)?>/i, (htmlTag) => `${htmlTag}<head>${policyTag}</head>`)
+}
+
+async function registerOfficeCliOutputFile(path: string): Promise<string> {
+  const { registerPromaFilePath } = await import('./local-file-protocol')
+  return registerPromaFilePath(path)
+}
+
+/** 使用已经稳定读取的授权副本调用 OfficeCLI，禁止 CLI 重新打开原始用户路径。 */
+async function renderOfficeBufferWithOfficeCli(
+  resolvedPath: string,
+  authorizedContent: Buffer,
+  registerFilePath: (path: string) => string | Promise<string> = registerOfficeCliOutputFile,
+  officeCliCandidates = getOfficeCliCandidates(),
+  expectedExtensions: ReadonlySet<string> = new Set(['.docx', '.xlsx', '.pptx']),
+): Promise<{ htmlUrl: string; text: string } | null> {
+  const extension = extname(resolvedPath).toLowerCase()
+  if (!expectedExtensions.has(extension)) return null
+
+  const outputPath = createOfficeCliOutputPath(resolvedPath)
+  const sourceCopyPath = writeTempBinary(authorizedContent, extension)
+  let lastError: unknown
+  try {
+    for (const candidate of officeCliCandidates) {
+      if (!isExecutableFile(candidate)) continue
+      try {
+        await execFileAsync(candidate, ['view', sourceCopyPath, 'html', '-o', outputPath], {
+          timeout: OFFICECLI_RENDER_TIMEOUT_MS,
+          windowsHide: true,
+          env: { ...process.env, OFFICECLI_SKIP_UPDATE: '1', OFFICECLI_NO_AUTO_INSTALL: '1', OFFICECLI_NO_AUTO_RESIDENT: '1' },
+          maxBuffer: 1024 * 1024,
+        })
+        const outputStat = statSync(outputPath)
+        if (outputStat.size <= 0 || outputStat.size > OFFICECLI_MAX_HTML_SIZE) {
+          throw new Error(`OfficeCLI HTML 输出大小异常: ${outputStat.size}`)
+        }
+        const html = restrictOfficeCliHtml(readFileSync(outputPath, 'utf-8'))
+        if (!html.includes('<html') || !html.includes('</html>')) throw new Error('OfficeCLI HTML 输出不完整')
+        writeFileSync(outputPath, html, 'utf-8')
+        const htmlUrl = await registerFilePath(outputPath)
+        let text = ''
+        try {
+          const result = await execFileAsync(candidate, ['view', sourceCopyPath, 'text', '--max-lines', '10000'], {
+            timeout: OFFICECLI_TEXT_RENDER_TIMEOUT_MS,
+            windowsHide: true,
+            env: { ...process.env, OFFICECLI_SKIP_UPDATE: '1', OFFICECLI_NO_AUTO_INSTALL: '1', OFFICECLI_NO_AUTO_RESIDENT: '1' },
+            maxBuffer: 2 * 1024 * 1024,
+          })
+          text = result.stdout.trim()
+        } catch (textError) {
+          console.warn('[file-preview] OfficeCLI 文本提取失败，预览仍可用:', textError instanceof Error ? textError.message : textError)
+        }
+        removeTempFileLater(outputPath)
+        return { htmlUrl, text }
+      } catch (error) {
+        lastError = error
+        try { unlinkSync(outputPath) } catch { /* 输出可能尚未生成 */ }
+      }
+    }
+
+    if (lastError) {
+      console.warn('[file-preview] OfficeCLI 文档渲染不可用，回退内置解析器:', lastError instanceof Error ? lastError.message : lastError)
+    }
+    return null
+  } finally {
+    try { unlinkSync(sourceCopyPath) } catch { /* 已授权临时副本已被清理 */ }
+  }
+}
+
+export async function renderOfficeWithOfficeCli(
+  resolvedPath: string,
+  registerFilePath: (path: string) => string | Promise<string> = registerOfficeCliOutputFile,
+  officeCliCandidates = getOfficeCliCandidates(),
+  expectedExtensions: ReadonlySet<string> = new Set(['.docx', '.xlsx', '.pptx']),
+): Promise<{ htmlUrl: string; text: string } | null> {
+  let authorizedContent: Buffer
+  try {
+    authorizedContent = readPreviewFileStable(resolvedPath, MAX_FILE_SIZE)
+  } catch {
+    return null
+  }
+  return renderOfficeBufferWithOfficeCli(
+    resolvedPath,
+    authorizedContent,
+    registerFilePath,
+    officeCliCandidates,
+    expectedExtensions,
+  )
+}
+
+export async function renderXlsxWithOfficeCli(
+  resolvedPath: string,
+  registerFilePath: (path: string) => string | Promise<string> = registerOfficeCliOutputFile,
+  officeCliCandidates = getOfficeCliCandidates(),
+): Promise<{ htmlUrl: string; text: string } | null> {
+  return renderOfficeWithOfficeCli(resolvedPath, registerFilePath, officeCliCandidates, new Set(['.xlsx']))
+}
+
 /** 将 XLSX/PPTX 转成可内联展示的 HTML 预览 */
 export async function convertOfficeToHtml(filePath: string, basePaths?: string[], authorizedContent?: Buffer): Promise<OfficePreviewResult | null> {
   const safePath = resolveTargetPath(filePath, basePaths)
@@ -779,8 +958,29 @@ export async function convertOfficeToHtml(filePath: string, basePaths?: string[]
 
   try {
     const ext = extname(safePath).toLowerCase()
-    if (ext === '.xlsx') return convertXlsxToHtml(filePath, safePath, stableOffice)
-    if (ext === '.pptx') return convertPptxToHtml(filePath, safePath, stableOffice)
+    if (ext === '.xlsx' || ext === '.docx' || ext === '.pptx') {
+      const officeCliResult = await renderOfficeBufferWithOfficeCli(safePath, stableOffice)
+      if (officeCliResult) {
+        const kind: OfficePreviewResult['kind'] = ext === '.xlsx'
+          ? 'spreadsheet'
+          : ext === '.docx'
+            ? 'document'
+            : 'presentation'
+        return {
+          resolvedPath: safePath,
+          kind,
+          html: '',
+          htmlUrl: officeCliResult.htmlUrl,
+          text: officeCliResult.text,
+          renderer: 'officecli',
+        }
+      }
+      if (ext === '.xlsx') return convertXlsxToHtml(filePath, safePath, stableOffice)
+      if (ext === '.pptx') return convertPptxToHtml(filePath, safePath, stableOffice)
+      const mammoth = await import('mammoth')
+      const result = await mammoth.convertToHtml({ buffer: stableOffice })
+      return { resolvedPath: safePath, kind: 'document', html: result.value, text: result.value.replace(/<[^>]+>/g, ' ') }
+    }
     return null
   } catch (err) {
     console.error('[file-preview] convertOfficeToHtml structured preview failed:', err)
@@ -790,7 +990,11 @@ export async function convertOfficeToHtml(filePath: string, basePaths?: string[]
       const parseOfficeBuffer = officeParser.parseOfficeAsync as (file: string | Buffer) => Promise<string>
       const text = await parseOfficeBuffer(stableOffice)
       const ext = extname(safePath).toLowerCase()
-      const kind: OfficePreviewResult['kind'] = ext === '.pptx' ? 'presentation' : 'spreadsheet'
+      const kind: OfficePreviewResult['kind'] = ext === '.pptx'
+        ? 'presentation'
+        : ext === '.docx'
+          ? 'document'
+          : 'spreadsheet'
       return {
         resolvedPath: safePath,
         kind,

@@ -20,6 +20,8 @@ export type PlanningChangeResource = 'todos' | 'calendar_events' | 'todo_groups'
 
 export interface PlanningChange {
   resources: PlanningChangeResource[]
+  /** 单项 Todo 更新可直接增量合并，避免每个窗口重新读取完整列表。 */
+  todo?: Todo
 }
 
 /** macOS 中用户可选、且当前允许 Proma 写入的 Calendar / Reminders List。 */
@@ -355,8 +357,6 @@ export const PLANNING_IPC_CHANNELS = {
   ACKNOWLEDGE_REMINDER: 'planning:acknowledge-reminder',
   SNOOZE_REMINDER: 'planning:snooze-reminder',
   REMINDER_DUE: 'planning:reminder-due',
-  /** 打开或聚焦单例独立规划窗口。 */
-  OPEN_WINDOW: 'planning:open-window',
   CHANGED: 'planning:changed',
   AGENT_OPERATION: 'planning:agent-operation',
   /** macOS Calendar / Reminders 连接设置（仅主进程可访问 EventKit）。 */

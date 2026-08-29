@@ -10,13 +10,20 @@ import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import {
   currentAgentSessionIdAtom,
+  currentSessionSidePanelOpenAtom,
   agentSessionPathMapAtom,
   agentDiffPanelTabAtom,
+  agentTerminalTabsAtom,
+  getTerminalSidePanelTab,
+  getBrowserSidePanelTab,
+  getPreviewSidePanelTab,
 } from '@/atoms/agent-atoms'
 import type { AgentSidePanelTab } from '@/atoms/agent-atoms'
 import { SidePanel } from '@/components/agent/SidePanel'
 import { DesignInspector } from '@/components/design/DesignInspector'
 import type { RightPanelMode } from './design-layout'
+import { browserPanelOpenMapAtom, browserStateMapAtom } from '@/atoms/browser-atoms'
+import { getPreviewFileId, previewFileMapAtom } from '@/atoms/preview-atoms'
 
 export interface RightSidePanelProps {
   /** 右栏内容类型，由 AppShell 统一计算。 */
@@ -33,6 +40,16 @@ export function RightSidePanel({ mode, projectId, width }: RightSidePanelProps):
   const sessionPathMap = useAtomValue(agentSessionPathMapAtom)
   const diffPanelTabMap = useAtomValue(agentDiffPanelTabAtom)
   const setDiffPanelTabMap = useSetAtom(agentDiffPanelTabAtom)
+  const setTerminalTabsMap = useSetAtom(agentTerminalTabsAtom)
+  const setSidePanelOpen = useSetAtom(currentSessionSidePanelOpenAtom)
+  const browserOpenMap = useAtomValue(browserPanelOpenMapAtom)
+  const browserStateMap = useAtomValue(browserStateMapAtom)
+  const browserOpen = currentSessionId ? browserOpenMap.get(currentSessionId) === true : false
+  const browserState = currentSessionId ? browserStateMap.get(currentSessionId) ?? null : null
+  const previewFileMap = useAtomValue(previewFileMapAtom)
+  const currentPreviewFile = currentSessionId ? previewFileMap.get(currentSessionId) ?? null : null
+  const previousBrowserStateRef = React.useRef<{ sessionId: string | null; open: boolean }>({ sessionId: null, open: false })
+  const pendingBrowserActivationRef = React.useRef<string | null>(null)
 
   const setActiveTab = React.useCallback((tab: AgentSidePanelTab) => {
     if (!currentSessionId) return
@@ -43,6 +60,65 @@ export function RightSidePanel({ mode, projectId, width }: RightSidePanelProps):
     })
   }, [currentSessionId, setDiffPanelTabMap])
 
+  // Agent 或回复链接在当前会话首次打开浏览器时，直接让右侧工作区承接它。
+  // 切换到一个已有浏览器的会话时不抢占用户当前视图，保留该会话上次的外层 Tab。
+  React.useEffect(() => {
+    const unsubscribeOpen = window.electronAPI.onAgentTerminalOpen((event) => {
+      setTerminalTabsMap((previous) => {
+        const current = previous.get(event.sessionId) ?? []
+        if (current.some((terminal) => terminal.terminalId === event.terminalId)) return previous
+        const next = new Map(previous)
+        next.set(event.sessionId, [...current, { terminalId: event.terminalId, title: event.title, cwd: event.cwd }])
+        return next
+      })
+      if (event.sessionId !== currentSessionId) return
+      setSidePanelOpen(true)
+      setDiffPanelTabMap((previous) => {
+        const next = new Map(previous)
+        next.set(event.sessionId, getTerminalSidePanelTab(event.terminalId))
+        return next
+      })
+    })
+    const unsubscribeClose = window.electronAPI.onAgentTerminalClose((event) => {
+      setTerminalTabsMap((previous) => {
+        const current = previous.get(event.sessionId) ?? []
+        const remaining = current.filter((terminal) => terminal.terminalId !== event.terminalId)
+        if (remaining.length === current.length) return previous
+        const next = new Map(previous)
+        if (remaining.length > 0) next.set(event.sessionId, remaining)
+        else next.delete(event.sessionId)
+        return next
+      })
+      if (event.sessionId !== currentSessionId) return
+      setDiffPanelTabMap((previous) => {
+        if (previous.get(event.sessionId) !== getTerminalSidePanelTab(event.terminalId)) return previous
+        const next = new Map(previous)
+        next.set(event.sessionId, 'files')
+        return next
+      })
+    })
+    return () => {
+      unsubscribeOpen()
+      unsubscribeClose()
+    }
+  }, [currentSessionId, setDiffPanelTabMap, setSidePanelOpen, setTerminalTabsMap])
+
+  React.useEffect(() => {
+    const previous = previousBrowserStateRef.current
+    const openedInCurrentSession = previous.sessionId === currentSessionId && !previous.open && browserOpen
+    previousBrowserStateRef.current = { sessionId: currentSessionId, open: browserOpen }
+    if (openedInCurrentSession && currentSessionId) pendingBrowserActivationRef.current = currentSessionId
+    if (!currentSessionId || pendingBrowserActivationRef.current !== currentSessionId || !browserState?.activeTabId) return
+
+    setSidePanelOpen(true)
+    setDiffPanelTabMap((prev) => {
+      const next = new Map(prev)
+      next.set(currentSessionId, getBrowserSidePanelTab(browserState.activeTabId))
+      return next
+    })
+    pendingBrowserActivationRef.current = null
+  }, [browserOpen, browserState?.activeTabId, currentSessionId, setDiffPanelTabMap, setSidePanelOpen])
+
   if (mode === 'design') {
     return projectId ? <DesignInspector projectId={projectId} width={width} /> : null
   }
@@ -52,7 +128,13 @@ export function RightSidePanel({ mode, projectId, width }: RightSidePanelProps):
   }
 
   const sessionPath = sessionPathMap.get(currentSessionId) ?? null
-  const activeTab = diffPanelTabMap.get(currentSessionId) ?? 'files'
+  const storedTab = diffPanelTabMap.get(currentSessionId) ?? 'files'
+  // 兼容这次扁平化前内存中的旧“浏览器”工作区值。
+  const activeTab: AgentSidePanelTab = storedTab === 'browser'
+    ? browserState?.activeTabId ? getBrowserSidePanelTab(browserState.activeTabId) : 'files'
+    : storedTab === 'preview'
+      ? currentPreviewFile ? getPreviewSidePanelTab(getPreviewFileId(currentPreviewFile)) : 'files'
+      : storedTab
 
   return (
     <SidePanel
