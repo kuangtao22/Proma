@@ -77,6 +77,7 @@ import type {
   SDKToolUseBlock,
   SDKToolResultBlock,
   RecoveryAction,
+  CanvasNodeReference,
 } from '@proma/shared'
 import type { AgentPendingFile } from '@proma/shared'
 import {
@@ -931,6 +932,14 @@ function ScheduledRunBadge(): React.ReactElement {
   )
 }
 
+/** 用户消息正文或结构化 Canvas 引用任一非空时都需要渲染内容区域。 */
+export function shouldRenderUserMessageContent(
+  text: string,
+  canvasNodeReferences: readonly CanvasNodeReference[] | undefined,
+): boolean {
+  return Boolean(text) || (canvasNodeReferences?.length ?? 0) > 0
+}
+
 function UserInputMessage({ message, onAgentHistoryQuoteClick }: {
   message: SDKUserMessage
   onAgentHistoryQuoteClick?: (quote: QuotedSelection) => void
@@ -1051,7 +1060,7 @@ function UserInputMessage({ message, onAgentHistoryQuoteClick }: {
             ))}
           </div>
         )}
-        {text && (
+        {shouldRenderUserMessageContent(text, message._canvasNodeReferences) && (
           <UserMessageContent
             onAgentHistoryQuoteClick={onAgentHistoryQuoteClick}
             sdkUserMessage={message}

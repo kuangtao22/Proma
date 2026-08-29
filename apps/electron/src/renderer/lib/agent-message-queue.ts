@@ -230,6 +230,27 @@ export interface QueuedMessageSendPayload {
   canvasNodeReferences?: CanvasNodeReference[]
 }
 
+/** Renderer 消息提交结果；skipped 表示没有任何可发送内容。 */
+export type AgentMessageSubmissionOutcome = 'submitted' | 'skipped'
+
+/**
+ * 仅在正文或 Canvas 引用至少一项非空时进入真实提交边界。
+ * @param payload 已解析的队列消息载荷。
+ * @param submit 调用主进程并等待其接管消息的提交函数。
+ * @returns submitted 表示主进程已成功接管；skipped 表示消息为空且未调用提交函数。
+ */
+export async function submitQueuedMessagePayload(
+  payload: QueuedMessageSendPayload,
+  submit: (payload: QueuedMessageSendPayload) => Promise<void>,
+): Promise<AgentMessageSubmissionOutcome> {
+  /** 结构化 Canvas 引用与正文都是独立、合法的用户输入。 */
+  const hasCanvasNodeReferences = (payload.canvasNodeReferences?.length ?? 0) > 0
+  if (!payload.rawText && !hasCanvasNodeReferences) return 'skipped'
+
+  await submit(payload)
+  return 'submitted'
+}
+
 /** 队列预览专用片段：保留原始消息用于发送，同时把引用协议渲染为可读芯片。 */
 export type QueuedMessageReferenceType = 'file' | 'skill' | 'mcp' | 'session' | 'todo' | 'calendar_event' | 'quote'
 

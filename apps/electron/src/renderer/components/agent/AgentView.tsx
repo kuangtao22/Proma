@@ -149,12 +149,12 @@ import {
   parseQueuedMessageMentions,
   queuedTextToParagraphHtml,
   removeQueuedMessage,
-  restoreQueuedMessageToFront,
   addCanvasNodeReferences,
   removeCanvasNodeReference,
   removeSentCanvasNodeReferences,
+  submitQueuedMessagePayload,
 } from '@/lib/agent-message-queue'
-import type { AgentQueuedAttachment, AgentQueuedMessage, QueueDropPlacement } from '@/lib/agent-message-queue'
+import type { AgentMessageSubmissionOutcome, AgentQueuedAttachment, AgentQueuedMessage, QueueDropPlacement } from '@/lib/agent-message-queue'
 
 /** 稳定的空 string 数组引用，避免无附件会话的 memo 链每次渲染失效。 */
 const EMPTY_STRING_ARRAY: string[] = []
@@ -1070,57 +1070,59 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
 
   const sendPlainTextAgentMessage = React.useCallback(async (
     message: AgentQueuedMessage,
-  ): Promise<void> => {
+  ): Promise<AgentMessageSubmissionOutcome> => {
     const quotedSelectionBlock = message.quotedSelection
       ? buildQuotedSelectionBlock(message.quotedSelection)
       : ''
     const payload = buildQueuedMessageSendPayload(message, quotedSelectionBlock)
-    if (!payload.rawText || !agentChannelId || !hasAvailableModel) return
+    if (!agentChannelId || !hasAvailableModel) return 'skipped'
 
-    clearStoppedByUser()
-    setAgentStreamErrors((prev) => {
-      if (!prev.has(sessionId)) return prev
-      const map = new Map(prev)
-      map.delete(sessionId)
-      return map
+    return submitQueuedMessagePayload(payload, async (submittedPayload) => {
+      clearStoppedByUser()
+      setAgentStreamErrors((prev) => {
+        if (!prev.has(sessionId)) return prev
+        const map = new Map(prev)
+        map.delete(sessionId)
+        return map
+      })
+
+      // “立即发送”与后台续轮都由主进程用实时状态路由：活跃通道可用则注入，
+      // 否则保留到 deferred queue。这里的 streaming 只表达用户是否要求打断，不决定路由。
+      const result = await window.electronAPI.submitOrEnqueueAgentMessage({
+        queueMessageId: message.id,
+        sessionId,
+        userMessage: submittedPayload.sdkText,
+        rawUserMessage: submittedPayload.rawText,
+        channelId: agentChannelId,
+        modelId: agentModelId || undefined,
+        workspaceId: currentWorkspaceId || undefined,
+        additionalDirectories: message.additionalDirectories,
+        permissionModeOverride: permissionMode,
+        dispatch: 'now',
+        interrupt: streaming,
+        mentionedSkills: submittedPayload.mentions.mentionedSkills,
+        mentionedMcpServers: submittedPayload.mentions.mentionedMcpServers,
+        mentionedSessionIds: submittedPayload.mentions.mentionedSessionIds,
+        mentionedTodoIds: submittedPayload.mentions.mentionedTodoIds,
+        mentionedCalendarEventIds: submittedPayload.mentions.mentionedCalendarEventIds,
+        ...(submittedPayload.canvasNodeReferences && submittedPayload.canvasNodeReferences.length > 0
+          ? { canvasNodeReferences: submittedPayload.canvasNodeReferences }
+          : {}),
+      })
+      if (result.disposition === 'injected') {
+        appendLiveUserMessage(createUserSDKMessage(
+          submittedPayload.rawText,
+          message.id,
+          Date.now(),
+          submittedPayload.canvasNodeReferences,
+        ))
+        setQueuedMessages((prev) => removeQueuedMessage(prev, message.id))
+        return
+      }
+
+      // 活跃通道已结束或不存在时，主进程已接管消息；恢复/保留队列投影，等待 started 事件消费。
+      setQueuedMessages((prev) => prev.some((item) => item.id === message.id) ? prev : [...prev, message])
     })
-
-    // “立即发送”与后台续轮都由主进程用实时状态路由：活跃通道可用则注入，
-    // 否则保留到 deferred queue。这里的 streaming 只表达用户是否要求打断，不决定路由。
-    const result = await window.electronAPI.submitOrEnqueueAgentMessage({
-      queueMessageId: message.id,
-      sessionId,
-      userMessage: payload.sdkText,
-      rawUserMessage: payload.rawText,
-      channelId: agentChannelId,
-      modelId: agentModelId || undefined,
-      workspaceId: currentWorkspaceId || undefined,
-      additionalDirectories: message.additionalDirectories,
-      permissionModeOverride: permissionMode,
-      dispatch: 'now',
-      interrupt: streaming,
-      mentionedSkills: payload.mentions.mentionedSkills,
-      mentionedMcpServers: payload.mentions.mentionedMcpServers,
-      mentionedSessionIds: payload.mentions.mentionedSessionIds,
-      mentionedTodoIds: payload.mentions.mentionedTodoIds,
-      mentionedCalendarEventIds: payload.mentions.mentionedCalendarEventIds,
-      ...(payload.canvasNodeReferences && payload.canvasNodeReferences.length > 0
-        ? { canvasNodeReferences: payload.canvasNodeReferences }
-        : {}),
-    })
-    if (result.disposition === 'injected') {
-      appendLiveUserMessage(createUserSDKMessage(
-        payload.rawText,
-        message.id,
-        Date.now(),
-        payload.canvasNodeReferences,
-      ))
-      setQueuedMessages((prev) => removeQueuedMessage(prev, message.id))
-      return
-    }
-
-    // 活跃通道已结束或不存在时，主进程已接管消息；恢复/保留队列投影，等待 started 事件消费。
-    setQueuedMessages((prev) => prev.some((item) => item.id === message.id) ? prev : [...prev, message])
   }, [
     agentChannelId,
     agentModelId,
@@ -2171,8 +2173,10 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         map.delete(sessionId)
         return map
       })
-      sendPlainTextAgentMessage(message).then(() => {
-        clearSentCanvasNodeReferences(canvasNodeReferencesSnapshot)
+      sendPlainTextAgentMessage(message).then((outcome) => {
+        if (outcome === 'submitted') {
+          clearSentCanvasNodeReferences(canvasNodeReferencesSnapshot)
+        }
       }).catch((error) => {
         console.error('[AgentView] 追加消息失败:', error)
         toast.error('追加消息失败', { description: String(error) })
@@ -2764,11 +2768,9 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
           toast.info('消息已开始发送，无法再立即发送')
           return
         }
-        setQueuedMessages((prev) => removeQueuedMessage(prev, messageId))
         return sendPlainTextAgentMessage(message).catch((error) => {
           console.error('[AgentView] 队列消息发送失败:', error)
           toast.error('队列消息发送失败', { description: String(error) })
-          setQueuedMessages((prev) => restoreQueuedMessageToFront(prev, message))
         })
       })
       .catch((error) => {

@@ -8,6 +8,7 @@ import {
   mergeAgentDraftWithRestoredMessage,
   parseQueuedMessageMentions,
   removeSentCanvasNodeReferences,
+  submitQueuedMessagePayload,
 } from './agent-message-queue'
 
 /** 队列结构化引用测试使用的稳定节点快照。 */
@@ -29,6 +30,77 @@ const canvasReferenceB: CanvasNodeReference = {
 }
 
 describe('Canvas 节点引用队列合同', () => {
+  test('Given 仅有 Canvas 引用 When 普通发送 Then 仍调用真实提交并返回 submitted', async () => {
+    const payload = buildQueuedMessageSendPayload(createAgentQueuedMessage('', 'message-refs-only', 100, null, {
+      canvasNodeReferences: [canvasReferenceA],
+    }))
+    /** 记录提交边界实际收到的结构化引用。 */
+    let submittedReferences: readonly CanvasNodeReference[] | undefined
+
+    const outcome = await submitQueuedMessagePayload(payload, async (submittedPayload) => {
+      submittedReferences = submittedPayload.canvasNodeReferences
+    })
+
+    expect(outcome).toBe('submitted')
+    expect(submittedReferences).toEqual([canvasReferenceA])
+  })
+
+  test('Given 后台等待的仅引用消息 When 主进程提交失败 Then 不进入成功清理引用路径', async () => {
+    const payload = buildQueuedMessageSendPayload(createAgentQueuedMessage('', 'message-background', 100, null, {
+      canvasNodeReferences: [canvasReferenceA],
+    }))
+    /** 模拟 composer 当前仍持有的引用。 */
+    let currentReferences = [canvasReferenceA]
+
+    try {
+      const outcome = await submitQueuedMessagePayload(payload, async () => {
+        throw new Error('主进程未接管')
+      })
+      if (outcome === 'submitted') {
+        currentReferences = removeSentCanvasNodeReferences(currentReferences, [canvasReferenceA])
+      }
+    } catch {
+      // 提交失败由 AgentView 的现有错误恢复路径处理；此处只验证成功副作用不会发生。
+    }
+
+    expect(currentReferences).toEqual([canvasReferenceA])
+  })
+
+  test('Given 队列中的仅引用消息 When 立即发送未成功 Then 本地队列保留供重试', async () => {
+    const message = createAgentQueuedMessage('', 'message-queued', 100, null, {
+      canvasNodeReferences: [canvasReferenceA],
+    })
+    const payload = buildQueuedMessageSendPayload(message)
+    /** 模拟 Renderer 当前队列投影。 */
+    let queue = [message]
+
+    try {
+      const outcome = await submitQueuedMessagePayload(payload, async () => {
+        throw new Error('重新提交失败')
+      })
+      if (outcome === 'submitted') {
+        queue = queue.filter((item) => item.id !== message.id)
+      }
+    } catch {
+      // 失败时不提前删除本地队列，用户仍可再次发送。
+    }
+
+    expect(queue).toEqual([message])
+  })
+
+  test('Given 普通空消息且没有引用 When 请求提交 Then 保持既有 skipped 行为', async () => {
+    const payload = buildQueuedMessageSendPayload(createAgentQueuedMessage('', 'message-empty', 100))
+    /** 记录空消息是否误触发主进程提交。 */
+    let submitted = false
+
+    const outcome = await submitQueuedMessagePayload(payload, async () => {
+      submitted = true
+    })
+
+    expect(outcome).toBe('skipped')
+    expect(submitted).toBe(false)
+  })
+
   test('Given 已有引用和重复新引用 When 合并 Then 按画布与节点去重并保持正文无关', () => {
     const text = '基于这些页面继续设计'
 

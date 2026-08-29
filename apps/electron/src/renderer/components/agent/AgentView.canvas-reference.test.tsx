@@ -10,6 +10,7 @@ import {
   CanvasNodeReferenceChips,
   UserMessageContent,
 } from '@/components/ai-elements/message'
+import { shouldRenderUserMessageContent } from './SDKMessageRenderer'
 
 /** Agent composer 与历史展示共同使用的完整引用快照。 */
 const reference: CanvasNodeReference = {
@@ -66,5 +67,10 @@ describe('Agent Canvas 节点引用 composer', () => {
     expect(html).toContain('画布')
     expect(html).toContain('版本 3')
     expect(html).not.toContain('移除需求说明 v3引用')
+  })
+
+  test('Given 历史消息正文为空但引用非空 When 判断用户内容 Then 仍渲染引用 chip', () => {
+    expect(shouldRenderUserMessageContent('', [reference])).toBe(true)
+    expect(shouldRenderUserMessageContent('', [])).toBe(false)
   })
 })
