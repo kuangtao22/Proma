@@ -573,6 +573,46 @@ describe('Canvas 节点内容 Store', () => {
     expect(fixture.scopes.trash.size).toBe(0)
   })
 
+  test.each([
+    ['image', 'config.json'],
+    ['document', 'content.md'],
+    ['webview', 'index.html'],
+  ] as const)('Given %s 主体已提交但 meta 前失败 When 重复清理 Then partial 原子移入精确 rollback', async (kind, bodyFileName) => {
+    /** meta-last 提交失败，保留已经落盘的类型主体文件。 */
+    const fixture = createFixture({
+      outcomeFor: (request) => request.fileName === 'meta.json'
+        ? { commitVisible: false, durabilityUncertain: false, error: 'meta rename failed' }
+        : undefined,
+    })
+    /** 当前内容与 rollback 的稳定身份。 */
+    const input = { kind, contentId: `partial-${kind}` }
+    const rollbackId = `rollback-${kind}`
+
+    await expect(fixture.store.prepareEmptyContent(target, input))
+      .rejects.toThrow('CANVAS_CONTENT_WRITE_FAILED')
+    expect(fixture.scopes.nodes.get(input.contentId)?.[bodyFileName]).toBeDefined()
+
+    await fixture.store.discardPreparedContent(target, input, rollbackId)
+    await fixture.store.discardPreparedContent(target, input, rollbackId)
+
+    expect(fixture.scopes.nodes.has(input.contentId)).toBe(false)
+    expect(fixture.scopes.trash.get(rollbackId)?.[bodyFileName]).toBeDefined()
+  })
+
+  test('Given Webview partial 占用 document contentId When 按 document 清理 Then 身份冲突且目录不移动', async () => {
+    const fixture = createFixture()
+    fixture.scopes.nodes.set('partial-conflict', { 'index.html': '<html></html>' })
+
+    await expect(fixture.store.discardPreparedContent(
+      target,
+      { kind: 'document', contentId: 'partial-conflict' },
+      'rollback-conflict',
+    )).rejects.toThrow('CANVAS_CONTENT_IDENTITY_CONFLICT')
+
+    expect(fixture.scopes.nodes.has('partial-conflict')).toBe(true)
+    expect(fixture.scopes.trash.has('rollback-conflict')).toBe(false)
+  })
+
   test('Given helper rename 前失败或 rename 后耐久性未确认 When 提交 Then 映射为明确错误', async () => {
     const failed = createFixture({
       outcomeFor: (request) => request.fileName === 'content.md'

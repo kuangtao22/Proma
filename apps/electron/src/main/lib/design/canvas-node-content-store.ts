@@ -446,6 +446,49 @@ export function createCanvasNodeContentStore(
     }
   }
 
+  /** 判断稳定 entry 目录是否真实存在，不能把 meta-last 缺失等同于目录缺失。 */
+  const hasEntryDirectory = async (
+    capability: CanvasTrustedDirectoryCapability,
+    childName: 'nodes' | 'trash',
+    entryId: string,
+  ): Promise<boolean> => (await listEntries(capability, childName)).includes(entryId)
+
+  /** 校验完整或 meta-last partial 目录确属本次内容身份，跨类型文件一律失败关闭。 */
+  const assertPreparedDirectoryIdentity = async (
+    capability: CanvasTrustedDirectoryCapability,
+    childName: 'nodes' | 'trash',
+    directoryEntryId: string,
+    input: PrepareCanvasNodeContentInput,
+  ): Promise<void> => {
+    const meta = await readMeta(capability, childName, directoryEntryId)
+    if (meta) {
+      await assertContentInScope(capability, childName, input, directoryEntryId)
+      return
+    }
+    /** meta-last 前仅允许出现当前类别唯一的主体文件。 */
+    const [config, document, webview] = await Promise.all([
+      readFile(capability, childName, directoryEntryId, 'config.json'),
+      readFile(capability, childName, directoryEntryId, 'content.md'),
+      readFile(capability, childName, directoryEntryId, 'index.html'),
+    ])
+    if (input.kind === 'image') {
+      if (config === null || document !== null || webview !== null) {
+        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      }
+      assertSameIdentity(parseImageConfig(config), input)
+      return
+    }
+    if (input.kind === 'document') {
+      if (document === null || document !== '' || config !== null || webview !== null) {
+        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      }
+      return
+    }
+    if (webview === null || webview !== EMPTY_WEBVIEW_HTML || config !== null || document !== null) {
+      throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+    }
+  }
+
   /** 准备空白或 legacy 内容，meta.json 固定最后提交。 */
   const prepareContent = async (
     target: CanvasTarget,
@@ -767,25 +810,26 @@ export function createCanvasNodeContentStore(
       const rollbackId = requireContentId(rawRollbackId, 'rollbackId')
       const scopes = loadScopes(target, true)
       const trash = scopes.trash!
-      const sourceMeta = await readMeta(scopes.nodes, 'nodes', contentId)
-      if (!sourceMeta) {
-        const existingRollback = await readMeta(trash, 'trash', rollbackId)
-        /** prepare 在创建前失败时两端都缺失，精确 rollback 可幂等视为已清理。 */
-        if (!existingRollback) return
-        if (existingRollback.kind !== kind || existingRollback.contentId !== contentId) {
-          throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
-        }
+      const identity = { kind, contentId }
+      const [sourceExists, rollbackExists] = await Promise.all([
+        hasEntryDirectory(scopes.nodes, 'nodes', contentId),
+        hasEntryDirectory(trash, 'trash', rollbackId),
+      ])
+      if (!sourceExists) {
+        /** 两端真缺失表示 prepare 尚未形成目录；精确 rollback 已存在则验证后幂等成功。 */
+        if (!rollbackExists) return
+        await assertPreparedDirectoryIdentity(trash, 'trash', rollbackId, identity)
         return
       }
-      if (sourceMeta.kind !== kind || sourceMeta.contentId !== contentId) {
-        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
-      }
+      if (rollbackExists) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      await assertPreparedDirectoryIdentity(scopes.nodes, 'nodes', contentId, identity)
       const durabilityError = await moveDirectory(
         scopes.nodes, trash, 'nodes', contentId, 'trash', rollbackId,
       )
       if (durabilityError) {
-        const moved = await readMeta(trash, 'trash', rollbackId)
-        if (!moved || moved.kind !== kind || moved.contentId !== contentId) {
+        try {
+          await assertPreparedDirectoryIdentity(trash, 'trash', rollbackId, identity)
+        } catch {
           throw contentCommitUnconfirmed('discard visible but verification failed', durabilityError)
         }
         throw durabilityError

@@ -81,6 +81,20 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
   return actual.length === expected.length && actual.every((key, index) => key === expected[index])
 }
 
+/** 校验恢复状态与物理资源 ownership 的组合不变量。 */
+function assertResourceRecoveryState(resource: CanvasBatchPreparedResource): void {
+  /** pending 尚未取得 ownership；其余恢复状态必须携带明确归属。 */
+  if ((resource.state === 'pending') !== (resource.createdByOperation === null)) {
+    throw new Error('CANVAS_BATCH_INTENT_INVALID')
+  }
+  /** 回收移动永远由当前事务发起，不允许伪造为既有外部资源。 */
+  if (resource.kind === 'content-trash'
+    && resource.state !== 'pending'
+    && resource.createdByOperation !== true) {
+    throw new Error('CANVAS_BATCH_INTENT_INVALID')
+  }
+}
+
 /** 严格解析磁盘批量 intent，损坏项不得进入恢复或幂等判断。 */
 function parseIntent(value: unknown, target: CanvasTarget, operationId: string): CanvasBatchOperationIntent {
   const validStates: CanvasBatchOperationState[] = ['prepared', 'resources-created', 'cleanup-pending', 'rolled-back', 'committed']
@@ -121,14 +135,17 @@ function parseIntent(value: unknown, target: CanvasTarget, operationId: string):
     const key = JSON.stringify([resource.kind, resource.resourceId])
     if (resourceKeys.has(key)) throw new Error('CANVAS_BATCH_INTENT_INVALID')
     resourceKeys.add(key)
-    resources.push({
+    /** 已通过字段级解析的规范化资源。 */
+    const normalizedResource: CanvasBatchPreparedResource = {
       nodeId: resource.nodeId,
       kind: resource.kind,
       resourceId: resource.resourceId,
       state: resource.state as CanvasBatchPreparedResourceState,
       createdByOperation: resource.createdByOperation,
       trashEntry,
-    })
+    }
+    assertResourceRecoveryState(normalizedResource)
+    resources.push(normalizedResource)
   }
   return {
     schemaVersion: 1,
@@ -394,6 +411,7 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
   /** 从可信基线重建磁盘 intent 的不可变计划，任何不一致都禁止进入资源副作用。 */
   const assertAuthoritativeIntentPlan = (intent: CanvasBatchOperationIntent): void => {
     try {
+      for (const resource of intent.preparedResources) assertResourceRecoveryState(resource)
       /** Store 负责严格验证 mutation schema 并从当前权威 base 计算最终图。 */
       const plan = dependencies.store.planBatchOperations(intent.target, intent.baseRevision, intent.operations)
       assertSupportedNodeTransitions(plan.operations, plan.baseDocument, plan.expectedDocument)
@@ -528,8 +546,9 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
     try {
       for (let index = 0; index < intent.preparedResources.length; index += 1) {
         let resource = intent.preparedResources[index]!
-        if (resource.state === 'ready') continue
-        if (resource.state !== 'pending' && resource.state !== 'preparing') throw new Error('CANVAS_BATCH_INTENT_INVALID')
+        if (resource.state !== 'pending' && resource.state !== 'preparing' && resource.state !== 'ready') {
+          throw new Error('CANVAS_BATCH_INTENT_INVALID')
+        }
         const node = resource.kind === 'content-trash' ? null : requireResourceNode(nodes, resource)
         if (resource.state === 'pending') {
           let inspection: { exists: boolean }
@@ -544,6 +563,14 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
           resource = { ...resource, state: 'preparing', createdByOperation: !inspection.exists }
           intent = await updateResource(intent, index, resource)
         }
+        /** 非本事务所有的资源必须在 prepare 前仍存在，禁止恢复时补建后留下悬空 ownership。 */
+        if (resource.createdByOperation === false && resource.kind !== 'content-trash') {
+          if (!node) throw new Error('CANVAS_BATCH_OPERATION_INVALID')
+          const inspection = resource.kind === 'content-directory'
+            ? await dependencies.contentLifecycle.inspectBatchContent(intent.target, contentInput(node))
+            : dependencies.agentNodeCreation.inspectBatchSession({ ...intent.target, nodeId: resource.nodeId, sessionId: resource.resourceId, title: node.title })
+          if (!inspection.exists) throw new Error('CANVAS_BATCH_RESOURCE_OWNERSHIP_CONFLICT')
+        }
         let prepared: { created: boolean }
         if (resource.kind === 'content-trash') {
           if (!resource.trashEntry) throw new Error('CANVAS_BATCH_INTENT_INVALID')
@@ -556,6 +583,8 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
             : dependencies.agentNodeCreation.prepareBatchSession({ ...intent.target, nodeId: resource.nodeId, sessionId: resource.resourceId, title: node.title })
         }
         if (resource.createdByOperation === false && prepared.created) throw new Error('CANVAS_BATCH_RESOURCE_OWNERSHIP_CONFLICT')
+        /** ready 仍需幂等验证物理事实，但无需重复写入相同状态。 */
+        if (resource.state === 'ready') continue
         resource = { ...resource, state: 'ready' }
         intent = await updateResource(intent, index, resource)
       }
@@ -631,7 +660,8 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
           continue
         }
         let intent = original
-        if (intent.state === 'prepared') {
+        /** resources-created 也是磁盘声明，提交或确认图事实前必须重新证明每项物理资源。 */
+        if (intent.state === 'prepared' || intent.state === 'resources-created') {
           intent = await prepareResources(intent)
         }
         try {

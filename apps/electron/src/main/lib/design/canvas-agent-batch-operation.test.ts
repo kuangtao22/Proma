@@ -617,6 +617,49 @@ describe('CanvasAgentBatchOperationService', () => {
     expect(fixture.events).toEqual([])
   })
 
+  test('Given prepared intent 的 pending 被伪造为无 ownership 的 ready When reconcile Then 图提交前失败关闭', async () => {
+    /** prepared intent 已持久化，但尚未探测或创建任何物理资源。 */
+    const fixture = createFixture({ uncertainState: 'prepared' })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_RECOVERY_REQUIRED')
+    const persisted = [...fixture.intents.values()][0]!
+    fixture.intents.set(persisted.operationId, {
+      ...persisted,
+      preparedResources: persisted.preparedResources.map((resource, index) => index === 0
+        ? { ...resource, state: 'ready' }
+        : resource),
+    })
+
+    await expect(fixture.service.reconcile(target)).rejects.toThrow('CANVAS_BATCH_INTENT_PLAN_CONFLICT')
+
+    expect(fixture.getDocument().revision).toBe(7)
+    expect(fixture.getMutateCalls()).toBe(0)
+    expect(fixture.sessions.size).toBe(0)
+    expect(fixture.contents.size).toBe(0)
+  })
+
+  test('Given intent 被伪造为 resources-created 且 ready 资源实际缺失 When reconcile Then 先幂等补齐再提交图', async () => {
+    /** 从零副作用的 prepared intent 伪造出表面完成、ownership 完整的恢复状态。 */
+    const fixture = createFixture({ uncertainState: 'prepared' })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_RECOVERY_REQUIRED')
+    const persisted = [...fixture.intents.values()][0]!
+    fixture.intents.set(persisted.operationId, {
+      ...persisted,
+      state: 'resources-created',
+      preparedResources: persisted.preparedResources.map((resource) => ({
+        ...resource,
+        state: 'ready',
+        createdByOperation: true,
+      })),
+    })
+
+    const result = await fixture.service.reconcile(target)
+
+    expect(result.document.revision).toBe(8)
+    expect(fixture.sessions.has('session-agent-1')).toBe(true)
+    expect(fixture.contents).toEqual(new Set(['content-doc-1', 'content-web-1']))
+    expect(fixture.getMutateCalls()).toBe(1)
+  })
+
   test('Given 图已提交但 committed rename 前失败 When 重启重试 Then LOAD 对账不重复 revision', async () => {
     const fixture = createFixture({ failCommittedOnce: true })
     await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_INTENT_WRITE_FAILED')
