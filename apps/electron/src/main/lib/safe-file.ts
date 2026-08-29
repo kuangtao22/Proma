@@ -617,8 +617,13 @@ export function writeJsonFileAtomicSecure(
   }
 }
 
-/** 读取目标完整状态；不存在返回 null，存在但不是安全普通文件则拒绝。 */
-function readDestinationState(path: string): AtomicFileState | null {
+/**
+ * 读取安全原子写目标的完整文件状态。
+ *
+ * @param path 待读取的明确文件路径。
+ * @returns 文件缺失时返回 null；存在时返回 CAS 使用的完整状态。
+ */
+export function readAtomicFileState(path: string): AtomicFileState | null {
   try {
     const stat = lstatSync(path)
     if (!stat.isFile() || !isOwnedByCurrentUser(stat.uid)) {
@@ -630,6 +635,9 @@ function readDestinationState(path: string): AtomicFileState | null {
     throw error
   }
 }
+
+/** secure writer 内部沿用公开只读状态边界。 */
+const readDestinationState = readAtomicFileState
 
 /** 在 temp 创建前确认当前状态满足调用方显式 CAS 预期。 */
 function assertExpectedDestinationState(

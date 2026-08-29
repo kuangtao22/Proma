@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import type {
   AgentCanvasBinding,
   LinkAgentCanvasInput,
@@ -14,8 +14,17 @@ import {
   parseUnlinkAgentCanvasInput,
 } from '@proma/shared'
 import { getAgentCanvasBindingsPath } from '../config-paths'
-import { readJsonFileSafe, writeJsonFileAtomic } from '../safe-file'
-import type { ReadJsonFileSafeOptions } from '../safe-file'
+import {
+  readAtomicFileState,
+  readJsonFileSafe,
+  writeJsonFileAtomicSecure,
+} from '../safe-file'
+import type {
+  AtomicDestinationExpectation,
+  AtomicFileState,
+  ReadJsonFileSafeOptions,
+  SecureAtomicJsonWriteOptions,
+} from '../safe-file'
 
 /** Agent-画布关联索引的当前磁盘版本。 */
 const AGENT_CANVAS_BINDINGS_VERSION = 1
@@ -26,22 +35,33 @@ interface AgentCanvasBindingsFile {
   bindings: AgentCanvasBinding[]
 }
 
+/** 单次 fresh load 绑定的规范化文件与 CAS 写入依据。 */
+interface AgentCanvasBindingsSnapshot {
+  file: AgentCanvasBindingsFile
+  expectedDestination: AtomicDestinationExpectation
+  priorFile: AgentCanvasBindingsFile | null
+}
+
 /** Store 可替换的文件系统、时间与日志依赖。 */
 export interface AgentCanvasBindingStoreDependencies {
   /** 关联索引文件路径；默认位于当前业务配置根。 */
   configPath?: string
   /** 生成业务变更时间戳；默认使用系统时间。 */
   now?: () => number
-  /** 判断主文件是否存在，用于区分缺失和损坏。 */
-  exists?: (filePath: string) => boolean
+  /** 读取主文件完整状态，用于区分缺失并建立 CAS 预期。 */
+  readState?: (filePath: string) => AtomicFileState | null
   /** 读取主文件原始内容，避免损坏读取触发候选提升。 */
   readFile?: (filePath: string, encoding: 'utf8') => string
   /** 使用 safe-file 读取合法主文件或缺失主文件的恢复候选。 */
   readJson?: (filePath: string, options: ReadJsonFileSafeOptions<unknown>) => unknown | null
   /** 使用 safe-file 原子写入完整索引。 */
-  writeJson?: (filePath: string, value: object) => unknown
-  /** 输出不含文件内容的中文损坏提示。 */
-  warn?: (message: string, error?: unknown) => void
+  writeJson?: (
+    filePath: string,
+    value: object,
+    options: SecureAtomicJsonWriteOptions,
+  ) => unknown
+  /** 输出不含文件内容或原始错误的中文损坏提示。 */
+  warn?: (message: string) => void
 }
 
 /** 管理普通 Agent 会话与项目画布的多对多关联。 */
@@ -50,8 +70,8 @@ export class AgentCanvasBindingStore {
   private readonly configPath: string
   /** 业务时间来源。 */
   private readonly now: () => number
-  /** 主文件存在性读取边界。 */
-  private readonly exists: (filePath: string) => boolean
+  /** 主文件完整状态读取边界。 */
+  private readonly readState: (filePath: string) => AtomicFileState | null
   /** 主文件原始内容读取边界。 */
   private readonly readFile: (filePath: string, encoding: 'utf8') => string
   /** safe-file JSON 恢复读取边界。 */
@@ -60,9 +80,13 @@ export class AgentCanvasBindingStore {
     options: ReadJsonFileSafeOptions<unknown>,
   ) => unknown | null
   /** safe-file 原子 JSON 写入边界。 */
-  private readonly writeJson: (filePath: string, value: object) => unknown
+  private readonly writeJson: (
+    filePath: string,
+    value: object,
+    options: SecureAtomicJsonWriteOptions,
+  ) => unknown
   /** 中文降级日志边界。 */
-  private readonly warn: (message: string, error?: unknown) => void
+  private readonly warn: (message: string) => void
   /** 首次访问后缓存的规范化关联记录。 */
   private bindings: AgentCanvasBinding[] | null = null
 
@@ -73,13 +97,15 @@ export class AgentCanvasBindingStore {
   constructor(dependencies: AgentCanvasBindingStoreDependencies = {}) {
     this.configPath = dependencies.configPath ?? getAgentCanvasBindingsPath()
     this.now = dependencies.now ?? Date.now
-    this.exists = dependencies.exists ?? existsSync
+    this.readState = dependencies.readState ?? readAtomicFileState
     this.readFile = dependencies.readFile ?? ((filePath, encoding) => readFileSync(filePath, encoding))
     this.readJson = dependencies.readJson ?? ((filePath, options) => (
       readJsonFileSafe<unknown>(filePath, options)
     ))
-    this.writeJson = dependencies.writeJson ?? ((filePath, value) => writeJsonFileAtomic(filePath, value))
-    this.warn = dependencies.warn ?? ((message, error) => console.warn(message, error))
+    this.writeJson = dependencies.writeJson ?? ((filePath, value, options) => (
+      writeJsonFileAtomicSecure(filePath, value, options)
+    ))
+    this.warn = dependencies.warn ?? ((message) => console.warn(message))
   }
 
   /**
@@ -120,8 +146,8 @@ export class AgentCanvasBindingStore {
   link(rawInput: LinkAgentCanvasInput): AgentCanvasBinding {
     /** 共享边界严格解析后的关联命令。 */
     const input = parseLinkAgentCanvasInput(rawInput)
-    /** 当前完整内存索引。 */
-    const bindings = this.load().map(copyBinding)
+    /** fresh 磁盘快照与隔离候选，避免长期缓存参与写入。 */
+    const { snapshot, bindings } = this.prepareMutation()
     /** 相同项目与会话的现有记录位置。 */
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
     /** 命中时用于判断重复操作或默认切换的现有记录。 */
@@ -141,7 +167,7 @@ export class AgentCanvasBindingStore {
         updatedAt: this.now(),
       }
       bindings[index] = updated
-      this.persist(bindings)
+      this.persist(bindings, snapshot)
       return copyBinding(updated)
     }
 
@@ -166,7 +192,7 @@ export class AgentCanvasBindingStore {
     }
     if (index < 0) bindings.push(updated)
     else bindings[index] = updated
-    this.persist(bindings)
+    this.persist(bindings, snapshot)
     return copyBinding(updated)
   }
 
@@ -178,8 +204,8 @@ export class AgentCanvasBindingStore {
   unlink(rawInput: UnlinkAgentCanvasInput): AgentCanvasBinding | null {
     /** 共享边界严格解析后的解除命令。 */
     const input = parseUnlinkAgentCanvasInput(rawInput)
-    /** 当前完整内存索引。 */
-    const bindings = this.load().map(copyBinding)
+    /** fresh 磁盘快照与隔离候选，避免长期缓存参与写入。 */
+    const { snapshot, bindings } = this.prepareMutation()
     /** 目标记录位置。 */
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
     if (index < 0) return null
@@ -190,7 +216,7 @@ export class AgentCanvasBindingStore {
     const linkedCanvasIds = existing.linkedCanvasIds.filter((canvasId) => canvasId !== input.canvasId)
     if (linkedCanvasIds.length === 0) {
       bindings.splice(index, 1)
-      this.persist(bindings)
+      this.persist(bindings, snapshot)
       return null
     }
     /** 若默认被删除则稳定回退到剩余首项。 */
@@ -210,7 +236,7 @@ export class AgentCanvasBindingStore {
       updatedAt: this.now(),
     }
     bindings[index] = updated
-    this.persist(bindings)
+    this.persist(bindings, snapshot)
     return copyBinding(updated)
   }
 
@@ -222,8 +248,8 @@ export class AgentCanvasBindingStore {
   setDefault(rawInput: SetDefaultAgentCanvasInput): AgentCanvasBinding {
     /** 共享边界严格解析后的默认切换命令。 */
     const input = parseSetDefaultAgentCanvasInput(rawInput)
-    /** 当前完整内存索引。 */
-    const bindings = this.load().map(copyBinding)
+    /** fresh 磁盘快照与隔离候选，避免长期缓存参与写入。 */
+    const { snapshot, bindings } = this.prepareMutation()
     /** 目标记录位置。 */
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
     /** 目标记录；未知会话或未知关联都明确拒绝。 */
@@ -243,7 +269,7 @@ export class AgentCanvasBindingStore {
       updatedAt: this.now(),
     }
     bindings[index] = updated
-    this.persist(bindings)
+    this.persist(bindings, snapshot)
     return copyBinding(updated)
   }
 
@@ -256,13 +282,13 @@ export class AgentCanvasBindingStore {
     /** 共享清理合同验证后的会话目标。 */
     const input = parseClearAgentCanvasBindingsInput({ projectId, target: 'session', sessionId })
     if (input.target !== 'session') throw new Error('CLEAR_AGENT_CANVAS_BINDINGS_INPUT_INVALID')
-    /** 当前完整内存索引。 */
-    const bindings = this.load().map(copyBinding)
+    /** fresh 磁盘快照与隔离候选，避免长期缓存参与写入。 */
+    const { snapshot, bindings } = this.prepareMutation()
     /** 目标记录位置。 */
     const index = findBindingIndex(bindings, input.projectId, input.sessionId)
     if (index < 0) return
     bindings.splice(index, 1)
-    this.persist(bindings)
+    this.persist(bindings, snapshot)
   }
 
   /**
@@ -274,8 +300,8 @@ export class AgentCanvasBindingStore {
     /** 共享清理合同验证后的画布目标。 */
     const input = parseClearAgentCanvasBindingsInput({ projectId, target: 'canvas', canvasId })
     if (input.target !== 'canvas') throw new Error('CLEAR_AGENT_CANVAS_BINDINGS_INPUT_INVALID')
-    /** 当前完整内存索引。 */
-    const bindings = this.load().map(copyBinding)
+    /** fresh 磁盘快照与隔离候选，避免长期缓存参与写入。 */
+    const { snapshot, bindings } = this.prepareMutation()
     /** 本轮是否实际修改过至少一条记录。 */
     let changed = false
     /** 同一次清理对所有保留记录使用一致时间戳。 */
@@ -312,36 +338,91 @@ export class AgentCanvasBindingStore {
         updatedAt: timestamp,
       }
     }
-    if (changed) this.persist(bindings)
+    if (changed) this.persist(bindings, snapshot)
   }
 
-  /** 延迟读取磁盘，并把损坏配置降级为空内存索引。 */
+  /** 延迟读取磁盘，并缓存规范化公开读结果。 */
   private load(): AgentCanvasBinding[] {
     if (this.bindings) return this.bindings
-    try {
-      /** 主文件存在时先只读解析，禁止损坏内容触发 tmp/bak 提升覆盖。 */
-      if (this.exists(this.configPath)) {
-        /** 主文件解析后的未知 JSON。 */
-        const primaryValue = JSON.parse(this.readFile(this.configPath, 'utf8')) as unknown
-        parseBindingsFile(primaryValue)
-      }
-      /** safe-file 返回的主文件或缺失主文件恢复候选。 */
-      const value = this.readJson(this.configPath, { validate: isAgentCanvasBindingsFile })
-      /** 规范化后的文件；全部候选缺失时使用空索引。 */
-      const file = value === null ? createEmptyBindingsFile() : parseBindingsFile(value)
-      this.bindings = file.bindings.map(copyBinding)
-    } catch (error) {
-      this.warn('[Agent-画布关联] 配置损坏，已降级为空；下次有效写入将原子重建', error)
-      this.bindings = []
-    }
+    /** 本次公开读使用的 fresh 权威快照。 */
+    const snapshot = this.loadFresh()
+    this.bindings = snapshot.file.bindings.map(copyBinding)
     return this.bindings
+  }
+
+  /**
+   * 为 mutation 强制读取 fresh 快照，并创建不污染缓存的候选数组。
+   * @returns 同一次读取绑定的 CAS 快照与隔离候选。
+   */
+  private prepareMutation(): {
+    snapshot: AgentCanvasBindingsSnapshot
+    bindings: AgentCanvasBinding[]
+  } {
+    /** mutation 不允许基于长期读缓存，必须重新读取当前磁盘事实。 */
+    const snapshot = this.loadFresh()
+    /** fresh 事实可供 no-op 后的公开读取复用。 */
+    this.bindings = snapshot.file.bindings.map(copyBinding)
+    return {
+      snapshot,
+      bindings: snapshot.file.bindings.map(copyBinding),
+    }
+  }
+
+  /** 读取一次主文件或执行缺失主文件恢复，并捕获后续 CAS 所需状态。 */
+  private loadFresh(): AgentCanvasBindingsSnapshot {
+    /** 读取前主文件状态决定直接读取或进入 safe-file 恢复链。 */
+    const initialState = this.readState(this.configPath)
+    if (initialState !== null) {
+      /** 主文件只读取一次，避免校验后再次读取形成 TOCTOU。 */
+      const raw = this.readFile(this.configPath, 'utf8')
+      try {
+        /** 合法主文件同时作为候选基线和 prior backup 数据。 */
+        const file = parseBindingsFile(JSON.parse(raw) as unknown)
+        return {
+          file,
+          expectedDestination: { kind: 'state', state: initialState },
+          priorFile: file,
+        }
+      } catch {
+        this.warn('[Agent-画布关联] 主配置 JSON 或 schema 损坏，已降级为空')
+        return {
+          file: createEmptyBindingsFile(),
+          expectedDestination: { kind: 'state', state: initialState },
+          priorFile: null,
+        }
+      }
+    }
+
+    /** 主文件缺失时才允许 safe-file 检查并提升 tmp/bak 候选。 */
+    const recoveredValue = this.readJson(this.configPath, { validate: isAgentCanvasBindingsFile })
+    if (recoveredValue === null) {
+      return {
+        file: createEmptyBindingsFile(),
+        expectedDestination: { kind: 'missing' },
+        priorFile: null,
+      }
+    }
+    /** validator 已筛选 schema，仍重建规范化副本供业务使用。 */
+    const file = parseBindingsFile(recoveredValue)
+    /** 恢复成功必须已发布主文件，后续 mutation 才能建立 state CAS。 */
+    const recoveredState = this.readState(this.configPath)
+    if (recoveredState === null) throw new Error('Agent-画布关联恢复后主文件缺失')
+    return {
+      file,
+      expectedDestination: { kind: 'state', state: recoveredState },
+      priorFile: file,
+    }
   }
 
   /**
    * 按稳定身份排序并原子提交候选索引。
    * @param candidateBindings 尚未影响当前缓存的完整候选记录。
+   * @param snapshot fresh load 捕获的 CAS 与 prior backup 依据。
    */
-  private persist(candidateBindings: readonly AgentCanvasBinding[]): void {
+  private persist(
+    candidateBindings: readonly AgentCanvasBinding[],
+    snapshot: AgentCanvasBindingsSnapshot,
+  ): void {
     /** 确定性排序后的隔离持久化记录。 */
     const bindings = candidateBindings.map(copyBinding).sort(compareBindings)
     /** 固定 schema v1 的完整写入值。 */
@@ -349,8 +430,20 @@ export class AgentCanvasBindingStore {
       version: AGENT_CANVAS_BINDINGS_VERSION,
       bindings,
     }
+    /** secure writer 使用 fresh 状态阻断并发覆盖，并保留合法旧文件备份。 */
+    const options: SecureAtomicJsonWriteOptions = {
+      expectedDestination: snapshot.expectedDestination,
+      ...(snapshot.priorFile === null
+        ? {}
+        : {
+            priorBackup: {
+              filePath: `${this.configPath}.bak`,
+              data: snapshot.priorFile,
+            },
+          }),
+    }
     try {
-      this.writeJson(this.configPath, file)
+      this.writeJson(this.configPath, file, options)
     } catch (error) {
       /** rename 是否已提交不可判定，下一次访问必须回到磁盘权威事实。 */
       this.bindings = null

@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   ensureDirectoryDurable,
+  readAtomicFileState,
   readJsonFileSafe,
   removeFileAtomic,
   writeJsonFileAtomic,
@@ -32,6 +33,20 @@ interface VersionedValue {
   version: 1
   value: string
 }
+
+test('Given 普通文件或缺失路径 When 读取原子状态 Then 返回完整状态或 null', () => {
+  /** 隔离状态读取边界的临时目录。 */
+  const tempDir = mkdtempSync(join(tmpdir(), 'proma-atomic-file-state-'))
+  /** 测试目标文件。 */
+  const filePath = join(tempDir, 'state.json')
+  try {
+    expect(readAtomicFileState(filePath)).toBeNull()
+    writeFileSync(filePath, '{"version":1}', 'utf8')
+    expect(readAtomicFileState(filePath)).toEqual(captureAtomicFileState(filePath))
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true })
+  }
+})
 
 describe('writeJsonLinesFileAtomic', () => {
   test('Given 多条追踪记录 When 原子写入 Then 每行都是独立 JSON 且文件以换行结尾', () => {

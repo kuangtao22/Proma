@@ -3,6 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentCanvasBinding } from '@proma/shared'
+import type { AtomicFileState } from '../safe-file'
+import { writeJsonFileAtomicSecure } from '../safe-file'
 import { AgentCanvasBindingStore } from './agent-canvas-binding-store'
 
 /** 测试配置文件的固定虚拟路径，不访问真实用户目录。 */
@@ -16,6 +18,17 @@ interface WriteCall {
   value: object
 }
 
+/** 为纯内存 Store fixture 构造可比较的 CAS 文件状态。 */
+function createTestFileState(value: unknown, revision = 1): AtomicFileState {
+  return {
+    dev: 1,
+    ino: 1,
+    size: JSON.stringify(value).length,
+    mtimeMs: revision,
+    ctimeMs: revision,
+  }
+}
+
 /** 创建纯内存依赖，稳定验证读取、写入与 no-op 行为。 */
 function createHarness(initial: unknown = null, nowValues: number[] = [100]) {
   /** 模拟磁盘当前 JSON 值。 */
@@ -24,11 +37,13 @@ function createHarness(initial: unknown = null, nowValues: number[] = [100]) {
   const writes: WriteCall[] = []
   /** 当前时间读取位置。 */
   let nowIndex = 0
+  /** 模拟每次原子提交后的文件状态版本。 */
+  let diskRevision = 1
   /** 供测试使用的 Store。 */
   const store = new AgentCanvasBindingStore({
     configPath: CONFIG_PATH,
     now: () => nowValues[Math.min(nowIndex++, nowValues.length - 1)] ?? 0,
-    exists: () => diskValue !== null,
+    readState: () => diskValue === null ? null : createTestFileState(diskValue, diskRevision),
     readFile: () => JSON.stringify(diskValue),
     readJson: () => diskValue,
     writeJson: (path, value) => {
@@ -36,6 +51,7 @@ function createHarness(initial: unknown = null, nowValues: number[] = [100]) {
       const copied = JSON.parse(JSON.stringify(value)) as object
       writes.push({ path, value: copied })
       diskValue = copied
+      diskRevision += 1
       return 'directory'
     },
     warn: () => undefined,
@@ -51,6 +67,25 @@ function linkInput(
   projectId = 'project-1',
 ) {
   return { projectId, sessionId, canvasId, makeDefault }
+}
+
+/** 创建包含单个会话关联的合法 schema v1 文件。 */
+function createBindingFile(canvasIds: string[]) {
+  /** 首项作为默认和最近画布，空数组仅用于空索引。 */
+  const firstCanvasId = canvasIds[0]
+  return {
+    version: 1,
+    bindings: firstCanvasId
+      ? [{
+          projectId: 'project-1',
+          sessionId: 'session-1',
+          defaultCanvasId: firstCanvasId,
+          linkedCanvasIds: canvasIds,
+          lastActiveCanvasId: firstCanvasId,
+          updatedAt: 10,
+        }]
+      : [],
+  }
 }
 
 beforeEach(() => {
@@ -174,7 +209,7 @@ describe('AgentCanvasBindingStore', () => {
     const store = new AgentCanvasBindingStore({
       configPath: CONFIG_PATH,
       now: () => 123,
-      exists: () => true,
+      readState: () => createTestFileState(rawContent),
       readFile: () => rawContent,
       readJson: () => { throw new Error('损坏主文件不应进入恢复提升') },
       writeJson: (_path, value) => {
@@ -195,6 +230,132 @@ describe('AgentCanvasBindingStore', () => {
       version: 1,
       bindings: [store.get('project-1', 'session-1')],
     })
+  })
+
+  test('Given 主文件合法且存在 When 首次读取 Then 只读取主文件一次且不触发恢复 reader', () => {
+    /** 合法主文件值。 */
+    const file = createBindingFile(['canvas-a'])
+    /** 主文件读取次数。 */
+    let readFileCalls = 0
+    /** 恢复 reader 调用次数。 */
+    let recoveryReadCalls = 0
+    const store = new AgentCanvasBindingStore({
+      configPath: CONFIG_PATH,
+      readState: () => createTestFileState(file),
+      readFile: () => {
+        readFileCalls += 1
+        return JSON.stringify(file)
+      },
+      readJson: () => {
+        recoveryReadCalls += 1
+        throw new Error('合法主文件不应触发恢复 reader')
+      },
+      warn: () => undefined,
+    })
+
+    expect(store.listByProject('project-1')).toEqual(file.bindings)
+    expect(readFileCalls).toBe(1)
+    expect(recoveryReadCalls).toBe(0)
+  })
+
+  test('Given 含敏感哨兵的损坏主文件 When 降级为空 Then warning 只有稳定中文类别', () => {
+    /** 不得进入 warning 参数的敏感哨兵。 */
+    const sensitiveSentinel = 'SECRET_SENTINEL_DO_NOT_LOG'
+    /** 捕获 warning 的全部参数以验证没有 error 或原文。 */
+    const warningArguments: unknown[][] = []
+    const store = new AgentCanvasBindingStore({
+      configPath: CONFIG_PATH,
+      readState: () => createTestFileState(sensitiveSentinel),
+      readFile: () => `{${sensitiveSentinel}`,
+      readJson: () => { throw new Error('损坏主文件不应触发恢复 reader') },
+      warn: (...args: unknown[]) => { warningArguments.push(args) },
+    })
+
+    expect(store.listByProject('project-1')).toEqual([])
+    expect(warningArguments).toHaveLength(1)
+    expect(warningArguments[0]).toHaveLength(1)
+    expect(JSON.stringify(warningArguments)).not.toContain(sensitiveSentinel)
+  })
+
+  test('Given 缺失主文件的恢复 rename 已提交但 durability 抛错 When 重试 Then 传播后重载磁盘事实', () => {
+    /** 恢复 reader 提交后可见的旧关联文件。 */
+    let diskValue: unknown = null
+    /** 恢复 reader 调用次数，主文件可见后不应再次调用。 */
+    let recoveryReadCalls = 0
+    const store = new AgentCanvasBindingStore({
+      configPath: CONFIG_PATH,
+      now: () => 20,
+      readState: () => diskValue === null ? null : createTestFileState(diskValue),
+      readFile: () => JSON.stringify(diskValue),
+      readJson: () => {
+        recoveryReadCalls += 1
+        diskValue = createBindingFile(['canvas-old'])
+        throw new Error('RECOVERY_DURABILITY_UNCERTAIN')
+      },
+      writeJson: (_path, value) => {
+        diskValue = JSON.parse(JSON.stringify(value)) as object
+        return 'directory'
+      },
+      warn: () => undefined,
+    })
+
+    expect(() => store.get('project-1', 'session-1')).toThrow('RECOVERY_DURABILITY_UNCERTAIN')
+    expect(store.get('project-1', 'session-1')?.linkedCanvasIds).toEqual(['canvas-old'])
+    expect(store.link(linkInput('session-1', 'canvas-new')).linkedCanvasIds).toEqual([
+      'canvas-old', 'canvas-new',
+    ])
+    expect(recoveryReadCalls).toBe(1)
+  })
+
+  test('Given 两个 Store 都缓存空索引 When 先后写入 Then 后写者 fresh reload 不丢前者关联', () => {
+    /** 真实 secure writer 需要已存在的父目录。 */
+    const directory = mkdtempSync(join(tmpdir(), 'proma-agent-canvas-concurrent-'))
+    temporaryDirectories.push(directory)
+    /** 两个 Store 共享的真实索引路径。 */
+    const configPath = join(directory, 'agent-canvas-bindings.json')
+    const storeA = new AgentCanvasBindingStore({ configPath, now: () => 10 })
+    const storeB = new AgentCanvasBindingStore({ configPath, now: () => 20 })
+    expect(storeA.listByProject('project-1')).toEqual([])
+    expect(storeB.listByProject('project-1')).toEqual([])
+
+    storeA.link(linkInput('session-1', 'canvas-a'))
+    storeB.link(linkInput('session-1', 'canvas-b'))
+
+    expect(new AgentCanvasBindingStore({ configPath }).get(
+      'project-1', 'session-1',
+    )?.linkedCanvasIds).toEqual(['canvas-a', 'canvas-b'])
+  })
+
+  test('Given fresh 读取后另一写者抢先提交 When CAS 写入 Then 明确冲突且不覆盖赢家', () => {
+    /** 真实 secure CAS 竞争使用的已存在父目录。 */
+    const directory = mkdtempSync(join(tmpdir(), 'proma-agent-canvas-cas-conflict-'))
+    temporaryDirectories.push(directory)
+    /** 竞争双方共享的索引路径。 */
+    const configPath = join(directory, 'agent-canvas-bindings.json')
+    /** mutation fresh 读取时看到的基线。 */
+    const baselineFile = createBindingFile(['canvas-base'])
+    /** beforeRename 阶段由赢家发布的新事实。 */
+    const winnerFile = createBindingFile(['canvas-base', 'canvas-winner'])
+    writeFileSync(configPath, JSON.stringify(baselineFile), 'utf8')
+    const store = new AgentCanvasBindingStore({
+      configPath,
+      writeJson: (filePath, value, options) => writeJsonFileAtomicSecure(
+        filePath,
+        value,
+        {
+          ...options,
+          beforeRename: () => writeFileSync(filePath, JSON.stringify(winnerFile), 'utf8'),
+        },
+      ),
+    })
+
+    expect(() => store.link(linkInput('session-1', 'canvas-loser'))).toThrow(
+      '安全原子写入目标状态冲突',
+    )
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual(winnerFile)
+    expect(store.get('project-1', 'session-1')?.linkedCanvasIds).toEqual([
+      'canvas-base', 'canvas-winner',
+    ])
   })
 
   test('Given 主文件缺失、错误版本 tmp 与合法 bak When 读取 Then 跳过 tmp 并从 bak 恢复合法主文件', () => {
@@ -268,7 +429,7 @@ describe('AgentCanvasBindingStore', () => {
     const store = new AgentCanvasBindingStore({
       configPath: CONFIG_PATH,
       now: () => 20,
-      exists: () => true,
+      readState: () => createTestFileState(diskValue),
       readFile: () => JSON.stringify(diskValue),
       readJson: () => diskValue,
       writeJson: (_path, value) => {
@@ -309,7 +470,7 @@ describe('AgentCanvasBindingStore', () => {
     const store = new AgentCanvasBindingStore({
       configPath: CONFIG_PATH,
       now: () => 20 + writeAttempts,
-      exists: () => true,
+      readState: () => createTestFileState(diskValue),
       readFile: () => JSON.stringify(diskValue),
       readJson: () => diskValue,
       writeJson: (_path, value) => {
