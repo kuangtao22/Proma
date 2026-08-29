@@ -625,39 +625,45 @@ function collectTopLevelExecutionCalls(node: ts.Node): ts.CallExpression[] {
 function loadAgentHandlers(): AgentHandlerIndex {
   if (cachedHandlerIndex) return cachedHandlerIndex
   const ipcPath = join(import.meta.dir, '..', 'ipc.ts')
+  const agentMessageIpcPath = join(import.meta.dir, 'agent-message-ipc.ts')
   const configPath = ts.findConfigFile(join(import.meta.dir, '../../../..'), ts.sys.fileExists, 'tsconfig.json')
   if (!configPath) throw new Error('找不到仓库 tsconfig.json')
   const config = ts.readConfigFile(configPath, ts.sys.readFile)
   const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, join(configPath, '..'))
-  const program = ts.createProgram([ipcPath], parsed.options)
+  const program = ts.createProgram([ipcPath, agentMessageIpcPath], parsed.options)
   const checker = program.getTypeChecker()
   const source = program.getSourceFile(ipcPath)
   if (!source) throw new Error('无法解析 ipc.ts')
+  const handlerSources = [source, program.getSourceFile(agentMessageIpcPath)]
+    .filter((candidate): candidate is ts.SourceFile => candidate !== undefined)
   const handlers: RegisteredHandler[] = []
 
-  const visit = (node: ts.Node): void => {
-    if (
-      ts.isCallExpression(node)
-      && node.expression.getText(source) === 'ipcMain.handle'
-      && node.arguments.length >= 2
-    ) {
-      const channelArg = node.arguments[0]
-      const handlerArg = node.arguments[1]
-      if (channelArg && handlerArg && (ts.isArrowFunction(handlerArg) || ts.isFunctionExpression(handlerArg))) {
-        if (ts.isPropertyAccessExpression(channelArg)) {
-          handlers.push({
-            channel: channelArg.name.text,
-            namespace: channelArg.expression.getText(source),
-            handler: handlerArg,
-          })
-        } else if (ts.isStringLiteral(channelArg)) {
-          handlers.push({ channel: channelArg.text, namespace: 'literal', handler: handlerArg })
+  for (const handlerSource of handlerSources) {
+    const visit = (node: ts.Node): void => {
+      const registrationName = ts.isCallExpression(node) ? node.expression.getText(handlerSource) : ''
+      if (
+        ts.isCallExpression(node)
+        && (registrationName === 'ipcMain.handle' || registrationName === 'dependencies.ipc.handle')
+        && node.arguments.length >= 2
+      ) {
+        const channelArg = node.arguments[0]
+        const handlerArg = node.arguments[1]
+        if (channelArg && handlerArg && (ts.isArrowFunction(handlerArg) || ts.isFunctionExpression(handlerArg))) {
+          if (ts.isPropertyAccessExpression(channelArg)) {
+            handlers.push({
+              channel: channelArg.name.text,
+              namespace: channelArg.expression.getText(handlerSource),
+              handler: handlerArg,
+            })
+          } else if (ts.isStringLiteral(channelArg)) {
+            handlers.push({ channel: channelArg.text, namespace: 'literal', handler: handlerArg })
+          }
         }
       }
+      ts.forEachChild(node, visit)
     }
-    ts.forEachChild(node, visit)
+    visit(handlerSource)
   }
-  visit(source)
   cachedHandlerIndex = { checker, handlers, source }
   return cachedHandlerIndex
 }

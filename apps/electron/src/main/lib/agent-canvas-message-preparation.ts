@@ -37,15 +37,22 @@ export function prepareAgentCanvasMessageForSend<T extends AgentSendInput | Agen
   extensions: AgentRunExtensions,
   resolver: CanvasNodeReferenceResolver,
 ): PreparedAgentCanvasMessage<T> {
-  if (!input.canvasNodeReferences?.length) {
+  /** 字段缺失表示无引用；显式字段必须先通过真实数组边界。 */
+  if (!Object.prototype.hasOwnProperty.call(input, 'canvasNodeReferences')) {
     return { input, extensions, references: undefined }
   }
+  const canvasNodeReferences = (input as { canvasNodeReferences?: unknown }).canvasNodeReferences
+  if (!Array.isArray(canvasNodeReferences)) {
+    throw new CanvasReferenceInvalidError(new Error('CANVAS_NODE_REFERENCES_INVALID'))
+  }
+  /** 合法空数组是唯一允许绕过 resolver 的显式引用值。 */
+  if (canvasNodeReferences.length === 0) return { input, extensions, references: undefined }
   const resolved = resolver.resolveForSend({
     sessionId: input.sessionId,
     mode: 'canvasNodeReferenceMode' in input
       ? input.canvasNodeReferenceMode ?? 'latest'
       : 'latest',
-    references: input.canvasNodeReferences,
+    references: canvasNodeReferences,
   })
   const canvasWorkspacePrompt = buildCanvasWorkspacePrompt(resolved.promptSummary)
   const systemPromptAppend = [extensions.systemPromptAppend, canvasWorkspacePrompt]

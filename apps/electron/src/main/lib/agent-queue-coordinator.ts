@@ -2,6 +2,7 @@ import type { WebContents } from 'electron'
 import type {
   AgentDeferredQueueMessageInput,
   AgentMoveQueuedMessageInput,
+  AgentMessagePublicError,
   AgentQueuedMessageControlInput,
   AgentQueuedMessageStatus,
 } from '@proma/shared'
@@ -19,8 +20,8 @@ export interface AgentQueueCoordinatorOptions {
   getWebContents: (sessionId: string) => WebContents | null
   prepareRun: (input: AgentDeferredQueueMessageInput) => PreparedAgentQueueRun
   startRun: (prepared: PreparedAgentQueueRun, webContents: WebContents) => Promise<void>
-  sendStarted: (webContents: WebContents, status: AgentQueuedMessageStatus) => void
-  onPrepareError: (input: AgentDeferredQueueMessageInput, error: unknown) => void
+  sendStatus: (webContents: WebContents, status: AgentQueuedMessageStatus) => void
+  onPrepareError: (input: AgentDeferredQueueMessageInput, error: unknown) => AgentMessagePublicError
 }
 
 /** 主进程持有 deferred queue；renderer 只保留展示投影。 */
@@ -35,7 +36,7 @@ export class AgentQueueCoordinator {
     if (queue.some((entry) => entry.input.queueMessageId === input.queueMessageId)) return
     queue.push({ input })
     this.queues.set(input.sessionId, queue)
-    this.tryDispatch(input.sessionId)
+    this.tryDispatch(input.sessionId, input.queueMessageId)
   }
 
   cancel(input: AgentQueuedMessageControlInput): boolean {
@@ -92,38 +93,48 @@ export class AgentQueueCoordinator {
     this.dispatching.delete(sessionId)
   }
 
-  private tryDispatch(sessionId: string): void {
+  private tryDispatch(sessionId: string, synchronousMessageId?: string): void {
     if (this.dispatching.has(sessionId) || this.options.isActive(sessionId)) return
-    const queue = this.queues.get(sessionId)
-    const entry = queue?.[0]
-    if (!entry) return
-    const messageId = entry.input.queueMessageId
-    const webContents = this.options.getWebContents(sessionId)
-    if (!webContents || webContents.isDestroyed()) {
-      return
-    }
-    const startedAt = Date.now()
-    let prepared: PreparedAgentQueueRun
-    try {
-      prepared = this.options.prepareRun({ ...entry.input, startedAt, userMessageUuid: messageId })
-    } catch (error) {
-      this.options.onPrepareError(entry.input, error)
-      return
-    }
-    queue?.shift()
-    if (queue?.length === 0) this.queues.delete(sessionId)
-    this.dispatching.set(sessionId, messageId)
-    this.options.sendStarted(webContents, {
+    while (true) {
+      const queue = this.queues.get(sessionId)
+      const entry = queue?.[0]
+      if (!entry) return
+      const messageId = entry.input.queueMessageId
+      const webContents = this.options.getWebContents(sessionId)
+      if (!webContents || webContents.isDestroyed()) return
+      const startedAt = Date.now()
+      let prepared: PreparedAgentQueueRun
+      try {
+        prepared = this.options.prepareRun({ ...entry.input, startedAt, userMessageUuid: messageId })
+      } catch (error) {
+        const publicError = this.options.onPrepareError(entry.input, error)
+        queue.shift()
+        if (queue.length === 0) this.queues.delete(sessionId)
+        if (messageId === synchronousMessageId) throw error
+        this.options.sendStatus(webContents, {
+          sessionId,
+          messageId,
+          status: 'failed',
+          error: publicError,
+        })
+        continue
+      }
+      queue.shift()
+      if (queue.length === 0) this.queues.delete(sessionId)
+      this.dispatching.set(sessionId, messageId)
+      this.options.sendStatus(webContents, {
         sessionId,
         messageId,
         status: 'started',
         userMessage: entry.input.userMessage,
         rawUserMessage: entry.input.rawUserMessage,
         startedAt,
-    })
-    void this.options.startRun(prepared, webContents)
-      .finally(() => {
-        if (this.dispatching.get(sessionId) === messageId) this.dispatching.delete(sessionId)
       })
+      void this.options.startRun(prepared, webContents)
+        .finally(() => {
+          if (this.dispatching.get(sessionId) === messageId) this.dispatching.delete(sessionId)
+        })
+      return
+    }
   }
 }

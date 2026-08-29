@@ -374,7 +374,7 @@ import {
 } from './lib/agent-model-selection'
 import { isAgentSessionUserVisible, requireUserVisibleAgentSession } from './lib/agent-session-visibility'
 import { agentEventBus, prepareAgentRun, runAgent, runPreparedAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, listActiveAgentSessionSnapshots, reserveAgentSessionStart, listActiveCanvasAgentRuns, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
-import { runAgentMessageInvoke } from './lib/agent-canvas-message-preparation'
+import { registerAgentMessageIpcHandlers } from './lib/agent-message-ipc'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import {
   getDefaultWorkspaceProjectRelocator,
@@ -4456,25 +4456,16 @@ export function registerIpcHandlers(): void {
     },
   )
 
-  ipcMain.handle(
-    AGENT_IPC_CHANNELS.SEND_MESSAGE,
-    async (event, input: AgentSendInput): Promise<import('@proma/shared').AgentMessageInvokeResult<void>> => (
-      runAgentMessageInvoke(async () => {
-        const session = requireVisibleSession(input.sessionId)
-        /** 在任何消息接管副作用前固化 Canvas 引用。 */
-        const prepared = prepareAgentRun(input)
-        const releaseStart = reserveAgentSessionStart(input.sessionId)
-        try {
-          await feishuBridgeManager.startSessionMirrorRun(session).catch((error) => {
-            console.error('[飞书 Session 镜像] 流式卡片初始化失败:', error)
-          })
-          await runPreparedAgent(prepared, event.sender)
-        } finally {
-          releaseStart()
-        }
-      })
-    )
-  )
+  registerAgentMessageIpcHandlers({
+    ipc: ipcMain,
+    requireVisibleSession,
+    prepareRun: prepareAgentRun,
+    reserveStart: reserveAgentSessionStart,
+    startSessionMirrorRun: (session) => feishuBridgeManager.startSessionMirrorRun(session),
+    runPrepared: runPreparedAgent,
+    queueMessage: queueAgentMessage,
+    submitOrEnqueue: submitOrEnqueueAgentMessage,
+  })
 
   // renderer 的当前 Agent Tab 决定 partial 消息是前台 20fps 还是后台 4fps。
   ipcMain.handle(
@@ -4499,28 +4490,6 @@ export function registerIpcHandlers(): void {
   )
 
   // ===== Agent 队列消息 =====
-
-  // 排队发送消息
-  ipcMain.handle(
-    AGENT_IPC_CHANNELS.QUEUE_MESSAGE,
-    async (event, input: import('@proma/shared').AgentQueueMessageInput): Promise<import('@proma/shared').AgentMessageInvokeResult<string>> => (
-      runAgentMessageInvoke(async () => {
-        requireVisibleSession(input.sessionId)
-        return queueAgentMessage(input, event.sender)
-      })
-    )
-  )
-
-  // 主进程原子决定立即注入活跃 Agent 或进入 deferred queue。
-  ipcMain.handle(
-    AGENT_IPC_CHANNELS.SUBMIT_OR_ENQUEUE_MESSAGE,
-    async (event, input: import('@proma/shared').AgentSubmitOrEnqueueInput): Promise<import('@proma/shared').AgentMessageInvokeResult<import('@proma/shared').AgentSubmitOrEnqueueResult>> => (
-      runAgentMessageInvoke(async () => {
-        requireVisibleSession(input.sessionId)
-        return submitOrEnqueueAgentMessage(input, event.sender)
-      })
-    ),
-  )
 
   // 兼容旧调用：将消息交给主进程 deferred queue。
   ipcMain.handle(

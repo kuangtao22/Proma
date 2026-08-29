@@ -198,11 +198,12 @@ const agentQueueCoordinator = new AgentQueueCoordinator({
   getWebContents: (sessionId) => streamRoutes.get(sessionId)?.target ?? getMainRendererWebContents(),
   prepareRun: (input) => prepareAgentRun(input),
   startRun: (prepared, webContents) => runPreparedAgent(prepared, webContents),
-  sendStarted: (webContents, status) => {
+  sendStatus: (webContents, status) => {
     if (!webContents.isDestroyed()) webContents.send(AGENT_IPC_CHANNELS.QUEUED_MESSAGE_STATUS, status)
   },
   onPrepareError: (input, error) => {
     console.error(`[Agent Canvas 引用] deferred 消息解析失败: sessionId=${input.sessionId}`, error instanceof Error ? error.cause ?? error : error)
+    return { code: 'CANVAS_REFERENCE_INVALID', message: '画布节点引用已失效，请重新选择后发送。' }
   },
 })
 

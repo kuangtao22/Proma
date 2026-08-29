@@ -1360,7 +1360,8 @@ export interface AgentMoveQueuedMessageInput {
   placement: 'before' | 'after'
 }
 
-export interface AgentQueuedMessageStatus {
+/** 主进程真正启动 deferred 消息后的状态。 */
+export interface AgentQueuedMessageStartedStatus {
   sessionId: string
   messageId: string
   status: 'started'
@@ -1368,6 +1369,17 @@ export interface AgentQueuedMessageStatus {
   rawUserMessage?: string
   startedAt: number
 }
+
+/** 已接管 deferred 消息在后台准备阶段失效后的安全终态。 */
+export interface AgentQueuedMessageFailedStatus {
+  sessionId: string
+  messageId: string
+  status: 'failed'
+  error: AgentMessagePublicError
+}
+
+/** deferred 消息的权威启动或失败状态。 */
+export type AgentQueuedMessageStatus = AgentQueuedMessageStartedStatus | AgentQueuedMessageFailedStatus
 
 // ===== 会话迁移输入 =====
 

@@ -16,6 +16,10 @@ import {
   agentSessionStreamingStateAtomFamily,
   agentStreamErrorsAtom,
   agentSessionMessageQueueAtom,
+  agentPendingFilesAtomFamily,
+  agentCanvasNodeReferencesAtomFamily,
+  agentSessionDraftsAtom,
+  agentSessionDraftHtmlAtom,
   agentSessionsAtom,
   agentMessageRefreshAtom,
   allPendingPermissionRequestsAtom,
@@ -113,7 +117,12 @@ import { getPlanModeChangeFromToolName, updatePlanModeSessionSet } from '@/lib/a
 import { detectIsWindows } from '@/lib/platform'
 import { getSessionFileChangeKind, getOwnedSessionWatcherPaths, upsertSessionFileChange } from '@/lib/session-file-changes'
 import { doesWorkspaceChangeAffectPreview } from '@/components/diff/preview-open-path'
-import { removeQueuedMessage, createQueuedAgentStreamState } from '@/lib/agent-message-queue'
+import {
+  createQueuedAgentStreamState,
+  mergeAgentDraftWithRestoredMessage,
+  removeQueuedMessage,
+  restoreMissingCanvasNodeReferences,
+} from '@/lib/agent-message-queue'
 import { createAgentStreamEventBatcher } from '@/lib/agent-stream-event-batcher'
 import { designAdapter } from '@/lib/design-adapter'
 import {
@@ -599,7 +608,10 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
  * @param status 主进程已启动队列消息的权威状态。
  * @returns 无返回值；同步更新运行态、队列、live 消息与错误状态。
  */
-export function applyAgentQueuedMessageStartedStatus(store: Store, status: AgentQueuedMessageStatus): void {
+export function applyAgentQueuedMessageStartedStatus(
+  store: Store,
+  status: Extract<AgentQueuedMessageStatus, { status: 'started' }>,
+): void {
   unstable_batchedUpdates(() => {
     /** started 状态本身不携带 Canvas 引用，必须在队列删除前保存匹配快照。 */
     const queuedMessage = store.get(agentSessionMessageQueueAtom)
@@ -653,6 +665,72 @@ export function applyAgentQueuedMessageStartedStatus(store: Store, status: Agent
   })
 }
 
+/** 恢复后台准备失败的 deferred 消息，重复状态不会重复写入。 */
+export function applyAgentQueuedMessageFailedStatus(
+  store: Store,
+  status: Extract<AgentQueuedMessageStatus, { status: 'failed' }>,
+): boolean {
+  const queuedMessage = store.get(agentSessionMessageQueueAtom)
+    .get(status.sessionId)
+    ?.find((message) => message.id === status.messageId)
+  if (!queuedMessage) return false
+  const attachments = queuedMessage.attachments
+  const canvasNodeReferences = queuedMessage.canvasNodeReferences
+
+  unstable_batchedUpdates(() => {
+    store.set(agentSessionMessageQueueAtom, (previous) => {
+      const current = previous.get(status.sessionId) ?? []
+      const next = removeQueuedMessage(current, status.messageId)
+      const map = new Map(previous)
+      if (next.length === 0) map.delete(status.sessionId)
+      else map.set(status.sessionId, next)
+      return map
+    })
+    store.set(agentSessionDraftsAtom, (previous) => {
+      const map = new Map(previous)
+      map.set(
+        status.sessionId,
+        mergeAgentDraftWithRestoredMessage(previous.get(status.sessionId) ?? '', queuedMessage.text),
+      )
+      return map
+    })
+    /** 恢复为纯文本草稿，避免旧富文本结构与新合并正文不一致。 */
+    store.set(agentSessionDraftHtmlAtom, (previous) => {
+      if (!previous.has(status.sessionId)) return previous
+      const map = new Map(previous)
+      map.delete(status.sessionId)
+      return map
+    })
+    if (attachments?.length) {
+      store.set(agentPendingFilesAtomFamily(status.sessionId), (current) => [
+        ...current,
+        ...attachments.map((attachment, index) => ({
+          id: `deferred-failed-${status.messageId}-${index}`,
+          filename: attachment.filename,
+          mediaType: attachment.mediaType,
+          size: attachment.size,
+          sourcePath: attachment.targetPath,
+        })),
+      ])
+    }
+    if (canvasNodeReferences?.length) {
+      store.set(agentCanvasNodeReferencesAtomFamily(status.sessionId), (current) => (
+        restoreMissingCanvasNodeReferences(current, canvasNodeReferences)
+      ))
+    }
+  })
+  return true
+}
+
+/** 按权威终态分派 deferred 消息状态。 */
+export function applyAgentQueuedMessageStatus(store: Store, status: AgentQueuedMessageStatus): boolean {
+  if (status.status === 'started') {
+    applyAgentQueuedMessageStartedStatus(store, status)
+    return true
+  }
+  return applyAgentQueuedMessageFailedStatus(store, status)
+}
+
 export function useGlobalAgentListeners(): void {
   const store = useStore()
 
@@ -669,7 +747,10 @@ export function useGlobalAgentListeners(): void {
     const pendingGitMutateTools = new Map<string, string>()
 
     const cleanupQueuedMessageStatus = window.electronAPI.onAgentQueuedMessageStatus((status) => {
-      applyAgentQueuedMessageStartedStatus(store, status)
+      const applied = applyAgentQueuedMessageStatus(store, status)
+      if (applied && status.status === 'failed') {
+        toast.error('队列消息发送失败', { description: status.error.message })
+      }
     })
 
     /** 构建导航到指定会话的回调 */

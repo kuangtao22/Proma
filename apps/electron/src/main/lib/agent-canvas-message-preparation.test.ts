@@ -23,6 +23,27 @@ describe('Agent Canvas 消息接管前置阶段', () => {
     expect(prepared.input).toBe(input)
   })
 
+  test.each([undefined, null, { length: 0 }, ''])('Given 引用字段为畸形值 %p When prepare Then resolver 零调用且稳定拒绝', (canvasNodeReferences) => {
+    let calls = 0
+    const input = { ...createInput(), canvasNodeReferences } as unknown as AgentSendInput
+
+    expect(() => prepareAgentCanvasMessageForSend(input, {}, {
+      resolveForSend: () => { calls += 1; throw new Error('不应调用') },
+    })).toThrow(CanvasReferenceInvalidError)
+    expect(calls).toBe(0)
+  })
+
+  test('Given 引用字段为合法空数组 When prepare Then resolver 零调用并保持无引用', () => {
+    let calls = 0
+    const input = { ...createInput(), canvasNodeReferences: [] }
+    const prepared = prepareAgentCanvasMessageForSend(input, {}, {
+      resolveForSend: () => { calls += 1; throw new Error('不应调用') },
+    })
+
+    expect(calls).toBe(0)
+    expect(prepared).toEqual({ input, extensions: {}, references: undefined })
+  })
+
   test('Given 有效引用消息 When prepare Then 只解析一次并固化权威输入与 prompt', () => {
     let calls = 0
     const prepared = prepareAgentCanvasMessageForSend({
