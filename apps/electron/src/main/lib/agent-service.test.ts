@@ -2,14 +2,16 @@ import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
+import { isEligibleProjectAgent } from './agent-session-visibility'
 
 describe('Agent service 迁移准入', () => {
   test('Given 普通项目、无项目与 Design 内部会话 When 准备运行 Then 仅普通项目在引用解析后注入 Canvas 单轮工具', () => {
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
     expect(source).toContain('createCanvasToolRun(')
     expect(source).toContain('prepared.references')
-    expect(source).toContain('sessionMeta.sourceDesignProjectId')
-    expect(source).toContain('sessionMeta.sourceCanvasProjectId')
+    expect(source).toContain('isEligibleProjectAgent(sessionMeta, sessionMeta.workspaceId)')
+    expect(source).toContain('resolveCanvasToolUserIntent(prepared.input)')
+    expect(source).not.toContain("extensions.canvasUserIntent ?? 'discuss'")
     expect(source).toContain("|| input.triggeredBy === 'user'")
     /** 只在运行准备函数体内比较调用顺序，避免 import 文本造成误报。 */
     const functionStart = source.indexOf('export function prepareAgentRun')
@@ -19,6 +21,28 @@ describe('Agent service 迁移准入', () => {
     const functionBody = source.slice(functionStart, functionEnd)
     expect(functionBody.indexOf('createCanvasToolRun('))
       .toBeGreaterThan(functionBody.indexOf('prepareAgentCanvasMessageForSend('))
+  })
+
+  test('Given 内部、探索、归档或损坏来源会话 When 生产 eligibility 判断 Then 全部排除 Canvas 工具', () => {
+    /** 普通顶层项目 Agent 的最小权威元数据。 */
+    const base = {
+      workspaceId: 'project-1', archived: false,
+      createdAt: 1, updatedAt: 1, id: 'session-1', title: 'Agent',
+    }
+    const rejected = [
+      { sourceAutomationId: 'automation-1' },
+      { sourceDelegationId: 'delegation-1' },
+      { explorationParentSessionId: 'parent-1' },
+      { archived: true },
+      { sourceDesignProjectId: '' },
+      { sourceCanvasProjectId: '' },
+      { sourceAutomationId: '' },
+      { sourceDelegationId: '' },
+    ]
+    expect(isEligibleProjectAgent(base, 'project-1')).toBe(true)
+    for (const fields of rejected) {
+      expect(isEligibleProjectAgent({ ...base, ...fields }, 'project-1')).toBe(false)
+    }
   })
 
   test('Given 数据根迁移预检 When 检查 service 导出 Then 使用 generation-owned 写查询并提供 workspace 维度能力', () => {

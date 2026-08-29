@@ -159,6 +159,7 @@ export interface CanvasToolProviderRuntime {
   documents: Pick<CanvasDocumentStore, 'load' | 'validateBatchOperations'>
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
   readNodeContent: (target: CanvasTarget, node: CanvasNode) => Promise<string>
+  inspectNode: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<void>
   runNode: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<CanvasToolNodeRunResult>
 }
 
@@ -1214,6 +1215,31 @@ export function registerCanvasDocumentIpcHandlers(
     return result.readOutcome.content
   }
 
+  /** 预检图片节点的实时目标、配置与模型；其它节点没有启动前置条件。 */
+  const inspectCanvasNode = async (
+    _context: CanvasToolRunContext,
+    node: CanvasNode,
+    target: CanvasTarget,
+  ): Promise<void> => {
+    if (node.kind !== 'image') return
+    /** 图片预检使用完整业务目标，避免节点与模块身份错配。 */
+    const imageTarget: CanvasImageTarget = {
+      ...target,
+      nodeId: node.id,
+      imageModuleId: node.imageModuleId,
+    }
+    await runImageCanvasExclusive(imageTarget, async () => {
+      requireWritableProject(target.projectId, options)
+      await options.imageJobTarget.assertTarget(target.projectId, {
+        kind: 'canvas-image', canvasId: target.canvasId,
+        nodeId: node.id, imageModuleId: node.imageModuleId,
+      })
+      const config = await options.imageModules.load(imageTarget)
+      assertOwnedImageConfig(config, imageTarget)
+      if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
+    })
+  }
+
   /** 图片节点复用 Renderer 同一 Design Job 流程；仓库尚无 webview 执行器。 */
   const runCanvasNode = async (
     _context: CanvasToolRunContext,
@@ -1230,6 +1256,10 @@ export function registerCanvasDocumentIpcHandlers(
     }
     const job = await runImageCanvasExclusive(imageTarget, async () => {
       requireWritableProject(target.projectId, options)
+      await options.imageJobTarget.assertTarget(target.projectId, {
+        kind: 'canvas-image', canvasId: target.canvasId,
+        nodeId: node.id, imageModuleId: node.imageModuleId,
+      })
       const config = await options.imageModules.load(imageTarget)
       assertOwnedImageConfig(config, imageTarget)
       if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
@@ -1262,6 +1292,7 @@ export function registerCanvasDocumentIpcHandlers(
         documents: options.store,
         batch: { execute: options.batch.execute },
         readNodeContent: readCanvasNodeContent,
+        inspectNode: inspectCanvasNode,
         runNode: runCanvasNode,
       },
     }

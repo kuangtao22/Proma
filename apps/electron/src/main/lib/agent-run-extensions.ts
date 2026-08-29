@@ -15,8 +15,6 @@ export interface AgentRunExtensions {
   allowedToolNames?: readonly string[]
   /** replace 用于受限内部 Agent；extend 仅声明新增工具，不替换普通 Agent 既有能力。 */
   allowedToolNamesMode?: 'replace' | 'extend'
-  /** 普通项目 Canvas 工具的可信用户意图；缺失时保持只读讨论。 */
-  canvasUserIntent?: 'discuss' | 'plan' | 'execute'
   /** Design Job 固化的可信生图模型，只对本次运行有效。 */
   trustedImageRoute?: ImageGenerationModelSnapshot
   /** 工具执行前同时复核配置并解析只在内存存在的凭据。 */

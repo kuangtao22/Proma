@@ -202,6 +202,7 @@ function createContext(options: {
   batchReconcile?: () => Promise<void>
   batchReconcileError?: Error
   batchPublications?: CanvasDocument[]
+  enableToolProviderRuntime?: boolean
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -283,6 +284,9 @@ function createContext(options: {
       validateBatchOperations: (_target, _expectedRevision, operations) => structuredClone(operations) as CanvasMutation[],
     },
     batch: {
+      ...(options.enableToolProviderRuntime ? {
+        execute: async () => ({ document: createDocument(4), operationId: 'tool-provider-operation' }),
+      } : {}),
       reconcileLocked: async () => {
         calls.push('batch:reconcile')
         await options.batchReconcile?.()
@@ -2754,5 +2758,34 @@ describe('原生 Canvas 文档 IPC', () => {
 
     registrationA.dispose()
     expect(removed).toHaveLength(19)
+  })
+
+  test('Given 可运行图片节点 When 普通 Agent 预检 Then 校验目标与配置且不创建 Job', async () => {
+    const context = createContext({ enableToolProviderRuntime: true })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      await runtime.inspectNode({
+        projectId: imageTargetA.projectId,
+        sessionId: 'agent-session-1',
+        runStartedAt: 99,
+        explicitReferences: [],
+        userIntent: 'execute',
+      }, {
+        id: imageTargetA.nodeId,
+        kind: 'image',
+        title: '主视觉',
+        position: { x: 0, y: 0 },
+        imageModuleId: imageTargetA.imageModuleId,
+      }, {
+        projectId: imageTargetA.projectId,
+        canvasId: imageTargetA.canvasId,
+      })
+
+      expect(context.imageCalls.map((call) => call.type)).toEqual(['assert-target', 'load'])
+      expect(context.imageCalls.some((call) => call.type === 'create' || call.type === 'run')).toBe(false)
+    } finally {
+      context.registration.dispose()
+    }
   })
 })

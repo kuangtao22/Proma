@@ -2,6 +2,7 @@ import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import type {
   AgentCanvasBinding,
+  AgentSendInput,
   CanvasBatchOperationEnvelope,
   CanvasDocument,
   CanvasMutation,
@@ -30,6 +31,32 @@ export const CANVAS_TOOL_NAMES = [
 ] as const
 
 export type CanvasToolUserIntent = 'discuss' | 'plan' | 'execute'
+
+/** Canvas 领域词只描述可操作对象，不依赖 Renderer 页面名称。 */
+const CANVAS_DOMAIN_PATTERN = /(?:画布|节点|连线|图片|原型|canvas|nodes?|edges?|connections?|images?|prototypes?)/i
+/** 问询和分析语义优先保持只读，避免“如何创建”被动作词误判为执行。 */
+const DISCUSS_INTENT_PATTERN = /(?:如何|怎么|怎样|能否|是否|为什么|分析|解释|说明|评估|研究|查看|检查|了解|how|why|can\s+(?:you|i|we)|could\s+(?:you|i|we)|would\s+(?:you|i|we)|explain|analy[sz]e|review|inspect|understand)/i
+/** 规划语义只允许搭建新的 idle 结构。 */
+const PLAN_INTENT_PATTERN = /(?:规划|计划|方案|拆解|梳理|plan|outline|structure)/i
+/** 明确动作词与 Canvas 对象同时出现时，才允许进入执行意图。 */
+const EXECUTE_INTENT_PATTERN = /(?:创建|新增|添加|连接|修改|更新|删除|移除|移动|运行|执行|生成|重建|关联|取消关联|设为默认|create|add|connect|link|modify|update|delete|remove|move|run|execute|generate|rebuild|unlink|set\s+(?:as\s+)?default)/i
+
+/**
+ * 从主进程收到的真实用户消息解析单轮 Canvas 工具意图。
+ * @param input 已经过发送边界准备的用户消息与可选权限模式。
+ * @returns 保守的只读、规划或执行意图。
+ */
+export function resolveCanvasToolUserIntent(
+  input: Pick<AgentSendInput, 'userMessage' | 'permissionModeOverride'>,
+): CanvasToolUserIntent {
+  if (input.permissionModeOverride === 'plan') return 'plan'
+  /** 空白和不涉及 Canvas 的消息均保持只读。 */
+  const message = input.userMessage.trim()
+  if (!message || !CANVAS_DOMAIN_PATTERN.test(message)) return 'discuss'
+  if (DISCUSS_INTENT_PATTERN.test(message)) return 'discuss'
+  if (PLAN_INTENT_PATTERN.test(message)) return 'plan'
+  return EXECUTE_INTENT_PATTERN.test(message) ? 'execute' : 'discuss'
+}
 
 /** 引用完成权威解析后构造的单轮可信上下文。 */
 export interface CanvasToolRunContext {
@@ -66,6 +93,7 @@ export interface CanvasToolProviderDependencies {
   }
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
+  inspectNode: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<void>
   runNode?: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<CanvasToolNodeRunResult>
 }
 
@@ -94,14 +122,32 @@ function requireLinkedCanvas(dependencies: CanvasToolProviderDependencies, conte
   return binding
 }
 
-/** 删除与覆盖现有节点均属于破坏性修改。 */
+/** 删除与覆盖现有节点或边均属于破坏性修改。 */
 function hasDestructiveMutation(document: CanvasDocument, operations: CanvasMutation[]): boolean {
   const existingNodeIds = new Set(document.nodes.map((node) => node.id))
+  const existingEdgeIds = new Set(document.edges.map((edge) => edge.id))
   return operations.some((operation) => (
     operation.type === 'remove-nodes'
     || operation.type === 'remove-edges'
     || (operation.type === 'upsert-nodes' && operation.nodes.some((node) => existingNodeIds.has(node.id)))
+    || (operation.type === 'upsert-edges' && operation.edges.some((edge) => existingEdgeIds.has(edge.id)))
   ))
+}
+
+/** plan 只能新增节点与边，任何覆盖或其它 mutation 都必须升级为 execute。 */
+function isPlanSafeMutation(document: CanvasDocument, operations: CanvasMutation[]): boolean {
+  /** 当前节点和边 ID 用于拒绝 plan 覆盖已有结构。 */
+  const existingNodeIds = new Set(document.nodes.map((node) => node.id))
+  const existingEdgeIds = new Set(document.edges.map((edge) => edge.id))
+  return operations.every((operation) => {
+    if (operation.type === 'upsert-nodes') {
+      return operation.nodes.every((node) => !existingNodeIds.has(node.id))
+    }
+    if (operation.type === 'upsert-edges') {
+      return operation.edges.every((edge) => !existingEdgeIds.has(edge.id))
+    }
+    return false
+  })
 }
 
 function isRevisionConflict(error: unknown): boolean {
@@ -152,24 +198,30 @@ export function createCanvasToolRun(
         action: Type.Union([Type.Literal('create'), Type.Literal('link'), Type.Literal('unlink'), Type.Literal('set-default')]),
         canvasId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
         title: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
-        explicitSelection: Type.Optional(Type.Boolean()),
         makeDefault: Type.Optional(Type.Boolean()),
       }),
       execute: async (_toolCallId, params) => {
-        if ((params.action === 'create' || params.action === 'link') && params.explicitSelection !== true) {
-          throw new Error('CANVAS_EXPLICIT_SELECTION_REQUIRED')
+        if (context.userIntent === 'discuss') throw new Error('CANVAS_WRITE_INTENT_REQUIRED')
+        if (context.userIntent === 'plan' && params.action !== 'create' && params.action !== 'link') {
+          throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         }
         if (params.action === 'create') {
-          if (context.userIntent === 'discuss') throw new Error('CANVAS_WRITE_INTENT_REQUIRED')
           const session = dependencies.sessions.create({ projectId: context.projectId, ...(params.title ? { title: params.title } : {}) })
           const binding = dependencies.bindings.link({ projectId: context.projectId, sessionId: context.sessionId, canvasId: session.id, makeDefault: params.makeDefault ?? true })
           return toolResult({ action: params.action, canvasId: session.id, session, binding })
         }
         if (!params.canvasId) throw new Error('CANVAS_ID_REQUIRED')
         if (params.action === 'link') {
+          /** 关联只能复用已有 binding 或本轮权威节点引用，模型自报参数不能扩权。 */
+          const binding = getContext()
+          const authorizedCanvasIds = new Set([
+            ...(binding?.linkedCanvasIds ?? []),
+            ...context.explicitReferences.map((reference) => reference.canvasId),
+          ])
+          if (!authorizedCanvasIds.has(params.canvasId)) throw new Error('CANVAS_EXPLICIT_SELECTION_REQUIRED')
           dependencies.sessions.requireNative(context.projectId, params.canvasId)
-          const binding = dependencies.bindings.link({ projectId: context.projectId, sessionId: context.sessionId, canvasId: params.canvasId, makeDefault: params.makeDefault ?? false })
-          return toolResult({ action: params.action, canvasId: params.canvasId, binding })
+          const nextBinding = dependencies.bindings.link({ projectId: context.projectId, sessionId: context.sessionId, canvasId: params.canvasId, makeDefault: params.makeDefault ?? false })
+          return toolResult({ action: params.action, canvasId: params.canvasId, binding: nextBinding })
         }
         requireLinkedCanvas(dependencies, context, params.canvasId)
         const binding = params.action === 'unlink'
@@ -235,12 +287,16 @@ export function createCanvasToolRun(
         destructiveIntent: Type.Optional(Type.Literal('explicit')),
       }),
       execute: async (toolCallId, params) => {
+        if (context.userIntent === 'discuss') throw new Error('CANVAS_WRITE_INTENT_REQUIRED')
         requireLinkedCanvas(dependencies, context, params.canvasId)
         const target = { projectId: context.projectId, canvasId: params.canvasId }
         const rawOperations = structuredClone(params.operations)
         const execute = (baseRevision: number, sourceToolCallId: string): Promise<CanvasBatchOperationResult> => {
           const operations = dependencies.documents.validateBatchOperations(target, baseRevision, rawOperations)
           const document = dependencies.documents.load(target).document
+          if (context.userIntent === 'plan' && !isPlanSafeMutation(document, operations)) {
+            throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
+          }
           if (hasDestructiveMutation(document, operations) && params.destructiveIntent !== 'explicit') {
             throw new Error('CANVAS_DESTRUCTIVE_INTENT_REQUIRED')
           }
@@ -273,18 +329,27 @@ export function createCanvasToolRun(
         requireLinkedCanvas(dependencies, context, params.canvasId)
         const target = { projectId: context.projectId, canvasId: params.canvasId }
         const document = dependencies.documents.load(target).document
-        const tasks = []
-        for (const nodeId of params.nodeIds) {
-          const node = document.nodes.find((candidate) => candidate.id === nodeId)
+        /** 稳定去重，避免同一请求重复启动相同节点。 */
+        const nodeIds = [...new Set(params.nodeIds)]
+        /** 单次建立索引，先全量证明每个节点存在。 */
+        const nodeById = new Map(document.nodes.map((node) => [node.id, node]))
+        const nodes = nodeIds.map((nodeId) => {
+          const node = nodeById.get(nodeId)
           if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
+          return node
+        })
+        /** 所有目标、配置和可运行性预检通过前，禁止创建任何任务。 */
+        for (const node of nodes) await dependencies.inspectNode(context, node, target)
+        const tasks = []
+        for (const node of nodes) {
           if (node.kind !== 'image' && node.kind !== 'webview') {
-            tasks.push({ nodeId, status: 'idle' })
+            tasks.push({ nodeId: node.id, status: 'idle' })
             continue
           }
           const outcome = dependencies.runNode
             ? await dependencies.runNode(context, node, target)
             : { status: 'unsupported' as const, message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' }
-          tasks.push({ nodeId, ...outcome })
+          tasks.push({ nodeId: node.id, ...outcome })
         }
         return toolResult({ canvasId: params.canvasId, revision: document.revision, tasks })
       },
