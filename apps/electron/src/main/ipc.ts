@@ -2174,6 +2174,9 @@ export function registerIpcHandlers(): void {
   /** 删除生命周期与 LIST 对账共用同一 Store 和固定广播边界。 */
   const agentCanvasBindingCleanup = {
     store: agentCanvasBindingStore,
+    runProjectMutation: <T>(projectId: string, effect: () => T): T => (
+      workspaceOperationGuard.runWorkspaceWrite(projectId, effect)
+    ),
     broadcast: (event: AgentCanvasBindingChangeEvent): void => {
       for (const contents of listAuthorizedDesignWebContents()) {
         try {
@@ -2188,11 +2191,11 @@ export function registerIpcHandlers(): void {
     ipcMain,
     store: agentCanvasBindingStore,
     getAgentSession: getAgentSessionMeta,
-    listCanvasSessions: (projectId) => {
-      /** 旧 Design 画布也是项目公开 Canvas，关联查询前幂等投影其元数据。 */
-      canvasSessionStore.ensureLegacySession(projectId)
-      return canvasSessionStore.list({ projectId })
-    },
+    /** 关联读路径只枚举当前索引，legacy 投影由受守卫 mutation 显式负责。 */
+    listCanvasSessions: (projectId) => canvasSessionStore.list({ projectId }),
+    ensureLegacyCanvasSession: (projectId) => canvasSessionStore.ensureLegacySession(projectId),
+    getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
+    runProjectMutation: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
     assertSenderProjectAccess: (sender, projectId) => {
       /** 仅仍存活的当前主窗口可访问已登记项目。 */
       const authorized = listAuthorizedDesignWebContents().some((contents) => (

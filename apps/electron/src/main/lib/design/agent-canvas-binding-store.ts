@@ -42,6 +42,19 @@ interface AgentCanvasBindingsSnapshot {
   priorFile: AgentCanvasBindingsFile | null
 }
 
+/** 项目批量对账产生的单条公开变化。 */
+export interface AgentCanvasBindingReconcileChange {
+  sessionId: string
+  cause: 'session-cleared' | 'canvas-cleared'
+  binding: AgentCanvasBinding | null
+}
+
+/** 项目批量对账的权威结果与提交后变化。 */
+export interface AgentCanvasBindingReconcileResult {
+  bindings: AgentCanvasBinding[]
+  changes: AgentCanvasBindingReconcileChange[]
+}
+
 /** Store 可替换的文件系统、时间与日志依赖。 */
 export interface AgentCanvasBindingStoreDependencies {
   /** 关联索引文件路径；默认位于当前业务配置根。 */
@@ -339,6 +352,78 @@ export class AgentCanvasBindingStore {
       }
     }
     if (changed) this.persist(bindings, snapshot)
+  }
+
+  /**
+   * 在单次 fresh-read 与单次 CAS 内清理项目失效会话和画布。
+   * @param projectId 项目稳定 ID。
+   * @param isSessionValid 判断当前普通 Agent 会话是否仍有效。
+   * @param isCanvasValid 判断当前项目画布是否仍有效。
+   * @returns 提交后的项目关联与精确变化；无变化时不写盘。
+   */
+  reconcileProject(
+    projectId: string,
+    isSessionValid: (sessionId: string) => boolean,
+    isCanvasValid: (canvasId: string) => boolean,
+  ): AgentCanvasBindingReconcileResult {
+    /** 复用共享 LIST 合同严格验证项目身份。 */
+    const input = parseListAgentCanvasBindingsInput({ projectId })
+    /** 整轮对账只读取一次磁盘权威快照。 */
+    const { snapshot, bindings } = this.prepareMutation()
+    /** 按 fresh 快照顺序记录提交后才可广播的变化。 */
+    const changes: AgentCanvasBindingReconcileChange[] = []
+    /** 同轮缩减画布的记录共享时间戳。 */
+    let timestamp: number | null = null
+
+    for (let index = bindings.length - 1; index >= 0; index -= 1) {
+      /** 当前候选关联。 */
+      const existing = bindings[index]!
+      if (existing.projectId !== input.projectId) continue
+      if (!isSessionValid(existing.sessionId)) {
+        bindings.splice(index, 1)
+        changes.push({ sessionId: existing.sessionId, cause: 'session-cleared', binding: null })
+        continue
+      }
+      /** 只保留仍存在的项目画布并保持原有首现顺序。 */
+      const linkedCanvasIds = existing.linkedCanvasIds.filter(isCanvasValid)
+      if (linkedCanvasIds.length === existing.linkedCanvasIds.length) continue
+      if (linkedCanvasIds.length === 0) {
+        bindings.splice(index, 1)
+        changes.push({ sessionId: existing.sessionId, cause: 'canvas-cleared', binding: null })
+        continue
+      }
+      /** 失效默认或最近画布稳定回退到剩余首项。 */
+      const defaultCanvasId = linkedCanvasIds.includes(existing.defaultCanvasId ?? '')
+        ? existing.defaultCanvasId!
+        : linkedCanvasIds[0]!
+      const lastActiveCanvasId = linkedCanvasIds.includes(existing.lastActiveCanvasId ?? '')
+        ? existing.lastActiveCanvasId!
+        : defaultCanvasId
+      timestamp ??= this.now()
+      const updated: AgentCanvasBinding = {
+        ...copyBinding(existing),
+        defaultCanvasId,
+        linkedCanvasIds,
+        lastActiveCanvasId,
+        updatedAt: timestamp,
+      }
+      bindings[index] = updated
+      changes.push({ sessionId: existing.sessionId, cause: 'canvas-cleared', binding: copyBinding(updated) })
+    }
+
+    if (changes.length > 0) this.persist(bindings, snapshot)
+    /** 逆序扫描后的事件恢复为项目记录的稳定身份顺序。 */
+    changes.reverse()
+    return {
+      bindings: bindings
+        .filter((binding) => binding.projectId === input.projectId)
+        .sort(compareBindings)
+        .map(copyBinding),
+      changes: changes.map((change) => ({
+        ...change,
+        binding: change.binding ? copyBinding(change.binding) : null,
+      })),
+    }
   }
 
   /** 延迟读取磁盘，并缓存规范化公开读结果。 */

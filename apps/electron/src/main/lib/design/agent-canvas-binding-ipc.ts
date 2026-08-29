@@ -36,9 +36,16 @@ export interface AgentCanvasBindingIpcRegistrar {
 /** 注册 Agent-Canvas 关联 IPC 所需的窄依赖。 */
 export interface RegisterAgentCanvasBindingIpcOptions {
   ipcMain: AgentCanvasBindingIpcRegistrar
-  store: Pick<AgentCanvasBindingStore, 'listByProject' | 'link' | 'unlink' | 'setDefault' | 'clearSession' | 'clearCanvas'>
+  store: Pick<AgentCanvasBindingStore, 'listByProject' | 'link' | 'unlink' | 'setDefault' | 'clearSession' | 'clearCanvas' | 'reconcileProject'>
   getAgentSession: (sessionId: string) => AgentSessionMeta | null | undefined
+  /** 纯读列出已有 Canvas 索引，不得隐式投影 legacy 会话。 */
   listCanvasSessions: (projectId: string) => CanvasSessionMeta[]
+  /** 只在项目写守卫内幂等投影 legacy 会话。 */
+  ensureLegacyCanvasSession: (projectId: string) => void
+  /** 返回项目当前只读原因；存在时禁止关联持久化 mutation。 */
+  getProjectReadOnlyReason: (projectId: string) => string | undefined
+  /** 在项目迁移写守卫与 lease 内执行完整 mutation。 */
+  runProjectMutation: <T>(projectId: string, effect: () => T) => T
   assertSenderProjectAccess: (
     sender: WebContents,
     projectId: string,
@@ -106,6 +113,8 @@ function isEligibleProjectAgent(session: AgentSessionMeta, projectId: string): b
 export interface AgentCanvasBindingCleanupOptions {
   store: Pick<AgentCanvasBindingStore, 'listByProject' | 'clearSession' | 'clearCanvas'>
   broadcast: (event: AgentCanvasBindingChangeEvent) => void
+  /** 删除后清理同样进入项目写守卫；测试替身可省略。 */
+  runProjectMutation?: <T>(projectId: string, effect: () => T) => T
 }
 
 /** 广播失败只记录固定类别，已提交关联事实不得回滚或报错。 */
@@ -149,18 +158,17 @@ export function clearAgentCanvasBindingsWithEvents(
 export function cleanupDeletedAgentSessionCanvasBindings(
   options: AgentCanvasBindingCleanupOptions,
   session: AgentSessionMeta,
-): boolean {
-  if (!session.workspaceId || !isEligibleProjectAgent(session, session.workspaceId)) return false
+): void {
+  if (!session.workspaceId || !isEligibleProjectAgent(session, session.workspaceId)) return
   try {
-    clearAgentCanvasBindingsWithEvents(options, {
-      projectId: session.workspaceId,
-      target: 'session',
-      sessionId: session.id,
+    const clear = (): void => clearAgentCanvasBindingsWithEvents(options, {
+      projectId: session.workspaceId!, target: 'session', sessionId: session.id,
     })
+    if (options.runProjectMutation) options.runProjectMutation(session.workspaceId, clear)
+    else clear()
   } catch {
     console.error('[Agent-Canvas 关联] Agent 删除后的关联清理失败')
   }
-  return true
 }
 
 /** Canvas 删除成功后的 best-effort 关联清理，不影响主删除结果与事件。 */
@@ -170,10 +178,23 @@ export function cleanupDeletedCanvasBindings(
   canvasId: string,
 ): void {
   try {
-    clearAgentCanvasBindingsWithEvents(options, { projectId, target: 'canvas', canvasId })
+    const clear = (): void => clearAgentCanvasBindingsWithEvents(
+      options, { projectId, target: 'canvas', canvasId },
+    )
+    if (options.runProjectMutation) options.runProjectMutation(projectId, clear)
+    else clear()
   } catch {
     console.error('[Agent-Canvas 关联] Canvas 删除后的关联清理失败')
   }
+}
+
+/** 在任何持久化 mutation 前统一拒绝只读项目。 */
+function requireWritableProject(
+  projectId: string,
+  options: RegisterAgentCanvasBindingIpcOptions,
+): void {
+  const reason = options.getProjectReadOnlyReason(projectId)
+  if (reason) throw new Error(reason)
 }
 
 /** 要求 Canvas 存在于目标项目公开索引；legacy-design 同样有效。 */
@@ -222,38 +243,51 @@ export function reconcileAgentCanvasBindings(
   projectId: string,
   options: RegisterAgentCanvasBindingIpcOptions,
 ): AgentCanvasBinding[] {
-  const bindings = parseListAgentCanvasBindingsResult(options.store.listByProject(projectId))
   const canvasIds = new Set(
     options.listCanvasSessions(projectId)
       .filter((canvas) => canvas.projectId === projectId)
       .map((canvas) => canvas.id),
   )
-  for (const binding of bindings) {
-    const session = options.getAgentSession(binding.sessionId)
-    if (session && isEligibleProjectAgent(session, projectId)) continue
-    clearAgentCanvasBindingsWithEvents(options, {
-      projectId,
-      target: 'session',
-      sessionId: binding.sessionId,
-    })
-  }
-  const invalidCanvasIds = new Set<string>()
-  for (const binding of parseListAgentCanvasBindingsResult(options.store.listByProject(projectId))) {
-    for (const canvasId of binding.linkedCanvasIds) {
-      if (!canvasIds.has(canvasId)) invalidCanvasIds.add(canvasId)
-    }
-  }
-  for (const canvasId of invalidCanvasIds) {
-    clearAgentCanvasBindingsWithEvents(options, { projectId, target: 'canvas', canvasId })
-  }
-  const reconciled = parseListAgentCanvasBindingsResult(options.store.listByProject(projectId))
+  const result = options.store.reconcileProject(
+    projectId,
+    (sessionId) => {
+      const session = options.getAgentSession(sessionId)
+      return Boolean(session && isEligibleProjectAgent(session, projectId))
+    },
+    (canvasId) => canvasIds.has(canvasId),
+  )
+  const reconciled = parseListAgentCanvasBindingsResult(result.bindings)
   if (!reconciled.every((binding) => {
     const session = options.getAgentSession(binding.sessionId)
     return Boolean(session
       && isEligibleProjectAgent(session, projectId)
       && binding.linkedCanvasIds.every((canvasId) => canvasIds.has(canvasId)))
   })) throw new Error('AGENT_CANVAS_BINDINGS_RECONCILE_INCOMPLETE')
+  for (const change of result.changes) {
+    broadcastChangeSafely(options, { projectId, ...change })
+  }
   return reconciled
+}
+
+/** 只读项目返回实时过滤视图，但不修改磁盘或投影 legacy 索引。 */
+function listValidAgentCanvasBindingsReadOnly(
+  projectId: string,
+  options: RegisterAgentCanvasBindingIpcOptions,
+): AgentCanvasBinding[] {
+  const canvasIds = new Set(options.listCanvasSessions(projectId).map((canvas) => canvas.id))
+  return parseListAgentCanvasBindingsResult(options.store.listByProject(projectId)).flatMap((binding) => {
+    const session = options.getAgentSession(binding.sessionId)
+    if (!session || !isEligibleProjectAgent(session, projectId)) return []
+    const linkedCanvasIds = binding.linkedCanvasIds.filter((canvasId) => canvasIds.has(canvasId))
+    if (linkedCanvasIds.length === 0) return []
+    const defaultCanvasId = linkedCanvasIds.includes(binding.defaultCanvasId ?? '')
+      ? binding.defaultCanvasId
+      : linkedCanvasIds[0]
+    const lastActiveCanvasId = linkedCanvasIds.includes(binding.lastActiveCanvasId ?? '')
+      ? binding.lastActiveCanvasId
+      : defaultCanvasId
+    return [{ ...binding, defaultCanvasId, linkedCanvasIds, lastActiveCanvasId }]
+  })
 }
 
 /** 注册五个 Agent-Canvas invoke handler。 */
@@ -274,7 +308,13 @@ export function registerAgentCanvasBindingIpcHandlers(
     async () => {
       const input = parseListAgentCanvasBindingsInput(value)
       await options.assertSenderProjectAccess(event.sender, input.projectId)
-      return reconcileAgentCanvasBindings(input.projectId, options)
+      if (options.getProjectReadOnlyReason(input.projectId)) {
+        return listValidAgentCanvasBindingsReadOnly(input.projectId, options)
+      }
+      return options.runProjectMutation(input.projectId, () => {
+        options.ensureLegacyCanvasSession(input.projectId)
+        return reconcileAgentCanvasBindings(input.projectId, options)
+      })
     },
   ))
 
@@ -283,12 +323,16 @@ export function registerAgentCanvasBindingIpcHandlers(
     async () => {
       const input = parseLinkAgentCanvasInput(value)
       await options.assertSenderProjectAccess(event.sender, input.projectId)
-      requireProjectAgent(input.sessionId, input.projectId, options)
-      requireProjectCanvas(input.canvasId, input.projectId, options)
-      const before = options.store.listByProject(input.projectId).find(
-        (binding) => binding.sessionId === input.sessionId,
-      ) ?? null
-      const binding = parseLinkAgentCanvasResult(options.store.link(input))
+      requireWritableProject(input.projectId, options)
+      const { before, binding } = options.runProjectMutation(input.projectId, () => {
+        options.ensureLegacyCanvasSession(input.projectId)
+        requireProjectAgent(input.sessionId, input.projectId, options)
+        requireProjectCanvas(input.canvasId, input.projectId, options)
+        const before = options.store.listByProject(input.projectId).find(
+          (candidate) => candidate.sessionId === input.sessionId,
+        ) ?? null
+        return { before, binding: parseLinkAgentCanvasResult(options.store.link(input)) }
+      })
       if (!nullableBindingsEqual(before, binding)) {
         broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'linked', binding })
       }
@@ -301,12 +345,16 @@ export function registerAgentCanvasBindingIpcHandlers(
     async () => {
       const input = parseUnlinkAgentCanvasInput(value)
       await options.assertSenderProjectAccess(event.sender, input.projectId)
-      requireProjectAgent(input.sessionId, input.projectId, options)
-      requireProjectCanvas(input.canvasId, input.projectId, options)
-      const before = options.store.listByProject(input.projectId).find(
-        (binding) => binding.sessionId === input.sessionId,
-      ) ?? null
-      const binding = parseUnlinkAgentCanvasResult(options.store.unlink(input))
+      requireWritableProject(input.projectId, options)
+      const { before, binding } = options.runProjectMutation(input.projectId, () => {
+        options.ensureLegacyCanvasSession(input.projectId)
+        requireProjectAgent(input.sessionId, input.projectId, options)
+        requireProjectCanvas(input.canvasId, input.projectId, options)
+        const before = options.store.listByProject(input.projectId).find(
+          (candidate) => candidate.sessionId === input.sessionId,
+        ) ?? null
+        return { before, binding: parseUnlinkAgentCanvasResult(options.store.unlink(input)) }
+      })
       if (!nullableBindingsEqual(before, binding)) {
         broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'unlinked', binding })
       }
@@ -319,12 +367,16 @@ export function registerAgentCanvasBindingIpcHandlers(
     async () => {
       const input = parseSetDefaultAgentCanvasInput(value)
       await options.assertSenderProjectAccess(event.sender, input.projectId)
-      requireProjectAgent(input.sessionId, input.projectId, options)
-      requireProjectCanvas(input.canvasId, input.projectId, options)
-      const before = options.store.listByProject(input.projectId).find(
-        (binding) => binding.sessionId === input.sessionId,
-      ) ?? null
-      const binding = parseSetDefaultAgentCanvasResult(options.store.setDefault(input))
+      requireWritableProject(input.projectId, options)
+      const { before, binding } = options.runProjectMutation(input.projectId, () => {
+        options.ensureLegacyCanvasSession(input.projectId)
+        requireProjectAgent(input.sessionId, input.projectId, options)
+        requireProjectCanvas(input.canvasId, input.projectId, options)
+        const before = options.store.listByProject(input.projectId).find(
+          (candidate) => candidate.sessionId === input.sessionId,
+        ) ?? null
+        return { before, binding: parseSetDefaultAgentCanvasResult(options.store.setDefault(input)) }
+      })
       if (!nullableBindingsEqual(before, binding)) {
         broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'default-changed', binding })
       }
@@ -337,12 +389,16 @@ export function registerAgentCanvasBindingIpcHandlers(
     async () => {
       const input = parseClearAgentCanvasBindingsInput(value)
       await options.assertSenderProjectAccess(event.sender, input.projectId)
-      if (input.target === 'session') {
-        requireProjectAgent(input.sessionId, input.projectId, options)
-      } else {
-        requireProjectCanvas(input.canvasId, input.projectId, options)
-      }
-      clearAgentCanvasBindingsWithEvents(options, input)
+      requireWritableProject(input.projectId, options)
+      options.runProjectMutation(input.projectId, () => {
+        options.ensureLegacyCanvasSession(input.projectId)
+        if (input.target === 'session') {
+          requireProjectAgent(input.sessionId, input.projectId, options)
+        } else {
+          requireProjectCanvas(input.canvasId, input.projectId, options)
+        }
+        clearAgentCanvasBindingsWithEvents(options, input)
+      })
       return parseClearAgentCanvasBindingsResult(undefined)
     },
   ))

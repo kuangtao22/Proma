@@ -201,6 +201,69 @@ describe('AgentCanvasBindingStore', () => {
     expect(store.get('project-2', 'session-c')?.linkedCanvasIds).toEqual(['canvas-shared'])
   })
 
+  test('Given 同项目同时存在失效会话与画布 When 批量对账 Then 单次 fresh-read 与单次原子写完成全部清理', () => {
+    const { store, writes } = createHarness(null, [10, 20, 30, 40])
+    store.link(linkInput('session-valid', 'canvas-valid'))
+    store.link(linkInput('session-valid', 'canvas-stale'))
+    store.link(linkInput('session-stale', 'canvas-valid'))
+    writes.length = 0
+
+    const result = store.reconcileProject(
+      'project-1',
+      (sessionId) => sessionId === 'session-valid',
+      (canvasId) => canvasId === 'canvas-valid',
+    )
+
+    expect(writes).toHaveLength(1)
+    expect(result.bindings).toEqual([expect.objectContaining({
+      sessionId: 'session-valid',
+      linkedCanvasIds: ['canvas-valid'],
+    })])
+    expect(result.changes).toEqual([{
+      sessionId: 'session-stale',
+      cause: 'session-cleared',
+      binding: null,
+    }, {
+      sessionId: 'session-valid',
+      cause: 'canvas-cleared',
+      binding: expect.objectContaining({ linkedCanvasIds: ['canvas-valid'] }),
+    }])
+  })
+
+  test('Given 批量对账 CAS 冲突 When 赢家抢先提交 Then 不覆盖赢家且下一次可基于权威磁盘重试', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'proma-agent-canvas-reconcile-conflict-'))
+    temporaryDirectories.push(directory)
+    const configPath = join(directory, 'agent-canvas-bindings.json')
+    const baselineFile = createBindingFile(['canvas-valid', 'canvas-stale'])
+    const winnerFile = createBindingFile(['canvas-valid', 'canvas-stale', 'canvas-winner'])
+    writeFileSync(configPath, JSON.stringify(baselineFile), 'utf8')
+    let shouldConflict = true
+    const store = new AgentCanvasBindingStore({
+      configPath,
+      writeJson: (filePath, value, options) => writeJsonFileAtomicSecure(filePath, value, {
+        ...options,
+        beforeRename: () => {
+          if (!shouldConflict) return
+          shouldConflict = false
+          writeFileSync(filePath, JSON.stringify(winnerFile), 'utf8')
+        },
+      }),
+    })
+
+    expect(() => store.reconcileProject(
+      'project-1',
+      () => true,
+      (canvasId) => canvasId !== 'canvas-stale',
+    )).toThrow('安全原子写入目标状态冲突')
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual(winnerFile)
+
+    expect(store.reconcileProject(
+      'project-1',
+      () => true,
+      (canvasId) => canvasId !== 'canvas-stale',
+    ).bindings[0]?.linkedCanvasIds).toEqual(['canvas-valid', 'canvas-winner'])
+  })
+
   test('Given 损坏配置 When 读取后执行有效写入 Then 先降级为空且写操作重建 schema v1', () => {
     /** 损坏内容必须在首次读取时保持原样，不能由恢复读取覆盖。 */
     let rawContent = '{broken-json'
