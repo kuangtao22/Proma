@@ -135,6 +135,11 @@ describe('Design preload', () => {
       [() => api.getCanvasAgentMessages({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }), CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }]],
       [() => api.sendCanvasAgentMessage({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1', message: '继续', userMessageUuid: 'message-1', startedAt: 10 }), CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1', message: '继续', userMessageUuid: 'message-1', startedAt: 10 }]],
       [() => api.stopCanvasAgent({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }), CANVAS_IPC_CHANNELS.STOP_AGENT, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }]],
+      [() => api.listAgentCanvasBindings({ projectId: 'p1' }), CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS, [{ projectId: 'p1' }]],
+      [() => api.linkAgentCanvas({ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false }), CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS, [{ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false }]],
+      [() => api.unlinkAgentCanvas({ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.UNLINK_AGENT_CANVAS, [{ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }]],
+      [() => api.setDefaultAgentCanvas({ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS, [{ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }]],
+      [() => api.clearAgentCanvasBindings({ projectId: 'p1', target: 'session', sessionId: 'session-1' }), CANVAS_IPC_CHANNELS.CLEAR_AGENT_BINDINGS, [{ projectId: 'p1', target: 'session', sessionId: 'session-1' }]],
       [() => api.listCanvasSessions({ projectId: 'p1', archived: false }), DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS, [{ projectId: 'p1', archived: false }]],
       [() => api.createCanvasSession({ projectId: 'p1', title: '页面设计' }), DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION, [{ projectId: 'p1', title: '页面设计' }]],
       [() => api.updateCanvasSession({ projectId: 'p1', canvasId: 'canvas-1', archived: true }), DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION, [{ projectId: 'p1', canvasId: 'canvas-1', archived: true }]],
@@ -188,6 +193,21 @@ describe('Design preload', () => {
     })
     expect(JSON.stringify(result)).not.toContain('remote method')
     expect(JSON.stringify(result)).not.toContain('/Users/name')
+  })
+
+  test('Given 关联 invoke rejection 含内部信息 When preload 调用 Then 返回固定安全错误', async () => {
+    const recorded = createRecordingIpc()
+    recorded.ipc.invoke = async () => { throw new Error('/private/.proma/agent-canvas-bindings.json') }
+    const api = createDesignPreloadApi(recorded.ipc)
+
+    expect(await api.listAgentCanvasBindings({ projectId: 'p1' })).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_BINDING_LIST_FAILED', message: '画布关联列表暂时无法加载。' },
+    })
+    expect(await api.linkAgentCanvas({ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false })).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_BINDING_FAILED', message: '画布关联失败，请重试。' },
+    })
   })
 
   test('Given 内容节点通道 rejection When preload 调用 Then 每类操作返回固定公开错误', async () => {
@@ -292,6 +312,30 @@ describe('Design preload', () => {
     expect(received).toEqual([change])
     expect(recorded.added[0]?.channel).toBe(CANVAS_IPC_CHANNELS.CHANGED)
     expect(recorded.removed[0]?.channel).toBe(CANVAS_IPC_CHANNELS.CHANGED)
+    expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
+  })
+
+  test('Given 关联变化订阅 When 推送合法、未知字段事件并重复取消 Then 只接收严格公开事件且幂等解绑', () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    const received: unknown[] = []
+    const release = api.onAgentCanvasBindingChanged((event) => received.push(event))
+    const change = {
+      projectId: 'p1', sessionId: 'session-1', cause: 'linked' as const,
+      binding: {
+        projectId: 'p1', sessionId: 'session-1', defaultCanvasId: 'canvas-1',
+        linkedCanvasIds: ['canvas-1'], lastActiveCanvasId: 'canvas-1', updatedAt: 10,
+      },
+    }
+
+    recorded.added[0]?.listener({} as IpcRendererEvent, change)
+    recorded.added[0]?.listener({} as IpcRendererEvent, { ...change, internalPath: '/private/secret' })
+    release()
+    release()
+
+    expect(received).toEqual([change])
+    expect(recorded.added[0]?.channel).toBe(CANVAS_IPC_CHANNELS.AGENT_BINDINGS_CHANGED)
+    expect(recorded.removed).toHaveLength(1)
     expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
   })
 })

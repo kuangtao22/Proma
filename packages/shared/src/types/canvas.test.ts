@@ -13,6 +13,7 @@ import {
   parseCanvasNodeContentMeta,
   parseCanvasTrashEntry,
   parseAgentCanvasBinding,
+  parseAgentCanvasBindingChangeEvent,
   parseCanvasBatchOperationEnvelope,
   parseCanvasNodeReference,
   parseCanvasRunNodesInput,
@@ -127,6 +128,50 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given 合法关联变化事件 When 解析 Then 返回隔离副本并保留 null 删除语义', () => {
+    const binding: AgentCanvasBinding = {
+      projectId: 'project-1',
+      sessionId: 'session-1',
+      defaultCanvasId: 'canvas-1',
+      linkedCanvasIds: ['canvas-1'],
+      lastActiveCanvasId: 'canvas-1',
+      updatedAt: 10,
+    }
+    const value = {
+      projectId: 'project-1',
+      sessionId: 'session-1',
+      cause: 'linked' as const,
+      binding,
+    }
+
+    const parsed = parseAgentCanvasBindingChangeEvent(value)
+
+    expect(parsed).toEqual(value)
+    expect(parsed).not.toBe(value)
+    expect(parsed.binding).not.toBe(binding)
+    expect(parseAgentCanvasBindingChangeEvent({
+      projectId: 'project-1',
+      sessionId: 'session-1',
+      cause: 'session-cleared',
+      binding: null,
+    }).binding).toBeNull()
+  })
+
+  test('Given 关联变化事件含未知字段或非法 cause When 解析 Then 严格拒绝', () => {
+    expect(() => parseAgentCanvasBindingChangeEvent({
+      projectId: 'project-1',
+      sessionId: 'session-1',
+      cause: 'linked',
+      binding: null,
+      internalPath: '/private/secret',
+    })).toThrow('AGENT_CANVAS_BINDING_CHANGE_EVENT_INVALID')
+    expect(() => parseAgentCanvasBindingChangeEvent({
+      projectId: 'project-1',
+      sessionId: 'session-1',
+      cause: 'unknown',
+      binding: null,
+    })).toThrow('AGENT_CANVAS_BINDING_CHANGE_EVENT_INVALID')
+  })
   test('Given Agent 关联包含重复画布 When 严格解析 Then 去重并保持首现顺序', () => {
     /** 持久化边界返回的关联记录，重复项应被规范化。 */
     const binding = parseAgentCanvasBinding({
@@ -522,6 +567,7 @@ describe('Canvas 图共享合同', () => {
       UNLINK_AGENT_CANVAS: 'canvas:unlink-agent-canvas',
       SET_DEFAULT_AGENT_CANVAS: 'canvas:set-default-agent-canvas',
       CLEAR_AGENT_BINDINGS: 'canvas:clear-agent-bindings',
+      AGENT_BINDINGS_CHANGED: 'canvas:agent-bindings-changed',
       CHANGED: 'canvas:changed',
     })
     expect(loadInput).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })

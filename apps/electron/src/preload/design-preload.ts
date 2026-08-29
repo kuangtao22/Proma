@@ -1,5 +1,12 @@
-import { CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS } from '@proma/shared'
+import {
+  CANVAS_IPC_CHANNELS,
+  DESIGN_IPC_CHANNELS,
+  parseAgentCanvasBindingChangeEvent,
+} from '@proma/shared'
 import type {
+  AgentCanvasBindingChangeEvent,
+  ClearAgentCanvasBindingsInput,
+  ClearAgentCanvasBindingsResult,
   CanvasChangeEvent,
   CanvasDocument,
   CanvasImageJobControlInput,
@@ -12,6 +19,10 @@ import type {
   CanvasSessionChangeEvent,
   CanvasSessionMeta,
   CanvasWorkspaceSnapshot,
+  LinkAgentCanvasInput,
+  LinkAgentCanvasResult,
+  ListAgentCanvasBindingsInput,
+  ListAgentCanvasBindingsResult,
   CanvasAgentNodeCreationResult,
   CanvasAgentMessagesResult,
   CanvasAgentActiveRunSnapshot,
@@ -56,6 +67,10 @@ import type {
   SendCanvasAgentMessageInput,
   SendCanvasAgentMessageResult,
   StopCanvasAgentInput,
+  SetDefaultAgentCanvasInput,
+  SetDefaultAgentCanvasResult,
+  UnlinkAgentCanvasInput,
+  UnlinkAgentCanvasResult,
   SaveImageGenerationModelProfilesInput,
   ListDesignContextInput,
   UpsertDesignContextDocumentInput,
@@ -120,6 +135,18 @@ export interface DesignPreloadApi {
   stopCanvasAgent: (input: StopCanvasAgentInput) => Promise<CanvasInvokeResult<void>>
   /** 订阅所有原生 Canvas 变化，双身份过滤由 Renderer adapter 执行。 */
   onCanvasChanged: (listener: (event: CanvasChangeEvent) => void) => () => void
+  /** 列出当前项目内全部普通 Agent-Canvas 关联。 */
+  listAgentCanvasBindings: (input: ListAgentCanvasBindingsInput) => Promise<CanvasInvokeResult<ListAgentCanvasBindingsResult>>
+  /** 建立普通 Agent 与项目 Canvas 的关联。 */
+  linkAgentCanvas: (input: LinkAgentCanvasInput) => Promise<CanvasInvokeResult<LinkAgentCanvasResult>>
+  /** 解除普通 Agent 与项目 Canvas 的关联。 */
+  unlinkAgentCanvas: (input: UnlinkAgentCanvasInput) => Promise<CanvasInvokeResult<UnlinkAgentCanvasResult>>
+  /** 切换普通 Agent 的默认 Canvas。 */
+  setDefaultAgentCanvas: (input: SetDefaultAgentCanvasInput) => Promise<CanvasInvokeResult<SetDefaultAgentCanvasResult>>
+  /** 按普通 Agent 或 Canvas 清空关联。 */
+  clearAgentCanvasBindings: (input: ClearAgentCanvasBindingsInput) => Promise<CanvasInvokeResult<ClearAgentCanvasBindingsResult>>
+  /** 订阅严格解析后的 Agent-Canvas 关联变化。 */
+  onAgentCanvasBindingChanged: (listener: (event: AgentCanvasBindingChangeEvent) => void) => () => void
   listCanvasSessions: (input: ListCanvasSessionsInput) => Promise<CanvasSessionMeta[]>
   createCanvasSession: (input: CreateCanvasSessionInput) => Promise<CanvasSessionMeta>
   updateCanvasSession: (input: UpdateCanvasSessionInput) => Promise<CanvasSessionMeta>
@@ -178,6 +205,8 @@ const CANVAS_PRELOAD_FALLBACKS = {
   messages: { code: 'CANVAS_AGENT_MESSAGES_FAILED', message: '会话消息暂时无法加载。' },
   send: { code: 'CANVAS_AGENT_SEND_FAILED', message: '消息发送失败，请重试。' },
   stop: { code: 'CANVAS_AGENT_STOP_FAILED', message: '停止 Agent 失败，请重试。' },
+  bindingList: { code: 'CANVAS_BINDING_LIST_FAILED', message: '画布关联列表暂时无法加载。' },
+  binding: { code: 'CANVAS_BINDING_FAILED', message: '画布关联失败，请重试。' },
 } as const satisfies Record<string, CanvasPublicError>
 
 /**
@@ -392,6 +421,57 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
       )
       ipc.on(CANVAS_IPC_CHANNELS.CHANGED, handler)
       return () => ipc.removeListener(CANVAS_IPC_CHANNELS.CHANGED, handler)
+    },
+    listAgentCanvasBindings: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS,
+      { projectId: input.projectId },
+      CANVAS_PRELOAD_FALLBACKS.bindingList,
+    ),
+    linkAgentCanvas: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS,
+      {
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        canvasId: input.canvasId,
+        makeDefault: input.makeDefault,
+      },
+      CANVAS_PRELOAD_FALLBACKS.binding,
+    ),
+    unlinkAgentCanvas: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.UNLINK_AGENT_CANVAS,
+      { projectId: input.projectId, sessionId: input.sessionId, canvasId: input.canvasId },
+      CANVAS_PRELOAD_FALLBACKS.binding,
+    ),
+    setDefaultAgentCanvas: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS,
+      { projectId: input.projectId, sessionId: input.sessionId, canvasId: input.canvasId },
+      CANVAS_PRELOAD_FALLBACKS.binding,
+    ),
+    clearAgentCanvasBindings: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.CLEAR_AGENT_BINDINGS,
+      input.target === 'session'
+        ? { projectId: input.projectId, target: input.target, sessionId: input.sessionId }
+        : { projectId: input.projectId, target: input.target, canvasId: input.canvasId },
+      CANVAS_PRELOAD_FALLBACKS.binding,
+    ),
+    onAgentCanvasBindingChanged: (listener) => {
+      /** 未知事件先经过 shared exact-key parser，非法 payload 静默丢弃。 */
+      const handler = (_event: IpcRendererEvent, value: unknown): void => {
+        try {
+          listener(parseAgentCanvasBindingChangeEvent(value))
+        } catch {
+          return
+        }
+      }
+      ipc.on(CANVAS_IPC_CHANNELS.AGENT_BINDINGS_CHANGED, handler)
+      return makeIdempotentRelease(() => {
+        ipc.removeListener(CANVAS_IPC_CHANNELS.AGENT_BINDINGS_CHANGED, handler)
+      })
     },
     listCanvasSessions: (input) => ipc.invoke(
       DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS,

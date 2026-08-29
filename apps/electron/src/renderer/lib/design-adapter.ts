@@ -1,4 +1,6 @@
 import type {
+  AgentCanvasBindingChangeEvent,
+  ClearAgentCanvasBindingsInput,
   CanvasAgentMessagesResult,
   CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
@@ -16,6 +18,10 @@ import type {
   CanvasTrashEntry,
   CanvasSessionChangeEvent,
   CanvasWorkspaceSnapshot,
+  LinkAgentCanvasInput,
+  LinkAgentCanvasResult,
+  ListAgentCanvasBindingsInput,
+  ListAgentCanvasBindingsResult,
   CreateCanvasSessionInput,
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
@@ -49,6 +55,10 @@ import type {
   SendCanvasAgentMessageInput,
   SendCanvasAgentMessageResult,
   StopCanvasAgentInput,
+  SetDefaultAgentCanvasInput,
+  SetDefaultAgentCanvasResult,
+  UnlinkAgentCanvasInput,
+  UnlinkAgentCanvasResult,
   UpsertDesignContextDocumentInput,
   UpdateCanvasSessionInput,
   UpdateDesignContextEntryInput,
@@ -111,6 +121,21 @@ export interface DesignAdapter {
     target: CanvasTarget,
     listener: (event: CanvasChangeEvent) => void,
   ) => ReturnType<DesignPreloadApi['onCanvasChanged']>
+  /** 列出目标项目的普通 Agent-Canvas 关联。 */
+  listAgentCanvasBindings: (input: ListAgentCanvasBindingsInput) => Promise<ListAgentCanvasBindingsResult>
+  /** 建立普通 Agent 与 Canvas 关联。 */
+  linkAgentCanvas: (input: LinkAgentCanvasInput) => Promise<LinkAgentCanvasResult>
+  /** 解除普通 Agent 与 Canvas 关联。 */
+  unlinkAgentCanvas: (input: UnlinkAgentCanvasInput) => Promise<UnlinkAgentCanvasResult>
+  /** 设置普通 Agent 默认 Canvas。 */
+  setDefaultAgentCanvas: (input: SetDefaultAgentCanvasInput) => Promise<SetDefaultAgentCanvasResult>
+  /** 按会话或 Canvas 清空关联。 */
+  clearAgentCanvasBindings: (input: ClearAgentCanvasBindingsInput) => Promise<void>
+  /** 只向监听器传递项目与 Agent 身份均匹配的事件。 */
+  onAgentCanvasBindingChanged: (
+    target: Pick<AgentCanvasBindingChangeEvent, 'projectId' | 'sessionId'>,
+    listener: (event: AgentCanvasBindingChangeEvent) => void,
+  ) => ReturnType<DesignPreloadApi['onAgentCanvasBindingChanged']>
   listCanvasSessions: (input: ListCanvasSessionsInput) => ReturnType<DesignPreloadApi['listCanvasSessions']>
   createCanvasSession: (input: CreateCanvasSessionInput) => ReturnType<DesignPreloadApi['createCanvasSession']>
   updateCanvasSession: (input: UpdateCanvasSessionInput) => ReturnType<DesignPreloadApi['updateCanvasSession']>
@@ -185,6 +210,8 @@ const CANVAS_ADAPTER_FALLBACKS = {
   messages: { code: 'CANVAS_AGENT_MESSAGES_FAILED', message: '会话消息暂时无法加载。' },
   send: { code: 'CANVAS_AGENT_SEND_FAILED', message: '消息发送失败，请重试。' },
   stop: { code: 'CANVAS_AGENT_STOP_FAILED', message: '停止 Agent 失败，请重试。' },
+  bindingList: { code: 'CANVAS_BINDING_LIST_FAILED', message: '画布关联列表暂时无法加载。' },
+  binding: { code: 'CANVAS_BINDING_FAILED', message: '画布关联失败，请重试。' },
 } as const satisfies Record<string, CanvasPublicError>
 
 /**
@@ -319,6 +346,32 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
       /** adapter 只隔离双重身份，revision 与 recovery 策略留给工作区 controller。 */
       if (event.projectId === target.projectId && event.canvasId === target.canvasId) listener(event)
     }),
+    listAgentCanvasBindings: (input) => callCanvasApi(
+      () => requireMethod(api, 'listAgentCanvasBindings')(input),
+      CANVAS_ADAPTER_FALLBACKS.bindingList,
+    ),
+    linkAgentCanvas: (input) => callCanvasApi(
+      () => requireMethod(api, 'linkAgentCanvas')(input),
+      CANVAS_ADAPTER_FALLBACKS.binding,
+    ),
+    unlinkAgentCanvas: (input) => callCanvasApi(
+      () => requireMethod(api, 'unlinkAgentCanvas')(input),
+      CANVAS_ADAPTER_FALLBACKS.binding,
+    ),
+    setDefaultAgentCanvas: (input) => callCanvasApi(
+      () => requireMethod(api, 'setDefaultAgentCanvas')(input),
+      CANVAS_ADAPTER_FALLBACKS.binding,
+    ),
+    clearAgentCanvasBindings: (input) => callCanvasApi(
+      () => requireMethod(api, 'clearAgentCanvasBindings')(input),
+      CANVAS_ADAPTER_FALLBACKS.binding,
+    ),
+    onAgentCanvasBindingChanged: (target, listener) => {
+      const release = requireMethod(api, 'onAgentCanvasBindingChanged')((event) => {
+        if (event.projectId === target.projectId && event.sessionId === target.sessionId) listener(event)
+      })
+      return makeIdempotentAdapterRelease(release)
+    },
     listCanvasSessions: (input) => requireMethod(api, 'listCanvasSessions')(input),
     createCanvasSession: (input) => requireMethod(api, 'createCanvasSession')(input),
     updateCanvasSession: (input) => requireMethod(api, 'updateCanvasSession')(input),

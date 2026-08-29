@@ -14,6 +14,77 @@ import {
 } from './design-adapter'
 
 describe('Design renderer adapter', () => {
+  test('Given Agent-画布关联 preload 成功 When adapter 调用 Then 解包结果并保留输入身份', async () => {
+    const received: unknown[] = []
+    const binding = {
+      projectId: 'project-1', sessionId: 'session-1', defaultCanvasId: 'canvas-1',
+      linkedCanvasIds: ['canvas-1'], lastActiveCanvasId: 'canvas-1', updatedAt: 10,
+    }
+    const adapter = createDesignAdapter({
+      listAgentCanvasBindings: async (input) => { received.push(input); return { ok: true, value: [binding] } },
+      linkAgentCanvas: async (input) => { received.push(input); return { ok: true, value: binding } },
+      unlinkAgentCanvas: async (input) => { received.push(input); return { ok: true, value: null } },
+      setDefaultAgentCanvas: async (input) => { received.push(input); return { ok: true, value: binding } },
+      clearAgentCanvasBindings: async (input) => { received.push(input); return { ok: true, value: undefined } },
+    })
+    const listInput = { projectId: 'project-1' }
+    const linkInput = { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false }
+    const target = { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }
+    const clearInput = { projectId: 'project-1', target: 'session' as const, sessionId: 'session-1' }
+
+    expect(await adapter.listAgentCanvasBindings(listInput)).toEqual([binding])
+    expect(await adapter.linkAgentCanvas(linkInput)).toBe(binding)
+    expect(await adapter.unlinkAgentCanvas(target)).toBeNull()
+    expect(await adapter.setDefaultAgentCanvas(target)).toBe(binding)
+    await expect(adapter.clearAgentCanvasBindings(clearInput)).resolves.toBeUndefined()
+    expect(received).toEqual([listInput, linkInput, target, target, clearInput])
+  })
+
+  test('Given 关联安全错误、缺失 API 或 rejection When adapter 调用 Then 只抛固定公开错误', async () => {
+    const input = { projectId: 'project-1' }
+    await expect(createDesignAdapter({
+      listAgentCanvasBindings: async () => ({
+        ok: false,
+        error: { code: 'CANVAS_BINDING_LIST_FAILED', message: '画布关联列表暂时无法加载。' },
+      }),
+    }).listAgentCanvasBindings(input)).rejects.toMatchObject({
+      code: 'CANVAS_BINDING_LIST_FAILED', message: '画布关联列表暂时无法加载。',
+    })
+    await expect(createDesignAdapter({}).listAgentCanvasBindings(input)).rejects.toMatchObject({
+      code: 'CANVAS_BINDING_LIST_FAILED', message: '画布关联列表暂时无法加载。',
+    })
+    await expect(createDesignAdapter({
+      linkAgentCanvas: async () => { throw new Error('/private/secret') },
+    }).linkAgentCanvas({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false })).rejects.toMatchObject({
+      code: 'CANVAS_BINDING_FAILED', message: '画布关联失败，请重试。',
+    })
+  })
+
+  test('Given 多个关联事件 When 订阅指定 Agent Then 双身份过滤且释放幂等', () => {
+    let sourceListener: ((event: import('@proma/shared').AgentCanvasBindingChangeEvent) => void) | undefined
+    let releaseCalls = 0
+    const adapter = createDesignAdapter({
+      onAgentCanvasBindingChanged: (listener) => {
+        sourceListener = listener
+        return () => { releaseCalls += 1 }
+      },
+    })
+    const received: import('@proma/shared').AgentCanvasBindingChangeEvent[] = []
+    const release = adapter.onAgentCanvasBindingChanged(
+      { projectId: 'project-1', sessionId: 'session-1' },
+      (event) => received.push(event),
+    )
+    const matching = { projectId: 'project-1', sessionId: 'session-1', cause: 'session-cleared' as const, binding: null }
+    sourceListener?.({ projectId: 'project-2', sessionId: 'session-1', cause: 'session-cleared', binding: null })
+    sourceListener?.({ projectId: 'project-1', sessionId: 'session-2', cause: 'session-cleared', binding: null })
+    sourceListener?.(matching)
+    release()
+    release()
+
+    expect(received).toEqual([matching])
+    expect(releaseCalls).toBe(1)
+  })
+
   test('Given Canvas 生图 preload 成功 When adapter 调用全部方法 Then 解包结果并保留输入对象', async () => {
     /** preload 收到的调用参数，用于锁定 adapter 不改写业务命令。 */
     const received: unknown[] = []

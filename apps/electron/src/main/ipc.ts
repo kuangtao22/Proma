@@ -171,6 +171,7 @@ import type {
   BrowserTabInput,
   BrowserCreateTabInput,
   CanvasChangeEvent,
+  AgentCanvasBindingChangeEvent,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
@@ -198,6 +199,11 @@ import { DesignImageModelPreferences } from './lib/design/design-image-model-pre
 import { registerDesignIpcHandlers } from './lib/design/design-ipc'
 import { registerCanvasSessionIpcHandlers } from './lib/design/canvas-session-ipc'
 import { CanvasSessionStore } from './lib/design/canvas-session-store'
+import {
+  clearDeletedAgentSessionCanvasBindings,
+  registerAgentCanvasBindingIpcHandlers,
+} from './lib/design/agent-canvas-binding-ipc'
+import { AgentCanvasBindingStore } from './lib/design/agent-canvas-binding-store'
 import { registerCanvasDocumentIpcHandlers } from './lib/design/canvas-document-ipc'
 import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
@@ -1882,6 +1888,9 @@ class CanvasContentAgentBusyError extends Error {
   }
 }
 
+/** Agent-Canvas 关联在主进程内只保留一个 Store 实例，避免缓存和 CAS 基线分叉。 */
+const agentCanvasBindingStore = new AgentCanvasBindingStore()
+
 export function registerIpcHandlers(): void {
   // ===== 本地终端（仅主 renderer 可操作，不能指定可执行文件） =====
   const assertMainTerminalRenderer = (senderId: number): void => {
@@ -2161,6 +2170,34 @@ export function registerIpcHandlers(): void {
     assets: designAssetService,
   })
   setDefaultDesignJobManager(designJobManager)
+  registerAgentCanvasBindingIpcHandlers({
+    ipcMain,
+    store: agentCanvasBindingStore,
+    getAgentSession: getAgentSessionMeta,
+    listCanvasSessions: (projectId) => {
+      /** 旧 Design 画布也是项目公开 Canvas，关联查询前幂等投影其元数据。 */
+      canvasSessionStore.ensureLegacySession(projectId)
+      return canvasSessionStore.list({ projectId })
+    },
+    assertSenderProjectAccess: (sender, projectId) => {
+      /** 仅仍存活的当前主窗口可访问已登记项目。 */
+      const authorized = listAuthorizedDesignWebContents().some((contents) => (
+        contents.id === sender.id && !contents.isDestroyed()
+      ))
+      if (!authorized || sender.isDestroyed() || !getAgentWorkspace(projectId)) {
+        throw new Error('无权访问 Agent-Canvas 关联')
+      }
+    },
+    broadcast: (event: AgentCanvasBindingChangeEvent) => {
+      for (const contents of listAuthorizedDesignWebContents()) {
+        try {
+          contents.send(CANVAS_IPC_CHANNELS.AGENT_BINDINGS_CHANGED, event)
+        } catch (error) {
+          console.error('[IPC] Agent-Canvas 关联变化广播失败:', error)
+        }
+      }
+    },
+  })
   registerCanvasSessionIpcHandlers({
     ipc: ipcMain,
     listAuthorizedWebContents: listAuthorizedDesignWebContents,
@@ -2202,6 +2239,8 @@ export function registerIpcHandlers(): void {
           console.error(`[Canvas 会话] 内部 Agent 清理失败 (${session.id}):`, error)
         }
       }
+      /** Canvas 索引删除成功后再移除普通 Agent 关联，不触碰上述内部会话身份。 */
+      agentCanvasBindingStore.clearCanvas(projectId, canvasId)
     },
   })
   registerCanvasDocumentIpcHandlers({
@@ -3611,7 +3650,8 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DELETE_SESSION,
     async (_, id: string): Promise<void> => {
-      const attachedFiles = requireVisibleSession(id).attachedFiles
+      const deletingSession = requireVisibleSession(id)
+      const attachedFiles = deletingSession.attachedFiles
       // 清理权限服务中该会话的白名单
       permissionService.clearSessionWhitelist(id)
       permissionService.clearSessionPending(id)
@@ -3623,6 +3663,8 @@ export function registerIpcHandlers(): void {
       await browserController.close(id)
       closeTerminalsForSession(id)
       deleteAgentSession(id)
+      /** 复用关联准入规则，只在普通顶层 Agent 删除成功后清理。 */
+      clearDeletedAgentSessionCanvasBindings(agentCanvasBindingStore, deletingSession)
       releaseAttachedFileWatchers(attachedFiles)
     }
   )

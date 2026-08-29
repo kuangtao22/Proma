@@ -35,6 +35,7 @@ export const CANVAS_IPC_CHANNELS = {
   UNLINK_AGENT_CANVAS: 'canvas:unlink-agent-canvas',
   SET_DEFAULT_AGENT_CANVAS: 'canvas:set-default-agent-canvas',
   CLEAR_AGENT_BINDINGS: 'canvas:clear-agent-bindings',
+  AGENT_BINDINGS_CHANGED: 'canvas:agent-bindings-changed',
   CHANGED: 'canvas:changed',
 } as const
 
@@ -323,6 +324,22 @@ export interface AgentCanvasBinding {
   updatedAt: number
 }
 
+/** Agent-Canvas 关联变更的稳定公开原因。 */
+export type AgentCanvasBindingChangeCause =
+  | 'linked'
+  | 'unlinked'
+  | 'default-changed'
+  | 'session-cleared'
+  | 'canvas-cleared'
+
+/** 主进程成功提交关联写入后广播的最小公开事件。 */
+export interface AgentCanvasBindingChangeEvent {
+  projectId: string
+  sessionId: string
+  cause: AgentCanvasBindingChangeCause
+  binding: AgentCanvasBinding | null
+}
+
 /** 对话消息引用的 Canvas 节点稳定快照。 */
 export interface CanvasNodeReference {
   projectId: string
@@ -538,6 +555,8 @@ export type CanvasPublicErrorCode =
   | 'CANVAS_IMAGE_SAVE_FAILED'
   | 'CANVAS_IMAGE_JOB_FAILED'
   | 'CANVAS_IMAGE_REVISION_CONFLICT'
+  | 'CANVAS_BINDING_LIST_FAILED'
+  | 'CANVAS_BINDING_FAILED'
 
 /** 不含内部路径、UUID、通道或堆栈的公开错误。 */
 export interface CanvasPublicError {
@@ -890,6 +909,36 @@ export function parseAgentCanvasBinding(value: unknown): AgentCanvasBinding {
 export function parseAgentCanvasBindings(value: unknown): AgentCanvasBinding[] {
   if (!Array.isArray(value)) throw new Error('AGENT_CANVAS_BINDINGS_INVALID')
   return value.map(parseAgentCanvasBinding)
+}
+
+/** 严格解析 Agent-Canvas 关联变化事件，拒绝额外字段和内部信息。 */
+export function parseAgentCanvasBindingChangeEvent(value: unknown): AgentCanvasBindingChangeEvent {
+  const keys = ['projectId', 'sessionId', 'cause', 'binding'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.sessionId)
+    || !isAgentCanvasBindingChangeCause(value.cause)) {
+    throw new Error('AGENT_CANVAS_BINDING_CHANGE_EVENT_INVALID')
+  }
+  const binding = value.binding === null ? null : parseAgentCanvasBinding(value.binding)
+  if (binding && (binding.projectId !== value.projectId || binding.sessionId !== value.sessionId)) {
+    throw new Error('AGENT_CANVAS_BINDING_CHANGE_EVENT_INVALID')
+  }
+  return {
+    projectId: value.projectId,
+    sessionId: value.sessionId,
+    cause: value.cause,
+    binding,
+  }
+}
+
+/** 判断值是否为允许跨 IPC 广播的关联变更原因。 */
+function isAgentCanvasBindingChangeCause(value: unknown): value is AgentCanvasBindingChangeCause {
+  return value === 'linked'
+    || value === 'unlinked'
+    || value === 'default-changed'
+    || value === 'session-cleared'
+    || value === 'canvas-cleared'
 }
 
 /** 严格解析一条对话持有的 Canvas 节点引用。 */
