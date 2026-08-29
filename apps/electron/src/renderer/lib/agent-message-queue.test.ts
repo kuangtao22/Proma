@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import type { CanvasNodeReference } from '@proma/shared'
+import { runAgentMessageInvoke } from '../../main/lib/agent-canvas-message-preparation'
+import { CanvasReferenceInvalidError } from '../../main/lib/design/canvas-node-reference-resolver'
+import { unwrapAgentMessageInvokeResult } from '../../preload/agent-message-preload'
 import {
   addCanvasNodeReferences,
   buildQueuedMessageSendPayload,
@@ -54,9 +57,9 @@ describe('Canvas 节点引用队列合同', () => {
     let currentReferences = [canvasReferenceA]
 
     try {
-      const outcome = await submitQueuedMessagePayload(payload, async () => {
-        throw new Error('主进程未接管')
-      })
+      const outcome = await submitQueuedMessagePayload(payload, () => unwrapAgentMessageInvokeResult(
+        runAgentMessageInvoke(async () => { throw new CanvasReferenceInvalidError(new Error('内部读取失败')) }, () => undefined),
+      ))
       if (outcome === 'submitted') {
         currentReferences = removeSentCanvasNodeReferences(currentReferences, [canvasReferenceA])
       }

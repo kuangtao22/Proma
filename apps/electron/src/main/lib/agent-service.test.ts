@@ -16,39 +16,34 @@ describe('Agent service 迁移准入', () => {
     const enqueueEnd = source.indexOf('\n}', enqueueStart) + 2
     const enqueueBody = source.slice(enqueueStart, enqueueEnd)
 
-    expect(runBody).toContain('resolveAgentCanvasReferencesForSend(input, extensions)')
-    expect(runBody).toContain('orchestrator.sendMessage(resolved.input')
-    expect(queueBody).toContain('resolveAgentCanvasReferencesForSend(input)')
-    expect(queueBody).toContain('resolved.references')
-    expect(enqueueBody).not.toContain('resolveAgentCanvasReferencesForSend(')
+    expect(runBody).toContain('prepareAgentRun(input, extensions)')
+    expect(runBody).toContain('runPreparedAgent(prepared, webContents)')
+    expect(queueBody).toContain('prepareAgentRun(input)')
+    expect(queueBody).toContain('queuePreparedAgentMessage(resolved)')
+    expect(enqueueBody).not.toContain('prepareAgentRun(')
   })
 
   test('Given 普通无引用消息 When 检查解析 helper Then 完全绕过 resolver 且不追加 prompt', () => {
-    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
-    const helperStart = source.indexOf('function resolveAgentCanvasReferencesForSend')
+    const source = readFileSync(join(import.meta.dir, 'agent-canvas-message-preparation.ts'), 'utf8')
+    const helperStart = source.indexOf('export function prepareAgentCanvasMessageForSend')
     const helperEnd = source.indexOf('\n\n/**', helperStart)
     const helperBody = source.slice(helperStart, helperEnd)
 
     expect(helperBody).toContain('if (!input.canvasNodeReferences?.length)')
     expect(helperBody).toContain("return { input, extensions, references: undefined }")
     expect(helperBody.indexOf('if (!input.canvasNodeReferences?.length)'))
-      .toBeLessThan(helperBody.indexOf('canvasNodeReferenceResolver.resolveForSend('))
+      .toBeLessThan(helperBody.indexOf('resolver.resolveForSend('))
   })
 
   test('Given 显式引用模式或普通新发送 When 解析 Canvas 引用 Then 只按 mode 选择 exact 或 latest', () => {
-    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
-    const helperStart = source.indexOf('function resolveAgentCanvasReferencesForSend')
+    const source = readFileSync(join(import.meta.dir, 'agent-canvas-message-preparation.ts'), 'utf8')
+    const helperStart = source.indexOf('export function prepareAgentCanvasMessageForSend')
     const helperEnd = source.indexOf('\n\n/**', helperStart)
     const helperBody = source.slice(helperStart, helperEnd)
-    const runStart = source.indexOf('export async function runAgent(')
-    const runEnd = source.indexOf('\n/**', runStart + 1)
-    const runBody = source.slice(runStart, runEnd)
 
     expect(helperBody).toContain("mode: 'canvasNodeReferenceMode' in input")
     expect(helperBody).toContain("input.canvasNodeReferenceMode ?? 'latest'")
     expect(helperBody).not.toContain('retryOfErrorUuid')
-    expect(runBody.indexOf('resolveAgentCanvasReferencesForSend(input, extensions)'))
-      .toBeLessThan(runBody.indexOf('orchestrator.sendMessage('))
   })
 
   test('Given Canvas 专用运行 When 检查 service 入口 Then 复用 renderer runtime 并接受单次工具扩展', () => {
@@ -58,8 +53,8 @@ describe('Agent service 迁移准入', () => {
     const body = source.slice(start, end)
 
     expect(body).toContain('extensions: AgentRunExtensions = {}')
-    expect(body).toContain('resolveAgentCanvasReferencesForSend(input, extensions)')
-    expect(body).toContain('}, resolved.extensions)')
+    expect(body).toContain('prepareAgentRun(input, extensions)')
+    expect(body).toContain('runPreparedAgent(prepared, webContents)')
   })
 
   test('Given 数据根迁移预检 When 检查 service 导出 Then 使用 generation-owned 写查询并提供 workspace 维度能力', () => {
@@ -122,7 +117,7 @@ describe('Agent service 迁移准入', () => {
     /** 读取真实 agent-service 源码约束实际接入。 */
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
     /** 截取 renderer runAgent 入口。 */
-    const start = source.indexOf('export async function runAgent(')
+    const start = source.indexOf('async function runPreparedAgent(')
     const end = source.indexOf('\n/**', start + 1)
     const body = source.slice(start, end)
     /** 生产 guard closure 起始位置。 */
@@ -174,7 +169,7 @@ describe('Agent service 迁移准入', () => {
     /** 读取真实 service，锁定外层 catch 不能发布无归属 completion。 */
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
     /** 只检查 renderer runAgent，避免 headless 合同干扰。 */
-    const start = source.indexOf('export async function runAgent(')
+    const start = source.indexOf('async function runPreparedAgent(')
     const end = source.indexOf('\n/**', start + 1)
     const body = source.slice(start, end)
     /** 外层 catch 是 Orchestrator 准入或发送早期异常的 completion 生产路径。 */
@@ -189,7 +184,7 @@ describe('Agent service 迁移准入', () => {
     /** 读取真实 service，锁定启动事件不能继续只发送 startedAt。 */
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
     /** 只检查 renderer runAgent 的启动 producer。 */
-    const start = source.indexOf('export async function runAgent(')
+    const start = source.indexOf('async function runPreparedAgent(')
     const end = source.indexOf('\n/**', start + 1)
     const body = source.slice(start, end)
 

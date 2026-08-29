@@ -1,3 +1,5 @@
+import type { AgentSubmitOrEnqueueInput, AgentSubmitOrEnqueueResult } from '@proma/shared'
+
 /**
  * Pi runtime 完成 query 与 renderer 收到终态事件之间，可能拒绝对旧通道的消息注入。
  * 这些错误表示消息尚未被接受，应转交 deferred queue，而不是暴露为用户发送失败。
@@ -18,4 +20,32 @@ export function isStaleActiveQueueError(error: unknown): boolean {
     message.includes('无活跃消息通道可注入队列消息') ||
     message.includes('当前会话没有正在运行的 Agent') ||
     message.includes('Agent session is not active')
+}
+
+/** queue-now 原子路由所需的可注入副作用。 */
+export interface AgentSubmitRouteDependencies<TPrepared> {
+  isActive: (sessionId: string) => boolean
+  prepareNow: (input: AgentSubmitOrEnqueueInput) => TPrepared
+  injectPrepared: (prepared: TPrepared) => Promise<void>
+  enqueue: (input: AgentSubmitOrEnqueueInput) => void
+  onStaleActive: (sessionId: string) => void
+}
+
+/** 先完成权威解析，再把 Pi stale-active 与 resolver 拒绝严格分流。 */
+export async function routeAgentSubmitOrEnqueue<TPrepared>(
+  input: AgentSubmitOrEnqueueInput,
+  dependencies: AgentSubmitRouteDependencies<TPrepared>,
+): Promise<AgentSubmitOrEnqueueResult> {
+  if (input.dispatch === 'now' && dependencies.isActive(input.sessionId)) {
+    const prepared = dependencies.prepareNow(input)
+    try {
+      await dependencies.injectPrepared(prepared)
+      return { disposition: 'injected' }
+    } catch (error) {
+      if (!isStaleActiveQueueError(error)) throw error
+      dependencies.onStaleActive(input.sessionId)
+    }
+  }
+  dependencies.enqueue(input)
+  return { disposition: 'queued' }
 }

@@ -34,7 +34,6 @@ import type {
   AgentActiveSessionSnapshot,
   AgentMessage,
   CanvasAgentActiveRunSnapshot,
-  CanvasNodeReference,
 } from '@proma/shared'
 import { PiAgentAdapter } from './adapters/pi-agent-adapter'
 import { PiUtilityAdapter } from './adapters/pi-utility-adapter'
@@ -59,9 +58,12 @@ import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 import { runAgentServiceTerminalEffects } from './agent-run-lifecycle'
 import type { AgentRunExtensions } from './agent-run-extensions'
-import { isStaleActiveQueueError } from './agent-queue-routing'
+import { routeAgentSubmitOrEnqueue } from './agent-queue-routing'
 import { shouldStopBeforeAgentRun } from './agent-stop-policy'
-import { buildCanvasWorkspacePrompt } from './agent-session-context-prompt'
+import {
+  prepareAgentCanvasMessageForSend,
+  type PreparedAgentCanvasMessage,
+} from './agent-canvas-message-preparation'
 import { AgentCanvasBindingStore } from './design/agent-canvas-binding-store'
 import { createCanvasDocumentStore } from './design/canvas-document-store'
 import { createCanvasNodeReferenceResolver } from './design/canvas-node-reference-resolver'
@@ -90,39 +92,12 @@ const canvasNodeReferenceResolver = createCanvasNodeReferenceResolver({
   loadCanvas: (target) => canvasReferenceDocumentStore.load(target),
 })
 
-/** 单次发送前解析引用，并把轻量摘要合并进当前运行扩展。 */
-function resolveAgentCanvasReferencesForSend<T extends AgentSendInput | AgentQueueMessageInput>(
+/** 单次发送前解析引用，并把轻量摘要固化进准备结果。 */
+export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInput>(
   input: T,
   extensions: AgentRunExtensions = {},
-): {
-  input: T
-  extensions: AgentRunExtensions
-  references: CanvasNodeReference[] | undefined
-  canvasWorkspacePrompt?: string
-} {
-  if (!input.canvasNodeReferences?.length) {
-    return { input, extensions, references: undefined }
-  }
-  /** Renderer 快照只作为定位输入，以下结果全部来自发送时权威文档。 */
-  const resolved = canvasNodeReferenceResolver.resolveForSend({
-    sessionId: input.sessionId,
-    mode: 'canvasNodeReferenceMode' in input
-      ? input.canvasNodeReferenceMode ?? 'latest'
-      : 'latest',
-    references: input.canvasNodeReferences,
-  })
-  /** 普通新 run 通过 extensions 进入 system prompt；queue-now 复用同一最小块。 */
-  const canvasWorkspacePrompt = buildCanvasWorkspacePrompt(resolved.promptSummary)
-  /** 保留调用方专用提示词，并把 Canvas 摘要放在同一单次运行边界。 */
-  const systemPromptAppend = [extensions.systemPromptAppend, canvasWorkspacePrompt]
-    .filter((section): section is string => Boolean(section?.trim()))
-    .join('\n\n')
-  return {
-    input: { ...input, canvasNodeReferences: resolved.references } as T,
-    extensions: { ...extensions, systemPromptAppend },
-    references: resolved.references,
-    canvasWorkspacePrompt,
-  }
+): PreparedAgentCanvasMessage<T> {
+  return prepareAgentCanvasMessageForSend(input, extensions, canvasNodeReferenceResolver)
 }
 /** Agent service 与队列写入口共享的工作区迁移守卫。 */
 const workspaceOperationGuard = createWorkspaceOperationGuard({
@@ -221,9 +196,13 @@ function getMainRendererWebContents(): WebContents | null {
 const agentQueueCoordinator = new AgentQueueCoordinator({
   isActive: (sessionId) => orchestrator.isActive(sessionId),
   getWebContents: (sessionId) => streamRoutes.get(sessionId)?.target ?? getMainRendererWebContents(),
-  startRun: (input, webContents) => runAgent(input, webContents),
+  prepareRun: (input) => prepareAgentRun(input),
+  startRun: (prepared, webContents) => runPreparedAgent(prepared, webContents),
   sendStarted: (webContents, status) => {
     if (!webContents.isDestroyed()) webContents.send(AGENT_IPC_CHANNELS.QUEUED_MESSAGE_STATUS, status)
+  },
+  onPrepareError: (input, error) => {
+    console.error(`[Agent Canvas 引用] deferred 消息解析失败: sessionId=${input.sessionId}`, error instanceof Error ? error.cause ?? error : error)
   },
 })
 
@@ -332,6 +311,17 @@ export async function runAgent(
   webContents: WebContents,
   extensions: AgentRunExtensions = {},
 ): Promise<void> {
+  /** 引用解析位于 IPC 接管完成前，失败必须直接拒绝调用方。 */
+  const prepared = prepareAgentRun(input, extensions)
+  return runPreparedAgent(prepared, webContents)
+}
+
+/** 运行已经完成权威 Canvas 引用解析的消息，禁止二次读取文档。 */
+export async function runPreparedAgent(
+  prepared: PreparedAgentCanvasMessage<AgentSendInput>,
+  webContents: WebContents,
+): Promise<void> {
+  const { input, extensions } = prepared
   // deferred queue runs carry their queue id as an internal extension.
   const queueMessageId = (input as Partial<AgentDeferredQueueMessageInput>).queueMessageId
   /** 仅在 Orchestrator 准入后取得 owner，避免被拒绝的重复请求覆盖活跃路由。 */
@@ -341,9 +331,7 @@ export async function runAgent(
     ? streamRoutes.getTargetIfOwner(input.sessionId, route.ownerId)
     : (webContents.isDestroyed() ? undefined : webContents)
   try {
-    /** deferred queue 也只在真正启动时进入此解析边界。 */
-    const resolved = resolveAgentCanvasReferencesForSend(input, extensions)
-    await orchestrator.sendMessage(resolved.input, {
+    await orchestrator.sendMessage(input, {
       onError: (error) => {
         runAgentServiceTerminalEffects([{
           name: 'renderer-error',
@@ -436,7 +424,7 @@ export async function runAgent(
           })
         }
       },
-    }, resolved.extensions)
+    }, extensions)
   } catch (err) {
     console.error('[Agent 服务] runAgent 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'
@@ -519,7 +507,7 @@ export async function runAgentHeadless(
 
   try {
     /** 外部入口携带引用时同样执行普通宿主与项目归属复核。 */
-    const resolved = resolveAgentCanvasReferencesForSend(runInput, extensions)
+    const resolved = prepareAgentRun(runInput, extensions)
     await orchestrator.sendMessage(resolved.input, {
       onError: (error) => {
         runAgentServiceTerminalEffects([
@@ -750,7 +738,14 @@ export async function queueAgentMessage(
   _webContents: WebContents,
 ): Promise<string> {
   /** queue-now 在注入当前 Pi 通道前重新读取权威节点。 */
-  const resolved = resolveAgentCanvasReferencesForSend(input)
+  const resolved = prepareAgentRun(input)
+  return queuePreparedAgentMessage(resolved)
+}
+
+/** 把已经解析的 queue-now 消息注入活跃通道。 */
+async function queuePreparedAgentMessage(
+  resolved: PreparedAgentCanvasMessage<AgentQueueMessageInput>,
+): Promise<string> {
   return orchestrator.queueMessage(
     resolved.input.sessionId,
     resolved.input.userMessage,
@@ -776,36 +771,35 @@ export async function submitOrEnqueueAgentMessage(
   input: AgentSubmitOrEnqueueInput,
   webContents: WebContents,
 ): Promise<AgentSubmitOrEnqueueResult> {
-  registerWebContents(input.sessionId, webContents)
-
-  if (input.dispatch === 'now' && orchestrator.isActive(input.sessionId)) {
-    try {
-      await queueAgentMessage({
-        sessionId: input.sessionId,
-        userMessage: input.userMessage,
-        rawUserMessage: input.rawUserMessage,
-        uuid: input.queueMessageId,
-        interrupt: input.interrupt,
-        mentionedSkills: input.mentionedSkills,
-        mentionedMcpServers: input.mentionedMcpServers,
-        mentionedSessionIds: input.mentionedSessionIds,
-        mentionedTodoIds: input.mentionedTodoIds,
-        mentionedCalendarEventIds: input.mentionedCalendarEventIds,
-        canvasNodeReferences: input.canvasNodeReferences,
-      }, webContents)
-      return { disposition: 'injected' }
-    } catch (error) {
-      // Pi Utility 在 query 结束、renderer 尚未收到 STREAM_COMPLETE 的窗口会拒绝注入。
-      // 该消息尚未被 SDK 接受，安全地降级到主进程队列，而非向用户暴露瞬态错误。
-      if (!isStaleActiveQueueError(error)) throw error
-      console.warn(`[Agent 服务] 活跃通道已结束，转入 deferred queue: sessionId=${input.sessionId}`)
-    }
-  }
-
-  workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
-    agentQueueCoordinator.enqueue(input)
+  return routeAgentSubmitOrEnqueue(input, {
+    isActive: (sessionId) => orchestrator.isActive(sessionId),
+    prepareNow: (candidate) => prepareAgentRun({
+      sessionId: candidate.sessionId,
+      userMessage: candidate.userMessage,
+      rawUserMessage: candidate.rawUserMessage,
+      uuid: candidate.queueMessageId,
+      interrupt: candidate.interrupt,
+      mentionedSkills: candidate.mentionedSkills,
+      mentionedMcpServers: candidate.mentionedMcpServers,
+      mentionedSessionIds: candidate.mentionedSessionIds,
+      mentionedTodoIds: candidate.mentionedTodoIds,
+      mentionedCalendarEventIds: candidate.mentionedCalendarEventIds,
+      canvasNodeReferences: candidate.canvasNodeReferences,
+    }),
+    injectPrepared: async (prepared) => {
+      registerWebContents(input.sessionId, webContents)
+      await queuePreparedAgentMessage(prepared)
+    },
+    enqueue: (candidate) => {
+      workspaceOperationGuard.runSessionWrite(candidate.sessionId, () => {
+        registerWebContents(candidate.sessionId, webContents)
+        agentQueueCoordinator.enqueue(candidate)
+      })
+    },
+    onStaleActive: (sessionId) => {
+      console.warn(`[Agent 服务] 活跃通道已结束，转入 deferred queue: sessionId=${sessionId}`)
+    },
   })
-  return { disposition: 'queued' }
 }
 
 /** 兼容旧调用：仅将消息追加到主进程 deferred queue。 */

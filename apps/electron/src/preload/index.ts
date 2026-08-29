@@ -13,6 +13,7 @@ import { createDesignPreloadApi } from './design-preload'
 import type { DesignPreloadApi } from './design-preload'
 import { createNormalPathManagementPreloadApi } from './path-management-preload'
 import type { NormalPathManagementPreloadApi } from './path-management-preload'
+import { unwrapAgentMessageInvokeResult } from './agent-message-preload'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS } from '../types'
 import type {
   RuntimeStatus,
@@ -1941,7 +1942,7 @@ const electronAPI: ElectronAPI = {
   },
 
   sendAgentMessage: (input: AgentSendInput) => {
-    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SEND_MESSAGE, input)
+    return unwrapAgentMessageInvokeResult<void>(ipcRenderer.invoke(AGENT_IPC_CHANNELS.SEND_MESSAGE, input))
   },
 
   stopAgent: (sessionId: string) => {
@@ -1950,10 +1951,10 @@ const electronAPI: ElectronAPI = {
 
   // Agent 队列消息
   queueAgentMessage: (input: AgentQueueMessageInput) => {
-    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.QUEUE_MESSAGE, input)
+    return unwrapAgentMessageInvokeResult<string>(ipcRenderer.invoke(AGENT_IPC_CHANNELS.QUEUE_MESSAGE, input))
   },
   submitOrEnqueueAgentMessage: (input: AgentSubmitOrEnqueueInput) => {
-    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SUBMIT_OR_ENQUEUE_MESSAGE, input)
+    return unwrapAgentMessageInvokeResult<AgentSubmitOrEnqueueResult>(ipcRenderer.invoke(AGENT_IPC_CHANNELS.SUBMIT_OR_ENQUEUE_MESSAGE, input))
   },
   enqueueAgentQueuedMessage: (input: AgentDeferredQueueMessageInput) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.ENQUEUE_QUEUED_MESSAGE, input)

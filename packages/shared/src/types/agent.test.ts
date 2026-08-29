@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { parseCanvasNodeReferences } from './canvas'
+import { CANVAS_NODE_REFERENCE_MAX_COUNT, parseCanvasNodeReferences } from './canvas'
 import type { CanvasNodeReference } from './canvas'
 import type {
   AgentDeferredQueueMessageInput,
@@ -62,6 +62,15 @@ describe('Agent Canvas 节点引用合同', () => {
     expect(() => parseCanvasNodeReferences([
       { ...canvasNodeReference, unknown: true },
     ])).toThrow()
+  })
+
+  test('Given Canvas 引用超过公开上限 When 解析 Then 在进入主进程 I/O 前拒绝', () => {
+    const references = Array.from({ length: CANVAS_NODE_REFERENCE_MAX_COUNT + 1 }, (_, index) => ({
+      ...canvasNodeReference,
+      nodeId: `node-${index}`,
+    }))
+
+    expect(() => parseCanvasNodeReferences(references)).toThrow('CANVAS_NODE_REFERENCES_INVALID')
   })
 
   test('Given 普通无引用输入 When 构造合同 Then 保持向后兼容', () => {

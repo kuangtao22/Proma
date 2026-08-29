@@ -20,6 +20,12 @@ type InternalSessionFields = Pick<
   | 'delegationGoal'
 >
 
+/** 项目画布可关联的普通 Agent 额外需要的生命周期字段。 */
+type ProjectAgentEligibilityFields = InternalSessionFields & Pick<
+  AgentSessionMeta,
+  'archived' | 'explorationParentSessionId'
+>
+
 /** Canvas 内部会话必须排除的其它来源与协作字段。 */
 const CANVAS_EXCLUSIVE_OWNERSHIP_FIELDS = [
   'sourceDesignProjectId',
@@ -125,6 +131,22 @@ export function hasValidCanvasAgentOwnership(session: InternalSessionFields): bo
  */
 export function isAgentSessionUserVisible(session: InternalSessionFields): boolean {
   return !isInternalDesignSession(session) && !hasAnyCanvasSourceField(session)
+}
+
+/** 判断会话是否为目标项目可持有 Canvas 关联的普通顶层 Agent。 */
+export function isEligibleProjectAgent(session: ProjectAgentEligibilityFields, projectId: string): boolean {
+  return isAgentSessionUserVisible(session)
+    && session.workspaceId === projectId
+    && !session.archived
+    && session.explorationParentSessionId === undefined
+    && session.sourceAutomationId === undefined
+    && session.parentSessionId === undefined
+    && session.rootSessionId === undefined
+    && session.sourceDelegationId === undefined
+    && session.delegationRole === undefined
+    && session.delegationStatus === undefined
+    && session.delegationDepth === undefined
+    && session.delegationGoal === undefined
 }
 
 /**

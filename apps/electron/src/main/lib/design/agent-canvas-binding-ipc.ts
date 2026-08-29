@@ -21,7 +21,7 @@ import type {
   CanvasSessionMeta,
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
-import { isAgentSessionUserVisible, requireUserVisibleAgentSession } from '../agent-session-visibility'
+import { isEligibleProjectAgent, requireUserVisibleAgentSession } from '../agent-session-visibility'
 import type { AgentCanvasBindingStore } from './agent-canvas-binding-store'
 
 /** Agent-Canvas 关联 IPC handler 的最小签名。 */
@@ -100,22 +100,6 @@ function requireProjectAgent(
   const session = requireUserVisibleAgentSession(options.getAgentSession(sessionId) ?? undefined)
   if (!isEligibleProjectAgent(session, projectId)) throw new Error('Agent 会话不是目标项目普通顶层会话')
   return session
-}
-
-/** 判断会话是否为目标项目可持有关联的普通顶层 Agent。 */
-export function isEligibleProjectAgent(session: AgentSessionMeta, projectId: string): boolean {
-  return isAgentSessionUserVisible(session)
-    && session.workspaceId === projectId
-    && !session.archived
-    && session.explorationParentSessionId === undefined
-    && session.sourceAutomationId === undefined
-    && session.parentSessionId === undefined
-    && session.rootSessionId === undefined
-    && session.sourceDelegationId === undefined
-    && session.delegationRole === undefined
-    && session.delegationStatus === undefined
-    && session.delegationDepth === undefined
-    && session.delegationGoal === undefined
 }
 
 /** 清理关联及广播所需的最小生命周期依赖。 */

@@ -5,16 +5,22 @@ import type {
   AgentQueuedMessageControlInput,
   AgentQueuedMessageStatus,
 } from '@proma/shared'
+import type { PreparedAgentCanvasMessage } from './agent-canvas-message-preparation'
 
 interface QueueEntry {
   input: AgentDeferredQueueMessageInput
 }
 
+/** deferred 在发布 started 前完成的权威运行准备结果。 */
+export type PreparedAgentQueueRun = PreparedAgentCanvasMessage<AgentDeferredQueueMessageInput>
+
 export interface AgentQueueCoordinatorOptions {
   isActive: (sessionId: string) => boolean
   getWebContents: (sessionId: string) => WebContents | null
-  startRun: (input: AgentDeferredQueueMessageInput, webContents: WebContents) => Promise<void>
+  prepareRun: (input: AgentDeferredQueueMessageInput) => PreparedAgentQueueRun
+  startRun: (prepared: PreparedAgentQueueRun, webContents: WebContents) => Promise<void>
   sendStarted: (webContents: WebContents, status: AgentQueuedMessageStatus) => void
+  onPrepareError: (input: AgentDeferredQueueMessageInput, error: unknown) => void
 }
 
 /** 主进程持有 deferred queue；renderer 只保留展示投影。 */
@@ -89,20 +95,24 @@ export class AgentQueueCoordinator {
   private tryDispatch(sessionId: string): void {
     if (this.dispatching.has(sessionId) || this.options.isActive(sessionId)) return
     const queue = this.queues.get(sessionId)
-    const entry = queue?.shift()
+    const entry = queue?.[0]
     if (!entry) return
-    if (queue?.length === 0) this.queues.delete(sessionId)
-
     const messageId = entry.input.queueMessageId
-    this.dispatching.set(sessionId, messageId)
     const webContents = this.options.getWebContents(sessionId)
     if (!webContents || webContents.isDestroyed()) {
-      queue?.unshift(entry)
-      if (queue) this.queues.set(sessionId, queue)
-      this.dispatching.delete(sessionId)
       return
     }
     const startedAt = Date.now()
+    let prepared: PreparedAgentQueueRun
+    try {
+      prepared = this.options.prepareRun({ ...entry.input, startedAt, userMessageUuid: messageId })
+    } catch (error) {
+      this.options.onPrepareError(entry.input, error)
+      return
+    }
+    queue?.shift()
+    if (queue?.length === 0) this.queues.delete(sessionId)
+    this.dispatching.set(sessionId, messageId)
     this.options.sendStarted(webContents, {
         sessionId,
         messageId,
@@ -111,7 +121,7 @@ export class AgentQueueCoordinator {
         rawUserMessage: entry.input.rawUserMessage,
         startedAt,
     })
-    void this.options.startRun({ ...entry.input, startedAt, userMessageUuid: messageId }, webContents)
+    void this.options.startRun(prepared, webContents)
       .finally(() => {
         if (this.dispatching.get(sessionId) === messageId) this.dispatching.delete(sessionId)
       })

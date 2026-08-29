@@ -1304,6 +1304,20 @@ export interface AgentSubmitOrEnqueueResult {
   disposition: 'injected' | 'queued'
 }
 
+/** Agent 消息接管阶段允许跨 IPC 暴露的稳定错误码。 */
+export type AgentMessagePublicErrorCode = 'CANVAS_REFERENCE_INVALID'
+
+/** Agent 消息接管失败的安全公开错误。 */
+export interface AgentMessagePublicError {
+  code: AgentMessagePublicErrorCode
+  message: string
+}
+
+/** Agent 消息 IPC 使用的结构化接管结果。 */
+export type AgentMessageInvokeResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: AgentMessagePublicError }
+
 /** 流式追加消息的输入参数（Agent 流式中发送新消息） */
 export interface AgentQueueMessageInput {
   /** 会话 ID */

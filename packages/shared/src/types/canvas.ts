@@ -964,9 +964,14 @@ export function parseCanvasNodeReference(value: unknown): CanvasNodeReference {
   }
 }
 
+/** 单条 Agent 消息允许携带的 Canvas 节点引用数量上限。 */
+export const CANVAS_NODE_REFERENCE_MAX_COUNT = 32
+
 /** 严格解析 Canvas 节点引用数组。 */
 export function parseCanvasNodeReferences(value: unknown): CanvasNodeReference[] {
-  if (!Array.isArray(value)) throw new Error('CANVAS_NODE_REFERENCES_INVALID')
+  if (!Array.isArray(value) || value.length > CANVAS_NODE_REFERENCE_MAX_COUNT) {
+    throw new Error('CANVAS_NODE_REFERENCES_INVALID')
+  }
   return value.map(parseCanvasNodeReference)
 }
 

@@ -12,11 +12,11 @@ import type {
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { writeJsonFileAtomicSecure } from '../safe-file'
+import { isEligibleProjectAgent } from '../agent-session-visibility'
 import { AgentCanvasBindingStore } from './agent-canvas-binding-store'
 import {
   cleanupDeletedAgentSessionCanvasBindings,
   cleanupDeletedCanvasBindings,
-  isEligibleProjectAgent,
   registerAgentCanvasBindingIpcHandlers,
 } from './agent-canvas-binding-ipc'
 
