@@ -22,7 +22,7 @@ import Markdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import { CalendarDays, ChevronDown, ChevronUp, Paperclip, FileText, ListTodo, Sparkles, Server, Download, MessageSquareText, Quote } from 'lucide-react'
+import { CalendarDays, ChevronDown, ChevronUp, Paperclip, FileText, ListTodo, Sparkles, Server, Download, MessageSquareText, Quote, Workflow, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { shouldInspectMermaidCodeBlock, shouldRenderMermaidCodeBlock } from '@/lib/mermaid-detection'
 import { normalizeLatexDelimiters } from '@/lib/normalize-latex'
@@ -44,7 +44,7 @@ import { buildAgentHistoryQuoteLabel, parseAgentHistoryQuoteMention } from '@/li
 import { createMentionPattern } from '@/lib/mention-patterns'
 import { useAgentBrowserLink } from '@/components/browser/AgentBrowserLinkProvider'
 import type { HTMLAttributes, ComponentProps, ReactNode } from 'react'
-import type { FileAttachment } from '@proma/shared'
+import type { CanvasNodeKind, CanvasNodeReference, FileAttachment, SDKUserMessage } from '@proma/shared'
 import type { QuotedSelection } from '@/atoms/preview-atoms'
 
 // ===== Message 根容器 =====
@@ -285,6 +285,73 @@ function safeDecode(raw: string): string {
  */
 const BasePathsContext = React.createContext<string[] | undefined>(undefined)
 const AgentHistoryQuoteClickContext = React.createContext<((quote: QuotedSelection) => void) | undefined>(undefined)
+
+/** Canvas 节点类型在 composer 与历史消息中的友好名称。 */
+const CANVAS_NODE_REFERENCE_TYPE_LABELS: Record<CanvasNodeKind, string> = {
+  agent: 'Agent',
+  image: '生图',
+  document: '文档',
+  webview: '原型',
+}
+
+/** Canvas 节点引用 chip 列表输入。 */
+export interface CanvasNodeReferenceChipsProps {
+  references: readonly CanvasNodeReference[]
+  /** 仅从 Renderer metadata 返回友好标题；缺失时组件统一显示“画布”。 */
+  getCanvasTitle?: (reference: CanvasNodeReference) => string | undefined
+  /** composer 提供移除回调；历史消息省略后保持只读。 */
+  onRemove?: (reference: CanvasNodeReference) => void
+  className?: string
+}
+
+/** 渲染结构化 Canvas 引用，不伪装为文件 mention，也不回查当前节点内容。 */
+export function CanvasNodeReferenceChips({
+  references,
+  getCanvasTitle,
+  onRemove,
+  className,
+}: CanvasNodeReferenceChipsProps): React.ReactElement | null {
+  if (references.length === 0) return null
+  return (
+    <div className={cn('flex flex-wrap gap-1.5', className)} data-canvas-node-references>
+      {references.map((reference) => {
+        /** 展示层永不回退内部 canvasId，metadata 缺失时只显示通用名称。 */
+        const canvasTitle = getCanvasTitle?.(reference)?.trim() || '画布'
+        /** 发送时快照的标题与 revision 始终直接展示，不读取当前 Canvas。 */
+        const typeLabel = CANVAS_NODE_REFERENCE_TYPE_LABELS[reference.nodeType]
+        return (
+          <span
+            key={`${reference.canvasId}:${reference.nodeId}`}
+            className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border/70 bg-muted/60 px-2 py-1 text-xs text-foreground"
+          >
+            <Workflow className="size-3.5 shrink-0 text-primary" aria-hidden="true" />
+            <span className="shrink-0 text-muted-foreground">{typeLabel}</span>
+            <span className="max-w-48 truncate font-medium">{reference.title}</span>
+            <span className="max-w-32 truncate text-muted-foreground">{canvasTitle}</span>
+            <span className="shrink-0 text-muted-foreground">版本 {reference.nodeRevision}</span>
+            {onRemove ? (
+              <TooltipProvider disableHoverableContent>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label={`移除${reference.title}引用`}
+                      className="ml-0.5 flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      onClick={() => onRemove(reference)}
+                    >
+                      <X className="size-3" aria-hidden="true" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>移除引用</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            ) : null}
+          </span>
+        )
+      })}
+    </div>
+  )
+}
 
 /** 提供附加目录候选给所有内嵌的 MessageResponse。 */
 export function BasePathsProvider({ basePaths, children }: { basePaths?: string[]; children: React.ReactNode }): React.ReactElement {
@@ -747,6 +814,10 @@ const USER_REMARK_PLUGINS: RemarkPluginFn[] = [remarkMentions, remarkPreserveBre
 interface UserMessageContentProps extends HTMLAttributes<HTMLDivElement> {
   children: string
   onAgentHistoryQuoteClick?: (quote: QuotedSelection) => void
+  /** 用户发送时持久化的 Canvas 节点引用快照。 */
+  canvasNodeReferences?: readonly CanvasNodeReference[]
+  /** SDK 用户消息原始公开元数据；历史渲染直接读取发送时快照。 */
+  sdkUserMessage?: Pick<SDKUserMessage, '_canvasNodeReferences'>
 }
 
 /**
@@ -755,7 +826,7 @@ interface UserMessageContentProps extends HTMLAttributes<HTMLDivElement> {
  * - 点击展开/收起，底部使用低对比度文字提示
  */
 export const UserMessageContent = React.memo(
-  function UserMessageContent({ children, onAgentHistoryQuoteClick, className, ...props }: UserMessageContentProps): React.ReactElement {
+  function UserMessageContent({ children, onAgentHistoryQuoteClick, canvasNodeReferences, sdkUserMessage, className, ...props }: UserMessageContentProps): React.ReactElement {
     const [isExpanded, setIsExpanded] = React.useState(false)
     const [shouldCollapse, setShouldCollapse] = React.useState(false)
     const contentRef = React.useRef<HTMLDivElement>(null)
@@ -778,6 +849,10 @@ export const UserMessageContent = React.memo(
 
     return (
       <div className={cn('relative inline-block max-w-full rounded-[10px] bg-primary/10 px-3.5 py-2.5', className)} {...props}>
+        <CanvasNodeReferenceChips
+          references={canvasNodeReferences ?? sdkUserMessage?._canvasNodeReferences ?? []}
+          className="mb-2"
+        />
         <div
           ref={contentRef}
           className={cn(
@@ -818,6 +893,8 @@ export const UserMessageContent = React.memo(
   (prevProps, nextProps) =>
     prevProps.children === nextProps.children
       && prevProps.onAgentHistoryQuoteClick === nextProps.onAgentHistoryQuoteClick
+      && prevProps.canvasNodeReferences === nextProps.canvasNodeReferences
+      && prevProps.sdkUserMessage === nextProps.sdkUserMessage
 )
 
 // ===== MessageLoading 加载动画 =====

@@ -100,6 +100,7 @@ export interface NativeCanvasProjectionOptions {
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
   canCreateChild: boolean
   onCreateChild: (nodeId: string, kind: CanvasNodeKind) => void
+  onReferenceNode?: (nodeId: string) => void
   onWorkbenchNodeChange: (nodeId: string) => void
 }
 
@@ -324,6 +325,7 @@ export function toNativeCanvasFlowNodes(
         onOpenWorkbench: options.onWorkbenchNodeChange,
         canCreateChild,
         ...(canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
+        ...(options.onReferenceNode ? { onReferenceNode: options.onReferenceNode } : {}),
       }
       return { ...base, type: 'canvasAgent', data }
     }
@@ -348,6 +350,7 @@ export function toNativeCanvasFlowNodes(
           onOpenWorkbench: options.onWorkbenchNodeChange,
           canCreateChild: options.canCreateChild,
           ...(options.canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
+          ...(options.onReferenceNode ? { onReferenceNode: options.onReferenceNode } : {}),
         },
       }
     }
@@ -367,6 +370,7 @@ export function toNativeCanvasFlowNodes(
           onOpenWorkbench: options.onWorkbenchNodeChange,
           canCreateChild: options.canCreateChild,
           ...(options.canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
+          ...(options.onReferenceNode ? { onReferenceNode: options.onReferenceNode } : {}),
         },
       }
     }
@@ -385,6 +389,7 @@ export function toNativeCanvasFlowNodes(
         onOpenWorkbench: options.onWorkbenchNodeChange,
         canCreateChild: options.canCreateChild,
         ...(options.canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
+        ...(options.onReferenceNode ? { onReferenceNode: options.onReferenceNode } : {}),
       },
     }
   })

@@ -7,6 +7,7 @@ import {
   Hand,
   Monitor,
   MousePointer2,
+  MessageSquareQuote,
   Plus,
   Trash2,
   TriangleAlert,
@@ -50,10 +51,13 @@ export interface NativeCanvasToolbarProps {
   /** 保存或创建在途时可单独禁用添加，不影响其它工具。 */
   canAdd?: boolean
   canDelete: boolean
+  /** 只有当前权威选区至少两个节点时展示批量引用。 */
+  canReferenceSelection?: boolean
   issueCount: number
   onToolChange: (tool: 'select' | 'pan') => void
   onAddNode: (kind: CanvasNodeKind) => void
   onDelete: () => void
+  onReferenceSelection?: () => void
   onFocusFirstIssue: () => void
 }
 
@@ -111,10 +115,12 @@ export function NativeCanvasToolbar({
   writable,
   canAdd = writable,
   canDelete,
+  canReferenceSelection = false,
   issueCount,
   onToolChange,
   onAddNode,
   onDelete,
+  onReferenceSelection,
   onFocusFirstIssue,
 }: NativeCanvasToolbarProps): React.ReactElement {
   return (
@@ -140,6 +146,25 @@ export function NativeCanvasToolbar({
           </TooltipTrigger>
           <TooltipContent side="bottom">选择</TooltipContent>
         </Tooltip>
+
+        {canReferenceSelection && onReferenceSelection ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-8 min-w-0 gap-1.5 px-2 text-xs"
+                aria-label="引用选中节点"
+                onClick={onReferenceSelection}
+              >
+                <MessageSquareQuote className="shrink-0" aria-hidden="true" />
+                <span className="truncate">引用选中节点</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">引用选中节点</TooltipContent>
+          </Tooltip>
+        ) : null}
         <Tooltip>
           <TooltipTrigger asChild>
             <Button

@@ -1052,7 +1052,10 @@ function UserInputMessage({ message, onAgentHistoryQuoteClick }: {
           </div>
         )}
         {text && (
-          <UserMessageContent onAgentHistoryQuoteClick={onAgentHistoryQuoteClick}>
+          <UserMessageContent
+            onAgentHistoryQuoteClick={onAgentHistoryQuoteClick}
+            sdkUserMessage={message}
+          >
             {text}
           </UserMessageContent>
         )}

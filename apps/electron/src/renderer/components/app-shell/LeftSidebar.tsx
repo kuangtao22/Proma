@@ -62,6 +62,7 @@ import {
   liveMessagesMapAtom,
   agentSessionPendingFilesAtom,
   agentSessionPendingMentionsAtom,
+  agentSessionCanvasNodeReferencesAtom,
   agentSessionStreamingStateAtomFamily,
   agentSessionViewStreamStateAtomFamily,
   agentSessionInputStreamStateAtomFamily,
@@ -70,6 +71,7 @@ import {
   agentSessionDraftHtmlAtomFamily,
   agentPendingFilesAtomFamily,
   agentPendingMentionsAtomFamily,
+  agentCanvasNodeReferencesAtomFamily,
   sessionPersistedPermissionModeAtom,
   sessionExistsAtom,
   automationGroupOrderAtom,
@@ -897,6 +899,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
   const setLiveMessagesMap = useSetAtom(liveMessagesMapAtom)
   const setSessionPendingFiles = useSetAtom(agentSessionPendingFilesAtom)
   const setSessionPendingMentions = useSetAtom(agentSessionPendingMentionsAtom)
+  const setSessionCanvasNodeReferences = useSetAtom(agentSessionCanvasNodeReferencesAtom)
   const setSessionViewStateMap = useSetAtom(sessionViewStateMapAtom)
 
   /** 清理 per-conversation/session Map atoms 条目 */
@@ -974,6 +977,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     setStreamingStates(deleteKey)
     setLiveMessagesMap(deleteKey)
     setSessionPendingMentions(deleteKey)
+    setSessionCanvasNodeReferences(deleteKey)
 
     // 待发送附件：先释放 blob URL 和 window 缓存中的 base64，再删 base map entry。
     // 与文字草稿不同，附件涉及 ObjectURL 和大体积二进制数据，删除/归档时不保留。
@@ -996,12 +1000,13 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     agentSessionDraftHtmlAtomFamily.remove(id)
     agentPendingFilesAtomFamily.remove(id)
     agentPendingMentionsAtomFamily.remove(id)
+    agentCanvasNodeReferencesAtomFamily.remove(id)
     agentSidePanelOpenAtomFamily.remove(id)
     sessionPersistedPermissionModeAtom.remove(id)
     sessionExistsAtom.remove(id)
 
     clearPreviewCacheForSession(id)
-  }, [setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setPreviewFiles, setPreviewContentRefreshVersion, setPreviewResolvedPaths, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles, setNonGitFileChanges, setFileChangesCurrentRun, setDiffData, setAgentSidePanelOpenMap, setSessionChannelMap, setSessionModelMap, setSessionPathMap, setSessionViewStateMap, setStreamingStates, setLiveMessagesMap, setSessionPendingFiles, setSessionPendingMentions, store])
+  }, [setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setPreviewFiles, setPreviewContentRefreshVersion, setPreviewResolvedPaths, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles, setNonGitFileChanges, setFileChangesCurrentRun, setDiffData, setAgentSidePanelOpenMap, setSessionChannelMap, setSessionModelMap, setSessionPathMap, setSessionViewStateMap, setStreamingStates, setLiveMessagesMap, setSessionPendingFiles, setSessionPendingMentions, setSessionCanvasNodeReferences, store])
 
   const currentWorkspaceSlug = React.useMemo(() => {
     if (!currentWorkspaceId) return null

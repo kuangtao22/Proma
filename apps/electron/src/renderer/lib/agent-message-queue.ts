@@ -1,5 +1,6 @@
 import type { AgentStreamState } from '@/atoms/agent-atoms'
 import type { QuotedSelection } from '@/atoms/preview-atoms'
+import type { CanvasNodeReference } from '@proma/shared'
 import {
   buildAgentHistoryQuoteLabel,
   expandAgentHistoryQuoteMentions,
@@ -24,6 +25,73 @@ export interface AgentQueuedMessage {
   fileReferenceBlock?: string
   attachments?: AgentQueuedAttachment[]
   additionalDirectories?: string[]
+  /** 发送时使用的 Canvas 节点公开快照。 */
+  canvasNodeReferences?: CanvasNodeReference[]
+}
+
+/** 生成 Canvas 引用的稳定去重键；项目归属由引用合同继续完整保留。 */
+function createCanvasNodeReferenceKey(reference: CanvasNodeReference): string {
+  return `${reference.canvasId}\u0000${reference.nodeId}`
+}
+
+/**
+ * 把新 Canvas 节点引用追加到已有引用，按 canvasId + nodeId 去重并保留首次出现顺序。
+ * @param current composer 或队列已有引用。
+ * @param additions 本次从权威 Canvas 快照生成的引用。
+ * @returns 新的去重数组；不会修改正文或输入数组。
+ */
+export function addCanvasNodeReferences(
+  current: readonly CanvasNodeReference[],
+  additions: readonly CanvasNodeReference[],
+): CanvasNodeReference[] {
+  /** 首次出现的引用决定展示与发送顺序。 */
+  const seen = new Set<string>()
+  /** 输出使用完整 shared 快照，不降级为仅 ID。 */
+  const references: CanvasNodeReference[] = []
+  for (const reference of [...current, ...additions]) {
+    /** 同一画布同一节点只保留首次出现版本。 */
+    const key = createCanvasNodeReferenceKey(reference)
+    if (seen.has(key)) continue
+    seen.add(key)
+    references.push(reference)
+  }
+  return references
+}
+
+/** 从引用数组删除指定画布节点，供 composer chip 与并发发送清理复用。 */
+export function removeCanvasNodeReference(
+  references: readonly CanvasNodeReference[],
+  target: Pick<CanvasNodeReference, 'canvasId' | 'nodeId'>,
+): CanvasNodeReference[] {
+  /** 删除只比较稳定身份，保留其它节点首次出现顺序。 */
+  const targetKey = `${target.canvasId}\u0000${target.nodeId}`
+  return references.filter((reference) => createCanvasNodeReferenceKey(reference) !== targetKey)
+}
+
+/** 判断 composer 当前引用是否仍与一次发送捕获的完整快照一致。 */
+function isSameCanvasNodeReference(
+  current: CanvasNodeReference,
+  sent: CanvasNodeReference,
+): boolean {
+  return current.projectId === sent.projectId
+    && current.canvasId === sent.canvasId
+    && current.nodeId === sent.nodeId
+    && current.nodeType === sent.nodeType
+    && current.nodeRevision === sent.nodeRevision
+    && current.title === sent.title
+}
+
+/**
+ * 正式发送或入队后只清除本次捕获且仍未变化的引用。
+ * 用户在异步请求期间重新引用的新 revision 会被保留。
+ */
+export function removeSentCanvasNodeReferences(
+  current: readonly CanvasNodeReference[],
+  sent: readonly CanvasNodeReference[],
+): CanvasNodeReference[] {
+  return current.filter((reference) => !sent.some((sentReference) => (
+    isSameCanvasNodeReference(reference, sentReference)
+  )))
 }
 
 /**
@@ -57,6 +125,7 @@ export function createAgentQueuedMessage(
     fileReferenceBlock?: string
     attachments?: AgentQueuedAttachment[]
     additionalDirectories?: string[]
+    canvasNodeReferences?: CanvasNodeReference[]
   },
 ): AgentQueuedMessage {
   const message: AgentQueuedMessage = {
@@ -68,6 +137,9 @@ export function createAgentQueuedMessage(
   if (options?.fileReferenceBlock) message.fileReferenceBlock = options.fileReferenceBlock
   if (options?.attachments && options.attachments.length > 0) message.attachments = options.attachments
   if (options?.additionalDirectories && options.additionalDirectories.length > 0) message.additionalDirectories = options.additionalDirectories
+  if (options?.canvasNodeReferences && options.canvasNodeReferences.length > 0) {
+    message.canvasNodeReferences = [...options.canvasNodeReferences]
+  }
   return message
 }
 
@@ -98,6 +170,25 @@ export function restoreQueuedMessageToFront(
 ): AgentQueuedMessage[] {
   if (queue.some((item) => item.id === message.id)) return queue
   return [message, ...queue]
+}
+
+/**
+ * 将失败消息正文恢复到当前草稿末尾，不覆盖请求期间的新输入，也不重复相同正文。
+ * @param currentDraft 失败回调发生时当前 session 的最新草稿。
+ * @param restoredMessage 本次失败发送需要恢复的原正文。
+ * @returns 同时保留新旧内容的 composer 文本。
+ */
+export function mergeAgentDraftWithRestoredMessage(
+  currentDraft: string,
+  restoredMessage: string,
+): string {
+  /** 恢复只使用规范化边界，正文内部内容保持原样。 */
+  const current = currentDraft.trim()
+  /** 空消息不改变用户当前草稿。 */
+  const restored = restoredMessage.trim()
+  if (!restored || current === restored) return current
+  if (!current) return restored
+  return `${current}\n\n${restored}`
 }
 
 export function moveQueuedMessage(
@@ -136,6 +227,7 @@ export interface QueuedMessageSendPayload {
   rawText: string
   sdkText: string
   mentions: ParsedQueuedMessageMentions
+  canvasNodeReferences?: CanvasNodeReference[]
 }
 
 /** 队列预览专用片段：保留原始消息用于发送，同时把引用协议渲染为可读芯片。 */
@@ -354,9 +446,13 @@ export function buildQueuedMessageSendPayload(
     ? `${contextBlocks.join('\n\n')}\n\n`
     : ''
 
-  return {
+  const payload: QueuedMessageSendPayload = {
     rawText: `${prefix}${expandAgentHistoryQuoteMentions(text)}`.trim(),
     sdkText: `${prefix}${expandAgentHistoryQuoteMentions(mentions.cleanedText)}`.trim(),
     mentions,
   }
+  if (message.canvasNodeReferences && message.canvasNodeReferences.length > 0) {
+    payload.canvasNodeReferences = [...message.canvasNodeReferences]
+  }
+  return payload
 }

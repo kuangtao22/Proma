@@ -8,6 +8,7 @@ import {
   type AgentQueuedMessage,
   type QueueDropPlacement,
 } from '@/lib/agent-message-queue'
+import { CanvasNodeReferenceChips } from '@/components/ai-elements/message'
 
 interface AgentMessageQueueProps {
   items: AgentQueuedMessage[]
@@ -113,6 +114,12 @@ export function AgentMessageQueue({
               {isDropAfter && <div className="absolute left-2 right-2 bottom-0 h-0.5 rounded-full bg-primary" />}
               <GripVertical className="size-4 shrink-0 cursor-grab text-muted-foreground/55 active:cursor-grabbing" />
               <div className="min-w-0 flex-1 text-[13px] leading-5 text-foreground/80">
+                {item.canvasNodeReferences && item.canvasNodeReferences.length > 0 ? (
+                  <CanvasNodeReferenceChips
+                    references={item.canvasNodeReferences}
+                    className="mb-1"
+                  />
+                ) : null}
                 {item.quotedSelection && (
                   <div className="mb-0.5 flex min-w-0 items-center gap-1 text-[11px] leading-4 text-muted-foreground">
                     <Quote className="size-3 shrink-0" />

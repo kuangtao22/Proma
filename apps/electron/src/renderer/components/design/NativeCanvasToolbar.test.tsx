@@ -15,10 +15,12 @@ function createToolbarProps(): React.ComponentProps<typeof NativeCanvasToolbar> 
     activeTool: 'select',
     writable: true,
     canDelete: true,
+    canReferenceSelection: false,
     issueCount: 0,
     onToolChange: () => undefined,
     onAddNode: () => undefined,
     onDelete: () => undefined,
+    onReferenceSelection: () => undefined,
     onFocusFirstIssue: () => undefined,
   }
 }
@@ -126,6 +128,15 @@ describe('原生 Canvas 顶部工具栏', () => {
 
     expect(html).toContain('2 个节点需要处理')
     expect(html).toContain('aria-label="聚焦首个问题节点"')
+  })
+
+  test('Given 多选节点 When 渲染工具栏 Then 提供引用选中节点动作', () => {
+    const html = renderToStaticMarkup(
+      <NativeCanvasToolbar {...createToolbarProps()} canReferenceSelection />,
+    )
+
+    expect(html).toContain('aria-label="引用选中节点"')
+    expect(html).toContain('引用选中节点')
   })
 
   test.each([

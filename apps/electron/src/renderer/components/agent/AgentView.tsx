@@ -32,6 +32,7 @@ import { ModelSelector } from '@/components/chat/ModelSelector'
 import { AttachmentPreviewItem } from '@/components/chat/AttachmentPreviewItem'
 import { QuotedSelectionChip } from '@/components/diff/QuotedSelectionChip'
 import { RichTextInput, type RichTextInputHandle } from '@/components/ai-elements/rich-text-input'
+import { CanvasNodeReferenceChips } from '@/components/ai-elements/message'
 import { SpeechButton } from '@/components/ai-elements/speech-button'
 import type { ToolbarItem } from '@/components/ai-elements/InputToolbarOverflow'
 import {
@@ -82,6 +83,7 @@ import {
   agentPendingPromptAtom,
   agentPendingFilesAtomFamily,
   agentPendingMentionsAtomFamily,
+  agentCanvasNodeReferencesAtomFamily,
   agentAckPendingMentionsAtom,
   agentMessageQueueAtomFamily,
   agentWorkspacesAtom,
@@ -123,7 +125,7 @@ import { settingsOpenAtom } from '@/atoms/settings-tab'
 import { deliverPendingMentionsToComposer } from '@/lib/design-session-actions'
 import { shouldOfferDesignHandoff } from '@/lib/agent-design-intent'
 import { activeViewAtom } from '@/atoms/active-view'
-import { activeCanvasSelectionAtom } from '@/atoms/canvas-session-atoms'
+import { activeCanvasSelectionAtom, canvasSessionsByProjectAtom } from '@/atoms/canvas-session-atoms'
 import { updateDesignProjectStateAtom } from '@/atoms/design-atoms'
 import { longTextPasteAsAttachmentEnabledAtom } from '@/atoms/ui-preferences'
 import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
@@ -132,7 +134,7 @@ import { useOpenSession } from '@/hooks/useOpenSession'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { useOpenPreview } from '@/components/diff/preview-opener'
-import type { AgentDeferredQueueMessageInput, AgentSendInput, AgentPendingFile, AgentThinkingLevel, FileDialogLargeFile, FileDialogResult, ModelOption, ReasoningCapability, SDKMessage, SDKUserMessage } from '@proma/shared'
+import type { AgentDeferredQueueMessageInput, AgentSendInput, AgentPendingFile, AgentThinkingLevel, CanvasNodeReference, FileDialogLargeFile, FileDialogResult, ModelOption, ReasoningCapability, SDKMessage, SDKUserMessage } from '@proma/shared'
 import { inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedModel, LEGACY_DESIGN_CANVAS_ID, MAX_ATTACHMENT_SIZE, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningCapability, resolveReasoningProfile } from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
 import { getFilePanelDragData, INSERT_FILE_MENTION_EVENT, type FilePanelDragItem } from '@/lib/file-panel-drag'
@@ -143,10 +145,14 @@ import {
   buildQueuedMessageSendPayload,
   createAgentQueuedMessage,
   moveQueuedMessage,
+  mergeAgentDraftWithRestoredMessage,
   parseQueuedMessageMentions,
   queuedTextToParagraphHtml,
   removeQueuedMessage,
   restoreQueuedMessageToFront,
+  addCanvasNodeReferences,
+  removeCanvasNodeReference,
+  removeSentCanvasNodeReferences,
 } from '@/lib/agent-message-queue'
 import type { AgentQueuedAttachment, AgentQueuedMessage, QueueDropPlacement } from '@/lib/agent-message-queue'
 
@@ -236,7 +242,12 @@ const AgentScopedRichTextInput = React.forwardRef<RichTextInputHandle, AgentScop
   },
 )
 
-function createUserSDKMessage(text: string, uuid?: string, createdAt = Date.now()): SDKMessage {
+function createUserSDKMessage(
+  text: string,
+  uuid?: string,
+  createdAt = Date.now(),
+  canvasNodeReferences?: readonly CanvasNodeReference[],
+): SDKMessage {
   const message: OptimisticSDKUserMessage = {
     type: 'user',
     uuid,
@@ -245,6 +256,9 @@ function createUserSDKMessage(text: string, uuid?: string, createdAt = Date.now(
     },
     parent_tool_use_id: null,
     _createdAt: createdAt,
+    ...(canvasNodeReferences && canvasNodeReferences.length > 0
+      ? { _canvasNodeReferences: [...canvasNodeReferences] }
+      : {}),
   }
   return message
 }
@@ -537,6 +551,18 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   }, [sessionMeta?.workspaceId, globalWorkspaceId])
   const [pendingPrompt, setPendingPrompt] = useAtom(agentPendingPromptAtom)
   const [pendingFiles, setPendingFiles] = useAtom(agentPendingFilesAtomFamily(sessionId))
+  /** 当前普通 Agent composer 的 Canvas 引用，按 session atom 隔离。 */
+  const [canvasNodeReferences, setCanvasNodeReferences] = useAtom(agentCanvasNodeReferencesAtomFamily(sessionId))
+  /** Canvas metadata 只用于友好标题，缺失时 chip 统一回退“画布”。 */
+  const canvasSessionsByProject = useAtomValue(canvasSessionsByProjectAtom)
+  /** 仅从现有 Canvas registry metadata 解析标题，禁止把 UUID 当作展示回退。 */
+  const getCanvasReferenceTitle = React.useCallback((reference: CanvasNodeReference): string | undefined => (
+    canvasSessionsByProject.get(reference.projectId)?.find((canvas) => canvas.id === reference.canvasId)?.title
+  ), [canvasSessionsByProject])
+  /** composer 删除按钮只移除当前 session 内指定稳定节点身份。 */
+  const handleRemoveCanvasNodeReference = React.useCallback((reference: CanvasNodeReference): void => {
+    setCanvasNodeReferences((current) => removeCanvasNodeReference(current, reference))
+  }, [setCanvasNodeReferences])
   const [queuedMessages, setQueuedMessages] = useAtom(agentMessageQueueAtomFamily(sessionId))
   const workspaces = useAtomValue(agentWorkspacesAtom)
   const setWorkspaces = useSetAtom(agentWorkspacesAtom)
@@ -667,6 +693,12 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       return next
     })
   }, [sessionId, setDraftHtmlMap])
+  /** 发送失败时把旧正文并入最新草稿，不能覆盖请求期间的新输入。 */
+  const restoreFailedInputContent = React.useCallback((failedText: string): void => {
+    const currentDraft = store.get(agentSessionDraftsAtom).get(sessionId) ?? ''
+    setInputContent(mergeAgentDraftWithRestoredMessage(currentDraft, failedText))
+    setInputHtmlContent('')
+  }, [sessionId, setInputContent, setInputHtmlContent, store])
 
   const createTodoForCurrentSession = React.useCallback(async (title: string, groupId: string, sourceText?: string): Promise<boolean> => {
     const normalizedTitle = title.trim()
@@ -1030,6 +1062,12 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     })
   }, [sessionId, store])
 
+  /** 正式发送后仅清除仍与本次快照相同的引用，保留请求期间新增或更新的引用。 */
+  const clearSentCanvasNodeReferences = React.useCallback((sent: readonly CanvasNodeReference[]): void => {
+    if (sent.length === 0) return
+    setCanvasNodeReferences((current) => removeSentCanvasNodeReferences(current, sent))
+  }, [setCanvasNodeReferences])
+
   const sendPlainTextAgentMessage = React.useCallback(async (
     message: AgentQueuedMessage,
   ): Promise<void> => {
@@ -1066,9 +1104,17 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       mentionedSessionIds: payload.mentions.mentionedSessionIds,
       mentionedTodoIds: payload.mentions.mentionedTodoIds,
       mentionedCalendarEventIds: payload.mentions.mentionedCalendarEventIds,
+      ...(payload.canvasNodeReferences && payload.canvasNodeReferences.length > 0
+        ? { canvasNodeReferences: payload.canvasNodeReferences }
+        : {}),
     })
     if (result.disposition === 'injected') {
-      appendLiveUserMessage(createUserSDKMessage(payload.rawText, message.id, Date.now()))
+      appendLiveUserMessage(createUserSDKMessage(
+        payload.rawText,
+        message.id,
+        Date.now(),
+        payload.canvasNodeReferences,
+      ))
       setQueuedMessages((prev) => removeQueuedMessage(prev, message.id))
       return
     }
@@ -1984,7 +2030,13 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     // 如果输入为空但有建议，使用建议内容
     const effectiveText = text || suggestion || ''
     const pendingFilesSnapshot = pendingFilesRef.current
-    if (!messagesLoaded || (!effectiveText && pendingFilesSnapshot.length === 0) || !agentChannelId || !hasAvailableModel) return
+    /** 同步读取当前 session 引用，避免 Canvas 动作与 React render 间隙发送旧数组。 */
+    const canvasNodeReferencesSnapshot = store.get(agentCanvasNodeReferencesAtomFamily(sessionId))
+    if (!messagesLoaded || (
+      !effectiveText
+      && pendingFilesSnapshot.length === 0
+      && canvasNodeReferencesSnapshot.length === 0
+    ) || !agentChannelId || !hasAvailableModel) return
     if (isStopping) {
       toast.info('正在停止上一轮 Agent', { description: '请等待停止完成后再发送消息。' })
       return
@@ -2005,6 +2057,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     if (!bypassDesignHandoff
       && currentWorkspaceId
       && pendingFilesSnapshot.length === 0
+      && canvasNodeReferencesSnapshot.length === 0
       && !currentQuotedSelection
       && shouldOfferDesignHandoff(effectiveText)) {
       setPendingDesignHandoff({ prompt: effectiveText })
@@ -2020,13 +2073,18 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       if (pendingFilesSnapshot.length > 0 && !attachmentContext) return
 
       const quotedSelection = consumeQuotedSelection()
-      const message = createAgentQueuedMessage(effectiveText, crypto.randomUUID(), Date.now(), quotedSelection, attachmentContext
-        ? {
+      const message = createAgentQueuedMessage(effectiveText, crypto.randomUUID(), Date.now(), quotedSelection, {
+        ...(attachmentContext
+          ? {
             fileReferenceBlock: attachmentContext.referenceBlock,
             attachments: attachmentContext.attachments,
             additionalDirectories: attachmentContext.additionalDirectories,
           }
-        : undefined)
+          : {}),
+        ...(canvasNodeReferencesSnapshot.length > 0
+          ? { canvasNodeReferences: canvasNodeReferencesSnapshot }
+          : {}),
+      })
       const quotedSelectionBlock = quotedSelection
         ? buildQuotedSelectionBlock(quotedSelection)
         : ''
@@ -2047,21 +2105,27 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         mentionedSessionIds: payload.mentions.mentionedSessionIds,
         mentionedTodoIds: payload.mentions.mentionedTodoIds,
         mentionedCalendarEventIds: payload.mentions.mentionedCalendarEventIds,
+        ...(payload.canvasNodeReferences && payload.canvasNodeReferences.length > 0
+          ? { canvasNodeReferences: payload.canvasNodeReferences }
+          : {}),
       }
       setQueuedMessages((prev) => [...prev, message])
-      void window.electronAPI.submitOrEnqueueAgentMessage(queuedInput).catch((error) => {
-        console.error('[AgentView] 主进程消息提交失败:', error)
-        setQueuedMessages((prev) => removeQueuedMessage(prev, message.id))
-        restoreQueuedAttachmentsToPending(message.attachments)
-        if (quotedSelection) {
-          setQuotedSelectionMap((prev) => {
-            const map = new Map(prev)
-            map.set(sessionId, quotedSelection)
-            return map
-          })
-        }
-        toast.error('消息加入队列失败', { description: String(error) })
-      })
+      void window.electronAPI.submitOrEnqueueAgentMessage(queuedInput)
+        .then(() => clearSentCanvasNodeReferences(canvasNodeReferencesSnapshot))
+        .catch((error) => {
+          console.error('[AgentView] 主进程消息提交失败:', error)
+          setQueuedMessages((prev) => removeQueuedMessage(prev, message.id))
+          restoreFailedInputContent(effectiveText)
+          restoreQueuedAttachmentsToPending(message.attachments)
+          if (quotedSelection) {
+            setQuotedSelectionMap((prev) => {
+              const map = new Map(prev)
+              map.set(sessionId, quotedSelection)
+              return map
+            })
+          }
+          toast.error('消息加入队列失败', { description: String(error) })
+        })
       // 入队后消息会出现在队列 UI 中，用户可见；不再弹 toast 打扰。
       if (overrideText === undefined || fromEditor) {
         setInputContent('')
@@ -2085,13 +2149,18 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       if (pendingFilesSnapshot.length > 0 && !attachmentContext) return
 
       const quotedSelection = consumeQuotedSelection()
-      const message = createAgentQueuedMessage(effectiveText, crypto.randomUUID(), Date.now(), quotedSelection, attachmentContext
-        ? {
+      const message = createAgentQueuedMessage(effectiveText, crypto.randomUUID(), Date.now(), quotedSelection, {
+        ...(attachmentContext
+          ? {
             fileReferenceBlock: attachmentContext.referenceBlock,
             attachments: attachmentContext.attachments,
             additionalDirectories: attachmentContext.additionalDirectories,
           }
-        : undefined)
+          : {}),
+        ...(canvasNodeReferencesSnapshot.length > 0
+          ? { canvasNodeReferences: canvasNodeReferencesSnapshot }
+          : {}),
+      })
       if (overrideText === undefined || fromEditor) {
         setInputContent('')
         setInputHtmlContent('')
@@ -2102,12 +2171,13 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         map.delete(sessionId)
         return map
       })
-      sendPlainTextAgentMessage(message).catch((error) => {
+      sendPlainTextAgentMessage(message).then(() => {
+        clearSentCanvasNodeReferences(canvasNodeReferencesSnapshot)
+      }).catch((error) => {
         console.error('[AgentView] 追加消息失败:', error)
         toast.error('追加消息失败', { description: String(error) })
         // 回滚：恢复输入框内容和建议，避免用户输入丢失
-        setInputContent(effectiveText)
-        setInputHtmlContent('')
+        restoreFailedInputContent(effectiveText)
         setPromptSuggestions((prev) => {
           const map = new Map(prev)
           if (suggestion) {
@@ -2126,6 +2196,9 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
           })
         }
         restoreQueuedAttachmentsToPending(message.attachments)
+        if (message.canvasNodeReferences && message.canvasNodeReferences.length > 0) {
+          setCanvasNodeReferences((current) => addCanvasNodeReferences(current, message.canvasNodeReferences ?? []))
+        }
       })
       return
     }
@@ -2205,6 +2278,9 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       },
       parent_tool_use_id: null,
       _createdAt: Date.now(),
+      ...(canvasNodeReferencesSnapshot.length > 0
+        ? { _canvasNodeReferences: [...canvasNodeReferencesSnapshot] }
+        : {}),
     } as unknown as SDKMessage
     appendOptimisticPersistedMessage(tempUserSDKMsg)
 
@@ -2223,6 +2299,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       ...(mentions.mentionedSessionIds.length > 0 && { mentionedSessionIds: mentions.mentionedSessionIds }),
       ...(mentions.mentionedTodoIds.length > 0 && { mentionedTodoIds: mentions.mentionedTodoIds }),
       ...(mentions.mentionedCalendarEventIds.length > 0 && { mentionedCalendarEventIds: mentions.mentionedCalendarEventIds }),
+      ...(canvasNodeReferencesSnapshot.length > 0 && { canvasNodeReferences: canvasNodeReferencesSnapshot }),
     }
 
     // 清空输入框（仅当发送的是用户自己输入的内容，而非推荐建议时）。
@@ -2232,17 +2309,28 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       setInputHtmlContent('')
     }
 
-    window.electronAPI.sendAgentMessage(input).catch((error) => {
-      console.error('[AgentView] 发送消息失败:', error)
-      setStreamingStates((prev) => {
-        const current = prev.get(sessionId)
-        if (!current) return prev
-        const map = new Map(prev)
-        map.set(sessionId, { ...current, running: false })
-        return map
+    window.electronAPI.sendAgentMessage(input)
+      .then(() => clearSentCanvasNodeReferences(canvasNodeReferencesSnapshot))
+      .catch((error) => {
+        console.error('[AgentView] 发送消息失败:', error)
+        setStreamingStates((prev) => {
+          const current = prev.get(sessionId)
+          if (!current) return prev
+          const map = new Map(prev)
+          map.set(sessionId, { ...current, running: false })
+          return map
+        })
+        restoreFailedInputContent(effectiveText)
+        restoreQueuedAttachmentsToPending(attachmentContext?.attachments)
+        if (quotedSelection) {
+          setQuotedSelectionMap((prev) => {
+            const map = new Map(prev)
+            map.set(sessionId, quotedSelection)
+            return map
+          })
+        }
       })
-    })
-  }, [createBaseAdditionalDirectories, preparePendingFilesForSend, restoreQueuedAttachmentsToPending, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, consumeQuotedSelection, currentQuotedSelection, setStreamingStates, setAgentStreamErrors, setPromptSuggestions, setInputContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, setQuotedSelectionMap, sendPlainTextAgentMessage, isLegacyTranscript, isStopping])
+  }, [clearSentCanvasNodeReferences, createBaseAdditionalDirectories, preparePendingFilesForSend, restoreFailedInputContent, restoreQueuedAttachmentsToPending, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, consumeQuotedSelection, currentQuotedSelection, setStreamingStates, setAgentStreamErrors, setPromptSuggestions, setInputContent, setInputHtmlContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, setQuotedSelectionMap, sendPlainTextAgentMessage, isLegacyTranscript, isStopping])
 
   /** 用户明确选择代码实现后，复用原发送链并只绕过一次 Design 判断。 */
   const handleContinueDesignRequestInAgent = React.useCallback((): void => {
@@ -2713,6 +2801,9 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
           })
         }
         restoreQueuedAttachmentsToPending(message.attachments)
+        if (message.canvasNodeReferences && message.canvasNodeReferences.length > 0) {
+          setCanvasNodeReferences((current) => addCanvasNodeReferences(current, message.canvasNodeReferences ?? []))
+        }
 
         const currentDraft = store.get(agentSessionDraftsAtom).get(sessionId) ?? ''
         const currentDraftHtml = store.get(agentSessionDraftHtmlAtom).get(sessionId) ?? ''
@@ -2736,7 +2827,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       .catch((error) => {
         console.warn('[AgentView] 撤回主进程队列消息失败:', error)
       })
-  }, [queuedMessages, restoreQueuedAttachmentsToPending, sessionId, setInputContent, setInputHtmlContent, setQueuedMessages, setQuotedSelectionMap, store])
+  }, [queuedMessages, restoreQueuedAttachmentsToPending, sessionId, setCanvasNodeReferences, setInputContent, setInputHtmlContent, setQueuedMessages, setQuotedSelectionMap, store])
 
   const handleRemoveQueuedMessage = React.useCallback((messageId: string): void => {
     void window.electronAPI.cancelAgentQueuedMessage({ sessionId, messageId })
@@ -3154,6 +3245,15 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
               sessionAttachedDirs={sessionMentionPaths}
               sendWithCmdEnter={sendWithCmdEnter}
               onAgentHistoryQuoteClick={handleAgentHistoryQuoteClick}
+              accessory={canvasNodeReferences.length > 0 ? (
+                <div className="px-3 pt-2.5 pb-1">
+                  <CanvasNodeReferenceChips
+                    references={canvasNodeReferences}
+                    getCanvasTitle={getCanvasReferenceTitle}
+                    onRemove={handleRemoveCanvasNodeReference}
+                  />
+                </div>
+              ) : undefined}
             />
 
           </AgentComposerFrame>

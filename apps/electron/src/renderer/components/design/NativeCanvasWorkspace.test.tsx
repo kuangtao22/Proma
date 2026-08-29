@@ -11,6 +11,7 @@ import type {
   CanvasNodeKind,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
+  CanvasNodeReference,
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
   DeleteCanvasNodeInput,
@@ -81,6 +82,7 @@ import {
   runNativeCanvasToolbarAddNode,
   routeNativeCanvasWorkspaceMutation,
   commitCanvasImageDraftAndCreateJob,
+  createCanvasNodeReferencesFromSnapshot,
 } from './NativeCanvasWorkspace'
 import type {
   CanvasAgentNodeCommandState,
@@ -107,6 +109,32 @@ function createInitialNativeCanvasState(): NativeCanvasState {
 }
 
 describe('Agent Canvas 共享图与独立视图', () => {
+  test('Given 权威快照和含已删除节点的选区 When 构造引用 Then 只返回仍存在节点的完整快照', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const snapshot = createSnapshot(7, target)
+    snapshot.document.nodes = [{
+      id: 'document-1',
+      kind: 'document',
+      title: '需求说明',
+      documentId: 'doc-1',
+      contentRevision: 2,
+      position: { x: 0, y: 0 },
+    }]
+
+    expect(createCanvasNodeReferencesFromSnapshot(target, snapshot, [
+      'deleted-node',
+      'document-1',
+      'document-1',
+    ])).toEqual([{
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      nodeId: 'document-1',
+      nodeType: 'document',
+      nodeRevision: 7,
+      title: '需求说明',
+    } satisfies CanvasNodeReference])
+  })
+
   test('Given 同一共享 Canvas 的两个 Agent 会话 When 渲染工作区 Then 共用 snapshot 且投影各自 viewport 与选区', () => {
     const target = { projectId: 'project-1', canvasId: 'canvas-1' }
     const graphKey = createNativeCanvasKey(target.projectId, target.canvasId)

@@ -183,6 +183,8 @@ interface RichTextInputProps {
   sendWithCmdEnter?: boolean
   /** 点击 Agent 历史引用 chip 时，用其消息范围触发定位与高亮。 */
   onAgentHistoryQuoteClick?: (quote: QuotedSelection) => void
+  /** 输入编辑器上方的结构化附件区域；不参与 TipTap mention 协议。 */
+  accessory?: React.ReactNode
   className?: string
 }
 
@@ -231,6 +233,7 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
   onHtmlChange,
   sendWithCmdEnter = false,
   onAgentHistoryQuoteClick,
+  accessory,
 }: RichTextInputProps, ref: React.Ref<RichTextInputHandle>): React.ReactElement {
   const [isExpanded, setIsExpanded] = useState(false)
   const inputIdRef = useRef(voiceInputId ?? `rich-text-input-${Math.random().toString(36).slice(2)}`)
@@ -1202,6 +1205,7 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
         className
       )}
     >
+      {accessory}
       <EditorContent editor={editor} className="w-full" />
       {/* 折叠/展开切换按钮 — sticky 悬浮在滚动区域内 */}
       {showCollapseToggle && (

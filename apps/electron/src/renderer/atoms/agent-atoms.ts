@@ -8,7 +8,7 @@
 import { atom } from 'jotai'
 import type { Getter } from 'jotai'
 import { atomFamily, atomWithStorage, selectAtom } from 'jotai/utils'
-import type { AgentSessionMeta, AgentEvent, AgentWorkspace, AgentPendingFile, RetryAttempt, PromaPermissionMode, PermissionRequest, AskUserRequest, ExitPlanModeRequest, ThinkingConfig, AgentEffort, SDKMessage, UnstagedChangesResult } from '@proma/shared'
+import type { AgentSessionMeta, AgentEvent, AgentWorkspace, AgentPendingFile, RetryAttempt, PromaPermissionMode, PermissionRequest, AskUserRequest, ExitPlanModeRequest, ThinkingConfig, AgentEffort, SDKMessage, UnstagedChangesResult, CanvasNodeReference } from '@proma/shared'
 import { PROMA_DEFAULT_PERMISSION_MODE } from '@proma/shared'
 import { calculateDockBadgeCount, countPendingRequests } from '@/lib/dock-badge-count'
 import type { AgentQueuedMessage } from '@/lib/agent-message-queue'
@@ -533,6 +533,32 @@ export const agentMessageQueueAtomFamily = atomFamily((sessionId: string) =>
           map.set(sessionId, next)
         }
         return map
+      })
+    },
+  ),
+)
+
+/**
+ * 普通 Agent composer 尚未发送的 Canvas 节点引用，以 sessionId 隔离。
+ * 只保存在 Renderer 内存，不能写入共享 Canvas graph/view 状态。
+ */
+export const agentSessionCanvasNodeReferencesAtom = atom<Map<string, CanvasNodeReference[]>>(new Map())
+
+/** 单个 Agent 会话的 Canvas 引用切片；空数组写回时删除 Map entry。 */
+export const agentCanvasNodeReferencesAtomFamily = atomFamily((sessionId: string) =>
+  atom(
+    (get) => get(agentSessionCanvasNodeReferencesAtom).get(sessionId) ?? [],
+    (_get, set, update: CanvasNodeReference[] | ((previous: CanvasNodeReference[]) => CanvasNodeReference[])) => {
+      set(agentSessionCanvasNodeReferencesAtom, (previous) => {
+        /** 当前 session 的引用数组是 updater 的唯一输入，避免读取其它会话。 */
+        const current = previous.get(sessionId) ?? []
+        /** 引用更新结果为空时删除键，避免长期使用留下空 entry。 */
+        const nextReferences = typeof update === 'function' ? update(current) : update
+        /** 新 Map 保留其它 session 的 composer 引用。 */
+        const next = new Map(previous)
+        if (nextReferences.length === 0) next.delete(sessionId)
+        else next.set(sessionId, nextReferences)
+        return next
       })
     },
   ),

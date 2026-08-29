@@ -131,6 +131,8 @@ export interface NativeCanvasGraphProps {
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
   canCreateChild?: boolean
   onCreateChild?: (nodeId: string, kind: CanvasNodeKind) => void
+  /** 单节点引用动作只传节点 ID，快照构造由 Workspace 完成。 */
+  onReferenceNode?: (nodeId: string) => void
   selectedNodeId: string | null
   /** 完整受控选区；未提供时兼容旧单选调用方。 */
   selectedNodeIds?: readonly string[]
@@ -204,6 +206,7 @@ export function NativeCanvasGraph({
   imagePreviews,
   canCreateChild = false,
   onCreateChild = NOOP_CREATE_CHILD,
+  onReferenceNode,
   selectedNodeId,
   selectedNodeIds,
   onMutation,
@@ -235,6 +238,7 @@ export function NativeCanvasGraph({
       imagePreviews,
       canCreateChild: writable && canCreateChild,
       onCreateChild,
+      onReferenceNode,
       onWorkbenchNodeChange: workbenchNodeChange,
     }).map((node) => ({
       ...node,
@@ -282,6 +286,7 @@ export function NativeCanvasGraph({
       imagePreviews,
       canCreateChild: writable && canCreateChild,
       onCreateChild,
+      onReferenceNode,
       onWorkbenchNodeChange: workbenchNodeChange,
     }).map((node) => ({
       ...node,
@@ -289,7 +294,7 @@ export function NativeCanvasGraph({
     })), document, expandedNodeId, renderWorkbench)
     flowNodesRef.current = nextNodes
     setFlowNodes(nextNodes)
-  }, [canCreateChild, controlledSelectedNodeIdSet, document, expandedNodeId, imagePreviews, nodeIssues, onCreateChild, renderWorkbench, runningSessionIds, workbenchNodeChange, writable])
+  }, [canCreateChild, controlledSelectedNodeIdSet, document, expandedNodeId, imagePreviews, nodeIssues, onCreateChild, onReferenceNode, renderWorkbench, runningSessionIds, workbenchNodeChange, writable])
 
   React.useEffect(() => {
     updateViewportState({ type: 'document-sync', viewport: document.viewport })

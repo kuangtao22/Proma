@@ -2,7 +2,8 @@ import * as React from 'react'
 import type { CanvasNodeKind } from '@proma/shared'
 import { Handle, Position } from '@xyflow/react'
 import type { LucideIcon } from 'lucide-react'
-import { Bot, CircleAlert, FileImage, FileText, LoaderCircle, Maximize2, Monitor, Plus } from 'lucide-react'
+import { Bot, CircleAlert, FileImage, FileText, LoaderCircle, Maximize2, MessageSquareQuote, Monitor, MoreHorizontal, Plus } from 'lucide-react'
+import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   Popover,
@@ -30,6 +31,8 @@ export interface CanvasNodeCardData {
   onOpenWorkbench?: (nodeId: string) => void
   canCreateChild: boolean
   onCreateChild?: (sourceNodeId: string, kind: CanvasNodeKind) => void
+  /** 把当前轻量节点身份交回 Workspace，由 Workspace 从权威 snapshot 构造引用。 */
+  onReferenceNode?: (nodeId: string) => void
 }
 
 /** XYFlow 泛型要求的数据适配层；展示组件继续只公开精确字段。 */
@@ -93,6 +96,7 @@ export function CanvasNodeCard({
   onOpenWorkbench,
   canCreateChild,
   onCreateChild,
+  onReferenceNode,
 }: CanvasNodeCardProps): React.ReactElement {
   /** 当前节点类型的稳定中文名称和 Lucide 图标。 */
   const { label, Icon } = CANVAS_NODE_PRESENTATION[kind]
@@ -132,6 +136,40 @@ export function CanvasNodeCard({
               <Icon className="size-4" aria-hidden="true" />
             </span>
             <span className="min-w-0 flex-1 text-xs font-medium text-muted-foreground">{label}</span>
+            {onReferenceNode ? (
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="节点操作"
+                    title="引用到对话"
+                    className="nodrag nopan flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={(event) => event.stopPropagation()}
+                    onDoubleClick={(event) => event.stopPropagation()}
+                  >
+                    <MoreHorizontal className="size-4" aria-hidden="true" />
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  side="bottom"
+                  align="end"
+                  className="w-44 p-1"
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="h-9 w-full justify-start gap-2 px-2"
+                    onClick={() => onReferenceNode(id)}
+                  >
+                    <MessageSquareQuote aria-hidden="true" />
+                    引用到对话
+                  </Button>
+                </PopoverContent>
+              </Popover>
+            ) : null}
             {canOpenWorkbench && onOpenWorkbench ? (
               <Tooltip>
                 <TooltipTrigger asChild>

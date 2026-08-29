@@ -10,6 +10,7 @@ import type {
   CanvasMutation,
   CanvasNode,
   CanvasNodeKind,
+  CanvasNodeReference,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
@@ -50,6 +51,7 @@ import {
   removeAgentCanvasViewStateAtom,
   updateAgentCanvasViewStateAtom,
 } from '@/atoms/agent-canvas-atoms'
+import { agentCanvasNodeReferencesAtomFamily } from '@/atoms/agent-atoms'
 import type {
   AgentCanvasViewState,
   AgentCanvasViewStateUpdate,
@@ -75,6 +77,7 @@ import {
 import { CanvasPublicOperationError, designAdapter } from '@/lib/design-adapter'
 import type { DesignAdapter } from '@/lib/design-adapter'
 import { copyTextToClipboard } from '@/lib/clipboard'
+import { addCanvasNodeReferences } from '@/lib/agent-message-queue'
 import { CanvasAgentRecoveryPanel } from './CanvasAgentRecoveryPanel'
 import { CanvasNodeWorkbenchOverlay } from './CanvasNodeWorkbenchOverlay'
 import { CanvasImageWorkbench } from './CanvasImageWorkbench'
@@ -118,6 +121,41 @@ export const NATIVE_CANVAS_SAVE_DEBOUNCE_MS = 400
 
 /** 图片配置连续编辑合并为一次保存，避免每次输入都触发磁盘写入。 */
 export const NATIVE_CANVAS_IMAGE_SAVE_DEBOUNCE_MS = 500
+
+/**
+ * 从当前权威 Workspace snapshot 构造公开 Canvas 节点引用。
+ * @param target 当前项目与画布身份。
+ * @param snapshot 当前 Workspace 已加载的权威快照。
+ * @param nodeIds 用户请求引用的节点 ID，允许包含重复或已删除身份。
+ * @returns 只包含快照中仍存在节点的去重引用，顺序遵循 nodeIds 首次出现顺序。
+ */
+export function createCanvasNodeReferencesFromSnapshot(
+  target: CanvasTarget,
+  snapshot: CanvasWorkspaceSnapshot,
+  nodeIds: readonly string[],
+): CanvasNodeReference[] {
+  /** 快照节点索引把多选构造从 O(selection * nodes) 降为 O(selection + nodes)。 */
+  const nodesById = new Map(snapshot.document.nodes.map((node) => [node.id, node]))
+  /** 重复选区身份不会生成重复公开引用。 */
+  const seenNodeIds = new Set<string>()
+  /** 引用版本使用当前权威 Canvas 文档 revision，Task 7 发送时仍会复核。 */
+  const references: CanvasNodeReference[] = []
+  for (const nodeId of nodeIds) {
+    if (seenNodeIds.has(nodeId)) continue
+    seenNodeIds.add(nodeId)
+    const node = nodesById.get(nodeId)
+    if (!node) continue
+    references.push({
+      projectId: target.projectId,
+      canvasId: target.canvasId,
+      nodeId: node.id,
+      nodeType: node.kind,
+      nodeRevision: snapshot.document.revision,
+      title: node.title,
+    })
+  }
+  return references
+}
 
 /** 合法节点 ID 不允许使用该内部保留值，用于复用 dirty 切换确认关闭工作台。 */
 export const NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET = '__close-workbench__'
@@ -2057,6 +2095,7 @@ export function NativeCanvasWorkspace({
   const initializeAgentCanvasViewState = useSetAtom(initializeAgentCanvasViewStateAtom)
   const removeAgentCanvasViewState = useSetAtom(removeAgentCanvasViewStateAtom)
   const updateAgentCanvasViewState = useSetAtom(updateAgentCanvasViewStateAtom)
+  const setComposerCanvasReferences = useSetAtom(agentCanvasNodeReferencesAtomFamily(sessionId))
   const store = useStore()
   const runningSessionIds = useAtomValue(canvasAgentRunningSessionIdsAtom)
   const runGenerations = useAtomValue(canvasAgentRunGenerationsAtom)
@@ -2196,6 +2235,15 @@ export function NativeCanvasWorkspace({
   const hasBusySelectedNode = selectedNodes.some((node) => (
     node.kind === 'agent' && runningSessionIds.has(node.agentSessionId)
   ))
+
+  /** 每次动作都重新读取共享 graph 当前 snapshot，已删除节点不会进入 composer。 */
+  const referenceCanvasNodes = React.useCallback((nodeIds: readonly string[]): void => {
+    const snapshot = store.get(nativeCanvasStatesAtom).get(stateKey)?.snapshot
+    if (!snapshot) return
+    const references = createCanvasNodeReferencesFromSnapshot(target, snapshot, nodeIds)
+    if (references.length === 0) return
+    setComposerCanvasReferences((current) => addCanvasNodeReferences(current, references))
+  }, [setComposerCanvasReferences, stateKey, store, target])
 
   React.useEffect(() => {
     if (!state.snapshot) return
@@ -3049,6 +3097,7 @@ export function NativeCanvasWorkspace({
                 writable={workspaceWritable}
                 canAdd={canCreateNode}
                 canDelete={canDeleteNode}
+                canReferenceSelection={validSelectedNodeIds.length > 1}
                 issueCount={state.snapshot.nodeIssues.length}
                 onToolChange={(activeTool) => updateAgentCanvasViewState({
                   key: viewStateKey,
@@ -3058,6 +3107,7 @@ export function NativeCanvasWorkspace({
                   void commandRef.current?.execute(request).catch(() => undefined)
                 })}
                 onDelete={requestSelectedNodeDelete}
+                onReferenceSelection={() => referenceCanvasNodes(validSelectedNodeIds)}
                 onFocusFirstIssue={focusFirstIssue}
               />
               <NativeCanvasGraph
@@ -3071,6 +3121,7 @@ export function NativeCanvasWorkspace({
                 onCreateChild={(sourceNodeId, kind) => {
                   void commandRef.current?.execute({ kind, sourceNodeId }).catch(() => undefined)
                 }}
+                onReferenceNode={(nodeId) => referenceCanvasNodes([nodeId])}
                 selectedNodeId={viewState.selectedNodeId}
                 selectedNodeIds={validSelectedNodeIds}
                 onMutation={(mutation) => routeNativeCanvasWorkspaceMutation(

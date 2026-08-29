@@ -18,6 +18,7 @@ function createProps(kind: CanvasNodeKind): CanvasNodeCardProps {
     onOpenWorkbench: () => undefined,
     canCreateChild: true,
     onCreateChild: () => undefined,
+    onReferenceNode: () => undefined,
   }
 }
 
@@ -95,6 +96,13 @@ describe('Canvas 通用折叠节点卡片', () => {
     expect(html).toContain('aria-label="从此节点扩展"')
     expect(html).toContain('data-handleid="input"')
     expect(html).toContain('data-handleid="output"')
+  })
+
+  test('Given 节点存在宿主 Agent When 折叠渲染 Then 单节点菜单提供引用到对话动作', () => {
+    const html = renderCard('document')
+
+    expect(html).toContain('aria-label="节点操作"')
+    expect(html).toContain('引用到对话')
   })
 
   test('Given 节点不可创建下游 When 折叠渲染 Then 不显示节点侧加号但保留详情入口', () => {
