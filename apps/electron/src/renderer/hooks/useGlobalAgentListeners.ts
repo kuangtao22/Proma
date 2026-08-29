@@ -73,12 +73,18 @@ import {
   canvasAgentLifecycleAtom,
   canvasAgentOpenSessionIdsAtom,
   canvasAgentRunningSessionIdsAtom,
+  createNativeCanvasKey,
   isCanvasAgentHandoffGenerationCurrent,
   isCanvasAgentGenerationCurrent,
-  createNativeCanvasKey,
-  createNativeCanvasWorkbenchChangeUpdate,
-  updateNativeCanvasStateAtom,
+  nativeCanvasStatesAtom,
 } from '@/atoms/native-canvas-atoms'
+import {
+  createAgentCanvasViewKey,
+  createAgentCanvasWorkbenchChangeUpdate,
+  createLegacyAgentCanvasHostSessionId,
+  initializeAgentCanvasViewStateAtom,
+  updateAgentCanvasViewStateAtom,
+} from '@/atoms/agent-canvas-atoms'
 import { tabsAtom, activeTabIdAtom, activeSessionIdAtom, openTab, updateTabTitle } from '@/atoms/tab-atoms'
 import type { AgentStreamState } from '@/atoms/agent-atoms'
 import { agentDiffUnseenChangesAtom, agentDiffUnseenFilesAtom } from '@/atoms/agent-atoms'
@@ -673,11 +679,19 @@ export function useGlobalAgentListeners(): void {
         projectId: owner.projectId,
         canvasId: owner.canvasId,
       })
-      store.set(updateNativeCanvasStateAtom, {
-        key: createNativeCanvasKey(owner.projectId, owner.canvasId),
+      /** 独立入口未挂载时先用共享文档视口初始化，确保通知导航不会因缺少 view key 丢失。 */
+      const hostSessionId = createLegacyAgentCanvasHostSessionId(owner.projectId)
+      const viewKey = createAgentCanvasViewKey(hostSessionId, owner.projectId, owner.canvasId)
+      const graphKey = createNativeCanvasKey(owner.projectId, owner.canvasId)
+      const viewport = store.get(nativeCanvasStatesAtom).get(graphKey)?.snapshot?.document.viewport
+        ?? { x: 0, y: 0, zoom: 1 }
+      store.set(initializeAgentCanvasViewStateAtom, { key: viewKey, viewport })
+      store.set(updateAgentCanvasViewStateAtom, {
+        key: viewKey,
         update: (current) => ({
           selectedNodeId: owner.nodeId,
-          ...createNativeCanvasWorkbenchChangeUpdate(current, owner.nodeId),
+          selectedNodeIds: [owner.nodeId],
+          ...createAgentCanvasWorkbenchChangeUpdate(current, owner.nodeId),
         }),
       })
       store.set(appModeAtom, 'agent')

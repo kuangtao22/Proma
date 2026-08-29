@@ -18,13 +18,19 @@ import {
   createInitialCanvasImageModuleState,
   createInitialNativeCanvasState,
   createNativeCanvasKey,
-  createNativeCanvasWorkbenchChangeUpdate,
   nativeCanvasStatesAtom,
   updateCanvasImageModuleStateAtom,
   updateNativeCanvasStateAtom,
   isCanvasAgentGenerationCurrent,
   isCanvasAgentHandoffGenerationCurrent,
 } from './native-canvas-atoms'
+import {
+  createAgentCanvasViewKey,
+  createAgentCanvasWorkbenchChangeUpdate as createNativeCanvasWorkbenchChangeUpdate,
+  createInitialAgentCanvasViewState,
+  updateAgentCanvasViewStateAtom,
+  agentCanvasViewStatesAtom,
+} from './agent-canvas-atoms'
 import {
   agentSessionStreamingStateAtomFamily,
   agentStreamErrorsAtom,
@@ -115,25 +121,29 @@ describe('原生 Canvas 状态隔离', () => {
     },
   ])('Given $name When 通过通知导航更新 Jotai Then 遵守统一工作台切换规则', ({ initial, targetNodeId, expected }) => {
     const store = createStore()
-    const key = createNativeCanvasKey('project-a', 'canvas-a')
-    store.set(updateNativeCanvasStateAtom, { key, update: initial })
+    const key = createAgentCanvasViewKey('session-a', 'project-a', 'canvas-a')
+    store.set(agentCanvasViewStatesAtom, new Map([[
+      key,
+      { ...createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 }), ...initial },
+    ]]))
 
-    store.set(updateNativeCanvasStateAtom, {
+    store.set(updateAgentCanvasViewStateAtom, {
       key,
       update: (current) => ({
         selectedNodeId: targetNodeId,
+        selectedNodeIds: [targetNodeId],
         ...createNativeCanvasWorkbenchChangeUpdate(current, targetNodeId),
       }),
     })
 
-    expect(store.get(nativeCanvasStatesAtom).get(key)).toMatchObject({
+    expect(store.get(agentCanvasViewStatesAtom).get(key)).toMatchObject({
       selectedNodeId: targetNodeId,
       ...expected,
     })
   })
 
   test('Given 新建状态 When 切换工具 Then activeTool 只允许 select 或 pan', () => {
-    const initial = createInitialNativeCanvasState()
+    const initial = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })
 
     expect(initial.activeTool).toBe('select')
     expect(initial).toMatchObject({
@@ -144,7 +154,7 @@ describe('原生 Canvas 状态隔离', () => {
     expect({ ...initial, activeTool: 'pan' as const }.activeTool).toBe('pan')
   })
 
-  test('Given 两个 Canvas When 更新其中一个 Then pending、错误与选区不会串用', () => {
+  test('Given 两个 Canvas When 更新其中一个 Then pending 与错误不会串用', () => {
     const store = createStore()
     const firstKey = createNativeCanvasKey('project-a', 'canvas-a')
     const secondKey = createNativeCanvasKey('project-a', 'canvas-b')
@@ -154,7 +164,6 @@ describe('原生 Canvas 状态隔离', () => {
       update: {
         phase: 'error',
         pendingMutations: [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
-        selectedNodeId: 'node-a',
         error: 'A 失败',
       },
     })
@@ -168,7 +177,6 @@ describe('原生 Canvas 状态隔离', () => {
     expect(states.get(secondKey)).toMatchObject({
       phase: 'ready',
       pendingMutations: [],
-      selectedNodeId: null,
       error: null,
     })
   })
@@ -179,6 +187,16 @@ describe('原生 Canvas 状态隔离', () => {
 
     expect(first.pendingMutations).not.toBe(second.pendingMutations)
     expect(first.inFlightMutations).not.toBe(second.inFlightMutations)
+    expect(Object.keys(first).sort()).toEqual([
+      'authoritativeRecoveryState',
+      'deferredGraphRevision',
+      'error',
+      'inFlightMutations',
+      'pendingMutations',
+      'phase',
+      'saveState',
+      'snapshot',
+    ])
     expect(createNativeCanvasKey('project-a', 'canvas-a')).toBe('project-a:canvas-a')
   })
 
@@ -190,7 +208,7 @@ describe('原生 Canvas 状态隔离', () => {
     store.set(canvasAgentPersistedMessagesAtom, new Map([['session-1', []]]))
     store.set(updateNativeCanvasStateAtom, {
       key: createNativeCanvasKey('project-a', 'canvas-b'),
-      update: { phase: 'ready', conversationNodeId: null },
+      update: { phase: 'ready' },
     })
 
     expect(store.get(canvasAgentOwnersAtom).get('session-1')?.canvasId).toBe('canvas-a')

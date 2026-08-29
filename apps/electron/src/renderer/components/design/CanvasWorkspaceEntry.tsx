@@ -8,6 +8,7 @@ import { Workflow } from 'lucide-react'
 import {
   activeCanvasSessionAtom,
 } from '@/atoms/canvas-session-atoms'
+import { createLegacyAgentCanvasHostSessionId } from '@/atoms/agent-canvas-atoms'
 import { DesignWorkspaceView } from './DesignWorkspaceView'
 import { NativeCanvasWorkspace } from './NativeCanvasWorkspace'
 
@@ -67,6 +68,7 @@ export function CanvasWorkspaceEntry(): React.ReactElement {
       nativeWorkspace={session ? (
         <NativeCanvasWorkspace
           key={`${session.projectId}:${session.id}`}
+          sessionId={createLegacyAgentCanvasHostSessionId(session.projectId)}
           target={{ projectId: session.projectId, canvasId: session.id }}
           title={session.title}
         />

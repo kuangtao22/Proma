@@ -60,6 +60,10 @@ export function calculateCanvasWorkbenchResize(input: CanvasWorkbenchResizeInput
 export interface CanvasNodeWorkbenchOverlayProps {
   node: CanvasNode
   dirty: boolean
+  /** 当前 Agent 会话保存的工作台尺寸。 */
+  workbenchSize: CanvasWorkbenchSize | null
+  /** 缩放或边界收敛后更新当前 Agent 会话尺寸。 */
+  onWorkbenchSizeChange: (size: CanvasWorkbenchSize) => void
   onDirtyChange: (dirty: boolean) => void
   onClose: () => void
   children?: React.ReactNode
@@ -88,8 +92,9 @@ export function CanvasNodeWorkbenchOverlay(
   const label = getCanvasNodeKindLabel(props.node.kind)
   /** 工作台 DOM 用于读取 Canvas 缩放后的真实可视边界。 */
   const workbenchRef = React.useRef<HTMLElement>(null)
-  /** 尺寸只在当前工作台挂载期间保留，不写入 Canvas 文档。 */
-  const [workbenchSize, setWorkbenchSize] = React.useState<CanvasWorkbenchSize | null>(null)
+  /** 最新尺寸回调通过 ref 供布局监听器使用，避免宿主重渲染反复绑定。 */
+  const onWorkbenchSizeChangeRef = React.useRef(props.onWorkbenchSizeChange)
+  onWorkbenchSizeChangeRef.current = props.onWorkbenchSizeChange
   /** 指针捕获期间的起点与边界，避免每帧重复测量布局。 */
   const resizeSessionRef = React.useRef<CanvasWorkbenchResizeSession | null>(null)
 
@@ -126,7 +131,7 @@ export function CanvasNodeWorkbenchOverlay(
     const clampWorkbenchToCanvas = (): void => {
       const resizeInput = readResizeInput()
       if (!resizeInput) return
-      setWorkbenchSize(calculateCanvasWorkbenchResize({
+      onWorkbenchSizeChangeRef.current(calculateCanvasWorkbenchResize({
         ...resizeInput,
         pointerDelta: { x: 0, y: 0 },
       }))
@@ -167,7 +172,7 @@ export function CanvasNodeWorkbenchOverlay(
     if (!session || session.pointerId !== event.pointerId) return
     event.preventDefault()
     event.stopPropagation()
-    setWorkbenchSize(calculateCanvasWorkbenchResize({
+    onWorkbenchSizeChangeRef.current(calculateCanvasWorkbenchResize({
       initialSize: session.initialSize,
       pointerDelta: {
         x: event.clientX - session.pointerOrigin.x,
@@ -196,7 +201,7 @@ export function CanvasNodeWorkbenchOverlay(
       className="nodrag nopan nowheel absolute left-0 top-[calc(100%+8px)] z-30 h-[min(620px,calc(100vh-9rem))] w-[min(720px,calc(100vw-2rem))] cursor-auto overflow-hidden rounded-[8px] border border-border bg-background text-foreground shadow-xl"
       aria-label={`${label}工作台`}
       data-workbench-dirty={props.dirty || undefined}
-      style={workbenchSize ?? undefined}
+      style={props.workbenchSize ?? undefined}
     >
       <header className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
         <span className="min-w-0 truncate text-sm font-medium">{props.node.title}</span>

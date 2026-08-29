@@ -28,7 +28,6 @@ import {
   canvasAgentRunGenerationsAtom,
   createInitialNativeCanvasState,
   createNativeCanvasKey,
-  createNativeCanvasWorkbenchChangeUpdate,
   nativeCanvasStatesAtom,
   updateNativeCanvasStateAtom,
 } from '@/atoms/native-canvas-atoms'
@@ -37,6 +36,20 @@ import type {
   CanvasImageModuleSaveState,
   NativeCanvasState,
 } from '@/atoms/native-canvas-atoms'
+import {
+  agentCanvasViewStatesAtom,
+  createAgentCanvasViewKey,
+  createAgentCanvasWorkbenchChangeUpdate,
+  createClosedAgentCanvasWorkbenchUpdate,
+  createConvergedAgentCanvasViewUpdate,
+  createInitialAgentCanvasViewState,
+  initializeAgentCanvasViewStateAtom,
+  updateAgentCanvasViewStateAtom,
+} from '@/atoms/agent-canvas-atoms'
+import type {
+  AgentCanvasViewState,
+  AgentCanvasViewStateUpdate,
+} from '@/atoms/agent-canvas-atoms'
 import {
   createInitialDesignProjectState,
   designProjectStatesAtom,
@@ -255,8 +268,8 @@ export type PendingCanvasStopDeleteGenerationStatus = 'active' | 'ended' | 'repl
 
 /** 确认保存或放弃后，把待切换目标提升为唯一展开工作台。 */
 export function createResolvedNativeCanvasWorkbenchSwitchUpdate(
-  current: NativeCanvasState,
-): Pick<NativeCanvasState, 'expandedNodeId' | 'pendingWorkbenchSwitchNodeId' | 'workbenchDraft'> {
+  current: AgentCanvasViewState,
+): Pick<AgentCanvasViewState, 'expandedNodeId' | 'pendingWorkbenchSwitchNodeId' | 'workbenchDraft'> {
   return {
     expandedNodeId: current.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
       ? null
@@ -268,7 +281,7 @@ export function createResolvedNativeCanvasWorkbenchSwitchUpdate(
 
 /** 关闭当前工作台时只清理临时态，保留普通节点选区。 */
 export function createClosedNativeCanvasWorkbenchUpdate(): Pick<
-  NativeCanvasState,
+  AgentCanvasViewState,
   'expandedNodeId' | 'pendingWorkbenchSwitchNodeId' | 'workbenchDraft'
 > {
   return {
@@ -284,8 +297,8 @@ export function createClosedNativeCanvasWorkbenchUpdate(): Pick<
  * @returns 立即关闭或等待确认的局部状态更新。
  */
 export function createNativeCanvasWorkbenchCloseRequestUpdate(
-  current: NativeCanvasState,
-): Partial<NativeCanvasState> {
+  current: AgentCanvasViewState,
+): Partial<AgentCanvasViewState> {
   if (current.expandedNodeId
     && current.workbenchDraft?.nodeId === current.expandedNodeId
     && current.workbenchDraft.dirty) {
@@ -436,24 +449,19 @@ export function findNativeCanvasAgentNodeCreationPosition(
 /**
  * 创建 Agent 节点成功后的局部状态更新。
  * @param current 创建完成时的当前 Canvas 状态。
- * @param nodeId 主进程已创建的节点 ID。
+ * @param _nodeId 主进程已创建的节点 ID；选区由 session view 边界处理。
  * @param result 主进程返回的权威创建结果。
- * @returns 只接管权威文档、选区与错误的局部更新。
+ * @returns 只接管权威文档与错误的共享图更新。
  */
 export function createNativeCanvasAgentNodeSuccessUpdate(
   current: NativeCanvasState,
-  nodeId: string,
+  _nodeId: string,
   result: CanvasAgentNodeCreationResult,
 ): Partial<NativeCanvasState> {
   /** 普通 graph 可能先于创建回调接管更高 revision，迟到结果不得倒退文档。 */
   const currentDocument = current.snapshot?.document
   if (currentDocument && currentDocument.revision > result.document.revision) {
-    /** 只有更高 revision 已包含新节点时才允许把选区切到该节点。 */
-    const containsCreatedNode = currentDocument.nodes.some((node) => node.id === nodeId)
-    return {
-      selectedNodeId: containsCreatedNode ? nodeId : current.selectedNodeId,
-      error: null,
-    }
+    return { error: null }
   }
   /** 创建请求在途期间已经投影的位置变更按真实发生顺序重新收集。 */
   const positionMutations = [
@@ -469,16 +477,15 @@ export function createNativeCanvasAgentNodeSuccessUpdate(
     snapshot: current.snapshot
       ? { ...current.snapshot, document: projectedDocument }
       : { document: projectedDocument, writable: true, nodeIssues: [] },
-    selectedNodeId: nodeId,
     error: null,
   }
 }
 
 /**
- * 将四类创建结果归一为只选中新折叠节点的状态更新。
+ * 将四类创建结果归一为共享图状态更新。
  * @param current 创建完成时当前 keyed Canvas 状态。
  * @param success 类型化创建结果和预分配节点身份。
- * @returns 只接管权威文档和新节点选区，始终保留请求期间形成的工作台状态。
+ * @returns 只接管权威文档，不读取或修改 session view。
  */
 export function createNativeCanvasNodeCreationSuccessUpdate(
   current: NativeCanvasState,
@@ -513,13 +520,13 @@ export function createNativeCanvasNodeCreationSuccessUpdate(
  * 删除或恢复成功后整体接管主进程权威快照。
  * @param current 生命周期完成时的当前 Renderer 状态。
  * @param result 主进程返回的权威生命周期事实。
- * @param selectedNodeId 恢复时选中新节点，删除时传 null。
- * @returns 清理工作台 dirty、待切换和历史结构 mutation 的状态更新。
+ * @param _selectedNodeId 旧调用合同保留值；选区由 session view 边界处理。
+ * @returns 清理历史结构 mutation 并接管权威图的状态更新。
  */
 export function createNativeCanvasLifecycleSuccessUpdate(
   current: NativeCanvasState,
   result: CanvasNodeLifecycleResult,
-  selectedNodeId: string | null,
+  _selectedNodeId: string | null,
 ): Partial<NativeCanvasState> {
   /** 更高 revision 已由事件接管时，迟到生命周期结果不得回退图。 */
   if (current.snapshot && current.snapshot.document.revision > result.snapshot.document.revision) {
@@ -535,11 +542,6 @@ export function createNativeCanvasLifecycleSuccessUpdate(
           ? { imagePreviews: current.snapshot.imagePreviews }
           : {}),
     },
-    selectedNodeId,
-    conversationNodeId: null,
-    expandedNodeId: null,
-    pendingWorkbenchSwitchNodeId: null,
-    workbenchDraft: null,
     pendingMutations: [],
     inFlightMutations: [],
     saveState: 'saved',
@@ -797,12 +799,10 @@ function getCurrentCanvasAgentRunGeneration(
  */
 export function createRebuiltNativeCanvasStateUpdate(
   result: RebuildCanvasAgentNodeResult,
-  nodeId: string,
+  _nodeId: string,
 ): Partial<NativeCanvasState> {
   return {
     snapshot: result.snapshot,
-    selectedNodeId: nodeId,
-    expandedNodeId: nodeId,
     error: null,
   }
 }
@@ -1242,11 +1242,6 @@ export function createNativeCanvasWorkspaceController(
         snapshot,
         inFlightMutations: [],
         saveState: 'conflict',
-        selectedNodeId: null,
-        conversationNodeId: null,
-        expandedNodeId: null,
-        pendingWorkbenchSwitchNodeId: null,
-        workbenchDraft: null,
         authoritativeRecoveryState: 'idle',
         error: NATIVE_CANVAS_STRUCTURAL_CONFLICT_MESSAGE,
       })
@@ -1259,11 +1254,6 @@ export function createNativeCanvasWorkspaceController(
       snapshot: { ...snapshot, document },
       inFlightMutations: [],
       saveState: pending.length > 0 ? 'dirty' : 'saved',
-      selectedNodeId: null,
-      conversationNodeId: null,
-      expandedNodeId: null,
-      pendingWorkbenchSwitchNodeId: null,
-      workbenchDraft: null,
       authoritativeRecoveryState: 'idle',
       error: null,
     })
@@ -1326,18 +1316,10 @@ export function createNativeCanvasWorkspaceController(
       }
       const localMutations = [...latest.inFlightMutations, ...latest.pendingMutations]
       const document = applyCanvasMutations(snapshot.document, localMutations)
-      /** 普通远端刷新若已删除展开节点，也必须释放对应临时工作台。 */
-      const expandedNodeStillExists = latest.expandedNodeId === null
-        || document.nodes.some((node) => node.id === latest.expandedNodeId)
       dependencies.updateState({
         phase: 'ready',
         snapshot: { ...snapshot, document },
         saveState: localMutations.length > 0 ? latest.saveState : 'saved',
-        ...(!expandedNodeStillExists ? {
-          expandedNodeId: null,
-          pendingWorkbenchSwitchNodeId: null,
-          workbenchDraft: null,
-        } : {}),
         error: null,
       })
     }).catch((error: unknown) => {
@@ -1367,9 +1349,6 @@ export function createNativeCanvasWorkspaceController(
       phase: latest.snapshot ? 'ready' : 'loading',
       inFlightMutations: [],
       saveState: 'failed',
-      expandedNodeId: null,
-      pendingWorkbenchSwitchNodeId: null,
-      workbenchDraft: null,
       authoritativeRecoveryState: 'loading',
       error: '正在恢复 Canvas',
     }))
@@ -1773,7 +1752,7 @@ export interface NativeCanvasWorkbenchDraftCommitOperation {
 /** 草稿保存协调器依赖，只允许通过当前 Jotai 状态判断异步结果归属。 */
 export interface NativeCanvasWorkbenchDraftCommitCoordinatorDependencies {
   getCurrentWorkspaceKey: () => string
-  getState: (stateKey: string) => NativeCanvasState | undefined
+  getState: (stateKey: string) => AgentCanvasViewState | undefined
   onSuccess: (operation: NativeCanvasWorkbenchDraftCommitOperation) => void
   onFailure: (operation: NativeCanvasWorkbenchDraftCommitOperation) => void
   onSettled: (operation: NativeCanvasWorkbenchDraftCommitOperation) => void
@@ -1833,8 +1812,61 @@ export function createNativeCanvasWorkbenchDraftCommitCoordinator(
   }
 }
 
+/**
+ * 将 Graph 交互按共享图与会话视图边界路由。
+ * @param mutation Graph 产生的最终交互 mutation。
+ * @param updateViewState 更新当前 Agent Canvas 会话视图。
+ * @param enqueueGraphMutation 提交共享图结构或节点位置修改。
+ */
+export function routeNativeCanvasWorkspaceMutation(
+  mutation: CanvasMutation,
+  updateViewState: (update: AgentCanvasViewStateUpdate) => void,
+  enqueueGraphMutation: (mutation: CanvasMutation) => void,
+): void {
+  if (mutation.type === 'set-viewport') {
+    updateViewState({ viewport: mutation.viewport })
+    return
+  }
+  enqueueGraphMutation(mutation)
+}
+
+/** HMR 与旧测试夹具可能仍携带迁移前视图字段，只在 view atom 首次缺失时读取一次。 */
+interface LegacyNativeCanvasViewFields extends Partial<AgentCanvasViewState> {
+  /** 旧字段已无可见用途，仅用于识别迁移前对象。 */
+  conversationNodeId?: string | null
+}
+
+/**
+ * 从共享文档视口创建 view fallback，并兼容当前进程内迁移前的 keyed 状态。
+ * @param graphState 当前共享图状态。
+ * @returns 不会写回 graph atom 的会话视图回退值。
+ */
+function createAgentCanvasViewFallback(graphState: NativeCanvasState): AgentCanvasViewState {
+  const initial = createInitialAgentCanvasViewState(
+    graphState.snapshot?.document.viewport ?? { x: 0, y: 0, zoom: 1 },
+  )
+  const legacy = graphState as NativeCanvasState & LegacyNativeCanvasViewFields
+  return {
+    ...initial,
+    ...(legacy.viewport ? { viewport: legacy.viewport } : {}),
+    ...(legacy.selectedNodeId !== undefined ? { selectedNodeId: legacy.selectedNodeId } : {}),
+    ...(legacy.selectedNodeIds ? { selectedNodeIds: legacy.selectedNodeIds } : {}),
+    ...(legacy.expandedNodeId !== undefined ? { expandedNodeId: legacy.expandedNodeId } : {}),
+    ...(legacy.workbenchSize !== undefined ? { workbenchSize: legacy.workbenchSize } : {}),
+    ...(legacy.isExpanded !== undefined ? { isExpanded: legacy.isExpanded } : {}),
+    ...(legacy.activityRevision !== undefined ? { activityRevision: legacy.activityRevision } : {}),
+    ...(legacy.activeTool ? { activeTool: legacy.activeTool } : {}),
+    ...(legacy.pendingWorkbenchSwitchNodeId !== undefined
+      ? { pendingWorkbenchSwitchNodeId: legacy.pendingWorkbenchSwitchNodeId }
+      : {}),
+    ...(legacy.workbenchDraft !== undefined ? { workbenchDraft: legacy.workbenchDraft } : {}),
+  }
+}
+
 /** 原生 Canvas React 壳输入。 */
 export interface NativeCanvasWorkspaceProps {
+  /** 宿主 Agent 会话 ID；独立 Canvas 入口必须传稳定 legacy host key。 */
+  sessionId: string
   target: CanvasTarget
   title: string
   adapter?: NativeCanvasAdapter
@@ -1845,16 +1877,21 @@ export interface NativeCanvasWorkspaceProps {
 
 /** 将隔离 Jotai 状态绑定到纯 controller，并渲染当前加载阶段。 */
 export function NativeCanvasWorkspace({
+  sessionId,
   target,
   title,
   adapter = designAdapter,
   flowRenderer,
   conversationRenderer,
 }: NativeCanvasWorkspaceProps): React.ReactElement {
-  /** 双身份 key 决定唯一状态与 effect 生命周期。 */
+  /** graph key 只隔离共享图；view key 再加入 Agent 会话身份。 */
   const stateKey = createNativeCanvasKey(target.projectId, target.canvasId)
+  const viewStateKey = createAgentCanvasViewKey(sessionId, target.projectId, target.canvasId)
   const states = useAtomValue(nativeCanvasStatesAtom)
+  const viewStates = useAtomValue(agentCanvasViewStatesAtom)
   const updateNativeCanvasState = useSetAtom(updateNativeCanvasStateAtom)
+  const initializeAgentCanvasViewState = useSetAtom(initializeAgentCanvasViewStateAtom)
+  const updateAgentCanvasViewState = useSetAtom(updateAgentCanvasViewStateAtom)
   const store = useStore()
   const runningSessionIds = useAtomValue(canvasAgentRunningSessionIdsAtom)
   const runGenerations = useAtomValue(canvasAgentRunGenerationsAtom)
@@ -1884,8 +1921,6 @@ export function NativeCanvasWorkspace({
   const [deleteDialogOpen, setDeleteDialogOpen] = React.useState(false)
   const [deleteSubmitting, setDeleteSubmitting] = React.useState(false)
   const [deleteError, setDeleteError] = React.useState<string | null>(null)
-  /** Renderer 局部完整选区；Jotai 的 selectedNodeId 继续作为详情主节点。 */
-  const [selectedNodeIds, setSelectedNodeIds] = React.useState<string[]>([])
   const [trashOpen, setTrashOpen] = React.useState(false)
   const [trashState, setTrashState] = React.useState<NativeCanvasTrashState>({
     entries: [], loading: false, restoringTrashId: null, error: null,
@@ -1903,16 +1938,16 @@ export function NativeCanvasWorkspace({
     [adapter],
   )
   /** 当前渲染的 Workspace key，供迟到草稿保存结果复核组件身份。 */
-  const currentWorkspaceKeyRef = React.useRef(stateKey)
-  currentWorkspaceKeyRef.current = stateKey
+  const currentWorkspaceKeyRef = React.useRef(viewStateKey)
+  currentWorkspaceKeyRef.current = viewStateKey
   /** 草稿保存代次跨 render 保持单调，不允许旧 Promise 污染新工作台。 */
   const workbenchDraftCommitCoordinatorRef = React.useRef<NativeCanvasWorkbenchDraftCommitCoordinator | null>(null)
   if (!workbenchDraftCommitCoordinatorRef.current) {
     workbenchDraftCommitCoordinatorRef.current = createNativeCanvasWorkbenchDraftCommitCoordinator({
       getCurrentWorkspaceKey: () => currentWorkspaceKeyRef.current,
-      getState: (key) => store.get(nativeCanvasStatesAtom).get(key),
+      getState: (key) => store.get(agentCanvasViewStatesAtom).get(key),
       onSuccess: ({ stateKey: operationStateKey }) => {
-        updateNativeCanvasState({
+        updateAgentCanvasViewState({
           key: operationStateKey,
           update: createResolvedNativeCanvasWorkbenchSwitchUpdate,
         })
@@ -1939,18 +1974,26 @@ export function NativeCanvasWorkspace({
   /** SSR 首帧使用该 key 专属的全新状态，不启动任何消息或 Canvas API。 */
   const fallbackState = React.useMemo(createInitialNativeCanvasState, [stateKey])
   const state = states.get(stateKey) ?? fallbackState
+  /** SSR 或首次 LOAD effect 前使用文档视口构造一次性视图回退。 */
+  const fallbackViewState = React.useMemo(
+    () => createAgentCanvasViewFallback(state),
+    [state, viewStateKey],
+  )
+  const viewState = viewStates.get(viewStateKey) ?? fallbackViewState
+  /** Graph 只接收会话视口投影；共享 snapshot 对象及 revision 保持不变。 */
+  const viewDocument = React.useMemo(() => state.snapshot
+    ? { ...state.snapshot.document, viewport: viewState.viewport }
+    : null, [state.snapshot, viewState.viewport])
   /** 工作区快照只建立一次素材预览索引，所有折叠卡片共享且不触发图片模块 LOAD。 */
   const imagePreviews = React.useMemo(() => new Map(
     (state.snapshot?.imagePreviews ?? []).map((preview) => [preview.assetId, preview]),
   ), [state.snapshot?.imagePreviews])
-  /** 识别创建、恢复和问题定位等外部主选中变化，避免旧多选遮住新目标。 */
-  const previousSelectedNodeIdRef = React.useRef(state.selectedNodeId)
   /** 权威文档过滤已删除节点，防止迟到选区引用不存在的节点。 */
   const validSelectedNodeIds = React.useMemo(() => {
     if (!state.snapshot) return []
     const documentNodeIds = new Set(state.snapshot.document.nodes.map((node) => node.id))
-    return selectedNodeIds.filter((nodeId) => documentNodeIds.has(nodeId))
-  }, [selectedNodeIds, state.snapshot])
+    return viewState.selectedNodeIds.filter((nodeId) => documentNodeIds.has(nodeId))
+  }, [state.snapshot, viewState.selectedNodeIds])
   /** 完整选区节点用于批量删除摘要和运行态边界检查。 */
   const selectedNodes = React.useMemo(() => {
     if (!state.snapshot) return []
@@ -1959,7 +2002,7 @@ export function NativeCanvasWorkspace({
   }, [state.snapshot, validSelectedNodeIds])
   /** Agent 工作台节点始终从当前 Canvas 权威内存文档解析，不保存 Renderer sessionId。 */
   const conversationNode = state.snapshot?.document.nodes.find((node) => (
-    node.id === state.expandedNodeId && node.kind === 'agent'
+    node.id === viewState.expandedNodeId && node.kind === 'agent'
   ))
   /** 节点问题只取主进程权威快照，不从会话读取失败反推。 */
   const conversationNodeIssue = state.snapshot?.nodeIssues.find((issue) => (
@@ -1967,7 +2010,7 @@ export function NativeCanvasWorkspace({
   ))
   /** 首个选中节点继续作为详情与单节点停止删除的主节点。 */
   const selectedNode = selectedNodes[0]
-    ?? state.snapshot?.document.nodes.find((node) => node.id === state.selectedNodeId)
+    ?? state.snapshot?.document.nodes.find((node) => node.id === viewState.selectedNodeId)
   /** 单节点运行态仍按当前 Agent 节点绑定的 session 判断。 */
   const selectedNodeBusy = selectedNode?.kind === 'agent'
     && runningSessionIds.has(selectedNode.agentSessionId)
@@ -1977,27 +2020,18 @@ export function NativeCanvasWorkspace({
   ))
 
   React.useEffect(() => {
-    /** 在调度状态更新前捕获变化事实，避免并发渲染时 ref 提前推进。 */
-    const primaryChanged = previousSelectedNodeIdRef.current !== state.selectedNodeId
-    previousSelectedNodeIdRef.current = state.selectedNodeId
-    /** 远端删除或首次加载时收敛选区；已有有效多选不得被主节点压缩。 */
-    setSelectedNodeIds((current) => {
-      if (!state.snapshot) return current.length === 0 ? current : []
-      const documentNodeIds = new Set(state.snapshot.document.nodes.map((node) => node.id))
-      const validNodeIds = current.filter((nodeId) => documentNodeIds.has(nodeId))
-      /** 外部命令切换主节点时改为新单选；Graph 自身更新时首项已经一致。 */
-      if (primaryChanged && state.selectedNodeId && documentNodeIds.has(state.selectedNodeId)
-        && validNodeIds[0] !== state.selectedNodeId) {
-        return [state.selectedNodeId]
-      }
-      if (validNodeIds.length > 0) {
-        return validNodeIds.length === current.length ? current : validNodeIds
-      }
-      return state.selectedNodeId && documentNodeIds.has(state.selectedNodeId)
-        ? [state.selectedNodeId]
-        : []
+    if (!state.snapshot) return
+    initializeAgentCanvasViewState({ key: viewStateKey, viewport: state.snapshot.document.viewport })
+    updateAgentCanvasViewState({
+      key: viewStateKey,
+      update: (current) => createConvergedAgentCanvasViewUpdate(current, state.snapshot!.document),
     })
-  }, [state.selectedNodeId, state.snapshot, stateKey])
+  }, [
+    initializeAgentCanvasViewState,
+    state.snapshot,
+    updateAgentCanvasViewState,
+    viewStateKey,
+  ])
 
   /** 登记提交器并返回身份安全的释放函数，迟到 cleanup 不删除新实例。 */
   const registerWorkbenchDraftCommitter = React.useCallback<RegisterNativeCanvasWorkbenchDraftCommitter>((committer) => {
@@ -2041,18 +2075,18 @@ export function NativeCanvasWorkspace({
   }, [adapter, stateKey, store, target.canvasId, target.projectId, updateNativeCanvasState])
 
   React.useEffect(() => {
-    const disposeCleanup = nativeCanvasWorkbenchCleanupCoordinator.mount(stateKey, () => {
+    const disposeCleanup = nativeCanvasWorkbenchCleanupCoordinator.mount(viewStateKey, () => {
       /** 微任务后仍未重挂才表示真实 Canvas 切换或卸载。 */
-      updateNativeCanvasState({
-        key: stateKey,
-        update: createClosedNativeCanvasWorkbenchUpdate(),
+      updateAgentCanvasViewState({
+        key: viewStateKey,
+        update: createClosedAgentCanvasWorkbenchUpdate(),
       })
     })
     return () => {
       workbenchDraftCommitCoordinatorRef.current?.invalidate()
       disposeCleanup()
     }
-  }, [stateKey, updateNativeCanvasState])
+  }, [updateAgentCanvasViewState, viewStateKey])
 
   React.useEffect(() => {
     if (!adapter.createCanvasAgentNode || !adapter.createCanvasContentNode) {
@@ -2074,7 +2108,9 @@ export function NativeCanvasWorkspace({
       getPosition: (sourceNodeId) => {
         /** 点击时读取最新权威文档，避免迟到视图闭包决定创建位置。 */
         const latest = store.get(nativeCanvasStatesAtom).get(stateKey)
-        const document = latest?.snapshot?.document
+        const sharedDocument = latest?.snapshot?.document
+        const viewport = store.get(agentCanvasViewStatesAtom).get(viewStateKey)?.viewport
+        const document = sharedDocument && viewport ? { ...sharedDocument, viewport } : sharedDocument
         if (!document) throw new Error('Canvas 尚未加载完成')
         if (sourceNodeId) {
           return findAvailableNativeCanvasChildPosition(sourceNodeId, document.nodes)
@@ -2086,17 +2122,36 @@ export function NativeCanvasWorkspace({
         })
       },
       onStateChange: setCreateState,
-      onSuccess: (success) => updateNativeCanvasState({
-        key: stateKey,
-        update: (current) => createNativeCanvasNodeCreationSuccessUpdate(current, success),
-      }),
+      onSuccess: (success) => {
+        updateNativeCanvasState({
+          key: stateKey,
+          update: (current) => createNativeCanvasNodeCreationSuccessUpdate(current, success),
+        })
+        /** 迟到创建结果只有在最新共享图确实包含节点时才有资格切换会话选区。 */
+        const latestDocument = store.get(nativeCanvasStatesAtom).get(stateKey)?.snapshot?.document
+        if (latestDocument?.nodes.some((node) => node.id === success.nodeId)) {
+          updateAgentCanvasViewState({
+            key: viewStateKey,
+            update: { selectedNodeId: success.nodeId, selectedNodeIds: [success.nodeId] },
+          })
+        }
+      },
     })
     commandRef.current = command
     return () => {
       command.cancel()
       if (commandRef.current === command) commandRef.current = null
     }
-  }, [adapter, stateKey, store, target.canvasId, target.projectId, updateNativeCanvasState])
+  }, [
+    adapter,
+    stateKey,
+    store,
+    target.canvasId,
+    target.projectId,
+    updateAgentCanvasViewState,
+    updateNativeCanvasState,
+    viewStateKey,
+  ])
 
   React.useEffect(() => {
     if (!adapter.listCanvasTrash || !adapter.restoreCanvasNode) {
@@ -2109,7 +2164,9 @@ export function NativeCanvasWorkspace({
       restoreNode: adapter.restoreCanvasNode,
       createId: () => window.crypto.randomUUID(),
       getDocument: () => {
-        const document = store.get(nativeCanvasStatesAtom).get(stateKey)?.snapshot?.document
+        const sharedDocument = store.get(nativeCanvasStatesAtom).get(stateKey)?.snapshot?.document
+        const viewport = store.get(agentCanvasViewStatesAtom).get(viewStateKey)?.viewport
+        const document = sharedDocument && viewport ? { ...sharedDocument, viewport } : sharedDocument
         if (!document) throw new Error('Canvas 尚未加载完成')
         return document
       },
@@ -2129,6 +2186,14 @@ export function NativeCanvasWorkspace({
           key: stateKey,
           update: (current) => createNativeCanvasLifecycleSuccessUpdate(current, result, nodeId),
         })
+        updateAgentCanvasViewState({
+          key: viewStateKey,
+          update: {
+            selectedNodeId: nodeId,
+            selectedNodeIds: [nodeId],
+            ...createClosedAgentCanvasWorkbenchUpdate(),
+          },
+        })
       },
     })
     trashControllerRef.current = controller
@@ -2136,7 +2201,16 @@ export function NativeCanvasWorkspace({
       controller.cancel()
       if (trashControllerRef.current === controller) trashControllerRef.current = null
     }
-  }, [adapter.listCanvasTrash, adapter.restoreCanvasNode, stateKey, store, target, updateNativeCanvasState])
+  }, [
+    adapter.listCanvasTrash,
+    adapter.restoreCanvasNode,
+    stateKey,
+    store,
+    target,
+    updateAgentCanvasViewState,
+    updateNativeCanvasState,
+    viewStateKey,
+  ])
 
   React.useEffect(() => {
     if (!adapter.rebuildCanvasAgentNode || !conversationNode || !conversationNodeIssue) {
@@ -2150,10 +2224,20 @@ export function NativeCanvasWorkspace({
       rebuildAgentNode: adapter.rebuildCanvasAgentNode,
       createId: () => window.crypto.randomUUID(),
       onStateChange: setRebuildState,
-      onSuccess: (result) => updateNativeCanvasState({
-        key: stateKey,
-        update: createRebuiltNativeCanvasStateUpdate(result, conversationNode.id),
-      }),
+      onSuccess: (result) => {
+        updateNativeCanvasState({
+          key: stateKey,
+          update: createRebuiltNativeCanvasStateUpdate(result, conversationNode.id),
+        })
+        updateAgentCanvasViewState({
+          key: viewStateKey,
+          update: {
+            selectedNodeId: conversationNode.id,
+            selectedNodeIds: [conversationNode.id],
+            expandedNodeId: conversationNode.id,
+          },
+        })
+      },
     })
     rebuildCommandRef.current = command
     return () => {
@@ -2166,7 +2250,9 @@ export function NativeCanvasWorkspace({
     conversationNodeIssue,
     stateKey,
     target,
+    updateAgentCanvasViewState,
     updateNativeCanvasState,
+    viewStateKey,
   ])
 
   /** 创建期间要求权威快照无本地待提交变更，避免立即制造 revision conflict。 */
@@ -2179,7 +2265,7 @@ export function NativeCanvasWorkspace({
     && state.pendingMutations.length === 0
     && state.inFlightMutations.length === 0
     && state.authoritativeRecoveryState === 'idle'
-    && !state.workbenchDraft?.dirty
+    && !viewState.workbenchDraft?.dirty
     && !createState.loading,
   )
   /** 三个 API 缺一即 fail closed，不展示无法完整控制的对话面板。 */
@@ -2218,15 +2304,15 @@ export function NativeCanvasWorkspace({
       )
     : 0
   /** 切换确认只读取当前展开节点自己登记的提交器。 */
-  const currentWorkbenchDraftCommitter = state.expandedNodeId
+  const currentWorkbenchDraftCommitter = viewState.expandedNodeId
     ? workbenchDraftCommitters.get(createNativeCanvasWorkbenchDraftCommitterKey(
-        stateKey,
-        state.expandedNodeId,
+        viewStateKey,
+        viewState.expandedNodeId,
       ))
     : undefined
   /** dirty 保存严格绑定当前节点注册的窄提交器。 */
   const workbenchCommitAvailability = getNativeCanvasWorkbenchCommitAvailability(
-    state.expandedNodeId,
+    viewState.expandedNodeId,
     currentWorkbenchDraftCommitter,
   )
 
@@ -2234,26 +2320,26 @@ export function NativeCanvasWorkspace({
   const closeWorkbench = React.useCallback((): void => {
     workbenchDraftCommitCoordinatorRef.current?.invalidate()
     setWorkbenchSwitchError(null)
-    updateNativeCanvasState({
-      key: stateKey,
+    updateAgentCanvasViewState({
+      key: viewStateKey,
       update: createNativeCanvasWorkbenchCloseRequestUpdate,
     })
-  }, [stateKey, updateNativeCanvasState])
+  }, [updateAgentCanvasViewState, viewStateKey])
 
   /** 请求打开节点工作台；dirty 切换先进入三选一确认。 */
   const requestWorkbenchNodeChange = React.useCallback((nodeId: string): void => {
     workbenchDraftCommitCoordinatorRef.current?.invalidate()
     setWorkbenchSwitchError(null)
-    updateNativeCanvasState({
-      key: stateKey,
-      update: (current) => createNativeCanvasWorkbenchChangeUpdate(current, nodeId),
+    updateAgentCanvasViewState({
+      key: viewStateKey,
+      update: (current) => createAgentCanvasWorkbenchChangeUpdate(current, nodeId),
     })
-  }, [stateKey, updateNativeCanvasState])
+  }, [updateAgentCanvasViewState, viewStateKey])
 
   /** 同步当前展开节点的 dirty 状态，其他节点的迟到 effect 无副作用。 */
   const updateWorkbenchDirty = React.useCallback((nodeId: string, nextDirty: boolean): void => {
-    updateNativeCanvasState({
-      key: stateKey,
+    updateAgentCanvasViewState({
+      key: viewStateKey,
       update: (current) => {
         if (current.expandedNodeId !== nodeId) return {}
         const currentDirty = current.workbenchDraft?.nodeId === nodeId
@@ -2262,38 +2348,38 @@ export function NativeCanvasWorkspace({
         return { workbenchDraft: nextDirty ? { nodeId, dirty: true } : null }
       },
     })
-  }, [stateKey, updateNativeCanvasState])
+  }, [updateAgentCanvasViewState, viewStateKey])
 
   /** 保存成功或明确放弃后完成唯一工作台切换。 */
   const resolveWorkbenchSwitch = React.useCallback((): void => {
     workbenchDraftCommitCoordinatorRef.current?.invalidate()
-    updateNativeCanvasState({
-      key: stateKey,
+    updateAgentCanvasViewState({
+      key: viewStateKey,
       update: createResolvedNativeCanvasWorkbenchSwitchUpdate,
     })
     setWorkbenchSwitchError(null)
-  }, [stateKey, updateNativeCanvasState])
+  }, [updateAgentCanvasViewState, viewStateKey])
 
   /** 仅调用当前节点已注册的窄提交器，缺失时按钮保持禁用。 */
   const saveAndSwitchWorkbench = React.useCallback((): void => {
-    const currentNodeId = state.expandedNodeId
-    const targetNodeId = state.pendingWorkbenchSwitchNodeId
+    const currentNodeId = viewState.expandedNodeId
+    const targetNodeId = viewState.pendingWorkbenchSwitchNodeId
     if (!currentNodeId || !targetNodeId
       || !workbenchCommitAvailability.enabled || !currentWorkbenchDraftCommitter) return
     setWorkbenchSwitchSaving(true)
     setWorkbenchSwitchError(null)
     void workbenchDraftCommitCoordinatorRef.current?.execute({
-      stateKey,
+      stateKey: viewStateKey,
       sourceExpandedNodeId: currentNodeId,
-      sourceDraftNodeId: state.workbenchDraft?.nodeId ?? null,
+      sourceDraftNodeId: viewState.workbenchDraft?.nodeId ?? null,
       targetNodeId,
       commitDraft: currentWorkbenchDraftCommitter.commitDraft,
     })
   }, [
-    state.expandedNodeId,
-    state.pendingWorkbenchSwitchNodeId,
-    state.workbenchDraft?.nodeId,
-    stateKey,
+    viewState.expandedNodeId,
+    viewState.pendingWorkbenchSwitchNodeId,
+    viewState.workbenchDraft?.nodeId,
+    viewStateKey,
     workbenchCommitAvailability.enabled,
     currentWorkbenchDraftCommitter,
   ])
@@ -2329,6 +2415,14 @@ export function NativeCanvasWorkspace({
         key: stateKey,
         update: (current) => createNativeCanvasLifecycleSuccessUpdate(current, result, null),
       })
+      updateAgentCanvasViewState({
+        key: viewStateKey,
+        update: {
+          selectedNodeId: null,
+          selectedNodeIds: [],
+          ...createClosedAgentCanvasWorkbenchUpdate(),
+        },
+      })
       deleteOperationRef.current = null
       invalidatePendingStopDelete()
       setDeleteSubmitting(false)
@@ -2346,7 +2440,9 @@ export function NativeCanvasWorkspace({
     stateKey,
     store,
     target,
+    updateAgentCanvasViewState,
     updateNativeCanvasState,
+    viewStateKey,
   ])
 
   /** 通过既有单节点生命周期串行删除完整选区，部分失败时保留剩余节点供重试。 */
@@ -2377,12 +2473,25 @@ export function NativeCanvasWorkspace({
             nextSelectedNodeId,
           ),
         })
-        setSelectedNodeIds([...remainingNodeIds])
+        updateAgentCanvasViewState({
+          key: viewStateKey,
+          update: {
+            selectedNodeId: nextSelectedNodeId,
+            selectedNodeIds: [...remainingNodeIds],
+            ...createClosedAgentCanvasWorkbenchUpdate(),
+          },
+        })
       },
     }).then((result) => {
       if (deleteGenerationRef.current !== deleteGeneration) return
       setDeleteSubmitting(false)
-      setSelectedNodeIds(result.remainingNodeIds)
+      updateAgentCanvasViewState({
+        key: viewStateKey,
+        update: {
+          selectedNodeId: result.remainingNodeIds[0] ?? null,
+          selectedNodeIds: result.remainingNodeIds,
+        },
+      })
       if (result.error) {
         /** 部分成功必须明确告诉用户已完成和未完成数量。 */
         const progressMessage = result.deletedNodeIds.length > 0
@@ -2395,7 +2504,15 @@ export function NativeCanvasWorkspace({
       setDeleteError(null)
       setDeleteDialogOpen(false)
     })
-  }, [adapter.deleteCanvasNode, stateKey, store, target, updateNativeCanvasState])
+  }, [
+    adapter.deleteCanvasNode,
+    stateKey,
+    store,
+    target,
+    updateAgentCanvasViewState,
+    updateNativeCanvasState,
+    viewStateKey,
+  ])
 
   React.useEffect(() => {
     if (!pendingStopDelete) return
@@ -2540,7 +2657,6 @@ export function NativeCanvasWorkspace({
     invalidatePendingStopDelete()
     deleteOperationRef.current = null
     batchDeleteOperationRef.current.clear()
-    setSelectedNodeIds([])
     setDeleteDialogOpen(false)
     setDeleteSubmitting(false)
     setDeleteError(null)
@@ -2553,28 +2669,33 @@ export function NativeCanvasWorkspace({
       stopDeleteRequestGenerationRef.current += 1
       pendingStopDeleteRef.current = null
     }
-  }, [invalidatePendingStopDelete, stateKey])
+  }, [invalidatePendingStopDelete, viewStateKey])
 
   React.useEffect(() => {
     if (state.authoritativeRecoveryState === 'idle') return
     /** recovery 已改变权威工作台身份，旧草稿保存不得再产生结果。 */
     workbenchDraftCommitCoordinatorRef.current?.invalidate()
+    updateAgentCanvasViewState({
+      key: viewStateKey,
+      update: createClosedAgentCanvasWorkbenchUpdate(),
+    })
     setWorkbenchSwitchSaving(false)
     setWorkbenchSwitchError(null)
-  }, [state.authoritativeRecoveryState])
+  }, [state.authoritativeRecoveryState, updateAgentCanvasViewState, viewStateKey])
 
   /** 聚焦第一个问题节点并打开局部恢复面板。 */
   const focusFirstIssue = React.useCallback((): void => {
     const issue = state.snapshot?.nodeIssues[0]
     if (!issue) return
-    updateNativeCanvasState({
-      key: stateKey,
+    updateAgentCanvasViewState({
+      key: viewStateKey,
       update: (current) => ({
         selectedNodeId: issue.nodeId,
-        ...createNativeCanvasWorkbenchChangeUpdate(current, issue.nodeId),
+        selectedNodeIds: [issue.nodeId],
+        ...createAgentCanvasWorkbenchChangeUpdate(current, issue.nodeId),
       }),
     })
-  }, [state.snapshot?.nodeIssues, stateKey, updateNativeCanvasState])
+  }, [state.snapshot?.nodeIssues, updateAgentCanvasViewState, viewStateKey])
 
   /** 重建入口只调用当前问题节点绑定的可取消命令。 */
   const rebuildConversationNode = React.useCallback((): void => {
@@ -2588,7 +2709,7 @@ export function NativeCanvasWorkspace({
   /** 为唯一展开节点构造轻量工作台；Agent 对话仅在这里按需挂载。 */
   const renderNodeWorkbench = React.useCallback((node: CanvasNode): React.ReactNode => {
     /** dirty 只属于当前节点，不随工作台切换复制。 */
-    const dirty = state.workbenchDraft?.nodeId === node.id && state.workbenchDraft.dirty
+    const dirty = viewState.workbenchDraft?.nodeId === node.id && viewState.workbenchDraft.dirty
     /** Agent 故障与健康对话共用同一个节点锚定壳。 */
     let content: React.ReactNode
     if (node.kind === 'agent') {
@@ -2624,7 +2745,7 @@ export function NativeCanvasWorkspace({
           target={target}
           writable={workspaceWritable}
           adapter={imageWorkbenchAdapter}
-          autoSaveEnabled={state.pendingWorkbenchSwitchNodeId === null}
+          autoSaveEnabled={viewState.pendingWorkbenchSwitchNodeId === null}
           onDirtyChange={updateWorkbenchDirty}
           onRegisterDraftCommitter={registerWorkbenchDraftCommitter}
         />
@@ -2634,6 +2755,11 @@ export function NativeCanvasWorkspace({
       <CanvasNodeWorkbenchOverlay
         node={node}
         dirty={dirty}
+        workbenchSize={viewState.workbenchSize}
+        onWorkbenchSizeChange={(workbenchSize) => updateAgentCanvasViewState({
+          key: viewStateKey,
+          update: { workbenchSize },
+        })}
         onDirtyChange={(nextDirty) => updateWorkbenchDirty(node.id, nextDirty)}
         onClose={closeWorkbench}
       >
@@ -2651,10 +2777,13 @@ export function NativeCanvasWorkspace({
     rebuildState.loading,
     requestSelectedNodeDelete,
     state.snapshot?.nodeIssues,
-    state.workbenchDraft,
-    stateKey,
+    updateAgentCanvasViewState,
     target,
     updateWorkbenchDirty,
+    viewState.pendingWorkbenchSwitchNodeId,
+    viewState.workbenchDraft,
+    viewState.workbenchSize,
+    viewStateKey,
     workspaceWritable,
   ])
 
@@ -2703,13 +2832,13 @@ export function NativeCanvasWorkspace({
               className="relative h-full min-w-0"
             >
               <NativeCanvasToolbar
-                activeTool={state.activeTool}
+                activeTool={viewState.activeTool}
                 writable={workspaceWritable}
                 canAdd={canCreateNode}
                 canDelete={canDeleteNode}
                 issueCount={state.snapshot.nodeIssues.length}
-                onToolChange={(activeTool) => updateNativeCanvasState({
-                  key: stateKey,
+                onToolChange={(activeTool) => updateAgentCanvasViewState({
+                  key: viewStateKey,
                   update: { activeTool },
                 })}
                 onAddNode={(kind) => runNativeCanvasToolbarAddNode(kind, (request) => {
@@ -2719,9 +2848,9 @@ export function NativeCanvasWorkspace({
                 onFocusFirstIssue={focusFirstIssue}
               />
               <NativeCanvasGraph
-                document={state.snapshot.document}
+                document={viewDocument ?? state.snapshot.document}
                 writable={workspaceWritable}
-                activeTool={state.activeTool}
+                activeTool={viewState.activeTool}
                 nodeIssues={state.snapshot.nodeIssues}
                 runningSessionIds={runningSessionIds}
                 imagePreviews={imagePreviews}
@@ -2729,24 +2858,30 @@ export function NativeCanvasWorkspace({
                 onCreateChild={(sourceNodeId, kind) => {
                   void commandRef.current?.execute({ kind, sourceNodeId }).catch(() => undefined)
                 }}
-                selectedNodeId={state.selectedNodeId}
+                selectedNodeId={viewState.selectedNodeId}
                 selectedNodeIds={validSelectedNodeIds}
-                onMutation={(mutation) => controllerRef.current?.enqueueMutation(mutation)}
-                onNodeSelect={(selectedNodeId) => updateNativeCanvasState({
-                  key: stateKey,
+                onMutation={(mutation) => routeNativeCanvasWorkspaceMutation(
+                  mutation,
+                  (update) => updateAgentCanvasViewState({ key: viewStateKey, update }),
+                  (graphMutation) => controllerRef.current?.enqueueMutation(graphMutation),
+                )}
+                onNodeSelect={(selectedNodeId) => updateAgentCanvasViewState({
+                  key: viewStateKey,
                   update: { selectedNodeId },
                 })}
                 onNodeSelectionChange={(nodeIds) => {
-                  /** Graph 是完整选区来源，首个节点继续同步给详情兼容状态。 */
-                  setSelectedNodeIds([...nodeIds])
-                  updateNativeCanvasState({
-                    key: stateKey,
-                    update: { selectedNodeId: nodeIds[0] ?? null },
+                  /** Graph 是完整选区来源，首个节点继续作为详情主节点。 */
+                  updateAgentCanvasViewState({
+                    key: viewStateKey,
+                    update: {
+                      selectedNodeId: nodeIds[0] ?? null,
+                      selectedNodeIds: [...nodeIds],
+                    },
                   })
                 }}
                 onConversationNodeChange={() => undefined}
                 onWorkbenchNodeChange={requestWorkbenchNodeChange}
-                expandedNodeId={state.expandedNodeId}
+                expandedNodeId={viewState.expandedNodeId}
                 renderWorkbench={renderNodeWorkbench}
                 flowRenderer={flowRenderer}
               />
@@ -2824,12 +2959,12 @@ export function NativeCanvasWorkspace({
         }}
       />
       <Dialog
-        open={state.pendingWorkbenchSwitchNodeId !== null}
+        open={viewState.pendingWorkbenchSwitchNodeId !== null}
         onOpenChange={(open) => {
           if (open || workbenchSwitchSaving) return
           workbenchDraftCommitCoordinatorRef.current?.invalidate()
-          updateNativeCanvasState({
-            key: stateKey,
+          updateAgentCanvasViewState({
+            key: viewStateKey,
             update: { pendingWorkbenchSwitchNodeId: null },
           })
           setWorkbenchSwitchError(null)
@@ -2838,7 +2973,7 @@ export function NativeCanvasWorkspace({
         <DialogContent className="max-w-md" hideClose>
           <DialogHeader>
             <DialogTitle>
-              {state.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
+              {viewState.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
                 ? '关闭工作台？'
                 : '切换工作台？'}
             </DialogTitle>
@@ -2861,8 +2996,8 @@ export function NativeCanvasWorkspace({
               disabled={workbenchSwitchSaving}
               onClick={() => {
                 workbenchDraftCommitCoordinatorRef.current?.invalidate()
-                updateNativeCanvasState({
-                  key: stateKey,
+                updateAgentCanvasViewState({
+                  key: viewStateKey,
                   update: { pendingWorkbenchSwitchNodeId: null },
                 })
               }}
@@ -2875,7 +3010,7 @@ export function NativeCanvasWorkspace({
               disabled={workbenchSwitchSaving}
               onClick={resolveWorkbenchSwitch}
             >
-              {state.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
+              {viewState.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
                 ? '放弃并关闭'
                 : '放弃并切换'}
             </Button>
@@ -2886,7 +3021,7 @@ export function NativeCanvasWorkspace({
             >
               {workbenchSwitchSaving
                 ? '正在保存'
-                : state.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
+                : viewState.pendingWorkbenchSwitchNodeId === NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET
                   ? '保存并关闭'
                   : '保存并切换'}
             </Button>

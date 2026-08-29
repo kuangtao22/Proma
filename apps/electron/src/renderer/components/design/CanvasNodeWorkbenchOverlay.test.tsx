@@ -26,6 +26,8 @@ describe('Canvas 节点工作台覆盖层', () => {
       <CanvasNodeWorkbenchOverlay
         node={createNode(kind)}
         dirty={false}
+        workbenchSize={null}
+        onWorkbenchSizeChange={() => undefined}
         onDirtyChange={() => undefined}
         onClose={() => undefined}
       />,
@@ -79,6 +81,8 @@ describe('Canvas 节点工作台覆盖层', () => {
       <CanvasNodeWorkbenchOverlay
         node={createNode('agent')}
         dirty={false}
+        workbenchSize={{ width: 680, height: 540 }}
+        onWorkbenchSizeChange={() => undefined}
         onDirtyChange={() => undefined}
         onClose={() => undefined}
       >
