@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import {
   CanvasNodeWorkbenchOverlay,
   calculateCanvasWorkbenchResize,
+  createCanvasWorkbenchResizeGestureController,
 } from './CanvasNodeWorkbenchOverlay'
 
 /** 创建四类最小节点，验证工作台壳不依赖正文或执行结果。 */
@@ -49,6 +50,33 @@ describe('Canvas 节点工作台覆盖层', () => {
       canvasScale: { x: 2, y: 2 },
       availableSize: { width: 900, height: 760 },
     })).toEqual({ width: 780, height: 660 })
+  })
+
+  test('Given 缩放指针连续移动多次 When 结束手势 Then 只提交一次最终尺寸', () => {
+    const previews: Array<{ width: number; height: number }> = []
+    const commits: Array<{ width: number; height: number }> = []
+    const controller = createCanvasWorkbenchResizeGestureController({
+      onPreview: (size) => previews.push(size),
+      onCommit: (size) => commits.push(size),
+    })
+    controller.start({
+      initialSize: { width: 600, height: 500 },
+      pointerDelta: { x: 0, y: 0 },
+      canvasScale: { x: 1, y: 1 },
+      availableSize: { width: 900, height: 800 },
+    })
+
+    controller.move({ x: 20, y: 30 })
+    controller.move({ x: 40, y: 50 })
+    controller.move({ x: 80, y: 90 })
+    controller.finish()
+
+    expect(previews).toEqual([
+      { width: 620, height: 530 },
+      { width: 640, height: 550 },
+      { width: 680, height: 590 },
+    ])
+    expect(commits).toEqual([{ width: 680, height: 590 }])
   })
 
   test('Given 工作台接近画布边界 When 放大或缩小超过范围 Then 尺寸限制在可视范围和最小值内', () => {

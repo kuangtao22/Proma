@@ -88,6 +88,12 @@ export function createCanvasImageModuleKey(target: CanvasImageTarget): string {
   ])
 }
 
+/** 共享 graph 的结构生命周期操作身份。 */
+export interface NativeCanvasStructuralOperation {
+  id: string
+  kind: 'create' | 'delete' | 'restore' | 'rebuild'
+}
+
 /** 按项目与 Canvas 双重身份隔离的 Renderer 状态。 */
 export interface NativeCanvasState {
   phase: NativeCanvasPhase
@@ -98,6 +104,8 @@ export interface NativeCanvasState {
   authoritativeRecoveryState: 'idle' | 'loading' | 'failed'
   /** recovery 期间观察到的最高普通 graph revision，跨 remount 保留。 */
   deferredGraphRevision: number | null
+  /** 当前共享 graph 正在执行的唯一结构生命周期操作。 */
+  structuralOperation: NativeCanvasStructuralOperation | null
   error: string | null
 }
 
@@ -111,6 +119,7 @@ export function createInitialNativeCanvasState(): NativeCanvasState {
     saveState: 'saved',
     authoritativeRecoveryState: 'idle',
     deferredGraphRevision: null,
+    structuralOperation: null,
     error: null,
   }
 }
@@ -504,5 +513,50 @@ export const updateNativeCanvasStateAtom = atom(
     const nextStates = new Map(states)
     nextStates.set(input.key, { ...current, ...update })
     set(nativeCanvasStatesAtom, nextStates)
+  },
+)
+
+/** 共享 graph 结构操作获取输入。 */
+export interface AcquireNativeCanvasStructuralOperationInput {
+  key: string
+  operation: NativeCanvasStructuralOperation
+}
+
+/** 仅在 graph 空闲时原子取得结构操作 token。 */
+export const acquireNativeCanvasStructuralOperationAtom = atom(
+  null,
+  (get, set, input: AcquireNativeCanvasStructuralOperationInput): boolean => {
+    const states = get(nativeCanvasStatesAtom)
+    const current = states.get(input.key) ?? createInitialNativeCanvasState()
+    if (!current.snapshot?.writable
+      || current.structuralOperation !== null
+      || current.pendingMutations.length > 0
+      || current.inFlightMutations.length > 0
+      || current.saveState !== 'saved'
+      || current.authoritativeRecoveryState !== 'idle') return false
+    const nextStates = new Map(states)
+    nextStates.set(input.key, { ...current, structuralOperation: input.operation })
+    set(nativeCanvasStatesAtom, nextStates)
+    return true
+  },
+)
+
+/** 共享 graph 结构操作释放输入。 */
+export interface ReleaseNativeCanvasStructuralOperationInput {
+  key: string
+  operationId: string
+}
+
+/** 只有持有者可释放结构操作 token。 */
+export const releaseNativeCanvasStructuralOperationAtom = atom(
+  null,
+  (get, set, input: ReleaseNativeCanvasStructuralOperationInput): boolean => {
+    const states = get(nativeCanvasStatesAtom)
+    const current = states.get(input.key)
+    if (!current || current.structuralOperation?.id !== input.operationId) return false
+    const nextStates = new Map(states)
+    nextStates.set(input.key, { ...current, structuralOperation: null })
+    set(nativeCanvasStatesAtom, nextStates)
+    return true
   },
 )

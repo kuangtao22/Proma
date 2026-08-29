@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
+import { createEmptyCanvasDocument } from '@proma/shared'
+import type { CanvasMutation } from '@proma/shared'
 import { createStore } from 'jotai'
 import {
+  acquireNativeCanvasStructuralOperationAtom,
   canvasImageModuleStatesAtom,
   canvasAgentActiveInternalInvalidSessionIdsAtom,
   canvasAgentInternalInvalidSessionIdsAtom,
@@ -19,6 +22,7 @@ import {
   createInitialNativeCanvasState,
   createNativeCanvasKey,
   nativeCanvasStatesAtom,
+  releaseNativeCanvasStructuralOperationAtom,
   updateCanvasImageModuleStateAtom,
   updateNativeCanvasStateAtom,
   isCanvasAgentGenerationCurrent,
@@ -196,8 +200,39 @@ describe('原生 Canvas 状态隔离', () => {
       'phase',
       'saveState',
       'snapshot',
+      'structuralOperation',
     ])
     expect(createNativeCanvasKey('project-a', 'canvas-a')).toBe('project-a:canvas-a')
+  })
+
+  test('Given 共享 graph 仍有 pending When 结构操作尝试获取 token Then 拒绝且不改既有队列', () => {
+    const store = createStore()
+    const key = createNativeCanvasKey('project-a', 'canvas-a')
+    const pending: CanvasMutation = {
+      type: 'move-nodes', positions: [{ nodeId: 'node-a', position: { x: 1, y: 2 } }],
+    }
+    store.set(nativeCanvasStatesAtom, new Map([[key, {
+      ...createInitialNativeCanvasState(),
+      phase: 'ready',
+      snapshot: { document: createEmptyCanvasDocument('project-a', 'canvas-a'), writable: true, nodeIssues: [] },
+      pendingMutations: [pending],
+      saveState: 'dirty',
+    }]]))
+
+    const acquired = store.set(acquireNativeCanvasStructuralOperationAtom, {
+      key,
+      operation: { id: 'delete-1', kind: 'delete' },
+    })
+
+    expect(acquired).toBe(false)
+    expect(store.get(nativeCanvasStatesAtom).get(key)).toMatchObject({
+      pendingMutations: [pending],
+      saveState: 'dirty',
+      structuralOperation: null,
+    })
+    expect(store.set(releaseNativeCanvasStructuralOperationAtom, {
+      key, operationId: 'delete-1',
+    })).toBe(false)
   })
 
   test('Given 未打开 Canvas 的 Agent 仍在运行 When 切换 Canvas Then owner 和按会话消息缓存不丢失', () => {

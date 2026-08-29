@@ -40,6 +40,10 @@ export interface NativeCanvasTrashControllerDependencies {
   getEmptyCanvasCenter: () => DesignPoint
   onStateChange: (state: NativeCanvasTrashState) => void
   onRestored: (result: CanvasNodeLifecycleResult, nodeId: string) => void
+  /** 恢复前取得共享 graph 结构 token。 */
+  beginOperation?: (operationId: string) => boolean
+  /** 恢复结束后释放共享 graph 结构 token。 */
+  endOperation?: (operationId: string) => void
 }
 
 /** 回收区按需加载和恢复命令。 */
@@ -124,6 +128,10 @@ export function createNativeCanvasTrashController(
         }
         restoreOperations.set(entry.trashId, operation)
       }
+      if (dependencies.beginOperation && !dependencies.beginOperation(operation.operationId)) {
+        updateState({ error: 'Canvas 正在执行其它结构操作。' })
+        return
+      }
       updateState({ restoringTrashId: entry.trashId, error: null })
       try {
         const result = await dependencies.restoreNode(operation)
@@ -141,6 +149,8 @@ export function createNativeCanvasTrashController(
       } catch {
         if (disposed || generation !== requestGeneration) return
         updateState({ restoringTrashId: null, error: '节点恢复失败，请重试。' })
+      } finally {
+        dependencies.endOperation?.(operation.operationId)
       }
     },
     close: () => {

@@ -73,6 +73,7 @@ import {
   createStopAcceptedPendingCanvasDelete,
   settleNativeCanvasStopDeleteAttempt,
   createNativeCanvasWorkspaceController,
+  createNativeCanvasWorkspaceControllerRegistry,
   getNativeCanvasConnectedEdgeCount,
   getPendingCanvasStopDeleteGenerationStatus,
   isPendingCanvasStopDeleteCurrent,
@@ -1041,6 +1042,36 @@ function createHarness(
 }
 
 describe('原生 Canvas controller 加载与事件', () => {
+  test('Given 两个会话 effect 使用同一 graph key When 依次卸载 Then 单路 LOAD 且最后用户才释放 controller', () => {
+    const tasks: Array<() => void> = []
+    const registry = createNativeCanvasWorkspaceControllerRegistry((task) => tasks.push(task))
+    const harness = createHarness({ phase: 'ready', snapshot: createSnapshot(2) })
+    let factories = 0
+    const first = registry.acquire('project-1:canvas-1', () => {
+      factories += 1
+      return harness.controller
+    })
+    const second = registry.acquire('project-1:canvas-1', () => {
+      factories += 1
+      return harness.controller
+    })
+
+    expect(factories).toBe(1)
+    expect(harness.loads).toHaveLength(1)
+    first.release()
+    tasks.splice(0).forEach((task) => task())
+    second.controller.enqueueMutation({
+      type: 'move-nodes', positions: [{ nodeId: 'node-1', position: { x: 12, y: 18 } }],
+    })
+    harness.scheduler.runAll()
+    expect(harness.saves).toHaveLength(1)
+    expect(harness.unsubscribeCount()).toBe(0)
+
+    second.release()
+    tasks.splice(0).forEach((task) => task())
+    expect(harness.unsubscribeCount()).toBe(1)
+  })
+
   test('Given LOAD 异常含内部正文 When 加载失败 Then 状态只保留固定公开文案', async () => {
     const harness = createHarness()
     harness.controller.start()
@@ -1121,6 +1152,25 @@ describe('原生 Canvas controller 加载与事件', () => {
 })
 
 describe('原生 Canvas controller 保存', () => {
+  test('Given 另一会话正在执行结构操作 When 当前会话尝试移动节点 Then 拒绝新增 mutation 且保留既有 pending', () => {
+    const existing: CanvasMutation = {
+      type: 'move-nodes', positions: [{ nodeId: 'node-1', position: { x: 3, y: 4 } }],
+    }
+    const harness = createHarness({
+      phase: 'ready', snapshot: createSnapshot(2), pendingMutations: [existing],
+      saveState: 'dirty',
+      structuralOperation: { id: 'delete-1', kind: 'delete' },
+    })
+    const blocked: CanvasMutation = {
+      type: 'move-nodes', positions: [{ nodeId: 'node-1', position: { x: 20, y: 30 } }],
+    }
+
+    harness.controller.enqueueMutation(blocked)
+
+    expect(harness.getState().pendingMutations).toEqual([existing])
+    expect(harness.scheduler.getDelay()).toBeUndefined()
+  })
+
   test('Given 连续交互 When 400ms 尾触发 Then 重排定时并压缩视口后单批保存', async () => {
     const harness = createHarness({ phase: 'ready', snapshot: createSnapshot(2) })
     harness.controller.enqueueMutation({ type: 'set-viewport', viewport: { x: 1, y: 1, zoom: 1 } })

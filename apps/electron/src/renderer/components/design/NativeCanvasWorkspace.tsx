@@ -26,15 +26,18 @@ import {
   canvasAgentRunningSessionIdsAtom,
   canvasAgentOptimisticRunGenerationsAtom,
   canvasAgentRunGenerationsAtom,
+  acquireNativeCanvasStructuralOperationAtom,
   createInitialNativeCanvasState,
   createNativeCanvasKey,
   nativeCanvasStatesAtom,
+  releaseNativeCanvasStructuralOperationAtom,
   updateNativeCanvasStateAtom,
 } from '@/atoms/native-canvas-atoms'
 import type {
   CanvasImageModuleDraft,
   CanvasImageModuleSaveState,
   NativeCanvasState,
+  NativeCanvasStructuralOperation,
 } from '@/atoms/native-canvas-atoms'
 import {
   agentCanvasViewStatesAtom,
@@ -213,6 +216,10 @@ export interface CanvasNodeCreateCommandDependencies {
   getPosition: (sourceNodeId?: string) => DesignPoint
   onStateChange: (state: CanvasAgentNodeCommandState) => void
   onSuccess: (success: CanvasNodeCreateCommandSuccess) => void
+  /** 请求开始前原子取得共享 graph 结构 token。 */
+  beginOperation?: (operationId: string) => boolean
+  /** Promise settle 后释放共享 graph 结构 token。 */
+  endOperation?: (operationId: string) => void
 }
 
 /** 通用节点创建命令接口。 */
@@ -229,6 +236,8 @@ export interface CanvasAgentNodeCommandDependencies {
   getPosition: (sourceNodeId?: string) => DesignPoint
   onStateChange: (state: CanvasAgentNodeCommandState) => void
   onSuccess: (nodeId: string, result: CanvasAgentNodeCreationResult) => void
+  beginOperation?: (operationId: string) => boolean
+  endOperation?: (operationId: string) => void
 }
 
 /** 单次用户创建 operation 的命令接口。 */
@@ -244,6 +253,8 @@ export interface CanvasAgentNodeRebuildDependencies {
   createId: () => string
   onStateChange: (state: CanvasAgentNodeCommandState) => void
   onSuccess: (result: RebuildCanvasAgentNodeResult) => void
+  beginOperation?: (operationId: string) => boolean
+  endOperation?: (operationId: string) => void
 }
 
 /** 单个坏节点重建 operation 的命令接口。 */
@@ -903,6 +914,9 @@ export function createCanvasNodeCommandController(
       /** operation 与 request 在同一同步分支中共同生成，此处固定捕获已确认类型。 */
       const commandKind = operationRequest!.kind
       const requestGeneration = generation
+      if (dependencies.beginOperation && !dependencies.beginOperation(command.operationId)) {
+        return Promise.reject(new Error('Canvas 正在执行其它结构操作'))
+      }
       dependencies.onStateChange({ loading: true, error: null })
       const createPromise = commandKind === 'agent'
         ? dependencies.createAgentNode(command as CreateCanvasAgentNodeInput)
@@ -922,6 +936,7 @@ export function createCanvasNodeCommandController(
         }
         throw error
       }).finally(() => {
+        dependencies.endOperation?.(command.operationId)
         if (inFlight === requestPromise) inFlight = null
       })
       inFlight = requestPromise
@@ -962,6 +977,8 @@ export function createCanvasAgentNodeCommandController(
       if ('snapshot' in result) return
       dependencies.onSuccess(nodeId, result)
     },
+    beginOperation: dependencies.beginOperation,
+    endOperation: dependencies.endOperation,
   })
   return {
     execute: (request = {}) => controller.execute({ kind: 'agent', ...request }),
@@ -992,6 +1009,9 @@ export function createCanvasAgentNodeRebuildController(
       /** 本轮请求固定捕获 operation 和代次。 */
       const request = operation
       const requestGeneration = generation
+      if (dependencies.beginOperation && !dependencies.beginOperation(request.operationId)) {
+        return Promise.reject(new Error('Canvas 正在执行其它结构操作'))
+      }
       dependencies.onStateChange({ loading: true, error: null })
       const requestPromise = dependencies.rebuildAgentNode(request).then((result) => {
         if (disposed || generation !== requestGeneration) return
@@ -1007,6 +1027,7 @@ export function createCanvasAgentNodeRebuildController(
         }
         throw error
       }).finally(() => {
+        dependencies.endOperation?.(request.operationId)
         if (inFlight === requestPromise) inFlight = null
       })
       inFlight = requestPromise
@@ -1144,6 +1165,77 @@ export interface NativeCanvasWorkspaceController {
   dispose: () => void
 }
 
+/** 共享 graph controller 的单个引用租约。 */
+export interface NativeCanvasWorkspaceControllerLease {
+  controller: NativeCanvasWorkspaceController
+  release: () => void
+}
+
+/** graph key 级 controller registry。 */
+export interface NativeCanvasWorkspaceControllerRegistry {
+  acquire: (
+    stateKey: string,
+    createController: () => NativeCanvasWorkspaceController,
+  ) => NativeCanvasWorkspaceControllerLease
+}
+
+/** registry 内单个 graph 的 controller、引用和待释放代次。 */
+interface NativeCanvasWorkspaceControllerRegistryEntry {
+  controller: NativeCanvasWorkspaceController
+  activeLeaseIds: Set<number>
+  pendingDisposeId: number | null
+}
+
+/**
+ * 创建 graph key 级共享 controller registry。
+ * @param scheduleMicrotask 最后引用释放后的延迟确认调度器。
+ * @returns 同 key 单 controller、StrictMode 安全且引用计数的 registry。
+ */
+export function createNativeCanvasWorkspaceControllerRegistry(
+  scheduleMicrotask: NativeCanvasWorkbenchCleanupScheduler,
+): NativeCanvasWorkspaceControllerRegistry {
+  const entries = new Map<string, NativeCanvasWorkspaceControllerRegistryEntry>()
+  let nextIdentity = 1
+  return {
+    acquire: (stateKey, createController) => {
+      let entry = entries.get(stateKey)
+      if (!entry) {
+        const controller = createController()
+        entry = { controller, activeLeaseIds: new Set(), pendingDisposeId: null }
+        entries.set(stateKey, entry)
+        controller.start()
+      }
+      entry.pendingDisposeId = null
+      const leaseId = nextIdentity
+      nextIdentity += 1
+      entry.activeLeaseIds.add(leaseId)
+      /** 新 owner 接管时重新检查共享 dirty，避免旧 owner 卸载留下无调度队列。 */
+      entry.controller.sync()
+      let released = false
+      return {
+        controller: entry.controller,
+        release: () => {
+          if (released) return
+          released = true
+          entry!.activeLeaseIds.delete(leaseId)
+          if (entry!.activeLeaseIds.size > 0) return
+          const disposeId = nextIdentity
+          nextIdentity += 1
+          entry!.pendingDisposeId = disposeId
+          scheduleMicrotask(() => {
+            if (entries.get(stateKey) !== entry
+              || entry!.pendingDisposeId !== disposeId
+              || entry!.activeLeaseIds.size > 0) return
+            entries.delete(stateKey)
+            entry!.pendingDisposeId = null
+            entry!.controller.dispose()
+          })
+        },
+      }
+    },
+  }
+}
+
 /** 当前 controller 持有的单个在途保存批次。 */
 interface ActiveNativeCanvasSave {
   generation: number
@@ -1228,6 +1320,7 @@ export function createNativeCanvasWorkspaceController(
     && state.saveState !== 'failed'
     && state.saveState !== 'conflict'
     && state.authoritativeRecoveryState === 'idle'
+    && state.structuralOperation === null
     && activeSave === null,
   )
 
@@ -1468,6 +1561,7 @@ export function createNativeCanvasWorkspaceController(
       dependencies.updateState((current) => {
         if (!current.snapshot
           || current.authoritativeRecoveryState !== 'idle'
+          || current.structuralOperation !== null
           || current.saveState === 'conflict') return {}
         return {
           snapshot: {
@@ -1531,6 +1625,11 @@ export function createNativeCanvasWorkspaceController(
     },
   }
 }
+
+/** Renderer 内所有同 graph Workspace 共享的唯一 controller registry。 */
+const nativeCanvasWorkspaceControllerRegistry = createNativeCanvasWorkspaceControllerRegistry(
+  (task) => { void Promise.resolve().then(task) },
+)
 
 /** 工作台编辑器注册的唯一草稿提交能力。 */
 export interface NativeCanvasWorkbenchDraftCommitter {
@@ -2000,6 +2099,19 @@ export function NativeCanvasWorkspace({
     [state, viewStateKey],
   )
   const viewState = viewStates.get(viewStateKey) ?? fallbackViewState
+  /** 原子取得共享 graph 结构操作身份，跨 session view 串行化生命周期请求。 */
+  const beginStructuralOperation = React.useCallback((
+    operationId: string,
+    kind: NativeCanvasStructuralOperation['kind'],
+  ): boolean => store.set(acquireNativeCanvasStructuralOperationAtom, {
+    key: stateKey,
+    operation: { id: operationId, kind },
+  }), [stateKey, store])
+  /** 只释放自身 token，并让共享 controller 重新调度结构操作前冻结的 pending。 */
+  const endStructuralOperation = React.useCallback((operationId: string): void => {
+    if (!store.set(releaseNativeCanvasStructuralOperationAtom, { key: stateKey, operationId })) return
+    controllerRef.current?.sync()
+  }, [stateKey, store])
   /** Graph 只接收会话视口投影；共享 snapshot 对象及 revision 保持不变。 */
   const viewDocument = React.useMemo(() => state.snapshot
     ? { ...state.snapshot.document, viewport: viewState.viewport }
@@ -2078,19 +2190,20 @@ export function NativeCanvasWorkspace({
       setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
       clearTimeout: (timerId) => window.clearTimeout(timerId),
     }
-    const controller = createNativeCanvasWorkspaceController({
-      target: { projectId: target.projectId, canvasId: target.canvasId },
-      adapter,
-      getState: () => store.get(nativeCanvasStatesAtom).get(stateKey)
-        ?? createInitialNativeCanvasState(),
-      updateState: (update) => updateNativeCanvasState({ key: stateKey, update }),
-      scheduler,
-    })
-    controllerRef.current = controller
-    controller.start()
+    const lease = nativeCanvasWorkspaceControllerRegistry.acquire(stateKey, () => (
+      createNativeCanvasWorkspaceController({
+        target: { projectId: target.projectId, canvasId: target.canvasId },
+        adapter,
+        getState: () => store.get(nativeCanvasStatesAtom).get(stateKey)
+          ?? createInitialNativeCanvasState(),
+        updateState: (update) => updateNativeCanvasState({ key: stateKey, update }),
+        scheduler,
+      })
+    ))
+    controllerRef.current = lease.controller
     return () => {
-      controller.dispose()
-      if (controllerRef.current === controller) controllerRef.current = null
+      lease.release()
+      if (controllerRef.current === lease.controller) controllerRef.current = null
     }
   }, [adapter, stateKey, store, target.canvasId, target.projectId, updateNativeCanvasState])
 
@@ -2140,6 +2253,8 @@ export function NativeCanvasWorkspace({
         })
       },
       onStateChange: setCreateState,
+      beginOperation: (operationId) => beginStructuralOperation(operationId, 'create'),
+      endOperation: endStructuralOperation,
       onSuccess: (success) => {
         updateNativeCanvasState({
           key: stateKey,
@@ -2162,6 +2277,8 @@ export function NativeCanvasWorkspace({
     }
   }, [
     adapter,
+    beginStructuralOperation,
+    endStructuralOperation,
     stateKey,
     store,
     target.canvasId,
@@ -2198,6 +2315,8 @@ export function NativeCanvasWorkspace({
         }
       },
       onStateChange: setTrashState,
+      beginOperation: (operationId) => beginStructuralOperation(operationId, 'restore'),
+      endOperation: endStructuralOperation,
       onRestored: (result, nodeId) => {
         workbenchDraftCommitCoordinatorRef.current?.invalidate()
         updateNativeCanvasState({
@@ -2222,6 +2341,8 @@ export function NativeCanvasWorkspace({
   }, [
     adapter.listCanvasTrash,
     adapter.restoreCanvasNode,
+    beginStructuralOperation,
+    endStructuralOperation,
     stateKey,
     store,
     target,
@@ -2242,6 +2363,8 @@ export function NativeCanvasWorkspace({
       rebuildAgentNode: adapter.rebuildCanvasAgentNode,
       createId: () => window.crypto.randomUUID(),
       onStateChange: setRebuildState,
+      beginOperation: (operationId) => beginStructuralOperation(operationId, 'rebuild'),
+      endOperation: endStructuralOperation,
       onSuccess: (result) => {
         updateNativeCanvasState({
           key: stateKey,
@@ -2264,8 +2387,10 @@ export function NativeCanvasWorkspace({
     }
   }, [
     adapter.rebuildCanvasAgentNode,
+    beginStructuralOperation,
     conversationNode,
     conversationNodeIssue,
+    endStructuralOperation,
     stateKey,
     target,
     updateAgentCanvasViewState,
@@ -2302,6 +2427,7 @@ export function NativeCanvasWorkspace({
   const workspaceWritable = Boolean(
     state.snapshot?.writable
     && state.authoritativeRecoveryState === 'idle'
+    && state.structuralOperation === null
     && state.saveState !== 'conflict',
   )
   /** 删除要求存在完整选区和可写快照，主进程继续逐节点复核运行态。 */
@@ -2423,6 +2549,10 @@ export function NativeCanvasWorkspace({
       }
       deleteOperationRef.current = operation
     }
+    if (!beginStructuralOperation(operation.operationId, 'delete')) {
+      setDeleteError('Canvas 正在执行其它结构操作。')
+      return
+    }
     const deleteGeneration = deleteGenerationRef.current
     setDeleteSubmitting(true)
     setDeleteError(null)
@@ -2451,9 +2581,13 @@ export function NativeCanvasWorkspace({
       invalidatePendingStopDelete()
       setDeleteSubmitting(false)
       setDeleteError(getNativeCanvasOperationErrorMessage('delete', error))
+    }).finally(() => {
+      endStructuralOperation(operation.operationId)
     })
   }, [
     adapter.deleteCanvasNode,
+    beginStructuralOperation,
+    endStructuralOperation,
     invalidatePendingStopDelete,
     stateKey,
     store,
@@ -2469,6 +2603,11 @@ export function NativeCanvasWorkspace({
     if (!adapter.deleteCanvasNode || !latest?.snapshot || nodeIds.length < 2) return
     /** 当前批次绑定 Canvas 删除代次，切换后不再提交后续节点。 */
     const deleteGeneration = deleteGenerationRef.current
+    const structuralOperationId = window.crypto.randomUUID()
+    if (!beginStructuralOperation(structuralOperationId, 'delete')) {
+      setDeleteError('Canvas 正在执行其它结构操作。')
+      return
+    }
     setDeleteSubmitting(true)
     setDeleteError(null)
     void deleteNativeCanvasNodesSequentially({
@@ -2521,9 +2660,13 @@ export function NativeCanvasWorkspace({
       batchDeleteOperationRef.current.clear()
       setDeleteError(null)
       setDeleteDialogOpen(false)
+    }).finally(() => {
+      endStructuralOperation(structuralOperationId)
     })
   }, [
     adapter.deleteCanvasNode,
+    beginStructuralOperation,
+    endStructuralOperation,
     stateKey,
     store,
     target,
