@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  getAgentCanvasBindingsPath,
   getAgentSessionMessagesPath,
   getAgentWorkspacePath,
   getConfigDir,
@@ -52,6 +53,15 @@ test('Given traversal 消息 ID When 解析 JSONL 路径 Then Agent 与 Conversa
 
 test('Given the default environment When resolving business storage Then it uses the shared config directory', () => {
   expect(getConfigDirName()).toBe('.proma')
+})
+
+test('Given 配置根 When 解析 Agent-画布关联索引 Then 使用根目录下固定 JSON 文件', () => {
+  /** 独立配置根用于证明路径不依赖 Electron userData。 */
+  const configRoot = join(tmpdir(), 'proma-agent-canvas-bindings')
+
+  expect(getAgentCanvasBindingsPath(configRoot)).toBe(
+    join(configRoot, 'agent-canvas-bindings.json'),
+  )
 })
 
 test('Given traversal 或绝对 sessionId When 解析会话目录 Then 在文件系统访问前拒绝越界', () => {

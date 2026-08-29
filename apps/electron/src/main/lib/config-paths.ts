@@ -255,6 +255,16 @@ export function getAgentSessionsIndexPath(): string {
 }
 
 /**
+ * 获取普通 Agent 与项目画布的关联索引路径。
+ *
+ * @param configDir 业务配置根；测试可注入独立目录。
+ * @returns 配置根下固定的 agent-canvas-bindings.json 路径。
+ */
+export function getAgentCanvasBindingsPath(configDir = getConfigDir()): string {
+  return join(configDir, 'agent-canvas-bindings.json')
+}
+
+/**
  * 获取 Agent 会话消息目录路径
  *
  * 如果目录不存在则自动创建。
