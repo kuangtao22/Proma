@@ -165,6 +165,13 @@ function createProjectMutationDependencies() {
   }
 }
 
+/** 删除生命周期测试显式注入同步项目写守卫。 */
+function createCleanupMutationDependency() {
+  return {
+    runProjectMutation: <T>(_projectId: string, effect: () => T): T => effect(),
+  }
+}
+
 /** 调用已注册 handler 并返回主进程安全信封。 */
 async function invoke<T>(
   handlers: Map<string, TestHandler>,
@@ -209,14 +216,14 @@ describe('Agent-画布关联 IPC', () => {
       clearCanvas: () => undefined,
     }
 
-    expect(cleanupDeletedAgentSessionCanvasBindings({ store, broadcast: () => undefined }, createAgentSession())).toBeUndefined()
-    expect(cleanupDeletedAgentSessionCanvasBindings({ store, broadcast: () => undefined }, createAgentSession('canvas-agent', {
+    expect(cleanupDeletedAgentSessionCanvasBindings({ ...createCleanupMutationDependency(), store, broadcast: () => undefined }, createAgentSession())).toBeUndefined()
+    expect(cleanupDeletedAgentSessionCanvasBindings({ ...createCleanupMutationDependency(), store, broadcast: () => undefined }, createAgentSession('canvas-agent', {
       sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
     }))).toBeUndefined()
-    expect(cleanupDeletedAgentSessionCanvasBindings({ store, broadcast: () => undefined }, createAgentSession('automation-agent', {
+    expect(cleanupDeletedAgentSessionCanvasBindings({ ...createCleanupMutationDependency(), store, broadcast: () => undefined }, createAgentSession('automation-agent', {
       sourceAutomationId: 'automation-1',
     }))).toBeUndefined()
-    expect(cleanupDeletedAgentSessionCanvasBindings({ store, broadcast: () => undefined }, createAgentSession('delegated-agent', {
+    expect(cleanupDeletedAgentSessionCanvasBindings({ ...createCleanupMutationDependency(), store, broadcast: () => undefined }, createAgentSession('delegated-agent', {
       parentSessionId: 'parent-1', sourceDelegationId: 'delegation-1',
     }))).toBeUndefined()
     expect(cleared).toEqual([{ projectId: 'project-1', sessionId: 'session-1' }])
@@ -234,7 +241,7 @@ describe('Agent-画布关联 IPC', () => {
       clearCanvas: () => { throw new Error('/private/store-path') },
     }
     expect(() => cleanupDeletedAgentSessionCanvasBindings(
-      { store: preCommitFailure, broadcast: () => undefined },
+      { ...createCleanupMutationDependency(), store: preCommitFailure, broadcast: () => undefined },
       createAgentSession(),
     )).not.toThrow()
     let committed = true
@@ -244,12 +251,12 @@ describe('Agent-画布关联 IPC', () => {
       clearCanvas: () => undefined,
     }
     expect(() => cleanupDeletedAgentSessionCanvasBindings(
-      { store: postCommitFailure, broadcast: () => undefined },
+      { ...createCleanupMutationDependency(), store: postCommitFailure, broadcast: () => undefined },
       createAgentSession(),
     )).not.toThrow()
     expect(committed).toBe(false)
     expect(() => cleanupDeletedCanvasBindings(
-      { store: preCommitFailure, broadcast: () => undefined },
+      { ...createCleanupMutationDependency(), store: preCommitFailure, broadcast: () => undefined },
       'project-1',
       'canvas-1',
     )).not.toThrow()
@@ -257,7 +264,7 @@ describe('Agent-画布关联 IPC', () => {
     const store = createStore()
     store.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false })
     expect(() => cleanupDeletedCanvasBindings(
-      { store, broadcast: () => { throw new Error('/private/broadcast-path') } },
+      { ...createCleanupMutationDependency(), store, broadcast: () => { throw new Error('/private/broadcast-path') } },
       'project-1',
       'canvas-1',
     )).not.toThrow()
@@ -320,6 +327,46 @@ describe('Agent-画布关联 IPC', () => {
     ])
     expect(errorSpy.mock.calls.flat().join(' ')).not.toContain('/private')
     errorSpy.mockRestore()
+  })
+
+  test('Given Store 已提交对账 When 会话事实随后变化 Then LIST 仍返回并广播本轮已提交 changes', async () => {
+    const handlers = new Map<string, TestHandler>()
+    const events: AgentCanvasBindingChangeEvent[] = []
+    const binding: AgentCanvasBinding = {
+      projectId: 'project-1', sessionId: 'session-1', defaultCanvasId: 'canvas-1',
+      linkedCanvasIds: ['canvas-1'], lastActiveCanvasId: 'canvas-1', updatedAt: 2,
+    }
+    let sessionReads = 0
+    registerAgentCanvasBindingIpcHandlers({
+      ...createProjectMutationDependencies(),
+      ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => handlers.delete(channel) },
+      store: {
+        ...createStore(),
+        reconcileProject: (_projectId, isSessionValid) => {
+          expect(isSessionValid('session-1')).toBe(true)
+          return {
+            bindings: [binding],
+            changes: [{ sessionId: 'session-1', cause: 'canvas-cleared', binding }],
+          }
+        },
+      },
+      getAgentSession: () => {
+        sessionReads += 1
+        return sessionReads === 1 ? createAgentSession() : null
+      },
+      listCanvasSessions: () => [createCanvasSession()],
+      assertSenderProjectAccess: () => undefined,
+      broadcast: (event) => events.push(event),
+    })
+
+    expect(await invoke(handlers, CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS, createSender(1), { projectId: 'project-1' })).toEqual({
+      ok: true,
+      value: [binding],
+    })
+    expect(sessionReads).toBe(1)
+    expect(events).toEqual([{
+      projectId: 'project-1', sessionId: 'session-1', cause: 'canvas-cleared', binding,
+    }])
   })
 
   test('Given LIST 对账清理失败 When 调用 Then 返回固定失败而不返回陈旧关联', async () => {

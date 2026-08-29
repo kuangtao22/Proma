@@ -113,8 +113,8 @@ function isEligibleProjectAgent(session: AgentSessionMeta, projectId: string): b
 export interface AgentCanvasBindingCleanupOptions {
   store: Pick<AgentCanvasBindingStore, 'listByProject' | 'clearSession' | 'clearCanvas'>
   broadcast: (event: AgentCanvasBindingChangeEvent) => void
-  /** 删除后清理同样进入项目写守卫；测试替身可省略。 */
-  runProjectMutation?: <T>(projectId: string, effect: () => T) => T
+  /** 删除后清理同样必须进入项目写守卫。 */
+  runProjectMutation: <T>(projectId: string, effect: () => T) => T
 }
 
 /** 广播失败只记录固定类别，已提交关联事实不得回滚或报错。 */
@@ -164,8 +164,7 @@ export function cleanupDeletedAgentSessionCanvasBindings(
     const clear = (): void => clearAgentCanvasBindingsWithEvents(options, {
       projectId: session.workspaceId!, target: 'session', sessionId: session.id,
     })
-    if (options.runProjectMutation) options.runProjectMutation(session.workspaceId, clear)
-    else clear()
+    options.runProjectMutation(session.workspaceId, clear)
   } catch {
     console.error('[Agent-Canvas 关联] Agent 删除后的关联清理失败')
   }
@@ -181,8 +180,7 @@ export function cleanupDeletedCanvasBindings(
     const clear = (): void => clearAgentCanvasBindingsWithEvents(
       options, { projectId, target: 'canvas', canvasId },
     )
-    if (options.runProjectMutation) options.runProjectMutation(projectId, clear)
-    else clear()
+    options.runProjectMutation(projectId, clear)
   } catch {
     console.error('[Agent-Canvas 关联] Canvas 删除后的关联清理失败')
   }
@@ -257,12 +255,7 @@ export function reconcileAgentCanvasBindings(
     (canvasId) => canvasIds.has(canvasId),
   )
   const reconciled = parseListAgentCanvasBindingsResult(result.bindings)
-  if (!reconciled.every((binding) => {
-    const session = options.getAgentSession(binding.sessionId)
-    return Boolean(session
-      && isEligibleProjectAgent(session, projectId)
-      && binding.linkedCanvasIds.every((canvasId) => canvasIds.has(canvasId)))
-  })) throw new Error('AGENT_CANVAS_BINDINGS_RECONCILE_INCOMPLETE')
+  /** Store 已使用本轮会话与画布有效性快照完成 CAS，提交后不得再次读取并阻断事件。 */
   for (const change of result.changes) {
     broadcastChangeSafely(options, { projectId, ...change })
   }
