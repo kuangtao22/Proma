@@ -740,6 +740,13 @@ describe('Agent-画布关联 IPC', () => {
       { delegationStatus: 'running' },
       { delegationDepth: 1 },
       { delegationGoal: '检查代码' },
+      { sourceAutomationId: '' },
+      { parentSessionId: '' },
+      { rootSessionId: '' },
+      { sourceDelegationId: '' },
+      { delegationGoal: '' },
+      { sourceCanvasProjectId: '' },
+      { sourceDesignProjectId: '' },
       { workspaceId: undefined },
       { workspaceId: 'project-2' },
     ] satisfies Array<Partial<AgentSessionMeta>>) {

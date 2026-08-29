@@ -35,6 +35,20 @@ describe('Agent service 迁移准入', () => {
       .toBeLessThan(helperBody.indexOf('canvasNodeReferenceResolver.resolveForSend('))
   })
 
+  test('Given 新发送与历史错误重试 When 解析 Canvas 引用 Then 分别使用 latest 与 exact revision 语义', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    const helperStart = source.indexOf('function resolveAgentCanvasReferencesForSend')
+    const helperEnd = source.indexOf('\n\n/**', helperStart)
+    const helperBody = source.slice(helperStart, helperEnd)
+    const runStart = source.indexOf('export async function runAgent(')
+    const runEnd = source.indexOf('\n/**', runStart + 1)
+    const runBody = source.slice(runStart, runEnd)
+
+    expect(helperBody).toContain("mode: 'retryOfErrorUuid' in input && input.retryOfErrorUuid ? 'exact' : 'latest'")
+    expect(runBody.indexOf('resolveAgentCanvasReferencesForSend(input, extensions)'))
+      .toBeLessThan(runBody.indexOf('orchestrator.sendMessage('))
+  })
+
   test('Given Canvas 专用运行 When 检查 service 入口 Then 复用 renderer runtime 并接受单次工具扩展', () => {
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
     const start = source.indexOf('export async function runAgent(')

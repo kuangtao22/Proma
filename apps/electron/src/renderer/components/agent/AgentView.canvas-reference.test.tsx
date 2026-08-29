@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import type { CanvasNodeReference } from '@proma/shared'
 import { createStore } from 'jotai'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -23,6 +24,17 @@ const reference: CanvasNodeReference = {
 }
 
 describe('Agent Canvas 节点引用 composer', () => {
+  test('Given 历史用户消息带 rev3 引用 When 点击重试 Then 正文与引用从同一 SDK 消息透传', () => {
+    const source = readFileSync(new URL('./AgentView.tsx', import.meta.url), 'utf8')
+    const retryStart = source.indexOf('const handleRetry = React.useCallback(')
+    const retryEnd = source.indexOf('\n  /**', retryStart + 1)
+    const retryBody = source.slice(retryStart, retryEnd)
+
+    expect(retryBody).toContain('lastUserSDKMessage')
+    expect(retryBody).toContain('lastUserSDKMessage._canvasNodeReferences')
+    expect(retryBody).toContain('canvasNodeReferences: [...lastUserSDKMessage._canvasNodeReferences]')
+  })
+
   test('Given 两个 Agent 会话 When 分别写入和移除引用 Then 状态按 session 隔离', () => {
     const store = createStore()
     store.set(agentCanvasNodeReferencesAtomFamily('session-a'), [reference])

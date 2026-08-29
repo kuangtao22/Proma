@@ -103,7 +103,7 @@ function requireProjectAgent(
 }
 
 /** 判断会话是否为目标项目可持有关联的普通顶层 Agent。 */
-function isEligibleProjectAgent(session: AgentSessionMeta, projectId: string): boolean {
+export function isEligibleProjectAgent(session: AgentSessionMeta, projectId: string): boolean {
   return isAgentSessionUserVisible(session)
     && session.workspaceId === projectId
     && session.sourceAutomationId === undefined

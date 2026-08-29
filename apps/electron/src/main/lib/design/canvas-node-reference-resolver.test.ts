@@ -97,6 +97,7 @@ describe('CanvasNodeReferenceResolver', () => {
 
     const result = resolver.resolveForSend({
       sessionId: 'session-1',
+      mode: 'latest',
       references: [createReference()],
     })
 
@@ -124,6 +125,7 @@ describe('CanvasNodeReferenceResolver', () => {
 
     const result = resolver.resolveForSend({
       sessionId: 'session-1',
+      mode: 'latest',
       references: [createReference(), createReference({ title: '重复旧标题' })],
     })
 
@@ -146,6 +148,7 @@ describe('CanvasNodeReferenceResolver', () => {
 
     expect(() => resolver.resolveForSend({
       sessionId: 'session-1',
+      mode: 'latest',
       references: [createReference()],
     })).toThrow('CANVAS_REFERENCE_INVALID')
   })
@@ -155,8 +158,54 @@ describe('CanvasNodeReferenceResolver', () => {
 
     expect(() => resolver.resolveForSend({
       sessionId: 'session-1',
+      mode: 'latest',
       references: [createReference({ projectId: 'project-2' })],
     })).toThrow('CANVAS_REFERENCE_INVALID')
     expect(loadTargets).toEqual([])
+  })
+
+  test('Given 历史 rev3 且当前文档已到 rev4 When exact 重试 Then 拒绝而不静默替换', () => {
+    const { resolver } = createHarness()
+
+    expect(() => resolver.resolveForSend({
+      sessionId: 'session-1',
+      mode: 'exact',
+      references: [createReference()],
+    })).toThrow('CANVAS_REFERENCE_INVALID')
+  })
+
+  test('Given 历史 rev3 且当前文档仍为 rev3 When exact 重试 Then 保持原始快照 revision', () => {
+    const reference = createReference({ title: '权威标题' })
+    const { resolver } = createHarness({ document: createDocument({ revision: 3 }) })
+
+    const result = resolver.resolveForSend({
+      sessionId: 'session-1',
+      mode: 'exact',
+      references: [reference],
+    })
+
+    expect(result.references).toEqual([reference])
+    expect(result.changedNodeIds).toEqual([])
+  })
+
+  test.each([
+    { sourceAutomationId: '' },
+    { parentSessionId: '' },
+    { rootSessionId: '' },
+    { sourceDelegationId: '' },
+    { delegationRole: 'explore' as const },
+    { delegationStatus: 'running' as const },
+    { delegationDepth: 0 },
+    { delegationGoal: '' },
+    { sourceCanvasProjectId: '' },
+    { sourceDesignProjectId: '' },
+  ])('Given 残缺内部归属元数据 %o When 解析引用 Then 复用 canonical 资格规则 fail closed', (overrides) => {
+    const { resolver } = createHarness({ session: createSession(overrides) })
+
+    expect(() => resolver.resolveForSend({
+      sessionId: 'session-1',
+      mode: 'latest',
+      references: [createReference()],
+    })).toThrow('CANVAS_REFERENCE_INVALID')
   })
 })

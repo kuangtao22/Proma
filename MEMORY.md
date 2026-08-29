@@ -21,7 +21,7 @@
 
 - Electron IPC 变更必须依次同步：共享类型与通道常量 -> 主进程处理 -> Preload 桥接 -> 渲染进程调用。
 - Agent-Canvas 关联 IPC 只允许已授权主窗口操作同项目普通顶层 Agent 与已登记 Canvas；LIST 按实时会话/画布事实清理陈旧关联，事件使用 shared exact-key parser。Canvas、普通 Agent 或工作区主删除成功后的关联清理均为带精确事件的 best-effort 后置步骤，失败不得反向击穿主删除，内部会话不参与。
-- Agent 消息携带 Canvas 节点引用时，主进程必须在普通发送、queue-now 注入和 deferred 真正启动边界基于 fresh 绑定、Canvas registry 与权威文档重新复核；SDK JSONL 只保存发送时真实 revision 的 `_canvasNodeReferences` 快照，历史渲染不得回查当前节点替代。
+- Agent 消息携带 Canvas 节点引用时，主进程必须在普通发送、queue-now 注入和 deferred 真正启动边界基于 fresh 绑定、Canvas registry 与权威文档重新复核；新发送使用 latest 刷新到发送时 revision，历史错误重试使用 exact，原 revision 当前无法证明时必须失效，禁止以当前版本替代；SDK JSONL 只保存发送时真实 revision 的 `_canvasNodeReferences` 快照，历史渲染不得回查当前节点替代。
 - Agent 仅使用 Pi Agent Runtime；主进程通过独立 utility process 与 `agent-runtime-client.ts` 管理每个会话，禁止重新引入 Claude/Codex Agent SDK。
 - Agent 自动标题统一复用 Pi ModelRuntime 的模型、渠道、认证、协议和代理解析；标题使用独立无工具、且不主动启用推理的会话，任何非中止失败均回退为首条用户消息，Chat 对话自身仍保留 Provider Adapter 路线。
 - Pi runtime 与 `sharp` 等 external 依赖由 `sync-runtime-deps.ts` 在打包前同步，桌面构建同时包含自包含的 Proma CLI 与原生辅助模块。

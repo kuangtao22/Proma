@@ -2514,12 +2514,13 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   const handleRetry = React.useCallback((retryOfErrorUuid?: string): void => {
     if (!agentChannelId || streaming) return
 
-    // 找到最后一条用户消息
-    const lastUserRawMessage = [...persistedSDKMessages]
+    // 找到最后一条真实用户消息；正文与 Canvas 引用必须来自同一历史快照。
+    const lastUserSDKMessage = [...persistedSDKMessages]
       .reverse()
-      .map(getUserTextFromSDKMessage)
-      .find((text): text is string => text !== null)
-    if (!lastUserRawMessage) return
+      .find((message): message is SDKUserMessage => getUserTextFromSDKMessage(message) !== null)
+    if (!lastUserSDKMessage) return
+    /** 同一历史消息的原始正文；类型守卫已证明其存在。 */
+    const lastUserRawMessage = getUserTextFromSDKMessage(lastUserSDKMessage)!
     // 重试重发给 Agent 的消息：@file 路径还原为真实路径（持久化存的是编码原文）
     const lastUserMessage = parseQueuedMessageMentions(lastUserRawMessage).cleanedText
 
@@ -2567,6 +2568,9 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       startedAt: streamStartedAt,
       permissionModeOverride: permissionMode,
       ...(retryOfErrorUuid && { retryOfErrorUuid }),
+      ...(lastUserSDKMessage._canvasNodeReferences?.length
+        ? { canvasNodeReferences: [...lastUserSDKMessage._canvasNodeReferences] }
+        : {}),
     }).catch(console.error)
   }, [persistedSDKMessages, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, setAgentStreamErrors, setStreamingStates, setMessagesCache, permissionMode])
 

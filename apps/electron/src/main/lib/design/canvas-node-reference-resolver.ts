@@ -7,6 +7,7 @@ import type {
   CanvasTarget,
   CanvasWorkspaceSnapshot,
 } from '@proma/shared'
+import { isEligibleProjectAgent } from './agent-canvas-binding-ipc'
 
 /** Canvas 引用发送前失效的稳定公开错误码。 */
 export const CANVAS_REFERENCE_INVALID = 'CANVAS_REFERENCE_INVALID'
@@ -38,6 +39,8 @@ export interface CanvasNodeReferenceResolver {
   /** 复核宿主、绑定、文档与节点身份并返回发送时快照。 */
   resolveForSend: (input: {
     sessionId: string
+    /** latest 刷新新选择；exact 只允许仍可证明的历史 revision。 */
+    mode: 'latest' | 'exact'
     references: CanvasNodeReference[]
   }) => ResolvedCanvasNodeReferences
 }
@@ -45,21 +48,6 @@ export interface CanvasNodeReferenceResolver {
 /** 创建不暴露内部失败详情的公开失效错误。 */
 function invalidReferenceError(): Error {
   return new Error(CANVAS_REFERENCE_INVALID)
-}
-
-/** 判断会话是否为可承载 Canvas 引用的普通顶层用户 Agent。 */
-function isOrdinaryTopLevelSession(session: AgentSessionMeta): boolean {
-  return !session.archived
-    && !session.sourceAutomationId
-    && !session.sourceDesignProjectId
-    && !session.sourceDesignJobId
-    && !session.sourceCanvasProjectId
-    && !session.sourceCanvasId
-    && !session.sourceCanvasNodeId
-    && !session.parentSessionId
-    && !session.rootSessionId
-    && !session.sourceDelegationId
-    && !session.explorationParentSessionId
 }
 
 /** 构建不含内部身份、路径或节点正文的轻量画布工作区摘要。 */
@@ -104,7 +92,10 @@ export function createCanvasNodeReferenceResolver(
         if (parsedReferences.length === 0) throw invalidReferenceError()
         /** 当前权威会话必须仍是同项目普通顶层用户 Agent。 */
         const session = dependencies.getSession(input.sessionId)
-        if (!session || !session.workspaceId || !isOrdinaryTopLevelSession(session)) {
+        if (!session
+          || session.archived
+          || !session.workspaceId
+          || !isEligibleProjectAgent(session, session.workspaceId)) {
           throw invalidReferenceError()
         }
         /** 同一 Canvas 节点重复引用时权威去重，避免重复 I/O 和 prompt 噪声。 */
@@ -143,6 +134,11 @@ export function createCanvasNodeReferenceResolver(
           const document = documents.get(reference.canvasId)?.document
           const node = document?.nodes.find((candidate) => candidate.id === reference.nodeId)
           if (!document || !node || node.kind !== reference.nodeType) throw invalidReferenceError()
+          /** 历史重试只能使用当前生命周期仍可精确证明的原 revision。 */
+          if (input.mode === 'exact') {
+            if (document.revision !== reference.nodeRevision) throw invalidReferenceError()
+            return reference
+          }
           return {
             projectId: session.workspaceId!,
             canvasId: reference.canvasId,
