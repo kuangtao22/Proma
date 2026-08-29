@@ -59,6 +59,8 @@ export interface CanvasAgentBatchOperationDependencies {
   runExclusive: <T>(target: CanvasTarget, effect: () => Promise<T>) => Promise<T>
   randomUUID?: () => string
   now?: () => number
+  /** serializer 与 workspace lease 释放后发布权威图事实。 */
+  publish: (target: CanvasTarget, document: CanvasDocument) => void | Promise<void>
   scanIntents?: (target: CanvasTarget) => Promise<CanvasBatchOperationIntent[]>
   writeIntent?: (intent: CanvasBatchOperationIntent) => Promise<StableDirectoryNativeWriteOutcome>
   contentLifecycle: Pick<CanvasContentNodeLifecycle, 'inspectBatchContent' | 'prepareBatchContent' | 'cleanupBatchContent' | 'prepareBatchDeletion' | 'restoreBatchDeletion' | 'assertBatchAgentNodeIdle'>
@@ -151,6 +153,37 @@ export interface CanvasBatchReconciliationResult extends CanvasBatchOperationRes
   publications: CanvasDocument[]
 }
 
+/** 锁内执行成功后交给外层发布的内部 envelope。 */
+interface CanvasBatchLockedExecutionResult extends CanvasBatchOperationResult {
+  reconciliationPublications: CanvasDocument[]
+  publication?: CanvasDocument
+}
+
+/** 锁内执行失败时保留已提交恢复事实与可选当前事实。 */
+class CanvasBatchExecutionError extends Error {
+  constructor(
+    readonly causeError: Error,
+    readonly reconciliationPublications: CanvasDocument[],
+    readonly publication?: CanvasDocument,
+  ) {
+    super(causeError.message, { cause: causeError })
+    this.name = 'CanvasBatchExecutionError'
+  }
+}
+
+/** reconcile 中途失败时保留此前已经提交的图事实。 */
+class CanvasBatchReconciliationError extends Error {
+  constructor(readonly causeError: Error, readonly publications: CanvasDocument[]) {
+    super(causeError.message, { cause: causeError })
+    this.name = 'CanvasBatchReconciliationError'
+  }
+}
+
+/** 把未知异常规范化为可重抛的 Error。 */
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error))
+}
+
 /** 图已提交但最终 intent 持久性未知时携带权威事实。 */
 export class CanvasBatchOperationPublishedError extends Error {
   constructor(readonly causeError: Error, readonly document: CanvasDocument) {
@@ -176,13 +209,47 @@ function createGraphSha256(document: CanvasDocument): string {
   })).digest('hex')
 }
 
+/** 批量规划使用的稳定外部资源身份。 */
+interface CanvasBatchResourceIdentity {
+  key: string
+  kind: 'agent' | 'image' | 'document' | 'webview'
+  resourceId: string
+  node: CanvasNode
+}
+
 /** 返回节点绑定的外部资源身份；纯图节点没有资源。 */
-function getNodeResourceIdentity(node: CanvasNode): string | null {
-  if (node.kind === 'agent') return `agent:${node.agentSessionId}`
-  if (node.kind === 'image') return `image:${node.imageModuleId}`
-  if (node.kind === 'document') return `document:${node.documentId}`
-  if (node.kind === 'webview') return `webview:${node.prototypeId}`
+function getNodeResourceIdentity(node: CanvasNode): CanvasBatchResourceIdentity | null {
+  if (node.kind === 'agent') return { key: `agent:${node.agentSessionId}`, kind: node.kind, resourceId: node.agentSessionId, node }
+  if (node.kind === 'image') return { key: `image:${node.imageModuleId}`, kind: node.kind, resourceId: node.imageModuleId, node }
+  if (node.kind === 'document') return { key: `document:${node.documentId}`, kind: node.kind, resourceId: node.documentId, node }
+  if (node.kind === 'webview') return { key: `webview:${node.prototypeId}`, kind: node.kind, resourceId: node.prototypeId, node }
   return null
+}
+
+/** 按 identity 聚合引用，同一资源只规划一次副作用。 */
+function indexResourceIdentities(document: CanvasDocument): Map<string, CanvasBatchResourceIdentity> {
+  const identities = new Map<string, CanvasBatchResourceIdentity>()
+  for (const node of document.nodes) {
+    const identity = getNodeResourceIdentity(node)
+    if (identity && !identities.has(identity.key)) identities.set(identity.key, identity)
+  }
+  return identities
+}
+
+/** 内容目录物理 ID 不允许跨类别复用，否则无法证明 meta 所有权。 */
+function assertContentResourceKinds(documents: CanvasDocument[]): void {
+  const kindsByResourceId = new Map<string, 'image' | 'document' | 'webview'>()
+  for (const document of documents) {
+    for (const node of document.nodes) {
+      const identity = getNodeResourceIdentity(node)
+      if (!identity || identity.kind === 'agent') continue
+      const existingKind = kindsByResourceId.get(identity.resourceId)
+      if (existingKind && existingKind !== identity.kind) {
+        throw new Error('CANVAS_BATCH_CONTENT_IDENTITY_CONFLICT')
+      }
+      kindsByResourceId.set(identity.resourceId, identity.kind)
+    }
+  }
 }
 
 /** 拒绝资源所有权无法用单一净差异安全表达的节点身份变换。 */
@@ -191,6 +258,7 @@ function assertSupportedNodeTransitions(
   baseDocument: CanvasDocument,
   expectedDocument: CanvasDocument,
 ): void {
+  assertContentResourceKinds([baseDocument, expectedDocument])
   const removedNodeIds = new Set<string>()
   for (const operation of operations) {
     if (operation.type === 'remove-nodes') {
@@ -205,7 +273,7 @@ function assertSupportedNodeTransitions(
   const finalNodes = new Map(expectedDocument.nodes.map((node) => [node.id, node]))
   for (const baseNode of baseDocument.nodes) {
     const finalNode = finalNodes.get(baseNode.id)
-    if (finalNode && getNodeResourceIdentity(baseNode) !== getNodeResourceIdentity(finalNode)) {
+    if (finalNode && getNodeResourceIdentity(baseNode)?.key !== getNodeResourceIdentity(finalNode)?.key) {
       throw new Error('CANVAS_BATCH_NODE_IDENTITY_REPLACEMENT_UNSUPPORTED')
     }
   }
@@ -219,18 +287,20 @@ function collectResources(
   now: () => number,
 ): CanvasBatchPreparedResource[] {
   const resources: CanvasBatchPreparedResource[] = []
-  const baseNodes = new Map(baseDocument.nodes.map((node) => [node.id, node]))
-  const finalNodes = new Map(expectedDocument.nodes.map((node) => [node.id, node]))
-  for (const node of expectedDocument.nodes) {
-    if (baseNodes.has(node.id)) continue
+  const baseIdentities = indexResourceIdentities(baseDocument)
+  const finalIdentities = indexResourceIdentities(expectedDocument)
+  for (const [key, identity] of finalIdentities) {
+    if (baseIdentities.has(key)) continue
+    const node = identity.node
     const base = { nodeId: node.id, state: 'pending' as const, createdByOperation: null, trashEntry: null }
     if (node.kind === 'agent') resources.push({ ...base, kind: 'agent-session', resourceId: node.agentSessionId })
     if (node.kind === 'image') resources.push({ ...base, kind: 'content-directory', resourceId: node.imageModuleId })
     if (node.kind === 'document') resources.push({ ...base, kind: 'content-directory', resourceId: node.documentId })
     if (node.kind === 'webview') resources.push({ ...base, kind: 'content-directory', resourceId: node.prototypeId })
   }
-  for (const node of baseDocument.nodes) {
-    if (finalNodes.has(node.id) || node.kind === 'agent') continue
+  for (const [key, identity] of baseIdentities) {
+    const node = identity.node
+    if (finalIdentities.has(key) || node.kind === 'agent') continue
     const contentId = node.kind === 'image' ? node.imageModuleId
       : node.kind === 'document' ? node.documentId : node.prototypeId
     const entry = parseCanvasTrashEntry({
@@ -462,64 +532,139 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
   const reconcileLocked = async (target: CanvasTarget): Promise<CanvasBatchReconciliationResult> => {
     let operationId = ''
     const publications: CanvasDocument[] = []
-    for (const original of await scan(target)) {
-      operationId = original.operationId
-      if (original.state === 'committed' || original.state === 'rolled-back') continue
-      if (original.state === 'cleanup-pending') {
-        await cleanup(original)
-        continue
+    try {
+      for (const original of await scan(target)) {
+        operationId = original.operationId
+        if (original.state === 'committed' || original.state === 'rolled-back') continue
+        if (original.state === 'cleanup-pending') {
+          await cleanup(original)
+          continue
+        }
+        let intent = original
+        if (intent.state === 'prepared') {
+          intent = await prepareResources(intent)
+        }
+        const beforeRevision = dependencies.store.load(target).document.revision
+        try {
+          const result = await commit(intent)
+          if (result.document.revision > beforeRevision) publications.push(result.document)
+        } catch (error) {
+          if (error instanceof CanvasBatchOperationPublishedError
+            && error.document.revision > beforeRevision) publications.push(error.document)
+          throw error
+        }
       }
-      let intent = original
-      if (intent.state === 'prepared') {
-        intent = await prepareResources(intent)
-      }
-      const beforeRevision = dependencies.store.load(target).document.revision
-      const result = await commit(intent)
-      if (result.document.revision > beforeRevision) publications.push(result.document)
+    } catch (error) {
+      const causeError = error instanceof CanvasBatchOperationPublishedError
+        ? error.causeError : asError(error)
+      throw new CanvasBatchReconciliationError(causeError, publications)
     }
     return { document: dependencies.store.load(target).document, operationId, publications }
   }
 
   /** 在已取得共享 Canvas 串行权与 workspace lease 时执行新批次。 */
-  const executeLocked = async (envelope: CanvasBatchOperationEnvelope): Promise<CanvasBatchOperationResult> => {
-    if (envelope.operations.length === 0 || envelope.operations.length > MAX_BATCH_OPERATIONS || Buffer.byteLength(JSON.stringify(envelope.operations)) > MAX_BATCH_BYTES) {
-      throw new Error('CANVAS_BATCH_OPERATION_LIMIT_EXCEEDED')
-    }
+  const executeLocked = async (envelope: CanvasBatchOperationEnvelope): Promise<CanvasBatchLockedExecutionResult> => {
     const target = { projectId: envelope.projectId, canvasId: envelope.canvasId }
     /** 任何新请求先收敛全部旧 intent，禁止并存第二个未决事务。 */
-    await reconcileLocked(target)
-    const existing = (await scan(target)).find((intent) => intent.source.toolCallId === envelope.sourceToolCallId)
-    if (existing) {
-      if (existing.source.sessionId !== envelope.sourceSessionId || existing.source.runStartedAt !== envelope.sourceRunStartedAt
-        || existing.baseRevision !== envelope.baseRevision || JSON.stringify(existing.operations) !== JSON.stringify(envelope.operations)) {
-        throw new Error('CANVAS_BATCH_OPERATION_CONFLICT')
+    let reconciliationPublications: CanvasDocument[]
+    try {
+      reconciliationPublications = (await reconcileLocked(target)).publications
+    } catch (error) {
+      if (error instanceof CanvasBatchReconciliationError) {
+        throw new CanvasBatchExecutionError(error.causeError, error.publications)
       }
-      if (existing.state === 'rolled-back') throw new Error('CANVAS_BATCH_OPERATION_ROLLED_BACK')
-      return { document: dependencies.store.load(target).document, operationId: existing.operationId }
+      throw error
     }
-    const plan = dependencies.store.planBatchOperations(target, envelope.baseRevision, envelope.operations)
-    assertSupportedNodeTransitions(plan.operations, plan.baseDocument, plan.expectedDocument)
-    assertRemovalsAllowed(plan.baseDocument, plan.operations)
-    let intent: CanvasBatchOperationIntent = {
-      schemaVersion: 1,
-      operationId: randomUUID(),
-      target,
-      baseRevision: envelope.baseRevision,
-      source: { sessionId: envelope.sourceSessionId, runStartedAt: envelope.sourceRunStartedAt, toolCallId: envelope.sourceToolCallId },
-      state: 'prepared',
-      preparedResources: collectResources(plan.baseDocument, plan.expectedDocument, randomUUID, now),
-      expectedGraphSha256: createGraphSha256(plan.expectedDocument),
-      operations: plan.operations,
+    try {
+      if (envelope.operations.length === 0 || envelope.operations.length > MAX_BATCH_OPERATIONS || Buffer.byteLength(JSON.stringify(envelope.operations)) > MAX_BATCH_BYTES) {
+        throw new Error('CANVAS_BATCH_OPERATION_LIMIT_EXCEEDED')
+      }
+      const existing = (await scan(target)).find((intent) => intent.source.toolCallId === envelope.sourceToolCallId)
+      if (existing) {
+        if (existing.source.sessionId !== envelope.sourceSessionId || existing.source.runStartedAt !== envelope.sourceRunStartedAt
+          || existing.baseRevision !== envelope.baseRevision || JSON.stringify(existing.operations) !== JSON.stringify(envelope.operations)) {
+          throw new Error('CANVAS_BATCH_OPERATION_CONFLICT')
+        }
+        if (existing.state === 'rolled-back') throw new Error('CANVAS_BATCH_OPERATION_ROLLED_BACK')
+        return {
+          document: dependencies.store.load(target).document,
+          operationId: existing.operationId,
+          reconciliationPublications,
+        }
+      }
+      const plan = dependencies.store.planBatchOperations(target, envelope.baseRevision, envelope.operations)
+      assertSupportedNodeTransitions(plan.operations, plan.baseDocument, plan.expectedDocument)
+      assertRemovalsAllowed(plan.baseDocument, plan.operations)
+      let intent: CanvasBatchOperationIntent = {
+        schemaVersion: 1,
+        operationId: randomUUID(),
+        target,
+        baseRevision: envelope.baseRevision,
+        source: { sessionId: envelope.sourceSessionId, runStartedAt: envelope.sourceRunStartedAt, toolCallId: envelope.sourceToolCallId },
+        state: 'prepared',
+        preparedResources: collectResources(plan.baseDocument, plan.expectedDocument, randomUUID, now),
+        expectedGraphSha256: createGraphSha256(plan.expectedDocument),
+        operations: plan.operations,
+      }
+      await write(intent)
+      intent = await prepareResources(intent)
+      try {
+        const result = await commit(intent)
+        return { ...result, reconciliationPublications, publication: result.document }
+      } catch (error) {
+        if (error instanceof CanvasBatchOperationPublishedError) {
+          throw new CanvasBatchExecutionError(
+            error.causeError,
+            reconciliationPublications,
+            error.document,
+          )
+        }
+        throw error
+      }
+    } catch (error) {
+      if (error instanceof CanvasBatchExecutionError) throw error
+      throw new CanvasBatchExecutionError(asError(error), reconciliationPublications)
     }
-    await write(intent)
-    intent = await prepareResources(intent)
-    return commit(intent)
+  }
+
+  /** lease 外按提交顺序 best-effort 发布，单次失败不得阻断后续事实。 */
+  const publishBestEffort = async (target: CanvasTarget, publications: CanvasDocument[]): Promise<void> => {
+    for (const publication of publications) {
+      try {
+        await dependencies.publish(target, publication)
+      } catch (error) {
+        console.error('[CanvasBatch] 画布批量事实发布失败，继续发布后续 revision:', error)
+      }
+    }
+  }
+
+  /** 唯一外层在 serializer 与 workspace lease 释放后发布锁内提交事实。 */
+  const execute = async (envelope: CanvasBatchOperationEnvelope): Promise<CanvasBatchOperationResult> => {
+    const target = { projectId: envelope.projectId, canvasId: envelope.canvasId }
+    let result: CanvasBatchLockedExecutionResult
+    try {
+      result = await dependencies.runExclusive(target, () => executeLocked(envelope))
+    } catch (error) {
+      if (error instanceof CanvasBatchExecutionError) {
+        await publishBestEffort(target, [
+          ...error.reconciliationPublications,
+          ...(error.publication ? [error.publication] : []),
+        ])
+        throw error.causeError
+      }
+      throw error
+    }
+    await publishBestEffort(target, [
+      ...result.reconciliationPublications,
+      ...(result.publication ? [result.publication] : []),
+    ])
+    return { document: result.document, operationId: result.operationId }
   }
 
   return {
     executeLocked,
     reconcileLocked,
-    execute: (envelope: CanvasBatchOperationEnvelope): Promise<CanvasBatchOperationResult> => dependencies.runExclusive({ projectId: envelope.projectId, canvasId: envelope.canvasId }, () => executeLocked(envelope)),
+    execute,
     reconcile: (target: CanvasTarget): Promise<CanvasBatchOperationResult> => dependencies.runExclusive(target, () => reconcileLocked(target)),
   }
 }

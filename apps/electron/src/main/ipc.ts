@@ -2164,6 +2164,21 @@ export function registerIpcHandlers(): void {
     runExclusive: (target, effect) => canvasOperationSerializer.run(target, () => (
       workspaceOperationGuard.runWorkspaceWrite(target.projectId, effect)
     )),
+    publish: (target, document) => {
+      /** 每个窗口独立 best-effort，单个发送失败不得阻断后续窗口或 revision。 */
+      for (const contents of listAuthorizedDesignWebContents()) {
+        try {
+          contents.send(CANVAS_IPC_CHANNELS.CHANGED, {
+            projectId: target.projectId,
+            canvasId: target.canvasId,
+            revision: document.revision,
+            cause: 'graph',
+          })
+        } catch (error) {
+          console.error('[CanvasBatch] 画布批量事实广播失败:', error)
+        }
+      }
+    },
     contentLifecycle: canvasContentNodeLifecycle,
     agentNodeCreation: canvasAgentNodeCreation,
   })
