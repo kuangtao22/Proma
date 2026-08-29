@@ -770,8 +770,10 @@ export function createCanvasNodeContentStore(
       const sourceMeta = await readMeta(scopes.nodes, 'nodes', contentId)
       if (!sourceMeta) {
         const existingRollback = await readMeta(trash, 'trash', rollbackId)
-        if (!existingRollback || existingRollback.kind !== kind || existingRollback.contentId !== contentId) {
-          throw new Error('CANVAS_CONTENT_NOT_FOUND')
+        /** prepare 在创建前失败时两端都缺失，精确 rollback 可幂等视为已清理。 */
+        if (!existingRollback) return
+        if (existingRollback.kind !== kind || existingRollback.contentId !== contentId) {
+          throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
         }
         return
       }

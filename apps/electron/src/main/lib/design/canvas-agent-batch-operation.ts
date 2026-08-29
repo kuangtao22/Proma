@@ -358,6 +358,16 @@ function collectResources(
   return resources
 }
 
+/** 只提取资源计划不随恢复进度变化的精确持久字段。 */
+function createResourcePlanSignature(resources: CanvasBatchPreparedResource[]): string {
+  return JSON.stringify(resources.map((resource) => ({
+    nodeId: resource.nodeId,
+    kind: resource.kind,
+    resourceId: resource.resourceId,
+    trashEntry: resource.trashEntry,
+  })))
+}
+
 /** 一次构建批次节点索引，资源准备和清理均保持 O(n)。 */
 function indexNodes(operations: CanvasMutation[]): Map<string, CanvasNode> {
   const nodes = new Map<string, CanvasNode>()
@@ -380,6 +390,47 @@ function contentInput(node: CanvasNode) {
 export function createCanvasAgentBatchOperationService(dependencies: CanvasAgentBatchOperationDependencies) {
   const randomUUID = dependencies.randomUUID ?? createRandomUUID
   const now = dependencies.now ?? Date.now
+
+  /** 从可信基线重建磁盘 intent 的不可变计划，任何不一致都禁止进入资源副作用。 */
+  const assertAuthoritativeIntentPlan = (intent: CanvasBatchOperationIntent): void => {
+    try {
+      /** Store 负责严格验证 mutation schema 并从当前权威 base 计算最终图。 */
+      const plan = dependencies.store.planBatchOperations(intent.target, intent.baseRevision, intent.operations)
+      assertSupportedNodeTransitions(plan.operations, plan.baseDocument, plan.expectedDocument)
+      if (JSON.stringify(plan.operations) !== JSON.stringify(intent.operations)
+        || createGraphSha256(plan.expectedDocument) !== intent.expectedGraphSha256) {
+        throw new Error('CANVAS_BATCH_INTENT_PLAN_MISMATCH')
+      }
+      /** trashId/deletedAt 是事务生成值，重规划时只允许复用 intent 中相同顺序的精确值。 */
+      const trashResources = intent.preparedResources.filter((resource) => resource.kind === 'content-trash')
+      /** 当前正在为 collectResources 提供的 trash 资源序号。 */
+      let trashIndex = 0
+      /** 从权威 base/final 图重建、仅复用事务 nonce 与时间的资源计划。 */
+      const expectedResources = collectResources(
+        plan.baseDocument,
+        plan.expectedDocument,
+        () => {
+          /** 当前删除资源必须携带可重建的完整 trash 条目。 */
+          const entry = trashResources[trashIndex]?.trashEntry
+          if (!entry) throw new Error('CANVAS_BATCH_INTENT_PLAN_MISMATCH')
+          return entry.trashId
+        },
+        () => {
+          /** deletedAt 与同一 trashId 成对复用后推进到下一项。 */
+          const entry = trashResources[trashIndex]?.trashEntry
+          if (!entry) throw new Error('CANVAS_BATCH_INTENT_PLAN_MISMATCH')
+          trashIndex += 1
+          return entry.deletedAt
+        },
+      )
+      if (createResourcePlanSignature(expectedResources) !== createResourcePlanSignature(intent.preparedResources)) {
+        throw new Error('CANVAS_BATCH_INTENT_PLAN_MISMATCH')
+      }
+      assertRemovalsAllowed(plan.baseDocument, plan.operations)
+    } catch (error) {
+      throw new Error('CANVAS_BATCH_INTENT_PLAN_CONFLICT', { cause: error })
+    }
+  }
 
   /** 使用稳定目录 helper 扫描批量 intent，测试可注入内存实现。 */
   const scan = async (target: CanvasTarget): Promise<CanvasBatchOperationIntent[]> => {
@@ -568,6 +619,13 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
       for (const original of await scan(target)) {
         operationId = original.operationId
         if (original.state === 'committed' || original.state === 'rolled-back') continue
+        /** 只有仍处于 base 的权威图才能证明并执行磁盘资源计划。 */
+        const currentDocument = dependencies.store.load(target).document
+        if (currentDocument.revision === original.baseRevision) {
+          assertAuthoritativeIntentPlan(original)
+        } else if (original.state !== 'resources-created') {
+          throw new Error('CANVAS_BATCH_INTENT_PLAN_CONFLICT')
+        }
         if (original.state === 'cleanup-pending') {
           await cleanup(original)
           continue
@@ -576,13 +634,12 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
         if (intent.state === 'prepared') {
           intent = await prepareResources(intent)
         }
-        const beforeRevision = dependencies.store.load(target).document.revision
         try {
           const result = await commit(intent)
-          if (result.document.revision > beforeRevision) publications.push(result.document)
+          /** 非终态 intent 本轮确认 committed 即形成待发布事实，不依赖 revision 是否刚递增。 */
+          publications.push(result.document)
         } catch (error) {
-          if (error instanceof CanvasBatchOperationPublishedError
-            && error.document.revision > beforeRevision) publications.push(error.document)
+          if (error instanceof CanvasBatchOperationPublishedError) publications.push(error.document)
           throw error
         }
       }
@@ -661,7 +718,11 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
 
   /** lease 外按提交顺序 best-effort 发布，单次失败不得阻断后续事实。 */
   const publishBestEffort = async (target: CanvasTarget, publications: CanvasDocument[]): Promise<void> => {
+    /** 本服务 cause 固定为 graph，revision Set 等价于 cause + revision 去重键。 */
+    const publishedRevisions = new Set<number>()
     for (const publication of publications) {
+      if (publishedRevisions.has(publication.revision)) continue
+      publishedRevisions.add(publication.revision)
       try {
         await dependencies.publish(target, publication)
       } catch (error) {

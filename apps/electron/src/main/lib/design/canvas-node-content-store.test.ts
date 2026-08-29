@@ -554,6 +554,25 @@ describe('Canvas 节点内容 Store', () => {
     expect(await fixture.store.listTrash(target)).toEqual([])
   })
 
+  test('Given 批量内容在真正创建前失败 When 相同 rollback 重复清理 Then 缺失资源按精确 ownership 幂等成功', async () => {
+    /** 首个正式内容文件在 rename 前失败，确保 nodes 目录从未形成。 */
+    const fixture = createFixture({
+      outcomeFor: (request) => request.fileName === 'content.md'
+        ? { commitVisible: false, durabilityUncertain: false, error: 'disk full' }
+        : undefined,
+    })
+    /** 精确 rollback 绑定的内容身份。 */
+    const input = { kind: 'document' as const, contentId: 'content-before-create' }
+
+    await expect(fixture.store.prepareEmptyContent(target, input))
+      .rejects.toThrow('CANVAS_CONTENT_WRITE_FAILED')
+    await fixture.store.discardPreparedContent(target, input, 'batch-rollback-before-create')
+    await fixture.store.discardPreparedContent(target, input, 'batch-rollback-before-create')
+
+    expect(fixture.scopes.nodes.size).toBe(0)
+    expect(fixture.scopes.trash.size).toBe(0)
+  })
+
   test('Given helper rename 前失败或 rename 后耐久性未确认 When 提交 Then 映射为明确错误', async () => {
     const failed = createFixture({
       outcomeFor: (request) => request.fileName === 'content.md'

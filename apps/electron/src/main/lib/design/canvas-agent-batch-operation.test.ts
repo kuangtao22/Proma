@@ -66,7 +66,8 @@ function createFixture(options: {
     },
   }
   let uuid = 0
-  const service = createCanvasAgentBatchOperationService({
+  /** 创建共享同一磁盘 intent 与图事实的新服务实例，用于模拟主进程重启。 */
+  const createService = () => createCanvasAgentBatchOperationService({
     store,
     runExclusive: async (operationTarget, effect) => {
       const key = `${operationTarget.projectId}\0${operationTarget.canvasId}`
@@ -149,8 +150,11 @@ function createFixture(options: {
       },
     },
   })
+  /** 当前测试进程首次使用的服务实例。 */
+  const service = createService()
   return {
     service,
+    createService,
     intents,
     intentWrites,
     events,
@@ -583,6 +587,36 @@ describe('CanvasAgentBatchOperationService', () => {
     expect(fixture.trash.size).toBe(1)
   })
 
+  test.each([
+    ['最终图 hash', (intent: CanvasBatchOperationIntent): CanvasBatchOperationIntent => ({
+      ...intent,
+      expectedGraphSha256: '0'.repeat(64),
+    })],
+    ['资源计划', (intent: CanvasBatchOperationIntent): CanvasBatchOperationIntent => ({
+      ...intent,
+      preparedResources: intent.preparedResources.map((resource, index) => index === 0
+        ? { ...resource, resourceId: 'forged-agent-session' }
+        : resource),
+    })],
+  ] as const)('Given prepared 磁盘 intent 的%s被伪造 When reconcile Then 权威重规划先拒绝且资源零副作用', async (_field, forge) => {
+    /** prepared 写可见但未进入资源阶段的恢复夹具。 */
+    const fixture = createFixture({ uncertainState: 'prepared' })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_RECOVERY_REQUIRED')
+    /** 模拟攻击者或磁盘损坏后被篡改的非终态 intent。 */
+    const persisted = [...fixture.intents.values()][0]!
+    fixture.intents.set(persisted.operationId, forge(persisted))
+    fixture.events.length = 0
+
+    await expect(fixture.service.reconcile(target)).rejects.toThrow('CANVAS_BATCH_INTENT_PLAN_CONFLICT')
+
+    expect(fixture.getDocument().revision).toBe(7)
+    expect(fixture.getMutateCalls()).toBe(0)
+    expect(fixture.agentSessionInspections).toEqual([])
+    expect(fixture.contents.size).toBe(0)
+    expect(fixture.sessions.size).toBe(0)
+    expect(fixture.events).toEqual([])
+  })
+
   test('Given 图已提交但 committed rename 前失败 When 重启重试 Then LOAD 对账不重复 revision', async () => {
     const fixture = createFixture({ failCommittedOnce: true })
     await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_INTENT_WRITE_FAILED')
@@ -590,6 +624,57 @@ describe('CanvasAgentBatchOperationService', () => {
     const recovered = await fixture.service.execute(batch())
     expect(recovered.document.revision).toBe(8)
     expect(fixture.getMutateCalls()).toBe(1)
+  })
+
+  test('Given fresh service 看到 base+1 图与 resources-created intent When 恢复后提交当前批次 Then 仍按旧到新发布', async () => {
+    /** 首个服务提交图后在 committed intent 写入前失败。 */
+    const fixture = createFixture({ failCommittedOnce: true })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_INTENT_WRITE_FAILED')
+    expect(fixture.getDocument().revision).toBe(8)
+    expect([...fixture.intents.values()][0]?.state).toBe('resources-created')
+    fixture.publicationAttempts.length = 0
+    fixture.publishedRevisions.length = 0
+
+    /** 共享磁盘与图事实、但没有进程内历史的新服务。 */
+    const freshService = fixture.createService()
+    /** 当前批次结果用于证明恢复后仍能继续推进 revision。 */
+    const result = await freshService.execute({
+      ...batch(),
+      baseRevision: 8,
+      sourceToolCallId: 'tool-after-fresh-replay',
+      operations: [{ type: 'set-viewport', viewport: { x: 8, y: 9, zoom: 1.25 } }],
+    })
+
+    expect(result.document.revision).toBe(9)
+    expect(fixture.publishedRevisions).toEqual([8, 9])
+    expect([...fixture.intents.values()].find((intent) => intent.source.toolCallId === 'tool-call-1')?.state).toBe('committed')
+  })
+
+  test('Given 两个 fresh recovery intent 确认同一 graph revision When 外层发布 Then cause 与 revision 去重', async () => {
+    /** 先构造 base+1 图与一份未终态恢复证据。 */
+    const fixture = createFixture({ failCommittedOnce: true })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_INTENT_WRITE_FAILED')
+    /** 第二份非终态 intent 模拟重复恢复证据指向同一已提交图事实。 */
+    const original = [...fixture.intents.values()][0]!
+    fixture.intents.set('22222222-2222-4222-8222-222222222222', {
+      ...structuredClone(original),
+      operationId: '22222222-2222-4222-8222-222222222222',
+      source: { ...original.source, toolCallId: 'duplicate-recovery-tool' },
+    })
+    fixture.publicationAttempts.length = 0
+    fixture.publishedRevisions.length = 0
+
+    /** fresh 外层负责合并两份相同 graph revision publication。 */
+    const freshService = fixture.createService()
+    await freshService.execute({
+      ...batch(),
+      baseRevision: 8,
+      sourceToolCallId: 'tool-after-duplicate-recovery',
+      operations: [{ type: 'set-viewport', viewport: { x: 2, y: 3, zoom: 1.1 } }],
+    })
+
+    expect(fixture.publicationAttempts).toEqual([8, 9])
+    expect(fixture.publishedRevisions).toEqual([8, 9])
   })
 
   test('Given 旧 recovery 已提交 When 当前 base 冲突 Then lease 释放后仍发布旧 revision', async () => {
