@@ -67,6 +67,23 @@ function buildReferencedSessionsHistoryInstruction(workspaceSlug?: string): stri
 }
 
 /**
+ * 构建当前 Agent 的轻量 Canvas 工作区提示词。
+ * @param promptSummary 主进程已按权威文档解析且移除内部身份的摘要。
+ * @returns 无摘要时返回空串；否则返回不含节点正文的工作区约束块。
+ */
+export function buildCanvasWorkspacePrompt(promptSummary?: string): string {
+  /** 空摘要必须完全绕过，避免普通聊天产生额外 prompt 噪声。 */
+  const summary = promptSummary?.trim()
+  if (!summary) return ''
+  return [
+    '<canvas_workspace>',
+    '你已经在当前 Agent 的画布工作区内，不得要求用户另建或切换画布。',
+    summary,
+    '</canvas_workspace>',
+  ].join('\n')
+}
+
+/**
  * 从 SDKMessage assistant 消息的 content 中提取工具活动摘要
  *
  * 扫描 tool_use 块，提取工具名称和关键参数，帮助新 SDK 会话理解之前做过什么。

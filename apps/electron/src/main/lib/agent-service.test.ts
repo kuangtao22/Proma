@@ -4,6 +4,37 @@ import { join } from 'node:path'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 
 describe('Agent service 迁移准入', () => {
+  test('Given 普通发送、queue-now 与 deferred 启动 When 检查主进程接线 Then 仅在实际发送边界解析引用', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    const runStart = source.indexOf('export async function runAgent(')
+    const runEnd = source.indexOf('\n/**', runStart + 1)
+    const runBody = source.slice(runStart, runEnd)
+    const queueStart = source.indexOf('export async function queueAgentMessage(')
+    const queueEnd = source.indexOf('\n/**', queueStart + 1)
+    const queueBody = source.slice(queueStart, queueEnd)
+    const enqueueStart = source.indexOf('export function enqueueAgentQueuedMessage(')
+    const enqueueEnd = source.indexOf('\n}', enqueueStart) + 2
+    const enqueueBody = source.slice(enqueueStart, enqueueEnd)
+
+    expect(runBody).toContain('resolveAgentCanvasReferencesForSend(input, extensions)')
+    expect(runBody).toContain('orchestrator.sendMessage(resolved.input')
+    expect(queueBody).toContain('resolveAgentCanvasReferencesForSend(input)')
+    expect(queueBody).toContain('resolved.references')
+    expect(enqueueBody).not.toContain('resolveAgentCanvasReferencesForSend(')
+  })
+
+  test('Given 普通无引用消息 When 检查解析 helper Then 完全绕过 resolver 且不追加 prompt', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    const helperStart = source.indexOf('function resolveAgentCanvasReferencesForSend')
+    const helperEnd = source.indexOf('\n\n/**', helperStart)
+    const helperBody = source.slice(helperStart, helperEnd)
+
+    expect(helperBody).toContain('if (!input.canvasNodeReferences?.length)')
+    expect(helperBody).toContain("return { input, extensions, references: undefined }")
+    expect(helperBody.indexOf('if (!input.canvasNodeReferences?.length)'))
+      .toBeLessThan(helperBody.indexOf('canvasNodeReferenceResolver.resolveForSend('))
+  })
+
   test('Given Canvas 专用运行 When 检查 service 入口 Then 复用 renderer runtime 并接受单次工具扩展', () => {
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
     const start = source.indexOf('export async function runAgent(')
@@ -11,7 +42,8 @@ describe('Agent service 迁移准入', () => {
     const body = source.slice(start, end)
 
     expect(body).toContain('extensions: AgentRunExtensions = {}')
-    expect(body).toContain('}, extensions)')
+    expect(body).toContain('resolveAgentCanvasReferencesForSend(input, extensions)')
+    expect(body).toContain('}, resolved.extensions)')
   })
 
   test('Given 数据根迁移预检 When 检查 service 导出 Then 使用 generation-owned 写查询并提供 workspace 维度能力', () => {

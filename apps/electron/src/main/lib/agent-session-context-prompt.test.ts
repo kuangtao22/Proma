@@ -77,3 +77,19 @@ describe('被引用 Agent 会话的主进程可见性复核', () => {
     )).toThrow('会话索引读取失败')
   })
 })
+
+describe('Canvas 工作区轻量提示词', () => {
+  test('Given 没有已解析 Canvas 摘要 When 构建 prompt Then 不追加任何噪声', () => {
+    expect(contextPrompt.buildCanvasWorkspacePrompt()).toBe('')
+  })
+
+  test('Given 已解析 Canvas 摘要 When 构建 prompt Then 明确当前工作区且不要求切换画布', () => {
+    const prompt = contextPrompt.buildCanvasWorkspacePrompt(
+      '已关联画布：需求画布\n默认画布：需求画布\n活动画布：交付画布\n本轮引用：document「规范」',
+    )
+
+    expect(prompt).toContain('你已经在当前 Agent 的画布工作区内')
+    expect(prompt).toContain('不得要求用户另建或切换画布')
+    expect(prompt).toContain('本轮引用：document「规范」')
+  })
+})

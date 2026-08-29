@@ -62,6 +62,22 @@ describe('Agent 工作区迁移准入', () => {
 })
 
 describe('Agent sendMessage 准入顺序合同', () => {
+  test('Given 已解析 Canvas 引用 When 持久化普通发送和 queue-now Then JSONL 写真实快照且原始文本不改写', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    const persistStart = source.indexOf('  private persistUserMessage(')
+    const persistEnd = source.indexOf('\n  }', persistStart) + 4
+    const persistBody = source.slice(persistStart, persistEnd)
+    const queueStart = source.indexOf('  async queueMessage(')
+    const queueEnd = source.indexOf('\n  }\n}', queueStart)
+    const queueBody = source.slice(queueStart, queueEnd)
+
+    expect(persistBody).toContain('canvasNodeReferences?: CanvasNodeReference[]')
+    expect(persistBody).toContain("...(canvasNodeReferences?.length ? { _canvasNodeReferences: canvasNodeReferences } : {})")
+    expect(queueBody).toContain('canvasNodeReferences?: CanvasNodeReference[]')
+    expect(queueBody).toContain("...(canvasNodeReferences?.length ? { _canvasNodeReferences: canvasNodeReferences } : {})")
+    expect(queueBody).toContain("text: rawText ?? text")
+  })
+
   test('Given 单次运行注入可信生图路由 When 构建 Pi 工具 Then 仅经运行扩展传入内置工具上下文', () => {
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
     const sendStart = source.indexOf('  async sendMessage(')

@@ -34,6 +34,7 @@ import type {
   AgentActiveSessionSnapshot,
   AgentMessage,
   CanvasAgentActiveRunSnapshot,
+  CanvasNodeReference,
 } from '@proma/shared'
 import { PiAgentAdapter } from './adapters/pi-agent-adapter'
 import { PiUtilityAdapter } from './adapters/pi-utility-adapter'
@@ -60,6 +61,12 @@ import { runAgentServiceTerminalEffects } from './agent-run-lifecycle'
 import type { AgentRunExtensions } from './agent-run-extensions'
 import { isStaleActiveQueueError } from './agent-queue-routing'
 import { shouldStopBeforeAgentRun } from './agent-stop-policy'
+import { buildCanvasWorkspacePrompt } from './agent-session-context-prompt'
+import { AgentCanvasBindingStore } from './design/agent-canvas-binding-store'
+import { createCanvasDocumentStore } from './design/canvas-document-store'
+import { createCanvasNodeReferenceResolver } from './design/canvas-node-reference-resolver'
+import { CanvasSessionStore } from './design/canvas-session-store'
+import { designPathResolver } from './design/design-paths'
 
 /** 保持现有主进程调用方从 agent-service 导入运行扩展类型的兼容性。 */
 export type { AgentRunExtensions } from './agent-run-extensions'
@@ -71,6 +78,49 @@ const useUtilityAgentRuntime = process.env.PROMA_AGENT_RUNTIME !== 'in-process'
   && process.env.PROMA_AGENT_RUNTIME !== 'off'
 const adapter = useUtilityAgentRuntime ? new PiUtilityAdapter() : new PiAgentAdapter()
 const orchestrator = new AgentOrchestrator(adapter, eventBus)
+/** Canvas 引用读取复用生产路径解析器，但不共享 IPC Store 的可变缓存。 */
+const canvasReferenceSessionStore = new CanvasSessionStore({ pathResolver: designPathResolver })
+/** 文档 Store 通过会话 registry 在每次 LOAD 时重新复核 Canvas 归属。 */
+const canvasReferenceDocumentStore = createCanvasDocumentStore({ sessions: canvasReferenceSessionStore })
+/** 发送边界的权威 Canvas 节点引用解析器。 */
+const canvasNodeReferenceResolver = createCanvasNodeReferenceResolver({
+  getSession: getAgentSessionMeta,
+  getBinding: (projectId, sessionId) => new AgentCanvasBindingStore().get(projectId, sessionId),
+  requireCanvas: (projectId, canvasId) => canvasReferenceSessionStore.requireNative(projectId, canvasId),
+  loadCanvas: (target) => canvasReferenceDocumentStore.load(target),
+})
+
+/** 单次发送前解析引用，并把轻量摘要合并进当前运行扩展。 */
+function resolveAgentCanvasReferencesForSend<T extends AgentSendInput | AgentQueueMessageInput>(
+  input: T,
+  extensions: AgentRunExtensions = {},
+): {
+  input: T
+  extensions: AgentRunExtensions
+  references: CanvasNodeReference[] | undefined
+  canvasWorkspacePrompt?: string
+} {
+  if (!input.canvasNodeReferences?.length) {
+    return { input, extensions, references: undefined }
+  }
+  /** Renderer 快照只作为定位输入，以下结果全部来自发送时权威文档。 */
+  const resolved = canvasNodeReferenceResolver.resolveForSend({
+    sessionId: input.sessionId,
+    references: input.canvasNodeReferences,
+  })
+  /** 普通新 run 通过 extensions 进入 system prompt；queue-now 复用同一最小块。 */
+  const canvasWorkspacePrompt = buildCanvasWorkspacePrompt(resolved.promptSummary)
+  /** 保留调用方专用提示词，并把 Canvas 摘要放在同一单次运行边界。 */
+  const systemPromptAppend = [extensions.systemPromptAppend, canvasWorkspacePrompt]
+    .filter((section): section is string => Boolean(section?.trim()))
+    .join('\n\n')
+  return {
+    input: { ...input, canvasNodeReferences: resolved.references } as T,
+    extensions: { ...extensions, systemPromptAppend },
+    references: resolved.references,
+    canvasWorkspacePrompt,
+  }
+}
 /** Agent service 与队列写入口共享的工作区迁移守卫。 */
 const workspaceOperationGuard = createWorkspaceOperationGuard({
   getWorkspaceIdBySessionId: (sessionId) => {
@@ -288,7 +338,9 @@ export async function runAgent(
     ? streamRoutes.getTargetIfOwner(input.sessionId, route.ownerId)
     : (webContents.isDestroyed() ? undefined : webContents)
   try {
-    await orchestrator.sendMessage(input, {
+    /** deferred queue 也只在真正启动时进入此解析边界。 */
+    const resolved = resolveAgentCanvasReferencesForSend(input, extensions)
+    await orchestrator.sendMessage(resolved.input, {
       onError: (error) => {
         runAgentServiceTerminalEffects([{
           name: 'renderer-error',
@@ -381,7 +433,7 @@ export async function runAgent(
           })
         }
       },
-    }, extensions)
+    }, resolved.extensions)
   } catch (err) {
     console.error('[Agent 服务] runAgent 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'
@@ -463,7 +515,9 @@ export async function runAgentHeadless(
     : (wc && !wc.isDestroyed() ? wc : undefined)
 
   try {
-    await orchestrator.sendMessage(runInput, {
+    /** 外部入口携带引用时同样执行普通宿主与项目归属复核。 */
+    const resolved = resolveAgentCanvasReferencesForSend(runInput, extensions)
+    await orchestrator.sendMessage(resolved.input, {
       onError: (error) => {
         runAgentServiceTerminalEffects([
           { name: 'external-on-error', run: () => { callbacks.onError(error) } },
@@ -553,7 +607,7 @@ export async function runAgentHeadless(
           })
         })
       },
-    }, extensions)
+    }, resolved.extensions)
   } catch (err) {
     console.error('[Agent 服务] runAgentHeadless 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'
@@ -692,18 +746,22 @@ export async function queueAgentMessage(
   input: AgentQueueMessageInput,
   _webContents: WebContents,
 ): Promise<string> {
+  /** queue-now 在注入当前 Pi 通道前重新读取权威节点。 */
+  const resolved = resolveAgentCanvasReferencesForSend(input)
   return orchestrator.queueMessage(
-    input.sessionId,
-    input.userMessage,
-    input.rawUserMessage,
+    resolved.input.sessionId,
+    resolved.input.userMessage,
+    resolved.input.rawUserMessage,
     undefined,
-    input.uuid,
-    { interrupt: input.interrupt },
-    input.mentionedSkills,
-    input.mentionedMcpServers,
-    input.mentionedSessionIds,
-    input.mentionedTodoIds,
-    input.mentionedCalendarEventIds,
+    resolved.input.uuid,
+    { interrupt: resolved.input.interrupt },
+    resolved.input.mentionedSkills,
+    resolved.input.mentionedMcpServers,
+    resolved.input.mentionedSessionIds,
+    resolved.input.mentionedTodoIds,
+    resolved.input.mentionedCalendarEventIds,
+    resolved.references,
+    resolved.canvasWorkspacePrompt,
   )
 }
 
@@ -730,6 +788,7 @@ export async function submitOrEnqueueAgentMessage(
         mentionedSessionIds: input.mentionedSessionIds,
         mentionedTodoIds: input.mentionedTodoIds,
         mentionedCalendarEventIds: input.mentionedCalendarEventIds,
+        canvasNodeReferences: input.canvasNodeReferences,
       }, webContents)
       return { disposition: 'injected' }
     } catch (error) {

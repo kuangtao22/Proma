@@ -19,7 +19,7 @@ import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { accessSync, constants, existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { app } from 'electron'
-import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, AgentActiveSessionSnapshot, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
+import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, AgentActiveSessionSnapshot, CanvasNodeReference, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
 import {
   PROMA_DEFAULT_PERMISSION_MODE,
   PROMA_PERMISSION_MODE_CONFIG,
@@ -617,6 +617,7 @@ export class AgentOrchestrator {
     createdAt = Date.now(),
     uuid?: string,
     vaultFocus?: import('@proma/shared').VaultFocusAttribution,
+    canvasNodeReferences?: CanvasNodeReference[],
   ): string {
     const persistedUuid = uuid ?? randomUUID()
     const userSDKMsg: SDKMessage = {
@@ -628,6 +629,7 @@ export class AgentOrchestrator {
       parent_tool_use_id: null,
       _createdAt: createdAt,
       ...(vaultFocus ? { _vaultFocus: vaultFocus } : {}),
+      ...(canvasNodeReferences?.length ? { _canvasNodeReferences: canvasNodeReferences } : {}),
     } as unknown as SDKMessage
     appendSDKMessages(sessionId, [userSDKMsg])
     return persistedUuid
@@ -721,7 +723,7 @@ export class AgentOrchestrator {
     callbacks: SessionCallbacks,
     extensions: AgentRunExtensions = {},
   ): Promise<void> {
-    const { sessionId, userMessage, rawUserMessage, userMessageUuid, channelId, modelId, workspaceId: requestedWorkspaceId, additionalDirectories, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid } = input
+    const { sessionId, userMessage, rawUserMessage, userMessageUuid, channelId, modelId, workspaceId: requestedWorkspaceId, additionalDirectories, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid, canvasNodeReferences } = input
     // Capture the focus once per turn. Later UI focus changes must not rewrite this reply's attribution.
     const initialVaultFocus = getVaultUserContext(sessionId)
     const streamStartedAt = input.startedAt ?? Date.now()
@@ -791,6 +793,7 @@ export class AgentOrchestrator {
           rootPath: initialVaultFocus.rootPath,
           focus: initialVaultFocus.focus,
         } : undefined,
+        canvasNodeReferences,
       )
       userMessagePersisted = true
     }
@@ -2536,6 +2539,8 @@ export class AgentOrchestrator {
     mentionedSessionIds?: string[],
     mentionedTodoIds?: string[],
     mentionedCalendarEventIds?: string[],
+    canvasNodeReferences?: CanvasNodeReference[],
+    canvasWorkspacePrompt?: string,
   ): Promise<string> {
     if (!this.activeSessions.has(sessionId)) {
       throw new Error(`[Agent 编排] 会话未运行，无法追加消息: ${sessionId}`)
@@ -2558,6 +2563,9 @@ export class AgentOrchestrator {
     let enrichedText = userBrowserContext || userVaultContext
       ? `${buildDynamicContext({ userBrowserContext, userVaultContext })}\n\n${text}`
       : text
+    if (canvasWorkspacePrompt) {
+      enrichedText = `${canvasWorkspacePrompt}\n\n${enrichedText}`
+    }
     const referencedSessionsBlock = buildReferencedSessionsPrompt(sessionId, mentionedSessionIds, workspaceSlug)
     if (referencedSessionsBlock) {
       enrichedText = `${referencedSessionsBlock}\n\n${enrichedText}`
@@ -2625,6 +2633,7 @@ export class AgentOrchestrator {
             focus: userVaultContext.focus,
           },
         } : {}),
+        ...(canvasNodeReferences?.length ? { _canvasNodeReferences: canvasNodeReferences } : {}),
       } as unknown as SDKMessage
       appendSDKMessages(sessionId, [persistMsg])
       this.flushPendingUserSkillActivations(sessionId, uuid)
