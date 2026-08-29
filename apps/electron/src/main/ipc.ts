@@ -200,7 +200,8 @@ import { registerDesignIpcHandlers } from './lib/design/design-ipc'
 import { registerCanvasSessionIpcHandlers } from './lib/design/canvas-session-ipc'
 import { CanvasSessionStore } from './lib/design/canvas-session-store'
 import {
-  clearDeletedAgentSessionCanvasBindings,
+  cleanupDeletedAgentSessionCanvasBindings,
+  cleanupDeletedCanvasBindings,
   registerAgentCanvasBindingIpcHandlers,
 } from './lib/design/agent-canvas-binding-ipc'
 import { AgentCanvasBindingStore } from './lib/design/agent-canvas-binding-store'
@@ -2170,6 +2171,19 @@ export function registerIpcHandlers(): void {
     assets: designAssetService,
   })
   setDefaultDesignJobManager(designJobManager)
+  /** 删除生命周期与 LIST 对账共用同一 Store 和固定广播边界。 */
+  const agentCanvasBindingCleanup = {
+    store: agentCanvasBindingStore,
+    broadcast: (event: AgentCanvasBindingChangeEvent): void => {
+      for (const contents of listAuthorizedDesignWebContents()) {
+        try {
+          contents.send(CANVAS_IPC_CHANNELS.AGENT_BINDINGS_CHANGED, event)
+        } catch {
+          console.error('[IPC] Agent-Canvas 关联变化广播失败')
+        }
+      }
+    },
+  }
   registerAgentCanvasBindingIpcHandlers({
     ipcMain,
     store: agentCanvasBindingStore,
@@ -2188,15 +2202,7 @@ export function registerIpcHandlers(): void {
         throw new Error('无权访问 Agent-Canvas 关联')
       }
     },
-    broadcast: (event: AgentCanvasBindingChangeEvent) => {
-      for (const contents of listAuthorizedDesignWebContents()) {
-        try {
-          contents.send(CANVAS_IPC_CHANNELS.AGENT_BINDINGS_CHANGED, event)
-        } catch (error) {
-          console.error('[IPC] Agent-Canvas 关联变化广播失败:', error)
-        }
-      }
-    },
+    broadcast: agentCanvasBindingCleanup.broadcast,
   })
   registerCanvasSessionIpcHandlers({
     ipc: ipcMain,
@@ -2239,8 +2245,8 @@ export function registerIpcHandlers(): void {
           console.error(`[Canvas 会话] 内部 Agent 清理失败 (${session.id}):`, error)
         }
       }
-      /** Canvas 索引删除成功后再移除普通 Agent 关联，不触碰上述内部会话身份。 */
-      agentCanvasBindingStore.clearCanvas(projectId, canvasId)
+      /** Canvas 索引删除成功后 best-effort 清理，失败不得阻断主删除广播。 */
+      cleanupDeletedCanvasBindings(agentCanvasBindingCleanup, projectId, canvasId)
     },
   })
   registerCanvasDocumentIpcHandlers({
@@ -3664,7 +3670,7 @@ export function registerIpcHandlers(): void {
       closeTerminalsForSession(id)
       deleteAgentSession(id)
       /** 复用关联准入规则，只在普通顶层 Agent 删除成功后清理。 */
-      clearDeletedAgentSessionCanvasBindings(agentCanvasBindingStore, deletingSession)
+      cleanupDeletedAgentSessionCanvasBindings(agentCanvasBindingCleanup, deletingSession)
       releaseAttachedFileWatchers(attachedFiles)
     }
   )
@@ -3926,6 +3932,11 @@ export function registerIpcHandlers(): void {
           }
           closeTerminalsForSession(sessionId)
           deleteAgentSession(sessionId)
+          /** 每个会话主删除成功后独立 best-effort 清理，不阻断工作区删除。 */
+          const deletedSession = affectedSessions.find((session) => session.id === sessionId)
+          if (deletedSession) {
+            cleanupDeletedAgentSessionCanvasBindings(agentCanvasBindingCleanup, deletedSession)
+          }
         }
         for (const automationId of affectedAutomationIds) {
           deleteAutomation(automationId)

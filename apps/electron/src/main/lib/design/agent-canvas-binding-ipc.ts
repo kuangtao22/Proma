@@ -72,7 +72,7 @@ async function invokeSafely<T>(
   try {
     return { ok: true, value: await run() }
   } catch (error) {
-    console.error('[AgentCanvasBindingIPC] 关联操作失败:', error)
+    console.error('[Agent-Canvas 关联] IPC 操作失败')
     return { ok: false, error: { ...fallback } }
   }
 }
@@ -96,16 +96,84 @@ function isEligibleProjectAgent(session: AgentSessionMeta, projectId: string): b
     && session.parentSessionId === undefined
     && session.rootSessionId === undefined
     && session.sourceDelegationId === undefined
+    && session.delegationRole === undefined
+    && session.delegationStatus === undefined
+    && session.delegationDepth === undefined
+    && session.delegationGoal === undefined
 }
 
-/** 普通 Agent 删除成功后按同一准入规则清理关联，内部会话保持不变。 */
-export function clearDeletedAgentSessionCanvasBindings(
-  store: Pick<AgentCanvasBindingStore, 'clearSession'>,
+/** 清理关联及广播所需的最小生命周期依赖。 */
+export interface AgentCanvasBindingCleanupOptions {
+  store: Pick<AgentCanvasBindingStore, 'listByProject' | 'clearSession' | 'clearCanvas'>
+  broadcast: (event: AgentCanvasBindingChangeEvent) => void
+}
+
+/** 广播失败只记录固定类别，已提交关联事实不得回滚或报错。 */
+function broadcastChangeSafely(
+  options: Pick<AgentCanvasBindingCleanupOptions, 'broadcast'>,
+  event: AgentCanvasBindingChangeEvent,
+): void {
+  try {
+    options.broadcast(parseAgentCanvasBindingChangeEvent(event))
+  } catch {
+    console.error('[Agent-Canvas 关联] 变化广播失败')
+  }
+}
+
+/** 对单个 session 或 canvas 执行前后差异清理并广播精确受影响身份。 */
+export function clearAgentCanvasBindingsWithEvents(
+  options: AgentCanvasBindingCleanupOptions,
+  input: { projectId: string; target: 'session'; sessionId: string }
+    | { projectId: string; target: 'canvas'; canvasId: string },
+): void {
+  const before = parseListAgentCanvasBindingsResult(options.store.listByProject(input.projectId))
+  if (input.target === 'session') options.store.clearSession(input.projectId, input.sessionId)
+  else options.store.clearCanvas(input.projectId, input.canvasId)
+  const afterBySession = new Map(
+    parseListAgentCanvasBindingsResult(options.store.listByProject(input.projectId))
+      .map((binding) => [binding.sessionId, binding]),
+  )
+  for (const previous of before) {
+    const current = afterBySession.get(previous.sessionId) ?? null
+    if (current && bindingsEqual(previous, current)) continue
+    broadcastChangeSafely(options, {
+      projectId: input.projectId,
+      sessionId: previous.sessionId,
+      cause: input.target === 'session' ? 'session-cleared' : 'canvas-cleared',
+      binding: current,
+    })
+  }
+}
+
+/** 普通 Agent 删除成功后的 best-effort 关联清理，内部会话保持不变。 */
+export function cleanupDeletedAgentSessionCanvasBindings(
+  options: AgentCanvasBindingCleanupOptions,
   session: AgentSessionMeta,
 ): boolean {
   if (!session.workspaceId || !isEligibleProjectAgent(session, session.workspaceId)) return false
-  store.clearSession(session.workspaceId, session.id)
+  try {
+    clearAgentCanvasBindingsWithEvents(options, {
+      projectId: session.workspaceId,
+      target: 'session',
+      sessionId: session.id,
+    })
+  } catch {
+    console.error('[Agent-Canvas 关联] Agent 删除后的关联清理失败')
+  }
   return true
+}
+
+/** Canvas 删除成功后的 best-effort 关联清理，不影响主删除结果与事件。 */
+export function cleanupDeletedCanvasBindings(
+  options: AgentCanvasBindingCleanupOptions,
+  projectId: string,
+  canvasId: string,
+): void {
+  try {
+    clearAgentCanvasBindingsWithEvents(options, { projectId, target: 'canvas', canvasId })
+  } catch {
+    console.error('[Agent-Canvas 关联] Canvas 删除后的关联清理失败')
+  }
 }
 
 /** 要求 Canvas 存在于目标项目公开索引；legacy-design 同样有效。 */
@@ -126,7 +194,16 @@ function broadcastChange(
   options: RegisterAgentCanvasBindingIpcOptions,
   event: AgentCanvasBindingChangeEvent,
 ): void {
-  options.broadcast(parseAgentCanvasBindingChangeEvent(event))
+  broadcastChangeSafely(options, event)
+}
+
+/** 比较可空关联事实，供幂等写操作抑制伪变化事件。 */
+function nullableBindingsEqual(
+  left: AgentCanvasBinding | null,
+  right: AgentCanvasBinding | null,
+): boolean {
+  if (left === null || right === null) return left === right
+  return bindingsEqual(left, right)
 }
 
 /** 判断清理前后记录是否发生公开业务变化。 */
@@ -138,6 +215,45 @@ function bindingsEqual(left: AgentCanvasBinding, right: AgentCanvasBinding): boo
     && left.updatedAt === right.updatedAt
     && left.linkedCanvasIds.length === right.linkedCanvasIds.length
     && left.linkedCanvasIds.every((canvasId, index) => canvasId === right.linkedCanvasIds[index])
+}
+
+/** LIST 前按实时 Agent/Canvas 权威事实移除陈旧关联。 */
+export function reconcileAgentCanvasBindings(
+  projectId: string,
+  options: RegisterAgentCanvasBindingIpcOptions,
+): AgentCanvasBinding[] {
+  const bindings = parseListAgentCanvasBindingsResult(options.store.listByProject(projectId))
+  const canvasIds = new Set(
+    options.listCanvasSessions(projectId)
+      .filter((canvas) => canvas.projectId === projectId)
+      .map((canvas) => canvas.id),
+  )
+  for (const binding of bindings) {
+    const session = options.getAgentSession(binding.sessionId)
+    if (session && isEligibleProjectAgent(session, projectId)) continue
+    clearAgentCanvasBindingsWithEvents(options, {
+      projectId,
+      target: 'session',
+      sessionId: binding.sessionId,
+    })
+  }
+  const invalidCanvasIds = new Set<string>()
+  for (const binding of parseListAgentCanvasBindingsResult(options.store.listByProject(projectId))) {
+    for (const canvasId of binding.linkedCanvasIds) {
+      if (!canvasIds.has(canvasId)) invalidCanvasIds.add(canvasId)
+    }
+  }
+  for (const canvasId of invalidCanvasIds) {
+    clearAgentCanvasBindingsWithEvents(options, { projectId, target: 'canvas', canvasId })
+  }
+  const reconciled = parseListAgentCanvasBindingsResult(options.store.listByProject(projectId))
+  if (!reconciled.every((binding) => {
+    const session = options.getAgentSession(binding.sessionId)
+    return Boolean(session
+      && isEligibleProjectAgent(session, projectId)
+      && binding.linkedCanvasIds.every((canvasId) => canvasIds.has(canvasId)))
+  })) throw new Error('AGENT_CANVAS_BINDINGS_RECONCILE_INCOMPLETE')
+  return reconciled
 }
 
 /** 注册五个 Agent-Canvas invoke handler。 */
@@ -158,7 +274,7 @@ export function registerAgentCanvasBindingIpcHandlers(
     async () => {
       const input = parseListAgentCanvasBindingsInput(value)
       await options.assertSenderProjectAccess(event.sender, input.projectId)
-      return parseListAgentCanvasBindingsResult(options.store.listByProject(input.projectId))
+      return reconcileAgentCanvasBindings(input.projectId, options)
     },
   ))
 
@@ -169,8 +285,13 @@ export function registerAgentCanvasBindingIpcHandlers(
       await options.assertSenderProjectAccess(event.sender, input.projectId)
       requireProjectAgent(input.sessionId, input.projectId, options)
       requireProjectCanvas(input.canvasId, input.projectId, options)
+      const before = options.store.listByProject(input.projectId).find(
+        (binding) => binding.sessionId === input.sessionId,
+      ) ?? null
       const binding = parseLinkAgentCanvasResult(options.store.link(input))
-      broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'linked', binding })
+      if (!nullableBindingsEqual(before, binding)) {
+        broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'linked', binding })
+      }
       return binding
     },
   ))
@@ -182,8 +303,13 @@ export function registerAgentCanvasBindingIpcHandlers(
       await options.assertSenderProjectAccess(event.sender, input.projectId)
       requireProjectAgent(input.sessionId, input.projectId, options)
       requireProjectCanvas(input.canvasId, input.projectId, options)
+      const before = options.store.listByProject(input.projectId).find(
+        (binding) => binding.sessionId === input.sessionId,
+      ) ?? null
       const binding = parseUnlinkAgentCanvasResult(options.store.unlink(input))
-      broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'unlinked', binding })
+      if (!nullableBindingsEqual(before, binding)) {
+        broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'unlinked', binding })
+      }
       return binding
     },
   ))
@@ -195,8 +321,13 @@ export function registerAgentCanvasBindingIpcHandlers(
       await options.assertSenderProjectAccess(event.sender, input.projectId)
       requireProjectAgent(input.sessionId, input.projectId, options)
       requireProjectCanvas(input.canvasId, input.projectId, options)
+      const before = options.store.listByProject(input.projectId).find(
+        (binding) => binding.sessionId === input.sessionId,
+      ) ?? null
       const binding = parseSetDefaultAgentCanvasResult(options.store.setDefault(input))
-      broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'default-changed', binding })
+      if (!nullableBindingsEqual(before, binding)) {
+        broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'default-changed', binding })
+      }
       return binding
     },
   ))
@@ -206,27 +337,12 @@ export function registerAgentCanvasBindingIpcHandlers(
     async () => {
       const input = parseClearAgentCanvasBindingsInput(value)
       await options.assertSenderProjectAccess(event.sender, input.projectId)
-      const before = options.store.listByProject(input.projectId)
       if (input.target === 'session') {
         requireProjectAgent(input.sessionId, input.projectId, options)
-        options.store.clearSession(input.projectId, input.sessionId)
       } else {
         requireProjectCanvas(input.canvasId, input.projectId, options)
-        options.store.clearCanvas(input.projectId, input.canvasId)
       }
-      const afterBySession = new Map(
-        options.store.listByProject(input.projectId).map((binding) => [binding.sessionId, binding]),
-      )
-      for (const previous of before) {
-        const current = afterBySession.get(previous.sessionId) ?? null
-        if (current && bindingsEqual(previous, current)) continue
-        broadcastChange(options, {
-          projectId: input.projectId,
-          sessionId: previous.sessionId,
-          cause: input.target === 'session' ? 'session-cleared' : 'canvas-cleared',
-          binding: current,
-        })
-      }
+      clearAgentCanvasBindingsWithEvents(options, input)
       return parseClearAgentCanvasBindingsResult(undefined)
     },
   ))

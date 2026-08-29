@@ -338,4 +338,15 @@ describe('Design preload', () => {
     expect(recorded.removed).toHaveLength(1)
     expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
   })
+
+  test('Given 关联变化 listener 抛错 When payload 合法 Then 消费者异常向上传播', () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    api.onAgentCanvasBindingChanged(() => { throw new Error('consumer-failure') })
+    const change = {
+      projectId: 'p1', sessionId: 'session-1', cause: 'session-cleared' as const, binding: null,
+    }
+
+    expect(() => recorded.added[0]?.listener({} as IpcRendererEvent, change)).toThrow('consumer-failure')
+  })
 })

@@ -1,4 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { CANVAS_IPC_CHANNELS } from '@proma/shared'
 import type {
   AgentCanvasBinding,
@@ -9,7 +11,8 @@ import type {
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import {
-  clearDeletedAgentSessionCanvasBindings,
+  cleanupDeletedAgentSessionCanvasBindings,
+  cleanupDeletedCanvasBindings,
   registerAgentCanvasBindingIpcHandlers,
 } from './agent-canvas-binding-ipc'
 
@@ -80,6 +83,7 @@ function createStore() {
     unlink: (input: { projectId: string; sessionId: string; canvasId: string }) => {
       const existing = bindings.find((binding) => binding.projectId === input.projectId && binding.sessionId === input.sessionId)
       if (!existing) return null
+      if (!existing.linkedCanvasIds.includes(input.canvasId)) return copy(existing)
       const linkedCanvasIds = existing.linkedCanvasIds.filter((canvasId) => canvasId !== input.canvasId)
       bindings = bindings.filter((candidate) => candidate !== existing)
       if (linkedCanvasIds.length === 0) return null
@@ -90,6 +94,7 @@ function createStore() {
     setDefault: (input: { projectId: string; sessionId: string; canvasId: string }) => {
       const existing = bindings.find((binding) => binding.projectId === input.projectId && binding.sessionId === input.sessionId)
       if (!existing?.linkedCanvasIds.includes(input.canvasId)) throw new Error('not found')
+      if (existing.defaultCanvasId === input.canvasId && existing.lastActiveCanvasId === input.canvasId) return copy(existing)
       existing.defaultCanvasId = input.canvasId
       existing.lastActiveCanvasId = input.canvasId
       existing.updatedAt = 12
@@ -123,23 +128,173 @@ async function invoke<T>(
 }
 
 describe('Agent-画布关联 IPC', () => {
+  test('Given 单会话、Canvas 与工作区删除入口 When 检查主进程接缝 Then 均在主删除成功后使用 best-effort helper', () => {
+    const source = readFileSync(join(import.meta.dir, '../../ipc.ts'), 'utf8')
+    expect(source).toContain('cleanupDeletedCanvasBindings(agentCanvasBindingCleanup, projectId, canvasId)')
+    expect(source).toContain('cleanupDeletedAgentSessionCanvasBindings(agentCanvasBindingCleanup, deletingSession)')
+    const workspaceDelete = source.indexOf('for (const sessionId of affectedSessionIds)')
+    const sessionDelete = source.indexOf('deleteAgentSession(sessionId)', workspaceDelete)
+    const bindingCleanup = source.indexOf('cleanupDeletedAgentSessionCanvasBindings(agentCanvasBindingCleanup, deletedSession)', sessionDelete)
+    expect(workspaceDelete).toBeGreaterThan(-1)
+    expect(sessionDelete).toBeGreaterThan(workspaceDelete)
+    expect(bindingCleanup).toBeGreaterThan(sessionDelete)
+  })
+
   test('Given 会话删除成功 When 清理关联 Then 只处理普通顶层 Agent 并排除内部身份', () => {
     const cleared: Array<{ projectId: string; sessionId: string }> = []
+    let binding: AgentCanvasBinding | null = {
+      projectId: 'project-1', sessionId: 'session-1', defaultCanvasId: 'canvas-1',
+      linkedCanvasIds: ['canvas-1'], lastActiveCanvasId: 'canvas-1', updatedAt: 1,
+    }
     const store = {
-      clearSession: (projectId: string, sessionId: string) => { cleared.push({ projectId, sessionId }) },
+      listByProject: () => binding ? [binding] : [],
+      clearSession: (projectId: string, sessionId: string) => {
+        cleared.push({ projectId, sessionId })
+        binding = null
+      },
+      clearCanvas: () => undefined,
     }
 
-    expect(clearDeletedAgentSessionCanvasBindings(store, createAgentSession())).toBe(true)
-    expect(clearDeletedAgentSessionCanvasBindings(store, createAgentSession('canvas-agent', {
+    expect(cleanupDeletedAgentSessionCanvasBindings({ store, broadcast: () => undefined }, createAgentSession())).toBe(true)
+    expect(cleanupDeletedAgentSessionCanvasBindings({ store, broadcast: () => undefined }, createAgentSession('canvas-agent', {
       sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
     }))).toBe(false)
-    expect(clearDeletedAgentSessionCanvasBindings(store, createAgentSession('automation-agent', {
+    expect(cleanupDeletedAgentSessionCanvasBindings({ store, broadcast: () => undefined }, createAgentSession('automation-agent', {
       sourceAutomationId: 'automation-1',
     }))).toBe(false)
-    expect(clearDeletedAgentSessionCanvasBindings(store, createAgentSession('delegated-agent', {
+    expect(cleanupDeletedAgentSessionCanvasBindings({ store, broadcast: () => undefined }, createAgentSession('delegated-agent', {
       parentSessionId: 'parent-1', sourceDelegationId: 'delegation-1',
     }))).toBe(false)
     expect(cleared).toEqual([{ projectId: 'project-1', sessionId: 'session-1' }])
+  })
+
+  test('Given 关联清理 Store 或广播失败 When 主实体已删除 Then 固定日志且不反向抛错', () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const bindingValue: AgentCanvasBinding = {
+      projectId: 'project-1', sessionId: 'session-1', defaultCanvasId: 'canvas-1',
+      linkedCanvasIds: ['canvas-1'], lastActiveCanvasId: 'canvas-1', updatedAt: 1,
+    }
+    const preCommitFailure = {
+      listByProject: () => [bindingValue],
+      clearSession: () => { throw new Error('/private/precommit-path') },
+      clearCanvas: () => { throw new Error('/private/store-path') },
+    }
+    expect(() => cleanupDeletedAgentSessionCanvasBindings(
+      { store: preCommitFailure, broadcast: () => undefined },
+      createAgentSession(),
+    )).not.toThrow()
+    let committed = true
+    const postCommitFailure = {
+      listByProject: () => committed ? [bindingValue] : [],
+      clearSession: () => { committed = false; throw new Error('/private/postcommit-path') },
+      clearCanvas: () => undefined,
+    }
+    expect(() => cleanupDeletedAgentSessionCanvasBindings(
+      { store: postCommitFailure, broadcast: () => undefined },
+      createAgentSession(),
+    )).not.toThrow()
+    expect(committed).toBe(false)
+    expect(() => cleanupDeletedCanvasBindings(
+      { store: preCommitFailure, broadcast: () => undefined },
+      'project-1',
+      'canvas-1',
+    )).not.toThrow()
+
+    const store = createStore()
+    store.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false })
+    expect(() => cleanupDeletedCanvasBindings(
+      { store, broadcast: () => { throw new Error('/private/broadcast-path') } },
+      'project-1',
+      'canvas-1',
+    )).not.toThrow()
+    expect(store.listByProject('project-1')).toEqual([])
+    expect(errorSpy.mock.calls.flat()).toEqual(expect.not.arrayContaining([
+      expect.stringContaining('/private'),
+    ]))
+    errorSpy.mockRestore()
+  })
+
+  test('Given 重复 link、未知 unlink 与重复 default When 调用 Then 事实未变化不广播', async () => {
+    const handlers = new Map<string, TestHandler>()
+    const store = createStore()
+    const events: AgentCanvasBindingChangeEvent[] = []
+    registerAgentCanvasBindingIpcHandlers({
+      ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => handlers.delete(channel) },
+      store,
+      getAgentSession: (sessionId) => createAgentSession(sessionId),
+      listCanvasSessions: () => [createCanvasSession(), createCanvasSession('canvas-2')],
+      assertSenderProjectAccess: () => undefined,
+      broadcast: (event) => events.push(event),
+    })
+    const sender = createSender(1)
+    const linkInput = { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false }
+    await invoke(handlers, CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS, sender, linkInput)
+    events.length = 0
+
+    await invoke(handlers, CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS, sender, linkInput)
+    await invoke(handlers, CANVAS_IPC_CHANNELS.UNLINK_AGENT_CANVAS, sender, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-2' })
+    await invoke(handlers, CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS, sender, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' })
+
+    expect(events).toEqual([])
+  })
+
+  test('Given LIST 包含失效 session 与 canvas When 实时对账 Then 清理并只返回当前有效关联', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const handlers = new Map<string, TestHandler>()
+    const store = createStore()
+    const events: AgentCanvasBindingChangeEvent[] = []
+    store.link({ projectId: 'project-1', sessionId: 'session-valid', canvasId: 'canvas-1', makeDefault: false })
+    store.link({ projectId: 'project-1', sessionId: 'session-valid', canvasId: 'canvas-stale', makeDefault: false })
+    store.link({ projectId: 'project-1', sessionId: 'session-missing', canvasId: 'canvas-1', makeDefault: false })
+    registerAgentCanvasBindingIpcHandlers({
+      ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => handlers.delete(channel) },
+      store,
+      getAgentSession: (sessionId) => sessionId === 'session-valid' ? createAgentSession(sessionId) : null,
+      listCanvasSessions: () => [createCanvasSession()],
+      assertSenderProjectAccess: () => undefined,
+      broadcast: (event) => { events.push(event); throw new Error('/private/broadcast-path') },
+    })
+
+    const result = await invoke<AgentCanvasBinding[]>(handlers, CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS, createSender(1), { projectId: 'project-1' })
+
+    expect(result).toMatchObject({ ok: true, value: [{ sessionId: 'session-valid', linkedCanvasIds: ['canvas-1'] }] })
+    expect(events.map((event) => `${event.sessionId}:${event.cause}`).sort()).toEqual([
+      'session-missing:session-cleared',
+      'session-valid:canvas-cleared',
+    ])
+    expect(errorSpy.mock.calls.flat().join(' ')).not.toContain('/private')
+    errorSpy.mockRestore()
+  })
+
+  test('Given LIST 对账清理失败 When 调用 Then 返回固定失败而不返回陈旧关联', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const handlers = new Map<string, TestHandler>()
+    const stale = {
+      projectId: 'project-1', sessionId: 'session-missing', defaultCanvasId: 'canvas-1',
+      linkedCanvasIds: ['canvas-1'], lastActiveCanvasId: 'canvas-1', updatedAt: 1,
+    }
+    registerAgentCanvasBindingIpcHandlers({
+      ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => handlers.delete(channel) },
+      store: {
+        listByProject: () => [stale],
+        link: () => stale,
+        unlink: () => stale,
+        setDefault: () => stale,
+        clearSession: () => { throw new Error('/private/store-path') },
+        clearCanvas: () => undefined,
+      },
+      getAgentSession: () => null,
+      listCanvasSessions: () => [createCanvasSession()],
+      assertSenderProjectAccess: () => undefined,
+      broadcast: () => undefined,
+    })
+
+    expect(await invoke(handlers, CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS, createSender(1), { projectId: 'project-1' })).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_BINDING_LIST_FAILED', message: '画布关联列表暂时无法加载。' },
+    })
+    expect(errorSpy.mock.calls.flat().join(' ')).not.toContain('/private')
+    errorSpy.mockRestore()
   })
 
   test('Given 授权普通 Agent 与同项目 Canvas When 五类 invoke Then 严格返回并广播变化，dispose 幂等解除', async () => {
@@ -238,6 +393,10 @@ describe('Agent-画布关联 IPC', () => {
       { sourceDesignProjectId: 'project-1' },
       { sourceAutomationId: 'automation-1' },
       { parentSessionId: 'parent-1' },
+      { delegationRole: 'explore' },
+      { delegationStatus: 'running' },
+      { delegationDepth: 1 },
+      { delegationGoal: '检查代码' },
       { workspaceId: undefined },
       { workspaceId: 'project-2' },
     ] satisfies Array<Partial<AgentSessionMeta>>) {

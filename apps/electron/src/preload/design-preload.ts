@@ -462,11 +462,13 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
     onAgentCanvasBindingChanged: (listener) => {
       /** 未知事件先经过 shared exact-key parser，非法 payload 静默丢弃。 */
       const handler = (_event: IpcRendererEvent, value: unknown): void => {
+        let parsed: AgentCanvasBindingChangeEvent
         try {
-          listener(parseAgentCanvasBindingChangeEvent(value))
+          parsed = parseAgentCanvasBindingChangeEvent(value)
         } catch {
           return
         }
+        listener(parsed)
       }
       ipc.on(CANVAS_IPC_CHANNELS.AGENT_BINDINGS_CHANGED, handler)
       return makeIdempotentRelease(() => {
