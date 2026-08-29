@@ -26,6 +26,7 @@ import {
   createAgentCanvasViewKey,
   createAgentCanvasWorkbenchChangeUpdate as createNativeCanvasWorkbenchChangeUpdate,
   createInitialAgentCanvasViewState,
+  removeAgentCanvasViewStateAtom,
   updateAgentCanvasViewStateAtom,
 } from '@/atoms/agent-canvas-atoms'
 import type { AgentCanvasViewState } from '@/atoms/agent-canvas-atoms'
@@ -59,6 +60,7 @@ import {
   createNativeCanvasWorkbenchDraftCommitCoordinator,
   createNativeCanvasWorkbenchCloseRequestUpdate,
   createNativeCanvasWorkbenchCleanupCoordinator,
+  mountNativeCanvasSessionView,
   createNativeCanvasAgentNodeSuccessUpdate,
   createNativeCanvasNodeCreationSuccessUpdate,
   createNativeCanvasLifecycleSuccessUpdate,
@@ -833,6 +835,37 @@ describe('原生 Canvas 工作台卸载清理协调', () => {
     harness.flush()
 
     expect(harness.cleared).toEqual(['canvas-1'])
+  })
+
+  test('Given 两个会话挂载同一共享图 When 当前会话真实卸载 Then 只删除当前 view 并保留 graph 与另一 view', () => {
+    const harness = createCleanupHarness()
+    const store = createStore()
+    const graphKey = createNativeCanvasKey('project-1', 'canvas-1')
+    const firstViewKey = createAgentCanvasViewKey('session-a', 'project-1', 'canvas-1')
+    const secondViewKey = createAgentCanvasViewKey('session-b', 'project-1', 'canvas-1')
+    const graphState = {
+      ...createInitialGraphNativeCanvasState(),
+      phase: 'ready' as const,
+      snapshot: createSnapshot(1),
+    }
+    const secondViewState = createInitialAgentCanvasViewState({ x: 20, y: 30, zoom: 1.2 })
+    store.set(nativeCanvasStatesAtom, new Map([[graphKey, graphState]]))
+    store.set(agentCanvasViewStatesAtom, new Map([
+      [firstViewKey, createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })],
+      [secondViewKey, secondViewState],
+    ]))
+    const dispose = mountNativeCanvasSessionView(
+      harness.coordinator,
+      firstViewKey,
+      (viewKey) => store.set(removeAgentCanvasViewStateAtom, viewKey),
+    )
+
+    dispose()
+    harness.flush()
+
+    expect(store.get(agentCanvasViewStatesAtom).has(firstViewKey)).toBe(false)
+    expect(store.get(agentCanvasViewStatesAtom).get(secondViewKey)).toBe(secondViewState)
+    expect(store.get(nativeCanvasStatesAtom).get(graphKey)).toBe(graphState)
   })
 
   test('Given Workspace 从 A 切到 B When A 清理微任务执行 Then 只清 A', () => {

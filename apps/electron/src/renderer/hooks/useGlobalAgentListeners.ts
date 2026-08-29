@@ -73,17 +73,13 @@ import {
   canvasAgentLifecycleAtom,
   canvasAgentOpenSessionIdsAtom,
   canvasAgentRunningSessionIdsAtom,
-  createNativeCanvasKey,
   isCanvasAgentHandoffGenerationCurrent,
   isCanvasAgentGenerationCurrent,
-  nativeCanvasStatesAtom,
 } from '@/atoms/native-canvas-atoms'
 import {
   createAgentCanvasViewKey,
-  createAgentCanvasWorkbenchChangeUpdate,
   createLegacyAgentCanvasHostSessionId,
-  initializeAgentCanvasViewStateAtom,
-  updateAgentCanvasViewStateAtom,
+  navigateAgentCanvasViewAtom,
 } from '@/atoms/agent-canvas-atoms'
 import { tabsAtom, activeTabIdAtom, activeSessionIdAtom, openTab, updateTabTitle } from '@/atoms/tab-atoms'
 import type { AgentStreamState } from '@/atoms/agent-atoms'
@@ -679,20 +675,12 @@ export function useGlobalAgentListeners(): void {
         projectId: owner.projectId,
         canvasId: owner.canvasId,
       })
-      /** 独立入口未挂载时先用共享文档视口初始化，确保通知导航不会因缺少 view key 丢失。 */
+      /** 未 LOAD 时只暂存导航意图，首个权威文档仍拥有 viewport 初始化权。 */
       const hostSessionId = createLegacyAgentCanvasHostSessionId(owner.projectId)
       const viewKey = createAgentCanvasViewKey(hostSessionId, owner.projectId, owner.canvasId)
-      const graphKey = createNativeCanvasKey(owner.projectId, owner.canvasId)
-      const viewport = store.get(nativeCanvasStatesAtom).get(graphKey)?.snapshot?.document.viewport
-        ?? { x: 0, y: 0, zoom: 1 }
-      store.set(initializeAgentCanvasViewStateAtom, { key: viewKey, viewport })
-      store.set(updateAgentCanvasViewStateAtom, {
+      store.set(navigateAgentCanvasViewAtom, {
         key: viewKey,
-        update: (current) => ({
-          selectedNodeId: owner.nodeId,
-          selectedNodeIds: [owner.nodeId],
-          ...createAgentCanvasWorkbenchChangeUpdate(current, owner.nodeId),
-        }),
+        nodeId: owner.nodeId,
       })
       store.set(appModeAtom, 'agent')
       store.set(activeViewAtom, 'design')

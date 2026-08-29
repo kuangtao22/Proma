@@ -151,6 +151,9 @@ export function createClosedAgentCanvasWorkbenchUpdate(): Partial<AgentCanvasVie
 /** 所有 Agent Canvas 会话视图按完整三元身份隔离的状态。 */
 export const agentCanvasViewStatesAtom = atom<Map<string, AgentCanvasViewState>>(new Map())
 
+/** 权威文档尚未 LOAD 时暂存的最新节点导航意图。 */
+const pendingAgentCanvasViewNavigationAtom = atom<Map<string, string>>(new Map())
+
 /** 单个 Agent Canvas 视图初始化输入。 */
 export interface InitializeAgentCanvasViewStateInput {
   /** 完整 Agent Canvas 视图键。 */
@@ -166,9 +169,24 @@ export const initializeAgentCanvasViewStateAtom = atom(
     /** 同一 view key 重载共享图时不得覆盖用户视口与选区。 */
     const states = get(agentCanvasViewStatesAtom)
     if (states.has(input.key)) return
+    const pendingNavigations = get(pendingAgentCanvasViewNavigationAtom)
+    const pendingNodeId = pendingNavigations.get(input.key)
+    const initial = createInitialAgentCanvasViewState(input.viewport)
     const nextStates = new Map(states)
-    nextStates.set(input.key, createInitialAgentCanvasViewState(input.viewport))
+    nextStates.set(input.key, pendingNodeId
+      ? {
+          ...initial,
+          selectedNodeId: pendingNodeId,
+          selectedNodeIds: [pendingNodeId],
+          ...createAgentCanvasWorkbenchChangeUpdate(initial, pendingNodeId),
+        }
+      : initial)
     set(agentCanvasViewStatesAtom, nextStates)
+    if (!pendingNodeId) return
+    /** 导航意图只消费一次，后续文档刷新不得再次抢占用户视图。 */
+    const nextPendingNavigations = new Map(pendingNavigations)
+    nextPendingNavigations.delete(input.key)
+    set(pendingAgentCanvasViewNavigationAtom, nextPendingNavigations)
   },
 )
 
@@ -199,15 +217,57 @@ export const updateAgentCanvasViewStateAtom = atom(
   },
 )
 
+/** Agent Canvas 节点导航输入。 */
+export interface NavigateAgentCanvasViewInput {
+  /** 完整 Agent Canvas 视图键。 */
+  key: string
+  /** 需要选中并打开工作台的节点 ID。 */
+  nodeId: string
+}
+
+/**
+ * 导航到 Agent Canvas 节点；权威文档未 LOAD 时只暂存意图。
+ * @param input 目标 view key 与节点 ID。
+ * @returns 无返回值；已有 view 立即更新，缺失 view 等待首次权威初始化。
+ */
+export const navigateAgentCanvasViewAtom = atom(
+  null,
+  (get, set, input: NavigateAgentCanvasViewInput): void => {
+    const states = get(agentCanvasViewStatesAtom)
+    const current = states.get(input.key)
+    if (!current) {
+      /** 同一 view key 的最新通知覆盖旧意图，避免 LOAD 后连续跳转。 */
+      const nextPendingNavigations = new Map(get(pendingAgentCanvasViewNavigationAtom))
+      nextPendingNavigations.set(input.key, input.nodeId)
+      set(pendingAgentCanvasViewNavigationAtom, nextPendingNavigations)
+      return
+    }
+    const nextStates = new Map(states)
+    nextStates.set(input.key, {
+      ...current,
+      selectedNodeId: input.nodeId,
+      selectedNodeIds: [input.nodeId],
+      ...createAgentCanvasWorkbenchChangeUpdate(current, input.nodeId),
+    })
+    set(agentCanvasViewStatesAtom, nextStates)
+  },
+)
+
 /** 删除单个已失效 Agent Canvas 会话视图的原子入口。 */
 export const removeAgentCanvasViewStateAtom = atom(
   null,
   (get, set, key: string): void => {
-    /** 无目标时保留原 Map 引用，避免其它会话无意义重渲染。 */
+    /** 两张 Map 分别判断，LOAD 前真实卸载也必须清除待导航意图。 */
     const states = get(agentCanvasViewStatesAtom)
-    if (!states.has(key)) return
-    const nextStates = new Map(states)
-    nextStates.delete(key)
-    set(agentCanvasViewStatesAtom, nextStates)
+    if (states.has(key)) {
+      const nextStates = new Map(states)
+      nextStates.delete(key)
+      set(agentCanvasViewStatesAtom, nextStates)
+    }
+    const pendingNavigations = get(pendingAgentCanvasViewNavigationAtom)
+    if (!pendingNavigations.has(key)) return
+    const nextPendingNavigations = new Map(pendingNavigations)
+    nextPendingNavigations.delete(key)
+    set(pendingAgentCanvasViewNavigationAtom, nextPendingNavigations)
   },
 )

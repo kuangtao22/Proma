@@ -44,6 +44,7 @@ import {
   createConvergedAgentCanvasViewUpdate,
   createInitialAgentCanvasViewState,
   initializeAgentCanvasViewStateAtom,
+  removeAgentCanvasViewStateAtom,
   updateAgentCanvasViewStateAtom,
 } from '@/atoms/agent-canvas-atoms'
 import type {
@@ -365,6 +366,24 @@ export function createNativeCanvasWorkbenchCleanupCoordinator(
       }
     },
   }
+}
+
+/** Agent Canvas view 删除入口。 */
+export type RemoveNativeCanvasSessionView = (viewStateKey: string) => void
+
+/**
+ * 把 view 生命周期绑定到 StrictMode 安全的真实卸载协调器。
+ * @param coordinator 跨挂载共享的微任务卸载协调器。
+ * @param viewStateKey 当前 Agent session view 的完整键。
+ * @param removeViewState 删除当前 view atom 的入口。
+ * @returns 当前挂载的幂等释放函数。
+ */
+export function mountNativeCanvasSessionView(
+  coordinator: NativeCanvasWorkbenchCleanupCoordinator,
+  viewStateKey: string,
+  removeViewState: RemoveNativeCanvasSessionView,
+): () => void {
+  return coordinator.mount(viewStateKey, () => removeViewState(viewStateKey))
 }
 
 /** Renderer 生命周期共享协调器，同 key StrictMode 重挂可取消前一轮候选清理。 */
@@ -1891,6 +1910,7 @@ export function NativeCanvasWorkspace({
   const viewStates = useAtomValue(agentCanvasViewStatesAtom)
   const updateNativeCanvasState = useSetAtom(updateNativeCanvasStateAtom)
   const initializeAgentCanvasViewState = useSetAtom(initializeAgentCanvasViewStateAtom)
+  const removeAgentCanvasViewState = useSetAtom(removeAgentCanvasViewStateAtom)
   const updateAgentCanvasViewState = useSetAtom(updateAgentCanvasViewStateAtom)
   const store = useStore()
   const runningSessionIds = useAtomValue(canvasAgentRunningSessionIdsAtom)
@@ -2075,18 +2095,16 @@ export function NativeCanvasWorkspace({
   }, [adapter, stateKey, store, target.canvasId, target.projectId, updateNativeCanvasState])
 
   React.useEffect(() => {
-    const disposeCleanup = nativeCanvasWorkbenchCleanupCoordinator.mount(viewStateKey, () => {
-      /** 微任务后仍未重挂才表示真实 Canvas 切换或卸载。 */
-      updateAgentCanvasViewState({
-        key: viewStateKey,
-        update: createClosedAgentCanvasWorkbenchUpdate(),
-      })
-    })
+    const disposeCleanup = mountNativeCanvasSessionView(
+      nativeCanvasWorkbenchCleanupCoordinator,
+      viewStateKey,
+      removeAgentCanvasViewState,
+    )
     return () => {
       workbenchDraftCommitCoordinatorRef.current?.invalidate()
       disposeCleanup()
     }
-  }, [updateAgentCanvasViewState, viewStateKey])
+  }, [removeAgentCanvasViewState, viewStateKey])
 
   React.useEffect(() => {
     if (!adapter.createCanvasAgentNode || !adapter.createCanvasContentNode) {

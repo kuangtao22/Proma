@@ -4,6 +4,7 @@ import {
   agentCanvasViewStatesAtom,
   createAgentCanvasViewKey,
   initializeAgentCanvasViewStateAtom,
+  navigateAgentCanvasViewAtom,
   removeAgentCanvasViewStateAtom,
   updateAgentCanvasViewStateAtom,
 } from './agent-canvas-atoms'
@@ -66,6 +67,27 @@ describe('Agent Canvas 视图状态隔离', () => {
       .toEqual({ x: 90, y: 70, zoom: 1.8 })
   })
 
+  test('Given Canvas 完成导航先于 LOAD When 首个权威文档初始化 Then 首次接管文档视口后应用节点导航', () => {
+    const store = createStore()
+    const key = createAgentCanvasViewKey('session-a', 'project-a', 'canvas-a')
+
+    store.set(navigateAgentCanvasViewAtom, { key, nodeId: 'node-a' })
+
+    expect(store.get(agentCanvasViewStatesAtom).has(key)).toBe(false)
+
+    store.set(initializeAgentCanvasViewStateAtom, {
+      key,
+      viewport: { x: 160, y: 90, zoom: 1.6 },
+    })
+
+    expect(store.get(agentCanvasViewStatesAtom).get(key)).toMatchObject({
+      viewport: { x: 160, y: 90, zoom: 1.6 },
+      selectedNodeId: 'node-a',
+      selectedNodeIds: ['node-a'],
+      expandedNodeId: 'node-a',
+    })
+  })
+
   test('Given 两个会话视图 When 删除当前视图 Then 共享画布的另一会话视图仍保留', () => {
     const store = createStore()
     const firstKey = createAgentCanvasViewKey('session-a', 'project-a', 'canvas-a')
@@ -84,5 +106,24 @@ describe('Agent Canvas 视图状态隔离', () => {
     const states = store.get(agentCanvasViewStatesAtom)
     expect(states.has(firstKey)).toBe(false)
     expect(states.has(secondKey)).toBe(true)
+  })
+
+  test('Given LOAD 前已有待导航 When Workspace 真实卸载 Then 后续初始化不复活旧导航', () => {
+    const store = createStore()
+    const key = createAgentCanvasViewKey('session-a', 'project-a', 'canvas-a')
+    store.set(navigateAgentCanvasViewAtom, { key, nodeId: 'node-old' })
+
+    store.set(removeAgentCanvasViewStateAtom, key)
+    store.set(initializeAgentCanvasViewStateAtom, {
+      key,
+      viewport: { x: 40, y: 50, zoom: 1.3 },
+    })
+
+    expect(store.get(agentCanvasViewStatesAtom).get(key)).toMatchObject({
+      viewport: { x: 40, y: 50, zoom: 1.3 },
+      selectedNodeId: null,
+      selectedNodeIds: [],
+      expandedNodeId: null,
+    })
   })
 })
