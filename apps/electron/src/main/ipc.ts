@@ -205,7 +205,11 @@ import {
   registerAgentCanvasBindingIpcHandlers,
 } from './lib/design/agent-canvas-binding-ipc'
 import { AgentCanvasBindingStore } from './lib/design/agent-canvas-binding-store'
-import { registerCanvasDocumentIpcHandlers } from './lib/design/canvas-document-ipc'
+import {
+  createCanvasOperationSerializer,
+  registerCanvasDocumentIpcHandlers,
+} from './lib/design/canvas-document-ipc'
+import { createCanvasAgentBatchOperationService } from './lib/design/canvas-agent-batch-operation'
 import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
 import { createCanvasNodeContentStore } from './lib/design/canvas-node-content-store'
@@ -2152,6 +2156,17 @@ export function registerIpcHandlers(): void {
       canvasImagePreferences.getSelection(projectId).selectedProfileId ?? null
     ),
   })
+  /** 批处理、LOAD、SAVE 与单节点操作共享唯一 Canvas 串行器。 */
+  const canvasOperationSerializer = createCanvasOperationSerializer()
+  /** 批量事务服务在主进程只实例化一次，后续工具 Provider 必须复用该实例。 */
+  const canvasAgentBatchOperation = createCanvasAgentBatchOperationService({
+    store: canvasDocumentStore,
+    runExclusive: (target, effect) => canvasOperationSerializer.run(target, () => (
+      workspaceOperationGuard.runWorkspaceWrite(target.projectId, effect)
+    )),
+    contentLifecycle: canvasContentNodeLifecycle,
+    agentNodeCreation: canvasAgentNodeCreation,
+  })
   cleanupSuccessfulDesignTask = (projectId, sourceJobId) => {
     designJobManager.cleanupTaskAfterSuccessfulAssetDeletion(projectId, sourceJobId)
   }
@@ -2259,6 +2274,8 @@ export function registerIpcHandlers(): void {
     listAuthorizedWebContents: listAuthorizedDesignWebContents,
     guard: workspaceOperationGuard,
     store: canvasDocumentStore,
+    batch: canvasAgentBatchOperation,
+    operationSerializer: canvasOperationSerializer,
     creation: canvasAgentNodeCreation,
     contentLifecycle: canvasContentNodeLifecycle,
     imageModules: canvasImageModuleStore,

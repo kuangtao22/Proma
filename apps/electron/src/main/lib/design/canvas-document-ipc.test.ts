@@ -20,7 +20,7 @@ import type {
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { parseCanvasDocument } from './canvas-document-store'
-import { registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
+import { createCanvasOperationSerializer, registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
 
 /** 测试 IPC handler 的最小签名。 */
 type TestHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
@@ -199,6 +199,7 @@ function createContext(options: {
   imageSave?: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
   imageJobsList?: (projectId: string) => DesignJobRecord[]
   imageTargetAssert?: (projectId: string, target: Omit<CanvasImageTarget, 'projectId'>) => Promise<void>
+  batchReconcile?: () => Promise<void>
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -275,6 +276,13 @@ function createContext(options: {
         storeInputs.push({ target, expectedRevision, mutations })
         if (options.mutateError) throw options.mutateError
         return options.mutateResult ?? createDocument(expectedRevision + (mutations.length > 0 ? 1 : 0))
+      },
+    },
+    batch: {
+      reconcileLocked: async () => {
+        calls.push('batch:reconcile')
+        await options.batchReconcile?.()
+        return { document: options.loadResult?.document ?? createDocument(4), operationId: '', publications: [] }
       },
     },
     creation: {
@@ -507,6 +515,46 @@ function createContext(options: {
 }
 
 describe('原生 Canvas 文档 IPC', () => {
+  test('Given LOAD 与 SAVE When 执行 Then 同一 lease 内先恢复 batch 再进入既有对账链', async () => {
+    const context = createContext()
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4, mutations: [],
+    })
+    expect(context.calls).toEqual([
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile', 'store:mutate',
+    ])
+  })
+
+  test('Given 共享 serializer When 同 Canvas 与不同 Canvas 并发 Then 仅同 Canvas 等待', async () => {
+    const serializer = createCanvasOperationSerializer()
+    const gate = createDeferred<void>()
+    const firstStarted = createDeferred<void>()
+    const otherStarted = createDeferred<void>()
+    const events: string[] = []
+    const first = serializer.run({ projectId: 'project-1', canvasId: 'canvas-1' }, async () => {
+      events.push('first:start')
+      firstStarted.resolve()
+      await gate.promise
+      events.push('first:end')
+    })
+    const same = serializer.run({ projectId: 'project-1', canvasId: 'canvas-1' }, async () => {
+      events.push('same:start')
+    })
+    const other = serializer.run({ projectId: 'project-1', canvasId: 'canvas-2' }, async () => {
+      events.push('other:start')
+      otherStarted.resolve()
+    })
+    await Promise.all([firstStarted.promise, otherStarted.promise])
+    expect(events).toEqual(['first:start', 'other:start'])
+    gate.resolve()
+    await Promise.all([first, same, other])
+    expect(events).toEqual(['first:start', 'other:start', 'first:end', 'same:start'])
+  })
+
   test('Given Canvas 生图节点已采用素材 When 重复 LOAD Then 返回缩略图预览且项目级授权只创建一次', async () => {
     const document = createDocument(4)
     document.nodes = [{
@@ -1470,7 +1518,7 @@ describe('原生 Canvas 文档 IPC', () => {
     const context = createContext()
     await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, { projectId: 'project-1', canvasId: 'canvas-1' })
     expect(context.calls).toEqual([
-      'readonly:project-1', 'guard:project-1', 'content:load', 'creation:reconcile',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
     ])
   })
 
@@ -1964,8 +2012,8 @@ describe('原生 Canvas 文档 IPC', () => {
     await invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, saveInput)
 
     expect(context.calls).toEqual([
-      'readonly:project-1', 'guard:project-1', 'content:load', 'creation:reconcile',
-      'readonly:project-1', 'guard:project-1', 'creation:reconcile', 'store:mutate',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile', 'store:mutate',
     ])
     expect(context.storeInputs[0]).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })
     expect(context.storeInputs[0]).not.toBe(loadInput)
@@ -2498,6 +2546,11 @@ describe('原生 Canvas 文档 IPC', () => {
       store: {
         load: () => ({ document: createDocument(revision), writable: true as const, nodeIssues: [] }),
         mutate: () => createDocument(revision),
+      },
+      batch: {
+        reconcileLocked: async () => ({
+          document: createDocument(revision), operationId: '', publications: [],
+        }),
       },
       creation: {
         reconcile: async () => ({

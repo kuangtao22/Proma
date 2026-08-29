@@ -145,6 +145,28 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(fixture.contents.has(input.contentId)).toBe(false)
   })
 
+  test.each(contentKinds)('Given %s 批量删除 When prepare 后 restore Then 复用真实 trash 身份往返', async (kind) => {
+    const fixture = createFixture()
+    const entry: CanvasTrashEntry = {
+      schemaVersion: 1,
+      trashId: `trash-batch-${kind}`,
+      nodeId: `node-batch-${kind}`,
+      kind,
+      contentId: `content-batch-${kind}`,
+      title: '批量删除',
+      position: { x: 1, y: 2 },
+      deletedRevision: 3,
+      deletedAt: 10,
+    }
+    fixture.contents.add(entry.contentId)
+    await fixture.service.prepareBatchDeletion(target, entry)
+    expect(fixture.contents.has(entry.contentId)).toBe(false)
+    expect(fixture.trash.get(entry.trashId)).toEqual(entry)
+    await fixture.service.restoreBatchDeletion(target, entry)
+    expect(fixture.contents.has(entry.contentId)).toBe(true)
+    if (kind === 'image') expect(fixture.imageDeleteCalls[0]).toBe('cancel-job')
+  })
+
   test('Given content intent When 严格解析 Then 拒绝未知字段、不可达状态与时间倒退', () => {
     const value = {
       schemaVersion: 1, operation: 'create', state: 'prepared',

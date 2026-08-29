@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
-import type { AgentSessionMeta, CanvasBatchOperationEnvelope, CanvasDocument, CanvasMutation } from '@proma/shared'
+import type { AgentSessionMeta, CanvasBatchOperationEnvelope, CanvasDocument, CanvasMutation, CanvasTrashEntry } from '@proma/shared'
 import {
   createCanvasAgentBatchOperationService,
   type CanvasBatchOperationIntent,
@@ -17,15 +17,24 @@ function createFixture(options: {
   mutateReturnsUncertain?: boolean
   /** 第一次 committed intent 写在 rename 前失败。 */
   failCommittedOnce?: boolean
+  /** Agent session 回收失败，用于验证恢复证据不会被吞掉。 */
+  failSessionCleanup?: boolean
+  /** 图写入前确定失败，用于验证已移入 trash 的内容会恢复。 */
+  mutateFailsBeforeCommit?: boolean
   busySessionId?: string
 } = {}) {
   let document: CanvasDocument = { ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 7 }
   const intents = new Map<string, CanvasBatchOperationIntent>()
+  const intentWrites: CanvasBatchOperationIntent[] = []
+  const events: string[] = []
   const contents = new Set<string>()
+  const trash = new Map<string, CanvasTrashEntry>()
   const sessions = new Map<string, AgentSessionMeta>()
   let mutateCalls = 0
   let activeMutations = 0
   let maxActiveMutations = 0
+  /** 模拟生产 IPC 注入的按 Canvas 共享串行器。 */
+  const tails = new Map<string, Promise<void>>()
   const store = {
     load: () => ({ document, writable: true as const, nodeIssues: [] }),
     validateBatchOperations: (_target: object, baseRevision: number, operations: unknown[]) => {
@@ -34,6 +43,7 @@ function createFixture(options: {
     },
     mutate: async (_target: object, baseRevision: number, operations: CanvasMutation[]) => {
       if (baseRevision !== document.revision) throw new Error('CANVAS_REVISION_CONFLICT')
+      if (options.mutateFailsBeforeCommit) throw new Error('MUTATE_FAILED_BEFORE_COMMIT')
       mutateCalls += 1
       activeMutations += 1
       maxActiveMutations = Math.max(maxActiveMutations, activeMutations)
@@ -47,10 +57,24 @@ function createFixture(options: {
   let uuid = 0
   const service = createCanvasAgentBatchOperationService({
     store,
-    runWorkspaceWrite: (_projectId, effect) => effect(),
+    runExclusive: async (operationTarget, effect) => {
+      const key = `${operationTarget.projectId}\0${operationTarget.canvasId}`
+      const previous = tails.get(key) ?? Promise.resolve()
+      const result = previous.catch(() => undefined).then(effect)
+      const tail = result.then(() => undefined, () => undefined)
+      tails.set(key, tail)
+      try {
+        return await result
+      } finally {
+        if (tails.get(key) === tail) tails.delete(key)
+      }
+    },
     randomUUID: () => `11111111-1111-4111-8111-${String(++uuid).padStart(12, '0')}`,
     scanIntents: async () => [...intents.values()].map((intent) => structuredClone(intent)),
     writeIntent: async (intent) => {
+      intentWrites.push(structuredClone(intent))
+      const firstResource = intent.preparedResources[0]
+      events.push(`write:${firstResource?.state ?? 'none'}:${String(firstResource?.createdByOperation)}`)
       if (options.failCommittedOnce && intent.state === 'committed') {
         options.failCommittedOnce = false
         return { commitVisible: false, durabilityUncertain: false, error: 'injected' }
@@ -63,29 +87,50 @@ function createFixture(options: {
       return { commitVisible: true, durabilityUncertain: false }
     },
     contentLifecycle: {
+      inspectBatchContent: async (_target, input) => ({ exists: contents.has(input.contentId) }),
       prepareBatchContent: async (_target, input) => {
+        events.push(`prepare:${input.contentId}`)
         if (input.contentId === options.failContentId) throw new Error('PREPARE_FAILED')
         const created = !contents.has(input.contentId)
         contents.add(input.contentId)
         return { created }
       },
       cleanupBatchContent: async (_target, input) => { contents.delete(input.contentId) },
+      prepareBatchDeletion: async (_target, entry) => {
+        if (trash.has(entry.trashId)) return
+        if (!contents.delete(entry.contentId)) throw new Error('CANVAS_CONTENT_NOT_FOUND')
+        trash.set(entry.trashId, structuredClone(entry))
+      },
+      restoreBatchDeletion: async (_target, entry) => {
+        const stored = trash.get(entry.trashId)
+        if (!stored) {
+          if (contents.has(entry.contentId)) return
+          throw new Error('CANVAS_TRASH_ENTRY_NOT_FOUND')
+        }
+        trash.delete(entry.trashId)
+        contents.add(entry.contentId)
+      },
       assertBatchAgentNodeIdle: (_nodeId, sessionId) => {
         if (sessionId === options.busySessionId) throw new Error('AGENT_SESSION_BUSY')
       },
     },
     agentNodeCreation: {
+      inspectBatchSession: (input) => ({ exists: sessions.has(input.sessionId) }),
       prepareBatchSession: (input) => {
+        events.push(`prepare:${input.sessionId}`)
         const existing = sessions.get(input.sessionId)
         if (existing) return { session: existing, created: false }
         const session = { id: input.sessionId, title: input.title, createdAt: 1, updatedAt: 1, workspaceId: input.projectId, sourceCanvasProjectId: input.projectId, sourceCanvasId: input.canvasId, sourceCanvasNodeId: input.nodeId } as AgentSessionMeta
         sessions.set(session.id, session)
         return { session, created: true }
       },
-      cleanupBatchSession: (input) => { sessions.delete(input.sessionId) },
+      cleanupBatchSession: (input) => {
+        if (options.failSessionCleanup) throw new Error('SESSION_CLEANUP_FAILED')
+        sessions.delete(input.sessionId)
+      },
     },
   })
-  return { service, intents, contents, sessions, getDocument: () => document, getMutateCalls: () => mutateCalls, getMaxActiveMutations: () => maxActiveMutations }
+  return { service, intents, intentWrites, events, contents, trash, sessions, getDocument: () => document, getMutateCalls: () => mutateCalls, getMaxActiveMutations: () => maxActiveMutations }
 }
 
 /** 三节点两连线批次，覆盖 Agent、文档和原型资源。 */
@@ -179,6 +224,95 @@ describe('CanvasAgentBatchOperationService', () => {
     const recovered = await fixture.service.execute(batch())
     expect(recovered.document.revision).toBe(8)
     expect(fixture.getMutateCalls()).toBe(1)
+  })
+
+  test('Given resources-created intent rename 耐久不确定 When 执行 Then 保留资源与可恢复 intent', async () => {
+    const fixture = createFixture({ uncertainState: 'resources-created' })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_RECOVERY_REQUIRED')
+    expect(fixture.contents.size).toBe(2)
+    expect(fixture.sessions.size).toBe(1)
+    expect([...fixture.intents.values()][0]?.state).toBe('resources-created')
+    expect(fixture.getMutateCalls()).toBe(0)
+  })
+
+  test('Given 第一项资源创建完成 When 第二项 prepare 失败 Then 下一项开始前已持久化资源归属', async () => {
+    const fixture = createFixture({ failContentId: 'content-doc-1' })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('PREPARE_FAILED')
+    const ownershipWrite = fixture.intentWrites.find((intent) => (
+      intent.preparedResources[0]?.createdByOperation === true
+      && intent.preparedResources[0]?.state === 'ready'
+    ))
+    expect(ownershipWrite).toBeDefined()
+    const ownershipIndex = fixture.events.indexOf('write:preparing:true')
+    const creationIndex = fixture.events.indexOf('prepare:session-agent-1')
+    expect(ownershipIndex).toBeGreaterThanOrEqual(0)
+    expect(ownershipIndex).toBeLessThan(creationIndex)
+  })
+
+  test('Given 资源回收失败 When prepare 失败 Then 返回恢复错误并持久化 cleanup-pending', async () => {
+    const fixture = createFixture({ failContentId: 'content-doc-1', failSessionCleanup: true })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_RECOVERY_REQUIRED')
+    expect(fixture.sessions.has('session-agent-1')).toBe(true)
+    expect([...fixture.intents.values()][0]?.preparedResources[0]?.state).toBe('cleanup-pending')
+  })
+
+  test('Given resources-created intent 未提交图 When reconcile Then 完成单次图提交', async () => {
+    const fixture = createFixture({ uncertainState: 'resources-created' })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_RECOVERY_REQUIRED')
+    const result = await fixture.service.reconcile(target)
+    expect(result.document.revision).toBe(8)
+    expect(fixture.getMutateCalls()).toBe(1)
+    expect([...fixture.intents.values()][0]?.state).toBe('committed')
+  })
+
+  test('Given 三类内容节点 When 批量删除 Then 单次图提交且内容全部进入 trash', async () => {
+    const fixture = createFixture()
+    fixture.getDocument().nodes.push(
+      { id: 'image-existing', kind: 'image', title: '图片', position: { x: 0, y: 0 }, imageModuleId: 'content-image' },
+      { id: 'doc-existing', kind: 'document', title: '文档', position: { x: 1, y: 0 }, documentId: 'content-doc', contentRevision: 0 },
+      { id: 'web-existing', kind: 'webview', title: '原型', position: { x: 2, y: 0 }, prototypeId: 'content-web', contentRevision: 0 },
+    )
+    fixture.contents.add('content-image')
+    fixture.contents.add('content-doc')
+    fixture.contents.add('content-web')
+    const result = await fixture.service.execute({
+      ...batch(),
+      operations: [{ type: 'remove-nodes', nodeIds: ['image-existing', 'doc-existing', 'web-existing'] }],
+    })
+    expect(result.document.nodes).toHaveLength(0)
+    expect(fixture.contents.size).toBe(0)
+    expect(fixture.trash.size).toBe(3)
+    expect(fixture.getMutateCalls()).toBe(1)
+  })
+
+  test('Given 内容已移入 trash When 图提交前失败 Then 全部恢复到 nodes 内容目录', async () => {
+    const fixture = createFixture({ mutateFailsBeforeCommit: true })
+    fixture.getDocument().nodes.push({
+      id: 'doc-existing', kind: 'document', title: '文档', position: { x: 0, y: 0 },
+      documentId: 'content-doc', contentRevision: 0,
+    })
+    fixture.contents.add('content-doc')
+    await expect(fixture.service.execute({
+      ...batch(), operations: [{ type: 'remove-nodes', nodeIds: ['doc-existing'] }],
+    })).rejects.toThrow('MUTATE_FAILED_BEFORE_COMMIT')
+    expect(fixture.contents.has('content-doc')).toBe(true)
+    expect(fixture.trash.size).toBe(0)
+    expect(fixture.getDocument().nodes).toHaveLength(1)
+  })
+
+  test('Given 删除资源已入 trash 且 resources-created 不确定 When LOAD reconcile Then 提交图并保留 trash', async () => {
+    const fixture = createFixture({ uncertainState: 'resources-created' })
+    fixture.getDocument().nodes.push({
+      id: 'web-existing', kind: 'webview', title: '原型', position: { x: 0, y: 0 },
+      prototypeId: 'content-web', contentRevision: 0,
+    })
+    fixture.contents.add('content-web')
+    const input = { ...batch(), operations: [{ type: 'remove-nodes', nodeIds: ['web-existing'] }] }
+    await expect(fixture.service.execute(input)).rejects.toThrow('CANVAS_BATCH_RECOVERY_REQUIRED')
+    expect(fixture.trash.size).toBe(1)
+    await fixture.service.reconcile(target)
+    expect(fixture.getDocument().nodes).toHaveLength(0)
+    expect(fixture.trash.size).toBe(1)
   })
 
   test('Given 图已提交但 committed rename 前失败 When 重启重试 Then LOAD 对账不重复 revision', async () => {

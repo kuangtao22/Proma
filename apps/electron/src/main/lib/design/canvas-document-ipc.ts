@@ -28,6 +28,7 @@ import type {
   CanvasWorkspaceSnapshot,
   CanvasNodeLifecycleResult,
   CanvasTrashEntry,
+  CanvasTarget,
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
   DeleteCanvasNodeInput,
@@ -55,6 +56,7 @@ import type { DesignJobManager } from './design-job-manager'
 import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
+import type { CanvasBatchReconciliationResult } from './canvas-agent-batch-operation'
 import type {
   CanvasContentNodeLifecycle,
   CanvasContentNodeReconciledResult,
@@ -80,12 +82,40 @@ export interface CanvasDocumentIpcRegistrar {
   removeHandler: (channel: string) => void
 }
 
+/** 所有 Canvas 写操作共享的键控串行器。 */
+export interface CanvasOperationSerializer {
+  run: <T>(target: CanvasTarget, effect: () => Promise<T>) => Promise<T>
+}
+
+/** 创建同 Canvas 串行、不同 Canvas 并行的进程级协调器。 */
+export function createCanvasOperationSerializer(): CanvasOperationSerializer {
+  const tails = new Map<string, Promise<void>>()
+  return {
+    run: async <T>(target: CanvasTarget, effect: () => Promise<T>): Promise<T> => {
+      const key = `${target.projectId}\0${target.canvasId}`
+      const previous = tails.get(key) ?? Promise.resolve()
+      const result = previous.catch(() => undefined).then(effect)
+      const tail = result.then(() => undefined, () => undefined)
+      tails.set(key, tail)
+      try {
+        return await result
+      } finally {
+        if (tails.get(key) === tail) tails.delete(key)
+      }
+    },
+  }
+}
+
 /** 注册原生 Canvas 文档 IPC 的可信依赖。 */
 export interface CanvasDocumentIpcOptions {
   ipc: CanvasDocumentIpcRegistrar
   listAuthorizedWebContents: () => WebContents[]
   guard: Pick<WorkspaceOperationGuard, 'runWorkspaceWrite'>
   store: Pick<CanvasDocumentStore, 'load' | 'mutate'>
+  /** 唯一批处理服务；调用时外层已持有共享 Canvas 串行权和 workspace lease。 */
+  batch: { reconcileLocked: (target: CanvasTarget) => Promise<CanvasBatchReconciliationResult> }
+  /** 生产注入进程级唯一实例，测试未注入时由注册器本地创建。 */
+  operationSerializer?: CanvasOperationSerializer
   /** 已持有 lease 时执行目标 Canvas 对账或联合创建事务。 */
   creation: Pick<CanvasAgentNodeCreationService, 'reconcile' | 'createReconciled' | 'rebuildReconciled'>
   /** 非 Agent 内容节点的可恢复生命周期，只开放 IPC 所需窄接口。 */
@@ -884,8 +914,8 @@ export function registerCanvasDocumentIpcHandlers(
   /** 热重载前先移除同名旧 handler。 */
   for (const channel of channels) options.ipc.removeHandler(channel)
   currentRegistrationTokens.set(options.ipc, registrationToken)
-  /** 同一 Canvas 的完整异步写链串行，不同 Canvas 仍保持并行。 */
-  const canvasOperationTails = new Map<string, Promise<void>>()
+  /** 批处理、LOAD、SAVE 与单节点操作必须共用同一键控串行器。 */
+  const operationSerializer = options.operationSerializer ?? createCanvasOperationSerializer()
   /** 每个窗口当前持有的单图片模块媒体授权。 */
   const imageMediaBySender = new Map<number, {
     sender: WebContents
@@ -1128,21 +1158,7 @@ export function registerCanvasDocumentIpcHandlers(
     canvasId: string,
     effect: () => Promise<T>,
   ): Promise<T> => {
-    const key = `${projectId}\0${canvasId}`
-    const previous = canvasOperationTails.get(key) ?? Promise.resolve()
-    let release = (): void => {}
-    const current = new Promise<void>((resolvePromise) => { release = resolvePromise })
-    const tail = previous.catch(() => undefined).then(() => current)
-    canvasOperationTails.set(key, tail)
-    void tail.finally(() => {
-      if (canvasOperationTails.get(key) === tail) canvasOperationTails.delete(key)
-    })
-    await previous.catch(() => undefined)
-    try {
-      return await effect()
-    } finally {
-      release()
-    }
+    return operationSerializer.run({ projectId, canvasId }, effect)
   }
 
   /** 图片模块操作按 Canvas 串行，并只在实际轮到执行时获取 workspace lease。 */
@@ -1613,11 +1629,15 @@ export function registerCanvasDocumentIpcHandlers(
       return runCanvasExclusive(input.projectId, input.canvasId, async () => {
         /** v1 内容必须先物化并提交 schema v2，Agent 对账才可安全 mutate。 */
         const outcome = await options.guard.runWorkspaceWrite(input.projectId, async () => {
+          const batch = await options.batch.reconcileLocked(input)
           const content = await options.contentLifecycle.load(input)
-          if (content.error) return { content }
-          return { content, agent: await options.creation.reconcile(input) }
+          if (content.error) return { batch, content }
+          return { batch, content, agent: await options.creation.reconcile(input) }
         })
         const published = new Set<string>()
+        for (const publication of outcome.batch.publications) {
+          publishUniqueChange(input, published, publication.revision, 'graph')
+        }
         publishUniqueReconciliation(input, published, outcome.content)
         if (outcome.content.error) throw outcome.content.error
         if (!outcome.agent) throw new Error('CANVAS_AGENT_RECONCILIATION_MISSING')
@@ -1643,16 +1663,20 @@ export function registerCanvasDocumentIpcHandlers(
       /** Store 在同一项目写 lease 内执行权威 schema、revision 和原子提交。 */
       return runCanvasExclusive(input.projectId, input.canvasId, async () => {
         /** 对账、运行态删除检查和 Store mutation 共用同一 workspace lease。 */
-        const outcome = await options.guard.runWorkspaceWrite(
+        const guarded = await options.guard.runWorkspaceWrite(
           input.projectId,
-          async (): Promise<ReconciledOperationOutcome<CanvasDocument>> => {
+          async (): Promise<{
+            batch: CanvasBatchReconciliationResult
+            outcome: ReconciledOperationOutcome<CanvasDocument>
+          }> => {
+            const batch = await options.batch.reconcileLocked(input)
             /** SAVE 先在同一 lease 内完成创建事务发布屏障，禁止二次加锁。 */
             const reconciliation = await options.creation.reconcile({
               projectId: input.projectId,
               canvasId: input.canvasId,
             })
             if (reconciliation.error) {
-              return { ok: false, error: reconciliation.error, reconciliation }
+              return { batch, outcome: { ok: false, error: reconciliation.error, reconciliation } }
             }
             try {
               assertRemovedContentNodesUseLifecycle(
@@ -1670,13 +1694,18 @@ export function registerCanvasDocumentIpcHandlers(
                 input.expectedRevision,
                 input.mutations,
               )
-              return { ok: true, value: document, reconciliation }
+              return { batch, outcome: { ok: true, value: document, reconciliation } }
             } catch (error) {
               /** 已提交的对账 revision 不能被后续 SAVE 错误吞掉。 */
-              return { ok: false, error, reconciliation }
+              return { batch, outcome: { ok: false, error, reconciliation } }
             }
           },
         )
+        const outcome = guarded.outcome
+        const published = new Set<string>()
+        for (const publication of guarded.batch.publications) {
+          publishUniqueChange(input, published, publication.revision, 'graph')
+        }
         publishReconciliation(options, input, outcome.reconciliation)
         if (!outcome.ok) throw outcome.error
         /** 成功文档是广播 revision 与返回值的共同事实。 */

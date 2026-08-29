@@ -121,6 +121,11 @@ export interface CanvasContentNodeLifecycle {
   create: (input: CreateCanvasContentNodeInput) => Promise<CanvasNodeLifecycleResult>
   delete: (input: DeleteCanvasNodeInput) => Promise<CanvasNodeLifecycleResult>
   restore: (input: RestoreCanvasNodeInput) => Promise<CanvasNodeLifecycleResult>
+  /** 批量事务持久化 ownership 前只检查内容是否已存在。 */
+  inspectBatchContent: (
+    target: CanvasTarget,
+    input: PrepareCanvasNodeContentInput,
+  ) => Promise<{ exists: boolean }>
   /** 批量事务只准备内容资源，不提交图 mutation。 */
   prepareBatchContent: (
     target: CanvasTarget,
@@ -132,6 +137,10 @@ export interface CanvasContentNodeLifecycle {
     input: PrepareCanvasNodeContentInput,
     rollbackId: string,
   ) => Promise<void>
+  /** 批量删除在图提交前把内容按完整回收身份移入 trash。 */
+  prepareBatchDeletion: (target: CanvasTarget, entry: CanvasTrashEntry) => Promise<void>
+  /** 批量图提交前失败时按同一回收身份恢复内容。 */
+  restoreBatchDeletion: (target: CanvasTarget, entry: CanvasTrashEntry) => Promise<void>
   /** 批量删除提交前复用现有 Agent 运行守卫。 */
   assertBatchAgentNodeIdle: (nodeId: string, sessionId: string) => void
 }
@@ -646,6 +655,18 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
 
   return {
     assertBatchAgentNodeIdle: dependencies.assertAgentNodeIdle,
+    /** 在批量事务持久化 ownership 前只读取内容存在性，不创建目录。 */
+    inspectBatchContent: async (target, input) => {
+      try {
+        await dependencies.contentStore.assertContent(target, input)
+        return { exists: true }
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('CANVAS_CONTENT_NOT_FOUND')) {
+          return { exists: false }
+        }
+        throw error
+      }
+    },
     prepareBatchContent: async (target, input) => {
       const preparedInput = input.kind === 'image'
         ? {
@@ -667,6 +688,22 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
     cleanupBatchContent: (target, input, rollbackId) => (
       dependencies.contentStore.discardPreparedContent(target, input, rollbackId)
     ),
+    prepareBatchDeletion: async (target, entry) => {
+      if (entry.kind === 'image') {
+        await dependencies.cancelActiveImageJobs({
+          ...target,
+          nodeId: entry.nodeId,
+          imageModuleId: entry.contentId,
+        })
+      }
+      await dependencies.contentStore.moveToTrash(target, entry)
+    },
+    restoreBatchDeletion: async (target, entry) => {
+      const restored = await dependencies.contentStore.restoreFromTrash(target, entry.trashId)
+      if (JSON.stringify(restored) !== JSON.stringify(entry)) {
+        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      }
+    },
     reconcile: async (target) => (await reconcileInternal(target)).result,
     load: async (target) => {
       const reconciled = await reconcileInternal(target)

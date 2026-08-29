@@ -1320,4 +1320,37 @@ describe('CanvasDocumentStore', () => {
     expect(writeCalls).toBe(1)
     expect(result.schemaVersion).toBe(CANVAS_DOCUMENT_VERSION)
   })
+
+  test('Given 万级链式边与五千次节点删除 When 验证批次 Then 在线性预算内完成', () => {
+    const fixture = createFixture()
+    const nodes: CanvasNode[] = Array.from({ length: 10_001 }, (_, index) => ({
+      id: `large-node-${index}`,
+      kind: 'agent',
+      title: `Agent ${index}`,
+      position: { x: index, y: 0 },
+      agentSessionId: `large-session-${index}`,
+    }))
+    const edges = Array.from({ length: 10_000 }, (_, index) => ({
+      id: `large-edge-${index}`,
+      sourceNodeId: `large-node-${index}`,
+      sourcePort: 'output',
+      targetNodeId: `large-node-${index + 1}`,
+      targetPort: 'input',
+    }))
+    writeDocument(fixture.documentPath, {
+      ...createEmptyCanvasDocument('project-1', 'canvas-1', 1),
+      revision: 2,
+      nodes,
+      edges,
+    })
+    const mutations: CanvasMutation[] = Array.from({ length: 5_000 }, (_, index) => ({
+      type: 'remove-nodes', nodeIds: [`large-node-${index * 2}`],
+    }))
+    const startedAt = performance.now()
+    const validated = fixture.store.validateBatchOperations(
+      { projectId: 'project-1', canvasId: 'canvas-1' }, 2, mutations,
+    )
+    expect(validated).toHaveLength(5_000)
+    expect(performance.now() - startedAt).toBeLessThan(1_000)
+  }, 2_000)
 })

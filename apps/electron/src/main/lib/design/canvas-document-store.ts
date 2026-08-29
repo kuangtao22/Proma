@@ -626,6 +626,29 @@ function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]):
     sourceNodeId: edge.sourceNodeId,
     targetNodeId: edge.targetNodeId,
   }]))
+  /** 节点到相连边的邻接索引，避免每个 remove-nodes 都全扫当前边集合。 */
+  const edgeIdsByNodeId = new Map<string, Set<string>>()
+  /** 把边 ID 加入单个端点的邻接集合。 */
+  const addAdjacentEdge = (nodeId: string, edgeId: string): void => {
+    const edgeIds = edgeIdsByNodeId.get(nodeId) ?? new Set<string>()
+    edgeIds.add(edgeId)
+    edgeIdsByNodeId.set(nodeId, edgeIds)
+  }
+  /** 从边表与两个端点的邻接集合同时移除边。 */
+  const removeCurrentEdge = (edgeId: string): void => {
+    const edge = currentEdges.get(edgeId)
+    if (!edge) return
+    currentEdges.delete(edgeId)
+    for (const nodeId of [edge.sourceNodeId, edge.targetNodeId]) {
+      const edgeIds = edgeIdsByNodeId.get(nodeId)
+      edgeIds?.delete(edgeId)
+      if (edgeIds?.size === 0) edgeIdsByNodeId.delete(nodeId)
+    }
+  }
+  for (const [edgeId, edge] of currentEdges) {
+    addAdjacentEdge(edge.sourceNodeId, edgeId)
+    addAdjacentEdge(edge.targetNodeId, edgeId)
+  }
   for (const mutation of mutations as unknown[]) {
     if (!isRecord(mutation) || typeof mutation.type !== 'string') {
       throw new Error('CANVAS_MUTATION_INVALID')
@@ -668,11 +691,13 @@ function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]):
         mutation.nodeIds,
         'CANVAS_MUTATION_INVALID',
       ))
-      for (const nodeId of removedNodeIds) currentNodeIds.delete(nodeId)
-      for (const [edgeId, edge] of currentEdges) {
-        if (removedNodeIds.has(edge.sourceNodeId) || removedNodeIds.has(edge.targetNodeId)) {
-          currentEdges.delete(edgeId)
+      for (const nodeId of removedNodeIds) {
+        currentNodeIds.delete(nodeId)
+        /** 只访问该节点真实相连的边，每条边最多随端点删除一次。 */
+        for (const edgeId of [...(edgeIdsByNodeId.get(nodeId) ?? [])]) {
+          removeCurrentEdge(edgeId)
         }
+        edgeIdsByNodeId.delete(nodeId)
       }
       continue
     }
@@ -687,17 +712,21 @@ function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]):
           throw new Error('CANVAS_MUTATION_INVALID')
         }
         upsertedEdgeIds.add(edge.id)
+        /** reducer 的 upsert 覆盖语义要求先摘除旧端点索引。 */
+        removeCurrentEdge(edge.id)
         currentEdges.set(edge.id, {
           sourceNodeId: edge.sourceNodeId,
           targetNodeId: edge.targetNodeId,
         })
+        addAdjacentEdge(edge.sourceNodeId, edge.id)
+        addAdjacentEdge(edge.targetNodeId, edge.id)
       }
       continue
     }
     if (mutation.type === 'remove-edges' && hasExactKeys(mutation, ['type', 'edgeIds'])) {
       /** 删除未知边继续保持 no-op；存在边只更新顺序状态。 */
       const removedEdgeIds = parseUniqueStableIds(mutation.edgeIds, 'CANVAS_MUTATION_INVALID')
-      for (const edgeId of removedEdgeIds) currentEdges.delete(edgeId)
+      for (const edgeId of removedEdgeIds) removeCurrentEdge(edgeId)
       continue
     }
     throw new Error('CANVAS_MUTATION_INVALID')

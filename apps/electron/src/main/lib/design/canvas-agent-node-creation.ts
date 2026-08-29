@@ -701,6 +701,28 @@ export class CanvasAgentNodeCreationService {
     this.runNative = dependencies.runStableDirectoryNative ?? runStableDirectoryNative
   }
 
+  /** 在批量事务持久化 ownership 前只检查会话是否存在并验证已有归属。 */
+  inspectBatchSession(input: {
+    projectId: string
+    canvasId: string
+    nodeId: string
+    sessionId: string
+    title: string
+  }): { exists: boolean } {
+    const existing = this.dependencies.getSession(input.sessionId)
+    if (!existing) return { exists: false }
+    if (!hasValidCanvasAgentOwnership(existing)
+      || existing.id !== input.sessionId
+      || existing.title !== input.title
+      || existing.workspaceId !== input.projectId
+      || existing.sourceCanvasProjectId !== input.projectId
+      || existing.sourceCanvasId !== input.canvasId
+      || existing.sourceCanvasNodeId !== input.nodeId) {
+      throw new Error('CANVAS_AGENT_SESSION_OWNERSHIP_CONFLICT')
+    }
+    return { exists: true }
+  }
+
   /** 为批量事务预备一个独占 Canvas Agent session，不提交图 mutation。 */
   prepareBatchSession(input: {
     projectId: string
@@ -755,8 +777,9 @@ export class CanvasAgentNodeCreationService {
     sessionId: string
   }): void {
     const session = this.dependencies.getSession(input.sessionId)
-    if (!session
-      || session.workspaceId !== input.projectId
+    /** cleaned intent 持久性不确定时恢复会重放清理，缺失即已完成。 */
+    if (!session) return
+    if (session.workspaceId !== input.projectId
       || session.sourceCanvasProjectId !== input.projectId
       || session.sourceCanvasId !== input.canvasId
       || session.sourceCanvasNodeId !== input.nodeId) {
