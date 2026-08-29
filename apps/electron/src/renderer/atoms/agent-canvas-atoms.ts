@@ -41,6 +41,8 @@ export interface AgentCanvasViewState {
   isExpanded: boolean
   /** 会话级活动变化代次，供宿主按需刷新视图提示。 */
   activityRevision: number
+  /** 当前宿主最后确认已读的活动代次。 */
+  seenActivityRevision: number
   /** 当前鼠标在画布上的主交互工具。 */
   activeTool: 'select' | 'pan'
   /** dirty 草稿确认后准备切换的目标节点。 */
@@ -65,6 +67,7 @@ export function createInitialAgentCanvasViewState(
     workbenchSize: null,
     isExpanded: false,
     activityRevision: 0,
+    seenActivityRevision: 0,
     activeTool: 'select',
     pendingWorkbenchSwitchNodeId: null,
     workbenchDraft: null,

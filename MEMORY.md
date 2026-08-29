@@ -223,3 +223,4 @@
 - 2026-08-29：Canvas 结构操作取得共享 token 后，所有 adapter 调用必须位于 async `try/finally` 边界内；同步抛错与异步拒绝均须收口 loading/error 并释放 token，禁止因 Promise 链尚未建立而永久阻塞后续结构操作和 SAVE。
 - 2026-08-29：普通 Agent 右侧画布标签由 `AgentCanvasBinding` 的关联顺序与项目 Canvas 元数据共同派生，后台 Canvas 事件只推进活动状态，不切换焦点；窄宽仅降级为单 Pane 呈现并保留 split 身份，展开态继续按 Agent 会话、项目与画布隔离。
 - 2026-08-29：普通 Agent 右侧的 `legacy-design` 必须直接挂载旧 `DesignWorkspaceView`，禁止构造原生 Canvas controller 或触发 native LOAD；Canvas 菜单 Promise 由 TabBar 的 pending/finally 与 SidePanel 固定中文错误边界双层收口，删除被运行任务阻断时保持确认框以便停止后重试，内部异常正文只进入工程日志。
+- 2026-08-30：Agent 右侧画布 Registry 的 LIST、关联动作和事件订阅必须绑定 `projectId + sessionId + generation`，旧宿主迟到成功、失败与 finally 均不得回写或提示；删除确认额外绑定 Canvas 与独立 operation generation。画布活动使用完整 view key 的 `activityRevision/seenActivityRevision` 轻量状态，不能为未 LOAD 的后台画布伪造 viewport；同一 Renderer 的 Canvas 变化消费者共享一个 Preload listener，并在最后消费者释放时解绑。

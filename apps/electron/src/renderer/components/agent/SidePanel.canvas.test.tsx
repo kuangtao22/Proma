@@ -9,6 +9,7 @@ import {
 } from '@/components/design/CanvasWorkspaceAdapter'
 import {
   getCanvasDeleteFailureMessage,
+  createCanvasDeleteLifecycle,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
 } from './canvas-workspace-actions'
@@ -116,5 +117,32 @@ describe('Agent 右侧画布动态标签', () => {
     expect(deleted).toBe(false)
     expect(confirmationOpen).toBe(true)
     expect(errors).toEqual(['画布仍有任务运行，请先停止后再删除'])
+  })
+
+  test('Given A 身份打开删除确认 When 切换到 B Then 旧确认失效且不能删除 A', () => {
+    const lifecycle = createCanvasDeleteLifecycle()
+    const pending = lifecycle.open('agent-a', 'project-1', {
+      id: 'canvas-a', projectId: 'project-1', title: 'A', archived: false, createdAt: 1, updatedAt: 1,
+    })
+
+    lifecycle.switchHost('agent-b', 'project-2')
+
+    expect(lifecycle.isCurrent(pending)).toBe(false)
+    expect(lifecycle.getPending()).toBeNull()
+  })
+
+  test('Given A 删除已开始 When 切换到 B 且 A 迟到完成 Then 不允许回写 B 的 UI', () => {
+    const lifecycle = createCanvasDeleteLifecycle()
+    const pending = lifecycle.open('agent-a', 'project-1', {
+      id: 'canvas-a', projectId: 'project-1', title: 'A', archived: false, createdAt: 1, updatedAt: 1,
+    })
+    const operation = lifecycle.begin(pending)
+    const retriedOperation = lifecycle.begin(pending)
+
+    lifecycle.switchHost('agent-b', 'project-2')
+
+    expect(operation).not.toBeNull()
+    expect(retriedOperation?.generation).toBeGreaterThan(operation!.generation)
+    expect(lifecycle.isOperationCurrent(operation!)).toBe(false)
   })
 })

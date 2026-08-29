@@ -1,4 +1,7 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import * as React from 'react'
+import { act } from 'react'
+import { createRoot } from 'react-dom/client'
 import { LEGACY_DESIGN_CANVAS_ID } from '@proma/shared'
 import type { AgentCanvasBinding, CanvasChangeEvent, CanvasSessionMeta } from '@proma/shared'
 import { createStore, Provider } from 'jotai'
@@ -8,12 +11,87 @@ import {
   createAgentCanvasViewKey,
   createInitialAgentCanvasViewState,
 } from '@/atoms/agent-canvas-atoms'
+import { designAdapter } from '@/lib/design-adapter'
 import type { DesignAdapter } from '@/lib/design-adapter'
 import {
   CanvasWorkspaceAdapter,
+  isAgentCanvasActivityUnread,
   reconcileMissingCanvas,
   subscribeAgentCanvasActivity,
+  useAgentCanvasLegacyViewInitialization,
+  useAgentCanvasWorkspaceRegistry,
 } from './CanvasWorkspaceAdapter'
+
+interface Deferred<T> {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (reason: unknown) => void
+}
+
+/** 创建可控 Promise，验证异步结果乱序时的宿主代次。 */
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve
+    reject = nextReject
+  })
+  return { promise, resolve, reject }
+}
+
+interface MinimalEventTarget {
+  addEventListener: () => void
+  removeEventListener: () => void
+}
+
+/** 创建只承载返回 null 的 Hook Probe 的最小 DOM 宿主。 */
+function createHookRoot(): {
+  render: (node: React.ReactElement) => void
+  unmount: () => void
+  restore: () => void
+} {
+  const eventTarget: MinimalEventTarget = { addEventListener: () => undefined, removeEventListener: () => undefined }
+  class FakeHtmlIFrameElement {}
+  const fakeWindow = { ...eventTarget, event: undefined, HTMLIFrameElement: FakeHtmlIFrameElement }
+  const fakeDocument = {
+    ...eventTarget,
+    nodeType: 9,
+    defaultView: fakeWindow,
+    activeElement: null,
+    body: null,
+    documentElement: { namespaceURI: 'http://www.w3.org/1999/xhtml' },
+  }
+  const container = {
+    ...eventTarget,
+    nodeType: 1,
+    tagName: 'DIV',
+    namespaceURI: 'http://www.w3.org/1999/xhtml',
+    ownerDocument: fakeDocument,
+  }
+  const globals = globalThis as unknown as { window?: unknown; document?: unknown; IS_REACT_ACT_ENVIRONMENT?: boolean }
+  const previousWindow = globals.window
+  const previousDocument = globals.document
+  const previousActEnvironment = globals.IS_REACT_ACT_ENVIRONMENT
+  globals.window = fakeWindow
+  globals.document = fakeDocument
+  globals.IS_REACT_ACT_ENVIRONMENT = true
+  const root = createRoot(container as unknown as Element)
+  return {
+    render: (node) => { root.render(node) },
+    unmount: () => { root.unmount() },
+    restore: () => {
+      globals.window = previousWindow
+      globals.document = previousDocument
+      globals.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment
+    },
+  }
+}
+
+const originalDesignAdapter = { ...designAdapter }
+
+afterEach(() => {
+  Object.assign(designAdapter, originalDesignAdapter)
+})
 
 /** 创建稳定的公开 Canvas 元数据。 */
 function createSession(id: string, archived = false): CanvasSessionMeta {
@@ -119,10 +197,12 @@ describe('Agent 右侧 Canvas 适配器', () => {
 
   test('Given 后台 Canvas 变化 When 订阅触发 Then 只更新对应 Agent 活动状态', () => {
     const listeners = new Map<string, (event: CanvasChangeEvent) => void>()
-    const adapter: Pick<DesignAdapter, 'onCanvasChanged'> = {
-      onCanvasChanged: (target, listener) => {
-        listeners.set(target.canvasId, listener)
-        return () => { listeners.delete(target.canvasId) }
+    const adapter: Pick<DesignAdapter, 'onCanvasChanges'> = {
+      onCanvasChanges: (_projectId, canvasIds, listener) => {
+        for (const canvasId of canvasIds) listeners.set(canvasId, listener)
+        return () => {
+          for (const canvasId of canvasIds) listeners.delete(canvasId)
+        }
       },
     }
     const binding: AgentCanvasBinding = {
@@ -183,5 +263,145 @@ describe('Agent 右侧 Canvas 适配器', () => {
     expect(expanded).toContain('aria-label="还原画布"')
     expect(expanded).toContain('agent-1')
     expect(expanded).toContain('canvas-1')
+  })
+
+  test('Given legacy Canvas When effect 挂载 Then 轻量 view 立即初始化且按 Agent 会话隔离', async () => {
+    const store = createStore()
+    const host = createHookRoot()
+    function Probe({ sessionId }: { sessionId: string }): null {
+      useAgentCanvasLegacyViewInitialization(sessionId, 'project-1', LEGACY_DESIGN_CANVAS_ID)
+      return null
+    }
+
+    try {
+      act(() => { host.render(<Provider store={store}><Probe sessionId="agent-1" /></Provider>) })
+      const firstKey = createAgentCanvasViewKey('agent-1', 'project-1', LEGACY_DESIGN_CANVAS_ID)
+      expect(store.get(agentCanvasViewStatesAtom).get(firstKey)).toMatchObject({ isExpanded: false })
+
+      act(() => { host.render(<Provider store={store}><Probe sessionId="agent-2" /></Provider>) })
+      const secondKey = createAgentCanvasViewKey('agent-2', 'project-1', LEGACY_DESIGN_CANVAS_ID)
+      expect(store.get(agentCanvasViewStatesAtom).has(firstKey)).toBe(true)
+      expect(store.get(agentCanvasViewStatesAtom).has(secondKey)).toBe(true)
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given A LIST 未完成 When rerender 到 B 且响应乱序 Then 只提交 B 并清理旧订阅', async () => {
+    const host = createHookRoot()
+    const store = createStore()
+    const requests = new Map<string, Deferred<AgentCanvasBinding[]>>()
+    let releaseCalls = 0
+    let latest: ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null = null
+    designAdapter.listAgentCanvasBindings = ({ projectId }) => {
+      const request = createDeferred<AgentCanvasBinding[]>()
+      requests.set(projectId, request)
+      return request.promise
+    }
+    designAdapter.onAgentCanvasBindingChanged = () => () => { releaseCalls += 1 }
+    designAdapter.onCanvasChanges = () => () => undefined
+    function Probe({ projectId, sessionId }: { projectId: string; sessionId: string }): null {
+      latest = useAgentCanvasWorkspaceRegistry(projectId, sessionId, () => undefined)
+      return null
+    }
+    const bindingA = { projectId: 'project-a', sessionId: 'agent-a', linkedCanvasIds: [], updatedAt: 1 } satisfies AgentCanvasBinding
+    const bindingB = { projectId: 'project-b', sessionId: 'agent-b', linkedCanvasIds: [], updatedAt: 2 } satisfies AgentCanvasBinding
+
+    try {
+      act(() => { host.render(<Provider store={store}><Probe projectId="project-a" sessionId="agent-a" /></Provider>) })
+      act(() => { host.render(<Provider store={store}><Probe projectId="project-b" sessionId="agent-b" /></Provider>) })
+      await act(async () => { requests.get('project-b')?.resolve([bindingB]); await Promise.resolve() })
+      await act(async () => { requests.get('project-a')?.resolve([bindingA]); await Promise.resolve() })
+
+      const currentRegistry = latest as ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null
+      expect(currentRegistry?.binding).toEqual(bindingB)
+      expect(currentRegistry?.bindingReady).toBe(true)
+      expect(releaseCalls).toBe(1)
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given A 用户动作未完成 When rerender 到 B 后 A 迟到失败 Then 不打开标签也不向 B 冒泡错误', async () => {
+    const host = createHookRoot()
+    const store = createStore()
+    const linkRequest = createDeferred<AgentCanvasBinding>()
+    const openedTabs: string[] = []
+    let latest: ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null = null
+    designAdapter.listAgentCanvasBindings = async () => []
+    designAdapter.onAgentCanvasBindingChanged = () => () => undefined
+    designAdapter.onCanvasChanges = () => () => undefined
+    designAdapter.linkAgentCanvas = () => linkRequest.promise
+    function Probe({ projectId, sessionId }: { projectId: string; sessionId: string }): null {
+      latest = useAgentCanvasWorkspaceRegistry(projectId, sessionId, (tab) => { openedTabs.push(tab) })
+      return null
+    }
+
+    try {
+      await act(async () => { host.render(<Provider store={store}><Probe projectId="project-a" sessionId="agent-a" /></Provider>) })
+      const action = latest!.linkAndOpen('canvas-a')
+      act(() => { host.render(<Provider store={store}><Probe projectId="project-b" sessionId="agent-b" /></Provider>) })
+      await act(async () => {
+        linkRequest.reject(new Error('A 已失效'))
+        await expect(action).resolves.toBeUndefined()
+      })
+      expect(openedTabs).toEqual([])
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 后台 Canvas 尚未 LOAD When 收到活动事件 Then 记录完整 view key 且不伪造 viewport', async () => {
+    const host = createHookRoot()
+    const store = createStore()
+    let activityListener: ((event: CanvasChangeEvent) => void) | null = null
+    let latest: ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null = null
+    const binding = {
+      projectId: 'project-1', sessionId: 'agent-1', linkedCanvasIds: ['canvas-1'], updatedAt: 1,
+    } satisfies AgentCanvasBinding
+    designAdapter.listAgentCanvasBindings = async () => [binding]
+    designAdapter.onAgentCanvasBindingChanged = () => () => undefined
+    designAdapter.onCanvasChanges = (_projectId, _canvasIds, listener) => {
+      activityListener = listener
+      return () => undefined
+    }
+    function Probe(): null {
+      latest = useAgentCanvasWorkspaceRegistry('project-1', 'agent-1', () => undefined)
+      return null
+    }
+
+    try {
+      await act(async () => { host.render(<Provider store={store}><Probe /></Provider>) })
+      act(() => {
+        activityListener?.({ projectId: 'project-1', canvasId: 'canvas-1', revision: 2, cause: 'graph' })
+      })
+      const key = createAgentCanvasViewKey('agent-1', 'project-1', 'canvas-1')
+      const currentRegistry = latest as ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null
+      expect(store.get(agentCanvasViewStatesAtom).has(key)).toBe(false)
+      expect(currentRegistry?.canvasActivityStates.get('canvas-1')).toEqual({
+        activityRevision: 1,
+        seenActivityRevision: 0,
+      })
+      act(() => { currentRegistry?.markActivitySeen('canvas-1') })
+      const seenRegistry = latest as ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null
+      expect(seenRegistry?.canvasActivityStates.get('canvas-1')).toEqual({
+        activityRevision: 1,
+        seenActivityRevision: 1,
+      })
+      expect(store.get(agentCanvasViewStatesAtom).has(key)).toBe(false)
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given activity 已读 When 新事件到达 Then 只在 revision 超过 seenRevision 时显示提示', () => {
+    const initial = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })
+    expect(isAgentCanvasActivityUnread(initial)).toBe(false)
+    expect(isAgentCanvasActivityUnread({ ...initial, activityRevision: 1 })).toBe(true)
+    expect(isAgentCanvasActivityUnread({ ...initial, activityRevision: 1, seenActivityRevision: 1 })).toBe(false)
   })
 })

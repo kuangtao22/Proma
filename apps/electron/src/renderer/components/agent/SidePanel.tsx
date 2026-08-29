@@ -134,20 +134,24 @@ import {
   sanitizeRightWorkspaceSplit,
   selectRightWorkspaceSplitTab,
   shouldRenderRightWorkspaceSplit,
+  resolveRightWorkspaceTabClose,
 } from '@/lib/right-workspace-split'
 import type { RightWorkspacePane, RightWorkspaceSplitState } from '@/lib/right-workspace-split'
 import {
   buildCanvasWorkspaceTabs,
   CanvasWorkspaceAdapter,
+  isAgentCanvasActivityUnread,
   useAgentCanvasWorkspaceRegistry,
 } from '@/components/design/CanvasWorkspaceAdapter'
 import { designAdapter } from '@/lib/design-adapter'
 import { removeCanvasSessionAtom, upsertCanvasSessionAtom } from '@/atoms/canvas-session-atoms'
 import {
   CANVAS_WORKSPACE_FAILURE_MESSAGES,
+  createCanvasDeleteLifecycle,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
 } from './canvas-workspace-actions'
+import type { PendingCanvasDelete } from './canvas-workspace-actions'
 
 function BrowserTabIcon({ favicon }: { favicon?: string }): React.ReactElement {
   const [loadFailed, setLoadFailed] = React.useState(false)
@@ -1172,8 +1176,14 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   )
   const upsertCanvasSession = useSetAtom(upsertCanvasSessionAtom)
   const removeCanvasSession = useSetAtom(removeCanvasSessionAtom)
-  const [pendingDeleteCanvas, setPendingDeleteCanvas] = React.useState<CanvasSessionMeta | null>(null)
+  const deleteLifecycleRef = React.useRef(createCanvasDeleteLifecycle())
+  const [pendingDeleteCanvas, setPendingDeleteCanvas] = React.useState<PendingCanvasDelete | null>(null)
   const [deletingCanvas, setDeletingCanvas] = React.useState(false)
+  React.useLayoutEffect(() => {
+    deleteLifecycleRef.current.switchHost(sessionId, currentWorkspaceId)
+    setPendingDeleteCanvas(null)
+    setDeletingCanvas(false)
+  }, [currentWorkspaceId, sessionId])
   const reportCanvasActionError = React.useCallback((context: string, error: unknown): void => {
     console.error(`[SidePanel] ${context}失败:`, error)
   }, [])
@@ -1184,9 +1194,9 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     () => buildCanvasWorkspaceTabs(
       canvasRegistry.binding,
       canvasRegistry.sessions,
-      canvasRegistry.canvasActivityRevision,
+      canvasRegistry.canvasActivityStates,
     ),
-    [canvasRegistry.binding, canvasRegistry.canvasActivityRevision, canvasRegistry.sessions],
+    [canvasRegistry.binding, canvasRegistry.canvasActivityStates, canvasRegistry.sessions],
   )
 
   /** 归档画布从菜单打开时先复用既有恢复合同，再建立当前 Agent 关联。 */
@@ -1276,31 +1286,40 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
 
   /** 删除继续经过主进程运行中任务守卫；这里只复用确认和 Renderer 索引更新。 */
   const handleConfirmDeleteCanvas = React.useCallback(async (): Promise<void> => {
-    const canvas = pendingDeleteCanvas
-    if (!canvas || deletingCanvas) return
+    const pending = pendingDeleteCanvas
+    if (!pending || deletingCanvas) return
+    const operation = deleteLifecycleRef.current.begin(pending)
+    if (!operation) return
+    const { canvas } = pending
     setDeletingCanvas(true)
     try {
       const deleted = await runCanvasDeleteAction({
         action: async () => {
           await designAdapter.deleteCanvasSession({ projectId: canvas.projectId, canvasId: canvas.id })
         },
-        onErrorMessage: showCanvasActionError,
-        onLogError: reportCanvasActionError,
+        onErrorMessage: (message) => {
+          if (deleteLifecycleRef.current.isOperationCurrent(operation)) showCanvasActionError(message)
+        },
+        onLogError: (context, error) => {
+          if (deleteLifecycleRef.current.isOperationCurrent(operation)) reportCanvasActionError(context, error)
+        },
       })
-      if (!deleted) return
+      if (!deleted || !deleteLifecycleRef.current.isOperationCurrent(operation)) return
       removeCanvasSession({ projectId: canvas.projectId, canvasId: canvas.id })
+      deleteLifecycleRef.current.cancel()
       setPendingDeleteCanvas(null)
       toast.success('画布已删除')
     } finally {
-      setDeletingCanvas(false)
+      if (deleteLifecycleRef.current.isOperationCurrent(operation)) setDeletingCanvas(false)
     }
   }, [deletingCanvas, pendingDeleteCanvas, removeCanvasSession, reportCanvasActionError, showCanvasActionError])
 
-  const activeCanvasId = parseCanvasWorkspaceTab(activeTab)
+  const focusedWorkspaceTab = split ? getFocusedRightWorkspaceTab(split) : effectiveActiveTab
+  const activeCanvasId = parseCanvasWorkspaceTab(focusedWorkspaceTab)
   React.useEffect(() => {
     if (!activeCanvasId || !canvasRegistry.bindingReady) return
     if (!canvasRegistry.binding?.linkedCanvasIds.includes(activeCanvasId)) {
-      returnToPreviousTabAfterClose(activeTab)
+      returnToPreviousTabAfterClose(focusedWorkspaceTab)
       return
     }
     if (canvasRegistry.binding.lastActiveCanvasId !== activeCanvasId) {
@@ -1308,7 +1327,8 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
         console.error('[SidePanel] 更新最近画布失败:', error)
       })
     }
-  }, [activeCanvasId, activeTab, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.markActive, returnToPreviousTabAfterClose])
+    canvasRegistry.markActivitySeen(activeCanvasId)
+  }, [activeCanvasId, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.markActive, canvasRegistry.markActivitySeen, focusedWorkspaceTab, returnToPreviousTabAfterClose])
 
   // Agent/浏览器等外部事件仍只更新兼容 activeTab；分屏时把新目标落到当前焦点 Pane。
   React.useEffect(() => {
@@ -1406,7 +1426,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       label: canvas.title,
       icon: <Workflow className="size-3.5" />,
       closable: true,
-      activity: canvas.activityRevision > 0 && activeTab !== canvas.id,
+      activity: isAgentCanvasActivityUnread(canvas),
     })),
     ...workspaceComponentTabs.map((component) => {
       const meta: Record<WorkspaceComponentTab, { label: string; icon: React.ReactNode }> = {
@@ -1458,7 +1478,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       closable: true,
       activity: showBrowserActivity && activeBrowserTabId !== tab.tabId && browserState.activeTabId === tab.tabId,
     })) ?? []),
-  ], [activeBrowserTabId, activeTab, browserState, canvasWorkspaceTabs, previewFiles, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideDelegationSessionIds, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
+  ], [activeBrowserTabId, browserState, canvasWorkspaceTabs, previewFiles, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideDelegationSessionIds, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
   workspaceTabsRef.current = workspaceTabs
 
   React.useEffect(() => {
@@ -1472,14 +1492,16 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
 
   const exitSplitInsteadOfClosingBoundTab = React.useCallback((tab: AgentSidePanelTab): boolean => {
     const currentSplit = splitMapRef.current.get(sessionId) ?? null
-    if (!currentSplit || (tab !== currentSplit.leftTab && tab !== currentSplit.rightTab)) return false
+    const resolution = resolveRightWorkspaceTabClose(currentSplit, tab)
+    if (resolution.kind !== 'collapse') return false
     // 关闭命令作用于绑定组时不销毁成员；等同“退出并排，保留当前焦点”。
-    handleWorkspaceTabChange(collapseRightWorkspaceSplit(currentSplit))
+    handleWorkspaceTabChange(resolution.activeTab)
     updateSplit(null)
     return true
   }, [handleWorkspaceTabChange, sessionId, updateSplit])
 
   const handleCloseWorkspaceTab = React.useCallback((tab: AgentSidePanelTab) => {
+    if (exitSplitInsteadOfClosingBoundTab(tab)) return
     const canvasId = parseCanvasWorkspaceTab(tab)
     if (canvasId) {
       void canvasRegistry.unlink(canvasId).catch((error: unknown) => {
@@ -1489,7 +1511,6 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       returnToPreviousTabAfterClose(tab)
       return
     }
-    if (exitSplitInsteadOfClosingBoundTab(tab)) return
     const terminalId = getTerminalIdFromSidePanelTab(tab)
     if (terminalId) {
       void window.electronAPI.killTerminal(terminalId).catch(console.error)
@@ -1956,7 +1977,10 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
             onRenameCanvas={handleRenameCanvas}
             onSetDefaultCanvas={handleSetDefaultCanvas}
             onToggleArchiveCanvas={handleToggleArchiveCanvas}
-            onRequestDeleteCanvas={setPendingDeleteCanvas}
+            onRequestDeleteCanvas={(canvas) => {
+              if (!currentWorkspaceId) return
+              setPendingDeleteCanvas(deleteLifecycleRef.current.open(sessionId, currentWorkspaceId, canvas))
+            }}
             onOpenWorkspaceComponent={(component) => {
               setWorkspaceComponentTabs((previous) => previous.includes(component) ? previous : [...previous, component])
               handleWorkspaceTabChange(component)
@@ -2022,13 +2046,16 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
             )}
           </div>
           <AlertDialog open={pendingDeleteCanvas !== null} onOpenChange={(open) => {
-            if (!open && !deletingCanvas) setPendingDeleteCanvas(null)
+            if (!open && !deletingCanvas) {
+              deleteLifecycleRef.current.cancel()
+              setPendingDeleteCanvas(null)
+            }
           }}>
             <AlertDialogContent>
               <AlertDialogHeader>
                 <AlertDialogTitle>确认删除画布</AlertDialogTitle>
                 <AlertDialogDescription>
-                  将永久删除“{pendingDeleteCanvas?.title ?? '该画布'}”及其中的节点和内部 Agent 对话。此操作无法恢复。
+                  将永久删除“{pendingDeleteCanvas?.canvas.title ?? '该画布'}”及其中的节点和内部 Agent 对话。此操作无法恢复。
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>

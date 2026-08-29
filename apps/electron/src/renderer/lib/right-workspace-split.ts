@@ -15,6 +15,19 @@ export interface RightWorkspaceSplitResolution {
   activeTab: AgentSidePanelTab
 }
 
+export type RightWorkspaceTabCloseResolution =
+  | { kind: 'collapse'; activeTab: AgentSidePanelTab }
+  | { kind: 'close' }
+
+/** 关闭 split 成员时只退出并排；非成员或非 split 标签继续执行真实关闭。 */
+export function resolveRightWorkspaceTabClose(
+  split: RightWorkspaceSplitState | null,
+  tab: AgentSidePanelTab,
+): RightWorkspaceTabCloseResolution {
+  if (!split || (tab !== split.leftTab && tab !== split.rightTab)) return { kind: 'close' }
+  return { kind: 'collapse', activeTab: collapseRightWorkspaceSplit(split) }
+}
+
 /** 判断内容宽度是否足以同时承载两个最小 Pane；不足时只降级呈现，不修改 split 状态。 */
 export function shouldRenderRightWorkspaceSplit(
   totalWidth: number,

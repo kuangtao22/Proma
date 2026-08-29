@@ -358,31 +358,46 @@ describe('Design renderer adapter', () => {
     await expect(failed.restoreCanvasNode({ projectId: 'project-1', canvasId: 'canvas-1', operationId: '22222222-2222-4222-8222-222222222222', trashId: 'trash-1', expectedRevision: 0, position: { x: 0, y: 0 } })).rejects.toMatchObject({ code: 'CANVAS_RESTORE_FAILED', message: '节点恢复失败，请重试。' })
   })
 
-  test('Given 多个 Canvas 事件 When 订阅目标 B Then recovery 和 graph 都只按双身份隔离', () => {
+  test('Given 多个 Canvas 消费者 When 订阅目标集合 Then 底层只注册一次并在最后释放时解绑', () => {
     /** 捕获 preload 层注册的未过滤 listener。 */
     let sourceListener: ((event: CanvasChangeEvent) => void) | undefined
-    /** preload 释放函数必须由 adapter 原样返回。 */
-    const release = (): void => undefined
+    let subscribeCalls = 0
+    let releaseCalls = 0
     const adapter = createDesignAdapter({
-      onCanvasChanged: (listener) => { sourceListener = listener; return release },
+      onCanvasChanged: (listener) => {
+        subscribeCalls += 1
+        sourceListener = listener
+        return () => { releaseCalls += 1 }
+      },
     })
-    /** 目标 B 实际收到的事件。 */
-    const received: CanvasChangeEvent[] = []
-    const returnedRelease = adapter.onCanvasChanged(
-      { projectId: 'project-1', canvasId: 'canvas-b' },
-      (event) => received.push(event),
+    const receivedA: CanvasChangeEvent[] = []
+    const receivedB: CanvasChangeEvent[] = []
+    const releaseA = adapter.onCanvasChanges(
+      'project-1',
+      new Set(['canvas-a']),
+      (event) => receivedA.push(event),
+    )
+    const releaseB = adapter.onCanvasChanges(
+      'project-1',
+      new Set(['canvas-b', 'canvas-c']),
+      (event) => receivedB.push(event),
     )
     const events: CanvasChangeEvent[] = [
       { projectId: 'project-1', canvasId: 'canvas-a', revision: 9, cause: 'graph' },
-      { projectId: 'project-1', canvasId: 'canvas-a', revision: 1, cause: 'recovery' },
       { projectId: 'project-2', canvasId: 'canvas-b', revision: 10, cause: 'graph' },
       { projectId: 'project-1', canvasId: 'canvas-b', revision: 2, cause: 'recovery' },
-      { projectId: 'project-1', canvasId: 'canvas-b', revision: 3, cause: 'graph' },
+      { projectId: 'project-1', canvasId: 'canvas-c', revision: 3, cause: 'graph' },
     ]
     for (const event of events) sourceListener?.(event)
 
-    expect(returnedRelease).toBe(release)
-    expect(received).toEqual(events.slice(3))
+    expect(subscribeCalls).toBe(1)
+    expect(receivedA).toEqual([events[0]!])
+    expect(receivedB).toEqual(events.slice(2))
+    releaseA()
+    expect(releaseCalls).toBe(0)
+    releaseB()
+    releaseB()
+    expect(releaseCalls).toBe(1)
   })
 
   test('Given preload 拒绝加载 When adapter 调用 Then 保留稳定错误供 UI 展示', async () => {

@@ -11,7 +11,9 @@ import {
 import {
   createAgentCanvasViewKey,
   agentCanvasViewStatesAtom,
+  initializeAgentCanvasViewStateAtom,
   updateAgentCanvasViewStateAtom,
+  type AgentCanvasViewState,
 } from '@/atoms/agent-canvas-atoms'
 import { designAdapter } from '@/lib/design-adapter'
 import type { DesignAdapter } from '@/lib/design-adapter'
@@ -28,6 +30,13 @@ export interface CanvasWorkspaceTabDescriptor {
   isDefault: boolean
   isRecent: boolean
   activityRevision: number
+  seenActivityRevision: number
+}
+
+/** 按完整 view key 保存的轻量活动状态，不负责初始化 Canvas viewport。 */
+export interface AgentCanvasActivityState {
+  activityRevision: number
+  seenActivityRevision: number
 }
 
 /**
@@ -37,7 +46,7 @@ export interface CanvasWorkspaceTabDescriptor {
 export function buildCanvasWorkspaceTabs(
   binding: AgentCanvasBinding | null,
   sessions: readonly CanvasSessionMeta[],
-  activityRevisions: ReadonlyMap<string, number> = new Map(),
+  activityStates: ReadonlyMap<string, AgentCanvasActivityState> = new Map(),
 ): CanvasWorkspaceTabDescriptor[] {
   if (!binding) return []
   const sessionsById = new Map(sessions.map((session) => [session.id, session]))
@@ -49,13 +58,14 @@ export function buildCanvasWorkspaceTabs(
       title: session?.title ?? '画布已删除',
       isDefault: binding.defaultCanvasId === canvasId,
       isRecent: binding.lastActiveCanvasId === canvasId,
-      activityRevision: activityRevisions.get(canvasId) ?? 0,
+      activityRevision: activityStates.get(canvasId)?.activityRevision ?? 0,
+      seenActivityRevision: activityStates.get(canvasId)?.seenActivityRevision ?? 0,
     }
   })
 }
 
 export interface SubscribeAgentCanvasActivityInput {
-  adapter: Pick<DesignAdapter, 'onCanvasChanged'>
+  adapter: Pick<DesignAdapter, 'onCanvasChanges'>
   projectId: string
   sessionId: string
   binding: AgentCanvasBinding
@@ -71,11 +81,17 @@ export function subscribeAgentCanvasActivity({
   binding,
   onActivity,
 }: SubscribeAgentCanvasActivityInput): () => void {
-  const releases = binding.linkedCanvasIds.map((canvasId) => adapter.onCanvasChanged(
-    { projectId, canvasId },
-    () => onActivity(canvasId, createAgentCanvasViewKey(sessionId, projectId, canvasId)),
-  ))
-  return () => releases.forEach((release) => release())
+  const canvasIds = new Set(binding.linkedCanvasIds)
+  return adapter.onCanvasChanges(projectId, canvasIds, (event) => {
+    onActivity(event.canvasId, createAgentCanvasViewKey(sessionId, projectId, event.canvasId))
+  })
+}
+
+/** 活动代次严格超过已读代次时才展示提示。 */
+export function isAgentCanvasActivityUnread(
+  state: Pick<AgentCanvasViewState, 'activityRevision' | 'seenActivityRevision'>,
+): boolean {
+  return state.activityRevision > state.seenActivityRevision
 }
 
 /** 解除当前 Agent 的单个 Canvas 关联，不触碰 Canvas 会话本身。 */
@@ -132,9 +148,10 @@ export interface AgentCanvasWorkspaceRegistry {
   bindingReady: boolean
   loading: boolean
   error: string | null
-  canvasActivityRevision: ReadonlyMap<string, number>
+  canvasActivityStates: ReadonlyMap<string, AgentCanvasActivityState>
   linkAndOpen: (canvasId: string, makeDefault?: boolean) => Promise<void>
   markActive: (canvasId: string) => Promise<void>
+  markActivitySeen: (canvasId: string) => void
   createAndOpen: () => Promise<void>
   unlink: (canvasId: string) => Promise<void>
   setDefault: (canvasId: string) => Promise<void>
@@ -154,7 +171,16 @@ export function useAgentCanvasWorkspaceRegistry(
   const [loading, setLoading] = React.useState(false)
   const [bindingReady, setBindingReady] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
-  const [activityRevisions, setActivityRevisions] = React.useState<Map<string, number>>(new Map())
+  const [activityStatesByViewKey, setActivityStatesByViewKey] = React.useState<Map<string, AgentCanvasActivityState>>(new Map())
+  const lifecycleRef = React.useRef({ projectId, sessionId, generation: 0 })
+  if (lifecycleRef.current.projectId !== projectId || lifecycleRef.current.sessionId !== sessionId) {
+    lifecycleRef.current = { projectId, sessionId, generation: lifecycleRef.current.generation + 1 }
+  }
+  const generation = lifecycleRef.current.generation
+  const isCurrent = React.useCallback(() => {
+    const current = lifecycleRef.current
+    return current.projectId === projectId && current.sessionId === sessionId && current.generation === generation
+  }, [generation, projectId, sessionId])
   const sessions = projectId ? sessionsByProject.get(projectId) ?? [] : []
   const projectStatus = projectId ? statusByProject.get(projectId) : undefined
   const metadataReady = projectStatus?.phase === 'ready' || sessionsByProject.has(projectId ?? '')
@@ -164,49 +190,61 @@ export function useAgentCanvasWorkspaceRegistry(
     setBinding(null)
     setBindingReady(false)
     setError(null)
+    setLoading(false)
+    setActivityStatesByViewKey(new Map())
     if (!projectId) return
     setLoading(true)
     let bindingEventReceived = false
     void designAdapter.listAgentCanvasBindings({ projectId })
       .then((bindings) => {
-        if (!disposed && !bindingEventReceived) {
+        if (!disposed && isCurrent() && !bindingEventReceived) {
           setBinding(bindings.find((item) => item.sessionId === sessionId) ?? null)
         }
       })
       .catch((cause: unknown) => {
-        if (!disposed) {
+        if (!disposed && isCurrent()) {
           console.error('[CanvasWorkspaceAdapter] 加载画布关联失败:', cause)
           setError('画布关联加载失败')
         }
       })
       .finally(() => {
-        if (!disposed) setLoading(false)
-        if (!disposed) setBindingReady(true)
+        if (!disposed && isCurrent()) setLoading(false)
+        if (!disposed && isCurrent()) setBindingReady(true)
       })
     const release = designAdapter.onAgentCanvasBindingChanged({ projectId, sessionId }, (event) => {
       bindingEventReceived = true
-      if (!disposed) {
+      if (!disposed && isCurrent()) {
         setBinding(event.binding)
         setBindingReady(true)
+        setLoading(false)
       }
     })
     return () => {
       disposed = true
       release()
     }
-  }, [projectId, sessionId])
+  }, [isCurrent, projectId, sessionId])
 
   React.useEffect(() => {
-    if (!projectId || !binding) return
+    if (!projectId || !binding || binding.projectId !== projectId || binding.sessionId !== sessionId) return
+    const linkedViewKeys = new Set(binding.linkedCanvasIds.map((canvasId) => (
+      createAgentCanvasViewKey(sessionId, projectId, canvasId)
+    )))
+    setActivityStatesByViewKey((previous) => {
+      const next = new Map([...previous].filter(([key]) => linkedViewKeys.has(key)))
+      return next.size === previous.size ? previous : next
+    })
     return subscribeAgentCanvasActivity({
       adapter: designAdapter,
       projectId,
       sessionId,
       binding,
       onActivity: (canvasId, key) => {
-        setActivityRevisions((previous) => {
+        if (!isCurrent()) return
+        setActivityStatesByViewKey((previous) => {
+          const current = previous.get(key) ?? { activityRevision: 0, seenActivityRevision: 0 }
           const next = new Map(previous)
-          next.set(canvasId, (previous.get(canvasId) ?? 0) + 1)
+          next.set(key, { ...current, activityRevision: current.activityRevision + 1 })
           return next
         })
         updateViewState({
@@ -215,38 +253,85 @@ export function useAgentCanvasWorkspaceRegistry(
         })
       },
     })
-  }, [binding, projectId, sessionId, updateViewState])
+  }, [binding, isCurrent, projectId, sessionId, updateViewState])
 
   const linkAndOpen = React.useCallback(async (canvasId: string, makeDefault = false): Promise<void> => {
     if (!projectId) return
-    const next = await designAdapter.linkAgentCanvas({ projectId, sessionId, canvasId, makeDefault })
-    setBinding(next)
-    onOpenTab(getCanvasWorkspaceTab(canvasId))
-  }, [onOpenTab, projectId, sessionId])
+    try {
+      const next = await designAdapter.linkAgentCanvas({ projectId, sessionId, canvasId, makeDefault })
+      if (!isCurrent()) return
+      setBinding(next)
+      onOpenTab(getCanvasWorkspaceTab(canvasId))
+    } catch (cause) {
+      if (isCurrent()) throw cause
+    }
+  }, [isCurrent, onOpenTab, projectId, sessionId])
 
   /** 复用关联合同更新最近画布，不改变右侧工作区焦点。 */
   const markActive = React.useCallback(async (canvasId: string): Promise<void> => {
     if (!projectId) return
-    setBinding(await markAgentCanvasActive(designAdapter, projectId, sessionId, canvasId))
-  }, [projectId, sessionId])
+    try {
+      const next = await markAgentCanvasActive(designAdapter, projectId, sessionId, canvasId)
+      if (isCurrent()) setBinding(next)
+    } catch (cause) {
+      if (isCurrent()) throw cause
+    }
+  }, [isCurrent, projectId, sessionId])
+
+  const markActivitySeen = React.useCallback((canvasId: string): void => {
+    if (!projectId || !isCurrent()) return
+    const key = createAgentCanvasViewKey(sessionId, projectId, canvasId)
+    setActivityStatesByViewKey((previous) => {
+      const current = previous.get(key)
+      if (!current || current.seenActivityRevision === current.activityRevision) return previous
+      const next = new Map(previous)
+      next.set(key, { ...current, seenActivityRevision: current.activityRevision })
+      return next
+    })
+    updateViewState({ key, update: (current) => ({ seenActivityRevision: current.activityRevision }) })
+  }, [isCurrent, projectId, sessionId, updateViewState])
 
   const createAndOpen = React.useCallback(async (): Promise<void> => {
     if (!projectId) return
-    const created = await designAdapter.createCanvasSession({ projectId })
-    replaceSessions({ projectId, sessions: [created, ...sessions.filter((session) => session.id !== created.id)] })
-    await linkAndOpen(created.id, binding?.defaultCanvasId === undefined)
-  }, [binding?.defaultCanvasId, linkAndOpen, projectId, replaceSessions, sessions])
+    try {
+      const created = await designAdapter.createCanvasSession({ projectId })
+      if (!isCurrent()) return
+      replaceSessions({ projectId, sessions: [created, ...sessions.filter((session) => session.id !== created.id)] })
+      await linkAndOpen(created.id, binding?.defaultCanvasId === undefined)
+    } catch (cause) {
+      if (isCurrent()) throw cause
+    }
+  }, [binding?.defaultCanvasId, isCurrent, linkAndOpen, projectId, replaceSessions, sessions])
 
   const unlink = React.useCallback(async (canvasId: string): Promise<void> => {
     if (!projectId) return
-    const next = await unlinkAgentCanvasForSession(designAdapter, projectId, sessionId, canvasId)
-    setBinding(next)
-  }, [projectId, sessionId])
+    try {
+      const next = await unlinkAgentCanvasForSession(designAdapter, projectId, sessionId, canvasId)
+      if (isCurrent()) setBinding(next)
+    } catch (cause) {
+      if (isCurrent()) throw cause
+    }
+  }, [isCurrent, projectId, sessionId])
 
   const setDefault = React.useCallback(async (canvasId: string): Promise<void> => {
     if (!projectId) return
-    setBinding(await designAdapter.setDefaultAgentCanvas({ projectId, sessionId, canvasId }))
-  }, [projectId, sessionId])
+    try {
+      const next = await designAdapter.setDefaultAgentCanvas({ projectId, sessionId, canvasId })
+      if (isCurrent()) setBinding(next)
+    } catch (cause) {
+      if (isCurrent()) throw cause
+    }
+  }, [isCurrent, projectId, sessionId])
+
+  const canvasActivityStates = React.useMemo(() => {
+    const states = new Map<string, AgentCanvasActivityState>()
+    if (!projectId || !binding || binding.projectId !== projectId || binding.sessionId !== sessionId) return states
+    for (const canvasId of binding.linkedCanvasIds) {
+      const state = activityStatesByViewKey.get(createAgentCanvasViewKey(sessionId, projectId, canvasId))
+      if (state) states.set(canvasId, state)
+    }
+    return states
+  }, [activityStatesByViewKey, binding, projectId, sessionId])
 
   return {
     binding,
@@ -255,13 +340,28 @@ export function useAgentCanvasWorkspaceRegistry(
     bindingReady,
     loading,
     error: error ?? projectStatus?.error ?? null,
-    canvasActivityRevision: activityRevisions,
+    canvasActivityStates,
     linkAndOpen,
     markActive,
+    markActivitySeen,
     createAndOpen,
     unlink,
     setDefault,
   }
+}
+
+/** legacy Design 不触发 native LOAD，因此在宿主 effect 内显式建立轻量会话视图。 */
+export function useAgentCanvasLegacyViewInitialization(
+  sessionId: string,
+  projectId: string,
+  canvasId: string,
+): void {
+  const initializeViewState = useSetAtom(initializeAgentCanvasViewStateAtom)
+  const key = createAgentCanvasViewKey(sessionId, projectId, canvasId)
+  React.useEffect(() => {
+    if (canvasId !== LEGACY_DESIGN_CANVAS_ID) return
+    initializeViewState({ key, viewport: { x: 0, y: 0, zoom: 1 } })
+  }, [canvasId, initializeViewState, key])
 }
 
 export interface CanvasWorkspaceAdapterProps {
@@ -300,6 +400,7 @@ export function CanvasWorkspaceAdapter({
   const viewStateKey = createAgentCanvasViewKey(sessionId, projectId, canvasId)
   const viewState = useAtomValue(agentCanvasViewStatesAtom).get(viewStateKey)
   const updateViewState = useSetAtom(updateAgentCanvasViewStateAtom)
+  useAgentCanvasLegacyViewInitialization(sessionId, projectId, canvasId)
   const isExpanded = viewState?.isExpanded ?? false
 
   const setExpanded = React.useCallback((expanded: boolean): void => {

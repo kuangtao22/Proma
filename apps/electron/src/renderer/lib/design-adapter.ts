@@ -121,6 +121,12 @@ export interface DesignAdapter {
     target: CanvasTarget,
     listener: (event: CanvasChangeEvent) => void,
   ) => ReturnType<DesignPreloadApi['onCanvasChanged']>
+  /** 使用单个底层 Renderer listener 分派同项目内的 Canvas 集合事件。 */
+  onCanvasChanges: (
+    projectId: string,
+    canvasIds: ReadonlySet<string>,
+    listener: (event: CanvasChangeEvent) => void,
+  ) => ReturnType<DesignPreloadApi['onCanvasChanged']>
   /** 列出目标项目的普通 Agent-Canvas 关联。 */
   listAgentCanvasBindings: (input: ListAgentCanvasBindingsInput) => Promise<ListAgentCanvasBindingsResult>
   /** 建立普通 Agent 与 Canvas 关联。 */
@@ -259,6 +265,43 @@ async function callCanvasApi<T>(
 
 /** 创建负责 Canvas 安全解包与 legacy Design 原样适配的 renderer adapter。 */
 export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
+  interface CanvasChangeSubscriber {
+    projectId: string
+    canvasIds: ReadonlySet<string>
+    listener: (event: CanvasChangeEvent) => void
+  }
+  /** 同一 Renderer adapter 的全部 Canvas 消费者共享一个 Preload listener。 */
+  const canvasChangeSubscribers = new Set<CanvasChangeSubscriber>()
+  let releaseCanvasChangeSource: (() => void) | null = null
+
+  /** 首个消费者挂载时建立底层监听，最后一个释放时由订阅释放函数关闭。 */
+  const subscribeCanvasChanges = (
+    projectId: string,
+    canvasIds: ReadonlySet<string>,
+    listener: (event: CanvasChangeEvent) => void,
+  ): (() => void) => {
+    const subscriber = { projectId, canvasIds: new Set(canvasIds), listener }
+    canvasChangeSubscribers.add(subscriber)
+    try {
+      if (!releaseCanvasChangeSource) {
+        releaseCanvasChangeSource = makeIdempotentAdapterRelease(requireMethod(api, 'onCanvasChanged')((event) => {
+          for (const current of canvasChangeSubscribers) {
+            if (current.projectId === event.projectId && current.canvasIds.has(event.canvasId)) current.listener(event)
+          }
+        }))
+      }
+    } catch (cause) {
+      canvasChangeSubscribers.delete(subscriber)
+      throw cause
+    }
+    return makeIdempotentAdapterRelease(() => {
+      canvasChangeSubscribers.delete(subscriber)
+      if (canvasChangeSubscribers.size > 0) return
+      releaseCanvasChangeSource?.()
+      releaseCanvasChangeSource = null
+    })
+  }
+
   return {
     loadCanvasImageModule: (input) => callCanvasApi(
       () => requireMethod(api, 'loadCanvasImageModule')(input),
@@ -342,10 +385,12 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
       () => requireMethod(api, 'stopCanvasAgent')(input),
       CANVAS_ADAPTER_FALLBACKS.stop,
     ),
-    onCanvasChanged: (target, listener) => requireMethod(api, 'onCanvasChanged')((event) => {
-      /** adapter 只隔离双重身份，revision 与 recovery 策略留给工作区 controller。 */
-      if (event.projectId === target.projectId && event.canvasId === target.canvasId) listener(event)
-    }),
+    onCanvasChanged: (target, listener) => subscribeCanvasChanges(
+      target.projectId,
+      new Set([target.canvasId]),
+      listener,
+    ),
+    onCanvasChanges: subscribeCanvasChanges,
     listAgentCanvasBindings: (input) => callCanvasApi(
       () => requireMethod(api, 'listAgentCanvasBindings')(input),
       CANVAS_ADAPTER_FALLBACKS.bindingList,

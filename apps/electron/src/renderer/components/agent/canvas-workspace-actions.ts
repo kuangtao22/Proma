@@ -1,3 +1,5 @@
+import type { CanvasSessionMeta } from '@proma/shared'
+
 /** Canvas 宿主动作的固定错误反馈合同。 */
 export interface CanvasWorkspaceActionOptions<T> {
   /** 真实 IPC 或 registry 动作。 */
@@ -58,6 +60,78 @@ export async function runCanvasDeleteAction({
     onLogError('删除画布', error)
     onErrorMessage(getCanvasDeleteFailureMessage(error))
     return false
+  }
+}
+
+export interface PendingCanvasDelete {
+  hostSessionId: string
+  projectId: string
+  canvas: CanvasSessionMeta
+  generation: number
+}
+
+export interface CanvasDeleteOperation {
+  hostSessionId: string
+  projectId: string
+  canvasId: string
+  hostGeneration: number
+  generation: number
+}
+
+export interface CanvasDeleteLifecycle {
+  switchHost: (sessionId: string, projectId: string | null) => void
+  open: (sessionId: string, projectId: string, canvas: CanvasSessionMeta) => PendingCanvasDelete
+  cancel: () => void
+  begin: (pending: PendingCanvasDelete) => CanvasDeleteOperation | null
+  getPending: () => PendingCanvasDelete | null
+  isCurrent: (pending: PendingCanvasDelete) => boolean
+  isOperationCurrent: (operation: CanvasDeleteOperation) => boolean
+}
+
+/** 把删除确认和已开始操作绑定到宿主身份与独立代次，阻断切换后的迟到 UI 回写。 */
+export function createCanvasDeleteLifecycle(): CanvasDeleteLifecycle {
+  let hostSessionId: string | null = null
+  let projectId: string | null = null
+  let generation = 0
+  let operationGeneration = 0
+  let pending: PendingCanvasDelete | null = null
+  return {
+    switchHost: (nextSessionId, nextProjectId) => {
+      if (hostSessionId === nextSessionId && projectId === nextProjectId) return
+      hostSessionId = nextSessionId
+      projectId = nextProjectId
+      generation += 1
+      operationGeneration += 1
+      pending = null
+    },
+    open: (nextSessionId, nextProjectId, canvas) => {
+      if (hostSessionId !== nextSessionId || projectId !== nextProjectId) {
+        hostSessionId = nextSessionId
+        projectId = nextProjectId
+        generation += 1
+      }
+      pending = { hostSessionId: nextSessionId, projectId: nextProjectId, canvas, generation }
+      return pending
+    },
+    cancel: () => { pending = null },
+    begin: (candidate) => {
+      if (candidate !== pending || hostSessionId !== candidate.hostSessionId
+        || projectId !== candidate.projectId || generation !== candidate.generation) return null
+      operationGeneration += 1
+      return {
+        hostSessionId: candidate.hostSessionId,
+        projectId: candidate.projectId,
+        canvasId: candidate.canvas.id,
+        hostGeneration: generation,
+        generation: operationGeneration,
+      }
+    },
+    getPending: () => pending,
+    isCurrent: (candidate) => candidate === pending && hostSessionId === candidate.hostSessionId
+      && projectId === candidate.projectId && generation === candidate.generation,
+    isOperationCurrent: (operation) => hostSessionId === operation.hostSessionId
+      && projectId === operation.projectId && generation === operation.hostGeneration
+      && operationGeneration === operation.generation,
   }
 }
 /** Agent 右侧 Canvas 用户动作只允许展示这些固定中文失败文案。 */

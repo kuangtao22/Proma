@@ -5,6 +5,7 @@ import {
   createRightWorkspaceSplit,
   shouldRenderRightWorkspaceSplit,
   sanitizeRightWorkspaceSplit,
+  resolveRightWorkspaceTabClose,
 } from './right-workspace-split'
 
 describe('Canvas 双 Pane', () => {
@@ -30,5 +31,20 @@ describe('Canvas 双 Pane', () => {
     expect(shouldRenderRightWorkspaceSplit(640)).toBe(false)
     expect(shouldRenderRightWorkspaceSplit(648)).toBe(true)
     expect(split).toEqual(expect.objectContaining({ leftTab: 'files', rightTab: 'canvas:canvas-1' }))
+  })
+
+  test('Given split 任一 Pane 是 Canvas When 关闭该标签 Then 先退出并排且不关闭成员', () => {
+    const leftCanvas = createRightWorkspaceSplit('canvas:canvas-1' as AgentSidePanelTab, 'files', 'right', 0.5)!
+    const rightCanvas = createRightWorkspaceSplit('files', 'canvas:canvas-1' as AgentSidePanelTab, 'right', 0.5)!
+
+    expect(resolveRightWorkspaceTabClose(leftCanvas, 'canvas:canvas-1' as AgentSidePanelTab)).toEqual({
+      kind: 'collapse',
+      activeTab: 'files',
+    })
+    expect(resolveRightWorkspaceTabClose(rightCanvas, 'canvas:canvas-1' as AgentSidePanelTab)).toEqual({
+      kind: 'collapse',
+      activeTab: 'canvas:canvas-1',
+    })
+    expect(resolveRightWorkspaceTabClose(null, 'canvas:canvas-1' as AgentSidePanelTab)).toEqual({ kind: 'close' })
   })
 })
