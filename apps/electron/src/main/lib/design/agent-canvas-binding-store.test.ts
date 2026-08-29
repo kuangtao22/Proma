@@ -291,6 +291,49 @@ describe('AgentCanvasBindingStore', () => {
     expect(writeAttempts).toBe(2)
   })
 
+  test('Given 原子写提交后 durability 抛错 When 再读取与追加 Then 从磁盘重载已提交事实', () => {
+    /** 模拟主文件当前可见内容，writer 会在抛错前先更新它。 */
+    let diskValue: unknown = {
+      version: 1,
+      bindings: [{
+        projectId: 'project-1',
+        sessionId: 'session-1',
+        defaultCanvasId: 'canvas-a',
+        linkedCanvasIds: ['canvas-a'],
+        lastActiveCanvasId: 'canvas-a',
+        updatedAt: 10,
+      }],
+    }
+    /** 原子写尝试次数，第一次模拟 rename 后 durability 不确定。 */
+    let writeAttempts = 0
+    const store = new AgentCanvasBindingStore({
+      configPath: CONFIG_PATH,
+      now: () => 20 + writeAttempts,
+      exists: () => true,
+      readFile: () => JSON.stringify(diskValue),
+      readJson: () => diskValue,
+      writeJson: (_path, value) => {
+        writeAttempts += 1
+        diskValue = JSON.parse(JSON.stringify(value)) as object
+        if (writeAttempts === 1) throw new Error('POSTCOMMIT_DURABILITY_UNCERTAIN')
+        return 'directory'
+      },
+      warn: () => undefined,
+    })
+
+    expect(() => store.link(linkInput('session-1', 'canvas-b'))).toThrow(
+      'POSTCOMMIT_DURABILITY_UNCERTAIN',
+    )
+    expect(store.get('project-1', 'session-1')?.linkedCanvasIds).toEqual([
+      'canvas-a', 'canvas-b',
+    ])
+
+    expect(store.link(linkInput('session-1', 'canvas-c')).linkedCanvasIds).toEqual([
+      'canvas-a', 'canvas-b', 'canvas-c',
+    ])
+    expect(writeAttempts).toBe(2)
+  })
+
   test.each([
     ['错误版本', { version: 2, bindings: [] }],
     ['未知字段', { version: 1, bindings: [], extra: true }],

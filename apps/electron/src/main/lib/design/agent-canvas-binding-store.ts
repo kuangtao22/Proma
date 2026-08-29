@@ -349,7 +349,13 @@ export class AgentCanvasBindingStore {
       version: AGENT_CANVAS_BINDINGS_VERSION,
       bindings,
     }
-    this.writeJson(this.configPath, file)
+    try {
+      this.writeJson(this.configPath, file)
+    } catch (error) {
+      /** rename 是否已提交不可判定，下一次访问必须回到磁盘权威事实。 */
+      this.bindings = null
+      throw error
+    }
     this.bindings = bindings
   }
 }
