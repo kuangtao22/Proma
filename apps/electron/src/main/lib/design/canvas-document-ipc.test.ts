@@ -200,6 +200,8 @@ function createContext(options: {
   imageJobsList?: (projectId: string) => DesignJobRecord[]
   imageTargetAssert?: (projectId: string, target: Omit<CanvasImageTarget, 'projectId'>) => Promise<void>
   batchReconcile?: () => Promise<void>
+  batchReconcileError?: Error
+  batchPublications?: CanvasDocument[]
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -282,7 +284,12 @@ function createContext(options: {
       reconcileLocked: async () => {
         calls.push('batch:reconcile')
         await options.batchReconcile?.()
-        return { document: options.loadResult?.document ?? createDocument(4), operationId: '', publications: [] }
+        if (options.batchReconcileError) throw options.batchReconcileError
+        return {
+          document: options.loadResult?.document ?? createDocument(4),
+          operationId: '',
+          publications: options.batchPublications ?? [],
+        }
       },
     },
     creation: {
@@ -527,6 +534,73 @@ describe('原生 Canvas 文档 IPC', () => {
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile', 'store:mutate',
     ])
+  })
+
+  test('Given 单节点图变更 When 执行 Then 同一 lease 内先通过 batch 恢复屏障', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-1', kind: 'agent', title: '首页 Agent', position: { x: 0, y: 0 },
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+    }]
+    const context = createContext({ loadResult: { document, writable: true, nodeIssues: [] } })
+
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'document-1', kind: 'document', contentId: 'content-1', title: '文档',
+      position: { x: 0, y: 0 }, expectedRevision: 4,
+    })
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', operationId: '22222222-2222-4222-8222-222222222222',
+      nodeId: 'agent-2', title: '新 Agent', position: { x: 10, y: 20 },
+    })
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', operationId: '33333333-3333-4333-8333-333333333333',
+      nodeId: 'node-1',
+    })
+
+    expect(context.calls).toEqual([
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile', 'content:create',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:create',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile', 'creation:rebuild',
+    ])
+  })
+
+  test('Given batch 恢复失败 When 单节点图变更 Then 当前 mutation 零副作用', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const context = createContext({ batchReconcileError: new Error('CANVAS_BATCH_RECOVERY_REQUIRED') })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', operationId: '44444444-4444-4444-8444-444444444444',
+      nodeId: 'document-1', kind: 'document', contentId: 'content-1', title: '文档',
+      position: { x: 0, y: 0 }, expectedRevision: 4,
+    }) as CanvasInvokeResult<unknown>
+
+    expect(result.ok).toBe(false)
+    expect(context.calls).toEqual(['readonly:project-1', 'guard:project-1', 'batch:reconcile'])
+    expect(context.sender.sent).toEqual([])
+    errorSpy.mockRestore()
+  })
+
+  test('Given batch 恢复与当前内容创建都提交图 When lease 释放 Then 按 revision 顺序广播', async () => {
+    const context = createContext({
+      batchPublications: [createDocument(5)],
+      contentResultFactory: (selectedNodeId) => ({
+        snapshot: { document: createDocument(6), writable: true, nodeIssues: [] },
+        ...(selectedNodeId ? { selectedNodeId } : {}),
+      }),
+    })
+
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', operationId: '55555555-5555-4555-8555-555555555555',
+      nodeId: 'document-1', kind: 'document', contentId: 'content-1', title: '文档',
+      position: { x: 0, y: 0 }, expectedRevision: 5,
+    })
+
+    expect(context.sender.sent).toEqual([
+      { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' } },
+      { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph' } },
+    ])
+    expect(context.broadcastLeaseStates).toEqual([false, false])
   })
 
   test('Given 共享 serializer When 同 Canvas 与不同 Canvas 并发 Then 仅同 Canvas 等待', async () => {
@@ -1740,6 +1814,7 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.calls).toEqual([
       'readonly:project-1',
       'guard:project-1',
+      'batch:reconcile',
       'creation:reconcile',
       'creation:rebuild',
     ])
@@ -1800,6 +1875,7 @@ describe('原生 Canvas 文档 IPC', () => {
     })
     expect(sent).toEqual({ ok: true, value: { ok: true } })
     expect(stopped).toEqual({ ok: true, value: undefined })
+    expect(context.calls.filter((call) => call === 'batch:reconcile')).toHaveLength(3)
     expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(3)
     /** 从真实运行记录中读取系统追加项，避免非对称 matcher 影响后续序列化断言。 */
     const runCall = context.agentCalls.find((call) => call.type === 'run')
@@ -2151,7 +2227,7 @@ describe('原生 Canvas 文档 IPC', () => {
     ) as CanvasInvokeResult<CanvasAgentNodeCreationResult>
 
     expect(context.calls).toEqual([
-      'readonly:project-1', 'guard:project-1', 'creation:create',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:create',
     ])
     expect(context.storeInputs[0]).toEqual(input)
     expect(context.storeInputs[0]).not.toBe(input)
@@ -2412,7 +2488,7 @@ describe('原生 Canvas 文档 IPC', () => {
       value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph' },
     }])
     expect(context.calls).toEqual([
-      'readonly:project-1', 'guard:project-1', 'creation:create',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:create',
     ])
     expect(context.broadcastLeaseStates).toEqual([false])
     errorSpy.mockRestore()

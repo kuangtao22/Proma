@@ -60,6 +60,12 @@ export interface CanvasDocumentStore {
     expectedRevision: number,
     operations: unknown[],
   ) => CanvasMutation[]
+  /** 在同一权威基线上规范化 mutation，并计算不推进 revision 的最终图事实。 */
+  planBatchOperations: (
+    target: CanvasTarget,
+    expectedRevision: number,
+    operations: unknown[],
+  ) => CanvasBatchOperationPlan
   /** 在权威 revision 上应用并提交一批 mutation。 */
   mutate: (
     target: CanvasTarget,
@@ -67,6 +73,13 @@ export interface CanvasDocumentStore {
     mutations: CanvasMutation[],
     validateCurrent?: (document: CanvasDocument) => void,
   ) => CanvasDocument
+}
+
+/** Agent batch 在资源副作用前使用的权威纯规划结果。 */
+export interface CanvasBatchOperationPlan {
+  baseDocument: CanvasDocument
+  operations: CanvasMutation[]
+  expectedDocument: CanvasDocument
 }
 
 /** 主进程私有的旧内容迁移能力，不进入共享合同或 IPC。 */
@@ -1320,7 +1333,28 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     return loaded.snapshot.document
   }
 
-  /** 只验证并深拷贝 mutation，不产生 revision 或磁盘副作用。 */
+  /** 验证并计算最终图事实，不产生 revision 或磁盘副作用。 */
+  function planBatchOperations(
+    target: CanvasTarget,
+    expectedRevision: number,
+    operations: unknown[],
+  ): CanvasBatchOperationPlan {
+    const current = requireStableAuthoritativeDocument(target)
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== current.revision) {
+      throw new Error(
+        `CANVAS_REVISION_CONFLICT: expected=${expectedRevision}, current=${current.revision}`,
+      )
+    }
+    validateCanvasMutations(current, operations)
+    const normalized = structuredClone(operations) as CanvasMutation[]
+    return {
+      baseDocument: structuredClone(current),
+      operations: normalized,
+      expectedDocument: applyCanvasMutations(current, normalized),
+    }
+  }
+
+  /** 兼容只需要规范 mutation 的调用方，避免额外执行最终图 reducer。 */
   function validateBatchOperations(
     target: CanvasTarget,
     expectedRevision: number,
@@ -1415,5 +1449,5 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     return next
   }
 
-  return { load, loadWithDirectoryCapability, loadWithMigrationCapability, requireStableAuthoritativeDocument, validateBatchOperations, mutate }
+  return { load, loadWithDirectoryCapability, loadWithMigrationCapability, requireStableAuthoritativeDocument, validateBatchOperations, planBatchOperations, mutate }
 }

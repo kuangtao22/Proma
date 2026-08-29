@@ -1,4 +1,4 @@
-import { randomUUID as createRandomUUID } from 'node:crypto'
+import { createHash, randomUUID as createRandomUUID } from 'node:crypto'
 import type {
   CanvasBatchOperationEnvelope,
   CanvasDocument,
@@ -44,6 +44,7 @@ export interface CanvasBatchOperationIntent {
   source: { sessionId: string; runStartedAt: number; toolCallId: string }
   state: CanvasBatchOperationState
   preparedResources: CanvasBatchPreparedResource[]
+  expectedGraphSha256: string
   operations: CanvasMutation[]
 }
 
@@ -51,7 +52,7 @@ export interface CanvasAgentBatchOperationDependencies {
   store: {
     load: (target: CanvasTarget) => CanvasWorkspaceSnapshot
     loadWithDirectoryCapability?: CanvasDocumentStore['loadWithDirectoryCapability']
-    validateBatchOperations: CanvasDocumentStore['validateBatchOperations']
+    planBatchOperations: CanvasDocumentStore['planBatchOperations']
     mutate: (target: CanvasTarget, expectedRevision: number, operations: CanvasMutation[]) => CanvasDocument | Promise<CanvasDocument>
   }
   /** 由 IPC 注入的唯一按 Canvas 串行与 workspace write lease 边界。 */
@@ -82,7 +83,7 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
 function parseIntent(value: unknown, target: CanvasTarget, operationId: string): CanvasBatchOperationIntent {
   const validStates: CanvasBatchOperationState[] = ['prepared', 'resources-created', 'cleanup-pending', 'rolled-back', 'committed']
   if (!isRecord(value)
-    || !hasExactKeys(value, ['schemaVersion', 'operationId', 'target', 'baseRevision', 'source', 'state', 'preparedResources', 'operations'])
+    || !hasExactKeys(value, ['schemaVersion', 'operationId', 'target', 'baseRevision', 'source', 'state', 'preparedResources', 'expectedGraphSha256', 'operations'])
     || value.schemaVersion !== 1 || value.operationId !== operationId
     || !isRecord(value.target) || !hasExactKeys(value.target, ['projectId', 'canvasId'])
     || value.target.projectId !== target.projectId || value.target.canvasId !== target.canvasId
@@ -92,6 +93,7 @@ function parseIntent(value: unknown, target: CanvasTarget, operationId: string):
     || typeof value.source.toolCallId !== 'string' || value.source.toolCallId.length === 0
     || !Number.isSafeInteger(value.source.runStartedAt) || (value.source.runStartedAt as number) < 0
     || !validStates.includes(value.state as CanvasBatchOperationState)
+    || typeof value.expectedGraphSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.expectedGraphSha256)
     || !Array.isArray(value.preparedResources) || !Array.isArray(value.operations)) {
     throw new Error('CANVAS_BATCH_INTENT_INVALID')
   }
@@ -134,6 +136,7 @@ function parseIntent(value: unknown, target: CanvasTarget, operationId: string):
     source: { sessionId: value.source.sessionId, runStartedAt: value.source.runStartedAt as number, toolCallId: value.source.toolCallId },
     state: value.state as CanvasBatchOperationState,
     preparedResources: resources,
+    expectedGraphSha256: value.expectedGraphSha256,
     operations: structuredClone(value.operations) as CanvasMutation[],
   }
 }
@@ -164,55 +167,91 @@ export class CanvasBatchRecoveryRequiredError extends Error {
   }
 }
 
-/** 从规范 mutation 单次收集需要预备的外部资源。 */
-function collectResources(
+/** 计算不含 revision 与时间字段的精确最终图事实。 */
+function createGraphSha256(document: CanvasDocument): string {
+  return createHash('sha256').update(JSON.stringify({
+    viewport: document.viewport,
+    nodes: document.nodes,
+    edges: document.edges,
+  })).digest('hex')
+}
+
+/** 返回节点绑定的外部资源身份；纯图节点没有资源。 */
+function getNodeResourceIdentity(node: CanvasNode): string | null {
+  if (node.kind === 'agent') return `agent:${node.agentSessionId}`
+  if (node.kind === 'image') return `image:${node.imageModuleId}`
+  if (node.kind === 'document') return `document:${node.documentId}`
+  if (node.kind === 'webview') return `webview:${node.prototypeId}`
+  return null
+}
+
+/** 拒绝资源所有权无法用单一净差异安全表达的节点身份变换。 */
+function assertSupportedNodeTransitions(
   operations: CanvasMutation[],
-  document: CanvasDocument,
+  baseDocument: CanvasDocument,
+  expectedDocument: CanvasDocument,
+): void {
+  const removedNodeIds = new Set<string>()
+  for (const operation of operations) {
+    if (operation.type === 'remove-nodes') {
+      for (const nodeId of operation.nodeIds) removedNodeIds.add(nodeId)
+      continue
+    }
+    if (operation.type !== 'upsert-nodes') continue
+    for (const node of operation.nodes) {
+      if (removedNodeIds.has(node.id)) throw new Error('CANVAS_BATCH_REMOVE_RECREATE_UNSUPPORTED')
+    }
+  }
+  const finalNodes = new Map(expectedDocument.nodes.map((node) => [node.id, node]))
+  for (const baseNode of baseDocument.nodes) {
+    const finalNode = finalNodes.get(baseNode.id)
+    if (finalNode && getNodeResourceIdentity(baseNode) !== getNodeResourceIdentity(finalNode)) {
+      throw new Error('CANVAS_BATCH_NODE_IDENTITY_REPLACEMENT_UNSUPPORTED')
+    }
+  }
+}
+
+/** 按基线到最终图的净差异收集需要预备的外部资源。 */
+function collectResources(
+  baseDocument: CanvasDocument,
+  expectedDocument: CanvasDocument,
   randomUUID: () => string,
   now: () => number,
 ): CanvasBatchPreparedResource[] {
   const resources: CanvasBatchPreparedResource[] = []
-  const existingNodes = new Map(document.nodes.map((node) => [node.id, node]))
-  const deletionNodeIds = new Set<string>()
-  for (const operation of operations) {
-    if (operation.type !== 'upsert-nodes') continue
-    for (const node of operation.nodes) {
-      const base = { nodeId: node.id, state: 'pending' as const, createdByOperation: null, trashEntry: null }
-      if (node.kind === 'agent') resources.push({ ...base, kind: 'agent-session', resourceId: node.agentSessionId })
-      if (node.kind === 'image') resources.push({ ...base, kind: 'content-directory', resourceId: node.imageModuleId })
-      if (node.kind === 'document') resources.push({ ...base, kind: 'content-directory', resourceId: node.documentId })
-      if (node.kind === 'webview') resources.push({ ...base, kind: 'content-directory', resourceId: node.prototypeId })
-    }
+  const baseNodes = new Map(baseDocument.nodes.map((node) => [node.id, node]))
+  const finalNodes = new Map(expectedDocument.nodes.map((node) => [node.id, node]))
+  for (const node of expectedDocument.nodes) {
+    if (baseNodes.has(node.id)) continue
+    const base = { nodeId: node.id, state: 'pending' as const, createdByOperation: null, trashEntry: null }
+    if (node.kind === 'agent') resources.push({ ...base, kind: 'agent-session', resourceId: node.agentSessionId })
+    if (node.kind === 'image') resources.push({ ...base, kind: 'content-directory', resourceId: node.imageModuleId })
+    if (node.kind === 'document') resources.push({ ...base, kind: 'content-directory', resourceId: node.documentId })
+    if (node.kind === 'webview') resources.push({ ...base, kind: 'content-directory', resourceId: node.prototypeId })
   }
-  for (const operation of operations) {
-    if (operation.type !== 'remove-nodes') continue
-    for (const nodeId of operation.nodeIds) {
-      if (deletionNodeIds.has(nodeId)) continue
-      deletionNodeIds.add(nodeId)
-      const node = existingNodes.get(nodeId)
-      if (!node || node.kind === 'agent') continue
-      const contentId = node.kind === 'image' ? node.imageModuleId
-        : node.kind === 'document' ? node.documentId : node.prototypeId
-      const entry = parseCanvasTrashEntry({
-        schemaVersion: 1,
-        trashId: randomUUID(),
-        nodeId: node.id,
-        kind: node.kind,
-        contentId,
-        title: node.title,
-        position: node.position,
-        deletedRevision: document.revision,
-        deletedAt: now(),
-      })
-      resources.push({
-        nodeId: node.id,
-        kind: 'content-trash',
-        resourceId: contentId,
-        state: 'pending',
-        createdByOperation: null,
-        trashEntry: entry,
-      })
-    }
+  for (const node of baseDocument.nodes) {
+    if (finalNodes.has(node.id) || node.kind === 'agent') continue
+    const contentId = node.kind === 'image' ? node.imageModuleId
+      : node.kind === 'document' ? node.documentId : node.prototypeId
+    const entry = parseCanvasTrashEntry({
+      schemaVersion: 1,
+      trashId: randomUUID(),
+      nodeId: node.id,
+      kind: node.kind,
+      contentId,
+      title: node.title,
+      position: node.position,
+      deletedRevision: baseDocument.revision,
+      deletedAt: now(),
+    })
+    resources.push({
+      nodeId: node.id,
+      kind: 'content-trash',
+      resourceId: contentId,
+      state: 'pending',
+      createdByOperation: null,
+      trashEntry: entry,
+    })
   }
   return resources
 }
@@ -233,33 +272,6 @@ function contentInput(node: CanvasNode) {
   if (node.kind === 'document') return { kind: node.kind, contentId: node.documentId }
   if (node.kind === 'webview') return { kind: node.kind, contentId: node.prototypeId }
   throw new Error('CANVAS_BATCH_OPERATION_INVALID')
-}
-
-/** 用预建索引判断当前图是否反映批次的最终事实。 */
-function documentReflectsOperations(document: CanvasDocument, operations: CanvasMutation[]): boolean {
-  const nodes = new Map(document.nodes.map((node) => [node.id, node]))
-  const edges = new Map(document.edges.map((edge) => [edge.id, edge]))
-  for (const operation of operations) {
-    if (operation.type === 'set-viewport' && JSON.stringify(document.viewport) !== JSON.stringify(operation.viewport)) return false
-    if (operation.type === 'move-nodes') {
-      for (const moved of operation.positions) {
-        if (JSON.stringify(nodes.get(moved.nodeId)?.position) !== JSON.stringify(moved.position)) return false
-      }
-    }
-    if (operation.type === 'upsert-nodes') {
-      for (const node of operation.nodes) if (JSON.stringify(nodes.get(node.id)) !== JSON.stringify(node)) return false
-    }
-    if (operation.type === 'remove-nodes') {
-      for (const nodeId of operation.nodeIds) if (nodes.has(nodeId)) return false
-    }
-    if (operation.type === 'upsert-edges') {
-      for (const edge of operation.edges) if (JSON.stringify(edges.get(edge.id)) !== JSON.stringify(edge)) return false
-    }
-    if (operation.type === 'remove-edges') {
-      for (const edgeId of operation.edgeIds) if (edges.has(edgeId)) return false
-    }
-  }
-  return true
 }
 
 /** 创建只负责持久事务逻辑、由外部共享串行器调度的批量服务。 */
@@ -426,13 +438,16 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
         document = await dependencies.store.mutate(intent.target, intent.baseRevision, intent.operations)
       } catch (error) {
         const reloaded = dependencies.store.load(intent.target).document
-        if (reloaded.revision !== intent.baseRevision + 1 || !documentReflectsOperations(reloaded, intent.operations)) {
+        if (reloaded.revision === intent.baseRevision) {
           await cleanup(intent)
           throw error
         }
+        if (reloaded.revision !== intent.baseRevision + 1 || createGraphSha256(reloaded) !== intent.expectedGraphSha256) {
+          throw new CanvasBatchRecoveryRequiredError('CANVAS_BATCH_GRAPH_FACT_CONFLICT', { cause: error })
+        }
         document = reloaded
       }
-    } else if (document.revision !== intent.baseRevision + 1 || !documentReflectsOperations(document, intent.operations)) {
+    } else if (document.revision !== intent.baseRevision + 1 || createGraphSha256(document) !== intent.expectedGraphSha256) {
       throw new CanvasBatchRecoveryRequiredError('CANVAS_BATCH_GRAPH_FACT_CONFLICT')
     }
     try {
@@ -471,6 +486,8 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
       throw new Error('CANVAS_BATCH_OPERATION_LIMIT_EXCEEDED')
     }
     const target = { projectId: envelope.projectId, canvasId: envelope.canvasId }
+    /** 任何新请求先收敛全部旧 intent，禁止并存第二个未决事务。 */
+    await reconcileLocked(target)
     const existing = (await scan(target)).find((intent) => intent.source.toolCallId === envelope.sourceToolCallId)
     if (existing) {
       if (existing.source.sessionId !== envelope.sourceSessionId || existing.source.runStartedAt !== envelope.sourceRunStartedAt
@@ -478,12 +495,11 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
         throw new Error('CANVAS_BATCH_OPERATION_CONFLICT')
       }
       if (existing.state === 'rolled-back') throw new Error('CANVAS_BATCH_OPERATION_ROLLED_BACK')
-      await reconcileLocked(target)
       return { document: dependencies.store.load(target).document, operationId: existing.operationId }
     }
-    const operations = dependencies.store.validateBatchOperations(target, envelope.baseRevision, envelope.operations)
-    const document = dependencies.store.load(target).document
-    assertRemovalsAllowed(document, operations)
+    const plan = dependencies.store.planBatchOperations(target, envelope.baseRevision, envelope.operations)
+    assertSupportedNodeTransitions(plan.operations, plan.baseDocument, plan.expectedDocument)
+    assertRemovalsAllowed(plan.baseDocument, plan.operations)
     let intent: CanvasBatchOperationIntent = {
       schemaVersion: 1,
       operationId: randomUUID(),
@@ -491,8 +507,9 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
       baseRevision: envelope.baseRevision,
       source: { sessionId: envelope.sourceSessionId, runStartedAt: envelope.sourceRunStartedAt, toolCallId: envelope.sourceToolCallId },
       state: 'prepared',
-      preparedResources: collectResources(operations, document, randomUUID, now),
-      operations,
+      preparedResources: collectResources(plan.baseDocument, plan.expectedDocument, randomUUID, now),
+      expectedGraphSha256: createGraphSha256(plan.expectedDocument),
+      operations: plan.operations,
     }
     await write(intent)
     intent = await prepareResources(intent)

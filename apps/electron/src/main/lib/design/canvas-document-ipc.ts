@@ -1287,6 +1287,17 @@ export function registerCanvasDocumentIpcHandlers(
     }
   }
 
+  /** 批处理恢复产生的历史图事实必须先于当前 operation 发布。 */
+  const publishBatchReconciliation = (
+    target: { projectId: string; canvasId: string },
+    published: Set<string>,
+    reconciliation: CanvasBatchReconciliationResult,
+  ): void => {
+    for (const publication of reconciliation.publications) {
+      publishUniqueChange(target, published, publication.revision, 'graph')
+    }
+  }
+
   /** 在同一 Canvas 队列与 workspace lease 内串接 Agent 对账和内容生命周期。 */
   const runContentLifecycle = async <T>(
     input: LoadCanvasInput,
@@ -1295,13 +1306,15 @@ export function registerCanvasDocumentIpcHandlers(
     getSuccessfulDocument?: (value: T) => CanvasDocument | undefined,
   ): Promise<T> => runCanvasExclusive(input.projectId, input.canvasId, async () => {
     const outcome = await options.guard.runWorkspaceWrite(input.projectId, async () => {
-      /** Agent intent 先收敛，内容 wrapper 自身随后只扫描一次 content intent。 */
+      /** batch、Agent intent 依次收敛，内容 wrapper 自身随后只扫描一次 content intent。 */
+      const batchReconciliation = await options.batch.reconcileLocked(input)
       const agentReconciliation = await options.creation.reconcile(input)
-      if (agentReconciliation.error) return { agentReconciliation }
-      return { agentReconciliation, content: await effect() }
+      if (agentReconciliation.error) return { batchReconciliation, agentReconciliation }
+      return { batchReconciliation, agentReconciliation, content: await effect() }
     })
     /** 所有广播必须发生在 workspace lease 释放后。 */
     const published = new Set<string>()
+    publishBatchReconciliation(input, published, outcome.batchReconciliation)
     publishUniqueReconciliation(input, published, outcome.agentReconciliation)
     if (outcome.agentReconciliation.error) throw outcome.agentReconciliation.error
     if (!outcome.content) throw new Error('CANVAS_CONTENT_LIFECYCLE_MISSING')
@@ -1527,12 +1540,18 @@ export function registerCanvasDocumentIpcHandlers(
   ) => {
     requireWritableProject(input.projectId, options)
     return runCanvasExclusive(input.projectId, input.canvasId, async () => {
-      /** 对账快照是节点可用性与 session 归属的唯一事实。 */
-      const reconciliation = await options.guard.runWorkspaceWrite(
-        input.projectId,
-        () => options.creation.reconcile({ projectId: input.projectId, canvasId: input.canvasId }),
-      )
-      publishReconciliation(options, input, reconciliation)
+      /** batch 屏障先于可能写图的 Agent intent 对账。 */
+      const guarded = await options.guard.runWorkspaceWrite(input.projectId, async () => ({
+        batch: await options.batch.reconcileLocked(input),
+        reconciliation: await options.creation.reconcile({
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+        }),
+      }))
+      const published = new Set<string>()
+      publishBatchReconciliation(input, published, guarded.batch)
+      publishUniqueReconciliation(input, published, guarded.reconciliation)
+      const reconciliation = guarded.reconciliation
       if (reconciliation.error) throw reconciliation.error
       /** 坏节点在读取 session JSONL 或触发 runtime 前必须短路。 */
       const unavailable = reconciliation.snapshot.nodeIssues.some((issue) => issue.nodeId === input.nodeId)
@@ -1790,32 +1809,29 @@ export function registerCanvasDocumentIpcHandlers(
       requireWritableProject(input.projectId, options)
       /** 创建服务内部不加锁，整个事务只持有这一份 workspace write lease。 */
       return runCanvasExclusive(input.projectId, input.canvasId, async () => {
-        /** 创建结果保留对账发布事实，内部 intent 不跨 IPC。 */
-        const outcome = await options.guard.runWorkspaceWrite(
-          input.projectId,
-          () => options.creation.createReconciled(input),
-        )
-        publishReconciliation(options, input, outcome.reconciliation)
-        if (!outcome.operationOutcome.ok) {
-          if (outcome.operationOutcome.publication) {
-            broadcastChange(options, {
-              projectId: input.projectId,
-              canvasId: input.canvasId,
-              revision: outcome.operationOutcome.publication.revision,
-              cause: 'graph',
-            })
+        /** batch 屏障与创建事务共用 lease，内部 intent 不跨 IPC。 */
+        const guarded = await options.guard.runWorkspaceWrite(input.projectId, async () => ({
+          batch: await options.batch.reconcileLocked(input),
+          outcome: await options.creation.createReconciled(input),
+        }))
+        const published = new Set<string>()
+        publishBatchReconciliation(input, published, guarded.batch)
+        publishUniqueReconciliation(input, published, guarded.outcome.reconciliation)
+        if (!guarded.outcome.operationOutcome.ok) {
+          if (guarded.outcome.operationOutcome.publication) {
+            publishUniqueChange(
+              input,
+              published,
+              guarded.outcome.operationOutcome.publication.revision,
+              'graph',
+            )
           }
-          throw outcome.operationOutcome.error
+          throw guarded.outcome.operationOutcome.error
         }
         /** 成功结果只公开文档与新会话最小元数据。 */
-        const result = outcome.operationOutcome.value
+        const result = guarded.outcome.operationOutcome.value
         if (result.documentChanged) {
-          broadcastChange(options, {
-            projectId: input.projectId,
-            canvasId: input.canvasId,
-            revision: result.document.revision,
-            cause: 'graph',
-          })
+          publishUniqueChange(input, published, result.document.revision, 'graph')
         }
         /** documentChanged 属于主进程发布策略，不暴露给 Renderer。 */
         return { document: result.document, session: result.session }
@@ -1832,16 +1848,20 @@ export function registerCanvasDocumentIpcHandlers(
       /** 重建与同 Canvas 的 LOAD/SAVE/CREATE 共用串行键，避免节点换绑竞态。 */
       return runCanvasExclusive(input.projectId, input.canvasId, async () => {
         /** 先对账并检查旧 session 运行态，再进入可恢复重建事务。 */
-        const outcome = await options.guard.runWorkspaceWrite(
+        const guarded = await options.guard.runWorkspaceWrite(
           input.projectId,
-          async (): Promise<ReconciledOperationOutcome<Awaited<ReturnType<CanvasAgentNodeCreationService['rebuildReconciled']>>>> => {
+          async (): Promise<{
+            batch: CanvasBatchReconciliationResult
+            outcome: ReconciledOperationOutcome<Awaited<ReturnType<CanvasAgentNodeCreationService['rebuildReconciled']>>>
+          }> => {
+            const batch = await options.batch.reconcileLocked(input)
             /** 首次对账提供当前节点和旧 session 的权威事实。 */
             const reconciliation = await options.creation.reconcile({
               projectId: input.projectId,
               canvasId: input.canvasId,
             })
             if (reconciliation.error) {
-              return { ok: false, error: reconciliation.error, reconciliation }
+              return { batch, outcome: { ok: false, error: reconciliation.error, reconciliation } }
             }
             try {
               /** 重建只允许目标仍是 Agent 节点，服务层还会再次做纵深校验。 */
@@ -1861,18 +1881,21 @@ export function registerCanvasDocumentIpcHandlers(
               }
               /** 服务在同一 lease 内完成 prepared 到 committed 的可恢复事务。 */
               const result = await options.creation.rebuildReconciled(input)
-              return { ok: true, value: result, reconciliation }
+              return { batch, outcome: { ok: true, value: result, reconciliation } }
             } catch (error) {
-              return { ok: false, error, reconciliation }
+              return { batch, outcome: { ok: false, error, reconciliation } }
             }
           },
         )
+        const published = new Set<string>()
+        publishBatchReconciliation(input, published, guarded.batch)
+        const outcome = guarded.outcome
         if (!outcome.ok) {
-          publishReconciliation(options, input, outcome.reconciliation)
+          publishUniqueReconciliation(input, published, outcome.reconciliation)
           throw outcome.error
         }
         /** 成功时按最终快照发布，recovery 仍优先于普通 graph 事件。 */
-        publishReconciliation(options, input, {
+        publishUniqueReconciliation(input, published, {
           snapshot: outcome.value.snapshot,
           documentChanged: outcome.value.documentChanged,
         })

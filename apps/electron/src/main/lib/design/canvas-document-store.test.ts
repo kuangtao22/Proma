@@ -1208,6 +1208,32 @@ describe('CanvasDocumentStore', () => {
     )).toThrow('CANVAS_MUTATION_INVALID')
   })
 
+  test('Given 顺序 batch mutation When 规划 Then 返回同一基线上的最终文档且不写盘', () => {
+    const fixture = createFixture()
+    const operations: CanvasMutation[] = [
+      { type: 'set-viewport', viewport: { x: 1, y: 1, zoom: 1 } },
+      { type: 'set-viewport', viewport: { x: 9, y: 8, zoom: 2 } },
+      { type: 'upsert-nodes', nodes: [{
+        id: 'planned-agent', kind: 'agent', title: '规划节点', position: { x: 0, y: 0 },
+        agentSessionId: 'planned-session',
+      }] },
+      { type: 'move-nodes', positions: [{ nodeId: 'planned-agent', position: { x: 50, y: 60 } }] },
+      { type: 'remove-nodes', nodeIds: ['planned-agent'] },
+    ]
+
+    const plan = fixture.store.planBatchOperations(
+      { projectId: 'project-1', canvasId: 'canvas-1' }, 0, operations,
+    )
+
+    expect(plan.baseDocument.revision).toBe(0)
+    expect(plan.operations).toEqual(operations)
+    expect(plan.operations).not.toBe(operations)
+    expect(plan.expectedDocument.revision).toBe(0)
+    expect(plan.expectedDocument.viewport).toEqual({ x: 9, y: 8, zoom: 2 })
+    expect(plan.expectedDocument.nodes).toEqual([])
+    expect(existsSync(fixture.documentPath)).toBe(false)
+  })
+
   test('Given move-nodes 指向当前不存在节点 When mutate Then reducer 和完整校验前拒绝', () => {
     /** 结果 validator 与写边界都不得触达。 */
     let validationCalls = 0

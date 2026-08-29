@@ -37,9 +37,14 @@ function createFixture(options: {
   const tails = new Map<string, Promise<void>>()
   const store = {
     load: () => ({ document, writable: true as const, nodeIssues: [] }),
-    validateBatchOperations: (_target: object, baseRevision: number, operations: unknown[]) => {
+    planBatchOperations: (_target: object, baseRevision: number, operations: unknown[]) => {
       if (baseRevision !== document.revision) throw new Error('CANVAS_REVISION_CONFLICT')
-      return structuredClone(operations) as CanvasMutation[]
+      const normalized = structuredClone(operations) as CanvasMutation[]
+      return {
+        baseDocument: structuredClone(document),
+        operations: normalized,
+        expectedDocument: applyCanvasMutations(document, normalized),
+      }
     },
     mutate: async (_target: object, baseRevision: number, operations: CanvasMutation[]) => {
       if (baseRevision !== document.revision) throw new Error('CANVAS_REVISION_CONFLICT')
@@ -263,6 +268,86 @@ describe('CanvasAgentBatchOperationService', () => {
     expect(result.document.revision).toBe(8)
     expect(fixture.getMutateCalls()).toBe(1)
     expect([...fixture.intents.values()][0]?.state).toBe('committed')
+  })
+
+  test('Given 旧 resources-created intent When 新 tool call 执行 Then 先收敛旧批次再创建新 intent', async () => {
+    const fixture = createFixture({ uncertainState: 'resources-created' })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_RECOVERY_REQUIRED')
+    const result = await fixture.service.execute({
+      ...batch(),
+      baseRevision: 8,
+      sourceToolCallId: 'tool-call-after-recovery',
+      operations: [{ type: 'set-viewport', viewport: { x: 20, y: 30, zoom: 1.5 } }],
+    })
+    expect(result.document.revision).toBe(9)
+    expect(fixture.getMutateCalls()).toBe(2)
+    expect([...fixture.intents.values()].map((intent) => intent.state)).toEqual(['committed', 'committed'])
+  })
+
+  test('Given 顺序 mutation 中间事实被后续覆盖 When mutate 提交后报不确定 Then 只按最终事实确认提交', async () => {
+    const fixture = createFixture({ mutateReturnsUncertain: true })
+    const result = await fixture.service.execute({
+      ...batch(),
+      operations: [
+        { type: 'set-viewport', viewport: { x: 1, y: 1, zoom: 1 } },
+        { type: 'set-viewport', viewport: { x: 9, y: 8, zoom: 2 } },
+        { type: 'upsert-nodes', nodes: [
+          { id: 'agent-sequential', kind: 'agent', title: '顺序节点', position: { x: 0, y: 0 }, agentSessionId: 'session-sequential' },
+        ] },
+        { type: 'move-nodes', positions: [{ nodeId: 'agent-sequential', position: { x: 50, y: 60 } }] },
+        { type: 'upsert-edges', edges: [
+          { id: 'edge-self', sourceNodeId: 'agent-sequential', sourcePort: 'output', targetNodeId: 'agent-sequential', targetPort: 'input' },
+        ] },
+        { type: 'remove-edges', edgeIds: ['edge-self'] },
+      ],
+    })
+    expect(result.document.revision).toBe(8)
+    expect(result.document.viewport).toEqual({ x: 9, y: 8, zoom: 2 })
+    expect(result.document.nodes[0]?.position).toEqual({ x: 50, y: 60 })
+    expect(result.document.edges).toEqual([])
+    expect(fixture.sessions.has('session-sequential')).toBe(true)
+  })
+
+  test.each([
+    ['image', { id: 'net-image', kind: 'image', title: '图片', position: { x: 0, y: 0 }, imageModuleId: 'net-image-content' }],
+    ['document', { id: 'net-document', kind: 'document', title: '文档', position: { x: 0, y: 0 }, documentId: 'net-document-content', contentRevision: 0 }],
+    ['webview', { id: 'net-webview', kind: 'webview', title: '原型', position: { x: 0, y: 0 }, prototypeId: 'net-webview-content', contentRevision: 0 }],
+    ['agent', { id: 'net-agent', kind: 'agent', title: 'Agent', position: { x: 0, y: 0 }, agentSessionId: 'net-agent-session' }],
+  ] as const)('Given %s 节点同批 create→remove When 提交 Then 不创建孤立资源', async (_kind, node) => {
+    const fixture = createFixture()
+    const result = await fixture.service.execute({
+      ...batch(),
+      operations: [
+        { type: 'upsert-nodes', nodes: [node] },
+        { type: 'remove-nodes', nodeIds: [node.id] },
+      ],
+    })
+    expect(result.document.nodes).toEqual([])
+    expect(fixture.contents.size).toBe(0)
+    expect(fixture.trash.size).toBe(0)
+    expect(fixture.sessions.size).toBe(0)
+  })
+
+  test('Given 已有内容节点 remove→recreate 同 ID When 规划资源 Then 在副作用前明确拒绝', async () => {
+    const fixture = createFixture()
+    fixture.getDocument().nodes.push({
+      id: 'recreate-doc', kind: 'document', title: '旧文档', position: { x: 0, y: 0 },
+      documentId: 'recreate-content', contentRevision: 0,
+    })
+    fixture.contents.add('recreate-content')
+    await expect(fixture.service.execute({
+      ...batch(),
+      operations: [
+        { type: 'remove-nodes', nodeIds: ['recreate-doc'] },
+        { type: 'upsert-nodes', nodes: [{
+          id: 'recreate-doc', kind: 'document', title: '新文档', position: { x: 1, y: 1 },
+          documentId: 'recreate-content', contentRevision: 0,
+        }] },
+      ],
+    })).rejects.toThrow('CANVAS_BATCH_REMOVE_RECREATE_UNSUPPORTED')
+    expect(fixture.intents.size).toBe(0)
+    expect(fixture.trash.size).toBe(0)
+    expect(fixture.contents.has('recreate-content')).toBe(true)
   })
 
   test('Given 三类内容节点 When 批量删除 Then 单次图提交且内容全部进入 trash', async () => {
