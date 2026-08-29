@@ -88,6 +88,7 @@ function createState(overrides: Partial<CanvasImageModuleViewState> = {}): Canva
       nodeId: 'node-1',
       imageModuleId: 'module-1',
     },
+    mediaLeaseId: 'lease-module-1',
     config: {
       schemaVersion: 2,
       kind: 'image',

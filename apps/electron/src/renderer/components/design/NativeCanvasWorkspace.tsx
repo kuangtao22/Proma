@@ -1940,8 +1940,8 @@ export function NativeCanvasWorkspace({
   const fallbackState = React.useMemo(createInitialNativeCanvasState, [stateKey])
   const state = states.get(stateKey) ?? fallbackState
   /** 工作区快照只建立一次素材预览索引，所有折叠卡片共享且不触发图片模块 LOAD。 */
-  const imagePreviewUrls = React.useMemo(() => new Map(
-    (state.snapshot?.imagePreviews ?? []).map((preview) => [preview.assetId, preview.previewUrl]),
+  const imagePreviews = React.useMemo(() => new Map(
+    (state.snapshot?.imagePreviews ?? []).map((preview) => [preview.assetId, preview]),
   ), [state.snapshot?.imagePreviews])
   /** 识别创建、恢复和问题定位等外部主选中变化，避免旧多选遮住新目标。 */
   const previousSelectedNodeIdRef = React.useRef(state.selectedNodeId)
@@ -2724,7 +2724,7 @@ export function NativeCanvasWorkspace({
                 activeTool={state.activeTool}
                 nodeIssues={state.snapshot.nodeIssues}
                 runningSessionIds={runningSessionIds}
-                imagePreviewUrls={imagePreviewUrls}
+                imagePreviews={imagePreviews}
                 canCreateChild={canCreateNode}
                 onCreateChild={(sourceNodeId, kind) => {
                   void commandRef.current?.execute({ kind, sourceNodeId }).catch(() => undefined)

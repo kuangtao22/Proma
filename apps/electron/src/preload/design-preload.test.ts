@@ -53,7 +53,7 @@ describe('Design preload', () => {
     await api.cancelCanvasImageJob(jobInput)
     await api.retryCanvasImageJob(jobInput)
     await api.adoptCanvasImageAsset(adoptInput)
-    await api.releaseCanvasImageMedia(target)
+    await api.releaseCanvasImageMedia({ ...target, mediaLeaseId: 'lease-1' })
 
     expect(recorded.invokes).toEqual([
       { channel: CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1' }] },
@@ -62,7 +62,7 @@ describe('Design preload', () => {
       { channel: CANVAS_IPC_CHANNELS.CANCEL_IMAGE_JOB, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', jobId: 'job-1' }] },
       { channel: CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', jobId: 'job-1' }] },
       { channel: CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', jobId: 'job-1', assetId: 'asset-1', expectedConfigRevision: 4 }] },
-      { channel: CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1' }] },
+      { channel: CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', mediaLeaseId: 'lease-1' }] },
     ])
   })
 

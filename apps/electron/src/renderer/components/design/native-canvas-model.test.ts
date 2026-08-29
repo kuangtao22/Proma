@@ -121,14 +121,48 @@ describe('原生 Canvas 纯投影', () => {
       canCreateChild: false,
       onCreateChild: () => undefined,
       onWorkbenchNodeChange: () => undefined,
-      imagePreviewUrls: new Map([['asset-1', 'proma-file://thumbnail-token/result.webp']]),
+      imagePreviews: new Map([['asset-1', {
+        assetId: 'asset-1',
+        previewUrl: 'proma-file://thumbnail-token/result.webp',
+        width: 1600,
+        height: 900,
+      }]]),
     } as never)
 
-    expect(nodes.find((node) => node.id === 'image-1')?.data).toMatchObject({
+    const imageNode = nodes.find((node) => node.id === 'image-1')
+    expect(imageNode?.data).toMatchObject({
       adoptedAssetId: 'asset-1',
       previewUrl: 'proma-file://thumbnail-token/result.webp',
+      nodeHeight: 210,
     })
+    expect(imageNode?.height).toBe(210)
+    expect(imageNode?.handles).toEqual([{
+      id: 'input', type: 'target', position: Position.Left, x: 0, y: 105,
+    }])
     expect(nodes.find((node) => node.id === 'image-2')?.data).not.toHaveProperty('previewUrl')
+  })
+
+  test('Given 图片比例极端或尺寸无效 When 计算节点高度 Then 限制预览高度并稳定回退', () => {
+    /** 通过公开投影入口读取高度，避免测试绑定内部计算实现。 */
+    const projectHeight = (width?: number, height?: number): number | undefined => {
+      const preview = width !== undefined && height !== undefined
+        ? new Map([['asset-1', {
+            assetId: 'asset-1', previewUrl: 'proma-file://thumbnail/result.webp', width, height,
+          }]])
+        : new Map()
+      return toNativeCanvasFlowNodes(createDocument(), {
+        nodeIssues: [], runningSessionIds: new Set(), canCreateChild: false,
+        onCreateChild: () => undefined, onWorkbenchNodeChange: () => undefined,
+        imagePreviews: preview,
+      } as never).find((node) => node.id === 'image-1')?.height
+    }
+
+    expect(projectHeight(1600, 900)).toBe(210)
+    expect(projectHeight(900, 1600)).toBe(368)
+    expect(projectHeight(1, 100)).toBe(368)
+    expect(projectHeight(100, 1)).toBe(144)
+    expect(projectHeight(0, 100)).toBe(144)
+    expect(projectHeight()).toBe(144)
   })
 
   test('Given 持久边 When 投影 Then 端口身份保留且边完全只读', () => {

@@ -31,12 +31,13 @@ function renderCard(kind: CanvasNodeKind): string {
 }
 
 /** 在 XYFlow 上下文中渲染带缩略图地址的生图卡片。 */
-function renderImagePreviewCard(previewUrl?: string): string {
+function renderImagePreviewCard(previewUrl?: string, nodeHeight?: number): string {
   return renderToStaticMarkup(
     <ReactFlowProvider>
       <CanvasNodeCard
         {...createProps('image')}
         {...(previewUrl ? { previewUrl } : {})}
+        {...(nodeHeight ? { nodeHeight } : {})}
       />
     </ReactFlowProvider>,
   )
@@ -107,13 +108,15 @@ describe('Canvas 通用折叠节点卡片', () => {
     expect(html).toContain('aria-label="展开生图工作台"')
   })
 
-  test('Given 生图节点存在安全预览地址 When 折叠渲染 Then 在固定尺寸卡片中显示图片缩略图', () => {
-    const html = renderImagePreviewCard('proma-file://thumbnail-token/result.webp')
+  test('Given 生图节点存在安全预览地址和比例高度 When 折叠渲染 Then 完整显示图片并同步卡片高度', () => {
+    const html = renderImagePreviewCard('proma-file://thumbnail-token/result.webp', 210)
 
     expect(html).toContain('src="proma-file://thumbnail-token/result.webp"')
     expect(html).toContain('alt="一个需要最多显示两行的很长节点标题缩略图"')
     expect(html).toContain('w-[288px]')
-    expect(html).toContain('h-[144px]')
+    expect(html).toContain('height:210px')
+    expect(html).toContain('object-contain')
+    expect(html).not.toContain('object-cover')
   })
 
   test('Given 生图节点没有预览地址 When 折叠渲染 Then 保留原有文字回退内容且不产生破图元素', () => {

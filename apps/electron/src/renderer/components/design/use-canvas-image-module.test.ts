@@ -3,6 +3,7 @@ import type {
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
+  ReleaseCanvasImageMediaInput,
   DesignJobRecord,
   DesignTaskDetails,
 } from '@proma/shared'
@@ -61,7 +62,8 @@ function config(moduleTarget: CanvasImageTarget, revision: number, prompt = `pro
 /** 创建图片模块权威快照。 */
 function snapshot(moduleTarget: CanvasImageTarget, revision: number, prompt?: string): CanvasImageModuleSnapshot {
   return {
-    target: structuredClone(moduleTarget), config: config(moduleTarget, revision, prompt),
+    target: structuredClone(moduleTarget), mediaLeaseId: `lease-${moduleTarget.imageModuleId}-${revision}`,
+    config: config(moduleTarget, revision, prompt),
     jobs: [], assets: [], assetBaseUrl: 'proma://asset', thumbnailBaseUrl: 'proma://thumbnail',
   }
 }
@@ -112,7 +114,7 @@ function createFixture() {
   const loadCalls: CanvasImageTarget[] = []
   const saveCalls: Parameters<DesignAdapter['saveCanvasImageModule']>[0][] = []
   const createCalls: Parameters<DesignAdapter['createCanvasImageJob']>[0][] = []
-  const releaseCalls: CanvasImageTarget[] = []
+  const releaseCalls: ReleaseCanvasImageMediaInput[] = []
   const listeners = new Map<string, Set<(event: CanvasImageTarget) => void>>()
   const loadQueue: Array<ReturnType<typeof deferred<CanvasImageModuleSnapshot>>> = []
   const saveQueue: Array<ReturnType<typeof deferred<CanvasImageModuleConfig>>> = []
@@ -240,7 +242,9 @@ describe('Canvas 生图模块 controller', () => {
     expect(fixture.state(targetA).snapshot).toBeNull()
     expect(fixture.states.has(createCanvasImageModuleKey(targetA))).toBe(false)
     expect(fixture.state(targetB).snapshot?.target).toEqual(targetB)
-    expect(fixture.releaseCalls).toEqual([targetA])
+    expect(fixture.releaseCalls).toEqual([{
+      ...targetA, mediaLeaseId: `lease-${targetA.imageModuleId}-1`,
+    }])
   })
 
   test.each(['recovery', 'delete'] as const)(
@@ -259,7 +263,9 @@ describe('Canvas 生图模块 controller', () => {
       await flush()
 
       expect(fixture.states.has(createCanvasImageModuleKey(moduleTarget))).toBe(false)
-      expect(fixture.releaseCalls).toEqual([moduleTarget])
+      expect(fixture.releaseCalls).toEqual([{
+        ...moduleTarget, mediaLeaseId: `lease-${moduleTarget.imageModuleId}-1`,
+      }])
       expect(fixture.loadCalls).toHaveLength(1)
     },
   )
@@ -279,7 +285,24 @@ describe('Canvas 生图模块 controller', () => {
     second.dispose()
     fixture.runMicrotasks()
     await flush()
-    expect(fixture.releaseCalls).toEqual([moduleTarget])
+    expect(fixture.releaseCalls).toEqual([])
+  })
+
+  test('Given 模块已加载 When 工作台真实卸载 Then 释放该快照对应的媒体授权', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('lease-release')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    /** 主进程签发给当前详情挂载实例的不可复用授权身份。 */
+    const mediaLeaseId = 'lease-current'
+    fixture.loadQueue[0]?.resolve({ ...snapshot(moduleTarget, 1), mediaLeaseId })
+    await flush()
+
+    controller.dispose()
+    fixture.runMicrotasks()
+    await flush()
+
+    expect(fixture.releaseCalls).toEqual([{ ...moduleTarget, mediaLeaseId }])
   })
 
   test('Given 草稿未 dirty When commitDraft Then 不调用保存', async () => {

@@ -314,6 +314,11 @@ export interface CanvasImageTarget extends CanvasTarget {
   imageModuleId: string
 }
 
+/** 释放图片模块媒体授权时绑定具体授权代次的输入。 */
+export interface ReleaseCanvasImageMediaInput extends CanvasImageTarget {
+  mediaLeaseId: string
+}
+
 /** 图片模块支持的固定画面比例。 */
 export type CanvasImageAspectRatio = '1:1' | '16:9' | '4:3' | '9:16' | '3:4'
 
@@ -354,6 +359,7 @@ export interface CanvasImageJobControlInput extends CanvasImageTarget {
 /** Renderer 加载单个 Canvas 图片模块后得到的完整公开快照。 */
 export interface CanvasImageModuleSnapshot {
   target: CanvasImageTarget
+  mediaLeaseId: string
   config: CanvasImageModuleConfig
   jobs: DesignJobRecord[]
   assets: DesignAsset[]
@@ -574,6 +580,31 @@ export function parseCanvasImageTarget(value: unknown): CanvasImageTarget {
 }
 
 /**
+ * 严格解析图片模块媒体授权释放输入。
+ * @param value 待解析的 Renderer 输入。
+ * @returns 完整图片身份与不可复用的媒体授权身份。
+ */
+export function parseReleaseCanvasImageMediaInput(value: unknown): ReleaseCanvasImageMediaInput {
+  /** 媒体释放命令只允许完整目标和授权身份。 */
+  const keys = ['projectId', 'canvasId', 'nodeId', 'imageModuleId', 'mediaLeaseId'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasLifecycleId(value.nodeId)
+    || !isCanvasLifecycleId(value.imageModuleId)
+    || !isCanvasLifecycleId(value.mediaLeaseId)) {
+    throw new Error('CANVAS_IMAGE_MEDIA_RELEASE_INPUT_INVALID')
+  }
+  return {
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    imageModuleId: value.imageModuleId,
+    mediaLeaseId: value.mediaLeaseId,
+  }
+}
+
+/**
  * 严格解析图片模块 schema v2 配置。
  * @param value 待解析的未知磁盘或进程边界值。
  * @returns 字段精确、枚举受限且文本有界的图片配置。
@@ -786,6 +817,10 @@ export interface RebuildCanvasAgentNodeResult {
 export interface CanvasImagePreview {
   assetId: string
   previewUrl: string
+  /** 已验证素材的原始像素宽度，用于 Renderer 稳定计算预览比例。 */
+  width: number
+  /** 已验证素材的原始像素高度，用于 Renderer 稳定计算预览比例。 */
+  height: number
 }
 
 /** Renderer 可见的原生 Canvas 工作区快照，不暴露路径或存储实现。 */

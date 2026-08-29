@@ -237,6 +237,7 @@ describe('Canvas 生图工作台接入', () => {
     }]
     const imageSnapshot: CanvasImageModuleSnapshot = {
       target: imageTarget,
+      mediaLeaseId: 'lease-module-1',
       config: {
         schemaVersion: 2,
         kind: 'image',
@@ -1545,7 +1546,9 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     const current = createInitialNativeCanvasState()
     current.snapshot = {
       ...createSnapshot(4),
-      imagePreviews: [{ assetId: 'asset-1', previewUrl: 'proma-file://thumbnail/result.webp' }],
+      imagePreviews: [{
+        assetId: 'asset-1', previewUrl: 'proma-file://thumbnail/result.webp', width: 100, height: 100,
+      }],
     }
     const result: CanvasNodeLifecycleResult = { snapshot: createSnapshot(5) }
 
@@ -1583,7 +1586,9 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     const current = createInitialNativeCanvasState()
     current.snapshot = {
       ...createSnapshot(4),
-      imagePreviews: [{ assetId: 'asset-1', previewUrl: 'proma-file://thumbnail/result.webp' }],
+      imagePreviews: [{
+        assetId: 'asset-1', previewUrl: 'proma-file://thumbnail/result.webp', width: 100, height: 100,
+      }],
     }
 
     const update = createNativeCanvasNodeCreationSuccessUpdate(current, {

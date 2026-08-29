@@ -1575,7 +1575,7 @@ export class AgentOrchestrator {
       const memoryRefreshOpportunity = workspaceSlug && !automationContext && !input.triggeredBy && !memoryGuidance?.needsCollaborationProfile
         ? claimWorkspaceMemoryRefreshOpportunity(workspaceSlug)
         : undefined
-      const systemPromptAppend = buildSystemPrompt({
+      const baseSystemPrompt = buildSystemPrompt({
         workspaceName: workspace?.name,
         workspaceSlug,
         sessionId,
@@ -1589,6 +1589,10 @@ export class AgentOrchestrator {
         memoryGuidance,
         memoryRefreshOpportunity,
       }) + (automationContext ? `\n\n## 定时任务执行上下文\n\n${automationContext}` : '')
+      /** 单次可信运行场景放在通用规则之后，使专用会话覆盖普通入口分流语义。 */
+      const systemPromptAppend = [baseSystemPrompt, extensions.systemPromptAppend]
+        .filter((section): section is string => Boolean(section?.trim()))
+        .join('\n\n')
       const startAutoTitleGeneration = (): void => {
         if (titleGenerationStarted) return
         titleGenerationStarted = true

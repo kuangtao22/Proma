@@ -7,6 +7,8 @@ import type { ResolveImageGenerationRoute } from './image-generation-runtime'
  * 不经过 IPC、会话 JSONL 或全局工具配置持久化。
  */
 export interface AgentRunExtensions {
+  /** 本次可信运行场景追加到通用系统提示词末尾，不写入用户消息或会话 JSONL。 */
+  systemPromptAppend?: string
   /** 本次运行额外注入的 Pi 工具。 */
   piCustomTools?: ToolDefinition[]
   /** 本次运行允许的完整工具名；缺失时保持普通 Agent 权限行为。 */

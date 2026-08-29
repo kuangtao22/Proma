@@ -6,6 +6,7 @@ import {
   createEmptyCanvasDocument,
   parseCanvasImageJobControlInput,
   parseCanvasImageModuleConfig,
+  parseReleaseCanvasImageMediaInput,
   parseCreateCanvasContentNodeInput,
   parseDeleteCanvasNodeInput,
   parseRestoreCanvasNodeInput,
@@ -112,6 +113,17 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given 图片媒体释放输入 When 严格解析 Then 保留完整目标与授权身份并拒绝多余字段', () => {
+    const input = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-image',
+      imageModuleId: 'module-1', mediaLeaseId: 'lease-1',
+    }
+
+    expect(parseReleaseCanvasImageMediaInput(input)).toEqual(input)
+    expect(() => parseReleaseCanvasImageMediaInput({ ...input, internalPath: '/private/image.png' }))
+      .toThrow('CANVAS_IMAGE_MEDIA_RELEASE_INPUT_INVALID')
+  })
+
   test('Given v2 图片配置 When 严格解析 Then 保留结构化生成选项', () => {
     /** 图片模块磁盘配置的完整合法样例。 */
     const config = parseCanvasImageModuleConfig({

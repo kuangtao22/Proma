@@ -211,3 +211,5 @@
 - 2026-08-29：Canvas Agent 重建事务固定使用 `agent-node-rebuild-<UUID>.json`，文件名合同必须由 TypeScript Host 与 C++ stable-directory helper 同步识别；开发客户端实际执行 `dist/resources` 副本，修改原生 helper 后必须执行资源同步并重启，否则会出现重建当下成功、重载后因旧 helper 漏扫重建事务而整张 Canvas 加载失败。
 - 2026-08-29：修复 Canvas Agent 详情消息撑高后裁掉输入框的问题，并为四类节点工作台增加右下角双向缩放；详情首次打开会按当前画布剩余空间收敛，真实 Electron 验证生图主操作和缩放手柄在底边可达，拖拽宽高同时变化且不移动节点。
 - 2026-08-29：合并官方最新正式版 `v0.19.1` 并将应用版本重置为 `0.19.1-bone.1`；接入 Vault、Terminal、OfficeCLI、双 Pane 与 MCP 安全更新，保留 Canvas、DataRoot、独立规划窗口和 Todo Agent 跨窗口接管，并补齐普通 Renderer 对内部会话的隔离。
+- 2026-08-29：Canvas 图片详情的每次 LOAD 必须签发不可复用 `mediaLeaseId`，RELEASE 只精确释放对应授权；旧详情的迟到释放不得取消新 LOAD，失效 controller 收到迟到成功快照时主动回收该授权。
+- 2026-08-29：Canvas 折叠生图卡片复用工作区 LOAD 已验证的素材宽高计算受限比例，固定 288px 宽、预览高度限制 96–320px，图片使用完整展示且 XYFlow 节点与连线 Handle 共用同一高度事实；Canvas Agent 身份通过可信单次系统上下文追加，不改写用户消息或 JSONL，并明确禁止要求用户另建或切换 Design/Canvas。

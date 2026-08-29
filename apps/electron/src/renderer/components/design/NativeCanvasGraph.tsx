@@ -1,5 +1,5 @@
 import * as React from 'react'
-import type { CanvasDocument, CanvasMutation, CanvasNode, CanvasNodeIssue, CanvasNodeKind } from '@proma/shared'
+import type { CanvasDocument, CanvasImagePreview, CanvasMutation, CanvasNode, CanvasNodeIssue, CanvasNodeKind } from '@proma/shared'
 import {
   Background,
   Controls,
@@ -128,7 +128,7 @@ export interface NativeCanvasGraphProps {
   nodeIssues?: CanvasNodeIssue[]
   runningSessionIds?: ReadonlySet<string>
   /** Canvas 工作区一次加载得到的素材缩略图索引。 */
-  imagePreviewUrls?: ReadonlyMap<string, string>
+  imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
   canCreateChild?: boolean
   onCreateChild?: (nodeId: string, kind: CanvasNodeKind) => void
   selectedNodeId: string | null
@@ -201,7 +201,7 @@ export function NativeCanvasGraph({
   activeTool = 'select',
   nodeIssues = EMPTY_CANVAS_NODE_ISSUES,
   runningSessionIds = EMPTY_RUNNING_SESSION_IDS,
-  imagePreviewUrls,
+  imagePreviews,
   canCreateChild = false,
   onCreateChild = NOOP_CREATE_CHILD,
   selectedNodeId,
@@ -232,7 +232,7 @@ export function NativeCanvasGraph({
     attachNativeCanvasWorkbench(toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
-      imagePreviewUrls,
+      imagePreviews,
       canCreateChild: writable && canCreateChild,
       onCreateChild,
       onWorkbenchNodeChange: workbenchNodeChange,
@@ -279,7 +279,7 @@ export function NativeCanvasGraph({
     const nextNodes = attachNativeCanvasWorkbench(toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
-      imagePreviewUrls,
+      imagePreviews,
       canCreateChild: writable && canCreateChild,
       onCreateChild,
       onWorkbenchNodeChange: workbenchNodeChange,
@@ -289,7 +289,7 @@ export function NativeCanvasGraph({
     })), document, expandedNodeId, renderWorkbench)
     flowNodesRef.current = nextNodes
     setFlowNodes(nextNodes)
-  }, [canCreateChild, controlledSelectedNodeIdSet, document, expandedNodeId, imagePreviewUrls, nodeIssues, onCreateChild, renderWorkbench, runningSessionIds, workbenchNodeChange, writable])
+  }, [canCreateChild, controlledSelectedNodeIdSet, document, expandedNodeId, imagePreviews, nodeIssues, onCreateChild, renderWorkbench, runningSessionIds, workbenchNodeChange, writable])
 
   React.useEffect(() => {
     updateViewportState({ type: 'document-sync', viewport: document.viewport })

@@ -1,6 +1,7 @@
 import * as React from 'react'
 import type {
   CanvasImageModuleConfig,
+  CanvasImageModuleSnapshot,
   CanvasImageTarget,
   DesignJobRecord,
   DesignTaskDetails,
@@ -255,6 +256,14 @@ export function createCanvasImageModuleController(
   /** 当前挂载实例的媒体和所有权凭据。 */
   let lifecycleLease: CanvasImageModuleLifecycleLease | null = null
 
+  /** 精确释放指定快照持有的媒体授权，迟到释放不会影响后续 LOAD。 */
+  const releaseSnapshotMedia = (snapshot: CanvasImageModuleSnapshot): void => {
+    void dependencies.adapter.releaseCanvasImageMedia({
+      ...dependencies.target,
+      mediaLeaseId: snapshot.mediaLeaseId,
+    }).catch((error: unknown) => dependencies.onReleaseError?.(error))
+  }
+
   /** 判断异步回调是否仍属于当前完整身份和实例代次。 */
   const isCurrentInstance = (epoch: number): boolean => (
     !disposed
@@ -358,7 +367,10 @@ export function createCanvasImageModuleController(
     beginErrorOperation(owner)
     dependencies.updateState(key, { phase: 'loading' })
     void dependencies.adapter.loadCanvasImageModule(dependencies.target).then((snapshot) => {
-      if (!isCurrentInstance(epoch) || generation !== loadGeneration) return
+      if (!isCurrentInstance(epoch) || generation !== loadGeneration) {
+        releaseSnapshotMedia(snapshot)
+        return
+      }
       clearOwnedError(owner)
       applySnapshot(snapshot)
     }).catch((error: unknown) => {
@@ -398,9 +410,10 @@ export function createCanvasImageModuleController(
       if (started || disposed) return
       started = true
       lifecycleLease = dependencies.lifecycle.mount(key, () => {
+        /** 删除状态前提取当前快照授权，避免释放请求失去代次身份。 */
+        const snapshot = dependencies.getState(key)?.snapshot
         dependencies.removeState(key)
-        void dependencies.adapter.releaseCanvasImageMedia(dependencies.target)
-          .catch((error: unknown) => dependencies.onReleaseError?.(error))
+        if (snapshot) releaseSnapshotMedia(snapshot)
       })
       unsubscribe = dependencies.adapter.onCanvasImageModuleChanged(dependencies.target, load)
       load()
@@ -585,7 +598,7 @@ export function createCanvasImageModuleController(
       unsubscribe?.()
       unsubscribe = null
       if (lifecycleLease?.isCurrent()) {
-        dependencies.removeState(key)
+        /** releaseNow 先读取快照中的授权身份，释放回调随后统一删除状态。 */
         lifecycleLease.releaseNow()
       }
     },

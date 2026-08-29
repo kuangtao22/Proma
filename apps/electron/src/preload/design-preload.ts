@@ -6,6 +6,7 @@ import type {
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
+  ReleaseCanvasImageMediaInput,
   CanvasInvokeResult,
   CanvasPublicError,
   CanvasSessionChangeEvent,
@@ -90,7 +91,7 @@ export interface DesignPreloadApi {
   /** 将指定图片任务输出采用为模块当前素材。 */
   adoptCanvasImageAsset: (input: AdoptCanvasImageAssetInput) => Promise<CanvasInvokeResult<CanvasImageModuleConfig>>
   /** 释放当前窗口为指定图片模块持有的媒体授权。 */
-  releaseCanvasImageMedia: (input: CanvasImageTarget) => Promise<CanvasInvokeResult<void>>
+  releaseCanvasImageMedia: (input: ReleaseCanvasImageMediaInput) => Promise<CanvasInvokeResult<void>>
   /** 订阅全部图片模块变化，只公开完整目标身份。 */
   onCanvasImageModuleChanged: (listener: (target: CanvasImageTarget) => void) => () => void
   /** 加载项目中指定原生 Canvas 的公开工作区快照。 */
@@ -300,7 +301,7 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
     releaseCanvasImageMedia: (input) => invokeCanvasSafely(
       ipc,
       CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
-      selectCanvasImageTarget(input),
+      { ...selectCanvasImageTarget(input), mediaLeaseId: input.mediaLeaseId },
       CANVAS_PRELOAD_FALLBACKS.imageLoad,
     ),
     onCanvasImageModuleChanged: (listener) => {

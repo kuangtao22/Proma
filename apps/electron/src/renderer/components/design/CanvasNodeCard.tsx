@@ -24,6 +24,8 @@ export interface CanvasNodeCardData {
   summary: string
   /** 仅生图节点可携带的工作区授权缩略图 URL。 */
   previewUrl?: string
+  /** 投影层根据已验证素材比例计算的节点总高度。 */
+  nodeHeight?: number
   canOpenWorkbench: boolean
   onOpenWorkbench?: (nodeId: string) => void
   canCreateChild: boolean
@@ -85,6 +87,7 @@ export function CanvasNodeCard({
   statusLabel,
   summary,
   previewUrl,
+  nodeHeight,
   selected,
   canOpenWorkbench,
   onOpenWorkbench,
@@ -99,9 +102,14 @@ export function CanvasNodeCard({
   React.useEffect(() => setPreviewFailed(false), [previewUrl])
   /** 只有生图节点的有效 URL 且未失败时显示缩略图。 */
   const showPreview = kind === 'image' && Boolean(previewUrl) && !previewFailed
+  /** 只有有效图片预览使用投影动态高度，文字和失败状态继续保持默认卡片。 */
+  const dynamicHeight = showPreview && nodeHeight && nodeHeight !== 144 ? nodeHeight : undefined
   return (
     <TooltipProvider delayDuration={200} disableHoverableContent>
-      <div className="group relative h-[144px] w-[288px]">
+      <div
+        className={cn('group relative w-[288px]', dynamicHeight ? undefined : 'h-[144px]')}
+        style={dynamicHeight ? { height: dynamicHeight } : undefined}
+      >
         <Handle
           id="input"
           type="target"
@@ -113,7 +121,8 @@ export function CanvasNodeCard({
         />
         <article
           className={cn(
-            'flex h-[144px] w-[288px] flex-col overflow-hidden rounded-[8px] border bg-card text-card-foreground shadow-sm',
+            'flex w-[288px] flex-col overflow-hidden rounded-[8px] border bg-card text-card-foreground shadow-sm',
+            dynamicHeight ? 'h-full' : 'h-[144px]',
             selected ? 'border-primary ring-2 ring-primary/25' : 'border-border',
           )}
           aria-label={`${label}：${title}，${statusLabel}`}
@@ -149,7 +158,7 @@ export function CanvasNodeCard({
               <img
                 src={previewUrl}
                 alt={`${title}缩略图`}
-                className="h-full w-full object-cover"
+                className="h-full w-full object-contain"
                 draggable={false}
                 onError={() => setPreviewFailed(true)}
               />

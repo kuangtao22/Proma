@@ -1,5 +1,6 @@
 import { applyCanvasMutations } from '@proma/shared'
 import type {
+  CanvasImagePreview,
   CanvasDocument,
   CanvasEdge,
   CanvasMutation,
@@ -18,6 +19,12 @@ import type { CanvasNodeCardData, CanvasNodeFlowData } from './CanvasNodeCard'
 export const NATIVE_CANVAS_NODE_WIDTH = 288
 /** 首版原生 Canvas 节点固定高度。 */
 export const NATIVE_CANVAS_NODE_HEIGHT = 144
+/** 生图卡片标题栏固定高度，预览比例只改变内容区。 */
+export const NATIVE_CANVAS_NODE_HEADER_HEIGHT = 48
+/** 极宽图片仍保留可辨识的最小预览高度。 */
+export const NATIVE_CANVAS_IMAGE_PREVIEW_MIN_HEIGHT = 96
+/** 极长图片限制预览高度，避免单个节点占满画布。 */
+export const NATIVE_CANVAS_IMAGE_PREVIEW_MAX_HEIGHT = 320
 /** 新增节点之间保留的最小间距，避免边框与选中环相互遮挡。 */
 export const NATIVE_CANVAS_NODE_GAP = 24
 /** 新节点避让只依赖已有节点的持久化位置。 */
@@ -90,7 +97,7 @@ export interface NativeCanvasProjectionOptions {
   nodeIssues: CanvasNodeIssue[]
   runningSessionIds: ReadonlySet<string>
   /** 工作区共享的素材预览索引，节点投影不得自行加载图片模块。 */
-  imagePreviewUrls?: ReadonlyMap<string, string>
+  imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
   canCreateChild: boolean
   onCreateChild: (nodeId: string, kind: CanvasNodeKind) => void
   onWorkbenchNodeChange: (nodeId: string) => void
@@ -130,6 +137,29 @@ export type NativeCanvasFlowNode =
   | NativeCanvasImageFlowNode
   | NativeCanvasDocumentFlowNode
   | NativeCanvasWebviewFlowNode
+
+/**
+ * 根据已验证图片尺寸计算生图节点高度。
+ * @param preview 工作区 LOAD 返回的轻量安全预览元数据。
+ * @returns 标题栏加受限预览区的总高度；无效尺寸回退固定高度。
+ */
+export function resolveNativeCanvasImageNodeHeight(
+  preview?: Pick<CanvasImagePreview, 'width' | 'height'>,
+): number {
+  if (!preview
+    || !Number.isFinite(preview.width)
+    || !Number.isFinite(preview.height)
+    || preview.width <= 0
+    || preview.height <= 0) return NATIVE_CANVAS_NODE_HEIGHT
+  /** 按固定节点宽度换算的原始预览高度。 */
+  const proportionalHeight = NATIVE_CANVAS_NODE_WIDTH * preview.height / preview.width
+  /** 受限预览高度同时避免极宽图不可见和极长图撑乱画布。 */
+  const previewHeight = Math.min(
+    NATIVE_CANVAS_IMAGE_PREVIEW_MAX_HEIGHT,
+    Math.max(NATIVE_CANVAS_IMAGE_PREVIEW_MIN_HEIGHT, proportionalHeight),
+  )
+  return NATIVE_CANVAS_NODE_HEADER_HEIGHT + previewHeight
+}
 
 /**
  * 从可视区域中心开始按顺时针方形环寻找首个不重叠位置。
@@ -222,6 +252,16 @@ export function toNativeCanvasFlowNodes(
 ): NativeCanvasFlowNode[] {
   /** 节点问题先建索引，避免大画布逐节点线性扫描全部问题。 */
   const unavailableNodeIds = new Set(options.nodeIssues.map((issue) => issue.nodeId))
+  /** 每个节点高度只计算一次，节点本体和静态 Handle 共用同一几何事实。 */
+  const nodeHeightById = new Map(document.nodes.map((node) => {
+    /** 只有已采用素材且预览索引命中时，生图节点才使用动态比例。 */
+    const preview = node.kind === 'image' && node.adoptedAssetId
+      ? options.imagePreviews?.get(node.adoptedAssetId)
+      : undefined
+    return [node.id, node.kind === 'image'
+      ? resolveNativeCanvasImageNodeHeight(preview)
+      : NATIVE_CANVAS_NODE_HEIGHT] as const
+  }))
   /** 仅为真实边涉及的节点建立端口索引，避免无边大画布节点承担 handle 成本。 */
   const handlesByNodeId = new Map<string, NodeHandle[]>()
   /** 向节点追加一次静态端口；相同方向与 ID 的端口只保留一个。 */
@@ -233,28 +273,34 @@ export function toNativeCanvasFlowNodes(
     handlesByNodeId.set(nodeId, handles)
   }
   for (const edge of document.edges) {
+    /** 源节点当前高度决定输出 Handle 的垂直中点。 */
+    const sourceHeight = nodeHeightById.get(edge.sourceNodeId) ?? NATIVE_CANVAS_NODE_HEIGHT
+    /** 目标节点当前高度决定输入 Handle 的垂直中点。 */
+    const targetHeight = nodeHeightById.get(edge.targetNodeId) ?? NATIVE_CANVAS_NODE_HEIGHT
     appendHandle(edge.sourceNodeId, {
       id: edge.sourcePort,
       type: 'source',
       position: Position.Right,
       x: NATIVE_CANVAS_NODE_WIDTH,
-      y: NATIVE_CANVAS_NODE_HEIGHT / 2,
+      y: sourceHeight / 2,
     })
     appendHandle(edge.targetNodeId, {
       id: edge.targetPort,
       type: 'target',
       position: Position.Left,
       x: 0,
-      y: NATIVE_CANVAS_NODE_HEIGHT / 2,
+      y: targetHeight / 2,
     })
   }
   return document.nodes.map((node): NativeCanvasFlowNode => {
+    /** 投影尺寸复用预先计算结果，避免边和节点使用不同高度。 */
+    const nodeHeight = nodeHeightById.get(node.id) ?? NATIVE_CANVAS_NODE_HEIGHT
     /** 四类节点共享稳定布局；无边节点继续显式空 handles 以支持可见区裁剪。 */
     const base = {
       id: node.id,
       position: node.position,
       width: NATIVE_CANVAS_NODE_WIDTH,
-      height: NATIVE_CANVAS_NODE_HEIGHT,
+      height: nodeHeight,
       handles: handlesByNodeId.get(node.id) ?? [],
     }
     if (node.kind === 'agent') {
@@ -283,8 +329,8 @@ export function toNativeCanvasFlowNodes(
     }
     if (node.kind === 'image') {
       /** 只有已采用素材且工作区成功解析时才向卡片注入安全 URL。 */
-      const previewUrl = node.adoptedAssetId
-        ? options.imagePreviewUrls?.get(node.adoptedAssetId)
+      const preview = node.adoptedAssetId
+        ? options.imagePreviews?.get(node.adoptedAssetId)
         : undefined
       return {
         ...base,
@@ -295,7 +341,7 @@ export function toNativeCanvasFlowNodes(
           title: node.title,
           imageModuleId: node.imageModuleId,
           ...(node.adoptedAssetId ? { adoptedAssetId: node.adoptedAssetId } : {}),
-          ...(previewUrl ? { previewUrl } : {}),
+          ...(preview ? { previewUrl: preview.previewUrl, nodeHeight } : {}),
           statusLabel: node.adoptedAssetId ? '已有素材' : '待创作',
           summary: node.adoptedAssetId ? '已采用画布素材' : '尚未生成图片',
           canOpenWorkbench: true,

@@ -10,6 +10,7 @@ import type {
   CanvasTrashEntry,
   CanvasWorkspaceSnapshot,
   CanvasImageModuleConfig,
+  CanvasImageModuleSnapshot,
   CanvasImageTarget,
   DesignAsset,
   DesignJobRecord,
@@ -535,6 +536,8 @@ describe('原生 Canvas 文档 IPC', () => {
         imagePreviews: [{
           assetId: 'asset-a',
           previewUrl: 'proma-file://thumbnails-0/asset-a.webp',
+          width: 100,
+          height: 100,
         }],
       },
     })
@@ -595,6 +598,7 @@ describe('原生 Canvas 文档 IPC', () => {
       ok: true,
       value: {
         target: imageTargetA,
+        mediaLeaseId: expect.any(String),
         config: createImageConfig(imageTargetA),
         jobs: [jobA],
         assets: [createImageAsset('asset-a', jobA.id)],
@@ -602,6 +606,40 @@ describe('原生 Canvas 文档 IPC', () => {
         thumbnailBaseUrl: 'proma-file://thumbnails-0',
       },
     })
+  })
+
+  test('Given 第二次 LOAD 已接管 When 第一次授权迟到 RELEASE Then 不撤销新授权', async () => {
+    const context = createContext()
+    /** 第一次详情打开后取得的旧授权。 */
+    const first = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    ) as CanvasInvokeResult<CanvasImageModuleSnapshot & { mediaLeaseId: string }>
+    /** 第二次详情打开后取得的当前授权。 */
+    const second = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+      context.sender,
+      imageTargetA,
+    ) as CanvasInvokeResult<CanvasImageModuleSnapshot & { mediaLeaseId: string }>
+
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    if (!first.ok || !second.ok) throw new Error('图片模块测试 LOAD 必须成功')
+    expect(first.value.mediaLeaseId).not.toBe(second.value.mediaLeaseId)
+
+    const releaseResult = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
+      context.sender,
+      { ...imageTargetA, mediaLeaseId: first.value.mediaLeaseId },
+    )
+
+    expect(releaseResult).toEqual({ ok: true, value: undefined })
+    /** 第二次 LOAD 已释放第一代授权；迟到 RELEASE 不得继续释放第二代。 */
+    expect(context.mediaReleases).toEqual([1])
   })
 
   test('Given A job 配 B target When cancel retry adopt Then 全部拒绝且不操作任务或资产', async () => {
@@ -684,7 +722,10 @@ describe('原生 Canvas 文档 IPC', () => {
 
   test('Given 重复 LOAD 与释放路径 When lease 替换失败或成功 Then 保旧授权并幂等回收当前授权', async () => {
     const failedReplacement = createContext({ mediaAccessErrorAt: 1 })
-    await invoke(failedReplacement.handlers, CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE, failedReplacement.sender, imageTargetA)
+    const retained = await invoke(
+      failedReplacement.handlers, CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE, failedReplacement.sender, imageTargetA,
+    ) as CanvasInvokeResult<CanvasImageModuleSnapshot>
+    if (!retained.ok) throw new Error('首个图片授权必须成功')
     const failed = await invoke(
       failedReplacement.handlers,
       CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
@@ -697,7 +738,7 @@ describe('原生 Canvas 文档 IPC', () => {
       failedReplacement.handlers,
       CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
       failedReplacement.sender,
-      imageTargetA,
+      { ...imageTargetA, mediaLeaseId: retained.value.mediaLeaseId },
     )
     expect(failedReplacement.mediaReleases[0]).toBe(1)
 
@@ -1082,10 +1123,11 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
       context.sender,
       newerTarget,
-    )
+    ) as CanvasInvokeResult<CanvasImageModuleSnapshot>
     oldLoad.resolve(createImageConfig(imageTargetA))
 
     expect(newerResult).toMatchObject({ ok: true, value: { target: newerTarget } })
+    if (!newerResult.ok) throw new Error('较新图片授权必须成功')
     await expect(oldResult).resolves.toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
     expect(context.getMediaAccessCount()).toBe(1)
     expect(context.mediaReleases[0] ?? 0).toBe(0)
@@ -1093,7 +1135,7 @@ describe('原生 Canvas 文档 IPC', () => {
       context.handlers,
       CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
       context.sender,
-      newerTarget,
+      { ...newerTarget, mediaLeaseId: newerResult.value.mediaLeaseId },
     )
     expect(context.mediaReleases[0]).toBe(1)
   })
@@ -1711,6 +1753,17 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(sent).toEqual({ ok: true, value: { ok: true } })
     expect(stopped).toEqual({ ok: true, value: undefined })
     expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(3)
+    /** 从真实运行记录中读取系统追加项，避免非对称 matcher 影响后续序列化断言。 */
+    const runCall = context.agentCalls.find((call) => call.type === 'run')
+    /** 运行扩展是主进程可信测试值，只收窄本测试需要的字段。 */
+    const runValue = runCall?.value as {
+      input?: { userMessage?: string; rawUserMessage?: string }
+      extensions?: { systemPromptAppend?: string }
+    } | undefined
+    /** 完整 Canvas 场景说明必须以字符串进入 Agent runtime。 */
+    const canvasSystemPrompt = runValue?.extensions?.systemPromptAppend
+    expect(canvasSystemPrompt).toContain('当前会话已经位于原生 Canvas')
+    expect(canvasSystemPrompt).toContain('不得要求用户创建、打开或切换到另一个 Design/Canvas')
     expect(context.agentCalls).toEqual([
       { type: 'messages', value: '22222222-2222-4222-8222-222222222222' },
       { type: 'reserve', value: {
@@ -1725,11 +1778,25 @@ describe('原生 Canvas 文档 IPC', () => {
           channelId: 'channel-1', modelId: 'model-1', workspaceId: 'project-1', triggeredBy: 'user',
         },
         senderId: 1,
-        extensions: { allowedToolNames: ['Read', 'Glob', 'Grep'] },
+        extensions: {
+          allowedToolNames: ['Read', 'Glob', 'Grep'],
+          systemPromptAppend: canvasSystemPrompt,
+        },
       } },
       { type: 'release', value: '22222222-2222-4222-8222-222222222222' },
       { type: 'stop', value: '22222222-2222-4222-8222-222222222222' },
     ])
+    expect(runCall).toMatchObject({
+      value: {
+        input: {
+          userMessage: '请分析当前项目',
+          rawUserMessage: '请分析当前项目',
+        },
+        extensions: {
+          systemPromptAppend: canvasSystemPrompt,
+        },
+      },
+    })
   })
 
   test('Given Canvas Agent 已在运行 When SEND 预留启动槽失败 Then 只返回稳定公开 busy 结果', async () => {

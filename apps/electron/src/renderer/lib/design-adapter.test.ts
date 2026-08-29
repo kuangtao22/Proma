@@ -24,6 +24,7 @@ describe('Design renderer adapter', () => {
     /** 共享公开快照。 */
     const snapshot = {
       target,
+      mediaLeaseId: 'lease-1',
       config: {
         schemaVersion: 2,
         kind: 'image',
@@ -60,6 +61,8 @@ describe('Design renderer adapter', () => {
     const createInput = { ...target, expectedConfigRevision: 3 }
     const jobInput = { ...target, jobId: 'job-1' }
     const adoptInput = { ...jobInput, assetId: 'asset-1', expectedConfigRevision: 4 }
+    /** 媒体释放必须携带 LOAD 快照签发的精确授权身份。 */
+    const releaseInput = { ...target, mediaLeaseId: snapshot.mediaLeaseId }
 
     expect(await adapter.loadCanvasImageModule(target)).toBe(snapshot)
     expect(await adapter.saveCanvasImageModule(saveInput)).toBe(config)
@@ -67,8 +70,8 @@ describe('Design renderer adapter', () => {
     expect(await adapter.cancelCanvasImageJob(jobInput)).toBe(job)
     expect(await adapter.retryCanvasImageJob(jobInput)).toBe(job)
     expect(await adapter.adoptCanvasImageAsset(adoptInput)).toBe(config)
-    await expect(adapter.releaseCanvasImageMedia(target)).resolves.toBeUndefined()
-    expect(received).toEqual([target, saveInput, createInput, jobInput, jobInput, adoptInput, target])
+    await expect(adapter.releaseCanvasImageMedia(releaseInput)).resolves.toBeUndefined()
+    expect(received).toEqual([target, saveInput, createInput, jobInput, jobInput, adoptInput, releaseInput])
   })
 
   test('Given Canvas 生图失败 When adapter 解包 Then 保留公开冲突并净化缺失接线与 rejection', async () => {

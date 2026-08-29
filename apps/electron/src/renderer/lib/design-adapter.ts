@@ -7,6 +7,7 @@ import type {
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
+  ReleaseCanvasImageMediaInput,
   CanvasInvokeResult,
   CanvasNodeLifecycleResult,
   CanvasPublicError,
@@ -77,7 +78,7 @@ export interface DesignAdapter {
   /** 采用目标任务的指定输出素材。 */
   adoptCanvasImageAsset: (input: AdoptCanvasImageAssetInput) => Promise<CanvasImageModuleConfig>
   /** 释放当前图片模块的媒体访问授权。 */
-  releaseCanvasImageMedia: (input: CanvasImageTarget) => Promise<void>
+  releaseCanvasImageMedia: (input: ReleaseCanvasImageMediaInput) => Promise<void>
   /** 只向监听器传递四元身份完整匹配的图片模块事件。 */
   onCanvasImageModuleChanged: (
     target: CanvasImageTarget,

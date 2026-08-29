@@ -75,6 +75,8 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(body).toContain('createRunToolCallLimiter(extensions.toolCallLimits)')
     expect(body).toContain('consumeRunToolCallLimit(toolName)')
     expect(body).toContain('extensions.beforeToolCall?.(toolName, input)')
+    expect(body).toContain('extensions.systemPromptAppend')
+    expect(body).toContain('systemPromptAppend')
     expect(body.indexOf('extensions.beforeToolCall?.(toolName, input)'))
       .toBeGreaterThan(body.indexOf('consumeRunToolCallLimit(toolName)'))
   })
