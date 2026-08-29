@@ -96,6 +96,7 @@ import {
   previewResolvedPathAtom,
   previewFileMapAtom,
   previewFilesMapAtom,
+  quotedSelectionMapAtom,
   type PreviewFile,
 } from '@/atoms/preview-atoms'
 import type { NotificationSoundType } from '@/types/settings'
@@ -676,6 +677,7 @@ export function applyAgentQueuedMessageFailedStatus(
   if (!queuedMessage) return false
   const attachments = queuedMessage.attachments
   const canvasNodeReferences = queuedMessage.canvasNodeReferences
+  const quotedSelection = queuedMessage.quotedSelection
 
   unstable_batchedUpdates(() => {
     store.set(agentSessionMessageQueueAtom, (previous) => {
@@ -717,6 +719,15 @@ export function applyAgentQueuedMessageFailedStatus(
       store.set(agentCanvasNodeReferencesAtomFamily(status.sessionId), (current) => (
         restoreMissingCanvasNodeReferences(current, canvasNodeReferences)
       ))
+    }
+    if (quotedSelection) {
+      store.set(quotedSelectionMapAtom, (previous) => {
+        /** 用户在等待期间创建的新选区优先，失败恢复只补回当前缺失的旧选区。 */
+        if (previous.has(status.sessionId)) return previous
+        const map = new Map(previous)
+        map.set(status.sessionId, quotedSelection)
+        return map
+      })
     }
   })
   return true

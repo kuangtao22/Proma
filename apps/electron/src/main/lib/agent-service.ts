@@ -61,6 +61,7 @@ import type { AgentRunExtensions } from './agent-run-extensions'
 import { routeAgentSubmitOrEnqueue } from './agent-queue-routing'
 import { shouldStopBeforeAgentRun } from './agent-stop-policy'
 import {
+  createAgentQueueNowInput,
   prepareAgentCanvasMessageForSend,
   type PreparedAgentCanvasMessage,
 } from './agent-canvas-message-preparation'
@@ -774,19 +775,7 @@ export async function submitOrEnqueueAgentMessage(
 ): Promise<AgentSubmitOrEnqueueResult> {
   return routeAgentSubmitOrEnqueue(input, {
     isActive: (sessionId) => orchestrator.isActive(sessionId),
-    prepareNow: (candidate) => prepareAgentRun({
-      sessionId: candidate.sessionId,
-      userMessage: candidate.userMessage,
-      rawUserMessage: candidate.rawUserMessage,
-      uuid: candidate.queueMessageId,
-      interrupt: candidate.interrupt,
-      mentionedSkills: candidate.mentionedSkills,
-      mentionedMcpServers: candidate.mentionedMcpServers,
-      mentionedSessionIds: candidate.mentionedSessionIds,
-      mentionedTodoIds: candidate.mentionedTodoIds,
-      mentionedCalendarEventIds: candidate.mentionedCalendarEventIds,
-      canvasNodeReferences: candidate.canvasNodeReferences,
-    }),
+    prepareNow: (candidate) => prepareAgentRun(createAgentQueueNowInput(candidate)),
     injectPrepared: async (prepared) => {
       registerWebContents(input.sessionId, webContents)
       await queuePreparedAgentMessage(prepared)

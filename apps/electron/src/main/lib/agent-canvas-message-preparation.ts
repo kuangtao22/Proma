@@ -2,6 +2,7 @@ import type {
   AgentMessageInvokeResult,
   AgentQueueMessageInput,
   AgentSendInput,
+  AgentSubmitOrEnqueueInput,
   CanvasNodeReference,
 } from '@proma/shared'
 import type { AgentRunExtensions } from './agent-run-extensions'
@@ -29,6 +30,29 @@ export interface PreparedAgentCanvasMessage<T extends AgentSendInput | AgentQueu
   extensions: AgentRunExtensions
   references: CanvasNodeReference[] | undefined
   canvasWorkspacePrompt?: string
+}
+
+/**
+ * 将 deferred 提交意图转换为活跃 Agent 的 queue-now 输入，并保留 Canvas 引用字段是否存在。
+ * @param candidate Renderer 已交给主进程原子路由的消息提交意图。
+ * @returns 仅包含活跃通道注入所需字段、且不把缺失引用归一化为 undefined 的队列输入。
+ */
+export function createAgentQueueNowInput(candidate: AgentSubmitOrEnqueueInput): AgentQueueMessageInput {
+  return {
+    sessionId: candidate.sessionId,
+    userMessage: candidate.userMessage,
+    rawUserMessage: candidate.rawUserMessage,
+    uuid: candidate.queueMessageId,
+    interrupt: candidate.interrupt,
+    mentionedSkills: candidate.mentionedSkills,
+    mentionedMcpServers: candidate.mentionedMcpServers,
+    mentionedSessionIds: candidate.mentionedSessionIds,
+    mentionedTodoIds: candidate.mentionedTodoIds,
+    mentionedCalendarEventIds: candidate.mentionedCalendarEventIds,
+    ...(Object.prototype.hasOwnProperty.call(candidate, 'canvasNodeReferences')
+      ? { canvasNodeReferences: candidate.canvasNodeReferences }
+      : {}),
+  }
 }
 
 /** 在接管前只解析一次 Canvas 引用，并固化权威 input/prompt。 */
