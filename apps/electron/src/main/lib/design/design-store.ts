@@ -55,8 +55,6 @@ export interface DesignStoreOptions {
 export interface DesignStore {
   /** 加载项目画布并标记是否发生安全恢复。 */
   load: (projectId: string) => DesignWorkspaceSnapshot
-  /** 幂等落盘项目的 legacy Design 空文档或返回既有权威文档。 */
-  initialize: (projectId: string) => DesignCanvasDocument
   /** 加载未发生恢复的权威文档；恢复候选必须先由 Renderer 重载确认。 */
   requireStableAuthoritativeDocument: (projectId: string) => DesignCanvasDocument
   /** 在磁盘最新 revision 上应用一组受控 mutation。 */
@@ -67,6 +65,12 @@ export interface DesignStore {
     /** 在同一次磁盘加载后、应用 mutation 前校验权威文档。 */
     validateCurrent?: (document: DesignCanvasDocument) => void,
   ) => DesignCanvasDocument
+}
+
+/** 生产启动边界可显式初始化 legacy Design 文档的扩展 Store。 */
+export interface InitializableDesignStore extends DesignStore {
+  /** 幂等落盘项目的 legacy Design 空文档或返回既有权威文档。 */
+  initialize: (projectId: string) => DesignCanvasDocument
 }
 
 /** JSON 候选实际来自哪个恢复层。 */
@@ -732,7 +736,7 @@ function writeMutatedDocument(
  * @param options 可信路径解析器与时钟依赖。
  * @returns 可加载和原子修改项目画布的同步存储。
  */
-export function createDesignStore(options: DesignStoreOptions = {}): DesignStore {
+export function createDesignStore(options: DesignStoreOptions = {}): InitializableDesignStore {
   /** 生产默认使用进程级可信路径解析器。 */
   const pathResolver = options.pathResolver ?? designPathResolver
   /** 生产默认使用系统当前时间。 */
