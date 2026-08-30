@@ -41,8 +41,14 @@ function createToolAccess(): CanvasToolAccessFacade {
       resolveForSend: () => { throw new Error('测试未配置 Canvas 引用') },
     },
     authorizeRead: () => undefined,
-    getBinding: () => null,
-    requireLinkedCanvas: () => { throw new Error('测试未配置 Canvas 关联') },
+    getBinding: () => ({
+      projectId: 'project-1', sessionId: 'agent-session-1', linkedCanvasIds: ['canvas-1'],
+      defaultCanvasId: 'canvas-1', lastActiveCanvasId: 'canvas-1', updatedAt: 1,
+    }),
+    requireLinkedCanvas: () => ({
+      projectId: 'project-1', sessionId: 'agent-session-1', linkedCanvasIds: ['canvas-1'],
+      defaultCanvasId: 'canvas-1', lastActiveCanvasId: 'canvas-1', updatedAt: 1,
+    }),
     runWrite: (_context, effect) => effect(),
     createAndLink: () => { throw new Error('测试未配置 Canvas 创建') },
     link: () => { throw new Error('测试未配置 Canvas 关联') },
@@ -255,6 +261,8 @@ function createContext(options: {
   const agentCalls: Array<{ type: string; value: unknown }> = []
   /** 图片模块服务调用记录。 */
   const imageCalls: Array<{ type: string; value: unknown }> = []
+  /** 普通 Agent 原子产物服务调用记录。 */
+  const artifactCalls: unknown[] = []
   /** 媒体 lease 释放次数，按候选创建顺序记录。 */
   const mediaReleases: number[] = []
   /** 媒体候选创建序号。 */
@@ -324,6 +332,18 @@ function createContext(options: {
       },
     },
     ...(options.enableToolProviderRuntime ? { toolAccess: createToolAccess() } : {}),
+    artifacts: {
+      create: async (input) => {
+        artifactCalls.push(structuredClone(input))
+        return {
+          canvasId: input.canvasId,
+          nodeId: 'artifact-node-1',
+          revision: 5,
+          artifactType: input.artifactType,
+          sourceToolCallId: input.source.toolCallId,
+        }
+      },
+    },
     creation: {
       reconcile: async (target) => {
         calls.push('creation:reconcile')
@@ -565,7 +585,7 @@ function createContext(options: {
     return { reconciliation, operationOutcome: { ok: true as const, value } }
   }
   return {
-    handlers, removed, sender, calls, storeInputs, agentCalls, imageCalls,
+    handlers, removed, sender, calls, storeInputs, agentCalls, imageCalls, artifactCalls,
     mediaReleases, broadcastLeaseStates, registration,
     getMediaAccessCount: () => mediaAccessCount,
   }
@@ -2692,6 +2712,19 @@ describe('原生 Canvas 文档 IPC', () => {
           document: createDocument(revision), operationId: '', publications: [],
         }),
       },
+      artifacts: {
+        create: async (input: {
+          canvasId: string
+          artifactType: 'webview' | 'image'
+          source: { toolCallId: string }
+        }) => ({
+          canvasId: input.canvasId,
+          nodeId: 'artifact-node',
+          revision,
+          artifactType: input.artifactType,
+          sourceToolCallId: input.source.toolCallId,
+        }),
+      },
       toolAccess: createToolAccess(),
       creation: {
         reconcile: async () => ({
@@ -2816,6 +2849,40 @@ describe('原生 Canvas 文档 IPC', () => {
 
     registrationA.dispose()
     expect(removed).toHaveLength(19)
+  })
+
+  test('Given 生产 Canvas Tool Provider runtime When Agent 创建 WebView 产物 Then 调用注入的原子产物服务', async () => {
+    const context = createContext({ enableToolProviderRuntime: true })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      const run = runtime.createRun({
+        projectId: 'project-1',
+        sessionId: 'agent-session-1',
+        runStartedAt: 99,
+        explicitReferences: [],
+        permissionCeiling: 'execute',
+      })
+      const tool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_create_artifact')
+      if (!tool) throw new Error('canvas_create_artifact 未注册')
+
+      const result = await tool.execute('tool-artifact-1', {
+        canvasId: 'canvas-1',
+        baseRevision: 4,
+        artifactType: 'webview',
+        title: '首页原型',
+        content: '<!doctype html><html></html>',
+      } as never, undefined as never, undefined as never, undefined as never, undefined as never)
+
+      expect(result.details).toMatchObject({ nodeId: 'artifact-node-1', revision: 5 })
+      expect(context.artifactCalls).toEqual([expect.objectContaining({
+        projectId: 'project-1',
+        canvasId: 'canvas-1',
+        source: { sessionId: 'agent-session-1', runStartedAt: 99, toolCallId: 'tool-artifact-1' },
+      })])
+    } finally {
+      context.registration.dispose()
+    }
   })
 
   test('Given 第二个图片节点创建失败 When 批量运行 Then 零启动并返回已创建任务回滚与失败节点审计', async () => {

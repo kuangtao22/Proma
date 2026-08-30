@@ -38,6 +38,7 @@ function createFixture(options: {
   const batchInputs: Array<{ baseRevision: number; operations: unknown[]; sourceToolCallId: string }> = []
   const runInputs: string[][] = []
   const runToolCallIds: string[] = []
+  const artifactInputs: Array<Record<string, unknown>> = []
   let listCalls = 0
   /** 返回当前 fixture 的隔离关联事实。 */
   const getBinding = (): AgentCanvasBinding => ({
@@ -113,6 +114,18 @@ function createFixture(options: {
       },
     },
     readNodeContent: async (_target, node) => node.kind === 'document' ? 'A'.repeat(40_000) : '',
+    artifacts: {
+      create: async (input) => {
+        artifactInputs.push(structuredClone(input) as unknown as Record<string, unknown>)
+        return {
+          canvasId: input.canvasId,
+          nodeId: 'artifact-created',
+          revision: 4,
+          artifactType: input.artifactType,
+          sourceToolCallId: input.source.toolCallId,
+        }
+      },
+    },
     batch: { execute: async (input) => {
       batchInputs.push({ baseRevision: input.baseRevision, operations: input.operations, sourceToolCallId: input.sourceToolCallId })
       if (options.conflictAlways || (options.conflictOnce && batchInputs.length === 1)) {
@@ -127,7 +140,7 @@ function createFixture(options: {
       runToolCallIds.push(toolCallId)
       return nodes.map((node) => node.kind === 'image'
         ? { nodeId: node.id, status: 'started' as const, taskId: `task-${node.id}` }
-        : { nodeId: node.id, status: 'unsupported' as const, message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' })
+        : { nodeId: node.id, status: 'idle' as const })
     },
   }
   const context: CanvasToolRunContext = {
@@ -135,7 +148,7 @@ function createFixture(options: {
     explicitReferences: [reference], permissionCeiling: 'execute',
   }
   return {
-    dependencies, context, batchInputs, runInputs, runToolCallIds,
+    dependencies, context, batchInputs, runInputs, runToolCallIds, artifactInputs,
     getListCalls: () => listCalls,
     getCreateCalls: () => createCalls,
     getLinkCalls: () => linkCalls,
@@ -143,14 +156,25 @@ function createFixture(options: {
 }
 
 describe('普通 Agent Canvas Tool Provider', () => {
-  test('Given 普通分析运行 When 获取上下文 Then 注入五工具且不扫描项目全部画布', async () => {
+  test('Given 普通分析运行 When 获取上下文 Then 注入六工具、语义问答规则且不扫描项目全部画布', async () => {
     const fixture = createFixture()
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
-    expect(run.piCustomTools.map((tool) => tool.name)).toEqual([...CANVAS_TOOL_NAMES])
+    expect(run.piCustomTools.map((tool) => tool.name)).toEqual([
+      'canvas_get_context',
+      'canvas_manage',
+      'canvas_read',
+      'canvas_apply_changes',
+      'canvas_create_artifact',
+      'canvas_run_nodes',
+    ])
     expect(run.allowedToolNames).toEqual([...CANVAS_TOOL_NAMES])
     expect(run.allowedToolNamesMode).toBe('extend')
     expect(run.singleApprovalToolNames).toEqual(['canvas_run_nodes'])
     expect(run.systemPromptAppend).toContain('不要按“首页”或“设计”等关键词硬编码')
+    expect(run.systemPromptAppend).toContain('创建 WebView 原型')
+    expect(run.systemPromptAppend).toContain('创建图片设计稿')
+    expect(run.systemPromptAppend).toContain('继续普通 Agent')
+    expect(run.systemPromptAppend).toContain('不重复询问')
     const result = await executeTool(run.piCustomTools, 'canvas_get_context', {})
     expect(result.details).toMatchObject({ defaultCanvasId: 'canvas-1', activeCanvasId: 'canvas-2' })
     expect(JSON.stringify(result.details)).toContain('doc-1')
@@ -246,12 +270,13 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(revoked.getLinkCalls()).toBe(0)
   })
 
-  test('Given 项目授权在运行后撤销 When 五工具 fresh execute Then 全部在 Store、batch 与 run 前拒绝', async () => {
+  test('Given 项目授权在运行后撤销 When 六工具 fresh execute Then 全部在 Store、batch 与 run 前拒绝', async () => {
     const cases: Array<{ name: string; args: Record<string, unknown> }> = [
       { name: 'canvas_get_context', args: {} },
       { name: 'canvas_manage', args: { action: 'create' } },
       { name: 'canvas_read', args: { canvasId: 'canvas-1', nodeIds: ['doc-1'] } },
       { name: 'canvas_apply_changes', args: { canvasId: 'canvas-1', baseRevision: 3, operations: [{ type: 'set-viewport', viewport: { x: 0, y: 0, zoom: 1 } }] } },
+      { name: 'canvas_create_artifact', args: { canvasId: 'canvas-1', baseRevision: 3, artifactType: 'webview', title: '原型', content: '<!doctype html><html></html>' } },
       { name: 'canvas_run_nodes', args: { canvasId: 'canvas-1', nodeIds: ['image-1'] } },
     ]
     for (const entry of cases) {
@@ -392,6 +417,51 @@ describe('普通 Agent Canvas Tool Provider', () => {
     })).rejects.toThrow('CANVAS_EXECUTE_INTENT_REQUIRED')
   })
 
+  test('Given execute 权限和已关联画布 When 创建产物 Then 传递受控内容与完整 Agent 来源身份', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const result = await executeTool(run.piCustomTools, 'canvas_create_artifact', {
+      canvasId: 'canvas-1',
+      baseRevision: 3,
+      artifactType: 'webview',
+      title: '首页原型',
+      content: '<!doctype html><html><body>首页</body></html>',
+      sourceNodeId: 'doc-1',
+    }, 'tool-artifact-1')
+
+    expect(result.details).toEqual({
+      canvasId: 'canvas-1',
+      nodeId: 'artifact-created',
+      revision: 4,
+      artifactType: 'webview',
+      sourceToolCallId: 'tool-artifact-1',
+    })
+    expect(fixture.artifactInputs).toEqual([expect.objectContaining({
+      projectId: 'project-1',
+      canvasId: 'canvas-1',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-artifact-1' },
+    })])
+  })
+
+  test('Given plan 权限或未关联画布 When 创建产物 Then 在原子服务前拒绝', async () => {
+    const planFixture = createFixture()
+    const plan = createCanvasToolRun(planFixture.dependencies, {
+      ...planFixture.context,
+      permissionCeiling: 'plan',
+    })
+    await expect(executeTool(plan.piCustomTools, 'canvas_create_artifact', {
+      canvasId: 'canvas-1', baseRevision: 3, artifactType: 'image', title: '设计稿', content: '首页视觉',
+    })).rejects.toThrow('CANVAS_EXECUTE_INTENT_REQUIRED')
+    expect(planFixture.artifactInputs).toEqual([])
+
+    const executeFixture = createFixture()
+    const executeRun = createCanvasToolRun(executeFixture.dependencies, executeFixture.context)
+    await expect(executeTool(executeRun.piCustomTools, 'canvas_create_artifact', {
+      canvasId: 'foreign-canvas', baseRevision: 3, artifactType: 'webview', title: '原型', content: '<html></html>',
+    })).rejects.toThrow('CANVAS_ACCESS_DENIED')
+    expect(executeFixture.artifactInputs).toEqual([])
+  })
+
   test('Given 重复节点与后置无效节点 When run_nodes Then 去重执行且任一无效时零副作用', async () => {
     const duplicateFixture = createFixture()
     const duplicateRun = createCanvasToolRun(duplicateFixture.dependencies, duplicateFixture.context)
@@ -432,7 +502,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(fixture.runToolCallIds).toEqual(['tool-batch-1'])
   })
 
-  test('Given webview 暂无执行器 When execute run_nodes Then 返回稳定 unsupported', async () => {
+  test('Given webview 内容已提交 When execute run_nodes Then 返回稳定 idle 而非 unsupported', async () => {
     const fixture = createFixture()
     fixture.dependencies.documents.load = () => ({
       document: {
@@ -445,7 +515,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
     const result = await executeTool(run.piCustomTools, 'canvas_run_nodes', { canvasId: 'canvas-1', nodeIds: ['webview-1'] })
     expect(result.details).toMatchObject({
-      tasks: [{ nodeId: 'webview-1', status: 'unsupported', message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' }],
+      tasks: [{ nodeId: 'webview-1', status: 'idle' }],
     })
   })
 })

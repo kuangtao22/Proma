@@ -60,6 +60,7 @@ import type { DesignJobManager } from './design-job-manager'
 import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
+import type { CanvasArtifactCreationService } from './canvas-artifact-creation'
 import type { CanvasBatchOperationResult, CanvasBatchReconciliationResult } from './canvas-agent-batch-operation'
 import type {
   CanvasContentNodeLifecycle,
@@ -129,6 +130,8 @@ export interface CanvasDocumentIpcOptions {
     reconcileLocked: (target: CanvasTarget) => Promise<CanvasBatchReconciliationResult>
     execute?: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult>
   }
+  /** 普通 Agent 创建 WebView 或图片节点时复用的原子产物服务。 */
+  artifacts: Pick<CanvasArtifactCreationService, 'create'>
   /** 生产注入进程级唯一实例，测试未注入时由注册器本地创建。 */
   operationSerializer?: CanvasOperationSerializer
   /** 已持有 lease 时执行目标 Canvas 对账或联合创建事务。 */
@@ -1267,8 +1270,7 @@ export function registerCanvasDocumentIpcHandlers(
       if (node.kind === 'webview') {
         taskByNodeId.set(node.id, {
           nodeId: node.id,
-          status: 'unsupported',
-          message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE',
+          status: 'idle',
         })
       } else if (node.kind !== 'image') {
         taskByNodeId.set(node.id, { nodeId: node.id, status: 'idle' })
@@ -1405,6 +1407,7 @@ export function registerCanvasDocumentIpcHandlers(
         createRun: (context) => createCanvasToolRun({
           access: toolAccess,
           documents: options.store,
+          artifacts: options.artifacts,
           batch,
           readNodeContent: readCanvasNodeContent,
           runNodes: runCanvasNodes,

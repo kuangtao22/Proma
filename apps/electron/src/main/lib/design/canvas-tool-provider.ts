@@ -16,17 +16,19 @@ import { Type } from 'typebox'
 import type { TSchema } from 'typebox'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import type { CanvasBatchOperationResult } from './canvas-agent-batch-operation'
+import type { CanvasArtifactCreationService } from './canvas-artifact-creation'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 
 const MAX_READ_NODES = 32
 const MAX_READ_CHARS = 32_768
 
-/** 普通项目 Agent 单轮可用的五个 Canvas 工具。 */
+/** 普通项目 Agent 单轮可用的六个 Canvas 工具。 */
 export const CANVAS_TOOL_NAMES = [
   'canvas_get_context',
   'canvas_manage',
   'canvas_read',
   'canvas_apply_changes',
+  'canvas_create_artifact',
   'canvas_run_nodes',
 ] as const
 
@@ -67,6 +69,7 @@ export interface CanvasToolProviderDependencies {
     validateBatchOperations: (target: CanvasTarget, expectedRevision: number, operations: unknown[]) => CanvasMutation[]
   }
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
+  artifacts: Pick<CanvasArtifactCreationService, 'create'>
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
   runNodes: (
     context: CanvasToolRunContext,
@@ -312,6 +315,45 @@ export function createCanvasToolRun(
       },
     }),
     defineCanvasTool({
+      name: 'canvas_create_artifact', label: '创建画布产物',
+      description: '在已关联画布中原子创建含真实内容的 WebView 原型或图片设计稿节点，可选从已有节点自动连线。不要把 HTML 正文传给 canvas_apply_changes。',
+      parameters: Type.Object({
+        canvasId: Type.String({ minLength: 1, maxLength: 128 }),
+        baseRevision: Type.Integer({ minimum: 0 }),
+        artifactType: Type.Union([Type.Literal('webview'), Type.Literal('image')]),
+        title: Type.String({ minLength: 1, maxLength: 120 }),
+        content: Type.String({ minLength: 1, maxLength: 256 * 1024 }),
+        position: Type.Optional(Type.Object({
+          x: Type.Number(),
+          y: Type.Number(),
+        })),
+        sourceNodeId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+      }),
+      execute: async (toolCallId, params) => {
+        dependencies.access.authorizeRead(context)
+        if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
+        return dependencies.access.runWrite(context, async () => {
+          dependencies.access.requireLinkedCanvas(context, params.canvasId)
+          const result = await dependencies.artifacts.create({
+            projectId: context.projectId,
+            canvasId: params.canvasId,
+            baseRevision: params.baseRevision,
+            artifactType: params.artifactType,
+            title: params.title,
+            content: params.content,
+            ...(params.position ? { position: params.position } : {}),
+            ...(params.sourceNodeId ? { sourceNodeId: params.sourceNodeId } : {}),
+            source: {
+              sessionId: context.sessionId,
+              runStartedAt: context.runStartedAt,
+              toolCallId,
+            },
+          })
+          return toolResult(result)
+        })
+      },
+    }),
+    defineCanvasTool({
       name: 'canvas_run_nodes', label: '运行画布节点',
       description: '仅在用户明确执行时运行已有生图或 HTML 节点；其它节点保持 idle，未来 video 稳定返回 unsupported。',
       parameters: Type.Object({ canvasId: Type.String({ minLength: 1, maxLength: 128 }), nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_READ_NODES }) }),
@@ -340,7 +382,14 @@ export function createCanvasToolRun(
   ] as ToolDefinition[]
 
   return {
-    systemPromptAppend: `## 画布工具\n请基于完整用户语义和工具 schema 自主决定是否读取、创建、修改或运行画布，不要按“首页”或“设计”等关键词硬编码。Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。普通讨论优先读取，不要要求用户另建已经存在的画布。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。`,
+    systemPromptAppend: `## 画布工具
+请基于完整用户语义、项目上下文和工具 schema 自主决定是否读取、创建、修改或运行画布，不要按“首页”或“设计”等关键词硬编码。
+
+当用户希望获得可视化产物，但尚不能确定需要可交互网页原型、静态视觉设计稿还是普通代码实现时，单独调用 AskUserQuestion 询问一次，选项固定为“创建 WebView 原型”“创建图片设计稿”“继续普通 Agent”。AskUserQuestion 会暂停当前工具批次，收到回答后再继续调用画布工具。用户已经明确指定“在画布中创建 WebView/网页原型”或“在画布中创建图片/设计稿”时直接执行，不重复询问；明确要求修改或生成项目 HTML、React、组件等代码文件时继续普通 Agent，不擅自转入画布。
+
+创建产物前先用 canvas_get_context 获取当前关联；没有可用画布且用户已明确选择画布产物时，用 canvas_manage 创建并关联。WebView 必须向 canvas_create_artifact 提供完整单文件 HTML，图片必须提供可直接生图的完整提示词；不要把 HTML 或提示词正文传给 canvas_apply_changes。canvas_create_artifact 只创建内容和 idle 节点，图片仅在用户明确要求立即生成时再调用 canvas_run_nodes。
+
+Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、产物创建、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。普通讨论优先读取，不要要求用户另建已经存在的画布。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。`,
     piCustomTools: tools,
     allowedToolNames: CANVAS_TOOL_NAMES,
     singleApprovalToolNames: ['canvas_run_nodes'],

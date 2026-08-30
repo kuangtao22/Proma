@@ -212,6 +212,7 @@ import {
   registerCanvasDocumentIpcHandlers,
 } from './lib/design/canvas-document-ipc'
 import { createCanvasAgentBatchOperationService } from './lib/design/canvas-agent-batch-operation'
+import { createCanvasArtifactCreationService } from './lib/design/canvas-artifact-creation'
 import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
 import { createCanvasNodeContentStore } from './lib/design/canvas-node-content-store'
@@ -2189,6 +2190,15 @@ export function registerIpcHandlers(): void {
     contentLifecycle: canvasContentNodeLifecycle,
     agentNodeCreation: canvasAgentNodeCreation,
   })
+  /** 普通 Agent 产物先准备受管正文，再通过唯一 batch 提交可见图事实。 */
+  const canvasArtifactCreation = createCanvasArtifactCreationService({
+    documents: canvasDocumentStore,
+    content: canvasNodeContentStore,
+    batch: canvasAgentBatchOperation,
+    resolveDefaultImageModelProfileId: (projectId) => (
+      canvasImagePreferences.getSelection(projectId).selectedProfileId ?? null
+    ),
+  })
   cleanupSuccessfulDesignTask = (projectId, sourceJobId) => {
     designJobManager.cleanupTaskAfterSuccessfulAssetDeletion(projectId, sourceJobId)
   }
@@ -2329,6 +2339,7 @@ export function registerIpcHandlers(): void {
     guard: workspaceOperationGuard,
     store: canvasDocumentStore,
     batch: canvasAgentBatchOperation,
+    artifacts: canvasArtifactCreation,
     operationSerializer: canvasOperationSerializer,
     creation: canvasAgentNodeCreation,
     contentLifecycle: canvasContentNodeLifecycle,
