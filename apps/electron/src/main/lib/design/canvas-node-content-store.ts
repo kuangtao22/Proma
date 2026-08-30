@@ -39,9 +39,25 @@ export interface PrepareCanvasNodeContentInput {
   selectedModelProfileId?: string | null
 }
 
+/** Agent 创建画布产物时允许初始化的受管正文。 */
+export interface PrepareCanvasArtifactContentInput {
+  kind: 'image' | 'webview'
+  contentId: string
+  content: string
+  selectedModelProfileId?: string | null
+}
+
+/** Store 内部统一的内容准备种子，兼容 legacy 迁移与新产物初始化。 */
+interface CanvasPreparedContentSeed extends PrepareCanvasNodeContentInput {
+  adoptedAssetId?: string
+  legacySourceUrl?: string
+  initialContent?: string
+}
+
 /** Canvas 非 Agent 节点内容与回收区的窄业务接口。 */
 export interface CanvasNodeContentStore {
   prepareEmptyContent: (target: CanvasTarget, input: PrepareCanvasNodeContentInput) => Promise<void>
+  prepareArtifactContent: (target: CanvasTarget, input: PrepareCanvasArtifactContentInput) => Promise<void>
   prepareMigratedContent: (target: CanvasTarget, seed: LegacyCanvasContentSeed) => Promise<void>
   assertContent: (target: CanvasTarget, input: PrepareCanvasNodeContentInput) => Promise<CanvasNodeContentMeta>
   /** 把未进入图提交的本轮新内容移出 active nodes，且不暴露为可恢复回收项。 */
@@ -492,7 +508,7 @@ export function createCanvasNodeContentStore(
   /** 准备空白或 legacy 内容，meta.json 固定最后提交。 */
   const prepareContent = async (
     target: CanvasTarget,
-    seed: LegacyCanvasContentSeed,
+    seed: CanvasPreparedContentSeed,
   ): Promise<void> => {
     /** 经过相对协议边界校验的内容身份。 */
     const kind = requireContentKind(seed.kind)
@@ -503,6 +519,7 @@ export function createCanvasNodeContentStore(
       'contentId',
       ...(kind === 'image' ? ['adoptedAssetId', 'selectedModelProfileId'] : []),
       ...(kind === 'webview' ? ['legacySourceUrl'] : []),
+      ...(kind === 'image' || kind === 'webview' ? ['initialContent'] : []),
     ])
     if (Object.keys(seed).some((key) => !allowedSeedKeys.has(key))) {
       throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
@@ -516,6 +533,14 @@ export function createCanvasNodeContentStore(
         || seed.legacySourceUrl.length > MAX_LEGACY_SOURCE_URL_LENGTH)) {
       throw new Error('CANVAS_CONTENT_LEGACY_SOURCE_INVALID')
     }
+    if (seed.initialContent !== undefined
+      && (typeof seed.initialContent !== 'string'
+        || seed.initialContent.length > MAX_CONTENT_TEXT_LENGTH)) {
+      throw new Error('CANVAS_ARTIFACT_CONTENT_INVALID')
+    }
+    /** 新产物正文；空内容与 legacy 迁移沿用既有默认值。 */
+    const initialContent = seed.initialContent
+      ?? (kind === 'webview' ? EMPTY_WEBVIEW_HTML : '')
     /** 本操作唯一 LOAD 派生的 nodes capability。 */
     const { nodes } = loadScopes(target)
     /** 已提交 meta 用于幂等重放和冲突拒绝。 */
@@ -536,7 +561,7 @@ export function createCanvasNodeContentStore(
           || config.createdAt !== config.updatedAt
           || config.createdAt !== existingMeta.createdAt
           || config.updatedAt !== existingMeta.updatedAt
-          || config.prompt !== ''
+          || config.prompt !== initialContent
           || config.selectedModelProfileId !== (seed.selectedModelProfileId ?? null)
           || config.adoptedAssetId !== (seed.adoptedAssetId ?? null)) {
           throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
@@ -562,7 +587,7 @@ export function createCanvasNodeContentStore(
       if (html === null) {
         throw new CanvasContentItemError('CANVAS_CONTENT_CORRUPT', 'committed webview missing index.html')
       }
-      if (html !== EMPTY_WEBVIEW_HTML) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      if (html !== initialContent) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
       return
     }
     /** 新内容使用的有限时间戳。 */
@@ -578,7 +603,7 @@ export function createCanvasNodeContentStore(
       const config = existingConfigContent === null
         ? {
             schemaVersion: 2 as const, kind: 'image' as const, contentId, revision: 0,
-            createdAt: timestamp, updatedAt: timestamp, prompt: '',
+            createdAt: timestamp, updatedAt: timestamp, prompt: initialContent,
             selectedModelProfileId: seed.selectedModelProfileId ?? null, adoptedAssetId,
             aspectRatio: '1:1' as const, imageSize: 'auto' as const, contextMode: 'auto' as const,
           }
@@ -586,7 +611,7 @@ export function createCanvasNodeContentStore(
       if (config.contentId !== contentId
         || config.revision !== 0
         || config.createdAt !== config.updatedAt
-        || config.prompt !== ''
+        || config.prompt !== initialContent
         || config.selectedModelProfileId !== (seed.selectedModelProfileId ?? null)
         || config.aspectRatio !== '1:1'
         || config.imageSize !== 'auto'
@@ -634,7 +659,7 @@ export function createCanvasNodeContentStore(
       return
     }
     if (seed.adoptedAssetId !== undefined) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
-    await ensureExactFile(nodes, 'nodes', contentId, 'index.html', EMPTY_WEBVIEW_HTML)
+    await ensureExactFile(nodes, 'nodes', contentId, 'index.html', initialContent)
     /** Webview meta 固定显式记录 legacySourceUrl，空内容为 null。 */
     const webviewMeta: CanvasWebviewContentMeta = {
       ...baseMeta,
@@ -793,6 +818,14 @@ export function createCanvasNodeContentStore(
     prepareEmptyContent: (target, input) => prepareContent(target, {
       kind: requireContentKind(input.kind),
       contentId: requireContentId(input.contentId, 'contentId'),
+      ...(input.kind === 'image'
+        ? { selectedModelProfileId: input.selectedModelProfileId ?? null }
+        : {}),
+    }),
+    prepareArtifactContent: (target, input) => prepareContent(target, {
+      kind: input.kind,
+      contentId: requireContentId(input.contentId, 'contentId'),
+      initialContent: input.content,
       ...(input.kind === 'image'
         ? { selectedModelProfileId: input.selectedModelProfileId ?? null }
         : {}),

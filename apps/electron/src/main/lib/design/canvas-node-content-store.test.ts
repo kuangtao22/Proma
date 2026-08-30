@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type {
+  CanvasImageModuleConfig,
   CanvasNodeContentMeta,
   CanvasTarget,
   CanvasTrashEntry,
@@ -228,6 +229,56 @@ describe('Canvas 节点内容 Store', () => {
       })
     }
     expect(fixture.loadCount).toBe(2)
+  })
+
+  test('Given Agent 创建 WebView 产物 When 准备初始内容 Then 原样保存完整 HTML 且支持相同请求幂等重放', async () => {
+    const fixture = createFixture()
+    const content = '<!doctype html><html lang="zh-CN"><body><main>项目首页</main></body></html>'
+
+    await fixture.store.prepareArtifactContent(target, {
+      kind: 'webview', contentId: 'prototype-1', content,
+    })
+    await fixture.store.prepareArtifactContent(target, {
+      kind: 'webview', contentId: 'prototype-1', content,
+    })
+
+    expect(fixture.scopes.nodes.get('prototype-1')?.['index.html']).toBe(content)
+    expect(await fixture.store.assertContent(target, {
+      kind: 'webview', contentId: 'prototype-1',
+    })).toMatchObject({ revision: 0 })
+    await expect(fixture.store.prepareArtifactContent(target, {
+      kind: 'webview',
+      contentId: 'prototype-1',
+      content: '<!doctype html><html><body>冲突版本</body></html>',
+    })).rejects.toThrow('CANVAS_CONTENT_IDENTITY_CONFLICT')
+  })
+
+  test('Given Agent 创建图片产物 When 准备初始内容 Then prompt 写入 revision 0 配置且不同 prompt 拒绝覆盖', async () => {
+    const fixture = createFixture()
+    const prompt = '安静克制的桌面 Agent 首页设计稿'
+
+    await fixture.store.prepareArtifactContent(target, {
+      kind: 'image',
+      contentId: 'image-1',
+      content: prompt,
+      selectedModelProfileId: 'profile-1',
+    })
+
+    const config = readJson<CanvasImageModuleConfig>(fixture.scopes.nodes.get('image-1')!, 'config.json')
+    expect(config).toMatchObject({
+      revision: 0,
+      prompt,
+      selectedModelProfileId: 'profile-1',
+      aspectRatio: '1:1',
+      imageSize: 'auto',
+      contextMode: 'auto',
+    })
+    await expect(fixture.store.prepareArtifactContent(target, {
+      kind: 'image',
+      contentId: 'image-1',
+      content: '另一版提示词',
+      selectedModelProfileId: 'profile-1',
+    })).rejects.toThrow('CANVAS_CONTENT_IDENTITY_CONFLICT')
   })
 
   test.each([
