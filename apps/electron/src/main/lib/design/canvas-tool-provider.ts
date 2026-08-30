@@ -361,7 +361,7 @@ export function createCanvasToolRun(
     }),
     defineCanvasTool({
       name: 'canvas_run_nodes', label: '运行画布节点',
-      description: '仅在用户明确执行时运行已有生图或 HTML 节点；其它节点保持 idle，未来 video 稳定返回 unsupported。',
+      description: '仅在用户明确要求立即生成图片时运行已有生图节点；WebView 创建成功后即可直接预览，不要用于 WebView。其它节点保持 idle，未来 video 稳定返回 unsupported。',
       parameters: Type.Object({ canvasId: Type.String({ minLength: 1, maxLength: 128 }), nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_READ_NODES }) }),
       execute: async (toolCallId, params) => {
         dependencies.access.authorizeRead(context)
@@ -393,7 +393,7 @@ export function createCanvasToolRun(
 
 当用户希望获得可视化产物，但尚不能确定需要可交互网页原型、静态视觉设计稿还是普通代码实现时，单独调用 AskUserQuestion 询问一次，选项固定为“创建 WebView 原型”“创建图片设计稿”“继续普通 Agent”。AskUserQuestion 会暂停当前工具批次，收到回答后再继续调用画布工具。用户已经明确指定“在画布中创建 WebView/网页原型”或“在画布中创建图片/设计稿”时直接执行，不重复询问；明确要求修改或生成项目 HTML、React、组件等代码文件时继续普通 Agent，不擅自转入画布。
 
-创建产物前先用 canvas_get_context 获取当前关联；没有可用画布且用户已明确选择画布产物时，用 canvas_manage 创建并关联。WebView 必须向 canvas_create_artifact 提供完整单文件 HTML，图片必须提供可直接生图的完整提示词；不要把 HTML 或提示词正文传给 canvas_apply_changes。canvas_create_artifact 只创建内容和 idle 节点，图片仅在用户明确要求立即生成时再调用 canvas_run_nodes。
+创建产物前先用 canvas_get_context 获取当前关联；没有可用画布且用户已明确选择画布产物时，用 canvas_manage 创建并关联。WebView 必须向 canvas_create_artifact 提供完整单文件 HTML，图片必须提供可直接生图的完整提示词；不要把 HTML 或提示词正文传给 canvas_apply_changes。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes。canvas_create_artifact 只创建内容和 idle 节点，图片仅在用户明确要求立即生成时再调用 canvas_run_nodes。
 
 Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、产物创建、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。普通讨论优先读取，不要要求用户另建已经存在的画布。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。`,
     piCustomTools: tools,
