@@ -5,12 +5,24 @@ import type {
   CanvasChangeEvent,
 } from '@proma/shared'
 import { createStore } from 'jotai'
+import {
+  agentDiffPanelTabAtom,
+  agentSessionsAtom,
+  agentSidePanelOpenAtomFamily,
+  currentAgentSessionIdAtom,
+  getCanvasWorkspaceTab,
+} from '@/atoms/agent-atoms'
 import { activeTabIdAtom } from '@/atoms/tab-atoms'
 import {
   agentCanvasActivityStatesAtom,
+  agentCanvasViewStatesAtom,
   createAgentCanvasViewKey,
+  initializeAgentCanvasViewStateAtom,
 } from '@/atoms/agent-canvas-atoms'
-import { startGlobalAgentCanvasActivityConsumer } from './useGlobalAgentListeners'
+import {
+  startGlobalAgentCanvasActivityConsumer,
+  startGlobalAgentCanvasArtifactConsumer,
+} from './useGlobalAgentListeners'
 
 /** 等待异步 bindings 权威读取和 atom 提交完成。 */
 async function flushActivity(): Promise<void> {
@@ -62,6 +74,91 @@ describe('全局普通 Agent Canvas activity consumer', () => {
 
     expect(store.get(agentCanvasActivityStatesAtom).get(currentKey)?.activityRevision).toBe(2)
     expect(store.get(agentCanvasActivityStatesAtom).has(backgroundKey)).toBe(false)
+    consumer.dispose()
+  })
+
+  test('Given 后台 Agent 创建画布产物 When 成功工具结果到达 Then 只打开该会话右侧画布并定位节点', () => {
+    const store = createStore()
+    store.set(activeTabIdAtom, 'foreground-tab')
+    store.set(currentAgentSessionIdAtom, 'agent-foreground')
+    store.set(agentSessionsAtom, [
+      { id: 'agent-foreground', title: '前台', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
+      { id: 'agent-background', title: '后台', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
+    ])
+    store.set(agentSidePanelOpenAtomFamily('agent-background'), false)
+    const consumer = startGlobalAgentCanvasArtifactConsumer(store)
+    const viewKey = createAgentCanvasViewKey('agent-background', 'project-1', 'canvas-1')
+    store.set(initializeAgentCanvasViewStateAtom, {
+      key: viewKey,
+      viewport: { x: 0, y: 0, zoom: 1 },
+    })
+
+    consumer.handle('agent-background', {
+      type: 'tool_start',
+      toolName: 'canvas_create_artifact',
+      toolUseId: 'tool-artifact-1',
+      input: {},
+    })
+    consumer.handle('agent-background', {
+      type: 'tool_result',
+      toolUseId: 'tool-artifact-1',
+      result: JSON.stringify({
+        canvasId: 'canvas-1', nodeId: 'node-1', revision: 4, artifactType: 'webview',
+      }),
+      isError: false,
+    })
+
+    expect(store.get(agentSidePanelOpenAtomFamily('agent-background'))).toBe(true)
+    expect(store.get(agentDiffPanelTabAtom).get('agent-background')).toBe(getCanvasWorkspaceTab('canvas-1'))
+    expect(store.get(agentCanvasViewStatesAtom).get(viewKey)).toMatchObject({
+      selectedNodeId: 'node-1',
+      selectedNodeIds: ['node-1'],
+      expandedNodeId: 'node-1',
+    })
+    expect(store.get(activeTabIdAtom)).toBe('foreground-tab')
+    expect(store.get(currentAgentSessionIdAtom)).toBe('agent-foreground')
+    consumer.dispose()
+  })
+
+  test('Given 失败、损坏、其它工具或跨会话结果 When 到达 Then 不导航', () => {
+    const store = createStore()
+    store.set(agentSessionsAtom, [
+      { id: 'agent-1', title: 'Agent 1', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
+    ])
+    store.set(agentSidePanelOpenAtomFamily('agent-1'), false)
+    const consumer = startGlobalAgentCanvasArtifactConsumer(store)
+    const validResult = JSON.stringify({
+      canvasId: 'canvas-1', nodeId: 'node-1', revision: 4, artifactType: 'image',
+    })
+
+    consumer.handle('agent-1', {
+      type: 'tool_start', toolName: 'Read', toolUseId: 'tool-read', input: {},
+    })
+    consumer.handle('agent-1', {
+      type: 'tool_result', toolUseId: 'tool-read', result: validResult, isError: false,
+    })
+    consumer.handle('agent-1', {
+      type: 'tool_start', toolName: 'canvas_create_artifact', toolUseId: 'tool-error', input: {},
+    })
+    consumer.handle('agent-1', {
+      type: 'tool_result', toolUseId: 'tool-error', result: validResult, isError: true,
+    })
+    consumer.handle('agent-1', {
+      type: 'tool_start', toolName: 'canvas_create_artifact', toolUseId: 'tool-broken', input: {},
+    })
+    consumer.handle('agent-1', {
+      type: 'tool_result', toolUseId: 'tool-broken', result: '{', isError: false,
+    })
+    consumer.handle('agent-1', {
+      type: 'tool_start', toolName: 'canvas_create_artifact', toolUseId: 'tool-other-session', input: {},
+    })
+    consumer.handle('agent-2', {
+      type: 'tool_result', toolUseId: 'tool-other-session', result: validResult, isError: false,
+    })
+
+    expect(store.get(agentSidePanelOpenAtomFamily('agent-1'))).toBe(false)
+    expect(store.get(agentDiffPanelTabAtom).has('agent-1')).toBe(false)
+    expect(store.get(agentCanvasViewStatesAtom).size).toBe(0)
     consumer.dispose()
   })
 })

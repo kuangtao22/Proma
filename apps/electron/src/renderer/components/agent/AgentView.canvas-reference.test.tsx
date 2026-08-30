@@ -24,23 +24,13 @@ const reference: CanvasNodeReference = {
 }
 
 describe('Agent Canvas 节点引用 composer', () => {
-  test('Given 普通 Agent 接受设计 handoff When 打开画布 Then 建立 binding 并聚焦右侧 Canvas workspace', () => {
+  test('Given 画布产物已由 Agent 语义工具驱动 When 渲染普通 Agent Then 不保留 Renderer 关键词分流弹窗', () => {
     const source = readFileSync(new URL('./AgentView.tsx', import.meta.url), 'utf8')
-    const start = source.indexOf('const handleOpenDesignHandoff = React.useCallback(')
-    const end = source.indexOf('\n  /**', start + 1)
-    const body = source.slice(start, end)
 
-    expect(body).toContain('designAdapter.ensureLegacyCanvasSession({ projectId: currentWorkspaceId })')
-    expect(body.indexOf('designAdapter.ensureLegacyCanvasSession('))
-      .toBeLessThan(body.indexOf('designAdapter.linkAgentCanvas({'))
-    expect(body).toContain('upsertCanvasSession(legacySession)')
-    expect(body).toContain('designAdapter.linkAgentCanvas({')
-    expect(body).toContain('sessionId,')
-    expect(body).toContain('canvasId: LEGACY_DESIGN_CANVAS_ID')
-    expect(body).toContain('setSidePanelOpen(true)')
-    expect(body).toContain('getCanvasWorkspaceTab(LEGACY_DESIGN_CANVAS_ID)')
-    expect(body).not.toContain('setActiveCanvasSelection')
-    expect(body).not.toContain("setActiveView('design')")
+    expect(source).not.toContain('shouldOfferDesignHandoff')
+    expect(source).not.toContain('pendingDesignHandoff')
+    expect(source).not.toContain('handleOpenDesignHandoff')
+    expect(source).not.toContain('LEGACY_DESIGN_CANVAS_ID')
   })
 
   test('Given 历史用户消息带 rev3 引用且错误 UUID 缺失 When 点击重试 Then 正文与 exact 引用从同一 SDK 消息透传', () => {

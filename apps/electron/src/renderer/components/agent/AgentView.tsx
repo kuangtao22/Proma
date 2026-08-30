@@ -17,7 +17,7 @@ import * as React from 'react'
 import { unstable_batchedUpdates } from 'react-dom'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { CornerDownLeft, Square, Settings, X, Copy, Check, Brain, Sparkles, ListTodo, Paperclip, Palette } from 'lucide-react'
+import { CornerDownLeft, Square, Settings, X, Copy, Check, Brain, Sparkles, ListTodo, Paperclip } from 'lucide-react'
 import { AgentMessages, type AgentHistoryQuoteNavigationRequest } from './AgentMessages'
 import { AgentHeader } from './AgentHeader'
 import { AgentMessageQueue } from './AgentMessageQueue'
@@ -44,7 +44,7 @@ import {
 } from '@/components/ai-elements/input-toolbar-styles'
 import { preventHoverPopoverFocusRestore } from '@/components/ai-elements/input-toolbar-popover-focus'
 import { Button } from '@/components/ui/button'
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
@@ -119,14 +119,11 @@ import {
   agentDiffPanelTabAtom,
   agentSidePanelOpenAtomFamily,
   agentSideTemporaryAgentMapAtom,
-  getCanvasWorkspaceTab,
   getExplorationSidePanelTab,
 } from '@/atoms/agent-atoms'
 import { settingsOpenAtom } from '@/atoms/settings-tab'
 import { deliverPendingMentionsToComposer } from '@/lib/design-session-actions'
-import { shouldOfferDesignHandoff } from '@/lib/agent-design-intent'
-import { canvasSessionsByProjectAtom, upsertCanvasSessionAtom } from '@/atoms/canvas-session-atoms'
-import { updateDesignProjectStateAtom } from '@/atoms/design-atoms'
+import { canvasSessionsByProjectAtom } from '@/atoms/canvas-session-atoms'
 import { longTextPasteAsAttachmentEnabledAtom } from '@/atoms/ui-preferences'
 import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
 import { todoPlanningGroupsAtom } from '@/atoms/planning-atoms'
@@ -135,13 +132,12 @@ import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { useOpenPreview } from '@/components/diff/preview-opener'
 import type { AgentDeferredQueueMessageInput, AgentSendInput, AgentPendingFile, AgentThinkingLevel, CanvasNodeReference, FileDialogLargeFile, FileDialogResult, ModelOption, ReasoningCapability, SDKMessage, SDKUserMessage } from '@proma/shared'
-import { inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedModel, LEGACY_DESIGN_CANVAS_ID, MAX_ATTACHMENT_SIZE, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningCapability, resolveReasoningProfile } from '@proma/shared'
+import { inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedModel, MAX_ATTACHMENT_SIZE, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningCapability, resolveReasoningProfile } from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
 import { getFilePanelDragData, INSERT_FILE_MENTION_EVENT, type FilePanelDragItem } from '@/lib/file-panel-drag'
 import { buildQuotedSelectionBlock, expandAgentHistoryQuoteMentions } from '@/lib/quoted-selection'
 import { createClipboardPendingFile, createClipboardTextDraft, makeUniqueAttachmentName } from '@/lib/clipboard-text-attachment'
 import { copyTextToClipboard } from '@/lib/clipboard'
-import { designAdapter } from '@/lib/design-adapter'
 import {
   buildQueuedMessageSendPayload,
   createAgentQueuedMessage,
@@ -170,11 +166,6 @@ function endOfToday(): number {
 
 interface OptimisticSDKUserMessage extends SDKUserMessage {
   _createdAt: number
-}
-
-/** 尚未发送、等待用户选择视觉设计或代码实现的请求。 */
-interface PendingDesignHandoff {
-  prompt: string
 }
 
 interface PreparedAgentAttachment {
@@ -516,10 +507,6 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   const [todoSourceText, setTodoSourceText] = React.useState('')
   const [todoGroupId, setTodoGroupId] = React.useState('__none__')
   const [creatingTodo, setCreatingTodo] = React.useState(false)
-  const [pendingDesignHandoff, setPendingDesignHandoff] = React.useState<PendingDesignHandoff | null>(null)
-  /** 用户明确选择继续 Agent 后，仅绕过同一段文本一次。 */
-  const designHandoffBypassPromptRef = React.useRef<string | null>(null)
-  const updateDesignProjectState = useSetAtom(updateDesignProjectStateAtom)
   React.useEffect(() => window.electronAPI.onPlanningAgentOperation((operation) => {
     if (operation.sessionId !== sessionId) return
     const target = operation.target === 'todo' ? 'Todo' : '日程'
@@ -542,7 +529,6 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   const setModelSelectorOpen = useSetAtom(modelSelectorOpenAtom)
   const setDraftSessionIds = useSetAtom(draftSessionIdsAtom)
   const globalWorkspaceId = useAtomValue(currentAgentWorkspaceIdAtom)
-  const setCurrentAgentWorkspaceId = useSetAtom(currentAgentWorkspaceIdAtom)
   // 会话已归属工作区时始终以其自身为准；缺少 workspaceId 的旧会话则回退当前项目。
   // 否则 AgentView 会把 workspaceSlug 传成 null，导致 # MCP（以及 / Skill、@ 文件）在
   // 已选中的工作区中仍拿不到能力摘要。
@@ -555,8 +541,6 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   const [canvasNodeReferences, setCanvasNodeReferences] = useAtom(agentCanvasNodeReferencesAtomFamily(sessionId))
   /** Canvas metadata 只用于友好标题，缺失时 chip 统一回退“画布”。 */
   const canvasSessionsByProject = useAtomValue(canvasSessionsByProjectAtom)
-  /** 显式初始化返回的权威 Canvas 元数据立即写入当前 Renderer registry。 */
-  const upsertCanvasSession = useSetAtom(upsertCanvasSessionAtom)
   /** 仅从现有 Canvas registry metadata 解析标题，禁止把 UUID 当作展示回退。 */
   const getCanvasReferenceTitle = React.useCallback((reference: CanvasNodeReference): string | undefined => (
     canvasSessionsByProject.get(reference.projectId)?.find((canvas) => canvas.id === reference.canvasId)?.title
@@ -2055,18 +2039,6 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       })
       return
     }
-    /** 附件和选区可能是实现依据，保持原 Agent 流程；纯文本视觉请求才进入本地选择。 */
-    const bypassDesignHandoff = designHandoffBypassPromptRef.current === effectiveText
-    if (bypassDesignHandoff) designHandoffBypassPromptRef.current = null
-    if (!bypassDesignHandoff
-      && currentWorkspaceId
-      && pendingFilesSnapshot.length === 0
-      && canvasNodeReferencesSnapshot.length === 0
-      && !currentQuotedSelection
-      && shouldOfferDesignHandoff(effectiveText)) {
-      setPendingDesignHandoff({ prompt: effectiveText })
-      return
-    }
     const additionalDirectoriesForRun = createBaseAdditionalDirectories()
 
     if (streaming) {
@@ -2337,62 +2309,6 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         }
       })
   }, [clearSentCanvasNodeReferences, createBaseAdditionalDirectories, preparePendingFilesForSend, restoreFailedInputContent, restoreQueuedAttachmentsToPending, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, consumeQuotedSelection, currentQuotedSelection, setStreamingStates, setAgentStreamErrors, setPromptSuggestions, setInputContent, setInputHtmlContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, setQuotedSelectionMap, sendPlainTextAgentMessage, isLegacyTranscript, isStopping])
-
-  /** 用户明确选择代码实现后，复用原发送链并只绕过一次 Design 判断。 */
-  const handleContinueDesignRequestInAgent = React.useCallback((): void => {
-    if (!pendingDesignHandoff) return
-    designHandoffBypassPromptRef.current = pendingDesignHandoff.prompt
-    setPendingDesignHandoff(null)
-    void handleSend(pendingDesignHandoff.prompt, true)
-  }, [handleSend, pendingDesignHandoff])
-
-  /** 将原始要求预填到当前 Agent 的右侧 Canvas，不发送消息、不自动开始付费生图。 */
-  const handleOpenDesignHandoff = React.useCallback(async (): Promise<void> => {
-    if (!pendingDesignHandoff || !currentWorkspaceId) return
-    try {
-      /** 全新项目先幂等创建 legacy 文档与索引，binding 校验随后继续使用权威 registry。 */
-      const legacySession = await designAdapter.ensureLegacyCanvasSession({ projectId: currentWorkspaceId })
-      upsertCanvasSession(legacySession)
-      /** 以主进程 binding 为准，首次关联时同时建立默认 Canvas。 */
-      const bindings = await designAdapter.listAgentCanvasBindings({ projectId: currentWorkspaceId })
-      const binding = bindings.find((item) => item.sessionId === sessionId)
-      await designAdapter.linkAgentCanvas({
-        projectId: currentWorkspaceId,
-        sessionId,
-        canvasId: LEGACY_DESIGN_CANVAS_ID,
-        makeDefault: binding?.defaultCanvasId === undefined,
-      })
-    } catch (error) {
-      console.error('[AgentView] 打开设计画布失败:', error)
-      toast.error('打开设计画布失败')
-      return
-    }
-    updateDesignProjectState({
-      projectId: currentWorkspaceId,
-      update: {
-        inspectorTab: 'ai',
-        generationPrompt: pendingDesignHandoff.prompt,
-      },
-    })
-    setCurrentAgentWorkspaceId(currentWorkspaceId)
-    void window.electronAPI.updateSettings({ agentWorkspaceId: currentWorkspaceId }).catch(console.error)
-    setInputContent('')
-    setInputHtmlContent('')
-    setPromptSuggestions((previous) => {
-      if (!previous.has(sessionId)) return previous
-      const next = new Map(previous)
-      next.delete(sessionId)
-      return next
-    })
-    setPendingDesignHandoff(null)
-    setSidePanelTabMap((previous) => {
-      const next = new Map(previous)
-      next.set(sessionId, getCanvasWorkspaceTab(LEGACY_DESIGN_CANVAS_ID))
-      return next
-    })
-    setSidePanelOpen(true)
-    toast.success('已打开设计面板', { description: '原始要求已填入，确认后再生成图片。' })
-  }, [currentWorkspaceId, pendingDesignHandoff, sessionId, setCurrentAgentWorkspaceId, setInputContent, setPromptSuggestions, setSidePanelOpen, setSidePanelTabMap, updateDesignProjectState, upsertCanvasSession])
 
   /** 停止生成。异常流未发出终态时，允许再次下发幂等的 abort 请求。 */
   const handleStop = React.useCallback((): void => {
@@ -3307,29 +3223,6 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
           </label>
         </div>
         <DialogFooter><Button type="button" variant="ghost" onClick={() => setTodoDialogOpen(false)}>取消</Button><Button type="button" onClick={() => void handleCreateReplyTodo()} disabled={creatingTodo || !todoDraftTitle.trim()}><ListTodo size={15} />添加 Todo</Button></DialogFooter>
-      </DialogContent>
-    </Dialog>
-
-    <Dialog
-      open={pendingDesignHandoff !== null}
-      onOpenChange={(open) => { if (!open) setPendingDesignHandoff(null) }}
-    >
-      <DialogContent className="max-w-md">
-        <DialogHeader>
-          <DialogTitle>这次先做视觉稿吗？</DialogTitle>
-          <DialogDescription>
-            当前要求可能同时表示视觉方案和代码实现。打开设计面板只会预填描述，不会立即生成图片。
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <Button type="button" variant="outline" onClick={handleContinueDesignRequestInAgent}>
-            继续让 Agent 实现
-          </Button>
-          <Button type="button" onClick={handleOpenDesignHandoff}>
-            <Palette aria-hidden="true" />
-            打开设计面板
-          </Button>
-        </DialogFooter>
       </DialogContent>
     </Dialog>
 

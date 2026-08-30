@@ -135,6 +135,7 @@ import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
 import { getChangedWorkspaceComponentFromSdkMessage, shouldRevealChangedWorkspaceComponentImmediately } from '@/lib/agent-component-activation'
 import { mergeActiveAgentSessionSnapshot } from '@/lib/agent-active-session-snapshot'
 import { buildTodoAgentPrompt } from '@/lib/todo-agent-prompt'
+import { parseCanvasArtifactToolResult } from '@/lib/agent-canvas-artifact-result'
 
 /** 触发右侧文件浏览器自动定位的写入类工具集合 */
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Update'])
@@ -824,6 +825,63 @@ export function startGlobalAgentCanvasActivityConsumer(
   }
 }
 
+/** 全局 Agent 产物工具消费者公开的最小生命周期。 */
+export interface GlobalAgentCanvasArtifactConsumer {
+  handle: (sessionId: string, event: AgentEvent) => void
+  dispose: () => void
+}
+
+/** 为会话与工具调用构造不会跨会话碰撞的短期身份。 */
+function createCanvasArtifactToolKey(sessionId: string, toolUseId: string): string {
+  return JSON.stringify([sessionId, toolUseId])
+}
+
+/**
+ * 监听普通 Agent 的画布产物工具结果，并只导航产出会话自己的右侧工作区。
+ * @param store Renderer 进程内唯一 Jotai store。
+ * @returns 可接收扁平 AgentEvent 的消费者与清理函数。
+ */
+export function startGlobalAgentCanvasArtifactConsumer(store: Store): GlobalAgentCanvasArtifactConsumer {
+  /** 只有真实 canvas_create_artifact start 才能授权同会话结果触发导航。 */
+  const pendingToolKeys = new Set<string>()
+  return {
+    handle: (sessionId, event) => {
+      if (event.type === 'tool_start') {
+        if (event.toolName === 'canvas_create_artifact') {
+          pendingToolKeys.add(createCanvasArtifactToolKey(sessionId, event.toolUseId))
+        }
+        return
+      }
+      if (event.type === 'complete' || event.type === 'error') {
+        const prefix = `[${JSON.stringify(sessionId)},`
+        for (const key of pendingToolKeys) {
+          if (key.startsWith(prefix)) pendingToolKeys.delete(key)
+        }
+        return
+      }
+      if (event.type !== 'tool_result') return
+      const key = createCanvasArtifactToolKey(sessionId, event.toolUseId)
+      if (!pendingToolKeys.delete(key) || event.isError) return
+      const result = parseCanvasArtifactToolResult(event.result)
+      if (!result) return
+      /** 会话项目是构造完整 view key 的权威 Renderer 快照；缺失时禁止猜测项目。 */
+      const session = store.get(agentSessionsAtom).find((candidate) => candidate.id === sessionId)
+      if (!session?.workspaceId) return
+      store.set(agentSidePanelOpenAtomFamily(sessionId), true)
+      store.set(agentDiffPanelTabAtom, (previous) => {
+        const nextTab = getCanvasWorkspaceTab(result.canvasId)
+        if (previous.get(sessionId) === nextTab) return previous
+        const next = new Map(previous)
+        next.set(sessionId, nextTab)
+        return next
+      })
+      const viewKey = createAgentCanvasViewKey(sessionId, session.workspaceId, result.canvasId)
+      store.set(navigateAgentCanvasViewAtom, { key: viewKey, nodeId: result.nodeId })
+    },
+    dispose: () => pendingToolKeys.clear(),
+  }
+}
+
 export function useGlobalAgentListeners(): void {
   const store = useStore()
 
@@ -838,6 +896,8 @@ export function useGlobalAgentListeners(): void {
     }>()
     /** 正在执行的 git 突变 Bash 命令：toolUseId → sessionId（完成后触发 diff 刷新） */
     const pendingGitMutateTools = new Map<string, string>()
+    /** 创建产物后只导航执行该工具的普通 Agent 会话。 */
+    const canvasArtifactConsumer = startGlobalAgentCanvasArtifactConsumer(store)
 
     /** 普通 Agent Canvas activity 只在应用顶层消费一次，不依赖 SidePanel 挂载。 */
     const canvasActivityConsumer = startGlobalAgentCanvasActivityConsumer(store, {
@@ -1477,6 +1537,8 @@ export function useGlobalAgentListeners(): void {
           )) {
             continue
           }
+
+          canvasArtifactConsumer.handle(sessionId, event)
 
           // 会话首次进入 running 时，清除旧的完成提醒状态
           if (event.type !== 'prompt_suggestion') {
@@ -2370,6 +2432,7 @@ export function useGlobalAgentListeners(): void {
       cleanupWatchedFileChanges()
       cleanupQueuedMessageStatus()
       canvasActivityConsumer.dispose()
+      canvasArtifactConsumer.dispose()
       clearInterval(pruneTimer)
       window.removeEventListener('focus', onWindowFocus)
     }
