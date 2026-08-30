@@ -25,7 +25,7 @@ import {
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, CANVAS_IPC_CHANNELS, isPromaPermissionMode, normalizePathForCompare, parseCanvasNodeContentMeta, TERMINAL_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS, isPromaPermissionMode, normalizePathForCompare, parseCanvasNodeContentMeta, TERMINAL_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS, TRAY_IPC_CHANNELS } from '../types'
 import type {
   QuickTaskSubmitInput,
@@ -172,6 +172,7 @@ import type {
   BrowserCreateTabInput,
   CanvasChangeEvent,
   AgentCanvasBindingChangeEvent,
+  CanvasSessionChangeEvent,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
@@ -205,6 +206,7 @@ import {
   registerAgentCanvasBindingIpcHandlers,
 } from './lib/design/agent-canvas-binding-ipc'
 import { AgentCanvasBindingStore } from './lib/design/agent-canvas-binding-store'
+import { createCanvasToolAccessFacade } from './lib/design/canvas-tool-access-facade'
 import {
   createCanvasOperationSerializer,
   registerCanvasDocumentIpcHandlers,
@@ -2208,21 +2210,47 @@ export function registerIpcHandlers(): void {
     assets: designAssetService,
   })
   setDefaultDesignJobManager(designJobManager)
+  /** Canvas 会话 IPC 与 Agent 工具共享同一公开事件通道。 */
+  const broadcastCanvasSessionChange = (event: CanvasSessionChangeEvent): void => {
+    for (const contents of listAuthorizedDesignWebContents()) {
+      try {
+        contents.send(DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED, event)
+      } catch {
+        console.error('[IPC] Canvas 会话变化广播失败')
+      }
+    }
+  }
+  /** Agent 关联 IPC、删除清理与 Agent 工具共享同一公开事件通道。 */
+  const broadcastAgentCanvasBindingChange = (event: AgentCanvasBindingChangeEvent): void => {
+    for (const contents of listAuthorizedDesignWebContents()) {
+      try {
+        contents.send(CANVAS_IPC_CHANNELS.AGENT_BINDINGS_CHANGED, event)
+      } catch {
+        console.error('[IPC] Agent-Canvas 关联变化广播失败')
+      }
+    }
+  }
+  /** 普通 Agent 引用和五个 Canvas 工具只消费生产唯一 Store 与守卫。 */
+  const canvasToolAccess = createCanvasToolAccessFacade({
+    getAgentSession: getAgentSessionMeta,
+    assertProjectAuthorized: (projectId) => {
+      if (!getAgentWorkspace(projectId)) throw new Error('CANVAS_PROJECT_ACCESS_DENIED')
+    },
+    getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
+    runProjectMutation: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+    sessions: canvasSessionStore,
+    bindings: agentCanvasBindingStore,
+    loadCanvas: (target) => canvasDocumentStore.load(target),
+    broadcastSession: broadcastCanvasSessionChange,
+    broadcastBinding: broadcastAgentCanvasBindingChange,
+  })
   /** 删除生命周期与 LIST 对账共用同一 Store 和固定广播边界。 */
   const agentCanvasBindingCleanup = {
     store: agentCanvasBindingStore,
     runProjectMutation: <T>(projectId: string, effect: () => T): T => (
       workspaceOperationGuard.runWorkspaceWrite(projectId, effect)
     ),
-    broadcast: (event: AgentCanvasBindingChangeEvent): void => {
-      for (const contents of listAuthorizedDesignWebContents()) {
-        try {
-          contents.send(CANVAS_IPC_CHANNELS.AGENT_BINDINGS_CHANGED, event)
-        } catch {
-          console.error('[IPC] Agent-Canvas 关联变化广播失败')
-        }
-      }
-    },
+    broadcast: broadcastAgentCanvasBindingChange,
   }
   registerAgentCanvasBindingIpcHandlers({
     ipcMain,
@@ -2250,6 +2278,7 @@ export function registerIpcHandlers(): void {
     guard: workspaceOperationGuard,
     sessions: canvasSessionStore,
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
+    broadcast: broadcastCanvasSessionChange,
     assertCanvasIdle: (projectId, canvasId) => {
       /** Agent 与图片任务任一仍运行时都保留画布，避免删除执行中的事实源。 */
       const hasBusyAgent = listAgentSessions().some((session) => (
@@ -2316,6 +2345,7 @@ export function registerIpcHandlers(): void {
       stop: stopAgent,
     },
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
+    toolAccess: canvasToolAccess,
   })
   registerDesignIpcHandlers({
     ipc: ipcMain,

@@ -85,6 +85,8 @@ import {
   createAgentCanvasViewKey,
   createLegacyAgentCanvasHostSessionId,
   navigateAgentCanvasViewAtom,
+  recordAgentCanvasActivityAtom,
+  reconcileAgentCanvasActivityBindingAtom,
 } from '@/atoms/agent-canvas-atoms'
 import { tabsAtom, activeTabIdAtom, activeSessionIdAtom, openTab, updateTabTitle } from '@/atoms/tab-atoms'
 import type { AgentStreamState } from '@/atoms/agent-atoms'
@@ -101,7 +103,7 @@ import {
 } from '@/atoms/preview-atoms'
 import type { NotificationSoundType } from '@/types/settings'
 import { toast } from 'sonner'
-import type { AgentStreamEvent, AgentStreamCompletePayload, AgentStreamErrorPayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, SDKAssistantMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock, AgentQueuedMessageStatus } from '@proma/shared'
+import type { AgentCanvasBinding, AgentCanvasBindingChangeEvent, AgentStreamEvent, AgentStreamCompletePayload, AgentStreamErrorPayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, CanvasChangeEvent, SDKAssistantMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock, AgentQueuedMessageStatus } from '@proma/shared'
 import { inferContextWindow } from '@proma/shared'
 import {
   buildExternalAgentRunActivation,
@@ -742,6 +744,57 @@ export function applyAgentQueuedMessageStatus(store: Store, status: AgentQueuedM
   return applyAgentQueuedMessageFailedStatus(store, status)
 }
 
+/** 全局 Canvas activity consumer 的可测试窄依赖。 */
+export interface GlobalAgentCanvasActivityDependencies {
+  listBindings: (projectId: string) => Promise<AgentCanvasBinding[]>
+  onCanvasChanged: (listener: (event: CanvasChangeEvent) => void) => () => void
+  onBindingChanged: (listener: (event: AgentCanvasBindingChangeEvent) => void) => () => void
+}
+
+/** 在应用顶层建立唯一 Canvas activity listener，不依赖任何 SidePanel 或 Canvas controller。 */
+export function startGlobalAgentCanvasActivityConsumer(
+  store: Store,
+  dependencies: GlobalAgentCanvasActivityDependencies,
+): { dispose: () => void } {
+  /** binding 变化代次用于阻止在途旧 LIST 恢复已撤销授权。 */
+  const bindingGenerationByProject = new Map<string, number>()
+  let disposed = false
+  const releaseBinding = dependencies.onBindingChanged((event) => {
+    bindingGenerationByProject.set(
+      event.projectId,
+      (bindingGenerationByProject.get(event.projectId) ?? 0) + 1,
+    )
+    store.set(
+      reconcileAgentCanvasActivityBindingAtom,
+      event.binding,
+      event.projectId,
+      event.sessionId,
+    )
+  })
+  const releaseCanvas = dependencies.onCanvasChanged((event) => {
+    void (async () => {
+      let bindings: AgentCanvasBinding[]
+      while (true) {
+        const generation = bindingGenerationByProject.get(event.projectId) ?? 0
+        bindings = await dependencies.listBindings(event.projectId)
+        if (disposed) return
+        if ((bindingGenerationByProject.get(event.projectId) ?? 0) === generation) break
+      }
+      store.set(recordAgentCanvasActivityAtom, { event, bindings })
+    })().catch(() => {
+      console.error('[Agent-Canvas activity] 权威关联读取失败')
+    })
+  })
+  return {
+    dispose: () => {
+      if (disposed) return
+      disposed = true
+      releaseCanvas()
+      releaseBinding()
+    },
+  }
+}
+
 export function useGlobalAgentListeners(): void {
   const store = useStore()
 
@@ -756,6 +809,13 @@ export function useGlobalAgentListeners(): void {
     }>()
     /** 正在执行的 git 突变 Bash 命令：toolUseId → sessionId（完成后触发 diff 刷新） */
     const pendingGitMutateTools = new Map<string, string>()
+
+    /** 普通 Agent Canvas activity 只在应用顶层消费一次，不依赖 SidePanel 挂载。 */
+    const canvasActivityConsumer = startGlobalAgentCanvasActivityConsumer(store, {
+      listBindings: (projectId) => designAdapter.listAgentCanvasBindings({ projectId }),
+      onCanvasChanged: (listener) => window.electronAPI.onCanvasChanged(listener),
+      onBindingChanged: (listener) => window.electronAPI.onAgentCanvasBindingChanged(listener),
+    })
 
     const cleanupQueuedMessageStatus = window.electronAPI.onAgentQueuedMessageStatus((status) => {
       const applied = applyAgentQueuedMessageStatus(store, status)
@@ -2265,6 +2325,7 @@ export function useGlobalAgentListeners(): void {
       cleanupPlaySound()
       cleanupWatchedFileChanges()
       cleanupQueuedMessageStatus()
+      canvasActivityConsumer.dispose()
       clearInterval(pruneTimer)
       window.removeEventListener('focus', onWindowFocus)
     }

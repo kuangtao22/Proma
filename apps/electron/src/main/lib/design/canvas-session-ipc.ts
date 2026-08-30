@@ -34,6 +34,8 @@ export interface CanvasSessionIpcOptions {
   guard: Pick<WorkspaceOperationGuard, 'runWorkspaceWrite'>
   sessions: CanvasSessionStoreContract
   getProjectReadOnlyReason: (projectId: string) => string | undefined
+  /** 生产可注入与 Agent 工具共享的唯一公开事件广播边界。 */
+  broadcast?: (event: CanvasSessionChangeEvent) => void
   /** 删除前阻止仍有运行任务的 Canvas 进入不可恢复清理。 */
   assertCanvasIdle?: (projectId: string, canvasId: string) => void
   /** 索引删除成功后先清理全部普通 Agent 关联并广播精确变化。 */
@@ -184,6 +186,10 @@ function requireWritableProject(projectId: string, options: CanvasSessionIpcOpti
  * @param event 不包含路径和内部存储形态的变化事件。
  */
 function broadcastChange(options: CanvasSessionIpcOptions, event: CanvasSessionChangeEvent): void {
+  if (options.broadcast) {
+    options.broadcast(event)
+    return
+  }
   for (const contents of options.listAuthorizedWebContents()) {
     if (contents.isDestroyed()) continue
     try {

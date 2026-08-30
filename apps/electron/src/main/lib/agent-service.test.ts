@@ -7,7 +7,7 @@ import { isEligibleProjectAgent } from './agent-session-visibility'
 describe('Agent service 迁移准入', () => {
   test('Given 普通项目、无项目与 Design 内部会话 When 准备运行 Then 仅普通项目在引用解析后注入 Canvas 单轮工具', () => {
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
-    expect(source).toContain('createCanvasToolRun(')
+    expect(source).toContain('runtime.createRun(')
     expect(source).toContain('prepared.references')
     expect(source).toContain('isEligibleProjectAgent(sessionMeta, sessionMeta.workspaceId)')
     expect(source).toContain("((prepared.input as AgentSendInput).permissionModeOverride ?? sessionMeta.permissionMode) === 'plan'")
@@ -20,8 +20,17 @@ describe('Agent service 迁移准入', () => {
     const functionEnd = source.indexOf('/** Agent service', functionStart)
     /** 被测运行准备函数的源码片段。 */
     const functionBody = source.slice(functionStart, functionEnd)
-    expect(functionBody.indexOf('createCanvasToolRun('))
+    expect(functionBody.indexOf('runtime.createRun('))
       .toBeGreaterThan(functionBody.indexOf('prepareAgentCanvasMessageForSend('))
+  })
+
+  test('Given 生产 Canvas runtime When 检查 Agent service Then 不构造独立 Store 且只消费唯一 facade', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    expect(source).not.toContain('new CanvasSessionStore(')
+    expect(source).not.toContain('new AgentCanvasBindingStore(')
+    expect(source).not.toContain('createCanvasDocumentStore(')
+    expect(source).toContain('runtime.referenceResolver')
+    expect(source).toContain('runtime.createRun(')
   })
 
   test('Given 内部、探索、归档或损坏来源会话 When 生产 eligibility 判断 Then 全部排除 Canvas 工具', () => {

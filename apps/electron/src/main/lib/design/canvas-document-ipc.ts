@@ -70,7 +70,11 @@ import type { AgentRunExtensions } from '../agent-run-extensions'
 import type {
   CanvasToolNodeRunResult,
   CanvasToolRunContext,
+  CanvasToolRun,
 } from './canvas-tool-provider'
+import { createCanvasToolRun } from './canvas-tool-provider'
+import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
+import type { CanvasNodeReferenceResolver } from './canvas-node-reference-resolver'
 import {
   CANVAS_AGENT_ALLOWED_TOOL_NAMES,
   requireCanvasAgentRunOwner,
@@ -156,10 +160,14 @@ export interface CanvasDocumentIpcOptions {
     stop: (sessionId: string) => void
   }
   getProjectReadOnlyReason: (projectId: string) => string | undefined
+  /** 生产普通 Agent 工具复用的唯一授权与关联 facade。 */
+  toolAccess?: CanvasToolAccessFacade
 }
 
 /** 普通 Agent 工具复用 IPC 已注册的唯一文档与 Task8 batch 实例。 */
 export interface CanvasToolProviderRuntime {
+  referenceResolver: CanvasNodeReferenceResolver
+  createRun: (context: CanvasToolRunContext) => CanvasToolRun
   documents: Pick<CanvasDocumentStore, 'load' | 'validateBatchOperations'>
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
   readNodeContent: (target: CanvasTarget, node: CanvasNode) => Promise<string>
@@ -1386,12 +1394,23 @@ export function registerCanvasDocumentIpcHandlers(
     return nodes.map((node) => taskByNodeId.get(node.id)!)
   }
 
-  if (options.batch.execute) {
+  if (options.batch.execute && options.toolAccess) {
+    /** 当前注册代次只闭包生产注入的唯一 facade 与文档执行边界。 */
+    const toolAccess = options.toolAccess
+    const batch = { execute: options.batch.execute }
     canvasToolProviderRuntime = {
       owner: registrationToken,
       value: {
+        referenceResolver: toolAccess.referenceResolver,
+        createRun: (context) => createCanvasToolRun({
+          access: toolAccess,
+          documents: options.store,
+          batch,
+          readNodeContent: readCanvasNodeContent,
+          runNodes: runCanvasNodes,
+        }, context),
         documents: options.store,
-        batch: { execute: options.batch.execute },
+        batch,
         readNodeContent: readCanvasNodeContent,
         runNodes: runCanvasNodes,
       },

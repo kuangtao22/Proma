@@ -23,6 +23,7 @@ import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasBatchPublication } from './canvas-agent-batch-operation'
 import { createCanvasOperationSerializer, getCanvasToolProviderRuntime, registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
+import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 
 /** 测试 IPC handler 的最小签名。 */
 type TestHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
@@ -31,6 +32,23 @@ type TestHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
 interface TestWebContents extends WebContents {
   sent: Array<{ channel: string; value: unknown }>
   destroyForTest: () => void
+}
+
+/** 创建不触碰 Store 的 runtime 测试 facade；相关用例只验证 runNodes 生命周期。 */
+function createToolAccess(): CanvasToolAccessFacade {
+  return {
+    referenceResolver: {
+      resolveForSend: () => { throw new Error('测试未配置 Canvas 引用') },
+    },
+    authorizeRead: () => undefined,
+    getBinding: () => null,
+    requireLinkedCanvas: () => { throw new Error('测试未配置 Canvas 关联') },
+    runWrite: (_context, effect) => effect(),
+    createAndLink: () => { throw new Error('测试未配置 Canvas 创建') },
+    link: () => { throw new Error('测试未配置 Canvas 关联') },
+    unlink: () => { throw new Error('测试未配置 Canvas 解除关联') },
+    setDefault: () => { throw new Error('测试未配置 Canvas 默认关联') },
+  }
 }
 
 /** 创建固定 ID 且可记录广播的窗口。 */
@@ -305,6 +323,7 @@ function createContext(options: {
         }
       },
     },
+    ...(options.enableToolProviderRuntime ? { toolAccess: createToolAccess() } : {}),
     creation: {
       reconcile: async (target) => {
         calls.push('creation:reconcile')
@@ -2673,6 +2692,7 @@ describe('原生 Canvas 文档 IPC', () => {
           document: createDocument(revision), operationId: '', publications: [],
         }),
       },
+      toolAccess: createToolAccess(),
       creation: {
         reconcile: async () => ({
           snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] },

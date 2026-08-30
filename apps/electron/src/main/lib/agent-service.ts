@@ -65,12 +65,10 @@ import {
   prepareAgentCanvasMessageForSend,
   type PreparedAgentCanvasMessage,
 } from './agent-canvas-message-preparation'
-import { AgentCanvasBindingStore } from './design/agent-canvas-binding-store'
-import { createCanvasDocumentStore } from './design/canvas-document-store'
-import { createCanvasNodeReferenceResolver } from './design/canvas-node-reference-resolver'
-import { CanvasSessionStore } from './design/canvas-session-store'
-import { designPathResolver } from './design/design-paths'
-import { createCanvasToolRun } from './design/canvas-tool-provider'
+import {
+  CanvasReferenceInvalidError,
+  type CanvasNodeReferenceResolver,
+} from './design/canvas-node-reference-resolver'
 import { getCanvasToolProviderRuntime } from './design/canvas-document-ipc'
 
 /** 保持现有主进程调用方从 agent-service 导入运行扩展类型的兼容性。 */
@@ -83,29 +81,29 @@ const useUtilityAgentRuntime = process.env.PROMA_AGENT_RUNTIME !== 'in-process'
   && process.env.PROMA_AGENT_RUNTIME !== 'off'
 const adapter = useUtilityAgentRuntime ? new PiUtilityAdapter() : new PiAgentAdapter()
 const orchestrator = new AgentOrchestrator(adapter, eventBus)
-/** Canvas 引用读取复用生产路径解析器，但不共享 IPC Store 的可变缓存。 */
-const canvasReferenceSessionStore = new CanvasSessionStore({ pathResolver: designPathResolver })
-/** 文档 Store 通过会话 registry 在每次 LOAD 时重新复核 Canvas 归属。 */
-const canvasReferenceDocumentStore = createCanvasDocumentStore({ sessions: canvasReferenceSessionStore })
-/** 普通 Agent 工具与引用解析共享同一进程内 binding Store。 */
-const canvasToolBindingStore = new AgentCanvasBindingStore()
-/** 发送边界的权威 Canvas 节点引用解析器。 */
-const canvasNodeReferenceResolver = createCanvasNodeReferenceResolver({
-  getSession: getAgentSessionMeta,
-  getBinding: (projectId, sessionId) => canvasToolBindingStore.get(projectId, sessionId),
-  requireCanvas: (projectId, canvasId) => canvasReferenceSessionStore.requireNative(projectId, canvasId),
-  loadCanvas: (target) => canvasReferenceDocumentStore.load(target),
-})
+/** IPC runtime 尚未注册时，非空 Canvas 引用必须 fail closed，禁止临时重建 Store。 */
+const unavailableCanvasReferenceResolver: CanvasNodeReferenceResolver = {
+  resolveForSend: () => { throw new CanvasReferenceInvalidError(new Error('CANVAS_RUNTIME_UNAVAILABLE')) },
+}
 
 /** 单次发送前解析引用，并把轻量摘要固化进准备结果。 */
 export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInput>(
   input: T,
   extensions: AgentRunExtensions = {},
 ): PreparedAgentCanvasMessage<T> {
-  /** 引用先完成权威解析，工具上下文只能使用解析后的快照。 */
-  const prepared = prepareAgentCanvasMessageForSend(input, extensions, canvasNodeReferenceResolver)
-  const sessionMeta = getAgentSessionMeta(input.sessionId)
+  /** runtime 同时提供唯一引用解析器和工具 facade；缺失时仅允许无引用消息继续。 */
   const runtime = getCanvasToolProviderRuntime()
+  /** 显式分支便于审计生产 resolver 来源，禁止隐藏回退 Store。 */
+  const referenceResolver = runtime
+    ? runtime.referenceResolver
+    : unavailableCanvasReferenceResolver
+  /** 引用先完成权威解析，工具上下文只能使用解析后的快照。 */
+  const prepared = prepareAgentCanvasMessageForSend(
+    input,
+    extensions,
+    referenceResolver,
+  )
+  const sessionMeta = getAgentSessionMeta(input.sessionId)
   const isInteractiveUserRun = !('triggeredBy' in input)
     || input.triggeredBy === undefined
     || input.triggeredBy === 'user'
@@ -113,14 +111,7 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
     || !sessionMeta?.workspaceId
     || !isEligibleProjectAgent(sessionMeta, sessionMeta.workspaceId)
     || !isInteractiveUserRun) return prepared
-  const canvasRun = createCanvasToolRun({
-    sessions: canvasReferenceSessionStore,
-    bindings: canvasToolBindingStore,
-    documents: runtime.documents,
-    readNodeContent: runtime.readNodeContent,
-    batch: runtime.batch,
-    runNodes: runtime.runNodes,
-  }, {
+  const canvasRun = runtime.createRun({
     projectId: sessionMeta.workspaceId,
     sessionId: input.sessionId,
     runStartedAt: 'startedAt' in input && input.startedAt != null ? input.startedAt : Date.now(),

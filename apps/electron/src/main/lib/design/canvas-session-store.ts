@@ -43,6 +43,12 @@ export interface CreateCanvasSessionWithIdInput {
   title?: string
 }
 
+/** 确定性 Canvas 创建的持久化结果，用于区分首次提交与幂等重放。 */
+export interface CreateCanvasSessionWithIdResult {
+  session: CanvasSessionMeta
+  created: boolean
+}
+
 /** 项目级 Canvas 会话索引，所有写入均使用 safe-file 原子提交。 */
 export class CanvasSessionStore {
   constructor(private readonly dependencies: CanvasSessionStoreDependencies) {}
@@ -132,6 +138,15 @@ export class CanvasSessionStore {
    * @returns 首次原子提交或既有原生记录对应的公开会话。
    */
   createWithId(input: CreateCanvasSessionWithIdInput): CanvasSessionMeta {
+    return this.createWithIdOnce(input).session
+  }
+
+  /**
+   * 以调用方派生的安全 ID 幂等创建原生 Canvas，并返回是否首次提交。
+   * @param input 已授权项目、确定性 Canvas ID 与可选标题。
+   * @returns 当前公开会话与本次是否真实写入索引。
+   */
+  createWithIdOnce(input: CreateCanvasSessionWithIdInput): CreateCanvasSessionWithIdResult {
     /** 每次调用都 fresh-read 项目索引，使路径撤销和外部变更继续 fail closed。 */
     const index = this.readIndex(input.projectId)
     if (!isSafeDesignStableId(input.canvasId)) throw new Error(`Canvas ID 非法或重复: ${input.canvasId}`)
@@ -139,7 +154,7 @@ export class CanvasSessionStore {
     const existing = index.sessions.find((session) => session.id === input.canvasId)
     if (existing) {
       if (existing.storageKind !== 'native') throw new Error(`Canvas ID 非法或重复: ${input.canvasId}`)
-      return toPublicSession(existing)
+      return { session: toPublicSession(existing), created: false }
     }
     /** 首次创建与普通创建保持相同标题、时间和原子索引合同。 */
     const now = this.requireNow()
@@ -155,7 +170,7 @@ export class CanvasSessionStore {
     index.sessions.push(record)
     index.updatedAt = now
     this.writeIndex(index)
-    return toPublicSession(record)
+    return { session: toPublicSession(record), created: true }
   }
 
   /**

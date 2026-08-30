@@ -1,4 +1,4 @@
-import type { CanvasDocument } from '@proma/shared'
+import type { AgentCanvasBinding, CanvasChangeEvent, CanvasDocument } from '@proma/shared'
 import { atom } from 'jotai'
 
 /** 独立 Canvas 入口在迁入普通 Agent 前使用的稳定宿主会话前缀。 */
@@ -88,6 +88,76 @@ export function createAgentCanvasViewKey(
 ): string {
   return JSON.stringify([sessionId, projectId, canvasId])
 }
+
+/** 未依赖 Canvas LOAD 的普通 Agent 画布活动状态。 */
+export interface AgentCanvasActivityState {
+  activityRevision: number
+  seenActivityRevision: number
+}
+
+/** 所有普通 Agent 的后台 Canvas activity 按完整 view key 持久驻留于 Renderer。 */
+export const agentCanvasActivityStatesAtom = atom<Map<string, AgentCanvasActivityState>>(new Map())
+
+/** 单次权威 Canvas 事件与完整 bindings 快照。 */
+export interface RecordAgentCanvasActivityInput {
+  event: CanvasChangeEvent
+  bindings: readonly AgentCanvasBinding[]
+}
+
+/** 基于完整 binding 列表增量所有关联 Agent，不读取共享 Canvas 图。 */
+export const recordAgentCanvasActivityAtom = atom(
+  null,
+  (get, set, input: RecordAgentCanvasActivityInput): void => {
+    const previous = get(agentCanvasActivityStatesAtom)
+    const next = new Map(previous)
+    for (const binding of input.bindings) {
+      if (binding.projectId !== input.event.projectId
+        || !binding.linkedCanvasIds.includes(input.event.canvasId)) continue
+      const key = createAgentCanvasViewKey(binding.sessionId, binding.projectId, input.event.canvasId)
+      const current = next.get(key) ?? { activityRevision: 0, seenActivityRevision: 0 }
+      next.set(key, { ...current, activityRevision: current.activityRevision + 1 })
+    }
+    set(agentCanvasActivityStatesAtom, next)
+  },
+)
+
+/** 单个 binding 变化后清除该 Agent 已不再关联的后台 activity。 */
+export const reconcileAgentCanvasActivityBindingAtom = atom(
+  null,
+  (get, set, binding: AgentCanvasBinding | null, projectId: string, sessionId: string): void => {
+    const linkedCanvasIds = new Set(binding?.linkedCanvasIds ?? [])
+    const previous = get(agentCanvasActivityStatesAtom)
+    const next = new Map(previous)
+    let changed = false
+    for (const key of previous.keys()) {
+      let identity: unknown
+      try {
+        identity = JSON.parse(key) as unknown
+      } catch {
+        continue
+      }
+      if (!Array.isArray(identity) || identity.length !== 3
+        || identity[0] !== sessionId || identity[1] !== projectId
+        || typeof identity[2] !== 'string' || linkedCanvasIds.has(identity[2])) continue
+      next.delete(key)
+      changed = true
+    }
+    if (changed) set(agentCanvasActivityStatesAtom, next)
+  },
+)
+
+/** 将目标 view 当前活动代次标记为已读。 */
+export const markAgentCanvasActivitySeenAtom = atom(
+  null,
+  (get, set, key: string): void => {
+    const previous = get(agentCanvasActivityStatesAtom)
+    const current = previous.get(key)
+    if (!current || current.seenActivityRevision === current.activityRevision) return
+    const next = new Map(previous)
+    next.set(key, { ...current, seenActivityRevision: current.activityRevision })
+    set(agentCanvasActivityStatesAtom, next)
+  },
+)
 
 /**
  * 请求打开目标节点工作台，dirty 时只登记待确认目标。

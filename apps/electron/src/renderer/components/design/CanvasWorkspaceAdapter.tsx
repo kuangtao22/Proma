@@ -10,10 +10,13 @@ import {
 } from '@/atoms/canvas-session-atoms'
 import {
   createAgentCanvasViewKey,
+  agentCanvasActivityStatesAtom,
   agentCanvasViewStatesAtom,
   initializeAgentCanvasViewStateAtom,
   removeAgentCanvasViewStateAtom,
+  markAgentCanvasActivitySeenAtom,
   updateAgentCanvasViewStateAtom,
+  type AgentCanvasActivityState,
   type AgentCanvasViewState,
 } from '@/atoms/agent-canvas-atoms'
 import { designAdapter } from '@/lib/design-adapter'
@@ -34,12 +37,6 @@ export interface CanvasWorkspaceTabDescriptor {
   title: string
   isDefault: boolean
   isRecent: boolean
-  activityRevision: number
-  seenActivityRevision: number
-}
-
-/** 按完整 view key 保存的轻量活动状态，不负责初始化 Canvas viewport。 */
-export interface AgentCanvasActivityState {
   activityRevision: number
   seenActivityRevision: number
 }
@@ -66,29 +63,6 @@ export function buildCanvasWorkspaceTabs(
       activityRevision: activityStates.get(canvasId)?.activityRevision ?? 0,
       seenActivityRevision: activityStates.get(canvasId)?.seenActivityRevision ?? 0,
     }
-  })
-}
-
-export interface SubscribeAgentCanvasActivityInput {
-  adapter: Pick<DesignAdapter, 'onCanvasChanges'>
-  projectId: string
-  sessionId: string
-  binding: AgentCanvasBinding
-  /** 只报告活动 Canvas 与隔离视图键，不接收标签切换能力。 */
-  onActivity: (canvasId: string, viewStateKey: string) => void
-}
-
-/** 订阅 binding 中的 Canvas 活动；该边界没有修改工作区焦点的能力。 */
-export function subscribeAgentCanvasActivity({
-  adapter,
-  projectId,
-  sessionId,
-  binding,
-  onActivity,
-}: SubscribeAgentCanvasActivityInput): () => void {
-  const canvasIds = new Set(binding.linkedCanvasIds)
-  return adapter.onCanvasChanges(projectId, canvasIds, (event) => {
-    onActivity(event.canvasId, createAgentCanvasViewKey(sessionId, projectId, event.canvasId))
   })
 }
 
@@ -171,12 +145,12 @@ export function useAgentCanvasWorkspaceRegistry(
   const sessionsByProject = useAtomValue(canvasSessionsByProjectAtom)
   const statusByProject = useAtomValue(canvasSessionStatusByProjectAtom)
   const replaceSessions = useSetAtom(replaceCanvasSessionsAtom)
-  const updateViewState = useSetAtom(updateAgentCanvasViewStateAtom)
+  const activityStatesByViewKey = useAtomValue(agentCanvasActivityStatesAtom)
+  const markActivitySeenByKey = useSetAtom(markAgentCanvasActivitySeenAtom)
   const [binding, setBinding] = React.useState<AgentCanvasBinding | null>(null)
   const [loading, setLoading] = React.useState(false)
   const [bindingReady, setBindingReady] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
-  const [activityStatesByViewKey, setActivityStatesByViewKey] = React.useState<Map<string, AgentCanvasActivityState>>(new Map())
   const lifecycleRef = React.useRef({ projectId, sessionId, generation: 0 })
   if (lifecycleRef.current.projectId !== projectId || lifecycleRef.current.sessionId !== sessionId) {
     lifecycleRef.current = { projectId, sessionId, generation: lifecycleRef.current.generation + 1 }
@@ -196,7 +170,6 @@ export function useAgentCanvasWorkspaceRegistry(
     setBindingReady(false)
     setError(null)
     setLoading(false)
-    setActivityStatesByViewKey(new Map())
     if (!projectId) return
     setLoading(true)
     let bindingEventReceived = false
@@ -230,36 +203,6 @@ export function useAgentCanvasWorkspaceRegistry(
     }
   }, [isCurrent, projectId, sessionId])
 
-  React.useEffect(() => {
-    if (!projectId || !binding || binding.projectId !== projectId || binding.sessionId !== sessionId) return
-    const linkedViewKeys = new Set(binding.linkedCanvasIds.map((canvasId) => (
-      createAgentCanvasViewKey(sessionId, projectId, canvasId)
-    )))
-    setActivityStatesByViewKey((previous) => {
-      const next = new Map([...previous].filter(([key]) => linkedViewKeys.has(key)))
-      return next.size === previous.size ? previous : next
-    })
-    return subscribeAgentCanvasActivity({
-      adapter: designAdapter,
-      projectId,
-      sessionId,
-      binding,
-      onActivity: (canvasId, key) => {
-        if (!isCurrent()) return
-        setActivityStatesByViewKey((previous) => {
-          const current = previous.get(key) ?? { activityRevision: 0, seenActivityRevision: 0 }
-          const next = new Map(previous)
-          next.set(key, { ...current, activityRevision: current.activityRevision + 1 })
-          return next
-        })
-        updateViewState({
-          key,
-          update: (current) => ({ activityRevision: current.activityRevision + 1 }),
-        })
-      },
-    })
-  }, [binding, isCurrent, projectId, sessionId, updateViewState])
-
   const linkAndOpen = React.useCallback(async (canvasId: string, makeDefault = false): Promise<void> => {
     if (!projectId) return
     try {
@@ -286,15 +229,8 @@ export function useAgentCanvasWorkspaceRegistry(
   const markActivitySeen = React.useCallback((canvasId: string): void => {
     if (!projectId || !isCurrent()) return
     const key = createAgentCanvasViewKey(sessionId, projectId, canvasId)
-    setActivityStatesByViewKey((previous) => {
-      const current = previous.get(key)
-      if (!current || current.seenActivityRevision === current.activityRevision) return previous
-      const next = new Map(previous)
-      next.set(key, { ...current, seenActivityRevision: current.activityRevision })
-      return next
-    })
-    updateViewState({ key, update: (current) => ({ seenActivityRevision: current.activityRevision }) })
-  }, [isCurrent, projectId, sessionId, updateViewState])
+    markActivitySeenByKey(key)
+  }, [isCurrent, markActivitySeenByKey, projectId, sessionId])
 
   const createAndOpen = React.useCallback(async (): Promise<void> => {
     if (!projectId) return

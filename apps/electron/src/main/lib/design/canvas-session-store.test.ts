@@ -92,12 +92,14 @@ describe('CanvasSessionStore', () => {
   test('Given 确定性 Canvas ID When Store 重建后重放创建 Then 返回同一持久记录且不重复索引', () => {
     const canvasId = `agent-canvas-${'a'.repeat(64)}`
     const firstStore = createStore()
-    const first = firstStore.createWithId({ projectId: 'project-1', canvasId, title: 'Agent 画布' })
+    const firstResult = firstStore.createWithIdOnce({ projectId: 'project-1', canvasId, title: 'Agent 画布' })
     const replayStore = createStore()
-    const replay = replayStore.createWithId({ projectId: 'project-1', canvasId, title: '重放标题不得覆盖' })
+    const replayResult = replayStore.createWithIdOnce({ projectId: 'project-1', canvasId, title: '重放标题不得覆盖' })
 
-    expect(replay).toEqual(first)
-    expect(replayStore.list({ projectId: 'project-1' })).toEqual([first])
+    expect(firstResult.created).toBe(true)
+    expect(replayResult).toEqual({ session: firstResult.session, created: false })
+    expect(replayStore.list({ projectId: 'project-1' })).toEqual([firstResult.session])
+    expect(replayStore.createWithId({ projectId: 'project-1', canvasId })).toEqual(firstResult.session)
   })
 
   test('Given 原生 Canvas 已创建内容与缓存 When 删除 Then 索引、正式目录和缓存目录一并清理', () => {

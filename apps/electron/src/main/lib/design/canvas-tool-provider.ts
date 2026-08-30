@@ -8,7 +8,6 @@ import type {
   CanvasMutation,
   CanvasNode,
   CanvasNodeReference,
-  CanvasSessionMeta,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
 } from '@proma/shared'
@@ -17,6 +16,7 @@ import { Type } from 'typebox'
 import type { TSchema } from 'typebox'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import type { CanvasBatchOperationResult } from './canvas-agent-batch-operation'
+import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 
 const MAX_READ_NODES = 32
 const MAX_READ_CHARS = 32_768
@@ -53,18 +53,15 @@ export interface CanvasToolNodeRunResult {
 
 /** Provider 只依赖现有权威 Store、Task8 batch 与执行接缝。 */
 export interface CanvasToolProviderDependencies {
-  sessions: {
-    list: (input: { projectId: string; archived?: boolean }) => CanvasSessionMeta[]
-    create: (input: { projectId: string; title?: string }) => CanvasSessionMeta
-    createWithId: (input: { projectId: string; canvasId: string; title?: string }) => CanvasSessionMeta
-    requireNative: (projectId: string, canvasId: string) => CanvasSessionMeta
-  }
-  bindings: {
-    get: (projectId: string, sessionId: string) => AgentCanvasBinding | null
-    link: (input: { projectId: string; sessionId: string; canvasId: string; makeDefault: boolean }) => AgentCanvasBinding
-    unlink: (input: { projectId: string; sessionId: string; canvasId: string }) => AgentCanvasBinding | null
-    setDefault: (input: { projectId: string; sessionId: string; canvasId: string }) => AgentCanvasBinding
-  }
+  access: Pick<CanvasToolAccessFacade,
+    | 'authorizeRead'
+    | 'getBinding'
+    | 'requireLinkedCanvas'
+    | 'runWrite'
+    | 'createAndLink'
+    | 'link'
+    | 'unlink'
+    | 'setDefault'>
   documents: {
     load: (target: CanvasTarget) => CanvasWorkspaceSnapshot
     validateBatchOperations: (target: CanvasTarget, expectedRevision: number, operations: unknown[]) => CanvasMutation[]
@@ -94,14 +91,6 @@ function defineCanvasTool<TParams extends TSchema, TDetails = unknown>(
   tool: ToolDefinition<TParams, TDetails>,
 ): ToolDefinition<TParams, TDetails> {
   return tool
-}
-
-/** 只允许访问当前会话已关联的 Canvas；参数中不接受 projectId。 */
-function requireLinkedCanvas(dependencies: CanvasToolProviderDependencies, context: CanvasToolRunContext, canvasId: string): AgentCanvasBinding {
-  const binding = dependencies.bindings.get(context.projectId, context.sessionId)
-  if (!binding?.linkedCanvasIds.includes(canvasId)) throw new Error('CANVAS_ACCESS_DENIED')
-  dependencies.sessions.requireNative(context.projectId, canvasId)
-  return binding
 }
 
 /** 删除与覆盖现有节点或边均属于破坏性修改。 */
@@ -160,7 +149,7 @@ export function createCanvasToolRun(
   context: CanvasToolRunContext,
 ): CanvasToolRun {
   /** 本轮访问上下文始终 fresh-read binding，不缓存扩大后的权限。 */
-  const getContext = (): AgentCanvasBinding | null => dependencies.bindings.get(context.projectId, context.sessionId)
+  const getContext = (): AgentCanvasBinding | null => dependencies.access.getBinding(context)
 
   const tools: ToolDefinition[] = [
     defineCanvasTool({
@@ -168,6 +157,7 @@ export function createCanvasToolRun(
       description: '返回当前 Agent 已关联、默认、活动画布和本轮明确引用摘要；不会扫描项目全部画布。',
       parameters: Type.Object({}),
       execute: async () => {
+        dependencies.access.authorizeRead(context)
         const binding = getContext()
         return toolResult({
           projectId: context.projectId,
@@ -192,6 +182,7 @@ export function createCanvasToolRun(
         makeDefault: Type.Optional(Type.Boolean()),
       }),
       execute: async (toolCallId, params) => {
+        dependencies.access.authorizeRead(context)
         if (context.permissionCeiling === 'plan' && params.action === 'create') {
           throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         }
@@ -201,22 +192,11 @@ export function createCanvasToolRun(
         if (params.action === 'create') {
           /** 同一 tool call 始终命中同一索引记录，首次 link 失败后也可安全重放。 */
           const canvasId = createManagedCanvasId(context, toolCallId)
-          const session = dependencies.sessions.createWithId({
-            projectId: context.projectId,
+          const { session, binding } = dependencies.access.createAndLink(context, {
             canvasId,
             ...(params.title ? { title: params.title } : {}),
+            makeDefault: params.makeDefault ?? true,
           })
-          const existingBinding = getContext()
-          const makeDefault = params.makeDefault ?? true
-          const alreadyLinked = existingBinding?.linkedCanvasIds.includes(session.id) ?? false
-          const binding = alreadyLinked && (!makeDefault || existingBinding?.defaultCanvasId === session.id)
-            ? existingBinding
-            : dependencies.bindings.link({
-                projectId: context.projectId,
-                sessionId: context.sessionId,
-                canvasId: session.id,
-                makeDefault,
-              })
           return toolResult({ action: params.action, canvasId: session.id, session, binding })
         }
         if (!params.canvasId) throw new Error('CANVAS_ID_REQUIRED')
@@ -228,14 +208,13 @@ export function createCanvasToolRun(
             ...context.explicitReferences.map((reference) => reference.canvasId),
           ])
           if (!authorizedCanvasIds.has(params.canvasId)) throw new Error('CANVAS_EXPLICIT_SELECTION_REQUIRED')
-          dependencies.sessions.requireNative(context.projectId, params.canvasId)
-          const nextBinding = dependencies.bindings.link({ projectId: context.projectId, sessionId: context.sessionId, canvasId: params.canvasId, makeDefault: params.makeDefault ?? false })
+          const nextBinding = dependencies.access.link(context, params.canvasId, params.makeDefault ?? false)
           return toolResult({ action: params.action, canvasId: params.canvasId, binding: nextBinding })
         }
-        requireLinkedCanvas(dependencies, context, params.canvasId)
+        dependencies.access.requireLinkedCanvas(context, params.canvasId)
         const binding = params.action === 'unlink'
-          ? dependencies.bindings.unlink({ projectId: context.projectId, sessionId: context.sessionId, canvasId: params.canvasId })
-          : dependencies.bindings.setDefault({ projectId: context.projectId, sessionId: context.sessionId, canvasId: params.canvasId })
+          ? dependencies.access.unlink(context, params.canvasId)
+          : dependencies.access.setDefault(context, params.canvasId)
         return toolResult({ action: params.action, canvasId: params.canvasId, binding })
       },
     }),
@@ -248,7 +227,8 @@ export function createCanvasToolRun(
         includeNeighbors: Type.Optional(Type.Boolean()),
       }),
       execute: async (_toolCallId, params) => {
-        requireLinkedCanvas(dependencies, context, params.canvasId)
+        dependencies.access.authorizeRead(context)
+        dependencies.access.requireLinkedCanvas(context, params.canvasId)
         const target = { projectId: context.projectId, canvasId: params.canvasId }
         const document = dependencies.documents.load(target).document
         const explicitNodeIds = new Set(params.nodeIds)
@@ -296,36 +276,39 @@ export function createCanvasToolRun(
         destructiveIntent: Type.Optional(Type.Literal('explicit')),
       }),
       execute: async (toolCallId, params) => {
-        requireLinkedCanvas(dependencies, context, params.canvasId)
-        const target = { projectId: context.projectId, canvasId: params.canvasId }
-        const rawOperations = structuredClone(params.operations)
-        const execute = (baseRevision: number, sourceToolCallId: string): Promise<CanvasBatchOperationResult> => {
-          const operations = dependencies.documents.validateBatchOperations(target, baseRevision, rawOperations)
-          const document = dependencies.documents.load(target).document
-          if (context.permissionCeiling === 'plan' && !isPlanSafeMutation(document, operations)) {
-            throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
+        dependencies.access.authorizeRead(context)
+        return dependencies.access.runWrite(context, async () => {
+          dependencies.access.requireLinkedCanvas(context, params.canvasId)
+          const target = { projectId: context.projectId, canvasId: params.canvasId }
+          const rawOperations = structuredClone(params.operations)
+          const execute = (baseRevision: number, sourceToolCallId: string): Promise<CanvasBatchOperationResult> => {
+            const operations = dependencies.documents.validateBatchOperations(target, baseRevision, rawOperations)
+            const document = dependencies.documents.load(target).document
+            if (context.permissionCeiling === 'plan' && !isPlanSafeMutation(document, operations)) {
+              throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
+            }
+            if (hasDestructiveMutation(document, operations) && params.destructiveIntent !== 'explicit') {
+              throw new Error('CANVAS_DESTRUCTIVE_INTENT_REQUIRED')
+            }
+            const envelope = parseCanvasBatchOperationEnvelope({
+              ...target, baseRevision, operations,
+              sourceSessionId: context.sessionId,
+              sourceRunStartedAt: context.runStartedAt,
+              sourceToolCallId,
+            })
+            return dependencies.batch.execute(envelope)
           }
-          if (hasDestructiveMutation(document, operations) && params.destructiveIntent !== 'explicit') {
-            throw new Error('CANVAS_DESTRUCTIVE_INTENT_REQUIRED')
+          let sourceToolCallId = toolCallId
+          let result: CanvasBatchOperationResult
+          try {
+            result = await execute(params.baseRevision, sourceToolCallId)
+          } catch (error) {
+            if (!isRevisionConflict(error)) throw error
+            sourceToolCallId = createRetrySourceToolCallId(toolCallId)
+            result = await execute(dependencies.documents.load(target).document.revision, sourceToolCallId)
           }
-          const envelope = parseCanvasBatchOperationEnvelope({
-            ...target, baseRevision, operations,
-            sourceSessionId: context.sessionId,
-            sourceRunStartedAt: context.runStartedAt,
-            sourceToolCallId,
-          })
-          return dependencies.batch.execute(envelope)
-        }
-        let sourceToolCallId = toolCallId
-        let result: CanvasBatchOperationResult
-        try {
-          result = await execute(params.baseRevision, sourceToolCallId)
-        } catch (error) {
-          if (!isRevisionConflict(error)) throw error
-          sourceToolCallId = createRetrySourceToolCallId(toolCallId)
-          result = await execute(dependencies.documents.load(target).document.revision, sourceToolCallId)
-        }
-        return toolResult({ canvasId: params.canvasId, revision: result.document.revision, operationId: result.operationId, sourceToolCallId })
+          return toolResult({ canvasId: params.canvasId, revision: result.document.revision, operationId: result.operationId, sourceToolCallId })
+        })
       },
     }),
     defineCanvasTool({
@@ -333,22 +316,25 @@ export function createCanvasToolRun(
       description: '仅在用户明确执行时运行已有生图或 HTML 节点；其它节点保持 idle，未来 video 稳定返回 unsupported。',
       parameters: Type.Object({ canvasId: Type.String({ minLength: 1, maxLength: 128 }), nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_READ_NODES }) }),
       execute: async (toolCallId, params) => {
+        dependencies.access.authorizeRead(context)
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
-        requireLinkedCanvas(dependencies, context, params.canvasId)
-        const target = { projectId: context.projectId, canvasId: params.canvasId }
-        const document = dependencies.documents.load(target).document
-        /** 稳定去重，避免同一请求重复启动相同节点。 */
-        const nodeIds = [...new Set(params.nodeIds)]
-        /** 单次建立索引，先全量证明每个节点存在。 */
-        const nodeById = new Map(document.nodes.map((node) => [node.id, node]))
-        const nodes = nodeIds.map((nodeId) => {
-          const node = nodeById.get(nodeId)
-          if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
-          return node
+        return dependencies.access.runWrite(context, async () => {
+          dependencies.access.requireLinkedCanvas(context, params.canvasId)
+          const target = { projectId: context.projectId, canvasId: params.canvasId }
+          const document = dependencies.documents.load(target).document
+          /** 稳定去重，避免同一请求重复启动相同节点。 */
+          const nodeIds = [...new Set(params.nodeIds)]
+          /** 单次建立索引，先全量证明每个节点存在。 */
+          const nodeById = new Map(document.nodes.map((node) => [node.id, node]))
+          const nodes = nodeIds.map((nodeId) => {
+            const node = nodeById.get(nodeId)
+            if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
+            return node
+          })
+          /** 目标预检、journal 建立和统一启动由生产批量边界一次完成。 */
+          const tasks = await dependencies.runNodes(context, target, nodes, toolCallId)
+          return toolResult({ canvasId: params.canvasId, revision: document.revision, tasks })
         })
-        /** 目标预检、journal 建立和统一启动由生产批量边界一次完成。 */
-        const tasks = await dependencies.runNodes(context, target, nodes, toolCallId)
-        return toolResult({ canvasId: params.canvasId, revision: document.revision, tasks })
       },
     }),
   ] as ToolDefinition[]

@@ -3,22 +3,21 @@ import * as React from 'react'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { LEGACY_DESIGN_CANVAS_ID } from '@proma/shared'
-import type { AgentCanvasBinding, CanvasChangeEvent, CanvasSessionMeta } from '@proma/shared'
+import type { AgentCanvasBinding, CanvasSessionMeta } from '@proma/shared'
 import { createStore, Provider } from 'jotai'
 import { renderToStaticMarkup } from 'react-dom/server'
 import {
   agentCanvasViewStatesAtom,
+  agentCanvasActivityStatesAtom,
   createAgentCanvasViewKey,
   createInitialAgentCanvasViewState,
 } from '@/atoms/agent-canvas-atoms'
 import { createInitialNativeCanvasState, nativeCanvasStatesAtom } from '@/atoms/native-canvas-atoms'
 import { designAdapter } from '@/lib/design-adapter'
-import type { DesignAdapter } from '@/lib/design-adapter'
 import {
   CanvasWorkspaceAdapter,
   isAgentCanvasActivityUnread,
   reconcileMissingCanvas,
-  subscribeAgentCanvasActivity,
   useAgentCanvasLegacyViewInitialization,
   useAgentCanvasWorkspaceRegistry,
 } from './CanvasWorkspaceAdapter'
@@ -196,105 +195,6 @@ describe('Agent 右侧 Canvas 适配器', () => {
     expect(errors).toHaveLength(1)
   })
 
-  test('Given 后台 Canvas 变化 When 订阅触发 Then 只更新对应 Agent 活动状态', () => {
-    const listeners = new Map<string, (event: CanvasChangeEvent) => void>()
-    const adapter: Pick<DesignAdapter, 'onCanvasChanges'> = {
-      onCanvasChanges: (_projectId, canvasIds, listener) => {
-        for (const canvasId of canvasIds) listeners.set(canvasId, listener)
-        return () => {
-          for (const canvasId of canvasIds) listeners.delete(canvasId)
-        }
-      },
-    }
-    const binding: AgentCanvasBinding = {
-      projectId: 'project-1',
-      sessionId: 'agent-1',
-      linkedCanvasIds: ['canvas-1', 'canvas-2'],
-      defaultCanvasId: 'canvas-1',
-      lastActiveCanvasId: 'canvas-1',
-      updatedAt: 1,
-    }
-    const revisions: string[] = []
-    const activeTab = 'files'
-
-    const release = subscribeAgentCanvasActivity({
-      adapter,
-      projectId: 'project-1',
-      sessionId: 'agent-1',
-      binding,
-      onActivity: (canvasId, viewKey) => { revisions.push(`${canvasId}:${viewKey}`) },
-    })
-    listeners.get('canvas-2')?.({
-      projectId: 'project-1',
-      canvasId: 'canvas-2',
-      revision: 2,
-      cause: 'graph',
-    })
-
-    expect(activeTab).toBe('files')
-    expect(revisions).toEqual([
-      `canvas-2:${createAgentCanvasViewKey('agent-1', 'project-1', 'canvas-2')}`,
-    ])
-    release()
-    expect(listeners.size).toBe(0)
-  })
-
-  test('Given 同一 Canvas 关联两个普通 Agent When 带来源变化到达 Then 两个隔离 view key 都增量且不切工作区', async () => {
-    const host = createHookRoot()
-    const store = createStore()
-    const listeners: Array<(event: CanvasChangeEvent) => void> = []
-    const openedTabs: string[] = []
-    const bindings = ['agent-1', 'agent-2'].map((sessionId) => ({
-      projectId: 'project-1', sessionId, linkedCanvasIds: ['canvas-1'], updatedAt: 1,
-    } satisfies AgentCanvasBinding))
-    for (const binding of bindings) {
-      const key = createAgentCanvasViewKey(binding.sessionId, binding.projectId, 'canvas-1')
-      store.set(agentCanvasViewStatesAtom, new Map([
-        ...store.get(agentCanvasViewStatesAtom),
-        [key, createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })],
-      ]))
-    }
-    designAdapter.listAgentCanvasBindings = async () => bindings
-    designAdapter.onAgentCanvasBindingChanged = () => () => undefined
-    designAdapter.onCanvasChanges = (_projectId, _canvasIds, listener) => {
-      listeners.push(listener)
-      return () => undefined
-    }
-    function Probe({ sessionId }: { sessionId: string }): null {
-      useAgentCanvasWorkspaceRegistry('project-1', sessionId, (tab) => { openedTabs.push(tab) })
-      return null
-    }
-
-    try {
-      await act(async () => {
-        host.render(
-          <Provider store={store}>
-            <Probe sessionId="agent-1" />
-            <Probe sessionId="agent-2" />
-          </Provider>,
-        )
-        await Promise.resolve()
-      })
-      act(() => {
-        const event: CanvasChangeEvent = {
-          projectId: 'project-1', canvasId: 'canvas-1', revision: 2, cause: 'graph',
-          source: { sessionId: 'agent-1', runStartedAt: 10, toolCallId: 'tool-call-1' },
-        }
-        for (const listener of listeners) listener(event)
-      })
-
-      for (const binding of bindings) {
-        const key = createAgentCanvasViewKey(binding.sessionId, binding.projectId, 'canvas-1')
-        expect(store.get(agentCanvasViewStatesAtom).get(key)?.activityRevision).toBe(1)
-      }
-      /** 活动来源只能点亮提示，不得切换 Files/Browser/Terminal/Preview 等当前工作区。 */
-      expect(openedTabs).toEqual([])
-    } finally {
-      act(() => { host.unmount() })
-      host.restore()
-    }
-  })
-
   test('Given 展开态切换 When 重渲染 Then session/project/canvas 身份保持不变', () => {
     const store = createStore()
     const key = createAgentCanvasViewKey('agent-1', 'project-1', 'canvas-1')
@@ -428,17 +328,16 @@ describe('Agent 右侧 Canvas 适配器', () => {
   test('Given 后台 Canvas 尚未 LOAD When 收到活动事件 Then 记录完整 view key 且不伪造 viewport', async () => {
     const host = createHookRoot()
     const store = createStore()
-    let activityListener: ((event: CanvasChangeEvent) => void) | null = null
     let latest: ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null = null
     const binding = {
       projectId: 'project-1', sessionId: 'agent-1', linkedCanvasIds: ['canvas-1'], updatedAt: 1,
     } satisfies AgentCanvasBinding
     designAdapter.listAgentCanvasBindings = async () => [binding]
     designAdapter.onAgentCanvasBindingChanged = () => () => undefined
-    designAdapter.onCanvasChanges = (_projectId, _canvasIds, listener) => {
-      activityListener = listener
-      return () => undefined
-    }
+    const key = createAgentCanvasViewKey('agent-1', 'project-1', 'canvas-1')
+    store.set(agentCanvasActivityStatesAtom, new Map([[
+      key, { activityRevision: 1, seenActivityRevision: 0 },
+    ]]))
     function Probe(): null {
       latest = useAgentCanvasWorkspaceRegistry('project-1', 'agent-1', () => undefined)
       return null
@@ -446,10 +345,6 @@ describe('Agent 右侧 Canvas 适配器', () => {
 
     try {
       await act(async () => { host.render(<Provider store={store}><Probe /></Provider>) })
-      act(() => {
-        activityListener?.({ projectId: 'project-1', canvasId: 'canvas-1', revision: 2, cause: 'graph' })
-      })
-      const key = createAgentCanvasViewKey('agent-1', 'project-1', 'canvas-1')
       const currentRegistry = latest as ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null
       expect(store.get(agentCanvasViewStatesAtom).has(key)).toBe(false)
       expect(currentRegistry?.canvasActivityStates.get('canvas-1')).toEqual({
