@@ -2,7 +2,6 @@ import { describe, expect, test } from 'bun:test'
 import { Provider, createStore } from 'jotai'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { activeViewAtom } from '@/atoms/active-view'
-import { activeCanvasSelectionAtom } from '@/atoms/canvas-session-atoms'
 import {
   channelFormDirtyAtom,
   settingsOpenAtom,
@@ -29,37 +28,28 @@ function captureOpenSession(
 }
 
 describe('统一会话打开', () => {
-  test('Given 当前显示 Canvas When 打开普通会话 Then 清除 Canvas 选择并切回会话视图', () => {
-    /** 预置正在显示 Canvas 的 Renderer 状态。 */
+  test('Given 当前显示其它顶层能力 When 打开普通会话 Then 只依赖普通会话状态并切回会话视图', () => {
     const store = createStore()
-    store.set(activeCanvasSelectionAtom, { projectId: 'project-1', canvasId: 'canvas-1' })
-    store.set(activeViewAtom, 'design')
+    store.set(activeViewAtom, 'planning')
     /** 通过真实 hook 执行普通会话导航。 */
     const openSession = captureOpenSession(store)
 
     openSession('chat', 'chat-1', '需求讨论')
 
-    expect(store.get(activeCanvasSelectionAtom)).toBeNull()
     expect(store.get(activeViewAtom)).toBe('conversations')
   })
 
-  test('Given 设置页存在未保存配置 When 会话导航被拦截 Then 保留 Canvas 选择', () => {
-    /** 预置设置导航守卫和当前 Canvas 状态。 */
+  test('Given 设置页存在未保存配置 When 会话导航被拦截 Then 保留当前顶层视图', () => {
     const store = createStore()
     store.set(settingsOpenAtom, true)
     store.set(channelFormDirtyAtom, true)
-    store.set(activeCanvasSelectionAtom, { projectId: 'project-1', canvasId: 'canvas-1' })
-    store.set(activeViewAtom, 'design')
+    store.set(activeViewAtom, 'planning')
     /** 通过真实 hook 触发会被设置守卫延后的导航。 */
     const openSession = captureOpenSession(store)
 
     openSession('chat', 'chat-1', '需求讨论')
 
-    expect(store.get(activeCanvasSelectionAtom)).toEqual({
-      projectId: 'project-1',
-      canvasId: 'canvas-1',
-    })
-    expect(store.get(activeViewAtom)).toBe('design')
+    expect(store.get(activeViewAtom)).toBe('planning')
     expect(store.get(settingsPendingSessionNavigationAtom)).toEqual({
       type: 'chat',
       sessionId: 'chat-1',

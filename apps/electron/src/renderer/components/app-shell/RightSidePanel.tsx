@@ -20,22 +20,16 @@ import {
 } from '@/atoms/agent-atoms'
 import type { AgentSidePanelTab } from '@/atoms/agent-atoms'
 import { SidePanel } from '@/components/agent/SidePanel'
-import { DesignInspector } from '@/components/design/DesignInspector'
-import type { RightPanelMode } from './design-layout'
 import { browserPanelOpenMapAtom, browserStateMapAtom } from '@/atoms/browser-atoms'
 import { getPreviewFileId, previewFileMapAtom } from '@/atoms/preview-atoms'
 
 export interface RightSidePanelProps {
-  /** 右栏内容类型，由 AppShell 统一计算。 */
-  mode: RightPanelMode
-  /** 设计模式绑定的当前项目。 */
-  projectId: string | null
   /** 用户可拖拽调整的右栏宽度。 */
   width?: number
 }
 
-/** 根据布局模式渲染会话文件面板或项目设计检查器。 */
-export function RightSidePanel({ mode, projectId, width }: RightSidePanelProps): React.ReactElement | null {
+/** 渲染当前普通 Agent 会话的右侧工作区。 */
+export function RightSidePanel({ width }: RightSidePanelProps): React.ReactElement | null {
   const currentSessionId = useAtomValue(currentAgentSessionIdAtom)
   const sessionPathMap = useAtomValue(agentSessionPathMapAtom)
   const diffPanelTabMap = useAtomValue(agentDiffPanelTabAtom)
@@ -119,11 +113,7 @@ export function RightSidePanel({ mode, projectId, width }: RightSidePanelProps):
     pendingBrowserActivationRef.current = null
   }, [browserOpen, browserState?.activeTabId, currentSessionId, setDiffPanelTabMap, setSidePanelOpen])
 
-  if (mode === 'design') {
-    return projectId ? <DesignInspector projectId={projectId} width={width} /> : null
-  }
-
-  if (mode !== 'agent' || !currentSessionId) {
+  if (!currentSessionId) {
     return null
   }
 

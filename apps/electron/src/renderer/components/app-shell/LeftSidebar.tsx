@@ -11,7 +11,7 @@
 import * as React from 'react'
 import { useAtom, useSetAtom, useAtomValue, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { Pin, PinOff, Star, Settings, Plus, CirclePlus, Trash2, Pencil, PanelLeft, PanelLeftOpen, ArrowRightLeft, Search, Archive, ArchiveRestore, ArrowLeft, Bot, MessageSquare, MoreHorizontal, FolderOpen, FolderInput, FolderPlus, GripVertical, Clock, CalendarDays, ChevronRight, ChevronDown, ChevronUp, Blocks, Brain, ListTodo, GitBranch, Download, Loader2, RotateCw, Workflow } from 'lucide-react'
+import { Pin, PinOff, Star, Settings, Plus, CirclePlus, Trash2, Pencil, PanelLeft, PanelLeftOpen, ArrowRightLeft, Search, Archive, ArchiveRestore, ArrowLeft, Bot, MessageSquare, MoreHorizontal, FolderOpen, FolderInput, FolderPlus, GripVertical, Clock, CalendarDays, ChevronRight, ChevronDown, ChevronUp, Blocks, Brain, ListTodo, GitBranch, Download, Loader2, RotateCw } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { ModeSwitcher } from './ModeSwitcher'
@@ -105,15 +105,7 @@ import { useCreateSession } from '@/hooks/useCreateSession'
 import { useOpenSession } from '@/hooks/useOpenSession'
 import { useSyncActiveTabSideEffects } from '@/hooks/useSyncActiveTabSideEffects'
 import { sessionHoverPreviewEnabledAtom } from '@/atoms/ui-preferences'
-import {
-  activeCanvasSelectionAtom,
-  canvasSessionsByProjectAtom,
-  canvasSessionStatusByProjectAtom,
-  removeCanvasSessionAtom,
-  upsertCanvasSessionAtom,
-} from '@/atoms/canvas-session-atoms'
 import { CollapsedWorkspacePopover } from '@/components/agent/CollapsedWorkspacePopover'
-import { CanvasSessionItem } from '@/components/design/CanvasSessionItem'
 import { ObsidianIcon } from '@/components/obsidian/obsidian-brand'
 import { VirtualSidebarList, type VirtualSidebarRow } from '@/components/ui/virtual-sidebar-list'
 import { LocalProjectBadge } from '@/components/agent/LocalProjectBadge'
@@ -126,7 +118,6 @@ import {
 import { detectIsMac } from '@/lib/platform'
 import { ShortcutKeycaps } from '@/components/shortcuts/ShortcutKeycaps'
 import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
-import { designAdapter } from '@/lib/design-adapter'
 import {
   collectAgentSessionTreeIds,
   countSettledDelegatedChildren,
@@ -160,7 +151,7 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
-import type { ConversationMeta, AgentSessionMeta, AgentWorkspace, CanvasSessionMeta, WorkspaceCapabilities } from '@proma/shared'
+import type { ConversationMeta, AgentSessionMeta, AgentWorkspace, WorkspaceCapabilities } from '@proma/shared'
 
 function formatAutomationCount(count: number): string {
   return count > 99 ? '99+' : String(count)
@@ -735,9 +726,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
 
   /** 待删除对话 ID，非空时显示确认弹窗 */
   const [pendingDeleteId, setPendingDeleteId] = React.useState<string | null>(null)
-  /** 待删除 Canvas 会话；删除前必须经独立确认，不能复用普通 Agent 会话 ID。 */
-  const [pendingDeleteCanvasSession, setPendingDeleteCanvasSession] = React.useState<CanvasSessionMeta | null>(null)
-  const [deletingCanvasId, setDeletingCanvasId] = React.useState<string | null>(null)
   /** 待删除项目 ID，非空时显示项目删除确认弹窗 */
   const [pendingDeleteWorkspaceId, setPendingDeleteWorkspaceId] = React.useState<string | null>(null)
   const [deletingWorkspaceId, setDeletingWorkspaceId] = React.useState<string | null>(null)
@@ -796,12 +784,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
   const [currentWorkspaceId, setCurrentWorkspaceId] = useAtom(currentAgentWorkspaceIdAtom)
   const [workspaces, setWorkspaces] = useAtom(agentWorkspacesAtom)
   const setMode = useSetAtom(appModeAtom)
-  /** Canvas 元数据与当前选择独立于 Agent 会话状态。 */
-  const canvasSessionsByProject = useAtomValue(canvasSessionsByProjectAtom)
-  const canvasSessionStatusByProject = useAtomValue(canvasSessionStatusByProjectAtom)
-  const [activeCanvasSelection, setActiveCanvasSelection] = useAtom(activeCanvasSelectionAtom)
-  const upsertCanvasSession = useSetAtom(upsertCanvasSessionAtom)
-  const removeCanvasSession = useSetAtom(removeCanvasSessionAtom)
 
   // 当前项目能力（MCP + Skill 计数）
   const [capabilities, setCapabilities] = React.useState<WorkspaceCapabilities | null>(null)
@@ -1095,15 +1077,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
   )
 
   /** 已归档 Agent 会话数量由主进程轻量统计返回，active 视图不扫描归档元数据。 */
-
-  /** Canvas registry 本身是轻量全量索引，可直接计算跨项目归档数量。 */
-  const archivedCanvasSessionCount = React.useMemo(() => {
-    let count = 0
-    for (const sessions of canvasSessionsByProject.values()) {
-      count += sessions.filter((session) => session.archived).length
-    }
-    return count
-  }, [canvasSessionsByProject])
 
   // 初始加载对话列表 + 用户档案
   React.useEffect(() => {
@@ -1433,106 +1406,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
       console.error('[侧边栏] 创建 Agent 会话失败:', error)
     }
   }, [agentChannelId, agentModelId, currentWorkspaceId, openSession, setActiveView, setAgentSessions, setCurrentWorkspaceId, setSessionChannelMap, setSessionModelMap])
-
-  /** 把目标项目设为当前项目，并保持其侧栏分组展开。 */
-  const activateCanvasProject = React.useCallback((projectId: string): void => {
-    if (projectId !== currentWorkspaceId) {
-      setCurrentWorkspaceId(projectId)
-      window.electronAPI.updateSettings({ agentWorkspaceId: projectId }).catch(console.error)
-    }
-    setCollapsedWorkspaceIds((prev) => deleteSetEntry(prev, projectId))
-  }, [currentWorkspaceId, setCurrentWorkspaceId])
-
-  /** 在指定项目创建独立 Canvas 会话并立即打开。 */
-  const createCanvasSessionInWorkspace = React.useCallback(async (projectId: string): Promise<void> => {
-    try {
-      const session = await designAdapter.createCanvasSession({ projectId })
-      upsertCanvasSession(session)
-      activateCanvasProject(projectId)
-      setActiveCanvasSelection({ projectId, canvasId: session.id })
-      setActiveView('design')
-    } catch (error) {
-      console.error('[侧边栏] 创建 Canvas 会话失败:', error)
-      toast.error('创建 Canvas 失败')
-    }
-  }, [activateCanvasProject, setActiveCanvasSelection, setActiveView, upsertCanvasSession])
-
-  /** 打开 Canvas 时只切换 Canvas 双重身份，不创建或复用 Agent 标签。 */
-  const handleSelectCanvasSession = React.useCallback((session: CanvasSessionMeta): void => {
-    activateCanvasProject(session.projectId)
-    setActiveCanvasSelection({ projectId: session.projectId, canvasId: session.id })
-    setActiveView('design')
-  }, [activateCanvasProject, setActiveCanvasSelection, setActiveView])
-
-  /** 使用项目与 Canvas 双重身份提交标题更新。 */
-  const handleRenameCanvasSession = React.useCallback(async (
-    session: CanvasSessionMeta,
-    title: string,
-  ): Promise<void> => {
-    try {
-      const updated = await designAdapter.updateCanvasSession({
-        projectId: session.projectId,
-        canvasId: session.id,
-        title,
-      })
-      upsertCanvasSession(updated)
-    } catch (error) {
-      console.error('[侧边栏] 重命名 Canvas 会话失败:', error)
-      toast.error('重命名 Canvas 失败')
-    }
-  }, [upsertCanvasSession])
-
-  /** 切换 Canvas 归档状态；归档当前项后返回普通会话视图。 */
-  const handleToggleArchiveCanvasSession = React.useCallback(async (
-    session: CanvasSessionMeta,
-  ): Promise<void> => {
-    try {
-      const updated = await designAdapter.updateCanvasSession({
-        projectId: session.projectId,
-        canvasId: session.id,
-        archived: !session.archived,
-      })
-      upsertCanvasSession(updated)
-      if (updated.archived
-        && activeCanvasSelection?.projectId === updated.projectId
-        && activeCanvasSelection.canvasId === updated.id) {
-        setActiveView('conversations')
-      }
-      toast.success(updated.archived ? 'Canvas 已归档' : 'Canvas 已取消归档')
-    } catch (error) {
-      console.error('[侧边栏] 切换 Canvas 归档状态失败:', error)
-      toast.error('更新 Canvas 归档状态失败')
-    }
-  }, [activeCanvasSelection, setActiveView, upsertCanvasSession])
-
-  /** 打开独立 Canvas 删除确认，避免右键菜单直接执行不可恢复操作。 */
-  const handleRequestDeleteCanvasSession = React.useCallback((session: CanvasSessionMeta): void => {
-    setPendingDeleteCanvasSession(session)
-  }, [])
-
-  /** 删除 Canvas 并同步清理 Renderer 索引与当前画布入口。 */
-  const handleConfirmDeleteCanvasSession = React.useCallback(async (): Promise<void> => {
-    const session = pendingDeleteCanvasSession
-    if (!session || deletingCanvasId) return
-    setDeletingCanvasId(session.id)
-    try {
-      await designAdapter.deleteCanvasSession({ projectId: session.projectId, canvasId: session.id })
-      removeCanvasSession({ projectId: session.projectId, canvasId: session.id })
-      if (activeCanvasSelection?.projectId === session.projectId
-        && activeCanvasSelection.canvasId === session.id) {
-        setActiveView('conversations')
-      }
-      toast.success('Canvas 已删除')
-      setPendingDeleteCanvasSession(null)
-    } catch (error) {
-      console.error('[侧边栏] 删除 Canvas 会话失败:', error)
-      toast.error(error instanceof Error && error.message.includes('任务运行')
-        ? 'Canvas 仍有任务运行，请先停止后再删除'
-        : '删除 Canvas 失败')
-    } finally {
-      setDeletingCanvasId(null)
-    }
-  }, [activeCanvasSelection, deletingCanvasId, pendingDeleteCanvasSession, removeCanvasSession, setActiveView])
 
   /** 切换当前项目；点击当前已选中工作区标题时则折叠/展开其会话列表 */
   const handleSelectProject = React.useCallback((workspaceId: string): void => {
@@ -2651,35 +2524,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     </AlertDialog>
   )
 
-  /** Canvas 删除使用独立确认文案，明确节点、原型和内部 Agent 对话都会一并移除。 */
-  const canvasDeleteDialog = (
-    <AlertDialog
-      open={pendingDeleteCanvasSession !== null}
-      onOpenChange={(open) => {
-        if (!open && !deletingCanvasId) setPendingDeleteCanvasSession(null)
-      }}
-    >
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>确认删除 Canvas</AlertDialogTitle>
-          <AlertDialogDescription>
-            将永久删除“{pendingDeleteCanvasSession?.title ?? '该 Canvas'}”及其中的节点、原型内容和内部 Agent 对话。此操作无法恢复。
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel disabled={deletingCanvasId !== null}>取消</AlertDialogCancel>
-          <AlertDialogAction
-            disabled={deletingCanvasId !== null}
-            onClick={() => { void handleConfirmDeleteCanvasSession() }}
-            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-          >
-            {deletingCanvasId ? '正在删除…' : '删除'}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-  )
-
   // 项目删除确认弹窗（会同时删除项目下的会话与工作区资源）
   const projectDeleteDialog = (
     <AlertDialog
@@ -2889,65 +2733,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
 
   const agentArchivedVirtualRows = React.useMemo<VirtualSidebarRow[]>(() => {
     const rows: VirtualSidebarRow[] = []
-    /** Canvas 归档固定置顶，避免 Agent 历史异步加载后把入口挤到长列表末尾。 */
-    const archivedCanvasGroups = workspaces.map((workspace) => ({
-      workspace,
-      sessions: (canvasSessionsByProject.get(workspace.id) ?? []).filter((session) => session.archived),
-      status: canvasSessionStatusByProject.get(workspace.id),
-    })).filter((group) => (
-      group.sessions.length > 0
-      || group.status?.phase === 'failed'
-      || group.status?.phase === 'loading'
-    ))
-
-    if (archivedCanvasGroups.length > 0) {
-      rows.push({
-        id: 'canvas-archived-heading',
-        estimateSize: 30,
-        content: <div className="px-3 pt-2 pb-1 text-[13px] font-medium leading-[18px] text-foreground/40 select-none">Canvas</div>,
-      })
-    }
-
-    for (const group of archivedCanvasGroups) {
-      rows.push({
-        id: `canvas-archived-project-${group.workspace.id}`,
-        estimateSize: 26,
-        content: <div className="px-4 pt-1.5 pb-0.5 text-[12px] text-foreground/35 select-none">{group.workspace.name}</div>,
-      })
-      for (const canvasSession of group.sessions) {
-        rows.push({
-          id: `canvas-archived-${canvasSession.projectId}-${canvasSession.id}`,
-          estimateSize: 34,
-          content: (
-            <div className="px-3">
-              <CanvasSessionItem
-                session={canvasSession}
-                active={false}
-                selectDisabled
-                onSelect={handleSelectCanvasSession}
-                onRename={handleRenameCanvasSession}
-                onToggleArchive={handleToggleArchiveCanvasSession}
-                onRequestDelete={handleRequestDeleteCanvasSession}
-              />
-            </div>
-          ),
-        })
-      }
-      if (group.status?.phase === 'failed') {
-        rows.push({
-          id: `canvas-archived-error-${group.workspace.id}`,
-          estimateSize: 28,
-          content: <div role="status" className="px-4 py-0.5 text-[12px] text-destructive/75 select-none">Canvas 加载失败</div>,
-        })
-      } else if (group.status?.phase === 'loading' && group.sessions.length === 0) {
-        rows.push({
-          id: `canvas-archived-loading-${group.workspace.id}`,
-          estimateSize: 28,
-          content: <div className="px-4 py-0.5 text-[12px] text-foreground/25 select-none">正在加载 Canvas…</div>,
-        })
-      }
-    }
-
     for (const group of archivedAgentSessionProjectGroups) {
       const collapsed = !expandedArchivedProjectIds.has(group.id)
       const isCurrentProject = group.kind === 'workspace' && group.id === currentWorkspaceId
@@ -3080,7 +2865,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     }
 
     return rows
-  }, [activeSessionId, agentIndicatorMap, archivedAgentSessionProjectGroups, canvasSessionsByProject, canvasSessionStatusByProject, collapsedDelegationParentIds, currentWorkspaceId, expandedArchivedProjectIds, expandedDelegationParentIds, handleAgentRename, handleRenameCanvasSession, handleRequestDelete, handleRequestDeleteCanvasSession, handleRequestMove, handleSelectAgentSession, handleSelectCanvasSession, handleToggleArchiveAgent, handleToggleArchiveCanvasSession, handleToggleArchivedProject, handleToggleDelegationParent, handleTogglePinAgent, handleToggleStarAgent, relativeTimeNow, sessionHoverPreviewEnabled, workspaceNameMap, workspaces])
+  }, [activeSessionId, agentIndicatorMap, archivedAgentSessionProjectGroups, collapsedDelegationParentIds, currentWorkspaceId, expandedArchivedProjectIds, expandedDelegationParentIds, handleAgentRename, handleRequestDelete, handleRequestMove, handleSelectAgentSession, handleToggleArchiveAgent, handleToggleArchivedProject, handleToggleDelegationParent, handleTogglePinAgent, handleToggleStarAgent, relativeTimeNow, sessionHoverPreviewEnabled, workspaceNameMap])
 
   const agentActiveVirtualRows = React.useMemo<VirtualSidebarRow[]>(() => {
     if (viewMode !== 'active') return []
@@ -3257,14 +3042,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
         relativeTimeNow,
         extraCount,
       })
-      /** 自动任务是合成分组，不对应可持久化 Canvas 项目。 */
-      const projectCanvasSessions = isAuto
-        ? []
-        : (canvasSessionsByProject.get(group.workspace.id) ?? []).filter((session) => !session.archived)
-      const projectCanvasStatus = isAuto
-        ? undefined
-        : canvasSessionStatusByProject.get(group.workspace.id)
-
       rows.push({
         id: `agent-project-${group.workspace.id}`,
         estimateSize: 34,
@@ -3289,7 +3066,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
               onCollapseExtra={handleCollapseExtraSessions}
               onSelectProject={isAuto ? handleToggleGroupCollapse : handleSelectProject}
               onNewSession={isAuto ? noopAsync : createAgentSessionInWorkspace}
-              onNewCanvas={isAuto ? noopAsync : createCanvasSessionInWorkspace}
               onDragStart={handleProjectDragStart}
               onDragOver={handleProjectDragOver}
               onDragLeave={handleProjectDragLeave}
@@ -3360,47 +3136,13 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
           }
         }
 
-        for (const canvasSession of projectCanvasSessions) {
-          rows.push({
-            id: `canvas-${canvasSession.projectId}-${canvasSession.id}`,
-            estimateSize: 34,
-            content: (
-              <div className="ml-4">
-                <CanvasSessionItem
-                  session={canvasSession}
-                  active={activeView === 'design'
-                    && activeCanvasSelection?.projectId === canvasSession.projectId
-                    && activeCanvasSelection.canvasId === canvasSession.id}
-                  onSelect={handleSelectCanvasSession}
-                  onRename={handleRenameCanvasSession}
-                  onToggleArchive={handleToggleArchiveCanvasSession}
-                  onRequestDelete={handleRequestDeleteCanvasSession}
-                />
-              </div>
-            ),
-          })
-        }
-
-        if (projectCanvasStatus?.phase === 'failed') {
-          rows.push({
-            id: `canvas-project-error-${group.workspace.id}`,
-            estimateSize: 28,
-            content: (
-              <div
-                role="status"
-                className="ml-5 px-1.5 py-0.5 text-[12px] text-destructive/75 select-none"
-              >
-                Canvas 加载失败
-              </div>
-            ),
-          })
-        } else if (visible.treeItems.length === 0 && projectCanvasSessions.length === 0) {
+        if (visible.treeItems.length === 0) {
           rows.push({
             id: `agent-project-empty-${group.workspace.id}`,
             estimateSize: 28,
             content: (
               <div className="ml-5 px-1.5 py-0.5 text-[12px] text-foreground/22 select-none">
-                {projectCanvasStatus?.phase === 'loading' ? '正在加载 Canvas…' : '暂无会话'}
+                暂无会话
               </div>
             ),
           })
@@ -3411,16 +3153,11 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     return rows
   }, [
     activeSessionId,
-    activeCanvasSelection,
-    activeView,
     agentIndicatorMap,
-    canvasSessionsByProject,
-    canvasSessionStatusByProject,
     collapsedDelegationParentIds,
     collapsedWorkspaceIds,
     creatingProject,
     createAgentSessionInWorkspace,
-    createCanvasSessionInWorkspace,
     displayProjectGroups,
     dragProjectId,
     expandedDelegationParentIds,
@@ -3439,17 +3176,14 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     handleRequestDeleteWorkspace,
     handleRequestMove,
     handleSelectAgentSession,
-    handleSelectCanvasSession,
     handleSelectProject,
     handleShowMoreSessions,
     handleStartCreateProject,
     handleToggleArchiveAgent,
-    handleToggleArchiveCanvasSession,
     handleToggleDelegationParent,
     handleToggleGroupCollapse,
     handleTogglePinAgent,
     handleToggleStarAgent,
-    handleRenameCanvasSession,
     handleWorkspaceRename,
     newProjectName,
     pinnedAgentSessionTrees,
@@ -3764,7 +3498,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
         </div>
 
         {deleteDialog}
-        {canvasDeleteDialog}
         {projectDeleteDialog}
         {restoreProjectRootDialog}
         {moveDialog}
@@ -3970,13 +3703,13 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
                 <span>已归档 ({archivedConversationCount})</span>
               </button>
             )}
-            {mode === 'agent' && archivedAgentSessionCount + archivedCanvasSessionCount > 0 && (
+            {mode === 'agent' && archivedAgentSessionCount > 0 && (
               <button
                 onClick={() => setViewMode('archived')}
                 className="w-full flex items-center gap-2 px-3 py-2 rounded-[10px] text-[12px] text-foreground/40 hover:bg-foreground/[0.04] hover:text-foreground/60 transition-colors titlebar-no-drag"
               >
                 <Archive size={13} className="text-foreground/30" />
-                <span>已归档 ({archivedAgentSessionCount + archivedCanvasSessionCount})</span>
+                <span>已归档 ({archivedAgentSessionCount})</span>
               </button>
             )}
           </>
@@ -4029,7 +3762,6 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
       </div>
 
       {deleteDialog}
-      {canvasDeleteDialog}
       {projectDeleteDialog}
       {restoreProjectRootDialog}
       {moveDialog}
@@ -4937,7 +4669,6 @@ interface AgentProjectGroupItemProps {
   onCollapseExtra: (workspaceId: string) => void
   onSelectProject: (workspaceId: string) => void
   onNewSession: (workspaceId: string) => Promise<void>
-  onNewCanvas: (workspaceId: string) => Promise<void>
   onDragStart: (e: React.DragEvent, workspaceId: string) => void
   onDragOver: (e: React.DragEvent, workspaceId: string) => void
   onDragLeave: (e: React.DragEvent) => void
@@ -4980,7 +4711,6 @@ const AgentProjectGroupItem = React.memo(function AgentProjectGroupItem({
   onCollapseExtra,
   onSelectProject,
   onNewSession,
-  onNewCanvas,
   onDragStart,
   onDragOver,
   onDragLeave,
@@ -5182,13 +4912,6 @@ const AgentProjectGroupItem = React.memo(function AgentProjectGroupItem({
               >
                 <Bot size={14} />
                 {`新建 Agent 会话${newSessionShortcutLabel ? ` (${newSessionShortcutLabel})` : ''}`}
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                className="py-1 text-xs [&>svg]:size-3.5"
-                onSelect={() => { void onNewCanvas(group.workspace.id) }}
-              >
-                <Workflow size={14} />
-                新建 Canvas
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>

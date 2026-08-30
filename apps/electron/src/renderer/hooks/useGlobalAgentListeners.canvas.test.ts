@@ -1,6 +1,34 @@
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import type { AgentCanvasBinding, AgentSessionMeta } from '@proma/shared'
+import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
+import { resolveCanvasAgentWorkspaceOwner } from './useGlobalAgentListeners'
+
+/** 构造不含路径等内部字段的普通 Agent 会话。 */
+function createAgentSession(id: string, workspaceId = 'project-1'): AgentSessionMeta {
+  return { id, title: id, workspaceId, createdAt: 1, updatedAt: 1 }
+}
+
+/** 构造用于通知宿主解析的项目级 Canvas binding。 */
+function createBinding(sessionId: string, updatedAt: number): AgentCanvasBinding {
+  return {
+    projectId: 'project-1',
+    sessionId,
+    linkedCanvasIds: ['canvas-1'],
+    lastActiveCanvasId: 'canvas-1',
+    updatedAt,
+  }
+}
+
+/** Canvas 内部 Agent 只公开节点归属，不携普通宿主会话。 */
+const canvasOwner: CanvasAgentOwner = {
+  sessionId: 'internal-canvas-agent',
+  projectId: 'project-1',
+  canvasId: 'canvas-1',
+  nodeId: 'node-1',
+  title: '画布节点 Agent',
+}
 
 describe('全局 Agent listener 的 Canvas 隔离', () => {
   test('Given Canvas owner When 流式事件到达 Then 跳过未知普通会话刷新', () => {
@@ -32,21 +60,43 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     expect(source).toContain('notifyAgentCompletionWarning(completionRoute.kind, data, (message) => {')
   })
 
-  test('Given Canvas 完成通知 When 用户点击 Then 返回原 Canvas 与节点对话且不打开 Agent tab', () => {
+  test('Given Canvas 完成通知 When 用户点击 Then 仅在普通 owner session 与 binding 均权威有效时打开右侧工作区', () => {
     const source = readFileSync(join(import.meta.dir, 'useGlobalAgentListeners.ts'), 'utf8')
     const start = source.indexOf('const makeNavigateToCanvasAgent')
     const end = source.indexOf('\n    /**', start + 1)
     const body = source.slice(start, end)
-    expect(body).toContain('store.set(activeCanvasSelectionAtom')
-    expect(body).toContain("store.set(activeViewAtom, 'design')")
-    expect(body).toContain('createLegacyAgentCanvasHostSessionId(owner.projectId)')
+    expect(body).toContain('designAdapter.listAgentCanvasBindings({ projectId: owner.projectId })')
+    expect(body).toContain('resolveCanvasAgentWorkspaceOwner(')
+    expect(body).toContain('if (!workspaceOwner) return')
+    expect(body).toContain('getCanvasWorkspaceTab(owner.canvasId)')
+    expect(body).toContain('agentSidePanelOpenAtomFamily(workspaceOwner.id)')
+    expect(body).toContain('agentDiffPanelTabAtom')
     expect(body).toContain('store.set(navigateAgentCanvasViewAtom')
-    expect(body).not.toContain('initializeAgentCanvasViewStateAtom')
-    expect(body).not.toContain('viewport: { x: 0, y: 0, zoom: 1 }')
-    expect(body).not.toContain('expandedNodeId: owner.nodeId')
-    expect(body).not.toContain('conversationNodeId: owner.nodeId')
     expect(body).toContain('nodeId: owner.nodeId')
-    expect(body).not.toContain('openTab(')
+    expect(body).toContain('openTab(')
+    expect(body).not.toContain('activeCanvasSelectionAtom')
+    expect(body).not.toContain("activeViewAtom, 'design'")
+    expect(body).not.toContain('createLegacyAgentCanvasHostSessionId')
+  })
+
+  test('Given 多个有效 binding When 解析通知宿主 Then 返回最近活动且仍存在的普通 Agent', () => {
+    const resolved = resolveCanvasAgentWorkspaceOwner(
+      canvasOwner,
+      [createBinding('agent-old', 1), createBinding('agent-new', 2)],
+      [createAgentSession('agent-old'), createAgentSession('agent-new')],
+    )
+
+    expect(resolved?.id).toBe('agent-new')
+  })
+
+  test('Given binding 或普通 Agent 会话缺失或项目不一致 When 解析通知宿主 Then fail closed', () => {
+    expect(resolveCanvasAgentWorkspaceOwner(canvasOwner, [], [createAgentSession('agent-1')])).toBeNull()
+    expect(resolveCanvasAgentWorkspaceOwner(canvasOwner, [createBinding('agent-1', 1)], [])).toBeNull()
+    expect(resolveCanvasAgentWorkspaceOwner(
+      canvasOwner,
+      [createBinding('agent-1', 1)],
+      [createAgentSession('agent-1', 'project-other')],
+    )).toBeNull()
   })
 
   test('Given renderer 重载且 bootstrap 未完成 When 未知流与标题先到 Then 暂存并在 owner 恢复后重放一次', () => {

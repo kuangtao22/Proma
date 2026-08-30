@@ -11,7 +11,6 @@
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { HelpCircle, Keyboard, Globe, PanelRight } from 'lucide-react'
-import type { CanvasSessionMeta } from '@proma/shared'
 import {
   tabsAtom,
   activeTabIdAtom,
@@ -33,17 +32,11 @@ import {
 } from '@/atoms/agent-atoms'
 import { appModeAtom } from '@/atoms/app-mode'
 import { activeViewAtom, type ActiveView } from '@/atoms/active-view'
-import {
-  activeCanvasSelectionAtom,
-  activeCanvasSessionAtom,
-} from '@/atoms/canvas-session-atoms'
 import { automationFormAtom } from '@/atoms/automation-atoms'
 import { tearOffPreviewToSplit } from '@/components/diff/preview-opener'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { TabBarItem } from './TabBarItem'
-import { CanvasSessionTab } from '@/components/design/CanvasSessionTab'
-import { shouldShowCanvasTab } from '@/components/app-shell/design-layout'
 import { getTabBarActionLayout } from './tab-bar-action-layout'
 import { useCloseTab } from '@/hooks/useCloseTab'
 import { cn } from '@/lib/utils'
@@ -67,9 +60,6 @@ export function TabBar(): React.ReactElement {
   const agentSessions = useAtomValue(agentSessionsAtom)
   const agentWorkspaces = useAtomValue(agentWorkspacesAtom)
   const setCurrentAgentWorkspaceId = useSetAtom(currentAgentWorkspaceIdAtom)
-  /** Canvas 顶部入口严格跟随独立选择与项目 registry。 */
-  const setActiveCanvasSelection = useSetAtom(activeCanvasSelectionAtom)
-  const currentCanvasSession = useAtomValue(activeCanvasSessionAtom)
   const setUnviewedCompleted = useSetAtom(unviewedCompletedSessionIdsAtom)
   const setAutomationForm = useSetAtom(automationFormAtom)
 
@@ -126,7 +116,6 @@ export function TabBar(): React.ReactElement {
 
   const handleActivate = React.useCallback((tabId: string) => {
     setActiveTabId(tabId)
-    setActiveCanvasSelection(null)
     setActiveView('conversations')
     // 点击任意 tab 都关闭定时任务编辑表单（overlay 否则会盖在内容区上）
     setAutomationForm({ open: false, draft: null })
@@ -162,19 +151,7 @@ export function TabBar(): React.ReactElement {
         setCurrentAgentSessionId(null)
       }
     }
-  }, [setActiveTabId, setActiveCanvasSelection, setActiveView, setAutomationForm, tabs, agentSessions, appMode, setAppMode, setCurrentConversationId, setCurrentAgentSessionId, setCurrentAgentWorkspaceId, setUnviewedCompleted])
-
-  /** 恢复当前 Canvas 及所属项目，不改变普通会话标签。 */
-  const handleCanvasActivate = React.useCallback(() => {
-    if (!currentCanvasSession) return
-    setAutomationForm({ open: false, draft: null })
-    setAppMode('agent')
-    setCurrentAgentWorkspaceId(currentCanvasSession.projectId)
-    window.electronAPI.updateSettings({
-      agentWorkspaceId: currentCanvasSession.projectId,
-    }).catch(console.error)
-    setActiveView('design')
-  }, [currentCanvasSession, setActiveView, setAppMode, setAutomationForm, setCurrentAgentWorkspaceId])
+  }, [setActiveTabId, setActiveView, setAutomationForm, tabs, agentSessions, appMode, setAppMode, setCurrentConversationId, setCurrentAgentSessionId, setCurrentAgentWorkspaceId, setUnviewedCompleted])
 
   const handleDragStart = React.useCallback((tabId: string, e: React.PointerEvent) => {
     if (e.button !== 0) return // 只处理左键
@@ -204,7 +181,7 @@ export function TabBar(): React.ReactElement {
     document.addEventListener('pointerup', handleUp)
   }, [tabs])
 
-  if (tabs.length === 0 && !shouldShowCanvasTab(currentCanvasSession?.id ?? null)) {
+  if (tabs.length === 0) {
     return <div className="h-[34px] titlebar-drag-region" />
   }
 
@@ -214,13 +191,11 @@ export function TabBar(): React.ReactElement {
         tabs={tabs}
         activeTabId={activeTabId}
         activeView={activeView}
-        currentCanvasSession={currentCanvasSession}
         streamingMap={indicatorMap}
         workspaceNameBySessionId={workspaceNameBySessionId}
         automationSessionIds={automationSessionIds}
         delegationSessionIds={delegationSessionIds}
         onActivate={handleActivate}
-        onCanvasActivate={handleCanvasActivate}
         onClose={requestClose}
         onDragStart={handleDragStart}
         onTearOff={handleTearOff}
@@ -234,13 +209,11 @@ function TabBarInner({
   tabs,
   activeTabId,
   activeView,
-  currentCanvasSession,
   streamingMap,
   workspaceNameBySessionId,
   automationSessionIds,
   delegationSessionIds,
   onActivate,
-  onCanvasActivate,
   onClose,
   onDragStart,
   onTearOff,
@@ -248,13 +221,11 @@ function TabBarInner({
   tabs: TabItem[]
   activeTabId: string | null
   activeView: ActiveView
-  currentCanvasSession: CanvasSessionMeta | null
   streamingMap: Map<string, SessionIndicatorStatus>
   workspaceNameBySessionId: Map<string, string>
   automationSessionIds: Set<string>
   delegationSessionIds: Set<string>
   onActivate: (tabId: string) => void
-  onCanvasActivate: () => void
   onClose: (tabId: string) => void
   onDragStart: (tabId: string, e: React.PointerEvent) => void
   onTearOff: (tabId: string) => void
@@ -485,13 +456,6 @@ function TabBarInner({
             onPanelHoverLeave={handleTabHoverLeave}
           />
         ))}
-        {currentCanvasSession && (
-          <CanvasSessionTab
-            session={currentCanvasSession}
-            active={activeView === 'design'}
-            onActivate={onCanvasActivate}
-          />
-        )}
       </div>
 
       <ShortcutGuideButton

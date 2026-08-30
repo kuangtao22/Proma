@@ -58,6 +58,7 @@ import {
   agentSidePanelOpenAtomFamily,
   revealChangedWorkspaceComponentAtom,
   agentSideDelegationMapAtom,
+  getCanvasWorkspaceTab,
   getDelegationSidePanelTab,
   askUserDraftsAtom,
   agentPendingPromptAtom,
@@ -71,7 +72,6 @@ import {
 } from '@/atoms/notifications'
 import { appModeAtom } from '@/atoms/app-mode'
 import { activeViewAtom } from '@/atoms/active-view'
-import { activeCanvasSelectionAtom } from '@/atoms/canvas-session-atoms'
 import {
   canvasAgentOwnersAtom,
   canvasAgentInternalInvalidSessionIdsAtom,
@@ -83,7 +83,6 @@ import {
 } from '@/atoms/native-canvas-atoms'
 import {
   createAgentCanvasViewKey,
-  createLegacyAgentCanvasHostSessionId,
   navigateAgentCanvasViewAtom,
   recordAgentCanvasActivityAtom,
   reconcileAgentCanvasActivityBindingAtom,
@@ -142,6 +141,36 @@ const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Upda
 
 /** 会改变 git 工作树状态的子命令（用于识别 Bash 中触发 diff 刷新的 git 操作） */
 const GIT_MUTATING_SUBCOMMANDS = /\bgit\s+(commit|checkout|reset|restore|stash|clean|add|rm|mv|pull|merge|rebase|cherry-pick|revert|switch|am|apply)\b/
+
+/**
+ * 从主进程会话与 binding 快照中解析 Canvas 通知应返回的普通 Agent。
+ * @param owner Canvas 内部 Agent 的权威节点归属。
+ * @param bindings 项目内的权威 Agent-Canvas 关联快照。
+ * @param sessions 主进程返回的普通 Agent 会话列表。
+ * @returns 同项目且确实关联目标 Canvas 的最近普通 Agent；缺任一事实时返回 null。
+ */
+export function resolveCanvasAgentWorkspaceOwner(
+  owner: CanvasAgentOwner,
+  bindings: readonly AgentCanvasBinding[],
+  sessions: readonly AgentSessionMeta[],
+): AgentSessionMeta | null {
+  /** 最近查看目标 Canvas 的 binding 优先，随后按 binding 更新时间稳定选择。 */
+  const candidates = bindings
+    .filter((binding) => binding.projectId === owner.projectId
+      && binding.linkedCanvasIds.includes(owner.canvasId))
+    .sort((left, right) => {
+      const leftActive = left.lastActiveCanvasId === owner.canvasId ? 1 : 0
+      const rightActive = right.lastActiveCanvasId === owner.canvasId ? 1 : 0
+      return rightActive - leftActive
+        || right.updatedAt - left.updatedAt
+        || left.sessionId.localeCompare(right.sessionId)
+    })
+  for (const binding of candidates) {
+    const session = sessions.find((item) => item.id === binding.sessionId)
+    if (session?.workspaceId === owner.projectId) return session
+  }
+  return null
+}
 
 function isAbsolutePath(path: string): boolean {
   return path.startsWith('/') || path.startsWith('\\\\') || /^[A-Za-z]:[\\/]/.test(path)
@@ -839,23 +868,38 @@ export function useGlobalAgentListeners(): void {
       }
     }
 
-    /** 构建返回原 Canvas 与节点对话的通知动作，不创建普通 Agent tab。 */
+    /** 构建返回普通 Agent 右侧 Canvas 与节点对话的通知动作。 */
     const makeNavigateToCanvasAgent = (owner: CanvasAgentOwner) => () => {
-      store.set(activeCanvasSelectionAtom, {
-        projectId: owner.projectId,
-        canvasId: owner.canvasId,
+      void Promise.all([
+        designAdapter.listAgentCanvasBindings({ projectId: owner.projectId }),
+        window.electronAPI.listAgentSessions(),
+      ]).then(([bindings, sessions]) => {
+        /** 通知点击时重新交叉验证两个主进程事实，陈旧 owner 缺任一事实均拒绝导航。 */
+        const workspaceOwner = resolveCanvasAgentWorkspaceOwner(owner, bindings, sessions)
+        if (!workspaceOwner) return
+        const result = openTab(store.get(tabsAtom), {
+          type: 'agent',
+          sessionId: workspaceOwner.id,
+          title: workspaceOwner.title,
+        })
+        store.set(tabsAtom, result.tabs)
+        store.set(activeTabIdAtom, result.activeTabId)
+        store.set(agentSidePanelOpenAtomFamily(workspaceOwner.id), true)
+        store.set(agentDiffPanelTabAtom, (previous) => {
+          const next = new Map(previous)
+          next.set(workspaceOwner.id, getCanvasWorkspaceTab(owner.canvasId))
+          return next
+        })
+        /** 未 LOAD 时只暂存节点导航意图，首个权威文档仍拥有 viewport 初始化权。 */
+        const viewKey = createAgentCanvasViewKey(workspaceOwner.id, owner.projectId, owner.canvasId)
+        store.set(navigateAgentCanvasViewAtom, { key: viewKey, nodeId: owner.nodeId })
+        store.set(appModeAtom, 'agent')
+        store.set(activeViewAtom, 'conversations')
+        store.set(currentAgentSessionIdAtom, workspaceOwner.id)
+        store.set(currentAgentWorkspaceIdAtom, owner.projectId)
+      }).catch((error: unknown) => {
+        console.error('[Canvas Agent] 返回所属 Agent 失败:', error)
       })
-      /** 未 LOAD 时只暂存导航意图，首个权威文档仍拥有 viewport 初始化权。 */
-      const hostSessionId = createLegacyAgentCanvasHostSessionId(owner.projectId)
-      const viewKey = createAgentCanvasViewKey(hostSessionId, owner.projectId, owner.canvasId)
-      store.set(navigateAgentCanvasViewAtom, {
-        key: viewKey,
-        nodeId: owner.nodeId,
-      })
-      store.set(appModeAtom, 'agent')
-      store.set(activeViewAtom, 'design')
-      store.set(currentAgentSessionIdAtom, null)
-      store.set(currentAgentWorkspaceIdAtom, owner.projectId)
     }
 
     /** 获取会话标题 */

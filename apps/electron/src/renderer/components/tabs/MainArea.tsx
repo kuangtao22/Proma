@@ -21,7 +21,6 @@ import { TabContent } from './TabContent'
 import { AutomationFormView } from '@/components/automation/AutomationFormView'
 import { PlanningView } from '@/components/planning/PlanningView'
 import { AgentSkillsView } from '@/components/agent-skills/AgentSkillsView'
-import { CanvasWorkspaceEntry } from '@/components/design/CanvasWorkspaceEntry'
 import { VaultView } from '@/components/vault/VaultView'
 import { automationFormAtom } from '@/atoms/automation-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
@@ -157,13 +156,6 @@ export function MainArea(): React.ReactElement {
             <AgentSkillsView />
           ) : activeView === 'vault' ? (
             <VaultView />
-          ) : activeView === 'design' ? (
-            <>
-              <TabBar />
-              <div className="flex-1 min-h-0 titlebar-no-drag">
-                <CanvasWorkspaceEntry />
-              </div>
-            </>
           ) : (
             <>
               {showCenterTabBar && <TabBar />}

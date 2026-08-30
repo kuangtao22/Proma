@@ -119,13 +119,13 @@ import {
   agentDiffPanelTabAtom,
   agentSidePanelOpenAtomFamily,
   agentSideTemporaryAgentMapAtom,
+  getCanvasWorkspaceTab,
   getExplorationSidePanelTab,
 } from '@/atoms/agent-atoms'
 import { settingsOpenAtom } from '@/atoms/settings-tab'
 import { deliverPendingMentionsToComposer } from '@/lib/design-session-actions'
 import { shouldOfferDesignHandoff } from '@/lib/agent-design-intent'
-import { activeViewAtom } from '@/atoms/active-view'
-import { activeCanvasSelectionAtom, canvasSessionsByProjectAtom } from '@/atoms/canvas-session-atoms'
+import { canvasSessionsByProjectAtom } from '@/atoms/canvas-session-atoms'
 import { updateDesignProjectStateAtom } from '@/atoms/design-atoms'
 import { longTextPasteAsAttachmentEnabledAtom } from '@/atoms/ui-preferences'
 import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
@@ -141,6 +141,7 @@ import { getFilePanelDragData, INSERT_FILE_MENTION_EVENT, type FilePanelDragItem
 import { buildQuotedSelectionBlock, expandAgentHistoryQuoteMentions } from '@/lib/quoted-selection'
 import { createClipboardPendingFile, createClipboardTextDraft, makeUniqueAttachmentName } from '@/lib/clipboard-text-attachment'
 import { copyTextToClipboard } from '@/lib/clipboard'
+import { designAdapter } from '@/lib/design-adapter'
 import {
   buildQueuedMessageSendPayload,
   createAgentQueuedMessage,
@@ -518,8 +519,6 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   const [pendingDesignHandoff, setPendingDesignHandoff] = React.useState<PendingDesignHandoff | null>(null)
   /** 用户明确选择继续 Agent 后，仅绕过同一段文本一次。 */
   const designHandoffBypassPromptRef = React.useRef<string | null>(null)
-  const setActiveView = useSetAtom(activeViewAtom)
-  const setActiveCanvasSelection = useSetAtom(activeCanvasSelectionAtom)
   const updateDesignProjectState = useSetAtom(updateDesignProjectStateAtom)
   React.useEffect(() => window.electronAPI.onPlanningAgentOperation((operation) => {
     if (operation.sessionId !== sessionId) return
@@ -2345,9 +2344,24 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     void handleSend(pendingDesignHandoff.prompt, true)
   }, [handleSend, pendingDesignHandoff])
 
-  /** 将原始要求预填到当前项目 Design，不发送消息、不自动开始付费生图。 */
-  const handleOpenDesignHandoff = React.useCallback((): void => {
+  /** 将原始要求预填到当前 Agent 的右侧 Canvas，不发送消息、不自动开始付费生图。 */
+  const handleOpenDesignHandoff = React.useCallback(async (): Promise<void> => {
     if (!pendingDesignHandoff || !currentWorkspaceId) return
+    try {
+      /** 以主进程 binding 为准，首次关联时同时建立默认 Canvas。 */
+      const bindings = await designAdapter.listAgentCanvasBindings({ projectId: currentWorkspaceId })
+      const binding = bindings.find((item) => item.sessionId === sessionId)
+      await designAdapter.linkAgentCanvas({
+        projectId: currentWorkspaceId,
+        sessionId,
+        canvasId: LEGACY_DESIGN_CANVAS_ID,
+        makeDefault: binding?.defaultCanvasId === undefined,
+      })
+    } catch (error) {
+      console.error('[AgentView] 打开设计画布失败:', error)
+      toast.error('打开设计画布失败')
+      return
+    }
     updateDesignProjectState({
       projectId: currentWorkspaceId,
       update: {
@@ -2366,10 +2380,14 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       return next
     })
     setPendingDesignHandoff(null)
-    setActiveCanvasSelection({ projectId: currentWorkspaceId, canvasId: LEGACY_DESIGN_CANVAS_ID })
-    setActiveView('design')
+    setSidePanelTabMap((previous) => {
+      const next = new Map(previous)
+      next.set(sessionId, getCanvasWorkspaceTab(LEGACY_DESIGN_CANVAS_ID))
+      return next
+    })
+    setSidePanelOpen(true)
     toast.success('已打开设计面板', { description: '原始要求已填入，确认后再生成图片。' })
-  }, [currentWorkspaceId, pendingDesignHandoff, sessionId, setActiveCanvasSelection, setActiveView, setCurrentAgentWorkspaceId, setInputContent, setPromptSuggestions, updateDesignProjectState])
+  }, [currentWorkspaceId, pendingDesignHandoff, sessionId, setCurrentAgentWorkspaceId, setInputContent, setPromptSuggestions, setSidePanelOpen, setSidePanelTabMap, updateDesignProjectState])
 
   /** 停止生成。异常流未发出终态时，允许再次下发幂等的 abort 请求。 */
   const handleStop = React.useCallback((): void => {

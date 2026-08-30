@@ -2,12 +2,9 @@ import { describe, expect, test } from 'bun:test'
 import type { CanvasSessionMeta } from '@proma/shared'
 import { createStore } from 'jotai'
 import {
-  activeCanvasSelectionAtom,
-  activeCanvasSessionAtom,
   canvasSessionsByProjectAtom,
-  replaceCanvasSessionsAtom,
   removeCanvasSessionAtom,
-  resolveActiveCanvasSession,
+  replaceCanvasSessionsAtom,
   upsertCanvasSessionAtom,
 } from './canvas-session-atoms'
 
@@ -44,45 +41,29 @@ describe('Canvas Renderer registry', () => {
     expect(store.get(canvasSessionsByProjectAtom).get('project-b')).toBe(projectB)
   })
 
-  test('Given 当前选择 When 更新其它项目 Canvas Then 选择保持 projectId 与 canvasId 双重身份', () => {
+  test('Given 跨项目元数据 When 替换项目 registry Then 拒绝污染目标项目', () => {
     const store = createStore()
-    store.set(activeCanvasSelectionAtom, { projectId: 'project-a', canvasId: 'a-1' })
 
-    store.set(upsertCanvasSessionAtom, createCanvas('b-1', 'project-b'))
-
-    expect(store.get(activeCanvasSelectionAtom)).toEqual({
+    expect(() => store.set(replaceCanvasSessionsAtom, {
       projectId: 'project-a',
-      canvasId: 'a-1',
-    })
+      sessions: [createCanvas('b-1', 'project-b')],
+    })).toThrow('Canvas 会话项目归属不匹配')
   })
 
-  test('Given 当前 Canvas When 会话被归档 Then 清除选择但保留索引记录', () => {
+  test('Given 项目内已有 Canvas When upsert 新版本 Then 按更新时间倒序且不重复 ID', () => {
     const store = createStore()
-    const activeCanvas = createCanvas('a-1', 'project-a')
-    store.set(canvasSessionsByProjectAtom, new Map([['project-a', [activeCanvas]]]))
-    store.set(activeCanvasSelectionAtom, { projectId: 'project-a', canvasId: 'a-1' })
+    store.set(canvasSessionsByProjectAtom, new Map([[
+      'project-a',
+      [createCanvas('a-1', 'project-a'), createCanvas('a-2', 'project-a', { updatedAt: 2 })],
+    ]]))
 
-    store.set(upsertCanvasSessionAtom, { ...activeCanvas, archived: true, updatedAt: 2 })
+    store.set(upsertCanvasSessionAtom, createCanvas('a-1', 'project-a', { updatedAt: 3 }))
 
-    expect(store.get(activeCanvasSelectionAtom)).toBeNull()
-    expect(store.get(canvasSessionsByProjectAtom).get('project-a')).toEqual([
-      { ...activeCanvas, archived: true, updatedAt: 2 },
-    ])
+    expect(store.get(canvasSessionsByProjectAtom).get('project-a')?.map((item) => item.id))
+      .toEqual(['a-1', 'a-2'])
   })
 
-  test('Given 当前 Canvas When 权威列表不再包含可见会话 Then 清除过期选择', () => {
-    const store = createStore()
-    store.set(activeCanvasSelectionAtom, { projectId: 'project-a', canvasId: 'a-1' })
-
-    store.set(replaceCanvasSessionsAtom, {
-      projectId: 'project-a',
-      sessions: [createCanvas('a-1', 'project-a', { archived: true })],
-    })
-
-    expect(store.get(activeCanvasSelectionAtom)).toBeNull()
-  })
-
-  test('Given 当前 Canvas When 删除成功 Then 只移除目标项目记录并清除当前选择', () => {
+  test('Given 两个项目 When 删除目标 Canvas Then 只移除目标项目记录', () => {
     const store = createStore()
     const projectA = [createCanvas('a-1', 'project-a'), createCanvas('a-2', 'project-a')]
     const projectB = [createCanvas('b-1', 'project-b')]
@@ -90,38 +71,10 @@ describe('Canvas Renderer registry', () => {
       ['project-a', projectA],
       ['project-b', projectB],
     ]))
-    store.set(activeCanvasSelectionAtom, { projectId: 'project-a', canvasId: 'a-1' })
 
     store.set(removeCanvasSessionAtom, { projectId: 'project-a', canvasId: 'a-1' })
 
     expect(store.get(canvasSessionsByProjectAtom).get('project-a')?.map((item) => item.id)).toEqual(['a-2'])
     expect(store.get(canvasSessionsByProjectAtom).get('project-b')).toBe(projectB)
-    expect(store.get(activeCanvasSelectionAtom)).toBeNull()
-  })
-
-  test('Given Agent 显式转交 legacy Design When 旧画布尚未落盘 Then 保留确定性兼容入口', () => {
-    const store = createStore()
-    const selection = { projectId: 'project-a', canvasId: 'legacy-design' }
-    store.set(activeCanvasSelectionAtom, selection)
-
-    store.set(replaceCanvasSessionsAtom, { projectId: 'project-a', sessions: [] })
-
-    expect(store.get(activeCanvasSelectionAtom)).toEqual(selection)
-    expect(resolveActiveCanvasSession(selection, store.get(canvasSessionsByProjectAtom))).toMatchObject({
-      id: 'legacy-design',
-      projectId: 'project-a',
-      archived: false,
-    })
-  })
-
-  test('Given legacy Design 已归档 When 解析迟到选择 Then 不生成虚拟兼容入口', () => {
-    const store = createStore()
-    const selection = { projectId: 'project-a', canvasId: 'legacy-design' }
-    const archived = createCanvas('legacy-design', 'project-a', { archived: true })
-    store.set(activeCanvasSelectionAtom, selection)
-    store.set(canvasSessionsByProjectAtom, new Map([['project-a', [archived]]]))
-
-    expect(resolveActiveCanvasSession(selection, new Map([['project-a', [archived]]]))).toBeNull()
-    expect(store.get(activeCanvasSessionAtom)).toBeNull()
   })
 })

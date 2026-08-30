@@ -18,7 +18,6 @@ import { sidebarCollapsedAtom } from '@/atoms/tab-atoms'
 import { clampRightPanelWidth, getRightPanelMaxWidth } from './right-panel-layout'
 import { automationFormAtom } from '@/atoms/automation-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
-import { activeCanvasSessionAtom } from '@/atoms/canvas-session-atoms'
 import { useProjectActions } from '@/hooks/useProjectActions'
 import { WorkspaceMemoryChangeObserver } from '@/components/agent-skills/WorkspaceMemoryChangeObserver'
 import { settingsOpenAtom } from '@/atoms/settings-tab'
@@ -27,7 +26,6 @@ import { SettingsPanel } from '@/components/settings/SettingsPanel'
 import { detectIsWindows } from '@/lib/platform'
 import { getWindowTitlebarContentInsetClass } from '@/lib/window-titlebar-layout'
 import { cn } from '@/lib/utils'
-import { getRightPanelMode } from './design-layout'
 import { useCanvasSessionRegistry } from '@/hooks/useCanvasSessionRegistry'
 import { Toaster } from '@/components/ui/sonner'
 
@@ -85,26 +83,15 @@ export function AppShell(): React.ReactElement {
   const automationForm = useAtomValue(automationFormAtom)
   const settingsOpen = useAtomValue(settingsOpenAtom)
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
-  // 右栏模式同时覆盖会话文件和项目设计，设计视图不依赖当前会话。
+  /** 顶层视图只决定普通 Agent 右栏是否应保持挂载。 */
   const activeView = useAtomValue(activeViewAtom)
-  const activeCanvasSession = useAtomValue(activeCanvasSessionAtom)
-  /** Design 右栏严格跟随 Canvas 选择；普通会话继续使用当前项目。 */
-  const rightPanelProjectId = activeView === 'design'
-    ? activeCanvasSession?.projectId ?? null
-    : currentWorkspace?.id ?? null
-  /** 当前视图需要挂载的右栏类型。 */
-  const rightPanelMode = getRightPanelMode({
-    activeView,
-    appMode,
-    projectId: rightPanelProjectId,
-    canvasId: activeCanvasSession?.id ?? null,
-    sessionId: currentSessionId,
-    automationOpen: automationForm.open,
-  })
-  /** 设计右栏默认展开，会话右栏继续尊重用户的开关。 */
-  const isRightPanelExpanded = rightPanelMode === 'design' || isPanelOpen
-  /** hidden 模式不挂载右栏，避免无效订阅和布局占位。 */
-  const showRightPanel = rightPanelMode !== 'hidden'
+  const isRightPanelExpanded = isPanelOpen
+  /** 非 Agent 主内容不挂载右栏，避免无效订阅和布局占位。 */
+  const showRightPanel = !automationForm.open
+    && activeView !== 'planning'
+    && activeView !== 'agent-skills'
+    && appMode === 'agent'
+    && currentSessionId !== null
   const isWindows = React.useMemo(() => detectIsWindows(), [])
 
   // 左侧边栏可拖拽宽度
@@ -382,8 +369,6 @@ export function AppShell(): React.ReactElement {
                   />
                 )}
                 <RightSidePanel
-                  mode={rightPanelMode}
-                  projectId={rightPanelProjectId}
                   width={displayedRightPanelWidth}
                 />
               </div>

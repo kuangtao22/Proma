@@ -28,18 +28,19 @@ describe('Agent 到 Design 的发送前意图判断', () => {
     expect(intentModule.shouldOfferDesignHandoff('修复首页白屏问题')).toBe(false)
   })
 
-  test('Given 会话项目与全局项目不同 When 打开 Design Then 先切到会话项目再切视图', () => {
+  test('Given 会话项目与全局项目不同 When 打开设计 handoff Then 先建立关联再聚焦右侧 Canvas', () => {
     const source = readFileSync(join(import.meta.dir, '../components/agent/AgentView.tsx'), 'utf8')
     const handlerStart = source.indexOf('const handleOpenDesignHandoff')
     const handlerEnd = source.indexOf('/** 停止生成', handlerStart)
     const handlerBody = source.slice(handlerStart, handlerEnd)
+    const canvasBindingIndex = handlerBody.indexOf('designAdapter.linkAgentCanvas({')
     const projectSwitchIndex = handlerBody.indexOf('setCurrentAgentWorkspaceId(currentWorkspaceId)')
-    const canvasSelectionIndex = handlerBody.indexOf('canvasId: LEGACY_DESIGN_CANVAS_ID')
-    const designViewIndex = handlerBody.indexOf("setActiveView('design')")
+    const canvasTabIndex = handlerBody.indexOf('getCanvasWorkspaceTab(LEGACY_DESIGN_CANVAS_ID)')
 
     expect(handlerStart).toBeGreaterThan(-1)
-    expect(projectSwitchIndex).toBeGreaterThan(-1)
-    expect(canvasSelectionIndex).toBeGreaterThan(projectSwitchIndex)
-    expect(designViewIndex).toBeGreaterThan(canvasSelectionIndex)
+    expect(canvasBindingIndex).toBeGreaterThan(-1)
+    expect(projectSwitchIndex).toBeGreaterThan(canvasBindingIndex)
+    expect(canvasTabIndex).toBeGreaterThan(projectSwitchIndex)
+    expect(handlerBody).not.toContain("setActiveView('design')")
   })
 })
