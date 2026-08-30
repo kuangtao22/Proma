@@ -70,6 +70,30 @@ export type PermissionResult = {
   decisionClassification?: PermissionDecisionClassification
 }
 
+/**
+ * 单次审批返回后重新验证运行代次与最新权限模式。
+ * @param result 用户本次审批结果。
+ * @param denyStaleToolRun 检查工具调用是否仍属于当前运行代次。
+ * @param getPermissionMode 读取当前会话权限模式，禁止使用审批前快照。
+ * @returns 可安全交给 SDK 的最终权限结果。
+ */
+export function revalidateSingleApprovalResult(
+  result: PermissionResult,
+  denyStaleToolRun: () => PermissionResult | undefined,
+  getPermissionMode: () => PromaPermissionMode,
+): PermissionResult {
+  const staleDenial = denyStaleToolRun()
+  if (staleDenial) return staleDenial
+  if (getPermissionMode() === 'plan') {
+    return {
+      behavior: 'deny',
+      message: '计划模式下不能执行需要逐次批准的工具，请在计划获批后执行。',
+      ...(result.toolUseID ? { toolUseID: result.toolUseID } : {}),
+    }
+  }
+  return result
+}
+
 /** canUseTool 回调的 options 参数（匹配 SDK CanUseTool） */
 export interface CanUseToolOptions {
   signal: AbortSignal

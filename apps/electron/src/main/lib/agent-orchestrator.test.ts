@@ -329,6 +329,20 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(body.slice(approvalIndex, bypassIndex)).toContain("currentMode === 'plan'")
   })
 
+  test('Given 单次审批等待期间权限模式变化 When 审批返回 Then 三条路径统一先查 stale 再 fresh-read mode', () => {
+    /** 读取真实 canUseTool，约束所有单次审批工具共享同一安全收口。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** 截取 canUseTool 权限函数，避免其它模块调用干扰计数。 */
+    const start = source.indexOf('const canUseTool = async')
+    const end = source.indexOf('// 13. 构建 Adapter 查询选项', start)
+    const body = source.slice(start, end)
+    /** Canvas、BrowserUpload 与规划删除都必须调用通用收口一次。 */
+    const revalidationCalls = body.match(/revalidateSingleApprovalResult\(/g)?.length ?? 0
+
+    expect(revalidationCalls).toBe(3)
+    expect(body).not.toContain('return permissionService.requestSingleApproval(sessionId, toolName, input, options')
+  })
+
   test('Given 会话或同项目会话仍在 draining When 请求 rewind Then 以 in-flight 状态保持阻断', () => {
     /** 读取真实编排源码，约束 rewind 不把 stop 后的 draining 误判为空闲。 */
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')

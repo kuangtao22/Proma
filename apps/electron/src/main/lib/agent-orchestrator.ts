@@ -58,7 +58,7 @@ import { resolveProjectInstructions } from './project-instruction-resolver'
 import { combinePromaInstructionFiles } from './adapters/pi-resource-loader-overrides'
 import { MAX_CONTEXT_MESSAGES, buildContextPrompt, buildRecoveryPrompt, buildReferencedSessionsPrompt } from './agent-session-context-prompt'
 import { buildReferencedPlanningPrompt } from './planning-reference-context'
-import { permissionService } from './agent-permission-service'
+import { permissionService, revalidateSingleApprovalResult } from './agent-permission-service'
 import type { PermissionResult, CanUseToolOptions } from './agent-permission-service'
 import { resolvePlanningDeletionPermission } from './planning-permission-policy'
 import { askUserService } from './agent-ask-user-service'
@@ -1370,7 +1370,7 @@ export class AgentOrchestrator {
               this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
             },
           )
-          return denyStaleToolRun() ?? result
+          return revalidateSingleApprovalResult(result, denyStaleToolRun, getPermissionMode)
         }
 
         // ── Write 大文件 token 截断防护 ──
@@ -1455,9 +1455,10 @@ export class AgentOrchestrator {
         // 仍需逐次确认该外发边界，不能被通用 Browser 放行规则覆盖。
         if (toolName === 'BrowserUpload') {
           if (currentMode === 'plan') return { behavior: 'deny' as const, message: '计划模式下不能选择网页上传文件，请在计划获批后执行。' }
-          return permissionService.requestSingleApproval(sessionId, toolName, input, options, (request) => {
+          const result = await permissionService.requestSingleApproval(sessionId, toolName, input, options, (request) => {
             this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
           })
+          return revalidateSingleApprovalResult(result, denyStaleToolRun, getPermissionMode)
         }
 
         // 终端元数据与已缓冲的输出可在计划阶段只读检查；创建、执行、打断或关闭 PTY 都属于可见的本地副作用。
@@ -1500,7 +1501,7 @@ export class AgentOrchestrator {
               this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
             },
           )
-          return denyStaleToolRun() ?? result
+          return revalidateSingleApprovalResult(result, denyStaleToolRun, getPermissionMode)
         }
 
         // ── 普通工具的权限分派 ──
