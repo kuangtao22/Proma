@@ -119,8 +119,7 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
     documents: runtime.documents,
     readNodeContent: runtime.readNodeContent,
     batch: runtime.batch,
-    inspectNode: runtime.inspectNode,
-    runNode: runtime.runNode,
+    runNodes: runtime.runNodes,
   }, {
     projectId: sessionMeta.workspaceId,
     sessionId: input.sessionId,
@@ -140,6 +139,10 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
         .join('\n\n'),
       piCustomTools: [...(prepared.extensions.piCustomTools ?? []), ...canvasRun.piCustomTools],
       allowedToolNames: [...(prepared.extensions.allowedToolNames ?? []), ...canvasRun.allowedToolNames],
+      singleApprovalToolNames: [
+        ...(prepared.extensions.singleApprovalToolNames ?? []),
+        ...canvasRun.singleApprovalToolNames,
+      ],
       allowedToolNamesMode: canvasRun.allowedToolNamesMode,
     },
   }

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { CanvasDocument, CanvasMutation, CanvasNodeReference } from '@proma/shared'
 import { createEmptyCanvasDocument } from '@proma/shared'
-import { CANVAS_TOOL_NAMES, createCanvasToolRun, type CanvasToolNodeRunIdentity, type CanvasToolProviderDependencies, type CanvasToolRunContext } from './canvas-tool-provider'
+import { CANVAS_TOOL_NAMES, createCanvasToolRun, type CanvasToolProviderDependencies, type CanvasToolRunContext } from './canvas-tool-provider'
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
 const reference: CanvasNodeReference = { ...target, nodeId: 'doc-1', nodeType: 'document', nodeRevision: 3, title: '需求' }
@@ -26,9 +26,8 @@ function createFixture(options: { conflictOnce?: boolean; conflictAlways?: boole
   }
   const linkedCanvasIds = ['canvas-1', 'canvas-2']
   const batchInputs: Array<{ baseRevision: number; operations: unknown[]; sourceToolCallId: string }> = []
-  const inspectInputs: string[] = []
-  const runInputs: string[] = []
-  const runIdentities: CanvasToolNodeRunIdentity[] = []
+  const runInputs: string[][] = []
+  const runToolCallIds: string[] = []
   let listCalls = 0
   const dependencies: CanvasToolProviderDependencies = {
     sessions: {
@@ -65,18 +64,19 @@ function createFixture(options: { conflictOnce?: boolean; conflictAlways?: boole
       document = { ...document, revision: input.baseRevision + 1 }
       return { document, operationId: `operation-${batchInputs.length}` }
     } },
-    inspectNode: async (_context, node) => { inspectInputs.push(node.id) },
-    runNode: async (identity, node) => {
-      runIdentities.push(identity)
-      runInputs.push(node.id)
-      return { status: 'started', taskId: `task-${node.id}` }
+    runNodes: async (_context, _target, nodes, toolCallId) => {
+      runInputs.push(nodes.map((node) => node.id))
+      runToolCallIds.push(toolCallId)
+      return nodes.map((node) => node.kind === 'image'
+        ? { nodeId: node.id, status: 'started' as const, taskId: `task-${node.id}` }
+        : { nodeId: node.id, status: 'unsupported' as const, message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' })
     },
   }
   const context: CanvasToolRunContext = {
     projectId: target.projectId, sessionId: 'session-1', runStartedAt: 99,
     explicitReferences: [reference], permissionCeiling: 'execute',
   }
-  return { dependencies, context, batchInputs, inspectInputs, runInputs, runIdentities, getListCalls: () => listCalls }
+  return { dependencies, context, batchInputs, runInputs, runToolCallIds, getListCalls: () => listCalls }
 }
 
 describe('普通 Agent Canvas Tool Provider', () => {
@@ -86,6 +86,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(run.piCustomTools.map((tool) => tool.name)).toEqual([...CANVAS_TOOL_NAMES])
     expect(run.allowedToolNames).toEqual([...CANVAS_TOOL_NAMES])
     expect(run.allowedToolNamesMode).toBe('extend')
+    expect(run.singleApprovalToolNames).toEqual(['canvas_run_nodes'])
     expect(run.systemPromptAppend).toContain('不要按“首页”或“设计”等关键词硬编码')
     const result = await executeTool(run.piCustomTools, 'canvas_get_context', {})
     expect(result.details).toMatchObject({ defaultCanvasId: 'canvas-1', activeCanvasId: 'canvas-2' })
@@ -240,11 +241,8 @@ describe('普通 Agent Canvas Tool Provider', () => {
     await expect(executeTool(plan.piCustomTools, 'canvas_run_nodes', { canvasId: 'canvas-1', nodeIds: ['image-1'] })).rejects.toThrow('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
     const executeCapable = createCanvasToolRun(fixture.dependencies, fixture.context)
     const result = await executeTool(executeCapable.piCustomTools, 'canvas_run_nodes', { canvasId: 'canvas-1', nodeIds: ['image-1'] }, 'tool-run-1')
-    expect(fixture.runInputs).toEqual(['image-1'])
-    expect(fixture.runIdentities).toEqual([{
-      sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-run-1',
-      canvasId: 'canvas-1', nodeId: 'image-1',
-    }])
+    expect(fixture.runInputs).toEqual([['image-1']])
+    expect(fixture.runToolCallIds).toEqual(['tool-run-1'])
     expect(result.details).toMatchObject({ revision: 3, tasks: [{ nodeId: 'image-1', taskId: 'task-image-1' }] })
   })
 
@@ -267,7 +265,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     await executeTool(duplicateRun.piCustomTools, 'canvas_run_nodes', {
       canvasId: 'canvas-1', nodeIds: ['image-1', 'image-1'],
     })
-    expect(duplicateFixture.runInputs).toEqual(['image-1'])
+    expect(duplicateFixture.runInputs).toEqual([['image-1']])
 
     const invalidFixture = createFixture()
     const invalidRun = createCanvasToolRun(invalidFixture.dependencies, invalidFixture.context)
@@ -277,7 +275,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(invalidFixture.runInputs).toEqual([])
   })
 
-  test('Given 后置节点预检失败 When run_nodes Then 所有预检完成前不得启动前置节点', async () => {
+  test('Given 多个有效节点 When run_nodes Then 单次交给批量运行边界且保留顺序', async () => {
     const fixture = createFixture()
     fixture.dependencies.documents.load = () => ({
       document: {
@@ -290,17 +288,15 @@ describe('普通 Agent Canvas Tool Provider', () => {
       writable: true,
       nodeIssues: [],
     })
-    fixture.dependencies.inspectNode = async (_context, node) => {
-      fixture.inspectInputs.push(node.id)
-      if (node.id === 'image-2') throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
-    }
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
 
     await expect(executeTool(run.piCustomTools, 'canvas_run_nodes', {
       canvasId: 'canvas-1', nodeIds: ['image-1', 'image-2'],
-    })).rejects.toThrow('CANVAS_IMAGE_MODEL_REQUIRED')
-    expect(fixture.inspectInputs).toEqual(['image-1', 'image-2'])
-    expect(fixture.runInputs).toEqual([])
+    }, 'tool-batch-1')).resolves.toMatchObject({
+      details: { tasks: [{ nodeId: 'image-1' }, { nodeId: 'image-2' }] },
+    })
+    expect(fixture.runInputs).toEqual([['image-1', 'image-2']])
+    expect(fixture.runToolCallIds).toEqual(['tool-batch-1'])
   })
 
   test('Given webview 暂无执行器 When execute run_nodes Then 返回稳定 unsupported', async () => {
@@ -313,7 +309,6 @@ describe('普通 Agent Canvas Tool Provider', () => {
       writable: true,
       nodeIssues: [],
     })
-    fixture.dependencies.runNode = async () => ({ status: 'unsupported', message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' })
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
     const result = await executeTool(run.piCustomTools, 'canvas_run_nodes', { canvasId: 'canvas-1', nodeIds: ['webview-1'] })
     expect(result.details).toMatchObject({

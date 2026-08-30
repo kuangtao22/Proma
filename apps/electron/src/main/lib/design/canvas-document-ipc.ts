@@ -67,7 +67,6 @@ import type {
 } from './canvas-content-node-lifecycle'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import type {
-  CanvasToolNodeRunIdentity,
   CanvasToolNodeRunResult,
   CanvasToolRunContext,
 } from './canvas-tool-provider'
@@ -134,7 +133,7 @@ export interface CanvasDocumentIpcOptions {
   /** 图片模块配置复用唯一受管内容 Store。 */
   imageModules: Pick<CanvasImageModuleStore, 'load' | 'save'>
   /** Canvas 图片任务复用唯一 Design Job Manager。 */
-  imageJobs: Pick<DesignJobManager, 'createCanvasImage' | 'createCanvasImageOnce' | 'run' | 'cancel' | 'retry' | 'getProjectJob' | 'listCanvasImageJobs' | 'onChanged'>
+  imageJobs: Pick<DesignJobManager, 'createCanvasImage' | 'createCanvasImageOnce' | 'rollbackCanvasImageOnce' | 'run' | 'cancel' | 'retry' | 'getProjectJob' | 'listCanvasImageJobs' | 'onChanged'>
   /** 图片采用复用 Job Manager 已注入的同一目标适配器。 */
   imageJobTarget: Pick<CanvasImageJobTargetAdapter, 'assertTarget' | 'adoptOutput'>
   /** 图片模块只读取 Design 素材公开元数据并创建目录媒体授权。 */
@@ -163,8 +162,12 @@ export interface CanvasToolProviderRuntime {
   documents: Pick<CanvasDocumentStore, 'load' | 'validateBatchOperations'>
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
   readNodeContent: (target: CanvasTarget, node: CanvasNode) => Promise<string>
-  inspectNode: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<void>
-  runNode: (identity: CanvasToolNodeRunIdentity, node: CanvasNode, target: CanvasTarget) => Promise<CanvasToolNodeRunResult>
+  runNodes: (
+    context: CanvasToolRunContext,
+    target: CanvasTarget,
+    nodes: CanvasNode[],
+    toolCallId: string,
+  ) => Promise<CanvasToolNodeRunResult[]>
 }
 
 /** 当前注册代次拥有的进程内运行时，不经过 Renderer IPC。 */
@@ -534,6 +537,29 @@ function isOwnedImageJob(job: DesignJobRecord, target: CanvasImageTarget): boole
     && job.target.canvasId === target.canvasId
     && job.target.nodeId === target.nodeId
     && job.target.imageModuleId === target.imageModuleId
+}
+
+/** 从单次 Agent 工具调用与节点身份派生跨重放稳定任务 ID。 */
+function createAgentCanvasImageJobId(
+  context: CanvasToolRunContext,
+  toolCallId: string,
+  canvasId: string,
+  nodeId: string,
+): string {
+  /** JSON 数组编码避免字段拼接碰撞。 */
+  const digest = createHash('sha256').update(JSON.stringify([
+    context.sessionId,
+    context.runStartedAt,
+    toolCallId,
+    canvasId,
+    nodeId,
+  ])).digest('hex')
+  return `agent-canvas-${digest}`
+}
+
+/** 把未知异常压缩为批量工具可审计的稳定文本。 */
+function canvasNodeRunError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /** 配置必须继续绑定请求模块，防止错误 Store 实现或竞态跨模块返回。 */
@@ -1219,85 +1245,144 @@ export function registerCanvasDocumentIpcHandlers(
     return result.readOutcome.content
   }
 
-  /** 预检图片节点的实时目标、配置与模型；其它节点没有启动前置条件。 */
-  const inspectCanvasNode = async (
-    _context: CanvasToolRunContext,
-    node: CanvasNode,
+  /** 批量图片节点在单一 lease 内完成全量预检与 journal 建立，锁外统一启动。 */
+  const runCanvasNodes = async (
+    context: CanvasToolRunContext,
     target: CanvasTarget,
-  ): Promise<void> => {
-    if (node.kind !== 'image') return
-    /** 图片预检使用完整业务目标，避免节点与模块身份错配。 */
-    const imageTarget: CanvasImageTarget = {
+    nodes: CanvasNode[],
+    toolCallId: string,
+  ): Promise<CanvasToolNodeRunResult[]> => {
+    /** 非图片类型在同一结果中返回稳定事实，不进入付费执行器。 */
+    const taskByNodeId = new Map<string, CanvasToolNodeRunResult>()
+    for (const node of nodes) {
+      if (node.kind === 'webview') {
+        taskByNodeId.set(node.id, {
+          nodeId: node.id,
+          status: 'unsupported',
+          message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE',
+        })
+      } else if (node.kind !== 'image') {
+        taskByNodeId.set(node.id, { nodeId: node.id, status: 'idle' })
+      }
+    }
+    const imageNodes = nodes.filter((node): node is Extract<CanvasNode, { kind: 'image' }> => node.kind === 'image')
+    if (imageNodes.length === 0) return nodes.map((node) => taskByNodeId.get(node.id)!)
+    const firstImageTarget: CanvasImageTarget = {
       ...target,
-      nodeId: node.id,
-      imageModuleId: node.imageModuleId,
+      nodeId: imageNodes[0]!.id,
+      imageModuleId: imageNodes[0]!.imageModuleId,
     }
-    await runImageCanvasExclusive(imageTarget, async () => {
+    const creationOutcome = await runImageCanvasExclusive(firstImageTarget, async () => {
       requireWritableProject(target.projectId, options)
-      await options.imageJobTarget.assertTarget(target.projectId, {
-        kind: 'canvas-image', canvasId: target.canvasId,
-        nodeId: node.id, imageModuleId: node.imageModuleId,
-      })
-      const config = await options.imageModules.load(imageTarget)
-      assertOwnedImageConfig(config, imageTarget)
-      if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
-    })
-  }
-
-  /** 图片节点复用 Renderer 同一 Design Job 流程；仓库尚无 webview 执行器。 */
-  const runCanvasNode = async (
-    identity: CanvasToolNodeRunIdentity,
-    node: CanvasNode,
-    target: CanvasTarget,
-  ): Promise<CanvasToolNodeRunResult> => {
-    if (node.kind !== 'image') {
-      return { status: 'unsupported', message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' }
-    }
-    const imageTarget: CanvasImageTarget = {
-      ...target,
-      nodeId: node.id,
-      imageModuleId: node.imageModuleId,
-    }
-    /** JSON 数组编码避免字段拼接碰撞，SHA-256 让任务身份稳定且满足安全 ID 约束。 */
-    const jobId = `agent-canvas-${createHash('sha256').update(JSON.stringify([
-      identity.sessionId,
-      identity.runStartedAt,
-      identity.toolCallId,
-      identity.canvasId,
-      identity.nodeId,
-    ])).digest('hex')}`
-    const result = await runImageCanvasExclusive(imageTarget, async () => {
-      requireWritableProject(target.projectId, options)
-      await options.imageJobTarget.assertTarget(target.projectId, {
-        kind: 'canvas-image', canvasId: target.canvasId,
-        nodeId: node.id, imageModuleId: node.imageModuleId,
-      })
-      const config = await options.imageModules.load(imageTarget)
-      assertOwnedImageConfig(config, imageTarget)
-      if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
-      return options.imageJobs.createCanvasImageOnce({
-        projectId: target.projectId,
-        target: {
+      /** 第一阶段先证明全部目标、配置和模型有效，禁止边预检边创建 journal。 */
+      const prepared: Array<{
+        node: Extract<CanvasNode, { kind: 'image' }>
+        imageTarget: CanvasImageTarget
+        config: CanvasImageModuleConfig
+        jobId: string
+      }> = []
+      for (const node of imageNodes) {
+        const imageTarget: CanvasImageTarget = {
+          ...target,
+          nodeId: node.id,
+          imageModuleId: node.imageModuleId,
+        }
+        await options.imageJobTarget.assertTarget(target.projectId, {
           kind: 'canvas-image', canvasId: target.canvasId,
           nodeId: node.id, imageModuleId: node.imageModuleId,
-        },
-        action: config.adoptedAssetId ? 'edit' : 'generate',
-        prompt: config.prompt,
-        contextMode: config.contextMode,
-        imageModelProfileId: config.selectedModelProfileId,
-        generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
-        canvasImageConfigRevision: config.revision,
-        ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
-      }, jobId)
+        })
+        const config = await options.imageModules.load(imageTarget)
+        assertOwnedImageConfig(config, imageTarget)
+        if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
+        prepared.push({
+          node,
+          imageTarget,
+          config,
+          jobId: createAgentCanvasImageJobId(context, toolCallId, target.canvasId, node.id),
+        })
+      }
+
+      /** 第二阶段建立全部持久 journal，中途失败则回滚本批新建项并返回完整审计。 */
+      const jobs: Array<{
+        node: Extract<CanvasNode, { kind: 'image' }>
+        imageTarget: CanvasImageTarget
+        job: DesignJobRecord
+        created: boolean
+      }> = []
+      for (let index = 0; index < prepared.length; index += 1) {
+        const item = prepared[index]!
+        try {
+          const result = await options.imageJobs.createCanvasImageOnce({
+            projectId: target.projectId,
+            target: {
+              kind: 'canvas-image', canvasId: target.canvasId,
+              nodeId: item.node.id, imageModuleId: item.node.imageModuleId,
+            },
+            action: item.config.adoptedAssetId ? 'edit' : 'generate',
+            prompt: item.config.prompt,
+            contextMode: item.config.contextMode,
+            imageModelProfileId: item.config.selectedModelProfileId!,
+            generationConstraints: { aspectRatio: item.config.aspectRatio, imageSize: item.config.imageSize },
+            canvasImageConfigRevision: item.config.revision,
+            ...(item.config.adoptedAssetId ? { sourceAssetId: item.config.adoptedAssetId } : {}),
+          }, item.jobId)
+          if (!isOwnedImageJob(result.job, item.imageTarget)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
+          jobs.push({ node: item.node, imageTarget: item.imageTarget, ...result })
+        } catch (error) {
+          const createdJobs = jobs.filter((entry) => entry.created)
+          const rollbackResults = await Promise.allSettled(createdJobs.map((entry) => (
+            options.imageJobs.rollbackCanvasImageOnce(
+              target.projectId,
+              entry.job.id,
+              entry.job.target as Extract<NonNullable<DesignJobRecord['target']>, { kind: 'canvas-image' }>,
+            )
+          )))
+          for (let rollbackIndex = 0; rollbackIndex < createdJobs.length; rollbackIndex += 1) {
+            const entry = createdJobs[rollbackIndex]!
+            const rollback = rollbackResults[rollbackIndex]!
+            const rolledBack = rollback.status === 'fulfilled' && rollback.value
+            taskByNodeId.set(entry.node.id, {
+              nodeId: entry.node.id,
+              status: rolledBack ? 'rolled-back' : 'queued',
+              taskId: entry.job.id,
+              ...(!rolledBack ? { error: rollback.status === 'rejected' ? canvasNodeRunError(rollback.reason) : 'CANVAS_BATCH_ROLLBACK_FAILED' } : {}),
+            })
+          }
+          /** 复用的旧 journal 不属于本批，保留 queued 审计且绝不回滚。 */
+          for (const entry of jobs.filter((candidate) => !candidate.created)) {
+            taskByNodeId.set(entry.node.id, { nodeId: entry.node.id, status: 'queued', taskId: entry.job.id })
+          }
+          taskByNodeId.set(item.node.id, { nodeId: item.node.id, status: 'failed', error: canvasNodeRunError(error) })
+          for (const blocked of prepared.slice(index + 1)) {
+            taskByNodeId.set(blocked.node.id, {
+              nodeId: blocked.node.id,
+              status: 'blocked',
+              error: 'CANVAS_BATCH_JOB_CREATION_BLOCKED',
+            })
+          }
+          return { ready: false as const, jobs: [] }
+        }
+      }
+      return { ready: true as const, jobs }
     })
-    const { job, created } = result
-    if (!isOwnedImageJob(job, imageTarget)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
-    if (created) {
-      void options.imageJobs.run(job.id).catch((error) => {
-        console.error('[CanvasDocumentIPC] Agent Canvas 图片任务后台运行失败:', error)
-      })
+    if (!creationOutcome.ready) return nodes.map((node) => taskByNodeId.get(node.id)!)
+
+    /** 锁外统一启动本批首次创建的任务；allSettled 保留每个节点的独立结果。 */
+    const createdJobs = creationOutcome.jobs.filter((entry) => entry.created)
+    const runResults = await Promise.allSettled(createdJobs.map((entry) => options.imageJobs.run(entry.job.id)))
+    for (let index = 0; index < createdJobs.length; index += 1) {
+      const entry = createdJobs[index]!
+      const result = runResults[index]!
+      taskByNodeId.set(entry.node.id, result.status === 'fulfilled'
+        ? { nodeId: entry.node.id, status: 'started', taskId: entry.job.id }
+        : { nodeId: entry.node.id, status: 'failed', taskId: entry.job.id, error: canvasNodeRunError(result.reason) })
     }
-    return { status: 'started', taskId: job.id }
+    for (const entry of creationOutcome.jobs.filter((candidate) => !candidate.created)) {
+      taskByNodeId.set(entry.node.id, entry.job.status === 'failed'
+        ? { nodeId: entry.node.id, status: 'failed', taskId: entry.job.id, error: entry.job.error ?? 'CANVAS_IMAGE_JOB_FAILED' }
+        : { nodeId: entry.node.id, status: entry.job.status === 'queued' ? 'queued' : 'started', taskId: entry.job.id })
+    }
+    return nodes.map((node) => taskByNodeId.get(node.id)!)
   }
 
   if (options.batch.execute) {
@@ -1307,8 +1392,7 @@ export function registerCanvasDocumentIpcHandlers(
         documents: options.store,
         batch: { execute: options.batch.execute },
         readNodeContent: readCanvasNodeContent,
-        inspectNode: inspectCanvasNode,
-        runNode: runCanvasNode,
+        runNodes: runCanvasNodes,
       },
     }
   }

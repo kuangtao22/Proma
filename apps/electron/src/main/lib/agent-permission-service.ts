@@ -89,6 +89,8 @@ export interface CanUseToolOptions {
 interface PendingPermission {
   resolve: (result: PermissionResult) => void
   request: PermissionRequest
+  /** SDK 工具调用身份，确保审批结果只释放对应调用。 */
+  toolUseID?: string
 }
 
 /** 会话级白名单 */
@@ -149,13 +151,13 @@ export class AgentPermissionService {
       sendToRenderer(request)
 
       return new Promise<PermissionResult>((resolve) => {
-        this.pendingPermissions.set(request.requestId, { resolve, request })
+        this.pendingPermissions.set(request.requestId, { resolve, request, toolUseID: options.toolUseID })
 
         // 如果 signal 被中止，自动拒绝
         options.signal.addEventListener('abort', () => {
           if (this.pendingPermissions.has(request.requestId)) {
             this.pendingPermissions.delete(request.requestId)
-            resolve({ behavior: 'deny' as const, message: '操作已中止' })
+            resolve({ behavior: 'deny' as const, message: '操作已中止', toolUseID: options.toolUseID })
           }
         }, { once: true })
       })
@@ -180,11 +182,11 @@ export class AgentPermissionService {
     }
     sendToRenderer(request)
     return new Promise<PermissionResult>((resolve) => {
-      this.pendingPermissions.set(request.requestId, { resolve, request })
+      this.pendingPermissions.set(request.requestId, { resolve, request, toolUseID: options.toolUseID })
       options.signal.addEventListener('abort', () => {
         if (!this.pendingPermissions.has(request.requestId)) return
         this.pendingPermissions.delete(request.requestId)
-        resolve({ behavior: 'deny' as const, message: '操作已中止' })
+        resolve({ behavior: 'deny' as const, message: '操作已中止', toolUseID: options.toolUseID })
       }, { once: true })
     })
   }
@@ -207,8 +209,8 @@ export class AgentPermissionService {
 
     pending.resolve(
       behavior === 'allow'
-        ? { behavior: 'allow' as const, updatedInput: pending.request.toolInput }
-        : { behavior: 'deny' as const, message: '用户拒绝了此操作' }
+        ? { behavior: 'allow' as const, updatedInput: pending.request.toolInput, toolUseID: pending.toolUseID }
+        : { behavior: 'deny' as const, message: '用户拒绝了此操作', toolUseID: pending.toolUseID }
     )
     this.pendingPermissions.delete(requestId)
     return sessionId
@@ -229,7 +231,7 @@ export class AgentPermissionService {
   clearSessionPending(sessionId: string): void {
     for (const [requestId, pending] of this.pendingPermissions) {
       if (pending.request.sessionId === sessionId) {
-        pending.resolve({ behavior: 'deny' as const, message: '会话已结束' })
+        pending.resolve({ behavior: 'deny' as const, message: '会话已结束', toolUseID: pending.toolUseID })
         this.pendingPermissions.delete(requestId)
       }
     }

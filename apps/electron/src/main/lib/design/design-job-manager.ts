@@ -83,6 +83,12 @@ interface StoredDesignJob extends Omit<DesignJobRecord, 'target'> {
   deletionState?: { status: 'pending' }
 }
 
+/** 同一稳定任务 ID 的进程内创建所有权。 */
+interface CanvasImageInFlightCreation {
+  identity: string
+  promise: Promise<{ job: DesignJobRecord; created: boolean }>
+}
+
 /** Manager 内部创建已使用独立可信 snapshot，不再依赖 Renderer profile ID。 */
 type InternalCreateDesignJobInput = Omit<CreateDesignJobInput, 'imageModelProfileId'>
 
@@ -247,8 +253,8 @@ export class DesignJobManager {
   private readonly canvasImageTargetKeyByJobId = new Map<string, string>()
   /** 尚未写入 journal 的 Canvas 图片目标预留，封闭并发 create/retry 的扫描窗口。 */
   private readonly canvasImageReservations = new Set<string>()
-  /** Agent Canvas 稳定任务 ID 的进程内预留，禁止并发请求覆盖同名 journal。 */
-  private readonly canvasImageJobIdReservations = new Set<string>()
+  /** Agent Canvas 稳定任务 ID 的在途创建；同身份合并，不同身份拒绝。 */
+  private readonly canvasImageInFlightCreations = new Map<string, CanvasImageInFlightCreation>()
   private readonly createId: () => string
   private readonly createCreativeTaskId: () => string
   private readonly now: () => number
@@ -293,19 +299,63 @@ export class DesignJobManager {
   ): Promise<{ job: DesignJobRecord; created: boolean }> {
     if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
     if (!isSafeDesignStableId(jobId)) throw new Error('设计任务 ID 非法')
-    if (this.canvasImageJobIdReservations.has(jobId)) {
-      throw new Error('CANVAS_IMAGE_JOB_IDENTITY_CONFLICT')
+    /** 局部值把已验证 Canvas target 收窄传播到异步 owner。 */
+    const target = input.target
+    const canvasInput = { ...input, target }
+    const identity = createCanvasImageTargetKey(input.projectId, target)
+    const inFlight = this.canvasImageInFlightCreations.get(jobId)
+    if (inFlight) {
+      if (inFlight.identity !== identity) throw new Error('CANVAS_IMAGE_JOB_IDENTITY_CONFLICT')
+      const result = await inFlight.promise
+      return { job: structuredClone(result.job), created: false }
     }
-    this.canvasImageJobIdReservations.add(jobId)
+    /** owner Promise 在 Map 写入前创建，但其同步执行段不包含 await 后的并发窗口。 */
+    const promise = this.createCanvasImageOnceOwned(canvasInput, jobId)
+    const owner: CanvasImageInFlightCreation = { identity, promise }
+    this.canvasImageInFlightCreations.set(jobId, owner)
     try {
-      /** journal 身份检查必须早于目标、模型、输入解析和新 ID 副作用。 */
-      const existing = this.findStableCanvasImageJob(input.projectId, input.target, jobId)
-      if (existing) return { job: clonePublicDesignJob(existing), created: false }
-      const job = await this.createCanvasImageInternal(input, jobId)
-      return { job: clonePublicDesignJob(job), created: true }
+      return await promise
     } finally {
-      this.canvasImageJobIdReservations.delete(jobId)
+      /** 仅当前 identity owner 可释放，避免旧 finally 删除后来者的 ABA 槽位。 */
+      if (this.canvasImageInFlightCreations.get(jobId) === owner) {
+        this.canvasImageInFlightCreations.delete(jobId)
+      }
     }
+  }
+
+  /**
+   * 回滚尚未启动的 Agent Canvas 幂等任务。
+   * @param projectId 任务所属项目。
+   * @param jobId 稳定任务 ID。
+   * @param target 预期 Canvas 图片目标，防止误删同名冲突任务。
+   * @returns journal 已删除或本就不存在时为 true，不满足回滚条件时为 false。
+   */
+  async rollbackCanvasImageOnce(
+    projectId: string,
+    jobId: string,
+    target: CanvasImageJobTarget,
+  ): Promise<boolean> {
+    const job = this.findStoredJob(jobId)
+    if (!job) return true
+    if (!job.id.startsWith('agent-canvas-')
+      || job.projectId !== projectId
+      || !isSameCanvasImageTarget(job.target, target)
+      || job.status !== 'queued'
+      || job.sessionId !== undefined) return false
+    this.deleteJobJournal(job)
+    return true
+  }
+
+  /** 稳定任务 ID owner 执行唯一 journal 查找或创建流程。 */
+  private async createCanvasImageOnceOwned(
+    input: CreateDesignJobInput & { target: CanvasImageJobTarget },
+    jobId: string,
+  ): Promise<{ job: DesignJobRecord; created: boolean }> {
+    /** journal 身份检查必须早于目标、模型、输入解析和新 ID 副作用。 */
+    const existing = this.findStableCanvasImageJob(input.projectId, input.target, jobId)
+    if (existing) return { job: clonePublicDesignJob(existing), created: false }
+    const job = await this.createCanvasImageInternal(input, jobId)
+    return { job: clonePublicDesignJob(job), created: true }
   }
 
   /** 执行 Canvas 图片任务的唯一创建流程，可选复用可信稳定 ID。 */

@@ -1355,6 +1355,24 @@ export class AgentOrchestrator {
           return { behavior: 'deny', message }
         }
 
+        /** 付费或高影响工具即使在 bypassPermissions 下也必须按 toolUseID 逐次确认。 */
+        if (extensions.singleApprovalToolNames?.includes(toolName)) {
+          if (currentMode === 'plan') {
+            return { behavior: 'deny' as const, message: '计划模式下不能执行需要逐次批准的工具，请在计划获批后执行。' }
+          }
+          const result = await permissionService.requestSingleApproval(
+            sessionId,
+            toolName,
+            input,
+            options,
+            (request) => {
+              if (denyStaleToolRun()) return
+              this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
+            },
+          )
+          return denyStaleToolRun() ?? result
+        }
+
         // ── Write 大文件 token 截断防护 ──
         if (toolName === 'Write' && typeof input.content === 'string') {
           const estimatedTokens = estimateTokenCount(input.content)

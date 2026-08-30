@@ -21,6 +21,8 @@ export interface AgentRunExtensions {
   resolveTrustedImageRoute?: ResolveImageGenerationRoute
   /** 本次运行按完整工具名设置的最大准入次数；缺失时不限制普通 Agent。 */
   toolCallLimits?: Readonly<Record<string, number>>
+  /** 即使处于 bypassPermissions，也必须按 toolUseID 逐次请求用户批准的工具名。 */
+  singleApprovalToolNames?: readonly string[]
   /** 工具参数校验和次数占位后、真实执行前的同步运行守卫。 */
   beforeToolCall?: (toolName: string, input: Readonly<Record<string, unknown>>) => void
   /** Design 可信图片工具在执行前回传的真实摘要和精确提示词。 */

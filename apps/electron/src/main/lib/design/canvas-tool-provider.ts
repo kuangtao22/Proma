@@ -41,20 +41,13 @@ export interface CanvasToolRunContext {
   permissionCeiling: CanvasToolPermissionCeiling
 }
 
-/** 单节点运行的稳定幂等身份，用于跨重放派生持久任务 ID。 */
-export interface CanvasToolNodeRunIdentity {
-  sessionId: string
-  runStartedAt: number
-  toolCallId: string
-  canvasId: string
-  nodeId: string
-}
-
 /** 已有节点执行器返回的稳定任务事实。 */
 export interface CanvasToolNodeRunResult {
-  status: 'started' | 'idle' | 'unsupported'
+  nodeId: string
+  status: 'started' | 'queued' | 'idle' | 'unsupported' | 'failed' | 'blocked' | 'rolled-back'
   taskId?: string
   message?: string
+  error?: string
 }
 
 /** Provider 只依赖现有权威 Store、Task8 batch 与执行接缝。 */
@@ -76,12 +69,16 @@ export interface CanvasToolProviderDependencies {
   }
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
-  inspectNode: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<void>
-  runNode?: (identity: CanvasToolNodeRunIdentity, node: CanvasNode, target: CanvasTarget) => Promise<CanvasToolNodeRunResult>
+  runNodes: (
+    context: CanvasToolRunContext,
+    target: CanvasTarget,
+    nodes: CanvasNode[],
+    toolCallId: string,
+  ) => Promise<CanvasToolNodeRunResult[]>
 }
 
 /** Provider 产出的单轮扩展；extend 保留普通 Agent 原有工具。 */
-export interface CanvasToolRun extends Required<Pick<AgentRunExtensions, 'systemPromptAppend' | 'piCustomTools' | 'allowedToolNames'>> {
+export interface CanvasToolRun extends Required<Pick<AgentRunExtensions, 'systemPromptAppend' | 'piCustomTools' | 'allowedToolNames' | 'singleApprovalToolNames'>> {
   allowedToolNamesMode: 'extend'
 }
 
@@ -319,25 +316,8 @@ export function createCanvasToolRun(
           if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
           return node
         })
-        /** 所有目标、配置和可运行性预检通过前，禁止创建任何任务。 */
-        for (const node of nodes) await dependencies.inspectNode(context, node, target)
-        const tasks = []
-        for (const node of nodes) {
-          if (node.kind !== 'image' && node.kind !== 'webview') {
-            tasks.push({ nodeId: node.id, status: 'idle' })
-            continue
-          }
-          const outcome = dependencies.runNode
-            ? await dependencies.runNode({
-                sessionId: context.sessionId,
-                runStartedAt: context.runStartedAt,
-                toolCallId,
-                canvasId: params.canvasId,
-                nodeId: node.id,
-              }, node, target)
-            : { status: 'unsupported' as const, message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' }
-          tasks.push({ nodeId: node.id, ...outcome })
-        }
+        /** 目标预检、journal 建立和统一启动由生产批量边界一次完成。 */
+        const tasks = await dependencies.runNodes(context, target, nodes, toolCallId)
         return toolResult({ canvasId: params.canvasId, revision: document.revision, tasks })
       },
     }),
@@ -347,6 +327,7 @@ export function createCanvasToolRun(
     systemPromptAppend: `## 画布工具\n请基于完整用户语义和工具 schema 自主决定是否读取、创建、修改或运行画布，不要按“首页”或“设计”等关键词硬编码。Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。普通讨论优先读取，不要要求用户另建已经存在的画布。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。`,
     piCustomTools: tools,
     allowedToolNames: CANVAS_TOOL_NAMES,
+    singleApprovalToolNames: ['canvas_run_nodes'],
     allowedToolNamesMode: 'extend',
   }
 }

@@ -313,6 +313,22 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(staleChecks).toBeGreaterThanOrEqual(4)
   })
 
+  test('Given bypass Canvas 运行工具 When 进入权限边界 Then 守卫后逐次审批且普通 Canvas 工具不审批', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    const start = source.indexOf('const canUseTool = async')
+    const end = source.indexOf('// 13. 构建 Adapter 查询选项', start)
+    const body = source.slice(start, end)
+    const guardIndex = body.indexOf('extensions.beforeToolCall?.(toolName, input)')
+    const approvalIndex = body.indexOf('extensions.singleApprovalToolNames?.includes(toolName)')
+    const bypassIndex = body.indexOf("case 'bypassPermissions':")
+
+    expect(approvalIndex).toBeGreaterThan(guardIndex)
+    expect(approvalIndex).toBeLessThan(bypassIndex)
+    expect(body.slice(approvalIndex, bypassIndex)).toContain('await permissionService.requestSingleApproval(')
+    expect(body.slice(approvalIndex, bypassIndex)).toContain('return denyStaleToolRun() ?? result')
+    expect(body.slice(approvalIndex, bypassIndex)).toContain("currentMode === 'plan'")
+  })
+
   test('Given 会话或同项目会话仍在 draining When 请求 rewind Then 以 in-flight 状态保持阻断', () => {
     /** 读取真实编排源码，约束 rewind 不把 stop 后的 draining 误判为空闲。 */
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')

@@ -201,6 +201,8 @@ function createContext(options: {
   imageJobsList?: (projectId: string) => DesignJobRecord[]
   imageTargetAssert?: (projectId: string, target: Omit<CanvasImageTarget, 'projectId'>) => Promise<void>
   imageCreateOnce?: (input: CreateDesignJobInput, jobId: string) => Promise<{ job: DesignJobRecord; created: boolean }>
+  imageRollbackOnce?: (projectId: string, jobId: string) => Promise<boolean>
+  imageRun?: (jobId: string, leaseHeld: boolean) => Promise<void>
   batchReconcile?: () => Promise<void>
   batchReconcileError?: Error
   batchPublications?: CanvasDocument[]
@@ -434,16 +436,24 @@ function createContext(options: {
         return createImageJob(imageTargetA, 'job-created')
       },
       createCanvasImageOnce: async (input, jobId) => {
+        imageCalls.push({ type: 'create-once', value: { input, jobId } })
         if (options.imageCreateOnce) return options.imageCreateOnce(input, jobId)
         const existing = agentImageJobs.get(jobId)
         if (existing) return { job: existing, created: false }
         if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
         const job = createImageJob({ projectId: input.projectId, ...input.target }, jobId)
         agentImageJobs.set(jobId, job)
-        imageCalls.push({ type: 'create-once', value: { input, jobId } })
         return { job, created: true }
       },
-      run: async (jobId) => { imageCalls.push({ type: 'run', value: jobId }) },
+      rollbackCanvasImageOnce: async (projectId, jobId) => {
+        imageCalls.push({ type: 'rollback-once', value: { projectId, jobId } })
+        if (options.imageRollbackOnce) return options.imageRollbackOnce(projectId, jobId)
+        return agentImageJobs.delete(jobId)
+      },
+      run: async (jobId) => {
+        imageCalls.push({ type: 'run', value: jobId })
+        await options.imageRun?.(jobId, leaseHeld)
+      },
       cancel: async (projectId, jobId) => {
         imageCalls.push({ type: 'cancel', value: { projectId, jobId } })
         return (options.imageJobs ?? [createImageJob(imageTargetA, 'job-a')]).find((job) => job.id === jobId)
@@ -2701,6 +2711,7 @@ describe('原生 Canvas 文档 IPC', () => {
         createCanvasImageOnce: async (_input: CreateDesignJobInput, jobId: string) => ({
           job: createImageJob(imageTargetA, jobId), created: true,
         }),
+        rollbackCanvasImageOnce: async () => true,
         run: async () => undefined,
         cancel: async () => createImageJob(imageTargetA, 'job-a'),
         retry: () => createImageJob(imageTargetA, 'job-retry'),
@@ -2777,30 +2788,71 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(removed).toHaveLength(19)
   })
 
-  test('Given 可运行图片节点 When 普通 Agent 预检 Then 校验目标与配置且不创建 Job', async () => {
-    const context = createContext({ enableToolProviderRuntime: true })
+  test('Given 第二个图片节点创建失败 When 批量运行 Then 零启动并返回已创建任务回滚与失败节点审计', async () => {
+    let createCount = 0
+    const context = createContext({
+      enableToolProviderRuntime: true,
+      imageCreateOnce: async (input, jobId) => {
+        createCount += 1
+        if (createCount === 2) throw new Error('SECOND_JOB_CREATE_FAILED')
+        if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
+        return { job: createImageJob({ projectId: input.projectId, ...input.target }, jobId), created: true }
+      },
+      imageRollbackOnce: async () => true,
+    })
     try {
       const runtime = getCanvasToolProviderRuntime()
       if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
-      await runtime.inspectNode({
-        projectId: imageTargetA.projectId,
-        sessionId: 'agent-session-1',
-        runStartedAt: 99,
-        explicitReferences: [],
-        permissionCeiling: 'execute',
+      const tasks = await runtime.runNodes({
+        projectId: imageTargetA.projectId, sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      }, { projectId: imageTargetA.projectId, canvasId: imageTargetA.canvasId }, [{
+        id: 'image-node-a', kind: 'image', title: '首图', position: { x: 0, y: 0 }, imageModuleId: 'image-module-a',
       }, {
-        id: imageTargetA.nodeId,
-        kind: 'image',
-        title: '主视觉',
-        position: { x: 0, y: 0 },
-        imageModuleId: imageTargetA.imageModuleId,
-      }, {
-        projectId: imageTargetA.projectId,
-        canvasId: imageTargetA.canvasId,
-      })
+        id: 'image-node-b', kind: 'image', title: '次图', position: { x: 100, y: 0 }, imageModuleId: 'image-module-b',
+      }], 'tool-run-batch-fail')
 
-      expect(context.imageCalls.map((call) => call.type)).toEqual(['assert-target', 'load'])
-      expect(context.imageCalls.some((call) => call.type === 'create' || call.type === 'run')).toBe(false)
+      expect(context.imageCalls.filter((call) => call.type === 'run')).toHaveLength(0)
+      expect(context.imageCalls.filter((call) => call.type === 'rollback-once')).toHaveLength(1)
+      expect(tasks).toMatchObject([
+        { nodeId: 'image-node-a', status: 'rolled-back', taskId: expect.stringMatching(/^agent-canvas-[a-f0-9]{64}$/) },
+        { nodeId: 'image-node-b', status: 'failed', error: 'SECOND_JOB_CREATE_FAILED' },
+      ])
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
+  test('Given 全部图片 journal 已建立 When 统一启动有一项失败 Then 锁外 allSettled 返回逐节点审计', async () => {
+    const runLeaseStates: boolean[] = []
+    const context = createContext({
+      enableToolProviderRuntime: true,
+      imageRun: async (jobId, leaseHeld) => {
+        runLeaseStates.push(leaseHeld)
+        if (jobId.includes('never-match')) throw new Error('unused')
+        const runCalls = context.imageCalls.filter((call) => call.type === 'run')
+        if (runCalls.length === 2) throw new Error('SECOND_JOB_RUN_FAILED')
+      },
+    })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      const tasks = await runtime.runNodes({
+        projectId: imageTargetA.projectId, sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      }, { projectId: imageTargetA.projectId, canvasId: imageTargetA.canvasId }, [{
+        id: 'image-node-a', kind: 'image', title: '首图', position: { x: 0, y: 0 }, imageModuleId: 'image-module-a',
+      }, {
+        id: 'image-node-b', kind: 'image', title: '次图', position: { x: 100, y: 0 }, imageModuleId: 'image-module-b',
+      }], 'tool-run-batch-success')
+
+      const callTypes = context.imageCalls.map((call) => call.type)
+      expect(callTypes.lastIndexOf('create-once')).toBeLessThan(callTypes.indexOf('run'))
+      expect(runLeaseStates).toEqual([false, false])
+      expect(tasks).toMatchObject([
+        { nodeId: 'image-node-a', status: 'started', taskId: expect.any(String) },
+        { nodeId: 'image-node-b', status: 'failed', taskId: expect.any(String), error: 'SECOND_JOB_RUN_FAILED' },
+      ])
     } finally {
       context.registration.dispose()
     }
@@ -2819,9 +2871,9 @@ describe('原生 Canvas 文档 IPC', () => {
       createCount += 1
       return { job, created: true }
     }
-    const identity = {
-      sessionId: 'agent-session-1', runStartedAt: 99, toolCallId: 'tool-run-1',
-      canvasId: imageTargetA.canvasId, nodeId: imageTargetA.nodeId,
+    const runContext = {
+      projectId: imageTargetA.projectId, sessionId: 'agent-session-1', runStartedAt: 99,
+      explicitReferences: [], permissionCeiling: 'execute' as const,
     }
     const node = {
       id: imageTargetA.nodeId, kind: 'image' as const, title: '主视觉',
@@ -2833,8 +2885,8 @@ describe('原生 Canvas 文档 IPC', () => {
     try {
       const runtime = getCanvasToolProviderRuntime()
       if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
-      firstTaskId = (await runtime.runNode(identity, node, target)).taskId
-      expect((await runtime.runNode(identity, node, target)).taskId).toBe(firstTaskId)
+      firstTaskId = (await runtime.runNodes(runContext, target, [node], 'tool-run-1'))[0]?.taskId
+      expect((await runtime.runNodes(runContext, target, [node], 'tool-run-1'))[0]?.taskId).toBe(firstTaskId)
       expect(firstContext.imageCalls.filter((call) => call.type === 'run')).toHaveLength(1)
     } finally {
       firstContext.registration.dispose()
@@ -2844,12 +2896,66 @@ describe('原生 Canvas 文档 IPC', () => {
     try {
       const runtime = getCanvasToolProviderRuntime()
       if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
-      expect((await runtime.runNode(identity, node, target)).taskId).toBe(firstTaskId)
+      expect((await runtime.runNodes(runContext, target, [node], 'tool-run-1'))[0]?.taskId).toBe(firstTaskId)
       expect(reloadedContext.imageCalls.filter((call) => call.type === 'run')).toHaveLength(0)
     } finally {
       reloadedContext.registration.dispose()
     }
     expect(firstTaskId).toMatch(/^agent-canvas-[a-f0-9]{64}$/)
     expect(createCount).toBe(1)
+  })
+
+  test('Given 相同 Agent Canvas 批次并发重放 When 首次正在锁外启动 Then Promise.all 只创建并运行一次', async () => {
+    const persistedJobs = new Map<string, DesignJobRecord>()
+    const runEntered = Promise.withResolvers<void>()
+    const releaseRun = Promise.withResolvers<void>()
+    let createCount = 0
+    let runCount = 0
+    const context = createContext({
+      enableToolProviderRuntime: true,
+      imageCreateOnce: async (input, jobId) => {
+        const existing = persistedJobs.get(jobId)
+        if (existing) return { job: existing, created: false }
+        if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
+        const job = createImageJob({ projectId: input.projectId, ...input.target }, jobId)
+        persistedJobs.set(jobId, job)
+        createCount += 1
+        return { job, created: true }
+      },
+      imageRun: async (jobId) => {
+        runCount += 1
+        const job = persistedJobs.get(jobId)
+        if (job) persistedJobs.set(jobId, { ...job, status: 'running' })
+        runEntered.resolve()
+        await releaseRun.promise
+      },
+    })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      const runContext = {
+        projectId: imageTargetA.projectId, sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute' as const,
+      }
+      const node = {
+        id: imageTargetA.nodeId, kind: 'image' as const, title: '主视觉',
+        position: { x: 0, y: 0 }, imageModuleId: imageTargetA.imageModuleId,
+      }
+      const target = { projectId: imageTargetA.projectId, canvasId: imageTargetA.canvasId }
+      const first = runtime.runNodes(runContext, target, [node], 'tool-run-concurrent')
+      await runEntered.promise
+      const replay = runtime.runNodes(runContext, target, [node], 'tool-run-concurrent')
+      const replayResult = await replay
+      releaseRun.resolve()
+      const [firstResult] = await Promise.all([first])
+
+      expect(firstResult[0]).toMatchObject({ status: 'started', taskId: expect.any(String) })
+      expect(replayResult[0]).toMatchObject({ status: 'started', taskId: firstResult[0]?.taskId })
+      expect(createCount).toBe(1)
+      expect(runCount).toBe(1)
+    } finally {
+      releaseRun.resolve()
+      context.registration.dispose()
+    }
   })
 })

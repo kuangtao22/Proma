@@ -218,6 +218,44 @@ describe('Design Job Manager', () => {
     expect(harness.modelResolutionCount).toBe(1)
   })
 
+  test('Given 相同 Agent Canvas 幂等 ID When 同进程并发创建 Then 合并在途 Promise 且只有 owner 创建', async () => {
+    const jobId = `agent-canvas-${'d'.repeat(64)}`
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    harness.resolveCanvasInputReferences = async () => {
+      entered.resolve()
+      await release.promise
+      return []
+    }
+
+    const first = harness.manager.createCanvasImageOnce(createCanvasImageInput('a'), jobId)
+    await entered.promise
+    const replay = harness.manager.createCanvasImageOnce(createCanvasImageInput('a'), jobId)
+    release.resolve()
+    const results = await Promise.all([first, replay])
+
+    expect(results.map((result) => result.created).sort()).toEqual([false, true])
+    expect(results[0]!.job).toEqual(results[1]!.job)
+    expect(harness.targetAssertionCount).toBe(1)
+    expect(harness.modelResolutionCount).toBe(1)
+  })
+
+  test('Given Agent Canvas 幂等创建在途失败 When 同 ID 重试 Then 释放 owner 并允许重新创建', async () => {
+    const jobId = `agent-canvas-${'e'.repeat(64)}`
+    let attempts = 0
+    harness.resolveCanvasInputReferences = async () => {
+      attempts += 1
+      if (attempts === 1) throw new Error('测试输入解析失败')
+      return []
+    }
+
+    await expect(harness.manager.createCanvasImageOnce(createCanvasImageInput('a'), jobId))
+      .rejects.toThrow('测试输入解析失败')
+    await expect(harness.manager.createCanvasImageOnce(createCanvasImageInput('a'), jobId))
+      .resolves.toMatchObject({ created: true, job: { id: jobId } })
+    expect(attempts).toBe(2)
+  })
+
   test('Given Agent Canvas journal 已持久化 When fresh Manager 重放 Then 不重新创建并返回同任务', async () => {
     const jobId = `agent-canvas-${'b'.repeat(64)}`
     const first = await harness.manager.createCanvasImageOnce(createCanvasImageInput('a'), jobId)
