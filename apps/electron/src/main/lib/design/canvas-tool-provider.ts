@@ -2,7 +2,6 @@ import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import type {
   AgentCanvasBinding,
-  AgentSendInput,
   CanvasBatchOperationEnvelope,
   CanvasDocument,
   CanvasMutation,
@@ -30,33 +29,8 @@ export const CANVAS_TOOL_NAMES = [
   'canvas_run_nodes',
 ] as const
 
-export type CanvasToolUserIntent = 'discuss' | 'plan' | 'execute'
-
-/** Canvas 领域词只描述可操作对象，不依赖 Renderer 页面名称。 */
-const CANVAS_DOMAIN_PATTERN = /(?:画布|节点|连线|图片|原型|canvas|nodes?|edges?|connections?|images?|prototypes?)/i
-/** 问询和分析语义优先保持只读，避免“如何创建”被动作词误判为执行。 */
-const DISCUSS_INTENT_PATTERN = /(?:如何|怎么|怎样|能否|是否|为什么|分析|解释|说明|评估|研究|查看|检查|了解|how|why|can\s+(?:you|i|we)|could\s+(?:you|i|we)|would\s+(?:you|i|we)|explain|analy[sz]e|review|inspect|understand)/i
-/** 规划语义只允许搭建新的 idle 结构。 */
-const PLAN_INTENT_PATTERN = /(?:规划|计划|方案|拆解|梳理|plan|outline|structure)/i
-/** 明确动作词与 Canvas 对象同时出现时，才允许进入执行意图。 */
-const EXECUTE_INTENT_PATTERN = /(?:创建|新增|添加|连接|修改|更新|删除|移除|移动|运行|执行|生成|重建|关联|取消关联|设为默认|create|add|connect|link|modify|update|delete|remove|move|run|execute|generate|rebuild|unlink|set\s+(?:as\s+)?default)/i
-
-/**
- * 从主进程收到的真实用户消息解析单轮 Canvas 工具意图。
- * @param input 已经过发送边界准备的用户消息与可选权限模式。
- * @returns 保守的只读、规划或执行意图。
- */
-export function resolveCanvasToolUserIntent(
-  input: Pick<AgentSendInput, 'userMessage' | 'permissionModeOverride'>,
-): CanvasToolUserIntent {
-  if (input.permissionModeOverride === 'plan') return 'plan'
-  /** 空白和不涉及 Canvas 的消息均保持只读。 */
-  const message = input.userMessage.trim()
-  if (!message || !CANVAS_DOMAIN_PATTERN.test(message)) return 'discuss'
-  if (DISCUSS_INTENT_PATTERN.test(message)) return 'discuss'
-  if (PLAN_INTENT_PATTERN.test(message)) return 'plan'
-  return EXECUTE_INTENT_PATTERN.test(message) ? 'execute' : 'discuss'
-}
+/** Host 只执法会话权限上限，不从用户文本推断业务意图。 */
+export type CanvasToolPermissionCeiling = 'plan' | 'execute'
 
 /** 引用完成权威解析后构造的单轮可信上下文。 */
 export interface CanvasToolRunContext {
@@ -64,7 +38,16 @@ export interface CanvasToolRunContext {
   sessionId: string
   runStartedAt: number
   explicitReferences: CanvasNodeReference[]
-  userIntent: CanvasToolUserIntent
+  permissionCeiling: CanvasToolPermissionCeiling
+}
+
+/** 单节点运行的稳定幂等身份，用于跨重放派生持久任务 ID。 */
+export interface CanvasToolNodeRunIdentity {
+  sessionId: string
+  runStartedAt: number
+  toolCallId: string
+  canvasId: string
+  nodeId: string
 }
 
 /** 已有节点执行器返回的稳定任务事实。 */
@@ -94,7 +77,7 @@ export interface CanvasToolProviderDependencies {
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
   inspectNode: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<void>
-  runNode?: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<CanvasToolNodeRunResult>
+  runNode?: (identity: CanvasToolNodeRunIdentity, node: CanvasNode, target: CanvasTarget) => Promise<CanvasToolNodeRunResult>
 }
 
 /** Provider 产出的单轮扩展；extend 保留普通 Agent 原有工具。 */
@@ -187,7 +170,7 @@ export function createCanvasToolRun(
             canvasId: reference.canvasId, nodeId: reference.nodeId, nodeType: reference.nodeType,
             nodeRevision: reference.nodeRevision, title: reference.title,
           })),
-          userIntent: context.userIntent,
+          permissionCeiling: context.permissionCeiling,
         })
       },
     }),
@@ -201,8 +184,7 @@ export function createCanvasToolRun(
         makeDefault: Type.Optional(Type.Boolean()),
       }),
       execute: async (_toolCallId, params) => {
-        if (context.userIntent === 'discuss') throw new Error('CANVAS_WRITE_INTENT_REQUIRED')
-        if (context.userIntent === 'plan' && params.action !== 'create' && params.action !== 'link') {
+        if (context.permissionCeiling === 'plan' && params.action !== 'create' && params.action !== 'link') {
           throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         }
         if (params.action === 'create') {
@@ -287,14 +269,13 @@ export function createCanvasToolRun(
         destructiveIntent: Type.Optional(Type.Literal('explicit')),
       }),
       execute: async (toolCallId, params) => {
-        if (context.userIntent === 'discuss') throw new Error('CANVAS_WRITE_INTENT_REQUIRED')
         requireLinkedCanvas(dependencies, context, params.canvasId)
         const target = { projectId: context.projectId, canvasId: params.canvasId }
         const rawOperations = structuredClone(params.operations)
         const execute = (baseRevision: number, sourceToolCallId: string): Promise<CanvasBatchOperationResult> => {
           const operations = dependencies.documents.validateBatchOperations(target, baseRevision, rawOperations)
           const document = dependencies.documents.load(target).document
-          if (context.userIntent === 'plan' && !isPlanSafeMutation(document, operations)) {
+          if (context.permissionCeiling === 'plan' && !isPlanSafeMutation(document, operations)) {
             throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
           }
           if (hasDestructiveMutation(document, operations) && params.destructiveIntent !== 'explicit') {
@@ -324,8 +305,8 @@ export function createCanvasToolRun(
       name: 'canvas_run_nodes', label: '运行画布节点',
       description: '仅在用户明确执行时运行已有生图或 HTML 节点；其它节点保持 idle，未来 video 稳定返回 unsupported。',
       parameters: Type.Object({ canvasId: Type.String({ minLength: 1, maxLength: 128 }), nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_READ_NODES }) }),
-      execute: async (_toolCallId, params) => {
-        if (context.userIntent !== 'execute') throw new Error('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
+      execute: async (toolCallId, params) => {
+        if (context.permissionCeiling === 'plan') throw new Error('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
         requireLinkedCanvas(dependencies, context, params.canvasId)
         const target = { projectId: context.projectId, canvasId: params.canvasId }
         const document = dependencies.documents.load(target).document
@@ -347,7 +328,13 @@ export function createCanvasToolRun(
             continue
           }
           const outcome = dependencies.runNode
-            ? await dependencies.runNode(context, node, target)
+            ? await dependencies.runNode({
+                sessionId: context.sessionId,
+                runStartedAt: context.runStartedAt,
+                toolCallId,
+                canvasId: params.canvasId,
+                nodeId: node.id,
+              }, node, target)
             : { status: 'unsupported' as const, message: 'CANVAS_NODE_EXECUTOR_UNAVAILABLE' }
           tasks.push({ nodeId: node.id, ...outcome })
         }
@@ -357,7 +344,7 @@ export function createCanvasToolRun(
   ] as ToolDefinition[]
 
   return {
-    systemPromptAppend: `## 画布工具\n根据用户语义和本轮意图选择画布工具，不要按“首页”或“设计”等关键词硬编码。普通讨论先读取，不创建、不修改、不运行。不要要求用户另建已经存在的画布。删除或覆盖必须有用户明确意图。`,
+    systemPromptAppend: `## 画布工具\n请基于完整用户语义和工具 schema 自主决定是否读取、创建、修改或运行画布，不要按“首页”或“设计”等关键词硬编码。Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。普通讨论优先读取，不要要求用户另建已经存在的画布。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。`,
     piCustomTools: tools,
     allowedToolNames: CANVAS_TOOL_NAMES,
     allowedToolNamesMode: 'extend',

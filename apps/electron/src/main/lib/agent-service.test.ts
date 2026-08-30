@@ -10,8 +10,9 @@ describe('Agent service 迁移准入', () => {
     expect(source).toContain('createCanvasToolRun(')
     expect(source).toContain('prepared.references')
     expect(source).toContain('isEligibleProjectAgent(sessionMeta, sessionMeta.workspaceId)')
-    expect(source).toContain('resolveCanvasToolUserIntent(prepared.input)')
-    expect(source).not.toContain("extensions.canvasUserIntent ?? 'discuss'")
+    expect(source).toContain("((prepared.input as AgentSendInput).permissionModeOverride ?? sessionMeta.permissionMode) === 'plan'")
+    expect(source).not.toContain('resolveCanvasToolUserIntent')
+    expect(source).not.toContain('prepared.input.userMessage')
     expect(source).toContain("|| input.triggeredBy === 'user'")
     /** 只在运行准备函数体内比较调用顺序，避免 import 文本造成误报。 */
     const functionStart = source.indexOf('export function prepareAgentRun')

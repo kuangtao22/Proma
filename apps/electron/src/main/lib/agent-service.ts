@@ -70,7 +70,7 @@ import { createCanvasDocumentStore } from './design/canvas-document-store'
 import { createCanvasNodeReferenceResolver } from './design/canvas-node-reference-resolver'
 import { CanvasSessionStore } from './design/canvas-session-store'
 import { designPathResolver } from './design/design-paths'
-import { createCanvasToolRun, resolveCanvasToolUserIntent } from './design/canvas-tool-provider'
+import { createCanvasToolRun } from './design/canvas-tool-provider'
 import { getCanvasToolProviderRuntime } from './design/canvas-document-ipc'
 
 /** 保持现有主进程调用方从 agent-service 导入运行扩展类型的兼容性。 */
@@ -126,7 +126,10 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
     sessionId: input.sessionId,
     runStartedAt: 'startedAt' in input && input.startedAt != null ? input.startedAt : Date.now(),
     explicitReferences: prepared.references ?? [],
-    userIntent: resolveCanvasToolUserIntent(prepared.input),
+    permissionCeiling:
+      ((prepared.input as AgentSendInput).permissionModeOverride ?? sessionMeta.permissionMode) === 'plan'
+        ? 'plan'
+        : 'execute',
   })
   return {
     ...prepared,

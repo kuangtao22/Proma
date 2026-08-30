@@ -205,6 +205,41 @@ describe('Design Job Manager', () => {
     expect(document.nodes).toEqual(before)
   })
 
+  test('Given 相同 Agent Canvas 幂等 ID When 同 Manager 连续创建 Then 只写一个 journal 并复用任务', async () => {
+    const jobId = `agent-canvas-${'a'.repeat(64)}`
+
+    const first = await harness.manager.createCanvasImageOnce(createCanvasImageInput('a'), jobId)
+    const replay = await harness.manager.createCanvasImageOnce(createCanvasImageInput('a'), jobId)
+
+    expect(first).toMatchObject({ created: true, job: { id: jobId } })
+    expect(replay).toMatchObject({ created: false, job: { id: jobId } })
+    expect(harness.manager.list('project-1').filter((job) => job.id === jobId)).toHaveLength(1)
+    expect(harness.targetAssertionCount).toBe(1)
+    expect(harness.modelResolutionCount).toBe(1)
+  })
+
+  test('Given Agent Canvas journal 已持久化 When fresh Manager 重放 Then 不重新创建并返回同任务', async () => {
+    const jobId = `agent-canvas-${'b'.repeat(64)}`
+    const first = await harness.manager.createCanvasImageOnce(createCanvasImageInput('a'), jobId)
+    const reloaded = createHarness()
+
+    const replay = await reloaded.manager.createCanvasImageOnce(createCanvasImageInput('a'), jobId)
+
+    expect(replay).toEqual({ created: false, job: first.job })
+    expect(reloaded.targetAssertionCount).toBe(0)
+    expect(reloaded.modelResolutionCount).toBe(0)
+    expect(reloaded.createdIdCount).toBe(0)
+  })
+
+  test('Given 相同 Agent Canvas 幂等 ID 已归属另一目标 When 创建 Then fail closed 且保留原 journal', async () => {
+    const jobId = `agent-canvas-${'c'.repeat(64)}`
+    const first = await harness.manager.createCanvasImageOnce(createCanvasImageInput('a'), jobId)
+
+    await expect(harness.manager.createCanvasImageOnce(createCanvasImageInput('b'), jobId))
+      .rejects.toThrow('CANVAS_IMAGE_JOB_IDENTITY_CONFLICT')
+    expect(harness.manager.getProjectJob('project-1', jobId)).toEqual(first.job)
+  })
+
   test('Given webview 直接入边 When 创建并重载 Canvas Job Then journal 与任务详情保留共享枚举', async () => {
     harness.canvasInputReferences = [{
       nodeId: 'webview-1', kind: 'webview', revision: 3,

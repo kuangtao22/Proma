@@ -12,6 +12,7 @@ import type {
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
+  CreateDesignJobInput,
   DesignAsset,
   DesignJobRecord,
   SaveCanvasImageModuleInput,
@@ -199,6 +200,7 @@ function createContext(options: {
   imageSave?: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
   imageJobsList?: (projectId: string) => DesignJobRecord[]
   imageTargetAssert?: (projectId: string, target: Omit<CanvasImageTarget, 'projectId'>) => Promise<void>
+  imageCreateOnce?: (input: CreateDesignJobInput, jobId: string) => Promise<{ job: DesignJobRecord; created: boolean }>
   batchReconcile?: () => Promise<void>
   batchReconcileError?: Error
   batchPublications?: CanvasDocument[]
@@ -236,6 +238,8 @@ function createContext(options: {
   const mediaReleases: number[] = []
   /** 媒体候选创建序号。 */
   let mediaAccessCount = 0
+  /** 普通 Agent 节点运行的进程内测试 journal；生产事实由 DesignJobManager 磁盘 journal 提供。 */
+  const agentImageJobs = new Map<string, DesignJobRecord>()
   /** 权威 Canvas 会话元数据。 */
   const agentSession: AgentSessionMeta = {
     id: '22222222-2222-4222-8222-222222222222', title: '首页 Agent',
@@ -428,6 +432,16 @@ function createContext(options: {
       createCanvasImage: async (input) => {
         imageCalls.push({ type: 'create', value: input })
         return createImageJob(imageTargetA, 'job-created')
+      },
+      createCanvasImageOnce: async (input, jobId) => {
+        if (options.imageCreateOnce) return options.imageCreateOnce(input, jobId)
+        const existing = agentImageJobs.get(jobId)
+        if (existing) return { job: existing, created: false }
+        if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
+        const job = createImageJob({ projectId: input.projectId, ...input.target }, jobId)
+        agentImageJobs.set(jobId, job)
+        imageCalls.push({ type: 'create-once', value: { input, jobId } })
+        return { job, created: true }
       },
       run: async (jobId) => { imageCalls.push({ type: 'run', value: jobId }) },
       cancel: async (projectId, jobId) => {
@@ -2684,6 +2698,9 @@ describe('原生 Canvas 文档 IPC', () => {
       },
       imageJobs: {
         createCanvasImage: async () => createImageJob(imageTargetA, 'job-created'),
+        createCanvasImageOnce: async (_input: CreateDesignJobInput, jobId: string) => ({
+          job: createImageJob(imageTargetA, jobId), created: true,
+        }),
         run: async () => undefined,
         cancel: async () => createImageJob(imageTargetA, 'job-a'),
         retry: () => createImageJob(imageTargetA, 'job-retry'),
@@ -2770,7 +2787,7 @@ describe('原生 Canvas 文档 IPC', () => {
         sessionId: 'agent-session-1',
         runStartedAt: 99,
         explicitReferences: [],
-        userIntent: 'execute',
+        permissionCeiling: 'execute',
       }, {
         id: imageTargetA.nodeId,
         kind: 'image',
@@ -2787,5 +2804,52 @@ describe('原生 Canvas 文档 IPC', () => {
     } finally {
       context.registration.dispose()
     }
+  })
+
+  test('Given 相同 Agent Canvas 工具调用 When runtime 连续及重建后重放 Then 复用 SHA-256 taskId 且只运行一次', async () => {
+    /** 模拟跨 runtime 仍由持久化 journal 复用的任务事实。 */
+    const persistedJobs = new Map<string, DesignJobRecord>()
+    let createCount = 0
+    const createOnce = async (input: CreateDesignJobInput, jobId: string) => {
+      const existing = persistedJobs.get(jobId)
+      if (existing) return { job: existing, created: false }
+      if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
+      const job = createImageJob({ projectId: input.projectId, ...input.target }, jobId)
+      persistedJobs.set(jobId, job)
+      createCount += 1
+      return { job, created: true }
+    }
+    const identity = {
+      sessionId: 'agent-session-1', runStartedAt: 99, toolCallId: 'tool-run-1',
+      canvasId: imageTargetA.canvasId, nodeId: imageTargetA.nodeId,
+    }
+    const node = {
+      id: imageTargetA.nodeId, kind: 'image' as const, title: '主视觉',
+      position: { x: 0, y: 0 }, imageModuleId: imageTargetA.imageModuleId,
+    }
+    const target = { projectId: imageTargetA.projectId, canvasId: imageTargetA.canvasId }
+    const firstContext = createContext({ enableToolProviderRuntime: true, imageCreateOnce: createOnce })
+    let firstTaskId: string | undefined
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      firstTaskId = (await runtime.runNode(identity, node, target)).taskId
+      expect((await runtime.runNode(identity, node, target)).taskId).toBe(firstTaskId)
+      expect(firstContext.imageCalls.filter((call) => call.type === 'run')).toHaveLength(1)
+    } finally {
+      firstContext.registration.dispose()
+    }
+
+    const reloadedContext = createContext({ enableToolProviderRuntime: true, imageCreateOnce: createOnce })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      expect((await runtime.runNode(identity, node, target)).taskId).toBe(firstTaskId)
+      expect(reloadedContext.imageCalls.filter((call) => call.type === 'run')).toHaveLength(0)
+    } finally {
+      reloadedContext.registration.dispose()
+    }
+    expect(firstTaskId).toMatch(/^agent-canvas-[a-f0-9]{64}$/)
+    expect(createCount).toBe(1)
   })
 })

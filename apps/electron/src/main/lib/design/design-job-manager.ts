@@ -247,6 +247,8 @@ export class DesignJobManager {
   private readonly canvasImageTargetKeyByJobId = new Map<string, string>()
   /** 尚未写入 journal 的 Canvas 图片目标预留，封闭并发 create/retry 的扫描窗口。 */
   private readonly canvasImageReservations = new Set<string>()
+  /** Agent Canvas 稳定任务 ID 的进程内预留，禁止并发请求覆盖同名 journal。 */
+  private readonly canvasImageJobIdReservations = new Set<string>()
   private readonly createId: () => string
   private readonly createCreativeTaskId: () => string
   private readonly now: () => number
@@ -276,6 +278,41 @@ export class DesignJobManager {
 
   /** 创建只归属 Canvas 图片模块的 queued journal，不修改旧 Design 节点。 */
   async createCanvasImage(input: CreateDesignJobInput): Promise<DesignJobRecord> {
+    return this.createCanvasImageInternal(input)
+  }
+
+  /**
+   * 使用调用方提供的稳定 ID 幂等创建 Canvas 图片任务。
+   * @param input 已固化图片模块配置的任务输入。
+   * @param jobId 由 Agent 单次工具调用身份派生的安全稳定 ID。
+   * @returns journal 首次创建状态及其公开任务副本。
+   */
+  async createCanvasImageOnce(
+    input: CreateDesignJobInput,
+    jobId: string,
+  ): Promise<{ job: DesignJobRecord; created: boolean }> {
+    if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
+    if (!isSafeDesignStableId(jobId)) throw new Error('设计任务 ID 非法')
+    if (this.canvasImageJobIdReservations.has(jobId)) {
+      throw new Error('CANVAS_IMAGE_JOB_IDENTITY_CONFLICT')
+    }
+    this.canvasImageJobIdReservations.add(jobId)
+    try {
+      /** journal 身份检查必须早于目标、模型、输入解析和新 ID 副作用。 */
+      const existing = this.findStableCanvasImageJob(input.projectId, input.target, jobId)
+      if (existing) return { job: clonePublicDesignJob(existing), created: false }
+      const job = await this.createCanvasImageInternal(input, jobId)
+      return { job: clonePublicDesignJob(job), created: true }
+    } finally {
+      this.canvasImageJobIdReservations.delete(jobId)
+    }
+  }
+
+  /** 执行 Canvas 图片任务的唯一创建流程，可选复用可信稳定 ID。 */
+  private async createCanvasImageInternal(
+    input: CreateDesignJobInput,
+    forcedJobId?: string,
+  ): Promise<StoredDesignJob> {
     if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
     /** action 与来源素材的不变量必须先于预留、解析、ID 和持久化副作用。 */
     if (input.action === 'generate' && input.sourceAssetId !== undefined) {
@@ -308,7 +345,7 @@ export class DesignJobManager {
       )
       /** 连线输入独立于 contextMode，始终从权威直接入边重新解析。 */
       const canvasInputReferences = await inputResolver.resolve(toCanvasImageTarget(input.projectId, target))
-      const id = this.createId()
+      const id = forcedJobId ?? this.createId()
       const creativeTaskId = this.createCreativeTaskId()
       if (!isSafeDesignStableId(id) || !isSafeDesignStableId(creativeTaskId) || id === creativeTaskId) {
         throw new Error('Design 创作任务 ID 非法')
@@ -343,6 +380,29 @@ export class DesignJobManager {
     } finally {
       releaseReservation()
     }
+  }
+
+  /** 按稳定 ID 读取 journal，并要求其精确归属同一项目与 Canvas 图片目标。 */
+  private findStableCanvasImageJob(
+    projectId: string,
+    target: CanvasImageJobTarget,
+    jobId: string,
+  ): StoredDesignJob | undefined {
+    const expectedJournalPath = this.resolveJobJournalPath(projectId, jobId)
+    if (existsSync(expectedJournalPath)) {
+      const exactJob = this.readJobJournal(projectId, jobId)
+      if (!exactJob) throw new Error('CANVAS_IMAGE_JOB_JOURNAL_INVALID')
+      if (!isSameCanvasImageJobIdentity(exactJob, projectId, target)) {
+        throw new Error('CANVAS_IMAGE_JOB_IDENTITY_CONFLICT')
+      }
+      return exactJob
+    }
+    const existing = this.findStoredJob(jobId)
+    if (!existing) return undefined
+    if (!isSameCanvasImageJobIdentity(existing, projectId, target)) {
+      throw new Error('CANVAS_IMAGE_JOB_IDENTITY_CONFLICT')
+    }
+    return existing
   }
 
   /** 查询已加载或磁盘可发现的任务。 */
@@ -1767,6 +1827,15 @@ function isSameCanvasImageTarget(
     && left.canvasId === right.canvasId
     && left.nodeId === right.nodeId
     && left.imageModuleId === right.imageModuleId
+}
+
+/** 稳定任务 ID 只能复用到完全相同的项目与 Canvas 图片目标。 */
+function isSameCanvasImageJobIdentity(
+  job: StoredDesignJob,
+  projectId: string,
+  target: CanvasImageJobTarget,
+): boolean {
+  return job.projectId === projectId && isSameCanvasImageTarget(job.target, target)
 }
 
 /** 判断任务是否占用同一 Canvas 图片模块业务身份。 */

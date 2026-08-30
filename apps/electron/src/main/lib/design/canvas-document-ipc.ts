@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   CANVAS_IPC_CHANNELS,
   parseCanvasImageJobControlInput,
@@ -66,7 +66,11 @@ import type {
   CanvasContentNodeReconciliationResult,
 } from './canvas-content-node-lifecycle'
 import type { AgentRunExtensions } from '../agent-run-extensions'
-import type { CanvasToolNodeRunResult, CanvasToolRunContext } from './canvas-tool-provider'
+import type {
+  CanvasToolNodeRunIdentity,
+  CanvasToolNodeRunResult,
+  CanvasToolRunContext,
+} from './canvas-tool-provider'
 import {
   CANVAS_AGENT_ALLOWED_TOOL_NAMES,
   requireCanvasAgentRunOwner,
@@ -130,7 +134,7 @@ export interface CanvasDocumentIpcOptions {
   /** 图片模块配置复用唯一受管内容 Store。 */
   imageModules: Pick<CanvasImageModuleStore, 'load' | 'save'>
   /** Canvas 图片任务复用唯一 Design Job Manager。 */
-  imageJobs: Pick<DesignJobManager, 'createCanvasImage' | 'run' | 'cancel' | 'retry' | 'getProjectJob' | 'listCanvasImageJobs' | 'onChanged'>
+  imageJobs: Pick<DesignJobManager, 'createCanvasImage' | 'createCanvasImageOnce' | 'run' | 'cancel' | 'retry' | 'getProjectJob' | 'listCanvasImageJobs' | 'onChanged'>
   /** 图片采用复用 Job Manager 已注入的同一目标适配器。 */
   imageJobTarget: Pick<CanvasImageJobTargetAdapter, 'assertTarget' | 'adoptOutput'>
   /** 图片模块只读取 Design 素材公开元数据并创建目录媒体授权。 */
@@ -160,7 +164,7 @@ export interface CanvasToolProviderRuntime {
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
   readNodeContent: (target: CanvasTarget, node: CanvasNode) => Promise<string>
   inspectNode: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<void>
-  runNode: (context: CanvasToolRunContext, node: CanvasNode, target: CanvasTarget) => Promise<CanvasToolNodeRunResult>
+  runNode: (identity: CanvasToolNodeRunIdentity, node: CanvasNode, target: CanvasTarget) => Promise<CanvasToolNodeRunResult>
 }
 
 /** 当前注册代次拥有的进程内运行时，不经过 Renderer IPC。 */
@@ -1242,7 +1246,7 @@ export function registerCanvasDocumentIpcHandlers(
 
   /** 图片节点复用 Renderer 同一 Design Job 流程；仓库尚无 webview 执行器。 */
   const runCanvasNode = async (
-    _context: CanvasToolRunContext,
+    identity: CanvasToolNodeRunIdentity,
     node: CanvasNode,
     target: CanvasTarget,
   ): Promise<CanvasToolNodeRunResult> => {
@@ -1254,7 +1258,15 @@ export function registerCanvasDocumentIpcHandlers(
       nodeId: node.id,
       imageModuleId: node.imageModuleId,
     }
-    const job = await runImageCanvasExclusive(imageTarget, async () => {
+    /** JSON 数组编码避免字段拼接碰撞，SHA-256 让任务身份稳定且满足安全 ID 约束。 */
+    const jobId = `agent-canvas-${createHash('sha256').update(JSON.stringify([
+      identity.sessionId,
+      identity.runStartedAt,
+      identity.toolCallId,
+      identity.canvasId,
+      identity.nodeId,
+    ])).digest('hex')}`
+    const result = await runImageCanvasExclusive(imageTarget, async () => {
       requireWritableProject(target.projectId, options)
       await options.imageJobTarget.assertTarget(target.projectId, {
         kind: 'canvas-image', canvasId: target.canvasId,
@@ -1263,7 +1275,7 @@ export function registerCanvasDocumentIpcHandlers(
       const config = await options.imageModules.load(imageTarget)
       assertOwnedImageConfig(config, imageTarget)
       if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
-      return options.imageJobs.createCanvasImage({
+      return options.imageJobs.createCanvasImageOnce({
         projectId: target.projectId,
         target: {
           kind: 'canvas-image', canvasId: target.canvasId,
@@ -1276,12 +1288,15 @@ export function registerCanvasDocumentIpcHandlers(
         generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
         canvasImageConfigRevision: config.revision,
         ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
-      })
+      }, jobId)
     })
+    const { job, created } = result
     if (!isOwnedImageJob(job, imageTarget)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
-    void options.imageJobs.run(job.id).catch((error) => {
-      console.error('[CanvasDocumentIPC] Agent Canvas 图片任务后台运行失败:', error)
-    })
+    if (created) {
+      void options.imageJobs.run(job.id).catch((error) => {
+        console.error('[CanvasDocumentIPC] Agent Canvas 图片任务后台运行失败:', error)
+      })
+    }
     return { status: 'started', taskId: job.id }
   }
 
