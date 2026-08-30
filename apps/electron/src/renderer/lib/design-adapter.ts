@@ -35,6 +35,7 @@ import type {
   DesignImageModelSelectionChangeEvent,
   DesignJobRecord,
   ExportDesignAssetInput,
+  EnsureLegacyCanvasSessionInput,
   GetDesignTaskDetailsInput,
   ImportAgentImageInput,
   ImportDesignContextDocumentInput,
@@ -143,6 +144,8 @@ export interface DesignAdapter {
     listener: (event: AgentCanvasBindingChangeEvent) => void,
   ) => ReturnType<DesignPreloadApi['onAgentCanvasBindingChanged']>
   listCanvasSessions: (input: ListCanvasSessionsInput) => ReturnType<DesignPreloadApi['listCanvasSessions']>
+  /** 幂等初始化旧 Design 文档并返回固定 Canvas 会话投影。 */
+  ensureLegacyCanvasSession: (input: EnsureLegacyCanvasSessionInput) => ReturnType<DesignPreloadApi['ensureLegacyCanvasSession']>
   createCanvasSession: (input: CreateCanvasSessionInput) => ReturnType<DesignPreloadApi['createCanvasSession']>
   updateCanvasSession: (input: UpdateCanvasSessionInput) => ReturnType<DesignPreloadApi['updateCanvasSession']>
   deleteCanvasSession: (input: DeleteCanvasSessionInput) => ReturnType<DesignPreloadApi['deleteCanvasSession']>
@@ -418,6 +421,7 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
       return makeIdempotentAdapterRelease(release)
     },
     listCanvasSessions: (input) => requireMethod(api, 'listCanvasSessions')(input),
+    ensureLegacyCanvasSession: (input) => requireMethod(api, 'ensureLegacyCanvasSession')(input),
     createCanvasSession: (input) => requireMethod(api, 'createCanvasSession')(input),
     updateCanvasSession: (input) => requireMethod(api, 'updateCanvasSession')(input),
     deleteCanvasSession: (input) => requireMethod(api, 'deleteCanvasSession')(input),

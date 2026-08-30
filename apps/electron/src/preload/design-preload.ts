@@ -48,6 +48,7 @@ import type {
   DesignTaskDetails,
   DesignWorkspaceSnapshot,
   ExportDesignAssetInput,
+  EnsureLegacyCanvasSessionInput,
   GetDesignTaskDetailsInput,
   ImportAgentImageInput,
   ImportDesignContextDocumentInput,
@@ -149,6 +150,7 @@ export interface DesignPreloadApi {
   /** 订阅严格解析后的 Agent-Canvas 关联变化。 */
   onAgentCanvasBindingChanged: (listener: (event: AgentCanvasBindingChangeEvent) => void) => () => void
   listCanvasSessions: (input: ListCanvasSessionsInput) => Promise<CanvasSessionMeta[]>
+  ensureLegacyCanvasSession: (input: EnsureLegacyCanvasSessionInput) => Promise<CanvasSessionMeta>
   createCanvasSession: (input: CreateCanvasSessionInput) => Promise<CanvasSessionMeta>
   updateCanvasSession: (input: UpdateCanvasSessionInput) => Promise<CanvasSessionMeta>
   deleteCanvasSession: (input: DeleteCanvasSessionInput) => Promise<CanvasSessionMeta>
@@ -487,6 +489,10 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
       DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS,
       input,
     ) as Promise<CanvasSessionMeta[]>,
+    ensureLegacyCanvasSession: (input) => ipc.invoke(
+      DESIGN_IPC_CHANNELS.ENSURE_LEGACY_CANVAS_SESSION,
+      { projectId: input.projectId },
+    ) as Promise<CanvasSessionMeta>,
     createCanvasSession: (input) => ipc.invoke(
       DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION,
       input,

@@ -30,6 +30,10 @@ describe('Agent Canvas 节点引用 composer', () => {
     const end = source.indexOf('\n  /**', start + 1)
     const body = source.slice(start, end)
 
+    expect(body).toContain('designAdapter.ensureLegacyCanvasSession({ projectId: currentWorkspaceId })')
+    expect(body.indexOf('designAdapter.ensureLegacyCanvasSession('))
+      .toBeLessThan(body.indexOf('designAdapter.linkAgentCanvas({'))
+    expect(body).toContain('upsertCanvasSession(legacySession)')
     expect(body).toContain('designAdapter.linkAgentCanvas({')
     expect(body).toContain('sessionId,')
     expect(body).toContain('canvasId: LEGACY_DESIGN_CANVAS_ID')

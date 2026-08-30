@@ -25,6 +25,11 @@ export interface ListCanvasSessionsInput {
   archived?: boolean
 }
 
+/** 幂等初始化旧 Design 并投影固定 Canvas 会话的输入。 */
+export interface EnsureLegacyCanvasSessionInput {
+  projectId: string
+}
+
 /** 新建 Canvas 会话的输入。 */
 export interface CreateCanvasSessionInput {
   projectId: string
@@ -569,6 +574,7 @@ export type DesignChangeEvent = {
 /** Design 专用 IPC 通道，避免与会话和文件预览通道混用。 */
 export const DESIGN_IPC_CHANNELS = {
   LIST_CANVAS_SESSIONS: 'design:list-canvas-sessions',
+  ENSURE_LEGACY_CANVAS_SESSION: 'design:ensure-legacy-canvas-session',
   CREATE_CANVAS_SESSION: 'design:create-canvas-session',
   UPDATE_CANVAS_SESSION: 'design:update-canvas-session',
   DELETE_CANVAS_SESSION: 'design:delete-canvas-session',

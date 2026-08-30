@@ -2276,6 +2276,9 @@ export function registerIpcHandlers(): void {
     ipc: ipcMain,
     listAuthorizedWebContents: listAuthorizedDesignWebContents,
     guard: workspaceOperationGuard,
+    initializeLegacyDesign: (projectId) => {
+      designStore.initialize(projectId)
+    },
     sessions: canvasSessionStore,
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
     broadcast: broadcastCanvasSessionChange,

@@ -1,9 +1,10 @@
-import { DESIGN_IPC_CHANNELS } from '@proma/shared'
+import { DESIGN_IPC_CHANNELS, LEGACY_DESIGN_CANVAS_ID } from '@proma/shared'
 import type {
   CanvasSessionChangeEvent,
   CanvasSessionMeta,
   CreateCanvasSessionInput,
   DeleteCanvasSessionInput,
+  EnsureLegacyCanvasSessionInput,
   ListCanvasSessionsInput,
   UpdateCanvasSessionInput,
 } from '@proma/shared'
@@ -32,6 +33,8 @@ export interface CanvasSessionIpcOptions {
   ipc: CanvasSessionIpcRegistrar
   listAuthorizedWebContents: () => WebContents[]
   guard: Pick<WorkspaceOperationGuard, 'runWorkspaceWrite'>
+  /** 在投影 legacy Canvas 索引前幂等落盘旧 Design 文档。 */
+  initializeLegacyDesign: (projectId: string) => void
   sessions: CanvasSessionStoreContract
   getProjectReadOnlyReason: (projectId: string) => string | undefined
   /** 生产可注入与 Agent 工具共享的唯一公开事件广播边界。 */
@@ -42,6 +45,15 @@ export interface CanvasSessionIpcOptions {
   cleanupBindings?: (projectId: string, canvasId: string) => void
   /** 索引删除成功后回收该 Canvas 独占的内部 Agent 会话。 */
   cleanupInternalSessions?: (projectId: string, canvasId: string) => Promise<void>
+}
+
+/** 解析显式 legacy 初始化请求，拒绝 archived 与其它夹带字段。 */
+function parseEnsureLegacyInput(value: unknown): EnsureLegacyCanvasSessionInput {
+  if (!isRecord(value) || !hasKeys(value, ['projectId'], ['projectId'])) {
+    throw new Error('Legacy Canvas 初始化参数无效')
+  }
+  if (!isSafeDesignStableId(value.projectId)) throw new Error('Canvas 项目 ID 非法')
+  return { projectId: value.projectId }
 }
 
 /** 注册结果用于退出和测试清理。 */
@@ -211,12 +223,32 @@ export function registerCanvasSessionIpcHandlers(
   /** 本注册器拥有的固定 invoke 通道。 */
   const channels = [
     DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS,
+    DESIGN_IPC_CHANNELS.ENSURE_LEGACY_CANVAS_SESSION,
     DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION,
     DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION,
     DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION,
   ]
   /** 热重载前先移除同名旧 handler。 */
   for (const channel of channels) options.ipc.removeHandler(channel)
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.ENSURE_LEGACY_CANVAS_SESSION, (event, value): CanvasSessionMeta => {
+    assertAuthorizedSender(event, options)
+    const input = parseEnsureLegacyInput(value)
+    requireWritableProject(input.projectId, options)
+    /** 文档先于索引提交；中途失败重放会从既有文档补齐投影，不产生悬空 binding。 */
+    const result = options.guard.runWorkspaceWrite(input.projectId, () => {
+      const existed = options.sessions.list({ projectId: input.projectId })
+        .some((session) => session.id === LEGACY_DESIGN_CANVAS_ID)
+      options.initializeLegacyDesign(input.projectId)
+      const session = options.sessions.ensureLegacySession(input.projectId)
+      if (!session) throw new Error('Legacy Canvas 初始化失败')
+      return { session, created: !existed }
+    })
+    if (result.created) {
+      broadcastChange(options, { projectId: input.projectId, canvasId: result.session.id, cause: 'created' })
+    }
+    return result.session
+  })
 
   options.ipc.handle(DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS, (event, value): CanvasSessionMeta[] => {
     assertAuthorizedSender(event, options)

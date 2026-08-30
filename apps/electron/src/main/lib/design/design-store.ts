@@ -55,6 +55,8 @@ export interface DesignStoreOptions {
 export interface DesignStore {
   /** 加载项目画布并标记是否发生安全恢复。 */
   load: (projectId: string) => DesignWorkspaceSnapshot
+  /** 幂等落盘项目的 legacy Design 空文档或返回既有权威文档。 */
+  initialize: (projectId: string) => DesignCanvasDocument
   /** 加载未发生恢复的权威文档；恢复候选必须先由 Renderer 重载确认。 */
   requireStableAuthoritativeDocument: (projectId: string) => DesignCanvasDocument
   /** 在磁盘最新 revision 上应用一组受控 mutation。 */
@@ -758,6 +760,28 @@ export function createDesignStore(options: DesignStoreOptions = {}): DesignStore
     }
   }
 
+  /** 幂等创建 legacy Design 文档；损坏候选继续 fail closed，不覆盖用户数据。 */
+  function initialize(projectId: string): DesignCanvasDocument {
+    /** 初始化与普通加载共用同一可信路径和恢复链。 */
+    const paths = pathResolver.resolve(projectId)
+    ensureDesignDirectories(paths)
+    const readResult = readDesignDocument(paths, projectId)
+    if (!readResult.document && readResult.hasCandidate) {
+      throw new Error(`DESIGN_DOCUMENT_CORRUPT: ${projectId}`)
+    }
+    if (readResult.document) {
+      if (readResult.recoveredFrom) {
+        writeDesignJsonSecure(paths, paths.canvasPath, readResult.document)
+        if (readResult.recoveredFrom === 'tmp') consumeRecoveredTemporary(paths)
+      }
+      return readResult.document
+    }
+    /** 全新项目只写一次 revision 0 空文档，重放读取该文档且不改时间。 */
+    const document = createEmptyDesignDocument(projectId, now())
+    writeDesignJsonSecure(paths, paths.canvasPath, document)
+    return document
+  }
+
   /** 加载可安全用于业务副作用的权威文档，恢复提升与业务操作必须分成两次调用。 */
   function requireStableAuthoritativeDocument(projectId: string): DesignCanvasDocument {
     /** 本次唯一加载的快照决定调用方能否继续业务副作用。 */
@@ -802,7 +826,7 @@ export function createDesignStore(options: DesignStoreOptions = {}): DesignStore
     return next
   }
 
-  return { load, requireStableAuthoritativeDocument, mutate }
+  return { load, initialize, requireStableAuthoritativeDocument, mutate }
 }
 
 /** 生产进程共享的 Design 存储实例。 */

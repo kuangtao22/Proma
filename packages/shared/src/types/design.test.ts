@@ -12,6 +12,7 @@ import type {
   CanvasSessionMeta,
   CreateCanvasSessionInput,
   DeleteCanvasSessionInput,
+  EnsureLegacyCanvasSessionInput,
   CreateDesignJobInput,
   CreateDesignJobTarget,
   DesignAsset,
@@ -250,6 +251,8 @@ describe('Design 共享契约', () => {
     }
     /** 四层 IPC 使用的结构化请求样例。 */
     const listInput: ListCanvasSessionsInput = { projectId: 'project-1', archived: false }
+    /** legacy 初始化请求只接受项目身份。 */
+    const ensureLegacyInput: EnsureLegacyCanvasSessionInput = { projectId: 'project-1' }
     /** 新建请求只接受项目与可选标题。 */
     const createInput: CreateCanvasSessionInput = { projectId: 'project-1', title: 'App 页面设计' }
     /** 更新请求只允许标题和归档状态。 */
@@ -279,9 +282,10 @@ describe('Design 共享契约', () => {
       createdAt: now,
       updatedAt: now,
     })
-    expect([listInput, createInput, updateInput, deleteInput, event]).toHaveLength(5)
+    expect([listInput, ensureLegacyInput, createInput, updateInput, deleteInput, event]).toHaveLength(6)
     expect(CANVAS_SESSION_TITLE_MAX_LENGTH).toBe(120)
     expect(DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS).toBe('design:list-canvas-sessions')
+    expect(DESIGN_IPC_CHANNELS.ENSURE_LEGACY_CANVAS_SESSION).toBe('design:ensure-legacy-canvas-session')
     expect(DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION).toBe('design:create-canvas-session')
     expect(DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION).toBe('design:update-canvas-session')
     expect(DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION).toBe('design:delete-canvas-session')

@@ -125,7 +125,7 @@ import {
 import { settingsOpenAtom } from '@/atoms/settings-tab'
 import { deliverPendingMentionsToComposer } from '@/lib/design-session-actions'
 import { shouldOfferDesignHandoff } from '@/lib/agent-design-intent'
-import { canvasSessionsByProjectAtom } from '@/atoms/canvas-session-atoms'
+import { canvasSessionsByProjectAtom, upsertCanvasSessionAtom } from '@/atoms/canvas-session-atoms'
 import { updateDesignProjectStateAtom } from '@/atoms/design-atoms'
 import { longTextPasteAsAttachmentEnabledAtom } from '@/atoms/ui-preferences'
 import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
@@ -555,6 +555,8 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   const [canvasNodeReferences, setCanvasNodeReferences] = useAtom(agentCanvasNodeReferencesAtomFamily(sessionId))
   /** Canvas metadata 只用于友好标题，缺失时 chip 统一回退“画布”。 */
   const canvasSessionsByProject = useAtomValue(canvasSessionsByProjectAtom)
+  /** 显式初始化返回的权威 Canvas 元数据立即写入当前 Renderer registry。 */
+  const upsertCanvasSession = useSetAtom(upsertCanvasSessionAtom)
   /** 仅从现有 Canvas registry metadata 解析标题，禁止把 UUID 当作展示回退。 */
   const getCanvasReferenceTitle = React.useCallback((reference: CanvasNodeReference): string | undefined => (
     canvasSessionsByProject.get(reference.projectId)?.find((canvas) => canvas.id === reference.canvasId)?.title
@@ -2348,6 +2350,9 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   const handleOpenDesignHandoff = React.useCallback(async (): Promise<void> => {
     if (!pendingDesignHandoff || !currentWorkspaceId) return
     try {
+      /** 全新项目先幂等创建 legacy 文档与索引，binding 校验随后继续使用权威 registry。 */
+      const legacySession = await designAdapter.ensureLegacyCanvasSession({ projectId: currentWorkspaceId })
+      upsertCanvasSession(legacySession)
       /** 以主进程 binding 为准，首次关联时同时建立默认 Canvas。 */
       const bindings = await designAdapter.listAgentCanvasBindings({ projectId: currentWorkspaceId })
       const binding = bindings.find((item) => item.sessionId === sessionId)
@@ -2387,7 +2392,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     })
     setSidePanelOpen(true)
     toast.success('已打开设计面板', { description: '原始要求已填入，确认后再生成图片。' })
-  }, [currentWorkspaceId, pendingDesignHandoff, sessionId, setCurrentAgentWorkspaceId, setInputContent, setPromptSuggestions, setSidePanelOpen, setSidePanelTabMap, updateDesignProjectState])
+  }, [currentWorkspaceId, pendingDesignHandoff, sessionId, setCurrentAgentWorkspaceId, setInputContent, setPromptSuggestions, setSidePanelOpen, setSidePanelTabMap, updateDesignProjectState, upsertCanvasSession])
 
   /** 停止生成。异常流未发出终态时，允许再次下发幂等的 abort 请求。 */
   const handleStop = React.useCallback((): void => {

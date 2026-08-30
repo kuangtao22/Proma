@@ -440,6 +440,7 @@ describe('Design renderer adapter', () => {
     const releaseCanvas = (): void => undefined
     const api: PartialDesignApi = {
       listCanvasSessions: async (input) => { canvasInputs.push(input); return [canvasSession] },
+      ensureLegacyCanvasSession: async (input) => { canvasInputs.push(input); return canvasSession },
       createCanvasSession: async (input) => { canvasInputs.push(input); return canvasSession },
       updateCanvasSession: async (input) => { canvasInputs.push(input); return canvasSession },
       deleteCanvasSession: async (input) => { canvasInputs.push(input); return canvasSession },
@@ -481,14 +482,16 @@ describe('Design renderer adapter', () => {
     expect(modelInputs).toEqual([saveProfilesInput, 'project-1', setSelectionInput])
     /** 三个 Canvas 方法必须保留调用方对象身份。 */
     const listCanvasInput = { projectId: 'project-1', archived: false }
+    const ensureLegacyCanvasInput = { projectId: 'project-1' }
     const createCanvasInput = { projectId: 'project-1', title: '页面设计' }
     const updateCanvasInput = { projectId: 'project-1', canvasId: 'canvas-1', archived: true }
     const deleteCanvasInput = { projectId: 'project-1', canvasId: 'canvas-1' }
     expect(await adapter.listCanvasSessions(listCanvasInput)).toEqual([canvasSession])
+    expect(await adapter.ensureLegacyCanvasSession(ensureLegacyCanvasInput)).toBe(canvasSession)
     expect(await adapter.createCanvasSession(createCanvasInput)).toBe(canvasSession)
     expect(await adapter.updateCanvasSession(updateCanvasInput)).toBe(canvasSession)
     expect(await adapter.deleteCanvasSession(deleteCanvasInput)).toBe(canvasSession)
-    expect(canvasInputs).toEqual([listCanvasInput, createCanvasInput, updateCanvasInput, deleteCanvasInput])
+    expect(canvasInputs).toEqual([listCanvasInput, ensureLegacyCanvasInput, createCanvasInput, updateCanvasInput, deleteCanvasInput])
     /** 六个上下文方法必须保留调用方对象身份。 */
     const listContextInput = { projectId: 'project-1', query: 'brand' }
     const upsertContextInput = { projectId: 'project-1', category: 'brand' as const, title: '品牌', tags: [], markdown: '# Brand' }

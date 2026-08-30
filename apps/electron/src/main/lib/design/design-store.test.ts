@@ -76,6 +76,19 @@ describe('Design revision 原子存储', () => {
     expect(existsSync(join(projectRoot, '.proma/design/canvas.json'))).toBe(false)
   })
 
+  test('Given 全新项目无 legacy 数据 When 幂等初始化 Design Then 原子落盘同一份空文档', () => {
+    const store = createStore()
+    const canvasPath = join(projectRoot, '.proma/design/canvas.json')
+
+    const first = store.initialize('project-1')
+    currentTime = 200
+    const replay = store.initialize('project-1')
+
+    expect(first).toEqual(createEmptyDesignDocument('project-1', 100))
+    expect(replay).toEqual(first)
+    expect(JSON.parse(readFileSync(canvasPath, 'utf8'))).toEqual(first)
+  })
+
   test('Given mutation 带权威策略 When 策略拒绝 Then 单次加载后在应用和写入前停止', () => {
     const store = createStore()
     /** 校验次数用于证明同一权威文档只进入一次策略。 */

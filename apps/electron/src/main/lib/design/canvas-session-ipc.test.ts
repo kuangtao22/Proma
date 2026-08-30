@@ -56,6 +56,42 @@ function createSession(id: string, title = '页面设计'): CanvasSessionMeta {
 }
 
 describe('Canvas 会话 IPC', () => {
+  test('Given 全新项目无 legacy 文档和索引 When 显式初始化 Then 在写守卫内先落盘再投影固定会话', async () => {
+    const handlers = new Map<string, TestHandler>()
+    const sender = createSender(7)
+    const calls: string[] = []
+    registerCanvasSessionIpcHandlers({
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: (channel) => { handlers.delete(channel) },
+      },
+      listAuthorizedWebContents: () => [sender],
+      guard: {
+        runWorkspaceWrite: (projectId, effect) => {
+          calls.push(`guard:${projectId}`)
+          return effect()
+        },
+      },
+      initializeLegacyDesign: () => { calls.push('initialize') },
+      sessions: {
+        ensureLegacySession: () => { calls.push('project'); return createSession('legacy-design') },
+        list: () => [],
+        create: () => createSession('canvas-1'),
+        update: () => createSession('canvas-1'),
+        delete: () => createSession('canvas-1'),
+      },
+      getProjectReadOnlyReason: () => undefined,
+    })
+
+    await expect(invoke(
+      handlers,
+      DESIGN_IPC_CHANNELS.ENSURE_LEGACY_CANVAS_SESSION,
+      sender,
+      { projectId: 'project-1' },
+    )).resolves.toMatchObject({ id: 'legacy-design', projectId: 'project-1' })
+    expect(calls).toEqual(['guard:project-1', 'initialize', 'project'])
+  })
+
   test('Given 主窗口 When 列出、新建、更新和删除 Canvas Then 经过项目写守卫并广播', async () => {
     /** 记录每个通道注册的 handler。 */
     const handlers = new Map<string, TestHandler>()
@@ -77,6 +113,7 @@ describe('Canvas 会话 IPC', () => {
           return effect()
         },
       },
+      initializeLegacyDesign: () => undefined,
       sessions: {
         ensureLegacySession: () => { calls.push('ensure'); return undefined },
         list: (input: ListCanvasSessionsInput) => { calls.push(`list:${String(input.archived)}`); return [] },
@@ -152,6 +189,7 @@ describe('Canvas 会话 IPC', () => {
       },
       listAuthorizedWebContents: () => [sender],
       guard: { runWorkspaceWrite: (_projectId, effect) => effect() },
+      initializeLegacyDesign: () => undefined,
       sessions: {
         ensureLegacySession: () => undefined,
         list: () => [],
@@ -195,6 +233,7 @@ describe('Canvas 会话 IPC', () => {
       },
       listAuthorizedWebContents: () => [authorized],
       guard: { runWorkspaceWrite: (_projectId, effect) => { calls.push('guard'); return effect() } },
+      initializeLegacyDesign: () => { calls.push('initialize') },
       sessions: {
         ensureLegacySession: () => { calls.push('ensure'); return undefined },
         list: () => { calls.push('list'); return [] },
@@ -232,6 +271,7 @@ describe('Canvas 会话 IPC', () => {
           return effect()
         },
       },
+      initializeLegacyDesign: () => undefined,
       sessions: {
         ensureLegacySession: () => undefined,
         list: () => [],
@@ -242,6 +282,12 @@ describe('Canvas 会话 IPC', () => {
       getProjectReadOnlyReason: () => undefined,
     })
 
+    await expect(invoke(
+      handlers,
+      DESIGN_IPC_CHANNELS.ENSURE_LEGACY_CANVAS_SESSION,
+      sender,
+      { projectId: 'project-1', archived: false },
+    )).rejects.toThrow('Legacy Canvas 初始化参数无效')
     await expect(invoke(
       handlers,
       DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION,
@@ -276,6 +322,7 @@ describe('Canvas 会话 IPC', () => {
       },
       listAuthorizedWebContents: () => [sender],
       guard: { runWorkspaceWrite: (_projectId, effect) => { calls.push('guard'); return effect() } },
+      initializeLegacyDesign: () => { calls.push('initialize') },
       sessions: {
         ensureLegacySession: () => { calls.push('ensure'); return undefined },
         list: () => { calls.push('list'); return [createSession('existing')] },
@@ -292,6 +339,12 @@ describe('Canvas 会话 IPC', () => {
       sender,
       { projectId: 'project-1' },
     )).toEqual([createSession('existing')])
+    await expect(invoke(
+      handlers,
+      DESIGN_IPC_CHANNELS.ENSURE_LEGACY_CANVAS_SESSION,
+      sender,
+      { projectId: 'project-1' },
+    )).rejects.toThrow('项目路径不可访问')
     await expect(invoke(
       handlers,
       DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION,
@@ -329,6 +382,7 @@ describe('Canvas 会话 IPC', () => {
       },
       listAuthorizedWebContents: () => [failingSender, receivingSender],
       guard: { runWorkspaceWrite: (_projectId, effect) => effect() },
+      initializeLegacyDesign: () => undefined,
       sessions: {
         ensureLegacySession: () => undefined,
         list: () => [],

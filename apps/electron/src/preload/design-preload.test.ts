@@ -141,6 +141,7 @@ describe('Design preload', () => {
       [() => api.setDefaultAgentCanvas({ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS, [{ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }]],
       [() => api.clearAgentCanvasBindings({ projectId: 'p1', target: 'session', sessionId: 'session-1' }), CANVAS_IPC_CHANNELS.CLEAR_AGENT_BINDINGS, [{ projectId: 'p1', target: 'session', sessionId: 'session-1' }]],
       [() => api.listCanvasSessions({ projectId: 'p1', archived: false }), DESIGN_IPC_CHANNELS.LIST_CANVAS_SESSIONS, [{ projectId: 'p1', archived: false }]],
+      [() => api.ensureLegacyCanvasSession({ projectId: 'p1' }), DESIGN_IPC_CHANNELS.ENSURE_LEGACY_CANVAS_SESSION, [{ projectId: 'p1' }]],
       [() => api.createCanvasSession({ projectId: 'p1', title: '页面设计' }), DESIGN_IPC_CHANNELS.CREATE_CANVAS_SESSION, [{ projectId: 'p1', title: '页面设计' }]],
       [() => api.updateCanvasSession({ projectId: 'p1', canvasId: 'canvas-1', archived: true }), DESIGN_IPC_CHANNELS.UPDATE_CANVAS_SESSION, [{ projectId: 'p1', canvasId: 'canvas-1', archived: true }]],
       [() => api.deleteCanvasSession({ projectId: 'p1', canvasId: 'canvas-1' }), DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION, [{ projectId: 'p1', canvasId: 'canvas-1' }]],
