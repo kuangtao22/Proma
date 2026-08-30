@@ -20,6 +20,7 @@
 ## 架构决策
 
 - Electron IPC 变更必须依次同步：共享类型与通道常量 -> 主进程处理 -> Preload 桥接 -> 渲染进程调用。
+- Canvas 不再作为左侧独立会话、顶部标签或独立主视图存在，只通过普通 Agent 的右侧“画布”工作区访问；项目级图事实仍按 `projectId + canvasId` 共享，视口、选区和详情状态按普通 `sessionId + canvasId` 隔离。首次打开 `legacy-design` 必须先在 workspace 写守卫内幂等初始化真实 Design 文档并进入 Canvas registry，再沿用普通 Agent、项目归属和画布存在性校验建立 binding，禁止用悬空关联或绕过校验兼容旧数据。
 - Agent-Canvas 关联 IPC 只允许已授权主窗口操作同项目普通顶层 Agent 与已登记 Canvas；LIST 按实时会话/画布事实清理陈旧关联，事件使用 shared exact-key parser。Canvas、普通 Agent 或工作区主删除成功后的关联清理均为带精确事件的 best-effort 后置步骤，失败不得反向击穿主删除，内部会话不参与。
 - Agent 消息携带 Canvas 节点引用时，主进程必须在飞书镜像、启动槽位、Orchestrator、started 事件或 Pi 注入等消息接管副作用前，基于 fresh 绑定、Canvas registry 与权威文档完成单次解析；引用字段缺失才表示无引用，字段存在时必须先是数组并严格解析，只有合法空数组可 bypass，queue-now 转换必须保留该字段的 presence，禁止把缺失归一化为显式 `undefined`。deferred 仅在 prepare 成功后移除队列投影并发布 started：空闲会话首次接管失败必须同步 reject 且移除本项；已异步接管的旧队首后来失效必须发布不含 cause 的稳定 failed 状态、终结该项并继续调度，Renderer 依据本地队列投影幂等恢复正文、附件、引用和旧 quoted selection，且旧选区只能在当前无新选区时补回。queue-now 只允许 Pi 注入阶段的 stale-active 降级排队。新发送缺省使用 latest 刷新到发送时 revision，历史消息重试必须通过显式发送字段使用 exact，不得从可选错误 UUID 推断；exact 的项目、Canvas、节点、类型与标题必须全部按权威文档重建，原 revision 当前无法证明时必须失效，禁止返回 Renderer 原对象或以当前版本替代。引用失效跨 IPC 只暴露稳定 `CANVAS_REFERENCE_INVALID` code/message，内部 cause 仅写主进程日志；prompt 摘要必须使用转义标签敏感字符的 JSON 数据编码，并在 I/O 前限制单条消息最多 32 个引用、编码后摘要最多 8192 字符。SDK JSONL 只保存发送时真实 revision 的 `_canvasNodeReferences` 快照，历史渲染不得回查当前节点替代。
 - Agent 仅使用 Pi Agent Runtime；主进程通过独立 utility process 与 `agent-runtime-client.ts` 管理每个会话，禁止重新引入 Claude/Codex Agent SDK。
