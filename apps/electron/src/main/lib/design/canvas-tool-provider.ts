@@ -349,7 +349,13 @@ export function createCanvasToolRun(
               toolCallId,
             },
           })
-          return toolResult(result)
+          return toolResult({
+            canvasId: result.canvasId,
+            nodeId: result.nodeId,
+            revision: result.revision,
+            artifactType: result.artifactType,
+            sourceToolCallId: result.sourceToolCallId,
+          })
         })
       },
     }),

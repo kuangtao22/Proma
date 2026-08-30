@@ -12,6 +12,11 @@ import {
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
 
+/** 服务测试已控制 envelope 来源，断言前从 JSON 外壳恢复为已验证 mutation。 */
+function getBatchOperations(batch: CanvasBatchOperationEnvelope): CanvasMutation[] {
+  return batch.operations as unknown as CanvasMutation[]
+}
+
 /** 构造可观察内容准备、批量提交与失败补偿的窄测试服务。 */
 function createFixture(options: {
   conflictOnce?: boolean
@@ -59,7 +64,7 @@ function createFixture(options: {
           document = { ...document, revision: document.revision + 1 }
           throw new Error('CANVAS_REVISION_CONFLICT')
         }
-        const next = applyOperations(input.operations as CanvasMutation[], input.baseRevision + 1)
+        const next = applyOperations(getBatchOperations(input), input.baseRevision + 1)
         document = next
         if (options.commitBeforeError) throw new Error('CANVAS_COMMIT_RESULT_UNCERTAIN')
         return { document: structuredClone(document), operationId: `operation-${batches.length}` }
@@ -92,7 +97,7 @@ describe('Canvas Agent 产物原子创建服务', () => {
     expect(fixture.prepared).toEqual([expect.objectContaining({
       kind: 'webview', content: '<!doctype html><html><body>首页</body></html>',
     })])
-    const operations = fixture.batches[0]?.operations as CanvasMutation[]
+    const operations = fixture.batches[0] ? getBatchOperations(fixture.batches[0]) : []
     const createdNode = operations.find((operation) => operation.type === 'upsert-nodes')
     expect(createdNode).toMatchObject({
       nodes: [{ kind: 'webview', title: '首页原型', position: { x: 400, y: 60 }, contentRevision: 0 }],
@@ -144,7 +149,7 @@ describe('Canvas Agent 产物原子创建服务', () => {
       'tool-retry-1', 'tool-retry-1-retry',
     ])
     const nodeIds = fixture.batches.map((batch) => (
-      batch.operations[0] as Extract<CanvasMutation, { type: 'upsert-nodes' }>
+      getBatchOperations(batch)[0] as unknown as Extract<CanvasMutation, { type: 'upsert-nodes' }>
     ).nodes[0]?.id)
     expect(new Set(nodeIds)).toEqual(new Set([result.nodeId]))
     expect(fixture.discarded).toEqual([])

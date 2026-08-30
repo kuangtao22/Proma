@@ -62,6 +62,10 @@ function createFixture(options: {
       preparedInputs.push({ ...input })
       contents.add(input.contentId)
     },
+    prepareArtifactContent: async (_target: object, input: { contentId: string; selectedModelProfileId?: string | null }) => {
+      preparedInputs.push({ ...input })
+      contents.add(input.contentId)
+    },
     prepareMigratedContent: async (_target: object, seed: { contentId: string }) => { contents.add(seed.contentId) },
     assertContent: async (_target: object, input: { contentId: string }) => {
       if (!contents.has(input.contentId)) throw new Error('CANVAS_CONTENT_NOT_FOUND')

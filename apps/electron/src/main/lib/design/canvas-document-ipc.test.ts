@@ -2872,7 +2872,7 @@ describe('原生 Canvas 文档 IPC', () => {
         artifactType: 'webview',
         title: '首页原型',
         content: '<!doctype html><html></html>',
-      } as never, undefined as never, undefined as never, undefined as never, undefined as never)
+      } as never, undefined as never, undefined as never, undefined as never)
 
       expect(result.details).toMatchObject({ nodeId: 'artifact-node-1', revision: 5 })
       expect(context.artifactCalls).toEqual([expect.objectContaining({
