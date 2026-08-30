@@ -37,6 +37,8 @@ function createFixture(options: {
   let maxActiveMutations = 0
   const publicationAttempts: number[] = []
   const publishedRevisions: number[] = []
+  /** 记录每个已发布 revision 对应的持久来源。 */
+  const publishedSources: Array<{ sessionId: string; runStartedAt: number; toolCallId: string }> = []
   /** 记录 Agent session 探测，证明身份冲突在任何外部资源读取前拒绝。 */
   const agentSessionInspections: string[] = []
   /** 模拟生产 IPC 注入的按 Canvas 共享串行器。 */
@@ -82,10 +84,11 @@ function createFixture(options: {
       }
     },
     randomUUID: () => `11111111-1111-4111-8111-${String(++uuid).padStart(12, '0')}`,
-    publish: async (_target, publication) => {
+    publish: async (_target, publication, source) => {
       publicationAttempts.push(publication.revision)
       if (publication.revision === options.publishFailsAtRevision) throw new Error('PUBLISH_FAILED')
       publishedRevisions.push(publication.revision)
+      publishedSources.push(structuredClone(source))
     },
     scanIntents: async () => [...intents.values()].map((intent) => structuredClone(intent)),
     writeIntent: async (intent) => {
@@ -163,6 +166,7 @@ function createFixture(options: {
     sessions,
     publicationAttempts,
     publishedRevisions,
+    publishedSources,
     agentSessionInspections,
     getDocument: () => document,
     getMutateCalls: () => mutateCalls,
@@ -742,6 +746,11 @@ describe('CanvasAgentBatchOperationService', () => {
 
     expect(result.document.revision).toBe(9)
     expect(fixture.publishedRevisions).toEqual([8, 9])
+    expect(fixture.publishedSources).toEqual([{
+      sessionId: 'source-session', runStartedAt: 99, toolCallId: 'tool-call-1',
+    }, {
+      sessionId: 'source-session', runStartedAt: 99, toolCallId: 'tool-success-after-recovery',
+    }])
   })
 
   test('Given 旧 publication 发送失败 When 当前提交成功 Then 隔离失败并继续发布新 revision', async () => {

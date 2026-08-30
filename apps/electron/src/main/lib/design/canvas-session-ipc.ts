@@ -36,6 +36,8 @@ export interface CanvasSessionIpcOptions {
   getProjectReadOnlyReason: (projectId: string) => string | undefined
   /** 删除前阻止仍有运行任务的 Canvas 进入不可恢复清理。 */
   assertCanvasIdle?: (projectId: string, canvasId: string) => void
+  /** 索引删除成功后先清理全部普通 Agent 关联并广播精确变化。 */
+  cleanupBindings?: (projectId: string, canvasId: string) => void
   /** 索引删除成功后回收该 Canvas 独占的内部 Agent 会话。 */
   cleanupInternalSessions?: (projectId: string, canvasId: string) => Promise<void>
 }
@@ -252,6 +254,12 @@ export function registerCanvasSessionIpcHandlers(
     return options.guard.runWorkspaceWrite(input.projectId, async () => {
       options.assertCanvasIdle?.(input.projectId, input.canvasId)
       const session = options.sessions.delete(input)
+      try {
+        options.cleanupBindings?.(input.projectId, input.canvasId)
+      } catch {
+        /** 索引已删除，关联清理失败不得击穿主删除或泄露内部路径。 */
+        console.error('[CanvasSessionIPC] Canvas 关联清理失败')
+      }
       await options.cleanupInternalSessions?.(input.projectId, input.canvasId)
       broadcastChange(options, { projectId: input.projectId, canvasId: session.id, cause: 'deleted' })
       return session

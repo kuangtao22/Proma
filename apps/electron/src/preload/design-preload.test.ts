@@ -304,15 +304,28 @@ describe('Design preload', () => {
     /** 同时携带项目与 Canvas 身份的恢复事件。 */
     const change = {
       projectId: 'p1', canvasId: 'canvas-1', revision: 1, cause: 'recovery' as const,
+      source: { sessionId: 'session-1', runStartedAt: 10, toolCallId: 'tool-1' },
     }
 
     recorded.added[0]?.listener({} as IpcRendererEvent, change)
+    recorded.added[0]?.listener({} as IpcRendererEvent, { ...change, source: { ...change.source, prompt: 'private' } })
+    recorded.added[0]?.listener({} as IpcRendererEvent, { ...change, unexpected: true })
     release()
 
     expect(received).toEqual([change])
     expect(recorded.added[0]?.channel).toBe(CANVAS_IPC_CHANNELS.CHANGED)
     expect(recorded.removed[0]?.channel).toBe(CANVAS_IPC_CHANNELS.CHANGED)
     expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
+  })
+
+  test('Given 原生 Canvas listener 抛错 When payload 合法 Then 消费者异常向上传播', () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    api.onCanvasChanged(() => { throw new Error('RENDERER_LISTENER_FAILED') })
+
+    expect(() => recorded.added[0]?.listener({} as IpcRendererEvent, {
+      projectId: 'p1', canvasId: 'canvas-1', revision: 1, cause: 'graph',
+    })).toThrow('RENDERER_LISTENER_FAILED')
   })
 
   test('Given 关联变化订阅 When 推送合法、未知字段事件并重复取消 Then 只接收严格公开事件且幂等解绑', () => {

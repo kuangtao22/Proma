@@ -2,6 +2,7 @@ import {
   CANVAS_IPC_CHANNELS,
   DESIGN_IPC_CHANNELS,
   parseAgentCanvasBindingChangeEvent,
+  parseCanvasChangeEvent,
 } from '@proma/shared'
 import type {
   AgentCanvasBindingChangeEvent,
@@ -416,9 +417,16 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
     ),
     onCanvasChanged: (listener) => {
       /** Electron event 对 Renderer 隐藏，只传原生 Canvas 业务变化。 */
-      const handler = (_event: IpcRendererEvent, value: unknown): void => (
-        listener(value as CanvasChangeEvent)
-      )
+      const handler = (_event: IpcRendererEvent, value: unknown): void => {
+        let event: CanvasChangeEvent
+        try {
+          event = parseCanvasChangeEvent(value)
+        } catch {
+          /** 非法或过度暴露的来源事件不得进入 Renderer。 */
+          return
+        }
+        listener(event)
+      }
       ipc.on(CANVAS_IPC_CHANNELS.CHANGED, handler)
       return () => ipc.removeListener(CANVAS_IPC_CHANNELS.CHANGED, handler)
     },

@@ -15,7 +15,12 @@ async function executeTool(tools: ToolDefinition[], name: string, args: Record<s
 }
 
 /** 构造可观察写入、执行与全项目扫描的窄依赖。 */
-function createFixture(options: { conflictOnce?: boolean; conflictAlways?: boolean } = {}) {
+function createFixture(options: {
+  conflictOnce?: boolean
+  conflictAlways?: boolean
+  noDefaultCanvas?: boolean
+  createCanvasError?: Error
+} = {}) {
   let document: CanvasDocument = {
     ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
     nodes: [
@@ -24,7 +29,12 @@ function createFixture(options: { conflictOnce?: boolean; conflictAlways?: boole
     ],
     edges: [{ id: 'edge-1', sourceNodeId: 'doc-1', sourcePort: 'output', targetNodeId: 'image-1', targetPort: 'input' }],
   }
-  const linkedCanvasIds = ['canvas-1', 'canvas-2']
+  const linkedCanvasIds = options.noDefaultCanvas ? [] : ['canvas-1', 'canvas-2']
+  const createdSessions = new Map<string, ReturnType<CanvasToolProviderDependencies['sessions']['create']>>()
+  let defaultCanvasId = options.noDefaultCanvas ? undefined : 'canvas-1'
+  let lastActiveCanvasId = options.noDefaultCanvas ? undefined : 'canvas-2'
+  let createCalls = 0
+  let linkCalls = 0
   const batchInputs: Array<{ baseRevision: number; operations: unknown[]; sourceToolCallId: string }> = []
   const runInputs: string[][] = []
   const runToolCallIds: string[] = []
@@ -33,16 +43,38 @@ function createFixture(options: { conflictOnce?: boolean; conflictAlways?: boole
     sessions: {
       list: () => { listCalls += 1; return [] },
       create: (input) => ({ id: 'created-canvas', projectId: input.projectId, title: input.title ?? '新 Canvas', archived: false, createdAt: 1, updatedAt: 1 }),
+      createWithId: (input) => {
+        createCalls += 1
+        if (options.createCanvasError) throw options.createCanvasError
+        const existing = createdSessions.get(input.canvasId)
+        if (existing) return existing
+        const created = {
+          id: input.canvasId, projectId: input.projectId, title: input.title ?? '新 Canvas',
+          archived: false, createdAt: 1, updatedAt: 1,
+        }
+        createdSessions.set(input.canvasId, created)
+        return created
+      },
       requireNative: (projectId, canvasId) => {
         if (projectId !== target.projectId || !['canvas-1', 'canvas-2', 'created-canvas'].includes(canvasId)) throw new Error('Canvas 会话不存在')
         return { id: canvasId, projectId, title: canvasId, archived: false, createdAt: 1, updatedAt: 1 }
       },
     },
     bindings: {
-      get: () => ({ projectId: target.projectId, sessionId: 'session-1', linkedCanvasIds: [...linkedCanvasIds], defaultCanvasId: 'canvas-1', lastActiveCanvasId: 'canvas-2', updatedAt: 1 }),
+      get: () => ({
+        projectId: target.projectId, sessionId: 'session-1', linkedCanvasIds: [...linkedCanvasIds],
+        ...(defaultCanvasId ? { defaultCanvasId } : {}),
+        ...(lastActiveCanvasId ? { lastActiveCanvasId } : {}), updatedAt: 1,
+      }),
       link: (input) => {
+        linkCalls += 1
         if (!linkedCanvasIds.includes(input.canvasId)) linkedCanvasIds.push(input.canvasId)
-        return { projectId: input.projectId, sessionId: input.sessionId, linkedCanvasIds: [...linkedCanvasIds], defaultCanvasId: input.makeDefault ? input.canvasId : 'canvas-1', lastActiveCanvasId: input.canvasId, updatedAt: 2 }
+        if (input.makeDefault) defaultCanvasId = input.canvasId
+        lastActiveCanvasId = input.canvasId
+        return {
+          projectId: input.projectId, sessionId: input.sessionId, linkedCanvasIds: [...linkedCanvasIds],
+          ...(defaultCanvasId ? { defaultCanvasId } : {}), lastActiveCanvasId: input.canvasId, updatedAt: 2,
+        }
       },
       unlink: (input) => ({ projectId: input.projectId, sessionId: input.sessionId, linkedCanvasIds: linkedCanvasIds.filter((id) => id !== input.canvasId), defaultCanvasId: 'canvas-1', lastActiveCanvasId: 'canvas-1', updatedAt: 2 }),
       setDefault: (input) => ({ projectId: input.projectId, sessionId: input.sessionId, linkedCanvasIds: [...linkedCanvasIds], defaultCanvasId: input.canvasId, lastActiveCanvasId: input.canvasId, updatedAt: 2 }),
@@ -76,7 +108,12 @@ function createFixture(options: { conflictOnce?: boolean; conflictAlways?: boole
     projectId: target.projectId, sessionId: 'session-1', runStartedAt: 99,
     explicitReferences: [reference], permissionCeiling: 'execute',
   }
-  return { dependencies, context, batchInputs, runInputs, runToolCallIds, getListCalls: () => listCalls }
+  return {
+    dependencies, context, batchInputs, runInputs, runToolCallIds,
+    getListCalls: () => listCalls,
+    getCreateCalls: () => createCalls,
+    getLinkCalls: () => linkCalls,
+  }
 }
 
 describe('普通 Agent Canvas Tool Provider', () => {
@@ -143,6 +180,44 @@ describe('普通 Agent Canvas Tool Provider', () => {
     })).rejects.toThrow('CANVAS_EXPLICIT_SELECTION_REQUIRED')
     const existing = await executeTool(run.piCustomTools, 'canvas_manage', { action: 'link', canvasId: 'canvas-1' })
     expect(existing.details).toMatchObject({ action: 'link', canvasId: 'canvas-1' })
+  })
+
+  test('Given execute Agent 无默认画布 When 同一 create tool call 跨 Provider 重放 Then 持久复用同一 Canvas 且只绑定一次', async () => {
+    const fixture = createFixture({ noDefaultCanvas: true })
+    const firstRun = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const first = await executeTool(firstRun.piCustomTools, 'canvas_manage', {
+      action: 'create', title: '执行画布', makeDefault: true,
+    }, 'tool-create-1')
+    const replayRun = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const replay = await executeTool(replayRun.piCustomTools, 'canvas_manage', {
+      action: 'create', title: '执行画布', makeDefault: true,
+    }, 'tool-create-1')
+
+    expect((first.details as { canvasId: string }).canvasId).toBe((replay.details as { canvasId: string }).canvasId)
+    expect((first.details as { canvasId: string }).canvasId).toMatch(/^agent-canvas-[0-9a-f]{64}$/)
+    expect(fixture.getCreateCalls()).toBe(2)
+    expect(fixture.getLinkCalls()).toBe(1)
+    expect(fixture.getListCalls()).toBe(0)
+  })
+
+  test('Given plan 或项目路径授权失效 When 创建 Canvas Then 禁止持久副作用且 fresh call fail closed', async () => {
+    const planFixture = createFixture({ noDefaultCanvas: true })
+    const plan = createCanvasToolRun(planFixture.dependencies, {
+      ...planFixture.context, permissionCeiling: 'plan',
+    })
+    await expect(executeTool(plan.piCustomTools, 'canvas_manage', { action: 'create' }, 'tool-plan-create'))
+      .rejects.toThrow('CANVAS_EXECUTE_INTENT_REQUIRED')
+    expect(planFixture.getCreateCalls()).toBe(0)
+    expect(planFixture.getLinkCalls()).toBe(0)
+
+    const revoked = createFixture({ noDefaultCanvas: true, createCanvasError: new Error('项目路径不可访问') })
+    for (const toolCallId of ['tool-revoked-1', 'tool-revoked-2']) {
+      const run = createCanvasToolRun(revoked.dependencies, revoked.context)
+      await expect(executeTool(run.piCustomTools, 'canvas_manage', { action: 'create' }, toolCallId))
+        .rejects.toThrow('项目路径不可访问')
+    }
+    expect(revoked.getCreateCalls()).toBe(2)
+    expect(revoked.getLinkCalls()).toBe(0)
   })
 
   test('Given execute-capable 与 plan 权限上限 When apply_changes Then host 不解析消息且 plan 只允许新增 idle 结构', async () => {

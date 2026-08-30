@@ -1,6 +1,7 @@
 import { createHash, randomUUID as createRandomUUID } from 'node:crypto'
 import type {
   CanvasBatchOperationEnvelope,
+  CanvasChangeSource,
   CanvasDocument,
   CanvasMutation,
   CanvasNode,
@@ -60,7 +61,7 @@ export interface CanvasAgentBatchOperationDependencies {
   randomUUID?: () => string
   now?: () => number
   /** serializer 与 workspace lease 释放后发布权威图事实。 */
-  publish: (target: CanvasTarget, document: CanvasDocument) => void | Promise<void>
+  publish: (target: CanvasTarget, document: CanvasDocument, source: CanvasChangeSource) => void | Promise<void>
   scanIntents?: (target: CanvasTarget) => Promise<CanvasBatchOperationIntent[]>
   writeIntent?: (intent: CanvasBatchOperationIntent) => Promise<StableDirectoryNativeWriteOutcome>
   contentLifecycle: Pick<CanvasContentNodeLifecycle, 'inspectBatchContent' | 'prepareBatchContent' | 'cleanupBatchContent' | 'prepareBatchDeletion' | 'restoreBatchDeletion' | 'assertBatchAgentNodeIdle'>
@@ -165,23 +166,29 @@ export interface CanvasBatchOperationResult {
   operationId: string
 }
 
+/** 待发布图事实及其持久来源，确保崩溃恢复后仍能定位触发 Agent。 */
+export interface CanvasBatchPublication {
+  document: CanvasDocument
+  source: CanvasChangeSource
+}
+
 /** LOAD/SAVE 对账期间新提交的图事实，必须在 workspace lease 释放后发布。 */
 export interface CanvasBatchReconciliationResult extends CanvasBatchOperationResult {
-  publications: CanvasDocument[]
+  publications: CanvasBatchPublication[]
 }
 
 /** 锁内执行成功后交给外层发布的内部 envelope。 */
 interface CanvasBatchLockedExecutionResult extends CanvasBatchOperationResult {
-  reconciliationPublications: CanvasDocument[]
-  publication?: CanvasDocument
+  reconciliationPublications: CanvasBatchPublication[]
+  publication?: CanvasBatchPublication
 }
 
 /** 锁内执行失败时保留已提交恢复事实与可选当前事实。 */
 class CanvasBatchExecutionError extends Error {
   constructor(
     readonly causeError: Error,
-    readonly reconciliationPublications: CanvasDocument[],
-    readonly publication?: CanvasDocument,
+    readonly reconciliationPublications: CanvasBatchPublication[],
+    readonly publication?: CanvasBatchPublication,
   ) {
     super(causeError.message, { cause: causeError })
     this.name = 'CanvasBatchExecutionError'
@@ -190,7 +197,7 @@ class CanvasBatchExecutionError extends Error {
 
 /** reconcile 中途失败时保留此前已经提交的图事实。 */
 class CanvasBatchReconciliationError extends Error {
-  constructor(readonly causeError: Error, readonly publications: CanvasDocument[]) {
+  constructor(readonly causeError: Error, readonly publications: CanvasBatchPublication[]) {
     super(causeError.message, { cause: causeError })
     this.name = 'CanvasBatchReconciliationError'
   }
@@ -643,7 +650,7 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
   /** 在调用方已经持有共享 Canvas 串行权与 workspace lease 时恢复全部 intent。 */
   const reconcileLocked = async (target: CanvasTarget): Promise<CanvasBatchReconciliationResult> => {
     let operationId = ''
-    const publications: CanvasDocument[] = []
+    const publications: CanvasBatchPublication[] = []
     try {
       for (const original of await scan(target)) {
         operationId = original.operationId
@@ -667,9 +674,11 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
         try {
           const result = await commit(intent)
           /** 非终态 intent 本轮确认 committed 即形成待发布事实，不依赖 revision 是否刚递增。 */
-          publications.push(result.document)
+          publications.push({ document: result.document, source: original.source })
         } catch (error) {
-          if (error instanceof CanvasBatchOperationPublishedError) publications.push(error.document)
+          if (error instanceof CanvasBatchOperationPublishedError) {
+            publications.push({ document: error.document, source: original.source })
+          }
           throw error
         }
       }
@@ -685,7 +694,7 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
   const executeLocked = async (envelope: CanvasBatchOperationEnvelope): Promise<CanvasBatchLockedExecutionResult> => {
     const target = { projectId: envelope.projectId, canvasId: envelope.canvasId }
     /** 任何新请求先收敛全部旧 intent，禁止并存第二个未决事务。 */
-    let reconciliationPublications: CanvasDocument[]
+    let reconciliationPublications: CanvasBatchPublication[]
     try {
       reconciliationPublications = (await reconcileLocked(target)).publications
     } catch (error) {
@@ -729,13 +738,17 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
       intent = await prepareResources(intent)
       try {
         const result = await commit(intent)
-        return { ...result, reconciliationPublications, publication: result.document }
+        return {
+          ...result,
+          reconciliationPublications,
+          publication: { document: result.document, source: intent.source },
+        }
       } catch (error) {
         if (error instanceof CanvasBatchOperationPublishedError) {
           throw new CanvasBatchExecutionError(
             error.causeError,
             reconciliationPublications,
-            error.document,
+            { document: error.document, source: intent.source },
           )
         }
         throw error
@@ -747,14 +760,14 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
   }
 
   /** lease 外按提交顺序 best-effort 发布，单次失败不得阻断后续事实。 */
-  const publishBestEffort = async (target: CanvasTarget, publications: CanvasDocument[]): Promise<void> => {
+  const publishBestEffort = async (target: CanvasTarget, publications: CanvasBatchPublication[]): Promise<void> => {
     /** 本服务 cause 固定为 graph，revision Set 等价于 cause + revision 去重键。 */
     const publishedRevisions = new Set<number>()
     for (const publication of publications) {
-      if (publishedRevisions.has(publication.revision)) continue
-      publishedRevisions.add(publication.revision)
+      if (publishedRevisions.has(publication.document.revision)) continue
+      publishedRevisions.add(publication.document.revision)
       try {
-        await dependencies.publish(target, publication)
+        await dependencies.publish(target, publication.document, publication.source)
       } catch (error) {
         console.error('[CanvasBatch] 画布批量事实发布失败，继续发布后续 revision:', error)
       }

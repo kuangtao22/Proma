@@ -2164,7 +2164,7 @@ export function registerIpcHandlers(): void {
     runExclusive: (target, effect) => canvasOperationSerializer.run(target, () => (
       workspaceOperationGuard.runWorkspaceWrite(target.projectId, effect)
     )),
-    publish: (target, document) => {
+    publish: (target, document, source) => {
       /** 每个窗口独立 best-effort，单个发送失败不得阻断后续窗口或 revision。 */
       for (const contents of listAuthorizedDesignWebContents()) {
         try {
@@ -2173,6 +2173,11 @@ export function registerIpcHandlers(): void {
             canvasId: target.canvasId,
             revision: document.revision,
             cause: 'graph',
+            source: {
+              sessionId: source.sessionId,
+              runStartedAt: source.runStartedAt,
+              toolCallId: source.toolCallId,
+            },
           })
         } catch (error) {
           console.error('[CanvasBatch] 画布批量事实广播失败:', error)
@@ -2261,6 +2266,10 @@ export function registerIpcHandlers(): void {
         throw new Error('Canvas 仍有任务运行，请先停止后再删除')
       }
     },
+    cleanupBindings: (projectId, canvasId) => {
+      /** Canvas 删除后先撤销所有普通 Agent 授权，再回收内部节点会话。 */
+      cleanupDeletedCanvasBindings(agentCanvasBindingCleanup, projectId, canvasId)
+    },
     cleanupInternalSessions: async (projectId, canvasId) => {
       /** 内部 Agent 会话严格按完整 Canvas 归属筛选，不能波及其它画布或普通会话。 */
       const sessions = listAgentSessions().filter((session) => (
@@ -2280,8 +2289,6 @@ export function registerIpcHandlers(): void {
           console.error(`[Canvas 会话] 内部 Agent 清理失败 (${session.id}):`, error)
         }
       }
-      /** Canvas 索引删除成功后 best-effort 清理，失败不得阻断主删除广播。 */
-      cleanupDeletedCanvasBindings(agentCanvasBindingCleanup, projectId, canvasId)
     },
   })
   registerCanvasDocumentIpcHandlers({

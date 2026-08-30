@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import type {
@@ -55,6 +56,7 @@ export interface CanvasToolProviderDependencies {
   sessions: {
     list: (input: { projectId: string; archived?: boolean }) => CanvasSessionMeta[]
     create: (input: { projectId: string; title?: string }) => CanvasSessionMeta
+    createWithId: (input: { projectId: string; canvasId: string; title?: string }) => CanvasSessionMeta
     requireNative: (projectId: string, canvasId: string) => CanvasSessionMeta
   }
   bindings: {
@@ -143,6 +145,15 @@ function createRetrySourceToolCallId(toolCallId: string): string {
   return `${toolCallId.slice(0, 128 - suffix.length)}${suffix}`
 }
 
+/** 从执行身份派生跨进程稳定 Canvas ID，不读取或扫描项目内其它 Canvas。 */
+function createManagedCanvasId(context: CanvasToolRunContext, toolCallId: string): string {
+  /** 长度前缀编码避免不同字段拼接产生边界碰撞。 */
+  const identity = [context.projectId, context.sessionId, String(context.runStartedAt), toolCallId]
+    .map((value) => `${value.length}:${value}`)
+    .join('|')
+  return `agent-canvas-${createHash('sha256').update(identity).digest('hex')}`
+}
+
 /** 为普通项目 Agent 创建不持久化的单轮 Canvas 工具。 */
 export function createCanvasToolRun(
   dependencies: CanvasToolProviderDependencies,
@@ -180,13 +191,32 @@ export function createCanvasToolRun(
         title: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
         makeDefault: Type.Optional(Type.Boolean()),
       }),
-      execute: async (_toolCallId, params) => {
+      execute: async (toolCallId, params) => {
+        if (context.permissionCeiling === 'plan' && params.action === 'create') {
+          throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
+        }
         if (context.permissionCeiling === 'plan' && params.action !== 'create' && params.action !== 'link') {
           throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         }
         if (params.action === 'create') {
-          const session = dependencies.sessions.create({ projectId: context.projectId, ...(params.title ? { title: params.title } : {}) })
-          const binding = dependencies.bindings.link({ projectId: context.projectId, sessionId: context.sessionId, canvasId: session.id, makeDefault: params.makeDefault ?? true })
+          /** 同一 tool call 始终命中同一索引记录，首次 link 失败后也可安全重放。 */
+          const canvasId = createManagedCanvasId(context, toolCallId)
+          const session = dependencies.sessions.createWithId({
+            projectId: context.projectId,
+            canvasId,
+            ...(params.title ? { title: params.title } : {}),
+          })
+          const existingBinding = getContext()
+          const makeDefault = params.makeDefault ?? true
+          const alreadyLinked = existingBinding?.linkedCanvasIds.includes(session.id) ?? false
+          const binding = alreadyLinked && (!makeDefault || existingBinding?.defaultCanvasId === session.id)
+            ? existingBinding
+            : dependencies.bindings.link({
+                projectId: context.projectId,
+                sessionId: context.sessionId,
+                canvasId: session.id,
+                makeDefault,
+              })
           return toolResult({ action: params.action, canvasId: session.id, session, binding })
         }
         if (!params.canvasId) throw new Error('CANVAS_ID_REQUIRED')

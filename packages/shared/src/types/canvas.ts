@@ -1319,10 +1319,55 @@ export interface CanvasWorkspaceSnapshot {
   recoveredFrom?: 'tmp' | 'backup'
 }
 
+/** Agent 工具触发 Canvas 变化时允许公开的最小来源身份。 */
+export interface CanvasChangeSource {
+  sessionId: string
+  runStartedAt: number
+  toolCallId: string
+}
+
 /** 原生 Canvas 文档变化事件，始终携带项目和 Canvas 双重身份。 */
 export interface CanvasChangeEvent extends CanvasTarget {
   revision: number
   cause: 'graph' | 'recovery'
+  /** 人工编辑和旧生图可无来源；存在时禁止携带 prompt 等私有内容。 */
+  source?: CanvasChangeSource
+}
+
+/** 严格解析 Renderer 可见的 Canvas 变化事件。 */
+export function parseCanvasChangeEvent(value: unknown): CanvasChangeEvent {
+  const record = value as Record<string, unknown>
+  const keys = record?.source === undefined
+    ? ['projectId', 'canvasId', 'revision', 'cause']
+    : ['projectId', 'canvasId', 'revision', 'cause', 'source']
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(record.projectId)
+    || !isCanvasLifecycleId(record.canvasId)
+    || !Number.isSafeInteger(record.revision) || (record.revision as number) < 0
+    || (record.cause !== 'graph' && record.cause !== 'recovery')) {
+    throw new Error('CANVAS_CHANGE_EVENT_INVALID')
+  }
+  let source: CanvasChangeSource | undefined
+  if (record.source !== undefined) {
+    if (!hasExactCanvasKeys(record.source, ['sessionId', 'runStartedAt', 'toolCallId'])
+      || !isCanvasLifecycleId(record.source.sessionId)
+      || !Number.isSafeInteger(record.source.runStartedAt) || (record.source.runStartedAt as number) < 0
+      || !isCanvasLifecycleId(record.source.toolCallId)) {
+      throw new Error('CANVAS_CHANGE_EVENT_INVALID')
+    }
+    source = {
+      sessionId: record.source.sessionId,
+      runStartedAt: record.source.runStartedAt as number,
+      toolCallId: record.source.toolCallId,
+    }
+  }
+  return {
+    projectId: record.projectId as string,
+    canvasId: record.canvasId as string,
+    revision: record.revision as number,
+    cause: record.cause as CanvasChangeEvent['cause'],
+    ...(source ? { source } : {}),
+  }
 }
 
 /**

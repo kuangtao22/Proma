@@ -94,6 +94,9 @@ describe('Canvas 会话 IPC', () => {
         },
       },
       getProjectReadOnlyReason: () => undefined,
+      assertCanvasIdle: () => { calls.push('idle') },
+      cleanupBindings: () => { calls.push('bindings') },
+      cleanupInternalSessions: async () => { calls.push('internal') },
     })
 
     expect(await invoke(
@@ -122,7 +125,7 @@ describe('Canvas 会话 IPC', () => {
     )).toMatchObject({ id: 'canvas-1' })
 
     expect(guardedProjects).toEqual(['project-1', 'project-1', 'project-1', 'project-1'])
-    expect(calls).toEqual(['ensure', 'list:false', 'create', 'update', 'delete'])
+    expect(calls).toEqual(['ensure', 'list:false', 'create', 'update', 'idle', 'delete', 'bindings', 'internal'])
     expect(sender.sent).toEqual([{
       channel: DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED,
       value: { projectId: 'project-1', canvasId: 'canvas-1', cause: 'created' },
@@ -135,6 +138,47 @@ describe('Canvas 会话 IPC', () => {
     }])
     registration.dispose()
     expect(handlers.size).toBe(0)
+  })
+
+  test('Given Canvas 索引已删除但关联清理失败 When 删除 Then 继续清内部会话并广播已删除事实', async () => {
+    const handlers = new Map<string, TestHandler>()
+    const sender = createSender(1)
+    const calls: string[] = []
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    registerCanvasSessionIpcHandlers({
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: (channel) => { handlers.delete(channel) },
+      },
+      listAuthorizedWebContents: () => [sender],
+      guard: { runWorkspaceWrite: (_projectId, effect) => effect() },
+      sessions: {
+        ensureLegacySession: () => undefined,
+        list: () => [],
+        create: () => createSession('canvas-1'),
+        update: () => createSession('canvas-1'),
+        delete: (input) => { calls.push('delete'); return createSession(input.canvasId) },
+      },
+      getProjectReadOnlyReason: () => undefined,
+      assertCanvasIdle: () => { calls.push('idle') },
+      cleanupBindings: () => { calls.push('bindings'); throw new Error('/private/binding-path') },
+      cleanupInternalSessions: async () => { calls.push('internal') },
+    })
+
+    await expect(invoke(
+      handlers,
+      DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION,
+      sender,
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+    )).resolves.toEqual(createSession('canvas-1'))
+    expect(calls).toEqual(['idle', 'delete', 'bindings', 'internal'])
+    expect(sender.sent).toEqual([{
+      channel: DESIGN_IPC_CHANNELS.CANVAS_SESSION_CHANGED,
+      value: { projectId: 'project-1', canvasId: 'canvas-1', cause: 'deleted' },
+    }])
+    expect(errorSpy).toHaveBeenCalledWith('[CanvasSessionIPC] Canvas 关联清理失败')
+    expect(errorSpy.mock.calls.flat()).not.toContain(expect.stringContaining('/private'))
+    errorSpy.mockRestore()
   })
 
   test('Given 未授权窗口 When 调用 Then 在守卫和 Store 副作用前拒绝', async () => {

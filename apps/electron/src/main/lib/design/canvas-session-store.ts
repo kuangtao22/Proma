@@ -36,6 +36,13 @@ export interface CanvasSessionStoreDependencies {
   createId?: () => string
 }
 
+/** Agent 工具内部使用的确定性 Canvas 创建输入，不暴露给 Renderer IPC。 */
+export interface CreateCanvasSessionWithIdInput {
+  projectId: string
+  canvasId: string
+  title?: string
+}
+
 /** 项目级 Canvas 会话索引，所有写入均使用 safe-file 原子提交。 */
 export class CanvasSessionStore {
   constructor(private readonly dependencies: CanvasSessionStoreDependencies) {}
@@ -108,6 +115,38 @@ export class CanvasSessionStore {
       id,
       projectId: input.projectId,
       title,
+      archived: false,
+      storageKind: 'native',
+      createdAt: now,
+      updatedAt: now,
+    }
+    index.sessions.push(record)
+    index.updatedAt = now
+    this.writeIndex(index)
+    return toPublicSession(record)
+  }
+
+  /**
+   * 以调用方派生的安全 ID 幂等创建原生 Canvas，崩溃重放时返回既有索引事实。
+   * @param input 已授权项目、确定性 Canvas ID 与可选标题。
+   * @returns 首次原子提交或既有原生记录对应的公开会话。
+   */
+  createWithId(input: CreateCanvasSessionWithIdInput): CanvasSessionMeta {
+    /** 每次调用都 fresh-read 项目索引，使路径撤销和外部变更继续 fail closed。 */
+    const index = this.readIndex(input.projectId)
+    if (!isSafeDesignStableId(input.canvasId)) throw new Error(`Canvas ID 非法或重复: ${input.canvasId}`)
+    /** 确定性 ID 已存在时只能复用同项目原生记录，不能接管 legacy 身份。 */
+    const existing = index.sessions.find((session) => session.id === input.canvasId)
+    if (existing) {
+      if (existing.storageKind !== 'native') throw new Error(`Canvas ID 非法或重复: ${input.canvasId}`)
+      return toPublicSession(existing)
+    }
+    /** 首次创建与普通创建保持相同标题、时间和原子索引合同。 */
+    const now = this.requireNow()
+    const record: CanvasSessionRecord = {
+      id: input.canvasId,
+      projectId: input.projectId,
+      title: normalizeTitle(input.title ?? '新 Canvas'),
       archived: false,
       storageKind: 'native',
       createdAt: now,

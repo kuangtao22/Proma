@@ -89,6 +89,17 @@ describe('CanvasSessionStore', () => {
     expect(existsSync(`${indexPath}.tmp`)).toBe(false)
   })
 
+  test('Given 确定性 Canvas ID When Store 重建后重放创建 Then 返回同一持久记录且不重复索引', () => {
+    const canvasId = `agent-canvas-${'a'.repeat(64)}`
+    const firstStore = createStore()
+    const first = firstStore.createWithId({ projectId: 'project-1', canvasId, title: 'Agent 画布' })
+    const replayStore = createStore()
+    const replay = replayStore.createWithId({ projectId: 'project-1', canvasId, title: '重放标题不得覆盖' })
+
+    expect(replay).toEqual(first)
+    expect(replayStore.list({ projectId: 'project-1' })).toEqual([first])
+  })
+
   test('Given 原生 Canvas 已创建内容与缓存 When 删除 Then 索引、正式目录和缓存目录一并清理', () => {
     const store = createStore()
     const created = store.create({ projectId: 'project-1', title: '待删除 Canvas' })

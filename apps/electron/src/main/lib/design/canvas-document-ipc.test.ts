@@ -21,6 +21,7 @@ import type {
 } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { parseCanvasDocument } from './canvas-document-store'
+import type { CanvasBatchPublication } from './canvas-agent-batch-operation'
 import { createCanvasOperationSerializer, getCanvasToolProviderRuntime, registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
 
 /** 测试 IPC handler 的最小签名。 */
@@ -205,7 +206,7 @@ function createContext(options: {
   imageRun?: (jobId: string, leaseHeld: boolean) => Promise<void>
   batchReconcile?: () => Promise<void>
   batchReconcileError?: Error
-  batchPublications?: CanvasDocument[]
+  batchPublications?: CanvasBatchPublication[]
   enableToolProviderRuntime?: boolean
 } = {}) {
   /** 当前注册的 invoke handler。 */
@@ -613,7 +614,10 @@ describe('原生 Canvas 文档 IPC', () => {
 
   test('Given batch 恢复与当前内容创建都提交图 When lease 释放 Then 按 revision 顺序广播', async () => {
     const context = createContext({
-      batchPublications: [createDocument(5)],
+      batchPublications: [{
+        document: createDocument(5),
+        source: { sessionId: 'source-session', runStartedAt: 99, toolCallId: 'source-tool-call' },
+      }],
       contentResultFactory: (selectedNodeId) => ({
         snapshot: { document: createDocument(6), writable: true, nodeIssues: [] },
         ...(selectedNodeId ? { selectedNodeId } : {}),
@@ -627,7 +631,13 @@ describe('原生 Canvas 文档 IPC', () => {
     })
 
     expect(context.sender.sent).toEqual([
-      { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph' } },
+      {
+        channel: CANVAS_IPC_CHANNELS.CHANGED,
+        value: {
+          projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'graph',
+          source: { sessionId: 'source-session', runStartedAt: 99, toolCallId: 'source-tool-call' },
+        },
+      },
       { channel: CANVAS_IPC_CHANNELS.CHANGED, value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph' } },
     ])
     expect(context.broadcastLeaseStates).toEqual([false, false])

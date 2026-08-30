@@ -17,6 +17,7 @@ import type {
   CanvasAgentMessagesResult,
   CanvasAgentActiveRunSnapshot,
   CanvasChangeEvent,
+  CanvasChangeSource,
   CanvasInvokeResult,
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
@@ -1483,6 +1484,7 @@ export function registerCanvasDocumentIpcHandlers(
     published: Set<string>,
     revision: number,
     cause: CanvasChangeEvent['cause'],
+    source?: CanvasChangeSource,
   ): void => {
     const key = `${cause}:${revision}`
     if (published.has(key)) return
@@ -1492,6 +1494,7 @@ export function registerCanvasDocumentIpcHandlers(
       canvasId: target.canvasId,
       revision,
       cause,
+      ...(source ? { source } : {}),
     })
   }
 
@@ -1522,7 +1525,13 @@ export function registerCanvasDocumentIpcHandlers(
     reconciliation: CanvasBatchReconciliationResult,
   ): void => {
     for (const publication of reconciliation.publications) {
-      publishUniqueChange(target, published, publication.revision, 'graph')
+      publishUniqueChange(
+        target,
+        published,
+        publication.document.revision,
+        'graph',
+        publication.source,
+      )
     }
   }
 
@@ -1883,7 +1892,7 @@ export function registerCanvasDocumentIpcHandlers(
         })
         const published = new Set<string>()
         for (const publication of outcome.batch.publications) {
-          publishUniqueChange(input, published, publication.revision, 'graph')
+          publishUniqueChange(input, published, publication.document.revision, 'graph', publication.source)
         }
         publishUniqueReconciliation(input, published, outcome.content)
         if (outcome.content.error) throw outcome.content.error
@@ -1951,7 +1960,7 @@ export function registerCanvasDocumentIpcHandlers(
         const outcome = guarded.outcome
         const published = new Set<string>()
         for (const publication of guarded.batch.publications) {
-          publishUniqueChange(input, published, publication.revision, 'graph')
+          publishUniqueChange(input, published, publication.document.revision, 'graph', publication.source)
         }
         publishReconciliation(options, input, outcome.reconciliation)
         if (!outcome.ok) throw outcome.error

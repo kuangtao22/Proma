@@ -15,6 +15,7 @@ import {
   parseAgentCanvasBinding,
   parseAgentCanvasBindingChangeEvent,
   parseCanvasBatchOperationEnvelope,
+  parseCanvasChangeEvent,
   parseCanvasNodeReference,
   parseCanvasRunNodesInput,
   parseClearAgentCanvasBindingsInput,
@@ -539,7 +540,21 @@ describe('Canvas 图共享合同', () => {
       canvasId: 'canvas-1',
       revision: 0,
       cause: 'recovery',
+      source: {
+        sessionId: 'session-1',
+        runStartedAt: 100,
+        toolCallId: 'tool-1',
+      },
     }
+
+    expect(parseCanvasChangeEvent(change)).toEqual(change)
+    expect(parseCanvasChangeEvent({
+      projectId: 'project-1', canvasId: 'canvas-1', revision: 1, cause: 'graph',
+    })).toEqual({ projectId: 'project-1', canvasId: 'canvas-1', revision: 1, cause: 'graph' })
+    expect(() => parseCanvasChangeEvent({ ...change, source: { ...change.source, prompt: 'private' } })).toThrow('CANVAS_CHANGE_EVENT_INVALID')
+    expect(() => parseCanvasChangeEvent({ ...change, source: { sessionId: 'session-1' } })).toThrow('CANVAS_CHANGE_EVENT_INVALID')
+    expect(() => parseCanvasChangeEvent({ ...change, source: { ...change.source, runStartedAt: -1 } })).toThrow('CANVAS_CHANGE_EVENT_INVALID')
+    expect(() => parseCanvasChangeEvent({ ...change, extra: true })).toThrow('CANVAS_CHANGE_EVENT_INVALID')
 
     expect(CANVAS_IPC_CHANNELS).toEqual({
       LOAD: 'canvas:load',
@@ -578,6 +593,11 @@ describe('Canvas 图共享合同', () => {
       canvasId: 'canvas-1',
       revision: 0,
       cause: 'recovery',
+      source: {
+        sessionId: 'session-1',
+        runStartedAt: 100,
+        toolCallId: 'tool-1',
+      },
     })
     expect('path' in snapshot).toBe(false)
     expect('storageKind' in snapshot).toBe(false)
