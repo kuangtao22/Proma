@@ -1,9 +1,11 @@
 import type {
   DesignAsset,
+  DesignContextReference,
   DesignContextMode,
   DesignJobRecord,
   DesignPoint,
   DesignViewport,
+  ImageGenerationModelSnapshot,
 } from './design'
 import type { AgentSessionMeta } from './agent'
 import type { SDKMessage } from './agent'
@@ -11,12 +13,23 @@ import type { SDKMessage } from './agent'
 /** 原生 Canvas 图文档使用的固定 IPC 通道。 */
 export const CANVAS_IPC_CHANNELS = {
   LOAD: 'canvas:load',
+  LOAD_WEBVIEW: 'canvas:load-webview',
+  LOAD_WEBVIEW_PREVIEW: 'canvas:load-webview-preview',
+  LOAD_TEXT_ARTIFACT: 'canvas:load-text-artifact',
+  UPDATE_TEXT_ARTIFACT: 'canvas:update-text-artifact',
+  LIST_ARTIFACT_REVISIONS: 'canvas:list-artifact-revisions',
+  ADOPT_ARTIFACT_REVISION: 'canvas:adopt-artifact-revision',
+  EXPORT_ARTIFACT: 'canvas:export-artifact',
   LOAD_IMAGE_MODULE: 'canvas:load-image-module',
   SAVE_IMAGE_MODULE: 'canvas:save-image-module',
   CREATE_IMAGE_JOB: 'canvas:create-image-job',
   CANCEL_IMAGE_JOB: 'canvas:cancel-image-job',
   RETRY_IMAGE_JOB: 'canvas:retry-image-job',
   ADOPT_IMAGE_ASSET: 'canvas:adopt-image-asset',
+  GET_IMAGE_CANDIDATE_BATCH: 'canvas:get-image-candidate-batch',
+  CONTINUE_IMAGE_CANDIDATE_BATCH: 'canvas:continue-image-candidate-batch',
+  ADOPT_IMAGE_CANDIDATE_BATCH: 'canvas:adopt-image-candidate-batch',
+  ABANDON_IMAGE_CANDIDATE_BATCH: 'canvas:abandon-image-candidate-batch',
   RELEASE_IMAGE_MEDIA: 'canvas:release-image-media',
   IMAGE_MODULE_CHANGED: 'canvas:image-module-changed',
   SAVE_MUTATIONS: 'canvas:save-mutations',
@@ -40,10 +53,28 @@ export const CANVAS_IPC_CHANNELS = {
 } as const
 
 /** 独立 Canvas 图文档的当前 schema 版本。 */
-export const CANVAS_DOCUMENT_VERSION = 2
+export const CANVAS_DOCUMENT_VERSION = 4
+
+/** WebView 节点支持的设备视口预设。 */
+export type CanvasWebviewDevicePreset = 'desktop' | 'mobile'
+
+/**
+ * 严格解析 WebView 设备预设。
+ * @param value 待解析的跨进程或持久化值。
+ * @returns 受支持的网页或手机预设。
+ */
+export function parseCanvasWebviewDevicePreset(value: unknown): CanvasWebviewDevicePreset {
+  if (value !== 'desktop' && value !== 'mobile') {
+    throw new Error('CANVAS_WEBVIEW_DEVICE_PRESET_INVALID')
+  }
+  return value
+}
 
 /** Canvas 支持的节点类别，每类节点只引用自身业务事实源。 */
 export type CanvasNodeKind = 'agent' | 'image' | 'document' | 'webview'
+
+/** 四类 Canvas 节点共享的瞬时活动状态，不写入持久化文档。 */
+export type CanvasNodeActivityState = 'idle' | 'queued' | 'running' | 'waiting-approval'
 
 /** 拥有独立受管内容目录的非 Agent 节点类别。 */
 export type CanvasContentKind = Exclude<CanvasNodeKind, 'agent'>
@@ -58,18 +89,42 @@ export interface CanvasNodeContentMeta {
   updatedAt: number
 }
 
-/** Renderer 可见的 Canvas 回收区条目，不包含任何磁盘路径。 */
-export interface CanvasTrashEntry {
-  schemaVersion: 1
+/** Renderer 可见回收条目的共享字段，不包含任何磁盘路径。 */
+interface CanvasTrashEntryBase {
+  schemaVersion: 2
   trashId: string
   nodeId: string
-  kind: CanvasContentKind
   contentId: string
   title: string
   position: DesignPoint
   deletedRevision: number
   deletedAt: number
 }
+
+/** 图片回收条目保留删除时已经采用的素材身份。 */
+export interface CanvasImageTrashEntry extends CanvasTrashEntryBase {
+  kind: 'image'
+  adoptedAssetId?: string
+}
+
+/** 文档回收条目保留删除时采用的正文修订。 */
+export interface CanvasDocumentTrashEntry extends CanvasTrashEntryBase {
+  kind: 'document'
+  contentRevision: number
+}
+
+/** WebView 回收条目保留删除时采用的正文修订和设备预设。 */
+export interface CanvasWebviewTrashEntry extends CanvasTrashEntryBase {
+  kind: 'webview'
+  contentRevision: number
+  devicePreset: CanvasWebviewDevicePreset
+}
+
+/** Renderer 可见的严格回收条目判别联合。 */
+export type CanvasTrashEntry =
+  | CanvasImageTrashEntry
+  | CanvasDocumentTrashEntry
+  | CanvasWebviewTrashEntry
 
 /** Canvas 内容稳定 ID 的共享边界，与 native helper 合同保持一致。 */
 const CANVAS_CONTENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
@@ -79,6 +134,8 @@ export const CANVAS_IMAGE_PROMPT_MAX_LENGTH = 100_000
 const CANVAS_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 /** Canvas 回收条目标题上限，避免无界数据进入 Renderer。 */
 const CANVAS_TRASH_TITLE_MAX_LENGTH = 120
+/** 文本产物正文最大 UTF-8 字节数，与受管文件写入边界保持一致。 */
+export const CANVAS_TEXT_ARTIFACT_CONTENT_MAX_BYTES = 256 * 1024
 
 /** 判断未知值是否为无未知字段的普通记录。 */
 function hasExactCanvasKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
@@ -135,44 +192,101 @@ export function parseCanvasNodeContentMeta(value: unknown): CanvasNodeContentMet
  * @returns 不含路径、字段有界且坐标有限的回收条目。
  */
 export function parseCanvasTrashEntry(value: unknown): CanvasTrashEntry {
-  /** 回收条目允许的完整字段集合。 */
-  const keys = [
+  /** schema v1 历史条目只允许旧版完整字段集合。 */
+  const legacyKeys = [
+    'schemaVersion', 'trashId', 'nodeId', 'kind', 'contentId', 'title',
+    'position', 'deletedRevision', 'deletedAt',
+  ] as const
+  /** schema v2 各分支共享的完整基础字段集合。 */
+  const baseKeys = [
     'schemaVersion', 'trashId', 'nodeId', 'kind', 'contentId', 'title',
     'position', 'deletedRevision', 'deletedAt',
   ] as const
   /** 坐标对象允许的完整字段集合。 */
   const positionKeys = ['x', 'y'] as const
-  if (!hasExactCanvasKeys(value, keys)
-    || value.schemaVersion !== 1
-    || typeof value.trashId !== 'string'
-    || !CANVAS_CONTENT_ID_PATTERN.test(value.trashId)
-    || typeof value.nodeId !== 'string'
-    || !CANVAS_CONTENT_ID_PATTERN.test(value.nodeId)
-    || !isCanvasContentKind(value.kind)
-    || typeof value.contentId !== 'string'
-    || !CANVAS_CONTENT_ID_PATTERN.test(value.contentId)
-    || typeof value.title !== 'string'
-    || value.title.length > CANVAS_TRASH_TITLE_MAX_LENGTH
-    || !hasExactCanvasKeys(value.position, positionKeys)
-    || typeof value.position.x !== 'number'
-    || !Number.isFinite(value.position.x)
-    || typeof value.position.y !== 'number'
-    || !Number.isFinite(value.position.y)
-    || !isCanvasNonNegativeInteger(value.deletedRevision)
-    || !isCanvasNonNegativeInteger(value.deletedAt)) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('CANVAS_TRASH_ENTRY_INVALID')
   }
-  return {
-    schemaVersion: 1,
-    trashId: value.trashId,
-    nodeId: value.nodeId,
-    kind: value.kind,
-    contentId: value.contentId,
-    title: value.title,
-    position: { x: value.position.x, y: value.position.y },
-    deletedRevision: value.deletedRevision,
-    deletedAt: value.deletedAt,
+  /** 收窄后的回收条目用于按版本和 kind 选择 exact-key 分支。 */
+  const record = value as Record<string, unknown>
+  /** v1 兼容读取必须严格拒绝新旧字段混用。 */
+  const isLegacy = record.schemaVersion === 1 && hasExactCanvasKeys(record, legacyKeys)
+  /** v2 图片允许 adoptedAssetId 缺省，另外两类必须包含各自完整状态。 */
+  const hasV2Keys = record.schemaVersion === 2 && (
+    (record.kind === 'image'
+      && (hasExactCanvasKeys(record, baseKeys) || hasExactCanvasKeys(record, [...baseKeys, 'adoptedAssetId'])))
+    || (record.kind === 'document'
+      && hasExactCanvasKeys(record, [...baseKeys, 'contentRevision']))
+    || (record.kind === 'webview'
+      && hasExactCanvasKeys(record, [...baseKeys, 'contentRevision', 'devicePreset']))
+  )
+  if ((!isLegacy && !hasV2Keys)
+    || typeof record.trashId !== 'string'
+    || !CANVAS_CONTENT_ID_PATTERN.test(record.trashId)
+    || typeof record.nodeId !== 'string'
+    || !CANVAS_CONTENT_ID_PATTERN.test(record.nodeId)
+    || !isCanvasContentKind(record.kind)
+    || typeof record.contentId !== 'string'
+    || !CANVAS_CONTENT_ID_PATTERN.test(record.contentId)
+    || typeof record.title !== 'string'
+    || record.title.length > CANVAS_TRASH_TITLE_MAX_LENGTH
+    || !hasExactCanvasKeys(record.position, positionKeys)
+    || typeof record.position.x !== 'number'
+    || !Number.isFinite(record.position.x)
+    || typeof record.position.y !== 'number'
+    || !Number.isFinite(record.position.y)
+    || !isCanvasNonNegativeInteger(record.deletedRevision)
+    || !isCanvasNonNegativeInteger(record.deletedAt)) {
+    throw new Error('CANVAS_TRASH_ENTRY_INVALID')
   }
+  /** 已校验的共享字段用于构造 v2 规范化输出。 */
+  const base = {
+    schemaVersion: 2 as const,
+    trashId: record.trashId,
+    nodeId: record.nodeId,
+    contentId: record.contentId,
+    title: record.title,
+    position: { x: record.position.x, y: record.position.y },
+    deletedRevision: record.deletedRevision,
+    deletedAt: record.deletedAt,
+  }
+  if (record.kind === 'image') {
+    if (record.adoptedAssetId !== undefined && !isCanvasLifecycleId(record.adoptedAssetId)) {
+      throw new Error('CANVAS_TRASH_ENTRY_INVALID')
+    }
+    return {
+      ...base,
+      kind: 'image',
+      ...(record.adoptedAssetId === undefined ? {} : { adoptedAssetId: record.adoptedAssetId }),
+    }
+  }
+  if (record.kind === 'document') {
+    if (!isLegacy && !isCanvasNonNegativeInteger(record.contentRevision)) {
+      throw new Error('CANVAS_TRASH_ENTRY_INVALID')
+    }
+    return { ...base, kind: 'document', contentRevision: isLegacy ? 0 : record.contentRevision as number }
+  }
+  if (record.kind === 'webview') {
+    if (!isLegacy && (!isCanvasNonNegativeInteger(record.contentRevision)
+      || (record.devicePreset !== 'desktop' && record.devicePreset !== 'mobile'))) {
+      throw new Error('CANVAS_TRASH_ENTRY_INVALID')
+    }
+    return {
+      ...base,
+      kind: 'webview',
+      contentRevision: isLegacy ? 0 : record.contentRevision as number,
+      devicePreset: isLegacy ? 'desktop' : record.devicePreset as CanvasWebviewDevicePreset,
+    }
+  }
+  throw new Error('CANVAS_TRASH_ENTRY_INVALID')
+}
+
+/** Canvas 节点共享的展示和布局字段。 */
+export interface CanvasNodeUpstreamChange {
+  /** 本次变化的直接上游节点，按稳定 ID 排序且去重。 */
+  sourceNodeIds: string[]
+  /** 采用事务提交该提示的时间。 */
+  changedAt: number
 }
 
 /** Canvas 节点共享的展示和布局字段。 */
@@ -181,6 +295,8 @@ export interface CanvasNodeBase {
   kind: CanvasNodeKind
   title: string
   position: DesignPoint
+  /** 数据依赖上游已变化，节点内容需要用户决定是否更新。 */
+  upstreamChange?: CanvasNodeUpstreamChange
 }
 
 /** 引用独立 Agent 会话的节点，不复制消息或执行状态。 */
@@ -222,6 +338,7 @@ export interface CanvasWebviewNode extends CanvasNodeBase {
   kind: 'webview'
   prototypeId: string
   contentRevision: number
+  devicePreset: CanvasWebviewDevicePreset
   agentSessionId?: never
   imageModuleId?: never
   adoptedAssetId?: never
@@ -235,6 +352,21 @@ export type CanvasNode =
   | CanvasDocumentNode
   | CanvasWebviewNode
 
+/** 拥有独立内容事实源的 Canvas 节点联合。 */
+export type CanvasContentNode = CanvasImageNode | CanvasDocumentNode | CanvasWebviewNode
+
+/** Canvas 边表达的长期语义关系。 */
+export type CanvasEdgeRelation = 'association' | 'reference' | 'depends-on' | 'derives'
+
+/** 严格解析 Canvas 边语义。 */
+export function parseCanvasEdgeRelation(value: unknown): CanvasEdgeRelation {
+  if (value !== 'association' && value !== 'reference'
+    && value !== 'depends-on' && value !== 'derives') {
+    throw new Error('CANVAS_EDGE_RELATION_INVALID')
+  }
+  return value
+}
+
 /** 连接两个节点稳定端口的数据或任务边。 */
 export interface CanvasEdge {
   id: string
@@ -242,6 +374,7 @@ export interface CanvasEdge {
   sourcePort: string
   targetNodeId: string
   targetPort: string
+  relation: CanvasEdgeRelation
 }
 
 /** 一个项目中单个 Canvas 会话的独立图文档。 */
@@ -299,6 +432,13 @@ export interface RemoveCanvasEdgesMutation {
   edgeIds: string[]
 }
 
+/** 切换单个 WebView 节点的设备视口，不修改位置或 HTML 内容。 */
+export interface SetCanvasWebviewDevicePresetMutation {
+  type: 'set-webview-device-preset'
+  nodeId: string
+  devicePreset: CanvasWebviewDevicePreset
+}
+
 /** Canvas reducer 可按顺序应用的完整 mutation 联合。 */
 export type CanvasMutation =
   | SetCanvasViewportMutation
@@ -307,11 +447,116 @@ export type CanvasMutation =
   | RemoveCanvasNodesMutation
   | UpsertCanvasEdgesMutation
   | RemoveCanvasEdgesMutation
+  | SetCanvasWebviewDevicePresetMutation
 
 /** 原生 Canvas 文档的项目与会话双重身份。 */
 export interface CanvasTarget {
   projectId: string
   canvasId: string
+}
+
+/** 支持不可变正文修订的 Canvas 产物类别。 */
+export type CanvasTextArtifactKind = 'document' | 'webview'
+
+/** 用户直接创建的产物修订作者。 */
+export interface CanvasUserArtifactAuthor {
+  type: 'user'
+}
+
+/** Agent 工具创建的产物修订作者。 */
+export interface CanvasAgentArtifactAuthor {
+  type: 'agent'
+  sessionId: string
+  toolCallId: string
+}
+
+/** 产物修订的可信作者联合。 */
+export type CanvasArtifactAuthor = CanvasUserArtifactAuthor | CanvasAgentArtifactAuthor
+
+/** 文本产物在单张 Canvas 中的稳定业务身份。 */
+export interface CanvasTextArtifactIdentity extends CanvasTarget {
+  nodeId: string
+  kind: CanvasTextArtifactKind
+  contentId: string
+}
+
+/** 文本产物读取绑定的精确内容修订。 */
+export interface CanvasTextArtifactTarget extends CanvasTextArtifactIdentity {
+  contentRevision: number
+}
+
+/** 不可变产物修订的公开摘要。 */
+export interface CanvasArtifactRevisionSummary {
+  kind: CanvasTextArtifactKind
+  contentId: string
+  revision: number
+  parentRevision: number | null
+  contentHash: string
+  createdBy: CanvasArtifactAuthor
+  createdAt: number
+}
+
+/** 文本产物正文及其完整修订身份。 */
+export interface CanvasTextArtifactSnapshot {
+  target: CanvasTextArtifactTarget
+  revision: CanvasArtifactRevisionSummary
+  content: string
+}
+
+/** 在图和正文双重基线上创建新文本修订的输入。 */
+export interface UpdateCanvasTextArtifactInput extends CanvasTextArtifactIdentity {
+  operationId: string
+  expectedCanvasRevision: number
+  expectedContentRevision: number
+  content: string
+}
+
+/** 把历史文本修订重新设为节点当前修订的输入。 */
+export interface AdoptCanvasTextArtifactRevisionInput extends CanvasTextArtifactIdentity {
+  operationId: string
+  expectedCanvasRevision: number
+  expectedContentRevision: number
+  revision: number
+}
+
+/** 导出指定文档或 WebView 修订的输入。 */
+export interface ExportCanvasTextArtifactInput extends CanvasTextArtifactTarget {}
+
+/** 导出已采用图片素材的完整身份。 */
+export interface ExportCanvasImageArtifactInput extends CanvasImageTarget {
+  kind: 'image'
+  assetId: string
+}
+
+/** 三类可导出 Canvas 产物的严格输入联合。 */
+export type ExportCanvasArtifactInput =
+  | ExportCanvasTextArtifactInput
+  | ExportCanvasImageArtifactInput
+
+/** 加载单个 WebView 原型时绑定的完整节点与内容修订身份。 */
+export interface CanvasWebviewTarget extends CanvasTarget {
+  nodeId: string
+  prototypeId: string
+  contentRevision: number
+}
+
+/** Renderer 展开 WebView 节点后得到的受管 HTML 快照。 */
+export interface CanvasWebviewSnapshot {
+  target: CanvasWebviewTarget
+  html: string
+}
+
+/** 生成 WebView 静态卡片预览时绑定的完整图与内容身份。 */
+export interface CanvasWebviewPreviewTarget extends CanvasWebviewTarget {
+  devicePreset: CanvasWebviewDevicePreset
+}
+
+/** Renderer 可见的受管 WebView 静态预览，不暴露本地文件路径。 */
+export interface CanvasWebviewPreviewSnapshot {
+  target: CanvasWebviewPreviewTarget
+  previewUrl: string
+  width: number
+  height: number
 }
 
 /** 一个普通 Agent 会话在所属项目内关联的 Canvas 集合。 */
@@ -385,6 +630,38 @@ export interface CanvasRunNodesInput extends CanvasTarget {
   sourceSessionId: string
   sourceRunStartedAt: number
   sourceToolCallId: string
+}
+
+/** 单个 Canvas 节点执行后的有限审计结果，不包含图片素材身份。 */
+export interface CanvasToolNodeRunResult {
+  nodeId: string
+  status: 'started' | 'queued' | 'idle' | 'unsupported' | 'failed' | 'blocked' | 'rolled-back'
+  taskId?: string
+  message?: string
+  error?: string
+}
+
+/** 图片节点运行后交给 Agent 的候选批次摘要，明确要求在画布验收。 */
+export interface CanvasRunNodesBatchSummary {
+  batchId: string
+  status: CanvasImageCandidateBatchStatus
+  totalCount: number
+  candidateCount: number
+  failedCount: number
+  runningCount: number
+  requiresCanvasReview: true
+}
+
+/** 主进程运行边界返回任务审计和可选图片候选批次。 */
+export interface CanvasRunNodesResult {
+  tasks: CanvasToolNodeRunResult[]
+  batch?: CanvasRunNodesBatchSummary
+}
+
+/** `canvas_run_nodes` 工具向 Agent 返回的完整结构化结果。 */
+export interface CanvasRunNodesToolResult extends CanvasRunNodesResult {
+  canvasId: string
+  revision: number
 }
 
 /** 读取项目内全部 Agent-Canvas 关联的输入。 */
@@ -492,6 +769,13 @@ export interface CanvasImageJobControlInput extends CanvasImageTarget {
   jobId: string
 }
 
+/** 由主进程从成功任务与现存素材严格派生的图片版本事实。 */
+export interface CanvasImageArtifactVersion {
+  jobId: string
+  assetId: string
+  createdAt: number
+}
+
 /** Renderer 加载单个 Canvas 图片模块后得到的完整公开快照。 */
 export interface CanvasImageModuleSnapshot {
   target: CanvasImageTarget
@@ -499,9 +783,295 @@ export interface CanvasImageModuleSnapshot {
   config: CanvasImageModuleConfig
   jobs: DesignJobRecord[]
   assets: DesignAsset[]
+  imageVersions: CanvasImageArtifactVersion[]
   assetBaseUrl: string
   thumbnailBaseUrl: string
 }
+
+/** 图片候选批次按事实推进的公开状态。 */
+export type CanvasImageCandidateBatchStatus = 'running' | 'partial' | 'ready' | 'adopted' | 'abandoned'
+
+/** 单个目标在候选批次中的有限状态。 */
+export type CanvasImageCandidateEntryStatus =
+  | 'queued' | 'running' | 'candidate' | 'failed' | 'invalid' | 'adopted' | 'kept'
+
+/** 候选批次的创建入口。 */
+export type CanvasImageCandidateBatchSource = 'single' | 'canvas-tool'
+
+/** 候选批次中一个稳定图片节点的基线与输出事实。 */
+export interface CanvasImageCandidateBatchEntry {
+  nodeId: string
+  imageModuleId: string
+  initialAdoptedAssetId: string | null
+  initialConfigRevision: number
+  jobId: string
+  candidateAssetId: string | null
+  status: CanvasImageCandidateEntryStatus
+  error: string | null
+}
+
+/** 用户明确采用后保存的结果摘要。 */
+export interface CanvasImageCandidateBatchAdoption {
+  mode: 'all' | 'succeeded'
+  adoptedNodeIds: string[]
+  keptNodeIds: string[]
+  invalidatedDownstreamNodeIds: string[]
+  committedAt: number
+}
+
+/** 主进程持久化的完整图片候选批次。 */
+export interface CanvasImageCandidateBatch extends CanvasTarget {
+  schemaVersion: 1
+  batchId: string
+  source: CanvasImageCandidateBatchSource
+  sourceSessionId: string | null
+  sourceToolCallId: string | null
+  status: CanvasImageCandidateBatchStatus
+  entries: CanvasImageCandidateBatchEntry[]
+  adoption: CanvasImageCandidateBatchAdoption | null
+  createdAt: number
+  updatedAt: number
+}
+
+/** 初始 Canvas LOAD 使用的有界批次摘要。 */
+export interface CanvasImageCandidateBatchSummary extends CanvasTarget {
+  batchId: string
+  status: CanvasImageCandidateBatchStatus
+  /** 供画布按节点投影候选与运行状态的有界轻量事实。 */
+  entries: CanvasImageCandidateBatchSummaryEntry[]
+  totalCount: number
+  candidateCount: number
+  failedCount: number
+  runningCount: number
+  updatedAt: number
+}
+
+/** 初始 LOAD 中每个候选节点只公开定位与状态，不复制 Job、Asset 或错误正文。 */
+export interface CanvasImageCandidateBatchSummaryEntry {
+  nodeId: string
+  status: CanvasImageCandidateEntryStatus
+}
+
+/** 按稳定身份读取一个候选批次。 */
+export interface GetCanvasImageCandidateBatchInput extends CanvasTarget { batchId: string }
+
+/** 明确选择整批或成功项采用。 */
+export interface AdoptCanvasImageCandidateBatchInput extends GetCanvasImageCandidateBatchInput {
+  mode: 'all' | 'succeeded'
+}
+
+/** 只补齐未成功条目的操作输入。 */
+export interface ContinueCanvasImageCandidateBatchInput extends GetCanvasImageCandidateBatchInput {}
+
+/** 放弃活跃批次但保留历史候选。 */
+export interface AbandonCanvasImageCandidateBatchInput extends GetCanvasImageCandidateBatchInput {}
+
+/** 候选批次公开条目上限，约束 IPC 与磁盘解析开销。 */
+export const CANVAS_IMAGE_CANDIDATE_BATCH_ENTRY_LIMIT = 1000
+/** 初始 LOAD 返回的活跃批次摘要上限。 */
+export const CANVAS_IMAGE_CANDIDATE_BATCH_SUMMARY_LIMIT = 20
+
+/** 解析候选批次使用的固定公开状态集合。 */
+const CANVAS_IMAGE_CANDIDATE_BATCH_STATUSES: readonly CanvasImageCandidateBatchStatus[] = [
+  'running', 'partial', 'ready', 'adopted', 'abandoned',
+]
+/** 解析候选条目使用的固定公开状态集合。 */
+const CANVAS_IMAGE_CANDIDATE_ENTRY_STATUSES: readonly CanvasImageCandidateEntryStatus[] = [
+  'queued', 'running', 'candidate', 'failed', 'invalid', 'adopted', 'kept',
+]
+
+/** 严格解析单个候选条目。 */
+function parseCanvasImageCandidateBatchEntry(value: unknown): CanvasImageCandidateBatchEntry {
+  const keys = [
+    'nodeId', 'imageModuleId', 'initialAdoptedAssetId', 'initialConfigRevision',
+    'jobId', 'candidateAssetId', 'status', 'error',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.nodeId)
+    || !isCanvasLifecycleId(value.imageModuleId)
+    || (value.initialAdoptedAssetId !== null && !isCanvasLifecycleId(value.initialAdoptedAssetId))
+    || !isCanvasNonNegativeInteger(value.initialConfigRevision)
+    || !isCanvasLifecycleId(value.jobId)
+    || (value.candidateAssetId !== null && !isCanvasLifecycleId(value.candidateAssetId))
+    || !CANVAS_IMAGE_CANDIDATE_ENTRY_STATUSES.includes(value.status as CanvasImageCandidateEntryStatus)
+    || (value.error !== null && (typeof value.error !== 'string' || value.error.length > 1000))) {
+    throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+  }
+  return {
+    nodeId: value.nodeId,
+    imageModuleId: value.imageModuleId,
+    initialAdoptedAssetId: value.initialAdoptedAssetId as string | null,
+    initialConfigRevision: value.initialConfigRevision as number,
+    jobId: value.jobId,
+    candidateAssetId: value.candidateAssetId as string | null,
+    status: value.status as CanvasImageCandidateEntryStatus,
+    error: value.error as string | null,
+  }
+}
+
+/** 严格解析采用结果并稳定排序所有公开 ID。 */
+function parseCanvasImageCandidateBatchAdoption(value: unknown): CanvasImageCandidateBatchAdoption {
+  const keys = ['mode', 'adoptedNodeIds', 'keptNodeIds', 'invalidatedDownstreamNodeIds', 'committedAt'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || (value.mode !== 'all' && value.mode !== 'succeeded')
+    || !Array.isArray(value.adoptedNodeIds)
+    || !Array.isArray(value.keptNodeIds)
+    || !Array.isArray(value.invalidatedDownstreamNodeIds)
+    || !isCanvasNonNegativeInteger(value.committedAt)) {
+    throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+  }
+  /** 采用结果列表均有限且不允许重复或非法身份。 */
+  const parseIds = (values: unknown[]): string[] => {
+    if (values.length > CANVAS_IMAGE_CANDIDATE_BATCH_ENTRY_LIMIT
+      || values.some((item) => !isCanvasLifecycleId(item))) {
+      throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+    }
+    const ids = values as string[]
+    if (new Set(ids).size !== ids.length) throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+    return [...ids].sort((left, right) => left.localeCompare(right))
+  }
+  return {
+    mode: value.mode,
+    adoptedNodeIds: parseIds(value.adoptedNodeIds),
+    keptNodeIds: parseIds(value.keptNodeIds),
+    invalidatedDownstreamNodeIds: parseIds(value.invalidatedDownstreamNodeIds),
+    committedAt: value.committedAt as number,
+  }
+}
+
+/** 严格解析完整候选批次并重建深隔离值。 */
+export function parseCanvasImageCandidateBatch(value: unknown): CanvasImageCandidateBatch {
+  try {
+    const keys = [
+      'schemaVersion', 'batchId', 'projectId', 'canvasId', 'source', 'sourceSessionId',
+      'sourceToolCallId', 'status', 'entries', 'adoption', 'createdAt', 'updatedAt',
+    ] as const
+    if (!hasExactCanvasKeys(value, keys)
+      || value.schemaVersion !== 1
+      || !isCanvasLifecycleId(value.batchId)
+      || !isCanvasLifecycleId(value.projectId)
+      || !isCanvasLifecycleId(value.canvasId)
+      || (value.source !== 'single' && value.source !== 'canvas-tool')
+      || (value.sourceSessionId !== null && !isCanvasLifecycleId(value.sourceSessionId))
+      || (value.sourceToolCallId !== null && !isCanvasLifecycleId(value.sourceToolCallId))
+      || !CANVAS_IMAGE_CANDIDATE_BATCH_STATUSES.includes(value.status as CanvasImageCandidateBatchStatus)
+      || !Array.isArray(value.entries)
+      || value.entries.length < 1
+      || value.entries.length > CANVAS_IMAGE_CANDIDATE_BATCH_ENTRY_LIMIT
+      || !isCanvasNonNegativeInteger(value.createdAt)
+      || !isCanvasNonNegativeInteger(value.updatedAt)
+      || (value.updatedAt as number) < (value.createdAt as number)) {
+      throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+    }
+    const entries = value.entries.map(parseCanvasImageCandidateBatchEntry)
+      .sort((left, right) => left.nodeId.localeCompare(right.nodeId) || left.jobId.localeCompare(right.jobId))
+    if (new Set(entries.map((entry) => entry.nodeId)).size !== entries.length
+      || new Set(entries.map((entry) => entry.jobId)).size !== entries.length) {
+      throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+    }
+    const adoption = value.adoption === null ? null : parseCanvasImageCandidateBatchAdoption(value.adoption)
+    if ((value.status === 'adopted') !== (adoption !== null)) {
+      throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+    }
+    return {
+      schemaVersion: 1,
+      batchId: value.batchId,
+      projectId: value.projectId,
+      canvasId: value.canvasId,
+      source: value.source,
+      sourceSessionId: value.sourceSessionId as string | null,
+      sourceToolCallId: value.sourceToolCallId as string | null,
+      status: value.status as CanvasImageCandidateBatchStatus,
+      entries,
+      adoption,
+      createdAt: value.createdAt as number,
+      updatedAt: value.updatedAt as number,
+    }
+  } catch (error) {
+    throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID', { cause: error })
+  }
+}
+
+/** 严格解析初始 LOAD 使用的候选批次摘要。 */
+export function parseCanvasImageCandidateBatchSummary(value: unknown): CanvasImageCandidateBatchSummary {
+  const keys = [
+    'batchId', 'projectId', 'canvasId', 'status', 'totalCount', 'candidateCount',
+    'failedCount', 'runningCount', 'updatedAt', 'entries',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.batchId)
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !CANVAS_IMAGE_CANDIDATE_BATCH_STATUSES.includes(value.status as CanvasImageCandidateBatchStatus)
+    || !isCanvasNonNegativeInteger(value.totalCount)
+    || !isCanvasNonNegativeInteger(value.candidateCount)
+    || !isCanvasNonNegativeInteger(value.failedCount)
+    || !isCanvasNonNegativeInteger(value.runningCount)
+    || !Array.isArray(value.entries)
+    || (value.totalCount as number) > CANVAS_IMAGE_CANDIDATE_BATCH_ENTRY_LIMIT
+    || (value.candidateCount as number) + (value.failedCount as number) + (value.runningCount as number) > (value.totalCount as number)
+    || !isCanvasNonNegativeInteger(value.updatedAt)) {
+    throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+  }
+  /** 摘要条目必须与总数闭合，且每个节点只出现一次。 */
+  const entries = value.entries.map((entry): CanvasImageCandidateBatchSummaryEntry => {
+    if (!hasExactCanvasKeys(entry, ['nodeId', 'status'])
+      || !isCanvasLifecycleId(entry.nodeId)
+      || !CANVAS_IMAGE_CANDIDATE_ENTRY_STATUSES.includes(entry.status as CanvasImageCandidateEntryStatus)) {
+      throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+    }
+    return { nodeId: entry.nodeId, status: entry.status as CanvasImageCandidateEntryStatus }
+  }).sort((left, right) => left.nodeId.localeCompare(right.nodeId))
+  const candidateCount = entries.filter((entry) => entry.status === 'candidate').length
+  const failedCount = entries.filter((entry) => entry.status === 'failed' || entry.status === 'invalid').length
+  const runningCount = entries.filter((entry) => entry.status === 'queued' || entry.status === 'running').length
+  if (entries.length !== value.totalCount
+    || new Set(entries.map((entry) => entry.nodeId)).size !== entries.length
+    || candidateCount !== value.candidateCount
+    || failedCount !== value.failedCount
+    || runningCount !== value.runningCount) {
+    throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+  }
+  return {
+    batchId: value.batchId,
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    status: value.status as CanvasImageCandidateBatchStatus,
+    entries,
+    totalCount: value.totalCount as number,
+    candidateCount: value.candidateCount as number,
+    failedCount: value.failedCount as number,
+    runningCount: value.runningCount as number,
+    updatedAt: value.updatedAt as number,
+  }
+}
+
+/** 严格解析候选批次稳定身份。 */
+export function parseGetCanvasImageCandidateBatchInput(value: unknown): GetCanvasImageCandidateBatchInput {
+  if (!hasExactCanvasKeys(value, ['projectId', 'canvasId', 'batchId'])
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasLifecycleId(value.batchId)) {
+    throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INPUT_INVALID')
+  }
+  return { projectId: value.projectId, canvasId: value.canvasId, batchId: value.batchId }
+}
+
+/** 严格解析候选批次采用模式。 */
+export function parseAdoptCanvasImageCandidateBatchInput(value: unknown): AdoptCanvasImageCandidateBatchInput {
+  if (!hasExactCanvasKeys(value, ['projectId', 'canvasId', 'batchId', 'mode'])
+    || (value.mode !== 'all' && value.mode !== 'succeeded')) {
+    throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INPUT_INVALID')
+  }
+  return { ...parseGetCanvasImageCandidateBatchInput({
+    projectId: value.projectId, canvasId: value.canvasId, batchId: value.batchId,
+  }), mode: value.mode }
+}
+
+/** 严格解析继续补齐输入。 */
+export const parseContinueCanvasImageCandidateBatchInput = parseGetCanvasImageCandidateBatchInput
+/** 严格解析放弃批次输入。 */
+export const parseAbandonCanvasImageCandidateBatchInput = parseGetCanvasImageCandidateBatchInput
 
 /** Design Job 固化的结构化图片生成约束。 */
 export interface DesignGenerationConstraints {
@@ -540,6 +1110,8 @@ export interface CanvasNodeIssue {
 /** Renderer 可见的 Canvas 业务错误码。 */
 export type CanvasPublicErrorCode =
   | 'CANVAS_LOAD_FAILED'
+  | 'CANVAS_WEBVIEW_LOAD_FAILED'
+  | 'CANVAS_WEBVIEW_PREVIEW_FAILED'
   | 'CANVAS_SAVE_FAILED'
   | 'CANVAS_CREATE_FAILED'
   | 'CANVAS_CONTENT_INVALID'
@@ -555,6 +1127,13 @@ export type CanvasPublicErrorCode =
   | 'CANVAS_IMAGE_SAVE_FAILED'
   | 'CANVAS_IMAGE_JOB_FAILED'
   | 'CANVAS_IMAGE_REVISION_CONFLICT'
+  | 'CANVAS_IMAGE_BATCH_CONFLICT'
+  | 'CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED'
+  | 'CANVAS_IMAGE_BATCH_INVALID'
+  | 'CANVAS_ARTIFACT_LOAD_FAILED'
+  | 'CANVAS_ARTIFACT_SAVE_FAILED'
+  | 'CANVAS_ARTIFACT_REVISION_CONFLICT'
+  | 'CANVAS_ARTIFACT_EXPORT_FAILED'
   | 'CANVAS_BINDING_LIST_FAILED'
   | 'CANVAS_BINDING_FAILED'
 
@@ -612,16 +1191,303 @@ export interface CanvasAgentMessagesResult {
 /** 加载单个原生 Canvas 文档的公开输入。 */
 export interface LoadCanvasInput extends CanvasTarget {}
 
+/** 严格解析 WebView 节点完整身份，拒绝额外字段和过期修订格式。 */
+export function parseCanvasWebviewTarget(value: unknown): CanvasWebviewTarget {
+  /** WebView 读取只接受用于复核节点与受管内容的完整字段集合。 */
+  const keys = ['projectId', 'canvasId', 'nodeId', 'prototypeId', 'contentRevision'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasLifecycleId(value.nodeId)
+    || !isCanvasLifecycleId(value.prototypeId)
+    || !isCanvasNonNegativeInteger(value.contentRevision)) {
+    throw new Error('CANVAS_WEBVIEW_TARGET_INVALID')
+  }
+  return {
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    prototypeId: value.prototypeId,
+    contentRevision: value.contentRevision,
+  }
+}
+
+/** 严格解析 WebView 静态预览的完整目标身份。 */
+export function parseCanvasWebviewPreviewTarget(value: unknown): CanvasWebviewPreviewTarget {
+  const keys = [
+    'projectId', 'canvasId', 'nodeId', 'prototypeId', 'contentRevision', 'devicePreset',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasLifecycleId(value.nodeId)
+    || !isCanvasLifecycleId(value.prototypeId)
+    || !isCanvasNonNegativeInteger(value.contentRevision)
+    || (value.devicePreset !== 'desktop' && value.devicePreset !== 'mobile')) {
+    throw new Error('CANVAS_WEBVIEW_PREVIEW_TARGET_INVALID')
+  }
+  return {
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    prototypeId: value.prototypeId,
+    contentRevision: value.contentRevision,
+    devicePreset: value.devicePreset,
+  }
+}
+
+/** 严格解析 Renderer 可见的 WebView 静态预览快照。 */
+export function parseCanvasWebviewPreviewSnapshot(value: unknown): CanvasWebviewPreviewSnapshot {
+  const keys = ['target', 'previewUrl', 'width', 'height'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || typeof value.previewUrl !== 'string'
+    || value.previewUrl.length === 0
+    || !Number.isSafeInteger(value.width)
+    || (value.width as number) <= 0
+    || !Number.isSafeInteger(value.height)
+    || (value.height as number) <= 0) {
+    throw new Error('CANVAS_WEBVIEW_PREVIEW_SNAPSHOT_INVALID')
+  }
+  try {
+    return {
+      target: parseCanvasWebviewPreviewTarget(value.target),
+      previewUrl: value.previewUrl,
+      width: value.width as number,
+      height: value.height as number,
+    }
+  } catch (error) {
+    throw new Error('CANVAS_WEBVIEW_PREVIEW_SNAPSHOT_INVALID', { cause: error })
+  }
+}
+
 /** 在指定权威 revision 上保存一批 Canvas mutation。 */
 export interface SaveCanvasMutationsInput extends CanvasTarget {
   expectedRevision: number
   mutations: CanvasMutation[]
 }
 
+/** 判断未知值是否为文本产物类别。 */
+function isCanvasTextArtifactKind(value: unknown): value is CanvasTextArtifactKind {
+  return value === 'document' || value === 'webview'
+}
+
+/** 判断文本正文是否位于 UTF-8 256 KiB 边界内。 */
+function isCanvasTextArtifactContent(value: unknown): value is string {
+  return typeof value === 'string'
+    && new TextEncoder().encode(value).byteLength <= CANVAS_TEXT_ARTIFACT_CONTENT_MAX_BYTES
+}
+
+/** 按指定错误码严格解析文本产物稳定身份。 */
+function parseCanvasTextArtifactIdentityWithError(
+  value: unknown,
+  errorCode: string,
+): CanvasTextArtifactIdentity {
+  /** 文本产物身份允许的完整字段集合。 */
+  const keys = ['projectId', 'canvasId', 'nodeId', 'kind', 'contentId'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasLifecycleId(value.nodeId)
+    || !isCanvasTextArtifactKind(value.kind)
+    || !isCanvasLifecycleId(value.contentId)) {
+    throw new Error(errorCode)
+  }
+  return {
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    kind: value.kind,
+    contentId: value.contentId,
+  }
+}
+
+/** 严格解析文本产物稳定身份。 */
+export function parseCanvasTextArtifactIdentity(value: unknown): CanvasTextArtifactIdentity {
+  return parseCanvasTextArtifactIdentityWithError(value, 'CANVAS_TEXT_ARTIFACT_IDENTITY_INVALID')
+}
+
+/** 严格解析文本产物精确修订目标。 */
+export function parseCanvasTextArtifactTarget(value: unknown): CanvasTextArtifactTarget {
+  /** 精确目标在稳定身份之外必须携带内容修订。 */
+  const keys = ['projectId', 'canvasId', 'nodeId', 'kind', 'contentId', 'contentRevision'] as const
+  if (!hasExactCanvasKeys(value, keys) || !isCanvasNonNegativeInteger(value.contentRevision)) {
+    throw new Error('CANVAS_TEXT_ARTIFACT_TARGET_INVALID')
+  }
+  /** 去除修订后复用唯一的稳定身份校验。 */
+  const identity = parseCanvasTextArtifactIdentityWithError({
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    kind: value.kind,
+    contentId: value.contentId,
+  }, 'CANVAS_TEXT_ARTIFACT_TARGET_INVALID')
+  return { ...identity, contentRevision: value.contentRevision }
+}
+
+/** 严格解析产物修订作者。 */
+export function parseCanvasArtifactAuthor(value: unknown): CanvasArtifactAuthor {
+  if (hasExactCanvasKeys(value, ['type']) && value.type === 'user') return { type: 'user' }
+  if (hasExactCanvasKeys(value, ['type', 'sessionId', 'toolCallId'])
+    && value.type === 'agent'
+    && isCanvasLifecycleId(value.sessionId)
+    && isCanvasLifecycleId(value.toolCallId)) {
+    return { type: 'agent', sessionId: value.sessionId, toolCallId: value.toolCallId }
+  }
+  throw new Error('CANVAS_ARTIFACT_AUTHOR_INVALID')
+}
+
+/** 严格解析不可变产物修订摘要。 */
+export function parseCanvasArtifactRevisionSummary(value: unknown): CanvasArtifactRevisionSummary {
+  /** 修订摘要只允许公开的版本事实字段。 */
+  const keys = [
+    'kind', 'contentId', 'revision', 'parentRevision', 'contentHash', 'createdBy', 'createdAt',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasTextArtifactKind(value.kind)
+    || !isCanvasLifecycleId(value.contentId)
+    || !isCanvasNonNegativeInteger(value.revision)
+    || !(value.parentRevision === null || isCanvasNonNegativeInteger(value.parentRevision))
+    || typeof value.contentHash !== 'string'
+    || !/^[0-9a-f]{64}$/i.test(value.contentHash)
+    || !isCanvasNonNegativeInteger(value.createdAt)) {
+    throw new Error('CANVAS_ARTIFACT_REVISION_SUMMARY_INVALID')
+  }
+  try {
+    return {
+      kind: value.kind,
+      contentId: value.contentId,
+      revision: value.revision,
+      parentRevision: value.parentRevision,
+      contentHash: value.contentHash,
+      createdBy: parseCanvasArtifactAuthor(value.createdBy),
+      createdAt: value.createdAt,
+    }
+  } catch (error) {
+    throw new Error('CANVAS_ARTIFACT_REVISION_SUMMARY_INVALID', { cause: error })
+  }
+}
+
+/** 严格解析文本产物正文快照。 */
+export function parseCanvasTextArtifactSnapshot(value: unknown): CanvasTextArtifactSnapshot {
+  if (!hasExactCanvasKeys(value, ['target', 'revision', 'content'])
+    || !isCanvasTextArtifactContent(value.content)) {
+    throw new Error('CANVAS_TEXT_ARTIFACT_SNAPSHOT_INVALID')
+  }
+  try {
+    /** 快照目标与修订摘要必须描述同一内容及采用修订。 */
+    const target = parseCanvasTextArtifactTarget(value.target)
+    /** 公开修订摘要按自身 exact-key 合同重建。 */
+    const revision = parseCanvasArtifactRevisionSummary(value.revision)
+    if (target.kind !== revision.kind
+      || target.contentId !== revision.contentId
+      || target.contentRevision !== revision.revision) {
+      throw new Error('CANVAS_TEXT_ARTIFACT_SNAPSHOT_INVALID')
+    }
+    return { target, revision, content: value.content }
+  } catch (error) {
+    throw new Error('CANVAS_TEXT_ARTIFACT_SNAPSHOT_INVALID', { cause: error })
+  }
+}
+
+/** 严格解析文本产物更新输入。 */
+export function parseUpdateCanvasTextArtifactInput(value: unknown): UpdateCanvasTextArtifactInput {
+  /** 更新输入必须同时绑定图 revision、正文 revision 和幂等 UUID。 */
+  const keys = [
+    'projectId', 'canvasId', 'nodeId', 'kind', 'contentId', 'operationId',
+    'expectedCanvasRevision', 'expectedContentRevision', 'content',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || typeof value.operationId !== 'string'
+    || !CANVAS_OPERATION_ID_PATTERN.test(value.operationId)
+    || !isCanvasNonNegativeInteger(value.expectedCanvasRevision)
+    || !isCanvasNonNegativeInteger(value.expectedContentRevision)
+    || !isCanvasTextArtifactContent(value.content)) {
+    throw new Error('CANVAS_TEXT_ARTIFACT_UPDATE_INPUT_INVALID')
+  }
+  /** 复用稳定身份规则，禁止更新命令漂移出安全 ID 边界。 */
+  const identity = parseCanvasTextArtifactIdentityWithError({
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    kind: value.kind,
+    contentId: value.contentId,
+  }, 'CANVAS_TEXT_ARTIFACT_UPDATE_INPUT_INVALID')
+  return {
+    ...identity,
+    operationId: value.operationId,
+    expectedCanvasRevision: value.expectedCanvasRevision,
+    expectedContentRevision: value.expectedContentRevision,
+    content: value.content,
+  }
+}
+
+/** 严格解析文本产物历史修订采用输入。 */
+export function parseAdoptCanvasTextArtifactRevisionInput(
+  value: unknown,
+): AdoptCanvasTextArtifactRevisionInput {
+  /** 采用命令必须显式声明当前双重基线和目标修订。 */
+  const keys = [
+    'projectId', 'canvasId', 'nodeId', 'kind', 'contentId', 'operationId',
+    'expectedCanvasRevision', 'expectedContentRevision', 'revision',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || typeof value.operationId !== 'string'
+    || !CANVAS_OPERATION_ID_PATTERN.test(value.operationId)
+    || !isCanvasNonNegativeInteger(value.expectedCanvasRevision)
+    || !isCanvasNonNegativeInteger(value.expectedContentRevision)
+    || !isCanvasNonNegativeInteger(value.revision)) {
+    throw new Error('CANVAS_TEXT_ARTIFACT_ADOPT_INPUT_INVALID')
+  }
+  /** 复用稳定身份规则，避免采用命令和读取目标的 ID 规则分叉。 */
+  const identity = parseCanvasTextArtifactIdentityWithError({
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    nodeId: value.nodeId,
+    kind: value.kind,
+    contentId: value.contentId,
+  }, 'CANVAS_TEXT_ARTIFACT_ADOPT_INPUT_INVALID')
+  return {
+    ...identity,
+    operationId: value.operationId,
+    expectedCanvasRevision: value.expectedCanvasRevision,
+    expectedContentRevision: value.expectedContentRevision,
+    revision: value.revision,
+  }
+}
+
+/** 严格解析文档、WebView 或图片导出输入。 */
+export function parseExportCanvasArtifactInput(value: unknown): ExportCanvasArtifactInput {
+  if (hasExactCanvasKeys(value, [
+    'projectId', 'canvasId', 'nodeId', 'kind', 'contentId', 'contentRevision',
+  ]) && isCanvasTextArtifactKind(value.kind)) {
+    return parseCanvasTextArtifactTarget(value)
+  }
+  if (hasExactCanvasKeys(value, [
+    'projectId', 'canvasId', 'nodeId', 'kind', 'imageModuleId', 'assetId',
+  ])
+    && value.kind === 'image'
+    && isCanvasLifecycleId(value.projectId)
+    && isCanvasLifecycleId(value.canvasId)
+    && isCanvasLifecycleId(value.nodeId)
+    && isCanvasLifecycleId(value.imageModuleId)
+    && isCanvasLifecycleId(value.assetId)) {
+    return {
+      projectId: value.projectId,
+      canvasId: value.canvasId,
+      nodeId: value.nodeId,
+      kind: 'image',
+      imageModuleId: value.imageModuleId,
+      assetId: value.assetId,
+    }
+  }
+  throw new Error('CANVAS_ARTIFACT_EXPORT_INPUT_INVALID')
+}
+
 /** 从源节点创建下游节点时使用的稳定关系身份。 */
 export interface CreateCanvasAgentNodeRelationship {
   sourceNodeId: string
   edgeId: string
+  relation: CanvasEdgeRelation
 }
 
 /** 幂等创建非 Agent 内容节点的严格输入。 */
@@ -782,6 +1648,409 @@ export function parseCanvasImageModuleConfig(value: unknown): CanvasImageModuleC
     imageSize: value.imageSize,
     contextMode: value.contextMode,
     adoptedAssetId: value.adoptedAssetId,
+  }
+}
+
+/** 判断未知文本是否可安全进入图片公开快照。 */
+function isCanvasImageSnapshotText(value: unknown, maxLength = CANVAS_IMAGE_PROMPT_MAX_LENGTH): value is string {
+  return typeof value === 'string' && value.length <= maxLength
+}
+
+/** 判断持久化相对路径不会泄漏绝对路径或越出受管目录。 */
+function isCanvasImagePublicRelativePath(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 1_024
+    || value.startsWith('/') || value.includes('\\')) return false
+  /** 相对路径逐段拒绝空段、当前目录和父目录。 */
+  const segments = value.split('/')
+  return segments.every((segment) => segment.length > 0 && segment !== '.' && segment !== '..')
+}
+
+/** 判断媒体授权根是有界的非 file URL，不接受本地绝对路径。 */
+function isCanvasImageMediaBaseUrl(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length <= 2_048
+    && /^[a-z][a-z0-9+.-]*:\/\/[^\s/\\]+(?:\/[^\s\\]*)?$/iu.test(value)
+    && !value.toLowerCase().startsWith('file://')
+}
+
+/** 严格重建图片快照中的公开素材元数据。 */
+function parseCanvasImageSnapshotAsset(value: unknown): DesignAsset {
+  /** 素材可选字段只在真实存在时加入 exact-key 合同。 */
+  const optionalKeys = [
+    'sourceSessionId', 'sourceJobId', 'prompt', 'parentAssetId',
+  ].filter((key) => value !== null && typeof value === 'object' && Object.hasOwn(value, key))
+  const keys = [
+    'id', 'filename', 'relativePath', 'thumbnailRelativePath', 'mediaType',
+    'width', 'height', 'byteSize', 'sha256', 'createdAt', ...optionalKeys,
+  ]
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.id)
+    || !isCanvasImagePublicRelativePath(value.filename) || value.filename.includes('/')
+    || !isCanvasImagePublicRelativePath(value.relativePath)
+    || !isCanvasImagePublicRelativePath(value.thumbnailRelativePath)
+    || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(String(value.mediaType))
+    || !Number.isSafeInteger(value.width) || (value.width as number) < 1
+    || !Number.isSafeInteger(value.height) || (value.height as number) < 1
+    || !Number.isSafeInteger(value.byteSize) || (value.byteSize as number) < 0
+    || typeof value.sha256 !== 'string' || !/^[0-9a-f]{64}$/iu.test(value.sha256)
+    || !isCanvasNonNegativeInteger(value.createdAt)
+    || (Object.hasOwn(value, 'sourceSessionId') && !isCanvasLifecycleId(value.sourceSessionId))
+    || (Object.hasOwn(value, 'sourceJobId') && !isCanvasLifecycleId(value.sourceJobId))
+    || (Object.hasOwn(value, 'prompt') && !isCanvasImageSnapshotText(value.prompt))
+    || (Object.hasOwn(value, 'parentAssetId') && !isCanvasLifecycleId(value.parentAssetId))) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  return {
+    id: value.id,
+    filename: value.filename,
+    relativePath: value.relativePath,
+    thumbnailRelativePath: value.thumbnailRelativePath,
+    mediaType: value.mediaType as DesignAsset['mediaType'],
+    width: value.width as number,
+    height: value.height as number,
+    byteSize: value.byteSize as number,
+    sha256: value.sha256,
+    createdAt: value.createdAt,
+    ...(Object.hasOwn(value, 'sourceSessionId') ? { sourceSessionId: value.sourceSessionId as string } : {}),
+    ...(Object.hasOwn(value, 'sourceJobId') ? { sourceJobId: value.sourceJobId as string } : {}),
+    ...(Object.hasOwn(value, 'prompt') ? { prompt: value.prompt as string } : {}),
+    ...(Object.hasOwn(value, 'parentAssetId') ? { parentAssetId: value.parentAssetId as string } : {}),
+  }
+}
+
+/** 严格重建图片任务固化的生图模型公开快照。 */
+function parseCanvasImageModelSnapshot(value: unknown): ImageGenerationModelSnapshot {
+  if (hasExactCanvasKeys(value, ['profileId', 'name', 'modelId', 'executor'])
+    && isCanvasLifecycleId(value.profileId)
+    && isCanvasImageSnapshotText(value.name, 128)
+    && isCanvasImageSnapshotText(value.modelId, 256)
+    && value.executor === 'nano-banana') {
+    return { profileId: value.profileId, name: value.name, modelId: value.modelId, executor: 'nano-banana' }
+  }
+  if (hasExactCanvasKeys(value, ['profileId', 'name', 'modelId', 'executor', 'channelId'])
+    && isCanvasLifecycleId(value.profileId)
+    && isCanvasImageSnapshotText(value.name, 128)
+    && isCanvasImageSnapshotText(value.modelId, 256)
+    && value.executor === 'openai-images'
+    && isCanvasLifecycleId(value.channelId)) {
+    return {
+      profileId: value.profileId, name: value.name, modelId: value.modelId,
+      executor: 'openai-images', channelId: value.channelId,
+    }
+  }
+  throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+}
+
+/** 严格重建图片任务实际读取的单条创作上下文引用。 */
+function parseCanvasImageContextReference(value: unknown): DesignContextReference {
+  /** 上下文引用的两类可选定位字段按存在性纳入 exact-key。 */
+  const optionalKeys = ['relativePath', 'assetId']
+    .filter((key) => value !== null && typeof value === 'object' && Object.hasOwn(value, key))
+  const keys = ['id', 'category', 'sourceKind', 'label', 'purpose', 'readAt', ...optionalKeys]
+  const categories = ['brand', 'product', 'code', 'character', 'story', 'scene', 'continuity', 'reference']
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.id)
+    || !categories.includes(String(value.category))
+    || !['project-file', 'context-document', 'design-asset'].includes(String(value.sourceKind))
+    || !isCanvasImageSnapshotText(value.label, 1_024)
+    || !isCanvasImageSnapshotText(value.purpose, 4_096)
+    || !isCanvasNonNegativeInteger(value.readAt)
+    || (Object.hasOwn(value, 'relativePath') && !isCanvasImagePublicRelativePath(value.relativePath))
+    || (Object.hasOwn(value, 'assetId') && !isCanvasLifecycleId(value.assetId))) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  return {
+    id: value.id,
+    category: value.category as DesignContextReference['category'],
+    sourceKind: value.sourceKind as DesignContextReference['sourceKind'],
+    label: value.label,
+    purpose: value.purpose,
+    readAt: value.readAt,
+    ...(Object.hasOwn(value, 'relativePath') ? { relativePath: value.relativePath as string } : {}),
+    ...(Object.hasOwn(value, 'assetId') ? { assetId: value.assetId as string } : {}),
+  }
+}
+
+/** 严格重建图片任务的一条直接上游引用。 */
+function parseCanvasImageSnapshotInputReference(value: unknown): CanvasImageInputReference {
+  /** 只有图片上游允许额外携带 adopted 素材身份。 */
+  const keys = value !== null && typeof value === 'object' && Object.hasOwn(value, 'assetId')
+    ? ['nodeId', 'kind', 'revision', 'summary', 'summaryHash', 'assetId']
+    : ['nodeId', 'kind', 'revision', 'summary', 'summaryHash']
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.nodeId)
+    || !['agent', 'image', 'document', 'webview'].includes(String(value.kind))
+    || !isCanvasNonNegativeInteger(value.revision)
+    || !isCanvasImageSnapshotText(value.summary, 8_192)
+    || typeof value.summaryHash !== 'string' || !/^[0-9a-f]{64}$/iu.test(value.summaryHash)
+    || (Object.hasOwn(value, 'assetId') && !isCanvasLifecycleId(value.assetId))) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  return {
+    nodeId: value.nodeId,
+    kind: value.kind as CanvasNodeKind,
+    revision: value.revision,
+    summary: value.summary,
+    summaryHash: value.summaryHash,
+    ...(Object.hasOwn(value, 'assetId') ? { assetId: value.assetId as string } : {}),
+  }
+}
+
+/** 严格重建单个 Canvas 图片任务公开记录。 */
+function parseCanvasImageSnapshotJob(value: unknown, target: CanvasImageTarget): DesignJobRecord {
+  const optionalKeys = [
+    'sessionId', 'generationConstraints', 'canvasInputReferences', 'canvasImageConfigRevision',
+    'candidateBatchId',
+    'sourceAgentMessageId', 'imageModelSnapshot', 'sourceSessionId', 'sourceAssetId',
+    'parentAssetId', 'outputAssetId', 'error', 'traceState', 'executionSessionCleanupState',
+    'startedAt', 'completedAt', 'contextReferences', 'designSummary', 'finalImagePrompt',
+    'rawThinkingAvailable', 'contextWarning',
+  ].filter((key) => value !== null && typeof value === 'object' && Object.hasOwn(value, key))
+  const keys = [
+    'id', 'creativeTaskId', 'attemptNumber', 'projectId', 'target', 'action', 'status',
+    'prompt', 'originalRequest', 'contextMode', 'createdAt', 'updatedAt', ...optionalKeys,
+  ]
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.id)
+    || !isCanvasLifecycleId(value.creativeTaskId)
+    || !Number.isSafeInteger(value.attemptNumber) || (value.attemptNumber as number) < 1
+    || value.projectId !== target.projectId
+    || !hasExactCanvasKeys(value.target, ['kind', 'canvasId', 'nodeId', 'imageModuleId'])
+    || value.target.kind !== 'canvas-image'
+    || value.target.canvasId !== target.canvasId
+    || value.target.nodeId !== target.nodeId
+    || value.target.imageModuleId !== target.imageModuleId
+    || !['generate', 'edit'].includes(String(value.action))
+    || !['queued', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(value.status))
+    || !isCanvasImageSnapshotText(value.prompt)
+    || !isCanvasImageSnapshotText(value.originalRequest)
+    || !isCanvasImageContextMode(value.contextMode)
+    || !isCanvasNonNegativeInteger(value.createdAt)
+    || !isCanvasNonNegativeInteger(value.updatedAt)) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  /** 可选 ID 字段统一使用稳定身份边界。 */
+  for (const key of [
+    'sessionId', 'sourceAgentMessageId', 'sourceSessionId', 'sourceAssetId',
+    'parentAssetId', 'outputAssetId', 'candidateBatchId',
+  ]) {
+    if (Object.hasOwn(value, key) && !isCanvasLifecycleId(value[key])) {
+      throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+    }
+  }
+  if (Object.hasOwn(value, 'generationConstraints')
+    && (!hasExactCanvasKeys(value.generationConstraints, ['aspectRatio', 'imageSize'])
+      || !isCanvasImageAspectRatio(value.generationConstraints.aspectRatio)
+      || !isCanvasImageSize(value.generationConstraints.imageSize))) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  if (Object.hasOwn(value, 'canvasInputReferences')
+    && (!Array.isArray(value.canvasInputReferences) || value.canvasInputReferences.length > 32)) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  /** 上游引用逐项严格重建。 */
+  const canvasInputReferences = Object.hasOwn(value, 'canvasInputReferences')
+    ? (value.canvasInputReferences as unknown[]).map(parseCanvasImageSnapshotInputReference)
+    : undefined
+  if (Object.hasOwn(value, 'canvasImageConfigRevision')
+    && !isCanvasNonNegativeInteger(value.canvasImageConfigRevision)) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  /** 固化模型只在字段存在时解析。 */
+  const imageModelSnapshot = Object.hasOwn(value, 'imageModelSnapshot')
+    ? parseCanvasImageModelSnapshot(value.imageModelSnapshot)
+    : undefined
+  if ((Object.hasOwn(value, 'error') && !isCanvasImageSnapshotText(value.error))
+    || (Object.hasOwn(value, 'traceState') && !['pending', 'ready', 'unavailable'].includes(String(value.traceState)))
+    || (Object.hasOwn(value, 'executionSessionCleanupState') && !['pending', 'completed'].includes(String(value.executionSessionCleanupState)))
+    || (Object.hasOwn(value, 'startedAt') && !isCanvasNonNegativeInteger(value.startedAt))
+    || (Object.hasOwn(value, 'completedAt') && !isCanvasNonNegativeInteger(value.completedAt))
+    || (Object.hasOwn(value, 'designSummary') && !isCanvasImageSnapshotText(value.designSummary))
+    || (Object.hasOwn(value, 'finalImagePrompt') && !isCanvasImageSnapshotText(value.finalImagePrompt))
+    || (Object.hasOwn(value, 'rawThinkingAvailable') && typeof value.rawThinkingAvailable !== 'boolean')
+    || (Object.hasOwn(value, 'contextWarning') && !isCanvasImageSnapshotText(value.contextWarning))) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  if (Object.hasOwn(value, 'contextReferences')
+    && (!Array.isArray(value.contextReferences) || value.contextReferences.length > 256)) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  /** 创作上下文逐项严格重建。 */
+  const contextReferences = Object.hasOwn(value, 'contextReferences')
+    ? (value.contextReferences as unknown[]).map(parseCanvasImageContextReference)
+    : undefined
+  return {
+    id: value.id,
+    creativeTaskId: value.creativeTaskId,
+    attemptNumber: value.attemptNumber as number,
+    projectId: value.projectId,
+    target: { kind: 'canvas-image', canvasId: target.canvasId, nodeId: target.nodeId, imageModuleId: target.imageModuleId },
+    action: value.action as DesignJobRecord['action'],
+    status: value.status as DesignJobRecord['status'],
+    prompt: value.prompt,
+    originalRequest: value.originalRequest,
+    contextMode: value.contextMode,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+    ...(Object.hasOwn(value, 'sessionId') ? { sessionId: value.sessionId as string } : {}),
+    ...(Object.hasOwn(value, 'generationConstraints') ? { generationConstraints: {
+      aspectRatio: (value.generationConstraints as Record<string, unknown>).aspectRatio as CanvasImageAspectRatio,
+      imageSize: (value.generationConstraints as Record<string, unknown>).imageSize as CanvasImageSize,
+    } } : {}),
+    ...(canvasInputReferences === undefined ? {} : { canvasInputReferences }),
+    ...(Object.hasOwn(value, 'canvasImageConfigRevision') ? { canvasImageConfigRevision: value.canvasImageConfigRevision as number } : {}),
+    ...(Object.hasOwn(value, 'candidateBatchId') ? { candidateBatchId: value.candidateBatchId as string } : {}),
+    ...(Object.hasOwn(value, 'sourceAgentMessageId') ? { sourceAgentMessageId: value.sourceAgentMessageId as string } : {}),
+    ...(imageModelSnapshot === undefined ? {} : { imageModelSnapshot }),
+    ...(Object.hasOwn(value, 'sourceSessionId') ? { sourceSessionId: value.sourceSessionId as string } : {}),
+    ...(Object.hasOwn(value, 'sourceAssetId') ? { sourceAssetId: value.sourceAssetId as string } : {}),
+    ...(Object.hasOwn(value, 'parentAssetId') ? { parentAssetId: value.parentAssetId as string } : {}),
+    ...(Object.hasOwn(value, 'outputAssetId') ? { outputAssetId: value.outputAssetId as string } : {}),
+    ...(Object.hasOwn(value, 'error') ? { error: value.error as string } : {}),
+    ...(Object.hasOwn(value, 'traceState') ? { traceState: value.traceState as DesignJobRecord['traceState'] } : {}),
+    ...(Object.hasOwn(value, 'executionSessionCleanupState') ? { executionSessionCleanupState: value.executionSessionCleanupState as DesignJobRecord['executionSessionCleanupState'] } : {}),
+    ...(Object.hasOwn(value, 'startedAt') ? { startedAt: value.startedAt as number } : {}),
+    ...(Object.hasOwn(value, 'completedAt') ? { completedAt: value.completedAt as number } : {}),
+    ...(contextReferences === undefined ? {} : { contextReferences }),
+    ...(Object.hasOwn(value, 'designSummary') ? { designSummary: value.designSummary as string } : {}),
+    ...(Object.hasOwn(value, 'finalImagePrompt') ? { finalImagePrompt: value.finalImagePrompt as string } : {}),
+    ...(Object.hasOwn(value, 'rawThinkingAvailable') ? { rawThinkingAvailable: value.rawThinkingAvailable as boolean } : {}),
+    ...(Object.hasOwn(value, 'contextWarning') ? { contextWarning: value.contextWarning as string } : {}),
+  }
+}
+
+/** 严格重建主进程公开的图片版本投影。 */
+function parseCanvasImageArtifactVersion(value: unknown): CanvasImageArtifactVersion {
+  if (!hasExactCanvasKeys(value, ['jobId', 'assetId', 'createdAt'])
+    || !isCanvasLifecycleId(value.jobId)
+    || !isCanvasLifecycleId(value.assetId)
+    || !isCanvasNonNegativeInteger(value.createdAt)) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  return { jobId: value.jobId, assetId: value.assetId, createdAt: value.createdAt }
+}
+
+/**
+ * 严格解析 Renderer 可见的单图片模块完整快照。
+ * @param value 主进程或 Preload 返回的未知值。
+ * @returns exact-key、深隔离且版本关系完整的公开快照。
+ */
+export function parseCanvasImageModuleSnapshot(value: unknown): CanvasImageModuleSnapshot {
+  try {
+    const keys = [
+      'target', 'mediaLeaseId', 'config', 'jobs', 'assets', 'imageVersions',
+      'assetBaseUrl', 'thumbnailBaseUrl',
+    ] as const
+    if (!hasExactCanvasKeys(value, keys)
+      || !isCanvasLifecycleId(value.mediaLeaseId)
+      || !Array.isArray(value.jobs)
+      || !Array.isArray(value.assets)
+      || !Array.isArray(value.imageVersions)
+      || value.imageVersions.length > 100
+      || !isCanvasImageMediaBaseUrl(value.assetBaseUrl)
+      || !isCanvasImageMediaBaseUrl(value.thumbnailBaseUrl)) {
+      throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+    }
+    /** 图片目标与配置先严格重建，再作为任务和 adopted 关系的基线。 */
+    const target = parseCanvasImageTarget(value.target)
+    const config = parseCanvasImageModuleConfig(value.config)
+    if (config.contentId !== target.imageModuleId) throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+    /** 任务、素材和版本均逐项重建，拒绝保留输入对象引用。 */
+    const jobs = value.jobs.map((job) => parseCanvasImageSnapshotJob(job, target))
+    const assets = value.assets.map(parseCanvasImageSnapshotAsset)
+    const imageVersions = value.imageVersions.map(parseCanvasImageArtifactVersion)
+    /** 同轮公开事实内任务和素材身份必须各自唯一。 */
+    const jobsById = new Map(jobs.map((job) => [job.id, job]))
+    const assetsById = new Map(assets.map((asset) => [asset.id, asset]))
+    if (jobsById.size !== jobs.length || assetsById.size !== assets.length) {
+      throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+    }
+    /** 每个输出素材只能由一个目标任务声明，并进入公开资产闭包。 */
+    const ownerByAssetId = new Map<string, DesignJobRecord>()
+    const visibleAssetIds = new Set<string>()
+    for (const job of jobs) {
+      /** generate 无父链；edit 必须从同一现存父素材派生。 */
+      if (job.action === 'generate') {
+        if (job.sourceAssetId !== undefined || job.parentAssetId !== undefined) {
+          throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+        }
+      } else if (!job.sourceAssetId
+        || job.parentAssetId !== job.sourceAssetId
+        || !assetsById.has(job.sourceAssetId)) {
+        throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+      }
+      if (!job.outputAssetId) continue
+      if (ownerByAssetId.has(job.outputAssetId)) {
+        throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+      }
+      ownerByAssetId.set(job.outputAssetId, job)
+      visibleAssetIds.add(job.outputAssetId)
+    }
+    /** 任务声明输出时必须与素材 sourceJobId 和 parentAssetId 双向一致。 */
+    for (const [outputAssetId, job] of ownerByAssetId) {
+      const asset = assetsById.get(outputAssetId)
+      if (!asset
+        || asset.sourceJobId !== job.id
+        || asset.parentAssetId !== job.parentAssetId) {
+        throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+      }
+    }
+    /** adopted 素材是第二个可信根，其完整祖先链必须存在、无环且有界。 */
+    if (config.adoptedAssetId !== null) {
+      const lineageVisited = new Set<string>()
+      let currentAssetId: string | undefined = config.adoptedAssetId
+      let lineageDepth = 0
+      while (currentAssetId !== undefined) {
+        if (lineageDepth >= 256 || lineageVisited.has(currentAssetId)) {
+          throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+        }
+        const asset = assetsById.get(currentAssetId)
+        if (!asset) throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+        lineageVisited.add(currentAssetId)
+        visibleAssetIds.add(currentAssetId)
+        currentAssetId = asset.parentAssetId
+        lineageDepth += 1
+      }
+    }
+    /** 快照不得夹带目标任务输出或 adopted 祖先闭包之外的孤儿素材。 */
+    if (assets.some((asset) => !visibleAssetIds.has(asset.id))) {
+      throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+    }
+    /** 版本内 jobId 和 assetId 分别唯一，避免歧义历史项。 */
+    const versionJobIds = new Set(imageVersions.map((version) => version.jobId))
+    const versionAssetIds = new Set(imageVersions.map((version) => version.assetId))
+    if (versionJobIds.size !== imageVersions.length || versionAssetIds.size !== imageVersions.length) {
+      throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+    }
+    for (const version of imageVersions) {
+      const job = jobsById.get(version.jobId)
+      const asset = assetsById.get(version.assetId)
+      if (!job || job.status !== 'succeeded' || job.outputAssetId !== version.assetId
+        || !asset || asset.sourceJobId !== version.jobId || asset.createdAt !== version.createdAt) {
+        throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+      }
+    }
+    /** 主进程稳定排序为时间倒序，平局按 assetId、jobId 升序。 */
+    for (let index = 1; index < imageVersions.length; index += 1) {
+      const previous = imageVersions[index - 1]!
+      const current = imageVersions[index]!
+      const order = previous.createdAt === current.createdAt
+        ? previous.assetId.localeCompare(current.assetId) || previous.jobId.localeCompare(current.jobId)
+        : current.createdAt - previous.createdAt
+      if (order > 0) throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+    }
+    return {
+      target,
+      mediaLeaseId: value.mediaLeaseId,
+      config,
+      jobs,
+      assets,
+      imageVersions,
+      assetBaseUrl: value.assetBaseUrl,
+      thumbnailBaseUrl: value.thumbnailBaseUrl,
+    }
+  } catch (error) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID', { cause: error })
   }
 }
 
@@ -1204,12 +2473,20 @@ export function parseClearAgentCanvasBindingsResult(value: unknown): ClearAgentC
 /** 严格解析可选的右侧扩展关系。 */
 function parseCanvasLifecycleRelationship(value: unknown): CreateCanvasAgentNodeRelationship | undefined {
   if (value === undefined) return undefined
-  if (!hasExactCanvasKeys(value, ['sourceNodeId', 'edgeId'])
+  if (!hasExactCanvasKeys(value, ['sourceNodeId', 'edgeId', 'relation'])
     || !isCanvasLifecycleId(value.sourceNodeId)
     || !isCanvasLifecycleId(value.edgeId)) {
     throw new Error('CANVAS_RELATIONSHIP_INVALID')
   }
-  return { sourceNodeId: value.sourceNodeId, edgeId: value.edgeId }
+  try {
+    return {
+      sourceNodeId: value.sourceNodeId,
+      edgeId: value.edgeId,
+      relation: parseCanvasEdgeRelation(value.relation),
+    }
+  } catch (error) {
+    throw new Error('CANVAS_RELATIONSHIP_INVALID', { cause: error })
+  }
 }
 
 /** 严格解析非 Agent 内容节点创建命令。 */
@@ -1316,7 +2593,302 @@ export interface CanvasWorkspaceSnapshot {
   nodeIssues: CanvasNodeIssue[]
   /** LOAD 提供当前 Canvas 已采用素材的共享缩略图；生命周期旧结果可暂不携带。 */
   imagePreviews?: CanvasImagePreview[]
+  /** 仅包含有限活跃摘要；完整条目由独立 IPC 按需读取。 */
+  activeImageCandidateBatches?: CanvasImageCandidateBatchSummary[]
   recoveredFrom?: 'tmp' | 'backup'
+}
+
+/** 严格重建节点的有限上游变化提示。 */
+function parseCanvasNodeUpstreamChange(value: unknown): CanvasNodeUpstreamChange | undefined {
+  if (value === undefined) return undefined
+  if (!hasExactCanvasKeys(value, ['sourceNodeIds', 'changedAt'])
+    || !Array.isArray(value.sourceNodeIds)
+    || value.sourceNodeIds.length < 1
+    || value.sourceNodeIds.length > 128
+    || !value.sourceNodeIds.every(isCanvasLifecycleId)
+    || new Set(value.sourceNodeIds).size !== value.sourceNodeIds.length
+    || !isCanvasNonNegativeInteger(value.changedAt)) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  }
+  /** 规范化后的上游 ID 必须已经按稳定次序持久化。 */
+  const sourceNodeIds = [...value.sourceNodeIds] as string[]
+  if (sourceNodeIds.some((nodeId, index) => index > 0 && sourceNodeIds[index - 1]!.localeCompare(nodeId) >= 0)) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  }
+  return { sourceNodeIds, changedAt: value.changedAt }
+}
+
+/** 严格重建工作区快照中的单个 Canvas 节点。 */
+function parseCanvasWorkspaceNode(value: unknown): CanvasNode {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  }
+  /** 节点记录用于按互斥 kind 选择唯一 exact-key 合同。 */
+  const record = value as Record<string, unknown>
+  /** 四类节点共享的展示与布局字段。 */
+  const baseKeys = Object.hasOwn(record, 'upstreamChange')
+    ? ['id', 'kind', 'title', 'position', 'upstreamChange'] as const
+    : ['id', 'kind', 'title', 'position'] as const
+  if (!isCanvasLifecycleId(record.id)
+    || !isCanvasLifecycleTitle(record.title)
+    || !isCanvasLifecyclePosition(record.position)) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  }
+  /** 已深拷贝的共享节点字段，避免 Renderer 保留 IPC 输入引用。 */
+  /** 可选变化提示在所有节点类别使用同一严格合同。 */
+  const upstreamChange = parseCanvasNodeUpstreamChange(record.upstreamChange)
+  const base = {
+    id: record.id,
+    title: record.title,
+    position: { x: record.position.x, y: record.position.y },
+    ...(upstreamChange ? { upstreamChange } : {}),
+  }
+  if (record.kind === 'agent'
+    && hasExactCanvasKeys(record, [...baseKeys, 'agentSessionId'])
+    && isCanvasLifecycleId(record.agentSessionId)) {
+    return { ...base, kind: 'agent', agentSessionId: record.agentSessionId }
+  }
+  if (record.kind === 'image') {
+    /** 图片节点仅允许可选 adoptedAssetId，不接受其它内容身份字段。 */
+    const imageKeys = Object.hasOwn(record, 'adoptedAssetId')
+      ? [...baseKeys, 'imageModuleId', 'adoptedAssetId']
+      : [...baseKeys, 'imageModuleId']
+    if (hasExactCanvasKeys(record, imageKeys)
+      && isCanvasLifecycleId(record.imageModuleId)
+      && (record.adoptedAssetId === undefined || isCanvasLifecycleId(record.adoptedAssetId))) {
+      return {
+        ...base,
+        kind: 'image',
+        imageModuleId: record.imageModuleId,
+        ...(record.adoptedAssetId === undefined ? {} : { adoptedAssetId: record.adoptedAssetId }),
+      }
+    }
+  }
+  if (record.kind === 'document'
+    && hasExactCanvasKeys(record, [...baseKeys, 'documentId', 'contentRevision'])
+    && isCanvasLifecycleId(record.documentId)
+    && isCanvasNonNegativeInteger(record.contentRevision)) {
+    return {
+      ...base,
+      kind: 'document',
+      documentId: record.documentId,
+      contentRevision: record.contentRevision,
+    }
+  }
+  if (record.kind === 'webview'
+    && hasExactCanvasKeys(record, [...baseKeys, 'prototypeId', 'contentRevision', 'devicePreset'])
+    && isCanvasLifecycleId(record.prototypeId)
+    && isCanvasNonNegativeInteger(record.contentRevision)
+    && (record.devicePreset === 'desktop' || record.devicePreset === 'mobile')) {
+    return {
+      ...base,
+      kind: 'webview',
+      prototypeId: record.prototypeId,
+      contentRevision: record.contentRevision,
+      devicePreset: record.devicePreset,
+    }
+  }
+  throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+}
+
+/** 严格重建工作区快照中的单条 Canvas 关系边。 */
+function parseCanvasWorkspaceEdge(value: unknown, nodeIds: ReadonlySet<string>): CanvasEdge {
+  /** 关系边允许的完整公开字段集合。 */
+  const keys = ['id', 'sourceNodeId', 'sourcePort', 'targetNodeId', 'targetPort', 'relation'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.id)
+    || !isCanvasLifecycleId(value.sourceNodeId)
+    || !isCanvasLifecycleId(value.sourcePort)
+    || !isCanvasLifecycleId(value.targetNodeId)
+    || !isCanvasLifecycleId(value.targetPort)
+    || !nodeIds.has(value.sourceNodeId)
+    || !nodeIds.has(value.targetNodeId)) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  }
+  return {
+    id: value.id,
+    sourceNodeId: value.sourceNodeId,
+    sourcePort: value.sourcePort,
+    targetNodeId: value.targetNodeId,
+    targetPort: value.targetPort,
+    relation: parseCanvasEdgeRelation(value.relation),
+  }
+}
+
+/** 严格重建工作区快照中的公开节点问题。 */
+function parseCanvasWorkspaceNodeIssue(
+  value: unknown,
+  agentNodeIds: ReadonlySet<string>,
+): CanvasNodeIssue {
+  /** 节点问题只允许稳定节点身份、固定错误码和恢复动作。 */
+  const keys = ['nodeId', 'code', 'allowedActions'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.nodeId)
+    || !agentNodeIds.has(value.nodeId)
+    || value.code !== 'AGENT_SESSION_UNAVAILABLE'
+    || !Array.isArray(value.allowedActions)
+    || value.allowedActions.some((action) => (
+      action !== 'rebuild-agent-session' && action !== 'remove-node'
+    ))
+    || new Set(value.allowedActions).size !== value.allowedActions.length) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  }
+  return {
+    nodeId: value.nodeId,
+    code: 'AGENT_SESSION_UNAVAILABLE',
+    allowedActions: value.allowedActions.map((action) => action as CanvasNodeIssueAction),
+  }
+}
+
+/** 严格重建工作区快照中的公开图片预览。 */
+function parseCanvasWorkspaceImagePreview(value: unknown): CanvasImagePreview {
+  /** 图片预览禁止携带本地路径，仅允许媒体 URL 和正像素尺寸。 */
+  const keys = ['assetId', 'previewUrl', 'width', 'height'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.assetId)
+    || typeof value.previewUrl !== 'string'
+    || !Number.isSafeInteger(value.width) || (value.width as number) <= 0
+    || !Number.isSafeInteger(value.height) || (value.height as number) <= 0) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  }
+  return {
+    assetId: value.assetId,
+    previewUrl: value.previewUrl,
+    width: value.width as number,
+    height: value.height as number,
+  }
+}
+
+/** 严格重建工作区快照中的 schema v4 Canvas 文档。 */
+function parseCanvasWorkspaceDocument(value: unknown): CanvasDocument {
+  /** Canvas 文档只允许当前 v4 的完整公开字段集合。 */
+  const keys = [
+    'schemaVersion', 'projectId', 'canvasId', 'revision', 'viewport',
+    'nodes', 'edges', 'createdAt', 'updatedAt',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || value.schemaVersion !== CANVAS_DOCUMENT_VERSION
+    || !isCanvasLifecycleId(value.projectId)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasNonNegativeInteger(value.revision)
+    || !hasExactCanvasKeys(value.viewport, ['x', 'y', 'zoom'])
+    || typeof value.viewport.x !== 'number' || !Number.isFinite(value.viewport.x)
+    || typeof value.viewport.y !== 'number' || !Number.isFinite(value.viewport.y)
+    || typeof value.viewport.zoom !== 'number' || !Number.isFinite(value.viewport.zoom)
+    || value.viewport.zoom <= 0
+    || !Array.isArray(value.nodes)
+    || !Array.isArray(value.edges)
+    || !isCanvasNonNegativeInteger(value.createdAt)
+    || !isCanvasNonNegativeInteger(value.updatedAt)) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  }
+  /** 节点逐项严格重建，并在解析边前建立唯一身份集合。 */
+  const nodes = value.nodes.map(parseCanvasWorkspaceNode)
+  /** 图内节点 ID 必须唯一。 */
+  const nodeIds = new Set(nodes.map((node) => node.id))
+  if (nodeIds.size !== nodes.length) throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  /** 边在重建时同时校验两端节点引用。 */
+  const edges = value.edges.map((edge) => parseCanvasWorkspaceEdge(edge, nodeIds))
+  /** 图内边 ID 必须唯一。 */
+  const edgeIds = new Set(edges.map((edge) => edge.id))
+  if (edgeIds.size !== edges.length) throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  return {
+    schemaVersion: CANVAS_DOCUMENT_VERSION,
+    projectId: value.projectId,
+    canvasId: value.canvasId,
+    revision: value.revision,
+    viewport: { x: value.viewport.x, y: value.viewport.y, zoom: value.viewport.zoom },
+    nodes,
+    edges,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  }
+}
+
+/**
+ * 严格解析 Renderer 可见的 Canvas 工作区快照。
+ * @param value 待解析的主进程或 Preload 返回值。
+ * @returns 逐字段重建、不含私有字段且与输入深隔离的公开快照。
+ */
+export function parseCanvasWorkspaceSnapshot(value: unknown): CanvasWorkspaceSnapshot {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+    }
+    /** 根记录按两个可选字段的实际存在性生成唯一 exact-key 合同。 */
+    const record = value as Record<string, unknown>
+    /** 标记图片预览字段是否真实存在，存在时不允许用 undefined 伪装缺省。 */
+    const hasImagePreviews = Object.hasOwn(record, 'imagePreviews')
+    /** 标记恢复来源字段是否真实存在，存在时必须命中公开枚举。 */
+    const hasRecoveredFrom = Object.hasOwn(record, 'recoveredFrom')
+    /** 活跃候选摘要存在时必须是有界数组。 */
+    const hasActiveImageCandidateBatches = Object.hasOwn(record, 'activeImageCandidateBatches')
+    /** 工作区快照的必填公开字段。 */
+    const keys = ['document', 'writable', 'nodeIssues']
+    if (hasImagePreviews) keys.push('imagePreviews')
+    if (hasActiveImageCandidateBatches) keys.push('activeImageCandidateBatches')
+    if (hasRecoveredFrom) keys.push('recoveredFrom')
+    if (!hasExactCanvasKeys(record, keys)
+      || record.writable !== true
+      || !Array.isArray(record.nodeIssues)
+      || (hasRecoveredFrom && record.recoveredFrom !== 'tmp' && record.recoveredFrom !== 'backup')
+      || (hasActiveImageCandidateBatches && !Array.isArray(record.activeImageCandidateBatches))
+      || (hasImagePreviews && !Array.isArray(record.imagePreviews))) {
+      throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+    }
+    /** 权威文档先重建，派生问题随后才能校验其 Agent 节点归属。 */
+    const document = parseCanvasWorkspaceDocument(record.document)
+    /** 仅 Agent 节点允许挂载会话不可用问题。 */
+    const agentNodeIds = new Set(
+      document.nodes.filter((node) => node.kind === 'agent').map((node) => node.id),
+    )
+    /** 节点问题逐项重建并保证同一节点最多出现一次。 */
+    const nodeIssues = record.nodeIssues.map((issue) => parseCanvasWorkspaceNodeIssue(issue, agentNodeIds))
+    /** 已出现问题的节点身份集合用于拒绝重复派生状态。 */
+    const issueNodeIds = new Set(nodeIssues.map((issue) => issue.nodeId))
+    if (issueNodeIds.size !== nodeIssues.length) throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+    /** 图片预览可选存在，存在时逐项重建并拒绝重复素材。 */
+    const imagePreviews = !hasImagePreviews
+      ? undefined
+      : (record.imagePreviews as unknown[]).map(parseCanvasWorkspaceImagePreview)
+    if (imagePreviews) {
+      /** 已出现预览的素材身份集合用于拒绝歧义映射。 */
+      const previewAssetIds = new Set(imagePreviews.map((preview) => preview.assetId))
+      if (previewAssetIds.size !== imagePreviews.length) throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+    }
+    const activeImageCandidateBatches = !hasActiveImageCandidateBatches
+      ? undefined
+      : (record.activeImageCandidateBatches as unknown[])
+        .map(parseCanvasImageCandidateBatchSummary)
+        .sort((left, right) => right.updatedAt - left.updatedAt || left.batchId.localeCompare(right.batchId))
+    if (activeImageCandidateBatches
+      && (activeImageCandidateBatches.length > CANVAS_IMAGE_CANDIDATE_BATCH_SUMMARY_LIMIT
+        || new Set(activeImageCandidateBatches.map((batch) => batch.batchId)).size !== activeImageCandidateBatches.length
+        || activeImageCandidateBatches.some((batch) => (
+          batch.projectId !== document.projectId
+          || batch.canvasId !== document.canvasId
+          || batch.status === 'adopted'
+          || batch.status === 'abandoned'
+        )))) {
+      throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+    }
+    return {
+      document,
+      writable: true,
+      nodeIssues,
+      ...(imagePreviews === undefined ? {} : { imagePreviews }),
+      ...(activeImageCandidateBatches === undefined ? {} : { activeImageCandidateBatches }),
+      ...(hasRecoveredFrom ? { recoveredFrom: record.recoveredFrom as 'tmp' | 'backup' } : {}),
+    }
+  } catch (error) {
+    throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID', { cause: error })
+  }
+}
+
+/** 文本产物写入或采用成功后的权威图与正文快照。 */
+export interface CanvasTextArtifactMutationResult {
+  snapshot: CanvasWorkspaceSnapshot
+  artifact: CanvasTextArtifactSnapshot
 }
 
 /** Agent 工具触发 Canvas 变化时允许公开的最小来源身份。 */
@@ -1461,6 +3033,13 @@ export function applyCanvasMutations(
         next.edges = next.edges.filter((edge) => !removedEdgeIds.has(edge.id))
         break
       }
+      case 'set-webview-device-preset':
+        next.nodes = next.nodes.map((node) => (
+          node.id === mutation.nodeId && node.kind === 'webview'
+            ? { ...node, devicePreset: mutation.devicePreset }
+            : node
+        ))
+        break
     }
   }
 

@@ -3,6 +3,8 @@ import type {
   CanvasDocument,
   CanvasImageModuleConfig,
   CanvasImageTarget,
+  DesignAsset,
+  DesignJobRecord,
 } from '@proma/shared'
 import type {
   StableDirectoryNativeRequest,
@@ -10,6 +12,7 @@ import type {
 } from '../stable-directory-native-host'
 import {
   createCanvasImageModuleStore,
+  deriveCanvasImageArtifactVersions,
   type CanvasImageModuleStoreDependencies,
 } from './canvas-image-module-store'
 
@@ -27,7 +30,7 @@ function createFixture() {
   const files = new Map<string, string>()
   /** 权威 Canvas 文档用于验证节点和模块归属。 */
   const document: CanvasDocument = {
-    schemaVersion: 2,
+    schemaVersion: 4,
     projectId: target.projectId,
     canvasId: target.canvasId,
     revision: 0,
@@ -100,6 +103,79 @@ function createFixture() {
 }
 
 describe('Canvas 图片模块 Store', () => {
+  test('Given 混合任务与素材 When 派生图片版本 Then 只返回精确归属且仍存在的成功输出', () => {
+    /** 创建最小任务事实，用于覆盖状态、归属、来源与重复输出边界。 */
+    const createJob = (
+      id: string,
+      status: DesignJobRecord['status'],
+      outputAssetId: string | undefined,
+      overrides: Partial<DesignJobRecord> = {},
+    ): DesignJobRecord => ({
+      id,
+      creativeTaskId: `creative-${id}`,
+      attemptNumber: 1,
+      projectId: target.projectId,
+      target: {
+        kind: 'canvas-image', canvasId: target.canvasId,
+        nodeId: target.nodeId, imageModuleId: target.imageModuleId,
+      },
+      action: 'generate', status, prompt: id, originalRequest: id,
+      contextMode: 'none', createdAt: 1, updatedAt: 1,
+      ...(outputAssetId ? { outputAssetId } : {}),
+      ...overrides,
+    })
+    /** 创建与任务绑定的最小素材事实。 */
+    const createAsset = (id: string, sourceJobId: string, createdAt: number): DesignAsset => ({
+      id, filename: `${id}.png`, relativePath: `assets/${id}.png`,
+      thumbnailRelativePath: `thumbnails/${id}.webp`, mediaType: 'image/png',
+      width: 100, height: 100, byteSize: 100, sha256: id.padEnd(64, 'a'),
+      sourceJobId, createdAt,
+    })
+    const jobs = [
+      createJob('job-old', 'succeeded', 'asset-old'),
+      createJob('job-new', 'succeeded', 'asset-new'),
+      createJob('job-missing', 'succeeded', 'asset-missing'),
+      createJob('job-failed', 'failed', 'asset-failed'),
+      createJob('job-foreign', 'succeeded', 'asset-foreign', {
+        target: { kind: 'canvas-image', canvasId: target.canvasId, nodeId: 'node-other', imageModuleId: target.imageModuleId },
+      }),
+      createJob('job-wrong-source', 'succeeded', 'asset-wrong-source'),
+      createJob('job-duplicate', 'succeeded', 'asset-old'),
+    ]
+    const assets = [
+      createAsset('asset-old', 'job-old', 100),
+      createAsset('asset-new', 'job-new', 300),
+      createAsset('asset-failed', 'job-failed', 400),
+      createAsset('asset-foreign', 'job-foreign', 500),
+      createAsset('asset-wrong-source', 'job-other', 600),
+    ]
+
+    expect(deriveCanvasImageArtifactVersions(target, jobs, assets, 10)).toEqual([
+      { jobId: 'job-new', assetId: 'asset-new', createdAt: 300 },
+      { jobId: 'job-old', assetId: 'asset-old', createdAt: 100 },
+    ])
+  })
+
+  test('Given 合法图片版本超过上限 When 派生 Then 稳定倒序并截断有限结果', () => {
+    /** 生成三个合法版本，时间相同用于锁定稳定 ID 次序。 */
+    const jobs: DesignJobRecord[] = ['a', 'c', 'b'].map((suffix) => ({
+      id: `job-${suffix}`, creativeTaskId: `creative-${suffix}`, attemptNumber: 1,
+      projectId: target.projectId,
+      target: { kind: 'canvas-image', canvasId: target.canvasId, nodeId: target.nodeId, imageModuleId: target.imageModuleId },
+      action: 'generate', status: 'succeeded', prompt: suffix, originalRequest: suffix,
+      contextMode: 'none', outputAssetId: `asset-${suffix}`, createdAt: 1, updatedAt: 1,
+    }))
+    const assets: DesignAsset[] = jobs.map((job) => ({
+      id: job.outputAssetId!, filename: `${job.id}.png`, relativePath: `assets/${job.id}.png`,
+      thumbnailRelativePath: `thumbnails/${job.id}.webp`, mediaType: 'image/png',
+      width: 1, height: 1, byteSize: 1, sha256: job.id.padEnd(64, 'a'),
+      sourceJobId: job.id, createdAt: 100,
+    }))
+
+    expect(deriveCanvasImageArtifactVersions(target, jobs, assets, 2).map((version) => version.assetId))
+      .toEqual(['asset-a', 'asset-b'])
+  })
+
   test('Given v1 图片配置 When LOAD Then 原子迁移并补齐默认值', async () => {
     const fixture = createFixture()
     fixture.seed({

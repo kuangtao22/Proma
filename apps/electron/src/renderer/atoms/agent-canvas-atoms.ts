@@ -17,13 +17,22 @@ export interface AgentCanvasWorkbenchDraftState {
   dirty: boolean
 }
 
-/** Agent Canvas 工作台的会话级宽高。 */
+/** Agent Canvas 工作台的屏幕像素宽高。 */
 export interface AgentCanvasWorkbenchSize {
-  /** 工作台宽度，单位为画布布局像素。 */
+  /** 工作台宽度，单位为屏幕像素。 */
   width: number
-  /** 工作台高度，单位为画布布局像素。 */
+  /** 工作台高度，单位为屏幕像素。 */
   height: number
 }
+
+/** Agent Canvas 工作台在 surface 内的屏幕像素位置。 */
+export interface AgentCanvasWorkbenchPosition {
+  x: number
+  y: number
+}
+
+/** 单个会话最多保留的节点工作台自定义尺寸数量。 */
+const MAX_AGENT_CANVAS_WORKBENCH_SIZES = 64
 
 /** 单个 Agent 会话查看一张共享画布时的独立视图状态。 */
 export interface AgentCanvasViewState {
@@ -35,8 +44,10 @@ export interface AgentCanvasViewState {
   selectedNodeIds: string[]
   /** 当前唯一展开的节点工作台。 */
   expandedNodeId: string | null
-  /** 当前工作台的用户调整尺寸。 */
-  workbenchSize: AgentCanvasWorkbenchSize | null
+  /** 用户调整后的尺寸按节点隔离，未出现的节点继续使用类型默认值。 */
+  workbenchSizesByNodeId: Record<string, AgentCanvasWorkbenchSize>
+  /** 当前 Canvas 内复用的浮窗位置；新 Canvas 初次打开时重新计算。 */
+  workbenchPosition: AgentCanvasWorkbenchPosition | null
   /** Agent 右侧画布区域是否处于展开态。 */
   isExpanded: boolean
   /** 会话级活动变化代次，供宿主按需刷新视图提示。 */
@@ -64,13 +75,59 @@ export function createInitialAgentCanvasViewState(
     selectedNodeId: null,
     selectedNodeIds: [],
     expandedNodeId: null,
-    workbenchSize: null,
+    workbenchSizesByNodeId: {},
+    workbenchPosition: null,
     isExpanded: false,
     activityRevision: 0,
     seenActivityRevision: 0,
     activeTool: 'select',
     pendingWorkbenchSwitchNodeId: null,
     workbenchDraft: null,
+  }
+}
+
+/** 迁移前会话状态可能携带的单一工作台尺寸。 */
+interface LegacyAgentCanvasWorkbenchState {
+  workbenchSize?: AgentCanvasWorkbenchSize | null
+}
+
+/** 工作台几何更新的可选输入。 */
+export interface AgentCanvasWorkbenchGeometryInput {
+  size?: AgentCanvasWorkbenchSize
+  position?: AgentCanvasWorkbenchPosition
+}
+
+/**
+ * 创建按节点隔离且有界的工作台几何更新。
+ * @param current 当前会话视图；兼容 HMR 留下的旧单值尺寸字段。
+ * @param nodeId 当前工作台节点 ID。
+ * @param input 本次需要提交的最终尺寸或位置。
+ * @returns 只包含发生变化几何字段的局部状态。
+ */
+export function createAgentCanvasWorkbenchGeometryUpdate(
+  current: AgentCanvasViewState,
+  nodeId: string,
+  input: AgentCanvasWorkbenchGeometryInput,
+): Partial<AgentCanvasViewState> {
+  /** 旧单值只迁给它实际所属的展开节点，避免污染其它类型。 */
+  const legacySize = (current as AgentCanvasViewState & LegacyAgentCanvasWorkbenchState).workbenchSize
+  /** 几何更新始终从独立对象开始，避免修改 atom 中的历史状态。 */
+  const sizes = { ...current.workbenchSizesByNodeId }
+  if (legacySize && current.expandedNodeId && sizes[current.expandedNodeId] === undefined) {
+    sizes[current.expandedNodeId] = { ...legacySize }
+  }
+  if (input.size) {
+    /** 赋值已有键不会改变对象枚举顺序，新键才参与最早项淘汰。 */
+    sizes[nodeId] = { ...input.size }
+    while (Object.keys(sizes).length > MAX_AGENT_CANVAS_WORKBENCH_SIZES) {
+      const oldestNodeId = Object.keys(sizes)[0]
+      if (oldestNodeId === undefined) break
+      delete sizes[oldestNodeId]
+    }
+  }
+  return {
+    ...(input.size || legacySize ? { workbenchSizesByNodeId: sizes } : {}),
+    ...(input.position ? { workbenchPosition: { ...input.position } } : {}),
   }
 }
 
@@ -199,14 +256,18 @@ export function createConvergedAgentCanvasViewUpdate(
     ? current.selectedNodeId
     : selectedNodeIds[0] ?? null
   const expandedNodeStillExists = current.expandedNodeId === null || nodeIds.has(current.expandedNodeId)
+  /** 删除任意节点都同步清理其自定义尺寸，不要求该节点当前展开。 */
+  const workbenchSizesByNodeId = Object.fromEntries(
+    Object.entries(current.workbenchSizesByNodeId).filter(([nodeId]) => nodeIds.has(nodeId)),
+  )
   return {
     selectedNodeId,
     selectedNodeIds,
+    workbenchSizesByNodeId,
     ...(!expandedNodeStillExists ? {
       expandedNodeId: null,
       pendingWorkbenchSwitchNodeId: null,
       workbenchDraft: null,
-      workbenchSize: null,
     } : {}),
   }
 }
@@ -217,7 +278,6 @@ export function createClosedAgentCanvasWorkbenchUpdate(): Partial<AgentCanvasVie
     expandedNodeId: null,
     pendingWorkbenchSwitchNodeId: null,
     workbenchDraft: null,
-    workbenchSize: null,
   }
 }
 

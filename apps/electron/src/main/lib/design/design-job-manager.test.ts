@@ -205,6 +205,107 @@ describe('Design Job Manager', () => {
     expect(document.nodes).toEqual(before)
   })
 
+  test('Given Canvas 图片任务失败或取消 When 进入终态 Then 候选批次不再保持运行中', async () => {
+    const candidateHarness = createHarness({ withCandidateBatches: true })
+    const failed = await candidateHarness.manager.createCanvasImage({
+      ...createCanvasImageInput('a'),
+      candidateBatchId: 'batch-failed',
+    })
+
+    await candidateHarness.manager.run(failed.id)
+
+    const cancelled = await candidateHarness.manager.createCanvasImage({
+      ...createCanvasImageInput('b'),
+      candidateBatchId: 'batch-cancelled',
+    })
+    await candidateHarness.manager.cancel('project-1', cancelled.id)
+    expect(candidateHarness.candidateTerminalEvents).toEqual([
+      {
+        jobId: failed.id,
+        candidateBatchId: 'batch-failed',
+        status: 'failed',
+        outputAssetId: null,
+        error: '任务完成但没有产生可验证图片',
+      },
+      {
+        jobId: cancelled.id,
+        candidateBatchId: 'batch-cancelled',
+        status: 'cancelled',
+        outputAssetId: null,
+        error: null,
+      },
+    ])
+  })
+
+  test('Given 旧 Canvas 图片任务没有候选批次 When 失败或取消 Then 不向候选服务登记不存在的批次', async () => {
+    const candidateHarness = createHarness({ withCandidateBatches: true })
+    const failed = await candidateHarness.manager.createCanvasImage(createCanvasImageInput('a'))
+
+    await candidateHarness.manager.run(failed.id)
+
+    const cancelled = await candidateHarness.manager.createCanvasImage(createCanvasImageInput('b'))
+    await candidateHarness.manager.cancel('project-1', cancelled.id)
+
+    expect(candidateHarness.candidateTerminalEvents).toEqual([])
+  })
+
+  test('Given 旧 Canvas 图片任务没有候选批次 When 成功且候选服务已接入 Then 仍沿用旧版采用路径', async () => {
+    const candidateHarness = createHarness({ withCandidateBatches: true })
+    candidateHarness.messages = [createToolMessage('session-1/output.png')]
+    const job = await candidateHarness.manager.createCanvasImage(createCanvasImageInput('a'))
+
+    await candidateHarness.manager.run(job.id)
+
+    expect(candidateHarness.manager.get(job.id)).toMatchObject({
+      status: 'succeeded',
+      outputAssetId: 'asset-output',
+    })
+    expect(candidateHarness.candidateTerminalEvents).toEqual([])
+    expect(candidateHarness.canvasAdoptionCount).toBe(1)
+  })
+
+  test('Given 旧 Canvas 图片采用已生效但返回不确定错误 When 候选服务已接入 Then 仍按权威采用事实收敛成功', async () => {
+    const candidateHarness = createHarness({ withCandidateBatches: true })
+    candidateHarness.messages = [createToolMessage('session-1/output.png')]
+    candidateHarness.adoptOutputAfterApplyError = new Error('采用结果暂时无法确认')
+    const job = await candidateHarness.manager.createCanvasImage(createCanvasImageInput('a'))
+
+    await candidateHarness.manager.run(job.id)
+
+    expect(candidateHarness.manager.get(job.id)).toMatchObject({
+      status: 'succeeded',
+      outputAssetId: 'asset-output',
+    })
+    expect(candidateHarness.manager.get(job.id)).not.toHaveProperty('terminalState')
+    expect(candidateHarness.candidateTerminalEvents).toEqual([])
+    expect(candidateHarness.canvasAdoptionCount).toBe(1)
+  })
+
+  test('Given 生产候选服务已接入 When Canvas 图片成功 Then 只登记候选且不自动采用', async () => {
+    const candidateHarness = createHarness({ withCandidateBatches: true })
+    candidateHarness.messages = [createToolMessage('session-1/output.png')]
+    const job = await candidateHarness.manager.createCanvasImage({
+      ...createCanvasImageInput('a'),
+      candidateBatchId: 'batch-1',
+    })
+
+    await candidateHarness.manager.run(job.id)
+
+    expect(candidateHarness.manager.get(job.id)).toMatchObject({
+      status: 'succeeded',
+      outputAssetId: 'asset-output',
+      candidateBatchId: 'batch-1',
+    })
+    expect(candidateHarness.candidateTerminalEvents).toEqual([{
+      jobId: job.id,
+      candidateBatchId: 'batch-1',
+      status: 'succeeded',
+      outputAssetId: 'asset-output',
+      error: null,
+    }])
+    expect(candidateHarness.canvasAdoptionCount).toBe(0)
+  })
+
   test('Given 相同 Agent Canvas 幂等 ID When 同 Manager 连续创建 Then 只写一个 journal 并复用任务', async () => {
     const jobId = `agent-canvas-${'a'.repeat(64)}`
 
@@ -1680,7 +1781,7 @@ describe('Design Job Manager', () => {
   })
 
   /** 创建覆盖真实状态机边界的可注入 Manager。 */
-  function createHarness() {
+  function createHarness(options: { withCandidateBatches?: boolean } = {}) {
     /** Design 上下文与项目指令测试使用的显式项目根。 */
     const projectRoot = join(cacheRoot, 'project')
     mkdirSync(projectRoot, { recursive: true })
@@ -1716,6 +1817,7 @@ describe('Design Job Manager', () => {
       canvasInputReferences: CanvasImageInputReference[]
       resolveCanvasInputReferences?: () => Promise<CanvasImageInputReference[]>
       adoptOutputError?: Error
+      adoptOutputAfterApplyError?: Error
       adoptOutputBarrier?: Promise<void>
       traceWriteError?: Error
       cleanupError?: Error
@@ -1780,6 +1882,14 @@ describe('Design Job Manager', () => {
     const cleanedSessionIds: string[] = []
     /** 用户删除创作任务时清理的单次 trace ID。 */
     const deletedTraceJobIds: string[] = []
+    /** 记录 Canvas 图片任务同步到候选批次的终态事实。 */
+    const candidateTerminalEvents: Array<{
+      jobId: string
+      candidateBatchId?: string
+      status: 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
+      outputAssetId: string | null
+      error: string | null
+    }> = []
     /** 记录 output 阶段副作用并验证 Manager 外层 lease。 */
     const recordOutputEffect = (effect: string): void => {
       outputEffects.push(effect)
@@ -1847,11 +1957,27 @@ describe('Design Job Manager', () => {
           await state.adoptOutputBarrier
           canvasAdoptionCount += 1
           adoptedOutputs.set(target.imageModuleId, assetId)
+          if (state.adoptOutputAfterApplyError) throw state.adoptOutputAfterApplyError
         },
         isOutputAdopted: async (_projectId, target, assetId) => (
           adoptedOutputs.get(target.imageModuleId) === assetId
         ),
       },
+      ...(options.withCandidateBatches
+        ? {
+            canvasImageCandidateBatches: {
+              recordJobTerminal: async (event) => {
+                candidateTerminalEvents.push({
+                  jobId: event.jobId,
+                  ...(event.candidateBatchId ? { candidateBatchId: event.candidateBatchId } : {}),
+                  status: event.status,
+                  outputAssetId: event.outputAssetId,
+                  error: event.error,
+                })
+              },
+            },
+          }
+        : {}),
       canvasImageInputResolver: {
         resolve: async () => state.resolveCanvasInputReferences
           ? state.resolveCanvasInputReferences()
@@ -2023,6 +2149,7 @@ describe('Design Job Manager', () => {
       warnings,
       cleanedSessionIds,
       deletedTraceJobIds,
+      candidateTerminalEvents,
       traceEntries,
       changedEvents,
       outputEffects,
@@ -2051,6 +2178,7 @@ describe('Design Job Manager', () => {
         state.resolveCanvasInputReferences = value
       },
       set adoptOutputError(value: Error | undefined) { state.adoptOutputError = value },
+      set adoptOutputAfterApplyError(value: Error | undefined) { state.adoptOutputAfterApplyError = value },
       set adoptOutputBarrier(value: Promise<void> | undefined) { state.adoptOutputBarrier = value },
       set traceWriteError(value: Error | undefined) { state.traceWriteError = value },
       set cleanupError(value: Error | undefined) { state.cleanupError = value },

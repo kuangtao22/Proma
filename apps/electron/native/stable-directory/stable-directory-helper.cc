@@ -125,7 +125,8 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
       if (value != "list" && value != "scan"
           && value != "canvas-intent-scan" && value != "canvas-intent-write"
           && value != "canvas-content-write" && value != "canvas-content-read"
-          && value != "canvas-content-list" && value != "canvas-content-move") {
+          && value != "canvas-content-list" && value != "canvas-content-move"
+          && value != "canvas-content-remove-marker") {
         *error = "unsupported mode";
         return false;
       }
@@ -185,7 +186,12 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
     return false;
   }
   const bool content_mode = config->mode.rfind("canvas-content-", 0) == 0;
-  const bool safe_child = config->child_name == "nodes" || config->child_name == "trash";
+  const bool safe_child = config->child_name == "nodes"
+      || config->child_name == "trash"
+      || config->child_name == "revisions";
+  const bool move_child = config->child_name == "nodes" || config->child_name == "trash";
+  const bool move_destination = config->destination_child_name == "nodes"
+      || config->destination_child_name == "trash";
   const bool needs_entry = config->mode != "canvas-content-list";
   const bool needs_file = config->mode == "canvas-content-write"
       || config->mode == "canvas-content-read";
@@ -196,16 +202,21 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
       ? config->destination_child_name.empty() && config->destination_entry_id.empty()
       : config->mode == "canvas-content-read"
         ? config->destination_child_name.empty() && config->destination_entry_id.empty()
-        : config->mode == "canvas-content-list"
+      : config->mode == "canvas-content-list"
           ? config->entry_id.empty() && config->destination_child_name.empty()
               && config->destination_entry_id.empty() && config->file_name.empty()
+          : config->mode == "canvas-content-remove-marker"
+            ? config->destination_child_name.empty()
+                && config->destination_entry_id.empty() && config->file_name.empty()
           : config->file_name.empty();
   if (content_mode && (config->roots.size() != 1 || !safe_child
+      || (config->mode == "canvas-content-remove-marker" && config->child_name != "trash")
       || config->max_entries == 0 || config->max_entries > 512 || !fields_match_mode
       || (needs_entry && (config->entry_id.empty() || config->entry_id.size() > 128))
       || (needs_file && !safe_file)
       || (config->mode == "canvas-content-move"
-          && ((config->destination_child_name != "nodes" && config->destination_child_name != "trash")
+          && (!move_child
+              || !move_destination
               || config->destination_child_name == config->child_name
               || config->destination_entry_id.empty()
               || config->destination_entry_id.size() > 128)))) {
@@ -675,7 +686,7 @@ bool RenameDirectoryNoReplace(int source_fd, const std::string& source_name,
 #endif
 }
 
-// 在已授权 Canvas root 下创建或打开固定 nodes/trash 根，禁止 symlink 和非目录对象。
+// 在已授权 Canvas root 下创建或打开固定内容根，禁止 symlink 和非目录对象。
 bool OpenCanvasContentRoot(const StableRoot& root, const std::string& name, bool create,
                            UniqueFd* directory, bool* missing, std::string* error) {
   *missing = false;
@@ -803,6 +814,63 @@ CanvasIntentWriteOutcome WriteCanvasContentAtomic(const Config& config, const St
   if (!entry_persisted || !content_root_persisted || !canvas_root_persisted) {
     outcome.durability_uncertain = true;
     outcome.error = "cannot persist canvas content directories";
+  }
+  return outcome;
+}
+
+// 仅删除只含 entry.json 的 trash tombstone；任何额外文件都会拒绝删除。
+CanvasIntentWriteOutcome RemoveCanvasTrashMarker(const Config& config, const StableRoot& root) {
+  CanvasIntentWriteOutcome outcome;
+  CanvasContentLock lock;
+  if (!lock.Acquire(root.descriptor.Get(), &outcome.error)) return outcome;
+  UniqueFd content_root;
+  bool missing = false;
+  if (!OpenCanvasContentRoot(root, config.child_name, false,
+      &content_root, &missing, &outcome.error)) return outcome;
+  if (missing) { outcome.commit_visible = true; return outcome; }
+  UniqueFd entry;
+  if (!OpenCanvasContentEntry(content_root.Get(), config.entry_id, false,
+      &entry, &missing, &outcome.error)) return outcome;
+  if (missing) { outcome.commit_visible = true; return outcome; }
+  UniqueFd duplicate(dup(entry.Get()));
+  DIR* raw_directory = duplicate.Get() < 0 ? nullptr : fdopendir(duplicate.Get());
+  if (!raw_directory) { outcome.error = "cannot inspect canvas trash marker"; return outcome; }
+  duplicate.Release();
+  std::unique_ptr<DIR, int (*)(DIR*)> directory(raw_directory, closedir);
+  std::size_t visible_entries = 0;
+  while (dirent* item = readdir(directory.get())) {
+    const std::string name(item->d_name);
+    if (name == "." || name == "..") continue;
+    ++visible_entries;
+    if (name != "entry.json") {
+      outcome.error = "canvas trash marker directory contains physical content";
+      return outcome;
+    }
+  }
+  directory.reset();
+  struct stat marker {};
+  if (visible_entries > 1
+      || (visible_entries == 1
+        && (fstatat(entry.Get(), "entry.json", &marker, AT_SYMLINK_NOFOLLOW) != 0
+          || !S_ISREG(marker.st_mode) || marker.st_nlink != 1))) {
+    outcome.error = "canvas trash marker directory is unsafe";
+    return outcome;
+  }
+  if (visible_entries == 1 && unlinkat(entry.Get(), "entry.json", 0) != 0) {
+    outcome.error = "cannot remove canvas trash marker file";
+    return outcome;
+  }
+  entry.Reset();
+  if (unlinkat(content_root.Get(), config.entry_id.c_str(), AT_REMOVEDIR) != 0) {
+    outcome.error = "cannot remove canvas trash marker directory";
+    return outcome;
+  }
+  outcome.commit_visible = true;
+  const bool content_root_persisted = fsync(content_root.Get()) == 0;
+  const bool canvas_root_persisted = fsync(root.descriptor.Get()) == 0;
+  if (!content_root_persisted || !canvas_root_persisted) {
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist canvas trash marker removal";
   }
   return outcome;
 }
@@ -1161,6 +1229,9 @@ int RunPlatform(const Config& config) {
     if (config.mode == "canvas-content-write") {
       const CanvasIntentWriteOutcome outcome = WriteCanvasContentAtomic(config, roots.front(), payload);
       if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
+    } else if (config.mode == "canvas-content-remove-marker") {
+      const CanvasIntentWriteOutcome outcome = RemoveCanvasTrashMarker(config, roots.front());
+      if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
     } else if (config.mode == "canvas-content-read") {
       if (!EmitLine(ReadCanvasContent(config, roots.front()), config, &budget)) return 4;
     } else if (config.mode == "canvas-content-list") {
@@ -1458,7 +1529,7 @@ void DeleteTemporaryWindowsFile(HANDLE handle) {
   SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition));
 }
 
-// 相对 Canvas HANDLE 创建或打开固定 nodes/trash 根，并拒绝 reparse point。
+// 相对 Canvas HANDLE 创建或打开固定内容根，并拒绝 reparse point。
 bool OpenCanvasContentRootWindows(const StableRoot& root, const std::string& name, bool create,
                                   UniqueHandle* directory, bool* missing, std::string* error) {
   *missing = false;
@@ -1656,6 +1727,87 @@ CanvasIntentWriteOutcome WriteCanvasContentAtomic(const Config& config, const St
   if (!entry_persisted || !content_root_persisted || !canvas_root_persisted) {
     outcome.durability_uncertain = true;
     outcome.error = "cannot persist canvas content directories";
+  }
+  return outcome;
+}
+
+// 仅删除只含 entry.json 的 Windows trash tombstone。
+CanvasIntentWriteOutcome RemoveCanvasTrashMarker(const Config& config, const StableRoot& root) {
+  CanvasIntentWriteOutcome outcome;
+  CanvasContentLock lock;
+  if (!lock.Acquire(root.handle.Get(), &outcome.error)) return outcome;
+  UniqueHandle content_root;
+  UniqueHandle entry;
+  bool missing = false;
+  if (!OpenCanvasContentRootWindows(root, config.child_name, false,
+      &content_root, &missing, &outcome.error)) return outcome;
+  if (missing) { outcome.commit_visible = true; return outcome; }
+  if (!OpenCanvasContentEntryWindows(content_root.Get(), config.entry_id, false,
+      &entry, &missing, &outcome.error)) return outcome;
+  if (missing) { outcome.commit_visible = true; return outcome; }
+  std::vector<unsigned char> buffer(64 * 1024);
+  bool restart = true;
+  std::size_t visible_entries = 0;
+  while (true) {
+    if (!GetFileInformationByHandleEx(entry.Get(),
+        restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
+        buffer.data(), static_cast<DWORD>(buffer.size()))) {
+      if (GetLastError() == ERROR_NO_MORE_FILES) break;
+      outcome.error = "cannot inspect canvas trash marker";
+      return outcome;
+    }
+    restart = false;
+    unsigned char* cursor = buffer.data();
+    while (true) {
+      auto* item = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(cursor);
+      const std::wstring name(item->FileName, item->FileNameLength / sizeof(wchar_t));
+      if (name != L"." && name != L"..") {
+        ++visible_entries;
+        if (name != L"entry.json"
+            || (item->FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+          outcome.error = "canvas trash marker directory contains physical content";
+          return outcome;
+        }
+      }
+      if (item->NextEntryOffset == 0) break;
+      cursor += item->NextEntryOffset;
+    }
+  }
+  if (visible_entries > 1) {
+    outcome.error = "canvas trash marker directory is unsafe";
+    return outcome;
+  }
+  FILE_DISPOSITION_INFO disposition {};
+  disposition.DeleteFile = TRUE;
+  if (visible_entries == 1) {
+    UniqueHandle marker;
+    if (!OpenRelativeWindows(entry.Get(), L"entry.json",
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_OPEN, FILE_NON_DIRECTORY_FILE,
+        &marker, &outcome.error)) return outcome;
+    BY_HANDLE_FILE_INFORMATION marker_identity {};
+    if (!GetFileInformationByHandle(marker.Get(), &marker_identity)
+        || (marker_identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0
+        || marker_identity.nNumberOfLinks != 1) {
+      outcome.error = "canvas trash marker file is unsafe";
+      return outcome;
+    }
+    if (!SetFileInformationByHandle(marker.Get(), FileDispositionInfo, &disposition, sizeof(disposition))) {
+      outcome.error = "cannot remove canvas trash marker file";
+      return outcome;
+    }
+    marker.Reset();
+  }
+  if (!SetFileInformationByHandle(entry.Get(), FileDispositionInfo, &disposition, sizeof(disposition))) {
+    outcome.error = "cannot remove canvas trash marker directory";
+    return outcome;
+  }
+  entry.Reset();
+  outcome.commit_visible = true;
+  const bool content_root_persisted = FlushCanvasDirectoryWindows(content_root.Get());
+  const bool canvas_root_persisted = FlushCanvasDirectoryWindows(root.handle.Get());
+  if (!content_root_persisted || !canvas_root_persisted) {
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist canvas trash marker removal";
   }
   return outcome;
 }
@@ -2131,6 +2283,9 @@ int RunPlatform(const Config& config) {
     std::string error;
     if (config.mode == "canvas-content-write") {
       const CanvasIntentWriteOutcome outcome = WriteCanvasContentAtomic(config, roots.front(), payload);
+      if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
+    } else if (config.mode == "canvas-content-remove-marker") {
+      const CanvasIntentWriteOutcome outcome = RemoveCanvasTrashMarker(config, roots.front());
       if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
     } else if (config.mode == "canvas-content-read") {
       if (!EmitLine(ReadCanvasContent(config, roots.front()), config, &budget)) return 4;

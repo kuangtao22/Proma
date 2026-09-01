@@ -33,7 +33,8 @@ export interface CanvasBatchPreparedResource {
   resourceId: string
   state: CanvasBatchPreparedResourceState
   createdByOperation: boolean | null
-  trashEntry: CanvasTrashEntry | null
+  /** 内容物理资源只规划一次，但保留每个被删节点的独立恢复快照。 */
+  trashEntries: CanvasTrashEntry[] | null
 }
 
 /** 位于目标 Canvas transactions 目录的可恢复批量事务。 */
@@ -64,7 +65,7 @@ export interface CanvasAgentBatchOperationDependencies {
   publish: (target: CanvasTarget, document: CanvasDocument, source: CanvasChangeSource) => void | Promise<void>
   scanIntents?: (target: CanvasTarget) => Promise<CanvasBatchOperationIntent[]>
   writeIntent?: (intent: CanvasBatchOperationIntent) => Promise<StableDirectoryNativeWriteOutcome>
-  contentLifecycle: Pick<CanvasContentNodeLifecycle, 'inspectBatchContent' | 'prepareBatchContent' | 'cleanupBatchContent' | 'prepareBatchDeletion' | 'restoreBatchDeletion' | 'assertBatchAgentNodeIdle'>
+  contentLifecycle: Pick<CanvasContentNodeLifecycle, 'inspectBatchContent' | 'prepareBatchContent' | 'cleanupBatchContent' | 'prepareBatchDeletions' | 'restoreBatchDeletions' | 'assertBatchAgentNodeIdle'>
   agentNodeCreation: Pick<CanvasAgentNodeCreationService, 'inspectBatchSession' | 'prepareBatchSession' | 'cleanupBatchSession'>
 }
 
@@ -118,19 +119,33 @@ function parseIntent(value: unknown, target: CanvasTarget, operationId: string):
   const resourceKeys = new Set<string>()
   const resources: CanvasBatchPreparedResource[] = []
   for (const resource of value.preparedResources) {
+    /** schema1 早期 intent 使用 singular trashEntry；读取时无损升级为数组。 */
+    const usesLegacyTrashEntry = isRecord(resource)
+      && hasExactKeys(resource, ['nodeId', 'kind', 'resourceId', 'state', 'createdByOperation', 'trashEntry'])
+    const usesCurrentTrashEntries = isRecord(resource)
+      && hasExactKeys(resource, ['nodeId', 'kind', 'resourceId', 'state', 'createdByOperation', 'trashEntries'])
     if (!isRecord(resource)
-      || !hasExactKeys(resource, ['nodeId', 'kind', 'resourceId', 'state', 'createdByOperation', 'trashEntry'])
+      || (!usesLegacyTrashEntry && !usesCurrentTrashEntries)
       || typeof resource.nodeId !== 'string' || resource.nodeId.length === 0
       || typeof resource.resourceId !== 'string' || resource.resourceId.length === 0
       || (resource.kind !== 'agent-session' && resource.kind !== 'content-directory' && resource.kind !== 'content-trash')
       || !validResourceStates.includes(resource.state as CanvasBatchPreparedResourceState)
       || (resource.createdByOperation !== null && typeof resource.createdByOperation !== 'boolean')
-      || (resource.kind === 'content-trash' && resource.trashEntry === null)
-      || (resource.kind !== 'content-trash' && resource.trashEntry !== null)) {
+      || (resource.kind === 'content-trash'
+        && (usesLegacyTrashEntry ? resource.trashEntry === null : !Array.isArray(resource.trashEntries)))
+      || (resource.kind !== 'content-trash'
+        && (usesLegacyTrashEntry ? resource.trashEntry !== null : resource.trashEntries !== null))) {
       throw new Error('CANVAS_BATCH_INTENT_INVALID')
     }
-    const trashEntry = resource.trashEntry === null ? null : parseCanvasTrashEntry(resource.trashEntry)
-    if (trashEntry && (trashEntry.nodeId !== resource.nodeId || trashEntry.contentId !== resource.resourceId)) {
+    /** 内部统一使用数组，保证共享内容的所有节点事实都参与签名与恢复。 */
+    const trashEntries = resource.kind !== 'content-trash'
+      ? null
+      : (usesLegacyTrashEntry ? [parseCanvasTrashEntry(resource.trashEntry)] : (resource.trashEntries as unknown[]).map(parseCanvasTrashEntry))
+    if (trashEntries && (trashEntries.length === 0
+      || trashEntries[0]?.nodeId !== resource.nodeId
+      || trashEntries.some((entry) => entry.contentId !== resource.resourceId)
+      || new Set(trashEntries.map((entry) => entry.trashId)).size !== trashEntries.length
+      || new Set(trashEntries.map((entry) => entry.nodeId)).size !== trashEntries.length)) {
       throw new Error('CANVAS_BATCH_INTENT_INVALID')
     }
     const key = JSON.stringify([resource.kind, resource.resourceId])
@@ -143,7 +158,7 @@ function parseIntent(value: unknown, target: CanvasTarget, operationId: string):
       resourceId: resource.resourceId,
       state: resource.state as CanvasBatchPreparedResourceState,
       createdByOperation: resource.createdByOperation,
-      trashEntry,
+      trashEntries,
     }
     assertResourceRecoveryState(normalizedResource)
     resources.push(normalizedResource)
@@ -348,35 +363,51 @@ function collectResources(
   for (const [key, identity] of finalIdentities) {
     if (baseIdentities.has(key)) continue
     const node = identity.node
-    const base = { nodeId: node.id, state: 'pending' as const, createdByOperation: null, trashEntry: null }
+    const base = { nodeId: node.id, state: 'pending' as const, createdByOperation: null, trashEntries: null }
     if (node.kind === 'agent') resources.push({ ...base, kind: 'agent-session', resourceId: node.agentSessionId })
     if (node.kind === 'image') resources.push({ ...base, kind: 'content-directory', resourceId: node.imageModuleId })
     if (node.kind === 'document') resources.push({ ...base, kind: 'content-directory', resourceId: node.documentId })
     if (node.kind === 'webview') resources.push({ ...base, kind: 'content-directory', resourceId: node.prototypeId })
   }
-  for (const [key, identity] of baseIdentities) {
-    const node = identity.node
+  /** 节点快照不能随资源身份去重；同一 contentId 的最后引用需要全部可恢复。 */
+  const baseNodesByIdentity = new Map<string, CanvasNode[]>()
+  for (const node of baseDocument.nodes) {
+    const identity = getNodeResourceIdentity(node)
+    if (!identity) continue
+    const nodes = baseNodesByIdentity.get(identity.key) ?? []
+    nodes.push(node)
+    baseNodesByIdentity.set(identity.key, nodes)
+  }
+  for (const [key, nodes] of baseNodesByIdentity) {
+    const node = nodes[0]!
     if (finalIdentities.has(key) || node.kind === 'agent') continue
     const contentId = node.kind === 'image' ? node.imageModuleId
       : node.kind === 'document' ? node.documentId : node.prototypeId
-    const entry = parseCanvasTrashEntry({
-      schemaVersion: 1,
+    const trashEntries = nodes.map((candidate) => parseCanvasTrashEntry({
+      schemaVersion: 2,
       trashId: randomUUID(),
-      nodeId: node.id,
-      kind: node.kind,
+      nodeId: candidate.id,
+      kind: candidate.kind,
       contentId,
-      title: node.title,
-      position: node.position,
+      title: candidate.title,
+      position: candidate.position,
       deletedRevision: baseDocument.revision,
       deletedAt: now(),
-    })
+      ...(candidate.kind === 'image' && candidate.adoptedAssetId
+        ? { adoptedAssetId: candidate.adoptedAssetId }
+        : {}),
+      ...(candidate.kind === 'document' || candidate.kind === 'webview'
+        ? { contentRevision: candidate.contentRevision }
+        : {}),
+      ...(candidate.kind === 'webview' ? { devicePreset: candidate.devicePreset } : {}),
+    }))
     resources.push({
       nodeId: node.id,
       kind: 'content-trash',
       resourceId: contentId,
       state: 'pending',
       createdByOperation: null,
-      trashEntry: entry,
+      trashEntries,
     })
   }
   return resources
@@ -388,7 +419,7 @@ function createResourcePlanSignature(resources: CanvasBatchPreparedResource[]): 
     nodeId: resource.nodeId,
     kind: resource.kind,
     resourceId: resource.resourceId,
-    trashEntry: resource.trashEntry,
+    trashEntries: resource.trashEntries,
   })))
 }
 
@@ -427,8 +458,8 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
         throw new Error('CANVAS_BATCH_INTENT_PLAN_MISMATCH')
       }
       /** trashId/deletedAt 是事务生成值，重规划时只允许复用 intent 中相同顺序的精确值。 */
-      const trashResources = intent.preparedResources.filter((resource) => resource.kind === 'content-trash')
-      /** 当前正在为 collectResources 提供的 trash 资源序号。 */
+      const trashEntries = intent.preparedResources.flatMap((resource) => resource.trashEntries ?? [])
+      /** 当前正在为 collectResources 提供的 trash 快照序号。 */
       let trashIndex = 0
       /** 从权威 base/final 图重建、仅复用事务 nonce 与时间的资源计划。 */
       const expectedResources = collectResources(
@@ -436,13 +467,13 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
         plan.expectedDocument,
         () => {
           /** 当前删除资源必须携带可重建的完整 trash 条目。 */
-          const entry = trashResources[trashIndex]?.trashEntry
+          const entry = trashEntries[trashIndex]
           if (!entry) throw new Error('CANVAS_BATCH_INTENT_PLAN_MISMATCH')
           return entry.trashId
         },
         () => {
           /** deletedAt 与同一 trashId 成对复用后推进到下一项。 */
-          const entry = trashResources[trashIndex]?.trashEntry
+          const entry = trashEntries[trashIndex]
           if (!entry) throw new Error('CANVAS_BATCH_INTENT_PLAN_MISMATCH')
           trashIndex += 1
           return entry.deletedAt
@@ -527,8 +558,8 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
       }
       try {
         if (resource.kind === 'content-trash') {
-          if (!resource.trashEntry) throw new Error('CANVAS_BATCH_INTENT_INVALID')
-          await dependencies.contentLifecycle.restoreBatchDeletion(intent.target, resource.trashEntry)
+          if (!resource.trashEntries) throw new Error('CANVAS_BATCH_INTENT_INVALID')
+          await dependencies.contentLifecycle.restoreBatchDeletions(intent.target, resource.trashEntries)
         } else if (resource.kind === 'content-directory') {
           await dependencies.contentLifecycle.cleanupBatchContent(intent.target, contentInput(requireResourceNode(nodes, resource)), `batch-${intent.operationId.slice(0, 8)}-${index}`)
         } else {
@@ -580,8 +611,8 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
         }
         let prepared: { created: boolean }
         if (resource.kind === 'content-trash') {
-          if (!resource.trashEntry) throw new Error('CANVAS_BATCH_INTENT_INVALID')
-          await dependencies.contentLifecycle.prepareBatchDeletion(intent.target, resource.trashEntry)
+          if (!resource.trashEntries) throw new Error('CANVAS_BATCH_INTENT_INVALID')
+          await dependencies.contentLifecycle.prepareBatchDeletions(intent.target, resource.trashEntries)
           prepared = { created: true }
         } else {
           if (!node) throw new Error('CANVAS_BATCH_OPERATION_INVALID')

@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type {
+  CanvasImageCandidateBatch,
+  CanvasImageCandidateBatchSummary,
   CanvasImageModuleSnapshot,
   DesignAsset,
   DesignJobRecord,
@@ -8,6 +10,7 @@ import type {
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { CanvasImageModuleViewState } from '@/atoms/native-canvas-atoms'
 import { CanvasImageWorkbench } from './CanvasImageWorkbench'
+import type { CanvasImageCandidateBatchWorkbenchProps } from './CanvasImageWorkbench'
 
 /** 创建 Canvas 生图工作台使用的模型选项。 */
 function createModelOption(): ImageGenerationModelOption {
@@ -105,6 +108,10 @@ function createState(overrides: Partial<CanvasImageModuleViewState> = {}): Canva
     },
     jobs,
     assets: [createAsset('asset-2', 'job-2'), createAsset('asset-1', 'job-1')],
+    imageVersions: [
+      { jobId: 'job-2', assetId: 'asset-2', createdAt: 200 },
+      { jobId: 'job-1', assetId: 'asset-1', createdAt: 100 },
+    ],
     assetBaseUrl: 'proma-file://asset-token',
     thumbnailBaseUrl: 'proma-file://thumbnail-token',
   }
@@ -128,7 +135,15 @@ function createState(overrides: Partial<CanvasImageModuleViewState> = {}): Canva
 }
 
 /** 使用稳定空回调渲染纯工作台视图。 */
-function renderWorkbench(state: CanvasImageModuleViewState, writable = true): string {
+function renderWorkbench(
+  state: CanvasImageModuleViewState,
+  writable = true,
+  options: {
+    exportState?: 'idle' | 'exporting'
+    exportError?: string | null
+    candidateBatch?: CanvasImageCandidateBatchWorkbenchProps
+  } = {},
+): string {
   return renderToStaticMarkup(
     <CanvasImageWorkbench
       state={state}
@@ -141,14 +156,84 @@ function renderWorkbench(state: CanvasImageModuleViewState, writable = true): st
       onRetry={() => undefined}
       onPreviewAsset={() => undefined}
       onAdoptAsset={() => undefined}
+      onExportAsset={() => undefined}
+      exportState={options.exportState ?? 'idle'}
+      exportError={options.exportError ?? null}
       onLoadTaskDetails={() => undefined}
       onConfigureModels={() => undefined}
       onRetryLoad={() => undefined}
+      candidateBatch={options.candidateBatch}
     />,
   )
 }
 
+/** 创建当前节点拥有候选版本的单节点批次。 */
+function createCandidateBatch(): CanvasImageCandidateBatch {
+  return {
+    schemaVersion: 1, batchId: 'batch-1', projectId: 'project-1', canvasId: 'canvas-1',
+    source: 'single', sourceSessionId: null, sourceToolCallId: null, status: 'ready',
+    entries: [{ nodeId: 'node-1', imageModuleId: 'module-1', initialAdoptedAssetId: 'asset-1', initialConfigRevision: 1, jobId: 'job-2', candidateAssetId: 'asset-2', status: 'candidate', error: null }],
+    adoption: null, createdAt: 100, updatedAt: 200,
+  }
+}
+
+/** 创建工作台候选批次区域使用的轻量摘要和命令。 */
+function createCandidateWorkbenchProps(): CanvasImageCandidateBatchWorkbenchProps {
+  const batch = createCandidateBatch()
+  const summary: CanvasImageCandidateBatchSummary = {
+    batchId: batch.batchId, projectId: batch.projectId, canvasId: batch.canvasId,
+    entries: batch.entries.map((entry) => ({ nodeId: entry.nodeId, status: entry.status })),
+    status: batch.status, totalCount: 1, candidateCount: 1, failedCount: 0, runningCount: 0,
+    updatedAt: batch.updatedAt,
+  }
+  return {
+    summary,
+    state: { phase: 'ready', batch, error: null, operation: 'idle' },
+    onLoad: () => undefined,
+    onContinue: () => undefined,
+    onAdopt: () => undefined,
+    onAbandon: () => undefined,
+  }
+}
+
 describe('Canvas 生图工作台', () => {
+  test('Given 当前节点存在候选版本 When 渲染详情 Then 候选验收区与正式历史并存', () => {
+    const html = renderWorkbench(createState(), true, { candidateBatch: createCandidateWorkbenchProps() })
+
+    expect(html).toContain('候选批次')
+    expect(html).toContain('当前版本')
+    expect(html).toContain('候选版本')
+    expect(html).toContain('历史版本')
+  })
+  test('Given 当前采用素材存在 When 渲染与历史预览 Then 导出始终绑定当前采用素材', () => {
+    const html = renderWorkbench(createState({ previewAssetId: 'asset-1' }))
+
+    expect(html).toContain('导出当前图片')
+    expect(html).toMatch(/<button[^>]*aria-label="导出当前图片"[^>]*>/u)
+  })
+
+  test('Given 采用素材缺失或正在导出 When 渲染 Then 导出按钮禁用', () => {
+    const current = createState()
+    const missingAssetHtml = renderWorkbench({
+      ...current,
+      snapshot: current.snapshot ? { ...current.snapshot, assets: [] } : null,
+    })
+    const exportingHtml = renderWorkbench(createState(), true, { exportState: 'exporting' })
+
+    expect(missingAssetHtml).toMatch(/<button(?=[^>]*disabled="")(?=[^>]*aria-label="导出当前图片")[^>]*>/u)
+    expect(exportingHtml).toContain('正在导出')
+    expect(exportingHtml).toMatch(/<button(?=[^>]*disabled="")(?=[^>]*aria-label="导出当前图片")[^>]*>/u)
+  })
+
+  test('Given 保存错误与导出错误同时存在 When 渲染 Then 两类反馈互不覆盖', () => {
+    const html = renderWorkbench(createState({ saveState: 'failed', error: '配置保存失败' }), true, {
+      exportError: '图片导出失败',
+    })
+
+    expect(html).toContain('配置保存失败')
+    expect(html).toContain('图片导出失败')
+  })
+
   test('Given 图片模块已加载 When 渲染 Then 显示完整配置、当前版本和直接上游摘要', () => {
     const html = renderWorkbench(createState())
 
@@ -204,6 +289,21 @@ describe('Canvas 生图工作台', () => {
     expect(html).toContain('正在预览历史版本')
     expect(html).toContain('设为当前')
     expect(html).toContain('历史版本')
+  })
+
+  test('Given 主进程版本事实与任务素材分叉 When 渲染 Then 历史只消费 imageVersions', () => {
+    const current = createState()
+    if (!current.snapshot) throw new Error('测试图片快照必须存在')
+    const html = renderWorkbench({
+      ...current,
+      snapshot: {
+        ...current.snapshot,
+        imageVersions: [{ jobId: 'job-1', assetId: 'asset-1', createdAt: 100 }],
+      },
+    })
+
+    expect(html).toContain('proma-file://thumbnail-token/asset-1.webp')
+    expect(html).not.toContain('proma-file://thumbnail-token/asset-2.webp')
   })
 
   test('Given 模块加载失败或只读 When 渲染 Then 保留局部恢复入口并禁用编辑', () => {

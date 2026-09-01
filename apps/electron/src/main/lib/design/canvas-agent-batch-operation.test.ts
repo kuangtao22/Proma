@@ -31,6 +31,8 @@ function createFixture(options: {
   const events: string[] = []
   const contents = new Set<string>()
   const trash = new Map<string, CanvasTrashEntry>()
+  /** 同一内容资源进入回收区的真实物理移动次数。 */
+  let trashMoveCalls = 0
   const sessions = new Map<string, AgentSessionMeta>()
   let mutateCalls = 0
   let activeMutations = 0
@@ -116,19 +118,26 @@ function createFixture(options: {
         return { created }
       },
       cleanupBatchContent: async (_target, input) => { contents.delete(input.contentId) },
-      prepareBatchDeletion: async (_target, entry) => {
-        if (trash.has(entry.trashId)) return
-        if (!contents.delete(entry.contentId)) throw new Error('CANVAS_CONTENT_NOT_FOUND')
-        trash.set(entry.trashId, structuredClone(entry))
-      },
-      restoreBatchDeletion: async (_target, entry) => {
-        const stored = trash.get(entry.trashId)
-        if (!stored) {
-          if (contents.has(entry.contentId)) return
-          throw new Error('CANVAS_TRASH_ENTRY_NOT_FOUND')
+      prepareBatchDeletions: async (_target, entries) => {
+        for (const entry of entries) {
+          if (trash.has(entry.trashId)) continue
+          if (contents.delete(entry.contentId)) trashMoveCalls += 1
+          else if (![...trash.values()].some((candidate) => candidate.contentId === entry.contentId)) {
+            throw new Error('CANVAS_CONTENT_NOT_FOUND')
+          }
+          trash.set(entry.trashId, structuredClone(entry))
         }
-        trash.delete(entry.trashId)
-        contents.add(entry.contentId)
+      },
+      restoreBatchDeletions: async (_target, entries) => {
+        for (const entry of entries) {
+          const stored = trash.get(entry.trashId)
+          if (!stored) {
+            if (contents.has(entry.contentId)) continue
+            throw new Error('CANVAS_TRASH_ENTRY_NOT_FOUND')
+          }
+          trash.delete(entry.trashId)
+          contents.add(entry.contentId)
+        }
       },
       assertBatchAgentNodeIdle: (_nodeId, sessionId) => {
         if (sessionId === options.busySessionId) throw new Error('AGENT_SESSION_BUSY')
@@ -171,6 +180,7 @@ function createFixture(options: {
     getDocument: () => document,
     getMutateCalls: () => mutateCalls,
     getMaxActiveMutations: () => maxActiveMutations,
+    getTrashMoveCalls: () => trashMoveCalls,
   }
 }
 
@@ -186,7 +196,7 @@ function batch(): CanvasBatchOperationEnvelope {
       { type: 'upsert-nodes', nodes: [
         { id: 'agent-1', kind: 'agent', title: '研究', position: { x: 0, y: 0 }, agentSessionId: 'session-agent-1' },
         { id: 'doc-1', kind: 'document', title: '结论', position: { x: 100, y: 0 }, documentId: 'content-doc-1', contentRevision: 0 },
-        { id: 'web-1', kind: 'webview', title: '原型', position: { x: 200, y: 0 }, prototypeId: 'content-web-1', contentRevision: 0 },
+        { id: 'web-1', kind: 'webview', title: '原型', position: { x: 200, y: 0 }, prototypeId: 'content-web-1', contentRevision: 0, devicePreset: 'desktop' },
       ] },
       { type: 'upsert-edges', edges: [
         { id: 'edge-1', sourceNodeId: 'agent-1', sourcePort: 'output', targetNodeId: 'doc-1', targetPort: 'input' },
@@ -348,7 +358,7 @@ describe('CanvasAgentBatchOperationService', () => {
   test.each([
     ['image', { id: 'net-image', kind: 'image', title: '图片', position: { x: 0, y: 0 }, imageModuleId: 'net-image-content' }],
     ['document', { id: 'net-document', kind: 'document', title: '文档', position: { x: 0, y: 0 }, documentId: 'net-document-content', contentRevision: 0 }],
-    ['webview', { id: 'net-webview', kind: 'webview', title: '原型', position: { x: 0, y: 0 }, prototypeId: 'net-webview-content', contentRevision: 0 }],
+    ['webview', { id: 'net-webview', kind: 'webview', title: '原型', position: { x: 0, y: 0 }, prototypeId: 'net-webview-content', contentRevision: 0, devicePreset: 'desktop' }],
     ['agent', { id: 'net-agent', kind: 'agent', title: 'Agent', position: { x: 0, y: 0 }, agentSessionId: 'net-agent-session' }],
   ] as const)('Given %s 节点同批 create→remove When 提交 Then 不创建孤立资源', async (_kind, node) => {
     const fixture = createFixture()
@@ -373,8 +383,8 @@ describe('CanvasAgentBatchOperationService', () => {
       { id: 'document-a', kind: 'document', title: '文档 A', position: { x: 0, y: 0 }, documentId: 'shared-document', contentRevision: 0 },
       { id: 'document-b', kind: 'document', title: '文档 B', position: { x: 1, y: 1 }, documentId: 'shared-document', contentRevision: 0 }],
     ['webview',
-      { id: 'webview-a', kind: 'webview', title: '原型 A', position: { x: 0, y: 0 }, prototypeId: 'shared-webview', contentRevision: 0 },
-      { id: 'webview-b', kind: 'webview', title: '原型 B', position: { x: 1, y: 1 }, prototypeId: 'shared-webview', contentRevision: 0 }],
+      { id: 'webview-a', kind: 'webview', title: '原型 A', position: { x: 0, y: 0 }, prototypeId: 'shared-webview', contentRevision: 0, devicePreset: 'desktop' },
+      { id: 'webview-b', kind: 'webview', title: '原型 B', position: { x: 1, y: 1 }, prototypeId: 'shared-webview', contentRevision: 0, devicePreset: 'desktop' }],
   ] as const)('Given %s 内容从 A 转移到 B When 同批删除并复用 identity Then 保留活动目录且不进入 trash', async (_kind, previous, next) => {
     const fixture = createFixture()
     fixture.getDocument().nodes.push(previous)
@@ -481,11 +491,11 @@ describe('CanvasAgentBatchOperationService', () => {
     expect(fixture.trash.size).toBe(0)
   })
 
-  test('Given 最后两个内容引用同批删除 When 提交 Then identity 只移动一次到 trash', async () => {
+  test('Given 两个共享 WebView 是最后引用 When 同批删除 Then 两条节点快照进入回收区且内容只移动一次', async () => {
     const fixture = createFixture()
     fixture.getDocument().nodes.push(
-      { id: 'last-a', kind: 'webview', title: 'A', position: { x: 0, y: 0 }, prototypeId: 'last-content', contentRevision: 0 },
-      { id: 'last-b', kind: 'webview', title: 'B', position: { x: 1, y: 1 }, prototypeId: 'last-content', contentRevision: 0 },
+      { id: 'last-a', kind: 'webview', title: '原型 A', position: { x: 10, y: 20 }, prototypeId: 'last-content', contentRevision: 3, devicePreset: 'desktop' },
+      { id: 'last-b', kind: 'webview', title: '原型 B', position: { x: 30, y: 40 }, prototypeId: 'last-content', contentRevision: 7, devicePreset: 'mobile' },
     )
     fixture.contents.add('last-content')
 
@@ -494,7 +504,12 @@ describe('CanvasAgentBatchOperationService', () => {
     })
 
     expect(fixture.contents.has('last-content')).toBe(false)
-    expect(fixture.trash.size).toBe(1)
+    expect(fixture.trash.size).toBe(2)
+    expect([...fixture.trash.values()]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ nodeId: 'last-a', title: '原型 A', position: { x: 10, y: 20 }, contentRevision: 3, devicePreset: 'desktop' }),
+      expect.objectContaining({ nodeId: 'last-b', title: '原型 B', position: { x: 30, y: 40 }, contentRevision: 7, devicePreset: 'mobile' }),
+    ]))
+    expect(fixture.getTrashMoveCalls()).toBe(1)
   })
 
   test('Given 跨类型节点复用同一 contentId When 批量转移 Then intent 与资源副作用前拒绝', async () => {
@@ -544,9 +559,9 @@ describe('CanvasAgentBatchOperationService', () => {
   test('Given 三类内容节点 When 批量删除 Then 单次图提交且内容全部进入 trash', async () => {
     const fixture = createFixture()
     fixture.getDocument().nodes.push(
-      { id: 'image-existing', kind: 'image', title: '图片', position: { x: 0, y: 0 }, imageModuleId: 'content-image' },
-      { id: 'doc-existing', kind: 'document', title: '文档', position: { x: 1, y: 0 }, documentId: 'content-doc', contentRevision: 0 },
-      { id: 'web-existing', kind: 'webview', title: '原型', position: { x: 2, y: 0 }, prototypeId: 'content-web', contentRevision: 0 },
+      { id: 'image-existing', kind: 'image', title: '图片', position: { x: 0, y: 0 }, imageModuleId: 'content-image', adoptedAssetId: 'asset-adopted' },
+      { id: 'doc-existing', kind: 'document', title: '文档', position: { x: 1, y: 0 }, documentId: 'content-doc', contentRevision: 7 },
+      { id: 'web-existing', kind: 'webview', title: '原型', position: { x: 2, y: 0 }, prototypeId: 'content-web', contentRevision: 9, devicePreset: 'mobile' },
     )
     fixture.contents.add('content-image')
     fixture.contents.add('content-doc')
@@ -558,6 +573,14 @@ describe('CanvasAgentBatchOperationService', () => {
     expect(result.document.nodes).toHaveLength(0)
     expect(fixture.contents.size).toBe(0)
     expect(fixture.trash.size).toBe(3)
+    /** 按 kind 读取规范化条目，直接验证批量 parser/恢复持久字段。 */
+    const trashEntries = [...fixture.trash.values()]
+    expect(trashEntries.find((entry) => entry.kind === 'image'))
+      .toMatchObject({ schemaVersion: 2, adoptedAssetId: 'asset-adopted' })
+    expect(trashEntries.find((entry) => entry.kind === 'document'))
+      .toMatchObject({ schemaVersion: 2, contentRevision: 7 })
+    expect(trashEntries.find((entry) => entry.kind === 'webview'))
+      .toMatchObject({ schemaVersion: 2, contentRevision: 9, devicePreset: 'mobile' })
     expect(fixture.getMutateCalls()).toBe(1)
   })
 
@@ -580,7 +603,7 @@ describe('CanvasAgentBatchOperationService', () => {
     const fixture = createFixture({ uncertainState: 'resources-created' })
     fixture.getDocument().nodes.push({
       id: 'web-existing', kind: 'webview', title: '原型', position: { x: 0, y: 0 },
-      prototypeId: 'content-web', contentRevision: 0,
+      prototypeId: 'content-web', contentRevision: 0, devicePreset: 'desktop',
     })
     fixture.contents.add('content-web')
     const input = { ...batch(), operations: [{ type: 'remove-nodes', nodeIds: ['web-existing'] }] }

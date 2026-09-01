@@ -21,6 +21,21 @@ function createRecordingIpc() {
 }
 
 describe('Design preload', () => {
+  test('Given 主进程图片快照夹带私有字段 When Preload 接收 Then 返回固定公开失败', async () => {
+    const api = createDesignPreloadApi({
+      invoke: async () => ({ ok: true, value: { internalPath: '/Users/private/module.json' } }),
+      on: () => undefined,
+      removeListener: () => undefined,
+    })
+
+    expect(await api.loadCanvasImageModule({
+      projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'module-1',
+    })).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_IMAGE_LOAD_FAILED', message: '生图节点暂时无法加载。' },
+    })
+  })
+
   test('Given Canvas 生图 API When 调用 Then 只向固定通道透传公开合同字段', async () => {
     const recorded = createRecordingIpc()
     const api = createDesignPreloadApi(recorded.ipc)
@@ -63,6 +78,31 @@ describe('Design preload', () => {
       { channel: CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', jobId: 'job-1' }] },
       { channel: CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', jobId: 'job-1', assetId: 'asset-1', expectedConfigRevision: 4 }] },
       { channel: CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA, args: [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1', mediaLeaseId: 'lease-1' }] },
+    ])
+  })
+
+  test('Given 图片候选批次 API When 调用 Then 只向四个固定通道透传公开字段', async () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    /** 批次身份携带的私有字段不得越过 Preload。 */
+    const input = {
+      projectId: 'p1', canvasId: 'canvas-1', batchId: 'batch-1',
+      internalPath: '/Users/private/candidate.json',
+    }
+
+    await api.getCanvasImageCandidateBatch(input)
+    await api.continueCanvasImageCandidateBatch(input)
+    await api.adoptCanvasImageCandidateBatch(Object.assign(
+      { ...input, mode: 'succeeded' as const },
+      { credential: 'secret' },
+    ))
+    await api.abandonCanvasImageCandidateBatch(input)
+
+    expect(recorded.invokes).toEqual([
+      { channel: CANVAS_IPC_CHANNELS.GET_IMAGE_CANDIDATE_BATCH, args: [{ projectId: 'p1', canvasId: 'canvas-1', batchId: 'batch-1' }] },
+      { channel: CANVAS_IPC_CHANNELS.CONTINUE_IMAGE_CANDIDATE_BATCH, args: [{ projectId: 'p1', canvasId: 'canvas-1', batchId: 'batch-1' }] },
+      { channel: CANVAS_IPC_CHANNELS.ADOPT_IMAGE_CANDIDATE_BATCH, args: [{ projectId: 'p1', canvasId: 'canvas-1', batchId: 'batch-1', mode: 'succeeded' }] },
+      { channel: CANVAS_IPC_CHANNELS.ABANDON_IMAGE_CANDIDATE_BATCH, args: [{ projectId: 'p1', canvasId: 'canvas-1', batchId: 'batch-1' }] },
     ])
   })
 
@@ -110,6 +150,8 @@ describe('Design preload', () => {
     const api = createDesignPreloadApi(recorded.ipc)
     const calls: Array<[() => Promise<unknown>, string, unknown[]]> = [
       [() => api.loadCanvasWorkspace({ projectId: 'p1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.LOAD, [{ projectId: 'p1', canvasId: 'canvas-1' }]],
+      [() => api.loadCanvasWebview({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'webview-1', prototypeId: 'prototype-1', contentRevision: 2 }), CANVAS_IPC_CHANNELS.LOAD_WEBVIEW, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'webview-1', prototypeId: 'prototype-1', contentRevision: 2 }]],
+      [() => api.loadCanvasWebviewPreview({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'webview-1', prototypeId: 'prototype-1', contentRevision: 2, devicePreset: 'mobile' }), CANVAS_IPC_CHANNELS.LOAD_WEBVIEW_PREVIEW, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'webview-1', prototypeId: 'prototype-1', contentRevision: 2, devicePreset: 'mobile' }]],
       [() => api.saveCanvasMutations({ projectId: 'p1', canvasId: 'canvas-1', expectedRevision: 0, mutations: [] }), CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, [{ projectId: 'p1', canvasId: 'canvas-1', expectedRevision: 0, mutations: [] }]],
       [() => api.createCanvasContentNode({ projectId: 'p1', canvasId: 'canvas-1', operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-image', kind: 'image', contentId: 'content-image', title: '图片', position: { x: 1, y: 2 }, expectedRevision: 0 }), CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, [{ projectId: 'p1', canvasId: 'canvas-1', operationId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-image', kind: 'image', contentId: 'content-image', title: '图片', position: { x: 1, y: 2 }, expectedRevision: 0 }]],
       [() => api.deleteCanvasNode({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', operationId: '22222222-2222-4222-8222-222222222222', expectedRevision: 1 }), CANVAS_IPC_CHANNELS.DELETE_NODE, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', operationId: '22222222-2222-4222-8222-222222222222', expectedRevision: 1 }]],
@@ -176,6 +218,51 @@ describe('Design preload', () => {
     expect(recorded.invokes).toEqual(calls.map(([, channel, args]) => ({ channel, args })))
   })
 
+  test('Given 完整文本产物目标 When 调用五类 API Then 只透传公开字段且导出不接受路径', async () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'doc-1',
+      kind: 'document' as const, contentId: 'content-1', contentRevision: 2,
+      path: '/private/content.md',
+    }
+    const identity = {
+      projectId: target.projectId, canvasId: target.canvasId, nodeId: target.nodeId,
+      kind: target.kind, contentId: target.contentId,
+    }
+    const update = {
+      ...identity, operationId: '11111111-1111-4111-8111-111111111111',
+      expectedCanvasRevision: 4, expectedContentRevision: 2, content: '# 新版',
+      path: '/private/content.md',
+    }
+    const adopt = {
+      ...identity, operationId: '22222222-2222-4222-8222-222222222222',
+      expectedCanvasRevision: 5, expectedContentRevision: 3, revision: 1,
+      path: '/private/content.md',
+    }
+
+    await api.loadCanvasTextArtifact(target)
+    await api.updateCanvasTextArtifact(update)
+    await api.listCanvasArtifactRevisions(identity)
+    await api.adoptCanvasArtifactRevision(adopt)
+    await api.exportCanvasArtifact(target)
+
+    expect(recorded.invokes).toEqual([
+      { channel: CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT, args: [{ ...identity, contentRevision: 2 }] },
+      { channel: CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT, args: [{
+        ...identity, operationId: update.operationId, expectedCanvasRevision: 4,
+        expectedContentRevision: 2, content: '# 新版',
+      }] },
+      { channel: CANVAS_IPC_CHANNELS.LIST_ARTIFACT_REVISIONS, args: [identity] },
+      { channel: CANVAS_IPC_CHANNELS.ADOPT_ARTIFACT_REVISION, args: [{
+        ...identity, operationId: adopt.operationId, expectedCanvasRevision: 5,
+        expectedContentRevision: 3, revision: 1,
+      }] },
+      { channel: CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT, args: [{ ...identity, contentRevision: 2 }] },
+    ])
+    expect(JSON.stringify(recorded.invokes)).not.toContain('/private')
+  })
+
   test('Given Electron invoke rejection 含内部信息 When preload 调用 LOAD Then 丢弃原始正文', async () => {
     const recorded = createRecordingIpc()
     /** 模拟 Electron 对主进程 reject 的包装异常。 */
@@ -194,6 +281,26 @@ describe('Design preload', () => {
     })
     expect(JSON.stringify(result)).not.toContain('remote method')
     expect(JSON.stringify(result)).not.toContain('/Users/name')
+  })
+
+  test('Given WebView 输入含额外内部字段 When preload 加载 Then 只发送公开完整身份', async () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+
+    const target = {
+      projectId: 'p1', canvasId: 'canvas-1', nodeId: 'webview-1',
+      prototypeId: 'prototype-1', contentRevision: 2,
+      internalPath: '/private/index.html',
+    }
+    await api.loadCanvasWebview(target)
+
+    expect(recorded.invokes).toEqual([{
+      channel: CANVAS_IPC_CHANNELS.LOAD_WEBVIEW,
+      args: [{
+        projectId: 'p1', canvasId: 'canvas-1', nodeId: 'webview-1',
+        prototypeId: 'prototype-1', contentRevision: 2,
+      }],
+    }])
   })
 
   test('Given 关联 invoke rejection 含内部信息 When preload 调用 Then 返回固定安全错误', async () => {

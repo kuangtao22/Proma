@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { createEmptyCanvasDocument, createEmptyDesignDocument } from '@proma/shared'
 import type {
   CanvasChangeEvent,
+  CanvasImageCandidateBatch,
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
   DesignJobRecord,
@@ -14,6 +15,230 @@ import {
 } from './design-adapter'
 
 describe('Design renderer adapter', () => {
+  test('Given 四类候选批次调用 When Preload 返回 Then 严格重建批次并拒绝私有字段', async () => {
+    const input = { projectId: 'project-1', canvasId: 'canvas-1', batchId: 'batch-1' }
+    const batch: CanvasImageCandidateBatch = {
+      schemaVersion: 1,
+      ...input,
+      source: 'single',
+      sourceSessionId: null,
+      sourceToolCallId: null,
+      status: 'ready',
+      entries: [{
+        nodeId: 'node-1', imageModuleId: 'module-1', initialAdoptedAssetId: null,
+        initialConfigRevision: 1, jobId: 'job-1', candidateAssetId: 'asset-1',
+        status: 'candidate', error: null,
+      }],
+      adoption: null,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    const received: unknown[] = []
+    const adapter = createDesignAdapter({
+      getCanvasImageCandidateBatch: async (value) => { received.push(value); return { ok: true, value: batch } },
+      continueCanvasImageCandidateBatch: async (value) => { received.push(value); return { ok: true, value: batch } },
+      adoptCanvasImageCandidateBatch: async (value) => { received.push(value); return { ok: true, value: batch } },
+      abandonCanvasImageCandidateBatch: async (value) => { received.push(value); return { ok: true, value: batch } },
+    })
+
+    expect(await adapter.getCanvasImageCandidateBatch(input)).toEqual(batch)
+    expect(await adapter.continueCanvasImageCandidateBatch(input)).toEqual(batch)
+    expect(await adapter.adoptCanvasImageCandidateBatch({ ...input, mode: 'all' })).toEqual(batch)
+    expect(await adapter.abandonCanvasImageCandidateBatch(input)).toEqual(batch)
+    expect(received).toEqual([input, input, { ...input, mode: 'all' }, input])
+
+    await expect(createDesignAdapter({
+      getCanvasImageCandidateBatch: async () => ({
+        ok: true,
+        value: { ...batch, internalPath: '/Users/private/candidate.json' } as never,
+      }),
+    }).getCanvasImageCandidateBatch(input)).rejects.toMatchObject({
+      code: 'CANVAS_IMAGE_BATCH_INVALID',
+    })
+  })
+
+  test('Given 相同完整文本目标并发读取且连续写入 When adapter 调用 Then 读合并、写独立并严格校验返回身份', async () => {
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'doc-1',
+      kind: 'document' as const, contentId: 'content-1', contentRevision: 2,
+    }
+    const revision = {
+      kind: 'document' as const, contentId: 'content-1', revision: 2, parentRevision: 1,
+      contentHash: 'a'.repeat(64), createdBy: { type: 'user' as const }, createdAt: 1,
+    }
+    const artifact = { target, revision, content: '# 当前版本' }
+    let loadCalls = 0
+    let listCalls = 0
+    let updateCalls = 0
+    /** 两个读取 Promise 由测试显式释放，以验证在途合并而非结果缓存。 */
+    let resolveLoad: ((value: { ok: true; value: typeof artifact }) => void) | undefined
+    let resolveList: ((value: { ok: true; value: typeof revision[] }) => void) | undefined
+    const loadResult = new Promise<{ ok: true; value: typeof artifact }>((resolve) => { resolveLoad = resolve })
+    const listResult = new Promise<{ ok: true; value: typeof revision[] }>((resolve) => { resolveList = resolve })
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.revision = 5
+    document.nodes = [{
+      id: 'doc-1', kind: 'document', title: '文档', position: { x: 0, y: 0 },
+      documentId: 'content-1', contentRevision: 3,
+    }]
+    const mutation = {
+      snapshot: { document, writable: true as const, nodeIssues: [] },
+      artifact: {
+        target: { ...target, contentRevision: 3 },
+        revision: { ...revision, revision: 3, parentRevision: 2 },
+        content: '# 新版本',
+      },
+    }
+    const adapter = createDesignAdapter({
+      loadCanvasTextArtifact: () => { loadCalls += 1; return loadResult },
+      listCanvasArtifactRevisions: () => { listCalls += 1; return listResult },
+      updateCanvasTextArtifact: async () => { updateCalls += 1; return { ok: true, value: mutation } },
+    })
+
+    const loads = [adapter.loadCanvasTextArtifact(target), adapter.loadCanvasTextArtifact({ ...target })]
+    const lists = [adapter.listCanvasArtifactRevisions(target), adapter.listCanvasArtifactRevisions({ ...target })]
+    expect(loadCalls).toBe(1)
+    expect(listCalls).toBe(1)
+    resolveLoad?.({ ok: true, value: artifact })
+    resolveList?.({ ok: true, value: [revision] })
+    await expect(Promise.all(loads)).resolves.toEqual([artifact, artifact])
+    await expect(Promise.all(lists)).resolves.toEqual([[revision], [revision]])
+
+    const update = {
+      projectId: target.projectId, canvasId: target.canvasId, nodeId: target.nodeId,
+      kind: target.kind, contentId: target.contentId,
+      operationId: '11111111-1111-4111-8111-111111111111',
+      expectedCanvasRevision: 4, expectedContentRevision: 2, content: '# 新版本',
+    }
+    await Promise.all([adapter.updateCanvasTextArtifact(update), adapter.updateCanvasTextArtifact({ ...update })])
+    expect(updateCalls).toBe(2)
+
+    await expect(createDesignAdapter({
+      loadCanvasTextArtifact: async () => ({
+        ok: true,
+        value: { ...artifact, target: { ...target, nodeId: 'other-node' } },
+      }),
+    }).loadCanvasTextArtifact(target)).rejects.toMatchObject({ code: 'CANVAS_ARTIFACT_LOAD_FAILED' })
+  })
+
+  test('Given 历史最大 revision 高于当前采用版本 When update 或 adopt 返回 Then 校验权威节点与目标 revision 语义', async () => {
+    const identity = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'doc-1',
+      kind: 'document' as const, contentId: 'content-1',
+    }
+    const update = {
+      ...identity,
+      operationId: '33333333-3333-4333-8333-333333333333',
+      expectedCanvasRevision: 4,
+      expectedContentRevision: 2,
+      content: '# 新版本',
+    }
+    const adopt = {
+      ...identity,
+      operationId: '44444444-4444-4444-8444-444444444444',
+      expectedCanvasRevision: 5,
+      expectedContentRevision: 7,
+      revision: 1,
+    }
+    /** 构造返回 snapshot，使节点 revision 与正文快照保持同一权威事实。 */
+    const createMutation = (contentRevision: number, canvasRevision = 6) => {
+      const document = createEmptyCanvasDocument(identity.projectId, identity.canvasId, 1)
+      document.revision = canvasRevision
+      document.nodes = [{
+        id: identity.nodeId,
+        kind: 'document',
+        title: '文档',
+        position: { x: 0, y: 0 },
+        documentId: identity.contentId,
+        contentRevision,
+      }]
+      return {
+        snapshot: { document, writable: true as const, nodeIssues: [] },
+        artifact: {
+          target: { ...identity, contentRevision },
+          revision: {
+            kind: identity.kind,
+            contentId: identity.contentId,
+            revision: contentRevision,
+            parentRevision: contentRevision > 0 ? contentRevision - 1 : null,
+            contentHash: 'c'.repeat(64),
+            createdBy: { type: 'user' as const },
+            createdAt: 3,
+          },
+          content: '# 历史分支之后的新版本',
+        },
+      }
+    }
+
+    /** 历史 max 为 6 时，update 从当前采用 2 跳到 7 是合法服务语义。 */
+    await expect(createDesignAdapter({
+      updateCanvasTextArtifact: async () => ({ ok: true, value: createMutation(7) }),
+    }).updateCanvasTextArtifact(update)).resolves.toHaveProperty('artifact.target.contentRevision', 7)
+
+    /** update 不得返回未前进的 revision。 */
+    await expect(createDesignAdapter({
+      updateCanvasTextArtifact: async () => ({ ok: true, value: createMutation(2) }),
+    }).updateCanvasTextArtifact(update)).rejects.toMatchObject({ code: 'CANVAS_ARTIFACT_SAVE_FAILED' })
+
+    /** adopt 必须精确返回用户选择的 revision，而不能悄悄采用其它历史版本。 */
+    await expect(createDesignAdapter({
+      adoptCanvasArtifactRevision: async () => ({ ok: true, value: createMutation(3) }),
+    }).adoptCanvasArtifactRevision(adopt)).rejects.toMatchObject({ code: 'CANVAS_ARTIFACT_SAVE_FAILED' })
+
+    /** artifact 与权威图节点 revision 漂移时同样稳定拒绝。 */
+    const mismatched = createMutation(7)
+    const node = mismatched.snapshot.document.nodes[0]
+    if (node?.kind === 'document') node.contentRevision = 6
+    await expect(createDesignAdapter({
+      updateCanvasTextArtifact: async () => ({ ok: true, value: mismatched }),
+    }).updateCanvasTextArtifact(update)).rejects.toMatchObject({ code: 'CANVAS_ARTIFACT_SAVE_FAILED' })
+
+    /** 图 revision 未超过调用基线时，返回属于陈旧或伪造事务。 */
+    await expect(createDesignAdapter({
+      updateCanvasTextArtifact: async () => ({ ok: true, value: createMutation(7, 4) }),
+    }).updateCanvasTextArtifact(update)).rejects.toMatchObject({ code: 'CANVAS_ARTIFACT_SAVE_FAILED' })
+    await expect(createDesignAdapter({
+      adoptCanvasArtifactRevision: async () => ({ ok: true, value: createMutation(1, 5) }),
+    }).adoptCanvasArtifactRevision(adopt)).rejects.toMatchObject({ code: 'CANVAS_ARTIFACT_SAVE_FAILED' })
+
+    /** Renderer 必须复用 Shared 深层 parser，任何层级的私有或未知字段都不能穿透。 */
+    const invalidMutations = [
+      (() => {
+        const value = createMutation(7)
+        Object.assign(value.snapshot, { privatePath: '/private/snapshot.json' })
+        return value
+      })(),
+      (() => {
+        const value = createMutation(7)
+        Object.assign(value.snapshot.document, { privatePath: '/private/document.json' })
+        return value
+      })(),
+      (() => {
+        const value = createMutation(7)
+        Object.assign(value.snapshot.document.viewport, { extra: true })
+        return value
+      })(),
+      (() => {
+        const value = createMutation(7)
+        Object.assign(value.snapshot.document.nodes[0]!, { privatePath: '/private/node.json' })
+        return value
+      })(),
+      (() => {
+        const value = createMutation(7)
+        value.snapshot.document.edges = [{
+          id: 'edge-1', sourceNodeId: identity.nodeId, sourcePort: 'output',
+          targetNodeId: identity.nodeId, targetPort: 'input', relation: 'association', extra: true,
+        } as never]
+        return value
+      })(),
+    ]
+    for (const value of invalidMutations) {
+      await expect(createDesignAdapter({
+        updateCanvasTextArtifact: async () => ({ ok: true, value }),
+      }).updateCanvasTextArtifact(update)).rejects.toMatchObject({ code: 'CANVAS_ARTIFACT_SAVE_FAILED' })
+    }
+  })
+
   test('Given Agent-画布关联 preload 成功 When adapter 调用 Then 解包结果并保留输入身份', async () => {
     const received: unknown[] = []
     const binding = {
@@ -112,6 +337,7 @@ describe('Design renderer adapter', () => {
       },
       jobs: [],
       assets: [],
+      imageVersions: [],
       assetBaseUrl: 'media://asset',
       thumbnailBaseUrl: 'media://thumbnail',
     } satisfies CanvasImageModuleSnapshot
@@ -135,7 +361,9 @@ describe('Design renderer adapter', () => {
     /** 媒体释放必须携带 LOAD 快照签发的精确授权身份。 */
     const releaseInput = { ...target, mediaLeaseId: snapshot.mediaLeaseId }
 
-    expect(await adapter.loadCanvasImageModule(target)).toBe(snapshot)
+    const loadedSnapshot = await adapter.loadCanvasImageModule(target)
+    expect(loadedSnapshot).toEqual(snapshot)
+    expect(loadedSnapshot).not.toBe(snapshot)
     expect(await adapter.saveCanvasImageModule(saveInput)).toBe(config)
     expect(await adapter.createCanvasImageJob(createInput)).toBe(job)
     expect(await adapter.cancelCanvasImageJob(jobInput)).toBe(job)
@@ -167,6 +395,16 @@ describe('Design renderer adapter', () => {
       code: 'CANVAS_IMAGE_JOB_FAILED', message: '图片任务操作失败，请重试。',
     })
     await expect(rejectedPromise).rejects.not.toThrow('/Users/private')
+
+    const invalidSnapshot = createDesignAdapter({
+      loadCanvasImageModule: async () => ({
+        ok: true,
+        value: { internalPath: '/Users/private/image-module.json' } as never,
+      }),
+    })
+    await expect(invalidSnapshot.loadCanvasImageModule(target)).rejects.toMatchObject({
+      code: 'CANVAS_IMAGE_LOAD_FAILED', message: '生图节点暂时无法加载。',
+    })
     const conflicted = createDesignAdapter({
       adoptCanvasImageAsset: async () => ({
         ok: false,
@@ -258,6 +496,51 @@ describe('Design renderer adapter', () => {
       name: 'CanvasPublicOperationError',
       code: 'CANVAS_LOAD_FAILED',
       message: '画布暂时无法加载。',
+    })
+  })
+
+  test('Given WebView preload 成功、公开失败或缺失 When adapter 加载 Then 解包快照并统一公开错误', async () => {
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'webview-1',
+      prototypeId: 'prototype-1', contentRevision: 2,
+    }
+    const snapshot = { target, html: '<main>首页</main>' }
+    const received: unknown[] = []
+    const adapter = createDesignAdapter({
+      loadCanvasWebview: async (input) => {
+        received.push(input)
+        return { ok: true, value: snapshot }
+      },
+    })
+
+    expect(await adapter.loadCanvasWebview(target)).toBe(snapshot)
+    expect(received).toEqual([target])
+    await expect(createDesignAdapter({}).loadCanvasWebview(target)).rejects.toMatchObject({
+      code: 'CANVAS_WEBVIEW_LOAD_FAILED', message: '原型暂时无法加载。',
+    })
+    await expect(createDesignAdapter({
+      loadCanvasWebview: async () => ({
+        ok: false,
+        error: { code: 'CANVAS_WEBVIEW_LOAD_FAILED', message: '原型暂时无法加载。' },
+      }),
+    }).loadCanvasWebview(target)).rejects.toMatchObject({
+      code: 'CANVAS_WEBVIEW_LOAD_FAILED', message: '原型暂时无法加载。',
+    })
+  })
+
+  test('Given WebView 静态预览 preload When adapter 加载 Then 保留完整目标并净化失败', async () => {
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'webview-1',
+      prototypeId: 'prototype-1', contentRevision: 2, devicePreset: 'desktop' as const,
+    }
+    const snapshot = { target, previewUrl: 'proma-file://preview', width: 1440, height: 900 }
+    const adapter = createDesignAdapter({
+      loadCanvasWebviewPreview: async (input) => ({ ok: true, value: { ...snapshot, target: input } }),
+    })
+
+    expect(await adapter.loadCanvasWebviewPreview(target)).toEqual(snapshot)
+    await expect(createDesignAdapter({}).loadCanvasWebviewPreview(target)).rejects.toMatchObject({
+      code: 'CANVAS_WEBVIEW_PREVIEW_FAILED', message: '原型预览生成失败，请重试。',
     })
   })
 

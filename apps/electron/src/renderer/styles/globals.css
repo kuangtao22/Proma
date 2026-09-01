@@ -2733,3 +2733,20 @@
 .vault-ink-mde .vault-mermaid-block .mermaid-block-wrapper {
   margin: 0;
 }
+
+/* Canvas 运行轮廓仅改变 SVG 描边偏移，不触发卡片布局或 React 帧更新。 */
+@keyframes canvas-running-dash-offset {
+  to {
+    stroke-dashoffset: -28;
+  }
+}
+
+.canvas-running-dash {
+  animation: canvas-running-dash-offset 1.2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .canvas-running-dash {
+    animation: none;
+  }
+}

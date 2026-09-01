@@ -417,6 +417,7 @@ describe('Canvas Agent 节点创建事务', () => {
       relationship: {
         sourceNodeId: sourceNode.id,
         edgeId: '33333333-3333-4333-8333-333333333333',
+        relation: 'derives' as const,
       },
     }
 
@@ -430,6 +431,7 @@ describe('Canvas Agent 节点创建事务', () => {
       sourcePort: 'output',
       targetNodeId: 'target-1',
       targetPort: 'input',
+      relation: 'derives',
     })
     expect(harness.mutationBatches).toEqual([[
       expect.objectContaining({ type: 'upsert-nodes' }),
@@ -455,6 +457,7 @@ describe('Canvas Agent 节点创建事务', () => {
       relationship: {
         sourceNodeId: 'source-1',
         edgeId: '33333333-3333-4333-8333-333333333333',
+        relation: 'derives' as const,
       },
     }
     const service = harness.createService()
@@ -481,6 +484,7 @@ describe('Canvas Agent 节点创建事务', () => {
       relationship: {
         sourceNodeId: 'node-1',
         edgeId: '44444444-4444-4444-8444-444444444444',
+        relation: 'derives',
       },
     })).rejects.toThrow('源节点会话不可用')
 
@@ -553,6 +557,7 @@ describe('Canvas Agent 节点创建事务', () => {
       relationship: {
         sourceNodeId: 'node-1',
         edgeId: relationshipEdgeId,
+        relation: 'derives',
       },
     })
     /** 用户删除源节点时图 Store 同步删除关联边，但保留下游 Agent 及其对话。 */
@@ -648,6 +653,7 @@ describe('Canvas Agent 节点创建事务', () => {
         sourcePort: 'output',
         targetNodeId: 'image-1',
         targetPort: 'input',
+        relation: 'depends-on',
       }],
     })
 

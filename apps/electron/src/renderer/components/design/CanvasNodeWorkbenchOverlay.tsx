@@ -9,6 +9,12 @@ export interface CanvasWorkbenchSize {
   height: number
 }
 
+/** 工作台在 Canvas surface 内的屏幕像素位置。 */
+export interface CanvasWorkbenchPosition {
+  x: number
+  y: number
+}
+
 /** 工作台双向缩放计算所需的稳定输入。 */
 export interface CanvasWorkbenchResizeInput {
   initialSize: CanvasWorkbenchSize
@@ -17,17 +23,24 @@ export interface CanvasWorkbenchResizeInput {
   availableSize: CanvasWorkbenchSize
 }
 
+/** 工作台标题拖动计算所需的稳定输入。 */
+export interface CanvasWorkbenchMoveInput {
+  initialPosition: CanvasWorkbenchPosition
+  pointerDelta: CanvasWorkbenchPosition
+  workbenchSize: CanvasWorkbenchSize
+  surfaceSize: CanvasWorkbenchSize
+}
+
 /** 工作台在正常桌面窗口下仍可操作的最小宽度。 */
 const CANVAS_WORKBENCH_MIN_WIDTH = 360
 /** 工作台在正常桌面窗口下仍可操作的最小高度。 */
 const CANVAS_WORKBENCH_MIN_HEIGHT = 320
+/** 浮窗与 Canvas surface 边界保持的最小屏幕间距。 */
+const CANVAS_WORKBENCH_SURFACE_MARGIN = 12
+/** 浮窗与目标节点之间保持的最小屏幕间距。 */
+const CANVAS_WORKBENCH_NODE_GAP = 12
 
 /** 单次指针拖拽期间保持不变的尺寸与画布边界。 */
-interface CanvasWorkbenchResizeSession extends CanvasWorkbenchResizeInput {
-  pointerId: number
-  pointerOrigin: { x: number; y: number }
-}
-
 /** 工作台缩放手势控制器依赖。 */
 export interface CanvasWorkbenchResizeGestureDependencies {
   /** 高频 move 仅更新 Overlay 局部预览。 */
@@ -40,6 +53,19 @@ export interface CanvasWorkbenchResizeGestureDependencies {
 export interface CanvasWorkbenchResizeGestureController {
   start: (input: CanvasWorkbenchResizeInput) => void
   move: (pointerDelta: CanvasWorkbenchResizeInput['pointerDelta']) => void
+  finish: () => void
+}
+
+/** 工作台移动手势控制器依赖。 */
+export interface CanvasWorkbenchMoveGestureDependencies {
+  onPreview: (position: CanvasWorkbenchPosition) => void
+  onCommit: (position: CanvasWorkbenchPosition) => void
+}
+
+/** 工作台移动手势控制器。 */
+export interface CanvasWorkbenchMoveGestureController {
+  start: (input: Omit<CanvasWorkbenchMoveInput, 'pointerDelta'>) => void
+  move: (pointerDelta: CanvasWorkbenchPosition) => void
   finish: () => void
 }
 
@@ -73,6 +99,36 @@ export function createCanvasWorkbenchResizeGestureController(
   }
 }
 
+/**
+ * 创建只在标题拖动结束时提交会话位置的控制器。
+ * @param dependencies 局部预览与最终提交回调。
+ * @returns 可重复开始、移动和结束的轻量手势控制器。
+ */
+export function createCanvasWorkbenchMoveGestureController(
+  dependencies: CanvasWorkbenchMoveGestureDependencies,
+): CanvasWorkbenchMoveGestureController {
+  let input: Omit<CanvasWorkbenchMoveInput, 'pointerDelta'> | null = null
+  let latestPosition: CanvasWorkbenchPosition | null = null
+  return {
+    start: (nextInput) => {
+      input = nextInput
+      latestPosition = nextInput.initialPosition
+    },
+    move: (pointerDelta) => {
+      if (!input) return
+      latestPosition = calculateCanvasWorkbenchMove({ ...input, pointerDelta })
+      dependencies.onPreview(latestPosition)
+    },
+    finish: () => {
+      if (!input || !latestPosition) return
+      const finalPosition = latestPosition
+      input = null
+      latestPosition = null
+      dependencies.onCommit(finalPosition)
+    },
+  }
+}
+
 /** 将数值限制在下限与可用上限之间；窄画布优先保证不越界。 */
 function clampCanvasWorkbenchDimension(value: number, minimum: number, maximum: number): number {
   const safeMaximum = Math.max(1, maximum)
@@ -85,30 +141,115 @@ function clampCanvasWorkbenchDimension(value: number, minimum: number, maximum: 
  * @returns 同时受最小尺寸和画布可视边界约束的宽高。
  */
 export function calculateCanvasWorkbenchResize(input: CanvasWorkbenchResizeInput): CanvasWorkbenchSize {
-  const scaleX = input.canvasScale.x > 0 ? input.canvasScale.x : 1
-  const scaleY = input.canvasScale.y > 0 ? input.canvasScale.y : 1
+  /** 浮窗已经位于屏幕空间，Canvas zoom 不参与指针位移换算。 */
   return {
     width: clampCanvasWorkbenchDimension(
-      input.initialSize.width + input.pointerDelta.x / scaleX,
+      input.initialSize.width + input.pointerDelta.x,
       CANVAS_WORKBENCH_MIN_WIDTH,
       input.availableSize.width,
     ),
     height: clampCanvasWorkbenchDimension(
-      input.initialSize.height + input.pointerDelta.y / scaleY,
+      input.initialSize.height + input.pointerDelta.y,
       CANVAS_WORKBENCH_MIN_HEIGHT,
       input.availableSize.height,
     ),
   }
 }
 
+/** 根据节点类型返回稳定的首次屏幕像素尺寸。 */
+export function resolveCanvasWorkbenchDefaultSize(node: CanvasNode): CanvasWorkbenchSize {
+  if (node.kind === 'agent') return { width: 760, height: 640 }
+  if (node.kind === 'image') return { width: 960, height: 700 }
+  if (node.kind === 'document') return { width: 900, height: 700 }
+  return node.devicePreset === 'mobile'
+    ? { width: 520, height: 720 }
+    : { width: 960, height: 720 }
+}
+
+/** 将默认或自定义尺寸收进 surface，极小 surface 仍保留 12px 四周边距。 */
+export function clampCanvasWorkbenchSizeToSurface(
+  size: CanvasWorkbenchSize,
+  surfaceSize: CanvasWorkbenchSize,
+): CanvasWorkbenchSize {
+  const availableSize = {
+    width: Math.max(1, surfaceSize.width - CANVAS_WORKBENCH_SURFACE_MARGIN * 2),
+    height: Math.max(1, surfaceSize.height - CANVAS_WORKBENCH_SURFACE_MARGIN * 2),
+  }
+  return calculateCanvasWorkbenchResize({
+    initialSize: size,
+    pointerDelta: { x: 0, y: 0 },
+    canvasScale: { x: 1, y: 1 },
+    availableSize,
+  })
+}
+
+/** 将浮窗位置限制在 surface 内，保证标题栏与缩放手柄可达。 */
+export function clampCanvasWorkbenchPosition(
+  position: CanvasWorkbenchPosition,
+  workbenchSize: CanvasWorkbenchSize,
+  surfaceSize: CanvasWorkbenchSize,
+): CanvasWorkbenchPosition {
+  const maximumX = Math.max(
+    CANVAS_WORKBENCH_SURFACE_MARGIN,
+    surfaceSize.width - workbenchSize.width - CANVAS_WORKBENCH_SURFACE_MARGIN,
+  )
+  const maximumY = Math.max(
+    CANVAS_WORKBENCH_SURFACE_MARGIN,
+    surfaceSize.height - workbenchSize.height - CANVAS_WORKBENCH_SURFACE_MARGIN,
+  )
+  return {
+    x: Math.min(Math.max(position.x, CANVAS_WORKBENCH_SURFACE_MARGIN), maximumX),
+    y: Math.min(Math.max(position.y, CANVAS_WORKBENCH_SURFACE_MARGIN), maximumY),
+  }
+}
+
+/** 根据目标节点屏幕矩形选择右侧、左侧或居中的首次浮窗位置。 */
+export function calculateCanvasWorkbenchInitialPosition(input: {
+  nodeRect: Pick<DOMRectReadOnly, 'left' | 'right' | 'top'>
+  surfaceSize: CanvasWorkbenchSize
+  workbenchSize: CanvasWorkbenchSize
+}): CanvasWorkbenchPosition {
+  const rightPosition = input.nodeRect.right + CANVAS_WORKBENCH_NODE_GAP
+  if (rightPosition + input.workbenchSize.width + CANVAS_WORKBENCH_SURFACE_MARGIN <= input.surfaceSize.width) {
+    return clampCanvasWorkbenchPosition(
+      { x: rightPosition, y: input.nodeRect.top }, input.workbenchSize, input.surfaceSize,
+    )
+  }
+  const leftPosition = input.nodeRect.left - CANVAS_WORKBENCH_NODE_GAP - input.workbenchSize.width
+  if (leftPosition >= CANVAS_WORKBENCH_SURFACE_MARGIN) {
+    return clampCanvasWorkbenchPosition(
+      { x: leftPosition, y: input.nodeRect.top }, input.workbenchSize, input.surfaceSize,
+    )
+  }
+  return clampCanvasWorkbenchPosition({
+    x: (input.surfaceSize.width - input.workbenchSize.width) / 2,
+    y: (input.surfaceSize.height - input.workbenchSize.height) / 2,
+  }, input.workbenchSize, input.surfaceSize)
+}
+
+/** 根据标题栏屏幕位移计算并约束浮窗位置。 */
+export function calculateCanvasWorkbenchMove(input: CanvasWorkbenchMoveInput): CanvasWorkbenchPosition {
+  return clampCanvasWorkbenchPosition({
+    x: input.initialPosition.x + input.pointerDelta.x,
+    y: input.initialPosition.y + input.pointerDelta.y,
+  }, input.workbenchSize, input.surfaceSize)
+}
+
 /** 节点工作台壳的最小受控输入。 */
 export interface CanvasNodeWorkbenchOverlayProps {
   node: CanvasNode
   dirty: boolean
-  /** 当前 Agent 会话保存的工作台尺寸。 */
-  workbenchSize: CanvasWorkbenchSize | null
-  /** 缩放或边界收敛后更新当前 Agent 会话尺寸。 */
-  onWorkbenchSizeChange: (size: CanvasWorkbenchSize) => void
+  surfaceSize?: CanvasWorkbenchSize
+  nodeScreenRect?: Pick<DOMRectReadOnly, 'left' | 'right' | 'top'>
+  /** 当前 Canvas 会话复用的浮窗位置；null 表示首次打开。 */
+  position?: CanvasWorkbenchPosition | null
+  /** 当前节点保存的自定义尺寸；null 表示使用类型默认值。 */
+  size?: CanvasWorkbenchSize | null
+  onPositionChange?: (position: CanvasWorkbenchPosition) => void
+  onSizeChange?: (size: CanvasWorkbenchSize) => void
+  /** 迁移期旧调用只用于避免 SSR 崩溃，Workspace 接线完成后不再使用。 */
+  workbenchSize?: CanvasWorkbenchSize | null
+  onWorkbenchSizeChange?: (size: CanvasWorkbenchSize) => void
   onDirtyChange: (dirty: boolean) => void
   onClose: () => void
   children?: React.ReactNode
@@ -129,101 +270,82 @@ function getCanvasNodeNextAction(kind: Exclude<CanvasNodeKind, 'agent'>): string
   return '下一步：创建 HTML 原型'
 }
 
-/** 渲染随 XYFlow 节点移动的单一工作台壳。 */
+/** 渲染位于 Canvas surface 上层、不继承 XYFlow transform 的单一工作台壳。 */
 export function CanvasNodeWorkbenchOverlay(
   props: CanvasNodeWorkbenchOverlayProps,
 ): React.ReactElement {
   /** 工作台标签只由稳定节点类型决定。 */
   const label = getCanvasNodeKindLabel(props.node.kind)
-  /** 工作台 DOM 用于读取 Canvas 缩放后的真实可视边界。 */
-  const workbenchRef = React.useRef<HTMLElement>(null)
-  /** 最新尺寸回调通过 ref 供布局监听器使用，避免宿主重渲染反复绑定。 */
-  const onWorkbenchSizeChangeRef = React.useRef(props.onWorkbenchSizeChange)
-  onWorkbenchSizeChangeRef.current = props.onWorkbenchSizeChange
+  /** SSR 与首次测量前使用稳定桌面边界，客户端 ResizeObserver 随后接管。 */
+  const surfaceSize = props.surfaceSize ?? { width: 1_200, height: 800 }
+  const nodeScreenRect = props.nodeScreenRect ?? { left: 12, right: 300, top: 12 }
+  /** 默认与自定义尺寸都先受当前 surface 屏幕边界约束。 */
+  const effectiveSize = clampCanvasWorkbenchSizeToSurface(
+    props.size ?? props.workbenchSize ?? resolveCanvasWorkbenchDefaultSize(props.node),
+    surfaceSize,
+  )
+  /** 首次位置围绕目标节点选择，已有位置则只做边界收敛。 */
+  const effectivePosition = props.position
+    ? clampCanvasWorkbenchPosition(props.position, effectiveSize, surfaceSize)
+    : calculateCanvasWorkbenchInitialPosition({
+        nodeRect: nodeScreenRect,
+        surfaceSize,
+        workbenchSize: effectiveSize,
+      })
+  const onSizeChangeRef = React.useRef(props.onSizeChange ?? props.onWorkbenchSizeChange ?? (() => undefined))
+  onSizeChangeRef.current = props.onSizeChange ?? props.onWorkbenchSizeChange ?? (() => undefined)
+  const onPositionChangeRef = React.useRef(props.onPositionChange ?? (() => undefined))
+  onPositionChangeRef.current = props.onPositionChange ?? (() => undefined)
+  /** 指针捕获期间的起点，避免每帧读取 DOM 或全局状态。 */
+  const resizeSessionRef = React.useRef<{ pointerId: number; pointerOrigin: CanvasWorkbenchPosition } | null>(null)
+  const moveSessionRef = React.useRef<{ pointerId: number; pointerOrigin: CanvasWorkbenchPosition } | null>(null)
   /** 拖拽预览只更新 Overlay 自身，避免每帧重写全局 view Map。 */
-  const [previewSize, setPreviewSize] = React.useState<CanvasWorkbenchSize | null>(props.workbenchSize)
+  const [previewSize, setPreviewSize] = React.useState<CanvasWorkbenchSize>(effectiveSize)
+  const [previewPosition, setPreviewPosition] = React.useState<CanvasWorkbenchPosition>(effectivePosition)
   const resizeGestureRef = React.useRef<CanvasWorkbenchResizeGestureController | null>(null)
   if (!resizeGestureRef.current) {
     resizeGestureRef.current = createCanvasWorkbenchResizeGestureController({
       onPreview: setPreviewSize,
-      onCommit: (size) => onWorkbenchSizeChangeRef.current(size),
+      onCommit: (size) => onSizeChangeRef.current(size),
+    })
+  }
+  const moveGestureRef = React.useRef<CanvasWorkbenchMoveGestureController | null>(null)
+  if (!moveGestureRef.current) {
+    moveGestureRef.current = createCanvasWorkbenchMoveGestureController({
+      onPreview: setPreviewPosition,
+      onCommit: (position) => onPositionChangeRef.current(position),
     })
   }
   React.useEffect(() => {
     /** 非手势更新继续服从受控 session view 尺寸。 */
-    if (resizeSessionRef.current === null) setPreviewSize(props.workbenchSize)
-  }, [props.workbenchSize])
-  /** 指针捕获期间的起点与边界，避免每帧重复测量布局。 */
-  const resizeSessionRef = React.useRef<CanvasWorkbenchResizeSession | null>(null)
-
-  /** 从当前布局读取缩放比例和右下方剩余空间。 */
-  const readResizeInput = React.useCallback((): Omit<CanvasWorkbenchResizeInput, 'pointerDelta'> | null => {
-    const workbench = workbenchRef.current
-    if (!workbench) return null
-    const workbenchRect = workbench.getBoundingClientRect()
-    const layoutWidth = workbench.offsetWidth || workbenchRect.width
-    const layoutHeight = workbench.offsetHeight || workbenchRect.height
-    /** React Flow 根节点代表实际可见画布；测试或降级环境使用浏览器视口。 */
-    const canvasSurface = workbench.closest('.react-flow')
-    const canvasRect = canvasSurface?.getBoundingClientRect()
-    const viewportWidth = typeof window === 'undefined' ? workbenchRect.right : window.innerWidth
-    const viewportHeight = typeof window === 'undefined' ? workbenchRect.bottom : window.innerHeight
-    const boundaryRight = canvasRect?.right ?? viewportWidth
-    const boundaryBottom = canvasRect?.bottom ?? viewportHeight
-    const canvasScale = {
-      x: workbenchRect.width > 0 && layoutWidth > 0 ? workbenchRect.width / layoutWidth : 1,
-      y: workbenchRect.height > 0 && layoutHeight > 0 ? workbenchRect.height / layoutHeight : 1,
-    }
-    return {
-      initialSize: { width: layoutWidth, height: layoutHeight },
-      canvasScale,
-      availableSize: {
-        width: Math.max(1, (boundaryRight - workbenchRect.left) / canvasScale.x),
-        height: Math.max(1, (boundaryBottom - workbenchRect.top) / canvasScale.y),
-      },
-    }
-  }, [])
-
+    if (resizeSessionRef.current === null) setPreviewSize(effectiveSize)
+    if (moveSessionRef.current === null) setPreviewPosition(effectivePosition)
+  }, [effectivePosition.x, effectivePosition.y, effectiveSize.height, effectiveSize.width])
   React.useEffect(() => {
-    /** 首次打开或窗口变化时把详情收进可见画布，确保右下角手柄始终可达。 */
-    const clampWorkbenchToCanvas = (): void => {
-      const resizeInput = readResizeInput()
-      if (!resizeInput) return
-      onWorkbenchSizeChangeRef.current(calculateCanvasWorkbenchResize({
-        ...resizeInput,
-        pointerDelta: { x: 0, y: 0 },
-      }))
-    }
-    clampWorkbenchToCanvas()
-    window.addEventListener('resize', clampWorkbenchToCanvas)
-    /** Canvas 容器尺寸改变时同步收敛，不观察工作台自身以避免 resize 反馈循环。 */
-    const canvasSurface = workbenchRef.current?.closest('.react-flow')
-    const canvasResizeObserver = typeof ResizeObserver === 'undefined' || !canvasSurface
-      ? null
-      : new ResizeObserver(clampWorkbenchToCanvas)
-    if (canvasSurface) canvasResizeObserver?.observe(canvasSurface)
-    return () => {
-      window.removeEventListener('resize', clampWorkbenchToCanvas)
-      canvasResizeObserver?.disconnect()
-    }
-  }, [readResizeInput])
+    /** 首次计算后保存位置，使后续切换节点复用同一浮窗位置。 */
+    if (props.position === null) onPositionChangeRef.current(effectivePosition)
+  }, [effectivePosition.x, effectivePosition.y, props.position])
 
   /** 开始双向缩放并捕获指针，防止拖出手柄后丢失移动事件。 */
   const handleResizePointerDown = React.useCallback((event: React.PointerEvent<HTMLButtonElement>): void => {
     if (event.button !== 0) return
-    const resizeInput = readResizeInput()
-    if (!resizeInput) return
     event.preventDefault()
     event.stopPropagation()
     event.currentTarget.setPointerCapture(event.pointerId)
     resizeSessionRef.current = {
-      ...resizeInput,
-      pointerDelta: { x: 0, y: 0 },
       pointerId: event.pointerId,
       pointerOrigin: { x: event.clientX, y: event.clientY },
     }
-    resizeGestureRef.current?.start({ ...resizeInput, pointerDelta: { x: 0, y: 0 } })
-  }, [readResizeInput])
+    resizeGestureRef.current?.start({
+      initialSize: previewSize,
+      pointerDelta: { x: 0, y: 0 },
+      canvasScale: { x: 1, y: 1 },
+      availableSize: {
+        width: Math.max(1, surfaceSize.width - previewPosition.x - CANVAS_WORKBENCH_SURFACE_MARGIN),
+        height: Math.max(1, surfaceSize.height - previewPosition.y - CANVAS_WORKBENCH_SURFACE_MARGIN),
+      },
+    })
+  }, [previewPosition.x, previewPosition.y, previewSize, surfaceSize.height, surfaceSize.width])
 
   /** 使用指针位移更新当前工作台宽高，不触发画布节点拖动或文档保存。 */
   const handleResizePointerMove = React.useCallback((event: React.PointerEvent<HTMLButtonElement>): void => {
@@ -235,6 +357,48 @@ export function CanvasNodeWorkbenchOverlay(
         x: event.clientX - session.pointerOrigin.x,
         y: event.clientY - session.pointerOrigin.y,
       })
+  }, [])
+
+  /** 标题栏按下时开始屏幕空间拖动，关闭按钮不会触发移动。 */
+  const handleMovePointerDown = React.useCallback((event: React.PointerEvent<HTMLElement>): void => {
+    if (event.button !== 0 || (event.target as HTMLElement).closest('button')) return
+    event.preventDefault()
+    event.stopPropagation()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    moveSessionRef.current = {
+      pointerId: event.pointerId,
+      pointerOrigin: { x: event.clientX, y: event.clientY },
+    }
+    moveGestureRef.current?.start({
+      initialPosition: previewPosition,
+      workbenchSize: previewSize,
+      surfaceSize,
+    })
+  }, [previewPosition, previewSize, surfaceSize])
+
+  /** 标题栏移动只更新 Overlay 局部位置。 */
+  const handleMovePointerMove = React.useCallback((event: React.PointerEvent<HTMLElement>): void => {
+    const session = moveSessionRef.current
+    if (!session || session.pointerId !== event.pointerId) return
+    event.preventDefault()
+    event.stopPropagation()
+    moveGestureRef.current?.move({
+      x: event.clientX - session.pointerOrigin.x,
+      y: event.clientY - session.pointerOrigin.y,
+    })
+  }, [])
+
+  /** 标题栏松开时只提交一次最终会话位置。 */
+  const finishMove = React.useCallback((event: React.PointerEvent<HTMLElement>): void => {
+    const session = moveSessionRef.current
+    if (!session || session.pointerId !== event.pointerId) return
+    event.preventDefault()
+    event.stopPropagation()
+    moveSessionRef.current = null
+    moveGestureRef.current?.finish()
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
   }, [])
 
   /** 结束当前缩放手势并释放指针捕获。 */
@@ -252,13 +416,23 @@ export function CanvasNodeWorkbenchOverlay(
 
   return (
     <section
-      ref={workbenchRef}
-      className="nodrag nopan nowheel absolute left-0 top-[calc(100%+8px)] z-30 h-[min(620px,calc(100vh-9rem))] w-[min(720px,calc(100vw-2rem))] cursor-auto overflow-hidden rounded-[8px] border border-border bg-background text-foreground shadow-xl"
+      className="nodrag nopan nowheel absolute z-30 cursor-auto overflow-hidden rounded-[8px] border border-border bg-background text-foreground shadow-xl"
       aria-label={`${label}工作台`}
+      data-workbench-kind={props.node.kind}
       data-workbench-dirty={props.dirty || undefined}
-      style={previewSize ?? props.workbenchSize ?? undefined}
+      style={{ width: previewSize.width, height: previewSize.height, left: previewPosition.x, top: previewPosition.y }}
     >
-      <header className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
+      <header
+        className="flex h-11 shrink-0 touch-none cursor-move items-center justify-between gap-2 border-b border-border px-3"
+        onPointerDown={handleMovePointerDown}
+        onPointerMove={handleMovePointerMove}
+        onPointerUp={finishMove}
+        onPointerCancel={finishMove}
+        onLostPointerCapture={() => {
+          moveSessionRef.current = null
+          moveGestureRef.current?.finish()
+        }}
+      >
         <span className="min-w-0 truncate text-sm font-medium">{props.node.title}</span>
         <Button
           type="button"

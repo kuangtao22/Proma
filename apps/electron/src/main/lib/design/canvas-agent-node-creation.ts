@@ -211,7 +211,9 @@ function isSameRelationship(
   right: CreateCanvasAgentNodeRelationship | undefined,
 ): boolean {
   if (!left || !right) return left === right
-  return left.sourceNodeId === right.sourceNodeId && left.edgeId === right.edgeId
+  return left.sourceNodeId === right.sourceNodeId
+    && left.edgeId === right.edgeId
+    && left.relation === right.relation
 }
 
 /** 精确比较重扫后的 intent 与刚提交内容。 */
@@ -289,11 +291,13 @@ function isCanonicalLimitedString(value: unknown, maxLength: number): value is s
 /** 校验从源节点到新节点的稳定关系身份。 */
 function isValidRelationship(value: unknown): value is CreateCanvasAgentNodeRelationship {
   return isRecord(value)
-    && hasIntentKeys(value, ['sourceNodeId', 'edgeId'])
+    && hasIntentKeys(value, ['sourceNodeId', 'edgeId', 'relation'])
     && isSafeDesignStableId(value.sourceNodeId)
     && value.sourceNodeId.length <= MAX_CANVAS_STABLE_ID_LENGTH
     && isSafeDesignStableId(value.edgeId)
     && value.edgeId.length <= MAX_CANVAS_STABLE_ID_LENGTH
+    && (value.relation === 'association' || value.relation === 'reference'
+      || value.relation === 'depends-on' || value.relation === 'derives')
 }
 
 /** 校验 Renderer 创建输入；IPC 和服务边界均调用以保持纵深防御。 */
@@ -665,6 +669,7 @@ function createRelationshipEdge(intent: CanvasAgentNodeCreationIntent): CanvasEd
     sourcePort: 'output',
     targetNodeId: intent.nodeId,
     targetPort: 'input',
+    relation: intent.relationship.relation,
   }
 }
 
@@ -680,7 +685,8 @@ function assertRelationshipMatchesIntent(
     || edge.sourceNodeId !== expected.sourceNodeId
     || edge.sourcePort !== expected.sourcePort
     || edge.targetNodeId !== expected.targetNodeId
-    || edge.targetPort !== expected.targetPort) {
+    || edge.targetPort !== expected.targetPort
+    || edge.relation !== expected.relation) {
     throw new Error(`Canvas Agent 扩展边归属损坏: ${expected.id}`)
   }
 }

@@ -30,7 +30,9 @@ import {
 } from './native-canvas-atoms'
 import {
   createAgentCanvasViewKey,
+  createAgentCanvasWorkbenchGeometryUpdate,
   createAgentCanvasWorkbenchChangeUpdate as createNativeCanvasWorkbenchChangeUpdate,
+  createConvergedAgentCanvasViewUpdate,
   createInitialAgentCanvasViewState,
   updateAgentCanvasViewStateAtom,
   agentCanvasViewStatesAtom,
@@ -156,6 +158,57 @@ describe('原生 Canvas 状态隔离', () => {
       workbenchDraft: null,
     })
     expect({ ...initial, activeTool: 'pan' as const }.activeTool).toBe('pan')
+  })
+
+  test('Given 两类节点有不同尺寸 When 更新其中一个 Then 另一节点尺寸保持独立', () => {
+    const current = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })
+    const imageUpdate = createAgentCanvasWorkbenchGeometryUpdate(current, 'image-1', {
+      size: { width: 1_000, height: 720 },
+    })
+    const next = { ...current, ...imageUpdate }
+    const documentUpdate = createAgentCanvasWorkbenchGeometryUpdate(next, 'document-1', {
+      size: { width: 880, height: 660 },
+    })
+
+    expect(documentUpdate.workbenchSizesByNodeId).toEqual({
+      'image-1': { width: 1_000, height: 720 },
+      'document-1': { width: 880, height: 660 },
+    })
+    expect(documentUpdate.workbenchPosition).toBeUndefined()
+  })
+
+  test('Given 工作台尺寸超过上限 When 新增第 65 个节点 Then 删除最早尺寸且保留已有键顺序', () => {
+    const current = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })
+    current.workbenchSizesByNodeId = Object.fromEntries(Array.from({ length: 64 }, (_, index) => [
+      `node-${index}`,
+      { width: 600 + index, height: 500 },
+    ]))
+
+    const update = createAgentCanvasWorkbenchGeometryUpdate(current, 'node-64', {
+      size: { width: 900, height: 700 },
+    })
+
+    expect(Object.keys(update.workbenchSizesByNodeId ?? {})).toHaveLength(64)
+    expect(update.workbenchSizesByNodeId?.['node-0']).toBeUndefined()
+    expect(update.workbenchSizesByNodeId?.['node-64']).toEqual({ width: 900, height: 700 })
+  })
+
+  test('Given 节点已删除 When 收敛会话视图 Then 清理其尺寸并关闭目标浮窗', () => {
+    const current = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })
+    current.expandedNodeId = 'deleted-node'
+    current.workbenchSizesByNodeId = {
+      'deleted-node': { width: 900, height: 700 },
+      'kept-node': { width: 760, height: 640 },
+    }
+    const document = createEmptyCanvasDocument('project-a', 'canvas-a')
+    document.nodes = [{
+      id: 'kept-node', kind: 'agent', title: '保留', agentSessionId: 'session-kept', position: { x: 0, y: 0 },
+    }]
+
+    expect(createConvergedAgentCanvasViewUpdate(current, document)).toMatchObject({
+      expandedNodeId: null,
+      workbenchSizesByNodeId: { 'kept-node': { width: 760, height: 640 } },
+    })
   })
 
   test('Given 两个 Canvas When 更新其中一个 Then pending 与错误不会串用', () => {

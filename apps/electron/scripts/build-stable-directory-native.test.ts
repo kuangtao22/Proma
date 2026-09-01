@@ -68,3 +68,12 @@ test('Given stable directory helper 的 Canvas intent 模式 When 检查三平�
     windowsScan.indexOf('budget->entries >= config.max_entries'),
   )
 })
+
+test('Given revisions 受管目录 When 检查 helper 参数合同 Then 只允许读写列举且拒绝 move', () => {
+  const source = readFileSync(resolve(import.meta.dir, '../native/stable-directory/stable-directory-helper.cc'), 'utf8')
+
+  expect(source).toContain('config->child_name == "revisions"')
+  expect(source).toContain('const bool move_child = config->child_name == "nodes" || config->child_name == "trash";')
+  expect(source).toContain('const bool move_destination = config->destination_child_name == "nodes"')
+  expect(source).toContain('|| config->destination_child_name == "trash";')
+})

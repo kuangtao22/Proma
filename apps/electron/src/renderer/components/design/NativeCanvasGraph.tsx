@@ -1,5 +1,18 @@
 import * as React from 'react'
-import type { CanvasDocument, CanvasImagePreview, CanvasMutation, CanvasNode, CanvasNodeIssue, CanvasNodeKind } from '@proma/shared'
+import type {
+  CanvasEdge,
+  CanvasEdgeRelation,
+  CanvasDocument,
+  CanvasImagePreview,
+  CanvasMutation,
+  CanvasNode,
+  CanvasNodeActivityState,
+  CanvasNodeIssue,
+  CanvasNodeKind,
+  CanvasWebviewDevicePreset,
+  CanvasWebviewPreviewSnapshot,
+  CanvasWebviewPreviewTarget,
+} from '@proma/shared'
 import {
   Background,
   Controls,
@@ -10,6 +23,7 @@ import type {
   Edge,
   NodeProps,
   NodeTypes,
+  OnConnect,
   OnMove,
   OnMoveEnd,
   OnMoveStart,
@@ -20,7 +34,12 @@ import type {
 import { CanvasAgentNode } from './CanvasAgentNode'
 import { CanvasNodeCard } from './CanvasNodeCard'
 import {
+  CanvasWebviewDeviceMenu,
+  CanvasWebviewPreview,
+} from './CanvasWebviewPreview'
+import {
   createMoveCanvasNodesMutation,
+  createNativeCanvasUserEdge,
   createViewportCanvasMutation,
   toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
@@ -32,54 +51,51 @@ import type {
   NativeCanvasWebviewFlowNode,
 } from './native-canvas-model'
 
-/** 从节点轻量数据中读取当前唯一覆盖层；折叠节点没有该字段。 */
-function getNativeCanvasNodeWorkbench(data: Record<string, unknown>): React.ReactNode {
-  return React.isValidElement(data.workbench) ? data.workbench : null
-}
-
-/** 渲染 Agent 折叠节点及其可选锚定工作台。 */
-function NativeCanvasAgentWorkbenchNode(props: NodeProps<Extract<NativeCanvasFlowNode, { type: 'canvasAgent' }>>): React.ReactElement {
-  return (
-    <div className="relative">
-      <CanvasAgentNode {...props} />
-      {getNativeCanvasNodeWorkbench(props.data)}
-    </div>
-  )
+/** 渲染不携带重内容工作台的 Agent 折叠节点。 */
+function NativeCanvasAgentNode(props: NodeProps<Extract<NativeCanvasFlowNode, { type: 'canvasAgent' }>>): React.ReactElement {
+  return <CanvasAgentNode {...props} />
 }
 
 /** 渲染生图折叠节点，不读取图片历史。 */
 function NativeCanvasImageNode({ data, selected }: NodeProps<NativeCanvasImageFlowNode>): React.ReactElement {
-  return (
-    <div className="relative">
-      <CanvasNodeCard {...data} selected={selected} />
-      {getNativeCanvasNodeWorkbench(data)}
-    </div>
-  )
+  return <CanvasNodeCard {...data} selected={selected} />
 }
 
 /** 渲染文档折叠节点，不读取 Markdown 正文。 */
 function NativeCanvasDocumentNode({ data, selected }: NodeProps<NativeCanvasDocumentFlowNode>): React.ReactElement {
-  return (
-    <div className="relative">
-      <CanvasNodeCard {...data} selected={selected} />
-      {getNativeCanvasNodeWorkbench(data)}
-    </div>
-  )
+  return <CanvasNodeCard {...data} selected={selected} />
 }
 
 /** 渲染原型折叠节点，不加载 HTML 或 iframe。 */
 function NativeCanvasWebviewNode({ data, selected }: NodeProps<NativeCanvasWebviewFlowNode>): React.ReactElement {
+  /** 设备菜单只修改持久预设；静态预览只读取主进程截图。 */
+  const deviceMenu = data.devicePreset ? (
+    <CanvasWebviewDeviceMenu
+      devicePreset={data.devicePreset}
+      writable={Boolean(data.onWebviewDevicePresetChange)}
+      onDevicePresetChange={(devicePreset) => data.onWebviewDevicePresetChange?.(data.id, devicePreset)}
+    />
+  ) : null
+  /** 缺少预览 IPC 时回退通用文字卡片，不影响其他节点和工作台入口。 */
+  const preview = data.webviewPreviewTarget && data.loadCanvasWebviewPreview ? (
+    <CanvasWebviewPreview
+      target={data.webviewPreviewTarget}
+      title={data.title}
+      statusLabel={data.statusLabel}
+      requestReady={data.webviewPreviewRequestReady ?? true}
+      loadPreview={data.loadCanvasWebviewPreview}
+    />
+  ) : null
   return (
-    <div className="relative">
-      <CanvasNodeCard {...data} selected={selected} />
-      {getNativeCanvasNodeWorkbench(data)}
-    </div>
+    <CanvasNodeCard {...data} selected={selected} toolbar={deviceMenu}>
+      {preview}
+    </CanvasNodeCard>
   )
 }
 
 /** 模块级稳定节点表，避免 XYFlow 在重渲染时重复注册节点组件。 */
 export const NATIVE_CANVAS_NODE_TYPES = {
-  canvasAgent: NativeCanvasAgentWorkbenchNode,
+  canvasAgent: NativeCanvasAgentNode,
   canvasImage: NativeCanvasImageNode,
   canvasDocument: NativeCanvasDocumentNode,
   canvasWebview: NativeCanvasWebviewNode,
@@ -89,35 +105,59 @@ export const NATIVE_CANVAS_NODE_TYPES = {
 const EMPTY_CANVAS_NODE_ISSUES: CanvasNodeIssue[] = []
 /** 未提供运行态时复用稳定空集合。 */
 const EMPTY_RUNNING_SESSION_IDS = new Set<string>()
+/** 未提供节点活动映射时复用稳定空 Map，避免投影 effect 重复执行。 */
+const EMPTY_NODE_ACTIVITY_STATES = new Map<string, CanvasNodeActivityState>()
+/** 未提供图片候选标记时复用稳定空 Map。 */
+const EMPTY_IMAGE_CANDIDATE_STATES = new Map<string, 'new-version' | 'partial'>()
 /** 未接通扩展命令时使用稳定空操作。 */
 const NOOP_EXPAND = (): void => undefined
 /** 未接通类型化扩展命令时使用稳定空操作。 */
 const NOOP_CREATE_CHILD = (): void => undefined
+/** 浏览器交互发生时才生成边 ID，服务端静态渲染不会访问 crypto。 */
+const CREATE_NATIVE_CANVAS_EDGE_ID = (): string => globalThis.crypto.randomUUID()
 
-/** 按节点权威身份构造当前工作台内容。 */
-export type NativeCanvasWorkbenchRenderer = (node: CanvasNode) => React.ReactNode
+/** 用户可为刚创建的稳定边选择的四种长期关系。 */
+const NATIVE_CANVAS_EDGE_RELATION_OPTIONS: ReadonlyArray<{
+  relation: CanvasEdgeRelation
+  label: string
+}> = [
+  { relation: 'association', label: '关联' },
+  { relation: 'reference', label: '引用' },
+  { relation: 'depends-on', label: '依赖' },
+  { relation: 'derives', label: '衍生' },
+]
 
-/** 只给目标节点复制并注入工作台元素，其他折叠节点保持原引用。 */
-function attachNativeCanvasWorkbench(
-  nodes: NativeCanvasFlowNode[],
-  document: CanvasDocument,
-  expandedNodeId: string | null,
-  renderWorkbench: NativeCanvasWorkbenchRenderer | undefined,
-): NativeCanvasFlowNode[] {
-  if (!expandedNodeId || !renderWorkbench) return nodes
-  /** 权威文档节点决定工作台类型与内容身份。 */
-  const canvasNode = document.nodes.find((node) => node.id === expandedNodeId)
-  const flowNodeIndex = nodes.findIndex((node) => node.id === expandedNodeId)
-  if (!canvasNode || flowNodeIndex < 0) return nodes
-  const targetNode = nodes[flowNodeIndex]
-  if (!targetNode) return nodes
-  /** 只复制节点数组和唯一目标节点，避免展开导致全图数据对象重建。 */
-  const nextNodes = [...nodes]
-  nextNodes[flowNodeIndex] = {
-    ...targetNode,
-    data: { ...targetNode.data, workbench: renderWorkbench(canvasNode) },
-  } as NativeCanvasFlowNode
-  return nextNodes
+/** 刚完成拖线后显示的轻量语义选择菜单。 */
+export interface NativeCanvasEdgeRelationMenuProps {
+  edge: CanvasEdge
+  onSelect: (relation: CanvasEdgeRelation) => void
+}
+
+/** 为已持久化的默认关联边选择最终语义，不改变边身份和端口。 */
+export function NativeCanvasEdgeRelationMenu({
+  edge,
+  onSelect,
+}: NativeCanvasEdgeRelationMenuProps): React.ReactElement {
+  return (
+    <div
+      aria-label="选择连线关系"
+      className="absolute right-3 top-3 z-20 flex gap-1 rounded-[6px] border border-border bg-background p-1 shadow-md"
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+    >
+      {NATIVE_CANVAS_EDGE_RELATION_OPTIONS.map((option) => (
+        <button
+          key={option.relation}
+          type="button"
+          aria-pressed={edge.relation === option.relation}
+          className="rounded-[4px] px-2 py-1 text-xs text-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          onClick={() => onSelect(option.relation)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  )
 }
 
 /** 原生 Canvas Graph 组件输入。 */
@@ -127,8 +167,18 @@ export interface NativeCanvasGraphProps {
   activeTool?: 'select' | 'pan'
   nodeIssues?: CanvasNodeIssue[]
   runningSessionIds?: ReadonlySet<string>
+  /** 按节点 ID 聚合的结构化活动态，优先于节点展示文案。 */
+  nodeActivityStates?: ReadonlyMap<string, CanvasNodeActivityState>
+  /** 生图节点按 nodeId 显示候选标记，正式缩略图仍来自 adopted 素材。 */
+  imageCandidateStates?: ReadonlyMap<string, 'new-version' | 'partial'>
   /** Canvas 工作区一次加载得到的素材缩略图索引。 */
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
+  /** WebView 卡片仅请求受管静态 WebP，不在折叠态加载 HTML。 */
+  loadCanvasWebviewPreview?: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
+  /** 设备预设仍在保存中的 WebView 节点集合，只阻断对应节点的新预览请求。 */
+  pendingWebviewDeviceNodeIds?: ReadonlySet<string>
+  /** 设备切换由 Workspace 提交图 mutation。 */
+  onWebviewDevicePresetChange?: (nodeId: string, devicePreset: CanvasWebviewDevicePreset) => void
   canCreateChild?: boolean
   onCreateChild?: (nodeId: string, kind: CanvasNodeKind) => void
   /** 单节点引用动作只传节点 ID，快照构造由 Workspace 完成。 */
@@ -145,10 +195,8 @@ export interface NativeCanvasGraphProps {
   onConversationNodeChange: (nodeId: string | null) => void
   /** 双击或卡片按钮只切换节点工作台，不改变图文档。 */
   onWorkbenchNodeChange?: (nodeId: string) => void
-  /** 当前唯一工作台节点；null 时所有节点保持折叠。 */
-  expandedNodeId?: string | null
-  /** 工作台内容由 Workspace 构造，Graph 只负责锚定。 */
-  renderWorkbench?: NativeCanvasWorkbenchRenderer
+  /** 为用户手工拖线分配稳定边身份；测试可注入确定值。 */
+  createEdgeId?: () => string
   flowRenderer?: NativeCanvasFlowRenderer
 }
 
@@ -203,7 +251,12 @@ export function NativeCanvasGraph({
   activeTool = 'select',
   nodeIssues = EMPTY_CANVAS_NODE_ISSUES,
   runningSessionIds = EMPTY_RUNNING_SESSION_IDS,
+  nodeActivityStates = EMPTY_NODE_ACTIVITY_STATES,
+  imageCandidateStates = EMPTY_IMAGE_CANDIDATE_STATES,
   imagePreviews,
+  loadCanvasWebviewPreview,
+  pendingWebviewDeviceNodeIds,
+  onWebviewDevicePresetChange,
   canCreateChild = false,
   onCreateChild = NOOP_CREATE_CHILD,
   onReferenceNode,
@@ -214,10 +267,11 @@ export function NativeCanvasGraph({
   onNodeSelectionChange,
   onConversationNodeChange,
   onWorkbenchNodeChange,
-  expandedNodeId = null,
-  renderWorkbench,
+  createEdgeId = CREATE_NATIVE_CANVAS_EDGE_ID,
   flowRenderer,
 }: NativeCanvasGraphProps): React.ReactElement {
+  /** 仅保留最近一次手工创建的边，供用户即时选择语义。 */
+  const [pendingRelationEdge, setPendingRelationEdge] = React.useState<CanvasEdge | null>(null)
   /** 旧调用方只传主节点时退化为单选集合。 */
   const controlledSelectedNodeIds = React.useMemo(
     () => selectedNodeIds ?? (selectedNodeId ? [selectedNodeId] : []),
@@ -232,10 +286,15 @@ export function NativeCanvasGraph({
   const workbenchNodeChange = onWorkbenchNodeChange ?? NOOP_EXPAND
   /** 首帧投影只使用 Canvas 文档内存数据，不读取 Agent 消息。 */
   const [flowNodes, setFlowNodes] = React.useState<NativeCanvasFlowNode[]>(() => (
-    attachNativeCanvasWorkbench(toNativeCanvasFlowNodes(document, {
+    toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
+      nodeActivityStates,
+      imageCandidateStates,
       imagePreviews,
+      loadCanvasWebviewPreview,
+      pendingWebviewDeviceNodeIds,
+      onWebviewDevicePresetChange,
       canCreateChild: writable && canCreateChild,
       onCreateChild,
       onReferenceNode,
@@ -243,7 +302,7 @@ export function NativeCanvasGraph({
     }).map((node) => ({
       ...node,
       selected: controlledSelectedNodeIdSet.has(node.id),
-    })), document, expandedNodeId, renderWorkbench)
+    }))
   ))
   /** 最新局部节点用于在同一批 React 更新内连续应用 XYFlow change。 */
   const flowNodesRef = React.useRef(flowNodes)
@@ -280,10 +339,15 @@ export function NativeCanvasGraph({
 
   React.useEffect(() => {
     /** 权威文档变化时同步稳定展示字段与选中态。 */
-    const nextNodes = attachNativeCanvasWorkbench(toNativeCanvasFlowNodes(document, {
+    const nextNodes = toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
+      nodeActivityStates,
+      imageCandidateStates,
       imagePreviews,
+      loadCanvasWebviewPreview,
+      pendingWebviewDeviceNodeIds,
+      onWebviewDevicePresetChange,
       canCreateChild: writable && canCreateChild,
       onCreateChild,
       onReferenceNode,
@@ -291,10 +355,10 @@ export function NativeCanvasGraph({
     }).map((node) => ({
       ...node,
       selected: controlledSelectedNodeIdSet.has(node.id),
-    })), document, expandedNodeId, renderWorkbench)
+    }))
     flowNodesRef.current = nextNodes
     setFlowNodes(nextNodes)
-  }, [canCreateChild, controlledSelectedNodeIdSet, document, expandedNodeId, imagePreviews, nodeIssues, onCreateChild, onReferenceNode, renderWorkbench, runningSessionIds, workbenchNodeChange, writable])
+  }, [canCreateChild, controlledSelectedNodeIdSet, document, imageCandidateStates, imagePreviews, loadCanvasWebviewPreview, nodeActivityStates, nodeIssues, onCreateChild, onReferenceNode, onWebviewDevicePresetChange, pendingWebviewDeviceNodeIds, runningSessionIds, workbenchNodeChange, writable])
 
   React.useEffect(() => {
     updateViewportState({ type: 'document-sync', viewport: document.viewport })
@@ -344,6 +408,33 @@ export function NativeCanvasGraph({
     onMutation(createMoveCanvasNodesMutation(movedNodes))
   }, [activeTool, onMutation, writable])
 
+  /** 手工拖线先以默认关联语义持久化，再打开同一边的语义菜单。 */
+  const handleConnect = React.useCallback<OnConnect>((connection) => {
+    if (!writable || activeTool !== 'select'
+      || !connection.source || !connection.target
+      || !connection.sourceHandle || !connection.targetHandle) return
+    /** 稳定边身份只生成一次，后续语义选择复用同一 ID。 */
+    const edge = createNativeCanvasUserEdge({
+      id: createEdgeId(),
+      sourceNodeId: connection.source,
+      sourcePort: connection.sourceHandle,
+      targetNodeId: connection.target,
+      targetPort: connection.targetHandle,
+    })
+    onMutation({ type: 'upsert-edges', edges: [edge] })
+    setPendingRelationEdge(edge)
+  }, [activeTool, createEdgeId, onMutation, writable])
+
+  /** 用同一稳定边覆盖语义，避免拖线产生重复边。 */
+  const selectPendingEdgeRelation = React.useCallback((relation: CanvasEdgeRelation): void => {
+    if (!pendingRelationEdge) return
+    onMutation({
+      type: 'upsert-edges',
+      edges: [{ ...pendingRelationEdge, relation }],
+    })
+    setPendingRelationEdge(null)
+  }, [onMutation, pendingRelationEdge])
+
   /** 视口手势开始后暂缓远端 viewport 覆盖本地逐帧反馈。 */
   const handleMoveStart = React.useCallback<OnMoveStart>(() => {
     updateViewportState({ type: 'move-start' })
@@ -366,25 +457,24 @@ export function NativeCanvasGraph({
 
   /** 普通节点单击只更新选中态，不隐式打开旧对话或工作台。 */
   const handleNodeClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeClick']>>((_event, node) => {
-    if (activeTool !== 'select') return
     syncSelectedNodeIds([node.id])
-  }, [activeTool, syncSelectedNodeIds])
+  }, [syncSelectedNodeIds])
 
   /** 双击节点只打开对应工作台；普通单击始终只选择节点。 */
   const handleNodeDoubleClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeDoubleClick']>>((_event, node) => {
-    if (activeTool !== 'select') return
     syncSelectedNodeIds([node.id])
     workbenchNodeChange(node.id)
-  }, [activeTool, syncSelectedNodeIds, workbenchNodeChange])
+  }, [syncSelectedNodeIds, workbenchNodeChange])
 
   /** 点击空白 pane 时立即清理选区，覆盖 XYFlow 未产生 selection change 的路径。 */
   const handlePaneClick = React.useCallback((): void => {
     if (activeTool !== 'select') return
+    setPendingRelationEdge(null)
     syncSelectedNodeIds([])
     onConversationNodeChange(null)
   }, [activeTool, onConversationNodeChange, syncSelectedNodeIds])
 
-  /** 受控 Flow 属性集中声明只读连线合同。 */
+  /** 受控 Flow 属性集中声明选择工具下的可写连线合同。 */
   const flowProps: NativeCanvasFlowProps = {
     nodes: flowNodes,
     edges: toNativeCanvasFlowEdges(document),
@@ -394,8 +484,8 @@ export function NativeCanvasGraph({
     maxZoom: 8,
     onlyRenderVisibleElements: true,
     nodesDraggable: writable && activeTool === 'select',
-    nodesConnectable: false,
-    elementsSelectable: activeTool === 'select',
+    nodesConnectable: writable && activeTool === 'select',
+    elementsSelectable: true,
     panOnDrag: activeTool === 'pan' ? true : [1],
     selectionOnDrag: activeTool === 'select',
     multiSelectionKeyCode: null,
@@ -404,6 +494,7 @@ export function NativeCanvasGraph({
     deleteKeyCode: null,
     onNodesChange: handleNodesChange,
     onNodeDragStop: handleNodeDragStop,
+    onConnect: handleConnect,
     onMoveStart: handleMoveStart,
     onMove: handleMove,
     onMoveEnd: handleMoveEnd,
@@ -420,6 +511,12 @@ export function NativeCanvasGraph({
           <Controls showInteractive={false} />
         </ReactFlow>
       )}
+      {pendingRelationEdge ? (
+        <NativeCanvasEdgeRelationMenu
+          edge={pendingRelationEdge}
+          onSelect={selectPendingEdgeRelation}
+        />
+      ) : null}
     </div>
   )
 }

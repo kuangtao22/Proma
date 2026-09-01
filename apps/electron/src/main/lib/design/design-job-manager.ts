@@ -101,6 +101,7 @@ const STORED_JOB_FIELDS = new Set([
   'finalImagePrompt', 'rawThinkingAvailable', 'contextWarning', 'startedAt', 'completedAt',
   'imageModelSnapshot',
   'target', 'generationConstraints', 'canvasInputReferences', 'canvasImageConfigRevision',
+  'candidateBatchId',
   'maskAnnotationId', 'placementState', 'terminalState',
   'replacedByJobId', 'retryState', 'deletionState',
 ])
@@ -135,6 +136,18 @@ export interface DesignJobManagerDependencies {
   assetService: Pick<DesignAssetService, 'resolveAssetPath' | 'importAuthorizedFiles'>
   /** Canvas 图片输出采用与节点投影修复边界；旧 Design 路径不依赖它。 */
   canvasImageTargetAdapter?: CanvasImageJobTargetAdapter
+  /** 新候选链路存在时，Canvas 图片成功输出只登记候选，不自动采用。 */
+  canvasImageCandidateBatches?: {
+    recordJobTerminal: (event: {
+      projectId: string
+      canvasId: string
+      jobId: string
+      candidateBatchId?: string
+      status: 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
+      outputAssetId: string | null
+      error: string | null
+    }) => Promise<void>
+  }
   /** 从直接入边读取已提交事实并固化任务输入。 */
   canvasImageInputResolver?: CanvasImageInputResolver
   /** 只暴露任务创建、预检和单次工具运行所需的模型路由能力。 */
@@ -353,7 +366,12 @@ export class DesignJobManager {
   ): Promise<{ job: DesignJobRecord; created: boolean }> {
     /** journal 身份检查必须早于目标、模型、输入解析和新 ID 副作用。 */
     const existing = this.findStableCanvasImageJob(input.projectId, input.target, jobId)
-    if (existing) return { job: clonePublicDesignJob(existing), created: false }
+    if (existing) {
+      if (existing.candidateBatchId !== input.candidateBatchId) {
+        throw new Error('CANVAS_IMAGE_JOB_IDENTITY_CONFLICT')
+      }
+      return { job: clonePublicDesignJob(existing), created: false }
+    }
     const job = await this.createCanvasImageInternal(input, jobId)
     return { job: clonePublicDesignJob(job), created: true }
   }
@@ -415,6 +433,7 @@ export class DesignJobManager {
         generationConstraints: { ...input.generationConstraints },
         canvasInputReferences: canvasInputReferences.map((reference) => ({ ...reference })),
         canvasImageConfigRevision: input.canvasImageConfigRevision,
+        ...(input.candidateBatchId ? { candidateBatchId: input.candidateBatchId } : {}),
         imageModelSnapshot: { ...imageModelSnapshot },
         ...(input.sourceAssetId
           ? { sourceAssetId: input.sourceAssetId, parentAssetId: input.sourceAssetId }
@@ -1124,6 +1143,31 @@ export class DesignJobManager {
   private async finalizeExecution(jobId: string): Promise<void> {
     let job = this.findStoredJob(jobId)
     if (!job || !TERMINAL_JOB_STATUSES.has(job.status)) return
+    /** Canvas 候选批次必须收到失败类终态，否则批次会永久停留在 running。 */
+    if (this.dependencies.canvasImageCandidateBatches
+      && job.candidateBatchId
+      && job.target.kind === 'canvas-image'
+      && job.status !== 'succeeded') {
+      /** Set 成员判断不会收窄字符串联合，这里显式固定失败类终态。 */
+      const terminalStatus = job.status
+      if (terminalStatus !== 'failed'
+        && terminalStatus !== 'cancelled'
+        && terminalStatus !== 'interrupted') return
+      try {
+        await this.dependencies.canvasImageCandidateBatches.recordJobTerminal({
+          projectId: job.projectId,
+          canvasId: job.target.canvasId,
+          jobId: job.id,
+          candidateBatchId: job.candidateBatchId,
+          status: terminalStatus,
+          outputAssetId: null,
+          error: job.error ?? null,
+        })
+      } catch (error) {
+        /** 终态 journal 已提交，候选批次可在后续恢复时再次对账。 */
+        this.warn(`[Canvas 图片候选] 任务 ${job.id} 终态登记失败，将在恢复时重试: ${String(error)}`)
+      }
+    }
     if (!job.sessionId) {
       if (job.traceState !== 'unavailable' || job.executionSessionCleanupState !== 'completed') {
         this.updateStatus(job, job.status, {
@@ -1335,14 +1379,30 @@ export class DesignJobManager {
     const pending = this.updateStatus(latest, latest.status, {
       terminalState: { status: 'pending', outputAssetId: asset.id },
     }, current.revision)
+    /** Asset 导入批次只能提交一次，后续采用失败只保留 terminal pending。 */
+    let assetBatchCommitted = false
     try {
       /** 旧 Design 只登记共享 Asset，节点数组保持完全不变。 */
       const updatedDocument = this.dependencies.store.mutate(job.projectId, current.revision, [
         { type: 'upsert-assets', assets: [asset] },
       ])
       this.projectRevisions.set(job.projectId, updatedDocument.revision)
-      await targetAdapter.adoptOutput(job.projectId, job.target, asset.id)
       batch.commit()
+      assetBatchCommitted = true
+      if (this.dependencies.canvasImageCandidateBatches && job.candidateBatchId) {
+        await this.dependencies.canvasImageCandidateBatches.recordJobTerminal({
+          projectId: job.projectId,
+          canvasId: job.target.canvasId,
+          jobId: job.id,
+          candidateBatchId: job.candidateBatchId,
+          status: 'succeeded',
+          outputAssetId: asset.id,
+          error: null,
+        })
+      } else {
+        /** 旧装配兼容分支；生产接入候选服务后不再自动采用。 */
+        await targetAdapter.adoptOutput(job.projectId, job.target, asset.id)
+      }
       this.updateStatus(pending, 'succeeded', {
         terminalState: undefined,
         outputAssetId: asset.id,
@@ -1369,7 +1429,8 @@ export class DesignJobManager {
         return
       }
       /** Asset 已进入权威 Store 后必须保留文件；采用失败由 pending 恢复重放。 */
-      batch.commit()
+      if (!assetBatchCommitted) batch.commit()
+      if (this.dependencies.canvasImageCandidateBatches && job.candidateBatchId) return
       try {
         if (await targetAdapter.isOutputAdopted(job.projectId, job.target, asset.id)) {
           this.updateStatus(pending, 'succeeded', {
@@ -1443,6 +1504,24 @@ export class DesignJobManager {
         this.updateStatus(job, 'failed', {
           terminalState: undefined,
           error: '设计任务终态提交未完成',
+        }, document.revision)
+        return
+      }
+      if (this.dependencies.canvasImageCandidateBatches && job.candidateBatchId) {
+        await this.dependencies.canvasImageCandidateBatches.recordJobTerminal({
+          projectId: job.projectId,
+          canvasId: job.target.canvasId,
+          jobId: job.id,
+          candidateBatchId: job.candidateBatchId,
+          status: 'succeeded',
+          outputAssetId,
+          error: null,
+        })
+        this.updateStatus(job, 'succeeded', {
+          terminalState: undefined,
+          outputAssetId,
+          parentAssetId: job.sourceAssetId,
+          error: undefined,
         }, document.revision)
         return
       }
@@ -2008,6 +2087,7 @@ function isStoredDesignJob(value: unknown): value is StoredDesignJob {
   if (value.canvasImageConfigRevision !== undefined
     && (!Number.isSafeInteger(value.canvasImageConfigRevision)
       || (value.canvasImageConfigRevision as number) < 0)) return false
+  if (!isOptionalStableId(value.candidateBatchId)) return false
   if (value.canvasInputReferences !== undefined) {
     if (!Array.isArray(value.canvasInputReferences)
       || value.canvasInputReferences.length > CANVAS_IMAGE_INPUT_MAX_REFERENCES

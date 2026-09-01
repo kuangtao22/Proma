@@ -3,23 +3,37 @@ import {
   DESIGN_IPC_CHANNELS,
   parseAgentCanvasBindingChangeEvent,
   parseCanvasChangeEvent,
+  parseCanvasImageCandidateBatch,
+  parseCanvasImageModuleSnapshot,
 } from '@proma/shared'
 import type {
   AgentCanvasBindingChangeEvent,
   ClearAgentCanvasBindingsInput,
   ClearAgentCanvasBindingsResult,
   CanvasChangeEvent,
+  CanvasArtifactRevisionSummary,
   CanvasDocument,
   CanvasImageJobControlInput,
+  CanvasImageCandidateBatch,
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
+  GetCanvasImageCandidateBatchInput,
+  AdoptCanvasImageCandidateBatchInput,
   ReleaseCanvasImageMediaInput,
   CanvasInvokeResult,
   CanvasPublicError,
   CanvasSessionChangeEvent,
   CanvasSessionMeta,
   CanvasWorkspaceSnapshot,
+  CanvasTextArtifactIdentity,
+  CanvasTextArtifactMutationResult,
+  CanvasTextArtifactSnapshot,
+  CanvasTextArtifactTarget,
+  CanvasWebviewSnapshot,
+  CanvasWebviewTarget,
+  CanvasWebviewPreviewSnapshot,
+  CanvasWebviewPreviewTarget,
   LinkAgentCanvasInput,
   LinkAgentCanvasResult,
   ListAgentCanvasBindingsInput,
@@ -34,6 +48,7 @@ import type {
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
   DeleteCanvasNodeInput,
+  AdoptCanvasTextArtifactRevisionInput,
   GetCanvasAgentMessagesInput,
   CreateDesignJobInput,
   DeleteDesignAssetInput,
@@ -48,6 +63,7 @@ import type {
   DesignTaskDetails,
   DesignWorkspaceSnapshot,
   ExportDesignAssetInput,
+  ExportCanvasArtifactInput,
   EnsureLegacyCanvasSessionInput,
   GetDesignTaskDetailsInput,
   ImportAgentImageInput,
@@ -77,6 +93,7 @@ import type {
   ListDesignContextInput,
   UpsertDesignContextDocumentInput,
   UpdateCanvasSessionInput,
+  UpdateCanvasTextArtifactInput,
   UpdateDesignContextEntryInput,
   UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
@@ -95,8 +112,26 @@ export interface AdoptCanvasImageAssetInput extends CanvasImageJobControlInput {
 
 /** Renderer 获得的稳定 Design API。 */
 export interface DesignPreloadApi {
+  /** 加载绑定精确正文 revision 的文档或 WebView 产物。 */
+  loadCanvasTextArtifact: (input: CanvasTextArtifactTarget) => Promise<CanvasInvokeResult<CanvasTextArtifactSnapshot>>
+  /** 在图与正文双重基线上提交新的文本产物修订。 */
+  updateCanvasTextArtifact: (input: UpdateCanvasTextArtifactInput) => Promise<CanvasInvokeResult<CanvasTextArtifactMutationResult>>
+  /** 列出文本产物的不可变修订摘要。 */
+  listCanvasArtifactRevisions: (input: CanvasTextArtifactIdentity) => Promise<CanvasInvokeResult<CanvasArtifactRevisionSummary[]>>
+  /** 把历史文本修订采用为节点当前版本。 */
+  adoptCanvasArtifactRevision: (input: AdoptCanvasTextArtifactRevisionInput) => Promise<CanvasInvokeResult<CanvasTextArtifactMutationResult>>
+  /** 通过主进程文件选择器导出文本或图片产物。 */
+  exportCanvasArtifact: (input: ExportCanvasArtifactInput) => Promise<CanvasInvokeResult<void>>
   /** 加载单个 Canvas 生图模块及其媒体授权快照。 */
   loadCanvasImageModule: (input: CanvasImageTarget) => Promise<CanvasInvokeResult<CanvasImageModuleSnapshot>>
+  /** 按批次稳定身份加载完整候选事实。 */
+  getCanvasImageCandidateBatch: (input: GetCanvasImageCandidateBatchInput) => Promise<CanvasInvokeResult<CanvasImageCandidateBatch>>
+  /** 重新运行批次中尚未成功的图片任务。 */
+  continueCanvasImageCandidateBatch: (input: GetCanvasImageCandidateBatchInput) => Promise<CanvasInvokeResult<CanvasImageCandidateBatch>>
+  /** 明确采用整批或成功候选。 */
+  adoptCanvasImageCandidateBatch: (input: AdoptCanvasImageCandidateBatchInput) => Promise<CanvasInvokeResult<CanvasImageCandidateBatch>>
+  /** 放弃活跃候选批次，但保留历史事实。 */
+  abandonCanvasImageCandidateBatch: (input: GetCanvasImageCandidateBatchInput) => Promise<CanvasInvokeResult<CanvasImageCandidateBatch>>
   /** 使用配置 revision 保存单个 Canvas 生图模块。 */
   saveCanvasImageModule: (input: SaveCanvasImageModuleInput) => Promise<CanvasInvokeResult<CanvasImageModuleConfig>>
   /** 从当前固化配置创建 Canvas 图片任务。 */
@@ -113,6 +148,10 @@ export interface DesignPreloadApi {
   onCanvasImageModuleChanged: (listener: (target: CanvasImageTarget) => void) => () => void
   /** 加载项目中指定原生 Canvas 的公开工作区快照。 */
   loadCanvasWorkspace: (input: LoadCanvasInput) => Promise<CanvasInvokeResult<CanvasWorkspaceSnapshot>>
+  /** 加载单个 WebView 节点的受管 HTML 快照。 */
+  loadCanvasWebview: (input: CanvasWebviewTarget) => Promise<CanvasInvokeResult<CanvasWebviewSnapshot>>
+  /** 加载单个 WebView 节点的静态卡片预览。 */
+  loadCanvasWebviewPreview: (input: CanvasWebviewPreviewTarget) => Promise<CanvasInvokeResult<CanvasWebviewPreviewSnapshot>>
   /** 在权威 revision 上保存指定原生 Canvas mutation。 */
   saveCanvasMutations: (input: SaveCanvasMutationsInput) => Promise<CanvasInvokeResult<CanvasDocument>>
   /** 在目标 Canvas 内幂等创建内部 Agent 节点。 */
@@ -195,10 +234,16 @@ export interface DesignPreloadIpc {
 
 /** Preload 无法调用主进程时使用的固定 Canvas 公开失败。 */
 const CANVAS_PRELOAD_FALLBACKS = {
+  artifactLoad: { code: 'CANVAS_ARTIFACT_LOAD_FAILED', message: '产物暂时无法加载。' },
+  artifactSave: { code: 'CANVAS_ARTIFACT_SAVE_FAILED', message: '产物保存失败，请重试。' },
+  artifactExport: { code: 'CANVAS_ARTIFACT_EXPORT_FAILED', message: '产物导出失败，请重试。' },
   imageLoad: { code: 'CANVAS_IMAGE_LOAD_FAILED', message: '生图节点暂时无法加载。' },
   imageSave: { code: 'CANVAS_IMAGE_SAVE_FAILED', message: '生图配置保存失败，请重试。' },
   imageJob: { code: 'CANVAS_IMAGE_JOB_FAILED', message: '图片任务操作失败，请重试。' },
+  imageBatch: { code: 'CANVAS_IMAGE_BATCH_INVALID', message: '图片候选批次暂时无法处理。' },
   load: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+  webviewLoad: { code: 'CANVAS_WEBVIEW_LOAD_FAILED', message: '原型暂时无法加载。' },
+  webviewPreview: { code: 'CANVAS_WEBVIEW_PREVIEW_FAILED', message: '原型预览生成失败，请重试。' },
   save: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
   create: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
   delete: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' },
@@ -212,6 +257,60 @@ const CANVAS_PRELOAD_FALLBACKS = {
   binding: { code: 'CANVAS_BINDING_FAILED', message: '画布关联失败，请重试。' },
 } as const satisfies Record<string, CanvasPublicError>
 
+/** 从 Renderer 输入中只拣选文本产物稳定身份。 */
+function selectCanvasTextArtifactIdentity(input: CanvasTextArtifactIdentity): CanvasTextArtifactIdentity {
+  return {
+    projectId: input.projectId,
+    canvasId: input.canvasId,
+    nodeId: input.nodeId,
+    kind: input.kind,
+    contentId: input.contentId,
+  }
+}
+
+/** 从 Renderer 输入中只拣选文本产物精确读取目标。 */
+function selectCanvasTextArtifactTarget(input: CanvasTextArtifactTarget): CanvasTextArtifactTarget {
+  return { ...selectCanvasTextArtifactIdentity(input), contentRevision: input.contentRevision }
+}
+
+/** 从 Renderer 输入中只拣选文本产物更新字段。 */
+function selectUpdateCanvasTextArtifactInput(input: UpdateCanvasTextArtifactInput): UpdateCanvasTextArtifactInput {
+  return {
+    ...selectCanvasTextArtifactIdentity(input),
+    operationId: input.operationId,
+    expectedCanvasRevision: input.expectedCanvasRevision,
+    expectedContentRevision: input.expectedContentRevision,
+    content: input.content,
+  }
+}
+
+/** 从 Renderer 输入中只拣选历史修订采用字段。 */
+function selectAdoptCanvasTextArtifactRevisionInput(
+  input: AdoptCanvasTextArtifactRevisionInput,
+): AdoptCanvasTextArtifactRevisionInput {
+  return {
+    ...selectCanvasTextArtifactIdentity(input),
+    operationId: input.operationId,
+    expectedCanvasRevision: input.expectedCanvasRevision,
+    expectedContentRevision: input.expectedContentRevision,
+    revision: input.revision,
+  }
+}
+
+/** 从 Renderer 输入中只拣选无文件路径的公开导出身份。 */
+function selectExportCanvasArtifactInput(input: ExportCanvasArtifactInput): ExportCanvasArtifactInput {
+  return input.kind === 'image'
+    ? {
+        projectId: input.projectId,
+        canvasId: input.canvasId,
+        nodeId: input.nodeId,
+        kind: 'image',
+        imageModuleId: input.imageModuleId,
+        assetId: input.assetId,
+      }
+    : selectCanvasTextArtifactTarget(input)
+}
+
 /**
  * 从调用输入中只拣选 Canvas 图片模块公开目标字段。
  * @param input Renderer 提供的图片模块目标。
@@ -223,6 +322,57 @@ function selectCanvasImageTarget(input: CanvasImageTarget): CanvasImageTarget {
     canvasId: input.canvasId,
     nodeId: input.nodeId,
     imageModuleId: input.imageModuleId,
+  }
+}
+
+/** 从 Renderer 输入中只拣选图片候选批次稳定身份。 */
+function selectCanvasImageCandidateBatchInput(
+  input: GetCanvasImageCandidateBatchInput,
+): GetCanvasImageCandidateBatchInput {
+  return { projectId: input.projectId, canvasId: input.canvasId, batchId: input.batchId }
+}
+
+/** 调用候选批次 IPC，并在 Preload 边界严格重建成功值。 */
+async function invokeCanvasImageCandidateBatchSafely(
+  ipc: DesignPreloadIpc,
+  channel: string,
+  input: GetCanvasImageCandidateBatchInput | AdoptCanvasImageCandidateBatchInput,
+): Promise<CanvasInvokeResult<CanvasImageCandidateBatch>> {
+  const selected = 'mode' in input
+    ? { ...selectCanvasImageCandidateBatchInput(input), mode: input.mode }
+    : selectCanvasImageCandidateBatchInput(input)
+  const result = await invokeCanvasSafely<CanvasImageCandidateBatch>(
+    ipc,
+    channel,
+    selected,
+    CANVAS_PRELOAD_FALLBACKS.imageBatch,
+  )
+  if (!result.ok) return result
+  try {
+    return { ok: true, value: parseCanvasImageCandidateBatch(result.value) }
+  } catch {
+    return { ok: false, error: { ...CANVAS_PRELOAD_FALLBACKS.imageBatch } }
+  }
+}
+
+/** 从 Renderer 输入中只拣选 WebView 预览的公开完整身份。 */
+function selectCanvasWebviewTarget(input: CanvasWebviewTarget): CanvasWebviewTarget {
+  return {
+    projectId: input.projectId,
+    canvasId: input.canvasId,
+    nodeId: input.nodeId,
+    prototypeId: input.prototypeId,
+    contentRevision: input.contentRevision,
+  }
+}
+
+/** 从 Renderer 输入中只拣选 WebView 静态预览公开身份。 */
+function selectCanvasWebviewPreviewTarget(
+  input: CanvasWebviewPreviewTarget,
+): CanvasWebviewPreviewTarget {
+  return {
+    ...selectCanvasWebviewTarget(input),
+    devicePreset: input.devicePreset,
   }
 }
 
@@ -278,14 +428,71 @@ async function invokeCanvasSafely<T>(
   }
 }
 
+/** 在 Preload 跨进程入口严格重建图片模块成功快照。 */
+async function invokeCanvasImageSnapshotSafely(
+  ipc: DesignPreloadIpc,
+  input: CanvasImageTarget,
+): Promise<CanvasInvokeResult<CanvasImageModuleSnapshot>> {
+  /** 先复用统一 rejection 清洗，再只解析成功业务值。 */
+  const result = await invokeCanvasSafely<CanvasImageModuleSnapshot>(
+    ipc,
+    CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
+    selectCanvasImageTarget(input),
+    CANVAS_PRELOAD_FALLBACKS.imageLoad,
+  )
+  if (!result.ok) return result
+  try {
+    return { ok: true, value: parseCanvasImageModuleSnapshot(result.value) }
+  } catch {
+    return { ok: false, error: { ...CANVAS_PRELOAD_FALLBACKS.imageLoad } }
+  }
+}
+
 /** 创建不暴露 ipcRenderer 本体的 Design preload API。 */
 export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi {
   return {
-    loadCanvasImageModule: (input) => invokeCanvasSafely(
+    loadCanvasTextArtifact: (input) => invokeCanvasSafely(
       ipc,
-      CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
-      selectCanvasImageTarget(input),
-      CANVAS_PRELOAD_FALLBACKS.imageLoad,
+      CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,
+      selectCanvasTextArtifactTarget(input),
+      CANVAS_PRELOAD_FALLBACKS.artifactLoad,
+    ),
+    updateCanvasTextArtifact: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT,
+      selectUpdateCanvasTextArtifactInput(input),
+      CANVAS_PRELOAD_FALLBACKS.artifactSave,
+    ),
+    listCanvasArtifactRevisions: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.LIST_ARTIFACT_REVISIONS,
+      selectCanvasTextArtifactIdentity(input),
+      CANVAS_PRELOAD_FALLBACKS.artifactLoad,
+    ),
+    adoptCanvasArtifactRevision: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.ADOPT_ARTIFACT_REVISION,
+      selectAdoptCanvasTextArtifactRevisionInput(input),
+      CANVAS_PRELOAD_FALLBACKS.artifactSave,
+    ),
+    exportCanvasArtifact: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT,
+      selectExportCanvasArtifactInput(input),
+      CANVAS_PRELOAD_FALLBACKS.artifactExport,
+    ),
+    loadCanvasImageModule: (input) => invokeCanvasImageSnapshotSafely(ipc, input),
+    getCanvasImageCandidateBatch: (input) => invokeCanvasImageCandidateBatchSafely(
+      ipc, CANVAS_IPC_CHANNELS.GET_IMAGE_CANDIDATE_BATCH, input,
+    ),
+    continueCanvasImageCandidateBatch: (input) => invokeCanvasImageCandidateBatchSafely(
+      ipc, CANVAS_IPC_CHANNELS.CONTINUE_IMAGE_CANDIDATE_BATCH, input,
+    ),
+    adoptCanvasImageCandidateBatch: (input) => invokeCanvasImageCandidateBatchSafely(
+      ipc, CANVAS_IPC_CHANNELS.ADOPT_IMAGE_CANDIDATE_BATCH, input,
+    ),
+    abandonCanvasImageCandidateBatch: (input) => invokeCanvasImageCandidateBatchSafely(
+      ipc, CANVAS_IPC_CHANNELS.ABANDON_IMAGE_CANDIDATE_BATCH, input,
     ),
     saveCanvasImageModule: (input) => invokeCanvasSafely(
       ipc,
@@ -353,6 +560,18 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
       CANVAS_IPC_CHANNELS.LOAD,
       input,
       CANVAS_PRELOAD_FALLBACKS.load,
+    ),
+    loadCanvasWebview: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW,
+      selectCanvasWebviewTarget(input),
+      CANVAS_PRELOAD_FALLBACKS.webviewLoad,
+    ),
+    loadCanvasWebviewPreview: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW_PREVIEW,
+      selectCanvasWebviewPreviewTarget(input),
+      CANVAS_PRELOAD_FALLBACKS.webviewPreview,
     ),
     saveCanvasMutations: (input) => invokeCanvasSafely(
       ipc,

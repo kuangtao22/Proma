@@ -12,7 +12,8 @@ const DEFAULT_MAX_QUEUED_REQUESTS = 16
 const DEFAULT_MAX_ROOTS_PER_REQUEST = 32
 const CANVAS_INTENT_FILE_PATTERN = /^(?:agent-node(?:-rebuild)?|content-node|canvas-batch)-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/i
 const CANVAS_CONTENT_ENTRY_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
-const CANVAS_CONTENT_CHILD_NAMES = new Set(['nodes', 'trash'])
+const CANVAS_CONTENT_CHILD_NAMES: ReadonlySet<string> = new Set(['nodes', 'trash', 'revisions'])
+const CANVAS_CONTENT_MOVE_CHILD_NAMES: ReadonlySet<string> = new Set(['nodes', 'trash'])
 const CANVAS_CONTENT_FILE_NAMES = new Set([
   'config.json', 'meta.json', 'content.md', 'index.html', 'entry.json',
 ])
@@ -53,6 +54,12 @@ export type StableDirectoryNativeReadOutcome =
 /** Canvas 内容目录 rename 的提交可见性与持久性结果。 */
 export type StableDirectoryNativeMoveOutcome = StableDirectoryNativeWriteOutcome
 
+/** Canvas 内容 helper 可读写和列举的固定一级目录。 */
+export type StableDirectoryCanvasChild = 'nodes' | 'trash' | 'revisions'
+
+/** Canvas 内容 helper 允许原子移动的固定一级目录。 */
+export type StableDirectoryCanvasMoveChild = 'nodes' | 'trash'
+
 export interface StableDirectoryNativeRequest {
   mode:
     | 'list'
@@ -63,6 +70,7 @@ export interface StableDirectoryNativeRequest {
     | 'canvas-content-read'
     | 'canvas-content-list'
     | 'canvas-content-move'
+    | 'canvas-content-remove-marker'
   roots: string[]
   maxDepth?: number
   maxEntries?: number
@@ -70,11 +78,11 @@ export interface StableDirectoryNativeRequest {
   ignoreDirectories?: string[]
   ignoreFiles?: string[]
   /** Canvas intent 模式下固定的单级事务目录名。 */
-  childName?: string
+  childName?: 'transactions' | StableDirectoryCanvasChild
   /** Canvas 内容模式下固定根目录内的安全稳定 ID。 */
   entryId?: string
   /** Canvas 内容 move 的目标固定根目录。 */
-  destinationChildName?: string
+  destinationChildName?: StableDirectoryCanvasMoveChild
   /** Canvas 内容 move 的目标安全稳定 ID。 */
   destinationEntryId?: string
   /** 原子写模式下固定的单级目标文件名。 */
@@ -87,7 +95,7 @@ export interface StableDirectoryNativeRequest {
 export interface StableDirectoryNativeResult {
   roots: StableDirectoryOpenedRoot[]
   entries: StableDirectoryNativeEntry[]
-  /** 仅 canvas-intent-write 模式返回。 */
+  /** 仅写入或 marker 清理模式返回。 */
   writeOutcome?: StableDirectoryNativeWriteOutcome
   /** 仅 canvas-content-read 模式返回。 */
   readOutcome?: StableDirectoryNativeReadOutcome
@@ -412,7 +420,9 @@ function executeStableDirectoryNative(
       }
       if (record?.type === 'write-result') {
         if (!authorized || authorizationPending
-          || (request.mode !== 'canvas-intent-write' && request.mode !== 'canvas-content-write')
+          || (request.mode !== 'canvas-intent-write'
+            && request.mode !== 'canvas-content-write'
+            && request.mode !== 'canvas-content-remove-marker')
           || writeOutcome) {
           finish(new Error('稳定目录 helper write-result 响应无效'))
           return
@@ -443,7 +453,9 @@ function executeStableDirectoryNative(
         if (!authorized
           || !Number.isSafeInteger(record.entryCount)
           || record.entryCount !== entries.length
-          || ((request.mode === 'canvas-intent-write' || request.mode === 'canvas-content-write') !== Boolean(writeOutcome))
+          || ((request.mode === 'canvas-intent-write'
+            || request.mode === 'canvas-content-write'
+            || request.mode === 'canvas-content-remove-marker') !== Boolean(writeOutcome))
           || ((request.mode === 'canvas-content-read') !== Boolean(readOutcome))
           || ((request.mode === 'canvas-content-move') !== Boolean(moveOutcome))) {
           finish(new Error('稳定目录 helper done 响应无效'))
@@ -602,7 +614,12 @@ export function createStableDirectoryNativeHost(
           && request.ignoreDirectories === undefined
           && request.ignoreFiles === undefined
         const childIsSafe = request.childName !== undefined
-          && CANVAS_CONTENT_CHILD_NAMES.has(request.childName)
+          && request.childName !== 'transactions'
+          && (request.mode === 'canvas-content-move'
+            ? CANVAS_CONTENT_MOVE_CHILD_NAMES.has(request.childName)
+            : request.mode === 'canvas-content-remove-marker'
+              ? request.childName === 'trash'
+            : CANVAS_CONTENT_CHILD_NAMES.has(request.childName))
         const needsEntry = request.mode !== 'canvas-content-list'
         const entryIsSafe = !needsEntry
           || (request.entryId !== undefined && CANVAS_CONTENT_ENTRY_ID_PATTERN.test(request.entryId))
@@ -611,7 +628,7 @@ export function createStableDirectoryNativeHost(
           || (request.fileName !== undefined && CANVAS_CONTENT_FILE_NAMES.has(request.fileName))
         const destinationIsSafe = request.mode !== 'canvas-content-move'
           || (request.destinationChildName !== undefined
-            && CANVAS_CONTENT_CHILD_NAMES.has(request.destinationChildName)
+            && CANVAS_CONTENT_MOVE_CHILD_NAMES.has(request.destinationChildName)
             && request.destinationChildName !== request.childName
             && request.destinationEntryId !== undefined
             && CANVAS_CONTENT_ENTRY_ID_PATTERN.test(request.destinationEntryId))
@@ -630,6 +647,11 @@ export function createStableDirectoryNativeHost(
                 && request.destinationEntryId === undefined
                 && request.fileName === undefined
                 && request.content === undefined
+              : request.mode === 'canvas-content-remove-marker'
+                ? request.destinationChildName === undefined
+                  && request.destinationEntryId === undefined
+                  && request.fileName === undefined
+                  && request.content === undefined
               : request.fileName === undefined && request.content === undefined
         if (request.roots.length !== 1
           || !isAbsolute(request.roots[0] ?? '')

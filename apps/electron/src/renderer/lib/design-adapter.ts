@@ -1,23 +1,43 @@
+import {
+  parseCanvasArtifactRevisionSummary,
+  parseCanvasImageCandidateBatch,
+  parseCanvasImageModuleSnapshot,
+  parseCanvasTextArtifactSnapshot,
+  parseCanvasWorkspaceSnapshot,
+} from '@proma/shared'
 import type {
+  AdoptCanvasTextArtifactRevisionInput,
   AgentCanvasBindingChangeEvent,
+  CanvasArtifactRevisionSummary,
   ClearAgentCanvasBindingsInput,
   CanvasAgentMessagesResult,
   CanvasAgentNodeCreationResult,
   CanvasChangeEvent,
   CanvasDocument,
   CanvasImageJobControlInput,
+  CanvasImageCandidateBatch,
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
+  GetCanvasImageCandidateBatchInput,
+  AdoptCanvasImageCandidateBatchInput,
   ReleaseCanvasImageMediaInput,
   CanvasInvokeResult,
   CanvasNodeLifecycleResult,
   CanvasPublicError,
   CanvasPublicErrorCode,
   CanvasTarget,
+  CanvasTextArtifactIdentity,
+  CanvasTextArtifactMutationResult,
+  CanvasTextArtifactSnapshot,
+  CanvasTextArtifactTarget,
   CanvasTrashEntry,
   CanvasSessionChangeEvent,
   CanvasWorkspaceSnapshot,
+  CanvasWebviewSnapshot,
+  CanvasWebviewTarget,
+  CanvasWebviewPreviewSnapshot,
+  CanvasWebviewPreviewTarget,
   LinkAgentCanvasInput,
   LinkAgentCanvasResult,
   ListAgentCanvasBindingsInput,
@@ -35,6 +55,7 @@ import type {
   DesignImageModelSelectionChangeEvent,
   DesignJobRecord,
   ExportDesignAssetInput,
+  ExportCanvasArtifactInput,
   EnsureLegacyCanvasSessionInput,
   GetDesignTaskDetailsInput,
   ImportAgentImageInput,
@@ -62,6 +83,7 @@ import type {
   UnlinkAgentCanvasResult,
   UpsertDesignContextDocumentInput,
   UpdateCanvasSessionInput,
+  UpdateCanvasTextArtifactInput,
   UpdateDesignContextEntryInput,
   UpdateDesignImageModelSelectionInput,
 } from '@proma/shared'
@@ -76,8 +98,26 @@ export type PartialDesignApi = Partial<DesignPreloadApi>
 
 /** Renderer 组件唯一使用的 Design 适配器。 */
 export interface DesignAdapter {
+  /** 加载绑定精确正文 revision 的文本产物。 */
+  loadCanvasTextArtifact: (input: CanvasTextArtifactTarget) => Promise<CanvasTextArtifactSnapshot>
+  /** 提交新的文档或 WebView 正文修订。 */
+  updateCanvasTextArtifact: (input: UpdateCanvasTextArtifactInput) => Promise<CanvasTextArtifactMutationResult>
+  /** 列出文本产物历史修订摘要。 */
+  listCanvasArtifactRevisions: (input: CanvasTextArtifactIdentity) => Promise<CanvasArtifactRevisionSummary[]>
+  /** 把历史修订采用为当前文本产物版本。 */
+  adoptCanvasArtifactRevision: (input: AdoptCanvasTextArtifactRevisionInput) => Promise<CanvasTextArtifactMutationResult>
+  /** 通过主进程文件选择器导出产物。 */
+  exportCanvasArtifact: (input: ExportCanvasArtifactInput) => Promise<void>
   /** 加载单个 Canvas 生图模块公开快照。 */
   loadCanvasImageModule: (input: CanvasImageTarget) => Promise<CanvasImageModuleSnapshot>
+  /** 加载一个完整图片候选批次。 */
+  getCanvasImageCandidateBatch: (input: GetCanvasImageCandidateBatchInput) => Promise<CanvasImageCandidateBatch>
+  /** 补齐批次中未成功的候选任务。 */
+  continueCanvasImageCandidateBatch: (input: GetCanvasImageCandidateBatchInput) => Promise<CanvasImageCandidateBatch>
+  /** 采用整批或成功候选。 */
+  adoptCanvasImageCandidateBatch: (input: AdoptCanvasImageCandidateBatchInput) => Promise<CanvasImageCandidateBatch>
+  /** 放弃活跃候选批次。 */
+  abandonCanvasImageCandidateBatch: (input: GetCanvasImageCandidateBatchInput) => Promise<CanvasImageCandidateBatch>
   /** 保存单个 Canvas 生图模块配置。 */
   saveCanvasImageModule: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
   /** 从当前模块配置创建图片任务。 */
@@ -97,6 +137,10 @@ export interface DesignAdapter {
   ) => ReturnType<DesignPreloadApi['onCanvasImageModuleChanged']>
   /** 加载目标原生 Canvas，避免与 legacy Design load 混淆。 */
   loadCanvas: (input: LoadCanvasInput) => Promise<CanvasWorkspaceSnapshot>
+  /** 加载单个 WebView 节点的受管 HTML 快照。 */
+  loadCanvasWebview: (input: CanvasWebviewTarget) => Promise<CanvasWebviewSnapshot>
+  /** 加载 WebView 折叠卡片使用的受管静态预览。 */
+  loadCanvasWebviewPreview: (input: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
   /** 保存目标原生 Canvas，避免与 legacy Design save 混淆。 */
   saveCanvas: (input: SaveCanvasMutationsInput) => Promise<CanvasDocument>
   /** 在目标 Canvas 内创建 Agent 节点并等待主进程 committed。 */
@@ -206,10 +250,16 @@ export class CanvasPublicOperationError extends Error {
 
 /** Adapter 无法调用 Preload 时使用的固定 Canvas 公开失败。 */
 const CANVAS_ADAPTER_FALLBACKS = {
+  artifactLoad: { code: 'CANVAS_ARTIFACT_LOAD_FAILED', message: '产物暂时无法加载。' },
+  artifactSave: { code: 'CANVAS_ARTIFACT_SAVE_FAILED', message: '产物保存失败，请重试。' },
+  artifactExport: { code: 'CANVAS_ARTIFACT_EXPORT_FAILED', message: '产物导出失败，请重试。' },
   imageLoad: { code: 'CANVAS_IMAGE_LOAD_FAILED', message: '生图节点暂时无法加载。' },
   imageSave: { code: 'CANVAS_IMAGE_SAVE_FAILED', message: '生图配置保存失败，请重试。' },
   imageJob: { code: 'CANVAS_IMAGE_JOB_FAILED', message: '图片任务操作失败，请重试。' },
+  imageBatch: { code: 'CANVAS_IMAGE_BATCH_INVALID', message: '图片候选批次暂时无法处理。' },
   load: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+  webviewLoad: { code: 'CANVAS_WEBVIEW_LOAD_FAILED', message: '原型暂时无法加载。' },
+  webviewPreview: { code: 'CANVAS_WEBVIEW_PREVIEW_FAILED', message: '原型预览生成失败，请重试。' },
   save: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
   create: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
   delete: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' },
@@ -222,6 +272,103 @@ const CANVAS_ADAPTER_FALLBACKS = {
   bindingList: { code: 'CANVAS_BINDING_LIST_FAILED', message: '画布关联列表暂时无法加载。' },
   binding: { code: 'CANVAS_BINDING_FAILED', message: '画布关联失败，请重试。' },
 } as const satisfies Record<string, CanvasPublicError>
+
+/** 判断未知值是否为普通对象。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** 判断对象是否只包含指定字段。 */
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value)
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key))
+}
+
+/** 比较两个文本产物稳定身份。 */
+function matchesTextArtifactIdentity(
+  actual: CanvasTextArtifactIdentity,
+  expected: CanvasTextArtifactIdentity,
+): boolean {
+  return actual.projectId === expected.projectId
+    && actual.canvasId === expected.canvasId
+    && actual.nodeId === expected.nodeId
+    && actual.kind === expected.kind
+    && actual.contentId === expected.contentId
+}
+
+/** 比较两个文本产物精确读取目标。 */
+function matchesTextArtifactTarget(
+  actual: CanvasTextArtifactTarget,
+  expected: CanvasTextArtifactTarget,
+): boolean {
+  return matchesTextArtifactIdentity(actual, expected)
+    && actual.contentRevision === expected.contentRevision
+}
+
+/** 文本事务返回 revision 的操作语义约束。 */
+interface TextArtifactRevisionExpectation {
+  mode: 'greater-than' | 'exact'
+  revision: number
+}
+
+/** 校验返回 snapshot 中同一文本节点已采用正文快照声明的 revision。 */
+function snapshotAdoptsArtifactRevision(
+  document: unknown,
+  artifact: CanvasTextArtifactSnapshot,
+): boolean {
+  if (!isRecord(document) || !Array.isArray(document.nodes)) return false
+  const node = document.nodes.find((candidate) => (
+    isRecord(candidate)
+    && candidate.id === artifact.target.nodeId
+    && candidate.kind === artifact.target.kind
+  ))
+  if (!isRecord(node) || node.contentRevision !== artifact.target.contentRevision) return false
+  return artifact.target.kind === 'document'
+    ? node.documentId === artifact.target.contentId
+    : node.prototypeId === artifact.target.contentId
+}
+
+/** 严格验证文本产物事务返回的图与正文身份。 */
+function parseTextArtifactMutationResult(
+  value: unknown,
+  expected: CanvasTextArtifactIdentity,
+  revisionExpectation: TextArtifactRevisionExpectation,
+  expectedCanvasRevision: number,
+): CanvasTextArtifactMutationResult {
+  if (!isRecord(value)
+    || !hasExactKeys(value, ['snapshot', 'artifact'])) {
+    throw new Error('CANVAS_TEXT_ARTIFACT_MUTATION_RESULT_INVALID')
+  }
+  /** Shared parser 逐层重建公开 snapshot，避免 Renderer 重复一份浅校验合同。 */
+  const snapshot = parseCanvasWorkspaceSnapshot(value.snapshot)
+  const artifact = parseCanvasTextArtifactSnapshot(value.artifact)
+  const document = snapshot.document
+  /** update 允许跨越历史 max，adopt 则必须精确命中用户选择的修订。 */
+  const revisionMatches = revisionExpectation.mode === 'greater-than'
+    ? artifact.target.contentRevision > revisionExpectation.revision
+    : artifact.target.contentRevision === revisionExpectation.revision
+  if (!matchesTextArtifactIdentity(artifact.target, expected)
+    || document.projectId !== expected.projectId
+    || document.canvasId !== expected.canvasId
+    || document.revision <= expectedCanvasRevision
+    || !revisionMatches
+    || !snapshotAdoptsArtifactRevision(document, artifact)) {
+    throw new Error('CANVAS_TEXT_ARTIFACT_MUTATION_RESULT_INVALID')
+  }
+  return { snapshot, artifact }
+}
+
+/** 建立不会与其它节点或修订冲突的文本产物在途读取键。 */
+function textArtifactKey(input: CanvasTextArtifactIdentity, revision?: number): string {
+  return [
+    input.projectId,
+    input.canvasId,
+    input.nodeId,
+    input.kind,
+    input.contentId,
+    revision === undefined ? '' : String(revision),
+  ].join('\0')
+}
 
 /**
  * 把订阅释放函数包装为重复调用安全的边界。
@@ -266,8 +413,94 @@ async function callCanvasApi<T>(
   }
 }
 
+/** 调用候选批次 API，并在 Renderer 边界再次严格重建返回值。 */
+async function loadCanvasImageCandidateBatch(
+  api: PartialDesignApi,
+  method: 'getCanvasImageCandidateBatch'
+    | 'continueCanvasImageCandidateBatch'
+    | 'adoptCanvasImageCandidateBatch'
+    | 'abandonCanvasImageCandidateBatch',
+  input: GetCanvasImageCandidateBatchInput | AdoptCanvasImageCandidateBatchInput,
+): Promise<CanvasImageCandidateBatch> {
+  try {
+    return parseCanvasImageCandidateBatch(await callCanvasApi(
+      () => requireMethod(api, method)(input as never),
+      CANVAS_ADAPTER_FALLBACKS.imageBatch,
+    ))
+  } catch (error) {
+    if (error instanceof CanvasPublicOperationError) throw error
+    throw new CanvasPublicOperationError(
+      CANVAS_ADAPTER_FALLBACKS.imageBatch.code,
+      CANVAS_ADAPTER_FALLBACKS.imageBatch.message,
+    )
+  }
+}
+
 /** 创建负责 Canvas 安全解包与 legacy Design 原样适配的 renderer adapter。 */
 export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
+  /** 只合并相同精确目标的在途正文读取，settle 后立即清理。 */
+  const textArtifactLoads = new Map<string, Promise<CanvasTextArtifactSnapshot>>()
+  /** 只合并相同稳定身份的在途修订列表读取，settle 后立即清理。 */
+  const textArtifactRevisionLists = new Map<string, Promise<CanvasArtifactRevisionSummary[]>>()
+
+  /** 加载并严格验证目标身份，避免旧节点响应覆盖当前工作台。 */
+  const loadCanvasTextArtifact = (input: CanvasTextArtifactTarget): Promise<CanvasTextArtifactSnapshot> => {
+    const key = textArtifactKey(input, input.contentRevision)
+    const existing = textArtifactLoads.get(key)
+    if (existing) return existing
+    const pending = callCanvasApi(
+      () => requireMethod(api, 'loadCanvasTextArtifact')(input),
+      CANVAS_ADAPTER_FALLBACKS.artifactLoad,
+    ).then((value) => {
+      const parsed = parseCanvasTextArtifactSnapshot(value)
+      if (!matchesTextArtifactTarget(parsed.target, input)) {
+        throw new CanvasPublicOperationError(
+          CANVAS_ADAPTER_FALLBACKS.artifactLoad.code,
+          CANVAS_ADAPTER_FALLBACKS.artifactLoad.message,
+        )
+      }
+      return parsed
+    }).catch((error: unknown) => {
+      if (error instanceof CanvasPublicOperationError) throw error
+      throw new CanvasPublicOperationError(
+        CANVAS_ADAPTER_FALLBACKS.artifactLoad.code,
+        CANVAS_ADAPTER_FALLBACKS.artifactLoad.message,
+      )
+    }).finally(() => {
+      if (textArtifactLoads.get(key) === pending) textArtifactLoads.delete(key)
+    })
+    textArtifactLoads.set(key, pending)
+    return pending
+  }
+
+  /** 加载并严格验证同一产物的修订摘要列表。 */
+  const listCanvasArtifactRevisions = (
+    input: CanvasTextArtifactIdentity,
+  ): Promise<CanvasArtifactRevisionSummary[]> => {
+    const key = textArtifactKey(input)
+    const existing = textArtifactRevisionLists.get(key)
+    if (existing) return existing
+    const pending = callCanvasApi(
+      () => requireMethod(api, 'listCanvasArtifactRevisions')(input),
+      CANVAS_ADAPTER_FALLBACKS.artifactLoad,
+    ).then((values) => values.map((value) => {
+      const parsed = parseCanvasArtifactRevisionSummary(value)
+      if (parsed.kind !== input.kind || parsed.contentId !== input.contentId) {
+        throw new Error('CANVAS_ARTIFACT_REVISION_IDENTITY_INVALID')
+      }
+      return parsed
+    })).catch((error: unknown) => {
+      if (error instanceof CanvasPublicOperationError) throw error
+      throw new CanvasPublicOperationError(
+        CANVAS_ADAPTER_FALLBACKS.artifactLoad.code,
+        CANVAS_ADAPTER_FALLBACKS.artifactLoad.message,
+      )
+    }).finally(() => {
+      if (textArtifactRevisionLists.get(key) === pending) textArtifactRevisionLists.delete(key)
+    })
+    textArtifactRevisionLists.set(key, pending)
+    return pending
+  }
   interface CanvasChangeSubscriber {
     projectId: string
     canvasIds: ReadonlySet<string>
@@ -306,9 +539,66 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
   }
 
   return {
-    loadCanvasImageModule: (input) => callCanvasApi(
-      () => requireMethod(api, 'loadCanvasImageModule')(input),
-      CANVAS_ADAPTER_FALLBACKS.imageLoad,
+    loadCanvasTextArtifact,
+    updateCanvasTextArtifact: async (input) => {
+      try {
+        return parseTextArtifactMutationResult(await callCanvasApi(
+          () => requireMethod(api, 'updateCanvasTextArtifact')(input),
+          CANVAS_ADAPTER_FALLBACKS.artifactSave,
+        ), input, { mode: 'greater-than', revision: input.expectedContentRevision }, input.expectedCanvasRevision)
+      } catch (error) {
+        if (error instanceof CanvasPublicOperationError) throw error
+        throw new CanvasPublicOperationError(
+          CANVAS_ADAPTER_FALLBACKS.artifactSave.code,
+          CANVAS_ADAPTER_FALLBACKS.artifactSave.message,
+        )
+      }
+    },
+    listCanvasArtifactRevisions,
+    adoptCanvasArtifactRevision: async (input) => {
+      try {
+        return parseTextArtifactMutationResult(await callCanvasApi(
+          () => requireMethod(api, 'adoptCanvasArtifactRevision')(input),
+          CANVAS_ADAPTER_FALLBACKS.artifactSave,
+        ), input, { mode: 'exact', revision: input.revision }, input.expectedCanvasRevision)
+      } catch (error) {
+        if (error instanceof CanvasPublicOperationError) throw error
+        throw new CanvasPublicOperationError(
+          CANVAS_ADAPTER_FALLBACKS.artifactSave.code,
+          CANVAS_ADAPTER_FALLBACKS.artifactSave.message,
+        )
+      }
+    },
+    exportCanvasArtifact: (input) => callCanvasApi(
+      () => requireMethod(api, 'exportCanvasArtifact')(input),
+      CANVAS_ADAPTER_FALLBACKS.artifactExport,
+    ),
+    loadCanvasImageModule: async (input) => {
+      try {
+        /** Renderer 再次重建完整快照，避免测试注入或旧 Preload 绕过边界。 */
+        return parseCanvasImageModuleSnapshot(await callCanvasApi(
+          () => requireMethod(api, 'loadCanvasImageModule')(input),
+          CANVAS_ADAPTER_FALLBACKS.imageLoad,
+        ))
+      } catch (error) {
+        if (error instanceof CanvasPublicOperationError) throw error
+        throw new CanvasPublicOperationError(
+          CANVAS_ADAPTER_FALLBACKS.imageLoad.code,
+          CANVAS_ADAPTER_FALLBACKS.imageLoad.message,
+        )
+      }
+    },
+    getCanvasImageCandidateBatch: (input) => loadCanvasImageCandidateBatch(
+      api, 'getCanvasImageCandidateBatch', input,
+    ),
+    continueCanvasImageCandidateBatch: (input) => loadCanvasImageCandidateBatch(
+      api, 'continueCanvasImageCandidateBatch', input,
+    ),
+    adoptCanvasImageCandidateBatch: (input) => loadCanvasImageCandidateBatch(
+      api, 'adoptCanvasImageCandidateBatch', input,
+    ),
+    abandonCanvasImageCandidateBatch: (input) => loadCanvasImageCandidateBatch(
+      api, 'abandonCanvasImageCandidateBatch', input,
     ),
     saveCanvasImageModule: (input) => callCanvasApi(
       () => requireMethod(api, 'saveCanvasImageModule')(input),
@@ -347,6 +637,14 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
     loadCanvas: (input) => callCanvasApi(
       () => requireMethod(api, 'loadCanvasWorkspace')(input),
       CANVAS_ADAPTER_FALLBACKS.load,
+    ),
+    loadCanvasWebview: (input) => callCanvasApi(
+      () => requireMethod(api, 'loadCanvasWebview')(input),
+      CANVAS_ADAPTER_FALLBACKS.webviewLoad,
+    ),
+    loadCanvasWebviewPreview: (input) => callCanvasApi(
+      () => requireMethod(api, 'loadCanvasWebviewPreview')(input),
+      CANVAS_ADAPTER_FALLBACKS.webviewPreview,
     ),
     saveCanvas: (input) => callCanvasApi(
       () => requireMethod(api, 'saveCanvasMutations')(input),

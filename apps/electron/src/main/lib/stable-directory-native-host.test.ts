@@ -11,6 +11,7 @@ import {
   createStableDirectoryNativeHost,
   runStableDirectoryNative,
   type StableDirectoryNativeHostDependencies,
+  type StableDirectoryNativeRequest,
 } from './stable-directory-native-host'
 
 interface FakeHelperOptions {
@@ -442,7 +443,7 @@ describe('stable directory native host', () => {
       },
     }
     /** 覆盖根目录、entry ID 与文件名三个独立路径输入边界。 */
-    const requests = [
+    const requests: StableDirectoryNativeRequest[] = [
       { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'transactions' },
       { mode: 'canvas-content-read' as const, roots: ['/requested'], childName: 'nodes', entryId: '../escape', fileName: 'meta.json' },
       { mode: 'canvas-content-write' as const, roots: ['/requested'], childName: 'nodes', entryId: 'entry-1', fileName: '../meta.json', content: '{}' },
@@ -454,6 +455,10 @@ describe('stable directory native host', () => {
       { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', maxEntries: 513 },
       { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', maxEntries: 1.5 },
       { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', maxEntries: Number.NaN },
+      { mode: 'canvas-content-write' as const, roots: ['/requested'], childName: 'revisions', entryId: 'revision-a', fileName: 'payload.txt', content: '{}' },
+      { mode: 'canvas-content-read' as const, roots: ['/requested'], childName: 'revisions', entryId: 'revision-a', fileName: 'nested/meta.json' },
+      { mode: 'canvas-content-move' as const, roots: ['/requested'], childName: 'revisions', destinationChildName: 'trash', entryId: 'revision-a', destinationEntryId: 'revision-a' },
+      { mode: 'canvas-content-move' as const, roots: ['/requested'], childName: 'nodes', destinationChildName: 'revisions' as unknown as StableDirectoryNativeRequest['destinationChildName'], entryId: 'entry-1', destinationEntryId: 'revision-a' },
     ]
 
     for (const request of requests) {
@@ -475,7 +480,7 @@ describe('stable directory native host', () => {
       },
     }
     /** 异常值与看似合法值都应拒绝，证明控制面按字段收窄而非只校验数值。 */
-    const requests = [
+    const requests: StableDirectoryNativeRequest[] = [
       { mode: 'canvas-content-write' as const, roots: ['/requested'], childName: 'nodes', entryId: 'entry-1', fileName: 'meta.json', content: '{}', maxDepth: -1 },
       { mode: 'canvas-content-read' as const, roots: ['/requested'], childName: 'nodes', entryId: 'entry-1', fileName: 'meta.json', maxOutputBytes: Number.NaN },
       { mode: 'canvas-content-list' as const, roots: ['/requested'], childName: 'nodes', ignoreDirectories: ['node_modules'] },
@@ -514,6 +519,40 @@ describe('stable directory native host', () => {
     expect(helperArguments).not.toContain('--max-output-bytes')
     expect(helperArguments).not.toContain('--ignore-dir')
     expect(helperArguments).not.toContain('--ignore-file')
+  })
+
+  test.skipIf(!nativeHelperPlatformSupported)('Given revisions 受管目录 When 读写固定正文和列举版本 Then helper 接受', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-revisions-flow-'))
+    const canvasRoot = join(root, 'canvas')
+    mkdirSync(canvasRoot)
+    try {
+      const metadata = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'revisions',
+        entryId: 'revision-a', fileName: 'meta.json', content: '{}',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(metadata.writeOutcome).toEqual({ commitVisible: true, durabilityUncertain: false })
+
+      const body = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'revisions',
+        entryId: 'revision-a', fileName: 'content.md', content: '# v1',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(body.writeOutcome).toEqual({ commitVisible: true, durabilityUncertain: false })
+
+      const read = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: 'revisions',
+        entryId: 'revision-a', fileName: 'content.md',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(read.readOutcome).toMatchObject({ status: 'ok', content: '# v1', size: 4 })
+
+      const listed = await runStableDirectoryNative({
+        mode: 'canvas-content-list', roots: [canvasRoot], childName: 'revisions', maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(listed.entries).toEqual([{
+        rootIndex: 0, name: 'revision-a', path: '', isDirectory: true,
+      }])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test('Given move 已提交但目录持久性未确认 When host 解析结果 Then 保留可见提交供上层对账', async () => {
@@ -1366,7 +1405,7 @@ describe('stable directory native host', () => {
           rejectPromise(new Error(`锁持有进程意外退出: ${code}`))
         })
       })
-      const request = {
+      const request: StableDirectoryNativeRequest = {
         mode: 'canvas-intent-write' as const,
         roots: [canvasRoot], childName: 'transactions',
         fileName: 'agent-node-ffffffff-ffff-4fff-8fff-eeeeeeeeeeee.json',

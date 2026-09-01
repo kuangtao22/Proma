@@ -170,7 +170,7 @@ export function createCanvasImageInputResolver(
       }
       /** 边顺序决定稳定输入顺序，重复源节点只解析一次。 */
       const sourceIds = [...new Set(document.edges
-        .filter((edge) => edge.targetNodeId === target.nodeId)
+        .filter((edge) => edge.targetNodeId === target.nodeId && edge.relation === 'reference')
         .map((edge) => edge.sourceNodeId))]
         .slice(0, CANVAS_IMAGE_INPUT_MAX_REFERENCES)
       /** 逐项消费固定引用、文本和媒体预算。 */

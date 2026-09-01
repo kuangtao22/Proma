@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import type { CanvasNodeKind } from '@proma/shared'
+import type { CanvasNodeActivityState, CanvasNodeKind } from '@proma/shared'
 import { ReactFlowProvider } from '@xyflow/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { CanvasNodeCard, createCanvasNodeChildTypeSelectHandler } from './CanvasNodeCard'
@@ -23,10 +23,13 @@ function createProps(kind: CanvasNodeKind): CanvasNodeCardProps {
 }
 
 /** 在 XYFlow 上下文中渲染折叠节点卡片。 */
-function renderCard(kind: CanvasNodeKind): string {
+function renderCard(
+  kind: CanvasNodeKind,
+  overrides: Partial<CanvasNodeCardProps> = {},
+): string {
   return renderToStaticMarkup(
     <ReactFlowProvider>
-      <CanvasNodeCard {...createProps(kind)} />
+      <CanvasNodeCard {...createProps(kind)} {...overrides} />
     </ReactFlowProvider>,
   )
 }
@@ -55,6 +58,41 @@ const propsWithLoadMessages: CanvasNodeCardProps = { ...createProps('agent'), lo
 const propsWithHtml: CanvasNodeCardProps = { ...createProps('webview'), html: '<main />' }
 
 describe('Canvas 通用折叠节点卡片', () => {
+  test.each([
+    ['idle', false, false],
+    ['queued', true, false],
+    ['running', true, true],
+    ['waiting-approval', true, false],
+  ] as const)('Given %s When 渲染卡片 Then 轮廓与动画符合合同', (activityState, outline, animated) => {
+    const html = renderCard('image', { activityState })
+
+    expect(html.includes('data-canvas-activity-outline')).toBe(outline)
+    expect(html.includes('canvas-running-dash')).toBe(animated)
+  })
+
+  test('Given 节点选中且运行 When 渲染卡片 Then 选中 ring 与外层运行轮廓同时保留', () => {
+    const html = renderCard('agent', { activityState: 'running', selected: true })
+
+    expect(html).toContain('ring-2')
+    expect(html).toContain('data-canvas-activity-outline')
+    expect(html).toContain('pointer-events-none')
+    expect(html).toContain('aria-hidden="true"')
+  })
+
+  test.each([
+    ['image', 288, 210],
+    ['webview', 384, 316],
+  ] as const)('Given %s 使用动态尺寸且运行 When 渲染轮廓 Then SVG 跟随卡片几何', (kind, nodeWidth, nodeHeight) => {
+    const activityState: CanvasNodeActivityState = 'running'
+    const html = renderCard(kind, { activityState, nodeWidth, nodeHeight })
+
+    expect(html).toContain(nodeWidth === 288 ? 'w-[288px]' : `width:${nodeWidth}px`)
+    expect(html).toContain(`height:${nodeHeight}px`)
+    expect(html).toContain('data-canvas-activity-outline')
+    expect(html).toContain('width="100%"')
+    expect(html).toContain('height="100%"')
+  })
+
   test('Given 节点侧选择文档 When 扩展 Then 同时传递源节点和目标类型', () => {
     const calls: Array<[string, CanvasNodeKind]> = []
     const handler = createCanvasNodeChildTypeSelectHandler(
@@ -96,6 +134,7 @@ describe('Canvas 通用折叠节点卡片', () => {
     expect(html).toContain('aria-label="从此节点扩展"')
     expect(html).toContain('data-handleid="input"')
     expect(html).toContain('data-handleid="output"')
+    expect(html).toContain('connectable')
   })
 
   test('Given 节点存在宿主 Agent When 折叠渲染 Then 单节点菜单提供引用到对话动作', () => {
@@ -127,12 +166,45 @@ describe('Canvas 通用折叠节点卡片', () => {
     expect(html).not.toContain('object-cover')
   })
 
+  test('Given WebView 投影提供网页设备尺寸 When 折叠渲染 Then 卡片使用统一几何且承载静态预览内容', () => {
+    const html = renderToStaticMarkup(
+      <ReactFlowProvider>
+        <CanvasNodeCard
+          {...createProps('webview')}
+          nodeWidth={384}
+          nodeHeight={316}
+        >
+          <div data-webview-static-preview>静态页面</div>
+        </CanvasNodeCard>
+      </ReactFlowProvider>,
+    )
+
+    expect(html).toContain('width:384px')
+    expect(html).toContain('height:316px')
+    expect(html).toContain('data-webview-static-preview="true"')
+    expect(html).not.toContain('w-[288px]')
+  })
+
   test('Given 生图节点没有预览地址 When 折叠渲染 Then 保留原有文字回退内容且不产生破图元素', () => {
     const html = renderImagePreviewCard()
 
     expect(html).not.toContain('<img')
     expect(html).toContain('这是只来自画布文档的单行摘要')
     expect(html).toContain('已创建')
+  })
+
+  test.each([
+    ['new-version', '新版本'],
+    ['partial', '部分完成'],
+  ] as const)('Given 生图节点存在 %s 候选 When 折叠渲染 Then 正式缩略图不变并显示候选标记', (candidateState, label) => {
+    const html = renderCard('image', {
+      previewUrl: 'proma-file://thumbnail-token/adopted.webp',
+      candidateState,
+    })
+
+    expect(html).toContain('proma-file://thumbnail-token/adopted.webp')
+    expect(html).toContain(label)
+    expect(html).toContain('aria-label="查看图片候选详情"')
   })
 
   test('Given 卡片输入 When 检查公开合同 Then 不接受内容加载函数', () => {

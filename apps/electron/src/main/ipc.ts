@@ -25,7 +25,7 @@ import {
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS, isPromaPermissionMode, normalizePathForCompare, parseCanvasNodeContentMeta, TERMINAL_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS, isPromaPermissionMode, normalizePathForCompare, TERMINAL_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS, TRAY_IPC_CHANNELS } from '../types'
 import type {
   QuickTaskSubmitInput,
@@ -173,6 +173,9 @@ import type {
   CanvasChangeEvent,
   AgentCanvasBindingChangeEvent,
   CanvasSessionChangeEvent,
+  CanvasWebviewTarget,
+  CanvasWebviewPreviewTarget,
+  ExportCanvasArtifactInput,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
@@ -213,13 +216,33 @@ import {
 } from './lib/design/canvas-document-ipc'
 import { createCanvasAgentBatchOperationService } from './lib/design/canvas-agent-batch-operation'
 import { createCanvasArtifactCreationService } from './lib/design/canvas-artifact-creation'
+import { createCanvasArtifactRevisionStore } from './lib/design/canvas-artifact-revision-store'
+import {
+  createCanvasArtifactRegistry,
+  IMAGE_ARTIFACT_DESCRIPTOR,
+} from './lib/design/canvas-artifact-registry'
+import {
+  createCanvasTextArtifactAdapter,
+  createCanvasTextArtifactGraphWriter,
+  createCanvasTextArtifactService,
+} from './lib/design/canvas-text-artifact-service'
 import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
-import { createCanvasNodeContentStore } from './lib/design/canvas-node-content-store'
+import {
+  createCanvasNodeContentStore,
+  parseCanvasNodeContentMetaContent,
+} from './lib/design/canvas-node-content-store'
 import { createCanvasContentNodeLifecycle } from './lib/design/canvas-content-node-lifecycle'
 import { createCanvasImageModuleStore } from './lib/design/canvas-image-module-store'
 import { createCanvasImageJobTargetAdapter } from './lib/design/canvas-image-job-target'
 import { createCanvasImageInputResolver } from './lib/design/canvas-image-input-resolver'
+import { createCanvasImageCandidateBatchStore } from './lib/design/canvas-image-candidate-batch-store'
+import { createCanvasImageCandidateBatchService } from './lib/design/canvas-image-candidate-batch-service'
+import {
+  createCanvasWebviewPreviewService,
+  createElectronCanvasWebviewOffscreenRenderer,
+  resolveCanvasWebviewPreviewCachePath,
+} from './lib/design/canvas-webview-preview-service'
 import {
   runChannelMutationWithImageModelBroadcast,
   updateToolCredentialsWithImageModelBroadcast,
@@ -1969,6 +1992,23 @@ export function registerIpcHandlers(): void {
   }
   /** 非 Agent 内容目录与图文档共享唯一 Store 实例和目录 capability。 */
   const canvasNodeContentStore = createCanvasNodeContentStore({ store: canvasDocumentStore })
+  /** 文本不可变版本复用同一 Canvas Store 与 revision 0 内容读取边界。 */
+  const canvasArtifactRevisionStore = createCanvasArtifactRevisionStore({
+    store: canvasDocumentStore,
+    nodeContentStore: canvasNodeContentStore,
+  })
+  /** WebView 预览延迟创建唯一离屏窗口，应用未打开画布时不占 Chromium 资源。 */
+  const webviewOffscreenRenderer = createElectronCanvasWebviewOffscreenRenderer()
+  /** 静态预览服务按完整目标缓存，并通过本地文件协议只公开不透明 URL。 */
+  const canvasWebviewPreviewService = createCanvasWebviewPreviewService({
+    resolveCachePath: (target) => resolveCanvasWebviewPreviewCachePath(
+      designPathResolver.resolveCanvas(target.projectId, target.canvasId).thumbnailsDir,
+      target,
+    ),
+    render: async (input) => (await webviewOffscreenRenderer).render(input),
+    registerPreview: (cachePath, content) => registerPromaAuthorizedFile(cachePath, content),
+    revokePreview: revokePromaPathUrl,
+  })
   /** 新图片节点默认模型复用现有项目级可用选择，不读取或复制凭据。 */
   const canvasImagePreferences = getDesignImageModelServices().imagePreferences
   /** Canvas 图片配置复用图文档 capability 与稳定目录 helper。 */
@@ -1979,13 +2019,53 @@ export function registerIpcHandlers(): void {
     imageStore: canvasImageModuleStore,
     onCanvasChanged: publishCanvasImageGraphChange,
   })
-  /** 从受管节点目录读取已提交正文，meta.json 始终作为身份和 revision 事实。 */
+  /** 按权威节点当前采用 revision 读取已提交正文，revision 0 才回退初始内容目录。 */
   const readCommittedCanvasContent = async (
     target: { projectId: string; canvasId: string },
     contentId: string,
     fileName: 'content.md' | 'index.html',
+    expectedWebview?: CanvasWebviewTarget | CanvasWebviewPreviewTarget,
   ): Promise<{ revision: number; content: string }> => {
     const loaded = canvasDocumentStore.loadWithDirectoryCapability(target)
+    /** 文件名决定唯一允许的文本节点类别。 */
+    const expectedKind = fileName === 'content.md' ? 'document' : 'webview'
+    /** 正文 ID 必须在同一次权威 LOAD 中唯一命中当前文本节点。 */
+    const matchingNodes = loaded.snapshot.document.nodes.filter((candidate) => (
+      candidate.kind === expectedKind
+      && (candidate.kind === 'document'
+        ? candidate.documentId === contentId
+        : candidate.prototypeId === contentId)
+    ))
+    if (matchingNodes.length !== 1) throw new Error('CANVAS_IMAGE_INPUT_CONTENT_INVALID')
+    /** 唯一命中的节点提供当前采用 revision，禁止信任旧 nodes/meta.json。 */
+    const authoritativeNode = matchingNodes[0]!
+    /** 显式收窄文本节点联合类型；shared 解析器已把 legacy revision 规范化为 0。 */
+    if (authoritativeNode.kind !== 'document' && authoritativeNode.kind !== 'webview') {
+      throw new Error('CANVAS_IMAGE_INPUT_CONTENT_INVALID')
+    }
+    if (expectedWebview) {
+      /** 图节点、内容目录和 revision 必须来自同一次权威 LOAD，避免 Renderer 越权读取其他原型。 */
+      if (authoritativeNode.id !== expectedWebview.nodeId
+        || authoritativeNode.kind !== 'webview'
+        || authoritativeNode.prototypeId !== expectedWebview.prototypeId
+        || authoritativeNode.contentRevision !== expectedWebview.contentRevision
+        || ('devicePreset' in expectedWebview && authoritativeNode.devicePreset !== expectedWebview.devicePreset)
+        || contentId !== expectedWebview.prototypeId) {
+        throw new Error('CANVAS_WEBVIEW_TARGET_MISMATCH')
+      }
+    }
+    if (authoritativeNode.contentRevision > 0) {
+      /** v1+ 正文只存在于不可变版本库，nodes 目录继续保留 revision 0 迁移基线。 */
+      const revision = await canvasArtifactRevisionStore.read(target, {
+        kind: expectedKind,
+        contentId,
+        revision: authoritativeNode.contentRevision,
+      })
+      if (revision.record.state !== 'committed') {
+        throw new Error('CANVAS_IMAGE_INPUT_CONTENT_INVALID')
+      }
+      return { revision: revision.record.revision, content: revision.content }
+    }
     const capability = loaded.openSingleChildDirectory('nodes')
     capability.assertValid()
     /** meta 与正文在同一 capability 生命周期内读取，目录换绑会 fail closed。 */
@@ -2001,9 +2081,8 @@ export function registerIpcHandlers(): void {
       if (result.readOutcome?.status !== 'ok') throw new Error('CANVAS_IMAGE_INPUT_CONTENT_INVALID')
       return result.readOutcome.content
     }
-    const meta = parseCanvasNodeContentMeta(JSON.parse(await readFile('meta.json')) as unknown)
-    const expectedKind = fileName === 'content.md' ? 'document' : 'webview'
-    if (meta.contentId !== contentId || meta.kind !== expectedKind) {
+    const meta = parseCanvasNodeContentMetaContent(await readFile('meta.json'))
+    if (meta.contentId !== contentId || meta.kind !== expectedKind || meta.revision !== 0) {
       throw new Error('CANVAS_IMAGE_INPUT_CONTENT_INVALID')
     }
     return { revision: meta.revision, content: await readFile(fileName) }
@@ -2101,12 +2180,63 @@ export function registerIpcHandlers(): void {
     closeBrowser: (sessionId) => browserController.close(sessionId),
     deleteSession: deleteAgentSession,
   })
+  /** 候选批次、LOAD、SAVE 与节点操作复用同一 Canvas 串行器。 */
+  const canvasOperationSerializer = createCanvasOperationSerializer()
+  /** 候选批次使用唯一受管 Store，避免 Job 与 IPC 各自维护状态。 */
+  const canvasImageCandidateBatchStore = createCanvasImageCandidateBatchStore({
+    documents: canvasDocumentStore,
+  })
+  /** Service 回调只会在 Job Manager 完成赋值后执行。 */
+  let designJobManager: DesignJobManager
+  const canvasImageCandidateBatchService = createCanvasImageCandidateBatchService({
+    store: canvasImageCandidateBatchStore,
+    runExclusive: (target, effect) => canvasOperationSerializer.run(target, () => (
+      workspaceOperationGuard.runWorkspaceWrite(target.projectId, effect)
+    )),
+    loadConfig: canvasImageModuleStore.load,
+    adoptAsset: canvasImageModuleStore.adoptAsset,
+    loadCanvas: (target) => canvasDocumentStore.load(target).document,
+    applyCanvasProjection: async (target, expectedRevision, nodes) => (
+      canvasDocumentStore.mutate(target, expectedRevision, [{ type: 'upsert-nodes', nodes: [...nodes] }])
+    ),
+    validateCandidate: async (batch, entry) => {
+      const job = designJobManager.getProjectJob(batch.projectId, entry.jobId)
+      const canvasTarget = job?.target?.kind === 'canvas-image' ? job.target : undefined
+      const asset = entry.candidateAssetId
+        ? designStore.requireStableAuthoritativeDocument(batch.projectId).assets
+          .find((candidate) => candidate.id === entry.candidateAssetId)
+        : undefined
+      if (!job
+        || job.status !== 'succeeded'
+        || !canvasTarget
+        || canvasTarget.canvasId !== batch.canvasId
+        || canvasTarget.nodeId !== entry.nodeId
+        || canvasTarget.imageModuleId !== entry.imageModuleId
+        || job.outputAssetId !== entry.candidateAssetId
+        || !asset
+        || asset.sourceJobId !== job.id) {
+        throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
+      }
+    },
+    retryEntry: async (batch, entry) => {
+      const replacement = designJobManager.retry(batch.projectId, entry.jobId)
+      return {
+        jobId: replacement.id,
+        start: () => {
+          void designJobManager.run(replacement.id).catch((error) => {
+            console.error('[Canvas 图片候选] 补齐任务启动失败:', error)
+          })
+        },
+      }
+    },
+  })
   /** Design Job 复用可见 Pi 会话和同一素材/Store 边界，不创建第二套 runtime。 */
-  const designJobManager = new DesignJobManager({
+  designJobManager = new DesignJobManager({
     pathResolver: designPathResolver,
     store: designStore,
     assetService: designAssetService,
     canvasImageTargetAdapter: canvasImageJobTarget,
+    canvasImageCandidateBatches: canvasImageCandidateBatchService,
     canvasImageInputResolver,
     imageModels,
     contextOrchestrator: designContextOrchestrator,
@@ -2159,8 +2289,7 @@ export function registerIpcHandlers(): void {
       canvasImagePreferences.getSelection(projectId).selectedProfileId ?? null
     ),
   })
-  /** 批处理、LOAD、SAVE 与单节点操作共享唯一 Canvas 串行器。 */
-  const canvasOperationSerializer = createCanvasOperationSerializer()
+  /** 批处理、LOAD、SAVE 与单节点操作共享上方创建的唯一 Canvas 串行器。 */
   /** 批量事务服务在主进程只实例化一次，后续工具 Provider 必须复用该实例。 */
   const canvasAgentBatchOperation = createCanvasAgentBatchOperationService({
     store: canvasDocumentStore,
@@ -2190,6 +2319,38 @@ export function registerIpcHandlers(): void {
     contentLifecycle: canvasContentNodeLifecycle,
     agentNodeCreation: canvasAgentNodeCreation,
   })
+  /** 文本图写复用现有文档 Store 与唯一 Agent batch，不创建第二串行器或 lease。 */
+  const canvasTextArtifactGraphWriter = createCanvasTextArtifactGraphWriter({
+    documents: canvasDocumentStore,
+    batch: canvasAgentBatchOperation,
+  })
+  /** 文档与 WebView 的版本事务在主进程只实例化一次，供 IPC 与普通 Agent 共用。 */
+  const canvasTextArtifactService = createCanvasTextArtifactService({
+    documents: canvasDocumentStore,
+    revisions: canvasArtifactRevisionStore,
+    graph: canvasTextArtifactGraphWriter,
+  })
+  /** 三类产物共享唯一能力表；具体存储与任务服务仍由各自适配器持有。 */
+  const canvasArtifactRegistry = createCanvasArtifactRegistry([
+    createCanvasTextArtifactAdapter('document', canvasTextArtifactService),
+    createCanvasTextArtifactAdapter('webview', canvasTextArtifactService),
+    {
+      descriptor: IMAGE_ARTIFACT_DESCRIPTOR,
+      /** 图片只允许导出当前模块已采用的素材，路径由主进程选择器补入。 */
+      export: async (input: Extract<ExportCanvasArtifactInput, { kind: 'image' }> & { targetPath: string }) => {
+        const config = await canvasImageModuleStore.load({
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+          nodeId: input.nodeId,
+          imageModuleId: input.imageModuleId,
+        })
+        if (config.adoptedAssetId !== input.assetId) {
+          throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
+        }
+        await designAssetService.exportAsset(input.projectId, input.assetId, input.targetPath)
+      },
+    },
+  ])
   /** 普通 Agent 产物先准备受管正文，再通过唯一 batch 提交可见图事实。 */
   const canvasArtifactCreation = createCanvasArtifactCreationService({
     documents: canvasDocumentStore,
@@ -2340,12 +2501,58 @@ export function registerIpcHandlers(): void {
     store: canvasDocumentStore,
     batch: canvasAgentBatchOperation,
     artifacts: canvasArtifactCreation,
+    textArtifacts: canvasTextArtifactService,
+    artifactRegistry: canvasArtifactRegistry,
+    pickArtifactExportPath: async (sender, input) => {
+      /** 默认文件名只使用受管元数据或固定类别名，不接收 Renderer 路径。 */
+      const defaultPath = 'assetId' in input
+        ? designStore.requireStableAuthoritativeDocument(input.projectId).assets
+          .find((asset) => asset.id === input.assetId)?.filename ?? `${input.assetId}.png`
+        : input.kind === 'document'
+          ? `${input.contentId}.md`
+          : `${input.contentId}.html`
+      const owner = BrowserWindow.fromWebContents(sender)
+      const options: SaveDialogOptions = {
+        title: '导出画布产物',
+        defaultPath,
+        filters: input.kind === 'document'
+          ? [{ name: 'Markdown', extensions: ['md'] }]
+          : input.kind === 'webview'
+            ? [{ name: 'HTML', extensions: ['html'] }]
+            : [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
+      }
+      const result = owner
+        ? await dialog.showSaveDialog(owner, options)
+        : await dialog.showSaveDialog(options)
+      return result.canceled ? null : result.filePath ?? null
+    },
     operationSerializer: canvasOperationSerializer,
     creation: canvasAgentNodeCreation,
     contentLifecycle: canvasContentNodeLifecycle,
+    webviews: {
+      load: async (target) => {
+        const committed = await readCommittedCanvasContent(
+          target,
+          target.prototypeId,
+          'index.html',
+          target,
+        )
+        return { target, html: committed.content }
+      },
+      preview: async (target) => {
+        const committed = await readCommittedCanvasContent(
+          target,
+          target.prototypeId,
+          'index.html',
+          target,
+        )
+        return canvasWebviewPreviewService.load(target, committed.content)
+      },
+    },
     imageModules: canvasImageModuleStore,
     imageJobs: designJobManager,
     imageJobTarget: canvasImageJobTarget,
+    imageCandidateBatches: canvasImageCandidateBatchService,
     imageAssets: {
       list: (projectId) => designStore.requireStableAuthoritativeDocument(projectId).assets,
       createMediaAccess: (projectId) => designAssetService.createMediaAccess(projectId),
@@ -4608,7 +4815,9 @@ export function registerIpcHandlers(): void {
     async (event, response: PermissionResponse): Promise<void> => {
       const { requestId, behavior, alwaysAllow } = response
       const ownerSessionId = permissionService.getPendingRequestOwner(requestId)
-      requireVisibleSession(ownerSessionId ?? '')
+      /** 请求可能已随超时或运行中止被清理；重复响应按幂等成功处理，让 Renderer 移除旧卡片。 */
+      if (!ownerSessionId) return
+      requireVisibleSession(ownerSessionId)
       const sessionId = permissionService.respondToPermission(requestId, behavior, alwaysAllow)
 
       // 发送 permission_resolved 事件给渲染进程
@@ -4819,7 +5028,9 @@ export function registerIpcHandlers(): void {
     async (event, response: AskUserResponse): Promise<void> => {
       const { requestId, answers } = response
       const ownerSessionId = askUserService.getPendingRequestOwner(requestId)
-      requireVisibleSession(ownerSessionId ?? '')
+      /** 已结束的问答不再有可消费对象，重复响应只需让 Renderer 收敛本地状态。 */
+      if (!ownerSessionId) return
+      requireVisibleSession(ownerSessionId)
       const sessionId = askUserService.respondToAskUser(requestId, answers)
 
       if (sessionId) {
@@ -4838,7 +5049,9 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.EXIT_PLAN_MODE_RESPOND,
     async (event, response: ExitPlanModeResponse): Promise<void> => {
       const ownerSessionId = exitPlanService.getPendingRequestOwner(response.requestId)
-      requireVisibleSession(ownerSessionId ?? '')
+      /** 计划审批已失效时保持幂等，不把空 owner 当成非法会话重新抛给 Renderer。 */
+      if (!ownerSessionId) return
+      requireVisibleSession(ownerSessionId)
       const result = exitPlanService.respondToExitPlanMode(response)
 
       if (result) {

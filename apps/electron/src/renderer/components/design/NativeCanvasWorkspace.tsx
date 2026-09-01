@@ -6,12 +6,16 @@ import type {
   CanvasChangeEvent,
   CanvasDocument,
   CanvasImageModuleConfig,
+  CanvasImageCandidateBatchSummary,
   CanvasNodeLifecycleResult,
   CanvasMutation,
   CanvasNode,
+  CanvasNodeActivityState,
   CanvasNodeKind,
   CanvasNodeReference,
   CanvasTarget,
+  CanvasTextArtifactMutationResult,
+  CanvasWebviewDevicePreset,
   CanvasWorkspaceSnapshot,
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
@@ -44,6 +48,7 @@ import {
   agentCanvasViewStatesAtom,
   createAgentCanvasViewKey,
   createAgentCanvasWorkbenchChangeUpdate,
+  createAgentCanvasWorkbenchGeometryUpdate,
   createClosedAgentCanvasWorkbenchUpdate,
   createConvergedAgentCanvasViewUpdate,
   createInitialAgentCanvasViewState,
@@ -80,7 +85,17 @@ import { copyTextToClipboard } from '@/lib/clipboard'
 import { addCanvasNodeReferences } from '@/lib/agent-message-queue'
 import { CanvasAgentRecoveryPanel } from './CanvasAgentRecoveryPanel'
 import { CanvasNodeWorkbenchOverlay } from './CanvasNodeWorkbenchOverlay'
+import type { CanvasWorkbenchSize } from './CanvasNodeWorkbenchOverlay'
+import {
+  CanvasDocumentWorkbench,
+  type CanvasDocumentWorkbenchAdapter,
+} from './CanvasDocumentWorkbench'
 import { CanvasImageWorkbench } from './CanvasImageWorkbench'
+import type { CanvasImageCandidateBatchWorkbenchProps } from './CanvasImageWorkbench'
+import {
+  CanvasWebviewWorkbench,
+  type CanvasWebviewWorkbenchAdapter,
+} from './CanvasWebviewWorkbench'
 import { NativeCanvasGraph } from './NativeCanvasGraph'
 import type { NativeCanvasFlowRenderer } from './NativeCanvasGraph'
 import { NativeCanvasDeleteDialog, isNativeCanvasDeleteShortcut } from './NativeCanvasDeleteDialog'
@@ -98,19 +113,23 @@ import {
 import {
   canReplayNativeCanvasPositionMutations,
   coalesceNativeCanvasMutationsForSave,
+  createArrangeCanvasNodesMutation,
   findAvailableNativeCanvasChildPosition,
-  findNativeCanvasGlobalAppendPosition,
+  findAvailableNativeCanvasNodePosition,
   isNativeCanvasPositionMutation,
-  NATIVE_CANVAS_NODE_GAP,
-  NATIVE_CANVAS_NODE_HEIGHT,
-  NATIVE_CANVAS_NODE_WIDTH,
-  overlapsNativeCanvasNodes,
   replayNativeCanvasPositionMutations,
+  resolveNativeCanvasNodeSize,
 } from './native-canvas-model'
 import {
   useCanvasImageModule,
   type CanvasImageModuleAdapter,
 } from './use-canvas-image-module'
+import {
+  findCanvasImageCandidateBatchSummary,
+  getCanvasImageCandidateNodeState,
+  useCanvasImageCandidateBatch,
+} from './use-canvas-image-candidate-batches'
+import type { CanvasImageCandidateBatchAdapter } from './use-canvas-image-candidate-batches'
 import {
   useDesignImageModelSelection,
   type DesignImageModelSelectionAdapter,
@@ -203,8 +222,17 @@ export interface NativeCanvasAdapter {
   cancelCanvasImageJob?: DesignAdapter['cancelCanvasImageJob']
   retryCanvasImageJob?: DesignAdapter['retryCanvasImageJob']
   adoptCanvasImageAsset?: DesignAdapter['adoptCanvasImageAsset']
+  /** 图片候选详情与验收命令只在存在活跃摘要时按需调用。 */
+  getCanvasImageCandidateBatch?: DesignAdapter['getCanvasImageCandidateBatch']
+  continueCanvasImageCandidateBatch?: DesignAdapter['continueCanvasImageCandidateBatch']
+  adoptCanvasImageCandidateBatch?: DesignAdapter['adoptCanvasImageCandidateBatch']
+  abandonCanvasImageCandidateBatch?: DesignAdapter['abandonCanvasImageCandidateBatch']
   releaseCanvasImageMedia?: DesignAdapter['releaseCanvasImageMedia']
   onCanvasImageModuleChanged?: DesignAdapter['onCanvasImageModuleChanged']
+  /** WebView 原型只在展开节点时按需读取。 */
+  loadCanvasWebview?: DesignAdapter['loadCanvasWebview']
+  /** WebView 折叠卡片只读取主进程生成的静态预览。 */
+  loadCanvasWebviewPreview?: DesignAdapter['loadCanvasWebviewPreview']
   getTaskDetails?: DesignAdapter['getTaskDetails']
   getTaskTrace?: DesignAdapter['getTaskTrace']
   /** Canvas 工作台复用项目模型目录，但模型选择仍写入图片模块草稿。 */
@@ -212,6 +240,12 @@ export interface NativeCanvasAdapter {
   setImageModelSelection?: DesignAdapter['setImageModelSelection']
   onImageModelProfilesChanged?: DesignAdapter['onImageModelProfilesChanged']
   onImageModelSelectionChanged?: DesignAdapter['onImageModelSelectionChanged']
+  /** 文档工作台五类文本产物能力必须同时存在。 */
+  loadCanvasTextArtifact?: DesignAdapter['loadCanvasTextArtifact']
+  updateCanvasTextArtifact?: DesignAdapter['updateCanvasTextArtifact']
+  listCanvasArtifactRevisions?: DesignAdapter['listCanvasArtifactRevisions']
+  adoptCanvasArtifactRevision?: DesignAdapter['adoptCanvasArtifactRevision']
+  exportCanvasArtifact?: DesignAdapter['exportCanvasArtifact']
 }
 
 /** 添加 Agent 按钮的局部异步状态。 */
@@ -251,7 +285,7 @@ export interface CanvasNodeCreateCommandDependencies {
   createContentNode: (input: CreateCanvasContentNodeInput) => Promise<CanvasNodeLifecycleResult>
   createId: () => string
   getDocument: () => CanvasDocument
-  getPosition: (sourceNodeId?: string) => DesignPoint
+  getPosition: (sourceNodeId?: string, kind?: CanvasNodeKind) => DesignPoint
   onStateChange: (state: CanvasAgentNodeCommandState) => void
   onSuccess: (success: CanvasNodeCreateCommandSuccess) => void
   /** 请求开始前原子取得共享 graph 结构 token。 */
@@ -271,7 +305,7 @@ export interface CanvasAgentNodeCommandDependencies {
   target: CanvasTarget
   createAgentNode: (input: CreateCanvasAgentNodeInput) => Promise<CanvasAgentNodeCreationResult>
   createId: () => string
-  getPosition: (sourceNodeId?: string) => DesignPoint
+  getPosition: (sourceNodeId?: string, kind?: CanvasNodeKind) => DesignPoint
   onStateChange: (state: CanvasAgentNodeCommandState) => void
   onSuccess: (nodeId: string, result: CanvasAgentNodeCreationResult) => void
   beginOperation?: (operationId: string) => boolean
@@ -449,69 +483,71 @@ export const nativeCanvasSessionViewCleanupCoordinator = createNativeCanvasWorkb
 export function findNativeCanvasAgentNodeCreationPosition(
   document: CanvasDocument,
   surfaceBounds: NativeCanvasSurfaceBounds,
+  candidate: Pick<CanvasNode, 'kind'> & { devicePreset?: CanvasWebviewDevicePreset } = { kind: 'agent' },
 ): DesignPoint {
-  /** 只有空图才把真实 surface 中心换算为世界坐标。 */
-  const emptyCanvasCenter = {
+  /** 当前真实 surface 中心始终作为手工新增的可信世界坐标锚点。 */
+  const visibleCenter = {
     x: (surfaceBounds.width / 2 - document.viewport.x) / document.viewport.zoom,
     y: (surfaceBounds.height / 2 - document.viewport.y) / document.viewport.zoom,
   }
-  /** 空图仍以画布中心创建，避免初始节点贴近边缘。 */
-  if (document.nodes.length === 0) {
-    return findNativeCanvasGlobalAppendPosition(emptyCanvasCenter, document.nodes)
-  }
-  /** 优先保留既有全局横向追加语义。 */
-  const globalAppendPosition = findNativeCanvasGlobalAppendPosition(emptyCanvasCenter, document.nodes)
-  /** 当前可视世界坐标保留一格边距，避免新节点贴住画布边缘。 */
-  const visibleBounds = {
-    left: (NATIVE_CANVAS_NODE_GAP - document.viewport.x) / document.viewport.zoom,
-    top: (NATIVE_CANVAS_NODE_GAP - document.viewport.y) / document.viewport.zoom,
-    right: (surfaceBounds.width - NATIVE_CANVAS_NODE_GAP - document.viewport.x) / document.viewport.zoom,
-    bottom: (surfaceBounds.height - NATIVE_CANVAS_NODE_GAP - document.viewport.y) / document.viewport.zoom,
-  }
-  /** 全局追加点完整可见时不改变原有排列。 */
-  const globalAppendVisible = globalAppendPosition.x >= visibleBounds.left
-    && globalAppendPosition.y >= visibleBounds.top
-    && globalAppendPosition.x + NATIVE_CANVAS_NODE_WIDTH <= visibleBounds.right
-    && globalAppendPosition.y + NATIVE_CANVAS_NODE_HEIGHT <= visibleBounds.bottom
-  if (globalAppendVisible) return globalAppendPosition
+  return findAvailableNativeCanvasNodePosition(visibleCenter, document.nodes, candidate)
+}
 
-  /** 只用当前可视节点确定网格起点，用户平移到空白区域时从视口左上开始。 */
-  const visibleNodes = document.nodes.filter((node) => (
-    node.position.x + NATIVE_CANVAS_NODE_WIDTH >= visibleBounds.left
-    && node.position.x <= visibleBounds.right
-    && node.position.y + NATIVE_CANVAS_NODE_HEIGHT >= visibleBounds.top
-    && node.position.y <= visibleBounds.bottom
-  ))
-  /** 横向起点沿用可视节点最左列，保持已有卡片对齐。 */
-  const anchorX = visibleNodes.length > 0
-    ? Math.max(visibleBounds.left, Math.min(...visibleNodes.map((node) => node.position.x)))
-    : visibleBounds.left
-  /** 纵向起点沿用可视节点首行，新增节点自然换到下一行。 */
-  const anchorY = visibleNodes.length > 0
-    ? Math.max(visibleBounds.top, Math.min(...visibleNodes.map((node) => node.position.y)))
-    : visibleBounds.top
-  /** 可视区最多容纳的固定宽度列数。 */
-  const columnCount = Math.max(0, Math.floor(
-    (visibleBounds.right - anchorX + NATIVE_CANVAS_NODE_GAP)
-    / (NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP),
-  ))
-  /** 可视区最多容纳的固定高度行数。 */
-  const rowCount = Math.max(0, Math.floor(
-    (visibleBounds.bottom - anchorY + NATIVE_CANVAS_NODE_GAP)
-    / (NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP),
-  ))
-  for (let row = 0; row < rowCount; row += 1) {
-    for (let column = 0; column < columnCount; column += 1) {
-      /** 候选按从左到右、从上到下排列，已有节点位置始终不变。 */
-      const candidate = {
-        x: anchorX + column * (NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP),
-        y: anchorY + row * (NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP),
-      }
-      if (!overlapsNativeCanvasNodes(candidate, document.nodes)) return candidate
-    }
+/**
+ * 根据当前视口和真实卡片尺寸返回可见节点 ID。
+ * @param document 带当前会话 viewport 的 Canvas 文档。
+ * @param surfaceBounds Canvas surface 的屏幕像素尺寸。
+ * @returns 按文档顺序排列的可见节点 ID。
+ */
+export function listVisibleNativeCanvasNodeIds(
+  document: CanvasDocument,
+  surfaceBounds: NativeCanvasSurfaceBounds,
+): string[] {
+  const { viewport } = document
+  if (!Number.isFinite(surfaceBounds.width) || !Number.isFinite(surfaceBounds.height)
+    || surfaceBounds.width <= 0 || surfaceBounds.height <= 0
+    || !Number.isFinite(viewport.zoom) || viewport.zoom <= 0) return []
+  /** 屏幕边界反算为世界坐标，节点只需与可见矩形相交。 */
+  const bounds = {
+    left: -viewport.x / viewport.zoom,
+    top: -viewport.y / viewport.zoom,
+    right: (surfaceBounds.width - viewport.x) / viewport.zoom,
+    bottom: (surfaceBounds.height - viewport.y) / viewport.zoom,
   }
-  /** 可视区确实无空位时退回确定性的全局追加，避免创建被阻断。 */
-  return globalAppendPosition
+  return document.nodes.filter((node) => {
+    const size = resolveNativeCanvasNodeSize(node)
+    return node.position.x + size.width >= bounds.left
+      && node.position.x <= bounds.right
+      && node.position.y + size.height >= bounds.top
+      && node.position.y <= bounds.bottom
+  }).map((node) => node.id)
+}
+
+/** 原子整理提交只在保存成功后向 Renderer 交付新文档。 */
+export interface CommitNativeCanvasArrangeMutationDependencies {
+  target: CanvasTarget
+  document: CanvasDocument
+  mutation: Extract<CanvasMutation, { type: 'move-nodes' }>
+  saveCanvas: NativeCanvasAdapter['saveCanvas']
+  onSuccess: (document: CanvasDocument) => void
+}
+
+/**
+ * 原子保存单次整理 mutation；失败时不调用成功回调，因此旧位置保持不变。
+ * @param dependencies 当前权威文档、整理 mutation 与保存入口。
+ * @returns 无位置变化时返回 null，否则返回主进程已提交文档。
+ */
+export async function commitNativeCanvasArrangeMutation(
+  dependencies: CommitNativeCanvasArrangeMutationDependencies,
+): Promise<CanvasDocument | null> {
+  if (dependencies.mutation.positions.length === 0) return null
+  const saved = await dependencies.saveCanvas({
+    ...dependencies.target,
+    expectedRevision: dependencies.document.revision,
+    mutations: [dependencies.mutation],
+  })
+  dependencies.onSuccess(saved)
+  return saved
 }
 
 /**
@@ -943,11 +979,11 @@ export function createCanvasNodeCommandController(
       if (!operation || !isSameCanvasNodeCreateRequest(operationRequest, request)) {
         const operationId = dependencies.createId()
         const nodeId = dependencies.createId()
-        const position = dependencies.getPosition(request.sourceNodeId)
+        const position = dependencies.getPosition(request.sourceNodeId, request.kind)
         operationRequest = { ...request }
         if (request.kind === 'agent') {
           const relationship = request.sourceNodeId
-            ? { sourceNodeId: request.sourceNodeId, edgeId: dependencies.createId() }
+            ? { sourceNodeId: request.sourceNodeId, edgeId: dependencies.createId(), relation: 'derives' as const }
             : undefined
           operation = {
               ...dependencies.target,
@@ -961,7 +997,7 @@ export function createCanvasNodeCommandController(
           /** 内容身份先于可选边身份分配，完整请求在失败重试时保持不变。 */
           const contentId = dependencies.createId()
           const relationship = request.sourceNodeId
-            ? { sourceNodeId: request.sourceNodeId, edgeId: dependencies.createId() }
+            ? { sourceNodeId: request.sourceNodeId, edgeId: dependencies.createId(), relation: 'derives' as const }
             : undefined
           operation = {
               ...dependencies.target,
@@ -1727,7 +1763,9 @@ export function createNativeCanvasWorkbenchDraftCommitterKey(
 }
 
 /** 图片工作台同时需要模块命令和项目模型目录命令。 */
-type NativeCanvasImageWorkbenchAdapter = CanvasImageModuleAdapter & DesignImageModelSelectionAdapter
+type NativeCanvasImageWorkbenchAdapter = CanvasImageModuleAdapter
+  & DesignImageModelSelectionAdapter
+  & Pick<DesignAdapter, 'exportCanvasArtifact'>
 
 /** 图片工作台向当前 Workspace 动态登记草稿提交器。 */
 type RegisterNativeCanvasWorkbenchDraftCommitter = (
@@ -1754,6 +1792,39 @@ export async function commitCanvasImageDraftAndCreateJob(
   return dependencies.createJob()
 }
 
+/** 图片工作台单次导出的纯命令依赖。 */
+export interface ExportCanvasImageArtifactDependencies {
+  target: CanvasTarget & { nodeId: string; imageModuleId: string }
+  adoptedAssetId: string | null
+  assetIds: readonly string[]
+  requestedAssetId: string
+  exportArtifact: NonNullable<DesignAdapter['exportCanvasArtifact']>
+}
+
+/**
+ * 导出当前 adopted 图片，不修改配置、任务或 Canvas 选区。
+ * @param dependencies 当前图片身份、素材存在性和统一导出命令。
+ * @returns null 表示成功，否则返回仅属于导出操作的用户错误。
+ */
+export async function exportCanvasImageArtifact(
+  dependencies: ExportCanvasImageArtifactDependencies,
+): Promise<string | null> {
+  if (dependencies.adoptedAssetId !== dependencies.requestedAssetId
+    || !dependencies.assetIds.includes(dependencies.requestedAssetId)) {
+    return '当前图片不可导出，请重新加载。'
+  }
+  try {
+    await dependencies.exportArtifact({
+      ...dependencies.target,
+      kind: 'image',
+      assetId: dependencies.requestedAssetId,
+    })
+    return null
+  } catch {
+    return '图片导出失败，请重试。'
+  }
+}
+
 /** 从 Workspace 可选 Adapter 中提取图片工作台需要的完整窄合同。 */
 function createNativeCanvasImageWorkbenchAdapter(
   adapter: NativeCanvasAdapter,
@@ -1771,7 +1842,8 @@ function createNativeCanvasImageWorkbenchAdapter(
     || !adapter.getImageModelSelection
     || !adapter.setImageModelSelection
     || !adapter.onImageModelProfilesChanged
-    || !adapter.onImageModelSelectionChanged) return null
+    || !adapter.onImageModelSelectionChanged
+    || !adapter.exportCanvasArtifact) return null
   return {
     loadCanvasImageModule: adapter.loadCanvasImageModule,
     saveCanvasImageModule: adapter.saveCanvasImageModule,
@@ -1787,6 +1859,61 @@ function createNativeCanvasImageWorkbenchAdapter(
     setImageModelSelection: adapter.setImageModelSelection,
     onImageModelProfilesChanged: adapter.onImageModelProfilesChanged,
     onImageModelSelectionChanged: adapter.onImageModelSelectionChanged,
+    exportCanvasArtifact: adapter.exportCanvasArtifact,
+  }
+}
+
+/** 从 Workspace Adapter 提取图片候选批次的完整四命令合同。 */
+function createNativeCanvasImageCandidateBatchAdapter(
+  adapter: NativeCanvasAdapter,
+): CanvasImageCandidateBatchAdapter | null {
+  if (!adapter.getCanvasImageCandidateBatch
+    || !adapter.continueCanvasImageCandidateBatch
+    || !adapter.adoptCanvasImageCandidateBatch
+    || !adapter.abandonCanvasImageCandidateBatch) return null
+  return {
+    getCanvasImageCandidateBatch: adapter.getCanvasImageCandidateBatch,
+    continueCanvasImageCandidateBatch: adapter.continueCanvasImageCandidateBatch,
+    adoptCanvasImageCandidateBatch: adapter.adoptCanvasImageCandidateBatch,
+    abandonCanvasImageCandidateBatch: adapter.abandonCanvasImageCandidateBatch,
+  }
+}
+
+/** 从 Workspace Adapter 提取文档工作台需要的完整五类文本产物合同。 */
+function createNativeCanvasDocumentWorkbenchAdapter(
+  adapter: NativeCanvasAdapter,
+): CanvasDocumentWorkbenchAdapter | null {
+  if (!adapter.loadCanvasTextArtifact
+    || !adapter.updateCanvasTextArtifact
+    || !adapter.listCanvasArtifactRevisions
+    || !adapter.adoptCanvasArtifactRevision
+    || !adapter.exportCanvasArtifact) return null
+  return {
+    loadCanvasTextArtifact: adapter.loadCanvasTextArtifact,
+    updateCanvasTextArtifact: adapter.updateCanvasTextArtifact,
+    listCanvasArtifactRevisions: adapter.listCanvasArtifactRevisions,
+    adoptCanvasArtifactRevision: adapter.adoptCanvasArtifactRevision,
+    exportCanvasArtifact: adapter.exportCanvasArtifact,
+  }
+}
+
+/** 从 Workspace Adapter 提取 WebView 编辑与版本生命周期的完整能力。 */
+export function createNativeCanvasWebviewWorkbenchAdapter(
+  adapter: NativeCanvasAdapter,
+): CanvasWebviewWorkbenchAdapter | null {
+  if (!adapter.loadCanvasWebview
+    || !adapter.loadCanvasTextArtifact
+    || !adapter.updateCanvasTextArtifact
+    || !adapter.listCanvasArtifactRevisions
+    || !adapter.adoptCanvasArtifactRevision
+    || !adapter.exportCanvasArtifact) return null
+  return {
+    loadCanvasWebview: adapter.loadCanvasWebview,
+    loadCanvasTextArtifact: adapter.loadCanvasTextArtifact,
+    updateCanvasTextArtifact: adapter.updateCanvasTextArtifact,
+    listCanvasArtifactRevisions: adapter.listCanvasArtifactRevisions,
+    adoptCanvasArtifactRevision: adapter.adoptCanvasArtifactRevision,
+    exportCanvasArtifact: adapter.exportCanvasArtifact,
   }
 }
 
@@ -1799,6 +1926,7 @@ interface CanvasImageNodeWorkbenchProps {
   autoSaveEnabled: boolean
   onDirtyChange: (nodeId: string, dirty: boolean) => void
   onRegisterDraftCommitter: RegisterNativeCanvasWorkbenchDraftCommitter
+  candidateBatch?: CanvasImageCandidateBatchWorkbenchProps
 }
 
 /** 只在图片节点展开时挂载模块状态、模型目录和媒体授权。 */
@@ -1810,6 +1938,7 @@ function CanvasImageNodeWorkbench({
   autoSaveEnabled,
   onDirtyChange,
   onRegisterDraftCommitter,
+  candidateBatch,
 }: CanvasImageNodeWorkbenchProps): React.ReactElement {
   /** 图片节点的四元业务身份。 */
   const imageTarget = React.useMemo(() => ({
@@ -1819,6 +1948,11 @@ function CanvasImageNodeWorkbench({
   }), [node.id, node.imageModuleId, target.canvasId, target.projectId])
   /** 当前图片模块独立的状态和命令。 */
   const imageModule = useCanvasImageModule(imageTarget, adapter)
+  /** 导出反馈与配置保存、任务执行状态完全隔离。 */
+  const [exportState, setExportState] = React.useState<'idle' | 'exporting'>('idle')
+  const [exportError, setExportError] = React.useState<string | null>(null)
+  /** 节点切换或卸载后使迟到导出结果失效。 */
+  const exportGenerationRef = React.useRef(0)
   /** 模型目录复用项目级清洗选项，不改变图片模块自己的选择。 */
   const projectModelStates = useAtomValue(designProjectStatesAtom)
   /** 还未加载模型目录时使用不共享集合的项目初始状态。 */
@@ -1869,6 +2003,10 @@ function CanvasImageNodeWorkbench({
 
   React.useEffect(() => () => autoSaveController.dispose(), [autoSaveController])
 
+  React.useEffect(() => () => {
+    exportGenerationRef.current += 1
+  }, [])
+
   /** 打开渠道设置并聚焦生图模型区。 */
   const configureModels = React.useCallback((): void => {
     setSettingsTab('channels')
@@ -1893,6 +2031,27 @@ function CanvasImageNodeWorkbench({
     void imageModule.adoptAsset(sourceJob.id, assetId).catch(() => undefined)
   }, [imageModule])
 
+  /** 点击导出只读取当前 adopted 素材快照并调用统一主进程选择器。 */
+  const exportAsset = React.useCallback((assetId: string): void => {
+    const snapshot = imageModule.state.snapshot
+    if (!snapshot || exportState === 'exporting') return
+    const generation = exportGenerationRef.current + 1
+    exportGenerationRef.current = generation
+    setExportState('exporting')
+    setExportError(null)
+    void exportCanvasImageArtifact({
+      target: imageTarget,
+      adoptedAssetId: snapshot.config.adoptedAssetId,
+      assetIds: snapshot.assets.map((asset) => asset.id),
+      requestedAssetId: assetId,
+      exportArtifact: adapter.exportCanvasArtifact,
+    }).then((error) => {
+      if (exportGenerationRef.current !== generation) return
+      setExportState('idle')
+      setExportError(error)
+    })
+  }, [adapter.exportCanvasArtifact, exportState, imageModule.state.snapshot, imageTarget])
+
   return (
     <CanvasImageWorkbench
       state={imageModule.state}
@@ -1906,6 +2065,9 @@ function CanvasImageNodeWorkbench({
       onRetry={(jobId) => { void imageModule.retryJob(jobId).catch(() => undefined) }}
       onPreviewAsset={(assetId) => imageModule.previewAsset(assetId)}
       onAdoptAsset={adoptAsset}
+      onExportAsset={exportAsset}
+      exportState={exportState}
+      exportError={exportError}
       onLoadTaskDetails={(jobId, includeTrace) => {
         void imageModule.loadTaskDetails(jobId, includeTrace).catch(() => undefined)
       }}
@@ -1915,8 +2077,35 @@ function CanvasImageNodeWorkbench({
         if (modelState.imageModelLoadState === 'failed') modelSelection.retryLoad()
       }}
       onCopyPrompt={(prompt) => { void copyTextToClipboard(prompt).catch(() => undefined) }}
+      candidateBatch={candidateBatch}
     />
   )
+}
+
+/** 活跃摘要存在时才挂载候选详情 controller，保持普通图片工作台零额外读取。 */
+function CanvasImageCandidateBatchWorkbench({
+  summary,
+  adapter,
+  nodeTitles,
+  onBatchChanged,
+  children,
+}: {
+  summary: CanvasImageCandidateBatchSummary
+  adapter: CanvasImageCandidateBatchAdapter
+  nodeTitles: ReadonlyMap<string, string>
+  onBatchChanged: () => void
+  children: (candidateBatch: CanvasImageCandidateBatchWorkbenchProps) => React.ReactElement
+}): React.ReactElement {
+  const candidateBatch = useCanvasImageCandidateBatch(summary, adapter, onBatchChanged)
+  return children({
+    summary,
+    state: candidateBatch.state,
+    nodeTitles,
+    onLoad: () => { void candidateBatch.load() },
+    onContinue: () => { void candidateBatch.continueBatch() },
+    onAdopt: (mode) => { void candidateBatch.adopt(mode) },
+    onAbandon: () => { void candidateBatch.abandon() },
+  })
 }
 
 /** dirty 工作台保存按钮的稳定可用性结果。 */
@@ -2029,10 +2218,58 @@ export function routeNativeCanvasWorkspaceMutation(
   enqueueGraphMutation(mutation)
 }
 
+/** 节点活动态的优先级，真实运行必须覆盖排队，空闲不写入 Map。 */
+const NATIVE_CANVAS_ACTIVITY_PRIORITY: Readonly<Record<CanvasNodeActivityState, number>> = {
+  idle: 0,
+  queued: 1,
+  'waiting-approval': 2,
+  running: 3,
+}
+
+/**
+ * 从 Agent 运行集合与结构化图片任务建立按节点 ID 的瞬时活动映射。
+ * @param document 当前权威 Canvas 文档，用于限制节点归属。
+ * @param runningSessionIds 当前真实或乐观运行中的 Agent 会话。
+ * @param jobs 项目级图片任务快照；仅消费明确的 canvas-image 目标。
+ * @returns 只包含非 idle 节点的活动 Map。
+ */
+export function createNativeCanvasNodeActivityStates(
+  document: CanvasDocument,
+  runningSessionIds: ReadonlySet<string>,
+  jobs: readonly DesignJobRecord[],
+): ReadonlyMap<string, CanvasNodeActivityState> {
+  /** 权威节点索引同时阻止其他 Canvas 的 Job 污染当前画布。 */
+  const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
+  /** 活动态只在 Renderer 内存聚合，不写入共享 Canvas 文档。 */
+  const states = new Map<string, CanvasNodeActivityState>()
+  /** 按优先级合并多个运行事实，避免 queued 覆盖 running。 */
+  const assign = (nodeId: string, state: CanvasNodeActivityState): void => {
+    const current = states.get(nodeId) ?? 'idle'
+    if (NATIVE_CANVAS_ACTIVITY_PRIORITY[state] > NATIVE_CANVAS_ACTIVITY_PRIORITY[current]) {
+      states.set(nodeId, state)
+    }
+  }
+  for (const node of document.nodes) {
+    if (node.kind === 'agent' && runningSessionIds.has(node.agentSessionId)) {
+      assign(node.id, 'running')
+    }
+  }
+  for (const job of jobs) {
+    if (job.target?.kind !== 'canvas-image'
+      || job.target.canvasId !== document.canvasId
+      || nodesById.get(job.target.nodeId)?.kind !== 'image') continue
+    if (job.status === 'running') assign(job.target.nodeId, 'running')
+    else if (job.status === 'queued') assign(job.target.nodeId, 'queued')
+  }
+  return states
+}
+
 /** HMR 与旧测试夹具可能仍携带迁移前视图字段，只在 view atom 首次缺失时读取一次。 */
 interface LegacyNativeCanvasViewFields extends Partial<AgentCanvasViewState> {
   /** 旧字段已无可见用途，仅用于识别迁移前对象。 */
   conversationNodeId?: string | null
+  /** 旧版仅保存当前工作台单一尺寸。 */
+  workbenchSize?: CanvasWorkbenchSize | null
 }
 
 /**
@@ -2051,7 +2288,9 @@ function createAgentCanvasViewFallback(graphState: NativeCanvasState): AgentCanv
     ...(legacy.selectedNodeId !== undefined ? { selectedNodeId: legacy.selectedNodeId } : {}),
     ...(legacy.selectedNodeIds ? { selectedNodeIds: legacy.selectedNodeIds } : {}),
     ...(legacy.expandedNodeId !== undefined ? { expandedNodeId: legacy.expandedNodeId } : {}),
-    ...(legacy.workbenchSize !== undefined ? { workbenchSize: legacy.workbenchSize } : {}),
+    ...(legacy.workbenchSize && legacy.expandedNodeId
+      ? { workbenchSizesByNodeId: { [legacy.expandedNodeId]: legacy.workbenchSize } }
+      : {}),
     ...(legacy.isExpanded !== undefined ? { isExpanded: legacy.isExpanded } : {}),
     ...(legacy.activityRevision !== undefined ? { activityRevision: legacy.activityRevision } : {}),
     ...(legacy.activeTool ? { activeTool: legacy.activeTool } : {}),
@@ -2098,6 +2337,8 @@ export function NativeCanvasWorkspace({
   const setComposerCanvasReferences = useSetAtom(agentCanvasNodeReferencesAtomFamily(sessionId))
   const store = useStore()
   const runningSessionIds = useAtomValue(canvasAgentRunningSessionIdsAtom)
+  /** 项目级 Job 只提供轻量任务事实，不读取图片正文或历史详情。 */
+  const designProjectStates = useAtomValue(designProjectStatesAtom)
   const runGenerations = useAtomValue(canvasAgentRunGenerationsAtom)
   const optimisticRunGenerations = useAtomValue(canvasAgentOptimisticRunGenerationsAtom)
   const controllerRef = React.useRef<NativeCanvasWorkspaceController | null>(null)
@@ -2114,11 +2355,21 @@ export function NativeCanvasWorkspace({
   const batchDeleteOperationRef = React.useRef(new Map<string, DeleteCanvasNodeInput>())
   /** 空图新增落点必须使用真实画布表面，不读取侧栏或窗口全宽。 */
   const canvasSurfaceRef = React.useRef<HTMLDivElement | null>(null)
+  /** SSR 与首次测量使用稳定桌面边界，真实 surface 挂载后立即接管。 */
+  const [canvasSurfaceSize, setCanvasSurfaceSize] = React.useState<CanvasWorkbenchSize>({
+    width: 1_200,
+    height: 800,
+  })
   const [createState, setCreateState] = React.useState<CanvasAgentNodeCommandState>({
     loading: false,
     error: null,
   })
   const [rebuildState, setRebuildState] = React.useState<CanvasAgentNodeCommandState>({
+    loading: false,
+    error: null,
+  })
+  /** 整理布局使用独立原子提交状态，失败时不污染普通拖动保存队列。 */
+  const [arrangeState, setArrangeState] = React.useState<CanvasAgentNodeCommandState>({
     loading: false,
     error: null,
   })
@@ -2139,6 +2390,21 @@ export function NativeCanvasWorkspace({
   /** 图片工作台只有在 Adapter 四组合同齐全时才接通。 */
   const imageWorkbenchAdapter = React.useMemo(
     () => createNativeCanvasImageWorkbenchAdapter(adapter),
+    [adapter],
+  )
+  /** 候选批次能力不影响普通生图工作台可用性。 */
+  const imageCandidateBatchAdapter = React.useMemo(
+    () => createNativeCanvasImageCandidateBatchAdapter(adapter),
+    [adapter],
+  )
+  /** 文档工作台只有在五类文本产物能力齐全时才替换占位内容。 */
+  const documentWorkbenchAdapter = React.useMemo(
+    () => createNativeCanvasDocumentWorkbenchAdapter(adapter),
+    [adapter],
+  )
+  /** WebView 工作台只在预览与五类文本产物能力齐全时启用。 */
+  const webviewWorkbenchAdapter = React.useMemo(
+    () => createNativeCanvasWebviewWorkbenchAdapter(adapter),
     [adapter],
   )
   /** 当前渲染的 Workspace key，供迟到草稿保存结果复核组件身份。 */
@@ -2184,6 +2450,10 @@ export function NativeCanvasWorkspace({
     [state, viewStateKey],
   )
   const viewState = viewStates.get(viewStateKey) ?? fallbackViewState
+  /** 当前唯一展开节点始终从权威图解析，删除后不会留下悬空浮窗。 */
+  const expandedWorkbenchNode = state.snapshot?.document.nodes.find(
+    (node) => node.id === viewState.expandedNodeId,
+  ) ?? null
   /** 原子取得共享 graph 结构操作身份，跨 session view 串行化生命周期请求。 */
   const beginStructuralOperation = React.useCallback((
     operationId: string,
@@ -2205,6 +2475,42 @@ export function NativeCanvasWorkspace({
   const imagePreviews = React.useMemo(() => new Map(
     (state.snapshot?.imagePreviews ?? []).map((preview) => [preview.assetId, preview]),
   ), [state.snapshot?.imagePreviews])
+  /** 四类卡片统一消费按 nodeId 聚合的结构化活动态。 */
+  const nodeActivityStates = React.useMemo(() => state.snapshot
+    ? createNativeCanvasNodeActivityStates(
+        state.snapshot.document,
+        runningSessionIds,
+        designProjectStates.get(target.projectId)?.jobs ?? [],
+      )
+    : new Map<string, CanvasNodeActivityState>(), [
+      designProjectStates,
+      runningSessionIds,
+      state.snapshot,
+      target.projectId,
+    ])
+  /** 折叠卡片仅从初始 LOAD 的轻量摘要映射候选标记。 */
+  const imageCandidateStates = React.useMemo(() => {
+    const summaries = state.snapshot?.activeImageCandidateBatches ?? []
+    return new Map(state.snapshot?.document.nodes.flatMap((node) => {
+      if (node.kind !== 'image') return []
+      const candidateState = getCanvasImageCandidateNodeState(summaries, node.id)
+      return candidateState ? [[node.id, candidateState] as const] : []
+    }) ?? [])
+  }, [state.snapshot])
+  /** 批次条目复用轻量节点标题索引，不读取正文。 */
+  const canvasNodeTitles = React.useMemo(() => new Map(
+    state.snapshot?.document.nodes.map((node) => [node.id, node.title]) ?? [],
+  ), [state.snapshot?.document.nodes])
+  /** 当前可见范围只依赖轻量节点几何，不读取工作台正文。 */
+  const visibleNodeIds = React.useMemo(() => viewDocument
+    ? listVisibleNativeCanvasNodeIds(viewDocument, canvasSurfaceSize)
+    : [], [canvasSurfaceSize, viewDocument])
+  /** 只收集设备预设保存中的 WebView 节点，普通移动与其它节点保存不阻断静态预览。 */
+  const pendingWebviewDeviceNodeIds = React.useMemo(() => new Set(
+    [...state.inFlightMutations, ...state.pendingMutations]
+      .filter((mutation) => mutation.type === 'set-webview-device-preset')
+      .map((mutation) => mutation.nodeId),
+  ), [state.inFlightMutations, state.pendingMutations])
   /** 权威文档过滤已删除节点，防止迟到选区引用不存在的节点。 */
   const validSelectedNodeIds = React.useMemo(() => {
     if (!state.snapshot) return []
@@ -2314,6 +2620,29 @@ export function NativeCanvasWorkspace({
   }, [removeAgentCanvasViewState, viewStateKey])
 
   React.useEffect(() => {
+    const surface = canvasSurfaceRef.current
+    if (!surface) return
+    /** surface 测量只更新会话浮窗边界，不读取节点正文或写 Canvas 文档。 */
+    const measure = (): void => {
+      const rect = surface.getBoundingClientRect()
+      if (rect.width <= 0 || rect.height <= 0) return
+      setCanvasSurfaceSize((current) => (
+        current.width === rect.width && current.height === rect.height
+          ? current
+          : { width: rect.width, height: rect.height }
+      ))
+    }
+    measure()
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    observer?.observe(surface)
+    window.addEventListener('resize', measure)
+    return () => {
+      observer?.disconnect()
+      window.removeEventListener('resize', measure)
+    }
+  }, [state.snapshot])
+
+  React.useEffect(() => {
     if (!adapter.createCanvasAgentNode || !adapter.createCanvasContentNode) {
       commandRef.current = null
       return
@@ -2330,7 +2659,7 @@ export function NativeCanvasWorkspace({
         if (!document) throw new Error('Canvas 尚未加载完成')
         return document
       },
-      getPosition: (sourceNodeId) => {
+      getPosition: (sourceNodeId, kind = 'agent') => {
         /** 点击时读取最新权威文档，避免迟到视图闭包决定创建位置。 */
         const latest = store.get(nativeCanvasStatesAtom).get(stateKey)
         const sharedDocument = latest?.snapshot?.document
@@ -2338,13 +2667,14 @@ export function NativeCanvasWorkspace({
         const document = sharedDocument && viewport ? { ...sharedDocument, viewport } : sharedDocument
         if (!document) throw new Error('Canvas 尚未加载完成')
         if (sourceNodeId) {
-          return findAvailableNativeCanvasChildPosition(sourceNodeId, document.nodes)
+          return findAvailableNativeCanvasChildPosition(sourceNodeId, document.nodes, { kind })
         }
         const bounds = canvasSurfaceRef.current?.getBoundingClientRect()
-        return findNativeCanvasAgentNodeCreationPosition(document, {
-          width: bounds?.width ?? 0,
-          height: bounds?.height ?? 0,
-        })
+        return findNativeCanvasAgentNodeCreationPosition(
+          document,
+          { width: bounds?.width ?? 0, height: bounds?.height ?? 0 },
+          { kind },
+        )
       },
       onStateChange: setCreateState,
       beginOperation: (operationId) => beginStructuralOperation(operationId, 'create'),
@@ -2587,6 +2917,29 @@ export function NativeCanvasWorkspace({
       },
     })
   }, [updateAgentCanvasViewState, viewStateKey])
+
+  /** 文档保存或采用成功后接管返回快照，并在其上重放本地位置 mutation。 */
+  const acceptTextArtifactMutation = React.useCallback((result: CanvasTextArtifactMutationResult): void => {
+    updateNativeCanvasState({
+      key: stateKey,
+      update: (current) => {
+        /** 迟到文本事务不得让已接管更高 revision 的共享图回退。 */
+        if (current.snapshot
+          && result.snapshot.document.revision < current.snapshot.document.revision) return {}
+        /** 本地未完成图修改继续保留，由现有 SAVE scheduler 基于新 revision 提交。 */
+        const localMutations = [...current.inFlightMutations, ...current.pendingMutations]
+        return {
+          phase: 'ready',
+          snapshot: {
+            ...result.snapshot,
+            document: applyCanvasMutations(result.snapshot.document, localMutations),
+          },
+          saveState: localMutations.length > 0 ? current.saveState : 'saved',
+          error: null,
+        }
+      },
+    })
+  }, [stateKey, updateNativeCanvasState])
 
   /** 保存成功或明确放弃后完成唯一工作台切换。 */
   const resolveWorkbenchSwitch = React.useCallback((): void => {
@@ -2966,6 +3319,81 @@ export function NativeCanvasWorkspace({
     void rebuildCommandRef.current.execute().catch(() => undefined)
   }, [])
 
+  /** WebView 设备切换只进入现有图保存队列，不创建 Agent 对话或内容副本。 */
+  const changeWebviewDevicePreset = React.useCallback((
+    nodeId: string,
+    devicePreset: CanvasWebviewDevicePreset,
+  ): void => {
+    if (!workspaceWritable) return
+    controllerRef.current?.enqueueMutation({
+      type: 'set-webview-device-preset',
+      nodeId,
+      devicePreset,
+    })
+  }, [workspaceWritable])
+
+  /** 按明确范围原子整理节点，运行和等待审批节点始终保持原位。 */
+  const arrangeCanvasNodes = React.useCallback((scopeNodeIds: readonly string[]): void => {
+    if (!workspaceWritable || arrangeState.loading) return
+    const current = store.get(nativeCanvasStatesAtom).get(stateKey)
+    const document = current?.snapshot?.document
+    if (!document) return
+    const blockedNodeIds = new Set([...nodeActivityStates]
+      .filter(([, activity]) => activity === 'running' || activity === 'waiting-approval')
+      .map(([nodeId]) => nodeId))
+    const mutation = createArrangeCanvasNodesMutation(document, scopeNodeIds, blockedNodeIds)
+    if (mutation.positions.length === 0) return
+    const operationId = window.crypto.randomUUID()
+    if (!beginStructuralOperation(operationId, 'arrange')) {
+      setArrangeState({ loading: false, error: '画布有未完成操作，稍后再整理。' })
+      return
+    }
+    const operationViewStateKey = viewStateKey
+    setArrangeState({ loading: true, error: null })
+    void commitNativeCanvasArrangeMutation({
+      target,
+      document,
+      mutation,
+      saveCanvas: adapter.saveCanvas,
+      onSuccess: (savedDocument) => {
+        if (currentWorkspaceKeyRef.current !== operationViewStateKey) return
+        updateNativeCanvasState({
+          key: stateKey,
+          update: (latest) => {
+            if (!latest.snapshot || latest.snapshot.document.revision > savedDocument.revision) return {}
+            return {
+              snapshot: { ...latest.snapshot, document: savedDocument },
+              pendingMutations: [],
+              inFlightMutations: [],
+              saveState: 'saved',
+              error: null,
+            }
+          },
+        })
+      },
+    }).then(() => {
+      if (currentWorkspaceKeyRef.current === operationViewStateKey) {
+        setArrangeState({ loading: false, error: null })
+      }
+    }).catch(() => {
+      if (currentWorkspaceKeyRef.current === operationViewStateKey) {
+        setArrangeState({ loading: false, error: '整理布局失败，原位置已保留。' })
+      }
+    }).finally(() => endStructuralOperation(operationId))
+  }, [
+    adapter.saveCanvas,
+    arrangeState.loading,
+    beginStructuralOperation,
+    endStructuralOperation,
+    nodeActivityStates,
+    stateKey,
+    store,
+    target,
+    updateNativeCanvasState,
+    viewStateKey,
+    workspaceWritable,
+  ])
+
   /** 为唯一展开节点构造轻量工作台；Agent 对话仅在这里按需挂载。 */
   const renderNodeWorkbench = React.useCallback((node: CanvasNode): React.ReactNode => {
     /** dirty 只属于当前节点，不随工作台切换复制。 */
@@ -2998,7 +3426,12 @@ export function NativeCanvasWorkspace({
         )
       }
     } else if (node.kind === 'image' && imageWorkbenchAdapter) {
-      content = (
+      /** 只为当前图片节点定位最近一个活跃批次，不预取详情。 */
+      const candidateSummary = findCanvasImageCandidateBatchSummary(
+        state.snapshot?.activeImageCandidateBatches ?? [],
+        node.id,
+      )
+      const imageWorkbench = (candidateBatch?: CanvasImageCandidateBatchWorkbenchProps): React.ReactElement => (
         <CanvasImageNodeWorkbench
           key={`${target.projectId}:${target.canvasId}:${node.id}:image`}
           node={node}
@@ -3008,6 +3441,48 @@ export function NativeCanvasWorkspace({
           autoSaveEnabled={viewState.pendingWorkbenchSwitchNodeId === null}
           onDirtyChange={updateWorkbenchDirty}
           onRegisterDraftCommitter={registerWorkbenchDraftCommitter}
+          candidateBatch={candidateBatch}
+        />
+      )
+      content = candidateSummary && imageCandidateBatchAdapter
+        ? (
+            <CanvasImageCandidateBatchWorkbench
+              summary={candidateSummary}
+              adapter={imageCandidateBatchAdapter}
+              nodeTitles={canvasNodeTitles}
+              onBatchChanged={() => controllerRef.current?.retryLoad()}
+            >
+              {imageWorkbench}
+            </CanvasImageCandidateBatchWorkbench>
+          )
+        : imageWorkbench()
+    } else if (node.kind === 'document' && documentWorkbenchAdapter && state.snapshot) {
+      content = (
+        <CanvasDocumentWorkbench
+          key={`${target.projectId}:${target.canvasId}:${node.id}:${node.documentId}:document`}
+          node={node}
+          target={target}
+          canvasRevision={state.snapshot.document.revision}
+          adapter={documentWorkbenchAdapter}
+          writable={workspaceWritable}
+          onDirtyChange={(nextDirty) => updateWorkbenchDirty(node.id, nextDirty)}
+          onSnapshotChange={acceptTextArtifactMutation}
+          onRegisterDraftCommitter={registerWorkbenchDraftCommitter}
+        />
+      )
+    } else if (node.kind === 'webview' && webviewWorkbenchAdapter && state.snapshot) {
+      content = (
+        <CanvasWebviewWorkbench
+          key={`${target.projectId}:${target.canvasId}:${node.id}:${node.prototypeId}:webview`}
+          node={node}
+          target={target}
+          canvasRevision={state.snapshot.document.revision}
+          adapter={webviewWorkbenchAdapter}
+          writable={workspaceWritable}
+          onDirtyChange={(nextDirty) => updateWorkbenchDirty(node.id, nextDirty)}
+          onSnapshotChange={acceptTextArtifactMutation}
+          onRegisterDraftCommitter={registerWorkbenchDraftCommitter}
+          onDevicePresetChange={changeWebviewDevicePreset}
         />
       )
     }
@@ -3015,10 +3490,22 @@ export function NativeCanvasWorkspace({
       <CanvasNodeWorkbenchOverlay
         node={node}
         dirty={dirty}
-        workbenchSize={viewState.workbenchSize}
-        onWorkbenchSizeChange={(workbenchSize) => updateAgentCanvasViewState({
+        surfaceSize={canvasSurfaceSize}
+        nodeScreenRect={{
+          left: viewState.viewport.x + node.position.x * viewState.viewport.zoom,
+          right: viewState.viewport.x
+            + (node.position.x + resolveNativeCanvasNodeSize(node).width) * viewState.viewport.zoom,
+          top: viewState.viewport.y + node.position.y * viewState.viewport.zoom,
+        }}
+        position={viewState.workbenchPosition}
+        size={viewState.workbenchSizesByNodeId[node.id] ?? null}
+        onPositionChange={(position) => updateAgentCanvasViewState({
           key: viewStateKey,
-          update: { workbenchSize },
+          update: (current) => createAgentCanvasWorkbenchGeometryUpdate(current, node.id, { position }),
+        })}
+        onSizeChange={(size) => updateAgentCanvasViewState({
+          key: viewStateKey,
+          update: (current) => createAgentCanvasWorkbenchGeometryUpdate(current, node.id, { size }),
         })}
         onDirtyChange={(nextDirty) => updateWorkbenchDirty(node.id, nextDirty)}
         onClose={closeWorkbench}
@@ -3028,9 +3515,16 @@ export function NativeCanvasWorkspace({
     )
   }, [
     ConversationRenderer,
+    acceptTextArtifactMutation,
+    canvasSurfaceSize,
+    changeWebviewDevicePreset,
     closeWorkbench,
     conversationAdapter,
     imageWorkbenchAdapter,
+    imageCandidateBatchAdapter,
+    canvasNodeTitles,
+    documentWorkbenchAdapter,
+    webviewWorkbenchAdapter,
     registerWorkbenchDraftCommitter,
     rebuildConversationNode,
     rebuildState.error,
@@ -3042,7 +3536,9 @@ export function NativeCanvasWorkspace({
     updateWorkbenchDirty,
     viewState.pendingWorkbenchSwitchNodeId,
     viewState.workbenchDraft,
-    viewState.workbenchSize,
+    viewState.viewport,
+    viewState.workbenchPosition,
+    viewState.workbenchSizesByNodeId,
     viewStateKey,
     workspaceWritable,
   ])
@@ -3099,6 +3595,12 @@ export function NativeCanvasWorkspace({
                 canDelete={canDeleteNode}
                 canReferenceSelection={validSelectedNodeIds.length > 1}
                 issueCount={state.snapshot.nodeIssues.length}
+                arrangeSelectionCount={validSelectedNodeIds.length}
+                arrangeVisibleCount={visibleNodeIds.length}
+                arrangeAllCount={state.snapshot.document.nodes.length}
+                onArrangeSelection={() => arrangeCanvasNodes(validSelectedNodeIds)}
+                onArrangeVisible={() => arrangeCanvasNodes(visibleNodeIds)}
+                onArrangeAll={() => arrangeCanvasNodes(state.snapshot!.document.nodes.map((node) => node.id))}
                 onToolChange={(activeTool) => updateAgentCanvasViewState({
                   key: viewStateKey,
                   update: { activeTool },
@@ -3116,7 +3618,12 @@ export function NativeCanvasWorkspace({
                 activeTool={viewState.activeTool}
                 nodeIssues={state.snapshot.nodeIssues}
                 runningSessionIds={runningSessionIds}
+                nodeActivityStates={nodeActivityStates}
+                imageCandidateStates={imageCandidateStates}
                 imagePreviews={imagePreviews}
+                loadCanvasWebviewPreview={adapter.loadCanvasWebviewPreview}
+                pendingWebviewDeviceNodeIds={pendingWebviewDeviceNodeIds}
+                onWebviewDevicePresetChange={workspaceWritable ? changeWebviewDevicePreset : undefined}
                 canCreateChild={canCreateNode}
                 onCreateChild={(sourceNodeId, kind) => {
                   void commandRef.current?.execute({ kind, sourceNodeId }).catch(() => undefined)
@@ -3145,14 +3652,14 @@ export function NativeCanvasWorkspace({
                 }}
                 onConversationNodeChange={() => undefined}
                 onWorkbenchNodeChange={requestWorkbenchNodeChange}
-                expandedNodeId={viewState.expandedNodeId}
-                renderWorkbench={renderNodeWorkbench}
+                createEdgeId={() => window.crypto.randomUUID()}
                 flowRenderer={flowRenderer}
               />
+              {expandedWorkbenchNode ? renderNodeWorkbench(expandedWorkbenchNode) : null}
             </div>
-            {createState.error ? (
+            {createState.error || arrangeState.error ? (
               <div className="absolute left-1/2 top-14 z-10 max-w-[calc(100%-1.5rem)] -translate-x-1/2 rounded-[6px] border border-destructive/30 bg-background/95 px-3 py-2 text-xs text-destructive shadow-sm" role="status">
-                {createState.error}
+                {createState.error ?? arrangeState.error}
               </div>
             ) : null}
             {state.saveState === 'conflict' ? (

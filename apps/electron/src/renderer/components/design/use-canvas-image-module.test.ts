@@ -64,7 +64,8 @@ function snapshot(moduleTarget: CanvasImageTarget, revision: number, prompt?: st
   return {
     target: structuredClone(moduleTarget), mediaLeaseId: `lease-${moduleTarget.imageModuleId}-${revision}`,
     config: config(moduleTarget, revision, prompt),
-    jobs: [], assets: [], assetBaseUrl: 'proma://asset', thumbnailBaseUrl: 'proma://thumbnail',
+    jobs: [], assets: [], imageVersions: [],
+    assetBaseUrl: 'proma://asset', thumbnailBaseUrl: 'proma://thumbnail',
   }
 }
 

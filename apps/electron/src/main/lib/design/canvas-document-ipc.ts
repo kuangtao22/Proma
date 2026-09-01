@@ -1,8 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto'
 import {
   CANVAS_IPC_CHANNELS,
+  parseAdoptCanvasTextArtifactRevisionInput,
+  parseCanvasTextArtifactIdentity,
+  parseCanvasTextArtifactTarget,
+  parseExportCanvasArtifactInput,
+  parseUpdateCanvasTextArtifactInput,
   parseCanvasImageJobControlInput,
+  parseCanvasImageCandidateBatch,
+  parseGetCanvasImageCandidateBatchInput,
+  parseAdoptCanvasImageCandidateBatchInput,
   parseCanvasImageTarget,
+  parseCanvasWebviewTarget,
+  parseCanvasWebviewPreviewTarget,
   parseReleaseCanvasImageMediaInput,
   parseSaveCanvasImageModuleInput,
   parseCanvasTrashEntry,
@@ -11,6 +21,8 @@ import {
   parseRestoreCanvasNodeInput,
 } from '@proma/shared'
 import type {
+  AdoptCanvasTextArtifactRevisionInput,
+  CanvasArtifactRevisionSummary,
   CanvasAgentNode,
   CanvasDocument,
   CanvasAgentNodeCreationResult,
@@ -20,6 +32,7 @@ import type {
   CanvasChangeSource,
   CanvasInvokeResult,
   CanvasImageModuleConfig,
+  CanvasImageCandidateBatch,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
   CanvasMutation,
@@ -28,7 +41,17 @@ import type {
   CanvasNodeIssue,
   CanvasPublicError,
   CanvasPublicErrorCode,
+  CanvasRunNodesResult,
+  CanvasToolNodeRunResult,
   CanvasWorkspaceSnapshot,
+  CanvasTextArtifactIdentity,
+  CanvasTextArtifactMutationResult,
+  CanvasTextArtifactSnapshot,
+  CanvasTextArtifactTarget,
+  CanvasWebviewSnapshot,
+  CanvasWebviewTarget,
+  CanvasWebviewPreviewSnapshot,
+  CanvasWebviewPreviewTarget,
   CanvasNodeLifecycleResult,
   CanvasTrashEntry,
   CanvasTarget,
@@ -46,6 +69,7 @@ import type {
   SaveCanvasImageModuleInput,
   DesignAsset,
   DesignJobRecord,
+  ExportCanvasArtifactInput,
   StopCanvasAgentInput,
   AgentSendInput,
   AgentSessionMeta,
@@ -57,10 +81,21 @@ import { runStableDirectoryNative } from '../stable-directory-native-host'
 import type { CanvasImageModuleStore } from './canvas-image-module-store'
 import type { CanvasImageJobTargetAdapter } from './canvas-image-job-target'
 import type { DesignJobManager } from './design-job-manager'
+import type { CanvasImageCandidateBatchService } from './canvas-image-candidate-batch-service'
 import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
 import type { CanvasArtifactCreationService } from './canvas-artifact-creation'
+import type {
+  CanvasArtifactAdapter,
+  CanvasArtifactCapability,
+  CanvasArtifactRegistry,
+} from './canvas-artifact-registry'
+import {
+  createCanvasImageArtifactAdapter,
+  replaceCanvasArtifactAdapter,
+} from './canvas-artifact-registry'
+import type { CanvasTextArtifactAdapter, CanvasTextArtifactService } from './canvas-text-artifact-service'
 import type { CanvasBatchOperationResult, CanvasBatchReconciliationResult } from './canvas-agent-batch-operation'
 import type {
   CanvasContentNodeLifecycle,
@@ -69,7 +104,6 @@ import type {
 } from './canvas-content-node-lifecycle'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import type {
-  CanvasToolNodeRunResult,
   CanvasToolRunContext,
   CanvasToolRun,
 } from './canvas-tool-provider'
@@ -132,21 +166,38 @@ export interface CanvasDocumentIpcOptions {
   }
   /** 普通 Agent 创建 WebView 或图片节点时复用的原子产物服务。 */
   artifacts: Pick<CanvasArtifactCreationService, 'create'>
+  /** 普通 Agent 文档与 WebView 读写复用生产唯一文本事务服务。 */
+  textArtifacts: Pick<CanvasTextArtifactService, 'read' | 'listVersions' | 'update' | 'adopt' | 'export'>
+  /** 三类产物能力与真实适配器的唯一进程内路由表。 */
+  artifactRegistry: CanvasArtifactRegistry
+  /** 导出路径只在主进程文件选择器内部产生，Renderer 永不接触。 */
+  pickArtifactExportPath: (sender: WebContents, input: ExportCanvasArtifactInput) => Promise<string | null>
   /** 生产注入进程级唯一实例，测试未注入时由注册器本地创建。 */
   operationSerializer?: CanvasOperationSerializer
   /** 已持有 lease 时执行目标 Canvas 对账或联合创建事务。 */
   creation: Pick<CanvasAgentNodeCreationService, 'reconcile' | 'createReconciled' | 'rebuildReconciled'>
   /** 非 Agent 内容节点的可恢复生命周期，只开放 IPC 所需窄接口。 */
   contentLifecycle: Pick<CanvasContentNodeLifecycle, 'load' | 'createReconciled' | 'deleteReconciled' | 'listTrashReconciled' | 'restoreReconciled'>
+  /** WebView 预览只开放经受管目录复核后的 HTML 读取。 */
+  webviews: {
+    load: (target: CanvasWebviewTarget) => Promise<CanvasWebviewSnapshot>
+    preview: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
+  }
   /** 图片模块配置复用唯一受管内容 Store。 */
-  imageModules: Pick<CanvasImageModuleStore, 'load' | 'save'>
+  imageModules: Pick<CanvasImageModuleStore, 'load' | 'save' | 'adoptAsset'>
   /** Canvas 图片任务复用唯一 Design Job Manager。 */
   imageJobs: Pick<DesignJobManager, 'createCanvasImage' | 'createCanvasImageOnce' | 'rollbackCanvasImageOnce' | 'run' | 'cancel' | 'retry' | 'getProjectJob' | 'listCanvasImageJobs' | 'onChanged'>
   /** 图片采用复用 Job Manager 已注入的同一目标适配器。 */
   imageJobTarget: Pick<CanvasImageJobTargetAdapter, 'assertTarget' | 'adoptOutput'>
+  /** 图片 Job、IPC 与恢复共用的唯一候选批次服务。 */
+  imageCandidateBatches: Pick<
+    CanvasImageCandidateBatchService,
+    'createBatchLocked' | 'listActiveSummaries' | 'load' | 'continueBatch' | 'adopt' | 'abandon'
+  >
   /** 图片模块只读取 Design 素材公开元数据并创建目录媒体授权。 */
   imageAssets: {
     list: (projectId: string) => DesignAsset[]
+    exportAsset?: (projectId: string, assetId: string, targetPath: string) => Promise<void>
     createMediaAccess: (projectId: string) => {
       assetBaseUrl: string
       thumbnailBaseUrl: string
@@ -167,6 +218,41 @@ export interface CanvasDocumentIpcOptions {
   toolAccess?: CanvasToolAccessFacade
 }
 
+/** Registry 中可执行统一导出的内部适配器。 */
+interface CanvasArtifactExportAdapter extends CanvasArtifactAdapter {
+  export: (input: ExportCanvasArtifactInput & { targetPath: string }) => Promise<void>
+}
+
+/** 从 Registry 取得并验证文本产物真实适配器。 */
+function requireTextArtifactAdapter(
+  registry: CanvasArtifactRegistry,
+  kind: CanvasTextArtifactIdentity['kind'],
+  capability: CanvasArtifactCapability,
+): CanvasTextArtifactAdapter {
+  /** Registry 已校验固定能力矩阵，这里继续校验真实方法合同。 */
+  const adapter = registry.requireCapability(kind, capability)
+  const candidate = adapter as unknown as Record<string, unknown>
+  if (typeof candidate.read !== 'function'
+    || typeof candidate.update !== 'function'
+    || typeof candidate.listVersions !== 'function'
+    || typeof candidate.adopt !== 'function'
+    || typeof candidate.export !== 'function') {
+    throw new Error('CANVAS_ARTIFACT_ADAPTER_INVALID')
+  }
+  return adapter as CanvasTextArtifactAdapter
+}
+
+/** 从 Registry 取得并验证任意产物的内部导出能力。 */
+function requireArtifactExportAdapter(
+  registry: CanvasArtifactRegistry,
+  input: ExportCanvasArtifactInput,
+): CanvasArtifactExportAdapter {
+  const adapter = registry.requireCapability(input.kind, 'export')
+  const candidate = adapter as unknown as Record<string, unknown>
+  if (typeof candidate.export !== 'function') throw new Error('CANVAS_ARTIFACT_ADAPTER_INVALID')
+  return adapter as CanvasArtifactExportAdapter
+}
+
 /** 普通 Agent 工具复用 IPC 已注册的唯一文档与 Task8 batch 实例。 */
 export interface CanvasToolProviderRuntime {
   referenceResolver: CanvasNodeReferenceResolver
@@ -179,7 +265,7 @@ export interface CanvasToolProviderRuntime {
     target: CanvasTarget,
     nodes: CanvasNode[],
     toolCallId: string,
-  ) => Promise<CanvasToolNodeRunResult[]>
+  ) => Promise<CanvasRunNodesResult>
 }
 
 /** 当前注册代次拥有的进程内运行时，不经过 Renderer IPC。 */
@@ -257,7 +343,7 @@ function isAgentSessionBusyError(error: unknown): boolean {
 }
 
 /** 需要安全结果信封的 Canvas 操作类别。 */
-type CanvasInvokeOperation = 'load' | 'save' | 'create' | 'delete' | 'listTrash' | 'restore' | 'rebuild' | 'messages' | 'send' | 'stop' | 'imageLoad' | 'imageSave' | 'imageJob'
+type CanvasInvokeOperation = 'load' | 'webviewLoad' | 'webviewPreview' | 'save' | 'create' | 'delete' | 'listTrash' | 'restore' | 'rebuild' | 'messages' | 'send' | 'stop' | 'imageLoad' | 'imageSave' | 'imageJob' | 'imageBatch' | 'artifactLoad' | 'artifactSave' | 'artifactExport'
 
 /** 主进程内部携带公开错误码的可预期业务失败。 */
 class CanvasPublicFailure extends Error {
@@ -278,6 +364,8 @@ class CanvasPublicFailure extends Error {
 /** 各操作发生未知异常时使用的固定公开失败。 */
 const CANVAS_OPERATION_FALLBACKS: Record<CanvasInvokeOperation, CanvasPublicError> = {
   load: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+  webviewLoad: { code: 'CANVAS_WEBVIEW_LOAD_FAILED', message: '原型暂时无法加载。' },
+  webviewPreview: { code: 'CANVAS_WEBVIEW_PREVIEW_FAILED', message: '原型预览生成失败，请重试。' },
   save: { code: 'CANVAS_SAVE_FAILED', message: '画布暂时无法保存。' },
   create: { code: 'CANVAS_CREATE_FAILED', message: '节点创建失败，请重试。' },
   delete: { code: 'CANVAS_DELETE_FAILED', message: '节点删除失败，请重试。' },
@@ -290,6 +378,10 @@ const CANVAS_OPERATION_FALLBACKS: Record<CanvasInvokeOperation, CanvasPublicErro
   imageLoad: { code: 'CANVAS_IMAGE_LOAD_FAILED', message: '生图节点暂时无法加载。' },
   imageSave: { code: 'CANVAS_IMAGE_SAVE_FAILED', message: '生图配置保存失败，请重试。' },
   imageJob: { code: 'CANVAS_IMAGE_JOB_FAILED', message: '图片任务操作失败，请重试。' },
+  imageBatch: { code: 'CANVAS_IMAGE_BATCH_INVALID', message: '图片候选批次暂时无法处理。' },
+  artifactLoad: { code: 'CANVAS_ARTIFACT_LOAD_FAILED', message: '产物暂时无法加载。' },
+  artifactSave: { code: 'CANVAS_ARTIFACT_SAVE_FAILED', message: '产物保存失败，请重试。' },
+  artifactExport: { code: 'CANVAS_ARTIFACT_EXPORT_FAILED', message: '产物导出失败，请重试。' },
 }
 
 /**
@@ -325,6 +417,12 @@ function toCanvasPublicError(
     && error instanceof Error
     && error.message === 'CANVAS_IMAGE_REVISION_CONFLICT') {
     return { code: 'CANVAS_IMAGE_REVISION_CONFLICT', message: '配置已在其他窗口更新。' }
+  }
+  if (operation === 'artifactSave'
+    && error instanceof Error
+    && (error.message === 'CANVAS_ARTIFACT_REVISION_CONFLICT'
+      || error.message === 'CANVAS_TEXT_ARTIFACT_IDENTITY_CONFLICT')) {
+    return { code: 'CANVAS_ARTIFACT_REVISION_CONFLICT', message: '产物已更新，请重新加载后重试。' }
   }
   if (isAgentSessionBusyError(error)) {
     return { code: 'AGENT_SESSION_BUSY', message: '请先停止 Agent，再继续节点操作。' }
@@ -569,6 +667,22 @@ function createAgentCanvasImageJobId(
   return `agent-canvas-${digest}`
 }
 
+/** 从同一 Agent 工具调用身份派生可重放的候选批次 ID。 */
+function createAgentCanvasImageBatchId(
+  context: CanvasToolRunContext,
+  toolCallId: string,
+  canvasId: string,
+): string {
+  const digest = createHash('sha256').update(JSON.stringify([
+    context.sessionId,
+    context.runStartedAt,
+    toolCallId,
+    canvasId,
+    'candidate-batch',
+  ])).digest('hex')
+  return `agent-canvas-batch-${digest}`
+}
+
 /** 把未知异常压缩为批量工具可审计的稳定文本。 */
 function canvasNodeRunError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -731,7 +845,7 @@ function parseCreateContentNodeInput(value: unknown): CreateCanvasContentNodeInp
     throw new Error('Canvas 内容节点创建参数无效')
   }
   if (hasRelationship && (!isRecord(value.relationship)
-    || !hasExactDataKeys(value.relationship, ['sourceNodeId', 'edgeId']))) {
+    || !hasExactDataKeys(value.relationship, ['sourceNodeId', 'edgeId', 'relation']))) {
     throw new Error('Canvas 内容节点扩展关系参数无效')
   }
   return parseCreateCanvasContentNodeInput({
@@ -745,7 +859,13 @@ function parseCreateContentNodeInput(value: unknown): CreateCanvasContentNodeInp
     position: { x: value.position.x, y: value.position.y },
     expectedRevision: value.expectedRevision,
     ...(hasRelationship && isRecord(value.relationship)
-      ? { relationship: { sourceNodeId: value.relationship.sourceNodeId, edgeId: value.relationship.edgeId } }
+      ? {
+          relationship: {
+            sourceNodeId: value.relationship.sourceNodeId,
+            edgeId: value.relationship.edgeId,
+            relation: value.relationship.relation,
+          },
+        }
       : {}),
   })
 }
@@ -827,7 +947,7 @@ function parseCreateAgentNodeInput(value: unknown): CreateCanvasAgentNodeInput {
   }
   if (value.relationship !== undefined
     && (!isRecord(value.relationship)
-      || !hasExactDataKeys(value.relationship, ['sourceNodeId', 'edgeId']))) {
+      || !hasExactDataKeys(value.relationship, ['sourceNodeId', 'edgeId', 'relation']))) {
     throw new Error('Canvas Agent 扩展关系参数无效')
   }
   /** 重建对象后交给共享主进程 validator 进行 ID、长度和有限数值检查。 */
@@ -843,6 +963,7 @@ function parseCreateAgentNodeInput(value: unknown): CreateCanvasAgentNodeInput {
           relationship: {
             sourceNodeId: value.relationship.sourceNodeId,
             edgeId: value.relationship.edgeId,
+            relation: value.relationship.relation,
           },
         }
       : {}),
@@ -956,6 +1077,13 @@ export function registerCanvasDocumentIpcHandlers(
   /** CHANGED 仅用于 send，不注册 handler。 */
   const channels = [
     CANVAS_IPC_CHANNELS.LOAD,
+    CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,
+    CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT,
+    CANVAS_IPC_CHANNELS.LIST_ARTIFACT_REVISIONS,
+    CANVAS_IPC_CHANNELS.ADOPT_ARTIFACT_REVISION,
+    CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT,
+    CANVAS_IPC_CHANNELS.LOAD_WEBVIEW,
+    CANVAS_IPC_CHANNELS.LOAD_WEBVIEW_PREVIEW,
     CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
     CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
     CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB,
@@ -963,6 +1091,10 @@ export function registerCanvasDocumentIpcHandlers(
     CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB,
     CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET,
     CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
+    CANVAS_IPC_CHANNELS.GET_IMAGE_CANDIDATE_BATCH,
+    CANVAS_IPC_CHANNELS.CONTINUE_IMAGE_CANDIDATE_BATCH,
+    CANVAS_IPC_CHANNELS.ADOPT_IMAGE_CANDIDATE_BATCH,
+    CANVAS_IPC_CHANNELS.ABANDON_IMAGE_CANDIDATE_BATCH,
     CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
     CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
     CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
@@ -982,6 +1114,47 @@ export function registerCanvasDocumentIpcHandlers(
   currentRegistrationTokens.set(options.ipc, registrationToken)
   /** 批处理、LOAD、SAVE 与单节点操作必须共用同一键控串行器。 */
   const operationSerializer = options.operationSerializer ?? createCanvasOperationSerializer()
+  /** 图片 Registry 适配器在 IPC 边界复用现有 Store、Job 与素材服务。 */
+  const imageArtifactAdapter = createCanvasImageArtifactAdapter({
+    read: options.imageModules.load,
+    update: options.imageModules.save,
+    listJobs: options.imageJobs.listCanvasImageJobs,
+    listAssets: options.imageAssets.list,
+    run: async (target) => {
+      /** 统一 run 继续创建并启动现有 Design Job，不引入第二套执行器。 */
+      const config = await options.imageModules.load(target)
+      assertOwnedImageConfig(config, target)
+      if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
+      const job = await options.imageJobs.createCanvasImage({
+        projectId: target.projectId,
+        target: {
+          kind: 'canvas-image', canvasId: target.canvasId,
+          nodeId: target.nodeId, imageModuleId: target.imageModuleId,
+        },
+        action: config.adoptedAssetId ? 'edit' : 'generate',
+        prompt: config.prompt,
+        contextMode: config.contextMode,
+        imageModelProfileId: config.selectedModelProfileId,
+        generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
+        canvasImageConfigRevision: config.revision,
+        ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
+      })
+      if (!isOwnedImageJob(job, target)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
+      await options.imageJobs.run(job.id)
+    },
+    adopt: options.imageModules.adoptAsset,
+    export: async (input) => {
+      if (options.imageAssets.exportAsset) {
+        await options.imageAssets.exportAsset(input.projectId, input.assetId, input.targetPath)
+        return
+      }
+      /** 兼容既有主进程装配：旧图片适配器本身已复用唯一素材服务。 */
+      const existing = requireArtifactExportAdapter(options.artifactRegistry, input)
+      await existing.export(input)
+    },
+  })
+  /** 只替换图片真实适配器，文档与 WebView 保持生产 Registry 原实例。 */
+  const artifactRegistry = replaceCanvasArtifactAdapter(options.artifactRegistry, imageArtifactAdapter)
   /** 每个窗口当前持有的单图片模块媒体授权。 */
   const imageMediaBySender = new Map<number, {
     sender: WebContents
@@ -1227,6 +1400,28 @@ export function registerCanvasDocumentIpcHandlers(
     return operationSerializer.run({ projectId, canvasId }, effect)
   }
 
+  /** 五类产物操作共享的崩溃 intent 对账、串行和锁外发布边界。 */
+  const runArtifactReconciled = async <T>(
+    target: CanvasTarget,
+    effect: () => Promise<T>,
+  ): Promise<T> => {
+    const guarded = await runCanvasExclusive(target.projectId, target.canvasId, () => (
+      options.guard.runWorkspaceWrite(target.projectId, async () => {
+        const batch = await options.batch.reconcileLocked(target)
+        try {
+          return { batch, outcome: { ok: true as const, value: await effect() } }
+        } catch (error) {
+          /** 已恢复的历史 publication 不能被后续产物业务失败吞掉。 */
+          return { batch, outcome: { ok: false as const, error } }
+        }
+      })
+    ))
+    const published = new Set<string>()
+    publishBatchReconciliation(target, published, guarded.batch)
+    if (!guarded.outcome.ok) throw guarded.outcome.error
+    return guarded.outcome.value
+  }
+
   /** 图片模块操作按 Canvas 串行，并只在实际轮到执行时获取 workspace lease。 */
   const runImageCanvasExclusive = <T>(
     target: CanvasImageTarget,
@@ -1263,7 +1458,7 @@ export function registerCanvasDocumentIpcHandlers(
     target: CanvasTarget,
     nodes: CanvasNode[],
     toolCallId: string,
-  ): Promise<CanvasToolNodeRunResult[]> => {
+  ): Promise<CanvasRunNodesResult> => {
     /** 非图片类型在同一结果中返回稳定事实，不进入付费执行器。 */
     const taskByNodeId = new Map<string, CanvasToolNodeRunResult>()
     for (const node of nodes) {
@@ -1277,12 +1472,14 @@ export function registerCanvasDocumentIpcHandlers(
       }
     }
     const imageNodes = nodes.filter((node): node is Extract<CanvasNode, { kind: 'image' }> => node.kind === 'image')
-    if (imageNodes.length === 0) return nodes.map((node) => taskByNodeId.get(node.id)!)
+    if (imageNodes.length === 0) return { tasks: nodes.map((node) => taskByNodeId.get(node.id)!) }
     const firstImageTarget: CanvasImageTarget = {
       ...target,
       nodeId: imageNodes[0]!.id,
       imageModuleId: imageNodes[0]!.imageModuleId,
     }
+    /** 同一 Agent 工具调用下的图片任务共享稳定候选批次身份。 */
+    const candidateBatchId = createAgentCanvasImageBatchId(context, toolCallId, target.canvasId)
     const creationOutcome = await runImageCanvasExclusive(firstImageTarget, async () => {
       requireWritableProject(target.projectId, options)
       /** 第一阶段先证明全部目标、配置和模型有效，禁止边预检边创建 journal。 */
@@ -1335,6 +1532,7 @@ export function registerCanvasDocumentIpcHandlers(
             imageModelProfileId: item.config.selectedModelProfileId!,
             generationConstraints: { aspectRatio: item.config.aspectRatio, imageSize: item.config.imageSize },
             canvasImageConfigRevision: item.config.revision,
+            candidateBatchId,
             ...(item.config.adoptedAssetId ? { sourceAssetId: item.config.adoptedAssetId } : {}),
           }, item.jobId)
           if (!isOwnedImageJob(result.job, item.imageTarget)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
@@ -1374,9 +1572,41 @@ export function registerCanvasDocumentIpcHandlers(
           return { ready: false as const, jobs: [] }
         }
       }
+      /** 全部 journal 建立后先登记同一批候选，终态回调随后才能可靠定位。 */
+      try {
+        await options.imageCandidateBatches.createBatchLocked({
+          ...target,
+          batchId: candidateBatchId,
+          source: 'canvas-tool',
+          sourceSessionId: context.sessionId,
+          sourceToolCallId: toolCallId,
+          entries: prepared.map((item) => ({
+            nodeId: item.node.id,
+            imageModuleId: item.node.imageModuleId,
+            initialAdoptedAssetId: item.config.adoptedAssetId,
+            initialConfigRevision: item.config.revision,
+            jobId: item.jobId,
+          })),
+        })
+      } catch (error) {
+        const createdJobs = jobs.filter((entry) => entry.created)
+        await Promise.allSettled(createdJobs.map((entry) => options.imageJobs.rollbackCanvasImageOnce(
+          target.projectId,
+          entry.job.id,
+          entry.job.target as Extract<NonNullable<DesignJobRecord['target']>, { kind: 'canvas-image' }>,
+        )))
+        for (const item of prepared) {
+          taskByNodeId.set(item.node.id, {
+            nodeId: item.node.id,
+            status: 'failed',
+            error: canvasNodeRunError(error),
+          })
+        }
+        return { ready: false as const, jobs: [] }
+      }
       return { ready: true as const, jobs }
     })
-    if (!creationOutcome.ready) return nodes.map((node) => taskByNodeId.get(node.id)!)
+    if (!creationOutcome.ready) return { tasks: nodes.map((node) => taskByNodeId.get(node.id)!) }
 
     /** 锁外统一启动本批首次创建的任务；allSettled 保留每个节点的独立结果。 */
     const createdJobs = creationOutcome.jobs.filter((entry) => entry.created)
@@ -1393,7 +1623,20 @@ export function registerCanvasDocumentIpcHandlers(
         ? { nodeId: entry.node.id, status: 'failed', taskId: entry.job.id, error: entry.job.error ?? 'CANVAS_IMAGE_JOB_FAILED' }
         : { nodeId: entry.node.id, status: entry.job.status === 'queued' ? 'queued' : 'started', taskId: entry.job.id })
     }
-    return nodes.map((node) => taskByNodeId.get(node.id)!)
+    /** 任务启动后只读取同一批次 JSON，向 Agent 返回有限计数而不加载素材原图。 */
+    const candidateBatch = await options.imageCandidateBatches.load({ ...target, batchId: candidateBatchId })
+    return {
+      tasks: nodes.map((node) => taskByNodeId.get(node.id)!),
+      batch: {
+        batchId: candidateBatch.batchId,
+        status: candidateBatch.status,
+        totalCount: candidateBatch.entries.length,
+        candidateCount: candidateBatch.entries.filter((entry) => entry.status === 'candidate').length,
+        failedCount: candidateBatch.entries.filter((entry) => entry.status === 'failed' || entry.status === 'invalid').length,
+        runningCount: candidateBatch.entries.filter((entry) => entry.status === 'queued' || entry.status === 'running').length,
+        requiresCanvasReview: true,
+      },
+    }
   }
 
   if (options.batch.execute && options.toolAccess) {
@@ -1408,6 +1651,14 @@ export function registerCanvasDocumentIpcHandlers(
           access: toolAccess,
           documents: options.store,
           artifacts: options.artifacts,
+          textArtifacts: options.textArtifacts,
+          images: {
+            load: async (target) => ({
+              config: await options.imageModules.load(target),
+              jobs: options.imageJobs.listCanvasImageJobs(target),
+            }),
+            save: (input) => options.imageModules.save(input),
+          },
           batch,
           readNodeContent: readCanvasNodeContent,
           runNodes: runCanvasNodes,
@@ -1632,6 +1883,9 @@ export function registerCanvasDocumentIpcHandlers(
           if (!isActiveLoad()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
           const assets = resolveOwnedImageAssets(target, config, jobs, options.imageAssets.list(target.projectId))
           if (!isActiveLoad()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
+          /** 图片历史只由 Registry 使用本轮已验证任务与素材事实严格派生。 */
+          const imageVersions = await imageArtifactAdapter.listVersions(target, { jobs, assets })
+          if (!isActiveLoad()) throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
           /** 媒体 token 是候选；创建或提交失败均不得撤销旧授权。 */
           const access = options.imageAssets.createMediaAccess(target.projectId)
           if (!isActiveLoad()) {
@@ -1644,7 +1898,7 @@ export function registerCanvasDocumentIpcHandlers(
             throw new Error('CANVAS_IMAGE_SENDER_DESTROYED')
           }
           return {
-            target: { ...target }, mediaLeaseId, config, jobs, assets,
+            target: { ...target }, mediaLeaseId, config, jobs, assets, imageVersions,
             assetBaseUrl: access.assetBaseUrl,
             thumbnailBaseUrl: access.thumbnailBaseUrl,
           }
@@ -1679,7 +1933,10 @@ export function registerCanvasDocumentIpcHandlers(
         assertOwnedImageConfig(config, input)
         if (config.revision !== input.expectedConfigRevision) throw new Error('CANVAS_IMAGE_REVISION_CONFLICT')
         if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
-        return options.imageJobs.createCanvasImage({
+        /** Job 与候选批次都使用主进程生成的稳定身份，Renderer 不得指定。 */
+        const jobId = randomUUID()
+        const batchId = randomUUID()
+        const created = await options.imageJobs.createCanvasImageOnce({
           projectId: input.projectId,
           target: {
             kind: 'canvas-image', canvasId: input.canvasId,
@@ -1691,8 +1948,35 @@ export function registerCanvasDocumentIpcHandlers(
           imageModelProfileId: config.selectedModelProfileId,
           generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
           canvasImageConfigRevision: config.revision,
+          candidateBatchId: batchId,
           ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
-        })
+        }, jobId)
+        try {
+          await options.imageCandidateBatches.createBatchLocked({
+            projectId: input.projectId,
+            canvasId: input.canvasId,
+            batchId,
+            source: 'single',
+            sourceSessionId: null,
+            sourceToolCallId: null,
+            entries: [{
+              nodeId: input.nodeId,
+              imageModuleId: input.imageModuleId,
+              initialAdoptedAssetId: config.adoptedAssetId,
+              initialConfigRevision: config.revision,
+              jobId: created.job.id,
+            }],
+          })
+        } catch (error) {
+          if (created.created) {
+            await options.imageJobs.rollbackCanvasImageOnce(input.projectId, created.job.id, {
+              kind: 'canvas-image', canvasId: input.canvasId,
+              nodeId: input.nodeId, imageModuleId: input.imageModuleId,
+            })
+          }
+          throw error
+        }
+        return created.job
       })
       if (!isOwnedImageJob(job, input)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
       void options.imageJobs.run(job.id).catch((error) => {
@@ -1781,6 +2065,41 @@ export function registerCanvasDocumentIpcHandlers(
       if (current
         && current.mediaLeaseId === input.mediaLeaseId
         && isSameImageTarget(current.target, input)) releaseImageMedia(event.sender.id)
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.GET_IMAGE_CANDIDATE_BATCH, (event, value) => (
+    invokeCanvasOperation<CanvasImageCandidateBatch>('imageBatch', async () => {
+      assertAuthorizedSender(event, options)
+      const input = parseGetCanvasImageCandidateBatchInput(value)
+      return parseCanvasImageCandidateBatch(await options.imageCandidateBatches.load(input))
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.CONTINUE_IMAGE_CANDIDATE_BATCH, (event, value) => (
+    invokeCanvasOperation<CanvasImageCandidateBatch>('imageBatch', async () => {
+      assertAuthorizedSender(event, options)
+      const input = parseGetCanvasImageCandidateBatchInput(value)
+      requireWritableProject(input.projectId, options)
+      return parseCanvasImageCandidateBatch(await options.imageCandidateBatches.continueBatch(input))
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.ADOPT_IMAGE_CANDIDATE_BATCH, (event, value) => (
+    invokeCanvasOperation<CanvasImageCandidateBatch>('imageBatch', async () => {
+      assertAuthorizedSender(event, options)
+      const input = parseAdoptCanvasImageCandidateBatchInput(value)
+      requireWritableProject(input.projectId, options)
+      return parseCanvasImageCandidateBatch(await options.imageCandidateBatches.adopt(input))
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.ABANDON_IMAGE_CANDIDATE_BATCH, (event, value) => (
+    invokeCanvasOperation<CanvasImageCandidateBatch>('imageBatch', async () => {
+      assertAuthorizedSender(event, options)
+      const input = parseGetCanvasImageCandidateBatchInput(value)
+      requireWritableProject(input.projectId, options)
+      return parseCanvasImageCandidateBatch(await options.imageCandidateBatches.abandon(input))
     })
   ))
 
@@ -1921,14 +2240,125 @@ export function registerCanvasDocumentIpcHandlers(
         if (!outcome.agent) throw new Error('CANVAS_AGENT_RECONCILIATION_MISSING')
         publishUniqueReconciliation(input, published, outcome.agent)
         if (outcome.agent.error) throw outcome.agent.error
+        const activeImageCandidateBatches = await options.imageCandidateBatches.listActiveSummaries(input)
         try {
-          return attachCanvasImagePreviews(event.sender, input, outcome.agent.snapshot)
+          const snapshot = attachCanvasImagePreviews(event.sender, input, outcome.agent.snapshot)
+          return activeImageCandidateBatches.length > 0
+            ? { ...snapshot, activeImageCandidateBatches }
+            : snapshot
         } catch (error) {
           /** 缩略图是可降级展示能力，授权或素材索引失败不能阻断画布本体。 */
           console.error('[CanvasDocumentIPC] Canvas 缩略图加载失败:', error)
-          return { ...outcome.agent.snapshot, imagePreviews: [] }
+          return {
+            ...outcome.agent.snapshot,
+            imagePreviews: [],
+            ...(activeImageCandidateBatches.length > 0 ? { activeImageCandidateBatches } : {}),
+          }
         }
       })
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT, (event, value) => (
+    invokeCanvasOperation<CanvasTextArtifactSnapshot>('artifactLoad', async () => {
+      assertAuthorizedSender(event, options)
+      /** Shared exact-key parser 拒绝路径和额外内部字段。 */
+      const input = parseCanvasTextArtifactTarget(value)
+      requireWritableProject(input.projectId, options)
+      const adapter = requireTextArtifactAdapter(artifactRegistry, input.kind, 'read')
+      return runArtifactReconciled(input, () => adapter.read(input))
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.LIST_ARTIFACT_REVISIONS, (event, value) => (
+    invokeCanvasOperation<CanvasArtifactRevisionSummary[]>('artifactLoad', async () => {
+      assertAuthorizedSender(event, options)
+      /** 历史列表只接受稳定产物身份，不接受路径或目标 revision。 */
+      const input = parseCanvasTextArtifactIdentity(value)
+      requireWritableProject(input.projectId, options)
+      const adapter = requireTextArtifactAdapter(artifactRegistry, input.kind, 'version')
+      return runArtifactReconciled(input, () => adapter.listVersions(input))
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT, (event, value) => (
+    invokeCanvasOperation<CanvasTextArtifactMutationResult>('artifactSave', async () => {
+      assertAuthorizedSender(event, options)
+      /** 更新命令在进入串行器前绑定图、正文 revision 与幂等 operation。 */
+      const input = parseUpdateCanvasTextArtifactInput(value)
+      requireWritableProject(input.projectId, options)
+      const adapter = requireTextArtifactAdapter(artifactRegistry, input.kind, 'update')
+      const result = await runArtifactReconciled(input, () => adapter.update({
+          ...input,
+          source: { type: 'user' },
+        }))
+      /** 广播必须发生在 workspace lease 释放后。 */
+      broadcastChange(options, {
+        projectId: input.projectId,
+        canvasId: input.canvasId,
+        revision: result.snapshot.document.revision,
+        cause: 'graph',
+      })
+      return result
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.ADOPT_ARTIFACT_REVISION, (event, value) => (
+    invokeCanvasOperation<CanvasTextArtifactMutationResult>('artifactSave', async () => {
+      assertAuthorizedSender(event, options)
+      /** 历史采用同样绑定当前图与正文基线，避免覆盖并发修改。 */
+      const input = parseAdoptCanvasTextArtifactRevisionInput(value)
+      requireWritableProject(input.projectId, options)
+      const adapter = requireTextArtifactAdapter(artifactRegistry, input.kind, 'adopt')
+      const result = await runArtifactReconciled(input, () => adapter.adopt(input))
+      /** 广播必须发生在 workspace lease 释放后。 */
+      broadcastChange(options, {
+        projectId: input.projectId,
+        canvasId: input.canvasId,
+        revision: result.snapshot.document.revision,
+        cause: 'graph',
+      })
+      return result
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT, (event, value) => (
+    invokeCanvasOperation<void>('artifactExport', async () => {
+      assertAuthorizedSender(event, options)
+      /** Renderer 只能传产物身份，目标路径始终由主进程选择器产生。 */
+      const input = parseExportCanvasArtifactInput(value)
+      requireWritableProject(input.projectId, options)
+      const adapter = requireArtifactExportAdapter(artifactRegistry, input)
+      const targetPath = await options.pickArtifactExportPath(event.sender, input)
+      if (!targetPath) return
+      await runArtifactReconciled(input, () => adapter.export({ ...input, targetPath }))
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.LOAD_WEBVIEW, (event, value) => (
+    invokeCanvasOperation<CanvasWebviewSnapshot>('webviewLoad', async () => {
+      assertAuthorizedSender(event, options)
+      /** 共享解析器重建完整节点、内容目录与 revision 身份。 */
+      const input = parseCanvasWebviewTarget(value)
+      requireWritableProject(input.projectId, options)
+      /** 受管读取与可能发生的恢复提升共享 Canvas 串行权和 workspace lease。 */
+      return operationSerializer.run(input, () => options.guard.runWorkspaceWrite(
+        input.projectId,
+        () => options.webviews.load(input),
+      ))
+    })
+  ))
+
+  options.ipc.handle(CANVAS_IPC_CHANNELS.LOAD_WEBVIEW_PREVIEW, (event, value) => (
+    invokeCanvasOperation<CanvasWebviewPreviewSnapshot>('webviewPreview', async () => {
+      assertAuthorizedSender(event, options)
+      /** 预览目标必须同时绑定图节点、内容 revision 与当前设备预设。 */
+      const input = parseCanvasWebviewPreviewTarget(value)
+      requireWritableProject(input.projectId, options)
+      return operationSerializer.run(input, () => options.guard.runWorkspaceWrite(
+        input.projectId,
+        () => options.webviews.preview(input),
+      ))
     })
   ))
 

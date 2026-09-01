@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type {
@@ -19,6 +19,7 @@ import {
   createCanvasNodeContentStore,
   type CanvasNodeContentStoreDependencies,
 } from './canvas-node-content-store'
+import * as canvasNodeContentStoreModule from './canvas-node-content-store'
 
 /** 测试使用的固定 Canvas 目标。 */
 const target: CanvasTarget = { projectId: 'project-1', canvasId: 'canvas-1' }
@@ -42,16 +43,69 @@ beforeAll(() => {
 
 /** 测试使用的固定回收条目。 */
 const trashEntry: CanvasTrashEntry = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   trashId: 'trash-1',
   nodeId: 'node-1',
   kind: 'document',
   contentId: 'content-1',
+  contentRevision: 0,
   title: '首页说明',
   position: { x: 10, y: 20 },
   deletedRevision: 3,
   deletedAt: 200,
 }
+
+/** 返回测试数组中的必需条目，fixture 不完整时立即暴露明确错误。 */
+function requireEntry<T>(entries: readonly T[], index: number): T {
+  const entry = entries[index]
+  if (entry === undefined) throw new Error(`测试回收条目缺失: ${index}`)
+  return entry
+}
+
+describe('Canvas 内容元数据解析', () => {
+  test('Given WebView 元数据包含 legacySourceUrl When 解析 Then 保留严格身份并接受合法扩展字段', () => {
+    /** 待实现的统一元数据解析入口，先验证 API 存在以形成清晰红测。 */
+    const parseMeta = Reflect.get(canvasNodeContentStoreModule, 'parseCanvasNodeContentMetaContent')
+    expect(parseMeta).toBeFunction()
+    if (typeof parseMeta !== 'function') return
+    /** 真实 WebView 内容目录使用的完整元数据正文。 */
+    const content = JSON.stringify({
+      schemaVersion: 1,
+      kind: 'webview',
+      contentId: 'prototype-1',
+      revision: 0,
+      createdAt: 100,
+      updatedAt: 100,
+      legacySourceUrl: null,
+    })
+
+    expect(parseMeta(content)).toEqual({
+      schemaVersion: 1,
+      kind: 'webview',
+      contentId: 'prototype-1',
+      revision: 0,
+      createdAt: 100,
+      updatedAt: 100,
+      legacySourceUrl: null,
+    })
+  })
+
+  test('Given WebView 元数据缺少 legacySourceUrl When 解析 Then fail closed', () => {
+    /** 旧错误路径会把 WebView 的六字段基础元数据误判为合法。 */
+    const content = JSON.stringify({
+      schemaVersion: 1,
+      kind: 'webview',
+      contentId: 'prototype-1',
+      revision: 0,
+      createdAt: 100,
+      updatedAt: 100,
+    })
+
+    expect(() => canvasNodeContentStoreModule.parseCanvasNodeContentMetaContent(content)).toThrow(
+      'CANVAS_CONTENT_CORRUPT: webview meta.json',
+    )
+  })
+})
 
 /** 内存协议中的单个内容目录。 */
 interface FakeEntryFiles {
@@ -119,6 +173,20 @@ function createFixture(options: {
         if (request.fileName === options.revokeAfterWriteFileName) valid = false
       }
       return { roots: [], entries: [], writeOutcome: outcome }
+    }
+    if (request.mode === 'canvas-content-remove-marker') {
+      const files = scopes.trash.get(request.entryId!)
+      const removable = files !== undefined
+        && Object.keys(files).length === 1
+        && typeof files['entry.json'] === 'string'
+      const outcome = options.outcomeFor?.(request) ?? (removable || files === undefined
+        ? { commitVisible: true, durabilityUncertain: false }
+        : { commitVisible: false, durabilityUncertain: false, error: 'marker directory contains physical content' })
+      if (removable && outcome.commitVisible) scopes.trash.delete(request.entryId!)
+      return {
+        roots: [], entries: [],
+        writeOutcome: outcome,
+      }
     }
     if (request.mode === 'canvas-content-list') {
       if (scopes[childName].size > (request.maxEntries ?? 512)) {
@@ -253,6 +321,30 @@ describe('Canvas 节点内容 Store', () => {
     })).rejects.toThrow('CANVAS_CONTENT_IDENTITY_CONFLICT')
   })
 
+  test.each([
+    ['document', 'document-1', 'content.md', '# 初稿'],
+    ['webview', 'webview-1', 'index.html', '<!doctype html><h1>首页</h1>'],
+  ] as const)('Given 旧 %s 节点只有 revision 0 When 读取 Then 返回严格 meta 和受管正文', async (
+    kind,
+    contentId,
+    fileName,
+    content,
+  ) => {
+    /** 先通过正式准备路径建立 revision 0 兼容目录。 */
+    const fixture = createFixture()
+    if (kind === 'webview') {
+      await fixture.store.prepareArtifactContent(target, { kind, contentId, content })
+    } else {
+      await fixture.store.prepareEmptyContent(target, { kind, contentId })
+      fixture.scopes.nodes.get(contentId)![fileName] = content
+    }
+
+    expect(await fixture.store.readTextRevisionZero(target, { kind, contentId })).toEqual({
+      meta: expect.objectContaining({ kind, contentId, revision: 0 }),
+      content,
+    })
+  })
+
   test('Given Agent 创建图片产物 When 准备初始内容 Then prompt 写入 revision 0 配置且不同 prompt 拒绝覆盖', async () => {
     const fixture = createFixture()
     const prompt = '安静克制的桌面 Agent 首页设计稿'
@@ -279,6 +371,24 @@ describe('Canvas 节点内容 Store', () => {
       content: '另一版提示词',
       selectedModelProfileId: 'profile-1',
     })).rejects.toThrow('CANVAS_CONTENT_IDENTITY_CONFLICT')
+  })
+
+  test('Given Agent 创建文档产物 When 准备 Markdown Then 首次写入且相同正文幂等、不同正文冲突', async () => {
+    const fixture = createFixture()
+    /** Agent 已准备完成的初始 Markdown 正文。 */
+    const markdown = '# 产品说明\n\n这是首个版本。'
+    /** 文档产物的稳定内容身份。 */
+    const input = { kind: 'document' as const, contentId: 'document-artifact-1', content: markdown }
+
+    await fixture.store.prepareArtifactContent(target, input)
+
+    expect(fixture.scopes.nodes.get(input.contentId)?.['content.md']).toBe(markdown)
+    await expect(fixture.store.prepareArtifactContent(target, input)).resolves.toBeUndefined()
+    await expect(fixture.store.prepareArtifactContent(target, {
+      ...input,
+      content: '# 不同正文',
+    })).rejects.toThrow('CANVAS_CONTENT_IDENTITY_CONFLICT')
+    expect(fixture.scopes.nodes.get(input.contentId)?.['content.md']).toBe(markdown)
   })
 
   test.each([
@@ -417,6 +527,53 @@ describe('Canvas 节点内容 Store', () => {
     expect(fixture.scopes.trash.has('trash-1')).toBe(false)
   })
 
+  test('Given 两个共享 WebView 已批量回收 When 首条恢复并刷新列表 Then 剩余条目仍可枚举并继续恢复', async () => {
+    const fixture = createFixture()
+    const entries: CanvasTrashEntry[] = [
+      { schemaVersion: 2, trashId: 'trash-web-a', nodeId: 'web-a', kind: 'webview', contentId: 'shared-web', title: '原型 A', position: { x: 10, y: 20 }, deletedRevision: 3, deletedAt: 200, contentRevision: 3, devicePreset: 'desktop' },
+      { schemaVersion: 2, trashId: 'trash-web-b', nodeId: 'web-b', kind: 'webview', contentId: 'shared-web', title: '原型 B', position: { x: 30, y: 40 }, deletedRevision: 3, deletedAt: 201, contentRevision: 7, devicePreset: 'mobile' },
+    ]
+    /** 两条共享内容回收身份都是本用例的必要前置。 */
+    const firstEntry = requireEntry(entries, 0)
+    const secondEntry = requireEntry(entries, 1)
+    await fixture.store.prepareEmptyContent(target, { kind: 'webview', contentId: 'shared-web' })
+    await fixture.store.moveManyToTrash!(target, entries)
+
+    expect(await fixture.store.restoreFromTrash(target, firstEntry.trashId)).toEqual(firstEntry)
+    expect(readJson<{
+      schemaVersion: number
+      contentLocation: string
+      physicalEntryId: string
+      pending: CanvasTrashEntry[]
+      restored: CanvasTrashEntry[]
+    }>(fixture.scopes.trash.get(firstEntry.trashId)!, 'entry.json')).toEqual({
+      schemaVersion: 1,
+      contentLocation: 'nodes',
+      physicalEntryId: 'shared-web',
+      pending: [secondEntry],
+      restored: [firstEntry],
+    })
+    expect(await fixture.store.listTrash(target)).toEqual([secondEntry])
+    expect(await fixture.store.restoreFromTrash(target, secondEntry.trashId)).toEqual(secondEntry)
+    expect(await fixture.store.listTrash(target)).toEqual([])
+    expect(fixture.scopes.nodes.has('shared-web')).toBe(true)
+  })
+
+  test('Given 共享 WebView 首条已恢复 When 再次删除该节点 Then 合并新 marker 且不覆盖未恢复快照', async () => {
+    const fixture = createFixture()
+    const pendingEntry: CanvasTrashEntry = { schemaVersion: 2, trashId: 'trash-web-pending', nodeId: 'web-b', kind: 'webview', contentId: 'shared-web', title: '原型 B', position: { x: 30, y: 40 }, deletedRevision: 3, deletedAt: 201, contentRevision: 7, devicePreset: 'mobile' }
+    const restoredEntry: CanvasTrashEntry = { schemaVersion: 2, trashId: 'trash-web-restored', nodeId: 'web-a', kind: 'webview', contentId: 'shared-web', title: '原型 A', position: { x: 10, y: 20 }, deletedRevision: 3, deletedAt: 200, contentRevision: 3, devicePreset: 'desktop' }
+    const deletedAgainEntry: CanvasTrashEntry = { ...restoredEntry, trashId: 'trash-web-deleted-again', deletedRevision: 4, deletedAt: 300, position: { x: 50, y: 60 } }
+    await fixture.store.prepareEmptyContent(target, { kind: 'webview', contentId: 'shared-web' })
+    await fixture.store.moveManyToTrash!(target, [restoredEntry, pendingEntry])
+    await fixture.store.restoreFromTrash(target, restoredEntry.trashId)
+
+    await fixture.store.moveToTrash(target, deletedAgainEntry)
+
+    expect(await fixture.store.listTrash(target)).toEqual([deletedAgainEntry, pendingEntry])
+    expect(await fixture.store.restoreFromTrash(target, pendingEntry.trashId)).toEqual(pendingEntry)
+  })
+
   test('Given 删除A恢复A再删除B恢复B When 使用新 trashId Then 历史 marker 可安全替换', async () => {
     const fixture = createFixture()
     const entryA: CanvasTrashEntry = { ...trashEntry, trashId: 'trash-a' }
@@ -426,7 +583,7 @@ describe('Canvas 节点内容 Store', () => {
     await fixture.store.moveToTrash(target, entryA)
     await fixture.store.restoreFromTrash(target, entryA.trashId)
     await fixture.store.moveToTrash(target, entryB)
-    expect(readJson<CanvasTrashEntry>(fixture.scopes.trash.get('trash-b')!, 'entry.json')).toEqual(entryB)
+    expect(await fixture.store.listTrash(target)).toEqual([entryB])
     expect(await fixture.store.restoreFromTrash(target, entryB.trashId)).toEqual(entryB)
   })
 
@@ -452,9 +609,10 @@ describe('Canvas 节点内容 Store', () => {
     await fixture.store.restoreFromTrash(target, entryA.trashId)
 
     await expect(fixture.store.moveToTrash(target, entryB)).rejects.toThrow('CANVAS_CONTENT_WRITE_FAILED')
-    expect(readJson<CanvasTrashEntry>(fixture.scopes.trash.get('trash-b')!, 'entry.json')).toEqual(entryA)
+    expect(await fixture.store.listTrash(target)).toEqual([])
+    expect(await fixture.store.restoreFromTrash(target, entryA.trashId)).toEqual(entryA)
     await fixture.store.moveToTrash(target, entryB)
-    expect(readJson<CanvasTrashEntry>(fixture.scopes.trash.get('trash-b')!, 'entry.json')).toEqual(entryB)
+    expect(await fixture.store.listTrash(target)).toEqual([entryB])
   })
 
   test('Given nodes 历史 marker 身份不匹配 When 再次删除 Then move 前拒绝且节点保持原位', async () => {
@@ -514,6 +672,122 @@ describe('Canvas 节点内容 Store', () => {
     expect(result).toHaveLength(512)
     expect(result[0]?.deletedAt).toBe(511)
     expect(result.at(-1)?.deletedAt).toBe(0)
+  })
+
+  test('Given 1000 个活动内容且回收区为空 When 列出回收项 Then 不扫描 nodes 目录', async () => {
+    const fixture = createFixture()
+    for (let index = 0; index < 1_000; index += 1) {
+      fixture.scopes.nodes.set(`active-${index}`, {})
+    }
+
+    expect(await fixture.store.listTrash(target)).toEqual([])
+    expect(fixture.requests.some((request) => (
+      request.mode === 'canvas-content-list' && request.childName === 'nodes'
+    ))).toBe(false)
+  })
+
+  test('Given 513 个共享内容均已完整恢复 When 列出回收项 Then 不残留 tombstone 且不触发目录上限', async () => {
+    const fixture = createFixture()
+    for (let index = 0; index < 513; index += 1) {
+      const contentId = `shared-${index}`
+      const entries: CanvasTrashEntry[] = [
+        { ...trashEntry, trashId: `trash-${index}-a`, nodeId: `node-${index}-a`, contentId },
+        { ...trashEntry, trashId: `trash-${index}-b`, nodeId: `node-${index}-b`, contentId, deletedAt: 200 },
+      ]
+      await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId })
+      await fixture.store.moveManyToTrash!(target, entries)
+      await fixture.store.restoreFromTrash(target, entries[0]!.trashId)
+      await fixture.store.restoreFromTrash(target, entries[1]!.trashId)
+    }
+
+    expect(fixture.scopes.trash.size).toBe(0)
+    expect(await fixture.store.listTrash(target)).toEqual([])
+  })
+
+  test('Given 同一节点多次删除恢复 When 重复恢复并继续删除 Then 幂等且 restored 历史保持有界', async () => {
+    const fixture = createFixture()
+    await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' })
+
+    for (let index = 0; index < 40; index += 1) {
+      const entry: CanvasTrashEntry = { ...trashEntry, trashId: `trash-cycle-${index}`, deletedAt: 200 + index }
+      await fixture.store.moveToTrash(target, entry)
+      expect(await fixture.store.restoreFromTrash(target, entry.trashId)).toEqual(entry)
+      expect(await fixture.store.restoreFromTrash(target, entry.trashId)).toEqual(entry)
+    }
+
+    const marker = readJson<{ restored: CanvasTrashEntry[] }>(fixture.scopes.nodes.get('content-1')!, 'entry.json')
+    expect(marker.restored.length).toBeLessThanOrEqual(32)
+    expect(marker.restored.at(-1)?.trashId).toBe('trash-cycle-39')
+    expect(fixture.scopes.trash.size).toBe(0)
+  })
+
+  test('Given 最后 pending 的 nodes marker 写入失败 When 恢复 Then tombstone 仍公开且重试可收敛', async () => {
+    let failFinalNodesMarker = true
+    const fixture = createFixture({
+      outcomeFor: (request) => {
+        if (request.mode === 'canvas-content-write'
+          && request.childName === 'nodes'
+          && request.entryId === 'shared-failure'
+          && request.fileName === 'entry.json'
+          && request.content?.includes('"pending": []')
+          && failFinalNodesMarker) {
+          failFinalNodesMarker = false
+          return { commitVisible: false, durabilityUncertain: false, error: 'injected nodes marker failure' }
+        }
+        return undefined
+      },
+    })
+    const entries: CanvasTrashEntry[] = [
+      { ...trashEntry, trashId: 'failure-a', nodeId: 'failure-node-a', contentId: 'shared-failure' },
+      { ...trashEntry, trashId: 'failure-b', nodeId: 'failure-node-b', contentId: 'shared-failure' },
+    ]
+    /** 两条失败恢复身份都必须存在，避免 undefined 掩盖恢复断言。 */
+    const firstEntry = requireEntry(entries, 0)
+    const secondEntry = requireEntry(entries, 1)
+    await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'shared-failure' })
+    await fixture.store.moveManyToTrash!(target, entries)
+    await fixture.store.restoreFromTrash(target, firstEntry.trashId)
+
+    await expect(fixture.store.restoreFromTrash(target, secondEntry.trashId))
+      .rejects.toThrow('CANVAS_CONTENT_WRITE_FAILED')
+    expect(await fixture.store.listTrash(target)).toEqual([secondEntry])
+    expect(await fixture.store.restoreFromTrash(target, secondEntry.trashId)).toEqual(secondEntry)
+    expect(fixture.scopes.trash.size).toBe(0)
+  })
+
+  test('Given nodes 已记录最终恢复但 tombstone 删除失败 When 重试 Then 幂等清理且不重复移动内容', async () => {
+    let failRemove = true
+    const fixture = createFixture({
+      outcomeFor: (request) => {
+        if (request.mode === 'canvas-content-remove-marker' && failRemove) {
+          failRemove = false
+          return { commitVisible: false, durabilityUncertain: false, error: 'injected marker removal failure' }
+        }
+        return undefined
+      },
+    })
+    const entries: CanvasTrashEntry[] = [
+      { ...trashEntry, trashId: 'remove-a', nodeId: 'remove-node-a', contentId: 'shared-remove' },
+      { ...trashEntry, trashId: 'remove-b', nodeId: 'remove-node-b', contentId: 'shared-remove' },
+    ]
+    /** 两条 marker 清理身份都必须存在，保证失败重试断言使用确定值。 */
+    const firstEntry = requireEntry(entries, 0)
+    const secondEntry = requireEntry(entries, 1)
+    await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'shared-remove' })
+    await fixture.store.moveManyToTrash!(target, entries)
+    await fixture.store.restoreFromTrash(target, firstEntry.trashId)
+    const movesBeforeFinalRestore = fixture.requests.filter((request) => request.mode === 'canvas-content-move').length
+
+    await expect(fixture.store.restoreFromTrash(target, secondEntry.trashId))
+      .rejects.toThrow('CANVAS_CONTENT_WRITE_FAILED')
+    expect(await fixture.store.listTrash(target)).toEqual([secondEntry])
+    expect(readJson<{ pending: CanvasTrashEntry[]; restored: CanvasTrashEntry[] }>(
+      fixture.scopes.nodes.get('shared-remove')!,
+      'entry.json',
+    )).toMatchObject({ pending: [], restored: expect.arrayContaining([secondEntry]) })
+    expect(await fixture.store.restoreFromTrash(target, secondEntry.trashId)).toEqual(secondEntry)
+    expect(fixture.requests.filter((request) => request.mode === 'canvas-content-move')).toHaveLength(movesBeforeFinalRestore)
+    expect(fixture.scopes.trash.size).toBe(0)
   })
 
   test('Given 回收区超过 512 项 When 列表 Then 原样传播 helper 上限错误', async () => {
@@ -789,6 +1063,16 @@ describe('Canvas 节点内容 Store', () => {
         kind: 'document',
         contentId: 'content-1',
       })).toMatchObject({ kind: 'document', contentId: 'content-1' })
+
+      const sharedEntries: CanvasTrashEntry[] = [
+        { ...trashEntry, trashId: 'real-shared-a', nodeId: 'real-node-a', contentId: 'real-shared' },
+        { ...trashEntry, trashId: 'real-shared-b', nodeId: 'real-node-b', contentId: 'real-shared' },
+      ]
+      await store.prepareEmptyContent(target, { kind: 'document', contentId: 'real-shared' })
+      await store.moveManyToTrash!(target, sharedEntries)
+      await store.restoreFromTrash(target, sharedEntries[0]!.trashId)
+      await store.restoreFromTrash(target, sharedEntries[1]!.trashId)
+      expect(readdirSync(join(canvasRoot, 'trash'))).toEqual([])
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true })
     }

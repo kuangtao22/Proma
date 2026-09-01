@@ -414,6 +414,8 @@ export interface DesignJobRecord extends DesignJobTraceSummary {
   generationConstraints?: DesignGenerationConstraints
   canvasInputReferences?: CanvasImageInputReference[]
   canvasImageConfigRevision?: number
+  /** Canvas 图片任务所属候选批次，用于终态 O(1) 定位验收记录。 */
+  candidateBatchId?: string
   sourceAgentMessageId?: string
   imageModelSnapshot?: ImageGenerationModelSnapshot
   sourceSessionId?: string
@@ -479,6 +481,8 @@ export interface CreateDesignJobInput {
   generationConstraints?: DesignGenerationConstraints
   canvasInputReferences?: CanvasImageInputReference[]
   canvasImageConfigRevision?: number
+  /** Canvas 图片调用方在创建 journal 前已经固化的候选批次身份。 */
+  candidateBatchId?: string
   sourceSessionId?: string
   sourceAssetId?: string
   maskAnnotationId?: string

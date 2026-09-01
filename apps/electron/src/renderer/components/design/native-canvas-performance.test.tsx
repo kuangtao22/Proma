@@ -3,7 +3,11 @@ import { createEmptyCanvasDocument } from '@proma/shared'
 import type { CanvasMutation } from '@proma/shared'
 import { ReactFlow } from '@xyflow/react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { NativeCanvasGraph, reduceNativeCanvasViewportState } from './NativeCanvasGraph'
+import {
+  NativeCanvasEdgeRelationMenu,
+  NativeCanvasGraph,
+  reduceNativeCanvasViewportState,
+} from './NativeCanvasGraph'
 import type { NativeCanvasFlowProps } from './NativeCanvasGraph'
 import {
   findAvailableNativeCanvasNodePosition,
@@ -34,7 +38,7 @@ describe('原生 Canvas 大画布性能预算', () => {
       }
       return {
         id: `webview-${index}`, kind: 'webview' as const, title: `原型 ${index}`,
-        prototypeId: `prototype-${index}`, contentRevision: 0, position,
+        prototypeId: `prototype-${index}`, contentRevision: 0, devicePreset: 'desktop' as const, position,
       }
     })
 
@@ -279,7 +283,7 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(html).toContain('class="design-canvas relative h-full w-full"')
   })
 
-  test('Given select 或 pan 工具 When 构造 Flow Then 交互配置互斥且布局稳定', () => {
+  test('Given select 或 pan 工具 When 构造 Flow Then 手型模式保留节点选择且禁用结构编辑', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     /** 两种工具各自捕获一次 XYFlow 属性。 */
     const captured: NativeCanvasFlowProps[] = []
@@ -306,7 +310,7 @@ describe('原生 Canvas 大画布性能预算', () => {
     })
     expect(captured[1]).toMatchObject({
       nodesDraggable: false,
-      elementsSelectable: false,
+      elementsSelectable: true,
       panOnDrag: true,
       selectionOnDrag: false,
     })
@@ -340,7 +344,7 @@ describe('原生 Canvas 大画布性能预算', () => {
     }])
   })
 
-  test('Given 持久连线 When 构造 Flow props Then 禁止连线、删除与边交互', () => {
+  test('Given 可写选择工具 When 用户拖线 Then 创建默认关联边且保留边删除禁用合同', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     document.nodes = [
       { id: 'agent-1', kind: 'agent', title: 'Agent', agentSessionId: 'session-1', position: { x: 0, y: 0 } },
@@ -351,31 +355,63 @@ describe('原生 Canvas 大画布性能预算', () => {
     ]
     document.edges = [{
       id: 'edge-1', sourceNodeId: 'agent-1', sourcePort: 'out',
-      targetNodeId: 'image-1', targetPort: 'in',
+      targetNodeId: 'image-1', targetPort: 'in', relation: 'association',
     }]
+    /** 捕获拖线提交，证明 Graph 已真实接入默认关系 helper。 */
+    const mutations: CanvasMutation[] = []
     let captured: NativeCanvasFlowProps | undefined
     renderToStaticMarkup(
       <NativeCanvasGraph
         document={document}
         writable
         selectedNodeId={null}
-        onMutation={() => {}}
+        onMutation={(mutation) => mutations.push(mutation)}
         onNodeSelect={() => {}}
         onConversationNodeChange={() => {}}
+        createEdgeId={() => 'edge-created'}
         flowRenderer={(props) => { captured = props; return <div /> }}
       />,
     )
 
     expect(captured).toMatchObject({
-      nodesConnectable: false,
+      nodesConnectable: true,
       edgesFocusable: false,
       edgesReconnectable: false,
       deleteKeyCode: null,
       onlyRenderVisibleElements: true,
     })
     expect(captured?.edges[0]).toMatchObject({ selectable: false, deletable: false, focusable: false })
-    expect('onConnect' in captured!).toBe(false)
+    expect(typeof captured?.onConnect).toBe('function')
     expect('onEdgesDelete' in captured!).toBe(false)
+
+    captured!.onConnect!({
+      source: 'agent-1', sourceHandle: 'output',
+      target: 'image-1', targetHandle: 'input',
+    })
+    expect(mutations).toEqual([{
+      type: 'upsert-edges',
+      edges: [{
+        id: 'edge-created', sourceNodeId: 'agent-1', sourcePort: 'output',
+        targetNodeId: 'image-1', targetPort: 'input', relation: 'association',
+      }],
+    }])
+  })
+
+  test('Given 拖线已创建默认关联 When 显示语义菜单 Then 提供四种中文关系选择', () => {
+    /** 菜单输入使用已经按默认 association 写入的稳定边。 */
+    const edge = {
+      id: 'edge-1', sourceNodeId: 'agent-1', sourcePort: 'output',
+      targetNodeId: 'image-1', targetPort: 'input', relation: 'association' as const,
+    }
+    const html = renderToStaticMarkup(
+      <NativeCanvasEdgeRelationMenu edge={edge} onSelect={() => undefined} />,
+    )
+
+    expect(html).toContain('aria-label="选择连线关系"')
+    expect(html).toContain('>关联<')
+    expect(html).toContain('>引用<')
+    expect(html).toContain('>依赖<')
+    expect(html).toContain('>衍生<')
   })
 
   test('Given 持久连线 When 使用真实 ReactFlow 渲染 Then 输出可见 edge path', () => {
@@ -389,7 +425,7 @@ describe('原生 Canvas 大画布性能预算', () => {
     ]
     document.edges = [{
       id: 'edge-1', sourceNodeId: 'agent-1', sourcePort: 'out',
-      targetNodeId: 'image-1', targetPort: 'in',
+      targetNodeId: 'image-1', targetPort: 'in', relation: 'association',
     }]
 
     const html = renderToStaticMarkup(

@@ -14,6 +14,7 @@ import {
   applyCanvasMutations,
   CANVAS_DOCUMENT_VERSION,
   createEmptyCanvasDocument,
+  parseCanvasEdgeRelation,
 } from '@proma/shared'
 import type {
   CanvasDocument,
@@ -84,9 +85,9 @@ export interface CanvasBatchOperationPlan {
 
 /** 主进程私有的旧内容迁移能力，不进入共享合同或 IPC。 */
 export interface CanvasDocumentMigrationCapability extends CanvasDocumentDirectoryCapability {
-  migratedFrom?: 1
+  migratedFrom?: 1 | 2 | 3
   legacyContentSeeds: LegacyCanvasContentSeed[]
-  /** 把同次读取的规范化 v2 载荷按 CAS 提交，保持图 revision 与时间不变。 */
+  /** 把同次读取的当前规范载荷按 CAS 提交，保持图 revision 与时间不变。 */
   commitMigration: () => CanvasDocument
 }
 
@@ -163,9 +164,25 @@ export interface LegacyCanvasContentSeed {
 /** 严格解析后的 v2 文档与不对 Renderer 公开的迁移上下文。 */
 export interface ParsedCanvasDocument {
   document: CanvasDocument
-  migratedFrom?: 1
+  migratedFrom?: 1 | 2 | 3
   legacyContentSeeds: LegacyCanvasContentSeed[]
-  persistencePayload: CanvasDocument | LegacyCanvasDocument
+  persistencePayload: CanvasDocument | LegacyCanvasDocument | LegacyCanvasDocumentV2 | LegacyCanvasDocumentV3
+}
+
+/** schema v2 的磁盘形态；WebView 尚未包含设备预设。 */
+interface LegacyCanvasDocumentV2 extends Omit<CanvasDocument, 'schemaVersion' | 'nodes' | 'edges'> {
+  schemaVersion: 2
+  nodes: Array<Omit<CanvasNode, 'devicePreset'> & { devicePreset?: never }>
+  edges: CanvasEdgeV3[]
+}
+
+/** schema v3 的稳定端口边尚未声明长期关系语义。 */
+type CanvasEdgeV3 = Omit<CanvasEdge, 'relation'>
+
+/** schema v3 的磁盘形态；节点已是当前结构，仅边缺少语义。 */
+interface LegacyCanvasDocumentV3 extends Omit<CanvasDocument, 'schemaVersion' | 'edges'> {
+  schemaVersion: 3
+  edges: CanvasEdgeV3[]
 }
 
 /** 严格重建后可安全重新落盘的 v1 节点联合。 */
@@ -207,7 +224,7 @@ interface LegacyCanvasDocument {
   revision: number
   viewport: CanvasDocument['viewport']
   nodes: LegacyCanvasNode[]
-  edges: CanvasEdge[]
+  edges: CanvasEdgeV3[]
   createdAt: number
   updatedAt: number
 }
@@ -311,8 +328,17 @@ function parseViewport(value: unknown, message: string): { x: number; y: number;
   return { x: value.x, y: value.y, zoom: value.zoom }
 }
 
-/** 严格解析 v2 四类互斥引用节点并重建对象。 */
-function parseCanvasNode(value: unknown, message: string): CanvasNode {
+/**
+ * 严格解析当前四类互斥引用节点并重建对象。
+ * @param value 待解析节点。
+ * @param message 失败时沿用的上层稳定错误码。
+ * @param allowLegacyWebviewDeviceDefault 是否允许 schema v2 WebView 缺省为网页预设。
+ */
+function parseCanvasNode(
+  value: unknown,
+  message: string,
+  allowLegacyWebviewDeviceDefault = false,
+): CanvasNode {
   if (!isRecord(value)
     || !isSafeDesignStableId(value.id)
     || !isBoundedNonEmptyString(value.title, CANVAS_NODE_TITLE_MAX_LENGTH)) {
@@ -320,57 +346,99 @@ function parseCanvasNode(value: unknown, message: string): CanvasNode {
   }
   /** 所有节点共享的有限布局坐标。 */
   const position = parsePoint(value.position, message)
+  /** 当前节点是否显式携带结构化上游变化提示。 */
+  const hasUpstreamChange = Object.hasOwn(value, 'upstreamChange')
+  /** 四类节点共同使用的精确字段前缀。 */
+  const baseKeys = hasUpstreamChange
+    ? ['id', 'kind', 'title', 'position', 'upstreamChange']
+    : ['id', 'kind', 'title', 'position']
+  /** 上游提示只能引用有界、唯一且已排序的稳定节点 ID。 */
+  let upstreamChange: CanvasNode['upstreamChange']
+  if (hasUpstreamChange) {
+    const rawChange = value.upstreamChange
+    /** 局部变量让数组校验在回调中保持类型收窄。 */
+    const rawSourceNodeIds = isRecord(rawChange) ? rawChange.sourceNodeIds : undefined
+    if (!isRecord(rawChange)
+      || !hasExactKeys(rawChange, ['sourceNodeIds', 'changedAt'])
+      || !Array.isArray(rawSourceNodeIds)
+      || rawSourceNodeIds.length < 1
+      || rawSourceNodeIds.length > 128
+      || !rawSourceNodeIds.every(isSafeDesignStableId)
+      || new Set(rawSourceNodeIds).size !== rawSourceNodeIds.length
+      || rawSourceNodeIds.some((nodeId, index) => (
+        index > 0 && String(rawSourceNodeIds[index - 1]).localeCompare(String(nodeId)) >= 0
+      ))
+      || !Number.isSafeInteger(rawChange.changedAt)
+      || (rawChange.changedAt as number) < 0) {
+      throw new Error(message)
+    }
+    upstreamChange = {
+      sourceNodeIds: [...rawSourceNodeIds] as string[],
+      changedAt: rawChange.changedAt as number,
+    }
+  }
+  /** 重建公共节点字段，避免返回磁盘对象引用。 */
+  const base = {
+    id: value.id,
+    title: value.title,
+    position,
+    ...(upstreamChange ? { upstreamChange } : {}),
+  }
   if (value.kind === 'agent'
-    && hasExactKeys(value, ['id', 'kind', 'title', 'position', 'agentSessionId'])
+    && hasExactKeys(value, [...baseKeys, 'agentSessionId'])
     && isSafeDesignStableId(value.agentSessionId)) {
-    return { id: value.id, kind: 'agent', title: value.title, position, agentSessionId: value.agentSessionId }
+    return { ...base, kind: 'agent', agentSessionId: value.agentSessionId }
   }
   if (value.kind === 'image'
-    && (hasExactKeys(value, ['id', 'kind', 'title', 'position', 'imageModuleId'])
+    && (hasExactKeys(value, [...baseKeys, 'imageModuleId'])
       || hasExactKeys(value, [
-        'id', 'kind', 'title', 'position', 'imageModuleId', 'adoptedAssetId',
+        ...baseKeys, 'imageModuleId', 'adoptedAssetId',
       ]))
     && isSafeDesignStableId(value.imageModuleId)
     && (value.adoptedAssetId === undefined || isSafeDesignStableId(value.adoptedAssetId))) {
     return {
-      id: value.id,
+      ...base,
       kind: 'image',
-      title: value.title,
-      position,
       imageModuleId: value.imageModuleId,
       ...(value.adoptedAssetId === undefined ? {} : { adoptedAssetId: value.adoptedAssetId }),
     }
   }
   if (value.kind === 'document'
     && hasExactKeys(value, [
-      'id', 'kind', 'title', 'position', 'documentId', 'contentRevision',
+      ...baseKeys, 'documentId', 'contentRevision',
     ])
     && isSafeDesignStableId(value.documentId)
     && Number.isSafeInteger(value.contentRevision)
     && (value.contentRevision as number) >= 0) {
     return {
-      id: value.id,
+      ...base,
       kind: 'document',
-      title: value.title,
-      position,
       documentId: value.documentId,
       contentRevision: value.contentRevision as number,
     }
   }
-  if (value.kind === 'webview'
-    && hasExactKeys(value, [
-      'id', 'kind', 'title', 'position', 'prototypeId', 'contentRevision',
+  /** v2 仅接受缺少设备预设的历史形态，当前版本仅接受包含预设的完整形态。 */
+  const hasExpectedWebviewKeys = allowLegacyWebviewDeviceDefault
+    ? hasExactKeys(value, [
+      ...baseKeys, 'prototypeId', 'contentRevision',
     ])
+    : hasExactKeys(value, [
+      ...baseKeys, 'prototypeId', 'contentRevision', 'devicePreset',
+    ])
+  if (value.kind === 'webview'
+    && hasExpectedWebviewKeys
     && isSafeDesignStableId(value.prototypeId)
     && Number.isSafeInteger(value.contentRevision)
-    && (value.contentRevision as number) >= 0) {
+    && (value.contentRevision as number) >= 0
+    && (value.devicePreset === undefined
+      ? allowLegacyWebviewDeviceDefault
+      : value.devicePreset === 'desktop' || value.devicePreset === 'mobile')) {
     return {
-      id: value.id,
+      ...base,
       kind: 'webview',
-      title: value.title,
-      position,
       prototypeId: value.prototypeId,
       contentRevision: value.contentRevision as number,
+      devicePreset: value.devicePreset === 'mobile' ? 'mobile' : 'desktop',
     }
   }
   throw new Error(message)
@@ -476,6 +544,7 @@ function parseLegacyCanvasNode(value: unknown, message: string): ParsedLegacyCan
         position: { x: position.x, y: position.y },
         prototypeId: value.id,
         contentRevision: 0,
+        devicePreset: 'desktop',
       },
       persistenceNode: {
         id: value.id,
@@ -494,8 +563,8 @@ function parseLegacyCanvasNode(value: unknown, message: string): ParsedLegacyCan
   throw new Error(message)
 }
 
-/** 严格解析稳定端口边并重建对象。 */
-function parseCanvasEdge(value: unknown, message: string): CanvasEdge {
+/** 严格解析 schema v1-v3 的无语义稳定端口边并重建对象。 */
+function parseLegacyCanvasEdge(value: unknown, message: string): CanvasEdgeV3 {
   const fields = ['id', 'sourceNodeId', 'sourcePort', 'targetNodeId', 'targetPort'] as const
   if (!isRecord(value)
     || !hasExactKeys(value, fields)
@@ -515,6 +584,45 @@ function parseCanvasEdge(value: unknown, message: string): CanvasEdge {
   }
 }
 
+/** 严格解析当前带语义的稳定端口边并重建对象。 */
+function parseCanvasEdge(value: unknown, message: string): CanvasEdge {
+  const fields = [
+    'id', 'sourceNodeId', 'sourcePort', 'targetNodeId', 'targetPort', 'relation',
+  ] as const
+  if (!isRecord(value)
+    || !hasExactKeys(value, fields)
+    || !isSafeDesignStableId(value.id)
+    || !isSafeDesignStableId(value.sourceNodeId)
+    || !isSafeDesignStableId(value.sourcePort)
+    || !isSafeDesignStableId(value.targetNodeId)
+    || !isSafeDesignStableId(value.targetPort)) {
+    throw new Error(message)
+  }
+  try {
+    return {
+      id: value.id,
+      sourceNodeId: value.sourceNodeId,
+      sourcePort: value.sourcePort,
+      targetNodeId: value.targetNodeId,
+      targetPort: value.targetPort,
+      relation: parseCanvasEdgeRelation(value.relation),
+    }
+  } catch (error) {
+    throw new Error(message, { cause: error })
+  }
+}
+
+/** 把历史无语义边按旧消费行为确定性映射为当前语义边。 */
+function migrateLegacyCanvasEdge(
+  edge: CanvasEdgeV3,
+  nodeKindsById: ReadonlyMap<string, CanvasNode['kind']>,
+): CanvasEdge {
+  return {
+    ...edge,
+    relation: nodeKindsById.get(edge.targetNodeId) === 'image' ? 'reference' : 'association',
+  }
+}
+
 /** 要求实体 ID 在数组内唯一。 */
 function assertUniqueIds(items: readonly { id: string }[], message: string): void {
   if (new Set(items.map((item) => item.id)).size !== items.length) throw new Error(message)
@@ -524,7 +632,7 @@ function assertUniqueIds(items: readonly { id: string }[], message: string): voi
  * 严格解析未知 Canvas 文档，逐字段重建并校验双重身份与跨实体引用。
  * @param value JSON 解析结果或 mutation 归约后的未知文档。
  * @param target 当前已授权项目与 Canvas 身份。
- * @returns 规范化 v2 文档与主进程私有迁移上下文。
+ * @returns 规范化当前版本文档与主进程私有迁移上下文。
  */
 export function parseCanvasDocument(value: unknown, target: CanvasTarget): ParsedCanvasDocument {
   const fields = [
@@ -540,7 +648,10 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
   ] as const
   if (!isRecord(value)
     || !hasExactKeys(value, fields)
-    || (value.schemaVersion !== 1 && value.schemaVersion !== CANVAS_DOCUMENT_VERSION)
+    || (value.schemaVersion !== 1
+      && value.schemaVersion !== 2
+      && value.schemaVersion !== 3
+      && value.schemaVersion !== CANVAS_DOCUMENT_VERSION)
     || value.projectId !== target.projectId
     || value.canvasId !== target.canvasId
     || !Number.isSafeInteger(value.revision)
@@ -567,8 +678,20 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
       if (parsed.legacyContentSeed) legacyContentSeeds.push(parsed.legacyContentSeed)
       return parsed.node
     })
-    : value.nodes.map((node) => parseCanvasNode(node, 'CANVAS_DOCUMENT_INVALID'))
-  const edges = value.edges.map((edge) => parseCanvasEdge(edge, 'CANVAS_DOCUMENT_INVALID'))
+    : value.nodes.map((node) => parseCanvasNode(
+      node,
+      'CANVAS_DOCUMENT_INVALID',
+      value.schemaVersion === 2,
+    ))
+  /** 节点类别索引让历史边迁移保持 O(nodes + edges)。 */
+  const nodeKindsById = new Map(nodes.map((node) => [node.id, node.kind]))
+  /** v4 严格要求 relation；历史版本只接受五字段边并确定性补全语义。 */
+  const legacyEdges = value.schemaVersion === CANVAS_DOCUMENT_VERSION
+    ? null
+    : value.edges.map((edge) => parseLegacyCanvasEdge(edge, 'CANVAS_DOCUMENT_INVALID'))
+  const edges = legacyEdges
+    ? legacyEdges.map((edge) => migrateLegacyCanvasEdge(edge, nodeKindsById))
+    : value.edges.map((edge) => parseCanvasEdge(edge, 'CANVAS_DOCUMENT_INVALID'))
   assertUniqueIds(nodes, 'CANVAS_DOCUMENT_INVALID')
   assertUniqueIds(edges, 'CANVAS_DOCUMENT_INVALID')
   /** 边的两端都必须引用当前文档中实际存在的节点。 */
@@ -578,7 +701,7 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
   }
   /** 视口只解析一次，v1 持久化载荷再从校验结果独立重建。 */
   const viewport = parseViewport(value.viewport, 'CANVAS_DOCUMENT_INVALID')
-  /** Renderer 始终只看到规范化后的 v2 文档。 */
+  /** Renderer 始终只看到规范化后的当前版本文档。 */
   const document: CanvasDocument = {
     schemaVersion: CANVAS_DOCUMENT_VERSION,
     projectId: target.projectId,
@@ -590,8 +713,8 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
     createdAt: value.createdAt,
     updatedAt: value.updatedAt,
   }
-  /** v1 在内容迁移完成前必须保留旧字段，v2 直接复用规范文档。 */
-  const persistencePayload: CanvasDocument | LegacyCanvasDocument = parsedLegacyNodes
+  /** v1 在内容迁移完成前保留旧字段，v2/v3 保留原磁盘形态，v4 复用规范文档。 */
+  const persistencePayload: ParsedCanvasDocument['persistencePayload'] = parsedLegacyNodes
     ? {
       schemaVersion: 1,
       projectId: target.projectId,
@@ -599,7 +722,7 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
       revision,
       viewport: { x: viewport.x, y: viewport.y, zoom: viewport.zoom },
       nodes: parsedLegacyNodes.map((parsed) => parsed.persistenceNode),
-      edges: edges.map((edge) => ({
+      edges: legacyEdges!.map((edge) => ({
         id: edge.id,
         sourceNodeId: edge.sourceNodeId,
         sourcePort: edge.sourcePort,
@@ -609,10 +732,18 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
       createdAt: value.createdAt,
       updatedAt: value.updatedAt,
     }
-    : document
+    : value.schemaVersion === 2 || value.schemaVersion === 3
+      ? structuredClone(value) as unknown as LegacyCanvasDocumentV2 | LegacyCanvasDocumentV3
+      : document
   return {
     document,
-    ...(value.schemaVersion === 1 ? { migratedFrom: 1 as const } : {}),
+    ...(value.schemaVersion === 1
+      ? { migratedFrom: 1 as const }
+      : value.schemaVersion === 2
+        ? { migratedFrom: 2 as const }
+        : value.schemaVersion === 3
+          ? { migratedFrom: 3 as const }
+          : {}),
     legacyContentSeeds,
     persistencePayload,
   }
@@ -634,6 +765,8 @@ function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]):
   const upsertedEdgeIds = new Set<string>()
   /** 当前步骤可引用的节点 ID，随 upsert/remove 顺序演进。 */
   const currentNodeIds = new Set(current.nodes.map((node) => node.id))
+  /** 当前步骤的节点类别随 upsert/remove 同步演进，供类型相关 mutation 做 O(1) 校验。 */
+  const nodeKindsById = new Map(current.nodes.map((node) => [node.id, node.kind]))
   /** 当前步骤的边端点，用于 remove-node 模拟 reducer 的级联删除。 */
   const currentEdges = new Map(current.edges.map((edge) => [edge.id, {
     sourceNodeId: edge.sourceNodeId,
@@ -695,6 +828,7 @@ function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]):
         if (upsertedNodeIds.has(node.id)) throw new Error('CANVAS_MUTATION_INVALID')
         upsertedNodeIds.add(node.id)
         currentNodeIds.add(node.id)
+        nodeKindsById.set(node.id, node.kind)
       }
       continue
     }
@@ -706,11 +840,21 @@ function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]):
       ))
       for (const nodeId of removedNodeIds) {
         currentNodeIds.delete(nodeId)
+        nodeKindsById.delete(nodeId)
         /** 只访问该节点真实相连的边，每条边最多随端点删除一次。 */
         for (const edgeId of [...(edgeIdsByNodeId.get(nodeId) ?? [])]) {
           removeCurrentEdge(edgeId)
         }
         edgeIdsByNodeId.delete(nodeId)
+      }
+      continue
+    }
+    if (mutation.type === 'set-webview-device-preset'
+      && hasExactKeys(mutation, ['type', 'nodeId', 'devicePreset'])
+      && isSafeDesignStableId(mutation.nodeId)
+      && (mutation.devicePreset === 'desktop' || mutation.devicePreset === 'mobile')) {
+      if (nodeKindsById.get(mutation.nodeId) !== 'webview') {
+        throw new Error('CANVAS_MUTATION_INVALID')
       }
       continue
     }
@@ -1076,7 +1220,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     paths: CanvasPaths,
     directoryIdentity: CanvasDirectoryScopeIdentity,
     filePath: string,
-    persistencePayload: CanvasDocument | LegacyCanvasDocument,
+    persistencePayload: ParsedCanvasDocument['persistencePayload'],
     writeOptions: Pick<CanvasSecureWriteOptions, 'expectedDestination' | 'priorBackup'> = {},
   ): void {
     if (dirname(filePath) !== paths.canvasRoot) {

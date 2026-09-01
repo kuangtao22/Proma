@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
+import { applyCanvasMutations, createEmptyCanvasDocument, parseCanvasTrashEntry } from '@proma/shared'
 import type {
   CanvasContentKind,
   CanvasDocument,
@@ -28,6 +28,8 @@ function createFixture(options: {
   const intents = new Map<string, CanvasContentNodeIntent>()
   /** 回收区的公开业务条目。 */
   const trash = new Map<string, CanvasTrashEntry>()
+  /** 共享内容从回收区回到活动目录的真实物理移动次数。 */
+  let trashRestoreCalls = 0
   /** 已准备的内容身份。 */
   const contents = new Set<string>()
   /** 内容 Store 收到的空内容准备输入。 */
@@ -77,9 +79,17 @@ function createFixture(options: {
       contents.delete(entry.contentId)
       trash.set(entry.trashId, entry)
     },
+    moveManyToTrash: async (_target: object, entries: readonly CanvasTrashEntry[]) => {
+      const firstEntry = entries[0]
+      if (!firstEntry) throw new Error('CANVAS_TRASH_ENTRY_INVALID')
+      imageDeleteCalls.push('move-to-trash')
+      contents.delete(firstEntry.contentId)
+      for (const entry of entries) trash.set(entry.trashId, entry)
+    },
     restoreFromTrash: async (_target: object, trashId: string) => {
       const entry = trash.get(trashId)
       if (!entry) throw new Error('CANVAS_TRASH_ENTRY_NOT_FOUND')
+      if (!contents.has(entry.contentId)) trashRestoreCalls += 1
       contents.add(entry.contentId)
       return entry
     },
@@ -117,6 +127,7 @@ function createFixture(options: {
     preparedInputs,
     running,
     imageDeleteCalls,
+    getTrashRestoreCalls: () => trashRestoreCalls,
     getDocument: () => document,
     setDocument: (next: CanvasDocument) => { document = next },
     getMigrationCommits: () => migrationCommits,
@@ -135,7 +146,7 @@ function createIntentNode(kind: CanvasContentKind, position = { x: 1, y: 2 }): T
   const base = { id: 'node-strict', title: '严格节点', position }
   if (kind === 'image') return { ...base, kind, imageModuleId: 'content-strict' }
   if (kind === 'document') return { ...base, kind, documentId: 'content-strict', contentRevision: 0 }
-  return { ...base, kind, prototypeId: 'content-strict', contentRevision: 0 }
+  return { ...base, kind, prototypeId: 'content-strict', contentRevision: 0, devicePreset: 'desktop' }
 }
 
 describe('CanvasContentNodeLifecycle', () => {
@@ -151,7 +162,7 @@ describe('CanvasContentNodeLifecycle', () => {
 
   test.each(contentKinds)('Given %s 批量删除 When prepare 后 restore Then 复用真实 trash 身份往返', async (kind) => {
     const fixture = createFixture()
-    const entry: CanvasTrashEntry = {
+    const entry = parseCanvasTrashEntry({
       schemaVersion: 1,
       trashId: `trash-batch-${kind}`,
       nodeId: `node-batch-${kind}`,
@@ -161,7 +172,7 @@ describe('CanvasContentNodeLifecycle', () => {
       position: { x: 1, y: 2 },
       deletedRevision: 3,
       deletedAt: 10,
-    }
+    })
     fixture.contents.add(entry.contentId)
     await fixture.service.prepareBatchDeletion(target, entry)
     expect(fixture.contents.has(entry.contentId)).toBe(false)
@@ -205,7 +216,8 @@ describe('CanvasContentNodeLifecycle', () => {
     const identity = node.kind === 'image' ? node.imageModuleId : node.kind === 'document' ? node.documentId : node.prototypeId
     const trashEntry = { schemaVersion: 1, trashId: 'trash-strict', nodeId: node.id, kind, contentId: identity, title: node.title, position: node.position, deletedRevision: 4, deletedAt: 10 } as const
     const base = { schemaVersion: 1, operation: 'delete', state: 'prepared', operationId, ...target, node, expectedRevision: 4, trashId: trashEntry.trashId, trashEntry, createdAt: 10, updatedAt: 10 } as const
-    expect(parseCanvasContentNodeIntent(base, target, operationId).trashEntry).toEqual(trashEntry)
+    /** 历史 schema1 条目在 intent 解析边界统一升级为规范化 schema2。 */
+    expect(parseCanvasContentNodeIntent(base, target, operationId).trashEntry?.schemaVersion).toBe(2)
     const mismatches = [
       { ...base, trashId: 'trash-other' },
       { ...base, trashEntry: { ...trashEntry, kind: kind === 'image' ? 'document' : 'image' } },
@@ -360,12 +372,13 @@ describe('CanvasContentNodeLifecycle', () => {
     fixture.setDocument({
       ...fixture.getDocument(), nodes: [{ id: 'source-1', kind: 'agent', title: '源', position: { x: 0, y: 0 }, agentSessionId: 'session-1' }],
     })
-    const input = { ...target, operationId: '22222222-2222-4222-8222-222222222222', nodeId: 'node-2', kind: 'document' as const, contentId: 'content-2', title: '文档', position: { x: 3, y: 4 }, expectedRevision: 0, relationship: { sourceNodeId: 'source-1', edgeId: 'edge-1' } }
+    const input = { ...target, operationId: '22222222-2222-4222-8222-222222222222', nodeId: 'node-2', kind: 'document' as const, contentId: 'content-2', title: '文档', position: { x: 3, y: 4 }, expectedRevision: 0, relationship: { sourceNodeId: 'source-1', edgeId: 'edge-1', relation: 'derives' as const } }
     const first = await fixture.service.create(input)
     const second = await fixture.service.create(input)
     expect(first.snapshot.document.revision).toBe(1)
     expect(second.snapshot.document.revision).toBe(1)
     expect(second.snapshot.document.edges).toHaveLength(1)
+    expect(second.snapshot.document.edges[0]?.relation).toBe('derives')
     await expect(fixture.service.create({ ...input, title: '冲突' })).rejects.toThrow('CANVAS_OPERATION_CONFLICT')
   })
 
@@ -425,6 +438,63 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(restored.snapshot.document.nodes[0]?.position).toEqual({ x: 8, y: 9 })
     const deletedAgain = await fixture.service.delete({ ...target, nodeId: 'node-3', operationId: '66666666-6666-4666-8666-666666666666', expectedRevision: 3 })
     expect(deletedAgain.trashEntry?.trashId).not.toBe(deleted.trashEntry?.trashId)
+  })
+
+  test.each([
+    {
+      kind: 'image' as const,
+      node: { id: 'image-lossless', kind: 'image' as const, title: '图片', position: { x: 1, y: 2 }, imageModuleId: 'image-content', adoptedAssetId: 'asset-adopted' },
+      contentId: 'image-content',
+    },
+    {
+      kind: 'document' as const,
+      node: { id: 'document-lossless', kind: 'document' as const, title: '文档', position: { x: 3, y: 4 }, documentId: 'document-content', contentRevision: 7 },
+      contentId: 'document-content',
+    },
+    {
+      kind: 'webview' as const,
+      node: { id: 'webview-lossless', kind: 'webview' as const, title: '原型', position: { x: 5, y: 6 }, prototypeId: 'webview-content', contentRevision: 9, devicePreset: 'mobile' as const },
+      contentId: 'webview-content',
+    },
+  ])('Given $kind 真实节点状态 When 删除并恢复 Then v2 trash 与节点状态无损往返', async ({ node, contentId }) => {
+    const fixture = createFixture()
+    /** 直接设置非默认节点状态，证明删除读取真实图事实而非内容默认值。 */
+    fixture.setDocument({ ...fixture.getDocument(), revision: 7, nodes: [node] })
+    fixture.contents.add(contentId)
+
+    const deleted = await fixture.service.delete({
+      ...target, nodeId: node.id,
+      operationId: '71717171-7171-4171-8171-717171717171', expectedRevision: 7,
+    })
+    expect(deleted.trashEntry?.schemaVersion).toBe(2)
+    const restored = await fixture.service.restore({
+      ...target, trashId: deleted.trashEntry!.trashId,
+      operationId: '72727272-7272-4272-8272-727272727272',
+      expectedRevision: 8, position: { x: 20, y: 30 },
+    })
+
+    expect(restored.snapshot.document.nodes[0]).toEqual({
+      ...node,
+      position: { x: 20, y: 30 },
+    })
+  })
+
+  test('Given 回收区有两个共享内容的 WebView 快照 When 分别恢复 Then 两个原节点状态回归且内容只移动一次', async () => {
+    const fixture = createFixture()
+    const entries: CanvasTrashEntry[] = [
+      { schemaVersion: 2, trashId: 'trash-shared-a', nodeId: 'web-shared-a', kind: 'webview', contentId: 'content-shared', title: '原型 A', position: { x: 10, y: 20 }, deletedRevision: 0, deletedAt: 10, contentRevision: 3, devicePreset: 'desktop' },
+      { schemaVersion: 2, trashId: 'trash-shared-b', nodeId: 'web-shared-b', kind: 'webview', contentId: 'content-shared', title: '原型 B', position: { x: 30, y: 40 }, deletedRevision: 0, deletedAt: 10, contentRevision: 7, devicePreset: 'mobile' },
+    ].map(parseCanvasTrashEntry)
+    for (const entry of entries) fixture.trash.set(entry.trashId, entry)
+
+    await fixture.service.restore({ ...target, operationId: '73737373-7373-4373-8373-737373737373', trashId: entries[0]!.trashId, expectedRevision: 0, position: entries[0]!.position })
+    const restored = await fixture.service.restore({ ...target, operationId: '74747474-7474-4474-8474-747474747474', trashId: entries[1]!.trashId, expectedRevision: 1, position: entries[1]!.position })
+
+    expect(restored.snapshot.document.nodes).toEqual([
+      { id: 'web-shared-a', kind: 'webview', title: '原型 A', position: { x: 10, y: 20 }, prototypeId: 'content-shared', contentRevision: 3, devicePreset: 'desktop' },
+      { id: 'web-shared-b', kind: 'webview', title: '原型 B', position: { x: 30, y: 40 }, prototypeId: 'content-shared', contentRevision: 7, devicePreset: 'mobile' },
+    ])
+    expect(fixture.getTrashRestoreCalls()).toBe(1)
   })
 
   test('Given 图片节点有运行任务 When 删除 Then 先取消任务再进入回收事务', async () => {

@@ -20,7 +20,7 @@ function createDocument(): { document: CanvasDocument; target: CanvasImageTarget
     { id: 'agent-1', kind: 'agent', title: 'Agent', position: { x: 0, y: 0 }, agentSessionId: 'session-1' },
     { id: 'image-1', kind: 'image', title: '参考图', position: { x: 0, y: 0 }, imageModuleId: 'module-reference', adoptedAssetId: 'asset-reference' },
     { id: 'document-1', kind: 'document', title: '文档', position: { x: 0, y: 0 }, documentId: 'document-content', contentRevision: 2 },
-    { id: 'webview-1', kind: 'webview', title: '原型', position: { x: 0, y: 0 }, prototypeId: 'prototype-content', contentRevision: 3 },
+    { id: 'webview-1', kind: 'webview', title: '原型', position: { x: 0, y: 0 }, prototypeId: 'prototype-content', contentRevision: 3, devicePreset: 'desktop' },
     { id: 'document-indirect', kind: 'document', title: '间接文档', position: { x: 0, y: 0 }, documentId: 'document-indirect-content', contentRevision: 4 },
   ]
   /** 显式元组避免数组解构把节点 ID 推断为可选值。 */
@@ -31,6 +31,7 @@ function createDocument(): { document: CanvasDocument; target: CanvasImageTarget
   ]
   document.edges = edgePairs.map(([sourceNodeId, targetNodeId], index) => ({
     id: `edge-${index}`, sourceNodeId, sourcePort: 'output', targetNodeId, targetPort: 'input',
+    relation: 'reference',
   }))
   return { document, target }
 }
@@ -76,6 +77,26 @@ describe('Canvas 图片直接输入解析器', () => {
     expect(references.every((reference) => /^[a-f0-9]{64}$/.test(reference.summaryHash))).toBe(true)
   })
 
+  test('Given 非引用语义直接入边 When 解析图片输入 Then 不读取上游事实', async () => {
+    const { document, target } = createDocument()
+    /** 三条直接边分别覆盖不应进入图片提示词的非引用语义。 */
+    document.edges = [
+      { id: 'edge-association', sourceNodeId: 'agent-1', sourcePort: 'output', targetNodeId: target.nodeId, targetPort: 'input', relation: 'association' },
+      { id: 'edge-depends-on', sourceNodeId: 'image-1', sourcePort: 'output', targetNodeId: target.nodeId, targetPort: 'input', relation: 'depends-on' },
+      { id: 'edge-derives', sourceNodeId: 'document-1', sourcePort: 'output', targetNodeId: target.nodeId, targetPort: 'input', relation: 'derives' },
+    ]
+    /** 所有事实读取器在被误调用时立即暴露自动消费回归。 */
+    const resolver = createCanvasImageInputResolver({
+      canvasStore: { requireStableAuthoritativeDocument: () => document },
+      getAgentOutput: async () => { throw new Error('不应读取 Agent') },
+      imageStore: { load: async () => { throw new Error('不应读取图片') } },
+      readDocument: async () => { throw new Error('不应读取文档') },
+      readPrototype: async () => { throw new Error('不应读取原型') },
+    })
+
+    await expect(resolver.resolve(target)).resolves.toEqual([])
+  })
+
   test('Given 直接入边和摘要超过预算 When 解析 Then 引用、文本和媒体均保持硬上限', async () => {
     const { document, target } = createDocument()
     document.nodes = [document.nodes[0]!, ...Array.from({ length: 24 }, (_, index) => ({
@@ -87,12 +108,12 @@ describe('Canvas 图片直接输入解析器', () => {
     }]
     const directEdges = document.nodes.slice(1).map((node, index) => ({
       id: `edge-${index}`, sourceNodeId: node.id, sourcePort: 'output',
-      targetNodeId: target.nodeId, targetPort: 'input',
+      targetNodeId: target.nodeId, targetPort: 'input', relation: 'reference' as const,
     }))
     /** 大量重复边不得扩大候选或实际读取工作量。 */
     document.edges = [...directEdges, ...Array.from({ length: 80 }, (_, index) => ({
       id: `duplicate-${index}`, sourceNodeId: `image-${index % 24}`, sourcePort: 'output',
-      targetNodeId: target.nodeId, targetPort: 'input',
+      targetNodeId: target.nodeId, targetPort: 'input', relation: 'reference' as const,
     }))]
     let imageLoadCount = 0
     let documentReadCount = 0

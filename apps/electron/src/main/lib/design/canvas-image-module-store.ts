@@ -4,8 +4,11 @@ import {
   parseSaveCanvasImageModuleInput,
 } from '@proma/shared'
 import type {
+  CanvasImageArtifactVersion,
   CanvasImageModuleConfig,
   CanvasImageTarget,
+  DesignAsset,
+  DesignJobRecord,
   SaveCanvasImageModuleInput,
 } from '@proma/shared'
 import { runStableDirectoryNative } from '../stable-directory-native-host'
@@ -22,6 +25,54 @@ import type {
 const MAX_IMAGE_CONFIG_LENGTH = 256 * 1024
 /** 图片模块稳定 ID 使用的共享字符边界。 */
 const IMAGE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
+/** 图片版本默认只返回有限历史，避免长生命周期项目无限放大单次读取。 */
+const DEFAULT_IMAGE_VERSION_LIMIT = 100
+
+/** 判断任务是否精确属于目标图片模块。 */
+function isOwnedCanvasImageJob(job: DesignJobRecord, target: CanvasImageTarget): boolean {
+  return job.projectId === target.projectId
+    && job.target?.kind === 'canvas-image'
+    && job.target.canvasId === target.canvasId
+    && job.target.nodeId === target.nodeId
+    && job.target.imageModuleId === target.imageModuleId
+}
+
+/**
+ * 从现有 Job 与素材事实派生有限图片版本，不创建第二份 revision 数据。
+ * @param target 图片模块完整身份。
+ * @param jobs 项目或模块现有任务列表。
+ * @param assets 项目现有素材列表。
+ * @param limit 最多返回的版本数量。
+ * @returns 去重且按创建时间稳定倒序的合法成功版本。
+ */
+export function deriveCanvasImageArtifactVersions(
+  target: CanvasImageTarget,
+  jobs: readonly DesignJobRecord[],
+  assets: readonly DesignAsset[],
+  limit = DEFAULT_IMAGE_VERSION_LIMIT,
+): CanvasImageArtifactVersion[] {
+  /** 有限上限必须是安全正整数，非法调用不允许退化为无限列表。 */
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('CANVAS_IMAGE_VERSION_LIMIT_INVALID')
+  /** 素材 ID 索引让任务与输出关联保持 O(jobs + assets)。 */
+  const assetsById = new Map(assets.map((asset) => [asset.id, asset]))
+  /** 已收录素材用于防止多个异常任务重复声明同一输出。 */
+  const seenAssetIds = new Set<string>()
+  /** 只保留可由当前任务和仍存在素材共同证明的版本。 */
+  const versions: CanvasImageArtifactVersion[] = []
+  for (const job of jobs) {
+    if (job.status !== 'succeeded' || !job.outputAssetId || !isOwnedCanvasImageJob(job, target)) continue
+    /** 素材必须仍存在且来源任务精确匹配。 */
+    const asset = assetsById.get(job.outputAssetId)
+    if (!asset || asset.sourceJobId !== job.id || seenAssetIds.has(asset.id)) continue
+    seenAssetIds.add(asset.id)
+    versions.push({ jobId: job.id, assetId: asset.id, createdAt: asset.createdAt })
+  }
+  return versions
+    .sort((left, right) => right.createdAt - left.createdAt
+      || left.assetId.localeCompare(right.assetId)
+      || left.jobId.localeCompare(right.jobId))
+    .slice(0, limit)
+}
 
 /** Canvas 图片模块的权威配置接口。 */
 export interface CanvasImageModuleStore {

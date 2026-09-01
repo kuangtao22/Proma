@@ -16,11 +16,12 @@ import {
 /** 创建文档回收条目，保持测试身份稳定。 */
 function createTrashEntry(): CanvasTrashEntry {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     trashId: 'trash-1',
     nodeId: 'document-1',
     kind: 'document',
     contentId: 'content-1',
+    contentRevision: 0,
     title: '需求文档',
     position: { x: 40, y: 80 },
     deletedRevision: 3,
@@ -32,7 +33,7 @@ function createTrashEntry(): CanvasTrashEntry {
 function createTrashRestoreSnapshot(revision: number): CanvasWorkspaceSnapshot {
   return {
     document: {
-      schemaVersion: 2, projectId: 'project-1', canvasId: 'canvas-1', revision,
+      schemaVersion: 4, projectId: 'project-1', canvasId: 'canvas-1', revision,
       createdAt: 1, updatedAt: 2, viewport: { x: 0, y: 0, zoom: 1 }, nodes: [], edges: [],
     },
     writable: true,
@@ -69,7 +70,7 @@ function createTrashListHarness(listTrash: () => Promise<CanvasTrashEntry[]>) {
     restoreNode: async () => ({
       snapshot: {
         document: {
-          schemaVersion: 2, projectId: 'project-1', canvasId: 'canvas-1', revision: 5,
+          schemaVersion: 4, projectId: 'project-1', canvasId: 'canvas-1', revision: 5,
           createdAt: 1, updatedAt: 2, viewport: { x: 0, y: 0, zoom: 1 }, nodes: [], edges: [],
         },
         writable: true,
@@ -78,7 +79,7 @@ function createTrashListHarness(listTrash: () => Promise<CanvasTrashEntry[]>) {
     }),
     createId: () => 'operation-1',
     getDocument: () => ({
-      schemaVersion: 2, projectId: 'project-1', canvasId: 'canvas-1', revision: 4,
+      schemaVersion: 4, projectId: 'project-1', canvasId: 'canvas-1', revision: 4,
       createdAt: 1, updatedAt: 1, viewport: { x: 0, y: 0, zoom: 1 }, nodes: [], edges: [],
     }),
     getEmptyCanvasCenter: () => ({ x: 0, y: 0 }),
@@ -97,7 +98,7 @@ describe('原生 Canvas 回收区', () => {
       restoreNode: async () => { throw new Error('not called') },
       createId: () => 'operation-1',
       getDocument: () => ({
-        schemaVersion: 2, projectId: 'project-1', canvasId: 'canvas-1', revision: 1,
+        schemaVersion: 4, projectId: 'project-1', canvasId: 'canvas-1', revision: 1,
         createdAt: 1, updatedAt: 1, viewport: { x: 0, y: 0, zoom: 1 }, nodes: [], edges: [],
       }),
       getEmptyCanvasCenter: () => ({ x: 0, y: 0 }),
@@ -110,7 +111,7 @@ describe('原生 Canvas 回收区', () => {
   test('Given 原位置被占用 When 恢复 Then 显式使用全局最右追加位置', () => {
     const entry = createTrashEntry()
     const document: CanvasDocument = {
-      schemaVersion: 2,
+      schemaVersion: 4,
       projectId: 'project-1',
       canvasId: 'canvas-1',
       revision: 4,
@@ -172,7 +173,7 @@ describe('原生 Canvas 回收区', () => {
         return {
           snapshot: {
             document: {
-              schemaVersion: 2, projectId: 'project-1', canvasId: 'canvas-1', revision: 5,
+              schemaVersion: 4, projectId: 'project-1', canvasId: 'canvas-1', revision: 5,
               createdAt: 1, updatedAt: 2, viewport: { x: 10, y: 20, zoom: 1.2 }, nodes: [], edges: [],
             },
             writable: true,
@@ -183,7 +184,7 @@ describe('原生 Canvas 回收区', () => {
       },
       createId: () => 'operation-1',
       getDocument: () => ({
-        schemaVersion: 2, projectId: 'project-1', canvasId: 'canvas-1', revision: 4,
+        schemaVersion: 4, projectId: 'project-1', canvasId: 'canvas-1', revision: 4,
         createdAt: 1, updatedAt: 1, viewport: { x: 10, y: 20, zoom: 1.2 }, nodes: [], edges: [],
       }),
       getEmptyCanvasCenter: () => ({ x: 0, y: 0 }),
@@ -245,7 +246,7 @@ describe('原生 Canvas 回收区', () => {
       restoreNode: () => restore.promise,
       createId: () => 'operation-1',
       getDocument: () => ({
-        schemaVersion: 2, projectId: 'project-1', canvasId: 'canvas-1', revision: 4,
+        schemaVersion: 4, projectId: 'project-1', canvasId: 'canvas-1', revision: 4,
         createdAt: 1, updatedAt: 1, viewport: { x: 0, y: 0, zoom: 1 }, nodes: [], edges: [],
       }),
       getEmptyCanvasCenter: () => ({ x: 0, y: 0 }),

@@ -1,9 +1,20 @@
-import { applyCanvasMutations } from '@proma/shared'
+import {
+  applyCanvasMutations,
+  createCanvasLayoutSpatialIndex,
+  findCompactCanvasSlot,
+} from '@proma/shared'
 import type {
+  CanvasLayoutRect,
   CanvasImagePreview,
+  CanvasWebviewDevicePreset,
+  CanvasWebviewPreviewSnapshot,
+  CanvasWebviewPreviewTarget,
   CanvasDocument,
   CanvasEdge,
+  CanvasEdgeRelation,
   CanvasMutation,
+  CanvasNode,
+  CanvasNodeActivityState,
   CanvasNodeKind,
   CanvasNodeIssue,
   DesignPoint,
@@ -15,10 +26,26 @@ import { AGENT_STATUS_LABELS } from './CanvasAgentNode'
 import type { CanvasAgentFlowData, CanvasAgentFlowNode } from './CanvasAgentNode'
 import type { CanvasNodeCardData, CanvasNodeFlowData } from './CanvasNodeCard'
 
+/** Canvas 语义边在画布上的稳定中文标签。 */
+const CANVAS_EDGE_RELATION_LABELS: Readonly<Record<CanvasEdgeRelation, string>> = {
+  association: '关联',
+  reference: '引用',
+  'depends-on': '依赖',
+  derives: '衍生',
+}
+
 /** 首版原生 Canvas 节点固定宽度，避免状态变化引发重排。 */
 export const NATIVE_CANVAS_NODE_WIDTH = 288
 /** 首版原生 Canvas 节点固定高度。 */
 export const NATIVE_CANVAS_NODE_HEIGHT = 144
+/** 网页 WebView 卡片固定宽度。 */
+export const NATIVE_CANVAS_WEBVIEW_DESKTOP_WIDTH = 384
+/** 网页 WebView 卡片固定高度。 */
+export const NATIVE_CANVAS_WEBVIEW_DESKTOP_HEIGHT = 316
+/** 手机 WebView 卡片固定宽度。 */
+export const NATIVE_CANVAS_WEBVIEW_MOBILE_WIDTH = 232
+/** 手机 WebView 卡片固定高度。 */
+export const NATIVE_CANVAS_WEBVIEW_MOBILE_HEIGHT = 578
 /** 生图卡片标题栏固定高度，预览比例只改变内容区。 */
 export const NATIVE_CANVAS_NODE_HEADER_HEIGHT = 48
 /** 极宽图片仍保留可辨识的最小预览高度。 */
@@ -30,11 +57,67 @@ export const NATIVE_CANVAS_NODE_GAP = 24
 /** 新节点避让只依赖已有节点的持久化位置。 */
 export interface NativeCanvasPositionedNode {
   position: DesignPoint
+  kind?: CanvasNodeKind
+  devicePreset?: 'desktop' | 'mobile'
+  /** 已知动态卡片宽度优先于类型默认值。 */
+  nodeWidth?: number
+  /** 已知动态卡片高度优先于类型默认值。 */
+  nodeHeight?: number
 }
 
 /** 扩展落点需要同时读取稳定节点 ID 和持久化位置。 */
 export interface NativeCanvasIdentifiedPositionedNode extends NativeCanvasPositionedNode {
   id: string
+}
+
+/** Canvas 节点在世界坐标中使用的稳定矩形尺寸。 */
+export interface NativeCanvasNodeSize {
+  width: number
+  height: number
+}
+
+/**
+ * 解析节点类型对应的稳定卡片尺寸。
+ * @param node 至少包含节点类别；WebView 同时读取设备预设。
+ * @returns 画布布局、Handle 与卡片共同使用的宽高。
+ */
+export function resolveNativeCanvasNodeSize(
+  node: Pick<NativeCanvasPositionedNode, 'kind' | 'devicePreset' | 'nodeWidth' | 'nodeHeight'>,
+): NativeCanvasNodeSize {
+  /** 有限正数的投影尺寸代表 Renderer 当前最准确的卡片几何。 */
+  const explicitWidth = Number.isFinite(node.nodeWidth) && (node.nodeWidth ?? 0) > 0
+    ? node.nodeWidth
+    : undefined
+  /** 生图比例等动态高度由投影层显式传入。 */
+  const explicitHeight = Number.isFinite(node.nodeHeight) && (node.nodeHeight ?? 0) > 0
+    ? node.nodeHeight
+    : undefined
+  if (explicitWidth !== undefined && explicitHeight !== undefined) {
+    return { width: explicitWidth, height: explicitHeight }
+  }
+  if (node.kind !== 'webview') {
+    return {
+      width: explicitWidth ?? NATIVE_CANVAS_NODE_WIDTH,
+      height: explicitHeight ?? NATIVE_CANVAS_NODE_HEIGHT,
+    }
+  }
+  const preset = node.devicePreset === 'mobile'
+    ? { width: NATIVE_CANVAS_WEBVIEW_MOBILE_WIDTH, height: NATIVE_CANVAS_WEBVIEW_MOBILE_HEIGHT }
+    : { width: NATIVE_CANVAS_WEBVIEW_DESKTOP_WIDTH, height: NATIVE_CANVAS_WEBVIEW_DESKTOP_HEIGHT }
+  return { width: explicitWidth ?? preset.width, height: explicitHeight ?? preset.height }
+}
+
+/** 将 Renderer 已知节点转换为共享布局矩形。 */
+function toNativeCanvasLayoutRects(
+  nodes: ReadonlyArray<NativeCanvasPositionedNode>,
+): CanvasLayoutRect[] {
+  return nodes.map((node, index) => {
+    /** 动态图片和 WebView 尺寸只在此处解析一次。 */
+    const size = resolveNativeCanvasNodeSize(node)
+    /** 无 ID 的旧调用使用稳定数组序号，仅用于本次内存碰撞查询。 */
+    const id = 'id' in node && typeof node.id === 'string' ? node.id : `node-${index}`
+    return { id, ...node.position, ...size }
+  })
 }
 
 /**
@@ -58,7 +141,8 @@ export function findNativeCanvasGlobalAppendPosition(
   /** 一次线性扫描得到全局最右边界，独立于当前 viewport。 */
   let maxRight = Number.NEGATIVE_INFINITY
   for (const node of nodes) {
-    maxRight = Math.max(maxRight, node.position.x + NATIVE_CANVAS_NODE_WIDTH)
+    const nodeSize = resolveNativeCanvasNodeSize(node)
+    maxRight = Math.max(maxRight, node.position.x + nodeSize.width)
   }
   /** 顶部新增始终固定在全局最右侧的新列。 */
   const appendX = maxRight + NATIVE_CANVAS_NODE_GAP
@@ -81,27 +165,39 @@ export function findNativeCanvasGlobalAppendPosition(
 export function overlapsNativeCanvasNodes(
   candidate: DesignPoint,
   nodes: ReadonlyArray<NativeCanvasPositionedNode>,
+  candidateNode: Pick<NativeCanvasPositionedNode, 'kind' | 'devicePreset'> = {},
 ): boolean {
-  /** 固定卡片水平方向包含节点宽度与最小间距。 */
-  const horizontalStep = NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP
-  /** 固定卡片纵向包含节点高度与最小间距。 */
-  const verticalStep = NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP
-  return nodes.some((node) => (
-    Math.abs(candidate.x - node.position.x) < horizontalStep
-    && Math.abs(candidate.y - node.position.y) < verticalStep
-  ))
+  /** 候选尺寸与既有节点尺寸共同决定真实矩形是否侵入最小间距。 */
+  const candidateSize = resolveNativeCanvasNodeSize(candidateNode)
+  return nodes.some((node) => {
+    const nodeSize = resolveNativeCanvasNodeSize(node)
+    return candidate.x < node.position.x + nodeSize.width + NATIVE_CANVAS_NODE_GAP
+      && candidate.x + candidateSize.width + NATIVE_CANVAS_NODE_GAP > node.position.x
+      && candidate.y < node.position.y + nodeSize.height + NATIVE_CANVAS_NODE_GAP
+      && candidate.y + candidateSize.height + NATIVE_CANVAS_NODE_GAP > node.position.y
+  })
 }
 
 /** 四类节点投影使用的运行时状态和轻量命令能力。 */
 export interface NativeCanvasProjectionOptions {
   nodeIssues: CanvasNodeIssue[]
   runningSessionIds: ReadonlySet<string>
+  /** Workspace 已按节点 ID 聚合的最终瞬时活动状态。 */
+  nodeActivityStates?: ReadonlyMap<string, CanvasNodeActivityState>
+  /** 图片候选只改变卡片标记，不替换 adopted 缩略图。 */
+  imageCandidateStates?: ReadonlyMap<string, 'new-version' | 'partial'>
   /** 工作区共享的素材预览索引，节点投影不得自行加载图片模块。 */
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
   canCreateChild: boolean
   onCreateChild: (nodeId: string, kind: CanvasNodeKind) => void
   onReferenceNode?: (nodeId: string) => void
   onWorkbenchNodeChange: (nodeId: string) => void
+  /** WebView 折叠卡片只加载主进程生成的静态预览。 */
+  loadCanvasWebviewPreview?: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
+  /** 设备预设仍在保存中的 WebView 节点不得提前请求新设备预览。 */
+  pendingWebviewDeviceNodeIds?: ReadonlySet<string>
+  /** 设备切换只提交图 mutation，不调用 Agent。 */
+  onWebviewDevicePresetChange?: (nodeId: string, devicePreset: CanvasWebviewDevicePreset) => void
 }
 
 /** 默认投影不暴露运行态或扩展命令，保持纯文档调用兼容。 */
@@ -122,6 +218,13 @@ export interface NativeCanvasContentNodeData extends CanvasNodeCardData {
   documentId?: string
   prototypeId?: string
   contentRevision?: number
+  devicePreset?: 'desktop' | 'mobile'
+  nodeWidth?: number
+  nodeHeight?: number
+  webviewPreviewTarget?: CanvasWebviewPreviewTarget
+  webviewPreviewRequestReady?: boolean
+  loadCanvasWebviewPreview?: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
+  onWebviewDevicePresetChange?: (nodeId: string, devicePreset: CanvasWebviewDevicePreset) => void
 }
 
 /** 非 Agent 展示数据与 XYFlow 索引签名要求之间的适配类型。 */
@@ -171,51 +274,24 @@ export function resolveNativeCanvasImageNodeHeight(
 export function findAvailableNativeCanvasNodePosition(
   visibleCenter: DesignPoint,
   nodes: ReadonlyArray<NativeCanvasPositionedNode>,
+  candidateNode: Pick<NativeCanvasPositionedNode, 'kind' | 'devicePreset' | 'nodeWidth' | 'nodeHeight'> = {},
 ): DesignPoint {
-  /** 首选位置让节点本身居中，而不是让节点左上角落在视口中心。 */
-  const origin = {
-    x: visibleCenter.x - NATIVE_CANVAS_NODE_WIDTH / 2,
-    y: visibleCenter.y - NATIVE_CANVAS_NODE_HEIGHT / 2,
+  /** 候选真实尺寸决定其左上角如何围绕视口中心布局。 */
+  const candidateSize = resolveNativeCanvasNodeSize(candidateNode)
+  /** 视口中心转换为候选左上角锚点，避免不同类型视觉中心偏移。 */
+  const anchor = {
+    x: visibleCenter.x - candidateSize.width / 2,
+    y: visibleCenter.y - candidateSize.height / 2,
   }
-  /** 相邻网格列之间的固定跨度。 */
-  const horizontalStep = NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP
-  /** 相邻网格行之间的固定跨度。 */
-  const verticalStep = NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP
-  /** 单个任意位置节点最多阻塞相邻四个网格候选，因此检查 4N+1 个即可找到空位。 */
-  const candidateLimit = nodes.length * 4 + 1
-  /** 已检查候选数包含中心原点。 */
-  let inspectedCandidates = 1
-
-  /** 将整数网格偏移转换为真实世界坐标。 */
-  const resolveCandidate = (gridX: number, gridY: number): DesignPoint => ({
-    x: origin.x + gridX * horizontalStep,
-    y: origin.y + gridY * verticalStep,
-  })
-  /** 按顺时针顺序检查单个方形环，首个候选固定在中心右侧。 */
-  const createRingOffsets = (radius: number): DesignPoint[] => {
-    /** 当前半径上的全部整数网格偏移。 */
-    const offsets: DesignPoint[] = [{ x: radius, y: 0 }]
-    for (let y = 1; y <= radius; y += 1) offsets.push({ x: radius, y })
-    for (let x = radius - 1; x >= -radius; x -= 1) offsets.push({ x, y: radius })
-    for (let y = radius - 1; y >= -radius; y -= 1) offsets.push({ x: -radius, y })
-    for (let x = -radius + 1; x <= radius; x += 1) offsets.push({ x, y: -radius })
-    for (let y = -radius + 1; y < 0; y += 1) offsets.push({ x: radius, y })
-    return offsets
-  }
-
-  if (!overlapsNativeCanvasNodes(origin, nodes)) return origin
-  for (let radius = 1; inspectedCandidates <= candidateLimit; radius += 1) {
-    /** 当前环按用户最常用的从左到右流程优先检查右侧位置。 */
-    const offsets = createRingOffsets(radius)
-    for (const offset of offsets) {
-      /** 当前网格偏移对应的真实候选位置。 */
-      const candidate = resolveCandidate(offset.x, offset.y)
-      inspectedCandidates += 1
-      if (!overlapsNativeCanvasNodes(candidate, nodes)) return candidate
-      if (inspectedCandidates > candidateLimit) break
-    }
-  }
-  throw new Error('Canvas 节点落点计算失败')
+  return findCompactCanvasSlot(
+    createCanvasLayoutSpatialIndex(toNativeCanvasLayoutRects(nodes), NATIVE_CANVAS_NODE_GAP),
+    {
+      anchor,
+      size: candidateSize,
+      order: 0,
+      direction: 'ring',
+    },
+  )
 }
 
 /**
@@ -227,23 +303,28 @@ export function findAvailableNativeCanvasNodePosition(
 export function findAvailableNativeCanvasChildPosition(
   sourceNodeId: string,
   nodes: ReadonlyArray<NativeCanvasIdentifiedPositionedNode>,
+  candidateNode: Pick<NativeCanvasPositionedNode, 'kind' | 'devicePreset' | 'nodeWidth' | 'nodeHeight'> = {},
 ): DesignPoint {
   /** 源节点必须来自当前权威文档，禁止为迟到命令猜测位置。 */
   const source = nodes.find((node) => node.id === sourceNodeId)
   if (!source) throw new Error('Canvas 扩展源节点不存在')
   /** 扩展默认从源节点正右侧开始。 */
+  const sourceSize = resolveNativeCanvasNodeSize(source)
   const start = {
-    x: source.position.x + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
+    x: source.position.x + sourceSize.width + NATIVE_CANVAS_NODE_GAP,
     y: source.position.y,
   }
-  /** 纵向避让间距与当前固定卡片尺寸对齐。 */
-  const verticalStep = NATIVE_CANVAS_NODE_HEIGHT + NATIVE_CANVAS_NODE_GAP
-  for (let row = 0; row <= nodes.length; row += 1) {
-    /** 候选始终位于同一右侧列，避免扩展关系在画布上来回跳跃。 */
-    const candidate = { x: start.x, y: start.y + row * verticalStep }
-    if (!overlapsNativeCanvasNodes(candidate, nodes)) return candidate
-  }
-  throw new Error('Canvas 扩展落点计算失败')
+  /** 目标类型的真实尺寸参与同源兄弟槽位避让。 */
+  const candidateSize = resolveNativeCanvasNodeSize(candidateNode)
+  return findCompactCanvasSlot(
+    createCanvasLayoutSpatialIndex(toNativeCanvasLayoutRects(nodes), NATIVE_CANVAS_NODE_GAP),
+    {
+      anchor: start,
+      size: candidateSize,
+      order: 0,
+      direction: 'right',
+    },
+  )
 }
 
 /** 将持久节点投影为固定尺寸且无消息读取能力的 XYFlow 节点。 */
@@ -253,15 +334,16 @@ export function toNativeCanvasFlowNodes(
 ): NativeCanvasFlowNode[] {
   /** 节点问题先建索引，避免大画布逐节点线性扫描全部问题。 */
   const unavailableNodeIds = new Set(options.nodeIssues.map((issue) => issue.nodeId))
-  /** 每个节点高度只计算一次，节点本体和静态 Handle 共用同一几何事实。 */
-  const nodeHeightById = new Map(document.nodes.map((node) => {
+  /** 每个节点尺寸只计算一次，节点本体和静态 Handle 共用同一几何事实。 */
+  const nodeSizeById = new Map(document.nodes.map((node) => {
     /** 只有已采用素材且预览索引命中时，生图节点才使用动态比例。 */
     const preview = node.kind === 'image' && node.adoptedAssetId
       ? options.imagePreviews?.get(node.adoptedAssetId)
       : undefined
+    const baseSize = resolveNativeCanvasNodeSize(node)
     return [node.id, node.kind === 'image'
-      ? resolveNativeCanvasImageNodeHeight(preview)
-      : NATIVE_CANVAS_NODE_HEIGHT] as const
+      ? { ...baseSize, height: resolveNativeCanvasImageNodeHeight(preview) }
+      : baseSize] as const
   }))
   /** 仅为真实边涉及的节点建立端口索引，避免无边大画布节点承担 handle 成本。 */
   const handlesByNodeId = new Map<string, NodeHandle[]>()
@@ -275,33 +357,35 @@ export function toNativeCanvasFlowNodes(
   }
   for (const edge of document.edges) {
     /** 源节点当前高度决定输出 Handle 的垂直中点。 */
-    const sourceHeight = nodeHeightById.get(edge.sourceNodeId) ?? NATIVE_CANVAS_NODE_HEIGHT
+    const sourceSize = nodeSizeById.get(edge.sourceNodeId)
     /** 目标节点当前高度决定输入 Handle 的垂直中点。 */
-    const targetHeight = nodeHeightById.get(edge.targetNodeId) ?? NATIVE_CANVAS_NODE_HEIGHT
+    const targetSize = nodeSizeById.get(edge.targetNodeId)
     appendHandle(edge.sourceNodeId, {
       id: edge.sourcePort,
       type: 'source',
       position: Position.Right,
-      x: NATIVE_CANVAS_NODE_WIDTH,
-      y: sourceHeight / 2,
+      x: sourceSize?.width ?? NATIVE_CANVAS_NODE_WIDTH,
+      y: (sourceSize?.height ?? NATIVE_CANVAS_NODE_HEIGHT) / 2,
     })
     appendHandle(edge.targetNodeId, {
       id: edge.targetPort,
       type: 'target',
       position: Position.Left,
       x: 0,
-      y: targetHeight / 2,
+      y: (targetSize?.height ?? NATIVE_CANVAS_NODE_HEIGHT) / 2,
     })
   }
   return document.nodes.map((node): NativeCanvasFlowNode => {
     /** 投影尺寸复用预先计算结果，避免边和节点使用不同高度。 */
-    const nodeHeight = nodeHeightById.get(node.id) ?? NATIVE_CANVAS_NODE_HEIGHT
+    const nodeSize = nodeSizeById.get(node.id) ?? resolveNativeCanvasNodeSize(node)
+    /** 活动映射按节点 ID 常量时间查询，未命中节点保持零动画的空闲态。 */
+    const activityState = options.nodeActivityStates?.get(node.id) ?? 'idle'
     /** 四类节点共享稳定布局；无边节点继续显式空 handles 以支持可见区裁剪。 */
     const base = {
       id: node.id,
       position: node.position,
-      width: NATIVE_CANVAS_NODE_WIDTH,
-      height: nodeHeight,
+      width: nodeSize.width,
+      height: nodeSize.height,
       handles: handlesByNodeId.get(node.id) ?? [],
     }
     if (node.kind === 'agent') {
@@ -318,6 +402,7 @@ export function toNativeCanvasFlowNodes(
         kind: node.kind,
         title: node.title,
         agentSessionId: node.agentSessionId,
+        activityState,
         status,
         statusLabel: AGENT_STATUS_LABELS[status],
         summary: unavailable ? '需要重建或删除节点' : '独立 Agent 会话',
@@ -342,8 +427,10 @@ export function toNativeCanvasFlowNodes(
           kind: node.kind,
           title: node.title,
           imageModuleId: node.imageModuleId,
+          activityState,
+          candidateState: options.imageCandidateStates?.get(node.id),
           ...(node.adoptedAssetId ? { adoptedAssetId: node.adoptedAssetId } : {}),
-          ...(preview ? { previewUrl: preview.previewUrl, nodeHeight } : {}),
+          ...(preview ? { previewUrl: preview.previewUrl, nodeHeight: nodeSize.height } : {}),
           statusLabel: node.adoptedAssetId ? '已有素材' : '待创作',
           summary: node.adoptedAssetId ? '已采用画布素材' : '尚未生成图片',
           canOpenWorkbench: true,
@@ -363,6 +450,7 @@ export function toNativeCanvasFlowNodes(
           kind: node.kind,
           title: node.title,
           documentId: node.documentId,
+          activityState,
           contentRevision: node.contentRevision,
           statusLabel: '已创建',
           summary: `内容版本 ${node.contentRevision}`,
@@ -382,7 +470,26 @@ export function toNativeCanvasFlowNodes(
         kind: node.kind,
         title: node.title,
         prototypeId: node.prototypeId,
+        activityState,
         contentRevision: node.contentRevision,
+        devicePreset: node.devicePreset,
+        nodeWidth: nodeSize.width,
+        nodeHeight: nodeSize.height,
+        webviewPreviewTarget: {
+          projectId: document.projectId,
+          canvasId: document.canvasId,
+          nodeId: node.id,
+          prototypeId: node.prototypeId,
+          contentRevision: node.contentRevision,
+          devicePreset: node.devicePreset,
+        },
+        webviewPreviewRequestReady: !options.pendingWebviewDeviceNodeIds?.has(node.id),
+        ...(options.loadCanvasWebviewPreview
+          ? { loadCanvasWebviewPreview: options.loadCanvasWebviewPreview }
+          : {}),
+        ...(options.onWebviewDevicePresetChange
+          ? { onWebviewDevicePresetChange: options.onWebviewDevicePresetChange }
+          : {}),
         statusLabel: '已创建',
         summary: `内容版本 ${node.contentRevision}`,
         canOpenWorkbench: true,
@@ -407,7 +514,18 @@ export function toNativeCanvasFlowEdges(document: CanvasDocument): Edge[] {
     deletable: false,
     focusable: false,
     animated: false,
+    data: { relation: edge.relation },
+    label: CANVAS_EDGE_RELATION_LABELS[edge.relation],
   }))
+}
+
+/**
+ * 为用户手动拖线构造默认关联边。
+ * @param edge 不含语义的稳定端口边。
+ * @returns 明确携带 association 的持久 Canvas 边。
+ */
+export function createNativeCanvasUserEdge(edge: Omit<CanvasEdge, 'relation'>): CanvasEdge {
+  return { ...edge, relation: 'association' }
 }
 
 /** 将一次拖动中的全部节点位置合成单个 mutation。 */
@@ -418,6 +536,110 @@ export function createMoveCanvasNodesMutation(
     type: 'move-nodes',
     positions: nodes.map((node) => ({ nodeId: node.id, position: node.position })),
   }
+}
+
+/** 只有衍生与依赖关系参与整理层级，引用和关联不强迫左右方向。 */
+function isDirectedCanvasLayoutRelation(relation: CanvasEdgeRelation): boolean {
+  return relation === 'derives' || relation === 'depends-on'
+}
+
+/**
+ * 为指定范围建立确定性紧凑位置 mutation，运行或等待审批节点保持原位。
+ * @param document 当前权威 Canvas 文档。
+ * @param scopeNodeIds 用户明确选择的整理范围。
+ * @param blockedNodeIds 当前不可移动的节点集合。
+ * @returns 只包含真实位置变化的单个 move-nodes mutation。
+ */
+export function createArrangeCanvasNodesMutation(
+  document: CanvasDocument,
+  scopeNodeIds: readonly string[],
+  blockedNodeIds: ReadonlySet<string>,
+): Extract<CanvasMutation, { type: 'move-nodes' }> {
+  /** 范围去重并按稳定节点 ID 排序，调用方传入顺序不影响结果。 */
+  const scope = new Set(scopeNodeIds)
+  /** 真正参与移动的节点必须存在、在范围内且没有活动阻断。 */
+  const movableNodes = document.nodes
+    .filter((node) => scope.has(node.id) && !blockedNodeIds.has(node.id))
+    .sort((left, right) => left.id.localeCompare(right.id))
+  if (movableNodes.length === 0) return { type: 'move-nodes', positions: [] }
+
+  /** 范围外节点和阻断节点作为不可穿越的固定障碍。 */
+  const movableIds = new Set(movableNodes.map((node) => node.id))
+  const fixedRects: CanvasLayoutRect[] = document.nodes
+    .filter((node) => !movableIds.has(node.id))
+    .map((node) => ({ ...node.position, ...resolveNativeCanvasNodeSize(node), id: node.id }))
+  const index = createCanvasLayoutSpatialIndex(fixedRects, NATIVE_CANVAS_NODE_GAP)
+
+  /** 每个节点的入边列表用于计算最长前驱层级。 */
+  const incomingByNodeId = new Map<string, string[]>()
+  for (const edge of document.edges) {
+    if (!isDirectedCanvasLayoutRelation(edge.relation)
+      || !movableIds.has(edge.sourceNodeId)
+      || !movableIds.has(edge.targetNodeId)) continue
+    const incoming = incomingByNodeId.get(edge.targetNodeId) ?? []
+    incoming.push(edge.sourceNodeId)
+    incomingByNodeId.set(edge.targetNodeId, incoming)
+  }
+  /** 递归层级遇到循环时回退当前层，保证坏图也能有限完成。 */
+  const layerByNodeId = new Map<string, number>()
+  const resolving = new Set<string>()
+  const resolveLayer = (nodeId: string): number => {
+    const cached = layerByNodeId.get(nodeId)
+    if (cached !== undefined) return cached
+    if (resolving.has(nodeId)) return 0
+    resolving.add(nodeId)
+    const incoming = incomingByNodeId.get(nodeId) ?? []
+    const layer = incoming.length === 0
+      ? 0
+      : Math.max(...incoming.map((sourceNodeId) => resolveLayer(sourceNodeId) + 1))
+    resolving.delete(nodeId)
+    layerByNodeId.set(nodeId, layer)
+    return layer
+  }
+  for (const node of movableNodes) resolveLayer(node.id)
+
+  /** 以原范围左上角为锚点，整理不会把整个分组跳到远处。 */
+  const origin = {
+    x: Math.min(...movableNodes.map((node) => node.position.x)),
+    y: Math.min(...movableNodes.map((node) => node.position.y)),
+  }
+  /** 各层最大宽度决定下一层 X，保持有向关系从左到右。 */
+  const layerWidths = new Map<number, number>()
+  for (const node of movableNodes) {
+    const layer = layerByNodeId.get(node.id) ?? 0
+    layerWidths.set(layer, Math.max(layerWidths.get(layer) ?? 0, resolveNativeCanvasNodeSize(node).width))
+  }
+  const sortedLayers = [...new Set(layerByNodeId.values())].sort((left, right) => left - right)
+  const layerX = new Map<number, number>()
+  let nextX = origin.x
+  for (const layer of sortedLayers) {
+    layerX.set(layer, nextX)
+    nextX += (layerWidths.get(layer) ?? NATIVE_CANVAS_NODE_WIDTH) + NATIVE_CANVAS_NODE_GAP
+  }
+
+  /** 同层按 ID 稳定纵向堆叠；固定障碍只让当前项向下寻找，不移动旧节点。 */
+  const nextYByLayer = new Map<number, number>()
+  const positions: Array<{ nodeId: string; position: DesignPoint }> = []
+  for (const node of movableNodes.sort((left, right) => {
+    const layerDifference = (layerByNodeId.get(left.id) ?? 0) - (layerByNodeId.get(right.id) ?? 0)
+    return layerDifference || left.id.localeCompare(right.id)
+  })) {
+    const layer = layerByNodeId.get(node.id) ?? 0
+    const size = resolveNativeCanvasNodeSize(node)
+    const x = layerX.get(layer) ?? origin.x
+    let y = nextYByLayer.get(layer) ?? origin.y
+    /** 搜索次数受节点总数限制，异常密集障碍仍保持有限。 */
+    for (let attempt = 0; attempt <= document.nodes.length; attempt += 1) {
+      if (!index.overlaps({ x, y, ...size })) break
+      y += size.height + NATIVE_CANVAS_NODE_GAP
+    }
+    index.insert({ id: node.id, x, y, ...size })
+    nextYByLayer.set(layer, y + size.height + NATIVE_CANVAS_NODE_GAP)
+    if (node.position.x !== x || node.position.y !== y) {
+      positions.push({ nodeId: node.id, position: { x, y } })
+    }
+  }
+  return { type: 'move-nodes', positions }
 }
 
 /** 将一次视口结束事件转换为持久 mutation。 */

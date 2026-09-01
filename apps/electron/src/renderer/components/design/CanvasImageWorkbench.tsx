@@ -9,6 +9,7 @@ import type {
 } from '@proma/shared'
 import {
   Check,
+  Download,
   History,
   ImageOff,
   LoaderCircle,
@@ -31,9 +32,19 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { DesignTaskDetailsView } from './DesignTaskDetails'
+import {
+  CanvasImageCandidateBatchPanel,
+  type CanvasImageCandidateBatchPanelProps,
+} from './CanvasImageCandidateBatchPanel'
 
 /** Canvas 图片工作台的模型加载状态。 */
 export type CanvasImageModelLoadState = 'idle' | 'loading' | 'ready' | 'failed'
+
+/** Workspace 注入候选批次状态和命令，工作台补充当前节点与预览动作。 */
+export type CanvasImageCandidateBatchWorkbenchProps = Omit<
+  CanvasImageCandidateBatchPanelProps,
+  'writable' | 'focusNodeId' | 'onPreviewAsset'
+>
 
 /** Canvas 图片工作台只接收状态与命令，不直接调用 IPC。 */
 export interface CanvasImageWorkbenchProps {
@@ -48,10 +59,15 @@ export interface CanvasImageWorkbenchProps {
   onRetry: (jobId: string) => void
   onPreviewAsset: (assetId: string) => void
   onAdoptAsset: (assetId: string) => void
+  onExportAsset: (assetId: string) => void
+  exportState: 'idle' | 'exporting'
+  exportError: string | null
   onLoadTaskDetails: (jobId: string, includeTrace: boolean) => void
   onConfigureModels: () => void
   onRetryLoad: () => void
   onCopyPrompt?: (prompt: string) => void
+  /** 当前图片节点所属的活跃候选批次；不存在时不挂载批次 UI。 */
+  candidateBatch?: CanvasImageCandidateBatchWorkbenchProps
 }
 
 /** 项目上下文三态的稳定用户文案。 */
@@ -109,21 +125,6 @@ function createMediaUrl(baseUrl: string, relativePath: string): string {
 /** 按更新时间从新到旧复制任务列表，避免改写权威快照数组。 */
 function sortJobsByRecency(jobs: DesignJobRecord[]): DesignJobRecord[] {
   return [...jobs].sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt)
-}
-
-/** 从成功任务输出派生历史版本，配置不保存重复历史列表。 */
-function createVersionHistory(
-  jobs: DesignJobRecord[],
-  assets: DesignAsset[],
-): Array<{ job: DesignJobRecord, asset: DesignAsset }> {
-  /** 素材索引用于 O(1) 关联任务输出。 */
-  const assetsById = new Map(assets.map((asset) => [asset.id, asset]))
-  return jobs.flatMap((job) => {
-    if (job.status !== 'succeeded' || !job.outputAssetId) return []
-    /** 输出不存在时不渲染破损历史缩略图。 */
-    const asset = assetsById.get(job.outputAssetId)
-    return asset ? [{ job, asset }] : []
-  })
 }
 
 /** 校验 Radix Select 返回值仍属于固定图片尺寸枚举。 */
@@ -207,10 +208,14 @@ export function CanvasImageWorkbench({
   onRetry,
   onPreviewAsset,
   onAdoptAsset,
+  onExportAsset,
+  exportState,
+  exportError,
   onLoadTaskDetails,
   onConfigureModels,
   onRetryLoad,
   onCopyPrompt,
+  candidateBatch,
 }: CanvasImageWorkbenchProps): React.ReactElement {
   /** 当前打开的任务详情仅属于本工作台实例。 */
   const [detailsJobId, setDetailsJobId] = React.useState<string | null>(null)
@@ -251,12 +256,22 @@ export function CanvasImageWorkbench({
   const retryableJob = latestJob && ['failed', 'cancelled', 'interrupted'].includes(latestJob.status)
     ? latestJob
     : undefined
-  /** 历史版本只从成功 Job 与现存素材的交集派生。 */
-  const versions = createVersionHistory(jobs, snapshot.assets)
+  /** 任务索引只用于补充版本按钮文案，不参与决定版本集合。 */
+  const jobsById = new Map(jobs.map((job) => [job.id, job]))
+  /** 素材索引只用于把主进程版本事实解析为安全媒体元数据。 */
+  const assetsById = new Map(snapshot.assets.map((asset) => [asset.id, asset]))
+  /** Renderer 只消费主进程版本顺序，缺失关联时局部跳过破损项。 */
+  const versions = snapshot.imageVersions.flatMap((version) => {
+    const job = jobsById.get(version.jobId)
+    const asset = assetsById.get(version.assetId)
+    return job && asset ? [{ job, asset }] : []
+  })
   /** null 表示跟随权威 adopted 图片，不覆盖当前选择。 */
   const visibleAssetId = state.previewAssetId ?? snapshot.config.adoptedAssetId
   /** 当前大图只加载用户正在查看的单个原图。 */
   const visibleAsset = snapshot.assets.find((asset) => asset.id === visibleAssetId)
+  /** 导出永远绑定权威 adopted 素材，不跟随临时历史预览。 */
+  const adoptedAsset = snapshot.assets.find((asset) => asset.id === snapshot.config.adoptedAssetId)
   /** 当前选择是否只是历史预览。 */
   const previewingHistory = state.previewAssetId !== null
     && state.previewAssetId !== snapshot.config.adoptedAssetId
@@ -297,6 +312,33 @@ export function CanvasImageWorkbench({
             aspectRatio={draft.aspectRatio}
             activeJob={activeJob}
           />
+
+          {candidateBatch && (
+            <CanvasImageCandidateBatchPanel
+              {...candidateBatch}
+              writable={writable}
+              focusNodeId={snapshot.target.nodeId}
+              onPreviewAsset={onPreviewAsset}
+            />
+          )}
+
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            aria-label="导出当前图片"
+            disabled={!writable || !adoptedAsset || exportState === 'exporting'}
+            onClick={() => {
+              if (adoptedAsset) onExportAsset(adoptedAsset.id)
+            }}
+          >
+            {exportState === 'exporting'
+              ? <><LoaderCircle className="animate-spin" aria-hidden="true" />正在导出</>
+              : <><Download aria-hidden="true" />导出当前图片</>}
+          </Button>
+          {exportError && (
+            <p className="break-words text-xs text-destructive" role="alert">{exportError}</p>
+          )}
 
           {previewingHistory && visibleAsset && (
             <Button type="button" variant="outline" size="sm" disabled={!writable} onClick={() => onAdoptAsset(visibleAsset.id)}>

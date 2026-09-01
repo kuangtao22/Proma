@@ -160,6 +160,7 @@ describe('CanvasDocumentStore', () => {
         sourcePort: 'output',
         targetNodeId: 'node-image',
         targetPort: 'input',
+        relation: 'association',
       }],
     }
   }
@@ -253,7 +254,7 @@ describe('CanvasDocumentStore', () => {
     expect(existsSync(fixture.documentPath)).toBe(false)
   })
 
-  test('Given v1 视觉文档节点 When 解析 Then 规范化为保留内容 ID 的 v2 文档节点', () => {
+  test('Given v1 视觉文档节点 When 解析 Then 规范化为保留内容 ID 的当前文档节点', () => {
     /** 主进程解析结果同时提供规范化文档和私有迁移信息。 */
     const parsed = parseCanvasDocument(createLegacyDocument(), {
       projectId: 'project-1',
@@ -261,7 +262,7 @@ describe('CanvasDocumentStore', () => {
     })
 
     expect(parsed.migratedFrom).toBe(1)
-    expect(parsed.document.schemaVersion).toBe(2)
+    expect(parsed.document.schemaVersion).toBe(4)
     expect(parsed.persistencePayload).toEqual(
       createLegacyDocument() as typeof parsed.persistencePayload,
     )
@@ -342,8 +343,15 @@ describe('CanvasDocumentStore', () => {
 
   test('Given v2 四类节点 When 解析 Then 严格重建且不产生迁移种子', () => {
     /** 在已有 Agent/图片节点上补齐文档与 Webview 节点。 */
-    const document = createConnectedDocument()
-    document.nodes.push(
+    const baseDocument = createConnectedDocument()
+    /** schema v2 的边严格保持历史五字段形态。 */
+    const legacyEdges = baseDocument.edges.map(({ relation: _relation, ...edge }) => edge)
+    const document = {
+      ...baseDocument,
+      schemaVersion: 2 as const,
+      edges: legacyEdges,
+      nodes: [
+        ...baseDocument.nodes,
       {
         id: 'node-document', kind: 'document', title: '文档', position: { x: 20, y: 20 },
         documentId: 'document-1', contentRevision: 5,
@@ -352,17 +360,103 @@ describe('CanvasDocumentStore', () => {
         id: 'node-webview', kind: 'webview', title: '原型', position: { x: 30, y: 30 },
         prototypeId: 'prototype-1', contentRevision: 6,
       },
-    )
+      ],
+    }
 
     /** v2 解析结果不应携带任何旧文档迁移状态。 */
     const parsed = parseCanvasDocument(document, {
       projectId: 'project-1', canvasId: 'canvas-1',
     })
 
-    expect(parsed.document).toEqual(document)
-    expect(parsed.persistencePayload).toEqual(document)
-    expect(parsed.migratedFrom).toBeUndefined()
+    expect(parsed.document.nodes.at(-1)).toMatchObject({
+      kind: 'webview', devicePreset: 'desktop',
+    })
+    expect(parsed.document.schemaVersion).toBe(4)
+    expect(parsed.persistencePayload as unknown).toEqual(document)
+    expect(parsed.migratedFrom).toBe(2)
     expect(parsed.legacyContentSeeds).toEqual([])
+  })
+
+  test('Given v2 WebView 夹带 devicePreset When 解析 Then exact-key 边界拒绝', () => {
+    /** v2 WebView 必须保持历史六字段形态，不能提前接受 v3 字段。 */
+    const document = {
+      ...createEmptyCanvasDocument('project-1', 'canvas-1', 20),
+      schemaVersion: 2,
+      nodes: [{
+        id: 'node-webview', kind: 'webview', title: '原型', position: { x: 30, y: 30 },
+        prototypeId: 'prototype-1', contentRevision: 6, devicePreset: 'mobile',
+      }],
+    }
+
+    expect(() => parseCanvasDocument(document, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })).toThrow('CANVAS_DOCUMENT_INVALID')
+  })
+
+  test('Given v3 WebView 缺少设备预设 When 解析 Then 严格拒绝而不静默补值', () => {
+    const document = {
+      ...createConnectedDocument(),
+      schemaVersion: 3 as const,
+      nodes: [{
+        id: 'node-webview', kind: 'webview', title: '原型', position: { x: 30, y: 30 },
+        prototypeId: 'prototype-1', contentRevision: 6,
+      }],
+      edges: [],
+    }
+
+    expect(() => parseCanvasDocument(document, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })).toThrow('CANVAS_DOCUMENT_INVALID')
+  })
+
+  test('Given v3 普通边与图片直接入边 When 解析 Then 确定性迁移语义且保持图事实', () => {
+    /** v3 只缺少边语义，节点、坐标、revision 与时间必须原样保留。 */
+    const document = {
+      ...createConnectedDocument(8),
+      schemaVersion: 3,
+      nodes: [
+        { id: 'node-document', kind: 'document', title: '文档', position: { x: 3, y: 4 }, documentId: 'document-1', contentRevision: 5 },
+        { id: 'node-image', kind: 'image', title: '图片', position: { x: 5, y: 6 }, imageModuleId: 'image-1' },
+        { id: 'node-webview', kind: 'webview', title: '原型', position: { x: 7, y: 8 }, prototypeId: 'web-1', contentRevision: 6, devicePreset: 'mobile' },
+      ] satisfies CanvasNode[],
+      edges: [
+        { id: 'edge-doc-web', sourceNodeId: 'node-document', sourcePort: 'output', targetNodeId: 'node-webview', targetPort: 'input' },
+        { id: 'edge-doc-image', sourceNodeId: 'node-document', sourcePort: 'output', targetNodeId: 'node-image', targetPort: 'input' },
+      ],
+    }
+
+    const parsed = parseCanvasDocument(document, { projectId: 'project-1', canvasId: 'canvas-1' })
+
+    expect(parsed.migratedFrom).toBe(3)
+    expect(parsed.document.schemaVersion).toBe(4)
+    expect(parsed.document.edges).toEqual([
+      { ...document.edges[0]!, relation: 'association' },
+      { ...document.edges[1]!, relation: 'reference' },
+    ])
+    expect(parsed.document.nodes).toEqual(document.nodes)
+    expect(parsed.document.revision).toBe(document.revision)
+    expect(parsed.document.createdAt).toBe(document.createdAt)
+    expect(parsed.document.updatedAt).toBe(document.updatedAt)
+  })
+
+  test('Given v4 文档或 mutation 缺失或伪造 relation When 解析 Then exact-key 边界拒绝', () => {
+    const current = createConnectedDocument()
+    const edge = current.edges[0]!
+    const { relation: _relation, ...missingRelation } = edge
+
+    expect(() => parseCanvasDocument({ ...current, edges: [missingRelation] }, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })).toThrow('CANVAS_DOCUMENT_INVALID')
+    expect(() => parseCanvasDocument({
+      ...current, edges: [{ ...edge, relation: 'causes' }],
+    }, { projectId: 'project-1', canvasId: 'canvas-1' })).toThrow('CANVAS_DOCUMENT_INVALID')
+
+    const fixture = createFixture()
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      0,
+      [{ type: 'upsert-nodes', nodes: current.nodes }, { type: 'upsert-edges', edges: [missingRelation] }] as CanvasMutation[],
+    )).toThrow('CANVAS_MUTATION_INVALID')
   })
 
   test('Given v2 仍包含 visual-document When 解析 Then 以文档错误拒绝', () => {
@@ -381,7 +475,7 @@ describe('CanvasDocumentStore', () => {
     })).toThrow('CANVAS_DOCUMENT_INVALID')
   })
 
-  test('Given v1 主文件 When load Then 只返回 v2 公开快照且不回写磁盘', () => {
+  test('Given v1 主文件 When load Then 只返回当前公开快照且不回写磁盘', () => {
     /** 真实 Store 用于验证主文件迁移只发生在内存。 */
     const fixture = createFixture()
     /** 磁盘原文需要在 load 后保持 v1 不变。 */
@@ -391,7 +485,7 @@ describe('CanvasDocumentStore', () => {
     /** 公开快照只允许包含规范化文档和既有工作区字段。 */
     const snapshot = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
 
-    expect(snapshot.document.schemaVersion).toBe(2)
+    expect(snapshot.document.schemaVersion).toBe(4)
     expect('legacyContentSeeds' in snapshot).toBe(false)
     expect('migratedFrom' in snapshot).toBe(false)
     expect('persistencePayload' in snapshot).toBe(false)
@@ -413,11 +507,11 @@ describe('CanvasDocumentStore', () => {
     expect(committed.revision).toBe(7)
     expect(committed.createdAt).toBe(20)
     expect(committed.updatedAt).toBe(27)
-    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).schemaVersion).toBe(2)
+    expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8')).schemaVersion).toBe(4)
     expect('legacyContentSeeds' in fixture.store.load(target)).toBe(false)
   })
 
-  test.each([['tmp', '.tmp'], ['backup', '.bak']] as const)('Given v1 %s 候选 When 私有迁移提交 Then 直接 CAS v2 且 tmp 只消费读取 inode', (_source, suffix) => {
+  test.each([['tmp', '.tmp'], ['backup', '.bak']] as const)('Given v1 %s 候选 When 私有迁移提交 Then 直接 CAS 当前 schema 且 tmp 只消费读取 inode', (_source, suffix) => {
     const fixture = createFixture()
     const legacyDocument = createLegacyDocument(4)
     writeDocument(fixture.documentPath, { broken: true })
@@ -426,7 +520,7 @@ describe('CanvasDocumentStore', () => {
     expect(capability.migratedFrom).toBe(1)
     capability.commitMigration()
     const persisted = JSON.parse(readFileSync(fixture.documentPath, 'utf8')) as CanvasDocument
-    expect(persisted.schemaVersion).toBe(2)
+    expect(persisted.schemaVersion).toBe(4)
     expect(persisted.revision).toBe(4)
     if (suffix === '.tmp') expect(existsSync(`${fixture.documentPath}.tmp`)).toBe(false)
   })
@@ -465,7 +559,7 @@ describe('CanvasDocumentStore', () => {
     const snapshot = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
 
     expect(snapshot.recoveredFrom).toBe(source)
-    expect(snapshot.document.schemaVersion).toBe(2)
+    expect(snapshot.document.schemaVersion).toBe(4)
     expect(snapshot.document.nodes.map((node) => node.kind)).toEqual([
       'agent', 'image', 'document', 'webview',
     ])
@@ -476,7 +570,7 @@ describe('CanvasDocumentStore', () => {
     const expectedSeeds = parsedLoads.at(-1)?.legacyContentSeeds
     parsedLoads.length = 0
     const reloaded = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
-    expect(reloaded.document.schemaVersion).toBe(2)
+    expect(reloaded.document.schemaVersion).toBe(4)
     expect(reloaded.recoveredFrom).toBeUndefined()
     expect(parsedLoads.at(-1)?.legacyContentSeeds).toEqual(expectedSeeds)
   })
@@ -1178,6 +1272,7 @@ describe('CanvasDocumentStore', () => {
         sourcePort: '',
         targetNodeId: 'missing-b',
         targetPort: 'input',
+        relation: 'association',
       }] }],
     )).toThrow('CANVAS_MUTATION_INVALID')
 
@@ -1191,6 +1286,7 @@ describe('CanvasDocumentStore', () => {
         sourcePort: 'output',
         targetNodeId: 'missing-b',
         targetPort: 'input',
+        relation: 'association',
       }] }],
     )).toThrow('CANVAS_MUTATION_INVALID')
     expect(existsSync(fixture.documentPath)).toBe(false)
@@ -1233,6 +1329,86 @@ describe('CanvasDocumentStore', () => {
     expect(plan.expectedDocument.nodes).toEqual([])
     expect(existsSync(fixture.documentPath)).toBe(false)
   })
+
+  test('Given 同批新增 WebView 后切换设备 When mutate Then 按当前态校验并成功提交', () => {
+    const fixture = createFixture()
+    /** 同批新建的 WebView 必须立即成为后续设备 mutation 的有效目标。 */
+    const webviewNode: CanvasNode = {
+      id: 'new-webview', kind: 'webview', title: '新原型', position: { x: 10, y: 20 },
+      prototypeId: 'prototype-new', contentRevision: 0, devicePreset: 'desktop',
+    }
+
+    const result = fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      0,
+      [
+        { type: 'upsert-nodes', nodes: [webviewNode] },
+        { type: 'set-webview-device-preset', nodeId: webviewNode.id, devicePreset: 'mobile' },
+      ],
+    )
+
+    expect(result.nodes[0]).toEqual({ ...webviewNode, devicePreset: 'mobile' })
+  })
+
+  test('Given 同批把 WebView 替换为文档后切换设备 When mutate Then 按当前态拒绝', () => {
+    const fixture = createFixture()
+    /** 磁盘基线先包含可切换设备的 WebView。 */
+    const current = {
+      ...createEmptyCanvasDocument('project-1', 'canvas-1', 20),
+      revision: 2,
+      updatedAt: 22,
+      nodes: [{
+        id: 'shared-node', kind: 'webview', title: '原型', position: { x: 10, y: 20 },
+        prototypeId: 'prototype-1', contentRevision: 1, devicePreset: 'desktop',
+      } satisfies CanvasNode],
+    }
+    writeDocument(fixture.documentPath, current)
+    /** 同 ID 文档替换后，后续设备 mutation 不得继续读取原始 WebView 类型。 */
+    const replacement: CanvasNode = {
+      id: 'shared-node', kind: 'document', title: '文档', position: { x: 10, y: 20 },
+      documentId: 'document-1', contentRevision: 1,
+    }
+
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [
+        { type: 'upsert-nodes', nodes: [replacement] },
+        { type: 'set-webview-device-preset', nodeId: replacement.id, devicePreset: 'mobile' },
+      ],
+    )).toThrow('CANVAS_MUTATION_INVALID')
+  })
+
+  test('Given 两千个同批 WebView 与设备切换 When 验证 Then 在线性预算内接受当前态', () => {
+    const fixture = createFixture()
+    /** 批量节点用于防止设备校验退化为逐项扫描原始数组。 */
+    const nodes: CanvasNode[] = Array.from({ length: 2_000 }, (_, index) => ({
+      id: `batch-webview-${index}`,
+      kind: 'webview',
+      title: `原型 ${index}`,
+      position: { x: index, y: 0 },
+      prototypeId: `prototype-${index}`,
+      contentRevision: 0,
+      devicePreset: 'desktop',
+    }))
+    /** 单个 upsert 后逐项切换，要求校验状态与 mutation 顺序同步演进。 */
+    const operations: CanvasMutation[] = [
+      { type: 'upsert-nodes', nodes },
+      ...nodes.map((node) => ({
+        type: 'set-webview-device-preset' as const,
+        nodeId: node.id,
+        devicePreset: 'mobile' as const,
+      })),
+    ]
+    const startedAt = performance.now()
+
+    const validated = fixture.store.validateBatchOperations(
+      { projectId: 'project-1', canvasId: 'canvas-1' }, 0, operations,
+    )
+
+    expect(validated).toHaveLength(2_001)
+    expect(performance.now() - startedAt).toBeLessThan(1_000)
+  }, 2_000)
 
   test('Given move-nodes 指向当前不存在节点 When mutate Then reducer 和完整校验前拒绝', () => {
     /** 结果 validator 与写边界都不得触达。 */
@@ -1281,6 +1457,7 @@ describe('CanvasDocumentStore', () => {
           sourcePort: 'output',
           targetNodeId: 'missing-target',
           targetPort: 'input',
+          relation: 'association',
         }] },
         { type: 'remove-edges', edgeIds: ['edge-dangling-hidden'] },
       ],
@@ -1362,6 +1539,7 @@ describe('CanvasDocumentStore', () => {
       sourcePort: 'output',
       targetNodeId: `large-node-${index + 1}`,
       targetPort: 'input',
+      relation: 'association' as const,
     }))
     writeDocument(fixture.documentPath, {
       ...createEmptyCanvasDocument('project-1', 'canvas-1', 1),

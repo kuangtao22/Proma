@@ -1,5 +1,5 @@
 import * as React from 'react'
-import type { CanvasNodeKind } from '@proma/shared'
+import type { CanvasNodeActivityState, CanvasNodeKind } from '@proma/shared'
 import { Handle, Position } from '@xyflow/react'
 import type { LucideIcon } from 'lucide-react'
 import { Bot, CircleAlert, FileImage, FileText, LoaderCircle, Maximize2, MessageSquareQuote, Monitor, MoreHorizontal, Plus } from 'lucide-react'
@@ -22,11 +22,17 @@ export interface CanvasNodeCardData {
   kind: CanvasNodeKind
   title: string
   statusLabel: string
+  /** Workspace 按节点 ID 聚合的瞬时活动状态。 */
+  activityState?: CanvasNodeActivityState
+  /** 图片候选只显示验收标记，不替换正式缩略图。 */
+  candidateState?: 'new-version' | 'partial'
   summary: string
   /** 仅生图节点可携带的工作区授权缩略图 URL。 */
   previewUrl?: string
   /** 投影层根据已验证素材比例计算的节点总高度。 */
   nodeHeight?: number
+  /** 投影层根据节点类型和设备预设计算的节点总宽度。 */
+  nodeWidth?: number
   canOpenWorkbench: boolean
   onOpenWorkbench?: (nodeId: string) => void
   canCreateChild: boolean
@@ -41,6 +47,10 @@ export type CanvasNodeFlowData = CanvasNodeCardData & Record<string, unknown>
 /** 通用折叠卡片输入包含 XYFlow 当前选中态。 */
 export interface CanvasNodeCardProps extends CanvasNodeCardData {
   selected: boolean
+  /** 特殊节点可在标题栏注入紧凑控制。 */
+  toolbar?: React.ReactNode
+  /** 特殊节点可替换默认文字内容区，但不能替换卡片壳和端口。 */
+  children?: React.ReactNode
 }
 
 /** 四类节点共享的中文名称与图标，不从内容文件派生展示。 */
@@ -49,6 +59,43 @@ const CANVAS_NODE_PRESENTATION: Record<CanvasNodeKind, { label: string; Icon: Lu
   image: { label: '生图', Icon: FileImage },
   document: { label: '文档', Icon: FileText },
   webview: { label: '原型', Icon: Monitor },
+}
+
+/** 非空闲活动状态在辅助技术中的稳定中文说明。 */
+const CANVAS_NODE_ACTIVITY_LABELS: Readonly<Record<Exclude<CanvasNodeActivityState, 'idle'>, string>> = {
+  queued: '排队中',
+  running: '运行中',
+  'waiting-approval': '等待审批',
+}
+
+/** 渲染不参与布局和鼠标命中的统一节点活动轮廓。 */
+function CanvasNodeActivityOutline({ state }: { state: CanvasNodeActivityState }): React.ReactElement | null {
+  if (state === 'idle') return null
+  return (
+    <svg
+      data-canvas-activity-outline
+      data-activity-state={state}
+      aria-hidden="true"
+      width="100%"
+      height="100%"
+      className="pointer-events-none absolute -inset-1 z-10 h-[calc(100%+8px)] w-[calc(100%+8px)] overflow-visible"
+    >
+      <rect
+        x="2"
+        y="2"
+        width="calc(100% - 4px)"
+        height="calc(100% - 4px)"
+        rx="10"
+        className={cn(
+          'fill-none stroke-2 [vector-effect:non-scaling-stroke]',
+          state === 'waiting-approval'
+            ? 'stroke-primary'
+            : 'stroke-primary [stroke-dasharray:8_6]',
+          state === 'running' && 'canvas-running-dash',
+        )}
+      />
+    </svg>
+  )
 }
 
 /** 节点侧菜单单项的最小结构，兼容顶部菜单的禁用视频项。 */
@@ -88,10 +135,15 @@ export function CanvasNodeCard({
   kind,
   title,
   statusLabel,
+  activityState = 'idle',
+  candidateState,
   summary,
   previewUrl,
   nodeHeight,
+  nodeWidth,
   selected,
+  toolbar,
+  children,
   canOpenWorkbench,
   onOpenWorkbench,
   canCreateChild,
@@ -106,36 +158,67 @@ export function CanvasNodeCard({
   React.useEffect(() => setPreviewFailed(false), [previewUrl])
   /** 只有生图节点的有效 URL 且未失败时显示缩略图。 */
   const showPreview = kind === 'image' && Boolean(previewUrl) && !previewFailed
-  /** 只有有效图片预览使用投影动态高度，文字和失败状态继续保持默认卡片。 */
-  const dynamicHeight = showPreview && nodeHeight && nodeHeight !== 144 ? nodeHeight : undefined
+  /** 投影给出的尺寸是卡片、碰撞和 Handle 共同使用的几何事实。 */
+  const resolvedWidth = nodeWidth ?? 288
+  /** 生图比例高度和 WebView 设备高度统一从投影读取。 */
+  const resolvedHeight = nodeHeight ?? 144
+  /** 默认节点保留原 Tailwind 固定类，动态节点改用精确内联尺寸。 */
+  const hasDynamicWidth = resolvedWidth !== 288
+  const hasDynamicHeight = resolvedHeight !== 144
   return (
     <TooltipProvider delayDuration={200} disableHoverableContent>
       <div
-        className={cn('group relative w-[288px]', dynamicHeight ? undefined : 'h-[144px]')}
-        style={dynamicHeight ? { height: dynamicHeight } : undefined}
+        className={cn('group relative', hasDynamicWidth ? undefined : 'w-[288px]', hasDynamicHeight ? undefined : 'h-[144px]')}
+        style={{
+          ...(hasDynamicWidth ? { width: resolvedWidth } : {}),
+          ...(hasDynamicHeight ? { height: resolvedHeight } : {}),
+        }}
       >
+        <CanvasNodeActivityOutline state={activityState} />
         <Handle
           id="input"
           type="target"
           position={Position.Left}
-          isConnectable={false}
+          isConnectable
           isConnectableStart={false}
-          isConnectableEnd={false}
+          isConnectableEnd
           className="!size-2 !border-2 !border-background !bg-muted-foreground"
         />
         <article
           className={cn(
-            'flex w-[288px] flex-col overflow-hidden rounded-[8px] border bg-card text-card-foreground shadow-sm',
-            dynamicHeight ? 'h-full' : 'h-[144px]',
+            'flex flex-col overflow-hidden rounded-[8px] border bg-card text-card-foreground shadow-sm',
+            hasDynamicWidth ? 'w-full' : 'w-[288px]',
+            hasDynamicHeight ? 'h-full' : 'h-[144px]',
             selected ? 'border-primary ring-2 ring-primary/25' : 'border-border',
           )}
-          aria-label={`${label}：${title}，${statusLabel}`}
+          aria-label={`${label}：${title}，${statusLabel}${activityState === 'idle' ? '' : `，${CANVAS_NODE_ACTIVITY_LABELS[activityState]}`}`}
         >
           <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-4">
             <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
               <Icon className="size-4" aria-hidden="true" />
             </span>
             <span className="min-w-0 flex-1 text-xs font-medium text-muted-foreground">{label}</span>
+            {kind === 'image' && candidateState ? (
+              <button
+                type="button"
+                aria-label="查看图片候选详情"
+                className={cn(
+                  'nodrag nopan shrink-0 rounded-sm border px-1.5 py-0.5 text-[10px] font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                  candidateState === 'partial'
+                    ? 'border-destructive/40 bg-destructive/10 text-destructive'
+                    : 'border-primary/40 bg-primary/10 text-primary',
+                )}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onOpenWorkbench?.(id)
+                }}
+                onDoubleClick={(event) => event.stopPropagation()}
+              >
+                {candidateState === 'partial' ? '部分完成' : '新版本'}
+              </button>
+            ) : null}
+            {toolbar}
             {onReferenceNode ? (
               <Popover>
                 <PopoverTrigger asChild>
@@ -191,7 +274,9 @@ export function CanvasNodeCard({
               </Tooltip>
             ) : null}
           </header>
-          {showPreview ? (
+          {children ? (
+            <div className="min-h-0 flex-1">{children}</div>
+          ) : showPreview ? (
             <div className="relative min-h-0 flex-1 bg-muted">
               <img
                 src={previewUrl}
@@ -224,8 +309,8 @@ export function CanvasNodeCard({
           id="output"
           type="source"
           position={Position.Right}
-          isConnectable={false}
-          isConnectableStart={false}
+          isConnectable
+          isConnectableStart
           isConnectableEnd={false}
           className="!size-2 !border-2 !border-background !bg-muted-foreground"
         />

@@ -1808,16 +1808,16 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
     ['PERMISSION_RESPOND', 'permissionService', 'respondToPermission'],
     ['ASK_USER_RESPOND', 'askUserService', 'respondToAskUser'],
     ['EXIT_PLAN_MODE_RESPOND', 'exitPlanService', 'respondToExitPlanMode'],
-  ])('Given %s 的 owner 内部、未知或已删除 When 执行实际 handler Then owner 传入 guard 且请求不消费', async (channel, serviceName, respondName) => {
+  ])('Given %s 的 owner 内部或已删除 When 执行实际 handler Then owner 传入 guard 且请求不消费', async (channel, serviceName, respondName) => {
     const { handlers } = loadAgentHandlers()
     const registered = handlers.find((handler) => handler.channel === channel)
     expect(registered).toBeDefined()
 
-    for (const ownerSessionId of ['canvas-owner', 'unknown-owner', 'deleted-owner']) {
+    for (const ownerSessionId of ['canvas-owner', 'deleted-owner']) {
       let guardedSessionId = ''
       let respondCallCount = 0
       const service = {
-        getPendingRequestOwner: () => ownerSessionId === 'unknown-owner' ? null : ownerSessionId,
+        getPendingRequestOwner: () => ownerSessionId,
         [respondName]: () => {
           respondCallCount += 1
           return null
@@ -1838,8 +1838,46 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
         { sender: { send: () => undefined } },
         { requestId: 'request-1', answers: {}, behavior: 'allow', alwaysAllow: false, action: 'deny' },
       )).rejects.toThrow('Agent 会话不存在')
-      expect(guardedSessionId).toBe(ownerSessionId === 'unknown-owner' ? '' : ownerSessionId)
+      expect(guardedSessionId).toBe(ownerSessionId)
       expect(respondCallCount).toBe(0)
     }
+  })
+
+  test.each([
+    ['PERMISSION_RESPOND', 'permissionService', 'respondToPermission'],
+    ['ASK_USER_RESPOND', 'askUserService', 'respondToAskUser'],
+    ['EXIT_PLAN_MODE_RESPOND', 'exitPlanService', 'respondToExitPlanMode'],
+  ])('Given %s 的请求已超时清理 When Renderer 重复响应 Then 幂等成功且不校验空 owner', async (channel, serviceName, respondName) => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find((handler) => handler.channel === channel)
+    expect(registered).toBeDefined()
+    let guardCallCount = 0
+    let respondCallCount = 0
+    let sendCallCount = 0
+    const service = {
+      getPendingRequestOwner: () => null,
+      [respondName]: () => {
+        respondCallCount += 1
+        return null
+      },
+    }
+    const handler = compileHandler<(event: { sender: { send: () => void } }, response: Record<string, unknown>) => Promise<void>>(
+      registered!,
+      {
+        [serviceName]: service,
+        requireVisibleSession: () => {
+          guardCallCount += 1
+          throw new Error('不应校验已失效请求的空 owner')
+        },
+      },
+    )
+
+    await expect(handler(
+      { sender: { send: () => { sendCallCount += 1 } } },
+      { requestId: 'expired-request', answers: {}, behavior: 'allow', alwaysAllow: false, action: 'deny' },
+    )).resolves.toBeUndefined()
+    expect(guardCallCount).toBe(0)
+    expect(respondCallCount).toBe(0)
+    expect(sendCallCount).toBe(0)
   })
 })

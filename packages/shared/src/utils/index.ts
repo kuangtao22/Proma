@@ -78,3 +78,11 @@ export {
   isRfc1918Ipv4,
   selectRfc1918Ipv4,
 } from './private-ipv4'
+export {
+  createCanvasLayoutSpatialIndex,
+  findCompactCanvasSlot,
+  type CanvasLayoutRect,
+  type CanvasLayoutSize,
+  type CanvasLayoutSpatialIndex,
+  type FindCompactCanvasSlotInput,
+} from './canvas-layout'

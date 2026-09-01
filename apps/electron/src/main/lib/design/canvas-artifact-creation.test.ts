@@ -91,6 +91,7 @@ describe('Canvas Agent 产物原子创建服务', () => {
       title: '首页原型',
       content: '<!doctype html><html><body>首页</body></html>',
       sourceNodeId: 'requirements-1',
+      relation: 'reference',
       source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-artifact-1' },
     })
 
@@ -100,14 +101,75 @@ describe('Canvas Agent 产物原子创建服务', () => {
     const operations = fixture.batches[0] ? getBatchOperations(fixture.batches[0]) : []
     const createdNode = operations.find((operation) => operation.type === 'upsert-nodes')
     expect(createdNode).toMatchObject({
-      nodes: [{ kind: 'webview', title: '首页原型', position: { x: 400, y: 60 }, contentRevision: 0 }],
+      nodes: [{
+        kind: 'webview', title: '首页原型', position: { x: 352, y: 60 },
+        contentRevision: 0, devicePreset: 'desktop',
+      }],
     })
     expect(operations.find((operation) => operation.type === 'upsert-edges')).toMatchObject({
-      edges: [{ sourceNodeId: 'requirements-1', targetNodeId: result.nodeId }],
+      edges: [{ sourceNodeId: 'requirements-1', targetNodeId: result.nodeId, relation: 'reference' }],
     })
     expect(result).toMatchObject({ canvasId: 'canvas-1', revision: 4, artifactType: 'webview' })
     expect(result.nodeId).toMatch(/^artifact-[0-9a-f]{64}$/)
     expect(fixture.discarded).toEqual([])
+  })
+
+  test('Given Agent 创建文档并引用需求节点 When 提交 Then 创建 document revision 0 和 reference 边', async () => {
+    const fixture = createFixture()
+
+    const result = await fixture.service.create({
+      ...target,
+      baseRevision: 3,
+      artifactType: 'document',
+      title: '产品说明',
+      content: '# 产品说明',
+      sourceNodeId: 'requirements-1',
+      relation: 'reference',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-doc-1' },
+    })
+
+    expect(result).toMatchObject({ artifactType: 'document' })
+    expect(fixture.prepared).toEqual([expect.objectContaining({ kind: 'document', content: '# 产品说明' })])
+    expect(getBatchOperations(fixture.batches[0]!).find((operation) => operation.type === 'upsert-nodes'))
+      .toMatchObject({ nodes: [{ kind: 'document', contentRevision: 0 }] })
+    expect(getBatchOperations(fixture.batches[0]!).find((operation) => operation.type === 'upsert-edges'))
+      .toMatchObject({ edges: [{ relation: 'reference' }] })
+  })
+
+  test('Given 来源与 relation 仅提供一项 When 创建 Then 在准备内容前拒绝', async () => {
+    const fixture = createFixture()
+    /** 创建调用的公共字段。 */
+    const base = {
+      ...target, baseRevision: 3, artifactType: 'document' as const,
+      title: '说明', content: '# 说明',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-invalid-relation' },
+    }
+
+    await expect(fixture.service.create({ ...base, sourceNodeId: 'requirements-1' }))
+      .rejects.toThrow('CANVAS_ARTIFACT_RELATION_REQUIRED')
+    await expect(fixture.service.create({ ...base, relation: 'association' }))
+      .rejects.toThrow('CANVAS_ARTIFACT_RELATION_UNEXPECTED')
+    expect(fixture.prepared).toHaveLength(0)
+  })
+
+  test('Given Agent 明确创建手机 WebView When 提交产物 Then 节点持久化 mobile 且内容仍只准备一次', async () => {
+    const fixture = createFixture()
+    await fixture.service.create({
+      ...target,
+      baseRevision: 3,
+      artifactType: 'webview',
+      devicePreset: 'mobile',
+      title: '手机首页原型',
+      content: '<!doctype html><html><body>手机首页</body></html>',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-mobile-artifact-1' },
+    })
+
+    const operations = fixture.batches[0] ? getBatchOperations(fixture.batches[0]) : []
+    expect(operations[0]).toMatchObject({
+      type: 'upsert-nodes',
+      nodes: [{ kind: 'webview', devicePreset: 'mobile' }],
+    })
+    expect(fixture.prepared).toHaveLength(1)
   })
 
   test('Given 图片产物 When 创建 Then 使用项目默认模型初始化 prompt 且不自动运行生图', async () => {
@@ -186,5 +248,53 @@ describe('Canvas Agent 产物原子创建服务', () => {
     expect(fixture.getDocument().nodes.some((node) => node.id === result.nodeId)).toBe(true)
     expect(fixture.discarded).toEqual([])
     expect(result.revision).toBe(4)
+  })
+
+  test('Given Agent 连续创建 14 个无来源产物 When 未提供坐标 Then Host 形成紧凑多行', async () => {
+    const fixture = createFixture()
+    for (let order = 0; order < 14; order += 1) {
+      await fixture.service.create({
+        ...target,
+        baseRevision: fixture.getDocument().revision,
+        artifactType: 'document',
+        title: `规划 ${order + 1}`,
+        content: `# 规划 ${order + 1}`,
+        source: {
+          sessionId: 'session-layout',
+          runStartedAt: 100,
+          toolCallId: `tool-layout-${order}`,
+        },
+      })
+    }
+
+    /** 排除测试夹具中的初始需求节点，只检查本次 Agent 连续创建结果。 */
+    const created = fixture.getDocument().nodes.filter((node) => node.id !== 'requirements-1')
+    expect(new Set(created.map((node) => node.position.y)).size).toBeGreaterThan(1)
+    expect(Math.max(...created.map((node) => node.position.x))).toBeLessThan(1_600)
+  })
+
+  test('Given 同一来源连续创建多个兄弟产物 When 未提供坐标 Then 使用来源右侧多个不重叠槽位', async () => {
+    const fixture = createFixture()
+    for (let order = 0; order < 6; order += 1) {
+      await fixture.service.create({
+        ...target,
+        baseRevision: fixture.getDocument().revision,
+        artifactType: order % 2 === 0 ? 'webview' : 'document',
+        title: `衍生产物 ${order + 1}`,
+        content: order % 2 === 0 ? '<main>原型</main>' : '# 文档',
+        sourceNodeId: 'requirements-1',
+        relation: 'derives',
+        source: {
+          sessionId: 'session-layout',
+          runStartedAt: 101,
+          toolCallId: `tool-sibling-${order}`,
+        },
+      })
+    }
+
+    /** 同源兄弟不能继续落在同一个来源右侧坐标。 */
+    const created = fixture.getDocument().nodes.filter((node) => node.id !== 'requirements-1')
+    expect(new Set(created.map((node) => `${node.position.x}:${node.position.y}`)).size).toBe(6)
+    expect(new Set(created.map((node) => node.position.y)).size).toBeGreaterThan(1)
   })
 })

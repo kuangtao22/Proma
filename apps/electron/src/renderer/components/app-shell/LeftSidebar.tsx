@@ -4889,32 +4889,24 @@ const AgentProjectGroupItem = React.memo(function AgentProjectGroupItem({
 
 
         {!isAutomationGroup && (
-          <DropdownMenu>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <DropdownMenuTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label={`在「${group.workspace.name}」中新建内容`}
-                    onClick={(event) => event.stopPropagation()}
-                    className="absolute right-0 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded-md text-foreground/30 transition-colors hover:bg-foreground/[0.055] hover:text-foreground/65 titlebar-no-drag"
-                  >
-                    <Plus size={13} />
-                  </button>
-                </DropdownMenuTrigger>
-              </TooltipTrigger>
-              <TooltipContent side="top">在此项目中新建内容</TooltipContent>
-            </Tooltip>
-            <DropdownMenuContent align="start" className="z-[9999] w-44 min-w-0 p-0.5">
-              <DropdownMenuItem
-                className="py-1 text-xs [&>svg]:size-3.5"
-                onSelect={() => { void onNewSession(group.workspace.id) }}
-              >
-                <Bot size={14} />
-                {`新建 Agent 会话${newSessionShortcutLabel ? ` (${newSessionShortcutLabel})` : ''}`}
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label={`在「${group.workspace.name}」中新建会话`}
+              onClick={(event) => {
+                event.stopPropagation()
+                void onNewSession(group.workspace.id)
+              }}
+              className="absolute right-0 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded-md text-foreground/30 transition-colors hover:bg-foreground/[0.055] hover:text-foreground/65 titlebar-no-drag"
+            >
+              <Plus size={13} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            {`在此项目中新建会话${newSessionShortcutLabel ? ` (${newSessionShortcutLabel})` : ''}`}
+          </TooltipContent>
+        </Tooltip>
         )}
 
         {!isAutomationGroup && (

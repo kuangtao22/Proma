@@ -4,14 +4,21 @@ import type {
   AgentSessionMeta,
   CanvasAgentNodeCreationResult,
   CanvasDocument,
+  CanvasChangeEvent,
   CanvasInvokeResult,
   CanvasMutation,
+  CanvasTarget,
   CanvasNodeLifecycleResult,
   CanvasTrashEntry,
   CanvasWorkspaceSnapshot,
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
+  CanvasImageCandidateBatch,
   CanvasImageTarget,
+  CanvasWebviewSnapshot,
+  CanvasWebviewTarget,
+  CanvasWebviewPreviewSnapshot,
+  CanvasWebviewPreviewTarget,
   CreateDesignJobInput,
   DesignAsset,
   DesignJobRecord,
@@ -24,6 +31,11 @@ import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasBatchPublication } from './canvas-agent-batch-operation'
 import { createCanvasOperationSerializer, getCanvasToolProviderRuntime, registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
+import {
+  DOCUMENT_ARTIFACT_DESCRIPTOR,
+  IMAGE_ARTIFACT_DESCRIPTOR,
+  WEBVIEW_ARTIFACT_DESCRIPTOR,
+} from './canvas-artifact-registry'
 
 /** 测试 IPC handler 的最小签名。 */
 type TestHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
@@ -139,6 +151,20 @@ function createImageAsset(id: string, sourceJobId?: string, parentAssetId?: stri
   }
 }
 
+/** 创建四类候选批次 IPC 共用的严格公开返回。 */
+function createImageCandidateBatch(batchId: string): CanvasImageCandidateBatch {
+  return {
+    schemaVersion: 1, batchId, projectId: 'project-1', canvasId: 'canvas-1',
+    source: 'single', sourceSessionId: null, sourceToolCallId: null, status: 'ready',
+    entries: [{
+      nodeId: imageTargetA.nodeId, imageModuleId: imageTargetA.imageModuleId,
+      initialAdoptedAssetId: 'asset-a', initialConfigRevision: 3, jobId: 'job-a',
+      candidateAssetId: 'asset-new', status: 'candidate', error: null,
+    }],
+    adoption: null, createdAt: 1, updatedAt: 2,
+  }
+}
+
 /** 创建指定目标与 revision 的完整图片配置保存命令。 */
 function createImageSaveInput(
   target: CanvasImageTarget,
@@ -222,12 +248,17 @@ function createContext(options: {
   imageLoadError?: Error
   mediaAccessErrorAt?: number
   imageLoad?: (target: CanvasImageTarget) => Promise<CanvasImageModuleConfig>
+  webviewLoad?: (target: CanvasWebviewTarget) => Promise<CanvasWebviewSnapshot>
+  webviewPreview?: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
   imageSave?: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
   imageJobsList?: (projectId: string) => DesignJobRecord[]
   imageTargetAssert?: (projectId: string, target: Omit<CanvasImageTarget, 'projectId'>) => Promise<void>
   imageCreateOnce?: (input: CreateDesignJobInput, jobId: string) => Promise<{ job: DesignJobRecord; created: boolean }>
   imageRollbackOnce?: (projectId: string, jobId: string) => Promise<boolean>
   imageRun?: (jobId: string, leaseHeld: boolean) => Promise<void>
+  imageCandidateBatch?: CanvasImageCandidateBatch
+  imageExport?: (projectId: string, assetId: string, targetPath: string) => Promise<void>
+  pickArtifactExportPath?: () => Promise<string | null>
   batchReconcile?: () => Promise<void>
   batchReconcileError?: Error
   batchPublications?: CanvasBatchPublication[]
@@ -261,6 +292,8 @@ function createContext(options: {
   const agentCalls: Array<{ type: string; value: unknown }> = []
   /** 图片模块服务调用记录。 */
   const imageCalls: Array<{ type: string; value: unknown }> = []
+  /** WebView 受管 HTML 读取调用记录。 */
+  const webviewCalls: CanvasWebviewTarget[] = []
   /** 普通 Agent 原子产物服务调用记录。 */
   const artifactCalls: unknown[] = []
   /** 媒体 lease 释放次数，按候选创建顺序记录。 */
@@ -275,6 +308,75 @@ function createContext(options: {
     channelId: 'channel-1', modelId: 'model-1', workspaceId: 'project-1',
     sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
     createdAt: 1, updatedAt: 1,
+  }
+  /** 文本产物测试适配器同时供旧工具 runtime 与新增 Registry IPC 路由。 */
+  const textArtifactAdapter = {
+    descriptor: DOCUMENT_ARTIFACT_DESCRIPTOR,
+    read: async (input: import('@proma/shared').CanvasTextArtifactTarget) => {
+      calls.push('artifact:read')
+      return {
+        target: input,
+        revision: {
+          kind: input.kind, contentId: input.contentId, revision: input.contentRevision,
+          parentRevision: input.contentRevision > 0 ? input.contentRevision - 1 : null,
+          contentHash: 'a'.repeat(64), createdBy: { type: 'user' as const }, createdAt: 1,
+        },
+        content: '<main>首页</main>',
+      }
+    },
+    listVersions: async (input: import('@proma/shared').CanvasTextArtifactIdentity) => {
+      calls.push('artifact:list')
+      return [{
+        kind: input.kind, contentId: input.contentId, revision: 1, parentRevision: 0,
+        contentHash: 'a'.repeat(64), createdBy: { type: 'user' as const }, createdAt: 1,
+      }]
+    },
+    update: async (input: import('./canvas-text-artifact-service').CanvasTextArtifactServiceUpdateInput) => {
+      calls.push('artifact:update')
+      /** 测试事务保持节点身份，只推进 Canvas 与正文 revision。 */
+      const current = structuredClone(options.loadResult?.document ?? createDocument(input.expectedCanvasRevision))
+      const nextDocument: CanvasDocument = {
+        ...current,
+        revision: input.expectedCanvasRevision + 1,
+        nodes: current.nodes.map((node) => node.id === input.nodeId && (node.kind === 'document' || node.kind === 'webview')
+          ? { ...node, contentRevision: input.expectedContentRevision + 1 }
+          : node),
+      }
+      return {
+        snapshot: { document: nextDocument, writable: true as const, nodeIssues: [] },
+        artifact: {
+          target: {
+            projectId: input.projectId, canvasId: input.canvasId, nodeId: input.nodeId,
+            kind: input.kind, contentId: input.contentId,
+            contentRevision: input.expectedContentRevision + 1,
+          },
+          revision: {
+            kind: input.kind, contentId: input.contentId,
+            revision: input.expectedContentRevision + 1,
+            parentRevision: input.expectedContentRevision,
+            contentHash: 'b'.repeat(64), createdBy: { type: 'user' as const }, createdAt: 2,
+          },
+          content: input.content,
+        },
+      }
+    },
+    adopt: async (input: import('@proma/shared').AdoptCanvasTextArtifactRevisionInput) => {
+      calls.push('artifact:adopt')
+      /** 测试采用沿用 update 的权威结果结构。 */
+      const nestedCallIndex = calls.length
+      const result = await textArtifactAdapter.update({
+        ...input,
+        content: '<main>历史版本</main>',
+        source: { type: 'user' },
+      })
+      /** 内部复用仅用于构造 fixture，不应伪装成第二次外部业务调用。 */
+      calls.splice(nestedCallIndex, 1)
+      return result
+    },
+    export: async (input: import('@proma/shared').CanvasTextArtifactTarget & { targetPath: string }) => {
+      calls.push('artifact:export')
+      artifactCalls.push({ type: 'export', value: structuredClone(input) })
+    },
   }
   const registration = registerCanvasDocumentIpcHandlers({
     ipc: {
@@ -344,6 +446,24 @@ function createContext(options: {
         }
       },
     },
+    textArtifacts: textArtifactAdapter,
+    artifactRegistry: {
+      describe: (kind) => kind === 'document'
+        ? DOCUMENT_ARTIFACT_DESCRIPTOR
+        : kind === 'webview' ? WEBVIEW_ARTIFACT_DESCRIPTOR : IMAGE_ARTIFACT_DESCRIPTOR,
+      requireCapability: (kind) => kind === 'image'
+        ? {
+            descriptor: IMAGE_ARTIFACT_DESCRIPTOR,
+            export: async (input: import('@proma/shared').ExportCanvasArtifactInput & { targetPath: string }) => {
+              artifactCalls.push({ type: 'export', value: structuredClone(input) })
+            },
+          }
+        : {
+            ...textArtifactAdapter,
+            descriptor: kind === 'document' ? DOCUMENT_ARTIFACT_DESCRIPTOR : WEBVIEW_ARTIFACT_DESCRIPTOR,
+          },
+    },
+    pickArtifactExportPath: options.pickArtifactExportPath ?? (async () => '/tmp/canvas-artifact.md'),
     creation: {
       reconcile: async (target) => {
         calls.push('creation:reconcile')
@@ -457,6 +577,23 @@ function createContext(options: {
         return createContentOutcome('node-restored')
       },
     },
+    webviews: {
+      load: async (target) => {
+        webviewCalls.push(target)
+        if (options.webviewLoad) return options.webviewLoad(target)
+        return { target, html: '<main>首页</main>' }
+      },
+      preview: async (target) => {
+        webviewCalls.push(target)
+        if (options.webviewPreview) return options.webviewPreview(target)
+        return {
+          target,
+          previewUrl: 'proma-file://webview-preview',
+          width: target.devicePreset === 'mobile' ? 390 : 1440,
+          height: target.devicePreset === 'mobile' ? 844 : 900,
+        }
+      },
+    },
     imageModules: {
       load: async (target) => {
         imageCalls.push({ type: 'load', value: target })
@@ -468,6 +605,10 @@ function createContext(options: {
         imageCalls.push({ type: 'save', value: input })
         if (options.imageSave) return options.imageSave(input)
         return { ...(options.imageConfig ?? createImageConfig(input)), revision: input.expectedConfigRevision + 1 }
+      },
+      adoptAsset: async (target, expectedConfigRevision, assetId) => {
+        imageCalls.push({ type: 'adopt-config', value: { target, expectedConfigRevision, assetId } })
+        return { ...(options.imageConfig ?? createImageConfig(target)), revision: expectedConfigRevision + 1, adoptedAssetId: assetId }
       },
     },
     imageJobs: {
@@ -526,6 +667,29 @@ function createContext(options: {
         imageCalls.push({ type: 'adopt', value: { projectId, target, assetId } })
       },
     },
+    imageCandidateBatches: {
+      createBatchLocked: async (input) => {
+        imageCalls.push({ type: 'candidate-create', value: input })
+        return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
+      },
+      listActiveSummaries: async () => [],
+      load: async (input) => {
+        imageCalls.push({ type: 'candidate-load', value: input })
+        return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
+      },
+      continueBatch: async (input) => {
+        imageCalls.push({ type: 'candidate-continue', value: input })
+        return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
+      },
+      adopt: async (input) => {
+        imageCalls.push({ type: 'candidate-adopt', value: input })
+        return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
+      },
+      abandon: async (input) => {
+        imageCalls.push({ type: 'candidate-abandon', value: input })
+        return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
+      },
+    },
     imageAssets: {
       list: () => options.imageAssets ?? [createImageAsset('asset-a', 'job-a')],
       createMediaAccess: () => {
@@ -537,6 +701,10 @@ function createContext(options: {
           thumbnailBaseUrl: `proma-file://thumbnails-${index}`,
           release: () => { mediaReleases[index] = (mediaReleases[index] ?? 0) + 1 },
         }
+      },
+      exportAsset: async (projectId, assetId, targetPath) => {
+        imageCalls.push({ type: 'export', value: { projectId, assetId, targetPath } })
+        await options.imageExport?.(projectId, assetId, targetPath)
       },
     },
     agent: {
@@ -585,13 +753,211 @@ function createContext(options: {
     return { reconciliation, operationOutcome: { ok: true as const, value } }
   }
   return {
-    handlers, removed, sender, calls, storeInputs, agentCalls, imageCalls, artifactCalls,
+    handlers, removed, sender, calls, storeInputs, agentCalls, imageCalls, webviewCalls, artifactCalls,
     mediaReleases, broadcastLeaseStates, registration,
     getMediaAccessCount: () => mediaAccessCount,
   }
 }
 
 describe('原生 Canvas 文档 IPC', () => {
+  test('Given 当前采用图片 When 统一导出 Then 路径只来自主进程并复用素材服务', async () => {
+    const job = createImageJob(imageTargetA, 'job-a', 'asset-a')
+    const context = createContext({
+      imageConfig: createImageConfig(imageTargetA),
+      imageJobs: [job],
+      imageAssets: [createImageAsset('asset-a', job.id)],
+      pickArtifactExportPath: async () => '/tmp/current-image.png',
+    })
+
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT, context.sender, {
+      ...imageTargetA, kind: 'image', assetId: 'asset-a',
+    })).resolves.toEqual({ ok: true, value: undefined })
+    expect(context.imageCalls).toContainEqual({
+      type: 'export',
+      value: { projectId: 'project-1', assetId: 'asset-a', targetPath: '/tmp/current-image.png' },
+    })
+  })
+
+  test('Given 非当前图片或用户取消路径 When 统一导出 Then 不写出素材', async () => {
+    const job = createImageJob(imageTargetA, 'job-a', 'asset-a')
+    const rejected = createContext({
+      imageConfig: createImageConfig(imageTargetA),
+      imageJobs: [job],
+      imageAssets: [createImageAsset('asset-a', job.id), createImageAsset('asset-b', job.id)],
+    })
+    await expect(invoke(rejected.handlers, CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT, rejected.sender, {
+      ...imageTargetA, kind: 'image', assetId: 'asset-b',
+    })).resolves.toMatchObject({ ok: false })
+    expect(rejected.imageCalls.some((call) => call.type === 'export')).toBe(false)
+
+    const cancelled = createContext({
+      imageConfig: createImageConfig(imageTargetA), imageJobs: [job],
+      imageAssets: [createImageAsset('asset-a', job.id)],
+      pickArtifactExportPath: async () => null,
+    })
+    await expect(invoke(cancelled.handlers, CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT, cancelled.sender, {
+      ...imageTargetA, kind: 'image', assetId: 'asset-a',
+    })).resolves.toEqual({ ok: true, value: undefined })
+    expect(cancelled.imageCalls.some((call) => call.type === 'export')).toBe(false)
+  })
+
+  test('Given 文本产物 Registry 已装配 When 注册 Canvas IPC Then 五类 handler 一次性可用', () => {
+    const context = createContext()
+    try {
+      expect([...context.handlers.keys()]).toEqual(expect.arrayContaining([
+        CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,
+        CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT,
+        CANVAS_IPC_CHANNELS.LIST_ARTIFACT_REVISIONS,
+        CANVAS_IPC_CHANNELS.ADOPT_ARTIFACT_REVISION,
+        CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT,
+      ]))
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
+  test('Given 文本产物完整身份 When 读写、采用并导出 Then Registry 路由且写广播发生在 lease 外', async () => {
+    const context = createContext()
+    const identity = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'document-1',
+      kind: 'document' as const, contentId: 'content-1',
+    }
+    const target = { ...identity, contentRevision: 2 }
+    const update = {
+      ...identity,
+      operationId: '11111111-1111-4111-8111-111111111111',
+      expectedCanvasRevision: 4,
+      expectedContentRevision: 2,
+      content: '# 新版本',
+    }
+    const adopt = {
+      ...identity,
+      operationId: '22222222-2222-4222-8222-222222222222',
+      expectedCanvasRevision: 5,
+      expectedContentRevision: 3,
+      revision: 1,
+    }
+
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT, context.sender, target))
+      .resolves.toHaveProperty('value.target', target)
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.LIST_ARTIFACT_REVISIONS, context.sender, identity))
+      .resolves.toHaveProperty('value.0.contentId', identity.contentId)
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT, context.sender, update))
+      .resolves.toHaveProperty('value.artifact.target.contentRevision', 3)
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.ADOPT_ARTIFACT_REVISION, context.sender, adopt))
+      .resolves.toHaveProperty('value.artifact.target.contentRevision', 4)
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT, context.sender, target))
+      .resolves.toEqual({ ok: true, value: undefined })
+
+    expect(context.artifactCalls).toContainEqual({
+      type: 'export',
+      value: { ...target, targetPath: '/tmp/canvas-artifact.md' },
+    })
+    expect(context.broadcastLeaseStates.slice(-2)).toEqual([false, false])
+    context.registration.dispose()
+  })
+
+  test('Given 崩溃 intent 留下 batch publication When 五类产物操作 Then 先对账再执行业务并在 lease 外发布', async () => {
+    const context = createContext({
+      batchPublications: [{
+        document: createDocument(5),
+        source: { sessionId: 'session-1', runStartedAt: 1, toolCallId: 'tool-call-1' },
+      }],
+    })
+    const identity = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'document-1',
+      kind: 'document' as const, contentId: 'content-1',
+    }
+    const target = { ...identity, contentRevision: 2 }
+
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT, context.sender, target)
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.LIST_ARTIFACT_REVISIONS, context.sender, identity)
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT, context.sender, {
+      ...identity, operationId: '55555555-5555-4555-8555-555555555555',
+      expectedCanvasRevision: 5, expectedContentRevision: 2, content: '# 新版本',
+    })
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.ADOPT_ARTIFACT_REVISION, context.sender, {
+      ...identity, operationId: '66666666-6666-4666-8666-666666666666',
+      expectedCanvasRevision: 6, expectedContentRevision: 3, revision: 1,
+    })
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT, context.sender, target)
+
+    expect(context.calls.filter((call) => call === 'batch:reconcile' || call.startsWith('artifact:'))).toEqual([
+      'batch:reconcile', 'artifact:read',
+      'batch:reconcile', 'artifact:list',
+      'batch:reconcile', 'artifact:update',
+      'batch:reconcile', 'artifact:adopt',
+      'batch:reconcile', 'artifact:export',
+    ])
+    expect(context.sender.sent.filter((event) => (
+      event.channel === CANVAS_IPC_CHANNELS.CHANGED
+      && (event.value as CanvasChangeEvent).revision === 5
+    ))).toHaveLength(5)
+    expect(context.broadcastLeaseStates.every((leaseHeld) => leaseHeld === false)).toBe(true)
+    context.registration.dispose()
+  })
+
+  test('Given 已授权 WebView 节点 When 加载原型 Then 只返回受管 HTML 快照', async () => {
+    const context = createContext()
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'webview-1',
+      prototypeId: 'prototype-1', contentRevision: 2,
+    }
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW,
+      context.sender,
+      target,
+    ) as CanvasInvokeResult<CanvasWebviewSnapshot>
+
+    expect(result).toEqual({ ok: true, value: { target, html: '<main>首页</main>' } })
+    expect(context.webviewCalls).toEqual([target])
+  })
+
+  test('Given WebView 读取内部失败 When 加载原型 Then 不泄露路径或异常正文', async () => {
+    const context = createContext({
+      webviewLoad: async () => { throw new Error('/private/canvas/index.html credential=secret') },
+    })
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW,
+      context.sender,
+      {
+        projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'webview-1',
+        prototypeId: 'prototype-1', contentRevision: 2,
+      },
+    )
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_WEBVIEW_LOAD_FAILED', message: '原型暂时无法加载。' },
+    })
+    expect(JSON.stringify(result)).not.toContain('/private')
+    expect(JSON.stringify(result)).not.toContain('credential')
+  })
+
+  test('Given 已授权 WebView 设备目标 When 加载卡片预览 Then 只返回受管图片快照', async () => {
+    const context = createContext()
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'webview-1',
+      prototypeId: 'prototype-1', contentRevision: 2, devicePreset: 'mobile' as const,
+    }
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW_PREVIEW,
+      context.sender,
+      target,
+    ) as CanvasInvokeResult<CanvasWebviewPreviewSnapshot>
+
+    expect(result).toEqual({
+      ok: true,
+      value: { target, previewUrl: 'proma-file://webview-preview', width: 390, height: 844 },
+    })
+    expect(context.webviewCalls).toContainEqual(target)
+  })
+
   test('Given LOAD 与 SAVE When 执行 Then 同一 lease 内先恢复 batch 再进入既有对账链', async () => {
     const context = createContext()
     await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
@@ -803,6 +1169,7 @@ describe('原生 Canvas 文档 IPC', () => {
         config: createImageConfig(imageTargetA),
         jobs: [jobA],
         assets: [createImageAsset('asset-a', jobA.id)],
+        imageVersions: [{ jobId: jobA.id, assetId: 'asset-a', createdAt: 2 }],
         assetBaseUrl: 'proma-file://assets-0',
         thumbnailBaseUrl: 'proma-file://thumbnails-0',
       },
@@ -1414,15 +1781,29 @@ describe('原生 Canvas 文档 IPC', () => {
     }]
     /** 合法回收条目用于确认 list 会逐项严格重建。 */
     const trashEntry: CanvasTrashEntry = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       trashId: 'trash-public',
       nodeId: 'document-public',
       kind: 'document',
       contentId: 'content-public',
+      contentRevision: 0,
       title: '公开文档',
       position: { x: 3, y: 4 },
       deletedRevision: 4,
       deletedAt: 10,
+    }
+    /** v1 兼容输入跨 IPC 后必须升级为 v2，并补齐文本内容 revision。 */
+    const normalizedTrashEntry: CanvasTrashEntry = {
+      schemaVersion: 2,
+      trashId: trashEntry.trashId,
+      nodeId: trashEntry.nodeId,
+      kind: trashEntry.kind,
+      contentId: trashEntry.contentId,
+      contentRevision: 0,
+      title: trashEntry.title,
+      position: trashEntry.position,
+      deletedRevision: trashEntry.deletedRevision,
+      deletedAt: trashEntry.deletedAt,
     }
     /** 生命周期故意夹带根与 snapshot 内部字段，IPC 必须丢弃而非透传。 */
     const context = createContext({
@@ -1469,9 +1850,12 @@ describe('原生 Canvas 文档 IPC', () => {
     })
     expect(deleteResult).toEqual({
       ok: true,
-      value: { snapshot: expectedSnapshot, trashEntry },
+      value: { snapshot: expectedSnapshot, trashEntry: normalizedTrashEntry },
     })
-    expect(listResult).toEqual({ ok: true, value: [trashEntry] })
+    expect(listResult).toEqual({ ok: true, value: [normalizedTrashEntry] })
+    expect(listResult).toHaveProperty('value.0.contentId', 'content-public')
+    expect(listResult).toHaveProperty('value.0.position', { x: 3, y: 4 })
+    expect(listResult).toHaveProperty('value.0.deletedRevision', 4)
     expect(restoreResult).toEqual({
       ok: true,
       value: { snapshot: expectedSnapshot, selectedNodeId: 'node-restored' },
@@ -1553,6 +1937,53 @@ describe('原生 Canvas 文档 IPC', () => {
       },
     }])
     expect(context.broadcastLeaseStates).toEqual([false])
+    errorSpy.mockRestore()
+  })
+
+  test('Given 内容节点创建携带关系语义 When IPC 严格重建 Then 保留合法 relation 并拒绝额外或未知字段', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    /** 两种合法关系必须原样穿过 IPC parser 进入 lifecycle。 */
+    for (const relation of ['derives', 'reference'] as const) {
+      const context = createContext()
+      const input = {
+        projectId: 'project-1', canvasId: 'canvas-1',
+        operationId: relation === 'derives'
+          ? '12121212-1212-4121-8121-121212121212'
+          : '34343434-3434-4343-8343-343434343434',
+        nodeId: `document-${relation}`, kind: 'document' as const,
+        contentId: `content-${relation}`, title: '关系文档',
+        position: { x: 10, y: 20 }, expectedRevision: 4,
+        relationship: { sourceNodeId: 'source-1', edgeId: `edge-${relation}`, relation },
+      }
+
+      const result = await invoke(
+        context.handlers,
+        CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
+        context.sender,
+        input,
+      ) as CanvasInvokeResult<CanvasNodeLifecycleResult>
+
+      expect(result.ok).toBe(true)
+      expect(context.storeInputs.at(-1)).toEqual(input)
+      expect(context.storeInputs.at(-1)).not.toBe(input)
+    }
+
+    /** 嵌套未知字段和非法关系均须在 lifecycle 前 fail closed。 */
+    for (const relationship of [
+      { sourceNodeId: 'source-1', edgeId: 'edge-extra', relation: 'derives', extra: true },
+      { sourceNodeId: 'source-1', edgeId: 'edge-unknown', relation: 'unknown' },
+    ]) {
+      const context = createContext()
+      const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE, context.sender, {
+        projectId: 'project-1', canvasId: 'canvas-1',
+        operationId: '56565656-5656-4565-8565-565656565656',
+        nodeId: 'document-invalid-relation', kind: 'document', contentId: 'content-invalid-relation',
+        title: '非法关系文档', position: { x: 0, y: 0 }, expectedRevision: 4, relationship,
+      }) as CanvasInvokeResult<unknown>
+
+      expect(result.ok).toBe(false)
+      expect(context.calls.some((call) => call === 'content:create')).toBe(false)
+    }
     errorSpy.mockRestore()
   })
 
@@ -1675,10 +2106,10 @@ describe('原生 Canvas 文档 IPC', () => {
     ])
   })
 
-  test('Given schema v1 文档已规范化 When 经 IPC 加载并执行下一次写入 Then 公开文档始终为 v2', async () => {
+  test('Given schema v1 文档已规范化 When 经 IPC 加载并执行下一次写入 Then 公开文档始终为 v4', async () => {
     /** 迁移解析与 IPC 调用共享的稳定双身份。 */
     const target = { projectId: 'project-1', canvasId: 'canvas-1' }
-    /** 真实 v1 parser 输出的规范化 v2 文档。 */
+    /** 真实 v1 parser 输出的规范化 v4 文档。 */
     const migrated = parseCanvasDocument({
       schemaVersion: 1,
       ...target,
@@ -1692,7 +2123,7 @@ describe('原生 Canvas 文档 IPC', () => {
       }],
       edges: [],
     }, target).document
-    /** 模拟迁移后下一次正常 mutation 的 v2 写入结果。 */
+    /** 模拟迁移后下一次正常 mutation 的 v4 写入结果。 */
     const written = { ...migrated, revision: 5, updatedAt: 3 }
     /** IPC 上下文同时返回迁移快照与后续写入结果。 */
     const context = createContext({
@@ -1711,8 +2142,12 @@ describe('原生 Canvas 文档 IPC', () => {
       mutations: [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }],
     }) as CanvasInvokeResult<CanvasDocument>
 
-    expect(loaded).toHaveProperty('value.document.schemaVersion', 2)
-    expect(saved).toHaveProperty('value.schemaVersion', 2)
+    expect(loaded).toHaveProperty('value.document.schemaVersion', 4)
+    expect(loaded).toHaveProperty('value.document.nodes.0.kind', 'document')
+    expect(loaded).toHaveProperty('value.document.nodes.0.documentId', 'document-1')
+    expect(saved).toHaveProperty('value.schemaVersion', 4)
+    expect(saved).toHaveProperty('value.nodes.0.kind', 'document')
+    expect(saved).toHaveProperty('value.nodes.0.documentId', 'document-1')
   })
   test('Given 内部 LOAD 异常含路径和 UUID When IPC 返回 Then 只暴露公开文案', async () => {
     const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
@@ -2331,6 +2766,7 @@ describe('原生 Canvas 文档 IPC', () => {
       relationship: {
         sourceNodeId: 'node-1',
         edgeId: '33333333-3333-4333-8333-333333333333',
+        relation: 'depends-on',
       },
     }
 
@@ -2338,6 +2774,7 @@ describe('原生 Canvas 文档 IPC', () => {
 
     expect(context.storeInputs[0]).toEqual(input)
     expect(context.storeInputs[0]).not.toBe(input)
+    expect(context.storeInputs[0]).toHaveProperty('relationship.relation', 'depends-on')
   })
 
   test('Given 同一 Canvas 两个异步 CREATE When 首个尚未完成 Then 第二个等待完整事务释放', async () => {
@@ -2609,6 +3046,28 @@ describe('原生 Canvas 文档 IPC', () => {
     errorSpy.mockRestore()
   })
 
+  test('Given 授权窗口 When 操作图片候选批次 Then 四个 handler 调用唯一服务且采用模式保持完整', async () => {
+    const context = createContext()
+    const input = { projectId: 'project-1', canvasId: 'canvas-1', batchId: 'batch-1' }
+    const expected = createImageCandidateBatch(input.batchId)
+
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.GET_IMAGE_CANDIDATE_BATCH, context.sender, input))
+      .resolves.toEqual({ ok: true, value: expected })
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.CONTINUE_IMAGE_CANDIDATE_BATCH, context.sender, input))
+      .resolves.toEqual({ ok: true, value: expected })
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.ADOPT_IMAGE_CANDIDATE_BATCH, context.sender, {
+      ...input, mode: 'succeeded',
+    })).resolves.toEqual({ ok: true, value: expected })
+    await expect(invoke(context.handlers, CANVAS_IPC_CHANNELS.ABANDON_IMAGE_CANDIDATE_BATCH, context.sender, input))
+      .resolves.toEqual({ ok: true, value: expected })
+    expect(context.imageCalls.filter((call) => call.type.startsWith('candidate-'))).toEqual([
+      { type: 'candidate-load', value: input },
+      { type: 'candidate-continue', value: input },
+      { type: 'candidate-adopt', value: { ...input, mode: 'succeeded' } },
+      { type: 'candidate-abandon', value: input },
+    ])
+  })
+
   test('Given 单窗口发送失败 When Store 已提交 Then 请求仍成功且其它窗口收到事件', async () => {
     const failing = createSender(2)
     const receiving = createSender(3)
@@ -2628,10 +3087,17 @@ describe('原生 Canvas 文档 IPC', () => {
     errorSpy.mockRestore()
   })
 
-  test('Given 已注册处理器 When 重复 dispose Then 仅移除十九个固定 invoke 通道一次', () => {
+  test('Given 已注册处理器 When 重复 dispose Then 仅移除三十个固定 invoke 通道一次', () => {
     const context = createContext()
     expect(context.registration.channels).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
+      CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,
+      CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT,
+      CANVAS_IPC_CHANNELS.LIST_ARTIFACT_REVISIONS,
+      CANVAS_IPC_CHANNELS.ADOPT_ARTIFACT_REVISION,
+      CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW_PREVIEW,
       CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
       CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
       CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB,
@@ -2639,6 +3105,10 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB,
       CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET,
       CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
+      CANVAS_IPC_CHANNELS.GET_IMAGE_CANDIDATE_BATCH,
+      CANVAS_IPC_CHANNELS.CONTINUE_IMAGE_CANDIDATE_BATCH,
+      CANVAS_IPC_CHANNELS.ADOPT_IMAGE_CANDIDATE_BATCH,
+      CANVAS_IPC_CHANNELS.ABANDON_IMAGE_CANDIDATE_BATCH,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
       CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
@@ -2658,6 +3128,13 @@ describe('原生 Canvas 文档 IPC', () => {
 
     expect(context.removed).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
+      CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,
+      CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT,
+      CANVAS_IPC_CHANNELS.LIST_ARTIFACT_REVISIONS,
+      CANVAS_IPC_CHANNELS.ADOPT_ARTIFACT_REVISION,
+      CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW_PREVIEW,
       CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
       CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
       CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB,
@@ -2665,6 +3142,10 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB,
       CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET,
       CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
+      CANVAS_IPC_CHANNELS.GET_IMAGE_CANDIDATE_BATCH,
+      CANVAS_IPC_CHANNELS.CONTINUE_IMAGE_CANDIDATE_BATCH,
+      CANVAS_IPC_CHANNELS.ADOPT_IMAGE_CANDIDATE_BATCH,
+      CANVAS_IPC_CHANNELS.ABANDON_IMAGE_CANDIDATE_BATCH,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
       CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
@@ -2715,7 +3196,7 @@ describe('原生 Canvas 文档 IPC', () => {
       artifacts: {
         create: async (input: {
           canvasId: string
-          artifactType: 'webview' | 'image'
+          artifactType: 'document' | 'webview' | 'image'
           source: { toolCallId: string }
         }) => ({
           canvasId: input.canvasId,
@@ -2725,6 +3206,32 @@ describe('原生 Canvas 文档 IPC', () => {
           sourceToolCallId: input.source.toolCallId,
         }),
       },
+      textArtifacts: {
+        read: async (input: import('@proma/shared').CanvasTextArtifactTarget) => ({
+          target: input,
+          revision: {
+            kind: input.kind, contentId: input.contentId, revision: input.contentRevision,
+            parentRevision: input.contentRevision > 0 ? input.contentRevision - 1 : null,
+            contentHash: 'a'.repeat(64), createdBy: { type: 'user' as const }, createdAt: 1,
+          },
+          content: input.kind === 'document' ? '# 文档' : '<main>首页</main>',
+        }),
+        listVersions: async () => [],
+        update: async () => { throw new Error('重复注册测试不执行文本更新') },
+        adopt: async () => { throw new Error('重复注册测试不执行文本采用') },
+        export: async () => undefined,
+      },
+      artifactRegistry: {
+        describe: (kind: import('@proma/shared').CanvasContentKind) => kind === 'document'
+          ? DOCUMENT_ARTIFACT_DESCRIPTOR
+          : kind === 'webview' ? WEBVIEW_ARTIFACT_DESCRIPTOR : IMAGE_ARTIFACT_DESCRIPTOR,
+        requireCapability: (kind: import('@proma/shared').CanvasContentKind) => ({
+          descriptor: kind === 'document'
+            ? DOCUMENT_ARTIFACT_DESCRIPTOR
+            : kind === 'webview' ? WEBVIEW_ARTIFACT_DESCRIPTOR : IMAGE_ARTIFACT_DESCRIPTOR,
+        }),
+      },
+      pickArtifactExportPath: async () => null,
       toolAccess: createToolAccess(),
       creation: {
         reconcile: async () => ({
@@ -2765,9 +3272,25 @@ describe('原生 Canvas 文档 IPC', () => {
         listTrashReconciled: async () => ({ reconciliation: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] }, documentChanged: false }, operationOutcome: { ok: true as const, value: [] } }),
         restoreReconciled: async () => ({ reconciliation: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] }, documentChanged: false }, operationOutcome: { ok: true as const, value: { snapshot: { document: createDocument(revision), writable: true as const, nodeIssues: [] } } } }),
       },
+      webviews: {
+        /** 重复注册测试只验证 handler 世代隔离，WebView 正文使用固定受管快照。 */
+        load: async (target: CanvasWebviewTarget) => ({
+          target,
+          html: '<main>首页</main>',
+        }),
+        preview: async (target: CanvasWebviewPreviewTarget) => ({
+          target,
+          previewUrl: 'proma-file://webview-preview',
+          width: target.devicePreset === 'mobile' ? 390 : 1440,
+          height: target.devicePreset === 'mobile' ? 844 : 900,
+        }),
+      },
       imageModules: {
         load: async (target: CanvasImageTarget) => createImageConfig(target),
         save: async (input: SaveCanvasImageModuleInput) => createImageConfig(input, input.expectedConfigRevision + 1),
+        adoptAsset: async (target: CanvasImageTarget, expectedConfigRevision: number, assetId: string) => ({
+          ...createImageConfig(target, expectedConfigRevision + 1), adoptedAssetId: assetId,
+        }),
       },
       imageJobs: {
         createCanvasImage: async () => createImageJob(imageTargetA, 'job-created'),
@@ -2786,8 +3309,17 @@ describe('原生 Canvas 文档 IPC', () => {
         assertTarget: async () => undefined,
         adoptOutput: async () => undefined,
       },
+      imageCandidateBatches: {
+        createBatchLocked: async (input: import('./canvas-image-candidate-batch-service').CreateCanvasImageCandidateBatchInput) => createImageCandidateBatch(input.batchId),
+        listActiveSummaries: async () => [],
+        load: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
+        continueBatch: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
+        adopt: async (input: import('@proma/shared').AdoptCanvasImageCandidateBatchInput) => createImageCandidateBatch(input.batchId),
+        abandon: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
+      },
       imageAssets: {
         list: () => [],
+        exportAsset: async () => undefined,
         createMediaAccess: () => ({
           assetBaseUrl: 'proma-file://assets',
           thumbnailBaseUrl: 'proma-file://thumbnails',
@@ -2827,6 +3359,13 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(handlers.size).toBe(0)
     expect(removed).toEqual([
       CANVAS_IPC_CHANNELS.LOAD,
+      CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,
+      CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT,
+      CANVAS_IPC_CHANNELS.LIST_ARTIFACT_REVISIONS,
+      CANVAS_IPC_CHANNELS.ADOPT_ARTIFACT_REVISION,
+      CANVAS_IPC_CHANNELS.EXPORT_ARTIFACT,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW,
+      CANVAS_IPC_CHANNELS.LOAD_WEBVIEW_PREVIEW,
       CANVAS_IPC_CHANNELS.LOAD_IMAGE_MODULE,
       CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
       CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB,
@@ -2834,6 +3373,10 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB,
       CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET,
       CANVAS_IPC_CHANNELS.RELEASE_IMAGE_MEDIA,
+      CANVAS_IPC_CHANNELS.GET_IMAGE_CANDIDATE_BATCH,
+      CANVAS_IPC_CHANNELS.CONTINUE_IMAGE_CANDIDATE_BATCH,
+      CANVAS_IPC_CHANNELS.ADOPT_IMAGE_CANDIDATE_BATCH,
+      CANVAS_IPC_CHANNELS.ABANDON_IMAGE_CANDIDATE_BATCH,
       CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
       CANVAS_IPC_CHANNELS.CREATE_AGENT_NODE,
       CANVAS_IPC_CHANNELS.CREATE_CONTENT_NODE,
@@ -2848,7 +3391,7 @@ describe('原生 Canvas 文档 IPC', () => {
     ])
 
     registrationA.dispose()
-    expect(removed).toHaveLength(19)
+    expect(removed).toHaveLength(30)
   })
 
   test('Given 生产 Canvas Tool Provider runtime When Agent 创建 WebView 产物 Then 调用注入的原子产物服务', async () => {
@@ -2885,6 +3428,58 @@ describe('原生 Canvas 文档 IPC', () => {
     }
   })
 
+  test('Given 生产 Canvas Tool Provider runtime When 读取并更新 WebView Then 文本与图片依赖已完整装配', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'web-1', kind: 'webview', title: '首页原型', position: { x: 0, y: 0 },
+      prototypeId: 'prototype-1', contentRevision: 1, devicePreset: 'desktop',
+    }, {
+      id: 'image-1', kind: 'image', title: '首页视觉', position: { x: 100, y: 0 },
+      imageModuleId: 'image-module-1',
+    }]
+    const context = createContext({
+      enableToolProviderRuntime: true,
+      loadResult: { document, writable: true, nodeIssues: [] },
+    })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      const run = runtime.createRun({
+        projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      })
+      const read = run.piCustomTools.find((candidate) => candidate.name === 'canvas_read')
+      const update = run.piCustomTools.find((candidate) => candidate.name === 'canvas_update_artifact')
+      if (!read || !update) throw new Error('Canvas 产物工具未注册')
+
+      const readResult = await read.execute('tool-read-1', {
+        canvasId: 'canvas-1', nodeIds: ['web-1', 'image-1'],
+      } as never, undefined as never, undefined as never, undefined as never)
+      const updateResult = await update.execute('tool-update-1', {
+        canvasId: 'canvas-1', nodeId: 'web-1', baseRevision: 4,
+        expectedContentRevision: 1, content: '<main>新版</main>',
+      } as never, undefined as never, undefined as never, undefined as never)
+      const imageUpdateResult = await update.execute('tool-image-update-1', {
+        canvasId: 'canvas-1', nodeId: 'image-1', baseRevision: 4,
+        expectedContentRevision: 3, content: '新的首页视觉提示词',
+      } as never, undefined as never, undefined as never, undefined as never)
+
+      expect(readResult.details).toMatchObject({
+        nodes: [
+          { node: { id: 'web-1' }, artifact: { currentRevision: 1 } },
+          { node: { id: 'image-1' }, artifact: { currentRevision: 3 } },
+        ],
+      })
+      expect(updateResult.details).toMatchObject({ nodeId: 'web-1', contentRevision: 2 })
+      expect(imageUpdateResult.details).toMatchObject({
+        nodeId: 'image-1', contentRevision: 4, requiresRun: true,
+      })
+      expect(context.imageCalls.map((call) => call.type)).not.toContain('run')
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
   test('Given 第二个图片节点创建失败 When 批量运行 Then 零启动并返回已创建任务回滚与失败节点审计', async () => {
     let createCount = 0
     const context = createContext({
@@ -2911,7 +3506,7 @@ describe('原生 Canvas 文档 IPC', () => {
 
       expect(context.imageCalls.filter((call) => call.type === 'run')).toHaveLength(0)
       expect(context.imageCalls.filter((call) => call.type === 'rollback-once')).toHaveLength(1)
-      expect(tasks).toMatchObject([
+      expect(tasks.tasks).toMatchObject([
         { nodeId: 'image-node-a', status: 'rolled-back', taskId: expect.stringMatching(/^agent-canvas-[a-f0-9]{64}$/) },
         { nodeId: 'image-node-b', status: 'failed', error: 'SECOND_JOB_CREATE_FAILED' },
       ])
@@ -2924,6 +3519,17 @@ describe('原生 Canvas 文档 IPC', () => {
     const runLeaseStates: boolean[] = []
     const context = createContext({
       enableToolProviderRuntime: true,
+      imageCandidateBatch: {
+        ...createImageCandidateBatch('agent-canvas-batch-runtime'),
+        status: 'running',
+        entries: [{
+          nodeId: 'image-node-a', imageModuleId: 'image-module-a', initialAdoptedAssetId: 'asset-a',
+          initialConfigRevision: 3, jobId: 'job-a', candidateAssetId: null, status: 'queued', error: null,
+        }, {
+          nodeId: 'image-node-b', imageModuleId: 'image-module-b', initialAdoptedAssetId: 'asset-a',
+          initialConfigRevision: 3, jobId: 'job-b', candidateAssetId: null, status: 'queued', error: null,
+        }],
+      },
       imageRun: async (jobId, leaseHeld) => {
         runLeaseStates.push(leaseHeld)
         if (jobId.includes('never-match')) throw new Error('unused')
@@ -2946,10 +3552,17 @@ describe('原生 Canvas 文档 IPC', () => {
       const callTypes = context.imageCalls.map((call) => call.type)
       expect(callTypes.lastIndexOf('create-once')).toBeLessThan(callTypes.indexOf('run'))
       expect(runLeaseStates).toEqual([false, false])
-      expect(tasks).toMatchObject([
+      expect(tasks.tasks).toMatchObject([
         { nodeId: 'image-node-a', status: 'started', taskId: expect.any(String) },
         { nodeId: 'image-node-b', status: 'failed', taskId: expect.any(String), error: 'SECOND_JOB_RUN_FAILED' },
       ])
+      expect(tasks.batch).toEqual({
+        batchId: 'agent-canvas-batch-runtime', status: 'running', totalCount: 2,
+        candidateCount: 0, failedCount: 0, runningCount: 2, requiresCanvasReview: true,
+      })
+      const serialized = JSON.stringify(tasks)
+      expect(serialized).not.toContain('assetId')
+      expect(serialized).not.toContain('已替换')
     } finally {
       context.registration.dispose()
     }
@@ -2982,8 +3595,8 @@ describe('原生 Canvas 文档 IPC', () => {
     try {
       const runtime = getCanvasToolProviderRuntime()
       if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
-      firstTaskId = (await runtime.runNodes(runContext, target, [node], 'tool-run-1'))[0]?.taskId
-      expect((await runtime.runNodes(runContext, target, [node], 'tool-run-1'))[0]?.taskId).toBe(firstTaskId)
+      firstTaskId = (await runtime.runNodes(runContext, target, [node], 'tool-run-1')).tasks[0]?.taskId
+      expect((await runtime.runNodes(runContext, target, [node], 'tool-run-1')).tasks[0]?.taskId).toBe(firstTaskId)
       expect(firstContext.imageCalls.filter((call) => call.type === 'run')).toHaveLength(1)
     } finally {
       firstContext.registration.dispose()
@@ -2993,7 +3606,7 @@ describe('原生 Canvas 文档 IPC', () => {
     try {
       const runtime = getCanvasToolProviderRuntime()
       if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
-      expect((await runtime.runNodes(runContext, target, [node], 'tool-run-1'))[0]?.taskId).toBe(firstTaskId)
+      expect((await runtime.runNodes(runContext, target, [node], 'tool-run-1')).tasks[0]?.taskId).toBe(firstTaskId)
       expect(reloadedContext.imageCalls.filter((call) => call.type === 'run')).toHaveLength(0)
     } finally {
       reloadedContext.registration.dispose()
@@ -3046,8 +3659,8 @@ describe('原生 Canvas 文档 IPC', () => {
       releaseRun.resolve()
       const [firstResult] = await Promise.all([first])
 
-      expect(firstResult[0]).toMatchObject({ status: 'started', taskId: expect.any(String) })
-      expect(replayResult[0]).toMatchObject({ status: 'started', taskId: firstResult[0]?.taskId })
+      expect(firstResult.tasks[0]).toMatchObject({ status: 'started', taskId: expect.any(String) })
+      expect(replayResult.tasks[0]).toMatchObject({ status: 'started', taskId: firstResult.tasks[0]?.taskId })
       expect(createCount).toBe(1)
       expect(runCount).toBe(1)
     } finally {

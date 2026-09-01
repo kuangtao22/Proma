@@ -55,6 +55,7 @@ import {
   NATIVE_CANVAS_WORKBENCH_CLOSE_TARGET,
   NativeCanvasWorkspace,
   createCanvasImageDraftAutoSaveController,
+  createNativeCanvasWebviewWorkbenchAdapter,
   createCanvasNodeCommandController,
   createCanvasAgentNodeCommandController,
   createCanvasAgentNodeRebuildController,
@@ -82,7 +83,11 @@ import {
   runNativeCanvasToolbarAddNode,
   routeNativeCanvasWorkspaceMutation,
   commitCanvasImageDraftAndCreateJob,
+  exportCanvasImageArtifact,
   createCanvasNodeReferencesFromSnapshot,
+  createNativeCanvasNodeActivityStates,
+  commitNativeCanvasArrangeMutation,
+  listVisibleNativeCanvasNodeIds,
 } from './NativeCanvasWorkspace'
 import type {
   CanvasAgentNodeCommandState,
@@ -109,6 +114,84 @@ function createInitialNativeCanvasState(): NativeCanvasState {
 }
 
 describe('Agent Canvas 共享图与独立视图', () => {
+  test('Given Agent 与图片任务同时运行 When 聚合节点活动态 Then 按 nodeId 输出真实结构化状态', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 100)
+    document.nodes = [
+      { id: 'agent-1', kind: 'agent', title: 'Agent', agentSessionId: 'session-1', position: { x: 0, y: 0 } },
+      { id: 'image-1', kind: 'image', title: '生图', imageModuleId: 'module-1', position: { x: 320, y: 0 } },
+      { id: 'image-2', kind: 'image', title: '生图 2', imageModuleId: 'module-2', position: { x: 640, y: 0 } },
+    ]
+    const jobs = [
+      {
+        id: 'job-1', creativeTaskId: 'task-1', attemptNumber: 1, projectId: 'project-1',
+        target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'image-1', imageModuleId: 'module-1' },
+        action: 'generate', status: 'queued', prompt: '首页', originalRequest: '首页', contextMode: 'none',
+        createdAt: 100, updatedAt: 100,
+      },
+      {
+        id: 'job-2', creativeTaskId: 'task-2', attemptNumber: 1, projectId: 'project-1',
+        target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'image-2', imageModuleId: 'module-2' },
+        action: 'generate', status: 'running', prompt: '发现页', originalRequest: '发现页', contextMode: 'none',
+        createdAt: 101, updatedAt: 101,
+      },
+    ] satisfies DesignJobRecord[]
+
+    const states = createNativeCanvasNodeActivityStates(document, new Set(['session-1']), jobs)
+
+    expect([...states]).toEqual([
+      ['agent-1', 'running'],
+      ['image-1', 'queued'],
+      ['image-2', 'running'],
+    ])
+  })
+
+  test('Given 其他 Canvas 的图片任务 When 聚合节点活动态 Then 不污染同名节点', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 100)
+    document.nodes = [{
+      id: 'image-1', kind: 'image', title: '生图', imageModuleId: 'module-1',
+      position: { x: 0, y: 0 },
+    }]
+    const jobs = [{
+      id: 'job-1', creativeTaskId: 'task-1', attemptNumber: 1, projectId: 'project-1',
+      target: { kind: 'canvas-image', canvasId: 'canvas-2', nodeId: 'image-1', imageModuleId: 'module-1' },
+      action: 'generate', status: 'running', prompt: '首页', originalRequest: '首页', contextMode: 'none',
+      createdAt: 100, updatedAt: 100,
+    }] satisfies DesignJobRecord[]
+
+    expect([...createNativeCanvasNodeActivityStates(document, new Set(), jobs)]).toEqual([])
+  })
+
+  test('Given 视口只覆盖部分动态节点 When 计算可见范围 Then 使用真实卡片尺寸判断相交', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 100)
+    document.nodes = [
+      { id: 'agent-1', kind: 'agent', title: 'Agent', agentSessionId: 'session-1', position: { x: 0, y: 0 } },
+      {
+        id: 'web-1', kind: 'webview', title: '手机原型', prototypeId: 'prototype-1',
+        contentRevision: 0, devicePreset: 'mobile', position: { x: 900, y: 0 },
+      },
+    ]
+
+    expect(listVisibleNativeCanvasNodeIds(document, { width: 800, height: 600 })).toEqual(['agent-1'])
+    document.viewport = { x: -500, y: 0, zoom: 1 }
+    expect(listVisibleNativeCanvasNodeIds(document, { width: 800, height: 600 })).toEqual(['web-1'])
+  })
+
+  test('Given 整理保存失败 When 提交原子位置批次 Then 不接管任何新位置', async () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 100)
+    const onSuccess = mock(() => undefined)
+    const saveCanvas = mock(async () => { throw new Error('disk full') })
+
+    await expect(commitNativeCanvasArrangeMutation({
+      target: { projectId: 'project-1', canvasId: 'canvas-1' },
+      document,
+      mutation: { type: 'move-nodes', positions: [{ nodeId: 'node-1', position: { x: 10, y: 20 } }] },
+      saveCanvas,
+      onSuccess,
+    })).rejects.toThrow('disk full')
+
+    expect(onSuccess).not.toHaveBeenCalled()
+  })
+
   test('Given 权威快照和含已删除节点的选区 When 构造引用 Then 只返回仍存在节点的完整快照', () => {
     const target = { projectId: 'project-1', canvasId: 'canvas-1' }
     const snapshot = createSnapshot(7, target)
@@ -339,6 +422,50 @@ describe('原生 Canvas 批量删除', () => {
 })
 
 describe('Canvas 生图工作台接入', () => {
+  test('Given 当前 adopted 素材存在 When 点击导出 Then 只提交完整图片身份且不修改业务状态', async () => {
+    /** 导出前的图片配置、任务和选区用于证明命令无业务副作用。 */
+    const config = { adoptedAssetId: 'asset-1', revision: 3 }
+    const jobs = [{ id: 'job-1', outputAssetId: 'asset-1' }]
+    const selection = { selectedNodeId: 'image-1' }
+    const before = structuredClone({ config, jobs, selection })
+    const calls: unknown[] = []
+    const error = await exportCanvasImageArtifact({
+      target: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-1', imageModuleId: 'module-1' },
+      adoptedAssetId: 'asset-1',
+      assetIds: ['asset-1'],
+      requestedAssetId: 'asset-1',
+      exportArtifact: async (input) => { calls.push(input) },
+    })
+
+    expect(error).toBeNull()
+    expect(calls).toEqual([{
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-1', imageModuleId: 'module-1',
+      kind: 'image', assetId: 'asset-1',
+    }])
+    expect({ config, jobs, selection }).toEqual(before)
+  })
+
+  test('Given 非当前素材、素材缺失或导出失败 When 点击导出 Then 拒绝错误目标并返回独立错误', async () => {
+    let calls = 0
+    const base = {
+      target: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-1', imageModuleId: 'module-1' },
+      adoptedAssetId: 'asset-1',
+      exportArtifact: async () => { calls += 1 },
+    }
+
+    expect(await exportCanvasImageArtifact({ ...base, assetIds: ['asset-1'], requestedAssetId: 'asset-2' }))
+      .toBe('当前图片不可导出，请重新加载。')
+    expect(await exportCanvasImageArtifact({ ...base, assetIds: [], requestedAssetId: 'asset-1' }))
+      .toBe('当前图片不可导出，请重新加载。')
+    expect(calls).toBe(0)
+    expect(await exportCanvasImageArtifact({
+      ...base,
+      assetIds: ['asset-1'],
+      requestedAssetId: 'asset-1',
+      exportArtifact: async () => { throw new Error('磁盘已满') },
+    })).toBe('图片导出失败，请重试。')
+  })
+
   test('Given 连续修改图片配置 When 短延迟结束 Then 合并为一次自动保存', async () => {
     const callbacks = new Map<number, () => void>()
     const cleared: number[] = []
@@ -438,10 +565,15 @@ describe('Canvas 生图工作台接入', () => {
         aspectRatio: '16:9',
         imageSize: '2K',
         contextMode: 'project',
-        adoptedAssetId: null,
+        adoptedAssetId: 'asset-1',
       },
       jobs: [],
-      assets: [],
+      assets: [{
+        id: 'asset-1', filename: 'asset-1.png', relativePath: 'assets/asset-1.png',
+        thumbnailRelativePath: 'thumbnails/asset-1.webp', mediaType: 'image/png',
+        width: 1, height: 1, byteSize: 1, sha256: 'a'.repeat(64), createdAt: 1,
+      }],
+      imageVersions: [],
       assetBaseUrl: 'proma-file://assets',
       thumbnailBaseUrl: 'proma-file://thumbnails',
     }
@@ -518,6 +650,7 @@ describe('Canvas 生图工作台接入', () => {
             }),
             onImageModelProfilesChanged: () => () => {},
             onImageModelSelectionChanged: () => () => {},
+            exportCanvasArtifact: async () => undefined,
           }}
           flowRenderer={(props) => <>{props.nodes[0]?.data.workbench}</>}
         />
@@ -526,11 +659,87 @@ describe('Canvas 生图工作台接入', () => {
 
     expect(html).toContain('生成图片')
     expect(html).toContain('提示词')
+    expect(html).toMatch(/<button(?![^>]*disabled="")[^>]*aria-label="导出当前图片"[^>]*>/u)
     expect(html).not.toContain('生图节点已创建')
   })
 })
 
 describe('原生 Canvas 单工作台切换', () => {
+  test('Given WebView 文本能力不完整 When 构造详情 Adapter Then 保留占位而不进入半可用编辑器', () => {
+    const base = {
+      loadCanvas: async () => createSnapshot(1, { projectId: 'project-1', canvasId: 'canvas-1' }),
+      saveCanvas: async () => createEmptyCanvasDocument('project-1', 'canvas-1', 1),
+      onCanvasChanged: () => () => undefined,
+    }
+    expect(createNativeCanvasWebviewWorkbenchAdapter({
+      ...base,
+      loadCanvasWebview: async (input) => ({ target: input, html: '<main>首页</main>' }),
+    })).toBeNull()
+
+    const complete = {
+      ...base,
+      loadCanvasWebview: async (input: Parameters<NonNullable<import('@/lib/design-adapter').DesignAdapter['loadCanvasWebview']>>[0]) => ({ target: input, html: '<main>首页</main>' }),
+      loadCanvasTextArtifact: async () => { throw new Error('not reached') },
+      updateCanvasTextArtifact: async () => { throw new Error('not reached') },
+      listCanvasArtifactRevisions: async () => [],
+      adoptCanvasArtifactRevision: async () => { throw new Error('not reached') },
+      exportCanvasArtifact: async () => undefined,
+    }
+    expect(createNativeCanvasWebviewWorkbenchAdapter(complete)).not.toBeNull()
+  })
+
+  test('Given 文档节点已展开 When 渲染工作区 Then 挂载真实文档工作台而不是占位提示', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const snapshot = createSnapshot(4, target)
+    snapshot.document.nodes = [{
+      id: 'document-1', kind: 'document', title: '需求说明',
+      documentId: 'content-1', contentRevision: 2, position: { x: 0, y: 0 },
+    }]
+    const graphKey = createNativeCanvasKey(target.projectId, target.canvasId)
+    const viewKey = createAgentCanvasViewKey('session-1', target.projectId, target.canvasId)
+    const store = createStore()
+    store.set(nativeCanvasStatesAtom, new Map([[graphKey, {
+      ...createInitialGraphNativeCanvasState(), phase: 'ready', snapshot,
+    }]]))
+    store.set(agentCanvasViewStatesAtom, new Map([[viewKey, {
+      ...createInitialAgentCanvasViewState(snapshot.document.viewport),
+      selectedNodeId: 'document-1', selectedNodeIds: ['document-1'], expandedNodeId: 'document-1',
+    }]]))
+    const adapter = {
+      loadCanvas: async () => snapshot,
+      saveCanvas: async () => snapshot.document,
+      onCanvasChanged: () => () => {},
+      loadCanvasTextArtifact: async (input: import('@proma/shared').CanvasTextArtifactTarget) => ({
+        target: input,
+        revision: {
+          kind: 'document' as const, contentId: input.contentId, revision: input.contentRevision,
+          parentRevision: 1, contentHash: 'a'.repeat(64), createdBy: { type: 'user' as const }, createdAt: 1,
+        },
+        content: '# 初稿',
+      }),
+      updateCanvasTextArtifact: async () => { throw new Error('not reached in SSR') },
+      listCanvasArtifactRevisions: async () => [],
+      adoptCanvasArtifactRevision: async () => { throw new Error('not reached in SSR') },
+      exportCanvasArtifact: async () => undefined,
+    }
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          sessionId="session-1"
+          target={target}
+          title="Canvas 1"
+          adapter={adapter}
+          flowRenderer={(props) => <>{props.nodes[0]?.data.workbench}</>}
+        />
+      </Provider>,
+    )
+
+    expect(html).toContain('aria-label="文档工作台"')
+    expect(html).toContain('aria-label="文档工作台内容"')
+    expect(html).not.toContain('下一步：开始撰写内容')
+  })
+
   test('Given 两个 Canvas 含同名节点 When 创建提交器键 Then Workspace 身份保持隔离', () => {
     const first = createNativeCanvasWorkbenchDraftCommitterKey('project-1:canvas-a', 'image-1')
     const second = createNativeCanvasWorkbenchDraftCommitterKey('project-1:canvas-b', 'image-1')
@@ -1802,7 +2011,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       await controller.execute({ kind, sourceNodeId: 'source-1' })
 
       expect(inputs[0]).toMatchObject({
-        relationship: { sourceNodeId: 'source-1', edgeId: 'edge-1' },
+        relationship: { sourceNodeId: 'source-1', edgeId: 'edge-1', relation: 'derives' },
       })
     },
   )
@@ -1980,7 +2189,18 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       .toEqual({ x: 106, y: 53 })
   })
 
-  test('Given 全局追加位置仍在可视区 When 独立新增 Then 保持既有横向追加顺序', () => {
+  test('Given 空图创建手机 WebView When 计算顶部新增位置 Then 使用手机卡片真实尺寸居中', () => {
+    const document = createSnapshot(1).document
+    document.viewport = { x: 0, y: 0, zoom: 1 }
+
+    expect(findNativeCanvasAgentNodeCreationPosition(
+      document,
+      { width: 800, height: 700 },
+      { kind: 'webview', devicePreset: 'mobile' },
+    )).toEqual({ x: 284, y: 61 })
+  })
+
+  test('Given 当前视口已有分散节点 When 独立新增 Then 围绕视口中心寻找最近空槽', () => {
     const document = createSnapshot(1).document
     document.nodes = [
       { id: 'first', kind: 'agent', title: '首节点', agentSessionId: 's-1', position: { x: -200, y: 40 } },
@@ -1989,10 +2209,10 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     document.viewport = { x: 0, y: 0, zoom: 1 }
 
     expect(findNativeCanvasAgentNodeCreationPosition(document, { width: 1_400, height: 900 }))
-      .toEqual({ x: 812, y: 40 })
+      .toEqual({ x: 868, y: 210 })
   })
 
-  test('Given 横向节点已延伸到屏幕外 When 独立新增 Then 在当前可视区下一行追加且不改已有布局', () => {
+  test('Given 横向节点已延伸到屏幕外 When 独立新增 Then 在当前视口紧凑避让且不改已有布局', () => {
     const document = createSnapshot(1).document
     document.viewport = { x: 0, y: 0, zoom: 1 }
     document.nodes = [
@@ -2010,7 +2230,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     const original = structuredClone(document)
 
     expect(findNativeCanvasAgentNodeCreationPosition(document, { width: 800, height: 600 }))
-      .toEqual({ x: 100, y: 268 })
+      .toEqual({ x: 568, y: 396 })
     expect(document).toEqual(original)
   })
 
@@ -2243,7 +2463,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       nodeId: 'node-2',
       title: '新 Agent',
       position: { x: 412, y: 268 },
-      relationship: { sourceNodeId: 'agent-1', edgeId: 'edge-1' },
+      relationship: { sourceNodeId: 'agent-1', edgeId: 'edge-1', relation: 'derives' },
     }])
   })
 
@@ -2277,8 +2497,8 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       { id: 'agent-2', kind: 'agent', title: 'Agent 2', agentSessionId: 'session-2', position: { x: 320, y: 0 } },
     ]
     document.edges = [
-      { id: 'edge-in', sourceNodeId: 'agent-2', sourcePort: 'output', targetNodeId: 'agent-1', targetPort: 'input' },
-      { id: 'edge-out', sourceNodeId: 'agent-1', sourcePort: 'output', targetNodeId: 'agent-2', targetPort: 'input' },
+      { id: 'edge-in', sourceNodeId: 'agent-2', sourcePort: 'output', targetNodeId: 'agent-1', targetPort: 'input', relation: 'depends-on' },
+      { id: 'edge-out', sourceNodeId: 'agent-1', sourcePort: 'output', targetNodeId: 'agent-2', targetPort: 'input', relation: 'depends-on' },
     ]
 
     expect(getNativeCanvasConnectedEdgeCount(document, 'agent-1')).toBe(2)
@@ -2577,7 +2797,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     expect(conversationRenderCount).toBe(0)
   })
 
-  test('Given Canvas 有工具状态、问题和运行节点 When 渲染 Graph Then 传入真实投影参数', () => {
+  test('Given 手型模式有运行节点 When 单击和双击节点 Then 保持平移且仍可选中并打开详情', () => {
     const target = { projectId: 'project-1', canvasId: 'canvas-1' }
     const snapshot = createSnapshot(3, target)
     snapshot.document.nodes = [{
@@ -2589,10 +2809,16 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       allowedActions: ['rebuild-agent-session', 'remove-node'],
     }]
     const store = createStore()
+    /** 手型模式状态按会话和画布隔离，避免测试依赖旧共享状态。 */
+    const viewStateKey = createAgentCanvasViewKey('legacy-test-session', target.projectId, target.canvasId)
     store.set(nativeCanvasStatesAtom, new Map([[
       createNativeCanvasKey(target.projectId, target.canvasId),
-      { ...createInitialNativeCanvasState(), phase: 'ready', snapshot, activeTool: 'pan' },
+      { ...createInitialGraphNativeCanvasState(), phase: 'ready', snapshot },
     ]]))
+    store.set(agentCanvasViewStatesAtom, new Map([[viewStateKey, {
+      ...createInitialAgentCanvasViewState(snapshot.document.viewport),
+      activeTool: 'pan',
+    }]]))
     store.set(canvasAgentRunningSessionIdsAtom, new Set(['session-1']))
     let flowProps: NativeCanvasFlowProps | undefined
 
@@ -2623,7 +2849,26 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       data: { status: 'unavailable', canOpenWorkbench: true, canCreateChild: false },
     })
     expect(flowProps?.nodesDraggable).toBe(false)
+    expect(flowProps?.nodesConnectable).toBe(false)
     expect(flowProps?.panOnDrag).toBe(true)
+    expect(flowProps?.elementsSelectable).toBe(true)
+
+    /** 使用真实投影节点触发 XYFlow 回调，验证选中和展开状态。 */
+    const node = flowProps?.nodes[0]
+    expect(node).toBeDefined()
+    flowProps?.onNodeClick?.({} as never, node!)
+    expect(store.get(agentCanvasViewStatesAtom).get(viewStateKey)).toMatchObject({
+      selectedNodeId: 'agent-1',
+      selectedNodeIds: ['agent-1'],
+      expandedNodeId: null,
+    })
+
+    flowProps?.onNodeDoubleClick?.({} as never, node!)
+    expect(store.get(agentCanvasViewStatesAtom).get(viewStateKey)).toMatchObject({
+      selectedNodeId: 'agent-1',
+      selectedNodeIds: ['agent-1'],
+      expandedNodeId: 'agent-1',
+    })
   })
 
   test('Given Agent 节点工作台已打开 When 收起工作台 Then 保留普通选区且不再挂载对话', () => {
@@ -2697,7 +2942,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     })
   })
 
-  test('Given 两个内容节点 When 只展开文档 Then Graph 只注入一个文档工作台', () => {
+  test('Given 两个内容节点 When 展开 WebView Then Graph 注入原型预览而不是空占位', () => {
     const target = { projectId: 'project-1', canvasId: 'canvas-1' }
     const snapshot = createSnapshot(2, target)
     snapshot.document.nodes = [
@@ -2707,7 +2952,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       },
       {
         id: 'webview-1', kind: 'webview', title: '首页原型',
-        prototypeId: 'prototype-1', contentRevision: 0, position: { x: 320, y: 0 },
+        prototypeId: 'prototype-1', contentRevision: 0, devicePreset: 'desktop', position: { x: 320, y: 0 },
       },
     ]
     const store = createStore()
@@ -2715,7 +2960,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       createNativeCanvasKey(target.projectId, target.canvasId),
       {
         ...createInitialNativeCanvasState(), phase: 'ready', snapshot,
-        selectedNodeId: 'document-1', expandedNodeId: 'document-1',
+        selectedNodeId: 'webview-1', expandedNodeId: 'webview-1',
       },
     ]]))
 
@@ -2727,6 +2972,20 @@ describe('原生 Canvas 添加 Agent 命令', () => {
           title="Canvas 1"
           adapter={{
             loadCanvas: async () => snapshot,
+            loadCanvasWebview: async (input) => ({ target: input, html: '<main>首页</main>' }),
+            loadCanvasTextArtifact: async (input) => ({
+              target: input,
+              revision: {
+                kind: 'webview', contentId: input.contentId, revision: input.contentRevision,
+                parentRevision: null, contentHash: 'a'.repeat(64),
+                createdBy: { type: 'user' }, createdAt: 1,
+              },
+              content: '<main>首页</main>',
+            }),
+            updateCanvasTextArtifact: async () => { throw new Error('not reached in SSR') },
+            listCanvasArtifactRevisions: async () => [],
+            adoptCanvasArtifactRevision: async () => { throw new Error('not reached in SSR') },
+            exportCanvasArtifact: async () => undefined,
             saveCanvas: async () => snapshot.document,
             onCanvasChanged: () => () => {},
           }}
@@ -2737,9 +2996,61 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       </Provider>,
     )
 
-    expect(html).toContain('aria-label="文档工作台"')
-    expect(html).not.toContain('aria-label="原型工作台"')
-    expect(html.match(/aria-label="文档工作台"/gu)).toHaveLength(1)
+    expect(html).toContain('aria-label="原型工作台"')
+    expect(html).toContain('aria-label="原型预览"')
+    expect(html).not.toContain('下一步：创建 HTML 原型')
+    expect(html.match(/aria-label="原型工作台"/gu)).toHaveLength(1)
+  })
+
+  test('Given WebView 设备切换仍在保存 When 投影折叠卡片 Then 阻止提前请求新设备预览', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const snapshot = createSnapshot(2, target)
+    snapshot.document.nodes = [{
+      id: 'webview-1', kind: 'webview', title: '首页原型',
+      prototypeId: 'prototype-1', contentRevision: 0, devicePreset: 'mobile', position: { x: 0, y: 0 },
+    }]
+    const pendingMutation = {
+      type: 'set-webview-device-preset' as const,
+      nodeId: 'webview-1',
+      devicePreset: 'mobile' as const,
+    }
+    const store = createStore()
+    store.set(nativeCanvasStatesAtom, new Map([[
+      createNativeCanvasKey(target.projectId, target.canvasId),
+      {
+        ...createInitialNativeCanvasState(),
+        phase: 'ready',
+        snapshot,
+        pendingMutations: [pendingMutation],
+        saveState: 'dirty',
+      },
+    ]]))
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          sessionId="preview-save-gate-session"
+          target={target}
+          title="Canvas 1"
+          adapter={{
+            loadCanvas: async () => snapshot,
+            loadCanvasWebviewPreview: async (input) => ({
+              target: input,
+              previewUrl: 'proma-file://preview/mobile.webp',
+              width: 390,
+              height: 844,
+            }),
+            saveCanvas: async () => snapshot.document,
+            onCanvasChanged: () => () => {},
+          }}
+          flowRenderer={(props) => (
+            <span>{String(props.nodes[0]?.data.webviewPreviewRequestReady)}</span>
+          )}
+        />
+      </Provider>,
+    )
+
+    expect(html).toContain('<span>false</span>')
   })
 
   test('Given Agent 工作台已展开 When 渲染 Canvas Then 对话只挂载在节点覆盖层且画布不缩窄', () => {

@@ -138,6 +138,7 @@ import {
 import { registerGlobalShortcut, unregisterAllGlobalShortcuts } from './lib/global-shortcut-service'
 import { setPromaVersion } from '@proma/core'
 import { canRecoverRenderer, RENDERER_RECOVERY_WINDOW_MS } from './lib/renderer-process-recovery'
+import { shouldBlockSandboxedSrcdocNavigation } from './lib/sandboxed-srcdoc-navigation'
 import {
   getDefaultDataRootLocator,
   registerPathManagementIpcHandlers,
@@ -614,7 +615,23 @@ function createWindow(): void {
   mainWindow.on('resize', scheduleWindowStateSave)
   mainWindow.on('move', scheduleWindowStateSave)
 
-  // 拦截页面内导航，外部链接用系统浏览器打开，防止 Electron 窗口被覆盖
+  // Agent 原型 iframe 必须保持离线；所有子 frame 导航方式统一在 Electron 边界阻断。
+  mainWindow.webContents.on('will-frame-navigate', (event) => {
+    /** 即将导航 frame 的当前地址，用于识别已提交的 srcdoc 原型。 */
+    const frameUrl = event.frame?.url ?? null
+    /** 发起导航的 frame 地址，覆盖跨 frame 触发的导航。 */
+    const initiatorUrl = event.initiator?.url ?? null
+    if (shouldBlockSandboxedSrcdocNavigation({
+      url: event.url,
+      isMainFrame: event.isMainFrame,
+      frameUrl,
+      initiatorUrl,
+    })) {
+      event.preventDefault()
+    }
+  })
+
+  // 拦截主页面内导航，外部链接用系统浏览器打开，防止 Electron 窗口被覆盖
   mainWindow.webContents.on('will-navigate', (event, url) => {
     // 错误页上的“重新加载主界面”需要放行回到原始入口。
     if (url === rendererEntryUrl) {

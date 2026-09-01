@@ -139,8 +139,12 @@ export interface CanvasContentNodeLifecycle {
   ) => Promise<void>
   /** 批量删除在图提交前把内容按完整回收身份移入 trash。 */
   prepareBatchDeletion: (target: CanvasTarget, entry: CanvasTrashEntry) => Promise<void>
+  /** 共享物理内容批量删除时一次处理全部回收身份。 */
+  prepareBatchDeletions: (target: CanvasTarget, entries: readonly CanvasTrashEntry[]) => Promise<void>
   /** 批量图提交前失败时按同一回收身份恢复内容。 */
   restoreBatchDeletion: (target: CanvasTarget, entry: CanvasTrashEntry) => Promise<void>
+  /** 共享物理内容批量回滚时逐项恢复全部回收身份。 */
+  restoreBatchDeletions: (target: CanvasTarget, entries: readonly CanvasTrashEntry[]) => Promise<void>
   /** 批量删除提交前复用现有 Agent 运行守卫。 */
   assertBatchAgentNodeIdle: (nodeId: string, sessionId: string) => void
 }
@@ -196,14 +200,31 @@ function parseIntentNode(value: unknown): CanvasNode {
     position: value.position, expectedRevision: 0,
   })
   if (parsed.kind === 'image' && hasKeys(value, ['id', 'kind', 'title', 'position', 'imageModuleId'], ['adoptedAssetId'])) {
-    if (value.adoptedAssetId !== undefined && typeof value.adoptedAssetId !== 'string') throw new Error('CANVAS_CONTENT_INTENT_INVALID')
+    if (value.adoptedAssetId !== undefined
+      && (typeof value.adoptedAssetId !== 'string' || !CONTENT_STABLE_ID.test(value.adoptedAssetId))) {
+      throw new Error('CANVAS_CONTENT_INTENT_INVALID')
+    }
     return { id: parsed.nodeId, kind: 'image', title: parsed.title, position: parsed.position, imageModuleId: parsed.contentId, ...(value.adoptedAssetId === undefined ? {} : { adoptedAssetId: value.adoptedAssetId }) }
   }
-  if (parsed.kind === 'document' && hasKeys(value, ['id', 'kind', 'title', 'position', 'documentId', 'contentRevision']) && value.contentRevision === 0) {
-    return { id: parsed.nodeId, kind: 'document', title: parsed.title, position: parsed.position, documentId: parsed.contentId, contentRevision: 0 }
+  if (parsed.kind === 'document'
+    && hasKeys(value, ['id', 'kind', 'title', 'position', 'documentId', 'contentRevision'])
+    && Number.isSafeInteger(value.contentRevision) && (value.contentRevision as number) >= 0) {
+    return { id: parsed.nodeId, kind: 'document', title: parsed.title, position: parsed.position, documentId: parsed.contentId, contentRevision: value.contentRevision as number }
   }
-  if (parsed.kind === 'webview' && hasKeys(value, ['id', 'kind', 'title', 'position', 'prototypeId', 'contentRevision']) && value.contentRevision === 0) {
-    return { id: parsed.nodeId, kind: 'webview', title: parsed.title, position: parsed.position, prototypeId: parsed.contentId, contentRevision: 0 }
+  if (parsed.kind === 'webview'
+    && hasKeys(value, ['id', 'kind', 'title', 'position', 'prototypeId', 'contentRevision'], ['devicePreset'])
+    && Number.isSafeInteger(value.contentRevision) && (value.contentRevision as number) >= 0
+    && (value.devicePreset === undefined || value.devicePreset === 'desktop' || value.devicePreset === 'mobile')) {
+    /** 旧崩溃恢复 intent 缺少设备字段时确定性迁移为网页预设。 */
+    return {
+      id: parsed.nodeId,
+      kind: 'webview',
+      title: parsed.title,
+      position: parsed.position,
+      prototypeId: parsed.contentId,
+      contentRevision: value.contentRevision as number,
+      devicePreset: value.devicePreset ?? 'desktop',
+    }
   }
   throw new Error('CANVAS_CONTENT_INTENT_INVALID')
 }
@@ -300,12 +321,61 @@ export function parseCanvasContentNodeIntent(value: unknown, target: CanvasTarge
   }
 }
 
-/** 按类别建立仅引用 contentId 的 v2 节点。 */
+/** 按类别建立仅引用 contentId 的当前版本节点。 */
 function createContentNode(input: CreateCanvasContentNodeInput): CanvasNode {
   const base = { id: input.nodeId, title: input.title, position: input.position }
   if (input.kind === 'image') return { ...base, kind: 'image', imageModuleId: input.contentId }
   if (input.kind === 'document') return { ...base, kind: 'document', documentId: input.contentId, contentRevision: 0 }
-  return { ...base, kind: 'webview', prototypeId: input.contentId, contentRevision: 0 }
+  return {
+    ...base,
+    kind: 'webview',
+    prototypeId: input.contentId,
+    contentRevision: 0,
+    devicePreset: 'desktop',
+  }
+}
+
+/**
+ * 从删除时的真实节点构造无损 v2 回收条目。
+ * @param node 当前权威图中的内容节点。
+ * @param trashId 本次删除的独立回收身份。
+ * @param deletedRevision 删除前权威图 revision。
+ * @param deletedAt 删除事务创建时间。
+ * @returns 已经共享 parser 规范化的 v2 回收条目。
+ */
+function createTrashEntry(
+  node: Exclude<CanvasNode, { kind: 'agent' }>,
+  trashId: string,
+  deletedRevision: number,
+  deletedAt: number,
+): CanvasTrashEntry {
+  const identity = requireContentIdentity(node)
+  const base = {
+    schemaVersion: 2 as const,
+    trashId,
+    nodeId: node.id,
+    contentId: identity.contentId,
+    title: node.title,
+    position: node.position,
+    deletedRevision,
+    deletedAt,
+  }
+  if (node.kind === 'image') {
+    return parseCanvasTrashEntry({
+      ...base,
+      kind: node.kind,
+      ...(node.adoptedAssetId ? { adoptedAssetId: node.adoptedAssetId } : {}),
+    })
+  }
+  if (node.kind === 'document') {
+    return parseCanvasTrashEntry({ ...base, kind: node.kind, contentRevision: node.contentRevision })
+  }
+  return parseCanvasTrashEntry({
+    ...base,
+    kind: node.kind,
+    contentRevision: node.contentRevision,
+    devicePreset: node.devicePreset,
+  })
 }
 
 /** 比较已有 operation 与当前输入固化的业务事实。 */
@@ -448,7 +518,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
           const relationship = intent.relationship
           if (relationship) {
             if (!document.nodes.some((node) => node.id === relationship.sourceNodeId)) throw new Error('CANVAS_RELATIONSHIP_SOURCE_MISSING')
-            mutations.push({ type: 'upsert-edges', edges: [{ id: relationship.edgeId, sourceNodeId: relationship.sourceNodeId, sourcePort: 'output', targetNodeId: intent.node.id, targetPort: 'input' }] })
+            mutations.push({ type: 'upsert-edges', edges: [{ id: relationship.edgeId, sourceNodeId: relationship.sourceNodeId, sourcePort: 'output', targetNodeId: intent.node.id, targetPort: 'input', relation: relationship.relation }] })
           }
           document = dependencies.store.mutate(target, document.revision, mutations)
           changed = true
@@ -609,7 +679,9 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       const identity = contentIdentity(node)
       const timestamp = now()
       const trashId = identity ? randomUUID() : undefined
-      const trashEntry = identity ? parseCanvasTrashEntry({ schemaVersion: 1, trashId, nodeId: node.id, kind: identity.kind, contentId: identity.contentId, title: node.title, position: node.position, deletedRevision: document.revision, deletedAt: timestamp }) : undefined
+      const trashEntry = identity
+        ? createTrashEntry(node, trashId!, document.revision, timestamp)
+        : undefined
       const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'delete', state: 'prepared', operationId: input.operationId, ...targetFrom(input), node, expectedRevision: input.expectedRevision, ...(trashId ? { trashId } : {}), ...(trashEntry ? { trashEntry } : {}), createdAt: timestamp, updatedAt: timestamp }
       const error = await write(intent, reconciled.capability)
       if (error) throw error
@@ -636,9 +708,20 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       const entry = (await dependencies.contentStore.listTrash(input)).find((candidate) => candidate.trashId === input.trashId)
       if (!entry) throw new Error('CANVAS_TRASH_ENTRY_NOT_FOUND')
       const base = { id: entry.nodeId, title: entry.title, position: input.position }
-      const node: CanvasNode = entry.kind === 'image' ? { ...base, kind: 'image', imageModuleId: entry.contentId }
-        : entry.kind === 'document' ? { ...base, kind: 'document', documentId: entry.contentId, contentRevision: 0 }
-          : { ...base, kind: 'webview', prototypeId: entry.contentId, contentRevision: 0 }
+      const node: CanvasNode = entry.kind === 'image' ? {
+        ...base,
+        kind: 'image',
+        imageModuleId: entry.contentId,
+        ...(entry.adoptedAssetId ? { adoptedAssetId: entry.adoptedAssetId } : {}),
+      }
+        : entry.kind === 'document' ? { ...base, kind: 'document', documentId: entry.contentId, contentRevision: entry.contentRevision }
+          : {
+              ...base,
+              kind: 'webview',
+              prototypeId: entry.contentId,
+              contentRevision: entry.contentRevision,
+              devicePreset: entry.devicePreset,
+            }
       if (document.nodes.some((candidate) => candidate.id === node.id)) throw new Error('CANVAS_NODE_IDENTITY_CONFLICT')
       const timestamp = now()
       const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'restore', state: 'prepared', operationId: input.operationId, ...targetFrom(input), node, expectedRevision: input.expectedRevision, trashId: input.trashId, trashEntry: entry, createdAt: timestamp, updatedAt: timestamp }
@@ -698,10 +781,38 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       }
       await dependencies.contentStore.moveToTrash(target, entry)
     },
+    /** 共享内容批删逐节点取消运行任务，但只执行一次物理目录迁移。 */
+    prepareBatchDeletions: async (target, entries) => {
+      if (entries.length === 0) throw new Error('CANVAS_TRASH_ENTRY_INVALID')
+      for (const entry of entries) {
+        if (entry.kind !== 'image') continue
+        await dependencies.cancelActiveImageJobs({
+          ...target,
+          nodeId: entry.nodeId,
+          imageModuleId: entry.contentId,
+        })
+      }
+      if (dependencies.contentStore.moveManyToTrash) {
+        await dependencies.contentStore.moveManyToTrash(target, entries)
+        return
+      }
+      /** 旧测试 Adapter 只支持单条回收；单节点路径保持兼容。 */
+      if (entries.length !== 1) throw new Error('CANVAS_BATCH_SHARED_TRASH_UNSUPPORTED')
+      await dependencies.contentStore.moveToTrash(target, entries[0]!)
+    },
     restoreBatchDeletion: async (target, entry) => {
       const restored = await dependencies.contentStore.restoreFromTrash(target, entry.trashId)
       if (JSON.stringify(restored) !== JSON.stringify(entry)) {
         throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      }
+    },
+    /** 共享内容回滚逐条验证节点快照，底层存储只在首次调用移动目录。 */
+    restoreBatchDeletions: async (target, entries) => {
+      for (const entry of entries) {
+        const restored = await dependencies.contentStore.restoreFromTrash(target, entry.trashId)
+        if (JSON.stringify(restored) !== JSON.stringify(entry)) {
+          throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+        }
       }
     },
     reconcile: async (target) => (await reconcileInternal(target)).result,

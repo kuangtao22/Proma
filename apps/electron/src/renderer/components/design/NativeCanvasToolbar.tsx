@@ -5,6 +5,7 @@ import {
   FileImage,
   FileText,
   Hand,
+  LayoutGrid,
   Monitor,
   MousePointer2,
   MessageSquareQuote,
@@ -14,6 +15,17 @@ import {
   Video,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
 import {
   Popover,
   PopoverClose,
@@ -58,6 +70,13 @@ export interface NativeCanvasToolbarProps {
   onAddNode: (kind: CanvasNodeKind) => void
   onDelete: () => void
   onReferenceSelection?: () => void
+  /** 三个显式整理范围分别展示实际节点数量。 */
+  arrangeSelectionCount?: number
+  arrangeVisibleCount?: number
+  arrangeAllCount?: number
+  onArrangeSelection?: () => void
+  onArrangeVisible?: () => void
+  onArrangeAll?: () => void
   onFocusFirstIssue: () => void
 }
 
@@ -121,6 +140,12 @@ export function NativeCanvasToolbar({
   onAddNode,
   onDelete,
   onReferenceSelection,
+  arrangeSelectionCount = 0,
+  arrangeVisibleCount = 0,
+  arrangeAllCount = 0,
+  onArrangeSelection,
+  onArrangeVisible,
+  onArrangeAll,
   onFocusFirstIssue,
 }: NativeCanvasToolbarProps): React.ReactElement {
   return (
@@ -211,6 +236,80 @@ export function NativeCanvasToolbar({
               {NATIVE_CANVAS_NODE_TYPE_OPTIONS.map((option) => (
                 <NativeCanvasNodeTypePickerOption key={option.kind} option={option} onAddNode={onAddNode} />
               ))}
+            </div>
+          </PopoverContent>
+        </Popover>
+
+        <Popover>
+          <PopoverTrigger asChild>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              className="size-8"
+              aria-label="整理布局"
+              disabled={!writable || arrangeAllCount < 2}
+            >
+              <LayoutGrid aria-hidden="true" />
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent
+            side="bottom"
+            align="center"
+            sideOffset={6}
+            className="w-56 max-w-[calc(100vw-1rem)] p-1"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <div className="flex flex-col gap-0.5" aria-label="选择整理范围">
+              <PopoverClose asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="h-9 justify-start px-2"
+                  aria-label="整理选中节点"
+                  disabled={arrangeSelectionCount < 2 || !onArrangeSelection}
+                  onClick={onArrangeSelection}
+                >
+                  整理选中节点 <span className="ml-auto text-xs text-muted-foreground">{arrangeSelectionCount}</span>
+                </Button>
+              </PopoverClose>
+              <PopoverClose asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="h-9 justify-start px-2"
+                  aria-label="整理当前可见节点"
+                  disabled={arrangeVisibleCount < 2 || !onArrangeVisible}
+                  onClick={onArrangeVisible}
+                >
+                  整理当前可见节点 <span className="ml-auto text-xs text-muted-foreground">{arrangeVisibleCount}</span>
+                </Button>
+              </PopoverClose>
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="h-9 w-full justify-start px-2"
+                    aria-label="整理整个画布"
+                    disabled={arrangeAllCount < 2 || !onArrangeAll}
+                  >
+                    整理整个画布 <span className="ml-auto text-xs text-muted-foreground">{arrangeAllCount}</span>
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>整理整个画布？</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      将重新排列 {arrangeAllCount} 个节点；运行中或等待审批的节点会保持原位。
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>取消</AlertDialogCancel>
+                    <AlertDialogAction onClick={onArrangeAll}>整理布局</AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
             </div>
           </PopoverContent>
         </Popover>

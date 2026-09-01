@@ -5,11 +5,17 @@ import type {
   AgentCanvasBinding,
   CanvasBatchOperationEnvelope,
   CanvasDocument,
+  CanvasEdgeRelation,
+  CanvasImageTarget,
+  CanvasImageModuleConfig,
   CanvasMutation,
   CanvasNode,
   CanvasNodeReference,
+  CanvasRunNodesResult,
+  SaveCanvasImageModuleInput,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
+  DesignJobRecord,
 } from '@proma/shared'
 import { parseCanvasBatchOperationEnvelope } from '@proma/shared'
 import { Type } from 'typebox'
@@ -17,18 +23,135 @@ import type { TSchema } from 'typebox'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import type { CanvasBatchOperationResult } from './canvas-agent-batch-operation'
 import type { CanvasArtifactCreationService } from './canvas-artifact-creation'
+import type { CanvasTextArtifactService } from './canvas-text-artifact-service'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 
 const MAX_READ_NODES = 32
-const MAX_READ_CHARS = 32_768
+const MAX_READ_RESPONSE_CHARS = 32_768
+const MAX_READ_HISTORY_ENTRIES = 32
 
-/** 普通项目 Agent 单轮可用的六个 Canvas 工具。 */
+/** canvas_read 单节点的内部预算条目，完整正文不直接进入最终响应。 */
+interface CanvasReadBudgetEntry {
+  node: CanvasNode | { id: string; kind: CanvasNode['kind']; title: string }
+  content: string
+  contentLength: number
+  artifact?: Record<string, unknown>
+}
+
+/** canvas_read 最终结构化响应，所有字段共同受统一字符预算约束。 */
+interface CanvasReadBudgetDetails {
+  canvasId: string
+  revision: number
+  nodes: CanvasReadBudgetEntry[]
+  edges: CanvasDocument['edges']
+  omittedEdgeCount: number
+  truncated: boolean
+}
+
+/** 返回结构化 JSON 的精确字符数，与 Agent 上下文断言保持一致。 */
+function canvasReadJsonLength(details: CanvasReadBudgetDetails): number {
+  return JSON.stringify(details).length
+}
+
+/** 从 artifact 安全读取数组字段，供预算收缩阶段使用。 */
+function readArtifactArray(artifact: Record<string, unknown> | undefined, key: string): unknown[] | undefined {
+  const value = artifact?.[key]
+  return Array.isArray(value) ? value : undefined
+}
+
+/** 在保留每个节点 revision 摘要的前提下，把完整结构化响应压入统一预算。 */
+function applyCanvasReadBudget(
+  details: CanvasReadBudgetDetails,
+  fullContents: string[],
+): CanvasReadBudgetDetails {
+  /** 先移除可选历史、边和图片配置，最小节点与 revision 摘要始终保留。 */
+  while (canvasReadJsonLength(details) > MAX_READ_RESPONSE_CHARS) {
+    const history = [...details.nodes].reverse()
+      .map((entry) => readArtifactArray(entry.artifact, 'jobHistory'))
+      .find((candidate) => candidate && candidate.length > 0)
+    if (history) {
+      history.pop()
+      continue
+    }
+    const revisions = [...details.nodes].reverse()
+      .map((entry) => readArtifactArray(entry.artifact, 'availableRevisions'))
+      .find((candidate) => candidate && candidate.length > 0)
+    if (revisions) {
+      revisions.pop()
+      continue
+    }
+    if (details.edges.length > 0) {
+      details.edges.pop()
+      details.omittedEdgeCount += 1
+      continue
+    }
+    const configurable = [...details.nodes].reverse().find((entry) => entry.artifact?.config)
+    if (configurable?.artifact) {
+      delete configurable.artifact.config
+      configurable.artifact.configOmitted = true
+      continue
+    }
+    const compactable = [...details.nodes].reverse().find((entry) => 'position' in entry.node)
+    if (compactable) {
+      compactable.node = {
+        id: compactable.node.id,
+        kind: compactable.node.kind,
+        title: compactable.node.title.slice(0, 32),
+      }
+      continue
+    }
+    break
+  }
+
+  /** 正文按节点顺序使用剩余预算；二分避免逐字符反复序列化。 */
+  for (const [index, entry] of details.nodes.entries()) {
+    const fullContent = fullContents[index] ?? ''
+    const imageConfig = entry.artifact?.config as CanvasImageModuleConfig | undefined
+    if (!fullContent || (entry.artifact?.kind === 'image' && !imageConfig)) continue
+    let lower = 0
+    let upper = fullContent.length
+    while (lower < upper) {
+      const candidateLength = Math.ceil((lower + upper) / 2)
+      const candidate = fullContent.slice(0, candidateLength)
+      if (imageConfig) imageConfig.prompt = candidate
+      else entry.content = candidate
+      if (canvasReadJsonLength(details) <= MAX_READ_RESPONSE_CHARS) lower = candidateLength
+      else upper = candidateLength - 1
+    }
+    const accepted = fullContent.slice(0, lower)
+    if (imageConfig) imageConfig.prompt = accepted
+    else entry.content = accepted
+  }
+
+  /** 省略计数与正文原长让后续节点即使无正文也不会丢失版本语义。 */
+  details.truncated = details.omittedEdgeCount > 0 || details.nodes.some((entry, index) => {
+    const artifact = entry.artifact
+    const fullContent = fullContents[index] ?? ''
+    const returnedContent = artifact?.kind === 'image'
+      ? ((artifact.config as CanvasImageModuleConfig | undefined)?.prompt ?? '')
+      : entry.content
+    const revisionCount = typeof artifact?.availableRevisionCount === 'number'
+      ? artifact.availableRevisionCount
+      : 0
+    const jobCount = typeof artifact?.jobHistoryCount === 'number' ? artifact.jobHistoryCount : 0
+    return returnedContent.length < fullContent.length
+      || (readArtifactArray(artifact, 'availableRevisions')?.length ?? 0) < revisionCount
+      || (readArtifactArray(artifact, 'jobHistory')?.length ?? 0) < jobCount
+      || artifact?.configOmitted === true
+  })
+  /** false 比 true 多一个字符；极限命中时保守声明截断以维持硬上限。 */
+  if (canvasReadJsonLength(details) > MAX_READ_RESPONSE_CHARS) details.truncated = true
+  return details
+}
+
+/** 普通项目 Agent 单轮可用的七个 Canvas 工具。 */
 export const CANVAS_TOOL_NAMES = [
   'canvas_get_context',
   'canvas_manage',
   'canvas_read',
   'canvas_apply_changes',
   'canvas_create_artifact',
+  'canvas_update_artifact',
   'canvas_run_nodes',
 ] as const
 
@@ -42,15 +165,6 @@ export interface CanvasToolRunContext {
   runStartedAt: number
   explicitReferences: CanvasNodeReference[]
   permissionCeiling: CanvasToolPermissionCeiling
-}
-
-/** 已有节点执行器返回的稳定任务事实。 */
-export interface CanvasToolNodeRunResult {
-  nodeId: string
-  status: 'started' | 'queued' | 'idle' | 'unsupported' | 'failed' | 'blocked' | 'rolled-back'
-  taskId?: string
-  message?: string
-  error?: string
 }
 
 /** Provider 只依赖现有权威 Store、Task8 batch 与执行接缝。 */
@@ -70,13 +184,21 @@ export interface CanvasToolProviderDependencies {
   }
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
   artifacts: Pick<CanvasArtifactCreationService, 'create'>
+  textArtifacts: Pick<CanvasTextArtifactService, 'read' | 'listVersions' | 'update'>
+  images: {
+    load: (target: CanvasImageTarget) => Promise<{
+      config: CanvasImageModuleConfig
+      jobs: DesignJobRecord[]
+    }>
+    save: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
+  }
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
   runNodes: (
     context: CanvasToolRunContext,
     target: CanvasTarget,
     nodes: CanvasNode[],
     toolCallId: string,
-  ) => Promise<CanvasToolNodeRunResult[]>
+  ) => Promise<CanvasRunNodesResult>
 }
 
 /** Provider 产出的单轮扩展；extend 保留普通 Agent 原有工具。 */
@@ -85,8 +207,10 @@ export interface CanvasToolRun extends Required<Pick<AgentRunExtensions, 'system
 }
 
 /** 构造同时写入文本与结构化 details 的 Pi 工具结果。 */
-function toolResult(details: Record<string, unknown>): AgentToolResult<unknown> {
-  return { content: [{ type: 'text', text: JSON.stringify(details, null, 2) }], details }
+function toolResult(details: Record<string, unknown>, compact = false): AgentToolResult<unknown> {
+  /** canvas_read 使用紧凑文本以复用同一预算口径，其它短响应保留格式化可读性。 */
+  const text = compact ? JSON.stringify(details) : JSON.stringify(details, null, 2)
+  return { content: [{ type: 'text', text }], details }
 }
 
 /** 保留 TypeBox schema 对 execute 参数的静态推断。 */
@@ -144,6 +268,15 @@ function createManagedCanvasId(context: CanvasToolRunContext, toolCallId: string
     .map((value) => `${value.length}:${value}`)
     .join('|')
   return `agent-canvas-${createHash('sha256').update(identity).digest('hex')}`
+}
+
+/** 从工具调用稳定派生共享文本事务要求的 UUID v4。 */
+function createArtifactOperationId(context: CanvasToolRunContext, toolCallId: string): string {
+  /** 固定执行身份 hash 用于重放时命中同一 operationId。 */
+  const hash = createHash('sha256')
+    .update(`${context.projectId}\u0000${context.sessionId}\u0000${context.runStartedAt}\u0000${toolCallId}`)
+    .digest('hex')
+  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`
 }
 
 /** 为普通项目 Agent 创建不持久化的单轮 Canvas 工具。 */
@@ -245,28 +378,83 @@ export function createCanvasToolRun(
         }
         const nodes = document.nodes.filter((node) => requestedIds.has(node.id)).slice(0, MAX_READ_NODES)
         const returnedNodeIds = new Set(nodes.map((node) => node.id))
-        let remaining = MAX_READ_CHARS
-        let truncated = false
-        const entries = []
+        /** revision 与图片任务历史分别共享全局上限，不能按节点各放大 32 倍。 */
+        let remainingRevisionEntries = MAX_READ_HISTORY_ENTRIES
+        let remainingJobEntries = MAX_READ_HISTORY_ENTRIES
+        const entries: CanvasReadBudgetEntry[] = []
+        const fullContents: string[] = []
         for (const node of nodes) {
-          if (remaining === 0) {
-            truncated = true
-            entries.push({ node, content: '' })
-            continue
+          /** 内容节点按权威类型加载统一产物投影。 */
+          let artifact: Record<string, unknown> | undefined
+          let fullContent = ''
+          if (node.kind === 'document' || node.kind === 'webview') {
+            /** 节点类别决定稳定正文 ID。 */
+            const contentId = node.kind === 'document' ? node.documentId : node.prototypeId
+            /** 当前采用正文和已提交历史。 */
+            const artifactTarget = { ...target, nodeId: node.id, kind: node.kind, contentId, contentRevision: node.contentRevision }
+            const [snapshot, versions] = await Promise.all([
+              dependencies.textArtifacts.read(artifactTarget),
+              dependencies.textArtifacts.listVersions({ ...target, nodeId: node.id, kind: node.kind, contentId }),
+            ])
+            fullContent = snapshot.content
+            const availableRevisions = versions
+              .slice(0, remainingRevisionEntries)
+              .map((version) => version.revision)
+            remainingRevisionEntries -= availableRevisions.length
+            artifact = {
+              nodeId: node.id,
+              kind: node.kind,
+              currentRevision: node.contentRevision,
+              availableRevisions,
+              availableRevisionCount: versions.length,
+            }
+          } else if (node.kind === 'image') {
+            /** 图片读取复用现有模块快照，不复制任务或素材事实。 */
+            const image = await dependencies.images.load({ ...target, nodeId: node.id, imageModuleId: node.imageModuleId })
+            /** 图片提示词同样计入单次正文预算，避免配置绕过上下文上限。 */
+            fullContent = image.config.prompt
+            const jobs = remainingJobEntries > 0
+              ? image.jobs.slice(-remainingJobEntries)
+              : []
+            remainingJobEntries -= jobs.length
+            const allRevisions = [...new Set(image.jobs
+              .map((job) => job.canvasImageConfigRevision)
+              .filter((revision): revision is number => revision !== undefined))]
+            const availableRevisions = allRevisions.slice(0, remainingRevisionEntries)
+            remainingRevisionEntries -= availableRevisions.length
+            artifact = {
+              nodeId: node.id,
+              kind: 'image',
+              currentRevision: image.config.revision,
+              availableRevisions,
+              availableRevisionCount: allRevisions.length,
+              jobHistory: jobs.map((job) => ({
+                id: job.id,
+                status: job.status,
+                configRevision: job.canvasImageConfigRevision,
+                outputAssetId: job.outputAssetId,
+                createdAt: job.createdAt,
+              })),
+              jobHistoryCount: image.jobs.length,
+              config: { ...image.config, prompt: '' },
+              adoptedAssetId: image.config.adoptedAssetId,
+            }
+          } else {
+            fullContent = dependencies.readNodeContent ? await dependencies.readNodeContent(target, node) : ''
           }
-          const fullContent = dependencies.readNodeContent ? await dependencies.readNodeContent(target, node) : ''
-          const content = fullContent.slice(0, remaining)
-          remaining -= content.length
-          if (content.length < fullContent.length) truncated = true
-          entries.push({ node, content })
+          fullContents.push(fullContent)
+          entries.push({ node, content: '', contentLength: fullContent.length, ...(artifact ? { artifact } : {}) })
         }
-        return toolResult({
+        /** 最终 details 自身而非单一正文字段受统一硬预算。 */
+        const details = applyCanvasReadBudget({
           canvasId: params.canvasId,
           revision: document.revision,
           nodes: entries,
           edges: document.edges.filter((edge) => returnedNodeIds.has(edge.sourceNodeId) && returnedNodeIds.has(edge.targetNodeId)),
-          truncated,
-        })
+          omittedEdgeCount: 0,
+          truncated: true,
+        }, fullContents)
+        return toolResult(details as unknown as Record<string, unknown>, true)
       },
     }),
     defineCanvasTool({
@@ -316,11 +504,12 @@ export function createCanvasToolRun(
     }),
     defineCanvasTool({
       name: 'canvas_create_artifact', label: '创建画布产物',
-      description: '在已关联画布中原子创建含真实内容的 WebView 原型或图片设计稿节点，可选从已有节点自动连线。不要把 HTML 正文传给 canvas_apply_changes。',
+      description: '在已关联画布中原子创建含真实内容的文档、WebView 原型或图片设计稿节点，可选从已有节点自动连线。不要把 Markdown、HTML 或图片提示词正文传给 canvas_apply_changes。',
       parameters: Type.Object({
         canvasId: Type.String({ minLength: 1, maxLength: 128 }),
         baseRevision: Type.Integer({ minimum: 0 }),
-        artifactType: Type.Union([Type.Literal('webview'), Type.Literal('image')]),
+        artifactType: Type.Union([Type.Literal('document'), Type.Literal('webview'), Type.Literal('image')]),
+        devicePreset: Type.Optional(Type.Union([Type.Literal('desktop'), Type.Literal('mobile')])),
         title: Type.String({ minLength: 1, maxLength: 120 }),
         content: Type.String({ minLength: 1, maxLength: 256 * 1024 }),
         position: Type.Optional(Type.Object({
@@ -328,6 +517,10 @@ export function createCanvasToolRun(
           y: Type.Number(),
         })),
         sourceNodeId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+        relation: Type.Optional(Type.Union([
+          Type.Literal('association'), Type.Literal('reference'),
+          Type.Literal('depends-on'), Type.Literal('derives'),
+        ])),
       }),
       execute: async (toolCallId, params) => {
         dependencies.access.authorizeRead(context)
@@ -341,8 +534,10 @@ export function createCanvasToolRun(
             artifactType: params.artifactType,
             title: params.title,
             content: params.content,
+            ...(params.devicePreset ? { devicePreset: params.devicePreset } : {}),
             ...(params.position ? { position: params.position } : {}),
             ...(params.sourceNodeId ? { sourceNodeId: params.sourceNodeId } : {}),
+            ...(params.relation ? { relation: params.relation as CanvasEdgeRelation } : {}),
             source: {
               sessionId: context.sessionId,
               runStartedAt: context.runStartedAt,
@@ -360,8 +555,84 @@ export function createCanvasToolRun(
       },
     }),
     defineCanvasTool({
+      name: 'canvas_update_artifact', label: '更新画布产物',
+      description: '更新已有文档、WebView 正文或图片提示词；图片只保存配置，不会生图。用户要求立即生图时必须另行调用 canvas_run_nodes。',
+      parameters: Type.Object({
+        canvasId: Type.String({ minLength: 1, maxLength: 128 }),
+        nodeId: Type.String({ minLength: 1, maxLength: 128 }),
+        baseRevision: Type.Integer({ minimum: 0 }),
+        expectedContentRevision: Type.Integer({ minimum: 0 }),
+        content: Type.String({ maxLength: 256 * 1024 }),
+      }),
+      execute: async (toolCallId, params) => {
+        dependencies.access.authorizeRead(context)
+        if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
+        return dependencies.access.runWrite(context, async () => {
+          dependencies.access.requireLinkedCanvas(context, params.canvasId)
+          /** fresh 图只按 nodeId 解析实际类别和内容身份。 */
+          const target = { projectId: context.projectId, canvasId: params.canvasId }
+          const document = dependencies.documents.load(target).document
+          if (document.revision !== params.baseRevision) throw new Error('CANVAS_ARTIFACT_REVISION_CONFLICT')
+          /** 当前权威节点，工具参数不允许自报 kind 或 contentId。 */
+          const node = document.nodes.find((candidate) => candidate.id === params.nodeId)
+          if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
+          if (node.kind === 'document' || node.kind === 'webview') {
+            /** 文本类别对应的稳定内容 ID。 */
+            const contentId = node.kind === 'document' ? node.documentId : node.prototypeId
+            const result = await dependencies.textArtifacts.update({
+              ...target,
+              nodeId: node.id,
+              kind: node.kind,
+              contentId,
+              operationId: createArtifactOperationId(context, toolCallId),
+              expectedCanvasRevision: params.baseRevision,
+              expectedContentRevision: params.expectedContentRevision,
+              content: params.content,
+              source: {
+                type: 'agent', sessionId: context.sessionId,
+                runStartedAt: context.runStartedAt, toolCallId,
+              },
+            })
+            return toolResult({
+              canvasId: params.canvasId,
+              nodeId: node.id,
+              kind: node.kind,
+              revision: result.snapshot.document.revision,
+              contentRevision: result.artifact.target.contentRevision,
+            })
+          }
+          if (node.kind === 'image') {
+            /** 图片更新先读取配置，以 CAS 保留模型、比例、尺寸和上下文。 */
+            const imageTarget = { ...target, nodeId: node.id, imageModuleId: node.imageModuleId }
+            const snapshot = await dependencies.images.load(imageTarget)
+            if (snapshot.config.revision !== params.expectedContentRevision) {
+              throw new Error('CANVAS_ARTIFACT_REVISION_CONFLICT')
+            }
+            const config = await dependencies.images.save({
+              ...imageTarget,
+              expectedConfigRevision: params.expectedContentRevision,
+              prompt: params.content,
+              selectedModelProfileId: snapshot.config.selectedModelProfileId,
+              aspectRatio: snapshot.config.aspectRatio,
+              imageSize: snapshot.config.imageSize,
+              contextMode: snapshot.config.contextMode,
+            })
+            return toolResult({
+              canvasId: params.canvasId,
+              nodeId: node.id,
+              kind: 'image',
+              revision: document.revision,
+              contentRevision: config.revision,
+              requiresRun: true,
+            })
+          }
+          throw new Error('CANVAS_ARTIFACT_TYPE_UNSUPPORTED')
+        })
+      },
+    }),
+    defineCanvasTool({
       name: 'canvas_run_nodes', label: '运行画布节点',
-      description: '仅在用户明确要求立即生成图片时运行已有生图节点；WebView 创建成功后即可直接预览，不要用于 WebView。其它节点保持 idle，未来 video 稳定返回 unsupported。',
+      description: '运行已有生图节点并生成图片，调用图片模型时可能产生模型费用。',
       parameters: Type.Object({ canvasId: Type.String({ minLength: 1, maxLength: 128 }), nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_READ_NODES }) }),
       execute: async (toolCallId, params) => {
         dependencies.access.authorizeRead(context)
@@ -380,8 +651,13 @@ export function createCanvasToolRun(
             return node
           })
           /** 目标预检、journal 建立和统一启动由生产批量边界一次完成。 */
-          const tasks = await dependencies.runNodes(context, target, nodes, toolCallId)
-          return toolResult({ canvasId: params.canvasId, revision: document.revision, tasks })
+          const result = await dependencies.runNodes(context, target, nodes, toolCallId)
+          return toolResult({
+            canvasId: params.canvasId,
+            revision: document.revision,
+            tasks: result.tasks,
+            ...(result.batch ? { batch: result.batch } : {}),
+          })
         })
       },
     }),
@@ -391,11 +667,11 @@ export function createCanvasToolRun(
     systemPromptAppend: `## 画布工具
 请基于完整用户语义、项目上下文和工具 schema 自主决定是否读取、创建、修改或运行画布，不要按“首页”或“设计”等关键词硬编码。
 
-当用户希望获得可视化产物，但尚不能确定需要可交互网页原型、静态视觉设计稿还是普通代码实现时，单独调用 AskUserQuestion 询问一次，选项固定为“创建 WebView 原型”“创建图片设计稿”“继续普通 Agent”。AskUserQuestion 会暂停当前工具批次，收到回答后再继续调用画布工具。用户已经明确指定“在画布中创建 WebView/网页原型”或“在画布中创建图片/设计稿”时直接执行，不重复询问；明确要求修改或生成项目 HTML、React、组件等代码文件时继续普通 Agent，不擅自转入画布。
+当任务需要网页原型、图片设计稿、文档或多个可关联产物时，先读取并遵循 \`canvas-production\` Skill。Skill 不可用时按以下最小规则继续：产物类型会改变交付结果且用户未说明时，只询问一次；用户已明确类型时直接执行；明确要求修改项目 HTML、React、组件或其它代码文件时继续普通 Agent。
 
-创建产物前先用 canvas_get_context 获取当前关联；没有可用画布且用户已明确选择画布产物时，用 canvas_manage 创建并关联。WebView 必须向 canvas_create_artifact 提供完整单文件 HTML，图片必须提供可直接生图的完整提示词；不要把 HTML 或提示词正文传给 canvas_apply_changes。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes。canvas_create_artifact 只创建内容和 idle 节点，图片仅在用户明确要求立即生成时再调用 canvas_run_nodes。
+创建或修改前先用 canvas_get_context 获取权威关联；已有合适画布时直接复用，不要要求用户另建已经存在的画布。没有可用画布且用户已明确选择画布产物时，才用 canvas_manage 创建并关联。正文只通过 canvas_create_artifact 或 canvas_update_artifact 保存，canvas_apply_changes 只处理结构；有关联来源时提供准确 relation。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes；图片仅在用户明确要求立即生成时才调用 canvas_run_nodes。图片运行结果只代表候选已创建或正在生成，必须提示用户进入画布验收，不得描述为已正式替换。
 
-Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、产物创建、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。普通讨论优先读取，不要要求用户另建已经存在的画布。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。`,
+Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、产物创建、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。`,
     piCustomTools: tools,
     allowedToolNames: CANVAS_TOOL_NAMES,
     singleApprovalToolNames: ['canvas_run_nodes'],
