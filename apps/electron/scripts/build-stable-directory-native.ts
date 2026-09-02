@@ -2,8 +2,9 @@
 /** 使用当前平台系统 C++ 编译器构建稳定目录 helper。 */
 
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
@@ -31,9 +32,37 @@ function findVisualStudioDeveloperCommand(): string {
   return developerCommand
 }
 
-/** 为 cmd.exe 命令行安全引用单个参数。 */
+/** 为 Windows 批处理文件安全引用单个参数。 */
 function quoteWindowsArgument(value: string): string {
   return `"${value.replaceAll('"', '""')}"`
+}
+
+/**
+ * 通过临时批处理文件初始化 Visual Studio 环境并运行编译器。
+ *
+ * 不能把带空格的 VsDevCmd.bat 路径直接拼进 `cmd /s /c`：该组合会再次处理
+ * 最外层引号，在 GitHub Windows runner 上把引号本身当成命令名的一部分。
+ */
+function compileWithVisualStudioDeveloperCommand(
+  developerCommand: string,
+  targetArchitecture: string,
+  compilerArgs: string[],
+): void {
+  const commandDirectory = mkdtempSync(join(tmpdir(), 'proma-stable-directory-build-'))
+  const commandFile = join(commandDirectory, 'build.cmd')
+  const command = [
+    '@echo off',
+    `call ${quoteWindowsArgument(developerCommand)} -no_logo -arch=${targetArchitecture} -host_arch=${targetArchitecture}`,
+    'if errorlevel 1 exit /b %errorlevel%',
+    `cl ${compilerArgs.map(quoteWindowsArgument).join(' ')}`,
+  ].join('\r\n')
+
+  try {
+    writeFileSync(commandFile, `${command}\r\n`, 'utf8')
+    execFileSync('cmd.exe', ['/d', '/c', commandFile], { stdio: 'inherit' })
+  } finally {
+    rmSync(commandDirectory, { recursive: true, force: true })
+  }
 }
 
 if (!existsSync(source)) throw new Error(`Stable directory helper source not found: ${source}`)
@@ -53,8 +82,7 @@ if (process.platform === 'darwin') {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     const developerCommand = findVisualStudioDeveloperCommand()
     const targetArchitecture = process.arch === 'arm64' ? 'arm64' : 'x64'
-    const command = `call ${quoteWindowsArgument(developerCommand)} -no_logo -arch=${targetArchitecture} -host_arch=${targetArchitecture} && cl ${compilerArgs.map(quoteWindowsArgument).join(' ')}`
-    execFileSync('cmd.exe', ['/d', '/s', '/c', command], { stdio: 'inherit' })
+    compileWithVisualStudioDeveloperCommand(developerCommand, targetArchitecture, compilerArgs)
   }
 } else {
   throw new Error(`Unsupported stable directory helper platform: ${process.platform}`)

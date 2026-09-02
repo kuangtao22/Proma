@@ -18,6 +18,9 @@ test('Given stable directory helper 构建脚本 When 检查三平台合同 Then
   expect(source).toContain("execFileSync('cl'")
   expect(source).toContain('vswhere.exe')
   expect(source).toContain('VsDevCmd.bat')
+  expect(source).toContain("mkdtempSync(join(tmpdir(), 'proma-stable-directory-build-'))")
+  expect(source).toContain("execFileSync('cmd.exe', ['/d', '/c', commandFile]")
+  expect(source).not.toContain("execFileSync('cmd.exe', ['/d', '/s', '/c', command]")
 })
 
 test.skipIf(process.platform === 'win32')('Given Windows 路径纯函数合同 When 在当前 C++ 编译器运行 Then drive 与 UNC 扩展路径双向规范化', () => {
