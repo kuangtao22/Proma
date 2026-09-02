@@ -583,19 +583,19 @@ export function CanvasWebviewWorkbench(props: CanvasWebviewWorkbenchProps): Reac
           </div>
         )}
 
-        <div className="absolute inset-0 flex items-center justify-center overflow-auto bg-muted/20 p-3" data-device-preset={props.node.devicePreset} hidden={mode !== 'preview'}>
+        <div className={cn('absolute inset-0 items-center justify-center overflow-auto bg-muted/20 p-3', mode === 'preview' ? 'flex' : 'hidden')} data-device-preset={props.node.devicePreset} aria-hidden={mode !== 'preview'}>
           <div className={props.node.devicePreset === 'mobile' ? 'h-full max-h-[844px] w-auto max-w-full overflow-hidden rounded-[8px] border border-border bg-white shadow-sm aspect-[390/844]' : 'h-full w-full overflow-hidden bg-white'}>
             <iframe key={frameState.key} className="h-full w-full border-0 bg-white" title={`${props.node.title}预览`} sandbox="allow-scripts" srcDoc={frameState.srcDoc} />
           </div>
         </div>
 
-        <div className="absolute inset-0 flex min-h-0 flex-col p-3" hidden={mode !== 'html'}>
+        <div className={cn('absolute inset-0 min-h-0 flex-col p-3', mode === 'html' ? 'flex' : 'hidden')} aria-hidden={mode !== 'html'}>
           {!props.writable && <p className="mb-2 text-xs text-muted-foreground">当前项目只读，仍可查看和导出 HTML。</p>}
           {!draft && <p className="mb-2 text-xs text-muted-foreground">空原型，可以从编辑区开始输入 HTML。</p>}
           <Textarea value={draft} readOnly={!props.writable || conflict} spellCheck={false} aria-label="HTML 编辑器" className="min-h-0 flex-1 resize-none rounded-sm font-mono text-xs leading-5" onChange={(event) => setEditorState((current) => ({ ...current, draft: event.target.value }))} />
         </div>
 
-        <div className="absolute inset-0" hidden={mode !== 'versions'}>
+        <div className={cn('absolute inset-0', mode === 'versions' ? 'block' : 'hidden')} aria-hidden={mode !== 'versions'}>
           <CanvasArtifactVersionPanel revisions={revisions} currentRevision={artifact.target.contentRevision} selectedRevision={selectedRevision} loading={versionsLoading} writable={props.writable && !conflict && !dirty} adopting={actionState === 'adopting'} error={versionError} currentContent={artifact.content} selectedContent={selectedArtifact?.content} selectedContentLoading={selectedContentLoading} onSelect={selectRevision} onAdopt={(revision) => { void adoptRevision(revision) }} />
         </div>
       </div>

@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test'
 import { createEmptyCanvasDocument } from '@proma/shared'
 import * as React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import {
   CanvasWebviewWorkbench,
   acceptPendingCanvasWebviewArtifact,
@@ -120,6 +122,15 @@ describe('Canvas WebView 工作台', () => {
     expect(html).toContain('网页')
     expect(html).toContain('手机')
     expect(html).toContain('data-device-preset="desktop"')
+  })
+
+  test('Given 三个绝对定位视图 When 切换工作台模式 Then display class 显式互斥且不依赖原生 hidden 属性', () => {
+    const source = readFileSync(join(import.meta.dir, 'CanvasWebviewWorkbench.tsx'), 'utf8')
+
+    expect(source).toContain("mode === 'preview' ? 'flex' : 'hidden'")
+    expect(source).toContain("mode === 'html' ? 'flex' : 'hidden'")
+    expect(source).toContain("mode === 'versions' ? 'block' : 'hidden'")
+    expect(source).not.toMatch(/\shidden=\{mode !== '(?:preview|html|versions)'\}/)
   })
 
   test('Given HTML 草稿保存 When 提交同一 WebView Then 使用 prototypeId 与图正文双 revision', async () => {
