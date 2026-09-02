@@ -189,5 +189,6 @@
   "build": {
     "extends": "electron-builder.yml"
   },
-  "proma": {}
+  "proma": {},
+  "homepage": "https://github.com/proma-ai/Proma"
 }

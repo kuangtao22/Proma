@@ -236,16 +236,6 @@ export async function createAgentWorkspace(input: string | CreateAgentWorkspaceI
   const { name, projectRootPath } = typeof input === 'string'
     ? { name: input, projectRootPath: undefined }
     : input
-  const index = readIndex()
-
-  const duplicate = index.workspaces.find((w) => w.name === name)
-  if (duplicate) {
-    throw new Error(`项目名称「${name}」已存在`)
-  }
-
-  const existingSlugs = new Set(index.workspaces.map((w) => w.slug))
-  const slug = createWorkspaceSlug(name, existingSlugs)
-  const now = Date.now()
   let normalizedProjectRootPath: string | undefined
 
   if (projectRootPath) {
@@ -264,6 +254,17 @@ export async function createAgentWorkspace(input: string | CreateAgentWorkspaceI
     }
   }
 
+  // 路径校验包含 await，必须在完成后才读取索引并进入无 await 的写入临界区。
+  // 这样并发创建/重连不会用过期索引覆盖其他工作区变更。
+  const index = readIndex()
+  const duplicate = index.workspaces.find((w) => w.name === name)
+  if (duplicate) {
+    throw new Error(`项目名称「${name}」已存在`)
+  }
+
+  const existingSlugs = new Set(index.workspaces.map((w) => w.slug))
+  const slug = createWorkspaceSlug(name, existingSlugs)
+  const now = Date.now()
   const workspace: AgentWorkspace = {
     id: randomUUID(),
     name,
