@@ -144,7 +144,7 @@ test('Bone 应用版本与更新频道保持一致', () => {
     'utf8',
   )
 
-  expect(metadata.version).toBe('0.19.16-bone.2')
+  expect(metadata.version).toBe('0.19.16-bone.3')
   expect(config.detectUpdateChannel).toBe(false)
   expect(config.publish).toEqual({
     provider: 'github',
@@ -158,6 +158,7 @@ test('Bone 应用版本与更新频道保持一致', () => {
 test('正式安装包名称包含完整版本、平台和架构', () => {
   /** Electron Builder 的正式打包配置。 */
   const config = readElectronBuilderConfig()
+  expect(readFileSync(resolve(import.meta.dir, '../electron-builder.yml'), 'utf8').match(/^linux:$/gm)).toHaveLength(1)
   expect(config.appId).toBe('com.bone.proma.app')
   expect(config.productName).toBe('Proma')
   expect(config.mac?.artifactName).toBe('Proma-${version}-macos-${arch}.${ext}')
