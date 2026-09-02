@@ -67,6 +67,8 @@ test('Given stable directory helper 的 Canvas intent 模式 When 检查三平�
   expect(source).toContain('NtSetInformationFile')
   expect(source).toContain('kWindowsFileRenameInformationClass')
   expect(source).toContain('static_cast<FILE_INFORMATION_CLASS>(10)')
+  expect(source).toContain('static_cast<FILE_INFORMATION_CLASS>(65)')
+  expect(source).toContain('kWindowsFileRenameReplaceIfExists | kWindowsFileRenamePosixSemantics')
   expect(source).toContain('RenameRelativeWindows(temporary.Get(), entry.Get(), target, true)')
   expect(source).toContain('RenameRelativeWindows(source.Get(), destination_root.Get(), target, false)')
   expect(source).toContain('RenameRelativeWindows(temporary.Get(), transactions, target, true)')
