@@ -107,6 +107,7 @@ test('Release 工作流构建并发布 Linux x64 安装包', () => {
   /** 汇总并创建 GitHub Release 的任务。 */
   const releaseJob = workflow.jobs?.release
 
+  expect(source.match(/^  build-linux-x64:$/gm)).toHaveLength(1)
   expect(linuxJob?.['runs-on']).toBe('ubuntu-latest')
   expect(linuxJob?.steps).toEqual(expect.arrayContaining([
     expect.objectContaining({
