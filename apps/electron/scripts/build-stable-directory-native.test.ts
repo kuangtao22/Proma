@@ -61,6 +61,11 @@ test('Given stable directory helper 的 Canvas intent 模式 When 检查三平�
   expect(source).toContain('FILE_OPEN_REPARSE_POINT')
   expect(source).toContain('FILE_ATTRIBUTE_REPARSE_POINT')
   expect(source).toContain('FILE_CREATE, FILE_NON_DIRECTORY_FILE, &temporary, &outcome.error')
+  /** Windows 相对 rename 的 RootDirectory 必须持有 traverse 权限。 */
+  expect(source).toContain('| FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE')
+  /** FileNameLength 不含 NUL，但 rename buffer 必须为末尾宽字符 NUL 留空间。 */
+  expect(source.match(/offsetof\(FILE_RENAME_INFO, FileName\) \+ target_bytes \+ sizeof\(wchar_t\)/g)).toHaveLength(3)
+  expect(source.match(/std::vector<unsigned char> rename_buffer\(rename_size, 0\)/g)).toHaveLength(3)
   expect(source).toContain('CanvasIntentWriteResultJson(outcome)')
   /** Windows scan 必须先排除目录/reparse，再让真实普通 intent 消耗容量。 */
   const windowsScan = source.slice(

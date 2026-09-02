@@ -1530,7 +1530,7 @@ bool OpenCanvasTransactions(const Config& config, const StableRoot& root,
   const std::wstring name = Utf8ToWide(config.child_name);
   if (!OpenRelativeWindows(root.handle.Get(), name,
       FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD
-          | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+          | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
       FILE_OPEN_IF, FILE_DIRECTORY_FILE, transactions, error)) return false;
   BY_HANDLE_FILE_INFORMATION identity {};
   if (!GetFileInformationByHandle(transactions->Get(), &identity)
@@ -1559,7 +1559,7 @@ bool OpenCanvasContentRootWindows(const StableRoot& root, const std::string& nam
   }
   if (!OpenRelativeWindows(root.handle.Get(), Utf8ToWide(name),
       FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD
-          | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+          | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
       create ? FILE_OPEN_IF : FILE_OPEN, FILE_DIRECTORY_FILE, directory, error)) {
     const DWORD open_error = GetLastError();
     if (!create && IsCanvasWindowsMissingError(open_error)) { *missing = true; return true; }
@@ -1582,7 +1582,7 @@ bool OpenCanvasContentEntryWindows(HANDLE content_root, const std::string& entry
   *missing = false;
   if (!OpenRelativeWindows(content_root, Utf8ToWide(entry_id),
       FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD
-          | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+          | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
       create ? FILE_OPEN_IF : FILE_OPEN, FILE_DIRECTORY_FILE, entry, error)) {
     const DWORD open_error = GetLastError();
     if (!create && IsCanvasWindowsMissingError(open_error)) { *missing = true; return true; }
@@ -1727,8 +1727,9 @@ CanvasIntentWriteOutcome WriteCanvasContentAtomic(const Config& config, const St
     return outcome;
   }
   const std::wstring target = Utf8ToWide(config.file_name);
-  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target.size() * sizeof(wchar_t);
-  std::vector<unsigned char> rename_buffer(rename_size);
+  const std::size_t target_bytes = target.size() * sizeof(wchar_t);
+  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target_bytes + sizeof(wchar_t);
+  std::vector<unsigned char> rename_buffer(rename_size, 0);
   auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
   rename_info->ReplaceIfExists = TRUE;
   rename_info->RootDirectory = entry.Get();
@@ -1993,8 +1994,9 @@ CanvasIntentWriteOutcome MoveCanvasContent(const Config& config, const StableRoo
   if (!CheckCanvasContentCapacity(config, destination_root.Get(),
       config.destination_entry_id, &outcome.error)) return outcome;
   const std::wstring target = Utf8ToWide(config.destination_entry_id);
-  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target.size() * sizeof(wchar_t);
-  std::vector<unsigned char> rename_buffer(rename_size);
+  const std::size_t target_bytes = target.size() * sizeof(wchar_t);
+  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target_bytes + sizeof(wchar_t);
+  std::vector<unsigned char> rename_buffer(rename_size, 0);
   auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
   rename_info->ReplaceIfExists = FALSE;
   rename_info->RootDirectory = destination_root.Get();
@@ -2090,8 +2092,9 @@ CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, HANDLE tr
     return outcome;
   }
   const std::wstring target = Utf8ToWide(config.file_name);
-  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target.size() * sizeof(wchar_t);
-  std::vector<unsigned char> rename_buffer(rename_size);
+  const std::size_t target_bytes = target.size() * sizeof(wchar_t);
+  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target_bytes + sizeof(wchar_t);
+  std::vector<unsigned char> rename_buffer(rename_size, 0);
   auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
   rename_info->ReplaceIfExists = TRUE;
   rename_info->RootDirectory = transactions;
