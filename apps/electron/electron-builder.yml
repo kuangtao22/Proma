@@ -157,9 +157,6 @@ dmg:
 # Linux 配置
 # ============================================
 linux:
-  # workspace 包名包含 scope；显式命名避免 `/` 被解释为输出子目录。
-  artifactName: "Proma-${version}-linux-${arch}.${ext}"
-
 # ============================================
 # Windows 配置
 # ============================================
@@ -182,6 +179,7 @@ nsis:
 # Linux 配置（Ubuntu/Debian x86_64）
 # ============================================
 linux:
+  artifactName: "Proma-${version}-linux-${arch}.${ext}"
   icon: resources/icon.png
   executableName: proma
   desktop:
