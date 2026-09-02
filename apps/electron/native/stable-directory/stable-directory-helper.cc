@@ -1357,9 +1357,21 @@ struct WindowsFileRenameInformation {
   WCHAR file_name[1];
 };
 
-/** winternl.h 并非所有 Windows SDK 都公开该枚举名；NT 合同中的稳定值为 10。 */
+/** 覆盖已有目标时使用的扩展结构，首字段为 FILE_RENAME_INFORMATION_EX flags。 */
+struct WindowsFileRenameInformationEx {
+  ULONG flags;
+  HANDLE root_directory;
+  ULONG file_name_length;
+  WCHAR file_name[1];
+};
+
+/** winternl.h 并非所有 Windows SDK 都公开这些枚举名；NT 合同值分别为 10 和 65。 */
 constexpr FILE_INFORMATION_CLASS kWindowsFileRenameInformationClass =
     static_cast<FILE_INFORMATION_CLASS>(10);
+constexpr FILE_INFORMATION_CLASS kWindowsFileRenameInformationExClass =
+    static_cast<FILE_INFORMATION_CLASS>(65);
+constexpr ULONG kWindowsFileRenameReplaceIfExists = 0x00000001;
+constexpr ULONG kWindowsFileRenamePosixSemantics = 0x00000002;
 
 /**
  * 基于已打开目标目录 HANDLE 执行相对 rename。
@@ -1385,18 +1397,30 @@ bool RenameRelativeWindows(HANDLE source, HANDLE destination_directory,
   }
 
   const std::size_t target_bytes = target.size() * sizeof(wchar_t);
-  const std::size_t rename_size = offsetof(WindowsFileRenameInformation, file_name)
-      + target_bytes + sizeof(wchar_t);
+  const std::size_t rename_offset = replace_if_exists
+      ? offsetof(WindowsFileRenameInformationEx, file_name)
+      : offsetof(WindowsFileRenameInformation, file_name);
+  const std::size_t rename_size = rename_offset + target_bytes + sizeof(wchar_t);
   std::vector<unsigned char> rename_buffer(rename_size, 0);
-  auto* rename_info = reinterpret_cast<WindowsFileRenameInformation*>(rename_buffer.data());
-  rename_info->replace_if_exists = replace_if_exists ? TRUE : FALSE;
-  rename_info->root_directory = destination_directory;
-  rename_info->file_name_length = static_cast<ULONG>(target_bytes);
-  std::memcpy(rename_info->file_name, target.data(), target_bytes);
+  if (replace_if_exists) {
+    auto* rename_info = reinterpret_cast<WindowsFileRenameInformationEx*>(rename_buffer.data());
+    rename_info->flags = kWindowsFileRenameReplaceIfExists | kWindowsFileRenamePosixSemantics;
+    rename_info->root_directory = destination_directory;
+    rename_info->file_name_length = static_cast<ULONG>(target_bytes);
+    std::memcpy(rename_info->file_name, target.data(), target_bytes);
+  } else {
+    auto* rename_info = reinterpret_cast<WindowsFileRenameInformation*>(rename_buffer.data());
+    rename_info->replace_if_exists = FALSE;
+    rename_info->root_directory = destination_directory;
+    rename_info->file_name_length = static_cast<ULONG>(target_bytes);
+    std::memcpy(rename_info->file_name, target.data(), target_bytes);
+  }
 
   IO_STATUS_BLOCK status_block {};
-  const NTSTATUS status = nt_set_information_file(source, &status_block, rename_info,
-      static_cast<ULONG>(rename_buffer.size()), kWindowsFileRenameInformationClass);
+  const FILE_INFORMATION_CLASS information_class = replace_if_exists
+      ? kWindowsFileRenameInformationExClass : kWindowsFileRenameInformationClass;
+  const NTSTATUS status = nt_set_information_file(source, &status_block, rename_buffer.data(),
+      static_cast<ULONG>(rename_buffer.size()), information_class);
   if (status < 0) {
     SetLastError(rtl_nt_status_to_dos_error ? rtl_nt_status_to_dos_error(status) : ERROR_GEN_FAILURE);
     return false;
