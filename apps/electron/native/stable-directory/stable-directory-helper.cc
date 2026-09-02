@@ -1345,7 +1345,60 @@ class UniqueHandle {
 using NtCreateFileFunction = NTSTATUS (NTAPI *)(
     PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER,
     ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+using NtSetInformationFileFunction = NTSTATUS (NTAPI *)(
+    HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
 using RtlNtStatusToDosErrorFunction = ULONG (WINAPI *)(NTSTATUS);
+
+/** NtSetInformationFile 使用的相对 rename 结构，布局对应 FILE_RENAME_INFORMATION。 */
+struct WindowsFileRenameInformation {
+  BOOLEAN replace_if_exists;
+  HANDLE root_directory;
+  ULONG file_name_length;
+  WCHAR file_name[1];
+};
+
+/**
+ * 基于已打开目标目录 HANDLE 执行相对 rename。
+ *
+ * Win32 SetFileInformationByHandle(FileRenameInfo) 在 GitHub Windows runner 上会拒绝
+ * 非空 RootDirectory；原生 FileRenameInformation 明确支持该安全语义，且不会重新按
+ * 绝对路径解析已授权目录。
+ */
+bool RenameRelativeWindows(HANDLE source, HANDLE destination_directory,
+                           const std::wstring& target, bool replace_if_exists) {
+  if (target.empty() || target.size() * sizeof(wchar_t) > ULONG_MAX) {
+    SetLastError(ERROR_INVALID_NAME);
+    return false;
+  }
+  const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  const auto nt_set_information_file = reinterpret_cast<NtSetInformationFileFunction>(
+      ntdll ? GetProcAddress(ntdll, "NtSetInformationFile") : nullptr);
+  const auto rtl_nt_status_to_dos_error = reinterpret_cast<RtlNtStatusToDosErrorFunction>(
+      ntdll ? GetProcAddress(ntdll, "RtlNtStatusToDosError") : nullptr);
+  if (!nt_set_information_file) {
+    SetLastError(ERROR_PROC_NOT_FOUND);
+    return false;
+  }
+
+  const std::size_t target_bytes = target.size() * sizeof(wchar_t);
+  const std::size_t rename_size = offsetof(WindowsFileRenameInformation, file_name)
+      + target_bytes + sizeof(wchar_t);
+  std::vector<unsigned char> rename_buffer(rename_size, 0);
+  auto* rename_info = reinterpret_cast<WindowsFileRenameInformation*>(rename_buffer.data());
+  rename_info->replace_if_exists = replace_if_exists ? TRUE : FALSE;
+  rename_info->root_directory = destination_directory;
+  rename_info->file_name_length = static_cast<ULONG>(target_bytes);
+  std::memcpy(rename_info->file_name, target.data(), target_bytes);
+
+  IO_STATUS_BLOCK status_block {};
+  const NTSTATUS status = nt_set_information_file(source, &status_block, rename_info,
+      static_cast<ULONG>(rename_buffer.size()), FileRenameInformation);
+  if (status < 0) {
+    SetLastError(rtl_nt_status_to_dos_error ? rtl_nt_status_to_dos_error(status) : ERROR_GEN_FAILURE);
+    return false;
+  }
+  return true;
+}
 
 // 通过 NtCreateFile 的 RootDirectory 相对打开对象，禁止路径重新解析到已授权根之外。
 bool OpenRelativeWindows(HANDLE RootDirectory, const std::wstring& name,
@@ -1727,16 +1780,7 @@ CanvasIntentWriteOutcome WriteCanvasContentAtomic(const Config& config, const St
     return outcome;
   }
   const std::wstring target = Utf8ToWide(config.file_name);
-  const std::size_t target_bytes = target.size() * sizeof(wchar_t);
-  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target_bytes + sizeof(wchar_t);
-  std::vector<unsigned char> rename_buffer(rename_size, 0);
-  auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
-  rename_info->ReplaceIfExists = TRUE;
-  rename_info->RootDirectory = entry.Get();
-  rename_info->FileNameLength = static_cast<DWORD>(target.size() * sizeof(wchar_t));
-  std::memcpy(rename_info->FileName, target.data(), rename_info->FileNameLength);
-  if (!SetFileInformationByHandle(temporary.Get(), FileRenameInfo,
-      rename_info, static_cast<DWORD>(rename_buffer.size()))) {
+  if (!RenameRelativeWindows(temporary.Get(), entry.Get(), target, true)) {
     DeleteTemporaryWindowsFile(temporary.Get());
     outcome.error = "cannot commit canvas content file";
     return outcome;
@@ -1994,16 +2038,7 @@ CanvasIntentWriteOutcome MoveCanvasContent(const Config& config, const StableRoo
   if (!CheckCanvasContentCapacity(config, destination_root.Get(),
       config.destination_entry_id, &outcome.error)) return outcome;
   const std::wstring target = Utf8ToWide(config.destination_entry_id);
-  const std::size_t target_bytes = target.size() * sizeof(wchar_t);
-  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target_bytes + sizeof(wchar_t);
-  std::vector<unsigned char> rename_buffer(rename_size, 0);
-  auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
-  rename_info->ReplaceIfExists = FALSE;
-  rename_info->RootDirectory = destination_root.Get();
-  rename_info->FileNameLength = static_cast<DWORD>(target.size() * sizeof(wchar_t));
-  std::memcpy(rename_info->FileName, target.data(), rename_info->FileNameLength);
-  if (!SetFileInformationByHandle(source.Get(), FileRenameInfo,
-      rename_info, static_cast<DWORD>(rename_buffer.size()))) {
+  if (!RenameRelativeWindows(source.Get(), destination_root.Get(), target, false)) {
     outcome.error = "cannot commit canvas content move";
     return outcome;
   }
@@ -2092,16 +2127,7 @@ CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, HANDLE tr
     return outcome;
   }
   const std::wstring target = Utf8ToWide(config.file_name);
-  const std::size_t target_bytes = target.size() * sizeof(wchar_t);
-  const std::size_t rename_size = offsetof(FILE_RENAME_INFO, FileName) + target_bytes + sizeof(wchar_t);
-  std::vector<unsigned char> rename_buffer(rename_size, 0);
-  auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
-  rename_info->ReplaceIfExists = TRUE;
-  rename_info->RootDirectory = transactions;
-  rename_info->FileNameLength = static_cast<DWORD>(target.size() * sizeof(wchar_t));
-  std::memcpy(rename_info->FileName, target.data(), rename_info->FileNameLength);
-  if (!SetFileInformationByHandle(
-      temporary.Get(), FileRenameInfo, rename_info, static_cast<DWORD>(rename_buffer.size()))) {
+  if (!RenameRelativeWindows(temporary.Get(), transactions, target, true)) {
     DeleteTemporaryWindowsFile(temporary.Get());
     outcome.error = "cannot commit canvas intent file";
     return outcome;

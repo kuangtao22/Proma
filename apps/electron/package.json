@@ -1,6 +1,6 @@
 {
   "name": "@proma/electron",
-  "version": "0.19.16-bone.5",
+  "version": "0.19.16-bone.6",
   "description": "Proma next gen ai software with general agents - Electron App",
   "homepage": "https://github.com/kuangtao22/Proma",
   "main": "dist/main.cjs",
