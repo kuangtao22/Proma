@@ -1357,6 +1357,10 @@ struct WindowsFileRenameInformation {
   WCHAR file_name[1];
 };
 
+/** winternl.h 并非所有 Windows SDK 都公开该枚举名；NT 合同中的稳定值为 10。 */
+constexpr FILE_INFORMATION_CLASS kWindowsFileRenameInformationClass =
+    static_cast<FILE_INFORMATION_CLASS>(10);
+
 /**
  * 基于已打开目标目录 HANDLE 执行相对 rename。
  *
@@ -1392,7 +1396,7 @@ bool RenameRelativeWindows(HANDLE source, HANDLE destination_directory,
 
   IO_STATUS_BLOCK status_block {};
   const NTSTATUS status = nt_set_information_file(source, &status_block, rename_info,
-      static_cast<ULONG>(rename_buffer.size()), FileRenameInformation);
+      static_cast<ULONG>(rename_buffer.size()), kWindowsFileRenameInformationClass);
   if (status < 0) {
     SetLastError(rtl_nt_status_to_dos_error ? rtl_nt_status_to_dos_error(status) : ERROR_GEN_FAILURE);
     return false;

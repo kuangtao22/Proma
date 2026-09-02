@@ -65,7 +65,8 @@ test('Given stable directory helper 的 Canvas intent 模式 When 检查三平�
   expect(source).toContain('| FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE')
   /** Windows 相对 rename 使用 NT 原生接口，保留 RootDirectory 句柄安全语义。 */
   expect(source).toContain('NtSetInformationFile')
-  expect(source).toContain('FileRenameInformation')
+  expect(source).toContain('kWindowsFileRenameInformationClass')
+  expect(source).toContain('static_cast<FILE_INFORMATION_CLASS>(10)')
   expect(source).toContain('RenameRelativeWindows(temporary.Get(), entry.Get(), target, true)')
   expect(source).toContain('RenameRelativeWindows(source.Get(), destination_root.Get(), target, false)')
   expect(source).toContain('RenameRelativeWindows(temporary.Get(), transactions, target, true)')
