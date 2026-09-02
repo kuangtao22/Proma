@@ -7,7 +7,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, cpSync, mkdirSync, statSync, lstatSync, openSync, readSync, closeSync, realpathSync, accessSync, constants } from 'node:fs'
-import { cp as cpAsync, readFile as readFileAsync, writeFile as writeFileAsync } from 'node:fs/promises'
+import { cp as cpAsync, readFile as readFileAsync, realpath as realpathAsync, writeFile as writeFileAsync } from 'node:fs/promises'
 import type { Dirent } from 'node:fs'
 import { rmSyncWithRetry, renameIfDestinationAbsentWithRetry, renameWithRetry } from './fs-retry'
 import { writeJsonFileAtomic, readJsonFileSafe, readJsonFileStrict, writeTextFileAtomic } from './safe-file'
@@ -33,6 +33,8 @@ import { createWorkspaceSlug } from './workspace-slug'
 import { inferMcpTransportType, normalizeMcpTransportType } from '@proma/shared'
 import { isAgentWorkspacesIndex, isWorkspaceConfig } from './owned-path-rebaser-schema'
 import type { AgentWorkspace, CreateAgentWorkspaceInput, LocalProjectRootStatus, WorkspaceMcpConfig, SkillMeta, SkillImportSource, OtherWorkspaceSkillsGroup, WorkspaceCapabilities, SkillFileNode, SkillFileContent, WorkspaceMemorySummary, BulkImportSkillItemResult, BulkImportSkillsResult, BulkImportWorkspaceSelection } from '@proma/shared'
+import { getLocalProjectRootStatus } from './project-root-health'
+export { getLocalProjectRootStatus } from './project-root-health'
 
 interface AgentWorkspacesIndex {
   version: number
@@ -122,36 +124,45 @@ function writeIndex(index: AgentWorkspacesIndex): void {
 
 export function listAgentWorkspaces(): AgentWorkspace[] {
   const index = readIndex()
-  return index.workspaces.map(withProjectRootStatus)
+  // 根目录状态只能通过异步 I/O 取得；这里保持索引读取的纯同步语义，供
+  // 不需要展示状态的内部调用复用，避免一次列表操作扫描所有外部项目根。
+  return index.workspaces.map((workspace) => ({ ...workspace }))
 }
 
 /** 按 updatedAt 降序（桥接/飞书列表等与旧版内联 sort 一致；渲染进程仍用 listAgentWorkspaces） */
 export function listAgentWorkspacesByUpdatedAt(): AgentWorkspace[] {
-  const index = readIndex()
-  return index.workspaces.map(withProjectRootStatus).sort((a, b) => b.updatedAt - a.updatedAt)
+  return listAgentWorkspaces().sort((a, b) => b.updatedAt - a.updatedAt)
 }
 
-/**
- * 同步检查用户选择的本地项目根。该状态用于运行前硬阻断和工作区列表提示，
- * 不依赖目录 watcher，避免把临时监听失败误报为项目根丢失。
- */
-export function getLocalProjectRootStatus(projectRootPath: string | undefined): LocalProjectRootStatus | undefined {
-  if (!projectRootPath) return undefined
-  if (!existsSync(projectRootPath)) return 'missing'
+const PROJECT_ROOT_STATUS_CONCURRENCY = 4
 
-  try {
-    if (!statSync(projectRootPath).isDirectory()) return 'not_directory'
-    accessSync(projectRootPath, constants.R_OK | constants.W_OK | constants.X_OK)
-    return 'available'
-  } catch {
-    return 'unavailable'
-  }
+async function mapWithConcurrency<T, U>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<U>,
+): Promise<U[]> {
+  const results = new Array<U>(items.length)
+  let nextIndex = 0
+  const workerCount = Math.min(concurrency, items.length)
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const currentIndex = nextIndex++
+      if (currentIndex >= items.length) return
+      results[currentIndex] = await mapper(items[currentIndex]!)
+    }
+  }))
+
+  return results
 }
 
-/** 为 IPC/展示调用附加即时状态，绝不修改磁盘索引中的工作区记录。 */
-function withProjectRootStatus(workspace: AgentWorkspace): AgentWorkspace {
-  const projectRootStatus = getLocalProjectRootStatus(workspace.projectRootPath)
-  return projectRootStatus ? { ...workspace, projectRootStatus } : { ...workspace }
+/** 为 IPC/展示调用异步附加即时状态，绝不修改磁盘索引中的工作区记录。 */
+export async function listAgentWorkspacesWithProjectRootStatus(): Promise<AgentWorkspace[]> {
+  const workspaces = listAgentWorkspaces()
+  return mapWithConcurrency(workspaces, PROJECT_ROOT_STATUS_CONCURRENCY, async (workspace) => {
+    const projectRootStatus = await getLocalProjectRootStatus(workspace.projectRootPath)
+    return projectRootStatus ? { ...workspace, projectRootStatus } : workspace
+  })
 }
 
 /** 按指定 ID 顺序重排工作区，未列出的追加到末尾 */
@@ -221,7 +232,7 @@ function copyDefaultSkills(workspaceSlug: string, options: { throwOnError?: bool
   }
 }
 
-export function createAgentWorkspace(input: string | CreateAgentWorkspaceInput): AgentWorkspace {
+export async function createAgentWorkspace(input: string | CreateAgentWorkspaceInput): Promise<AgentWorkspace> {
   const { name, projectRootPath } = typeof input === 'string'
     ? { name: input, projectRootPath: undefined }
     : input
@@ -239,11 +250,12 @@ export function createAgentWorkspace(input: string | CreateAgentWorkspaceInput):
 
   if (projectRootPath) {
     try {
-      normalizedProjectRootPath = realpathSync(resolve(projectRootPath))
-      if (!statSync(normalizedProjectRootPath).isDirectory()) {
+      normalizedProjectRootPath = await realpathAsync(resolve(projectRootPath))
+      const status = await getLocalProjectRootStatus(normalizedProjectRootPath)
+      if (status === 'not_directory') {
         throw new Error('选择的路径不是文件夹')
       }
-      if (getLocalProjectRootStatus(normalizedProjectRootPath) !== 'available') {
+      if (status !== 'available') {
         throw new Error('选择的文件夹不可访问')
       }
     } catch (error) {
@@ -283,14 +295,19 @@ export function createAgentWorkspace(input: string | CreateAgentWorkspaceInput):
   writeIndex(index)
 
   console.log(`[Agent 工作区] 已创建工作区: ${name} (slug: ${slug})`)
+  return normalizedProjectRootPath ? { ...workspace, projectRootStatus: 'available' } : workspace
+}
+
+/** 同步读取已知项目根的即时状态，供迁移与回退路径使用。 */
+function withProjectRootStatus(workspace: AgentWorkspace): AgentWorkspace {
   return workspace
 }
 
 /** 更新工作区名称（slug 和目录不变） */
-export function updateAgentWorkspace(
+export async function updateAgentWorkspace(
   id: string,
   updates: { name: string },
-): AgentWorkspace {
+): Promise<AgentWorkspace> {
   const index = readIndex()
   const idx = index.workspaces.findIndex((w) => w.id === id)
 
@@ -315,28 +332,32 @@ export function updateAgentWorkspace(
   writeIndex(index)
 
   console.log(`[Agent 工作区] 已更新工作区: ${updated.name} (${updated.id})`)
-  return withProjectRootStatus(updated)
+  const projectRootStatus = await getLocalProjectRootStatus(updated.projectRootPath)
+  return projectRootStatus ? { ...updated, projectRootStatus } : updated
 }
 
 /** 将本地项目重新关联到一个已有文件夹，保留项目、会话与配置。 */
-export function relinkAgentWorkspaceProjectRoot(id: string, projectRootPath: string): AgentWorkspace {
-  const index = readIndex()
-  const idx = index.workspaces.findIndex((workspace) => workspace.id === id)
-  if (idx === -1) throw new Error(`项目不存在: ${id}`)
-
+export async function relinkAgentWorkspaceProjectRoot(id: string, projectRootPath: string): Promise<AgentWorkspace> {
   let normalizedProjectRootPath: string
   try {
-    normalizedProjectRootPath = realpathSync(resolve(projectRootPath))
-    if (!statSync(normalizedProjectRootPath).isDirectory()) {
+    normalizedProjectRootPath = await realpathAsync(resolve(projectRootPath))
+    const status = await getLocalProjectRootStatus(normalizedProjectRootPath)
+    if (status === 'not_directory') {
       throw new Error('选择的路径不是文件夹')
     }
-    if (getLocalProjectRootStatus(normalizedProjectRootPath) !== 'available') {
+    if (status !== 'available') {
       throw new Error('选择的文件夹不可访问')
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : '无法访问选择的文件夹'
     throw new Error(`项目文件夹无效: ${message}`)
   }
+
+  // 与创建同理：根路径检查完成后重新读取索引，避免异步等待期间的其他
+  // 工作区写入被旧快照覆盖。
+  const index = readIndex()
+  const idx = index.workspaces.findIndex((workspace) => workspace.id === id)
+  if (idx === -1) throw new Error(`项目不存在: ${id}`)
 
   const updated: AgentWorkspace = {
     ...index.workspaces[idx]!,
@@ -346,7 +367,7 @@ export function relinkAgentWorkspaceProjectRoot(id: string, projectRootPath: str
   index.workspaces[idx] = updated
   writeIndex(index)
   console.log(`[Agent 工作区] 已重新关联项目根: ${updated.name} → ${normalizedProjectRootPath}`)
-  return withProjectRootStatus(updated)
+  return { ...updated, projectRootStatus: 'available' }
 }
 
 /**
@@ -381,21 +402,31 @@ export function updateAgentWorkspaceProjectRoot(workspaceId: string, targetRoot:
 }
 
 /** 在本地项目原路径恢复一个空目录。仅允许路径确实缺失时执行。 */
-export function restoreAgentWorkspaceProjectRoot(id: string): AgentWorkspace {
-  const index = readIndex()
-  const idx = index.workspaces.findIndex((workspace) => workspace.id === id)
-  if (idx === -1) throw new Error(`项目不存在: ${id}`)
+export async function restoreAgentWorkspaceProjectRoot(id: string): Promise<AgentWorkspace> {
+  const initialIndex = readIndex()
+  const initialWorkspace = initialIndex.workspaces.find((workspace) => workspace.id === id)
+  if (!initialWorkspace) throw new Error(`项目不存在: ${id}`)
+  if (!initialWorkspace.projectRootPath) throw new Error('该项目不是本地项目')
 
-  const workspace = index.workspaces[idx]!
-  if (!workspace.projectRootPath) throw new Error('该项目不是本地项目')
-  const status = getLocalProjectRootStatus(workspace.projectRootPath)
+  const projectRootPath = initialWorkspace.projectRootPath
+  const status = await getLocalProjectRootStatus(projectRootPath)
   if (status !== 'missing') {
     throw new Error('只能恢复已缺失的本地项目根目录')
   }
 
-  mkdirSync(workspace.projectRootPath, { recursive: true })
-  console.log(`[Agent 工作区] 已在原路径恢复空项目根: ${workspace.projectRootPath}`)
-  return withProjectRootStatus(workspace)
+  // 根状态检查会让出事件循环；恢复前重新读取索引，拒绝对等待期间已删除
+  // 或已重新关联的项目根产生副作用。mkdir 保持原有同步语义，避免检查后
+  // 再次让出事件循环而在旧路径创建目录。
+  const latestIndex = readIndex()
+  const latestWorkspace = latestIndex.workspaces.find((workspace) => workspace.id === id)
+  if (!latestWorkspace) throw new Error('项目已删除，无法恢复原项目根目录')
+  if (latestWorkspace.projectRootPath !== projectRootPath) {
+    throw new Error('项目根目录已变更，请重试恢复操作')
+  }
+
+  mkdirSync(projectRootPath, { recursive: true })
+  console.log(`[Agent 工作区] 已在原路径恢复空项目根: ${projectRootPath}`)
+  return { ...latestWorkspace, projectRootStatus: 'available' }
 }
 
 /** 删除工作区索引条目及其本地目录 */
@@ -1144,9 +1175,15 @@ function resolveSkillDir(workspaceSlug: string, skillSlug: string): string | nul
   return null
 }
 
-export function readWorkspaceSkillContent(workspaceSlug: string, skillSlug: string): string {
+/** 返回 Skill 的实际目录，避免 renderer 使用可能过期的 Skills 根路径。 */
+export function getWorkspaceSkillFolder(workspaceSlug: string, skillSlug: string): string {
   const dir = resolveSkillDir(workspaceSlug, skillSlug)
   if (!dir) throw new Error(`Skill 不存在: ${workspaceSlug}/${skillSlug}`)
+  return dir
+}
+
+export function readWorkspaceSkillContent(workspaceSlug: string, skillSlug: string): string {
+  const dir = getWorkspaceSkillFolder(workspaceSlug, skillSlug)
   const mdPath = join(dir, 'SKILL.md')
   if (!existsSync(mdPath)) throw new Error(`SKILL.md 不存在: ${mdPath}`)
   return readFileSync(mdPath, 'utf-8')

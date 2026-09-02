@@ -280,12 +280,16 @@ bool IsHexDigit(char value) {
       || (value >= 'A' && value <= 'F');
 }
 
-// 只接受固定 Agent 创建、Agent 重建、内容节点和批量事务 UUID 文件名。
+// 只接受固定 Agent、内容、批量与图片候选事务文件名。
 bool IsCanvasIntentCandidateName(const std::string& name) {
   constexpr std::size_t kAgentRebuildPrefixLength = 19;
   constexpr std::size_t kAgentPrefixLength = 11;
   constexpr std::size_t kContentPrefixLength = 13;
   constexpr std::size_t kBatchPrefixLength = 13;
+  constexpr std::size_t kImageCandidateBatchPrefixLength = 22;
+  constexpr std::size_t kImageCandidateAdoptionPrefixLength = 25;
+  constexpr std::size_t kAgentCanvasPrefixLength = 13;
+  constexpr std::size_t kSha256Length = 64;
   constexpr std::size_t kUuidLength = 36;
   constexpr std::size_t kSuffixLength = 5;
   std::size_t prefix_length = 0;
@@ -297,6 +301,22 @@ bool IsCanvasIntentCandidateName(const std::string& name) {
     prefix_length = kContentPrefixLength;
   } else if (name.compare(0, kBatchPrefixLength, "canvas-batch-") == 0) {
     prefix_length = kBatchPrefixLength;
+  } else if (name.compare(0, kImageCandidateBatchPrefixLength, "image-candidate-batch-") == 0) {
+    prefix_length = kImageCandidateBatchPrefixLength;
+    // Agent 多节点批次使用 agent-canvas-<sha256>，其余单节点批次继续使用 UUID。
+    if (name.size() == prefix_length + kAgentCanvasPrefixLength + kSha256Length + kSuffixLength
+        && name.compare(prefix_length, kAgentCanvasPrefixLength, "agent-canvas-") == 0
+        && name.compare(prefix_length + kAgentCanvasPrefixLength + kSha256Length,
+                        kSuffixLength, ".json") == 0) {
+      for (std::size_t index = prefix_length + kAgentCanvasPrefixLength;
+           index < prefix_length + kAgentCanvasPrefixLength + kSha256Length; ++index) {
+        if (!IsHexDigit(name[index])) return false;
+      }
+      return true;
+    }
+  } else if (name.compare(0, kImageCandidateAdoptionPrefixLength,
+                          "image-candidate-adoption-") == 0) {
+    prefix_length = kImageCandidateAdoptionPrefixLength;
   } else {
     return false;
   }

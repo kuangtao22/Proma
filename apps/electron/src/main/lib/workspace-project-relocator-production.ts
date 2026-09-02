@@ -6,12 +6,12 @@ import { listWorktreesStrict } from './git-diff-service'
 import { listAgentSessions, rebaseWorkspaceSessionPaths } from './agent-session-manager'
 import {
   getAgentWorkspace,
-  getLocalProjectRootStatus,
   listAgentWorkspaces,
   rebaseWorkspaceConfigPaths,
   relinkAgentWorkspaceProjectRoot,
   updateAgentWorkspaceProjectRoot,
 } from './agent-workspace-manager'
+import { getLocalProjectRootStatusSync } from './project-root-health'
 import { acquireWorkspaceOperation } from './workspace-operation-lock'
 import { WorkspaceProjectRelocator } from './workspace-project-relocator'
 
@@ -47,7 +47,7 @@ export function listWorkspacePathStates(): WorkspacePathState[] {
     /** 显式项目根为 external；缺省项目根位于 Proma 托管 workspace-files。 */
     const kind = workspace.projectRootPath === undefined ? 'managed' as const : 'external' as const
     const sourceRoot = workspace.projectRootPath ?? getWorkspaceFilesDir(workspace.slug)
-    const rootStatus = getLocalProjectRootStatus(sourceRoot)
+    const rootStatus = getLocalProjectRootStatusSync(sourceRoot)
     return {
       workspaceId: workspace.id,
       name: workspace.name,

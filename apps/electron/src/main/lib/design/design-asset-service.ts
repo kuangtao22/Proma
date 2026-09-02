@@ -72,6 +72,12 @@ export interface DesignAssetImportBatch extends Array<DesignAsset> {
   rollback: () => void
 }
 
+/** 提供给主进程 Agent 工具的受控缩略图内容，不暴露磁盘位置。 */
+export interface StoredDesignThumbnail {
+  bytes: Buffer
+  mediaType: DesignAsset['mediaType']
+}
+
 /** 素材服务仅依赖可信路径、revision store 与主进程能力。 */
 export interface DesignAssetServiceDependencies {
   /** 从稳定项目 ID 解析项目正式目录与可重建缓存目录。 */
@@ -1191,6 +1197,28 @@ export class DesignAssetService {
         if (existsSync(temporaryTarget)) unlinkSync(temporaryTarget)
       }
     })
+  }
+
+  /**
+   * 按权威素材身份读取当前受管缩略图。
+   * @param projectId 已登记项目稳定 ID。
+   * @param assetId 已存在于项目 Design 文档的素材 ID。
+   * @returns 通过普通文件与图片签名校验的缩略图字节和真实媒体类型。
+   */
+  readStoredThumbnail(projectId: string, assetId: string): StoredDesignThumbnail {
+    const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
+    const asset = document.assets.find((item) => item.id === assetId)
+    if (!asset) throw new Error('DESIGN_ASSET_NOT_FOUND')
+    try {
+      /** 相对路径只来自已通过 Design Store schema 的权威素材记录。 */
+      const thumbnailPath = this.resolveStoredAssetFiles(projectId, asset)[1]
+      const bytes = readAuthorizedImage(thumbnailPath)
+      const format = detectImageFormat(bytes)
+      return { bytes, mediaType: format.mediaType }
+    } catch (error) {
+      this.warn(`Design 受管缩略图读取失败: ${assetId}: ${String(error)}`)
+      throw new Error('DESIGN_THUMBNAIL_UNAVAILABLE')
+    }
   }
 
   /**

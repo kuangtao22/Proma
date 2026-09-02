@@ -163,6 +163,141 @@ describe('Canvas 图片候选批次 Service', () => {
     })).resolves.toBeUndefined()
   })
 
+  test('Given 多条失败记录 When 定向重试一条 Then 仅替换目标 Job 且保存后再启动', async () => {
+    const fixture = createFixture()
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-1', source: 'canvas-tool',
+      sourceSessionId: 'session-1', sourceToolCallId: 'tool-1', entries: fixture.entries.slice(0, 2),
+    })
+    for (const jobId of ['job-0', 'job-1']) {
+      await fixture.service.recordJobTerminal({
+        ...fixture.target, jobId, status: 'failed', outputAssetId: null, error: '失败',
+      })
+    }
+
+    const replacementJobId = await fixture.service.retryJob({
+      ...fixture.target, batchId: 'batch-1', nodeId: 'node-0', imageModuleId: 'module-0', jobId: 'job-0',
+    })
+
+    expect(replacementJobId).toBe('job-0-retry')
+    expect(fixture.retried).toEqual(['job-0'])
+    expect(fixture.started).toEqual(['job-0-retry'])
+    expect((await fixture.service.load({ ...fixture.target, batchId: 'batch-1' })).entries).toMatchObject([
+      { nodeId: 'node-0', jobId: 'job-0-retry', status: 'queued' },
+      { nodeId: 'node-1', jobId: 'job-1', status: 'failed' },
+    ])
+  })
+
+  test('Given 单节点批次文件缺失且任务已有输出 When 登记终态 Then 重建批次并保留候选', async () => {
+    const fixture = createFixture()
+
+    await fixture.service.recordJobTerminal({
+      ...fixture.target,
+      jobId: 'job-retry',
+      candidateBatchId: 'batch-missing',
+      status: 'succeeded',
+      outputAssetId: 'asset-new',
+      error: null,
+      singleBatchRecovery: {
+        nodeId: 'node-0',
+        imageModuleId: 'module-0',
+        initialAdoptedAssetId: 'old-0',
+        initialConfigRevision: 1,
+      },
+    })
+
+    expect(await fixture.service.load({ ...fixture.target, batchId: 'batch-missing' })).toMatchObject({
+      source: 'single',
+      status: 'ready',
+      entries: [{
+        nodeId: 'node-0', imageModuleId: 'module-0', jobId: 'job-retry',
+        candidateAssetId: 'asset-new', status: 'candidate',
+      }],
+    })
+  })
+
+  test('Given 单节点批次仍指向旧失败 Job When replacement 成功 Then 修复 Job 身份并保留新候选', async () => {
+    const fixture = createFixture()
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-stale', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+    })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, jobId: 'job-0', status: 'cancelled', outputAssetId: null, error: null,
+    })
+
+    await fixture.service.recordJobTerminal({
+      ...fixture.target,
+      jobId: 'job-retry',
+      candidateBatchId: 'batch-stale',
+      status: 'succeeded',
+      outputAssetId: 'asset-new',
+      error: null,
+      singleBatchRecovery: {
+        nodeId: 'node-0', imageModuleId: 'module-0',
+        initialAdoptedAssetId: 'old-0', initialConfigRevision: 1,
+      },
+    })
+
+    expect(await fixture.service.load({ ...fixture.target, batchId: 'batch-stale' })).toMatchObject({
+      status: 'ready',
+      entries: [{ jobId: 'job-retry', candidateAssetId: 'asset-new', status: 'candidate' }],
+    })
+  })
+
+  test('Given 缺失批次的旧失败 attempt 携带恢复基线 When 登记终态 Then 仍拒绝创建批次', async () => {
+    const fixture = createFixture()
+
+    await expect(fixture.service.recordJobTerminal({
+      ...fixture.target,
+      jobId: 'job-old',
+      candidateBatchId: 'batch-missing',
+      status: 'cancelled',
+      outputAssetId: null,
+      error: null,
+      singleBatchRecovery: {
+        nodeId: 'node-0', imageModuleId: 'module-0',
+        initialAdoptedAssetId: 'old-0', initialConfigRevision: 1,
+      },
+    })).rejects.toThrow('CANVAS_IMAGE_BATCH_JOB_NOT_FOUND')
+  })
+
+  test('Given 旧单节点失败任务的批次文件缺失 When 定向重试 Then 先重建失败条目再替换 Job', async () => {
+    const fixture = createFixture()
+
+    const replacementJobId = await fixture.service.retryJob({
+      ...fixture.target,
+      batchId: 'batch-missing',
+      nodeId: 'node-0',
+      imageModuleId: 'module-0',
+      jobId: 'job-0',
+      singleBatchRecovery: {
+        nodeId: 'node-0', imageModuleId: 'module-0',
+        initialAdoptedAssetId: 'old-0', initialConfigRevision: 1,
+      },
+    })
+
+    expect(replacementJobId).toBe('job-0-retry')
+    expect(await fixture.service.load({ ...fixture.target, batchId: 'batch-missing' })).toMatchObject({
+      status: 'running', entries: [{ jobId: 'job-0-retry', status: 'queued' }],
+    })
+  })
+
+  test('Given 批次文件缺失但没有单节点恢复证据 When 登记终态 Then 拒绝猜测重建', async () => {
+    const fixture = createFixture()
+
+    await expect(fixture.service.recordJobTerminal({
+      ...fixture.target,
+      jobId: 'job-unknown',
+      candidateBatchId: 'batch-missing',
+      status: 'succeeded',
+      outputAssetId: 'asset-new',
+      error: null,
+    })).rejects.toThrow('CANVAS_IMAGE_BATCH_JOB_NOT_FOUND')
+    await expect(fixture.service.load({ ...fixture.target, batchId: 'batch-missing' }))
+      .rejects.toThrow('CANVAS_IMAGE_BATCH_NOT_FOUND')
+  })
+
   test('Given 2 成功 12 失败 When adopt succeeded Then 明确记录 adopted 与 kept', async () => {
     const fixture = createFixture()
     await fixture.service.createBatch({

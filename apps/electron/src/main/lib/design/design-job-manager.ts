@@ -56,6 +56,8 @@ const DESIGN_IMAGE_TOOL = 'mcp__nano_banana__generate_image'
 const DESIGN_JOB_MODEL_ERROR = '未配置可用的 Agent 渠道和模型'
 const DESIGN_JOB_OUTPUT_ERROR = '任务完成但没有产生可验证图片'
 const DESIGN_IMAGE_MODEL_VALIDATION_ERROR = '校验生图模型配置失败，请刷新后重试'
+/** 直接点击生图创建的单节点批次使用主进程 UUID；Agent 多节点批次使用 agent-canvas 前缀。 */
+const SINGLE_CANVAS_IMAGE_BATCH_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 /** 已完成业务执行、可以进入 trace 与会话回收阶段的状态。 */
 const TERMINAL_JOB_STATUSES = new Set<DesignJobRecord['status']>([
   'succeeded', 'failed', 'cancelled', 'interrupted',
@@ -81,6 +83,25 @@ interface StoredDesignJob extends Omit<DesignJobRecord, 'target'> {
   retryState?: { status: 'pending' }
   /** 终态任务删除在画布与 journal 之间的可恢复意图。 */
   deletionState?: { status: 'pending' }
+}
+
+/** 从持久化 Job 中提取可证明的旧版单节点批次恢复基线。 */
+function createSingleBatchRecovery(job: StoredDesignJob): {
+  nodeId: string
+  imageModuleId: string
+  initialAdoptedAssetId: string | null
+  initialConfigRevision: number
+} | undefined {
+  if (job.target.kind !== 'canvas-image'
+    || !job.candidateBatchId
+    || !SINGLE_CANVAS_IMAGE_BATCH_ID.test(job.candidateBatchId)
+    || job.canvasImageConfigRevision === undefined) return undefined
+  return {
+    nodeId: job.target.nodeId,
+    imageModuleId: job.target.imageModuleId,
+    initialAdoptedAssetId: job.sourceAssetId ?? null,
+    initialConfigRevision: job.canvasImageConfigRevision,
+  }
 }
 
 /** 同一稳定任务 ID 的进程内创建所有权。 */
@@ -146,6 +167,12 @@ export interface DesignJobManagerDependencies {
       status: 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
       outputAssetId: string | null
       error: string | null
+      singleBatchRecovery?: {
+        nodeId: string
+        imageModuleId: string
+        initialAdoptedAssetId: string | null
+        initialConfigRevision: number
+      }
     }) => Promise<void>
   }
   /** 从直接入边读取已提交事实并固化任务输入。 */
@@ -830,6 +857,29 @@ export class DesignJobManager {
           await this.reconcileTerminalJob(job)
           continue
         }
+        /** 启动时重放成功单节点候选，修复旧版缺失或仍指向前一 attempt 的批次文件。 */
+        const singleBatchRecovery = createSingleBatchRecovery(job)
+        if (job.status === 'succeeded'
+          && job.outputAssetId
+          && job.candidateBatchId
+          && job.target.kind === 'canvas-image'
+          && singleBatchRecovery
+          && this.dependencies.canvasImageCandidateBatches) {
+          try {
+            await this.dependencies.canvasImageCandidateBatches.recordJobTerminal({
+              projectId: job.projectId,
+              canvasId: job.target.canvasId,
+              jobId: job.id,
+              candidateBatchId: job.candidateBatchId,
+              status: 'succeeded',
+              outputAssetId: job.outputAssetId,
+              error: null,
+              singleBatchRecovery,
+            })
+          } catch (error) {
+            this.warn(`[Canvas 图片候选] 成功任务 ${job.id} 的批次恢复失败: ${String(error)}`)
+          }
+        }
         if (job.retryState?.status === 'pending') {
           try {
             /** 本次恢复补建的替代任务，必须在返回用户前收敛为可显式重试的终态。 */
@@ -1398,6 +1448,9 @@ export class DesignJobManager {
           status: 'succeeded',
           outputAssetId: asset.id,
           error: null,
+          ...(createSingleBatchRecovery(job)
+            ? { singleBatchRecovery: createSingleBatchRecovery(job) }
+            : {}),
         })
       } else {
         /** 旧装配兼容分支；生产接入候选服务后不再自动采用。 */
@@ -1516,6 +1569,9 @@ export class DesignJobManager {
           status: 'succeeded',
           outputAssetId,
           error: null,
+          ...(createSingleBatchRecovery(job)
+            ? { singleBatchRecovery: createSingleBatchRecovery(job) }
+            : {}),
         })
         this.updateStatus(job, 'succeeded', {
           terminalState: undefined,
@@ -1995,9 +2051,17 @@ function compareDesignJobs(left: StoredDesignJob, right: StoredDesignJob): numbe
   return left.createdAt - right.createdAt || left.id.localeCompare(right.id)
 }
 
-/** 通过 JSON 公开边界复制任务，并删除未定义的可选内部字段。 */
+/** 通过 JSON 公开边界复制任务，并剥离只供主进程恢复使用的内部字段。 */
 function clonePublicDesignJob(job: StoredDesignJob): DesignJobRecord {
-  return JSON.parse(JSON.stringify(job)) as DesignJobRecord
+  /** 公开副本不能携带 journal 恢复状态，否则会破坏跨进程 exact-key 合同。 */
+  const publicJob = { ...job }
+  delete publicJob.maskAnnotationId
+  delete publicJob.placementState
+  delete publicJob.terminalState
+  delete publicJob.replacedByJobId
+  delete publicJob.retryState
+  delete publicJob.deletionState
+  return JSON.parse(JSON.stringify(publicJob)) as DesignJobRecord
 }
 
 /** 把 journal 目标补全为 Canvas Store 使用的四重身份。 */

@@ -1,5 +1,5 @@
 import { createRoot, type Root } from 'react-dom/client'
-import katex from 'katex'
+import DOMPurify from 'dompurify'
 import { RangeSetBuilder, StateEffect, StateField, type Extension, type EditorState } from '@codemirror/state'
 import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet } from '@codemirror/view'
 import { highlightCode, highlightToTokens } from '@proma/core'
@@ -7,8 +7,27 @@ import type { HighlightTokensResult } from '@proma/core'
 import { CodeBlock, MermaidBlock } from '@proma/ui'
 import { shouldRenderMermaidCodeBlock } from '@/lib/mermaid-detection'
 import { copyTextToClipboard } from '@/lib/clipboard'
+import { renderMarkdownMath } from '@/lib/markdown-math'
+import {
+  findInlineLiveMarkdownPreviews,
+  findRawHtmlBlockEnd,
+  getDisplayMathClosingDelimiter,
+} from './live-markdown-preview-syntax'
+import {
+  isLiveMarkdownTableSeparator,
+  parseLiveMarkdownTable,
+  serializeLiveMarkdownTable,
+  type LiveMarkdownTable,
+} from './live-markdown-table'
+import { LiveMarkdownTableEditor } from './LiveMarkdownTableEditor'
+import { getLeadingFrontmatter, type LiveMarkdownPropertyEntry } from './live-markdown-frontmatter'
 
-type PreviewKind = 'code' | 'table' | 'mermaid' | 'thematic-break' | 'math'
+type PreviewKind = 'code' | 'table' | 'frontmatter' | 'mermaid' | 'thematic-break' | 'math' | 'raw-html'
+
+export type ResolveLiveMarkdownImageSrc = (src: string) => Promise<string | null>
+export type SaveLiveMarkdownPastedImage = (file: File) => Promise<string | null>
+export type { LiveMarkdownPropertyEntry } from './live-markdown-frontmatter'
+export type ChangeLiveMarkdownProperties = (entries: LiveMarkdownPropertyEntry[], documentValue?: string) => void
 
 interface PreviewBlock {
   kind: PreviewKind
@@ -173,7 +192,7 @@ abstract class LiveMarkdownBlockWidget extends WidgetType {
     this.observer = null
   }
 
-  override ignoreEvent(): boolean { return false }
+  override ignoreEvent(_event?: Event): boolean { return false }
 }
 
 class CodeBlockWidget extends LiveMarkdownBlockWidget {
@@ -207,27 +226,180 @@ class CodeBlockWidget extends LiveMarkdownBlockWidget {
 }
 
 class TableWidget extends LiveMarkdownBlockWidget {
-  constructor(private readonly rows: string[][], private readonly from: number) { super() }
-  override eq(other: TableWidget): boolean { return this.from === other.from && JSON.stringify(this.rows) === JSON.stringify(other.rows) }
+  private root: Root | null = null
+
+  constructor(
+    private readonly table: LiveMarkdownTable,
+    private readonly from: number,
+    private readonly to: number,
+  ) { super() }
+
+  override eq(other: TableWidget): boolean {
+    return this.from === other.from && this.to === other.to && JSON.stringify(this.table) === JSON.stringify(other.table)
+  }
+
+  override ignoreEvent(): boolean { return true }
+
   override toDOM(view: EditorView): HTMLElement {
     const wrapper = document.createElement('div')
-    wrapper.className = 'vault-markdown-table'
+    wrapper.className = 'live-markdown-table-editor-root'
     wrapper.dataset.liveMarkdownBlockFrom = String(this.from)
-    const table = document.createElement('table')
-    table.setAttribute('aria-label', 'Markdown 表格')
-    this.rows.forEach((row, rowIndex) => {
-      const tr = document.createElement('tr')
-      row.forEach((value) => {
-        const cell = document.createElement(rowIndex === 0 ? 'th' : 'td')
-        cell.textContent = value
-        tr.appendChild(cell)
-      })
-      table.appendChild(tr)
-    })
-    wrapper.appendChild(table)
+    wrapper.dataset.liveMarkdownBlockKind = 'table'
+    this.root = createRoot(wrapper)
+    const onMeasure = () => view.requestMeasure()
+    this.root.render(
+      <LiveMarkdownTableEditor
+        table={this.table}
+        readOnly={view.state.readOnly}
+        onMeasure={onMeasure}
+        onCommit={(nextTable, focusCell) => {
+          if (view.state.readOnly) return
+          const nextSource = serializeLiveMarkdownTable(nextTable)
+          const currentBlock = buildBlocks(view.state).find((block) => block.kind === 'table' && block.from === this.from)
+          if (!currentBlock) return
+          view.dispatch({ changes: { from: currentBlock.from, to: currentBlock.to, insert: nextSource } })
+          if (focusCell) requestAnimationFrame(() => {
+            const target = view.dom.querySelector<HTMLButtonElement>(`[data-live-markdown-table-cell="${focusCell.row}:${focusCell.column}"]`)
+            target?.focus()
+            target?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+          })
+        }}
+      />,
+    )
     this.observeSize(wrapper, view)
     return wrapper
   }
+
+  override destroy(): void {
+    super.destroy()
+    unmountRootAfterRender(this.root)
+    this.root = null
+  }
+}
+
+class FrontmatterWidget extends LiveMarkdownBlockWidget {
+  constructor(
+    private readonly entries: LiveMarkdownPropertyEntry[],
+    private readonly from: number,
+    private readonly onChange?: ChangeLiveMarkdownProperties,
+  ) { super() }
+
+  override eq(other: FrontmatterWidget): boolean {
+    return this.from === other.from && JSON.stringify(this.entries) === JSON.stringify(other.entries)
+  }
+
+  override toDOM(view: EditorView): HTMLElement {
+    const wrapper = document.createElement('section')
+    wrapper.className = 'vault-properties'
+    wrapper.dataset.liveMarkdownBlockFrom = String(this.from)
+    wrapper.dataset.liveMarkdownBlockKind = 'frontmatter'
+    wrapper.setAttribute('aria-label', 'Properties')
+
+    const heading = document.createElement('div')
+    heading.className = 'vault-properties-heading'
+    const title = document.createElement('span')
+    title.textContent = 'Properties'
+    const count = document.createElement('span')
+    count.className = 'vault-properties-count'
+    count.textContent = `${this.entries.length} 个字段`
+    heading.append(title, count)
+    wrapper.appendChild(heading)
+
+    const list = document.createElement('div')
+    list.className = 'vault-properties-list'
+    this.entries.forEach((entry, index) => {
+      const dateValue = /^\d{4}-\d{2}-\d{2}(?:[T ][\d:.+-]+)?$/.test(entry.value)
+      const row = document.createElement('div')
+      row.className = 'vault-property-row'
+
+      const icon = document.createElement('span')
+      icon.className = `vault-property-icon ${dateValue ? 'vault-property-icon-date' : 'vault-property-icon-text'}`
+      icon.setAttribute('aria-hidden', 'true')
+
+      const key = document.createElement(this.onChange ? 'input' : 'span')
+      key.className = `vault-property-key${this.onChange ? ' vault-property-input' : ''}`
+      if (key instanceof HTMLInputElement) {
+        key.value = entry.key
+        key.setAttribute('aria-label', `Property ${entry.key} 名称`)
+        key.spellcheck = false
+      } else {
+        key.textContent = entry.key
+      }
+
+      const value = document.createElement(this.onChange ? 'input' : 'span')
+      value.className = `vault-property-value${this.onChange ? ' vault-property-input' : ''}${dateValue ? ' vault-property-value-date' : ''}`
+      if (value instanceof HTMLInputElement) {
+        value.value = entry.value
+        value.setAttribute('aria-label', `${entry.key} 属性值`)
+        value.spellcheck = false
+      } else {
+        value.textContent = entry.value || '未设置'
+      }
+
+      if (this.onChange && key instanceof HTMLInputElement && value instanceof HTMLInputElement) {
+        let pendingKey: string | null = null
+        let skipKeyBlurCommit = false
+        const commit = (): void => {
+          const nextKey = (pendingKey ?? key.value).trim()
+          if (!nextKey) return
+          this.onChange?.(this.entries.map((current, currentIndex) => currentIndex === index
+            ? { key: nextKey, value: value.value }
+            : current), view.state.doc.toString())
+        }
+        key.addEventListener('blur', () => {
+          if (skipKeyBlurCommit) {
+            skipKeyBlurCommit = false
+            return
+          }
+          commit()
+        })
+        value.addEventListener('blur', commit)
+        key.addEventListener('keydown', (event) => {
+          if (event.key === 'Tab' && !event.shiftKey) {
+            // Do not rebuild the widget between key and value editing. The
+            // pending key is persisted together with the value on its blur.
+            event.preventDefault()
+            pendingKey = key.value
+            skipKeyBlurCommit = true
+            value.focus()
+          } else if (event.key === 'Enter') {
+            event.preventDefault()
+            key.blur()
+          }
+        })
+        value.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') { event.preventDefault(); value.blur() }
+        })
+
+        const remove = document.createElement('button')
+        remove.type = 'button'
+        remove.className = 'vault-property-remove'
+        remove.textContent = '×'
+        remove.setAttribute('aria-label', `删除属性 ${entry.key}`)
+        // Preserve field focus for pointer users. Native button click still
+        // handles mouse, Enter, and Space accessibly.
+        remove.addEventListener('mousedown', (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+        })
+        remove.addEventListener('click', (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          this.onChange?.(this.entries.filter((_, currentIndex) => currentIndex !== index), view.state.doc.toString())
+        })
+        row.append(icon, key, value, remove)
+      } else {
+        row.append(icon, key, value)
+      }
+
+      list.appendChild(row)
+    })
+    wrapper.appendChild(list)
+    this.observeSize(wrapper, view)
+    return wrapper
+  }
+
+  override ignoreEvent(): boolean { return true }
 }
 
 class HorizontalRuleWidget extends LiveMarkdownBlockWidget {
@@ -270,57 +442,123 @@ class MathWidget extends LiveMarkdownBlockWidget {
     const wrapper = document.createElement('div')
     wrapper.className = 'live-markdown-math-block'
     wrapper.dataset.liveMarkdownBlockFrom = String(this.from)
-    try {
-      wrapper.innerHTML = katex.renderToString(this.latex, { displayMode: true, throwOnError: false })
-    } catch {
-      wrapper.textContent = this.latex
-    }
+    wrapper.innerHTML = renderMarkdownMath(this.latex, true)
     this.observeSize(wrapper, view)
     return wrapper
   }
 }
 
 class InlineMathWidget extends WidgetType {
-  constructor(private readonly latex: string) { super() }
-  override eq(other: InlineMathWidget): boolean { return this.latex === other.latex }
+  constructor(private readonly latex: string, private readonly from: number) { super() }
+  override eq(other: InlineMathWidget): boolean { return this.latex === other.latex && this.from === other.from }
   override toDOM(): HTMLElement {
     const element = document.createElement('span')
     element.className = 'live-markdown-math-inline'
-    try {
-      element.innerHTML = katex.renderToString(this.latex, { throwOnError: false })
-    } catch {
-      element.textContent = this.latex
-    }
+    element.dataset.liveMarkdownInlineFrom = String(this.from)
+    element.setAttribute('aria-label', '点击编辑公式')
+    element.innerHTML = renderMarkdownMath(this.latex)
     return element
   }
   override ignoreEvent(): boolean { return false }
 }
 
-function splitTableRow(line: string): string[] {
-  const content = line.trim().replace(/^\|/, '').replace(/\|$/, '')
-  const cells: string[] = []
-  let cell = ''
-  let escaped = false
-  for (const character of content) {
-    if (escaped) { cell += character; escaped = false }
-    else if (character === '\\') escaped = true
-    else if (character === '|') { cells.push(cell.trim()); cell = '' }
-    else cell += character
+/** Raw HTML 在阅读态保持可用，但先经 DOMPurify 处理，避免 Markdown 文件执行脚本。 */
+class RawHtmlBlockWidget extends LiveMarkdownBlockWidget {
+  constructor(private readonly html: string, private readonly from: number) { super() }
+  override eq(other: RawHtmlBlockWidget): boolean { return this.from === other.from && this.html === other.html }
+  override toDOM(view: EditorView): HTMLElement {
+    const wrapper = document.createElement('div')
+    wrapper.className = 'live-markdown-raw-html-block'
+    wrapper.dataset.liveMarkdownBlockFrom = String(this.from)
+    wrapper.innerHTML = DOMPurify.sanitize(this.html, {
+      USE_PROFILES: { html: true },
+      FORBID_TAGS: ['style'],
+      FORBID_ATTR: ['style'],
+    })
+    for (const link of Array.from(wrapper.querySelectorAll('a'))) {
+      link.target = '_blank'
+      link.rel = 'noreferrer noopener'
+    }
+    this.observeSize(wrapper, view)
+    return wrapper
   }
-  if (escaped) cell += '\\'
-  cells.push(cell.trim())
-  return cells
 }
 
-function isTableSeparator(line: string): boolean {
-  const cells = splitTableRow(line)
-  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell))
+class InlineImageWidget extends WidgetType {
+  private destroyed = false
+
+  constructor(
+    private readonly src: string,
+    private readonly alt: string,
+    private readonly title: string,
+    private readonly from: number,
+    private readonly resolveImageSrc?: ResolveLiveMarkdownImageSrc,
+  ) { super() }
+
+  override eq(other: InlineImageWidget): boolean {
+    return this.src === other.src && this.alt === other.alt && this.title === other.title && this.from === other.from
+  }
+
+  override toDOM(view: EditorView): HTMLElement {
+    const element = document.createElement('span')
+    element.className = 'live-markdown-image'
+    element.dataset.liveMarkdownInlineFrom = String(this.from)
+    element.setAttribute('aria-label', '点击编辑图片')
+
+    const image = document.createElement('img')
+    image.alt = this.alt
+    image.title = this.title
+    image.loading = 'lazy'
+    image.addEventListener('load', () => view.requestMeasure())
+    image.addEventListener('error', () => view.requestMeasure())
+    element.appendChild(image)
+
+    if (/^(?:https?:|data:|blob:|proma-file:)/i.test(this.src)) {
+      image.src = this.src
+    } else if (this.resolveImageSrc) {
+      void this.resolveImageSrc(this.src).then((resolved) => {
+        if (!this.destroyed && resolved) image.src = resolved
+      }).catch(() => {})
+    }
+    return element
+  }
+
+  override destroy(): void { this.destroyed = true }
+  override ignoreEvent(): boolean { return false }
 }
 
-function buildBlocks(state: EditorState): PreviewBlock[] {
+/** CommonMark angle autolinks are not interpreted by ink-mde, so retain their normal link behavior. */
+class AngleAutolinkWidget extends WidgetType {
+  constructor(private readonly href: string) { super() }
+  override eq(other: AngleAutolinkWidget): boolean { return this.href === other.href }
+  override toDOM(): HTMLElement {
+    const link = document.createElement('a')
+    link.className = 'live-markdown-autolink'
+    link.href = this.href
+    link.target = '_blank'
+    link.rel = 'noreferrer noopener'
+    link.textContent = this.href
+    return link
+  }
+  override ignoreEvent(): boolean { return false }
+}
+
+function buildBlocks(
+  state: EditorState,
+  onChangeProperties?: ChangeLiveMarkdownProperties,
+  enableProperties = false,
+): PreviewBlock[] {
   const blocks: PreviewBlock[] = []
   const lines = Array.from({ length: state.doc.lines }, (_, index) => state.doc.line(index + 1).text)
-  for (let number = 1; number <= lines.length; number += 1) {
+  const frontmatter = enableProperties ? getLeadingFrontmatter(lines) : null
+  if (frontmatter) {
+    const from = state.doc.line(1).from
+    const to = state.doc.line(frontmatter.endLine).to
+    blocks.push({ kind: 'frontmatter', from, to, decoration: Decoration.replace({ widget: new FrontmatterWidget(frontmatter.entries, from, onChangeProperties), block: true }) })
+  }
+  // Only hide the source when an editable flat mapping was recognized. Complex
+  // frontmatter remains in the normal editor, preserving the original YAML.
+  for (let number = frontmatter ? frontmatter.endLine + 1 : 1; number <= lines.length; number += 1) {
     const line = lines[number - 1] ?? ''
     const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/)
     if (fence) {
@@ -342,9 +580,10 @@ function buildBlocks(state: EditorState): PreviewBlock[] {
       }
       continue
     }
-    if (line.trim() === '$$') {
+    const closingDelimiter = getDisplayMathClosingDelimiter(line)
+    if (closingDelimiter) {
       let closing = number + 1
-      while (closing <= lines.length && (lines[closing - 1] ?? '').trim() !== '$$') closing += 1
+      while (closing <= lines.length && (lines[closing - 1] ?? '').trim() !== closingDelimiter) closing += 1
       if (closing <= lines.length) {
         const from = state.doc.line(number).from
         const to = state.doc.line(closing).to
@@ -353,45 +592,60 @@ function buildBlocks(state: EditorState): PreviewBlock[] {
       }
       continue
     }
+    const rawHtmlEnd = findRawHtmlBlockEnd(lines, number - 1)
+    if (rawHtmlEnd !== null) {
+      const from = state.doc.line(number).from
+      const to = state.doc.line(rawHtmlEnd + 1).to
+      const html = lines.slice(number - 1, rawHtmlEnd + 1).join('\n')
+      blocks.push({ kind: 'raw-html', from, to, decoration: Decoration.replace({ widget: new RawHtmlBlockWidget(html, from), block: true }) })
+      number = rawHtmlEnd + 1
+      continue
+    }
     if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
       const from = state.doc.line(number).from
       blocks.push({ kind: 'thematic-break', from, to: state.doc.line(number).to, decoration: Decoration.replace({ widget: new HorizontalRuleWidget(from), block: true }) })
       continue
     }
-    if (line.includes('|') && number < lines.length && isTableSeparator(lines[number] ?? '')) {
+    if (line.includes('|') && number < lines.length && isLiveMarkdownTableSeparator(lines[number] ?? '')) {
       let end = number + 1
       while (end < lines.length && (lines[end] ?? '').trim() && (lines[end] ?? '').includes('|')) end += 1
-      const header = splitTableRow(line)
-      const body = lines.slice(number + 1, end).map(splitTableRow)
-      const width = Math.max(header.length, ...body.map((row) => row.length))
-      const rows = [header, ...body].map((row) => Array.from({ length: width }, (_, index) => row[index] ?? ''))
       const from = state.doc.line(number).from
-      blocks.push({ kind: 'table', from, to: state.doc.line(end).to, decoration: Decoration.replace({ widget: new TableWidget(rows, from), block: true }) })
+      const to = state.doc.line(end).to
+      const table = parseLiveMarkdownTable(state.sliceDoc(from, to))
+      if (table) blocks.push({ kind: 'table', from, to, decoration: Decoration.replace({ widget: new TableWidget(table, from, to), block: true }) })
       number = end
     }
   }
   return blocks
 }
 
-function buildDecorations(state: EditorState, blocks: PreviewBlock[], lines: Set<number>): DecorationSet {
+function buildDecorations(
+  state: EditorState,
+  blocks: PreviewBlock[],
+  lines: Set<number>,
+  resolveImageSrc?: ResolveLiveMarkdownImageSrc,
+): DecorationSet {
   const entries: Array<{ from: number; to: number; decoration: Decoration }> = []
   const protectedRanges = blocks.map((block) => ({ from: block.from, to: block.to }))
   for (const block of blocks) {
     const first = state.doc.lineAt(block.from).number
     const last = state.doc.lineAt(block.to).number
-    if (![...lines].some((line) => line >= first && line <= last)) entries.push(block)
+    const hasActiveSelectionInBlock = [...lines].some((line) => line >= first && line <= last)
+    if (block.kind === 'table' || block.kind === 'frontmatter' || !hasActiveSelectionInBlock) entries.push(block)
   }
   for (let number = 1; number <= state.doc.lines; number += 1) {
     if (lines.has(number)) continue
     const line = state.doc.line(number)
-    const pattern = /(^|[^\\])\$([^$\n]+)\$/g
-    let match: RegExpExecArray | null
-    while ((match = pattern.exec(line.text)) !== null) {
-      const markerOffset = match.index + match[1]!.length
-      const from = line.from + markerOffset
-      const to = from + match[0]!.length - match[1]!.length
+    for (const preview of findInlineLiveMarkdownPreviews(line.text)) {
+      const from = line.from + preview.from
+      const to = line.from + preview.to
       if (protectedRanges.some((range) => from >= range.from && to <= range.to)) continue
-      entries.push({ from, to, decoration: Decoration.replace({ widget: new InlineMathWidget(match[2]!) }) })
+      const widget = preview.kind === 'math'
+        ? new InlineMathWidget(preview.content, from)
+        : preview.kind === 'image'
+          ? new InlineImageWidget(preview.src, preview.alt, preview.title, from, resolveImageSrc)
+          : new AngleAutolinkWidget(preview.content)
+      entries.push({ from, to, decoration: Decoration.replace({ widget }) })
     }
   }
   entries.sort((left, right) => left.from - right.from || left.to - right.to)
@@ -401,36 +655,75 @@ function buildDecorations(state: EditorState, blocks: PreviewBlock[], lines: Set
 }
 
 /** Common live preview for block Markdown that ink-mde does not render itself. */
-export const liveMarkdownBlockPreview: Extension = [
+export function createLiveMarkdownBlockPreview(
+  resolveImageSrc?: ResolveLiveMarkdownImageSrc,
+  savePastedImage?: SaveLiveMarkdownPastedImage,
+  onChangeProperties?: ChangeLiveMarkdownProperties,
+  enableProperties = false,
+): Extension {
+  return [
   liveMarkdownShikiHighlight,
   StateField.define<PreviewState>({
     create: (state) => {
       const lines = activeLines(state)
-      const blocks = buildBlocks(state)
-      return { activeLines: lines, blocks, decorations: buildDecorations(state, blocks, lines) }
+      const blocks = buildBlocks(state, onChangeProperties, enableProperties)
+      return {
+        activeLines: lines,
+        blocks,
+        decorations: buildDecorations(state, blocks, lines, resolveImageSrc),
+      }
     },
     update: (value, transaction) => {
       const lines = activeLines(transaction.state)
+      const blocks = transaction.docChanged ? buildBlocks(transaction.state, onChangeProperties, enableProperties) : value.blocks
       if (!transaction.docChanged && sameLines(lines, value.activeLines)) return value
-      const blocks = transaction.docChanged ? buildBlocks(transaction.state) : value.blocks
-      return { activeLines: lines, blocks, decorations: buildDecorations(transaction.state, blocks, lines) }
+      return {
+        activeLines: lines,
+        blocks,
+        decorations: buildDecorations(transaction.state, blocks, lines, resolveImageSrc),
+      }
     },
     provide: (field) => EditorView.decorations.from(field, (value) => value.decorations),
   }),
   EditorView.domEventHandlers({
+    paste: (event, view) => {
+      const image = Array.from(event.clipboardData?.files ?? []).find((file) => /^image\/(?:png|jpeg|gif|webp)$/i.test(file.type))
+      if (!image || !savePastedImage || view.state.readOnly) return false
+      event.preventDefault()
+      void savePastedImage(image).then((src) => {
+        if (!src) return
+        const position = view.state.selection.main.from
+        const alt = image.name.replace(/[\\[\]]/g, '\\$&') || '粘贴的图片'
+        const markdown = `![${alt}](<${src}>)`
+        view.dispatch({ changes: { from: position, insert: markdown }, selection: { anchor: position + markdown.length } })
+      }).catch(() => {})
+      return true
+    },
     mousedown: (event, view) => {
       const target = event.target as HTMLElement | null
       const block = target?.closest<HTMLElement>('[data-live-markdown-block-from]')
-      if (!block) return false
+      const inlineMath = target?.closest<HTMLElement>('[data-live-markdown-inline-from]')
+      if (!block && !inlineMath) return false
+      if (block?.dataset.liveMarkdownBlockKind === 'table') return true
       // CodeBlock 的复制按钮必须在外层选区切换之前收到完整 click 序列。
       // 否则 mousedown 会把预览切回源码并卸载按钮，导致 click 永远无法触发。
+      // `.cm-content` 本身就是 contenteditable；把它纳入排除条件会让所有
+      // widget 点击都被提前吞掉。只给真正需要原生 click 序列的交互控件让路。
       if (target?.closest('button, a, input, select, textarea, [role="button"]')) return true
-      const from = Number(block.dataset.liveMarkdownBlockFrom)
+      const from = Number(block?.dataset.liveMarkdownBlockFrom ?? inlineMath?.dataset.liveMarkdownInlineFrom)
       if (!Number.isSafeInteger(from)) return false
+      // Replacement widget 没有可供 CodeMirror 命中的文本位置；默认命中会跳到邻行。
+      // 直接选中其源码起点，下一次 decorations 更新便会展示该行的公式标记。
       event.preventDefault()
-      view.dispatch({ selection: { anchor: from } })
+      view.dispatch({
+        selection: { anchor: from },
+      })
       view.focus()
       return true
     },
   }),
-]
+  ]
+}
+
+/** Default extension for consumers that do not need local-media resolution. */
+export const liveMarkdownBlockPreview = createLiveMarkdownBlockPreview()

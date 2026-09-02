@@ -12,6 +12,7 @@ type AgentStreamCompletionPayloadDetails = Omit<
   AgentStreamCompletePayload,
   'sessionId' | 'triggeredBy'
 >
+type AgentRunIdentity = Readonly<Pick<AgentSendInput, 'sessionId' | 'triggeredBy'> & { runGeneration?: number }>
 
 /** completion producer 可提供的业务字段；session 必须由主进程权威索引注入。 */
 export type AgentStreamCompletionDetails = Omit<AgentStreamCompletionPayloadDetails, 'session'>
@@ -92,13 +93,15 @@ export function buildAuthoritativeAgentStreamErrorPayload(
 }
 
 function buildAgentStreamCompletePayload(
-  run: Readonly<Pick<AgentSendInput, 'sessionId' | 'triggeredBy'>>,
+  run: AgentRunIdentity,
   details: AgentStreamCompletionPayloadDetails = {},
 ): AgentStreamCompletePayload {
+  const { runGeneration, ...otherDetails } = details
   return {
     sessionId: run.sessionId,
     triggeredBy: run.triggeredBy,
-    ...details,
+    ...otherDetails,
+    ...(runGeneration != null ? { runGeneration } : run.runGeneration != null ? { runGeneration: run.runGeneration } : {}),
   }
 }
 
@@ -110,7 +113,7 @@ function buildAgentStreamCompletePayload(
  * @returns 始终经过轻量 metadata 选择器的 completion payload。
  */
 export function buildAuthoritativeAgentStreamCompletePayload(
-  run: Readonly<Pick<AgentSendInput, 'sessionId' | 'triggeredBy'>>,
+  run: AgentRunIdentity,
   getSession: (sessionId: string) => AgentSessionMeta | undefined,
   details: AgentStreamCompletionDetails = {},
 ): AgentStreamCompletePayload {

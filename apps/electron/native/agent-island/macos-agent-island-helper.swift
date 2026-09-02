@@ -667,14 +667,9 @@ struct ExpandedIslandView: View {
     // hardware notch, while the lower inset protects the continuous curve.
     .padding(.top, 8)
     .padding(.bottom, expandedBottomCornerClearance)
-    // Replace the live Agent stack and the idle recent-session dashboard as
-    // distinct views, so a completion feels like a calm handoff, not a cut.
+    // 内容模式切换只替换同一内容树，不再对 live/recent/planning 各自做过渡；
+    // 高频 Agent 快照如果同时保留旧树，会在顶部形成两层并造成闪烁。
     .id(contentMode)
-    .transition(.asymmetric(
-      insertion: .opacity.combined(with: .move(edge: .top)),
-      removal: .opacity.combined(with: .move(edge: .bottom))
-    ))
-    .animation(.easeInOut(duration: 0.36), value: contentMode)
   }
 
   var body: some View {
@@ -713,11 +708,9 @@ struct PlanningColumn<Content: View>: View {
       content.font(.system(size: 11)).foregroundStyle(.white.opacity(0.86)).frame(maxWidth: .infinity, alignment: .leading)
       if count == 0 { Text("暂无事项").font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.45)) }
     }
-    .padding(13).frame(maxWidth: .infinity, alignment: .topLeading)
-    .compositingGroup()
-    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-    .background(.white.opacity(0.075), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-    .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(.white.opacity(0.10), lineWidth: 1))
+    .padding(.horizontal, 4)
+    .padding(.vertical, 2)
+    .frame(maxWidth: .infinity, alignment: .topLeading)
   }
 }
 
@@ -762,12 +755,7 @@ struct IslandRootView: View {
         // Keep the expanded silhouette legible against a dark desktop so its
         // lower continuous corners do not disappear into the background.
         if expanded {
-          ZStack {
-            // A soft outer pass first, then a crisp inner edge: the result
-            // reads as one rounded macOS surface instead of a hard rectangle.
-            outline.stroke(.white.opacity(0.08), lineWidth: 3)
-            outline.stroke(.white.opacity(0.20), lineWidth: 1.2)
-          }
+          outline.stroke(.white.opacity(0.18), lineWidth: 1)
         } else if hovered {
           shape.stroke(.white.opacity(0.15), lineWidth: 1)
         }
@@ -890,8 +878,11 @@ final class IslandController {
     // interactive surface. This avoids a giant transparent WindowServer hit area,
     // so native AppKit hover and clicks stay immediate without event replays.
     let targetFrame = Self.topFrame(screen: screen, width: width, height: height)
+    // 仅在外框高度确实变化时启动尺寸动画。流式快照会频繁到达，不能让同一
+    // 个目标 frame 反复重启动画，否则 AppKit 会留下可见的重绘闪层。
+    let shouldAnimateFrame = animateFrame && abs(panel.frame.height - targetFrame.height) > 0.5
     if panel.frame != targetFrame {
-      if animateFrame {
+      if shouldAnimateFrame {
         NSAnimationContext.runAnimationGroup { context in
           context.duration = 0.36
           panel.animator().setFrame(targetFrame, display: true)
@@ -903,7 +894,9 @@ final class IslandController {
     model.apply(message, screen: screen, surfaceSize: surfaceSize, force: forceModelUpdate)
     panel.ignoresMouseEvents = !message.state.visible
     panel.acceptsMouseMovedEvents = message.state.visible
-    if message.state.visible { panel.orderFrontRegardless() } else { panel.orderOut(nil) }
+    if message.state.visible {
+      if !panel.isVisible { panel.orderFrontRegardless() }
+    } else if panel.isVisible { panel.orderOut(nil) }
   }
 
   private static func preferredScreen() -> NSScreen? {

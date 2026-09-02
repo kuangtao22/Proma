@@ -202,7 +202,7 @@ export async function sendMessage(
   input: ChatSendInput,
   webContents: WebContents | null,
   onEvent?: (event: ChatStreamEvent) => void,
-): Promise<void> {
+): Promise<boolean> {
   const {
     conversationId, userMessage, channelId,
     modelId, systemMessage, contextLength, contextDividers, attachments,
@@ -231,7 +231,7 @@ export async function sendMessage(
       conversationId,
       error: '渠道不存在',
     })
-    return
+    return false
   }
 
   // Subscription OAuth uses Pi provider-specific transports, which Chat mode does
@@ -243,7 +243,7 @@ export async function sendMessage(
       conversationId,
       error: `Chat 模式暂不支持 ${providerName}，请切换到 Agent 模式使用。`,
     })
-    return
+    return false
   }
 
   // 2. 解密 API Key
@@ -255,7 +255,7 @@ export async function sendMessage(
       conversationId,
       error: '解密 API Key 失败',
     })
-    return
+    return false
   }
 
   // 3. 先读取历史消息（在追加用户消息之前，避免 adapter 重复发送当前消息）
@@ -474,6 +474,7 @@ export async function sendMessage(
       model: modelId,
       messageId: (accumulatedContent.trim() || accumulatedGeneratedAttachments.length > 0) ? assistantMsgId : undefined,
     })
+    return true
   } catch (error) {
     // 被中止的请求：保存已输出的部分内容，通知前端停止
     if (controller.signal.aborted) {
@@ -511,7 +512,7 @@ export async function sendMessage(
           model: modelId,
         })
       }
-      return
+      return true
     }
 
     const errorMessage = error instanceof Error ? error.message : '未知错误'
@@ -558,6 +559,7 @@ export async function sendMessage(
       conversationId,
       error: errorMessage,
     })
+    return false
   } finally {
     activeControllers.delete(conversationId)
   }

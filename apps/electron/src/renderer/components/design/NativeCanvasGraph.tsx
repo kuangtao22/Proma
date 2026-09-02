@@ -487,6 +487,11 @@ export function NativeCanvasGraph({
     nodesConnectable: writable && activeTool === 'select',
     elementsSelectable: true,
     panOnDrag: activeTool === 'pan' ? true : [1],
+    /** 两指滑动平移，捏合缩放；滚轮缩放仅由 Command/Ctrl 修饰触发。 */
+    panOnScroll: true,
+    zoomOnScroll: false,
+    zoomOnPinch: true,
+    preventScrolling: true,
     selectionOnDrag: activeTool === 'select',
     multiSelectionKeyCode: null,
     edgesFocusable: false,

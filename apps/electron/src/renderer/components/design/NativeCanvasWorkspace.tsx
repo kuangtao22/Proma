@@ -20,6 +20,7 @@ import type {
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
   DeleteCanvasNodeInput,
+  DesignChangeEvent,
   DesignPoint,
   DesignJobRecord,
   RebuildCanvasAgentNodeInput,
@@ -199,6 +200,9 @@ export interface NativeCanvasAdapter {
   loadCanvas: DesignAdapter['loadCanvas']
   saveCanvas: DesignAdapter['saveCanvas']
   onCanvasChanged: DesignAdapter['onCanvasChanged']
+  /** 画布卡片运行态只读取轻量任务列表，并监听项目级任务事件。 */
+  listJobs?: DesignAdapter['listJobs']
+  onChanged?: DesignAdapter['onChanged']
   /** 旧测试替身可省略，真实 Design adapter 始终提供。 */
   createCanvasAgentNode?: DesignAdapter['createCanvasAgentNode']
   /** 非 Agent 内容节点必须通过主进程生命周期创建。 */
@@ -246,6 +250,73 @@ export interface NativeCanvasAdapter {
   listCanvasArtifactRevisions?: DesignAdapter['listCanvasArtifactRevisions']
   adoptCanvasArtifactRevision?: DesignAdapter['adoptCanvasArtifactRevision']
   exportCanvasArtifact?: DesignAdapter['exportCanvasArtifact']
+}
+
+/** 画布卡片任务同步器依赖，只包含项目任务列表与变更事件。 */
+export interface NativeCanvasJobActivityControllerDependencies {
+  projectId: string
+  listJobs: DesignAdapter['listJobs']
+  onChanged: DesignAdapter['onChanged']
+  onJobsChange: (jobs: DesignJobRecord[]) => void
+}
+
+/** 画布卡片任务同步器公开的最小生命周期。 */
+export interface NativeCanvasJobActivityController {
+  start: () => void
+  refresh: () => Promise<void>
+  whenIdle: () => Promise<void>
+  dispose: () => void
+}
+
+/**
+ * 创建事件驱动的画布任务同步器，避免依赖未挂载的旧设计工作区。
+ * @param dependencies 当前项目的任务读取、事件订阅与状态提交入口。
+ * @returns 可启动、等待刷新与释放的轻量控制器。
+ */
+export function createNativeCanvasJobActivityController(
+  dependencies: NativeCanvasJobActivityControllerDependencies,
+): NativeCanvasJobActivityController {
+  /** 已释放控制器不得提交迟到任务结果。 */
+  let disposed = false
+  /** 仅最后一次任务读取可以更新卡片活动态。 */
+  let requestGeneration = 0
+  /** 当前事件订阅释放器，保证重复 start 不重复监听。 */
+  let unsubscribe: (() => void) | null = null
+  /** 测试与收尾可等待的最近一次刷新。 */
+  let pendingRefresh = Promise.resolve()
+
+  const refresh = (): Promise<void> => {
+    if (disposed) return Promise.resolve()
+    const generation = requestGeneration + 1
+    requestGeneration = generation
+    pendingRefresh = dependencies.listJobs(dependencies.projectId).then((jobs) => {
+      if (disposed || generation !== requestGeneration) return
+      dependencies.onJobsChange(jobs)
+    }).catch(() => {
+      /** 卡片运行提示是增强信息；读取失败时保留最后一次有效快照。 */
+    })
+    return pendingRefresh
+  }
+
+  return {
+    start: () => {
+      if (disposed || unsubscribe) return
+      unsubscribe = dependencies.onChanged((change: DesignChangeEvent) => {
+        if (change.projectId !== dependencies.projectId || change.cause !== 'job') return
+        void refresh()
+      })
+      void refresh()
+    },
+    refresh,
+    whenIdle: () => pendingRefresh,
+    dispose: () => {
+      if (disposed) return
+      disposed = true
+      requestGeneration += 1
+      unsubscribe?.()
+      unsubscribe = null
+    },
+  }
 }
 
 /** 添加 Agent 按钮的局部异步状态。 */
@@ -2339,6 +2410,11 @@ export function NativeCanvasWorkspace({
   const runningSessionIds = useAtomValue(canvasAgentRunningSessionIdsAtom)
   /** 项目级 Job 只提供轻量任务事实，不读取图片正文或历史详情。 */
   const designProjectStates = useAtomValue(designProjectStatesAtom)
+  /** 原生画布独立维护任务快照，不依赖旧设计工作区是否同时挂载。 */
+  const [canvasActivityJobs, setCanvasActivityJobs] = React.useState<{
+    projectId: string
+    jobs: DesignJobRecord[]
+  } | null>(null)
   const runGenerations = useAtomValue(canvasAgentRunGenerationsAtom)
   const optimisticRunGenerations = useAtomValue(canvasAgentOptimisticRunGenerationsAtom)
   const controllerRef = React.useRef<NativeCanvasWorkspaceController | null>(null)
@@ -2392,6 +2468,19 @@ export function NativeCanvasWorkspace({
     () => createNativeCanvasImageWorkbenchAdapter(adapter),
     [adapter],
   )
+
+  React.useEffect(() => {
+    if (!adapter.listJobs || !adapter.onChanged) return
+    /** 当前画布只在任务变化时读取轻量 journal，不轮询或加载图片正文。 */
+    const activityController = createNativeCanvasJobActivityController({
+      projectId: target.projectId,
+      listJobs: adapter.listJobs,
+      onChanged: adapter.onChanged,
+      onJobsChange: (jobs) => setCanvasActivityJobs({ projectId: target.projectId, jobs }),
+    })
+    activityController.start()
+    return () => activityController.dispose()
+  }, [adapter.listJobs, adapter.onChanged, target.projectId])
   /** 候选批次能力不影响普通生图工作台可用性。 */
   const imageCandidateBatchAdapter = React.useMemo(
     () => createNativeCanvasImageCandidateBatchAdapter(adapter),
@@ -2480,9 +2569,12 @@ export function NativeCanvasWorkspace({
     ? createNativeCanvasNodeActivityStates(
         state.snapshot.document,
         runningSessionIds,
-        designProjectStates.get(target.projectId)?.jobs ?? [],
+        canvasActivityJobs?.projectId === target.projectId
+          ? canvasActivityJobs.jobs
+          : designProjectStates.get(target.projectId)?.jobs ?? [],
       )
     : new Map<string, CanvasNodeActivityState>(), [
+      canvasActivityJobs,
       designProjectStates,
       runningSessionIds,
       state.snapshot,

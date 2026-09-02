@@ -31,6 +31,7 @@ import {
   conversationThinkingEnabledAtom,
   conversationParallelModeAtom,
   agentSideChatMapAtom,
+  conversationQuotedSelectionMapAtom,
 } from '@/atoms/chat-atoms'
 import {
   agentSessionsAtom,
@@ -104,7 +105,7 @@ import { conversationPromptIdAtom } from '@/atoms/system-prompt-atoms'
 import { useCreateSession } from '@/hooks/useCreateSession'
 import { useOpenSession } from '@/hooks/useOpenSession'
 import { useSyncActiveTabSideEffects } from '@/hooks/useSyncActiveTabSideEffects'
-import { sessionHoverPreviewEnabledAtom } from '@/atoms/ui-preferences'
+import { productivityToolsAtom, sessionHoverPreviewEnabledAtom } from '@/atoms/ui-preferences'
 import { CollapsedWorkspacePopover } from '@/components/agent/CollapsedWorkspacePopover'
 import { ObsidianIcon } from '@/components/obsidian/obsidian-brand'
 import { VirtualSidebarList, type VirtualSidebarRow } from '@/components/ui/virtual-sidebar-list'
@@ -581,6 +582,7 @@ function getSyncableDelegatedChildren(
 ): AgentSessionMeta[] {
   return getDirectDelegatedChildren(sessions, parentSessionId).filter((child) => (
     !child.archived
+    && !child.isDraft
     && !draftSessionIds.has(child.id)
   ))
 }
@@ -596,6 +598,7 @@ function getArchivedDelegatedChildren(
 ): AgentSessionMeta[] {
   return getDirectDelegatedChildren(sessions, parentSessionId).filter((child) => (
     child.archived
+    && !child.isDraft
     && !draftSessionIds.has(child.id)
   ))
 }
@@ -763,6 +766,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
   const updateStatus = useAtomValue(updateStatusAtom)
   const hasEnvironmentIssues = useAtomValue(hasEnvironmentIssuesAtom)
   const sessionHoverPreviewEnabled = useAtomValue(sessionHoverPreviewEnabledAtom)
+  const productivityTools = useAtomValue(productivityToolsAtom)
 
   // Agent 模式状态
   const [agentSessions, setAgentSessions] = useAtom(agentSessionsAtom)
@@ -869,6 +873,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
   const setPreviewContentRefreshVersion = useSetAtom(previewContentRefreshVersionAtom)
   const setPreviewResolvedPaths = useSetAtom(previewResolvedPathAtom)
   const setAgentSideChatMap = useSetAtom(agentSideChatMapAtom)
+  const setConversationQuotedSelections = useSetAtom(conversationQuotedSelectionMapAtom)
   const setDiffPanelTab = useSetAtom(agentDiffPanelTabAtom)
   const setDiffRefreshVersion = useSetAtom(agentDiffRefreshVersionAtom)
   const setDiffUnseen = useSetAtom(agentDiffUnseenChangesAtom)
@@ -910,6 +915,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     }
     setPreviewContentRefreshVersion(deletePreviewSessionEntries)
     setPreviewResolvedPaths(deletePreviewSessionEntries)
+    setConversationQuotedSelections(deleteKey)
     setAgentSideChatMap((prev) => {
       let changed = false
       const map = new Map(prev)
@@ -1039,6 +1045,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
       if (viewMode !== 'active') return []
       const filtered = agentSessions.filter((s) =>
         s.pinned
+        && !s.isDraft
         && !draftSessionIds.has(s.id)
         && !hasPinnedVisibleParent(s, agentSessions)
       )
@@ -1052,6 +1059,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
       session,
       childSessions: getDirectDelegatedChildren(agentSessions, session.id).filter((child) => (
         !child.archived
+        && !child.isDraft
         && !draftSessionIds.has(child.id)
         && !isHiddenAutomationSession(child)
       )),
@@ -1652,6 +1660,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
         agentSessions.filter((session) =>
           !session.archived
           && !session.pinned
+          && !session.isDraft
           && !draftSessionIds.has(session.id)
           && !!session.sourceAutomationId
         )
@@ -2299,6 +2308,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
         agentSessions.filter((session) =>
           !session.archived
           && !session.pinned
+          && !session.isDraft
           && !draftSessionIds.has(session.id)
           // 自动任务会话不进入项目列表，统一归到「自动任务」视图
           && !isHiddenAutomationSession(session)
@@ -2374,7 +2384,9 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
       return
     }
 
-    const recent = sessions.find((s) => !s.archived && !draftSessionIds.has(s.id))
+    const recent = isChatMode
+      ? conversations.find((conversation) => !conversation.archived && !draftSessionIds.has(conversation.id))
+      : agentSessions.find((session) => !session.archived && !session.isDraft && !draftSessionIds.has(session.id))
     if (recent) {
       openSession(targetMode, recent.id, recent.title)
       return
@@ -2423,6 +2435,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     return agentSessions
       .filter((session) =>
         !session.archived
+        && !session.isDraft
         && !draftSessionIds.has(session.id)
         && (!currentWorkspaceId || session.workspaceId === currentWorkspaceId)
         // 自动任务会话不出现在收起态 Rail，与展开态列表保持一致
@@ -3199,13 +3212,13 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
   // ===== 折叠状态：精简图标视图 =====
   if (sidebarCollapsed) {
     const hasActiveCollapsedTool = [
-      "todos",
-      "calendar",
+      ...(productivityTools.todosEnabled ? ["todos"] : []),
+      ...(productivityTools.calendarEnabled ? ["calendar"] : []),
       "automations",
       "skills",
       "mcp",
       "memory",
-      "vault",
+      ...(productivityTools.obsidianEnabled ? ["vault"] : []),
     ].some((component) =>
       isWorkspaceComponentActive(component as WorkspaceComponentTab),
     );
@@ -3403,30 +3416,36 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
               <TooltipContent side="right">更多工作区工具</TooltipContent>
             </Tooltip>
             <DropdownMenuContent side="right" align="end" className="min-w-40">
-              <DropdownMenuItem
-                aria-current={isWorkspaceComponentActive("todos") ? "page" : undefined}
-                className={cn(isWorkspaceComponentActive("todos") && "bg-accent/70 text-accent-foreground")}
-                onSelect={() => handleOpenPlanningComponent("todos")}
-              >
-                <ListTodo />
-                Todo
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                aria-current={isWorkspaceComponentActive("calendar") ? "page" : undefined}
-                className={cn(isWorkspaceComponentActive("calendar") && "bg-accent/70 text-accent-foreground")}
-                onSelect={() => handleOpenPlanningComponent("calendar")}
-              >
-                <CalendarDays />
-                日程
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                aria-current={isWorkspaceComponentActive("vault") ? "page" : undefined}
-                className={cn(isWorkspaceComponentActive("vault") && "bg-accent/70 text-accent-foreground")}
-                onSelect={handleOpenVault}
-              >
-                <ObsidianIcon size={16} />
-                Obsidian
-              </DropdownMenuItem>
+              {productivityTools.todosEnabled && (
+                <DropdownMenuItem
+                  aria-current={isWorkspaceComponentActive("todos") ? "page" : undefined}
+                  className={cn(isWorkspaceComponentActive("todos") && "bg-accent/70 text-accent-foreground")}
+                  onSelect={() => handleOpenPlanningComponent("todos")}
+                >
+                  <ListTodo />
+                  Todo
+                </DropdownMenuItem>
+              )}
+              {productivityTools.calendarEnabled && (
+                <DropdownMenuItem
+                  aria-current={isWorkspaceComponentActive("calendar") ? "page" : undefined}
+                  className={cn(isWorkspaceComponentActive("calendar") && "bg-accent/70 text-accent-foreground")}
+                  onSelect={() => handleOpenPlanningComponent("calendar")}
+                >
+                  <CalendarDays />
+                  日程
+                </DropdownMenuItem>
+              )}
+              {productivityTools.obsidianEnabled && (
+                <DropdownMenuItem
+                  aria-current={isWorkspaceComponentActive("vault") ? "page" : undefined}
+                  className={cn(isWorkspaceComponentActive("vault") && "bg-accent/70 text-accent-foreground")}
+                  onSelect={handleOpenVault}
+                >
+                  <ObsidianIcon size={16} />
+                  Obsidian
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem
                 aria-current={isWorkspaceComponentActive("automations") ? "page" : undefined}
                 className={cn(isWorkspaceComponentActive("automations") && "bg-accent/70 text-accent-foreground")}
@@ -3590,24 +3609,30 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
 
       {/* 项目级组件：每一行直接打开对应的右侧工作区 Tab。 */}
       <div className="space-y-0.5 px-3 pb-0.5 pt-2">
-        <WorkspaceComponentSidebarEntry
-          label="Todo"
-          icon={<ListTodo size={16} />}
-          active={isWorkspaceComponentActive('todos')}
-          onClick={() => handleOpenPlanningComponent('todos')}
-        />
-        <WorkspaceComponentSidebarEntry
-          label="日程"
-          icon={<CalendarDays size={16} />}
-          active={isWorkspaceComponentActive('calendar')}
-          onClick={() => handleOpenPlanningComponent('calendar')}
-        />
-        <WorkspaceComponentSidebarEntry
-          label="Obsidian"
-          icon={<ObsidianIcon size={16} />}
-          active={mode === 'chat' ? activeView === 'vault' : isWorkspaceComponentActive('vault')}
-          onClick={handleOpenVault}
-        />
+        {productivityTools.todosEnabled && (
+          <WorkspaceComponentSidebarEntry
+            label="Todo"
+            icon={<ListTodo size={16} />}
+            active={isWorkspaceComponentActive('todos')}
+            onClick={() => handleOpenPlanningComponent('todos')}
+          />
+        )}
+        {productivityTools.calendarEnabled && (
+          <WorkspaceComponentSidebarEntry
+            label="日程"
+            icon={<CalendarDays size={16} />}
+            active={isWorkspaceComponentActive('calendar')}
+            onClick={() => handleOpenPlanningComponent('calendar')}
+          />
+        )}
+        {productivityTools.obsidianEnabled && (
+          <WorkspaceComponentSidebarEntry
+            label="Obsidian"
+            icon={<ObsidianIcon size={16} />}
+            active={mode === 'chat' ? activeView === 'vault' : isWorkspaceComponentActive('vault')}
+            onClick={handleOpenVault}
+          />
+        )}
       </div>
 
       {mode === 'agent' && (

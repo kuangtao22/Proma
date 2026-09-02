@@ -11,7 +11,8 @@
  */
 
 import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path'
-import { accessSync, constants, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdir as mkdirAsync, writeFile as writeFileAsync } from 'node:fs/promises'
 import { BrowserWindow } from 'electron'
 import type { WebContents } from 'electron'
 import { AGENT_IPC_CHANNELS, MAX_ATTACHMENT_SIZE } from '@proma/shared'
@@ -32,9 +33,13 @@ import type {
   PromaPermissionMode,
   AgentExternalRunSource,
   AgentActiveSessionSnapshot,
+  AgentQueuedMessageSnapshot,
   AgentMessage,
   CanvasAgentActiveRunSnapshot,
 } from '@proma/shared'
+
+/** Agent service 内部运行输入，允许主进程携带不对外暴露的运行代际。 */
+type AgentRunInput = AgentSendInput & { runGeneration?: number }
 import { PiAgentAdapter } from './adapters/pi-agent-adapter'
 import { PiUtilityAdapter } from './adapters/pi-utility-adapter'
 import { AgentEventBus } from './agent-event-bus'
@@ -198,6 +203,21 @@ function registerWebContents(sessionId: string, wc: WebContents) {
   return route
 }
 
+/**
+ * 更新已有 run 的 renderer 目标，但绝不能取得新的 owner。
+ *
+ * 排队或中断消息不创建新 run；若它们调用 bind()，旧 run 的终态将因 owner
+ * 不匹配而无法投递，renderer 会永久保留 running 状态。
+ */
+function rebindWebContents(sessionId: string, wc: WebContents) {
+  const previousWebContents = streamRoutes.get(sessionId)?.target
+  if (previousWebContents && previousWebContents !== wc) streamForwarder.clear(sessionId)
+  const route = streamRoutes.rebind(sessionId, wc)
+  attachWebContentsCleanup(wc)
+  agentQueueCoordinator.onTargetAvailable(sessionId)
+  return route
+}
+
 function getStreamRouteTargets(): Map<string, WebContents> {
   const targets = new Map<string, WebContents>()
   for (const snapshot of orchestrator.listActiveSessionSnapshots()) {
@@ -290,6 +310,7 @@ function publishRunStopped(
   sessionId: string,
   stoppedByUser: boolean | undefined,
   startedAt: number | undefined,
+  runGeneration: number | undefined,
 ): void {
   if (!stoppedByUser) return
   eventBus.emit(sessionId, {
@@ -297,6 +318,7 @@ function publishRunStopped(
     event: {
       type: 'run_stopped',
       ...(startedAt != null ? { startedAt } : {}),
+      ...(runGeneration != null ? { runGeneration } : {}),
     },
   })
 }
@@ -347,7 +369,7 @@ export function setVisibleAgentSession(webContents: WebContents, sessionId: stri
  * 注册 webContents 到 EventBus 映射，委托给 Orchestrator。
  */
 export async function runAgent(
-  input: AgentSendInput,
+  input: AgentRunInput,
   webContents: WebContents,
   extensions: AgentRunExtensions = {},
 ): Promise<void> {
@@ -390,7 +412,7 @@ export async function runPreparedAgent(
         runAgentServiceTerminalEffects([
           {
             name: 'publish-run-stopped',
-            run: () => { publishRunStopped(input.sessionId, opts?.stoppedByUser, opts?.startedAt) },
+            run: () => { publishRunStopped(input.sessionId, opts?.stoppedByUser, opts?.startedAt, opts?.runGeneration) },
           },
           {
             name: 'renderer-complete',
@@ -532,8 +554,10 @@ export async function runAgentHeadless(
   // treat an omitted source as an interactive desktop-user run: custom tools may grant
   // local side effects that cannot be visibly supervised by an external sender.
   const inferredTriggeredBy = callbacks.source === 'delegation' ? 'delegation' : 'external'
-  const runInput: AgentSendInput = {
-    ...input,
+  // Headless callers are public service clients too; discard any forged runtime identity.
+  const { runGeneration: _ignoredRunGeneration, ...publicInput } = input as AgentSendInput & { runGeneration?: unknown }
+  const runInput: AgentRunInput = {
+    ...publicInput,
     ...(input.triggeredBy ? {} : { triggeredBy: inferredTriggeredBy }),
     ...(input.startedAt != null ? {} : { startedAt: Date.now() }),
   }
@@ -571,7 +595,7 @@ export async function runAgentHeadless(
           { name: 'external-on-complete', run: () => { callbacks.onComplete(messages) } },
           {
             name: 'publish-run-stopped',
-            run: () => { publishRunStopped(runInput.sessionId, opts?.stoppedByUser, opts?.startedAt) },
+            run: () => { publishRunStopped(runInput.sessionId, opts?.stoppedByUser, opts?.startedAt, opts?.runGeneration) },
           },
           {
             name: 'renderer-complete',
@@ -616,7 +640,7 @@ export async function runAgentHeadless(
           })
         }
       },
-      onRunStarted: ({ startedAt: persistedStartedAt }) => {
+      onRunStarted: ({ startedAt: persistedStartedAt, runGeneration }) => {
         const session = getAgentSessionMeta(runInput.sessionId)
         workspaceOperationGuard.runAgentServiceEffects({
           sessionWorkspaceId: session?.workspaceId,
@@ -749,6 +773,10 @@ export function hasActiveAgentDataWritesForWorkspace(workspaceId: string): boole
 /** 列出当前活跃 Agent 会话的安全快照，供 renderer 重载恢复。 */
 export function listActiveAgentSessionSnapshots(): AgentActiveSessionSnapshot[] {
   return orchestrator.listActiveSessionSnapshots()
+}
+
+export function listQueuedAgentMessages(sessionId: string): AgentQueuedMessageSnapshot[] {
+  return agentQueueCoordinator.snapshot(sessionId)
 }
 
 /** 中止所有活跃的 Agent 会话（应用退出时调用） */
@@ -936,21 +964,50 @@ function resolveSafeWorkspaceFilePath(workspaceRoot: string, filename: string): 
  *
  * 空白项目写入 Proma 托管的 workspace-files/；本地目录项目直接写入用户选择的原始目录。
  */
-export function saveFilesToWorkspaceFiles(input: AgentSaveWorkspaceFilesInput): AgentSavedFile[] {
+function isFileAlreadyExistsError(error: unknown): boolean {
+  return !!error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST'
+}
+
+async function writeUniqueWorkspaceFile(
+  workspaceFilesDir: string,
+  initialTargetPath: string,
+  buffer: Buffer,
+  usedPaths: Set<string>,
+): Promise<string> {
+  const relativeFilename = relative(workspaceFilesDir, initialTargetPath)
+  const dotIdx = relativeFilename.lastIndexOf('.')
+  const baseName = dotIdx > 0 ? relativeFilename.slice(0, dotIdx) : relativeFilename
+  const ext = dotIdx > 0 ? relativeFilename.slice(dotIdx) : ''
+
+  for (let counter = 0; ; counter++) {
+    const filename = counter === 0 ? relativeFilename : `${baseName}-${counter}${ext}`
+    const targetPath = resolveSafeWorkspaceFilePath(workspaceFilesDir, filename)
+    if (usedPaths.has(targetPath)) continue
+
+    await mkdirAsync(dirname(targetPath), { recursive: true })
+    try {
+      // `wx` 确保另一条 IPC 请求不会在碰撞检查与写入之间覆盖文件；
+      // 若目标已存在，则尝试下一个编号后缀。
+      await writeFileAsync(targetPath, buffer, { flag: 'wx' })
+      usedPaths.add(targetPath)
+      return targetPath
+    } catch (error) {
+      if (isFileAlreadyExistsError(error)) continue
+      throw error
+    }
+  }
+}
+
+export async function saveFilesToWorkspaceFiles(input: AgentSaveWorkspaceFilesInput): Promise<AgentSavedFile[]> {
   const workspace = getAgentWorkspaceBySlug(input.workspaceSlug)
   if (!workspace) {
     throw new Error(`指定的 Agent 项目不存在或已删除: ${input.workspaceSlug}`)
   }
 
   if (workspace.projectRootPath) {
-    const status = getLocalProjectRootStatus(workspace.projectRootPath)
+    const status = await getLocalProjectRootStatus(workspace.projectRootPath)
     if (status !== 'available') {
       throw createLocalProjectRootUnavailableError(workspace.projectRootPath, status)
-    }
-    try {
-      accessSync(workspace.projectRootPath, constants.R_OK | constants.W_OK | constants.X_OK)
-    } catch {
-      throw createLocalProjectRootUnavailableError(workspace.projectRootPath, 'unavailable')
     }
   }
 
@@ -969,28 +1026,8 @@ export function saveFilesToWorkspaceFiles(input: AgentSaveWorkspaceFilesInput): 
   const results: AgentSavedFile[] = []
   const usedPaths = new Set<string>()
 
-  for (const { file, initialTargetPath, buffer } of decodedFiles) {
-    let targetPath = initialTargetPath
-
-    // 防止同名文件覆盖
-    if (usedPaths.has(targetPath) || existsSync(targetPath)) {
-      const relativeFilename = relative(wsFilesDir, targetPath)
-      const dotIdx = relativeFilename.lastIndexOf('.')
-      const baseName = dotIdx > 0 ? relativeFilename.slice(0, dotIdx) : relativeFilename
-      const ext = dotIdx > 0 ? relativeFilename.slice(dotIdx) : ''
-      let counter = 1
-      let candidate = resolveSafeWorkspaceFilePath(wsFilesDir, `${baseName}-${counter}${ext}`)
-      while (usedPaths.has(candidate) || existsSync(candidate)) {
-        counter++
-        candidate = resolveSafeWorkspaceFilePath(wsFilesDir, `${baseName}-${counter}${ext}`)
-      }
-      targetPath = candidate
-    }
-    usedPaths.add(targetPath)
-
-    mkdirSync(dirname(targetPath), { recursive: true })
-    writeFileSync(targetPath, buffer)
-
+  for (const { initialTargetPath, buffer } of decodedFiles) {
+    const targetPath = await writeUniqueWorkspaceFile(wsFilesDir, initialTargetPath, buffer, usedPaths)
     const actualFilename = relative(wsFilesDir, targetPath)
     results.push({ filename: actualFilename, targetPath })
     console.log(`[Agent 服务] 工作区文件已保存: ${targetPath} (${buffer.length} bytes)`)

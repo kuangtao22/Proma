@@ -8,6 +8,8 @@ export interface VaultConfig {
 
 /** Renderer-safe summary. The selected root path stays in the main process. */
 export interface VaultSummary {
+  /** Stable opaque identity for scoping renderer-local state to this Vault. */
+  vaultId: string
   displayName: string
   inboxPath: string
   allowAgentWrites: boolean
@@ -54,6 +56,12 @@ export interface VaultDeleteInput {
   expectedSha256?: string
 }
 
+export interface VaultSavePastedImageInput {
+  noteRelativePath: string
+  mimeType: string
+  base64: string
+}
+
 export interface VaultReadResult {
   relativePath: string
   content: string
@@ -80,6 +88,8 @@ export const VAULT_IPC_CHANNELS = {
   AUTHORIZE_CANDIDATE: 'vault:authorize-candidate',
   LIST_FILES: 'vault:list-files',
   READ_FILE: 'vault:read-file',
+  RESOLVE_MEDIA: 'vault:resolve-media',
+  SAVE_PASTED_IMAGE: 'vault:save-pasted-image',
   WRITE_FILE: 'vault:write-file',
   CREATE_UNTITLED_FILE: 'vault:create-untitled-file',
   CREATE_UNTITLED_FILE_IN_FOLDER: 'vault:create-untitled-file-in-folder',

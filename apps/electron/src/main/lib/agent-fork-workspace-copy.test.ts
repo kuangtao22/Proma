@@ -28,7 +28,7 @@ afterEach(() => {
 })
 
 describe('fork 工作区复制', () => {
-  test('Given 会话目录包含上下文和依赖目录 When 复制 fork 工作区 Then 保留 .context 并跳过高风险目录', () => {
+  test('Given 会话目录包含上下文和依赖目录 When 复制 fork 工作区 Then 保留 .context 并跳过高风险目录', async () => {
     const root = makeTempRoot()
     const sourceDir = join(root, 'source')
     const destDir = join(root, 'dest')
@@ -42,7 +42,7 @@ describe('fork 工作区复制', () => {
     writeFile(join(sourceDir, 'nested-repo', '.git', 'config'))
     writeFile(join(sourceDir, 'nested-repo', 'src', 'file.ts'), 'export const ok = true')
 
-    const result = copyForkWorkspaceFiles(sourceDir, destDir)
+    const result = await copyForkWorkspaceFiles(sourceDir, destDir)
 
     expect(result.copiedCount).toBe(3)
     expect(result.skippedCount).toBe(4)

@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
+import type { ImageContent, TextContent } from '@earendil-works/pi-ai'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
+import sharp from 'sharp'
 import type {
   AgentCanvasBinding,
   CanvasBatchOperationEnvelope,
@@ -16,11 +18,13 @@ import type {
   CanvasTarget,
   CanvasWorkspaceSnapshot,
   DesignJobRecord,
+  DesignAsset,
 } from '@proma/shared'
 import { parseCanvasBatchOperationEnvelope } from '@proma/shared'
 import { Type } from 'typebox'
 import type { TSchema } from 'typebox'
 import type { AgentRunExtensions } from '../agent-run-extensions'
+import { isValidImageBytes } from '../image-content-validation'
 import type { CanvasBatchOperationResult } from './canvas-agent-batch-operation'
 import type { CanvasArtifactCreationService } from './canvas-artifact-creation'
 import type { CanvasTextArtifactService } from './canvas-text-artifact-service'
@@ -29,6 +33,112 @@ import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 const MAX_READ_NODES = 32
 const MAX_READ_RESPONSE_CHARS = 32_768
 const MAX_READ_HISTORY_ENTRIES = 32
+const DEFAULT_LIST_NODES_LIMIT = 50
+const MAX_LIST_NODES_LIMIT = 100
+const MAX_INSPECT_IMAGE_NODES = 4
+const MAX_INSPECT_IMAGE_BYTES = 512 * 1024
+const MAX_INSPECT_BATCH_BYTES = 2 * 1024 * 1024
+const MAX_INSPECT_IMAGE_PIXELS = 64_000_000
+const CANVAS_NODE_KINDS: CanvasNode['kind'][] = ['agent', 'image', 'document', 'webview']
+
+/** 不透明分页游标绑定的权威读取边界。 */
+interface CanvasNodeCursorPayload {
+  projectId: string
+  canvasId: string
+  revision: number
+  kind: CanvasNode['kind'] | null
+  offset: number
+}
+
+/** Agent 图片检查可读取的受控缩略图。 */
+interface CanvasInspectionThumbnail {
+  bytes: Buffer
+  mediaType: DesignAsset['mediaType']
+}
+
+/** 内存校验与压缩后的结果，区分不可读和无法压入预算。 */
+interface PreparedInspectionThumbnail {
+  thumbnail?: CanvasInspectionThumbnail
+  failure?: 'image-unavailable' | 'image-too-large'
+}
+
+/** 图片检查结果只暴露节点身份和公开状态。 */
+interface CanvasImageInspectionSummary {
+  nodeId: string
+  title: string
+  status: 'ready' | 'node-not-found' | 'invalid-node-kind' | 'missing-adopted-asset'
+    | 'adopted-asset-mismatch' | 'image-unavailable' | 'image-too-large'
+}
+
+/** 判断未知值是否为 Canvas 固定节点类型。 */
+function isCanvasNodeKind(value: unknown): value is CanvasNode['kind'] {
+  return typeof value === 'string' && CANVAS_NODE_KINDS.includes(value as CanvasNode['kind'])
+}
+
+/** 创建带摘要校验的不透明分页游标，避免调用方直接拼接页偏移。 */
+function encodeCanvasNodeCursor(payload: CanvasNodeCursorPayload): string {
+  const encodedPayload = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+  const digest = createHash('sha256').update(encodedPayload).digest('base64url')
+  return `${encodedPayload}.${digest}`
+}
+
+/** 解析并严格校验分页游标结构与摘要。 */
+function decodeCanvasNodeCursor(cursor: string): CanvasNodeCursorPayload {
+  try {
+    const [encodedPayload, digest, extra] = cursor.split('.')
+    if (!encodedPayload || !digest || extra !== undefined) throw new Error('invalid cursor shape')
+    const expectedDigest = createHash('sha256').update(encodedPayload).digest('base64url')
+    if (digest !== expectedDigest) throw new Error('invalid cursor digest')
+    const value: unknown = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'))
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid cursor payload')
+    const record = value as Record<string, unknown>
+    if (Object.keys(record).sort().join(',') !== 'canvasId,kind,offset,projectId,revision'
+      || typeof record.projectId !== 'string'
+      || typeof record.canvasId !== 'string'
+      || !Number.isSafeInteger(record.revision) || Number(record.revision) < 0
+      || (record.kind !== null && !isCanvasNodeKind(record.kind))
+      || !Number.isSafeInteger(record.offset) || Number(record.offset) < 0) {
+      throw new Error('invalid cursor payload')
+    }
+    return {
+      projectId: record.projectId,
+      canvasId: record.canvasId,
+      revision: Number(record.revision),
+      kind: record.kind as CanvasNode['kind'] | null,
+      offset: Number(record.offset),
+    }
+  } catch {
+    throw new Error('CANVAS_CURSOR_INVALID')
+  }
+}
+
+/** 把受控缩略图压入单张预算；压缩只发生在内存，不修改正式素材。 */
+async function prepareInspectionThumbnail(thumbnail: CanvasInspectionThumbnail): Promise<PreparedInspectionThumbnail> {
+  if (!isValidImageBytes(thumbnail.mediaType, thumbnail.bytes)) return { failure: 'image-unavailable' }
+  try {
+    const metadata = await sharp(thumbnail.bytes, { limitInputPixels: MAX_INSPECT_IMAGE_PIXELS }).metadata()
+    if (!metadata.width || !metadata.height) return { failure: 'image-unavailable' }
+  } catch {
+    return { failure: 'image-unavailable' }
+  }
+  if (thumbnail.bytes.byteLength <= MAX_INSPECT_IMAGE_BYTES) return { thumbnail }
+  for (const width of [512, 384, 256]) {
+    for (const quality of [76, 60, 44]) {
+      try {
+        const bytes = await sharp(thumbnail.bytes, { limitInputPixels: MAX_INSPECT_IMAGE_PIXELS })
+          .resize({ width, height: width, fit: 'inside', withoutEnlargement: true })
+          .webp({ quality })
+          .toBuffer()
+        if (bytes.byteLength <= MAX_INSPECT_IMAGE_BYTES && isValidImageBytes('image/webp', bytes)) {
+          return { thumbnail: { bytes, mediaType: 'image/webp' } }
+        }
+      } catch {
+        return { failure: 'image-unavailable' }
+      }
+    }
+  }
+  return { failure: 'image-too-large' }
+}
 
 /** canvas_read 单节点的内部预算条目，完整正文不直接进入最终响应。 */
 interface CanvasReadBudgetEntry {
@@ -144,10 +254,12 @@ function applyCanvasReadBudget(
   return details
 }
 
-/** 普通项目 Agent 单轮可用的七个 Canvas 工具。 */
+/** 普通项目 Agent 单轮可用的九个 Canvas 工具。 */
 export const CANVAS_TOOL_NAMES = [
   'canvas_get_context',
   'canvas_manage',
+  'canvas_list_nodes',
+  'canvas_inspect_images',
   'canvas_read',
   'canvas_apply_changes',
   'canvas_create_artifact',
@@ -186,11 +298,13 @@ export interface CanvasToolProviderDependencies {
   artifacts: Pick<CanvasArtifactCreationService, 'create'>
   textArtifacts: Pick<CanvasTextArtifactService, 'read' | 'listVersions' | 'update'>
   images: {
+    loadConfig: (target: CanvasImageTarget) => Promise<CanvasImageModuleConfig>
     load: (target: CanvasImageTarget) => Promise<{
       config: CanvasImageModuleConfig
       jobs: DesignJobRecord[]
     }>
     save: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
+    readThumbnail: (projectId: string, assetId: string) => Promise<CanvasInspectionThumbnail>
   }
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
   runNodes: (
@@ -352,6 +466,168 @@ export function createCanvasToolRun(
           ? dependencies.access.unlink(context, params.canvasId)
           : dependencies.access.setDefault(context, params.canvasId)
         return toolResult({ action: params.action, canvasId: params.canvasId, binding })
+      },
+    }),
+    defineCanvasTool({
+      name: 'canvas_list_nodes', label: '枚举画布节点',
+      description: '分页枚举当前会话已关联画布的权威节点摘要；可按节点类型过滤，不返回素材 ID、媒体 URL 或本地路径。',
+      parameters: Type.Object({
+        canvasId: Type.String({ minLength: 1, maxLength: 128 }),
+        kind: Type.Optional(Type.Union([
+          Type.Literal('agent'), Type.Literal('image'), Type.Literal('document'), Type.Literal('webview'),
+        ])),
+        cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_LIST_NODES_LIMIT })),
+      }),
+      execute: async (_toolCallId, params) => {
+        dependencies.access.authorizeRead(context)
+        dependencies.access.requireLinkedCanvas(context, params.canvasId)
+        const target = { projectId: context.projectId, canvasId: params.canvasId }
+        const document = dependencies.documents.load(target).document
+        /** 游标只能继续同项目、同画布、同过滤条件和同一 revision 的读取。 */
+        const cursor = params.cursor ? decodeCanvasNodeCursor(params.cursor) : undefined
+        if (cursor && (cursor.projectId !== context.projectId
+          || cursor.canvasId !== params.canvasId
+          || cursor.kind !== (params.kind ?? null))) {
+          throw new Error('CANVAS_CURSOR_INVALID')
+        }
+        if (cursor && cursor.revision !== document.revision) throw new Error('CANVAS_REVISION_CONFLICT')
+        const offset = cursor?.offset ?? 0
+        const limit = params.limit ?? DEFAULT_LIST_NODES_LIMIT
+        const filteredNodes = params.kind
+          ? document.nodes.filter((node) => node.kind === params.kind)
+          : document.nodes
+        const pageNodes = filteredNodes.slice(offset, offset + limit)
+        /** 图片配置只读取当前页，避免为未返回节点加载模块 JSON 或任务历史。 */
+        const nodes = await Promise.all(pageNodes.map(async (node) => {
+          if (node.kind === 'image') {
+            const config = await dependencies.images.loadConfig({ ...target, nodeId: node.id, imageModuleId: node.imageModuleId })
+            return {
+              nodeId: node.id,
+              kind: node.kind,
+              title: node.title,
+              configRevision: config.revision,
+              hasAdoptedAsset: Boolean(node.adoptedAssetId && config.adoptedAssetId),
+            }
+          }
+          return {
+            nodeId: node.id,
+            kind: node.kind,
+            title: node.title,
+            ...((node.kind === 'document' || node.kind === 'webview')
+              ? { contentRevision: node.contentRevision }
+              : {}),
+          }
+        }))
+        const nextOffset = offset + pageNodes.length
+        const hasMore = nextOffset < filteredNodes.length
+        return toolResult({
+          canvasId: params.canvasId,
+          revision: document.revision,
+          nodes,
+          hasMore,
+          nextCursor: hasMore
+            ? encodeCanvasNodeCursor({
+              projectId: context.projectId,
+              canvasId: params.canvasId,
+              revision: document.revision,
+              kind: params.kind ?? null,
+              offset: nextOffset,
+            })
+            : null,
+        })
+      },
+    }),
+    defineCanvasTool({
+      name: 'canvas_inspect_images', label: '检查画布图片',
+      description: '按节点读取同一画布 revision 下当前正式采用的受限缩略图；只用于视觉核对，不修改提示词、不生图、不采用候选。',
+      parameters: Type.Object({
+        canvasId: Type.String({ minLength: 1, maxLength: 128 }),
+        nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
+          minItems: 1,
+          maxItems: MAX_INSPECT_IMAGE_NODES,
+        }),
+        expectedRevision: Type.Integer({ minimum: 0 }),
+      }),
+      execute: async (_toolCallId, params) => {
+        dependencies.access.authorizeRead(context)
+        dependencies.access.requireLinkedCanvas(context, params.canvasId)
+        if (params.nodeIds.length < 1 || params.nodeIds.length > MAX_INSPECT_IMAGE_NODES) {
+          throw new Error('CANVAS_IMAGE_BATCH_LIMIT')
+        }
+        const target = { projectId: context.projectId, canvasId: params.canvasId }
+        const document = dependencies.documents.load(target).document
+        /** revision 必须在任何图片模块或缩略图读取前复核，避免混合新旧正式状态。 */
+        if (document.revision !== params.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+        const nodeIds = [...new Set(params.nodeIds)]
+        const content: Array<TextContent | ImageContent> = []
+        const inspections: CanvasImageInspectionSummary[] = []
+        let totalImageBytes = 0
+        /** 公开失败只描述节点级状态，底层素材身份和磁盘错误不得进入工具结果。 */
+        const appendStatus = (summary: CanvasImageInspectionSummary): void => {
+          inspections.push(summary)
+          content.push({ type: 'text', text: JSON.stringify(summary) })
+        }
+        for (const nodeId of nodeIds) {
+          const node = document.nodes.find((candidate) => candidate.id === nodeId)
+          if (!node) {
+            appendStatus({ nodeId, title: '', status: 'node-not-found' })
+            continue
+          }
+          if (node.kind !== 'image') {
+            appendStatus({ nodeId, title: node.title, status: 'invalid-node-kind' })
+            continue
+          }
+          let config: CanvasImageModuleConfig
+          try {
+            config = await dependencies.images.loadConfig({ ...target, nodeId: node.id, imageModuleId: node.imageModuleId })
+          } catch {
+            appendStatus({ nodeId, title: node.title, status: 'image-unavailable' })
+            continue
+          }
+          if (!node.adoptedAssetId && !config.adoptedAssetId) {
+            appendStatus({ nodeId, title: node.title, status: 'missing-adopted-asset' })
+            continue
+          }
+          if (!node.adoptedAssetId || node.adoptedAssetId !== config.adoptedAssetId) {
+            appendStatus({ nodeId, title: node.title, status: 'adopted-asset-mismatch' })
+            continue
+          }
+          let thumbnail: CanvasInspectionThumbnail
+          try {
+            thumbnail = await dependencies.images.readThumbnail(context.projectId, node.adoptedAssetId)
+          } catch {
+            appendStatus({ nodeId, title: node.title, status: 'image-unavailable' })
+            continue
+          }
+          const prepared = await prepareInspectionThumbnail(thumbnail)
+          if (!prepared.thumbnail) {
+            appendStatus({ nodeId, title: node.title, status: prepared.failure ?? 'image-unavailable' })
+            continue
+          }
+          if (totalImageBytes + prepared.thumbnail.bytes.byteLength > MAX_INSPECT_BATCH_BYTES) {
+            appendStatus({ nodeId, title: node.title, status: 'image-too-large' })
+            continue
+          }
+          totalImageBytes += prepared.thumbnail.bytes.byteLength
+          const summary: CanvasImageInspectionSummary = { nodeId, title: node.title, status: 'ready' }
+          appendStatus(summary)
+          content.push({
+            type: 'image',
+            data: prepared.thumbnail.bytes.toString('base64'),
+            mimeType: prepared.thumbnail.mediaType,
+          })
+        }
+        return {
+          content,
+          details: {
+            canvasId: params.canvasId,
+            revision: document.revision,
+            inspections,
+            imageCount: inspections.filter((entry) => entry.status === 'ready').length,
+            totalImageBytes,
+          },
+        } satisfies AgentToolResult<unknown>
       },
     }),
     defineCanvasTool({
@@ -670,6 +946,8 @@ export function createCanvasToolRun(
 当任务需要网页原型、图片设计稿、文档或多个可关联产物时，先读取并遵循 \`canvas-production\` Skill。Skill 不可用时按以下最小规则继续：产物类型会改变交付结果且用户未说明时，只询问一次；用户已明确类型时直接执行；明确要求修改项目 HTML、React、组件或其它代码文件时继续普通 Agent。
 
 创建或修改前先用 canvas_get_context 获取权威关联；已有合适画布时直接复用，不要要求用户另建已经存在的画布。没有可用画布且用户已明确选择画布产物时，才用 canvas_manage 创建并关联。正文只通过 canvas_create_artifact 或 canvas_update_artifact 保存，canvas_apply_changes 只处理结构；有关联来源时提供准确 relation。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes；图片仅在用户明确要求立即生成时才调用 canvas_run_nodes。图片运行结果只代表候选已创建或正在生成，必须提示用户进入画布验收，不得描述为已正式替换。
+
+用户只要求核对、检查或评审画布图片时保持只读：先用 canvas_list_nodes 分页枚举同一 revision 的全部图片节点，再用 canvas_inspect_images 每批最多四张读取当前正式采用缩略图。不得只比较提示词或使用当前画布截图后声称已完成全量视觉核对；未明确要求修正时，不更新提示词、不运行节点、不采用候选。
 
 Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、产物创建、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。`,
     piCustomTools: tools,

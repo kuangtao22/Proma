@@ -716,6 +716,38 @@ describe('stable directory native host', () => {
     })
   })
 
+  test('Given 图片候选批次与采用 intent 文件名 When 写入 Then 只接受固定来源身份合同', async () => {
+    const run = createStableDirectoryNativeHost().run
+    /** 每次请求使用独立 helper 进程夹具，和生产单请求进程模型保持一致。 */
+    const dependencies = () => createDependencies(createFakeHelper({
+      writeOutcome: { commitVisible: true, durabilityUncertain: false },
+    }))
+    /** 单节点批次和采用事务均使用主进程 UUID。 */
+    const uuidNames = [
+      'image-candidate-batch-11111111-1111-4111-8111-111111111111.json',
+      'image-candidate-adoption-11111111-1111-4111-8111-111111111111.json',
+    ]
+    for (const fileName of uuidNames) {
+      await expect(run({
+        mode: 'canvas-intent-write', roots: ['/requested'], childName: 'transactions',
+        fileName, content: '{}',
+      }, () => true, dependencies())).resolves.toHaveProperty(
+        'writeOutcome.commitVisible', true,
+      )
+    }
+    /** Agent 多节点候选批次使用可重放的 SHA-256 身份。 */
+    await expect(run({
+      mode: 'canvas-intent-write', roots: ['/requested'], childName: 'transactions',
+      fileName: `image-candidate-batch-agent-canvas-${'a'.repeat(64)}.json`, content: '{}',
+    }, () => true, dependencies())).resolves.toHaveProperty(
+      'writeOutcome.commitVisible', true,
+    )
+    await expect(run({
+      mode: 'canvas-intent-write', roots: ['/requested'], childName: 'transactions',
+      fileName: 'image-candidate-batch-agent-canvas-not-a-hash.json', content: '{}',
+    }, () => true, dependencies())).rejects.toThrow('合同无效')
+  })
+
   test('Given helper 报告 rename 后目录持久性未确认 When host 消费协议 Then 保留可见提交结果而非提前退出', async () => {
     const fake = createFakeHelper({
       writeOutcome: {
@@ -1172,6 +1204,27 @@ describe('stable directory native host', () => {
         mode: 'canvas-intent-scan', roots: [canvasRoot], childName: 'transactions', maxEntries: 512,
       }, () => true, { helperPath: () => nativeHelperPath })
       expect(scanned.entries.map((entry) => entry.name)).toEqual([rebuildFileName])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(!nativeHelperPlatformSupported)('Given 已授权 Canvas 根 When 原生 helper 写图片候选批次 Then 文件可提交并参与安全扫描', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-image-candidate-intent-'))
+    const canvasRoot = join(root, 'canvas')
+    const candidateFileName = 'image-candidate-batch-11111111-1111-4111-8111-111111111111.json'
+    mkdirSync(canvasRoot)
+    try {
+      const written = await runStableDirectoryNative({
+        mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
+        fileName: candidateFileName, content: '{"status":"ready"}', maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(written.writeOutcome).toEqual({ commitVisible: true, durabilityUncertain: false })
+
+      const scanned = await runStableDirectoryNative({
+        mode: 'canvas-intent-scan', roots: [canvasRoot], childName: 'transactions', maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(scanned.entries.map((entry) => entry.name)).toEqual([candidateFileName])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

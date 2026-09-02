@@ -97,6 +97,36 @@ describe('Design 素材安全服务', () => {
     expect((await sharp(thumbnailPath).metadata()).format).toBe('webp')
   })
 
+  test('Given 已提交素材 When Agent 请求缩略图 Then 只返回受管缩略图字节与真实媒体类型', async () => {
+    const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])
+
+    const thumbnail = service.readStoredThumbnail('project-1', asset!.id)
+
+    expect(thumbnail.mediaType).toBe('image/webp')
+    expect((await sharp(thumbnail.bytes).metadata()).format).toBe('webp')
+    expect(() => service.readStoredThumbnail('project-1', 'missing-asset'))
+      .toThrow('DESIGN_ASSET_NOT_FOUND')
+  })
+
+  test('Given 缩略图被替换为符号链接或损坏文件 When Agent 请求读取 Then fail closed', async () => {
+    const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])
+    const thumbnailPath = join(paths.thumbnailsDir, basename(asset!.thumbnailRelativePath))
+    const outsidePath = join(sourceRoot, 'outside-thumbnail.webp')
+    writeFileSync(outsidePath, readFileSync(thumbnailPath))
+    rmSync(thumbnailPath)
+    symlinkSync(outsidePath, thumbnailPath)
+
+    expect(() => service.readStoredThumbnail('project-1', asset!.id))
+      .toThrow('DESIGN_THUMBNAIL_UNAVAILABLE')
+
+    rmSync(thumbnailPath)
+    writeFileSync(thumbnailPath, 'not-an-image')
+    expect(() => service.readStoredThumbnail('project-1', asset!.id))
+      .toThrow('DESIGN_THUMBNAIL_UNAVAILABLE')
+  })
+
   test('Given 导入元数据已提交 When 确认批次 Then 保留正式文件并消费精确 journal', async () => {
     const batch = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
     const asset = batch[0]!

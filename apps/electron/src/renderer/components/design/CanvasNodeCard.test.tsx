@@ -59,15 +59,19 @@ const propsWithHtml: CanvasNodeCardProps = { ...createProps('webview'), html: '<
 
 describe('Canvas 通用折叠节点卡片', () => {
   test.each([
-    ['idle', false, false],
-    ['queued', true, false],
-    ['running', true, true],
-    ['waiting-approval', true, false],
-  ] as const)('Given %s When 渲染卡片 Then 轮廓与动画符合合同', (activityState, outline, animated) => {
+    ['idle', false, null],
+    ['queued', true, 'canvas-queued-dash'],
+    ['running', true, 'canvas-running-dash'],
+    ['waiting-approval', true, null],
+  ] as const)('Given %s When 渲染卡片 Then 轮廓与动画符合合同', (activityState, outline, animationClass) => {
     const html = renderCard('image', { activityState })
 
     expect(html.includes('data-canvas-activity-outline')).toBe(outline)
-    expect(html.includes('canvas-running-dash')).toBe(animated)
+    if (animationClass) expect(html).toContain(animationClass)
+    else {
+      expect(html).not.toContain('canvas-queued-dash')
+      expect(html).not.toContain('canvas-running-dash')
+    }
   })
 
   test('Given 节点选中且运行 When 渲染卡片 Then 选中 ring 与外层运行轮廓同时保留', () => {

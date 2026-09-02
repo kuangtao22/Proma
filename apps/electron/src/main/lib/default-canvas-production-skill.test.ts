@@ -19,7 +19,7 @@ test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数�
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.1"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.2"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
@@ -33,6 +33,8 @@ test('Given 多产物画布任务 When 读取 canvas-production Then 定义节�
   for (const toolName of [
     'canvas_get_context',
     'canvas_manage',
+    'canvas_list_nodes',
+    'canvas_inspect_images',
     'canvas_read',
     'canvas_apply_changes',
     'canvas_create_artifact',
@@ -49,6 +51,18 @@ test('Given 多产物画布任务 When 读取 canvas-production Then 定义节�
   expect(skill).toContain('局部更新')
   expect(skill).toContain('普通创建不要主动提供 `position`')
   expect(skill).toContain('由 Proma 根据来源关系和真实节点尺寸紧凑排布')
+})
+
+test('Given 用户只要求核对全部图片 When 读取 canvas-production Then 先枚举再看当前采用缩略图且保持只读', () => {
+  const skill = readCanvasProductionSkill()
+
+  expect(skill).toContain('核对只读')
+  expect(skill).toContain('先使用 `canvas_list_nodes`')
+  expect(skill).toContain('再使用 `canvas_inspect_images`')
+  expect(skill).toContain('不得只比较提示词')
+  expect(skill).toContain('不得使用画布截图')
+  expect(skill).toContain('不更新提示词')
+  expect(skill).toContain('不调用 `canvas_run_nodes`')
 })
 
 test('Given Canvas Skill 负责语义编排 When 校验执行边界 Then 权限、破坏性操作和付费运行仍由工具层控制', () => {

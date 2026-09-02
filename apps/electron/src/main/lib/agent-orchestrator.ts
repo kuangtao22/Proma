@@ -48,7 +48,8 @@ import { decryptApiKey, getChannelById, listChannels, persistCodexOAuthCredentia
 import pkg from '../../../package.json' with { type: 'json' }
 import { getEffectiveProxyUrl } from './proxy-settings-service'
 import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, removeSDKErrorMessage, updateSDKUserMessageSkillActivations, rewindPiAgentSession, resolveAgentCwd, getActiveWorktreePath, getAgentCwdMode, getSessionWorkbenchLayout } from './agent-session-manager'
-import { getAgentWorkspace, getLocalProjectRootStatus, getProjectFilesPath, getWorkspaceMcpConfig, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles, getWorkspaceAgentsMdPath, readWorkspaceAgentsMd, getWorkspaceMemoryGuidance, isWorkspaceProjectKnowledgeMaintenanceApproved } from './agent-workspace-manager'
+import { getAgentWorkspace, getProjectFilesPath, getWorkspaceMcpConfig, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles, getWorkspaceAgentsMdPath, readWorkspaceAgentsMd, getWorkspaceMemoryGuidance, isWorkspaceProjectKnowledgeMaintenanceApproved } from './agent-workspace-manager'
+import { getLocalProjectRootStatus } from './project-root-health'
 import { getMcpOAuthHeaders } from './mcp-oauth-service'
 import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceSkillsDir } from './config-paths'
 import { getRuntimeStatus } from './runtime-init'
@@ -102,6 +103,11 @@ const workspaceOperationGuard = createWorkspaceOperationGuard({
   getWorkspaceIdBySlug: () => undefined,
   getWorkspaceOperationBlockReason,
 })
+
+/** 将本地项目根解析为稳定的真实路径，用于并发回退冲突判断。 */
+function resolveLocalProjectRootForRewind(projectRootPath: string): string {
+  return realpathSync(projectRootPath)
+}
 import { resolveRuntimeAdditionalDirectories } from './agent-orchestrator-vault-access'
 
 // ===== 类型定义 =====
@@ -112,15 +118,17 @@ import { resolveRuntimeAdditionalDirectories } from './agent-orchestrator-vault-
  * 解耦 Electron webContents，使 Orchestrator 可独立测试。
  * agent-service.ts 负责将这些回调绑定到 webContents.send()。
  */
+type AgentRunInput = AgentSendInput & { runGeneration?: number }
+
 export interface SessionCallbacks {
   /** 发送流式错误 */
-  onError: (error: string) => void
+  onError: (error: string, opts?: { runGeneration?: number }) => void
   /** 发送流式完成（携带已持久化的消息列表） */
-  onComplete: (messages?: AgentMessage[], opts?: { stoppedByUser?: boolean; startedAt?: number; resultSubtype?: string; resultErrors?: string[]; backgroundTasksPending?: boolean }) => void
+  onComplete: (messages?: AgentMessage[], opts?: { stoppedByUser?: boolean; startedAt?: number; runGeneration?: number; resultSubtype?: string; resultErrors?: string[]; backgroundTasksPending?: boolean }) => void
   /** 发送标题更新 */
   onTitleUpdated: (title: string) => void
   /** 用户消息已持久化，外部入口可据此通知前端切到实时会话 */
-  onRunStarted?: (opts: { startedAt: number }) => void
+  onRunStarted?: (opts: { startedAt: number; runGeneration: number }) => void
 }
 
 /** 单次 Agent 运行完成时发送给外部入口的选项。 */
@@ -244,23 +252,6 @@ function createLocalProjectRootUnavailableError(projectRootPath: string, status?
   return error
 }
 
-/** 验证本地项目根，并返回用于跨会话比较的真实规范化路径。 */
-function resolveLocalProjectRootForRewind(projectRootPath: string): string {
-  const status = getLocalProjectRootStatus(projectRootPath)
-  if (status !== 'available') {
-    throw createLocalProjectRootUnavailableError(projectRootPath, status)
-  }
-
-  try {
-    accessSync(projectRootPath, constants.R_OK | constants.W_OK | constants.X_OK)
-    const realRoot = realpathSync(projectRootPath)
-    const normalizedRoot = normalizePathForCompare(realRoot) || realRoot
-    return process.platform === 'win32' ? normalizedRoot.toLowerCase() : normalizedRoot
-  } catch {
-    throw createLocalProjectRootUnavailableError(projectRootPath, 'unavailable')
-  }
-}
-
 // ===== AgentOrchestrator =====
 
 export class AgentOrchestrator {
@@ -268,7 +259,7 @@ export class AgentOrchestrator {
   private eventBus: AgentEventBus
   private activeSessions = new Map<string, number>()
   private activeSessionStartedAt = new Map<string, number>()
-  private nextRunGeneration = 0
+  private nextRunGenerationBySession = new Map<string, number>()
 
   /** 队列消息本地记录（sessionId → UUID 集合，用于防重） */
   private queuedMessageUuids = new Map<string, Set<string>>()
@@ -719,7 +710,7 @@ export class AgentOrchestrator {
    * 通过 EventBus 分发 AgentEvent，通过 callbacks 发送控制信号。
    */
   async sendMessage(
-    input: AgentSendInput,
+    input: AgentRunInput,
     callbacks: SessionCallbacks,
     extensions: AgentRunExtensions = {},
   ): Promise<void> {
@@ -775,6 +766,7 @@ export class AgentOrchestrator {
       terminalNotifier.onComplete([], {
         ...options,
         startedAt: options.startedAt ?? streamStartedAt,
+        ...(input.runGeneration != null ? { runGeneration: input.runGeneration } : {}),
         stoppedByUser: options.stoppedByUser === true || stoppedByUser,
       })
     }
@@ -824,7 +816,7 @@ export class AgentOrchestrator {
       completeBeforeRun({ stoppedByUser: true })
       return
     }
-    runGeneration = ++this.nextRunGeneration
+    runGeneration = this.reserveRunGeneration(sessionId)
     this.activeSessions.set(sessionId, runGeneration)
     this.activeSessionStartedAt.set(sessionId, streamStartedAt)
     this.latestRunGenerations.set(sessionId, runGeneration)
@@ -910,7 +902,7 @@ export class AgentOrchestrator {
         return
       }
 
-      const projectRootStatus = getLocalProjectRootStatus(workspace.projectRootPath)
+      const projectRootStatus = await getLocalProjectRootStatus(workspace.projectRootPath)
       if (projectRootStatus && projectRootStatus !== 'available') {
         reportPreflightError({
           code: 'local_project_root_unavailable',
@@ -1001,7 +993,7 @@ export class AgentOrchestrator {
     }
 
     // 2.1 所有同步预检通过后，才通知外部本轮已进入可见运行态。
-    callbacks.onRunStarted?.({ startedAt: streamStartedAt })
+    callbacks.onRunStarted?.({ startedAt: streamStartedAt, runGeneration })
     const completeRun = (
       messages?: AgentMessage[],
       opts?: AgentRunCompleteOptions,
@@ -1097,7 +1089,8 @@ export class AgentOrchestrator {
       // 从源会话继承并持久化，避免历史相对路径在恢复时切换到另一文件根。
 
       // 必须与 runtime 接收的附加目录保持一致；视觉助手据此限制允许外发的图片路径。
-      const vaultUserContext = getVaultUserContext(sessionId)
+      const productivityTools = appSettings.productivityTools
+      const vaultUserContext = productivityTools.obsidianEnabled ? getVaultUserContext(sessionId) : null
       const attachedDirectories = collectAttachedDirectories({
         extraDirs: additionalDirectories,
         sessionMeta,
@@ -1105,7 +1098,7 @@ export class AgentOrchestrator {
       })
       const allAdditionalDirectories = resolveRuntimeAdditionalDirectories(
         attachedDirectories,
-        getAgentVaultRoots(),
+        productivityTools.obsidianEnabled ? getAgentVaultRoots() : [],
       )
       const browserAllowedRoots = [...new Set([
         workspaceId ? agentCwd : undefined,
@@ -1136,6 +1129,8 @@ export class AgentOrchestrator {
         allowedRoots: browserAllowedRoots,
         permissionMode: permissionModeOverride ?? sessionMeta?.permissionMode ?? PROMA_DEFAULT_PERMISSION_MODE,
         triggeredBy: input.triggeredBy,
+        productivityTools,
+        lastWindowsTerminalProfile: appSettings.lastWindowsTerminalProfile,
         windowsShellAvailable: process.platform !== 'win32' || runtimeEnv.shellKind != null,
         trustedImageRoute: extensions.trustedImageRoute,
         resolveTrustedImageRoute: extensions.resolveTrustedImageRoute,
@@ -1187,8 +1182,8 @@ export class AgentOrchestrator {
         console.log(`[Agent 编排] 注入 mentioned_tools: ${mentionedSkills?.length ?? 0} skills, ${mentionedMcpServers?.length ?? 0} MCP`)
       }
       const referencedPlanningBlock = buildReferencedPlanningPrompt(
-        mentionedTodoIds,
-        mentionedCalendarEventIds,
+        productivityTools.todosEnabled ? mentionedTodoIds : undefined,
+        productivityTools.calendarEnabled ? mentionedCalendarEventIds : undefined,
         { requireToolRead: true },
       )
       if (referencedPlanningBlock) {
@@ -1273,6 +1268,27 @@ export class AgentOrchestrator {
         // 脚本执行（具有潜在副作用，如 node script.js / python main.py）
         if (/\b(node|python[23]?|ruby|perl|php)\s+[^-]/.test(command)) return false
         return true
+      }
+
+      /**
+       * 判断 PowerShell 命令是否可在计划模式只读执行。
+       * 为避免管道、重定向与别名隐含副作用，仅允许显式的只读 cmdlet，或沿用
+       * Bash 策略验证的 Git / JavaScript 工具链探索命令。
+       */
+      const isPowerShellCommandReadOnly = (command: string): boolean => {
+        const trimmed = command.trim()
+        if (!trimmed || /[;`|<>]/.test(trimmed) || /&&|\|\|/.test(trimmed)) return false
+
+        const [commandName] = trimmed.split(/\s+/, 1)
+        const normalizedName = commandName?.toLowerCase()
+        const readOnlyCmdlets = new Set([
+          'get-childitem', 'get-content', 'get-item', 'get-location', 'get-command', 'get-help',
+          'get-process', 'get-date', 'get-culture', 'get-module', 'measure-object',
+          'resolve-path', 'select-string', 'test-path',
+        ])
+        if (normalizedName && readOnlyCmdlets.has(normalizedName)) return true
+
+        return /^(git|bun|npm|pnpm|yarn)\s/.test(trimmed) && isBashCommandReadOnly(trimmed)
       }
 
       // Plan 模式下允许的只读工具（不包含 Write/Edit/Bash 等写操作）
@@ -1504,6 +1520,21 @@ export class AgentOrchestrator {
           return revalidateSingleApprovalResult(result, denyStaleToolRun, getPermissionMode)
         }
 
+        // Pi 的原生 PowerShell 尚未具备 Proma Bash 等价的命令级安全分类和白名单。
+        // 在需确认的权限模式中，每条命令都必须显示并单次确认；bypassPermissions
+        // 则遵从其既有语义，允许用户显式跳过所有工具确认。
+        if (toolName === 'PowerShell' && currentMode !== 'bypassPermissions') {
+          if (currentMode === 'plan') {
+            const command = typeof input.command === 'string' ? input.command : ''
+            return isPowerShellCommandReadOnly(command)
+              ? { behavior: 'allow' as const, updatedInput: input }
+              : { behavior: 'deny' as const, message: '计划模式下只允许只读 PowerShell 探索命令，请在计划审批通过后再执行写操作' }
+          }
+          return permissionService.requestSingleApproval(sessionId, toolName, input, options, (request) => {
+            this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
+          })
+        }
+
         // ── 普通工具的权限分派 ──
 
         switch (currentMode) {
@@ -1611,6 +1642,7 @@ export class AgentOrchestrator {
         currentModelId: selectedModelId,
         projectInstructions,
         projectKnowledgeMaintenanceApproved,
+        productivityTools,
         memoryGuidance,
         memoryRefreshOpportunity,
       }) + (automationContext ? `\n\n## 定时任务执行上下文\n\n${automationContext}` : '')
@@ -1876,6 +1908,7 @@ export class AgentOrchestrator {
                   deltas: [msg.delta],
                   session_id: msg.session_id,
                   runStartedAt: streamStartedAt,
+                  runGeneration,
                   _channelModelId: msg._channelModelId,
                 },
               })
@@ -2401,6 +2434,13 @@ export class AgentOrchestrator {
     console.log(`[Agent 编排] 已中止会话: ${sessionId}`)
   }
 
+  /** 为一个会话预留下一次运行身份。所有 run lifecycle 事件都必须复用该值。 */
+  reserveRunGeneration(sessionId: string): number {
+    const runGeneration = (this.nextRunGenerationBySession.get(sessionId) ?? 0) + 1
+    this.nextRunGenerationBySession.set(sessionId, runGeneration)
+    return runGeneration
+  }
+
   /** 检查指定会话是否正在处理中 */
   isActive(sessionId: string): boolean {
     return this.activeSessions.has(sessionId)
@@ -2416,6 +2456,7 @@ export class AgentOrchestrator {
     return [...this.activeSessions.keys()].map((sessionId) => ({
       sessionId,
       startedAt: this.activeSessionStartedAt.get(sessionId) ?? Date.now(),
+      runGeneration: this.activeSessions.get(sessionId),
     }))
   }
 

@@ -679,6 +679,7 @@ export function createAgentSession(
   modelId?: string,
   agentCwdMode?: AgentCwdMode,
   sessionWorkbenchLayout?: SessionWorkbenchLayout,
+  isDraft?: boolean,
 ): AgentSessionMeta {
   return createAgentSessionWithMetadata({
     title,
@@ -1166,7 +1167,7 @@ async function forkPiAgentSession(sourceMeta: AgentSessionMeta, input: ForkSessi
     newMeta.activeWorktree = sourceActiveWorktree
     Object.assign(newMeta, explorationMeta)
 
-    if (sourceWorkbenchDir && destWorkbenchDir) copyForkWorkspaceFiles(sourceWorkbenchDir, destWorkbenchDir)
+    if (sourceWorkbenchDir && destWorkbenchDir) await copyForkWorkspaceFiles(sourceWorkbenchDir, destWorkbenchDir)
     await copyForkStoredSDKMessages({
       sourceSessionId: sourceMeta.id,
       destSessionId: newMeta.id,
@@ -1592,7 +1593,8 @@ export function autoArchiveAgentSessions(daysThreshold: number): number {
   let count = 0
 
   for (const session of index.sessions) {
-    if (!session.pinned && !session.archived && session.updatedAt < threshold) {
+    // 草稿没有侧栏入口；自动归档后无法由 Welcome 恢复，会变成不可达记录。
+    if (!session.isDraft && !session.pinned && !session.archived && session.updatedAt < threshold) {
       session.archived = true
       count++
     }

@@ -53,7 +53,9 @@ const defaultDependencies: LanBridgePromaDependencies = {
   stopAgent: (sessionId) => stopAgent(sessionId),
   getSettings: () => getSettings(),
   listChannels: () => listChannels(),
-  sendConversationMessage: (input, webContents, onEvent) => sendConversationMessage(input, webContents, onEvent),
+  sendConversationMessage: async (input, webContents, onEvent) => {
+    await sendConversationMessage(input, webContents, onEvent)
+  },
   stopConversation: (conversationId) => stopConversation(conversationId),
   getPrimaryWebContents: () => BrowserWindow.getAllWindows()[0]?.webContents ?? null,
   notifyAgentTitleUpdated: (session) => {

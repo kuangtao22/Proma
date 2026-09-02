@@ -306,6 +306,49 @@ describe('Design Job Manager', () => {
     expect(candidateHarness.canvasAdoptionCount).toBe(0)
   })
 
+  test('Given 直接单节点 UUID 批次的输出待恢复 When 登记候选 Then 携带可证明的模块基线', async () => {
+    const candidateHarness = createHarness({ withCandidateBatches: true })
+    candidateHarness.messages = [createToolMessage('session-1/output.png')]
+    /** 单节点入口由主进程生成的 RFC 4122 批次身份。 */
+    const candidateBatchId = 'c7c9a30c-7fe3-4519-97fe-a06aa89b32e2'
+    const job = await candidateHarness.manager.createCanvasImage({
+      ...createCanvasImageInput('a'),
+      candidateBatchId,
+    })
+
+    await candidateHarness.manager.run(job.id)
+
+    expect(candidateHarness.candidateTerminalEvents).toEqual([{
+      jobId: job.id,
+      candidateBatchId,
+      status: 'succeeded',
+      outputAssetId: 'asset-output',
+      error: null,
+      singleBatchRecovery: {
+        nodeId: 'image-node-a',
+        imageModuleId: 'image-module-a',
+        initialAdoptedAssetId: null,
+        initialConfigRevision: 0,
+      },
+    }])
+
+    candidateHarness.candidateTerminalEvents.length = 0
+    await candidateHarness.manager.recover('project-1')
+    expect(candidateHarness.candidateTerminalEvents).toEqual([{
+      jobId: job.id,
+      candidateBatchId,
+      status: 'succeeded',
+      outputAssetId: 'asset-output',
+      error: null,
+      singleBatchRecovery: {
+        nodeId: 'image-node-a',
+        imageModuleId: 'image-module-a',
+        initialAdoptedAssetId: null,
+        initialConfigRevision: 0,
+      },
+    }])
+  })
+
   test('Given 相同 Agent Canvas 幂等 ID When 同 Manager 连续创建 Then 只写一个 journal 并复用任务', async () => {
     const jobId = `agent-canvas-${'a'.repeat(64)}`
 
@@ -447,6 +490,24 @@ describe('Design Job Manager', () => {
       expect.objectContaining({ id: original.id, status: 'failed' }),
       expect.objectContaining({ id: replacement.id, status: 'queued' }),
     ])
+  })
+
+  test('Given Canvas Job 重试后保留内部恢复字段 When 按目标查询 Then 公开任务不泄露恢复状态', async () => {
+    const target: CanvasImageTarget = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'image-node-a', imageModuleId: 'image-module-a',
+    }
+    const original = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    await harness.manager.run(original.id)
+
+    const replacement = harness.manager.retry('project-1', original.id)
+    const persistedOriginal = JSON.parse(
+      readFileSync(join(cacheRoot, 'jobs', `${original.id}.json`), 'utf8'),
+    ) as Record<string, unknown>
+    const publicOriginal = harness.manager.listCanvasImageJobs(target)
+      .find((job) => job.id === original.id) as DesignJobRecord & { replacedByJobId?: string }
+
+    expect(persistedOriginal.replacedByJobId).toBe(replacement.id)
+    expect(publicOriginal).not.toHaveProperty('replacedByJobId')
   })
 
   test('Given Canvas 成功任务被回收 When 再按目标查询 Then 索引同步删除全部 attempt', async () => {
@@ -1443,7 +1504,10 @@ describe('Design Job Manager', () => {
     harness.outputReloadError = new Error('DESIGN_RECOVERY_REQUIRED: backup 已恢复')
     harness.forceOutputReloadError = true
 
-    expect((await harness.manager.recover('project-1'))[0]).toMatchObject({
+    const firstRecovery = (await harness.manager.recover('project-1'))[0]
+    expect(firstRecovery).toMatchObject({ status: 'running' })
+    expect(firstRecovery).not.toHaveProperty('terminalState')
+    expect(harness.manager.get('job-pending')).toMatchObject({
       status: 'running', terminalState: { status: 'pending' },
     })
 
@@ -1889,6 +1953,12 @@ describe('Design Job Manager', () => {
       status: 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
       outputAssetId: string | null
       error: string | null
+      singleBatchRecovery?: {
+        nodeId: string
+        imageModuleId: string
+        initialAdoptedAssetId: string | null
+        initialConfigRevision: number
+      }
     }> = []
     /** 记录 output 阶段副作用并验证 Manager 外层 lease。 */
     const recordOutputEffect = (effect: string): void => {
@@ -1973,6 +2043,9 @@ describe('Design Job Manager', () => {
                   status: event.status,
                   outputAssetId: event.outputAssetId,
                   error: event.error,
+                  ...(event.singleBatchRecovery
+                    ? { singleBatchRecovery: { ...event.singleBatchRecovery } }
+                    : {}),
                 })
               },
             },

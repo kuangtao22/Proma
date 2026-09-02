@@ -45,6 +45,16 @@ export interface CanvasImageCandidateJobTerminalEvent extends CanvasTarget {
   status: 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
   outputAssetId: string | null
   error: string | null
+  /** 仅旧版单节点批次文件丢失时使用的可信重建基线；多节点任务不得提供。 */
+  singleBatchRecovery?: Omit<CreateCanvasImageCandidateBatchEntry, 'jobId'>
+}
+
+/** 单条候选任务定向重试的完整身份。 */
+export interface RetryCanvasImageCandidateJobInput extends CanvasImageTarget {
+  batchId: string
+  jobId: string
+  /** 旧版单节点批次文件缺失时，从原 Job 固化事实恢复重试入口。 */
+  singleBatchRecovery?: Omit<CreateCanvasImageCandidateBatchEntry, 'jobId'>
 }
 
 /** 候选批次业务服务依赖。 */
@@ -70,6 +80,8 @@ export interface CanvasImageCandidateBatchServiceDependencies {
     batch: CanvasImageCandidateBatch,
     entry: CanvasImageCandidateBatchEntry,
   ) => Promise<{ jobId: string; start: () => void }>
+  /** 定向重试前复核节点仍绑定目标图片模块，防止删除或换绑后的陈旧重试。 */
+  assertRetryTarget?: (target: CanvasImageTarget) => Promise<void>
   /** 候选 Asset、Job 与血缘的额外权威验证。 */
   validateCandidate?: (batch: CanvasImageCandidateBatch, entry: CanvasImageCandidateBatchEntry) => Promise<void>
   now?: () => number
@@ -85,6 +97,9 @@ export interface CanvasImageCandidateBatchService {
   recordJobTerminal(event: CanvasImageCandidateJobTerminalEvent): Promise<void>
   load(input: CanvasTarget & { batchId: string }): Promise<CanvasImageCandidateBatch>
   continueBatch(input: CanvasTarget & { batchId: string }): Promise<CanvasImageCandidateBatch>
+  retryJob(input: RetryCanvasImageCandidateJobInput): Promise<string>
+  /** 调用方已持有同一 Canvas 串行权时定向重试，避免重复获取非重入锁。 */
+  retryJobLocked(input: RetryCanvasImageCandidateJobInput): Promise<string>
   adopt(input: AdoptCanvasImageCandidateBatchInput): Promise<CanvasImageCandidateBatch>
   abandon(input: CanvasTarget & { batchId: string }): Promise<CanvasImageCandidateBatch>
   /** 恢复目标 Canvas 中所有未完成整批采用 intent。 */
@@ -410,12 +425,124 @@ export function createCanvasImageCandidateBatchService(
     }
   }
 
+  /** 校验既有单节点批次与 Job 固化的恢复基线完全一致。 */
+  const assertRecoverableSingleBatch = (
+    batch: CanvasImageCandidateBatch,
+    recovery: Omit<CreateCanvasImageCandidateBatchEntry, 'jobId'>,
+  ): CanvasImageCandidateBatchEntry => {
+    const entry = batch.entries[0]
+    if (batch.source !== 'single'
+      || batch.entries.length !== 1
+      || batch.adoption !== null
+      || batch.status === 'adopted'
+      || batch.status === 'abandoned'
+      || !entry
+      || entry.nodeId !== recovery.nodeId
+      || entry.imageModuleId !== recovery.imageModuleId
+      || entry.initialAdoptedAssetId !== recovery.initialAdoptedAssetId
+      || entry.initialConfigRevision !== recovery.initialConfigRevision) {
+      throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
+    }
+    return entry
+  }
+
+  /** 读取历史单节点批次；文件缺失时从可信 Job 基线创建失败条目供重试。 */
+  const loadOrCreateRetryBatch = async (
+    input: RetryCanvasImageCandidateJobInput,
+  ): Promise<CanvasImageCandidateBatch> => {
+    try {
+      return await dependencies.store.load(input, input.batchId)
+    } catch (error) {
+      if (!(error instanceof Error)
+        || error.message !== 'CANVAS_IMAGE_BATCH_NOT_FOUND'
+        || !input.singleBatchRecovery) throw error
+    }
+    const created = await createBatchLocked({
+      ...input,
+      source: 'single',
+      sourceSessionId: null,
+      sourceToolCallId: null,
+      entries: [{ ...input.singleBatchRecovery, jobId: input.jobId }],
+    })
+    /** 原 Job 已由 Manager 证明可重试，恢复后的条目明确进入失败态。 */
+    return dependencies.store.save({
+      ...created,
+      status: 'partial',
+      entries: created.entries.map((entry) => ({
+        ...entry, status: 'failed', error: '历史任务待重试',
+      })),
+      updatedAt: now(),
+    })
+  }
+
+  /** 只替换精确条目的 Job 身份，并保证新任务在批次写入后启动。 */
+  const retryJobLocked = async (input: RetryCanvasImageCandidateJobInput): Promise<string> => {
+    await dependencies.assertRetryTarget?.(input)
+    const batch = await loadOrCreateRetryBatch(input)
+    if (batch.status === 'adopted' || batch.status === 'abandoned') {
+      throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
+    }
+    const entry = batch.entries.find((candidate) => candidate.jobId === input.jobId)
+    if (!entry
+      || entry.nodeId !== input.nodeId
+      || entry.imageModuleId !== input.imageModuleId
+      || (entry.status !== 'failed' && entry.status !== 'invalid')) {
+      throw new Error('CANVAS_IMAGE_BATCH_JOB_NOT_FOUND')
+    }
+    const replacement = await dependencies.retryEntry(batch, entry)
+    /** replacement 身份必须先成为权威批次事实，快速终态才可反向定位。 */
+    await dependencies.store.save({
+      ...batch,
+      entries: batch.entries.map((candidate) => candidate.jobId === input.jobId
+        ? {
+            ...candidate,
+            jobId: replacement.jobId,
+            candidateAssetId: null,
+            status: 'queued',
+            error: null,
+          }
+        : candidate),
+      status: 'running',
+      updatedAt: now(),
+    })
+    replacement.start()
+    return replacement.jobId
+  }
+
   return {
     createBatch: async (input) => dependencies.runExclusive(input, () => createBatchLocked(input)),
     createBatchLocked,
     listActiveSummaries: async (input) => dependencies.store.listActiveSummaries(input),
     recordJobTerminal: async (event) => dependencies.runExclusive(event, async () => {
-      const batch = await dependencies.store.findByJobId(event, event.jobId, event.candidateBatchId)
+      let batch = await dependencies.store.findByJobId(event, event.jobId, event.candidateBatchId)
+      if (!batch
+        && event.status === 'succeeded'
+        && event.candidateBatchId
+        && event.singleBatchRecovery) {
+        /** 成功 replacement 可修复仍指向旧 attempt 的单节点批次；失败旧任务无恢复资格。 */
+        try {
+          const existing = await dependencies.store.load(event, event.candidateBatchId)
+          const entry = assertRecoverableSingleBatch(existing, event.singleBatchRecovery)
+          batch = await dependencies.store.save({
+            ...existing,
+            status: 'running',
+            entries: [{
+              ...entry, jobId: event.jobId, candidateAssetId: null, status: 'queued', error: null,
+            }],
+            updatedAt: now(),
+          })
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== 'CANVAS_IMAGE_BATCH_NOT_FOUND') throw error
+          batch = await createBatchLocked({
+            ...event,
+            batchId: event.candidateBatchId,
+            source: 'single',
+            sourceSessionId: null,
+            sourceToolCallId: null,
+            entries: [{ ...event.singleBatchRecovery, jobId: event.jobId }],
+          })
+        }
+      }
       if (!batch) throw new Error('CANVAS_IMAGE_BATCH_JOB_NOT_FOUND')
       const entries = batch.entries.map((entry): CanvasImageCandidateBatchEntry => {
         if (entry.jobId !== event.jobId) return entry
@@ -440,6 +567,8 @@ export function createCanvasImageCandidateBatchService(
       const input = parseGetCanvasImageCandidateBatchInput(rawInput)
       return dependencies.store.load(input, input.batchId)
     },
+    retryJob: async (input) => dependencies.runExclusive(input, () => retryJobLocked(input)),
+    retryJobLocked,
     continueBatch: async (rawInput) => {
       const input = parseGetCanvasImageCandidateBatchInput(rawInput)
       return dependencies.runExclusive(input, async () => {

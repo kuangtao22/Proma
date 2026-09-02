@@ -18,9 +18,6 @@ import {
   agentDiffViewModeAtom,
   agentDiffRefreshVersionAtom,
   agentSidePanelOpenAtomFamily,
-  agentSessionsAtom,
-  agentSideTemporaryAgentMapAtom,
-  getExplorationSidePanelTab,
 } from '@/atoms/agent-atoms'
 import { resolvedThemeAtom } from '@/atoms/theme'
 import {
@@ -30,22 +27,39 @@ import {
   previewResolvedPathAtom,
   quotedSelectionMapAtom,
 } from '@/atoms/preview-atoms'
+import {
+  agentSideChatMapAtom,
+  conversationsAtom,
+  conversationDraftsAtom,
+  conversationQuotedSelectionMapAtom,
+  selectedModelAtom,
+} from '@/atoms/chat-atoms'
 import { markdownTocOpenAtom } from '@/atoms/markdown-toc'
 import { useFocusAgentSessionInput } from '@/hooks/useFocusAgentSessionInput'
 import { useShortcut } from '@/hooks/useShortcut'
 import { initShortcutRegistry } from '@/lib/shortcut-registry'
 import { DiffView } from './DiffView'
-import { LiveMarkdownEditor } from '@/components/markdown/LiveMarkdownEditor'
+import { LiveMarkdownEditor, type LiveMarkdownEditorHandle, type LiveMarkdownTextSelection } from '@/components/markdown/LiveMarkdownEditor'
+import { createLiveMarkdownImageResolver } from '@/components/markdown/live-markdown-media'
 import { getPreviewCandidateBasePaths, isAbsoluteFilePath } from './preview-open-path'
 import { DefaultAppOpenButton } from './DefaultAppOpenButton'
 import { UnsupportedFilePreview } from './UnsupportedFilePreview'
 import { PreviewFindBar } from './PreviewFindBar'
-import { MarkdownToc } from './MarkdownToc'
+import { MarkdownToc, MarkdownTocScrollTail } from './MarkdownToc'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { PIERRE_FILE_CSS } from '@/components/agent/tool-result-renderers/pierre-styles'
 import { SelectionActionPopover } from '@/components/selection/SelectionActionPopover'
+import { focusChatInput } from '@/components/chat/focus-chat-input'
+import { getOrCreateSideChat } from '@/lib/side-chat'
+import { insertAgentInputQuote } from '@/lib/agent-input-quote'
 import { SELECTION_ACTION_POPOVER_SELECTOR } from '@/lib/quoted-selection'
 import { copyTextToClipboard } from '@/lib/clipboard'
+import {
+  clearPreviewContentCacheForFile,
+  clearPreviewContentCacheForSession,
+  getPreviewContentCache,
+  setPreviewContentCache,
+} from '@/lib/preview-content-cache'
 import {
   clearMarkdownEditorStateForSession,
   createMarkdownEditorCacheKey,
@@ -84,31 +98,10 @@ function getParentFolderPath(filePath: string): string {
 const FILE_FIND_SHORTCUT_OPTIONS = { exclusive: true }
 
 /**
- * 简易 LRU 缓存：保留最近访问的 N 个 entries。
- * key 设计：
- * - diff 模式：`${sessionId}:diff:${filePath}@v${refreshVersion}:${scope}`
- * - preview 模式：`${sessionId}:preview:${filePath}@v${previewContentVersion}:${scope}`
- * Diff 使用会话级版本；纯预览使用文件级版本，只在当前文件实际变化时失效。
- * 老 entry 不会被命中，最终被 LRU 淘汰；无需主动失效。
+ * 预览内容按 session、路径、version 与解析范围做 LRU 缓存。
+ * - diff：`${sessionId}:diff:${filePath}@v${refreshVersion}:${scope}`
+ * - 纯预览：`${sessionId}:preview:${filePath}@v${previewContentVersion}:${scope}`
  */
-type CacheEntry = {
-  oldContent: string
-  newContent: string
-  /** 非文本文件预览数据 */
-  pdfSrc?: string
-  imageDataUrl?: string
-  imagePath?: string
-  officeHtml?: string
-  officeHtmlUrl?: string
-  officeText?: string
-  /** HTML 预览的目录级 token URL，允许加载同目录相对资源 */
-  htmlPreviewUrl?: string
-  /** 二进制或其他不可安全内联渲染的文件提示 */
-  unsupportedPreviewReason?: string
-  /** 无法内联预览时由主进程返回的安全基础元数据。 */
-  previewMetadata?: FilePreviewMetadata
-}
-
 interface DeepSelection {
   text: string
   rect: DOMRect | null
@@ -120,9 +113,6 @@ interface PreviewTextSelection {
   y: number
   filePath: string
 }
-
-const CACHE_MAX = 50
-const contentCache = new Map<string, CacheEntry>()
 
 /** 超过此字符数的文本文件将跳过 PierreFile 高亮，直接以纯文本展示，避免大文件卡顿 */
 const MAX_PREVIEW_CHARS = 500_000
@@ -150,26 +140,8 @@ export function clearPreviewCacheForSession(sessionId: string): void {
   for (const key of scrollPositionCache.keys()) {
     if (key.startsWith(prefix)) scrollPositionCache.delete(key)
   }
-  for (const key of contentCache.keys()) {
-    if (key.startsWith(prefix)) contentCache.delete(key)
-  }
+  clearPreviewContentCacheForSession(sessionId)
   clearMarkdownEditorStateForSession(sessionId)
-}
-function cacheGet(key: string): CacheEntry | undefined {
-  const v = contentCache.get(key)
-  if (!v) return undefined
-  // 重新插入到末尾，更新 LRU 位置
-  contentCache.delete(key)
-  contentCache.set(key, v)
-  return v
-}
-function cacheSet(key: string, value: CacheEntry): void {
-  if (contentCache.has(key)) contentCache.delete(key)
-  contentCache.set(key, value)
-  if (contentCache.size > CACHE_MAX) {
-    const oldestKey = contentCache.keys().next().value
-    if (oldestKey !== undefined) contentCache.delete(oldestKey)
-  }
 }
 
 function getExtension(filePath: string): string {
@@ -365,6 +337,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   const imageDragging = React.useRef(false)
   const imageDragStart = React.useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 })
   const scrollContainerRef = React.useRef<HTMLDivElement>(null)
+  const markdownEditorRef = React.useRef<LiveMarkdownEditorHandle>(null)
   const [findOpen, setFindOpen] = React.useState(false)
   const [loading, setLoading] = React.useState(true)
   const [copied, setCopied] = React.useState(false)
@@ -387,6 +360,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   const theme = useAtomValue(resolvedThemeAtom)
   const [codeWrap, setCodeWrap] = useAtom(previewCodeWrapAtom)
   const [tocOpen, setTocOpen] = useAtom(markdownTocOpenAtom)
+  const tocContent = React.useDeferredValue(activeMarkdownEditing ? markdownDraft : newContent)
 
   const canTogglePreviewWrap =
     previewOnly &&
@@ -429,18 +403,16 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     markdownSourceMode: activeMarkdownEditing && markdownSourceMode,
   }), [filePath, loading, activeMarkdownEditing, markdownSourceMode, newContent.length, officeHtml.length, officeHtmlUrl, htmlPreviewUrl, htmlSourceMode, oldContent.length, previewOnly, viewMode])
 
-  // 目录提取只需在「文件本身或其内容」变化时重建，避免 loading/编辑态切换造成的抖动
-  const tocContentKey = React.useMemo(
-    () => JSON.stringify({ filePath, previewContentVersion, newLength: newContent.length }),
-    [filePath, previewContentVersion, newContent.length],
-  )
-
   // ===== 选中文本引用（Quoted Selection）=====
 
   const setQuotedSelectionMap = useSetAtom(quotedSelectionMapAtom)
-  const agentSessions = useAtomValue(agentSessionsAtom)
-  const setAgentSessions = useSetAtom(agentSessionsAtom)
-  const setSideTemporaryAgentMap = useSetAtom(agentSideTemporaryAgentMapAtom)
+  const selectedChatModel = useAtomValue(selectedModelAtom)
+  const conversations = useAtomValue(conversationsAtom)
+  const sideChatMap = useAtomValue(agentSideChatMapAtom)
+  const setConversations = useSetAtom(conversationsAtom)
+  const setConversationDrafts = useSetAtom(conversationDraftsAtom)
+  const setChatQuotedSelectionMap = useSetAtom(conversationQuotedSelectionMapAtom)
+  const setSideChatMap = useSetAtom(agentSideChatMapAtom)
   const setSidePanelOpen = useSetAtom(agentSidePanelOpenAtomFamily(sessionId))
   const setSidePanelTabMap = useSetAtom(agentDiffPanelTabAtom)
   const focusAgentSessionInput = useFocusAgentSessionInput()
@@ -450,7 +422,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   const shadowRootsRef = React.useRef<Set<ShadowRoot>>(new Set())
   const pointerSelectingRef = React.useRef(false)
   const captureTimerRef = React.useRef<number | null>(null)
-  const openTemporaryAgentPendingRef = React.useRef(false)
+  const openSelectionChatPendingRef = React.useRef(false)
   /** 当前正在展示的截断 toast id；选中回落到上限内或选区消失时主动 dismiss */
   const lastToastIdRef = React.useRef<string | null>(null)
 
@@ -465,35 +437,20 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     setPreviewSelection(null)
   }, [])
 
-  /** 捕获预览面板中的文本选中，显示动作弹层 */
-  const handleSelectionCapture = React.useCallback(() => {
-    if (!previewOnly) return
-    if (activeMarkdownEditing) return
-    const container = scrollContainerRef.current
-    if (!container) return
-
-    const deepSel = getDeepSelection(container, shadowRootsRef.current)
-    if (!deepSel) {
-      clearPreviewSelection()
-      return
-    }
-
-    const truncated = deepSel.text.length > MAX_QUOTED_CHARS
-    const newText = truncated ? deepSel.text.slice(0, MAX_QUOTED_CHARS) : deepSel.text
-    const newFilePath = filePathRef.current
-    const anchorRect = deepSel.rect
-    if (!anchorRect) return
-
+  /** 将 DOM 或 CodeMirror 的选区归一为同一套引用动作。 */
+  const capturePreviewSelection = React.useCallback((text: string, x: number, y: number) => {
+    const truncated = text.length > MAX_QUOTED_CHARS
+    const quotedText = truncated ? text.slice(0, MAX_QUOTED_CHARS) : text
     setPreviewSelection({
-      text: newText,
-      x: anchorRect.left + anchorRect.width / 2,
-      y: Math.max(12, anchorRect.top - 12),
-      filePath: newFilePath,
+      text: quotedText,
+      x,
+      y: Math.max(12, y),
+      filePath: filePathRef.current,
     })
 
     // 超过上限时按千位分档 toast；跨档时撤掉上一档，回到上限内则全部撤掉
     if (truncated) {
-      const k = Math.floor(deepSel.text.length / 1000) * 1000
+      const k = Math.floor(text.length / 1000) * 1000
       const id = `quoted-chars-cap:${sessionId}:${k}`
       if (lastToastIdRef.current && lastToastIdRef.current !== id) {
         toast.dismiss(lastToastIdRef.current)
@@ -506,7 +463,38 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     } else {
       dismissTruncationToast()
     }
-  }, [clearPreviewSelection, dismissTruncationToast, activeMarkdownEditing, previewOnly, sessionId])
+  }, [dismissTruncationToast, sessionId])
+
+  /** 捕获预览面板中的 DOM 文本选中，显示动作弹层。 */
+  const handleSelectionCapture = React.useCallback(() => {
+    if (!previewOnly || activeMarkdownEditing) return
+    const container = scrollContainerRef.current
+    if (!container) return
+
+    const deepSel = getDeepSelection(container, shadowRootsRef.current)
+    if (!deepSel?.rect) {
+      clearPreviewSelection()
+      return
+    }
+
+    capturePreviewSelection(
+      deepSel.text,
+      deepSel.rect.left + deepSel.rect.width / 2,
+      deepSel.rect.top - 12,
+    )
+  }, [activeMarkdownEditing, capturePreviewSelection, clearPreviewSelection, previewOnly])
+
+  /**
+   * ink-mde 的选择由 CodeMirror state 管理，不能可靠地从 window.getSelection() 读取。
+   * 预览 Markdown 也可能是可编辑的，因此直接接收其精确文本与坐标。
+   */
+  const handleLiveMarkdownSelectionChange = React.useCallback((selection: LiveMarkdownTextSelection | null) => {
+    if (!selection) {
+      clearPreviewSelection()
+      return
+    }
+    capturePreviewSelection(selection.text, selection.x, selection.y)
+  }, [capturePreviewSelection, clearPreviewSelection])
 
   const scheduleSelectionCapture = React.useCallback((): void => {
     if (captureTimerRef.current != null) {
@@ -601,6 +589,12 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     // 绝对路径不追加该回退，避免失效路径按同名文件误命中会话目录。
     candidateBasePaths: getPreviewCandidateBasePaths(basePaths, isAbsoluteFilePath(filePath) ? undefined : dirPath),
   }), [sessionId, basePaths, dirPath, filePath, workspaceSkillSlug, legacySkillFilePath])
+
+  const resolveProjectMarkdownImageSrc = React.useMemo(() => (
+    createLiveMarkdownImageResolver(filePath, async (candidate) => (
+      (await window.electronAPI.resolveMarkdownMedia(filePath, candidate, fileAccess))?.url ?? null
+    ))
+  ), [fileAccess, filePath])
 
   const contentCacheScope = React.useMemo(() => JSON.stringify({
     dirPath,
@@ -776,7 +770,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     const cacheKey = previewOnly
       ? getContentCacheKey('preview', previewContentVersion)
       : getContentCacheKey('diff', refreshVersion)
-    const cached = cacheGet(cacheKey)
+    const cached = getPreviewContentCache(cacheKey)
     // 保存或窗口恢复触发 refreshVersion 时，仍在编辑的 Markdown 必须继续留在
     // 当前 ProseMirror 实例中；后台读取可以更新预览缓存，但不能先挂载 loading
     // 占位，从而卸载编辑器并丢失内层滚动和选区。
@@ -869,7 +863,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
             setOfficeHtml(html)
             setOfficeHtmlUrl(htmlUrl)
             setOfficeText(text)
-            cacheSet(cacheKey, { oldContent: '', newContent: '', officeHtml: html, officeHtmlUrl: htmlUrl, officeText: text })
+            setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', officeHtml: html, officeHtmlUrl: htmlUrl, officeText: text })
             return
           }
           if (previewOnly) {
@@ -884,7 +878,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
               if (cancelled) return
               const src = result?.tmpHtmlUrl ?? ''
               setPdfSrc(src)
-              cacheSet(cacheKey, { oldContent: '', newContent: '', pdfSrc: src })
+              setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', pdfSrc: src })
               return
             }
             if (isImage) {
@@ -893,11 +887,11 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
               if (resolved) {
                 setImagePath(filePath)
                 setImageDataUrl(resolved.url)
-                cacheSet(cacheKey, { oldContent: '', newContent: '', imagePath: filePath, imageDataUrl: resolved.url })
+                setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', imagePath: filePath, imageDataUrl: resolved.url })
               } else {
                 setImagePath('')
                 setImageDataUrl('')
-                cacheSet(cacheKey, { oldContent: '', newContent: '', imagePath: '', imageDataUrl: '' })
+                setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', imagePath: '', imageDataUrl: '' })
               }
               return
             }
@@ -911,7 +905,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
                 : '此二进制或编码异常文件暂不支持内联预览，请使用默认应用打开。'
               setUnsupportedPreviewReason(reason)
               setPreviewMetadata(result.metadata)
-              cacheSet(cacheKey, {
+              setPreviewContentCache(cacheKey, {
                 oldContent: '',
                 newContent: '',
                 unsupportedPreviewReason: reason,
@@ -941,7 +935,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
           setOldContent(old)
           setNewContent(content)
 
-          if (cacheKey) cacheSet(cacheKey, { oldContent: old, newContent: content, htmlPreviewUrl: htmlUrl || undefined })
+          if (cacheKey) setPreviewContentCache(cacheKey, { oldContent: old, newContent: content, htmlPreviewUrl: htmlUrl || undefined })
         }
 
         if (previewOnly && !MD_EXTS.has(ext) && content) {
@@ -979,7 +973,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
         const newC = result.newContent ?? ''
         const oldC = result.oldContent ?? ''
         // 用新 refreshVersion 写入缓存，让后续切走再切回来能命中
-        cacheSet(getContentCacheKey('diff', refreshVersion), { oldContent: oldC, newContent: newC })
+        setPreviewContentCache(getContentCacheKey('diff', refreshVersion), { oldContent: oldC, newContent: newC })
         if (newC === lastNewContentRef.current && oldC === lastOldContentRef.current) return
         lastNewContentRef.current = newC
         lastOldContentRef.current = oldC
@@ -1034,6 +1028,69 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   const prevRefreshVersionRef = React.useRef(refreshVersion)
   const restoreScrollRef = React.useRef(false)
   const restoreRafRef = React.useRef(0)
+  const scrollNavigationEpochRef = React.useRef(0)
+
+  const cancelPendingPreviewScrollRestore = React.useCallback(() => {
+    // A user-initiated TOC jump supersedes a restore captured before this click.
+    // Otherwise the restore rAF may write the old (often zero) position after
+    // CodeMirror has already moved the document to the requested heading.
+    scrollNavigationEpochRef.current += 1
+    restoreScrollRef.current = false
+    if (restoreRafRef.current) {
+      cancelAnimationFrame(restoreRafRef.current)
+      restoreRafRef.current = 0
+    }
+  }, [])
+
+  // 等待异步 Markdown 渲染稳定期间保留布局但隐藏正文，避免切回标签时
+  // 先暴露文档顶部、再跳回保存位置。
+  const [liveMarkdownReadyKey, setLiveMarkdownReadyKey] = React.useState<string | null>(null)
+  const [restoredScrollKey, setRestoredScrollKey] = React.useState<string | null>(null)
+  const restoreGenerationRef = React.useRef(0)
+  const cachedScrollPosition = scrollPositionCache.get(scrollKey)
+  const shouldMaskMarkdownForScrollRestore = Boolean(
+    isMarkdown
+    && !loading
+    && cachedScrollPosition
+    && (cachedScrollPosition.top > 0 || cachedScrollPosition.left > 0)
+    && restoredScrollKey !== scrollKey,
+  )
+
+  React.useLayoutEffect(() => {
+    // 同一预览组件复用打开另一文件时，旧编辑器的 ready / restore 结果不能解开新文件遮罩。
+    if (liveMarkdownReadyKey && liveMarkdownReadyKey !== scrollKey) setLiveMarkdownReadyKey(null)
+    if (restoredScrollKey && restoredScrollKey !== scrollKey) setRestoredScrollKey(null)
+  }, [liveMarkdownReadyKey, restoredScrollKey, scrollKey])
+
+  React.useEffect(() => {
+    // 异常 widget 或极端资源压力不能让阅读区永久空白；超时后 best-effort 恢复。
+    if (!shouldMaskMarkdownForScrollRestore || liveMarkdownReadyKey === scrollKey) return
+    const timer = window.setTimeout(() => {
+      restoreScrollRef.current = false
+      restoreGenerationRef.current++
+      if (restoreRafRef.current) {
+        cancelAnimationFrame(restoreRafRef.current)
+        restoreRafRef.current = 0
+      }
+      const position = scrollPositionCache.get(scrollKey)
+      const container = scrollContainerRef.current
+      if (position && container) {
+        container.scrollTop = position.top
+        container.scrollLeft = position.left
+      }
+      setRestoredScrollKey(scrollKey)
+    }, 500)
+    return () => window.clearTimeout(timer)
+  }, [liveMarkdownReadyKey, scrollKey, shouldMaskMarkdownForScrollRestore])
+
+  const handleLiveMarkdownReady = React.useCallback(() => {
+    // ink-mde 异步完成后才允许本 Markdown 的恢复事务结束；不能以空容器的高度稳定
+    // 来提前解除遮罩，否则会重新出现“顶部可见后再跳回”的闪动。
+    setLiveMarkdownReadyKey(scrollKey)
+    if (!scrollPositionCache.has(scrollKey) || restoredScrollKey === scrollKey) return
+    restoreScrollRef.current = true
+    setPreviewScrollRestoreVersion((version) => version + 1)
+  }, [restoredScrollKey, scrollKey])
 
   // WHEN content version changes (refreshVersion bump): delete stored scroll position
   // 只在内容变化时清除，切换文件时保留位置以支持返回导航。正在编辑的 Markdown
@@ -1060,23 +1117,54 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     restoreScrollRef.current = true
   }, [previewScrollRestoreVersion, scrollKey])
 
-  // RESTORE scroll position after cached content renders.
-  // 等待滚动容器内容高度连续 3 帧稳定后再恢复，避免异步渲染
-  // （Shiki tokenize、ProseMirror mount）导致高度变化引起滚动偏移。
+  // RESTORE scroll position after cached content renders. Markdown 必须等待对应
+  // 实例的 ink-mde onReady；高度稳定 3 帧或最多 30 帧后恢复，避免永久遮罩。
   React.useEffect(() => {
     if (loading || !restoreScrollRef.current) return
+    if (isMarkdown && liveMarkdownReadyKey !== scrollKey) return
 
     const pos = scrollPositionCache.get(scrollKey)
     if (!pos || !scrollContainerRef.current) {
       restoreScrollRef.current = false
+      setRestoredScrollKey(scrollKey)
       return
     }
 
+    const generation = ++restoreGenerationRef.current
     const el = scrollContainerRef.current
+    const restoreEpoch = scrollNavigationEpochRef.current
+    const maxFrames = 30
+    let frameCount = 0
     let prevHeight = el.scrollHeight
     let stableFrames = 0
 
+    const canRestore = (): boolean => (
+      restoreGenerationRef.current === generation
+      && restoreEpoch === scrollNavigationEpochRef.current
+      && restoreScrollRef.current
+    )
+
+    const completeRestore = (): void => {
+      if (!canRestore()) return
+      // 首帧与下一帧各写入一次，覆盖 CodeMirror / widget 延迟测量导致的钳制。
+      el.scrollTop = pos.top
+      el.scrollLeft = pos.left
+      restoreRafRef.current = requestAnimationFrame(() => {
+        if (!canRestore()) return
+        el.scrollTop = pos.top
+        el.scrollLeft = pos.left
+        restoreScrollRef.current = false
+        setRestoredScrollKey(scrollKey)
+        restoreRafRef.current = 0
+      })
+    }
+
     const check = () => {
+      if (!canRestore()) {
+        restoreRafRef.current = 0
+        return
+      }
+      frameCount++
       const curHeight = el.scrollHeight
       if (curHeight === prevHeight) {
         stableFrames++
@@ -1084,11 +1172,8 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
         stableFrames = 0
         prevHeight = curHeight
       }
-      if (stableFrames >= 3) {
-        restoreScrollRef.current = false
-        el.scrollTop = pos.top
-        el.scrollLeft = pos.left
-        restoreRafRef.current = 0
+      if (stableFrames >= 3 || frameCount >= maxFrames) {
+        completeRestore()
         return
       }
       restoreRafRef.current = requestAnimationFrame(check)
@@ -1097,12 +1182,14 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     restoreRafRef.current = requestAnimationFrame(check)
 
     return () => {
+      if (restoreGenerationRef.current === generation) restoreGenerationRef.current++
       if (restoreRafRef.current) {
         cancelAnimationFrame(restoreRafRef.current)
         restoreRafRef.current = 0
       }
     }
-  }, [loading, previewScrollRestoreVersion, scrollKey])
+  }, [isMarkdown, liveMarkdownReadyKey, loading, previewScrollRestoreVersion, scrollKey])
+
 
   // SAVE scroll position on scroll (throttled via rAF)
   const scrollRafRef = React.useRef(0)
@@ -1267,7 +1354,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
         setOldContent('')
         setNewContent(draft)
         const nextPreviewContentVersion = previewContentVersion + 1
-        cacheSet(getContentCacheKey('preview', nextPreviewContentVersion), { oldContent: '', newContent: draft })
+        setPreviewContentCache(getContentCacheKey('preview', nextPreviewContentVersion), { oldContent: '', newContent: draft })
         setPreviewContentRefreshVersionMap((prev) => {
           const m = new Map(prev)
           m.set(previewContentRefreshKey, nextPreviewContentVersion)
@@ -1305,6 +1392,8 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
 
   const handleManualRefresh = React.useCallback(() => {
     if (previewOnly) {
+      // 刷新是用户要求以磁盘内容为准，不能因恰好命中某个历史 version 缓存而无效。
+      clearPreviewContentCacheForFile(sessionId, filePath)
       setPreviewContentRefreshVersionMap((prev) => {
         const m = new Map(prev)
         m.set(previewContentRefreshKey, (prev.get(previewContentRefreshKey) ?? 0) + 1)
@@ -1318,75 +1407,86 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
       m.set(sessionId, (prev.get(sessionId) ?? 0) + 1)
       return m
     })
-  }, [previewContentRefreshKey, previewOnly, sessionId, setPreviewContentRefreshVersionMap, setRefreshVersionMap])
+  }, [filePath, previewContentRefreshKey, previewOnly, sessionId, setPreviewContentRefreshVersionMap, setRefreshVersionMap])
 
   const handleAddSelectionToAgent = React.useCallback(() => {
     if (!previewSelection) return
-    setQuotedSelectionMap((prev) => {
-      const next = new Map(prev)
-      next.set(sessionId, {
-        text: previewSelection.text,
-        filePath: previewSelection.filePath,
-        sourceType: 'file',
-        sourceLabel: previewSelection.filePath,
-        capturedAt: Date.now(),
-      })
-      return next
-    })
+    const quote = {
+      text: previewSelection.text,
+      filePath: previewSelection.filePath,
+      sourceType: 'file' as const,
+      sourceLabel: previewSelection.filePath,
+      capturedAt: Date.now(),
+    }
+    // 与 Agent 历史选区相同：直接向 RichTextInput 插入 chip，因而可多次引用并与草稿共存。
+    // 仅在输入框尚未挂载的非常规场景回退旧的单条引用状态。
+    if (!insertAgentInputQuote(sessionId, quote)) {
+      setQuotedSelectionMap((prev) => new Map(prev).set(sessionId, quote))
+    }
     window.getSelection()?.removeAllRanges()
     clearPreviewSelection()
     focusAgentSessionInput(sessionId)
   }, [clearPreviewSelection, focusAgentSessionInput, previewSelection, sessionId, setQuotedSelectionMap])
 
-  const handleOpenExplorationBranch = React.useCallback(async (): Promise<void> => {
-    if (!previewSelection || openTemporaryAgentPendingRef.current) return
-    const parentSession = agentSessions.find((item) => item.id === sessionId)
-    // 文件预览不是一条对话消息；从当前主线最近一个可恢复的 Pi 节点分叉。
-    const sourceMessageId = Object.keys(parentSession?.piEntryBindings ?? {}).at(-1)
-    if (!sourceMessageId) {
-      toast.info('当前还没有可探索的 Agent 回复，请先完成一轮对话')
+  const handleOpenSelectionChat = React.useCallback(async (): Promise<void> => {
+    if (!previewSelection || openSelectionChatPendingRef.current) return
+
+    const quote = {
+      text: previewSelection.text,
+      filePath: previewSelection.filePath,
+      sourceType: 'file' as const,
+      sourceLabel: previewSelection.filePath,
+      capturedAt: Date.now(),
+    }
+    const activeConversationId = sideChatMap.get(sessionId) ?? null
+    // 右侧已绑定有效 Chat 时始终复用，避免因激活 Tab 状态短暂不同步而重复创建会话。
+    if (activeConversationId) {
+      setChatQuotedSelectionMap((previous) => new Map(previous).set(activeConversationId, quote))
+      setSidePanelOpen(true)
+      setSidePanelTabMap((previous) => new Map(previous).set(sessionId, 'chat'))
+      window.getSelection()?.removeAllRanges()
+      clearPreviewSelection()
+      focusChatInput(activeConversationId)
       return
     }
 
-    openTemporaryAgentPendingRef.current = true
+    openSelectionChatPendingRef.current = true
     try {
-      const branch = await window.electronAPI.forkAgentSession({
-        sessionId,
-        upToMessageUuid: sourceMessageId,
-        explorationSourceLabel: `当前节点 · ${getPreviewPathLabel(previewSelection.filePath)}`,
-      })
-      setAgentSessions((prev) => prev.some((item) => item.id === branch.id) ? prev : [branch, ...prev])
-      setQuotedSelectionMap((prev) => new Map(prev).set(branch.id, {
-        text: previewSelection.text,
-        filePath: previewSelection.filePath,
-        sourceType: 'file',
-        sourceLabel: previewSelection.filePath,
-        capturedAt: Date.now(),
-      }))
-      setSideTemporaryAgentMap((prev) => {
-        const openBranches = prev.get(sessionId) ?? []
-        const next = new Map(prev)
-        next.set(sessionId, openBranches.some((item) => item.sessionId === branch.id)
-          ? openBranches
-          : [...openBranches, {
-              sessionId: branch.id,
-              sourceMessageId,
-              sourceLabel: `当前节点 · ${getPreviewPathLabel(previewSelection.filePath)}`,
-            }])
-        return next
-      })
+      const conversation = await getOrCreateSideChat(sessionId, () => window.electronAPI.createConversation(
+        '预览选区问答',
+        selectedChatModel?.modelId,
+        selectedChatModel?.channelId,
+      ))
+      setConversations((prev) => prev.some((item) => item.id === conversation.id) ? prev : [conversation, ...prev])
+      setConversationDrafts((prev) => new Map(prev).set(conversation.id, '我的问题：'))
+      setSideChatMap((prev) => new Map(prev).set(sessionId, conversation.id))
       setSidePanelOpen(true)
-      setSidePanelTabMap((prev) => new Map(prev).set(sessionId, getExplorationSidePanelTab(branch.id)))
+      setSidePanelTabMap((prev) => new Map(prev).set(sessionId, 'chat'))
+      setChatQuotedSelectionMap((previous) => new Map(previous).set(conversation.id, quote))
       window.getSelection()?.removeAllRanges()
       clearPreviewSelection()
-      toast.success('已从当前节点创建探索分支', { description: '文件选区已带入分支；结论可回到主线输入框。' })
+      focusChatInput(conversation.id)
     } catch (error) {
-      console.error('[DiffTabContent] 创建文件探索分支失败:', error)
-      toast.error('创建探索分支失败', { description: error instanceof Error ? error.message : undefined })
+      console.error('[DiffTabContent] 打开预览选区聊天标签失败:', error)
+      toast.error('打开右侧问答失败')
     } finally {
-      openTemporaryAgentPendingRef.current = false
+      openSelectionChatPendingRef.current = false
     }
-  }, [agentSessions, clearPreviewSelection, previewSelection, sessionId, setAgentSessions, setQuotedSelectionMap, setSidePanelOpen, setSidePanelTabMap, setSideTemporaryAgentMap])
+  }, [
+    clearPreviewSelection,
+    conversations,
+    previewSelection,
+    selectedChatModel,
+    sessionId,
+    setConversationDrafts,
+    setConversations,
+    setChatQuotedSelectionMap,
+    setQuotedSelectionMap,
+    setSideChatMap,
+    setSidePanelOpen,
+    setSidePanelTabMap,
+    sideChatMap,
+  ])
 
   // persistRef 始终持有最新 persistMarkdownDraft，供 setTimeout / unmount cleanup 调用。
   // 用 effect 而非渲染期赋值，避免 React 19 严格模式下并发渲染中途读到中间态。
@@ -1684,8 +1784,10 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
         />
         <MarkdownToc
           containerRef={scrollContainerRef}
-          contentKey={tocContentKey}
+          content={tocContent}
+          editorRef={markdownEditorRef}
           enabled={Boolean(isMarkdown && tocOpen)}
+          onBeforeNavigate={cancelPendingPreviewScrollRestore}
           onOpenChange={setTocOpen}
         />
         {isMarkdown && !tocOpen && (
@@ -1832,12 +1934,19 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
               )
             ) : isMarkdown ? (
               <LiveMarkdownEditor
-                key={readOnly ? 'readonly' : 'editable'}
+                key={`${readOnly ? 'readonly' : 'editable'}:${filePath}`}
+                ref={markdownEditorRef}
                 value={readOnly ? newContent : markdownDraft}
                 onChange={updateMarkdownDraft}
                 onSave={() => void saveMarkdownEdit()}
+                onReady={handleLiveMarkdownReady}
+                onTextSelectionChange={handleLiveMarkdownSelectionChange}
                 readOnly={Boolean(readOnly)}
-                className="live-markdown-external-scroll"
+                resolveImageSrc={resolveProjectMarkdownImageSrc}
+                className={cn(
+                  'live-markdown-external-scroll',
+                  shouldMaskMarkdownForScrollRestore && 'invisible',
+                )}
               />
             ) : isPlainTextEditable && activeMarkdownEditing ? (
               <textarea
@@ -1881,13 +1990,14 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
           ) : (
             <DiffView oldContent={oldContent} newContent={newContent} filePath={filePath} viewMode={viewMode} />
           )}
+          {isMarkdown && !loading && <MarkdownTocScrollTail containerRef={scrollContainerRef} enabled />}
         </div>
         {previewSelection && (
           <SelectionActionPopover
             x={previewSelection.x}
             y={previewSelection.y}
             onAddToAgent={handleAddSelectionToAgent}
-            onOpenExplorationBranch={handleOpenExplorationBranch}
+            onOpenChat={handleOpenSelectionChat}
           />
         )}
       </div>

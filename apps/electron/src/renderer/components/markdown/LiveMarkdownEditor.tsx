@@ -4,13 +4,29 @@ import { Prec, RangeSetBuilder, StateEffect, StateField, type EditorState, type 
 import { Decoration, EditorView, ViewPlugin, keymap, type DecorationSet } from '@codemirror/view'
 import ink, { type Instance } from 'ink-mde'
 import { cn } from '@/lib/utils'
-import { liveMarkdownBlockPreview } from './LiveMarkdownPreview'
+import { createLiveMarkdownBlockPreview, type ResolveLiveMarkdownImageSrc, type SaveLiveMarkdownPastedImage, type ChangeLiveMarkdownProperties } from './LiveMarkdownPreview'
+import {
+  shouldRebuildMarkdownHeadingDecorations,
+  shouldRebuildMarkdownSyntaxDecorations,
+} from './live-markdown-lifecycle'
+export type { ChangeLiveMarkdownProperties } from './LiveMarkdownPreview'
+export type { LiveMarkdownPropertyEntry } from './live-markdown-frontmatter'
+import type { LiveMarkdownPropertyEntry } from './live-markdown-frontmatter'
 
 export interface LiveMarkdownEditorHandle {
   focus: () => void
   insert: (text: string) => void
+  scrollToPosition: (position: number) => void
+  getPositionAtViewportY: (viewportY: number) => number | null
   getHost: () => HTMLDivElement | null
   getView: () => EditorView | null
+}
+
+/** CodeMirror 选区的文本与可用于浮层定位的视口坐标。 */
+export interface LiveMarkdownTextSelection {
+  text: string
+  x: number
+  y: number
 }
 
 interface LiveMarkdownEditorProps {
@@ -18,8 +34,20 @@ interface LiveMarkdownEditorProps {
   onChange: (value: string) => void
   onSave?: () => void
   onCancel?: () => void
+  /** 编辑器异步挂载完成后通知外层（用于恢复外层滚动位置）。 */
+  onReady?: () => void
+  /** CodeMirror 的选区不必经过 DOM Selection，直接向外提供可靠的文本与锚点。 */
+  onTextSelectionChange?: (selection: LiveMarkdownTextSelection | null) => void
   /** 只读时沿用同一套 Live Preview 渲染，但不允许修改源文档。 */
   readOnly?: boolean
+  /** 将本地 Markdown 图片映射为当前来源授权的安全 URL。 */
+  resolveImageSrc?: ResolveLiveMarkdownImageSrc
+  /** 保存剪贴板图片并返回其可写入 Markdown 的相对来源。 */
+  savePastedImage?: SaveLiveMarkdownPastedImage
+  /** Vault adapter callback for editing flat YAML Properties. */
+  onChangeProperties?: ChangeLiveMarkdownProperties
+  /** Vault-only opt-in for replacing flat YAML frontmatter with editable Properties. */
+  enableProperties?: boolean
   extensions?: readonly Extension[]
   className?: string
 }
@@ -35,6 +63,8 @@ const markdownSyntaxMarkerNames = new Set([
   'HeaderMark',
   'LinkMark',
   'QuoteMark',
+  // ink-mde 使用 GFM parser；隐藏 ~~ 定界符，让删除线呈现与 Obsidian Live Preview 一致。
+  'StrikethroughMark',
 ])
 const hiddenMarkdownSyntax = Decoration.replace({ class: 'live-markdown-syntax-hidden' })
 const pendingListHeading = Decoration.mark({ class: 'live-markdown-pending-list-heading' })
@@ -77,6 +107,7 @@ function markdownHeadingDecorations(state: EditorState): DecorationSet {
         'data-markdown-heading': 'true',
         'data-toc-level': String(heading.level),
         'data-toc-text': heading.text,
+        'data-toc-position': String(heading.from),
       },
     }))
   }
@@ -85,7 +116,15 @@ function markdownHeadingDecorations(state: EditorState): DecorationSet {
 
 const markdownHeadingMarkers = StateField.define<DecorationSet>({
   create: markdownHeadingDecorations,
-  update: (value, transaction) => transaction.docChanged ? markdownHeadingDecorations(transaction.state) : value,
+  update: (value, transaction) => {
+    const syntaxTreeChanged = syntaxTree(transaction.startState) !== syntaxTree(transaction.state)
+    return shouldRebuildMarkdownHeadingDecorations({
+      documentChanged: transaction.docChanged,
+      syntaxTreeChanged,
+    })
+      ? markdownHeadingDecorations(transaction.state)
+      : value
+  },
   provide: (field) => EditorView.decorations.from(field),
 })
 
@@ -132,7 +171,13 @@ const markdownSyntaxVisibilityField = StateField.define<MarkdownSyntaxVisibility
     for (const effect of transaction.effects) {
       if (effect.is(markdownSyntaxFocusEffect)) focused = effect.value
     }
-    if (!transaction.docChanged && transaction.selection === undefined && focused === value.focused) return value
+    const syntaxTreeChanged = syntaxTree(transaction.startState) !== syntaxTree(transaction.state)
+    if (!shouldRebuildMarkdownSyntaxDecorations({
+      documentChanged: transaction.docChanged,
+      selectionChanged: transaction.selection !== undefined,
+      focusChanged: focused !== value.focused,
+      syntaxTreeChanged,
+    })) return value
     return { focused, decorations: markdownSyntaxDecorations(transaction.state, focused) }
   },
   provide: (field) => EditorView.decorations.from(field, (value) => value.decorations),
@@ -184,7 +229,13 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
   onChange,
   onSave,
   onCancel,
+  onReady,
+  onTextSelectionChange,
   readOnly = false,
+  resolveImageSrc,
+  savePastedImage,
+  onChangeProperties,
+  enableProperties = false,
   extensions = [],
   className,
 }, ref): React.ReactElement {
@@ -195,14 +246,39 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
   const onChangeRef = React.useRef(onChange)
   const onSaveRef = React.useRef(onSave)
   const onCancelRef = React.useRef(onCancel)
+  const onReadyRef = React.useRef(onReady)
+  const onTextSelectionChangeRef = React.useRef(onTextSelectionChange)
+  const onChangePropertiesRef = React.useRef(onChangeProperties)
   valueRef.current = value
   onChangeRef.current = onChange
   onSaveRef.current = onSave
   onCancelRef.current = onCancel
+  onReadyRef.current = onReady
+  onTextSelectionChangeRef.current = onTextSelectionChange
+  onChangePropertiesRef.current = onChangeProperties
+
+  const onChangePropertiesProxy = React.useCallback((entries: LiveMarkdownPropertyEntry[], documentValue?: string): void => {
+    // The extension is retained for the editor lifetime. Forward its live
+    // CodeMirror snapshot so the Vault adapter never falls back to a stale
+    // controlled prop after a body edit.
+    onChangePropertiesRef.current?.(entries, documentValue)
+  }, [])
 
   React.useImperativeHandle(ref, () => ({
     focus: () => instanceRef.current?.focus(),
     insert: (text) => instanceRef.current?.insert(text),
+    scrollToPosition: (position) => {
+      const view = viewRef.current
+      if (!view) return
+      const safePosition = Math.max(0, Math.min(position, view.state.doc.length))
+      view.dispatch({ effects: EditorView.scrollIntoView(safePosition, { y: 'start', yMargin: 8 }) })
+    },
+    getPositionAtViewportY: (viewportY) => {
+      const view = viewRef.current
+      if (!view) return null
+      const documentHeight = Math.max(0, (viewportY - view.documentTop) / view.scaleY)
+      return view.lineBlockAtHeight(documentHeight).from
+    },
     getHost: () => hostRef.current,
     getView: () => viewRef.current,
   }), [])
@@ -243,10 +319,53 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
         markdownHeadingMarkers,
         ViewPlugin.define((view) => {
           viewRef.current = view
-          return { destroy: () => { if (viewRef.current === view) viewRef.current = null } }
+          let selectionFrame = 0
+          const reportSelection = (): void => {
+            selectionFrame = 0
+            const range = view.state.selection.main
+            if (range.empty) {
+              onTextSelectionChangeRef.current?.(null)
+              return
+            }
+            const text = view.state.sliceDoc(range.from, range.to).trim()
+            // Mouse drag 结束后 CodeMirror 才会同步 selection；延迟到下一帧读取，
+            // 覆盖只读/Live Preview 中浏览器 DOM selection 与 editor state 的时序差异。
+            const coords = view.coordsAtPos(range.head) ?? view.coordsAtPos(range.from)
+            if (!text || !coords) {
+              onTextSelectionChangeRef.current?.(null)
+              return
+            }
+            onTextSelectionChangeRef.current?.({
+              text,
+              x: (coords.left + coords.right) / 2,
+              y: coords.top - 12,
+            })
+          }
+          const scheduleSelectionReport = (): void => {
+            if (selectionFrame) cancelAnimationFrame(selectionFrame)
+            selectionFrame = requestAnimationFrame(reportSelection)
+          }
+          // 只在鼠标松开后展示动作，不要在拖选过程中不断弹出、跟随选区移动。
+          // rAF 仍可覆盖 ink-mde 只读预览的 selection transaction 时序。
+          view.dom.addEventListener('mouseup', scheduleSelectionReport)
+          return {
+            update: (update) => {
+              // Pointer selections are reported on mouseup to avoid a moving popover;
+              // keyboard selection has no mouseup, so report it after CodeMirror commits.
+              const isPointerSelection = update.transactions.some((transaction) => transaction.isUserEvent('select.pointer'))
+              if (update.selectionSet && update.view.hasFocus && !isPointerSelection) {
+                scheduleSelectionReport()
+              }
+            },
+            destroy: () => {
+              view.dom.removeEventListener('mouseup', scheduleSelectionReport)
+              if (selectionFrame) cancelAnimationFrame(selectionFrame)
+              if (viewRef.current === view) viewRef.current = null
+            },
+          }
         }),
         ...markdownSyntaxVisibility,
-        liveMarkdownBlockPreview,
+        createLiveMarkdownBlockPreview(resolveImageSrc, savePastedImage, onChangePropertiesProxy, enableProperties),
         ...extensions,
       ].map((extension) => ({ type: 'default' as const, value: extension })),
       search: false,
@@ -261,6 +380,7 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
       instanceRef.current = instance
       if (instance.getDoc() !== valueRef.current) instance.update(valueRef.current)
       ready = true
+      onReadyRef.current?.()
     })
 
     const scheduler = createMeasureScheduler(() => viewRef.current)
@@ -284,14 +404,26 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
       mount.remove()
     }
   // The editor owns its document state after initialization; external reloads use the effect below.
-  // `readOnly` is an ink-mde construction option, so changing it must recreate the instance.
+  // `readOnly` 是 ink-mde construction option；文件来源切换由调用方的 editor key 显式重建，
+  // 不要因 render callback 引用变化而意外销毁 CodeMirror，避免丢失选区与滚动状态。
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [readOnly])
 
   React.useEffect(() => {
     const instance = instanceRef.current
     if (!instance || instance.getDoc() === value) return
+    // External document refreshes (for example an Agent writing the opened Vault
+    // note) must not eject a reader back to the top of a long CodeMirror document.
+    const scroller = hostRef.current?.querySelector<HTMLElement>('.cm-scroller')
+    const scrollTop = scroller?.scrollTop
+    const scrollLeft = scroller?.scrollLeft
     instance.update(value)
+    if (scroller && scrollTop !== undefined && scrollLeft !== undefined) {
+      requestAnimationFrame(() => {
+        scroller.scrollTop = scrollTop
+        scroller.scrollLeft = scrollLeft
+      })
+    }
   }, [value])
 
   return <div ref={hostRef} className={cn('live-markdown-editor vault-ink-mde h-full min-h-0', className)} />

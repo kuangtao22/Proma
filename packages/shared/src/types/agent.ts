@@ -634,12 +634,12 @@ export type PromaEvent =
   | { type: 'context_window'; contextWindow: number }
   | { type: 'permission_mode_changed'; mode: PromaPermissionMode }
   | { type: 'title_updated'; title: string }
-  | { type: 'external_run_started'; source: AgentExternalRunSource; sessionId: string; title?: string; workspaceId?: string; modelId?: string; startedAt: number; session?: AgentSessionMeta }
+  | { type: 'external_run_started'; source: AgentExternalRunSource; sessionId: string; title?: string; workspaceId?: string; modelId?: string; startedAt: number; runGeneration?: number; session?: AgentSessionMeta }
   /** 桌面会话已开始执行；startedAt 区分连续运行，session 提供权威轻量事件归属。 */
-  | { type: 'run_started'; startedAt: number; session?: AgentStreamSessionMeta }
+  | { type: 'run_started'; startedAt: number; runGeneration?: number; session?: AgentStreamSessionMeta }
   | { type: 'run_resumed'; sessionId: string }
   /** 用户主动停止当前执行；startedAt 防止旧运行的终态覆盖新一轮执行。 */
-  | { type: 'run_stopped'; startedAt?: number }
+  | { type: 'run_stopped'; startedAt?: number; runGeneration?: number }
   // 协作子会话阻塞事件上浮
   | { type: 'delegation_blocked'; delegationId: string; blockedEvent: unknown }
   // 自动任务会话被用户接管（毕业）
@@ -673,6 +673,8 @@ export interface AgentAssistantDeltaPayload {
   session_id?: string
   /** 产生该 Delta 的 Agent run 起始时间；仅存在于运行时 payload，不写入 JSONL。 */
   runStartedAt?: number
+  /** 主进程为本次运行分配的单调代际，优先于时间戳用于拒绝迟到事件。 */
+  runGeneration?: number
   _channelModelId?: string
 }
 
@@ -768,6 +770,10 @@ export interface AgentSessionMeta {
   starred?: boolean
   /** 是否已归档 */
   archived?: boolean
+  /**
+   * 尚未发送首条消息的临时输入会话。该标记须持久化，避免应用重启后在侧栏中冒出空会话。
+   */
+  isDraft?: boolean
   /** 附加的外部目录路径列表（绝对路径，作为 SDK additionalDirectories 传递） */
   attachedDirectories?: string[]
   /** 附加的外部文件路径列表（绝对路径，发送时以父目录作为 SDK additionalDirectories） */
@@ -1300,8 +1306,8 @@ export interface AgentSubmitOrEnqueueInput extends AgentDeferredQueueMessageInpu
 }
 
 export interface AgentSubmitOrEnqueueResult {
-  /** injected：已注入当前活跃 Agent；queued：已由主进程接管，等待或启动下一轮。 */
-  disposition: 'injected' | 'queued'
+  /** injected：已注入当前活跃 Agent；started：主进程已启动下一轮；queued：仍在等待。 */
+  disposition: 'injected' | 'started' | 'queued'
 }
 
 /** Agent 消息接管阶段允许跨 IPC 暴露的稳定错误码。 */
@@ -1368,6 +1374,13 @@ export interface AgentQueuedMessageStartedStatus {
   userMessage: string
   rawUserMessage?: string
   startedAt: number
+  runGeneration?: number
+}
+
+/** 主进程 deferred queue 的可恢复展示快照。输入保持原样，以便 renderer 重载后继续取消、移动或显示。 */
+export interface AgentQueuedMessageSnapshot {
+  input: AgentDeferredQueueMessageInput
+  queuedAt: number
 }
 
 /** 已接管 deferred 消息在后台准备阶段失效后的安全终态。 */
@@ -1471,6 +1484,17 @@ export interface AgentActiveSessionSnapshot {
   sessionId: string
   /** 对应当前运行实例的启动时间，用于拒绝陈旧的 renderer 恢复快照。 */
   startedAt: number
+  /** 主进程按 session 单调递增的 run 代际；避免 startedAt 同毫秒碰撞。 */
+  runGeneration?: number
+}
+
+/** Agent 流式错误事件载荷；运行身份用于拒绝迟到错误污染新一轮 UI。 */
+export interface AgentStreamErrorPayload {
+  sessionId: string
+  error: string
+  startedAt?: number
+  runGeneration?: number
+  session?: AgentStreamSessionMeta
 }
 
 /**
@@ -1485,8 +1509,10 @@ export interface AgentStreamCompletePayload {
   messages?: AgentMessage[]
   /** 是否由用户手动中止 */
   stoppedByUser?: boolean
-  /** 本轮流式开始时间戳（用于区分新旧流，防止旧流的 complete 事件重置新流状态） */
+  /** 本轮流式开始时间戳（用于展示与旧协议兼容）。 */
   startedAt?: number
+  /** 主进程按 session 单调递增的 run 代际；完成事件仅能结束同一代运行。 */
+  runGeneration?: number
   /** SDK result 消息的 subtype（success / error_max_turns / error_max_budget_usd / error_during_execution 等） */
   resultSubtype?: string
   /** SDK result 消息携带的错误详情（error_during_execution 等场景下的真实错误原因，用于展示具体错误） */
@@ -1494,16 +1520,6 @@ export interface AgentStreamCompletePayload {
   /** 本轮主体结束但仍有后台任务/定时任务在飞行：UI 进入"空闲可输入"态，等待任务完成自动唤醒 */
   backgroundTasksPending?: boolean
   /** 完成时的最新会话元数据，供 renderer 增量更新列表，避免重新传输全量会话索引。 */
-  session?: AgentStreamSessionMeta
-}
-
-/** Agent 流式错误事件载荷（主进程 → 渲染进程）。 */
-export interface AgentStreamErrorPayload {
-  sessionId: string
-  error: string
-  /** 本轮流式开始时间戳；内部 Canvas 会话仅允许匹配代次的错误终态化。 */
-  startedAt?: number
-  /** 与 completion 共用的安全会话分类元数据。 */
   session?: AgentStreamSessionMeta
 }
 
@@ -1812,6 +1828,8 @@ export const AGENT_IPC_CHANNELS = {
   CREATE_SESSION: 'agent:create-session',
   /** 获取当前主进程仍在执行的 Agent 会话快照 */
   ACTIVE_SESSIONS_SNAPSHOT: 'agent:active-sessions-snapshot',
+  /** 获取指定会话中仍由主进程持有的 deferred queue 快照。 */
+  GET_QUEUED_MESSAGES: 'agent:get-queued-messages',
   /** 获取会话 SDKMessage（Phase 4 新格式） */
   GET_SDK_MESSAGES: 'agent:get-sdk-messages',
   /** 更新会话标题 */
@@ -1921,6 +1939,8 @@ export const AGENT_IPC_CHANNELS = {
   GET_SKILLS: 'agent:get-skills',
   /** 获取工作区 Skills 目录绝对路径 */
   GET_SKILLS_DIR: 'agent:get-skills-dir',
+  /** 使用系统文件管理器打开指定工作区 Skill 的实际目录 */
+  OPEN_SKILL_FOLDER: 'agent:open-skill-folder',
   /** 删除工作区 Skill */
   DELETE_SKILL: 'agent:delete-skill',
   /** 切换工作区 Skill 启用/禁用 */

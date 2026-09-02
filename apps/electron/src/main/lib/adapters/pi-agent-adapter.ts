@@ -89,6 +89,14 @@ import {
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 type BashOperations = import('@earendil-works/pi-coding-agent').BashOperations
 type BashToolOptions = import('@earendil-works/pi-coding-agent').BashToolOptions
+/** 0.84.3+ PowerShell hook 的最小结构；旧版 SDK 不导出该类型时仍可编译。 */
+type PowerShellToolOptions = {
+  spawnHook?: (input: { command: string; cwd: string; env: Record<string, string> }) => {
+    command: string
+    cwd: string
+    env: Record<string, string>
+  }
+}
 type SkillLoadResult = ReturnType<ResourceLoader['getSkills']>
 
 const PI_NATIVE_MAX_RETRIES = 8
@@ -1248,8 +1256,35 @@ export function isPiBashToolAvailable(
   runtimeEnv: Pick<AgentRuntimeEnv, 'shellKind'> | undefined,
 ): boolean {
   // Pi 的 Windows Bash 工具只能通过 Proma 配置的 Git Bash 或 WSL 执行。
-  // 没有可用 Shell 时，基础 Agent 仍可使用文件与 Proma 工具，但不能暴露一个必然失败的 Bash 工具。
   return platform !== 'win32' || runtimeEnv?.shellKind === 'git-bash' || runtimeEnv?.shellKind === 'wsl'
+}
+
+/** Pi 0.84.3 起可在 Windows 无 Git Bash / WSL 时使用系统原生 PowerShell。 */
+export function isPiPowerShellToolAvailable(platform: NodeJS.Platform): boolean {
+  return platform === 'win32'
+}
+
+export type PiBuiltinShellTool = 'bash' | 'powershell' | 'none'
+
+/** 每个会话只暴露一种 Shell，避免模型混用 Bash 与 PowerShell 语法。 */
+export function selectPiBuiltinShellTool(
+  platform: NodeJS.Platform,
+  runtimeEnv: Pick<AgentRuntimeEnv, 'shellKind'> | undefined,
+): PiBuiltinShellTool {
+  if (isPiBashToolAvailable(platform, runtimeEnv)) return 'bash'
+  if (isPiPowerShellToolAvailable(platform)) return 'powershell'
+  return 'none'
+}
+
+function createPromaPowerShellToolOptions(runtimeEnv: AgentRuntimeEnv | undefined): PowerShellToolOptions | undefined {
+  if (!runtimeEnv) return undefined
+  return {
+    spawnHook: ({ command, cwd, env }: { command: string; cwd: string; env: Record<string, string> }) => ({
+      command,
+      cwd,
+      env: mergeRuntimeEnv(env, runtimeEnv.env),
+    }),
+  }
 }
 
 function buildBuiltinToolDefinitions(
@@ -1258,10 +1293,22 @@ function buildBuiltinToolDefinitions(
   canUseTool: PiAgentQueryOptions['canUseTool'],
   runtimeEnv: AgentRuntimeEnv | undefined,
 ): ToolDefinition[] {
+  const shellTool = selectPiBuiltinShellTool(process.platform, runtimeEnv)
   const definitions = [
     sdk.createReadToolDefinition(cwd),
-    ...(isPiBashToolAvailable(process.platform, runtimeEnv)
+    ...(shellTool === 'bash'
       ? [sdk.createBashToolDefinition(cwd, createPromaBashToolOptions(runtimeEnv))]
+      : []),
+    ...(shellTool === 'powershell'
+      ? (() => {
+          /** 旧版 Pi 没有原生 PowerShell 工具时回退为空，避免启动阶段崩溃。 */
+          const createPowerShell = (sdk as unknown as {
+            createPowerShellToolDefinition?: (cwd: string, options?: PowerShellToolOptions) => ToolDefinition
+          }).createPowerShellToolDefinition
+          return createPowerShell
+            ? [createPowerShell(cwd, createPromaPowerShellToolOptions(runtimeEnv))]
+            : []
+        })()
       : []),
     sdk.createEditToolDefinition(cwd),
     sdk.createWriteToolDefinition(cwd),
@@ -1275,8 +1322,17 @@ function buildBuiltinToolDefinitions(
 }
 
 function appendWindowsBaseModeInstruction(systemPrompt: string, runtimeEnv: AgentRuntimeEnv | undefined): string {
-  if (process.platform !== 'win32' || isPiBashToolAvailable(process.platform, runtimeEnv)) {
+  const shellTool = selectPiBuiltinShellTool(process.platform, runtimeEnv)
+  if (process.platform !== 'win32' || shellTool === 'bash') {
     return systemPrompt
+  }
+
+  if (shellTool === 'powershell') {
+    return `${systemPrompt}
+
+<runtime_capabilities>
+当前 Windows 设备未配置 Git Bash 或 WSL，因此 Bash 工具不可用；已启用原生 PowerShell 工具。需要运行命令、测试或 Git 操作时，请使用 PowerShell，并采用 PowerShell 语法；不要调用 InstallWindowsShell。
+</runtime_capabilities>`
   }
 
   return `${systemPrompt}

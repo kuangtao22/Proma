@@ -126,6 +126,12 @@ import {
   restoreMissingCanvasNodeReferences,
 } from '@/lib/agent-message-queue'
 import { createAgentStreamEventBatcher } from '@/lib/agent-stream-event-batcher'
+import {
+  isSameOrNewerRun,
+  isTerminalEventForCurrentRun,
+  type AgentRunMarker,
+} from '@/lib/agent-active-session-snapshot'
+import { createAgentQueuedMessage } from '@/lib/agent-message-queue'
 import { designAdapter } from '@/lib/design-adapter'
 import {
   createCanvasAgentBootstrapCoordinator,
@@ -971,7 +977,7 @@ export function useGlobalAgentListeners(): void {
     const activateExternalAgentRun = (event: Extract<PromaEvent, { type: 'external_run_started' }>): void => {
       const applyActivation = (sessions: AgentSessionMeta[]): void => {
         const currentStreamState = store.get(agentStreamingStatesAtom).get(event.sessionId)
-        if (!shouldActivateExternalAgentRun(currentStreamState, event.startedAt)) {
+        if (!shouldActivateExternalAgentRun(currentStreamState, event.startedAt, event.runGeneration)) {
           return
         }
 
@@ -985,6 +991,7 @@ export function useGlobalAgentListeners(): void {
           workspaceId: event.workspaceId,
           modelId: event.modelId,
           startedAt: event.startedAt,
+          runGeneration: event.runGeneration,
           currentStreamState,
         })
 
@@ -1184,6 +1191,8 @@ export function useGlobalAgentListeners(): void {
     const isWindows = detectIsWindows()
     // 初始化快照与 STREAM_COMPLETE 可跨 IPC channel 乱序抵达。完成处理回收
     // startedAt 后仍需保留一个短生命周期的终态标记，避免迟到快照复活旧 run。
+    // 新协议用 runGeneration；只有老协议才回退到 startedAt。
+    const latestTerminalRun = new Map<string, AgentRunMarker>()
     const latestTerminalRunStartedAt = new Map<string, number>()
 
     const bumpPreviewContentRefresh = (sessionId: string, file: PreviewFile): void => {
@@ -1286,6 +1295,38 @@ export function useGlobalAgentListeners(): void {
       })().catch(() => { /* 文件监听不应影响会话流 */ })
     })
 
+    // ===== 0. 初始化：恢复 stoppedByUser、主进程真实运行态与 deferred queue 投影 =====
+    // 队列由主进程持有。reload 后只将还在主进程队列中的项合并到本地，
+    // 使用 queueMessageId 去重，绝不覆盖用户在 reload 窗口内刚更新的本地投影。
+    const restoreQueuedMessages = async (): Promise<void> => {
+      const sessionIds = new Set<string>([
+        ...store.get(agentSessionsAtom).map((session) => session.id),
+        ...store.get(agentSessionMessageQueueAtom).keys(),
+      ])
+      for (const sessionId of sessionIds) {
+        const snapshots = await window.electronAPI.getQueuedAgentMessages(sessionId)
+        if (snapshots.length === 0) continue
+        store.set(agentSessionMessageQueueAtom, (previous) => {
+          const current = previous.get(sessionId) ?? []
+          const knownIds = new Set(current.map((message) => message.id))
+          const recovered = snapshots
+            .filter(({ input }) => !knownIds.has(input.queueMessageId))
+            .map(({ input, queuedAt }) => createAgentQueuedMessage(
+              input.rawUserMessage ?? input.userMessage,
+              input.queueMessageId,
+              queuedAt,
+              null,
+              { additionalDirectories: input.additionalDirectories },
+            ))
+          if (recovered.length === 0) return previous
+          const next = new Map(previous)
+          next.set(sessionId, [...current, ...recovered])
+          return next
+        })
+      }
+    }
+    void restoreQueuedMessages().catch(console.error)
+
     // ===== 0. 初始化：恢复 stoppedByUser 与主进程真实运行态 =====
     // 运行态不落盘，窗口重载或 renderer 晚订阅时必须从主进程 activeSessions
     // 补一份快照；快照只提升缺失/更旧的状态，不覆盖已收到的完成态。
@@ -1296,7 +1337,7 @@ export function useGlobalAgentListeners(): void {
             return mergeActiveAgentSessionSnapshot(
               existing,
               snapshot,
-              latestTerminalRunStartedAt.get(snapshot.sessionId),
+              latestTerminalRun.get(snapshot.sessionId),
             )
           })
         }
@@ -1347,14 +1388,24 @@ export function useGlobalAgentListeners(): void {
           // 必须在首个 SDK/tool 事件之前恢复 running、startedAt 和正常的 live UI。
           store.set(agentStreamingStatesAtom, (prev) => {
             const current = prev.get(sessionId)
-            // 迟到的旧 run_started 不能重新激活当前更新的一轮运行；同一 run
-            // 已处于 running 时保留已有模型和上下文数据，避免重复初始化。
-            if (current?.startedAt != null && (
+            if (
+              current?.runGeneration != null
+              && runStartedEvent.runGeneration != null
+            ) {
+              if (current.runGeneration > runStartedEvent.runGeneration) return prev
+              // 重复 start 保留已有 live 状态；已结束 run 更不能被重复 start 复活。
+              if (current.runGeneration === runStartedEvent.runGeneration) return prev
+            }
+            // 旧协议事件没有代际，只能保留 startedAt 回退比较。
+            if (runStartedEvent.runGeneration == null && current?.startedAt != null && (
               current.startedAt > runStartedEvent.startedAt
               || (current.startedAt === runStartedEvent.startedAt && current.running)
             )) return prev
             const map = new Map(prev)
-            map.set(sessionId, createQueuedAgentStreamState(current, runStartedEvent.startedAt))
+            map.set(sessionId, {
+              ...createQueuedAgentStreamState(current, runStartedEvent.startedAt),
+              ...(runStartedEvent.runGeneration != null ? { runGeneration: runStartedEvent.runGeneration } : {}),
+            })
             return map
           })
           if (!isCanvasAgent) store.set(unviewedCompletedSessionIdsAtom, (prev) => {
@@ -1385,10 +1436,11 @@ export function useGlobalAgentListeners(): void {
         // Phase 2: 直接累积 SDKMessage 到 liveMessagesMapAtom（跳过 replay 消息，避免与持久化消息重复）
         if (payload.kind === 'sdk_delta') {
           const deltaPayload = payload.delta
-          const currentRunStartedAt = store.get(agentSessionStreamingStateAtomFamily(sessionId))?.startedAt
-          // Delta 必须携带产生它的 run 标识。迟到的旧 run Delta 不能借用当前 run，
-          // 否则会被 live-group-set 误判为新一轮消息；无标识的旧协议事件也不强行归类。
-          if (currentRunStartedAt != null && deltaPayload.runStartedAt !== currentRunStartedAt) return
+          const currentRun = store.get(agentSessionStreamingStateAtomFamily(sessionId))
+          // Delta 必须属于当前运行。新协议以 generation 为准，老协议才比较 startedAt。
+          if (currentRun?.runGeneration != null && deltaPayload.runGeneration != null) {
+            if (currentRun.runGeneration !== deltaPayload.runGeneration) return
+          } else if (currentRun?.startedAt != null && deltaPayload.runStartedAt !== currentRun.startedAt) return
           const deltaRunStartedAt = deltaPayload.runStartedAt
           const sessionModelMap = store.get(agentSessionModelMapAtom)
           const defaultModelId = store.get(agentModelIdAtom)
@@ -1976,10 +2028,11 @@ export function useGlobalAgentListeners(): void {
         // 不发"任务已完成"通知（任务并未真正完成）、不清后台任务列表、不重载消息——
         // 等后台任务完成时 Agent 会自动唤醒续轮。
         const backgroundTasksPending = data.backgroundTasksPending === true
-        if (!backgroundTasksPending && data.startedAt != null) {
-          const previousTerminalStartedAt = latestTerminalRunStartedAt.get(data.sessionId)
-          if (previousTerminalStartedAt == null || data.startedAt > previousTerminalStartedAt) {
-            latestTerminalRunStartedAt.set(data.sessionId, data.startedAt)
+        if (!backgroundTasksPending && (data.runGeneration != null || data.startedAt != null)) {
+          const terminalRun = { startedAt: data.startedAt, runGeneration: data.runGeneration }
+          const previousTerminalRun = latestTerminalRun.get(data.sessionId)
+          if (!previousTerminalRun || !isSameOrNewerRun(previousTerminalRun, terminalRun)) {
+            latestTerminalRun.set(data.sessionId, terminalRun)
           }
         }
         const hasStreamError = store.get(agentStreamErrorsAtom).has(data.sessionId)
@@ -2070,9 +2123,7 @@ export function useGlobalAgentListeners(): void {
           if (!current || (!current.running && !current.backgroundWaiting)) {
             return prev
           }
-          if (current.startedAt != null && (data.startedAt == null || current.startedAt > data.startedAt)) {
-            return prev
-          }
+          if (!isTerminalEventForCurrentRun(current, data)) return prev
           const map = new Map(prev)
           map.set(data.sessionId, {
             ...current,

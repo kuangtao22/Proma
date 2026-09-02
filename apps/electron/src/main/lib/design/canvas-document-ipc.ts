@@ -120,6 +120,9 @@ import {
 } from './canvas-agent-node-creation'
 import { isSafeDesignStableId } from './design-paths'
 
+/** 直接点击创建的单节点候选批次使用主进程 UUID；Agent 批次使用稳定哈希前缀。 */
+const SINGLE_IMAGE_CANDIDATE_BATCH_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
 /** Canvas 文档 IPC handler 的最小签名。 */
 type CanvasDocumentIpcHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
 
@@ -192,12 +195,16 @@ export interface CanvasDocumentIpcOptions {
   /** 图片 Job、IPC 与恢复共用的唯一候选批次服务。 */
   imageCandidateBatches: Pick<
     CanvasImageCandidateBatchService,
-    'createBatchLocked' | 'listActiveSummaries' | 'load' | 'continueBatch' | 'adopt' | 'abandon'
+    'createBatchLocked' | 'listActiveSummaries' | 'load' | 'continueBatch' | 'retryJobLocked' | 'adopt' | 'abandon'
   >
   /** 图片模块只读取 Design 素材公开元数据并创建目录媒体授权。 */
   imageAssets: {
     list: (projectId: string) => DesignAsset[]
     exportAsset?: (projectId: string, assetId: string, targetPath: string) => Promise<void>
+    readStoredThumbnail?: (projectId: string, assetId: string) => {
+      bytes: Buffer
+      mediaType: DesignAsset['mediaType']
+    }
     createMediaAccess: (projectId: string) => {
       assetBaseUrl: string
       thumbnailBaseUrl: string
@@ -1653,11 +1660,16 @@ export function registerCanvasDocumentIpcHandlers(
           artifacts: options.artifacts,
           textArtifacts: options.textArtifacts,
           images: {
+            loadConfig: (target) => options.imageModules.load(target),
             load: async (target) => ({
               config: await options.imageModules.load(target),
               jobs: options.imageJobs.listCanvasImageJobs(target),
             }),
             save: (input) => options.imageModules.save(input),
+            readThumbnail: async (projectId, assetId) => {
+              if (!options.imageAssets.readStoredThumbnail) throw new Error('DESIGN_THUMBNAIL_UNAVAILABLE')
+              return options.imageAssets.readStoredThumbnail(projectId, assetId)
+            },
           },
           batch,
           readNodeContent: readCanvasNodeContent,
@@ -2010,14 +2022,33 @@ export function registerCanvasDocumentIpcHandlers(
       const input = parseImageJobControlInput(value)
       const job = await runImageCanvasExclusive(input, async () => {
         requireWritableProject(input.projectId, options)
-        requireOwnedJob(input, input.jobId)
+        const previous = requireOwnedJob(input, input.jobId)
         await options.imageJobTarget.assertTarget(input.projectId, {
           kind: 'canvas-image', canvasId: input.canvasId,
           nodeId: input.nodeId, imageModuleId: input.imageModuleId,
         })
-        return options.imageJobs.retry(input.projectId, input.jobId)
+        if (!previous.candidateBatchId) return options.imageJobs.retry(input.projectId, input.jobId)
+        /** 历史单节点批次缺失时，只从原 Job 的固化快照恢复，不读取当前可编辑配置。 */
+        const singleBatchRecovery = SINGLE_IMAGE_CANDIDATE_BATCH_ID.test(previous.candidateBatchId)
+          && previous.canvasImageConfigRevision !== undefined
+          ? {
+              nodeId: input.nodeId,
+              imageModuleId: input.imageModuleId,
+              initialAdoptedAssetId: previous.sourceAssetId ?? null,
+              initialConfigRevision: previous.canvasImageConfigRevision,
+            }
+          : undefined
+        const replacementJobId = await options.imageCandidateBatches.retryJobLocked({
+          ...input,
+          batchId: previous.candidateBatchId,
+          ...(singleBatchRecovery ? { singleBatchRecovery } : {}),
+        })
+        const replacement = options.imageJobs.getProjectJob(input.projectId, replacementJobId)
+        if (!replacement) throw new Error('CANVAS_IMAGE_BATCH_JOB_NOT_FOUND')
+        return replacement
       })
       if (!isOwnedImageJob(job, input)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
+      if (job.candidateBatchId) return job
       void options.imageJobs.run(job.id).catch((error) => {
         console.error('[CanvasDocumentIPC] Canvas 图片任务后台重试失败:', error)
       })

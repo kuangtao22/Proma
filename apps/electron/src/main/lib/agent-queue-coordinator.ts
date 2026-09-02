@@ -5,11 +5,15 @@ import type {
   AgentMessagePublicError,
   AgentQueuedMessageControlInput,
   AgentQueuedMessageStatus,
+  AgentQueuedMessageSnapshot,
 } from '@proma/shared'
 import type { PreparedAgentCanvasMessage } from './agent-canvas-message-preparation'
 
+type DispatchedQueueRunInput = AgentDeferredQueueMessageInput & { runGeneration: number }
+
 interface QueueEntry {
   input: AgentDeferredQueueMessageInput
+  queuedAt: number
 }
 
 /** deferred 在发布 started 前完成的权威运行准备结果。 */
@@ -31,12 +35,17 @@ export class AgentQueueCoordinator {
 
   constructor(private readonly options: AgentQueueCoordinatorOptions) {}
 
-  enqueue(input: AgentDeferredQueueMessageInput): void {
+  enqueue(input: AgentDeferredQueueMessageInput): 'started' | 'queued' {
+    if (this.dispatching.get(input.sessionId) === input.queueMessageId) return 'started'
     const queue = this.queues.get(input.sessionId) ?? []
-    if (queue.some((entry) => entry.input.queueMessageId === input.queueMessageId)) return
-    queue.push({ input })
+    if (queue.some((entry) => entry.input.queueMessageId === input.queueMessageId)) {
+      const runStarted = this.dispatching.get(input.sessionId) === input.queueMessageId
+      return runStarted ? 'started' : 'queued'
+    }
+    queue.push({ input, queuedAt: Date.now() })
     this.queues.set(input.sessionId, queue)
     this.tryDispatch(input.sessionId, input.queueMessageId)
+    return 'queued'
   }
 
   cancel(input: AgentQueuedMessageControlInput): boolean {
@@ -78,6 +87,15 @@ export class AgentQueueCoordinator {
 
   onBackgroundTaskComplete(sessionId: string): void {
     this.tryDispatch(sessionId)
+  }
+
+  /** Renderer/webContents 重新可用后唤醒等待中的队列。tryDispatch 自身负责去重 active/dispatching。 */
+  onTargetAvailable(sessionId: string): void {
+    this.tryDispatch(sessionId)
+  }
+
+  snapshot(sessionId: string): AgentQueuedMessageSnapshot[] {
+    return (this.queues.get(sessionId) ?? []).map((entry) => ({ input: { ...entry.input }, queuedAt: entry.queuedAt }))
   }
 
   isDispatching(sessionId: string): boolean {

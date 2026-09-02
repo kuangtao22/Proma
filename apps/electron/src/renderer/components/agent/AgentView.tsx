@@ -136,6 +136,7 @@ import { inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedMo
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
 import { getFilePanelDragData, INSERT_FILE_MENTION_EVENT, type FilePanelDragItem } from '@/lib/file-panel-drag'
 import { buildQuotedSelectionBlock, expandAgentHistoryQuoteMentions } from '@/lib/quoted-selection'
+import { INSERT_AGENT_INPUT_QUOTE_EVENT, type InsertAgentInputQuoteDetail } from '@/lib/agent-input-quote'
 import { createClipboardPendingFile, createClipboardTextDraft, makeUniqueAttachmentName } from '@/lib/clipboard-text-attachment'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import {
@@ -758,6 +759,15 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   const handleAddHistoryQuote = React.useCallback((quote: QuotedSelection): boolean => {
     return richTextInputRef.current?.insertAgentHistoryQuoteMention(quote) ?? false
   }, [])
+  React.useEffect(() => {
+    const handleInsertQuote = (event: Event): void => {
+      const detail = (event as CustomEvent<InsertAgentInputQuoteDetail>).detail
+      if (!detail || detail.sessionId !== sessionId) return
+      detail.inserted = richTextInputRef.current?.insertQuotedSelectionMention(detail.quote) ?? false
+    }
+    window.addEventListener(INSERT_AGENT_INPUT_QUOTE_EVENT, handleInsertQuote)
+    return () => window.removeEventListener(INSERT_AGENT_INPUT_QUOTE_EVENT, handleInsertQuote)
+  }, [sessionId])
   const handleAgentHistoryQuoteClick = React.useCallback((quote: QuotedSelection): void => {
     if (
       quote.sourceType !== 'agent-history'
@@ -2225,13 +2235,17 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       return next
     })
 
-    // 取消 draft 标记，让会话出现在侧边栏
+    // 取消 draft 标记，让会话出现在侧边栏。主进程会在实际启动时持久化清除
+    // isDraft；这里先乐观更新，避免 IPC 往返期间仍被侧栏过滤。
     setDraftSessionIds((prev: Set<string>) => {
       if (!prev.has(sessionId)) return prev
       const next = new Set(prev)
       next.delete(sessionId)
       return next
     })
+    setAgentSessions((prev) => prev.map((session) => (
+      session.id === sessionId && session.isDraft ? { ...session, isDraft: false } : session
+    )))
 
     // 初始化流式状态（startedAt 由渲染进程生成，传递给主进程原样回传，确保竞态保护使用同一个值）
     const streamStartedAt = Date.now()

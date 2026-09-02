@@ -15,6 +15,7 @@ import type {
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
   DeleteCanvasNodeInput,
+  DesignChangeEvent,
   DesignJobRecord,
   DesignTaskDetails,
   RebuildCanvasAgentNodeResult,
@@ -86,6 +87,7 @@ import {
   exportCanvasImageArtifact,
   createCanvasNodeReferencesFromSnapshot,
   createNativeCanvasNodeActivityStates,
+  createNativeCanvasJobActivityController,
   commitNativeCanvasArrangeMutation,
   listVisibleNativeCanvasNodeIds,
 } from './NativeCanvasWorkspace'
@@ -114,6 +116,42 @@ function createInitialNativeCanvasState(): NativeCanvasState {
 }
 
 describe('Agent Canvas 共享图与独立视图', () => {
+  test('Given 仅打开 Agent 画布 When 图片任务创建并推进 Then 卡片任务状态持续同步', async () => {
+    /** 模拟画布详情关闭后仍由项目级任务事件推进的权威任务列表。 */
+    let jobs: DesignJobRecord[] = [{
+      id: 'job-1', creativeTaskId: 'task-1', attemptNumber: 1, projectId: 'project-1',
+      target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'image-1', imageModuleId: 'module-1' },
+      action: 'generate', status: 'queued', prompt: '首页', originalRequest: '首页', contextMode: 'none',
+      createdAt: 100, updatedAt: 100,
+    }]
+    /** 使用集合模拟真实事件总线，并验证释放时移除监听器。 */
+    const listeners = new Set<(change: DesignChangeEvent) => void>()
+    const snapshots: DesignJobRecord[][] = []
+    const controller = createNativeCanvasJobActivityController({
+      projectId: 'project-1',
+      listJobs: async () => jobs,
+      onChanged: (nextListener) => {
+        listeners.add(nextListener)
+        return () => { listeners.delete(nextListener) }
+      },
+      onJobsChange: (nextJobs) => snapshots.push(nextJobs),
+    })
+
+    controller.start()
+    await controller.refresh()
+    expect(snapshots.at(-1)?.[0]?.status).toBe('queued')
+
+    jobs = [{ ...jobs[0]!, status: 'running', updatedAt: 101 }]
+    for (const listener of listeners) {
+      listener({ projectId: 'project-1', revision: 1, cause: 'job' })
+    }
+    await controller.whenIdle()
+    expect(snapshots.at(-1)?.[0]?.status).toBe('running')
+
+    controller.dispose()
+    expect(listeners.size).toBe(0)
+  })
+
   test('Given Agent 与图片任务同时运行 When 聚合节点活动态 Then 按 nodeId 输出真实结构化状态', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 100)
     document.nodes = [

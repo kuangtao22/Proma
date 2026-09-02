@@ -28,6 +28,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
+import { productivityToolsAtom } from '@/atoms/ui-preferences'
 import { markdownToHtml } from '@/lib/markdown-rich-text'
 import { FileBrowser, FileDropZone, FileTypeIcon, FileSearchBar, computeRevealAncestors, isPathUnderRoot, computeTreeRowLayout, AncestorGuides, STICKY_ROW_BASE_CLASS, canBeSticky } from '@/components/file-browser'
 import { DiffPanelTabBar } from '@/components/diff/DiffPanelTabBar'
@@ -111,6 +112,7 @@ import {
   previewPanelOpenMapAtom,
 } from '@/atoms/preview-atoms'
 import { PreviewPanel } from '@/components/diff/PreviewPanel'
+import { clearPreviewContentCacheForFile } from '@/lib/preview-content-cache'
 import { useOpenPreview } from '@/components/diff/preview-opener'
 import type { FileEntry, AgentPendingFile, AgentSessionMeta, CanvasSessionMeta, SDKMessage, WorktreeInfo } from '@proma/shared'
 import { setFilePanelDragData, getMediaTypeFromFilename, dispatchInsertFileMention } from '@/lib/file-panel-drag'
@@ -828,7 +830,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
 
   const fileSourceFilterMap = useAtomValue(agentFileSourceFilterMapAtom)
   const setFileSourceFilterMap = useSetAtom(agentFileSourceFilterMapAtom)
-  const fileSourceFilter = fileSourceFilterMap[sessionId] ?? 'session'
+  const fileSourceFilter = fileSourceFilterMap[sessionId] ?? 'project'
   const setFileSourceFilter = React.useCallback((source: AgentFileSourceFilter) => {
     setFileSourceFilterMap((prev) => {
       if (prev[sessionId] === source) return prev
@@ -875,13 +877,22 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     : null
   // Todo / 日程 / 能力 / 记忆的数据仍归属于 workspace，但右侧 Tab 仅属于当前 session。
   const [workspaceComponentTabs, setWorkspaceComponentTabs] = useAtom(agentSessionComponentTabsAtomFamily(sessionId))
+  const productivityTools = useAtomValue(productivityToolsAtom)
   const automationFormOpen = useAtomValue(automationFormAtom).open
+  const isWorkspaceComponentEnabled = React.useCallback((component: WorkspaceComponentTab): boolean => (
+    component !== 'todos' || productivityTools.todosEnabled
+  ) && (
+    component !== 'calendar' || productivityTools.calendarEnabled
+  ) && (
+    component !== 'vault' || productivityTools.obsidianEnabled
+  ), [productivityTools.calendarEnabled, productivityTools.obsidianEnabled, productivityTools.todosEnabled])
 
   React.useEffect(() => {
     const validTabs = sanitizeWorkspaceComponentTabs(workspaceComponentTabs)
-    if (validTabs === workspaceComponentTabs) return
+      .filter(isWorkspaceComponentEnabled)
+    if (validTabs.length === workspaceComponentTabs.length && validTabs.every((tab, index) => tab === workspaceComponentTabs[index])) return
     setWorkspaceComponentTabs(validTabs)
-  }, [setWorkspaceComponentTabs, workspaceComponentTabs])
+  }, [isWorkspaceComponentEnabled, setWorkspaceComponentTabs, workspaceComponentTabs])
 
   const agentStreamState = useAtomValue(agentSessionStreamingStateAtomFamily(sessionId))
   const memoryChangesMap = useAtomValue(workspaceMemoryChangesAtom)
@@ -893,7 +904,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     // `temporary-agent` 是旧的单分支内存状态；新状态使用 exploration:<sessionId>。
     : activeTab === 'temporary-agent' || (activeExplorationSessionId !== null && !activeExplorationBranch) || (activeDelegationSessionId !== null && !activeDelegationSession) || (activeTerminalId !== null && !terminalTabs.some((terminal) => terminal.terminalId === activeTerminalId))
       ? 'files'
-      : isWorkspaceComponentTab(activeTab) && (!workspaceSlug || !workspaceComponentTabs.includes(activeTab))
+      : isWorkspaceComponentTab(activeTab) && (!workspaceSlug || !workspaceComponentTabs.includes(activeTab) || !isWorkspaceComponentEnabled(activeTab))
         ? 'files'
         : activeTab
   const [splitMap, setSplitMap] = useAtom(agentSidePanelSplitMapAtom)
@@ -933,6 +944,9 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   }, [agentStreamState?.running, agentStreamState?.startedAt, effectiveActiveTab, isOpen, latestMemoryChange, onTabChange, setIsOpen, setMemoryNavigationRequest, setWorkspaceComponentTabs, workspaceSlug])
 
   const handleClosePreviewTab = React.useCallback((previewId: string) => {
+    const closingFile = previewFiles.find((file) => getPreviewFileId(file) === previewId)
+    // 关闭代表结束这次预览生命周期；下次打开必须重新读盘，不能回落到旧 v0 缓存。
+    if (closingFile?.previewOnly) clearPreviewContentCacheForFile(sessionId, closingFile.filePath)
     const remaining = previewFiles.filter((file) => getPreviewFileId(file) !== previewId)
     setPreviewFilesMap((previous) => {
       const next = new Map(previous)
@@ -1417,6 +1431,11 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const showBrowserActivity = Boolean(browserState?.activity && browserState.executionSource !== 'user')
   // WebContentsView 是原生子视图，会盖住 renderer 的 portal。加号菜单打开时，
   // BrowserPanel 为它保留一个固定避让区，而非 setVisible(false)。
+  React.useEffect(() => {
+    if (activeTab !== 'todos' && activeTab !== 'calendar' && activeTab !== 'vault') return
+    if (!isWorkspaceComponentEnabled(activeTab)) onTabChange('files')
+  }, [activeTab, isWorkspaceComponentEnabled, onTabChange])
+
   const [isAddTabMenuOpen, setIsAddTabMenuOpen] = React.useState(false)
   const workspaceTabs = React.useMemo<WorkspacePanelTab[]>(() => [
     { id: 'files', label: '文件', icon: <FolderOpen className="size-3.5" /> },
@@ -1856,20 +1875,6 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
                     role="tab"
                     className={cn(
                       'relative flex-1 h-7 px-2 text-[11px] transition-colors select-none',
-                      fileSourceFilter === 'session'
-                        ? 'app-tab-active text-foreground'
-                        : 'app-tab-inactive text-muted-foreground hover:text-foreground',
-                    )}
-                    aria-selected={fileSourceFilter === 'session'}
-                    onClick={() => setFileSourceFilter('session')}
-                  >
-                    会话文件
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    className={cn(
-                      'relative flex-1 h-7 px-2 text-[11px] transition-colors select-none',
                       fileSourceFilter === 'project'
                         ? 'app-tab-active text-foreground'
                         : 'app-tab-inactive text-muted-foreground hover:text-foreground',
@@ -1879,13 +1884,27 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
                   >
                     项目文件
                   </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    className={cn(
+                      'relative flex-1 h-7 px-2 text-[11px] transition-colors select-none',
+                      fileSourceFilter === 'session'
+                        ? 'app-tab-active text-foreground'
+                        : 'app-tab-inactive text-muted-foreground hover:text-foreground',
+                    )}
+                    aria-selected={fileSourceFilter === 'session'}
+                    onClick={() => setFileSourceFilter('session')}
+                  >
+                    会话文件
+                  </button>
                 </div>
               )}
             </FileSearchBar>
             {showBothFileSources ? (
               <div className="grid min-h-0 flex-1 grid-cols-2 divide-x divide-border/70 overflow-hidden pt-2">
-                {renderFileSourceContent('session')}
                 {renderFileSourceContent('project')}
+                {renderFileSourceContent('session')}
               </div>
             ) : (
               <div className="flex-1 min-h-0 overflow-y-auto scrollbar-thin pt-1">
@@ -1982,14 +2001,15 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
               setPendingDeleteCanvas(deleteLifecycleRef.current.open(sessionId, currentWorkspaceId, canvas))
             }}
             onOpenWorkspaceComponent={(component) => {
+              if (!isWorkspaceComponentEnabled(component)) return
               setWorkspaceComponentTabs((previous) => previous.includes(component) ? previous : [...previous, component])
               handleWorkspaceTabChange(component)
             }}
-            onOpenVault={() => {
+            onOpenVault={productivityTools.obsidianEnabled ? () => {
               setWorkspaceComponentTabs((previous) => previous.includes('vault') ? previous : [...previous, 'vault'])
               setIsOpen(true)
               handleWorkspaceTabChange('vault')
-            }}
+            } : undefined}
             visibleTabs={renderSplit && split ? { left: split.leftTab, right: split.rightTab } : undefined}
             focusedPane={renderSplit ? split?.focusedPane : undefined}
             onTabDragChange={handleTabDragChange}

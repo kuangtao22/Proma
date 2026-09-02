@@ -306,12 +306,20 @@ describe('原生 Canvas 大画布性能预算', () => {
       nodesDraggable: true,
       elementsSelectable: true,
       panOnDrag: [1],
+      panOnScroll: true,
+      zoomOnScroll: false,
+      zoomOnPinch: true,
+      preventScrolling: true,
       selectionOnDrag: true,
     })
     expect(captured[1]).toMatchObject({
       nodesDraggable: false,
       elementsSelectable: true,
       panOnDrag: true,
+      panOnScroll: true,
+      zoomOnScroll: false,
+      zoomOnPinch: true,
+      preventScrolling: true,
       selectionOnDrag: false,
     })
   })

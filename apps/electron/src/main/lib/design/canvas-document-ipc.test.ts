@@ -257,7 +257,9 @@ function createContext(options: {
   imageRollbackOnce?: (projectId: string, jobId: string) => Promise<boolean>
   imageRun?: (jobId: string, leaseHeld: boolean) => Promise<void>
   imageCandidateBatch?: CanvasImageCandidateBatch
+  imageCandidateRetry?: (input: CanvasImageTarget & { batchId: string; jobId: string }) => Promise<string>
   imageExport?: (projectId: string, assetId: string, targetPath: string) => Promise<void>
+  imageThumbnail?: (projectId: string, assetId: string) => { bytes: Buffer; mediaType: DesignAsset['mediaType'] }
   pickArtifactExportPath?: () => Promise<string | null>
   batchReconcile?: () => Promise<void>
   batchReconcileError?: Error
@@ -681,6 +683,10 @@ function createContext(options: {
         imageCalls.push({ type: 'candidate-continue', value: input })
         return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
       },
+      retryJobLocked: async (input) => {
+        imageCalls.push({ type: 'candidate-retry', value: input })
+        return options.imageCandidateRetry?.(input) ?? 'job-retry'
+      },
       adopt: async (input) => {
         imageCalls.push({ type: 'candidate-adopt', value: input })
         return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
@@ -692,6 +698,10 @@ function createContext(options: {
     },
     imageAssets: {
       list: () => options.imageAssets ?? [createImageAsset('asset-a', 'job-a')],
+      readStoredThumbnail: (projectId, assetId) => options.imageThumbnail?.(projectId, assetId) ?? {
+        bytes: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lwqSmQAAAABJRU5ErkJggg==', 'base64'),
+        mediaType: 'image/png',
+      },
       createMediaAccess: () => {
         const index = mediaAccessCount
         mediaAccessCount += 1
@@ -1258,6 +1268,34 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(rebound.imageCalls.filter((call) => call.type === 'assert-target')).toHaveLength(1)
     expect(deleted.imageCalls.filter((call) => call.type === 'cancel')).toHaveLength(0)
     expect(rebound.imageCalls.filter((call) => call.type === 'retry' || call.type === 'run')).toHaveLength(0)
+  })
+
+  test('Given 任务属于候选批次 When RETRY Then 通过批次服务定向替换且不直接启动旧路径', async () => {
+    const original = {
+      ...createImageJob(imageTargetA, 'job-failed'),
+      status: 'failed' as const,
+      candidateBatchId: 'batch-1',
+    }
+    const replacement = {
+      ...createImageJob(imageTargetA, 'job-retry'),
+      attemptNumber: 2,
+      candidateBatchId: 'batch-1',
+    }
+    const context = createContext({
+      imageJobs: [original, replacement],
+      imageCandidateRetry: async () => replacement.id,
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB,
+      context.sender,
+      { ...imageTargetA, jobId: original.id },
+    )
+
+    expect(result).toMatchObject({ ok: true, value: { id: replacement.id } })
+    expect(context.imageCalls.filter((call) => call.type === 'candidate-retry')).toHaveLength(1)
+    expect(context.imageCalls.filter((call) => call.type === 'retry' || call.type === 'run')).toEqual([])
   })
 
   test('Given revision 身份或 asset 归属错误 When 写操作 Then fail closed 且无业务副作用', async () => {
@@ -3314,6 +3352,7 @@ describe('原生 Canvas 文档 IPC', () => {
         listActiveSummaries: async () => [],
         load: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
         continueBatch: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
+        retryJobLocked: async () => 'job-retry',
         adopt: async (input: import('@proma/shared').AdoptCanvasImageCandidateBatchInput) => createImageCandidateBatch(input.batchId),
         abandon: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
       },
@@ -3428,14 +3467,14 @@ describe('原生 Canvas 文档 IPC', () => {
     }
   })
 
-  test('Given 生产 Canvas Tool Provider runtime When 读取并更新 WebView Then 文本与图片依赖已完整装配', async () => {
+  test('Given 生产 Canvas Tool Provider runtime When 读取、检查并更新产物 Then 文本与图片依赖已完整装配', async () => {
     const document = createDocument(4)
     document.nodes = [{
       id: 'web-1', kind: 'webview', title: '首页原型', position: { x: 0, y: 0 },
       prototypeId: 'prototype-1', contentRevision: 1, devicePreset: 'desktop',
     }, {
       id: 'image-1', kind: 'image', title: '首页视觉', position: { x: 100, y: 0 },
-      imageModuleId: 'image-module-1',
+      imageModuleId: 'image-module-1', adoptedAssetId: 'asset-a',
     }]
     const context = createContext({
       enableToolProviderRuntime: true,
@@ -3449,11 +3488,15 @@ describe('原生 Canvas 文档 IPC', () => {
         explicitReferences: [], permissionCeiling: 'execute',
       })
       const read = run.piCustomTools.find((candidate) => candidate.name === 'canvas_read')
+      const inspectImages = run.piCustomTools.find((candidate) => candidate.name === 'canvas_inspect_images')
       const update = run.piCustomTools.find((candidate) => candidate.name === 'canvas_update_artifact')
-      if (!read || !update) throw new Error('Canvas 产物工具未注册')
+      if (!read || !inspectImages || !update) throw new Error('Canvas 产物工具未注册')
 
       const readResult = await read.execute('tool-read-1', {
         canvasId: 'canvas-1', nodeIds: ['web-1', 'image-1'],
+      } as never, undefined as never, undefined as never, undefined as never)
+      const inspectResult = await inspectImages.execute('tool-inspect-1', {
+        canvasId: 'canvas-1', nodeIds: ['image-1'], expectedRevision: 4,
       } as never, undefined as never, undefined as never, undefined as never)
       const updateResult = await update.execute('tool-update-1', {
         canvasId: 'canvas-1', nodeId: 'web-1', baseRevision: 4,
@@ -3470,6 +3513,8 @@ describe('原生 Canvas 文档 IPC', () => {
           { node: { id: 'image-1' }, artifact: { currentRevision: 3 } },
         ],
       })
+      expect(inspectResult.content.map((block) => block.type)).toEqual(['text', 'image'])
+      expect(inspectResult.details).toMatchObject({ inspections: [{ nodeId: 'image-1', status: 'ready' }] })
       expect(updateResult.details).toMatchObject({ nodeId: 'web-1', contentRevision: 2 })
       expect(imageUpdateResult.details).toMatchObject({
         nodeId: 'image-1', contentRevision: 4, requiresRun: true,

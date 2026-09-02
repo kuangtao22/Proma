@@ -44,6 +44,7 @@ import type {
   FileOrFolderDialogResult,
   RecentMessagesResult,
   MessageSearchResult,
+  SessionMessageSearchResponse,
   AgentSessionMeta,
   AgentActiveSessionSnapshot,
   SetAgentSessionActiveWorktreeInput,
@@ -122,6 +123,7 @@ import type {
   AgentQueuedMessageControlInput,
   AgentMoveQueuedMessageInput,
   AgentQueuedMessageStatus,
+  AgentQueuedMessageSnapshot,
   PendingRequestsSnapshot,
   VaultCandidate,
   VaultDeleteInput,
@@ -129,6 +131,7 @@ import type {
   VaultFocus,
   VaultReadResult,
   VaultRenameInput,
+  VaultSavePastedImageInput,
   VaultSummary,
   VaultWriteInput,
   VaultWriteResult,
@@ -363,6 +366,9 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   /** 获取对话最近 N 条消息（分页加载） */
   getRecentMessages: (id: string, limit: number) => Promise<RecentMessagesResult>
 
+  /** 获取指定消息附近的有限窗口，供搜索定位 */
+  getConversationMessagesAround: (id: string, messageId: string, radius?: number) => Promise<ChatMessage[]>
+
   /** 更新对话标题 */
   updateConversationTitle: (id: string, title: string) => Promise<ConversationMeta>
 
@@ -378,8 +384,11 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   /** 切换对话归档状态 */
   toggleArchiveConversation: (id: string) => Promise<ConversationMeta>
 
-  /** 搜索对话消息内容 */
+  /** 搜索全部对话消息内容 */
   searchConversationMessages: (query: string) => Promise<MessageSearchResult[]>
+
+  /** 搜索当前对话完整持久化历史（仅返回命中元数据） */
+  searchConversationSessionMessages: (conversationId: string, query: string) => Promise<SessionMessageSearchResponse>
 
   // ===== 教程 =====
 
@@ -392,7 +401,7 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   // ===== 消息发送 =====
 
   /** 发送消息（触发 AI 流式响应） */
-  sendMessage: (input: ChatSendInput) => Promise<void>
+  sendMessage: (input: ChatSendInput) => Promise<boolean>
 
   /** 中止生成 */
   stopGeneration: (conversationId: string) => Promise<void>
@@ -493,6 +502,8 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   authorizeDiscoveredVault: (rootPath: string, options?: { inboxPath?: string; allowAgentWrites?: boolean }) => Promise<VaultSummary>
   listVaultFiles: () => Promise<VaultFileEntry[]>
   readVaultFile: (relativePath: string) => Promise<VaultReadResult>
+  resolveVaultMedia: (noteRelativePath: string, src: string) => Promise<import('@proma/shared').ResolvedFileUrl | null>
+  saveVaultPastedImage: (input: VaultSavePastedImageInput) => Promise<{ src: string } | null>
   writeVaultFile: (input: VaultWriteInput) => Promise<VaultWriteResult>
   createUntitledVaultFile: () => Promise<VaultWriteResult>
   createUntitledVaultFileInFolder: (folderPath: string) => Promise<VaultWriteResult>
@@ -575,8 +586,8 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   /** 获取归档会话数量，不返回归档元数据 */
   countArchivedAgentSessions: () => Promise<number>
 
-  /** 创建 Agent 会话 */
-  createAgentSession: (title?: string, channelId?: string, workspaceId?: string, modelId?: string) => Promise<AgentSessionMeta>
+  /** 创建 Agent 会话；草稿会话在首条消息发送前不会出现在侧栏。 */
+  createAgentSession: (title?: string, channelId?: string, workspaceId?: string, modelId?: string, isDraft?: boolean) => Promise<AgentSessionMeta>
 
   /** 获取当前主进程仍在执行的 Agent 会话，供 renderer 重载后恢复运行态 */
   listActiveAgentSessionSnapshots: () => Promise<AgentActiveSessionSnapshot[]>
@@ -657,6 +668,8 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   cancelAgentQueuedMessage: (input: AgentQueuedMessageControlInput) => Promise<boolean>
   moveAgentQueuedMessage: (input: AgentMoveQueuedMessageInput) => Promise<boolean>
   onAgentQueuedMessageStatus: (callback: (status: AgentQueuedMessageStatus) => void) => () => void
+  /** 获取主进程持有的 deferred queue 快照；用于 renderer 重载恢复队列 UI。 */
+  getQueuedAgentMessages: (sessionId: string) => Promise<AgentQueuedMessageSnapshot[]>
 
   // ===== Agent 工作区管理相关 =====
 
@@ -728,6 +741,9 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
 
   /** 获取工作区 Skills 目录绝对路径 */
   getWorkspaceSkillsDir: (workspaceSlug: string) => Promise<string>
+
+  /** 用系统文件管理器打开指定 Skill 的实际目录 */
+  openWorkspaceSkillFolder: (workspaceSlug: string, skillSlug: string) => Promise<void>
 
   /** 删除工作区 Skill */
   deleteWorkspaceSkill: (workspaceSlug: string, skillSlug: string) => Promise<void>
@@ -972,8 +988,11 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   /** 写入文本文件（供 Markdown 内联编辑使用） */
   writeTextFile: (filePath: string, content: string, access?: import('@proma/shared').FileAccessOptions) => Promise<boolean>
 
-  /** 仅解析文件路径（供 PDF/图片等用 proma-file:// 加载） */
+  // 仅解析文件路径（供 PDF/图片等用 proma-file:// 加载）
   resolveFilePath: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<import('@proma/shared').ResolvedFileUrl | null>
+
+  /** 解析当前 Markdown 同目录内的相对媒体文件（仅供 LiveMarkdown 图片使用） */
+  resolveMarkdownMedia: (markdownFilePath: string, src: string, access?: import('@proma/shared').FileAccessOptions) => Promise<import('@proma/shared').ResolvedFileUrl | null>
 
   /** 解析 HTML 预览路径，并授权加载同目录的相对资源 */
   resolveHtmlPreviewPath: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<import('@proma/shared').ResolvedFileUrl | null>
@@ -1585,6 +1604,10 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(CHAT_IPC_CHANNELS.GET_RECENT_MESSAGES, id, limit)
   },
 
+  getConversationMessagesAround: (id: string, messageId: string, radius?: number) => {
+    return ipcRenderer.invoke(CHAT_IPC_CHANNELS.GET_MESSAGES_AROUND, id, messageId, radius)
+  },
+
   updateConversationTitle: (id: string, title: string) => {
     return ipcRenderer.invoke(CHAT_IPC_CHANNELS.UPDATE_TITLE, id, title)
   },
@@ -1607,6 +1630,10 @@ const electronAPI: ElectronAPI = {
 
   searchConversationMessages: (query: string) => {
     return ipcRenderer.invoke(CHAT_IPC_CHANNELS.SEARCH_MESSAGES, query)
+  },
+
+  searchConversationSessionMessages: (conversationId: string, query: string) => {
+    return ipcRenderer.invoke(CHAT_IPC_CHANNELS.SEARCH_SESSION_MESSAGES, conversationId, query)
   },
 
   // 教程
@@ -1752,6 +1779,8 @@ const electronAPI: ElectronAPI = {
   authorizeDiscoveredVault: (rootPath: string, options?: { inboxPath?: string; allowAgentWrites?: boolean }) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.AUTHORIZE_CANDIDATE, rootPath, options),
   listVaultFiles: () => ipcRenderer.invoke(VAULT_IPC_CHANNELS.LIST_FILES),
   readVaultFile: (relativePath: string) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.READ_FILE, relativePath),
+  resolveVaultMedia: (noteRelativePath: string, src: string) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.RESOLVE_MEDIA, noteRelativePath, src),
+  saveVaultPastedImage: (input: VaultSavePastedImageInput) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.SAVE_PASTED_IMAGE, input),
   writeVaultFile: (input: VaultWriteInput) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.WRITE_FILE, input),
   createUntitledVaultFile: () => ipcRenderer.invoke(VAULT_IPC_CHANNELS.CREATE_UNTITLED_FILE),
   createUntitledVaultFileInFolder: (folderPath: string) => ipcRenderer.invoke(VAULT_IPC_CHANNELS.CREATE_UNTITLED_FILE_IN_FOLDER, folderPath),
@@ -1855,8 +1884,8 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.COUNT_ARCHIVED_SESSIONS)
   },
 
-  createAgentSession: (title?: string, channelId?: string, workspaceId?: string, modelId?: string) => {
-    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.CREATE_SESSION, title, channelId, workspaceId, modelId)
+  createAgentSession: (title?: string, channelId?: string, workspaceId?: string, modelId?: string, isDraft?: boolean) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.CREATE_SESSION, title, channelId, workspaceId, modelId, isDraft)
   },
 
   listActiveAgentSessionSnapshots: () => {
@@ -1965,6 +1994,9 @@ const electronAPI: ElectronAPI = {
   moveAgentQueuedMessage: (input: AgentMoveQueuedMessageInput) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.MOVE_QUEUED_MESSAGE, input)
   },
+  getQueuedAgentMessages: (sessionId: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_QUEUED_MESSAGES, sessionId)
+  },
   onAgentQueuedMessageStatus: (callback: (status: AgentQueuedMessageStatus) => void) => {
     const listener = (_: unknown, status: AgentQueuedMessageStatus): void => callback(status)
     ipcRenderer.on(AGENT_IPC_CHANNELS.QUEUED_MESSAGE_STATUS, listener)
@@ -2063,6 +2095,10 @@ const electronAPI: ElectronAPI = {
 
   getWorkspaceSkillsDir: (workspaceSlug: string) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_SKILLS_DIR, workspaceSlug)
+  },
+
+  openWorkspaceSkillFolder: (workspaceSlug: string, skillSlug: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.OPEN_SKILL_FOLDER, workspaceSlug, skillSlug)
   },
 
   deleteWorkspaceSkill: (workspaceSlug: string, skillSlug: string) => {
@@ -2451,6 +2487,10 @@ const electronAPI: ElectronAPI = {
 
   resolveFilePath: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => {
     return ipcRenderer.invoke('file:resolve-path', filePath, access) as Promise<import('@proma/shared').ResolvedFileUrl | null>
+  },
+
+  resolveMarkdownMedia: (markdownFilePath: string, src: string, access?: import('@proma/shared').FileAccessOptions) => {
+    return ipcRenderer.invoke('file:resolve-markdown-media', markdownFilePath, src, access) as Promise<import('@proma/shared').ResolvedFileUrl | null>
   },
 
   resolveHtmlPreviewPath: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => {

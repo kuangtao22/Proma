@@ -91,6 +91,7 @@ function CanvasNodeActivityOutline({ state }: { state: CanvasNodeActivityState }
           state === 'waiting-approval'
             ? 'stroke-primary'
             : 'stroke-primary [stroke-dasharray:8_6]',
+          state === 'queued' && 'canvas-queued-dash',
           state === 'running' && 'canvas-running-dash',
         )}
       />

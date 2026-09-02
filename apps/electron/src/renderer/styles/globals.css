@@ -578,14 +578,16 @@
 
 /* Windows 顶部标题栏与系统控制按钮。拖拽区和按钮组分属独立矩形，避免高 DPI 下的 hitmask 重叠。 */
 .window-titlebar {
+  --window-titlebar-controls-width: 138px;
   background-color: hsl(var(--background));
 }
-
 
 .window-controls {
   -webkit-app-region: no-drag;
   app-region: no-drag;
+  width: var(--window-titlebar-controls-width);
   height: 32px;
+  flex: 0 0 var(--window-titlebar-controls-width);
 }
 
 .window-control-btn {
@@ -2543,31 +2545,191 @@
   overflow-x: auto;
   padding: 0.9rem 0;
   text-align: center;
+  line-height: 1.2;
 }
+/* Match the Agent history's inline-block + baseline contract. CodeMirror's
+ * editor line-height must not leak into KaTeX's vlist/table positioning. */
 .live-markdown-editor .live-markdown-math-inline {
   display: inline-block;
-  vertical-align: -0.1em;
+  vertical-align: baseline;
+  line-height: 1.2;
+  white-space: nowrap;
 }
-.vault-ink-mde .vault-markdown-table table {
+.live-markdown-editor .live-markdown-math-inline .katex,
+.live-markdown-editor .live-markdown-math-block .katex {
+  font-size: 1.21em;
+  line-height: 1.2;
+}
+/* ink-mde has `.cm-line span { display: inline }`, whose specificity overrides
+ * KaTeX's structural span displays. Restore the KaTeX layout primitives inside
+ * widgets: vlist drives superscripts, fractions, roots, matrices and integrals. */
+.live-markdown-editor .ink-mde .cm-line .katex .base,
+.live-markdown-editor .ink-mde .cm-line .katex .strut,
+.live-markdown-editor .ink-mde .cm-line .katex .vlist > span > span,
+.live-markdown-editor .ink-mde .cm-line .katex .mfrac .frac-line,
+.live-markdown-editor .ink-mde .cm-line .katex .mspace,
+.live-markdown-editor .ink-mde .cm-line .katex .llap > .fix,
+.live-markdown-editor .ink-mde .cm-line .katex .rlap > .fix,
+.live-markdown-editor .ink-mde .cm-line .katex .clap > .fix,
+.live-markdown-editor .ink-mde .cm-line .katex .rule,
+.live-markdown-editor .ink-mde .cm-line .katex .overline .overline-line,
+.live-markdown-editor .ink-mde .cm-line .katex .underline .underline-line,
+.live-markdown-editor .ink-mde .cm-line .katex .hline,
+.live-markdown-editor .ink-mde .cm-line .katex .hdashline,
+.live-markdown-editor .ink-mde .cm-line .katex .nulldelimiter,
+.live-markdown-editor .ink-mde .cm-line .katex .mtable .vertical-separator,
+.live-markdown-editor .ink-mde .cm-line .katex .mtable .arraycolsep,
+.live-markdown-editor .ink-mde .cm-line .katex .cd-vert-arrow,
+.live-markdown-editor .ink-mde .cm-line .katex .cd-label-left,
+.live-markdown-editor .ink-mde .cm-line .katex .cd-label-right {
+  display: inline-block !important;
+}
+.live-markdown-editor .ink-mde .cm-line .katex .vlist-t {
+  display: inline-table !important;
+}
+.live-markdown-editor .ink-mde .cm-line .katex .vlist-r {
+  display: table-row !important;
+}
+.live-markdown-editor .ink-mde .cm-line .katex .vlist,
+.live-markdown-editor .ink-mde .cm-line .katex .vlist-s {
+  display: table-cell !important;
+}
+.live-markdown-editor .ink-mde .cm-line .katex .vlist > span,
+.live-markdown-editor .ink-mde .cm-line .katex .overlay,
+.live-markdown-editor .ink-mde .cm-line .katex .stretchy {
+  display: block !important;
+}
+.live-markdown-editor .ink-mde .cm-line .katex .vbox,
+.live-markdown-editor .ink-mde .cm-line .katex .hbox,
+.live-markdown-editor .ink-mde .cm-line .katex .thinbox {
+  display: inline-flex !important;
+}
+.live-markdown-editor .live-markdown-math-inline .katex .vlist,
+.live-markdown-editor .live-markdown-math-block .katex .vlist {
+  line-height: 1.2;
+}
+.live-markdown-editor .live-markdown-image {
+  display: inline-block;
+  max-width: 100%;
+  cursor: text;
+}
+.live-markdown-editor .live-markdown-image img {
+  display: block;
+  max-width: min(100%, 56rem);
+  max-height: 44rem;
+  border: 1px solid hsl(var(--border) / 0.38);
+  border-radius: 0.5rem;
+  background: hsl(var(--muted) / 0.2);
+  object-fit: contain;
+}
+.live-markdown-editor .live-markdown-raw-html-block {
+  display: block;
+  min-height: 1.625em;
+}
+.live-markdown-editor .live-markdown-raw-html-block center {
+  display: block;
+}
+.live-markdown-editor .live-markdown-autolink {
+  color: hsl(var(--primary));
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
+}
+.vault-ink-mde .vault-markdown-table table,
+.live-markdown-table-editor table {
   width: 100%;
   border-collapse: collapse;
+  table-layout: fixed;
   font-size: 0.94em;
 }
 .vault-ink-mde .vault-markdown-table th,
-.vault-ink-mde .vault-markdown-table td {
+.vault-ink-mde .vault-markdown-table td,
+.live-markdown-table-editor th,
+.live-markdown-table-editor td {
   border-bottom: 1px solid hsl(var(--border) / 0.55);
   padding: 0.5rem 0.7rem;
   text-align: left;
   vertical-align: top;
 }
-.vault-ink-mde .vault-markdown-table th {
+.vault-ink-mde .vault-markdown-table th,
+.live-markdown-table-editor th {
   background: hsl(var(--muted) / 0.45);
   color: hsl(var(--foreground));
   font-weight: 700;
 }
-.vault-ink-mde .vault-markdown-table td {
+.vault-ink-mde .vault-markdown-table td,
+.live-markdown-table-editor td {
   color: hsl(var(--foreground) / 0.88);
 }
+.live-markdown-table-editor-root {
+  display: block;
+  max-width: 100%;
+}
+.live-markdown-table-editor {
+  overflow-x: auto;
+  border-radius: 0.5rem;
+}
+.live-markdown-table-cell-trigger {
+  display: block;
+  width: calc(100% + 1.4rem);
+  min-height: 1.35rem;
+  margin: -0.5rem -0.7rem;
+  padding: 0.5rem 0.7rem;
+  border: 0;
+  border-radius: 0.25rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  text-align: inherit;
+  cursor: text;
+  transition: background-color 120ms ease;
+}
+.live-markdown-table-cell-trigger:hover {
+  background: hsl(var(--muted) / 0.58);
+}
+.live-markdown-table-cell-trigger:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+.live-markdown-table-editor .is-editing {
+  padding: 0.2rem 0.25rem;
+  background: hsl(var(--muted) / 0.38);
+}
+.live-markdown-table-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: 0.25rem;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  padding: 0.3rem 0.45rem;
+  font: inherit;
+  line-height: inherit;
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 0;
+}
+.live-markdown-table-value {
+  display: block;
+  min-height: 1.35rem;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.live-markdown-table-math {
+  display: inline-block;
+  vertical-align: baseline;
+  line-height: 1.2;
+}
+.live-markdown-table-math.is-display {
+  display: block;
+  overflow-x: auto;
+  padding-block: 0.15rem;
+}
+.live-markdown-table-editor .katex {
+  font-size: 1.06em;
+  line-height: 1.2;
+}
+
 .vault-ink-mde .vault-properties {
   display: block;
   box-sizing: border-box;
@@ -2576,12 +2738,23 @@
   padding: 1.5rem 0 1.95rem;
 }
 .vault-ink-mde .vault-properties-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
   margin: 0 0 0.8rem;
   color: hsl(var(--foreground));
   font-size: 1.15rem;
   font-weight: 600;
   letter-spacing: 0;
   line-height: 1.35;
+}
+.vault-ink-mde .vault-properties-count {
+  color: hsl(var(--muted-foreground) / 0.78);
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
 }
 .vault-ink-mde .vault-properties-list {
   display: flex;
@@ -2745,7 +2918,13 @@
   animation: canvas-running-dash-offset 1.2s linear infinite;
 }
 
+/* 排队态使用更慢的流动速度，让点击生成立即有反馈且不与真实运行混淆。 */
+.canvas-queued-dash {
+  animation: canvas-running-dash-offset 2.4s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .canvas-queued-dash,
   .canvas-running-dash {
     animation: none;
   }

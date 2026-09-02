@@ -27,7 +27,7 @@ function createFixture(options: {
     nodes: [
       { id: 'doc-1', kind: 'document', title: '需求', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 2 },
       { id: 'web-1', kind: 'webview', title: '原型', position: { x: 50, y: 0 }, prototypeId: 'prototype-1', contentRevision: 1, devicePreset: 'desktop' },
-      { id: 'image-1', kind: 'image', title: '主视觉', position: { x: 100, y: 0 }, imageModuleId: 'image-content-1' },
+      { id: 'image-1', kind: 'image', title: '主视觉', position: { x: 100, y: 0 }, imageModuleId: 'image-content-1', adoptedAssetId: 'asset-1' },
     ],
     edges: [{ id: 'edge-1', sourceNodeId: 'doc-1', sourcePort: 'output', targetNodeId: 'image-1', targetPort: 'input', relation: 'reference' }],
   }
@@ -46,6 +46,7 @@ function createFixture(options: {
   /** 图片配置保存调用记录。 */
   const imageSaveInputs: Array<Record<string, unknown>> = []
   let listCalls = 0
+  let thumbnailReadCalls = 0
   /** 返回当前 fixture 的隔离关联事实。 */
   const getBinding = (): AgentCanvasBinding => ({
     projectId: target.projectId, sessionId: 'session-1', linkedCanvasIds: [...linkedCanvasIds],
@@ -172,6 +173,12 @@ function createFixture(options: {
       },
     },
     images: {
+      loadConfig: async () => ({
+        schemaVersion: 2 as const, kind: 'image' as const, contentId: 'image-content-1', revision: 4,
+        createdAt: 1, updatedAt: 2, prompt: '旧提示词', selectedModelProfileId: 'model-1',
+        aspectRatio: '16:9' as const, imageSize: '2K' as const, contextMode: 'project' as const,
+        adoptedAssetId: 'asset-1',
+      }),
       load: async () => ({
         target: { ...target, nodeId: 'image-1', imageModuleId: 'image-content-1' },
         mediaLeaseId: 'lease-1',
@@ -191,6 +198,13 @@ function createFixture(options: {
           prompt: input.prompt, selectedModelProfileId: input.selectedModelProfileId,
           aspectRatio: input.aspectRatio, imageSize: input.imageSize, contextMode: input.contextMode,
           adoptedAssetId: 'asset-1',
+        }
+      },
+      readThumbnail: async () => {
+        thumbnailReadCalls += 1
+        return {
+          bytes: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lwqSmQAAAABJRU5ErkJggg==', 'base64'),
+          mediaType: 'image/png' as const,
         }
       },
     },
@@ -222,18 +236,21 @@ function createFixture(options: {
     dependencies, context, batchInputs, runInputs, runToolCallIds, artifactInputs,
     textUpdateInputs, imageSaveInputs,
     getListCalls: () => listCalls,
+    getThumbnailReadCalls: () => thumbnailReadCalls,
     getCreateCalls: () => createCalls,
     getLinkCalls: () => linkCalls,
   }
 }
 
 describe('普通 Agent Canvas Tool Provider', () => {
-  test('Given 普通分析运行 When 获取上下文 Then 注入七工具、Canvas Skill 路由与硬边界且不扫描全部画布', async () => {
+  test('Given 普通分析运行 When 获取上下文 Then 注入九工具、Canvas Skill 路由与硬边界且不扫描全部画布', async () => {
     const fixture = createFixture()
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
     expect(run.piCustomTools.map((tool) => tool.name)).toEqual([
       'canvas_get_context',
       'canvas_manage',
+      'canvas_list_nodes',
+      'canvas_inspect_images',
       'canvas_read',
       'canvas_apply_changes',
       'canvas_create_artifact',
@@ -262,6 +279,110 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(result.details).toMatchObject({ defaultCanvasId: 'canvas-1', activeCanvasId: 'canvas-2' })
     expect(JSON.stringify(result.details)).toContain('doc-1')
     expect(fixture.getListCalls()).toBe(0)
+  })
+
+  test('Given 已关联画布含多种节点 When 分页枚举图片 Then 只返回图片摘要且不泄露素材身份', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_list_nodes', {
+      canvasId: 'canvas-1', kind: 'image', limit: 1,
+    })
+
+    expect(result.details).toMatchObject({
+      canvasId: 'canvas-1', revision: 3, hasMore: false,
+      nodes: [{ nodeId: 'image-1', kind: 'image', title: '主视觉', configRevision: 4, hasAdoptedAsset: true }],
+    })
+    expect(JSON.stringify(result.details)).not.toContain('asset-1')
+  })
+
+  test('Given 有当前采用图片 When 按权威 revision 检查 Then 返回节点身份文本和紧邻图片块', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_inspect_images', {
+      canvasId: 'canvas-1', nodeIds: ['image-1', 'image-1'], expectedRevision: 3,
+    })
+
+    expect(result.content.map((block) => block.type)).toEqual(['text', 'image'])
+    expect(result.content[0]).toMatchObject({ type: 'text', text: expect.stringContaining('image-1') })
+    expect(result.details).toMatchObject({
+      canvasId: 'canvas-1', revision: 3,
+      inspections: [{ nodeId: 'image-1', title: '主视觉', status: 'ready' }],
+    })
+    expect(JSON.stringify(result.details)).not.toContain('asset-1')
+    expect(fixture.getThumbnailReadCalls()).toBe(1)
+  })
+
+  test('Given 枚举后画布 revision 改变 When 检查图片 Then 拒绝读取任何缩略图', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    await expect(executeTool(run.piCustomTools, 'canvas_inspect_images', {
+      canvasId: 'canvas-1', nodeIds: ['image-1'], expectedRevision: 2,
+    })).rejects.toThrow('CANVAS_REVISION_CONFLICT')
+    expect(fixture.getThumbnailReadCalls()).toBe(0)
+  })
+
+  test('Given 分页游标生成后画布变化 When 继续枚举 Then 明确 revision 冲突', async () => {
+    const fixture = createFixture()
+    let revision = 3
+    const baseDocument = fixture.dependencies.documents.load(target).document
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...baseDocument,
+        revision,
+        nodes: [
+          ...baseDocument.nodes,
+          { id: 'image-2', kind: 'image', title: '次视觉', position: { x: 150, y: 0 }, imageModuleId: 'image-content-2', adoptedAssetId: 'asset-1' },
+        ],
+      },
+      writable: true,
+      nodeIssues: [],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const firstPage = await executeTool(run.piCustomTools, 'canvas_list_nodes', {
+      canvasId: 'canvas-1', kind: 'image', limit: 1,
+    })
+    const cursor = (firstPage.details as { nextCursor: string }).nextCursor
+    revision = 4
+
+    await expect(executeTool(run.piCustomTools, 'canvas_list_nodes', {
+      canvasId: 'canvas-1', kind: 'image', limit: 1, cursor,
+    })).rejects.toThrow('CANVAS_REVISION_CONFLICT')
+  })
+
+  test('Given 节点与配置采用身份不一致或缩略图损坏 When 检查 Then fail closed 且不返回图片', async () => {
+    const fixture = createFixture()
+    const baseDocument = fixture.dependencies.documents.load(target).document
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...baseDocument,
+        nodes: baseDocument.nodes.map((node) => node.id === 'image-1'
+          ? { ...node, adoptedAssetId: 'asset-other' }
+          : node) as CanvasDocument['nodes'],
+      },
+      writable: true,
+      nodeIssues: [],
+    })
+    let run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    let result = await executeTool(run.piCustomTools, 'canvas_inspect_images', {
+      canvasId: 'canvas-1', nodeIds: ['image-1'], expectedRevision: 3,
+    })
+    expect(result.content.map((block) => block.type)).toEqual(['text'])
+    expect(result.details).toMatchObject({ inspections: [{ status: 'adopted-asset-mismatch' }] })
+    expect(fixture.getThumbnailReadCalls()).toBe(0)
+
+    fixture.dependencies.documents.load = () => ({ document: baseDocument, writable: true, nodeIssues: [] })
+    fixture.dependencies.images.readThumbnail = async () => ({
+      bytes: Buffer.from('not-an-image'), mediaType: 'image/png',
+    })
+    run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    result = await executeTool(run.piCustomTools, 'canvas_inspect_images', {
+      canvasId: 'canvas-1', nodeIds: ['image-1'], expectedRevision: 3,
+    })
+    expect(result.content.map((block) => block.type)).toEqual(['text'])
+    expect(result.details).toMatchObject({ inspections: [{ status: 'image-unavailable' }] })
   })
 
   test('Given Agent 更新已有 WebView When 调用 canvas_update_artifact Then 节点 ID 不变且 revision 增加', async () => {
@@ -468,7 +589,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(revoked.getLinkCalls()).toBe(0)
   })
 
-  test('Given 项目授权在运行后撤销 When 七工具 fresh execute Then 全部在 Store、batch 与 run 前拒绝', async () => {
+  test('Given 项目授权在运行后撤销 When 九工具 fresh execute Then 全部在 Store、batch 与 run 前拒绝', async () => {
     const cases: Array<{ name: string; args: Record<string, unknown> }> = [
       { name: 'canvas_get_context', args: {} },
       { name: 'canvas_manage', args: { action: 'create' } },
