@@ -63,6 +63,34 @@ export async function runCanvasDeleteAction({
   }
 }
 
+export interface SelectCanvasAfterArchiveInput {
+  /** 本次刚被归档的画布 ID。 */
+  archivedCanvasId: string
+  /** 当前 Agent 的默认画布 ID。 */
+  defaultCanvasId?: string
+  /** 当前 Agent 的画布关联顺序。 */
+  linkedCanvasIds: readonly string[]
+  /** 已包含本次归档结果的项目画布索引。 */
+  sessions: readonly CanvasSessionMeta[]
+}
+
+/** 当前画布归档后选择下一张未归档且仍存在的关联画布。 */
+export function selectCanvasAfterArchive(input: SelectCanvasAfterArchiveInput): CanvasSessionMeta | null {
+  /** 只保留仍存在、未归档且不是当前项的候选画布。 */
+  const available = new Map(input.sessions
+    .filter((session) => !session.archived && session.id !== input.archivedCanvasId)
+    .map((session) => [session.id, session]))
+  if (input.defaultCanvasId) {
+    const defaultCanvas = available.get(input.defaultCanvasId)
+    if (defaultCanvas) return defaultCanvas
+  }
+  for (const canvasId of input.linkedCanvasIds) {
+    const canvas = available.get(canvasId)
+    if (canvas) return canvas
+  }
+  return null
+}
+
 export interface PendingCanvasDelete {
   hostSessionId: string
   projectId: string
