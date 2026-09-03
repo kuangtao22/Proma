@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type { AgentCanvasBinding, CanvasSessionMeta } from '@proma/shared'
 import { createAgentCanvasViewKey } from '@/atoms/agent-canvas-atoms'
 import type { DesignAdapter } from '@/lib/design-adapter'
+import type { RightWorkspaceSplitState } from '@/lib/right-workspace-split'
 import {
   buildCanvasWorkspaceTabs,
   markAgentCanvasActive,
@@ -10,9 +11,12 @@ import {
 import {
   getCanvasDeleteFailureMessage,
   createCanvasDeleteLifecycle,
+  isCanvasWorkspaceTabStillCurrent,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
+  selectCanvasWorkspaceTabForPane,
   selectCanvasAfterArchive,
+  setAgentDefaultCanvas,
 } from './canvas-workspace-actions'
 
 /** 创建指定 Agent 的稳定 binding。 */
@@ -170,5 +174,74 @@ describe('Agent 右侧画布动态标签', () => {
       linkedCanvasIds: ['current'],
       sessions: [],
     })).toBeNull()
+  })
+
+  test('Given 未关联项目画布 When 设为默认 Then 先建立默认关联而不是调用仅限已关联项的 setter', async () => {
+    const calls: string[] = []
+    await setAgentDefaultCanvas({
+      binding: createBinding('agent-1', 'canvas-linked'),
+      canvasId: 'canvas-unlinked',
+      link: async (canvasId, makeDefault) => { calls.push(`link:${canvasId}:${String(makeDefault)}`) },
+      setDefault: async (canvasId) => { calls.push(`default:${canvasId}`) },
+    })
+
+    expect(calls).toEqual(['link:canvas-unlinked:true'])
+  })
+
+  test('Given Canvas IPC 在途期间焦点变化 When 指定原 Pane 打开标签 Then 使用最新 split 且只更新目标 Pane', async () => {
+    const split: RightWorkspaceSplitState = {
+      leftTab: 'canvas:canvas-left',
+      rightTab: 'files',
+      focusedPane: 'right',
+      ratio: 0.5,
+    }
+    expect(selectCanvasWorkspaceTabForPane(split, 'canvas:canvas-next', 'left')).toEqual({
+      ...split,
+      leftTab: 'canvas:canvas-next',
+      focusedPane: 'left',
+    })
+  })
+
+  test('Given 顶部菜单不承载画布管理 When 检查 SidePanel 入口 Then 零关联仍提供独立画布标签', async () => {
+    const source = await Bun.file(new URL('./SidePanel.tsx', import.meta.url)).text()
+
+    expect(source).toContain("id: 'canvas', label: '画布'")
+    expect(source).toContain('shouldShowCanvasWorkspaceLauncher')
+    expect(source).toContain('if (!split || !canvasRegistry.bindingReady) return')
+    expect(source).toContain('split?.focusedPane ?? null')
+  })
+
+  test('Given 归档请求在途时用户切换目标 Pane When 请求完成 Then 不再执行迟到回退', () => {
+    const changedSplit: RightWorkspaceSplitState = {
+      leftTab: 'files',
+      rightTab: 'changes',
+      focusedPane: 'left',
+      ratio: 0.5,
+    }
+
+    expect(isCanvasWorkspaceTabStillCurrent({
+      split: changedSplit,
+      activeTab: 'canvas:canvas-archived',
+      pane: 'left',
+      canvasId: 'canvas-archived',
+    })).toBe(false)
+    expect(isCanvasWorkspaceTabStillCurrent({
+      split: { ...changedSplit, rightTab: 'canvas:canvas-archived' },
+      activeTab: 'files',
+      pane: 'right',
+      canvasId: 'canvas-archived',
+    })).toBe(true)
+    expect(isCanvasWorkspaceTabStillCurrent({
+      split: null,
+      activeTab: 'canvas:canvas-archived',
+      pane: null,
+      canvasId: 'canvas-archived',
+    })).toBe(true)
+    expect(isCanvasWorkspaceTabStillCurrent({
+      split: null,
+      activeTab: 'canvas:canvas-archived',
+      pane: 'left',
+      canvasId: 'canvas-archived',
+    })).toBe(false)
   })
 })

@@ -61,12 +61,12 @@ describe('Canvas 工作区画布抽屉', () => {
     expect(pending.at(-1)).toBeNull()
     expect(openStates).toEqual([false])
 
-    expect(await runCanvasSidebarNavigationAction({
+    await expect(runCanvasSidebarNavigationAction({
       pendingAction: 'open:canvas-3',
       action: async () => { throw new Error('IPC_INTERNAL') },
       onPendingChange,
       onOpenChange,
-    })).toBe(false)
+    })).rejects.toThrow('IPC_INTERNAL')
     expect(pending.at(-1)).toBeNull()
     expect(openStates).toEqual([false])
   })

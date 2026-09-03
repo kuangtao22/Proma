@@ -22,6 +22,7 @@ import {
 import { designAdapter } from '@/lib/design-adapter'
 import type { DesignAdapter } from '@/lib/design-adapter'
 import { getCanvasWorkspaceTab, type AgentSidePanelTab } from '@/atoms/agent-atoms'
+import type { RightWorkspacePane } from '@/lib/right-workspace-split'
 import {
   mountNativeCanvasSessionView,
   NativeCanvasWorkspace,
@@ -56,9 +57,10 @@ export function buildCanvasWorkspaceTabs(
 ): CanvasWorkspaceTabDescriptor[] {
   if (!binding) return []
   const sessionsById = new Map(sessions.map((session) => [session.id, session]))
-  return binding.linkedCanvasIds.map((canvasId) => {
+  return binding.linkedCanvasIds.flatMap((canvasId) => {
     const session = sessionsById.get(canvasId)
-    return {
+    if (session?.archived) return []
+    return [{
       id: getCanvasWorkspaceTab(canvasId),
       canvasId,
       title: session?.title ?? '画布已删除',
@@ -66,8 +68,18 @@ export function buildCanvasWorkspaceTabs(
       isRecent: binding.lastActiveCanvasId === canvasId,
       activityRevision: activityStates.get(canvasId)?.activityRevision ?? 0,
       seenActivityRevision: activityStates.get(canvasId)?.seenActivityRevision ?? 0,
-    }
+    }]
   })
+}
+
+/** 没有可见关联画布时保留独立入口，避免管理抽屉随最后一个标签一起消失。 */
+export function shouldShowCanvasWorkspaceLauncher(
+  binding: AgentCanvasBinding | null,
+  sessions: readonly CanvasSessionMeta[],
+  bindingReady: boolean,
+): boolean {
+  if (!bindingReady) return false
+  return buildCanvasWorkspaceTabs(binding, sessions).length === 0
 }
 
 /** 活动代次严格超过已读代次时才展示提示。 */
@@ -132,10 +144,11 @@ export interface AgentCanvasWorkspaceRegistry {
   loading: boolean
   error: string | null
   canvasActivityStates: ReadonlyMap<string, AgentCanvasActivityState>
-  linkAndOpen: (canvasId: string, makeDefault?: boolean) => Promise<void>
+  link: (canvasId: string, makeDefault?: boolean) => Promise<boolean>
+  linkAndOpen: (canvasId: string, makeDefault?: boolean, pane?: RightWorkspacePane | null) => Promise<void>
   markActive: (canvasId: string) => Promise<void>
   markActivitySeen: (canvasId: string) => void
-  createAndOpen: () => Promise<void>
+  createAndOpen: (pane?: RightWorkspacePane | null) => Promise<void>
   unlink: (canvasId: string) => Promise<void>
   setDefault: (canvasId: string) => Promise<void>
 }
@@ -144,7 +157,7 @@ export interface AgentCanvasWorkspaceRegistry {
 export function useAgentCanvasWorkspaceRegistry(
   projectId: string | null,
   sessionId: string,
-  onOpenTab: (tab: AgentSidePanelTab) => void,
+  onOpenTab: (tab: AgentSidePanelTab, pane: RightWorkspacePane | null) => void,
 ): AgentCanvasWorkspaceRegistry {
   const sessionsByProject = useAtomValue(canvasSessionsByProjectAtom)
   const statusByProject = useAtomValue(canvasSessionStatusByProjectAtom)
@@ -181,17 +194,17 @@ export function useAgentCanvasWorkspaceRegistry(
       .then((bindings) => {
         if (!disposed && isCurrent() && !bindingEventReceived) {
           setBinding(bindings.find((item) => item.sessionId === sessionId) ?? null)
+          setBindingReady(true)
         }
       })
       .catch((cause: unknown) => {
-        if (!disposed && isCurrent()) {
+        if (!disposed && isCurrent() && !bindingEventReceived) {
           console.error('[CanvasWorkspaceAdapter] 加载画布关联失败:', cause)
           setError('画布关联加载失败')
         }
       })
       .finally(() => {
         if (!disposed && isCurrent()) setLoading(false)
-        if (!disposed && isCurrent()) setBindingReady(true)
       })
     const release = designAdapter.onAgentCanvasBindingChanged({ projectId, sessionId }, (event) => {
       bindingEventReceived = true
@@ -199,6 +212,7 @@ export function useAgentCanvasWorkspaceRegistry(
         setBinding(event.binding)
         setBindingReady(true)
         setLoading(false)
+        setError(null)
       }
     })
     return () => {
@@ -207,17 +221,27 @@ export function useAgentCanvasWorkspaceRegistry(
     }
   }, [isCurrent, projectId, sessionId])
 
-  const linkAndOpen = React.useCallback(async (canvasId: string, makeDefault = false): Promise<void> => {
-    if (!projectId) return
+  /** 建立或更新关联；只有当前 Hook 代次接管成功时返回 true。 */
+  const link = React.useCallback(async (canvasId: string, makeDefault = false): Promise<boolean> => {
+    if (!projectId || !bindingReady) return false
     try {
       const next = await designAdapter.linkAgentCanvas({ projectId, sessionId, canvasId, makeDefault })
-      if (!isCurrent()) return
+      if (!isCurrent()) return false
       setBinding(next)
-      onOpenTab(getCanvasWorkspaceTab(canvasId))
+      return true
     } catch (cause) {
       if (isCurrent()) throw cause
+      return false
     }
-  }, [isCurrent, onOpenTab, projectId, sessionId])
+  }, [bindingReady, isCurrent, projectId, sessionId])
+
+  const linkAndOpen = React.useCallback(async (
+    canvasId: string,
+    makeDefault = false,
+    pane: RightWorkspacePane | null = null,
+  ): Promise<void> => {
+    if (await link(canvasId, makeDefault)) onOpenTab(getCanvasWorkspaceTab(canvasId), pane)
+  }, [link, onOpenTab])
 
   /** 复用关联合同更新最近画布，不改变右侧工作区焦点。 */
   const markActive = React.useCallback(async (canvasId: string): Promise<void> => {
@@ -236,17 +260,17 @@ export function useAgentCanvasWorkspaceRegistry(
     markActivitySeenByKey(key)
   }, [isCurrent, markActivitySeenByKey, projectId, sessionId])
 
-  const createAndOpen = React.useCallback(async (): Promise<void> => {
-    if (!projectId) return
+  const createAndOpen = React.useCallback(async (pane: RightWorkspacePane | null = null): Promise<void> => {
+    if (!projectId || !bindingReady) return
     try {
       const created = await designAdapter.createCanvasSession({ projectId })
       if (!isCurrent()) return
       replaceSessions({ projectId, sessions: [created, ...sessions.filter((session) => session.id !== created.id)] })
-      await linkAndOpen(created.id, binding?.defaultCanvasId === undefined)
+      await linkAndOpen(created.id, binding?.defaultCanvasId === undefined, pane)
     } catch (cause) {
       if (isCurrent()) throw cause
     }
-  }, [binding?.defaultCanvasId, isCurrent, linkAndOpen, projectId, replaceSessions, sessions])
+  }, [binding?.defaultCanvasId, bindingReady, isCurrent, linkAndOpen, projectId, replaceSessions, sessions])
 
   const unlink = React.useCallback(async (canvasId: string): Promise<void> => {
     if (!projectId) return
@@ -259,14 +283,14 @@ export function useAgentCanvasWorkspaceRegistry(
   }, [isCurrent, projectId, sessionId])
 
   const setDefault = React.useCallback(async (canvasId: string): Promise<void> => {
-    if (!projectId) return
+    if (!projectId || !bindingReady) return
     try {
       const next = await designAdapter.setDefaultAgentCanvas({ projectId, sessionId, canvasId })
       if (isCurrent()) setBinding(next)
     } catch (cause) {
       if (isCurrent()) throw cause
     }
-  }, [isCurrent, projectId, sessionId])
+  }, [bindingReady, isCurrent, projectId, sessionId])
 
   const canvasActivityStates = React.useMemo(() => {
     const states = new Map<string, AgentCanvasActivityState>()
@@ -286,6 +310,7 @@ export function useAgentCanvasWorkspaceRegistry(
     loading,
     error: error ?? projectStatus?.error ?? null,
     canvasActivityStates,
+    link,
     linkAndOpen,
     markActive,
     markActivitySeen,
@@ -342,6 +367,8 @@ export interface CanvasWorkspaceAdapterProps {
   onToggleArchiveCanvas?: (session: CanvasSessionMeta) => Promise<boolean>
   /** 请求宿主打开共用的永久删除确认。 */
   onRequestDeleteCanvas?: (session: CanvasSessionMeta) => void
+  /** 当前 Adapter 所属 Pane 是否接收全局 Escape。 */
+  paneActive?: boolean
   /** 测试或宿主可替换旧 Design 内容；只有 legacy 分支才会调用。 */
   renderLegacyWorkspace?: () => React.ReactNode
   /** 测试或宿主可替换原生 Canvas；只有 native 分支才会调用。 */
@@ -354,6 +381,112 @@ export interface CanvasWorkspaceAdapterProps {
     headerTitle?: React.ReactNode
     headerActions?: React.ReactNode
   }) => React.ReactNode
+}
+
+export interface CanvasWorkspaceLauncherProps {
+  /** 当前项目的完整画布索引。 */
+  sessions: readonly CanvasSessionMeta[]
+  /** 当前 Agent 绑定的默认画布 ID。 */
+  defaultCanvasId?: string
+  /** 当前 Agent 按画布隔离的活动代次。 */
+  activityStates: ReadonlyMap<string, AgentCanvasActivityState>
+  /** registry 是否仍在加载。 */
+  loading: boolean
+  /** registry 的公开错误。 */
+  error: string | null
+  /** 当前 launcher 所属 Pane 是否接收 Escape。 */
+  paneActive: boolean
+  /** 新建并打开画布。 */
+  onCreateCanvas: () => Promise<boolean>
+  /** 打开或恢复指定画布。 */
+  onOpenCanvas: (session: CanvasSessionMeta) => Promise<boolean>
+  /** 设置当前 Agent 默认画布。 */
+  onSetDefaultCanvas: (session: CanvasSessionMeta) => Promise<boolean>
+  /** 归档或恢复指定画布。 */
+  onToggleArchiveCanvas: (session: CanvasSessionMeta) => Promise<boolean>
+  /** 请求宿主打开永久删除确认。 */
+  onRequestDeleteCanvas: (session: CanvasSessionMeta) => void
+}
+
+/** 零关联或只剩归档项时保留可达的 Canvas Pane 壳层。 */
+export function CanvasWorkspaceLauncher({
+  sessions,
+  defaultCanvasId,
+  activityStates,
+  loading,
+  error,
+  paneActive,
+  onCreateCanvas,
+  onOpenCanvas,
+  onSetDefaultCanvas,
+  onToggleArchiveCanvas,
+  onRequestDeleteCanvas,
+}: CanvasWorkspaceLauncherProps): React.ReactElement {
+  /** launcher 的抽屉状态只属于当前 Pane 实例。 */
+  const [sidebarOpen, setSidebarOpen] = React.useState(false)
+
+  React.useEffect(() => {
+    if (!paneActive || !sidebarOpen) return
+    /** 当前 Pane 激活时只关闭自己的抽屉。 */
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.defaultPrevented || event.key !== 'Escape') return
+      event.preventDefault()
+      setSidebarOpen(false)
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [paneActive, sidebarOpen])
+
+  return (
+    <TooltipProvider delayDuration={200} disableHoverableContent>
+      <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-content-area">
+        <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="打开画布列表"
+                onClick={() => setSidebarOpen(true)}
+              >
+                <PanelLeft className="size-3.5" aria-hidden="true" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>画布列表</TooltipContent>
+          </Tooltip>
+          <h1 className="min-w-0 flex-1 truncate px-2 text-sm font-medium text-foreground">画布</h1>
+        </header>
+        <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-center">
+          {error ? (
+            <p className="text-sm text-destructive">{error}</p>
+          ) : loading ? (
+            <p className="text-sm text-muted-foreground">正在加载画布...</p>
+          ) : (
+            <div className="flex flex-col items-center gap-3">
+              <Workflow className="size-7 text-muted-foreground" aria-hidden="true" />
+              <Button type="button" variant="outline" size="sm" onClick={() => setSidebarOpen(true)}>
+                打开画布列表
+              </Button>
+            </div>
+          )}
+        </div>
+        <CanvasWorkspaceSidebar
+          open={sidebarOpen}
+          currentCanvasId={null}
+          sessions={sessions}
+          defaultCanvasId={defaultCanvasId}
+          activityStates={activityStates}
+          onOpenChange={setSidebarOpen}
+          onCreateCanvas={onCreateCanvas}
+          onOpenCanvas={onOpenCanvas}
+          onSetDefaultCanvas={onSetDefaultCanvas}
+          onToggleArchiveCanvas={onToggleArchiveCanvas}
+          onRequestDeleteCanvas={onRequestDeleteCanvas}
+        />
+      </div>
+    </TooltipProvider>
+  )
 }
 
 export interface CanvasWorkspaceTitleSubmitResult {
@@ -386,7 +519,10 @@ export function resolveCanvasWorkspaceEscapeAction(input: {
   editingTitle: boolean
   sidebarOpen: boolean
   expanded: boolean
+  paneActive?: boolean
+  defaultPrevented?: boolean
 }): CanvasWorkspaceEscapeAction | null {
+  if (input.paneActive === false || input.defaultPrevented === true) return null
   if (input.editingTitle) return 'cancel-title'
   if (input.sidebarOpen) return 'close-sidebar'
   if (input.expanded) return 'exit-expanded'
@@ -412,6 +548,7 @@ export function CanvasWorkspaceAdapter({
   onSetDefaultCanvas = async () => false,
   onToggleArchiveCanvas = async () => false,
   onRequestDeleteCanvas = () => undefined,
+  paneActive = true,
   renderLegacyWorkspace,
   renderNativeWorkspace,
 }: CanvasWorkspaceAdapterProps): React.ReactElement {
@@ -445,10 +582,16 @@ export function CanvasWorkspaceAdapter({
   }, [session?.title])
 
   React.useEffect(() => {
-    if (!editingTitle && !sidebarOpen && !isExpanded) return
+    if (!paneActive || (!editingTitle && !sidebarOpen && !isExpanded)) return
     const handleKeyDown = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return
-      const action = resolveCanvasWorkspaceEscapeAction({ editingTitle, sidebarOpen, expanded: isExpanded })
+      const action = resolveCanvasWorkspaceEscapeAction({
+        editingTitle,
+        sidebarOpen,
+        expanded: isExpanded,
+        paneActive,
+        defaultPrevented: event.defaultPrevented,
+      })
       if (!action) return
       event.preventDefault()
       if (action === 'cancel-title') cancelTitleEdit()
@@ -457,7 +600,7 @@ export function CanvasWorkspaceAdapter({
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [cancelTitleEdit, editingTitle, isExpanded, setExpanded, sidebarOpen])
+  }, [cancelTitleEdit, editingTitle, isExpanded, paneActive, setExpanded, sidebarOpen])
 
   React.useEffect(() => {
     void reconcileMissingCanvas({

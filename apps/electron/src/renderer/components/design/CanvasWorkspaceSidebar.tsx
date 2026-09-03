@@ -45,7 +45,7 @@ export interface CanvasWorkspaceSidebarProps {
   /** 抽屉是否在当前 Canvas Pane 内打开。 */
   open: boolean
   /** 当前 Pane 正在展示的画布 ID。 */
-  currentCanvasId: string
+  currentCanvasId: string | null
   /** 当前项目的完整画布索引。 */
   sessions: readonly CanvasSessionMeta[]
   /** 当前 Agent 绑定的默认画布 ID。 */
@@ -64,6 +64,8 @@ export interface CanvasWorkspaceSidebarProps {
   onToggleArchiveCanvas: (session: CanvasSessionMeta) => Promise<boolean>
   /** 交给宿主打开共用的永久删除确认。 */
   onRequestDeleteCanvas: (session: CanvasSessionMeta) => void
+  /** 记录理论上已被宿主收口的非预期异常。 */
+  onUnexpectedError?: (context: string, error: unknown) => void
 }
 
 interface CanvasSidebarSessionRowProps {
@@ -115,8 +117,6 @@ export async function runCanvasSidebarNavigationAction({
     const succeeded = await action()
     if (succeeded) onOpenChange(false)
     return succeeded
-  } catch {
-    return false
   } finally {
     onPendingChange(null)
   }
@@ -214,6 +214,9 @@ export function CanvasWorkspaceSidebar({
   onSetDefaultCanvas,
   onToggleArchiveCanvas,
   onRequestDeleteCanvas,
+  onUnexpectedError = (context, error) => {
+    console.error(`[CanvasWorkspaceSidebar] ${context}出现非预期异常:`, error)
+  },
 }: CanvasWorkspaceSidebarProps): React.ReactElement | null {
   /** 抽屉内按公开归档事实分组的稳定列表。 */
   const groups = React.useMemo(() => groupCanvasWorkspaceSessions(sessions), [sessions])
@@ -235,8 +238,8 @@ export function CanvasWorkspaceSidebar({
       action: onCreateCanvas,
       onPendingChange: setPendingAction,
       onOpenChange,
-    })
-  }, [onCreateCanvas, onOpenChange])
+    }).catch((error: unknown) => onUnexpectedError('新建画布', error))
+  }, [onCreateCanvas, onOpenChange, onUnexpectedError])
 
   /** 打开画布；点击当前项只负责关闭，不产生重复绑定请求。 */
   const handleOpen = React.useCallback((session: CanvasSessionMeta): void => {
@@ -249,27 +252,31 @@ export function CanvasWorkspaceSidebar({
       action: () => onOpenCanvas(session),
       onPendingChange: setPendingAction,
       onOpenChange,
-    })
-  }, [currentCanvasId, onOpenCanvas, onOpenChange])
+    }).catch((error: unknown) => onUnexpectedError('打开画布', error))
+  }, [currentCanvasId, onOpenCanvas, onOpenChange, onUnexpectedError])
 
   /** 执行不主动关闭抽屉的行级管理动作。 */
   const runManagementAction = React.useCallback((
     actionId: CanvasSidebarPendingAction,
+    context: string,
     action: () => Promise<boolean>,
   ): void => {
     setPendingAction(actionId)
-    void action().catch(() => false).finally(() => setPendingAction(null))
-  }, [])
+    void action()
+      .catch((error: unknown) => onUnexpectedError(context, error))
+      .finally(() => setPendingAction(null))
+  }, [onUnexpectedError])
 
   /** 把指定未归档画布设为默认。 */
   const handleSetDefault = React.useCallback((session: CanvasSessionMeta): void => {
-    runManagementAction(`default:${session.id}`, () => onSetDefaultCanvas(session))
+    runManagementAction(`default:${session.id}`, '设置默认画布', () => onSetDefaultCanvas(session))
   }, [onSetDefaultCanvas, runManagementAction])
 
   /** 归档或恢复指定画布；当前项回退由 SidePanel 宿主处理。 */
   const handleToggleArchive = React.useCallback((session: CanvasSessionMeta): void => {
     runManagementAction(
       `${session.archived ? 'restore' : 'archive'}:${session.id}`,
+      session.archived ? '恢复画布' : '归档画布',
       () => onToggleArchiveCanvas(session),
     )
   }, [onToggleArchiveCanvas, runManagementAction])

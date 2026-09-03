@@ -142,8 +142,10 @@ import {
 import type { RightWorkspacePane, RightWorkspaceSplitState } from '@/lib/right-workspace-split'
 import {
   buildCanvasWorkspaceTabs,
+  CanvasWorkspaceLauncher,
   CanvasWorkspaceAdapter,
   isAgentCanvasActivityUnread,
+  shouldShowCanvasWorkspaceLauncher,
   useAgentCanvasWorkspaceRegistry,
 } from '@/components/design/CanvasWorkspaceAdapter'
 import { designAdapter } from '@/lib/design-adapter'
@@ -151,9 +153,12 @@ import { removeCanvasSessionAtom, upsertCanvasSessionAtom } from '@/atoms/canvas
 import {
   CANVAS_WORKSPACE_FAILURE_MESSAGES,
   createCanvasDeleteLifecycle,
+  isCanvasWorkspaceTabStillCurrent,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
+  selectCanvasWorkspaceTabForPane,
   selectCanvasAfterArchive,
+  setAgentDefaultCanvas,
 } from './canvas-workspace-actions'
 import type { PendingCanvasDelete } from './canvas-workspace-actions'
 
@@ -914,6 +919,9 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const split = splitMap.get(sessionId) ?? null
   const splitMapRef = React.useRef(splitMap)
   splitMapRef.current = splitMap
+  /** 非分屏异步动作使用最新活动标签复核归属，避免迟到结果覆盖用户切换。 */
+  const effectiveActiveTabRef = React.useRef(effectiveActiveTab)
+  effectiveActiveTabRef.current = effectiveActiveTab
   const savedSplitRatio = clampRightWorkspaceSplitRatio(splitRatioMap[sessionId] ?? 0.5)
 
   const updateSplit = React.useCallback((next: RightWorkspaceSplitState | null) => {
@@ -1185,10 +1193,26 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     flushBrowserTabSelection()
   }, [flushBrowserTabSelection, onTabChange, previewFiles, sessionId, setPreviewFileMap, sideChatConversationId, sideDelegationSessionIds, sideTemporaryAgents, split, updateSplit])
 
+  /** Canvas 异步动作按发起 Pane 写入最新 split，避免依赖请求返回时的焦点。 */
+  const handleCanvasWorkspaceTabChange = React.useCallback((
+    tab: AgentSidePanelTab,
+    pane: RightWorkspacePane | null,
+  ): void => {
+    setSplitMap((previous) => {
+      const current = previous.get(sessionId) ?? null
+      const nextSplit = selectCanvasWorkspaceTabForPane(current, tab, pane)
+      if (!nextSplit || nextSplit === current) return previous
+      const next = new Map(previous)
+      next.set(sessionId, nextSplit)
+      return next
+    })
+    onTabChange(tab)
+  }, [onTabChange, sessionId, setSplitMap])
+
   const canvasRegistry = useAgentCanvasWorkspaceRegistry(
     currentWorkspaceId,
     sessionId,
-    handleWorkspaceTabChange,
+    handleCanvasWorkspaceTabChange,
   )
   const upsertCanvasSession = useSetAtom(upsertCanvasSessionAtom)
   const removeCanvasSession = useSetAtom(removeCanvasSessionAtom)
@@ -1220,7 +1244,11 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const activeCanvasId = parseCanvasWorkspaceTab(focusedWorkspaceTab)
 
   /** 归档画布从菜单打开时先复用既有恢复合同，再建立当前 Agent 关联。 */
-  const handleOpenCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<boolean> => {
+  const handleOpenCanvas = React.useCallback(async (
+    canvas: CanvasSessionMeta,
+    pane: RightWorkspacePane | null,
+  ): Promise<boolean> => {
+    if (!canvasRegistry.bindingReady) return false
     const result = await runCanvasWorkspaceAction({
       action: async () => {
         let visibleCanvas = canvas
@@ -1235,6 +1263,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
         await canvasRegistry.linkAndOpen(
           visibleCanvas.id,
           canvasRegistry.binding?.defaultCanvasId === undefined,
+          pane,
         )
       },
       failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.open,
@@ -1246,16 +1275,17 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   }, [canvasRegistry, reportCanvasActionError, showCanvasActionError, upsertCanvasSession])
 
   /** 新建与关联作为一个用户动作收口，任一 IPC 失败都只显示固定提示。 */
-  const handleCreateCanvas = React.useCallback(async (): Promise<boolean> => {
+  const handleCreateCanvas = React.useCallback(async (pane: RightWorkspacePane | null): Promise<boolean> => {
+    if (!canvasRegistry.bindingReady) return false
     const result = await runCanvasWorkspaceAction({
-      action: canvasRegistry.createAndOpen,
+      action: () => canvasRegistry.createAndOpen(pane),
       failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.create,
       logContext: '新建画布',
       onErrorMessage: showCanvasActionError,
       onLogError: reportCanvasActionError,
     })
     return result !== null
-  }, [canvasRegistry.createAndOpen, reportCanvasActionError, showCanvasActionError])
+  }, [canvasRegistry.bindingReady, canvasRegistry.createAndOpen, reportCanvasActionError, showCanvasActionError])
 
   const handleRenameCanvas = React.useCallback(async (
     canvas: CanvasSessionMeta,
@@ -1279,17 +1309,27 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   }, [reportCanvasActionError, showCanvasActionError, upsertCanvasSession])
 
   const handleSetDefaultCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<boolean> => {
+    if (!canvasRegistry.bindingReady) return false
     const result = await runCanvasWorkspaceAction({
-      action: () => canvasRegistry.setDefault(canvas.id),
+      action: () => setAgentDefaultCanvas({
+        binding: canvasRegistry.binding,
+        canvasId: canvas.id,
+        link: canvasRegistry.link,
+        setDefault: canvasRegistry.setDefault,
+      }),
       failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.setDefault,
       logContext: '设置默认画布',
       onErrorMessage: showCanvasActionError,
       onLogError: reportCanvasActionError,
     })
     return result !== null
-  }, [canvasRegistry.setDefault, reportCanvasActionError, showCanvasActionError])
+  }, [canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.link, canvasRegistry.setDefault, reportCanvasActionError, showCanvasActionError])
 
-  const handleToggleArchiveCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<boolean> => {
+  const handleToggleArchiveCanvas = React.useCallback(async (
+    canvas: CanvasSessionMeta,
+    pane: RightWorkspacePane | null,
+    paneCanvasId: string | null,
+  ): Promise<boolean> => {
     const updated = await runCanvasWorkspaceAction({
       action: () => designAdapter.updateCanvasSession({
         projectId: canvas.projectId,
@@ -1306,7 +1346,13 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     if (!updated) return false
     upsertCanvasSession(updated)
     toast.success(updated.archived ? '画布已归档' : '画布已恢复')
-    if (!updated.archived || activeCanvasId !== canvas.id) return true
+    if (!updated.archived || paneCanvasId !== canvas.id) return true
+    if (!isCanvasWorkspaceTabStillCurrent({
+      split: splitMapRef.current.get(sessionId) ?? null,
+      activeTab: effectiveActiveTabRef.current,
+      pane,
+      canvasId: canvas.id,
+    })) return true
 
     /** 使用刚完成的权威归档结果替换本地列表，避免回退选中已归档项。 */
     const nextSessions = canvasRegistry.sessions.map((item) => item.id === updated.id ? updated : item)
@@ -1317,11 +1363,11 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       sessions: nextSessions,
     })
     if (!fallback) {
-      returnToPreviousTabAfterClose(getCanvasWorkspaceTab(canvas.id))
+      handleCanvasWorkspaceTabChange('canvas', pane)
       return true
     }
     const fallbackResult = await runCanvasWorkspaceAction({
-      action: () => canvasRegistry.linkAndOpen(fallback.id, false),
+      action: () => canvasRegistry.linkAndOpen(fallback.id, false, pane),
       failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.open,
       logContext: '归档后打开回退画布',
       onErrorMessage: showCanvasActionError,
@@ -1329,13 +1375,13 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     })
     return fallbackResult !== null
   }, [
-    activeCanvasId,
     canvasRegistry.binding?.defaultCanvasId,
     canvasRegistry.binding?.linkedCanvasIds,
     canvasRegistry.linkAndOpen,
     canvasRegistry.sessions,
+    handleCanvasWorkspaceTabChange,
     reportCanvasActionError,
-    returnToPreviousTabAfterClose,
+    sessionId,
     showCanvasActionError,
     upsertCanvasSession,
   ])
@@ -1486,6 +1532,13 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const workspaceTabs = React.useMemo<WorkspacePanelTab[]>(() => [
     { id: 'files', label: '文件', icon: <FolderOpen className="size-3.5" /> },
     { id: 'changes', label: '改动', icon: <FileDiff className="size-3.5" /> },
+    ...(currentWorkspaceId && shouldShowCanvasWorkspaceLauncher(
+      canvasRegistry.binding,
+      canvasRegistry.sessions,
+      canvasRegistry.bindingReady,
+    )
+      ? [{ id: 'canvas', label: '画布', icon: <Workflow className="size-3.5" /> } as const]
+      : []),
     ...canvasWorkspaceTabs.map((canvas) => ({
       id: canvas.id,
       label: canvas.title,
@@ -1543,17 +1596,17 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       closable: true,
       activity: showBrowserActivity && activeBrowserTabId !== tab.tabId && browserState.activeTabId === tab.tabId,
     })) ?? []),
-  ], [activeBrowserTabId, browserState, canvasWorkspaceTabs, previewFiles, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideDelegationSessionIds, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
+  ], [activeBrowserTabId, browserState, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.sessions, canvasWorkspaceTabs, currentWorkspaceId, previewFiles, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideDelegationSessionIds, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
   workspaceTabsRef.current = workspaceTabs
 
   React.useEffect(() => {
-    if (!split) return
+    if (!split || !canvasRegistry.bindingReady) return
     const availableTabs = new Set<AgentSidePanelTab>(workspaceTabs.map((tab) => tab.id))
     const resolution = sanitizeRightWorkspaceSplit(split, availableTabs)
     if (resolution.split === split && resolution.activeTab === effectiveActiveTab) return
     updateSplit(resolution.split)
     if (resolution.activeTab !== effectiveActiveTab) onTabChange(resolution.activeTab)
-  }, [effectiveActiveTab, onTabChange, split, updateSplit, workspaceTabs])
+  }, [canvasRegistry.bindingReady, effectiveActiveTab, onTabChange, split, updateSplit, workspaceTabs])
 
   const exitSplitInsteadOfClosingBoundTab = React.useCallback((tab: AgentSidePanelTab): boolean => {
     const currentSplit = splitMapRef.current.get(sessionId) ?? null
@@ -1768,7 +1821,12 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     )
   }
 
-  const renderWorkspaceTabContent = (paneTab: AgentSidePanelTab, paneWidth: number): React.ReactNode => {
+  const renderWorkspaceTabContent = (
+    paneTab: AgentSidePanelTab,
+    paneWidth: number,
+    pane: RightWorkspacePane | null,
+    paneActive: boolean,
+  ): React.ReactNode => {
     const paneCanvasId = parseCanvasWorkspaceTab(paneTab)
     const panePreviewId = getPreviewIdFromSidePanelTab(paneTab)
     const panePreviewFile = (panePreviewId ? previewFiles.find((file) => getPreviewFileId(file) === panePreviewId) : null)
@@ -1795,6 +1853,24 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     const hasVisibleSessionAttachedItems = showSessionFiles && hasSessionAttachedItems
     const hasVisibleWorkspaceAttachedItems = showProjectFiles && hasWorkspaceAttachedItems
 
+    if (paneTab === 'canvas' && currentWorkspaceId) {
+      return (
+        <CanvasWorkspaceLauncher
+          sessions={canvasRegistry.sessions}
+          defaultCanvasId={canvasRegistry.binding?.defaultCanvasId}
+          activityStates={canvasRegistry.canvasActivityStates}
+          loading={canvasRegistry.loading}
+          error={canvasRegistry.error}
+          paneActive={paneActive}
+          onCreateCanvas={() => handleCreateCanvas(pane)}
+          onOpenCanvas={(canvas) => handleOpenCanvas(canvas, pane)}
+          onSetDefaultCanvas={handleSetDefaultCanvas}
+          onToggleArchiveCanvas={(canvas) => handleToggleArchiveCanvas(canvas, pane, null)}
+          onRequestDeleteCanvas={handleRequestDeleteCanvas}
+        />
+      )
+    }
+
     if (paneCanvasId && currentWorkspaceId) {
       const canvasSession = canvasRegistry.sessions.find((canvas) => canvas.id === paneCanvasId) ?? null
       return (
@@ -1811,12 +1887,13 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
             sessions={canvasRegistry.sessions}
             defaultCanvasId={canvasRegistry.binding?.defaultCanvasId}
             activityStates={canvasRegistry.canvasActivityStates}
-            onCreateCanvas={handleCreateCanvas}
-            onOpenCanvas={handleOpenCanvas}
+            onCreateCanvas={() => handleCreateCanvas(pane)}
+            onOpenCanvas={(canvas) => handleOpenCanvas(canvas, pane)}
             onRenameCanvas={handleRenameCanvas}
             onSetDefaultCanvas={handleSetDefaultCanvas}
-            onToggleArchiveCanvas={handleToggleArchiveCanvas}
+            onToggleArchiveCanvas={(canvas) => handleToggleArchiveCanvas(canvas, pane, paneCanvasId)}
             onRequestDeleteCanvas={handleRequestDeleteCanvas}
+            paneActive={paneActive}
           />
         </div>
       )
@@ -2011,8 +2088,14 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
         className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-content-area"
         aria-label={`${pane === 'left' ? '左侧' : '右侧'} Pane：${tab}`}
         onPointerDownCapture={() => handleFocusPane(pane)}
+        onFocusCapture={() => handleFocusPane(pane)}
       >
-        <MeasuredWorkspacePane>{(paneWidth) => renderWorkspaceTabContent(tab, paneWidth)}</MeasuredWorkspacePane>
+        <MeasuredWorkspacePane>{(paneWidth) => renderWorkspaceTabContent(
+          tab,
+          paneWidth,
+          pane,
+          split?.focusedPane === pane,
+        )}</MeasuredWorkspacePane>
       </section>
     )
   }
@@ -2088,6 +2171,8 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
               <MeasuredWorkspacePane>{(paneWidth) => renderWorkspaceTabContent(
                 split ? getFocusedRightWorkspaceTab(split) : effectiveActiveTab,
                 paneWidth,
+                split?.focusedPane ?? null,
+                true,
               )}</MeasuredWorkspacePane>
             )}
 
