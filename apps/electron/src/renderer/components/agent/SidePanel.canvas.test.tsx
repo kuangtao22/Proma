@@ -12,6 +12,7 @@ import {
   createCanvasDeleteLifecycle,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
+  selectCanvasAfterArchive,
 } from './canvas-workspace-actions'
 
 /** 创建指定 Agent 的稳定 binding。 */
@@ -144,5 +145,30 @@ describe('Agent 右侧画布动态标签', () => {
     expect(operation).not.toBeNull()
     expect(retriedOperation?.generation).toBeGreaterThan(operation!.generation)
     expect(lifecycle.isOperationCurrent(operation!)).toBe(false)
+  })
+
+  test('Given 当前画布被归档 When 选择回退 Then 默认优先、关联顺序次之、无可用返回 null', () => {
+    /** 构造可用于回退的未归档画布。 */
+    const sessions: CanvasSessionMeta[] = [
+      { id: 'default', projectId: 'project-1', title: '默认', archived: false, createdAt: 1, updatedAt: 1 },
+      { id: 'recent', projectId: 'project-1', title: '最近', archived: false, createdAt: 1, updatedAt: 1 },
+    ]
+
+    expect(selectCanvasAfterArchive({
+      archivedCanvasId: 'current',
+      defaultCanvasId: 'default',
+      linkedCanvasIds: ['current', 'recent', 'default'],
+      sessions,
+    })?.id).toBe('default')
+    expect(selectCanvasAfterArchive({
+      archivedCanvasId: 'current',
+      linkedCanvasIds: ['current', 'recent'],
+      sessions,
+    })?.id).toBe('recent')
+    expect(selectCanvasAfterArchive({
+      archivedCanvasId: 'current',
+      linkedCanvasIds: ['current'],
+      sessions: [],
+    })).toBeNull()
   })
 })

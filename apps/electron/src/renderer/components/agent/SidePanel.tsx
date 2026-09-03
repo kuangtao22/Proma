@@ -78,6 +78,7 @@ import {
 import {
   getBrowserSidePanelTab,
   getBrowserTabIdFromSidePanelTab,
+  getCanvasWorkspaceTab,
   getDelegationSessionIdFromSidePanelTab,
   getDelegationSidePanelTab,
   getExplorationSessionIdFromSidePanelTab,
@@ -152,6 +153,7 @@ import {
   createCanvasDeleteLifecycle,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
+  selectCanvasAfterArchive,
 } from './canvas-workspace-actions'
 import type { PendingCanvasDelete } from './canvas-workspace-actions'
 
@@ -1212,10 +1214,14 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     ),
     [canvasRegistry.binding, canvasRegistry.canvasActivityStates, canvasRegistry.sessions],
   )
+  /** 当前有焦点的工作区标签，用于归档当前画布后的确定性回退。 */
+  const focusedWorkspaceTab = split ? getFocusedRightWorkspaceTab(split) : effectiveActiveTab
+  /** 当前有焦点的画布 ID；非画布标签返回 null。 */
+  const activeCanvasId = parseCanvasWorkspaceTab(focusedWorkspaceTab)
 
   /** 归档画布从菜单打开时先复用既有恢复合同，再建立当前 Agent 关联。 */
-  const handleOpenCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<void> => {
-    await runCanvasWorkspaceAction({
+  const handleOpenCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<boolean> => {
+    const result = await runCanvasWorkspaceAction({
       action: async () => {
         let visibleCanvas = canvas
         if (canvas.archived) {
@@ -1236,24 +1242,26 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       onErrorMessage: showCanvasActionError,
       onLogError: reportCanvasActionError,
     })
+    return result !== null
   }, [canvasRegistry, reportCanvasActionError, showCanvasActionError, upsertCanvasSession])
 
   /** 新建与关联作为一个用户动作收口，任一 IPC 失败都只显示固定提示。 */
-  const handleCreateCanvas = React.useCallback(async (): Promise<void> => {
-    await runCanvasWorkspaceAction({
+  const handleCreateCanvas = React.useCallback(async (): Promise<boolean> => {
+    const result = await runCanvasWorkspaceAction({
       action: canvasRegistry.createAndOpen,
       failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.create,
       logContext: '新建画布',
       onErrorMessage: showCanvasActionError,
       onLogError: reportCanvasActionError,
     })
+    return result !== null
   }, [canvasRegistry.createAndOpen, reportCanvasActionError, showCanvasActionError])
 
   const handleRenameCanvas = React.useCallback(async (
     canvas: CanvasSessionMeta,
     title: string,
-  ): Promise<void> => {
-    await runCanvasWorkspaceAction({
+  ): Promise<boolean> => {
+    const result = await runCanvasWorkspaceAction({
       action: async () => {
         const updated = await designAdapter.updateCanvasSession({
           projectId: canvas.projectId,
@@ -1267,19 +1275,21 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       onErrorMessage: showCanvasActionError,
       onLogError: reportCanvasActionError,
     })
+    return result !== null
   }, [reportCanvasActionError, showCanvasActionError, upsertCanvasSession])
 
-  const handleSetDefaultCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<void> => {
-    await runCanvasWorkspaceAction({
+  const handleSetDefaultCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<boolean> => {
+    const result = await runCanvasWorkspaceAction({
       action: () => canvasRegistry.setDefault(canvas.id),
       failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.setDefault,
       logContext: '设置默认画布',
       onErrorMessage: showCanvasActionError,
       onLogError: reportCanvasActionError,
     })
+    return result !== null
   }, [canvasRegistry.setDefault, reportCanvasActionError, showCanvasActionError])
 
-  const handleToggleArchiveCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<void> => {
+  const handleToggleArchiveCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<boolean> => {
     const updated = await runCanvasWorkspaceAction({
       action: () => designAdapter.updateCanvasSession({
         projectId: canvas.projectId,
@@ -1293,10 +1303,48 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       onErrorMessage: showCanvasActionError,
       onLogError: reportCanvasActionError,
     })
-    if (!updated) return
+    if (!updated) return false
     upsertCanvasSession(updated)
     toast.success(updated.archived ? '画布已归档' : '画布已恢复')
-  }, [reportCanvasActionError, showCanvasActionError, upsertCanvasSession])
+    if (!updated.archived || activeCanvasId !== canvas.id) return true
+
+    /** 使用刚完成的权威归档结果替换本地列表，避免回退选中已归档项。 */
+    const nextSessions = canvasRegistry.sessions.map((item) => item.id === updated.id ? updated : item)
+    const fallback = selectCanvasAfterArchive({
+      archivedCanvasId: canvas.id,
+      defaultCanvasId: canvasRegistry.binding?.defaultCanvasId,
+      linkedCanvasIds: canvasRegistry.binding?.linkedCanvasIds ?? [],
+      sessions: nextSessions,
+    })
+    if (!fallback) {
+      returnToPreviousTabAfterClose(getCanvasWorkspaceTab(canvas.id))
+      return true
+    }
+    const fallbackResult = await runCanvasWorkspaceAction({
+      action: () => canvasRegistry.linkAndOpen(fallback.id, false),
+      failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.open,
+      logContext: '归档后打开回退画布',
+      onErrorMessage: showCanvasActionError,
+      onLogError: reportCanvasActionError,
+    })
+    return fallbackResult !== null
+  }, [
+    activeCanvasId,
+    canvasRegistry.binding?.defaultCanvasId,
+    canvasRegistry.binding?.linkedCanvasIds,
+    canvasRegistry.linkAndOpen,
+    canvasRegistry.sessions,
+    reportCanvasActionError,
+    returnToPreviousTabAfterClose,
+    showCanvasActionError,
+    upsertCanvasSession,
+  ])
+
+  /** 复用 SidePanel 的删除生命周期打开当前画布确认框。 */
+  const handleRequestDeleteCanvas = React.useCallback((canvas: CanvasSessionMeta): void => {
+    if (!currentWorkspaceId) return
+    setPendingDeleteCanvas(deleteLifecycleRef.current.open(sessionId, currentWorkspaceId, canvas))
+  }, [currentWorkspaceId, sessionId])
 
   /** 删除继续经过主进程运行中任务守卫；这里只复用确认和 Renderer 索引更新。 */
   const handleConfirmDeleteCanvas = React.useCallback(async (): Promise<void> => {
@@ -1328,8 +1376,6 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     }
   }, [deletingCanvas, pendingDeleteCanvas, removeCanvasSession, reportCanvasActionError, showCanvasActionError])
 
-  const focusedWorkspaceTab = split ? getFocusedRightWorkspaceTab(split) : effectiveActiveTab
-  const activeCanvasId = parseCanvasWorkspaceTab(focusedWorkspaceTab)
   React.useEffect(() => {
     if (!activeCanvasId || !canvasRegistry.bindingReady) return
     if (!canvasRegistry.binding?.linkedCanvasIds.includes(activeCanvasId)) {
@@ -1762,6 +1808,15 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
             loading={canvasRegistry.loading}
             error={canvasRegistry.error}
             onUnlink={canvasRegistry.unlink}
+            sessions={canvasRegistry.sessions}
+            defaultCanvasId={canvasRegistry.binding?.defaultCanvasId}
+            activityStates={canvasRegistry.canvasActivityStates}
+            onCreateCanvas={handleCreateCanvas}
+            onOpenCanvas={handleOpenCanvas}
+            onRenameCanvas={handleRenameCanvas}
+            onSetDefaultCanvas={handleSetDefaultCanvas}
+            onToggleArchiveCanvas={handleToggleArchiveCanvas}
+            onRequestDeleteCanvas={handleRequestDeleteCanvas}
           />
         </div>
       )
@@ -1996,10 +2051,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
             onRenameCanvas={handleRenameCanvas}
             onSetDefaultCanvas={handleSetDefaultCanvas}
             onToggleArchiveCanvas={handleToggleArchiveCanvas}
-            onRequestDeleteCanvas={(canvas) => {
-              if (!currentWorkspaceId) return
-              setPendingDeleteCanvas(deleteLifecycleRef.current.open(sessionId, currentWorkspaceId, canvas))
-            }}
+            onRequestDeleteCanvas={handleRequestDeleteCanvas}
             onOpenWorkspaceComponent={(component) => {
               if (!isWorkspaceComponentEnabled(component)) return
               setWorkspaceComponentTabs((previous) => previous.includes(component) ? previous : [...previous, component])
