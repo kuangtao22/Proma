@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto'
+import { resolveCanvasEdgeBinding } from '@proma/shared'
 import type {
+  CanvasArtifactInputSlot,
+  CanvasArtifactOutputCapability,
   CanvasDocument,
   CanvasImageInputReference,
   CanvasImageTarget,
@@ -46,6 +49,7 @@ export interface CanvasImageInputResolver {
 export interface CanvasImageInputResolverDependencies {
   canvasStore: Pick<CanvasDocumentStore, 'requireStableAuthoritativeDocument'>
   imageStore: Pick<CanvasImageModuleStore, 'load'>
+  resolveAssetPath: (projectId: string, assetId: string) => string
   getAgentOutput: (sessionId: string) => Promise<CanvasAgentCommittedOutput>
   readDocument: (
     target: { projectId: string; canvasId: string },
@@ -55,6 +59,13 @@ export interface CanvasImageInputResolverDependencies {
     target: { projectId: string; canvasId: string },
     prototypeId: string,
   ) => Promise<CanvasPrototypeCommittedOutput>
+}
+
+/** 已通过 Host 节点类型与端口合同校验的单个直接输入。 */
+interface ResolvedCanvasInputBinding {
+  node: CanvasNode
+  sourcePort: CanvasArtifactOutputCapability
+  targetPort: CanvasArtifactInputSlot
 }
 
 /** 判断未知值是否为普通对象。 */
@@ -115,7 +126,6 @@ export function createCanvasImageInputResolver(
         kind: node.kind,
         revision: requireRevision(output.revision),
         summary: resolveLatestAgentSummary(output.messages),
-        ...(output.assetId ? { assetId: output.assetId } : {}),
       }
     }
     if (node.kind === 'image') {
@@ -127,6 +137,11 @@ export function createCanvasImageInputResolver(
         imageModuleId: node.imageModuleId,
       })
       if (!config.adoptedAssetId) return undefined
+      if (node.adoptedAssetId !== undefined && node.adoptedAssetId !== config.adoptedAssetId) {
+        throw new Error('CANVAS_IMAGE_INPUT_INVALID')
+      }
+      /** Asset Service 必须证明 adopted 身份当前仍对应可读取的真实图片。 */
+      dependencies.resolveAssetPath(target.projectId, config.adoptedAssetId)
       return {
         nodeId: node.id,
         kind: node.kind,
@@ -168,28 +183,53 @@ export function createCanvasImageInputResolver(
         || targetNode.imageModuleId !== target.imageModuleId) {
         throw new Error('CANVAS_IMAGE_TARGET_INVALID')
       }
-      /** 边顺序决定稳定输入顺序，重复源节点只解析一次。 */
-      const sourceIds = [...new Set(document.edges
-        .filter((edge) => edge.targetNodeId === target.nodeId && edge.relation === 'reference')
-        .map((edge) => edge.sourceNodeId))]
-        .slice(0, CANVAS_IMAGE_INPUT_MAX_REFERENCES)
+      /** 边顺序决定稳定输入顺序，重复源节点只保留首个已确认绑定。 */
+      const boundSources = new Map<string, ResolvedCanvasInputBinding>()
+      for (const edge of document.edges) {
+        if (edge.targetNodeId !== target.nodeId || edge.relation === 'association') continue
+        /** 权威 Store 正常不会返回悬空边，异常输入仍在执行前 fail closed。 */
+        const node = nodesById.get(edge.sourceNodeId)
+        if (!node) throw new Error('CANVAS_IMAGE_INPUT_INVALID')
+        /** 节点类型与持久化端口共同决定本边能否成为执行输入。 */
+        const binding = resolveCanvasEdgeBinding(edge, node.kind, targetNode.kind)
+        if (binding.state === 'unresolved') {
+          throw new Error('CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED')
+        }
+        if (binding.state !== 'bound') throw new Error('CANVAS_IMAGE_INPUT_INVALID')
+        if (!boundSources.has(node.id)) {
+          boundSources.set(node.id, {
+            node,
+            sourcePort: binding.sourceCapability,
+            targetPort: binding.targetSlot,
+          })
+        }
+      }
+      /** 输入数量上限在合同校验后应用，避免上限外的伪造端口绕过检查。 */
+      const inputs = [...boundSources.values()].slice(0, CANVAS_IMAGE_INPUT_MAX_REFERENCES)
       /** 逐项消费固定引用、文本和媒体预算。 */
       const references: CanvasImageInputReference[] = []
       let textLength = 0
       let mediaCount = 0
-      for (const sourceId of sourceIds) {
+      for (const input of inputs) {
         if (references.length >= CANVAS_IMAGE_INPUT_MAX_REFERENCES
           || textLength >= CANVAS_IMAGE_INPUT_MAX_TEXT) break
-        const node = nodesById.get(sourceId)
-        if (!node) continue
         /** 图片媒体预算已满时不触发模块 Store 读取。 */
-        if (node.kind === 'image' && mediaCount >= CANVAS_IMAGE_INPUT_MAX_MEDIA) continue
-        const resolved = await resolveNode(target, node)
+        if (input.node.kind === 'image' && mediaCount >= CANVAS_IMAGE_INPUT_MAX_MEDIA) continue
+        const resolved = await resolveNode(target, input.node)
+        if (input.targetPort === 'image.reference' && !resolved?.assetId) {
+          throw new Error('CANVAS_IMAGE_INPUT_MISSING')
+        }
         if (!resolved) continue
         if (resolved.assetId && mediaCount >= CANVAS_IMAGE_INPUT_MAX_MEDIA) continue
         const summary = truncateSummary(resolved.summary, CANVAS_IMAGE_INPUT_MAX_TEXT - textLength)
         if (!summary) continue
-        references.push({ ...resolved, summary, summaryHash: hashSummary(summary) })
+        references.push({
+          ...resolved,
+          sourcePort: input.sourcePort,
+          targetPort: input.targetPort,
+          summary,
+          summaryHash: hashSummary(summary),
+        })
         textLength += summary.length
         if (resolved.assetId) mediaCount += 1
       }

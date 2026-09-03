@@ -29,10 +29,23 @@ function createDocument(): { document: CanvasDocument; target: CanvasImageTarget
     ['document-1', target.nodeId], ['webview-1', target.nodeId],
     ['document-indirect', 'document-1'],
   ]
-  document.edges = edgePairs.map(([sourceNodeId, targetNodeId], index) => ({
-    id: `edge-${index}`, sourceNodeId, sourcePort: 'output', targetNodeId, targetPort: 'input',
-    relation: 'reference',
-  }))
+  /** 每条边的端口由来源与目标节点类型决定，间接边只用于证明不递归。 */
+  document.edges = edgePairs.map(([sourceNodeId, targetNodeId], index) => {
+    /** 来源节点必然来自上方固定夹具。 */
+    const sourceNode = document.nodes.find((node) => node.id === sourceNodeId)!
+    /** 图片来源进入媒体槽，其余来源只提供文本上下文。 */
+    const ports = sourceNode.kind === 'image'
+      ? { sourcePort: 'image.asset', targetPort: 'image.reference' }
+      : sourceNode.kind === 'agent'
+        ? { sourcePort: 'agent.text', targetPort: 'context.text' }
+        : sourceNode.kind === 'document'
+          ? { sourcePort: 'document.markdown', targetPort: 'context.text' }
+          : { sourcePort: 'webview.html', targetPort: 'context.text' }
+    return {
+      id: `edge-${index}`, sourceNodeId, ...ports, targetNodeId,
+      relation: 'reference' as const,
+    }
+  })
   return { document, target }
 }
 
@@ -52,6 +65,7 @@ function createResolver(document: CanvasDocument) {
         aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto', adoptedAssetId: 'asset-reference',
       }),
     },
+    resolveAssetPath: (_projectId, assetId) => `/project/assets/${assetId}.png`,
     readDocument: async () => ({ revision: 2, markdown: '# 首页\n强调主要行动' }),
     readPrototype: async () => ({ revision: 3, summary: '已提交原型：首页顶部导航与内容流' }),
   })
@@ -65,31 +79,31 @@ describe('Canvas 图片直接输入解析器', () => {
 
     expect(references.map((reference) => ({
       nodeId: reference.nodeId, kind: reference.kind, revision: reference.revision,
-      assetId: reference.assetId,
+      assetId: reference.assetId, sourcePort: reference.sourcePort, targetPort: reference.targetPort,
     }))).toEqual([
-      { nodeId: 'agent-1', kind: 'agent', revision: 4, assetId: undefined },
-      { nodeId: 'image-1', kind: 'image', revision: 5, assetId: 'asset-reference' },
-      { nodeId: 'document-1', kind: 'document', revision: 2, assetId: undefined },
-      { nodeId: 'webview-1', kind: 'webview', revision: 3, assetId: undefined },
+      { nodeId: 'agent-1', kind: 'agent', revision: 4, assetId: undefined, sourcePort: 'agent.text', targetPort: 'context.text' },
+      { nodeId: 'image-1', kind: 'image', revision: 5, assetId: 'asset-reference', sourcePort: 'image.asset', targetPort: 'image.reference' },
+      { nodeId: 'document-1', kind: 'document', revision: 2, assetId: undefined, sourcePort: 'document.markdown', targetPort: 'context.text' },
+      { nodeId: 'webview-1', kind: 'webview', revision: 3, assetId: undefined, sourcePort: 'webview.html', targetPort: 'context.text' },
     ])
     expect(references.some((reference) => reference.nodeId === 'document-indirect')).toBe(false)
     expect(references[0]?.summary).toContain('最近明确输出')
     expect(references.every((reference) => /^[a-f0-9]{64}$/.test(reference.summaryHash))).toBe(true)
   })
 
-  test('Given 非引用语义直接入边 When 解析图片输入 Then 不读取上游事实', async () => {
+  test('Given 纯关联直接入边 When 解析图片输入 Then 不读取上游事实', async () => {
     const { document, target } = createDocument()
-    /** 三条直接边分别覆盖不应进入图片提示词的非引用语义。 */
-    document.edges = [
-      { id: 'edge-association', sourceNodeId: 'agent-1', sourcePort: 'output', targetNodeId: target.nodeId, targetPort: 'input', relation: 'association' },
-      { id: 'edge-depends-on', sourceNodeId: 'image-1', sourcePort: 'output', targetNodeId: target.nodeId, targetPort: 'input', relation: 'depends-on' },
-      { id: 'edge-derives', sourceNodeId: 'document-1', sourcePort: 'output', targetNodeId: target.nodeId, targetPort: 'input', relation: 'derives' },
-    ]
+    /** association 只表达业务关系，永远不形成执行输入。 */
+    document.edges = [{
+      id: 'edge-association', sourceNodeId: 'agent-1', sourcePort: 'unbound',
+      targetNodeId: target.nodeId, targetPort: 'unbound', relation: 'association',
+    }]
     /** 所有事实读取器在被误调用时立即暴露自动消费回归。 */
     const resolver = createCanvasImageInputResolver({
       canvasStore: { requireStableAuthoritativeDocument: () => document },
       getAgentOutput: async () => { throw new Error('不应读取 Agent') },
       imageStore: { load: async () => { throw new Error('不应读取图片') } },
+      resolveAssetPath: () => { throw new Error('不应读取素材路径') },
       readDocument: async () => { throw new Error('不应读取文档') },
       readPrototype: async () => { throw new Error('不应读取原型') },
     })
@@ -101,19 +115,19 @@ describe('Canvas 图片直接输入解析器', () => {
     const { document, target } = createDocument()
     document.nodes = [document.nodes[0]!, ...Array.from({ length: 24 }, (_, index) => ({
       id: `image-${index}`, kind: 'image' as const, title: `图片 ${index}`,
-      position: { x: 0, y: 0 }, imageModuleId: `module-${index}`, adoptedAssetId: `asset-${index}`,
+      position: { x: 0, y: 0 }, imageModuleId: `module-${index}`, adoptedAssetId: `asset-module-${index}`,
     })), {
       id: 'document-after-images', kind: 'document' as const, title: '候选上限外文档',
       position: { x: 0, y: 0 }, documentId: 'document-after-images', contentRevision: 1,
     }]
     const directEdges = document.nodes.slice(1).map((node, index) => ({
-      id: `edge-${index}`, sourceNodeId: node.id, sourcePort: 'output',
-      targetNodeId: target.nodeId, targetPort: 'input', relation: 'reference' as const,
+      id: `edge-${index}`, sourceNodeId: node.id, sourcePort: node.kind === 'image' ? 'image.asset' : 'document.markdown',
+      targetNodeId: target.nodeId, targetPort: node.kind === 'image' ? 'image.reference' : 'context.text', relation: 'reference' as const,
     }))
     /** 大量重复边不得扩大候选或实际读取工作量。 */
     document.edges = [...directEdges, ...Array.from({ length: 80 }, (_, index) => ({
-      id: `duplicate-${index}`, sourceNodeId: `image-${index % 24}`, sourcePort: 'output',
-      targetNodeId: target.nodeId, targetPort: 'input', relation: 'reference' as const,
+      id: `duplicate-${index}`, sourceNodeId: `image-${index % 24}`, sourcePort: 'image.asset',
+      targetNodeId: target.nodeId, targetPort: 'image.reference', relation: 'reference' as const,
     }))]
     let imageLoadCount = 0
     let documentReadCount = 0
@@ -131,6 +145,7 @@ describe('Canvas 图片直接输入解析器', () => {
           }
         },
       },
+      resolveAssetPath: (_projectId, assetId) => `/project/assets/${assetId}.png`,
       readDocument: async () => {
         documentReadCount += 1
         return { revision: 1, markdown: 'x'.repeat(CANVAS_IMAGE_INPUT_MAX_TEXT * 2) }
@@ -151,5 +166,101 @@ describe('Canvas 图片直接输入解析器', () => {
     expect(imageLoadCount).toBe(CANVAS_IMAGE_INPUT_MAX_MEDIA)
     expect(documentReadCount).toBe(0)
     expect(prototypeReadCount).toBe(0)
+  })
+
+  test('Given WebView 绑定 context.text When 解析 Then 只提供安全文本且没有媒体身份', async () => {
+    const { document, target } = createDocument()
+    document.edges = [{
+      id: 'edge-web', sourceNodeId: 'webview-1', sourcePort: 'webview.html',
+      targetNodeId: target.nodeId, targetPort: 'context.text', relation: 'reference',
+    }]
+
+    const references = await createResolver(document).resolve(target)
+
+    expect(references).toEqual([expect.objectContaining({
+      nodeId: 'webview-1', sourcePort: 'webview.html', targetPort: 'context.text',
+    })])
+    expect(references[0]).not.toHaveProperty('assetId')
+  })
+
+  test('Given WebView 被伪装为图片参考 When 解析 Then 在任何素材读取前拒绝', async () => {
+    const { document, target } = createDocument()
+    document.edges = [{
+      id: 'edge-invalid', sourceNodeId: 'webview-1', sourcePort: 'webview.html',
+      targetNodeId: target.nodeId, targetPort: 'image.reference', relation: 'reference',
+    }]
+
+    await expect(createResolver(document).resolve(target)).rejects
+      .toThrow('CANVAS_IMAGE_INPUT_INVALID')
+  })
+
+  test('Given 图片参考没有正式采用素材 When 解析 Then 明确阻断缺少媒体', async () => {
+    const { document, target } = createDocument()
+    /** 节点和模块同时没有正式 adopted 素材，不能静默跳过引用意图。 */
+    const source = document.nodes.find((node) => node.id === 'image-1')
+    if (source?.kind === 'image') delete source.adoptedAssetId
+    document.edges = [{
+      id: 'edge-image', sourceNodeId: 'image-1', sourcePort: 'image.asset',
+      targetNodeId: target.nodeId, targetPort: 'image.reference', relation: 'reference',
+    }]
+    /** 自定义 resolver 固定返回未采用图片配置。 */
+    const resolver = createCanvasImageInputResolver({
+      canvasStore: { requireStableAuthoritativeDocument: () => document },
+      getAgentOutput: async () => ({ revision: 0, messages: [] }),
+      imageStore: { load: async (input) => ({
+        schemaVersion: 2, kind: 'image', contentId: input.imageModuleId,
+        revision: 5, createdAt: 1, updatedAt: 2, prompt: '', selectedModelProfileId: null,
+        aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto', adoptedAssetId: null,
+      }) },
+      resolveAssetPath: () => { throw new Error('缺少素材时不应解析路径') },
+      readDocument: async () => ({ revision: 0, markdown: '' }),
+      readPrototype: async () => ({ revision: 0, summary: '' }),
+    })
+
+    await expect(resolver.resolve(target)).rejects.toThrow('CANVAS_IMAGE_INPUT_MISSING')
+  })
+
+  test('Given 历史 reference 边尚未确认 When 解析 Then 不静默猜测用途', async () => {
+    const { document, target } = createDocument()
+    document.edges = [{
+      id: 'edge-legacy', sourceNodeId: 'image-1', sourcePort: 'output',
+      targetNodeId: target.nodeId, targetPort: 'input', relation: 'reference',
+    }]
+
+    await expect(createResolver(document).resolve(target)).rejects
+      .toThrow('CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED')
+  })
+
+  test('Given 合法图片参考 When 解析 Then 验证正式素材路径且快照不暴露路径', async () => {
+    const { document, target } = createDocument()
+    document.edges = [{
+      id: 'edge-image', sourceNodeId: 'image-1', sourcePort: 'image.asset',
+      targetNodeId: target.nodeId, targetPort: 'image.reference', relation: 'reference',
+    }]
+    /** 收集 Asset Service 校验调用，证明 adopted ID 对应真实媒体。 */
+    const resolvedAssets: Array<{ projectId: string; assetId: string }> = []
+    const resolver = createCanvasImageInputResolver({
+      canvasStore: { requireStableAuthoritativeDocument: () => document },
+      getAgentOutput: async () => ({ revision: 0, messages: [] }),
+      imageStore: {
+        load: async (input) => ({
+          schemaVersion: 2, kind: 'image', contentId: input.imageModuleId,
+          revision: 5, createdAt: 1, updatedAt: 2, prompt: '', selectedModelProfileId: null,
+          aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto', adoptedAssetId: 'asset-reference',
+        }),
+      },
+      resolveAssetPath: (projectId, assetId) => {
+        resolvedAssets.push({ projectId, assetId })
+        return `/project/assets/${assetId}.png`
+      },
+      readDocument: async () => ({ revision: 0, markdown: '' }),
+      readPrototype: async () => ({ revision: 0, summary: '' }),
+    })
+
+    const references = await resolver.resolve(target)
+
+    expect(resolvedAssets).toEqual([{ projectId: 'project-1', assetId: 'asset-reference' }])
+    expect(references[0]).toMatchObject({ assetId: 'asset-reference' })
+    expect(references[0]).not.toHaveProperty('path')
   })
 })

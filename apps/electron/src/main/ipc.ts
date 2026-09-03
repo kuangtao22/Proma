@@ -2101,32 +2101,6 @@ export function registerIpcHandlers(): void {
     }
     return { revision: meta.revision, content: await readFile(fileName) }
   }
-  /** 直接入边解析器只读取已提交 Agent JSONL、图片配置和受管正文。 */
-  const canvasImageInputResolver = createCanvasImageInputResolver({
-    canvasStore: canvasDocumentStore,
-    imageStore: canvasImageModuleStore,
-    getAgentOutput: async (sessionId) => {
-      const session = getAgentSessionMeta(sessionId)
-      if (!session) throw new Error('CANVAS_IMAGE_INPUT_AGENT_INVALID')
-      return { revision: session.updatedAt, messages: getAgentSessionSDKMessages(sessionId) }
-    },
-    readDocument: async (target, documentId) => {
-      const committed = await readCommittedCanvasContent(target, documentId, 'content.md')
-      return { revision: committed.revision, markdown: committed.content }
-    },
-    readPrototype: async (target, prototypeId) => {
-      const committed = await readCommittedCanvasContent(target, prototypeId, 'index.html')
-      /** 原型摘要只提取有界可见文本，不执行 HTML 或脚本。 */
-      const summary = committed.content
-        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 4_000)
-      return { revision: committed.revision, summary: summary || '已提交原型无可见文本' }
-    },
-  })
   /** Canvas Agent 创建事务复用现有 Agent 索引与模型可用性事实。 */
   const canvasAgentNodeCreation = new CanvasAgentNodeCreationService({
     store: canvasDocumentStore,
@@ -2173,6 +2147,33 @@ export function registerIpcHandlers(): void {
     isContextAssetReferenced: (projectId, assetId) => designContextCatalog.isAssetReferenced(projectId, assetId),
     onSuccessfulJobAssetDeleted: (projectId, sourceJobId) => {
       cleanupSuccessfulDesignTask?.(projectId, sourceJobId)
+    },
+  })
+  /** 直接入边解析器只读取已提交 Agent JSONL、图片配置和受管正文。 */
+  const canvasImageInputResolver = createCanvasImageInputResolver({
+    canvasStore: canvasDocumentStore,
+    imageStore: canvasImageModuleStore,
+    resolveAssetPath: (projectId, assetId) => designAssetService.resolveAssetPath(projectId, assetId),
+    getAgentOutput: async (sessionId) => {
+      const session = getAgentSessionMeta(sessionId)
+      if (!session) throw new Error('CANVAS_IMAGE_INPUT_AGENT_INVALID')
+      return { revision: session.updatedAt, messages: getAgentSessionSDKMessages(sessionId) }
+    },
+    readDocument: async (target, documentId) => {
+      const committed = await readCommittedCanvasContent(target, documentId, 'content.md')
+      return { revision: committed.revision, markdown: committed.content }
+    },
+    readPrototype: async (target, prototypeId) => {
+      const committed = await readCommittedCanvasContent(target, prototypeId, 'index.html')
+      /** 原型摘要只提取有界可见文本，不执行 HTML 或脚本。 */
+      const summary = committed.content
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 4_000)
+      return { revision: committed.revision, summary: summary || '已提交原型无可见文本' }
     },
   })
   /** Design trace 独立落在本机 cache，列表和普通 Agent 投影不直接读取。 */
