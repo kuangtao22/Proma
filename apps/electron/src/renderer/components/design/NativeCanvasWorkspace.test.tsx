@@ -3317,7 +3317,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
           adapter={{
             loadCanvas: async () => createSnapshot(0, target),
             saveCanvas: async () => createSnapshot(1, target).document,
-            listCanvasTrash: async () => ({ entries: [] }),
+            listCanvasTrash: async () => [],
             restoreCanvasNode: async () => ({ snapshot: createSnapshot(1, target), restoredNodeId: 'node-1' }),
             onCanvasChanged: () => () => {},
           }}

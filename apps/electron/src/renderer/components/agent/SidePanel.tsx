@@ -2044,14 +2044,6 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
             onAddTabMenuOpenChange={setIsAddTabMenuOpen}
             onOpenFile={() => handleWorkspaceTabChange('files')}
             onOpenTerminal={handleOpenTerminal}
-            canvasSessions={canvasRegistry.sessions}
-            defaultCanvasId={canvasRegistry.binding?.defaultCanvasId}
-            onOpenCanvas={handleOpenCanvas}
-            onCreateCanvas={handleCreateCanvas}
-            onRenameCanvas={handleRenameCanvas}
-            onSetDefaultCanvas={handleSetDefaultCanvas}
-            onToggleArchiveCanvas={handleToggleArchiveCanvas}
-            onRequestDeleteCanvas={handleRequestDeleteCanvas}
             onOpenWorkspaceComponent={(component) => {
               if (!isWorkspaceComponentEnabled(component)) return
               setWorkspaceComponentTabs((previous) => previous.includes(component) ? previous : [...previous, component])
