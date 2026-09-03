@@ -2,7 +2,7 @@ import * as React from 'react'
 import { LEGACY_DESIGN_CANVAS_ID } from '@proma/shared'
 import type { AgentCanvasBinding, CanvasSessionMeta } from '@proma/shared'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { Maximize2, Minimize2, Workflow } from 'lucide-react'
+import { Maximize2, Minimize2, PanelLeft, Trash2, Workflow } from 'lucide-react'
 import {
   canvasSessionsByProjectAtom,
   canvasSessionStatusByProjectAtom,
@@ -28,6 +28,10 @@ import {
   nativeCanvasSessionViewCleanupCoordinator,
 } from './NativeCanvasWorkspace'
 import { DesignWorkspaceView } from './DesignWorkspaceView'
+import { CanvasWorkspaceSidebar } from './CanvasWorkspaceSidebar'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 
 /** Agent 右侧工作区需要的 Canvas 动态标签描述。 */
@@ -320,6 +324,24 @@ export interface CanvasWorkspaceAdapterProps {
   loading?: boolean
   error?: string | null
   onUnlink: (canvasId: string) => Promise<void>
+  /** 当前项目的完整画布索引。 */
+  sessions?: readonly CanvasSessionMeta[]
+  /** 当前 Agent 绑定的默认画布 ID。 */
+  defaultCanvasId?: string
+  /** 当前 Agent 按画布隔离的活动代次。 */
+  activityStates?: ReadonlyMap<string, AgentCanvasActivityState>
+  /** 新建并打开画布，返回是否成功。 */
+  onCreateCanvas?: () => Promise<boolean>
+  /** 打开未归档画布，或恢复并打开归档画布。 */
+  onOpenCanvas?: (session: CanvasSessionMeta) => Promise<boolean>
+  /** 修改画布标题，返回是否成功。 */
+  onRenameCanvas?: (session: CanvasSessionMeta, title: string) => Promise<boolean>
+  /** 把指定未归档画布设为默认。 */
+  onSetDefaultCanvas?: (session: CanvasSessionMeta) => Promise<boolean>
+  /** 归档或恢复指定画布。 */
+  onToggleArchiveCanvas?: (session: CanvasSessionMeta) => Promise<boolean>
+  /** 请求宿主打开共用的永久删除确认。 */
+  onRequestDeleteCanvas?: (session: CanvasSessionMeta) => void
   /** 测试或宿主可替换旧 Design 内容；只有 legacy 分支才会调用。 */
   renderLegacyWorkspace?: () => React.ReactNode
   /** 测试或宿主可替换原生 Canvas；只有 native 分支才会调用。 */
@@ -328,7 +350,47 @@ export interface CanvasWorkspaceAdapterProps {
     target: { projectId: string; canvasId: string }
     title: string
     presentation: 'side-panel'
+    headerLeading?: React.ReactNode
+    headerTitle?: React.ReactNode
+    headerActions?: React.ReactNode
   }) => React.ReactNode
+}
+
+export interface CanvasWorkspaceTitleSubmitResult {
+  status: 'reset' | 'unchanged' | 'saved' | 'failed'
+  title: string
+}
+
+export interface SubmitCanvasWorkspaceTitleInput {
+  originalTitle: string
+  draftTitle: string
+  rename: (title: string) => Promise<boolean>
+}
+
+/** 归一化标题并返回组件应采取的确定性编辑结果。 */
+export async function submitCanvasWorkspaceTitle(
+  input: SubmitCanvasWorkspaceTitleInput,
+): Promise<CanvasWorkspaceTitleSubmitResult> {
+  const title = input.draftTitle.trim()
+  if (!title) return { status: 'reset', title: input.originalTitle }
+  if (title === input.originalTitle) return { status: 'unchanged', title }
+  return await input.rename(title)
+    ? { status: 'saved', title }
+    : { status: 'failed', title }
+}
+
+export type CanvasWorkspaceEscapeAction = 'cancel-title' | 'close-sidebar' | 'exit-expanded'
+
+/** 只选择最内层的 Escape 动作，避免一次按键关闭多层状态。 */
+export function resolveCanvasWorkspaceEscapeAction(input: {
+  editingTitle: boolean
+  sidebarOpen: boolean
+  expanded: boolean
+}): CanvasWorkspaceEscapeAction | null {
+  if (input.editingTitle) return 'cancel-title'
+  if (input.sidebarOpen) return 'close-sidebar'
+  if (input.expanded) return 'exit-expanded'
+  return null
 }
 
 /** 只桥接 Agent binding/metadata 与原生 Canvas，不读取旧全局 active selection。 */
@@ -341,6 +403,15 @@ export function CanvasWorkspaceAdapter({
   loading = false,
   error = null,
   onUnlink,
+  sessions = session ? [session] : [],
+  defaultCanvasId,
+  activityStates = new Map(),
+  onCreateCanvas = async () => false,
+  onOpenCanvas = async () => false,
+  onRenameCanvas = async () => false,
+  onSetDefaultCanvas = async () => false,
+  onToggleArchiveCanvas = async () => false,
+  onRequestDeleteCanvas = () => undefined,
   renderLegacyWorkspace,
   renderNativeWorkspace,
 }: CanvasWorkspaceAdapterProps): React.ReactElement {
@@ -349,21 +420,44 @@ export function CanvasWorkspaceAdapter({
   const updateViewState = useSetAtom(updateAgentCanvasViewStateAtom)
   useAgentCanvasLegacyViewInitialization(sessionId, projectId, canvasId)
   const isExpanded = viewState?.isExpanded ?? false
+  const [sidebarOpen, setSidebarOpen] = React.useState(false)
+  const [editingTitle, setEditingTitle] = React.useState(false)
+  const [titleDraft, setTitleDraft] = React.useState(session?.title ?? '')
+  const [renaming, setRenaming] = React.useState(false)
+  const titleInputRef = React.useRef<HTMLInputElement>(null)
 
   const setExpanded = React.useCallback((expanded: boolean): void => {
     updateViewState({ key: viewStateKey, update: { isExpanded: expanded } })
   }, [updateViewState, viewStateKey])
 
   React.useEffect(() => {
-    if (!isExpanded) return
+    if (!editingTitle) setTitleDraft(session?.title ?? '')
+  }, [editingTitle, session?.title])
+
+  React.useEffect(() => {
+    if (editingTitle) titleInputRef.current?.select()
+  }, [editingTitle])
+
+  /** 取消标题编辑并恢复权威标题。 */
+  const cancelTitleEdit = React.useCallback((): void => {
+    setTitleDraft(session?.title ?? '')
+    setEditingTitle(false)
+  }, [session?.title])
+
+  React.useEffect(() => {
+    if (!editingTitle && !sidebarOpen && !isExpanded) return
     const handleKeyDown = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return
+      const action = resolveCanvasWorkspaceEscapeAction({ editingTitle, sidebarOpen, expanded: isExpanded })
+      if (!action) return
       event.preventDefault()
-      setExpanded(false)
+      if (action === 'cancel-title') cancelTitleEdit()
+      else if (action === 'close-sidebar') setSidebarOpen(false)
+      else setExpanded(false)
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [isExpanded, setExpanded])
+  }, [cancelTitleEdit, editingTitle, isExpanded, setExpanded, sidebarOpen])
 
   React.useEffect(() => {
     void reconcileMissingCanvas({
@@ -397,36 +491,157 @@ export function CanvasWorkspaceAdapter({
     return <div className="flex h-full items-center justify-center text-sm text-muted-foreground">画布已归档</div>
   }
   const isLegacy = session.id === LEGACY_DESIGN_CANVAS_ID
+
+  /** 提交标题；失败时保留草稿和编辑态供用户直接重试。 */
+  const submitTitle = async (): Promise<void> => {
+    if (renaming) return
+    setRenaming(true)
+    try {
+      const result = await submitCanvasWorkspaceTitle({
+        originalTitle: session.title,
+        draftTitle: titleDraft,
+        rename: (title) => onRenameCanvas(session, title),
+      })
+      setTitleDraft(result.title)
+      if (result.status !== 'failed') setEditingTitle(false)
+    } catch {
+      setEditingTitle(true)
+    } finally {
+      setRenaming(false)
+    }
+  }
+
+  /** Pane 标题前的项目画布列表入口。 */
+  const headerLeading = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button type="button" variant="ghost" size="icon-sm" aria-label="打开画布列表" onClick={() => setSidebarOpen(true)}>
+          <PanelLeft className="size-3.5" aria-hidden="true" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>画布列表</TooltipContent>
+    </Tooltip>
+  )
+  /** 标题展示与原地编辑共享同一稳定宽度。 */
+  const headerTitle = editingTitle ? (
+    <Input
+      ref={titleInputRef}
+      value={titleDraft}
+      aria-label="编辑画布标题"
+      disabled={renaming}
+      className="h-7 min-w-0 flex-1 border-0 px-2 text-sm font-medium shadow-none focus-visible:ring-1"
+      onChange={(event) => setTitleDraft(event.target.value)}
+      onBlur={() => { void submitTitle() }}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault()
+          void submitTitle()
+        } else if (event.key === 'Escape') {
+          event.preventDefault()
+          event.stopPropagation()
+          cancelTitleEdit()
+        }
+      }}
+    />
+  ) : (
+    <button
+      type="button"
+      className="min-w-0 flex-1 truncate rounded-sm px-2 py-1 text-left text-sm font-medium text-foreground outline-none hover:bg-muted/70 focus-visible:ring-1 focus-visible:ring-ring"
+      aria-label={`编辑画布标题：${session.title}`}
+      onClick={() => setEditingTitle(true)}
+    >
+      {session.title}
+    </button>
+  )
+  /** 当前画布低频操作与展开控制统一放入标题栏。 */
+  const headerActions = (
+    <>
+      {!isLegacy ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label="删除当前画布"
+              onClick={() => onRequestDeleteCanvas(session)}
+            >
+              <Trash2 className="size-3.5" aria-hidden="true" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>删除当前画布</TooltipContent>
+        </Tooltip>
+      ) : null}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            disabled={!viewState}
+            onClick={() => setExpanded(!isExpanded)}
+            aria-label={isExpanded ? '还原画布' : '展开画布'}
+          >
+            {isExpanded
+              ? <Minimize2 className="size-3.5" aria-hidden="true" />
+              : <Maximize2 className="size-3.5" aria-hidden="true" />}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{isExpanded ? '还原画布' : '展开画布'}</TooltipContent>
+      </Tooltip>
+    </>
+  )
   const workspace = isLegacy
-    ? (renderLegacyWorkspace?.() ?? <DesignWorkspaceView />)
+    ? (
+        <section className="flex h-full min-h-0 flex-col bg-content-area">
+          <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
+            {headerLeading}
+            {headerTitle}
+            <div className="ml-auto flex shrink-0 items-center gap-1">{headerActions}</div>
+          </header>
+          <div className="min-h-0 flex-1">{renderLegacyWorkspace?.() ?? <DesignWorkspaceView />}</div>
+        </section>
+      )
     : (renderNativeWorkspace?.({
         sessionId,
         target: { projectId, canvasId },
         title: session.title,
         presentation: 'side-panel',
+        headerLeading,
+        headerTitle,
+        headerActions,
       }) ?? (
         <NativeCanvasWorkspace
           sessionId={sessionId}
           target={{ projectId, canvasId }}
           title={session.title}
           presentation="side-panel"
+          headerLeading={headerLeading}
+          headerTitle={headerTitle}
+          headerActions={headerActions}
         />
       ))
   return (
-    <div className={cn(
-      'relative h-full min-h-0 overflow-hidden bg-content-area',
-      isExpanded && 'fixed inset-0 z-[200]',
-    )}>
-      {workspace}
-      <button
-        type="button"
-        disabled={!viewState}
-        onClick={() => setExpanded(!isExpanded)}
-        aria-label={isExpanded ? '还原画布' : '展开画布'}
-        className="absolute right-12 top-2 z-20 inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
-      >
-        {isExpanded ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
-      </button>
-    </div>
+    <TooltipProvider delayDuration={200} disableHoverableContent>
+      <div className={cn(
+        'relative h-full min-h-0 overflow-hidden bg-content-area',
+        isExpanded && 'fixed inset-0 z-[200]',
+      )}>
+        {workspace}
+        <CanvasWorkspaceSidebar
+          open={sidebarOpen}
+          currentCanvasId={canvasId}
+          sessions={sessions}
+          defaultCanvasId={defaultCanvasId}
+          activityStates={activityStates}
+          onOpenChange={setSidebarOpen}
+          onCreateCanvas={onCreateCanvas}
+          onOpenCanvas={onOpenCanvas}
+          onSetDefaultCanvas={onSetDefaultCanvas}
+          onToggleArchiveCanvas={onToggleArchiveCanvas}
+          onRequestDeleteCanvas={onRequestDeleteCanvas}
+        />
+      </div>
+    </TooltipProvider>
   )
 }

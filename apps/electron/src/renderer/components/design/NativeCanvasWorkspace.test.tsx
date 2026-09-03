@@ -3297,4 +3297,40 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     expect(html).toContain('aria-label="添加节点"')
     expect(html).toContain('aria-label="选择工具"')
   })
+
+  test('Given side-panel 标题栏插槽 When 渲染原生 Canvas Then 自定义内容与回收区共存', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-header' }
+    const store = createStore()
+    store.set(nativeCanvasStatesAtom, new Map([[
+      createNativeCanvasKey(target.projectId, target.canvasId),
+      { ...createInitialNativeCanvasState(), phase: 'ready', snapshot: createSnapshot(0, target) },
+    ]]))
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          sessionId="header-slot-session"
+          target={target}
+          title="原始标题"
+          headerLeading={<button type="button">列表入口</button>}
+          headerTitle={<button type="button">可编辑标题</button>}
+          headerActions={<button type="button">工作区动作</button>}
+          adapter={{
+            loadCanvas: async () => createSnapshot(0, target),
+            saveCanvas: async () => createSnapshot(1, target).document,
+            listCanvasTrash: async () => ({ entries: [] }),
+            restoreCanvasNode: async () => ({ snapshot: createSnapshot(1, target), restoredNodeId: 'node-1' }),
+            onCanvasChanged: () => () => {},
+          }}
+          flowRenderer={() => <div />}
+        />
+      </Provider>,
+    )
+
+    expect(html).toContain('列表入口')
+    expect(html).toContain('可编辑标题')
+    expect(html).toContain('工作区动作')
+    expect(html).toContain('aria-label="打开回收区"')
+    expect(html).not.toContain('原始标题')
+  })
 })

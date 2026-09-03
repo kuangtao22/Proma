@@ -18,6 +18,8 @@ import {
   CanvasWorkspaceAdapter,
   isAgentCanvasActivityUnread,
   reconcileMissingCanvas,
+  resolveCanvasWorkspaceEscapeAction,
+  submitCanvasWorkspaceTitle,
   useAgentCanvasLegacyViewInitialization,
   useAgentCanvasWorkspaceRegistry,
 } from './CanvasWorkspaceAdapter'
@@ -154,13 +156,16 @@ describe('Agent 右侧 Canvas 适配器', () => {
           metadataReady
           onUnlink={async () => undefined}
           renderNativeWorkspace={(props) => (
-            <div
-              data-native-canvas-workspace
-              data-session-id={props.sessionId}
-              data-project-id={props.target.projectId}
-              data-canvas-id={props.target.canvasId}
-              data-presentation={props.presentation}
-            />
+            <div>
+              <div
+                data-native-canvas-workspace
+                data-session-id={props.sessionId}
+                data-project-id={props.target.projectId}
+                data-canvas-id={props.target.canvasId}
+                data-presentation={props.presentation}
+              />
+              {props.headerActions}
+            </div>
           )}
         />
       </Provider>,
@@ -209,7 +214,15 @@ describe('Agent 右侧 Canvas 适配器', () => {
           session={createSession('canvas-1')}
           metadataReady
           onUnlink={async () => undefined}
-          renderNativeWorkspace={(props) => <div data-target={JSON.stringify(props)} />}
+          renderNativeWorkspace={(props) => (
+            <div
+              data-session-id={props.sessionId}
+              data-project-id={props.target.projectId}
+              data-canvas-id={props.target.canvasId}
+            >
+              {props.headerActions}
+            </div>
+          )}
         />
       </Provider>,
     )
@@ -369,5 +382,84 @@ describe('Agent 右侧 Canvas 适配器', () => {
     expect(isAgentCanvasActivityUnread(initial)).toBe(false)
     expect(isAgentCanvasActivityUnread({ ...initial, activityRevision: 1 })).toBe(true)
     expect(isAgentCanvasActivityUnread({ ...initial, activityRevision: 1, seenActivityRevision: 1 })).toBe(false)
+  })
+
+  test('Given 当前标题 When 提交变化、空白、原值或失败 Then 返回明确编辑决策', async () => {
+    const submitted: string[] = []
+    const rename = async (title: string): Promise<boolean> => {
+      submitted.push(title)
+      return title !== '失败标题'
+    }
+
+    expect(await submitCanvasWorkspaceTitle({ originalTitle: '旧标题', draftTitle: ' 新标题 ', rename }))
+      .toEqual({ status: 'saved', title: '新标题' })
+    expect(await submitCanvasWorkspaceTitle({ originalTitle: '旧标题', draftTitle: '   ', rename }))
+      .toEqual({ status: 'reset', title: '旧标题' })
+    expect(await submitCanvasWorkspaceTitle({ originalTitle: '旧标题', draftTitle: '旧标题', rename }))
+      .toEqual({ status: 'unchanged', title: '旧标题' })
+    expect(await submitCanvasWorkspaceTitle({ originalTitle: '旧标题', draftTitle: '失败标题', rename }))
+      .toEqual({ status: 'failed', title: '失败标题' })
+    expect(submitted).toEqual(['新标题', '失败标题'])
+  })
+
+  test('Given 多层工作区状态 When 解析 Escape Then 标题、抽屉、全屏按顺序消费', () => {
+    expect(resolveCanvasWorkspaceEscapeAction({ editingTitle: true, sidebarOpen: true, expanded: true }))
+      .toBe('cancel-title')
+    expect(resolveCanvasWorkspaceEscapeAction({ editingTitle: false, sidebarOpen: true, expanded: true }))
+      .toBe('close-sidebar')
+    expect(resolveCanvasWorkspaceEscapeAction({ editingTitle: false, sidebarOpen: false, expanded: true }))
+      .toBe('exit-expanded')
+    expect(resolveCanvasWorkspaceEscapeAction({ editingTitle: false, sidebarOpen: false, expanded: false }))
+      .toBeNull()
+  })
+
+  test('Given native 与 legacy Canvas When 渲染工作区标题栏 Then 都可打开列表且仅 native 可删除', () => {
+    const createProps = (session: CanvasSessionMeta) => ({
+      sessionId: 'agent-1',
+      projectId: 'project-1',
+      canvasId: session.id,
+      session,
+      sessions: [session],
+      metadataReady: true,
+      activityStates: new Map(),
+      onUnlink: async () => undefined,
+      onCreateCanvas: async () => true,
+      onOpenCanvas: async () => true,
+      onRenameCanvas: async () => true,
+      onSetDefaultCanvas: async () => true,
+      onToggleArchiveCanvas: async () => true,
+      onRequestDeleteCanvas: () => undefined,
+    })
+    const store = createStore()
+    const nativeSession = createSession('canvas-1')
+    const nativeHtml = renderToStaticMarkup(
+      <Provider store={store}>
+        <CanvasWorkspaceAdapter
+          {...createProps(nativeSession)}
+          renderNativeWorkspace={(props) => (
+            <div>
+              {props.headerLeading}
+              {props.headerTitle}
+              {props.headerActions}
+            </div>
+          )}
+        />
+      </Provider>,
+    )
+    const legacySession = createSession(LEGACY_DESIGN_CANVAS_ID)
+    const legacyHtml = renderToStaticMarkup(
+      <Provider store={store}>
+        <CanvasWorkspaceAdapter
+          {...createProps(legacySession)}
+          renderLegacyWorkspace={() => <div>旧设计内容</div>}
+        />
+      </Provider>,
+    )
+
+    expect(nativeHtml).toContain('aria-label="打开画布列表"')
+    expect(nativeHtml).toContain('aria-label="删除当前画布"')
+    expect(nativeHtml).toContain('aria-label="展开画布"')
+    expect(legacyHtml).toContain('aria-label="打开画布列表"')
+    expect(legacyHtml).not.toContain('aria-label="删除当前画布"')
   })
 })
