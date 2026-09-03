@@ -378,7 +378,9 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(first.snapshot.document.revision).toBe(1)
     expect(second.snapshot.document.revision).toBe(1)
     expect(second.snapshot.document.edges).toHaveLength(1)
-    expect(second.snapshot.document.edges[0]?.relation).toBe('derives')
+    expect(second.snapshot.document.edges[0]).toMatchObject({
+      relation: 'derives', sourcePort: 'agent.text', targetPort: 'context.text',
+    })
     await expect(fixture.service.create({ ...input, title: '冲突' })).rejects.toThrow('CANVAS_OPERATION_CONFLICT')
   })
 

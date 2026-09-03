@@ -107,7 +107,10 @@ describe('Canvas Agent 产物原子创建服务', () => {
       }],
     })
     expect(operations.find((operation) => operation.type === 'upsert-edges')).toMatchObject({
-      edges: [{ sourceNodeId: 'requirements-1', targetNodeId: result.nodeId, relation: 'reference' }],
+      edges: [{
+        sourceNodeId: 'requirements-1', sourcePort: 'document.markdown',
+        targetNodeId: result.nodeId, targetPort: 'context.text', relation: 'reference',
+      }],
     })
     expect(result).toMatchObject({ canvasId: 'canvas-1', revision: 4, artifactType: 'webview' })
     expect(result.nodeId).toMatch(/^artifact-[0-9a-f]{64}$/)
@@ -133,7 +136,11 @@ describe('Canvas Agent 产物原子创建服务', () => {
     expect(getBatchOperations(fixture.batches[0]!).find((operation) => operation.type === 'upsert-nodes'))
       .toMatchObject({ nodes: [{ kind: 'document', contentRevision: 0 }] })
     expect(getBatchOperations(fixture.batches[0]!).find((operation) => operation.type === 'upsert-edges'))
-      .toMatchObject({ edges: [{ relation: 'reference' }] })
+      .toMatchObject({
+        edges: [{
+          relation: 'reference', sourcePort: 'document.markdown', targetPort: 'context.text',
+        }],
+      })
   })
 
   test('Given 来源与 relation 仅提供一项 When 创建 Then 在准备内容前拒绝', async () => {

@@ -9,6 +9,7 @@ import {
 import type { BigIntStats, Dirent } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID as createRandomUUID } from 'node:crypto'
+import { createCanvasBoundEdge } from '@proma/shared'
 import type {
   AgentSessionMeta,
   CanvasAgentNode,
@@ -661,16 +662,18 @@ function assertNodeMatchesRebuildIntent(
 }
 
 /** 从创建 intent 生成固定兼容端口连线。 */
-function createRelationshipEdge(intent: CanvasAgentNodeCreationIntent): CanvasEdge | undefined {
+function createRelationshipEdge(
+  intent: CanvasAgentNodeCreationIntent,
+  sourceNode: CanvasDocument['nodes'][number],
+  targetNode: CanvasAgentNode,
+): CanvasEdge | undefined {
   if (!intent.relationship) return undefined
-  return {
+  return createCanvasBoundEdge(sourceNode, targetNode, {
     id: intent.relationship.edgeId,
     sourceNodeId: intent.relationship.sourceNodeId,
-    sourcePort: 'output',
     targetNodeId: intent.nodeId,
-    targetPort: 'input',
     relation: intent.relationship.relation,
-  }
+  })
 }
 
 /** 验证已提交扩展边没有被另一关系占用或部分丢失。 */
@@ -678,8 +681,17 @@ function assertRelationshipMatchesIntent(
   document: CanvasDocument,
   intent: CanvasAgentNodeCreationIntent,
 ): void {
-  const expected = createRelationshipEdge(intent)
-  if (!expected) return
+  if (!intent.relationship) return
+  /** 已提交文档中的来源节点决定边的输出能力。 */
+  const sourceNode = document.nodes.find((candidate) => candidate.id === intent.relationship?.sourceNodeId)
+  /** 已提交 Agent 节点决定边的目标输入槽。 */
+  const targetNode = document.nodes.find((candidate): candidate is CanvasAgentNode => (
+    candidate.id === intent.nodeId && candidate.kind === 'agent'
+  ))
+  if (!sourceNode || !targetNode) {
+    throw new Error(`Canvas Agent 扩展边归属损坏: ${intent.relationship.edgeId}`)
+  }
+  const expected = createRelationshipEdge(intent, sourceNode, targetNode)!
   const edge = document.edges.find((candidate) => candidate.id === expected.id)
   if (!edge
     || edge.sourceNodeId !== expected.sourceNodeId
@@ -1047,12 +1059,14 @@ export class CanvasAgentNodeCreationService {
         }
         /** 节点与可选边必须通过同一 Store 批次共享 revision。 */
         const mutations: CanvasMutation[] = [{ type: 'upsert-nodes', nodes: [node] }]
-        const relationshipEdge = createRelationshipEdge(intent)
-        if (relationshipEdge) {
+        if (intent.relationship) {
+          /** 权威来源节点决定新边可公开的产物能力。 */
           const sourceNode = document.nodes.find((candidate) => (
-            candidate.id === relationshipEdge.sourceNodeId
+            candidate.id === intent.relationship?.sourceNodeId
           ))
           if (!sourceNode) throw new Error('Canvas 扩展源节点不存在')
+          /** 本次新建 Agent 是类型化边的目标节点。 */
+          const relationshipEdge = createRelationshipEdge(intent, sourceNode, node)!
           if (document.edges.some((edge) => edge.id === relationshipEdge.id)) {
             throw new Error('Canvas 扩展边 ID 已被占用')
           }

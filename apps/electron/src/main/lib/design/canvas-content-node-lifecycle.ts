@@ -1,5 +1,6 @@
 import { randomUUID as createRandomUUID } from 'node:crypto'
 import {
+  createCanvasBoundEdge,
   parseCanvasTrashEntry,
   parseCreateCanvasContentNodeInput,
   parseDeleteCanvasNodeInput,
@@ -517,8 +518,15 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
           const mutations: CanvasMutation[] = [{ type: 'upsert-nodes', nodes: [intent.node] }]
           const relationship = intent.relationship
           if (relationship) {
-            if (!document.nodes.some((node) => node.id === relationship.sourceNodeId)) throw new Error('CANVAS_RELATIONSHIP_SOURCE_MISSING')
-            mutations.push({ type: 'upsert-edges', edges: [{ id: relationship.edgeId, sourceNodeId: relationship.sourceNodeId, sourcePort: 'output', targetNodeId: intent.node.id, targetPort: 'input', relation: relationship.relation }] })
+            /** 权威来源节点决定新内容边的输出能力。 */
+            const sourceNode = document.nodes.find((node) => node.id === relationship.sourceNodeId)
+            if (!sourceNode) throw new Error('CANVAS_RELATIONSHIP_SOURCE_MISSING')
+            mutations.push({ type: 'upsert-edges', edges: [createCanvasBoundEdge(sourceNode, intent.node, {
+              id: relationship.edgeId,
+              sourceNodeId: relationship.sourceNodeId,
+              targetNodeId: intent.node.id,
+              relation: relationship.relation,
+            })] })
           }
           document = dependencies.store.mutate(target, document.revision, mutations)
           changed = true

@@ -394,12 +394,12 @@ const CANVAS_NODE_OUTPUT_CAPABILITY: Readonly<Record<CanvasNodeKind, CanvasArtif
 }
 
 /** 判断未知值是否为受支持的 Canvas 输出能力。 */
-function isCanvasArtifactOutputCapability(value: unknown): value is CanvasArtifactOutputCapability {
+export function isCanvasArtifactOutputCapability(value: unknown): value is CanvasArtifactOutputCapability {
   return Object.values(CANVAS_NODE_OUTPUT_CAPABILITY).includes(value as CanvasArtifactOutputCapability)
 }
 
 /** 判断未知值是否为受支持的 Canvas 输入槽。 */
-function isCanvasArtifactInputSlot(value: unknown): value is CanvasArtifactInputSlot {
+export function isCanvasArtifactInputSlot(value: unknown): value is CanvasArtifactInputSlot {
   return value === 'context.text' || value === 'context.image' || value === 'image.reference'
 }
 
@@ -2824,9 +2824,9 @@ function parseCanvasWorkspaceEdge(value: unknown, nodeIds: ReadonlySet<string>):
   if (!hasExactCanvasKeys(value, keys)
     || !isCanvasLifecycleId(value.id)
     || !isCanvasLifecycleId(value.sourceNodeId)
-    || !isCanvasLifecycleId(value.sourcePort)
+    || (!isCanvasLifecycleId(value.sourcePort) && !isCanvasArtifactOutputCapability(value.sourcePort))
     || !isCanvasLifecycleId(value.targetNodeId)
-    || !isCanvasLifecycleId(value.targetPort)
+    || (!isCanvasLifecycleId(value.targetPort) && !isCanvasArtifactInputSlot(value.targetPort))
     || !nodeIds.has(value.sourceNodeId)
     || !nodeIds.has(value.targetNodeId)) {
     throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')

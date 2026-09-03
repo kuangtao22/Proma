@@ -14,7 +14,10 @@ import {
   applyCanvasMutations,
   CANVAS_DOCUMENT_VERSION,
   createEmptyCanvasDocument,
+  isCanvasArtifactInputSlot,
+  isCanvasArtifactOutputCapability,
   parseCanvasEdgeRelation,
+  resolveCanvasEdgeBinding,
 } from '@proma/shared'
 import type {
   CanvasDocument,
@@ -593,9 +596,9 @@ function parseCanvasEdge(value: unknown, message: string): CanvasEdge {
     || !hasExactKeys(value, fields)
     || !isSafeDesignStableId(value.id)
     || !isSafeDesignStableId(value.sourceNodeId)
-    || !isSafeDesignStableId(value.sourcePort)
+    || (!isSafeDesignStableId(value.sourcePort) && !isCanvasArtifactOutputCapability(value.sourcePort))
     || !isSafeDesignStableId(value.targetNodeId)
-    || !isSafeDesignStableId(value.targetPort)) {
+    || (!isSafeDesignStableId(value.targetPort) && !isCanvasArtifactInputSlot(value.targetPort))) {
     throw new Error(message)
   }
   try {
@@ -697,6 +700,16 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
   /** 边的两端都必须引用当前文档中实际存在的节点。 */
   const nodeIds = new Set(nodes.map((node) => node.id))
   if (edges.some((edge) => !nodeIds.has(edge.sourceNodeId) || !nodeIds.has(edge.targetNodeId))) {
+    throw new Error('CANVAS_DOCUMENT_INVALID')
+  }
+  /** 当前文档拒绝已知但错误的端口组合，未知旧端口继续保持待确认。 */
+  if (edges.some((edge) => {
+    /** 端点存在性已验证，此处节点类型必然可取。 */
+    const sourceKind = nodeKindsById.get(edge.sourceNodeId)!
+    /** 目标类型与来源类型共同决定唯一允许的输入槽。 */
+    const targetKind = nodeKindsById.get(edge.targetNodeId)!
+    return resolveCanvasEdgeBinding(edge, sourceKind, targetKind).state === 'incompatible'
+  })) {
     throw new Error('CANVAS_DOCUMENT_INVALID')
   }
   /** 视口只解析一次，v1 持久化载荷再从校验结果独立重建。 */
@@ -866,6 +879,13 @@ function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]):
         if (upsertedEdgeIds.has(edge.id)
           || !currentNodeIds.has(edge.sourceNodeId)
           || !currentNodeIds.has(edge.targetNodeId)) {
+          throw new Error('CANVAS_MUTATION_INVALID')
+        }
+        /** 当前步骤中的两端类型必须形成可信绑定、纯关联或待确认旧边。 */
+        const sourceKind = nodeKindsById.get(edge.sourceNodeId)!
+        /** 端点存在性已在同一条件中验证，目标类型必然存在。 */
+        const targetKind = nodeKindsById.get(edge.targetNodeId)!
+        if (resolveCanvasEdgeBinding(edge, sourceKind, targetKind).state === 'incompatible') {
           throw new Error('CANVAS_MUTATION_INVALID')
         }
         upsertedEdgeIds.add(edge.id)

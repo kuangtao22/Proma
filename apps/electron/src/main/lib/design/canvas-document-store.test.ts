@@ -165,6 +165,18 @@ describe('CanvasDocumentStore', () => {
     }
   }
 
+  test('Given v4 历史边使用 output/input When 加载 Then 保留原端口并作为未解析关系返回', () => {
+    const fixture = createFixture()
+    /** 当前 schema 中的旧端口仍是可读取的用户事实。 */
+    const document = createConnectedDocument()
+    document.edges[0] = { ...document.edges[0]!, relation: 'reference' }
+    writeDocument(fixture.documentPath, document)
+
+    const loaded = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
+
+    expect(loaded.document.edges[0]).toMatchObject({ sourcePort: 'output', targetPort: 'input' })
+  })
+
   /**
    * 创建包含旧四类节点的 schema v1 文档。
    * @param revision 需要固化的旧文档 revision。
@@ -1290,6 +1302,44 @@ describe('CanvasDocumentStore', () => {
       }] }],
     )).toThrow('CANVAS_MUTATION_INVALID')
     expect(existsSync(fixture.documentPath)).toBe(false)
+  })
+
+  test('Given 已知能力写入错误输入槽 When 保存 mutation Then 在落盘前拒绝', () => {
+    const fixture = createFixture()
+    /** 已存在端点让用例只验证端口组合，不混入悬空引用错误。 */
+    const document = createConnectedDocument()
+    writeDocument(fixture.documentPath, document)
+
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      document.revision,
+      [{ type: 'upsert-edges', edges: [{
+        id: 'edge-invalid', sourceNodeId: 'node-image', sourcePort: 'image.asset',
+        targetNodeId: 'node-agent', targetPort: 'context.text', relation: 'reference',
+      }] }],
+    )).toThrow('CANVAS_MUTATION_INVALID')
+  })
+
+  test('Given 合法类型化端口 When 保存 mutation Then 写入并可从当前文档重新加载', () => {
+    const fixture = createFixture()
+    /** 合法基线提供图片来源和 Agent 目标两个真实端点。 */
+    const document = createConnectedDocument()
+    writeDocument(fixture.documentPath, document)
+
+    const updated = fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      document.revision,
+      [{ type: 'upsert-edges', edges: [{
+        id: 'edge-bound', sourceNodeId: 'node-image', sourcePort: 'image.asset',
+        targetNodeId: 'node-agent', targetPort: 'context.image', relation: 'reference',
+      }] }],
+    )
+
+    expect(updated.edges).toContainEqual(expect.objectContaining({
+      id: 'edge-bound', sourcePort: 'image.asset', targetPort: 'context.image',
+    }))
+    expect(fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }).document.edges)
+      .toContainEqual(expect.objectContaining({ id: 'edge-bound' }))
   })
 
   test('Given Agent batch 传入未知字段和重复节点 When 权威预验证 Then 资源副作用前拒绝', () => {

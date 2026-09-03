@@ -237,6 +237,20 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given 工作区快照包含类型化端口 When 严格解析 Then 保留可信绑定', () => {
+    /** Renderer 公开快照必须接受 Host 已验证且含点号的类型化端口。 */
+    const document = createDocument()
+    document.edges[1] = {
+      ...document.edges[1]!, sourcePort: 'document.markdown', targetPort: 'context.text',
+    }
+
+    const parsed = parseCanvasWorkspaceSnapshot({ document, writable: true, nodeIssues: [] })
+
+    expect(parsed.document.edges[1]).toMatchObject({
+      sourcePort: 'document.markdown', targetPort: 'context.text',
+    })
+  })
+
   test('Given 完整公开工作区快照 When 严格解析 Then 重建四类节点、关系边与深隔离副本', () => {
     const document = structuredClone(createDocument())
     document.nodes.push(structuredClone(webviewNode))

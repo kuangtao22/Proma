@@ -14,6 +14,7 @@ import type {
   DesignPoint,
 } from '@proma/shared'
 import {
+  createCanvasBoundEdge,
   createCanvasLayoutSpatialIndex,
   findCompactCanvasSlot,
   parseCanvasBatchOperationEnvelope,
@@ -275,16 +276,17 @@ function createArtifactOperations(
   /** 节点提交和可选连线保持在同一个 batch。 */
   const operations: CanvasMutation[] = [{ type: 'upsert-nodes', nodes: [node] }]
   if (input.sourceNodeId) {
+    /** 已由位置解析验证存在的来源节点决定产物输出能力。 */
+    const sourceNode = document.nodes.find((candidate) => candidate.id === input.sourceNodeId)
+    if (!sourceNode) throw new Error('CANVAS_ARTIFACT_SOURCE_NODE_NOT_FOUND')
     operations.push({
       type: 'upsert-edges',
-      edges: [{
+      edges: [createCanvasBoundEdge(sourceNode, node, {
         id: identity.edgeId,
         sourceNodeId: input.sourceNodeId,
-        sourcePort: 'output',
         targetNodeId: identity.nodeId,
-        targetPort: 'input',
         relation: input.relation!,
-      }],
+      })],
     })
   }
   return operations

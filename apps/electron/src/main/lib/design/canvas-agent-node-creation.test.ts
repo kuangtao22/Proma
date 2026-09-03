@@ -428,9 +428,9 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(result.document.edges).toContainEqual({
       id: '33333333-3333-4333-8333-333333333333',
       sourceNodeId: 'source-1',
-      sourcePort: 'output',
+      sourcePort: 'agent.text',
       targetNodeId: 'target-1',
-      targetPort: 'input',
+      targetPort: 'context.text',
       relation: 'derives',
     })
     expect(harness.mutationBatches).toEqual([[
