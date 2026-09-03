@@ -3,6 +3,7 @@ import {
   CANVAS_IPC_CHANNELS,
   CANVAS_DOCUMENT_VERSION,
   applyCanvasMutations,
+  createCanvasBoundEdge,
   createEmptyCanvasDocument,
   parseCanvasWebviewDevicePreset,
   parseCanvasWebviewPreviewSnapshot,
@@ -40,6 +41,7 @@ import {
   parseSetDefaultAgentCanvasInput,
   parseUnlinkAgentCanvasInput,
   parseUnlinkAgentCanvasResult,
+  resolveCanvasEdgeBinding,
 } from './canvas'
 import type {
   AgentCanvasBinding,
@@ -74,6 +76,51 @@ const canvasNodeActivityStates: readonly CanvasNodeActivityState[] = [
 
 test('Given Canvas 节点活动合同 When 枚举状态 Then 只包含四种结构化状态', () => {
   expect(canvasNodeActivityStates).toEqual(['idle', 'queued', 'running', 'waiting-approval'])
+})
+
+test('Given 图片到图片的类型化引用 When 判定绑定 Then 输出 image.asset 进入 image.reference', () => {
+  /** 图片到图片引用必须形成可供执行器消费的真实媒体槽。 */
+  const edge = createCanvasBoundEdge(
+    { id: 'source', kind: 'image' },
+    { id: 'target', kind: 'image' },
+    { id: 'edge-1', sourceNodeId: 'source', targetNodeId: 'target', relation: 'reference' },
+  )
+
+  expect(edge).toMatchObject({ sourcePort: 'image.asset', targetPort: 'image.reference' })
+  expect(resolveCanvasEdgeBinding(edge, 'image', 'image')).toEqual({
+    state: 'bound', sourceCapability: 'image.asset', targetSlot: 'image.reference',
+  })
+})
+
+test('Given WebView 到图片的引用 When 创建绑定 Then 只能进入文本上下文槽', () => {
+  /** HTML 产物只能提供文本上下文，不能冒充图片媒体。 */
+  const edge = createCanvasBoundEdge(
+    { id: 'source', kind: 'webview' },
+    { id: 'target', kind: 'image' },
+    { id: 'edge-1', sourceNodeId: 'source', targetNodeId: 'target', relation: 'reference' },
+  )
+
+  expect(edge).toMatchObject({ sourcePort: 'webview.html', targetPort: 'context.text' })
+})
+
+test('Given 历史 output/input 引用 When 判定绑定 Then 保留关系但要求确认', () => {
+  /** 旧端口仍可加载，但不能在没有用户确认时进入执行。 */
+  const edge: CanvasEdge = {
+    id: 'edge-legacy', sourceNodeId: 'source', sourcePort: 'output',
+    targetNodeId: 'target', targetPort: 'input', relation: 'reference',
+  }
+
+  expect(resolveCanvasEdgeBinding(edge, 'image', 'image')).toEqual({ state: 'unresolved' })
+})
+
+test('Given 图片能力被写入文本槽 When 判定绑定 Then 明确标记不兼容', () => {
+  /** 已知端口的错误组合属于非法事实，不能降级成待确认。 */
+  const edge: CanvasEdge = {
+    id: 'edge-invalid', sourceNodeId: 'source', sourcePort: 'image.asset',
+    targetNodeId: 'target', targetPort: 'context.text', relation: 'reference',
+  }
+
+  expect(resolveCanvasEdgeBinding(edge, 'image', 'image')).toEqual({ state: 'incompatible' })
 })
 
 /** 创建共享层图片快照 parser 使用的完整合法样例。 */
@@ -621,6 +668,40 @@ describe('Canvas 图共享合同', () => {
     expect(parsed.jobs[0]).not.toBe(input.jobs[0])
     expect(parsed.assets[0]).not.toBe(input.assets[0])
     expect(parsed.imageVersions[0]).not.toBe(input.imageVersions[0])
+  })
+
+  test('Given 新旧图片任务引用 When 严格解析 Then 新端口成对保留且旧引用继续兼容', () => {
+    /** 新任务固化已验证的媒体绑定，供运行时按槽解析真实素材。 */
+    const current = createCanvasImageSnapshotFixture()
+    current.jobs[0]!.canvasInputReferences = [{
+      nodeId: 'node-reference', kind: 'image', revision: 2,
+      summary: '角色三视图', summaryHash: 'b'.repeat(64), assetId: 'asset-reference',
+      sourcePort: 'image.asset', targetPort: 'image.reference',
+    }]
+    /** 旧任务没有端口字段，升级后仍须正常读取历史详情。 */
+    const legacy = createCanvasImageSnapshotFixture()
+    legacy.jobs[0]!.canvasInputReferences = [{
+      nodeId: 'node-reference', kind: 'image', revision: 2,
+      summary: '角色三视图', summaryHash: 'b'.repeat(64), assetId: 'asset-reference',
+    }]
+
+    expect(parseCanvasImageModuleSnapshot(current).jobs[0]?.canvasInputReferences)
+      .toEqual(current.jobs[0]?.canvasInputReferences)
+    expect(parseCanvasImageModuleSnapshot(legacy).jobs[0]?.canvasInputReferences)
+      .toEqual(legacy.jobs[0]?.canvasInputReferences)
+  })
+
+  test('Given 图片任务引用只包含单侧端口 When 严格解析 Then 拒绝不完整绑定快照', () => {
+    /** 单侧端口无法证明绑定合同，必须在 IPC 边界 fail closed。 */
+    const input = createCanvasImageSnapshotFixture()
+    input.jobs[0]!.canvasInputReferences = [{
+      nodeId: 'node-reference', kind: 'image', revision: 2,
+      summary: '角色三视图', summaryHash: 'b'.repeat(64), assetId: 'asset-reference',
+      sourcePort: 'image.asset',
+    }]
+
+    expect(() => parseCanvasImageModuleSnapshot(input))
+      .toThrow('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
   })
 
   test('Given 图片快照夹带未知字段、私有路径或错误版本关系 When 严格解析 Then fail closed', () => {

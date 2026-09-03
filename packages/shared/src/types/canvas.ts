@@ -358,6 +358,51 @@ export type CanvasContentNode = CanvasImageNode | CanvasDocumentNode | CanvasWeb
 /** Canvas 边表达的长期语义关系。 */
 export type CanvasEdgeRelation = 'association' | 'reference' | 'depends-on' | 'derives'
 
+/** Canvas 节点可向下游提供的可信产物能力。 */
+export type CanvasArtifactOutputCapability =
+  | 'agent.text'
+  | 'image.asset'
+  | 'document.markdown'
+  | 'webview.html'
+
+/** Canvas 下游节点可接收的可信输入槽。 */
+export type CanvasArtifactInputSlot =
+  | 'context.text'
+  | 'context.image'
+  | 'image.reference'
+
+/** Canvas 边经过节点类型校验后的执行绑定状态。 */
+export type CanvasEdgeBindingResolution =
+  | {
+    state: 'bound'
+    sourceCapability: CanvasArtifactOutputCapability
+    targetSlot: CanvasArtifactInputSlot
+  }
+  | { state: 'none' }
+  | { state: 'unresolved' }
+  | { state: 'incompatible' }
+
+/** 纯业务关联边使用的稳定空端口，不代表任何执行输入。 */
+export const CANVAS_UNBOUND_PORT = 'unbound'
+
+/** 各节点类型唯一公开的默认产物能力。 */
+const CANVAS_NODE_OUTPUT_CAPABILITY: Readonly<Record<CanvasNodeKind, CanvasArtifactOutputCapability>> = {
+  agent: 'agent.text',
+  image: 'image.asset',
+  document: 'document.markdown',
+  webview: 'webview.html',
+}
+
+/** 判断未知值是否为受支持的 Canvas 输出能力。 */
+function isCanvasArtifactOutputCapability(value: unknown): value is CanvasArtifactOutputCapability {
+  return Object.values(CANVAS_NODE_OUTPUT_CAPABILITY).includes(value as CanvasArtifactOutputCapability)
+}
+
+/** 判断未知值是否为受支持的 Canvas 输入槽。 */
+function isCanvasArtifactInputSlot(value: unknown): value is CanvasArtifactInputSlot {
+  return value === 'context.text' || value === 'context.image' || value === 'image.reference'
+}
+
 /** 严格解析 Canvas 边语义。 */
 export function parseCanvasEdgeRelation(value: unknown): CanvasEdgeRelation {
   if (value !== 'association' && value !== 'reference'
@@ -375,6 +420,68 @@ export interface CanvasEdge {
   targetNodeId: string
   targetPort: string
   relation: CanvasEdgeRelation
+}
+
+/**
+ * 根据两端节点类型创建 Host 可验证的执行边。
+ * @param source 来源节点稳定身份与类型。
+ * @param target 目标节点稳定身份与类型。
+ * @param edge 不含端口的关系边事实。
+ * @returns 写入类型化端口或空关联端口的完整边。
+ */
+export function createCanvasBoundEdge(
+  source: Pick<CanvasNode, 'id' | 'kind'>,
+  target: Pick<CanvasNode, 'id' | 'kind'>,
+  edge: Omit<CanvasEdge, 'sourcePort' | 'targetPort'>,
+): CanvasEdge {
+  if (edge.relation === 'association') {
+    return { ...edge, sourcePort: CANVAS_UNBOUND_PORT, targetPort: CANVAS_UNBOUND_PORT }
+  }
+  /** 来源能力由权威节点类型唯一决定。 */
+  const sourcePort = CANVAS_NODE_OUTPUT_CAPABILITY[source.kind]
+  /** 图片产物进入媒体槽，其它产物只进入文本上下文。 */
+  const targetPort: CanvasArtifactInputSlot = sourcePort === 'image.asset'
+    ? target.kind === 'image' ? 'image.reference' : 'context.image'
+    : 'context.text'
+  return { ...edge, sourcePort, targetPort }
+}
+
+/**
+ * 判定持久化边是否形成可信执行绑定。
+ * @param edge 待校验的持久化边。
+ * @param sourceKind 来源节点权威类型。
+ * @param targetKind 目标节点权威类型。
+ * @returns 已绑定、无绑定、待确认或不兼容状态。
+ */
+export function resolveCanvasEdgeBinding(
+  edge: CanvasEdge,
+  sourceKind: CanvasNodeKind,
+  targetKind: CanvasNodeKind,
+): CanvasEdgeBindingResolution {
+  if (edge.relation === 'association') return { state: 'none' }
+  /** 用同一建边规则计算当前节点组合唯一允许的端口。 */
+  const expected = createCanvasBoundEdge(
+    { id: edge.sourceNodeId, kind: sourceKind },
+    { id: edge.targetNodeId, kind: targetKind },
+    {
+      id: edge.id,
+      sourceNodeId: edge.sourceNodeId,
+      targetNodeId: edge.targetNodeId,
+      relation: edge.relation,
+    },
+  )
+  if (edge.sourcePort === expected.sourcePort && edge.targetPort === expected.targetPort) {
+    return {
+      state: 'bound',
+      sourceCapability: expected.sourcePort as CanvasArtifactOutputCapability,
+      targetSlot: expected.targetPort as CanvasArtifactInputSlot,
+    }
+  }
+  /** 任一已知端口出现在错误组合中时，必须判定为不兼容。 */
+  if (isCanvasArtifactOutputCapability(edge.sourcePort) || isCanvasArtifactInputSlot(edge.targetPort)) {
+    return { state: 'incompatible' }
+  }
+  return { state: 'unresolved' }
 }
 
 /** 一个项目中单个 Canvas 会话的独立图文档。 */
@@ -1087,6 +1194,8 @@ export interface CanvasImageInputReference {
   summary: string
   summaryHash: string
   assetId?: string
+  sourcePort?: CanvasArtifactOutputCapability
+  targetPort?: CanvasArtifactInputSlot
 }
 
 /** Canvas Agent 节点的项目、Canvas 与节点三重身份。 */
@@ -1126,6 +1235,9 @@ export type CanvasPublicErrorCode =
   | 'CANVAS_IMAGE_LOAD_FAILED'
   | 'CANVAS_IMAGE_SAVE_FAILED'
   | 'CANVAS_IMAGE_JOB_FAILED'
+  | 'CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED'
+  | 'CANVAS_IMAGE_INPUT_MISSING'
+  | 'CANVAS_IMAGE_INPUT_INVALID'
   | 'CANVAS_IMAGE_REVISION_CONFLICT'
   | 'CANVAS_IMAGE_BATCH_CONFLICT'
   | 'CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED'
@@ -1773,17 +1885,27 @@ function parseCanvasImageContextReference(value: unknown): DesignContextReferenc
 
 /** 严格重建图片任务的一条直接上游引用。 */
 function parseCanvasImageSnapshotInputReference(value: unknown): CanvasImageInputReference {
+  /** 新任务端口必须成对存在；旧任务允许两端同时缺失。 */
+  const hasSourcePort = value !== null && typeof value === 'object' && Object.hasOwn(value, 'sourcePort')
+  /** 目标端口存在性与来源端口必须完全一致。 */
+  const hasTargetPort = value !== null && typeof value === 'object' && Object.hasOwn(value, 'targetPort')
   /** 只有图片上游允许额外携带 adopted 素材身份。 */
-  const keys = value !== null && typeof value === 'object' && Object.hasOwn(value, 'assetId')
-    ? ['nodeId', 'kind', 'revision', 'summary', 'summaryHash', 'assetId']
-    : ['nodeId', 'kind', 'revision', 'summary', 'summaryHash']
+  const optionalKeys = [
+    ...(value !== null && typeof value === 'object' && Object.hasOwn(value, 'assetId') ? ['assetId'] : []),
+    ...(hasSourcePort ? ['sourcePort', 'targetPort'] : []),
+  ]
+  /** exact-key 合同按真实存在的可选字段构造。 */
+  const keys = ['nodeId', 'kind', 'revision', 'summary', 'summaryHash', ...optionalKeys]
   if (!hasExactCanvasKeys(value, keys)
+    || hasSourcePort !== hasTargetPort
     || !isCanvasLifecycleId(value.nodeId)
     || !['agent', 'image', 'document', 'webview'].includes(String(value.kind))
     || !isCanvasNonNegativeInteger(value.revision)
     || !isCanvasImageSnapshotText(value.summary, 8_192)
     || typeof value.summaryHash !== 'string' || !/^[0-9a-f]{64}$/iu.test(value.summaryHash)
-    || (Object.hasOwn(value, 'assetId') && !isCanvasLifecycleId(value.assetId))) {
+    || (Object.hasOwn(value, 'assetId') && !isCanvasLifecycleId(value.assetId))
+    || (hasSourcePort && !isCanvasArtifactOutputCapability(value.sourcePort))
+    || (hasTargetPort && !isCanvasArtifactInputSlot(value.targetPort))) {
     throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
   }
   return {
@@ -1793,6 +1915,10 @@ function parseCanvasImageSnapshotInputReference(value: unknown): CanvasImageInpu
     summary: value.summary,
     summaryHash: value.summaryHash,
     ...(Object.hasOwn(value, 'assetId') ? { assetId: value.assetId as string } : {}),
+    ...(hasSourcePort ? {
+      sourcePort: value.sourcePort as CanvasArtifactOutputCapability,
+      targetPort: value.targetPort as CanvasArtifactInputSlot,
+    } : {}),
   }
 }
 
