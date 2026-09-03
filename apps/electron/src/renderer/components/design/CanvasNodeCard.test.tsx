@@ -198,7 +198,7 @@ describe('Canvas 通用折叠节点卡片', () => {
   })
 
   test.each([
-    ['new-version', '新版本'],
+    ['new-version', '有新版本'],
     ['partial', '部分完成'],
   ] as const)('Given 生图节点存在 %s 候选 When 折叠渲染 Then 正式缩略图不变并显示候选标记', (candidateState, label) => {
     const html = renderCard('image', {

@@ -267,6 +267,8 @@ describe('Canvas 生图工作台', () => {
 
     expect(html).toContain('取消生成')
     expect(html).not.toContain('>生成图片<')
+    expect(html).toContain('正在整理生成上下文并生成图片。')
+    expect(html).not.toContain('Agent 正在')
   })
 
   test('Given 最近任务失败 When 渲染 Then 显示清洗错误、重试和详情入口', () => {

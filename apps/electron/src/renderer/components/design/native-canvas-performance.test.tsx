@@ -383,13 +383,17 @@ describe('原生 Canvas 大画布性能预算', () => {
 
     expect(captured).toMatchObject({
       nodesConnectable: true,
-      edgesFocusable: false,
+      edgesFocusable: true,
       edgesReconnectable: false,
       deleteKeyCode: null,
       onlyRenderVisibleElements: true,
     })
-    expect(captured?.edges[0]).toMatchObject({ selectable: false, deletable: false, focusable: false })
+    expect(captured?.edges[0]).toMatchObject({
+      sourceHandle: 'output', targetHandle: 'input',
+      selectable: true, deletable: false, focusable: true,
+    })
     expect(typeof captured?.onConnect).toBe('function')
+    expect(typeof captured?.onEdgeClick).toBe('function')
     expect('onEdgesDelete' in captured!).toBe(false)
 
     captured!.onConnect!({
@@ -399,27 +403,32 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(mutations).toEqual([{
       type: 'upsert-edges',
       edges: [{
-        id: 'edge-created', sourceNodeId: 'agent-1', sourcePort: 'output',
-        targetNodeId: 'image-1', targetPort: 'input', relation: 'association',
+        id: 'edge-created', sourceNodeId: 'agent-1', sourcePort: 'unbound',
+        targetNodeId: 'image-1', targetPort: 'unbound', relation: 'association',
       }],
     }])
   })
 
   test('Given 拖线已创建默认关联 When 显示语义菜单 Then 提供四种中文关系选择', () => {
     /** 菜单输入使用已经按默认 association 写入的稳定边。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [
+      { id: 'agent-1', kind: 'agent', title: 'Agent', agentSessionId: 'session-1', position: { x: 0, y: 0 } },
+      { id: 'image-1', kind: 'image', title: 'Image', imageModuleId: 'image-1', position: { x: 300, y: 0 } },
+    ]
     const edge = {
-      id: 'edge-1', sourceNodeId: 'agent-1', sourcePort: 'output',
-      targetNodeId: 'image-1', targetPort: 'input', relation: 'association' as const,
+      id: 'edge-1', sourceNodeId: 'agent-1', sourcePort: 'unbound',
+      targetNodeId: 'image-1', targetPort: 'unbound', relation: 'association' as const,
     }
     const html = renderToStaticMarkup(
-      <NativeCanvasEdgeRelationMenu edge={edge} onSelect={() => undefined} />,
+      <NativeCanvasEdgeRelationMenu edge={edge} document={document} onSelect={() => undefined} />,
     )
 
     expect(html).toContain('aria-label="选择连线关系"')
-    expect(html).toContain('>关联<')
-    expect(html).toContain('>引用<')
-    expect(html).toContain('>依赖<')
-    expect(html).toContain('>衍生<')
+    expect(html).toContain('>仅关联<')
+    expect(html).toContain('>引用 · 文字上下文<')
+    expect(html).toContain('>依赖 · 文字上下文<')
+    expect(html).toContain('>衍生 · 文字上下文<')
   })
 
   test('Given 持久连线 When 使用真实 ReactFlow 渲染 Then 输出可见 edge path', () => {
@@ -494,9 +503,10 @@ describe('原生 Canvas 大画布性能预算', () => {
     )
 
     captured!.onNodesChange?.([{ id: 'agent-1', type: 'select', selected: true }])
+    captured!.onSelectionChange?.({ nodes: captured!.nodes, edges: [] })
 
     expect(selected).toEqual(['agent-1'])
     expect(conversations).toEqual([])
-    expect(captured!.onSelectionChange).toBeUndefined()
+    expect(typeof captured!.onSelectionChange).toBe('function')
   })
 })

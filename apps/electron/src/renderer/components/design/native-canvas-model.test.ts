@@ -8,6 +8,7 @@ import {
   createArrangeCanvasNodesMutation,
   createMoveCanvasNodesMutation,
   createNativeCanvasUserEdge,
+  confirmNativeCanvasEdge,
   createViewportCanvasMutation,
   findAvailableNativeCanvasChildPosition,
   findAvailableNativeCanvasNodePosition,
@@ -272,12 +273,12 @@ describe('原生 Canvas 纯投影', () => {
     expect(projectHeight()).toBe(144)
   })
 
-  test('Given 持久边 When 投影 Then 端口与引用语义保留并显示中文标签', () => {
+  test('Given 历史引用边 When 投影 Then 显示待确认且仍连接结构 Handle', () => {
     expect(toNativeCanvasFlowEdges(createDocument())).toEqual([{
       id: 'edge-1', source: 'agent-1', sourceHandle: 'output',
-      target: 'image-1', targetHandle: 'input', selectable: false,
-      deletable: false, focusable: false, animated: false,
-      data: { relation: 'reference' }, label: '引用',
+      target: 'image-1', targetHandle: 'input', selectable: true,
+      deletable: false, focusable: true, animated: false,
+      data: { relation: 'reference', bindingState: 'unresolved' }, label: '引用 · 待确认',
     }])
   })
 
@@ -286,8 +287,11 @@ describe('原生 Canvas 纯投影', () => {
     const relations = ['association', 'reference', 'depends-on', 'derives'] as const
     const document = createDocument()
     document.edges = relations.map((relation, index) => ({
-      id: `edge-${index}`, sourceNodeId: 'agent-1', sourcePort: 'output',
-      targetNodeId: 'image-1', targetPort: 'input', relation,
+      id: `edge-${index}`, sourceNodeId: 'agent-1',
+      sourcePort: relation === 'association' ? 'unbound' : 'agent.text',
+      targetNodeId: 'image-1',
+      targetPort: relation === 'association' ? 'unbound' : 'context.text',
+      relation,
     }))
 
     expect(toNativeCanvasFlowEdges(document).map((edge) => [edge.data?.relation, edge.label]))
@@ -301,11 +305,29 @@ describe('原生 Canvas 纯投影', () => {
 
   test('Given 用户拖线 When 构造持久边 Then 默认语义为关联', () => {
     expect(createNativeCanvasUserEdge({
-      id: 'edge-user', sourceNodeId: 'agent-1', sourcePort: 'output',
-      targetNodeId: 'image-1', targetPort: 'input',
+      id: 'edge-user', sourceNodeId: 'agent-1', targetNodeId: 'image-1',
     })).toEqual({
-      id: 'edge-user', sourceNodeId: 'agent-1', sourcePort: 'output',
-      targetNodeId: 'image-1', targetPort: 'input', relation: 'association',
+      id: 'edge-user', sourceNodeId: 'agent-1', sourcePort: 'unbound',
+      targetNodeId: 'image-1', targetPort: 'unbound', relation: 'association',
+    })
+  })
+
+  test('Given 用户重新确认图片引用 When 构造边 Then 同一 edge ID 写入图片绑定', () => {
+    const document = createDocument()
+    document.nodes.push({
+      id: 'image-source', kind: 'image', title: '参考图', position: { x: 0, y: 0 },
+      imageModuleId: 'image-source-module', adoptedAssetId: 'image-source-asset',
+    })
+    document.edges[0] = {
+      id: 'edge-image-reference', sourceNodeId: 'image-source', sourcePort: 'output',
+      targetNodeId: 'image-1', targetPort: 'input', relation: 'reference',
+    }
+
+    expect(confirmNativeCanvasEdge(document.edges[0]!, 'reference', document)).toMatchObject({
+      id: 'edge-image-reference',
+      sourcePort: 'image.asset',
+      targetPort: 'image.reference',
+      relation: 'reference',
     })
   })
 })

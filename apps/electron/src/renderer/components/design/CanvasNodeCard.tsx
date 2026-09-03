@@ -216,7 +216,7 @@ export function CanvasNodeCard({
                 }}
                 onDoubleClick={(event) => event.stopPropagation()}
               >
-                {candidateState === 'partial' ? '部分完成' : '新版本'}
+                {candidateState === 'partial' ? '部分完成' : '有新版本'}
               </button>
             ) : null}
             {toolbar}

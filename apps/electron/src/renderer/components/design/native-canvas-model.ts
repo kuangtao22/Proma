@@ -1,7 +1,10 @@
 import {
   applyCanvasMutations,
+  CANVAS_UNBOUND_PORT,
+  createCanvasBoundEdge,
   createCanvasLayoutSpatialIndex,
   findCompactCanvasSlot,
+  resolveCanvasEdgeBinding,
 } from '@proma/shared'
 import type {
   CanvasLayoutRect,
@@ -361,14 +364,14 @@ export function toNativeCanvasFlowNodes(
     /** 目标节点当前高度决定输入 Handle 的垂直中点。 */
     const targetSize = nodeSizeById.get(edge.targetNodeId)
     appendHandle(edge.sourceNodeId, {
-      id: edge.sourcePort,
+      id: 'output',
       type: 'source',
       position: Position.Right,
       x: sourceSize?.width ?? NATIVE_CANVAS_NODE_WIDTH,
       y: (sourceSize?.height ?? NATIVE_CANVAS_NODE_HEIGHT) / 2,
     })
     appendHandle(edge.targetNodeId, {
-      id: edge.targetPort,
+      id: 'input',
       type: 'target',
       position: Position.Left,
       x: 0,
@@ -502,30 +505,72 @@ export function toNativeCanvasFlowNodes(
   })
 }
 
-/** 将持久端口连线投影为完全只读的 XYFlow 边。 */
+/** 将持久业务端口投影到固定 XYFlow 结构 Handle，并附带绑定状态。 */
 export function toNativeCanvasFlowEdges(document: CanvasDocument): Edge[] {
-  return document.edges.map((edge: CanvasEdge): Edge => ({
-    id: edge.id,
-    source: edge.sourceNodeId,
-    sourceHandle: edge.sourcePort,
-    target: edge.targetNodeId,
-    targetHandle: edge.targetPort,
-    selectable: false,
-    deletable: false,
-    focusable: false,
-    animated: false,
-    data: { relation: edge.relation },
-    label: CANVAS_EDGE_RELATION_LABELS[edge.relation],
-  }))
+  /** 节点类别决定业务端口是否合法；索引避免逐边线性搜索。 */
+  const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
+  return document.edges.map((edge: CanvasEdge): Edge => {
+    const source = nodesById.get(edge.sourceNodeId)
+    const target = nodesById.get(edge.targetNodeId)
+    if (!source || !target) throw new Error('CANVAS_EDGE_ENDPOINT_MISSING')
+    const binding = resolveCanvasEdgeBinding(edge, source.kind, target.kind)
+    return {
+      id: edge.id,
+      source: edge.sourceNodeId,
+      sourceHandle: 'output',
+      target: edge.targetNodeId,
+      targetHandle: 'input',
+      selectable: true,
+      deletable: false,
+      focusable: true,
+      animated: false,
+      data: { relation: edge.relation, bindingState: binding.state },
+      label: binding.state === 'unresolved'
+        ? `${CANVAS_EDGE_RELATION_LABELS[edge.relation]} · 待确认`
+        : CANVAS_EDGE_RELATION_LABELS[edge.relation],
+    }
+  })
 }
 
 /**
  * 为用户手动拖线构造默认关联边。
- * @param edge 不含语义的稳定端口边。
+ * @param edge 不含语义和业务端口的稳定结构边。
  * @returns 明确携带 association 的持久 Canvas 边。
  */
-export function createNativeCanvasUserEdge(edge: Omit<CanvasEdge, 'relation'>): CanvasEdge {
-  return { ...edge, relation: 'association' }
+export function createNativeCanvasUserEdge(
+  edge: Omit<CanvasEdge, 'relation' | 'sourcePort' | 'targetPort'>,
+): CanvasEdge {
+  return {
+    ...edge,
+    sourcePort: CANVAS_UNBOUND_PORT,
+    targetPort: CANVAS_UNBOUND_PORT,
+    relation: 'association',
+  }
+}
+
+/**
+ * 使用当前权威节点类别重新确认一条持久边的业务用途。
+ * @param edge 待确认的新边或历史边。
+ * @param relation 用户选择的关系语义。
+ * @param document 当前权威 Canvas 文档。
+ * @returns 保留 edge ID 且写入类型化业务端口的新边。
+ */
+export function confirmNativeCanvasEdge(
+  edge: CanvasEdge,
+  relation: CanvasEdgeRelation,
+  document: CanvasDocument,
+): CanvasEdge {
+  /** 端点必须仍存在于当前权威文档，避免用陈旧菜单写回悬空边。 */
+  const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
+  const source = nodesById.get(edge.sourceNodeId)
+  const target = nodesById.get(edge.targetNodeId)
+  if (!source || !target) throw new Error('CANVAS_EDGE_ENDPOINT_MISSING')
+  return createCanvasBoundEdge(source, target, {
+    id: edge.id,
+    sourceNodeId: edge.sourceNodeId,
+    targetNodeId: edge.targetNodeId,
+    relation,
+  })
 }
 
 /** 将一次拖动中的全部节点位置合成单个 mutation。 */

@@ -40,6 +40,7 @@ import {
 import {
   createMoveCanvasNodesMutation,
   createNativeCanvasUserEdge,
+  confirmNativeCanvasEdge,
   createViewportCanvasMutation,
   toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
@@ -130,12 +131,29 @@ const NATIVE_CANVAS_EDGE_RELATION_OPTIONS: ReadonlyArray<{
 /** 刚完成拖线后显示的轻量语义选择菜单。 */
 export interface NativeCanvasEdgeRelationMenuProps {
   edge: CanvasEdge
+  document: CanvasDocument
   onSelect: (relation: CanvasEdgeRelation) => void
 }
 
-/** 为已持久化的默认关联边选择最终语义，不改变边身份和端口。 */
+/** 将关系与推导出的输入槽转换为用户可理解的菜单标签。 */
+function getNativeCanvasRelationOptionLabel(
+  edge: CanvasEdge,
+  relation: CanvasEdgeRelation,
+  document: CanvasDocument,
+): string {
+  if (relation === 'association') return '仅关联'
+  const confirmed = confirmNativeCanvasEdge(edge, relation, document)
+  /** 输入槽表达真实消费方式，用户无需理解内部端口字符串。 */
+  const inputLabel = confirmed.targetPort === 'image.reference'
+    ? '图片参考'
+    : confirmed.targetPort === 'context.image' ? '图片上下文' : '文字上下文'
+  return `${NATIVE_CANVAS_EDGE_RELATION_OPTIONS.find((option) => option.relation === relation)?.label ?? relation} · ${inputLabel}`
+}
+
+/** 为新建或已持久化边选择最终语义，并保持边身份不变。 */
 export function NativeCanvasEdgeRelationMenu({
   edge,
+  document,
   onSelect,
 }: NativeCanvasEdgeRelationMenuProps): React.ReactElement {
   return (
@@ -153,7 +171,7 @@ export function NativeCanvasEdgeRelationMenu({
           className="rounded-[4px] px-2 py-1 text-xs text-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           onClick={() => onSelect(option.relation)}
         >
-          {option.label}
+          {getNativeCanvasRelationOptionLabel(edge, option.relation, document)}
         </button>
       ))}
     </div>
@@ -411,29 +429,42 @@ export function NativeCanvasGraph({
   /** 手工拖线先以默认关联语义持久化，再打开同一边的语义菜单。 */
   const handleConnect = React.useCallback<OnConnect>((connection) => {
     if (!writable || activeTool !== 'select'
-      || !connection.source || !connection.target
-      || !connection.sourceHandle || !connection.targetHandle) return
+      || !connection.source || !connection.target) return
     /** 稳定边身份只生成一次，后续语义选择复用同一 ID。 */
     const edge = createNativeCanvasUserEdge({
       id: createEdgeId(),
       sourceNodeId: connection.source,
-      sourcePort: connection.sourceHandle,
       targetNodeId: connection.target,
-      targetPort: connection.targetHandle,
     })
     onMutation({ type: 'upsert-edges', edges: [edge] })
     setPendingRelationEdge(edge)
   }, [activeTool, createEdgeId, onMutation, writable])
 
-  /** 用同一稳定边覆盖语义，避免拖线产生重复边。 */
+  /** 用同一稳定边覆盖语义与业务端口，避免拖线或旧边确认产生重复边。 */
   const selectPendingEdgeRelation = React.useCallback((relation: CanvasEdgeRelation): void => {
     if (!pendingRelationEdge) return
     onMutation({
       type: 'upsert-edges',
-      edges: [{ ...pendingRelationEdge, relation }],
+      edges: [confirmNativeCanvasEdge(pendingRelationEdge, relation, document)],
     })
     setPendingRelationEdge(null)
-  }, [onMutation, pendingRelationEdge])
+  }, [document, onMutation, pendingRelationEdge])
+
+  /** 点击已持久化边时重新打开用途确认菜单。 */
+  const handleEdgeClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onEdgeClick']>>((_event, edge) => {
+    if (!writable || activeTool !== 'select') return
+    const persisted = document.edges.find((candidate) => candidate.id === edge.id)
+    if (persisted) setPendingRelationEdge(persisted)
+  }, [activeTool, document.edges, writable])
+
+  /** 键盘选择边时同样打开用途确认菜单，保持无鼠标操作可达。 */
+  const handleSelectionChange = React.useCallback<NonNullable<NativeCanvasFlowProps['onSelectionChange']>>(({ edges }) => {
+    if (!writable || activeTool !== 'select') return
+    const selected = edges[0]
+    if (!selected) return
+    const persisted = document.edges.find((candidate) => candidate.id === selected.id)
+    if (persisted) setPendingRelationEdge(persisted)
+  }, [activeTool, document.edges, writable])
 
   /** 视口手势开始后暂缓远端 viewport 覆盖本地逐帧反馈。 */
   const handleMoveStart = React.useCallback<OnMoveStart>(() => {
@@ -494,12 +525,14 @@ export function NativeCanvasGraph({
     preventScrolling: true,
     selectionOnDrag: activeTool === 'select',
     multiSelectionKeyCode: null,
-    edgesFocusable: false,
+    edgesFocusable: writable && activeTool === 'select',
     edgesReconnectable: false,
     deleteKeyCode: null,
     onNodesChange: handleNodesChange,
     onNodeDragStop: handleNodeDragStop,
     onConnect: handleConnect,
+    onEdgeClick: handleEdgeClick,
+    onSelectionChange: handleSelectionChange,
     onMoveStart: handleMoveStart,
     onMove: handleMove,
     onMoveEnd: handleMoveEnd,
@@ -519,6 +552,7 @@ export function NativeCanvasGraph({
       {pendingRelationEdge ? (
         <NativeCanvasEdgeRelationMenu
           edge={pendingRelationEdge}
+          document={document}
           onSelect={selectPendingEdgeRelation}
         />
       ) : null}

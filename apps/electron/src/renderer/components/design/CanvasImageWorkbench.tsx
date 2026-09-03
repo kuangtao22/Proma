@@ -105,7 +105,7 @@ const JOB_STATUS_LABELS: Record<DesignJobRecord['status'], string> = {
 /** 任务状态对应的语义提示。 */
 const JOB_STATUS_MESSAGES: Partial<Record<DesignJobRecord['status'], string>> = {
   queued: '任务已进入队列，开始前可以取消。',
-  running: 'Agent 正在整理上下文并生成图片。',
+  running: '正在整理生成上下文并生成图片。',
   cancelled: '本次生成已取消，当前图片保持不变。',
   interrupted: '应用中断了本次生成，可以使用原配置重试。',
 }
@@ -252,6 +252,8 @@ export function CanvasImageWorkbench({
   const activeJob = jobs.find((job) => job.status === 'queued' || job.status === 'running')
   /** 最近任务决定失败、取消和中断后的恢复主操作。 */
   const latestJob = jobs[0]
+  /** 运行任务优先代表当前界面状态，避免较新的历史终态遮住正在执行的任务。 */
+  const displayedJob = activeJob ?? latestJob
   /** 只有可恢复终态任务显示重试。 */
   const retryableJob = latestJob && ['failed', 'cancelled', 'interrupted'].includes(latestJob.status)
     ? latestJob
@@ -285,8 +287,8 @@ export function CanvasImageWorkbench({
     || imageModelLoadState !== 'ready'
     || !draft.prompt.trim()
     || !selectedModel?.available
-  /** 最近任务固化的直接上游内容用于用户核对真实输入。 */
-  const inputReferences = latestJob?.canvasInputReferences ?? []
+  /** 当前展示任务固化的直接上游内容用于用户核对真实输入。 */
+  const inputReferences = displayedJob?.canvasInputReferences ?? []
   /** 当前展开的详情任务必须仍存在于模块快照中。 */
   const detailsJob = detailsJobId ? jobs.find((job) => job.id === detailsJobId) : undefined
   /** 详情视图按 job 独立读取，不复用旧 Inspector Map。 */
@@ -303,7 +305,7 @@ export function CanvasImageWorkbench({
                 {previewingHistory ? '正在预览历史版本' : '跟随已采用版本'}
               </p>
             </div>
-            {latestJob && <Badge variant="secondary" className="rounded-sm text-[10px]">{JOB_STATUS_LABELS[latestJob.status]}</Badge>}
+            {displayedJob && <Badge variant="secondary" className="rounded-sm text-[10px]">{JOB_STATUS_LABELS[displayedJob.status]}</Badge>}
           </div>
 
           <ImagePreview
@@ -346,11 +348,11 @@ export function CanvasImageWorkbench({
             </Button>
           )}
 
-          {latestJob?.error && (
-            <p className="break-words text-xs text-destructive" role="alert">{latestJob.error}</p>
+          {displayedJob?.error && (
+            <p className="break-words text-xs text-destructive" role="alert">{displayedJob.error}</p>
           )}
-          {latestJob && JOB_STATUS_MESSAGES[latestJob.status] && !latestJob.error && (
-            <p className="text-xs text-muted-foreground">{JOB_STATUS_MESSAGES[latestJob.status]}</p>
+          {displayedJob && JOB_STATUS_MESSAGES[displayedJob.status] && !displayedJob.error && (
+            <p className="text-xs text-muted-foreground">{JOB_STATUS_MESSAGES[displayedJob.status]}</p>
           )}
 
           <div className="space-y-2">
@@ -396,8 +398,8 @@ export function CanvasImageWorkbench({
             )}
           </div>
 
-          {latestJob && (
-            <Button type="button" variant="ghost" size="sm" className="px-1" onClick={() => setDetailsJobId(latestJob.id)}>
+          {displayedJob && (
+            <Button type="button" variant="ghost" size="sm" className="px-1" onClick={() => setDetailsJobId(displayedJob.id)}>
               查看任务详情
             </Button>
           )}
