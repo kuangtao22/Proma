@@ -751,7 +751,7 @@ export function getDelegationTabLabel(title: string | null | undefined): string 
   return title?.trim() || '委派任务'
 }
 
-export type AgentSidePanelBaseTab = 'files' | 'changes' | 'chat' | 'temporary-agent' | WorkspaceComponentTab
+export type AgentSidePanelBaseTab = 'files' | 'changes' | 'chat' | 'temporary-agent' | 'canvas' | WorkspaceComponentTab
 /** 工作区组件、每个 Pi 探索分支、协作子 Agent、浏览器网页和文件预览都处于右侧工作区顶栏。 */
 export type AgentSidePanelTab = AgentSidePanelBaseTab | `exploration:${string}` | `delegation:${string}` | `browser:${string}` | `preview:${string}` | `terminal:${string}` | `canvas:${string}`
 

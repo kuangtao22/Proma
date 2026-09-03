@@ -1,4 +1,11 @@
-import type { CanvasSessionMeta } from '@proma/shared'
+import type { AgentCanvasBinding, CanvasSessionMeta } from '@proma/shared'
+import {
+  placeRightWorkspaceSplitTab,
+  selectRightWorkspaceSplitTab,
+} from '@/lib/right-workspace-split'
+import type { RightWorkspacePane, RightWorkspaceSplitState } from '@/lib/right-workspace-split'
+import { getCanvasWorkspaceTab } from '@/atoms/agent-atoms'
+import type { AgentSidePanelTab } from '@/atoms/agent-atoms'
 
 /** Canvas 宿主动作的固定错误反馈合同。 */
 export interface CanvasWorkspaceActionOptions<T> {
@@ -32,6 +39,62 @@ export async function runCanvasWorkspaceAction<T>({
     onErrorMessage(failureMessage)
     return null
   }
+}
+
+export interface SetAgentDefaultCanvasInput {
+  /** 当前 Agent 的权威 Canvas 关联；null 表示尚未建立关联。 */
+  binding: AgentCanvasBinding | null
+  /** 用户选择的新默认画布。 */
+  canvasId: string
+  /** 为未关联画布建立关联并可同时设为默认。 */
+  link: (canvasId: string, makeDefault: boolean) => Promise<unknown>
+  /** 更新已关联画布的默认标记。 */
+  setDefault: (canvasId: string) => Promise<unknown>
+}
+
+/** 未关联画布先建立默认关联，已关联画布复用轻量默认更新。 */
+export async function setAgentDefaultCanvas(input: SetAgentDefaultCanvasInput): Promise<void> {
+  if (!input.binding?.linkedCanvasIds.includes(input.canvasId)) {
+    await input.link(input.canvasId, true)
+    return
+  }
+  await input.setDefault(input.canvasId)
+}
+
+/**
+ * 把 Canvas 导航落到发起动作的明确 Pane；无分屏时交给普通 activeTab 状态。
+ * @returns 下一份分屏状态；null 表示当前没有分屏。
+ */
+export function selectCanvasWorkspaceTabForPane(
+  split: RightWorkspaceSplitState | null,
+  tab: AgentSidePanelTab,
+  pane: RightWorkspacePane | null,
+): RightWorkspaceSplitState | null {
+  if (!split) return null
+  return pane
+    ? placeRightWorkspaceSplitTab(split, tab, pane)
+    : selectRightWorkspaceSplitTab(split, tab)
+}
+
+export interface IsCanvasWorkspaceTabStillCurrentInput {
+  /** 当前已提交的分屏状态；null 表示单 Pane。 */
+  split: RightWorkspaceSplitState | null
+  /** 单 Pane 模式下最新的活动标签。 */
+  activeTab: AgentSidePanelTab
+  /** 发起异步动作的 Pane；单 Pane 使用 null。 */
+  pane: RightWorkspacePane | null
+  /** 异步动作针对的画布 ID。 */
+  canvasId: string
+}
+
+/** 复核异步动作返回时，发起 Pane 是否仍显示原画布。 */
+export function isCanvasWorkspaceTabStillCurrent(
+  input: IsCanvasWorkspaceTabStillCurrentInput,
+): boolean {
+  const canvasTab = getCanvasWorkspaceTab(input.canvasId)
+  if (!input.split) return input.pane === null && input.activeTab === canvasTab
+  if (!input.pane) return false
+  return (input.pane === 'left' ? input.split.leftTab : input.split.rightTab) === canvasTab
 }
 
 /** 删除运行阻断使用可操作提示，其余异常始终折叠为固定通用错误。 */

@@ -3,7 +3,7 @@ import * as React from 'react'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { LEGACY_DESIGN_CANVAS_ID } from '@proma/shared'
-import type { AgentCanvasBinding, CanvasSessionMeta } from '@proma/shared'
+import type { AgentCanvasBinding, AgentCanvasBindingChangeEvent, CanvasSessionMeta } from '@proma/shared'
 import { createStore, Provider } from 'jotai'
 import { renderToStaticMarkup } from 'react-dom/server'
 import {
@@ -16,9 +16,12 @@ import { createInitialNativeCanvasState, nativeCanvasStatesAtom } from '@/atoms/
 import { designAdapter } from '@/lib/design-adapter'
 import {
   CanvasWorkspaceAdapter,
+  CanvasWorkspaceLauncher,
+  buildCanvasWorkspaceTabs,
   isAgentCanvasActivityUnread,
   reconcileMissingCanvas,
   resolveCanvasWorkspaceEscapeAction,
+  shouldShowCanvasWorkspaceLauncher,
   submitCanvasWorkspaceTitle,
   useAgentCanvasLegacyViewInitialization,
   useAgentCanvasWorkspaceRegistry,
@@ -308,6 +311,165 @@ describe('Agent 右侧 Canvas 适配器', () => {
     }
   })
 
+  test('Given binding LIST 尚未完成 When 尝试创建或关联画布 Then 不发起依赖默认状态的写操作', async () => {
+    const host = createHookRoot()
+    const store = createStore()
+    const bindingRequest = createDeferred<AgentCanvasBinding[]>()
+    let createCalls = 0
+    let linkCalls = 0
+    let latest: ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null = null
+    designAdapter.listAgentCanvasBindings = () => bindingRequest.promise
+    designAdapter.onAgentCanvasBindingChanged = () => () => undefined
+    designAdapter.onCanvasChanges = () => () => undefined
+    designAdapter.createCanvasSession = async () => {
+      createCalls += 1
+      return createSession('created')
+    }
+    designAdapter.linkAgentCanvas = async () => {
+      linkCalls += 1
+      return {
+        projectId: 'project-1',
+        sessionId: 'agent-1',
+        linkedCanvasIds: ['canvas-1'],
+        updatedAt: 1,
+      }
+    }
+    function Probe(): null {
+      latest = useAgentCanvasWorkspaceRegistry('project-1', 'agent-1', () => undefined)
+      return null
+    }
+
+    try {
+      act(() => { host.render(<Provider store={store}><Probe /></Provider>) })
+      await act(async () => {
+        await latest?.createAndOpen()
+        await latest?.link('canvas-1', true)
+      })
+
+      const currentRegistry = latest as ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null
+      expect(currentRegistry?.bindingReady).toBe(false)
+      expect(createCalls).toBe(0)
+      expect(linkCalls).toBe(0)
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given binding LIST 失败 When 请求收口 Then 保持未就绪并继续阻断依赖 binding 的写操作', async () => {
+    const host = createHookRoot()
+    const store = createStore()
+    /** 该用例主动制造 LIST 失败，避免预期错误污染测试输出。 */
+    const originalConsoleError = console.error
+    console.error = () => undefined
+    const bindingRequest = createDeferred<AgentCanvasBinding[]>()
+    let publishBinding: ((event: AgentCanvasBindingChangeEvent) => void) | null = null
+    let linkCalls = 0
+    let latest: ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null = null
+    designAdapter.listAgentCanvasBindings = () => bindingRequest.promise
+    designAdapter.onAgentCanvasBindingChanged = (_target, listener) => {
+      publishBinding = listener
+      return () => undefined
+    }
+    designAdapter.onCanvasChanges = () => () => undefined
+    designAdapter.linkAgentCanvas = async () => {
+      linkCalls += 1
+      return {
+        projectId: 'project-1',
+        sessionId: 'agent-1',
+        linkedCanvasIds: ['canvas-1'],
+        updatedAt: 1,
+      }
+    }
+    function Probe(): null {
+      latest = useAgentCanvasWorkspaceRegistry('project-1', 'agent-1', () => undefined)
+      return null
+    }
+
+    try {
+      act(() => { host.render(<Provider store={store}><Probe /></Provider>) })
+      await act(async () => {
+        bindingRequest.reject(new Error('LIST_FAILED'))
+        await Promise.resolve()
+      })
+      await act(async () => { await latest?.link('canvas-1', true) })
+
+      const currentRegistry = latest as ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null
+      expect(currentRegistry?.bindingReady).toBe(false)
+      expect(currentRegistry?.loading).toBe(false)
+      expect(currentRegistry?.error).toBe('画布关联加载失败')
+      expect(linkCalls).toBe(0)
+
+      await act(async () => {
+        publishBinding?.({
+          projectId: 'project-1',
+          sessionId: 'agent-1',
+          cause: 'linked',
+          binding: {
+            projectId: 'project-1',
+            sessionId: 'agent-1',
+            linkedCanvasIds: ['canvas-1'],
+            updatedAt: 2,
+          },
+        })
+        await Promise.resolve()
+      })
+      const recoveredRegistry = latest as ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null
+      expect(recoveredRegistry?.bindingReady).toBe(true)
+      expect(recoveredRegistry?.error).toBeNull()
+    } finally {
+      console.error = originalConsoleError
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given binding 事件已成功 When 更早的 LIST 随后失败 Then 保留事件状态且忽略旧错误', async () => {
+    const host = createHookRoot()
+    const store = createStore()
+    const bindingRequest = createDeferred<AgentCanvasBinding[]>()
+    let publishBinding: ((event: AgentCanvasBindingChangeEvent) => void) | null = null
+    let latest: ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null = null
+    designAdapter.listAgentCanvasBindings = () => bindingRequest.promise
+    designAdapter.onAgentCanvasBindingChanged = (_target, listener) => {
+      publishBinding = listener
+      return () => undefined
+    }
+    designAdapter.onCanvasChanges = () => () => undefined
+    function Probe(): null {
+      latest = useAgentCanvasWorkspaceRegistry('project-1', 'agent-1', () => undefined)
+      return null
+    }
+    const eventBinding = {
+      projectId: 'project-1',
+      sessionId: 'agent-1',
+      linkedCanvasIds: ['canvas-1'],
+      updatedAt: 2,
+    } satisfies AgentCanvasBinding
+
+    try {
+      act(() => { host.render(<Provider store={store}><Probe /></Provider>) })
+      await act(async () => {
+        publishBinding?.({
+          projectId: 'project-1',
+          sessionId: 'agent-1',
+          cause: 'linked',
+          binding: eventBinding,
+        })
+        bindingRequest.reject(new Error('STALE_LIST_FAILED'))
+        await Promise.resolve()
+      })
+
+      const currentRegistry = latest as ReturnType<typeof useAgentCanvasWorkspaceRegistry> | null
+      expect(currentRegistry?.binding).toEqual(eventBinding)
+      expect(currentRegistry?.bindingReady).toBe(true)
+      expect(currentRegistry?.error).toBeNull()
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
   test('Given A 用户动作未完成 When rerender 到 B 后 A 迟到失败 Then 不打开标签也不向 B 冒泡错误', async () => {
     const host = createHookRoot()
     const store = createStore()
@@ -384,6 +546,45 @@ describe('Agent 右侧 Canvas 适配器', () => {
     expect(isAgentCanvasActivityUnread({ ...initial, activityRevision: 1, seenActivityRevision: 1 })).toBe(false)
   })
 
+  test('Given 只关联归档画布或没有 binding When 组装工作区 Then 隐藏归档标签并要求展示稳定入口', () => {
+    const archived = createSession('canvas-archived', true)
+    const active = createSession('canvas-active')
+    const binding = {
+      projectId: 'project-1',
+      sessionId: 'agent-1',
+      linkedCanvasIds: [archived.id, active.id],
+      updatedAt: 1,
+    } satisfies AgentCanvasBinding
+    expect(buildCanvasWorkspaceTabs(binding, [archived, active]).map((tab) => tab.canvasId))
+      .toEqual([active.id])
+    expect(shouldShowCanvasWorkspaceLauncher(null, [active], false)).toBe(false)
+    expect(shouldShowCanvasWorkspaceLauncher(null, [active], true)).toBe(true)
+    expect(shouldShowCanvasWorkspaceLauncher({ ...binding, linkedCanvasIds: [archived.id] }, [archived], true))
+      .toBe(true)
+    expect(shouldShowCanvasWorkspaceLauncher(binding, [archived, active], true)).toBe(false)
+  })
+
+  test('Given 零关联 launcher When 首次渲染 Then 提供列表入口且抽屉默认收起', () => {
+    const html = renderToStaticMarkup(
+      <CanvasWorkspaceLauncher
+        sessions={[]}
+        activityStates={new Map()}
+        loading={false}
+        error={null}
+        paneActive
+        onCreateCanvas={async () => true}
+        onOpenCanvas={async () => true}
+        onSetDefaultCanvas={async () => true}
+        onToggleArchiveCanvas={async () => true}
+        onRequestDeleteCanvas={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('aria-label="打开画布列表"')
+    expect(html).toContain('打开画布列表')
+    expect(html).not.toContain('data-canvas-sidebar-layer="true"')
+  })
+
   test('Given 当前标题 When 提交变化、空白、原值或失败 Then 返回明确编辑决策', async () => {
     const submitted: string[] = []
     const rename = async (title: string): Promise<boolean> => {
@@ -411,6 +612,18 @@ describe('Agent 右侧 Canvas 适配器', () => {
       .toBe('exit-expanded')
     expect(resolveCanvasWorkspaceEscapeAction({ editingTitle: false, sidebarOpen: false, expanded: false }))
       .toBeNull()
+    expect(resolveCanvasWorkspaceEscapeAction({
+      editingTitle: false,
+      sidebarOpen: true,
+      expanded: false,
+      paneActive: false,
+    })).toBeNull()
+    expect(resolveCanvasWorkspaceEscapeAction({
+      editingTitle: false,
+      sidebarOpen: true,
+      expanded: false,
+      defaultPrevented: true,
+    })).toBeNull()
   })
 
   test('Given native 与 legacy Canvas When 渲染工作区标题栏 Then 都可打开列表且仅 native 可删除', () => {
