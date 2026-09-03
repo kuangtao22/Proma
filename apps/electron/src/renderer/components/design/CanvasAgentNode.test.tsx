@@ -83,8 +83,10 @@ describe('Canvas Agent 节点', () => {
       expect(html).toContain('data-handleid="output"')
       expect(html).toMatch(/data-handleid="input"[^>]*class="[^"]*\btarget\b/u)
       expect(html).toMatch(/data-handleid="output"[^>]*class="[^"]*\bsource\b/u)
-      expect(html).not.toContain('connectablestart')
-      expect(html).not.toContain('connectableend')
+      expect(html).toMatch(/data-handleid="input"[^>]*class="[^"]*\bconnectableend\b/u)
+      expect(html).toMatch(/data-handleid="output"[^>]*class="[^"]*\bconnectablestart\b/u)
+      expect(html).not.toMatch(/data-handleid="input"[^>]*class="[^"]*\bconnectablestart\b/u)
+      expect(html).not.toMatch(/data-handleid="output"[^>]*class="[^"]*\bconnectableend\b/u)
     }
   })
 })
