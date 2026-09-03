@@ -196,7 +196,8 @@ export interface CanvasDocumentIpcOptions {
   /** 图片 Job、IPC 与恢复共用的唯一候选批次服务。 */
   imageCandidateBatches: Pick<
     CanvasImageCandidateBatchService,
-    'createBatchLocked' | 'listActiveSummaries' | 'load' | 'continueBatch' | 'retryJobLocked' | 'adopt' | 'abandon'
+    'createBatchLocked' | 'listActiveSummaries' | 'load' | 'continueBatch' | 'retryJobLocked'
+    | 'adoptExistingAssetLocked' | 'adopt' | 'abandon'
   >
   /** 图片模块只读取 Design 素材公开元数据并创建目录媒体授权。 */
   imageAssets: {
@@ -454,6 +455,12 @@ function toCanvasPublicError(
     /** 图片输入错误必须保留稳定 code，同时删除内部边、素材和路径信息。 */
     const inputError = toCanvasImageInputPublicError(error)
     if (inputError) return inputError
+    if (error instanceof Error && error.message === 'CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED') {
+      return {
+        code: 'CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED',
+        message: '图片版本采用状态需要恢复，请重新打开画布后重试。',
+      }
+    }
   }
   if (operation === 'artifactSave'
     && error instanceof Error
@@ -2116,13 +2123,19 @@ export function registerCanvasDocumentIpcHandlers(
         if (!asset || job.outputAssetId !== asset.id || asset.sourceJobId !== job.id) {
           throw new Error('CANVAS_IMAGE_ASSET_TARGET_CONFLICT')
         }
-        await options.imageJobTarget.adoptOutput(input.projectId, {
-          kind: 'canvas-image', canvasId: input.canvasId,
-          nodeId: input.nodeId, imageModuleId: input.imageModuleId,
-        }, input.assetId)
+        /** 历史版本与新候选复用同一 journal，保证采用和下游提示在一次事务中收敛。 */
+        await options.imageCandidateBatches.adoptExistingAssetLocked({
+          ...input,
+          currentAssetId: config.adoptedAssetId ?? null,
+          currentConfigRevision: config.revision,
+          batchId: randomUUID(),
+        })
         const latest = await options.imageModules.load(input)
         assertOwnedImageConfig(latest, input)
-        if (latest.adoptedAssetId !== input.assetId) throw new Error('CANVAS_IMAGE_ADOPT_FAILED')
+        if (latest.revision !== input.expectedConfigRevision + 1
+          || latest.adoptedAssetId !== input.assetId) {
+          throw new Error('CANVAS_IMAGE_ADOPT_FAILED')
+        }
         return latest
       })
       broadcastImageModuleChanged(input)

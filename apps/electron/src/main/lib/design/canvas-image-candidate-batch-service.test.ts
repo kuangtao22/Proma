@@ -115,6 +115,7 @@ function createFixture() {
 describe('Canvas 图片候选批次 Service', () => {
   test('Given 14 节点 When 仅 2 个成功 Then partial 且不采用任何正式版本', async () => {
     const fixture = createFixture()
+    const before = structuredClone(fixture.canvas)
     await fixture.service.createBatch({
       ...fixture.target, batchId: 'batch-1', source: 'canvas-tool',
       sourceSessionId: 'session-1', sourceToolCallId: 'tool-1', entries: fixture.entries,
@@ -128,6 +129,7 @@ describe('Canvas 图片候选批次 Service', () => {
     expect(batch.status).toBe('partial')
     expect(batch.entries.filter((entry) => entry.status === 'candidate')).toHaveLength(2)
     expect(fixture.adopted).toEqual([])
+    expect(fixture.canvas).toEqual(before)
   })
 
   test('Given 配置基线已变化 When adopt all Then 冲突且零写入', async () => {
@@ -340,8 +342,11 @@ describe('Canvas 图片候选批次 Service', () => {
       nodes: [...fixture.canvas.nodes, ...downstreamNodes],
       edges: downstreamKinds.map((relation) => ({
         id: `edge-${relation}`,
-        sourceNodeId: 'node-0', sourcePort: 'output',
-        targetNodeId: `downstream-${relation}`, targetPort: 'input', relation,
+        sourceNodeId: 'node-0',
+        sourcePort: relation === 'association' ? 'unbound' : 'image.asset',
+        targetNodeId: `downstream-${relation}`,
+        targetPort: relation === 'association' ? 'unbound' : 'context.image',
+        relation,
       })),
     }
     await fixture.service.createBatch({
@@ -360,6 +365,78 @@ describe('Canvas 图片候选批次 Service', () => {
     const changes = new Map(fixture.canvas.nodes.map((node) => [node.id, node.upstreamChange]))
     expect(changes.get('downstream-reference')?.sourceNodeIds).toEqual(['node-0'])
     expect(changes.get('downstream-association')).toBeUndefined()
+  })
+
+  test('Given 正式采用同时存在绑定边和旧引用边 When 提交 Then 只标记绑定下游', async () => {
+    const fixture = createFixture()
+    fixture.canvas.nodes.push({
+      id: 'downstream-bound', kind: 'document', title: '已绑定下游',
+      position: { x: 0, y: 100 }, documentId: 'document-bound', contentRevision: 0,
+    }, {
+      id: 'downstream-legacy', kind: 'document', title: '旧边下游',
+      position: { x: 100, y: 100 }, documentId: 'document-legacy', contentRevision: 0,
+    })
+    fixture.canvas.edges = [{
+      id: 'edge-bound', sourceNodeId: 'node-0', sourcePort: 'image.asset',
+      targetNodeId: 'downstream-bound', targetPort: 'context.image', relation: 'depends-on',
+    }, {
+      id: 'edge-legacy', sourceNodeId: 'node-0', sourcePort: 'output',
+      targetNodeId: 'downstream-legacy', targetPort: 'input', relation: 'reference',
+    }]
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-bound', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+    })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, jobId: 'job-0', status: 'succeeded',
+      outputAssetId: 'new-0', error: null,
+    })
+
+    const result = await fixture.service.adopt({
+      ...fixture.target, batchId: 'batch-bound', mode: 'all',
+    })
+
+    expect(result.adoption?.invalidatedDownstreamNodeIds).toEqual(['downstream-bound'])
+    expect(fixture.canvas.nodes.find((node) => node.id === 'downstream-legacy')?.upstreamChange)
+      .toBeUndefined()
+  })
+
+  test('Given 已验证历史素材 When 已持锁采用 Then 复用候选事务并更新绑定下游', async () => {
+    const fixture = createFixture()
+    fixture.canvas.nodes.push({
+      id: 'downstream-bound', kind: 'document', title: '已绑定下游',
+      position: { x: 0, y: 100 }, documentId: 'document-bound', contentRevision: 0,
+    })
+    fixture.canvas.edges = [{
+      id: 'edge-bound', sourceNodeId: 'node-0', sourcePort: 'image.asset',
+      targetNodeId: 'downstream-bound', targetPort: 'context.image', relation: 'reference',
+    }]
+
+    const result = await fixture.service.adoptExistingAssetLocked({
+      ...fixture.target,
+      nodeId: 'node-0',
+      imageModuleId: 'module-0',
+      jobId: 'job-history',
+      assetId: 'asset-history',
+      currentAssetId: 'old-0',
+      currentConfigRevision: 1,
+      batchId: 'batch-history',
+    })
+
+    expect(result).toMatchObject({
+      status: 'adopted',
+      adoption: {
+        adoptedNodeIds: ['node-0'],
+        invalidatedDownstreamNodeIds: ['downstream-bound'],
+      },
+    })
+    expect(fixture.configs.get('node-0')).toMatchObject({
+      revision: 2,
+      adoptedAssetId: 'asset-history',
+    })
+    expect(fixture.canvas.nodes.find((node) => node.id === 'node-0')).toMatchObject({
+      adoptedAssetId: 'asset-history',
+    })
   })
 
   test.each(['after-first-module', 'after-all-modules', 'after-graph', 'after-batch'] as const)(

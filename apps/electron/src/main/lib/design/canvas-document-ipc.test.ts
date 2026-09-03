@@ -259,6 +259,9 @@ function createContext(options: {
   imageRun?: (jobId: string, leaseHeld: boolean) => Promise<void>
   imageCandidateBatch?: CanvasImageCandidateBatch
   imageCandidateRetry?: (input: CanvasImageTarget & { batchId: string; jobId: string }) => Promise<string>
+  imageCandidateAdoptExisting?: (
+    input: import('./canvas-image-candidate-batch-service').AdoptExistingCanvasImageAssetInput,
+  ) => Promise<CanvasImageCandidateBatch>
   imageExport?: (projectId: string, assetId: string, targetPath: string) => Promise<void>
   imageThumbnail?: (projectId: string, assetId: string) => { bytes: Buffer; mediaType: DesignAsset['mediaType'] }
   pickArtifactExportPath?: () => Promise<string | null>
@@ -691,6 +694,12 @@ function createContext(options: {
       retryJobLocked: async (input) => {
         imageCalls.push({ type: 'candidate-retry', value: input })
         return options.imageCandidateRetry?.(input) ?? 'job-retry'
+      },
+      adoptExistingAssetLocked: async (input) => {
+        imageCalls.push({ type: 'candidate-adopt-existing', value: input })
+        return options.imageCandidateAdoptExisting?.(input)
+          ?? options.imageCandidateBatch
+          ?? createImageCandidateBatch(input.batchId)
       },
       adopt: async (input) => {
         imageCalls.push({ type: 'candidate-adopt', value: input })
@@ -1329,6 +1338,58 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(adoptResult).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_JOB_FAILED' } })
     expect(loadResult).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
     expect(context.imageCalls.filter((call) => ['create', 'run', 'adopt'].includes(call.type))).toEqual([])
+  })
+
+  test('Given 历史版本已验证 When 设为当前 Then 通过候选采用事务切换而不走旧直写路径', async () => {
+    let config = createImageConfig(imageTargetA, 3)
+    const job = { ...createImageJob(imageTargetA, 'job-history'), outputAssetId: 'asset-history' }
+    const context = createContext({
+      imageJobs: [job],
+      imageAssets: [createImageAsset('asset-history', job.id)],
+      imageLoad: async () => config,
+      imageCandidateAdoptExisting: async (input) => {
+        config = { ...config, revision: 4, adoptedAssetId: input.assetId }
+        return createImageCandidateBatch(input.batchId)
+      },
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET,
+      context.sender,
+      { ...imageTargetA, jobId: job.id, assetId: 'asset-history', expectedConfigRevision: 3 },
+    )
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { revision: 4, adoptedAssetId: 'asset-history' },
+    })
+    expect(context.imageCalls.filter((call) => call.type === 'candidate-adopt-existing')).toHaveLength(1)
+    expect(context.imageCalls.filter((call) => call.type === 'adopt')).toEqual([])
+  })
+
+  test('Given 历史版本采用事务状态不确定 When 设为当前 Then 返回稳定恢复错误', async () => {
+    const job = { ...createImageJob(imageTargetA, 'job-history'), outputAssetId: 'asset-history' }
+    const context = createContext({
+      imageJobs: [job],
+      imageAssets: [createImageAsset('asset-history', job.id)],
+      imageCandidateAdoptExisting: async () => {
+        throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
+      },
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.ADOPT_IMAGE_ASSET,
+      context.sender,
+      { ...imageTargetA, jobId: job.id, assetId: 'asset-history', expectedConfigRevision: 3 },
+    )
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { code: 'CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED' },
+    })
+    expect(context.imageCalls.filter((call) => call.type === 'adopt')).toEqual([])
   })
 
   test('Given 手动生图存在待确认输入 When 创建任务 Then 返回稳定中文错误且不泄露内部身份', async () => {
@@ -3383,6 +3444,7 @@ describe('原生 Canvas 文档 IPC', () => {
         load: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
         continueBatch: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
         retryJobLocked: async () => 'job-retry',
+        adoptExistingAssetLocked: async (input: import('./canvas-image-candidate-batch-service').AdoptExistingCanvasImageAssetInput) => createImageCandidateBatch(input.batchId),
         adopt: async (input: import('@proma/shared').AdoptCanvasImageCandidateBatchInput) => createImageCandidateBatch(input.batchId),
         abandon: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
       },
