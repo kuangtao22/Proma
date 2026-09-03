@@ -6,7 +6,7 @@
 
 import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { Blocks, Brain, CalendarDays, Clock, Columns2, FolderOpen, Globe, ListTodo, MessageCircle, PanelRight, Plus, Repeat2, ServerCog, SquareTerminal, X } from 'lucide-react'
+import { Blocks, Brain, CalendarDays, Clock, Columns2, FolderOpen, Globe, ListTodo, MessageCircle, PanelRight, Plus, Repeat2, ServerCog, SquareTerminal, Workflow, X } from 'lucide-react'
 import { OBSIDIAN_NAME, ObsidianIcon } from '@/components/obsidian/obsidian-brand'
 import { cn } from '@/lib/utils'
 import { getScrollLeftToRevealTab } from '@/lib/tab-visibility'
@@ -55,6 +55,10 @@ interface DiffPanelTabBarProps {
   onOpenTerminal?: () => void
   onOpenWorkspaceComponent?: (component: WorkspaceComponentTab) => void
   onOpenVault?: () => void
+  /** 打开当前 Agent 的 Canvas 工作区；具体画布管理仍归属 Canvas Pane。 */
+  onOpenCanvas?: () => void
+  /** Canvas 关联尚未就绪或当前无项目时保留入口但禁止导航。 */
+  openCanvasDisabled?: boolean
   productivityTools?: ProductivityToolsSettings
   onOpenChat?: () => void
   /** 仅当前右侧 Tab 需要的紧凑动作，渲染于标签列表之后，不影响内容区布局。 */
@@ -79,6 +83,8 @@ export function DiffPanelTabBar({
   onOpenTerminal,
   onOpenWorkspaceComponent,
   onOpenVault,
+  onOpenCanvas,
+  openCanvasDisabled = false,
   productivityTools = { todosEnabled: true, calendarEnabled: true, obsidianEnabled: true },
   onOpenChat,
   activeTabAction,
@@ -521,6 +527,15 @@ export function DiffPanelTabBar({
                 <ObsidianIcon className="size-3.5" />
                 打开 {OBSIDIAN_NAME}
               </DropdownMenuItem>
+            )}
+            {onOpenCanvas && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem disabled={openCanvasDisabled} onSelect={onOpenCanvas}>
+                  <Workflow className="size-3.5" />
+                  打开画布
+                </DropdownMenuItem>
+              </>
             )}
           </DropdownMenuContent>
         </DropdownMenu>

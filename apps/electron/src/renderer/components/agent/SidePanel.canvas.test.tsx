@@ -14,6 +14,7 @@ import {
   isCanvasWorkspaceTabStillCurrent,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
+  selectCanvasWorkspaceEntryTab,
   selectCanvasWorkspaceTabForPane,
   selectCanvasAfterArchive,
   setAgentDefaultCanvas,
@@ -207,8 +208,24 @@ describe('Agent 右侧画布动态标签', () => {
 
     expect(source).toContain("id: 'canvas', label: '画布'")
     expect(source).toContain('shouldShowCanvasWorkspaceLauncher')
+    expect(source).toContain('selectCanvasWorkspaceEntryTab(canvasWorkspaceTabs)')
+    expect(source).toContain('openCanvasDisabled={!currentWorkspaceId || !canvasRegistry.bindingReady}')
     expect(source).toContain('if (!split || !canvasRegistry.bindingReady) return')
     expect(source).toContain('split?.focusedPane ?? null')
+  })
+
+  test('Given 顶部点击打开画布 When 选择目标 Then 最近、默认、首项和 launcher 依次回退', () => {
+    /** 构造顶部入口可选择的关联画布标签。 */
+    const tabs = [
+      { id: 'canvas:first' as const, isRecent: false, isDefault: false },
+      { id: 'canvas:default' as const, isRecent: false, isDefault: true },
+      { id: 'canvas:recent' as const, isRecent: true, isDefault: false },
+    ]
+
+    expect(selectCanvasWorkspaceEntryTab(tabs)).toBe('canvas:recent')
+    expect(selectCanvasWorkspaceEntryTab(tabs.slice(0, 2))).toBe('canvas:default')
+    expect(selectCanvasWorkspaceEntryTab(tabs.slice(0, 1))).toBe('canvas:first')
+    expect(selectCanvasWorkspaceEntryTab([])).toBe('canvas')
   })
 
   test('Given 归档请求在途时用户切换目标 Pane When 请求完成 Then 不再执行迟到回退', () => {

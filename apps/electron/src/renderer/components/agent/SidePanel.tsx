@@ -156,6 +156,7 @@ import {
   isCanvasWorkspaceTabStillCurrent,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
+  selectCanvasWorkspaceEntryTab,
   selectCanvasWorkspaceTabForPane,
   selectCanvasAfterArchive,
   setAgentDefaultCanvas,
@@ -2137,6 +2138,8 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
               setIsOpen(true)
               handleWorkspaceTabChange('vault')
             } : undefined}
+            onOpenCanvas={() => handleWorkspaceTabChange(selectCanvasWorkspaceEntryTab(canvasWorkspaceTabs))}
+            openCanvasDisabled={!currentWorkspaceId || !canvasRegistry.bindingReady}
             visibleTabs={renderSplit && split ? { left: split.leftTab, right: split.rightTab } : undefined}
             focusedPane={renderSplit ? split?.focusedPane : undefined}
             onTabDragChange={handleTabDragChange}

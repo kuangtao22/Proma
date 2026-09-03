@@ -61,6 +61,25 @@ export async function setAgentDefaultCanvas(input: SetAgentDefaultCanvasInput): 
   await input.setDefault(input.canvasId)
 }
 
+export interface CanvasWorkspaceEntryTab {
+  /** 可直接交给右侧工作区导航的标签身份。 */
+  id: AgentSidePanelTab
+  /** 是否为当前 Agent 最近打开的画布。 */
+  isRecent: boolean
+  /** 是否为当前 Agent 的默认画布。 */
+  isDefault: boolean
+}
+
+/** 顶部入口优先打开最近画布，再回退默认、首个关联画布和稳定 launcher。 */
+export function selectCanvasWorkspaceEntryTab(
+  tabs: readonly CanvasWorkspaceEntryTab[],
+): AgentSidePanelTab {
+  return tabs.find((tab) => tab.isRecent)?.id
+    ?? tabs.find((tab) => tab.isDefault)?.id
+    ?? tabs[0]?.id
+    ?? 'canvas'
+}
+
 /**
  * 把 Canvas 导航落到发起动作的明确 Pane；无分屏时交给普通 activeTab 状态。
  * @returns 下一份分屏状态；null 表示当前没有分屏。
