@@ -2384,6 +2384,12 @@ export interface NativeCanvasWorkspaceProps {
   conversationRenderer?: React.ComponentType<CanvasAgentConversationProps>
   /** 宿主布局语义；右侧工作区复用同一实现但保持紧凑呈现边界。 */
   presentation?: 'main' | 'side-panel'
+  /** 标题前的 Pane 局部导航入口。 */
+  headerLeading?: React.ReactNode
+  /** 替换默认标题的可编辑标题内容。 */
+  headerTitle?: React.ReactNode
+  /** 位于回收区按钮之前的 Pane 局部动作。 */
+  headerActions?: React.ReactNode
 }
 
 /** 将隔离 Jotai 状态绑定到纯 controller，并渲染当前加载阶段。 */
@@ -2395,6 +2401,9 @@ export function NativeCanvasWorkspace({
   flowRenderer,
   conversationRenderer,
   presentation = 'main',
+  headerLeading,
+  headerTitle,
+  headerActions,
 }: NativeCanvasWorkspaceProps): React.ReactElement {
   /** graph key 只隔离共享图；view key 再加入 Agent 会话身份。 */
   const stateKey = createNativeCanvasKey(target.projectId, target.canvasId)
@@ -3643,22 +3652,27 @@ export function NativeCanvasWorkspace({
       data-canvas-id={target.canvasId}
       data-presentation={presentation}
     >
-      <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
-        <h1 className="truncate text-sm font-medium text-foreground">{title}</h1>
-        <Button
-          type="button"
-          size="icon-sm"
-          variant="ghost"
-          className="ml-auto"
-          aria-label="打开回收区"
-          disabled={!adapter.listCanvasTrash || !adapter.restoreCanvasNode}
-          onClick={() => {
-            setTrashOpen(true)
-            void trashControllerRef.current?.load()
-          }}
-        >
-          <ArchiveRestore aria-hidden="true" />
-        </Button>
+      <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
+        {headerLeading}
+        {headerTitle ?? (
+          <h1 className="min-w-0 truncate px-2 text-sm font-medium text-foreground">{title}</h1>
+        )}
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          {headerActions}
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            aria-label="打开回收区"
+            disabled={!adapter.listCanvasTrash || !adapter.restoreCanvasNode}
+            onClick={() => {
+              setTrashOpen(true)
+              void trashControllerRef.current?.load()
+            }}
+          >
+            <ArchiveRestore aria-hidden="true" />
+          </Button>
+        </div>
       </header>
       <div className="min-h-0 flex-1">
         {(state.phase === 'idle' || state.phase === 'loading') && !state.snapshot ? (
