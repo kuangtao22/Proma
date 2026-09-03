@@ -135,6 +135,12 @@ export interface NativeCanvasEdgeRelationMenuProps {
   onSelect: (relation: CanvasEdgeRelation) => void
 }
 
+/** 将待确认边绑定到打开菜单时的画布，避免切换文档后复用陈旧端点。 */
+interface PendingNativeCanvasRelation {
+  canvasId: string
+  edge: CanvasEdge
+}
+
 /** 将关系与推导出的输入槽转换为用户可理解的菜单标签。 */
 function getNativeCanvasRelationOptionLabel(
   edge: CanvasEdge,
@@ -155,7 +161,12 @@ export function NativeCanvasEdgeRelationMenu({
   edge,
   document,
   onSelect,
-}: NativeCanvasEdgeRelationMenuProps): React.ReactElement {
+}: NativeCanvasEdgeRelationMenuProps): React.ReactElement | null {
+  /** 菜单只为当前权威文档中仍然存在的完整边提供关系选择。 */
+  const hasSource = document.nodes.some((node) => node.id === edge.sourceNodeId)
+  /** 任一端点失效都说明菜单属于陈旧画布状态，不能继续推导业务端口。 */
+  const hasTarget = document.nodes.some((node) => node.id === edge.targetNodeId)
+  if (!hasSource || !hasTarget) return null
   return (
     <div
       aria-label="选择连线关系"
@@ -288,8 +299,12 @@ export function NativeCanvasGraph({
   createEdgeId = CREATE_NATIVE_CANVAS_EDGE_ID,
   flowRenderer,
 }: NativeCanvasGraphProps): React.ReactElement {
-  /** 仅保留最近一次手工创建的边，供用户即时选择语义。 */
-  const [pendingRelationEdge, setPendingRelationEdge] = React.useState<CanvasEdge | null>(null)
+  /** 仅保留最近一次手工创建的边及所属画布，供用户即时选择语义。 */
+  const [pendingRelation, setPendingRelation] = React.useState<PendingNativeCanvasRelation | null>(null)
+  /** 只有仍属于当前画布的菜单边才允许进入渲染和提交链路。 */
+  const pendingRelationEdge = pendingRelation?.canvasId === document.canvasId
+    ? pendingRelation.edge
+    : null
   /** 旧调用方只传主节点时退化为单选集合。 */
   const controlledSelectedNodeIds = React.useMemo(
     () => selectedNodeIds ?? (selectedNodeId ? [selectedNodeId] : []),
@@ -382,6 +397,11 @@ export function NativeCanvasGraph({
     updateViewportState({ type: 'document-sync', viewport: document.viewport })
   }, [document.viewport, updateViewportState])
 
+  React.useEffect(() => {
+    /** 画布身份变化后清理陈旧菜单，避免切回旧画布时再次出现。 */
+    if (pendingRelation && pendingRelation.canvasId !== document.canvasId) setPendingRelation(null)
+  }, [document.canvasId, pendingRelation])
+
   /**
    * 同步 Canvas 的单一选中身份。
    * @param nodeId 用户交互产生的新选中节点；null 表示清空。
@@ -437,8 +457,8 @@ export function NativeCanvasGraph({
       targetNodeId: connection.target,
     })
     onMutation({ type: 'upsert-edges', edges: [edge] })
-    setPendingRelationEdge(edge)
-  }, [activeTool, createEdgeId, onMutation, writable])
+    setPendingRelation({ canvasId: document.canvasId, edge })
+  }, [activeTool, createEdgeId, document.canvasId, onMutation, writable])
 
   /** 用同一稳定边覆盖语义与业务端口，避免拖线或旧边确认产生重复边。 */
   const selectPendingEdgeRelation = React.useCallback((relation: CanvasEdgeRelation): void => {
@@ -447,15 +467,15 @@ export function NativeCanvasGraph({
       type: 'upsert-edges',
       edges: [confirmNativeCanvasEdge(pendingRelationEdge, relation, document)],
     })
-    setPendingRelationEdge(null)
+    setPendingRelation(null)
   }, [document, onMutation, pendingRelationEdge])
 
   /** 点击已持久化边时重新打开用途确认菜单。 */
   const handleEdgeClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onEdgeClick']>>((_event, edge) => {
     if (!writable || activeTool !== 'select') return
     const persisted = document.edges.find((candidate) => candidate.id === edge.id)
-    if (persisted) setPendingRelationEdge(persisted)
-  }, [activeTool, document.edges, writable])
+    if (persisted) setPendingRelation({ canvasId: document.canvasId, edge: persisted })
+  }, [activeTool, document.canvasId, document.edges, writable])
 
   /** 键盘选择边时同样打开用途确认菜单，保持无鼠标操作可达。 */
   const handleSelectionChange = React.useCallback<NonNullable<NativeCanvasFlowProps['onSelectionChange']>>(({ edges }) => {
@@ -463,8 +483,8 @@ export function NativeCanvasGraph({
     const selected = edges[0]
     if (!selected) return
     const persisted = document.edges.find((candidate) => candidate.id === selected.id)
-    if (persisted) setPendingRelationEdge(persisted)
-  }, [activeTool, document.edges, writable])
+    if (persisted) setPendingRelation({ canvasId: document.canvasId, edge: persisted })
+  }, [activeTool, document.canvasId, document.edges, writable])
 
   /** 视口手势开始后暂缓远端 viewport 覆盖本地逐帧反馈。 */
   const handleMoveStart = React.useCallback<OnMoveStart>(() => {
@@ -500,7 +520,7 @@ export function NativeCanvasGraph({
   /** 点击空白 pane 时立即清理选区，覆盖 XYFlow 未产生 selection change 的路径。 */
   const handlePaneClick = React.useCallback((): void => {
     if (activeTool !== 'select') return
-    setPendingRelationEdge(null)
+    setPendingRelation(null)
     syncSelectedNodeIds([])
     onConversationNodeChange(null)
   }, [activeTool, onConversationNodeChange, syncSelectedNodeIds])
@@ -514,6 +534,8 @@ export function NativeCanvasGraph({
     minZoom: 0.05,
     maxZoom: 8,
     onlyRenderVisibleElements: true,
+    /** Fit View 使用节点声明尺寸纳入尚未挂载测量的离屏节点。 */
+    fitViewOptions: { includeHiddenNodes: true },
     nodesDraggable: writable && activeTool === 'select',
     nodesConnectable: writable && activeTool === 'select',
     elementsSelectable: true,
@@ -546,7 +568,7 @@ export function NativeCanvasGraph({
       {flowRenderer ? flowRenderer(flowProps) : (
         <ReactFlow<NativeCanvasFlowNode, Edge> {...flowProps}>
           <Background gap={24} size={1} />
-          <Controls showInteractive={false} />
+          <Controls showInteractive={false} fitViewOptions={flowProps.fitViewOptions} />
         </ReactFlow>
       )}
       {pendingRelationEdge ? (

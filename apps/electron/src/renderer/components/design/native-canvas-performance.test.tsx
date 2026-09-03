@@ -155,6 +155,36 @@ describe('原生 Canvas 大画布性能预算', () => {
     ])
   })
 
+  test('Given 离屏节点已有稳定尺寸 When 配置 Fit View Then 在保持可见区裁剪时纳入未测量节点', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [{
+      id: 'document-offscreen',
+      kind: 'document',
+      title: '离屏文档',
+      documentId: 'document-content-offscreen',
+      contentRevision: 0,
+      position: { x: 10_000, y: 10_000 },
+    }]
+    let captured: NativeCanvasFlowProps | undefined
+
+    renderToStaticMarkup(
+      <NativeCanvasGraph
+        document={document}
+        writable
+        selectedNodeId={null}
+        onMutation={() => {}}
+        onNodeSelect={() => {}}
+        onConversationNodeChange={() => {}}
+        flowRenderer={(props) => { captured = props; return <div /> }}
+      />,
+    )
+
+    expect(captured?.nodes[0]?.width).toBe(NATIVE_CANVAS_NODE_WIDTH)
+    expect(captured?.nodes[0]?.height).toBe(NATIVE_CANVAS_NODE_HEIGHT)
+    expect(captured?.onlyRenderVisibleElements).toBe(true)
+    expect(captured?.fitViewOptions?.includeHiddenNodes).toBe(true)
+  })
+
   test('Given Agent 与非 Agent 折叠节点 When 单击和双击 Then 单击只选择而双击打开工作台', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     document.nodes = [
@@ -429,6 +459,31 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(html).toContain('>引用 · 文字上下文<')
     expect(html).toContain('>依赖 · 文字上下文<')
     expect(html).toContain('>衍生 · 文字上下文<')
+  })
+
+  test('Given 关系菜单仍持有上一张画布的边 When 当前文档已切换 Then 不渲染失效菜单且不抛错', () => {
+    /** 模拟画布切换后仍残留在组件局部状态中的旧边。 */
+    const staleEdge = {
+      id: 'edge-stale', sourceNodeId: 'agent-old', sourcePort: 'unbound',
+      targetNodeId: 'image-old', targetPort: 'unbound', relation: 'reference' as const,
+    }
+    /** 新画布不包含旧边的任何端点。 */
+    const currentDocument = createEmptyCanvasDocument('project-1', 'canvas-new', 1)
+
+    expect(() => renderToStaticMarkup(
+      <NativeCanvasEdgeRelationMenu
+        edge={staleEdge}
+        document={currentDocument}
+        onSelect={() => undefined}
+      />,
+    )).not.toThrow()
+    expect(renderToStaticMarkup(
+      <NativeCanvasEdgeRelationMenu
+        edge={staleEdge}
+        document={currentDocument}
+        onSelect={() => undefined}
+      />,
+    )).toBe('')
   })
 
   test('Given 持久连线 When 使用真实 ReactFlow 渲染 Then 输出可见 edge path', () => {

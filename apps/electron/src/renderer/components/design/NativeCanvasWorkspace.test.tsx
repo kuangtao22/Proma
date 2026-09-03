@@ -2972,8 +2972,9 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       workbenchDraft: null,
     })
 
-    /** close 后不再订阅 XYFlow 派生 selection，避免受控选区反写形成反馈循环。 */
-    expect(flowProps?.onSelectionChange).toBeUndefined()
+    /** 边选择回调只处理关系菜单，空边选区不得反写已保留的节点选区。 */
+    expect(flowProps?.onSelectionChange).toBeFunction()
+    flowProps?.onSelectionChange?.({ nodes: [], edges: [] })
     expect(store.get(agentCanvasViewStatesAtom).get(viewStateKey)).toMatchObject({
       selectedNodeId: 'agent-1',
       expandedNodeId: null,
