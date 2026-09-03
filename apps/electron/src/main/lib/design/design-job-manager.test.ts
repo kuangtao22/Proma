@@ -426,6 +426,7 @@ describe('Design Job Manager', () => {
     harness.canvasInputReferences = [{
       nodeId: 'webview-1', kind: 'webview', revision: 3,
       summary: '已提交首页原型', summaryHash: 'b'.repeat(64),
+      sourcePort: 'webview.html', targetPort: 'context.text',
     }]
 
     const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
@@ -438,6 +439,22 @@ describe('Design Job Manager', () => {
     expect(reloaded.manager.getTaskDetails('project-1', job.id, false)).toMatchObject({
       canvasInputReferences: [expect.objectContaining({ kind: 'webview', nodeId: 'webview-1' })],
     })
+  })
+
+  test('Given Canvas 图片参考已绑定 When 运行生成 Then 隐藏 Agent 收到真实参考图路径', async () => {
+    harness.canvasInputReferences = [{
+      nodeId: 'image-reference', kind: 'image', revision: 2,
+      summary: '当前采用角色三视图', summaryHash: 'a'.repeat(64),
+      assetId: 'asset-reference', sourcePort: 'image.asset', targetPort: 'image.reference',
+    }]
+    harness.messages = [createToolMessage('session-1/output.png')]
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+
+    await harness.manager.run(job.id)
+
+    expect(harness.runInputs[0]?.userMessage).toContain(
+      'referenceImagePaths: ["/trusted/asset-reference.png"]',
+    )
   })
 
   test('Given 未 recover 的 Manager When 重复按完整 Canvas 图片目标查询 Then journal 只扫描一次并返回稳定防御副本', async () => {
@@ -604,7 +621,7 @@ describe('Design Job Manager', () => {
 
     await harness.manager.run(job.id)
 
-    expect(harness.runInputs[0]?.userMessage).toContain('/trusted/source.png')
+    expect(harness.runInputs[0]?.userMessage).toContain('/trusted/asset-source.png')
     expect(harness.importSources).toEqual([{
       kind: 'job', sourceJobId: job.id, sourceSessionId: 'session-1',
       parentAssetId: 'asset-source', prompt: '移除 Canvas 图片文字',
@@ -844,7 +861,7 @@ describe('Design Job Manager', () => {
       },
       hasTrustedImageRouteResolver: true,
     })
-    expect(harness.runInputs[0]?.userMessage).toContain('/trusted/source.png')
+    expect(harness.runInputs[0]?.userMessage).toContain('/trusted/asset-source.png')
     expect(harness.runInputs[0]?.userMessage).toContain('mask-1')
     expect(harness.importSources).toEqual([{
       kind: 'job',
@@ -1999,7 +2016,7 @@ describe('Design Job Manager', () => {
       },
       store,
       assetService: {
-        resolveAssetPath: () => '/trusted/source.png',
+        resolveAssetPath: (_projectId, assetId) => `/trusted/${assetId}.png`,
         importAuthorizedFiles: async (_projectId, _paths, source) => {
           state.outputPhase = true
           recordOutputEffect('import')

@@ -5,6 +5,7 @@ import type {
   AgentMessage,
   AgentSendInput,
   AgentSessionMeta,
+  CanvasImageInputReference,
   CanvasImageTarget,
   CreateDesignJobInput,
   DesignAsset,
@@ -25,6 +26,8 @@ import type {
 import {
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
   IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
+  isCanvasArtifactInputSlot,
+  isCanvasArtifactOutputCapability,
 } from '@proma/shared'
 import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
 import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-paths'
@@ -108,6 +111,16 @@ function createSingleBatchRecovery(job: StoredDesignJob): {
 interface CanvasImageInFlightCreation {
   identity: string
   promise: Promise<{ job: DesignJobRecord; created: boolean }>
+}
+
+/** Canvas 图片创建前可重复执行且不写入的权威预检结果。 */
+interface CanvasImagePreflightResult {
+  target: CanvasImageJobTarget
+  prompt: string
+  authoritativeRevision: number
+  generationConstraints: NonNullable<CreateDesignJobInput['generationConstraints']>
+  imageModelSnapshot: ImageGenerationModelSnapshot
+  canvasInputReferences: CanvasImageInputReference[]
 }
 
 /** Manager 内部创建已使用独立可信 snapshot，不再依赖 Renderer profile ID。 */
@@ -328,6 +341,15 @@ export class DesignJobManager {
   }
 
   /**
+   * 在不创建 ID、journal 或 Agent 会话的前提下验证 Canvas 图片任务。
+   * @param input 已固化当前图片配置的完整任务输入。
+   * @returns 所有目标、模型、来源素材和直接入边有效时完成。
+   */
+  async preflightCanvasImage(input: CreateDesignJobInput): Promise<void> {
+    await this.resolveCanvasImagePreflight(input)
+  }
+
+  /**
    * 使用调用方提供的稳定 ID 幂等创建 Canvas 图片任务。
    * @param input 已固化图片模块配置的任务输入。
    * @param jobId 由 Agent 单次工具调用身份派生的安全稳定 ID。
@@ -409,37 +431,13 @@ export class DesignJobManager {
     forcedJobId?: string,
   ): Promise<StoredDesignJob> {
     if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
-    /** action 与来源素材的不变量必须先于预留、解析、ID 和持久化副作用。 */
-    if (input.action === 'generate' && input.sourceAssetId !== undefined) {
-      throw new Error('生成任务不得包含来源素材')
-    }
-    if (input.action === 'edit' && !input.sourceAssetId) throw new Error('编辑任务缺少来源素材')
     /** 局部常量保留跨异步调用和数组回调的 Canvas 目标收窄。 */
     const target = input.target
     /** 目标预留必须早于首个 await，保证同一事件循环内并发请求只能有一个进入。 */
     const releaseReservation = this.reserveCanvasImageTarget(input.projectId, target)
     try {
-      const prompt = input.prompt.trim()
-      if (!prompt) throw new Error('设计任务提示词不能为空')
-      if (!input.generationConstraints || input.canvasImageConfigRevision === undefined) {
-        throw new Error('Canvas 图片任务缺少生成快照')
-      }
-      const targetAdapter = this.dependencies.canvasImageTargetAdapter
-      const inputResolver = this.dependencies.canvasImageInputResolver
-      if (!targetAdapter || !inputResolver) throw new Error('Canvas 图片任务执行边界未初始化')
-      /** 完整目标必须在模型、输入、ID 和 journal 副作用前验证。 */
-      await targetAdapter.assertTarget(input.projectId, target)
-      /** 来源素材必须先由当前项目权威 Store 证明，禁止跨项目或陈旧 ID 进入 journal。 */
-      const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
-      if (input.sourceAssetId && !current.assets.some((asset) => asset.id === input.sourceAssetId)) {
-        throw new Error(`素材不存在: ${input.sourceAssetId}`)
-      }
-      /** 可信模型校验必须早于 ID、journal 和事件副作用。 */
-      const imageModelSnapshot = this.runImageModelValidation(
-        () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
-      )
-      /** 连线输入独立于 contextMode，始终从权威直接入边重新解析。 */
-      const canvasInputReferences = await inputResolver.resolve(toCanvasImageTarget(input.projectId, target))
+      /** 创建与公开预检复用同一权威函数，防止批量验证和真实写入规则漂移。 */
+      const preflight = await this.resolveCanvasImagePreflight(input)
       const id = forcedJobId ?? this.createId()
       const creativeTaskId = this.createCreativeTaskId()
       if (!isSafeDesignStableId(id) || !isSafeDesignStableId(creativeTaskId) || id === creativeTaskId) {
@@ -454,14 +452,14 @@ export class DesignJobManager {
         target: { ...target },
         action: input.action,
         status: 'queued',
-        prompt,
-        originalRequest: prompt,
+        prompt: preflight.prompt,
+        originalRequest: preflight.prompt,
         contextMode: input.contextMode,
-        generationConstraints: { ...input.generationConstraints },
-        canvasInputReferences: canvasInputReferences.map((reference) => ({ ...reference })),
+        generationConstraints: { ...preflight.generationConstraints },
+        canvasInputReferences: preflight.canvasInputReferences.map((reference) => ({ ...reference })),
         canvasImageConfigRevision: input.canvasImageConfigRevision,
         ...(input.candidateBatchId ? { candidateBatchId: input.candidateBatchId } : {}),
-        imageModelSnapshot: { ...imageModelSnapshot },
+        imageModelSnapshot: { ...preflight.imageModelSnapshot },
         ...(input.sourceAssetId
           ? { sourceAssetId: input.sourceAssetId, parentAssetId: input.sourceAssetId }
           : {}),
@@ -471,10 +469,52 @@ export class DesignJobManager {
         updatedAt: timestamp,
       }
       this.writeJob(job)
-      this.emit(job, current.revision)
+      this.emit(job, preflight.authoritativeRevision)
       return job
     } finally {
       releaseReservation()
+    }
+  }
+
+  /** 解析 Canvas 图片任务在写入前必须成立的全部权威事实。 */
+  private async resolveCanvasImagePreflight(input: CreateDesignJobInput): Promise<CanvasImagePreflightResult> {
+    if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
+    /** action 与来源素材的不变量必须先于模型、输入、ID 和持久化副作用。 */
+    if (input.action === 'generate' && input.sourceAssetId !== undefined) {
+      throw new Error('生成任务不得包含来源素材')
+    }
+    if (input.action === 'edit' && !input.sourceAssetId) throw new Error('编辑任务缺少来源素材')
+    /** 空提示词和缺失生成约束不能进入付费任务。 */
+    const prompt = input.prompt.trim()
+    if (!prompt) throw new Error('设计任务提示词不能为空')
+    if (!input.generationConstraints || input.canvasImageConfigRevision === undefined) {
+      throw new Error('Canvas 图片任务缺少生成快照')
+    }
+    const targetAdapter = this.dependencies.canvasImageTargetAdapter
+    const inputResolver = this.dependencies.canvasImageInputResolver
+    if (!targetAdapter || !inputResolver) throw new Error('Canvas 图片任务执行边界未初始化')
+    /** 完整目标必须在模型、输入、ID 和 journal 副作用前验证。 */
+    await targetAdapter.assertTarget(input.projectId, input.target)
+    /** 来源素材必须先由当前项目权威 Store 证明，禁止跨项目或陈旧 ID 进入 journal。 */
+    const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
+    if (input.sourceAssetId && !current.assets.some((asset) => asset.id === input.sourceAssetId)) {
+      throw new Error(`素材不存在: ${input.sourceAssetId}`)
+    }
+    /** 可信模型校验必须早于 ID、journal 和事件副作用。 */
+    const imageModelSnapshot = this.runImageModelValidation(
+      () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
+    )
+    /** 连线输入独立于 contextMode，始终从权威直接入边重新解析。 */
+    const canvasInputReferences = await inputResolver.resolve(
+      toCanvasImageTarget(input.projectId, input.target),
+    )
+    return {
+      target: input.target,
+      prompt,
+      authoritativeRevision: current.revision,
+      generationConstraints: { ...input.generationConstraints },
+      imageModelSnapshot,
+      canvasInputReferences,
     }
   }
 
@@ -1080,12 +1120,21 @@ export class DesignJobManager {
         `结构化画面比例：${job.generationConstraints?.aspectRatio ?? '1:1'}`,
         `结构化输出尺寸：${job.generationConstraints?.imageSize ?? 'auto'}`,
         `Canvas 直接入边已提交快照：${JSON.stringify(job.canvasInputReferences ?? [])}`,
+        `referenceImagePaths: ${JSON.stringify([
+          ...(job.action === 'edit'
+            ? [this.dependencies.assetService.resolveAssetPath(job.projectId, job.sourceAssetId!)]
+            : []),
+          ...this.resolveCanvasReferenceImagePaths(job),
+        ].filter((path, index, paths) => paths.indexOf(path) === index))}`,
       )
     }
     if (job.action === 'generate') {
       return [...commonInstructions, `用户要求：${job.prompt}`].join('\n')
     }
-    const sourcePath = this.dependencies.assetService.resolveAssetPath(job.projectId, job.sourceAssetId!)
+    /** 旧 Design 编辑任务仍在此处注入单张来源图，Canvas 已在结构化分支注入。 */
+    const sourcePath = job.target.kind === 'canvas-image'
+      ? undefined
+      : this.dependencies.assetService.resolveAssetPath(job.projectId, job.sourceAssetId!)
     const document = this.dependencies.store.requireStableAuthoritativeDocument(job.projectId)
     const annotation = job.maskAnnotationId
       ? document.annotations.find((item) => item.id === job.maskAnnotationId)
@@ -1094,9 +1143,23 @@ export class DesignJobManager {
       ? `\n蒙版 ${annotation.id} 点位：${JSON.stringify(annotation.points)}`
       : ''
     return [...commonInstructions,
-      `referenceImagePaths: ${JSON.stringify([sourcePath])}`,
+      ...(sourcePath ? [`referenceImagePaths: ${JSON.stringify([sourcePath])}`] : []),
       `编辑要求：${job.prompt}${maskText}`,
     ].join('\n')
+  }
+
+  /** 将 Canvas journal 中的正式媒体身份按运行时授权解析为真实路径。 */
+  private resolveCanvasReferenceImagePaths(job: StoredDesignJob): string[] {
+    if (job.target.kind !== 'canvas-image') return []
+    /** 只有明确进入图片参考槽且带 adopted Asset 的输入属于媒体。 */
+    const assetIds = (job.canvasInputReferences ?? []).flatMap((reference) => (
+      reference.targetPort === 'image.reference' && reference.assetId
+        ? [reference.assetId]
+        : []
+    ))
+    return [...new Set(assetIds)].map((assetId) => (
+      this.dependencies.assetService.resolveAssetPath(job.projectId, assetId)
+    ))
   }
 
   /** 从本轮消息中选择第一张成功且属于当前会话的 Nano Banana 图片。 */
@@ -2080,9 +2143,17 @@ function toCanvasImageTarget(
 /** 严格校验 journal 内单条 Canvas 直接入边快照。 */
 function isCanvasImageInputReference(value: unknown): boolean {
   if (!isRecord(value)) return false
-  const allowedFields = new Set(['nodeId', 'kind', 'revision', 'summary', 'summaryHash', 'assetId'])
+  /** 新任务的两端端口必须成对存在，旧 journal 允许两端同时缺失。 */
+  const hasSourcePort = Object.hasOwn(value, 'sourcePort')
+  /** 目标端口存在性必须与来源端口完全一致。 */
+  const hasTargetPort = Object.hasOwn(value, 'targetPort')
+  const allowedFields = new Set([
+    'nodeId', 'kind', 'revision', 'summary', 'summaryHash', 'assetId',
+    'sourcePort', 'targetPort',
+  ])
   if (Object.keys(value).some((field) => !allowedFields.has(field))) return false
-  if (!isSafeDesignStableId(value.nodeId)
+  if (hasSourcePort !== hasTargetPort
+    || !isSafeDesignStableId(value.nodeId)
     || !['agent', 'image', 'document', 'webview'].includes(String(value.kind))
     || !Number.isSafeInteger(value.revision)
     || (value.revision as number) < 0
@@ -2090,7 +2161,9 @@ function isCanvasImageInputReference(value: unknown): boolean {
     || value.summary.length === 0
     || value.summary.length > CANVAS_IMAGE_INPUT_MAX_TEXT
     || typeof value.summaryHash !== 'string'
-    || !/^[a-f0-9]{64}$/.test(value.summaryHash)) return false
+    || !/^[a-f0-9]{64}$/.test(value.summaryHash)
+    || (hasSourcePort && !isCanvasArtifactOutputCapability(value.sourcePort))
+    || (hasTargetPort && !isCanvasArtifactInputSlot(value.targetPort))) return false
   return value.assetId === undefined || isSafeDesignStableId(value.assetId)
 }
 

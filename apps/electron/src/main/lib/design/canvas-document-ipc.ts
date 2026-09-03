@@ -41,6 +41,7 @@ import type {
   CanvasNodeIssue,
   CanvasPublicError,
   CanvasPublicErrorCode,
+  CreateDesignJobInput,
   CanvasRunNodesResult,
   CanvasToolNodeRunResult,
   CanvasWorkspaceSnapshot,
@@ -189,7 +190,7 @@ export interface CanvasDocumentIpcOptions {
   /** 图片模块配置复用唯一受管内容 Store。 */
   imageModules: Pick<CanvasImageModuleStore, 'load' | 'save' | 'adoptAsset'>
   /** Canvas 图片任务复用唯一 Design Job Manager。 */
-  imageJobs: Pick<DesignJobManager, 'createCanvasImage' | 'createCanvasImageOnce' | 'rollbackCanvasImageOnce' | 'run' | 'cancel' | 'retry' | 'getProjectJob' | 'listCanvasImageJobs' | 'onChanged'>
+  imageJobs: Pick<DesignJobManager, 'preflightCanvasImage' | 'createCanvasImage' | 'createCanvasImageOnce' | 'rollbackCanvasImageOnce' | 'run' | 'cancel' | 'retry' | 'getProjectJob' | 'listCanvasImageJobs' | 'onChanged'>
   /** 图片采用复用 Job Manager 已注入的同一目标适配器。 */
   imageJobTarget: Pick<CanvasImageJobTargetAdapter, 'assertTarget' | 'adoptOutput'>
   /** 图片 Job、IPC 与恢复共用的唯一候选批次服务。 */
@@ -391,6 +392,30 @@ const CANVAS_OPERATION_FALLBACKS: Record<CanvasInvokeOperation, CanvasPublicErro
   artifactExport: { code: 'CANVAS_ARTIFACT_EXPORT_FAILED', message: '产物导出失败，请重试。' },
 }
 
+/** 将图片输入合同错误映射为不含内部身份的稳定公开失败。 */
+function toCanvasImageInputPublicError(error: unknown): CanvasPublicError | undefined {
+  if (!(error instanceof Error)) return undefined
+  if (error.message === 'CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED') {
+    return {
+      code: 'CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED',
+      message: '有引用连线尚未确认用途，请先在画布中确认后再生成。',
+    }
+  }
+  if (error.message === 'CANVAS_IMAGE_INPUT_MISSING') {
+    return {
+      code: 'CANVAS_IMAGE_INPUT_MISSING',
+      message: '图片参考缺少已采用素材，请先导入或采用参考图。',
+    }
+  }
+  if (error.message === 'CANVAS_IMAGE_INPUT_INVALID') {
+    return {
+      code: 'CANVAS_IMAGE_INPUT_INVALID',
+      message: '引用类型与图片输入不兼容，请调整连线用途。',
+    }
+  }
+  return undefined
+}
+
 /**
  * 判断 Store 异常是否表示乐观 revision 已过期。
  * @param error Store 或对账层抛出的未知异常。
@@ -424,6 +449,11 @@ function toCanvasPublicError(
     && error instanceof Error
     && error.message === 'CANVAS_IMAGE_REVISION_CONFLICT') {
     return { code: 'CANVAS_IMAGE_REVISION_CONFLICT', message: '配置已在其他窗口更新。' }
+  }
+  if (operation === 'imageJob') {
+    /** 图片输入错误必须保留稳定 code，同时删除内部边、素材和路径信息。 */
+    const inputError = toCanvasImageInputPublicError(error)
+    if (inputError) return inputError
   }
   if (operation === 'artifactSave'
     && error instanceof Error
@@ -1495,6 +1525,7 @@ export function registerCanvasDocumentIpcHandlers(
         imageTarget: CanvasImageTarget
         config: CanvasImageModuleConfig
         jobId: string
+        input: CreateDesignJobInput
       }> = []
       for (const node of imageNodes) {
         const imageTarget: CanvasImageTarget = {
@@ -1502,19 +1533,43 @@ export function registerCanvasDocumentIpcHandlers(
           nodeId: node.id,
           imageModuleId: node.imageModuleId,
         }
-        await options.imageJobTarget.assertTarget(target.projectId, {
-          kind: 'canvas-image', canvasId: target.canvasId,
-          nodeId: node.id, imageModuleId: node.imageModuleId,
-        })
-        const config = await options.imageModules.load(imageTarget)
-        assertOwnedImageConfig(config, imageTarget)
-        if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
-        prepared.push({
-          node,
-          imageTarget,
-          config,
-          jobId: createAgentCanvasImageJobId(context, toolCallId, target.canvasId, node.id),
-        })
+        try {
+          const config = await options.imageModules.load(imageTarget)
+          assertOwnedImageConfig(config, imageTarget)
+          if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
+          /** 预检与后续幂等创建使用完全相同的固化输入。 */
+          const input: CreateDesignJobInput = {
+            projectId: target.projectId,
+            target: {
+              kind: 'canvas-image', canvasId: target.canvasId,
+              nodeId: node.id, imageModuleId: node.imageModuleId,
+            },
+            action: config.adoptedAssetId ? 'edit' : 'generate',
+            prompt: config.prompt,
+            contextMode: config.contextMode,
+            imageModelProfileId: config.selectedModelProfileId,
+            generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
+            canvasImageConfigRevision: config.revision,
+            candidateBatchId,
+            ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
+          }
+          await options.imageJobs.preflightCanvasImage(input)
+          prepared.push({
+            node,
+            imageTarget,
+            config,
+            input,
+            jobId: createAgentCanvasImageJobId(context, toolCallId, target.canvasId, node.id),
+          })
+        } catch (error) {
+          /** 任一预检失败时，整批保持零 journal；失败节点与被阻断节点分别可审计。 */
+          for (const candidate of imageNodes) {
+            taskByNodeId.set(candidate.id, candidate.id === node.id
+              ? { nodeId: candidate.id, status: 'failed', error: canvasNodeRunError(error) }
+              : { nodeId: candidate.id, status: 'blocked', error: 'CANVAS_BATCH_PREFLIGHT_BLOCKED' })
+          }
+          return { ready: false as const, jobs: [] }
+        }
       }
 
       /** 第二阶段建立全部持久 journal，中途失败则回滚本批新建项并返回完整审计。 */
@@ -1527,21 +1582,7 @@ export function registerCanvasDocumentIpcHandlers(
       for (let index = 0; index < prepared.length; index += 1) {
         const item = prepared[index]!
         try {
-          const result = await options.imageJobs.createCanvasImageOnce({
-            projectId: target.projectId,
-            target: {
-              kind: 'canvas-image', canvasId: target.canvasId,
-              nodeId: item.node.id, imageModuleId: item.node.imageModuleId,
-            },
-            action: item.config.adoptedAssetId ? 'edit' : 'generate',
-            prompt: item.config.prompt,
-            contextMode: item.config.contextMode,
-            imageModelProfileId: item.config.selectedModelProfileId!,
-            generationConstraints: { aspectRatio: item.config.aspectRatio, imageSize: item.config.imageSize },
-            canvasImageConfigRevision: item.config.revision,
-            candidateBatchId,
-            ...(item.config.adoptedAssetId ? { sourceAssetId: item.config.adoptedAssetId } : {}),
-          }, item.jobId)
+          const result = await options.imageJobs.createCanvasImageOnce(item.input, item.jobId)
           if (!isOwnedImageJob(result.job, item.imageTarget)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
           jobs.push({ node: item.node, imageTarget: item.imageTarget, ...result })
         } catch (error) {
@@ -1945,10 +1986,8 @@ export function registerCanvasDocumentIpcHandlers(
         assertOwnedImageConfig(config, input)
         if (config.revision !== input.expectedConfigRevision) throw new Error('CANVAS_IMAGE_REVISION_CONFLICT')
         if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
-        /** Job 与候选批次都使用主进程生成的稳定身份，Renderer 不得指定。 */
-        const jobId = randomUUID()
-        const batchId = randomUUID()
-        const created = await options.imageJobs.createCanvasImageOnce({
+        /** 任务输入先完成无写入预检，再分配任何 journal 或候选批次身份。 */
+        const jobInput: CreateDesignJobInput = {
           projectId: input.projectId,
           target: {
             kind: 'canvas-image', canvasId: input.canvasId,
@@ -1960,8 +1999,15 @@ export function registerCanvasDocumentIpcHandlers(
           imageModelProfileId: config.selectedModelProfileId,
           generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
           canvasImageConfigRevision: config.revision,
-          candidateBatchId: batchId,
           ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
+        }
+        await options.imageJobs.preflightCanvasImage(jobInput)
+        /** Job 与候选批次都使用主进程生成的稳定身份，Renderer 不得指定。 */
+        const jobId = randomUUID()
+        const batchId = randomUUID()
+        const created = await options.imageJobs.createCanvasImageOnce({
+          ...jobInput,
+          candidateBatchId: batchId,
         }, jobId)
         try {
           await options.imageCandidateBatches.createBatchLocked({

@@ -253,6 +253,7 @@ function createContext(options: {
   imageSave?: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
   imageJobsList?: (projectId: string) => DesignJobRecord[]
   imageTargetAssert?: (projectId: string, target: Omit<CanvasImageTarget, 'projectId'>) => Promise<void>
+  imagePreflight?: (input: CreateDesignJobInput) => Promise<void>
   imageCreateOnce?: (input: CreateDesignJobInput, jobId: string) => Promise<{ job: DesignJobRecord; created: boolean }>
   imageRollbackOnce?: (projectId: string, jobId: string) => Promise<boolean>
   imageRun?: (jobId: string, leaseHeld: boolean) => Promise<void>
@@ -614,6 +615,10 @@ function createContext(options: {
       },
     },
     imageJobs: {
+      preflightCanvasImage: async (input) => {
+        imageCalls.push({ type: 'preflight', value: input })
+        await options.imagePreflight?.(input)
+      },
       createCanvasImage: async (input) => {
         imageCalls.push({ type: 'create', value: input })
         return createImageJob(imageTargetA, 'job-created')
@@ -1324,6 +1329,30 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(adoptResult).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_JOB_FAILED' } })
     expect(loadResult).toMatchObject({ ok: false, error: { code: 'CANVAS_IMAGE_LOAD_FAILED' } })
     expect(context.imageCalls.filter((call) => ['create', 'run', 'adopt'].includes(call.type))).toEqual([])
+  })
+
+  test('Given 手动生图存在待确认输入 When 创建任务 Then 返回稳定中文错误且不泄露内部身份', async () => {
+    const context = createContext({
+      imagePreflight: async () => { throw new Error('CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED') },
+    })
+
+    const result = await invoke(
+      context.handlers,
+      CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB,
+      context.sender,
+      { ...imageTargetA, expectedConfigRevision: 3 },
+    )
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED',
+        message: '有引用连线尚未确认用途，请先在画布中确认后再生成。',
+      },
+    })
+    expect(JSON.stringify(result)).not.toContain('edge-')
+    expect(JSON.stringify(result)).not.toContain('/trusted/')
+    expect(context.imageCalls.filter((call) => call.type === 'create-once')).toHaveLength(0)
   })
 
   test('Given 重复 LOAD 与释放路径 When lease 替换失败或成功 Then 保旧授权并幂等回收当前授权', async () => {
@@ -3331,6 +3360,7 @@ describe('原生 Canvas 文档 IPC', () => {
         }),
       },
       imageJobs: {
+        preflightCanvasImage: async () => undefined,
         createCanvasImage: async () => createImageJob(imageTargetA, 'job-created'),
         createCanvasImageOnce: async (_input: CreateDesignJobInput, jobId: string) => ({
           job: createImageJob(imageTargetA, jobId), created: true,
@@ -3555,6 +3585,39 @@ describe('原生 Canvas 文档 IPC', () => {
         { nodeId: 'image-node-a', status: 'rolled-back', taskId: expect.stringMatching(/^agent-canvas-[a-f0-9]{64}$/) },
         { nodeId: 'image-node-b', status: 'failed', error: 'SECOND_JOB_CREATE_FAILED' },
       ])
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
+  test('Given 批量第二个节点输入待确认 When 运行 Then 不建立任何 Job journal', async () => {
+    const context = createContext({
+      enableToolProviderRuntime: true,
+      imagePreflight: async (input) => {
+        if (input.target?.kind === 'canvas-image' && input.target.nodeId === 'image-node-b') {
+          throw new Error('CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED')
+        }
+      },
+    })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+
+      const result = await runtime.runNodes({
+        projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      }, { projectId: 'project-1', canvasId: 'canvas-1' }, [{
+        id: 'image-node-a', kind: 'image', title: '首图',
+        position: { x: 0, y: 0 }, imageModuleId: 'image-module-a',
+      }, {
+        id: 'image-node-b', kind: 'image', title: '次图',
+        position: { x: 100, y: 0 }, imageModuleId: 'image-module-b',
+      }], 'tool-preflight')
+
+      expect(context.imageCalls.filter((call) => call.type === 'create-once')).toHaveLength(0)
+      expect(result.tasks).toContainEqual(expect.objectContaining({
+        nodeId: 'image-node-b', status: 'failed', error: 'CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED',
+      }))
     } finally {
       context.registration.dispose()
     }
