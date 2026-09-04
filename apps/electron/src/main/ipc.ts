@@ -131,6 +131,10 @@ import type {
   DetachedPreviewWindowInput,
   RevertFileInput,
   FileAccessOptions,
+  FileExistsBatchInput,
+  FileExistsBatchResult,
+  ResolveAuthorizedFilePathInput,
+  ResolvedAuthorizedFilePath,
   ResolvedFileUrl,
   Automation,
   CreateAutomationInput,
@@ -320,7 +324,6 @@ import {
   openFileOrFolderDialog,
 } from './lib/attachment-service'
 import { extractTextFromAttachment } from './lib/document-parser'
-import { getTutorialContent, createWelcomeConversation } from './lib/tutorial-service'
 import { getUserProfile, updateUserProfile } from './lib/user-profile-service'
 import { getSettings, updateSettings } from './lib/settings-service'
 import { refreshAgentIslandConfiguration, markAgentIslandSessionViewed } from './lib/agent-island-service'
@@ -409,7 +412,7 @@ import {
   listEnabledAgentModelsForChannel,
 } from './lib/agent-model-selection'
 import { isAgentSessionUserVisible, requireUserVisibleAgentSession } from './lib/agent-session-visibility'
-import { agentEventBus, prepareAgentRun, runAgent, runPreparedAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, listActiveAgentSessionSnapshots, reserveAgentSessionStart, listActiveCanvasAgentRuns, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
+import { agentEventBus, prepareAgentRun, runAgent, runPreparedAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, listActiveAgentSessionSnapshots, listQueuedAgentMessages, reserveAgentSessionStart, listActiveCanvasAgentRuns, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerAgentMessageIpcHandlers } from './lib/agent-message-ipc'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import {
@@ -3300,22 +3303,6 @@ export function registerIpcHandlers(): void {
     }
   )
 
-  // 获取教程内容
-  ipcMain.handle(
-    CHAT_IPC_CHANNELS.GET_TUTORIAL_CONTENT,
-    async (): Promise<string | null> => {
-      return getTutorialContent()
-    }
-  )
-
-  // 创建欢迎对话（含教程附件）
-  ipcMain.handle(
-    CHAT_IPC_CHANNELS.CREATE_WELCOME_CONVERSATION,
-    async (): Promise<ConversationMeta | null> => {
-      return createWelcomeConversation()
-    }
-  )
-
   // 发送消息（触发 AI 流式响应）
   // 注意：通过 event.sender 获取 webContents 用于推送流式事件
   ipcMain.handle(
@@ -4881,6 +4868,16 @@ export function registerIpcHandlers(): void {
 
   // ===== Agent 队列消息 =====
 
+  // Renderer reload 后只能恢复普通可见会话的 deferred queue 投影。
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.GET_QUEUED_MESSAGES,
+    async (_, sessionId: string): Promise<import('@proma/shared').AgentQueuedMessageSnapshot[]> => {
+      if (typeof sessionId !== 'string' || sessionId.length === 0) throw new Error('会话 ID 非法')
+      requireVisibleSession(sessionId)
+      return listQueuedAgentMessages(sessionId)
+    },
+  )
+
   // 兼容旧调用：将消息交给主进程 deferred queue。
   ipcMain.handle(
     AGENT_IPC_CHANNELS.ENQUEUE_QUEUED_MESSAGE,
@@ -5608,6 +5605,37 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  // 批量检查文件是否仍存在（供渲染端清理已删除的会话文件变更记录）。
+  // 只接受绝对路径；逐项保留稳定 fd/owner 校验，每 16 项让出一次事件循环。
+  ipcMain.handle(
+    IPC_CHANNELS.FILE_EXISTS_BATCH,
+    async (_, input: FileExistsBatchInput): Promise<FileExistsBatchResult> => {
+      if (!input || typeof input !== 'object' || !Array.isArray(input.filePaths)) return []
+      const snapshot = requireVisibleFileAccess(input.access)
+      const candidates = input.filePaths.slice(0, 1000).filter(
+        (rawPath): rawPath is string => typeof rawPath === 'string' && rawPath.length > 0 && isAbsolute(rawPath),
+      )
+      const existing: string[] = []
+      for (let index = 0; index < candidates.length; index += 1) {
+        /** 当前候选路径仍通过同一稳定文件授权边界打开。 */
+        const filePath = candidates[index]!
+        try {
+          const accessSnapshot = requireVisibleFileReadAccess(input.access, filePath, undefined, 0, snapshot)
+          const authorizedFile = accessSnapshot.authorizedFiles.get(filePath)
+          if (!authorizedFile) continue
+          existing.push(filePath)
+          authorizedFile.close()
+        } catch {
+          // 不存在、不可读或不在授权路径内：视为已删除。
+        }
+        if ((index + 1) % 16 === 0 && index + 1 < candidates.length) {
+          await new Promise<void>((resolve) => setImmediate(resolve))
+        }
+      }
+      return existing
+    },
+  )
+
   // 写入文本文件（供 Markdown 内联编辑使用）
   ipcMain.handle(
     'file:write-text',
@@ -5630,29 +5658,54 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     'file:resolve-markdown-media',
     async (_, markdownFilePath: string, src: string, access?: FileAccessOptions | string[]): Promise<ResolvedFileUrl | null> => {
+      const accessSnapshot = requireVisibleFileAccess(access)
       const { resolveMarkdownRelativeMediaPath } = await import('./lib/markdown-media-service')
-      const options = normalizeFileAccessOptions(access)
-      const result = resolveMarkdownRelativeMediaPath(markdownFilePath, src, options)
+      const result = resolveMarkdownRelativeMediaPath(markdownFilePath, src, accessSnapshot.options)
       if (!result) return null
+      const resolvedAccess = requireVisibleFileReadAccess(access, result, undefined, 100 * 1024 * 1024, accessSnapshot)
+      const authorizedFile = resolvedAccess.authorizedFiles.get(result)
+      if (!authorizedFile) return null
       try {
-        return { url: registerPromaFilePath(result) }
+        return {
+          url: registerPromaAuthorizedFile(authorizedFile.canonicalPath, authorizedFile.readBytes()),
+        }
       } catch (err) {
         console.warn('[IPC] file:resolve-markdown-media 无法注册图片，跳过:', result, err instanceof Error ? err.message : err)
         return null
+      } finally {
+        authorizedFile.close()
       }
     },
   )
 
   // 仅解析文件路径（供 PDF/图片等用 proma-file:// 加载）
   ipcMain.handle(
+    IPC_CHANNELS.RESOLVE_AUTHORIZED_FILE_PATH,
+    async (_, input: ResolveAuthorizedFilePathInput): Promise<ResolvedAuthorizedFilePath | null> => {
+      if (!input || typeof input !== 'object' || typeof input.filePath !== 'string') return null
+      const accessSnapshot = requireVisibleFileReadAccess(input.access, input.filePath, undefined, 0)
+      const authorizedFile = accessSnapshot.authorizedFiles.get(input.filePath)
+      if (!authorizedFile) return null
+      try {
+        return { resolvedPath: authorizedFile.canonicalPath }
+      } finally {
+        authorizedFile.close()
+      }
+    },
+  )
+
+  ipcMain.handle(
     'file:resolve-path',
-    async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<ResolvedFileUrl | null> => {
+    async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<(ResolvedFileUrl & { resolvedPath: string }) | null> => {
       const accessSnapshot = requireVisibleFileReadAccess(access, filePath, undefined, 100 * 1024 * 1024)
       const authorizedFile = accessSnapshot.authorizedFiles.get(filePath)
       if (!authorizedFile) return null
       try {
         const content = authorizedFile.readBytes()
-        return { url: registerPromaAuthorizedFile(authorizedFile.canonicalPath, content) }
+        return {
+          url: registerPromaAuthorizedFile(authorizedFile.canonicalPath, content),
+          resolvedPath: authorizedFile.canonicalPath,
+        }
       } catch (err) {
         console.warn('[IPC] file:resolve-path 无法注册稳定文件，跳过:', err instanceof Error ? err.message : err)
         return null
@@ -6921,6 +6974,14 @@ export function registerIpcHandlers(): void {
 
   // ===== LAN Bridge IPC Handlers =====
   registerLanBridgeIpcHandlers(ipcMain, createLanBridgeIpcDependencies(agentEventBus))
+
+  ipcMain.handle(
+    IPC_CHANNELS.WINDOW_IS_FOCUSED,
+    async (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+      return win && !win.isDestroyed() ? win.isFocused() : false
+    }
+  )
 
   // ===== 任务 / 日程（Planning）=====
 

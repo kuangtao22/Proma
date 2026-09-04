@@ -50,7 +50,7 @@ import { getEffectiveProxyUrl } from './proxy-settings-service'
 import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, removeSDKErrorMessage, updateSDKUserMessageSkillActivations, rewindPiAgentSession, resolveAgentCwd, getActiveWorktreePath, getAgentCwdMode, getSessionWorkbenchLayout } from './agent-session-manager'
 import { getAgentWorkspace, getProjectFilesPath, getWorkspaceMcpConfig, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles, getWorkspaceAgentsMdPath, readWorkspaceAgentsMd, getWorkspaceMemoryGuidance, isWorkspaceProjectKnowledgeMaintenanceApproved } from './agent-workspace-manager'
 import { getLocalProjectRootStatus } from './project-root-health'
-import { getMcpOAuthHeaders } from './mcp-oauth-service'
+import { getMcpApiKeyEnvironment, getMcpOAuthHeaders } from './mcp-oauth-service'
 import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceSkillsDir } from './config-paths'
 import { getRuntimeStatus } from './runtime-init'
 import { getSettings } from './settings-service'
@@ -308,16 +308,18 @@ export class AgentOrchestrator {
       const type = normalizeMcpTransportType((entry as { type?: unknown }).type)
 
       if (type === 'stdio' && entry.command) {
+        const credentialEnv = getMcpApiKeyEnvironment(workspaceSlug, name, entry)
         const mergedEnv: Record<string, string> = {
           ...(process.env.PATH && { PATH: process.env.PATH }),
           ...entry.env,
+          ...credentialEnv,
         }
         mcpServers[name] = {
           type: 'stdio',
           command: entry.command,
           ...(entry.args && entry.args.length > 0 && { args: entry.args }),
           ...(Object.keys(mergedEnv).length > 0 && { env: mergedEnv }),
-          required: false,
+          required: true,
           startup_timeout_sec: entry.timeout ?? 30,
         }
       } else if ((type === 'http' || type === 'sse') && entry.url) {
@@ -334,7 +336,7 @@ export class AgentOrchestrator {
           url: entry.url,
           ...(Object.keys(headers).length > 0 && { headers }),
           ...(proxyUrl && { proxyUrl }),
-          required: false,
+          required: true,
         }
       } else {
         console.warn(`[Agent 编排] MCP 服务器 "${name}" 配置不完整，已跳过（type=${entry.type}, command=${entry.command ?? '无'}, url=${entry.url ?? '无'}）`)
@@ -1530,24 +1532,11 @@ export class AgentOrchestrator {
               ? { behavior: 'allow' as const, updatedInput: input }
               : { behavior: 'deny' as const, message: '计划模式下只允许只读 PowerShell 探索命令，请在计划审批通过后再执行写操作' }
           }
-          return permissionService.requestSingleApproval(sessionId, toolName, input, options, (request) => {
+          /** 等待 PowerShell 单次审批后的权限结果。 */
+          const result = await permissionService.requestSingleApproval(sessionId, toolName, input, options, (request) => {
             this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
           })
-        }
-
-        // Pi 的原生 PowerShell 尚未具备 Proma Bash 等价的命令级安全分类和白名单。
-        // 在需确认的权限模式中，每条命令都必须显示并单次确认；bypassPermissions
-        // 则遵从其既有语义，允许用户显式跳过所有工具确认。
-        if (toolName === 'PowerShell' && currentMode !== 'bypassPermissions') {
-          if (currentMode === 'plan') {
-            const command = typeof input.command === 'string' ? input.command : ''
-            return isPowerShellCommandReadOnly(command)
-              ? { behavior: 'allow' as const, updatedInput: input }
-              : { behavior: 'deny' as const, message: '计划模式下只允许只读 PowerShell 探索命令，请在计划审批通过后再执行写操作' }
-          }
-          return permissionService.requestSingleApproval(sessionId, toolName, input, options, (request) => {
-            this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
-          })
+          return revalidateSingleApprovalResult(result, denyStaleToolRun, getPermissionMode)
         }
 
         // ── 普通工具的权限分派 ──

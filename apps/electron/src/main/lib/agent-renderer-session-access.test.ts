@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, extname, join, resolve } from 'node:path'
-import type { AgentSessionMeta, FileAccessOptions } from '@proma/shared'
+import type { AgentQueuedMessageSnapshot, AgentSessionMeta, FileAccessOptions } from '@proma/shared'
 import ts from 'typescript'
 import { requireUserVisibleAgentSession } from './agent-session-visibility'
 
@@ -65,6 +65,9 @@ const NON_AGENT_FILE_CHANNELS = new Set([
   'SYSTEM_OPEN_FILE',
   'GET_DEFAULT_APP_FOR_FILE',
   'file:resolve-and-read',
+  'file:resolve-markdown-media',
+  'FILE_EXISTS_BATCH',
+  'RESOLVE_AUTHORIZED_FILE_PATH',
   'file:write-text',
   'file:resolve-path',
   'file:resolve-html-preview-path',
@@ -164,6 +167,7 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'LIST_WORKSPACE_AUTO_MEMORY_FILES',
     'OPEN_FILE_OR_FOLDER_DIALOG',
     'OPEN_FOLDER_DIALOG',
+    'OPEN_SKILL_FOLDER',
     'OPEN_WORKSPACE_MEMORY_WINDOW',
     'READ_SKILL_CONTENT',
     'READ_SKILL_FILE',
@@ -225,15 +229,14 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
   ], { kind: 'exempt', reason: EXEMPT_REASONS.CHANNEL_IPC_CHANNELS }),
   ...defineRendererHandlerPolicies('CHAT_IPC_CHANNELS', [
     'CREATE_CONVERSATION',
-    'CREATE_WELCOME_CONVERSATION',
     'DELETE_ATTACHMENT',
     'DELETE_CONVERSATION',
     'DELETE_MESSAGE',
     'EXTRACT_ATTACHMENT_TEXT',
     'GENERATE_TITLE',
     'GET_MESSAGES',
+    'GET_MESSAGES_AROUND',
     'GET_RECENT_MESSAGES',
-    'GET_TUTORIAL_CONTENT',
     'LIST_CONVERSATIONS',
     'OPEN_FILE_DIALOG',
     'READ_ATTACHMENT',
@@ -241,6 +244,7 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'SAVE_IMAGE_AS',
     'SAVE_RESOURCE_FILE_AS',
     'SEARCH_MESSAGES',
+    'SEARCH_SESSION_MESSAGES',
     'SEND_MESSAGE',
     'STOP_GENERATION',
     'TOGGLE_ARCHIVE',
@@ -322,6 +326,7 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'SCAN_EDITORS',
     'SCREENSHOT_CAPTURE',
     'WINDOW_CLOSE',
+    'WINDOW_IS_FOCUSED',
     'WINDOW_IS_MAXIMIZED',
     'WINDOW_MAXIMIZE',
     'WINDOW_MINIMIZE',
@@ -415,6 +420,8 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'LIST_FILES',
     'READ_FILE',
     'RENAME_FILE',
+    'RESOLVE_MEDIA',
+    'SAVE_PASTED_IMAGE',
     'SELECT',
     'SELECT_DEFAULT',
     'WRITE_FILE',
@@ -458,6 +465,7 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'ENQUEUE_QUEUED_MESSAGE',
     'EXIT_PLAN_MODE_RESPOND',
     'FORK_SESSION',
+    'GET_QUEUED_MESSAGES',
     'GET_SDK_MESSAGES',
     'GET_SESSION_PATH',
     'MIGRATE_CHAT_TO_AGENT',
@@ -541,6 +549,10 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'SYSTEM_OPEN_FILE',
   ], { kind: 'path', guards: ['requireVisibleFileAccess'] }),
   ...defineRendererHandlerPolicies('IPC_CHANNELS', [
+    'FILE_EXISTS_BATCH',
+    'RESOLVE_AUTHORIZED_FILE_PATH',
+  ], { kind: 'path', guards: ['requireVisibleFileAccess', 'requireVisibleFileReadAccess'] }),
+  ...defineRendererHandlerPolicies('IPC_CHANNELS', [
     'REVERT_FILE',
   ], { kind: 'path', guards: ['Error'] }),
   ...defineRendererHandlerPolicies('WINDOWS_AGENT_ISLAND_IPC_CHANNELS', [
@@ -558,6 +570,7 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'file:prepare-pdf-preview',
     'file:read-binary-base64',
     'file:resolve-and-read',
+    'file:resolve-markdown-media',
     'file:resolve-path',
   ], { kind: 'path', guards: ['requireVisibleFileReadAccess'] }),
   ...defineRendererHandlerPolicies('literal', [
@@ -996,7 +1009,7 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
           }]]),
         }
       }
-      const handler = compileHandler<(event: object, path: string) => Promise<{ url: string } | null>>(registered!, {
+      const handler = compileHandler<(event: object, path: string) => Promise<{ url: string; resolvedPath: string } | null>>(registered!, {
         requireVisibleFileAccess: () => ({ options: undefined }),
         requireVisibleFileReadAccess,
         getPreviewCandidateBasePaths: () => [root],
@@ -1012,7 +1025,10 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
         console,
       })
 
-      await expect(handler({}, filePath)).resolves.toEqual({ url: 'proma-file://buffer-token' })
+      await expect(handler({}, filePath)).resolves.toEqual({
+        url: 'proma-file://buffer-token',
+        resolvedPath: filePath,
+      })
       expect(registeredContent).toBe('authorized-content')
       expect(() => fstatSync(descriptor!)).toThrow()
     } finally {
@@ -1021,6 +1037,143 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       }
       rmSync(root, { recursive: true, force: true })
     }
+  })
+
+  test('Given 文件路径 chip 解析路径 When 调用轻量 handler Then 不读取内容或注册协议 token', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'RESOLVE_AUTHORIZED_FILE_PATH')
+    expect(registered).toBeDefined()
+    let readCount = 0
+    let closeCount = 0
+    const handler = compileHandler<(event: object, input: { filePath: string }) => Promise<{ resolvedPath: string } | null>>(registered!, {
+      requireVisibleFileReadAccess: () => ({
+        authorizedFiles: new Map([['relative/file.md', {
+          canonicalPath: '/project/relative/file.md',
+          readBytes: () => { readCount += 1; return Buffer.alloc(0) },
+          close: () => { closeCount += 1 },
+        }]]),
+      }),
+    })
+
+    await expect(handler({}, { filePath: 'relative/file.md' })).resolves.toEqual({
+      resolvedPath: '/project/relative/file.md',
+    })
+    expect(readCount).toBe(0)
+    expect(closeCount).toBe(1)
+  })
+
+  test('Given 批量存在性检查包含正常与越界文件 When 逐项授权 Then 只返回通过稳定授权的路径', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'FILE_EXISTS_BATCH')
+    expect(registered).toBeDefined()
+    const closed: string[] = []
+    const handler = compileHandler<(event: object, input: { filePaths: string[] }) => Promise<string[]>>(registered!, {
+      isAbsolute: () => true,
+      requireVisibleFileAccess: () => ({ options: undefined }),
+      requireVisibleFileReadAccess: (_access: unknown, filePath: string) => {
+        if (filePath === '/outside.txt') throw new Error('访问路径超出当前会话的授权范围')
+        return {
+          authorizedFiles: new Map([[filePath, {
+            canonicalPath: filePath,
+            close: () => { closed.push(filePath) },
+          }]]),
+        }
+      },
+    })
+
+    await expect(handler({}, {
+      filePaths: ['/project/ok.txt', '/outside.txt'],
+    })).resolves.toEqual(['/project/ok.txt'])
+    expect(closed).toEqual(['/project/ok.txt'])
+  })
+
+  test('Given 17 个批量文件 When 逐项稳定授权 Then 处理完前 16 项后让出一次主进程事件循环', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'FILE_EXISTS_BATCH')
+    expect(registered).toBeDefined()
+    /** 记录文件打开与调度点顺序，验证分片边界而不依赖真实时间。 */
+    const events: string[] = []
+    /** 构造刚好跨过一个 16 项分片的路径集合。 */
+    const filePaths = Array.from({ length: 17 }, (_, index) => `/project/${index}.txt`)
+    const handler = compileHandler<(event: object, input: { filePaths: string[] }) => Promise<string[]>>(registered!, {
+      isAbsolute: () => true,
+      requireVisibleFileAccess: () => ({ options: undefined }),
+      requireVisibleFileReadAccess: (_access: unknown, filePath: string) => {
+        events.push(`open:${filePath}`)
+        return {
+          authorizedFiles: new Map([[filePath, {
+            canonicalPath: filePath,
+            close: () => undefined,
+          }]]),
+        }
+      },
+      setImmediate: (callback: () => void) => {
+        events.push('yield')
+        callback()
+      },
+    })
+
+    await expect(handler({}, { filePaths })).resolves.toEqual(filePaths)
+    expect(events[15]).toBe('open:/project/15.txt')
+    expect(events[16]).toBe('yield')
+    expect(events[17]).toBe('open:/project/16.txt')
+    expect(events.filter((event) => event === 'yield')).toHaveLength(1)
+  })
+
+  test('Given 普通、Canvas、Design 与不存在会话 When 读取 deferred 快照 Then 仅普通可见会话进入队列服务', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'GET_QUEUED_MESSAGES')
+    expect(registered).toBeDefined()
+    /** 主进程队列服务返回的真实快照。 */
+    const snapshots: AgentQueuedMessageSnapshot[] = [{
+      input: {
+        sessionId: 'visible',
+        queueMessageId: 'message-1',
+        userMessage: '继续',
+        channelId: 'channel-1',
+      },
+      queuedAt: 100,
+    }]
+    /** 四类 owner 覆盖普通可见、两类内部会话与不存在边界。 */
+    const sessions = new Map<string, AgentSessionMeta>([
+      ['visible', { id: 'visible', title: '普通会话', createdAt: 1, updatedAt: 1 }],
+      ['canvas', { id: 'canvas', title: 'Canvas', sourceCanvasProjectId: 'p', sourceCanvasId: 'c', sourceCanvasNodeId: 'n', createdAt: 1, updatedAt: 1 }],
+      ['design', { id: 'design', title: 'Design', sourceDesignProjectId: 'p', sourceDesignJobId: 'j', createdAt: 1, updatedAt: 1 }],
+    ])
+    /** 记录真实队列读取次数，证明 guard 失败时业务零副作用。 */
+    const listedSessionIds: string[] = []
+    const handler = compileHandler<(event: object, sessionId: string) => Promise<AgentQueuedMessageSnapshot[]>>(registered!, {
+      requireVisibleSession: (sessionId: string) => requireUserVisibleAgentSession(sessions.get(sessionId)),
+      listQueuedAgentMessages: (sessionId: string) => {
+        listedSessionIds.push(sessionId)
+        return snapshots
+      },
+    })
+
+    await expect(handler({}, 'visible')).resolves.toEqual(snapshots)
+    for (const sessionId of ['canvas', 'design', 'missing']) {
+      await expect(handler({}, sessionId)).rejects.toThrow('Agent 会话不存在')
+    }
+    await expect(handler({}, '')).rejects.toThrow('会话 ID 非法')
+    expect(listedSessionIds).toEqual(['visible'])
+  })
+
+  test('Given Canvas managed session context When 批量检查文件 Then owner guard 先失败且不打开文件', async () => {
+    const { handlers } = loadAgentHandlers()
+    const registered = handlers.find(({ channel }) => channel === 'FILE_EXISTS_BATCH')
+    expect(registered).toBeDefined()
+    let openCount = 0
+    const handler = compileHandler<(event: object, input: { filePaths: string[]; access: FileAccessOptions }) => Promise<string[]>>(registered!, {
+      isAbsolute: () => true,
+      requireVisibleFileAccess: () => { throw new Error('Agent 会话不存在') },
+      requireVisibleFileReadAccess: () => { openCount += 1; throw new Error('不应执行') },
+    })
+
+    await expect(handler({}, {
+      filePaths: ['/managed/canvas-session/output.txt'],
+      access: { sessionId: 'canvas-session', unrestricted: true },
+    })).rejects.toThrow('Agent 会话不存在')
+    expect(openCount).toBe(0)
   })
 
   test('Given HTML 目录无法绑定稳定授权对象 When 请求预览 Then 明确禁用且不注册目录', async () => {
@@ -1174,12 +1327,30 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
     expect(sourceByPath.get('FileMentionSuggestion')).toMatch(/searchWorkspaceFiles\([\s\S]*\{\s*sessionId:\s*currentSessionIdRef\?\.current/)
     expect(sourceByPath.get('RichTextInput')).toContain('currentSessionIdRef,')
     expect(sourceByPath.get('FilePathChip')).toMatch(/showItemInFolder\(cleanPath,\s*\{[\s\S]*sessionId:[\s\S]*candidateBasePaths:/)
+    expect(sourceByPath.get('FilePathChip')).toContain('resolveAuthorizedFilePath(cleanPath')
+    expect(sourceByPath.get('FilePathChip')).not.toContain('resolveFilePath(cleanPath')
     expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/showItemInFolder\(summary\.agentsMd\.path,\s*\{\s*workspaceSlug\s*\}\)/)
     expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/showItemInFolder\(autoMemoryPath\(summary, path\),\s*\{\s*workspaceSlug\s*\}\)/)
     expect(sourceByPath.get('AgentSkillsView')).toMatch(/openFile\(`\$\{data\.skillsDir\}\/\$\{slug\}`,\s*\{\s*workspaceSlug:\s*data\.workspaceSlug\s*\}\)/)
     expect(sourceByPath.get('GlobalAgentListeners')).toMatch(/getGitRepoStatus\(dirPath,\s*\{\s*sessionId:\s*sid\s*\}\)/)
     expect(sourceByPath.get('FileSearchBar')).toContain("toast.error('文件搜索不可用'")
     expect(sourceByPath.get('FileMentionSuggestion')).toContain("toast.error('暂时无法引用文件'")
+  })
+
+  test('Given TipTap 拒绝插入会话引用 When insertSessionMention 返回 Then 向调用方透传 run 的 false', () => {
+    /** 读取真实富文本输入源码，锁定命令执行结果的返回合同。 */
+    const source = readFileSync(
+      join(import.meta.dir, '../../renderer/components/ai-elements/rich-text-input.tsx'),
+      'utf8',
+    )
+    /** 仅截取会话引用插入方法，避免其它插入命令干扰断言。 */
+    const start = source.indexOf('    insertSessionMention(item: SessionReferenceDragItem): boolean {')
+    const end = source.indexOf('    insertAgentHistoryQuoteMention(', start)
+    const body = source.slice(start, end)
+
+    expect(start).toBeGreaterThan(-1)
+    expect(body).toMatch(/return editor\.chain\(\)\.focus\(\)[\s\S]*\.insertContent\(' '\)[\s\S]*\.run\(\)/)
+    expect(body).not.toContain('return true')
   })
 
   test('Given AGENT handler 使用裸 id 参数 When 检查矩阵 Then 每个 id 都必须显式归类', () => {

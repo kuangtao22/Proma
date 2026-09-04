@@ -53,6 +53,10 @@ import { createFileMentionSuggestion } from '@/components/file-browser/file-ment
 import { getFilePanelDragData, type FilePanelDragItem } from '@/lib/file-panel-drag'
 import { insertFileMentionsWithFallback } from '@/lib/file-mention-insertion'
 import {
+  getSessionReferenceDragData,
+  type SessionReferenceDragItem,
+} from '@/lib/session-reference-drag'
+import {
   createMcpMentionSuggestion,
   createPlanningMentionSuggestion,
   createSessionMentionSuggestion,
@@ -197,6 +201,8 @@ export interface RichTextInputHandle {
   getMarkdown: () => string
   /** 在光标处插入文件引用（右侧文件面板拖入时调用） */
   insertFileMentions: (items: FilePanelDragItem[]) => boolean
+  /** 在光标处插入会话引用（左侧会话行拖入时调用）。 */
+  insertSessionMention: (item: SessionReferenceDragItem) => boolean
   /** 在光标处插入可定位的 Agent 历史引用 chip。 */
   insertAgentHistoryQuoteMention: (quote: QuotedSelection) => boolean
   /** 在光标处插入文件或 Vault 的选区引用 chip；可重复插入、多条并存。 */
@@ -685,10 +691,16 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
     content: value || '',
     editable: !disabled,
     editorProps: {
-      // 右侧文件面板拖拽载荷（自定义 MIME）交给外层容器 onDrop 处理，
-      // 阻止 ProseMirror 把 text/plain 路径文本当作普通文本插入。
+      // 文件面板和左侧会话行的自定义 MIME 载荷交给外层容器 onDrop 处理，
+      // 阻止 ProseMirror 把 text/plain 兜底载荷当作普通文本插入。
       handleDrop: (_view, event) => {
-        if (event.dataTransfer && getFilePanelDragData(event.dataTransfer)) {
+        if (
+          event.dataTransfer
+          && (
+            getFilePanelDragData(event.dataTransfer)
+            || getSessionReferenceDragData(event.dataTransfer)
+          )
+        ) {
           event.preventDefault()
           return true
         }
@@ -1069,6 +1081,20 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
         hasMentionNode: Boolean(editor.schema.nodes.mention),
         insertContent: (content) => editor.chain().focus().insertContent(content).run(),
       })
+    },
+    insertSessionMention(item: SessionReferenceDragItem): boolean {
+      if (!editor || !editor.isEditable) return false
+      return editor.chain().focus()
+        .insertContent({
+          type: 'mention',
+          attrs: {
+            id: item.sessionId,
+            label: item.title,
+            mentionSuggestionChar: '&',
+          },
+        })
+        .insertContent(' ')
+        .run()
     },
     insertAgentHistoryQuoteMention(quote: QuotedSelection): boolean {
       if (!editor) return false

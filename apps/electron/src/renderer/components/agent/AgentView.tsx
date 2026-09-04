@@ -135,6 +135,15 @@ import type { AgentDeferredQueueMessageInput, AgentSendInput, AgentPendingFile, 
 import { inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedModel, MAX_ATTACHMENT_SIZE, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningCapability, resolveReasoningProfile } from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
 import { getFilePanelDragData, INSERT_FILE_MENTION_EVENT, type FilePanelDragItem } from '@/lib/file-panel-drag'
+import {
+  canReferenceDraggedSession,
+  clearSessionReferenceDragState,
+  getActiveSessionReferenceDragId,
+  getSessionReferenceDragData,
+  INSERT_SESSION_REFERENCE_MENTION_EVENT,
+  isSessionReferenceDrag,
+  type InsertSessionReferenceMentionDetail,
+} from '@/lib/session-reference-drag'
 import { buildQuotedSelectionBlock, expandAgentHistoryQuoteMentions } from '@/lib/quoted-selection'
 import { INSERT_AGENT_INPUT_QUOTE_EVENT, type InsertAgentInputQuoteDetail } from '@/lib/agent-input-quote'
 import { createClipboardPendingFile, createClipboardTextDraft, makeUniqueAttachmentName } from '@/lib/clipboard-text-attachment'
@@ -768,6 +777,16 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     window.addEventListener(INSERT_AGENT_INPUT_QUOTE_EVENT, handleInsertQuote)
     return () => window.removeEventListener(INSERT_AGENT_INPUT_QUOTE_EVENT, handleInsertQuote)
   }, [sessionId])
+  React.useEffect(() => {
+    const handleInsertSessionReference = (event: Event): void => {
+      const detail = (event as CustomEvent<InsertSessionReferenceMentionDetail>).detail
+      if (!detail || detail.targetSessionId !== sessionId) return
+      if (!canReferenceDraggedSession(detail.item, sessionId)) return
+      detail.inserted = richTextInputRef.current?.insertSessionMention(detail.item) ?? false
+    }
+    window.addEventListener(INSERT_SESSION_REFERENCE_MENTION_EVENT, handleInsertSessionReference)
+    return () => window.removeEventListener(INSERT_SESSION_REFERENCE_MENTION_EVENT, handleInsertSessionReference)
+  }, [sessionId])
   const handleAgentHistoryQuoteClick = React.useCallback((quote: QuotedSelection): void => {
     if (
       quote.sourceType !== 'agent-history'
@@ -862,6 +881,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     () => globalChannels.some((channel) => channel.enabled && channel.models.some((model) => model.enabled)),
     [globalChannels],
   )
+  const isComposerDisabled = isLegacyTranscript || !agentChannelId || !hasAvailableModel
   React.useEffect(() => {
     if (!agentChannelId || agentModelId) return
 
@@ -891,39 +911,42 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
 
   // 获取当前 session 的工作路径（文件浏览器需要）
   React.useEffect(() => {
+    let disposed = false
+
     if (!currentWorkspaceId) {
       setSessionPathMap((prev) => {
+        if (!prev.has(sessionId)) return prev
         const map = new Map(prev)
         map.delete(sessionId)
         return map
       })
-      return
+      return () => { disposed = true }
     }
 
+    // IPC 请求不可取消，用 effect 生命周期阻止旧工作区请求覆盖当前路径。
+    // 不在请求开始时清空已有路径，避免正常挂载时文件面板出现空窗。
     window.electronAPI
       .getAgentSessionPath(currentWorkspaceId, sessionId)
       .then((path) => {
-        if (path) {
-          setSessionPathMap((prev) => {
-            const map = new Map(prev)
-            map.set(sessionId, path)
-            return map
-          })
-        } else {
-          setSessionPathMap((prev) => {
-            const map = new Map(prev)
-            map.delete(sessionId)
-            return map
-          })
-        }
+        if (disposed) return
+        setSessionPathMap((prev) => {
+          const map = new Map(prev)
+          if (path) map.set(sessionId, path)
+          else map.delete(sessionId)
+          return map
+        })
       })
       .catch(() => {
+        if (disposed) return
         setSessionPathMap((prev) => {
+          if (!prev.has(sessionId)) return prev
           const map = new Map(prev)
           map.delete(sessionId)
           return map
         })
       })
+
+    return () => { disposed = true }
   }, [sessionId, currentWorkspaceId, setSessionPathMap])
 
   // 获取工作区共享文件目录路径（@ 引用时需要搜索）
@@ -1758,8 +1781,19 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   const handleDragOver = React.useCallback((e: React.DragEvent): void => {
     e.preventDefault()
     e.stopPropagation()
+    const sessionReferenceDrag = isSessionReferenceDrag(e.dataTransfer)
+    const draggedSessionId = getActiveSessionReferenceDragId(e.dataTransfer)
+    if (
+      sessionReferenceDrag
+      && (draggedSessionId === sessionId || isComposerDisabled)
+    ) {
+      e.dataTransfer.dropEffect = 'none'
+      setIsDragOver(false)
+      return
+    }
+    e.dataTransfer.dropEffect = 'copy'
     setIsDragOver(true)
-  }, [])
+  }, [isComposerDisabled, sessionId])
 
   const handleDragLeave = React.useCallback((e: React.DragEvent): void => {
     e.preventDefault()
@@ -1771,6 +1805,19 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     e.preventDefault()
     e.stopPropagation()
     setIsDragOver(false)
+    clearSessionReferenceDragState()
+
+    // 左侧 Agent 会话行拖入：复用键盘 & 菜单生成的 session mention chip。
+    const draggedSession = getSessionReferenceDragData(e.dataTransfer)
+    if (draggedSession) {
+      if (isComposerDisabled) return
+      if (!canReferenceDraggedSession(draggedSession, sessionId)) {
+        toast.warning('不能引用当前会话')
+        return
+      }
+      richTextInputRef.current?.insertSessionMention(draggedSession)
+      return
+    }
 
     // 优先识别右侧文件面板的自定义拖拽载荷（会话文件 / 项目文件引用）
     // 文件直接插入引用；文件夹先附加到会话（Agent 可访问），附加成功后才插入引用，
@@ -1903,7 +1950,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       // 无路径信息：回退，所有项按普通文件处理
       addFilesAsAttachments(droppedFiles)
     }
-  }, [sessionId, addFilesAsAttachments, addPanelDirectory, setAttachedDirsMap, workspaces, currentWorkspaceId])
+  }, [sessionId, addFilesAsAttachments, addPanelDirectory, setAttachedDirsMap, workspaces, currentWorkspaceId, isComposerDisabled])
 
   /** ModelSelector 选择回调 */
   const handleModelSelect = React.useCallback((option: ModelOption): void => {
@@ -2093,6 +2140,15 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         mentionedCalendarEventIds: payload.mentions.mentionedCalendarEventIds,
         ...(payload.canvasNodeReferences && payload.canvasNodeReferences.length > 0
           ? { canvasNodeReferences: payload.canvasNodeReferences }
+          : {}),
+        ...(message.quotedSelection || message.fileReferenceBlock || (message.attachments?.length ?? 0) > 0
+          ? {
+            queuePresentation: {
+              quotedSelection: message.quotedSelection,
+              fileReferenceBlock: message.fileReferenceBlock,
+              attachments: message.attachments,
+            },
+          }
           : {}),
       }
       setQueuedMessages((prev) => [...prev, message])
@@ -3085,7 +3141,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
             trailing={inputTrailingNode}
             className={cn(
               (isPlanMode || isPermissionPlanMode) && !isDragOver && 'plan-mode-border',
-              isDragOver && 'border-[2px] border-dashed border-[#2ecc71] bg-[#2ecc71]/[0.03]'
+              isDragOver && 'border-[2px] border-dashed border-primary bg-primary/[0.03]'
             )}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -3198,7 +3254,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
                     ? '请先选择模型'
                     : '暂无可用模型，请先在设置中启用渠道'
               }
-              disabled={isLegacyTranscript || !agentChannelId || !hasAvailableModel}
+              disabled={isComposerDisabled}
               autoFocusTrigger={sessionId}
               collapsible
               enableMentions

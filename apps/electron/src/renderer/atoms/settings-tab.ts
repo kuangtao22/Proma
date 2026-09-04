@@ -14,7 +14,7 @@ import { atom } from 'jotai'
 import type { TabType } from './tab-atoms'
 
 /** `migration` 继续作为“路径与迁移”的稳定 id，避免已有导航状态失效。 */
-export type SettingsTab = 'general' | 'channels' | 'vision-relay' | 'proxy' | 'appearance' | 'about' | 'onboarding' | 'prompts' | 'tools' | 'bots' | 'tutorial' | 'shortcuts' | 'voice-input' | 'migration' | 'storage'
+export type SettingsTab = 'general' | 'channels' | 'vision-relay' | 'proxy' | 'appearance' | 'about' | 'onboarding' | 'prompts' | 'tools' | 'bots' | 'shortcuts' | 'voice-input' | 'migration' | 'storage'
 export type ToolSettingsFocus = 'web-search' | 'nano-banana' | 'custom-tools'
 export type ChannelSettingsFocus = 'image-models'
 

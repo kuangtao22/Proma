@@ -127,7 +127,7 @@ import type {
   PendingRequestsSnapshot,
   VaultCandidate,
   VaultDeleteInput,
-  VaultFileEntry,
+  VaultTreeEntry,
   VaultFocus,
   VaultReadResult,
   VaultRenameInput,
@@ -302,6 +302,8 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   windowClose: () => Promise<void>
   /** 窗口是否处于最大化状态 */
   windowIsMaximized: () => Promise<boolean>
+  /** 宿主 BrowserWindow 是否处于前台（焦点可位于原生 WebContentsView） */
+  windowIsFocused: () => Promise<boolean>
   /** 订阅窗口最大化/还原事件 */
   onWindowResize: (callback: () => void) => () => void
 
@@ -389,14 +391,6 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
 
   /** 搜索当前对话完整持久化历史（仅返回命中元数据） */
   searchConversationSessionMessages: (conversationId: string, query: string) => Promise<SessionMessageSearchResponse>
-
-  // ===== 教程 =====
-
-  /** 获取教程内容 */
-  getTutorialContent: () => Promise<string | null>
-
-  /** 创建欢迎对话（含教程附件） */
-  createWelcomeConversation: () => Promise<ConversationMeta | null>
 
   // ===== 消息发送 =====
 
@@ -500,7 +494,7 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   listVaultCandidates: () => Promise<VaultCandidate[]>
   selectVault: (options?: { inboxPath?: string; allowAgentWrites?: boolean }) => Promise<VaultSummary | null>
   authorizeDiscoveredVault: (rootPath: string, options?: { inboxPath?: string; allowAgentWrites?: boolean }) => Promise<VaultSummary>
-  listVaultFiles: () => Promise<VaultFileEntry[]>
+  listVaultFiles: () => Promise<VaultTreeEntry[]>
   readVaultFile: (relativePath: string) => Promise<VaultReadResult>
   resolveVaultMedia: (noteRelativePath: string, src: string) => Promise<import('@proma/shared').ResolvedFileUrl | null>
   saveVaultPastedImage: (input: VaultSavePastedImageInput) => Promise<{ src: string } | null>
@@ -985,11 +979,17 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   /** 解析文件路径并读取内容（供内联预览使用） */
   resolveAndReadFile: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<import('@proma/shared').FilePreviewReadResult | null>
 
+  /** 批量检查文件是否仍存在（用于清理已删除的会话文件变更记录） */
+  filterExistingFilePaths: (filePaths: string[], access?: import('@proma/shared').FileAccessOptions) => Promise<string[]>
+
+  /** 只解析已授权文件的 canonical path，不读取内容或创建预览 token。 */
+  resolveAuthorizedFilePath: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<import('@proma/shared').ResolvedAuthorizedFilePath | null>
+
   /** 写入文本文件（供 Markdown 内联编辑使用） */
   writeTextFile: (filePath: string, content: string, access?: import('@proma/shared').FileAccessOptions) => Promise<boolean>
 
   // 仅解析文件路径（供 PDF/图片等用 proma-file:// 加载）
-  resolveFilePath: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<import('@proma/shared').ResolvedFileUrl | null>
+  resolveFilePath: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => Promise<(import('@proma/shared').ResolvedFileUrl & { resolvedPath?: string }) | null>
 
   /** 解析当前 Markdown 同目录内的相对媒体文件（仅供 LiveMarkdown 图片使用） */
   resolveMarkdownMedia: (markdownFilePath: string, src: string, access?: import('@proma/shared').FileAccessOptions) => Promise<import('@proma/shared').ResolvedFileUrl | null>
@@ -1516,6 +1516,10 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(IPC_CHANNELS.WINDOW_IS_MAXIMIZED)
   },
 
+  windowIsFocused: () => {
+    return ipcRenderer.invoke(IPC_CHANNELS.WINDOW_IS_FOCUSED)
+  },
+
   onWindowResize: (callback: () => void) => {
     const handler = (): void => callback()
     window.addEventListener('resize', handler)
@@ -1634,15 +1638,6 @@ const electronAPI: ElectronAPI = {
 
   searchConversationSessionMessages: (conversationId: string, query: string) => {
     return ipcRenderer.invoke(CHAT_IPC_CHANNELS.SEARCH_SESSION_MESSAGES, conversationId, query)
-  },
-
-  // 教程
-  getTutorialContent: () => {
-    return ipcRenderer.invoke(CHAT_IPC_CHANNELS.GET_TUTORIAL_CONTENT)
-  },
-
-  createWelcomeConversation: () => {
-    return ipcRenderer.invoke(CHAT_IPC_CHANNELS.CREATE_WELCOME_CONVERSATION)
   },
 
   // 消息发送
@@ -2481,12 +2476,22 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke('file:resolve-and-read', filePath, access) as Promise<import('@proma/shared').FilePreviewReadResult | null>
   },
 
+  filterExistingFilePaths: (filePaths: string[], access?: import('@proma/shared').FileAccessOptions) => {
+    const input: import('@proma/shared').FileExistsBatchInput = { filePaths, access }
+    return ipcRenderer.invoke(IPC_CHANNELS.FILE_EXISTS_BATCH, input) as Promise<import('@proma/shared').FileExistsBatchResult>
+  },
+
+  resolveAuthorizedFilePath: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => {
+    const input: import('@proma/shared').ResolveAuthorizedFilePathInput = { filePath, access }
+    return ipcRenderer.invoke(IPC_CHANNELS.RESOLVE_AUTHORIZED_FILE_PATH, input) as Promise<import('@proma/shared').ResolvedAuthorizedFilePath | null>
+  },
+
   writeTextFile: (filePath: string, content: string, access?: import('@proma/shared').FileAccessOptions) => {
     return ipcRenderer.invoke('file:write-text', filePath, content, access) as Promise<boolean>
   },
 
   resolveFilePath: (filePath: string, access?: import('@proma/shared').FileAccessOptions) => {
-    return ipcRenderer.invoke('file:resolve-path', filePath, access) as Promise<import('@proma/shared').ResolvedFileUrl | null>
+    return ipcRenderer.invoke('file:resolve-path', filePath, access) as Promise<(import('@proma/shared').ResolvedFileUrl & { resolvedPath?: string }) | null>
   },
 
   resolveMarkdownMedia: (markdownFilePath: string, src: string, access?: import('@proma/shared').FileAccessOptions) => {

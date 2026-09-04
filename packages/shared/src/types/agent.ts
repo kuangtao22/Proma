@@ -1054,6 +1054,10 @@ export interface SaveMcpApiKeyInput {
   serverUrl: string
   headerName: string
   value: string
+  /** stdio MCP 环境变量凭据；远程 HTTP/SSE 凭据留空。 */
+  envName?: string
+  /** stdio MCP 凭据绑定的启动命令；注入前与当前配置比对，防止同名配置被改后泄露密钥。 */
+  stdioBinding?: { command: string; args: string[] }
 }
 
 /** Non-sensitive status for a CLI integration. Secret values are never returned to the renderer. */
@@ -1289,9 +1293,61 @@ export interface AgentSendInput {
 
 // ===== Agent 队列消息 =====
 
+/** deferred 队列附件的 Renderer 展示快照，不参与 Agent 运行输入解析。 */
+export interface AgentQueuedAttachmentSnapshot {
+  /** 展示文件名。 */
+  filename: string
+  /** 附件媒体类型。 */
+  mediaType: string
+  /** 附件字节大小。 */
+  size: number
+  /** Renderer 已交给主进程的会话附件路径。 */
+  targetPath: string
+}
+
+/** deferred 队列引用选区的 Renderer 展示快照。 */
+export interface AgentQueuedQuotedSelectionSnapshot {
+  /** 选中文本。 */
+  text: string
+  /** 来源文件路径或历史展示字段。 */
+  filePath: string
+  /** 引用来源类型。 */
+  sourceType?: 'file' | 'agent-history'
+  /** 面向用户的来源名称。 */
+  sourceLabel?: string
+  /** Agent 历史消息 ID。 */
+  messageId?: string
+  /** Agent 历史消息角色。 */
+  messageRole?: 'user' | 'assistant' | 'system'
+  /** 起始行号（1-based）。 */
+  startLine?: number
+  /** 结束行号（1-based）。 */
+  endLine?: number
+  /** 历史消息内选区起始偏移。 */
+  selectionStart?: number
+  /** 历史消息内选区结束偏移。 */
+  selectionEnd?: number
+  /** Agent 历史中的所属轮次。 */
+  turn?: number
+  /** 选区捕获时间戳。 */
+  capturedAt: number
+}
+
+/** 主进程随 deferred 输入原样保留的 Renderer 队列展示数据。 */
+export interface AgentQueuedMessagePresentationSnapshot {
+  /** 已固化到 prompt 的附件引用块。 */
+  fileReferenceBlock?: string
+  /** 用于撤回或失败恢复的附件列表。 */
+  attachments?: AgentQueuedAttachmentSnapshot[]
+  /** 用于撤回或失败恢复的引用选区。 */
+  quotedSelection?: AgentQueuedQuotedSelectionSnapshot
+}
+
 /** 等待当前 run 结束后由主进程启动的消息。 */
 export interface AgentDeferredQueueMessageInput extends AgentSendInput {
   queueMessageId: string
+  /** 仅用于 Renderer reload 后恢复队列 UI；主进程不从 prompt 反向猜测该数据。 */
+  queuePresentation?: AgentQueuedMessagePresentationSnapshot
 }
 
 /**

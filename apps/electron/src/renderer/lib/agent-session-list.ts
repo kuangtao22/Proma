@@ -6,6 +6,18 @@ interface AgentSessionTreeLike {
   childSessions: readonly Pick<AgentSessionMeta, 'id'>[]
 }
 
+const DELEGATION_STATUS_ICON_CLASS: Readonly<Record<SessionIndicatorStatus, string>> = {
+  idle: 'text-foreground/40',
+  running: 'text-blue-500',
+  blocked: 'text-orange-500',
+  completed: 'text-green-500',
+}
+
+/** 保持协作子 Agent 在所有入口使用一致的状态颜色。 */
+export function getDelegationStatusIconClass(status: SessionIndicatorStatus): string {
+  return DELEGATION_STATUS_ICON_CLASS[status]
+}
+
 /**
  * 判断会话是否允许进入 Renderer 普通用户列表。
  * @param session 待判断的内部来源字段。
@@ -235,6 +247,46 @@ export function isAgentSessionVisibleInTrees(
 ): boolean {
   if (!sessionId) return false
   return collectAgentSessionTreeIds(items).has(sessionId)
+}
+
+/** The stable delegation observation slot is visible in a single pane or either split pane. */
+export function isDelegationObservationVisible(
+  sidePanelOpen: boolean,
+  activeSidePanelTab: string | undefined,
+  split: { leftTab: string; rightTab: string } | null,
+): boolean {
+  if (!sidePanelOpen) return false
+  return split
+    ? split.leftTab === 'delegation' || split.rightTab === 'delegation'
+    : activeSidePanelTab === 'delegation'
+}
+
+/** Replace the delegated child shown in one parent's single observation slot. */
+export function selectDelegatedSession(
+  selections: Map<string, string>,
+  parentSessionId: string,
+  childSessionId: string,
+): Map<string, string> {
+  if (selections.get(parentSessionId) === childSessionId) return selections
+  const next = new Map(selections)
+  next.set(parentSessionId, childSessionId)
+  return next
+}
+
+/** Remove a deleted parent or child from the delegated-session observation slots. */
+export function removeDelegatedSessionSelection(
+  selections: Map<string, string>,
+  sessionId: string,
+): Map<string, string> {
+  let changed = false
+  const next = new Map(selections)
+  if (next.delete(sessionId)) changed = true
+  for (const [parentSessionId, childSessionId] of next) {
+    if (childSessionId !== sessionId) continue
+    next.delete(parentSessionId)
+    changed = true
+  }
+  return changed ? next : selections
 }
 
 /**

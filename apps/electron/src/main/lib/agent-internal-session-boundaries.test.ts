@@ -641,9 +641,14 @@ describe('Canvas Agent Collaboration 边界', () => {
     ) as Array<{ name: string; execute: (toolCallId: string, params: unknown) => Promise<unknown> }>
     const delegate = tools.find((tool) => tool.name === 'mcp__collaboration__delegate_agent')
     const list = tools.find((tool) => tool.name === 'mcp__collaboration__list_delegations')
+    const setThinkingLevel = tools.find((tool) => tool.name === 'mcp__collaboration__set_delegation_thinking_level')
 
     await expect(delegate?.execute('call-1', { task: '分析任务' })).rejects.toThrow('Canvas Agent 不允许使用协作工具')
     await expect(list?.execute('call-2', {})).rejects.toThrow('Canvas Agent 不允许使用协作工具')
+    await expect(setThinkingLevel?.execute('call-3', {
+      delegationId: 'delegation-1',
+      thinkingLevel: 'high',
+    })).rejects.toThrow('Canvas Agent 不允许使用协作工具')
     expect(agentSessionManagerTestMock.createdSessionIds).toEqual([])
   })
 

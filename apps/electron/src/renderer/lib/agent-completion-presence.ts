@@ -1,5 +1,6 @@
 import type { AgentStreamCompletePayload, AgentStreamSessionMeta } from '@proma/shared'
 import type { TabItem } from '@/atoms/tab-atoms'
+import { isDelegationObservationVisible } from '@/lib/agent-session-list'
 
 export interface AgentCompletionPresenceInput {
   tabs: TabItem[]
@@ -18,7 +19,7 @@ export interface AgentCompletionMarkers {
 
 export interface AgentCompletionNotificationInput {
   completion: AgentStreamCompletePayload
-  session?: Pick<AgentStreamSessionMeta, 'sourceDelegationId' | 'sourceCanvasProjectId'>
+  session?: Pick<AgentStreamSessionMeta, 'sourceDelegationId' | 'sourceCanvasProjectId' | 'parentSessionId'>
 }
 
 export interface NotifyAgentCompletionInput extends AgentCompletionNotificationInput {
@@ -36,6 +37,74 @@ export function shouldNotifyAgentCompletion({
     && !session?.sourceCanvasProjectId
 }
 
+export function markSessionCompletionUnviewed(
+  sessionIds: Set<string>,
+  sessionId: string,
+): Set<string> {
+  if (sessionIds.has(sessionId)) return sessionIds
+  const next = new Set(sessionIds)
+  next.add(sessionId)
+  return next
+}
+
+export function markSessionCompletionViewed(
+  sessionIds: Set<string>,
+  sessionId: string,
+): Set<string> {
+  if (!sessionIds.has(sessionId)) return sessionIds
+  const next = new Set(sessionIds)
+  next.delete(sessionId)
+  return next
+}
+
+export function isSuccessfulAgentCompletion(
+  completion: AgentStreamCompletePayload,
+  hasStreamError: boolean,
+): boolean {
+  return !completion.stoppedByUser &&
+    !hasStreamError &&
+    (!completion.resultSubtype || completion.resultSubtype === 'success')
+}
+
+export type DelegatedCompletionAttention = 'viewed' | 'unviewed' | null
+
+interface DelegatedCompletionAttentionInput extends AgentCompletionNotificationInput {
+  hasStreamError: boolean
+  activeSessionId: string | null
+  selectedDelegationSessionId: string | null
+  activeSidePanelTab: string | undefined
+  split: { leftTab: string; rightTab: string } | null
+  sidePanelOpen: boolean
+  windowHasFocus: boolean
+}
+
+/** Resolve delegated completion to one attention transition; null means no state change. */
+export function getDelegatedCompletionAttention({
+  completion,
+  session,
+  hasStreamError,
+  activeSessionId,
+  selectedDelegationSessionId,
+  activeSidePanelTab,
+  split,
+  sidePanelOpen,
+  windowHasFocus,
+}: DelegatedCompletionAttentionInput): DelegatedCompletionAttention {
+  if (session?.sourceCanvasProjectId) return null
+  if (completion.triggeredBy !== 'delegation' && !session?.sourceDelegationId) return null
+
+  const visible = !!session?.parentSessionId
+    && windowHasFocus
+    && activeSessionId === session.parentSessionId
+    && selectedDelegationSessionId === completion.sessionId
+    && isDelegationObservationVisible(sidePanelOpen, activeSidePanelTab, split)
+  if (visible) return 'viewed'
+
+  return !completion.backgroundTasksPending && isSuccessfulAgentCompletion(completion, hasStreamError)
+    ? 'unviewed'
+    : null
+}
+
 /** 仅在真正成功且无需等待后台任务时调用完成通知 callback */
 export function notifyAgentCompletion({
   completion,
@@ -43,12 +112,8 @@ export function notifyAgentCompletion({
   hasStreamError,
   notify,
 }: NotifyAgentCompletionInput): void {
-  const isSuccessfulCompletion = !completion.stoppedByUser &&
-    !hasStreamError &&
-    (!completion.resultSubtype || completion.resultSubtype === 'success')
-
   if (!completion.backgroundTasksPending &&
-    isSuccessfulCompletion &&
+    isSuccessfulAgentCompletion(completion, hasStreamError) &&
     shouldNotifyAgentCompletion({ completion, session })) {
     notify()
   }

@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test'
 import {
+  getDelegatedCompletionAttention,
   getAgentCompletionMarkers,
   isAgentSessionActiveForCompletion,
   notifyAgentCompletionWarning,
@@ -93,6 +94,28 @@ describe('Agent 完成归属判断', () => {
       session,
       documentHasFocus: false,
     })).toEqual({ markUnviewedCompleted: false })
+  })
+
+  test('Given Canvas 完成混入 delegation 触发标记 When 计算委派提醒 Then fail closed', () => {
+    expect(getDelegatedCompletionAttention({
+      completion: {
+        sessionId: 'canvas-session',
+        triggeredBy: 'delegation',
+        stoppedByUser: false,
+      },
+      session: {
+        sourceCanvasProjectId: 'project-1',
+        sourceDelegationId: 'delegation-1',
+        parentSessionId: 'parent-1',
+      },
+      hasStreamError: false,
+      activeSessionId: null,
+      selectedDelegationSessionId: null,
+      activeSidePanelTab: undefined,
+      split: null,
+      sidePanelOpen: false,
+      windowHasFocus: false,
+    })).toBeNull()
   })
 
   test.each(['canvas', 'internal-invalid'] as const)(

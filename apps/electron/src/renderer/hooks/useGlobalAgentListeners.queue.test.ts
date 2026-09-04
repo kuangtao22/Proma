@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createStore } from 'jotai'
-import type { AgentQueuedMessageStatus, CanvasNodeReference, SDKUserMessage } from '@proma/shared'
+import type { AgentQueuedMessageSnapshot, AgentQueuedMessageStatus, CanvasNodeReference, SDKUserMessage } from '@proma/shared'
 import type { QuotedSelection } from '@/atoms/preview-atoms'
 import {
   agentCanvasNodeReferencesAtomFamily,
@@ -11,7 +11,7 @@ import {
 } from '@/atoms/agent-atoms'
 import { quotedSelectionMapAtom } from '@/atoms/preview-atoms'
 import { createAgentQueuedMessage } from '@/lib/agent-message-queue'
-import { applyAgentQueuedMessageStatus } from './useGlobalAgentListeners'
+import { applyAgentQueuedMessageStatus, mergeRestoredAgentQueuedMessages } from './useGlobalAgentListeners'
 
 /** started-event 回归使用的完整 Canvas 引用快照。 */
 const canvasReference: CanvasNodeReference = {
@@ -42,6 +42,49 @@ const newerQuotedSelection: QuotedSelection = {
 }
 
 describe('全局 Agent listener 的 after-current started 投影', () => {
+  test('Given Renderer reload 后的 deferred snapshot When 恢复后收到 started Then Canvas 引用与可持久展示字段仍完整', () => {
+    /** 快照只携带主进程真实保留的队列展示数据，测试不从 prompt 反向猜测。 */
+    const snapshots = [{
+      input: {
+        sessionId: 'session-1',
+        queueMessageId: 'message-reloaded',
+        userMessage: 'SDK 正文',
+        rawUserMessage: '原始正文',
+        channelId: 'channel-1',
+        canvasNodeReferences: [canvasReference],
+        additionalDirectories: ['/tmp/reference'],
+        queuePresentation: {
+          quotedSelection: queuedQuotedSelection,
+          fileReferenceBlock: '<attached_files>brief.png</attached_files>',
+          attachments: [{ filename: 'brief.png', mediaType: 'image/png', size: 8, targetPath: '/tmp/brief.png' }],
+        },
+      },
+      queuedAt: 100,
+    }] as AgentQueuedMessageSnapshot[]
+    const store = createStore()
+    const recovered = mergeRestoredAgentQueuedMessages([], snapshots)
+    store.set(agentSessionMessageQueueAtom, new Map([['session-1', recovered]]))
+
+    expect(recovered[0]).toMatchObject({
+      text: '原始正文',
+      quotedSelection: queuedQuotedSelection,
+      fileReferenceBlock: '<attached_files>brief.png</attached_files>',
+      attachments: [{ targetPath: '/tmp/brief.png' }],
+      additionalDirectories: ['/tmp/reference'],
+      canvasNodeReferences: [canvasReference],
+    })
+    applyAgentQueuedMessageStatus(store, {
+      sessionId: 'session-1',
+      messageId: 'message-reloaded',
+      status: 'started',
+      userMessage: 'SDK 正文',
+      rawUserMessage: '原始正文',
+      startedAt: 200,
+    })
+    const liveMessage = store.get(liveMessagesMapAtom).get('session-1')?.[0] as SDKUserMessage | undefined
+    expect(liveMessage?._canvasNodeReferences).toEqual([canvasReference])
+  })
+
   test('Given refs-only 队列项 When started 事件移除队列 Then optimistic 用户消息保留引用快照', () => {
     const store = createStore()
     const queuedMessage = createAgentQueuedMessage('', 'message-refs-only', 100, null, {

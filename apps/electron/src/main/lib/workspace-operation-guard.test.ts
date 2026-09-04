@@ -117,8 +117,8 @@ describe('工作区写 IPC 守卫合同', () => {
     const source = readFileSync(join(import.meta.dir, '..', 'ipc.ts'), 'utf8')
     /** IPC 通道、守卫调用与最早可能副作用 token 的合同。 */
     const contracts: Array<{ channel: string; guardCall: string; sideEffects: string[] }> = [
-      { channel: 'RELINK_WORKSPACE_PROJECT_ROOT', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, () =>', sideEffects: ['getAgentWorkspace(id)', 'relinkAgentWorkspaceProjectRoot(', 'releaseDirectoryWatcherIfUnreferenced(', 'watchAttachedDirectory('] },
-      { channel: 'RESTORE_WORKSPACE_PROJECT_ROOT', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, () =>', sideEffects: ['restoreAgentWorkspaceProjectRoot(', 'watchAttachedDirectory('] },
+      { channel: 'RELINK_WORKSPACE_PROJECT_ROOT', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, async () =>', sideEffects: ['getAgentWorkspace(id)', 'relinkAgentWorkspaceProjectRoot(', 'releaseDirectoryWatcherIfUnreferenced(', 'watchAttachedDirectory('] },
+      { channel: 'RESTORE_WORKSPACE_PROJECT_ROOT', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, async () =>', sideEffects: ['restoreAgentWorkspaceProjectRoot(', 'watchAttachedDirectory('] },
       { channel: 'DELETE_WORKSPACE', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, () =>', sideEffects: ['getAgentWorkspace(id)', 'listAgentWorkspaces()', 'removeBindingsForDeletedWorkspace(', 'deleteAgentSession(', 'deleteAgentWorkspace('] },
       { channel: 'ATTACH_DIRECTORY', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'watchAttachedDirectory('] },
       { channel: 'DETACH_DIRECTORY', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'releaseDirectoryWatcherIfUnreferenced('] },

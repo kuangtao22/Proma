@@ -231,6 +231,26 @@ export interface ResolvedFileUrl {
   url: string
 }
 
+/** 批量检查已授权文件存在性的 IPC 请求。 */
+export interface FileExistsBatchInput {
+  filePaths: string[]
+  access?: FileAccessOptions
+}
+
+/** 批量检查结果只返回仍存在且通过授权的原始路径。 */
+export type FileExistsBatchResult = string[]
+
+/** 只解析已授权文件 canonical path 的 IPC 请求，不读取文件内容。 */
+export interface ResolveAuthorizedFilePathInput {
+  filePath: string
+  access?: FileAccessOptions
+}
+
+/** 已授权文件的 canonical path；不创建 proma-file 协议 token。 */
+export interface ResolvedAuthorizedFilePath {
+  resolvedPath: string
+}
+
 /** Office 文件内联预览类型 */
 export type OfficePreviewKind = 'document' | 'spreadsheet' | 'presentation'
 
@@ -413,6 +433,10 @@ export const IPC_CHANNELS = {
   SYSTEM_OPEN_FILE: 'shell:system-open-file',
   /** 在系统文件管理器（访达/资源管理器）中显示文件 */
   SHOW_ITEM_IN_FOLDER: 'shell:show-item-in-folder',
+  /** 批量检查 Renderer 已授权文件是否仍存在。 */
+  FILE_EXISTS_BATCH: 'file:exists-batch',
+  /** 仅解析 Renderer 已授权文件的 canonical path。 */
+  RESOLVE_AUTHORIZED_FILE_PATH: 'file:resolve-authorized-path',
   /** 扫描系统中可用的编辑器应用 */
   SCAN_EDITORS: 'shell:scan-editors',
   /** 查询某个文件在本机系统中的默认打开应用信息（带图标） */
@@ -429,6 +453,8 @@ export const IPC_CHANNELS = {
   WINDOW_CLOSE: 'window:close',
   /** 窗口是否最大化 */
   WINDOW_IS_MAXIMIZED: 'window:is-maximized',
+  /** 宿主 BrowserWindow 是否处于前台（包含焦点位于 WebContentsView 的情况） */
+  WINDOW_IS_FOCUSED: 'window:is-focused',
   /** 在系统剪贴板中写入纯文本 */
   WRITE_CLIPBOARD_TEXT: 'clipboard:write-text',
   /** 截图导出：将 HTML 渲染为 PNG 图片 */

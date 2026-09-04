@@ -128,13 +128,23 @@ function compilePiReasoningCapabilities(
  * only this protocol-safe catalog flag: current Claude models require adaptive
  * thinking, while copying the complete catalog compat object could leak unrelated
  * tool/sampling behaviour across provider protocols.
+ *
+ * Fable 5.1 is newer than the bundled Pi catalog entry (`claude-fable-5`), so its
+ * exact ID lookup can legitimately miss. Its official Anthropic Messages endpoint
+ * nevertheless rejects legacy `thinking: { type: 'enabled' }`; recognize the whole
+ * Fable 5 family here to keep the request on Pi's adaptive + effort path.
  */
 export function shouldForcePiAdaptiveThinking(
   api: Api,
   catalogModel: { api: Api, compat?: unknown } | undefined,
+  modelId?: string,
 ): boolean {
-  if (api !== 'anthropic-messages' || catalogModel?.api !== 'anthropic-messages') return false
-  return (catalogModel.compat as { forceAdaptiveThinking?: unknown } | undefined)?.forceAdaptiveThinking === true
+  if (api !== 'anthropic-messages') return false
+  if ((catalogModel?.compat as { forceAdaptiveThinking?: unknown } | undefined)?.forceAdaptiveThinking === true) {
+    return true
+  }
+  const claudeFamilyKey = modelId ? getClaudeFamilyKey(modelId, true) : undefined
+  return claudeFamilyKey === 'fable-5' || claudeFamilyKey?.startsWith('fable-5-') === true
 }
 
 const CODEX_56_THINKING_LEVEL_MAP = compilePiReasoningCapabilities('openai-responses', 'gpt-5.6')?.thinkingLevelMap
@@ -439,8 +449,17 @@ function getClaudeFamilyKey(modelRef: string, allowMajorOnly = false): string | 
 function findClaudeCatalogModel(models: readonly PiCatalogModel[], modelId: string): PiCatalogModel | undefined {
   const familyKey = getClaudeFamilyKey(modelId)
   if (!familyKey) return undefined
-  return models.find((model) =>
+  const catalogModel = models.find((model) =>
     getClaudeFamilyKey(model.id, true) === familyKey || getClaudeFamilyKey(model.name, true) === familyKey)
+  if (catalogModel) return catalogModel
+
+  // Fable 5.x models can precede the catalog's major-version entry. Reuse only
+  // the matching Fable major family; other Claude families require an exact
+  // major/minor match to avoid inheriting the wrong thinking or protocol flags.
+  const fableMajorKey = familyKey.match(/^fable-(\d+)-\d+$/)?.[0].replace(/-\d+$/, '')
+  if (!fableMajorKey) return undefined
+  return models.find((model) =>
+    getClaudeFamilyKey(model.id, true) === fableMajorKey || getClaudeFamilyKey(model.name, true) === fableMajorKey)
 }
 
 async function getCatalogModels(provider: KnownProvider): Promise<readonly PiCatalogModel[]> {
@@ -604,7 +623,7 @@ async function resolvePiModelDefaults(input: Pick<PiModelBuildInput, 'provider' 
     && (glmModelId === 'glm-5.3' || glmModelId === 'glm-5.3-flash')
   const catalogContextWindow = catalogModel?.contextWindow ?? DEFAULT_CONTEXT_WINDOW
   const inferredContextWindow = inferContextWindow(input.model) ?? DEFAULT_CONTEXT_WINDOW
-  const shouldForceAdaptiveThinking = shouldForcePiAdaptiveThinking(api, catalogModel)
+  const shouldForceAdaptiveThinking = shouldForcePiAdaptiveThinking(api, catalogModel, input.model)
   return {
     api,
     reasoning: catalogModel?.reasoning ?? true,
