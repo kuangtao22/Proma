@@ -1063,6 +1063,23 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     setMessagesCache((prev) => setSessionMessagesCache(prev, sessionId, next))
   }, [sessionId, setMessagesCache])
 
+  /**
+   * 主进程拒绝接管时精确撤销本次乐观用户消息，不影响内容相同的历史消息。
+   * @param message 本次发送前插入到当前会话缓存的同一消息对象。
+   */
+  const rollbackOptimisticPersistedMessage = React.useCallback((message: SDKMessage): void => {
+    /** 对象身份只命中本次插入项，避免误删用户此前发送的相同正文。 */
+    const current = persistedSDKMessagesRef.current
+    const optimisticIndex = current.lastIndexOf(message)
+    if (optimisticIndex < 0) return
+    /** 生成不含失败乐观项的新快照，并同步 React 状态与会话 LRU 缓存。 */
+    const next = [...current.slice(0, optimisticIndex), ...current.slice(optimisticIndex + 1)]
+    messagesMutationVersionRef.current += 1
+    persistedSDKMessagesRef.current = next
+    setPersistedSDKMessages(next)
+    setMessagesCache((prev) => setSessionMessagesCache(prev, sessionId, next))
+  }, [sessionId, setMessagesCache])
+
   const appendLiveUserMessage = React.useCallback((message: SDKMessage) => {
     store.set(liveMessagesMapAtom, (prev) => {
       const map = new Map(prev)
@@ -2357,10 +2374,12 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       setInputHtmlContent('')
     }
 
+    /** IPC 会等待整轮 Agent 结束，引用必须在请求接管时清理，避免运行期间被重复发送。 */
+    clearSentCanvasNodeReferences(canvasNodeReferencesSnapshot)
     window.electronAPI.sendAgentMessage(input)
-      .then(() => clearSentCanvasNodeReferences(canvasNodeReferencesSnapshot))
       .catch((error) => {
         console.error('[AgentView] 发送消息失败:', error)
+        rollbackOptimisticPersistedMessage(tempUserSDKMsg)
         setStreamingStates((prev) => {
           const current = prev.get(sessionId)
           if (!current) return prev
@@ -2377,8 +2396,13 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
             return map
           })
         }
+        /** 若用户期间已重新选择同一节点的新版本，以当前引用为准，只补回缺失引用。 */
+        setCanvasNodeReferences((current) => (
+          restoreMissingCanvasNodeReferences(current, canvasNodeReferencesSnapshot)
+        ))
+        toast.error('消息发送失败', { description: getErrorMessage(error) })
       })
-  }, [clearSentCanvasNodeReferences, createBaseAdditionalDirectories, preparePendingFilesForSend, restoreFailedInputContent, restoreQueuedAttachmentsToPending, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, consumeQuotedSelection, currentQuotedSelection, setStreamingStates, setAgentStreamErrors, setPromptSuggestions, setInputContent, setInputHtmlContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, setQuotedSelectionMap, sendPlainTextAgentMessage, isLegacyTranscript, isStopping])
+  }, [clearSentCanvasNodeReferences, createBaseAdditionalDirectories, preparePendingFilesForSend, restoreFailedInputContent, restoreQueuedAttachmentsToPending, rollbackOptimisticPersistedMessage, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, consumeQuotedSelection, currentQuotedSelection, setStreamingStates, setAgentStreamErrors, setPromptSuggestions, setInputContent, setInputHtmlContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, setQuotedSelectionMap, sendPlainTextAgentMessage, isLegacyTranscript, isStopping])
 
   /** 停止生成。异常流未发出终态时，允许再次下发幂等的 abort 请求。 */
   const handleStop = React.useCallback((): void => {
@@ -2912,7 +2936,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     setInputHasContent(hasContent)
   }, [])
   const hasTextInput = inputHasContent
-  const canSend = !isStopping && messagesLoaded && (streaming || !messagesRefreshing) && (hasTextInput || pendingFiles.length > 0 || !!suggestion) && agentChannelId !== null && hasAvailableModel && (!streaming || hasTextInput)
+  const canSend = !isStopping && messagesLoaded && (streaming || !messagesRefreshing) && (hasTextInput || pendingFiles.length > 0 || !!suggestion || canvasNodeReferences.length > 0) && agentChannelId !== null && hasAvailableModel && (!streaming || hasTextInput || canvasNodeReferences.length > 0)
 
   const inputToolbarItems = React.useMemo<ToolbarItem[]>(() => [
     ...(isCodexFastModeAvailable ? [{

@@ -46,8 +46,8 @@ export interface AgentCanvasViewState {
   expandedNodeId: string | null
   /** 用户调整后的尺寸按节点隔离，未出现的节点继续使用类型默认值。 */
   workbenchSizesByNodeId: Record<string, AgentCanvasWorkbenchSize>
-  /** 当前 Canvas 内复用的浮窗位置；新 Canvas 初次打开时重新计算。 */
-  workbenchPosition: AgentCanvasWorkbenchPosition | null
+  /** 用户调整后的相对偏移按节点隔离，单位为屏幕像素。 */
+  workbenchOffsetsByNodeId: Record<string, AgentCanvasWorkbenchPosition>
   /** Agent 右侧画布区域是否处于展开态。 */
   isExpanded: boolean
   /** 会话级活动变化代次，供宿主按需刷新视图提示。 */
@@ -76,7 +76,7 @@ export function createInitialAgentCanvasViewState(
     selectedNodeIds: [],
     expandedNodeId: null,
     workbenchSizesByNodeId: {},
-    workbenchPosition: null,
+    workbenchOffsetsByNodeId: {},
     isExpanded: false,
     activityRevision: 0,
     seenActivityRevision: 0,
@@ -94,7 +94,7 @@ interface LegacyAgentCanvasWorkbenchState {
 /** 工作台几何更新的可选输入。 */
 export interface AgentCanvasWorkbenchGeometryInput {
   size?: AgentCanvasWorkbenchSize
-  position?: AgentCanvasWorkbenchPosition
+  offset?: AgentCanvasWorkbenchPosition
 }
 
 /**
@@ -113,6 +113,8 @@ export function createAgentCanvasWorkbenchGeometryUpdate(
   const legacySize = (current as AgentCanvasViewState & LegacyAgentCanvasWorkbenchState).workbenchSize
   /** 几何更新始终从独立对象开始，避免修改 atom 中的历史状态。 */
   const sizes = { ...current.workbenchSizesByNodeId }
+  /** HMR 可能保留升级前状态；缺少节点偏移 Map 时按空集合接管。 */
+  const offsets = { ...(current.workbenchOffsetsByNodeId ?? {}) }
   if (legacySize && current.expandedNodeId && sizes[current.expandedNodeId] === undefined) {
     sizes[current.expandedNodeId] = { ...legacySize }
   }
@@ -125,9 +127,18 @@ export function createAgentCanvasWorkbenchGeometryUpdate(
       delete sizes[oldestNodeId]
     }
   }
+  if (input.offset) {
+    /** 节点偏移与尺寸使用同一上限，但各自按写入顺序独立淘汰。 */
+    offsets[nodeId] = { ...input.offset }
+    while (Object.keys(offsets).length > MAX_AGENT_CANVAS_WORKBENCH_SIZES) {
+      const oldestNodeId = Object.keys(offsets)[0]
+      if (oldestNodeId === undefined) break
+      delete offsets[oldestNodeId]
+    }
+  }
   return {
     ...(input.size || legacySize ? { workbenchSizesByNodeId: sizes } : {}),
-    ...(input.position ? { workbenchPosition: { ...input.position } } : {}),
+    ...(input.offset ? { workbenchOffsetsByNodeId: offsets } : {}),
   }
 }
 
@@ -260,10 +271,15 @@ export function createConvergedAgentCanvasViewUpdate(
   const workbenchSizesByNodeId = Object.fromEntries(
     Object.entries(current.workbenchSizesByNodeId).filter(([nodeId]) => nodeIds.has(nodeId)),
   )
+  /** 节点删除后同步清理会话级相对偏移，避免长期保留悬空几何。 */
+  const workbenchOffsetsByNodeId = Object.fromEntries(
+    Object.entries(current.workbenchOffsetsByNodeId ?? {}).filter(([nodeId]) => nodeIds.has(nodeId)),
+  )
   return {
     selectedNodeId,
     selectedNodeIds,
     workbenchSizesByNodeId,
+    workbenchOffsetsByNodeId,
     ...(!expandedNodeStillExists ? {
       expandedNodeId: null,
       pendingWorkbenchSwitchNodeId: null,

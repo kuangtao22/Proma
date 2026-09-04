@@ -86,6 +86,7 @@ import { seedDefaultSkills } from './lib/config-paths'
 import { upgradeDefaultSkillsInWorkspaces } from './lib/agent-workspace-manager'
 import { agentEventBus, hasActiveAgentSessions, stopAllAgents } from './lib/agent-service'
 import { stopAllTerminals } from './lib/terminal-service'
+import { serverOpsRuntimeClient } from './lib/server-ops/server-ops-runtime-client'
 import { disposePiMcpConnections } from './lib/adapters/pi-mcp-tools'
 import { browserController } from './lib/browser-controller'
 import { markRunningDelegationsAsInterrupted } from './lib/agent-session-manager'
@@ -1070,6 +1071,7 @@ app.on('before-quit', () => {
     { name: 'Design Job 中断', run: () => { getDefaultDesignJobManager()?.markRunningInterrupted() } },
     { name: 'Agent 进程', run: stopAllAgents },
     { name: '终端进程', run: () => { void stopAllTerminals() } },
+    { name: '服务器运维 SSH 进程', run: () => { serverOpsRuntimeClient.stop() } },
     { name: '浏览器控制器', run: () => { browserController.dispose() } },
     { name: '生成任务', run: stopAllGenerations },
     { name: '更新器', run: cleanupUpdater },

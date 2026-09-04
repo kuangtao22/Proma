@@ -14,6 +14,7 @@ import {
 } from '@/atoms/agent-canvas-atoms'
 import { createInitialNativeCanvasState, nativeCanvasStatesAtom } from '@/atoms/native-canvas-atoms'
 import { designAdapter } from '@/lib/design-adapter'
+import { getCanvasExpandedTitlebarHeight } from '@/lib/window-titlebar-layout'
 import {
   CanvasWorkspaceAdapter,
   CanvasWorkspaceLauncher,
@@ -111,6 +112,13 @@ function createSession(id: string, archived = false): CanvasSessionMeta {
 }
 
 describe('Agent 右侧 Canvas 适配器', () => {
+  test('Given 不同桌面平台 When 计算 Canvas 展开安全区 Then 只避让对应系统标题栏', () => {
+    expect(getCanvasExpandedTitlebarHeight(true, true, false)).toBe(40)
+    expect(getCanvasExpandedTitlebarHeight(true, false, true)).toBe(32)
+    expect(getCanvasExpandedTitlebarHeight(true, false, false)).toBe(0)
+    expect(getCanvasExpandedTitlebarHeight(false, true, false)).toBe(0)
+  })
+
   test('Given legacy Canvas When 渲染真实适配器 Then 只挂旧内容且 native LOAD 为零', () => {
     let legacyRenderCount = 0
     let nativeLoadCount = 0
@@ -230,10 +238,15 @@ describe('Agent 右侧 Canvas 适配器', () => {
       </Provider>,
     )
 
-    expect(render()).toContain('aria-label="展开画布"')
+    const collapsed = render()
+    expect(collapsed).toContain('aria-label="展开画布"')
+    expect(collapsed).toContain('data-canvas-workspace-expanded="false"')
+    expect(collapsed).not.toContain('data-canvas-expanded-titlebar-spacer')
     store.set(agentCanvasViewStatesAtom, new Map([[key, { ...initial, isExpanded: true }]]))
     const expanded = render()
     expect(expanded).toContain('aria-label="还原画布"')
+    expect(expanded).toContain('data-canvas-workspace-expanded="true"')
+    expect(expanded).toContain('data-canvas-expanded-titlebar-spacer="true"')
     expect(expanded).toContain('agent-1')
     expect(expanded).toContain('canvas-1')
   })

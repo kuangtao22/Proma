@@ -12,6 +12,8 @@ import type {
   CanvasWebviewDevicePreset,
   CanvasWebviewPreviewSnapshot,
   CanvasWebviewPreviewTarget,
+  DesignPoint,
+  DesignViewport,
 } from '@proma/shared'
 import {
   Background,
@@ -42,6 +44,7 @@ import {
   createNativeCanvasUserEdge,
   confirmNativeCanvasEdge,
   createViewportCanvasMutation,
+  resolveNativeCanvasNodeSize,
   toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
 } from './native-canvas-model'
@@ -108,8 +111,6 @@ const EMPTY_CANVAS_NODE_ISSUES: CanvasNodeIssue[] = []
 const EMPTY_RUNNING_SESSION_IDS = new Set<string>()
 /** 未提供节点活动映射时复用稳定空 Map，避免投影 effect 重复执行。 */
 const EMPTY_NODE_ACTIVITY_STATES = new Map<string, CanvasNodeActivityState>()
-/** 未提供图片候选标记时复用稳定空 Map。 */
-const EMPTY_IMAGE_CANDIDATE_STATES = new Map<string, 'new-version' | 'partial'>()
 /** 未接通扩展命令时使用稳定空操作。 */
 const NOOP_EXPAND = (): void => undefined
 /** 未接通类型化扩展命令时使用稳定空操作。 */
@@ -139,6 +140,101 @@ export interface NativeCanvasEdgeRelationMenuProps {
 interface PendingNativeCanvasRelation {
   canvasId: string
   edge: CanvasEdge
+}
+
+/** Canvas 工作台逐帧定位所需的最小瞬时几何。 */
+export interface NativeCanvasTransientGeometrySnapshot {
+  viewport: DesignViewport
+  nodePositions: ReadonlyMap<string, DesignPoint>
+}
+
+/** 隔离 XYFlow 高频坐标与持久化状态的轻量订阅 Store。 */
+export interface NativeCanvasTransientGeometryStore {
+  /** 订阅瞬时几何变化。 */
+  subscribe: (listener: () => void) => () => void
+  /** 读取当前不可变快照。 */
+  getSnapshot: () => NativeCanvasTransientGeometrySnapshot
+  /** 权威文档变化时重置全部几何。 */
+  syncDocument: (document: CanvasDocument, viewport: DesignViewport) => void
+  /** 画布移动时只更新 viewport。 */
+  updateViewport: (viewport: DesignViewport) => void
+  /** 节点拖动时只更新发生变化的节点位置。 */
+  updateNodePositions: (updates: ReadonlyArray<{ nodeId: string; position: DesignPoint }>) => void
+}
+
+/** 将文档节点位置复制为不会受后续 mutation 影响的索引。 */
+function createNativeCanvasNodePositionIndex(document: CanvasDocument): ReadonlyMap<string, DesignPoint> {
+  return new Map(document.nodes.map((node) => [node.id, { ...node.position }]))
+}
+
+/**
+ * 创建 Canvas 瞬时几何 Store。
+ * @param document 首次渲染使用的权威文档。
+ * @returns 只在内存中发布逐帧 viewport 与节点坐标的订阅 Store。
+ */
+export function createNativeCanvasTransientGeometryStore(
+  document: CanvasDocument,
+): NativeCanvasTransientGeometryStore {
+  /** 当前快照每次更新都会替换对象，满足 useSyncExternalStore 一致性要求。 */
+  let snapshot: NativeCanvasTransientGeometrySnapshot = {
+    viewport: { ...document.viewport },
+    nodePositions: createNativeCanvasNodePositionIndex(document),
+  }
+  /** 通常只有一个展开工作台订阅，Set 保证释放幂等。 */
+  const listeners = new Set<() => void>()
+  /** 发布快照变化，不参与 Jotai 或文档保存。 */
+  const publish = (): void => {
+    for (const listener of listeners) listener()
+  }
+  return {
+    subscribe: (listener) => {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    getSnapshot: () => snapshot,
+    syncDocument: (nextDocument, viewport) => {
+      snapshot = {
+        viewport: { ...viewport },
+        nodePositions: createNativeCanvasNodePositionIndex(nextDocument),
+      }
+      publish()
+    },
+    updateViewport: (viewport) => {
+      snapshot = { ...snapshot, viewport: { ...viewport } }
+      publish()
+    },
+    updateNodePositions: (updates) => {
+      if (updates.length === 0) return
+      /** 复制 Map 后只覆盖本帧发生 position change 的节点，不再扫描完整节点数组。 */
+      const nextPositions = new Map(snapshot.nodePositions)
+      for (const update of updates) {
+        nextPositions.set(update.nodeId, { ...update.position })
+      }
+      snapshot = { ...snapshot, nodePositions: nextPositions }
+      publish()
+    },
+  }
+}
+
+/**
+ * 把节点世界坐标投影为工作台定位所需的屏幕矩形。
+ * @param node 工作台所属的权威节点。
+ * @param geometry XYFlow 当前瞬时 viewport 与节点坐标。
+ * @returns 不缩放工作台自身尺寸的节点屏幕矩形。
+ */
+export function resolveNativeCanvasWorkbenchNodeRect(
+  node: CanvasNode,
+  geometry: NativeCanvasTransientGeometrySnapshot,
+): Pick<DOMRectReadOnly, 'left' | 'right' | 'top'> {
+  /** 节点拖动帧优先使用瞬时坐标，缺失时回退权威文档位置。 */
+  const position = geometry.nodePositions.get(node.id) ?? node.position
+  /** 卡片世界尺寸随 Canvas zoom 投影，工作台像素尺寸由 Overlay 独立保持。 */
+  const size = resolveNativeCanvasNodeSize(node)
+  return {
+    left: geometry.viewport.x + position.x * geometry.viewport.zoom,
+    right: geometry.viewport.x + (position.x + size.width) * geometry.viewport.zoom,
+    top: geometry.viewport.y + position.y * geometry.viewport.zoom,
+  }
 }
 
 /** 将关系与推导出的输入槽转换为用户可理解的菜单标签。 */
@@ -198,8 +294,6 @@ export interface NativeCanvasGraphProps {
   runningSessionIds?: ReadonlySet<string>
   /** 按节点 ID 聚合的结构化活动态，优先于节点展示文案。 */
   nodeActivityStates?: ReadonlyMap<string, CanvasNodeActivityState>
-  /** 生图节点按 nodeId 显示候选标记，正式缩略图仍来自 adopted 素材。 */
-  imageCandidateStates?: ReadonlyMap<string, 'new-version' | 'partial'>
   /** Canvas 工作区一次加载得到的素材缩略图索引。 */
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
   /** WebView 卡片仅请求受管静态 WebP，不在折叠态加载 HTML。 */
@@ -224,6 +318,15 @@ export interface NativeCanvasGraphProps {
   onConversationNodeChange: (nodeId: string | null) => void
   /** 双击或卡片按钮只切换节点工作台，不改变图文档。 */
   onWorkbenchNodeChange?: (nodeId: string) => void
+  /** 当前唯一展开的工作台节点；由 Graph 使用瞬时几何就地渲染。 */
+  workbenchNode?: CanvasNode | null
+  /** 根据节点实时屏幕矩形渲染固定像素工作台。 */
+  renderWorkbench?: (
+    node: CanvasNode,
+    nodeScreenRect: Pick<DOMRectReadOnly, 'left' | 'right' | 'top'>,
+  ) => React.ReactNode
+  /** 测试或宿主可注入同一瞬时 Store；默认由 Graph 自行创建。 */
+  transientGeometryStore?: NativeCanvasTransientGeometryStore
   /** 为用户手工拖线分配稳定边身份；测试可注入确定值。 */
   createEdgeId?: () => string
   flowRenderer?: NativeCanvasFlowRenderer
@@ -242,6 +345,8 @@ export interface NativeCanvasViewportState {
   viewport: CanvasDocument['viewport']
   gestureActive: boolean
   deferredViewport: CanvasDocument['viewport'] | null
+  /** 最近一次来自权威文档的 viewport，用于区分 graph 更新与真实视口更新。 */
+  documentViewport: CanvasDocument['viewport']
 }
 
 /** viewport reducer 支持文档重渲染与手势事件按单一顺序收敛。 */
@@ -257,9 +362,19 @@ export function reduceNativeCanvasViewportState(
   event: NativeCanvasViewportEvent,
 ): NativeCanvasViewportState {
   if (event.type === 'document-sync') {
+    /** 普通 graph revision 可能重建文档对象，但相同 viewport 不应打断本地手势。 */
+    const unchanged = event.viewport.x === state.documentViewport.x
+      && event.viewport.y === state.documentViewport.y
+      && event.viewport.zoom === state.documentViewport.zoom
+    if (unchanged) return state
     return state.gestureActive
-      ? { ...state, deferredViewport: event.viewport }
-      : { ...state, viewport: event.viewport, deferredViewport: null }
+      ? { ...state, deferredViewport: event.viewport, documentViewport: event.viewport }
+      : {
+          ...state,
+          viewport: event.viewport,
+          deferredViewport: null,
+          documentViewport: event.viewport,
+        }
   }
   if (event.type === 'move-start') return { ...state, gestureActive: true, deferredViewport: null }
   if (event.type === 'move') return { ...state, viewport: event.viewport }
@@ -267,6 +382,7 @@ export function reduceNativeCanvasViewportState(
     viewport: state.deferredViewport ?? event.viewport,
     gestureActive: false,
     deferredViewport: null,
+    documentViewport: state.documentViewport,
   }
 }
 
@@ -281,7 +397,6 @@ export function NativeCanvasGraph({
   nodeIssues = EMPTY_CANVAS_NODE_ISSUES,
   runningSessionIds = EMPTY_RUNNING_SESSION_IDS,
   nodeActivityStates = EMPTY_NODE_ACTIVITY_STATES,
-  imageCandidateStates = EMPTY_IMAGE_CANDIDATE_STATES,
   imagePreviews,
   loadCanvasWebviewPreview,
   pendingWebviewDeviceNodeIds,
@@ -296,9 +411,25 @@ export function NativeCanvasGraph({
   onNodeSelectionChange,
   onConversationNodeChange,
   onWorkbenchNodeChange,
+  workbenchNode,
+  renderWorkbench,
+  transientGeometryStore,
   createEdgeId = CREATE_NATIVE_CANVAS_EDGE_ID,
   flowRenderer,
 }: NativeCanvasGraphProps): React.ReactElement {
+  /** 内部 Store 只创建一次；正式 Workspace 不需要额外全局状态。 */
+  const internalGeometryStoreRef = React.useRef<NativeCanvasTransientGeometryStore | null>(null)
+  if (!internalGeometryStoreRef.current) {
+    internalGeometryStoreRef.current = createNativeCanvasTransientGeometryStore(document)
+  }
+  /** 注入 Store 仅用于复用同一瞬时数据源，不改变默认运行路径。 */
+  const geometryStore = transientGeometryStore ?? internalGeometryStoreRef.current
+  /** 仅 Graph 与当前工作台订阅高频几何，不触发 Workspace/Jotai 重渲染。 */
+  const transientGeometry = React.useSyncExternalStore(
+    geometryStore.subscribe,
+    geometryStore.getSnapshot,
+    geometryStore.getSnapshot,
+  )
   /** 仅保留最近一次手工创建的边及所属画布，供用户即时选择语义。 */
   const [pendingRelation, setPendingRelation] = React.useState<PendingNativeCanvasRelation | null>(null)
   /** 只有仍属于当前画布的菜单边才允许进入渲染和提交链路。 */
@@ -323,7 +454,6 @@ export function NativeCanvasGraph({
       nodeIssues,
       runningSessionIds,
       nodeActivityStates,
-      imageCandidateStates,
       imagePreviews,
       loadCanvasWebviewPreview,
       pendingWebviewDeviceNodeIds,
@@ -357,6 +487,7 @@ export function NativeCanvasGraph({
     viewport: document.viewport,
     gestureActive: false,
     deferredViewport: null,
+    documentViewport: document.viewport,
   })
   /** 同步镜像供结束回调判断手势中是否收到了权威 viewport。 */
   const viewportStateRef = React.useRef(viewportState)
@@ -376,7 +507,6 @@ export function NativeCanvasGraph({
       nodeIssues,
       runningSessionIds,
       nodeActivityStates,
-      imageCandidateStates,
       imagePreviews,
       loadCanvasWebviewPreview,
       pendingWebviewDeviceNodeIds,
@@ -391,11 +521,13 @@ export function NativeCanvasGraph({
     }))
     flowNodesRef.current = nextNodes
     setFlowNodes(nextNodes)
-  }, [canCreateChild, controlledSelectedNodeIdSet, document, imageCandidateStates, imagePreviews, loadCanvasWebviewPreview, nodeActivityStates, nodeIssues, onCreateChild, onReferenceNode, onWebviewDevicePresetChange, pendingWebviewDeviceNodeIds, runningSessionIds, workbenchNodeChange, writable])
+  }, [canCreateChild, controlledSelectedNodeIdSet, document, imagePreviews, loadCanvasWebviewPreview, nodeActivityStates, nodeIssues, onCreateChild, onReferenceNode, onWebviewDevicePresetChange, pendingWebviewDeviceNodeIds, runningSessionIds, workbenchNodeChange, writable])
 
   React.useEffect(() => {
-    updateViewportState({ type: 'document-sync', viewport: document.viewport })
-  }, [document.viewport, updateViewportState])
+    /** 几何 Store 复用 reducer 结果，手势中不会被迟到的远端 viewport 覆盖。 */
+    const nextViewportState = updateViewportState({ type: 'document-sync', viewport: document.viewport })
+    geometryStore.syncDocument(document, nextViewportState.viewport)
+  }, [document, geometryStore, updateViewportState])
 
   React.useEffect(() => {
     /** 画布身份变化后清理陈旧菜单，避免切回旧画布时再次出现。 */
@@ -432,11 +564,18 @@ export function NativeCanvasGraph({
     const nextNodes = applyNodeChanges(changes, flowNodesRef.current)
     flowNodesRef.current = nextNodes
     setFlowNodes(nextNodes)
+    /** 只把 position change 的坐标同步给工作台瞬时 Store。 */
+    const positionNodeUpdates = changes.flatMap((change) => (
+      change.type === 'position' && change.position
+        ? [{ nodeId: change.id, position: change.position }]
+        : []
+    ))
+    geometryStore.updateNodePositions(positionNodeUpdates)
     if (!changes.some((change) => change.type === 'select')) return
     /** 按文档稳定顺序保留所有选中节点，避免框选被压缩成单选。 */
     const nextSelectedNodeIds = nextNodes.filter((node) => node.selected).map((node) => node.id)
     syncSelectedNodeIds(nextSelectedNodeIds)
-  }, [syncSelectedNodeIds])
+  }, [geometryStore, syncSelectedNodeIds])
 
   /** 拖动结束后把多选集合合成单一 move mutation。 */
   const handleNodeDragStop = React.useCallback<OnNodeDrag<NativeCanvasFlowNode>>((_event, node, nodes) => {
@@ -494,17 +633,20 @@ export function NativeCanvasGraph({
   /** 视口逐帧变化只更新组件局部受控值。 */
   const handleMove = React.useCallback<OnMove>((_event, viewport) => {
     updateViewportState({ type: 'move', viewport })
-  }, [updateViewportState])
+    geometryStore.updateViewport(viewport)
+  }, [geometryStore, updateViewportState])
 
   /** 视口手势结束时只提交最终 viewport；权威更新在途时直接采用远端且不回写旧值。 */
   const handleMoveEnd = React.useCallback<OnMoveEnd>((_event, viewport) => {
     /** 手势中收到的远端 viewport 优先级高于本地结束事件。 */
     const hasDeferredViewport = viewportStateRef.current.deferredViewport !== null
-    updateViewportState({ type: 'move-end', viewport })
+    /** 工作台采用与 ReactFlow 相同的最终 viewport，包括手势中的远端权威更新。 */
+    const nextViewportState = updateViewportState({ type: 'move-end', viewport })
+    geometryStore.updateViewport(nextViewportState.viewport)
     if (!writable) return
     if (hasDeferredViewport) return
     onMutation(createViewportCanvasMutation(viewport))
-  }, [onMutation, updateViewportState, writable])
+  }, [geometryStore, onMutation, updateViewportState, writable])
 
   /** 普通节点单击只更新选中态，不隐式打开旧对话或工作台。 */
   const handleNodeClick = React.useCallback<NonNullable<NativeCanvasFlowProps['onNodeClick']>>((_event, node) => {
@@ -562,6 +704,13 @@ export function NativeCanvasGraph({
     onNodeDoubleClick: handleNodeDoubleClick,
     onPaneClick: handlePaneClick,
   }
+  /** 工作台与 Flow 同处 Graph 根层，但不进入 ReactFlow transform 容器。 */
+  const workbench = workbenchNode && renderWorkbench
+    ? renderWorkbench(
+        workbenchNode,
+        resolveNativeCanvasWorkbenchNodeRect(workbenchNode, transientGeometry),
+      )
+    : null
 
   return (
     <div className="design-canvas relative h-full w-full" aria-label="Canvas 画布">
@@ -571,6 +720,7 @@ export function NativeCanvasGraph({
           <Controls showInteractive={false} fitViewOptions={flowProps.fitViewOptions} />
         </ReactFlow>
       )}
+      {workbench}
       {pendingRelationEdge ? (
         <NativeCanvasEdgeRelationMenu
           edge={pendingRelationEdge}

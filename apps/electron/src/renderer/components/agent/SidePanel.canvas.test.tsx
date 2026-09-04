@@ -47,6 +47,23 @@ function createCanvasSession(id: string, archived = false): CanvasSessionMeta {
 }
 
 describe('Agent 右侧画布动态标签', () => {
+  test('Given Canvas 全屏展开 When 检查层叠契约 Then 外层右栏与 SidePanel 都能越过应用分隔线', async () => {
+    const [sidePanelSource, appShellSource, globalStyles, windowControlsSource] = await Promise.all([
+      Bun.file(new URL('./SidePanel.tsx', import.meta.url)).text(),
+      Bun.file(new URL('../app-shell/AppShell.tsx', import.meta.url)).text(),
+      Bun.file(new URL('../../styles/globals.css', import.meta.url)).text(),
+      Bun.file(new URL('../WindowControls.tsx', import.meta.url)).text(),
+    ])
+
+    expect(sidePanelSource).toContain('agent-side-panel')
+    expect(appShellSource).toContain('agent-right-panel-host')
+    expect(globalStyles).toMatch(
+      /\.agent-right-panel-host:has\(\[data-canvas-workspace-expanded="true"\]\)[\s\S]*?z-index: 90;/,
+    )
+    expect(globalStyles).toContain('.agent-side-panel:has([data-canvas-workspace-expanded="true"])')
+    expect(windowControlsSource).toContain('z-[100]')
+  })
+
   test('Given 多个关联 Canvas When 组装标签 Then 保持 linked 顺序和默认最近语义', () => {
     const binding: AgentCanvasBinding = {
       ...createBinding('agent-1'),

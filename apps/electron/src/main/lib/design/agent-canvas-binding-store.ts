@@ -107,9 +107,6 @@ export class AgentCanvasBindingStore {
   ) => unknown
   /** 中文降级日志边界。 */
   private readonly warn: (message: string) => void
-  /** 首次访问后缓存的规范化关联记录。 */
-  private bindings: AgentCanvasBinding[] | null = null
-
   /**
    * 创建关联 Store。
    * @param dependencies 可替换的路径、时钟与文件边界。
@@ -477,13 +474,14 @@ export class AgentCanvasBindingStore {
     }
   }
 
-  /** 延迟读取磁盘，并缓存规范化公开读结果。 */
+  /**
+   * 每次公开读取都采用共享配置文件的权威快照。
+   * 开发版与正式版可能并行运行，长期内存缓存会把另一客户端的新关联误判为失效。
+   */
   private load(): AgentCanvasBinding[] {
-    if (this.bindings) return this.bindings
-    /** 本次公开读使用的 fresh 权威快照。 */
+    /** 读取结果保持隔离，调用方不能修改后续读取的权威数据。 */
     const snapshot = this.loadFresh()
-    this.bindings = snapshot.file.bindings.map(copyBinding)
-    return this.bindings
+    return snapshot.file.bindings.map(copyBinding)
   }
 
   /**
@@ -496,8 +494,6 @@ export class AgentCanvasBindingStore {
   } {
     /** mutation 不允许基于长期读缓存，必须重新读取当前磁盘事实。 */
     const snapshot = this.loadFresh()
-    /** fresh 事实可供 no-op 后的公开读取复用。 */
-    this.bindings = snapshot.file.bindings.map(copyBinding)
     return {
       snapshot,
       bindings: snapshot.file.bindings.map(copyBinding),
@@ -581,11 +577,9 @@ export class AgentCanvasBindingStore {
     try {
       this.writeJson(this.configPath, file, options)
     } catch (error) {
-      /** rename 是否已提交不可判定，下一次访问必须回到磁盘权威事实。 */
-      this.bindings = null
+      /** rename 是否已提交不可判定；公开读取始终会回到磁盘权威事实。 */
       throw error
     }
-    this.bindings = bindings
   }
 }
 

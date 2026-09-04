@@ -32,9 +32,9 @@ describe('Canvas 节点工作台覆盖层', () => {
         dirty={false}
         surfaceSize={{ width: 1_200, height: 800 }}
         nodeScreenRect={{ left: 40, right: 328, top: 60 }}
-        position={null}
+        offset={null}
         size={null}
-        onPositionChange={() => undefined}
+        onOffsetChange={() => undefined}
         onSizeChange={() => undefined}
         onDirtyChange={() => undefined}
         onClose={() => undefined}
@@ -97,6 +97,51 @@ describe('Canvas 节点工作台覆盖层', () => {
       canvasScale: { x: 2, y: 2 },
       availableSize: { width: 900, height: 760 },
     })).toEqual({ width: 840, height: 700 })
+  })
+
+  test('Given 节点屏幕锚点变化 When 使用同一相对偏移重渲染 Then 工作台同步移动且尺寸不变', () => {
+    /** 使用非默认偏移，确保测试验证相对坐标合同而不是首次自动选位。 */
+    const renderAt = (left: number, top: number): string => renderToStaticMarkup(
+      <CanvasNodeWorkbenchOverlay
+        node={createNode('image')}
+        dirty={false}
+        surfaceSize={{ width: 1_600, height: 1_000 }}
+        nodeScreenRect={{ left, right: left + 288, top }}
+        offset={{ x: 300, y: 20 }}
+        size={{ width: 640, height: 520 }}
+        onOffsetChange={() => undefined}
+        onSizeChange={() => undefined}
+        onDirtyChange={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+
+    const initial = renderAt(40, 60)
+    const moved = renderAt(120, 110)
+
+    expect(initial).toContain('left:340px;top:80px')
+    expect(moved).toContain('left:420px;top:130px')
+    expect(initial).toContain('width:640px;height:520px')
+    expect(moved).toContain('width:640px;height:520px')
+  })
+
+  test('Given 节点随画布移出视口 When 派生工作台位置 Then 不夹紧到 surface 边缘', () => {
+    const html = renderToStaticMarkup(
+      <CanvasNodeWorkbenchOverlay
+        node={createNode('image')}
+        dirty={false}
+        surfaceSize={{ width: 1_200, height: 800 }}
+        nodeScreenRect={{ left: -700, right: -412, top: -300 }}
+        offset={{ x: 300, y: 20 }}
+        size={{ width: 640, height: 520 }}
+        onOffsetChange={() => undefined}
+        onSizeChange={() => undefined}
+        onDirtyChange={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('left:-400px;top:-280px')
   })
 
   test('Given 标题栏连续拖动 When 结束手势 Then 只提交一次最终屏幕位置', () => {
@@ -178,9 +223,9 @@ describe('Canvas 节点工作台覆盖层', () => {
         dirty={false}
         surfaceSize={{ width: 1_200, height: 800 }}
         nodeScreenRect={{ left: 40, right: 328, top: 60 }}
-        position={{ x: 340, y: 60 }}
+        offset={{ x: 300, y: 0 }}
         size={{ width: 680, height: 540 }}
-        onPositionChange={() => undefined}
+        onOffsetChange={() => undefined}
         onSizeChange={() => undefined}
         onDirtyChange={() => undefined}
         onClose={() => undefined}

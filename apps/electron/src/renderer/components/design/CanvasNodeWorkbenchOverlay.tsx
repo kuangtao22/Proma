@@ -15,6 +15,12 @@ export interface CanvasWorkbenchPosition {
   y: number
 }
 
+/** 工作台所属节点在 Canvas surface 内的实时屏幕锚点。 */
+export interface CanvasWorkbenchNodeAnchor {
+  x: number
+  y: number
+}
+
 /** 工作台双向缩放计算所需的稳定输入。 */
 export interface CanvasWorkbenchResizeInput {
   initialSize: CanvasWorkbenchSize
@@ -235,17 +241,49 @@ export function calculateCanvasWorkbenchMove(input: CanvasWorkbenchMoveInput): C
   }, input.workbenchSize, input.surfaceSize)
 }
 
+/**
+ * 使用节点实时锚点与节点级相对偏移派生工作台屏幕位置。
+ * @param nodeAnchor 当前节点左上角的屏幕像素坐标。
+ * @param offset 用户为当前节点保存的屏幕像素偏移。
+ * @returns 不受 surface 边界夹紧的工作台屏幕位置。
+ */
+export function resolveCanvasWorkbenchScreenPosition(
+  nodeAnchor: CanvasWorkbenchNodeAnchor,
+  offset: CanvasWorkbenchPosition,
+): CanvasWorkbenchPosition {
+  return {
+    x: nodeAnchor.x + offset.x,
+    y: nodeAnchor.y + offset.y,
+  }
+}
+
+/**
+ * 把工作台最终屏幕位置转换为当前节点独立的相对偏移。
+ * @param nodeAnchor 拖动开始时捕获的节点屏幕锚点。
+ * @param screenPosition 工作台最终屏幕位置。
+ * @returns 可在节点后续移动时复用的屏幕像素偏移。
+ */
+export function resolveCanvasWorkbenchOffset(
+  nodeAnchor: CanvasWorkbenchNodeAnchor,
+  screenPosition: CanvasWorkbenchPosition,
+): CanvasWorkbenchPosition {
+  return {
+    x: screenPosition.x - nodeAnchor.x,
+    y: screenPosition.y - nodeAnchor.y,
+  }
+}
+
 /** 节点工作台壳的最小受控输入。 */
 export interface CanvasNodeWorkbenchOverlayProps {
   node: CanvasNode
   dirty: boolean
   surfaceSize?: CanvasWorkbenchSize
   nodeScreenRect?: Pick<DOMRectReadOnly, 'left' | 'right' | 'top'>
-  /** 当前 Canvas 会话复用的浮窗位置；null 表示首次打开。 */
-  position?: CanvasWorkbenchPosition | null
+  /** 当前节点保存的相对偏移；null 表示首次打开。 */
+  offset?: CanvasWorkbenchPosition | null
   /** 当前节点保存的自定义尺寸；null 表示使用类型默认值。 */
   size?: CanvasWorkbenchSize | null
-  onPositionChange?: (position: CanvasWorkbenchPosition) => void
+  onOffsetChange?: (offset: CanvasWorkbenchPosition) => void
   onSizeChange?: (size: CanvasWorkbenchSize) => void
   /** 迁移期旧调用只用于避免 SSR 崩溃，Workspace 接线完成后不再使用。 */
   workbenchSize?: CanvasWorkbenchSize | null
@@ -279,14 +317,16 @@ export function CanvasNodeWorkbenchOverlay(
   /** SSR 与首次测量前使用稳定桌面边界，客户端 ResizeObserver 随后接管。 */
   const surfaceSize = props.surfaceSize ?? { width: 1_200, height: 800 }
   const nodeScreenRect = props.nodeScreenRect ?? { left: 12, right: 300, top: 12 }
+  /** 节点锚点始终来自最新 viewport 投影，负责驱动工作台跟随。 */
+  const nodeAnchor = { x: nodeScreenRect.left, y: nodeScreenRect.top }
   /** 默认与自定义尺寸都先受当前 surface 屏幕边界约束。 */
   const effectiveSize = clampCanvasWorkbenchSizeToSurface(
     props.size ?? props.workbenchSize ?? resolveCanvasWorkbenchDefaultSize(props.node),
     surfaceSize,
   )
-  /** 首次位置围绕目标节点选择，已有位置则只做边界收敛。 */
-  const effectivePosition = props.position
-    ? clampCanvasWorkbenchPosition(props.position, effectiveSize, surfaceSize)
+  /** 已有偏移不做视口夹紧，节点移出视口时工作台必须同步移出。 */
+  const effectivePosition = props.offset
+    ? resolveCanvasWorkbenchScreenPosition(nodeAnchor, props.offset)
     : calculateCanvasWorkbenchInitialPosition({
         nodeRect: nodeScreenRect,
         surfaceSize,
@@ -294,11 +334,13 @@ export function CanvasNodeWorkbenchOverlay(
       })
   const onSizeChangeRef = React.useRef(props.onSizeChange ?? props.onWorkbenchSizeChange ?? (() => undefined))
   onSizeChangeRef.current = props.onSizeChange ?? props.onWorkbenchSizeChange ?? (() => undefined)
-  const onPositionChangeRef = React.useRef(props.onPositionChange ?? (() => undefined))
-  onPositionChangeRef.current = props.onPositionChange ?? (() => undefined)
+  const onOffsetChangeRef = React.useRef(props.onOffsetChange ?? (() => undefined))
+  onOffsetChangeRef.current = props.onOffsetChange ?? (() => undefined)
   /** 指针捕获期间的起点，避免每帧读取 DOM 或全局状态。 */
   const resizeSessionRef = React.useRef<{ pointerId: number; pointerOrigin: CanvasWorkbenchPosition } | null>(null)
   const moveSessionRef = React.useRef<{ pointerId: number; pointerOrigin: CanvasWorkbenchPosition } | null>(null)
+  /** 拖动期间固定节点锚点，避免 viewport 同时变化时提交错误偏移。 */
+  const moveNodeAnchorRef = React.useRef<CanvasWorkbenchNodeAnchor>(nodeAnchor)
   /** 拖拽预览只更新 Overlay 自身，避免每帧重写全局 view Map。 */
   const [previewSize, setPreviewSize] = React.useState<CanvasWorkbenchSize>(effectiveSize)
   const [previewPosition, setPreviewPosition] = React.useState<CanvasWorkbenchPosition>(effectivePosition)
@@ -313,7 +355,9 @@ export function CanvasNodeWorkbenchOverlay(
   if (!moveGestureRef.current) {
     moveGestureRef.current = createCanvasWorkbenchMoveGestureController({
       onPreview: setPreviewPosition,
-      onCommit: (position) => onPositionChangeRef.current(position),
+      onCommit: (position) => onOffsetChangeRef.current(
+        resolveCanvasWorkbenchOffset(moveNodeAnchorRef.current, position),
+      ),
     })
   }
   React.useEffect(() => {
@@ -321,10 +365,14 @@ export function CanvasNodeWorkbenchOverlay(
     if (resizeSessionRef.current === null) setPreviewSize(effectiveSize)
     if (moveSessionRef.current === null) setPreviewPosition(effectivePosition)
   }, [effectivePosition.x, effectivePosition.y, effectiveSize.height, effectiveSize.width])
+  /** 非标题拖动期间直接使用节点实时投影，避免等待 effect 造成一帧跟随延迟。 */
+  const renderedPosition = moveSessionRef.current === null ? effectivePosition : previewPosition
   React.useEffect(() => {
-    /** 首次计算后保存位置，使后续切换节点复用同一浮窗位置。 */
-    if (props.position === null) onPositionChangeRef.current(effectivePosition)
-  }, [effectivePosition.x, effectivePosition.y, props.position])
+    /** 首次计算后保存节点相对偏移，后续 viewport 更新只重新派生屏幕位置。 */
+    if (props.offset === null) {
+      onOffsetChangeRef.current(resolveCanvasWorkbenchOffset(nodeAnchor, effectivePosition))
+    }
+  }, [effectivePosition.x, effectivePosition.y, nodeAnchor.x, nodeAnchor.y, props.offset])
 
   /** 开始双向缩放并捕获指针，防止拖出手柄后丢失移动事件。 */
   const handleResizePointerDown = React.useCallback((event: React.PointerEvent<HTMLButtonElement>): void => {
@@ -369,12 +417,13 @@ export function CanvasNodeWorkbenchOverlay(
       pointerId: event.pointerId,
       pointerOrigin: { x: event.clientX, y: event.clientY },
     }
+    moveNodeAnchorRef.current = nodeAnchor
     moveGestureRef.current?.start({
       initialPosition: previewPosition,
       workbenchSize: previewSize,
       surfaceSize,
     })
-  }, [previewPosition, previewSize, surfaceSize])
+  }, [nodeAnchor, previewPosition, previewSize, surfaceSize])
 
   /** 标题栏移动只更新 Overlay 局部位置。 */
   const handleMovePointerMove = React.useCallback((event: React.PointerEvent<HTMLElement>): void => {
@@ -420,7 +469,7 @@ export function CanvasNodeWorkbenchOverlay(
       aria-label={`${label}工作台`}
       data-workbench-kind={props.node.kind}
       data-workbench-dirty={props.dirty || undefined}
-      style={{ width: previewSize.width, height: previewSize.height, left: previewPosition.x, top: previewPosition.y }}
+      style={{ width: previewSize.width, height: previewSize.height, left: renderedPosition.x, top: renderedPosition.y }}
     >
       <header
         className="flex h-11 shrink-0 touch-none cursor-move items-center justify-between gap-2 border-b border-border px-3"

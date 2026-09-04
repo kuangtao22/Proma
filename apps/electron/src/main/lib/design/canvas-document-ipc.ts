@@ -752,7 +752,7 @@ function createAgentCanvasImageBatchId(
     canvasId,
     'candidate-batch',
   ])).digest('hex')
-  return `agent-canvas-batch-${digest}`
+  return `agent-canvas-${digest}`
 }
 
 /** 把未知异常压缩为批量工具可审计的稳定文本。 */
@@ -1436,10 +1436,17 @@ export function registerCanvasDocumentIpcHandlers(
 
   /** 广播图片模块需重新加载，只携带完整公开目标身份。 */
   const broadcastImageModuleChanged = (target: CanvasImageTarget): void => {
+    /** 严格裁剪采用命令里的 jobId 等字段，只公开图片模块目标身份。 */
+    const publicTarget: CanvasImageTarget = {
+      projectId: target.projectId,
+      canvasId: target.canvasId,
+      nodeId: target.nodeId,
+      imageModuleId: target.imageModuleId,
+    }
     for (const contents of options.listAuthorizedWebContents()) {
       if (contents.isDestroyed()) continue
       try {
-        contents.send(CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, { ...target })
+        contents.send(CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, publicTarget)
       } catch (error) {
         console.error('[CanvasDocumentIPC] 图片模块变化广播失败:', error)
       }
@@ -2165,10 +2172,18 @@ export function registerCanvasDocumentIpcHandlers(
           || latest.adoptedAssetId !== input.assetId) {
           throw new Error('CANVAS_IMAGE_ADOPT_FAILED')
         }
-        return latest
+        /** 候选事务同时推进 Canvas 文档，必须在同一 lease 内读取其权威 revision。 */
+        const snapshot = options.store.load(input)
+        return { config: latest, graphRevision: snapshot.document.revision }
+      })
+      broadcastChange(options, {
+        projectId: input.projectId,
+        canvasId: input.canvasId,
+        revision: adopted.graphRevision,
+        cause: 'graph',
       })
       broadcastImageModuleChanged(input)
-      return adopted
+      return adopted.config
     })
   ))
 
@@ -2383,19 +2398,14 @@ export function registerCanvasDocumentIpcHandlers(
         if (!outcome.agent) throw new Error('CANVAS_AGENT_RECONCILIATION_MISSING')
         publishUniqueReconciliation(input, published, outcome.agent)
         if (outcome.agent.error) throw outcome.agent.error
-        const activeImageCandidateBatches = await options.imageCandidateBatches.listActiveSummaries(input)
         try {
-          const snapshot = attachCanvasImagePreviews(event.sender, input, outcome.agent.snapshot)
-          return activeImageCandidateBatches.length > 0
-            ? { ...snapshot, activeImageCandidateBatches }
-            : snapshot
+          return attachCanvasImagePreviews(event.sender, input, outcome.agent.snapshot)
         } catch (error) {
           /** 缩略图是可降级展示能力，授权或素材索引失败不能阻断画布本体。 */
           console.error('[CanvasDocumentIPC] Canvas 缩略图加载失败:', error)
           return {
             ...outcome.agent.snapshot,
             imagePreviews: [],
-            ...(activeImageCandidateBatches.length > 0 ? { activeImageCandidateBatches } : {}),
           }
         }
       })

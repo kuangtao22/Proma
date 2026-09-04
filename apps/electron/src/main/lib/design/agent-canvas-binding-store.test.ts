@@ -389,6 +389,22 @@ describe('AgentCanvasBindingStore', () => {
     )?.linkedCanvasIds).toEqual(['canvas-a', 'canvas-b'])
   })
 
+  test('Given 当前客户端已缓存空关联 When 另一客户端写入关联 Then 当前客户端公开读立即采用磁盘最新事实', () => {
+    /** 两个客户端共享同一真实配置文件，复现开发版与正式版并行运行。 */
+    const directory = mkdtempSync(join(tmpdir(), 'proma-agent-canvas-fresh-read-'))
+    temporaryDirectories.push(directory)
+    const configPath = join(directory, 'agent-canvas-bindings.json')
+    const currentClient = new AgentCanvasBindingStore({ configPath, now: () => 10 })
+    const otherClient = new AgentCanvasBindingStore({ configPath, now: () => 20 })
+    expect(currentClient.get('project-1', 'session-1')).toBeNull()
+    expect(currentClient.listByProject('project-1')).toEqual([])
+
+    otherClient.link(linkInput('session-1', 'canvas-new'))
+
+    expect(currentClient.get('project-1', 'session-1')?.linkedCanvasIds).toEqual(['canvas-new'])
+    expect(currentClient.listByProject('project-1').map((binding) => binding.sessionId)).toEqual(['session-1'])
+  })
+
   test('Given fresh 读取后另一写者抢先提交 When CAS 写入 Then 明确冲突且不覆盖赢家', () => {
     /** 真实 secure CAS 竞争使用的已存在父目录。 */
     const directory = mkdtempSync(join(tmpdir(), 'proma-agent-canvas-cas-conflict-'))

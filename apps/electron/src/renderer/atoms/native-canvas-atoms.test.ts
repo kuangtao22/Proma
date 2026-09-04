@@ -174,7 +174,24 @@ describe('原生 Canvas 状态隔离', () => {
       'image-1': { width: 1_000, height: 720 },
       'document-1': { width: 880, height: 660 },
     })
-    expect(documentUpdate.workbenchPosition).toBeUndefined()
+    expect(documentUpdate.workbenchOffsetsByNodeId).toBeUndefined()
+  })
+
+  test('Given 两个节点有不同详情偏移 When 依次更新 Then 偏移按节点隔离', () => {
+    const current = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })
+    const imageUpdate = createAgentCanvasWorkbenchGeometryUpdate(current, 'image-1', {
+      offset: { x: 300, y: 40 },
+    })
+    const next = { ...current, ...imageUpdate }
+    const documentUpdate = createAgentCanvasWorkbenchGeometryUpdate(next, 'document-1', {
+      offset: { x: -500, y: 20 },
+    })
+
+    expect(documentUpdate.workbenchOffsetsByNodeId).toEqual({
+      'image-1': { x: 300, y: 40 },
+      'document-1': { x: -500, y: 20 },
+    })
+    expect(documentUpdate.workbenchSizesByNodeId).toBeUndefined()
   })
 
   test('Given 工作台尺寸超过上限 When 新增第 65 个节点 Then 删除最早尺寸且保留已有键顺序', () => {
@@ -193,12 +210,33 @@ describe('原生 Canvas 状态隔离', () => {
     expect(update.workbenchSizesByNodeId?.['node-64']).toEqual({ width: 900, height: 700 })
   })
 
+  test('Given 工作台偏移超过上限 When 新增第 65 个节点 Then 删除最早偏移且不修改原状态', () => {
+    const current = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })
+    current.workbenchOffsetsByNodeId = Object.fromEntries(Array.from({ length: 64 }, (_, index) => [
+      `node-${index}`,
+      { x: index, y: index + 10 },
+    ]))
+
+    const update = createAgentCanvasWorkbenchGeometryUpdate(current, 'node-64', {
+      offset: { x: 640, y: 650 },
+    })
+
+    expect(Object.keys(update.workbenchOffsetsByNodeId ?? {})).toHaveLength(64)
+    expect(update.workbenchOffsetsByNodeId?.['node-0']).toBeUndefined()
+    expect(update.workbenchOffsetsByNodeId?.['node-64']).toEqual({ x: 640, y: 650 })
+    expect(current.workbenchOffsetsByNodeId['node-0']).toEqual({ x: 0, y: 10 })
+  })
+
   test('Given 节点已删除 When 收敛会话视图 Then 清理其尺寸并关闭目标浮窗', () => {
     const current = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })
     current.expandedNodeId = 'deleted-node'
     current.workbenchSizesByNodeId = {
       'deleted-node': { width: 900, height: 700 },
       'kept-node': { width: 760, height: 640 },
+    }
+    current.workbenchOffsetsByNodeId = {
+      'deleted-node': { x: 300, y: 20 },
+      'kept-node': { x: -500, y: 30 },
     }
     const document = createEmptyCanvasDocument('project-a', 'canvas-a')
     document.nodes = [{
@@ -208,6 +246,7 @@ describe('原生 Canvas 状态隔离', () => {
     expect(createConvergedAgentCanvasViewUpdate(current, document)).toMatchObject({
       expandedNodeId: null,
       workbenchSizesByNodeId: { 'kept-node': { width: 760, height: 640 } },
+      workbenchOffsetsByNodeId: { 'kept-node': { x: -500, y: 30 } },
     })
   })
 

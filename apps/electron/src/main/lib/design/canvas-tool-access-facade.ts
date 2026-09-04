@@ -120,6 +120,22 @@ function createFixedCanvasBinding(
   }
 }
 
+/**
+ * 要求画布仍登记在目标项目中，仅用于引用摘要读取公开元数据。
+ * legacy 画布可以提供标题，但节点文档加载仍由原生 Canvas Store 单独校验。
+ */
+function requireRegisteredCanvas(
+  dependencies: CanvasToolAccessFacadeDependencies,
+  projectId: string,
+  canvasId: string,
+): CanvasSessionMeta {
+  /** registry 同时包含 native 与 legacy，不能用 requireNative 误删合法关联。 */
+  const session = dependencies.sessions.list({ projectId })
+    .find((candidate) => candidate.id === canvasId)
+  if (!session) throw new Error('Canvas 会话不存在')
+  return session
+}
+
 /** Canvas Agent 的画布身份由节点归属固定，禁止进入普通关联管理写路径。 */
 function requireCanvasManagementAccess(context: CanvasToolRunContext): void {
   if (context.canvasAgentTarget) throw new Error('CANVAS_AGENT_CANVAS_SCOPE_FIXED')
@@ -138,7 +154,11 @@ export function createCanvasToolAccessFacade(
       return session
     },
     getBinding: (projectId, sessionId) => dependencies.bindings.get(projectId, sessionId),
-    requireCanvas: (projectId, canvasId) => dependencies.sessions.requireNative(projectId, canvasId),
+    requireCanvas: (projectId, canvasId) => requireRegisteredCanvas(
+      dependencies,
+      projectId,
+      canvasId,
+    ),
     loadCanvas: dependencies.loadCanvas,
   })
 

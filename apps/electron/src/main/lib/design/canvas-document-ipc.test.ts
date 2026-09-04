@@ -258,6 +258,10 @@ function createContext(options: {
   imageRollbackOnce?: (projectId: string, jobId: string) => Promise<boolean>
   imageRun?: (jobId: string, leaseHeld: boolean) => Promise<void>
   imageCandidateBatch?: CanvasImageCandidateBatch
+  /** 测试可注入候选摘要读取行为，证明普通 Canvas LOAD 不再依赖它。 */
+  imageCandidateListActiveSummaries?: (
+    target: CanvasTarget,
+  ) => Promise<import('@proma/shared').CanvasImageCandidateBatchSummary[]>
   imageCandidateRetry?: (input: CanvasImageTarget & { batchId: string; jobId: string }) => Promise<string>
   imageCandidateAdoptExisting?: (
     input: import('./canvas-image-candidate-batch-service').AdoptExistingCanvasImageAssetInput,
@@ -701,7 +705,7 @@ function createContext(options: {
         imageCalls.push({ type: 'candidate-create', value: input })
         return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
       },
-      listActiveSummaries: async () => [],
+      listActiveSummaries: async (target) => options.imageCandidateListActiveSummaries?.(target) ?? [],
       load: async (input) => {
         imageCalls.push({ type: 'candidate-load', value: input })
         return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
@@ -1162,6 +1166,25 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.mediaReleases).toEqual([1])
   })
 
+  test('Given 候选摘要读取不可用 When LOAD Canvas Then 不访问候选批次且仍返回权威快照', async () => {
+    /** 调用计数证明 LOAD 已与候选事务查询解耦。 */
+    let listCalls = 0
+    const context = createContext({
+      imageCandidateListActiveSummaries: async () => {
+        listCalls += 1
+        throw new Error('LOAD 不应读取候选摘要')
+      },
+    })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    }) as CanvasInvokeResult<CanvasWorkspaceSnapshot>
+
+    expect(result).toMatchObject({ ok: true, value: { document: { revision: 4 } } })
+    expect(listCalls).toBe(0)
+    if (result.ok) expect(result.value).not.toHaveProperty('activeImageCandidateBatches')
+  })
+
   test('Given Canvas 缩略图授权失败 When LOAD Then 画布仍成功加载并回退为空预览', async () => {
     const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const document = createDocument(4)
@@ -1361,8 +1384,11 @@ describe('原生 Canvas 文档 IPC', () => {
 
   test('Given 历史版本已验证 When 设为当前 Then 通过候选采用事务切换而不走旧直写路径', async () => {
     let config = createImageConfig(imageTargetA, 3)
+    /** 候选采用事务完成后 Store 返回的权威画布 revision。 */
+    const adoptedDocument = createDocument(8)
     const job = { ...createImageJob(imageTargetA, 'job-history'), outputAssetId: 'asset-history' }
     const context = createContext({
+      loadResult: { document: adoptedDocument, writable: true, nodeIssues: [] },
       imageJobs: [job],
       imageAssets: [createImageAsset('asset-history', job.id)],
       imageLoad: async () => config,
@@ -1385,6 +1411,14 @@ describe('原生 Canvas 文档 IPC', () => {
     })
     expect(context.imageCalls.filter((call) => call.type === 'candidate-adopt-existing')).toHaveLength(1)
     expect(context.imageCalls.filter((call) => call.type === 'adopt')).toEqual([])
+    expect(context.sender.sent).toEqual([
+      {
+        channel: CANVAS_IPC_CHANNELS.CHANGED,
+        value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 8, cause: 'graph' },
+      },
+      { channel: CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, value: imageTargetA },
+    ])
+    expect(context.broadcastLeaseStates).toEqual([false, false])
   })
 
   test('Given 历史版本采用事务状态不确定 When 设为当前 Then 返回稳定恢复错误', async () => {
@@ -3805,6 +3839,33 @@ describe('原生 Canvas 文档 IPC', () => {
       expect(result.tasks).toContainEqual(expect.objectContaining({
         nodeId: 'image-node-b', status: 'failed', error: 'CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED',
       }))
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
+  test('Given Agent 批量生图 When 持久化候选批次 Then 批次身份符合原生写入合同', async () => {
+    /** 生产 runtime 夹具记录传入候选批次 Store 的真实身份。 */
+    const context = createContext({ enableToolProviderRuntime: true })
+    try {
+      /** 回归测试必须经过 canvas_run_nodes 的完整生产路由。 */
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+
+      await runtime.runNodes({
+        projectId: imageTargetA.projectId, sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      }, { projectId: imageTargetA.projectId, canvasId: imageTargetA.canvasId }, [{
+        id: imageTargetA.nodeId, kind: 'image', title: '主视觉',
+        position: { x: 0, y: 0 }, imageModuleId: imageTargetA.imageModuleId,
+      }], 'tool-native-candidate-contract')
+
+      expect(context.imageCalls).toContainEqual({
+        type: 'candidate-create',
+        value: expect.objectContaining({
+          batchId: expect.stringMatching(/^agent-canvas-[a-f0-9]{64}$/),
+        }),
+      })
     } finally {
       context.registration.dispose()
     }

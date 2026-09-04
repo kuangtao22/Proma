@@ -1,7 +1,5 @@
 import { describe, expect, test } from 'bun:test'
 import type {
-  CanvasImageCandidateBatch,
-  CanvasImageCandidateBatchSummary,
   CanvasImageModuleSnapshot,
   DesignAsset,
   DesignJobRecord,
@@ -10,7 +8,6 @@ import type {
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { CanvasImageModuleViewState } from '@/atoms/native-canvas-atoms'
 import { CanvasImageWorkbench } from './CanvasImageWorkbench'
-import type { CanvasImageCandidateBatchWorkbenchProps } from './CanvasImageWorkbench'
 
 /** 创建 Canvas 生图工作台使用的模型选项。 */
 function createModelOption(): ImageGenerationModelOption {
@@ -141,7 +138,7 @@ function renderWorkbench(
   options: {
     exportState?: 'idle' | 'exporting'
     exportError?: string | null
-    candidateBatch?: CanvasImageCandidateBatchWorkbenchProps
+    adoptingAssetId?: string | null
   } = {},
 ): string {
   return renderToStaticMarkup(
@@ -156,53 +153,24 @@ function renderWorkbench(
       onRetry={() => undefined}
       onPreviewAsset={() => undefined}
       onAdoptAsset={() => undefined}
+      adoptingAssetId={options.adoptingAssetId ?? null}
       onExportAsset={() => undefined}
       exportState={options.exportState ?? 'idle'}
       exportError={options.exportError ?? null}
       onLoadTaskDetails={() => undefined}
       onConfigureModels={() => undefined}
       onRetryLoad={() => undefined}
-      candidateBatch={options.candidateBatch}
     />,
   )
 }
 
-/** 创建当前节点拥有候选版本的单节点批次。 */
-function createCandidateBatch(): CanvasImageCandidateBatch {
-  return {
-    schemaVersion: 1, batchId: 'batch-1', projectId: 'project-1', canvasId: 'canvas-1',
-    source: 'single', sourceSessionId: null, sourceToolCallId: null, status: 'ready',
-    entries: [{ nodeId: 'node-1', imageModuleId: 'module-1', initialAdoptedAssetId: 'asset-1', initialConfigRevision: 1, jobId: 'job-2', candidateAssetId: 'asset-2', status: 'candidate', error: null }],
-    adoption: null, createdAt: 100, updatedAt: 200,
-  }
-}
-
-/** 创建工作台候选批次区域使用的轻量摘要和命令。 */
-function createCandidateWorkbenchProps(): CanvasImageCandidateBatchWorkbenchProps {
-  const batch = createCandidateBatch()
-  const summary: CanvasImageCandidateBatchSummary = {
-    batchId: batch.batchId, projectId: batch.projectId, canvasId: batch.canvasId,
-    entries: batch.entries.map((entry) => ({ nodeId: entry.nodeId, status: entry.status })),
-    status: batch.status, totalCount: 1, candidateCount: 1, failedCount: 0, runningCount: 0,
-    updatedAt: batch.updatedAt,
-  }
-  return {
-    summary,
-    state: { phase: 'ready', batch, error: null, operation: 'idle' },
-    onLoad: () => undefined,
-    onContinue: () => undefined,
-    onAdopt: () => undefined,
-    onAbandon: () => undefined,
-  }
-}
-
 describe('Canvas 生图工作台', () => {
-  test('Given 当前节点存在候选版本 When 渲染详情 Then 候选验收区与正式历史并存', () => {
-    const html = renderWorkbench(createState(), true, { candidateBatch: createCandidateWorkbenchProps() })
+  test('Given 图片模块包含多个成功版本 When 渲染详情 Then 只展示统一历史版本入口', () => {
+    const html = renderWorkbench(createState())
 
-    expect(html).toContain('候选批次')
-    expect(html).toContain('当前版本')
-    expect(html).toContain('候选版本')
+    expect(html).not.toContain('候选批次')
+    expect(html).not.toContain('当前版本')
+    expect(html).not.toContain('候选版本')
     expect(html).toContain('历史版本')
   })
   test('Given 当前采用素材存在 When 渲染与历史预览 Then 导出始终绑定当前采用素材', () => {
@@ -284,13 +252,31 @@ describe('Canvas 生图工作台', () => {
     expect(html).toContain('查看任务详情')
   })
 
-  test('Given 历史版本被预览 When 渲染 Then 原图切换但不会伪装成当前版本', () => {
+  test('Given 历史版本被预览 When 渲染 Then 原图切换且采用入口只在历史项内', () => {
     const html = renderWorkbench(createState({ previewAssetId: 'asset-1' }))
 
     expect(html).toContain('proma-file://asset-token/asset-1.png')
     expect(html).toContain('正在预览历史版本')
-    expect(html).toContain('设为当前')
+    expect(html).not.toContain('设为当前')
+    expect(html).toContain('aria-label="设为默认"')
+    expect(html).toContain('>默认</span>')
     expect(html).toContain('历史版本')
+  })
+
+  test('Given Canvas 只读 When 渲染非默认历史版本 Then 采用按钮保持可见但不可写', () => {
+    const html = renderWorkbench(createState({ previewAssetId: 'asset-1' }), false)
+
+    expect(html).toMatch(/<button(?=[^>]*disabled="")(?=[^>]*aria-label="设为默认")[^>]*>/u)
+    expect(html).toContain('当前画布为只读状态')
+  })
+
+  test('Given 一个历史版本正在设为默认 When 渲染 Then 阻止并发采用并标记目标版本', () => {
+    const html = renderWorkbench(createState({ previewAssetId: 'asset-1' }), true, {
+      adoptingAssetId: 'asset-1',
+    })
+
+    expect(html).toMatch(/<button(?=[^>]*disabled="")(?=[^>]*aria-label="正在设为默认")[^>]*>/u)
+    expect(html).toContain('animate-spin')
   })
 
   test('Given 主进程版本事实与任务素材分叉 When 渲染 Then 历史只消费 imageVersions', () => {

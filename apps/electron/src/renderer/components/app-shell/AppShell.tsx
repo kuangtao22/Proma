@@ -361,7 +361,7 @@ export function AppShell(): React.ReactElement {
             {/* 右侧边栏：Agent 文件面板 */}
             {showRightPanel && (
               <div
-                className="relative z-[60] flex flex-shrink-0 items-stretch crt-sidebar"
+                className="agent-right-panel-host relative z-[60] flex flex-shrink-0 items-stretch crt-sidebar"
               >
                 <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 z-10 w-px bg-border/80 dark:bg-border/70" />
                 {/* 拖拽手柄 */}

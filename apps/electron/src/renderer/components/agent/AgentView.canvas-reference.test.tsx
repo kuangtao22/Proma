@@ -95,4 +95,32 @@ describe('Agent Canvas 节点引用 composer', () => {
     expect(shouldRenderUserMessageContent('', [reference])).toBe(true)
     expect(shouldRenderUserMessageContent('', [])).toBe(false)
   })
+
+  test('Given 普通发送携带 Canvas 引用 When 主进程接管或拒绝 Then 立即清理 composer 且失败时完整恢复', () => {
+    const source = readFileSync(new URL('./AgentView.tsx', import.meta.url), 'utf8')
+    const sendCall = 'window.electronAPI.sendAgentMessage(input)'
+    const sendStart = source.indexOf('window.electronAPI.sendAgentMessage(input)')
+    const sendEnd = source.indexOf('\n  }, [', sendStart)
+    const optimisticStart = source.lastIndexOf(
+      'appendOptimisticPersistedMessage(tempUserSDKMsg)',
+      sendStart,
+    )
+    const sendPrefix = source.slice(optimisticStart, sendStart)
+    const sendBody = source.slice(sendStart, sendEnd)
+    /** 引用不能等待整轮 Agent 完成才清理，否则运行期间继续发送会重复引用同一节点。 */
+    expect(sendPrefix).toContain('clearSentCanvasNodeReferences(canvasNodeReferencesSnapshot)')
+    expect(source.indexOf(sendCall, optimisticStart)).toBe(sendStart)
+    expect(sendBody).toContain('rollbackOptimisticPersistedMessage(tempUserSDKMsg)')
+    expect(sendBody).toContain('restoreMissingCanvasNodeReferences(current, canvasNodeReferencesSnapshot)')
+    expect(sendBody).toContain("toast.error('消息发送失败'")
+  })
+
+  test('Given composer 只有 Canvas 引用 When 计算发送按钮状态 Then 引用本身属于可发送内容', () => {
+    const source = readFileSync(new URL('./AgentView.tsx', import.meta.url), 'utf8')
+    const canSendStart = source.indexOf('const canSend =')
+    const canSendEnd = source.indexOf('\n\n', canSendStart)
+    const canSendBody = source.slice(canSendStart, canSendEnd)
+
+    expect(canSendBody).toContain('canvasNodeReferences.length > 0')
+  })
 })

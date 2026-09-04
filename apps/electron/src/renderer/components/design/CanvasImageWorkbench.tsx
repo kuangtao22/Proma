@@ -30,21 +30,12 @@ import { Label } from '@/components/ui/label'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { DesignTaskDetailsView } from './DesignTaskDetails'
-import {
-  CanvasImageCandidateBatchPanel,
-  type CanvasImageCandidateBatchPanelProps,
-} from './CanvasImageCandidateBatchPanel'
 
 /** Canvas 图片工作台的模型加载状态。 */
 export type CanvasImageModelLoadState = 'idle' | 'loading' | 'ready' | 'failed'
-
-/** Workspace 注入候选批次状态和命令，工作台补充当前节点与预览动作。 */
-export type CanvasImageCandidateBatchWorkbenchProps = Omit<
-  CanvasImageCandidateBatchPanelProps,
-  'writable' | 'focusNodeId' | 'onPreviewAsset'
->
 
 /** Canvas 图片工作台只接收状态与命令，不直接调用 IPC。 */
 export interface CanvasImageWorkbenchProps {
@@ -59,6 +50,8 @@ export interface CanvasImageWorkbenchProps {
   onRetry: (jobId: string) => void
   onPreviewAsset: (assetId: string) => void
   onAdoptAsset: (assetId: string) => void
+  /** 当前正在设为默认的历史素材；null 表示采用通道空闲。 */
+  adoptingAssetId: string | null
   onExportAsset: (assetId: string) => void
   exportState: 'idle' | 'exporting'
   exportError: string | null
@@ -66,8 +59,6 @@ export interface CanvasImageWorkbenchProps {
   onConfigureModels: () => void
   onRetryLoad: () => void
   onCopyPrompt?: (prompt: string) => void
-  /** 当前图片节点所属的活跃候选批次；不存在时不挂载批次 UI。 */
-  candidateBatch?: CanvasImageCandidateBatchWorkbenchProps
 }
 
 /** 项目上下文三态的稳定用户文案。 */
@@ -208,6 +199,7 @@ export function CanvasImageWorkbench({
   onRetry,
   onPreviewAsset,
   onAdoptAsset,
+  adoptingAssetId,
   onExportAsset,
   exportState,
   exportError,
@@ -215,7 +207,6 @@ export function CanvasImageWorkbench({
   onConfigureModels,
   onRetryLoad,
   onCopyPrompt,
-  candidateBatch,
 }: CanvasImageWorkbenchProps): React.ReactElement {
   /** 当前打开的任务详情仅属于本工作台实例。 */
   const [detailsJobId, setDetailsJobId] = React.useState<string | null>(null)
@@ -315,15 +306,6 @@ export function CanvasImageWorkbench({
             activeJob={activeJob}
           />
 
-          {candidateBatch && (
-            <CanvasImageCandidateBatchPanel
-              {...candidateBatch}
-              writable={writable}
-              focusNodeId={snapshot.target.nodeId}
-              onPreviewAsset={onPreviewAsset}
-            />
-          )}
-
           <Button
             type="button"
             variant="outline"
@@ -342,12 +324,6 @@ export function CanvasImageWorkbench({
             <p className="break-words text-xs text-destructive" role="alert">{exportError}</p>
           )}
 
-          {previewingHistory && visibleAsset && (
-            <Button type="button" variant="outline" size="sm" disabled={!writable} onClick={() => onAdoptAsset(visibleAsset.id)}>
-              <Check aria-hidden="true" />设为当前
-            </Button>
-          )}
-
           {displayedJob?.error && (
             <p className="break-words text-xs text-destructive" role="alert">{displayedJob.error}</p>
           )}
@@ -361,38 +337,66 @@ export function CanvasImageWorkbench({
               <FieldHeader>历史版本</FieldHeader>
             </div>
             {versions.length > 0 ? (
-              <ul className="flex gap-2 overflow-x-auto pb-1" aria-label="历史版本">
-                {versions.map(({ job, asset }) => {
-                  /** 当前权威采用版本使用明确状态，不与预览选择混淆。 */
-                  const adopted = asset.id === snapshot.config.adoptedAssetId
-                  /** 当前可见版本支持键盘和鼠标选择。 */
-                  const selected = asset.id === visibleAssetId
-                  return (
-                    <li key={asset.id} className="shrink-0">
-                      <button
-                        type="button"
-                        className={cn(
-                          'relative size-16 overflow-hidden rounded-sm border bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                          selected ? 'border-primary' : 'border-border hover:border-foreground/40',
+              <TooltipProvider delayDuration={200} disableHoverableContent>
+                <ul className="flex gap-2 overflow-x-auto pb-1" aria-label="历史版本">
+                  {versions.map(({ job, asset }) => {
+                    /** 当前权威采用版本使用明确状态，不与预览选择混淆。 */
+                    const adopted = asset.id === snapshot.config.adoptedAssetId
+                    /** 当前可见版本支持键盘和鼠标选择。 */
+                    const selected = asset.id === visibleAssetId
+                    /** 采用期间所有版本共享单一写通道，目标项显示明确进度。 */
+                    const adopting = asset.id === adoptingAssetId
+                    return (
+                      <li key={asset.id} className="relative size-16 shrink-0">
+                        <button
+                          type="button"
+                          className={cn(
+                            'size-16 overflow-hidden rounded-sm border bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                            selected ? 'border-primary' : 'border-border hover:border-foreground/40',
+                          )}
+                          aria-label={`预览第 ${job.attemptNumber} 次生成结果`}
+                          aria-pressed={selected}
+                          onClick={() => onPreviewAsset(asset.id)}
+                        >
+                          <img
+                            src={createMediaUrl(snapshot.thumbnailBaseUrl, asset.thumbnailRelativePath)}
+                            alt=""
+                            className="h-full w-full object-cover"
+                            loading="lazy"
+                          />
+                          {adopted && (
+                            <span className="absolute bottom-0 left-0 right-0 bg-background/90 py-0.5 text-center text-[9px] text-foreground">默认</span>
+                          )}
+                        </button>
+                        {!adopted && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="absolute right-1 top-1 inline-flex" tabIndex={writable ? undefined : 0}>
+                                <Button
+                                  type="button"
+                                  size="icon"
+                                  variant="secondary"
+                                  className="size-6 rounded-sm bg-background/90 shadow-sm"
+                                  aria-label={adopting ? '正在设为默认' : '设为默认'}
+                                  disabled={!writable || adoptingAssetId !== null}
+                                  onClick={() => onAdoptAsset(asset.id)}
+                                >
+                                  {adopting
+                                    ? <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />
+                                    : <Check className="size-3.5" aria-hidden="true" />}
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">
+                              {writable ? '设为默认' : '当前画布为只读状态'}
+                            </TooltipContent>
+                          </Tooltip>
                         )}
-                        aria-label={`预览第 ${job.attemptNumber} 次生成结果`}
-                        aria-pressed={selected}
-                        onClick={() => onPreviewAsset(asset.id)}
-                      >
-                        <img
-                          src={createMediaUrl(snapshot.thumbnailBaseUrl, asset.thumbnailRelativePath)}
-                          alt=""
-                          className="h-full w-full object-cover"
-                          loading="lazy"
-                        />
-                        {adopted && (
-                          <span className="absolute bottom-0 left-0 right-0 bg-background/90 py-0.5 text-center text-[9px] text-foreground">当前</span>
-                        )}
-                      </button>
-                    </li>
-                  )
-                })}
-              </ul>
+                      </li>
+                    )
+                  })}
+                </ul>
+              </TooltipProvider>
             ) : (
               <p className="text-xs text-muted-foreground">生成成功后会在这里保留版本</p>
             )}

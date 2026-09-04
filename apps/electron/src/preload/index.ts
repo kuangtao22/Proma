@@ -6,7 +6,7 @@
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, TERMINAL_IPC_CHANNELS, PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, TERMINAL_IPC_CHANNELS, PATH_MANAGEMENT_IPC_CHANNELS, SERVER_OPS_IPC_CHANNELS } from '@proma/shared'
 import { createLanBridgePreloadApi } from './lan-bridge-preload'
 import type { LanBridgePreloadApi } from './lan-bridge-preload'
 import { createDesignPreloadApi } from './design-preload'
@@ -180,6 +180,17 @@ import type {
   TerminalOutputAck,
   TerminalSnapshot,
   TerminalExitEvent,
+  ServerOpsHost,
+  ServerOpsUpsertHostInput,
+  ServerOpsConnectInput,
+  ServerOpsConfirmHostKeyInput,
+  ServerOpsConnectionState,
+  ServerOpsTerminalInput,
+  ServerOpsTerminalIdentity,
+  ServerOpsTerminalResizeInput,
+  ServerOpsTerminalOutputAck,
+  ServerOpsTerminalOutputEvent,
+  ServerOpsTerminalExitEvent,
 } from '@proma/shared'
 import type {
   UserProfile,
@@ -239,6 +250,21 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   onAgentTerminalClose: (callback: (event: AgentTerminalCloseEvent) => void) => () => void
   onTerminalOutput: (callback: (event: TerminalOutputEvent) => void) => () => void
   onTerminalExit: (callback: (event: TerminalExitEvent) => void) => () => void
+
+  // ===== Linux 服务器运维资产 =====
+  listServerOpsHosts: () => Promise<ServerOpsHost[]>
+  upsertServerOpsHost: (input: ServerOpsUpsertHostInput) => Promise<ServerOpsHost>
+  deleteServerOpsHost: (hostId: string) => Promise<boolean>
+  connectServerOpsHost: (input: ServerOpsConnectInput) => Promise<ServerOpsConnectionState>
+  confirmServerOpsHostKey: (input: ServerOpsConfirmHostKeyInput) => Promise<ServerOpsConnectionState>
+  disconnectServerOpsHost: (hostId: string) => Promise<ServerOpsConnectionState>
+  writeServerOpsTerminal: (input: ServerOpsTerminalInput) => Promise<void>
+  resizeServerOpsTerminal: (input: ServerOpsTerminalResizeInput) => Promise<void>
+  acknowledgeServerOpsTerminalOutput: (input: ServerOpsTerminalOutputAck) => Promise<void>
+  getServerOpsTerminalSnapshot: (input: ServerOpsTerminalIdentity) => Promise<ServerOpsTerminalOutputEvent | undefined>
+  onServerOpsConnectionState: (callback: (state: ServerOpsConnectionState) => void) => () => void
+  onServerOpsTerminalOutput: (callback: (event: ServerOpsTerminalOutputEvent) => void) => () => void
+  onServerOpsTerminalExit: (callback: (event: ServerOpsTerminalExitEvent) => void) => () => void
 
   /**
    * 获取指定目录的 Git 仓库状态
@@ -1412,6 +1438,34 @@ const electronAPI: ElectronAPI = {
     const listener = (_event: Electron.IpcRendererEvent, event: TerminalExitEvent): void => callback(event)
     ipcRenderer.on(TERMINAL_IPC_CHANNELS.EXIT, listener)
     return () => ipcRenderer.removeListener(TERMINAL_IPC_CHANNELS.EXIT, listener)
+  },
+  listServerOpsHosts: () => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.LIST_HOSTS),
+  upsertServerOpsHost: (input: ServerOpsUpsertHostInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.UPSERT_HOST, input),
+  deleteServerOpsHost: (hostId: string) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.DELETE_HOST, hostId),
+  connectServerOpsHost: (input: ServerOpsConnectInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.CONNECT, input),
+  confirmServerOpsHostKey: (input: ServerOpsConfirmHostKeyInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.CONFIRM_HOST_KEY, input),
+  disconnectServerOpsHost: (hostId: string) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.DISCONNECT, hostId),
+  writeServerOpsTerminal: (input: ServerOpsTerminalInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.WRITE_TERMINAL, input),
+  resizeServerOpsTerminal: (input: ServerOpsTerminalResizeInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.RESIZE_TERMINAL, input),
+  acknowledgeServerOpsTerminalOutput: (input: ServerOpsTerminalOutputAck) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.ACK_TERMINAL_OUTPUT, input),
+  getServerOpsTerminalSnapshot: (input: ServerOpsTerminalIdentity) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.TERMINAL_SNAPSHOT, input),
+  onServerOpsConnectionState: (callback: (state: ServerOpsConnectionState) => void) => {
+    /** 只把主进程公开状态转发给 Renderer。 */
+    const listener = (_event: Electron.IpcRendererEvent, state: ServerOpsConnectionState): void => callback(state)
+    ipcRenderer.on(SERVER_OPS_IPC_CHANNELS.CONNECTION_STATE, listener)
+    return () => ipcRenderer.removeListener(SERVER_OPS_IPC_CHANNELS.CONNECTION_STATE, listener)
+  },
+  onServerOpsTerminalOutput: (callback: (event: ServerOpsTerminalOutputEvent) => void) => {
+    /** 只把远程 PTY 的有序输出转发给 Renderer。 */
+    const listener = (_event: Electron.IpcRendererEvent, output: ServerOpsTerminalOutputEvent): void => callback(output)
+    ipcRenderer.on(SERVER_OPS_IPC_CHANNELS.TERMINAL_OUTPUT, listener)
+    return () => ipcRenderer.removeListener(SERVER_OPS_IPC_CHANNELS.TERMINAL_OUTPUT, listener)
+  },
+  onServerOpsTerminalExit: (callback: (event: ServerOpsTerminalExitEvent) => void) => {
+    /** 远程 PTY 退出事件不包含底层异常或秘密。 */
+    const listener = (_event: Electron.IpcRendererEvent, exit: ServerOpsTerminalExitEvent): void => callback(exit)
+    ipcRenderer.on(SERVER_OPS_IPC_CHANNELS.TERMINAL_EXIT, listener)
+    return () => ipcRenderer.removeListener(SERVER_OPS_IPC_CHANNELS.TERMINAL_EXIT, listener)
   },
 
   getGitRepoStatus: (dirPath: string, access?: import('@proma/shared').FileAccessOptions) => {

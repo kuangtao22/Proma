@@ -4,6 +4,25 @@
 @tailwind components;
 @tailwind utilities;
 
+/* 运维右栏按自身宽度收紧标题栏，不受主窗口断点影响。 */
+.server-ops-workspace-container {
+  container-type: inline-size;
+}
+
+@container (max-width: 430px) {
+  [data-server-ops-toolbar] [data-server-ops-connection-badge],
+  [data-server-ops-toolbar] [data-server-ops-connection-label] {
+    display: none;
+  }
+
+  [data-server-ops-toolbar] [data-server-ops-connection-action] {
+    width: 1.75rem;
+    gap: 0;
+    padding-right: 0;
+    padding-left: 0;
+  }
+}
+
 /* ===== 全局字体与渲染优化 =====
  * 优先 Inter Variable（自托管，见 main.tsx 引入） → SF Pro Text（macOS 系统） → system-ui；
  * 数字使用 tabular-nums，配合 cv11/ss01/ss03 让字形接近 Vercel / Linear 的现代感。
@@ -1543,6 +1562,18 @@
 
 [data-sticky-row="true"]:not(:has(~ * [data-sticky-row="true"])) {
   box-shadow: 0 2px 4px -1px hsl(var(--foreground) / 0.08);
+}
+
+/*
+ * Canvas 的 fixed 全屏层仍受祖先层叠上下文约束。展开时同步提升右栏宿主与
+ * SidePanel，避免 AppShell 边界线和右栏拖拽手柄穿透画布；收起后自动恢复原层级。
+ */
+.agent-right-panel-host:has([data-canvas-workspace-expanded="true"]) {
+  z-index: 90;
+}
+
+.agent-side-panel:has([data-canvas-workspace-expanded="true"]) {
+  z-index: 30;
 }
 
 /* ===== Office 内联预览 ===== */

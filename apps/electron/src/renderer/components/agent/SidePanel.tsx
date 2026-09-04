@@ -158,6 +158,7 @@ import {
 } from '@/components/design/CanvasWorkspaceAdapter'
 import { designAdapter } from '@/lib/design-adapter'
 import { removeCanvasSessionAtom, upsertCanvasSessionAtom } from '@/atoms/canvas-session-atoms'
+import { ServerOpsWorkspace } from '@/components/server-ops/ServerOpsWorkspace'
 import {
   CANVAS_WORKSPACE_FAILURE_MESSAGES,
   createCanvasDeleteLifecycle,
@@ -915,7 +916,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const activeExplorationBranch = activeExplorationSessionId
     ? sideTemporaryAgents.find((branch) => branch.sessionId === activeExplorationSessionId) ?? null
     : null
-  // Todo / 日程 / 能力 / 记忆的数据仍归属于 workspace，但右侧 Tab 仅属于当前 session。
+  // 项目能力与全局运维入口共用当前 session 的右侧 Tab 生命周期，业务数据保持各自归属。
   const [workspaceComponentTabs, setWorkspaceComponentTabs] = useAtom(agentSessionComponentTabsAtomFamily(sessionId))
   const productivityTools = useAtomValue(productivityToolsAtom)
   const automationFormOpen = useAtomValue(automationFormAtom).open
@@ -944,7 +945,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     // `temporary-agent` 是旧的单分支内存状态；新状态使用 exploration:<sessionId>。
     : activeTab === 'temporary-agent' || (activeExplorationSessionId !== null && !activeExplorationBranch) || (activeTab === 'delegation' && !selectedDelegationSession) || (activeTerminalId !== null && !terminalTabs.some((terminal) => terminal.terminalId === activeTerminalId))
       ? 'files'
-      : isWorkspaceComponentTab(activeTab) && (!workspaceSlug || !workspaceComponentTabs.includes(activeTab) || !isWorkspaceComponentEnabled(activeTab))
+      : isWorkspaceComponentTab(activeTab) && ((activeTab !== 'server-ops' && !workspaceSlug) || !workspaceComponentTabs.includes(activeTab) || !isWorkspaceComponentEnabled(activeTab))
         ? 'files'
         : activeTab
   const [splitMap, setSplitMap] = useAtom(agentSidePanelSplitMapAtom)
@@ -1743,6 +1744,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
         mcp: { label: 'MCP', icon: <ServerCog className="size-3.5" /> },
         memory: { label: '项目记忆', icon: <Brain className="size-3.5" /> },
         vault: { label: OBSIDIAN_NAME, icon: <ObsidianIcon className="size-3.5" /> },
+        'server-ops': { label: '运维', icon: <ServerCog className="size-3.5" /> },
       }
       return { id: component, ...meta[component], closable: true }
     }),
@@ -2158,6 +2160,8 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       )
     ) : paneTab === 'vault' ? (
       <div className="min-h-0 flex-1 overflow-hidden"><VaultView embedded sessionId={sessionId} /></div>
+    ) : paneTab === 'server-ops' ? (
+      <ServerOpsWorkspace />
     ) : paneTab === 'changes' ? (
       sessionPath ? (
         <DiffChangesList
@@ -2298,7 +2302,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   return (
     <div
       className={cn(
-        'relative z-0 h-full flex-shrink-0 overflow-hidden titlebar-drag-region bg-content-area',
+        'agent-side-panel relative z-0 h-full flex-shrink-0 overflow-hidden titlebar-drag-region bg-content-area',
         shouldAnimate && 'transition-[width] duration-300 ease-in-out',
         isOpen ? '' : '!w-0',
       )}

@@ -7,6 +7,7 @@ import {
   coalesceNativeCanvasMutationsForSave,
   createArrangeCanvasNodesMutation,
   createMoveCanvasNodesMutation,
+  createNativeCanvasNodeSizeMap,
   createNativeCanvasUserEdge,
   confirmNativeCanvasEdge,
   createViewportCanvasMutation,
@@ -14,6 +15,7 @@ import {
   findAvailableNativeCanvasNodePosition,
   findNativeCanvasGlobalAppendPosition,
   NATIVE_CANVAS_NODE_GAP,
+  NATIVE_CANVAS_NODE_HEADER_HEIGHT,
   NATIVE_CANVAS_NODE_HEIGHT,
   NATIVE_CANVAS_NODE_WIDTH,
   overlapsNativeCanvasNodes,
@@ -358,6 +360,71 @@ describe('原生 Canvas mutation', () => {
 
     expect(positions.get('image-1')!.x).toBeGreaterThan(positions.get('agent-1')!.x)
     expect(second).toEqual(first)
+  })
+
+  test('Given 同层图片卡片高度不同 When 整理布局 Then 使用当前投影尺寸避免卡片重叠', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [
+      {
+        id: 'image-a', kind: 'image', title: '竖图', imageModuleId: 'image-a',
+        adoptedAssetId: 'asset-a',
+        position: { x: 0, y: 0 },
+      },
+      {
+        id: 'image-b', kind: 'image', title: '横图', imageModuleId: 'image-b',
+        adoptedAssetId: 'asset-b',
+        position: { x: 800, y: 0 },
+      },
+    ]
+    /** Renderer 当前投影尺寸是整理布局必须消费的唯一视觉几何事实。 */
+    const nodeSizesById = createNativeCanvasNodeSizeMap(document, new Map([
+      ['asset-a', { assetId: 'asset-a', previewUrl: 'media://asset-a', width: 288, height: 320 }],
+      ['asset-b', { assetId: 'asset-b', previewUrl: 'media://asset-b', width: 288, height: 100 }],
+    ]))
+
+    const mutation = createArrangeCanvasNodesMutation(
+      document,
+      document.nodes.map((node) => node.id),
+      new Set(),
+      nodeSizesById,
+    )
+    const positions = new Map(mutation.positions.map((entry) => [entry.nodeId, entry.position]))
+
+    expect(positions.get('image-b')).toEqual({
+      x: 0,
+      y: NATIVE_CANVAS_NODE_HEADER_HEIGHT + 320 + NATIVE_CANVAS_NODE_GAP,
+    })
+  })
+
+  test('Given 整理范围外存在高卡片 When 整理布局 Then 使用固定卡片当前尺寸进行避让', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [
+      {
+        id: 'fixed-image', kind: 'image', title: '固定竖图', imageModuleId: 'fixed-image',
+        position: { x: 0, y: 0 },
+      },
+      {
+        id: 'moving-image', kind: 'image', title: '待整理图片', imageModuleId: 'moving-image',
+        position: { x: 0, y: 0 },
+      },
+    ]
+    /** 范围外障碍与待移动节点都必须按当前卡片尺寸参与碰撞检测。 */
+    const nodeSizesById = new Map([
+      ['fixed-image', { width: 288, height: 500 }],
+      ['moving-image', { width: 288, height: 220 }],
+    ])
+
+    const mutation = createArrangeCanvasNodesMutation(
+      document,
+      ['moving-image'],
+      new Set(),
+      nodeSizesById,
+    )
+
+    expect(mutation.positions).toEqual([{
+      nodeId: 'moving-image',
+      position: { x: 0, y: (220 + NATIVE_CANVAS_NODE_GAP) * 3 },
+    }])
   })
 
   test('Given 空画布 When 全局新增 Then 固定节点中心对齐真实画布世界中心', () => {

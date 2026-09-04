@@ -197,18 +197,15 @@ describe('Canvas 通用折叠节点卡片', () => {
     expect(html).toContain('已创建')
   })
 
-  test.each([
-    ['new-version', '有新版本'],
-    ['partial', '部分完成'],
-  ] as const)('Given 生图节点存在 %s 候选 When 折叠渲染 Then 正式缩略图不变并显示候选标记', (candidateState, label) => {
+  test('Given 生图节点展示正式采用版本 When 折叠渲染 Then 不暴露候选批次状态或入口', () => {
     const html = renderCard('image', {
       previewUrl: 'proma-file://thumbnail-token/adopted.webp',
-      candidateState,
     })
 
     expect(html).toContain('proma-file://thumbnail-token/adopted.webp')
-    expect(html).toContain(label)
-    expect(html).toContain('aria-label="查看图片候选详情"')
+    expect(html).not.toContain('有新版本')
+    expect(html).not.toContain('部分完成')
+    expect(html).not.toContain('aria-label="查看图片候选详情"')
   })
 
   test('Given 卡片输入 When 检查公开合同 Then 不接受内容加载函数', () => {

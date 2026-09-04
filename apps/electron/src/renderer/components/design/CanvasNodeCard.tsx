@@ -24,8 +24,6 @@ export interface CanvasNodeCardData {
   statusLabel: string
   /** Workspace 按节点 ID 聚合的瞬时活动状态。 */
   activityState?: CanvasNodeActivityState
-  /** 图片候选只显示验收标记，不替换正式缩略图。 */
-  candidateState?: 'new-version' | 'partial'
   summary: string
   /** 仅生图节点可携带的工作区授权缩略图 URL。 */
   previewUrl?: string
@@ -137,7 +135,6 @@ export function CanvasNodeCard({
   title,
   statusLabel,
   activityState = 'idle',
-  candidateState,
   summary,
   previewUrl,
   nodeHeight,
@@ -199,26 +196,6 @@ export function CanvasNodeCard({
               <Icon className="size-4" aria-hidden="true" />
             </span>
             <span className="min-w-0 flex-1 text-xs font-medium text-muted-foreground">{label}</span>
-            {kind === 'image' && candidateState ? (
-              <button
-                type="button"
-                aria-label="查看图片候选详情"
-                className={cn(
-                  'nodrag nopan shrink-0 rounded-sm border px-1.5 py-0.5 text-[10px] font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                  candidateState === 'partial'
-                    ? 'border-destructive/40 bg-destructive/10 text-destructive'
-                    : 'border-primary/40 bg-primary/10 text-primary',
-                )}
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={(event) => {
-                  event.stopPropagation()
-                  onOpenWorkbench?.(id)
-                }}
-                onDoubleClick={(event) => event.stopPropagation()}
-              >
-                {candidateState === 'partial' ? '部分完成' : '有新版本'}
-              </button>
-            ) : null}
             {toolbar}
             {onReferenceNode ? (
               <Popover>

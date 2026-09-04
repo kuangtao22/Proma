@@ -6,6 +6,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import {
   NativeCanvasEdgeRelationMenu,
   NativeCanvasGraph,
+  createNativeCanvasTransientGeometryStore,
+  resolveNativeCanvasWorkbenchNodeRect,
   reduceNativeCanvasViewportState,
 } from './NativeCanvasGraph'
 import type { NativeCanvasFlowProps } from './NativeCanvasGraph'
@@ -382,6 +384,44 @@ describe('原生 Canvas 大画布性能预算', () => {
     }])
   })
 
+  test('Given 工作台已展开 When 平移缩放或拖动节点 Then 瞬时几何立即更新且不提交文档 mutation', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: 'Agent',
+      agentSessionId: 'session-1', position: { x: 10, y: 20 },
+    }]
+    /** 独立瞬时 Store 用于观察真实 Flow 回调产生的逐帧位置。 */
+    const geometryStore = createNativeCanvasTransientGeometryStore(document)
+    /** mutation 数量证明逐帧更新没有进入文档持久化链路。 */
+    const mutations: CanvasMutation[] = []
+    let captured: NativeCanvasFlowProps | undefined
+    renderToStaticMarkup(
+      <NativeCanvasGraph
+        document={document}
+        writable
+        selectedNodeId="agent-1"
+        transientGeometryStore={geometryStore}
+        onMutation={(mutation) => mutations.push(mutation)}
+        onNodeSelect={() => {}}
+        onConversationNodeChange={() => {}}
+        flowRenderer={(props) => { captured = props; return <div /> }}
+      />,
+    )
+
+    captured!.onMove?.({} as never, { x: 100, y: 200, zoom: 2 })
+    expect(resolveNativeCanvasWorkbenchNodeRect(
+      document.nodes[0]!, geometryStore.getSnapshot(),
+    )).toEqual({ left: 120, right: 696, top: 240 })
+
+    captured!.onNodesChange?.([{
+      id: 'agent-1', type: 'position', position: { x: 30, y: 40 }, dragging: true,
+    }])
+    expect(resolveNativeCanvasWorkbenchNodeRect(
+      document.nodes[0]!, geometryStore.getSnapshot(),
+    )).toEqual({ left: 160, right: 736, top: 280 })
+    expect(mutations).toEqual([])
+  })
+
   test('Given 可写选择工具 When 用户拖线 Then 创建默认关联边且保留边删除禁用合同', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     document.nodes = [
@@ -518,6 +558,7 @@ describe('原生 Canvas 大画布性能预算', () => {
   test('Given 远端 viewport 在手势期间更新 When 手势结束 Then 不把旧 viewport 写回', () => {
     const initial = {
       viewport: { x: 0, y: 0, zoom: 1 }, gestureActive: false, deferredViewport: null,
+      documentViewport: { x: 0, y: 0, zoom: 1 },
     }
     const moving = reduceNativeCanvasViewportState(initial, { type: 'move-start' })
     const local = reduceNativeCanvasViewportState(moving, {
@@ -533,6 +574,31 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(recovered.viewport).toEqual({ x: 10, y: 20, zoom: 1.5 })
     expect(ended).toEqual({
       viewport: { x: 90, y: 80, zoom: 0.8 }, gestureActive: false, deferredViewport: null,
+      documentViewport: { x: 90, y: 80, zoom: 0.8 },
+    })
+  })
+
+  test('Given 手势中仅 graph revision 更新且权威 viewport 未变 When 手势结束 Then 提交用户最终 viewport', () => {
+    const initial = {
+      viewport: { x: 0, y: 0, zoom: 1 }, gestureActive: false, deferredViewport: null,
+      documentViewport: { x: 0, y: 0, zoom: 1 },
+    }
+    const moving = reduceNativeCanvasViewportState(initial, { type: 'move-start' })
+    const local = reduceNativeCanvasViewportState(moving, {
+      type: 'move', viewport: { x: 24, y: 36, zoom: 1.4 },
+    })
+    /** 图片采用等普通 graph 更新会生成新文档对象，但没有改变权威 viewport。 */
+    const graphUpdated = reduceNativeCanvasViewportState(local, {
+      type: 'document-sync', viewport: { x: 0, y: 0, zoom: 1 },
+    })
+    const ended = reduceNativeCanvasViewportState(graphUpdated, {
+      type: 'move-end', viewport: { x: 24, y: 36, zoom: 1.4 },
+    })
+
+    expect(graphUpdated.deferredViewport).toBeNull()
+    expect(ended).toEqual({
+      viewport: { x: 24, y: 36, zoom: 1.4 }, gestureActive: false, deferredViewport: null,
+      documentViewport: { x: 0, y: 0, zoom: 1 },
     })
   })
 

@@ -4,7 +4,7 @@
  * 负责注册主进程和渲染进程之间的通信处理器
  */
 
-import { ipcMain, nativeTheme, shell, dialog, BrowserWindow, app, clipboard, nativeImage } from 'electron'
+import { ipcMain, nativeTheme, shell, dialog, BrowserWindow, app, clipboard, nativeImage, safeStorage } from 'electron'
 import type { OpenDialogOptions, SaveDialogOptions, WebContents } from 'electron'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
@@ -415,6 +415,12 @@ import { isAgentSessionUserVisible, requireUserVisibleAgentSession } from './lib
 import { agentEventBus, prepareAgentRun, runAgent, runPreparedAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, listActiveAgentSessionSnapshots, listQueuedAgentMessages, reserveAgentSessionStart, listActiveCanvasAgentRuns, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerAgentMessageIpcHandlers } from './lib/agent-message-ipc'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
+import { registerServerOpsIpcHandlers } from './lib/server-ops/server-ops-ipc'
+import { ServerOpsHostStore } from './lib/server-ops/server-ops-host-store'
+import { ServerOpsCredentialStore } from './lib/server-ops/server-ops-credential-store'
+import { ServerOpsHostTrustStore } from './lib/server-ops/server-ops-host-trust-store'
+import { ServerOpsConnectionService, createServerOpsConnectionSystemDependencies } from './lib/server-ops/server-ops-connection-service'
+import { serverOpsRuntimeClient } from './lib/server-ops/server-ops-runtime-client'
 import {
   getDefaultWorkspaceProjectRelocator,
   listWorkspacePathStates,
@@ -2001,6 +2007,27 @@ export function registerIpcHandlers(): void {
     const contents = getStoredMainWindow()?.webContents
     return contents && !contents.isDestroyed() ? [contents] : []
   }
+  /** 全局服务器资产只初始化一次，并复用当前主窗口授权边界。 */
+  const serverOpsHostStore = new ServerOpsHostStore()
+  /** 运维凭据只通过 Electron safeStorage 加密，Linux basic_text 会 fail closed。 */
+  const serverOpsCredentialStore = new ServerOpsCredentialStore(undefined, { safeStorage })
+  /** endpoint Host Key 与显示主机资产分离持久化。 */
+  const serverOpsHostTrustStore = new ServerOpsHostTrustStore()
+  /** 真实 SSH 连接统一由独立 utility runtime 编排。 */
+  const serverOpsConnectionService = new ServerOpsConnectionService({
+    hosts: serverOpsHostStore,
+    credentials: serverOpsCredentialStore,
+    trust: serverOpsHostTrustStore,
+    runtime: serverOpsRuntimeClient,
+    ...createServerOpsConnectionSystemDependencies(),
+  })
+  registerServerOpsIpcHandlers({
+    ipc: ipcMain,
+    listAuthorizedWebContents: listAuthorizedDesignWebContents,
+    hosts: serverOpsHostStore,
+    connections: serverOpsConnectionService,
+    credentials: serverOpsCredentialStore,
+  })
   /** 图片任务直接更新 Canvas 节点后发布准确 revision，驱动折叠节点即时刷新。 */
   const publishCanvasImageGraphChange = (event: CanvasChangeEvent): void => {
     for (const contents of listAuthorizedDesignWebContents()) {

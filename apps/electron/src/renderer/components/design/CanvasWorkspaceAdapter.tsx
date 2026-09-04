@@ -33,7 +33,9 @@ import { CanvasWorkspaceSidebar } from './CanvasWorkspaceSidebar'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { detectIsMac, detectIsWindows } from '@/lib/platform'
 import { cn } from '@/lib/utils'
+import { getCanvasExpandedTitlebarHeight } from '@/lib/window-titlebar-layout'
 
 /** Agent 右侧工作区需要的 Canvas 动态标签描述。 */
 export interface CanvasWorkspaceTabDescriptor {
@@ -558,6 +560,12 @@ export function CanvasWorkspaceAdapter({
   const updateViewState = useSetAtom(updateAgentCanvasViewStateAtom)
   useAgentCanvasLegacyViewInitialization(sessionId, projectId, canvasId)
   const isExpanded = viewState?.isExpanded ?? false
+  /** 当前平台在 Canvas 展开态需要保留的系统标题栏高度。 */
+  const expandedTitlebarHeight = getCanvasExpandedTitlebarHeight(
+    isExpanded,
+    detectIsMac(),
+    detectIsWindows(),
+  )
   const [sidebarOpen, setSidebarOpen] = React.useState(false)
   const [editingTitle, setEditingTitle] = React.useState(false)
   const [titleDraft, setTitleDraft] = React.useState(session?.title ?? '')
@@ -770,7 +778,15 @@ export function CanvasWorkspaceAdapter({
       <div className={cn(
         'relative h-full min-h-0 overflow-hidden bg-content-area',
         isExpanded && 'fixed inset-0 z-[200]',
-      )}>
+      )} data-canvas-workspace-expanded={isExpanded} style={{ paddingTop: expandedTitlebarHeight }}>
+        {isExpanded ? (
+          <div
+            data-canvas-expanded-titlebar-spacer
+            aria-hidden="true"
+            className="titlebar-drag-region absolute inset-x-0 top-0"
+            style={{ height: expandedTitlebarHeight }}
+          />
+        ) : null}
         {workspace}
         <CanvasWorkspaceSidebar
           open={sidebarOpen}

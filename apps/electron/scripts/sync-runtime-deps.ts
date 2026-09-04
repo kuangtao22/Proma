@@ -51,7 +51,12 @@ export const EXTERNAL_RUNTIME_PACKAGES: readonly string[] = [
   'sharp',
   // 独立 Terminal utility process 通过 require 加载其 native PTY binding。
   'node-pty',
+  // 独立 Server Ops utility process 使用 ssh2 的纯 JavaScript crypto 路径。
+  'ssh2',
 ]
+
+/** ssh2 的性能型可选依赖含 native binding，跨平台打包统一走 JS fallback。 */
+const SKIPPED_OPTIONAL_RUNTIME_PACKAGES = new Set(['cpu-features', 'nan'])
 
 const appDir = resolve(import.meta.dir, '..')
 const repoRoot = resolve(appDir, '../..')
@@ -153,22 +158,29 @@ function copyPackage(
     dereference: true,
     force: true,
     preserveTimestamps: true,
+    // ssh2 安装脚本可能在包内编译可选 binding；正式包固定排除以保持三平台一致。
+    filter: (source) => packageName !== 'ssh2' || !source.endsWith('.node'),
   })
 
   const nextAncestors = new Set(sourceAncestors)
   nextAncestors.add(sourceDir)
   for (const dependency of listRuntimeDependencies(manifest)) {
-    copyDependency(ctx, dependency, sourceDir, targetDir, nextAncestors)
+    copyDependency(ctx, dependency, packageName, sourceDir, targetDir, nextAncestors)
   }
 }
 
 function copyDependency(
   ctx: SyncContext,
   dependency: RuntimeDependency,
+  parentPackageName: string,
   parentSourceDir: string,
   parentTargetDir: string,
   sourceAncestors: Set<string>,
 ): void {
+  if (parentPackageName === 'ssh2' && dependency.optional && SKIPPED_OPTIONAL_RUNTIME_PACKAGES.has(dependency.name)) {
+    ctx.skippedOptionalPackages.push(dependency.name)
+    return
+  }
   const sourceDir = resolvePackageSourceDir(ctx, dependency.name, parentSourceDir)
   if (!sourceDir) {
     if (dependency.optional) {
