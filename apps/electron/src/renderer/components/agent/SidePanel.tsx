@@ -154,10 +154,10 @@ import { removeCanvasSessionAtom, upsertCanvasSessionAtom } from '@/atoms/canvas
 import {
   CANVAS_WORKSPACE_FAILURE_MESSAGES,
   createCanvasDeleteLifecycle,
+  createCanvasWorkspaceEntryController,
   isCanvasWorkspaceTabStillCurrent,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
-  selectCanvasWorkspaceEntryTab,
   selectCanvasWorkspaceTabForPane,
   selectCanvasAfterArchive,
   setAgentDefaultCanvas,
@@ -1251,6 +1251,11 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const deleteLifecycleRef = React.useRef(createCanvasDeleteLifecycle())
   const [pendingDeleteCanvas, setPendingDeleteCanvas] = React.useState<PendingCanvasDelete | null>(null)
   const [deletingCanvas, setDeletingCanvas] = React.useState(false)
+  /** 按 Agent 与项目隔离首次打开单飞任务，切换宿主后不复用旧请求。 */
+  const canvasWorkspaceEntryController = React.useMemo(
+    () => createCanvasWorkspaceEntryController(),
+    [currentWorkspaceId, sessionId],
+  )
   React.useLayoutEffect(() => {
     deleteLifecycleRef.current.switchHost(sessionId, currentWorkspaceId)
     setPendingDeleteCanvas(null)
@@ -1339,6 +1344,27 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     })
     return result !== null
   }, [canvasRegistry.bindingReady, canvasRegistry.createAndOpen, reportCanvasActionError, showCanvasActionError])
+
+  /** 从顶部入口打开默认或首个未归档画布；空项目复用现有创建流程。 */
+  const handleOpenInitialCanvas = React.useCallback(async (
+    pane: RightWorkspacePane | null,
+  ): Promise<boolean> => {
+    if (!canvasRegistry.metadataReady || !canvasRegistry.bindingReady) return false
+    return canvasWorkspaceEntryController.open({
+      sessions: canvasRegistry.sessions,
+      defaultCanvasId: canvasRegistry.binding?.defaultCanvasId,
+      openCanvas: (canvas) => handleOpenCanvas(canvas, pane),
+      createCanvas: () => handleCreateCanvas(pane),
+    })
+  }, [
+    canvasRegistry.binding?.defaultCanvasId,
+    canvasRegistry.bindingReady,
+    canvasRegistry.metadataReady,
+    canvasRegistry.sessions,
+    canvasWorkspaceEntryController,
+    handleCreateCanvas,
+    handleOpenCanvas,
+  ])
 
   const handleRenameCanvas = React.useCallback(async (
     canvas: CanvasSessionMeta,
@@ -2203,8 +2229,8 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
               setIsOpen(true)
               handleWorkspaceTabChange('vault')
             } : undefined}
-            onOpenCanvas={() => handleCanvasWorkspaceTabChange(selectCanvasWorkspaceEntryTab(availableCanvasWorkspaceTabs), split?.focusedPane ?? null)}
-            openCanvasDisabled={!currentWorkspaceId || !canvasRegistry.bindingReady}
+            onOpenCanvas={() => void handleOpenInitialCanvas(split?.focusedPane ?? null)}
+            openCanvasDisabled={!currentWorkspaceId || !canvasRegistry.metadataReady || !canvasRegistry.bindingReady}
             visibleTabs={renderSplit && split ? { left: split.leftTab, right: split.rightTab } : undefined}
             focusedPane={renderSplit ? split?.focusedPane : undefined}
             onTabDragChange={handleTabDragChange}
