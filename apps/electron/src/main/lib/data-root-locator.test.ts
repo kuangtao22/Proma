@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { DataRootLocatorFile } from '@proma/shared'
@@ -110,6 +110,22 @@ describe('DataRootLocator', () => {
       status: 'ready',
       state: { activeRoot: customRoot, availability: 'available' },
     })
+  })
+
+  test('Given activeRoot 是目录链接 When 启动检查 Then 进入不可用状态而不是迟到崩溃', () => {
+    /** 精确模拟 Windows 用户用 junction 把默认 ~/.proma 重定向到其他磁盘。 */
+    const actualRoot = join(homeDir, 'actual-root')
+    const linkedRoot = join(homeDir, '.proma')
+    mkdirSync(actualRoot)
+    symlinkSync(actualRoot, linkedRoot, 'junction')
+    /** 定位器必须与安全原子写使用相同的 no-follow 目录语义。 */
+    const locator = new DataRootLocator({ homeDir })
+
+    expect(locator.inspect()).toMatchObject({
+      status: 'unavailable',
+      state: { activeRoot: linkedRoot, availability: 'unavailable' },
+    })
+    expect(() => locator.requireActiveRoot()).toThrow('数据根不可用')
   })
 
   test('Given a damaged primary locator and valid backup When inspecting Then it recovers from backup', () => {

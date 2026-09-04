@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test'
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -1192,6 +1192,41 @@ describe('路径管理 IPC', () => {
       readFileSync(join(relocatedRoot, PROMA_DATA_ROOT_MARKER_FILE), 'utf8'),
     )).toEqual({ owner: 'proma', version: 1 })
     expect(calls).toEqual(['relaunch', 'quit'])
+  })
+
+  test('Given recovery 选择目录链接 When 重新定位 Then 明确拒绝且不改写 locator', async () => {
+    /** 用目录 symlink 模拟 Windows junction，候选实际内容看起来是合法 Proma 根。 */
+    const homeDir = await mkdtemp(join(tmpdir(), 'proma-path-linked-recovery-'))
+    const offlineRoot = join(homeDir, 'offline-root')
+    const actualRoot = join(homeDir, 'actual-root')
+    const linkedRoot = join(homeDir, 'linked-root')
+    mkdirSync(actualRoot)
+    writeFileSync(join(actualRoot, 'settings.json'), '{"themeMode":"dark"}')
+    symlinkSync(actualRoot, linkedRoot, 'junction')
+    new DataRootLocator({ homeDir }).write({ version: 1, activeRoot: offlineRoot })
+    /** 捕获恢复 IPC，验证拒绝发生在写 marker 和 locator 之前。 */
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    const calls: string[] = []
+    registerPathManagementIpcHandlers({
+      mode: 'data-root-recovery',
+      homeDir,
+      ipc: {
+        handle: (channel, handler) => { handlers.set(channel, handler) },
+        removeHandler: () => undefined,
+      },
+      app: {
+        relaunch: () => { calls.push('relaunch') },
+        quit: () => { calls.push('quit') },
+      },
+      getExpectedWebContents: () => expectedWebContents,
+    })
+
+    const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
+    if (!handler) throw new Error('未注册数据根恢复通道')
+    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: linkedRoot }))
+      .toThrow('所选数据根必须是实际目录，不能是符号链接或目录联接')
+    expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({ activeRoot: offlineRoot })
+    expect(calls).toEqual([])
   })
 
   test('Given previousRoot 已恢复在线 When 切回旧备份 Then 验证目录后交换 activeRoot', async () => {

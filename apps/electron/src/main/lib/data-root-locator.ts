@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, mkdirSync, statSync } from 'node:fs'
+import { accessSync, constants, existsSync, lstatSync, mkdirSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 import { isDataRootLocatorFile } from '@proma/shared'
 import type {
@@ -411,14 +411,18 @@ export class DataRootLocator {
  * @returns 对应的共享可用性状态。
  */
 function inspectRootAvailability(root: string): PathManagementState['availability'] {
-  if (!existsSync(root)) {
-    return 'missing'
+  /** no-follow 判型必须与后续安全原子写一致，目录链接交给恢复模式处理。 */
+  let rootStat: ReturnType<typeof lstatSync>
+  try {
+    rootStat = lstatSync(root)
+  } catch (error) {
+    return error instanceof Error && 'code' in error && error.code === 'ENOENT'
+      ? 'missing'
+      : 'unavailable'
   }
+  if (!rootStat.isDirectory()) return 'unavailable'
 
   try {
-    if (!statSync(root).isDirectory()) {
-      return 'unavailable'
-    }
     accessSync(root, constants.R_OK | constants.W_OK | constants.X_OK)
     return 'available'
   } catch {

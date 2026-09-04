@@ -1,4 +1,4 @@
-import { accessSync, constants, statSync } from 'node:fs'
+import { accessSync, constants, lstatSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { isAbsolute, resolve } from 'node:path'
@@ -823,10 +823,16 @@ function isRecoverDataRootInput(input: unknown): input is RecoverDataRootInput {
 function assertAvailableDirectory(root: string): void {
   if (!isAbsolute(root)) throw new Error('数据根必须是绝对路径')
   try {
-    if (!statSync(root).isDirectory()) throw new Error('数据根必须是目录')
+    /** recovery 候选同样禁止跟随链接，避免通过后在 marker 安全写入阶段迟到失败。 */
+    if (!lstatSync(root).isDirectory()) {
+      throw new Error('所选数据根必须是实际目录，不能是符号链接或目录联接')
+    }
     accessSync(root, constants.R_OK | constants.W_OK | constants.X_OK)
   } catch (error) {
-    if (error instanceof Error && error.message === '数据根必须是目录') throw error
+    if (error instanceof Error
+      && error.message === '所选数据根必须是实际目录，不能是符号链接或目录联接') {
+      throw error
+    }
     throw new Error('所选数据根当前不可读写', { cause: error })
   }
 }
