@@ -216,6 +216,7 @@ import {
 } from './lib/design/canvas-document-ipc'
 import { createCanvasAgentBatchOperationService } from './lib/design/canvas-agent-batch-operation'
 import { createCanvasArtifactCreationService } from './lib/design/canvas-artifact-creation'
+import { createCanvasImportedImageService } from './lib/design/canvas-imported-image-service'
 import { createCanvasArtifactRevisionStore } from './lib/design/canvas-artifact-revision-store'
 import {
   createCanvasArtifactRegistry,
@@ -247,7 +248,10 @@ import {
   runChannelMutationWithImageModelBroadcast,
   updateToolCredentialsWithImageModelBroadcast,
 } from './lib/image-model-profile-broadcast'
-import { DesignSessionBridge } from './lib/design/design-session-bridge'
+import {
+  DesignSessionBridge,
+  openAuthorizedAgentImageSource,
+} from './lib/design/design-session-bridge'
 import { DesignExecutionSessionLifecycle } from './lib/design/design-execution-session-lifecycle'
 import {
   DesignJobManager,
@@ -2382,6 +2386,12 @@ export function registerIpcHandlers(): void {
       canvasImagePreferences.getSelection(projectId).selectedProfileId ?? null
     ),
   })
+  /** 已有图片复用 Design 素材 promotion 与 Canvas 产物事务，不创建第二套存储。 */
+  const canvasImportedImage = createCanvasImportedImageService({
+    assets: designAssetService,
+    design: designStore,
+    artifacts: canvasArtifactCreation,
+  })
   cleanupSuccessfulDesignTask = (projectId, sourceJobId) => {
     designJobManager.cleanupTaskAfterSuccessfulAssetDeletion(projectId, sourceJobId)
   }
@@ -2523,6 +2533,38 @@ export function registerIpcHandlers(): void {
     store: canvasDocumentStore,
     batch: canvasAgentBatchOperation,
     artifacts: canvasArtifactCreation,
+    importImage: async (input) => {
+      /** 每次工具调用 fresh-read 会话和工作区，撤权后不得沿用旧 cwd。 */
+      const session = getAgentSessionMeta(input.source.sessionId)
+      if (!session || session.workspaceId !== input.projectId) {
+        throw new Error('CANVAS_PROJECT_ACCESS_DENIED')
+      }
+      const workspace = getAgentWorkspace(input.projectId)
+      const agentCwd = resolveAgentCwd(
+        workspace,
+        session.id,
+        session.agentCwdMode,
+        session.activeWorktree,
+      )
+      if (!workspace || !agentCwd) throw new Error('CANVAS_PROJECT_ACCESS_DENIED')
+      /** 路径授权与普通文件工具一致，并额外允许当前会话附件目录。 */
+      const authorizedSource = openAuthorizedAgentImageSource({
+        inputPath: input.localPath,
+        baseDir: agentCwd,
+        allowedRoots: [
+          ...getAuthorizedRoots({ sessionId: session.id }),
+          getConversationAttachmentsDir(session.id),
+        ],
+      })
+      try {
+        /** localPath 只参与授权，不进入素材或画布持久化合同。 */
+        const { localPath, ...canvasInput } = input
+        void localPath
+        return await canvasImportedImage.import({ ...canvasInput, authorizedSource })
+      } finally {
+        authorizedSource.close()
+      }
+    },
     textArtifacts: canvasTextArtifactService,
     artifactRegistry: canvasArtifactRegistry,
     pickArtifactExportPath: async (sender, input) => {

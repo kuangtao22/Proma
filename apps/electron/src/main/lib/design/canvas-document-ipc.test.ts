@@ -451,6 +451,25 @@ function createContext(options: {
           sourceToolCallId: input.source.toolCallId,
         }
       },
+      createAgent: async (input) => {
+        artifactCalls.push({ type: 'create-agent', value: structuredClone(input) })
+        return {
+          canvasId: input.canvasId,
+          nodeId: 'agent-node-1',
+          revision: 5,
+          sourceToolCallId: input.source.toolCallId,
+        }
+      },
+    },
+    importImage: async (input) => {
+      artifactCalls.push({ type: 'import-image', value: structuredClone(input) })
+      return {
+        canvasId: input.canvasId,
+        nodeId: 'imported-image-node-1',
+        revision: 5,
+        artifactType: 'image',
+        sourceToolCallId: input.source.toolCallId,
+      }
     },
     textArtifacts: textArtifactAdapter,
     artifactRegistry: {
@@ -2565,6 +2584,54 @@ describe('原生 Canvas 文档 IPC', () => {
     })
   })
 
+  test('Given Canvas Agent 存在直接输入节点 When SEND Then 注入固定画布工具与权威上游引用', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-1', kind: 'agent', title: '视频导演 Agent', position: { x: 320, y: 0 },
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+    }, {
+      id: 'brief-1', kind: 'document', title: '视频生产合同', position: { x: 0, y: 0 },
+      documentId: 'content-1', contentRevision: 2,
+    }]
+    document.edges = [{
+      id: 'edge-1', sourceNodeId: 'brief-1', sourcePort: 'output',
+      targetNodeId: 'node-1', targetPort: 'input', relation: 'depends-on',
+    }]
+    const context = createContext({
+      loadResult: { document, writable: true, nodeIssues: [] },
+      enableToolProviderRuntime: true,
+    })
+    try {
+      await invoke(context.handlers, CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, context.sender, {
+        projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+        message: '开始创建下游产物', userMessageUuid: 'message-1', startedAt: 10,
+      })
+
+      const runCall = context.agentCalls.find((call) => call.type === 'run')
+      const runValue = runCall?.value as {
+        extensions?: {
+          allowedToolNames?: string[]
+          piCustomTools?: Array<{ name: string }>
+          systemPromptAppend?: string
+        }
+      } | undefined
+      const allowedToolNames = runValue?.extensions?.allowedToolNames ?? []
+      const customToolNames = runValue?.extensions?.piCustomTools?.map((tool) => tool.name) ?? []
+      expect(allowedToolNames).toContain('canvas_create_artifact')
+      expect(allowedToolNames).toContain('canvas_apply_changes')
+      expect(allowedToolNames).toContain('canvas_import_image')
+      expect(allowedToolNames).not.toContain('canvas_manage')
+      expect(allowedToolNames).not.toContain('canvas_create_agent')
+      expect(customToolNames).toContain('canvas_read')
+      expect(customToolNames).not.toContain('canvas_manage')
+      expect(customToolNames).not.toContain('canvas_create_agent')
+      expect(runValue?.extensions?.systemPromptAppend).toContain('brief-1')
+      expect(runValue?.extensions?.systemPromptAppend).toContain('直接创建或更新当前画布的下游产物')
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
   test('Given Canvas Agent 已在运行 When SEND 预留启动槽失败 Then 只返回稳定公开 busy 结果', async () => {
     const document = createDocument(4)
     document.nodes = [{
@@ -3333,7 +3400,26 @@ describe('原生 Canvas 文档 IPC', () => {
           artifactType: input.artifactType,
           sourceToolCallId: input.source.toolCallId,
         }),
+        createAgent: async (input: {
+          canvasId: string
+          source: { toolCallId: string }
+        }) => ({
+          canvasId: input.canvasId,
+          nodeId: 'agent-node',
+          revision,
+          sourceToolCallId: input.source.toolCallId,
+        }),
       },
+      importImage: async (input: {
+        canvasId: string
+        source: { toolCallId: string }
+      }) => ({
+        canvasId: input.canvasId,
+        nodeId: 'imported-image-node',
+        revision,
+        artifactType: 'image' as const,
+        sourceToolCallId: input.source.toolCallId,
+      }),
       textArtifacts: {
         read: async (input: import('@proma/shared').CanvasTextArtifactTarget) => ({
           target: input,
@@ -3554,6 +3640,45 @@ describe('原生 Canvas 文档 IPC', () => {
         canvasId: 'canvas-1',
         source: { sessionId: 'agent-session-1', runStartedAt: 99, toolCallId: 'tool-artifact-1' },
       })])
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
+  test('Given 生产 Canvas Tool Provider runtime When 普通 Agent 创建分工并导入参考图 Then 调用真实窄服务', async () => {
+    const context = createContext({ enableToolProviderRuntime: true })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      const run = runtime.createRun({
+        projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      })
+      const createAgentTool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_create_agent')
+      const importImageTool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_import_image')
+      if (!createAgentTool || !importImageTool) throw new Error('Canvas 分工或图片导入工具未注册')
+
+      await createAgentTool.execute('tool-agent-1', {
+        canvasId: 'canvas-1', baseRevision: 4, title: '分镜 Agent',
+      } as never, undefined as never, undefined as never, undefined as never)
+      await importImageTool.execute('tool-import-1', {
+        canvasId: 'canvas-1', baseRevision: 4, title: '角色三视图', localPath: 'reference.png',
+      } as never, undefined as never, undefined as never, undefined as never)
+
+      expect(context.artifactCalls).toContainEqual({
+        type: 'create-agent',
+        value: expect.objectContaining({
+          projectId: 'project-1', canvasId: 'canvas-1',
+          source: { sessionId: 'agent-session-1', runStartedAt: 99, toolCallId: 'tool-agent-1' },
+        }),
+      })
+      expect(context.artifactCalls).toContainEqual({
+        type: 'import-image',
+        value: expect.objectContaining({
+          projectId: 'project-1', canvasId: 'canvas-1', localPath: 'reference.png',
+          source: { sessionId: 'agent-session-1', runStartedAt: 99, toolCallId: 'tool-import-1' },
+        }),
+      })
     } finally {
       context.registration.dispose()
     }

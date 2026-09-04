@@ -17,7 +17,66 @@ function createAgent(): AgentSessionMeta {
   }
 }
 
+/** 创建完整归属于固定 Canvas 节点的内部 Agent。 */
+function createCanvasAgent(): AgentSessionMeta {
+  return {
+    id: 'canvas-agent-1', title: '分镜 Agent', workspaceId: 'project-1', archived: false,
+    sourceCanvasProjectId: 'project-1', sourceCanvasId: 'canvas-1', sourceCanvasNodeId: 'node-1',
+    createdAt: 1, updatedAt: 2,
+  }
+}
+
 describe('Canvas Tool 唯一授权 facade', () => {
+  test('Given Canvas Agent 拥有完整节点归属 When 访问工具 facade Then 仅可读写自身画布且不能管理关联', () => {
+    const session: CanvasSessionMeta = {
+      id: 'canvas-1', projectId: 'project-1', title: '画布', archived: false,
+      createdAt: 1, updatedAt: 1,
+    }
+    let guardCalls = 0
+    const canvasAgentContext = {
+      projectId: 'project-1', sessionId: 'canvas-agent-1', runStartedAt: 10,
+      explicitReferences: [], permissionCeiling: 'execute' as const,
+      canvasAgentTarget: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1' },
+    }
+    const facade = createCanvasToolAccessFacade({
+      getAgentSession: () => createCanvasAgent(),
+      assertProjectAuthorized: () => undefined,
+      getProjectReadOnlyReason: () => undefined,
+      runProjectMutation: (_projectId, effect) => { guardCalls += 1; return effect() },
+      sessions: {
+        list: () => [session],
+        requireNative: (_projectId, canvasId) => {
+          if (canvasId !== session.id) throw new Error('CANVAS_NOT_FOUND')
+          return session
+        },
+        createWithIdOnce: () => { throw new Error('STORE_MUST_NOT_WRITE') },
+      },
+      bindings: {
+        get: () => { throw new Error('CANVAS_AGENT_MUST_NOT_READ_BINDINGS') },
+        linkWithChange: () => { throw new Error('STORE_MUST_NOT_WRITE') },
+        unlinkWithChange: () => { throw new Error('STORE_MUST_NOT_WRITE') },
+        setDefaultWithChange: () => { throw new Error('STORE_MUST_NOT_WRITE') },
+      },
+      loadCanvas: (target) => ({ document: createEmptyCanvasDocument(target.projectId, target.canvasId, 1), writable: true, nodeIssues: [] }),
+      broadcastSession: () => undefined,
+      broadcastBinding: () => undefined,
+    })
+
+    expect(facade.getBinding(canvasAgentContext)).toEqual({
+      projectId: 'project-1', sessionId: 'canvas-agent-1', linkedCanvasIds: ['canvas-1'],
+      defaultCanvasId: 'canvas-1', lastActiveCanvasId: 'canvas-1', updatedAt: 2,
+    })
+    expect(facade.requireLinkedCanvas(canvasAgentContext, 'canvas-1')).toMatchObject({
+      linkedCanvasIds: ['canvas-1'],
+    })
+    expect(() => facade.requireLinkedCanvas(canvasAgentContext, 'canvas-2')).toThrow('CANVAS_ACCESS_DENIED')
+    expect(facade.runWrite(canvasAgentContext, () => 'written')).toBe('written')
+    expect(guardCalls).toBe(1)
+    expect(() => facade.createAndLink(canvasAgentContext, {
+      canvasId: 'canvas-2', makeDefault: true,
+    })).toThrow('CANVAS_AGENT_CANVAS_SCOPE_FIXED')
+  })
+
   test('Given 项目只读或 Agent 撤权 When 读写 facade Then 读保持可用且写与撤权均在 Store 前拒绝', () => {
     const session: CanvasSessionMeta = {
       id: 'canvas-1', projectId: 'project-1', title: '画布', archived: false,

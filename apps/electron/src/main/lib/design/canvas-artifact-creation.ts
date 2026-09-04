@@ -34,8 +34,20 @@ export interface CanvasArtifactCreationInput extends CanvasTarget {
   artifactType: CanvasArtifactType
   title: string
   content: string
+  /** 仅主进程已验证的图片导入服务可提供；普通 Agent 工具不接收素材 ID。 */
+  adoptedAssetId?: string
   /** WebView 可由 Agent 显式选择设备；缺省网页，图片产物忽略该字段。 */
   devicePreset?: CanvasWebviewDevicePreset
+  position?: DesignPoint
+  sourceNodeId?: string
+  relation?: CanvasEdgeRelation
+  source: CanvasChangeSource
+}
+
+/** 普通 Agent 显式创建独立 Canvas Agent 节点的可信输入。 */
+export interface CanvasAgentArtifactCreationInput extends CanvasTarget {
+  baseRevision: number
+  title: string
   position?: DesignPoint
   sourceNodeId?: string
   relation?: CanvasEdgeRelation
@@ -48,6 +60,14 @@ export interface CanvasArtifactCreationResult {
   nodeId: string
   revision: number
   artifactType: CanvasArtifactType
+  sourceToolCallId: string
+}
+
+/** Agent 节点创建只返回图事实，不向模型暴露内部会话身份。 */
+export interface CanvasAgentArtifactCreationResult {
+  canvasId: string
+  nodeId: string
+  revision: number
   sourceToolCallId: string
 }
 
@@ -66,6 +86,7 @@ export interface CanvasArtifactCreationDependencies {
 /** 原子产物创建服务的公开窄接口。 */
 export interface CanvasArtifactCreationService {
   create: (input: CanvasArtifactCreationInput) => Promise<CanvasArtifactCreationResult>
+  createAgent: (input: CanvasAgentArtifactCreationInput) => Promise<CanvasAgentArtifactCreationResult>
 }
 
 /** 自动创建节点之间保留的最小净间距。 */
@@ -95,11 +116,12 @@ function createRetryToolCallId(toolCallId: string): string {
 }
 
 /** 从工具调用和目标身份派生稳定资源 ID，重放不会产生重复节点。 */
-function createArtifactIdentity(input: CanvasArtifactCreationInput): {
+function createArtifactIdentity(input: Pick<CanvasArtifactCreationInput, 'projectId' | 'canvasId' | 'source'>): {
   nodeId: string
   contentId: string
   edgeId: string
   rollbackId: string
+  agentSessionId: string
 } {
   /** 长度前缀阻止字段拼接产生边界碰撞。 */
   const identity = [
@@ -111,11 +133,14 @@ function createArtifactIdentity(input: CanvasArtifactCreationInput): {
   ].map((value) => `${value.length}:${value}`).join('|')
   /** 单次哈希同时派生同一事务的图与内容资源。 */
   const digest = createHash('sha256').update(identity).digest('hex')
+  /** 独立 Agent session 必须符合 UUID v4 形状，且同一工具调用重放保持稳定。 */
+  const agentSessionId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`
   return {
     nodeId: `artifact-${digest}`,
     contentId: `artifact-content-${digest}`,
     edgeId: `artifact-edge-${digest}`,
     rollbackId: `artifact-rollback-${digest}`,
+    agentSessionId,
   }
 }
 
@@ -236,6 +261,9 @@ function createArtifactOperations(
   document: CanvasDocument,
   identity: ReturnType<typeof createArtifactIdentity>,
 ): CanvasMutation[] {
+  if (input.adoptedAssetId && input.artifactType !== 'image') {
+    throw new Error('CANVAS_ARTIFACT_ADOPTED_ASSET_UNEXPECTED')
+  }
   if (input.sourceNodeId && !input.relation) throw new Error('CANVAS_ARTIFACT_RELATION_REQUIRED')
   if (!input.sourceNodeId && input.relation) throw new Error('CANVAS_ARTIFACT_RELATION_UNEXPECTED')
   if (document.revision !== input.baseRevision) throw new Error('CANVAS_REVISION_CONFLICT')
@@ -272,6 +300,7 @@ function createArtifactOperations(
         title: input.title,
         position,
         imageModuleId: identity.contentId,
+        ...(input.adoptedAssetId ? { adoptedAssetId: input.adoptedAssetId } : {}),
       }
   /** 节点提交和可选连线保持在同一个 batch。 */
   const operations: CanvasMutation[] = [{ type: 'upsert-nodes', nodes: [node] }]
@@ -285,6 +314,49 @@ function createArtifactOperations(
         id: identity.edgeId,
         sourceNodeId: input.sourceNodeId,
         targetNodeId: identity.nodeId,
+        relation: input.relation!,
+      })],
+    })
+  }
+  return operations
+}
+
+/** 根据权威图构造独立 Agent 节点和可选输入关系。 */
+function createAgentOperations(
+  input: CanvasAgentArtifactCreationInput,
+  document: CanvasDocument,
+  identity: ReturnType<typeof createArtifactIdentity>,
+): CanvasMutation[] {
+  if (input.sourceNodeId && !input.relation) throw new Error('CANVAS_ARTIFACT_RELATION_REQUIRED')
+  if (!input.sourceNodeId && input.relation) throw new Error('CANVAS_ARTIFACT_RELATION_UNEXPECTED')
+  if (document.revision !== input.baseRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+  if (document.nodes.some((node) => node.id === identity.nodeId)) {
+    throw new Error('CANVAS_ARTIFACT_NODE_IDENTITY_CONFLICT')
+  }
+  /** Agent 折叠卡片使用标准尺寸，由 Host 计算紧凑安全位置。 */
+  const position = resolveArtifactPosition(
+    document,
+    input.position,
+    input.sourceNodeId,
+    ARTIFACT_DEFAULT_SIZE,
+  )
+  const node: CanvasNode = {
+    id: identity.nodeId,
+    kind: 'agent',
+    title: input.title,
+    position,
+    agentSessionId: identity.agentSessionId,
+  }
+  const operations: CanvasMutation[] = [{ type: 'upsert-nodes', nodes: [node] }]
+  if (input.sourceNodeId) {
+    const sourceNode = document.nodes.find((candidate) => candidate.id === input.sourceNodeId)
+    if (!sourceNode) throw new Error('CANVAS_ARTIFACT_SOURCE_NODE_NOT_FOUND')
+    operations.push({
+      type: 'upsert-edges',
+      edges: [createCanvasBoundEdge(sourceNode, node, {
+        id: identity.edgeId,
+        sourceNodeId: sourceNode.id,
+        targetNodeId: node.id,
         relation: input.relation!,
       })],
     })
@@ -332,6 +404,7 @@ export function createCanvasArtifactCreationService(
             contentId: identity.contentId,
             content: input.content,
             selectedModelProfileId: dependencies.resolveDefaultImageModelProfileId?.(input.projectId) ?? null,
+            ...(input.adoptedAssetId ? { adoptedAssetId: input.adoptedAssetId } : {}),
           }
         : { kind: input.artifactType, contentId: identity.contentId, content: input.content }
       await dependencies.content.prepareArtifactContent(target, preparedInput)
@@ -392,6 +465,51 @@ export function createCanvasArtifactCreationService(
           { kind: preparedInput.kind, contentId: preparedInput.contentId },
           identity.rollbackId,
         )
+        throw error
+      }
+    },
+    createAgent: async (input) => {
+      const target: CanvasTarget = { projectId: input.projectId, canvasId: input.canvasId }
+      const identity = createArtifactIdentity(input)
+      /** 同一工具调用只允许一次权威重读重试，节点和会话身份始终不变。 */
+      const execute = async (baseRevision: number, sourceToolCallId: string): Promise<CanvasAgentArtifactCreationResult> => {
+        const document = dependencies.documents.load(target).document
+        const operations = createAgentOperations({ ...input, baseRevision }, document, identity)
+        const result = await dependencies.batch.execute(parseCanvasBatchOperationEnvelope({
+          ...target,
+          baseRevision,
+          operations,
+          sourceSessionId: input.source.sessionId,
+          sourceRunStartedAt: input.source.runStartedAt,
+          sourceToolCallId,
+        }))
+        return {
+          canvasId: input.canvasId,
+          nodeId: identity.nodeId,
+          revision: result.document.revision,
+          sourceToolCallId,
+        }
+      }
+      try {
+        try {
+          return await execute(input.baseRevision, input.source.toolCallId)
+        } catch (error) {
+          if (!isRevisionConflict(error)) throw error
+          const revision = dependencies.documents.load(target).document.revision
+          return await execute(revision, createRetryToolCallId(input.source.toolCallId))
+        }
+      } catch (error) {
+        /** 批处理可能已提交但返回不确定；只接受完全匹配的权威节点。 */
+        const authoritative = dependencies.documents.load(target).document
+        const existing = authoritative.nodes.find((node) => node.id === identity.nodeId)
+        if (existing?.kind === 'agent' && existing.agentSessionId === identity.agentSessionId) {
+          return {
+            canvasId: input.canvasId,
+            nodeId: identity.nodeId,
+            revision: authoritative.revision,
+            sourceToolCallId: input.source.toolCallId,
+          }
+        }
         throw error
       }
     },

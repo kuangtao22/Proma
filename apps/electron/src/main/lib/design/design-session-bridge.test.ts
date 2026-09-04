@@ -21,7 +21,7 @@ import type {
 } from '@proma/shared'
 import sharp from 'sharp'
 import type { DesignAssetImportBatch, DesignAuthorizedImageSource } from './design-asset-service'
-import { DesignSessionBridge } from './design-session-bridge'
+import { DesignSessionBridge, openAuthorizedAgentImageSource } from './design-session-bridge'
 import { applyDesignMutations } from './design-store'
 
 describe('Design Session Bridge', () => {
@@ -275,6 +275,46 @@ describe('Design Session Bridge', () => {
       position: { x: 0, y: 0 },
     })).rejects.toThrow('图片不能超过 64 MiB')
     expect(importedPaths).toEqual([])
+  })
+
+  test('Given 当前会话授权根与相对图片路径 When 打开稳定来源 Then 返回真实路径并读取同一文件身份', () => {
+    const imagePath = join(root, 'project-reference.png')
+    writeFileSync(imagePath, pngBytes)
+
+    const source = openAuthorizedAgentImageSource({
+      inputPath: 'project-reference.png',
+      baseDir: root,
+      allowedRoots: [root],
+    })
+    try {
+      expect(source.sourcePath).toBe(realpathSync(imagePath))
+      expect(source.readBytes()).toEqual(pngBytes)
+    } finally {
+      source.close()
+    }
+  })
+
+  test('Given 越界路径或符号链接叶子 When 打开稳定来源 Then 在返回素材句柄前拒绝', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'proma-canvas-import-outside-'))
+    try {
+      const outsideImage = join(outside, 'outside.png')
+      const linkedImage = join(root, 'linked.png')
+      writeFileSync(outsideImage, pngBytes)
+      symlinkSync(outsideImage, linkedImage)
+
+      expect(() => openAuthorizedAgentImageSource({
+        inputPath: outsideImage,
+        baseDir: root,
+        allowedRoots: [root],
+      })).toThrow('图片不在指定 Agent 会话的授权目录内')
+      expect(() => openAuthorizedAgentImageSource({
+        inputPath: linkedImage,
+        baseDir: root,
+        allowedRoots: [root],
+      })).toThrow('Agent 图片不能是符号链接')
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
   })
 })
 

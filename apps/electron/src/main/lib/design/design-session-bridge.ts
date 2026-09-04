@@ -45,6 +45,13 @@ interface DesignSessionBridgeStore extends Pick<
 /** 与 Design Asset Service 保持一致的单图片读取上限。 */
 const MAX_AGENT_IMAGE_BYTES = 64 * 1024 * 1024
 
+/** 打开已授权 Agent 图片时所需的可信路径边界。 */
+export interface OpenAuthorizedAgentImageSourceInput {
+  inputPath: string
+  baseDir: string
+  allowedRoots: string[]
+}
+
 /** Design 与 Agent 会话双向传递所需的可信主进程依赖。 */
 export interface DesignSessionBridgeDependencies {
   getSession: (sessionId: string) => AgentSessionMeta | undefined
@@ -85,6 +92,65 @@ function readStableAgentImage(descriptor: number, expected: { dev: number; ino: 
     throw new Error('Agent 图片读取期间已变化')
   }
   return bytes
+}
+
+/** 在授权根内打开稳定图片句柄，供会话桥与 Canvas Agent 工具共同使用。 */
+export function openAuthorizedAgentImageSource(
+  input: OpenAuthorizedAgentImageSourceInput,
+): DesignAuthorizedImageSource {
+  /** 相对路径只允许相对本次 Agent 的可信工作目录解释。 */
+  const requestedPath = resolve(input.baseDir, input.inputPath)
+  /** 明确拒绝叶子符号链接，避免平台缺少 O_NOFOLLOW 时语义降级。 */
+  const requestedStat = lstatSync(requestedPath)
+  if (requestedStat.isSymbolicLink()) throw new Error('Agent 图片不能是符号链接')
+  /** 无法 canonicalize 的授权根不参与授权判断。 */
+  const allowedRoots = input.allowedRoots.flatMap((root) => {
+    try {
+      return [realpathSync(resolve(root))]
+    } catch {
+      return []
+    }
+  })
+  let descriptor: number | undefined
+  try {
+    /** 稳定 fd 保证授权完成后，即使路径被置换，读取的仍是同一个 inode。 */
+    descriptor = openSync(requestedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    const openedStat = fstatSync(descriptor)
+    if (!openedStat.isFile()) throw new Error('Agent 图片不是普通文件')
+    if (openedStat.size > MAX_AGENT_IMAGE_BYTES) throw new Error('图片不能超过 64 MiB')
+    /** 真实路径与 fd 必须指向同一文件，并且真实路径必须处于授权根内。 */
+    const imagePath = realpathSync(requestedPath)
+    const pathStat = lstatSync(imagePath)
+    if (!pathStat.isFile()
+      || pathStat.isSymbolicLink()
+      || pathStat.dev !== openedStat.dev
+      || pathStat.ino !== openedStat.ino
+      || pathStat.size !== openedStat.size) {
+      throw new Error('Agent 图片授权校验期间已变化')
+    }
+    if (!allowedRoots.some((root) => isPathWithinRoot(imagePath, root))) {
+      throw new Error('图片不在指定 Agent 会话的授权目录内')
+    }
+    let closed = false
+    /** 返回的来源只暴露稳定读取与幂等关闭能力，不暴露原始 fd。 */
+    const authorizedSource: DesignAuthorizedImageSource = {
+      sourcePath: imagePath,
+      byteSize: openedStat.size,
+      readBytes: () => {
+        if (closed || descriptor === undefined) throw new Error('Agent 图片稳定句柄已关闭')
+        return readStableAgentImage(descriptor, openedStat)
+      },
+      close: () => {
+        if (closed || descriptor === undefined) return
+        closed = true
+        closeSync(descriptor)
+      },
+    }
+    return authorizedSource
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor)
+    throw error
+  }
 }
 
 /** 从指定会话持久化消息中寻找精确 localPath 的图片归属证据。 */
@@ -181,53 +247,19 @@ export class DesignSessionBridge {
     if (!ownedImage) throw new Error('图片不属于指定 Agent 会话')
     /** 项目必须在任何素材 staging 前处于稳定权威状态。 */
     const currentDocument = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
-    const requestedPath = resolve(this.dependencies.resolveAgentImagePath(input.localPath))
-    /** 先 canonicalize 授权根；之后用稳定 fd 的身份反向证明打开对象属于其中。 */
-    const allowedRoots = this.dependencies.getAllowedRoots(session, input.projectId).flatMap((root) => {
-      try {
-        return [realpathSync(resolve(root))]
-      } catch {
-        return []
-      }
-    })
-    let descriptor: number | undefined
-    let descriptorHandedOff = false
+    /** 会话附件解析器仍决定路径语义，公共 helper 只负责文件系统授权。 */
+    const requestedPath = this.dependencies.resolveAgentImagePath(input.localPath)
+    let authorizedSource: DesignAuthorizedImageSource | undefined
+    let sourceHandedOff = false
     /** 只有本次调用创建的 promotion 批次允许在失败路径回滚。 */
     let importBatch: DesignAssetImportBatch | undefined
     try {
-      /** O_NOFOLLOW 拒绝叶子链接；fd 一旦建立，后续祖先或叶子置换不会改变读取对象。 */
-      descriptor = openSync(requestedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-      const openedStat = fstatSync(descriptor)
-      if (!openedStat.isFile()) throw new Error('Agent 图片不是普通文件')
-      if (openedStat.size > MAX_AGENT_IMAGE_BYTES) throw new Error('图片不能超过 64 MiB')
-      /** 打开后重新解析当前路径，并以 dev/ino 证明 canonical 路径与稳定 fd 是同一文件。 */
-      const imagePath = realpathSync(requestedPath)
-      const pathStat = lstatSync(imagePath)
-      if (!pathStat.isFile()
-        || pathStat.isSymbolicLink()
-        || pathStat.dev !== openedStat.dev
-        || pathStat.ino !== openedStat.ino
-        || pathStat.size !== openedStat.size) {
-        throw new Error('Agent 图片授权校验期间已变化')
-      }
-      if (!allowedRoots.some((root) => isPathWithinRoot(imagePath, root))) {
-        throw new Error('图片不在指定 Agent 会话的授权目录内')
-      }
-      let closed = false
-      const authorizedSource: DesignAuthorizedImageSource = {
-        sourcePath: imagePath,
-        byteSize: openedStat.size,
-        readBytes: () => {
-          if (closed || descriptor === undefined) throw new Error('Agent 图片稳定句柄已关闭')
-          return readStableAgentImage(descriptor, openedStat)
-        },
-        close: () => {
-          if (closed || descriptor === undefined) return
-          closed = true
-          closeSync(descriptor)
-        },
-      }
-      descriptorHandedOff = true
+      authorizedSource = openAuthorizedAgentImageSource({
+        inputPath: requestedPath,
+        baseDir: process.cwd(),
+        allowedRoots: this.dependencies.getAllowedRoots(session, input.projectId),
+      })
+      sourceHandedOff = true
       importBatch = await this.dependencies.assets.importAuthorizedImageSources(
         input.projectId,
         [authorizedSource],
@@ -253,7 +285,7 @@ export class DesignSessionBridge {
       importBatch?.rollback()
       throw error
     } finally {
-      if (!descriptorHandedOff && descriptor !== undefined) closeSync(descriptor)
+      if (!sourceHandedOff) authorizedSource?.close()
     }
   }
 

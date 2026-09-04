@@ -47,6 +47,8 @@ export interface PrepareCanvasArtifactContentInput {
   contentId: string
   content: string
   selectedModelProfileId?: string | null
+  /** 仅可信图片导入流程可在 revision 0 固化正式素材身份。 */
+  adoptedAssetId?: string
 }
 
 /** Store 内部统一的内容准备种子，兼容 legacy 迁移与新产物初始化。 */
@@ -1125,7 +1127,10 @@ export function createCanvasNodeContentStore(
       contentId: requireContentId(input.contentId, 'contentId'),
       initialContent: input.content,
       ...(input.kind === 'image'
-        ? { selectedModelProfileId: input.selectedModelProfileId ?? null }
+        ? {
+            selectedModelProfileId: input.selectedModelProfileId ?? null,
+            ...(input.adoptedAssetId ? { adoptedAssetId: input.adoptedAssetId } : {}),
+          }
         : {}),
     }),
     prepareMigratedContent: prepareContent,

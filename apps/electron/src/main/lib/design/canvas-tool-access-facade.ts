@@ -7,7 +7,7 @@ import type {
   CanvasTarget,
   CanvasWorkspaceSnapshot,
 } from '@proma/shared'
-import { isEligibleProjectAgent } from '../agent-session-visibility'
+import { hasValidCanvasAgentOwnership, isEligibleProjectAgent } from '../agent-session-visibility'
 import type { AgentCanvasBindingMutationResult } from './agent-canvas-binding-store'
 import {
   createCanvasNodeReferenceResolver,
@@ -71,20 +71,58 @@ export interface CanvasToolAccessFacadeDependencies {
   broadcastBinding: (event: AgentCanvasBindingChangeEvent) => void
 }
 
-/** 要求当前会话仍是目标项目的普通顶层 Agent，并复核项目授权。 */
+/** 已通过 fresh session 校验的画布工具访问身份。 */
+interface AuthorizedCanvasToolAgent {
+  session: AgentSessionMeta
+  fixedCanvasId?: string
+}
+
+/** 要求当前会话仍是目标项目普通 Agent，或精确归属于本节点的 Canvas Agent。 */
 function requireAuthorizedAgent(
   dependencies: CanvasToolAccessFacadeDependencies,
   context: CanvasToolRunContext,
-): AgentSessionMeta {
+): AuthorizedCanvasToolAgent {
   /** 每次执行都 fresh-read，撤权或身份漂移立即 fail closed。 */
   const session = dependencies.getAgentSession(context.sessionId)
-  if (!session
-    || session.workspaceId !== context.projectId
-    || !isEligibleProjectAgent(session, context.projectId)) {
+  if (!session || session.workspaceId !== context.projectId) {
     throw new Error('CANVAS_AGENT_ACCESS_DENIED')
   }
+  const fixedTarget = context.canvasAgentTarget
+  if (fixedTarget) {
+    if (!hasValidCanvasAgentOwnership(session)
+      || fixedTarget.projectId !== context.projectId
+      || session.sourceCanvasProjectId !== fixedTarget.projectId
+      || session.sourceCanvasId !== fixedTarget.canvasId
+      || session.sourceCanvasNodeId !== fixedTarget.nodeId) {
+      throw new Error('CANVAS_AGENT_ACCESS_DENIED')
+    }
+    dependencies.assertProjectAuthorized(context.projectId)
+    return { session, fixedCanvasId: fixedTarget.canvasId }
+  }
+  if (!isEligibleProjectAgent(session, context.projectId)) throw new Error('CANVAS_AGENT_ACCESS_DENIED')
   dependencies.assertProjectAuthorized(context.projectId)
-  return session
+  return { session }
+}
+
+/** 为固定 Canvas Agent 构造只存在于本轮内存的单画布授权投影。 */
+function createFixedCanvasBinding(
+  context: CanvasToolRunContext,
+  agent: AuthorizedCanvasToolAgent,
+): AgentCanvasBinding | null {
+  if (!agent.fixedCanvasId) return null
+  return {
+    projectId: context.projectId,
+    sessionId: context.sessionId,
+    linkedCanvasIds: [agent.fixedCanvasId],
+    defaultCanvasId: agent.fixedCanvasId,
+    lastActiveCanvasId: agent.fixedCanvasId,
+    updatedAt: agent.session.updatedAt,
+  }
+}
+
+/** Canvas Agent 的画布身份由节点归属固定，禁止进入普通关联管理写路径。 */
+function requireCanvasManagementAccess(context: CanvasToolRunContext): void {
+  if (context.canvasAgentTarget) throw new Error('CANVAS_AGENT_CANVAS_SCOPE_FIXED')
 }
 
 /** 创建复用生产唯一 Store、守卫、序列化器和广播边界的 Canvas 工具 facade。 */
@@ -139,72 +177,92 @@ export function createCanvasToolAccessFacade(
     referenceResolver,
     authorizeRead: (context) => { requireAuthorizedAgent(dependencies, context) },
     getBinding: (context) => {
-      requireAuthorizedAgent(dependencies, context)
+      const agent = requireAuthorizedAgent(dependencies, context)
+      const fixedBinding = createFixedCanvasBinding(context, agent)
+      if (fixedBinding) return fixedBinding
       return dependencies.bindings.get(context.projectId, context.sessionId)
     },
     requireLinkedCanvas: (context, canvasId) => {
-      requireAuthorizedAgent(dependencies, context)
+      const agent = requireAuthorizedAgent(dependencies, context)
+      const fixedBinding = createFixedCanvasBinding(context, agent)
+      if (fixedBinding) {
+        if (canvasId !== agent.fixedCanvasId) throw new Error('CANVAS_ACCESS_DENIED')
+        dependencies.sessions.requireNative(context.projectId, canvasId)
+        return fixedBinding
+      }
       const binding = dependencies.bindings.get(context.projectId, context.sessionId)
       if (!binding?.linkedCanvasIds.includes(canvasId)) throw new Error('CANVAS_ACCESS_DENIED')
       dependencies.sessions.requireNative(context.projectId, canvasId)
       return binding
     },
     runWrite,
-    createAndLink: (context, input) => runWrite(context, () => {
-      const created = dependencies.sessions.createWithIdOnce({
-        projectId: context.projectId,
-        canvasId: input.canvasId,
-        ...(input.title === undefined ? {} : { title: input.title }),
-      })
-      if (created.created) {
-        dependencies.broadcastSession({
+    createAndLink: (context, input) => {
+      requireCanvasManagementAccess(context)
+      return runWrite(context, () => {
+        const created = dependencies.sessions.createWithIdOnce({
           projectId: context.projectId,
-          canvasId: created.session.id,
-          cause: 'created',
+          canvasId: input.canvasId,
+          ...(input.title === undefined ? {} : { title: input.title }),
         })
-      }
-      const mutation = dependencies.bindings.linkWithChange({
-        projectId: context.projectId,
-        sessionId: context.sessionId,
-        canvasId: created.session.id,
-        makeDefault: input.makeDefault,
+        if (created.created) {
+          dependencies.broadcastSession({
+            projectId: context.projectId,
+            canvasId: created.session.id,
+            cause: 'created',
+          })
+        }
+        const mutation = dependencies.bindings.linkWithChange({
+          projectId: context.projectId,
+          sessionId: context.sessionId,
+          canvasId: created.session.id,
+          makeDefault: input.makeDefault,
+        })
+        publishBinding(context, 'linked', mutation)
+        if (!mutation.after) throw new Error('CANVAS_BINDING_CREATE_FAILED')
+        return { session: created.session, binding: mutation.after }
       })
-      publishBinding(context, 'linked', mutation)
-      if (!mutation.after) throw new Error('CANVAS_BINDING_CREATE_FAILED')
-      return { session: created.session, binding: mutation.after }
-    }),
-    link: (context, canvasId, makeDefault) => runWrite(context, () => {
-      dependencies.sessions.requireNative(context.projectId, canvasId)
-      const mutation = dependencies.bindings.linkWithChange({
-        projectId: context.projectId,
-        sessionId: context.sessionId,
-        canvasId,
-        makeDefault,
+    },
+    link: (context, canvasId, makeDefault) => {
+      requireCanvasManagementAccess(context)
+      return runWrite(context, () => {
+        dependencies.sessions.requireNative(context.projectId, canvasId)
+        const mutation = dependencies.bindings.linkWithChange({
+          projectId: context.projectId,
+          sessionId: context.sessionId,
+          canvasId,
+          makeDefault,
+        })
+        publishBinding(context, 'linked', mutation)
+        if (!mutation.after) throw new Error('CANVAS_BINDING_CREATE_FAILED')
+        return mutation.after
       })
-      publishBinding(context, 'linked', mutation)
-      if (!mutation.after) throw new Error('CANVAS_BINDING_CREATE_FAILED')
-      return mutation.after
-    }),
-    unlink: (context, canvasId) => runWrite(context, () => {
-      dependencies.sessions.requireNative(context.projectId, canvasId)
-      const mutation = dependencies.bindings.unlinkWithChange({
-        projectId: context.projectId,
-        sessionId: context.sessionId,
-        canvasId,
+    },
+    unlink: (context, canvasId) => {
+      requireCanvasManagementAccess(context)
+      return runWrite(context, () => {
+        dependencies.sessions.requireNative(context.projectId, canvasId)
+        const mutation = dependencies.bindings.unlinkWithChange({
+          projectId: context.projectId,
+          sessionId: context.sessionId,
+          canvasId,
+        })
+        publishBinding(context, 'unlinked', mutation)
+        return mutation.after
       })
-      publishBinding(context, 'unlinked', mutation)
-      return mutation.after
-    }),
-    setDefault: (context, canvasId) => runWrite(context, () => {
-      dependencies.sessions.requireNative(context.projectId, canvasId)
-      const mutation = dependencies.bindings.setDefaultWithChange({
-        projectId: context.projectId,
-        sessionId: context.sessionId,
-        canvasId,
+    },
+    setDefault: (context, canvasId) => {
+      requireCanvasManagementAccess(context)
+      return runWrite(context, () => {
+        dependencies.sessions.requireNative(context.projectId, canvasId)
+        const mutation = dependencies.bindings.setDefaultWithChange({
+          projectId: context.projectId,
+          sessionId: context.sessionId,
+          canvasId,
+        })
+        publishBinding(context, 'default-changed', mutation)
+        if (!mutation.after) throw new Error('CANVAS_BINDING_NOT_FOUND')
+        return mutation.after
       })
-      publishBinding(context, 'default-changed', mutation)
-      if (!mutation.after) throw new Error('CANVAS_BINDING_NOT_FOUND')
-      return mutation.after
-    }),
+    },
   }
 }

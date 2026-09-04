@@ -19,7 +19,7 @@ test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数�
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.2"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.4"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
@@ -37,6 +37,8 @@ test('Given 多产物画布任务 When 读取 canvas-production Then 定义节�
     'canvas_inspect_images',
     'canvas_read',
     'canvas_apply_changes',
+    'canvas_create_agent',
+    'canvas_import_image',
     'canvas_create_artifact',
     'canvas_update_artifact',
     'canvas_run_nodes',
@@ -51,6 +53,8 @@ test('Given 多产物画布任务 When 读取 canvas-production Then 定义节�
   expect(skill).toContain('局部更新')
   expect(skill).toContain('普通创建不要主动提供 `position`')
   expect(skill).toContain('由 Proma 根据来源关系和真实节点尺寸紧凑排布')
+  expect(skill).toContain('先建立并验证新链路')
+  expect(skill).toContain('再删除旧节点')
 })
 
 test('Given 用户只要求核对全部图片 When 读取 canvas-production Then 先枚举再看当前采用缩略图且保持只读', () => {
@@ -76,4 +80,23 @@ test('Given Canvas Skill 负责语义编排 When 校验执行边界 Then 权限�
   expect(skill).toContain('单次审批')
   expect(skill).toContain('候选已生成')
   expect(skill).toContain('不得描述为已经正式替换')
+})
+
+test('Given 当前会话位于 Canvas Agent 节点 When 执行生产任务 Then 读取直接输入并由自身创建下游产物', () => {
+  const skill = readCanvasProductionSkill()
+
+  expect(skill).toContain('当前会话位于 Canvas Agent 节点')
+  expect(skill).toContain('直接输入节点')
+  expect(skill).toContain('由当前 Canvas Agent 直接创建或更新下游产物')
+  expect(skill).toContain('不得把普通 Agent、协作会话或当前会话伪装绑定为 Canvas Agent 节点')
+  expect(skill).toContain('不得要求用户在主会话与 Canvas Agent 之间反复复制任务')
+  expect(skill).toContain('普通 Agent 自行调用 `canvas_create_agent`')
+})
+
+test('Given Agent 已有授权本地参考图 When 读取 canvas-production Then 使用导入工具并立即设为正式采用版本', () => {
+  const skill = readCanvasProductionSkill()
+
+  expect(skill).toContain('使用 `canvas_import_image`')
+  expect(skill).toContain('立即成为该图片节点的正式采用版本')
+  expect(skill).toContain('不得要求用户拖入或上传到原生 Canvas')
 })

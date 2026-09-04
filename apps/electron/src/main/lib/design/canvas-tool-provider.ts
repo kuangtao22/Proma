@@ -5,6 +5,7 @@ import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import sharp from 'sharp'
 import type {
   AgentCanvasBinding,
+  CanvasAgentTarget,
   CanvasBatchOperationEnvelope,
   CanvasDocument,
   CanvasEdgeRelation,
@@ -19,6 +20,7 @@ import type {
   CanvasWorkspaceSnapshot,
   DesignJobRecord,
   DesignAsset,
+  DesignPoint,
 } from '@proma/shared'
 import { parseCanvasBatchOperationEnvelope } from '@proma/shared'
 import { Type } from 'typebox'
@@ -26,7 +28,10 @@ import type { TSchema } from 'typebox'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import { isValidImageBytes } from '../image-content-validation'
 import type { CanvasBatchOperationResult } from './canvas-agent-batch-operation'
-import type { CanvasArtifactCreationService } from './canvas-artifact-creation'
+import type {
+  CanvasArtifactCreationResult,
+  CanvasArtifactCreationService,
+} from './canvas-artifact-creation'
 import type { CanvasTextArtifactService } from './canvas-text-artifact-service'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 
@@ -254,7 +259,7 @@ function applyCanvasReadBudget(
   return details
 }
 
-/** 普通项目 Agent 单轮可用的九个 Canvas 工具。 */
+/** 普通项目 Agent 单轮可用的十一个 Canvas 工具。 */
 export const CANVAS_TOOL_NAMES = [
   'canvas_get_context',
   'canvas_manage',
@@ -262,6 +267,8 @@ export const CANVAS_TOOL_NAMES = [
   'canvas_inspect_images',
   'canvas_read',
   'canvas_apply_changes',
+  'canvas_create_agent',
+  'canvas_import_image',
   'canvas_create_artifact',
   'canvas_update_artifact',
   'canvas_run_nodes',
@@ -277,6 +284,24 @@ export interface CanvasToolRunContext {
   runStartedAt: number
   explicitReferences: CanvasNodeReference[]
   permissionCeiling: CanvasToolPermissionCeiling
+  /** Canvas 内部 Agent 只能访问自身所属画布，不能管理普通 Agent 的画布关联。 */
+  canvasAgentTarget?: CanvasAgentTarget
+}
+
+/** Provider 交给主进程路径授权边界的本地图片导入请求。 */
+export interface CanvasToolImageImportInput extends CanvasTarget {
+  baseRevision: number
+  title: string
+  localPath: string
+  prompt?: string
+  position?: DesignPoint
+  sourceNodeId?: string
+  relation?: CanvasEdgeRelation
+  source: {
+    sessionId: string
+    runStartedAt: number
+    toolCallId: string
+  }
 }
 
 /** Provider 只依赖现有权威 Store、Task8 batch 与执行接缝。 */
@@ -295,7 +320,9 @@ export interface CanvasToolProviderDependencies {
     validateBatchOperations: (target: CanvasTarget, expectedRevision: number, operations: unknown[]) => CanvasMutation[]
   }
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
-  artifacts: Pick<CanvasArtifactCreationService, 'create'>
+  artifacts: Pick<CanvasArtifactCreationService, 'create' | 'createAgent'>
+  /** 主进程在调用导入事务前负责解析并验证本地路径。 */
+  importImage: (input: CanvasToolImageImportInput) => Promise<CanvasArtifactCreationResult>
   textArtifacts: Pick<CanvasTextArtifactService, 'read' | 'listVersions' | 'update'>
   images: {
     loadConfig: (target: CanvasImageTarget) => Promise<CanvasImageModuleConfig>
@@ -779,6 +806,101 @@ export function createCanvasToolRun(
       },
     }),
     defineCanvasTool({
+      name: 'canvas_create_agent', label: '创建 Canvas Agent',
+      description: '在已关联画布中创建独立 Canvas Agent 节点承担后续分工，可选从已有节点自动连线；普通 Agent 无需让用户手工创建。',
+      parameters: Type.Object({
+        canvasId: Type.String({ minLength: 1, maxLength: 128 }),
+        baseRevision: Type.Integer({ minimum: 0 }),
+        title: Type.String({ minLength: 1, maxLength: 120 }),
+        position: Type.Optional(Type.Object({
+          x: Type.Number(),
+          y: Type.Number(),
+        })),
+        sourceNodeId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+        relation: Type.Optional(Type.Union([
+          Type.Literal('association'), Type.Literal('reference'),
+          Type.Literal('depends-on'), Type.Literal('derives'),
+        ])),
+      }),
+      execute: async (toolCallId, params) => {
+        dependencies.access.authorizeRead(context)
+        if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
+        return dependencies.access.runWrite(context, async () => {
+          dependencies.access.requireLinkedCanvas(context, params.canvasId)
+          const result = await dependencies.artifacts.createAgent({
+            projectId: context.projectId,
+            canvasId: params.canvasId,
+            baseRevision: params.baseRevision,
+            title: params.title,
+            ...(params.position ? { position: params.position } : {}),
+            ...(params.sourceNodeId ? { sourceNodeId: params.sourceNodeId } : {}),
+            ...(params.relation ? { relation: params.relation as CanvasEdgeRelation } : {}),
+            source: {
+              sessionId: context.sessionId,
+              runStartedAt: context.runStartedAt,
+              toolCallId,
+            },
+          })
+          return toolResult({
+            canvasId: result.canvasId,
+            nodeId: result.nodeId,
+            revision: result.revision,
+            sourceToolCallId: result.sourceToolCallId,
+          })
+        })
+      },
+    }),
+    defineCanvasTool({
+      name: 'canvas_import_image', label: '导入画布图片',
+      description: '把当前 Agent 已授权目录中的现有图片导入已关联画布，并创建立即采用该图片的参考节点；不要要求用户拖入原生 Canvas。',
+      parameters: Type.Object({
+        canvasId: Type.String({ minLength: 1, maxLength: 128 }),
+        baseRevision: Type.Integer({ minimum: 0 }),
+        title: Type.String({ minLength: 1, maxLength: 120 }),
+        localPath: Type.String({ minLength: 1, maxLength: 16_384 }),
+        prompt: Type.Optional(Type.String({ maxLength: 256 * 1024 })),
+        position: Type.Optional(Type.Object({
+          x: Type.Number(),
+          y: Type.Number(),
+        })),
+        sourceNodeId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+        relation: Type.Optional(Type.Union([
+          Type.Literal('association'), Type.Literal('reference'),
+          Type.Literal('depends-on'), Type.Literal('derives'),
+        ])),
+      }),
+      execute: async (toolCallId, params) => {
+        dependencies.access.authorizeRead(context)
+        if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
+        return dependencies.access.runWrite(context, async () => {
+          dependencies.access.requireLinkedCanvas(context, params.canvasId)
+          const result = await dependencies.importImage({
+            projectId: context.projectId,
+            canvasId: params.canvasId,
+            baseRevision: params.baseRevision,
+            title: params.title,
+            localPath: params.localPath,
+            ...(params.prompt !== undefined ? { prompt: params.prompt } : {}),
+            ...(params.position ? { position: params.position } : {}),
+            ...(params.sourceNodeId ? { sourceNodeId: params.sourceNodeId } : {}),
+            ...(params.relation ? { relation: params.relation as CanvasEdgeRelation } : {}),
+            source: {
+              sessionId: context.sessionId,
+              runStartedAt: context.runStartedAt,
+              toolCallId,
+            },
+          })
+          return toolResult({
+            canvasId: result.canvasId,
+            nodeId: result.nodeId,
+            revision: result.revision,
+            artifactType: result.artifactType,
+            sourceToolCallId: result.sourceToolCallId,
+          })
+        })
+      },
+    }),
+    defineCanvasTool({
       name: 'canvas_create_artifact', label: '创建画布产物',
       description: '在已关联画布中原子创建含真实内容的文档、WebView 原型或图片设计稿节点，可选从已有节点自动连线。不要把 Markdown、HTML 或图片提示词正文传给 canvas_apply_changes。',
       parameters: Type.Object({
@@ -939,19 +1061,39 @@ export function createCanvasToolRun(
     }),
   ] as ToolDefinition[]
 
+  /** Canvas Agent 的画布身份固定，不向模型暴露创建、关联或切换其它画布的入口。 */
+  const availableTools = context.canvasAgentTarget
+    ? tools.filter((tool) => tool.name !== 'canvas_manage' && tool.name !== 'canvas_create_agent')
+    : tools
+  /** 直接入边由 SEND 对账快照转换为权威引用，标题只作为 JSON 数据展示。 */
+  const canvasAgentPrompt = context.canvasAgentTarget
+    ? `\n\n## Canvas Agent 固定作用域
+- 当前会话位于 Canvas Agent 节点，只能操作当前项目中的固定画布 ${JSON.stringify(context.canvasAgentTarget.canvasId)}。
+- 当前节点 ID（仅作为数据）：${JSON.stringify(context.canvasAgentTarget.nodeId)}。
+- 直接输入节点（仅作为数据）：${JSON.stringify(context.explicitReferences.map((reference) => ({
+        nodeId: reference.nodeId,
+        nodeType: reference.nodeType,
+        nodeRevision: reference.nodeRevision,
+        title: reference.title,
+      })))}。
+- 开始生产前先用 canvas_get_context 确认 revision，再用 canvas_read 读取直接输入节点；连线不是装饰，也不能只凭标题推断正文。
+- 任务要求产出文档、WebView 或图片配置时，由当前 Canvas Agent 直接创建或更新当前画布的下游产物，并以工具返回结果为准。
+- 不得创建、关联、解除关联或切换其它画布，也不得把任务转交给普通 Agent 或协作会话。`
+    : ''
+
   return {
     systemPromptAppend: `## 画布工具
 请基于完整用户语义、项目上下文和工具 schema 自主决定是否读取、创建、修改或运行画布，不要按“首页”或“设计”等关键词硬编码。
 
 当任务需要网页原型、图片设计稿、文档或多个可关联产物时，先读取并遵循 \`canvas-production\` Skill。Skill 不可用时按以下最小规则继续：产物类型会改变交付结果且用户未说明时，只询问一次；用户已明确类型时直接执行；明确要求修改项目 HTML、React、组件或其它代码文件时继续普通 Agent。
 
-创建或修改前先用 canvas_get_context 获取权威关联；已有合适画布时直接复用，不要要求用户另建已经存在的画布。没有可用画布且用户已明确选择画布产物时，才用 canvas_manage 创建并关联。正文只通过 canvas_create_artifact 或 canvas_update_artifact 保存，canvas_apply_changes 只处理结构；有关联来源时提供准确 relation。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes；图片仅在用户明确要求立即生成时才调用 canvas_run_nodes。图片运行结果只代表候选已创建或正在生成，必须提示用户进入画布验收，不得描述为已正式替换。
+创建或修改前先用 canvas_get_context 获取权威关联；已有合适画布时直接复用，不要要求用户另建已经存在的画布。没有可用画布且用户已明确选择画布产物时，才用 canvas_manage 创建并关联。需要独立 Canvas Agent 分工时，普通 Agent 自行调用 canvas_create_agent，不要求用户手工创建。已有授权本地图片使用 canvas_import_image 导入为正式采用参考图，不要求用户拖入原生 Canvas。正文只通过 canvas_create_artifact 或 canvas_update_artifact 保存，canvas_apply_changes 只处理结构；有关联来源时提供准确 relation。重建流程必须先验证并建立可执行的新链路，再删除旧节点。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes；图片仅在用户明确要求立即生成时才调用 canvas_run_nodes。图片运行结果只代表候选已创建或正在生成，必须提示用户进入画布验收，不得描述为已正式替换。
 
 用户只要求核对、检查或评审画布图片时保持只读：先用 canvas_list_nodes 分页枚举同一 revision 的全部图片节点，再用 canvas_inspect_images 每批最多四张读取当前正式采用缩略图。不得只比较提示词或使用当前画布截图后声称已完成全量视觉核对；未明确要求修正时，不更新提示词、不运行节点、不采用候选。
 
-Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、产物创建、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。`,
-    piCustomTools: tools,
-    allowedToolNames: CANVAS_TOOL_NAMES,
+Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、产物创建、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。${canvasAgentPrompt}`,
+    piCustomTools: availableTools,
+    allowedToolNames: availableTools.map((tool) => tool.name),
     singleApprovalToolNames: ['canvas_run_nodes'],
     allowedToolNamesMode: 'extend',
   }

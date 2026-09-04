@@ -41,6 +41,10 @@ function createFixture(options: {
   const runInputs: string[][] = []
   const runToolCallIds: string[] = []
   const artifactInputs: Array<Record<string, unknown>> = []
+  /** Canvas Agent 节点创建调用记录。 */
+  const agentArtifactInputs: Array<Record<string, unknown>> = []
+  /** 已授权本地图片导入调用记录。 */
+  const importedImageInputs: Array<Record<string, unknown>> = []
   /** 文本产物更新调用记录。 */
   const textUpdateInputs: Array<Record<string, unknown>> = []
   /** 图片配置保存调用记录。 */
@@ -132,6 +136,25 @@ function createFixture(options: {
           sourceToolCallId: input.source.toolCallId,
         }
       },
+      createAgent: async (input) => {
+        agentArtifactInputs.push(structuredClone(input) as unknown as Record<string, unknown>)
+        return {
+          canvasId: input.canvasId,
+          nodeId: 'agent-created',
+          revision: 4,
+          sourceToolCallId: input.source.toolCallId,
+        }
+      },
+    },
+    importImage: async (input) => {
+      importedImageInputs.push(structuredClone(input) as unknown as Record<string, unknown>)
+      return {
+        canvasId: input.canvasId,
+        nodeId: 'image-imported',
+        revision: 4,
+        artifactType: 'image' as const,
+        sourceToolCallId: input.source.toolCallId,
+      }
     },
     textArtifacts: {
       read: async (input) => ({
@@ -234,6 +257,7 @@ function createFixture(options: {
   }
   return {
     dependencies, context, batchInputs, runInputs, runToolCallIds, artifactInputs,
+    agentArtifactInputs, importedImageInputs,
     textUpdateInputs, imageSaveInputs,
     getListCalls: () => listCalls,
     getThumbnailReadCalls: () => thumbnailReadCalls,
@@ -243,7 +267,7 @@ function createFixture(options: {
 }
 
 describe('普通 Agent Canvas Tool Provider', () => {
-  test('Given 普通分析运行 When 获取上下文 Then 注入九工具、Canvas Skill 路由与硬边界且不扫描全部画布', async () => {
+  test('Given 普通分析运行 When 获取上下文 Then 注入十一工具、Canvas Skill 路由与硬边界且不扫描全部画布', async () => {
     const fixture = createFixture()
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
     expect(run.piCustomTools.map((tool) => tool.name)).toEqual([
@@ -253,6 +277,8 @@ describe('普通 Agent Canvas Tool Provider', () => {
       'canvas_inspect_images',
       'canvas_read',
       'canvas_apply_changes',
+      'canvas_create_agent',
+      'canvas_import_image',
       'canvas_create_artifact',
       'canvas_update_artifact',
       'canvas_run_nodes',
@@ -589,12 +615,14 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(revoked.getLinkCalls()).toBe(0)
   })
 
-  test('Given 项目授权在运行后撤销 When 九工具 fresh execute Then 全部在 Store、batch 与 run 前拒绝', async () => {
+  test('Given 项目授权在运行后撤销 When 十一工具 fresh execute Then 全部在 Store、batch 与 run 前拒绝', async () => {
     const cases: Array<{ name: string; args: Record<string, unknown> }> = [
       { name: 'canvas_get_context', args: {} },
       { name: 'canvas_manage', args: { action: 'create' } },
       { name: 'canvas_read', args: { canvasId: 'canvas-1', nodeIds: ['doc-1'] } },
       { name: 'canvas_apply_changes', args: { canvasId: 'canvas-1', baseRevision: 3, operations: [{ type: 'set-viewport', viewport: { x: 0, y: 0, zoom: 1 } }] } },
+      { name: 'canvas_create_agent', args: { canvasId: 'canvas-1', baseRevision: 3, title: '分镜 Agent' } },
+      { name: 'canvas_import_image', args: { canvasId: 'canvas-1', baseRevision: 3, title: '角色三视图', localPath: 'reference.png' } },
       { name: 'canvas_create_artifact', args: { canvasId: 'canvas-1', baseRevision: 3, artifactType: 'webview', title: '原型', content: '<!doctype html><html></html>' } },
       { name: 'canvas_update_artifact', args: { canvasId: 'canvas-1', nodeId: 'web-1', baseRevision: 3, expectedContentRevision: 1, content: '<main>新版</main>' } },
       { name: 'canvas_run_nodes', args: { canvasId: 'canvas-1', nodeIds: ['image-1'] } },
@@ -778,6 +806,65 @@ describe('普通 Agent Canvas Tool Provider', () => {
       devicePreset: 'mobile',
       source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-artifact-1' },
     })])
+  })
+
+  test('Given 普通 Agent 需要画布分工 When 创建 Canvas Agent Then 创建独立节点且不暴露内部会话身份', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_create_agent', {
+      canvasId: 'canvas-1', baseRevision: 3, title: '分镜策划 Agent',
+      sourceNodeId: 'doc-1', relation: 'depends-on',
+    }, 'tool-agent-1')
+
+    expect(result.details).toEqual({
+      canvasId: 'canvas-1', nodeId: 'agent-created', revision: 4,
+      sourceToolCallId: 'tool-agent-1',
+    })
+    expect(JSON.stringify(result.details)).not.toContain('sessionId')
+    expect(fixture.agentArtifactInputs).toEqual([expect.objectContaining({
+      projectId: 'project-1', canvasId: 'canvas-1', title: '分镜策划 Agent',
+      sourceNodeId: 'doc-1', relation: 'depends-on',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-agent-1' },
+    })])
+  })
+
+  test('Given Agent 工作区已有参考图 When 导入 Canvas Then 创建已采用图片节点且不暴露素材身份', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_import_image', {
+      canvasId: 'canvas-1', baseRevision: 3, title: 'IP 三视图',
+      localPath: 'workspace-files/ip-turnaround.png', prompt: '角色一致性参考',
+      sourceNodeId: 'doc-1', relation: 'reference',
+    }, 'tool-import-1')
+
+    expect(result.details).toEqual({
+      canvasId: 'canvas-1', nodeId: 'image-imported', revision: 4,
+      artifactType: 'image', sourceToolCallId: 'tool-import-1',
+    })
+    expect(JSON.stringify(result.details)).not.toContain('assetId')
+    expect(fixture.importedImageInputs).toEqual([expect.objectContaining({
+      projectId: 'project-1', canvasId: 'canvas-1', localPath: 'workspace-files/ip-turnaround.png',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-import-1' },
+    })])
+  })
+
+  test('Given plan 权限上限 When 创建 Canvas Agent 或导入图片 Then 在服务调用前拒绝', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, {
+      ...fixture.context,
+      permissionCeiling: 'plan',
+    })
+
+    await expect(executeTool(run.piCustomTools, 'canvas_create_agent', {
+      canvasId: 'canvas-1', baseRevision: 3, title: '分镜 Agent',
+    })).rejects.toThrow('CANVAS_EXECUTE_INTENT_REQUIRED')
+    await expect(executeTool(run.piCustomTools, 'canvas_import_image', {
+      canvasId: 'canvas-1', baseRevision: 3, title: '参考图', localPath: 'reference.png',
+    })).rejects.toThrow('CANVAS_EXECUTE_INTENT_REQUIRED')
+    expect(fixture.agentArtifactInputs).toEqual([])
+    expect(fixture.importedImageInputs).toEqual([])
   })
 
   test('Given plan 权限或未关联画布 When 创建产物 Then 在原子服务前拒绝', async () => {

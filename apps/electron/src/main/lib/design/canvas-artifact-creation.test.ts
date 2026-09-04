@@ -35,7 +35,13 @@ function createFixture(options: {
       contentRevision: 1,
     }],
   }
-  const prepared: Array<{ kind: string; contentId: string; content: string; selectedModelProfileId?: string | null }> = []
+  const prepared: Array<{
+    kind: string
+    contentId: string
+    content: string
+    selectedModelProfileId?: string | null
+    adoptedAssetId?: string
+  }> = []
   const discarded: Array<{ contentId: string; rollbackId: string }> = []
   const batches: CanvasBatchOperationEnvelope[] = []
   /** 测试 fake 只实现本服务会产生的节点和连线 upsert。 */
@@ -200,6 +206,62 @@ describe('Canvas Agent 产物原子创建服务', () => {
       type: 'upsert-nodes',
       nodes: [expect.objectContaining({ id: result.nodeId, kind: 'image', position: { x: 800, y: 120 } })],
     })])
+  })
+
+  test('Given 已导入素材 When 创建图片产物 Then 配置与节点从 revision 0 指向同一正式素材', async () => {
+    const fixture = createFixture()
+    const result = await fixture.service.create({
+      ...target,
+      baseRevision: 3,
+      artifactType: 'image',
+      title: '马小本三视图',
+      content: '角色身份参考图，不直接重新生成。',
+      adoptedAssetId: 'asset-imported',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-import-image-1' },
+    })
+
+    expect(fixture.prepared).toEqual([expect.objectContaining({
+      kind: 'image',
+      adoptedAssetId: 'asset-imported',
+    })])
+    expect(fixture.batches[0]?.operations).toEqual([expect.objectContaining({
+      type: 'upsert-nodes',
+      nodes: [expect.objectContaining({
+        id: result.nodeId,
+        kind: 'image',
+        adoptedAssetId: 'asset-imported',
+      })],
+    })])
+  })
+
+  test('Given 普通 Agent 需要编排节点 When 明确创建 Agent Then Host 创建独立会话节点并保持稳定身份', async () => {
+    const fixture = createFixture()
+    const result = await fixture.service.createAgent({
+      ...target,
+      baseRevision: 3,
+      title: '小红书视频制作 Agent',
+      sourceNodeId: 'requirements-1',
+      relation: 'depends-on',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-create-agent-1' },
+    })
+
+    expect(fixture.prepared).toHaveLength(0)
+    const operations = getBatchOperations(fixture.batches[0]!)
+    expect(operations.find((operation) => operation.type === 'upsert-nodes')).toMatchObject({
+      nodes: [{
+        id: result.nodeId,
+        kind: 'agent',
+        title: '小红书视频制作 Agent',
+        agentSessionId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      }],
+    })
+    expect(operations.find((operation) => operation.type === 'upsert-edges')).toMatchObject({
+      edges: [{
+        sourceNodeId: 'requirements-1',
+        targetNodeId: result.nodeId,
+        relation: 'depends-on',
+      }],
+    })
   })
 
   test('Given 首次 revision 冲突 When 创建 Then 权威重读后只重试一次并保持同一节点身份', async () => {
