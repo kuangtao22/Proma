@@ -9,11 +9,13 @@ import {
   unlinkAgentCanvasForSession,
 } from '@/components/design/CanvasWorkspaceAdapter'
 import {
+  createCanvasWorkspaceEntryController,
   getCanvasDeleteFailureMessage,
   createCanvasDeleteLifecycle,
   isCanvasWorkspaceTabStillCurrent,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
+  selectInitialCanvasWorkspaceSession,
   selectCanvasWorkspaceTabForPane,
   selectCanvasAfterArchive,
   setAgentDefaultCanvas,
@@ -27,6 +29,18 @@ function createBinding(sessionId: string, canvasId = 'canvas-1'): AgentCanvasBin
     defaultCanvasId: canvasId,
     lastActiveCanvasId: canvasId,
     linkedCanvasIds: [canvasId],
+    updatedAt: 1,
+  }
+}
+
+/** 创建首次打开决策使用的稳定 Canvas 元数据。 */
+function createCanvasSession(id: string, archived = false): CanvasSessionMeta {
+  return {
+    id,
+    projectId: 'project-1',
+    title: id,
+    archived,
+    createdAt: 1,
     updatedAt: 1,
   }
 }
@@ -202,13 +216,59 @@ describe('Agent 右侧画布动态标签', () => {
     })
   })
 
-  test('Given 顶部菜单不承载画布管理 When 检查 SidePanel 入口 Then 零关联仍提供独立画布标签', async () => {
+  test('Given 用户未点击添加画布 When 检查 SidePanel Then 不根据持久关联默认展示画布标签', async () => {
     const source = await Bun.file(new URL('./SidePanel.tsx', import.meta.url)).text()
 
-    expect(source).toContain("id: 'canvas', label: '画布'")
+    expect(source).toContain('agentCanvasWorkspaceOpenTabsAtom')
+    expect(source).toContain('openedCanvasWorkspaceTabs')
+    expect(source).toContain("openedCanvasWorkspaceTabs.includes('canvas')")
     expect(source).toContain('shouldShowCanvasWorkspaceLauncher')
+    expect(source).toContain('createCanvasWorkspaceEntryController')
+    expect(source).toContain('handleOpenInitialCanvas')
+    expect(source).toContain('canvasRegistry.metadataReady')
+    expect(source).toContain('openCanvas: (canvas) => handleOpenCanvas(canvas, pane)')
+    expect(source).toContain('createCanvas: () => handleCreateCanvas(pane)')
+    expect(source).not.toContain('selectCanvasWorkspaceEntryTab')
+    expect(source).toContain('openCanvasDisabled={!currentWorkspaceId || !canvasRegistry.metadataReady || !canvasRegistry.bindingReady}')
     expect(source).toContain('if (!split || !canvasRegistry.bindingReady) return')
     expect(source).toContain('split?.focusedPane ?? null')
+  })
+
+  test('Given 默认、首项和归档画布 When 选择首次打开目标 Then 默认优先且只考虑未归档画布', () => {
+    const sessions = [
+      createCanvasSession('canvas-first'),
+      createCanvasSession('canvas-default'),
+      createCanvasSession('canvas-archived', true),
+    ]
+
+    expect(selectInitialCanvasWorkspaceSession(sessions, 'canvas-default')?.id).toBe('canvas-default')
+    expect(selectInitialCanvasWorkspaceSession(sessions, 'canvas-missing')?.id).toBe('canvas-first')
+    expect(selectInitialCanvasWorkspaceSession(
+      [createCanvasSession('canvas-archived', true)],
+      'canvas-archived',
+    )).toBeNull()
+  })
+
+  test('Given 项目没有可用画布 When 首次打开被快速触发两次 Then 只创建一次并共享结果', async () => {
+    let createCalls = 0
+    const controller = createCanvasWorkspaceEntryController()
+    const input = {
+      sessions: [],
+      defaultCanvasId: undefined,
+      openCanvas: async (): Promise<boolean> => false,
+      createCanvas: async (): Promise<boolean> => {
+        createCalls += 1
+        await Promise.resolve()
+        return true
+      },
+    }
+
+    const first = controller.open(input)
+    const second = controller.open(input)
+
+    expect(first).toBe(second)
+    expect(await first).toBe(true)
+    expect(createCalls).toBe(1)
   })
 
   test('Given 归档请求在途时用户切换目标 Pane When 请求完成 Then 不再执行迟到回退', () => {

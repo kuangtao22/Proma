@@ -546,7 +546,7 @@ describe('Agent 右侧 Canvas 适配器', () => {
     expect(isAgentCanvasActivityUnread({ ...initial, activityRevision: 1, seenActivityRevision: 1 })).toBe(false)
   })
 
-  test('Given 只关联归档画布或没有 binding When 组装工作区 Then 隐藏归档标签并要求展示稳定入口', () => {
+  test('Given 只关联归档画布或没有 binding When 未显式打开 Then 隐藏 launcher 直到用户点击添加', () => {
     const archived = createSession('canvas-archived', true)
     const active = createSession('canvas-active')
     const binding = {
@@ -557,11 +557,12 @@ describe('Agent 右侧 Canvas 适配器', () => {
     } satisfies AgentCanvasBinding
     expect(buildCanvasWorkspaceTabs(binding, [archived, active]).map((tab) => tab.canvasId))
       .toEqual([active.id])
-    expect(shouldShowCanvasWorkspaceLauncher(null, [active], false)).toBe(false)
-    expect(shouldShowCanvasWorkspaceLauncher(null, [active], true)).toBe(true)
-    expect(shouldShowCanvasWorkspaceLauncher({ ...binding, linkedCanvasIds: [archived.id] }, [archived], true))
+    expect(shouldShowCanvasWorkspaceLauncher(null, [active], false, false)).toBe(false)
+    expect(shouldShowCanvasWorkspaceLauncher(null, [active], true, false)).toBe(false)
+    expect(shouldShowCanvasWorkspaceLauncher(null, [active], true, true)).toBe(true)
+    expect(shouldShowCanvasWorkspaceLauncher({ ...binding, linkedCanvasIds: [archived.id] }, [archived], true, true))
       .toBe(true)
-    expect(shouldShowCanvasWorkspaceLauncher(binding, [archived, active], true)).toBe(false)
+    expect(shouldShowCanvasWorkspaceLauncher(binding, [archived, active], true, true)).toBe(false)
   })
 
   test('Given 零关联 launcher When 首次渲染 Then 提供列表入口且抽屉默认收起', () => {

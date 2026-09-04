@@ -61,6 +61,54 @@ export async function setAgentDefaultCanvas(input: SetAgentDefaultCanvasInput): 
   await input.setDefault(input.canvasId)
 }
 
+/** 选择首次打开目标：有效默认画布优先，否则使用第一个未归档画布。 */
+export function selectInitialCanvasWorkspaceSession(
+  sessions: readonly CanvasSessionMeta[],
+  defaultCanvasId?: string,
+): CanvasSessionMeta | null {
+  return sessions.find((session) => !session.archived && session.id === defaultCanvasId)
+    ?? sessions.find((session) => !session.archived)
+    ?? null
+}
+
+export interface OpenCanvasWorkspaceEntryInput {
+  /** 当前项目的完整画布列表。 */
+  sessions: readonly CanvasSessionMeta[]
+  /** 当前 Agent 的默认画布 ID。 */
+  defaultCanvasId?: string
+  /** 打开并按需关联已有画布。 */
+  openCanvas: (session: CanvasSessionMeta) => Promise<boolean>
+  /** 创建、关联并打开新画布。 */
+  createCanvas: () => Promise<boolean>
+}
+
+export interface CanvasWorkspaceEntryController {
+  /** 执行或复用当前在途的首次打开动作。 */
+  open: (input: OpenCanvasWorkspaceEntryInput) => Promise<boolean>
+}
+
+/** 创建按入口实例隔离的单飞控制器，避免重复点击创建多个画布。 */
+export function createCanvasWorkspaceEntryController(): CanvasWorkspaceEntryController {
+  /** 当前仍在执行的打开或创建任务。 */
+  let inFlight: Promise<boolean> | null = null
+  return {
+    open: (input) => {
+      if (inFlight) return inFlight
+      /** 本次点击应直接打开的已有画布；null 表示需要创建。 */
+      const target = selectInitialCanvasWorkspaceSession(input.sessions, input.defaultCanvasId)
+      /** 所有并发调用共享同一个任务，直到本次动作收口。 */
+      const task = target ? input.openCanvas(target) : input.createCanvas()
+      inFlight = task
+      /** 仅清理由当前任务持有的锁，避免未来任务被旧回调误清。 */
+      const clear = (): void => {
+        if (inFlight === task) inFlight = null
+      }
+      void task.then(clear, clear)
+      return task
+    },
+  }
+}
+
 /**
  * 把 Canvas 导航落到发起动作的明确 Pane；无分屏时交给普通 activeTab 状态。
  * @returns 下一份分屏状态；null 表示当前没有分屏。
