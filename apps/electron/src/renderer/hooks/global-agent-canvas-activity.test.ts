@@ -77,7 +77,7 @@ describe('全局普通 Agent Canvas activity consumer', () => {
     consumer.dispose()
   })
 
-  test('Given 后台 Agent 创建画布产物 When 成功工具结果到达 Then 只打开该会话右侧画布并定位节点', () => {
+  test('Given 后台 Agent 创建画布产物 When 成功工具结果到达 Then 仅记录待定位节点且不自动打开画布', () => {
     const store = createStore()
     store.set(activeTabIdAtom, 'foreground-tab')
     store.set(currentAgentSessionIdAtom, 'agent-foreground')
@@ -108,8 +108,8 @@ describe('全局普通 Agent Canvas activity consumer', () => {
       isError: false,
     })
 
-    expect(store.get(agentSidePanelOpenAtomFamily('agent-background'))).toBe(true)
-    expect(store.get(agentDiffPanelTabAtom).get('agent-background')).toBe(getCanvasWorkspaceTab('canvas-1'))
+    expect(store.get(agentSidePanelOpenAtomFamily('agent-background'))).toBe(false)
+    expect(store.get(agentDiffPanelTabAtom).has('agent-background')).toBe(false)
     expect(store.get(agentCanvasViewStatesAtom).get(viewKey)).toMatchObject({
       selectedNodeId: 'node-1',
       selectedNodeIds: ['node-1'],

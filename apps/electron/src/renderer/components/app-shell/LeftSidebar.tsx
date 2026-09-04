@@ -48,6 +48,7 @@ import {
   agentWorkspacesAtom,
   workspaceCapabilitiesVersionAtom,
   agentDiffPanelTabAtom,
+  agentCanvasWorkspaceOpenTabsAtom,
   agentDiffRefreshVersionAtom,
   agentDiffUnseenChangesAtom,
   agentDiffUnseenFilesAtom,
@@ -942,6 +943,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
       return changed ? next : prev
     })
     setDiffPanelTab(deleteKey)
+    store.set(agentCanvasWorkspaceOpenTabsAtom, deleteKey)
     setDiffRefreshVersion(deleteKey)
     setDiffUnseen(deleteKey)
     setDiffUnseenFiles(deleteKey)

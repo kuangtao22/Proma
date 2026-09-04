@@ -203,12 +203,15 @@ describe('Agent 右侧画布动态标签', () => {
     })
   })
 
-  test('Given 顶部菜单不承载画布管理 When 检查 SidePanel 入口 Then 零关联仍提供独立画布标签', async () => {
+  test('Given 用户未点击添加画布 When 检查 SidePanel Then 不根据持久关联默认展示画布标签', async () => {
     const source = await Bun.file(new URL('./SidePanel.tsx', import.meta.url)).text()
 
-    expect(source).toContain("id: 'canvas', label: '画布'")
+    expect(source).toContain('agentCanvasWorkspaceOpenTabsAtom')
+    expect(source).toContain('openedCanvasWorkspaceTabs')
+    expect(source).toContain("openedCanvasWorkspaceTabs.includes('canvas')")
     expect(source).toContain('shouldShowCanvasWorkspaceLauncher')
-    expect(source).toContain('selectCanvasWorkspaceEntryTab(canvasWorkspaceTabs)')
+    expect(source).toContain('selectCanvasWorkspaceEntryTab(availableCanvasWorkspaceTabs)')
+    expect(source).toContain('handleCanvasWorkspaceTabChange(selectCanvasWorkspaceEntryTab(availableCanvasWorkspaceTabs)')
     expect(source).toContain('openCanvasDisabled={!currentWorkspaceId || !canvasRegistry.bindingReady}')
     expect(source).toContain('if (!split || !canvasRegistry.bindingReady) return')
     expect(source).toContain('split?.focusedPane ?? null')

@@ -72,13 +72,14 @@ export function buildCanvasWorkspaceTabs(
   })
 }
 
-/** 没有可见关联画布时保留独立入口，避免管理抽屉随最后一个标签一起消失。 */
+/** 只有用户明确打开且没有可见关联画布时才展示独立 Canvas 入口。 */
 export function shouldShowCanvasWorkspaceLauncher(
   binding: AgentCanvasBinding | null,
   sessions: readonly CanvasSessionMeta[],
   bindingReady: boolean,
+  explicitlyOpened: boolean,
 ): boolean {
-  if (!bindingReady) return false
+  if (!bindingReady || !explicitlyOpened) return false
   return buildCanvasWorkspaceTabs(binding, sessions).length === 0
 }
 

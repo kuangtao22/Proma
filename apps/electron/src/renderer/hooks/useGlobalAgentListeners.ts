@@ -62,6 +62,7 @@ import {
   getDelegationSidePanelTab,
   askUserDraftsAtom,
   agentPendingPromptAtom,
+  agentCanvasWorkspaceOpenTabsAtom,
 } from '@/atoms/agent-atoms'
 import {
   notificationsEnabledAtom,
@@ -843,7 +844,7 @@ function createCanvasArtifactToolKey(sessionId: string, toolUseId: string): stri
 }
 
 /**
- * 监听普通 Agent 的画布产物工具结果，并只导航产出会话自己的右侧工作区。
+ * 监听普通 Agent 的画布产物工具结果，只记录稍后打开时需要定位的节点。
  * @param store Renderer 进程内唯一 Jotai store。
  * @returns 可接收扁平 AgentEvent 的消费者与清理函数。
  */
@@ -873,14 +874,6 @@ export function startGlobalAgentCanvasArtifactConsumer(store: Store): GlobalAgen
       /** 会话项目是构造完整 view key 的权威 Renderer 快照；缺失时禁止猜测项目。 */
       const session = store.get(agentSessionsAtom).find((candidate) => candidate.id === sessionId)
       if (!session?.workspaceId) return
-      store.set(agentSidePanelOpenAtomFamily(sessionId), true)
-      store.set(agentDiffPanelTabAtom, (previous) => {
-        const nextTab = getCanvasWorkspaceTab(result.canvasId)
-        if (previous.get(sessionId) === nextTab) return previous
-        const next = new Map(previous)
-        next.set(sessionId, nextTab)
-        return next
-      })
       const viewKey = createAgentCanvasViewKey(sessionId, session.workspaceId, result.canvasId)
       store.set(navigateAgentCanvasViewAtom, { key: viewKey, nodeId: result.nodeId })
     },
@@ -951,6 +944,17 @@ export function useGlobalAgentListeners(): void {
         store.set(tabsAtom, result.tabs)
         store.set(activeTabIdAtom, result.activeTabId)
         store.set(agentSidePanelOpenAtomFamily(workspaceOwner.id), true)
+        store.set(agentCanvasWorkspaceOpenTabsAtom, (previous) => {
+          const targetTab = getCanvasWorkspaceTab(owner.canvasId)
+          const current = previous.get(workspaceOwner.id) ?? []
+          const withoutLauncher = current.filter((tab) => tab !== 'canvas')
+          if (withoutLauncher.includes(targetTab) && withoutLauncher.length === current.length) return previous
+          const next = new Map(previous)
+          next.set(workspaceOwner.id, withoutLauncher.includes(targetTab)
+            ? withoutLauncher
+            : [...withoutLauncher, targetTab])
+          return next
+        })
         store.set(agentDiffPanelTabAtom, (previous) => {
           const next = new Map(previous)
           next.set(workspaceOwner.id, getCanvasWorkspaceTab(owner.canvasId))

@@ -756,7 +756,7 @@ export type AgentSidePanelBaseTab = 'files' | 'changes' | 'chat' | 'temporary-ag
 export type AgentSidePanelTab = AgentSidePanelBaseTab | `exploration:${string}` | `delegation:${string}` | `browser:${string}` | `preview:${string}` | `terminal:${string}` | `canvas:${string}`
 
 /** 为右侧工作区创建不依赖全局 Canvas selection 的标签身份。 */
-export function getCanvasWorkspaceTab(canvasId: string): AgentSidePanelTab {
+export function getCanvasWorkspaceTab(canvasId: string): `canvas:${string}` {
   return `canvas:${canvasId}`
 }
 
@@ -890,6 +890,9 @@ export const agentSessionComponentTabsAtomFamily = atomFamily((sessionId: string
 
 /** 侧面板当前工作区：基础视图或某个浏览器网页（per-session Map）。 */
 export const agentDiffPanelTabAtom = atom<Map<string, AgentSidePanelTab | 'browser' | 'preview'>>(new Map())
+
+/** 当前 Renderer 运行期内由用户明确打开的 Canvas 标签；重启后默认隐藏。 */
+export const agentCanvasWorkspaceOpenTabsAtom = atom<Map<string, AgentSidePanelTab[]>>(new Map())
 
 /** 当前 renderer 运行期内的右侧双 Pane 状态；动态 Tab 失效时由 SidePanel 主动清理。 */
 export const agentSidePanelSplitMapAtom = atom<Map<string, RightWorkspaceSplitState>>(new Map())

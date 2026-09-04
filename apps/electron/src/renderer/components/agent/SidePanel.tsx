@@ -72,6 +72,7 @@ import {
   agentSessionDraftSyncVersionsAtom,
   agentSessionDraftHtmlAtom,
   agentTerminalTabsAtom,
+  agentCanvasWorkspaceOpenTabsAtom,
   agentSidePanelSplitMapAtom,
   agentSidePanelSplitRatioMapAtom,
 } from '@/atoms/agent-atoms'
@@ -1194,11 +1195,41 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     flushBrowserTabSelection()
   }, [flushBrowserTabSelection, onTabChange, previewFiles, sessionId, setPreviewFileMap, sideChatConversationId, sideDelegationSessionIds, sideTemporaryAgents, split, updateSplit])
 
+  const [canvasWorkspaceOpenTabs, setCanvasWorkspaceOpenTabs] = useAtom(agentCanvasWorkspaceOpenTabsAtom)
+  const openedCanvasWorkspaceTabs = canvasWorkspaceOpenTabs.get(sessionId) ?? []
+
+  /** 登记用户明确打开的 Canvas 标签；具体画布会替换仅用于选取画布的 launcher。 */
+  const rememberOpenedCanvasWorkspaceTab = React.useCallback((tab: AgentSidePanelTab): void => {
+    if (tab !== 'canvas' && !parseCanvasWorkspaceTab(tab)) return
+    setCanvasWorkspaceOpenTabs((previous) => {
+      const current = previous.get(sessionId) ?? []
+      const withoutLauncher = tab === 'canvas' ? current : current.filter((item) => item !== 'canvas')
+      if (withoutLauncher.includes(tab) && withoutLauncher.length === current.length) return previous
+      const next = new Map(previous)
+      next.set(sessionId, withoutLauncher.includes(tab) ? withoutLauncher : [...withoutLauncher, tab])
+      return next
+    })
+  }, [sessionId, setCanvasWorkspaceOpenTabs])
+
+  /** 移除已关闭或已失效的 Canvas 标签，避免未来重新关联时自动显示。 */
+  const forgetOpenedCanvasWorkspaceTab = React.useCallback((tab: AgentSidePanelTab): void => {
+    setCanvasWorkspaceOpenTabs((previous) => {
+      const current = previous.get(sessionId)
+      if (!current?.includes(tab)) return previous
+      const remaining = current.filter((item) => item !== tab)
+      const next = new Map(previous)
+      if (remaining.length > 0) next.set(sessionId, remaining)
+      else next.delete(sessionId)
+      return next
+    })
+  }, [sessionId, setCanvasWorkspaceOpenTabs])
+
   /** Canvas 异步动作按发起 Pane 写入最新 split，避免依赖请求返回时的焦点。 */
   const handleCanvasWorkspaceTabChange = React.useCallback((
     tab: AgentSidePanelTab,
     pane: RightWorkspacePane | null,
   ): void => {
+    rememberOpenedCanvasWorkspaceTab(tab)
     setSplitMap((previous) => {
       const current = previous.get(sessionId) ?? null
       const nextSplit = selectCanvasWorkspaceTabForPane(current, tab, pane)
@@ -1208,7 +1239,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       return next
     })
     onTabChange(tab)
-  }, [onTabChange, sessionId, setSplitMap])
+  }, [onTabChange, rememberOpenedCanvasWorkspaceTab, sessionId, setSplitMap])
 
   const canvasRegistry = useAgentCanvasWorkspaceRegistry(
     currentWorkspaceId,
@@ -1231,7 +1262,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const showCanvasActionError = React.useCallback((message: string): void => {
     toast.error(message)
   }, [])
-  const canvasWorkspaceTabs = React.useMemo(
+  const availableCanvasWorkspaceTabs = React.useMemo(
     () => buildCanvasWorkspaceTabs(
       canvasRegistry.binding,
       canvasRegistry.sessions,
@@ -1239,6 +1270,27 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     ),
     [canvasRegistry.binding, canvasRegistry.canvasActivityStates, canvasRegistry.sessions],
   )
+  const canvasWorkspaceTabs = React.useMemo(
+    () => availableCanvasWorkspaceTabs.filter((canvas) => openedCanvasWorkspaceTabs.includes(canvas.id)),
+    [availableCanvasWorkspaceTabs, openedCanvasWorkspaceTabs],
+  )
+
+  React.useEffect(() => {
+    if (!canvasRegistry.bindingReady) return
+    const availableTabIds = new Set(availableCanvasWorkspaceTabs.map((canvas) => canvas.id))
+    setCanvasWorkspaceOpenTabs((previous) => {
+      const current = previous.get(sessionId)
+      if (!current) return previous
+      const remaining = current.filter((tab) => (
+        tab === 'canvas' ? availableTabIds.size === 0 : availableTabIds.has(tab)
+      ))
+      if (remaining.length === current.length) return previous
+      const next = new Map(previous)
+      if (remaining.length > 0) next.set(sessionId, remaining)
+      else next.delete(sessionId)
+      return next
+    })
+  }, [availableCanvasWorkspaceTabs, canvasRegistry.bindingReady, sessionId, setCanvasWorkspaceOpenTabs])
   /** 当前有焦点的工作区标签，用于归档当前画布后的确定性回退。 */
   const focusedWorkspaceTab = split ? getFocusedRightWorkspaceTab(split) : effectiveActiveTab
   /** 当前有焦点的画布 ID；非画布标签返回 null。 */
@@ -1415,13 +1467,16 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       })
       if (!deleted || !deleteLifecycleRef.current.isOperationCurrent(operation)) return
       removeCanvasSession({ projectId: canvas.projectId, canvasId: canvas.id })
+      const deletedTab = getCanvasWorkspaceTab(canvas.id)
+      forgetOpenedCanvasWorkspaceTab(deletedTab)
+      if (focusedWorkspaceTab === deletedTab) returnToPreviousTabAfterClose(deletedTab)
       deleteLifecycleRef.current.cancel()
       setPendingDeleteCanvas(null)
       toast.success('画布已删除')
     } finally {
       if (deleteLifecycleRef.current.isOperationCurrent(operation)) setDeletingCanvas(false)
     }
-  }, [deletingCanvas, pendingDeleteCanvas, removeCanvasSession, reportCanvasActionError, showCanvasActionError])
+  }, [deletingCanvas, focusedWorkspaceTab, forgetOpenedCanvasWorkspaceTab, pendingDeleteCanvas, removeCanvasSession, reportCanvasActionError, returnToPreviousTabAfterClose, showCanvasActionError])
 
   React.useEffect(() => {
     if (!activeCanvasId || !canvasRegistry.bindingReady) return
@@ -1537,8 +1592,9 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       canvasRegistry.binding,
       canvasRegistry.sessions,
       canvasRegistry.bindingReady,
+      openedCanvasWorkspaceTabs.includes('canvas'),
     )
-      ? [{ id: 'canvas', label: '画布', icon: <Workflow className="size-3.5" /> } as const]
+      ? [{ id: 'canvas', label: '画布', icon: <Workflow className="size-3.5" />, closable: true } as const]
       : []),
     ...canvasWorkspaceTabs.map((canvas) => ({
       id: canvas.id,
@@ -1597,7 +1653,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       closable: true,
       activity: showBrowserActivity && activeBrowserTabId !== tab.tabId && browserState.activeTabId === tab.tabId,
     })) ?? []),
-  ], [activeBrowserTabId, browserState, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.sessions, canvasWorkspaceTabs, currentWorkspaceId, previewFiles, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideDelegationSessionIds, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
+  ], [activeBrowserTabId, browserState, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.sessions, canvasWorkspaceTabs, currentWorkspaceId, openedCanvasWorkspaceTabs, previewFiles, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideDelegationSessionIds, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
   workspaceTabsRef.current = workspaceTabs
 
   React.useEffect(() => {
@@ -1621,13 +1677,22 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
 
   const handleCloseWorkspaceTab = React.useCallback((tab: AgentSidePanelTab) => {
     if (exitSplitInsteadOfClosingBoundTab(tab)) return
+    if (tab === 'canvas') {
+      forgetOpenedCanvasWorkspaceTab(tab)
+      returnToPreviousTabAfterClose(tab)
+      return
+    }
     const canvasId = parseCanvasWorkspaceTab(tab)
     if (canvasId) {
-      void canvasRegistry.unlink(canvasId).catch((error: unknown) => {
-        console.error('[SidePanel] 解除画布关联失败:', error)
-        toast.error(CANVAS_WORKSPACE_FAILURE_MESSAGES.close)
-      })
-      returnToPreviousTabAfterClose(tab)
+      void canvasRegistry.unlink(canvasId)
+        .then(() => {
+          forgetOpenedCanvasWorkspaceTab(tab)
+          returnToPreviousTabAfterClose(tab)
+        })
+        .catch((error: unknown) => {
+          console.error('[SidePanel] 解除画布关联失败:', error)
+          toast.error(CANVAS_WORKSPACE_FAILURE_MESSAGES.close)
+        })
       return
     }
     const terminalId = getTerminalIdFromSidePanelTab(tab)
@@ -1659,7 +1724,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     if (delegationSessionId) { handleCloseDelegationTab(delegationSessionId); return }
     const browserTabId = getBrowserTabIdFromSidePanelTab(tab)
     if (browserTabId) void handleCloseBrowserTab(browserTabId)
-  }, [canvasRegistry, exitSplitInsteadOfClosingBoundTab, handleCloseBrowserTab, handleCloseChatTab, handleCloseDelegationTab, handleCloseExplorationTab, handleClosePreviewTab, returnToPreviousTabAfterClose, sessionId, setTerminalTabsMap, setWorkspaceComponentTabs])
+  }, [canvasRegistry, exitSplitInsteadOfClosingBoundTab, forgetOpenedCanvasWorkspaceTab, handleCloseBrowserTab, handleCloseChatTab, handleCloseDelegationTab, handleCloseExplorationTab, handleClosePreviewTab, returnToPreviousTabAfterClose, sessionId, setTerminalTabsMap, setWorkspaceComponentTabs])
 
   React.useEffect(() => {
     const handleCloseActiveWorkspaceTab = (event: Event) => {
@@ -2138,7 +2203,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
               setIsOpen(true)
               handleWorkspaceTabChange('vault')
             } : undefined}
-            onOpenCanvas={() => handleWorkspaceTabChange(selectCanvasWorkspaceEntryTab(canvasWorkspaceTabs))}
+            onOpenCanvas={() => handleCanvasWorkspaceTabChange(selectCanvasWorkspaceEntryTab(availableCanvasWorkspaceTabs), split?.focusedPane ?? null)}
             openCanvasDisabled={!currentWorkspaceId || !canvasRegistry.bindingReady}
             visibleTabs={renderSplit && split ? { left: split.leftTab, right: split.rightTab } : undefined}
             focusedPane={renderSplit ? split?.focusedPane : undefined}
