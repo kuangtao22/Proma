@@ -64,7 +64,8 @@ import {
   getDelegationSidePanelTab,
   askUserDraftsAtom,
   agentPendingPromptAtom,
-  agentCanvasWorkspaceOpenTabsAtom,
+  agentCanvasWorkspaceStateMapAtom,
+  rememberAgentCanvasWorkspaceTab,
 } from '@/atoms/agent-atoms'
 import {
   notificationsEnabledAtom,
@@ -1009,20 +1010,18 @@ export function useGlobalAgentListeners(): void {
         store.set(tabsAtom, result.tabs)
         store.set(activeTabIdAtom, result.activeTabId)
         store.set(agentSidePanelOpenAtomFamily(workspaceOwner.id), true)
-        store.set(agentCanvasWorkspaceOpenTabsAtom, (previous) => {
-          const targetTab = getCanvasWorkspaceTab(owner.canvasId)
-          const current = previous.get(workspaceOwner.id) ?? []
-          const withoutLauncher = current.filter((tab) => tab !== 'canvas')
-          if (withoutLauncher.includes(targetTab) && withoutLauncher.length === current.length) return previous
-          const next = new Map(previous)
-          next.set(workspaceOwner.id, withoutLauncher.includes(targetTab)
-            ? withoutLauncher
-            : [...withoutLauncher, targetTab])
-          return next
-        })
+        const targetCanvasTab = getCanvasWorkspaceTab(owner.canvasId)
+        store.set(agentCanvasWorkspaceStateMapAtom, (previous) => ({
+          ...previous,
+          [workspaceOwner.id]: rememberAgentCanvasWorkspaceTab(
+            previous[workspaceOwner.id],
+            targetCanvasTab,
+            true,
+          ),
+        }))
         store.set(agentDiffPanelTabAtom, (previous) => {
           const next = new Map(previous)
-          next.set(workspaceOwner.id, getCanvasWorkspaceTab(owner.canvasId))
+          next.set(workspaceOwner.id, targetCanvasTab)
           return next
         })
         /** 未 LOAD 时只暂存节点导航意图，首个权威文档仍拥有 viewport 初始化权。 */

@@ -755,6 +755,9 @@ export type AgentSidePanelBaseTab = 'files' | 'changes' | 'chat' | 'temporary-ag
 /** 工作区组件、每个 Pi 探索分支、协作子 Agent、浏览器网页和文件预览都处于右侧工作区顶栏。 */
 export type AgentSidePanelTab = AgentSidePanelBaseTab | `exploration:${string}` | `browser:${string}` | `preview:${string}` | `terminal:${string}` | `canvas:${string}`
 
+/** 经过严格解析的具体 Canvas 工作区标签，不包含临时 launcher。 */
+export type AgentCanvasWorkspaceTab = `canvas:${string}`
+
 /** 为右侧工作区创建不依赖全局 Canvas selection 的标签身份。 */
 export function getCanvasWorkspaceTab(canvasId: string): `canvas:${string}` {
   return `canvas:${canvasId}`
@@ -883,8 +886,165 @@ export const agentSessionComponentTabsAtomFamily = atomFamily((sessionId: string
 /** 侧面板当前工作区：基础视图或某个浏览器网页（per-session Map）。 */
 export const agentDiffPanelTabAtom = atom<Map<string, AgentSidePanelTab | 'browser' | 'preview'>>(new Map())
 
-/** 当前 Renderer 运行期内由用户明确打开的 Canvas 标签；重启后默认隐藏。 */
-export const agentCanvasWorkspaceOpenTabsAtom = atom<Map<string, AgentSidePanelTab[]>>(new Map())
+/** 单个普通 Agent 会话需要跨客户端重启恢复的 Canvas 工作区偏好。 */
+export interface PersistedAgentCanvasWorkspaceState {
+  /** 用户明确打开且尚未关闭的具体 Canvas 标签。 */
+  openTabs: AgentCanvasWorkspaceTab[]
+  /** 退出时位于前台的具体 Canvas；查看其它右侧标签时为 null。 */
+  activeTab: AgentCanvasWorkspaceTab | null
+}
+
+/** 空 Canvas 工作区偏好，每次清洗均返回独立数组避免共享可变引用。 */
+function createEmptyAgentCanvasWorkspaceState(): PersistedAgentCanvasWorkspaceState {
+  return { openTabs: [], activeTab: null }
+}
+
+/** 将未知持久化值降级为严格、去重且内部一致的 Canvas 工作区偏好。 */
+export function sanitizeAgentCanvasWorkspaceState(value: unknown): PersistedAgentCanvasWorkspaceState {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return createEmptyAgentCanvasWorkspaceState()
+  }
+  /** 未验证的本地存储对象只读取允许的两个字段。 */
+  const candidate = value as { openTabs?: unknown; activeTab?: unknown }
+  /** 按原始打开顺序收集合法具体 Canvas 标签。 */
+  const openTabs: AgentCanvasWorkspaceTab[] = []
+  /** 去重集合避免损坏值重复挂载同一 Canvas。 */
+  const seenTabs = new Set<AgentCanvasWorkspaceTab>()
+  if (Array.isArray(candidate.openTabs)) {
+    for (const item of candidate.openTabs) {
+      if (typeof item !== 'string' || !parseCanvasWorkspaceTab(item)) continue
+      /** parse 已证明该字符串符合具体 Canvas 标签合同。 */
+      const tab = item as AgentCanvasWorkspaceTab
+      if (seenTabs.has(tab)) continue
+      seenTabs.add(tab)
+      openTabs.push(tab)
+    }
+  }
+  /** 活动标签只有仍在打开集合内时才有效。 */
+  const activeTab = typeof candidate.activeTab === 'string'
+    && parseCanvasWorkspaceTab(candidate.activeTab)
+    && seenTabs.has(candidate.activeTab as AgentCanvasWorkspaceTab)
+    ? candidate.activeTab as AgentCanvasWorkspaceTab
+    : null
+  return { openTabs, activeTab }
+}
+
+/** 将未知顶层本地存储值清洗为按普通 Agent 会话隔离的 Canvas 工作区状态。 */
+export function sanitizeAgentCanvasWorkspaceStateMap(
+  value: unknown,
+): Record<string, PersistedAgentCanvasWorkspaceState> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  /** 只保存非空会话键和至少一张具体 Canvas，损坏条目独立降级。 */
+  const entries = Object.entries(value)
+    .filter(([sessionId]) => sessionId.length > 0)
+    .map(([sessionId, state]) => [sessionId, sanitizeAgentCanvasWorkspaceState(state)] as const)
+    .filter(([, state]) => state.openTabs.length > 0)
+  return Object.fromEntries(entries)
+}
+
+/** 登记具体 Canvas 标签，并按调用方意图决定是否同时设为前台。 */
+export function rememberAgentCanvasWorkspaceTab(
+  state: unknown,
+  tab: AgentSidePanelTab | string,
+  makeActive: boolean,
+): PersistedAgentCanvasWorkspaceState {
+  /** 所有更新均从严格清洗后的状态开始，防止损坏 localStorage 扩散。 */
+  const current = sanitizeAgentCanvasWorkspaceState(state)
+  if (!parseCanvasWorkspaceTab(tab)) return current
+  /** parse 已证明该字符串符合具体 Canvas 标签合同。 */
+  const canvasTab = tab as AgentCanvasWorkspaceTab
+  const openTabs = current.openTabs.includes(canvasTab)
+    ? current.openTabs
+    : [...current.openTabs, canvasTab]
+  return {
+    openTabs,
+    activeTab: makeActive ? canvasTab : current.activeTab,
+  }
+}
+
+/** 更新前台 Canvas；传入非 Canvas 标签时仅清空活动项并保留打开集合。 */
+export function setActiveAgentCanvasWorkspaceTab(
+  state: unknown,
+  tab: AgentSidePanelTab | string | null,
+): PersistedAgentCanvasWorkspaceState {
+  /** 非 Canvas 标签表示用户当前正在查看其它右侧能力。 */
+  if (!tab || !parseCanvasWorkspaceTab(tab)) {
+    const current = sanitizeAgentCanvasWorkspaceState(state)
+    return { ...current, activeTab: null }
+  }
+  return rememberAgentCanvasWorkspaceTab(state, tab, true)
+}
+
+/** 移除已关闭或已失效 Canvas，并在必要时同步清空活动项。 */
+export function forgetAgentCanvasWorkspaceTab(
+  state: unknown,
+  tab: AgentSidePanelTab | string,
+): PersistedAgentCanvasWorkspaceState {
+  /** 所有更新均从严格清洗后的状态开始。 */
+  const current = sanitizeAgentCanvasWorkspaceState(state)
+  if (!parseCanvasWorkspaceTab(tab)) return current
+  /** parse 已证明该字符串符合具体 Canvas 标签合同。 */
+  const canvasTab = tab as AgentCanvasWorkspaceTab
+  return {
+    openTabs: current.openTabs.filter((item) => item !== canvasTab),
+    activeTab: current.activeTab === canvasTab ? null : current.activeTab,
+  }
+}
+
+/** Canvas 工作区偏好沿用右侧布局的会话上限，避免 localStorage 无限增长。 */
+export function pruneAgentCanvasWorkspaceStates(
+  states: Record<string, PersistedAgentCanvasWorkspaceState>,
+  sessions: readonly Pick<AgentSessionMeta, 'id' | 'updatedAt'>[],
+  activeSessionId?: string,
+): Record<string, PersistedAgentCanvasWorkspaceState> {
+  /** 有会话元数据时按最近活动排序；冷启动时按本地存储顺序保留末尾记录。 */
+  const stateIds = Object.keys(states)
+  const recentSessionIds = sessions.length === 0
+    ? stateIds.slice(-MAX_PERSISTED_AGENT_SIDE_PANEL_LAYOUTS)
+    : sessions
+      .slice()
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, MAX_PERSISTED_AGENT_SIDE_PANEL_LAYOUTS)
+      .map((session) => session.id)
+  /** 当前正在使用的会话即使元数据尚未更新也必须保留。 */
+  const retainedIds = new Set(recentSessionIds)
+  if (activeSessionId && states[activeSessionId] && !retainedIds.has(activeSessionId)) {
+    if (retainedIds.size === MAX_PERSISTED_AGENT_SIDE_PANEL_LAYOUTS) {
+      retainedIds.delete(recentSessionIds.at(-1)!)
+    }
+    retainedIds.add(activeSessionId)
+  }
+  /** 只保留仍有具体 Canvas 的严格状态，空状态没有持久化价值。 */
+  const entries = Object.entries(states)
+    .filter(([sessionId]) => retainedIds.has(sessionId))
+    .map(([sessionId, state]) => [sessionId, sanitizeAgentCanvasWorkspaceState(state)] as const)
+    .filter(([, state]) => state.openTabs.length > 0)
+  return Object.fromEntries(entries)
+}
+
+/** localStorage 原始值保持 unknown，所有消费者必须通过受控 Atom 读取。 */
+const persistedAgentCanvasWorkspaceStateMapAtom = atomWithStorage<unknown>(
+  'proma-agent-canvas-workspace-by-session',
+  {},
+  undefined,
+  { getOnInit: true },
+)
+
+/** 用户明确打开的 Canvas 工作区状态按普通 Agent 会话持久化并在读写边界清洗。 */
+export const agentCanvasWorkspaceStateMapAtom = atom(
+  (get) => sanitizeAgentCanvasWorkspaceStateMap(get(persistedAgentCanvasWorkspaceStateMapAtom)),
+  (
+    get,
+    set,
+    update: Record<string, PersistedAgentCanvasWorkspaceState>
+      | ((previous: Record<string, PersistedAgentCanvasWorkspaceState>) => Record<string, PersistedAgentCanvasWorkspaceState>),
+  ) => {
+    /** 写入函数只能看到已清洗状态，输出也需再次清洗后才落入 localStorage。 */
+    const previous = sanitizeAgentCanvasWorkspaceStateMap(get(persistedAgentCanvasWorkspaceStateMapAtom))
+    const next = typeof update === 'function' ? update(previous) : update
+    set(persistedAgentCanvasWorkspaceStateMapAtom, sanitizeAgentCanvasWorkspaceStateMap(next))
+  },
+)
 
 /** 当前 renderer 运行期内的右侧双 Pane 状态；动态 Tab 失效时由 SidePanel 主动清理。 */
 export const agentSidePanelSplitMapAtom = atom<Map<string, RightWorkspaceSplitState>>(new Map())

@@ -71,6 +71,38 @@ export function selectInitialCanvasWorkspaceSession(
     ?? null
 }
 
+export interface SelectPersistedCanvasWorkspaceRestoreInput {
+  /** 上次退出时位于前台的具体 Canvas 标签。 */
+  persistedActiveTab: AgentSidePanelTab | null
+  /** 当前 metadata 与 binding 共同证明可用的具体 Canvas 标签。 */
+  availableTabs: readonly AgentSidePanelTab[]
+  /** 当前 Agent 的 binding 是否完成首次权威读取。 */
+  bindingReady: boolean
+  /** 当前项目的 Canvas metadata 是否完成首次权威读取。 */
+  metadataReady: boolean
+  /** 当前会话右侧工作区是否应保持打开。 */
+  sidePanelOpen: boolean
+  /** 当前宿主挂载时观察到的初始右侧标签。 */
+  initialTab: AgentSidePanelTab
+  /** 准备恢复时的最新右侧标签。 */
+  currentTab: AgentSidePanelTab
+  /** 当前宿主挂载后发生的明确标签选择次数。 */
+  userSelectionGeneration: number
+}
+
+/**
+ * 选择可恢复的 Canvas 标签。
+ * @returns 满足全部权威与用户意图条件的具体 Canvas；否则返回 null。
+ */
+export function selectPersistedCanvasWorkspaceRestore(
+  input: SelectPersistedCanvasWorkspaceRestoreInput,
+): AgentSidePanelTab | null {
+  if (!input.bindingReady || !input.metadataReady || !input.sidePanelOpen) return null
+  if (input.userSelectionGeneration > 0 || input.currentTab !== input.initialTab) return null
+  if (!input.persistedActiveTab || !input.availableTabs.includes(input.persistedActiveTab)) return null
+  return input.persistedActiveTab
+}
+
 export interface OpenCanvasWorkspaceEntryInput {
   /** 当前项目的完整画布列表。 */
   sessions: readonly CanvasSessionMeta[]

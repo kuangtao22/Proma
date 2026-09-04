@@ -11,8 +11,16 @@ import {
   agentStreamingStatesAtom,
   applyAgentEvent,
   clearAgentStreamError,
+  forgetAgentCanvasWorkspaceTab,
   isRetryEventForCurrentStream,
+  pruneAgentCanvasWorkspaceStates,
+  rememberAgentCanvasWorkspaceTab,
+  sanitizeAgentCanvasWorkspaceState,
+  sanitizeAgentCanvasWorkspaceStateMap,
+  setActiveAgentCanvasWorkspaceTab,
+  type AgentCanvasWorkspaceTab,
   type AgentStreamState,
+  type PersistedAgentCanvasWorkspaceState,
 } from './agent-atoms'
 
 describe('Agent 右侧画布标签', () => {
@@ -22,6 +30,70 @@ describe('Agent 右侧画布标签', () => {
     expect(source).toContain('| `canvas:${string}`')
     expect(source).toContain('export function parseCanvasWorkspaceTab')
     expect(source).toContain("tab.slice('canvas:'.length) || null")
+  })
+
+  test('Given 损坏或失效持久化值 When 清洗 Then 只保留有效且去重的具体 Canvas', () => {
+    expect(sanitizeAgentCanvasWorkspaceState({
+      openTabs: ['canvas', 'files', 'canvas:valid', 'canvas:valid', 'canvas:'],
+      activeTab: 'canvas:missing',
+    })).toEqual({ openTabs: ['canvas:valid'], activeTab: null })
+
+    expect(sanitizeAgentCanvasWorkspaceState(null)).toEqual({ openTabs: [], activeTab: null })
+  })
+
+  test('Given 顶层 localStorage 不是合法 Record When 清洗 Then 坏值降级且不影响其它会话', () => {
+    expect(sanitizeAgentCanvasWorkspaceStateMap(['canvas:a'])).toEqual({})
+    expect(sanitizeAgentCanvasWorkspaceStateMap({
+      'session-a': { openTabs: ['canvas:a'], activeTab: 'canvas:a' },
+      'session-empty': { openTabs: 'broken', activeTab: 42 },
+    })).toEqual({
+      'session-a': { openTabs: ['canvas:a'], activeTab: 'canvas:a' },
+    })
+  })
+
+  test('Given 打开、切换和关闭 Canvas When 更新持久化状态 Then 标签与活动项保持一致', () => {
+    /** 首次打开但尚未成为前台的 Canvas 状态。 */
+    const opened = rememberAgentCanvasWorkspaceTab(undefined, 'canvas:a', false)
+    /** 用户切换到第二张 Canvas 后的状态。 */
+    const activated = rememberAgentCanvasWorkspaceTab(opened, 'canvas:b', true)
+    /** 用户切换到普通右侧标签后的状态。 */
+    const backgrounded = setActiveAgentCanvasWorkspaceTab(activated, 'files')
+    /** 关闭第一张非活动 Canvas 后的状态。 */
+    const closedBackground = forgetAgentCanvasWorkspaceTab(backgrounded, 'canvas:a')
+    /** 再次激活并关闭最后一张 Canvas 后的状态。 */
+    const closedActive = forgetAgentCanvasWorkspaceTab(
+      setActiveAgentCanvasWorkspaceTab(closedBackground, 'canvas:b'),
+      'canvas:b',
+    )
+
+    expect(opened).toEqual({ openTabs: ['canvas:a'], activeTab: null })
+    expect(activated).toEqual({ openTabs: ['canvas:a', 'canvas:b'], activeTab: 'canvas:b' })
+    expect(backgrounded).toEqual({ openTabs: ['canvas:a', 'canvas:b'], activeTab: null })
+    expect(closedBackground).toEqual({ openTabs: ['canvas:b'], activeTab: null })
+    expect(closedActive).toEqual({ openTabs: [], activeTab: null })
+  })
+
+  test('Given 超过上限的历史会话 When 裁剪 Then 保留最近 50 个并始终保留当前会话', () => {
+    /** 由旧到新排列的 51 个普通 Agent 会话。 */
+    const sessions = Array.from({ length: 51 }, (_, index) => ({
+      id: `session-${index}`,
+      updatedAt: index,
+    }))
+    /** 每个会话各自保存一张已打开 Canvas。 */
+    const states: Record<string, PersistedAgentCanvasWorkspaceState> = Object.fromEntries(
+      sessions.map((session) => {
+        /** 模板字符串在测试边界显式收紧为具体 Canvas 标签。 */
+        const canvasTab = `canvas:${session.id}` as AgentCanvasWorkspaceTab
+        return [session.id, { openTabs: [canvasTab], activeTab: canvasTab }]
+      }),
+    )
+
+    const pruned = pruneAgentCanvasWorkspaceStates(states, sessions, 'session-0')
+
+    expect(Object.keys(pruned)).toHaveLength(50)
+    expect(pruned['session-0']).toBeDefined()
+    expect(pruned['session-1']).toBeUndefined()
+    expect(pruned['session-50']).toBeDefined()
   })
 })
 

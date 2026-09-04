@@ -15,6 +15,7 @@ import {
   isCanvasWorkspaceTabStillCurrent,
   runCanvasDeleteAction,
   runCanvasWorkspaceAction,
+  selectPersistedCanvasWorkspaceRestore,
   selectInitialCanvasWorkspaceSession,
   selectCanvasWorkspaceTabForPane,
   selectCanvasAfterArchive,
@@ -216,12 +217,17 @@ describe('Agent 右侧画布动态标签', () => {
     })
   })
 
-  test('Given 用户未点击添加画布 When 检查 SidePanel Then 不根据持久关联默认展示画布标签', async () => {
+  test('Given 用户未点击添加画布 When 检查 SidePanel Then 只恢复用户持久化的有效画布标签', async () => {
     const source = await Bun.file(new URL('./SidePanel.tsx', import.meta.url)).text()
 
-    expect(source).toContain('agentCanvasWorkspaceOpenTabsAtom')
+    expect(source).toContain('agentCanvasWorkspaceStateMapAtom')
+    expect(source).toContain('sanitizeAgentCanvasWorkspaceState')
+    expect(source).toContain('selectPersistedCanvasWorkspaceRestore')
+    expect(source).toContain('canvasWorkspaceRestoreRef')
+    expect(source).toContain('canvasWorkspaceRestoreRef.current.pendingTab = null')
     expect(source).toContain('openedCanvasWorkspaceTabs')
-    expect(source).toContain("openedCanvasWorkspaceTabs.includes('canvas')")
+    expect(source).not.toContain("openedCanvasWorkspaceTabs.includes('canvas')")
+    expect(source).toContain("effectiveActiveTab === 'canvas'")
     expect(source).toContain('shouldShowCanvasWorkspaceLauncher')
     expect(source).toContain('createCanvasWorkspaceEntryController')
     expect(source).toContain('handleOpenInitialCanvas')
@@ -232,6 +238,7 @@ describe('Agent 右侧画布动态标签', () => {
     expect(source).toContain('openCanvasDisabled={!currentWorkspaceId || !canvasRegistry.metadataReady || !canvasRegistry.bindingReady}')
     expect(source).toContain('if (!split || !canvasRegistry.bindingReady) return')
     expect(source).toContain('split?.focusedPane ?? null')
+    expect(source).not.toContain('agentCanvasWorkspaceOpenTabsAtom')
   })
 
   test('Given 默认、首项和归档画布 When 选择首次打开目标 Then 默认优先且只考虑未归档画布', () => {
@@ -269,6 +276,55 @@ describe('Agent 右侧画布动态标签', () => {
     expect(first).toBe(second)
     expect(await first).toBe(true)
     expect(createCalls).toBe(1)
+  })
+
+  test('Given 上次正在查看的 Canvas 仍有效 When registry 就绪且用户未切换 Then 恢复该标签', () => {
+    expect(selectPersistedCanvasWorkspaceRestore({
+      persistedActiveTab: 'canvas:canvas-1',
+      availableTabs: ['canvas:canvas-1'],
+      bindingReady: true,
+      metadataReady: true,
+      sidePanelOpen: true,
+      initialTab: 'files',
+      currentTab: 'files',
+      userSelectionGeneration: 0,
+    })).toBe('canvas:canvas-1')
+  })
+
+  test('Given 恢复条件不完整 When 决策 Then 不打开失效 Canvas 或覆盖用户选择', () => {
+    /** 共享的有效 Canvas 恢复输入。 */
+    const baseInput = {
+      persistedActiveTab: 'canvas:canvas-1' as const,
+      availableTabs: ['canvas:canvas-1'] as const,
+      bindingReady: true,
+      metadataReady: true,
+      sidePanelOpen: true,
+      initialTab: 'files' as const,
+      currentTab: 'files' as const,
+      userSelectionGeneration: 0,
+    }
+
+    expect(selectPersistedCanvasWorkspaceRestore({ ...baseInput, bindingReady: false })).toBeNull()
+    expect(selectPersistedCanvasWorkspaceRestore({ ...baseInput, metadataReady: false })).toBeNull()
+    expect(selectPersistedCanvasWorkspaceRestore({ ...baseInput, sidePanelOpen: false })).toBeNull()
+    expect(selectPersistedCanvasWorkspaceRestore({ ...baseInput, availableTabs: [] })).toBeNull()
+    expect(selectPersistedCanvasWorkspaceRestore({
+      ...baseInput,
+      currentTab: 'changes',
+      userSelectionGeneration: 1,
+    })).toBeNull()
+  })
+
+  test('Given 会话终态或历史状态超限 When 检查应用接线 Then 清理并有界裁剪持久化 Canvas 状态', async () => {
+    const [sidebarSource, appShellSource] = await Promise.all([
+      Bun.file(new URL('../app-shell/LeftSidebar.tsx', import.meta.url)).text(),
+      Bun.file(new URL('../app-shell/AppShell.tsx', import.meta.url)).text(),
+    ])
+
+    expect(sidebarSource).toContain('agentCanvasWorkspaceStateMapAtom')
+    expect(sidebarSource).not.toContain('agentCanvasWorkspaceOpenTabsAtom')
+    expect(appShellSource).toContain('pruneAgentCanvasWorkspaceStates')
+    expect(appShellSource).toContain('agentCanvasWorkspaceStateMapAtom')
   })
 
   test('Given 归档请求在途时用户切换目标 Pane When 请求完成 Then 不再执行迟到回退', () => {

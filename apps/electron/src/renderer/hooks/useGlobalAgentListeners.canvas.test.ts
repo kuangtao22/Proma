@@ -70,6 +70,8 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     expect(body).toContain('if (!workspaceOwner) return')
     expect(body).toContain('getCanvasWorkspaceTab(owner.canvasId)')
     expect(body).toContain('agentSidePanelOpenAtomFamily(workspaceOwner.id)')
+    expect(body).toContain('agentCanvasWorkspaceStateMapAtom')
+    expect(body).toContain('rememberAgentCanvasWorkspaceTab')
     expect(body).toContain('agentDiffPanelTabAtom')
     expect(body).toContain('store.set(navigateAgentCanvasViewAtom')
     expect(body).toContain('nodeId: owner.nodeId')
@@ -77,6 +79,7 @@ describe('全局 Agent listener 的 Canvas 隔离', () => {
     expect(body).not.toContain('activeCanvasSelectionAtom')
     expect(body).not.toContain("activeViewAtom, 'design'")
     expect(body).not.toContain('createLegacyAgentCanvasHostSessionId')
+    expect(body).not.toContain('agentCanvasWorkspaceOpenTabsAtom')
   })
 
   test('Given 多个有效 binding When 解析通知宿主 Then 返回最近活动且仍存在的普通 Agent', () => {

@@ -49,7 +49,7 @@ import {
   agentWorkspacesAtom,
   workspaceCapabilitiesVersionAtom,
   agentDiffPanelTabAtom,
-  agentCanvasWorkspaceOpenTabsAtom,
+  agentCanvasWorkspaceStateMapAtom,
   agentDiffRefreshVersionAtom,
   agentDiffUnseenChangesAtom,
   agentDiffUnseenFilesAtom,
@@ -972,7 +972,12 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     store.set(agentSideDelegationMapAtom, (prev) => removeDelegatedSessionSelection(prev, id))
     setUnviewedDelegatedCompleted((prev) => markSessionCompletionViewed(prev, id))
     setDiffPanelTab(deleteKey)
-    store.set(agentCanvasWorkspaceOpenTabsAtom, deleteKey)
+    store.set(agentCanvasWorkspaceStateMapAtom, (prev) => {
+      if (!(id in prev)) return prev
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
     setDiffRefreshVersion(deleteKey)
     setDiffUnseen(deleteKey)
     setDiffUnseenFiles(deleteKey)

@@ -12,7 +12,7 @@ import { LeftSidebar } from './LeftSidebar'
 import { RightSidePanel } from './RightSidePanel'
 import { MainArea } from '@/components/tabs/MainArea'
 import { appModeAtom } from '@/atoms/app-mode'
-import { agentDiffPanelTabAtom, agentSessionComponentOpenMapAtom, agentSessionsAtom, agentSidePanelLayoutAtomFamily, agentSidePanelLayoutMapAtom, agentSidePanelSplitMapAtom, currentAgentSessionIdAtom, currentSessionSidePanelOpenAtom, isWorkspaceComponentTab, pruneAgentSidePanelLayouts, fileBrowserExpandedPathsAtom, fileBrowserScrollTopMapAtom, pruneFileBrowserStateMap } from '@/atoms/agent-atoms'
+import { agentCanvasWorkspaceStateMapAtom, agentDiffPanelTabAtom, agentSessionComponentOpenMapAtom, agentSessionsAtom, agentSidePanelLayoutAtomFamily, agentSidePanelLayoutMapAtom, agentSidePanelSplitMapAtom, currentAgentSessionIdAtom, currentSessionSidePanelOpenAtom, isWorkspaceComponentTab, pruneAgentCanvasWorkspaceStates, pruneAgentSidePanelLayouts, fileBrowserExpandedPathsAtom, fileBrowserScrollTopMapAtom, pruneFileBrowserStateMap } from '@/atoms/agent-atoms'
 import { leftSidebarWidthAtom } from '@/atoms/sidebar-atoms'
 import { sidebarCollapsedAtom } from '@/atoms/tab-atoms'
 import { clampRightPanelWidth, getRightPanelMaxWidth } from './right-panel-layout'
@@ -158,6 +158,7 @@ export function AppShell(): React.ReactElement {
   const setFileBrowserExpandedPaths = useSetAtom(fileBrowserExpandedPathsAtom)
   const setFileBrowserScrollTopMap = useSetAtom(fileBrowserScrollTopMapAtom)
   const setRightPanelSplitMap = useSetAtom(agentSidePanelSplitMapAtom)
+  const setCanvasWorkspaceStates = useSetAtom(agentCanvasWorkspaceStateMapAtom)
   const [rightPanelLayout, setRightPanelLayout] = useAtom(agentSidePanelLayoutAtomFamily(currentSessionId ?? ''))
   const [viewportWidth, setViewportWidth] = React.useState(() => window.innerWidth)
   const dragging = React.useRef(false)
@@ -215,6 +216,7 @@ export function AppShell(): React.ReactElement {
 
   React.useEffect(() => {
     setRightPanelLayouts((previous) => pruneAgentSidePanelLayouts(previous, agentSessions, currentSessionId ?? undefined))
+    setCanvasWorkspaceStates((previous) => pruneAgentCanvasWorkspaceStates(previous, agentSessions, currentSessionId ?? undefined))
     const retainedSessionIds = new Set(agentSessions.map((session) => session.id))
     if (currentSessionId) retainedSessionIds.add(currentSessionId)
     setFileBrowserExpandedPaths((previous) => pruneFileBrowserStateMap(previous, retainedSessionIds))
@@ -223,7 +225,7 @@ export function AppShell(): React.ReactElement {
       const next = new Map([...previous].filter(([sessionId]) => retainedSessionIds.has(sessionId)))
       return next.size === previous.size ? previous : next
     })
-  }, [agentSessions, currentSessionId, setFileBrowserExpandedPaths, setFileBrowserScrollTopMap, setRightPanelLayouts, setRightPanelSplitMap])
+  }, [agentSessions, currentSessionId, setCanvasWorkspaceStates, setFileBrowserExpandedPaths, setFileBrowserScrollTopMap, setRightPanelLayouts, setRightPanelSplitMap])
 
   React.useEffect(() => {
     // 分屏本身是临时宽布局，不能因为其中一个 Pane 是 Browser/Preview 就污染退出后的宽度。

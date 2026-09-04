@@ -74,7 +74,7 @@ import {
   agentSessionDraftSyncVersionsAtom,
   agentSessionDraftHtmlAtom,
   agentTerminalTabsAtom,
-  agentCanvasWorkspaceOpenTabsAtom,
+  agentCanvasWorkspaceStateMapAtom,
   agentSidePanelSplitMapAtom,
   agentSidePanelSplitRatioMapAtom,
 } from '@/atoms/agent-atoms'
@@ -89,9 +89,13 @@ import {
   getPreviewSidePanelTab,
   getTerminalIdFromSidePanelTab,
   getTerminalSidePanelTab,
+  forgetAgentCanvasWorkspaceTab,
   parseCanvasWorkspaceTab,
+  rememberAgentCanvasWorkspaceTab,
+  sanitizeAgentCanvasWorkspaceState,
+  setActiveAgentCanvasWorkspaceTab,
 } from '@/atoms/agent-atoms'
-import type { AgentSidePanelTab, AgentFileSourceFilter, AgentExplorationBranchTab, WorkspaceComponentTab } from '@/atoms/agent-atoms'
+import type { AgentSidePanelTab, AgentFileSourceFilter, AgentExplorationBranchTab, PersistedAgentCanvasWorkspaceState, WorkspaceComponentTab } from '@/atoms/agent-atoms'
 import { WorkspaceMemoryTab } from '@/components/agent-skills/WorkspaceMemoryTab'
 import { AgentSkillsView } from '@/components/agent-skills/AgentSkillsView'
 import { PlanningView } from '@/components/planning/PlanningView'
@@ -163,6 +167,7 @@ import {
   runCanvasWorkspaceAction,
   selectCanvasWorkspaceTabForPane,
   selectCanvasAfterArchive,
+  selectPersistedCanvasWorkspaceRestore,
   setAgentDefaultCanvas,
 } from './canvas-workspace-actions'
 import type { PendingCanvasDelete } from './canvas-workspace-actions'
@@ -1188,7 +1193,67 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     setIsOpen(false)
   }, [sessionId, setIsOpen])
 
+  const [canvasWorkspaceStateMap, setCanvasWorkspaceStateMap] = useAtom(agentCanvasWorkspaceStateMapAtom)
+  /** 当前会话从本地存储恢复并严格清洗后的 Canvas 工作区偏好。 */
+  const canvasWorkspaceState = React.useMemo(
+    () => sanitizeAgentCanvasWorkspaceState(canvasWorkspaceStateMap[sessionId]),
+    [canvasWorkspaceStateMap, sessionId],
+  )
+  /** 当前会话由用户明确打开且尚未关闭的具体 Canvas 标签。 */
+  const openedCanvasWorkspaceTabs = canvasWorkspaceState.openTabs
+  /** 当前恢复宿主身份，项目或会话变化时必须重新建立恢复基线。 */
+  const canvasWorkspaceRestoreHostKey = `${sessionId}\u0000${currentWorkspaceId ?? ''}`
+  /** 恢复只允许覆盖挂载初态；任何明确标签选择都会使迟到恢复失效。 */
+  const canvasWorkspaceRestoreRef = React.useRef({
+    hostKey: canvasWorkspaceRestoreHostKey,
+    initialTab: effectiveActiveTab,
+    userSelectionGeneration: 0,
+    attempted: false,
+    pendingTab: null as AgentSidePanelTab | null,
+  })
+  if (canvasWorkspaceRestoreRef.current.hostKey !== canvasWorkspaceRestoreHostKey) {
+    canvasWorkspaceRestoreRef.current = {
+      hostKey: canvasWorkspaceRestoreHostKey,
+      initialTab: effectiveActiveTab,
+      userSelectionGeneration: 0,
+      attempted: false,
+      pendingTab: null,
+    }
+  }
+
+  /** 原子更新当前会话 Canvas 偏好；空集合直接删除 session 键。 */
+  const updateCanvasWorkspaceState = React.useCallback((
+    update: (state: PersistedAgentCanvasWorkspaceState) => PersistedAgentCanvasWorkspaceState,
+  ): void => {
+    setCanvasWorkspaceStateMap((previous) => {
+      /** 更新前先清洗本地存储值，避免损坏数据进入业务逻辑。 */
+      const current = sanitizeAgentCanvasWorkspaceState(previous[sessionId])
+      const nextState = update(current)
+      const unchanged = current.activeTab === nextState.activeTab
+        && current.openTabs.length === nextState.openTabs.length
+        && current.openTabs.every((tab, index) => tab === nextState.openTabs[index])
+      const stored = previous[sessionId]
+      const storedIsCanonical = stored !== undefined
+        && stored.activeTab === current.activeTab
+        && stored.openTabs.length === current.openTabs.length
+        && stored.openTabs.every((tab, index) => tab === current.openTabs[index])
+      if (unchanged && (storedIsCanonical || (!stored && nextState.openTabs.length === 0))) return previous
+      const next = { ...previous }
+      if (nextState.openTabs.length === 0) delete next[sessionId]
+      else next[sessionId] = nextState
+      return next
+    })
+  }, [sessionId, setCanvasWorkspaceStateMap])
+
+  /** 记录明确标签选择并更新 Canvas 前台偏好，阻断尚未完成的启动恢复。 */
+  const recordWorkspaceTabSelection = React.useCallback((tab: AgentSidePanelTab): void => {
+    canvasWorkspaceRestoreRef.current.pendingTab = null
+    canvasWorkspaceRestoreRef.current.userSelectionGeneration += 1
+    updateCanvasWorkspaceState((current) => setActiveAgentCanvasWorkspaceTab(current, tab))
+  }, [updateCanvasWorkspaceState])
+
   const handleWorkspaceTabChange = React.useCallback((tab: AgentSidePanelTab) => {
+    recordWorkspaceTabSelection(tab)
     if (tab === 'delegation' && sideDelegationSessionId) {
       rememberStopGenerationTarget({ kind: 'agent', sessionId: sideDelegationSessionId })
       markDelegationSessionViewed(sideDelegationSessionId)
@@ -1221,43 +1286,27 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     if (queue.sessionId !== sessionId) return
     queue.desiredTabId = browserTabId
     flushBrowserTabSelection()
-  }, [flushBrowserTabSelection, markDelegationSessionViewed, onTabChange, previewFiles, sessionId, setPreviewFileMap, sideChatConversationId, sideDelegationSessionId, sideTemporaryAgents, split, updateSplit])
-
-  const [canvasWorkspaceOpenTabs, setCanvasWorkspaceOpenTabs] = useAtom(agentCanvasWorkspaceOpenTabsAtom)
-  const openedCanvasWorkspaceTabs = canvasWorkspaceOpenTabs.get(sessionId) ?? []
+  }, [flushBrowserTabSelection, markDelegationSessionViewed, onTabChange, previewFiles, recordWorkspaceTabSelection, sessionId, setPreviewFileMap, sideChatConversationId, sideDelegationSessionId, sideTemporaryAgents, split, updateSplit])
 
   /** 登记用户明确打开的 Canvas 标签；具体画布会替换仅用于选取画布的 launcher。 */
-  const rememberOpenedCanvasWorkspaceTab = React.useCallback((tab: AgentSidePanelTab): void => {
-    if (tab !== 'canvas' && !parseCanvasWorkspaceTab(tab)) return
-    setCanvasWorkspaceOpenTabs((previous) => {
-      const current = previous.get(sessionId) ?? []
-      const withoutLauncher = tab === 'canvas' ? current : current.filter((item) => item !== 'canvas')
-      if (withoutLauncher.includes(tab) && withoutLauncher.length === current.length) return previous
-      const next = new Map(previous)
-      next.set(sessionId, withoutLauncher.includes(tab) ? withoutLauncher : [...withoutLauncher, tab])
-      return next
-    })
-  }, [sessionId, setCanvasWorkspaceOpenTabs])
+  const rememberOpenedCanvasWorkspaceTab = React.useCallback((tab: AgentSidePanelTab, makeActive: boolean): void => {
+    if (!parseCanvasWorkspaceTab(tab)) return
+    updateCanvasWorkspaceState((current) => rememberAgentCanvasWorkspaceTab(current, tab, makeActive))
+  }, [updateCanvasWorkspaceState])
 
   /** 移除已关闭或已失效的 Canvas 标签，避免未来重新关联时自动显示。 */
   const forgetOpenedCanvasWorkspaceTab = React.useCallback((tab: AgentSidePanelTab): void => {
-    setCanvasWorkspaceOpenTabs((previous) => {
-      const current = previous.get(sessionId)
-      if (!current?.includes(tab)) return previous
-      const remaining = current.filter((item) => item !== tab)
-      const next = new Map(previous)
-      if (remaining.length > 0) next.set(sessionId, remaining)
-      else next.delete(sessionId)
-      return next
-    })
-  }, [sessionId, setCanvasWorkspaceOpenTabs])
+    updateCanvasWorkspaceState((current) => forgetAgentCanvasWorkspaceTab(current, tab))
+  }, [updateCanvasWorkspaceState])
 
   /** Canvas 异步动作按发起 Pane 写入最新 split，避免依赖请求返回时的焦点。 */
   const handleCanvasWorkspaceTabChange = React.useCallback((
     tab: AgentSidePanelTab,
     pane: RightWorkspacePane | null,
   ): void => {
-    rememberOpenedCanvasWorkspaceTab(tab)
+    canvasWorkspaceRestoreRef.current.pendingTab = null
+    canvasWorkspaceRestoreRef.current.userSelectionGeneration += 1
+    rememberOpenedCanvasWorkspaceTab(tab, true)
     setSplitMap((previous) => {
       const current = previous.get(sessionId) ?? null
       const nextSplit = selectCanvasWorkspaceTabForPane(current, tab, pane)
@@ -1303,27 +1352,55 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     ),
     [canvasRegistry.binding, canvasRegistry.canvasActivityStates, canvasRegistry.sessions],
   )
-  const canvasWorkspaceTabs = React.useMemo(
-    () => availableCanvasWorkspaceTabs.filter((canvas) => openedCanvasWorkspaceTabs.includes(canvas.id)),
-    [availableCanvasWorkspaceTabs, openedCanvasWorkspaceTabs],
-  )
+  const canvasWorkspaceTabs = React.useMemo(() => {
+    /** 使用通用工作区标签集合与 registry 投影比较，避免丢失 id 的具体模板类型。 */
+    const openedTabs = new Set<AgentSidePanelTab>(openedCanvasWorkspaceTabs)
+    return availableCanvasWorkspaceTabs.filter((canvas) => openedTabs.has(canvas.id))
+  }, [availableCanvasWorkspaceTabs, openedCanvasWorkspaceTabs])
 
   React.useEffect(() => {
-    if (!canvasRegistry.bindingReady) return
+    if (!canvasRegistry.bindingReady || !canvasRegistry.metadataReady) return
+    /** metadata 与 binding 共同证明当前仍可访问的具体 Canvas 标签。 */
     const availableTabIds = new Set(availableCanvasWorkspaceTabs.map((canvas) => canvas.id))
-    setCanvasWorkspaceOpenTabs((previous) => {
-      const current = previous.get(sessionId)
-      if (!current) return previous
-      const remaining = current.filter((tab) => (
-        tab === 'canvas' ? availableTabIds.size === 0 : availableTabIds.has(tab)
-      ))
-      if (remaining.length === current.length) return previous
-      const next = new Map(previous)
-      if (remaining.length > 0) next.set(sessionId, remaining)
-      else next.delete(sessionId)
-      return next
+    updateCanvasWorkspaceState((current) => {
+      /** 删除、归档、解绑或跨项目失效的标签都不能继续恢复。 */
+      const openTabs = current.openTabs.filter((tab) => availableTabIds.has(tab))
+      const activeTab = current.activeTab && openTabs.includes(current.activeTab)
+        ? current.activeTab
+        : null
+      return { openTabs, activeTab }
     })
-  }, [availableCanvasWorkspaceTabs, canvasRegistry.bindingReady, sessionId, setCanvasWorkspaceOpenTabs])
+
+    const restore = canvasWorkspaceRestoreRef.current
+    if (restore.attempted || !isOpen) return
+    /** 仅在当前宿主仍处于挂载初态时恢复，避免覆盖加载期间的新选择。 */
+    const targetTab = selectPersistedCanvasWorkspaceRestore({
+      persistedActiveTab: canvasWorkspaceState.activeTab,
+      availableTabs: [...availableTabIds],
+      bindingReady: canvasRegistry.bindingReady,
+      metadataReady: canvasRegistry.metadataReady,
+      sidePanelOpen: isOpen,
+      initialTab: restore.initialTab,
+      currentTab: effectiveActiveTab,
+      userSelectionGeneration: restore.userSelectionGeneration,
+    })
+    restore.attempted = true
+    if (targetTab && targetTab !== effectiveActiveTab) {
+      restore.pendingTab = targetTab
+      onTabChange(targetTab)
+    }
+  }, [availableCanvasWorkspaceTabs, canvasRegistry.bindingReady, canvasRegistry.metadataReady, canvasWorkspaceState.activeTab, effectiveActiveTab, isOpen, onTabChange, updateCanvasWorkspaceState])
+
+  React.useEffect(() => {
+    const restore = canvasWorkspaceRestoreRef.current
+    if (!restore.attempted) return
+    if (restore.pendingTab) {
+      if (restore.pendingTab !== effectiveActiveTab) return
+      restore.pendingTab = null
+    }
+    /** 恢复完成后的所有标签来源都同步活动 Canvas，包含原生 Browser 等外部焦点事件。 */
+    updateCanvasWorkspaceState((current) => setActiveAgentCanvasWorkspaceTab(current, effectiveActiveTab))
+  }, [effectiveActiveTab, updateCanvasWorkspaceState])
   /** 当前有焦点的工作区标签，用于归档当前画布后的确定性回退。 */
   const focusedWorkspaceTab = split ? getFocusedRightWorkspaceTab(split) : effectiveActiveTab
   /** 当前有焦点的画布 ID；非画布标签返回 null。 */
@@ -1646,7 +1723,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       canvasRegistry.binding,
       canvasRegistry.sessions,
       canvasRegistry.bindingReady,
-      openedCanvasWorkspaceTabs.includes('canvas'),
+      effectiveActiveTab === 'canvas',
     )
       ? [{ id: 'canvas', label: '画布', icon: <Workflow className="size-3.5" />, closable: true } as const]
       : []),
@@ -1703,7 +1780,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       closable: true,
       activity: showBrowserActivity && activeBrowserTabId !== tab.tabId && browserState.activeTabId === tab.tabId,
     })) ?? []),
-  ], [activeBrowserTabId, browserState, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.sessions, canvasWorkspaceTabs, currentWorkspaceId, openedCanvasWorkspaceTabs, previewFiles, selectedDelegationSession, selectedDelegationStatus, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
+  ], [activeBrowserTabId, browserState, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.sessions, canvasWorkspaceTabs, currentWorkspaceId, effectiveActiveTab, previewFiles, selectedDelegationSession, selectedDelegationStatus, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
   workspaceTabsRef.current = workspaceTabs
 
   React.useEffect(() => {
