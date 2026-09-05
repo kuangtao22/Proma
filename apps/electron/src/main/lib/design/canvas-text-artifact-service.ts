@@ -35,6 +35,7 @@ import {
   type CanvasArtifactAdapter,
   type CanvasArtifactDescriptor,
 } from './canvas-artifact-registry'
+import type { CanvasDependencyStateService } from './canvas-dependency-state-service'
 
 /** 文本产物变更的可信调用来源。 */
 export type CanvasTextArtifactChangeSource =
@@ -50,6 +51,8 @@ export interface CanvasTextArtifactServiceUpdateInput extends UpdateCanvasTextAr
 export interface CanvasTextArtifactGraphCommitInput extends CanvasTarget {
   operationId: string
   expectedCanvasRevision: number
+  /** 与 expected revision 对应的权威图基线，供同事务依赖投影使用。 */
+  document: CanvasDocument
   node: CanvasDocumentNode | CanvasWebviewNode
   source?: CanvasChangeSource
 }
@@ -62,9 +65,11 @@ export interface CanvasTextArtifactGraphWriter {
 /** 用户图写与 Agent batch 分支使用的依赖。 */
 export interface CanvasTextArtifactGraphWriterDependencies {
   documents: Pick<CanvasDocumentStore, 'mutate'>
+  dependencyState: CanvasDependencyStateService
   batch: {
     execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult>
   }
+  now?: () => number
 }
 
 /** 经过 save dialog 授权后的文本产物导出输入。 */
@@ -233,8 +238,25 @@ export function createCanvasTextArtifactGraphWriter(
 ): CanvasTextArtifactGraphWriter {
   return {
     commit: async (input) => {
-      /** 单节点更新 mutation 不改变其它节点或边。 */
-      const mutation = { type: 'upsert-nodes' as const, nodes: [input.node] }
+      /** 依赖投影与 producer 正式 revision 在同一批节点中提交。 */
+      const dependencyProjection = dependencies.dependencyState.consumeAndPropagate({
+        document: input.document,
+        producerNodeIds: [input.node.id],
+        changedAt: (dependencies.now ?? Date.now)(),
+      })
+      /** producer 必须来自权威基线，缺失时拒绝提交不完整图事实。 */
+      const projectedProducer = dependencyProjection.nodes.find((node) => node.id === input.node.id)
+      if (!projectedProducer
+        || !isTextNode(projectedProducer)
+        || projectedProducer.kind !== input.node.kind) {
+        throw new Error('CANVAS_TEXT_ARTIFACT_IDENTITY_CONFLICT')
+      }
+      /** producer 的 upstreamChange 已由纯服务消费，只叠加本次正式正文 revision。 */
+      const producerNode = replaceNodeContentRevision(projectedProducer, input.node.contentRevision)
+      const nodes = dependencyProjection.nodes.map((node) => (
+        node.id === producerNode.id ? producerNode : node
+      ))
+      const mutation = { type: 'upsert-nodes' as const, nodes }
       if (!input.source) {
         return dependencies.documents.mutate(
           { projectId: input.projectId, canvasId: input.canvasId },
@@ -375,6 +397,7 @@ export function createCanvasTextArtifactService(
         canvasId: input.canvasId,
         operationId: input.operationId,
         expectedCanvasRevision: input.expectedCanvasRevision,
+        document: current.document,
         node: nextNode,
         ...(input.source.type === 'agent'
           ? { source: toCanvasChangeSource(input.source) }
@@ -430,6 +453,7 @@ export function createCanvasTextArtifactService(
         canvasId: input.canvasId,
         operationId: input.operationId,
         expectedCanvasRevision: input.expectedCanvasRevision,
+        document: current.document,
         node: replaceNodeContentRevision(currentNode, input.revision),
       })
       /** prepared 恢复候选被采用后同样进入 committed 状态。 */

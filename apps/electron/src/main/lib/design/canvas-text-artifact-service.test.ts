@@ -21,6 +21,7 @@ import {
   DOCUMENT_ARTIFACT_DESCRIPTOR,
   WEBVIEW_ARTIFACT_DESCRIPTOR,
 } from './canvas-artifact-registry'
+import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
 
 /** 测试使用的固定文档节点。 */
 const documentNode: CanvasDocumentNode = {
@@ -447,11 +448,14 @@ describe('Canvas Text Artifact Graph Writer', () => {
           return { document: structuredClone(document), operationId: 'batch-1' }
         },
       },
+      dependencyState: createCanvasDependencyStateService(),
+      now: () => 50,
     })
     /** 用户分支提交输入。 */
     const userInput: CanvasTextArtifactGraphCommitInput = {
       projectId: 'project-1', canvasId: 'canvas-1', operationId: 'operation-user',
-      expectedCanvasRevision: 7, node: { ...documentNode, contentRevision: 3 },
+      expectedCanvasRevision: 7, document: createDocument(7),
+      node: { ...documentNode, contentRevision: 3 },
     }
     /** Agent 分支提交输入。 */
     const agentInput: CanvasTextArtifactGraphCommitInput = {
@@ -464,5 +468,94 @@ describe('Canvas Text Artifact Graph Writer', () => {
     await writer.commit(agentInput)
 
     expect(calls).toEqual(['user:upsert-nodes', 'agent:session-1:tool-1'])
+  })
+
+  test('Given 文档正式提交存在绑定下游 When graph commit Then 同一 mutation 消费自身提示并传播下游', async () => {
+    const producer: CanvasDocumentNode = {
+      ...documentNode,
+      upstreamChange: { sourceNodeIds: ['older-source'], changedAt: 5 },
+    }
+    const downstream: CanvasDocumentNode = {
+      id: 'doc-2', kind: 'document', title: '下游', position: { x: 320, y: 0 },
+      documentId: 'content-2', contentRevision: 1,
+      upstreamChange: { sourceNodeIds: ['pending-source'], changedAt: 6 },
+    }
+    const document: CanvasDocument = {
+      ...createDocument(),
+      nodes: [producer, downstream],
+      edges: [{
+        id: 'edge-1', sourceNodeId: producer.id, sourcePort: 'document.markdown',
+        targetNodeId: downstream.id, targetPort: 'context.text', relation: 'depends-on',
+      }],
+    }
+    /** 单次 Store mutation 捕获完整 producer 与下游投影。 */
+    const mutationNodeBatches: CanvasDocument['nodes'][] = []
+    const writer = createCanvasTextArtifactGraphWriter({
+      documents: {
+        mutate: (_target, _revision, mutations) => {
+          const mutation = mutations[0]
+          if (mutation?.type === 'upsert-nodes') mutationNodeBatches.push(structuredClone(mutation.nodes))
+          return { ...document, revision: document.revision + 1 }
+        },
+      },
+      batch: { execute: async () => { throw new Error('测试不使用 Agent batch') } },
+      dependencyState: createCanvasDependencyStateService(),
+      now: () => 50,
+    })
+
+    await writer.commit({
+      projectId: document.projectId,
+      canvasId: document.canvasId,
+      operationId: 'operation-user',
+      expectedCanvasRevision: document.revision,
+      document,
+      node: { ...producer, contentRevision: 3 },
+    })
+
+    expect(mutationNodeBatches).toHaveLength(1)
+    expect(mutationNodeBatches[0]?.find((node) => node.id === producer.id)).toEqual({
+      ...documentNode,
+      contentRevision: 3,
+    })
+    expect(mutationNodeBatches[0]?.find((node) => node.id === downstream.id)?.upstreamChange).toEqual({
+      sourceNodeIds: ['doc-1', 'pending-source'],
+      changedAt: 50,
+    })
+  })
+
+  test('Given 图提交失败 When document 更新尝试传播 Then 只发生一次原子提交且不留下部分传播', async () => {
+    const document = createDocument()
+    document.nodes[0] = {
+      ...document.nodes[0]!,
+      upstreamChange: { sourceNodeIds: ['older-source'], changedAt: 5 },
+    }
+    document.edges = [{
+      id: 'edge-1', sourceNodeId: 'doc-1', sourcePort: 'document.markdown',
+      targetNodeId: 'web-1', targetPort: 'context.text', relation: 'reference',
+    }]
+    let mutationCalls = 0
+    const writer = createCanvasTextArtifactGraphWriter({
+      documents: {
+        mutate: () => {
+          mutationCalls += 1
+          throw new Error('CANVAS_REVISION_CONFLICT')
+        },
+      },
+      batch: { execute: async () => { throw new Error('测试不使用 Agent batch') } },
+      dependencyState: createCanvasDependencyStateService(),
+      now: () => 60,
+    })
+
+    await expect(writer.commit({
+      projectId: document.projectId,
+      canvasId: document.canvasId,
+      operationId: 'operation-user',
+      expectedCanvasRevision: document.revision,
+      document,
+      node: { ...documentNode, contentRevision: 3 },
+    })).rejects.toThrow('CANVAS_REVISION_CONFLICT')
+    expect(mutationCalls).toBe(1)
+    expect(document.nodes[0]?.upstreamChange).toEqual({ sourceNodeIds: ['older-source'], changedAt: 5 })
+    expect(document.nodes[1]?.upstreamChange).toBeUndefined()
   })
 })

@@ -2,11 +2,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import {
   parseAdoptCanvasImageCandidateBatchInput,
   parseGetCanvasImageCandidateBatchInput,
-  resolveCanvasEdgeBinding,
 } from '@proma/shared'
 import type {
   AdoptCanvasImageCandidateBatchInput,
-  CanvasEdge,
   CanvasImageCandidateBatch,
   CanvasImageCandidateBatchEntry,
   CanvasImageCandidateBatchSource,
@@ -21,6 +19,7 @@ import type {
   CanvasImageCandidateAdoptionIntent,
   CanvasImageCandidateBatchStore,
 } from './canvas-image-candidate-batch-store'
+import type { CanvasDependencyStateService } from './canvas-dependency-state-service'
 
 /** 创建批次时每个节点已经固化的基线。 */
 export interface CreateCanvasImageCandidateBatchEntry {
@@ -71,6 +70,8 @@ export interface AdoptExistingCanvasImageAssetInput extends CanvasImageTarget {
 /** 候选批次业务服务依赖。 */
 export interface CanvasImageCandidateBatchServiceDependencies {
   store: CanvasImageCandidateBatchStore
+  /** 正式采用时复用的纯依赖提示投影；候选创建和终态登记不得调用。 */
+  dependencyState: CanvasDependencyStateService
   runExclusive: <T>(target: CanvasTarget, effect: () => Promise<T>) => Promise<T>
   loadConfig: (target: CanvasImageTarget) => Promise<CanvasImageModuleConfig>
   adoptAsset: (
@@ -135,79 +136,45 @@ function createGraphSha256(document: CanvasDocument): string {
   })).digest('hex')
 }
 
-/** 允许传播“上游已变化”提示的数据关系。 */
-const UPSTREAM_CHANGE_RELATIONS = new Set(['reference', 'depends-on', 'derives'])
-
-/** 只有类型合同已确认的数据边才能传播上游变化。 */
-function isPropagatingCanvasEdge(
-  edge: CanvasEdge,
-  nodesById: ReadonlyMap<string, CanvasNode>,
-): boolean {
-  if (edge.relation === 'association' || !UPSTREAM_CHANGE_RELATIONS.has(edge.relation)) return false
-  const source = nodesById.get(edge.sourceNodeId)
-  const target = nodesById.get(edge.targetNodeId)
-  return Boolean(source && target
-    && resolveCanvasEdgeBinding(edge, source.kind, target.kind).state === 'bound')
-}
-
 /** 从图关系派生本批需要提示更新的直接下游节点。 */
 function getInvalidatedDownstreamNodeIds(
   document: CanvasDocument,
   intent: CanvasImageCandidateAdoptionIntent,
+  dependencyState: CanvasDependencyStateService,
 ): string[] {
-  /** 本批正式采用的源节点集合。 */
-  const sourceNodeIds = new Set(intent.entries.map((entry) => entry.nodeId))
-  /** 单次建立节点索引，避免逐边线性搜索。 */
-  const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
-  return [...new Set(document.edges
-    .filter((edge) => sourceNodeIds.has(edge.sourceNodeId) && isPropagatingCanvasEdge(edge, nodesById))
-    .map((edge) => edge.targetNodeId))].sort()
+  return dependencyState.consumeAndPropagate({
+    document,
+    producerNodeIds: intent.entries.map((entry) => entry.nodeId),
+    changedAt: intent.createdAt,
+  }).downstreamNodeIds
 }
 
 /** 从基线图构造整批采用后的单次节点投影。 */
 function createAdoptionProjection(
   document: CanvasDocument,
   intent: CanvasImageCandidateAdoptionIntent,
+  dependencyState: CanvasDependencyStateService,
 ): { nodes: CanvasNode[]; invalidatedDownstreamNodeIds: string[]; expectedDocument: CanvasDocument } {
   /** 按节点定位本批采用条目。 */
   const entryByNodeId = new Map(intent.entries.map((entry) => [entry.nodeId, entry]))
-  /** 传播判定复用同一节点索引，保持恢复哈希与首次提交完全一致。 */
-  const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
-  /** 每个下游节点聚合本次变化的直接上游。 */
-  const changedSourcesByNodeId = new Map<string, Set<string>>()
-  for (const edge of document.edges) {
-    if (!entryByNodeId.has(edge.sourceNodeId) || !isPropagatingCanvasEdge(edge, nodesById)) continue
-    /** 同一下游可同时受本批多个图片节点影响。 */
-    const sources = changedSourcesByNodeId.get(edge.targetNodeId) ?? new Set<string>()
-    sources.add(edge.sourceNodeId)
-    changedSourcesByNodeId.set(edge.targetNodeId, sources)
-  }
-  /** 只提交发生变化的图片节点和直接数据下游。 */
-  const nodes: CanvasNode[] = []
-  /** 权威图中的节点 ID 用于拒绝悬空关系。 */
-  const existingNodeIds = new Set(document.nodes.map((node) => node.id))
-  for (const node of document.nodes) {
+  /** 统一纯服务同时消费 producer 自身提示并聚合直接下游。 */
+  const dependencyProjection = dependencyState.consumeAndPropagate({
+    document,
+    producerNodeIds: intent.entries.map((entry) => entry.nodeId),
+    changedAt: intent.createdAt,
+  })
+  /** 在同一节点投影内叠加正式采用素材，保证只发生一次图 mutation。 */
+  const nodes = dependencyProjection.nodes.map((node): CanvasNode => {
     const entry = entryByNodeId.get(node.id)
-    const changedSources = changedSourcesByNodeId.get(node.id)
-    if (entry) {
-      if (node.kind !== 'image'
-        || node.imageModuleId !== entry.imageModuleId
-        || (node.adoptedAssetId ?? null) !== entry.oldAssetId) {
-        throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
-      }
-      nodes.push({ ...node, adoptedAssetId: entry.candidateAssetId })
-      continue
+    if (!entry) return node
+    if (node.kind !== 'image'
+      || node.imageModuleId !== entry.imageModuleId
+      || (node.adoptedAssetId ?? null) !== entry.oldAssetId) {
+      throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
     }
-    if (!changedSources) continue
-    /** 保留旧提示并合并本次来源，避免覆盖尚未处理的上游变化。 */
-    const sourceNodeIds = [...new Set([
-      ...(node.upstreamChange?.sourceNodeIds ?? []),
-      ...changedSources,
-    ])].sort()
-    nodes.push({ ...node, upstreamChange: { sourceNodeIds, changedAt: intent.createdAt } })
-  }
-  if (nodes.filter((node) => entryByNodeId.has(node.id)).length !== intent.entries.length
-    || [...changedSourcesByNodeId.keys()].some((nodeId) => !existingNodeIds.has(nodeId))) {
+    return { ...node, adoptedAssetId: entry.candidateAssetId }
+  })
+  if (nodes.filter((node) => entryByNodeId.has(node.id)).length !== intent.entries.length) {
     throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
   }
   /** 用 reducer 等价的 upsert 结果计算崩溃后可证明的最终图哈希。 */
@@ -220,7 +187,7 @@ function createAdoptionProjection(
   }
   return {
     nodes,
-    invalidatedDownstreamNodeIds: [...changedSourcesByNodeId.keys()].sort(),
+    invalidatedDownstreamNodeIds: dependencyProjection.downstreamNodeIds,
     expectedDocument,
   }
 }
@@ -365,7 +332,7 @@ export function createCanvasImageCandidateBatchService(
     /** 图提交只允许从原基线推进一次，或由 revision+哈希精确证明已完成。 */
     let document = await dependencies.loadCanvas(intent)
     if (document.revision === intent.baseCanvasRevision) {
-      const projection = createAdoptionProjection(document, intent)
+      const projection = createAdoptionProjection(document, intent, dependencies.dependencyState)
       try {
         document = await dependencies.applyCanvasProjection(
           intent,
@@ -394,7 +361,11 @@ export function createCanvasImageCandidateBatchService(
     }
 
     /** 批次终态只保存采用/保留集合和下游提示，不触发任何新任务。 */
-    const invalidatedDownstreamNodeIds = getInvalidatedDownstreamNodeIds(document, intent)
+    const invalidatedDownstreamNodeIds = getInvalidatedDownstreamNodeIds(
+      document,
+      intent,
+      dependencies.dependencyState,
+    )
     let batch = await dependencies.store.load(intent, intent.batchId)
     if (!isBatchCommitted(batch, intent, invalidatedDownstreamNodeIds)) {
       if (batch.status === 'adopted' || batch.status === 'abandoned') {
@@ -591,7 +562,7 @@ export function createCanvasImageCandidateBatchService(
       updatedAt: timestamp,
     }
     /** 最终哈希在 intent 首次可见前完成，恢复无需重新猜测目标图。 */
-    const projection = createAdoptionProjection(document, draftIntent)
+    const projection = createAdoptionProjection(document, draftIntent, dependencies.dependencyState)
     const intent = await dependencies.store.saveAdoptionIntent({
       ...draftIntent,
       expectedGraphSha256: createGraphSha256(projection.expectedDocument),

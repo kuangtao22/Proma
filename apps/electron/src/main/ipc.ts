@@ -244,6 +244,7 @@ import { createCanvasImageJobTargetAdapter } from './lib/design/canvas-image-job
 import { createCanvasImageInputResolver } from './lib/design/canvas-image-input-resolver'
 import { createCanvasImageCandidateBatchStore } from './lib/design/canvas-image-candidate-batch-store'
 import { createCanvasImageCandidateBatchService } from './lib/design/canvas-image-candidate-batch-service'
+import { createCanvasDependencyStateService } from './lib/design/canvas-dependency-state-service'
 import {
   createCanvasWebviewPreviewService,
   createElectronCanvasWebviewOffscreenRenderer,
@@ -2256,10 +2257,13 @@ export function registerIpcHandlers(): void {
   const canvasImageCandidateBatchStore = createCanvasImageCandidateBatchStore({
     documents: canvasDocumentStore,
   })
+  /** 正式产物提交统一复用唯一纯依赖投影，不持有 Store、锁或后台状态。 */
+  const canvasDependencyStateService = createCanvasDependencyStateService()
   /** Service 回调只会在 Job Manager 完成赋值后执行。 */
   let designJobManager: DesignJobManager
   const canvasImageCandidateBatchService = createCanvasImageCandidateBatchService({
     store: canvasImageCandidateBatchStore,
+    dependencyState: canvasDependencyStateService,
     runExclusive: (target, effect) => canvasOperationSerializer.run(target, () => (
       workspaceOperationGuard.runWorkspaceWrite(target.projectId, effect)
     )),
@@ -2400,6 +2404,7 @@ export function registerIpcHandlers(): void {
   const canvasTextArtifactGraphWriter = createCanvasTextArtifactGraphWriter({
     documents: canvasDocumentStore,
     batch: canvasAgentBatchOperation,
+    dependencyState: canvasDependencyStateService,
   })
   /** 文档与 WebView 的版本事务在主进程只实例化一次，供 IPC 与普通 Agent 共用。 */
   const canvasTextArtifactService = createCanvasTextArtifactService({

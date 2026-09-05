@@ -9,6 +9,7 @@ import type {
 } from '@proma/shared'
 import { createCanvasImageCandidateBatchService } from './canvas-image-candidate-batch-service'
 import type { CanvasImageCandidateAdoptionIntent } from './canvas-image-candidate-batch-store'
+import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
 
 /** 创建 14 节点候选批次 Service 内存夹具。 */
 function createFixture() {
@@ -19,6 +20,10 @@ function createFixture() {
   const adopted: string[] = []
   const retried: string[] = []
   const started: string[] = []
+  /** 依赖投影调用数用于证明候选阶段不会提前传播。 */
+  let dependencyProjectionCalls = 0
+  /** fixture 复用真实纯服务，仅在入口外记录调用次数。 */
+  const dependencyState = createCanvasDependencyStateService()
   const entries = Array.from({ length: 14 }, (_, index) => {
     const nodeId = `node-${index}`
     configs.set(nodeId, {
@@ -76,6 +81,12 @@ function createFixture() {
   }
   const service = createCanvasImageCandidateBatchService({
     store,
+    dependencyState: {
+      consumeAndPropagate: (input) => {
+        dependencyProjectionCalls += 1
+        return dependencyState.consumeAndPropagate(input)
+      },
+    },
     runExclusive: async (_target, effect) => effect(),
     loadConfig: async (imageTarget) => structuredClone(configs.get(imageTarget.nodeId)!),
     adoptAsset: async (imageTarget, _revision, assetId) => {
@@ -109,6 +120,7 @@ function createFixture() {
     target, entries, batches, intents, configs, adopted, retried, started, service,
     get canvas() { return canvas },
     set canvas(value: CanvasDocument) { canvas = value },
+    get dependencyProjectionCalls() { return dependencyProjectionCalls },
   }
 }
 
@@ -129,6 +141,7 @@ describe('Canvas 图片候选批次 Service', () => {
     expect(batch.status).toBe('partial')
     expect(batch.entries.filter((entry) => entry.status === 'candidate')).toHaveLength(2)
     expect(fixture.adopted).toEqual([])
+    expect(fixture.dependencyProjectionCalls).toBe(0)
     expect(fixture.canvas).toEqual(before)
   })
 
@@ -327,6 +340,11 @@ describe('Canvas 图片候选批次 Service', () => {
 
   test('Given 四类直接下游 When adopt Then 只标记数据关系并排除 association', async () => {
     const fixture = createFixture()
+    /** producer 在正式采用前仍背负旧上游提示，采用后必须一并消费。 */
+    fixture.canvas.nodes[0] = {
+      ...fixture.canvas.nodes[0]!,
+      upstreamChange: { sourceNodeIds: ['older-source'], changedAt: 20 },
+    }
     const downstreamKinds = ['reference', 'depends-on', 'derives', 'association'] as const
     /** 为每种关系追加一个独立文档节点，便于断言结构化提示。 */
     const downstreamNodes: CanvasNode[] = downstreamKinds.map((relation, index) => ({
@@ -363,6 +381,7 @@ describe('Canvas 图片候选批次 Service', () => {
       'downstream-depends-on', 'downstream-derives', 'downstream-reference',
     ])
     const changes = new Map(fixture.canvas.nodes.map((node) => [node.id, node.upstreamChange]))
+    expect(changes.get('node-0')).toBeUndefined()
     expect(changes.get('downstream-reference')?.sourceNodeIds).toEqual(['node-0'])
     expect(changes.get('downstream-association')).toBeUndefined()
   })
