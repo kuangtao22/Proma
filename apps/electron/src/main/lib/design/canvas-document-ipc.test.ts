@@ -425,8 +425,15 @@ function createContext(options: {
         if (options.loadError) throw options.loadError
         return options.loadResult ?? { document: createDocument(4), writable: true, nodeIssues: [] }
       },
-      mutate: (target, expectedRevision, mutations) => {
-        calls.push('store:mutate')
+      mutateBatchOperations: (target, expectedRevision, operations, validateCurrent) => {
+        calls.push('store:mutate-batch')
+        /** 测试替身模拟 Store 在同一权威读取内完成规范化与生命周期回调。 */
+        const mutations = options.validateBatchOperations?.(target, expectedRevision, operations)
+          ?? structuredClone(operations) as CanvasMutation[]
+        validateCurrent?.(
+          options.loadResult?.document ?? createDocument(expectedRevision),
+          mutations,
+        )
         storeInputs.push({ target, expectedRevision, mutations })
         if (options.mutateError) throw options.mutateError
         return options.mutateResult ?? createDocument(expectedRevision + (mutations.length > 0 ? 1 : 0))
@@ -1025,7 +1032,7 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.calls).toEqual([
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile',
-      'store:validate-batch', 'store:mutate',
+      'store:mutate-batch',
     ])
   })
 
@@ -2310,8 +2317,8 @@ describe('原生 Canvas 文档 IPC', () => {
       ) as CanvasInvokeResult<CanvasDocument>
 
       expect(result.ok).toBe(false)
-      expect(context.calls).toContain('store:validate-batch')
-      expect(context.calls).not.toContain('store:mutate')
+      expect(context.calls.filter((call) => call.startsWith('store:')))
+        .toEqual(['store:mutate-batch'])
     }
     errorSpy.mockRestore()
   })
@@ -2946,7 +2953,7 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.calls).toEqual([
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile',
-      'store:validate-batch', 'store:mutate',
+      'store:mutate-batch',
     ])
     expect(context.storeInputs[0]).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })
     expect(context.storeInputs[0]).not.toBe(loadInput)
@@ -3527,7 +3534,20 @@ describe('原生 Canvas 文档 IPC', () => {
       store: {
         loadWithDirectoryCapability: () => { throw new Error('测试未配置目录读取') },
         load: () => ({ document: createDocument(revision), writable: true as const, nodeIssues: [] }),
-        mutate: () => createDocument(revision),
+        mutateBatchOperations: (
+          _target: CanvasTarget,
+          _expectedRevision: number,
+          operations: unknown[],
+          validateCurrent?: (
+            document: CanvasDocument,
+            normalizedMutations: CanvasMutation[],
+          ) => void,
+        ) => {
+          /** 热注册 fixture 同样模拟单次入口先规范化再执行同步策略。 */
+          const normalizedMutations = structuredClone(operations) as CanvasMutation[]
+          validateCurrent?.(createDocument(revision), normalizedMutations)
+          return createDocument(revision)
+        },
         validateBatchOperations: (_target: unknown, _expectedRevision: number, operations: unknown[]) => structuredClone(operations) as CanvasMutation[],
       },
       batch: {

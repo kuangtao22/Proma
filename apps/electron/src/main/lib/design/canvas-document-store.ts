@@ -65,6 +65,16 @@ export interface CanvasDocumentStore {
     expectedRevision: number,
     operations: unknown[],
   ) => CanvasMutation[]
+  /** 在一次权威读取内验证不可信 mutation、执行同步策略并原子提交。 */
+  mutateBatchOperations: (
+    target: CanvasTarget,
+    expectedRevision: number,
+    operations: unknown[],
+    validateCurrent?: (
+      document: CanvasDocument,
+      normalizedMutations: CanvasMutation[],
+    ) => void,
+  ) => CanvasDocument
   /** 在同一权威基线上规范化 mutation，并计算不推进 revision 的最终图事实。 */
   planBatchOperations: (
     target: CanvasTarget,
@@ -1587,28 +1597,14 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     return structuredClone(operations) as CanvasMutation[]
   }
 
-  /** 在磁盘最新 revision 上应用一批受控 mutation 并安全提交。 */
-  function mutate(
+  /** 提交已经基于同一 current 完成校验的 mutation，统一 reducer、schema 与 CAS 写边界。 */
+  function commitValidatedMutations(
     target: CanvasTarget,
-    expectedRevision: number,
+    loaded: ReturnType<typeof loadWithAuthoritativeState>,
+    current: CanvasDocument,
     mutations: CanvasMutation[],
-    validateCurrent?: (document: CanvasDocument) => void,
   ): CanvasDocument {
-    /** mutation 始终从稳定权威文档开始，禁止跨恢复边界写入。 */
-    const loaded = loadWithAuthoritativeState(target, true)
-    const current = loaded.snapshot.document
-    if (loaded.parsedDocument.migratedFrom === 1) throw new Error('CANVAS_MIGRATION_REQUIRED')
-    if (loaded.snapshot.recoveredFrom) {
-      throw new Error(`CANVAS_RECOVERY_REQUIRED: recoveredFrom=${loaded.snapshot.recoveredFrom}`)
-    }
-    validateCurrent?.(current)
-    if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== current.revision) {
-      throw new Error(
-        `CANVAS_REVISION_CONFLICT: expected=${expectedRevision}, current=${current.revision}`,
-      )
-    }
     if (mutations.length === 0) return current
-    validateCanvasMutations(current, mutations)
     /** reducer 只执行一次，结果随后只走一次完整文档 schema 链。 */
     const mutated = applyCanvasMutations(current, mutations)
     /** updatedAt 独立生成，时间边界错误不得伪装为 mutation schema 错误。 */
@@ -1666,5 +1662,67 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     return next
   }
 
-  return { load, loadWithDirectoryCapability, loadWithMigrationCapability, requireStableAuthoritativeDocument, validateBatchOperations, planBatchOperations, mutate }
+  /** 在单次权威读取内完成 Renderer batch 防篡改、业务策略和原子提交。 */
+  function mutateBatchOperations(
+    target: CanvasTarget,
+    expectedRevision: number,
+    operations: unknown[],
+    validateCurrent?: (
+      document: CanvasDocument,
+      normalizedMutations: CanvasMutation[],
+    ) => void,
+  ): CanvasDocument {
+    const loaded = loadWithAuthoritativeState(target, true)
+    const current = loaded.snapshot.document
+    if (loaded.parsedDocument.migratedFrom === 1) throw new Error('CANVAS_MIGRATION_REQUIRED')
+    if (loaded.snapshot.recoveredFrom) {
+      throw new Error(`CANVAS_RECOVERY_REQUIRED: recoveredFrom=${loaded.snapshot.recoveredFrom}`)
+    }
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== current.revision) {
+      throw new Error(
+        `CANVAS_REVISION_CONFLICT: expected=${expectedRevision}, current=${current.revision}`,
+      )
+    }
+    validateCanvasMutations(current, operations, true)
+    /** 后续策略与提交只消费已重建副本，禁止继续依赖 Renderer 输入引用。 */
+    const normalizedMutations = structuredClone(operations) as CanvasMutation[]
+    validateCurrent?.(current, normalizedMutations)
+    return commitValidatedMutations(target, loaded, current, normalizedMutations)
+  }
+
+  /** 在磁盘最新 revision 上应用一批受控 mutation 并安全提交。 */
+  function mutate(
+    target: CanvasTarget,
+    expectedRevision: number,
+    mutations: CanvasMutation[],
+    validateCurrent?: (document: CanvasDocument) => void,
+  ): CanvasDocument {
+    /** mutation 始终从稳定权威文档开始，禁止跨恢复边界写入。 */
+    const loaded = loadWithAuthoritativeState(target, true)
+    const current = loaded.snapshot.document
+    if (loaded.parsedDocument.migratedFrom === 1) throw new Error('CANVAS_MIGRATION_REQUIRED')
+    if (loaded.snapshot.recoveredFrom) {
+      throw new Error(`CANVAS_RECOVERY_REQUIRED: recoveredFrom=${loaded.snapshot.recoveredFrom}`)
+    }
+    validateCurrent?.(current)
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== current.revision) {
+      throw new Error(
+        `CANVAS_REVISION_CONFLICT: expected=${expectedRevision}, current=${current.revision}`,
+      )
+    }
+    if (mutations.length === 0) return current
+    validateCanvasMutations(current, mutations)
+    return commitValidatedMutations(target, loaded, current, mutations)
+  }
+
+  return {
+    load,
+    loadWithDirectoryCapability,
+    loadWithMigrationCapability,
+    requireStableAuthoritativeDocument,
+    validateBatchOperations,
+    mutateBatchOperations,
+    planBatchOperations,
+    mutate,
+  }
 }

@@ -167,7 +167,10 @@ export interface CanvasDocumentIpcOptions {
   ipc: CanvasDocumentIpcRegistrar
   listAuthorizedWebContents: () => WebContents[]
   guard: Pick<WorkspaceOperationGuard, 'runWorkspaceWrite'>
-  store: Pick<CanvasDocumentStore, 'load' | 'loadWithDirectoryCapability' | 'mutate' | 'validateBatchOperations'>
+  store: Pick<
+    CanvasDocumentStore,
+    'load' | 'loadWithDirectoryCapability' | 'mutateBatchOperations' | 'validateBatchOperations'
+  >
   /** 唯一批处理服务；调用时外层已持有共享 Canvas 串行权和 workspace lease。 */
   batch: {
     reconcileLocked: (target: CanvasTarget) => Promise<CanvasBatchReconciliationResult>
@@ -2540,27 +2543,20 @@ export function registerCanvasDocumentIpcHandlers(
               return { batch, outcome: { ok: false, error: reconciliation.error, reconciliation } }
             }
             try {
-              /** Renderer mutation 先经不可信 batch 边界规范化并保护 Agent 正式输出。 */
               const target = { projectId: input.projectId, canvasId: input.canvasId }
-              const mutations = options.store.validateBatchOperations(
+              /** 单次权威读取内完成防篡改、生命周期检查与 CAS 提交。 */
+              const document = options.store.mutateBatchOperations(
                 target,
                 input.expectedRevision,
                 input.mutations,
-              )
-              assertRemovedContentNodesUseLifecycle(
-                reconciliation.snapshot.document,
-                mutations,
-              )
-              assertRemovedAgentNodesAreIdle(
-                reconciliation.snapshot.document,
-                mutations,
-                options.agent.listActiveRuns(),
-              )
-              /** 只有整个删除 batch 均为空闲，才允许进入原子 Store 提交。 */
-              const document = options.store.mutate(
-                target,
-                input.expectedRevision,
-                mutations,
+                (current, normalizedMutations) => {
+                  assertRemovedContentNodesUseLifecycle(current, normalizedMutations)
+                  assertRemovedAgentNodesAreIdle(
+                    current,
+                    normalizedMutations,
+                    options.agent.listActiveRuns(),
+                  )
+                },
               )
               return { batch, outcome: { ok: true, value: document, reconciliation } }
             } catch (error) {

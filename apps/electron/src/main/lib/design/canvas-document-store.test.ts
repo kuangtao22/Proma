@@ -1495,6 +1495,119 @@ describe('CanvasDocumentStore', () => {
       .toMatchObject({ outputPointer })
   })
 
+  test('Given 不可信单次提交篡改 Agent 输出指针 When mutateBatchOperations Then 增改删均拒绝', () => {
+    /** 正式输出指针用于构造三种 Renderer 越权修改。 */
+    const outputPointer = {
+      messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+      contentSha256: '2'.repeat(64),
+      completedAt: 300,
+    }
+    /** 三个场景复用同一 Store，并在每轮验证失败后重置权威磁盘基线。 */
+    const cases = [
+      { currentPointer: undefined, nextPointer: outputPointer },
+      { currentPointer: outputPointer, nextPointer: { ...outputPointer, contentSha256: '3'.repeat(64) } },
+      { currentPointer: outputPointer, nextPointer: undefined },
+    ] as const
+    const fixture = createFixture()
+
+    for (const scenario of cases) {
+      const document = createConnectedDocument()
+      const agent = document.nodes[0] as CanvasAgentNode
+      document.nodes[0] = {
+        ...agent,
+        ...(scenario.currentPointer ? { outputPointer: scenario.currentPointer } : {}),
+      }
+      /** 删除场景不能从当前节点扩展，否则会意外保留旧指针。 */
+      const submittedAgent = {
+        ...agent,
+        ...(scenario.nextPointer ? { outputPointer: scenario.nextPointer } : {}),
+      }
+      writeDocument(fixture.documentPath, document)
+
+      expect(() => fixture.store.mutateBatchOperations(
+        { projectId: 'project-1', canvasId: 'canvas-1' },
+        document.revision,
+        [{ type: 'upsert-nodes', nodes: [submittedAgent] }],
+      )).toThrow('CANVAS_MUTATION_INVALID')
+      expect(JSON.parse(readFileSync(fixture.documentPath, 'utf8'))).toEqual(document)
+    }
+  })
+
+  test('Given 同值输出指针的结构修改 When mutateBatchOperations Then 单次读取并提交规范化副本', () => {
+    /** authoritative candidate 读取次数用于锁定 autosave 热路径只读盘一次。 */
+    let authoritativeReadCount = 0
+    const fixture = createFixture({
+      afterCandidateRead: () => { authoritativeReadCount += 1 },
+    })
+    const document = createConnectedDocument()
+    const agent = document.nodes[0] as CanvasAgentNode
+    /** 同值副本允许标题与位置更新，但不能改变正式输出事实。 */
+    const outputPointer = {
+      messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+      contentSha256: '4'.repeat(64),
+      completedAt: 400,
+    }
+    document.nodes[0] = { ...agent, outputPointer }
+    writeDocument(fixture.documentPath, document)
+    const operations = [{
+      type: 'upsert-nodes',
+      nodes: [{
+        ...agent,
+        title: '结构更新',
+        position: { x: 80, y: 90 },
+        outputPointer: { ...outputPointer },
+      }],
+    }] satisfies CanvasMutation[]
+    let callbackCalled = false
+
+    const result = fixture.store.mutateBatchOperations(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      document.revision,
+      operations,
+      (current, normalizedMutations) => {
+        callbackCalled = true
+        expect(current).toEqual(document)
+        expect(normalizedMutations).toEqual(operations)
+        expect(normalizedMutations).not.toBe(operations)
+        expect((normalizedMutations[0] as { nodes: unknown[] }).nodes).not.toBe(operations[0]!.nodes)
+      },
+    )
+
+    expect(callbackCalled).toBe(true)
+    expect(authoritativeReadCount).toBe(1)
+    expect(result.revision).toBe(document.revision + 1)
+    expect(result.nodes[0]).toMatchObject({ title: '结构更新', position: { x: 80, y: 90 }, outputPointer })
+  })
+
+  test('Given mutateBatchOperations 生命周期回调拒绝 When 提交 Then 零写入且 revision 不变', () => {
+    /** 写边界计数证明回调失败不会产生部分提交。 */
+    let writeCalls = 0
+    const fixture = createFixture({
+      writeJsonFileAtomicSecure: () => { writeCalls += 1 },
+    })
+    const document = createConnectedDocument()
+    writeDocument(fixture.documentPath, document)
+    const before = readFileSync(fixture.documentPath, 'utf8')
+    let callbackCalled = false
+
+    expect(() => fixture.store.mutateBatchOperations(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      document.revision,
+      [{ type: 'upsert-nodes', nodes: [{
+        ...document.nodes[0]!, title: '不应提交', position: { x: 20, y: 30 },
+      }] }],
+      (_current, normalizedMutations) => {
+        callbackCalled = true
+        expect(normalizedMutations[0]).toMatchObject({ type: 'upsert-nodes' })
+        throw new Error('CANVAS_LIFECYCLE_REJECTED')
+      },
+    )).toThrow('CANVAS_LIFECYCLE_REJECTED')
+    expect(callbackCalled).toBe(true)
+    expect(writeCalls).toBe(0)
+    expect(readFileSync(fixture.documentPath, 'utf8')).toBe(before)
+    expect(JSON.parse(before)).toHaveProperty('revision', document.revision)
+  })
+
   test('Given 顺序 batch mutation When 规划 Then 返回同一基线上的最终文档且不写盘', () => {
     const fixture = createFixture()
     const operations: CanvasMutation[] = [
