@@ -4,7 +4,7 @@
 
 **Goal:** Windows 安装器检测到现有 Proma Bone 时，明确展示旧版本和旧安装位置，并继续由 electron-builder 在用户选择的目标目录执行安全升级。
 
-**Architecture:** 继续使用 electron-builder assisted NSIS 和稳定 `appId` 的既有注册表检测、旧版卸载及 `--updated` 数据保留语义。仅通过 `nsis.include` 注入一个 `customPageAfterChangeDir` 自定义摘要页，读取当前安装模式对应的注册表值；没有旧安装路径时直接跳过该页。
+**Architecture:** 继续使用 electron-builder assisted NSIS 和稳定 `appId` 的既有注册表检测、旧版卸载及 `--updated` 数据保留语义。仅通过 `nsis.include` 注入一个 `customPageAfterChangeDir` 自定义摘要页，复用当前安装模式设置的 `SHELL_CONTEXT` 读取注册表值；没有旧安装路径时直接跳过该页。
 
 **Tech Stack:** Bun test、Electron Builder 25、NSIS Modern UI、nsDialogs、YAML 配置。
 
@@ -93,56 +93,52 @@ git commit -m "测试：锁定 Windows 原位升级安装器合同"
 创建 `apps/electron/resources/installer.nsh`：
 
 ```nsis
-!include nsDialogs.nsh
-!include LogicLib.nsh
-
 # 保存检测到的旧安装目录，只用于升级摘要展示。
 Var upgradeInstallLocation
 # 保存检测到的旧版本号，注册表缺失时显示“未知版本”。
 Var upgradeDisplayVersion
 
+# 在安装目录页之后注册升级摘要页，由页面创建函数决定是否跳过。
 !macro customPageAfterChangeDir
   Page custom createUpgradeSummaryPage
 !macroend
 
-# 按 electron-builder 已选定的安装模式读取旧安装信息并创建只读摘要页。
-Function createUpgradeSummaryPage
-  StrCpy $upgradeInstallLocation ""
-  StrCpy $upgradeDisplayVersion ""
+# 延后定义页面函数，确保 electron-builder 已加载 MUI、nsDialogs 与注册表上下文。
+!macro customHeader
+  # 按 electron-builder 已选定的安装作用域读取旧安装信息并创建只读摘要页。
+  Function createUpgradeSummaryPage
+    StrCpy $upgradeInstallLocation ""
+    StrCpy $upgradeDisplayVersion ""
 
-  ${If} $installMode == "all"
-    ReadRegStr $upgradeInstallLocation HKLM "${INSTALL_REGISTRY_KEY}" InstallLocation
-    ReadRegStr $upgradeDisplayVersion HKLM "${UNINSTALL_REGISTRY_KEY}" DisplayVersion
-  ${Else}
-    ReadRegStr $upgradeInstallLocation HKCU "${INSTALL_REGISTRY_KEY}" InstallLocation
-    ReadRegStr $upgradeDisplayVersion HKCU "${UNINSTALL_REGISTRY_KEY}" DisplayVersion
-  ${EndIf}
+    ReadRegStr $upgradeInstallLocation SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}" InstallLocation
+    ReadRegStr $upgradeDisplayVersion SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" DisplayVersion
 
-  ${If} $upgradeInstallLocation == ""
-    Abort
-  ${EndIf}
-  ${If} $upgradeDisplayVersion == ""
-    StrCpy $upgradeDisplayVersion "未知版本"
-  ${EndIf}
+    ${If} $upgradeInstallLocation == ""
+      Abort
+    ${EndIf}
+    ${If} $upgradeDisplayVersion == ""
+      StrCpy $upgradeDisplayVersion "未知版本"
+    ${EndIf}
 
-  !insertmacro MUI_HEADER_TEXT "升级现有 Proma" "确认旧版本与本次安装位置"
-  nsDialogs::Create 1018
-  Pop $0
-  ${If} $0 == error
-    Abort
-  ${EndIf}
+    !insertmacro MUI_HEADER_TEXT "升级现有 Proma" "确认旧版本与本次安装位置"
+    nsDialogs::Create 1018
+    Pop $0
+    ${If} $0 == error
+      Abort
+    ${EndIf}
 
-  ${NSD_CreateLabel} 0 0 100% 24u "检测到已安装版本：Proma $upgradeDisplayVersion"
-  Pop $1
-  ${NSD_CreateLabel} 0 28u 100% 36u "旧安装位置：$upgradeInstallLocation"
-  Pop $1
-  ${NSD_CreateLabel} 0 68u 100% 36u "本次安装位置：$INSTDIR"
-  Pop $1
-  ${NSD_CreateLabel} 0 112u 100% 42u "继续后将先卸载旧版本，保留本地业务数据与快捷方式，再安装新版本。"
-  Pop $1
+    ${NSD_CreateLabel} 0 0 100% 24u "检测到已安装版本：Proma $upgradeDisplayVersion"
+    Pop $1
+    ${NSD_CreateLabel} 0 28u 100% 36u "旧安装位置：$upgradeInstallLocation"
+    Pop $1
+    ${NSD_CreateLabel} 0 68u 100% 36u "本次安装位置：$INSTDIR"
+    Pop $1
+    ${NSD_CreateLabel} 0 112u 100% 42u "继续后将先卸载旧版本，保留本地业务数据与快捷方式，再安装 Proma ${VERSION}。"
+    Pop $1
 
-  nsDialogs::Show
-FunctionEnd
+    nsDialogs::Show
+  FunctionEnd
+!macroend
 ```
 
 - [ ] **Step 2: 运行测试并确认仅剩配置接线失败**
@@ -217,7 +213,7 @@ Expected: 在 Windows runner 上生成 unpacked 目录且 NSIS include 可被 el
 
 - [ ] **Step 5: 记录长期决策**
 
-在 `MEMORY.md` 末尾追加一条 2026-09-05 决策：Windows 升级提示通过 electron-builder `nsis.include` 的 `customPageAfterChangeDir` 实现，跟随既有用户/机器安装模式读取 `InstallLocation` 与 `DisplayVersion`；安装、卸载、数据和快捷方式保留仍由 electron-builder 负责。说明原因、用户影响及仅增加常数次注册表读取和静态页面的性能影响。
+在 `MEMORY.md` 末尾追加一条 2026-09-05 决策：Windows 升级提示通过 electron-builder `nsis.include` 的 `customPageAfterChangeDir` 实现，复用既有用户/机器安装模式的 `SHELL_CONTEXT` 读取 `InstallLocation` 与 `DisplayVersion`；安装、卸载、数据和快捷方式保留仍由 electron-builder 负责。说明原因、用户影响及仅增加常数次注册表读取和静态页面的性能影响。
 
 - [ ] **Step 6: 检查改动边界并提交决策记录**
 

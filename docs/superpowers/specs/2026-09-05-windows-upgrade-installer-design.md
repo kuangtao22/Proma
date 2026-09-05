@@ -61,9 +61,9 @@
 
 自定义 include 通过 `customPageAfterChangeDir` 宏接入 electron-builder assisted installer，在页面创建时：
 
-1. 根据模板已识别的 per-user/per-machine 安装状态选择注册表根；
-2. 从 `${INSTALL_REGISTRY_KEY}` 读取 `InstallLocation`；
-3. 从 `${UNINSTALL_REGISTRY_KEY}` 读取 `DisplayVersion`；
+1. 复用模板已根据 per-user/per-machine 安装状态设置的 `SHELL_CONTEXT`；
+2. 从该上下文的 `${INSTALL_REGISTRY_KEY}` 读取 `InstallLocation`；
+3. 从同一上下文的 `${UNINSTALL_REGISTRY_KEY}` 读取 `DisplayVersion`；
 4. 没有旧路径时跳过页面；
 5. 有旧路径时用 `nsDialogs` 渲染只读版本、旧路径和目标路径。
 
