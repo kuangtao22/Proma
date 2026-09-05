@@ -188,16 +188,20 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
   const bool content_mode = config->mode.rfind("canvas-content-", 0) == 0;
   const bool safe_child = config->child_name == "nodes"
       || config->child_name == "trash"
-      || config->child_name == "revisions";
+      || config->child_name == "revisions"
+      || config->child_name == "agent-configs";
   const bool move_child = config->child_name == "nodes" || config->child_name == "trash";
   const bool move_destination = config->destination_child_name == "nodes"
       || config->destination_child_name == "trash";
   const bool needs_entry = config->mode != "canvas-content-list";
   const bool needs_file = config->mode == "canvas-content-write"
       || config->mode == "canvas-content-read";
-  const bool safe_file = config->file_name == "config.json" || config->file_name == "meta.json"
-      || config->file_name == "content.md" || config->file_name == "index.html"
-      || config->file_name == "entry.json";
+  // Agent 配置目录只接受 config.json；其它内容根保持既有文件集合。
+  const bool safe_file = config->child_name == "agent-configs"
+      ? config->file_name == "config.json"
+      : config->file_name == "config.json" || config->file_name == "meta.json"
+          || config->file_name == "content.md" || config->file_name == "index.html"
+          || config->file_name == "entry.json";
   const bool fields_match_mode = config->mode == "canvas-content-write"
       ? config->destination_child_name.empty() && config->destination_entry_id.empty()
       : config->mode == "canvas-content-read"

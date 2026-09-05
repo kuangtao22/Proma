@@ -92,3 +92,15 @@ test('Given revisions 受管目录 When 检查 helper 参数合同 Then 只允�
   expect(source).toContain('const bool move_destination = config->destination_child_name == "nodes"')
   expect(source).toContain('|| config->destination_child_name == "trash";')
 })
+
+test('Given agent-configs 受管目录 When 检查跨平台参数合同 Then 只允许 config.json 读写列举', () => {
+  /** helper 单一源码同时承载 POSIX 与 Windows 参数校验合同。 */
+  const source = readFileSync(resolve(import.meta.dir, '../native/stable-directory/stable-directory-helper.cc'), 'utf8')
+
+  expect(source).toContain('config->child_name == "agent-configs"')
+  expect(source).toContain('const bool safe_file = config->child_name == "agent-configs"')
+  expect(source).toContain('? config->file_name == "config.json"')
+  expect(source).toContain(': config->file_name == "config.json" || config->file_name == "meta.json"')
+  expect(source).toContain('const bool move_child = config->child_name == "nodes" || config->child_name == "trash";')
+  expect(source).toContain('config->mode == "canvas-content-remove-marker" && config->child_name != "trash"')
+})

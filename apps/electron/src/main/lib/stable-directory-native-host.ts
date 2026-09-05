@@ -12,11 +12,13 @@ const DEFAULT_MAX_QUEUED_REQUESTS = 16
 const DEFAULT_MAX_ROOTS_PER_REQUEST = 32
 const CANVAS_INTENT_FILE_PATTERN = /^(?:(?:agent-node(?:-rebuild)?|content-node|canvas-batch|image-candidate-(?:batch|adoption))-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|image-candidate-batch-agent-canvas-[0-9a-f]{64})\.json$/i
 const CANVAS_CONTENT_ENTRY_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
-const CANVAS_CONTENT_CHILD_NAMES: ReadonlySet<string> = new Set(['nodes', 'trash', 'revisions'])
+const CANVAS_CONTENT_CHILD_NAMES: ReadonlySet<string> = new Set(['nodes', 'trash', 'revisions', 'agent-configs'])
 const CANVAS_CONTENT_MOVE_CHILD_NAMES: ReadonlySet<string> = new Set(['nodes', 'trash'])
 const CANVAS_CONTENT_FILE_NAMES = new Set([
   'config.json', 'meta.json', 'content.md', 'index.html', 'entry.json',
 ])
+/** Agent 配置目录只暴露单一固定配置文件，避免复用其它 Canvas 内容叶子。 */
+const CANVAS_AGENT_CONFIG_FILE_NAMES: ReadonlySet<string> = new Set(['config.json'])
 const CANVAS_CONTENT_MAX_FILE_BYTES = 256 * 1024
 const { app } = electron
 
@@ -55,7 +57,7 @@ export type StableDirectoryNativeReadOutcome =
 export type StableDirectoryNativeMoveOutcome = StableDirectoryNativeWriteOutcome
 
 /** Canvas 内容 helper 可读写和列举的固定一级目录。 */
-export type StableDirectoryCanvasChild = 'nodes' | 'trash' | 'revisions'
+export type StableDirectoryCanvasChild = 'nodes' | 'trash' | 'revisions' | 'agent-configs'
 
 /** Canvas 内容 helper 允许原子移动的固定一级目录。 */
 export type StableDirectoryCanvasMoveChild = 'nodes' | 'trash'
@@ -624,8 +626,12 @@ export function createStableDirectoryNativeHost(
         const entryIsSafe = !needsEntry
           || (request.entryId !== undefined && CANVAS_CONTENT_ENTRY_ID_PATTERN.test(request.entryId))
         const needsFile = request.mode === 'canvas-content-write' || request.mode === 'canvas-content-read'
+        /** 文件名白名单按一级目录收窄，Host 在启动 helper 前独立执行安全检查。 */
+        const allowedFileNames = request.childName === 'agent-configs'
+          ? CANVAS_AGENT_CONFIG_FILE_NAMES
+          : CANVAS_CONTENT_FILE_NAMES
         const fileIsSafe = !needsFile
-          || (request.fileName !== undefined && CANVAS_CONTENT_FILE_NAMES.has(request.fileName))
+          || (request.fileName !== undefined && allowedFileNames.has(request.fileName))
         const destinationIsSafe = request.mode !== 'canvas-content-move'
           || (request.destinationChildName !== undefined
             && CANVAS_CONTENT_MOVE_CHILD_NAMES.has(request.destinationChildName)

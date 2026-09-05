@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, test } from 'bun:test'
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -521,6 +521,65 @@ describe('stable directory native host', () => {
     expect(helperArguments).not.toContain('--ignore-file')
   })
 
+  test('Given 合法 Agent 配置请求 When host 启动 helper Then argv 使用固定一级目录和 config.json', async () => {
+    /** 返回成功写结果的假 helper，用于隔离 argv 生成逻辑。 */
+    const fake = createFakeHelper({
+      writeOutcome: { commitVisible: true, durabilityUncertain: false },
+    })
+    /** 捕获 Host 交给原生 helper 的安全参数，不允许退化为任意路径。 */
+    let helperArguments: string[] = []
+
+    await runStableDirectoryNative({
+      mode: 'canvas-content-write', roots: ['/requested'],
+      childName: 'agent-configs',
+      entryId: 'agent-1', fileName: 'config.json', content: '{}',
+    }, () => true, {
+      ...createDependencies(fake),
+      spawnProcess: (_path, args) => {
+        helperArguments = args
+        return fake.child
+      },
+    })
+
+    expect(helperArguments).toContain('--child-name')
+    expect(helperArguments).toContain('agent-configs')
+    expect(helperArguments).toContain('--entry-id')
+    expect(helperArguments).toContain('agent-1')
+    expect(helperArguments).toContain('--file-name')
+    expect(helperArguments).toContain('config.json')
+  })
+
+  test('Given Agent 配置请求越过固定文件或操作边界 When 提交 host Then spawn 前拒绝', async () => {
+    /** 记录不安全请求是否越过 Host 校验启动子进程。 */
+    let spawnCount = 0
+    /** 对所有攻击请求复用的零启动依赖。 */
+    const dependencies: StableDirectoryNativeHostDependencies = {
+      helperPath: () => '/fake',
+      helperExists: () => true,
+      spawnProcess: () => {
+        spawnCount += 1
+        throw new Error('不应启动 helper')
+      },
+    }
+    /** Agent 配置固定一级目录名。 */
+    const agentConfigs = 'agent-configs' as const
+    /** 覆盖文件白名单、move 与 marker 删除边界的攻击请求。 */
+    const requests: StableDirectoryNativeRequest[] = [
+      { mode: 'canvas-content-read', roots: ['/requested'], childName: agentConfigs, entryId: 'agent-1', fileName: 'meta.json' },
+      { mode: 'canvas-content-read', roots: ['/requested'], childName: agentConfigs, entryId: 'agent-1', fileName: 'content.md' },
+      { mode: 'canvas-content-write', roots: ['/requested'], childName: agentConfigs, entryId: 'agent-1', fileName: 'index.html', content: '{}' },
+      { mode: 'canvas-content-write', roots: ['/requested'], childName: agentConfigs, entryId: 'agent-1', fileName: 'entry.json', content: '{}' },
+      { mode: 'canvas-content-move', roots: ['/requested'], childName: agentConfigs, destinationChildName: 'trash', entryId: 'agent-1', destinationEntryId: 'agent-1' },
+      { mode: 'canvas-content-remove-marker', roots: ['/requested'], childName: agentConfigs, entryId: 'agent-1' },
+    ]
+
+    for (const request of requests) {
+      await expect(runStableDirectoryNative(request, () => true, dependencies))
+        .rejects.toThrow('Canvas 内容原生请求合同无效')
+    }
+    expect(spawnCount).toBe(0)
+  })
+
   test.skipIf(!nativeHelperPlatformSupported)('Given revisions 受管目录 When 读写固定正文和列举版本 Then helper 接受', async () => {
     const root = mkdtempSync(join(tmpdir(), 'proma-native-revisions-flow-'))
     const canvasRoot = join(root, 'canvas')
@@ -550,6 +609,83 @@ describe('stable directory native host', () => {
       expect(listed.entries).toEqual([{
         rootIndex: 0, name: 'revision-a', path: '', isDirectory: true,
       }])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform !== 'darwin')('Given Agent 配置受管目录 When 读写列举及攻击边界 Then 仅安全 config.json 可访问', async () => {
+    /** 当前用例独占的临时工作根。 */
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-agent-configs-'))
+    /** 传给 helper 的已授权 Canvas 根。 */
+    const canvasRoot = join(root, 'canvas')
+    /** Agent 配置固定一级目录名。 */
+    const agentConfigs = 'agent-configs' as const
+    mkdirSync(canvasRoot)
+    try {
+      /** 合法原子写结果。 */
+      const written = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: agentConfigs,
+        entryId: 'agent-1', fileName: 'config.json', content: '{"model":"local"}',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(written.writeOutcome).toEqual({ commitVisible: true, durabilityUncertain: false })
+
+      /** 合法 no-follow 读取结果。 */
+      const read = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: agentConfigs,
+        entryId: 'agent-1', fileName: 'config.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(read.readOutcome).toMatchObject({ status: 'ok', content: '{"model":"local"}' })
+
+      /** 固定根下安全 entry 的列表结果。 */
+      const listed = await runStableDirectoryNative({
+        mode: 'canvas-content-list', roots: [canvasRoot], childName: agentConfigs, maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(listed.entries.map((entry) => entry.name)).toEqual(['agent-1'])
+
+      /** 绕过 Host 直测 native 对错误文件名的参数拒绝。 */
+      const invalidFile = spawnSync(nativeHelperPath, [
+        '--mode', 'canvas-content-read', '--root', canvasRoot, '--max-entries', '512',
+        '--child-name', 'agent-configs', '--entry-id', 'agent-1', '--file-name', 'meta.json',
+      ], { encoding: 'utf8' })
+      expect(invalidFile.status).toBe(1)
+      expect(invalidFile.stderr).toContain('invalid canvas content directory contract')
+
+      /** 绕过 Host 直测 native 对路径型 entry ID 的参数拒绝。 */
+      const invalidId = spawnSync(nativeHelperPath, [
+        '--mode', 'canvas-content-read', '--root', canvasRoot, '--max-entries', '512',
+        '--child-name', 'agent-configs', '--entry-id', '../agent-1', '--file-name', 'config.json',
+      ], { encoding: 'utf8' })
+      expect(invalidId.status).toBe(1)
+
+      mkdirSync(join(canvasRoot, 'agent-configs', 'linked-entry'))
+      symlinkSync(join(canvasRoot, 'agent-configs', 'agent-1', 'config.json'),
+        join(canvasRoot, 'agent-configs', 'linked-entry', 'config.json'))
+      /** 符号链接叶子的 no-follow 读取结果。 */
+      const linkedRead = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: agentConfigs,
+        entryId: 'linked-entry', fileName: 'config.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(linkedRead.readOutcome).toMatchObject({ status: 'corrupt' })
+
+      mkdirSync(join(canvasRoot, 'agent-configs', 'hardlinked-entry'))
+      linkSync(join(canvasRoot, 'agent-configs', 'agent-1', 'config.json'),
+        join(canvasRoot, 'agent-configs', 'hardlinked-entry', 'config.json'))
+      /** 多链接普通文件的稳定身份读取结果。 */
+      const hardlinkedRead = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: agentConfigs,
+        entryId: 'hardlinked-entry', fileName: 'config.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(hardlinkedRead.readOutcome).toMatchObject({ status: 'corrupt' })
+
+      mkdirSync(join(canvasRoot, 'agent-configs', 'oversized-entry'))
+      writeFileSync(join(canvasRoot, 'agent-configs', 'oversized-entry', 'config.json'), 'x'.repeat(256 * 1024 + 1))
+      /** 超过 256 KiB 上限的磁盘文件读取结果。 */
+      const oversizedRead = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: agentConfigs,
+        entryId: 'oversized-entry', fileName: 'config.json',
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(oversizedRead.readOutcome).toMatchObject({ status: 'corrupt' })
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
