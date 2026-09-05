@@ -1,0 +1,47 @@
+import { describe, expect, test } from 'bun:test'
+import type { CanvasNode } from '@proma/shared'
+import { canvasNodeCapabilityRegistry } from './canvas-node-capability-registry'
+
+/** 构造覆盖四类节点的最小权威节点。 */
+function createNode(kind: CanvasNode['kind']): CanvasNode {
+  const base = { id: `${kind}-1`, kind, title: kind, position: { x: 0, y: 0 } }
+  switch (kind) {
+    case 'agent': return { ...base, kind, agentSessionId: 'session-1' }
+    case 'image': return { ...base, kind, imageModuleId: 'image-module-1' }
+    case 'document': return { ...base, kind, documentId: 'document-1', contentRevision: 1 }
+    case 'webview': return { ...base, kind, prototypeId: 'prototype-1', contentRevision: 1, devicePreset: 'desktop' }
+  }
+}
+
+describe('Canvas 节点能力注册表', () => {
+  test('Given 当前四类可用节点 When 枚举能力 Then 返回稳定、有界且无重复的派生能力', () => {
+    expect(canvasNodeCapabilityRegistry.list(createNode('agent'), { availability: 'available' }))
+      .toEqual(['read', 'update-config', 'run'])
+    expect(canvasNodeCapabilityRegistry.list(createNode('image'), { availability: 'available' }))
+      .toEqual(['read', 'update-config', 'run', 'review-required'])
+    expect(canvasNodeCapabilityRegistry.list(createNode('document'), { availability: 'available' }))
+      .toEqual(['read', 'update-content'])
+    expect(canvasNodeCapabilityRegistry.list(createNode('webview'), { availability: 'available' }))
+      .toEqual(['read', 'update-content'])
+
+    for (const kind of ['agent', 'image', 'document', 'webview'] as const) {
+      const capabilities = canvasNodeCapabilityRegistry.list(createNode(kind), { availability: 'available' })
+      expect(capabilities.length).toBeLessThanOrEqual(5)
+      expect(new Set(capabilities).size).toBe(capabilities.length)
+    }
+  })
+
+  test('Given 节点不可用或损坏 When 枚举能力 Then 绝不公开运行能力', () => {
+    for (const availability of ['unavailable', 'corrupt'] as const) {
+      expect(canvasNodeCapabilityRegistry.list(createNode('agent'), { availability })).not.toContain('run')
+      expect(canvasNodeCapabilityRegistry.list(createNode('image'), { availability })).not.toContain('run')
+    }
+  })
+
+  test('Given 节点不支持目标能力 When 预检 Then 使用稳定错误拒绝', () => {
+    expect(() => canvasNodeCapabilityRegistry.assert(createNode('document'), 'run'))
+      .toThrow('CANVAS_NODE_CAPABILITY_UNSUPPORTED')
+    expect(() => canvasNodeCapabilityRegistry.assert(createNode('agent'), 'update-content'))
+      .toThrow('CANVAS_NODE_CAPABILITY_UNSUPPORTED')
+  })
+})

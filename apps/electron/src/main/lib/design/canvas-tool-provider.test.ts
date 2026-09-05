@@ -25,6 +25,7 @@ function createFixture(options: {
   let document: CanvasDocument = {
     ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
     nodes: [
+      { id: 'agent-1', kind: 'agent', title: '策划', position: { x: -50, y: 0 }, agentSessionId: 'canvas-agent-session-1' },
       { id: 'doc-1', kind: 'document', title: '需求', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 2 },
       { id: 'web-1', kind: 'webview', title: '原型', position: { x: 50, y: 0 }, prototypeId: 'prototype-1', contentRevision: 1, devicePreset: 'desktop' },
       { id: 'image-1', kind: 'image', title: '主视觉', position: { x: 100, y: 0 }, imageModuleId: 'image-content-1', adoptedAssetId: 'asset-1' },
@@ -459,6 +460,65 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(details.nodes[1]?.artifact).toMatchObject({
       nodeId: 'image-1', kind: 'image', currentRevision: 4, adoptedAssetId: 'asset-1',
     })
+  })
+
+  test('Given 四类节点且 Agent 会话不可用 When canvas_read Then 每个条目公开当前派生能力且不可用节点没有 run', async () => {
+    const fixture = createFixture()
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
+        nodes: [
+          { id: 'agent-1', kind: 'agent', title: '策划', position: { x: 0, y: 0 }, agentSessionId: 'canvas-agent-session-1' },
+          { id: 'image-1', kind: 'image', title: '主视觉', position: { x: 50, y: 0 }, imageModuleId: 'image-content-1' },
+          { id: 'doc-1', kind: 'document', title: '需求', position: { x: 100, y: 0 }, documentId: 'content-1', contentRevision: 2 },
+          { id: 'web-1', kind: 'webview', title: '原型', position: { x: 150, y: 0 }, prototypeId: 'prototype-1', contentRevision: 1, devicePreset: 'desktop' },
+        ],
+      },
+      writable: true,
+      nodeIssues: [{ nodeId: 'agent-1', code: 'AGENT_SESSION_UNAVAILABLE', allowedActions: ['rebuild-agent-session', 'remove-node'] }],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_read', {
+      canvasId: 'canvas-1', nodeIds: ['agent-1', 'image-1', 'doc-1', 'web-1'],
+    })
+    const entries = (result.details as {
+      nodes: Array<{ node: { id: string }; capabilities: string[] }>
+    }).nodes
+
+    expect(entries.map((entry) => [entry.node.id, entry.capabilities])).toEqual([
+      ['agent-1', ['read', 'update-config']],
+      ['image-1', ['read', 'update-config', 'run', 'review-required']],
+      ['doc-1', ['read', 'update-content']],
+      ['web-1', ['read', 'update-content']],
+    ])
+  })
+
+  test('Given 调用方伪造 capability When 更新错误类型或旧版本产物 Then Host 仍拒绝类型与 revision', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    await expect(executeTool(run.piCustomTools, 'canvas_update_artifact', {
+      canvasId: 'canvas-1', nodeId: 'agent-1', baseRevision: 3,
+      expectedContentRevision: 1, content: '伪造正文', capabilities: ['update-content'],
+    })).rejects.toThrow('CANVAS_ARTIFACT_TYPE_UNSUPPORTED')
+    await expect(executeTool(run.piCustomTools, 'canvas_update_artifact', {
+      canvasId: 'canvas-1', nodeId: 'doc-1', baseRevision: 2,
+      expectedContentRevision: 2, content: '伪造正文', capabilities: ['update-content'],
+    })).rejects.toThrow('CANVAS_ARTIFACT_REVISION_CONFLICT')
+    expect(fixture.textUpdateInputs).toHaveLength(0)
+  })
+
+  test('Given 调用方缓存 apply capability When 批处理使用旧 revision Then Host 仍执行权威 revision 校验', async () => {
+    const fixture = createFixture({ conflictAlways: true })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', {
+      canvasId: 'canvas-1', baseRevision: 2,
+      operations: [{ type: 'set-title', nodeId: 'doc-1', title: '新版需求' }],
+      capabilities: ['update-content'],
+    })).rejects.toThrow('CANVAS_REVISION_CONFLICT')
+    expect(fixture.batchInputs).toHaveLength(1)
   })
 
   test('Given 只读分析 When 读取节点 Then 返回必要邻接、限制总字符并拒绝未关联画布', async () => {

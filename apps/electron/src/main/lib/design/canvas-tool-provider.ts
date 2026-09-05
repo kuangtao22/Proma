@@ -34,6 +34,10 @@ import type {
 } from './canvas-artifact-creation'
 import type { CanvasTextArtifactService } from './canvas-text-artifact-service'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
+import {
+  canvasNodeCapabilityRegistry,
+  type CanvasNodeCapability,
+} from './canvas-node-capability-registry'
 
 const MAX_READ_NODES = 32
 const MAX_READ_RESPONSE_CHARS = 32_768
@@ -148,6 +152,7 @@ async function prepareInspectionThumbnail(thumbnail: CanvasInspectionThumbnail):
 /** canvas_read 单节点的内部预算条目，完整正文不直接进入最终响应。 */
 interface CanvasReadBudgetEntry {
   node: CanvasNode | { id: string; kind: CanvasNode['kind']; title: string }
+  capabilities: CanvasNodeCapability[]
   content: string
   contentLength: number
   artifact?: Record<string, unknown>
@@ -669,7 +674,10 @@ export function createCanvasToolRun(
         dependencies.access.authorizeRead(context)
         dependencies.access.requireLinkedCanvas(context, params.canvasId)
         const target = { projectId: context.projectId, canvasId: params.canvasId }
-        const document = dependencies.documents.load(target).document
+        const snapshot = dependencies.documents.load(target)
+        const document = snapshot.document
+        /** 节点问题是本轮权威运行态，不进入 CanvasNode 或持久化文档。 */
+        const unavailableNodeIds = new Set(snapshot.nodeIssues.map((issue) => issue.nodeId))
         const explicitNodeIds = new Set(params.nodeIds)
         const requestedIds = new Set(explicitNodeIds)
         if (params.includeNeighbors) {
@@ -746,7 +754,11 @@ export function createCanvasToolRun(
             fullContent = dependencies.readNodeContent ? await dependencies.readNodeContent(target, node) : ''
           }
           fullContents.push(fullContent)
-          entries.push({ node, content: '', contentLength: fullContent.length, ...(artifact ? { artifact } : {}) })
+          /** 能力只用于发现；各工具仍在执行时独立完成 Host 身份与 revision 校验。 */
+          const capabilities = canvasNodeCapabilityRegistry.list(node, {
+            availability: unavailableNodeIds.has(node.id) ? 'unavailable' : 'available',
+          })
+          entries.push({ node, capabilities, content: '', contentLength: fullContent.length, ...(artifact ? { artifact } : {}) })
         }
         /** 最终 details 自身而非单一正文字段受统一硬预算。 */
         const details = applyCanvasReadBudget({
