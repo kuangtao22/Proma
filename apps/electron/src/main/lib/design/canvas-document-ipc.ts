@@ -116,6 +116,7 @@ import type {
 import { createCanvasToolRun } from './canvas-tool-provider'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 import type { CanvasNodeReferenceResolver } from './canvas-node-reference-resolver'
+import type { CanvasAgentOutputService } from './canvas-agent-output-service'
 import {
   CANVAS_AGENT_ALLOWED_TOOL_NAMES,
   requireCanvasAgentRunOwner,
@@ -231,6 +232,8 @@ export interface CanvasDocumentIpcOptions {
     reserveStart: (sessionId: string, startedAt?: number) => () => void
     run: (input: AgentSendInput, sender: WebContents, extensions: AgentRunExtensions) => Promise<void>
     stop: (sessionId: string) => void
+    /** 当前 registration 独占捕获的 Agent 正式输出读取服务。 */
+    outputs: Pick<CanvasAgentOutputService, 'read'>
   }
   getProjectReadOnlyReason: (projectId: string) => string | undefined
   /** 生产普通 Agent 工具复用的唯一授权与关联 facade。 */
@@ -1743,6 +1746,7 @@ export function registerCanvasDocumentIpcHandlers(
         createRun: (context) => createCanvasToolRun({
           access: toolAccess,
           documents: options.store,
+          agentOutputs: options.agent.outputs,
           artifacts: options.artifacts,
           importImage: options.importImage,
           textArtifacts: options.textArtifacts,

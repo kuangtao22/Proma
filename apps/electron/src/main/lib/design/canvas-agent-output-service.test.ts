@@ -56,7 +56,12 @@ function currentRun(...messages: SDKMessage[]): SDKMessage[] {
 }
 
 /** 创建可观察原子图提交与发布顺序的输出服务 fixture。 */
-function createFixture(options: { messages?: SDKMessage[]; publishError?: Error } = {}) {
+function createFixture(options: {
+  messages?: SDKMessage[]
+  publishError?: Error
+  mutateReturnsUncertain?: boolean
+  afterUncertainWrite?: (document: CanvasDocument) => CanvasDocument
+} = {}) {
   const oldPointer = {
     messageUuid: oldUuid,
     contentSha256: createHash('sha256').update('旧正文', 'utf8').digest('hex'),
@@ -105,10 +110,14 @@ function createFixture(options: { messages?: SDKMessage[]; publishError?: Error 
           operation.type === 'upsert-nodes' ? operation.nodes : []
         ))
         const replacementsById = new Map(replacements.map((node) => [node.id, node]))
-        document = {
+        const committedDocument: CanvasDocument = {
           ...document,
           revision: document.revision + 1,
           nodes: document.nodes.map((node) => replacementsById.get(node.id) ?? node),
+        }
+        document = options.afterUncertainWrite?.(committedDocument) ?? committedDocument
+        if (options.mutateReturnsUncertain) {
+          throw new Error('CANVAS_COMMIT_UNCERTAIN: main durability requires reload')
         }
         return structuredClone(document)
       },
@@ -204,6 +213,30 @@ describe('Canvas Agent 正式输出服务', () => {
       .toEqual(fixture.oldPointer)
   })
 
+  test.each([
+    ['顶层为 null', [null as unknown as SDKMessage]],
+    ['顶层为数组', [[] as unknown as SDKMessage]],
+    ['assistant 缺少 message', [user(anchorUuid), {
+      type: 'assistant', uuid: lastUuid, parent_tool_use_id: null,
+    } as unknown as SDKMessage]],
+    ['assistant content 非数组', [user(anchorUuid), {
+      type: 'assistant', uuid: lastUuid, parent_tool_use_id: null,
+      message: { content: '损坏正文' },
+    } as unknown as SDKMessage]],
+    ['assistant text block 的 text 非字符串', currentRun(assistant(lastUuid, [
+      { type: 'text', text: 42 },
+    ]))],
+    ['user content 非数组', [{
+      type: 'user', uuid: anchorUuid, parent_tool_use_id: null,
+      message: { content: { type: 'text', text: '损坏锚点' } },
+    } as unknown as SDKMessage, assistant(lastUuid, [{ type: 'text', text: '正文' }])]],
+  ])('Given SDK JSONL %s When 解析正式输出 Then 稳定返回 invalid 而非运行时 TypeError', (_name, messages) => {
+    const fixture = createFixture({ messages })
+
+    expect(() => fixture.service.resolveCompletedOutput(completion()))
+      .toThrow('CANVAS_AGENT_OUTPUT_INVALID')
+  })
+
   test('Given 当前锚点后没有完成回复 When 解析 Then 不得采纳锚点前的旧消息', () => {
     const fixture = createFixture({ messages: [
       user(oldAnchorUuid), assistant(oldUuid, [{ type: 'text', text: '旧回复' }]), user(anchorUuid),
@@ -281,6 +314,75 @@ describe('Canvas Agent 正式输出服务', () => {
     expect(document.nodes.find((node) => node.id === 'doc-1')?.upstreamChange).toEqual({ sourceNodeIds: ['agent-1'], changedAt: 100 })
     expect(document.nodes.find((node) => node.id === 'image-1')?.upstreamChange).toEqual({ sourceNodeIds: ['agent-1'], changedAt: 100 })
     expect(document.nodes.find((node) => node.id === 'ignored-1')).not.toHaveProperty('upstreamChange')
+    expect(fixture.getPublishStates()).toEqual([false])
+  })
+
+  test('Given mutate 已写入完整投影后返回 uncertain When commit Then fresh 对账确认并推进代次阻止旧回调', async () => {
+    const generationTwoAnchor = '123e4567-e89b-42d3-a456-426614174092'
+    const fixture = createFixture({
+      messages: [user(generationTwoAnchor), assistant(lastUuid, [{ type: 'text', text: '第二代正式正文' }])],
+      mutateReturnsUncertain: true,
+    })
+
+    const result = await fixture.service.commit(completion({
+      userMessageUuid: generationTwoAnchor, runGeneration: 2, completedAt: 80,
+    }))
+    const committed = fixture.getDocument()
+    fixture.setMessages([
+      user(anchorUuid), assistant(firstUuid, [{ type: 'text', text: '第一代迟到' }]),
+      user(generationTwoAnchor), assistant(lastUuid, [{ type: 'text', text: '第二代正式正文' }]),
+    ])
+
+    expect(result.revision).toBe(committed.revision)
+    expect(result.downstreamNodeIds).toEqual(['doc-1', 'image-1'])
+    await expect(fixture.service.commit(completion({
+      runGeneration: 1, completedAt: 150,
+    }))).rejects.toThrow('CANVAS_AGENT_OUTPUT_STALE')
+    expect(fixture.getMutateCalls()).toBe(1)
+    expect(fixture.getPublishStates()).toEqual([false])
+  })
+
+  test('Given mutate uncertain 后权威下游投影不一致 When commit Then 不误确认且不重写', async () => {
+    const fixture = createFixture({
+      messages: currentRun(assistant(lastUuid, [{ type: 'text', text: '正式正文' }])),
+      mutateReturnsUncertain: true,
+      afterUncertainWrite: (document) => ({
+        ...document,
+        nodes: document.nodes.map((node) => node.id === 'doc-1'
+          ? { ...node, upstreamChange: { sourceNodeIds: ['other-agent'], changedAt: 100 } }
+          : node),
+      }),
+    })
+
+    await expect(fixture.service.commit(completion()))
+      .rejects.toThrow('CANVAS_COMMIT_UNCERTAIN')
+    expect(fixture.getMutateCalls()).toBe(1)
+    expect(fixture.getPublishStates()).toEqual([])
+  })
+
+  test('Given mutate uncertain 后权威 revision 超过本次单次提交 When commit Then 不凭节点同值误确认', async () => {
+    const fixture = createFixture({
+      messages: currentRun(assistant(lastUuid, [{ type: 'text', text: '正式正文' }])),
+      mutateReturnsUncertain: true,
+      afterUncertainWrite: (document) => ({ ...document, revision: document.revision + 1 }),
+    })
+
+    await expect(fixture.service.commit(completion()))
+      .rejects.toThrow('CANVAS_COMMIT_UNCERTAIN')
+    expect(fixture.getMutateCalls()).toBe(1)
+    expect(fixture.getPublishStates()).toEqual([])
+  })
+
+  test('Given 广播失败 When commit Then 已提交图事实仍返回成功且不回滚', async () => {
+    const fixture = createFixture({
+      messages: currentRun(assistant(lastUuid, [{ type: 'text', text: '正式正文' }])),
+      publishError: new Error('窗口已销毁'),
+    })
+
+    const result = await fixture.service.commit(completion())
+
+    expect(fixture.getDocument().nodes[0]).toMatchObject({ outputPointer: result.pointer })
+    expect(fixture.getMutateCalls()).toBe(1)
     expect(fixture.getPublishStates()).toEqual([false])
   })
 

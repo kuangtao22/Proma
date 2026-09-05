@@ -51,16 +51,6 @@ const MAX_INSPECT_BATCH_BYTES = 2 * 1024 * 1024
 const MAX_INSPECT_IMAGE_PIXELS = 64_000_000
 const CANVAS_NODE_KINDS: CanvasNode['kind'][] = ['agent', 'image', 'document', 'webview']
 
-/** 主进程装配的唯一 Agent 正式输出读取边界；测试可在 dependencies 中显式覆盖。 */
-let registeredCanvasAgentOutputs: Pick<CanvasAgentOutputService, 'read'> | null = null
-
-/** 注册主进程唯一 Agent 输出服务，供既有 Canvas Tool runtime 延迟取用。 */
-export function registerCanvasAgentOutputs(
-  service: Pick<CanvasAgentOutputService, 'read'>,
-): void {
-  registeredCanvasAgentOutputs = service
-}
-
 /** 不透明分页游标绑定的权威读取边界。 */
 interface CanvasNodeCursorPayload {
   projectId: string
@@ -335,7 +325,7 @@ export interface CanvasToolProviderDependencies {
     load: (target: CanvasTarget) => CanvasWorkspaceSnapshot
     validateBatchOperations: (target: CanvasTarget, expectedRevision: number, operations: unknown[]) => CanvasMutation[]
   }
-  agentOutputs?: Pick<CanvasAgentOutputService, 'read'>
+  agentOutputs: Pick<CanvasAgentOutputService, 'read'>
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
   artifacts: Pick<CanvasArtifactCreationService, 'create' | 'createAgent'>
   /** 主进程在调用导入事务前负责解析并验证本地路径。 */
@@ -712,9 +702,7 @@ export function createCanvasToolRun(
           let fullContent = ''
           if (node.kind === 'agent') {
             /** Agent 正文只从节点正式 outputPointer 经权威服务校验后读取。 */
-            const agentOutputs = dependencies.agentOutputs ?? registeredCanvasAgentOutputs
-            if (!agentOutputs) throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
-            fullContent = await agentOutputs.read({ ...target, nodeId: node.id })
+            fullContent = await dependencies.agentOutputs.read({ ...target, nodeId: node.id })
           } else if (node.kind === 'document' || node.kind === 'webview') {
             /** 节点类别决定稳定正文 ID。 */
             const contentId = node.kind === 'document' ? node.documentId : node.prototypeId

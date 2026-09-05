@@ -246,7 +246,6 @@ import { createCanvasImageCandidateBatchStore } from './lib/design/canvas-image-
 import { createCanvasImageCandidateBatchService } from './lib/design/canvas-image-candidate-batch-service'
 import { createCanvasDependencyStateService } from './lib/design/canvas-dependency-state-service'
 import { createCanvasAgentOutputService } from './lib/design/canvas-agent-output-service'
-import { registerCanvasAgentOutputs } from './lib/design/canvas-tool-provider'
 import {
   createCanvasWebviewPreviewService,
   createElectronCanvasWebviewOffscreenRenderer,
@@ -2286,8 +2285,6 @@ export function registerIpcHandlers(): void {
       }
     },
   })
-  /** 既有 Canvas Tool runtime 延迟读取该唯一实例，不创建第二套输出服务。 */
-  registerCanvasAgentOutputs(canvasAgentOutputService)
   /** Service 回调只会在 Job Manager 完成赋值后执行。 */
   let designJobManager: DesignJobManager
   const canvasImageCandidateBatchService = createCanvasImageCandidateBatchService({
@@ -2714,6 +2711,7 @@ export function registerIpcHandlers(): void {
       reserveStart: reserveAgentSessionStart,
       run: runAgent,
       stop: stopAgent,
+      outputs: canvasAgentOutputService,
     },
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
     toolAccess: canvasToolAccess,

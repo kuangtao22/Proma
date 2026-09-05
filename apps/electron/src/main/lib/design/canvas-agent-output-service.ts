@@ -5,6 +5,7 @@ import type {
   CanvasAgentTarget,
   CanvasDocument,
   CanvasMutation,
+  CanvasNodeUpstreamChange,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
   SDKAssistantMessage,
@@ -89,20 +90,43 @@ function contentSha256(content: string): string {
   return createHash('sha256').update(content, 'utf8').digest('hex')
 }
 
+/** 判断 SDK JSONL 嵌套值可作为无 getter 的解析后对象读取。 */
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** 严格读取 assistant/user 的消息块，损坏持久化结构统一 fail closed。 */
+function requireMessageContent(message: SDKMessage): Array<Record<string, unknown>> {
+  if (!isObjectRecord(message)) throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
+  const record = message as unknown as Record<string, unknown>
+  const envelope = record.message
+  if (!isObjectRecord(envelope) || !Array.isArray(envelope.content)) {
+    throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
+  }
+  return envelope.content.map((block) => {
+    if (!isObjectRecord(block)
+      || typeof block.type !== 'string'
+      || (block.type === 'text' && typeof block.text !== 'string')) {
+      throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
+    }
+    return block
+  })
+}
+
 /** 只按块顺序提取 text；thinking、tool 和未知块均不进入正式正文。 */
 function extractAssistantText(message: SDKAssistantMessage): string {
-  return message.message.content
-    .filter((block): block is Extract<typeof block, { type: 'text' }> => (
-      block.type === 'text' && typeof block.text === 'string'
-    ))
+  return requireMessageContent(message)
+    .filter((block): block is Record<string, unknown> & { type: 'text'; text: string } => block.type === 'text')
     .map((block) => block.text)
     .join('')
 }
 
 /** 判断消息是当前 run 的完整、无错误、非 replay assistant 候选。 */
 function isCompletedAssistant(message: SDKMessage): message is SDKAssistantMessage {
-  if (message.type !== 'assistant') return false
-  const record = message as SDKAssistantMessage & Record<string, unknown>
+  if (!isObjectRecord(message)) throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
+  const record = message as unknown as SDKAssistantMessage & Record<string, unknown>
+  if (record.type !== 'assistant') return false
+  requireMessageContent(message)
   return record._partial !== true
     && record.isReplay !== true
     && record.error === undefined
@@ -112,24 +136,28 @@ function isCompletedAssistant(message: SDKMessage): message is SDKAssistantMessa
 
 /** 用户文本消息是 run 边界；tool_result user 消息仍属于锚点后的同一运行。 */
 function isUserRunAnchor(message: SDKMessage): boolean {
+  if (!isObjectRecord(message)) throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
   const record = message as {
     type: string
     isSynthetic?: boolean
     uuid?: string
     message?: { content?: Array<{ type?: unknown }> }
   }
-  if (record.type !== 'user' || record.isSynthetic === true || typeof record.uuid !== 'string') {
+  if (record.type !== 'user') return false
+  const content = requireMessageContent(message)
+  if (record.isSynthetic === true || typeof record.uuid !== 'string') {
     return false
   }
-  return record.message?.content?.some((block) => block.type === 'text') === true
+  return content.some((block) => block.type === 'text')
 }
 
 /** 在有界日志中定位唯一用户锚点，重复或缺失均不能证明 run 归属。 */
 function findUniqueRunAnchor(messages: SDKMessage[], userMessageUuid: string): number {
   let anchorIndex = -1
   for (const [index, message] of messages.entries()) {
+    if (!isUserRunAnchor(message)) continue
     const uuid = (message as { uuid?: unknown }).uuid
-    if (!isUserRunAnchor(message) || uuid !== userMessageUuid) continue
+    if (uuid !== userMessageUuid) continue
     if (anchorIndex !== -1) throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
     anchorIndex = index
   }
@@ -163,6 +191,22 @@ function isSamePointer(left: CanvasAgentOutputPointer | undefined, right: Canvas
     && left.completedAt === right.completedAt
 }
 
+/** 比较依赖提示的完整投影，避免 uncertain 对账接受部分图事实。 */
+function isSameUpstreamChange(
+  left: CanvasNodeUpstreamChange | undefined,
+  right: CanvasNodeUpstreamChange | undefined,
+): boolean {
+  if (!left || !right) return left === right
+  return left.changedAt === right.changedAt
+    && left.sourceNodeIds.length === right.sourceNodeIds.length
+    && left.sourceNodeIds.every((sourceNodeId, index) => sourceNodeId === right.sourceNodeIds[index])
+}
+
+/** 只识别 Store 明确声明的提交不确定错误。 */
+function isCanvasCommitUncertain(error: unknown): error is Error {
+  return error instanceof Error && error.message.startsWith('CANVAS_COMMIT_UNCERTAIN')
+}
+
 /** 构造 Canvas Agent 正式输出服务，不创建额外 Store、串行器或持久化。 */
 export function createCanvasAgentOutputService(
   dependencies: CanvasAgentOutputServiceDependencies,
@@ -174,8 +218,11 @@ export function createCanvasAgentOutputService(
     `${target.projectId}\0${target.canvasId}\0${target.nodeId}`
   )
 
-  /** 从权威 session 日志按精确用户锚点解析本轮最后一条有效正文。 */
-  const resolveCompletedOutput = (input: CanvasAgentCompletionInput): CanvasResolvedAgentOutput => {
+  /** 从已锁定 owner 的权威日志按精确用户锚点解析本轮最后一条有效正文。 */
+  const resolveOwnerCompletedOutput = (
+    input: CanvasAgentCompletionInput,
+    agentSessionId: string,
+  ): CanvasResolvedAgentOutput => {
     if (input.terminalStatus !== 'completed'
       || !isNonNegativeSafeInteger(input.startedAt)
       || !Number.isSafeInteger(input.runGeneration) || input.runGeneration <= 0
@@ -185,9 +232,8 @@ export function createCanvasAgentOutputService(
       || input.userMessageUuid.length > MAX_CANVAS_AGENT_RUN_ANCHOR_LENGTH) {
       throw new Error('CANVAS_AGENT_OUTPUT_MISSING')
     }
-    const owner = requireOwner(dependencies, input.target)
     /** SDK API 当前整份返回单会话消息；这里只做一次线性范围解析，不复制正文集合。 */
-    const messages = dependencies.getMessages(owner.node.agentSessionId)
+    const messages = dependencies.getMessages(agentSessionId)
     const anchorIndex = findUniqueRunAnchor(messages, input.userMessageUuid)
     let selected: { messageUuid: string; content: string } | undefined
     for (let index = anchorIndex + 1; index < messages.length; index += 1) {
@@ -211,6 +257,12 @@ export function createCanvasAgentOutputService(
     }
   }
 
+  /** 公共解析入口每次 fresh-read owner，不接受调用方提供内部 session 身份。 */
+  const resolveCompletedOutput = (input: CanvasAgentCompletionInput): CanvasResolvedAgentOutput => {
+    const owner = requireOwner(dependencies, input.target)
+    return resolveOwnerCompletedOutput(input, owner.node.agentSessionId)
+  }
+
   const service: CanvasAgentOutputService = {
     resolveCompletedOutput,
     commit: async (input) => {
@@ -226,7 +278,7 @@ export function createCanvasAgentOutputService(
         if (latestGeneration !== undefined && input.runGeneration < latestGeneration) {
           throw new Error('CANVAS_AGENT_OUTPUT_STALE')
         }
-        const resolved = resolveCompletedOutput(input)
+        const resolved = resolveOwnerCompletedOutput(input, initialOwner.node.agentSessionId)
         /** 第二次 fresh-read 与 mutation 共处同一临界区，抵御解析期间换绑。 */
         const owner = requireOwner(dependencies, input.target)
         if (owner.node.agentSessionId !== initialOwner.node.agentSessionId) {
@@ -257,11 +309,39 @@ export function createCanvasAgentOutputService(
           producerNodeIds: [owner.node.id],
           changedAt: input.completedAt,
         })
-        const document = await dependencies.documents.mutate(
-          input.target,
-          owner.document.revision,
-          [{ type: 'upsert-nodes', nodes: dependencyProjection.nodes }],
-        )
+        let document: CanvasDocument
+        try {
+          document = await dependencies.documents.mutate(
+            input.target,
+            owner.document.revision,
+            [{ type: 'upsert-nodes', nodes: dependencyProjection.nodes }],
+          )
+        } catch (error) {
+          if (!isCanvasCommitUncertain(error)) throw error
+          /** mutate 可能已可见；只接受 owner、pointer 与全部受影响投影完全匹配的权威复读。 */
+          let authoritativeOwner: ReturnType<typeof requireOwner>
+          try {
+            authoritativeOwner = requireOwner(dependencies, input.target)
+          } catch {
+            throw error
+          }
+          const projectedById = new Map(dependencyProjection.nodes.map((node) => [node.id, node]))
+          const projectedProducer = projectedById.get(owner.node.id)
+          const producerMatches = projectedProducer !== undefined
+            && authoritativeOwner.document.revision === owner.document.revision + 1
+            && authoritativeOwner.node.agentSessionId === owner.node.agentSessionId
+            && isSamePointer(authoritativeOwner.node.outputPointer, resolved.pointer)
+            && isSameUpstreamChange(authoritativeOwner.node.upstreamChange, projectedProducer?.upstreamChange)
+          const downstreamMatches = dependencyProjection.downstreamNodeIds.every((nodeId) => {
+            const authoritativeNode = authoritativeOwner.document.nodes.find((node) => node.id === nodeId)
+            const projectedNode = projectedById.get(nodeId)
+            return authoritativeNode !== undefined
+              && projectedNode !== undefined
+              && isSameUpstreamChange(authoritativeNode.upstreamChange, projectedNode.upstreamChange)
+          })
+          if (!producerMatches || !downstreamMatches) throw error
+          document = authoritativeOwner.document
+        }
         committedRunGenerations.set(key, {
           agentSessionId: owner.node.agentSessionId,
           generation: input.runGeneration,

@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from 'bun:test'
 import { CANVAS_IPC_CHANNELS, createEmptyCanvasDocument } from '@proma/shared'
 import type {
   AgentSessionMeta,
+  CanvasAgentTarget,
   CanvasAgentNodeCreationResult,
   CanvasDocument,
   CanvasChangeEvent,
@@ -278,6 +279,7 @@ function createContext(options: {
   batchReconcileError?: Error
   batchPublications?: CanvasBatchPublication[]
   enableToolProviderRuntime?: boolean
+  agentOutput?: (target: CanvasAgentTarget) => Promise<string>
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -786,6 +788,9 @@ function createContext(options: {
         agentCalls.push({ type: 'run', value: { input, senderId: sender.id, extensions } })
       },
       stop: (sessionId) => { agentCalls.push({ type: 'stop', value: sessionId }) },
+      outputs: {
+        read: options.agentOutput ?? (async () => '默认 Agent 正式输出'),
+      },
     },
     getProjectReadOnlyReason: (projectId) => {
       calls.push(`readonly:${projectId}`)
@@ -3718,6 +3723,7 @@ describe('原生 Canvas 文档 IPC', () => {
         reserveStart: () => () => undefined,
         run: async () => undefined,
         stop: () => undefined,
+        outputs: { read: async () => `Agent 输出 ${revision}` },
       },
       getProjectReadOnlyReason: () => undefined,
     })
@@ -3811,6 +3817,62 @@ describe('原生 Canvas 文档 IPC', () => {
     } finally {
       context.registration.dispose()
     }
+  })
+
+  test('Given Canvas runtime 连续注册不同输出服务 When 旧 runtime 读取且当前 registration dispose Then 闭包不串线且全局入口 fail closed', async () => {
+    /** 两代 registration 读取同一节点，但输出服务身份不同。 */
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'agent-1', kind: 'agent', title: '研究 Agent', position: { x: 0, y: 0 },
+      agentSessionId: 'session-1',
+    }]
+    /** 记录实际被调用的 registration 输出服务。 */
+    const outputReads: string[] = []
+    const contextA = createContext({
+      enableToolProviderRuntime: true,
+      loadResult: { document, writable: true, nodeIssues: [] },
+      agentOutput: async () => { outputReads.push('A'); return 'A 输出' },
+    })
+    const runtimeA = getCanvasToolProviderRuntime()
+    if (!runtimeA) throw new Error('A runtime 未注册')
+    const contextB = createContext({
+      enableToolProviderRuntime: true,
+      loadResult: { document, writable: true, nodeIssues: [] },
+      agentOutput: async () => { outputReads.push('B'); return 'B 输出' },
+    })
+    const runtimeB = getCanvasToolProviderRuntime()
+    if (!runtimeB) throw new Error('B runtime 未注册')
+
+    try {
+      contextA.registration.dispose()
+      const runA = runtimeA.createRun({
+        projectId: 'project-1', sessionId: 'session-a', runStartedAt: 1,
+        explicitReferences: [], permissionCeiling: 'execute',
+      })
+      const runB = runtimeB.createRun({
+        projectId: 'project-1', sessionId: 'session-b', runStartedAt: 2,
+        explicitReferences: [], permissionCeiling: 'execute',
+      })
+      const readA = runA.piCustomTools.find((tool) => tool.name === 'canvas_read')
+      const readB = runB.piCustomTools.find((tool) => tool.name === 'canvas_read')
+      if (!readA || !readB) throw new Error('canvas_read 未注册')
+
+      const resultA = await readA.execute('read-a', {
+        canvasId: 'canvas-1', nodeIds: ['agent-1'],
+      } as never, undefined as never, undefined as never, undefined as never)
+      const resultB = await readB.execute('read-b', {
+        canvasId: 'canvas-1', nodeIds: ['agent-1'],
+      } as never, undefined as never, undefined as never, undefined as never)
+
+      expect(resultA.details).toMatchObject({ nodes: [{ content: 'A 输出' }] })
+      expect(resultB.details).toMatchObject({ nodes: [{ content: 'B 输出' }] })
+      expect(outputReads).toEqual(['A', 'B'])
+      expect(getCanvasToolProviderRuntime()).toBe(runtimeB)
+    } finally {
+      contextB.registration.dispose()
+      contextA.registration.dispose()
+    }
+    expect(getCanvasToolProviderRuntime()).toBeNull()
   })
 
   test('Given 生产 Canvas Tool Provider runtime When 普通 Agent 创建分工并导入参考图 Then 调用真实窄服务', async () => {
