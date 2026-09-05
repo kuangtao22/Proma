@@ -689,7 +689,14 @@ export function createCanvasImageCandidateBatchService(
           jobId: event.jobId,
         }
       })
-      for (const listener of listeners) listener(changed)
+      for (const listener of listeners) {
+        try {
+          listener(changed)
+        } catch (error) {
+          /** 单个观察者失败不得中断后续通知，也不得把已提交终态误报为登记失败。 */
+          console.error('[CanvasImageCandidateBatchService] 候选批次变化监听器执行失败:', error)
+        }
+      }
     },
     onChanged: (listener) => {
       listeners.add(listener)

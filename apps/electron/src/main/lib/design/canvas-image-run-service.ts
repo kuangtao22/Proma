@@ -204,7 +204,8 @@ export function createCanvasImageRunService(
       throw new Error('CANVAS_IMAGE_TASK_CANCEL_INPUT_INVALID')
     }
     const batch = await loadOwnedBatch(input)
-    /** 批次条目提供节点与模块身份，每次取消前仍 fresh-read Job 防止竞态越权。 */
+    /** 先对全批完成 fresh ownership 与 active 快照，验证失败时保持零取消。 */
+    const activeTaskIds: string[] = []
     for (const entry of batch.entries) {
       const job = dependencies.imageJobs.getProjectJob(input.projectId, entry.jobId)
       const imageTarget: CanvasImageTarget = {
@@ -218,8 +219,14 @@ export function createCanvasImageRunService(
         || !isOwnedImageJob(job, imageTarget)) {
         throw new Error('CANVAS_IMAGE_BATCH_WAIT_OWNERSHIP_INVALID')
       }
-      if (!ACTIVE_JOB_STATUSES.has(job.status)) continue
-      await dependencies.imageJobs.cancel(input.projectId, entry.jobId)
+      if (ACTIVE_JOB_STATUSES.has(job.status)) activeTaskIds.push(entry.jobId)
+    }
+    /** 单项失败不得短路其它 owned active 任务，全部尝试后只返回稳定汇总错误。 */
+    const results = await Promise.allSettled(activeTaskIds.map((taskId) => (
+      dependencies.imageJobs.cancel(input.projectId, taskId)
+    )))
+    if (results.some((result) => result.status === 'rejected')) {
+      throw new Error('CANVAS_IMAGE_TASK_CANCEL_FAILED')
     }
   }
 
@@ -512,7 +519,12 @@ export function createCanvasImageRunService(
         && (error.message === 'CANVAS_IMAGE_BATCH_WAIT_ABORTED'
           || error.message === 'CANVAS_IMAGE_BATCH_WAIT_DEADLINE')) {
         /** 只取消输入任务中仍属于当前批次与 Canvas 的活跃 Job。 */
-        await cancelTasks(input)
+        try {
+          await cancelTasks(input)
+        } catch (cleanupError) {
+          /** 清理异常只进入内部诊断，不能覆盖调用方可依赖的等待主错误。 */
+          console.error('[CanvasImageRunService] 候选批次等待清理失败:', cleanupError)
+        }
       }
       throw error
     } finally {

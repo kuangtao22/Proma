@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import {
   parseCanvasWorkspaceSnapshot,
   type CanvasDocument,
@@ -126,25 +126,38 @@ function createFixture() {
 }
 
 describe('Canvas 图片候选批次 Service', () => {
-  test('Given Job 终态完成登记 When 发布批次变化 Then 监听器可立即读取权威终态', async () => {
+  test('Given 首个批次监听器抛错 When Job 终态完成登记 Then 持久化成功且继续通知后续监听器', async () => {
     const fixture = createFixture()
     await fixture.service.createBatch({
       ...fixture.target, batchId: 'batch-event', source: 'canvas-tool',
       sourceSessionId: 'session-1', sourceToolCallId: 'tool-event', entries: [fixture.entries[0]!],
     })
+    /** 隔离预期中文错误日志，避免失败监听器污染测试输出。 */
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
     const observedStatuses: string[] = []
+    fixture.service.onChanged(() => { throw new Error('监听器测试失败') })
     const unsubscribe = fixture.service.onChanged((event) => {
       /** 事件回调触发时，内存 store 必须已经持有可重读的权威终态。 */
       observedStatuses.push(fixture.batches.get(event.batchId)?.entries[0]?.status ?? 'missing')
     })
 
-    await fixture.service.recordJobTerminal({
-      ...fixture.target, jobId: 'job-0', candidateBatchId: 'batch-event',
-      status: 'succeeded', outputAssetId: 'asset-event', error: null,
-    })
-    unsubscribe()
-
-    expect(observedStatuses).toEqual(['candidate'])
+    try {
+      await expect(fixture.service.recordJobTerminal({
+        ...fixture.target, jobId: 'job-0', candidateBatchId: 'batch-event',
+        status: 'succeeded', outputAssetId: 'asset-event', error: null,
+      })).resolves.toBeUndefined()
+      expect(observedStatuses).toEqual(['candidate'])
+      expect(fixture.batches.get('batch-event')?.entries[0]).toMatchObject({
+        status: 'candidate', candidateAssetId: 'asset-event',
+      })
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[CanvasImageCandidateBatchService] 候选批次变化监听器执行失败:',
+        expect.objectContaining({ message: '监听器测试失败' }),
+      )
+    } finally {
+      unsubscribe()
+      errorSpy.mockRestore()
+    }
   })
 
   test('Given 14 节点 When 仅 2 个成功 Then partial 且不采用任何正式版本', async () => {

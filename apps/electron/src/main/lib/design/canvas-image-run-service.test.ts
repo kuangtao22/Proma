@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import type {
   CanvasImageCandidateBatch,
   CanvasImageModuleConfig,
@@ -92,6 +92,7 @@ interface HarnessOptions {
     jobs: Map<string, DesignJobRecord>,
   ) => Promise<{ job: DesignJobRecord; created: boolean }>
   run?: (jobId: string, jobs: Map<string, DesignJobRecord>) => Promise<void>
+  cancel?: (projectId: string, jobId: string, jobs: Map<string, DesignJobRecord>) => Promise<void>
 }
 
 /** 构造完全内存化的服务依赖，并记录事务顺序与监听生命周期。 */
@@ -152,6 +153,7 @@ function createHarness(options: HarnessOptions = {}) {
         calls.push(`cancel:${jobId}`)
         const job = jobs.get(jobId)
         if (!job || job.projectId !== projectId) throw new Error('DESIGN_JOB_NOT_FOUND')
+        await options.cancel?.(projectId, jobId, jobs)
         const cancelled = { ...job, status: 'cancelled' as const }
         jobs.set(jobId, cancelled)
         return cancelled
@@ -393,9 +395,11 @@ describe('Canvas 图片统一运行服务', () => {
     })
   })
 
-  test('Given 等待被中止 When 清理 Then 移除两类监听且不取消同 Canvas 其它任务', async () => {
+  test('Given 等待被中止且取消清理失败 When 清理 Then 保留中止主错误并移除两类监听', async () => {
     const node = createImageNode('image-a')
-    const harness = createHarness()
+    const harness = createHarness({
+      cancel: async () => { throw new Error('CANCEL_SECRET') },
+    })
     const started = await harness.service.run(context, target, [node], 'tool-abort')
     const taskId = started.tasks[0]?.taskId
     const batchId = started.batch?.batchId
@@ -417,13 +421,24 @@ describe('Canvas 图片统一运行服务', () => {
       deadlineAt: Date.now() + 5_000,
     })
     await Promise.resolve()
+    /** 隔离预期清理日志，并验证不会记录底层取消异常正文。 */
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
     abortController.abort()
 
-    await expect(waiting).rejects.toThrow('CANVAS_IMAGE_BATCH_WAIT_ABORTED')
-    expect(harness.calls.filter((call) => call.startsWith('cancel:'))).toEqual([`cancel:${taskId}`])
-    expect(harness.jobs.get('foreign-job')?.status).toBe('running')
-    expect(harness.listeners.size).toBe(0)
-    expect(harness.batchListeners.size).toBe(0)
+    try {
+      await expect(waiting).rejects.toThrow('CANVAS_IMAGE_BATCH_WAIT_ABORTED')
+      expect(harness.calls.filter((call) => call.startsWith('cancel:'))).toEqual([`cancel:${taskId}`])
+      expect(harness.jobs.get(taskId)?.status).toBe('queued')
+      expect(harness.jobs.get('foreign-job')?.status).toBe('running')
+      expect(harness.listeners.size).toBe(0)
+      expect(harness.batchListeners.size).toBe(0)
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[CanvasImageRunService] 候选批次等待清理失败:',
+        expect.objectContaining({ message: 'CANVAS_IMAGE_TASK_CANCEL_FAILED' }),
+      )
+    } finally {
+      errorSpy.mockRestore()
+    }
   })
 
   test('Given 直接取消请求跨越 Canvas、批次或批次任务集合 When 校验所有权 Then 全部拒绝且零取消', async () => {
@@ -467,24 +482,67 @@ describe('Canvas 图片统一运行服务', () => {
     expect(harness.jobs.get(taskIds[1]!)?.status).toBe('succeeded')
   })
 
-  test('Given 等待期限已过 When 进入服务 Then 不保留监听并取消本批活跃任务', async () => {
+  test('Given 批次有两个活跃任务且首个取消失败 When 直接取消 Then 仍尝试后续任务并返回稳定汇总失败', async () => {
+    /** 取消调用序号用于稳定制造首项失败。 */
+    let cancelAttempt = 0
+    const harness = createHarness({
+      cancel: async () => {
+        cancelAttempt += 1
+        if (cancelAttempt === 1) throw new Error('CANCEL_SECRET')
+      },
+    })
+    const started = await harness.service.run(
+      context,
+      target,
+      [createImageNode('image-a'), createImageNode('image-b')],
+      'tool-cancel-all-settled',
+    )
+    const taskIds = started.tasks.flatMap((task) => task.taskId ? [task.taskId] : [])
+    const batchId = started.batch?.batchId
+    if (taskIds.length !== 2 || !batchId) throw new Error('测试批次未创建')
+
+    await expect(harness.service.cancelTasks({ ...target, batchId, taskIds }))
+      .rejects.toThrow('CANVAS_IMAGE_TASK_CANCEL_FAILED')
+
+    expect(harness.calls.filter((call) => call.startsWith('cancel:'))).toEqual([
+      `cancel:${taskIds[0]}`,
+      `cancel:${taskIds[1]}`,
+    ])
+    expect(harness.jobs.get(taskIds[0]!)?.status).toBe('queued')
+    expect(harness.jobs.get(taskIds[1]!)?.status).toBe('cancelled')
+  })
+
+  test('Given 等待期限已过且取消清理失败 When 进入服务 Then 保留期限主错误并移除两类监听', async () => {
     const node = createImageNode('image-a')
-    const harness = createHarness()
+    const harness = createHarness({
+      cancel: async () => { throw new Error('CANCEL_SECRET') },
+    })
     const started = await harness.service.run(context, target, [node], 'tool-deadline')
     const taskId = started.tasks[0]?.taskId
     const batchId = started.batch?.batchId
     if (!taskId || !batchId) throw new Error('测试批次未创建')
+    /** 隔离预期清理日志，并验证 deadline 路径使用同一稳定诊断。 */
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
 
-    await expect(harness.service.awaitBatch({
-      ...target,
-      batchId,
-      taskIds: [taskId],
-      signal: new AbortController().signal,
-      deadlineAt: Date.now() - 1,
-    })).rejects.toThrow('CANVAS_IMAGE_BATCH_WAIT_DEADLINE')
+    try {
+      await expect(harness.service.awaitBatch({
+        ...target,
+        batchId,
+        taskIds: [taskId],
+        signal: new AbortController().signal,
+        deadlineAt: Date.now() - 1,
+      })).rejects.toThrow('CANVAS_IMAGE_BATCH_WAIT_DEADLINE')
 
-    expect(harness.calls.filter((call) => call.startsWith('cancel:'))).toEqual([`cancel:${taskId}`])
-    expect(harness.listeners.size).toBe(0)
-    expect(harness.batchListeners.size).toBe(0)
+      expect(harness.calls.filter((call) => call.startsWith('cancel:'))).toEqual([`cancel:${taskId}`])
+      expect(harness.jobs.get(taskId)?.status).toBe('queued')
+      expect(harness.listeners.size).toBe(0)
+      expect(harness.batchListeners.size).toBe(0)
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[CanvasImageRunService] 候选批次等待清理失败:',
+        expect.objectContaining({ message: 'CANVAS_IMAGE_TASK_CANCEL_FAILED' }),
+      )
+    } finally {
+      errorSpy.mockRestore()
+    }
   })
 })
