@@ -30,6 +30,10 @@ import {
   parseCanvasBatchOperationEnvelope,
   parseCanvasChangeEvent,
   parseCanvasWorkspaceSnapshot,
+  parseCanvasAgentOutputPointer,
+  parseCanvasRunAgentResult,
+  parseCanvasRunWorkflowInput,
+  parseCanvasRunWorkflowResult,
   parseCanvasNodeReference,
   parseCanvasRunNodesInput,
   parseClearAgentCanvasBindingsInput,
@@ -57,6 +61,8 @@ import type {
   CanvasMutation,
   CanvasNode,
   CanvasNodeActivityState,
+  CanvasRunAgentResult,
+  CanvasRunWorkflowResult,
   CreateCanvasAgentNodeInput,
   RebuildCanvasAgentNodeResult,
   CanvasWebviewNode,
@@ -76,6 +82,90 @@ const canvasNodeActivityStates: readonly CanvasNodeActivityState[] = [
 
 test('Given Canvas 节点活动合同 When 枚举状态 Then 只包含四种结构化状态', () => {
   expect(canvasNodeActivityStates).toEqual(['idle', 'queued', 'running', 'waiting-approval'])
+})
+
+describe('Canvas Agent 工作流公开合同', () => {
+  /** 测试使用的合法 UUID，覆盖正式输出消息身份。 */
+  const messageUuid = '123e4567-e89b-42d3-a456-426614174000'
+  /** 测试使用的小写 SHA-256，覆盖正式输出内容身份。 */
+  const contentSha256 = 'a'.repeat(64)
+
+  test('Given 正式输出指针 When 严格解析 Then 重建 UUID、哈希与完成时间', () => {
+    const pointer = { messageUuid, contentSha256, completedAt: 100 }
+
+    expect(parseCanvasAgentOutputPointer(pointer)).toEqual(pointer)
+    expect(parseCanvasAgentOutputPointer(pointer)).not.toBe(pointer)
+    expect(() => parseCanvasAgentOutputPointer({ ...pointer, messageUuid: 'not-uuid' })).toThrow()
+    expect(() => parseCanvasAgentOutputPointer({ ...pointer, contentSha256: 'A'.repeat(64) })).toThrow()
+    expect(() => parseCanvasAgentOutputPointer({ ...pointer, contentSha256: 'a'.repeat(63) })).toThrow()
+    expect(() => parseCanvasAgentOutputPointer({ ...pointer, completedAt: -1 })).toThrow()
+    expect(() => parseCanvasAgentOutputPointer({ ...pointer, completedAt: 1.5 })).toThrow()
+    expect(() => parseCanvasAgentOutputPointer({ ...pointer, localPath: '/private/output.jsonl' })).toThrow()
+  })
+
+  test('Given 工作流工具输入 When 严格解析 Then 只接受唯一有界起点与图片预算', () => {
+    const input = {
+      canvasId: 'canvas-1', expectedRevision: 2, startNodeIds: ['agent-1', 'agent-2'],
+      goal: '完成营销页面产物', maxImageRuns: 16,
+    }
+
+    expect(parseCanvasRunWorkflowInput(input)).toEqual(input)
+    expect(parseCanvasRunWorkflowInput(input)).not.toBe(input)
+    expect(parseCanvasRunWorkflowInput({ ...input, maxImageRuns: 0 }).maxImageRuns).toBe(0)
+    expect(() => parseCanvasRunWorkflowInput({ ...input, projectId: 'project-1' })).toThrow()
+    expect(() => parseCanvasRunWorkflowInput({ ...input, startNodeIds: ['agent-1', 'agent-1'] })).toThrow()
+    expect(() => parseCanvasRunWorkflowInput({ ...input, startNodeIds: [] })).toThrow()
+    expect(() => parseCanvasRunWorkflowInput({ ...input, startNodeIds: Array.from({ length: 9 }, (_, index) => `agent-${index}`) })).toThrow()
+    expect(() => parseCanvasRunWorkflowInput({ ...input, maxImageRuns: -1 })).toThrow()
+    expect(() => parseCanvasRunWorkflowInput({ ...input, maxImageRuns: 17 })).toThrow()
+    expect(() => parseCanvasRunWorkflowInput({ ...input, goal: 'x'.repeat(4_001) })).toThrow()
+  })
+
+  test('Given 单 Agent 公开结果 When 严格解析 Then 保留有限事实且拒绝敏感字段', () => {
+    const result = {
+      nodeId: 'agent-1', status: 'completed',
+      outputPointer: { messageUuid, contentSha256, completedAt: 100 },
+      affectedDownstreamNodeIds: ['document-1'], outputSummary: '已完成结构化文案', errorCode: null,
+    } satisfies CanvasRunAgentResult
+
+    expect(parseCanvasRunAgentResult(result)).toEqual(result)
+    expect(parseCanvasRunAgentResult(result).outputPointer).not.toBe(result.outputPointer)
+    for (const sensitive of ['sessionId', 'assetId', 'localPath', 'rawError', 'logs']) {
+      expect(() => parseCanvasRunAgentResult({ ...result, [sensitive]: 'secret' })).toThrow()
+    }
+    expect(() => parseCanvasRunAgentResult({ ...result, outputSummary: 'x'.repeat(2_001) })).toThrow()
+    expect(() => parseCanvasRunAgentResult({ ...result, outputPointer: null })).toThrow()
+    expect(() => parseCanvasRunAgentResult({ ...result, status: 'failed', errorCode: null })).toThrow()
+  })
+
+  test('Given 工作流公开结果 When 严格解析 Then 节点、错误与图片摘要均保持有界', () => {
+    const result = {
+      status: 'waiting-review', initialRevision: 2, finalRevision: 4,
+      nodes: [
+        { nodeId: 'agent-1', status: 'completed', errorCode: null },
+        { nodeId: 'image-1', status: 'waiting-review', errorCode: null },
+      ],
+      imageSummary: {
+        status: 'ready', totalCount: 1, candidateCount: 1, failedCount: 0, runningCount: 0,
+      },
+      requiresReview: true, errorCode: null,
+    } satisfies CanvasRunWorkflowResult
+
+    expect(parseCanvasRunWorkflowResult(result)).toEqual(result)
+    for (const sensitive of ['sessionId', 'assetId', 'localPath', 'rawError', 'logs']) {
+      expect(() => parseCanvasRunWorkflowResult({ ...result, [sensitive]: 'secret' })).toThrow()
+    }
+    expect(() => parseCanvasRunWorkflowResult({
+      ...result,
+      nodes: Array.from({ length: 33 }, (_, index) => ({
+        nodeId: `node-${index}`, status: 'satisfied', errorCode: null,
+      })),
+    })).toThrow()
+    expect(() => parseCanvasRunWorkflowResult({
+      ...result,
+      nodes: [{ nodeId: 'agent-1', status: 'failed', errorCode: 'x'.repeat(121) }],
+    })).toThrow()
+  })
 })
 
 test('Given 图片到图片的类型化引用 When 判定绑定 Then 输出 image.asset 进入 image.reference', () => {

@@ -132,6 +132,22 @@ const CANVAS_CONTENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
 export const CANVAS_IMAGE_PROMPT_MAX_LENGTH = 100_000
 /** Canvas 可恢复命令使用的 UUID，避免 operationId 与稳定内容 ID 混用。 */
 const CANVAS_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+/** Canvas Agent 正式输出消息使用的标准 UUID。 */
+const CANVAS_AGENT_MESSAGE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+/** 正式输出正文使用小写十六进制 SHA-256，避免多种等价编码。 */
+const CANVAS_SHA256_PATTERN = /^[0-9a-f]{64}$/
+/** 单次工作流最多允许八个显式起点，与 Agent 总数预算一致。 */
+export const CANVAS_WORKFLOW_START_NODE_LIMIT = 8
+/** 单次工作流公开节点摘要上限，与执行图预算一致。 */
+export const CANVAS_WORKFLOW_NODE_LIMIT = 32
+/** 单次工作流允许启动的图片任务上限。 */
+export const CANVAS_WORKFLOW_IMAGE_RUN_LIMIT = 16
+/** 工作流目标文本上限，避免审批与运行上下文无界增长。 */
+export const CANVAS_WORKFLOW_GOAL_MAX_LENGTH = 4_000
+/** 单 Agent 公开输出摘要上限。 */
+export const CANVAS_AGENT_OUTPUT_SUMMARY_MAX_LENGTH = 2_000
+/** 公开稳定错误码上限。 */
+export const CANVAS_WORKFLOW_ERROR_CODE_MAX_LENGTH = 120
 /** Canvas 回收条目标题上限，避免无界数据进入 Renderer。 */
 const CANVAS_TRASH_TITLE_MAX_LENGTH = 120
 /** 文本产物正文最大 UTF-8 字节数，与受管文件写入边界保持一致。 */
@@ -299,10 +315,40 @@ export interface CanvasNodeBase {
   upstreamChange?: CanvasNodeUpstreamChange
 }
 
+/** Canvas Agent 当前正式输出在内部消息日志中的不可变引用。 */
+export interface CanvasAgentOutputPointer {
+  messageUuid: string
+  contentSha256: string
+  completedAt: number
+}
+
+/**
+ * 严格解析 Canvas Agent 正式输出指针。
+ * @param value 待解析的磁盘或跨进程值。
+ * @returns 无未知字段且重新构造的不可变输出引用。
+ */
+export function parseCanvasAgentOutputPointer(value: unknown): CanvasAgentOutputPointer {
+  const keys = ['messageUuid', 'contentSha256', 'completedAt'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || typeof value.messageUuid !== 'string'
+    || !CANVAS_AGENT_MESSAGE_UUID_PATTERN.test(value.messageUuid)
+    || typeof value.contentSha256 !== 'string'
+    || !CANVAS_SHA256_PATTERN.test(value.contentSha256)
+    || !isCanvasNonNegativeInteger(value.completedAt)) {
+    throw new Error('CANVAS_AGENT_OUTPUT_POINTER_INVALID')
+  }
+  return {
+    messageUuid: value.messageUuid,
+    contentSha256: value.contentSha256,
+    completedAt: value.completedAt,
+  }
+}
+
 /** 引用独立 Agent 会话的节点，不复制消息或执行状态。 */
 export interface CanvasAgentNode extends CanvasNodeBase {
   kind: 'agent'
   agentSessionId: string
+  outputPointer?: CanvasAgentOutputPointer
   imageModuleId?: never
   adoptedAssetId?: never
   documentId?: never
@@ -1201,6 +1247,243 @@ export interface CanvasImageInputReference {
 /** Canvas Agent 节点的项目、Canvas 与节点三重身份。 */
 export interface CanvasAgentTarget extends CanvasTarget {
   nodeId: string
+}
+
+/** 普通 Agent 公开工具运行一次有界 Canvas 工作流的输入。 */
+export interface CanvasRunWorkflowInput {
+  canvasId: string
+  expectedRevision: number
+  startNodeIds: string[]
+  goal: string
+  maxImageRuns: number
+}
+
+/** 单次 Canvas 工作流的公开终态。 */
+export type CanvasWorkflowStatus =
+  | 'completed'
+  | 'partial'
+  | 'waiting-review'
+  | 'failed'
+  | 'cancelled'
+
+/** 工作流中单节点的有限公开状态。 */
+export type CanvasWorkflowNodeStatus =
+  | 'satisfied'
+  | 'started'
+  | 'completed'
+  | 'waiting-review'
+  | 'waiting-approval'
+  | 'blocked'
+  | 'failed'
+  | 'cancelled'
+
+/** 单个 Canvas Agent 运行的公开终态。 */
+export type CanvasRunAgentStatus = 'completed' | 'failed' | 'cancelled'
+
+/** 单个 Canvas Agent 运行结果的公共字段，不包含内部会话或完整日志。 */
+interface CanvasRunAgentResultBase {
+  nodeId: string
+  affectedDownstreamNodeIds: string[]
+  outputSummary: string
+}
+
+/** 单个 Canvas Agent 运行结果，按终态约束输出指针与稳定错误码。 */
+export type CanvasRunAgentResult = CanvasRunAgentResultBase & (
+  | { status: 'completed'; outputPointer: CanvasAgentOutputPointer; errorCode: null }
+  | { status: 'failed'; outputPointer: null; errorCode: string }
+  | { status: 'cancelled'; outputPointer: null; errorCode: string | null }
+)
+
+/** 工作流图片批次只公开状态与计数，不公开任务、批次或素材身份。 */
+export interface CanvasWorkflowImageSummary {
+  status: CanvasImageCandidateBatchStatus
+  totalCount: number
+  candidateCount: number
+  failedCount: number
+  runningCount: number
+}
+
+/** 工作流中单节点的有界公开结果。 */
+export interface CanvasWorkflowNodeResult {
+  nodeId: string
+  status: CanvasWorkflowNodeStatus
+  errorCode: string | null
+}
+
+/** 一次 Canvas 工作流的有界公开结果。 */
+export interface CanvasRunWorkflowResult {
+  status: CanvasWorkflowStatus
+  initialRevision: number
+  finalRevision: number
+  nodes: CanvasWorkflowNodeResult[]
+  imageSummary: CanvasWorkflowImageSummary | null
+  requiresReview: boolean
+  errorCode: string | null
+}
+
+/** 判断字符串是否为公开且有界的稳定错误码。 */
+function isCanvasWorkflowErrorCode(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string'
+    && value.length >= 1
+    && value.length <= CANVAS_WORKFLOW_ERROR_CODE_MAX_LENGTH
+    && /^[A-Z][A-Z0-9_]*$/.test(value))
+}
+
+/** 判断未知值是否为单次工作流终态。 */
+function isCanvasWorkflowStatus(value: unknown): value is CanvasWorkflowStatus {
+  return value === 'completed' || value === 'partial' || value === 'waiting-review'
+    || value === 'failed' || value === 'cancelled'
+}
+
+/** 判断未知值是否为工作流节点状态。 */
+function isCanvasWorkflowNodeStatus(value: unknown): value is CanvasWorkflowNodeStatus {
+  return value === 'satisfied' || value === 'started' || value === 'completed'
+    || value === 'waiting-review' || value === 'waiting-approval' || value === 'blocked'
+    || value === 'failed' || value === 'cancelled'
+}
+
+/**
+ * 严格解析公开工作流输入。
+ * @param value 普通 Agent 工具传入的未知值。
+ * @returns 无项目身份、起点唯一且预算有界的输入。
+ */
+export function parseCanvasRunWorkflowInput(value: unknown): CanvasRunWorkflowInput {
+  const keys = ['canvasId', 'expectedRevision', 'startNodeIds', 'goal', 'maxImageRuns'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.canvasId)
+    || !isCanvasNonNegativeInteger(value.expectedRevision)
+    || !Array.isArray(value.startNodeIds)
+    || value.startNodeIds.length < 1
+    || value.startNodeIds.length > CANVAS_WORKFLOW_START_NODE_LIMIT
+    || !value.startNodeIds.every(isCanvasLifecycleId)
+    || new Set(value.startNodeIds).size !== value.startNodeIds.length
+    || typeof value.goal !== 'string'
+    || value.goal.trim().length < 1
+    || value.goal.length > CANVAS_WORKFLOW_GOAL_MAX_LENGTH
+    || !isCanvasNonNegativeInteger(value.maxImageRuns)
+    || value.maxImageRuns > CANVAS_WORKFLOW_IMAGE_RUN_LIMIT) {
+    throw new Error('CANVAS_RUN_WORKFLOW_INPUT_INVALID')
+  }
+  return {
+    canvasId: value.canvasId,
+    expectedRevision: value.expectedRevision,
+    startNodeIds: [...value.startNodeIds],
+    goal: value.goal,
+    maxImageRuns: value.maxImageRuns,
+  }
+}
+
+/**
+ * 严格解析单个 Canvas Agent 的公开运行结果。
+ * @param value 主进程运行服务返回的未知值。
+ * @returns 不含内部会话、素材、路径、异常或完整日志的结果。
+ */
+export function parseCanvasRunAgentResult(value: unknown): CanvasRunAgentResult {
+  const keys = [
+    'nodeId', 'status', 'outputPointer', 'affectedDownstreamNodeIds', 'outputSummary', 'errorCode',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasLifecycleId(value.nodeId)
+    || (value.status !== 'completed' && value.status !== 'failed' && value.status !== 'cancelled')
+    || (value.outputPointer !== null && value.outputPointer === undefined)
+    || !Array.isArray(value.affectedDownstreamNodeIds)
+    || value.affectedDownstreamNodeIds.length > CANVAS_WORKFLOW_NODE_LIMIT
+    || !value.affectedDownstreamNodeIds.every(isCanvasLifecycleId)
+    || new Set(value.affectedDownstreamNodeIds).size !== value.affectedDownstreamNodeIds.length
+    || typeof value.outputSummary !== 'string'
+    || value.outputSummary.length > CANVAS_AGENT_OUTPUT_SUMMARY_MAX_LENGTH
+    || !isCanvasWorkflowErrorCode(value.errorCode)
+    || (value.status === 'completed' && (value.outputPointer === null || value.errorCode !== null))
+    || (value.status === 'failed' && (value.outputPointer !== null || value.errorCode === null))
+    || (value.status === 'cancelled' && value.outputPointer !== null)) {
+    throw new Error('CANVAS_RUN_AGENT_RESULT_INVALID')
+  }
+  /** 可选正式输出必须通过独立 exact-key parser 重建。 */
+  const outputPointer = value.outputPointer === null
+    ? null
+    : parseCanvasAgentOutputPointer(value.outputPointer)
+  /** 公共字段与判别字段分开构造，让 TypeScript 同步保留终态约束。 */
+  const base = {
+    nodeId: value.nodeId,
+    affectedDownstreamNodeIds: [...value.affectedDownstreamNodeIds],
+    outputSummary: value.outputSummary,
+  }
+  if (value.status === 'completed' && outputPointer && value.errorCode === null) {
+    return { ...base, status: 'completed', outputPointer, errorCode: null }
+  }
+  if (value.status === 'failed' && value.errorCode !== null) {
+    return { ...base, status: 'failed', outputPointer: null, errorCode: value.errorCode }
+  }
+  return { ...base, status: 'cancelled', outputPointer: null, errorCode: value.errorCode }
+}
+
+/** 严格解析工作流图片计数摘要。 */
+function parseCanvasWorkflowImageSummary(value: unknown): CanvasWorkflowImageSummary | null {
+  if (value === null) return null
+  const keys = ['status', 'totalCount', 'candidateCount', 'failedCount', 'runningCount'] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !CANVAS_IMAGE_CANDIDATE_BATCH_STATUSES.includes(value.status as CanvasImageCandidateBatchStatus)
+    || !isCanvasNonNegativeInteger(value.totalCount)
+    || value.totalCount > CANVAS_WORKFLOW_IMAGE_RUN_LIMIT
+    || !isCanvasNonNegativeInteger(value.candidateCount)
+    || !isCanvasNonNegativeInteger(value.failedCount)
+    || !isCanvasNonNegativeInteger(value.runningCount)
+    || value.candidateCount > value.totalCount
+    || value.failedCount > value.totalCount
+    || value.runningCount > value.totalCount) {
+    throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
+  }
+  return {
+    status: value.status as CanvasImageCandidateBatchStatus,
+    totalCount: value.totalCount,
+    candidateCount: value.candidateCount,
+    failedCount: value.failedCount,
+    runningCount: value.runningCount,
+  }
+}
+
+/**
+ * 严格解析 Canvas 工作流公开结果。
+ * @param value 主进程调度器返回的未知值。
+ * @returns 节点与图片摘要均有界的深重建结果。
+ */
+export function parseCanvasRunWorkflowResult(value: unknown): CanvasRunWorkflowResult {
+  const keys = [
+    'status', 'initialRevision', 'finalRevision', 'nodes', 'imageSummary', 'requiresReview', 'errorCode',
+  ] as const
+  if (!hasExactCanvasKeys(value, keys)
+    || !isCanvasWorkflowStatus(value.status)
+    || !isCanvasNonNegativeInteger(value.initialRevision)
+    || !isCanvasNonNegativeInteger(value.finalRevision)
+    || !Array.isArray(value.nodes)
+    || value.nodes.length > CANVAS_WORKFLOW_NODE_LIMIT
+    || typeof value.requiresReview !== 'boolean'
+    || !isCanvasWorkflowErrorCode(value.errorCode)) {
+    throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
+  }
+  /** 节点数组逐项 exact-key 重建，禁止敏感或未知字段随结果透传。 */
+  const nodes = value.nodes.map((node): CanvasWorkflowNodeResult => {
+    const nodeKeys = ['nodeId', 'status', 'errorCode'] as const
+    if (!hasExactCanvasKeys(node, nodeKeys)
+      || !isCanvasLifecycleId(node.nodeId)
+      || !isCanvasWorkflowNodeStatus(node.status)
+      || !isCanvasWorkflowErrorCode(node.errorCode)) {
+      throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
+    }
+    return { nodeId: node.nodeId, status: node.status, errorCode: node.errorCode }
+  })
+  if (new Set(nodes.map((node) => node.nodeId)).size !== nodes.length) {
+    throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
+  }
+  return {
+    status: value.status,
+    initialRevision: value.initialRevision,
+    finalRevision: value.finalRevision,
+    nodes,
+    imageSummary: parseCanvasWorkflowImageSummary(value.imageSummary),
+    requiresReview: value.requiresReview,
+    errorCode: value.errorCode,
+  }
 }
 
 /** Canvas 节点可由用户执行的恢复动作。 */
@@ -2770,9 +3053,19 @@ function parseCanvasWorkspaceNode(value: unknown): CanvasNode {
     ...(upstreamChange ? { upstreamChange } : {}),
   }
   if (record.kind === 'agent'
-    && hasExactCanvasKeys(record, [...baseKeys, 'agentSessionId'])
+    && (hasExactCanvasKeys(record, [...baseKeys, 'agentSessionId'])
+      || hasExactCanvasKeys(record, [...baseKeys, 'agentSessionId', 'outputPointer']))
     && isCanvasLifecycleId(record.agentSessionId)) {
-    return { ...base, kind: 'agent', agentSessionId: record.agentSessionId }
+    /** 正式输出引用必须独立重建，禁止保留 IPC 输入对象。 */
+    const outputPointer = Object.hasOwn(record, 'outputPointer')
+      ? parseCanvasAgentOutputPointer(record.outputPointer)
+      : undefined
+    return {
+      ...base,
+      kind: 'agent',
+      agentSessionId: record.agentSessionId,
+      ...(outputPointer ? { outputPointer } : {}),
+    }
   }
   if (record.kind === 'image') {
     /** 图片节点仅允许可选 adoptedAssetId，不接受其它内容身份字段。 */

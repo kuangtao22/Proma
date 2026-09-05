@@ -19,7 +19,7 @@ import {
   CANVAS_DOCUMENT_VERSION,
   createEmptyCanvasDocument,
 } from '@proma/shared'
-import type { CanvasDocument, CanvasMutation, CanvasNode } from '@proma/shared'
+import type { CanvasAgentNode, CanvasDocument, CanvasMutation, CanvasNode } from '@proma/shared'
 import {
   createCanvasDocumentStore,
   isOpenedRootSameDirectoryIdentity,
@@ -175,6 +175,48 @@ describe('CanvasDocumentStore', () => {
     const loaded = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
 
     expect(loaded.document.edges[0]).toMatchObject({ sourcePort: 'output', targetPort: 'input' })
+  })
+
+  test('Given schema v4 Agent 节点有无正式输出指针 When 加载 Then 严格重建且不保留磁盘引用', () => {
+    const fixture = createFixture()
+    /** 指针对象在写盘后继续保留，用于验证加载结果是共享 parser 重建值。 */
+    const outputPointer = {
+      messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+      contentSha256: 'a'.repeat(64),
+      completedAt: 100,
+    }
+    const document = createConnectedDocument()
+    /** 基线首节点在夹具中固定为 Agent，显式收窄避免联合类型扩散。 */
+    const agentNode = document.nodes[0] as CanvasAgentNode
+    document.nodes = [
+      agentNode,
+      { ...agentNode, id: 'node-agent-output', outputPointer },
+    ]
+    document.edges = []
+    writeDocument(fixture.documentPath, document)
+
+    const loaded = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
+
+    expect(loaded.document.schemaVersion).toBe(4)
+    expect(loaded.document.nodes[0]).not.toHaveProperty('outputPointer')
+    expect(loaded.document.nodes[1]).toMatchObject({ outputPointer })
+    expect((loaded.document.nodes[1] as { outputPointer: object }).outputPointer).not.toBe(outputPointer)
+  })
+
+  test.each([
+    ['非法 UUID', { messageUuid: 'bad', contentSha256: 'a'.repeat(64), completedAt: 100 }],
+    ['大写哈希', { messageUuid: '123e4567-e89b-42d3-a456-426614174000', contentSha256: 'A'.repeat(64), completedAt: 100 }],
+    ['负数时间', { messageUuid: '123e4567-e89b-42d3-a456-426614174000', contentSha256: 'a'.repeat(64), completedAt: -1 }],
+    ['未知字段', { messageUuid: '123e4567-e89b-42d3-a456-426614174000', contentSha256: 'a'.repeat(64), completedAt: 100, sessionId: 'secret' }],
+  ])('Given Agent 输出指针包含%s When 加载 Then 文档严格拒绝', (_label, outputPointer) => {
+    const fixture = createFixture()
+    const document = createConnectedDocument()
+    document.nodes = [{ ...document.nodes[0]!, outputPointer } as CanvasNode]
+    document.edges = []
+    writeDocument(fixture.documentPath, document)
+
+    expect(() => fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_DOCUMENT_CORRUPT')
   })
 
   /**

@@ -16,6 +16,7 @@ import {
   createEmptyCanvasDocument,
   isCanvasArtifactInputSlot,
   isCanvasArtifactOutputCapability,
+  parseCanvasAgentOutputPointer,
   parseCanvasEdgeRelation,
   resolveCanvasEdgeBinding,
 } from '@proma/shared'
@@ -388,9 +389,23 @@ function parseCanvasNode(
     ...(upstreamChange ? { upstreamChange } : {}),
   }
   if (value.kind === 'agent'
-    && hasExactKeys(value, [...baseKeys, 'agentSessionId'])
+    && (hasExactKeys(value, [...baseKeys, 'agentSessionId'])
+      || hasExactKeys(value, [...baseKeys, 'agentSessionId', 'outputPointer']))
     && isSafeDesignStableId(value.agentSessionId)) {
-    return { ...base, kind: 'agent', agentSessionId: value.agentSessionId }
+    try {
+      /** 通过共享 parser 重建正式输出指针，禁止返回磁盘对象引用。 */
+      const outputPointer = Object.hasOwn(value, 'outputPointer')
+        ? parseCanvasAgentOutputPointer(value.outputPointer)
+        : undefined
+      return {
+        ...base,
+        kind: 'agent',
+        agentSessionId: value.agentSessionId,
+        ...(outputPointer ? { outputPointer } : {}),
+      }
+    } catch (error) {
+      throw new Error(message, { cause: error })
+    }
   }
   if (value.kind === 'image'
     && (hasExactKeys(value, [...baseKeys, 'imageModuleId'])
