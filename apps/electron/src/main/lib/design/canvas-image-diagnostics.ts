@@ -2,6 +2,7 @@
 export type CanvasImageDiagnosticCode =
   | 'CANVAS_IMAGE_BATCH_LISTENER_FAILED'
   | 'CANVAS_IMAGE_BATCH_CANCEL_CLEANUP_FAILED'
+  | 'CANVAS_IMAGE_RUN_CANCEL_CLEANUP_FAILED'
 
 /**
  * 尽力记录不含动态数据的 Canvas 图片诊断；日志实现故障不得影响业务结果。

@@ -92,6 +92,7 @@ interface HarnessOptions {
     jobs: Map<string, DesignJobRecord>,
   ) => Promise<{ job: DesignJobRecord; created: boolean }>
   run?: (jobId: string, jobs: Map<string, DesignJobRecord>) => Promise<void>
+  start?: (jobId: string, jobs: Map<string, DesignJobRecord>) => Promise<void>
   cancel?: (projectId: string, jobId: string, jobs: Map<string, DesignJobRecord>) => Promise<void>
 }
 
@@ -148,6 +149,10 @@ function createHarness(options: HarnessOptions = {}) {
       run: async (jobId) => {
         calls.push(`run:${jobId}:${leaseHeld ? 'locked' : 'unlocked'}`)
         await options.run?.(jobId, jobs)
+      },
+      start: async (jobId) => {
+        calls.push(`start:${jobId}:${leaseHeld ? 'locked' : 'unlocked'}`)
+        await options.start?.(jobId, jobs)
       },
       cancel: async (projectId, jobId) => {
         calls.push(`cancel:${jobId}`)
@@ -260,7 +265,7 @@ describe('Canvas 图片统一运行服务', () => {
     expect(first.tasks[0]?.taskId).toMatch(/^agent-canvas-[a-f0-9]{64}$/)
     expect(second.tasks[0]?.taskId).toBe(first.tasks[0]?.taskId)
     expect(second.batch?.batchId).toBe(first.batch?.batchId)
-    expect(harness.calls.filter((call) => call.startsWith('run:'))).toHaveLength(1)
+    expect(harness.calls.filter((call) => call.startsWith('start:'))).toHaveLength(1)
   })
 
   test('Given 第二个 journal 创建失败 When 回滚 Then 只删除本轮新建 journal', async () => {
@@ -298,9 +303,75 @@ describe('Canvas 图片统一运行服务', () => {
     await harness.service.run(context, target, [createImageNode('image-a')], 'tool-order')
 
     expect(harness.calls.indexOf('batch:create')).toBeLessThan(
-      harness.calls.findIndex((call) => call.startsWith('run:')),
+      harness.calls.findIndex((call) => call.startsWith('start:')),
     )
-    expect(harness.calls.find((call) => call.startsWith('run:'))).toContain('unlocked')
+    expect(harness.calls.find((call) => call.startsWith('start:'))).toContain('unlocked')
+  })
+
+  test('Given Job 完成 Promise 长时间运行 When 批次启动已确认 Then 立即返回 owned task IDs', async () => {
+    const completion = Promise.withResolvers<void>()
+    const harness = createHarness({ run: async () => completion.promise })
+
+    const result = await harness.service.run(context, target, [createImageNode('image-a')], 'tool-start-ack')
+
+    expect(result.tasks).toEqual([{
+      nodeId: 'image-a',
+      status: 'started',
+      taskId: expect.stringMatching(/^agent-canvas-[a-f0-9]{64}$/),
+    }])
+    expect(harness.calls.filter((call) => call.startsWith('start:'))).toHaveLength(1)
+    expect(harness.calls.filter((call) => call.startsWith('run:'))).toHaveLength(0)
+    completion.resolve()
+  })
+
+  test('Given start ack 被期限阻塞 When 已拥有批次任务 Then 精确取消并保留期限错误', async () => {
+    const startAck = Promise.withResolvers<void>()
+    const harness = createHarness({ start: async () => startAck.promise })
+
+    try {
+      await expect(harness.service.run(
+        context,
+        target,
+        [createImageNode('image-a')],
+        'tool-start-deadline',
+        { signal: new AbortController().signal, deadlineAt: Date.now() + 10 },
+      )).rejects.toThrow('CANVAS_IMAGE_RUN_DEADLINE')
+      const taskId = [...harness.jobs.keys()][0]
+      expect(taskId).toBeDefined()
+      expect(harness.calls.filter((call) => call.startsWith('cancel:'))).toEqual([`cancel:${taskId}`])
+    } finally {
+      startAck.resolve()
+    }
+  })
+
+  test('Given start ack 等待被中止且取消与日志都失败 When 收口 Then 保留稳定中止错误', async () => {
+    const startAck = Promise.withResolvers<void>()
+    const abortController = new AbortController()
+    const harness = createHarness({
+      start: async () => startAck.promise,
+      cancel: async () => { throw new Error('credential=secret') },
+    })
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('LOGGER_FAILED')
+    })
+    const running = harness.service.run(
+      context,
+      target,
+      [createImageNode('image-a')],
+      'tool-start-abort',
+      { signal: abortController.signal, deadlineAt: Date.now() + 5_000 },
+    )
+    await Promise.resolve()
+    abortController.abort()
+
+    try {
+      await expect(running).rejects.toThrow('CANVAS_IMAGE_RUN_ABORTED')
+      expect(errorSpy).toHaveBeenCalledWith('[CanvasImageDiagnostics] CANVAS_IMAGE_RUN_CANCEL_CLEANUP_FAILED')
+      expect(JSON.stringify(errorSpy.mock.calls)).not.toContain('credential=secret')
+    } finally {
+      startAck.resolve()
+      errorSpy.mockRestore()
+    }
   })
 
   test('Given 非图片节点 When 低层运行 Then 保持 idle 且不创建图片任务', async () => {
@@ -347,10 +418,49 @@ describe('Canvas 图片统一运行服务', () => {
     expect(summary).toEqual({
       batchId, status: 'ready', totalCount: 1, candidateCount: 1,
       failedCount: 0, runningCount: 0, requiresCanvasReview: true,
+      entries: [{ nodeId: node.id, taskId, status: 'candidate' }],
     })
     expect(JSON.stringify(summary)).not.toContain('asset')
     expect(harness.listeners.size).toBe(0)
     expect(harness.batchListeners.size).toBe(0)
+  })
+
+  test('Given 混合成功失败批次 When 等待终态 Then 返回稳定排序且脱敏的逐节点状态', async () => {
+    const nodes = [createImageNode('image-b'), createImageNode('image-a')]
+    const harness = createHarness()
+    const started = await harness.service.run(context, target, nodes, 'tool-mixed-terminal')
+    const batchId = started.batch?.batchId
+    const taskIds = started.tasks.flatMap((task) => task.taskId ? [task.taskId] : [])
+    if (!batchId || taskIds.length !== 2) throw new Error('测试批次未创建')
+    const batch = harness.batches.get(batchId)
+    if (!batch) throw new Error('测试候选批次未创建')
+    const waiting = harness.service.awaitBatch({
+      ...target,
+      batchId,
+      taskIds,
+      signal: new AbortController().signal,
+      deadlineAt: Date.now() + 5_000,
+    })
+    await Promise.resolve()
+    harness.batches.set(batchId, {
+      ...batch,
+      status: 'partial',
+      entries: batch.entries.map((entry, index) => index === 0
+        ? { ...entry, status: 'candidate', candidateAssetId: 'asset-secret' }
+        : { ...entry, status: 'failed', error: 'credential=secret' }),
+    })
+    harness.emitBatchChange(batchId, taskIds[0]!)
+
+    const summary = await waiting
+    const expectedEntries = batch.entries.map((entry, index) => ({
+      nodeId: entry.nodeId,
+      taskId: entry.jobId,
+      status: index === 0 ? 'candidate' as const : 'failed' as const,
+    })).sort((left, right) => left.taskId.localeCompare(right.taskId) || left.nodeId.localeCompare(right.nodeId))
+    expect(summary.entries).toEqual(expectedEntries)
+    expect(summary).toMatchObject({ candidateCount: 1, failedCount: 1, runningCount: 0 })
+    expect(JSON.stringify(summary)).not.toContain('asset-secret')
+    expect(JSON.stringify(summary)).not.toContain('credential=secret')
   })
 
   test('Given Job 终态事件早于候选登记 When 跨多个 macrotask 后批次发出 ack Then 等待完成且不超时', async () => {

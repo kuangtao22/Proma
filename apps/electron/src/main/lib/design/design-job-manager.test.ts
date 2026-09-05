@@ -205,6 +205,58 @@ describe('Design Job Manager', () => {
     expect(document.nodes).toEqual(before)
   })
 
+  test('Given Canvas 图片执行仍在运行 When 并发 start Then running 后立即确认且只启动一次', async () => {
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    let runCount = 0
+    harness.runHeadless = async () => {
+      runCount += 1
+      entered.resolve()
+      await release.promise
+    }
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+
+    await Promise.all([harness.manager.start(job.id), harness.manager.start(job.id)])
+
+    expect(harness.manager.get(job.id)?.status).toBe('running')
+    expect(runCount).toBe(1)
+    await entered.promise
+    release.resolve()
+    await harness.manager.run(job.id)
+  })
+
+  test('Given 会话创建在 running 前失败 When start Then 拒绝确认并收口失败任务', async () => {
+    harness.createSessionError = new Error('START_FAILED')
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+
+    await expect(harness.manager.start(job.id)).rejects.toThrow('START_FAILED')
+
+    expect(harness.manager.get(job.id)?.status).toBe('failed')
+  })
+
+  test('Given start 已确认 When 后台 completion 拒绝 Then 既有运行链收口且 run 可等待同一执行', async () => {
+    const candidateHarness = createHarness({ withCandidateBatches: true })
+    const completion = Promise.withResolvers<void>()
+    candidateHarness.runHeadless = async () => completion.promise
+    const job = await candidateHarness.manager.createCanvasImage({
+      ...createCanvasImageInput('a'),
+      candidateBatchId: 'batch-completion-failed',
+    })
+
+    await candidateHarness.manager.start(job.id)
+    completion.reject(new Error('COMPLETION_FAILED'))
+    await expect(candidateHarness.manager.run(job.id)).resolves.toBeUndefined()
+
+    expect(candidateHarness.manager.get(job.id)).toMatchObject({ status: 'failed', error: 'COMPLETION_FAILED' })
+    expect(candidateHarness.candidateTerminalEvents).toEqual([{
+      jobId: job.id,
+      candidateBatchId: 'batch-completion-failed',
+      status: 'failed',
+      outputAssetId: null,
+      error: 'COMPLETION_FAILED',
+    }])
+  })
+
   test('Given Canvas 图片任务失败或取消 When 进入终态 Then 候选批次不再保持运行中', async () => {
     const candidateHarness = createHarness({ withCandidateBatches: true })
     const failed = await candidateHarness.manager.createCanvasImage({

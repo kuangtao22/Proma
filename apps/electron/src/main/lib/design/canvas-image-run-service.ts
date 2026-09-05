@@ -5,6 +5,7 @@ import type {
   CanvasImageTarget,
   CanvasNode,
   CanvasRunNodesBatchSummary,
+  CanvasRunNodesBatchTerminalSummary,
   CanvasRunNodesResult,
   CanvasTarget,
   CanvasToolNodeRunResult,
@@ -37,6 +38,12 @@ export interface CanvasImageBatchCancelInput extends CanvasTarget {
   taskIds: readonly string[]
 }
 
+/** 图片任务启动确认阶段的可中止边界。 */
+export interface CanvasImageRunOptions {
+  signal: AbortSignal
+  deadlineAt: number
+}
+
 /** Canvas 图片运行服务的最小公开合同。 */
 export interface CanvasImageRunService {
   run(
@@ -44,8 +51,9 @@ export interface CanvasImageRunService {
     target: CanvasTarget,
     nodes: CanvasNode[],
     operationId: string,
+    options?: CanvasImageRunOptions,
   ): Promise<CanvasRunNodesResult>
-  awaitBatch(input: CanvasImageBatchWaitInput): Promise<CanvasRunNodesBatchSummary>
+  awaitBatch(input: CanvasImageBatchWaitInput): Promise<CanvasRunNodesBatchTerminalSummary>
   cancelTasks(input: CanvasImageBatchCancelInput): Promise<void>
 }
 
@@ -64,7 +72,7 @@ export interface CanvasImageRunServiceDependencies {
     DesignJobManager,
     'preflightCanvasImage' | 'createCanvasImageOnce' | 'rollbackCanvasImageOnce'
     | 'run' | 'cancel' | 'getProjectJob' | 'onChanged'
-  >
+  > & Partial<Pick<DesignJobManager, 'start'>>
   candidateBatches: Pick<CanvasImageCandidateBatchService, 'createBatchLocked' | 'load' | 'onChanged'>
   getProjectReadOnlyReason: (projectId: string) => string | undefined
 }
@@ -133,6 +141,62 @@ function summarizeBatch(batch: CanvasImageCandidateBatch): CanvasRunNodesBatchSu
     failedCount: batch.entries.filter((entry) => entry.status === 'failed' || entry.status === 'invalid').length,
     runningCount: batch.entries.filter((entry) => entry.status === 'queued' || entry.status === 'running').length,
     requiresCanvasReview: true,
+  }
+}
+
+/** 从权威候选条目生成稳定排序且不含素材或错误正文的终态摘要。 */
+function summarizeTerminalBatch(batch: CanvasImageCandidateBatch): CanvasRunNodesBatchTerminalSummary {
+  /** 已采用等价于已有候选，明确保留等价于当前版本无新候选。 */
+  const entries = batch.entries.map((entry) => ({
+    nodeId: entry.nodeId,
+    taskId: entry.jobId,
+    status: entry.status === 'candidate' || entry.status === 'adopted'
+      ? 'candidate' as const
+      : entry.status === 'failed'
+        ? 'failed' as const
+        : 'invalid' as const,
+  })).sort((left, right) => {
+    if (left.taskId !== right.taskId) return left.taskId < right.taskId ? -1 : 1
+    if (left.nodeId === right.nodeId) return 0
+    return left.nodeId < right.nodeId ? -1 : 1
+  })
+  return { ...summarizeBatch(batch), entries }
+}
+
+/** 校验可选启动边界，避免无效 signal 或 deadline 进入任务副作用。 */
+function assertRunOptions(options: CanvasImageRunOptions | undefined): void {
+  if (options === undefined) return
+  if (!(options.signal instanceof AbortSignal)
+    || !Number.isSafeInteger(options.deadlineAt)
+    || options.deadlineAt < 0) {
+    throw new Error('CANVAS_IMAGE_RUN_INPUT_INVALID')
+  }
+}
+
+/** 等待全部启动确认，同时只用单次 timer 响应中止或绝对期限。 */
+async function awaitStartResults<T>(promise: Promise<T>, options: CanvasImageRunOptions | undefined): Promise<T> {
+  if (!options) return promise
+  if (options.signal.aborted) throw new Error('CANVAS_IMAGE_RUN_ABORTED')
+  if (Date.now() >= options.deadlineAt) throw new Error('CANVAS_IMAGE_RUN_DEADLINE')
+  /** 当前 AbortSignal 临时监听器只覆盖启动确认等待。 */
+  let abortListener: (() => void) | undefined
+  /** 绝对期限 timer 在任一分支完成后立即清理。 */
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        abortListener = () => reject(new Error('CANVAS_IMAGE_RUN_ABORTED'))
+        options.signal.addEventListener('abort', abortListener, { once: true })
+        deadlineTimer = setTimeout(
+          () => reject(new Error('CANVAS_IMAGE_RUN_DEADLINE')),
+          Math.max(0, options.deadlineAt - Date.now()),
+        )
+      }),
+    ])
+  } finally {
+    if (abortListener) options.signal.removeEventListener('abort', abortListener)
+    if (deadlineTimer) clearTimeout(deadlineTimer)
   }
 }
 
@@ -237,7 +301,9 @@ export function createCanvasImageRunService(
     target: CanvasTarget,
     nodes: CanvasNode[],
     operationId: string,
+    options?: CanvasImageRunOptions,
   ): Promise<CanvasRunNodesResult> => {
+    assertRunOptions(options)
     /** 非图片节点先记录既有 idle 结果，不进入付费执行器。 */
     const taskByNodeId = new Map<string, CanvasToolNodeRunResult>()
     for (const node of nodes) {
@@ -414,8 +480,31 @@ export function createCanvasImageRunService(
 
     /** 只有本轮新建 journal 才需要锁外启动，既有 journal 不产生重复费用。 */
     const createdJobs = creationOutcome.jobs.filter((entry) => entry.created)
-    /** 每个启动结果独立返回，单任务失败不吞掉其它节点事实。 */
-    const runResults = await Promise.allSettled(createdJobs.map((entry) => dependencies.imageJobs.run(entry.job.id)))
+    /** Manager 的 start 只等待 running ack，完整生成由 Manager 自己持有并收口。 */
+    const startResultsPromise = Promise.allSettled(
+      createdJobs.map((entry) => dependencies.imageJobs.start
+        ? dependencies.imageJobs.start(entry.job.id)
+        : dependencies.imageJobs.run(entry.job.id)),
+    )
+    /** start 阶段由本服务独占中止取消；返回后取消所有权交给 awaitBatch。 */
+    let runResults: PromiseSettledResult<void>[]
+    try {
+      runResults = await awaitStartResults(startResultsPromise, options)
+    } catch (error) {
+      if (error instanceof Error
+        && (error.message === 'CANVAS_IMAGE_RUN_ABORTED' || error.message === 'CANVAS_IMAGE_RUN_DEADLINE')) {
+        try {
+          await cancelTasks({
+            ...target,
+            batchId: candidateBatchId,
+            taskIds: creationOutcome.jobs.map((entry) => entry.job.id),
+          })
+        } catch {
+          reportCanvasImageDiagnostic('CANVAS_IMAGE_RUN_CANCEL_CLEANUP_FAILED')
+        }
+      }
+      throw error
+    }
     for (let index = 0; index < createdJobs.length; index += 1) {
       /** 当前本轮新建任务。 */
       const entry = createdJobs[index]!
@@ -434,7 +523,7 @@ export function createCanvasImageRunService(
             taskId: entry.job.id,
           })
     }
-    /** 启动后只读取批次 JSON，公开结果不包含 Asset 或本地路径。 */
+    /** 启动确认后只读取批次 JSON，公开结果不包含 Asset 或本地路径。 */
     const candidateBatch = await dependencies.candidateBatches.load({ ...target, batchId: candidateBatchId })
     return {
       tasks: nodes.map((node) => taskByNodeId.get(node.id)!),
@@ -443,7 +532,7 @@ export function createCanvasImageRunService(
   }
 
   /** 通过相关 Job change 事件等待候选批次终态，不轮询磁盘。 */
-  const awaitBatch = async (input: CanvasImageBatchWaitInput): Promise<CanvasRunNodesBatchSummary> => {
+  const awaitBatch = async (input: CanvasImageBatchWaitInput): Promise<CanvasRunNodesBatchTerminalSummary> => {
     assertWaitInput(input)
     /** 相关事件单调代次用于封闭读取与挂起之间的 lost wakeup。 */
     let changeVersion = 0
@@ -484,7 +573,7 @@ export function createCanvasImageRunService(
         const batch = await loadOwnedBatch(input)
         /** 只有无活跃条目才返回公开终态摘要。 */
         const summary = summarizeBatch(batch)
-        if (summary.runningCount === 0) return summary
+        if (summary.runningCount === 0) return summarizeTerminalBatch(batch)
         if (input.signal.aborted) throw new Error('CANVAS_IMAGE_BATCH_WAIT_ABORTED')
         if (Date.now() >= input.deadlineAt) throw new Error('CANVAS_IMAGE_BATCH_WAIT_DEADLINE')
         if (changeVersion !== observedVersion) continue

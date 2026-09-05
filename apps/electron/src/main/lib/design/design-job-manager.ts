@@ -308,6 +308,11 @@ export class DesignJobManager {
   private readonly canvasImageReservations = new Set<string>()
   /** Agent Canvas 稳定任务 ID 的在途创建；同身份合并，不同身份拒绝。 */
   private readonly canvasImageInFlightCreations = new Map<string, CanvasImageInFlightCreation>()
+  /** 运行中任务的启动确认与完整完成 Promise，避免并发入口重复启动同一 Job。 */
+  private readonly activeExecutions = new Map<string, {
+    accepted: Promise<void>
+    completion: Promise<void>
+  }>()
   private readonly createId: () => string
   private readonly createCreativeTaskId: () => string
   private readonly now: () => number
@@ -621,15 +626,76 @@ export class DesignJobManager {
     return () => this.listeners.delete(listener)
   }
 
+  /** 执行 queued 任务并等待完整终态；并发调用复用同一运行 Promise。 */
+  run(jobId: string): Promise<void> {
+    return this.getOrCreateExecution(jobId).completion
+  }
+
+  /**
+   * 发起 queued 任务，并在任务进入 running 后立即确认。
+   * @param jobId 需要启动的稳定任务 ID。
+   * @returns 启动前置成功并进入 running 后完成；前置异常时拒绝。
+   */
+  start(jobId: string): Promise<void> {
+    return this.getOrCreateExecution(jobId).accepted
+  }
+
+  /** 创建或复用单个任务的启动确认与完整运行 Promise。 */
+  private getOrCreateExecution(jobId: string): { accepted: Promise<void>; completion: Promise<void> } {
+    const existing = this.activeExecutions.get(jobId)
+    if (existing) return existing
+    /** 启动确认与完整完成分别收口，调用方无需持有后台 completion。 */
+    const accepted = Promise.withResolvers<void>()
+    const completion = Promise.withResolvers<void>()
+    const execution = { accepted: accepted.promise, completion: completion.promise }
+    this.activeExecutions.set(jobId, execution)
+    /** 兼容 run-only 调用没有 accepted 消费者，内部观察拒绝以避免未处理 Promise。 */
+    void accepted.promise.catch(() => undefined)
+    /** 先登记 owner 再执行，阻断同步状态监听器重入造成重复启动。 */
+    const running = this.execute(jobId, {
+      accept: accepted.resolve,
+      reject: accepted.reject,
+    })
+    void running.then(
+      () => {
+        /** 非 queued 幂等入口可能无需进入 running，也视为已接受。 */
+        accepted.resolve()
+        completion.resolve()
+      },
+      (error: unknown) => {
+        accepted.reject(error)
+        completion.reject(error)
+      },
+    )
+    /** 双分支处理 completion rejection，保证 start 调用方不持有后台 Promise 时也不会未处理拒绝。 */
+    void completion.promise.then(
+      () => {
+        if (this.activeExecutions.get(jobId) === execution) this.activeExecutions.delete(jobId)
+      },
+      () => {
+        if (this.activeExecutions.get(jobId) === execution) this.activeExecutions.delete(jobId)
+      },
+    )
+    return execution
+  }
+
   /** 执行 queued 任务，并只接纳本轮 Nano Banana 的受归属图片。 */
-  async run(jobId: string): Promise<void> {
+  private async execute(
+    jobId: string,
+    start: { accept: () => void; reject: (error: unknown) => void },
+  ): Promise<void> {
     const queued = this.requireJob(jobId)
-    if (queued.status !== 'queued') return
+    if (queued.status !== 'queued') {
+      start.accept()
+      return
+    }
     try {
       /** journal 固化的公开模型快照，也是本轮复核的唯一输入。 */
       const imageModelSnapshot = queued.imageModelSnapshot
       if (!imageModelSnapshot) {
-        this.updateStatus(queued, 'failed', { error: '旧任务未记录生图模型，请重新提交新任务' })
+        const error = new Error('旧任务未记录生图模型，请重新提交新任务')
+        this.updateStatus(queued, 'failed', { error: error.message })
+        start.reject(error)
         return
       }
       /** 排队期间配置可能被删除、停用或修改，付费会话创建前必须再次复核。 */
@@ -639,6 +705,7 @@ export class DesignJobManager {
       const model = this.resolveModel(queued)
       if (!model) {
         this.updateStatus(queued, 'failed', { error: DESIGN_JOB_MODEL_ERROR })
+        start.reject(new Error(DESIGN_JOB_MODEL_ERROR))
         return
       }
       /** 上下文预检和项目指令解析必须早于内部会话创建，避免失败时留下空会话。 */
@@ -658,6 +725,8 @@ export class DesignJobManager {
         sourceDesignJobId: queued.id,
       })
       const running = this.updateStatus(queued, 'running', { sessionId: session.id, error: undefined })
+      /** running journal 已持久化后才允许调度器获得 accepted ack。 */
+      start.accept()
       let runError: string | undefined
       let messages: AgentMessage[] = []
       try {
@@ -723,6 +792,8 @@ export class DesignJobManager {
       }
       await this.commitOutput(latest, session.id, outputPath)
     } catch (error) {
+      /** accepted 后的拒绝不会改变已完成启动确认，但仍由 completion 链收口。 */
+      start.reject(error)
       this.failUnlessStopped(jobId, error)
     } finally {
       await this.finalizeExecution(jobId)

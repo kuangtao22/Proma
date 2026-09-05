@@ -824,6 +824,18 @@ export interface CanvasRunNodesBatchSummary {
   requiresCanvasReview: true
 }
 
+/** 图片批次单个节点的脱敏终态，不暴露素材、路径或底层错误。 */
+export interface CanvasRunNodesBatchEntrySummary {
+  nodeId: string
+  taskId: string
+  status: 'candidate' | 'failed' | 'invalid'
+}
+
+/** 图片批次等待完成后的逐节点终态摘要。 */
+export interface CanvasRunNodesBatchTerminalSummary extends CanvasRunNodesBatchSummary {
+  entries: CanvasRunNodesBatchEntrySummary[]
+}
+
 /** 主进程运行边界返回任务审计和可选图片候选批次。 */
 export interface CanvasRunNodesResult {
   tasks: CanvasToolNodeRunResult[]
