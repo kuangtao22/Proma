@@ -1,0 +1,285 @@
+import { describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
+import { createCanvasBoundEdge, createEmptyCanvasDocument } from '@proma/shared'
+import type { AgentSessionMeta, CanvasDocument, CanvasNode, SDKMessage } from '@proma/shared'
+import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
+import {
+  createCanvasAgentOutputService,
+  type CanvasAgentCompletionInput,
+  type CanvasAgentOutputServiceDependencies,
+} from './canvas-agent-output-service'
+
+const target = { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'agent-1' }
+const oldUuid = '123e4567-e89b-42d3-a456-426614174000'
+const firstUuid = '123e4567-e89b-42d3-a456-426614174001'
+const lastUuid = '123e4567-e89b-42d3-a456-426614174002'
+const oldAnchorUuid = '123e4567-e89b-42d3-a456-426614174098'
+const anchorUuid = '123e4567-e89b-42d3-a456-426614174099'
+
+/** 创建完整 Canvas 内部会话归属。 */
+function createSession(overrides: Partial<AgentSessionMeta> = {}): AgentSessionMeta {
+  return {
+    id: 'session-1', title: '研究 Agent', workspaceId: target.projectId,
+    sourceCanvasProjectId: target.projectId, sourceCanvasId: target.canvasId,
+    sourceCanvasNodeId: target.nodeId, createdAt: 1, updatedAt: 1,
+    ...overrides,
+  }
+}
+
+/** 创建覆盖正文、partial、replay 与错误状态的 assistant 消息。 */
+function assistant(
+  uuid: string | undefined,
+  blocks: Array<Record<string, unknown>>,
+  overrides: Record<string, unknown> = {},
+): SDKMessage {
+  return {
+    type: 'assistant', uuid, parent_tool_use_id: null,
+    message: { content: blocks, stop_reason: 'end_turn' },
+    ...overrides,
+  } as unknown as SDKMessage
+}
+
+/** 创建落盘在本轮 assistant 之前的精确用户消息锚点。 */
+function user(uuid: string): SDKMessage {
+  return {
+    type: 'user', uuid, parent_tool_use_id: null,
+    message: { content: [{ type: 'text', text: '执行本轮任务' }] },
+  } as unknown as SDKMessage
+}
+
+/** 构造由唯一用户消息锚定的当前 run 消息片段。 */
+function currentRun(...messages: SDKMessage[]): SDKMessage[] {
+  return [user(anchorUuid), ...messages]
+}
+
+/** 创建可观察原子图提交与发布顺序的输出服务 fixture。 */
+function createFixture(options: { messages?: SDKMessage[]; publishError?: Error } = {}) {
+  const oldPointer = {
+    messageUuid: oldUuid,
+    contentSha256: createHash('sha256').update('旧正文', 'utf8').digest('hex'),
+    completedAt: 10,
+  }
+  let document: CanvasDocument = {
+    ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1),
+    revision: 4,
+    nodes: [
+      {
+        id: target.nodeId, kind: 'agent', title: '研究 Agent', position: { x: 0, y: 0 },
+        agentSessionId: 'session-1', outputPointer: oldPointer,
+        upstreamChange: { sourceNodeIds: ['input-1'], changedAt: 8 },
+      },
+      { id: 'doc-1', kind: 'document', title: '文档', position: { x: 100, y: 0 }, documentId: 'doc-content', contentRevision: 1 },
+      { id: 'image-1', kind: 'image', title: '图片', position: { x: 200, y: 0 }, imageModuleId: 'image-content' },
+      { id: 'ignored-1', kind: 'document', title: '忽略', position: { x: 300, y: 0 }, documentId: 'ignored-content', contentRevision: 1 },
+    ],
+    edges: [],
+  }
+  const producer = document.nodes[0]!
+  document.edges = [
+    createCanvasBoundEdge(producer, document.nodes[1]!, {
+      id: 'edge-doc', sourceNodeId: target.nodeId, targetNodeId: 'doc-1', relation: 'depends-on',
+    }),
+    createCanvasBoundEdge(producer, document.nodes[2]!, {
+      id: 'edge-image', sourceNodeId: target.nodeId, targetNodeId: 'image-1', relation: 'reference',
+    }),
+    createCanvasBoundEdge(producer, document.nodes[3]!, {
+      id: 'edge-ignored', sourceNodeId: target.nodeId, targetNodeId: 'ignored-1', relation: 'association',
+    }),
+  ]
+  let messages = options.messages ?? []
+  let session = createSession()
+  let mutateCalls = 0
+  let leaseHeld = false
+  const publishStates: boolean[] = []
+  const dependencies: CanvasAgentOutputServiceDependencies = {
+    documents: {
+      load: () => ({ document: structuredClone(document), writable: true, nodeIssues: [] }),
+      mutate: (_target, expectedRevision, operations) => {
+        expect(leaseHeld).toBe(true)
+        if (expectedRevision !== document.revision) throw new Error('CANVAS_REVISION_CONFLICT')
+        mutateCalls += 1
+        const replacements = operations.flatMap((operation) => (
+          operation.type === 'upsert-nodes' ? operation.nodes : []
+        ))
+        const replacementsById = new Map(replacements.map((node) => [node.id, node]))
+        document = {
+          ...document,
+          revision: document.revision + 1,
+          nodes: document.nodes.map((node) => replacementsById.get(node.id) ?? node),
+        }
+        return structuredClone(document)
+      },
+    },
+    runExclusive: async (_target, effect) => {
+      leaseHeld = true
+      try { return await effect() } finally { leaseHeld = false }
+    },
+    dependencyState: createCanvasDependencyStateService(),
+    getSession: () => session,
+    getMessages: () => structuredClone(messages),
+    publish: async () => {
+      publishStates.push(leaseHeld)
+      if (options.publishError) throw options.publishError
+    },
+  }
+  return {
+    service: createCanvasAgentOutputService(dependencies), oldPointer,
+    getDocument: () => structuredClone(document),
+    getMutateCalls: () => mutateCalls,
+    getPublishStates: () => [...publishStates],
+    setMessages: (next: SDKMessage[]) => { messages = next },
+    setSession: (next: AgentSessionMeta) => { session = next },
+  }
+}
+
+/** 创建只允许采纳精确用户消息锚点之后消息的成功完成输入。 */
+function completion(overrides: Partial<CanvasAgentCompletionInput> = {}): CanvasAgentCompletionInput {
+  return {
+    target, runGeneration: 1, completedAt: 100, terminalStatus: 'completed',
+    userMessageUuid: anchorUuid, startedAt: 50,
+    ...overrides,
+  }
+}
+
+describe('Canvas Agent 正式输出服务', () => {
+  test('Given 当前 run 多条完整回复 When 解析完成输出 Then 选择最后一条并只顺序拼接 text 后计算精确 UTF-8 SHA-256', () => {
+    const fixture = createFixture({ messages: [
+      assistant(oldUuid, [{ type: 'text', text: '旧回复' }]),
+      user(anchorUuid),
+      assistant(firstUuid, [{ type: 'text', text: '第一条' }]),
+      assistant(lastUuid, [
+        { type: 'thinking', thinking: '不要进入正文' },
+        { type: 'text', text: '你好，' },
+        { type: 'tool_use', id: 'tool-1', name: 'Read', input: {} },
+        { type: 'text', text: '世界\n' },
+        { type: 'title', text: '不要进入正文' },
+      ]),
+    ] })
+
+    const result = fixture.service.resolveCompletedOutput(completion())
+
+    expect(result).toEqual({
+      content: '你好，世界\n',
+      pointer: {
+        messageUuid: lastUuid,
+        contentSha256: createHash('sha256').update('你好，世界\n', 'utf8').digest('hex'),
+        completedAt: 100,
+      },
+      runGeneration: 1,
+    })
+  })
+
+  test.each([
+    ['partial', assistant(lastUuid, [{ type: 'text', text: 'partial' }], { _partial: true })],
+    ['errored', assistant(lastUuid, [{ type: 'text', text: 'error text' }], { error: { message: '失败' } })],
+    ['without UUID', assistant(undefined, [{ type: 'text', text: 'no uuid' }])],
+    ['replayed', assistant(lastUuid, [{ type: 'text', text: 'replay' }], { isReplay: true })],
+    ['empty text', assistant(lastUuid, [{ type: 'thinking', thinking: 'only thinking' }, { type: 'text', text: '' }])],
+    ['blank text', assistant(lastUuid, [{ type: 'text', text: '  \n' }])],
+  ])('Given %s assistant When 解析正式输出 Then 返回稳定 missing 且不替换旧 pointer', async (_name, message) => {
+    const fixture = createFixture({ messages: currentRun(message) })
+
+    expect(() => fixture.service.resolveCompletedOutput(completion())).toThrow('CANVAS_AGENT_OUTPUT_MISSING')
+    await expect(fixture.service.commit(completion())).rejects.toThrow('CANVAS_AGENT_OUTPUT_MISSING')
+    expect(fixture.getMutateCalls()).toBe(0)
+    expect((fixture.getDocument().nodes[0] as CanvasNode & { outputPointer?: object }).outputPointer)
+      .toEqual(fixture.oldPointer)
+  })
+
+  test('Given 当前锚点后没有完成回复 When 解析 Then 不得采纳锚点前的旧消息', () => {
+    const fixture = createFixture({ messages: [
+      user(oldAnchorUuid), assistant(oldUuid, [{ type: 'text', text: '旧回复' }]), user(anchorUuid),
+    ] })
+
+    expect(() => fixture.service.resolveCompletedOutput(completion())).toThrow('CANVAS_AGENT_OUTPUT_MISSING')
+  })
+
+  test.each(['partial', 'errored'] as const)('Given run 终态为 %s When 解析 Then 即使有正文也拒绝固化', (terminalStatus) => {
+    const fixture = createFixture({ messages: currentRun(assistant(lastUuid, [{ type: 'text', text: '未完成正文' }])) })
+
+    expect(() => fixture.service.resolveCompletedOutput(completion({ terminalStatus })))
+      .toThrow('CANVAS_AGENT_OUTPUT_MISSING')
+  })
+
+  test('Given 当前 run 后已有下一条用户消息 When 解析旧 run Then 只检查两个用户锚点之间的 assistant', () => {
+    const nextAnchor = '123e4567-e89b-42d3-a456-426614174096'
+    const fixture = createFixture({ messages: [
+      user(anchorUuid), assistant(firstUuid, [{ type: 'text', text: '本轮正文' }]),
+      user(nextAnchor), assistant(lastUuid, [{ type: 'text', text: '下一轮正文' }]),
+    ] })
+
+    expect(fixture.service.resolveCompletedOutput(completion()).content).toBe('本轮正文')
+  })
+
+  test.each([
+    ['缺少指针', undefined, createSession(), [assistant(lastUuid, [{ type: 'text', text: '正文' }])]],
+    ['owner mismatch', { messageUuid: lastUuid, contentSha256: 'a'.repeat(64), completedAt: 10 }, createSession({ sourceCanvasNodeId: 'other' }), [assistant(lastUuid, [{ type: 'text', text: '正文' }])]],
+    ['hash mismatch', { messageUuid: lastUuid, contentSha256: 'a'.repeat(64), completedAt: 10 }, createSession(), [assistant(lastUuid, [{ type: 'text', text: '正文' }])]],
+    ['UUID 不存在', { messageUuid: lastUuid, contentSha256: createHash('sha256').update('正文', 'utf8').digest('hex'), completedAt: 10 }, createSession(), [assistant(firstUuid, [{ type: 'text', text: '正文' }])]],
+  ])('Given %s When 读取正式输出 Then 统一返回稳定 invalid', async (_name, pointer, session, messages) => {
+    const fixture = createFixture({ messages })
+    const document = fixture.getDocument()
+    const agent = document.nodes[0]
+    if (!agent || agent.kind !== 'agent') throw new Error('测试 Agent 节点缺失')
+    Object.assign(agent, { outputPointer: pointer })
+    fixture.setSession(session)
+    if (pointer === undefined) delete agent.outputPointer
+    fixture.setMessages(messages)
+    const isolated = createCanvasAgentOutputService({
+      documents: {
+        load: () => ({ document, writable: true, nodeIssues: [] }),
+        mutate: () => { throw new Error('unexpected mutate') },
+      },
+      runExclusive: async (_target, effect) => effect(),
+      dependencyState: createCanvasDependencyStateService(),
+      getSession: () => session,
+      getMessages: () => messages,
+      publish: () => undefined,
+    })
+
+    await expect(isolated.read(target)).rejects.toThrow('CANVAS_AGENT_OUTPUT_INVALID')
+  })
+
+  test('Given 精确 UUID 指向唯一完整 assistant When 读取 Then 重建纯 text 正文并校验 hash', async () => {
+    const content = '精确\n正文'
+    const fixture = createFixture({ messages: currentRun(assistant(lastUuid, [
+      { type: 'text', text: '精确\n' }, { type: 'thinking', thinking: '忽略' }, { type: 'text', text: '正文' },
+    ])) })
+    await fixture.service.commit(completion())
+
+    expect(await fixture.service.read(target)).toBe(content)
+  })
+
+  test('Given fresh owner 与完成输出 When commit Then 同一次 CAS 更新 pointer、消费自身提示并只标记有效直接下游，发布在锁释放后', async () => {
+    const fixture = createFixture({ messages: currentRun(assistant(lastUuid, [{ type: 'text', text: '正式正文' }])) })
+
+    const result = await fixture.service.commit(completion())
+    const document = fixture.getDocument()
+
+    expect(result).toMatchObject({ revision: 5, downstreamNodeIds: ['doc-1', 'image-1'] })
+    expect(fixture.getMutateCalls()).toBe(1)
+    expect(document.nodes[0]).toMatchObject({ outputPointer: result.pointer })
+    expect(document.nodes[0]).not.toHaveProperty('upstreamChange')
+    expect(document.nodes.find((node) => node.id === 'doc-1')?.upstreamChange).toEqual({ sourceNodeIds: ['agent-1'], changedAt: 100 })
+    expect(document.nodes.find((node) => node.id === 'image-1')?.upstreamChange).toEqual({ sourceNodeIds: ['agent-1'], changedAt: 100 })
+    expect(document.nodes.find((node) => node.id === 'ignored-1')).not.toHaveProperty('upstreamChange')
+    expect(fixture.getPublishStates()).toEqual([false])
+  })
+
+  test('Given generation 2 已提交 When generation 1 迟到 Then 不能覆盖较新 pointer或产生部分图事实', async () => {
+    const generationTwoAnchor = '123e4567-e89b-42d3-a456-426614174097'
+    const fixture = createFixture({ messages: [user(generationTwoAnchor), assistant(lastUuid, [{ type: 'text', text: '第二代' }])] })
+    await fixture.service.commit(completion({ userMessageUuid: generationTwoAnchor, runGeneration: 2, completedAt: 80 }))
+    const committed = fixture.getDocument()
+    fixture.setMessages([
+      user(anchorUuid), assistant(firstUuid, [{ type: 'text', text: '第一代迟到' }]),
+      user(generationTwoAnchor), assistant(lastUuid, [{ type: 'text', text: '第二代' }]),
+    ])
+
+    await expect(fixture.service.commit(completion({
+      runGeneration: 1, completedAt: 150,
+    }))).rejects.toThrow('CANVAS_AGENT_OUTPUT_STALE')
+    expect(fixture.getDocument()).toEqual(committed)
+    expect(fixture.getMutateCalls()).toBe(1)
+  })
+})

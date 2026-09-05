@@ -245,6 +245,8 @@ import { createCanvasImageInputResolver } from './lib/design/canvas-image-input-
 import { createCanvasImageCandidateBatchStore } from './lib/design/canvas-image-candidate-batch-store'
 import { createCanvasImageCandidateBatchService } from './lib/design/canvas-image-candidate-batch-service'
 import { createCanvasDependencyStateService } from './lib/design/canvas-dependency-state-service'
+import { createCanvasAgentOutputService } from './lib/design/canvas-agent-output-service'
+import { registerCanvasAgentOutputs } from './lib/design/canvas-tool-provider'
 import {
   createCanvasWebviewPreviewService,
   createElectronCanvasWebviewOffscreenRenderer,
@@ -2259,6 +2261,33 @@ export function registerIpcHandlers(): void {
   })
   /** 正式产物提交统一复用唯一纯依赖投影，不持有 Store、锁或后台状态。 */
   const canvasDependencyStateService = createCanvasDependencyStateService()
+  /** Canvas Agent 正式输出复用唯一文档 Store、依赖投影、串行器和 workspace write lease。 */
+  const canvasAgentOutputService = createCanvasAgentOutputService({
+    documents: canvasDocumentStore,
+    dependencyState: canvasDependencyStateService,
+    getSession: getAgentSessionMeta,
+    getMessages: getAgentSessionSDKMessages,
+    runExclusive: (target, effect) => canvasOperationSerializer.run(target, () => (
+      workspaceOperationGuard.runWorkspaceWrite(target.projectId, effect)
+    )),
+    publish: (target, document) => {
+      /** 正式输出已原子可见且 lease 已释放；广播失败由服务隔离。 */
+      for (const contents of listAuthorizedDesignWebContents()) {
+        try {
+          contents.send(CANVAS_IPC_CHANNELS.CHANGED, {
+            projectId: target.projectId,
+            canvasId: target.canvasId,
+            revision: document.revision,
+            cause: 'graph',
+          })
+        } catch (error) {
+          console.error('[Canvas Agent 输出] 单窗口图事实广播失败:', error)
+        }
+      }
+    },
+  })
+  /** 既有 Canvas Tool runtime 延迟读取该唯一实例，不创建第二套输出服务。 */
+  registerCanvasAgentOutputs(canvasAgentOutputService)
   /** Service 回调只会在 Job Manager 完成赋值后执行。 */
   let designJobManager: DesignJobManager
   const canvasImageCandidateBatchService = createCanvasImageCandidateBatchService({

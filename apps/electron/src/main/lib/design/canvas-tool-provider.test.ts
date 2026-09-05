@@ -21,6 +21,7 @@ function createFixture(options: {
   noDefaultCanvas?: boolean
   createCanvasError?: Error
   runBatch?: CanvasRunNodesBatchSummary
+  agentOutput?: string
 } = {}) {
   let document: CanvasDocument = {
     ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
@@ -124,6 +125,9 @@ function createFixture(options: {
         if (expectedRevision !== document.revision) throw new Error('CANVAS_REVISION_CONFLICT')
         return structuredClone(operations) as CanvasMutation[]
       },
+    },
+    agentOutputs: {
+      read: async () => options.agentOutput ?? 'Agent 正式输出',
     },
     readNodeContent: async (_target, node) => node.kind === 'document' ? 'A'.repeat(40_000) : '',
     artifacts: {
@@ -460,6 +464,24 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(details.nodes[1]?.artifact).toMatchObject({
       nodeId: 'image-1', kind: 'image', currentRevision: 4, adoptedAssetId: 'asset-1',
     })
+  })
+
+  test('Given Agent 节点已有权威正式输出 When canvas_read Then 返回验证正文且统一受 32 KiB 预算约束', async () => {
+    const fixture = createFixture({ agentOutput: '中'.repeat(40_000) })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_read', {
+      canvasId: 'canvas-1', nodeIds: ['agent-1'],
+    })
+    const details = result.details as {
+      nodes: Array<{ content: string; contentLength: number }>
+      truncated: boolean
+    }
+
+    expect(details.nodes[0]?.contentLength).toBe(40_000)
+    expect(details.nodes[0]?.content.length).toBeLessThan(40_000)
+    expect(details.truncated).toBe(true)
+    expect(JSON.stringify(details).length).toBeLessThanOrEqual(32_768)
   })
 
   test('Given 四类节点且 Agent 会话不可用 When canvas_read Then 每个条目公开当前派生能力且不可用节点没有 run', async () => {
