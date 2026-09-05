@@ -31,6 +31,20 @@ export interface HeadlessAgentRunCallbacks {
   originSessionId?: string
 }
 
+/**
+ * 解析 headless Agent 的公开终态。
+ * 入参包含本轮错误、停止与 Pi result subtype；返回调用方可消费的有界终态。
+ */
+export function resolveHeadlessAgentRunTerminalStatus(input: {
+  runErrored: boolean
+  stoppedByUser?: boolean
+  resultSubtype?: string
+}): HeadlessAgentRunTerminalOptions['status'] {
+  if (input.stoppedByUser) return 'cancelled'
+  if (input.runErrored || input.resultSubtype !== 'success') return 'errored'
+  return 'completed'
+}
+
 export type HeadlessAgentRunner = (
   input: AgentSendInput,
   callbacks: HeadlessAgentRunCallbacks,

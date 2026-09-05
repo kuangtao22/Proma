@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import { createCanvasBoundEdge, createEmptyCanvasDocument } from '@proma/shared'
 import type { AgentSessionMeta, CanvasDocument, SkillMeta } from '@proma/shared'
+import type { AgentRunExtensions } from '../agent-run-extensions'
 import type { CanvasAgentConfig } from './canvas-agent-config-store'
+import type { CanvasToolRun } from './canvas-tool-provider'
 import {
   createCanvasAgentExecutionService,
   type CanvasAgentExecutionServiceDependencies,
@@ -26,6 +28,8 @@ function createFixture(options: {
   prepareDocument?: CanvasDocument
   commitGate?: Promise<void>
   headlessResultSubtype?: string
+  canvasRun?: CanvasToolRun
+  inspectHeadlessExtensions?: (extensions: AgentRunExtensions | undefined) => void
 } = {}) {
   const calls: string[] = []
   const document: CanvasDocument = createEmptyCanvasDocument(target.projectId, target.canvasId, 1)
@@ -87,7 +91,7 @@ function createFixture(options: {
     },
     createCanvasRun: (context) => {
       calls.push(`tools:${context.explicitReferences.map((reference) => reference.nodeId).join(',')}`)
-      return {
+      return options.canvasRun ?? {
         systemPromptAppend: 'tools-prompt', piCustomTools: [],
         allowedToolNames: ['canvas_read', 'canvas_run_nodes'],
         allowedToolNamesMode: 'extend', singleApprovalToolNames: ['canvas_run_nodes'],
@@ -106,6 +110,7 @@ function createFixture(options: {
     runHeadless: async (input, callbacks, extensions) => {
       calls.push(`headless:${callbacks.source}:${callbacks.originSessionId}:${input.triggeredBy}`)
       activeRun = { sessionId: input.sessionId, startedAt: input.startedAt! }
+      options.inspectHeadlessExtensions?.(extensions)
       expect(extensions?.allowedToolNames).not.toContain('canvas_run_nodes')
       if (options.runError) callbacks.onError(options.runError)
       await options.runGate
@@ -181,6 +186,38 @@ describe('Canvas Agent 统一执行服务', () => {
 
     expect(fixture.calls).toContain('headless:design:parent-1:external')
     expect(fixture.calls.filter((call) => call.startsWith('commit:'))).toEqual(['commit:completed:1'])
+  })
+
+  test('Given Provider 新增未知 Canvas 工具 When 父 Agent 编排运行 Then 三个工具入口默认拒绝未知项', async () => {
+    /** 当前父编排明确允许的已知工具。 */
+    const knownTool = { name: 'canvas_update_artifact' } as unknown as CanvasToolRun['piCustomTools'][number]
+    /** 模拟 Provider 未来新增但尚未进入父编排许可合同的工具。 */
+    const unknownTool = { name: 'canvas_future_tool' } as unknown as CanvasToolRun['piCustomTools'][number]
+    /** 证明测试实际观察到传入 headless runner 的最终扩展。 */
+    let inspected = false
+    const fixture = createFixture({
+      canvasRun: {
+        systemPromptAppend: 'tools-prompt',
+        piCustomTools: [knownTool, unknownTool],
+        allowedToolNames: [knownTool.name, unknownTool.name],
+        allowedToolNamesMode: 'extend',
+        singleApprovalToolNames: [knownTool.name, unknownTool.name],
+      },
+      inspectHeadlessExtensions: (extensions) => {
+        inspected = true
+        expect(extensions?.allowedToolNames).toContain(knownTool.name)
+        expect(extensions?.allowedToolNames).not.toContain(unknownTool.name)
+        expect(extensions?.piCustomTools?.map((tool) => tool.name)).toEqual([knownTool.name])
+        expect(extensions?.singleApprovalToolNames).toEqual([knownTool.name])
+      },
+    })
+
+    await fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '生成方案',
+      userMessageUuid: 'anchor-future-tool', startedAt: 61,
+    })
+
+    expect(inspected).toBe(true)
   })
 
   test.each([

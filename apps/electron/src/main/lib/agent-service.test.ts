@@ -170,9 +170,8 @@ describe('Agent service 迁移准入', () => {
     const body = source.slice(start, end)
 
     expect(body).toContain("name: 'internal-terminal-observer'")
-    expect(body).toContain("? 'cancelled'")
-    expect(body).toContain("? 'errored'")
-    expect(body).toContain(": 'completed'")
+    expect(body).toContain('resolveHeadlessAgentRunTerminalStatus({')
+    expect(body).toContain('resultSubtype: options?.resultSubtype')
     expect(body).toContain('startedAt:')
     expect(body).toContain('runGeneration:')
     expect(body).toContain('runAgentServiceTerminalEffects([')
@@ -189,6 +188,7 @@ describe('Agent service 迁移准入', () => {
     expect(body).toContain('startedAt:')
     expect(body).toContain('runGeneration:')
     expect(body).toContain('resultSubtype:')
+    expect(body).toContain('resolveHeadlessAgentRunTerminalStatus({')
     expect(body).toContain("status: 'errored'")
   })
 

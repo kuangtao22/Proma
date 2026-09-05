@@ -59,7 +59,11 @@ import { getAgentSessionWorkspacePath } from './config-paths'
 import { getAgentWorkspaceBySlug, getLocalProjectRootStatus, getProjectFilesPath } from './agent-workspace-manager'
 import { getAgentSessionMeta, listAgentSessions, updateAgentSessionMeta } from './agent-session-manager'
 import { buildCanvasAgentActiveRunSnapshot, isEligibleProjectAgent } from './agent-session-visibility'
-import { setAgentStopper, setHeadlessAgentRunner } from './agent-headless-runner-registry'
+import {
+  resolveHeadlessAgentRunTerminalStatus,
+  setAgentStopper,
+  setHeadlessAgentRunner,
+} from './agent-headless-runner-registry'
 import type { HeadlessAgentRunCallbacks, HeadlessAgentRunTerminalOptions } from './agent-headless-runner-registry'
 import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
 import {
@@ -411,15 +415,15 @@ export async function runPreparedAgent(
     terminalObserved = true
     terminalObserver(observation)
   }
-  /** SDK 非 success subtype 与显式 stop 都不能被 Canvas 当作成功输出。 */
+  /** 只有 Pi 明确返回 success 时，Canvas 才能把本轮视为可提交完成。 */
   const getCompletionStatus = (options?: {
     stoppedByUser?: boolean
     resultSubtype?: string
-  }): AgentRunTerminalObservation['status'] => options?.stoppedByUser
-    ? 'cancelled'
-    : options?.resultSubtype && options.resultSubtype !== 'success'
-      ? 'errored'
-      : 'completed'
+  }): AgentRunTerminalObservation['status'] => resolveHeadlessAgentRunTerminalStatus({
+    runErrored: false,
+    stoppedByUser: options?.stoppedByUser,
+    resultSubtype: options?.resultSubtype,
+  })
   /** 获取当前运行仍拥有的 renderer；准入前错误只返回本次调用方。 */
   const getRunTarget = (): WebContents | undefined => route
     ? streamRoutes.getTargetIfOwner(input.sessionId, route.ownerId)
@@ -626,11 +630,11 @@ export async function runAgentHeadless(
     /** 优先使用 completion 自带的权威代次，早期异常回退已捕获的启动代次。 */
     const terminalRunGeneration = options?.runGeneration ?? runGeneration
     return {
-      status: options?.stoppedByUser
-        ? 'cancelled'
-        : runErrored || (options?.resultSubtype !== undefined && options.resultSubtype !== 'success')
-          ? 'errored'
-          : 'completed',
+      status: resolveHeadlessAgentRunTerminalStatus({
+        runErrored,
+        stoppedByUser: options?.stoppedByUser,
+        resultSubtype: options?.resultSubtype,
+      }),
       stoppedByUser: options?.stoppedByUser === true,
       startedAt: options?.startedAt ?? startedAt,
       ...(terminalRunGeneration !== undefined ? { runGeneration: terminalRunGeneration } : {}),

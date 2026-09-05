@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type { AgentSendInput } from '@proma/shared'
 import type { AgentRunExtensions } from './agent-run-extensions'
 import {
+  resolveHeadlessAgentRunTerminalStatus,
   runRegisteredHeadlessAgent,
   setHeadlessAgentRunner,
 } from './agent-headless-runner-registry'
@@ -11,6 +12,45 @@ const input: AgentSendInput = {
 }
 
 describe('Agent headless runner 注册表', () => {
+  test('Given Pi typed-error 未提供 result subtype When 归一化终态 Then fail closed 为错误', () => {
+    expect(resolveHeadlessAgentRunTerminalStatus({
+      runErrored: false,
+      stoppedByUser: false,
+    })).toBe('errored')
+  })
+
+  test('Given Pi 正常 result 明确提供 success When 归一化终态 Then 允许完成', () => {
+    expect(resolveHeadlessAgentRunTerminalStatus({
+      runErrored: false,
+      stoppedByUser: false,
+      resultSubtype: 'success',
+    })).toBe('completed')
+  })
+
+  test('Given Pi result 明确提供非 success subtype When 归一化终态 Then 判定为错误', () => {
+    expect(resolveHeadlessAgentRunTerminalStatus({
+      runErrored: false,
+      stoppedByUser: false,
+      resultSubtype: 'error_during_execution',
+    })).toBe('errored')
+  })
+
+  test('Given 本轮已经触发 onError When 后续 completion 到达 Then 错误事实优先', () => {
+    expect(resolveHeadlessAgentRunTerminalStatus({
+      runErrored: true,
+      stoppedByUser: false,
+      resultSubtype: 'success',
+    })).toBe('errored')
+  })
+
+  test('Given 用户已停止 When completion 同时携带其它信号 Then STOP 优先判定为取消', () => {
+    expect(resolveHeadlessAgentRunTerminalStatus({
+      runErrored: true,
+      stoppedByUser: true,
+      resultSubtype: 'success',
+    })).toBe('cancelled')
+  })
+
   test('Given 调用方提供单次运行扩展 When 启动已注册 runner Then 原样传递且旧两参数调用仍兼容', async () => {
     /** 记录 runner 收到的可信单次扩展。 */
     const received: Array<AgentRunExtensions | undefined> = []

@@ -277,6 +277,34 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(sendBody).toContain('callbacks.onRunStarted?.({ startedAt: streamStartedAt, runGeneration })')
   })
 
+  test('Given Pi typed-error 与正常 result When 完成运行 Then 只有正常 result 透传可证明的 success subtype', () => {
+    /** 读取真实编排源码，锁定两条生产终态路径的信号差异。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** typed-error 分支起点。 */
+    const typedErrorStart = source.indexOf('// 透传归一化后的错误消息到前端')
+    /** typed-error 分支终点。 */
+    const typedErrorEnd = source.indexOf('// 累积 assistant 和 user 消息用于持久化', typedErrorStart)
+    /** typed-error 实际完成调用。 */
+    const typedErrorBody = source.slice(typedErrorStart, typedErrorEnd)
+    /** Pi result 终态处理起点。 */
+    const resultStart = source.indexOf("if (msg.type === 'result')", typedErrorEnd)
+    /** Pi result 终态处理终点。 */
+    const resultEnd = source.indexOf('// 过滤 SDK 内部生成的 user 消息', resultStart)
+    /** Pi result subtype 捕获逻辑。 */
+    const resultBody = source.slice(resultStart, resultEnd)
+    /** 正常完成通知起点。 */
+    const finalCompletionStart = source.indexOf('// 发送完成信号', resultEnd)
+    /** 正常完成通知终点。 */
+    const finalCompletionEnd = source.indexOf('return', finalCompletionStart)
+    /** 正常完成实际调用。 */
+    const finalCompletionBody = source.slice(finalCompletionStart, finalCompletionEnd)
+
+    expect(typedErrorBody).toContain('completeRun(getAgentSessionMessages(sessionId), { startedAt: streamStartedAt })')
+    expect(typedErrorBody).not.toContain('resultSubtype:')
+    expect(resultBody).toContain('capturedResultSubtype = (msg as { subtype?: string }).subtype')
+    expect(finalCompletionBody).toContain('resultSubtype: capturedResultSubtype')
+  })
+
   test('Given stop 后旧 adapter 尚未退出 When 检查生产接入 Then 独立跟踪 in-flight 并阻止旧代际副作用', () => {
     /** 读取真实编排源码，约束迁移准入与前台 active 状态分离。 */
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')

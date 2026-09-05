@@ -104,9 +104,17 @@ export interface CanvasAgentExecutionService {
   execute: (request: CanvasAgentExecutionRequest) => Promise<CanvasAgentExecutionResult>
 }
 
-/** parent 模式禁止递归编排和图片付费运行。 */
-const PARENT_DENIED_CANVAS_TOOLS = new Set([
-  'canvas_manage', 'canvas_create_agent', 'canvas_run_agent', 'canvas_run_workflow', 'canvas_run_nodes',
+/** parent 模式只开放当前节点生产所需能力；未来新增工具默认无权进入子 Agent。 */
+const PARENT_ALLOWED_CANVAS_TOOLS = new Set([
+  'canvas_get_context',
+  'canvas_list_nodes',
+  'canvas_inspect_images',
+  'canvas_read',
+  'canvas_apply_changes',
+  'canvas_import_image',
+  'canvas_create_artifact',
+  'canvas_update_artifact',
+  'canvas_update_image_config',
 ])
 
 /** 将长期和本轮 Skill 名称解析为当前启用 Skill 的稳定 slug。 */
@@ -141,17 +149,19 @@ function buildRunExtensions(
   canvasRun: CanvasToolRun | undefined,
 ): AgentRunExtensions {
   const canvasToolNames = (canvasRun?.allowedToolNames ?? []).filter((name) => (
-    mode === 'renderer-manual' || !PARENT_DENIED_CANVAS_TOOLS.has(name)
+    mode === 'renderer-manual' || PARENT_ALLOWED_CANVAS_TOOLS.has(name)
   ))
+  /** 三个工具入口共享同一正向集合，避免 schema、执行器和审批列表出现权限漂移。 */
+  const canvasToolNameSet = new Set(canvasToolNames)
   return {
     systemPromptAppend: [prompt, canvasRun?.systemPromptAppend]
       .filter((section): section is string => Boolean(section?.trim()))
       .join('\n\n'),
-    ...(canvasRun ? { piCustomTools: canvasRun.piCustomTools.filter((tool) => canvasToolNames.includes(tool.name)) } : {}),
+    ...(canvasRun ? { piCustomTools: canvasRun.piCustomTools.filter((tool) => canvasToolNameSet.has(tool.name)) } : {}),
     allowedToolNames: [...CANVAS_AGENT_ALLOWED_TOOL_NAMES, ...canvasToolNames],
     allowedToolNamesMode: 'replace',
     ...(canvasRun ? {
-      singleApprovalToolNames: canvasRun.singleApprovalToolNames.filter((name) => canvasToolNames.includes(name)),
+      singleApprovalToolNames: canvasRun.singleApprovalToolNames.filter((name) => canvasToolNameSet.has(name)),
     } : {}),
   }
 }
