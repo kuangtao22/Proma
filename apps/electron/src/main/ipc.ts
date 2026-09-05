@@ -233,6 +233,7 @@ import {
 } from './lib/design/canvas-text-artifact-service'
 import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
+import { createCanvasAgentConfigStore } from './lib/design/canvas-agent-config-store'
 import {
   createCanvasNodeContentStore,
   parseCanvasNodeContentMetaContent,
@@ -459,6 +460,7 @@ import {
   getWorkspaceCapabilities,
   getAgentWorkspace,
   getAgentWorkspaceBySlug,
+  getWorkspaceSkills,
   getProjectFilesPath,
   deleteWorkspaceSkill,
   importSkillFromWorkspace,
@@ -2040,6 +2042,24 @@ export function registerIpcHandlers(): void {
   }
   /** 非 Agent 内容目录与图文档共享唯一 Store 实例和目录 capability。 */
   const canvasNodeContentStore = createCanvasNodeContentStore({ store: canvasDocumentStore })
+  /** Canvas Agent 长期配置复用唯一图文档 Store，并在保存时重新验证 Skills 与模型。 */
+  const canvasAgentConfigStore = createCanvasAgentConfigStore({
+    store: canvasDocumentStore,
+    getWorkspaceSkills: (projectId) => {
+      /** 项目 ID 必须解析到当前工作区，禁止跨项目读取 Skills。 */
+      const workspace = getAgentWorkspace(projectId)
+      if (!workspace) throw new Error('CANVAS_AGENT_CONFIG_WORKSPACE_INVALID')
+      return getWorkspaceSkills(workspace.slug)
+    },
+    assertChannelAvailable: (channelId) => {
+      listEnabledAgentModelsForChannel(channelId, 'Canvas Agent 配置')
+    },
+    assertModelAvailable: (channelId, modelId) => {
+      assertEnabledModelForChannel({ channelId, modelId, purpose: 'Canvas Agent 配置' })
+    },
+  })
+  /** 当前切片只建立唯一生产实例，后续 Canvas 工具与执行服务将复用该引用。 */
+  void canvasAgentConfigStore
   /** 文本不可变版本复用同一 Canvas Store 与 revision 0 内容读取边界。 */
   const canvasArtifactRevisionStore = createCanvasArtifactRevisionStore({
     store: canvasDocumentStore,
