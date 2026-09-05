@@ -100,6 +100,8 @@ function createHarness(options: HarnessOptions = {}) {
   const jobs = new Map<string, DesignJobRecord>()
   const batches = new Map<string, CanvasImageCandidateBatch>()
   const listeners = new Set<DesignJobChangedListener>()
+  /** 候选批次变化监听器模拟权威 JSON 保存完成后的 ack。 */
+  const batchListeners = new Set<(event: CanvasTarget & { batchId: string; jobId: string }) => void>()
   let leaseHeld = false
   const service = createCanvasImageRunService({
     serializer: {
@@ -196,6 +198,10 @@ function createHarness(options: HarnessOptions = {}) {
         if (!batch) throw new Error('CANVAS_IMAGE_BATCH_NOT_FOUND')
         return structuredClone(batch)
       },
+      onChanged: (listener: (event: CanvasTarget & { batchId: string; jobId: string }) => void) => {
+        batchListeners.add(listener)
+        return () => { batchListeners.delete(listener) }
+      },
     },
     getProjectReadOnlyReason: () => undefined,
   })
@@ -205,9 +211,13 @@ function createHarness(options: HarnessOptions = {}) {
     jobs,
     batches,
     listeners,
+    batchListeners,
     emit(job: DesignJobRecord) {
       jobs.set(job.id, job)
       for (const listener of [...listeners]) listener({ job, revision: 1 })
+    },
+    emitBatchChange(batchId: string, jobId: string) {
+      for (const listener of [...batchListeners]) listener({ ...target, batchId, jobId })
     },
   }
 }
@@ -335,7 +345,7 @@ describe('Canvas 图片统一运行服务', () => {
     expect(harness.listeners.size).toBe(0)
   })
 
-  test('Given Job 终态事件早于候选登记 When 下一微任务提交批次 Then 同一事件仍可唤醒终态重读', async () => {
+  test('Given Job 终态事件早于候选登记 When 跨多个 macrotask 后批次发出 ack Then 等待完成且不超时', async () => {
     const node = createImageNode('image-a')
     const harness = createHarness()
     const started = await harness.service.run(context, target, [node], 'tool-event-order')
@@ -351,15 +361,22 @@ describe('Canvas 图片统一运行服务', () => {
       batchId,
       taskIds: [taskId],
       signal: new AbortController().signal,
-      deadlineAt: Date.now() + 200,
+      deadlineAt: Date.now() + 1_000,
     })
     await Promise.resolve()
     harness.emit({ ...job, status: 'failed', error: 'IMAGE_FAILED' })
-    await Promise.resolve()
-    harness.batches.set(batchId, {
-      ...batch,
-      status: 'partial',
-      entries: batch.entries.map((entry) => ({ ...entry, status: 'failed', error: 'IMAGE_FAILED' })),
+    await new Promise<void>((resolve) => {
+      setTimeout(() => {
+        setTimeout(() => {
+          harness.batches.set(batchId, {
+            ...batch,
+            status: 'partial',
+            entries: batch.entries.map((entry) => ({ ...entry, status: 'failed', error: 'IMAGE_FAILED' })),
+          })
+          harness.emitBatchChange(batchId, taskId)
+          resolve()
+        }, 0)
+      }, 0)
     })
 
     await expect(waiting).resolves.toMatchObject({
@@ -370,7 +387,7 @@ describe('Canvas 图片统一运行服务', () => {
     })
   })
 
-  test('Given 等待被中止 When 清理 Then 移除监听且只取消输入中仍属于批次的活跃任务', async () => {
+  test('Given 等待被中止 When 清理 Then 移除两类监听且不取消同 Canvas 其它任务', async () => {
     const node = createImageNode('image-a')
     const harness = createHarness()
     const started = await harness.service.run(context, target, [node], 'tool-abort')
@@ -382,14 +399,14 @@ describe('Canvas 图片统一运行服务', () => {
       target: { kind: 'canvas-image', canvasId: 'canvas-foreign', nodeId: 'foreign', imageModuleId: 'module-foreign' },
       action: 'generate', prompt: 'foreign', contextMode: 'none', imageModelProfileId: 'profile-1',
       generationConstraints: { aspectRatio: '1:1', imageSize: '1K' },
-      canvasImageConfigRevision: 1, candidateBatchId: batchId,
+      canvasImageConfigRevision: 1, candidateBatchId: 'foreign-batch',
     }
     harness.jobs.set('foreign-job', createJob(foreignInput, 'foreign-job', 'running'))
     const abortController = new AbortController()
     const waiting = harness.service.awaitBatch({
       ...target,
       batchId,
-      taskIds: [taskId, 'foreign-job'],
+      taskIds: [taskId],
       signal: abortController.signal,
       deadlineAt: Date.now() + 5_000,
     })
@@ -398,7 +415,50 @@ describe('Canvas 图片统一运行服务', () => {
 
     await expect(waiting).rejects.toThrow('CANVAS_IMAGE_BATCH_WAIT_ABORTED')
     expect(harness.calls.filter((call) => call.startsWith('cancel:'))).toEqual([`cancel:${taskId}`])
+    expect(harness.jobs.get('foreign-job')?.status).toBe('running')
     expect(harness.listeners.size).toBe(0)
+    expect(harness.batchListeners.size).toBe(0)
+  })
+
+  test('Given 直接取消请求跨越 Canvas、批次或批次任务集合 When 校验所有权 Then 全部拒绝且零取消', async () => {
+    const node = createImageNode('image-a')
+    const harness = createHarness()
+    const started = await harness.service.run(context, target, [node], 'tool-cancel-ownership')
+    const taskId = started.tasks[0]?.taskId
+    const batchId = started.batch?.batchId
+    if (!taskId || !batchId) throw new Error('测试批次未创建')
+    const ownedBatch = harness.batches.get(batchId)
+    if (!ownedBatch) throw new Error('测试候选批次未创建')
+    /** 真实存在的另一批次复用 taskId，必须由 Job candidateBatchId 复核拒绝。 */
+    harness.batches.set('batch-foreign', { ...structuredClone(ownedBatch), batchId: 'batch-foreign' })
+    await expect(harness.service.cancelTasks({
+      ...target, canvasId: 'canvas-foreign', batchId, taskIds: [taskId],
+    }))
+      .rejects.toThrow('CANVAS_IMAGE_BATCH_WAIT_OWNERSHIP_INVALID')
+    await expect(harness.service.cancelTasks({ ...target, batchId: 'batch-foreign', taskIds: [taskId] }))
+      .rejects.toThrow('CANVAS_IMAGE_BATCH_WAIT_OWNERSHIP_INVALID')
+    await expect(harness.service.cancelTasks({
+      ...target, batchId, taskIds: [taskId, 'task-outside-batch'],
+    }))
+      .rejects.toThrow('CANVAS_IMAGE_BATCH_WAIT_OWNERSHIP_INVALID')
+    expect(harness.calls.filter((call) => call.startsWith('cancel:'))).toEqual([])
+  })
+
+  test('Given 合法批次包含活跃与终态任务 When 直接取消 Then 只取消 owned active IDs', async () => {
+    const first = createImageNode('image-a')
+    const second = createImageNode('image-b')
+    const harness = createHarness()
+    const started = await harness.service.run(context, target, [first, second], 'tool-cancel-active')
+    const taskIds = started.tasks.flatMap((task) => task.taskId ? [task.taskId] : [])
+    const batchId = started.batch?.batchId
+    if (taskIds.length !== 2 || !batchId) throw new Error('测试批次未创建')
+    const completed = harness.jobs.get(taskIds[1]!)
+    if (!completed) throw new Error('测试任务未创建')
+    harness.jobs.set(completed.id, { ...completed, status: 'succeeded', outputAssetId: 'asset-completed' })
+    await harness.service.cancelTasks({ ...target, batchId, taskIds })
+
+    expect(harness.calls.filter((call) => call.startsWith('cancel:'))).toEqual([`cancel:${taskIds[0]}`])
+    expect(harness.jobs.get(taskIds[1]!)?.status).toBe('succeeded')
   })
 
   test('Given 等待期限已过 When 进入服务 Then 不保留监听并取消本批活跃任务', async () => {

@@ -50,6 +50,17 @@ export interface CanvasImageCandidateJobTerminalEvent extends CanvasTarget {
   singleBatchRecovery?: Omit<CreateCanvasImageCandidateBatchEntry, 'jobId'>
 }
 
+/** 候选批次权威状态完成写入后的有界变化事件。 */
+export interface CanvasImageCandidateBatchChangedEvent extends CanvasTarget {
+  batchId: string
+  jobId: string
+}
+
+/** 候选批次变化监听器只接收稳定业务身份。 */
+export type CanvasImageCandidateBatchChangedListener = (
+  event: CanvasImageCandidateBatchChangedEvent,
+) => void
+
 /** 单条候选任务定向重试的完整身份。 */
 export interface RetryCanvasImageCandidateJobInput extends CanvasImageTarget {
   batchId: string
@@ -107,6 +118,7 @@ export interface CanvasImageCandidateBatchService {
   createBatchLocked(input: CreateCanvasImageCandidateBatchInput): Promise<CanvasImageCandidateBatch>
   listActiveSummaries(input: CanvasTarget): Promise<CanvasImageCandidateBatchSummary[]>
   recordJobTerminal(event: CanvasImageCandidateJobTerminalEvent): Promise<void>
+  onChanged(listener: CanvasImageCandidateBatchChangedListener): () => void
   load(input: CanvasTarget & { batchId: string }): Promise<CanvasImageCandidateBatch>
   continueBatch(input: CanvasTarget & { batchId: string }): Promise<CanvasImageCandidateBatch>
   retryJob(input: RetryCanvasImageCandidateJobInput): Promise<string>
@@ -196,6 +208,8 @@ function createAdoptionProjection(
 export function createCanvasImageCandidateBatchService(
   dependencies: CanvasImageCandidateBatchServiceDependencies,
 ): CanvasImageCandidateBatchService {
+  /** 仅保存进程内订阅者，事件载荷不携带候选素材或本地路径。 */
+  const listeners = new Set<CanvasImageCandidateBatchChangedListener>()
   /** 时间源只允许非负安全整数。 */
   const now = (): number => {
     const value = (dependencies.now ?? Date.now)()
@@ -617,56 +631,70 @@ export function createCanvasImageCandidateBatchService(
     createBatch: async (input) => dependencies.runExclusive(input, () => createBatchLocked(input)),
     createBatchLocked,
     listActiveSummaries: async (input) => dependencies.store.listActiveSummaries(input),
-    recordJobTerminal: async (event) => dependencies.runExclusive(event, async () => {
-      let batch = await dependencies.store.findByJobId(event, event.jobId, event.candidateBatchId)
-      if (!batch
-        && event.status === 'succeeded'
-        && event.candidateBatchId
-        && event.singleBatchRecovery) {
-        /** 成功 replacement 可修复仍指向旧 attempt 的单节点批次；失败旧任务无恢复资格。 */
-        try {
-          const existing = await dependencies.store.load(event, event.candidateBatchId)
-          const entry = assertRecoverableSingleBatch(existing, event.singleBatchRecovery)
-          batch = await dependencies.store.save({
-            ...existing,
-            status: 'running',
-            entries: [{
-              ...entry, jobId: event.jobId, candidateAssetId: null, status: 'queued', error: null,
-            }],
-            updatedAt: now(),
-          })
-        } catch (error) {
-          if (!(error instanceof Error) || error.message !== 'CANVAS_IMAGE_BATCH_NOT_FOUND') throw error
-          batch = await createBatchLocked({
-            ...event,
-            batchId: event.candidateBatchId,
-            source: 'single',
-            sourceSessionId: null,
-            sourceToolCallId: null,
-            entries: [{ ...event.singleBatchRecovery, jobId: event.jobId }],
-          })
+    recordJobTerminal: async (event) => {
+      /** 先完成权威批次写入并释放同 Canvas 串行锁，再通知等待方重读。 */
+      const changed = await dependencies.runExclusive(event, async (): Promise<CanvasImageCandidateBatchChangedEvent> => {
+        let batch = await dependencies.store.findByJobId(event, event.jobId, event.candidateBatchId)
+        if (!batch
+          && event.status === 'succeeded'
+          && event.candidateBatchId
+          && event.singleBatchRecovery) {
+          /** 成功 replacement 可修复仍指向旧 attempt 的单节点批次；失败旧任务无恢复资格。 */
+          try {
+            const existing = await dependencies.store.load(event, event.candidateBatchId)
+            const entry = assertRecoverableSingleBatch(existing, event.singleBatchRecovery)
+            batch = await dependencies.store.save({
+              ...existing,
+              status: 'running',
+              entries: [{
+                ...entry, jobId: event.jobId, candidateAssetId: null, status: 'queued', error: null,
+              }],
+              updatedAt: now(),
+            })
+          } catch (error) {
+            if (!(error instanceof Error) || error.message !== 'CANVAS_IMAGE_BATCH_NOT_FOUND') throw error
+            batch = await createBatchLocked({
+              ...event,
+              batchId: event.candidateBatchId,
+              source: 'single',
+              sourceSessionId: null,
+              sourceToolCallId: null,
+              entries: [{ ...event.singleBatchRecovery, jobId: event.jobId }],
+            })
+          }
         }
-      }
-      if (!batch) throw new Error('CANVAS_IMAGE_BATCH_JOB_NOT_FOUND')
-      const entries = batch.entries.map((entry): CanvasImageCandidateBatchEntry => {
-        if (entry.jobId !== event.jobId) return entry
-        if (event.status === 'succeeded') {
-          if (!event.outputAssetId) throw new Error('CANVAS_IMAGE_BATCH_OUTPUT_INVALID')
-          return { ...entry, candidateAssetId: event.outputAssetId, status: 'candidate', error: null }
-        }
+        if (!batch) throw new Error('CANVAS_IMAGE_BATCH_JOB_NOT_FOUND')
+        const entries = batch.entries.map((entry): CanvasImageCandidateBatchEntry => {
+          if (entry.jobId !== event.jobId) return entry
+          if (event.status === 'succeeded') {
+            if (!event.outputAssetId) throw new Error('CANVAS_IMAGE_BATCH_OUTPUT_INVALID')
+            return { ...entry, candidateAssetId: event.outputAssetId, status: 'candidate', error: null }
+          }
+          return {
+            ...entry, candidateAssetId: null, status: 'failed',
+            error: (event.error ?? `任务${event.status}`).slice(0, 1000),
+          }
+        })
+        /** abandoned 只追加历史候选事实，不恢复为待验收状态。 */
+        const saved = await dependencies.store.save({
+          ...batch,
+          entries,
+          status: batch.status === 'abandoned' ? 'abandoned' : deriveStatus(entries),
+          updatedAt: now(),
+        })
         return {
-          ...entry, candidateAssetId: null, status: 'failed',
-          error: (event.error ?? `任务${event.status}`).slice(0, 1000),
+          projectId: saved.projectId,
+          canvasId: saved.canvasId,
+          batchId: saved.batchId,
+          jobId: event.jobId,
         }
       })
-      /** abandoned 只追加历史候选事实，不恢复为待验收状态。 */
-      await dependencies.store.save({
-        ...batch,
-        entries,
-        status: batch.status === 'abandoned' ? 'abandoned' : deriveStatus(entries),
-        updatedAt: now(),
-      })
-    }),
+      for (const listener of listeners) listener(changed)
+    },
+    onChanged: (listener) => {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
     load: async (rawInput) => {
       const input = parseGetCanvasImageCandidateBatchInput(rawInput)
       return dependencies.store.load(input, input.batchId)

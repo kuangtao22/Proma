@@ -730,6 +730,7 @@ function createContext(options: {
         imageCalls.push({ type: 'candidate-load', value: input })
         return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
       },
+      onChanged: () => () => undefined,
       continueBatch: async (input) => {
         imageCalls.push({ type: 'candidate-continue', value: input })
         return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
@@ -3651,6 +3652,7 @@ describe('原生 Canvas 文档 IPC', () => {
         createBatchLocked: async (input: import('./canvas-image-candidate-batch-service').CreateCanvasImageCandidateBatchInput) => createImageCandidateBatch(input.batchId),
         listActiveSummaries: async () => [],
         load: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
+        onChanged: () => () => undefined,
         continueBatch: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
         retryJobLocked: async () => 'job-retry',
         adoptExistingAssetLocked: async (input: import('./canvas-image-candidate-batch-service').AdoptExistingCanvasImageAssetInput) => createImageCandidateBatch(input.batchId),

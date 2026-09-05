@@ -126,6 +126,27 @@ function createFixture() {
 }
 
 describe('Canvas 图片候选批次 Service', () => {
+  test('Given Job 终态完成登记 When 发布批次变化 Then 监听器可立即读取权威终态', async () => {
+    const fixture = createFixture()
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-event', source: 'canvas-tool',
+      sourceSessionId: 'session-1', sourceToolCallId: 'tool-event', entries: [fixture.entries[0]!],
+    })
+    const observedStatuses: string[] = []
+    const unsubscribe = fixture.service.onChanged((event) => {
+      /** 事件回调触发时，内存 store 必须已经持有可重读的权威终态。 */
+      observedStatuses.push(fixture.batches.get(event.batchId)?.entries[0]?.status ?? 'missing')
+    })
+
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, jobId: 'job-0', candidateBatchId: 'batch-event',
+      status: 'succeeded', outputAssetId: 'asset-event', error: null,
+    })
+    unsubscribe()
+
+    expect(observedStatuses).toEqual(['candidate'])
+  })
+
   test('Given 14 节点 When 仅 2 个成功 Then partial 且不采用任何正式版本', async () => {
     const fixture = createFixture()
     const before = structuredClone(fixture.canvas)

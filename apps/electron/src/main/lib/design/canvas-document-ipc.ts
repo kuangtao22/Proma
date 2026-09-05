@@ -207,7 +207,7 @@ export interface CanvasDocumentIpcOptions {
   imageCandidateBatches: Pick<
     CanvasImageCandidateBatchService,
     'createBatchLocked' | 'listActiveSummaries' | 'load' | 'continueBatch' | 'retryJobLocked'
-    | 'adoptExistingAssetLocked' | 'adopt' | 'abandon'
+    | 'adoptExistingAssetLocked' | 'adopt' | 'abandon' | 'onChanged'
   >
   /** 主进程可注入唯一图片运行服务；测试缺省时复用同一组依赖构造。 */
   imageRunService?: CanvasImageRunService

@@ -11,7 +11,10 @@ import type {
   CreateDesignJobInput,
   DesignJobRecord,
 } from '@proma/shared'
-import type { CanvasImageCandidateBatchService } from './canvas-image-candidate-batch-service'
+import type {
+  CanvasImageCandidateBatchChangedListener,
+  CanvasImageCandidateBatchService,
+} from './canvas-image-candidate-batch-service'
 import type { DesignJobChangedListener, DesignJobManager } from './design-job-manager'
 import { isSafeDesignStableId } from './design-paths'
 import type { CanvasToolRunContext } from './canvas-tool-provider'
@@ -27,6 +30,12 @@ export interface CanvasImageBatchWaitInput extends CanvasTarget {
   deadlineAt: number
 }
 
+/** 取消图片批次任务时必须携带的完整所有权身份。 */
+export interface CanvasImageBatchCancelInput extends CanvasTarget {
+  batchId: string
+  taskIds: readonly string[]
+}
+
 /** Canvas 图片运行服务的最小公开合同。 */
 export interface CanvasImageRunService {
   run(
@@ -36,7 +45,7 @@ export interface CanvasImageRunService {
     operationId: string,
   ): Promise<CanvasRunNodesResult>
   awaitBatch(input: CanvasImageBatchWaitInput): Promise<CanvasRunNodesBatchSummary>
-  cancelTasks(projectId: string, taskIds: readonly string[]): Promise<void>
+  cancelTasks(input: CanvasImageBatchCancelInput): Promise<void>
 }
 
 /** 图片运行服务复用的生产单例依赖。 */
@@ -55,7 +64,7 @@ export interface CanvasImageRunServiceDependencies {
     'preflightCanvasImage' | 'createCanvasImageOnce' | 'rollbackCanvasImageOnce'
     | 'run' | 'cancel' | 'getProjectJob' | 'onChanged'
   >
-  candidateBatches: Pick<CanvasImageCandidateBatchService, 'createBatchLocked' | 'load'>
+  candidateBatches: Pick<CanvasImageCandidateBatchService, 'createBatchLocked' | 'load' | 'onChanged'>
   getProjectReadOnlyReason: (projectId: string) => string | undefined
 }
 
@@ -156,7 +165,8 @@ export function createCanvasImageRunService(
     if (batch.projectId !== input.projectId
       || batch.canvasId !== input.canvasId
       || batch.batchId !== input.batchId
-      || batch.entries.length > MAX_IMAGE_RUN_TASKS) {
+      || batch.entries.length > MAX_IMAGE_RUN_TASKS
+      || batch.entries.length !== input.taskIds.length) {
       throw new Error('CANVAS_IMAGE_BATCH_WAIT_OWNERSHIP_INVALID')
     }
     /** 调用方只能等待本次 run 返回的任务；批次不得悄悄扩入其它任务。 */
@@ -177,20 +187,35 @@ export function createCanvasImageRunService(
     return batch
   }
 
-  /** 取消调用方明确传入且仍属于目标项目的活跃图片任务。 */
-  const cancelTasks = async (projectId: string, taskIds: readonly string[]): Promise<void> => {
-    if (!isSafeDesignStableId(projectId)
-      || taskIds.length > MAX_IMAGE_RUN_TASKS
-      || taskIds.some((taskId) => !isSafeDesignStableId(taskId))) {
+  /** 取消调用方明确持有且仍属于目标 Canvas 候选批次的活跃图片任务。 */
+  const cancelTasks = async (input: CanvasImageBatchCancelInput): Promise<void> => {
+    if (!isSafeDesignStableId(input.projectId)
+      || !isSafeDesignStableId(input.canvasId)
+      || !isSafeDesignStableId(input.batchId)
+      || !Array.isArray(input.taskIds)
+      || input.taskIds.length === 0
+      || input.taskIds.length > MAX_IMAGE_RUN_TASKS
+      || new Set(input.taskIds).size !== input.taskIds.length
+      || input.taskIds.some((taskId) => !isSafeDesignStableId(taskId))) {
       throw new Error('CANVAS_IMAGE_TASK_CANCEL_INPUT_INVALID')
     }
-    /** 稳定去重防止同一任务被重复取消。 */
-    const uniqueTaskIds = [...new Set(taskIds)]
-    for (const taskId of uniqueTaskIds) {
-      /** 每次取消前 fresh-read 项目归属与活跃状态。 */
-      const job = dependencies.imageJobs.getProjectJob(projectId, taskId)
-      if (!job || !ACTIVE_JOB_STATUSES.has(job.status)) continue
-      await dependencies.imageJobs.cancel(projectId, taskId)
+    const batch = await loadOwnedBatch(input)
+    /** 批次条目提供节点与模块身份，每次取消前仍 fresh-read Job 防止竞态越权。 */
+    for (const entry of batch.entries) {
+      const job = dependencies.imageJobs.getProjectJob(input.projectId, entry.jobId)
+      const imageTarget: CanvasImageTarget = {
+        projectId: input.projectId,
+        canvasId: input.canvasId,
+        nodeId: entry.nodeId,
+        imageModuleId: entry.imageModuleId,
+      }
+      if (!job
+        || job.candidateBatchId !== input.batchId
+        || !isOwnedImageJob(job, imageTarget)) {
+        throw new Error('CANVAS_IMAGE_BATCH_WAIT_OWNERSHIP_INVALID')
+      }
+      if (!ACTIVE_JOB_STATUSES.has(job.status)) continue
+      await dependencies.imageJobs.cancel(input.projectId, entry.jobId)
     }
   }
 
@@ -414,8 +439,6 @@ export function createCanvasImageRunService(
     let wakeListener: (() => void) | null = null
     /** 当前 deadline timer；相关事件先到时立即清除。 */
     let deadlineTimer: ReturnType<typeof setTimeout> | null = null
-    /** 同一事件循环拍内的相关 Job 变化只安排一次批次重读。 */
-    let eventTimer: ReturnType<typeof setTimeout> | null = null
     /** 当前 AbortSignal 临时监听器；任一唤醒路径都必须显式移除。 */
     let abortListener: (() => void) | null = null
     /** 只接纳同项目、同 Canvas、同候选批次的 Job 变化。 */
@@ -424,16 +447,21 @@ export function createCanvasImageRunService(
         || job.candidateBatchId !== input.batchId
         || job.target?.kind !== 'canvas-image'
         || job.target.canvasId !== input.canvasId) return
-      if (eventTimer) return
-      /** Job Manager 先发布任务状态、再登记候选终态；下一拍读取可覆盖该顺序。 */
-      eventTimer = setTimeout(() => {
-        eventTimer = null
-        changeVersion += 1
-        wakeListener?.()
-      }, 0)
+      changeVersion += 1
+      wakeListener?.()
     }
-    /** 临时监听只覆盖当前 await 调用。 */
-    const unsubscribe = dependencies.imageJobs.onChanged(onChanged)
+    /** 候选 ack 只在权威批次状态保存完成后发出，不依赖事件循环时序猜测。 */
+    const onBatchChanged: CanvasImageCandidateBatchChangedListener = (event) => {
+      if (event.projectId !== input.projectId
+        || event.canvasId !== input.canvasId
+        || event.batchId !== input.batchId
+        || !input.taskIds.includes(event.jobId)) return
+      changeVersion += 1
+      wakeListener?.()
+    }
+    /** 两类临时监听只覆盖当前 await 调用，并在所有终态路径退订。 */
+    const unsubscribeJob = dependencies.imageJobs.onChanged(onChanged)
+    const unsubscribeBatch = dependencies.candidateBatches.onChanged(onBatchChanged)
     try {
       while (true) {
         if (input.signal.aborted) throw new Error('CANVAS_IMAGE_BATCH_WAIT_ABORTED')
@@ -480,17 +508,15 @@ export function createCanvasImageRunService(
         && (error.message === 'CANVAS_IMAGE_BATCH_WAIT_ABORTED'
           || error.message === 'CANVAS_IMAGE_BATCH_WAIT_DEADLINE')) {
         /** 只取消输入任务中仍属于当前批次与 Canvas 的活跃 Job。 */
-        const batch = await loadOwnedBatch(input)
-        const ownedTaskIds = batch.entries.map((entry) => entry.jobId)
-        await cancelTasks(input.projectId, ownedTaskIds)
+        await cancelTasks(input)
       }
       throw error
     } finally {
       wakeListener = null
       if (abortListener) input.signal.removeEventListener('abort', abortListener)
       if (deadlineTimer) clearTimeout(deadlineTimer)
-      if (eventTimer) clearTimeout(eventTimer)
-      unsubscribe()
+      unsubscribeBatch()
+      unsubscribeJob()
     }
   }
 
