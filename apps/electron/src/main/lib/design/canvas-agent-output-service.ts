@@ -73,6 +73,12 @@ export interface CanvasAgentOutputServiceDependencies {
   publish: (target: CanvasTarget, document: CanvasDocument) => void | Promise<void>
 }
 
+/** 单节点当前 owner 已提交的最高运行代次；owner 换绑后旧代次立即失效。 */
+interface CanvasCommittedRunGeneration {
+  agentSessionId: string
+  generation: number
+}
+
 /** 判断数值可安全作为单调运行或时间事实。 */
 function isNonNegativeSafeInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0
@@ -161,8 +167,8 @@ function isSamePointer(left: CanvasAgentOutputPointer | undefined, right: Canvas
 export function createCanvasAgentOutputService(
   dependencies: CanvasAgentOutputServiceDependencies,
 ): CanvasAgentOutputService {
-  /** 当前进程各节点已提交的最高运行代次，阻止旧回调覆盖新事实。 */
-  const committedRunGenerations = new Map<string, number>()
+  /** 当前进程各节点当前 owner 已提交的最高运行代次，阻止旧回调覆盖新事实。 */
+  const committedRunGenerations = new Map<string, CanvasCommittedRunGeneration>()
   /** 目标键只用于进程内代次仲裁，不持久化或对外暴露 session。 */
   const targetKey = (target: CanvasAgentTarget): string => (
     `${target.projectId}\0${target.canvasId}\0${target.nodeId}`
@@ -211,13 +217,21 @@ export function createCanvasAgentOutputService(
       const key = targetKey(input.target)
       /** 锁内结果延后到 lease 外发布。 */
       const locked = await dependencies.runExclusive(input.target, async () => {
-        const latestGeneration = committedRunGenerations.get(key)
+        /** stale 仲裁必须基于锁内 fresh owner，节点重建后的新 session 从 generation 1 重新计数。 */
+        const initialOwner = requireOwner(dependencies, input.target)
+        const committedRun = committedRunGenerations.get(key)
+        const latestGeneration = committedRun?.agentSessionId === initialOwner.node.agentSessionId
+          ? committedRun.generation
+          : undefined
         if (latestGeneration !== undefined && input.runGeneration < latestGeneration) {
           throw new Error('CANVAS_AGENT_OUTPUT_STALE')
         }
         const resolved = resolveCompletedOutput(input)
         /** 第二次 fresh-read 与 mutation 共处同一临界区，抵御解析期间换绑。 */
         const owner = requireOwner(dependencies, input.target)
+        if (owner.node.agentSessionId !== initialOwner.node.agentSessionId) {
+          throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
+        }
         if (latestGeneration === input.runGeneration) {
           if (!isSamePointer(owner.node.outputPointer, resolved.pointer)) {
             throw new Error('CANVAS_AGENT_OUTPUT_STALE')
@@ -248,7 +262,10 @@ export function createCanvasAgentOutputService(
           owner.document.revision,
           [{ type: 'upsert-nodes', nodes: dependencyProjection.nodes }],
         )
-        committedRunGenerations.set(key, input.runGeneration)
+        committedRunGenerations.set(key, {
+          agentSessionId: owner.node.agentSessionId,
+          generation: input.runGeneration,
+        })
         return {
           document,
           result: {

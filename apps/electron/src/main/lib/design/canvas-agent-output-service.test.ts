@@ -15,6 +15,9 @@ const firstUuid = '123e4567-e89b-42d3-a456-426614174001'
 const lastUuid = '123e4567-e89b-42d3-a456-426614174002'
 const oldAnchorUuid = '123e4567-e89b-42d3-a456-426614174098'
 const anchorUuid = '123e4567-e89b-42d3-a456-426614174099'
+/** replacement session 使用独立锚点和回复，证明不会复用旧会话 run。 */
+const replacementAnchorUuid = '123e4567-e89b-42d3-a456-426614174095'
+const replacementMessageUuid = '123e4567-e89b-42d3-a456-426614174094'
 
 /** 创建完整 Canvas 内部会话归属。 */
 function createSession(overrides: Partial<AgentSessionMeta> = {}): AgentSessionMeta {
@@ -129,6 +132,21 @@ function createFixture(options: { messages?: SDKMessage[]; publishError?: Error 
     getPublishStates: () => [...publishStates],
     setMessages: (next: SDKMessage[]) => { messages = next },
     setSession: (next: AgentSessionMeta) => { session = next },
+    /** 模拟同一节点重建：owner 换绑新 session，并清除旧正式输出指针。 */
+    replaceAgentOwner: (nextSessionId: string, nextMessages: SDKMessage[]) => {
+      session = createSession({ id: nextSessionId })
+      messages = nextMessages
+      document = {
+        ...document,
+        revision: document.revision + 1,
+        nodes: document.nodes.map((node) => {
+          if (node.id !== target.nodeId || node.kind !== 'agent') return node
+          const replacement = { ...node, agentSessionId: nextSessionId }
+          delete replacement.outputPointer
+          return replacement
+        }),
+      }
+    },
   }
 }
 
@@ -281,5 +299,34 @@ describe('Canvas Agent 正式输出服务', () => {
     }))).rejects.toThrow('CANVAS_AGENT_OUTPUT_STALE')
     expect(fixture.getDocument()).toEqual(committed)
     expect(fixture.getMutateCalls()).toBe(1)
+  })
+
+  test('Given 旧 session 高代次已提交且同节点重建 When 新 session generation 1 完成且旧回调迟到 Then 新输出可提交且旧输出 fail closed', async () => {
+    const generationTwoAnchor = '123e4567-e89b-42d3-a456-426614174093'
+    const fixture = createFixture({
+      messages: [user(generationTwoAnchor), assistant(lastUuid, [{ type: 'text', text: '旧会话第二代' }])],
+    })
+    await fixture.service.commit(completion({
+      userMessageUuid: generationTwoAnchor, runGeneration: 2, completedAt: 80,
+    }))
+    fixture.replaceAgentOwner('session-2', [
+      user(replacementAnchorUuid),
+      assistant(replacementMessageUuid, [{ type: 'text', text: '新会话第一代' }]),
+    ])
+
+    const replacement = await fixture.service.commit(completion({
+      userMessageUuid: replacementAnchorUuid, runGeneration: 1, completedAt: 120,
+    }))
+    const committedReplacement = fixture.getDocument()
+
+    expect(replacement.pointer.messageUuid).toBe(replacementMessageUuid)
+    expect(committedReplacement.nodes[0]).toMatchObject({
+      agentSessionId: 'session-2', outputPointer: replacement.pointer,
+    })
+    await expect(fixture.service.commit(completion({
+      userMessageUuid: generationTwoAnchor, runGeneration: 3, completedAt: 150,
+    }))).rejects.toThrow('CANVAS_AGENT_OUTPUT_INVALID')
+    expect(fixture.getDocument()).toEqual(committedReplacement)
+    expect(fixture.getMutateCalls()).toBe(2)
   })
 })
