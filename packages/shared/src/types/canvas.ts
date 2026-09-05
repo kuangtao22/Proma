@@ -306,6 +306,16 @@ export function parseCanvasTrashEntry(value: unknown): CanvasTrashEntry {
 /** 单个节点最多保留的未消费直接上游来源数。 */
 export const CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS = 128
 
+/**
+ * 按 JavaScript UTF-16 code unit 比较 Canvas 稳定 ID，避免宿主 locale 改变持久化顺序。
+ * @param left 左侧稳定 ID。
+ * @param right 右侧稳定 ID。
+ * @returns 左侧较小时为 -1，较大时为 1，相等时为 0。
+ */
+export function compareCanvasStableIds(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
 /** Canvas 节点共享的展示和布局字段。 */
 export interface CanvasNodeUpstreamChange {
   /** 本次变化的直接上游节点，按稳定 ID 排序且去重。 */
@@ -3088,7 +3098,9 @@ function parseCanvasNodeUpstreamChange(value: unknown): CanvasNodeUpstreamChange
   }
   /** 规范化后的上游 ID 必须已经按稳定次序持久化。 */
   const sourceNodeIds = [...value.sourceNodeIds] as string[]
-  if (sourceNodeIds.some((nodeId, index) => index > 0 && sourceNodeIds[index - 1]!.localeCompare(nodeId) >= 0)) {
+  if (sourceNodeIds.some((nodeId, index) => (
+    index > 0 && compareCanvasStableIds(sourceNodeIds[index - 1]!, nodeId) >= 0
+  ))) {
     throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
   }
   return { sourceNodeIds, changedAt: value.changedAt }

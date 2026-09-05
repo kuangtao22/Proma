@@ -28,6 +28,7 @@ import {
 } from './canvas-document-store'
 import type { CanvasDocumentStoreOptions } from './canvas-document-store'
 import { CanvasSessionStore } from './canvas-session-store'
+import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
 import { createDesignPathResolver } from './design-paths'
 import type { DesignPathResolver } from './design-paths'
 import { writeJsonFileAtomicSecure } from '../safe-file'
@@ -188,6 +189,57 @@ describe('CanvasDocumentStore', () => {
       }],
       edges: [],
     }, document)).toThrow('CANVAS_DOCUMENT_INVALID')
+  })
+
+  test('Given 大小写与标点来源的依赖投影 When 真实 Store mutate Then 可持久化并重新解析', () => {
+    const fixture = createFixture()
+    const document: CanvasDocument = {
+      ...createEmptyCanvasDocument('project-1', 'canvas-1', 20),
+      revision: 2,
+      updatedAt: 22,
+      nodes: [
+        {
+          id: 'A', kind: 'document', title: '大写来源', position: { x: 0, y: 0 },
+          documentId: 'content-upper', contentRevision: 1,
+        },
+        {
+          id: 'a-', kind: 'document', title: '标点来源', position: { x: 10, y: 0 },
+          documentId: 'content-punctuation', contentRevision: 1,
+        },
+        {
+          id: 'downstream', kind: 'document', title: '下游', position: { x: 20, y: 0 },
+          documentId: 'content-downstream', contentRevision: 1,
+          upstreamChange: { sourceNodeIds: ['a', 'a_'], changedAt: 10 },
+        },
+      ],
+      edges: [
+        {
+          id: 'edge-upper', sourceNodeId: 'A', sourcePort: 'document.markdown',
+          targetNodeId: 'downstream', targetPort: 'context.text', relation: 'depends-on',
+        },
+        {
+          id: 'edge-punctuation', sourceNodeId: 'a-', sourcePort: 'document.markdown',
+          targetNodeId: 'downstream', targetPort: 'context.text', relation: 'derives',
+        },
+      ],
+    }
+    writeDocument(fixture.documentPath, document)
+    /** 使用生产依赖服务生成 Store 将实际持久化的节点 mutation。 */
+    const projection = createCanvasDependencyStateService().consumeAndPropagate({
+      document,
+      producerNodeIds: ['a-', 'A'],
+      changedAt: 30,
+    })
+
+    const updated = fixture.store.mutate(
+      document,
+      document.revision,
+      [{ type: 'upsert-nodes', nodes: projection.nodes }],
+    )
+
+    expect(updated.nodes.find((node) => node.id === 'downstream')?.upstreamChange)
+      .toEqual({ sourceNodeIds: ['A', 'a', 'a-', 'a_'], changedAt: 30 })
+    expect(fixture.store.load(document).document).toEqual(updated)
   })
 
   test('Given v4 历史边使用 output/input When 加载 Then 保留原端口并作为未解析关系返回', () => {

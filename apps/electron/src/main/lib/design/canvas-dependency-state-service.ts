@@ -1,5 +1,6 @@
 import {
   CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS,
+  compareCanvasStableIds,
   resolveCanvasEdgeBinding,
 } from '@proma/shared'
 import type { CanvasDocument, CanvasNode } from '@proma/shared'
@@ -66,7 +67,7 @@ export function createCanvasDependencyStateService(): CanvasDependencyStateServi
         const sourceNodeIds = [...new Set([
           ...(node.upstreamChange?.sourceNodeIds ?? []),
           ...changedSources,
-        ])].sort()
+        ])].sort(compareCanvasStableIds)
         if (sourceNodeIds.length > CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS) {
           throw new Error('CANVAS_DEPENDENCY_SOURCE_LIMIT_EXCEEDED')
         }
@@ -80,7 +81,7 @@ export function createCanvasDependencyStateService(): CanvasDependencyStateServi
       }
       return {
         nodes,
-        downstreamNodeIds: [...changedSourcesByNodeId.keys()].sort(),
+        downstreamNodeIds: [...changedSourcesByNodeId.keys()].sort(compareCanvasStableIds),
       }
     },
   }

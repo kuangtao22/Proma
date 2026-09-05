@@ -387,6 +387,19 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given 大小写与标点稳定 ID 按 code-unit 排序 When 解析工作区快照 Then 保留确定性顺序', () => {
+    const document = structuredClone(createDocument())
+    document.nodes[0] = {
+      ...document.nodes[0]!,
+      upstreamChange: { sourceNodeIds: ['A', 'a', 'a-', 'a_'], changedAt: 100 },
+    }
+    /** 公开 parser 必须接受与持久化生产者相同的 locale-independent 顺序。 */
+    const snapshot = parseCanvasWorkspaceSnapshot({ document, writable: true, nodeIssues: [] })
+
+    expect(snapshot.document.nodes[0]?.upstreamChange?.sourceNodeIds)
+      .toEqual(['A', 'a', 'a-', 'a_'])
+  })
+
   test('Given 上游来源达到共享上限 When 解析工作区快照 Then 接受 128 并拒绝 129', () => {
     expect(CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS).toBe(128)
     const document = structuredClone(createDocument())

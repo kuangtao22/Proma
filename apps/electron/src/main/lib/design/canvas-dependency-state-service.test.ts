@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { createCanvasBoundEdge } from '@proma/shared'
+import { createCanvasBoundEdge, parseCanvasWorkspaceSnapshot } from '@proma/shared'
 import type { CanvasDocument, CanvasNode } from '@proma/shared'
 import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
 
@@ -46,6 +46,45 @@ function connectProducer(document: CanvasDocument, producer: CanvasNode, downstr
 }
 
 describe('Canvas Dependency State Service', () => {
+  test('Given 大小写与标点来源 When 合并传播 Then 投影可通过 shared parser round-trip', () => {
+    const service = createCanvasDependencyStateService()
+    const producerUpper = createDocumentNode('A')
+    const producerPunctuation = createDocumentNode('a-')
+    const downstream = createDocumentNode('downstream', ['a', 'a_'])
+    const document = createDocument([producerUpper, producerPunctuation, downstream])
+    document.edges = [
+      createCanvasBoundEdge(producerUpper, downstream, {
+        id: 'edge-upper', sourceNodeId: producerUpper.id,
+        targetNodeId: downstream.id, relation: 'depends-on',
+      }),
+      createCanvasBoundEdge(producerPunctuation, downstream, {
+        id: 'edge-punctuation', sourceNodeId: producerPunctuation.id,
+        targetNodeId: downstream.id, relation: 'derives',
+      }),
+    ]
+
+    const result = service.consumeAndPropagate({
+      document,
+      producerNodeIds: [producerPunctuation.id, producerUpper.id],
+      changedAt: 20,
+    })
+    /** 把纯投影按真实 reducer 的节点替换语义合回文档。 */
+    const replacements = new Map(result.nodes.map((node) => [node.id, node]))
+    const projectedDocument = {
+      ...document,
+      nodes: document.nodes.map((node) => replacements.get(node.id) ?? node),
+    }
+    /** shared round-trip 是 Renderer 接收该图事实的公开边界。 */
+    const snapshot = parseCanvasWorkspaceSnapshot({
+      document: projectedDocument,
+      writable: true,
+      nodeIssues: [],
+    })
+
+    expect(snapshot.document.nodes.find((node) => node.id === downstream.id)?.upstreamChange)
+      .toEqual({ sourceNodeIds: ['A', 'a', 'a-', 'a_'], changedAt: 20 })
+  })
+
   test('Given producer 已有待更新来源 When 提交正式输出 Then 清除自身提示并保持无关节点语义不变', () => {
     const service = createCanvasDependencyStateService()
     const producer = createDocumentNode('producer', ['older-source'])

@@ -14,6 +14,7 @@ import {
   applyCanvasMutations,
   CANVAS_DOCUMENT_VERSION,
   CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS,
+  compareCanvasStableIds,
   createEmptyCanvasDocument,
   isCanvasArtifactInputSlot,
   isCanvasArtifactOutputCapability,
@@ -383,7 +384,7 @@ function parseCanvasNode(
       || !rawSourceNodeIds.every(isSafeDesignStableId)
       || new Set(rawSourceNodeIds).size !== rawSourceNodeIds.length
       || rawSourceNodeIds.some((nodeId, index) => (
-        index > 0 && String(rawSourceNodeIds[index - 1]).localeCompare(String(nodeId)) >= 0
+        index > 0 && compareCanvasStableIds(String(rawSourceNodeIds[index - 1]), String(nodeId)) >= 0
       ))
       || !Number.isSafeInteger(rawChange.changedAt)
       || (rawChange.changedAt as number) < 0) {

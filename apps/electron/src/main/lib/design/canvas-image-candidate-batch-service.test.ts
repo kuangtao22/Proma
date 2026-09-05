@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto'
 import { describe, expect, test } from 'bun:test'
-import type {
-  CanvasDocument,
-  CanvasImageCandidateBatch,
-  CanvasImageModuleConfig,
-  CanvasNode,
-  CanvasTarget,
+import {
+  parseCanvasWorkspaceSnapshot,
+  type CanvasDocument,
+  type CanvasImageCandidateBatch,
+  type CanvasImageModuleConfig,
+  type CanvasNode,
+  type CanvasTarget,
 } from '@proma/shared'
 import { createCanvasImageCandidateBatchService } from './canvas-image-candidate-batch-service'
 import type { CanvasImageCandidateAdoptionIntent } from './canvas-image-candidate-batch-store'
@@ -499,6 +500,53 @@ describe('Canvas 图片候选批次 Service', () => {
     expect(fixture.configs.get('node-0')).toEqual(beforeConfig)
     expect(fixture.batches.get('batch-limit')).toEqual(beforeBatch)
     expect(fixture.canvas).toEqual(beforeCanvas)
+  })
+
+  test('Given 图片节点与旧来源只在标点上不同 When 采用并重复恢复 Then 图可解析且 intent 哈希确定', async () => {
+    const fixture = createFixture()
+    const downstream: CanvasNode = {
+      id: 'downstream-case', kind: 'document', title: '排序下游', position: { x: 0, y: 100 },
+      documentId: 'document-case', contentRevision: 1,
+      upstreamChange: { sourceNodeIds: ['node_0'], changedAt: 80 },
+    }
+    fixture.canvas = {
+      ...fixture.canvas,
+      nodes: [...fixture.canvas.nodes, downstream],
+      edges: [{
+        id: 'edge-case', sourceNodeId: 'node-0', sourcePort: 'image.asset',
+        targetNodeId: downstream.id, targetPort: 'context.image', relation: 'depends-on',
+      }],
+    }
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-case', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+    })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, jobId: 'job-0', status: 'succeeded', outputAssetId: 'new-0', error: null,
+    })
+
+    await expect(fixture.service.adopt({
+      ...fixture.target, batchId: 'batch-case', mode: 'all',
+    })).resolves.toMatchObject({ status: 'adopted' })
+    /** 首次采用固化的图哈希用于证明重复恢复不会漂移。 */
+    const expectedGraphSha256 = fixture.intents.get('operation-1')?.expectedGraphSha256
+    /** 首次采用后的 revision 用于证明重复恢复不产生额外提交。 */
+    const adoptedRevision = fixture.canvas.revision
+
+    expect(() => parseCanvasWorkspaceSnapshot({
+      document: fixture.canvas,
+      writable: true,
+      nodeIssues: [],
+    })).not.toThrow()
+    expect(fixture.canvas.nodes.find((node) => node.id === downstream.id)?.upstreamChange)
+      .toEqual({ sourceNodeIds: ['node-0', 'node_0'], changedAt: 100 })
+
+    await fixture.service.reconcile(fixture.target)
+    await fixture.service.reconcile(fixture.target)
+
+    expect(fixture.intents.get('operation-1')?.expectedGraphSha256).toBe(expectedGraphSha256)
+    expect(fixture.canvas.revision).toBe(adoptedRevision)
+    expect(fixture.configs.get('node-0')?.revision).toBe(2)
   })
 
   test.each(['after-first-module', 'after-all-modules', 'after-graph', 'after-batch'] as const)(
