@@ -1430,7 +1430,8 @@ function parseCanvasWorkflowImageSummary(value: unknown): CanvasWorkflowImageSum
     || !isCanvasNonNegativeInteger(value.runningCount)
     || value.candidateCount > value.totalCount
     || value.failedCount > value.totalCount
-    || value.runningCount > value.totalCount) {
+    || value.runningCount > value.totalCount
+    || value.candidateCount + value.failedCount + value.runningCount > value.totalCount) {
     throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
   }
   return {

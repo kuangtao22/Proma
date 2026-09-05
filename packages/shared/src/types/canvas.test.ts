@@ -165,6 +165,12 @@ describe('Canvas Agent 工作流公开合同', () => {
       ...result,
       nodes: [{ nodeId: 'agent-1', status: 'failed', errorCode: 'x'.repeat(121) }],
     })).toThrow()
+    expect(() => parseCanvasRunWorkflowResult({
+      ...result,
+      imageSummary: {
+        status: 'partial', totalCount: 1, candidateCount: 1, failedCount: 1, runningCount: 1,
+      },
+    })).toThrow()
   })
 })
 
