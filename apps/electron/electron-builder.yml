@@ -165,6 +165,8 @@ win:
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
+  # 复用 electron-builder 安装状态，只增加旧版本与安装位置摘要页。
+  include: resources/installer.nsh
   createDesktopShortcut: true
   createStartMenuShortcut: true
 

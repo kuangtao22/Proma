@@ -211,12 +211,18 @@ test('Windows 升级安装器展示既有版本和目录并保留完整性校验
 
   expect(config.nsis?.include).toBe('resources/installer.nsh')
   expect(installerSource).toContain('!macro customPageAfterChangeDir')
-  expect(installerSource).toContain('ReadRegStr $upgradeInstallLocation')
-  expect(installerSource).toContain('"${INSTALL_REGISTRY_KEY}" InstallLocation')
-  expect(installerSource).toContain('ReadRegStr $upgradeDisplayVersion')
-  expect(installerSource).toContain('"${UNINSTALL_REGISTRY_KEY}" DisplayVersion')
+  expect(installerSource).toContain(
+    'ReadRegStr $upgradeInstallLocation SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}" InstallLocation',
+  )
+  expect(installerSource).toContain(
+    'ReadRegStr $upgradeDisplayVersion SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" DisplayVersion',
+  )
   expect(installerSource).toContain('StrCpy $upgradeDisplayVersion "未知版本"')
   expect(installerSource).toMatch(/\$upgradeInstallLocation == ""[\s\S]*Abort/)
+  expect(installerSource).toContain('$INSTDIR')
+  expect(installerSource).toContain('${VERSION}')
+  expect(installerSource).not.toContain('uninstallOldVersion')
+  expect(installerSource).not.toContain('SetOutPath')
   expect(installerSource).not.toContain('/NCRC')
 })
 
