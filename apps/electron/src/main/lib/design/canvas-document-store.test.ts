@@ -203,6 +203,21 @@ describe('CanvasDocumentStore', () => {
     expect((loaded.document.nodes[1] as { outputPointer: object }).outputPointer).not.toBe(outputPointer)
   })
 
+  test('Given schema v4 Agent 节点指针 When 直接解析 Then 文档与持久化载荷均不复用输入引用', () => {
+    const outputPointer = {
+      messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+      contentSha256: 'd'.repeat(64),
+      completedAt: 100,
+    }
+    const document = createConnectedDocument()
+    document.nodes[0] = { ...document.nodes[0] as CanvasAgentNode, outputPointer }
+
+    const parsed = parseCanvasDocument(document, { projectId: 'project-1', canvasId: 'canvas-1' })
+
+    expect((parsed.document.nodes[0] as CanvasAgentNode).outputPointer).not.toBe(outputPointer)
+    expect((parsed.persistencePayload.nodes[0] as CanvasAgentNode).outputPointer).not.toBe(outputPointer)
+  })
+
   test.each([
     ['非法 UUID', { messageUuid: 'bad', contentSha256: 'a'.repeat(64), completedAt: 100 }],
     ['大写哈希', { messageUuid: '123e4567-e89b-42d3-a456-426614174000', contentSha256: 'A'.repeat(64), completedAt: 100 }],
@@ -445,6 +460,27 @@ describe('CanvasDocumentStore', () => {
     expect(() => parseCanvasDocument(document, {
       projectId: 'project-1', canvasId: 'canvas-1',
     })).toThrow('CANVAS_DOCUMENT_INVALID')
+  })
+
+  test.each([2, 3])('Given schema v%s Agent 携带 v4 outputPointer When 解析 Then 历史版本拒绝', (schemaVersion) => {
+    const document = createConnectedDocument()
+    const agent = document.nodes[0] as CanvasAgentNode
+    const legacy = {
+      ...document,
+      schemaVersion,
+      nodes: [{
+        ...agent,
+        outputPointer: {
+          messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+          contentSha256: 'e'.repeat(64),
+          completedAt: 100,
+        },
+      }],
+      edges: [],
+    }
+
+    expect(() => parseCanvasDocument(legacy, { projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow('CANVAS_DOCUMENT_INVALID')
   })
 
   test('Given v3 WebView 缺少设备预设 When 解析 Then 严格拒绝而不静默补值', () => {
@@ -1394,6 +1430,69 @@ describe('CanvasDocumentStore', () => {
         { id: 'duplicate', kind: 'agent', title: '二', position: { x: 1, y: 1 }, agentSessionId: 'session-2' },
       ], internal: true }],
     )).toThrow('CANVAS_MUTATION_INVALID')
+  })
+
+  test('Given Agent batch 改写正式输出指针 When 验证或规划 Then 拒绝篡改但允许原指针随结构更新', () => {
+    const fixture = createFixture()
+    const document = createConnectedDocument()
+    const agent = document.nodes[0] as CanvasAgentNode
+    const outputPointer = {
+      messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+      contentSha256: 'f'.repeat(64),
+      completedAt: 100,
+    }
+    document.nodes[0] = { ...agent, outputPointer }
+    writeDocument(fixture.documentPath, document)
+    const changedPointer = { ...outputPointer, contentSha256: '0'.repeat(64) }
+    const forgedOperations = [
+      [{ type: 'upsert-nodes', nodes: [{ ...agent, outputPointer: changedPointer }] }],
+      [{ type: 'upsert-nodes', nodes: [{ ...agent }] }],
+      [{ type: 'upsert-nodes', nodes: [{
+        ...agent, id: 'new-agent', agentSessionId: 'new-session', outputPointer,
+      }] }],
+    ]
+
+    for (const operations of forgedOperations) {
+      expect(() => fixture.store.validateBatchOperations(
+        { projectId: 'project-1', canvasId: 'canvas-1' }, document.revision, operations,
+      )).toThrow('CANVAS_MUTATION_INVALID')
+      expect(() => fixture.store.planBatchOperations(
+        { projectId: 'project-1', canvasId: 'canvas-1' }, document.revision, operations,
+      )).toThrow('CANVAS_MUTATION_INVALID')
+    }
+
+    const unchangedPointerOperations = [{
+      type: 'upsert-nodes', nodes: [{ ...agent, title: '更新标题', outputPointer: { ...outputPointer } }],
+    }] satisfies CanvasMutation[]
+    expect(fixture.store.validateBatchOperations(
+      { projectId: 'project-1', canvasId: 'canvas-1' }, document.revision, unchangedPointerOperations,
+    )).toEqual(unchangedPointerOperations)
+    expect(fixture.store.planBatchOperations(
+      { projectId: 'project-1', canvasId: 'canvas-1' }, document.revision, unchangedPointerOperations,
+    ).expectedDocument.nodes[0]).toMatchObject({ title: '更新标题', outputPointer })
+  })
+
+  test('Given 可信服务写入 Agent 正式输出指针 When 保存 mutation Then 允许更新并持久化', () => {
+    const fixture = createFixture()
+    const document = createConnectedDocument()
+    const agent = document.nodes[0] as CanvasAgentNode
+    /** 正式输出服务通过可信 mutate 入口提交完整内容寻址指针。 */
+    const outputPointer = {
+      messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+      contentSha256: '1'.repeat(64),
+      completedAt: 200,
+    }
+    writeDocument(fixture.documentPath, document)
+
+    const updated = fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      document.revision,
+      [{ type: 'upsert-nodes', nodes: [{ ...agent, outputPointer }] }],
+    )
+
+    expect(updated.nodes[0]).toMatchObject({ outputPointer })
+    expect(fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' }).document.nodes[0])
+      .toMatchObject({ outputPointer })
   })
 
   test('Given 顺序 batch mutation When 规划 Then 返回同一基线上的最终文档且不写盘', () => {

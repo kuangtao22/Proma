@@ -1140,13 +1140,15 @@ export class CanvasAgentNodeCreationService {
         throw new Error(`Canvas Agent 重建节点归属损坏: ${intent.nodeId}`)
       }
       if (node.agentSessionId === intent.previousSessionId) {
+        /** 旧会话输出不属于 replacement session，换绑时必须显式移除。 */
+        const { outputPointer: _outputPointer, ...nodeWithoutOutput } = node
         /** 只替换 session 引用，节点身份、布局、标题和全部边保持不变。 */
         document = this.dependencies.store.mutate(
           { projectId: intent.projectId, canvasId: intent.canvasId },
           document.revision,
           [{
             type: 'upsert-nodes',
-            nodes: [{ ...node, agentSessionId: intent.replacementSessionId }],
+            nodes: [{ ...nodeWithoutOutput, agentSessionId: intent.replacementSessionId }],
           }],
         )
       } else if (node.agentSessionId !== intent.replacementSessionId) {

@@ -636,7 +636,15 @@ describe('Canvas Agent 节点创建事务', () => {
       ...document,
       nodes: [
         ...document.nodes.map((node) => (
-          node.id === 'node-1' ? { ...node, position: { x: 360, y: 240 } } : node
+          node.id === 'node-1' ? {
+            ...node,
+            position: { x: 360, y: 240 },
+            outputPointer: {
+              messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+              contentSha256: 'a'.repeat(64),
+              completedAt: 100,
+            },
+          } : node
         )),
         {
           id: 'image-1',
@@ -669,6 +677,8 @@ describe('Canvas Agent 节点创建事务', () => {
       position: { x: 360, y: 240 },
       agentSessionId: REPLACEMENT_SESSION_ID,
     })
+    expect(result.snapshot.document.nodes.find((node) => node.id === 'node-1'))
+      .not.toHaveProperty('outputPointer')
     expect(result.snapshot.document.edges).toEqual(harness.getDocument().edges)
     expect(result.snapshot.nodeIssues).toEqual([])
     expect(result.session.id).toBe(REPLACEMENT_SESSION_ID)

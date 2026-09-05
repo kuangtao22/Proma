@@ -164,6 +164,12 @@ function hasExactCanvasKeys(value: unknown, keys: readonly string[]): value is R
     && actualKeys.every((key, index) => key === expectedKeys[index])
 }
 
+/** 判断数组每个索引都实际存在，拒绝会跳过 every/map 回调的空洞。 */
+function isDenseCanvasArray(value: unknown): value is unknown[] {
+  return Array.isArray(value)
+    && Array.from({ length: value.length }, (_, index) => Object.hasOwn(value, index)).every(Boolean)
+}
+
 /** 判断未知值是否为非负安全整数。 */
 function isCanvasNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
@@ -1303,23 +1309,36 @@ export interface CanvasWorkflowImageSummary {
   runningCount: number
 }
 
-/** 工作流中单节点的有界公开结果。 */
-export interface CanvasWorkflowNodeResult {
+/** 工作流中单节点结果的公共定位字段。 */
+interface CanvasWorkflowNodeResultBase {
   nodeId: string
-  status: CanvasWorkflowNodeStatus
-  errorCode: string | null
 }
 
-/** 一次 Canvas 工作流的有界公开结果。 */
-export interface CanvasRunWorkflowResult {
-  status: CanvasWorkflowStatus
+/** 工作流中单节点的有界公开结果，失败与阻断必须给出稳定原因。 */
+export type CanvasWorkflowNodeResult = CanvasWorkflowNodeResultBase & (
+  | { status: 'failed' | 'blocked'; errorCode: string }
+  | {
+    status: Exclude<CanvasWorkflowNodeStatus, 'failed' | 'blocked'>
+    errorCode: null
+  }
+)
+
+/** 一次 Canvas 工作流结果的公共字段。 */
+interface CanvasRunWorkflowResultBase {
   initialRevision: number
   finalRevision: number
   nodes: CanvasWorkflowNodeResult[]
   imageSummary: CanvasWorkflowImageSummary | null
-  requiresReview: boolean
-  errorCode: string | null
 }
+
+/** 一次 Canvas 工作流的有界公开结果，终态与审批/错误事实保持一致。 */
+export type CanvasRunWorkflowResult = CanvasRunWorkflowResultBase & (
+  | { status: 'completed'; requiresReview: false; errorCode: null }
+  | { status: 'waiting-review'; requiresReview: true; errorCode: null }
+  | { status: 'failed'; requiresReview: false; errorCode: string }
+  | { status: 'partial'; requiresReview: boolean; errorCode: string | null }
+  | { status: 'cancelled'; requiresReview: false; errorCode: string | null }
+)
 
 /** 判断字符串是否为公开且有界的稳定错误码。 */
 function isCanvasWorkflowErrorCode(value: unknown): value is string | null {
@@ -1352,7 +1371,7 @@ export function parseCanvasRunWorkflowInput(value: unknown): CanvasRunWorkflowIn
   if (!hasExactCanvasKeys(value, keys)
     || !isCanvasLifecycleId(value.canvasId)
     || !isCanvasNonNegativeInteger(value.expectedRevision)
-    || !Array.isArray(value.startNodeIds)
+    || !isDenseCanvasArray(value.startNodeIds)
     || value.startNodeIds.length < 1
     || value.startNodeIds.length > CANVAS_WORKFLOW_START_NODE_LIMIT
     || !value.startNodeIds.every(isCanvasLifecycleId)
@@ -1379,42 +1398,46 @@ export function parseCanvasRunWorkflowInput(value: unknown): CanvasRunWorkflowIn
  * @returns 不含内部会话、素材、路径、异常或完整日志的结果。
  */
 export function parseCanvasRunAgentResult(value: unknown): CanvasRunAgentResult {
-  const keys = [
-    'nodeId', 'status', 'outputPointer', 'affectedDownstreamNodeIds', 'outputSummary', 'errorCode',
-  ] as const
-  if (!hasExactCanvasKeys(value, keys)
-    || !isCanvasLifecycleId(value.nodeId)
-    || (value.status !== 'completed' && value.status !== 'failed' && value.status !== 'cancelled')
-    || (value.outputPointer !== null && value.outputPointer === undefined)
-    || !Array.isArray(value.affectedDownstreamNodeIds)
-    || value.affectedDownstreamNodeIds.length > CANVAS_WORKFLOW_NODE_LIMIT
-    || !value.affectedDownstreamNodeIds.every(isCanvasLifecycleId)
-    || new Set(value.affectedDownstreamNodeIds).size !== value.affectedDownstreamNodeIds.length
-    || typeof value.outputSummary !== 'string'
-    || value.outputSummary.length > CANVAS_AGENT_OUTPUT_SUMMARY_MAX_LENGTH
-    || !isCanvasWorkflowErrorCode(value.errorCode)
-    || (value.status === 'completed' && (value.outputPointer === null || value.errorCode !== null))
-    || (value.status === 'failed' && (value.outputPointer !== null || value.errorCode === null))
-    || (value.status === 'cancelled' && value.outputPointer !== null)) {
-    throw new Error('CANVAS_RUN_AGENT_RESULT_INVALID')
+  try {
+    const keys = [
+      'nodeId', 'status', 'outputPointer', 'affectedDownstreamNodeIds', 'outputSummary', 'errorCode',
+    ] as const
+    if (!hasExactCanvasKeys(value, keys)
+      || !isCanvasLifecycleId(value.nodeId)
+      || (value.status !== 'completed' && value.status !== 'failed' && value.status !== 'cancelled')
+      || (value.outputPointer !== null && value.outputPointer === undefined)
+      || !isDenseCanvasArray(value.affectedDownstreamNodeIds)
+      || value.affectedDownstreamNodeIds.length > CANVAS_WORKFLOW_NODE_LIMIT
+      || !value.affectedDownstreamNodeIds.every(isCanvasLifecycleId)
+      || new Set(value.affectedDownstreamNodeIds).size !== value.affectedDownstreamNodeIds.length
+      || typeof value.outputSummary !== 'string'
+      || value.outputSummary.length > CANVAS_AGENT_OUTPUT_SUMMARY_MAX_LENGTH
+      || !isCanvasWorkflowErrorCode(value.errorCode)
+      || (value.status === 'completed' && (value.outputPointer === null || value.errorCode !== null))
+      || (value.status === 'failed' && (value.outputPointer !== null || value.errorCode === null))
+      || (value.status === 'cancelled' && value.outputPointer !== null)) {
+      throw new Error('CANVAS_RUN_AGENT_RESULT_INVALID')
+    }
+    /** 可选正式输出必须通过独立 exact-key parser 重建。 */
+    const outputPointer = value.outputPointer === null
+      ? null
+      : parseCanvasAgentOutputPointer(value.outputPointer)
+    /** 公共字段与判别字段分开构造，让 TypeScript 同步保留终态约束。 */
+    const base = {
+      nodeId: value.nodeId,
+      affectedDownstreamNodeIds: [...value.affectedDownstreamNodeIds],
+      outputSummary: value.outputSummary,
+    }
+    if (value.status === 'completed' && outputPointer && value.errorCode === null) {
+      return { ...base, status: 'completed', outputPointer, errorCode: null }
+    }
+    if (value.status === 'failed' && value.errorCode !== null) {
+      return { ...base, status: 'failed', outputPointer: null, errorCode: value.errorCode }
+    }
+    return { ...base, status: 'cancelled', outputPointer: null, errorCode: value.errorCode }
+  } catch (error) {
+    throw new Error('CANVAS_RUN_AGENT_RESULT_INVALID', { cause: error })
   }
-  /** 可选正式输出必须通过独立 exact-key parser 重建。 */
-  const outputPointer = value.outputPointer === null
-    ? null
-    : parseCanvasAgentOutputPointer(value.outputPointer)
-  /** 公共字段与判别字段分开构造，让 TypeScript 同步保留终态约束。 */
-  const base = {
-    nodeId: value.nodeId,
-    affectedDownstreamNodeIds: [...value.affectedDownstreamNodeIds],
-    outputSummary: value.outputSummary,
-  }
-  if (value.status === 'completed' && outputPointer && value.errorCode === null) {
-    return { ...base, status: 'completed', outputPointer, errorCode: null }
-  }
-  if (value.status === 'failed' && value.errorCode !== null) {
-    return { ...base, status: 'failed', outputPointer: null, errorCode: value.errorCode }
-  }
-  return { ...base, status: 'cancelled', outputPointer: null, errorCode: value.errorCode }
 }
 
 /** 严格解析工作流图片计数摘要。 */
@@ -1449,41 +1472,81 @@ function parseCanvasWorkflowImageSummary(value: unknown): CanvasWorkflowImageSum
  * @returns 节点与图片摘要均有界的深重建结果。
  */
 export function parseCanvasRunWorkflowResult(value: unknown): CanvasRunWorkflowResult {
-  const keys = [
-    'status', 'initialRevision', 'finalRevision', 'nodes', 'imageSummary', 'requiresReview', 'errorCode',
-  ] as const
-  if (!hasExactCanvasKeys(value, keys)
-    || !isCanvasWorkflowStatus(value.status)
-    || !isCanvasNonNegativeInteger(value.initialRevision)
-    || !isCanvasNonNegativeInteger(value.finalRevision)
-    || !Array.isArray(value.nodes)
-    || value.nodes.length > CANVAS_WORKFLOW_NODE_LIMIT
-    || typeof value.requiresReview !== 'boolean'
-    || !isCanvasWorkflowErrorCode(value.errorCode)) {
-    throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
-  }
-  /** 节点数组逐项 exact-key 重建，禁止敏感或未知字段随结果透传。 */
-  const nodes = value.nodes.map((node): CanvasWorkflowNodeResult => {
-    const nodeKeys = ['nodeId', 'status', 'errorCode'] as const
-    if (!hasExactCanvasKeys(node, nodeKeys)
-      || !isCanvasLifecycleId(node.nodeId)
-      || !isCanvasWorkflowNodeStatus(node.status)
-      || !isCanvasWorkflowErrorCode(node.errorCode)) {
+  try {
+    const keys = [
+      'status', 'initialRevision', 'finalRevision', 'nodes', 'imageSummary', 'requiresReview', 'errorCode',
+    ] as const
+    if (!hasExactCanvasKeys(value, keys)
+      || !isCanvasWorkflowStatus(value.status)
+      || !isCanvasNonNegativeInteger(value.initialRevision)
+      || !isCanvasNonNegativeInteger(value.finalRevision)
+      || value.finalRevision < value.initialRevision
+      || !isDenseCanvasArray(value.nodes)
+      || value.nodes.length > CANVAS_WORKFLOW_NODE_LIMIT
+      || typeof value.requiresReview !== 'boolean'
+      || !isCanvasWorkflowErrorCode(value.errorCode)) {
       throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
     }
-    return { nodeId: node.nodeId, status: node.status, errorCode: node.errorCode }
-  })
-  if (new Set(nodes.map((node) => node.nodeId)).size !== nodes.length) {
-    throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
-  }
-  return {
-    status: value.status,
-    initialRevision: value.initialRevision,
-    finalRevision: value.finalRevision,
-    nodes,
-    imageSummary: parseCanvasWorkflowImageSummary(value.imageSummary),
-    requiresReview: value.requiresReview,
-    errorCode: value.errorCode,
+    /** 节点数组逐项 exact-key 重建，禁止敏感或未知字段随结果透传。 */
+    const nodes = value.nodes.map((node): CanvasWorkflowNodeResult => {
+      const nodeKeys = ['nodeId', 'status', 'errorCode'] as const
+      if (!hasExactCanvasKeys(node, nodeKeys)
+        || !isCanvasLifecycleId(node.nodeId)
+        || !isCanvasWorkflowNodeStatus(node.status)
+        || !isCanvasWorkflowErrorCode(node.errorCode)
+        || ((node.status === 'failed' || node.status === 'blocked') && node.errorCode === null)
+        || (node.status !== 'failed' && node.status !== 'blocked' && node.errorCode !== null)) {
+        throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
+      }
+      if ((node.status === 'failed' || node.status === 'blocked') && node.errorCode !== null) {
+        return { nodeId: node.nodeId, status: node.status, errorCode: node.errorCode }
+      }
+      return {
+        nodeId: node.nodeId,
+        status: node.status as Exclude<CanvasWorkflowNodeStatus, 'failed' | 'blocked'>,
+        errorCode: null,
+      }
+    })
+    if (new Set(nodes.map((node) => node.nodeId)).size !== nodes.length) {
+      throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
+    }
+    /** 终态、审批提示与稳定错误必须形成唯一一致组合。 */
+    const validTerminalState = value.status === 'completed'
+      ? value.requiresReview === false && value.errorCode === null
+      : value.status === 'waiting-review'
+        ? value.requiresReview === true && value.errorCode === null
+        : value.status === 'failed'
+          ? value.requiresReview === false && value.errorCode !== null
+          : value.status === 'cancelled'
+            ? value.requiresReview === false
+            : true
+    if (!validTerminalState) throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
+    const base = {
+      initialRevision: value.initialRevision,
+      finalRevision: value.finalRevision,
+      nodes,
+      imageSummary: parseCanvasWorkflowImageSummary(value.imageSummary),
+    }
+    if (value.status === 'completed') {
+      return { ...base, status: 'completed', requiresReview: false, errorCode: null }
+    }
+    if (value.status === 'waiting-review') {
+      return { ...base, status: 'waiting-review', requiresReview: true, errorCode: null }
+    }
+    if (value.status === 'failed' && value.errorCode !== null) {
+      return { ...base, status: 'failed', requiresReview: false, errorCode: value.errorCode }
+    }
+    if (value.status === 'cancelled') {
+      return { ...base, status: 'cancelled', requiresReview: false, errorCode: value.errorCode }
+    }
+    return {
+      ...base,
+      status: 'partial',
+      requiresReview: value.requiresReview,
+      errorCode: value.errorCode,
+    }
+  } catch (error) {
+    throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID', { cause: error })
   }
 }
 

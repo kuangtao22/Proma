@@ -337,11 +337,13 @@ function parseViewport(value: unknown, message: string): { x: number; y: number;
  * @param value 待解析节点。
  * @param message 失败时沿用的上层稳定错误码。
  * @param allowLegacyWebviewDeviceDefault 是否允许 schema v2 WebView 缺省为网页预设。
+ * @param allowAgentOutputPointer 是否允许当前 schema v4 的正式输出指针。
  */
 function parseCanvasNode(
   value: unknown,
   message: string,
   allowLegacyWebviewDeviceDefault = false,
+  allowAgentOutputPointer = true,
 ): CanvasNode {
   if (!isRecord(value)
     || !isSafeDesignStableId(value.id)
@@ -390,7 +392,8 @@ function parseCanvasNode(
   }
   if (value.kind === 'agent'
     && (hasExactKeys(value, [...baseKeys, 'agentSessionId'])
-      || hasExactKeys(value, [...baseKeys, 'agentSessionId', 'outputPointer']))
+      || (allowAgentOutputPointer
+        && hasExactKeys(value, [...baseKeys, 'agentSessionId', 'outputPointer'])))
     && isSafeDesignStableId(value.agentSessionId)) {
     try {
       /** 通过共享 parser 重建正式输出指针，禁止返回磁盘对象引用。 */
@@ -700,6 +703,7 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
       node,
       'CANVAS_DOCUMENT_INVALID',
       value.schemaVersion === 2,
+      value.schemaVersion === CANVAS_DOCUMENT_VERSION,
     ))
   /** 节点类别索引让历史边迁移保持 O(nodes + edges)。 */
   const nodeKindsById = new Map(nodes.map((node) => [node.id, node.kind]))
@@ -787,7 +791,11 @@ function parseUniqueStableIds(value: unknown, message: string): string[] {
 }
 
 /** 在 reducer 前按顺序校验原始 mutation 字段、图引用和批内重复 ID。 */
-function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]): void {
+function validateCanvasMutations(
+  current: CanvasDocument,
+  mutations: unknown[],
+  protectAgentOutputPointers = false,
+): void {
   /** 跨 mutation 追踪 upsert ID，阻止同批次先后覆盖隐藏重复输入。 */
   const upsertedNodeIds = new Set<string>()
   const upsertedEdgeIds = new Set<string>()
@@ -795,6 +803,10 @@ function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]):
   const currentNodeIds = new Set(current.nodes.map((node) => node.id))
   /** 当前步骤的节点类别随 upsert/remove 同步演进，供类型相关 mutation 做 O(1) 校验。 */
   const nodeKindsById = new Map(current.nodes.map((node) => [node.id, node.kind]))
+  /** 仅不可信 batch 入口需要权威基线，可信 mutate 保留正式输出写入能力。 */
+  const authoritativeNodesById = protectAgentOutputPointers
+    ? new Map(current.nodes.map((node) => [node.id, node]))
+    : null
   /** 当前步骤的边端点，用于 remove-node 模拟 reducer 的级联删除。 */
   const currentEdges = new Map(current.edges.map((edge) => [edge.id, {
     sourceNodeId: edge.sourceNodeId,
@@ -853,6 +865,21 @@ function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]):
       for (const value of mutation.nodes) {
         /** 每个节点先做单体 exact schema，再检查整批重复 ID。 */
         const node = parseCanvasNode(value, 'CANVAS_MUTATION_INVALID')
+        /** 不可信 batch 只能原样携带既有正式输出，不能新增、覆盖或省略指针。 */
+        if (authoritativeNodesById) {
+          const authoritativeNode = authoritativeNodesById.get(node.id)
+          if (authoritativeNode?.kind === 'agent') {
+            if (node.kind !== 'agent'
+              || !areCanvasAgentOutputPointersEqual(
+                authoritativeNode.outputPointer,
+                node.outputPointer,
+              )) {
+              throw new Error('CANVAS_MUTATION_INVALID')
+            }
+          } else if (node.kind === 'agent' && node.outputPointer !== undefined) {
+            throw new Error('CANVAS_MUTATION_INVALID')
+          }
+        }
         if (upsertedNodeIds.has(node.id)) throw new Error('CANVAS_MUTATION_INVALID')
         upsertedNodeIds.add(node.id)
         currentNodeIds.add(node.id)
@@ -923,6 +950,17 @@ function validateCanvasMutations(current: CanvasDocument, mutations: unknown[]):
     }
     throw new Error('CANVAS_MUTATION_INVALID')
   }
+}
+
+/** 比较两个 Agent 正式输出指针的完整值，不依赖对象引用。 */
+function areCanvasAgentOutputPointersEqual(
+  left: Extract<CanvasNode, { kind: 'agent' }>['outputPointer'],
+  right: Extract<CanvasNode, { kind: 'agent' }>['outputPointer'],
+): boolean {
+  if (left === undefined || right === undefined) return left === right
+  return left.messageUuid === right.messageUuid
+    && left.contentSha256 === right.contentSha256
+    && left.completedAt === right.completedAt
 }
 
 /** 创建统一的 native Canvas 路径安全错误。 */
@@ -1524,7 +1562,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
         `CANVAS_REVISION_CONFLICT: expected=${expectedRevision}, current=${current.revision}`,
       )
     }
-    validateCanvasMutations(current, operations)
+    validateCanvasMutations(current, operations, true)
     const normalized = structuredClone(operations) as CanvasMutation[]
     return {
       baseDocument: structuredClone(current),
@@ -1545,7 +1583,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
         `CANVAS_REVISION_CONFLICT: expected=${expectedRevision}, current=${current.revision}`,
       )
     }
-    validateCanvasMutations(current, operations)
+    validateCanvasMutations(current, operations, true)
     return structuredClone(operations) as CanvasMutation[]
   }
 

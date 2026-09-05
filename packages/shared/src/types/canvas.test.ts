@@ -119,6 +119,7 @@ describe('Canvas Agent 工作流公开合同', () => {
     expect(() => parseCanvasRunWorkflowInput({ ...input, maxImageRuns: -1 })).toThrow()
     expect(() => parseCanvasRunWorkflowInput({ ...input, maxImageRuns: 17 })).toThrow()
     expect(() => parseCanvasRunWorkflowInput({ ...input, goal: 'x'.repeat(4_001) })).toThrow()
+    expect(() => parseCanvasRunWorkflowInput({ ...input, startNodeIds: new Array(1) })).toThrow()
   })
 
   test('Given 单 Agent 公开结果 When 严格解析 Then 保留有限事实且拒绝敏感字段', () => {
@@ -136,6 +137,14 @@ describe('Canvas Agent 工作流公开合同', () => {
     expect(() => parseCanvasRunAgentResult({ ...result, outputSummary: 'x'.repeat(2_001) })).toThrow()
     expect(() => parseCanvasRunAgentResult({ ...result, outputPointer: null })).toThrow()
     expect(() => parseCanvasRunAgentResult({ ...result, status: 'failed', errorCode: null })).toThrow()
+    expect(() => parseCanvasRunAgentResult({
+      ...result,
+      outputPointer: { ...result.outputPointer, messageUuid: 'invalid' },
+    })).toThrow('CANVAS_RUN_AGENT_RESULT_INVALID')
+    expect(() => parseCanvasRunAgentResult({
+      ...result,
+      affectedDownstreamNodeIds: new Array(1),
+    })).toThrow()
   })
 
   test('Given 工作流公开结果 When 严格解析 Then 节点、错误与图片摘要均保持有界', () => {
@@ -171,6 +180,50 @@ describe('Canvas Agent 工作流公开合同', () => {
         status: 'partial', totalCount: 1, candidateCount: 1, failedCount: 1, runningCount: 1,
       },
     })).toThrow()
+    expect(() => parseCanvasRunWorkflowResult({ ...result, nodes: new Array(1) })).toThrow()
+    expect(() => parseCanvasRunWorkflowResult({ ...result, finalRevision: 1 }))
+      .toThrow('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
+
+    const validTerminalStates = [
+      ['completed', false, null],
+      ['waiting-review', true, null],
+      ['failed', false, 'CANVAS_WORKFLOW_FAILED'],
+      ['partial', false, 'CANVAS_BRANCH_FAILED'],
+      ['partial', true, null],
+      ['cancelled', false, null],
+      ['cancelled', false, 'CANVAS_WORKFLOW_CANCELLED'],
+    ] as const
+    for (const [status, requiresReview, errorCode] of validTerminalStates) {
+      expect(parseCanvasRunWorkflowResult({ ...result, status, requiresReview, errorCode }))
+        .toMatchObject({ status, requiresReview, errorCode })
+    }
+
+    const invalidTerminalStates = [
+      ['completed', true, null],
+      ['completed', false, 'CANVAS_WORKFLOW_FAILED'],
+      ['waiting-review', false, null],
+      ['waiting-review', true, 'CANVAS_WORKFLOW_FAILED'],
+      ['failed', false, null],
+      ['failed', true, 'CANVAS_WORKFLOW_FAILED'],
+      ['cancelled', true, null],
+    ] as const
+    for (const [status, requiresReview, errorCode] of invalidTerminalStates) {
+      expect(() => parseCanvasRunWorkflowResult({ ...result, status, requiresReview, errorCode }))
+        .toThrow('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
+    }
+
+    const invalidNodeStates = [
+      ['failed', null],
+      ['blocked', null],
+      ['completed', 'CANVAS_NODE_FAILED'],
+      ['waiting-review', 'CANVAS_NODE_FAILED'],
+    ] as const
+    for (const [status, errorCode] of invalidNodeStates) {
+      expect(() => parseCanvasRunWorkflowResult({
+        ...result,
+        nodes: [{ nodeId: 'agent-1', status, errorCode }],
+      })).toThrow('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
+    }
   })
 })
 
@@ -349,6 +402,13 @@ describe('Canvas 图共享合同', () => {
 
   test('Given 完整公开工作区快照 When 严格解析 Then 重建四类节点、关系边与深隔离副本', () => {
     const document = structuredClone(createDocument())
+    /** 正式输出指针用于验证共享快照 parser 的嵌套深拷贝。 */
+    const outputPointer = {
+      messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+      contentSha256: 'b'.repeat(64),
+      completedAt: 100,
+    }
+    document.nodes[0] = { ...document.nodes[0] as CanvasAgentNode, outputPointer }
     document.nodes.push(structuredClone(webviewNode))
     document.edges.push({
       id: 'edge-image-webview',
@@ -379,6 +439,7 @@ describe('Canvas 图共享合同', () => {
     expect(parsed.document).not.toBe(snapshot.document)
     expect(parsed.document.nodes[0]).not.toBe(snapshot.document.nodes[0])
     expect(parsed.document.nodes[0]?.position).not.toBe(snapshot.document.nodes[0]?.position)
+    expect((parsed.document.nodes[0] as CanvasAgentNode).outputPointer).not.toBe(outputPointer)
     expect(parsed.nodeIssues[0]).not.toBe(snapshot.nodeIssues[0])
     expect(parsed.nodeIssues[0]?.allowedActions).not.toBe(snapshot.nodeIssues[0]?.allowedActions)
     expect(parsed.imagePreviews?.[0]).not.toBe(snapshot.imagePreviews[0])
@@ -387,6 +448,35 @@ describe('Canvas 图共享合同', () => {
     snapshot.imagePreviews[0]!.width = 1
     expect(parsed.document.nodes[0]?.position.x).toBe(10)
     expect(parsed.imagePreviews?.[0]?.width).toBe(1200)
+  })
+
+  test('Given 工作区 Agent 指针合法或损坏 When 严格解析 Then 深重建或返回稳定外层错误', () => {
+    const document = structuredClone(createDocument())
+    document.nodes[0] = {
+      ...document.nodes[0] as CanvasAgentNode,
+      outputPointer: {
+        messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+        contentSha256: 'c'.repeat(64),
+        completedAt: 200,
+      },
+    }
+    const snapshot = { document, writable: true as const, nodeIssues: [] }
+
+    expect(parseCanvasWorkspaceSnapshot(snapshot).document.nodes[0]).toEqual(document.nodes[0])
+    expect(() => parseCanvasWorkspaceSnapshot({
+      ...snapshot,
+      document: {
+        ...document,
+        nodes: [{
+          ...document.nodes[0] as CanvasAgentNode,
+          outputPointer: {
+            ...(document.nodes[0] as CanvasAgentNode).outputPointer!,
+            contentSha256: 'C'.repeat(64),
+          },
+        }],
+        edges: [],
+      },
+    })).toThrow('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
   })
 
   test('Given 快照含额外字段、畸形图或公开派生数据 When 严格解析 Then 全部拒绝', () => {
