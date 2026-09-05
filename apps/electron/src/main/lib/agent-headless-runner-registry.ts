@@ -12,9 +12,19 @@ import type {
 } from '@proma/shared'
 import type { AgentRunExtensions } from './agent-run-extensions'
 
+/** Headless 调用方用于判定本轮是否可提交业务结果的有界终态。 */
+export interface HeadlessAgentRunTerminalOptions {
+  status: 'completed' | 'errored' | 'cancelled'
+  stoppedByUser: boolean
+  startedAt: number
+  runGeneration?: number
+  resultSubtype?: string
+}
+
 export interface HeadlessAgentRunCallbacks {
   onError: (error: string) => void
-  onComplete: (messages?: AgentMessage[]) => void
+  /** 第二参数可选以保持现有 Feishu、Automation 与 Collaboration 回调源码兼容。 */
+  onComplete: (messages?: AgentMessage[], options?: HeadlessAgentRunTerminalOptions) => void
   onTitleUpdated: (title: string) => void
   source?: AgentExternalRunSource
   /** 发起此次 headless 运行的可见会话，用于将事件路由回其 renderer。 */

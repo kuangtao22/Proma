@@ -32,4 +32,25 @@ describe('Agent headless runner 注册表', () => {
 
     expect(received).toEqual([extensions, undefined])
   })
+
+  test('Given runner 返回有界终态 metadata When 完成 Then 调用方收到完整身份且旧单参数 callback 仍兼容', async () => {
+    let terminal: unknown
+    setHeadlessAgentRunner(async (_input, callbacks) => {
+      callbacks.onComplete(undefined, {
+        status: 'cancelled', stoppedByUser: true, startedAt: 123,
+        runGeneration: 4, resultSubtype: 'success',
+      })
+    })
+
+    await runRegisteredHeadlessAgent(input, {
+      onError: () => undefined,
+      onComplete: (_messages, options) => { terminal = options },
+      onTitleUpdated: () => undefined,
+    })
+
+    expect(terminal).toEqual({
+      status: 'cancelled', stoppedByUser: true, startedAt: 123,
+      runGeneration: 4, resultSubtype: 'success',
+    })
+  })
 })

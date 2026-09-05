@@ -60,6 +60,7 @@ import { getAgentWorkspaceBySlug, getLocalProjectRootStatus, getProjectFilesPath
 import { getAgentSessionMeta, listAgentSessions, updateAgentSessionMeta } from './agent-session-manager'
 import { buildCanvasAgentActiveRunSnapshot, isEligibleProjectAgent } from './agent-session-visibility'
 import { setAgentStopper, setHeadlessAgentRunner } from './agent-headless-runner-registry'
+import type { HeadlessAgentRunCallbacks, HeadlessAgentRunTerminalOptions } from './agent-headless-runner-registry'
 import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
 import {
   buildAuthoritativeAgentRunStartedEvent,
@@ -592,13 +593,7 @@ export async function runPreparedAgent(
  */
 export async function runAgentHeadless(
   input: AgentSendInput,
-  callbacks: {
-    onError: (error: string) => void
-    onComplete: (messages?: AgentMessage[]) => void
-    onTitleUpdated: (title: string) => void
-    source?: AgentExternalRunSource
-    originSessionId?: string
-  },
+  callbacks: HeadlessAgentRunCallbacks,
   extensions?: AgentRunExtensions,
 ): Promise<void> {
   // 委派子会话优先回到父会话所在 renderer，外部无界面运行才回退任意主窗口。
@@ -619,6 +614,29 @@ export async function runAgentHeadless(
     ...(input.startedAt != null ? {} : { startedAt: Date.now() }),
   }
   const startedAt = runInput.startedAt!
+  let runGeneration: number | undefined
+  let runErrored = false
+  /** Orchestrator 完成参数归一为 headless 调用方可直接信任的明确终态。 */
+  const buildHeadlessTerminalOptions = (options?: {
+    stoppedByUser?: boolean
+    startedAt?: number
+    runGeneration?: number
+    resultSubtype?: string
+  }): HeadlessAgentRunTerminalOptions => {
+    /** 优先使用 completion 自带的权威代次，早期异常回退已捕获的启动代次。 */
+    const terminalRunGeneration = options?.runGeneration ?? runGeneration
+    return {
+      status: options?.stoppedByUser
+        ? 'cancelled'
+        : runErrored || (options?.resultSubtype !== undefined && options.resultSubtype !== 'success')
+          ? 'errored'
+          : 'completed',
+      stoppedByUser: options?.stoppedByUser === true,
+      startedAt: options?.startedAt ?? startedAt,
+      ...(terminalRunGeneration !== undefined ? { runGeneration: terminalRunGeneration } : {}),
+      ...(options?.resultSubtype !== undefined ? { resultSubtype: options.resultSubtype } : {}),
+    }
+  }
   /** 仅在 headless 运行准入后绑定 renderer route。 */
   let route: AgentStreamRoute<WebContents> | undefined
   /** 获取本轮 headless 运行仍拥有的 renderer；准入前允许向初始窗口返回错误。 */
@@ -631,6 +649,7 @@ export async function runAgentHeadless(
     const resolved = prepareAgentRun(runInput, extensions)
     await orchestrator.sendMessage(resolved.input, {
       onError: (error) => {
+        runErrored = true
         runAgentServiceTerminalEffects([
           { name: 'external-on-error', run: () => { callbacks.onError(error) } },
           {
@@ -649,7 +668,10 @@ export async function runAgentHeadless(
       },
       onComplete: (messages, opts) => {
         runAgentServiceTerminalEffects([
-          { name: 'external-on-complete', run: () => { callbacks.onComplete(messages) } },
+          {
+            name: 'external-on-complete',
+            run: () => { callbacks.onComplete(messages, buildHeadlessTerminalOptions(opts)) },
+          },
           {
             name: 'publish-run-stopped',
             run: () => { publishRunStopped(runInput.sessionId, opts?.stoppedByUser, opts?.startedAt, opts?.runGeneration) },
@@ -697,7 +719,8 @@ export async function runAgentHeadless(
           })
         }
       },
-      onRunStarted: ({ startedAt: persistedStartedAt, runGeneration }) => {
+      onRunStarted: ({ startedAt: persistedStartedAt, runGeneration: persistedRunGeneration }) => {
+        runGeneration = persistedRunGeneration
         const session = getAgentSessionMeta(runInput.sessionId)
         workspaceOperationGuard.runAgentServiceEffects({
           sessionWorkspaceId: session?.workspaceId,
@@ -723,9 +746,16 @@ export async function runAgentHeadless(
   } catch (err) {
     console.error('[Agent 服务] runAgentHeadless 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'
+    runErrored = true
     runAgentServiceTerminalEffects([
       { name: 'external-on-error', run: () => { callbacks.onError(errorMessage) } },
-      { name: 'external-on-complete', run: () => { callbacks.onComplete() } },
+      {
+        name: 'external-on-complete',
+        run: () => { callbacks.onComplete(undefined, {
+          status: 'errored', stoppedByUser: false, startedAt,
+          ...(runGeneration !== undefined ? { runGeneration } : {}),
+        }) },
+      },
       {
         name: 'renderer-error',
         run: () => {

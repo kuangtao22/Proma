@@ -178,6 +178,20 @@ describe('Agent service 迁移准入', () => {
     expect(body).toContain('runAgentServiceTerminalEffects([')
   })
 
+  test('Given Headless Orchestrator 完成或 catch When 通知内部调用方 Then 透传有界权威终态 metadata', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    const start = source.indexOf('export async function runAgentHeadless(')
+    const end = source.indexOf('\n/**', start + 1)
+    const body = source.slice(start, end)
+
+    expect(body).toContain('callbacks.onComplete(messages, buildHeadlessTerminalOptions(opts))')
+    expect(body).toContain('stoppedByUser:')
+    expect(body).toContain('startedAt:')
+    expect(body).toContain('runGeneration:')
+    expect(body).toContain('resultSubtype:')
+    expect(body).toContain("status: 'errored'")
+  })
+
   test('Given Canvas run 在准入早期抛错 When runAgent 发布 completion Then 仍附带主进程权威轻量 metadata', () => {
     /** 读取真实 service，锁定外层 catch 不能发布无归属 completion。 */
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')

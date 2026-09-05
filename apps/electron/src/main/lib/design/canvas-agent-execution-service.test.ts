@@ -25,6 +25,7 @@ function createFixture(options: {
   afterConfig?: () => void
   prepareDocument?: CanvasDocument
   commitGate?: Promise<void>
+  headlessResultSubtype?: string
 } = {}) {
   const calls: string[] = []
   const document: CanvasDocument = createEmptyCanvasDocument(target.projectId, target.canvasId, 1)
@@ -106,10 +107,17 @@ function createFixture(options: {
       calls.push(`headless:${callbacks.source}:${callbacks.originSessionId}:${input.triggeredBy}`)
       activeRun = { sessionId: input.sessionId, startedAt: input.startedAt! }
       expect(extensions?.allowedToolNames).not.toContain('canvas_run_nodes')
-      if (options.stopped) stopListener?.()
       if (options.runError) callbacks.onError(options.runError)
       await options.runGate
-      callbacks.onComplete()
+      callbacks.onComplete(undefined, {
+        status: options.stopped ? 'cancelled' : options.runError || options.headlessResultSubtype !== undefined ? 'errored' : 'completed',
+        stoppedByUser: options.stopped === true,
+        startedAt: input.startedAt!,
+        runGeneration: 3,
+        ...(options.headlessResultSubtype !== undefined ? { resultSubtype: options.headlessResultSubtype } : {}),
+      })
+      /** 复现生产顺序：headless onComplete 先于 run_stopped 事件。 */
+      if (options.stopped) stopListener?.()
       activeRun = undefined
     },
     subscribeStopped: (_sessionId, _startedAt, listener) => {
@@ -187,6 +195,16 @@ describe('Canvas Agent 统一执行服务', () => {
 
     expect(fixture.calls.some((call) => call.startsWith('commit:'))).toBe(false)
     expect(fixture.calls.slice(-3)).toEqual(['unlisten', 'release', 'release-generation:child-1:1'])
+  })
+
+  test('Given Headless 非 success subtype 且锚点后已有正文 When onComplete Then 不提交旧或部分输出', async () => {
+    const fixture = createFixture({ headlessResultSubtype: 'error_during_execution' })
+
+    await expect(fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      userMessageUuid: 'anchor-partial', startedAt: 71,
+    })).resolves.toEqual({ status: 'errored' })
+    expect(fixture.calls.some((call) => call.startsWith('commit:'))).toBe(false)
   })
 
   test('Given 会话 busy When 预留失败 Then Pi 不启动且不提交输出', async () => {

@@ -272,7 +272,14 @@ export function createCanvasAgentExecutionService(
             source: 'design',
             originSessionId: request.parentSessionId,
             onError: () => { setTerminalStatus('errored') },
-            onComplete: () => { setTerminalStatus('completed') },
+            onComplete: (_messages, terminal) => {
+              /** 缺失或错代终态一律按错误处理，只有当前 run 明确成功才允许提交。 */
+              if (!terminal || terminal.startedAt !== request.startedAt) {
+                setTerminalStatus('errored')
+                return
+              }
+              setTerminalStatus(terminal.status)
+            },
             onTitleUpdated: () => undefined,
           }, extensions)
           ownsLiveChild = false
