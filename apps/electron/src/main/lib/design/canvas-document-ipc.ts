@@ -2540,20 +2540,27 @@ export function registerCanvasDocumentIpcHandlers(
               return { batch, outcome: { ok: false, error: reconciliation.error, reconciliation } }
             }
             try {
+              /** Renderer mutation 先经不可信 batch 边界规范化并保护 Agent 正式输出。 */
+              const target = { projectId: input.projectId, canvasId: input.canvasId }
+              const mutations = options.store.validateBatchOperations(
+                target,
+                input.expectedRevision,
+                input.mutations,
+              )
               assertRemovedContentNodesUseLifecycle(
                 reconciliation.snapshot.document,
-                input.mutations,
+                mutations,
               )
               assertRemovedAgentNodesAreIdle(
                 reconciliation.snapshot.document,
-                input.mutations,
+                mutations,
                 options.agent.listActiveRuns(),
               )
               /** 只有整个删除 batch 均为空闲，才允许进入原子 Store 提交。 */
               const document = options.store.mutate(
-                { projectId: input.projectId, canvasId: input.canvasId },
+                target,
                 input.expectedRevision,
-                input.mutations,
+                mutations,
               )
               return { batch, outcome: { ok: true, value: document, reconciliation } }
             } catch (error) {

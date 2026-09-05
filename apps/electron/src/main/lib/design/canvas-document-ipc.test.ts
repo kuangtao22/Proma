@@ -208,6 +208,11 @@ function createContext(options: {
   guardError?: Error
   loadError?: Error
   mutateError?: Error
+  validateBatchOperations?: (
+    target: CanvasTarget,
+    expectedRevision: number,
+    operations: unknown[],
+  ) => CanvasMutation[]
   reconcileError?: Error
   createError?: Error
   createPublication?: CanvasDocument
@@ -426,7 +431,11 @@ function createContext(options: {
         if (options.mutateError) throw options.mutateError
         return options.mutateResult ?? createDocument(expectedRevision + (mutations.length > 0 ? 1 : 0))
       },
-      validateBatchOperations: (_target, _expectedRevision, operations) => structuredClone(operations) as CanvasMutation[],
+      validateBatchOperations: (target, expectedRevision, operations) => {
+        calls.push('store:validate-batch')
+        return options.validateBatchOperations?.(target, expectedRevision, operations)
+          ?? structuredClone(operations) as CanvasMutation[]
+      },
     },
     batch: {
       ...(options.enableToolProviderRuntime ? {
@@ -1015,7 +1024,8 @@ describe('原生 Canvas 文档 IPC', () => {
     })
     expect(context.calls).toEqual([
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
-      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile', 'store:mutate',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile',
+      'store:validate-batch', 'store:mutate',
     ])
   })
 
@@ -2249,6 +2259,109 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.calls).not.toContain('store:mutate')
   })
 
+  test('Given Renderer SAVE 篡改已有 Agent 输出指针 When 保存 Then 三种篡改均在 mutate 前拒绝', async () => {
+    /** 预期拒绝日志不属于公开合同，测试只观察安全结果和调用边界。 */
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    /** 已发布正式输出用于构造新增、改写和删除三类越权 mutation。 */
+    const outputPointer = {
+      messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+      contentSha256: 'a'.repeat(64),
+      completedAt: 100,
+    }
+    /** 三类攻击分别覆盖无指针节点新增、已有指针改写与已有指针删除。 */
+    const cases = [
+      { label: '新增', currentPointer: undefined, nextPointer: outputPointer },
+      {
+        label: '改写', currentPointer: outputPointer,
+        nextPointer: { ...outputPointer, contentSha256: 'b'.repeat(64) },
+      },
+      { label: '删除', currentPointer: outputPointer, nextPointer: undefined },
+    ] as const
+
+    for (const fixture of cases) {
+      const document = createDocument(4)
+      /** 当前 Agent 节点只在对应场景携带权威正式输出。 */
+      const currentAgent = {
+        id: 'node-1', kind: 'agent' as const, title: '首页 Agent', position: { x: 0, y: 0 },
+        agentSessionId: '22222222-2222-4222-8222-222222222222',
+        ...(fixture.currentPointer ? { outputPointer: fixture.currentPointer } : {}),
+      }
+      document.nodes = [currentAgent]
+      /** Renderer 上送节点按场景新增、替换或省略正式输出。 */
+      const submittedAgent = {
+        ...currentAgent,
+        ...(fixture.nextPointer ? { outputPointer: fixture.nextPointer } : {}),
+      }
+      if (!fixture.nextPointer) delete (submittedAgent as { outputPointer?: unknown }).outputPointer
+      const mutations: CanvasMutation[] = [{ type: 'upsert-nodes', nodes: [submittedAgent] }]
+      const context = createContext({
+        loadResult: { document, writable: true, nodeIssues: [] },
+        validateBatchOperations: (_target, _expectedRevision, operations) => {
+          expect(operations).toEqual(mutations)
+          throw new Error(`CANVAS_MUTATION_INVALID: ${fixture.label}`)
+        },
+      })
+
+      const result = await invoke(
+        context.handlers,
+        CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
+        context.sender,
+        { projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4, mutations },
+      ) as CanvasInvokeResult<CanvasDocument>
+
+      expect(result.ok).toBe(false)
+      expect(context.calls).toContain('store:validate-batch')
+      expect(context.calls).not.toContain('store:mutate')
+    }
+    errorSpy.mockRestore()
+  })
+
+  test('Given Renderer SAVE 合法更新 Agent 结构 When 保存 Then 规范化 mutation 进入可信提交', async () => {
+    /** 有正式输出与无正式输出两类既有节点都必须允许普通结构更新。 */
+    const pointers = [{
+      messageUuid: '123e4567-e89b-42d3-a456-426614174000',
+      contentSha256: 'c'.repeat(64),
+      completedAt: 200,
+    }, undefined] as const
+
+    for (const outputPointer of pointers) {
+      const document = createDocument(4)
+      /** 当前 Agent 可携带正式输出，也可仍处于未产出状态。 */
+      const currentAgent = {
+        id: 'node-1', kind: 'agent' as const, title: '首页 Agent', position: { x: 0, y: 0 },
+        agentSessionId: '22222222-2222-4222-8222-222222222222',
+        ...(outputPointer ? { outputPointer } : {}),
+      }
+      document.nodes = [currentAgent]
+      const mutations: CanvasMutation[] = [{
+        type: 'upsert-nodes',
+        nodes: [{
+          ...currentAgent,
+          title: '新版首页 Agent',
+          position: { x: 40, y: 60 },
+          ...(outputPointer ? { outputPointer: { ...outputPointer } } : {}),
+        }],
+      }]
+      /** validator 返回的隔离副本必须成为后续可信 mutate 的唯一输入。 */
+      const normalized = structuredClone(mutations)
+      const context = createContext({
+        loadResult: { document, writable: true, nodeIssues: [] },
+        validateBatchOperations: () => normalized,
+      })
+
+      const result = await invoke(
+        context.handlers,
+        CANVAS_IPC_CHANNELS.SAVE_MUTATIONS,
+        context.sender,
+        { projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4, mutations },
+      ) as CanvasInvokeResult<CanvasDocument>
+
+      expect(result.ok).toBe(true)
+      expect((context.storeInputs.at(-1) as { mutations: CanvasMutation[] }).mutations)
+        .toBe(normalized)
+    }
+  })
+
   test('Given 内容节点 revision conflict 或 Agent busy When 删除 Then 映射稳定公开错误', async () => {
     const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
     const conflict = createContext({ contentOperationError: new Error('CANVAS_REVISION_CONFLICT') })
@@ -2832,7 +2945,8 @@ describe('原生 Canvas 文档 IPC', () => {
 
     expect(context.calls).toEqual([
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
-      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile', 'store:mutate',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile',
+      'store:validate-batch', 'store:mutate',
     ])
     expect(context.storeInputs[0]).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })
     expect(context.storeInputs[0]).not.toBe(loadInput)
