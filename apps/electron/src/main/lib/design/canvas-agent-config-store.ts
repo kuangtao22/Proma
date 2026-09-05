@@ -74,6 +74,8 @@ export interface CanvasAgentConfigStore {
 /** Canvas Agent 配置 Store 的可测试依赖。 */
 export interface CanvasAgentConfigStoreDependencies {
   store: Pick<CanvasDocumentStore, 'loadWithDirectoryCapability'>
+  /** 与 Canvas 图、候选批次及节点写操作共享的 keyed-exclusive 临界区。 */
+  runExclusive: <T>(target: CanvasAgentTarget, effect: () => Promise<T>) => Promise<T>
   runStableDirectoryNative?: (
     request: StableDirectoryNativeRequest,
     authorize: CanvasTrustedDirectoryCapability['authorizeOpenedRoots'],
@@ -88,6 +90,11 @@ export interface CanvasAgentConfigStoreDependencies {
 interface CanvasAgentConfigScope {
   graphRevision: number
   capability: CanvasTrustedDirectoryCapability
+}
+
+/** 创建保留底层 scope 或复读失败原因的提交未确认错误。 */
+function configCommitUnconfirmed(detail: string, cause: unknown): Error {
+  return new Error(`CANVAS_AGENT_CONFIG_COMMIT_UNCONFIRMED: ${detail}`, { cause })
 }
 
 /** 判断未知值是否为无未知字段的普通记录。 */
@@ -288,18 +295,31 @@ export function createCanvasAgentConfigStore(
   const confirmWrite = (
     capability: CanvasTrustedDirectoryCapability,
     outcome: StableDirectoryNativeWriteOutcome | undefined,
-  ): void => {
+  ): Error | null => {
     if (!outcome) throw new Error('CANVAS_AGENT_CONFIG_PROTOCOL_INVALID')
     /** 保留 helper 已报告的提交事实。 */
     const committedOutcome = outcome
-    /** helper 返回后立即复验目录授权。 */
-    capability.assertValid()
+    /** helper 返回后的 capability 复验错误，不能覆盖已经发生的提交阶段。 */
+    let scopeError: unknown
+    try {
+      capability.assertValid()
+    } catch (error: unknown) {
+      scopeError = error
+    }
     if (!committedOutcome.commitVisible) {
-      throw new Error(`CANVAS_AGENT_CONFIG_WRITE_FAILED: ${committedOutcome.error}`)
+      throw new Error(
+        `CANVAS_AGENT_CONFIG_WRITE_FAILED: ${committedOutcome.error}`,
+        scopeError === undefined ? undefined : { cause: scopeError },
+      )
     }
     if (committedOutcome.durabilityUncertain) {
-      throw new Error(`CANVAS_AGENT_CONFIG_DURABILITY_UNCERTAIN: ${committedOutcome.error}`)
+      if (scopeError !== undefined) {
+        throw configCommitUnconfirmed('write visible but scope revalidation failed', scopeError)
+      }
+      return new Error(`CANVAS_AGENT_CONFIG_DURABILITY_UNCERTAIN: ${committedOutcome.error}`)
     }
+    if (scopeError !== undefined) throw scopeError
+    return null
   }
 
   /** 保存前验证当前仍安装启用的 Skill 与完整模型选择。 */
@@ -337,67 +357,84 @@ export function createCanvasAgentConfigStore(
         || !isConfigPatch(input.patch)) {
         throw new Error('CANVAS_AGENT_CONFIG_UPDATE_INVALID')
       }
-      /** 与本次权威图绑定的配置 scope。 */
-      const scope = loadScope(target)
-      if (scope.graphRevision !== input.expectedGraphRevision) {
-        throw new Error('CANVAS_AGENT_GRAPH_REVISION_CONFLICT')
-      }
-      /** 缺失文件按 revision 0 默认值参与首次 CAS 创建。 */
-      const current = (await readConfig(scope.capability, target)) ?? createDefaultConfig(target)
-      if (current.revision !== input.expectedConfigRevision) {
-        throw new Error('CANVAS_AGENT_CONFIG_REVISION_CONFLICT')
-      }
-      /** patch 是否显式携带 channelId。 */
-      const hasChannelId = Object.prototype.hasOwnProperty.call(input.patch, 'channelId')
-      /** patch 是否显式携带 modelId。 */
-      const hasModelId = Object.prototype.hasOwnProperty.call(input.patch, 'modelId')
-      /** 合并后的渠道选择。 */
-      const channelId = hasChannelId
-        ? requireOptionalModelSelectionId(input.patch.channelId)
-        : current.channelId
-      if (hasChannelId && channelId !== current.channelId && channelId !== null && !hasModelId) {
-        throw new Error('CANVAS_AGENT_CONFIG_MODEL_PATCH_REQUIRED')
-      }
-      /** 清空渠道强制清空模型，否则按显式 patch 或当前值合并。 */
-      const modelId = channelId === null
-        ? null
-        : hasModelId
-          ? requireOptionalModelSelectionId(input.patch.modelId)
-          : current.modelId
-      /** 合并并重新构造的下一版配置。 */
-      const next: CanvasAgentConfig = {
-        ...current,
-        revision: current.revision + 1,
-        instruction: Object.prototype.hasOwnProperty.call(input.patch, 'instruction')
-          ? requireInstruction(input.patch.instruction)
-          : current.instruction,
-        skillNames: Object.prototype.hasOwnProperty.call(input.patch, 'skillNames')
-          ? requireSkillNames(input.patch.skillNames)
-          : [...current.skillNames],
-        channelId,
-        modelId,
-        updatedAt: now(),
-      }
-      if (!isNonNegativeInteger(next.updatedAt)) throw new Error('CANVAS_AGENT_CONFIG_TIME_INVALID')
-      validateDependencies(next)
-      /** 固定字段顺序的待提交 JSON 正文。 */
-      const serialized = JSON.stringify(next, null, 2)
-      /** helper 原子写结果。 */
-      const result = await runNative({
-        mode: 'canvas-content-write',
-        roots: [scope.capability.rootPath],
-        childName: 'agent-configs',
-        entryId: target.nodeId,
-        fileName: 'config.json',
-        content: serialized,
-      }, scope.capability.authorizeOpenedRoots)
-      confirmWrite(scope.capability, result.writeOutcome)
-      /** 写后必须从同一 capability 复读并严格比较完整配置。 */
-      const reread = await readConfig(scope.capability, target)
-      if (reread === null || JSON.stringify(reread) !== JSON.stringify(next)) {
-        throw new Error('CANVAS_AGENT_CONFIG_COMMIT_UNCONFIRMED')
-      }
-      return reread
+      return dependencies.runExclusive(target, async () => {
+        /** 与本次权威图绑定的配置 scope。 */
+        const scope = loadScope(target)
+        if (scope.graphRevision !== input.expectedGraphRevision) {
+          throw new Error('CANVAS_AGENT_GRAPH_REVISION_CONFLICT')
+        }
+        /** 缺失文件按 revision 0 默认值参与首次 CAS 创建。 */
+        const current = (await readConfig(scope.capability, target)) ?? createDefaultConfig(target)
+        if (current.revision !== input.expectedConfigRevision) {
+          throw new Error('CANVAS_AGENT_CONFIG_REVISION_CONFLICT')
+        }
+        /** patch 是否显式携带 channelId。 */
+        const hasChannelId = Object.prototype.hasOwnProperty.call(input.patch, 'channelId')
+        /** patch 是否显式携带 modelId。 */
+        const hasModelId = Object.prototype.hasOwnProperty.call(input.patch, 'modelId')
+        /** 合并后的渠道选择。 */
+        const channelId = hasChannelId
+          ? requireOptionalModelSelectionId(input.patch.channelId)
+          : current.channelId
+        if (hasChannelId && channelId !== current.channelId && channelId !== null && !hasModelId) {
+          throw new Error('CANVAS_AGENT_CONFIG_MODEL_PATCH_REQUIRED')
+        }
+        /** 清空渠道强制清空模型，否则按显式 patch 或当前值合并。 */
+        const modelId = channelId === null
+          ? null
+          : hasModelId
+            ? requireOptionalModelSelectionId(input.patch.modelId)
+            : current.modelId
+        /** 合并并重新构造的下一版配置。 */
+        const next: CanvasAgentConfig = {
+          ...current,
+          revision: current.revision + 1,
+          instruction: Object.prototype.hasOwnProperty.call(input.patch, 'instruction')
+            ? requireInstruction(input.patch.instruction)
+            : current.instruction,
+          skillNames: Object.prototype.hasOwnProperty.call(input.patch, 'skillNames')
+            ? requireSkillNames(input.patch.skillNames)
+            : [...current.skillNames],
+          channelId,
+          modelId,
+          updatedAt: now(),
+        }
+        if (!isNonNegativeInteger(next.updatedAt)) throw new Error('CANVAS_AGENT_CONFIG_TIME_INVALID')
+        validateDependencies(next)
+        /** 固定字段顺序的待提交 JSON 正文。 */
+        const serialized = JSON.stringify(next, null, 2)
+        /** helper 原子写结果。 */
+        const result = await runNative({
+          mode: 'canvas-content-write',
+          roots: [scope.capability.rootPath],
+          childName: 'agent-configs',
+          entryId: target.nodeId,
+          fileName: 'config.json',
+          content: serialized,
+        }, scope.capability.authorizeOpenedRoots)
+        /** durability 不确定时先复读对账，一致后仍按不确定阶段返回错误。 */
+        const durabilityError = confirmWrite(scope.capability, result.writeOutcome)
+        if (durabilityError) {
+          try {
+            const committed = await readConfig(scope.capability, target)
+            if (committed === null || JSON.stringify(committed) !== JSON.stringify(next)) {
+              throw new Error('committed config does not match requested config')
+            }
+          } catch (error: unknown) {
+            throw configCommitUnconfirmed('write visible but config verification failed', error)
+          }
+          throw durabilityError
+        }
+        /** 已确认耐久的写仍须从同一 capability 复读并严格比较完整配置。 */
+        const reread = await readConfig(scope.capability, target)
+        if (reread === null || JSON.stringify(reread) !== JSON.stringify(next)) {
+          throw configCommitUnconfirmed(
+            'durable write content verification failed',
+            new Error('committed config does not match requested config'),
+          )
+        }
+        return reread
+      })
     },
   }
 }

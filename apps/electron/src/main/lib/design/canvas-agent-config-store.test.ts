@@ -7,6 +7,10 @@ import type {
 } from '../stable-directory-native-host'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import {
+  createCanvasOperationSerializer,
+  type CanvasOperationSerializer,
+} from './canvas-document-ipc'
+import {
   createCanvasAgentConfigStore,
   type CanvasAgentConfig,
   type CanvasAgentConfigStoreDependencies,
@@ -66,6 +70,8 @@ function createFixture(options: {
   revokeAfterWrite?: boolean
   writeOutcome?: StableDirectoryNativeWriteOutcome
   rereadContent?: string
+  pauseFirstWrite?: boolean
+  serializer?: CanvasOperationSerializer
 } = {}) {
   /** 当前受管配置正文；null 表示文件缺失。 */
   let content = options.content ?? null
@@ -75,12 +81,26 @@ function createFixture(options: {
   let writeCount = 0
   /** 每个公开操作取得权威 Canvas LOAD 的次数。 */
   let loadCount = 0
+  /** native 固定文件读取次数，用于核对 uncertain 后确实复读。 */
+  let readCount = 0
   /** capability 当前是否仍有效。 */
   let valid = true
   /** 模型校验调用，证明仅在保存显式选择时执行。 */
   const modelChecks: Array<{ channelId: string; modelId: string | null }> = []
   /** 渠道校验调用，包含选择渠道默认模型的场景。 */
   const channelChecks: string[] = []
+  /** Store 与其它 Canvas 写路径共享的真实键控串行器。 */
+  const serializer = options.serializer ?? createCanvasOperationSerializer()
+  /** 第一次 write 到达 native 边界时的通知。 */
+  let notifyFirstWriteStarted: (() => void) | undefined
+  const firstWriteStarted = new Promise<void>((resolve) => {
+    notifyFirstWriteStarted = resolve
+  })
+  /** 测试控制第一次 write 何时继续。 */
+  let releaseFirstWrite: (() => void) | undefined
+  const firstWriteRelease = new Promise<void>((resolve) => {
+    releaseFirstWrite = resolve
+  })
 
   /** 测试 native 协议只接受固定目录、entry 和文件名。 */
   const runNative: CanvasAgentConfigStoreDependencies['runStableDirectoryNative'] = async (
@@ -98,6 +118,7 @@ function createFixture(options: {
     if (options.revokeOnAuthorize) valid = false
     if (!authorize(openedRoots)) throw new Error('NATIVE_AUTHORIZATION_REVOKED')
     if (request.mode === 'canvas-content-read') {
+      readCount += 1
       const readContent = writeCount > 0 && options.rereadContent !== undefined
         ? options.rereadContent
         : content
@@ -113,6 +134,10 @@ function createFixture(options: {
       throw new Error('UNEXPECTED_NATIVE_REQUEST')
     }
     writeCount += 1
+    if (options.pauseFirstWrite && writeCount === 1) {
+      notifyFirstWriteStarted?.()
+      await firstWriteRelease
+    }
     content = request.content
     if (options.revokeAfterWrite) valid = false
     return {
@@ -123,12 +148,14 @@ function createFixture(options: {
   }
 
   /** 测试 Store 只暴露同一次 LOAD 的文档和 agent-configs capability。 */
+  /** 当前权威图，测试可模拟其它串行写在 config update 前推进。 */
+  let currentDocument = options.document ?? createDocument()
   const documentStore: Pick<CanvasDocumentStore, 'loadWithDirectoryCapability'> = {
     loadWithDirectoryCapability: () => {
       loadCount += 1
       return {
         snapshot: {
-          document: options.document ?? createDocument(),
+          document: currentDocument,
           writable: true,
           nodeIssues: [],
         },
@@ -147,7 +174,8 @@ function createFixture(options: {
     },
   }
 
-  const store = createCanvasAgentConfigStore({
+  /** 注入真实 serializer，验证 Store 与其它 Canvas 写路径共享同一临界区。 */
+  const dependencies: CanvasAgentConfigStoreDependencies = {
     store: documentStore,
     runStableDirectoryNative: runNative,
     getWorkspaceSkills: () => options.skills ?? [{ slug: 'research', name: 'research', enabled: true }],
@@ -160,15 +188,24 @@ function createFixture(options: {
       if (modelId === 'missing-model') throw new Error('MODEL_DISABLED')
     },
     now: () => 100,
-  })
+    runExclusive: <T>(runTarget: CanvasAgentTarget, effect: () => Promise<T>) => (
+      serializer.run(runTarget, effect)
+    ),
+  }
+  const store = createCanvasAgentConfigStore(dependencies)
 
   return {
     store,
     requests,
     modelChecks,
     channelChecks,
+    serializer,
+    firstWriteStarted,
+    releaseFirstWrite: () => releaseFirstWrite?.(),
+    setDocument: (document: CanvasDocument) => { currentDocument = document },
     get writeCount() { return writeCount },
     get loadCount() { return loadCount },
+    get readCount() { return readCount },
     get content() { return content },
   }
 }
@@ -284,6 +321,54 @@ describe('CanvasAgentConfigStore', () => {
     expect(graphConflict.writeCount + configConflict.writeCount).toBe(0)
   })
 
+  test('Given 两个更新共享同一 config baseline When 并发提交 Then 只有一个写入成功', async () => {
+    const fixture = createFixture({
+      content: JSON.stringify(createConfig()),
+      pauseFirstWrite: true,
+    })
+    const first = fixture.store.update(createUpdate({ instruction: 'first' }))
+    await fixture.firstWriteStarted
+    const second = fixture.store.update(createUpdate({ instruction: 'second' }))
+
+    fixture.releaseFirstWrite()
+    const results = await Promise.allSettled([first, second])
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    const rejected = results.find((result) => result.status === 'rejected')
+    expect(rejected?.status).toBe('rejected')
+    if (rejected?.status === 'rejected') {
+      expect(String(rejected.reason)).toContain('CANVAS_AGENT_CONFIG_REVISION_CONFLICT')
+    }
+    expect(fixture.writeCount).toBe(1)
+  })
+
+  test('Given 同 Canvas 图写已持锁 When 节点在配置更新前被删除 Then 更新排队后拒绝且不写', async () => {
+    const fixture = createFixture({ content: JSON.stringify(createConfig()) })
+    /** 控制在 update 请求到达后才提交图 revision 与节点删除。 */
+    let releaseGraphMutation: (() => void) | undefined
+    const graphMutationRelease = new Promise<void>((resolve) => {
+      releaseGraphMutation = resolve
+    })
+    let notifyGraphMutationStarted: (() => void) | undefined
+    const graphMutationStarted = new Promise<void>((resolve) => {
+      notifyGraphMutationStarted = resolve
+    })
+    const graphMutation = fixture.serializer.run(target, async () => {
+      notifyGraphMutationStarted?.()
+      await graphMutationRelease
+      fixture.setDocument(createDocument({ revision: 8, nodes: [] }))
+    })
+    await graphMutationStarted
+
+    const update = fixture.store.update(createUpdate({ instruction: 'stale write' }))
+    await Promise.resolve()
+    releaseGraphMutation?.()
+    await graphMutation
+
+    await expect(update).rejects.toThrow('CANVAS_AGENT_TARGET_INVALID')
+    expect(fixture.writeCount).toBe(0)
+  })
+
   test('Given Skill 未安装或停用且模型选择无效 When 保存 Then 全部 fail closed', async () => {
     const missingSkill = createFixture({ content: JSON.stringify(createConfig()), skills: [] })
     const disabledSkill = createFixture({
@@ -318,21 +403,39 @@ describe('CanvasAgentConfigStore', () => {
     await expect(corrupt.store.load(target)).rejects.toThrow('CANVAS_AGENT_CONFIG_CORRUPT')
   })
 
-  test('Given 写提交耐久性不确定、写后撤权或复读不一致 When 更新 Then 都不返回成功', async () => {
-    const uncertain = createFixture({
+  test('Given 写提交可见但耐久不确定且复读一致 When 更新 Then 复读一次后保留 durability 阶段', async () => {
+    const fixture = createFixture({
       content: JSON.stringify(createConfig()),
       writeOutcome: { commitVisible: true, durabilityUncertain: true, error: 'directory flush failed' },
     })
-    const revoked = createFixture({ content: JSON.stringify(createConfig()), revokeAfterWrite: true })
-    const mismatch = createFixture({
+
+    await expect(fixture.store.update(createUpdate({ instruction: 'new' })))
+      .rejects.toThrow('CANVAS_AGENT_CONFIG_DURABILITY_UNCERTAIN')
+    expect(fixture.readCount).toBe(2)
+    expect(fixture.writeCount).toBe(1)
+  })
+
+  test('Given 写提交耐久不确定且复读不一致 When 更新 Then 报 commit-unconfirmed 且不重写', async () => {
+    const fixture = createFixture({
       content: JSON.stringify(createConfig()),
+      writeOutcome: { commitVisible: true, durabilityUncertain: true, error: 'directory flush failed' },
       rereadContent: JSON.stringify(createConfig({ revision: 99 })),
     })
 
-    await expect(uncertain.store.update(createUpdate({ instruction: 'new' })))
-      .rejects.toThrow('CANVAS_AGENT_CONFIG_DURABILITY_UNCERTAIN')
-    await expect(revoked.store.update(createUpdate({ instruction: 'new' }))).rejects.toThrow()
-    await expect(mismatch.store.update(createUpdate({ instruction: 'new' })))
+    await expect(fixture.store.update(createUpdate({ instruction: 'new' })))
       .rejects.toThrow('CANVAS_AGENT_CONFIG_COMMIT_UNCONFIRMED')
+    expect(fixture.writeCount).toBe(1)
+  })
+
+  test('Given uncertain 写返回后 capability 被撤销 When 更新 Then 保留 commit-unconfirmed 阶段且不重写', async () => {
+    const fixture = createFixture({
+      content: JSON.stringify(createConfig()),
+      revokeAfterWrite: true,
+      writeOutcome: { commitVisible: true, durabilityUncertain: true, error: 'directory flush failed' },
+    })
+
+    await expect(fixture.store.update(createUpdate({ instruction: 'new' })))
+      .rejects.toThrow('CANVAS_AGENT_CONFIG_COMMIT_UNCONFIRMED')
+    expect(fixture.writeCount).toBe(1)
   })
 })

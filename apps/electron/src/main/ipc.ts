@@ -2003,6 +2003,8 @@ export function registerIpcHandlers(): void {
   const canvasSessionStore = new CanvasSessionStore({ pathResolver: designPathResolver })
   /** 原生 Canvas 文档复用同一会话索引作为项目与 Canvas 双身份授权事实。 */
   const canvasDocumentStore = createCanvasDocumentStore({ sessions: canvasSessionStore })
+  /** Canvas 图、配置、候选批次与节点写操作共享唯一键控串行器。 */
+  const canvasOperationSerializer = createCanvasOperationSerializer()
   /** Canvas 与 legacy Design 共用仍存活主窗口授权边界。 */
   const listAuthorizedDesignWebContents = (): WebContents[] => {
     /** 销毁窗口不能继续调用 handler 或接收广播。 */
@@ -2045,6 +2047,7 @@ export function registerIpcHandlers(): void {
   /** Canvas Agent 长期配置复用唯一图文档 Store，并在保存时重新验证 Skills 与模型。 */
   const canvasAgentConfigStore = createCanvasAgentConfigStore({
     store: canvasDocumentStore,
+    runExclusive: (target, effect) => canvasOperationSerializer.run(target, effect),
     getWorkspaceSkills: (projectId) => {
       /** 项目 ID 必须解析到当前工作区，禁止跨项目读取 Skills。 */
       const workspace = getAgentWorkspace(projectId)
@@ -2249,8 +2252,6 @@ export function registerIpcHandlers(): void {
     closeBrowser: (sessionId) => browserController.close(sessionId),
     deleteSession: deleteAgentSession,
   })
-  /** 候选批次、LOAD、SAVE 与节点操作复用同一 Canvas 串行器。 */
-  const canvasOperationSerializer = createCanvasOperationSerializer()
   /** 候选批次使用唯一受管 Store，避免 Job 与 IPC 各自维护状态。 */
   const canvasImageCandidateBatchStore = createCanvasImageCandidateBatchStore({
     documents: canvasDocumentStore,
