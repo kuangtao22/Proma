@@ -1,4 +1,7 @@
-import { resolveCanvasEdgeBinding } from '@proma/shared'
+import {
+  CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS,
+  resolveCanvasEdgeBinding,
+} from '@proma/shared'
 import type { CanvasDocument, CanvasNode } from '@proma/shared'
 
 /** 正式产物提交后消费 producer 提示并传播直接下游的输入。 */
@@ -64,9 +67,15 @@ export function createCanvasDependencyStateService(): CanvasDependencyStateServi
           ...(node.upstreamChange?.sourceNodeIds ?? []),
           ...changedSources,
         ])].sort()
+        if (sourceNodeIds.length > CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS) {
+          throw new Error('CANVAS_DEPENDENCY_SOURCE_LIMIT_EXCEEDED')
+        }
         nodes.push({
           ...node,
-          upstreamChange: { sourceNodeIds, changedAt: input.changedAt },
+          upstreamChange: {
+            sourceNodeIds,
+            changedAt: Math.max(node.upstreamChange?.changedAt ?? 0, input.changedAt),
+          },
         })
       }
       return {

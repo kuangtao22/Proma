@@ -303,6 +303,9 @@ export function parseCanvasTrashEntry(value: unknown): CanvasTrashEntry {
   throw new Error('CANVAS_TRASH_ENTRY_INVALID')
 }
 
+/** 单个节点最多保留的未消费直接上游来源数。 */
+export const CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS = 128
+
 /** Canvas 节点共享的展示和布局字段。 */
 export interface CanvasNodeUpstreamChange {
   /** 本次变化的直接上游节点，按稳定 ID 排序且去重。 */
@@ -3077,7 +3080,7 @@ function parseCanvasNodeUpstreamChange(value: unknown): CanvasNodeUpstreamChange
   if (!hasExactCanvasKeys(value, ['sourceNodeIds', 'changedAt'])
     || !Array.isArray(value.sourceNodeIds)
     || value.sourceNodeIds.length < 1
-    || value.sourceNodeIds.length > 128
+    || value.sourceNodeIds.length > CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS
     || !value.sourceNodeIds.every(isCanvasLifecycleId)
     || new Set(value.sourceNodeIds).size !== value.sourceNodeIds.length
     || !isCanvasNonNegativeInteger(value.changedAt)) {

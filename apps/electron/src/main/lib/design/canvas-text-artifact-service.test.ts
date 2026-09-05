@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type {
   CanvasDocument,
   CanvasDocumentNode,
+  CanvasJsonValue,
   CanvasTextArtifactKind,
   CanvasWebviewNode,
   CanvasWorkspaceSnapshot,
@@ -33,6 +34,19 @@ const documentNode: CanvasDocumentNode = {
 const webviewNode: CanvasWebviewNode = {
   id: 'web-1', kind: 'webview', title: '原型', position: { x: 320, y: 0 },
   prototypeId: 'prototype-1', contentRevision: 3, devicePreset: 'desktop',
+}
+
+/**
+ * 从真实 GraphWriter 生成的 JSON batch 中提取节点 mutation。
+ * @param operations batch 外壳中尚未由 Store 解析的 JSON 操作。
+ * @returns fixture 内存文档需要提交的节点列表。
+ */
+function extractFixtureUpsertNodes(operations: CanvasJsonValue[]): CanvasDocument['nodes'] {
+  return operations.flatMap((operation) => {
+    if (operation === null || typeof operation !== 'object' || Array.isArray(operation)) return []
+    if (operation.type !== 'upsert-nodes' || !Array.isArray(operation.nodes)) return []
+    return operation.nodes as unknown as CanvasDocument['nodes']
+  })
 }
 
 /** 创建包含两类文本节点的权威图。 */
@@ -151,21 +165,40 @@ function createFixture(options: { failCommitOnce?: boolean } = {}) {
   const load = (): CanvasWorkspaceSnapshot => ({
     document: structuredClone(currentDocument), writable: true, nodeIssues: [],
   })
-  /** 内存 Graph Writer 只替换单节点并推进图 revision。 */
+  /** 在内存中应用真实 GraphWriter 产生的同批节点并推进图 revision。 */
+  const commitNodes = (expectedRevision: number, nodes: CanvasDocument['nodes']): CanvasDocument => {
+    if (currentDocument.revision !== expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+    const replacements = new Map(nodes.map((node) => [node.id, structuredClone(node)]))
+    currentDocument = {
+      ...currentDocument,
+      revision: currentDocument.revision + 1,
+      nodes: currentDocument.nodes.map((node) => replacements.get(node.id) ?? node),
+    }
+    return structuredClone(currentDocument)
+  }
+  /** fixture 使用真实 GraphWriter，避免测试替身丢弃 dependency projection。 */
+  const graphWriter = createCanvasTextArtifactGraphWriter({
+    documents: {
+      mutate: (_target, expectedRevision, mutations) => {
+        const nodes = mutations.flatMap((mutation) => mutation.type === 'upsert-nodes' ? mutation.nodes : [])
+        return commitNodes(expectedRevision, nodes)
+      },
+    },
+    batch: {
+      execute: async (input) => {
+        /** batch fixture 提交经过外壳隔离的真实节点 mutation。 */
+        const nodes = extractFixtureUpsertNodes(input.operations)
+        return { document: commitNodes(input.baseRevision, nodes), operationId: 'batch-fixture' }
+      },
+    },
+    dependencyState: createCanvasDependencyStateService(),
+    now: () => 50,
+  })
+  /** 记录输入后委托真实 GraphWriter，保留来源与基线断言能力。 */
   const graph = {
     commit: async (input: CanvasTextArtifactGraphCommitInput): Promise<CanvasDocument> => {
       graphInputs.push(structuredClone(input))
-      if (currentDocument.revision !== input.expectedCanvasRevision) {
-        throw new Error('CANVAS_REVISION_CONFLICT')
-      }
-      currentDocument = {
-        ...currentDocument,
-        revision: currentDocument.revision + 1,
-        nodes: currentDocument.nodes.map((node) => node.id === input.node.id
-          ? structuredClone(input.node)
-          : node),
-      }
-      return structuredClone(currentDocument)
+      return graphWriter.commit(input)
     },
   }
   /** 被测文本产物服务。 */
@@ -220,6 +253,40 @@ describe('Canvas Text Artifact Service', () => {
     expect(fixture.preparedInputs[0]?.createdBy).toEqual({ type: 'user' })
   })
 
+  test('Given 文档更新存在绑定下游 When service update Then revision 与下游提示在同一次 mutation 提交', async () => {
+    const fixture = createFixture()
+    const document = fixture.getDocument()
+    document.nodes[0] = {
+      ...document.nodes[0]!,
+      upstreamChange: { sourceNodeIds: ['older-source'], changedAt: 10 },
+    }
+    document.nodes[1] = {
+      ...document.nodes[1]!,
+      upstreamChange: { sourceNodeIds: ['pending-source'], changedAt: 20 },
+    }
+    document.edges = [{
+      id: 'edge-update', sourceNodeId: 'doc-1', sourcePort: 'document.markdown',
+      targetNodeId: 'web-1', targetPort: 'context.text', relation: 'depends-on',
+    }]
+    fixture.setDocument(document)
+
+    await fixture.service.update({
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'doc-1',
+      kind: 'document', contentId: 'content-1', expectedCanvasRevision: 7,
+      expectedContentRevision: 2, content: '# 第三版',
+      operationId: '11111111-1111-4111-8111-111111111112', source: { type: 'user' },
+    })
+
+    expect(fixture.graphInputs).toHaveLength(1)
+    expect(fixture.getDocument().nodes.find((node) => node.id === 'doc-1')).toMatchObject({
+      contentRevision: 3,
+    })
+    expect(fixture.getDocument().nodes.find((node) => node.id === 'doc-1')?.upstreamChange).toBeUndefined()
+    expect(fixture.getDocument().nodes.find((node) => node.id === 'web-1')?.upstreamChange).toEqual({
+      sourceNodeIds: ['doc-1', 'pending-source'], changedAt: 50,
+    })
+  })
+
   test('Given WebView 历史 revision 1 When 采用 Then 只切换 contentRevision 且不复制正文', async () => {
     const fixture = createFixture()
 
@@ -233,6 +300,40 @@ describe('Canvas Text Artifact Service', () => {
     expect(result.artifact.target).toMatchObject({ nodeId: 'web-1', contentRevision: 1 })
     expect(result.artifact.content).toBe('<main>第一版</main>')
     expect(fixture.preparedInputs).toHaveLength(0)
+  })
+
+  test('Given WebView 采用历史版本存在绑定下游 When service adopt Then revision 与下游提示在同一次 mutation 提交', async () => {
+    const fixture = createFixture()
+    const document = fixture.getDocument()
+    document.nodes[0] = {
+      ...document.nodes[0]!,
+      upstreamChange: { sourceNodeIds: ['pending-source'], changedAt: 20 },
+    }
+    document.nodes[1] = {
+      ...document.nodes[1]!,
+      upstreamChange: { sourceNodeIds: ['older-source'], changedAt: 10 },
+    }
+    document.edges = [{
+      id: 'edge-adopt', sourceNodeId: 'web-1', sourcePort: 'webview.html',
+      targetNodeId: 'doc-1', targetPort: 'context.text', relation: 'derives',
+    }]
+    fixture.setDocument(document)
+
+    await fixture.service.adopt({
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'web-1',
+      kind: 'webview', contentId: 'prototype-1', expectedCanvasRevision: 7,
+      expectedContentRevision: 3, revision: 1,
+      operationId: '22222222-2222-4222-8222-222222222223',
+    })
+
+    expect(fixture.graphInputs).toHaveLength(1)
+    expect(fixture.getDocument().nodes.find((node) => node.id === 'web-1')).toMatchObject({
+      contentRevision: 1,
+    })
+    expect(fixture.getDocument().nodes.find((node) => node.id === 'web-1')?.upstreamChange).toBeUndefined()
+    expect(fixture.getDocument().nodes.find((node) => node.id === 'doc-1')?.upstreamChange).toEqual({
+      sourceNodeIds: ['pending-source', 'web-1'], changedAt: 50,
+    })
   })
 
   test('Given 图或正文基线过期 When 更新 Then 不创建可见新版本', async () => {
@@ -557,5 +658,48 @@ describe('Canvas Text Artifact Graph Writer', () => {
     expect(mutationCalls).toBe(1)
     expect(document.nodes[0]?.upstreamChange).toEqual({ sourceNodeIds: ['older-source'], changedAt: 5 })
     expect(document.nodes[1]?.upstreamChange).toBeUndefined()
+  })
+
+  test('Given 下游已有 128 个不同来源 When 文本提交新增来源 Then 稳定拒绝且 mutate 零调用', async () => {
+    const producer = documentNode
+    const downstream: CanvasDocumentNode = {
+      id: 'doc-limit', kind: 'document', title: '来源上限', position: { x: 320, y: 0 },
+      documentId: 'content-limit', contentRevision: 1,
+      upstreamChange: {
+        sourceNodeIds: Array.from({ length: 128 }, (_, index) => `source-${index.toString().padStart(3, '0')}`),
+        changedAt: 20,
+      },
+    }
+    const document: CanvasDocument = {
+      ...createDocument(),
+      nodes: [producer, downstream],
+      edges: [{
+        id: 'edge-limit', sourceNodeId: producer.id, sourcePort: 'document.markdown',
+        targetNodeId: downstream.id, targetPort: 'context.text', relation: 'reference',
+      }],
+    }
+    let mutationCalls = 0
+    const writer = createCanvasTextArtifactGraphWriter({
+      documents: {
+        mutate: () => {
+          mutationCalls += 1
+          return document
+        },
+      },
+      batch: { execute: async () => { throw new Error('测试不使用 Agent batch') } },
+      dependencyState: createCanvasDependencyStateService(),
+      now: () => 50,
+    })
+
+    await expect(writer.commit({
+      projectId: document.projectId,
+      canvasId: document.canvasId,
+      operationId: 'operation-limit',
+      expectedCanvasRevision: document.revision,
+      document,
+      node: { ...producer, contentRevision: 3 },
+    })).rejects.toThrow('CANVAS_DEPENDENCY_SOURCE_LIMIT_EXCEEDED')
+    expect(mutationCalls).toBe(0)
+    expect(document.nodes[1]).toEqual(downstream)
   })
 })

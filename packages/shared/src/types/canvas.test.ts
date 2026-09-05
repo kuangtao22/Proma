@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   CANVAS_IPC_CHANNELS,
   CANVAS_DOCUMENT_VERSION,
+  CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS,
   applyCanvasMutations,
   createCanvasBoundEdge,
   createEmptyCanvasDocument,
@@ -386,6 +387,35 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given 上游来源达到共享上限 When 解析工作区快照 Then 接受 128 并拒绝 129', () => {
+    expect(CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS).toBe(128)
+    const document = structuredClone(createDocument())
+    /** 使用补零稳定 ID，确保数组同时满足严格排序合同。 */
+    const sourceNodeIds = Array.from(
+      { length: CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS },
+      (_, index) => `source-${index.toString().padStart(3, '0')}`,
+    )
+    document.nodes[0] = {
+      ...document.nodes[0]!,
+      upstreamChange: { sourceNodeIds, changedAt: 100 },
+    }
+    const snapshot = { document, writable: true as const, nodeIssues: [] }
+
+    expect(parseCanvasWorkspaceSnapshot(snapshot).document.nodes[0]?.upstreamChange?.sourceNodeIds)
+      .toHaveLength(CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS)
+    expect(() => parseCanvasWorkspaceSnapshot({
+      ...snapshot,
+      document: {
+        ...document,
+        nodes: [{
+          ...document.nodes[0]!,
+          upstreamChange: { sourceNodeIds: [...sourceNodeIds, 'source-999'], changedAt: 100 },
+        }],
+        edges: [],
+      },
+    })).toThrow('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  })
+
   test('Given 工作区快照包含类型化端口 When 严格解析 Then 保留可信绑定', () => {
     /** Renderer 公开快照必须接受 Host 已验证且含点号的类型化端口。 */
     const document = createDocument()

@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   CANVAS_DOCUMENT_VERSION,
+  CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS,
   createEmptyCanvasDocument,
 } from '@proma/shared'
 import type { CanvasAgentNode, CanvasDocument, CanvasMutation, CanvasNode } from '@proma/shared'
@@ -164,6 +165,30 @@ describe('CanvasDocumentStore', () => {
       }],
     }
   }
+
+  test('Given 上游来源达到共享上限 When 解析权威文档 Then 接受上限并拒绝再多一个', () => {
+    const document = createConnectedDocument()
+    /** 使用共享常量生成边界输入，避免测试与 parser 各自维护数字。 */
+    const sourceNodeIds = Array.from(
+      { length: CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS },
+      (_, index) => `source-${index.toString().padStart(3, '0')}`,
+    )
+    document.nodes[0] = {
+      ...document.nodes[0]!,
+      upstreamChange: { sourceNodeIds, changedAt: 100 },
+    }
+
+    expect(parseCanvasDocument(document, document).document.nodes[0]?.upstreamChange?.sourceNodeIds)
+      .toHaveLength(CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS)
+    expect(() => parseCanvasDocument({
+      ...document,
+      nodes: [{
+        ...document.nodes[0]!,
+        upstreamChange: { sourceNodeIds: [...sourceNodeIds, 'source-999'], changedAt: 100 },
+      }],
+      edges: [],
+    }, document)).toThrow('CANVAS_DOCUMENT_INVALID')
+  })
 
   test('Given v4 历史边使用 output/input When 加载 Then 保留原端口并作为未解析关系返回', () => {
     const fixture = createFixture()

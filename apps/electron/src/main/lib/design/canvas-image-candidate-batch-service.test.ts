@@ -458,6 +458,49 @@ describe('Canvas 图片候选批次 Service', () => {
     })
   })
 
+  test('Given 下游已有 128 个来源 When 正式采用新增来源 Then 在 intent 和模块写入前稳定拒绝', async () => {
+    const fixture = createFixture()
+    const downstream: CanvasNode = {
+      id: 'downstream-limit', kind: 'document', title: '来源上限', position: { x: 0, y: 100 },
+      documentId: 'document-limit', contentRevision: 1,
+      upstreamChange: {
+        sourceNodeIds: Array.from({ length: 128 }, (_, index) => `source-${index.toString().padStart(3, '0')}`),
+        changedAt: 80,
+      },
+    }
+    fixture.canvas = {
+      ...fixture.canvas,
+      nodes: [...fixture.canvas.nodes, downstream],
+      edges: [{
+        id: 'edge-limit', sourceNodeId: 'node-0', sourcePort: 'image.asset',
+        targetNodeId: downstream.id, targetPort: 'context.image', relation: 'depends-on',
+      }],
+    }
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-limit', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+    })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, jobId: 'job-0', status: 'succeeded', outputAssetId: 'new-0', error: null,
+    })
+    /** adoption 前的全部权威事实用于证明溢出是零副作用预检。 */
+    const beforeCanvas = structuredClone(fixture.canvas)
+    const beforeConfig = structuredClone(fixture.configs.get('node-0'))
+    const beforeBatch = structuredClone(fixture.batches.get('batch-limit'))
+
+    await expect(fixture.service.adopt({
+      ...fixture.target, batchId: 'batch-limit', mode: 'all',
+    })).rejects.toThrow('CANVAS_DEPENDENCY_SOURCE_LIMIT_EXCEEDED')
+
+    expect(fixture.intents.size).toBe(0)
+    expect(fixture.adopted).toEqual([])
+    expect(fixture.started).toEqual([])
+    expect(fixture.retried).toEqual([])
+    expect(fixture.configs.get('node-0')).toEqual(beforeConfig)
+    expect(fixture.batches.get('batch-limit')).toEqual(beforeBatch)
+    expect(fixture.canvas).toEqual(beforeCanvas)
+  })
+
   test.each(['after-first-module', 'after-all-modules', 'after-graph', 'after-batch'] as const)(
     'Given %s 崩溃 When reconcile Then 不重复 revision 且完成整批采用',
     async (crashPoint) => {
@@ -471,13 +514,36 @@ describe('Canvas 图片候选批次 Service', () => {
           ...fixture.target, jobId: `job-${index}`, status: 'succeeded', outputAssetId: `new-${index}`, error: null,
         })
       }
+      /** crash 基线同时包含 producer 旧提示与绑定下游，验证恢复哈希覆盖完整依赖投影。 */
+      fixture.canvas.nodes[0] = {
+        ...fixture.canvas.nodes[0]!,
+        upstreamChange: { sourceNodeIds: ['older-source'], changedAt: 20 },
+      }
+      fixture.canvas.nodes.push({
+        id: 'downstream-recovery', kind: 'document', title: '恢复下游', position: { x: 0, y: 100 },
+        documentId: 'document-recovery', contentRevision: 1,
+        upstreamChange: { sourceNodeIds: ['pending-source'], changedAt: 30 },
+      })
+      fixture.canvas.edges = [{
+        id: 'edge-recovery-0', sourceNodeId: 'node-0', sourcePort: 'image.asset',
+        targetNodeId: 'downstream-recovery', targetPort: 'context.image', relation: 'depends-on',
+      }, {
+        id: 'edge-recovery-1', sourceNodeId: 'node-1', sourcePort: 'image.asset',
+        targetNodeId: 'downstream-recovery', targetPort: 'context.image', relation: 'derives',
+      }]
       /** 预先计算采用完成后的精确图事实，模拟重启时磁盘上的不同阶段。 */
       const projectedCanvas: CanvasDocument = {
         ...fixture.canvas,
         revision: 4,
-        nodes: fixture.canvas.nodes.map((node, index) => (
-          index < 2 && node.kind === 'image' ? { ...node, adoptedAssetId: `new-${index}` } : node
-        )),
+        nodes: fixture.canvas.nodes.map((node, index) => {
+          if (index < 2 && node.kind === 'image') {
+            const { upstreamChange: _consumed, ...producer } = node
+            return { ...producer, adoptedAssetId: `new-${index}` }
+          }
+          return node.id === 'downstream-recovery'
+            ? { ...node, upstreamChange: { sourceNodeIds: ['node-0', 'node-1', 'pending-source'], changedAt: 100 } }
+            : node
+        }),
         updatedAt: 100,
       }
       /** intent 哈希只覆盖稳定图数据，不包含 revision 与时间。 */
@@ -526,7 +592,7 @@ describe('Canvas 图片候选批次 Service', () => {
             mode: 'all',
             adoptedNodeIds: ['node-0', 'node-1'],
             keptNodeIds: [],
-            invalidatedDownstreamNodeIds: [],
+            invalidatedDownstreamNodeIds: ['downstream-recovery'],
             committedAt: 100,
           },
           updatedAt: 100,
@@ -540,6 +606,10 @@ describe('Canvas 图片候选批次 Service', () => {
       expect(fixture.intents.get('operation-1')?.state).toBe('batch-committed')
       expect(fixture.canvas.nodes.slice(0, 2).map((node) => node.kind === 'image' ? node.adoptedAssetId : null))
         .toEqual(['new-0', 'new-1'])
+      expect(fixture.canvas.nodes.find((node) => node.id === 'node-0')?.upstreamChange).toBeUndefined()
+      expect(fixture.canvas.nodes.find((node) => node.id === 'downstream-recovery')?.upstreamChange).toEqual({
+        sourceNodeIds: ['node-0', 'node-1', 'pending-source'], changedAt: 100,
+      })
     },
   )
 })

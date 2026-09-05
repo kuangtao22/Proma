@@ -33,6 +33,18 @@ function createDocument(nodes: CanvasNode[]): CanvasDocument {
   }
 }
 
+/** 创建指定数量且稳定排序的既有待更新来源。 */
+function createSourceNodeIds(count: number): string[] {
+  return Array.from({ length: count }, (_, index) => `source-${index.toString().padStart(3, '0')}`)
+}
+
+/** 创建单条 document 到 document 的可信依赖边。 */
+function connectProducer(document: CanvasDocument, producer: CanvasNode, downstream: CanvasNode): void {
+  document.edges = [createCanvasBoundEdge(producer, downstream, {
+    id: 'edge-limit', sourceNodeId: producer.id, targetNodeId: downstream.id, relation: 'depends-on',
+  })]
+}
+
 describe('Canvas Dependency State Service', () => {
   test('Given producer 已有待更新来源 When 提交正式输出 Then 清除自身提示并保持无关节点语义不变', () => {
     const service = createCanvasDependencyStateService()
@@ -145,5 +157,60 @@ describe('Canvas Dependency State Service', () => {
       sourceNodeIds: ['producer-a', 'producer-z', 'source-z'],
       changedAt: 40,
     })
+  })
+
+  test('Given 下游已有 127 个来源 When 新 producer 提交 Then 无损合并为 128 个来源', () => {
+    const service = createCanvasDependencyStateService()
+    const producer = createDocumentNode('producer-new')
+    const downstream = createDocumentNode('downstream', createSourceNodeIds(127))
+    const document = createDocument([producer, downstream])
+    connectProducer(document, producer, downstream)
+
+    const result = service.consumeAndPropagate({ document, producerNodeIds: [producer.id], changedAt: 20 })
+
+    expect(result.nodes.find((node) => node.id === downstream.id)?.upstreamChange?.sourceNodeIds)
+      .toHaveLength(128)
+  })
+
+  test('Given 下游已有 128 个来源且包含 producer When 重复传播 Then 去重后仍成功', () => {
+    const service = createCanvasDependencyStateService()
+    const producer = createDocumentNode('producer-existing')
+    const existingSources = [...createSourceNodeIds(127), producer.id].sort()
+    const downstream = createDocumentNode('downstream', existingSources)
+    const document = createDocument([producer, downstream])
+    connectProducer(document, producer, downstream)
+
+    const result = service.consumeAndPropagate({ document, producerNodeIds: [producer.id], changedAt: 20 })
+
+    expect(result.nodes.find((node) => node.id === downstream.id)?.upstreamChange?.sourceNodeIds)
+      .toEqual(existingSources)
+  })
+
+  test('Given 下游已有 128 个不同来源 When 新 producer 提交 Then 稳定拒绝且不返回非法投影', () => {
+    const service = createCanvasDependencyStateService()
+    const producer = createDocumentNode('producer-new')
+    const downstream = createDocumentNode('downstream', createSourceNodeIds(128))
+    const document = createDocument([producer, downstream])
+    connectProducer(document, producer, downstream)
+
+    expect(() => service.consumeAndPropagate({
+      document,
+      producerNodeIds: [producer.id],
+      changedAt: 20,
+    })).toThrow('CANVAS_DEPENDENCY_SOURCE_LIMIT_EXCEEDED')
+    expect(document.nodes[1]).toEqual(downstream)
+  })
+
+  test('Given 下游已有较新的 changedAt When 迟到 producer 变化传播 Then 时间不倒退', () => {
+    const service = createCanvasDependencyStateService()
+    const producer = createDocumentNode('producer-new')
+    const downstream = createDocumentNode('downstream', ['older-source'])
+    downstream.upstreamChange = { sourceNodeIds: ['older-source'], changedAt: 100 }
+    const document = createDocument([producer, downstream])
+    connectProducer(document, producer, downstream)
+
+    const result = service.consumeAndPropagate({ document, producerNodeIds: [producer.id], changedAt: 50 })
+
+    expect(result.nodes.find((node) => node.id === downstream.id)?.upstreamChange?.changedAt).toBe(100)
   })
 })

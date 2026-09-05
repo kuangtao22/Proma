@@ -13,6 +13,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import {
   applyCanvasMutations,
   CANVAS_DOCUMENT_VERSION,
+  CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS,
   createEmptyCanvasDocument,
   isCanvasArtifactInputSlot,
   isCanvasArtifactOutputCapability,
@@ -378,7 +379,7 @@ function parseCanvasNode(
       || !hasExactKeys(rawChange, ['sourceNodeIds', 'changedAt'])
       || !Array.isArray(rawSourceNodeIds)
       || rawSourceNodeIds.length < 1
-      || rawSourceNodeIds.length > 128
+      || rawSourceNodeIds.length > CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS
       || !rawSourceNodeIds.every(isSafeDesignStableId)
       || new Set(rawSourceNodeIds).size !== rawSourceNodeIds.length
       || rawSourceNodeIds.some((nodeId, index) => (
