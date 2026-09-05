@@ -10,6 +10,7 @@ import type {
   AgentMessage,
   AgentSendInput,
 } from '@proma/shared'
+import type { AgentRunExtensions } from './agent-run-extensions'
 
 export interface HeadlessAgentRunCallbacks {
   onError: (error: string) => void
@@ -23,6 +24,7 @@ export interface HeadlessAgentRunCallbacks {
 export type HeadlessAgentRunner = (
   input: AgentSendInput,
   callbacks: HeadlessAgentRunCallbacks,
+  extensions?: AgentRunExtensions,
 ) => Promise<void>
 
 export type AgentStopper = (sessionId: string) => void
@@ -41,11 +43,12 @@ export function setAgentStopper(stopper: AgentStopper): void {
 export async function runRegisteredHeadlessAgent(
   input: AgentSendInput,
   callbacks: HeadlessAgentRunCallbacks,
+  extensions?: AgentRunExtensions,
 ): Promise<void> {
   if (!headlessRunner) {
     throw new Error('Agent headless runner 尚未初始化')
   }
-  await headlessRunner(input, callbacks)
+  await headlessRunner(input, callbacks, extensions)
 }
 
 export function stopRegisteredAgent(sessionId: string): void {

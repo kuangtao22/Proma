@@ -779,14 +779,11 @@ function createContext(options: {
         agentCalls.push({ type: 'messages', value: sessionId })
         return [{ type: 'user', message: { content: [{ type: 'text', text: '已有消息' }] } }] as SDKMessage[]
       },
-      reserveStart: (sessionId, startedAt) => {
-        agentCalls.push({ type: 'reserve', value: { sessionId, startedAt } })
+      execution: { execute: async (request) => {
+        agentCalls.push({ type: 'execute', value: request })
         if (options.reserveStartError) throw options.reserveStartError
-        return () => { agentCalls.push({ type: 'release', value: sessionId }) }
-      },
-      run: async (input, sender, extensions) => {
-        agentCalls.push({ type: 'run', value: { input, senderId: sender.id, extensions } })
-      },
+        return { status: 'completed' as const }
+      } },
       stop: (sessionId) => { agentCalls.push({ type: 'stop', value: sessionId }) },
       outputs: {
         read: options.agentOutput ?? (async () => '默认 Agent 正式输出'),
@@ -2695,100 +2692,36 @@ describe('原生 Canvas 文档 IPC', () => {
     })
     expect(sent).toEqual({ ok: true, value: { ok: true } })
     expect(stopped).toEqual({ ok: true, value: undefined })
-    expect(context.calls.filter((call) => call === 'batch:reconcile')).toHaveLength(3)
-    expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(3)
-    /** 从真实运行记录中读取系统追加项，避免非对称 matcher 影响后续序列化断言。 */
-    const runCall = context.agentCalls.find((call) => call.type === 'run')
-    /** 运行扩展是主进程可信测试值，只收窄本测试需要的字段。 */
-    const runValue = runCall?.value as {
-      input?: { userMessage?: string; rawUserMessage?: string }
-      extensions?: { systemPromptAppend?: string }
-    } | undefined
-    /** 完整 Canvas 场景说明必须以字符串进入 Agent runtime。 */
-    const canvasSystemPrompt = runValue?.extensions?.systemPromptAppend
-    expect(canvasSystemPrompt).toContain('当前会话已经位于原生 Canvas')
-    expect(canvasSystemPrompt).toContain('不得要求用户创建、打开或切换到另一个 Design/Canvas')
+    expect(context.calls.filter((call) => call === 'batch:reconcile')).toHaveLength(2)
+    expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(2)
     expect(context.agentCalls).toEqual([
       { type: 'messages', value: '22222222-2222-4222-8222-222222222222' },
-      { type: 'reserve', value: {
-        sessionId: '22222222-2222-4222-8222-222222222222',
-        startedAt: 10,
+      { type: 'execute', value: {
+        mode: 'renderer-manual',
+        target: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1' },
+        sender: context.sender,
+        message: '请分析当前项目', userMessageUuid: 'message-1', startedAt: 10,
       } },
-      { type: 'run', value: {
-        input: {
-          sessionId: '22222222-2222-4222-8222-222222222222',
-          userMessage: '请分析当前项目', rawUserMessage: '请分析当前项目',
-          userMessageUuid: 'message-1', startedAt: 10,
-          channelId: 'channel-1', modelId: 'model-1', workspaceId: 'project-1', triggeredBy: 'user',
-        },
-        senderId: 1,
-        extensions: {
-          allowedToolNames: ['Read', 'Glob', 'Grep'],
-          systemPromptAppend: canvasSystemPrompt,
-        },
-      } },
-      { type: 'release', value: '22222222-2222-4222-8222-222222222222' },
       { type: 'stop', value: '22222222-2222-4222-8222-222222222222' },
     ])
-    expect(runCall).toMatchObject({
-      value: {
-        input: {
-          userMessage: '请分析当前项目',
-          rawUserMessage: '请分析当前项目',
-        },
-        extensions: {
-          systemPromptAppend: canvasSystemPrompt,
-        },
-      },
-    })
   })
 
-  test('Given Canvas Agent 存在直接输入节点 When SEND Then 注入固定画布工具与权威上游引用', async () => {
-    const document = createDocument(4)
-    document.nodes = [{
-      id: 'node-1', kind: 'agent', title: '视频导演 Agent', position: { x: 320, y: 0 },
-      agentSessionId: '22222222-2222-4222-8222-222222222222',
-    }, {
-      id: 'brief-1', kind: 'document', title: '视频生产合同', position: { x: 0, y: 0 },
-      documentId: 'content-1', contentRevision: 2,
-    }]
-    document.edges = [{
-      id: 'edge-1', sourceNodeId: 'brief-1', sourcePort: 'output',
-      targetNodeId: 'node-1', targetPort: 'input', relation: 'depends-on',
-    }]
-    const context = createContext({
-      loadResult: { document, writable: true, nodeIssues: [] },
-      enableToolProviderRuntime: true,
+  test('Given Renderer SEND When 调用 Then 只委托统一执行服务且保留可信输入身份', async () => {
+    const context = createContext()
+    await invoke(context.handlers, CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      message: '开始创建下游产物', userMessageUuid: 'message-1', startedAt: 10,
     })
-    try {
-      await invoke(context.handlers, CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE, context.sender, {
-        projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
-        message: '开始创建下游产物', userMessageUuid: 'message-1', startedAt: 10,
-      })
 
-      const runCall = context.agentCalls.find((call) => call.type === 'run')
-      const runValue = runCall?.value as {
-        extensions?: {
-          allowedToolNames?: string[]
-          piCustomTools?: Array<{ name: string }>
-          systemPromptAppend?: string
-        }
-      } | undefined
-      const allowedToolNames = runValue?.extensions?.allowedToolNames ?? []
-      const customToolNames = runValue?.extensions?.piCustomTools?.map((tool) => tool.name) ?? []
-      expect(allowedToolNames).toContain('canvas_create_artifact')
-      expect(allowedToolNames).toContain('canvas_apply_changes')
-      expect(allowedToolNames).toContain('canvas_import_image')
-      expect(allowedToolNames).not.toContain('canvas_manage')
-      expect(allowedToolNames).not.toContain('canvas_create_agent')
-      expect(customToolNames).toContain('canvas_read')
-      expect(customToolNames).not.toContain('canvas_manage')
-      expect(customToolNames).not.toContain('canvas_create_agent')
-      expect(runValue?.extensions?.systemPromptAppend).toContain('brief-1')
-      expect(runValue?.extensions?.systemPromptAppend).toContain('直接创建或更新当前画布的下游产物')
-    } finally {
-      context.registration.dispose()
-    }
+    expect(context.agentCalls).toEqual([{
+      type: 'execute',
+      value: {
+        mode: 'renderer-manual',
+        target: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1' },
+        sender: context.sender,
+        message: '开始创建下游产物', userMessageUuid: 'message-1', startedAt: 10,
+      },
+    }])
   })
 
   test('Given Canvas Agent 已在运行 When SEND 预留启动槽失败 Then 只返回稳定公开 busy 结果', async () => {
@@ -2814,12 +2747,8 @@ describe('原生 Canvas 文档 IPC', () => {
         error: { code: 'SESSION_BUSY', message: '会话正在运行，请先停止当前任务。' },
       },
     })
-    expect(context.agentCalls).toEqual([
-      { type: 'reserve', value: {
-        sessionId: '22222222-2222-4222-8222-222222222222',
-        startedAt: 10,
-      } },
-    ])
+    expect(context.agentCalls).toHaveLength(1)
+    expect(context.agentCalls[0]?.type).toBe('execute')
   })
 
   test('Given Canvas Agent 普通准入错误 When SEND 预留启动槽失败 Then 返回安全发送失败', async () => {
@@ -3720,8 +3649,7 @@ describe('原生 Canvas 文档 IPC', () => {
         listActiveRuns: () => ({ owners: [], internalInvalidRuns: [] }),
         getSession: () => undefined,
         getMessages: () => [],
-        reserveStart: () => () => undefined,
-        run: async () => undefined,
+        execution: { execute: async () => ({ status: 'completed' as const }) },
         stop: () => undefined,
         outputs: { read: async () => `Agent 输出 ${revision}` },
       },

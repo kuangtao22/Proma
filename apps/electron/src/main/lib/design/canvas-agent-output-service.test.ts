@@ -373,6 +373,37 @@ describe('Canvas Agent 正式输出服务', () => {
     expect(fixture.getPublishStates()).toEqual([])
   })
 
+  test.each([
+    ['owner', (document: CanvasDocument) => ({
+      ...document,
+      nodes: document.nodes.map((node) => node.id === target.nodeId && node.kind === 'agent'
+        ? { ...node, agentSessionId: 'session-other' }
+        : node),
+    })],
+    ['pointer', (document: CanvasDocument) => ({
+      ...document,
+      nodes: document.nodes.map((node) => node.id === target.nodeId && node.kind === 'agent'
+        ? { ...node, outputPointer: { ...node.outputPointer!, contentSha256: 'f'.repeat(64) } }
+        : node),
+    })],
+    ['producer pending', (document: CanvasDocument) => ({
+      ...document,
+      nodes: document.nodes.map((node) => node.id === target.nodeId
+        ? { ...node, upstreamChange: { sourceNodeIds: ['stale-input'], changedAt: 100 } }
+        : node),
+    })],
+  ])('Given mutate uncertain 后 %s 独立不一致 When commit Then 不误确认提交', async (_case, mutateDocument) => {
+    const fixture = createFixture({
+      messages: currentRun(assistant(lastUuid, [{ type: 'text', text: '正式正文' }])),
+      mutateReturnsUncertain: true,
+      afterUncertainWrite: mutateDocument,
+    })
+
+    await expect(fixture.service.commit(completion())).rejects.toThrow('CANVAS_COMMIT_UNCERTAIN')
+    expect(fixture.getMutateCalls()).toBe(1)
+    expect(fixture.getPublishStates()).toEqual([])
+  })
+
   test('Given 广播失败 When commit Then 已提交图事实仍返回成功且不回滚', async () => {
     const fixture = createFixture({
       messages: currentRun(assistant(lastUuid, [{ type: 'text', text: '正式正文' }])),
@@ -401,6 +432,26 @@ describe('Canvas Agent 正式输出服务', () => {
     }))).rejects.toThrow('CANVAS_AGENT_OUTPUT_STALE')
     expect(fixture.getDocument()).toEqual(committed)
     expect(fixture.getMutateCalls()).toBe(1)
+  })
+
+  test('Given 已提交代次 When 精确释放 owner 与 generation Then 只释放完全匹配的保护项', async () => {
+    const generationTwoAnchor = '123e4567-e89b-42d3-a456-426614174091'
+    const fixture = createFixture({ messages: [
+      user(anchorUuid), assistant(firstUuid, [{ type: 'text', text: '第一代' }]),
+      user(generationTwoAnchor), assistant(lastUuid, [{ type: 'text', text: '第二代' }]),
+    ] })
+    await fixture.service.commit(completion({
+      userMessageUuid: generationTwoAnchor, runGeneration: 2, completedAt: 80,
+    }))
+
+    fixture.service.releaseGeneration({ ...target, agentSessionId: 'session-1', runGeneration: 1 })
+    await expect(fixture.service.commit(completion({ runGeneration: 1, completedAt: 150 })))
+      .rejects.toThrow('CANVAS_AGENT_OUTPUT_STALE')
+
+    fixture.service.releaseGeneration({ ...target, agentSessionId: 'session-1', runGeneration: 2 })
+    await expect(fixture.service.commit(completion({ runGeneration: 1, completedAt: 150 }))).resolves.toMatchObject({
+      pointer: { messageUuid: firstUuid },
+    })
   })
 
   test('Given 旧 session 高代次已提交且同节点重建 When 新 session generation 1 完成且旧回调迟到 Then 新输出可提交且旧输出 fail closed', async () => {

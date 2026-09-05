@@ -216,6 +216,7 @@ import { AgentCanvasBindingStore } from './lib/design/agent-canvas-binding-store
 import { createCanvasToolAccessFacade } from './lib/design/canvas-tool-access-facade'
 import {
   createCanvasOperationSerializer,
+  getCanvasToolProviderRuntime,
   registerCanvasDocumentIpcHandlers,
 } from './lib/design/canvas-document-ipc'
 import { createCanvasAgentBatchOperationService } from './lib/design/canvas-agent-batch-operation'
@@ -246,6 +247,7 @@ import { createCanvasImageCandidateBatchStore } from './lib/design/canvas-image-
 import { createCanvasImageCandidateBatchService } from './lib/design/canvas-image-candidate-batch-service'
 import { createCanvasDependencyStateService } from './lib/design/canvas-dependency-state-service'
 import { createCanvasAgentOutputService } from './lib/design/canvas-agent-output-service'
+import { createCanvasAgentExecutionService } from './lib/design/canvas-agent-execution-service'
 import {
   createCanvasWebviewPreviewService,
   createElectronCanvasWebviewOffscreenRenderer,
@@ -2285,6 +2287,65 @@ export function registerIpcHandlers(): void {
       }
     },
   })
+  /** Renderer 与父 Agent 共用的 Canvas Agent 生命周期，不依赖工作台挂载状态。 */
+  const canvasAgentExecutionService = createCanvasAgentExecutionService({
+    reconcile: async (target) => {
+      /** batch 与 Agent intent 必须在同一 Canvas 串行器和 workspace lease 中完成对账。 */
+      const guarded = await canvasOperationSerializer.run(target, () => (
+        workspaceOperationGuard.runWorkspaceWrite(target.projectId, async () => ({
+          batch: await canvasAgentBatchOperation.reconcileLocked(target),
+          agent: await canvasAgentNodeCreation.reconcile(target),
+        }))
+      ))
+      /** 对账提交已可见且 lease 已释放后再广播，单窗口失败不击穿运行。 */
+      const publications = [
+        ...guarded.batch.publications,
+        ...(guarded.agent.documentChanged ? [{ document: guarded.agent.snapshot.document }] : []),
+      ]
+      /** 同一恢复 revision 只发布一次，并保留 batch 原始 source 路由。 */
+      const publishedRevisions = new Set<number>()
+      for (const publication of publications) {
+        if (publishedRevisions.has(publication.document.revision)) continue
+        publishedRevisions.add(publication.document.revision)
+        for (const contents of listAuthorizedDesignWebContents()) {
+          try {
+            contents.send(CANVAS_IPC_CHANNELS.CHANGED, {
+              projectId: target.projectId,
+              canvasId: target.canvasId,
+              revision: publication.document.revision,
+              cause: 'graph',
+              ...('source' in publication ? { source: publication.source } : {}),
+            })
+          } catch (error) {
+            console.error('[Canvas Agent 执行] 对账图事实广播失败:', error)
+          }
+        }
+      }
+      if (guarded.agent.error) throw guarded.agent.error
+      return guarded.agent.snapshot
+    },
+    getSession: getAgentSessionMeta,
+    configs: canvasAgentConfigStore,
+    getWorkspaceSkills: (projectId) => {
+      /** 每次运行 fresh-read 当前项目启用 Skills，禁用或删除后不能沿用旧配置。 */
+      const workspace = getAgentWorkspace(projectId)
+      if (!workspace) throw new Error('CANVAS_AGENT_CONFIG_WORKSPACE_INVALID')
+      return getWorkspaceSkills(workspace.slug)
+    },
+    assertModelAvailable: (channelId, modelId) => {
+      assertEnabledModelForChannel({ channelId, modelId, purpose: 'Canvas Agent 运行' })
+    },
+    reserveStart: reserveAgentSessionStart,
+    createCanvasRun: (context) => getCanvasToolProviderRuntime()?.createRun(context),
+    runRenderer: runAgent,
+    runHeadless: runAgentHeadless,
+    subscribeStopped: (sessionId, startedAt, listener) => agentEventBus.on((eventSessionId, payload) => {
+      if (eventSessionId !== sessionId || payload.kind !== 'proma_event') return
+      if (payload.event.type === 'run_stopped' && payload.event.startedAt === startedAt) listener()
+    }),
+    outputs: canvasAgentOutputService,
+    stopAgent,
+  })
   /** Service 回调只会在 Job Manager 完成赋值后执行。 */
   let designJobManager: DesignJobManager
   const canvasImageCandidateBatchService = createCanvasImageCandidateBatchService({
@@ -2708,8 +2769,7 @@ export function registerIpcHandlers(): void {
       listActiveRuns: listActiveCanvasAgentRuns,
       getSession: getAgentSessionMeta,
       getMessages: getAgentSessionSDKMessages,
-      reserveStart: reserveAgentSessionStart,
-      run: runAgent,
+      execution: canvasAgentExecutionService,
       stop: stopAgent,
       outputs: canvasAgentOutputService,
     },

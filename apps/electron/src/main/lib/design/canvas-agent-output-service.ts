@@ -53,6 +53,8 @@ export interface CanvasAgentOutputService {
   resolveCompletedOutput: (input: CanvasAgentCompletionInput) => CanvasResolvedAgentOutput
   commit: (input: CanvasAgentOutputCommitInput) => Promise<CanvasAgentOutputCommitResult>
   read: (target: CanvasAgentTarget) => Promise<string>
+  /** 仅由统一执行服务在当前 run 已无回调后精确释放内存代次。 */
+  releaseGeneration: (input: CanvasAgentTarget & { agentSessionId: string; runGeneration: number }) => void
 }
 
 /** 服务只依赖唯一文档 Store、共享锁、会话索引和 SDK 消息日志。 */
@@ -387,6 +389,14 @@ export function createCanvasAgentOutputService(
         return matchedContent
       } catch (error) {
         throw new Error('CANVAS_AGENT_OUTPUT_INVALID', { cause: error })
+      }
+    },
+    releaseGeneration: (input) => {
+      const key = targetKey(input)
+      const committed = committedRunGenerations.get(key)
+      if (committed?.agentSessionId === input.agentSessionId
+        && committed.generation === input.runGeneration) {
+        committedRunGenerations.delete(key)
       }
     },
   }
