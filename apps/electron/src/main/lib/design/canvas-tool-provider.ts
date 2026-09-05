@@ -14,6 +14,7 @@ import type {
   CanvasMutation,
   CanvasNode,
   CanvasNodeReference,
+  CanvasRunWorkflowResult,
   SaveCanvasImageModuleInput,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
@@ -21,7 +22,11 @@ import type {
   DesignAsset,
   DesignPoint,
 } from '@proma/shared'
-import { parseCanvasBatchOperationEnvelope } from '@proma/shared'
+import {
+  parseCanvasBatchOperationEnvelope,
+  parseCanvasRunWorkflowInput,
+  parseCanvasRunWorkflowResult,
+} from '@proma/shared'
 import { Type } from 'typebox'
 import type { TSchema } from 'typebox'
 import type { AgentRunExtensions } from '../agent-run-extensions'
@@ -36,6 +41,7 @@ import type {
 } from './canvas-artifact-creation'
 import type { CanvasTextArtifactService } from './canvas-text-artifact-service'
 import type { CanvasImageRunService } from './canvas-image-run-service'
+import type { CanvasWorkflowExecutionService } from './canvas-workflow-execution-service'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 import {
   canvasNodeCapabilityRegistry,
@@ -327,6 +333,7 @@ export const CANVAS_TOOL_NAMES = [
   'canvas_update_artifact',
   'canvas_update_agent_config',
   'canvas_run_agent',
+  'canvas_run_workflow',
   'canvas_run_nodes',
 ] as const
 
@@ -392,6 +399,7 @@ export interface CanvasToolProviderDependencies {
   agentOutputs: Pick<CanvasAgentOutputService, 'read' | 'readAtPointer'>
   agentConfigs: Pick<CanvasAgentConfigStore, 'load' | 'update'>
   agentExecution: Pick<CanvasAgentExecutionService, 'execute'>
+  workflowExecution: Pick<CanvasWorkflowExecutionService, 'execute'>
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
   artifacts: Pick<CanvasArtifactCreationService, 'create' | 'createAgent'>
   /** 主进程在调用导入事务前负责解析并验证本地路径。 */
@@ -1247,6 +1255,30 @@ export function createCanvasToolRun(
       },
     }),
     defineCanvasTool({
+      name: 'canvas_run_workflow', label: '运行 Canvas 工作流',
+      description: '从指定 Agent 起点运行一次 bound 可达下游；图片严格受本次上限约束并停在候选验收状态。',
+      parameters: Type.Object({
+        canvasId: Type.String({ minLength: 1, maxLength: 128 }),
+        expectedRevision: Type.Integer({ minimum: 0 }),
+        startNodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: 8 }),
+        goal: Type.String({ minLength: 1, maxLength: 4_000 }),
+        maxImageRuns: Type.Integer({ minimum: 0, maximum: 16 }),
+      }, { additionalProperties: false }),
+      execute: async (toolCallId, params, signal) => {
+        dependencies.access.authorizeRead(context)
+        if (context.permissionCeiling === 'plan') throw new Error('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
+        const input = parseCanvasRunWorkflowInput(params)
+        /** Provider 只做快速初检；调度服务在每个外部 await 后重新验证关联和图事实。 */
+        dependencies.access.requireLinkedCanvas(context, input.canvasId)
+        const document = dependencies.documents.load({ projectId: context.projectId, canvasId: input.canvasId }).document
+        if (document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+        const result: CanvasRunWorkflowResult = parseCanvasRunWorkflowResult(
+          await dependencies.workflowExecution.execute(context, input, toolCallId, signal),
+        )
+        return toolResult({ ...result })
+      },
+    }),
+    defineCanvasTool({
       name: 'canvas_run_nodes', label: '运行画布节点',
       description: '运行已有生图节点并生成图片，调用图片模型时可能产生模型费用。',
       parameters: Type.Object({ canvasId: Type.String({ minLength: 1, maxLength: 128 }), nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_READ_NODES }) }),
@@ -1313,9 +1345,8 @@ export function createCanvasToolRun(
 Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、产物创建、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。${canvasAgentPrompt}`,
     piCustomTools: availableTools,
     allowedToolNames: availableTools.map((tool) => tool.name),
-    singleApprovalToolNames: availableTools.some((tool) => tool.name === 'canvas_run_nodes')
-      ? ['canvas_run_nodes']
-      : [],
+    singleApprovalToolNames: ['canvas_run_nodes', 'canvas_run_workflow']
+      .filter((name) => availableTools.some((tool) => tool.name === name)),
     allowedToolNamesMode: 'extend',
   }
 }

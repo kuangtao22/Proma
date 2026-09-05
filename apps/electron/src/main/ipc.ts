@@ -234,6 +234,7 @@ import {
 } from './lib/design/canvas-text-artifact-service'
 import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import { createCanvasImageRunService } from './lib/design/canvas-image-run-service'
+import { createCanvasWorkflowExecutionService } from './lib/design/canvas-workflow-execution-service'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
 import { createCanvasAgentConfigStore } from './lib/design/canvas-agent-config-store'
 import {
@@ -2747,6 +2748,16 @@ export function registerIpcHandlers(): void {
     candidateBatches: canvasImageCandidateBatchService,
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
   })
+  /** 显式工作流只在主进程存活，直接复用唯一 Agent 与图片执行服务。 */
+  const canvasWorkflowExecutionService = createCanvasWorkflowExecutionService({
+    load: (target) => canvasDocumentStore.load(target).document,
+    validateAccess: (context, canvasId) => {
+      canvasToolAccess.requireLinkedCanvas(context, canvasId)
+    },
+    isAgentBusy: (node) => isAgentSessionBusy(node.agentSessionId),
+    agentExecution: canvasAgentExecutionService,
+    imageRuns: canvasImageRunService,
+  })
   registerCanvasDocumentIpcHandlers({
     ipc: ipcMain,
     listAuthorizedWebContents: listAuthorizedDesignWebContents,
@@ -2839,6 +2850,7 @@ export function registerIpcHandlers(): void {
     imageJobTarget: canvasImageJobTarget,
     imageCandidateBatches: canvasImageCandidateBatchService,
     imageRunService: canvasImageRunService,
+    workflowExecution: canvasWorkflowExecutionService,
     imageAssets: {
       list: (projectId) => designStore.requireStableAuthoritativeDocument(projectId).assets,
       readStoredThumbnail: (projectId, assetId) => designAssetService.readStoredThumbnail(projectId, assetId),

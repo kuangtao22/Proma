@@ -33,6 +33,7 @@ import type { CanvasBatchPublication } from './canvas-agent-batch-operation'
 import { createCanvasOperationSerializer, getCanvasToolProviderRuntime, registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 import type { CanvasImageRunService } from './canvas-image-run-service'
+import type { CanvasWorkflowExecutionService } from './canvas-workflow-execution-service'
 import {
   DOCUMENT_ARTIFACT_DESCRIPTOR,
   IMAGE_ARTIFACT_DESCRIPTOR,
@@ -281,6 +282,7 @@ function createContext(options: {
   batchPublications?: CanvasBatchPublication[]
   enableToolProviderRuntime?: boolean
   imageRunService?: CanvasImageRunService
+  workflowExecution?: Pick<CanvasWorkflowExecutionService, 'execute'>
   agentOutput?: (target: CanvasAgentTarget) => Promise<string>
 } = {}) {
   /** 当前注册的 invoke handler。 */
@@ -755,6 +757,7 @@ function createContext(options: {
       },
     },
     ...(options.imageRunService ? { imageRunService: options.imageRunService } : {}),
+    ...(options.workflowExecution ? { workflowExecution: options.workflowExecution } : {}),
     imageAssets: {
       list: () => options.imageAssets ?? [createImageAsset('asset-a', 'job-a')],
       readStoredThumbnail: (projectId, assetId) => options.imageThumbnail?.(projectId, assetId) ?? {
@@ -3808,6 +3811,57 @@ describe('原生 Canvas 文档 IPC', () => {
         { type: 'config-update', value: expect.objectContaining({ nodeId: 'node-1' }) },
         { type: 'execute', value: expect.objectContaining({ mode: 'parent-orchestrated' }) },
       ])
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
+  test('Given 生产 Canvas Tool Provider runtime When 运行工作流 Then 复用 IPC 注册的唯一调度服务实例', async () => {
+    const workflowCalls: unknown[] = []
+    const context = createContext({
+      enableToolProviderRuntime: true,
+      workflowExecution: {
+        execute: async (runContext, input, toolCallId, signal) => {
+          workflowCalls.push({ runContext, input, toolCallId, signal })
+          return {
+            status: 'completed' as const,
+            initialRevision: input.expectedRevision,
+            finalRevision: input.expectedRevision,
+            nodes: input.startNodeIds.map((nodeId) => ({
+              nodeId, status: 'completed' as const, errorCode: null,
+            })),
+            imageSummary: null,
+            requiresReview: false as const,
+            errorCode: null,
+          }
+        },
+      },
+    })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      const run = runtime.createRun({
+        projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      })
+      const tool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_run_workflow')
+      if (!tool) throw new Error('canvas_run_workflow 未注册')
+      const controller = new AbortController()
+
+      const result = await tool.execute('tool-workflow-1', {
+        canvasId: 'canvas-1', expectedRevision: 4, startNodeIds: ['node-1'],
+        goal: '完成工作流', maxImageRuns: 1,
+      } as never, controller.signal as never, undefined as never, undefined as never)
+
+      expect(result.details).toMatchObject({ status: 'completed', initialRevision: 4, finalRevision: 4 })
+      expect(workflowCalls).toEqual([{
+        runContext: expect.objectContaining({ projectId: 'project-1', sessionId: 'agent-session-1' }),
+        input: {
+          canvasId: 'canvas-1', expectedRevision: 4, startNodeIds: ['node-1'],
+          goal: '完成工作流', maxImageRuns: 1,
+        },
+        toolCallId: 'tool-workflow-1', signal: controller.signal,
+      }])
     } finally {
       context.registration.dispose()
     }

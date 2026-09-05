@@ -85,6 +85,7 @@ import {
   createCanvasImageRunService,
   type CanvasImageRunService,
 } from './canvas-image-run-service'
+import type { CanvasWorkflowExecutionService } from './canvas-workflow-execution-service'
 import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
@@ -211,6 +212,8 @@ export interface CanvasDocumentIpcOptions {
   >
   /** 主进程可注入唯一图片运行服务；测试缺省时复用同一组依赖构造。 */
   imageRunService?: CanvasImageRunService
+  /** 普通 Agent 工作流复用唯一主进程调度服务。 */
+  workflowExecution?: Pick<CanvasWorkflowExecutionService, 'execute'>
   /** 图片模块只读取 Design 素材公开元数据并创建目录媒体授权。 */
   imageAssets: {
     list: (projectId: string) => DesignAsset[]
@@ -1487,6 +1490,9 @@ export function registerCanvasDocumentIpcHandlers(
           agentOutputs: options.agent.outputs,
           agentConfigs: options.agent.configs,
           agentExecution: options.agent.execution,
+          workflowExecution: options.workflowExecution ?? {
+            execute: async () => { throw new Error('CANVAS_WORKFLOW_UNAVAILABLE') },
+          },
           artifacts: options.artifacts,
           importImage: options.importImage,
           textArtifacts: options.textArtifacts,

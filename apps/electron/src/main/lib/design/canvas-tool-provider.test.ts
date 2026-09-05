@@ -70,6 +70,8 @@ function createFixture(options: {
   const agentConfigUpdateInputs: unknown[] = []
   /** 单节点执行只记录可信父运行身份和临时 Skills。 */
   const agentExecutionInputs: unknown[] = []
+  /** 工作流执行只记录 Host 绑定后的父运行与审批参数。 */
+  const workflowExecutionInputs: unknown[] = []
   /** 精确指针读取调用用于证明摘要不会漂移到后续运行。 */
   const agentOutputReadPointers: unknown[] = []
   /** 授权与关联调用计数用于证明工具执行时 fresh-read。 */
@@ -202,6 +204,20 @@ function createFixture(options: {
             },
             downstreamNodeIds: ['doc-1', 'image-1'],
           },
+        }
+      },
+    },
+    workflowExecution: {
+      execute: async (runContext, input, toolCallId, signal) => {
+        workflowExecutionInputs.push({ runContext, input, toolCallId, signal })
+        return {
+          status: 'completed' as const,
+          initialRevision: input.expectedRevision,
+          finalRevision: input.expectedRevision + 1,
+          nodes: input.startNodeIds.map((nodeId) => ({ nodeId, status: 'completed' as const, errorCode: null })),
+          imageSummary: null,
+          requiresReview: false as const,
+          errorCode: null,
         }
       },
     },
@@ -342,7 +358,7 @@ function createFixture(options: {
     dependencies, context, batchInputs, runInputs, runToolCallIds, artifactInputs,
     agentArtifactInputs, importedImageInputs,
     textUpdateInputs, imageSaveInputs,
-    agentConfigUpdateInputs, agentExecutionInputs, agentOutputReadPointers,
+    agentConfigUpdateInputs, agentExecutionInputs, workflowExecutionInputs, agentOutputReadPointers,
     getAuthorizeReadCalls: () => authorizeReadCalls,
     getRequireLinkedCanvasCalls: () => requireLinkedCanvasCalls,
     getListCalls: () => listCalls,
@@ -353,7 +369,7 @@ function createFixture(options: {
 }
 
 describe('普通 Agent Canvas Tool Provider', () => {
-  test('Given 普通分析运行 When 获取上下文 Then 注入十三工具、Canvas Skill 路由与硬边界且不扫描全部画布', async () => {
+  test('Given 普通分析运行 When 获取上下文 Then 注入十四工具、Canvas Skill 路由与硬边界且不扫描全部画布', async () => {
     const fixture = createFixture()
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
     expect(run.piCustomTools.map((tool) => tool.name)).toEqual([
@@ -369,11 +385,12 @@ describe('普通 Agent Canvas Tool Provider', () => {
       'canvas_update_artifact',
       'canvas_update_agent_config',
       'canvas_run_agent',
+      'canvas_run_workflow',
       'canvas_run_nodes',
     ])
     expect(run.allowedToolNames).toEqual([...CANVAS_TOOL_NAMES])
     expect(run.allowedToolNamesMode).toBe('extend')
-    expect(run.singleApprovalToolNames).toEqual(['canvas_run_nodes'])
+    expect(run.singleApprovalToolNames).toEqual(['canvas_run_nodes', 'canvas_run_workflow'])
     expect(run.systemPromptAppend).toContain('不要按“首页”或“设计”等关键词硬编码')
     expect(run.systemPromptAppend).toContain('先读取并遵循 `canvas-production` Skill')
     expect(run.systemPromptAppend).toContain('Skill 不可用')
@@ -640,6 +657,32 @@ describe('普通 Agent Canvas Tool Provider', () => {
       contentSha256: 'a'.repeat(64),
       completedAt: 120,
     }])
+  })
+
+  test('Given 普通 Agent 明确运行工作流 When 工具执行 Then 只透传五个参数、父运行身份和取消信号', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const controller = new AbortController()
+
+    const result = await executeTool(run.piCustomTools, 'canvas_run_workflow', {
+      canvasId: 'canvas-1', expectedRevision: 3, startNodeIds: ['agent-1'],
+      goal: '生成小红书视频方案', maxImageRuns: 2,
+    }, 'tool-workflow-1', controller.signal)
+
+    expect(result.details).toMatchObject({
+      status: 'completed', initialRevision: 3, finalRevision: 4,
+      nodes: [{ nodeId: 'agent-1', status: 'completed', errorCode: null }],
+    })
+    expect(fixture.workflowExecutionInputs).toEqual([{
+      runContext: fixture.context,
+      input: {
+        canvasId: 'canvas-1', expectedRevision: 3, startNodeIds: ['agent-1'],
+        goal: '生成小红书视频方案', maxImageRuns: 2,
+      },
+      toolCallId: 'tool-workflow-1', signal: controller.signal,
+    }])
+    expect(fixture.getAuthorizeReadCalls()).toBe(1)
+    expect(fixture.getRequireLinkedCanvasCalls()).toBe(1)
   })
 
   test('Given 正式输出包含多字节字符 When 生成响应摘要 Then 按 UTF-8 字节安全截断且不切断字符', async () => {

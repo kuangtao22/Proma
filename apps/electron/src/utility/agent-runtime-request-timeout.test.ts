@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { AGENT_RUNTIME_METHODS } from '@proma/shared'
 import {
   ASK_USER_QUESTION_TIMEOUT_MS,
-  CANVAS_AGENT_TOOL_TIMEOUT_MS,
+  CANVAS_EXECUTION_TOOL_TIMEOUT_MS,
   DESIGN_IMAGE_TOOL_TIMEOUT_MS,
   getParentRequestTimeoutMs,
 } from './agent-runtime-request-timeout'
@@ -25,7 +25,10 @@ describe('Agent utility 主进程请求超时', () => {
   test('Given canvas_run_agent 等待子 Agent 完整终态 When 解析超时 Then 使用十五分钟长时限', () => {
     expect(getParentRequestTimeoutMs(AGENT_RUNTIME_METHODS.CAPABILITY_CUSTOM_TOOL, {
       toolName: 'canvas_run_agent',
-    })).toBe(CANVAS_AGENT_TOOL_TIMEOUT_MS)
+    })).toBe(CANVAS_EXECUTION_TOOL_TIMEOUT_MS)
+    expect(getParentRequestTimeoutMs(AGENT_RUNTIME_METHODS.CAPABILITY_CUSTOM_TOOL, {
+      toolName: 'canvas_run_workflow',
+    })).toBe(CANVAS_EXECUTION_TOOL_TIMEOUT_MS)
   })
 
   test('Given AskUserQuestion When 等待用户输入 Then 保留交互长时限', () => {
