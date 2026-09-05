@@ -40,6 +40,17 @@ import type {
 
 /** Agent service 内部运行输入，允许主进程携带不对外暴露的运行代际。 */
 type AgentRunInput = AgentSendInput & { runGeneration?: number }
+
+/** 主进程内部消费者使用的 Renderer Agent 精确终态，不进入公开 IPC。 */
+export interface AgentRunTerminalObservation {
+  status: 'completed' | 'errored' | 'cancelled'
+  sessionId: string
+  startedAt?: number
+  runGeneration?: number
+}
+
+/** 内部终态观察器；异常由 Agent service 副作用边界隔离。 */
+export type AgentRunTerminalObserver = (observation: AgentRunTerminalObservation) => void
 import { PiAgentAdapter } from './adapters/pi-agent-adapter'
 import { PiUtilityAdapter } from './adapters/pi-utility-adapter'
 import { AgentEventBus } from './agent-event-bus'
@@ -372,22 +383,42 @@ export async function runAgent(
   input: AgentRunInput,
   webContents: WebContents,
   extensions: AgentRunExtensions = {},
+  terminalObserver?: AgentRunTerminalObserver,
 ): Promise<void> {
   /** 引用解析位于 IPC 接管完成前，失败必须直接拒绝调用方。 */
   const prepared = prepareAgentRun(input, extensions)
-  return runPreparedAgent(prepared, webContents)
+  return runPreparedAgent(prepared, webContents, terminalObserver)
 }
 
 /** 运行已经完成权威 Canvas 引用解析的消息，禁止二次读取文档。 */
 export async function runPreparedAgent(
   prepared: PreparedAgentCanvasMessage<AgentSendInput>,
   webContents: WebContents,
+  terminalObserver?: AgentRunTerminalObserver,
 ): Promise<void> {
   const { input, extensions } = prepared
   // deferred queue runs carry their queue id as an internal extension.
   const queueMessageId = (input as Partial<AgentDeferredQueueMessageInput>).queueMessageId
   /** 仅在 Orchestrator 准入后取得 owner，避免被拒绝的重复请求覆盖活跃路由。 */
   let route: AgentStreamRoute<WebContents> | undefined
+  /** observer 最多接收一次终态；先锁定再调用，避免异常后被 completion 重复通知。 */
+  let terminalObserved = false
+  let activeStartedAt = input.startedAt
+  let activeRunGeneration: number | undefined
+  const notifyTerminal = (observation: AgentRunTerminalObservation): void => {
+    if (terminalObserved || !terminalObserver) return
+    terminalObserved = true
+    terminalObserver(observation)
+  }
+  /** SDK 非 success subtype 与显式 stop 都不能被 Canvas 当作成功输出。 */
+  const getCompletionStatus = (options?: {
+    stoppedByUser?: boolean
+    resultSubtype?: string
+  }): AgentRunTerminalObservation['status'] => options?.stoppedByUser
+    ? 'cancelled'
+    : options?.resultSubtype && options.resultSubtype !== 'success'
+      ? 'errored'
+      : 'completed'
   /** 获取当前运行仍拥有的 renderer；准入前错误只返回本次调用方。 */
   const getRunTarget = (): WebContents | undefined => route
     ? streamRoutes.getTargetIfOwner(input.sessionId, route.ownerId)
@@ -395,9 +426,17 @@ export async function runPreparedAgent(
   try {
     await orchestrator.sendMessage(input, {
       onError: (error) => {
-        runAgentServiceTerminalEffects([{
-          name: 'renderer-error',
-          run: () => {
+        runAgentServiceTerminalEffects([
+          {
+            name: 'internal-terminal-observer',
+            run: () => { notifyTerminal({
+              status: 'errored', sessionId: input.sessionId,
+              startedAt: activeStartedAt, runGeneration: activeRunGeneration,
+            }) },
+          },
+          {
+            name: 'renderer-error',
+            run: () => {
             const target = getRunTarget()
             if (target) {
               target.send(
@@ -405,11 +444,20 @@ export async function runPreparedAgent(
                 buildAuthoritativeAgentStreamErrorPayload(input.sessionId, error, getAgentSessionMeta, input.startedAt),
               )
             }
+            },
           },
-        }], reportAgentServiceTerminalEffectError)
+        ], reportAgentServiceTerminalEffectError)
       },
       onComplete: (messages, opts) => {
         runAgentServiceTerminalEffects([
+          {
+            name: 'internal-terminal-observer',
+            run: () => { notifyTerminal({
+              status: getCompletionStatus(opts), sessionId: input.sessionId,
+              startedAt: opts?.startedAt ?? activeStartedAt,
+              runGeneration: opts?.runGeneration ?? activeRunGeneration,
+            }) },
+          },
           {
             name: 'publish-run-stopped',
             run: () => { publishRunStopped(input.sessionId, opts?.stoppedByUser, opts?.startedAt, opts?.runGeneration) },
@@ -443,7 +491,9 @@ export async function runPreparedAgent(
           },
         ], reportAgentServiceTerminalEffectError)
       },
-      onRunStarted: ({ startedAt }) => {
+      onRunStarted: ({ startedAt, runGeneration }) => {
+        activeStartedAt = startedAt
+        activeRunGeneration = runGeneration
         const sessionMeta = getAgentSessionMeta(input.sessionId)
         workspaceOperationGuard.runAgentServiceEffects({
           sessionWorkspaceId: sessionMeta?.workspaceId,
@@ -491,6 +541,13 @@ export async function runPreparedAgent(
     console.error('[Agent 服务] runAgent 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'
     runAgentServiceTerminalEffects([
+      {
+        name: 'internal-terminal-observer',
+        run: () => { notifyTerminal({
+          status: 'errored', sessionId: input.sessionId,
+          startedAt: activeStartedAt, runGeneration: activeRunGeneration,
+        }) },
+      },
       {
         name: 'renderer-error',
         run: () => {

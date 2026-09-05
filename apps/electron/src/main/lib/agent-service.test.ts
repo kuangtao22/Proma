@@ -163,6 +163,21 @@ describe('Agent service 迁移准入', () => {
     expect(source).toContain("name: 'renderer-complete'")
   })
 
+  test('Given Canvas Renderer 订阅内部终态 When 成功、错误或停止 Then observer 精确识别运行且异常不击穿既有收尾', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    const start = source.indexOf('async function runPreparedAgent(')
+    const end = source.indexOf('\n/**', start + 1)
+    const body = source.slice(start, end)
+
+    expect(body).toContain("name: 'internal-terminal-observer'")
+    expect(body).toContain("? 'cancelled'")
+    expect(body).toContain("? 'errored'")
+    expect(body).toContain(": 'completed'")
+    expect(body).toContain('startedAt:')
+    expect(body).toContain('runGeneration:')
+    expect(body).toContain('runAgentServiceTerminalEffects([')
+  })
+
   test('Given Canvas run 在准入早期抛错 When runAgent 发布 completion Then 仍附带主进程权威轻量 metadata', () => {
     /** 读取真实 service，锁定外层 catch 不能发布无归属 completion。 */
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')

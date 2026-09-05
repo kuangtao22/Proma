@@ -20,6 +20,11 @@ function createFixture(options: {
   runGate?: Promise<void>
   configError?: Error
   modelError?: Error
+  rendererStatus?: 'completed' | 'errored' | 'cancelled'
+  configGate?: Promise<void>
+  afterConfig?: () => void
+  prepareDocument?: CanvasDocument
+  commitGate?: Promise<void>
 } = {}) {
   const calls: string[] = []
   const document: CanvasDocument = createEmptyCanvasDocument(target.projectId, target.canvasId, 1)
@@ -42,18 +47,29 @@ function createFixture(options: {
     sourceCanvasNodeId: target.nodeId, createdAt: 1, updatedAt: 2,
   }
   let stopListener: (() => void) | undefined
+  let activeRun: { sessionId: string; startedAt: number } | undefined
+  let commitCount = 0
   const dependencies: CanvasAgentExecutionServiceDependencies = {
     reconcile: async () => { calls.push('reconcile'); return { document, nodeIssues: [] } },
-    getSession: () => { calls.push('session'); return session },
+    getSession: (sessionId) => {
+      calls.push('session')
+      return sessionId === session.id ? session : undefined
+    },
     configs: {
       load: async () => {
         calls.push('config')
+        await options.configGate
+        options.afterConfig?.()
         if (options.configError) throw options.configError
         return {
           schemaVersion: 1, ...target, revision: 2, instruction: '规划短视频', skillNames: ['专业策划'],
           channelId: null, modelId: null, updatedAt: 2, ...options.config,
         }
       },
+    },
+    prepareStart: async (_target, effect) => {
+      calls.push('prepare')
+      return effect({ document: options.prepareDocument ?? document, nodeIssues: [] })
     },
     getWorkspaceSkills: () => {
       calls.push('skills')
@@ -76,18 +92,25 @@ function createFixture(options: {
         allowedToolNamesMode: 'extend', singleApprovalToolNames: ['canvas_run_nodes'],
       }
     },
-    runRenderer: async (input, _sender, extensions) => {
+    runRenderer: async (input, _sender, extensions, observer) => {
       calls.push(`renderer:${input.channelId}/${input.modelId}:${input.mentionedSkills?.join(',')}`)
       expect(extensions.allowedToolNames).toContain('canvas_run_nodes')
       if (options.stopped) stopListener?.()
+      observer({
+        status: options.rendererStatus ?? 'completed',
+        sessionId: input.sessionId,
+        startedAt: input.startedAt!,
+      })
     },
     runHeadless: async (input, callbacks, extensions) => {
       calls.push(`headless:${callbacks.source}:${callbacks.originSessionId}:${input.triggeredBy}`)
+      activeRun = { sessionId: input.sessionId, startedAt: input.startedAt! }
       expect(extensions?.allowedToolNames).not.toContain('canvas_run_nodes')
       if (options.stopped) stopListener?.()
       if (options.runError) callbacks.onError(options.runError)
       await options.runGate
       callbacks.onComplete()
+      activeRun = undefined
     },
     subscribeStopped: (_sessionId, _startedAt, listener) => {
       calls.push('listen')
@@ -97,12 +120,19 @@ function createFixture(options: {
     outputs: {
       commit: async (input) => {
         calls.push(`commit:${input.terminalStatus}:${input.runGeneration}`)
+        commitCount += 1
+        if (commitCount === 1) await options.commitGate
         if (options.commitError) throw options.commitError
         return { target, revision: 8, pointer: { messageUuid: 'reply-1', contentSha256: 'a'.repeat(64), completedAt: input.completedAt }, downstreamNodeIds: [] }
       },
       releaseGeneration: (input) => { calls.push(`release-generation:${input.agentSessionId}:${input.runGeneration}`) },
     },
-    stopAgent: () => { calls.push('stop') },
+    stopOwnedAgent: (identity) => {
+      calls.push(`stop-check:${identity.sessionId}:${identity.startedAt}`)
+      if (activeRun?.sessionId !== identity.sessionId || activeRun.startedAt !== identity.startedAt) return false
+      calls.push('stop')
+      return true
+    },
     now: () => 100,
   }
   return { service: createCanvasAgentExecutionService(dependencies), calls }
@@ -117,10 +147,21 @@ describe('Canvas Agent 统一执行服务', () => {
     })
 
     expect(fixture.calls).toEqual([
-      'reconcile', 'session', 'config', 'session', 'skills', 'model:channel-live/model-live',
+      'reconcile', 'session', 'config', 'skills', 'prepare', 'session', 'model:channel-live/model-live',
       'tools:input-1', 'reserve', 'listen', 'renderer:channel-live/model-live:pro-plan',
       'commit:completed:1', 'unlisten', 'release', 'release-generation:child-1:1',
     ])
+  })
+
+  test('Given Renderer 明确错误且锚点后已有旧正文 When 运行结束 Then 不调用输出提交', async () => {
+    const fixture = createFixture({ rendererStatus: 'errored' })
+
+    await expect(fixture.service.execute({
+      mode: 'renderer-manual', target, sender: { id: 1 } as unknown as import('electron').WebContents, message: '重新生成',
+      userMessageUuid: 'anchor-with-old-assistant', startedAt: 51,
+    })).resolves.toEqual({ status: 'errored' })
+
+    expect(fixture.calls.some((call) => call.startsWith('commit:'))).toBe(false)
   })
 
   test('Given 父 Agent 编排运行 When 成功完成 Then 无需 Renderer 且使用 design 来源和父会话路由', async () => {
@@ -231,5 +272,52 @@ describe('Canvas Agent 统一执行服务', () => {
     })).resolves.toEqual({ status: 'cancelled' })
     expect(fixture.calls.some((call) => call.startsWith('headless:'))).toBe(false)
     expect(fixture.calls).not.toContain('stop')
+  })
+
+  test('Given child 已终态且正式输出提交阻塞 When 父取消 Then 不停止会话且紧邻新运行不被预停', async () => {
+    let finishCommit: (() => void) | undefined
+    const commitGate = new Promise<void>((resolve) => { finishCommit = resolve })
+    const controller = new AbortController()
+    const first = createFixture({ commitGate })
+    const running = first.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      userMessageUuid: 'anchor-commit-gate', startedAt: 95, signal: controller.signal,
+    })
+    while (!first.calls.some((call) => call.startsWith('commit:'))) await Bun.sleep(0)
+
+    controller.abort()
+    finishCommit?.()
+    await running
+
+    expect(first.calls.some((call) => call.startsWith('stop-check:'))).toBe(false)
+    await expect(first.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '继续',
+      userMessageUuid: 'anchor-next', startedAt: 96,
+    })).resolves.toMatchObject({ status: 'completed' })
+    expect(first.calls).not.toContain('stop')
+  })
+
+  test('Given 配置读取期间 Agent 节点删除或重建 When 最终启动校验 Then 旧会话零副作用', async () => {
+    for (const replacementSessionId of [undefined, 'child-2']) {
+      let finishConfig: (() => void) | undefined
+      const configGate = new Promise<void>((resolve) => { finishConfig = resolve })
+      const changedDocument = createEmptyCanvasDocument(target.projectId, target.canvasId, 1)
+      changedDocument.revision = 8
+      changedDocument.nodes = replacementSessionId
+        ? [{ id: target.nodeId, kind: 'agent', title: '重建导演', position: { x: 100, y: 0 }, agentSessionId: replacementSessionId }]
+        : []
+      const fixture = createFixture({ configGate, prepareDocument: changedDocument })
+      const running = fixture.service.execute({
+        mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+        userMessageUuid: `anchor-race-${replacementSessionId ?? 'deleted'}`, startedAt: 97,
+      })
+      while (!fixture.calls.includes('config')) await Bun.sleep(0)
+      finishConfig?.()
+
+      await expect(running).rejects.toThrow('Canvas Agent 归属无效')
+      expect(fixture.calls).not.toContain('reserve')
+      expect(fixture.calls.some((call) => call.startsWith('tools:'))).toBe(false)
+      expect(fixture.calls.some((call) => call.startsWith('headless:'))).toBe(false)
+    }
   })
 })

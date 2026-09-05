@@ -55,16 +55,40 @@ export interface CanvasAgentExecutionResult {
   output?: CanvasAgentOutputCommitResult
 }
 
+/** Renderer 运行由 Agent service 返回的主进程权威终态身份。 */
+export interface CanvasAgentRendererTerminalObservation {
+  status: CanvasAgentExecutionResult['status']
+  sessionId: string
+  startedAt?: number
+  runGeneration?: number
+}
+
+/** 父运行只能停止仍与当前启动身份完全一致的活跃 child。 */
+export interface CanvasAgentOwnedRunIdentity {
+  sessionId: string
+  startedAt: number
+  runGeneration?: number
+}
+
 /** 统一执行服务的可替换进程内依赖。 */
 export interface CanvasAgentExecutionServiceDependencies {
   reconcile: (target: CanvasAgentTarget) => Promise<Pick<CanvasWorkspaceSnapshot, 'document' | 'nodeIssues'>>
+  prepareStart: <T>(
+    target: CanvasAgentTarget,
+    effect: (snapshot: Pick<CanvasWorkspaceSnapshot, 'document' | 'nodeIssues'>) => T,
+  ) => Promise<T>
   getSession: (sessionId: string) => AgentSessionMeta | undefined
   configs: Pick<CanvasAgentConfigStore, 'load'>
   getWorkspaceSkills: (projectId: string) => readonly SkillMeta[]
   assertModelAvailable: (channelId: string, modelId: string) => void
   reserveStart: (sessionId: string, startedAt?: number) => () => void
   createCanvasRun: (context: CanvasToolRunContext) => CanvasToolRun | undefined
-  runRenderer: (input: AgentSendInput, sender: WebContents, extensions: AgentRunExtensions) => Promise<void>
+  runRenderer: (
+    input: AgentSendInput,
+    sender: WebContents,
+    extensions: AgentRunExtensions,
+    observer: (observation: CanvasAgentRendererTerminalObservation) => void,
+  ) => Promise<void>
   runHeadless: (
     input: AgentSendInput,
     callbacks: HeadlessAgentRunCallbacks,
@@ -72,7 +96,7 @@ export interface CanvasAgentExecutionServiceDependencies {
   ) => Promise<void>
   subscribeStopped: (sessionId: string, startedAt: number, listener: () => void) => () => void
   outputs: Pick<CanvasAgentOutputService, 'commit' | 'releaseGeneration'>
-  stopAgent: (sessionId: string) => void
+  stopOwnedAgent: (identity: CanvasAgentOwnedRunIdentity) => boolean
   now?: () => number
 }
 
@@ -147,82 +171,90 @@ export function createCanvasAgentExecutionService(
       if (snapshot.nodeIssues.some((issue) => issue.nodeId === request.target.nodeId)) {
         throw new Error('CANVAS_AGENT_OWNER_INVALID')
       }
-      const owner = requireCanvasAgentRunOwner({
+      requireCanvasAgentRunOwner({
         target: request.target,
         nodeId: request.target.nodeId,
         document: snapshot.document,
         getSession: dependencies.getSession,
       })
       const config = await dependencies.configs.load(request.target)
-      /** 配置读取可能跨 I/O；启动前再次读取内部会话路由与归属。 */
-      const currentOwner = requireCanvasAgentRunOwner({
-        target: request.target,
-        nodeId: request.target.nodeId,
-        document: snapshot.document,
-        getSession: dependencies.getSession,
-      })
       const selectedSkillNames = [
         ...config.skillNames,
         ...(request.mode === 'parent-orchestrated' ? request.skillNames ?? [] : []),
       ]
       const skillSlugs = resolveSkillSlugs(selectedSkillNames, dependencies.getWorkspaceSkills(request.target.projectId))
-      /** 显式配置必须是完整 route；继承配置每次 fresh-read 当前内部 session。 */
-      const channelId = config.channelId ?? currentOwner.session.channelId
-      const modelId = config.channelId === null ? currentOwner.session.modelId : config.modelId
-      if (!channelId || !modelId) throw new Error('CANVAS_AGENT_MODEL_UNAVAILABLE')
-      dependencies.assertModelAvailable(channelId, modelId)
-
       const key = targetKey(request.target)
-      const previous = generations.get(key)
-      const runGeneration = previous?.sessionId === currentOwner.session.id ? previous.generation + 1 : 1
-      const inputReferences = listCanvasAgentBoundInputReferences(snapshot.document, owner.node.id)
-      const canvasRun = dependencies.createCanvasRun({
-        projectId: request.target.projectId,
-        sessionId: currentOwner.session.id,
-        runStartedAt: request.startedAt,
-        explicitReferences: inputReferences,
-        permissionCeiling: currentOwner.session.permissionMode === 'plan' ? 'plan' : 'execute',
-        canvasAgentTarget: request.target,
-      })
       const goal = request.mode === 'renderer-manual' ? request.message : request.instruction
-      const prompt = buildCanvasAgentExecutionSystemPrompt({
-        mode: request.mode,
-        nodeTitle: owner.node.title,
-        instruction: config.instruction,
-        goal,
-        inputReferences,
-      })
-      const extensions = buildRunExtensions(request.mode, prompt, canvasRun)
-      const input: AgentSendInput = {
-        sessionId: currentOwner.session.id,
-        userMessage: goal,
-        rawUserMessage: goal,
-        userMessageUuid: request.userMessageUuid,
-        startedAt: request.startedAt,
-        channelId,
-        modelId,
-        workspaceId: request.target.projectId,
-        mentionedSkills: skillSlugs,
-        triggeredBy: request.mode === 'renderer-manual' ? 'user' : 'external',
-      }
-      /** 所有可能失败的纯配置构造完成后，再占用 Pi 启动槽。 */
-      const releaseStart = dependencies.reserveStart(currentOwner.session.id, request.startedAt)
-      generations.set(key, { sessionId: currentOwner.session.id, generation: runGeneration })
-      let terminalStatus: CanvasAgentExecutionResult['status'] = 'completed'
-      let unsubscribeStopped = (): void => undefined
-      /** 取消监听器只停止仍由本次父运行拥有的精确 child run。 */
-      const ownershipToken = Symbol('canvas-agent-run')
-      let activeToken: symbol | undefined = ownershipToken
-      let childStarted = false
-      const onAbort = (): void => {
-        if (request.mode === 'parent-orchestrated' && activeToken === ownershipToken) {
-          terminalStatus = 'cancelled'
-          if (childStarted) dependencies.stopAgent(currentOwner.session.id)
+      /** 配置 I/O 后在图串行写边界内 fresh-read owner/输入，并把 reserve 作为最后一步同步提交。 */
+      const prepared = await dependencies.prepareStart(request.target, (currentSnapshot) => {
+        if (currentSnapshot.nodeIssues.some((issue) => issue.nodeId === request.target.nodeId)) {
+          throw new Error('CANVAS_AGENT_OWNER_INVALID')
         }
+        const currentOwner = requireCanvasAgentRunOwner({
+          target: request.target,
+          nodeId: request.target.nodeId,
+          document: currentSnapshot.document,
+          getSession: dependencies.getSession,
+        })
+        /** 显式配置必须是完整 route；继承配置每次 fresh-read 当前内部 session。 */
+        const channelId = config.channelId ?? currentOwner.session.channelId
+        const modelId = config.channelId === null ? currentOwner.session.modelId : config.modelId
+        if (!channelId || !modelId) throw new Error('CANVAS_AGENT_MODEL_UNAVAILABLE')
+        dependencies.assertModelAvailable(channelId, modelId)
+        const previous = generations.get(key)
+        const runGeneration = previous?.sessionId === currentOwner.session.id ? previous.generation + 1 : 1
+        const inputReferences = listCanvasAgentBoundInputReferences(currentSnapshot.document, currentOwner.node.id)
+        const canvasRun = dependencies.createCanvasRun({
+          projectId: request.target.projectId,
+          sessionId: currentOwner.session.id,
+          runStartedAt: request.startedAt,
+          explicitReferences: inputReferences,
+          permissionCeiling: currentOwner.session.permissionMode === 'plan' ? 'plan' : 'execute',
+          canvasAgentTarget: request.target,
+        })
+        const prompt = buildCanvasAgentExecutionSystemPrompt({
+          mode: request.mode,
+          nodeTitle: currentOwner.node.title,
+          instruction: config.instruction,
+          goal,
+          inputReferences,
+        })
+        const extensions = buildRunExtensions(request.mode, prompt, canvasRun)
+        const input: AgentSendInput = {
+          sessionId: currentOwner.session.id,
+          userMessage: goal,
+          rawUserMessage: goal,
+          userMessageUuid: request.userMessageUuid,
+          startedAt: request.startedAt,
+          channelId,
+          modelId,
+          workspaceId: request.target.projectId,
+          mentionedSkills: skillSlugs,
+          triggeredBy: request.mode === 'renderer-manual' ? 'user' : 'external',
+        }
+        /** reserve 与最终 owner 校验同处一个同步临界区；成功后图删除/重建由 busy 门禁阻断。 */
+        const releaseStart = dependencies.reserveStart(currentOwner.session.id, request.startedAt)
+        generations.set(key, { sessionId: currentOwner.session.id, generation: runGeneration })
+        return { currentOwner, runGeneration, input, extensions, releaseStart }
+      })
+      const { currentOwner, runGeneration, input, extensions, releaseStart } = prepared
+      let terminalStatus: CanvasAgentExecutionResult['status'] | undefined
+      let unsubscribeStopped = (): void => undefined
+      /** 终态 callback 到达即撤销父取消所有权，不能延长到正式输出提交。 */
+      let ownsLiveChild = false
+      const setTerminalStatus = (status: CanvasAgentExecutionResult['status']): void => {
+        if (terminalStatus === undefined) terminalStatus = status
+        ownsLiveChild = false
+      }
+      const onAbort = (): void => {
+        if (request.mode !== 'parent-orchestrated' || !ownsLiveChild) return
+        terminalStatus = 'cancelled'
+        ownsLiveChild = false
+        dependencies.stopOwnedAgent({ sessionId: currentOwner.session.id, startedAt: request.startedAt })
       }
       try {
         unsubscribeStopped = dependencies.subscribeStopped(currentOwner.session.id, request.startedAt, () => {
-          terminalStatus = 'cancelled'
+          setTerminalStatus('cancelled')
         })
         if (request.mode === 'parent-orchestrated') request.signal?.addEventListener('abort', onAbort, { once: true })
         if (request.mode === 'parent-orchestrated' && request.signal?.aborted) {
@@ -230,18 +262,22 @@ export function createCanvasAgentExecutionService(
           return { status: 'cancelled' }
         }
         if (request.mode === 'renderer-manual') {
-          await dependencies.runRenderer(input, request.sender, extensions)
+          await dependencies.runRenderer(input, request.sender, extensions, (observation) => {
+            if (observation.sessionId !== currentOwner.session.id || observation.startedAt !== request.startedAt) return
+            setTerminalStatus(observation.status)
+          })
         } else {
-          childStarted = true
+          ownsLiveChild = true
           await dependencies.runHeadless(input, {
             source: 'design',
             originSessionId: request.parentSessionId,
-            onError: () => { terminalStatus = 'errored' },
-            onComplete: () => undefined,
+            onError: () => { setTerminalStatus('errored') },
+            onComplete: () => { setTerminalStatus('completed') },
             onTitleUpdated: () => undefined,
           }, extensions)
+          ownsLiveChild = false
         }
-        if (terminalStatus !== 'completed') return { status: terminalStatus }
+        if (terminalStatus !== 'completed') return { status: terminalStatus ?? 'errored' }
         try {
           const output = await dependencies.outputs.commit({
             target: request.target,
@@ -259,7 +295,7 @@ export function createCanvasAgentExecutionService(
           throw error
         }
       } finally {
-        activeToken = undefined
+        ownsLiveChild = false
         if (request.mode === 'parent-orchestrated') request.signal?.removeEventListener('abort', onAbort)
         unsubscribeStopped()
         releaseStart()

@@ -2324,6 +2324,56 @@ export function registerIpcHandlers(): void {
       if (guarded.agent.error) throw guarded.agent.error
       return guarded.agent.snapshot
     },
+    prepareStart: async (target, effect) => {
+      /** 最终 owner、输入和启动槽在同一图串行写边界完成，运行本身不持锁。 */
+      const guarded = await canvasOperationSerializer.run(target, () => (
+        workspaceOperationGuard.runWorkspaceWrite(target.projectId, async () => {
+          const batch = await canvasAgentBatchOperation.reconcileLocked(target)
+          const agent = await canvasAgentNodeCreation.reconcile(target)
+          /** effect 失败也先带出已提交 publication，锁外广播后再恢复原错误。 */
+          let prepared: { ok: true; value: ReturnType<typeof effect> } | { ok: false; error: unknown } | undefined
+          if (!agent.error) {
+            try {
+              prepared = { ok: true, value: effect(agent.snapshot) }
+            } catch (error) {
+              prepared = { ok: false, error }
+            }
+          }
+          return {
+            batch,
+            agent,
+            prepared,
+          }
+        })
+      ))
+      /** 对账产生的恢复事实仍在 lease 外广播，不能把运行扩展进临界区。 */
+      const publications = [
+        ...guarded.batch.publications,
+        ...(guarded.agent.documentChanged ? [{ document: guarded.agent.snapshot.document }] : []),
+      ]
+      const publishedRevisions = new Set<number>()
+      for (const publication of publications) {
+        if (publishedRevisions.has(publication.document.revision)) continue
+        publishedRevisions.add(publication.document.revision)
+        for (const contents of listAuthorizedDesignWebContents()) {
+          try {
+            contents.send(CANVAS_IPC_CHANNELS.CHANGED, {
+              projectId: target.projectId,
+              canvasId: target.canvasId,
+              revision: publication.document.revision,
+              cause: 'graph',
+              ...('source' in publication ? { source: publication.source } : {}),
+            })
+          } catch (error) {
+            console.error('[Canvas Agent 执行] 最终对账图事实广播失败:', error)
+          }
+        }
+      }
+      if (guarded.agent.error) throw guarded.agent.error
+      if (!guarded.prepared) throw new Error('CANVAS_AGENT_OWNER_INVALID')
+      if (!guarded.prepared.ok) throw guarded.prepared.error
+      return guarded.prepared.value
+    },
     getSession: getAgentSessionMeta,
     configs: canvasAgentConfigStore,
     getWorkspaceSkills: (projectId) => {
@@ -2337,14 +2387,24 @@ export function registerIpcHandlers(): void {
     },
     reserveStart: reserveAgentSessionStart,
     createCanvasRun: (context) => getCanvasToolProviderRuntime()?.createRun(context),
-    runRenderer: runAgent,
+    runRenderer: (input, sender, extensions, observer) => runAgent(input, sender, extensions, observer),
     runHeadless: runAgentHeadless,
     subscribeStopped: (sessionId, startedAt, listener) => agentEventBus.on((eventSessionId, payload) => {
       if (eventSessionId !== sessionId || payload.kind !== 'proma_event') return
       if (payload.event.type === 'run_stopped' && payload.event.startedAt === startedAt) listener()
     }),
     outputs: canvasAgentOutputService,
-    stopAgent,
+    stopOwnedAgent: (identity) => {
+      /** 同一 JS tick 内先核对 active 身份再停止，避免终态后的 reserve 被写入预停止标记。 */
+      const ownsActiveRun = listActiveAgentSessionSnapshots().some((active) => (
+        active.sessionId === identity.sessionId
+        && active.startedAt === identity.startedAt
+        && (identity.runGeneration === undefined || active.runGeneration === identity.runGeneration)
+      ))
+      if (!ownsActiveRun) return false
+      stopAgent(identity.sessionId)
+      return true
+    },
   })
   /** Service 回调只会在 Job Manager 完成赋值后执行。 */
   let designJobManager: DesignJobManager
