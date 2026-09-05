@@ -32,6 +32,7 @@ import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasBatchPublication } from './canvas-agent-batch-operation'
 import { createCanvasOperationSerializer, getCanvasToolProviderRuntime, registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
+import type { CanvasImageRunService } from './canvas-image-run-service'
 import {
   DOCUMENT_ARTIFACT_DESCRIPTOR,
   IMAGE_ARTIFACT_DESCRIPTOR,
@@ -279,6 +280,7 @@ function createContext(options: {
   batchReconcileError?: Error
   batchPublications?: CanvasBatchPublication[]
   enableToolProviderRuntime?: boolean
+  imageRunService?: CanvasImageRunService
   agentOutput?: (target: CanvasAgentTarget) => Promise<string>
 } = {}) {
   /** 当前注册的 invoke handler。 */
@@ -751,6 +753,7 @@ function createContext(options: {
         return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
       },
     },
+    ...(options.imageRunService ? { imageRunService: options.imageRunService } : {}),
     imageAssets: {
       list: () => options.imageAssets ?? [createImageAsset('asset-a', 'job-a')],
       readStoredThumbnail: (projectId, assetId) => options.imageThumbnail?.(projectId, assetId) ?? {
@@ -3898,6 +3901,44 @@ describe('原生 Canvas 文档 IPC', () => {
           source: { sessionId: 'agent-session-1', runStartedAt: 99, toolCallId: 'tool-import-1' },
         }),
       })
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
+  test('Given 注入统一图片运行服务 When runtime 运行节点 Then 直接委托同一服务实例', async () => {
+    /** 记录 runtime 传给统一服务的完整调用身份。 */
+    const calls: unknown[] = []
+    const imageRunService: CanvasImageRunService = {
+      run: async (...args) => {
+        calls.push(args)
+        return { tasks: args[2].map((node) => ({ nodeId: node.id, status: 'idle' as const })) }
+      },
+      awaitBatch: async () => { throw new Error('测试未等待批次') },
+      cancelTasks: async () => undefined,
+    }
+    const context = createContext({ enableToolProviderRuntime: true, imageRunService })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      /** 本测试使用显式非图片节点避免引入付费任务语义。 */
+      const node = {
+        id: 'document-delegate', kind: 'document' as const, title: '委托测试',
+        position: { x: 0, y: 0 }, documentId: 'content-delegate', contentRevision: 0,
+      }
+      const result = await runtime.runNodes({
+        projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      }, { projectId: 'project-1', canvasId: 'canvas-1' }, [node], 'tool-delegate')
+
+      expect(result.tasks).toEqual([{ nodeId: node.id, status: 'idle' }])
+      expect(calls).toHaveLength(1)
+      expect(calls[0]).toEqual(expect.arrayContaining([
+        expect.objectContaining({ sessionId: 'agent-session-1', runStartedAt: 99 }),
+        expect.objectContaining({ projectId: 'project-1', canvasId: 'canvas-1' }),
+        [node],
+        'tool-delegate',
+      ]))
     } finally {
       context.registration.dispose()
     }

@@ -233,6 +233,7 @@ import {
   createCanvasTextArtifactService,
 } from './lib/design/canvas-text-artifact-service'
 import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
+import { createCanvasImageRunService } from './lib/design/canvas-image-run-service'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
 import { createCanvasAgentConfigStore } from './lib/design/canvas-agent-config-store'
 import {
@@ -2737,6 +2738,15 @@ export function registerIpcHandlers(): void {
       }
     },
   })
+  /** 低层图片工具与后续 Canvas 工作流复用唯一运行服务和既有持久化边界。 */
+  const canvasImageRunService = createCanvasImageRunService({
+    serializer: canvasOperationSerializer,
+    guard: workspaceOperationGuard,
+    imageModules: canvasImageModuleStore,
+    imageJobs: designJobManager,
+    candidateBatches: canvasImageCandidateBatchService,
+    getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
+  })
   registerCanvasDocumentIpcHandlers({
     ipc: ipcMain,
     listAuthorizedWebContents: listAuthorizedDesignWebContents,
@@ -2828,6 +2838,7 @@ export function registerIpcHandlers(): void {
     imageJobs: designJobManager,
     imageJobTarget: canvasImageJobTarget,
     imageCandidateBatches: canvasImageCandidateBatchService,
+    imageRunService: canvasImageRunService,
     imageAssets: {
       list: (projectId) => designStore.requireStableAuthoritativeDocument(projectId).assets,
       readStoredThumbnail: (projectId, assetId) => designAssetService.readStoredThumbnail(projectId, assetId),

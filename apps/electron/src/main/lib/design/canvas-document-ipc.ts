@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import {
   CANVAS_IPC_CHANNELS,
   parseAdoptCanvasTextArtifactRevisionInput,
@@ -43,7 +43,6 @@ import type {
   CanvasPublicErrorCode,
   CreateDesignJobInput,
   CanvasRunNodesResult,
-  CanvasToolNodeRunResult,
   CanvasWorkspaceSnapshot,
   CanvasTextArtifactIdentity,
   CanvasTextArtifactMutationResult,
@@ -82,6 +81,10 @@ import type { CanvasImageModuleStore } from './canvas-image-module-store'
 import type { CanvasImageJobTargetAdapter } from './canvas-image-job-target'
 import type { DesignJobManager } from './design-job-manager'
 import type { CanvasImageCandidateBatchService } from './canvas-image-candidate-batch-service'
+import {
+  createCanvasImageRunService,
+  type CanvasImageRunService,
+} from './canvas-image-run-service'
 import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
@@ -206,6 +209,8 @@ export interface CanvasDocumentIpcOptions {
     'createBatchLocked' | 'listActiveSummaries' | 'load' | 'continueBatch' | 'retryJobLocked'
     | 'adoptExistingAssetLocked' | 'adopt' | 'abandon'
   >
+  /** 主进程可注入唯一图片运行服务；测试缺省时复用同一组依赖构造。 */
+  imageRunService?: CanvasImageRunService
   /** 图片模块只读取 Design 素材公开元数据并创建目录媒体授权。 */
   imageAssets: {
     list: (projectId: string) => DesignAsset[]
@@ -688,45 +693,6 @@ function isOwnedImageJob(job: DesignJobRecord, target: CanvasImageTarget): boole
     && job.target.imageModuleId === target.imageModuleId
 }
 
-/** 从单次 Agent 工具调用与节点身份派生跨重放稳定任务 ID。 */
-function createAgentCanvasImageJobId(
-  context: CanvasToolRunContext,
-  toolCallId: string,
-  canvasId: string,
-  nodeId: string,
-): string {
-  /** JSON 数组编码避免字段拼接碰撞。 */
-  const digest = createHash('sha256').update(JSON.stringify([
-    context.sessionId,
-    context.runStartedAt,
-    toolCallId,
-    canvasId,
-    nodeId,
-  ])).digest('hex')
-  return `agent-canvas-${digest}`
-}
-
-/** 从同一 Agent 工具调用身份派生可重放的候选批次 ID。 */
-function createAgentCanvasImageBatchId(
-  context: CanvasToolRunContext,
-  toolCallId: string,
-  canvasId: string,
-): string {
-  const digest = createHash('sha256').update(JSON.stringify([
-    context.sessionId,
-    context.runStartedAt,
-    toolCallId,
-    canvasId,
-    'candidate-batch',
-  ])).digest('hex')
-  return `agent-canvas-${digest}`
-}
-
-/** 把未知异常压缩为批量工具可审计的稳定文本。 */
-function canvasNodeRunError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
 /** 配置必须继续绑定请求模块，防止错误 Store 实现或竞态跨模块返回。 */
 function assertOwnedImageConfig(config: CanvasImageModuleConfig, target: CanvasImageTarget): void {
   if (config.contentId !== target.imageModuleId) throw new Error('CANVAS_IMAGE_IDENTITY_CONFLICT')
@@ -1153,6 +1119,15 @@ export function registerCanvasDocumentIpcHandlers(
   currentRegistrationTokens.set(options.ipc, registrationToken)
   /** 批处理、LOAD、SAVE 与单节点操作必须共用同一键控串行器。 */
   const operationSerializer = options.operationSerializer ?? createCanvasOperationSerializer()
+  /** 低层工具与后续工作流共享唯一图片运行边界。 */
+  const imageRunService = options.imageRunService ?? createCanvasImageRunService({
+    serializer: operationSerializer,
+    guard: options.guard,
+    imageModules: options.imageModules,
+    imageJobs: options.imageJobs,
+    candidateBatches: options.imageCandidateBatches,
+    getProjectReadOnlyReason: options.getProjectReadOnlyReason,
+  })
   /** 图片 Registry 适配器在 IPC 边界复用现有 Store、Job 与素材服务。 */
   const imageArtifactAdapter = createCanvasImageArtifactAdapter({
     read: options.imageModules.load,
@@ -1498,204 +1473,6 @@ export function registerCanvasDocumentIpcHandlers(
     return result.readOutcome.content
   }
 
-  /** 批量图片节点在单一 lease 内完成全量预检与 journal 建立，锁外统一启动。 */
-  const runCanvasNodes = async (
-    context: CanvasToolRunContext,
-    target: CanvasTarget,
-    nodes: CanvasNode[],
-    toolCallId: string,
-  ): Promise<CanvasRunNodesResult> => {
-    /** 非图片类型在同一结果中返回稳定事实，不进入付费执行器。 */
-    const taskByNodeId = new Map<string, CanvasToolNodeRunResult>()
-    for (const node of nodes) {
-      if (node.kind === 'webview') {
-        taskByNodeId.set(node.id, {
-          nodeId: node.id,
-          status: 'idle',
-        })
-      } else if (node.kind !== 'image') {
-        taskByNodeId.set(node.id, { nodeId: node.id, status: 'idle' })
-      }
-    }
-    const imageNodes = nodes.filter((node): node is Extract<CanvasNode, { kind: 'image' }> => node.kind === 'image')
-    if (imageNodes.length === 0) return { tasks: nodes.map((node) => taskByNodeId.get(node.id)!) }
-    const firstImageTarget: CanvasImageTarget = {
-      ...target,
-      nodeId: imageNodes[0]!.id,
-      imageModuleId: imageNodes[0]!.imageModuleId,
-    }
-    /** 同一 Agent 工具调用下的图片任务共享稳定候选批次身份。 */
-    const candidateBatchId = createAgentCanvasImageBatchId(context, toolCallId, target.canvasId)
-    const creationOutcome = await runImageCanvasExclusive(firstImageTarget, async () => {
-      requireWritableProject(target.projectId, options)
-      /** 第一阶段先证明全部目标、配置和模型有效，禁止边预检边创建 journal。 */
-      const prepared: Array<{
-        node: Extract<CanvasNode, { kind: 'image' }>
-        imageTarget: CanvasImageTarget
-        config: CanvasImageModuleConfig
-        jobId: string
-        input: CreateDesignJobInput
-      }> = []
-      for (const node of imageNodes) {
-        const imageTarget: CanvasImageTarget = {
-          ...target,
-          nodeId: node.id,
-          imageModuleId: node.imageModuleId,
-        }
-        try {
-          const config = await options.imageModules.load(imageTarget)
-          assertOwnedImageConfig(config, imageTarget)
-          if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
-          /** 预检与后续幂等创建使用完全相同的固化输入。 */
-          const input: CreateDesignJobInput = {
-            projectId: target.projectId,
-            target: {
-              kind: 'canvas-image', canvasId: target.canvasId,
-              nodeId: node.id, imageModuleId: node.imageModuleId,
-            },
-            action: config.adoptedAssetId ? 'edit' : 'generate',
-            prompt: config.prompt,
-            contextMode: config.contextMode,
-            imageModelProfileId: config.selectedModelProfileId,
-            generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
-            canvasImageConfigRevision: config.revision,
-            candidateBatchId,
-            ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
-          }
-          await options.imageJobs.preflightCanvasImage(input)
-          prepared.push({
-            node,
-            imageTarget,
-            config,
-            input,
-            jobId: createAgentCanvasImageJobId(context, toolCallId, target.canvasId, node.id),
-          })
-        } catch (error) {
-          /** 任一预检失败时，整批保持零 journal；失败节点与被阻断节点分别可审计。 */
-          for (const candidate of imageNodes) {
-            taskByNodeId.set(candidate.id, candidate.id === node.id
-              ? { nodeId: candidate.id, status: 'failed', error: canvasNodeRunError(error) }
-              : { nodeId: candidate.id, status: 'blocked', error: 'CANVAS_BATCH_PREFLIGHT_BLOCKED' })
-          }
-          return { ready: false as const, jobs: [] }
-        }
-      }
-
-      /** 第二阶段建立全部持久 journal，中途失败则回滚本批新建项并返回完整审计。 */
-      const jobs: Array<{
-        node: Extract<CanvasNode, { kind: 'image' }>
-        imageTarget: CanvasImageTarget
-        job: DesignJobRecord
-        created: boolean
-      }> = []
-      for (let index = 0; index < prepared.length; index += 1) {
-        const item = prepared[index]!
-        try {
-          const result = await options.imageJobs.createCanvasImageOnce(item.input, item.jobId)
-          if (!isOwnedImageJob(result.job, item.imageTarget)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
-          jobs.push({ node: item.node, imageTarget: item.imageTarget, ...result })
-        } catch (error) {
-          const createdJobs = jobs.filter((entry) => entry.created)
-          const rollbackResults = await Promise.allSettled(createdJobs.map((entry) => (
-            options.imageJobs.rollbackCanvasImageOnce(
-              target.projectId,
-              entry.job.id,
-              entry.job.target as Extract<NonNullable<DesignJobRecord['target']>, { kind: 'canvas-image' }>,
-            )
-          )))
-          for (let rollbackIndex = 0; rollbackIndex < createdJobs.length; rollbackIndex += 1) {
-            const entry = createdJobs[rollbackIndex]!
-            const rollback = rollbackResults[rollbackIndex]!
-            const rolledBack = rollback.status === 'fulfilled' && rollback.value
-            taskByNodeId.set(entry.node.id, {
-              nodeId: entry.node.id,
-              status: rolledBack ? 'rolled-back' : 'queued',
-              taskId: entry.job.id,
-              ...(!rolledBack ? { error: rollback.status === 'rejected' ? canvasNodeRunError(rollback.reason) : 'CANVAS_BATCH_ROLLBACK_FAILED' } : {}),
-            })
-          }
-          /** 复用的旧 journal 不属于本批，保留 queued 审计且绝不回滚。 */
-          for (const entry of jobs.filter((candidate) => !candidate.created)) {
-            taskByNodeId.set(entry.node.id, { nodeId: entry.node.id, status: 'queued', taskId: entry.job.id })
-          }
-          taskByNodeId.set(item.node.id, { nodeId: item.node.id, status: 'failed', error: canvasNodeRunError(error) })
-          for (const blocked of prepared.slice(index + 1)) {
-            taskByNodeId.set(blocked.node.id, {
-              nodeId: blocked.node.id,
-              status: 'blocked',
-              error: 'CANVAS_BATCH_JOB_CREATION_BLOCKED',
-            })
-          }
-          return { ready: false as const, jobs: [] }
-        }
-      }
-      /** 全部 journal 建立后先登记同一批候选，终态回调随后才能可靠定位。 */
-      try {
-        await options.imageCandidateBatches.createBatchLocked({
-          ...target,
-          batchId: candidateBatchId,
-          source: 'canvas-tool',
-          sourceSessionId: context.sessionId,
-          sourceToolCallId: toolCallId,
-          entries: prepared.map((item) => ({
-            nodeId: item.node.id,
-            imageModuleId: item.node.imageModuleId,
-            initialAdoptedAssetId: item.config.adoptedAssetId,
-            initialConfigRevision: item.config.revision,
-            jobId: item.jobId,
-          })),
-        })
-      } catch (error) {
-        const createdJobs = jobs.filter((entry) => entry.created)
-        await Promise.allSettled(createdJobs.map((entry) => options.imageJobs.rollbackCanvasImageOnce(
-          target.projectId,
-          entry.job.id,
-          entry.job.target as Extract<NonNullable<DesignJobRecord['target']>, { kind: 'canvas-image' }>,
-        )))
-        for (const item of prepared) {
-          taskByNodeId.set(item.node.id, {
-            nodeId: item.node.id,
-            status: 'failed',
-            error: canvasNodeRunError(error),
-          })
-        }
-        return { ready: false as const, jobs: [] }
-      }
-      return { ready: true as const, jobs }
-    })
-    if (!creationOutcome.ready) return { tasks: nodes.map((node) => taskByNodeId.get(node.id)!) }
-
-    /** 锁外统一启动本批首次创建的任务；allSettled 保留每个节点的独立结果。 */
-    const createdJobs = creationOutcome.jobs.filter((entry) => entry.created)
-    const runResults = await Promise.allSettled(createdJobs.map((entry) => options.imageJobs.run(entry.job.id)))
-    for (let index = 0; index < createdJobs.length; index += 1) {
-      const entry = createdJobs[index]!
-      const result = runResults[index]!
-      taskByNodeId.set(entry.node.id, result.status === 'fulfilled'
-        ? { nodeId: entry.node.id, status: 'started', taskId: entry.job.id }
-        : { nodeId: entry.node.id, status: 'failed', taskId: entry.job.id, error: canvasNodeRunError(result.reason) })
-    }
-    for (const entry of creationOutcome.jobs.filter((candidate) => !candidate.created)) {
-      taskByNodeId.set(entry.node.id, entry.job.status === 'failed'
-        ? { nodeId: entry.node.id, status: 'failed', taskId: entry.job.id, error: entry.job.error ?? 'CANVAS_IMAGE_JOB_FAILED' }
-        : { nodeId: entry.node.id, status: entry.job.status === 'queued' ? 'queued' : 'started', taskId: entry.job.id })
-    }
-    /** 任务启动后只读取同一批次 JSON，向 Agent 返回有限计数而不加载素材原图。 */
-    const candidateBatch = await options.imageCandidateBatches.load({ ...target, batchId: candidateBatchId })
-    return {
-      tasks: nodes.map((node) => taskByNodeId.get(node.id)!),
-      batch: {
-        batchId: candidateBatch.batchId,
-        status: candidateBatch.status,
-        totalCount: candidateBatch.entries.length,
-        candidateCount: candidateBatch.entries.filter((entry) => entry.status === 'candidate').length,
-        failedCount: candidateBatch.entries.filter((entry) => entry.status === 'failed' || entry.status === 'invalid').length,
-        runningCount: candidateBatch.entries.filter((entry) => entry.status === 'queued' || entry.status === 'running').length,
-        requiresCanvasReview: true,
-      },
-    }
-  }
-
   if (options.batch.execute && options.toolAccess) {
     /** 当前注册代次只闭包生产注入的唯一 facade 与文档执行边界。 */
     const toolAccess = options.toolAccess
@@ -1727,14 +1504,14 @@ export function registerCanvasDocumentIpcHandlers(
           },
           batch,
           readNodeContent: readCanvasNodeContent,
-          runNodes: runCanvasNodes,
+          imageRuns: imageRunService,
         }, context),
         documents: options.store,
         agentConfigs: options.agent.configs,
         agentExecution: options.agent.execution,
         batch,
         readNodeContent: readCanvasNodeContent,
-        runNodes: runCanvasNodes,
+        runNodes: imageRunService.run,
       },
     }
   }

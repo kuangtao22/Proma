@@ -321,15 +321,17 @@ function createFixture(options: {
       document = { ...document, revision: input.baseRevision + 1 }
       return { document, operationId: `operation-${batchInputs.length}` }
     } },
-    runNodes: async (_context, _target, nodes, toolCallId) => {
-      runInputs.push(nodes.map((node) => node.id))
-      runToolCallIds.push(toolCallId)
-      return {
-        tasks: nodes.map((node) => node.kind === 'image'
-          ? { nodeId: node.id, status: 'started' as const, taskId: `task-${node.id}` }
-          : { nodeId: node.id, status: 'idle' as const }),
-        ...(options.runBatch ? { batch: options.runBatch } : {}),
-      }
+    imageRuns: {
+      run: async (_context, _target, nodes, toolCallId) => {
+        runInputs.push(nodes.map((node) => node.id))
+        runToolCallIds.push(toolCallId)
+        return {
+          tasks: nodes.map((node) => node.kind === 'image'
+            ? { nodeId: node.id, status: 'started' as const, taskId: `task-${node.id}` }
+            : { nodeId: node.id, status: 'idle' as const }),
+          ...(options.runBatch ? { batch: options.runBatch } : {}),
+        }
+      },
     },
   }
   const context: CanvasToolRunContext = {

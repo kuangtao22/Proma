@@ -14,7 +14,6 @@ import type {
   CanvasMutation,
   CanvasNode,
   CanvasNodeReference,
-  CanvasRunNodesResult,
   SaveCanvasImageModuleInput,
   CanvasTarget,
   CanvasWorkspaceSnapshot,
@@ -36,6 +35,7 @@ import type {
   CanvasArtifactCreationService,
 } from './canvas-artifact-creation'
 import type { CanvasTextArtifactService } from './canvas-text-artifact-service'
+import type { CanvasImageRunService } from './canvas-image-run-service'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 import {
   canvasNodeCapabilityRegistry,
@@ -407,12 +407,8 @@ export interface CanvasToolProviderDependencies {
     readThumbnail: (projectId: string, assetId: string) => Promise<CanvasInspectionThumbnail>
   }
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
-  runNodes: (
-    context: CanvasToolRunContext,
-    target: CanvasTarget,
-    nodes: CanvasNode[],
-    toolCallId: string,
-  ) => Promise<CanvasRunNodesResult>
+  /** 低层工具直接调用主进程唯一图片运行服务。 */
+  imageRuns: Pick<CanvasImageRunService, 'run'>
 }
 
 /** Provider 产出的单轮扩展；extend 保留普通 Agent 原有工具。 */
@@ -1271,7 +1267,7 @@ export function createCanvasToolRun(
             return node
           })
           /** 目标预检、journal 建立和统一启动由生产批量边界一次完成。 */
-          const result = await dependencies.runNodes(context, target, nodes, toolCallId)
+          const result = await dependencies.imageRuns.run(context, target, nodes, toolCallId)
           return toolResult({
             canvasId: params.canvasId,
             revision: document.revision,
