@@ -53,11 +53,51 @@ const MAX_INSPECT_BATCH_BYTES = 2 * 1024 * 1024
 const MAX_INSPECT_IMAGE_PIXELS = 64_000_000
 /** 父 Agent 单次指令与正式输出摘要的上下文预算。 */
 const MAX_AGENT_RUN_INSTRUCTION_LENGTH = 8_192
-const MAX_AGENT_RUN_OUTPUT_SUMMARY_LENGTH = 4_096
+const MAX_AGENT_RUN_OUTPUT_SUMMARY_BYTES = 4_096
 /** 临时 Skill 只接受稳定名称或 slug，禁止路径和空白。 */
 const MAX_AGENT_RUN_SKILLS = 16
 const STABLE_AGENT_SKILL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/
 const CANVAS_NODE_KINDS: CanvasNode['kind'][] = ['agent', 'image', 'document', 'webview']
+
+/** renderer 手动运行的 Canvas Agent 仅继承 Task 8 前已有的固定能力。 */
+const RENDERER_MANUAL_CANVAS_AGENT_TOOL_NAMES = new Set([
+  'canvas_get_context',
+  'canvas_list_nodes',
+  'canvas_inspect_images',
+  'canvas_read',
+  'canvas_apply_changes',
+  'canvas_import_image',
+  'canvas_create_artifact',
+  'canvas_update_artifact',
+  'canvas_run_nodes',
+])
+/** 父 Agent 编排模式禁止 Canvas Agent 再启动任何付费图片任务。 */
+const PARENT_ORCHESTRATED_CANVAS_AGENT_TOOL_NAMES = new Set([
+  'canvas_get_context',
+  'canvas_list_nodes',
+  'canvas_inspect_images',
+  'canvas_read',
+  'canvas_apply_changes',
+  'canvas_import_image',
+  'canvas_create_artifact',
+  'canvas_update_artifact',
+])
+
+/** 按 UTF-8 原始字节预算截断文本，并保持完整 Unicode 字符。 */
+function truncateUtf8(content: string, maxBytes: number): string {
+  /** 已接受的 UTF-8 字节数。 */
+  let acceptedBytes = 0
+  /** 已接受正文对应的 UTF-16 结束下标。 */
+  let acceptedEnd = 0
+  for (const character of content) {
+    /** 当前完整 Unicode 字符的 UTF-8 字节数。 */
+    const characterBytes = Buffer.byteLength(character, 'utf8')
+    if (acceptedBytes + characterBytes > maxBytes) break
+    acceptedBytes += characterBytes
+    acceptedEnd += character.length
+  }
+  return content.slice(0, acceptedEnd)
+}
 
 /** 不透明分页游标绑定的权威读取边界。 */
 interface CanvasNodeCursorPayload {
@@ -304,6 +344,18 @@ export interface CanvasToolRunContext {
   canvasAgentTarget?: CanvasAgentTarget
   /** 由统一执行服务注入的可信 Canvas Agent 运行模式，用于第二层能力收缩。 */
   canvasAgentMode?: 'renderer-manual' | 'parent-orchestrated'
+}
+
+/** Canvas Agent 按固定正向清单选择工具，未来新增能力默认拒绝。 */
+export function filterCanvasAgentToolsForMode(
+  tools: readonly ToolDefinition[],
+  mode: NonNullable<CanvasToolRunContext['canvasAgentMode']>,
+): ToolDefinition[] {
+  /** 当前可信运行模式允许的固定工具名集合。 */
+  const allowedNames = mode === 'parent-orchestrated'
+    ? PARENT_ORCHESTRATED_CANVAS_AGENT_TOOL_NAMES
+    : RENDERER_MANUAL_CANVAS_AGENT_TOOL_NAMES
+  return tools.filter((tool) => allowedNames.has(tool.name))
 }
 
 /** Provider 交给主进程路径授权边界的本地图片导入请求。 */
@@ -1118,6 +1170,9 @@ export function createCanvasToolRun(
               ...(params.patch.channelId !== undefined ? { channelId: params.patch.channelId } : {}),
               ...(params.patch.modelId !== undefined ? { modelId: params.patch.modelId } : {}),
             },
+          }, () => {
+            /** serializer 等待期间可能发生解绑，最终校验必须与配置写共享临界区。 */
+            dependencies.access.requireLinkedCanvas(context, params.canvasId)
           })
           return toolResult({
             canvasId: config.canvasId,
@@ -1191,7 +1246,7 @@ export function createCanvasToolRun(
           status: result.status,
           outputPointer: result.output.pointer,
           downstreamNodeIds: result.output.downstreamNodeIds,
-          outputSummary: output.slice(0, MAX_AGENT_RUN_OUTPUT_SUMMARY_LENGTH),
+          outputSummary: truncateUtf8(output, MAX_AGENT_RUN_OUTPUT_SUMMARY_BYTES),
         })
       },
     }),
@@ -1230,15 +1285,9 @@ export function createCanvasToolRun(
 
   /** Canvas Agent 的可信模式只缩减能力；普通 Agent 继续保留既有工具与审批。 */
   const isCanvasAgent = context.canvasAgentTarget !== undefined
-  const isParentOrchestrated = context.canvasAgentMode === 'parent-orchestrated'
-  const availableTools = tools.filter((tool) => {
-    if (!isCanvasAgent) return true
-    if (tool.name === 'canvas_manage'
-      || tool.name === 'canvas_create_agent'
-      || tool.name === 'canvas_update_agent_config'
-      || tool.name === 'canvas_run_agent') return false
-    return !isParentOrchestrated || tool.name !== 'canvas_run_nodes'
-  })
+  const availableTools = isCanvasAgent
+    ? filterCanvasAgentToolsForMode(tools, context.canvasAgentMode ?? 'renderer-manual')
+    : tools
   /** 直接入边由 SEND 对账快照转换为权威引用，标题只作为 JSON 数据展示。 */
   const canvasAgentPrompt = context.canvasAgentTarget
     ? `\n\n## Canvas Agent 固定作用域

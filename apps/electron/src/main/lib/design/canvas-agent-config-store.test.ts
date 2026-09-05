@@ -397,6 +397,38 @@ describe('CanvasAgentConfigStore', () => {
     expect(fixture.writeCount).toBe(0)
   })
 
+  test('Given 配置更新等待同 Canvas 串行器期间关联被撤销 When 获得写临界区 Then 授权复核先于 native 读写并拒绝更新', async () => {
+    const fixture = createFixture({ content: JSON.stringify(createConfig()) })
+    /** 模拟其它 Canvas 写先占用串行器，让配置更新在旧授权检查之后排队。 */
+    let releaseCanvasWrite: (() => void) | undefined
+    const canvasWriteRelease = new Promise<void>((resolve) => {
+      releaseCanvasWrite = resolve
+    })
+    let notifyCanvasWriteStarted: (() => void) | undefined
+    const canvasWriteStarted = new Promise<void>((resolve) => {
+      notifyCanvasWriteStarted = resolve
+    })
+    const canvasWrite = fixture.serializer.run(target, async () => {
+      notifyCanvasWriteStarted?.()
+      await canvasWriteRelease
+    })
+    await canvasWriteStarted
+
+    /** 第二参数模拟 Host 捕获的可信 binding 复核。 */
+    let linked = true
+    const update = fixture.store.update(createUpdate({ instruction: 'stale write' }), () => {
+      if (!linked) throw new Error('CANVAS_ACCESS_DENIED')
+    })
+    await Promise.resolve()
+    linked = false
+    releaseCanvasWrite?.()
+    await canvasWrite
+
+    await expect(update).rejects.toThrow('CANVAS_ACCESS_DENIED')
+    expect(fixture.requests).toHaveLength(0)
+    expect(fixture.writeCount).toBe(0)
+  })
+
   test('Given Skill 未安装或停用且模型选择无效 When 保存 Then 全部 fail closed', async () => {
     const missingSkill = createFixture({ content: JSON.stringify(createConfig()), skills: [] })
     const disabledSkill = createFixture({

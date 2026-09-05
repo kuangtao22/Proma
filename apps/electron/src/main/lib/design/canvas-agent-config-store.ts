@@ -68,7 +68,11 @@ export interface UpdateCanvasAgentConfigInput extends CanvasAgentTarget {
 /** Canvas Agent 长期配置的窄业务接口。 */
 export interface CanvasAgentConfigStore {
   load: (target: CanvasAgentTarget) => Promise<CanvasAgentConfig>
-  update: (input: UpdateCanvasAgentConfigInput) => Promise<CanvasAgentConfig>
+  update: (
+    input: UpdateCanvasAgentConfigInput,
+    /** Host 捕获的可信授权复核；Store 在 keyed serializer 内、I/O 前执行。 */
+    validateAccess?: () => void,
+  ) => Promise<CanvasAgentConfig>
 }
 
 /** Canvas Agent 配置 Store 的可测试依赖。 */
@@ -359,7 +363,7 @@ export function createCanvasAgentConfigStore(
       return (await readConfig(scope.capability, target)) ?? createDefaultConfig(target)
     },
 
-    update: async (input) => {
+    update: async (input, validateAccess) => {
       /** 经过稳定 ID 校验的目标。 */
       const target = requireTarget(input)
       if (!isNonNegativeInteger(input.expectedGraphRevision)
@@ -368,6 +372,8 @@ export function createCanvasAgentConfigStore(
         throw new Error('CANVAS_AGENT_CONFIG_UPDATE_INVALID')
       }
       return dependencies.runExclusive(target, async () => {
+        /** Host 授权必须在 Canvas 串行器内最终复核，且先于任何配置目录 I/O。 */
+        validateAccess?.()
         /** 与本次权威图绑定的配置 scope。 */
         const scope = loadScope(target)
         if (scope.graphRevision !== input.expectedGraphRevision) {

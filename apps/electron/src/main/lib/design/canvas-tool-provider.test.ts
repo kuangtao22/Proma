@@ -2,7 +2,13 @@ import { describe, expect, test } from 'bun:test'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentCanvasBinding, CanvasDocument, CanvasMutation, CanvasNodeReference, CanvasRunNodesBatchSummary, CanvasSessionMeta, DesignJobRecord } from '@proma/shared'
 import { createEmptyCanvasDocument } from '@proma/shared'
-import { CANVAS_TOOL_NAMES, createCanvasToolRun, type CanvasToolProviderDependencies, type CanvasToolRunContext } from './canvas-tool-provider'
+import {
+  CANVAS_TOOL_NAMES,
+  createCanvasToolRun,
+  filterCanvasAgentToolsForMode,
+  type CanvasToolProviderDependencies,
+  type CanvasToolRunContext,
+} from './canvas-tool-provider'
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
 const reference: CanvasNodeReference = { ...target, nodeId: 'doc-1', nodeType: 'document', nodeRevision: 3, title: '需求' }
@@ -30,6 +36,7 @@ function createFixture(options: {
   agentOutput?: string
   agentOutputAtPointer?: string
   unlinkBeforeWrite?: boolean
+  unlinkBeforeAgentConfigValidation?: boolean
 } = {}) {
   let document: CanvasDocument = {
     ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
@@ -159,7 +166,12 @@ function createFixture(options: {
         schemaVersion: 1 as const, ...input, revision: 4, instruction: '长期职责',
         skillNames: ['research'], channelId: 'channel-1', modelId: 'model-1', updatedAt: 1,
       }),
-      update: async (input) => {
+      update: async (input, validateAccess?: () => void) => {
+        if (options.unlinkBeforeAgentConfigValidation) {
+          linkedCanvasIds.splice(0)
+          if (!validateAccess) throw new Error('CANVAS_AGENT_CONFIG_ACCESS_VALIDATOR_REQUIRED')
+          validateAccess()
+        }
         agentConfigUpdateInputs.push(structuredClone(input))
         return {
           schemaVersion: 1 as const,
@@ -559,7 +571,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
   })
 
   test('Given 配置更新排队期间画布已解绑 When 进入写临界区 Then 在持久化前重新拒绝', async () => {
-    const fixture = createFixture({ unlinkBeforeWrite: true })
+    const fixture = createFixture({ unlinkBeforeAgentConfigValidation: true })
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
 
     await expect(executeTool(run.piCustomTools, 'canvas_update_agent_config', {
@@ -628,6 +640,22 @@ describe('普通 Agent Canvas Tool Provider', () => {
     }])
   })
 
+  test('Given 正式输出包含多字节字符 When 生成响应摘要 Then 按 UTF-8 字节安全截断且不切断字符', async () => {
+    const prefix = '中'.repeat(1_365)
+    const fixture = createFixture({ agentOutputAtPointer: `${prefix}😀后续正文` })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_run_agent', {
+      canvasId: 'canvas-1', nodeId: 'agent-1', expectedRevision: 3,
+      instruction: '生成多字节正文',
+    }, 'tool-agent-run-utf8-budget')
+    const summary = (result.details as { outputSummary: string }).outputSummary
+
+    expect(summary).toBe(prefix)
+    expect(Buffer.byteLength(summary, 'utf8')).toBeLessThanOrEqual(4_096)
+    expect(summary).not.toContain('\uFFFD')
+  })
+
   test('Given plan 上限或非法目标 When 单 Agent 运行 Then 不启动执行服务', async () => {
     const fixture = createFixture()
     const planRun = createCanvasToolRun(fixture.dependencies, {
@@ -660,8 +688,9 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(fixture.agentExecutionInputs).toHaveLength(0)
   })
 
-  test('Given Canvas Agent 的可信执行模式 When 构造工具 Then 两种模式都不能配置或递归运行且父模式额外禁用批量运行', () => {
+  test('Given Canvas Agent 的可信执行模式和未来未知工具 When 构造工具 Then 两种模式按固定正向清单默认拒绝未知能力', () => {
     const fixture = createFixture()
+    const ordinary = createCanvasToolRun(fixture.dependencies, fixture.context)
     const canvasAgentTarget = { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'agent-1' }
     const rendererManual = createCanvasToolRun(fixture.dependencies, {
       ...fixture.context, sessionId: 'canvas-agent-session-1', canvasAgentTarget,
@@ -671,14 +700,26 @@ describe('普通 Agent Canvas Tool Provider', () => {
       ...fixture.context, sessionId: 'canvas-agent-session-1', canvasAgentTarget,
       canvasAgentMode: 'parent-orchestrated',
     })
-    const previousCanvasAgentTools = CANVAS_TOOL_NAMES.filter((name) => (
-      !['canvas_manage', 'canvas_create_agent', 'canvas_update_agent_config', 'canvas_run_agent'].includes(name)
-    ))
+    const rendererManualToolNames = [
+      'canvas_get_context', 'canvas_list_nodes', 'canvas_inspect_images', 'canvas_read',
+      'canvas_apply_changes', 'canvas_import_image', 'canvas_create_artifact',
+      'canvas_update_artifact',
+      'canvas_run_nodes',
+    ]
+    const parentOrchestratedToolNames = rendererManualToolNames.filter((name) => name !== 'canvas_run_nodes')
+    /** 模拟未来给普通 Agent 新增的高权限工具，Canvas Agent 必须默认拒绝。 */
+    const futurePrivilegedTool: ToolDefinition = {
+      ...ordinary.piCustomTools[0]!,
+      name: 'canvas_future_privileged',
+    }
+    const candidateTools = [...ordinary.piCustomTools, futurePrivilegedTool]
 
-    expect(rendererManual.allowedToolNames).toEqual(previousCanvasAgentTools)
-    expect(parentOrchestrated.allowedToolNames).toEqual(
-      previousCanvasAgentTools.filter((name) => name !== 'canvas_run_nodes'),
-    )
+    expect(rendererManual.allowedToolNames).toEqual(rendererManualToolNames)
+    expect(parentOrchestrated.allowedToolNames).toEqual(parentOrchestratedToolNames)
+    expect(filterCanvasAgentToolsForMode(candidateTools, 'renderer-manual').map((tool) => tool.name))
+      .toEqual(rendererManualToolNames)
+    expect(filterCanvasAgentToolsForMode(candidateTools, 'parent-orchestrated').map((tool) => tool.name))
+      .toEqual(parentOrchestratedToolNames)
     expect(parentOrchestrated.singleApprovalToolNames).toEqual([])
   })
 
