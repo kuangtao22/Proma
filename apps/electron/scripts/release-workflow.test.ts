@@ -60,6 +60,11 @@ interface ElectronBuilderConfig {
   win?: PlatformArtifactConfig
   /** Linux 安装包配置。 */
   linux?: PlatformArtifactConfig
+  /** Windows NSIS 安装器配置。 */
+  nsis?: {
+    /** 注入 electron-builder NSIS 模板的自定义 include。 */
+    include?: string
+  }
 }
 
 /** 返回仓库中的 Release 工作流文本。 */
@@ -95,6 +100,13 @@ function readElectronBuilderConfig(): ElectronBuilderConfig {
   /** 当前测试脚本到 Electron Builder YAML 的路径。 */
   const configPath = resolve(import.meta.dir, '../electron-builder.yml')
   return Bun.YAML.parse(readFileSync(configPath, 'utf8')) as ElectronBuilderConfig
+}
+
+/** 返回 Windows 安装器自定义 NSIS include 文本。 */
+function readWindowsInstallerInclude(): string {
+  /** 当前测试脚本到 NSIS include 的路径。 */
+  const includePath = resolve(import.meta.dir, '../resources/installer.nsh')
+  return readFileSync(includePath, 'utf8')
 }
 
 test('Release 工作流构建并发布 Linux x64 安装包', () => {
@@ -189,6 +201,23 @@ test('Windows 构建与发布在打包前执行稳定目录原生回归', () => 
 
   expect(workflowCommands(buildWorkflow.jobs?.['build-windows-x64'])).toContain(stableDirectoryTests)
   expect(workflowCommands(releaseWorkflow.jobs?.['build-windows-x64'])).toContain(stableDirectoryTests)
+})
+
+test('Windows 升级安装器展示既有版本和目录并保留完整性校验', () => {
+  /** Electron Builder 的正式打包配置。 */
+  const config = readElectronBuilderConfig()
+  /** Windows 安装器自定义 NSIS include。 */
+  const installerSource = readWindowsInstallerInclude()
+
+  expect(config.nsis?.include).toBe('resources/installer.nsh')
+  expect(installerSource).toContain('!macro customPageAfterChangeDir')
+  expect(installerSource).toContain('ReadRegStr $upgradeInstallLocation')
+  expect(installerSource).toContain('"${INSTALL_REGISTRY_KEY}" InstallLocation')
+  expect(installerSource).toContain('ReadRegStr $upgradeDisplayVersion')
+  expect(installerSource).toContain('"${UNINSTALL_REGISTRY_KEY}" DisplayVersion')
+  expect(installerSource).toContain('StrCpy $upgradeDisplayVersion "未知版本"')
+  expect(installerSource).toMatch(/\$upgradeInstallLocation == ""[\s\S]*Abort/)
+  expect(installerSource).not.toContain('/NCRC')
 })
 
 test('Release 工作流在全平台构建前校验 Bone 发布合同', () => {
