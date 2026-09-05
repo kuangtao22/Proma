@@ -70,6 +70,7 @@ function createFixture(options: {
   revokeAfterWrite?: boolean
   writeOutcome?: StableDirectoryNativeWriteOutcome
   rereadContent?: string
+  postWriteReadError?: Error
   pauseFirstWrite?: boolean
   serializer?: CanvasOperationSerializer
 } = {}) {
@@ -119,6 +120,7 @@ function createFixture(options: {
     if (!authorize(openedRoots)) throw new Error('NATIVE_AUTHORIZATION_REVOKED')
     if (request.mode === 'canvas-content-read') {
       readCount += 1
+      if (writeCount > 0 && options.postWriteReadError) throw options.postWriteReadError
       const readContent = writeCount > 0 && options.rereadContent !== undefined
         ? options.rereadContent
         : content
@@ -251,6 +253,20 @@ describe('CanvasAgentConfigStore', () => {
     await expect(wrongProject.store.load(target)).rejects.toThrow('CANVAS_AGENT_CONFIG_IDENTITY_CONFLICT')
   })
 
+  test('Given 配置字段语义损坏 When 加载 Then 统一分类为 corrupt 并保留字段错误 cause', async () => {
+    const fixture = createFixture({
+      content: JSON.stringify(createConfig({ instruction: '中'.repeat(2_731) })),
+    })
+
+    const error = await fixture.store.load(target).catch((reason: unknown) => reason)
+
+    expect(error).toBeInstanceOf(Error)
+    if (!(error instanceof Error)) return
+    expect(error.message).toContain('CANVAS_AGENT_CONFIG_CORRUPT')
+    expect(error.cause).toBeInstanceOf(Error)
+    expect((error.cause as Error).message).toContain('CANVAS_AGENT_CONFIG_INSTRUCTION_INVALID')
+  })
+
   test('Given 指令超过 8 KiB、Skill 超量重复或 ID 越界 When 更新 Then 全部在写前拒绝', async () => {
     const tooLong = createFixture({ content: JSON.stringify(createConfig()) })
     const tooMany = createFixture({ content: JSON.stringify(createConfig()) })
@@ -319,6 +335,18 @@ describe('CanvasAgentConfigStore', () => {
     await expect(configConflict.store.update(createUpdate({ instruction: 'new' }, { expectedConfigRevision: 1 })))
       .rejects.toThrow('CANVAS_AGENT_CONFIG_REVISION_CONFLICT')
     expect(graphConflict.writeCount + configConflict.writeCount).toBe(0)
+  })
+
+  test('Given 当前 config revision 已达安全整数上限 When 更新 Then 溢出前拒绝且不写', async () => {
+    const fixture = createFixture({
+      content: JSON.stringify(createConfig({ revision: Number.MAX_SAFE_INTEGER })),
+    })
+
+    await expect(fixture.store.update(createUpdate(
+      { instruction: 'overflow' },
+      { expectedConfigRevision: Number.MAX_SAFE_INTEGER },
+    ))).rejects.toThrow('CANVAS_AGENT_CONFIG_REVISION_OVERFLOW')
+    expect(fixture.writeCount).toBe(0)
   })
 
   test('Given 两个更新共享同一 config baseline When 并发提交 Then 只有一个写入成功', async () => {
@@ -436,6 +464,40 @@ describe('CanvasAgentConfigStore', () => {
 
     await expect(fixture.store.update(createUpdate({ instruction: 'new' })))
       .rejects.toThrow('CANVAS_AGENT_CONFIG_COMMIT_UNCONFIRMED')
+    expect(fixture.writeCount).toBe(1)
+  })
+
+  test('Given durable commit 后复读 helper 抛错 When 更新 Then 统一报 commit-unconfirmed 并保留 cause', async () => {
+    const rereadError = new Error('HELPER_START_FAILED')
+    const fixture = createFixture({
+      content: JSON.stringify(createConfig()),
+      postWriteReadError: rereadError,
+    })
+
+    const error = await fixture.store.update(createUpdate({ instruction: 'new' }))
+      .catch((reason: unknown) => reason)
+
+    expect(error).toBeInstanceOf(Error)
+    if (!(error instanceof Error)) return
+    expect(error.message).toContain('CANVAS_AGENT_CONFIG_COMMIT_UNCONFIRMED')
+    expect(error.cause).toBe(rereadError)
+    expect(fixture.writeCount).toBe(1)
+  })
+
+  test('Given durable commit 后 capability 被撤销 When 更新 Then 统一报 commit-unconfirmed 且不重写', async () => {
+    const fixture = createFixture({
+      content: JSON.stringify(createConfig()),
+      revokeAfterWrite: true,
+    })
+
+    const error = await fixture.store.update(createUpdate({ instruction: 'new' }))
+      .catch((reason: unknown) => reason)
+
+    expect(error).toBeInstanceOf(Error)
+    if (!(error instanceof Error)) return
+    expect(error.message).toContain('CANVAS_AGENT_CONFIG_COMMIT_UNCONFIRMED')
+    expect(error.cause).toBeInstanceOf(Error)
+    expect((error.cause as Error).message).toContain('CAPABILITY_REVOKED')
     expect(fixture.writeCount).toBe(1)
   })
 })

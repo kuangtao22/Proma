@@ -189,42 +189,50 @@ function parseConfig(content: string, target: CanvasAgentTarget): CanvasAgentCon
   } catch (error: unknown) {
     throw new Error('CANVAS_AGENT_CONFIG_CORRUPT: invalid JSON', { cause: error })
   }
-  if (!hasExactKeys(value, CONFIG_KEYS)
-    || value.schemaVersion !== 1
-    || !isNonNegativeInteger(value.revision)
-    || !isNonNegativeInteger(value.updatedAt)) {
+  if (!hasExactKeys(value, CONFIG_KEYS)) {
     throw new Error('CANVAS_AGENT_CONFIG_CORRUPT')
   }
-  /** 从磁盘重新验证的项目身份。 */
-  const projectId = requireStableId(value.projectId, 'CANVAS_AGENT_CONFIG_CORRUPT')
-  /** 从磁盘重新验证的 Canvas 身份。 */
-  const canvasId = requireStableId(value.canvasId, 'CANVAS_AGENT_CONFIG_CORRUPT')
-  /** 从磁盘重新验证的节点身份。 */
-  const nodeId = requireStableId(value.nodeId, 'CANVAS_AGENT_CONFIG_CORRUPT')
+  /** exact-key 通过后的字段语义解析结果。 */
+  let parsed: CanvasAgentConfig
+  try {
+    if (value.schemaVersion !== 1) throw new Error('CANVAS_AGENT_CONFIG_SCHEMA_INVALID')
+    if (!isNonNegativeInteger(value.revision)) throw new Error('CANVAS_AGENT_CONFIG_REVISION_INVALID')
+    if (!isNonNegativeInteger(value.updatedAt)) throw new Error('CANVAS_AGENT_CONFIG_TIME_INVALID')
+    /** 从磁盘重新验证的项目身份。 */
+    const projectId = requireStableId(value.projectId, 'CANVAS_AGENT_CONFIG_PROJECT_ID_INVALID')
+    /** 从磁盘重新验证的 Canvas 身份。 */
+    const canvasId = requireStableId(value.canvasId, 'CANVAS_AGENT_CONFIG_CANVAS_ID_INVALID')
+    /** 从磁盘重新验证的节点身份。 */
+    const nodeId = requireStableId(value.nodeId, 'CANVAS_AGENT_CONFIG_NODE_ID_INVALID')
+    /** 从磁盘重新构造的职责正文。 */
+    const instruction = requireInstruction(value.instruction)
+    /** 从磁盘重新构造的 Skill 列表。 */
+    const skillNames = requireSkillNames(value.skillNames)
+    /** 从磁盘重新构造的渠道选择。 */
+    const channelId = requireOptionalModelSelectionId(value.channelId)
+    /** 从磁盘重新构造的模型选择。 */
+    const modelId = requireOptionalModelSelectionId(value.modelId)
+    if (channelId === null && modelId !== null) throw new Error('CANVAS_AGENT_CONFIG_ROUTE_INVALID')
+    parsed = {
+      schemaVersion: 1,
+      projectId,
+      canvasId,
+      nodeId,
+      revision: value.revision,
+      instruction,
+      skillNames,
+      channelId,
+      modelId,
+      updatedAt: value.updatedAt,
+    }
+  } catch (error: unknown) {
+    throw new Error('CANVAS_AGENT_CONFIG_CORRUPT: invalid fields', { cause: error })
+  }
+  const { projectId, canvasId, nodeId } = parsed
   if (projectId !== target.projectId || canvasId !== target.canvasId || nodeId !== target.nodeId) {
     throw new Error('CANVAS_AGENT_CONFIG_IDENTITY_CONFLICT')
   }
-  /** 从磁盘重新构造的职责正文。 */
-  const instruction = requireInstruction(value.instruction)
-  /** 从磁盘重新构造的 Skill 列表。 */
-  const skillNames = requireSkillNames(value.skillNames)
-  /** 从磁盘重新构造的渠道选择。 */
-  const channelId = requireOptionalModelSelectionId(value.channelId)
-  /** 从磁盘重新构造的模型选择。 */
-  const modelId = requireOptionalModelSelectionId(value.modelId)
-  if (channelId === null && modelId !== null) throw new Error('CANVAS_AGENT_CONFIG_CORRUPT')
-  return {
-    schemaVersion: 1,
-    projectId,
-    canvasId,
-    nodeId,
-    revision: value.revision,
-    instruction,
-    skillNames,
-    channelId,
-    modelId,
-    updatedAt: value.updatedAt,
-  }
+  return parsed
 }
 
 /** 校验公开目标的全部稳定 ID。 */
@@ -318,7 +326,9 @@ export function createCanvasAgentConfigStore(
       }
       return new Error(`CANVAS_AGENT_CONFIG_DURABILITY_UNCERTAIN: ${committedOutcome.error}`)
     }
-    if (scopeError !== undefined) throw scopeError
+    if (scopeError !== undefined) {
+      throw configCommitUnconfirmed('durable write scope revalidation failed', scopeError)
+    }
     return null
   }
 
@@ -367,6 +377,9 @@ export function createCanvasAgentConfigStore(
         const current = (await readConfig(scope.capability, target)) ?? createDefaultConfig(target)
         if (current.revision !== input.expectedConfigRevision) {
           throw new Error('CANVAS_AGENT_CONFIG_REVISION_CONFLICT')
+        }
+        if (current.revision >= Number.MAX_SAFE_INTEGER) {
+          throw new Error('CANVAS_AGENT_CONFIG_REVISION_OVERFLOW')
         }
         /** patch 是否显式携带 channelId。 */
         const hasChannelId = Object.prototype.hasOwnProperty.call(input.patch, 'channelId')
@@ -426,14 +439,15 @@ export function createCanvasAgentConfigStore(
           throw durabilityError
         }
         /** 已确认耐久的写仍须从同一 capability 复读并严格比较完整配置。 */
-        const reread = await readConfig(scope.capability, target)
-        if (reread === null || JSON.stringify(reread) !== JSON.stringify(next)) {
-          throw configCommitUnconfirmed(
-            'durable write content verification failed',
-            new Error('committed config does not match requested config'),
-          )
+        try {
+          const reread = await readConfig(scope.capability, target)
+          if (reread === null || JSON.stringify(reread) !== JSON.stringify(next)) {
+            throw new Error('committed config does not match requested config')
+          }
+          return reread
+        } catch (error: unknown) {
+          throw configCommitUnconfirmed('durable write content verification failed', error)
         }
-        return reread
       })
     },
   }
