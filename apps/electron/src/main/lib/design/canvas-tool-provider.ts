@@ -337,7 +337,7 @@ export interface CanvasToolProviderDependencies {
     load: (target: CanvasTarget) => CanvasWorkspaceSnapshot
     validateBatchOperations: (target: CanvasTarget, expectedRevision: number, operations: unknown[]) => CanvasMutation[]
   }
-  agentOutputs: Pick<CanvasAgentOutputService, 'read'>
+  agentOutputs: Pick<CanvasAgentOutputService, 'read' | 'readAtPointer'>
   agentConfigs: Pick<CanvasAgentConfigStore, 'load' | 'update'>
   agentExecution: Pick<CanvasAgentExecutionService, 'execute'>
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
@@ -1103,9 +1103,9 @@ export function createCanvasToolRun(
       execute: async (_toolCallId, params) => {
         dependencies.access.authorizeRead(context)
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
-        /** 每次执行 fresh-read 当前关联，不能沿用创建本轮工具时的权限快照。 */
-        dependencies.access.requireLinkedCanvas(context, params.canvasId)
         return dependencies.access.runWrite(context, async () => {
+          /** 排队进入写临界区后再次读取关联，避免先完成的 unlink 撤权被旧快照绕过。 */
+          dependencies.access.requireLinkedCanvas(context, params.canvasId)
           const config = await dependencies.agentConfigs.update({
             projectId: context.projectId,
             canvasId: params.canvasId,
@@ -1163,6 +1163,7 @@ export function createCanvasToolRun(
           mode: 'parent-orchestrated',
           target: agentTarget,
           parentSessionId: context.sessionId,
+          expectedGraphRevision: params.expectedRevision,
           instruction,
           ...(skillNames ? { skillNames } : {}),
           userMessageUuid: toolCallId,
@@ -1184,7 +1185,7 @@ export function createCanvasToolRun(
           throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
         }
         /** 正式 pointer 对应的权威正文只用于生成有界摘要，不回查任意末条消息。 */
-        const output = await dependencies.agentOutputs.read(agentTarget)
+        const output = await dependencies.agentOutputs.readAtPointer(agentTarget, result.output.pointer)
         return toolResult({
           nodeId: node.id,
           status: result.status,

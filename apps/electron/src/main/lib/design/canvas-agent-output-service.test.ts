@@ -141,6 +141,16 @@ function createFixture(options: {
     getPublishStates: () => [...publishStates],
     setMessages: (next: SDKMessage[]) => { messages = next },
     setSession: (next: AgentSessionMeta) => { session = next },
+    /** 模拟后续运行推进节点当前正式指针。 */
+    setOutputPointer: (pointer: Extract<CanvasNode, { kind: 'agent' }>['outputPointer']) => {
+      document = {
+        ...document,
+        revision: document.revision + 1,
+        nodes: document.nodes.map((node) => node.id === target.nodeId && node.kind === 'agent'
+          ? { ...node, outputPointer: pointer }
+          : node),
+      }
+    },
     /** 模拟同一节点重建：owner 换绑新 session，并清除旧正式输出指针。 */
     replaceAgentOwner: (nextSessionId: string, nextMessages: SDKMessage[]) => {
       session = createSession({ id: nextSessionId })
@@ -299,6 +309,42 @@ describe('Canvas Agent 正式输出服务', () => {
     await fixture.service.commit(completion())
 
     expect(await fixture.service.read(target)).toBe(content)
+  })
+
+  test('Given 节点当前指针已被下一轮推进 When 按本次旧指针读取 Then 仍返回旧正文而不漂移', async () => {
+    const oldContent = '本次正式正文'
+    const nextContent = '下一轮正文'
+    const fixture = createFixture({ messages: currentRun(
+      assistant(firstUuid, [{ type: 'text', text: oldContent }]),
+      user(replacementAnchorUuid),
+      assistant(lastUuid, [{ type: 'text', text: nextContent }]),
+    ) })
+    const oldPointer = {
+      messageUuid: firstUuid,
+      contentSha256: createHash('sha256').update(oldContent, 'utf8').digest('hex'),
+      completedAt: 100,
+    }
+    fixture.setOutputPointer({
+      messageUuid: lastUuid,
+      contentSha256: createHash('sha256').update(nextContent, 'utf8').digest('hex'),
+      completedAt: 120,
+    })
+
+    expect(await fixture.service.readAtPointer(target, oldPointer)).toBe(oldContent)
+  })
+
+  test('Given 本次指针提交后节点 owner 已换绑 When 按旧指针读取 Then fail closed', async () => {
+    const fixture = createFixture({ messages: currentRun(
+      assistant(lastUuid, [{ type: 'text', text: '旧 owner 正文' }]),
+    ) })
+    const committed = await fixture.service.commit(completion())
+    fixture.replaceAgentOwner('session-2', [
+      user(replacementAnchorUuid),
+      assistant(replacementMessageUuid, [{ type: 'text', text: '新 owner 正文' }]),
+    ])
+
+    await expect(fixture.service.readAtPointer(target, committed.pointer))
+      .rejects.toThrow('CANVAS_AGENT_OUTPUT_INVALID')
   })
 
   test('Given fresh owner 与完成输出 When commit Then 同一次 CAS 更新 pointer、消费自身提示并只标记有效直接下游，发布在锁释放后', async () => {

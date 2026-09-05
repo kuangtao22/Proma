@@ -229,7 +229,7 @@ export interface CanvasDocumentIpcOptions {
     configs: Pick<CanvasAgentConfigStore, 'load' | 'update'>
     stop: (sessionId: string) => void
     /** 当前 registration 独占捕获的 Agent 正式输出读取服务。 */
-    outputs: Pick<CanvasAgentOutputService, 'read'>
+    outputs: Pick<CanvasAgentOutputService, 'read' | 'readAtPointer'>
   }
   getProjectReadOnlyReason: (projectId: string) => string | undefined
   /** 生产普通 Agent 工具复用的唯一授权与关联 facade。 */

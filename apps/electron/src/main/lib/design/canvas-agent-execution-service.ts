@@ -38,6 +38,8 @@ export interface CanvasParentOrchestratedAgentExecutionRequest {
   mode: 'parent-orchestrated'
   target: CanvasAgentTarget
   parentSessionId: string
+  /** Provider 初检时的图版本，只能由 Host 从工具参数重建。 */
+  expectedGraphRevision: number
   instruction: string
   skillNames?: string[]
   userMessageUuid: string
@@ -77,6 +79,12 @@ export interface CanvasAgentExecutionServiceDependencies {
     target: CanvasAgentTarget,
     effect: (snapshot: Pick<CanvasWorkspaceSnapshot, 'document' | 'nodeIssues'>) => T,
   ) => Promise<T>
+  /** 在最终启动临界区 fresh-read 父会话、项目授权与 Canvas binding。 */
+  validateParentAccess: (input: {
+    target: CanvasAgentTarget
+    parentSessionId: string
+    startedAt: number
+  }) => void
   getSession: (sessionId: string) => AgentSessionMeta | undefined
   configs: Pick<CanvasAgentConfigStore, 'load'>
   getWorkspaceSkills: (projectId: string) => readonly SkillMeta[]
@@ -199,6 +207,16 @@ export function createCanvasAgentExecutionService(
       const prepared = await dependencies.prepareStart(request.target, (currentSnapshot) => {
         if (currentSnapshot.nodeIssues.some((issue) => issue.nodeId === request.target.nodeId)) {
           throw new Error('CANVAS_AGENT_OWNER_INVALID')
+        }
+        if (request.mode === 'parent-orchestrated') {
+          if (currentSnapshot.document.revision !== request.expectedGraphRevision) {
+            throw new Error('CANVAS_REVISION_CONFLICT')
+          }
+          dependencies.validateParentAccess({
+            target: request.target,
+            parentSessionId: request.parentSessionId,
+            startedAt: request.startedAt,
+          })
         }
         const currentOwner = requireCanvasAgentRunOwner({
           target: request.target,

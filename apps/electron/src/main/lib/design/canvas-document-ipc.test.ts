@@ -802,6 +802,9 @@ function createContext(options: {
       stop: (sessionId) => { agentCalls.push({ type: 'stop', value: sessionId }) },
       outputs: {
         read: options.agentOutput ?? (async () => '默认 Agent 正式输出'),
+        readAtPointer: async (target, _pointer) => (
+          options.agentOutput ? options.agentOutput(target) : '默认 Agent 正式输出'
+        ),
       },
     },
     getProjectReadOnlyReason: (projectId) => {
@@ -3678,7 +3681,10 @@ describe('原生 Canvas 文档 IPC', () => {
           }),
         },
         stop: () => undefined,
-        outputs: { read: async () => `Agent 输出 ${revision}` },
+        outputs: {
+          read: async () => `Agent 输出 ${revision}`,
+          readAtPointer: async () => `Agent 输出 ${revision}`,
+        },
       },
       getProjectReadOnlyReason: () => undefined,
     })
@@ -3787,6 +3793,7 @@ describe('原生 Canvas 文档 IPC', () => {
       })
       const execution = await runtime.agentExecution.execute({
         mode: 'parent-orchestrated', target, parentSessionId: 'agent-session-1',
+        expectedGraphRevision: 4,
         instruction: '生成首屏文案', userMessageUuid: 'tool-agent-run-1', startedAt: 99,
       })
 

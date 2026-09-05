@@ -2372,6 +2372,16 @@ export function registerIpcHandlers(): void {
       if (!guarded.prepared.ok) throw guarded.prepared.error
       return guarded.prepared.value
     },
+    validateParentAccess: ({ target, parentSessionId, startedAt }) => {
+      /** 父会话与 binding 在 prepareStart 的同一写临界区 fresh-read。 */
+      canvasToolAccess.requireLinkedCanvas({
+        projectId: target.projectId,
+        sessionId: parentSessionId,
+        runStartedAt: startedAt,
+        explicitReferences: [],
+        permissionCeiling: 'execute',
+      }, target.canvasId)
+    },
     getSession: getAgentSessionMeta,
     configs: canvasAgentConfigStore,
     getWorkspaceSkills: (projectId) => {

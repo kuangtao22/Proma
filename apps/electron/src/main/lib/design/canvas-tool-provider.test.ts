@@ -28,6 +28,8 @@ function createFixture(options: {
   createCanvasError?: Error
   runBatch?: CanvasRunNodesBatchSummary
   agentOutput?: string
+  agentOutputAtPointer?: string
+  unlinkBeforeWrite?: boolean
 } = {}) {
   let document: CanvasDocument = {
     ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
@@ -61,6 +63,8 @@ function createFixture(options: {
   const agentConfigUpdateInputs: unknown[] = []
   /** 单节点执行只记录可信父运行身份和临时 Skills。 */
   const agentExecutionInputs: unknown[] = []
+  /** 精确指针读取调用用于证明摘要不会漂移到后续运行。 */
+  const agentOutputReadPointers: unknown[] = []
   /** 授权与关联调用计数用于证明工具执行时 fresh-read。 */
   let authorizeReadCalls = 0
   let requireLinkedCanvasCalls = 0
@@ -100,7 +104,10 @@ function createFixture(options: {
         requireNative(target.projectId, canvasId)
         return binding
       },
-      runWrite: (_context, effect) => effect(),
+      runWrite: (_context, effect) => {
+        if (options.unlinkBeforeWrite) linkedCanvasIds.splice(0)
+        return effect()
+      },
       createAndLink: (_context, input) => {
         createCalls += 1
         if (options.createCanvasError) throw options.createCanvasError
@@ -142,6 +149,10 @@ function createFixture(options: {
     },
     agentOutputs: {
       read: async () => options.agentOutput ?? 'Agent 正式输出',
+      readAtPointer: async (_target, pointer) => {
+        agentOutputReadPointers.push(structuredClone(pointer))
+        return options.agentOutputAtPointer ?? options.agentOutput ?? 'Agent 正式输出'
+      },
     },
     agentConfigs: {
       load: async (input) => ({
@@ -317,7 +328,7 @@ function createFixture(options: {
     dependencies, context, batchInputs, runInputs, runToolCallIds, artifactInputs,
     agentArtifactInputs, importedImageInputs,
     textUpdateInputs, imageSaveInputs,
-    agentConfigUpdateInputs, agentExecutionInputs,
+    agentConfigUpdateInputs, agentExecutionInputs, agentOutputReadPointers,
     getAuthorizeReadCalls: () => authorizeReadCalls,
     getRequireLinkedCanvasCalls: () => requireLinkedCanvasCalls,
     getListCalls: () => listCalls,
@@ -547,6 +558,17 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(fixture.agentConfigUpdateInputs).toHaveLength(0)
   })
 
+  test('Given 配置更新排队期间画布已解绑 When 进入写临界区 Then 在持久化前重新拒绝', async () => {
+    const fixture = createFixture({ unlinkBeforeWrite: true })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    await expect(executeTool(run.piCustomTools, 'canvas_update_agent_config', {
+      canvasId: 'canvas-1', nodeId: 'agent-1', expectedGraphRevision: 3,
+      expectedConfigRevision: 4, patch: { instruction: '不应保存' },
+    })).rejects.toThrow('CANVAS_ACCESS_DENIED')
+    expect(fixture.agentConfigUpdateInputs).toHaveLength(0)
+  })
+
   test('Given 普通 Agent 显式执行单节点 When 子 Agent 完成 Then 等待终态并只返回正式指针、下游和有界摘要', async () => {
     const fixture = createFixture({ agentOutput: '输出'.repeat(3_000) })
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
@@ -569,7 +591,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(fixture.agentExecutionInputs).toEqual([{
       mode: 'parent-orchestrated',
       target: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'agent-1' },
-      parentSessionId: 'session-1', instruction: '完成首页分镜',
+      parentSessionId: 'session-1', expectedGraphRevision: 3, instruction: '完成首页分镜',
       skillNames: ['storyboard', 'brand:review'], userMessageUuid: 'tool-agent-run-1',
       startedAt: 99, signal: controller.signal,
     }])
@@ -577,6 +599,33 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(fixture.batchInputs).toHaveLength(0)
     expect(fixture.getAuthorizeReadCalls()).toBe(1)
     expect(fixture.getRequireLinkedCanvasCalls()).toBe(1)
+  })
+
+  test('Given 本次执行返回旧指针后下一轮已提交 When 生成响应摘要 Then 只读取本次精确指针正文', async () => {
+    const fixture = createFixture({
+      agentOutput: '下一轮不应泄露的正文',
+      agentOutputAtPointer: '本次正式正文',
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_run_agent', {
+      canvasId: 'canvas-1', nodeId: 'agent-1', expectedRevision: 3,
+      instruction: '完成本轮任务',
+    }, 'tool-agent-run-race')
+
+    expect(result.details).toMatchObject({
+      outputPointer: {
+        messageUuid: '33333333-3333-4333-8333-333333333333',
+        contentSha256: 'a'.repeat(64),
+        completedAt: 120,
+      },
+      outputSummary: '本次正式正文',
+    })
+    expect(fixture.agentOutputReadPointers).toEqual([{
+      messageUuid: '33333333-3333-4333-8333-333333333333',
+      contentSha256: 'a'.repeat(64),
+      completedAt: 120,
+    }])
   })
 
   test('Given plan 上限或非法目标 When 单 Agent 运行 Then 不启动执行服务', async () => {

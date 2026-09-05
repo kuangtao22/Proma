@@ -30,6 +30,8 @@ function createFixture(options: {
   headlessResultSubtype?: string
   canvasRun?: CanvasToolRun
   inspectHeadlessExtensions?: (extensions: AgentRunExtensions | undefined) => void
+  parentAccessError?: Error
+  inspectRunOutsidePrepare?: (prepareHeld: boolean) => void
 } = {}) {
   const calls: string[] = []
   const document: CanvasDocument = createEmptyCanvasDocument(target.projectId, target.canvasId, 1)
@@ -54,6 +56,7 @@ function createFixture(options: {
   let stopListener: (() => void) | undefined
   let activeRun: { sessionId: string; startedAt: number } | undefined
   let commitCount = 0
+  let prepareHeld = false
   const dependencies: CanvasAgentExecutionServiceDependencies = {
     reconcile: async () => { calls.push('reconcile'); return { document, nodeIssues: [] } },
     getSession: (sessionId) => {
@@ -74,7 +77,16 @@ function createFixture(options: {
     },
     prepareStart: async (_target, effect) => {
       calls.push('prepare')
-      return effect({ document: options.prepareDocument ?? document, nodeIssues: [] })
+      prepareHeld = true
+      try {
+        return effect({ document: options.prepareDocument ?? document, nodeIssues: [] })
+      } finally {
+        prepareHeld = false
+      }
+    },
+    validateParentAccess: () => {
+      calls.push('parent-access')
+      if (options.parentAccessError) throw options.parentAccessError
     },
     getWorkspaceSkills: () => {
       calls.push('skills')
@@ -109,6 +121,7 @@ function createFixture(options: {
     },
     runHeadless: async (input, callbacks, extensions) => {
       calls.push(`headless:${callbacks.source}:${callbacks.originSessionId}:${input.triggeredBy}`)
+      options.inspectRunOutsidePrepare?.(prepareHeld)
       activeRun = { sessionId: input.sessionId, startedAt: input.startedAt! }
       options.inspectHeadlessExtensions?.(extensions)
       expect(extensions?.allowedToolNames).not.toContain('canvas_run_nodes')
@@ -180,13 +193,50 @@ describe('Canvas Agent 统一执行服务', () => {
   test('Given 父 Agent 编排运行 When 成功完成 Then 无需 Renderer 且使用 design 来源和父会话路由', async () => {
     const fixture = createFixture()
     await fixture.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '生成三幕分镜',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '生成三幕分镜',
       skillNames: ['专业策划'], userMessageUuid: 'anchor-2', startedAt: 60,
     })
 
     expect(fixture.calls).toContain('headless:design:parent-1:external')
     expect(fixture.calls).toContain('tools:parent-orchestrated:input-1')
     expect(fixture.calls.filter((call) => call.startsWith('commit:'))).toEqual(['commit:completed:1'])
+  })
+
+  test('Given 父 Agent 初检后图 revision 已变化 When 最终启动 Then 在 reserve 前拒绝且不运行模型', async () => {
+    const changedDocument = createEmptyCanvasDocument(target.projectId, target.canvasId, 1)
+    changedDocument.revision = 8
+    changedDocument.nodes = [{
+      id: target.nodeId, kind: 'agent', title: '视频导演', position: { x: 100, y: 0 },
+      agentSessionId: 'child-1',
+    }]
+    const fixture = createFixture({ prepareDocument: changedDocument })
+
+    await expect(fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '执行', userMessageUuid: 'anchor-revision-race', startedAt: 60,
+    })).rejects.toThrow('CANVAS_REVISION_CONFLICT')
+    expect(fixture.calls).not.toContain('reserve')
+    expect(fixture.calls.some((call) => call.startsWith('headless:'))).toBe(false)
+  })
+
+  test('Given 父 Agent 初检后已解绑 When 最终启动 Then 临界区复核父权限且模型运行不持锁', async () => {
+    const denied = createFixture({ parentAccessError: new Error('CANVAS_ACCESS_DENIED') })
+    await expect(denied.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '执行', userMessageUuid: 'anchor-binding-race', startedAt: 60,
+    })).rejects.toThrow('CANVAS_ACCESS_DENIED')
+    expect(denied.calls).not.toContain('reserve')
+    expect(denied.calls.some((call) => call.startsWith('headless:'))).toBe(false)
+
+    let observedPrepareHeld = true
+    const allowed = createFixture({
+      inspectRunOutsidePrepare: (prepareHeld) => { observedPrepareHeld = prepareHeld },
+    })
+    await allowed.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '执行', userMessageUuid: 'anchor-no-long-lock', startedAt: 61,
+    })
+    expect(observedPrepareHeld).toBe(false)
   })
 
   test('Given Provider 新增未知 Canvas 工具 When 父 Agent 编排运行 Then 三个工具入口默认拒绝未知项', async () => {
@@ -214,7 +264,7 @@ describe('Canvas Agent 统一执行服务', () => {
     })
 
     await fixture.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '生成方案',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '生成方案',
       userMessageUuid: 'anchor-future-tool', startedAt: 61,
     })
 
@@ -227,7 +277,7 @@ describe('Canvas Agent 统一执行服务', () => {
   ])('Given %s终态 When 运行结束 Then 不提交指针且始终释放监听与启动槽', async (_name, options) => {
     const fixture = createFixture(options)
     await fixture.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行',
       userMessageUuid: 'anchor-3', startedAt: 70,
     })
 
@@ -239,7 +289,7 @@ describe('Canvas Agent 统一执行服务', () => {
     const fixture = createFixture({ headlessResultSubtype: 'error_during_execution' })
 
     await expect(fixture.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行',
       userMessageUuid: 'anchor-partial', startedAt: 71,
     })).resolves.toEqual({ status: 'errored' })
     expect(fixture.calls.some((call) => call.startsWith('commit:'))).toBe(false)
@@ -260,14 +310,14 @@ describe('Canvas Agent 统一执行服务', () => {
   test('Given Skill 已禁用或显式模型不完整 When 校验运行配置 Then 在预留前 fail closed', async () => {
     const disabled = createFixture({ skills: [{ slug: 'pro-plan', name: '专业策划', enabled: false }] })
     await expect(disabled.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行',
       userMessageUuid: 'anchor-5', startedAt: 90,
     })).rejects.toThrow('CANVAS_AGENT_SKILL_UNAVAILABLE')
     expect(disabled.calls).not.toContain('reserve')
 
     const incompleteRoute = createFixture({ config: { channelId: 'channel-fixed', modelId: null } })
     await expect(incompleteRoute.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行',
       userMessageUuid: 'anchor-6', startedAt: 91,
     })).rejects.toThrow('CANVAS_AGENT_MODEL_UNAVAILABLE')
     expect(incompleteRoute.calls).not.toContain('reserve')
@@ -279,7 +329,7 @@ describe('Canvas Agent 统一执行服务', () => {
   ])('Given %s When 运行时重新校验 Then 在预留前拒绝且不更新指针', async (_name, options) => {
     const fixture = createFixture(options)
     await expect(fixture.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行',
       userMessageUuid: 'anchor-invalid-config', startedAt: 91,
     })).rejects.toThrow()
     expect(fixture.calls).not.toContain('reserve')
@@ -289,7 +339,7 @@ describe('Canvas Agent 统一执行服务', () => {
   test('Given 正式输出为空 When success 回调完成 Then 返回错误终态且不产生指针', async () => {
     const fixture = createFixture({ commitError: new Error('CANVAS_AGENT_OUTPUT_MISSING') })
     const result = await fixture.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行',
       userMessageUuid: 'anchor-empty', startedAt: 92,
     })
 
@@ -304,7 +354,7 @@ describe('Canvas Agent 统一执行服务', () => {
     const controller = new AbortController()
     const fixture = createFixture({ runGate })
     const running = fixture.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行',
       userMessageUuid: 'anchor-late', startedAt: 93, signal: controller.signal,
     })
     /** 等待 child 确实进入 headless runner 后再模拟父运行取消。 */
@@ -323,7 +373,7 @@ describe('Canvas Agent 统一执行服务', () => {
     const fixture = createFixture()
 
     await expect(fixture.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行',
       userMessageUuid: 'anchor-pre-abort', startedAt: 94, signal: controller.signal,
     })).resolves.toEqual({ status: 'cancelled' })
     expect(fixture.calls.some((call) => call.startsWith('headless:'))).toBe(false)
@@ -336,7 +386,7 @@ describe('Canvas Agent 统一执行服务', () => {
     const controller = new AbortController()
     const first = createFixture({ commitGate })
     const running = first.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行',
       userMessageUuid: 'anchor-commit-gate', startedAt: 95, signal: controller.signal,
     })
     while (!first.calls.some((call) => call.startsWith('commit:'))) await Bun.sleep(0)
@@ -347,7 +397,7 @@ describe('Canvas Agent 统一执行服务', () => {
 
     expect(first.calls.some((call) => call.startsWith('stop-check:'))).toBe(false)
     await expect(first.service.execute({
-      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '继续',
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '继续',
       userMessageUuid: 'anchor-next', startedAt: 96,
     })).resolves.toMatchObject({ status: 'completed' })
     expect(first.calls).not.toContain('stop')
@@ -364,7 +414,7 @@ describe('Canvas Agent 统一执行服务', () => {
         : []
       const fixture = createFixture({ configGate, prepareDocument: changedDocument })
       const running = fixture.service.execute({
-        mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', instruction: '执行',
+        mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 8, instruction: '执行',
         userMessageUuid: `anchor-race-${replacementSessionId ?? 'deleted'}`, startedAt: 97,
       })
       while (!fixture.calls.includes('config')) await Bun.sleep(0)

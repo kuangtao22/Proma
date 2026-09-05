@@ -53,6 +53,8 @@ export interface CanvasAgentOutputService {
   resolveCompletedOutput: (input: CanvasAgentCompletionInput) => CanvasResolvedAgentOutput
   commit: (input: CanvasAgentOutputCommitInput) => Promise<CanvasAgentOutputCommitResult>
   read: (target: CanvasAgentTarget) => Promise<string>
+  /** 从当前 owner 的权威日志读取指定内容寻址指针，不能漂移到节点后续正式输出。 */
+  readAtPointer: (target: CanvasAgentTarget, pointer: CanvasAgentOutputPointer) => Promise<string>
   /** 仅由统一执行服务在当前 run 已无回调后精确释放内存代次。 */
   releaseGeneration: (input: CanvasAgentTarget & { agentSessionId: string; runGeneration: number }) => void
 }
@@ -265,6 +267,33 @@ export function createCanvasAgentOutputService(
     return resolveOwnerCompletedOutput(input, owner.node.agentSessionId)
   }
 
+  /** 在已证明归属的当前 owner 日志中读取 exact pointer 正文。 */
+  const readOwnerAtPointer = (
+    agentSessionId: string,
+    pointer: CanvasAgentOutputPointer,
+  ): string => {
+    if (!CANVAS_AGENT_MESSAGE_UUID_PATTERN.test(pointer.messageUuid)
+      || !/^[0-9a-f]{64}$/.test(pointer.contentSha256)
+      || !isNonNegativeSafeInteger(pointer.completedAt)) {
+      throw new Error('pointer invalid')
+    }
+    /** 从尾部扫描 exact UUID，同时拒绝损坏日志中的重复标识。 */
+    const messages = dependencies.getMessages(agentSessionId)
+    let matchedContent: string | undefined
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index]!
+      if (!isCompletedAssistant(message) || message.uuid !== pointer.messageUuid) continue
+      if (matchedContent !== undefined) throw new Error('duplicate message UUID')
+      matchedContent = extractAssistantText(message)
+    }
+    if (matchedContent === undefined
+      || matchedContent.trim().length === 0
+      || contentSha256(matchedContent) !== pointer.contentSha256) {
+      throw new Error('content mismatch')
+    }
+    return matchedContent
+  }
+
   const service: CanvasAgentOutputService = {
     resolveCompletedOutput,
     commit: async (input) => {
@@ -372,21 +401,15 @@ export function createCanvasAgentOutputService(
         const owner = requireOwner(dependencies, target)
         const pointer = owner.node.outputPointer
         if (!pointer) throw new Error('pointer missing')
-        /** 从尾部扫描 exact UUID，同时拒绝损坏日志中的重复标识。 */
-        const messages = dependencies.getMessages(owner.node.agentSessionId)
-        let matchedContent: string | undefined
-        for (let index = messages.length - 1; index >= 0; index -= 1) {
-          const message = messages[index]!
-          if (!isCompletedAssistant(message) || message.uuid !== pointer.messageUuid) continue
-          if (matchedContent !== undefined) throw new Error('duplicate message UUID')
-          matchedContent = extractAssistantText(message)
-        }
-        if (matchedContent === undefined
-          || matchedContent.trim().length === 0
-          || contentSha256(matchedContent) !== pointer.contentSha256) {
-          throw new Error('content mismatch')
-        }
-        return matchedContent
+        return readOwnerAtPointer(owner.node.agentSessionId, pointer)
+      } catch (error) {
+        throw new Error('CANVAS_AGENT_OUTPUT_INVALID', { cause: error })
+      }
+    },
+    readAtPointer: async (target, pointer) => {
+      try {
+        const owner = requireOwner(dependencies, target)
+        return readOwnerAtPointer(owner.node.agentSessionId, pointer)
       } catch (error) {
         throw new Error('CANVAS_AGENT_OUTPUT_INVALID', { cause: error })
       }
