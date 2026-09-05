@@ -161,7 +161,11 @@ export function createCanvasImageRunService(
     input: Pick<CanvasImageBatchWaitInput, 'projectId' | 'canvasId' | 'batchId' | 'taskIds'>,
   ): Promise<CanvasImageCandidateBatch> => {
     /** 候选服务只返回目标项目与 Canvas 下的指定批次。 */
-    const batch = await dependencies.candidateBatches.load(input)
+    const batch = await dependencies.candidateBatches.load({
+      projectId: input.projectId,
+      canvasId: input.canvasId,
+      batchId: input.batchId,
+    })
     if (batch.projectId !== input.projectId
       || batch.canvasId !== input.canvasId
       || batch.batchId !== input.batchId

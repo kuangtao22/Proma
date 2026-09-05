@@ -194,6 +194,11 @@ function createHarness(options: HarnessOptions = {}) {
       },
       load: async (input) => {
         calls.push('batch:load')
+        /** 模拟生产 exact-key parser，禁止等待或取消字段穿透候选服务。 */
+        const keys = Object.keys(input).sort()
+        if (JSON.stringify(keys) !== JSON.stringify(['batchId', 'canvasId', 'projectId'])) {
+          throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INPUT_INVALID')
+        }
         const batch = batches.get(input.batchId)
         if (!batch) throw new Error('CANVAS_IMAGE_BATCH_NOT_FOUND')
         return structuredClone(batch)
@@ -343,6 +348,7 @@ describe('Canvas 图片统一运行服务', () => {
     })
     expect(JSON.stringify(summary)).not.toContain('asset')
     expect(harness.listeners.size).toBe(0)
+    expect(harness.batchListeners.size).toBe(0)
   })
 
   test('Given Job 终态事件早于候选登记 When 跨多个 macrotask 后批次发出 ack Then 等待完成且不超时', async () => {
@@ -479,5 +485,6 @@ describe('Canvas 图片统一运行服务', () => {
 
     expect(harness.calls.filter((call) => call.startsWith('cancel:'))).toEqual([`cancel:${taskId}`])
     expect(harness.listeners.size).toBe(0)
+    expect(harness.batchListeners.size).toBe(0)
   })
 })
