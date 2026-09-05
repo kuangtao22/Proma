@@ -784,6 +784,21 @@ function createContext(options: {
         if (options.reserveStartError) throw options.reserveStartError
         return { status: 'completed' as const }
       } },
+      configs: {
+        load: async (target) => ({
+          schemaVersion: 1 as const, ...target, revision: 2, instruction: '长期职责',
+          skillNames: [], channelId: null, modelId: null, updatedAt: 1,
+        }),
+        update: async (input) => {
+          agentCalls.push({ type: 'config-update', value: input })
+          return {
+            schemaVersion: 1 as const, projectId: input.projectId, canvasId: input.canvasId,
+            nodeId: input.nodeId, revision: input.expectedConfigRevision + 1,
+            instruction: input.patch.instruction ?? '长期职责', skillNames: input.patch.skillNames ?? [],
+            channelId: input.patch.channelId ?? null, modelId: input.patch.modelId ?? null, updatedAt: 2,
+          }
+        },
+      },
       stop: (sessionId) => { agentCalls.push({ type: 'stop', value: sessionId }) },
       outputs: {
         read: options.agentOutput ?? (async () => '默认 Agent 正式输出'),
@@ -3650,6 +3665,18 @@ describe('原生 Canvas 文档 IPC', () => {
         getSession: () => undefined,
         getMessages: () => [],
         execution: { execute: async () => ({ status: 'completed' as const }) },
+        configs: {
+          load: async (target: CanvasAgentTarget) => ({
+            schemaVersion: 1 as const, ...target, revision: 1, instruction: '', skillNames: [],
+            channelId: null, modelId: null, updatedAt: 1,
+          }),
+          update: async (input: import('./canvas-agent-config-store').UpdateCanvasAgentConfigInput) => ({
+            schemaVersion: 1 as const, projectId: input.projectId, canvasId: input.canvasId,
+            nodeId: input.nodeId, revision: input.expectedConfigRevision + 1,
+            instruction: input.patch.instruction ?? '', skillNames: input.patch.skillNames ?? [],
+            channelId: input.patch.channelId ?? null, modelId: input.patch.modelId ?? null, updatedAt: 2,
+          }),
+        },
         stop: () => undefined,
         outputs: { read: async () => `Agent 输出 ${revision}` },
       },
@@ -3742,6 +3769,33 @@ describe('原生 Canvas 文档 IPC', () => {
         canvasId: 'canvas-1',
         source: { sessionId: 'agent-session-1', runStartedAt: 99, toolCallId: 'tool-artifact-1' },
       })])
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
+  test('Given 生产 Canvas Tool Provider runtime When 访问 Agent 配置与单节点执行依赖 Then 复用 IPC 注册的唯一服务实例', async () => {
+    const context = createContext({ enableToolProviderRuntime: true })
+    try {
+      const runtime = getCanvasToolProviderRuntime()
+      if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
+      const target = { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1' }
+
+      const config = await runtime.agentConfigs.update({
+        ...target, expectedGraphRevision: 4, expectedConfigRevision: 2,
+        patch: { instruction: '只负责文案' },
+      })
+      const execution = await runtime.agentExecution.execute({
+        mode: 'parent-orchestrated', target, parentSessionId: 'agent-session-1',
+        instruction: '生成首屏文案', userMessageUuid: 'tool-agent-run-1', startedAt: 99,
+      })
+
+      expect(config).toMatchObject({ nodeId: 'node-1', revision: 3, instruction: '只负责文案' })
+      expect(execution).toEqual({ status: 'completed' })
+      expect(context.agentCalls).toEqual([
+        { type: 'config-update', value: expect.objectContaining({ nodeId: 'node-1' }) },
+        { type: 'execute', value: expect.objectContaining({ mode: 'parent-orchestrated' }) },
+      ])
     } finally {
       context.registration.dispose()
     }

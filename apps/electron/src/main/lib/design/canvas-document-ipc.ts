@@ -114,6 +114,7 @@ import { createCanvasToolRun } from './canvas-tool-provider'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 import type { CanvasNodeReferenceResolver } from './canvas-node-reference-resolver'
 import type { CanvasAgentOutputService } from './canvas-agent-output-service'
+import type { CanvasAgentConfigStore } from './canvas-agent-config-store'
 import type { CanvasAgentExecutionService } from './canvas-agent-execution-service'
 import { requireCanvasAgentRunOwner } from './canvas-agent-run-policy'
 import {
@@ -225,6 +226,7 @@ export interface CanvasDocumentIpcOptions {
     getSession: (sessionId: string) => AgentSessionMeta | undefined
     getMessages: (sessionId: string) => SDKMessage[]
     execution: Pick<CanvasAgentExecutionService, 'execute'>
+    configs: Pick<CanvasAgentConfigStore, 'load' | 'update'>
     stop: (sessionId: string) => void
     /** 当前 registration 独占捕获的 Agent 正式输出读取服务。 */
     outputs: Pick<CanvasAgentOutputService, 'read'>
@@ -274,6 +276,8 @@ export interface CanvasToolProviderRuntime {
   referenceResolver: CanvasNodeReferenceResolver
   createRun: (context: CanvasToolRunContext) => CanvasToolRun
   documents: Pick<CanvasDocumentStore, 'load' | 'validateBatchOperations'>
+  agentConfigs: Pick<CanvasAgentConfigStore, 'load' | 'update'>
+  agentExecution: Pick<CanvasAgentExecutionService, 'execute'>
   batch: { execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult> }
   readNodeContent: (target: CanvasTarget, node: CanvasNode) => Promise<string>
   runNodes: (
@@ -1704,6 +1708,8 @@ export function registerCanvasDocumentIpcHandlers(
           access: toolAccess,
           documents: options.store,
           agentOutputs: options.agent.outputs,
+          agentConfigs: options.agent.configs,
+          agentExecution: options.agent.execution,
           artifacts: options.artifacts,
           importImage: options.importImage,
           textArtifacts: options.textArtifacts,
@@ -1724,6 +1730,8 @@ export function registerCanvasDocumentIpcHandlers(
           runNodes: runCanvasNodes,
         }, context),
         documents: options.store,
+        agentConfigs: options.agent.configs,
+        agentExecution: options.agent.execution,
         batch,
         readNodeContent: readCanvasNodeContent,
         runNodes: runCanvasNodes,

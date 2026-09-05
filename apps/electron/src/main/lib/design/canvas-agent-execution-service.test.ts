@@ -90,7 +90,7 @@ function createFixture(options: {
       return () => { calls.push('release') }
     },
     createCanvasRun: (context) => {
-      calls.push(`tools:${context.explicitReferences.map((reference) => reference.nodeId).join(',')}`)
+      calls.push(`tools:${context.canvasAgentMode}:${context.explicitReferences.map((reference) => reference.nodeId).join(',')}`)
       return options.canvasRun ?? {
         systemPromptAppend: 'tools-prompt', piCustomTools: [],
         allowedToolNames: ['canvas_read', 'canvas_run_nodes'],
@@ -161,7 +161,7 @@ describe('Canvas Agent 统一执行服务', () => {
 
     expect(fixture.calls).toEqual([
       'reconcile', 'session', 'config', 'skills', 'prepare', 'session', 'model:channel-live/model-live',
-      'tools:input-1', 'reserve', 'listen', 'renderer:channel-live/model-live:pro-plan',
+      'tools:renderer-manual:input-1', 'reserve', 'listen', 'renderer:channel-live/model-live:pro-plan',
       'commit:completed:1', 'unlisten', 'release', 'release-generation:child-1:1',
     ])
   })
@@ -185,6 +185,7 @@ describe('Canvas Agent 统一执行服务', () => {
     })
 
     expect(fixture.calls).toContain('headless:design:parent-1:external')
+    expect(fixture.calls).toContain('tools:parent-orchestrated:input-1')
     expect(fixture.calls.filter((call) => call.startsWith('commit:'))).toEqual(['commit:completed:1'])
   })
 

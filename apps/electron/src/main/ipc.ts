@@ -2065,8 +2065,6 @@ export function registerIpcHandlers(): void {
       assertEnabledModelForChannel({ channelId, modelId, purpose: 'Canvas Agent 配置' })
     },
   })
-  /** 当前切片只建立唯一生产实例，后续 Canvas 工具与执行服务将复用该引用。 */
-  void canvasAgentConfigStore
   /** 文本不可变版本复用同一 Canvas Store 与 revision 0 内容读取边界。 */
   const canvasArtifactRevisionStore = createCanvasArtifactRevisionStore({
     store: canvasDocumentStore,
@@ -2830,6 +2828,7 @@ export function registerIpcHandlers(): void {
       getSession: getAgentSessionMeta,
       getMessages: getAgentSessionSDKMessages,
       execution: canvasAgentExecutionService,
+      configs: canvasAgentConfigStore,
       stop: stopAgent,
       outputs: canvasAgentOutputService,
     },

@@ -221,6 +221,7 @@ export function createCanvasAgentExecutionService(
           explicitReferences: inputReferences,
           permissionCeiling: currentOwner.session.permissionMode === 'plan' ? 'plan' : 'execute',
           canvasAgentTarget: request.target,
+          canvasAgentMode: request.mode,
         })
         const prompt = buildCanvasAgentExecutionSystemPrompt({
           mode: request.mode,

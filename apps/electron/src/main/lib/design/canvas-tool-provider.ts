@@ -28,6 +28,8 @@ import type { TSchema } from 'typebox'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import { isValidImageBytes } from '../image-content-validation'
 import type { CanvasBatchOperationResult } from './canvas-agent-batch-operation'
+import type { CanvasAgentConfigStore } from './canvas-agent-config-store'
+import type { CanvasAgentExecutionService } from './canvas-agent-execution-service'
 import type { CanvasAgentOutputService } from './canvas-agent-output-service'
 import type {
   CanvasArtifactCreationResult,
@@ -49,6 +51,12 @@ const MAX_INSPECT_IMAGE_NODES = 4
 const MAX_INSPECT_IMAGE_BYTES = 512 * 1024
 const MAX_INSPECT_BATCH_BYTES = 2 * 1024 * 1024
 const MAX_INSPECT_IMAGE_PIXELS = 64_000_000
+/** 父 Agent 单次指令与正式输出摘要的上下文预算。 */
+const MAX_AGENT_RUN_INSTRUCTION_LENGTH = 8_192
+const MAX_AGENT_RUN_OUTPUT_SUMMARY_LENGTH = 4_096
+/** 临时 Skill 只接受稳定名称或 slug，禁止路径和空白。 */
+const MAX_AGENT_RUN_SKILLS = 16
+const STABLE_AGENT_SKILL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/
 const CANVAS_NODE_KINDS: CanvasNode['kind'][] = ['agent', 'image', 'document', 'webview']
 
 /** 不透明分页游标绑定的权威读取边界。 */
@@ -265,7 +273,7 @@ function applyCanvasReadBudget(
   return details
 }
 
-/** 普通项目 Agent 单轮可用的十一个 Canvas 工具。 */
+/** 普通项目 Agent 单轮可用的十三个 Canvas 工具。 */
 export const CANVAS_TOOL_NAMES = [
   'canvas_get_context',
   'canvas_manage',
@@ -277,6 +285,8 @@ export const CANVAS_TOOL_NAMES = [
   'canvas_import_image',
   'canvas_create_artifact',
   'canvas_update_artifact',
+  'canvas_update_agent_config',
+  'canvas_run_agent',
   'canvas_run_nodes',
 ] as const
 
@@ -292,6 +302,8 @@ export interface CanvasToolRunContext {
   permissionCeiling: CanvasToolPermissionCeiling
   /** Canvas 内部 Agent 只能访问自身所属画布，不能管理普通 Agent 的画布关联。 */
   canvasAgentTarget?: CanvasAgentTarget
+  /** 由统一执行服务注入的可信 Canvas Agent 运行模式，用于第二层能力收缩。 */
+  canvasAgentMode?: 'renderer-manual' | 'parent-orchestrated'
 }
 
 /** Provider 交给主进程路径授权边界的本地图片导入请求。 */
@@ -326,6 +338,8 @@ export interface CanvasToolProviderDependencies {
     validateBatchOperations: (target: CanvasTarget, expectedRevision: number, operations: unknown[]) => CanvasMutation[]
   }
   agentOutputs: Pick<CanvasAgentOutputService, 'read'>
+  agentConfigs: Pick<CanvasAgentConfigStore, 'load' | 'update'>
+  agentExecution: Pick<CanvasAgentExecutionService, 'execute'>
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
   artifacts: Pick<CanvasArtifactCreationService, 'create' | 'createAgent'>
   /** 主进程在调用导入事务前负责解析并验证本地路径。 */
@@ -425,6 +439,30 @@ function createArtifactOperationId(context: CanvasToolRunContext, toolCallId: st
     .update(`${context.projectId}\u0000${context.sessionId}\u0000${context.runStartedAt}\u0000${toolCallId}`)
     .digest('hex')
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`
+}
+
+/** 重建单节点临时指令并同时执行非空与 UTF-8 字节预算校验。 */
+function requireAgentRunInstruction(value: string): string {
+  if (value.trim().length === 0 || Buffer.byteLength(value, 'utf8') > MAX_AGENT_RUN_INSTRUCTION_LENGTH) {
+    throw new Error('CANVAS_AGENT_RUN_INPUT_INVALID')
+  }
+  return value
+}
+
+/** 重建临时 Skill 名称，拒绝重复、路径、空白和超量输入。 */
+function requireAgentRunSkillNames(value: string[] | undefined): string[] | undefined {
+  if (value === undefined) return undefined
+  if (value.length > MAX_AGENT_RUN_SKILLS) throw new Error('CANVAS_AGENT_RUN_INPUT_INVALID')
+  const skillNames: string[] = []
+  const seen = new Set<string>()
+  for (const skillName of value) {
+    if (!STABLE_AGENT_SKILL_NAME_PATTERN.test(skillName) || seen.has(skillName)) {
+      throw new Error('CANVAS_AGENT_RUN_INPUT_INVALID')
+    }
+    seen.add(skillName)
+    skillNames.push(skillName)
+  }
+  return skillNames
 }
 
 /** 为普通项目 Agent 创建不持久化的单轮 Canvas 工具。 */
@@ -1046,6 +1084,117 @@ export function createCanvasToolRun(
       },
     }),
     defineCanvasTool({
+      name: 'canvas_update_agent_config', label: '更新 Canvas Agent 配置',
+      description: '局部更新已有 Canvas Agent 的长期职责、Skills 或模型选择；不会运行模型、下游节点或图片任务。',
+      parameters: Type.Object({
+        canvasId: Type.String({ minLength: 1, maxLength: 128 }),
+        nodeId: Type.String({ minLength: 1, maxLength: 128 }),
+        expectedGraphRevision: Type.Integer({ minimum: 0 }),
+        expectedConfigRevision: Type.Integer({ minimum: 0 }),
+        patch: Type.Object({
+          instruction: Type.Optional(Type.String({ maxLength: MAX_AGENT_RUN_INSTRUCTION_LENGTH })),
+          skillNames: Type.Optional(Type.Array(Type.String({ pattern: STABLE_AGENT_SKILL_NAME_PATTERN.source }), {
+            maxItems: MAX_AGENT_RUN_SKILLS,
+          })),
+          channelId: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 256 }), Type.Null()])),
+          modelId: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 256 }), Type.Null()])),
+        }, { additionalProperties: false }),
+      }, { additionalProperties: false }),
+      execute: async (_toolCallId, params) => {
+        dependencies.access.authorizeRead(context)
+        if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
+        /** 每次执行 fresh-read 当前关联，不能沿用创建本轮工具时的权限快照。 */
+        dependencies.access.requireLinkedCanvas(context, params.canvasId)
+        return dependencies.access.runWrite(context, async () => {
+          const config = await dependencies.agentConfigs.update({
+            projectId: context.projectId,
+            canvasId: params.canvasId,
+            nodeId: params.nodeId,
+            expectedGraphRevision: params.expectedGraphRevision,
+            expectedConfigRevision: params.expectedConfigRevision,
+            patch: {
+              ...(params.patch.instruction !== undefined ? { instruction: params.patch.instruction } : {}),
+              ...(params.patch.skillNames !== undefined ? { skillNames: [...params.patch.skillNames] } : {}),
+              ...(params.patch.channelId !== undefined ? { channelId: params.patch.channelId } : {}),
+              ...(params.patch.modelId !== undefined ? { modelId: params.patch.modelId } : {}),
+            },
+          })
+          return toolResult({
+            canvasId: config.canvasId,
+            nodeId: config.nodeId,
+            graphRevision: params.expectedGraphRevision,
+            configRevision: config.revision,
+            instruction: config.instruction,
+            skillNames: config.skillNames,
+            channelId: config.channelId,
+            modelId: config.modelId,
+          })
+        })
+      },
+    }),
+    defineCanvasTool({
+      name: 'canvas_run_agent', label: '运行 Canvas Agent',
+      description: '显式运行单个 Canvas Agent 并等待终态；不会自动运行下游节点或启动图片任务。',
+      parameters: Type.Object({
+        canvasId: Type.String({ minLength: 1, maxLength: 128 }),
+        nodeId: Type.String({ minLength: 1, maxLength: 128 }),
+        expectedRevision: Type.Integer({ minimum: 0 }),
+        instruction: Type.String({ minLength: 1, maxLength: MAX_AGENT_RUN_INSTRUCTION_LENGTH }),
+        skillNames: Type.Optional(Type.Array(Type.String({ pattern: STABLE_AGENT_SKILL_NAME_PATTERN.source }), {
+          maxItems: MAX_AGENT_RUN_SKILLS,
+        })),
+      }, { additionalProperties: false }),
+      execute: async (toolCallId, params, signal) => {
+        dependencies.access.authorizeRead(context)
+        if (context.permissionCeiling === 'plan') throw new Error('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
+        /** 当前关联和图 revision 均在显式执行时 fresh-read，避免启动已换绑节点。 */
+        dependencies.access.requireLinkedCanvas(context, params.canvasId)
+        const target = { projectId: context.projectId, canvasId: params.canvasId }
+        const document = dependencies.documents.load(target).document
+        if (document.revision !== params.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+        const node = document.nodes.find((candidate) => candidate.id === params.nodeId)
+        if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
+        if (node.kind !== 'agent') throw new Error('CANVAS_AGENT_NODE_REQUIRED')
+        const agentTarget = { ...target, nodeId: node.id }
+        const instruction = requireAgentRunInstruction(params.instruction)
+        const skillNames = requireAgentRunSkillNames(params.skillNames)
+        /** custom tool 的取消信号直接传给统一执行服务，不经过 Renderer IPC 或递归 Pi 工具。 */
+        const result = await dependencies.agentExecution.execute({
+          mode: 'parent-orchestrated',
+          target: agentTarget,
+          parentSessionId: context.sessionId,
+          instruction,
+          ...(skillNames ? { skillNames } : {}),
+          userMessageUuid: toolCallId,
+          startedAt: context.runStartedAt,
+          signal,
+        })
+        if (result.status !== 'completed') {
+          return toolResult({
+            nodeId: node.id,
+            status: result.status,
+            downstreamNodeIds: [],
+            outputSummary: '',
+          })
+        }
+        if (!result.output
+          || result.output.target.projectId !== agentTarget.projectId
+          || result.output.target.canvasId !== agentTarget.canvasId
+          || result.output.target.nodeId !== agentTarget.nodeId) {
+          throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
+        }
+        /** 正式 pointer 对应的权威正文只用于生成有界摘要，不回查任意末条消息。 */
+        const output = await dependencies.agentOutputs.read(agentTarget)
+        return toolResult({
+          nodeId: node.id,
+          status: result.status,
+          outputPointer: result.output.pointer,
+          downstreamNodeIds: result.output.downstreamNodeIds,
+          outputSummary: output.slice(0, MAX_AGENT_RUN_OUTPUT_SUMMARY_LENGTH),
+        })
+      },
+    }),
+    defineCanvasTool({
       name: 'canvas_run_nodes', label: '运行画布节点',
       description: '运行已有生图节点并生成图片，调用图片模型时可能产生模型费用。',
       parameters: Type.Object({ canvasId: Type.String({ minLength: 1, maxLength: 128 }), nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_READ_NODES }) }),
@@ -1078,10 +1227,17 @@ export function createCanvasToolRun(
     }),
   ] as ToolDefinition[]
 
-  /** Canvas Agent 的画布身份固定，不向模型暴露创建、关联或切换其它画布的入口。 */
-  const availableTools = context.canvasAgentTarget
-    ? tools.filter((tool) => tool.name !== 'canvas_manage' && tool.name !== 'canvas_create_agent')
-    : tools
+  /** Canvas Agent 的可信模式只缩减能力；普通 Agent 继续保留既有工具与审批。 */
+  const isCanvasAgent = context.canvasAgentTarget !== undefined
+  const isParentOrchestrated = context.canvasAgentMode === 'parent-orchestrated'
+  const availableTools = tools.filter((tool) => {
+    if (!isCanvasAgent) return true
+    if (tool.name === 'canvas_manage'
+      || tool.name === 'canvas_create_agent'
+      || tool.name === 'canvas_update_agent_config'
+      || tool.name === 'canvas_run_agent') return false
+    return !isParentOrchestrated || tool.name !== 'canvas_run_nodes'
+  })
   /** 直接入边由 SEND 对账快照转换为权威引用，标题只作为 JSON 数据展示。 */
   const canvasAgentPrompt = context.canvasAgentTarget
     ? `\n\n## Canvas Agent 固定作用域
@@ -1111,7 +1267,9 @@ export function createCanvasToolRun(
 Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、产物创建、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。${canvasAgentPrompt}`,
     piCustomTools: availableTools,
     allowedToolNames: availableTools.map((tool) => tool.name),
-    singleApprovalToolNames: ['canvas_run_nodes'],
+    singleApprovalToolNames: availableTools.some((tool) => tool.name === 'canvas_run_nodes')
+      ? ['canvas_run_nodes']
+      : [],
     allowedToolNamesMode: 'extend',
   }
 }
