@@ -422,7 +422,9 @@ describe('Canvas 图片统一运行服务', () => {
     })
     await Promise.resolve()
     /** 隔离预期清理日志，并验证不会记录底层取消异常正文。 */
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('LOGGER_FAILED')
+    })
     abortController.abort()
 
     try {
@@ -432,10 +434,7 @@ describe('Canvas 图片统一运行服务', () => {
       expect(harness.jobs.get('foreign-job')?.status).toBe('running')
       expect(harness.listeners.size).toBe(0)
       expect(harness.batchListeners.size).toBe(0)
-      expect(errorSpy).toHaveBeenCalledWith(
-        '[CanvasImageRunService] 候选批次等待清理失败:',
-        expect.objectContaining({ message: 'CANVAS_IMAGE_TASK_CANCEL_FAILED' }),
-      )
+      expect(errorSpy).toHaveBeenCalledWith('[CanvasImageDiagnostics] CANVAS_IMAGE_BATCH_CANCEL_CLEANUP_FAILED')
     } finally {
       errorSpy.mockRestore()
     }
@@ -522,7 +521,9 @@ describe('Canvas 图片统一运行服务', () => {
     const batchId = started.batch?.batchId
     if (!taskId || !batchId) throw new Error('测试批次未创建')
     /** 隔离预期清理日志，并验证 deadline 路径使用同一稳定诊断。 */
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('LOGGER_FAILED')
+    })
 
     try {
       await expect(harness.service.awaitBatch({
@@ -537,10 +538,7 @@ describe('Canvas 图片统一运行服务', () => {
       expect(harness.jobs.get(taskId)?.status).toBe('queued')
       expect(harness.listeners.size).toBe(0)
       expect(harness.batchListeners.size).toBe(0)
-      expect(errorSpy).toHaveBeenCalledWith(
-        '[CanvasImageRunService] 候选批次等待清理失败:',
-        expect.objectContaining({ message: 'CANVAS_IMAGE_TASK_CANCEL_FAILED' }),
-      )
+      expect(errorSpy).toHaveBeenCalledWith('[CanvasImageDiagnostics] CANVAS_IMAGE_BATCH_CANCEL_CLEANUP_FAILED')
     } finally {
       errorSpy.mockRestore()
     }

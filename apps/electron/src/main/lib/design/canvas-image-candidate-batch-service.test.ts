@@ -133,9 +133,11 @@ describe('Canvas 图片候选批次 Service', () => {
       sourceSessionId: 'session-1', sourceToolCallId: 'tool-event', entries: [fixture.entries[0]!],
     })
     /** 隔离预期中文错误日志，避免失败监听器污染测试输出。 */
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('LOGGER_FAILED')
+    })
     const observedStatuses: string[] = []
-    fixture.service.onChanged(() => { throw new Error('监听器测试失败') })
+    fixture.service.onChanged(() => { throw new Error('credential=secret') })
     const unsubscribe = fixture.service.onChanged((event) => {
       /** 事件回调触发时，内存 store 必须已经持有可重读的权威终态。 */
       observedStatuses.push(fixture.batches.get(event.batchId)?.entries[0]?.status ?? 'missing')
@@ -150,10 +152,8 @@ describe('Canvas 图片候选批次 Service', () => {
       expect(fixture.batches.get('batch-event')?.entries[0]).toMatchObject({
         status: 'candidate', candidateAssetId: 'asset-event',
       })
-      expect(errorSpy).toHaveBeenCalledWith(
-        '[CanvasImageCandidateBatchService] 候选批次变化监听器执行失败:',
-        expect.objectContaining({ message: '监听器测试失败' }),
-      )
+      expect(errorSpy).toHaveBeenCalledWith('[CanvasImageDiagnostics] CANVAS_IMAGE_BATCH_LISTENER_FAILED')
+      expect(JSON.stringify(errorSpy.mock.calls)).not.toContain('credential=secret')
     } finally {
       unsubscribe()
       errorSpy.mockRestore()

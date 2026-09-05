@@ -16,6 +16,7 @@ import type {
   CanvasImageCandidateBatchService,
 } from './canvas-image-candidate-batch-service'
 import type { DesignJobChangedListener, DesignJobManager } from './design-job-manager'
+import { reportCanvasImageDiagnostic } from './canvas-image-diagnostics'
 import { isSafeDesignStableId } from './design-paths'
 import type { CanvasToolRunContext } from './canvas-tool-provider'
 
@@ -521,9 +522,9 @@ export function createCanvasImageRunService(
         /** 只取消输入任务中仍属于当前批次与 Canvas 的活跃 Job。 */
         try {
           await cancelTasks(input)
-        } catch (cleanupError) {
+        } catch {
           /** 清理异常只进入内部诊断，不能覆盖调用方可依赖的等待主错误。 */
-          console.error('[CanvasImageRunService] 候选批次等待清理失败:', cleanupError)
+          reportCanvasImageDiagnostic('CANVAS_IMAGE_BATCH_CANCEL_CLEANUP_FAILED')
         }
       }
       throw error
