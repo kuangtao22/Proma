@@ -1,6 +1,6 @@
 {
   "name": "@proma/electron",
-  "version": "0.19.31-bone.1",
+  "version": "0.19.31-bone.2",
   "description": "Proma，为专业用户设计的 Agent - Electron App",
   "homepage": "https://github.com/kuangtao22/Proma",
   "main": "dist/main.cjs",
@@ -42,7 +42,7 @@
     "build": "bun run prepare:officecli && bun run build:main && bun run build:agent-runtime && bun run build:terminal-runtime && bun run build:server-ops-runtime && bun run build:preload && bun run build:renderer && bun run build:cli && bun run build:native-helpers && bun run build:resources",
     "rebuild:node-pty": "electron-rebuild -f -w node-pty && bun run ensure:node-pty-helper",
     "ensure:node-pty-helper": "bun run scripts/ensure-node-pty-helper-executable.ts",
-    "package:prepare": "bun run build && bun run build:mobile && bun run sync:runtime-deps && bun run rebuild:node-pty",
+    "package:prepare": "bun run build && bun run build:mobile && bun run rebuild:node-pty && bun run sync:runtime-deps",
     "start": "bun run build && bunx electron .",
     "typecheck": "tsc --noEmit",
     "generate:icons": "cd resources && ./generate-icons.sh",

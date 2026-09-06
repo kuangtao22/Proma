@@ -281,7 +281,7 @@ const validFiles: Record<string, string> = {
     scripts: {
       dev: 'bun run build:mobile && bun run scripts/dev-kill.ts --vite && concurrently -k',
       'build:mobile': "bun run --filter='@proma/mobile' build",
-      'package:prepare': 'bun run build && bun run build:mobile && bun run sync:runtime-deps',
+      'package:prepare': 'bun run build && bun run build:mobile && bun run rebuild:node-pty && bun run sync:runtime-deps',
     },
   }),
   'apps/mobile/package.json': JSON.stringify({ name: '@proma/mobile', scripts: { build: 'vite build' } }),
@@ -1504,13 +1504,13 @@ describe('fork 上游兼容检查器', () => {
   })
 
   test('Given package prepare 顺序错误 When 检查移动构建 Then 明确失败', () => {
-    /** 三个真实命令存在但顺序违反打包契约。 */
+    /** 四个真实命令存在但 runtime 同步提前清除了 native rebuild 工具。 */
     const files = {
       ...validFiles,
       'apps/electron/package.json': JSON.stringify({
         scripts: {
           'build:mobile': "bun run --filter='@proma/mobile' build",
-          'package:prepare': 'bun run build:mobile && bun run build && bun run sync:runtime-deps',
+          'package:prepare': 'bun run build && bun run build:mobile && bun run sync:runtime-deps && bun run rebuild:node-pty',
         },
       }),
     }
@@ -1526,7 +1526,7 @@ describe('fork 上游兼容检查器', () => {
         scripts: {
           dev: 'bun run build:mobile && bun run scripts/dev-kill.ts --vite && concurrently -k',
           'build:mobile': 'bun run --filter=@proma/mobile build',
-          'package:prepare': 'bun run build && bun run build:mobile && bun run sync:runtime-deps',
+          'package:prepare': 'bun run build && bun run build:mobile && bun run rebuild:node-pty && bun run sync:runtime-deps',
         },
       }),
     }

@@ -1678,15 +1678,16 @@ function checkMobileBuild(reader: RepositoryReader): ForkCompatCheckResult {
     /** build:mobile 唯一允许的真实 workspace 构建命令。 */
     const hasValidMobileBuild = buildMobileCommands?.length === 1
       && commandEquals(buildMobileCommands[0], ['bun', 'run', '--filter=@proma/mobile', 'build'])
-    /** package:prepare 必须无额外前置命令地执行固定三步。 */
-    const hasValidPackagePrepare = packagePrepareCommands?.length === 3
+    /** package:prepare 必须先重建 native 依赖，再清理并同步打包运行时目录。 */
+    const hasValidPackagePrepare = packagePrepareCommands?.length === 4
       && commandEquals(packagePrepareCommands[0], ['bun', 'run', 'build'])
       && commandEquals(packagePrepareCommands[1], ['bun', 'run', 'build:mobile'])
-      && commandEquals(packagePrepareCommands[2], ['bun', 'run', 'sync:runtime-deps'])
+      && commandEquals(packagePrepareCommands[2], ['bun', 'run', 'rebuild:node-pty'])
+      && commandEquals(packagePrepareCommands[3], ['bun', 'run', 'sync:runtime-deps'])
 
     if (!hasValidDevMobileBuild) details.push('dev 必须先执行 bun run build:mobile，避免局域网服务加载旧移动端产物')
     if (!hasValidMobileBuild) details.push('build:mobile 必须直接执行 @proma/mobile workspace build')
-    if (!hasValidPackagePrepare) details.push('package:prepare 必须按 Electron build、mobile build、runtime 同步顺序直接执行')
+    if (!hasValidPackagePrepare) details.push('package:prepare 必须按 Electron build、mobile build、node-pty 重建、runtime 同步顺序直接执行')
     if (mobilePackage.name !== '@proma/mobile' || !mobilePackage.scripts?.build) details.push('apps/mobile 未保留可执行 build script')
   } catch (error) {
     details.push(`package.json 解析失败：${error instanceof Error ? error.message : String(error)}`)
@@ -1696,7 +1697,7 @@ function checkMobileBuild(reader: RepositoryReader): ForkCompatCheckResult {
     'mobile-build',
     '移动端构建与打包准备',
     [PATHS.electronPackage, PATHS.mobilePackage],
-    '让 dev 首步构建移动端；保留 Electron build:mobile workspace 命令，并让 package:prepare 同时执行 Electron build、mobile build 和 runtime 同步。',
+    '让 dev 首步构建移动端；保留 Electron build:mobile workspace 命令，并让 package:prepare 在 runtime 同步前完成 node-pty 重建。',
     details,
   )
 }

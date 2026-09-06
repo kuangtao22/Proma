@@ -23,6 +23,8 @@ interface ElectronPackageMetadata {
   version?: string
   /** Debian 等 Linux 安装包需要展示的项目主页。 */
   homepage?: string
+  /** Electron workspace 的构建与发布脚本。 */
+  scripts?: Record<string, string>
 }
 
 interface PlatformArtifactConfig {
@@ -145,6 +147,15 @@ test('Linux deb 包含 Electron Builder 必需的项目主页', () => {
   expect(metadata.homepage).toBe('https://github.com/kuangtao22/Proma')
 })
 
+test('打包准备在清理运行时依赖目录前重建 node-pty', () => {
+  /** Electron workspace 的打包准备命令。 */
+  const packagePrepare = readElectronPackageMetadata().scripts?.['package:prepare']
+
+  expect(packagePrepare).toBe(
+    'bun run build && bun run build:mobile && bun run rebuild:node-pty && bun run sync:runtime-deps',
+  )
+})
+
 test('Bone 应用版本与更新频道保持一致', () => {
   /** Electron workspace 的发布元数据。 */
   const metadata = readElectronPackageMetadata()
@@ -156,7 +167,7 @@ test('Bone 应用版本与更新频道保持一致', () => {
     'utf8',
   )
 
-  expect(metadata.version).toBe('0.19.31-bone.1')
+  expect(metadata.version).toBe('0.19.31-bone.2')
   expect(config.detectUpdateChannel).toBe(false)
   expect(config.publish).toEqual({
     provider: 'github',
