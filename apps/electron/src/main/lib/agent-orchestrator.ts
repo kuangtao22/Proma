@@ -64,7 +64,11 @@ import type { PermissionResult, CanUseToolOptions } from './agent-permission-ser
 import { resolvePlanningDeletionPermission } from './planning-permission-policy'
 import { askUserService } from './agent-ask-user-service'
 import { exitPlanService, type ExitPlanPermissionResult } from './agent-exit-plan-service'
-import { createRunToolCallLimiter, denyToolOutsideRunAllowlist } from './agent-run-tool-policy'
+import {
+  createRunToolCallLimiter,
+  denyToolOutsideRunAllowlist,
+  resolvePiActiveToolNames,
+} from './agent-run-tool-policy'
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
@@ -718,6 +722,8 @@ export class AgentOrchestrator {
     extensions: AgentRunExtensions = {},
   ): Promise<void> {
     const { sessionId, userMessage, rawUserMessage, userMessageUuid, channelId, modelId, workspaceId: requestedWorkspaceId, additionalDirectories, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid, canvasNodeReferences } = input
+    /** 受限内部运行可关闭 Workspace Skills，避免 Pi 把普通 Skill 目录注入系统提示。 */
+    const runSkillsEnabled = extensions.skillsMode !== 'disabled'
     // Capture the focus once per turn. Later UI focus changes must not rewrite this reply's attribution.
     const initialVaultFocus = getVaultUserContext(sessionId)
     const streamStartedAt = input.startedAt ?? Date.now()
@@ -1177,9 +1183,9 @@ export class AgentOrchestrator {
         enrichedMessage = `${referencedSessionsBlock}\n\n${enrichedMessage}`
         console.log(`[Agent 编排] 注入 referenced_sessions: ${mentionedSessionIds?.length ?? 0} sessions`)
       }
-      if (mentionedSkills?.length || mentionedMcpServers?.length) {
+      if ((runSkillsEnabled && mentionedSkills?.length) || mentionedMcpServers?.length) {
         const toolLines: string[] = ['用户在消息中明确引用了以下工具，请在本次回复中主动调用：']
-        for (const slug of mentionedSkills ?? []) {
+        for (const slug of runSkillsEnabled ? mentionedSkills ?? [] : []) {
           const qualifiedName = workspaceSlug
             ? `proma-workspace-${workspaceSlug}:${slug}`
             : slug
@@ -1792,13 +1798,17 @@ export class AgentOrchestrator {
         initialUserMessageUuid,
         piAgentDir: getSdkConfigDir(),
         piSessionDir: join(getSdkConfigDir(), 'sessions'),
+        activeToolNames: resolvePiActiveToolNames(
+          extensions.allowedToolNames,
+          extensions.allowedToolNamesMode,
+        ),
         ...(allAdditionalDirectories.length > 0 && { additionalDirectories: allAdditionalDirectories }),
-        ...(workspaceSlug ? {
+        ...(workspaceSlug && runSkillsEnabled ? {
           additionalSkillPaths: [getWorkspaceSkillsDir(workspaceSlug)],
           skillWorkspaceSlug: workspaceSlug,
         } : {}),
-        ...(mentionedSkills?.length ? { skillMentions: mentionedSkills } : {}),
-        onSkillActivated: recordSkillActivation,
+        ...(runSkillsEnabled && mentionedSkills?.length ? { skillMentions: mentionedSkills } : {}),
+        ...(runSkillsEnabled ? { onSkillActivated: recordSkillActivation } : {}),
         ...(isCompactCommand ? { compactRequest: true } : {}),
         ...(sessionMeta?.codexFastMode && channel.provider === 'openai-codex' ? { codexFastMode: true } : {}),
         ...(codexOAuthCredentials && {

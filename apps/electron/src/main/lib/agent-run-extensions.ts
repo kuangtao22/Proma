@@ -11,6 +11,8 @@ export interface AgentRunExtensions {
   systemPromptAppend?: string
   /** 本次运行额外注入的 Pi 工具。 */
   piCustomTools?: ToolDefinition[]
+  /** 本次运行的 Workspace Skills 暴露策略；默认 workspace，内部受限运行可显式禁用。 */
+  skillsMode?: 'workspace' | 'disabled'
   /** 本次运行允许的完整工具名；缺失时保持普通 Agent 权限行为。 */
   allowedToolNames?: readonly string[]
   /** replace 用于受限内部 Agent；extend 仅声明新增工具，不替换普通 Agent 既有能力。 */

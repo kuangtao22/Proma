@@ -139,6 +139,8 @@ export interface PiAgentQueryOptions extends AgentQueryInput {
   piAgentDir: string
   piSessionDir: string
   customTools?: ToolDefinition[]
+  /** 本轮真正暴露给模型的 Pi 工具名；缺失时保持普通 Agent 的完整工具集合。 */
+  activeToolNames?: string[]
   onSessionId?: (sdkSessionId: string, sessionFile?: string) => void
   /** Pi final assistant UI UUID → 持久树状 session entry ID。 */
   onPiEntryBindings?: (bindings: Record<string, string>) => void
@@ -1565,6 +1567,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
         model,
         thinkingLevel: input.thinkingLevel ?? 'off',
         noTools: 'builtin',
+        ...(input.activeToolNames ? { tools: input.activeToolNames } : {}),
         customTools,
       })
       session.agent.toolExecution = 'sequential'

@@ -103,6 +103,22 @@ describe('Agent sendMessage 准入顺序合同', () => {
       .toBeGreaterThan(body.indexOf('consumeRunToolCallLimit(toolName)'))
   })
 
+  test('Given 内部运行禁用 Workspace Skills When 构建 Pi 查询 Then 不注入 Skill 目录、mention 或激活回调', () => {
+    /** 读取真实编排源码，锁定单次运行策略与 Pi 查询边界。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    /** 只检查 sendMessage，避免队列和标题生成路径中的同名字段干扰。 */
+    const sendStart = source.indexOf('  async sendMessage(')
+    const sendEnd = source.indexOf('\n  /**\n   * 中止指定会话', sendStart)
+    const body = source.slice(sendStart, sendEnd)
+
+    expect(body).toContain("const runSkillsEnabled = extensions.skillsMode !== 'disabled'")
+    expect(body).toContain('for (const slug of runSkillsEnabled ? mentionedSkills ?? [] : [])')
+    expect(body).toContain('...(workspaceSlug && runSkillsEnabled ? {')
+    expect(body).toContain('...(runSkillsEnabled && mentionedSkills?.length ? { skillMentions: mentionedSkills } : {})')
+    expect(body).toContain('...(runSkillsEnabled ? { onSkillActivated: recordSkillActivation } : {})')
+    expect(body).toContain('activeToolNames: resolvePiActiveToolNames(')
+  })
+
   test('Given sendMessage 实现 When 检查迁移拒绝分支 Then 它早于 active、retry 删除、消息落盘和首次 await', () => {
     /** 读取实际 orchestrator 源码以约束不可注入的副作用顺序。 */
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')

@@ -939,6 +939,7 @@ describe('Design Job Manager', () => {
       source: 'design',
       triggeredBy: 'user',
       permissionModeOverride: 'bypassPermissions',
+      skillsMode: 'disabled',
       allowedToolNames: [
         'design_list_project_files',
         'design_search_project_text',
@@ -2233,6 +2234,7 @@ describe('Design Job Manager', () => {
         runInputs.push({
           ...input,
           source: callbacks.source,
+          skillsMode: extensions.skillsMode,
           allowedToolNames: extensions.allowedToolNames,
           toolCallLimits: extensions.toolCallLimits,
           trustedImageRoute: extensions.trustedImageRoute,

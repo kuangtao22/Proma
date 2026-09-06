@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { createRunToolCallLimiter, denyToolOutsideRunAllowlist } from './agent-run-tool-policy'
+import {
+  createRunToolCallLimiter,
+  denyToolOutsideRunAllowlist,
+  resolvePiActiveToolNames,
+} from './agent-run-tool-policy'
 
 describe('Design Agent 运行级工具策略', () => {
   test('Given Design run 仅允许 Nano Banana When 检查工具 Then 其它内置和 MCP 工具全部拒绝', () => {
@@ -43,6 +47,26 @@ describe('Design Agent 运行级工具策略', () => {
     const consumeLimit = createRunToolCallLimiter(undefined)
     expect(consumeLimit('mcp__nano_banana__generate_image')).toBeUndefined()
     expect(consumeLimit('mcp__nano_banana__generate_image')).toBeUndefined()
+  })
+
+  test('Given replace 白名单 When 构建 Pi 可见工具 Then 只保留允许项并转换内建名称', () => {
+    expect(resolvePiActiveToolNames([
+      'Read',
+      'Glob',
+      'Edit',
+      'MultiEdit',
+      'mcp__nano_banana__generate_image',
+    ], 'replace')).toEqual([
+      'read',
+      'find',
+      'edit',
+      'mcp__nano_banana__generate_image',
+    ])
+  })
+
+  test('Given 普通或 extend 运行 When 构建 Pi 可见工具 Then 不收窄模型工具集合', () => {
+    expect(resolvePiActiveToolNames(undefined, 'replace')).toBeUndefined()
+    expect(resolvePiActiveToolNames(['canvas_read'], 'extend')).toBeUndefined()
   })
 
   test('Given canUseTool 进入权限边界 When 检查源码顺序 Then stale 后且参数处理前执行 allowlist', () => {

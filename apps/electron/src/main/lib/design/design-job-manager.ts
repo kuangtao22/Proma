@@ -754,6 +754,7 @@ export class DesignJobManager {
           onTitleUpdated: () => undefined,
         }, {
           piCustomTools: contextRun.tools,
+          skillsMode: 'disabled',
           allowedToolNames: [...contextRun.allowedToolNames, DESIGN_IMAGE_TOOL],
           toolCallLimits: { [DESIGN_IMAGE_TOOL]: 1 },
           beforeToolCall: (toolName) => {
