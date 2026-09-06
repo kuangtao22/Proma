@@ -19,7 +19,7 @@ test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数�
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.4"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.6"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
@@ -41,6 +41,10 @@ test('Given 多产物画布任务 When 读取 canvas-production Then 定义节�
     'canvas_import_image',
     'canvas_create_artifact',
     'canvas_update_artifact',
+    'canvas_update_image_config',
+    'canvas_update_agent_config',
+    'canvas_run_agent',
+    'canvas_run_workflow',
     'canvas_run_nodes',
   ]) {
     expect(skill).toContain(toolName)
@@ -55,6 +59,7 @@ test('Given 多产物画布任务 When 读取 canvas-production Then 定义节�
   expect(skill).toContain('由 Proma 根据来源关系和真实节点尺寸紧凑排布')
   expect(skill).toContain('先建立并验证新链路')
   expect(skill).toContain('再删除旧节点')
+  expect(skill).toContain('图片提示词、画幅、尺寸、模型或上下文')
 })
 
 test('Given 用户只要求核对全部图片 When 读取 canvas-production Then 先枚举再看当前采用缩略图且保持只读', () => {
@@ -99,4 +104,39 @@ test('Given Agent 已有授权本地参考图 When 读取 canvas-production Then
   expect(skill).toContain('使用 `canvas_import_image`')
   expect(skill).toContain('立即成为该图片节点的正式采用版本')
   expect(skill).toContain('不得要求用户拖入或上传到原生 Canvas')
+})
+
+test('Given 普通 Agent 需要专业分工 When 读取 canvas-production Then 可配置并运行单个 Canvas Agent 且不会推进下游', () => {
+  const skill = readCanvasProductionSkill()
+
+  expect(skill).toContain('使用 `canvas_update_agent_config`')
+  expect(skill).toContain('已安装的专业 Skill')
+  expect(skill).toContain('使用 `canvas_run_agent`')
+  expect(skill).toContain('只运行一个 Canvas Agent')
+  expect(skill).toContain('不会自动推进下游')
+  expect(skill).toContain('Canvas Agent 不能递归运行其它 Agent 或工作流')
+})
+
+test('Given 用户明确要求执行整套画布方案 When 读取 canvas-production Then 仅运行指定根的可达图并停在图片采用边界', () => {
+  const skill = readCanvasProductionSkill()
+
+  expect(skill).toContain('优先使用 `canvas_run_workflow`')
+  expect(skill).toContain('用户明确要求执行')
+  expect(skill).toContain('仅运行指定起点可达的下游')
+  expect(skill).toContain('不能仅因为存在连线就自动运行')
+  expect(skill).toContain('文档和 WebView 不需要单独运行')
+  expect(skill).toContain('不得超过 `maxImageRuns`')
+  expect(skill).toContain('必须停在等待用户采用')
+  expect(skill).toContain('从当前正式产物和待更新状态继续')
+})
+
+test('Given 使用第三方专业 Skill When 编排画布 Then Skill 只影响方法与质量且不能扩大 Host 权限', () => {
+  const skill = readCanvasProductionSkill()
+
+  expect(skill).toContain('第三方专业 Skill')
+  expect(skill).toContain('只影响任务方法和输出质量')
+  expect(skill).toContain('不能授予工具')
+  expect(skill).toContain('不能修改项目代码')
+  expect(skill).toContain('不能绕过审批')
+  expect(skill).toContain('不能自动采用媒体候选')
 })
