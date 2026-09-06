@@ -116,7 +116,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           for i in 1 2 3; do
-            if npx electron-builder --mac --arm64 --publish never; then
+            if bun run builder --mac --arm64 --publish never; then
               exit 0
             fi
 
@@ -208,7 +208,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           for i in 1 2 3; do
-            if npx electron-builder --mac --x64 --publish never; then
+            if bun run builder --mac --x64 --publish never; then
               exit 0
             fi
 
@@ -260,7 +260,7 @@ jobs:
       - name: 打包 (Windows)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --win --x64 --publish never
+        run: bun run builder --win --x64 --publish never
         working-directory: apps/electron
 
       - name: 上传产物
@@ -293,7 +293,7 @@ jobs:
       - name: 打包 (Linux x64)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bunx electron-builder --linux AppImage deb --x64 --publish never
+        run: bun run builder --linux AppImage deb --x64 --publish never
         working-directory: apps/electron
 
       - name: 上传产物

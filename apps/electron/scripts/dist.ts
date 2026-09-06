@@ -192,7 +192,8 @@ function main(): void {
   step++
   printStepStart(step, totalSteps, 'Electron Builder 打包')
 
-  const builderArgs = ['electron-builder', `--${opts.platform}`]
+  /** 通过 package.json 中固定版本的统一入口启动 Electron Builder。 */
+  const builderArgs = ['run', 'builder', `--${opts.platform}`]
 
   // 只构建当前架构
   if (opts.currentArch) {
@@ -218,7 +219,7 @@ function main(): void {
   }
 
   results.push(
-    runStep('Electron Builder', 'bunx', builderArgs, {
+    runStep('Electron Builder', 'bun', builderArgs, {
       verbose: true, // 打包步骤始终显示输出
       env: builderEnv,
     })

@@ -25,6 +25,8 @@ interface ElectronPackageMetadata {
   homepage?: string
   /** Electron workspace 的构建与发布脚本。 */
   scripts?: Record<string, string>
+  /** Electron workspace 的开发期依赖。 */
+  devDependencies?: Record<string, string>
 }
 
 interface PlatformArtifactConfig {
@@ -156,6 +158,32 @@ test('打包准备在清理运行时依赖目录前重建 node-pty', () => {
   )
 })
 
+test('所有打包入口使用固定版本的 Electron Builder', () => {
+  /** Electron workspace 的包元数据。 */
+  const metadata = readElectronPackageMetadata()
+  /** Release 工作流原始文本。 */
+  const releaseWorkflow = readReleaseWorkflow()
+  /** 独立 Windows 构建工作流原始文本。 */
+  const windowsWorkflow = readWindowsBuildWorkflow()
+  /** 可视化打包脚本源码。 */
+  const distSource = readFileSync(resolve(import.meta.dir, './dist.ts'), 'utf8')
+  /** 允许调用统一固定版本打包器的发布脚本。 */
+  const packagingScripts = ['pack', 'dist', 'dist:mac', 'dist:win', 'dist:linux']
+
+  expect(metadata.devDependencies?.['electron-builder']).toBe('25.1.8')
+  expect(metadata.scripts?.builder).toBe('bunx electron-builder@25.1.8')
+  for (const scriptName of packagingScripts) {
+    expect(metadata.scripts?.[scriptName]).toContain('bun run builder')
+    expect(metadata.scripts?.[scriptName]).not.toMatch(/(?:^|&&\s*)electron-builder\b/)
+  }
+  expect(distSource).toContain("const builderArgs = ['run', 'builder', `--${opts.platform}`]")
+  expect(distSource).toContain("runStep('Electron Builder', 'bun', builderArgs")
+  expect(releaseWorkflow).not.toMatch(/\b(?:npx|bunx) electron-builder(?:\s|$)/)
+  expect(windowsWorkflow).not.toMatch(/\b(?:npx|bunx) electron-builder(?:\s|$)/)
+  expect(releaseWorkflow.match(/bun run builder/g)).toHaveLength(4)
+  expect(windowsWorkflow.match(/bun run builder/g)).toHaveLength(1)
+})
+
 test('Bone 应用版本与更新频道保持一致', () => {
   /** Electron workspace 的发布元数据。 */
   const metadata = readElectronPackageMetadata()
@@ -167,7 +195,7 @@ test('Bone 应用版本与更新频道保持一致', () => {
     'utf8',
   )
 
-  expect(metadata.version).toBe('0.19.31-bone.2')
+  expect(metadata.version).toBe('0.19.31-bone.3')
   expect(config.detectUpdateChannel).toBe(false)
   expect(config.publish).toEqual({
     provider: 'github',
