@@ -57,6 +57,7 @@ function createFixture(document: CanvasDocument, options: {
   }>
   onAgentStart?: (nodeId: string, signal?: AbortSignal) => Promise<void>
   onLoad?: (callCount: number) => Promise<void>
+  onValidateAccess?: (callCount: number) => Promise<void>
   onImageRun?: (signal: AbortSignal, deadlineAt: number) => Promise<void>
   onImageWait?: (signal: AbortSignal) => Promise<void>
   imageWaitError?: Error
@@ -68,6 +69,7 @@ function createFixture(document: CanvasDocument, options: {
   let activeAgents = 0
   let maxActiveAgents = 0
   let loadCalls = 0
+  let validateAccessCalls = 0
   let deadlineCallback = (): void => undefined
   const dependencies: CanvasWorkflowExecutionServiceDependencies = {
     load: async () => {
@@ -75,7 +77,10 @@ function createFixture(document: CanvasDocument, options: {
       await options.onLoad?.(loadCalls)
       return structuredClone(current)
     },
-    validateAccess: () => undefined,
+    validateAccess: async () => {
+      validateAccessCalls += 1
+      await options.onValidateAccess?.(validateAccessCalls)
+    },
     isAgentBusy: (node) => options.busyNodeIds?.includes(node.id) ?? false,
     agentExecution: {
       execute: async (request): Promise<CanvasAgentExecutionResult> => {
@@ -525,6 +530,67 @@ describe('Canvas Workflow Execution Service', () => {
     })
   })
 
+  test('Given 图片候选等待期间新增可达 Agent 和图片 When fresh plan Then 继续实际运行且不遗留 started', async () => {
+    const root = createNode('root', 'agent')
+    const firstImage = createNode('image-first', 'image')
+    const addedAgent = createNode('agent-added', 'agent')
+    const addedImage = createNode('image-added', 'image')
+    let expanded = false
+    let fixture: ReturnType<typeof createFixture>
+    fixture = createFixture(createDocument([root, firstImage], [[root, firstImage]]), {
+      onImageWait: async () => {
+        if (expanded) return
+        expanded = true
+        /** 保留既有边身份，只在图片等待期间追加两个独立可达节点。 */
+        const next = createDocument(
+          [root, firstImage, addedAgent, addedImage],
+          [[root, firstImage], [root, addedAgent], [root, addedImage]],
+        )
+        next.revision = 5
+        fixture.setDocument(next)
+      },
+    })
+    fixture.input.maxImageRuns = 2
+
+    const result = await fixture.service.execute(context, fixture.input, 'tool-image-expansion')
+
+    expect(fixture.agentStarts).toEqual(['root', 'agent-added'])
+    expect(fixture.imageRuns).toEqual([['image-first'], ['image-added']])
+    expect(result.nodes.some((node) => node.status === 'started')).toBe(false)
+  })
+
+  for (const scenario of [
+    {
+      name: '授权复核',
+      options: {
+        onValidateAccess: async (callCount: number) => {
+          if (callCount === 5) throw new Error('CANVAS_REFRESH_ACCESS_FAILED')
+        },
+      },
+      errorCode: 'CANVAS_REFRESH_ACCESS_FAILED',
+    },
+    {
+      name: '权威读取',
+      options: {
+        onLoad: async (callCount: number) => {
+          if (callCount === 3) throw new Error('CANVAS_REFRESH_LOAD_FAILED')
+        },
+      },
+      errorCode: 'CANVAS_REFRESH_LOAD_FAILED',
+    },
+  ]) {
+    test(`Given 图片候选已返回后 fresh ${scenario.name}失败 When 终止 Then 保留顶层错误而不改写为生图失败`, async () => {
+      const root = createNode('root', 'agent')
+      const image = createNode('image', 'image')
+      const fixture = createFixture(createDocument([root, image], [[root, image]]), scenario.options)
+
+      await expect(fixture.service.execute(context, fixture.input, `tool-refresh-${scenario.name}`))
+        .rejects.toThrow(scenario.errorCode)
+      expect(fixture.imageRuns).toEqual([['image']])
+      expect(fixture.imageWaits).toEqual([['task-0']])
+    })
+  }
+
   test('Given 图片批次逐节点为候选、失败和无效 When 终态映射 Then 各分支使用真实结果', async () => {
     const root = createNode('root', 'agent')
     const candidate = createNode('candidate', 'image')
@@ -614,6 +680,36 @@ describe('Canvas Workflow Execution Service', () => {
     releaseLoad()
     expect(result.status).toBe('cancelled')
     expect(result.errorCode).toBe('CANVAS_WORKFLOW_TIMEOUT')
+    expect(result.finalRevision).toBe(4)
+  })
+
+  test('Given Agent 已提交新 revision 后 fresh-load 等待中父级取消 When 终止 Then 返回已观察到的最新版本', async () => {
+    const root = createNode('root', 'agent')
+    const controller = new AbortController()
+    let releaseLoad = (): void => undefined
+    const loadBlocked = new Promise<void>((resolve) => { releaseLoad = resolve })
+    const fixture = createFixture(createDocument([root]), {
+      onLoad: async (callCount) => {
+        if (callCount === 2) await loadBlocked
+      },
+    })
+    const running = fixture.service.execute(
+      context, fixture.input, 'tool-refresh-parent-abort', controller.signal,
+    )
+    while (fixture.loadCalls() < 2) await Promise.resolve()
+
+    controller.abort()
+    const result = await Promise.race([
+      running,
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error('TEST_REFRESH_PARENT_ABORT_GATE_TIMEOUT')), 100)
+      }),
+    ])
+
+    releaseLoad()
+    expect(result.status).toBe('cancelled')
+    expect(result.errorCode).toBe('CANVAS_WORKFLOW_CANCELLED')
+    expect(result.finalRevision).toBe(4)
   })
 
   test('Given 图片启动阶段取消且底层清理失败 When 返回 Then 清理错误不覆盖取消主事实', async () => {
