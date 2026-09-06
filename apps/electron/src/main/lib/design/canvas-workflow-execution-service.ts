@@ -24,18 +24,16 @@ const MAX_AGENT_CONCURRENCY = 2
 /** Canvas 工作流与单 Agent 长工具共用的总时限。 */
 export const CANVAS_WORKFLOW_TIMEOUT_MS = 15 * 60_000
 
-/** 为动态图片子批派生可重放且互不冲突的安全 operationId。 */
+/** 为单个图片节点派生跨分波重放稳定且互不冲突的安全 operationId。 */
 function createWorkflowImageOperationId(
   parentOperationId: string,
-  batchOrdinal: number,
-  nodeIds: readonly string[],
+  nodeId: string,
 ): string {
   /** 只哈希稳定业务身份，不包含节点标题、提示词或其它正文。 */
   const digest = createHash('sha256').update(JSON.stringify([
-    'canvas-workflow-image-batch',
+    'canvas-workflow-image-node',
     parentOperationId,
-    batchOrdinal,
-    [...nodeIds].sort(),
+    nodeId,
   ])).digest('hex')
   return `workflow-image-${digest}`
 }
@@ -243,6 +241,29 @@ function toWorkflowImageSummary(summary: CanvasRunNodesBatchTerminalSummary): Ca
   }
 }
 
+/** 累加不同单节点子批和动态波次的终态计数。 */
+function mergeWorkflowImageSummary(
+  current: CanvasWorkflowImageSummary | null,
+  next: CanvasWorkflowImageSummary,
+): CanvasWorkflowImageSummary {
+  const totalCount = (current?.totalCount ?? 0) + next.totalCount
+  const candidateCount = (current?.candidateCount ?? 0) + next.candidateCount
+  const failedCount = (current?.failedCount ?? 0) + next.failedCount
+  const runningCount = (current?.runningCount ?? 0) + next.runningCount
+  return {
+    status: failedCount === 0 && runningCount === 0 && candidateCount === totalCount ? 'ready' : 'partial',
+    totalCount,
+    candidateCount,
+    failedCount,
+    runningCount,
+  }
+}
+
+/** 为未产生可信终态的已尝试节点构造公开失败计数。 */
+function failedWorkflowImageSummary(): CanvasWorkflowImageSummary {
+  return { status: 'partial', totalCount: 1, candidateCount: 0, failedCount: 1, runningCount: 0 }
+}
+
 /** 对不接受 signal 的只读短 I/O 加 deadline gate，迟到结果不会触发后续副作用。 */
 async function awaitReadOnlyWithinDeadline<T>(
   operation: () => T | Promise<T>,
@@ -335,7 +356,6 @@ export function createCanvasWorkflowExecutionService(
       let states = new Map<string, InternalNodeState>()
       const executedNodeIds = new Set<string>()
       let imageRunsStarted = 0
-      let imageBatchOrdinal = 0
       let maxObservedRevision = input.expectedRevision
       let imageSummary: CanvasWorkflowImageSummary | null = null
       let workflowErrorCode: string | null = null
@@ -508,74 +528,77 @@ export function createCanvasWorkflowExecutionService(
           if (readyImages.length > 0) {
             for (const node of readyImages) executedNodeIds.add(node.id)
             imageRunsStarted += readyImages.length
-            /** ordinal 只在真实启动子批时推进，同一确定性重放会得到相同身份序列。 */
-            const imageOperationId = createWorkflowImageOperationId(
-              toolCallId,
-              imageBatchOrdinal,
-              readyImages.map((node) => node.id),
-            )
-            imageBatchOrdinal += 1
-            let runResult: Awaited<ReturnType<CanvasImageRunService['run']>> | null = null
-            try {
-              runResult = await dependencies.imageRuns.run(
-                context, target, readyImages, imageOperationId, { signal: controller.signal, deadlineAt },
-              )
-            } catch (error) {
-              if (!controller.signal.aborted) {
-                const errorCode = stableErrorCode(error, 'CANVAS_IMAGE_RUN_FAILED')
-                for (const node of readyImages) states.set(node.id, { status: 'failed', errorCode })
-              }
-            }
-            if (!runResult) {
-              /** run 未交接 owned batch 时，Task 9 已在拒绝前自行完成取消。 */
-              if (controller.signal.aborted) break
-              if (!await refreshPlan()) break
-              continue
-            }
-
-            const batch = runResult.batch
-            /** 只把实际返回且带任务身份的节点移交给 awaitBatch。 */
-            const taskIds = runResult.tasks.flatMap((task) => task.taskId ? [task.taskId] : [])
-            if (batch && taskIds.length > 0) {
-              let terminal: CanvasRunNodesBatchTerminalSummary | null = null
+            /** 每节点独立稳定子批；同一波并发，避免稳定身份以串行性能为代价。 */
+            const outcomes = await Promise.all(readyImages.map(async (node) => {
+              let runResult: Awaited<ReturnType<CanvasImageRunService['run']>>
               try {
+                runResult = await dependencies.imageRuns.run(
+                  context,
+                  target,
+                  [node],
+                  createWorkflowImageOperationId(toolCallId, node.id),
+                  { signal: controller.signal, deadlineAt },
+                )
+              } catch (error) {
+                /** run 拒绝前由 Task 9 自行清理，取消时保留 started 供统一投影。 */
+                return controller.signal.aborted ? null : {
+                  nodeId: node.id,
+                  state: {
+                    status: 'failed' as const,
+                    errorCode: stableErrorCode(error, 'CANVAS_IMAGE_RUN_FAILED'),
+                  },
+                  summary: failedWorkflowImageSummary(),
+                }
+              }
+
+              const task = runResult.tasks.find((candidate) => candidate.nodeId === node.id)
+              if (!runResult.batch || !task?.taskId) {
+                return {
+                  nodeId: node.id,
+                  state: task?.status === 'failed'
+                    ? { status: 'failed' as const, errorCode: 'CANVAS_IMAGE_RUN_FAILED' }
+                    : { status: 'blocked' as const, errorCode: 'CANVAS_IMAGE_BATCH_MISSING' },
+                  summary: failedWorkflowImageSummary(),
+                }
+              }
+
+              let terminal: CanvasRunNodesBatchTerminalSummary
+              try {
+                /** owned 子批必须无条件交给 awaitBatch，即使父 signal 已在 run 返回后取消。 */
                 terminal = await dependencies.imageRuns.awaitBatch({
-                  ...target, batchId: batch.batchId, taskIds, signal: controller.signal, deadlineAt,
+                  ...target,
+                  batchId: runResult.batch.batchId,
+                  taskIds: [task.taskId],
+                  signal: controller.signal,
+                  deadlineAt,
                 })
               } catch (error) {
-                if (!controller.signal.aborted) {
-                  const errorCode = stableErrorCode(error, 'CANVAS_IMAGE_RUN_FAILED')
-                  for (const node of readyImages) states.set(node.id, { status: 'failed', errorCode })
+                return controller.signal.aborted ? null : {
+                  nodeId: node.id,
+                  state: { status: 'failed' as const, errorCode: stableErrorCode(error, 'CANVAS_IMAGE_RUN_FAILED') },
+                  summary: failedWorkflowImageSummary(),
                 }
               }
-              /** run 已返回 owned batch 后，即使已取消也必须先调用 awaitBatch 完成交接清理。 */
-              if (controller.signal.aborted) break
-              if (terminal) {
-                imageSummary = toWorkflowImageSummary(terminal)
-                /** 逐节点终态必须同时匹配 run 返回的 nodeId 和 owned taskId。 */
-                const entriesByNodeId = new Map(terminal.entries.map((entry) => [entry.nodeId, entry]))
-                for (const node of readyImages) {
-                  const task = runResult.tasks.find((candidate) => candidate.nodeId === node.id)
-                  const entry = entriesByNodeId.get(node.id)
-                  if (!task?.taskId || !entry || entry.taskId !== task.taskId || entry.nodeId !== node.id) {
-                    states.set(node.id, { status: 'failed', errorCode: 'CANVAS_IMAGE_RESULT_INVALID' })
-                  } else if (entry.status === 'candidate') {
-                    states.set(node.id, { status: 'waiting-review', errorCode: null })
-                  } else if (entry.status === 'failed') {
-                    states.set(node.id, { status: 'failed', errorCode: 'CANVAS_IMAGE_RUN_FAILED' })
-                  } else {
-                    states.set(node.id, { status: 'failed', errorCode: 'CANVAS_IMAGE_RESULT_INVALID' })
-                  }
-                }
+
+              const entry = terminal.entries.find((candidate) => candidate.nodeId === node.id)
+              let state: InternalNodeState
+              if (!entry || entry.taskId !== task.taskId) {
+                state = { status: 'failed', errorCode: 'CANVAS_IMAGE_RESULT_INVALID' }
+              } else if (entry.status === 'candidate') {
+                state = { status: 'waiting-review', errorCode: null }
+              } else if (entry.status === 'failed') {
+                state = { status: 'failed', errorCode: 'CANVAS_IMAGE_RUN_FAILED' }
+              } else {
+                state = { status: 'failed', errorCode: 'CANVAS_IMAGE_RESULT_INVALID' }
               }
-            } else {
-              for (const node of readyImages) {
-                const task = runResult.tasks.find((candidate) => candidate.nodeId === node.id)
-                states.set(node.id, task?.status === 'failed'
-                  ? { status: 'failed', errorCode: 'CANVAS_IMAGE_RUN_FAILED' }
-                  : { status: 'blocked', errorCode: 'CANVAS_IMAGE_BATCH_MISSING' })
-              }
+              return { nodeId: node.id, state, summary: toWorkflowImageSummary(terminal) }
+            }))
+            for (const outcome of outcomes) {
+              if (!outcome) continue
+              states.set(outcome.nodeId, outcome.state)
+              imageSummary = mergeWorkflowImageSummary(imageSummary, outcome.summary)
             }
+            if (controller.signal.aborted) break
             /** refresh 不属于图片调用异常域，授权或读取错误必须保持顶层语义。 */
             if (!await refreshPlan()) break
             continue

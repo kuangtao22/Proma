@@ -65,12 +65,15 @@ function createDocument(nodes: CanvasNode[], pairs: Array<[CanvasNode, CanvasNod
 function createRealImageRunHarness(options: { completeOnStart?: boolean } = {}): {
   service: CanvasImageRunService
   batches: Map<string, CanvasImageCandidateBatch>
+  jobs: Map<string, DesignJobRecord>
+  startedJobIds: string[]
   cancelledJobIds: string[]
 } {
   const batches = new Map<string, CanvasImageCandidateBatch>()
   const jobs = new Map<string, DesignJobRecord>()
   const jobListeners = new Set<DesignJobChangedListener>()
   const adoptionIntents = new Map<string, CanvasImageCandidateAdoptionIntent>()
+  const startedJobIds: string[] = []
   const cancelledJobIds: string[] = []
   let timestamp = 10
   const store: CanvasImageCandidateBatchStore = {
@@ -177,6 +180,7 @@ function createRealImageRunHarness(options: { completeOnStart?: boolean } = {}):
       },
       rollbackCanvasImageOnce: async (_projectId, jobId) => jobs.delete(jobId),
       start: async (jobId) => {
+        startedJobIds.push(jobId)
         const job = jobs.get(jobId)
         if (!job || job.target?.kind !== 'canvas-image' || !job.candidateBatchId) {
           throw new Error('TEST_JOB_NOT_FOUND')
@@ -222,7 +226,7 @@ function createRealImageRunHarness(options: { completeOnStart?: boolean } = {}):
     candidateBatches: candidateService,
     getProjectReadOnlyReason: () => undefined,
   })
-  return { service, batches, cancelledJobIds }
+  return { service, batches, jobs, startedJobIds, cancelledJobIds }
 }
 
 /** 构造可观察 Agent、图片和 fresh-read 行为的调度夹具。 */
@@ -255,6 +259,7 @@ function createFixture(document: CanvasDocument, options: {
   let loadCalls = 0
   let validateAccessCalls = 0
   let deadlineCallback = (): void => undefined
+  const imageNodesByBatchId = new Map<string, string[]>()
   const dependencies: CanvasWorkflowExecutionServiceDependencies = {
     load: async () => {
       loadCalls += 1
@@ -298,12 +303,14 @@ function createFixture(document: CanvasDocument, options: {
       run: async (_context, _target, nodes, _operationId, runOptions) => {
         if (!runOptions) throw new Error('TEST_IMAGE_RUN_OPTIONS_REQUIRED')
         imageRuns.push(nodes.map((node) => node.id))
+        const batchId = `batch-${imageRuns.length}`
+        imageNodesByBatchId.set(batchId, nodes.map((node) => node.id))
         await options.onImageRun?.(runOptions.signal, runOptions.deadlineAt)
         if (runOptions.signal.aborted) throw new Error('CANVAS_IMAGE_RUN_ABORTED')
         return options.imageResult ?? {
           tasks: nodes.map((node, index) => ({ nodeId: node.id, status: 'started', taskId: `task-${index}` })),
           batch: {
-            batchId: 'batch-1', status: 'running', totalCount: nodes.length,
+            batchId, status: 'running', totalCount: nodes.length,
             candidateCount: 0, failedCount: 0, runningCount: nodes.length, requiresCanvasReview: true,
           },
         }
@@ -313,19 +320,23 @@ function createFixture(document: CanvasDocument, options: {
         await options.onImageWait?.(input.signal)
         if (options.imageWaitError) throw options.imageWaitError
         if (input.signal.aborted) throw new Error('CANVAS_IMAGE_BATCH_ABORTED')
+        /** 单节点子批按自身节点筛选定制终态，避免并发等待互相串批。 */
+        const entries = options.imageTerminalEntries?.filter((entry) => (
+          imageNodesByBatchId.get(input.batchId)?.includes(entry.nodeId)
+        )) ?? input.taskIds.map((taskId, index) => ({
+          nodeId: imageNodesByBatchId.get(input.batchId)?.[index] ?? `image-${index}`,
+          taskId,
+          status: 'candidate' as const,
+        }))
         return {
           batchId: input.batchId,
           status: options.imageTerminalStatus ?? 'ready',
-          totalCount: input.taskIds.length,
-          candidateCount: options.imageTerminalStatus === 'partial' ? 0 : input.taskIds.length,
-          failedCount: options.imageTerminalStatus === 'partial' ? input.taskIds.length : 0,
+          totalCount: entries.length,
+          candidateCount: entries.filter((entry) => entry.status === 'candidate').length,
+          failedCount: entries.filter((entry) => entry.status !== 'candidate').length,
           runningCount: 0,
           requiresCanvasReview: true,
-          entries: options.imageTerminalEntries ?? input.taskIds.map((taskId, index) => ({
-            nodeId: imageRuns.at(-1)?.[index] ?? `image-${index}`,
-            taskId,
-            status: 'candidate' as const,
-          })),
+          entries,
         }
       },
     },
@@ -787,13 +798,67 @@ describe('Canvas Workflow Execution Service', () => {
     expect(result.nodes.filter((node) => node.status === 'waiting-review')).toHaveLength(2)
 
     const firstOperationIds = [...operationIds]
-    fixture.setDocument(createDocument([root, firstImage], [[root, firstImage]]))
-    expanded = false
+    const firstStartedJobIds = [...realImages.startedJobIds]
+    /** 不回退动态扩图，直接按真实持久化图重放，验证分波变化不会改变付费身份。 */
+    fixture.input.expectedRevision = 5
     const replay = await fixture.service.execute(context, fixture.input, 'tool-real-dynamic-batches')
 
-    expect(operationIds.slice(firstOperationIds.length)).toEqual(firstOperationIds)
+    expect(operationIds.slice(firstOperationIds.length).sort()).toEqual([...firstOperationIds].sort())
+    expect(new Set(firstOperationIds).size).toBe(2)
+    expect(realImages.startedJobIds).toEqual(firstStartedJobIds)
+    expect(realImages.jobs).toHaveLength(2)
     expect(realImages.batches).toHaveLength(2)
     expect(replay.nodes.filter((node) => node.status === 'waiting-review')).toHaveLength(2)
+  })
+
+  test('Given 两个图片节点同时 ready When 调度 Then 使用独立稳定子批并发启动', async () => {
+    const root = createNode('root', 'agent')
+    const imageA = createNode('image-a', 'image')
+    const imageB = createNode('image-b', 'image')
+    let activeRuns = 0
+    let maxActiveRuns = 0
+    let enteredRuns = 0
+    let releaseRuns = (): void => undefined
+    const runGate = new Promise<void>((resolve) => { releaseRuns = resolve })
+    const operationIds: string[] = []
+    const fixture = createFixture(createDocument(
+      [root, imageA, imageB], [[root, imageA], [root, imageB]],
+    ), {
+      imageRunService: {
+        run: async (_context, _target, nodes, operationId) => {
+          operationIds.push(operationId)
+          activeRuns += 1
+          enteredRuns += 1
+          maxActiveRuns = Math.max(maxActiveRuns, activeRuns)
+          if (enteredRuns === 2) releaseRuns()
+          await runGate
+          activeRuns -= 1
+          const node = nodes[0]!
+          return {
+            tasks: [{ nodeId: node.id, status: 'started', taskId: `task-${node.id}` }],
+            batch: {
+              batchId: `batch-${node.id}`, status: 'running', totalCount: 1,
+              candidateCount: 0, failedCount: 0, runningCount: 1, requiresCanvasReview: true,
+            },
+          }
+        },
+        awaitBatch: async (input) => ({
+          batchId: input.batchId, status: 'ready', totalCount: 1, candidateCount: 1,
+          failedCount: 0, runningCount: 0, requiresCanvasReview: true,
+          entries: [{
+            nodeId: input.batchId.replace('batch-', ''), taskId: input.taskIds[0]!, status: 'candidate',
+          }],
+        }),
+      },
+    })
+
+    const result = await fixture.service.execute(context, fixture.input, 'tool-concurrent-images')
+
+    expect(maxActiveRuns).toBe(2)
+    expect(new Set(operationIds).size).toBe(2)
+    expect(result.imageSummary).toEqual({
+      status: 'ready', totalCount: 2, candidateCount: 2, failedCount: 0, runningCount: 0,
+    })
   })
 
   test('Given 真实图片 run 已返回 owned 批次后父级立即取消 When 交接 Then 仍由 awaitBatch 精确取消任务', async () => {
@@ -873,8 +938,8 @@ describe('Canvas Workflow Execution Service', () => {
       imageTerminalStatus: 'partial',
       imageTerminalEntries: [
         { nodeId: 'candidate', taskId: 'task-0', status: 'candidate' },
-        { nodeId: 'failed', taskId: 'task-1', status: 'failed' },
-        { nodeId: 'invalid', taskId: 'task-2', status: 'invalid' },
+        { nodeId: 'failed', taskId: 'task-0', status: 'failed' },
+        { nodeId: 'invalid', taskId: 'task-0', status: 'invalid' },
       ],
     })
     fixture.input.maxImageRuns = 3
@@ -893,6 +958,9 @@ describe('Canvas Workflow Execution Service', () => {
     })
     expect(result.nodes.find((node) => node.nodeId === 'failed-child')).toEqual({
       nodeId: 'failed-child', status: 'blocked', errorCode: 'UPSTREAM_FAILED',
+    })
+    expect(result.imageSummary).toEqual({
+      status: 'partial', totalCount: 3, candidateCount: 1, failedCount: 2, runningCount: 0,
     })
   })
 
