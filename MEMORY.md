@@ -98,6 +98,7 @@
 
 ## 会话记录
 
+- 2026-09-07：用户要求服务器运维后续工作在分支继续并先规划；已从 `feed23c4` 建立 `codex/server-ops-completion` 与 `.worktrees/server-ops-completion`。设计与实施计划位于 `docs/superpowers/specs/2026-09-07-server-ops-completion-design.md`、`docs/superpowers/plans/2026-09-07-server-ops-completion.md`，当前是待实施草案，顺序为指纹恢复、文件管理、Docker、数据服务。为什么这样处理：先恢复可信连接并逐领域完成审批、审计、取消与验收，避免新页签停在占位或把数据库权限混入通用 Shell；对用户的影响是每阶段可单独验收，不受主工作区并发 Canvas/打包改动干扰。性能约束是复用 SSH 运行时、按页签工作、传输和查询有界，不增加全主机后台采集；本轮没有业务运行时改动，也未访问真实服务器。
 - 2026-08-18：首次建立项目记忆文件；创建时仓库 `main` 指向 `d1a131c7`，配置 `origin` 与 `upstream` 两个远端。
 - 2026-08-18：官方 `upstream/main` 停留在旧版本，发布进度应以远端 `v*` 标签为准；本次确认最新官方标签为 `v0.17.42`。
 - 2026-08-18：将 fork 从 `v0.12.23` 升级到官方 `v0.17.42`，保留 LAN Bridge、移动端、开发环境隔离与独立发布流程；桌面版本与官方保持为 `0.17.42`。
