@@ -29,6 +29,13 @@ interface ElectronPackageMetadata {
   devDependencies?: Record<string, string>
 }
 
+interface RootPackageMetadata {
+  /** 仓库统一使用的 Bun 包管理器版本。 */
+  packageManager?: string
+  /** monorepo 构建期共享依赖。 */
+  devDependencies?: Record<string, string>
+}
+
 interface PlatformArtifactConfig {
   /** 当前平台的安装包文件名模板。 */
   artifactName?: string
@@ -97,6 +104,13 @@ function readElectronPackageMetadata(): ElectronPackageMetadata {
   /** 当前测试脚本到 Electron package.json 的路径。 */
   const packagePath = resolve(import.meta.dir, '../package.json')
   return JSON.parse(readFileSync(packagePath, 'utf8')) as ElectronPackageMetadata
+}
+
+/** 返回 monorepo 根包元数据。 */
+function readRootPackageMetadata(): RootPackageMetadata {
+  /** 当前测试脚本到根 package.json 的路径。 */
+  const packagePath = resolve(import.meta.dir, '../../../package.json')
+  return JSON.parse(readFileSync(packagePath, 'utf8')) as RootPackageMetadata
 }
 
 /** 返回 Electron Builder 配置。 */
@@ -184,6 +198,22 @@ test('所有打包入口使用固定版本的 Electron Builder', () => {
   expect(windowsWorkflow.match(/bun run builder/g)).toHaveLength(1)
 })
 
+test('Release 原生依赖工具链使用固定 Bun 与 node-gyp 版本', () => {
+  /** monorepo 根包元数据。 */
+  const metadata = readRootPackageMetadata()
+  /** 正式 Release 工作流原始文本。 */
+  const releaseWorkflow = readReleaseWorkflow()
+  /** 独立 Windows 构建工作流原始文本。 */
+  const windowsWorkflow = readWindowsBuildWorkflow()
+
+  expect(metadata.packageManager).toBe('bun@1.3.14')
+  expect(metadata.devDependencies?.['node-gyp']).toBe('12.4.0')
+  expect(releaseWorkflow).not.toContain('bun-version: latest')
+  expect(windowsWorkflow).not.toContain('bun-version: latest')
+  expect(releaseWorkflow.match(/bun-version: 1\.3\.14/g)).toHaveLength(5)
+  expect(windowsWorkflow.match(/bun-version: 1\.3\.14/g)).toHaveLength(1)
+})
+
 test('Bone 应用版本与更新频道保持一致', () => {
   /** Electron workspace 的发布元数据。 */
   const metadata = readElectronPackageMetadata()
@@ -195,7 +225,7 @@ test('Bone 应用版本与更新频道保持一致', () => {
     'utf8',
   )
 
-  expect(metadata.version).toBe('0.19.31-bone.4')
+  expect(metadata.version).toBe('0.19.31-bone.5')
   expect(config.detectUpdateChannel).toBe(false)
   expect(config.publish).toEqual({
     provider: 'github',
