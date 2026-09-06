@@ -257,6 +257,19 @@ describe('Design Job Manager', () => {
     }])
   })
 
+  test('Given runHeadless 永不 settle When 取消任务 Then 当前与后续 run 都不会永久挂起', async () => {
+    harness.runHeadless = async () => new Promise<void>(() => undefined)
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    const running = harness.manager.run(job.id)
+    await harness.manager.start(job.id)
+
+    await harness.manager.cancel('project-1', job.id)
+
+    await expect(running).resolves.toBeUndefined()
+    await expect(harness.manager.run(job.id)).resolves.toBeUndefined()
+    expect(harness.manager.get(job.id)?.status).toBe('cancelled')
+  })
+
   test('Given Canvas 图片任务失败或取消 When 进入终态 Then 候选批次不再保持运行中', async () => {
     const candidateHarness = createHarness({ withCandidateBatches: true })
     const failed = await candidateHarness.manager.createCanvasImage({

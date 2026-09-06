@@ -4,6 +4,7 @@ import type {
   CanvasImageModuleConfig,
   CanvasImageTarget,
   CanvasNode,
+  CanvasRunNodesBatchEntrySummary,
   CanvasRunNodesBatchSummary,
   CanvasRunNodesBatchTerminalSummary,
   CanvasRunNodesResult,
@@ -71,8 +72,8 @@ export interface CanvasImageRunServiceDependencies {
   imageJobs: Pick<
     DesignJobManager,
     'preflightCanvasImage' | 'createCanvasImageOnce' | 'rollbackCanvasImageOnce'
-    | 'run' | 'cancel' | 'getProjectJob' | 'onChanged'
-  > & Partial<Pick<DesignJobManager, 'start'>>
+    | 'start' | 'cancel' | 'getProjectJob' | 'onChanged'
+  >
   candidateBatches: Pick<CanvasImageCandidateBatchService, 'createBatchLocked' | 'load' | 'onChanged'>
   getProjectReadOnlyReason: (projectId: string) => string | undefined
 }
@@ -131,15 +132,26 @@ function assertOwnedImageConfig(config: CanvasImageModuleConfig, target: CanvasI
   if (config.contentId !== target.imageModuleId) throw new Error('CANVAS_IMAGE_IDENTITY_CONFLICT')
 }
 
+/** 把候选批次内部状态规范化为公开聚合状态。 */
+function normalizeBatchEntryStatus(
+  status: CanvasImageCandidateBatch['entries'][number]['status'],
+): CanvasRunNodesBatchEntrySummary['status'] | 'running' {
+  if (status === 'candidate' || status === 'adopted') return 'candidate'
+  if (status === 'failed') return 'failed'
+  if (status === 'queued' || status === 'running') return 'running'
+  return 'invalid'
+}
+
 /** 从内部候选批次裁剪公开有界摘要。 */
 function summarizeBatch(batch: CanvasImageCandidateBatch): CanvasRunNodesBatchSummary {
+  const statuses = batch.entries.map((entry) => normalizeBatchEntryStatus(entry.status))
   return {
     batchId: batch.batchId,
     status: batch.status,
     totalCount: batch.entries.length,
-    candidateCount: batch.entries.filter((entry) => entry.status === 'candidate').length,
-    failedCount: batch.entries.filter((entry) => entry.status === 'failed' || entry.status === 'invalid').length,
-    runningCount: batch.entries.filter((entry) => entry.status === 'queued' || entry.status === 'running').length,
+    candidateCount: statuses.filter((status) => status === 'candidate').length,
+    failedCount: statuses.filter((status) => status === 'failed' || status === 'invalid').length,
+    runningCount: statuses.filter((status) => status === 'running').length,
     requiresCanvasReview: true,
   }
 }
@@ -150,11 +162,9 @@ function summarizeTerminalBatch(batch: CanvasImageCandidateBatch): CanvasRunNode
   const entries = batch.entries.map((entry) => ({
     nodeId: entry.nodeId,
     taskId: entry.jobId,
-    status: entry.status === 'candidate' || entry.status === 'adopted'
-      ? 'candidate' as const
-      : entry.status === 'failed'
-        ? 'failed' as const
-        : 'invalid' as const,
+    status: normalizeBatchEntryStatus(entry.status) === 'running'
+      ? 'invalid' as const
+      : normalizeBatchEntryStatus(entry.status) as CanvasRunNodesBatchEntrySummary['status'],
   })).sort((left, right) => {
     if (left.taskId !== right.taskId) return left.taskId < right.taskId ? -1 : 1
     if (left.nodeId === right.nodeId) return 0
@@ -173,8 +183,8 @@ function assertRunOptions(options: CanvasImageRunOptions | undefined): void {
   }
 }
 
-/** 等待全部启动确认，同时只用单次 timer 响应中止或绝对期限。 */
-async function awaitStartResults<T>(promise: Promise<T>, options: CanvasImageRunOptions | undefined): Promise<T> {
+/** 在调度器接管前等待异步步骤，同时只用单次 timer 响应中止或绝对期限。 */
+async function awaitRunBoundary<T>(promise: Promise<T>, options: CanvasImageRunOptions | undefined): Promise<T> {
   if (!options) return promise
   if (options.signal.aborted) throw new Error('CANVAS_IMAGE_RUN_ABORTED')
   if (Date.now() >= options.deadlineAt) throw new Error('CANVAS_IMAGE_RUN_DEADLINE')
@@ -478,18 +488,46 @@ export function createCanvasImageRunService(
     ))
     if (!creationOutcome.ready) return { tasks: nodes.map((node) => taskByNodeId.get(node.id)!) }
 
-    /** 只有本轮新建 journal 才需要锁外启动，既有 journal 不产生重复费用。 */
-    const createdJobs = creationOutcome.jobs.filter((entry) => entry.created)
-    /** Manager 的 start 只等待 running ack，完整生成由 Manager 自己持有并收口。 */
-    const startResultsPromise = Promise.allSettled(
-      createdJobs.map((entry) => dependencies.imageJobs.start
-        ? dependencies.imageJobs.start(entry.job.id)
-        : dependencies.imageJobs.run(entry.job.id)),
-    )
-    /** start 阶段由本服务独占中止取消；返回后取消所有权交给 awaitBatch。 */
-    let runResults: PromiseSettledResult<void>[]
+    /** 返回调度器前，本服务独占本批次所有 active Job 的取消职责。 */
+    const ownedTaskIds = creationOutcome.jobs.map((entry) => entry.job.id)
     try {
-      runResults = await awaitStartResults(startResultsPromise, options)
+      /** creation 期间可能已中止；必须在调用任何付费 start 前先复核。 */
+      await awaitRunBoundary(Promise.resolve(), options)
+      /** 只有本轮新建 journal 才需要锁外启动，既有 journal 不产生重复费用。 */
+      const createdJobs = creationOutcome.jobs.filter((entry) => entry.created)
+      /** Manager 的 start 只等待 running ack，完整生成由 Manager 自己持有并收口。 */
+      const runResults = await awaitRunBoundary(Promise.allSettled(
+        createdJobs.map((entry) => dependencies.imageJobs.start(entry.job.id)),
+      ), options)
+      for (let index = 0; index < createdJobs.length; index += 1) {
+        /** 当前本轮新建任务。 */
+        const entry = createdJobs[index]!
+        /** 当前任务的锁外启动结果。 */
+        const result = runResults[index]!
+        taskByNodeId.set(entry.node.id, result.status === 'fulfilled'
+          ? { nodeId: entry.node.id, status: 'started', taskId: entry.job.id }
+          : { nodeId: entry.node.id, status: 'failed', taskId: entry.job.id, error: canvasNodeRunError(result.reason) })
+      }
+      for (const entry of creationOutcome.jobs.filter((candidate) => !candidate.created)) {
+        taskByNodeId.set(entry.node.id, entry.job.status === 'failed'
+          ? { nodeId: entry.node.id, status: 'failed', taskId: entry.job.id, error: entry.job.error ?? 'CANVAS_IMAGE_JOB_FAILED' }
+          : {
+              nodeId: entry.node.id,
+              status: entry.job.status === 'queued' ? 'queued' : 'started',
+              taskId: entry.job.id,
+            })
+      }
+      /** 批次摘要加载也属于交接前窗口，中止时必须由本服务精确取消。 */
+      const candidateBatch = await awaitRunBoundary(
+        dependencies.candidateBatches.load({ ...target, batchId: candidateBatchId }),
+        options,
+      )
+      /** load 完成与公开结果交接之间再做一次同步复核，封闭迟到取消。 */
+      await awaitRunBoundary(Promise.resolve(), options)
+      return {
+        tasks: nodes.map((node) => taskByNodeId.get(node.id)!),
+        batch: summarizeBatch(candidateBatch),
+      }
     } catch (error) {
       if (error instanceof Error
         && (error.message === 'CANVAS_IMAGE_RUN_ABORTED' || error.message === 'CANVAS_IMAGE_RUN_DEADLINE')) {
@@ -497,37 +535,13 @@ export function createCanvasImageRunService(
           await cancelTasks({
             ...target,
             batchId: candidateBatchId,
-            taskIds: creationOutcome.jobs.map((entry) => entry.job.id),
+            taskIds: ownedTaskIds,
           })
         } catch {
           reportCanvasImageDiagnostic('CANVAS_IMAGE_RUN_CANCEL_CLEANUP_FAILED')
         }
       }
       throw error
-    }
-    for (let index = 0; index < createdJobs.length; index += 1) {
-      /** 当前本轮新建任务。 */
-      const entry = createdJobs[index]!
-      /** 当前任务的锁外启动结果。 */
-      const result = runResults[index]!
-      taskByNodeId.set(entry.node.id, result.status === 'fulfilled'
-        ? { nodeId: entry.node.id, status: 'started', taskId: entry.job.id }
-        : { nodeId: entry.node.id, status: 'failed', taskId: entry.job.id, error: canvasNodeRunError(result.reason) })
-    }
-    for (const entry of creationOutcome.jobs.filter((candidate) => !candidate.created)) {
-      taskByNodeId.set(entry.node.id, entry.job.status === 'failed'
-        ? { nodeId: entry.node.id, status: 'failed', taskId: entry.job.id, error: entry.job.error ?? 'CANVAS_IMAGE_JOB_FAILED' }
-        : {
-            nodeId: entry.node.id,
-            status: entry.job.status === 'queued' ? 'queued' : 'started',
-            taskId: entry.job.id,
-          })
-    }
-    /** 启动确认后只读取批次 JSON，公开结果不包含 Asset 或本地路径。 */
-    const candidateBatch = await dependencies.candidateBatches.load({ ...target, batchId: candidateBatchId })
-    return {
-      tasks: nodes.map((node) => taskByNodeId.get(node.id)!),
-      batch: summarizeBatch(candidateBatch),
     }
   }
 

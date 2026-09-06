@@ -312,6 +312,7 @@ export class DesignJobManager {
   private readonly activeExecutions = new Map<string, {
     accepted: Promise<void>
     completion: Promise<void>
+    resolveCompletion: () => void
   }>()
   private readonly createId: () => string
   private readonly createCreativeTaskId: () => string
@@ -647,7 +648,11 @@ export class DesignJobManager {
     /** 启动确认与完整完成分别收口，调用方无需持有后台 completion。 */
     const accepted = Promise.withResolvers<void>()
     const completion = Promise.withResolvers<void>()
-    const execution = { accepted: accepted.promise, completion: completion.promise }
+    const execution = {
+      accepted: accepted.promise,
+      completion: completion.promise,
+      resolveCompletion: completion.resolve,
+    }
     this.activeExecutions.set(jobId, execution)
     /** 兼容 run-only 调用没有 accepted 消费者，内部观察拒绝以避免未处理 Promise。 */
     void accepted.promise.catch(() => undefined)
@@ -812,6 +817,10 @@ export class DesignJobManager {
     if (latest.status !== 'queued' && latest.status !== 'running') return latest
     const cancelled = this.updateStatus(latest, 'cancelled', { error: undefined })
     await this.finalizeExecution(cancelled.id)
+    /** runHeadless 可能不响应 stop；取消终态必须主动释放当前及后续 run 等待。 */
+    const execution = this.activeExecutions.get(cancelled.id)
+    execution?.resolveCompletion()
+    if (this.activeExecutions.get(cancelled.id) === execution) this.activeExecutions.delete(cancelled.id)
     return this.requireProjectJob(projectId, cancelled.id)
   }
 

@@ -201,7 +201,7 @@ export interface CanvasDocumentIpcOptions {
   /** 图片模块配置复用唯一受管内容 Store。 */
   imageModules: Pick<CanvasImageModuleStore, 'load' | 'save' | 'adoptAsset'>
   /** Canvas 图片任务复用唯一 Design Job Manager。 */
-  imageJobs: Pick<DesignJobManager, 'preflightCanvasImage' | 'createCanvasImage' | 'createCanvasImageOnce' | 'rollbackCanvasImageOnce' | 'run' | 'cancel' | 'retry' | 'getProjectJob' | 'listCanvasImageJobs' | 'onChanged'>
+  imageJobs: Pick<DesignJobManager, 'preflightCanvasImage' | 'createCanvasImage' | 'createCanvasImageOnce' | 'rollbackCanvasImageOnce' | 'start' | 'run' | 'cancel' | 'retry' | 'getProjectJob' | 'listCanvasImageJobs' | 'onChanged'>
   /** 图片采用复用 Job Manager 已注入的同一目标适配器。 */
   imageJobTarget: Pick<CanvasImageJobTargetAdapter, 'assertTarget' | 'adoptOutput'>
   /** 图片 Job、IPC 与恢复共用的唯一候选批次服务。 */

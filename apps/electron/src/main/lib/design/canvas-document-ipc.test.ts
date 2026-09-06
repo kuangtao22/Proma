@@ -690,6 +690,10 @@ function createContext(options: {
         imageCalls.push({ type: 'run', value: jobId })
         await options.imageRun?.(jobId, leaseHeld)
       },
+      start: async (jobId) => {
+        imageCalls.push({ type: 'start', value: jobId })
+        await options.imageRun?.(jobId, leaseHeld)
+      },
       cancel: async (projectId, jobId) => {
         imageCalls.push({ type: 'cancel', value: { projectId, jobId } })
         return (options.imageJobs ?? [createImageJob(imageTargetA, 'job-a')]).find((job) => job.id === jobId)
@@ -3640,6 +3644,7 @@ describe('原生 Canvas 文档 IPC', () => {
           job: createImageJob(imageTargetA, jobId), created: true,
         }),
         rollbackCanvasImageOnce: async () => true,
+        start: async () => undefined,
         run: async () => undefined,
         cancel: async () => createImageJob(imageTargetA, 'job-a'),
         retry: () => createImageJob(imageTargetA, 'job-retry'),
@@ -4171,7 +4176,7 @@ describe('原生 Canvas 文档 IPC', () => {
       imageRun: async (jobId, leaseHeld) => {
         runLeaseStates.push(leaseHeld)
         if (jobId.includes('never-match')) throw new Error('unused')
-        const runCalls = context.imageCalls.filter((call) => call.type === 'run')
+        const runCalls = context.imageCalls.filter((call) => call.type === 'start')
         if (runCalls.length === 2) throw new Error('SECOND_JOB_RUN_FAILED')
       },
     })
@@ -4188,7 +4193,7 @@ describe('原生 Canvas 文档 IPC', () => {
       }], 'tool-run-batch-success')
 
       const callTypes = context.imageCalls.map((call) => call.type)
-      expect(callTypes.lastIndexOf('create-once')).toBeLessThan(callTypes.indexOf('run'))
+      expect(callTypes.lastIndexOf('create-once')).toBeLessThan(callTypes.indexOf('start'))
       expect(runLeaseStates).toEqual([false, false])
       expect(tasks.tasks).toMatchObject([
         { nodeId: 'image-node-a', status: 'started', taskId: expect.any(String) },
@@ -4235,7 +4240,7 @@ describe('原生 Canvas 文档 IPC', () => {
       if (!runtime) throw new Error('Canvas Tool Provider runtime 未注册')
       firstTaskId = (await runtime.runNodes(runContext, target, [node], 'tool-run-1')).tasks[0]?.taskId
       expect((await runtime.runNodes(runContext, target, [node], 'tool-run-1')).tasks[0]?.taskId).toBe(firstTaskId)
-      expect(firstContext.imageCalls.filter((call) => call.type === 'run')).toHaveLength(1)
+      expect(firstContext.imageCalls.filter((call) => call.type === 'start')).toHaveLength(1)
     } finally {
       firstContext.registration.dispose()
     }
