@@ -156,7 +156,7 @@ test('Bone 应用版本与更新频道保持一致', () => {
     'utf8',
   )
 
-  expect(metadata.version).toBe('0.19.26-bone.3')
+  expect(metadata.version).toBe('0.19.26-bone.4')
   expect(config.detectUpdateChannel).toBe(false)
   expect(config.publish).toEqual({
     provider: 'github',
@@ -211,6 +211,9 @@ test('Windows 升级安装器展示既有版本和目录并保留完整性校验
 
   expect(config.nsis?.include).toBe('resources/installer.nsh')
   expect(installerSource).toContain('!macro customPageAfterChangeDir')
+  expect(installerSource).toMatch(
+    /!ifndef BUILD_UNINSTALLER[\s\S]*?Var upgradeInstallLocation[\s\S]*?Var upgradeDisplayVersion[\s\S]*?!endif/,
+  )
   expect(installerSource).toMatch(
     /!macro customHeader[\s\S]*?!ifndef BUILD_UNINSTALLER[\s\S]*?Function createUpgradeSummaryPage[\s\S]*?!endif[\s\S]*?!macroend/,
   )

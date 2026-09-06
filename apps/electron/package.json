@@ -1,6 +1,6 @@
 {
   "name": "@proma/electron",
-  "version": "0.19.26-bone.3",
+  "version": "0.19.26-bone.4",
   "description": "Proma，为专业用户设计的 Agent - Electron App",
   "homepage": "https://github.com/kuangtao22/Proma",
   "main": "dist/main.cjs",

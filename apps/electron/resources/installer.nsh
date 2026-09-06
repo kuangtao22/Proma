@@ -1,7 +1,10 @@
-# 保存检测到的旧安装目录，只用于升级摘要展示。
-Var upgradeInstallLocation
-# 保存检测到的旧版本号，注册表缺失时显示“未知版本”。
-Var upgradeDisplayVersion
+# 卸载器不会展示升级摘要页，避免声明未使用变量触发 NSIS warning 6001。
+!ifndef BUILD_UNINSTALLER
+  # 保存检测到的旧安装目录，只用于升级摘要展示。
+  Var upgradeInstallLocation
+  # 保存检测到的旧版本号，注册表缺失时显示“未知版本”。
+  Var upgradeDisplayVersion
+!endif
 
 # 在安装目录页之后注册升级摘要页，由页面创建函数决定是否跳过。
 !macro customPageAfterChangeDir
