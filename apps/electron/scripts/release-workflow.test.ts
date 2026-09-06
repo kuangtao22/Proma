@@ -195,7 +195,7 @@ test('Bone 应用版本与更新频道保持一致', () => {
     'utf8',
   )
 
-  expect(metadata.version).toBe('0.19.31-bone.3')
+  expect(metadata.version).toBe('0.19.31-bone.4')
   expect(config.detectUpdateChannel).toBe(false)
   expect(config.publish).toEqual({
     provider: 'github',
@@ -233,13 +233,19 @@ test('稳定目录 helper 进入三平台资源并纳入 macOS 签名', () => {
 test('Windows 构建与发布在打包前执行稳定目录原生回归', () => {
   /** Windows 上必须真实运行的 helper/host 定向测试命令。 */
   const stableDirectoryTests = 'bun test apps/electron/src/main/lib/stable-directory-native-host.test.ts apps/electron/scripts/build-stable-directory-native.test.ts'
+  /** 完成应用构建并清理 workspace 开发依赖的资源准备命令。 */
+  const packagePrepare = "bun run --filter='@proma/electron' package:prepare"
   /** 独立 Windows 构建工作流。 */
   const buildWorkflow = Bun.YAML.parse(readWindowsBuildWorkflow()) as ReleaseWorkflow
   /** 正式发布工作流。 */
   const releaseWorkflow = Bun.YAML.parse(readReleaseWorkflow()) as ReleaseWorkflow
 
-  expect(workflowCommands(buildWorkflow.jobs?.['build-windows-x64'])).toContain(stableDirectoryTests)
-  expect(workflowCommands(releaseWorkflow.jobs?.['build-windows-x64'])).toContain(stableDirectoryTests)
+  for (const workflow of [buildWorkflow, releaseWorkflow]) {
+    /** 当前 Windows job 的全部 shell 命令。 */
+    const commands = workflowCommands(workflow.jobs?.['build-windows-x64'])
+    expect(commands).toContain(stableDirectoryTests)
+    expect(commands.indexOf(stableDirectoryTests)).toBeLessThan(commands.indexOf(packagePrepare))
+  }
 })
 
 test('Windows 升级安装器展示既有版本和目录并保留完整性校验', () => {
