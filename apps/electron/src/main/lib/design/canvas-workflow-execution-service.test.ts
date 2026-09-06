@@ -1,12 +1,30 @@
 import { describe, expect, test } from 'bun:test'
 import { createCanvasBoundEdge, createEmptyCanvasDocument } from '@proma/shared'
 import type {
+  CanvasImageCandidateBatch,
+  CanvasImageModuleConfig,
   CanvasDocument,
   CanvasNode,
   CanvasRunNodesResult,
   CanvasRunWorkflowInput,
+  CreateDesignJobInput,
+  DesignJobRecord,
 } from '@proma/shared'
 import type { CanvasAgentExecutionResult } from './canvas-agent-execution-service'
+import {
+  createCanvasImageCandidateBatchService,
+  type CanvasImageCandidateBatchService,
+} from './canvas-image-candidate-batch-service'
+import type {
+  CanvasImageCandidateAdoptionIntent,
+  CanvasImageCandidateBatchStore,
+} from './canvas-image-candidate-batch-store'
+import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
+import {
+  createCanvasImageRunService,
+  type CanvasImageRunService,
+} from './canvas-image-run-service'
+import type { DesignJobChangedListener } from './design-job-manager'
 import {
   createCanvasWorkflowExecutionService,
   type CanvasWorkflowExecutionServiceDependencies,
@@ -43,6 +61,170 @@ function createDocument(nodes: CanvasNode[], pairs: Array<[CanvasNode, CanvasNod
   }
 }
 
+/** 创建真实候选批次服务与图片运行服务组合，持久层保持严格内存语义。 */
+function createRealImageRunHarness(options: { completeOnStart?: boolean } = {}): {
+  service: CanvasImageRunService
+  batches: Map<string, CanvasImageCandidateBatch>
+  cancelledJobIds: string[]
+} {
+  const batches = new Map<string, CanvasImageCandidateBatch>()
+  const jobs = new Map<string, DesignJobRecord>()
+  const jobListeners = new Set<DesignJobChangedListener>()
+  const adoptionIntents = new Map<string, CanvasImageCandidateAdoptionIntent>()
+  const cancelledJobIds: string[] = []
+  let timestamp = 10
+  const store: CanvasImageCandidateBatchStore = {
+    listActiveSummaries: async () => [],
+    load: async (_target, batchId) => {
+      const batch = batches.get(batchId)
+      if (!batch) throw new Error('CANVAS_IMAGE_BATCH_NOT_FOUND')
+      return structuredClone(batch)
+    },
+    save: async (batch) => {
+      batches.set(batch.batchId, structuredClone(batch))
+      return structuredClone(batch)
+    },
+    findByJobId: async (_target, jobId, candidateBatchId) => {
+      if (candidateBatchId) {
+        const batch = batches.get(candidateBatchId)
+        return batch?.entries.some((entry) => entry.jobId === jobId) ? structuredClone(batch) : null
+      }
+      const batch = [...batches.values()].find((candidate) => (
+        candidate.entries.some((entry) => entry.jobId === jobId)
+      ))
+      return batch ? structuredClone(batch) : null
+    },
+    scanAdoptionIntents: async () => [...adoptionIntents.values()].map((intent) => structuredClone(intent)),
+    loadAdoptionIntent: async (_target, operationId) => {
+      const intent = adoptionIntents.get(operationId)
+      if (!intent) throw new Error('CANVAS_IMAGE_BATCH_ADOPTION_INTENT_NOT_FOUND')
+      return structuredClone(intent)
+    },
+    saveAdoptionIntent: async (intent) => {
+      adoptionIntents.set(intent.operationId, structuredClone(intent))
+      return structuredClone(intent)
+    },
+  }
+  let candidateService: CanvasImageCandidateBatchService
+  candidateService = createCanvasImageCandidateBatchService({
+    store,
+    dependencyState: createCanvasDependencyStateService(),
+    runExclusive: async (_target, effect) => effect(),
+    loadConfig: async () => { throw new Error('TEST_UNUSED_LOAD_CONFIG') },
+    adoptAsset: async () => { throw new Error('TEST_UNUSED_ADOPT_ASSET') },
+    loadCanvas: async (canvasTarget) => createEmptyCanvasDocument(canvasTarget.projectId, canvasTarget.canvasId, 1),
+    applyCanvasProjection: async (canvasTarget, expectedRevision, nodes) => ({
+      ...createEmptyCanvasDocument(canvasTarget.projectId, canvasTarget.canvasId, 1),
+      revision: expectedRevision + 1,
+      nodes: [...nodes],
+    }),
+    retryEntry: async () => { throw new Error('TEST_UNUSED_RETRY_ENTRY') },
+    now: () => {
+      timestamp += 1
+      return timestamp
+    },
+  })
+  const service = createCanvasImageRunService({
+    serializer: { run: async (_target, effect) => effect() },
+    guard: { runWorkspaceWrite: async (_projectId, effect) => effect() },
+    imageModules: {
+      load: async (imageTarget): Promise<CanvasImageModuleConfig> => ({
+        schemaVersion: 2,
+        kind: 'image',
+        contentId: imageTarget.imageModuleId,
+        revision: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        prompt: `prompt-${imageTarget.nodeId}`,
+        selectedModelProfileId: 'profile-1',
+        aspectRatio: '1:1',
+        imageSize: '1K',
+        contextMode: 'none',
+        adoptedAssetId: null,
+      }),
+    },
+    imageJobs: {
+      preflightCanvasImage: async () => undefined,
+      createCanvasImageOnce: async (input: CreateDesignJobInput, jobId: string) => {
+        const existing = jobs.get(jobId)
+        if (existing) return { job: structuredClone(existing), created: false }
+        if (input.target?.kind !== 'canvas-image') throw new Error('TEST_IMAGE_TARGET_REQUIRED')
+        const job: DesignJobRecord = {
+          id: jobId,
+          projectId: input.projectId,
+          creativeTaskId: `creative-${jobId}`,
+          attemptNumber: 1,
+          action: input.action,
+          status: 'queued',
+          prompt: input.prompt,
+          originalRequest: input.prompt,
+          contextMode: input.contextMode,
+          target: input.target,
+          canvasImageConfigRevision: input.canvasImageConfigRevision,
+          candidateBatchId: input.candidateBatchId,
+          imageModelSnapshot: {
+            profileId: input.imageModelProfileId ?? 'profile-1',
+            modelId: 'model-1',
+            name: '测试模型',
+            executor: 'nano-banana',
+          },
+          generationConstraints: input.generationConstraints,
+          createdAt: 1,
+          updatedAt: 1,
+        }
+        jobs.set(jobId, job)
+        return { job: structuredClone(job), created: true }
+      },
+      rollbackCanvasImageOnce: async (_projectId, jobId) => jobs.delete(jobId),
+      start: async (jobId) => {
+        const job = jobs.get(jobId)
+        if (!job || job.target?.kind !== 'canvas-image' || !job.candidateBatchId) {
+          throw new Error('TEST_JOB_NOT_FOUND')
+        }
+        if (options.completeOnStart === false) {
+          jobs.set(jobId, { ...job, status: 'running', updatedAt: 2 })
+          return
+        }
+        const completed: DesignJobRecord = {
+          ...job,
+          status: 'succeeded',
+          outputAssetId: `asset-${job.target.nodeId}`,
+          updatedAt: 2,
+        }
+        jobs.set(jobId, completed)
+        await candidateService.recordJobTerminal({
+          projectId: completed.projectId,
+          canvasId: job.target.canvasId,
+          jobId,
+          candidateBatchId: job.candidateBatchId,
+          status: 'succeeded',
+          outputAssetId: completed.outputAssetId ?? null,
+          error: null,
+        })
+      },
+      cancel: async (_projectId, jobId) => {
+        const job = jobs.get(jobId)
+        if (!job) throw new Error('TEST_JOB_NOT_FOUND')
+        cancelledJobIds.push(jobId)
+        const cancelled = { ...job, status: 'cancelled' as const }
+        jobs.set(jobId, cancelled)
+        return cancelled
+      },
+      getProjectJob: (projectId, jobId) => {
+        const job = jobs.get(jobId)
+        return job?.projectId === projectId ? structuredClone(job) : undefined
+      },
+      onChanged: (listener) => {
+        jobListeners.add(listener)
+        return () => { jobListeners.delete(listener) }
+      },
+    },
+    candidateBatches: candidateService,
+    getProjectReadOnlyReason: () => undefined,
+  })
+  return { service, batches, cancelledJobIds }
+}
+
 /** 构造可观察 Agent、图片和 fresh-read 行为的调度夹具。 */
 function createFixture(document: CanvasDocument, options: {
   busyNodeIds?: string[]
@@ -58,9 +240,11 @@ function createFixture(document: CanvasDocument, options: {
   onAgentStart?: (nodeId: string, signal?: AbortSignal) => Promise<void>
   onLoad?: (callCount: number) => Promise<void>
   onValidateAccess?: (callCount: number) => Promise<void>
+  imageRunService?: Pick<CanvasImageRunService, 'run' | 'awaitBatch'>
   onImageRun?: (signal: AbortSignal, deadlineAt: number) => Promise<void>
   onImageWait?: (signal: AbortSignal) => Promise<void>
   imageWaitError?: Error
+  now?: () => number
 } = {}) {
   let current = structuredClone(document)
   const agentStarts: string[] = []
@@ -110,7 +294,7 @@ function createFixture(document: CanvasDocument, options: {
         }
       },
     },
-    imageRuns: {
+    imageRuns: options.imageRunService ?? {
       run: async (_context, _target, nodes, _operationId, runOptions) => {
         if (!runOptions) throw new Error('TEST_IMAGE_RUN_OPTIONS_REQUIRED')
         imageRuns.push(nodes.map((node) => node.id))
@@ -145,7 +329,7 @@ function createFixture(document: CanvasDocument, options: {
         }
       },
     },
-    now: () => 1_000,
+    now: options.now ?? (() => 1_000),
     setDeadline: (callback) => {
       deadlineCallback = callback
       return { cancel: () => undefined }
@@ -557,6 +741,90 @@ describe('Canvas Workflow Execution Service', () => {
     expect(fixture.agentStarts).toEqual(['root', 'agent-added'])
     expect(fixture.imageRuns).toEqual([['image-first'], ['image-added']])
     expect(result.nodes.some((node) => node.status === 'started')).toBe(false)
+  })
+
+  test('Given 真实图片服务首批等待期间动态新增第二图片 When 持续调度与重放 Then 子批身份互异且重放稳定', async () => {
+    const root = createNode('root', 'agent')
+    const firstImage = createNode('image-first', 'image')
+    const addedImage = createNode('image-added', 'image')
+    const realImages = createRealImageRunHarness()
+    const operationIds: string[] = []
+    let expanded = false
+    let fixture: ReturnType<typeof createFixture>
+    fixture = createFixture(createDocument([root, firstImage], [[root, firstImage]]), {
+      now: Date.now,
+      imageRunService: {
+        run: (runContext, runTarget, nodes, operationId, runOptions) => {
+          operationIds.push(operationId)
+          return realImages.service.run(runContext, runTarget, nodes, operationId, runOptions)
+        },
+        awaitBatch: async (input) => {
+          const terminal = await realImages.service.awaitBatch(input)
+          if (!expanded) {
+            expanded = true
+            const next = createDocument(
+              [root, firstImage, addedImage],
+              [[root, firstImage], [root, addedImage]],
+            )
+            next.revision = 5
+            fixture.setDocument(next)
+          }
+          return terminal
+        },
+      },
+    })
+    fixture.input.maxImageRuns = 2
+
+    const result = await fixture.service.execute(context, fixture.input, 'tool-real-dynamic-batches')
+    const savedBatches = [...realImages.batches.values()]
+
+    expect(savedBatches).toHaveLength(2)
+    expect(new Set(savedBatches.map((batch) => batch.batchId)).size).toBe(2)
+    expect(savedBatches.map((batch) => batch.entries[0]?.nodeId).sort()).toEqual([
+      'image-added', 'image-first',
+    ])
+    expect(savedBatches.every((batch) => batch.status === 'ready')).toBe(true)
+    expect(result.nodes.filter((node) => node.status === 'waiting-review')).toHaveLength(2)
+
+    const firstOperationIds = [...operationIds]
+    fixture.setDocument(createDocument([root, firstImage], [[root, firstImage]]))
+    expanded = false
+    const replay = await fixture.service.execute(context, fixture.input, 'tool-real-dynamic-batches')
+
+    expect(operationIds.slice(firstOperationIds.length)).toEqual(firstOperationIds)
+    expect(realImages.batches).toHaveLength(2)
+    expect(replay.nodes.filter((node) => node.status === 'waiting-review')).toHaveLength(2)
+  })
+
+  test('Given 真实图片 run 已返回 owned 批次后父级立即取消 When 交接 Then 仍由 awaitBatch 精确取消任务', async () => {
+    const root = createNode('root', 'agent')
+    const image = createNode('image', 'image')
+    const controller = new AbortController()
+    const realImages = createRealImageRunHarness({ completeOnStart: false })
+    let awaitBatchCalls = 0
+    const fixture = createFixture(createDocument([root, image], [[root, image]]), {
+      now: Date.now,
+      imageRunService: {
+        run: async (runContext, runTarget, nodes, operationId, runOptions) => {
+          const result = await realImages.service.run(runContext, runTarget, nodes, operationId, runOptions)
+          controller.abort()
+          return result
+        },
+        awaitBatch: async (input) => {
+          awaitBatchCalls += 1
+          return realImages.service.awaitBatch(input)
+        },
+      },
+    })
+
+    const result = await fixture.service.execute(
+      context, fixture.input, 'tool-real-handoff-abort', controller.signal,
+    )
+
+    expect(awaitBatchCalls).toBe(1)
+    expect(realImages.cancelledJobIds).toHaveLength(1)
+    expect(result.status).toBe('cancelled')
+    expect(result.errorCode).toBe('CANVAS_WORKFLOW_CANCELLED')
   })
 
   for (const scenario of [

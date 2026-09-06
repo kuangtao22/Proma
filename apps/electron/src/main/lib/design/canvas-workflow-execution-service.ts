@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type {
   CanvasDocument,
   CanvasNode,
@@ -22,6 +23,22 @@ import {
 const MAX_AGENT_CONCURRENCY = 2
 /** Canvas 工作流与单 Agent 长工具共用的总时限。 */
 export const CANVAS_WORKFLOW_TIMEOUT_MS = 15 * 60_000
+
+/** 为动态图片子批派生可重放且互不冲突的安全 operationId。 */
+function createWorkflowImageOperationId(
+  parentOperationId: string,
+  batchOrdinal: number,
+  nodeIds: readonly string[],
+): string {
+  /** 只哈希稳定业务身份，不包含节点标题、提示词或其它正文。 */
+  const digest = createHash('sha256').update(JSON.stringify([
+    'canvas-workflow-image-batch',
+    parentOperationId,
+    batchOrdinal,
+    [...nodeIds].sort(),
+  ])).digest('hex')
+  return `workflow-image-${digest}`
+}
 
 /** 可取消 deadline 的窄句柄，便于测试不依赖真实时钟。 */
 export interface CanvasWorkflowDeadlineHandle {
@@ -318,6 +335,7 @@ export function createCanvasWorkflowExecutionService(
       let states = new Map<string, InternalNodeState>()
       const executedNodeIds = new Set<string>()
       let imageRunsStarted = 0
+      let imageBatchOrdinal = 0
       let maxObservedRevision = input.expectedRevision
       let imageSummary: CanvasWorkflowImageSummary | null = null
       let workflowErrorCode: string | null = null
@@ -490,10 +508,17 @@ export function createCanvasWorkflowExecutionService(
           if (readyImages.length > 0) {
             for (const node of readyImages) executedNodeIds.add(node.id)
             imageRunsStarted += readyImages.length
+            /** ordinal 只在真实启动子批时推进，同一确定性重放会得到相同身份序列。 */
+            const imageOperationId = createWorkflowImageOperationId(
+              toolCallId,
+              imageBatchOrdinal,
+              readyImages.map((node) => node.id),
+            )
+            imageBatchOrdinal += 1
             let runResult: Awaited<ReturnType<CanvasImageRunService['run']>> | null = null
             try {
               runResult = await dependencies.imageRuns.run(
-                context, target, readyImages, toolCallId, { signal: controller.signal, deadlineAt },
+                context, target, readyImages, imageOperationId, { signal: controller.signal, deadlineAt },
               )
             } catch (error) {
               if (!controller.signal.aborted) {
@@ -501,8 +526,9 @@ export function createCanvasWorkflowExecutionService(
                 for (const node of readyImages) states.set(node.id, { status: 'failed', errorCode })
               }
             }
-            if (controller.signal.aborted) break
             if (!runResult) {
+              /** run 未交接 owned batch 时，Task 9 已在拒绝前自行完成取消。 */
+              if (controller.signal.aborted) break
               if (!await refreshPlan()) break
               continue
             }
@@ -522,6 +548,7 @@ export function createCanvasWorkflowExecutionService(
                   for (const node of readyImages) states.set(node.id, { status: 'failed', errorCode })
                 }
               }
+              /** run 已返回 owned batch 后，即使已取消也必须先调用 awaitBatch 完成交接清理。 */
               if (controller.signal.aborted) break
               if (terminal) {
                 imageSummary = toWorkflowImageSummary(terminal)
